@@ -202,7 +202,7 @@ struct Surface::Impl {
                 const std::size_t o = (std::size_t(j) * std::size_t(w) + std::size_t(i)) * 3;
                 float step[3];
                 if (!point(g, grid, float(x + double(i0 + i) * raster.sx), Sheared ? float(y + double(i0 + i) * raster.ky) : row,
-                           xyz + o, step)) {
+                           xyz + o, nrm ? step : nullptr)) {
                     xyz[o] = xyz[o + 1] = xyz[o + 2] = kNaN;
                     step[0] = step[1] = step[2] = kNaN;
                 }
@@ -300,7 +300,7 @@ void Surface::resample(const Raster& raster, float* xyz, float* normals) const
     });
 }
 
-void Surface::pointsAt(const float* xy, std::size_t n, float* xyz, float* normals) const
+void Surface::pointsAt(const float* xy, std::size_t n, float* xyz, float* normals, float* columnTangents, float* rowTangents) const
 {
     std::vector<float> scratch;
     if (!xyz) {
@@ -313,7 +313,11 @@ void Surface::pointsAt(const float* xy, std::size_t n, float* xyz, float* normal
     resamplePool().parallel_for(parts, [&](std::size_t k) {
         for (std::size_t i = n * k / parts; i < n * (k + 1) / parts; ++i) {
             float step[3];
-            if (!point(g, grid, xy[i * 2], xy[i * 2 + 1], xyz + i * 3, step)) {
+            auto* du = columnTangents ? columnTangents + i * 3 : nullptr;
+            auto* dv = rowTangents ? rowTangents + i * 3 : nullptr;
+            if (!point(g, grid, xy[i * 2], xy[i * 2 + 1], xyz + i * 3, normals ? step : nullptr, du, dv)) {
+                if (du) std::fill_n(du, 3, kNaN);
+                if (dv) std::fill_n(dv, 3, kNaN);
                 xyz[i * 3] = xyz[i * 3 + 1] = xyz[i * 3 + 2] = kNaN;
                 step[0] = step[1] = step[2] = kNaN;
             }

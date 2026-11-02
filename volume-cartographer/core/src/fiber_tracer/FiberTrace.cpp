@@ -1,3 +1,4 @@
+#include <vc_reader/sampling.hpp>
 #include "vc/fiber_tracer/FiberTrace.hpp"
 #include "vc/fiber_tracer/FiberEmbedding.hpp"
 #include "vc/fiber_tracer/FiberWidth.hpp"
@@ -1140,11 +1141,11 @@ float directionModulatedPresence(float presence, const TraceVec& prevStep,
     if (!valid)
         return {};
 
-    const auto weights = vc::lasagna::lasagnaCornerWeights(fractionXYZ);
+    const auto weights = vcr::sampling::cornerWeights(fractionXYZ);
     const size_t normalFirstVolume = optionCount * 3;
     TraceVec smoothNormal{0.0f, 0.0f, 0.0f};
     bool smoothNormalValid = false;
-    if (vc::lasagna::interpolateLasagnaCorners(
+    if (vcr::sampling::weightedCorners(
             volumeCorners[normalFirstVolume], weights) > 0.0f) {
         smoothNormal = vc::lasagna::interpolateLasagnaCompactAxisCorners(
             volumeCorners[normalFirstVolume + 1],
@@ -1174,7 +1175,7 @@ float directionModulatedPresence(float presence, const TraceVec& prevStep,
 
         const TraceVec alignedDirection = direction;
         const float rawPresence = traceClamp01(
-            vc::lasagna::interpolateLasagnaCorners(
+            vcr::sampling::weightedCorners(
                 volumeCorners[volume], weights) /
             255.0f);
         const float presence = rawPresence * presenceScale;
@@ -4092,13 +4093,13 @@ public:
                     out.options.push_back({});
                     continue;
                 }
-                const auto weights = vc::lasagna::lasagnaCornerWeights(batch.fractionsXYZ[pointIndex]);
+                const auto weights = vcr::sampling::cornerWeights(batch.fractionsXYZ[pointIndex]);
                 cv::Vec3f direction = vc::lasagna::interpolateLasagnaCompactAxisCorners(
                     batch.values[1][pointIndex], batch.values[2][pointIndex], weights, reference);
                 if (direction.dot(reference) < 0.0f)
                     direction *= -1.0f;
                 const float rawPresence =
-                    vc::lasagna::interpolateLasagnaCorners(batch.values[0][pointIndex], weights);
+                    vcr::sampling::weightedCorners(batch.values[0][pointIndex], weights.data());
                 out.options.push_back({
                     direction,
                     std::clamp(rawPresence / 255.0f, 0.0f, 1.0f),
@@ -4176,7 +4177,7 @@ public:
                     out.options.push_back({});
                     continue;
                 }
-                const double rawPresence = vc::lasagna::interpolateLasagnaCube(
+                const double rawPresence = vcr::sampling::trilinear(
                     option.presence.values[pointIndex], option.presence.fractionsXYZ[pointIndex]);
                 const auto direction = vc::lasagna::lasagnaCompactAxisCube(
                     option.nx.values[pointIndex], option.ny.values[pointIndex],
@@ -4319,7 +4320,7 @@ public:
         const auto sampleOne = [&](size_t index) {
             if (!presence.valid[index])
                 return;
-            const double rawPresence = vc::lasagna::interpolateLasagnaCube(presence.values[index], presence.fractionsXYZ[index]);
+            const double rawPresence = vcr::sampling::trilinear(presence.values[index], presence.fractionsXYZ[index]);
             samples[index].presence = clamp01(rawPresence / 255.0);
             samples[index].presenceValid = true;
             if (!nx.valid[index] || !ny.valid[index])
@@ -4345,7 +4346,7 @@ public:
         samples.assign(indicesZYX.size(), {});
         sampleStoredIndices(indicesZYX.size(), parallelThreads, [&](size_t index) {
             if (presence.valid[index])
-                samples[index] = {clamp01(vc::lasagna::interpolateLasagnaCube(
+                samples[index] = {clamp01(vcr::sampling::trilinear(
                     presence.values[index], presence.fractionsXYZ[index]) / 255.0), true};
         });
     }

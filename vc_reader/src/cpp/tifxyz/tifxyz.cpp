@@ -291,9 +291,9 @@ const grid::Surface& Surface::interpolator(grid::Interpolation interpolation) co
     return *interpolators_->surfaces[k];
 }
 
-void Surface::pointsAt(const float* xy, std::size_t n, grid::Interpolation interpolation, float* xyz, float* normals) const
+void Surface::pointsAt(const float* xy, std::size_t n, grid::Interpolation interpolation, float* xyz, float* normals, float* columnTangents, float* rowTangents) const
 {
-    interpolator(interpolation).pointsAt(xy, n, xyz, normals);
+    interpolator(interpolation).pointsAt(xy, n, xyz, normals, columnTangents, rowTangents);
 }
 
 void Surface::resample(const grid::Raster& raster, grid::Interpolation interpolation, float* xyz, float* normals) const
@@ -315,6 +315,22 @@ std::vector<std::uint8_t> readMask(const std::string& location, std::int64_t row
     std::vector<std::uint8_t> valid(std::size_t(rows) * std::size_t(cols), 1);
     applyMask(*mask, g, 0, 0, rows, cols, valid.data());
     return valid;
+}
+
+json Metadata::document() const
+{
+    json out = extra;
+    out["uuid"] = uuid;
+    out["scale"] = {scale[1], scale[0]};
+    if (bbox) out["bbox"] = {{(*bbox)[0],(*bbox)[1],(*bbox)[2]}, {(*bbox)[3],(*bbox)[4],(*bbox)[5]}};
+    if (area) out["area"] = *area;
+    return out;
+}
+
+std::array<std::int64_t, 2> storedShape(const std::string& location, const sources::OptionsFor& options)
+{
+    auto reader = openImage(child(location, "x.tif"), "scalar", {"y", "x"}, settingsOf(options));
+    return {reader->shape()[0], reader->shape()[1]};
 }
 
 Metadata parseMetadata(const json& document, const std::string& location)
@@ -426,11 +442,10 @@ void write(const std::filesystem::path& path, Surface& surface, const WriteOptio
             sources::writeTiff(temporary / names[a], component.data(), "<f4", rows, cols, 1, tiff);
         }
         const auto box = surface.bounds().value_or(Bounds{0, 0, 0, 0, 0, 0});
-        json document = metadata.extra;
-        document.update(json{{"uuid", metadata.uuid}, {"scale", {metadata.scale[1], metadata.scale[0]}}, {"bbox", {{box[0], box[1], box[2]}, {box[3], box[4], box[5]}}}});
+        json document = metadata.document();
+        document["bbox"] = {{box[0], box[1], box[2]}, {box[3], box[4], box[5]}};
         if (!document.contains("type")) document["type"] = "seg";
         if (!document.contains("format")) document["format"] = "tifxyz";
-        if (metadata.area) document["area"] = *metadata.area;
         zarr::atomicWrite(temporary / "meta.json", document.dump(2) + "\n");
         if (options.mask) {
             std::vector<std::uint8_t> mask(cells);

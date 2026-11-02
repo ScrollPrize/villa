@@ -1,3 +1,4 @@
+#include <vc_reader/sampling.hpp>
 #include "vc/fiber_tracer/detail/FiberChunkTensor.hpp"
 #include "vc_reader/array.hpp"
 #include <algorithm>
@@ -49,7 +50,7 @@ FiberPredictionSampleOption batchDirection(float presence,
     const cv::Vec3f& fraction,const cv::Vec3f& reference)
 {
     auto direction=vc::lasagna::interpolateLasagnaCompactAxisCorners(nxValues,nyValues,
-        vc::lasagna::lasagnaCornerWeights(fraction),reference);
+        vcr::sampling::cornerWeights(fraction),reference);
     if(direction.dot(reference)<0)direction*=-1.f;
     return {direction,presence,direction.dot(direction)>1.e-12f};
 }
@@ -191,7 +192,7 @@ FiberPredictionSampleOption FiberChunkTensor::scalarOption(Cube& indices,const c
     if(!direction)return {};
     const auto presence=sampleCorners<Measured,double>(0,indices,timer);
     const auto interpolated=[&]{Scope stage(timer,SamplingStage::Presence);
-        return vc::lasagna::interpolateLasagnaCube(presence,f);}();
+        return vcr::sampling::trilinear(presence, f.val);}();
     Scope stage(timer,SamplingStage::PredictionOutput);
     return materializeFiberScalarPrediction(interpolated,*direction,ref);
 }
@@ -202,8 +203,8 @@ FiberPredictionSampleOption FiberChunkTensor::batchOption(const cv::Vec3d& p,con
     const cv::Vec3f fp=cv::Vec3f(p)/float(spacing_);Cube indices;cv::Vec3d fd;
     if(!cube(cv::Vec3d(fp),indices,fd))return {};
     const cv::Vec3f f(fd),reference(ref);
-    const auto weights=vc::lasagna::lasagnaCornerWeights(f);
-    const float presence=std::clamp(vc::lasagna::interpolateLasagnaCorners(bytes(0,indices),weights)/255.0f,0.0f,1.0f);
+    const auto weights=vcr::sampling::cornerWeights(f);
+    const float presence=std::clamp(vcr::sampling::weightedCorners(bytes(0,indices), weights.data())/255.0f,0.0f,1.0f);
     if(presence<threshold)return {};
     return batchDirection(presence,bytes(1,indices),bytes(2,indices),f,reference);
 }
@@ -262,7 +263,7 @@ nlohmann::json FiberChunkTensor::seedGrid(const cv::Vec3d& lo,double scale,doubl
     if(phaseCount<=4096){
         weights.reserve(phaseCount);
         for(float z:phases[2])for(float y:phases[1])for(float x:phases[0])
-            weights.push_back(vc::lasagna::lasagnaCornerWeights({x,y,z}));
+            weights.push_back(vcr::sampling::cornerWeights({x,y,z}));
     }
     auto corners=[&](const AxisPoint& x,const AxisPoint& y,const AxisPoint& z){
         std::array<size_t,8> indices;
@@ -288,9 +289,9 @@ nlohmann::json FiberChunkTensor::seedGrid(const cv::Vec3d& lo,double scale,doubl
         for(int z=zr.begin;z<zr.end;++z)for(int y=yr.begin;y<yr.end;++y)for(int x=xr.begin;x<xr.end;++x){
             const auto& ax=axes[0][x];const auto& ay=axes[1][y];const auto& az=axes[2][z];
             std::array<float,8> w;
-            if(weights.empty())w=vc::lasagna::lasagnaCornerWeights({ax.fraction,ay.fraction,az.fraction});
+            if(weights.empty())w=vcr::sampling::cornerWeights({ax.fraction,ay.fraction,az.fraction});
             else w=weights[(az.phase*phases[1].size()+ay.phase)*phases[0].size()+ax.phase];
-            const float value=std::clamp(vc::lasagna::interpolateLasagnaCorners(values,w)/255.f,0.f,1.f);
+            const float value=std::clamp(vcr::sampling::weightedCorners(values, w.data())/255.f,0.f,1.f);
             ++interpolated;
             if(value<threshold)continue;
             const size_t index=(size_t(z)*side+y)*side+x;
@@ -349,7 +350,7 @@ float FiberChunkTensor::width(Cube& indices,const cv::Vec3d& f,FiberSamplingTime
     const auto mask=sampleCorners<Measured,uint8_t>(0,indices,timer);
     const auto samples=sampleCorners<Measured,double>(6,indices,timer);
     const auto value=[&]{Scope stage(timer,SamplingStage::WidthInterpolation);
-        return vc::lasagna::interpolateLasagnaMaskedScalarCorners(samples,f,mask);}();
+        return vcr::sampling::maskedTrilinear(samples,f,mask);}();
     Scope stage(timer,SamplingStage::WidthConversion);
     if(!value||!std::isfinite(*value)||!std::isfinite(*value * *value))return 0;
     // Existing vector materialization rounds before unit conversion.
@@ -382,7 +383,7 @@ vc::lasagna::NormalSample FiberChunkTensor::normal(Cube& indices,const cv::Vec3d
     const auto mask=sampleCorners<Measured,uint8_t>(3,indices,timer);
     const auto magnitude=[&]{Scope stage(timer,SamplingStage::NormalValidity);
         std::array<double,8> grad;for(size_t k=0;k<8;++k)grad[k]=mask[k];
-        return vc::lasagna::interpolateLasagnaCube(grad,f);}();
+        return vcr::sampling::trilinear(grad, f.val);}();
     if(magnitude<=0)return {{},false,"zero normal magnitude"};
     const auto nx=sampleCorners<Measured,uint8_t>(4,indices,timer);
     const auto ny=sampleCorners<Measured,uint8_t>(5,indices,timer);

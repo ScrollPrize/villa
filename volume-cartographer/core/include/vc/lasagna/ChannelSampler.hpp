@@ -123,8 +123,6 @@ void readLasagnaCubes(
     std::span<const cv::Vec3d> volumePoints,
     LasagnaCubes& cubes);
 
-[[nodiscard]] double interpolateLasagnaCube(
-    const std::array<double, 8>& values, const cv::Vec3d& fractionXYZ);
 
 // Compact-normal (nx, ny byte) cubes to their weighted principal axis; corners
 // whose `validity` value is zero are left out. nullopt when no corner counts.
@@ -153,8 +151,6 @@ void sampleLasagnaVectorBatch(const std::vector<LasagnaChannelBinding>& channels
 
 [[nodiscard]] double decodeCompactNormalComponent(double raw);
 // Storage-independent interpolation, also used by owned dense ROIs.
-[[nodiscard]] std::optional<double> interpolateLasagnaMaskedScalarCorners(
-    const std::array<double,8>&, const cv::Vec3d&, const std::array<uint8_t,8>&);
 [[nodiscard]] std::optional<cv::Vec3d> interpolateLasagnaCompactTensorCorners(
     const std::array<uint8_t,8>& nx, const std::array<uint8_t,8>& ny,
     const cv::Vec3d& fraction, const std::array<uint8_t,8>& mask);
@@ -176,13 +172,8 @@ encodeCompactNormalToRaw(const cv::Vec3d& normal);
     const cv::Matx33d& tensor,
     const cv::Vec3d& hint);
 
-[[nodiscard]] std::array<float, 8> lasagnaCornerWeights(
-    const cv::Vec3f& fractionXYZ);
 [[nodiscard]] std::array<float, 8> validLasagnaCornerWeights(
     const std::array<float, 8>& weights, const std::array<uint8_t, 8>& validity);
-[[nodiscard]] float interpolateLasagnaCorners(
-    const std::array<uint8_t, 8>& values,
-    const std::array<float, 8>& weights);
 
 [[nodiscard]] cv::Vec3f interpolateLasagnaCompactAxisCorners(
     const std::array<uint8_t, 8>& nx,

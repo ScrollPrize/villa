@@ -179,6 +179,24 @@ std::string datasetPath(const Json& dataset)
 }
 }  // namespace
 
+// A root array's metadata, when the location is one.
+std::optional<Json> readArrayDocument(const std::string& location, const OpenOptions& options)
+{
+    if (options.offline && isRemote(location))
+        return cachedSourceZarray(options.cacheDirs, options.access.cacheUrl(location), {}, {},
+                                  options.vc3dVolumeDir);
+    if (keptGroup(location, options))
+        return std::nullopt;
+    const auto read = reader(options);
+    auto root = readJsonNode(read, location, ".zarray");
+    if (!root) {
+        const auto v3 = readJsonNode(read, location, "zarr.json");
+        if (v3 && v3->value("node_type", "") == "array") root = v3;
+    }
+    return root;
+}
+
+
 OpenedArray openArray(const std::string& input, const OpenOptions& options, ArrayHints hints)
 {
     if (options.readMode != "mmap" && options.readMode != "slab")
@@ -222,13 +240,8 @@ OpenedArray openArray(const std::string& input, const OpenOptions& options, Arra
             throw CacheMiss(location + " is not in the disk caches (offline)");
         out.meta = parseArrayMeta(*cached);
     } else {
-        const auto read = reader(options);
-        auto meta = readJsonNode(read, location, ".zarray");
-        if (!meta) {
-            meta = readJsonNode(read, location, "zarr.json");
-            if (!meta || meta->value("node_type", "") != "array")
-                throw NotFound("no Zarr array at " + location + " (.zarray/zarr.json not found)");
-        }
+        const auto meta = readArrayDocument(location, options);
+        if (!meta) throw NotFound("no Zarr array at " + location + " (.zarray/zarr.json not found)");
         out.meta = parseArrayMeta(*meta);
     }
     out.store = group.value_or(location);
@@ -406,6 +419,8 @@ Group Group::open(const std::string& input, OpenOptions options)
     const auto read = options.metadata;
     auto zgroup = read(location, ".zgroup");
     auto zattrs = read(location, ".zattrs");
+    if (zgroup && Json::parse(*zgroup).value("zarr_format", 0) != 2)
+        throw std::invalid_argument(location + ": invalid Zarr v2 group metadata");
     int version = 2;
     if (!zgroup && !zattrs) {
         if (const auto node = readJsonNode(read, location, "zarr.json")) {
@@ -636,23 +651,6 @@ LevelPlacement levelPlacement(const Json& attributes, const std::string& path)
 
 namespace {
 
-// A root array's metadata, when the location is one.
-std::optional<Json> rootArrayMetadata(const std::string& location, const OpenOptions& options)
-{
-    if (options.offline && isRemote(location))
-        return cachedSourceZarray(options.cacheDirs, options.access.cacheUrl(location), {}, {},
-                                  options.vc3dVolumeDir);
-    if (keptGroup(location, options))
-        return std::nullopt;
-    const auto read = reader(options);
-    auto root = readJsonNode(read, location, ".zarray");
-    if (!root) {
-        const auto v3 = readJsonNode(read, location, "zarr.json");
-        if (v3 && v3->value("node_type", "") == "array") root = v3;
-    }
-    return root;
-}
-
 // (level number, path) of a group's levels, in the group's order.
 std::vector<std::pair<int, std::string>> numberedLevels(Group& group, int probeLevels)
 {
@@ -691,7 +689,7 @@ bool isLocalZarrArray(const std::filesystem::path& directory)
 
 bool isArrayNode(const std::string& location, const OpenOptions& options)
 {
-    return rootArrayMetadata(stripSlashes(location), options).has_value();
+    return readArrayDocument(stripSlashes(location), options).has_value();
 }
 
 // Keeps a pyramid's group state with its caches, every level looked up.
@@ -723,7 +721,7 @@ OpenedArray openPyramidLevel(const std::string& input, int level, const OpenOpti
     if (level < 0 || probeLevels < 0)
         throw std::invalid_argument("pyramid level and probeLevels must be nonnegative");
     const auto location = stripSlashes(input);
-    if (auto root = rootArrayMetadata(location, options)) {
+    if (auto root = readArrayDocument(location, options)) {
         if (level != 0) throw std::out_of_range("a root array has only pyramid level 0");
         ArrayHints hints;
         hints.metadata = std::move(root);
@@ -748,7 +746,7 @@ std::vector<PyramidLevelInfo> pyramidLevels(const std::string& input, const Open
     if (probeLevels < 0)
         throw std::invalid_argument("probeLevels must be nonnegative");
     const auto location = stripSlashes(input);
-    if (const auto root = rootArrayMetadata(location, options))
+    if (const auto root = readArrayDocument(location, options))
         return {{0, "", parseArrayMeta(*root)}};
     auto group = Group::open(location, options);
     std::vector<PyramidLevelInfo> out;

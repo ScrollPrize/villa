@@ -69,8 +69,9 @@ __all__ = [
 
 
 _NATIVE_EXPORTS = {
+    'zarr_inventory', 'create_object_array',
     'shortest_path', 'write_image', 'encode_png', 'encode_jpeg', 'snapshot',
-    'window_level_lut', 'palette_lut', 'overlay_lut', 'display_to_uint8',
+    'window_level_lut', 'palette_lut', 'overlay_lut', 'display_to_uint8', 'display_to_uint16',
     'apply_lut', 'blend', 'blend_argb', 'SlabProjection', 'opacity_lut', 'composite_slab',
 }
 __all__ += sorted(_NATIVE_EXPORTS - set(__all__))

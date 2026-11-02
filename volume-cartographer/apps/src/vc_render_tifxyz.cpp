@@ -1,3 +1,4 @@
+#include <vc_reader/display.hpp>
 #include <iostream>
 #include "vc/core/util/QuadSurface.hpp"
 #include "vc/core/util/RemoteCacheSettings.hpp"
@@ -242,11 +243,12 @@ static cv::Mat toImage(const vcr::grid::Result& result, int layer)
     cv::Mat_<T> out(result.height, result.width);
     const std::size_t n = std::size_t(result.width) * std::size_t(result.height);
     const float* v = result.values.data() + std::size_t(layer) * n;
-    constexpr float maxValue = float(std::numeric_limits<T>::max());
-    constexpr float rounding = std::is_same_v<T, uint16_t> ? 0.5f : 0.0f;
-    T* dst = out[0];
-    for (std::size_t p = 0; p < n; ++p)
-        dst[p] = std::isnan(v[p]) ? T(0) : T(std::clamp(v[p], 0.0f, maxValue) + rounding);
+    if constexpr (std::is_same_v<T, uint16_t>)
+        vcr::display::toUint16(v, n, out[0]);
+    else if constexpr (std::is_same_v<T, uint8_t>)
+        vcr::display::toUint8(v, n, out[0], nullptr, {1, vcr::display::Rounding::Truncate, true});
+    else
+        static_assert(std::is_same_v<T, uint8_t> || std::is_same_v<T, uint16_t>);
     return out;
 }
 

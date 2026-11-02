@@ -1,3 +1,4 @@
+#include <vc_reader/display.hpp>
 #include "Fiber3DCT.hpp"
 #include "Fiber3DGeometry.hpp"
 #include "OpenedVolumes.hpp"
@@ -9,14 +10,6 @@
 
 namespace vc3d::fibers3d::ct
 {
-cv::Mat_<uint8_t> displayBytes(const cv::Mat& values)
-{
-    if (values.type() != CV_8UC1 && values.type() != CV_16UC1)
-        throw std::invalid_argument("CT display supports uint8 and uint16 values");
-    cv::Mat_<uint8_t> bytes;
-    values.convertTo(bytes, CV_8U, values.type() == CV_16UC1 ? 1./256. : 1.);
-    return bytes;
-}
 cv::Mat_<cv::Vec2b> sampleCoordinates(const cv::Mat_<cv::Vec3f>& points, OpenedVolumes& volumes, const Volume& volume, int level)
 {
     const auto& pyramid = volumes.pyramid(volume);
@@ -46,8 +39,11 @@ cv::Mat_<cv::Vec2b> sampleCoordinates(const cv::Mat_<cv::Vec3f>& points, OpenedV
     std::vector<float> values(indices.size());
     opened.array->array->sample_linear(coords.data(), indices.size(), opened.array->meta.type, false, values.data());
     const double scale = pyramid.dtype == "<u2" ? 1./256. : 1.;
+    std::vector<uint8_t> bytes(indices.size());
+    vcr::display::toUint8(values.data(), values.size(), bytes.data(), nullptr,
+        {scale, vcr::display::Rounding::NearestEven});
     for (size_t i=0; i<indices.size(); ++i)
-        result(int(indices[i] / points.cols), int(indices[i] % points.cols))[0] = cv::saturate_cast<uint8_t>(values[i] * scale);
+        result(int(indices[i] / points.cols), int(indices[i] % points.cols))[0] = bytes[i];
     return result;
 }
 

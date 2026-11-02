@@ -314,6 +314,10 @@ struct StoreMetadata;
 // its next open reads it as published.
 void forgetKeptMetadata(const std::string& location, const OpenOptions& options);
 
+// Raw array metadata without constructing a numeric decoder (also object arrays).
+// Uses the same metadata readers and offline caches as openArray; absent for groups.
+std::optional<Json> readArrayDocument(const std::string& location, const OpenOptions& options = {});
+
 class Group {
 public:
     // A group in a public channel with caches keeps its state() there once its pyramid

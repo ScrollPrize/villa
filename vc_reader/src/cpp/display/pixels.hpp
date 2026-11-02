@@ -1,6 +1,7 @@
 #pragma once
 #include "vc_reader/display.hpp"
 #include <cmath>
+#include "../rounding.hpp"
 #ifdef __CUDACC__
 #define VCR_PIXEL __host__ __device__
 #else
@@ -9,7 +10,21 @@
 namespace vcr::display::detail {
 VCR_PIXEL inline float clamp(float x,float a,float b) { return x<a?a:x>b?b:x; }
 VCR_PIXEL inline bool finite(float x) { return x<=3.402823466e38f && x>=-3.402823466e38f; }
-VCR_PIXEL inline uint8_t byte(float v) { return finite(v) ? uint8_t(clamp(v,0,255)) : 0; }
+template<class T>
+VCR_PIXEL inline T converted(float v, Conversion options) {
+    if (v != v || (!options.saturateInfinity && !finite(v))) return 0;
+    constexpr double maximum = sizeof(T) == 1 ? 255. : 65535.;
+    double value = double(v) * options.scale;
+    if (value != value) return 0;
+    value = value < 0 ? 0 : value > maximum ? maximum : value;
+    if (options.rounding == Rounding::NearestEven) {
+        value = round_half_even(value);
+    } else if (options.rounding == Rounding::HalfUp) {
+        value = floor(value + .5);
+    }
+    return T(value > maximum ? maximum : value);
+}
+VCR_PIXEL inline uint8_t byte(float v) { return converted<uint8_t>(v, {}); }
 VCR_PIXEL inline uint32_t gray(int i,float low,float high) {
     const int lo=int(clamp(finite(low)?low:0,0,255));
     // A top endpoint of 255 still yields a well-defined one-unit span.

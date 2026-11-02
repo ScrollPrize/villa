@@ -121,7 +121,7 @@ void normalize_crop(T* values, std::size_t n, const Normalize& t, const std::uin
     double lo = stats[0].lo, hi = stats[0].hi;
     std::size_t count = 0;
     for (const auto& s : stats) { lo = std::min(lo, s.lo); hi = std::max(hi, s.hi); count += s.count; }
-    if (!count || lo == hi) {
+    if (!count || (lo == hi && t.eps == 0)) {
         for_parts(parts, [&](std::size_t p) {
             std::fill(values + p * grain, values + std::min(n, (p + 1) * grain), T{0});
         });

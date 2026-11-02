@@ -157,8 +157,8 @@ NB_MODULE(_transforms, m) {
 
     bind<BrightnessMultiply>(m, "BrightnessMultiply", [](auto& t, auto& a) { t.factor = parameter(a, "factor", t.factor); });
     bind<BrightnessAdd>(m, "BrightnessAdd", [](auto& t, auto& a) { t.shift = parameter(a, "shift", t.shift); });
-    bind<Contrast>(m, "Contrast", [](auto& t, auto& a) { t.factor = parameter(a, "factor", t.factor); t.preserve_range = a.get("preserve_range", t.preserve_range); });
-    bind<Gamma>(m, "Gamma", [](auto& t, auto& a) { t.gamma = parameter(a, "gamma", t.gamma); t.p_invert = a.get("p_invert", t.p_invert); t.p_retain_stats = a.get("p_retain_stats", t.p_retain_stats); });
+    bind<Contrast>(m, "Contrast", [](auto& t, auto& a) { t.factor = parameter(a, "factor", t.factor); t.preserve_range = a.get("preserve_range", t.preserve_range); t.masked = a.get("masked", t.masked); });
+    bind<Gamma>(m, "Gamma", [](auto& t, auto& a) { t.gamma = parameter(a, "gamma", t.gamma); t.p_invert = a.get("p_invert", t.p_invert); t.p_retain_stats = a.get("p_retain_stats", t.p_retain_stats); t.masked = a.get("masked", t.masked); t.clip = a.get("clip", t.clip); t.eps = a.get("eps", t.eps); });
     bind<Invert>(m, "Invert", [](auto&, auto&) {});
     bind<Normalize>(m, "Normalize", [](auto& t, auto& a) {
         const auto mode = a.get("mode", std::string("zscore"));

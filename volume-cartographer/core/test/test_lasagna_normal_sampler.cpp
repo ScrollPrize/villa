@@ -1,3 +1,4 @@
+#include <vc_reader/sampling.hpp>
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
 #include <doctest/doctest.h>
 
@@ -324,7 +325,7 @@ TEST_CASE("validity masks companion corners without diluting width or presence")
         const cv::Vec3d p(at(rng),at(rng),at(rng));
         LasagnaCubes cubes;
         readLasagnaCubes(m,std::span(&p,1),cubes);
-        largest=std::max(largest,std::abs(*sampleLasagnaChannel(m,p)-interpolateLasagnaCube(cubes.values[0],cubes.fractionsXYZ[0])));
+        largest=std::max(largest,std::abs(*sampleLasagnaChannel(m,p)-vcr::sampling::trilinear(cubes.values[0],cubes.fractionsXYZ[0])));
     }
     MESSAGE("largest scalar difference from the cube form: " << largest);
     CHECK(largest<1e-12);
@@ -335,10 +336,10 @@ TEST_CASE("validity masks companion corners without diluting width or presence")
     CHECK_FALSE(sampler.sampleNormal({1,1,1}).valid);
     std::array<uint8_t,8> a{},b{},v{};
     a[0]=255;b[0]=128;v[0]=255;
-    auto weights=lasagnaCornerWeights({.5f,.5f,.5f});
+    auto weights=vcr::sampling::cornerWeights({.5f,.5f,.5f});
     auto axis=interpolateLasagnaCompactAxisCorners(a,b,validLasagnaCornerWeights(weights,v));
     CHECK(std::abs(axis[0])==doctest::Approx(1)); CHECK(std::abs(axis[1])<1e-6);
-    auto zero=interpolateLasagnaCompactAxisCorners(a,b,validLasagnaCornerWeights(lasagnaCornerWeights({1,1,1}),v));
+    auto zero=interpolateLasagnaCompactAxisCorners(a,b,validLasagnaCornerWeights(vcr::sampling::cornerWeights({1,1,1}),v));
     CHECK(zero.dot(zero)==doctest::Approx(0));
     v.fill(255); CHECK(validLasagnaCornerWeights(weights,v)==weights);
     CHECK(sampler.masksInvalidCorners());

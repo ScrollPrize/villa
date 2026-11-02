@@ -10,45 +10,6 @@
 #include <cmath>
 #include <random>
 
-//somehow opencvs functions are pretty slow
-static cv::Vec3f normed(const cv::Vec3f& v)
-{
-    return v/sqrt(v[0]*v[0]+v[1]*v[1]+v[2]*v[2]);
-}
-
-static cv::Vec2f vmin(const cv::Vec2f &a, const cv::Vec2f &b)
-{
-    return {std::min(a[0],b[0]),std::min(a[1],b[1])};
-}
-
-static cv::Vec2f vmax(const cv::Vec2f &a, const cv::Vec2f &b)
-{
-    return {std::max(a[0],b[0]),std::max(a[1],b[1])};
-}
-
-template <typename E>
-static E at_int_impl(const cv::Mat_<E> &points, const cv::Vec2f& p)
-{
-    int x = p[0];
-    int y = p[1];
-    float fx = p[0]-x;
-    float fy = p[1]-y;
-
-    const E& p00 = points(y,x);
-    const E& p01 = points(y,x+1);
-    const E& p10 = points(y+1,x);
-    const E& p11 = points(y+1,x+1);
-
-    E p0 = (1-fx)*p00 + fx*p01;
-    E p1 = (1-fx)*p10 + fx*p11;
-
-    return (1-fy)*p0 + fy*p1;
-}
-// Note (2026-04): explicit row-pointer hoisting was tried here and
-// benchmarked ~23% slower than the operator()-based form above. The
-// compiler's CSE handles the stride-multiply fine; manual hoisting
-// defeats some optimization pass on this codepath. Leaving as-is.
-
 template<typename T, int C>
 static bool loc_valid_impl(const cv::Mat_<cv::Vec<T,C>> &m, const cv::Vec2d &l)
 {
@@ -111,18 +72,6 @@ static bool loc_valid_xy_impl(const cv::Mat_<cv::Vec<T,C>> &m, const cv::Vec2d &
 static bool loc_valid_xy_scalar(const cv::Mat_<float> &m, const cv::Vec2d &l)
 {
     return loc_valid_scalar(m, {l[1],l[0]});
-}
-
-cv::Vec3f at_int(const cv::Mat_<cv::Vec3f> &points, const cv::Vec2f &p) {
-    return at_int_impl(points, p);
-}
-
-float at_int(const cv::Mat_<float> &points, const cv::Vec2f& p) {
-    return at_int_impl(points, p);
-}
-
-cv::Vec3d at_int(const cv::Mat_<cv::Vec3d> &points, const cv::Vec2f& p) {
-    return at_int_impl(points, p);
 }
 
 bool loc_valid(const cv::Mat_<cv::Vec3f> &m, const cv::Vec2d &l) {

@@ -1,5 +1,6 @@
 // Zarr array metadata normalized for source chunks and decoded disk caches.
 #include "vc_reader/reader.hpp"
+#include "format.hpp"
 #include "vc_reader/zarr.hpp"
 #include "vc_reader/array.hpp"
 #include "vc_reader/native/rounding.hpp"
@@ -196,11 +197,7 @@ ArrayMeta parseArrayMeta(const Json& input)
     m.raw = d;
     m.shape = d.at("shape").get<Index>();
     m.chunks = d.at("chunks").get<Index>();
-    if (m.shape.empty() || m.shape.size() != m.chunks.size())
-        throw std::invalid_argument("Zarr shape and chunks must have the same nonzero rank");
-    for (std::size_t i = 0; i < m.shape.size(); ++i)
-        if (m.shape[i] < 0 || m.chunks[i] <= 0)
-            throw std::invalid_argument("invalid Zarr shape or chunks");
+    detail::validateShape(m.shape, m.chunks);
     if (!d.at("dtype").is_string())
         throw std::invalid_argument("structured Zarr dtypes are not supported");
     const auto t = parseTypestr(d.at("dtype").get<std::string>());

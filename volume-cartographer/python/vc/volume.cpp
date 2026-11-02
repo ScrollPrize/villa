@@ -1,3 +1,4 @@
+#include <vc_reader/transforms.hpp>
 #include <nanobind/nanobind.h>
 #include <nanobind/ndarray.h>
 #include <nanobind/stl/array.h>
@@ -309,101 +310,50 @@ nb::ndarray<float, nb::numpy, nb::c_contig> fiber3DValueTransform(
     }
     if (pointCount > std::numeric_limits<size_t>::max() / sizeof(float))
         throw nb::value_error("volume allocation overflows size_t");
-    if (normalization != "none" && normalization != "raw" &&
-        normalization != "identity" && normalization != "zscore" &&
-        normalization != "minmax") {
+    if (normalization != "none" && normalization != "raw" && normalization != "identity" &&
+        normalization != "zscore" && normalization != "minmax")
         throw nb::value_error("unsupported image normalization");
-    }
-    if (!std::isfinite(contrast) || contrast <= 0.0f ||
-        !std::isfinite(brightness) ||
-        !std::isfinite(gamma) || gamma <= 0.0f) {
-        throw nb::value_error(
-            "contrast and gamma must be positive and all parameters finite");
-    }
-
+    if (!std::isfinite(contrast) || contrast <= 0 || !std::isfinite(brightness) ||
+        !std::isfinite(gamma) || gamma <= 0)
+        throw nb::value_error("contrast and gamma must be positive and all parameters finite");
     std::vector<float> output(pointCount);
-    const float* source = volume.data();
-    const bool* mask = validMask.data();
     {
         nb::gil_scoped_release release;
-        size_t validCount = 0;
-        double sum = 0.0;
-        float sourceMin = std::numeric_limits<float>::infinity();
-        float sourceMax = -std::numeric_limits<float>::infinity();
-        for (size_t index = 0; index < pointCount; ++index) {
-            if (!mask[index])
-                continue;
-            const float value = source[index];
-            sum += static_cast<double>(value);
-            sourceMin = std::min(sourceMin, value);
-            sourceMax = std::max(sourceMax, value);
-            ++validCount;
-        }
-        const bool anyValid = validCount != 0;
-        if (!anyValid) {
-            for (size_t index = 0; index < pointCount; ++index) {
-                const float value = source[index];
-                sum += static_cast<double>(value);
-                sourceMin = std::min(sourceMin, value);
-                sourceMax = std::max(sourceMax, value);
-            }
-            validCount = pointCount;
-        }
-
-        const float sourceMean = static_cast<float>(
-            sum / static_cast<double>(validCount));
-        float normalizeDivisor = 1.0f;
-        const bool useZscore = anyValid && normalization == "zscore";
-        const bool useMinmax = anyValid && normalization == "minmax";
-        if (useZscore) {
-            double squared = 0.0;
-            size_t varianceCount = 0;
-            for (size_t index = 0; index < pointCount; ++index) {
-                if (mask[index]) {
-                    const double delta = static_cast<double>(source[index]) -
-                                         static_cast<double>(sourceMean);
-                    squared += delta * delta;
-                    ++varianceCount;
-                }
-            }
-            const float standardDeviation = std::max(
-                1.0e-6f,
-                static_cast<float>(std::sqrt(
-                    squared / static_cast<double>(varianceCount))));
-            normalizeDivisor = standardDeviation;
-        } else if (useMinmax) {
-            normalizeDivisor = std::max(1.0e-6f, sourceMax - sourceMin);
-        }
-
-        const auto normalizeValue = [&](float value) {
-            if (useZscore)
-                return (value - sourceMean) / normalizeDivisor;
-            if (useMinmax)
-                return (value - sourceMin) / normalizeDivisor;
-            return value;
+        namespace tr = vcr::transforms;
+        tr::Shape dimensions{1, shape[0], shape[1], shape[2]};
+        tr::Array image(dimensions, 'f', sizeof(float)), mask(dimensions, 'u', 1);
+        std::memcpy(image.data(), volume.data(), pointCount * sizeof(float));
+        std::memcpy(mask.data(), validMask.data(), pointCount);
+        tr::Target imageTarget, maskTarget;
+        imageTarget.refill = false;
+        maskTarget.role = tr::Role::Valid;
+        tr::Sample sample{{"image", {std::move(image), imageTarget}},
+                          {"padding_mask", {std::move(mask), maskTarget}}};
+        tr::Random random{0};
+        const auto apply = [&](const auto& operation) {
+            tr::apply(operation, sample, tr::sample(operation, sample, random));
         };
-        const float normalizedMean = normalizeValue(sourceMean);
-        const auto transformValue = [&](float value) {
-            const float normalized = normalizeValue(value);
-            return (normalized - normalizedMean) * contrast +
-                   normalizedMean + brightness;
-        };
-        const float transformedMin = transformValue(sourceMin);
-        const float transformedMax = transformValue(sourceMax);
-        const float transformedRange = std::max(
-            1.0e-6f, transformedMax - transformedMin);
-        for (size_t index = 0; index < pointCount; ++index) {
-            float value = transformValue(source[index]);
-            if (gamma != 1.0f) {
-                const float unit = std::clamp(
-                    (value - transformedMin) / transformedRange, 0.0f, 1.0f);
-                value = std::pow(unit, gamma) *
-                            (transformedMax - transformedMin) +
-                        transformedMin;
-            }
-            output[index] = value;
+        if (std::any_of(validMask.data(), validMask.data() + pointCount, [](bool v) { return v; }) &&
+            (normalization == "zscore" || normalization == "minmax")) {
+            tr::Normalize op;
+            op.mode = normalization == "zscore" ? tr::Normalization::ZScore : tr::Normalization::MinMax;
+            op.nonzero = false; op.masked = true; op.eps = 1e-6;
+            apply(op);
         }
+        tr::Contrast contrastOp;
+        contrastOp.factor = double(contrast); contrastOp.preserve_range = false; contrastOp.masked = true;
+        apply(contrastOp);
+        tr::BrightnessAdd brightnessOp;
+        brightnessOp.shift = double(brightness);
+        apply(brightnessOp);
+        if (gamma != 1) {
+            tr::Gamma op;
+            op.gamma = double(gamma); op.masked = true; op.clip = true; op.eps = 1e-6;
+            apply(op);
+        }
+        std::memcpy(output.data(), sample.at("image").array.data(), pointCount * sizeof(float));
     }
+
     return makeNumpyArray<float>(std::move(output), shape);
 }
 

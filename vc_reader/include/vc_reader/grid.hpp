@@ -95,7 +95,11 @@ public:
     // xyz + d * normal. Either output may be null.
     void resample(const Raster& raster, float* xyz, float* normals) const;
     // The same at `n` real-valued grid positions (`xy`: column, row pairs).
-    void pointsAt(const float* xy, std::size_t n, float* xyz, float* normals) const;
+    // Optional tangents are derivatives of XYZ with respect to grid column/row,
+    // before spacing or normal normalization, from the same position patch.
+    // Position-only queries also accept patches with undefined (zero-area) normals.
+    void pointsAt(const float* xy, std::size_t n, float* xyz, float* normals,
+                  float* columnTangents = nullptr, float* rowTangents = nullptr) const;
 
     struct Impl;
 

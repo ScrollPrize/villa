@@ -1,3 +1,4 @@
+#include <vc_reader/sampling.hpp>
 #include "vc/lasagna/LasagnaNormalSampler.hpp"
 #include "vc/lasagna/ChannelSampler.hpp"
 
@@ -309,11 +310,11 @@ public:
                 if (densityBatch.valid[local] == 0 ||
                     normalBatch.valid[local] == 0)
                     return;
-                const auto densityWeights = lasagnaCornerWeights(
+                const auto densityWeights = vcr::sampling::cornerWeights(
                     densityBatch.fractionsXYZ[local]);
-                const auto normalWeights = lasagnaCornerWeights(
+                const auto normalWeights = vcr::sampling::cornerWeights(
                     normalBatch.fractionsXYZ[local]);
-                const double encodedDensity = interpolateLasagnaCorners(
+                const double encodedDensity = vcr::sampling::weightedCorners(
                     densityBatch.values[0][local], densityWeights);
                 if (!(encodedDensity >= 0.0))
                     return;
@@ -457,9 +458,9 @@ public:
                 samples[index] = {};
                 return;
             }
-            const auto weights = lasagnaCornerWeights(corners.fractionsXYZ[index]);
+            const auto weights = vcr::sampling::cornerWeights(corners.fractionsXYZ[index]);
             const auto& gradMag = corners.values[firstVolume][index];
-            if (!(interpolateLasagnaCorners(gradMag, weights) > 0.0f)) {
+            if (!(vcr::sampling::weightedCorners(gradMag, weights.data()) > 0.0f)) {
                 samples[index] = {};
                 return;
             }
@@ -544,8 +545,8 @@ public:
                     samples[index] = invalidNormal("missing Lasagna grad_mag sample");
                     return;
                 }
-                const auto weights = lasagnaCornerWeights(corners.fractionsXYZ[index]);
-                if (!(interpolateLasagnaCorners(corners.values[0][index], weights) > 0.0f)) {
+                const auto weights = vcr::sampling::cornerWeights(corners.fractionsXYZ[index]);
+                if (!(vcr::sampling::weightedCorners(corners.values[0][index], weights.data()) > 0.0f)) {
                     samples[index] = invalidNormal("Lasagna grad_mag sample is zero");
                     return;
                 }
@@ -569,7 +570,7 @@ public:
                     samples[index] = invalidNormal("missing Lasagna grad_mag sample");
                     return;
                 }
-                if (interpolateLasagnaCube(gradMag.values[index], gradMag.fractionsXYZ[index]) <= 0.0) {
+                if (vcr::sampling::trilinear(gradMag.values[index], gradMag.fractionsXYZ[index]) <= 0.0) {
                     samples[index] = invalidNormal("Lasagna grad_mag sample is zero");
                     return;
                 }

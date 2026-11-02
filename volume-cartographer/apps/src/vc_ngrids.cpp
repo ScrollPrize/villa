@@ -1,3 +1,4 @@
+#include <vc_reader/sampling.hpp>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -1136,59 +1137,16 @@ static void run_vis_normals_zarr_on_surf_edges_as_ply(
         const double gy = (static_cast<double>(p_xyz.y) - origin_xyz[1]) / static_cast<double>(step);
         const double gz = (static_cast<double>(p_xyz.z) - origin_xyz[2]) / static_cast<double>(step);
 
-        int x0 = static_cast<int>(std::floor(gx));
-        int y0 = static_cast<int>(std::floor(gy));
-        int z0 = static_cast<int>(std::floor(gz));
-        x0 = std::clamp(x0, 0, static_cast<int>(X) - 2);
-        y0 = std::clamp(y0, 0, static_cast<int>(Y) - 2);
-        z0 = std::clamp(z0, 0, static_cast<int>(Z) - 2);
-        const int x1 = x0 + 1;
-        const int y1 = y0 + 1;
-        const int z1 = z0 + 1;
-
-        if (is_fill(static_cast<size_t>(z0), static_cast<size_t>(y0), static_cast<size_t>(x0)) ||
-            is_fill(static_cast<size_t>(z1), static_cast<size_t>(y0), static_cast<size_t>(x0)) ||
-            is_fill(static_cast<size_t>(z0), static_cast<size_t>(y1), static_cast<size_t>(x0)) ||
-            is_fill(static_cast<size_t>(z1), static_cast<size_t>(y1), static_cast<size_t>(x0)) ||
-            is_fill(static_cast<size_t>(z0), static_cast<size_t>(y0), static_cast<size_t>(x1)) ||
-            is_fill(static_cast<size_t>(z1), static_cast<size_t>(y0), static_cast<size_t>(x1)) ||
-            is_fill(static_cast<size_t>(z0), static_cast<size_t>(y1), static_cast<size_t>(x1)) ||
-            is_fill(static_cast<size_t>(z1), static_cast<size_t>(y1), static_cast<size_t>(x1))) {
-            return false;
-        }
-
-        double tx = gx - x0;
-        double ty = gy - y0;
-        double tz = gz - z0;
-        tx = std::clamp(tx, 0.0, 1.0);
-        ty = std::clamp(ty, 0.0, 1.0);
-        tz = std::clamp(tz, 0.0, 1.0);
-
-        auto lerp = [](double a, double b, double t) { return (1.0 - t) * a + t * b; };
-        auto tri = [&](double c000, double c100, double c010, double c110,
-                       double c001, double c101, double c011, double c111) -> double {
-            const double c00 = lerp(c000, c001, tx);
-            const double c01 = lerp(c010, c011, tx);
-            const double c10 = lerp(c100, c101, tx);
-            const double c11 = lerp(c110, c111, tx);
-            const double c0 = lerp(c00, c01, ty);
-            const double c1 = lerp(c10, c11, ty);
-            return lerp(c0, c1, tz);
+        const int shapeZYX[3]{int(Z),int(Y),int(X)};
+        const double xyz[3]{gx,gy,gz};
+        const auto valid = [&](int z,int y,int x) { return !is_fill(z,y,x); };
+        const auto sample = [&](const std::vector<uint8_t>& field,double& out) {
+            return vcr::sampling::sampleCube([&](int z,int y,int x) {
+                return double(decode(field[(size_t(z)*Y+size_t(y))*X+size_t(x)]));
+            },valid,shapeZYX,xyz,out);
         };
-
-        auto c = [&](const std::vector<uint8_t>& a, int zz, int yy, int xx) -> double {
-            return static_cast<double>(decode(a[static_cast<size_t>(zz) * Y * X + static_cast<size_t>(yy) * X + static_cast<size_t>(xx)]));
-        };
-
-        const double nx = tri(
-            c(ax, z0, y0, x0), c(ax, z1, y0, x0), c(ax, z0, y1, x0), c(ax, z1, y1, x0),
-            c(ax, z0, y0, x1), c(ax, z1, y0, x1), c(ax, z0, y1, x1), c(ax, z1, y1, x1));
-        const double ny = tri(
-            c(ay, z0, y0, x0), c(ay, z1, y0, x0), c(ay, z0, y1, x0), c(ay, z1, y1, x0),
-            c(ay, z0, y0, x1), c(ay, z1, y0, x1), c(ay, z0, y1, x1), c(ay, z1, y1, x1));
-        const double nz = tri(
-            c(az, z0, y0, x0), c(az, z1, y0, x0), c(az, z0, y1, x0), c(az, z1, y1, x0),
-            c(az, z0, y0, x1), c(az, z1, y0, x1), c(az, z0, y1, x1), c(az, z1, y1, x1));
+        double nx,ny,nz;
+        if(!sample(ax,nx)||!sample(ay,ny)||!sample(az,nz))return false;
 
         const double nlen2 = nx * nx + ny * ny + nz * nz;
         if (!(nlen2 > 1e-24)) return false;

@@ -1,3 +1,4 @@
+#include "../sampling_math.hpp"
 // Points on a surface stored as a grid of vertices, at real-valued grid positions:
 // the position and the unit normal, shared by the CPU and CUDA samplers.
 #pragma once
@@ -66,7 +67,7 @@ VCR_POINTS_HD inline Hermite hermite(float t)
 // (optional) the move in output coordinates per unit of physical offset along the unit
 // physical normal (destination's linear part applied to the normal).
 VCR_POINTS_HD VCR_POINTS_FLATTEN inline bool point(const PointMap& g, const GridView& v, float x, float y, float* point,
-                                                   float* step = nullptr)
+                                                   float* step = nullptr, float* columnTangent = nullptr, float* rowTangent = nullptr)
 {
     using geometry::V;
     using geometry::vector;
@@ -101,10 +102,15 @@ VCR_POINTS_HD VCR_POINTS_FLATTEN inline bool point(const PointMap& g, const Grid
         du = q0u * by.p0 + r0u * by.m0 + q1u * by.p1 + r1u * by.m1;
         dv = q0 * by.dp0 + r0 * by.dm0 + q1 * by.dp1 + r1 * by.dm1;
     } else {
-        position = (p[0] * (1 - u) + p[1] * u) * (1 - w) + (p[2] * (1 - u) + p[3] * u) * w;
+        position = sampling::bilinear(p[0], p[1], p[2], p[3], u, w);
         du = (p[1] - p[0]) * (1 - w) + (p[3] - p[2]) * w;
         dv = (p[2] - p[0]) * (1 - u) + (p[3] - p[1]) * u;
     }
+    if (!geometry::finite(position)) return false;
+    geometry::store(point, position);
+    if (columnTangent) geometry::store(columnTangent, du);
+    if (rowTangent) geometry::store(rowTangent, dv);
+    if (!step) return true;
     V n = geometry::cross(geometry::linear(g.physical, du), geometry::linear(g.physical, dv)) * g.orientation;
     if (v.normals) {
         V m[4];
@@ -120,9 +126,6 @@ VCR_POINTS_HD VCR_POINTS_FLATTEN inline bool point(const PointMap& g, const Grid
         return false;
     n = n * (1 / scale);
     n = n * (1 / sqrtf(geometry::dot(n, n)));
-    if (!geometry::finite(position))
-        return false;
-    geometry::store(point, position);
     if (step)
         geometry::store(step, geometry::linear(g.destination, n));
     return true;

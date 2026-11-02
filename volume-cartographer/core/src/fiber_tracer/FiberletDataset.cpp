@@ -447,42 +447,18 @@ json arrayMetadata(const FiberletDatasetMetadata& metadata, FiberletStorageChunk
     const int codecVersion = kind == FiberletStorageChunkKind::FiberletRoutes ? 3
                              : (kind == FiberletStorageChunkKind::FiberTraces || kind == FiberletStorageChunkKind::PublishedFiberlets) ? 1
                                                                              : 2;
-    json result = {
-        {"zarr_format", 2},
-        {"shape", metadata.chunkGridShapeZYX},
-        {"chunks", {1, 1, 1}},
-        {"dtype", "|O"},
-        {"fill_value", nullptr},
-        {"order", "C"},
-        {"filters", {{{"id", "vc-fiberlet-chunk"}, {"codec_version", codecVersion}, {"sample_format", sampleFormat}}}},
-        {"compressor", nullptr},
-    };
-    if (metadata.kind == FiberletDatasetKind::Published)
-        result["dimension_separator"] = "/";
-    return result;
-}
-
-std::string readText(const std::filesystem::path& path)
-{
-    std::ifstream input(path, std::ios::binary);
-    if (!input)
-        throw std::runtime_error("cannot open " + path.string());
-    return std::string(std::istreambuf_iterator<char>(input), {});
+    return vcr::zarr::objectArrayDocument(
+        {metadata.chunkGridShapeZYX.begin(), metadata.chunkGridShapeZYX.end()}, {1,1,1},
+        {{{"id", "vc-fiberlet-chunk"}, {"codec_version", codecVersion}, {"sample_format", sampleFormat}}},
+        metadata.kind == FiberletDatasetKind::Published ? "/" : "");
 }
 
 std::optional<std::vector<std::byte>> readBytes(const std::filesystem::path& path)
 {
-    std::ifstream input(path, std::ios::binary | std::ios::ate);
-    if (!input)
-        return std::nullopt;
-    const auto end = input.tellg();
-    if (end < 0)
-        throw std::runtime_error("cannot size " + path.string());
-    std::vector<std::byte> result(static_cast<std::size_t>(end));
-    input.seekg(0);
-    input.read(reinterpret_cast<char*>(result.data()), static_cast<std::streamsize>(result.size()));
-    if (!input)
-        throw std::runtime_error("cannot read " + path.string());
+    const auto bytes = vcr::zarr::Store(path.parent_path()).read(path.filename().string());
+    if (!bytes) return std::nullopt;
+    std::vector<std::byte> result(bytes->size());
+    std::memcpy(result.data(), bytes->data(), bytes->size());
     return result;
 }
 
@@ -515,62 +491,17 @@ std::string expectedChunkDigest(
     return "fnv256:" + hexFingerprint(datasetFingerprint(canonical));
 }
 
-bool parseNonnegativeInt(std::string_view text, int& value)
-{
-    if (text.empty())
-        return false;
-    int parsed = 0;
-    const auto result = std::from_chars(
-        text.data(), text.data() + text.size(), parsed);
-    if (result.ec != std::errc{} || result.ptr != text.data() + text.size() ||
-        parsed < 0)
-        return false;
-    value = parsed;
-    return true;
-}
-
 std::vector<FiberletChunkKey> publishedPhysicalChunks(
     const std::filesystem::path& root)
 {
     const auto array = root / "fiberlets";
-    const auto arrayCanonical = std::filesystem::weakly_canonical(array);
     std::vector<FiberletChunkKey> result;
-    if (!std::filesystem::is_directory(array))
-        return result;
-    for (const auto& entry :
-        std::filesystem::recursive_directory_iterator(array)) {
-        if (!entry.is_regular_file())
-            continue;
-        const auto resolvedRelative = std::filesystem::weakly_canonical(
-            entry.path()).lexically_relative(arrayCanonical);
-        if (resolvedRelative.empty() || *resolvedRelative.begin() == "..")
-            throw std::invalid_argument(
-                "published fiberlet chunk path escapes its array root");
-        const auto relative = std::filesystem::relative(entry.path(), array);
-        if (relative == ".zarray")
-            continue;
-        const auto components = std::distance(relative.begin(), relative.end());
-        if (components != 3)
-            throw std::invalid_argument(
-                "published fiberlet array contains an unexpected file: " +
-                relative.string());
-        auto it = relative.begin();
-        int z = 0;
-        int y = 0;
-        int x = 0;
-        if (!parseNonnegativeInt(it++->string(), z) ||
-            !parseNonnegativeInt(it++->string(), y) ||
-            !parseNonnegativeInt(it->string(), x)) {
-            throw std::invalid_argument(
-                "published fiberlet array contains an invalid chunk key: " +
-                relative.string());
-        }
-        result.push_back({0, z, y, x});
+    if (!std::filesystem::is_directory(array)) return result;
+    for (const auto& index : vcr::zarr::inventory(array, {}, true).chunks) {
+        if (index.size()!=3 || std::any_of(index.begin(),index.end(),[](auto i){return i>std::numeric_limits<int>::max();}))
+            throw std::invalid_argument("invalid fiberlet chunk index");
+        result.push_back({0,int(index[0]),int(index[1]),int(index[2])});
     }
-    std::sort(result.begin(), result.end(), [](const auto& left, const auto& right) {
-        return std::tie(left.iz, left.iy, left.ix) <
-            std::tie(right.iz, right.iy, right.ix);
-    });
     return result;
 }
 
@@ -952,27 +883,25 @@ std::shared_ptr<FiberletChunkDataset> FiberletChunkDataset::createOrOpen(
     const auto expected = metadataJson(metadata);
     auto effectiveMetadata = metadata;
     if (std::filesystem::exists(root / ".zattrs")) {
-        const auto group = json::parse(readText(root / ".zgroup"));
-        if (group != json{{"zarr_format", 2}})
-            throw std::invalid_argument("fiberlet dataset .zgroup metadata is invalid");
-        const auto parsed = parseMetadata(vcr::zarr::readAttributes(root));
+        auto group = vcr::zarr::Group::open(root.string(), {});
+        if (group.version() != 2) throw std::invalid_argument("fiberlet dataset requires a Zarr v2 group");
+        const auto parsed = parseMetadata(group.attributes());
         if (!fiberletDatasetMetadataCompatible(parsed, metadata))
             throw std::invalid_argument("fiberlet dataset metadata does not match the requested configuration");
         effectiveMetadata = parsed;
         for (const auto kind : datasetKinds(metadata.kind)) {
-            const auto storedArray = json::parse(readText(arrayDirectory(root, kind) / ".zarray"));
-            if (storedArray != arrayMetadata(metadata, kind))
+            const auto node = group.node(arrayDirectory(root, kind).filename().string());
+            if (!node || node->first != vcr::zarr::Group::NodeKind::Array || node->second != arrayMetadata(metadata, kind))
                 throw std::invalid_argument("fiberlet dataset .zarray metadata is invalid");
         }
         removeLegacyBookkeeping(root);
     } else {
-        // The dataset is a Zarr group (.zgroup, .zattrs) whose arrays' .zarray vc_reader's
-        // writer cannot express (|O), so those stay written here.
         vcr::zarr::createGroup(root, std::optional<vcr::zarr::Json>(expected), 2, {}, vcr::zarr::Durability::Fsync);
         for (const auto kind : datasetKinds(metadata.kind)) {
             const auto directory = arrayDirectory(root, kind);
-            std::filesystem::create_directories(directory);
-            vcr::zarr::atomicWrite(directory / ".zarray", arrayMetadata(metadata, kind).dump(2) + "\n", vcr::zarr::Durability::Fsync);
+            const auto spec = arrayMetadata(metadata, kind);
+            vcr::zarr::createObjectArray(directory, spec["shape"].get<vcr::Index>(), spec["chunks"].get<vcr::Index>(),
+                spec["filters"], spec.value("dimension_separator", std::string()), {}, vcr::zarr::Durability::Fsync);
         }
         removeLegacyBookkeeping(root);
     }
@@ -988,14 +917,12 @@ std::shared_ptr<FiberletChunkDataset> FiberletChunkDataset::openExisting(
         throw std::invalid_argument(
             "fiberlet dataset is missing .zgroup or .zattrs metadata");
     }
-    const auto group = json::parse(readText(root / ".zgroup"));
-    if (group != json{{"zarr_format", 2}})
-        throw std::invalid_argument("fiberlet dataset .zgroup metadata is invalid");
-    auto metadata = parseMetadata(vcr::zarr::readAttributes(root));
+    auto group = vcr::zarr::Group::open(root.string(), {});
+    if (group.version() != 2) throw std::invalid_argument("fiberlet dataset requires a Zarr v2 group");
+    auto metadata = parseMetadata(group.attributes());
     for (const auto kind : datasetKinds(metadata.kind)) {
-        const auto storedArray = json::parse(
-            readText(arrayDirectory(root, kind) / ".zarray"));
-        if (storedArray != arrayMetadata(metadata, kind))
+        const auto node = group.node(arrayDirectory(root, kind).filename().string());
+        if (!node || node->first != vcr::zarr::Group::NodeKind::Array || node->second != arrayMetadata(metadata, kind))
             throw std::invalid_argument(
                 "fiberlet dataset .zarray metadata is invalid");
     }
@@ -1029,7 +956,9 @@ bool FiberletChunkDataset::datasetComplete() const
     if (metadata_.buildState != FiberletDatasetBuildState::Complete ||
         !metadata_.expectedChunkCount || !metadata_.expectedChunkDigest)
         return false;
-    const auto physical = publishedPhysicalChunks(root_);
+    std::vector<FiberletChunkKey> physical;
+    try { physical = publishedPhysicalChunks(root_); }
+    catch (const std::invalid_argument&) { return false; }
     if (physical.size() != *metadata_.expectedChunkCount ||
         expectedChunkDigest(physical) != *metadata_.expectedChunkDigest)
         return false;
@@ -1199,12 +1128,9 @@ FiberletChunkKey FiberletChunkDataset::chunkOwningAnchor(
 std::filesystem::path FiberletChunkDataset::chunkPath(FiberletStorageChunkKind kind, const FiberletChunkKey& key) const
 {
     (void)codecConfig(kind, key);
-    if (metadata_.kind == FiberletDatasetKind::Published) {
-        return arrayDirectory(root_, FiberletStorageChunkKind::PublishedFiberlets) /
-            std::to_string(key.iz) / std::to_string(key.iy) /
-            std::to_string(key.ix);
-    }
-    return arrayDirectory(root_, kind) / (std::to_string(key.iz) + "." + std::to_string(key.iy) + "." + std::to_string(key.ix));
+    const bool published = metadata_.kind == FiberletDatasetKind::Published;
+    return arrayDirectory(root_, published ? FiberletStorageChunkKind::PublishedFiberlets : kind) /
+        vcr::chunkKey({key.iz, key.iy, key.ix}, published ? "/" : ".");
 }
 
 std::optional<std::vector<std::byte>> FiberletChunkDataset::readChunk(FiberletStorageChunkKind kind, const FiberletChunkKey& key) const

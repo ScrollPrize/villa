@@ -1,3 +1,4 @@
+#include <vc_reader/sampling.hpp>
 #include "vc/lasagna/ChannelSampler.hpp"
 #include "vc/core/util/PortableTensor.hpp"
 
@@ -273,26 +274,7 @@ template <class Real>
            z <= static_cast<Real>(binding.shapeZYX[0] - 1);
 }
 
-template <class Real>
-[[nodiscard]] Real cornerWeight(size_t k, const cv::Vec<Real, 3>& f)
-{
-    return ((k & 1) ? f[0] : 1 - f[0]) * ((k & 2) ? f[1] : 1 - f[1]) * ((k & 4) ? f[2] : 1 - f[2]);
-}
-
 using vc::core::portable::normalizedFloatOrZero;
-
-[[nodiscard]] std::array<float, 8> cornerWeights(const cv::Vec3f& fractionXYZ)
-{
-    const float fx = fractionXYZ[0];
-    const float fy = fractionXYZ[1];
-    const float fz = fractionXYZ[2];
-    const float ax = 1.0f - fx;
-    const float ay = 1.0f - fy;
-    const float az = 1.0f - fz;
-    return {
-        az * ay * ax, az * ay * fx, az * fy * ax, az * fy * fx,
-        fz * ay * ax, fz * ay * fx, fz * fy * ax, fz * fy * fx};
-}
 
 struct DecodedCompactNormalFloat {
     // Two padding lanes permit one vector load, no overread into the next entry.
@@ -558,16 +540,6 @@ void readLasagnaCubes(
         std::copy_n(values.begin() + std::ptrdiff_t(distinct.of[i]) * 8, 8, cubes.values[points[i]].begin());
 }
 
-double interpolateLasagnaCube(const std::array<double, 8>& values, const cv::Vec3d& f)
-{
-    const double c00 = values[0] * (1.0 - f[0]) + values[1] * f[0];
-    const double c01 = values[2] * (1.0 - f[0]) + values[3] * f[0];
-    const double c10 = values[4] * (1.0 - f[0]) + values[5] * f[0];
-    const double c11 = values[6] * (1.0 - f[0]) + values[7] * f[0];
-    const double c0 = c00 * (1.0 - f[1]) + c01 * f[1];
-    const double c1 = c10 * (1.0 - f[1]) + c11 * f[1];
-    return c0 * (1.0 - f[2]) + c1 * f[2];
-}
 
 namespace {
 template<class Value, class Skip>
@@ -579,7 +551,7 @@ LasagnaCompactTensor accumulateCompactTensor(
     LasagnaCompactTensor tensor;
     auto& [t00, t01, t02, t11, t12, t22, hint, totalWeight] = tensor;
     for (size_t k = 0; k < 8; ++k) {
-        const double weight = cornerWeight(k, fraction);
+        const double weight = vcr::sampling::cornerWeight(k, fraction.val);
         if (weight <= 0.0 || skip(k))
             continue;
         const auto& decoded =
@@ -639,26 +611,6 @@ std::optional<cv::Vec3d> interpolateLasagnaCompactTensorCorners(
     const cv::Vec3d& fraction, const std::array<uint8_t, 8>& mask)
 {
     return finalizeLasagnaCompactTensor(accumulateLasagnaCompactTensorCorners(nxValues, nyValues, fraction, mask));
-}
-
-std::optional<double> interpolateLasagnaMaskedScalarCorners(
-    const std::array<double, 8>& samples, const cv::Vec3d& fraction, const std::array<uint8_t, 8>& mask)
-{
-    if (std::all_of(mask.begin(), mask.end(), [](uint8_t v) { return v != 0; }))
-        return interpolateLasagnaCube(samples, fraction);
-    double sum = 0, denominator = 0;
-    for (size_t k = 0; k < 8; ++k) {
-        if (!mask[k])
-            continue;
-        const double weight = cornerWeight(k, fraction);
-        if (weight > 0) {
-            sum += weight * samples[k];
-            denominator += weight;
-        }
-    }
-    if (denominator > 0)
-        return sum / denominator;
-    return std::nullopt;
 }
 
 std::optional<double> sampleLasagnaChannel(
@@ -727,14 +679,13 @@ void sampleLasagnaVectorBatch(const std::vector<LasagnaChannelBinding>& channels
             if (!cubes[c].valid[i]) { vector.clear(); break; }
             const auto& values = cubes[c].values[i];
             const auto& f = cubes[c].fractionsXYZ[i];
-            std::optional<double> value = interpolateLasagnaCube(values, f);
+            std::optional<double> value = vcr::sampling::trilinear(values, f.val);
             if (masked) {
-                double sum = 0, denom = 0;
-                for (size_t k = 0; k < 8; ++k) if (byteValue(mask.values[i][k])) {
-                    const double w = cornerWeight(k, f);
-                    if (w > 0) { sum += w * values[k]; denom += w; }
-                }
-                value = denom > 0 ? std::optional<double>(sum / denom) : std::nullopt;
+                std::array<uint8_t, 8> valid{};
+                for (size_t k = 0; k < 8; ++k) valid[k] = byteValue(mask.values[i][k]) != 0;
+                double sampled;
+                value = vcr::sampling::maskedTrilinear(values, valid, f.val, sampled, vcr::sampling::Accumulation::Weighted)
+                    ? std::optional<double>(sampled) : std::nullopt;
             }
             if (!value || !std::isfinite(*value)) { vector.clear(); break; }
             vector.push_back(static_cast<float>(*value));
@@ -743,21 +694,6 @@ void sampleLasagnaVectorBatch(const std::vector<LasagnaChannelBinding>& channels
         if (vector.size() != channels.size() || !std::isfinite(norm2) || (normalize && norm2 <= 1e-16)) vector.clear();
         else if (normalize) for (auto& v : vector) v /= static_cast<float>(std::sqrt(norm2));
     }
-}
-
-std::array<float, 8> lasagnaCornerWeights(const cv::Vec3f& fractionXYZ)
-{
-    return cornerWeights(fractionXYZ);
-}
-
-float interpolateLasagnaCorners(
-    const std::array<uint8_t, 8>& values,
-    const std::array<float, 8>& weights)
-{
-    float value = 0.0f;
-    for (size_t corner = 0; corner < weights.size(); ++corner)
-        value = std::fma(weights[corner], static_cast<float>(values[corner]), value);
-    return value;
 }
 
 std::array<float, 8> validLasagnaCornerWeights(

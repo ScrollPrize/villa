@@ -136,10 +136,7 @@ LazySurfaceGeometry readLazySurfaceGeometry(const std::filesystem::path& path,
         scale = cv::Vec2f(float(disk[1]), float(disk[0]));
     }
 
-    // The grid's shape from x.tif alone, as a plain image source.
-    vcr::sources::SourceReader xReader(vcr::sources::imageSource((path / "x.tif").string()), {});
-    const auto height = xReader.shape()[0];
-    const auto width = xReader.shape()[1];
+    const auto [height, width] = vcr::tifxyz::storedShape(path.string());
 
     LazySurfaceGeometry result;
     result.scale = *scale;
@@ -219,8 +216,7 @@ QuadSurface::QuadSurface(const std::filesystem::path &path_)
     vcr::files::recoverDirectory(path_);
     path = path_;
     id = path_.filename().string();
-    auto metaPath = path_ / "meta.json";
-    meta = nlohmann::json::parse(std::ifstream(metaPath));
+    meta = vcr::tifxyz::readMetadata(path_.string()).document();
 
     if (meta.contains("bbox"))
         _bbox = rect_from_json(meta["bbox"]);
@@ -584,7 +580,7 @@ void QuadSurface::writeValidMask()
     if (path.empty()) {
         return;
     }
-    std::lock_guard<std::recursive_mutex> dirLock(dirWriteMutex(path));
+    std::lock_guard<std::recursive_mutex> dirLock(vcr::files::directoryMutex(path));
     auto options = tiffOptions(dpi_);
     options.compression = "lzw";
     options.tile = std::array<int, 2>{1024, 1024};
@@ -621,7 +617,7 @@ static inline cv::Vec2f mul(const cv::Vec2f &a, const cv::Vec2f &b)
 
 static bool pointSearchAxisContains(float value, int size)
 {
-    // Narrow ribbons have no interior margin, but still contain bilinear cells.
+    // Narrow ribbons have no interior margin, but still contain surface patches.
     if (size <= 3)
         return size >= 2 && value >= 0 && value < size - 1;
     const int rounded = cvRound(value);
@@ -634,7 +630,7 @@ static float pointSearchAxisSeed(int size)
 }
 
 template <typename E>
-static float search_min_loc(const cv::Mat_<E> &points, cv::Vec2f &loc, cv::Vec3f &out, cv::Vec3f tgt, cv::Vec2f init_step, float min_step_x)
+static float search_min_loc(const cv::Mat_<E> &points, cv::Vec2f &loc, cv::Vec3f &out, cv::Vec3f tgt, cv::Vec2f init_step, float min_step_x, const vcr::grid::Surface* surface)
 {
     const auto contains = [&](const cv::Vec2f& p) {
         return pointSearchAxisContains(p[0], points.cols) &&
@@ -645,10 +641,15 @@ static float search_min_loc(const cv::Mat_<E> &points, cv::Vec2f &loc, cv::Vec3f
         return -1;
     }
 
+    const auto sample = [&](const cv::Vec2f& xy) -> E {
+        cv::Vec3f p;
+        surface->pointsAt(xy.val,1,p.val,nullptr);
+        return E(p);
+    };
     bool changed = true;
-    E val = at_int(points, loc);
+    E val = sample(loc);
     out = val;
-    float best = sdist(val, tgt);
+    float best = std::isfinite(val[0]) ? sdist(val, tgt) : std::numeric_limits<float>::infinity();
     float res;
 
     // 8-neighbor search offsets: hold in a static constexpr-ish array
@@ -670,7 +671,7 @@ static float search_min_loc(const cv::Mat_<E> &points, cv::Vec2f &loc, cv::Vec3f
             if (!contains(cand))
                 continue;
 
-            val = at_int(points, cand);
+            val = sample(cand);
             res = sdist(val, tgt);
             if (res < best) {
                 changed = true;
@@ -690,7 +691,7 @@ static float search_min_loc(const cv::Mat_<E> &points, cv::Vec2f &loc, cv::Vec3f
             break;
     }
 
-    return sqrt(best);
+    return std::isfinite(best) ? sqrt(best) : -1;
 }
 
 
@@ -700,6 +701,8 @@ static float pointTo_(cv::Vec2f &loc, const cv::Mat_<E> &points, const cv::Vec3f
 {
     if (points.cols < 2 || points.rows < 2)
         return -1;
+    const QuadSurface source(points, {1, 1});
+    const auto sampledSurface = source.pointSurface();
     loc = cv::Vec2f(points.cols/2,points.rows/2);
     cv::Vec3f _out;
 
@@ -707,7 +710,7 @@ static float pointTo_(cv::Vec2f &loc, const cv::Mat_<E> &points, const cv::Vec3f
     float min_mul = std::min(0.1*points.cols/scale,0.1*points.rows/scale);
     cv::Vec2f step_large = {min_mul*scale,min_mul*scale};
 
-    float dist = search_min_loc(points, loc, _out, tgt, step_small, scale*0.1);
+    float dist = search_min_loc(points, loc, _out, tgt, step_small, scale*0.1, sampledSurface.get());
 
     if (dist < th && dist >= 0) {
         return dist;
@@ -729,10 +732,10 @@ static float pointTo_(cv::Vec2f &loc, const cv::Mat_<E> &points, const cv::Vec3f
 
         r_full++;
 
-        float dist = search_min_loc(points, loc, _out, tgt, step_large, scale*0.1);
+        float dist = search_min_loc(points, loc, _out, tgt, step_large, scale*0.1, sampledSurface.get());
 
         if (dist < th && dist >= 0) {
-            dist = search_min_loc(points, loc, _out, tgt, step_small, scale*0.1);
+            dist = search_min_loc(points, loc, _out, tgt, step_small, scale*0.1, sampledSurface.get());
             return dist;
         } else if (dist >= 0 && dist < min_dist) {
             min_loc = loc;
@@ -784,13 +787,14 @@ float QuadSurface::pointTo(cv::Vec3f &ptr, const cv::Vec3f &tgt, float th, int m
         return -1;
     cv::Vec2f loc = cv::Vec2f(ptr[0], ptr[1]) + cv::Vec2f(_center[0]*_scale[0], _center[1]*_scale[1]);
     cv::Vec3f _out;
+    const auto sampledSurface = pointSurface();
 
     cv::Vec2f step_small = {std::max(1.0f,_scale[0]), std::max(1.0f,_scale[1])};
     float min_mul = std::min(0.1*_points->cols/_scale[0], 0.1*_points->rows/_scale[1]);
     cv::Vec2f step_large = {min_mul*_scale[0], min_mul*_scale[1]};
 
     // Try initial location first
-    float dist = search_min_loc(*_points, loc, _out, tgt, step_small, _scale[0]*0.1);
+    float dist = search_min_loc(*_points, loc, _out, tgt, step_small, _scale[0]*0.1, sampledSurface.get());
 
     if (dist < th && dist >= 0) {
         ptr = cv::Vec3f(loc[0], loc[1], 0) - cv::Vec3f(_center[0]*_scale[0], _center[1]*_scale[1], 0);
@@ -856,10 +860,10 @@ float QuadSurface::pointTo(cv::Vec3f &ptr, const cv::Vec3f &tgt, float th, int m
 
         r_full++;
 
-        float dist = search_min_loc(*_points, loc, _out, tgt, step_large, _scale[0]*0.1);
+        float dist = search_min_loc(*_points, loc, _out, tgt, step_large, _scale[0]*0.1, sampledSurface.get());
 
         if (dist < th && dist >= 0) {
-            dist = search_min_loc((*_points), loc, _out, tgt, step_small, _scale[0]*0.1);
+            dist = search_min_loc((*_points), loc, _out, tgt, step_small, _scale[0]*0.1, sampledSurface.get());
             ptr = cv::Vec3f(loc[0], loc[1], 0) - cv::Vec3f(_center[0]*_scale[0], _center[1]*_scale[1], 0);
             return dist;
         } else if (dist >= 0 && dist < min_dist) {
@@ -906,17 +910,13 @@ void QuadSurface::saveEdited(const std::filesystem::path &source,
         saveAsNew(dest, force_overwrite);
 }
 
-std::recursive_mutex& QuadSurface::dirWriteMutex(const std::filesystem::path& dir)
-{
-    return vcr::files::directoryMutex(dir);
-}
 
 void QuadSurface::saveOverwrite()
 {
     if (path.empty()) {
         throw std::runtime_error("QuadSurface::saveOverwrite() requires a valid path");
     }
-    std::lock_guard<std::recursive_mutex> dirLock(dirWriteMutex(path));
+    std::lock_guard<std::recursive_mutex> dirLock(vcr::files::directoryMutex(path));
 
     std::filesystem::path final_path = path;
     const std::string uuid = objectUuidOrNew();
@@ -1048,11 +1048,9 @@ std::unique_ptr<QuadSurface> load_quad_from_tifxyz_impl(
 {
     vcr::files::recoverDirectory(path);
 
-    // Read meta first (scale, uuid, etc.)
-    auto metadata = nlohmann::json::parse(std::ifstream(std::filesystem::path(path)/"meta.json"));
-    cv::Vec2f scale = {metadata["scale"][0].get<float>(), metadata["scale"][1].get<float>()};
-
     vcr::tifxyz::Reader reader(path.string(), !(flags & SURF_LOAD_IGNORE_MASK));
+    const auto metadata = reader.metadata().document();
+    const cv::Vec2f scale{float(reader.metadata().scale[1]), float(reader.metadata().scale[0])};
     const auto stored = requestedRegion ? reader.window({requestedRegion->y, requestedRegion->x, requestedRegion->height, requestedRegion->width}) : reader.whole();
     auto points = std::make_unique<cv::Mat_<cv::Vec3f>>(int(stored.rows), int(stored.cols));
     std::memcpy(points->data, stored.xyz.data(), stored.xyz.size() * sizeof(float));

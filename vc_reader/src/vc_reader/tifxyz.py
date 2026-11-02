@@ -33,6 +33,11 @@ def read_mask(location, shape, **reader_options):
     return _reader._tifxyz_read_mask(os.fspath(location), shape[0], shape[1], _options_for(reader_options))
 
 
+def stored_shape(location, **reader_options):
+    """Stored grid rows and columns, reading only the coordinate image header."""
+    return _reader._tifxyz_stored_shape(os.fspath(location), _options_for(reader_options))
+
+
 @dataclass(frozen=True)
 class Metadata:
     uuid: str
@@ -77,4 +82,4 @@ def full_extent(stored, scale):
     return _reader._tifxyz_full_extent(stored, scale)
 
 
-__all__ = ['Entry', 'Metadata', 'Surface', 'full_extent', 'list_surfaces', 'read', 'read_mask', 'read_metadata', 'write']
+__all__ = ['Entry', 'Metadata', 'Surface', 'full_extent', 'list_surfaces', 'read', 'read_mask', 'read_metadata', 'stored_shape', 'write']

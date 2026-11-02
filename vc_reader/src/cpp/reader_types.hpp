@@ -13,6 +13,16 @@ namespace vcr {
 
 using Index = std::vector<std::int64_t>;
 
+inline std::string chunkKey(const Index& index, const std::string& separator)
+{
+    std::string key;
+    for (std::size_t axis = 0; axis < index.size(); ++axis) {
+        if (axis) key += separator;
+        key += std::to_string(index[axis]);
+    }
+    return key;
+}
+
 // How requests authenticate.
 // A key below a remote location: slashes between them collapse, and a query (a signed
 // URL's token) stays at the end, its bytes untouched. Anything without a scheme is a

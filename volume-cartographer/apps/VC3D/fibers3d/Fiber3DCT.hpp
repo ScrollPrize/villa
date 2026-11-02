@@ -24,8 +24,6 @@ struct Tile {
 // reads: call off the GUI thread.
 // Blocking CT sampling, with the same uint16 conversion and bounds mask.
 cv::Mat_<cv::Vec2b> sampleCoordinates(const cv::Mat_<cv::Vec3f>&, OpenedVolumes&, const Volume&, int level);
-// Shared display normalization for raw uint8/uint16 CT data.
-cv::Mat_<uint8_t> displayBytes(const cv::Mat&);
 void sampleTile(Tile&, OpenedVolumes&, const Volume&, int level, const std::atomic_bool* cancelled = nullptr);
 // The present level with the finest voxels no smaller than `spacing` level-0 voxels; the
 // finest present level when all are coarser.

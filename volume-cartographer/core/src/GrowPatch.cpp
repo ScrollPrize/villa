@@ -185,41 +185,6 @@ static cv::Mat_<cv::Vec3f> downsample_surface_points_nearest(const cv::Mat_<cv::
     return result;
 }
 
-static cv::Mat resize_surface_points_weighted(const cv::Mat_<cv::Vec3f>& points,
-                                              const cv::Size& dst_size,
-                                              int interpolation)
-{
-    cv::Mat value(points.size(), CV_32FC3, cv::Scalar(0, 0, 0));
-    cv::Mat weight(points.size(), CV_32FC1, cv::Scalar(0));
-    for (int r = 0; r < points.rows; ++r) {
-        for (int c = 0; c < points.cols; ++c) {
-            const cv::Vec3f& p = points(r, c);
-            if (p[0] == -1.0f) {
-                continue;
-            }
-            value.at<cv::Vec3f>(r, c) = p;
-            weight.at<float>(r, c) = 1.0f;
-        }
-    }
-
-    cv::Mat value_resized;
-    cv::Mat weight_resized;
-    cv::resize(value, value_resized, dst_size, 0.0, 0.0, interpolation);
-    cv::resize(weight, weight_resized, dst_size, 0.0, 0.0, interpolation);
-
-    cv::Mat_<cv::Vec3f> result(dst_size, cv::Vec3f(-1.0f, -1.0f, -1.0f));
-    for (int r = 0; r < result.rows; ++r) {
-        for (int c = 0; c < result.cols; ++c) {
-            const float w = weight_resized.at<float>(r, c);
-            if (w <= 1e-5f) {
-                continue;
-            }
-            result(r, c) = value_resized.at<cv::Vec3f>(r, c) * (1.0f / w);
-        }
-    }
-    return result;
-}
-
 static cv::Mat downsample_channel_for_growth(const cv::Mat& channel, const cv::Size& dst_size, const std::string& name)
 {
     if (channel.empty()) {
@@ -286,8 +251,19 @@ static QuadSurface* make_output_scale_surface(QuadSurface* coarse,
     if (exact_output_size.width > 0 && exact_output_size.height > 0) {
         output_size = exact_output_size;
     }
-    cv::Mat_<cv::Vec3f> output_points =
-        resize_surface_points_weighted(coarse_points, output_size, cv::INTER_LINEAR);
+    cv::Mat_<cv::Vec3f> output_points(output_size, cv::Vec3f(-1, -1, -1));
+    const auto surface = coarse->pointSurface();
+    std::vector<float> xy(std::size_t(output_size.width) * 2);
+    cv::Mat_<cv::Vec3f> row(1, output_size.width);
+    for (int r = 0; r < output_size.height; ++r) {
+        for (int c = 0; c < output_size.width; ++c) {
+            xy[2*c] = std::clamp(float((c+.5)*coarse_points.cols/output_size.width-.5), 0.f, float(coarse_points.cols-1));
+            xy[2*c+1] = std::clamp(float((r+.5)*coarse_points.rows/output_size.height-.5), 0.f, float(coarse_points.rows-1));
+        }
+        surface->pointsAt(xy.data(), output_size.width, row.ptr<float>(), nullptr);
+        for (int c = 0; c < output_size.width; ++c)
+            if (std::isfinite(row(0,c)[0])) output_points(r,c) = row(0,c);
+    }
 
     auto* output = new QuadSurface(output_points, output_scale);
     output->id = coarse->id;

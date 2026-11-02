@@ -35,7 +35,7 @@ inline ReferenceVolume reference_volume(const Array& values) {
 }
 }  // namespace volume_detail
 
-inline void check(const Gamma& t) { probability(t.p_invert); probability(t.p_retain_stats); }
+inline void check(const Gamma& t) { probability(t.p_invert); probability(t.p_retain_stats); require(std::isfinite(t.eps) && t.eps > 0, "gamma eps must be positive and finite"); }
 inline void check(const ClipOutliers& t) { probability(t.p_retain_std); }
 inline void check(const Sharpen& t) { probability(t.p_clamp); }
 inline void check(const Flip& t) { probability(t.p_axis); }

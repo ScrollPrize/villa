@@ -77,7 +77,7 @@ template<int Phase> __device__ void finish_normalization(KernelIndex vcr_launch,
     if (!threadIdx.x) {
         const auto q = values[0];
         if constexpr (Phase == 0) {
-            *params = {q.low,1,q.high-q.low,q.weight,q.low,q.high,q.weight == 0 || q.low == q.high};
+            *params = {q.low,1,q.high-q.low,q.weight,q.low,q.high,q.weight == 0 || (q.low == q.high && eps == 0)};
             if (params->constant) { params->divisor = 0; return; }
             if (zscore) {
                 if (mean_ready) { params->center=q.sum/q.weight; return; }
@@ -145,24 +145,6 @@ template<class T> __device__ void normalize_values(KernelIndex vcr_launch, View<
 }
 struct normalize_values_launch {
     template<class... Args> __device__ void operator()(KernelIndex index, Args... args) const { normalize_values(index,args...); }
-};
-
-// Validity flags for one channel, counting valid voxels; with none valid,
-// statistics use every voxel (flags become all ones).
-template<class M> __device__ void select_valid(KernelIndex vcr_launch, const M* mask, std::uint8_t* valid, std::size_t n, unsigned long long* count) {
-    unsigned long long local = 0;
-    EACH_INDEX(n) { valid[i] = mask[i] != M(0); local += valid[i]; }
-    if (local) atomicAdd(count,local);
-}
-struct select_valid_launch {
-    template<class... Args> __device__ void operator()(KernelIndex index, Args... args) const { select_valid(index,args...); }
-};
-__device__ void select_all_if_empty(KernelIndex vcr_launch, std::uint8_t* valid, std::size_t n, const unsigned long long* count) {
-    if (*count) return;
-    EACH_INDEX(n) valid[i] = 1;
-}
-struct select_all_if_empty_launch {
-    template<class... Args> __device__ void operator()(KernelIndex index, Args... args) const { select_all_if_empty(index,args...); }
 };
 
 // Order statistics sort the selected values; unselected voxels sort last as +inf.
@@ -270,17 +252,8 @@ void apply_cuda(const Normalize& t, Sample& s, const Parameters& p, Session& ses
         if (t.mode == Normalization::Fixed) {
             launch(blocks(data.size),256,0,vcr::device::stream(), fixed_values_launch{}, data,Options(t),invalid); check(cudaGetLastError()); return;
         }
-        std::unique_ptr<Buffer<std::uint8_t>> valid;
         Buffer<unsigned long long> selected(1);
-        const auto& f = s.at(c.key);
-        if (t.masked && session.arrays.count(f.target.valid)) {
-            const auto& mask = session.arrays.at(f.target.valid);
-            valid = std::make_unique<Buffer<std::uint8_t>>(data.size);
-            check(memset_async(selected.ptr,0,sizeof(unsigned long long),vcr::device::stream()));
-            const std::size_t offset = (mask.shape[0] == 1 ? 0 : c.channel)*data.size;
-            mask.typed([&](auto m) { launch(blocks(data.size),256,0,vcr::device::stream(), select_valid_launch{}, m.ptr+offset,valid->ptr,data.size,selected.ptr); });
-            launch(blocks(data.size),256,0,vcr::device::stream(), select_all_if_empty_launch{}, valid->ptr,data.size,selected.ptr);
-        }
+        auto valid = t.masked ? valid_voxels(s, c, session, selected.ptr) : nullptr;
         const Selection select{valid ? valid->ptr : nullptr,t.mode == Normalization::ZScore && t.nonzero};
         Buffer<ParametersGPU> params(1);
         if (t.mode == Normalization::MinMax || t.mode == Normalization::ZScore) {

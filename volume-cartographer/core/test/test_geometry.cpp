@@ -24,45 +24,6 @@ cv::Mat_<cv::Vec3f> makePlanarGrid(int rows, int cols, float dx = 1.0f, float dy
 
 } // namespace
 
-TEST_CASE("at_int Vec3f bilinear at integer corner returns same value")
-{
-    auto m = makePlanarGrid(4, 4);
-    cv::Vec3f v = at_int(m, cv::Vec2f(1.0f, 2.0f));
-    CHECK(v[0] == doctest::Approx(1.0f));
-    CHECK(v[1] == doctest::Approx(2.0f));
-    CHECK(v[2] == doctest::Approx(1.0f));
-}
-
-TEST_CASE("at_int Vec3f bilinear at midpoint averages neighbors")
-{
-    auto m = makePlanarGrid(4, 4);
-    cv::Vec3f v = at_int(m, cv::Vec2f(1.5f, 1.5f));
-    CHECK(v[0] == doctest::Approx(1.5f));
-    CHECK(v[1] == doctest::Approx(1.5f));
-}
-
-TEST_CASE("at_int float overload")
-{
-    cv::Mat_<float> m(3, 3);
-    for (int r = 0; r < 3; ++r)
-        for (int c = 0; c < 3; ++c)
-            m(r, c) = static_cast<float>(r * 10 + c);
-    CHECK(at_int(m, cv::Vec2f(0.0f, 0.0f)) == doctest::Approx(0.0f));
-    CHECK(at_int(m, cv::Vec2f(1.0f, 1.0f)) == doctest::Approx(11.0f));
-    CHECK(at_int(m, cv::Vec2f(0.5f, 0.0f)) == doctest::Approx(0.5f));
-}
-
-TEST_CASE("at_int Vec3d overload")
-{
-    cv::Mat_<cv::Vec3d> m(3, 3);
-    for (int r = 0; r < 3; ++r)
-        for (int c = 0; c < 3; ++c)
-            m(r, c) = cv::Vec3d(c, r, 0);
-    cv::Vec3d v = at_int(m, cv::Vec2f(1.0f, 1.0f));
-    CHECK(v[0] == doctest::Approx(1.0));
-    CHECK(v[1] == doctest::Approx(1.0));
-}
-
 TEST_CASE("loc_valid Vec3f basic")
 {
     auto m = makePlanarGrid(5, 5);

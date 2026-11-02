@@ -1,7 +1,10 @@
 #include "pixels.hpp"
 namespace vcr::display {
-void toUint8(const float* in,std::size_t n,uint8_t* out,uint8_t* coverage) {
-    for(std::size_t i=0;i<n;++i) { out[i]=detail::byte(in[i]); if(coverage) coverage[i]=detail::finite(in[i]); }
+void toUint8(const float* in,std::size_t n,uint8_t* out,uint8_t* coverage, Conversion conversion) {
+    for(std::size_t i=0;i<n;++i) { out[i]=detail::converted<uint8_t>(in[i], conversion); if(coverage) coverage[i]=detail::finite(in[i]); }
+}
+void toUint16(const float* in,std::size_t n,uint16_t* out,Conversion conversion) {
+    for(std::size_t i=0;i<n;++i) out[i]=detail::converted<uint16_t>(in[i],conversion);
 }
 void windowLevelLut(std::array<uint32_t,256>& out,float low,float high) noexcept {
     for(int i=0;i<256;++i) out[i]=detail::window(i,low,high);

@@ -30,6 +30,47 @@ bool nextIndex(Index& idx, const Index& lo, const Index& hi)
     return false;
 }
 
+std::vector<Index> chunkKeyIndices(const Store& store, const std::string& prefix,
+                                   const std::string& separator, std::size_t rank, bool strict)
+{
+    std::vector<Index> result;
+    for (const auto& object : store.list(strict ? "" : prefix)) {
+        if (object.key == ".zarray" || object.key == "zarr.json" || object.key == ".zattrs") continue;
+        if (!object.key.starts_with(prefix))
+            throw std::invalid_argument("unexpected chunk key: " + object.key);
+        Index index;
+        std::string_view rest(object.key);
+        rest.remove_prefix(prefix.size());
+        for (;;) {
+            const auto end = rest.find(separator);
+            const auto part = rest.substr(0, end);
+            std::int64_t value = 0;
+            const auto parsed = std::from_chars(part.data(), part.data() + part.size(), value);
+            if (part.empty() || parsed.ec != std::errc{} || parsed.ptr != part.data() + part.size()) {
+                index.clear();
+                break;
+            }
+            index.push_back(value);
+            if (end == std::string_view::npos)
+                break;
+            rest.remove_prefix(end + separator.size());
+        }
+        if (index.size() != rank || std::any_of(index.begin(),index.end(),[](auto i){return i<0;})) {
+            if (strict && object.key != ".zarray" && object.key != "zarr.json" && object.key != ".zattrs")
+                throw std::invalid_argument("unexpected chunk key: " + object.key);
+            continue;
+        }
+        if(strict && !store.remote()) {
+            const auto root=fs::weakly_canonical(store.location());
+            const auto relative=fs::weakly_canonical(root/object.key).lexically_relative(root);
+            if(relative.empty() || *relative.begin()=="..")throw std::invalid_argument("chunk path escapes its array root");
+        }
+        result.push_back(std::move(index));
+    }
+    std::sort(result.begin(),result.end());
+    return result;
+}
+
 EncodeOptions encodeOptions(const Json& compressor)
 {
     EncodeOptions o;
@@ -61,6 +102,21 @@ Json compressorConfig(const CreateOptions& options)
     if (id == "volcomp")
         return {{"id", "volcomp"}, {"q", level >= 0 ? double(level) : 8.0}};
     throw std::invalid_argument("cannot write Zarr chunks compressed with '" + id + "'");
+}
+
+Json v2Document(const CreateOptions& options, const Json& filters)
+{
+    Json document{{"zarr_format", 2},
+                {"shape", options.shape},
+                {"chunks", options.chunks},
+                {"dtype", options.dtype},
+                {"compressor", compressorConfig(options)},
+                {"fill_value", options.fillValue},
+                {"filters", filters},
+                {"order", "C"},
+                {"dimension_separator", options.separator}};
+    if (options.separator.empty()) document.erase("dimension_separator");
+    return document;
 }
 
 Json v3Metadata(const ArrayMeta& meta, const CreateOptions& options)
@@ -176,16 +232,14 @@ struct Writer::Impl {
     {
         if (chunk.size() != meta.shape.size())
             throw std::invalid_argument("chunk index rank does not match the array");
-        std::string key = meta.v3 ? meta.v3->prefix : "";
+        Index stored = chunk;
         for (std::size_t i = 0; i < chunk.size(); ++i) {
             const auto grid = meta.shape[i] / meta.chunks[i] + (meta.shape[i] % meta.chunks[i] != 0);
             if (chunk[i] < 0 || chunk[i] >= std::max<std::int64_t>(grid, 1))
                 throw std::out_of_range("chunk index outside the array");
-            if (i)
-                key += meta.separator;
-            key += std::to_string(shards ? chunk[i] / shards->ratios[i] : chunk[i]);
+            if (shards) stored[i] /= shards->ratios[i];
         }
-        return key;
+        return (meta.v3 ? meta.v3->prefix : "") + vcr::chunkKey(stored, meta.separator);
     }
 
     // A remote shard edited as a local file: downloaded, patched and uploaded whole.
@@ -298,6 +352,51 @@ CreateOptions createOptionsLike(const ArrayMeta& meta)
     return options;
 }
 
+Json objectArrayDocument(const Index& shape,const Index& chunks,const Json& filters,const std::string& separator)
+{
+    if(shape.empty()||shape.size()!=chunks.size() || !filters.is_array() || filters.empty() ||
+       (!separator.empty() && separator!="." && separator!="/"))
+        throw std::invalid_argument("invalid object-array layout");
+    detail::validateShape(shape, chunks);
+    CreateOptions options;
+    options.shape = shape; options.chunks = chunks; options.dtype = "|O";
+    options.compressor = "none"; options.fillValue = nullptr; options.separator = separator;
+    return v2Document(options, filters);
+}
+void createObjectArray(const fs::path& path,const Index& shape,const Index& chunks,const Json& filters,
+                       const std::string& separator,const Access& access,Durability durability)
+{
+    const auto document=objectArrayDocument(shape,chunks,filters,separator);
+    const Store store(path,access);
+    if(store.isNode())throw std::invalid_argument("Zarr node already exists at " + path.string());
+    store.write(".zarray",document.dump(2)+"\n",durability);
+}
+ArrayInventory inventory(const fs::path& path,const Access& access,bool strict)
+{
+    OpenOptions options; options.access = access;
+    const auto metadata = readArrayDocument(path.string(), options);
+    if (!metadata) throw NotFound("no Zarr array at " + path.string());
+    ArrayInventory out; out.metadata = *metadata;
+    if(out.metadata.value("zarr_format",0)==3) {
+        auto writer=Writer::open(path,access);out.chunks=writer.storedChunks(strict);
+        return out;
+    }
+    const auto& j=out.metadata;
+    if(j.value("zarr_format",0)!=2 || !j.contains("shape") || !j.contains("chunks") ||
+       !j["shape"].is_array() || !j["chunks"].is_array() || j["shape"].empty() || j["shape"].size()!=j["chunks"].size())
+        throw std::invalid_argument("invalid Zarr shape/chunks");
+    for(const char* key:{"shape","chunks"})for(const auto& n:j[key])
+        if(!n.is_number_integer())throw std::invalid_argument("invalid Zarr shape/chunks");
+    const auto shape=j["shape"].get<Index>(),chunks=j["chunks"].get<Index>();
+    detail::validateShape(shape, chunks);
+    const auto separator=j.value("dimension_separator",std::string("."));
+    if(separator!="."&&separator!="/")throw std::invalid_argument("invalid Zarr dimension separator");
+    out.chunks=chunkKeyIndices(Store(path,access),"",separator,shape.size(),strict);
+    for(const auto& index:out.chunks)for(size_t a=0;a<shape.size();++a)
+        if(shape[a] == 0 || index[a]>(shape[a]-1)/chunks[a])throw std::invalid_argument("stored chunk outside array shape");
+    return out;
+}
+
 Writer::Writer(std::unique_ptr<Impl> impl) : impl_(std::move(impl)) {}
 Writer::Writer(Writer&&) noexcept = default;
 Writer& Writer::operator=(Writer&&) noexcept = default;
@@ -321,15 +420,7 @@ Writer Writer::create(const fs::path& path, const CreateOptions& options, const 
         if (existing && Json::parse(*existing).value("node_type", "") != "array")
             throw std::invalid_argument("cannot replace a group with an array at " + path.string());
     }
-    Json zarray{{"zarr_format", 2},
-                {"shape", options.shape},
-                {"chunks", options.chunks},
-                {"dtype", options.dtype},
-                {"compressor", compressorConfig(options)},
-                {"fill_value", options.fillValue},
-                {"filters", options.packbits ? Json::array({{{"id", "packbits"}}}) : Json(nullptr)},
-                {"order", "C"},
-                {"dimension_separator", options.separator}};
+    Json zarray = v2Document(options, options.packbits ? Json::array({{{"id", "packbits"}}}) : Json(nullptr));
     auto meta = parseArrayMeta(zarray);  // validates before anything is written
     const auto codec = parse_chunk_codec(meta.codec());
     if (codec == Codec::Volcomp && (meta.itemsize() != 1 || meta.chunks != Index{128, 128, 128}))
@@ -354,15 +445,13 @@ Writer Writer::create(const fs::path& path, const CreateOptions& options, const 
 Writer Writer::open(const fs::path& path, const Access& access)
 {
     Store store(path, access);
-    auto stored = store.read(".zarray");
-    if (!stored)
-        stored = store.read("zarr.json");
-    if (!stored)
-        throw std::runtime_error("no Zarr array to write at " + path.string());
+    OpenOptions options; options.access = access;
+    const auto stored = readArrayDocument(path.string(), options);
+    if (!stored) throw NotFound("no Zarr array to write at " + path.string());
     auto impl = std::make_unique<Impl>();
     impl->path = path;
     impl->store = std::move(store);
-    impl->meta = parseArrayMeta(Json::parse(*stored));
+    impl->meta = parseArrayMeta(*stored);
     if (impl->meta.v3 && !impl->meta.v3->shards.empty()) {
         const auto& v3 = *impl->meta.v3;
         impl->shards = std::make_unique<ShardLayout>(v3.shards, v3.indexEnd, v3.indexCrc, impl->meta.chunkBytes());
@@ -371,8 +460,6 @@ Writer Writer::open(const fs::path& path, const Access& access)
     }
     impl->codec = parse_chunk_codec(impl->meta.codec());
     impl->encode = encodeOptions(impl->meta.compressor);
-    OpenOptions options;
-    options.access = access;
     options.threads = 4;
     // Mutable arrays must see atomic replacements by this or another writer.
     options.readMode = "slab";
@@ -426,7 +513,7 @@ bool Writer::chunkExists(const Index& chunk) const
     return impl_->store->exists(key);
 }
 
-std::vector<Index> Writer::storedChunks() const
+std::vector<Index> Writer::storedChunks(bool strict) const
 {
     const auto& meta = impl_->meta;
     const std::string prefix = meta.v3 ? meta.v3->prefix : "";
@@ -435,26 +522,14 @@ std::vector<Index> Writer::storedChunks() const
     for (std::size_t i = 0; i < rank; ++i)
         grid[i] = std::max<std::int64_t>(meta.shape[i] / meta.chunks[i] + (meta.shape[i] % meta.chunks[i] != 0), 1);
     std::vector<Index> stored;
-    for (const auto& object : impl_->store->list(prefix)) {
-        Index index;
-        std::string_view rest(object.key);
-        rest.remove_prefix(prefix.size());
-        for (;;) {
-            const auto end = rest.find(meta.separator);
-            const auto part = rest.substr(0, end);
-            std::int64_t value = 0;
-            const auto parsed = std::from_chars(part.data(), part.data() + part.size(), value);
-            if (part.empty() || parsed.ec != std::errc{} || parsed.ptr != part.data() + part.size()) {
-                index.clear();
-                break;
+    for (auto index : chunkKeyIndices(*impl_->store, prefix, meta.separator, rank, strict)) {
+        if (strict) {
+            for (std::size_t axis = 0; axis < rank; ++axis) {
+                const auto ratio = impl_->shards ? impl_->shards->ratios[axis] : 1;
+                if (meta.shape[axis] == 0 || index[axis] > (grid[axis] - 1) / ratio)
+                    throw std::invalid_argument("stored chunk outside array shape");
             }
-            index.push_back(value);
-            if (end == std::string_view::npos)
-                break;
-            rest.remove_prefix(end + meta.separator.size());
         }
-        if (index.size() != rank)
-            continue;
         if (!impl_->shards) {
             bool inside = true;
             for (std::size_t i = 0; i < rank; ++i)

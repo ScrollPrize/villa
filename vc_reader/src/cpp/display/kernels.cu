@@ -3,9 +3,10 @@
 #include "../cuda_buffer.hpp"
 namespace vcr::display::cuda {
 namespace {
-__global__ void convert(const float* in,std::size_t n,uint8_t* out,uint8_t* coverage) {
+template<class T>
+__global__ void convert(const float* in,std::size_t n,T* out,uint8_t* coverage,Conversion options) {
     for(std::size_t i=std::size_t(blockIdx.x)*blockDim.x+threadIdx.x;i<n;i+=std::size_t(gridDim.x)*blockDim.x) {
-        out[i]=detail::byte(in[i]);if(coverage) coverage[i]=detail::finite(in[i]);
+        out[i]=detail::converted<T>(in[i],options);if(coverage) coverage[i]=detail::finite(in[i]);
     }
 }
 __global__ void apply(const uint8_t* in,std::size_t rows,std::size_t cols,std::size_t stride,const uint32_t* lut,uint32_t* out,std::size_t outStride) {
@@ -30,8 +31,11 @@ void lut(std::array<uint32_t,256>& out,const uint32_t* in,float low,float high,i
     device::check(cudaMemcpyAsync(out.data(),dest.ptr,1024,cudaMemcpyDeviceToHost,device::stream()));device::complete();
 }
 }
-void toUint8(const float* in,std::size_t n,uint8_t* out,uint8_t* coverage) {
-    if(!n)return;convert<<<blocks(n),256,0,device::stream()>>>(in,n,out,coverage);finish();
+void toUint8(const float* in,std::size_t n,uint8_t* out,uint8_t* coverage,Conversion options) {
+    if(!n)return;convert<<<blocks(n),256,0,device::stream()>>>(in,n,out,coverage,options);finish();
+}
+void toUint16(const float* in,std::size_t n,uint16_t* out,Conversion options) {
+    if(!n)return;convert<<<blocks(n),256,0,device::stream()>>>(in,n,out,nullptr,options);finish();
 }
 void applyLut(const uint8_t* in,std::size_t rows,std::size_t cols,std::size_t stride,const uint32_t* lut,uint32_t* out,std::size_t outStride) {
     if(!rows||!cols)return;apply<<<blocks(rows*cols),256,0,device::stream()>>>(in,rows,cols,stride,lut,out,outStride);finish();

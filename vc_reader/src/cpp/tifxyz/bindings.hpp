@@ -54,15 +54,20 @@ inline nb::ndarray<nb::numpy, bool, nb::ndim<2>> finiteOf(const float* xyz, std:
     return nb::ndarray<nb::numpy, bool, nb::ndim<2>>(data, 2, shape, owner);
 }
 
-inline nb::tuple pointsOut(const Surface& s, const float* xy, std::size_t n, std::size_t rows, std::size_t cols, grid::Interpolation mode, bool normals)
+inline nb::tuple pointsOut(const Surface& s, const float* xy, std::size_t n, std::size_t rows, std::size_t cols, grid::Interpolation mode, bool normals, bool tangents = false)
 {
     auto xyz = floats<3>({rows, cols, 3});
     auto valid = nb::ndarray<nb::numpy, float, nb::ndim<3>>();
     if (normals) valid = floats<3>({rows, cols, 3});
+    auto du = tangents ? floats<3>({rows, cols, 3}) : nb::ndarray<nb::numpy, float, nb::ndim<3>>();
+    auto dv = tangents ? floats<3>({rows, cols, 3}) : nb::ndarray<nb::numpy, float, nb::ndim<3>>();
     {
         nb::gil_scoped_release release;
-        s.pointsAt(xy, n, mode, xyz.data(), normals ? valid.data() : nullptr);
+        s.pointsAt(xy, n, mode, xyz.data(), normals ? valid.data() : nullptr,
+                   tangents ? du.data() : nullptr, tangents ? dv.data() : nullptr);
     }
+    if (tangents) return normals ? nb::make_tuple(xyz, finiteOf(xyz.data(), rows, cols), valid, du, dv)
+                                : nb::make_tuple(xyz, finiteOf(xyz.data(), rows, cols), du, dv);
     return normals ? nb::make_tuple(xyz, finiteOf(xyz.data(), rows, cols), valid) : nb::make_tuple(xyz, finiteOf(xyz.data(), rows, cols));
 }
 
@@ -81,6 +86,11 @@ inline nb::tuple rasterOut(const Surface& s, const grid::Raster& raster, grid::I
 
 inline void bind(nb::module_& m)
 {
+    m.def("_tifxyz_stored_shape", [](const std::string& location, nb::object options) {
+        auto optionsFor = sources::python::optionsFrom(std::move(options));
+        nb::gil_scoped_release release;
+        return storedShape(location, optionsFor);
+    }, "location"_a, "options"_a);
     auto imageView = [](nb::ndarray<nb::ro, nb::c_contig, nb::device::cpu> image) {
         if (image.ndim()<2 || image.ndim()>3) throw nb::value_error("image must have rows, columns and optional channels");
         return sources::ImageView{image.data(),typestrOf(image.dtype()),std::int64_t(image.shape(0)),
@@ -216,7 +226,7 @@ inline void bind(nb::module_& m)
         })
         .def("bounds", &Surface::bounds)
         .def("retarget", &Surface::retargeted, "factor"_a)
-        .def("points_at", [](const Surface& s, FloatsIn rows, FloatsIn cols, const std::string& interpolation, bool normals) {
+        .def("points_at", [](const Surface& s, FloatsIn rows, FloatsIn cols, const std::string& interpolation, bool normals, bool tangents) {
             if (rows.ndim() != 2 || cols.ndim() != 2 || rows.shape(0) != cols.shape(0) || rows.shape(1) != cols.shape(1)) throw nb::value_error("points_at takes 2-D rows and columns of one shape");
             const std::size_t r = rows.shape(0), c = rows.shape(1), n = r * c;
             std::vector<float> xy(n * 2);
@@ -224,8 +234,9 @@ inline void bind(nb::module_& m)
                 xy[i * 2] = cols.data()[i];
                 xy[i * 2 + 1] = rows.data()[i];
             }
-            return pointsOut(s, xy.data(), n, r, c, grid::interpolationNamed(interpolation), normals);
-        }, "rows"_a, "cols"_a, "interpolation"_a = "bicubic", "normals"_a = false)
+            return pointsOut(s, xy.data(), n, r, c, grid::interpolationNamed(interpolation), normals, tangents);
+        }, "rows"_a, "cols"_a, "interpolation"_a = "bicubic", "normals"_a = false, "tangents"_a = false,
+           "Positions and validity; append normals when requested, then column/row tangents when tangents=True.")
         .def("resample", [](const Surface& s, std::array<double, 2> origin, std::array<double, 2> step, std::array<int, 2> size, const std::string& interpolation, bool normals) {
             if (size[0] <= 0 || size[1] <= 0) throw nb::value_error("resample size must be positive");
             return rasterOut(s, grid::Raster{origin[1], origin[0], step[1], step[0], size[1], size[0]}, grid::interpolationNamed(interpolation), normals);

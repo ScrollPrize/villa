@@ -25,10 +25,7 @@ namespace vc3d::opendata {
 namespace {
 
 // Write a marker file whole or not at all.
-void writeMarker(const std::filesystem::path& path, const std::string& text)
-{
-    vcr::zarr::atomicWrite(path, text);
-}
+
 
 void validateGroupDescriptor(const vc::lasagna::LasagnaDatasetManifest& manifest,
                              const vc::lasagna::LasagnaChannelGroup& group)
@@ -206,7 +203,7 @@ CachedLasagna cacheLasagna(
                     markerChanged = true;
                 }
                 if (markerChanged) {
-                    writeMarker(markerPath, marker.dump(2));
+                    vcr::zarr::atomicWrite(markerPath, marker.dump(2));
                 }
                 auto dataset = vc::lasagna::LasagnaDataset::open(manifest);
                 const auto kind = validatePrepared(volume, artifact, dataset);
@@ -254,7 +251,7 @@ CachedLasagna cacheLasagna(
         marker["source_to_base"] = *artifact.sourceToBase;
     if (volume.shapeZYX)
         marker["base_shape_zyx"] = *volume.shapeZYX;
-    writeMarker(markerPath, marker.dump(2));
+    vcr::zarr::atomicWrite(markerPath, marker.dump(2));
     try {
         auto dataset = vc::lasagna::LasagnaDataset::open(manifest);
         const auto kind = validatePrepared(volume, artifact, dataset);

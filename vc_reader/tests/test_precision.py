@@ -41,6 +41,43 @@ class PrecisionTests(unittest.TestCase):
     def backends(self):
         return ('cpu', 'cuda') if A._transforms.cuda_available() else ('cpu',)
 
+    def test_masked_intensity_statistics_without_refilling(self):
+        image = np.array([-10, 2, 4, 6, 20, 3], np.float32).reshape(1, 2, 3)
+        mask = np.array([0, 1, 1, 1, 0, 1], bool).reshape(image.shape)
+        for backend in self.backends():
+            for valid in (mask, np.zeros_like(mask), np.ones_like(mask)):
+                for retain in (False, True):
+                    chosen = image[valid] if valid.any() else image.ravel()
+                    mean = chosen.mean(dtype=np.float64)
+                    contrast = (image - np.float32(mean)) * np.float32(1.7) + np.float32(mean)
+                    selected = contrast[valid] if valid.any() else contrast.ravel()
+                    low, high = selected.min(), selected.max()
+                    expected = np.clip((contrast - low) / max(high-low, 1e-6), 0, 1)**np.float32(.7) * (high-low) + low
+                    if retain:
+                        after = expected[valid] if valid.any() else expected.ravel()
+                        expected = ((expected.astype(np.float64)-after.mean(dtype=np.float64)) *
+                                    (selected.std(dtype=np.float64, ddof=1) / max(after.std(dtype=np.float64, ddof=1), 1e-7)) +
+                                    selected.mean(dtype=np.float64)).astype(np.float32)
+                    pipeline = A.Pipeline([A.Contrast(1.7, masked=True, preserve_range=False),
+                                           A.Gamma(.7, masked=True, clip=True, eps=1e-6, p_retain_stats=float(retain))],
+                                          targets={'image': A.Image(refill=False), 'padding_mask': A.ValidMask()}, backend=backend)
+                    sample = {'image': image, 'padding_mask': valid}
+                    output = pipeline(sample, seed=19)
+                    plan = pipeline.sample(sample, seed=19)
+                    np.testing.assert_allclose(output['image'], expected, rtol=2e-6, atol=2e-6)
+                    np.testing.assert_array_equal(plan.apply(sample)['image'], output['image'])
+                    np.testing.assert_array_equal(output['padding_mask'], valid)
+
+    def test_constant_masked_normalization_honors_epsilon_outside_mask(self):
+        image = np.array([1, 3, 3, 5], np.float32).reshape(1, 2, 2)
+        mask = np.array([0, 1, 1, 0], bool).reshape(image.shape)
+        for backend in self.backends():
+            for mode in ('zscore', 'minmax'):
+                pipeline = A.Pipeline([A.Normalize(mode, masked=True, eps=.5, **({"nonzero": False} if mode == "zscore" else {}))],
+                                      targets={'image': A.Image(refill=False), 'padding_mask': A.ValidMask()}, backend=backend)
+                output = pipeline({'image': image, 'padding_mask': mask}, seed=0)['image']
+                np.testing.assert_array_equal(output, (image-3)/.5)
+
     def test_transforms_and_replay(self):
         rng = np.random.default_rng(124)
         reference = rng.random((1, 5, 7, 9), dtype=np.float32)

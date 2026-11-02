@@ -41,7 +41,7 @@ struct PaletteChannel {
             for (std::size_t i = 0; i < values.size(); ++i) if (!counts[i]) values[i] = float(b.first);
             gamma_values(values, p,
                 [&](const auto& v) { return palette_statistics(v, counts, n); },
-                [&](const auto& v) { return palette_bounds(v, counts); });
+                [&](const auto& v) { return palette_bounds(v, counts); }, t);
         } else {
             double m = 0, low = 0, high = 0;
             if constexpr (std::is_same_v<T, Contrast> || std::is_same_v<T, Invert>) {

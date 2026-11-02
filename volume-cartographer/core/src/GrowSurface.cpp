@@ -1,3 +1,4 @@
+#include <vc_reader/sampling.hpp>
 #include <shared_mutex>
 #include <omp.h>
 
@@ -557,7 +558,7 @@ static int add_surftrack_surfloss(QuadSurface *sm, const cv::Vec2i& p, SurfTrack
     if ((state(p) & STATE_LOC_VALID) == 0 || !data.valid_int(sm, p))
         return 0;
 
-    ceres::ResidualBlockId tmp = problem.AddResidualBlock(SurfaceLossD::Create(sm->rawPoints(), w), nullptr,
+    ceres::ResidualBlockId tmp = problem.AddResidualBlock(SurfaceLossD::Create(sm->pointSurface(), w), nullptr,
                                                           &points(p)[0], &data.loc(sm, p)[0]);
 
     if (res)
@@ -639,8 +640,8 @@ static int surftrack_add_local(QuadSurface *sm, const cv::Vec2i& p, SurfTrackerD
     }
 
     if (flags & LOSS_ZLOC)
-        problem.AddResidualBlock(ZLocationLoss<cv::Vec3f>::Create(
-            sm->rawPoints(),
+        problem.AddResidualBlock(ZLocationLoss::Create(
+            sm->pointSurface(),
             data.seed_coord[2] - (p[0]-data.seed_loc[0])*step*src_step, z_loc_loss_w),
             new ceres::HuberLoss(1.0), &data.loc(sm, p)[0]);
 
@@ -815,6 +816,7 @@ static cv::Mat_<cv::Vec3d> surftrack_genpoints_hr(SurfTrackerData &data, cv::Mat
     cv::Mat_<cv::Vec3f> points_hr(hr_rows, hr_cols, {0,0,0});
     cv::Mat_<int> counts_hr(hr_rows, hr_cols, 0);
     cv::Mat_<uint8_t> rejected_hr(hr_rows, hr_cols, static_cast<uint8_t>(0));
+    const auto inputSurface = QuadSurface(points, {1, 1}).pointSurface();
     const double sample_outlier_dist = std::max<double>(step_src * 3.0, step * step_src);
     const double sample_outlier_dist_sq = sample_outlier_dist * sample_outlier_dist;
     for(int j=used_area.y;j<used_area.br().y-1;j++)
@@ -824,10 +826,12 @@ static cv::Mat_<cv::Vec3d> surftrack_genpoints_hr(SurfTrackerData &data, cv::Mat
                 && state(j+1,i) & (STATE_LOC_VALID|STATE_COORD_VALID)
                 && state(j+1,i+1) & (STATE_LOC_VALID|STATE_COORD_VALID))
             {
-            const cv::Vec3d& c00 = points(j,i);
-            const cv::Vec3d& c01 = points(j,i+1);
-            const cv::Vec3d& c10 = points(j+1,i);
-            const cv::Vec3d& c11 = points(j+1,i+1);
+            const auto position = [&](float fx, float fy) {
+                const float xy[]{float(i) + fx, float(j) + fy};
+                cv::Vec3f out;
+                inputSurface->pointsAt(xy, 1, out.val, nullptr);
+                return cv::Vec3d(out);
+            };
             for(auto &sm : data.surfsC({j,i})) {
                 if (data.valid_int(sm,{j,i})
                     && data.valid_int(sm,{j,i+1})
@@ -843,13 +847,10 @@ static cv::Mat_<cv::Vec3d> surftrack_genpoints_hr(SurfTrackerData &data, cv::Mat
                         for(int sx=0;sx<=step;sx++) {
                             float fx = sx/step;
                             float fy = sy/step;
-                            cv::Vec2f l0 = (1-fx)*l00 + fx*l01;
-                            cv::Vec2f l1 = (1-fx)*l10 + fx*l11;
-                            cv::Vec2f l = (1-fy)*l0 + fy*l1;
+                            // Interpolate the correspondence parameters, then evaluate the bicubic XYZ surface.
+                            const cv::Vec2f l = vcr::sampling::bilinear(l00, l01, l10, l11, fx, fy);
                             if (loc_valid(sm->rawPoints(), l)) {
-                                cv::Vec3d c0 = (1-fx)*c00 + fx*c01;
-                                cv::Vec3d c1 = (1-fx)*c10 + fx*c11;
-                                cv::Vec3d expected = (1-fy)*c0 + fy*c1;
+                                const cv::Vec3d expected = position(fx, fy);
                                 cv::Vec3d sample = SurfTrackerData::lookup_int_loc(sm,l);
                                 const cv::Vec3d delta = sample - expected;
                                 const int y = j*step+sy;
@@ -872,9 +873,7 @@ static cv::Mat_<cv::Vec3d> surftrack_genpoints_hr(SurfTrackerData &data, cv::Mat
                     if (!counts_hr(y,x) && rejected_hr(y,x)) {
                         float fx = sx/step;
                         float fy = sy/step;
-                        cv::Vec3d c0 = (1-fx)*c00 + fx*c01;
-                        cv::Vec3d c1 = (1-fx)*c10 + fx*c11;
-                        cv::Vec3d c = (1-fy)*c0 + fy*c1;
+                        const cv::Vec3d c = position(fx, fy);
                         points_hr(y,x) = c;
                         counts_hr(y,x) = 1;
                     }
@@ -885,9 +884,7 @@ static cv::Mat_<cv::Vec3d> surftrack_genpoints_hr(SurfTrackerData &data, cv::Mat
                         if (!counts_hr(j*step+sy,i*step+sx)) {
                             float fx = sx/step;
                             float fy = sy/step;
-                            cv::Vec3d c0 = (1-fx)*c00 + fx*c01;
-                            cv::Vec3d c1 = (1-fx)*c10 + fx*c11;
-                            cv::Vec3d c = (1-fy)*c0 + fy*c1;
+                            const cv::Vec3d c = position(fx, fy);
                             points_hr(j*step+sy,i*step+sx) = c;
                             counts_hr(j*step+sy,i*step+sx) = 1;
                         }
@@ -1080,7 +1077,7 @@ static void optimize_surface_mapping(SurfTrackerData &data, cv::Mat_<uint8_t> &s
         for(int i=used_area.x;i<used_area.br().x;i++) {
             fix_points_z++;
             if (problem.HasParameterBlock(&data_inp.loc(sm_inp, {j,i})[0]))
-                problem.AddResidualBlock(ZLocationLoss<cv::Vec3d>::Create(points_new, data_inp.seed_coord[2] - (j-data.seed_loc[0])*step*src_step, z_loc_loss_w), new ceres::HuberLoss(1.0), &data_inp.loc(sm_inp, {j,i})[0]);
+                problem.AddResidualBlock(ZLocationLoss::Create(sm_inp->pointSurface(), data_inp.seed_coord[2] - (j-data.seed_loc[0])*step*src_step, z_loc_loss_w), new ceres::HuberLoss(1.0), &data_inp.loc(sm_inp, {j,i})[0]);
         }
 
     std::cout << "optimizer: optimizing " << res_count << " residuals, seed " << seed << std::endl;
@@ -1113,6 +1110,7 @@ static void optimize_surface_mapping(SurfTrackerData &data, cv::Mat_<uint8_t> &s
     }
 
     cv::Mat_<cv::Vec3d> points_hr = surftrack_genpoints_hr(data, new_state, points_inpainted, used_area, step, src_step);
+    const auto highResolutionSurface = QuadSurface(points_hr, {1, 1}).pointSurface();
     SurfTrackerData data_out;
     cv::Mat_<cv::Vec3d> points_out(points.size(), {-1,-1,-1});
     cv::Mat_<uint8_t> state_out(state.size(), 0);
@@ -1149,7 +1147,11 @@ static void optimize_surface_mapping(SurfTrackerData &data, cv::Mat_<uint8_t> &s
 
                     support_count(j,i) = src_loc_valid_count;
 
-                    points_out(j, i) = interp_lin_2d(points_hr, l);
+                    const float xy[]{float(l[1]), float(l[0])};
+                    cv::Vec3f position;
+                    highResolutionSurface->pointsAt(xy, 1, position.val, nullptr);
+                    if (!std::isfinite(position[0])) continue;
+                    points_out(j, i) = position;
                     state_out(j, i) = STATE_LOC_VALID | STATE_COORD_VALID;
 
                     std::set<QuadSurface *> surfs;

@@ -22,10 +22,7 @@ namespace vc3d::opendata {
 namespace {
 
 // Where the store's URL caches under the root, as every vc_reader cache does.
-std::filesystem::path normalGridsCacheDir(const std::filesystem::path& remoteCacheRoot, const std::string& url)
-{
-    return vcr::zarr::decodedCachePath(remoteCacheRoot, url);
-}
+
 
 constexpr const char* kCompleteMarker = "normal-grids-complete.json";
 
@@ -103,7 +100,7 @@ bool attachStreamingNormalGridsEntry(VolumePkg& pkg,
     if (remoteCacheRoot.empty() || info.url.empty()) {
         return false;
     }
-    const auto dir = normalGridsCacheDir(remoteCacheRoot, info.url);
+    const auto dir = vcr::zarr::decodedCachePath(remoteCacheRoot, info.url);
     if (!vc::core::util::writeNormalGridsRemoteMarker(dir, info.url)) {
         Logger()->warn("Failed to create streaming normal-grid cache at {}", dir.string());
         return false;
@@ -165,7 +162,7 @@ NormalGridsCacheState normalGridsCacheState(
     }
     state.complete = true;
     for (const auto& artifact : artifacts) {
-        const auto dir = normalGridsCacheDir(remoteCacheRoot, artifact.url);
+        const auto dir = vcr::zarr::decodedCachePath(remoteCacheRoot, artifact.url);
         std::error_code ec;
         bool artifactComplete = false;
         const auto completeMarker = dir / kCompleteMarker;
@@ -215,7 +212,7 @@ std::filesystem::path downloadOpenDataNormalGrids(
         return {};
     }
 
-    const auto finalDir = normalGridsCacheDir(remoteCacheRoot, info.url);
+    const auto finalDir = vcr::zarr::decodedCachePath(remoteCacheRoot, info.url);
     std::error_code completeEc;
     if (std::filesystem::is_regular_file(finalDir / kCompleteMarker, completeEc)) {
         return finalDir;

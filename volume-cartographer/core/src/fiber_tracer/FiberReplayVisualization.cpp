@@ -1,3 +1,4 @@
+#include "vc/core/util/QuadSurface.hpp"
 #include "vc/fiber_tracer/FiberReplayVisualization.hpp"
 #include <iomanip>
 #include <sstream>
@@ -1390,10 +1391,19 @@ cv::Mat_<uint8_t> renderFiberReplayPresenceTexture(
     if (sourceCoordinates.empty() || renderScale < 1 ||
         !std::isfinite(workingToBaseScale) || workingToBaseScale <= 0)
         throw std::invalid_argument("invalid presence texture coordinates/scale");
-    cv::Mat_<cv::Vec3f> coords;
-    cv::resize(sourceCoordinates, coords,
-        cv::Size(sourceCoordinates.cols * renderScale, sourceCoordinates.rows * renderScale),
-        0, 0, cv::INTER_LINEAR);
+    cv::Mat_<cv::Vec3f> coords = sourceCoordinates;
+    if (renderScale > 1) {
+        coords.create(sourceCoordinates.rows * renderScale, sourceCoordinates.cols * renderScale);
+        const auto surface = QuadSurface(sourceCoordinates, {1, 1}).pointSurface();
+        std::vector<float> xy(std::size_t(coords.cols) * 2);
+        for (int r = 0; r < coords.rows; ++r) {
+            for (int c = 0; c < coords.cols; ++c) {
+                xy[2*c] = std::clamp(float((c+.5)/renderScale-.5), 0.f, float(sourceCoordinates.cols-1));
+                xy[2*c+1] = std::clamp(float((r+.5)/renderScale-.5), 0.f, float(sourceCoordinates.rows-1));
+            }
+            surface->pointsAt(xy.data(), coords.cols, coords.ptr<float>(r), nullptr);
+        }
+    }
     cv::Mat_<uint8_t> image(coords.rows, coords.cols, uint8_t(0));
     // Bounded requests avoid materializing a full strip's interpolation data.
     constexpr size_t batchSize = 4096;

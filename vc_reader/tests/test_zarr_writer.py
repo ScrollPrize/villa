@@ -280,3 +280,53 @@ def test_affine_directions_and_normals():
     assert stretch.map_direction((1, 1, 0)) == pytest.approx((2 / 5**.5, 1 / 5**.5, 0))
     assert stretch.map_normal((1, 1, 0)) == pytest.approx((.5 / 1.25**.5, 1 / 1.25**.5, 0))
     assert stretch.normal_transform().map_direction((1, 1, 0)) == pytest.approx(stretch.map_normal((1, 1, 0)))
+
+
+@pytest.mark.parametrize('separator', ['.', '/'])
+def test_object_array_inventory_uses_native_store(tmp_path, separator):
+    from vc_reader import _reader
+    path = tmp_path / 'objects'
+    filters = [{'id': 'application-object-codec'}]
+    _reader.create_object_array(str(path), [3, 5], [1, 2], filters, separator)
+    key = path / separator.join(('1', '2'))
+    key.parent.mkdir(parents=True, exist_ok=True)
+    key.write_bytes(b'opaque application payload')
+    metadata, chunks = _reader.zarr_inventory(str(path), strict=True)
+    assert metadata['dtype'] == '|O' and metadata['filters'] == filters
+    assert chunks == [[1, 2]]
+    with pytest.raises(ValueError):
+        _reader.create_object_array(str(path), [3, 5], [1, 2], filters, separator)
+    outside = path / separator.join(('3', '0'))
+    outside.parent.mkdir(parents=True, exist_ok=True)
+    outside.write_bytes(b'out of bounds')
+    with pytest.raises(ValueError, match='outside'):
+        _reader.zarr_inventory(str(path))
+    outside.unlink()
+    (path / 'unexpected').write_bytes(b'unknown')
+    with pytest.raises(ValueError, match='unexpected'):
+        _reader.zarr_inventory(str(path), strict=True)
+
+
+def test_object_inventory_rejects_escaping_chunk_symlink(tmp_path):
+    from vc_reader import _reader
+    path = tmp_path / 'objects'
+    _reader.create_object_array(str(path), [2], [1], [{'id': 'objects'}])
+    external = tmp_path / 'outside'
+    external.write_bytes(b'payload')
+    (path / '0').symlink_to(external)
+    with pytest.raises(ValueError, match='escapes'):
+        _reader.zarr_inventory(str(path), strict=True)
+
+
+@pytest.mark.parametrize('shards', [None, (4, 4)])
+def test_v3_inventory_reuses_writer_chunk_listing(tmp_path, shards):
+    from vc_reader import _reader
+    path = tmp_path / 'array'
+    writer = ZarrWriter.create(path, shape=(8, 8), chunks=(2, 2), dtype='u1', version=3, shards=shards)
+    writer[0:2, 0:2] = 1
+    metadata, chunks = _reader.zarr_inventory(str(path), strict=True)
+    assert metadata['zarr_format'] == 3 and chunks == [[0, 0]]
+    unexpected = path / 'unexpected'
+    unexpected.write_bytes(b'bad')
+    with pytest.raises(ValueError, match='unexpected'):
+        _reader.zarr_inventory(str(path), strict=True)

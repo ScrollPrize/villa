@@ -141,3 +141,23 @@ def test_extra_channels_and_sibling_artifacts(tmp_path):
     from vc_reader import _reader
     _reader.snapshot(path, force=True)
     np.testing.assert_array_equal(tifffile.imread(tmp_path / 'backups/surface/0/labels.tif'), labels + 1)
+
+
+def test_bicubic_points_and_tangents_share_the_patch(tmp_path):
+    row, col = np.mgrid[:8, :9].astype(np.float32)
+    xyz = np.stack([col, row, col*col + 2*row*row], axis=-1)
+    surface = tifxyz.Surface(xyz)
+    rows = np.array([[3.5]], np.float32)
+    cols = np.array([[2.25]], np.float32)
+    positions, valid, du, dv = surface.points_at(rows, cols, tangents=True)
+    np.testing.assert_array_equal(valid, True)
+    np.testing.assert_allclose(positions[0, 0], [2.25, 3.5, 29.5625], atol=1e-6)
+    np.testing.assert_allclose(du[0, 0], [1, 0, 4.5], atol=1e-6)
+    np.testing.assert_allclose(dv[0, 0], [0, 1, 14], atol=1e-6)
+    linear, _ = surface.points_at(rows, cols, interpolation='linear')
+    assert abs(linear[0, 0, 2] - positions[0, 0, 2]) > .5
+    path = tmp_path / 'surface'
+    tifxyz.write(path, surface)
+    assert tuple(tifxyz.stored_shape(path)) == (8, 9)
+    outside, valid, du, dv = surface.points_at(rows, cols + 100, tangents=True)
+    assert not valid.any() and np.isnan(outside).all() and np.isnan(du).all() and np.isnan(dv).all()

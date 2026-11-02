@@ -100,3 +100,25 @@ def test_cuda_bulk_display_matches_cpu():
     mixed = torch.empty_like(base)
     _reader.blend(base, over, 1., mixed)
     np.testing.assert_array_equal(mixed.cpu().numpy(),[0xff504040,0xff204060])
+
+
+def test_conversion_rounding_saturation_and_scaling():
+    values = np.array([-1, .5, 1.5, 2.5, 254.5, 255.5, 65535, np.nan, np.inf, -np.inf], np.float32)
+    for use_cuda in (False, True):
+        if use_cuda:
+            import torch
+            if not torch.cuda.is_available():
+                continue
+            source = torch.as_tensor(values, device='cuda')
+            output = torch.empty(values.size, dtype=torch.uint8, device='cuda')
+            wide = torch.empty(values.size, dtype=torch.uint16, device='cuda')
+            host = lambda x: x.cpu().numpy()
+        else:
+            source, output, wide = values, np.empty(values.size, np.uint8), np.empty(values.size, np.uint16)
+            host = np.asarray
+        _reader.display_to_uint8(source, output, rounding='nearest_even', saturate_infinity=True)
+        np.testing.assert_array_equal(host(output), [0, 0, 2, 2, 254, 255, 255, 0, 255, 0])
+        _reader.display_to_uint16(source, wide)
+        np.testing.assert_array_equal(host(wide), [0, 1, 2, 3, 255, 256, 65535, 0, 65535, 0])
+        _reader.display_to_uint8(source, output, scale=1/256, rounding='nearest_even')
+        np.testing.assert_array_equal(host(output), [0, 0, 0, 0, 1, 1, 255, 0, 0, 0])

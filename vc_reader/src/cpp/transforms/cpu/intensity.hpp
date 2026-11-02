@@ -99,15 +99,21 @@ inline ChannelPlan channel_parameters(const Smear& t, const Array& a, Random&) {
 // Share the transform with compact palette consumers. Their statistics and
 // bounds must be weighted by the actual number of voxels at each palette entry.
 template<class T, class Statistics, class Bounds>
-inline void gamma_values(std::vector<T>& v, const ChannelPlan& p, Statistics&& statistics, Bounds&& bounds) {
+inline void gamma_values(std::vector<T>& v, const ChannelPlan& p, Statistics&& statistics, Bounds&& bounds, const Gamma& t = {}) {
     bool invert = p.values[1], retain = p.values[2];
     if (invert) for (auto& x : v) x = -x;
     const auto before = retain ? statistics(v) : std::pair{0., 0.};
     const auto [low, high] = bounds(v); double range = high - low;
     for (auto& x : v) {
-        T value=std::pow((x-T(low))/std::max(T(range),T(1e-7)),T(p.values[0]))*T(range)+T(low);
+        auto unit = (x-T(low))/std::max(T(range),T(t.eps));
+        if (t.clip) unit = std::clamp(unit, T(0), T(1));
+        T value=std::pow(unit,T(p.values[0]))*T(range)+T(low);
         if constexpr(std::is_same_v<T,float>) if(!std::isfinite(value) || !std::isfinite(T(range)))
-            value=T(std::pow((double(x)-low)/std::max(range,1e-7),p.values[0])*range+low);
+            {
+                double wide = (double(x)-low)/std::max(range,t.eps);
+                if (t.clip) wide = std::clamp(wide, 0., 1.);
+                value=T(std::pow(wide,p.values[0])*range+low);
+            }
         x=value;
     }
     if (retain) {
@@ -117,13 +123,26 @@ inline void gamma_values(std::vector<T>& v, const ChannelPlan& p, Statistics&& s
     if (invert) for (auto& x : v) x = -x;
 }
 template<class T>
-inline void channel_apply(const Gamma&, std::vector<T>& v, const Grid&, const ChannelPlan& p) {
+inline void channel_apply(const Gamma& t, std::vector<T>& v, const Grid&, const ChannelPlan& p,
+                          const std::vector<std::uint8_t>& valid = {}) {
+    const auto selected = [&](const auto& values) {
+        std::vector<T> out;
+        for (std::size_t i = 0; i < values.size(); ++i) if (valid[i]) out.push_back(values[i]);
+        return out;
+    };
     gamma_values(v, p,
-        [](const auto& values) { double m = mean(values); return std::pair{m, deviation(values, m)}; },
-        [](const auto& values) {
-            const auto [lo, hi] = std::minmax_element(values.begin(), values.end());
-            return std::pair<double, double>{*lo, *hi};
-        });
+        [&](const auto& values) {
+            if (valid.empty()) { double m = mean(values); return std::pair{m, deviation(values, m)}; }
+            const auto chosen = selected(values); double m = mean(chosen); return std::pair{m, deviation(chosen, m)};
+        },
+        [&](const auto& values) {
+            // Bounds need no temporary selection buffer.
+            double low = INFINITY, high = -INFINITY;
+            for (std::size_t i = 0; i < values.size(); ++i) if (valid.empty() || valid[i]) {
+                low = std::min(low, double(values[i])); high = std::max(high, double(values[i]));
+            }
+            return std::pair{low, high};
+        }, t);
 }
 
 template<class T,class Real>
@@ -536,6 +555,12 @@ void apply(const T& t, Sample& s, const Parameters& p) {
                   std::is_same_v<T, Sharpen> || std::is_same_v<T, LocalSmoothing>) {
         for (const auto& c : p.channels) {
             auto& a = s.at(c.key).array; Grid g(a.spatial());
+            const auto run_channel = [&](auto& values) {
+                if constexpr (std::is_same_v<T, Gamma>) {
+                    const auto valid = t.masked ? normalization_detail::valid_voxels(s, c.key, c.channel) : std::vector<std::uint8_t>{};
+                    channel_apply(t, values, g, c, valid);
+                } else channel_apply(t, values, g, c);
+            };
             if (a.bytes == 4) {
                 auto* data = static_cast<float*>(a.data()) + c.channel * g.size;
                 // Float arithmetic is sufficient for ordinary images. Retain
@@ -546,7 +571,7 @@ void apply(const T& t, Sample& s, const Parameters& p) {
                     if constexpr (std::is_same_v<T, Sharpen>) limit /= std::max(1., std::abs(c.values[0]));
                     if (std::any_of(data, data + g.size, [&](float x) { return std::abs(double(x)) > limit; }) ||
                         (std::is_same_v<T, Sharpen> && std::abs(c.values[0]) > std::numeric_limits<float>::max())) {
-                        auto values = a.channel(c.channel); channel_apply(t, values, g, c); a.channel(c.channel, values);
+                        auto values = a.channel(c.channel); run_channel(values); a.channel(c.channel, values);
                         continue;
                     }
                 }
@@ -554,14 +579,14 @@ void apply(const T& t, Sample& s, const Parameters& p) {
                     // The blur already owns a separate buffer. Blend directly
                     // into the writable image instead of copying out and back.
                     std::span<float> values(data, g.size);
-                    channel_apply(t, values, g, c);
+                    run_channel(values);
                 } else {
                     std::vector<float> values(data, data + g.size);
-                    channel_apply(t, values, g, c);
+                    run_channel(values);
                     std::copy(values.begin(), values.end(), data);
                 }
             } else {
-                auto values = a.channel(c.channel); channel_apply(t, values, g, c); a.channel(c.channel, values);
+                auto values = a.channel(c.channel); run_channel(values); a.channel(c.channel, values);
             }
         }
         restore_valid(s);
@@ -583,13 +608,17 @@ void apply(const T& t, Sample& s, const Parameters& p) {
                               std::is_same_v<T, BrightnessGradient> || std::is_same_v<T, LocalContrast> || std::is_same_v<T, LocalGamma>)
                     channel_apply(t, v, g, c);
                 else {
-                    double m = 0, low = 0, high = 0;
+                    double m = 0, low = INFINITY, high = -INFINITY;
                     if constexpr (std::is_same_v<T, Contrast> || std::is_same_v<T, Invert>) {
-                        for (auto x : v) m += double(x);
-                        m /= v.size();
-                    }
-                    if constexpr (std::is_same_v<T, Contrast>) {
-                        auto bounds = std::minmax_element(v.begin(), v.end()); low = *bounds.first; high = *bounds.second;
+                        std::vector<std::uint8_t> valid;
+                        if constexpr (std::is_same_v<T, Contrast>)
+                            if (t.masked) valid = normalization_detail::valid_voxels(s, c.key, c.channel);
+                        std::size_t count = 0;
+                        for (std::size_t i = 0; i < v.size(); ++i) if (valid.empty() || valid[i]) {
+                            m += double(v[i]); ++count;
+                            low = std::min(low, double(v[i])); high = std::max(high, double(v[i]));
+                        }
+                        m /= count;
                     }
                     for (auto& x : v) {
                         V y = pointwise_intensity(t, x, c, V(m), V(low), V(high));

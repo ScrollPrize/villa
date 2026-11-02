@@ -1396,16 +1396,7 @@ private:
                 throw std::out_of_range("chunk index outside the array");
     }
 
-    std::string key(const Index& idx) const
-    {
-        std::string k;
-        for (std::size_t i = 0; i < idx.size(); ++i) {
-            if (i)
-                k += spec_.separator;
-            k += std::to_string(idx[i]);
-        }
-        return k;
-    }
+    std::string key(const Index& idx) const { return chunkKey(idx, spec_.separator); }
 
     std::string marker_path(const LayerSpec& l, const std::string& k) const
     {

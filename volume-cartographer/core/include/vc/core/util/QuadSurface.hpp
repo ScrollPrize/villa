@@ -485,7 +485,6 @@ private:
     // at the same dir. Recursive so a public entry point (saveOverwrite) can hold
     // it across nested saveSnapshot()/save() calls on the same thread without
     // self-deadlock.
-    static std::recursive_mutex& dirWriteMutex(const std::filesystem::path& dir);
 };
 
 // --- vc_object_store surfaces ------------------------------------------------

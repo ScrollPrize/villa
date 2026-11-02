@@ -1,4 +1,5 @@
 #pragma once
+#include <vc_reader/grid.hpp>
 
 #include <iostream>
 #include "vc/core/util/NormalGridVolume.hpp"
@@ -188,65 +189,39 @@ struct StraightLoss2D {
     }
 };
 
-template<typename T, typename E, int C>
-void interp_lin_2d(const cv::Mat_<cv::Vec<E,C>> &m, const T &y, const T &x, T *v) {
-    int yi = val(y);
-    int xi = val(x);
+struct SurfaceLossD : ceres::SizedCostFunction<3, 3, 2> {
+    SurfaceLossD(std::shared_ptr<const vcr::grid::Surface> surface, float weight)
+        : surface_(std::move(surface)), weight_(weight) {}
 
-    T fx = x - T(xi);
-    T fy = y - T(yi);
-
-    cv::Vec<E,C> c00 = m(yi,xi);
-    cv::Vec<E,C> c01 = m(yi,xi+1);
-    cv::Vec<E,C> c10 = m(yi+1,xi);
-    cv::Vec<E,C> c11 = m(yi+1,xi+1);
-
-    for (int i=0;i<C;i++) {
-        T c0 = (T(1)-fx)*T(c00[i]) + fx*T(c01[i]);
-        T c1 = (T(1)-fx)*T(c10[i]) + fx*T(c11[i]);
-        v[i] = (T(1)-fy)*c0 + fy*c1;
-    }
-}
-
-template<typename E1, typename E2, int C>
-cv::Vec<E2,C> interp_lin_2d(const cv::Mat_<cv::Vec<E2,C>> &m, const cv::Vec<E1,2> &l)
-{
-    cv::Vec<E1,C> v;
-    interp_lin_2d(m, l[0], l[1], &v[0]);
-    return v;
-}
-
-struct SurfaceLossD {
-    //NOTE we expect loc to be [y, x]
-    SurfaceLossD(const cv::Mat_<cv::Vec3f> &m, float w) : _m(m), _w(w) {};
-    template <typename T>
-    bool operator()(const T* const p, const T* const l, T* residual) const {
-        T v[3];
-
-        if (!loc_valid(_m, {val(l[0]), val(l[1])})) {
-            residual[0] = T(0);
-            residual[1] = T(0);
-            residual[2] = T(0);
-            return true;
+    // Parameter locations are row, column; native sampling takes column, row.
+    bool Evaluate(double const* const* parameters, double* residual, double** jacobians) const override {
+        const float xy[]{float(parameters[1][1]), float(parameters[1][0])};
+        float point[3], du[3], dv[3];
+        surface_->pointsAt(xy, 1, point, nullptr, du, dv);
+        std::fill_n(residual, 3, 0.);
+        if (jacobians) {
+            if (jacobians[0]) std::fill_n(jacobians[0], 9, 0.);
+            if (jacobians[1]) std::fill_n(jacobians[1], 6, 0.);
         }
-
-        interp_lin_2d(_m, l[0], l[1], v);
-
-        residual[0] = T(_w)*(v[0] - p[0]);
-        residual[1] = T(_w)*(v[1] - p[1]);
-        residual[2] = T(_w)*(v[2] - p[2]);
-
+        if (!std::isfinite(point[0])) return true;
+        for (int axis = 0; axis < 3; ++axis) {
+            residual[axis] = weight_ * (double(point[axis]) - parameters[0][axis]);
+            if (jacobians) {
+                if (jacobians[0]) jacobians[0][axis * 3 + axis] = -weight_;
+                if (jacobians[1]) {
+                    jacobians[1][axis * 2] = weight_ * dv[axis];
+                    jacobians[1][axis * 2 + 1] = weight_ * du[axis];
+                }
+            }
+        }
         return true;
     }
-
-    const cv::Mat_<cv::Vec3f> _m;
-    float _w;
-
-    static ceres::CostFunction* Create(const cv::Mat_<cv::Vec3f> &m, float w = 1.0)
-    {
-        return new ceres::AutoDiffCostFunction<SurfaceLossD, 3, 3, 2>(new SurfaceLossD(m, w));
+    static ceres::CostFunction* Create(std::shared_ptr<const vcr::grid::Surface> surface, float weight = 1) {
+        return new SurfaceLossD(std::move(surface), weight);
     }
-
+private:
+    std::shared_ptr<const vcr::grid::Surface> surface_;
+    double weight_;
 };
 
 struct LinChkDistLoss {
@@ -279,34 +254,27 @@ struct LinChkDistLoss {
 
 };
 
-template <typename V>
-struct ZLocationLoss {
-    ZLocationLoss(const cv::Mat_<V> &m, float z, float w) :  _m(m), _z(z), _w(w) {};
-    template <typename T>
-    bool operator()(const T* const l, T* residual) const {
-        T p[3];
-        
-        if (!loc_valid(_m, {val(l[0]), val(l[1])})) {
-            residual[0] = T(0);
-            return true;
+struct ZLocationLoss : ceres::SizedCostFunction<1, 2> {
+    ZLocationLoss(std::shared_ptr<const vcr::grid::Surface> surface, float z, float weight)
+        : surface_(std::move(surface)), z_(z), weight_(weight) {}
+    bool Evaluate(double const* const* parameters, double* residual, double** jacobians) const override {
+        const float xy[]{float(parameters[0][1]), float(parameters[0][0])};
+        float point[3], du[3], dv[3];
+        surface_->pointsAt(xy, 1, point, nullptr, du, dv);
+        const bool valid = std::isfinite(point[0]);
+        residual[0] = valid ? weight_ * (double(point[2]) - z_) : 0.;
+        if (jacobians && jacobians[0]) {
+            jacobians[0][0] = valid ? weight_ * dv[2] : 0.;
+            jacobians[0][1] = valid ? weight_ * du[2] : 0.;
         }
-        
-        interp_lin_2d(_m, l[0], l[1], p);
-        
-        residual[0] = T(_w)*(p[2] - T(_z));
-        
         return true;
     }
-    
-    const cv::Mat_<V> _m;
-    float _z;
-    float _w;
-    
-    static ceres::CostFunction* Create(const cv::Mat_<V> &m, float z, float w = 1.0)
-    {
-        return new ceres::AutoDiffCostFunction<ZLocationLoss, 1, 2>(new ZLocationLoss(m, z, w));
+    static ceres::CostFunction* Create(std::shared_ptr<const vcr::grid::Surface> surface, float z, float weight = 1) {
+        return new ZLocationLoss(std::move(surface), z, weight);
     }
-    
+private:
+    std::shared_ptr<const vcr::grid::Surface> surface_;
+    double z_, weight_;
 };
 
 /**

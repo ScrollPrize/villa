@@ -27,6 +27,7 @@ struct Metadata {
     std::optional<Bounds> bbox;
     std::optional<double> area;
     nlohmann::json extra = nlohmann::json::object();  // every other meta.json field
+    [[nodiscard]] nlohmann::json document() const;
 };
 
 // The extent of a grid at full resolution: as vc_render_tifxyz sizes its output, the stored
@@ -61,6 +62,8 @@ struct Coordinates {
 // meta.json of a tifxyz directory. Scale must be two positive finite numbers.
 [[nodiscard]] Metadata parseMetadata(const nlohmann::json& document, const std::string& location);
 [[nodiscard]] Metadata readMetadata(const std::string& location, const sources::OptionsFor& options = {});
+// Inspect the stored YX shape using only the x coordinate image's header.
+[[nodiscard]] std::array<std::int64_t, 2> storedShape(const std::string& location, const sources::OptionsFor& options = {});
 
 // mask.tif at `location` for a grid of rows x cols: nonzero where allowed, empty when there is none.
 // Its first page counts; at an integer multiple of the grid a vertex needs its whole block, any
@@ -113,7 +116,8 @@ public:
     // Positions and normals at `n` real-valued grid positions (`xy`: column, row pairs), NaN
     // where no patch covers one. Normals are as grid::Surface::resample gives them: with the
     // unit spacing here, unit normals (column direction x row direction).
-    void pointsAt(const float* xy, std::size_t n, grid::Interpolation interpolation, float* xyz, float* normals = nullptr) const;
+    void pointsAt(const float* xy, std::size_t n, grid::Interpolation interpolation, float* xyz, float* normals = nullptr,
+                  float* columnTangents = nullptr, float* rowTangents = nullptr) const;
     // The same at every pixel of a raster.
     void resample(const grid::Raster& raster, grid::Interpolation interpolation, float* xyz, float* normals = nullptr) const;
     // tifxyz::fullRaster at this surface's scale.

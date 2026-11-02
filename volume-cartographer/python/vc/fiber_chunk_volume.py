@@ -31,7 +31,8 @@ def sparse_keys(path, channel, spacing, base_shape_zyx, core_base):
     and other channel chunks cannot create jobs.
     """
     path = Path(path)
-    metadata = json.loads((path / ".zarray").read_text())
+    from vc_reader import zarr_inventory
+    metadata, stored_chunks = zarr_inventory(os.fspath(path))
     shape, chunks = metadata["shape"], metadata["chunks"]
     if metadata.get("zarr_format") != 2 or len(shape) not in (3, 4) or len(chunks) != len(shape):
         raise ValueError("enumeration requires Zarr v2 ZYX or CZYX storage")
@@ -61,21 +62,7 @@ def sparse_keys(path, channel, spacing, base_shape_zyx, core_base):
             raise ValueError("recursive native pooling inventory")
         return sparse_keys(source, 0, spacing / 2, base_shape_zyx, core_base)
     keys = set()
-    # Walk only numeric paths; never descend into unrelated metadata/scratch.
-    def chunks_on_disk(root, prefix=()):
-        with os.scandir(root) as entries:
-            for entry in entries:
-                if separator == ".":
-                    parts = entry.name.split(".")
-                    if entry.is_file() and len(parts) == len(shape) and all(p.isdecimal() for p in parts):
-                        yield tuple(map(int, parts))
-                elif entry.name.isdecimal():
-                    key = prefix + (int(entry.name),)
-                    if len(key) == len(shape) and entry.is_file():
-                        yield key
-                    elif len(key) < len(shape) and entry.is_dir():
-                        yield from chunks_on_disk(entry.path, key)
-    for index in chunks_on_disk(path):
+    for index in stored_chunks:
         if any(i * c >= n for i, c, n in zip(index, chunks, shape)):
             raise ValueError(f"stored chunk outside array shape: {index}")
         if len(shape) == 4 and index[0] != channel // chunks[0]:

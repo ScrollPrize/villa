@@ -283,6 +283,17 @@ NB_MODULE(_reader, m)
         .def_prop_ro("chunk_nbytes", &ArrayMeta::chunkBytes)
         .def("codec", &ArrayMeta::codec)
         .def("decoded_zarray", [](const ArrayMeta& a) { return py_json(a.decodedZarray()); });
+    m.def("zarr_inventory", [](const std::string& path, bool strict) {
+        vcr::zarr::ArrayInventory result;
+        { nb::gil_scoped_release release; result=vcr::zarr::inventory(path,{},strict); }
+        return nb::make_tuple(py_json(result.metadata),result.chunks);
+    }, "path"_a, "strict"_a=false);
+    m.def("create_object_array", [](const std::string& path,const vcr::Index& shape,const vcr::Index& chunks,
+                                    const nb::object& filters,const std::string& separator) {
+        const auto config=to_json(filters);
+        nb::gil_scoped_release release;
+        vcr::zarr::createObjectArray(path,shape,chunks,config,separator);
+    }, "path"_a,"shape"_a,"chunks"_a,"filters"_a,"separator"_a="");
     m.def("parse_array_meta", [](const nb::object& metadata) { return vcr::zarr::parseArrayMeta(to_json(metadata)); }, "metadata"_a);
 
     using vcr::zarr::CacheLayer;
@@ -394,24 +405,39 @@ NB_MODULE(_reader, m)
         } else vcr::display::overlayLut(out, color, low, high, intensity, premultiplied);
         return out;
     }, "color"_a, "low"_a, "high"_a, "intensity_as_alpha"_a, "premultiplied"_a, "cuda"_a = false);
-    m.def("display_to_uint8", [](nb::ndarray<const float, nb::ndim<1>, nb::c_contig> input,
-                                nb::ndarray<std::uint8_t, nb::ndim<1>, nb::c_contig> output,
-                                nb::ndarray<std::uint8_t, nb::ndim<1>, nb::c_contig> coverage) {
-        if (input.size()!=output.size() || input.size()!=coverage.size() ||
-            input.device_type()!=output.device_type() || input.device_type()!=coverage.device_type() ||
-            input.device_id()!=output.device_id() || input.device_id()!=coverage.device_id())
-            throw nb::value_error("display buffers must have matching size and device");
-        nb::gil_scoped_release release;
-        if (input.device_type()==nb::device::cpu::value)
-            vcr::display::toUint8(input.data(),input.size(),output.data(),coverage.data());
+    const auto bindConversion = [&]<class T>(const char* name, const char* defaultRounding, bool defaultSaturate) {
+        m.def(name, [](nb::ndarray<const float, nb::ndim<1>, nb::c_contig> input,
+                       nb::ndarray<T, nb::ndim<1>, nb::c_contig> output,
+                       std::optional<nb::ndarray<std::uint8_t, nb::ndim<1>, nb::c_contig>> coverage,
+                       double scale, const std::string& rounding, bool saturateInfinity) {
+            if (input.size()!=output.size() || input.device_type()!=output.device_type() || input.device_id()!=output.device_id() ||
+                (coverage && (coverage->size()!=input.size() || coverage->device_type()!=input.device_type() || coverage->device_id()!=input.device_id())))
+                throw nb::value_error("display buffers must have matching size and device");
+            if (!std::isfinite(scale)) throw nb::value_error("display scale must be finite");
+            using namespace vcr::display;
+            Conversion conversion{scale, Rounding::Truncate, saturateInfinity};
+            if (rounding == "nearest_even") conversion.rounding = Rounding::NearestEven;
+            else if (rounding == "half_up") conversion.rounding = Rounding::HalfUp;
+            else if (rounding != "truncate") throw nb::value_error("unknown display rounding");
+            if constexpr (sizeof(T) == 2) if (coverage) throw nb::value_error("uint16 conversion does not produce coverage");
+            nb::gil_scoped_release release;
+            if (input.device_type()==nb::device::cpu::value) {
+                if constexpr (sizeof(T) == 1) toUint8(input.data(),input.size(),output.data(),coverage ? coverage->data() : nullptr,conversion);
+                else toUint16(input.data(),input.size(),output.data(),conversion);
+            }
 #ifdef VC_READER_CUDA
-        else if (input.device_type()==nb::device::cuda::value) {
-            vcr::device::Guard guard(input.device_id());
-            vcr::display::cuda::toUint8(input.data(),input.size(),output.data(),coverage.data());
-        }
+            else if (input.device_type()==nb::device::cuda::value) {
+                vcr::device::Guard guard(input.device_id());
+                if constexpr (sizeof(T) == 1) vcr::display::cuda::toUint8(input.data(),input.size(),output.data(),coverage ? coverage->data() : nullptr,conversion);
+                else vcr::display::cuda::toUint16(input.data(),input.size(),output.data(),conversion);
+            }
 #endif
-        else throw std::invalid_argument("unsupported display device");
-    }, "input"_a.noconvert(), "output"_a.noconvert(), "coverage"_a.noconvert());
+            else throw nb::value_error("unsupported display device");
+        }, "input"_a.noconvert(), "output"_a.noconvert(), "coverage"_a.none() = nb::none(),
+           "scale"_a = 1., "rounding"_a = defaultRounding, "saturate_infinity"_a = defaultSaturate);
+    };
+    bindConversion.template operator()<std::uint8_t>("display_to_uint8", "truncate", false);
+    bindConversion.template operator()<std::uint16_t>("display_to_uint16", "half_up", true);
     m.def("apply_lut", [](nb::ndarray<const std::uint8_t, nb::ndim<2>, nb::c_contig> input,
                             nb::ndarray<const std::uint32_t, nb::ndim<1>, nb::c_contig> lut,
                             nb::ndarray<std::uint32_t, nb::ndim<2>, nb::c_contig> output) {
@@ -675,7 +701,7 @@ NB_MODULE(_reader, m)
                 w.writeChunk(chunk, bytes, data.nbytes());
         }, "chunk"_a, "data"_a, "skip_empty"_a = false)
         .def("chunk_exists", &Writer::chunkExists, "chunk"_a, nb::call_guard<nb::gil_scoped_release>())
-        .def("stored_chunks", &Writer::storedChunks, nb::call_guard<nb::gil_scoped_release>())
+        .def("stored_chunks", &Writer::storedChunks, "strict"_a = false, nb::call_guard<nb::gil_scoped_release>())
         .def("remove_chunk", &Writer::removeChunk, "chunk"_a, nb::call_guard<nb::gil_scoped_release>())
         .def("set_fill_value", [](Writer& w, const nb::object& value) {
             const auto fill = to_json(value);

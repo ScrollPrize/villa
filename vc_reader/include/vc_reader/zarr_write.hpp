@@ -57,6 +57,19 @@ private:
     std::unique_ptr<Impl> impl_;
 };
 
+// Metadata and stored chunk indices without decoding payloads. Object arrays are
+// supported; their filters and payloads belong to the caller. strict rejects
+// unexpected files, escaping symlinks and out-of-range keys. V2 numeric
+// out-of-range keys also raise when strict is false.
+struct ArrayInventory { Json metadata; std::vector<Index> chunks; };
+ArrayInventory inventory(const std::filesystem::path& path, const Access& access = {}, bool strict = false);
+// Zarr-v2 object-array metadata, with caller-owned object codecs. An empty
+// separator omits the field (the v2 default is '.'). No numeric decoder is used.
+Json objectArrayDocument(const Index& shape, const Index& chunks, const Json& filters, const std::string& separator = "");
+void createObjectArray(const std::filesystem::path& path, const Index& shape, const Index& chunks,
+                       const Json& filters, const std::string& separator = "", const Access& access = {},
+                       Durability durability = Durability::Fast);
+
 // ---- codecs on plain bytes -------------------------------------------------------------
 
 // `data` encoded by a numcodecs compressor config ({"id": "blosc", "cname": ...}; null copies),
@@ -122,7 +135,8 @@ public:
     bool chunkExists(const Index& chunk) const;
     // Every stored chunk, in index order, from a listing of the store: the grid is not scanned,
     // except inside a shard, whose index is read per chunk.
-    std::vector<Index> storedChunks() const;
+    // strict rejects unexpected files, escaping chunk symlinks and out-of-range keys.
+    std::vector<Index> storedChunks(bool strict = false) const;
     // `data` is one decoded chunk, exactly meta().chunkBytes() bytes in C order.
     void writeChunk(const Index& chunk, const std::uint8_t* data, std::size_t size);
     // Skips a chunk that is entirely the fill value, removing any stored one. A

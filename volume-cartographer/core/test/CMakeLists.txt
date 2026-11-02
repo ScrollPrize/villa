@@ -524,6 +524,7 @@ vc_add_test(NAME test_colormaps SOURCES test_colormaps.cpp
 vc_add_test(NAME test_quadsurface_io)
 
 vc_add_test(NAME test_quadsurface_pointto)
+vc_add_test(NAME test_surface_losses LIBS doctest::doctest vc_core Ceres::ceres)
 
 vc_add_test(NAME test_quadsurface_snapshot)
 

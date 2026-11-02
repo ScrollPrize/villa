@@ -1,9 +1,20 @@
 #pragma once
 
+#include "../reader_types.hpp"
+#include <stdexcept>
 #include <map>
 #include <string>
 
 namespace vcr::zarr::detail {
+inline void validateShape(const Index& shape, const Index& chunks)
+{
+    if (shape.empty() || shape.size() != chunks.size())
+        throw std::invalid_argument("Zarr shape and chunks must have the same nonzero rank");
+    for (std::size_t i = 0; i < shape.size(); ++i)
+        if (shape[i] < 0 || chunks[i] <= 0)
+            throw std::invalid_argument("invalid Zarr shape or chunks");
+}
+
 // The same names are used when normalizing metadata and when creating arrays.
 inline const std::map<std::string, std::string> v3Types{
     {"bool", "|b1"}, {"uint8", "|u1"}, {"uint16", "<u2"}, {"uint32", "<u4"},

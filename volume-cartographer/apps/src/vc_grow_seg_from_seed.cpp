@@ -1422,12 +1422,13 @@ static int run_main(int argc, char *argv[])
             std::cout << "  Resizing grid from " << cols << "x" << rows
                       << " to " << new_cols << "x" << new_rows << std::endl;
 
-            // Custom bilinear interpolation that properly handles invalid markers
+            // Resize with the reader's masked interpolation and half-pixel coordinates.
             // cv::resize doesn't work because it interpolates invalid (-1,-1,-1) markers
             // as if they were real coordinates, corrupting the result
             cv::Mat_<cv::Vec3f> resized_points(new_rows, new_cols);
             resized_points.setTo(invalid_marker);
 
+            const auto surface = QuadSurface(dst_points, {1, 1}).pointSurface();
             #pragma omp parallel for schedule(static)
             for (int new_r = 0; new_r < new_rows; ++new_r) {
                 for (int new_c = 0; new_c < new_cols; ++new_c) {
@@ -1436,34 +1437,10 @@ static int run_main(int argc, char *argv[])
                     float orig_r = (static_cast<float>(new_r) + 0.5f) / static_cast<float>(scale_factor) - 0.5f;
                     float orig_c = (static_cast<float>(new_c) + 0.5f) / static_cast<float>(scale_factor) - 0.5f;
 
-                    // Clamp to valid range
-                    orig_r = std::clamp(orig_r, 0.0f, static_cast<float>(rows - 1));
-                    orig_c = std::clamp(orig_c, 0.0f, static_cast<float>(cols - 1));
-
-                    // Bilinear interpolation indices
-                    int r0 = static_cast<int>(std::floor(orig_r));
-                    int c0 = static_cast<int>(std::floor(orig_c));
-                    int r1 = std::min(r0 + 1, rows - 1);
-                    int c1 = std::min(c0 + 1, cols - 1);
-
-                    // Check all 4 corners are valid - skip if any are invalid
-                    if (!vc::geometry::validSurfacePoint(dst_points(r0, c0)) || !vc::geometry::validSurfacePoint(dst_points(r0, c1)) ||
-                        !vc::geometry::validSurfacePoint(dst_points(r1, c0)) || !vc::geometry::validSurfacePoint(dst_points(r1, c1))) {
-                        continue;  // Leave as invalid marker
-                    }
-
-                    float t_r = orig_r - static_cast<float>(r0);
-                    float t_c = orig_c - static_cast<float>(c0);
-
-                    cv::Vec3f p00 = dst_points(r0, c0);
-                    cv::Vec3f p01 = dst_points(r0, c1);
-                    cv::Vec3f p10 = dst_points(r1, c0);
-                    cv::Vec3f p11 = dst_points(r1, c1);
-
-                    // Bilinear interpolation of world coordinates
-                    cv::Vec3f top = p00 * (1.0f - t_c) + p01 * t_c;
-                    cv::Vec3f bot = p10 * (1.0f - t_c) + p11 * t_c;
-                    resized_points(new_r, new_c) = top * (1.0f - t_r) + bot * t_r;
+                    const float xy[]{std::clamp(orig_c, 0.f, float(cols-1)), std::clamp(orig_r, 0.f, float(rows-1))};
+                    cv::Vec3f point;
+                    surface->pointsAt(xy, 1, point.val, nullptr);
+                    if (std::isfinite(point[0])) resized_points(new_r, new_c) = point;
                 }
             }
 

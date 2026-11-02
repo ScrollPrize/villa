@@ -42,10 +42,7 @@ namespace {
 
 // Public buckets are read anonymously, others with the environment's AWS credentials
 // when allowed (vcr::zarr::resolveAccess).
-[[nodiscard]] vcr::zarr::Access lasagnaAccess(const std::string& location, bool discover)
-{
-    return vcr::zarr::resolveAccess(location, discover ? vcr::zarr::AuthMode::Auto : vcr::zarr::AuthMode::Anonymous);
-}
+
 
 // A remote location with no slash ending its path; its query (a signed URL's token) kept.
 [[nodiscard]] std::string runtimeLocation(std::string_view location)
@@ -188,7 +185,7 @@ MaterializedLasagnaManifest materializeLasagnaManifest(const std::string& manife
         std::filesystem::remove(manifestPath, ignored);
     }
     const bool hit = std::filesystem::is_regular_file(manifestPath);
-    const auto access = lasagnaAccess(identity, options.discoverAwsCredentials);
+    const auto access = vcr::zarr::resolveAccess(identity, options.discoverAwsCredentials ? vcr::zarr::AuthMode::Auto : vcr::zarr::AuthMode::Anonymous);
     vcr::sources::EncodedFiles files([root, access](const std::string&) {
         auto open = vc::settings::remoteOpenOptions(root);
         open.access = access;
@@ -283,7 +280,7 @@ vcr::zarr::OpenedArray openLasagnaGroupArray(
     const auto& location = group.sourceLocation;
     auto options = vc::settings::remoteOpenOptions(group.remoteCacheRoot);
     options.memoryCache = std::move(cache);
-    options.access = lasagnaAccess(location, group.discoverAwsCredentials);
+    options.access = vcr::zarr::resolveAccess(location, group.discoverAwsCredentials ? vcr::zarr::AuthMode::Auto : vcr::zarr::AuthMode::Anonymous);
     return vcr::zarr::openArray(location, options);
 }
 
