@@ -51,6 +51,18 @@ std::set<std::string> HubLeaseCounts::held()
     return result;
 }
 
+bool HubLeaseCounts::retain(const std::vector<std::string>& objects, const HubStatus& status, int64_t validThroughUs)
+{
+    std::lock_guard lock(mutex);
+    if (!std::all_of(objects.begin(), objects.end(), [&](const auto& id) {
+            return counts.contains(id) && std::any_of(status.leases.begin(), status.leases.end(), [&](const auto& lease) {
+                return lease.objectUuid == id && lease.holder == status.replica && lease.expiresUs > validThroughUs;
+            });
+        })) return false;
+    for (const auto& id : objects) ++counts.at(id);
+    return true;
+}
+
 HubWorker::HubWorker(ObjectStore& replica, const HubSessionOptions& options, std::function<void()> statusChanged)
     : replica_(replica), options_(options), statusChanged_(std::move(statusChanged))
 {
@@ -110,6 +122,17 @@ LeaseHold HubWorker::hold(const std::vector<std::string>& objects)
 {
     std::vector<std::string> ids;
     for (const auto& object : objects) ids.push_back(formatUuid(parseUuid(object)));
+    LeaseHold result;
+    // An existing editor already prevents sync from releasing this lease.
+    // Read the local mirror, not a second lease cache: other tools may also
+    // acquire, renew or release leases through this replica. Checking a held
+    // lease must not wait behind the worker's remote I/O.
+    const auto local = hubStatus(replica_);
+    if (leases_->retain(ids, *local, nowMicros() + kHoldMarginUs)) {
+        result.counts_ = leases_;
+        result.objects_ = std::move(ids);
+        return result;
+    }
     {
         std::lock_guard hub(hub_);
         const auto status = hubStatus(replica_);
@@ -129,9 +152,8 @@ LeaseHold HubWorker::hold(const std::vector<std::string>& objects)
                 acquireLeases(replica_, missing);
             }
         }
-    }
-    LeaseHold result;
-    {
+        // Register before releasing hub_: otherwise sync could decide to
+        // release a newly acquired lease before its first hold was counted.
         std::lock_guard lock(leases_->mutex);
         for (const auto& id : ids) ++leases_->counts[id];
     }

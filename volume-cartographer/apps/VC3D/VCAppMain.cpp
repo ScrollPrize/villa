@@ -11,6 +11,7 @@
 #include <QComboBox>
 #include <QEvent>
 #include <QImageReader>
+#include <QSurfaceFormat>
 
 #include "CWindow.hpp"
 #include "SshPrompts.hpp"
@@ -232,8 +233,25 @@ auto main(int argc, char* argv[]) -> int
         qputenv("QT_WIDGETS_RHI", "0");
     }
 
+    // QOpenGLWidget's compositing/share contexts must use the same core profile
+    // as Fibers 3D. On macOS this must be set before QApplication construction;
+    // a legacy share context otherwise falls back to an unshared renderer.
+    // CT views continue to use their existing QWidget/CPU rendering path.
+    QSurfaceFormat glFormat;
+    glFormat.setVersion(3, 3);
+    glFormat.setProfile(QSurfaceFormat::CoreProfile);
+    glFormat.setDepthBufferSize(24);
+    glFormat.setSamples(4);
+    QSurfaceFormat::setDefaultFormat(glFormat);
+
     QApplication app(argc, argv);
 #ifdef VC_TESTING
+    if (hasCliFlag(argc, argv, "--test-scene-3d")) {
+        extern int runScene3DPanelTests();
+        const int result = runScene3DPanelTests();
+        std::cout.flush(); std::cerr.flush();
+        std::_Exit(result);
+    }
     if (hasCliFlag(argc, argv, "--test-object-store")) {
         extern int runObjectStoreControllerTests();
         const int result=runObjectStoreControllerTests();

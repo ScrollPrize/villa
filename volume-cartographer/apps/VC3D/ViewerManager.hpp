@@ -105,6 +105,7 @@ public:
     const OverlayCompositeSettings& overlayComposite() const { return _overlayComposite; }
 
     void setVolumeWindow(float low, float high);
+    void setCompositeMethod(const std::string& method);
     float volumeWindowLow() const { return _volumeWindowLow; }
     float volumeWindowHigh() const { return _volumeWindowHigh; }
 
@@ -205,6 +206,8 @@ public:
                                                        float tolerance) const;
 
 signals:
+    // Request the shared Composite View mode from another viewer control.
+    void volumetricModeRequested(bool enabled);
     void baseViewerCreated(VolumeViewerBase* viewer);
     void baseViewerClosing(VolumeViewerBase* viewer);
     void currentVolumeChanged();

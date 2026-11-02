@@ -13,6 +13,14 @@ from vc_reader.reader import load_basic_auth, open_node
 _PUBLIC_S3_VOLUME_SUBSTRING = "vesuvius-challenge-open-data"
 
 
+def normalized_source_path(volume_path: str | Path) -> str:
+    """Resolve local path aliases while preserving remote source URLs."""
+    volume_path = str(volume_path)
+    if "://" in volume_path:
+        return volume_path.rstrip("/")
+    return str(Path(volume_path).expanduser().resolve())
+
+
 def open_volume_root(
     path: str | Path,
     auth_json_path: str | Path | None = None,

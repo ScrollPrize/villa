@@ -44,6 +44,7 @@ public:
 
     [[nodiscard]] bool supportsConcurrentSampling() const noexcept override { return true; }
     [[nodiscard]] bool masksInvalidCorners() const noexcept;
+    [[nodiscard]] std::array<LasagnaChannelBinding,3> regionChannels() const; // grad_mag,nx,ny
     [[nodiscard]] NormalSample sampleNormal(const cv::Vec3d& volumePoint) const override;
     [[nodiscard]] std::optional<double> sampleWindingDensity(const cv::Vec3d& volumePoint) const;
     [[nodiscard]] double windingDistance(const cv::Vec3d& a, const cv::Vec3d& b, double stepVx = 8.0) const;
@@ -57,6 +58,10 @@ public:
         const std::vector<cv::Vec3d>& volumePoints, bool withDerivative, std::vector<NormalSampleWithDerivative>& samples) const override;
     [[nodiscard]] NormalBatchReport sampleNormalBatch(
         const std::vector<cv::Vec3d>& volumePoints, bool withDerivative, int parallelThreads, std::vector<NormalSampleWithDerivative>& samples) const override;
+    // Reuses chunks across points, preserving sampleNormal's arithmetic.
+    [[nodiscard]] NormalBatchReport sampleNormalBatchScalarEquivalent(
+        const std::vector<cv::Vec3d>& volumePoints, int parallelThreads,
+        std::vector<NormalSampleWithDerivative>& samples) const;
     [[nodiscard]] NormalBatchReport sampleNormalBatch(const std::vector<cv::Vec3f>& volumePoints, int parallelThreads, std::vector<FloatNormalSample>& samples) const;
     // grad_mag, nx and ny when they share one sampling grid (corner batches), else null.
     [[nodiscard]] std::array<const LasagnaChannelBinding*, 3> groupedCornerBindings() const noexcept;

@@ -138,6 +138,34 @@ Tested (glibc is bundled, so it's never the limit):
 would lower the GUI floor to match the CLI, at the cost of using host font
 config — left to the host by default here.
 
+### Headless servers and containers
+
+The CLI tools need the host libraries listed above even when no display is
+configured. On Debian/Ubuntu, install those runtime prerequisites with:
+
+```bash
+sudo apt-get update
+sudo apt-get install -y --no-install-recommends \
+  libglvnd0 libegl1 libglx0 libopengl0 libgl1 \
+  libx11-6 libx11-xcb1 libxcb1 libice6 libsm6 \
+  libfontconfig1 libfreetype6 libharfbuzz0b \
+  libexpat1 zlib1g libuuid1 libcom-err2 libgmp10 libgpg-error0 ca-certificates
+```
+
+Without FUSE, extract once and run tools through `AppRun`:
+
+```bash
+chmod +x VC3D.AppImage
+./VC3D.AppImage --appimage-extract
+./squashfs-root/AppRun vc_render_tifxyz --help
+```
+
+`AppRun` selects the bundled dynamic loader and libraries. Calling
+`squashfs-root/usr/bin/<tool>` directly bypasses that setup and can crash
+before the tool starts, even for `--help` (see [#2153](https://github.com/ScrollPrize/villa/issues/2153)).
+For a single command, `APPIMAGE_EXTRACT_AND_RUN=1 ./VC3D.AppImage <tool> ...`
+also handles systems without FUSE. Neither CLI route needs a display server.
+
 ## Size
 
 The Release build carries full DWARF debug info (VC3D alone is ~490 MB

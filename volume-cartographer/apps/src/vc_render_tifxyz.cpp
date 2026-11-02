@@ -1,5 +1,6 @@
 #include <iostream>
 #include "vc/core/util/QuadSurface.hpp"
+#include "vc/core/util/RemoteCacheSettings.hpp"
 #include "vc/core/util/StoreToolOptions.hpp"
 #include "vc/core/util/Surface.hpp"
 #include <vc_reader/image_write.hpp>

@@ -64,6 +64,8 @@ function(vc_add_test)
     vc_register_ctest(${T_NAME} ${T_NAME})
 endfunction()
 
+
+
 vc_add_test(NAME test_fiber_view LIBS doctest::doctest vc_fiber_view)
 vc_add_test(NAME test_fiber_constraint_geometry LIBS doctest::doctest vc_object_store::vc_object_geometry)
 
@@ -274,7 +276,7 @@ vc_add_test(NAME test_fiber_embedding_scoring LIBS doctest::doctest vc_fiber_tra
 vc_add_test(NAME test_fiber_width_scoring LIBS doctest::doctest vc_fiber_tracer)
 vc_add_test(NAME test_fiber_reverse_consistency LIBS doctest::doctest vc_fiber_tracer)
 vc_add_test(NAME test_fiber_reference_replay_core LIBS doctest::doctest vc_fiber_tracer)
-vc_add_test(NAME test_fiber_chunk_trace LIBS doctest::doctest vc_fiber_tracer)
+vc_add_test(NAME test_fiber_chunk_trace LIBS doctest::doctest vc_fiber_tracer zstd::libzstd)
 vc_add_test(NAME test_fiber_case_queue LIBS doctest::doctest vc_fiber_tracer)
 set_tests_properties(test_fiber_case_queue PROPERTIES TIMEOUT 30)
 vc_add_test(NAME test_fiberlet_storage LIBS doctest::doctest vc_fiber_tracer)
@@ -414,6 +416,12 @@ vc_add_test(NAME test_normal_grid_volume)
 vc_add_test(NAME test_normal_grid_stream)
 vc_add_test(NAME test_normal_grid_generate)
 
+vc_add_test(NAME test_normal_constraint_grid_change
+    SOURCES test_normal_constraint_grid_change.cpp
+            normal_constraint_grid_change_fixture.cpp
+    LIBS doctest::doctest vc_core Ceres::ceres)
+set_tests_properties(test_normal_constraint_grid_change PROPERTIES TIMEOUT 30)
+
 vc_add_test(NAME test_surface_query_set)
 
 
@@ -464,6 +472,18 @@ if(EXISTS "${PROJECT_SOURCE_DIR}/.venv/bin/python" AND TARGET vc_fiber_trace)
         WORKING_DIRECTORY "${PROJECT_SOURCE_DIR}")
     set_tests_properties(vc_python_tests PROPERTIES TIMEOUT 300)
     vc_register_ctest(vc_python_tests vc_fiber_trace)
+endif()
+
+if(TARGET vc_gen_normalgrids)
+    find_package(Python3 REQUIRED COMPONENTS Interpreter)
+    vc_register_test_target(vc_gen_normalgrids)
+    add_test(NAME test_normal_grid_threshold_resume
+        COMMAND ${Python3_EXECUTABLE}
+            "${CMAKE_CURRENT_SOURCE_DIR}/test_normal_grid_threshold_resume.py"
+            $<TARGET_FILE:vc_gen_normalgrids>)
+    set_tests_properties(test_normal_grid_threshold_resume PROPERTIES
+        LABELS network SKIP_RETURN_CODE 77 TIMEOUT 300)
+    vc_register_ctest(test_normal_grid_threshold_resume vc_gen_normalgrids)
 endif()
 
 if(TARGET vc_render_tifxyz)
@@ -555,3 +575,6 @@ vc_add_test(NAME test_quadsurface_extras)
 vc_add_test(NAME test_quadsurface_store)
 
 vc_add_test(NAME test_volume_pkg_more)
+
+vc_add_test(NAME test_seed_anchor LIBS doctest::doctest Ceres::ceres
+    INCLUDES "${CMAKE_CURRENT_SOURCE_DIR}/../include")

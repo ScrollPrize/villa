@@ -90,6 +90,7 @@ class LineAnnotationDialog;
 class SpiralWorkspace;
 class ProjectWorkspace;
 class FiberMapWorkspace;
+namespace vc3d::fibers3d { class Fiber3DPanel; }
 
 class CWindow : public QMainWindow
 {
@@ -274,6 +275,9 @@ private:
     CPointCollectionWidget* _point_collection_widget;
     WrapAnnotationWidget* _wrapAnnotationWidget{nullptr};
     CFiberWidget* _fiberWidget{nullptr};
+    QDockWidget* _fibers3DDock{nullptr};
+    vc3d::fibers3d::Fiber3DPanel* _fibers3DPanel{nullptr};
+    QDockWidget* _scene3DDock{nullptr};
 
     SurfaceTreeWidget *treeWidgetSurfaces;
 

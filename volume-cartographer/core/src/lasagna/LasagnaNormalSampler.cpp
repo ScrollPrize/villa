@@ -142,6 +142,7 @@ void validateLasagnaNormalDatasetStructure(const LasagnaDataset& dataset)
 class LasagnaNormalSampler::Impl {
 public:
     bool masksInvalidCorners() const noexcept { return maskInvalidCorners_; }
+    std::array<LasagnaChannelBinding,3> regionChannels() const {return {gradMag_,nx_,ny_};}
     Impl(const LasagnaDataset& dataset, const LasagnaNormalSamplerOptions& options)
         : arrays_(options.memoryCache ? options.memoryCache
                                       : std::make_shared<vcr::MemoryCache>(options.maxCachedBytes)),
@@ -520,7 +521,8 @@ public:
         const std::vector<cv::Vec3d>& volumePoints,
         bool withDerivative,
         int parallelThreads,
-        std::vector<NormalSampleWithDerivative>& samples) const
+        std::vector<NormalSampleWithDerivative>& samples,
+        bool scalarEquivalent = false) const
     {
         (void)withDerivative;
         using Clock = std::chrono::steady_clock;
@@ -532,7 +534,8 @@ public:
         }
         const size_t workers = normalBatchWorkerCount(volumePoints.size(), parallelThreads);
         const auto start = Clock::now();
-        if (sharedGrid_) {
+        // Float corners only when the caller did not ask for sampleNormal's arithmetic.
+        if (sharedGrid_ && !scalarEquivalent) {
             const std::vector<cv::Vec3f> floatPoints(volumePoints.begin(), volumePoints.end());
             LasagnaCornerBatch corners;
             sampleLasagnaChannelCornerBatch({&gradMag_, &nx_, &ny_}, floatPoints, corners);
@@ -571,7 +574,8 @@ public:
                     return;
                 }
                 const auto normal = nx.valid[index] && ny.valid[index]
-                    ? lasagnaCompactAxisCube(nx.values[index], ny.values[index], nx.fractionsXYZ[index])
+                    ? lasagnaCompactAxisCube(nx.values[index], ny.values[index], nx.fractionsXYZ[index],
+                                               maskInvalidCorners_ ? &gradMag.values[index] : nullptr)
                     : std::nullopt;
                 if (!normal.has_value()) {
                     samples[index] = invalidNormal("missing Lasagna nx/ny sample");
@@ -606,6 +610,11 @@ LasagnaNormalSampler::LasagnaNormalSampler(
 }
 
 LasagnaNormalSampler::~LasagnaNormalSampler() = default;
+
+std::array<LasagnaChannelBinding,3> LasagnaNormalSampler::regionChannels() const
+{
+    return impl_->regionChannels();
+}
 
 LasagnaNormalSampler::LasagnaNormalSampler(
     const LasagnaDataset& dataset, LasagnaNormalSamplerOptions options)
@@ -680,6 +689,14 @@ NormalBatchReport LasagnaNormalSampler::sampleNormalBatch(
     std::vector<FloatNormalSample>& samples) const
 {
     return impl_->sampleNormalBatch(volumePoints, parallelThreads, samples);
+}
+
+NormalBatchReport LasagnaNormalSampler::sampleNormalBatchScalarEquivalent(
+    const std::vector<cv::Vec3d>& volumePoints,
+    int parallelThreads,
+    std::vector<NormalSampleWithDerivative>& samples) const
+{
+    return impl_->sampleNormalBatch(volumePoints, false, parallelThreads, samples, true);
 }
 
 bool LasagnaNormalSampler::masksInvalidCorners() const noexcept

@@ -94,4 +94,7 @@ struct LasagnaDatasetManifest {
     int maximumAbsoluteLevel = 30);
 
 
+// Alias predicted sheet_* heads as normals without changing packed channel indices.
+[[nodiscard]] LasagnaDatasetManifest fiberNormalManifest(const LasagnaDatasetManifest&);
+
 } // namespace vc::lasagna

@@ -16,6 +16,7 @@
 #include <ctime>
 #include <functional>
 #include <exception>
+#include <filesystem>
 #include <cctype>
 #include <cstdio>
 #include <cstring>
@@ -45,6 +46,24 @@ struct HttpResponse {
     std::optional<std::size_t> content_length;
     std::string content_encoding;
 };
+
+// The CA bundle to use instead of libcurl's built-in one: empty when that one exists (or
+// libcurl has none), else the first of this machine's bundles (same list as Go's crypto/x509).
+inline std::string select_ca_bundle(const std::string& builtin)
+{
+    std::error_code error;
+    if (builtin.empty() || std::filesystem::exists(builtin, error))
+        return {};
+    for (const char* candidate : {"/etc/ssl/certs/ca-certificates.crt",                // Debian, Ubuntu, Arch
+                                  "/etc/pki/tls/certs/ca-bundle.crt",                  // Fedora, RHEL
+                                  "/etc/ssl/ca-bundle.pem",                            // openSUSE
+                                  "/etc/pki/tls/cacert.pem",                           // OpenELEC
+                                  "/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem", // CentOS, RHEL 7
+                                  "/etc/ssl/cert.pem"})                                // Alpine
+        if (std::filesystem::is_regular_file(candidate, error))
+            return candidate;
+    return {};
+}
 
 class HttpClient {
 public:
@@ -192,6 +211,24 @@ private:
             curl_easy_setopt(h, CURLOPT_LOW_SPEED_LIMIT, 1L);
             curl_easy_setopt(h, CURLOPT_LOW_SPEED_TIME, options_.stall_timeout_s);
             curl_easy_setopt(h, CURLOPT_TCP_KEEPALIVE, 1L);
+#if defined(_WIN32)
+            // MSYS2's OpenSSL-backed libcurl defaults to a CA bundle under /ucrt64
+            // that end-user machines lack; verify against the Windows store instead.
+            curl_easy_setopt(h, CURLOPT_SSL_OPTIONS, static_cast<long>(CURLSSLOPT_NATIVE_CA));
+            // An HTTPS proxy is verified with its own options.
+            curl_easy_setopt(h, CURLOPT_PROXY_SSL_OPTIONS, static_cast<long>(CURLSSLOPT_NATIVE_CA));
+#elif defined(__linux__) && LIBCURL_VERSION_NUM >= 0x075400
+            // A portable libcurl (the AppImage's Debian one) looks for its CA bundle at the
+            // path it was built with, which Fedora, RHEL and openSUSE do not have. When that
+            // bundle is missing, use the one this machine has.
+            static const std::string host_ca_bundle = [h] {
+                char* builtin = nullptr;
+                curl_easy_getinfo(h, CURLINFO_CAINFO, &builtin);
+                return select_ca_bundle(builtin ? builtin : "");
+            }();
+            if (!host_ca_bundle.empty())
+                curl_easy_setopt(h, CURLOPT_CAINFO, host_ca_bundle.c_str());
+#endif
             curl_easy_setopt(h, CURLOPT_WRITEFUNCTION, &HttpClient::receive);
             curl_easy_setopt(h, CURLOPT_WRITEDATA, &transfer);
             curl_easy_setopt(h, CURLOPT_HEADERFUNCTION, &HttpClient::header);

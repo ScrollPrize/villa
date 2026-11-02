@@ -4552,6 +4552,12 @@ dependencies = [
 [package.metadata]
 requires-dist = [{ name = "numpy" }]
 
+[package.metadata.requires-dev]
+test = [
+    { name = "pytest" },
+    { name = "vc-reader", editable = "../vc_reader" },
+]
+
 [[package]]
 name = "wandb"
 version = "0.28.0"

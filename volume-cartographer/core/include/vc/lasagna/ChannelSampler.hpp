@@ -152,6 +152,23 @@ void sampleLasagnaVectorBatch(const std::vector<LasagnaChannelBinding>& channels
     bool normalize = true, const LasagnaChannelBinding* validity = nullptr);
 
 [[nodiscard]] double decodeCompactNormalComponent(double raw);
+// Storage-independent interpolation, also used by owned dense ROIs.
+[[nodiscard]] std::optional<double> interpolateLasagnaMaskedScalarCorners(
+    const std::array<double,8>&, const cv::Vec3d&, const std::array<uint8_t,8>&);
+[[nodiscard]] std::optional<cv::Vec3d> interpolateLasagnaCompactTensorCorners(
+    const std::array<uint8_t,8>& nx, const std::array<uint8_t,8>& ny,
+    const cv::Vec3d& fraction, const std::array<uint8_t,8>& mask);
+// Shared scalar stages; separate entrypoints also allow profiling actual tensor
+// accumulation versus principal-axis solving, without timers in the hot loop.
+struct LasagnaCompactTensor {
+    double t00=0,t01=0,t02=0,t11=0,t12=0,t22=0;
+    cv::Vec3d hint{0,0,0};
+    double totalWeight=0;
+};
+[[nodiscard]] LasagnaCompactTensor accumulateLasagnaCompactTensorCorners(
+    const std::array<uint8_t,8>& nx,const std::array<uint8_t,8>& ny,
+    const cv::Vec3d& fraction,const std::array<uint8_t,8>& mask);
+[[nodiscard]] std::optional<cv::Vec3d> finalizeLasagnaCompactTensor(const LasagnaCompactTensor&);
 [[nodiscard]] cv::Vec3d decodeCompactNormalFromRaw(double rawNx, double rawNy);
 [[nodiscard]] std::optional<std::array<uint8_t, 2>>
 encodeCompactNormalToRaw(const cv::Vec3d& normal);

@@ -22,7 +22,7 @@ from vesuvius.ink_detection.data.patch_finding_default import (
 from vesuvius.ink_detection.data.patch_finding_subtiling import build_patch_index
 from vesuvius.ink_detection.data.segment import discover_segment_labels
 from vesuvius.ink_detection.types import Segment
-from vesuvius.ink_detection.volume_io import open_volume, open_volume_root
+from vesuvius.ink_detection.volume_io import normalized_source_path, open_volume, open_volume_root
 from vesuvius.utils.cli import HyphenUnderscoreParser
 
 
@@ -326,12 +326,6 @@ def _array_schema(array) -> dict[str, object]:
     }
 
 
-def _normalized_source_path(volume_path: str) -> str:
-    if "://" in volume_path:
-        return volume_path.rstrip("/")
-    return str(Path(volume_path).expanduser().resolve())
-
-
 def _build_download_plan(
     source_group,
     *,
@@ -347,7 +341,7 @@ def _build_download_plan(
     return {
         "format": DOWNLOAD_PLAN_FORMAT,
         "source": {
-            "volume_path": _normalized_source_path(volume_path),
+            "volume_path": normalized_source_path(volume_path),
             "volume_scale": int(volume_scale),
         },
         "arrays": {

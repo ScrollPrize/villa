@@ -569,24 +569,18 @@ double interpolateLasagnaCube(const std::array<double, 8>& values, const cv::Vec
     return c0 * (1.0 - f[2]) + c1 * f[2];
 }
 
-std::optional<cv::Vec3d> lasagnaCompactAxisCube(
-    const std::array<double, 8>& nxValues,
-    const std::array<double, 8>& nyValues,
-    const cv::Vec3d& fraction,
-    const std::array<double, 8>* validity)
+namespace {
+template<class Value, class Skip>
+LasagnaCompactTensor accumulateCompactTensor(
+    const std::array<Value, 8>& nxValues, const std::array<Value, 8>& nyValues,
+    const cv::Vec3d& fraction, Skip skip)
 {
     const auto& normalTable = decodedCompactNormalTable();
-    double t00 = 0.0;
-    double t01 = 0.0;
-    double t02 = 0.0;
-    double t11 = 0.0;
-    double t12 = 0.0;
-    double t22 = 0.0;
-    cv::Vec3d hint{0.0, 0.0, 0.0};
-    double totalWeight = 0.0;
+    LasagnaCompactTensor tensor;
+    auto& [t00, t01, t02, t11, t12, t22, hint, totalWeight] = tensor;
     for (size_t k = 0; k < 8; ++k) {
         const double weight = cornerWeight(k, fraction);
-        if (weight <= 0.0 || (validity && byteValue((*validity)[k]) == 0))
+        if (weight <= 0.0 || skip(k))
             continue;
         const auto& decoded =
             normalTable[(static_cast<size_t>(byteValue(nxValues[k])) << 8) |
@@ -605,6 +599,13 @@ std::optional<cv::Vec3d> lasagnaCompactAxisCube(
         hint += cv::Vec3d{nx, ny, nz} * weight;
         totalWeight += weight;
     }
+    return tensor;
+}
+} // namespace
+
+std::optional<cv::Vec3d> finalizeLasagnaCompactTensor(const LasagnaCompactTensor& tensor)
+{
+    const auto& [t00, t01, t02, t11, t12, t22, hint, totalWeight] = tensor;
     if (totalWeight <= kEpsilon) {
         return std::nullopt;
     }
@@ -614,6 +615,50 @@ std::optional<cv::Vec3d> lasagnaCompactAxisCube(
         return std::nullopt;
     }
     return normal;
+}
+
+std::optional<cv::Vec3d> lasagnaCompactAxisCube(
+    const std::array<double, 8>& nxValues,
+    const std::array<double, 8>& nyValues,
+    const cv::Vec3d& fraction,
+    const std::array<double, 8>* validity)
+{
+    return finalizeLasagnaCompactTensor(accumulateCompactTensor(nxValues, nyValues, fraction,
+        [&](size_t k) { return validity && byteValue((*validity)[k]) == 0; }));
+}
+
+LasagnaCompactTensor accumulateLasagnaCompactTensorCorners(
+    const std::array<uint8_t, 8>& nxValues, const std::array<uint8_t, 8>& nyValues,
+    const cv::Vec3d& fraction, const std::array<uint8_t, 8>& mask)
+{
+    return accumulateCompactTensor(nxValues, nyValues, fraction, [&](size_t k) { return mask[k] == 0; });
+}
+
+std::optional<cv::Vec3d> interpolateLasagnaCompactTensorCorners(
+    const std::array<uint8_t, 8>& nxValues, const std::array<uint8_t, 8>& nyValues,
+    const cv::Vec3d& fraction, const std::array<uint8_t, 8>& mask)
+{
+    return finalizeLasagnaCompactTensor(accumulateLasagnaCompactTensorCorners(nxValues, nyValues, fraction, mask));
+}
+
+std::optional<double> interpolateLasagnaMaskedScalarCorners(
+    const std::array<double, 8>& samples, const cv::Vec3d& fraction, const std::array<uint8_t, 8>& mask)
+{
+    if (std::all_of(mask.begin(), mask.end(), [](uint8_t v) { return v != 0; }))
+        return interpolateLasagnaCube(samples, fraction);
+    double sum = 0, denominator = 0;
+    for (size_t k = 0; k < 8; ++k) {
+        if (!mask[k])
+            continue;
+        const double weight = cornerWeight(k, fraction);
+        if (weight > 0) {
+            sum += weight * samples[k];
+            denominator += weight;
+        }
+    }
+    if (denominator > 0)
+        return sum / denominator;
+    return std::nullopt;
 }
 
 std::optional<double> sampleLasagnaChannel(

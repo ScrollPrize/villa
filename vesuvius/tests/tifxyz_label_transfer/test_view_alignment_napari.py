@@ -11,6 +11,19 @@ import tifffile
 from vc_reader.reader import ZarrWriter, create_group
 
 from vesuvius.tifxyz_label_transfer import view_alignment_napari as viewer
+from vesuvius.tifxyz_label_transfer.core import close_memmap
+
+
+def _own_render(array: np.ndarray) -> np.ndarray:
+    """Copy a (possibly memory-mapped) render and release its file mapping.
+
+    The viewer hands back live memory maps of cache files. A test that lets its
+    TemporaryDirectory be torn down while still holding one fails on Windows
+    with a sharing violation, so own the data and then close the mapping.
+    """
+    owned = np.array(array)
+    close_memmap(array)
+    return owned
 
 
 class SurfaceVolumeCompositeTests(unittest.TestCase):
@@ -165,7 +178,9 @@ class SurfaceVolumeCompositeTests(unittest.TestCase):
             )
             case = mock.Mock(root=root)
 
-            actual = viewer.evidence_center_render(case, "source_render")
+            actual = _own_render(
+                viewer.evidence_center_render(case, "source_render")
+            )
 
         np.testing.assert_array_equal(actual, expected)
 
@@ -193,8 +208,10 @@ class SurfaceVolumeCompositeTests(unittest.TestCase):
                 )
             )
 
-            actual = viewer.evidence_center_render(
-                mock.Mock(root=root), "source_render"
+            actual = _own_render(
+                viewer.evidence_center_render(
+                    mock.Mock(root=root), "source_render"
+                )
             )
 
         np.testing.assert_array_equal(actual, expected)
@@ -220,10 +237,12 @@ class SurfaceVolumeCompositeTests(unittest.TestCase):
                 )
             )
 
-            actual = viewer.evidence_comparison_render(
-                mock.Mock(root=root),
-                "annotation-matched-slab",
-                "source_render",
+            actual = _own_render(
+                viewer.evidence_comparison_render(
+                    mock.Mock(root=root),
+                    "annotation-matched-slab",
+                    "source_render",
+                )
             )
 
         np.testing.assert_array_equal(actual, expected)
@@ -340,8 +359,10 @@ class SurfaceVolumeCompositeTests(unittest.TestCase):
                 "inspect_zarr",
                 side_effect=AssertionError("unexpected remote read"),
             ):
-                actual = viewer.load_middle_three_max(
-                    "s3://bucket/render.zarr", cache, preferred_level=2
+                actual = _own_render(
+                    viewer.load_middle_three_max(
+                        "s3://bucket/render.zarr", cache, preferred_level=2
+                    )
                 )
         np.testing.assert_array_equal(actual, expected)
 
@@ -355,6 +376,7 @@ class SurfaceVolumeCompositeTests(unittest.TestCase):
 
             self.assertIsInstance(actual, np.memmap)
             np.testing.assert_array_equal(actual, expected)
+            close_memmap(actual)
 
     def test_centered_thirteen_plane_max_selects_six_each_side(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -471,16 +493,18 @@ class ViewerLayerSemanticsTests(unittest.TestCase):
                     return_value=(projected, validity, None, stats),
                 ) as transfer,
             ):
-                actual = viewer.register_render(
-                    case,
-                    source_path,
-                    target_path,
-                    source_render,
-                    projected.shape,
-                    affine,
-                    report,
-                    "projected.tif",
-                    label_offset_render_yx=(1.25, -2.5),
+                actual = _own_render(
+                    viewer.register_render(
+                        case,
+                        source_path,
+                        target_path,
+                        source_render,
+                        projected.shape,
+                        affine,
+                        report,
+                        "projected.tif",
+                        label_offset_render_yx=(1.25, -2.5),
+                    )
                 )
 
         np.testing.assert_array_equal(actual, projected)
