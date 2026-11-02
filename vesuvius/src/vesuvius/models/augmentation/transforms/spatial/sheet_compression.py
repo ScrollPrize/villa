@@ -215,6 +215,42 @@ class SheetCompressionTransform(BasicTransform):
 
         return output
 
+    def apply(self, data_dict, **params):
+        data_dict = super().apply(data_dict, **params)
+        # _is_spatial stops BasicTransform from restoring padding from the
+        # un-warped mask, so the mask has to move with the image, like in
+        # SpatialTransform.
+        if data_dict.get('padding_mask') is not None:
+            data_dict['padding_mask'] = self._apply_to_padding_mask(data_dict['padding_mask'], **params)
+        return data_dict
+
+    def _apply_to_padding_mask(self, mask: torch.Tensor, **params) -> torch.Tensor:
+        """Warp the padding mask with the grid used for image and labels.
+
+        Nearest-neighbour keeps it binary. Zeros padding marks as padding the
+        tail that the compression pulls in from outside the volume (the image
+        repeats its border there).
+        """
+        if not params.get('apply', False):
+            return mask
+
+        displacement = params['displacement'].to(mask.device)
+        grid = self._create_sampling_grid(
+            params['spatial_shape'], displacement, params['chosen_axis'], mask.device
+        )
+
+        output = F.grid_sample(
+            mask.float().unsqueeze(0),
+            grid,
+            mode='nearest',
+            padding_mode='zeros',
+            align_corners=True
+        ).squeeze(0)
+
+        if mask.dtype == torch.bool:
+            return output > 0.5
+        return output.to(mask.dtype)
+
     def _apply_to_image(self, img: torch.Tensor, **params) -> torch.Tensor:
         return self._apply_compression(img, **params)
 
