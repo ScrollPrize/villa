@@ -318,15 +318,17 @@ wheels = [
 
 [[package]]
 name = "batchgeneratorsv2"
-version = "0.2.1"
+version = "0.3.7"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "batchgenerators" },
-    { name = "fft-conv-pytorch" },
     { name = "numpy" },
     { name = "torch" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/60/37/4c46a5ac20c76af8d78131da0b070b441eb94857c6ef524d02e935e5214e/batchgeneratorsv2-0.2.1.tar.gz", hash = "sha256:a681f7a81956ddba11f72aed20ae468b118166f9c950a61662f8ec422fea3cf1", size = 34020, upload-time = "2024-08-08T13:11:57.554Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/29/74/23ca0acb9c69ee93a9581d91f6d18653ea577aeab9ce70ecb8164a02b7a8/batchgeneratorsv2-0.3.7.tar.gz", hash = "sha256:53c84d34ee312ea5322b0671bef458b8b0eb9ee731618e5abdffc3e780988ba7", size = 64641, upload-time = "2026-10-29T18:57:50.692Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/11/70/7ab980664969e11f4f868272b0a433d9c1eff2be2355f51cd9c8a5d35add/batchgeneratorsv2-0.3.7-py3-none-any.whl", hash = "sha256:0db2f998f0037457674f5354a8969249d12139863be4fe135fb72f9bea3c7b56", size = 80115, upload-time = "2026-10-29T18:57:49.19Z" },
+]
 
 [[package]]
 name = "beautifulsoup4"
@@ -791,22 +793,6 @@ wheels = [
 ]
 
 [[package]]
-name = "dicom2nifti"
-version = "2.6.2"
-source = { registry = "https://pypi.org/simple" }
-dependencies = [
-    { name = "nibabel" },
-    { name = "numpy" },
-    { name = "pydicom" },
-    { name = "python-gdcm" },
-    { name = "scipy" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/26/3a/88d1339ccdf51d2547d4b4b9f511d8a80be989961878b3773fd2a4396c88/dicom2nifti-2.6.2.tar.gz", hash = "sha256:2a421efeacf1616a932f41047e588477b5de72fd2d90aa15b49dcc8f1e4ea544", size = 43193, upload-time = "2025-06-23T06:39:50.267Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/ab/59/598237cb4a5b1fae3515ad8b402ae815a5551e236e530ba11b7a17b2c036/dicom2nifti-2.6.2-py3-none-any.whl", hash = "sha256:d2a328ac534cd424236660d3df1ad01c6fbd71587c620e93041d9ff07dceef4b", size = 43717, upload-time = "2025-06-23T06:39:48.871Z" },
-]
-
-[[package]]
 name = "diffusers"
 version = "0.39.0"
 source = { registry = "https://pypi.org/simple" }
@@ -837,13 +823,18 @@ wheels = [
 
 [[package]]
 name = "dynamic-network-architectures"
-version = "0.3.1"
+version = "0.4.4"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
+    { name = "einops" },
     { name = "numpy" },
+    { name = "timm" },
     { name = "torch" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/29/c7/27ad2284c7cdeab9e7ba9ba4fcfa5bdba560ecb0705c8c652a9c7d131c7f/dynamic_network_architectures-0.3.1.tar.gz", hash = "sha256:e3702b451891c01ccdcbd468aea309ae7301ab706e27394a438f3edba3fd9acd", size = 20846, upload-time = "2024-02-21T20:03:24.026Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/7e/ec/36c0bd48e352257b1296fca696720cb863e7ff12023b7b9ed9acb7ada298/dynamic_network_architectures-0.4.4.tar.gz", hash = "sha256:5aee8856a255b658ef4f3b1ffa1276884bb5585cb38ff9c816403b1d905afa94", size = 42765, upload-time = "2026-06-07T14:26:11.287Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/2f/e3/07a70c9b83e5446528dd5d222fdca88ab30efcb07094536a864546c0096f/dynamic_network_architectures-0.4.4-py3-none-any.whl", hash = "sha256:7c51bc6518d5c3ee5449b81e00b4e140bb5fd26d035744c01538cdb47b55751d", size = 53618, upload-time = "2026-06-07T14:26:09.833Z" },
+]
 
 [[package]]
 name = "edt"
@@ -893,19 +884,6 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/20/b5/23b216d9d985a956623b6bd12d4086b60f0059b27799f23016af04a74ea1/fastjsonschema-2.21.2.tar.gz", hash = "sha256:b1eb43748041c880796cd077f1a07c3d94e93ae84bba5ed36800a33554ae05de", size = 374130, upload-time = "2025-08-14T18:49:36.666Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/cb/a8/20d0723294217e47de6d9e2e40fd4a9d2f7c4b6ef974babd482a59743694/fastjsonschema-2.21.2-py3-none-any.whl", hash = "sha256:1c797122d0a86c5cace2e54bf4e819c36223b552017172f32c5c024a6b77e463", size = 24024, upload-time = "2025-08-14T18:49:34.776Z" },
-]
-
-[[package]]
-name = "fft-conv-pytorch"
-version = "1.2.0"
-source = { registry = "https://pypi.org/simple" }
-dependencies = [
-    { name = "numpy" },
-    { name = "torch" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/e2/33/bebb4a0c01aa18513331b6a19d1a100b5762ce3678fefae862d2f12673e6/fft-conv-pytorch-1.2.0.tar.gz", hash = "sha256:9a061383176fa72cb2d8815d0c9ae67d03f7f1cea182ec9b9f5e869168582adb", size = 7420, upload-time = "2023-09-28T16:06:32.755Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/34/96/bbbf3761c6969defddb3c3268e2ab1a0524a7a16378afbdf06985cccce26/fft_conv_pytorch-1.2.0-py3-none-any.whl", hash = "sha256:17b9bd616df86da25e4820473698eb4831c2f2f6e73906961901e6c278098f3c", size = 6821, upload-time = "2023-09-28T16:06:31.04Z" },
 ]
 
 [[package]]
@@ -2260,23 +2238,20 @@ wheels = [
 
 [[package]]
 name = "nnunetv2"
-version = "2.5.1"
-source = { directory = "../segmentation/models/arch/nnunet" }
+version = "2.8.1"
+source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "acvl-utils" },
     { name = "batchgenerators" },
     { name = "batchgeneratorsv2" },
-    { name = "dicom2nifti" },
+    { name = "blosc2" },
     { name = "dynamic-network-architectures" },
-    { name = "edt" },
     { name = "einops" },
     { name = "graphviz" },
     { name = "imagecodecs" },
     { name = "matplotlib" },
-    { name = "monai" },
     { name = "nibabel" },
     { name = "numpy" },
-    { name = "opencv-python-headless" },
     { name = "pandas" },
     { name = "requests" },
     { name = "scikit-image" },
@@ -2287,43 +2262,12 @@ dependencies = [
     { name = "tifffile" },
     { name = "torch" },
     { name = "tqdm" },
-    { name = "wandb" },
     { name = "yacs" },
 ]
-
-[package.metadata]
-requires-dist = [
-    { name = "acvl-utils", specifier = ">=0.2,<0.3" },
-    { name = "batchgenerators", specifier = ">=0.25" },
-    { name = "batchgeneratorsv2", specifier = ">=0.2" },
-    { name = "black", marker = "extra == 'dev'" },
-    { name = "dicom2nifti" },
-    { name = "dynamic-network-architectures", specifier = ">=0.3.1,<0.4" },
-    { name = "edt" },
-    { name = "einops" },
-    { name = "graphviz" },
-    { name = "imagecodecs" },
-    { name = "matplotlib" },
-    { name = "monai" },
-    { name = "nibabel" },
-    { name = "numpy", specifier = ">=1.24" },
-    { name = "opencv-python-headless" },
-    { name = "pandas" },
-    { name = "pre-commit", marker = "extra == 'dev'" },
-    { name = "requests" },
-    { name = "ruff", marker = "extra == 'dev'" },
-    { name = "scikit-image", specifier = ">=0.19.3" },
-    { name = "scikit-learn" },
-    { name = "scipy" },
-    { name = "seaborn" },
-    { name = "simpleitk", specifier = ">=2.2.1" },
-    { name = "tifffile" },
-    { name = "torch", specifier = ">=2.1.2" },
-    { name = "tqdm" },
-    { name = "wandb" },
-    { name = "yacs" },
+sdist = { url = "https://files.pythonhosted.org/packages/1d/f6/fc6d02fafdae3059c57b612020522724a8a3648d4f80e850fb1b7493c439/nnunetv2-2.8.1.tar.gz", hash = "sha256:63646638f1bbbaaa9f2a7f92dda44b992581435e45556529f0d8190f6c80dfcc", size = 209001, upload-time = "2026-07-01T06:32:59.718Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/b3/0a/1102f1362b290d06aaf3a92163fb424e7499dbde407230d61d2617b355f2/nnunetv2-2.8.1-py3-none-any.whl", hash = "sha256:58aeb5719c9ee7bdac4b420106940cf3b21ea08a28a494802b0921ca14fde63f", size = 291096, upload-time = "2026-07-01T06:32:58.193Z" },
 ]
-provides-extras = ["dev"]
 
 [[package]]
 name = "notebook-shim"
@@ -3074,15 +3018,6 @@ wheels = [
 ]
 
 [[package]]
-name = "pydicom"
-version = "3.0.2"
-source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/7a/de/52aaf905f1f0ae7aba85996e2592ea2c1fe49157f3cfbcd1871965bdb51d/pydicom-3.0.2.tar.gz", hash = "sha256:5942bfc2d72c6fa4b3b5b62c527f54b7f2355f21d6f5d296df6bb30188df6a4f", size = 2886792, upload-time = "2026-03-19T21:46:20.935Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/46/e0/60466c6d712dad2cf807df315e39863e91609ffd1064ecb835994460bbda/pydicom-3.0.2-py3-none-any.whl", hash = "sha256:abf971a5440f84dbaf42c4b6758e30e62480902584f8b270b9a5d146e278a07b", size = 2376822, upload-time = "2026-03-19T21:46:19.042Z" },
-]
-
-[[package]]
 name = "pygments"
 version = "2.20.0"
 source = { registry = "https://pypi.org/simple" }
@@ -3209,19 +3144,6 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/82/ed/0301aeeac3e5353ef3d94b6ec08bbcabd04a72018415dcb29e588514bba8/python_dotenv-1.2.2.tar.gz", hash = "sha256:2c371a91fbd7ba082c2c1dc1f8bf89ca22564a087c2c287cd9b662adde799cf3", size = 50135, upload-time = "2026-03-01T16:00:26.196Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/0b/d7/1959b9648791274998a9c3526f6d0ec8fd2233e4d4acce81bbae76b44b2a/python_dotenv-1.2.2-py3-none-any.whl", hash = "sha256:1d8214789a24de455a8b8bd8ae6fe3c6b69a5e3d64aa8a8e5d68e694bbcb285a", size = 22101, upload-time = "2026-03-01T16:00:25.09Z" },
-]
-
-[[package]]
-name = "python-gdcm"
-version = "3.2.6"
-source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/c1/99/83550191a6bd7278c13c623270d69b0ee99b8b998e81e10f6924dce130c6/python_gdcm-3.2.6.tar.gz", hash = "sha256:2f16eaea7a8c736279492f829d7f95002237a7fb2ea9c3ae85175498e1cd3dad", size = 3384598, upload-time = "2026-05-11T00:49:17.23Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/69/00/b1ddc555a0b9e7e03620393dc425c3844403b0acc5993526688e81094aa8/python_gdcm-3.2.6-cp314-cp314-macosx_10_15_x86_64.whl", hash = "sha256:c0525c26c5ab59d4e93119d097ea44cb045af339bbd4ef4ee4a5edee260bf424", size = 11378919, upload-time = "2026-05-11T00:40:54.69Z" },
-    { url = "https://files.pythonhosted.org/packages/11/cd/c1d3aed4c28d476116f80057c77b2fabd9217e48e2b88bdafd24973b3b87/python_gdcm-3.2.6-cp314-cp314-macosx_11_0_arm64.whl", hash = "sha256:d514d840028c30786e729ba0946470612eee3854e1faf2ae767f6ee83c19aa6e", size = 10717887, upload-time = "2026-05-11T00:40:58.065Z" },
-    { url = "https://files.pythonhosted.org/packages/10/58/84c9dc52bdc9f4abd96f6cf2548299afafc52507d5fa01f6cd885d778055/python_gdcm-3.2.6-cp314-cp314-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:f44cf5ea4acdaacb465dede71842096c0ede26718f4fd8ceae8efb64a94c2d75", size = 12279373, upload-time = "2026-05-11T00:41:02.242Z" },
-    { url = "https://files.pythonhosted.org/packages/a4/86/60798cdb1d5aa7e9ac886ab273b10eff2c1f187b64b5c948f427451614a2/python_gdcm-3.2.6-cp314-cp314-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:aea109691afe754ae317909b9776a7547859bdb4340e512e5733eec16bf8b0ba", size = 13278357, upload-time = "2026-05-11T00:41:06.82Z" },
-    { url = "https://files.pythonhosted.org/packages/e5/47/a5d1495584b7e849de777185a45cdc38454fb2a9b656cbc465dfe8a32838/python_gdcm-3.2.6-cp314-cp314-win_amd64.whl", hash = "sha256:9ea4e0d723137ae1af1d5283301b609c00087844906ef75efcfacaafe98f90e7", size = 34796758, upload-time = "2026-05-11T00:49:13.465Z" },
 ]
 
 [[package]]
@@ -3925,7 +3847,7 @@ wheels = [
 
 [[package]]
 name = "timm"
-version = "1.0.27"
+version = "1.0.22"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "huggingface-hub" },
@@ -3934,9 +3856,9 @@ dependencies = [
     { name = "torch" },
     { name = "torchvision" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/08/54/ece85b0eef3700c90db8271a43669b05a0ebbe2edb1962329c34374a297e/timm-1.0.27.tar.gz", hash = "sha256:315dfe63186ca9fb7ff941268941231fd5be259f2b4bb4afa28560ae1015cb9a", size = 2439861, upload-time = "2026-05-08T19:38:36.844Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/c5/9d/e4670765d1c033f97096c760b3b907eeb659cf80f3678640e5f060b04c6c/timm-1.0.22.tar.gz", hash = "sha256:14fd74bcc17db3856b1a47d26fb305576c98579ab9d02b36714a5e6b25cde422", size = 2382998, upload-time = "2025-11-05T04:06:09.377Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/1f/2e/26bab7686ff4aed48f8f5f6c23e2aa37b7a37ddd9effe3aa61e908fd518f/timm-1.0.27-py3-none-any.whl", hash = "sha256:5ff07c9ddf53cbada88eab1c93ff175c64cab683b5a2fddf863bcee985926f89", size = 2589280, upload-time = "2026-05-08T19:38:35.034Z" },
+    { url = "https://files.pythonhosted.org/packages/d6/14/fc04d491527b774ec7479897f5861959209de1480e4c4cd32ed098ff8bea/timm-1.0.22-py3-none-any.whl", hash = "sha256:888981753e65cbaacfc07494370138b1700a27b1f0af587f4f9b47bc024161d0", size = 2530238, upload-time = "2025-11-05T04:06:06.823Z" },
 ]
 
 [[package]]
@@ -4428,8 +4350,8 @@ requires-dist = [
     { name = "nest-asyncio", marker = "extra == 'label-transfer'", specifier = ">=1.6.0" },
     { name = "nest-asyncio", marker = "extra == 'models'", specifier = ">=1.6.0" },
     { name = "nest-asyncio", marker = "extra == 'notebooks'", specifier = ">=1.6.0" },
-    { name = "nnunetv2", marker = "extra == 'all'", directory = "../segmentation/models/arch/nnunet" },
-    { name = "nnunetv2", marker = "extra == 'models'", directory = "../segmentation/models/arch/nnunet" },
+    { name = "nnunetv2", marker = "extra == 'all'", specifier = ">=2.8.1,<2.9" },
+    { name = "nnunetv2", marker = "extra == 'models'", specifier = ">=2.8.1,<2.9" },
     { name = "numba", marker = "extra == 'all'", specifier = ">=0.60.0" },
     { name = "numba", marker = "extra == 'models'", specifier = ">=0.60.0" },
     { name = "numpy", specifier = ">=2.0.2" },
@@ -4554,6 +4476,7 @@ requires-dist = [{ name = "numpy" }]
 
 [package.metadata.requires-dev]
 test = [
+    { name = "msgpack" },
     { name = "pytest" },
     { name = "vc-reader", editable = "../vc_reader" },
 ]

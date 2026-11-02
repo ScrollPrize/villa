@@ -49,7 +49,7 @@ models = [
     "huggingface-hub>=0.35.0",
     "timm>=1.0.20",
     "dynamic-network-architectures>=0.3.1",
-    "nnunetv2",
+    "nnunetv2>=2.8.1,<2.9",
     # Monorepo-only C++ package (resolved via [tool.uv.sources]); provides the vc /
     # vc3d bindings imported by vesuvius.neural_tracing. Not on PyPI, so it must stay
     # out of the base dependencies to keep `pip install vesuvius[volume-only]` working.
@@ -141,7 +141,7 @@ all = [
     "timm>=1.0.20",
     "numba>=0.60.0",
     "dynamic-network-architectures>=0.3.1",
-    "nnunetv2",
+    "nnunetv2>=2.8.1,<2.9",
     "volume-cartographer",  # monorepo-only, see the note in [project.optional-dependencies.models]
     "vc-object-store",  # monorepo-only, see the note in [project.optional-dependencies.models]
     "vc-reader",  # monorepo-only until published
@@ -243,4 +243,3 @@ vc-object-store = { path = "../vc_object_store", editable = true }
 vc-reader = { path = "../vc_reader", editable = true }
 villa-gpu-manager = { path = "../gpu_manager", editable = true }
 cucim-cu13 = { index = "nvidia" }
-nnunetv2 = { path = "../segmentation/models/arch/nnunet" }
