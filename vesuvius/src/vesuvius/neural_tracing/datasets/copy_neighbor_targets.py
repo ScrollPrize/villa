@@ -10,6 +10,7 @@ from scipy import ndimage
 from scipy.spatial import cKDTree
 
 import vc_reader.transforms as A
+from vc_reader.geometry import fill_holes
 
 # Nearest voxel of a mask for every voxel (scipy distance_transform_edt indices).
 _NEAREST = A.DistanceTransform(mode="outside", indices="_nearest", implicit_background=True)
@@ -142,7 +143,7 @@ def _connector_domain(
 
     domain = bridge | source_mask | target_mask
     if bool(config.get("copy_neighbor_fill_domain_holes", True)):
-        domain = ndimage.binary_fill_holes(domain)
+        domain = fill_holes(domain)
 
     if bool(config.get("copy_neighbor_keep_touching_components", True)):
         domain = _keep_components_touching_source_and_target(domain, source_mask, target_mask, debug)

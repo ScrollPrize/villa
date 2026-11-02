@@ -13,6 +13,7 @@ from typing import List, Optional, Tuple
 import numpy as np
 from vc_reader import images
 import vc_reader.transforms as A
+from vc_reader.geometry import fill_holes
 from scipy import ndimage as ndi
 from tqdm import tqdm
 
@@ -74,7 +75,7 @@ def _fix_2d_hole_fill(
 
     filled = np.zeros_like(label_mask, dtype=bool)
     for z in range(label_mask.shape[0]):
-        filled[z] = ndi.binary_fill_holes(label_mask[z])
+        filled[z] = fill_holes(label_mask[z])
 
     to_add = filled & hole_mask & (~ignore_mask)
 

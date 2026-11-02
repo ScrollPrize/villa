@@ -13,8 +13,8 @@ from typing import Dict, List, Sequence
 
 import cv2
 import numpy as np
-from scipy import ndimage
 from vc_reader import images
+from vc_reader.geometry import fill_holes as fill_mask_holes
 from tqdm.auto import tqdm
 
 from vesuvius.ink_detection.preprocessing.staged_write import (
@@ -211,7 +211,8 @@ def remove_small_components(mask_u8: np.ndarray, min_component_size: int) -> np.
 
 
 def fill_holes(mask_u8: np.ndarray) -> np.ndarray:
-    filled = ndimage.binary_fill_holes(mask_u8 != 0)
+    # One thread: this runs in process-pool workers.
+    filled = fill_mask_holes(mask_u8, threads=1)
     return np.ascontiguousarray(filled.astype(np.uint8) * 255)
 
 

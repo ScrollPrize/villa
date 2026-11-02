@@ -144,16 +144,17 @@ class ExteriorBlack:
 
     def near(self, traces: Sequence[dict[str, Any]], distance: float) -> np.ndarray:
         """Whether each fiber has a point within ``distance`` voxels of a black cube's centre, or inside one."""
-        from scipy.ndimage import binary_dilation, binary_erosion, binary_fill_holes
         from scipy.spatial import cKDTree
+        import vc_reader.transforms as A
+        from vc_reader.geometry import fill_holes
 
         result = np.zeros(len(traces), dtype=bool)
-        cube = np.ones((3, 3, 3), dtype=bool)
-        black = binary_dilation(~binary_fill_holes(~self.all_zero), cube) & self.any_zero
+        cube = {"radius": 1, "footprint": "cube"}  # the full 3x3x3 neighbourhood
+        black = A.Morphology("dilate", **cube)(~fill_holes(~self.all_zero)[None])[0] & self.any_zero
         if not len(traces) or not black.any():
             return result
         # The nearest black cube to a point outside the black is on its surface.
-        surface = black & ~binary_erosion(black, cube)
+        surface = black & ~A.Morphology("erode", **cube)(black[None])[0]
         tree = cKDTree((np.argwhere(surface)[:, ::-1] + 0.5) * CELL + self.low)
         points = np.concatenate([np.asarray(t["points"], dtype=np.float64) for t in traces])
         owner = np.repeat(np.arange(len(traces)), [len(t["points"]) for t in traces])
