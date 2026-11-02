@@ -146,15 +146,16 @@ jobs:
     if: needs.changes.outputs.test_core == 'true'
     runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 20
+    # Published by vc3d-publish-ghcr.yml; deps recipe hash: 675836fc3d478d17.
     container:
-      image: ghcr.io/scrollprize/vc3d-deps/linux:sha-0c371b1d472c5281b703d65517e980d945da693f
+      image: ghcr.io/scrollprize/villa/volume-cartographer@sha256:1bebf104edbd6c290ddbaf8036c919635259f3722e8eddb31340b240baf1ed68
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
     env:
       SCCACHE_GHA_ENABLED: 'true'
       SCCACHE_IGNORE_SERVER_IO_ERROR: '1'
-      SCCACHE_C_CUSTOM_CACHE_BUSTER: vc3d-linux-ubuntu-26.04-deps-0c371b1d-clang-quickbuild-o0
+      SCCACHE_C_CUSTOM_CACHE_BUSTER: vc3d-linux-ubuntu-26.04-deps-675836fc3d478d17-clang-quickbuild-o0
     steps:
       - name: Checkout Villa
         id: checkout
@@ -175,13 +176,12 @@ jobs:
             volume-cartographer
             vc_object_store
             vc_reader
-      # Keep this until the next published dependency image includes the
-      # libsqlite3-dev/libssl-dev entries in scripts/install_build_deps.sh.
-      - name: Install database headers and headless OpenGL runtime
+      # Fibers 3D tests need a real X server and software OpenGL. The pinned
+      # builder already contains the database headers, but not these runtimes.
+      - name: Install headless OpenGL runtime
         run: |
           apt-get update
           apt-get install -y --no-install-recommends \
-            libsqlite3-dev libssl-dev \
             xvfb xauth libxcb-cursor0 libgl1-mesa-dri libglx-mesa0
       - name: Set up shared compiler cache
         uses: mozilla-actions/sccache-action@v0.0.10
@@ -215,14 +215,14 @@ jobs:
     runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 20
     container:
-      image: ghcr.io/scrollprize/vc3d-deps/linux:sha-0c371b1d472c5281b703d65517e980d945da693f
+      image: ghcr.io/scrollprize/villa/volume-cartographer@sha256:1bebf104edbd6c290ddbaf8036c919635259f3722e8eddb31340b240baf1ed68
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
     env:
       SCCACHE_GHA_ENABLED: 'true'
       SCCACHE_IGNORE_SERVER_IO_ERROR: '1'
-      SCCACHE_C_CUSTOM_CACHE_BUSTER: vc3d-linux-ubuntu-26.04-deps-0c371b1d-clang-quickbuild-o0
+      SCCACHE_C_CUSTOM_CACHE_BUSTER: vc3d-linux-ubuntu-26.04-deps-675836fc3d478d17-clang-quickbuild-o0
     steps:
       - name: Checkout Villa
         id: checkout
@@ -243,12 +243,6 @@ jobs:
             volume-cartographer
             vc_object_store
             vc_reader
-      # Keep this until the next published dependency image includes the
-      # libsqlite3-dev/libssl-dev entries in scripts/install_build_deps.sh.
-      - name: Install SQLite and OpenSSL headers
-        run: |
-          apt-get update
-          apt-get install -y --no-install-recommends libsqlite3-dev libssl-dev
       - uses: mozilla-actions/sccache-action@v0.0.10
         with:
           version: v0.15.0
@@ -276,10 +270,14 @@ jobs:
     runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 20
     container:
-      image: ghcr.io/scrollprize/vc3d-deps/linux:sha-0c371b1d472c5281b703d65517e980d945da693f
+      image: ghcr.io/scrollprize/villa/volume-cartographer@sha256:1bebf104edbd6c290ddbaf8036c919635259f3722e8eddb31340b240baf1ed68
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
+    env:
+      SCCACHE_GHA_ENABLED: 'true'
+      SCCACHE_IGNORE_SERVER_IO_ERROR: '1'
+      SCCACHE_C_CUSTOM_CACHE_BUSTER: vc3d-linux-ubuntu-26.04-deps-675836fc3d478d17-gcc15-release
     steps:
       - name: Checkout Villa
         id: checkout
@@ -300,27 +298,19 @@ jobs:
             volume-cartographer
             vc_object_store
             vc_reader
-      # Keep this until the next published dependency image includes the
-      # libsqlite3-dev/libssl-dev entries in scripts/install_build_deps.sh.
-      - name: Install SQLite and OpenSSL headers
-        run: |
-          apt-get update
-          apt-get install -y --no-install-recommends libsqlite3-dev libssl-dev
-      # Keep this until the next published dependency image includes the
-      # valgrind entry in scripts/install_build_deps.sh.
-      - name: Install Valgrind profiler
-        run: |
-          apt-get update
-          apt-get install -y --no-install-recommends valgrind
-          valgrind --version
+      - name: Set up benchmark compiler cache
+        uses: mozilla-actions/sccache-action@v0.0.10
+        with:
+          version: v0.15.0
       - name: Configure Release benchmark graph
         working-directory: volume-cartographer
         run: |
+          sccache --zero-stats
           cmake -S . -B build/ci-render-benchmark -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_C_COMPILER=gcc-15 -DCMAKE_CXX_COMPILER=g++-15 \
             -DCMAKE_Fortran_COMPILER=flang \
-            -DVC_MARCH_NATIVE=OFF -DVC_TESTING=ON \
+            -DVC_MARCH_NATIVE=OFF -DVC_TESTING=ON -DVC_USE_SCCACHE=ON \
             -DVC_RUN_RENDER_BENCHMARKS=ON \
             -DVC_BUILD_APPS=OFF \
             -DVC_BUILD_FLATBOI=OFF
@@ -335,6 +325,9 @@ jobs:
             --parallel "$jobs"
           ctest --test-dir build/ci-render-benchmark --output-on-failure \
             -R '^(test_render_synthetic_fixture|test_thread_sync_replay_native)$'
+      - name: Report benchmark compiler cache statistics
+        if: always()
+        run: sccache --show-stats
       - name: Run full fresh Valgrind matrix
         working-directory: volume-cartographer
         run: |
@@ -357,14 +350,14 @@ jobs:
     runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 20
     container:
-      image: ghcr.io/scrollprize/vc3d-deps/linux:sha-0c371b1d472c5281b703d65517e980d945da693f
+      image: ghcr.io/scrollprize/villa/volume-cartographer@sha256:1bebf104edbd6c290ddbaf8036c919635259f3722e8eddb31340b240baf1ed68
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
     env:
       SCCACHE_GHA_ENABLED: 'true'
       SCCACHE_IGNORE_SERVER_IO_ERROR: '1'
-      SCCACHE_C_CUSTOM_CACHE_BUSTER: vc3d-linux-ubuntu-26.04-deps-0c371b1d-clang-quickbuild-o0
+      SCCACHE_C_CUSTOM_CACHE_BUSTER: vc3d-linux-ubuntu-26.04-deps-675836fc3d478d17-clang-quickbuild-o0
     steps:
       - name: Checkout Villa
         id: checkout
@@ -385,12 +378,6 @@ jobs:
             volume-cartographer
             vc_object_store
             vc_reader
-      # Keep this until the next published dependency image includes the
-      # libsqlite3-dev/libssl-dev entries in scripts/install_build_deps.sh.
-      - name: Install SQLite and OpenSSL headers
-        run: |
-          apt-get update
-          apt-get install -y --no-install-recommends libsqlite3-dev libssl-dev
       - uses: mozilla-actions/sccache-action@v0.0.10
         with:
           version: v0.15.0
@@ -422,14 +409,14 @@ jobs:
     runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 20
     container:
-      image: ghcr.io/scrollprize/vc3d-deps/linux:sha-0c371b1d472c5281b703d65517e980d945da693f
+      image: ghcr.io/scrollprize/villa/volume-cartographer@sha256:1bebf104edbd6c290ddbaf8036c919635259f3722e8eddb31340b240baf1ed68
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
     env:
       SCCACHE_GHA_ENABLED: 'true'
       SCCACHE_IGNORE_SERVER_IO_ERROR: '1'
-      SCCACHE_C_CUSTOM_CACHE_BUSTER: vc3d-linux-ubuntu-26.04-deps-0c371b1d-clang-quickbuild-o0
+      SCCACHE_C_CUSTOM_CACHE_BUSTER: vc3d-linux-ubuntu-26.04-deps-675836fc3d478d17-clang-quickbuild-o0
     steps:
       - name: Checkout Villa
         id: checkout
@@ -450,12 +437,6 @@ jobs:
             volume-cartographer
             vc_object_store
             vc_reader
-      # Keep this until the next published dependency image includes the
-      # libsqlite3-dev/libssl-dev entries in scripts/install_build_deps.sh.
-      - name: Install SQLite and OpenSSL headers
-        run: |
-          apt-get update
-          apt-get install -y --no-install-recommends libsqlite3-dev libssl-dev
       - uses: mozilla-actions/sccache-action@v0.0.10
         with:
           version: v0.15.0
@@ -493,14 +474,14 @@ jobs:
     runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 20
     container:
-      image: ghcr.io/scrollprize/vc3d-deps/linux:sha-0c371b1d472c5281b703d65517e980d945da693f
+      image: ghcr.io/scrollprize/villa/volume-cartographer@sha256:1bebf104edbd6c290ddbaf8036c919635259f3722e8eddb31340b240baf1ed68
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
     env:
       SCCACHE_GHA_ENABLED: 'true'
       SCCACHE_IGNORE_SERVER_IO_ERROR: '1'
-      SCCACHE_C_CUSTOM_CACHE_BUSTER: vc3d-linux-ubuntu-26.04-deps-0c371b1d-clang-quickbuild-o0
+      SCCACHE_C_CUSTOM_CACHE_BUSTER: vc3d-linux-ubuntu-26.04-deps-675836fc3d478d17-clang-quickbuild-o0
     steps:
       - name: Checkout Villa
         id: checkout
@@ -521,12 +502,6 @@ jobs:
             volume-cartographer
             vc_object_store
             vc_reader
-      # Keep this until the next published dependency image includes the
-      # libsqlite3-dev/libssl-dev entries in scripts/install_build_deps.sh.
-      - name: Install SQLite and OpenSSL headers
-        run: |
-          apt-get update
-          apt-get install -y --no-install-recommends libsqlite3-dev libssl-dev
       - uses: mozilla-actions/sccache-action@v0.0.10
         with:
           version: v0.15.0
@@ -584,13 +559,13 @@ jobs:
           PYTHONWARNINGS: error::ResourceWarning
         run: python -m unittest discover -p 'test*.py'
 
-  # macOS compile is a hard PR gate (parity with the Ubuntu Release cells).
-  # Full packaging and packaged-app smoke checks run after merge and on releases.
+  # macOS QuickBuild compile is a hard PR gate. Optimized builds, packaging,
+  # and packaged-app smoke checks run after merge and on releases.
   macos-build:
     name: macOS compile (${{ matrix.os }}, Homebrew LLVM)
     needs: changes
-    # The packaging workflow builds and seeds this same toolchain on main.
     # Keep the required compile gate on PRs without rebuilding it after merge.
+    # Compiler flags distinguish QuickBuild cache entries from packaging builds.
     if: needs.changes.outputs.vc == 'true' && github.event_name == 'pull_request'
     runs-on: ${{ matrix.os }}
     timeout-minutes: 90
@@ -632,8 +607,8 @@ jobs:
         with:
           version: v0.15.0
 
-      - name: Install Homebrew dependencies + build
-        run: volume-cartographer/scripts/build_macos.sh --install-deps --sccache
+      - name: Install Homebrew dependencies + QuickBuild
+        run: volume-cartographer/scripts/build_macos.sh --install-deps --sccache --quickbuild
 
       - uses: actions/setup-python@v5
         with:
