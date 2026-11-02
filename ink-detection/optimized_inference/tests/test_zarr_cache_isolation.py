@@ -32,10 +32,13 @@ class ZarrCacheIsolationTests(unittest.TestCase):
             {"ZARR_CACHE_DIR": os.path.join(self.tmp, "zarr_cache"), "ZARR_MEM_CACHE_MB": "0"},
         )
         self._fs = mock.patch.object(processing.fsspec, "filesystem", local_filesystem_as_s3)
+        self._anon = mock.patch.object(processing, "s3_anonymous", return_value=True)  # no credential lookup in tests
         self._env.start()
         self._fs.start()
+        self._anon.start()
 
     def tearDown(self):
+        self._anon.stop()
         self._fs.stop()
         self._env.stop()
         self._tmp.cleanup()

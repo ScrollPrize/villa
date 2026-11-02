@@ -7,6 +7,7 @@ tasks (prepare, reduce) to run without loading torch.
 import os
 os.environ.setdefault("OPENCV_IO_MAX_IMAGE_PIXELS", "0")
 
+import functools
 import hashlib
 import logging
 import shutil
@@ -31,11 +32,21 @@ from profiling import dir_size_bytes, get_active_profiler
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+@functools.lru_cache(maxsize=None)
+def s3_anonymous() -> bool:
+    """True when boto finds no AWS credentials; public buckets like the open-data bucket are then read anonymously."""
+    import botocore.session
+    anon = botocore.session.get_session().get_credentials() is None
+    if anon:
+        logger.info("No AWS credentials found; reading S3 anonymously (public buckets only)")
+    return anon
+
+
 def path_exists(path: str) -> bool:
     """Check if path exists (supports local paths and S3 URLs)."""
     if path.startswith("s3://"):
         import s3fs
-        fs = s3fs.S3FileSystem(anon=False)
+        fs = s3fs.S3FileSystem(anon=s3_anonymous())
         return fs.exists(path)
     return os.path.exists(path)
 
@@ -56,10 +67,10 @@ def get_cached_zarr_store(path: str):
         Cached zarr store (CacheStore for S3, path string for local)
     """
     if path.startswith("s3://"):
-        # Create S3 filesystem with credentials
+        # Create S3 filesystem (anonymous when no AWS credentials are configured)
         fs = fsspec.filesystem(
             's3',
-            anon=False,
+            anon=s3_anonymous(),
             asynchronous=True,
             s3_additional_kwargs={'StorageClass': 'INTELLIGENT_TIERING'}
         )
