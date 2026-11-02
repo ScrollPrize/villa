@@ -9,6 +9,7 @@
 #include <nlohmann/json.hpp>
 #include <iostream>
 #include <cstring>
+#include <limits>
 #include <optional>
 #include <sqlite3.h>
 using namespace vc::objects;
@@ -119,6 +120,40 @@ int main() try {
             const auto heads = db.currentRevisions(txn, umbilici);
             require(heads.size() == 2 && *heads.at(a) == db.currentObjectRevision(txn, a)->uuid &&
                     *heads.at(b) == db.currentObjectRevision(txn, b)->uuid, "current revisions pin a selection");
+        });
+        // The current revisions of a selection are the time-based selection
+        // at "now" (retired objects included) restricted to it, through
+        // edits, retirement and deletion.
+        const auto c = util::newUuid();
+        session.act(attachment, {{c,{}}}, [&](auto& db, auto& txn) {
+            ObjectRecord object; object.uuid = c; object.kind = "umbilicus";
+            db.upsertObject(txn, object);
+        });
+        const auto current = [&](const std::string& uuid) {
+            RevisionSelection pin;
+            session.read(attachment, [&](const auto& db, const auto& txn, const auto&) {
+                pin.emplace(uuid, db.currentObjectRevision(txn, uuid)->uuid);
+            });
+            return pin;
+        };
+        session.act(attachment, current(a), [&](auto& db, auto& txn) {
+            auto record = *db.objectByUuid(txn, a); record.name = "renamed";
+            db.upsertObject(txn, record);
+        });
+        session.act(attachment, current(b), [&](auto& db, auto& txn) { db.retireObject(txn, b); });
+        session.act(attachment, current(c), [&](auto& db, auto& txn) { db.deleteObject(txn, c); });
+        session.read(attachment, [&](const auto& db, const auto& txn, const auto&) {
+            ObjectSelection umbilici; umbilici.kind = "umbilicus";
+            const auto all = db.revisionSelectionAt(txn, std::numeric_limits<int64_t>::max(), true);
+            ObjectSelection named; named.uuids = {a, b, c};
+            RevisionSelection expected;
+            for (const auto& object : db.selectObjects(txn, named, std::vector<std::string>{}))
+                if (const auto found = all.find(object.uuid); found != all.end()) expected.insert(*found);
+            require(!expected.empty() && expected.contains(a) && !expected.contains(c) &&
+                    db.currentRevisions(txn, named) == expected,
+                    "current revisions match the time-based selection");
+            for (const auto& [uuid, revision] : db.currentRevisions(txn, umbilici))
+                require(all.at(uuid) == revision, "every current revision is the latest");
         });
     }
     // Auxiliary channels and non-finite payload bits belong to the generic

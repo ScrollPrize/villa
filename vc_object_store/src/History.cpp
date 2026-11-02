@@ -512,10 +512,14 @@ RevisionSelection ObjectStore::revisionSelectionAt(const Txn& txn, int64_t publi
 
 RevisionSelection ObjectStore::currentRevisions(const Txn& txn, const ObjectSelection& selection) const
 {
-    const auto heads = revisionSelectionAt(txn, std::numeric_limits<int64_t>::max(), true);
+    // The materialized heads are the revisionSelectionAt(now, retired
+    // included) result: every publication is newer than all before it and
+    // moves its objects' heads, and a deletion drops them. Looking up only
+    // the selected objects keeps this independent of the store's size.
+    auto* db = static_cast<sqlite3*>(connection(txn));
     RevisionSelection result;
     for (const auto& object : selectObjects(txn, selection, std::vector<std::string>{}))
-        if (const auto head = heads.find(object.uuid); head != heads.end()) result.emplace(head->first, head->second);
+        if (const auto revision = head(db, object.uuid)) result.emplace(object.uuid, *revision);
     return result;
 }
 
