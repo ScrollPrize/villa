@@ -3,8 +3,11 @@
   "cache": "cache",
   "csv": "results.csv",
 
-  "baseline": null,
-  "results": [],
+  "baseline": "main-fd97a4b60",
+  "results": [
+    {"label": "main-fd97a4b60", "path": "saved/main-fd97a4b60-params-20261103.jsonl"},
+    {"label": "branch-20f3a2ee3", "path": "saved/branch-20f3a2ee3-params-20261103.jsonl"}
+  ],
 
   "volumes": {
     "paris4-2.4um": {

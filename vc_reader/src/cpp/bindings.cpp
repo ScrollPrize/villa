@@ -1098,6 +1098,7 @@ NB_MODULE(_reader, m)
             d["corrupt"] = s.corrupt.load();
             d["last_corrupt_chunk"] = a.last_corrupt_chunk();
             d["offline_misses"] = s.offline_misses.load();
+            d["dropped_writes"] = s.dropped_writes.load();
             return d;
         })
         .def("offline_misses", &vcr::Array::offline_misses,

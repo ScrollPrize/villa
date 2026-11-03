@@ -296,7 +296,7 @@ struct ArraySpec {
     bool hint = false;               // queue readahead for every piece before reading
     std::size_t threads = 16;
     std::size_t writer_threads = 4;                    // background disk-cache writes
-    std::size_t max_pending_write_bytes = 1ull << 30;  // reads wait beyond this much unwritten data
+    std::size_t max_pending_write_bytes = 1ull << 30;  // beyond this much unwritten data, writes are dropped
     std::shared_ptr<DiskCache> disk_cache;
     HttpOptions http;
     ChunkCompute compute;            // the chunk source of a computed array (no remote or store)
@@ -310,7 +310,8 @@ struct Stats {
     std::atomic<std::uint64_t> memory_hits{0}, pending_hits{0}, disk_hits{0}, remote_fetches{0},
         remote_missing{0}, remote_bytes{0}, write_errors{0}, computed{0},
         corrupt{0},          // chunks that did not decode (skipped; see Array::last_corrupt_chunk)
-        offline_misses{0};   // distinct chunks an offline_fill array read as fill (in no layer)
+        offline_misses{0},   // distinct chunks an offline_fill array read as fill (in no layer)
+        dropped_writes{0};   // cache writes skipped because the write queue was over budget
 };
 
 class Array {
@@ -362,6 +363,19 @@ public:
     }
 
     std::size_t pending_writes() { return writes_ ? writes_->outstanding() : 0; }
+
+    // While one is alive, a full write queue makes reads wait instead of dropping
+    // the cache write: for callers (prefill) whose point is the chunks on disk.
+    class KeepWrites {
+    public:
+        explicit KeepWrites(Array& array) : array_(array) { ++array_.keep_writes_; }
+        ~KeepWrites() { --array_.keep_writes_; }
+        KeepWrites(const KeepWrites&) = delete;
+        KeepWrites& operator=(const KeepWrites&) = delete;
+
+    private:
+        Array& array_;
+    };
     std::size_t ndim() const noexcept { return spec_.shape.size(); }
     const ArraySpec& spec() const noexcept { return spec_; }
     const std::shared_ptr<MemoryCache>& memory_cache() const noexcept { return cache_; }
@@ -1755,8 +1769,7 @@ private:
         }
         if (!found) {
             ++stats_.remote_missing;
-            if (writes_ && !write_disabled_.load())
-                writes_->submit(k, nullptr, 64, [this, k] { store_missing(k); });
+            queue_write(k, nullptr, 64, [this, k] { store_missing(k); });
             return nullptr;
         }
         ChunkPtr chunk;
@@ -1778,10 +1791,8 @@ private:
             return nullptr;
         }
         // The read returns now; the cache file is written (and encoded) in the background.
-        if (writes_ && !write_disabled_.load()) {
-            const std::size_t bytes = chunk->size() + (payload == chunk ? 0 : payload->size());
-            writes_->submit(k, chunk, bytes, [this, k, chunk, payload] { store(k, *chunk, *payload); });
-        }
+        const std::size_t bytes = chunk->size() + (payload == chunk ? 0 : payload->size());
+        queue_write(k, chunk, bytes, [this, k, chunk, payload] { store(k, *chunk, *payload); });
         return chunk;
     }
 
@@ -1790,13 +1801,11 @@ private:
         auto chunk = std::make_shared<Chunk>(chunk_bytes_);
         ++stats_.computed;
         if (!spec_.compute(idx, chunk->data())) {
-            if (writes_ && !write_disabled_.load())
-                writes_->submit(k, nullptr, 64, [this, k] { store_missing(k); });
+            queue_write(k, nullptr, 64, [this, k] { store_missing(k); });
             return nullptr;
         }
         ChunkPtr out = std::move(chunk);
-        if (writes_ && !write_disabled_.load())
-            writes_->submit(k, out, out->size(), [this, k, out] { store(k, *out, *out); });
+        queue_write(k, out, out->size(), [this, k, out] { store(k, *out, *out); });
         return out;
     }
 
@@ -1846,6 +1855,16 @@ private:
         }
     }
 
+    // Queues a background cache write; over the byte budget it is dropped (the
+    // chunk stays memory-only) unless a KeepWrites is alive.
+    void queue_write(const std::string& k, ChunkPtr visible, std::size_t bytes, std::function<void()> write)
+    {
+        if (!writes_ || write_disabled_.load())
+            return;
+        if (!writes_->submit(k, std::move(visible), bytes, std::move(write), keep_writes_.load() > 0))
+            ++stats_.dropped_writes;
+    }
+
     void write_failed(const char* what)
     {
         ++stats_.write_errors;
@@ -1869,6 +1888,7 @@ private:
     std::mutex inflight_mutex_;
     std::unordered_map<std::string, std::shared_future<ChunkPtr>> inflight_;
     std::atomic<bool> write_disabled_{false};
+    std::atomic<int> keep_writes_{0};
     std::mutex error_mutex_;
     std::string last_write_error_, last_corrupt_;
     mutable std::mutex miss_mutex_;

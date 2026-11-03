@@ -19,6 +19,7 @@ PrefillResult prefillChunks(Array& array, std::size_t total, ChunkAt chunkAt, co
                             const PrefillProgress& progress)
 {
     PrefillResult result;
+    const Array::KeepWrites keep(array);  // prefill exists to fill the disk cache
     const auto cancelled = [&] { return cancel && cancel->load(std::memory_order_acquire); };
     const auto fetchedBefore = array.stats().remote_fetches.load();
     const auto writeErrorsBefore = array.stats().write_errors.load();

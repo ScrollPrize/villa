@@ -1332,7 +1332,8 @@ SourceReader::Stats SourceReader::stats()
         const auto& counters = array.stats();
         out.zarr = {{"memory_hits", counters.memory_hits.load()}, {"pending_hits", counters.pending_hits.load()}, {"pending_writes", array.pending_writes()},
                     {"disk_hits", counters.disk_hits.load()}, {"remote_fetches", counters.remote_fetches.load()}, {"remote_missing", counters.remote_missing.load()},
-                    {"remote_bytes", counters.remote_bytes.load()}, {"write_errors", counters.write_errors.load()}, {"last_write_error", array.last_write_error()}};
+                    {"remote_bytes", counters.remote_bytes.load()}, {"write_errors", counters.write_errors.load()}, {"dropped_writes", counters.dropped_writes.load()},
+                    {"last_write_error", array.last_write_error()}};
     }
     return out;
 }

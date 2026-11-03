@@ -1,6 +1,8 @@
 #include <vc_reader/cache.hpp>
 #include <vc_reader/zarr_write.hpp>
 #include <vc_reader/array.hpp>
+#include <vc_reader/native/write_behind.hpp>
+#include <future>
 #include <chrono>
 #include <filesystem>
 #include <fstream>
@@ -52,6 +54,17 @@ int main()
         try { (void)vcr::cache::downloadPrefix("s3://bucket/prefix", {}, 1); }
         catch (const std::invalid_argument&) { rejected = true; }
         require(rejected, "download must have persistent cache");
+        {   // over the byte budget, a non-waiting submit drops its write instead of blocking
+            vcr::WriteBehind writes(1, 100);
+            std::promise<void> release;
+            auto released = release.get_future().share();
+            require(writes.submit("a", nullptr, 100, [released] { released.wait(); }, false), "first write queued");
+            require(!writes.submit("b", nullptr, 1, [] {}, false), "over budget: dropped");
+            require(!writes.pending("b").first, "a dropped write is not pending");
+            release.set_value();
+            writes.flush();
+            require(writes.submit("b", nullptr, 1, [] {}, false), "room again after the queue drains");
+        }
         std::cout << "Cache prefill cancellation, resume, counts and values passed\n";
     } catch (const std::exception& e) { std::cerr << e.what() << '\n'; return 1; }
 }
