@@ -51,6 +51,8 @@ manifest. Pass another one with `--config` (or `CONFIG=` for the scripts).
 ```jsonc
 {
   "cache": "cache",          // where data is cached; default: cache/ beside the manifest
+  "baseline": "<label>",     // optional; the saved results compare sets the others against
+  "results": [ { "label": "<label>", "path": "saved/results.jsonl" } ],  // saved results, see below
   "scratch": "...",          // optional; scratch caches for cold/partial (default: <cache>-scratch)
   "volumes":  { "<name>": { "url": "s3://..." } },
   "segments": { "<name>": { "url": "s3://.../x.tifxyz", "volume": "<volume>", "scale": 1 } },
@@ -146,7 +148,7 @@ ninja -C volume-cartographer/build bench_viewer_navigation bench_line_annotation
 ## Run
 
 ```sh
-volume-cartographer/benchmarks/run.sh                                  # cpu, cuda, compare
+volume-cartographer/benchmarks/run.sh                                  # cpu, cuda, compare (with saved results)
 STATES="cached partial cold" volume-cartographer/benchmarks/run.sh     # all three cache states
 EXTRA="--passes 1" volume-cartographer/benchmarks/run.sh cpu compare   # one pipeline again, then the table
 BENCHES=line_annotation volume-cartographer/benchmarks/run.sh cuda     # one harness
@@ -155,9 +157,47 @@ BENCHES=line_annotation volume-cartographer/benchmarks/run.sh cuda     # one har
 `run.sh` runs every case of the manifest for each harness, step and cache state.
 Results append to `$OUT/results.jsonl` (default `benchmarks/out/`), one line per
 step and metric. Each line has `benchmark`, `case`, `pipeline`, `cache_state`, n,
-mean, p50, p95, min, max, total, and the run's configuration. Each harness also
-prints a table. `compare` lays out the means of every pipeline side by side, per
-benchmark, case and cache state (the latest run of each pipeline wins).
+mean, p50, p95, min, max, total, and the run's configuration: the fixture facts
+and every parameter's effective value. Each harness also prints a table.
+
+## Saved results and baselines
+
+`compare` (`compare.py --config <manifest> [results.jsonl]`) shows this run's
+means beside the means of any earlier results listed in the manifest, so you
+don't have to rerun a baseline:
+
+```json
+"baseline": "main-1101",
+"results": [
+  { "label": "main-1101", "path": "saved/main-1101.jsonl" },
+  { "label": "before-fix", "path": "/mnt/raid_nvme/dev_builds/bench_out/results.jsonl" }
+]
+```
+
+- **Saving a result:** any `results.jsonl` written by `run.sh` (or `--json`)
+  works. Copy it somewhere, or point at it where it is. Paths are relative to
+  the manifest.
+- **The baseline:** the entry `baseline` names, else the first entry. Every
+  other column, this run's included, is followed by `d% <column>`, its change
+  against the baseline in percent (negative means lower than the baseline).
+- **Matching pipelines:** a column is compared with the baseline's same
+  pipeline. If the baseline holds only one pipeline (a saved origin/main
+  `chunkcache` run, say), every column is compared with that one, so a saved
+  main run is a baseline for both CPU and CUDA.
+- **Rows:** a row is (benchmark, case, cache state, step, metric). Rows that only
+  some sources have show `-` for the others. In each file, the latest line of a
+  (row, pipeline) pair wins.
+- **Configuration notes:** under the table, `compare` lists configuration
+  differences against the baseline for the same benchmark, case and cache state:
+  parameters, data and settings, but not machine paths or traffic counters. A
+  difference there means the two columns measured different workloads.
+
+```sh
+volume-cartographer/benchmarks/run.sh main             # once: produce a main result
+cp volume-cartographer/benchmarks/out/results.jsonl volume-cartographer/benchmarks/saved/main-1101.jsonl
+# list it under "results" (and as "baseline"), then from now on:
+volume-cartographer/benchmarks/run.sh                  # cpu, cuda, compare against main-1101
+```
 
 ## Comparing with origin/main (optional)
 

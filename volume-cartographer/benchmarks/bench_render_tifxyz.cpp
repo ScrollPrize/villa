@@ -147,9 +147,14 @@ int main(int argc, char** argv)
 
         auto config = fixture.config();
         config["tool"] = tool;
-        for (std::size_t i = 0; i + 1 < common.size(); i += 2)
+        // The tool's options: "--key value", or a bare "--flag".
+        for (std::size_t i = 0; i < common.size(); ++i) {
+            const bool hasValue = i + 1 < common.size() && common[i + 1].rfind("--", 0) != 0;
             if (common[i] != "--segmentation")
-                config[common[i].substr(2)] = common[i + 1];
+                config[common[i].substr(2)] = hasValue ? common[i + 1] : "1";
+            if (hasValue)
+                ++i;
+        }
         auto report = fixture.makeReport();
         report.setConfig(config);
 

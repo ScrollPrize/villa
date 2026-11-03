@@ -2,8 +2,11 @@
   "description": "Workflow benchmark data and cases. Relative paths are relative to this file. See README.md.",
   "cache": "cache",
 
-  "baseline": null,
-  "results": [],
+  "baseline": "main-20261103",
+  "results": [
+    {"label": "main-20261103", "path": "saved/main-20261103.jsonl"},
+    {"label": "branch-743f1eb", "path": "saved/branch-743f1eb-20261103.jsonl"}
+  ],
 
   "volumes": {
     "paris4-2.4um": {
