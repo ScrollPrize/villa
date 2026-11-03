@@ -97,3 +97,81 @@ def list_s3_chunk_indices(session, array_url, metadata, first_chunk, last_chunk)
             if not continuation:
                 raise ValueError("truncated S3 listing omitted continuation token")
     return result
+
+
+_MIRRORED = ".vc-mirrored"
+
+
+def mirror_array(array_url, directory, *, workers=16, progress=None, session_factory=None):
+    """Copy the Zarr v2 array at ``array_url`` (an anonymous virtual-hosted
+    S3 URL) into the directory Zarr ``directory``, byte for byte: its
+    metadata and every chunk its bucket lists. Interrupted copies resume:
+    chunks already written whole are kept. ``progress(done, total)`` is
+    called as chunks arrive. Returns ``directory``."""
+    from concurrent.futures import ThreadPoolExecutor
+    import threading
+
+    import requests
+
+    session_factory = session_factory or requests.Session
+    directory = Path(directory)
+    if (directory / _MIRRORED).is_file():
+        return str(directory)
+    url = str(array_url).rstrip("/")
+    with session_factory() as session:
+        metadata = get_json(session, f"{url}/.zarray")
+        shape, chunks = metadata["shape"], metadata["chunks"]
+        last = tuple(-(-int(s) // int(c)) - 1 for s, c in zip(shape, chunks))
+        indices = list_s3_chunk_indices(session, url, metadata, (0, 0, 0), last)
+        if indices is None:
+            raise ValueError(f"{url}: its chunks cannot be listed; only arrays in an "
+                             "anonymous virtual-hosted S3 bucket are fetched")
+        directory.mkdir(parents=True, exist_ok=True)
+        for name in (".zarray", ".zattrs"):
+            content = fetch(session, f"{url}/{name}")
+            if content is not None:
+                _write_whole(directory / name, content)
+    separator = metadata.get("dimension_separator", ".")
+    missing = [index for index in sorted(indices)
+               if not (directory / separator.join(map(str, index))).is_file()]
+    done = len(indices) - len(missing)
+    lock = threading.Lock()
+    local = threading.local()
+    sessions = []
+    if progress is not None:
+        progress(done, len(indices))
+
+    def copy(index):
+        nonlocal done
+        session = getattr(local, "session", None)
+        if session is None:
+            session = local.session = session_factory()
+            with lock:
+                sessions.append(session)
+        content = fetch(session, chunk_url(url, index, metadata))
+        if content is None:
+            raise ValueError(f"{url}: listed chunk {index} is missing")
+        _write_whole(directory / separator.join(map(str, index)), content)
+        with lock:
+            done += 1
+            if progress is not None:
+                progress(done, len(indices))
+
+    try:
+        with ThreadPoolExecutor(max_workers=max(1, int(workers))) as pool:
+            for _ in pool.map(copy, missing):
+                pass
+    finally:
+        for session in sessions:
+            session.close()
+    (directory / _MIRRORED).write_text(f"{url}\n")
+    return str(directory)
+
+
+def _write_whole(path, content):
+    import os
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(path.name + ".partial")
+    temporary.write_bytes(content)
+    os.replace(temporary, path)

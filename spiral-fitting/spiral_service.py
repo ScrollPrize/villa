@@ -57,6 +57,7 @@ from session_lease import SessionLease
 from workspace_storage import reclaim_workspaces
 from collections import OrderedDict, deque
 from collections.abc import Mapping
+import contextlib
 import copy
 import dataclasses
 import hashlib
@@ -123,6 +124,8 @@ PREVIEW_ARTIFACTS_KEPT = 3
 CHECKPOINT_ARTIFACTS_KEPT = 2
 # Parallel chunk reads when extracting missing fiber directions.
 FIBER_DIRECTION_WORKERS = 64
+# Parallel object fetches when copying remote Lasagna arrays to pack them.
+FETCH_WORKERS = 64
 # Upper bound on the checkpoint listing /bindings advertises. A client offers
 # this as a choice, so it is a menu, not an inventory.
 SESSION_CHECKPOINTS_LISTED = 200
@@ -2132,10 +2135,13 @@ class ServiceState:
 
     def _prepare_lasagna_packs(self, paths, config):
         """Unless it requires prepared packs, a host builds missing pools
-        from local arrays before linking."""
+        before linking: from local arrays, or from HTTP(S) ones it first
+        fetches whole into the cache (beside the pack, removed once it is
+        built; an interrupted fetch resumes)."""
         if not self.build_missing_lasagna_packs or not paths.lasagna:
             return
         from lasagna_source import is_remote_location
+        from remote_zarr import is_http
         source = load_lasagna_source(paths.lasagna)
         kinds = _lasagna_pack_kinds(config, source)
         if not kinds:
@@ -2145,7 +2151,12 @@ class ServiceState:
                     source.pack_directory(paths.cache_directory, kind), "meta.json")):
                 continue
             for array in source.arrays(kind):
-                if is_remote_location(array) or not os.path.isdir(array):
+                if is_remote_location(array) and not is_http(array):
+                    raise ValueError(
+                        f"Cannot build missing Lasagna {kind} pack: {array} is "
+                        "neither local nor HTTP(S). Prepare the pack where the "
+                        "arrays are and copy it into the service cache.")
+                if not is_remote_location(array) and not os.path.isdir(array):
                     raise ValueError(
                         f"Cannot build missing Lasagna {kind} pack: {array} is not "
                         "an accessible local array. Prepare the pack where the "
@@ -2157,7 +2168,7 @@ class ServiceState:
             ensure_fit_sparse_stores(
                 source=source, cache_directory=paths.cache_directory,
                 use_normals="normals" in kinds, use_spacing="grad_mag" in kinds,
-                progress=progress)
+                progress=progress, local_arrays=_fetched_lasagna_arrays)
             for kind in sorted(kinds):
                 _require_sidecar(source, paths.cache_directory, kind)
         finally:
@@ -3691,6 +3702,32 @@ def _route_upload_file(ctx):
             raise ApiError(HTTPStatus.BAD_REQUEST, "Invalid upload offset")
     return ctx.state.receive_upload_file(
         ctx.args[0], ctx.args[1], handler.rfile, length, offset=offset)
+
+
+@contextlib.contextmanager
+def _fetched_lasagna_arrays(arrays, sidecar, progress):
+    """``arrays`` made local for building ``sidecar``: each HTTP(S) one
+    fetched whole into ``<sidecar>.arrays/<i>``, removed once the pack is
+    built and kept, to resume, when building fails."""
+    from lasagna_source import is_remote_location
+    from remote_zarr import mirror_array
+
+    root = Path(f"{sidecar}.arrays")
+    local = []
+    for index, array in enumerate(arrays):
+        if not is_remote_location(array):
+            local.append(array)
+            continue
+        if progress is not None:
+            progress.begin("fetching", "Fetching remote Lasagna arrays", step=0,
+                           total_steps=0, unit="chunks", detail=array)
+        local.append(mirror_array(
+            array, root / str(index), workers=FETCH_WORKERS,
+            progress=(None if progress is None else
+                      lambda done, total: progress.update(done, total_steps=total))))
+    yield local
+    if root.exists():
+        shutil.rmtree(root, ignore_errors=True)
 
 
 def _lasagna_pack_kinds(config, source):

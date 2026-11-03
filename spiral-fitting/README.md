@@ -546,13 +546,13 @@ python spiral_service.py --object-store /path/to/store --output /path/to/output 
 ```
 
 The project supplies the dataset identity, array paths and scale. Missing packs
-are built only from accessible local arrays, with shared packing locks and
-progress reporting, before link refresh or replacement of the resident fit.
-Checkpoint resumes prepare missing packs too, retaining their recorded input
-position. Existing packs are reused without needing the source arrays. A packing
-failure leaves the resident session intact. The same flag extracts missing
-fiber-direction samples (see "Fiber direction samples"). It cannot be enabled
-by a fit request.
+are built from accessible local arrays, or from HTTP(S) ones, with shared
+packing locks and progress reporting, before link refresh or replacement of the
+resident fit. Checkpoint resumes prepare missing packs too, retaining their
+recorded input position. Existing packs are reused without needing the source
+arrays. A packing failure leaves the resident session intact. The same default
+extracts missing fiber-direction samples (see "Fiber direction samples"). A fit
+request cannot change it.
 
 A remote Lasagna dataset (an open-data one, or any whose arrays are on S3)
 reaches a service on VC3D's host as its arrays' directories in VC3D's remote
@@ -561,9 +561,17 @@ service's cache lacks into those directories (logging its progress), so the
 service packs them like local arrays; once packed, the cached arrays are no
 longer read.
 
-For a service launched with `--require-prepared-lasagna-packs`, or one on
-another host than VC3D's whose arrays are remote, pack where the arrays are and
-copy the packs over:
+A service on another host is given the arrays' URLs. It fetches each array
+whole into its cache beside the pack it builds (`<pack>.arrays/`), packs it,
+and removes the copy; an interrupted fetch resumes from the chunks already
+there. Only arrays in an anonymous virtual-hosted S3 bucket (an
+`https://<bucket>.s3.<region>.amazonaws.com/...` URL, as open data is) can be
+listed and fetched. The copy needs the arrays' full size on the service host's
+disk while the pack is built.
+
+For a service launched with `--require-prepared-lasagna-packs`, or arrays it
+cannot fetch (`s3://` URLs, private buckets, servers that do not list), pack
+where the arrays are and copy the packs over:
 
 ```sh
 python pack_resident_pools.py /path/to/dataset.lasagna.json \

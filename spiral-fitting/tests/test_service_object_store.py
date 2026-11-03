@@ -662,9 +662,45 @@ def test_a_launched_service_builds_missing_packs_unless_told_not_to(
     assert constructed.value.args == (builds,)
 
 
-@pytest.mark.parametrize('location', ['https://example.invalid/array', '/missing/array'])
+def test_a_service_packs_remote_arrays_as_it_packs_local_ones(host, store_path, tmp_path,
+                                                             monkeypatch):
+    import numpy as np
+    import requests
+    from fake_s3 import BUCKET, FakeS3Session
+    from test_sparse_cuda_cache import write_raw_pack_source
+
+    channels = ('normal_x', 'normal_y', 'gradient_magnitude')
+    for value, channel in enumerate(channels):
+        write_raw_pack_source(tmp_path / 'bucket' / channel / '0',
+                              np.full((16, 16, 16), 100 + value, dtype=np.uint8))
+
+    def lasagna(identity, root):
+        return {'location': '/client/remote_cache/s.lasagna.json', 'identity': identity,
+                'group': '0', **{channel: f'{root}/{channel}' for channel in channels}}
+    local = lasagna('local-copy', tmp_path / 'bucket')
+    remote = lasagna('remote-copy', BUCKET)
+    gets = []
+    monkeypatch.setattr(requests, 'Session', lambda: FakeS3Session(tmp_path / 'bucket', gets))
+
+    def built(dataset):
+        _built(service(host, store_path, build_missing_lasagna_packs=True),
+               initialize_body(loss_weight_dense_spacing=1) | {
+                   'project': project(lasagna=dataset, lasagna_scale=2)})
+        return host.cache / 'lasagna' / dataset['identity']
+    from_local, from_remote = built(local), built(remote)
+    assert gets
+    for kind in ('normals_g0', 'grad_mag_g0'):
+        for name in ('table.npy', 'channel_0.u8'):
+            assert (from_remote / kind / name).read_bytes() == (from_local / kind / name).read_bytes()
+        # The fetched arrays are removed once packed.
+        assert not (from_remote / f'{kind}.arrays').exists()
+
+
+@pytest.mark.parametrize('location, refused', [
+    ('s3://bucket/array', 'neither local nor HTTP(S)'),
+    ('/missing/array', 'not an accessible local array')])
 def test_pack_failure_preserves_resident_before_link_refresh(host, store_path,
-                                                            monkeypatch, location):
+                                                            monkeypatch, location, refused):
     import object_store_inputs as osi
     state = service(host, store_path, build_missing_lasagna_packs=True)
     resident = SimpleNamespace(status=lambda: {"state": SessionState.Idle})
@@ -674,7 +710,7 @@ def test_pack_failure_preserves_resident_before_link_refresh(host, store_path,
                'group': '0', 'normal_x': location, 'normal_y': location}
     failure = _built(state, initialize_body() | {
         'project': project(lasagna=lasagna, lasagna_scale=2)})
-    assert 'not an accessible local array' in failure['message']
+    assert refused in failure['message']
     assert state.session is resident
 
 
