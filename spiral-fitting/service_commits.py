@@ -140,6 +140,33 @@ def _shape(value, name):
     return tuple(int(v) for v in value)
 
 
+def _check_lasagna_frame(meta, base_shape):
+    """Refuse a flattened surface whose coordinates may be in a Lasagna
+    volume's frame rather than the Spiral surface's.
+
+    An export_coordinate_scale of 1.0 says only that Lasagna did not rescale
+    its own coordinates. Its own frame is the fit frame when either it
+    records its base shape and that is the fit volume's, or it flattened
+    with no volume (fit_config args ``input`` null, as a preview does) and
+    so carried the Spiral surface's coordinates through. The surface's
+    ``base_shape_zyx`` is no evidence: lasagna_publish overwrites it with
+    the manifest's.
+    """
+    lasagna_base = meta.get("lasagna_base_shape_zyx")
+    if lasagna_base is not None:
+        if _shape(lasagna_base, "the surface's lasagna_base_shape_zyx") != base_shape:
+            raise CommitRefused(
+                f"Lasagna flattened in a volume of base shape {lasagna_base}, not the "
+                f"fit volume's {None if base_shape is None else list(base_shape)}")
+        return
+    fit_config = meta.get("fit_config")
+    args = fit_config.get("args") if isinstance(fit_config, Mapping) else None
+    if isinstance(args, Mapping) and args.get("input") is not None:
+        raise CommitRefused(
+            "Lasagna flattened in a volume without recording its base shape, so "
+            "the flattened surface may not be in the fit frame")
+
+
 def read_published_generation(root, manifest_name="manifest.json"):
     """The generation published under ``root``, checked to be in the fit frame.
 
@@ -180,9 +207,7 @@ def read_published_generation(root, manifest_name="manifest.json"):
     step = float(profile.get("output_step_vx") or 0.0)
     scale = _validate_tifxyz_output_step(meta, step)
     base_shape = _shape(manifest.get("base_shape_zyx"), "the generation's base_shape_zyx")
-    if _shape(meta.get("base_shape_zyx"), "the surface's base_shape_zyx") != base_shape:
-        raise CommitRefused(
-            "the flattened surface and the generation's manifest disagree on base_shape_zyx")
+    _check_lasagna_frame(meta, base_shape)
     xyz, flattened_valid = _surface_xyz(surface_dir)
     valid = flattened_valid & store_valid(xyz)
     xyz[~valid] = -1.0

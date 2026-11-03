@@ -241,12 +241,35 @@ def test_concurrent_commits_write_one_surface(fit, monkeypatch):
 @pytest.mark.parametrize('surface_meta, message', [
     ({'export_coordinate_scale': 0.5}, 'export_coordinate_scale 0.5'),
     ({'export_coordinate_scale': None}, 'export_coordinate_scale None'),
+    # Lasagna flattened in a volume of another frame...
+    ({'lasagna_base_shape_zyx': [32, 64, 64]}, 'Lasagna flattened in a volume of base shape'),
+    # ...or in one whose frame it did not record.
+    ({'fit_config': {'args': {'input': '/data/scroll.lasagna.json'}}},
+     'without recording its base shape'),
 ])
 def test_a_surface_outside_the_fit_frame_is_refused(fit, surface_meta, message):
     result = commit(fit, fit.generation(surface_meta=surface_meta))
     assert result['state'] == 'failed'
     assert message in result['error']
     assert _committed(fit.store) == []
+
+
+def test_lasagna_in_the_fit_volumes_frame_is_committed(fit):
+    result = commit(fit, fit.generation(surface_meta={
+        'lasagna_base_shape_zyx': list(BASE_SHAPE),
+        'fit_config': {'args': {'input': '/data/scroll.lasagna.json'}}}))
+    assert result['state'] == 'done', result['error']
+
+
+def test_a_commit_leaves_the_links_current(fit):
+    # A committed fit is a surface, but never selected: the next refresh
+    # neither links it nor treats the links as stale.
+    assert commit(fit, fit.generation())['state'] == 'done'
+    lines = []
+    inputs = osi.load_fit_inputs(fit.config, log=lines.append)
+    assert any(line.startswith('link refresh: skip') for line in lines), lines
+    assert inputs.manifest['position'] != fit.inputs.manifest['position']
+    assert inputs.manifest['selection'] == fit.inputs.manifest['selection']
 
 
 def test_a_shape_other_than_the_fit_volumes_is_refused(fit):
@@ -456,6 +479,19 @@ def test_startup_pushes_pending_commits_and_refuses_anything_else(hosted, hub):
                    volume=VOLUME, tool='other', author='svc')
     with pytest.raises(spiral_service.ObjectStoreBindingError, match='unpublished edits'):
         spiral_service.bind_object_store(hub.replica, 'svc', hub.hub)
+
+
+def test_a_pushed_commit_leaves_the_hub_links_current(hosted):
+    # The commit moves the hub head; the next update finds only an
+    # unselected surface since its links, so it neither relinks nor fails.
+    assert commit(hosted, hosted.generation())['pushed'] is True
+    lines = []
+    with ObjectStore.open(hosted.store, author='svc') as store:
+        prepared = osi.prepare_position(store, hosted.config,
+                                        osi.request_from_config(hosted.config),
+                                        log=lines.append)
+    assert any('link refresh: skip' in line for line in prepared.lines + lines), (
+        prepared.lines, lines)
 
 
 def test_a_commit_waits_for_a_link_refresh(hosted):
