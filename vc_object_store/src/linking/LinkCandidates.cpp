@@ -40,6 +40,13 @@ bool isDetectorsOwnEdge(const EdgeRecord& e, const std::string& detectorName)
 
 }  // namespace
 
+std::map<std::string, int> detectorVersions()
+{
+    return {{kSurfaceOverlapDetector, kSurfaceOverlapVersion}, {kFiberSurfaceDetector, kFiberSurfaceVersion},
+            {kTrackTrackDetector, kTrackTrackVersion}, {kTrackSurfaceDetector, kTrackSurfaceVersion},
+            {kPointCollectionSurfaceDetector, kPointCollectionSurfaceVersion}};
+}
+
 bool DetectorReport::failed() const
 {
     return std::any_of(issues.begin(), issues.end(),
@@ -72,10 +79,11 @@ static DetectorReport commitCandidatesImpl(objects::ObjectStore& db, objects::Wr
 
     std::set<std::string> kinds;
     for (const auto& c : candidates) kinds.insert(c.kind);
-    std::set<std::string> scopedKinds, scopedObjects;
+    std::set<std::string> scopedKinds, scopedObjects, touching;
     if (staleScope) {
         scopedKinds.insert(staleScope->edgeKinds.begin(), staleScope->edgeKinds.end());
         scopedObjects.insert(staleScope->objectUuids.begin(), staleScope->objectUuids.end());
+        touching.insert(staleScope->touching.begin(), staleScope->touching.end());
         kinds.insert(scopedKinds.begin(), scopedKinds.end());
     }
 
@@ -108,6 +116,7 @@ static DetectorReport commitCandidatesImpl(objects::ObjectStore& db, objects::Wr
         for (const auto& [key, e] : existing) {
             if (staleScope && (!scopedKinds.contains(e.kind) || !scopedObjects.contains(e.aUuid) ||
                                !scopedObjects.contains(e.bUuid))) continue;
+            if (!touching.empty() && !touching.contains(e.aUuid) && !touching.contains(e.bUuid)) continue;
             if (candidateKeys.contains(key)) continue;
             if (e.approvalState != "pending") continue;  // reviewed edges are never touched
             if (!isDetectorsOwnEdge(e, detectorName)) continue;

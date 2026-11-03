@@ -669,23 +669,58 @@ DetectorReport linkSurfaceOverlaps(objects::ObjectStore& db,
     auto cancelled = [&] { return cancel && cancel->load(); };
 
     detail::StoredGeometry inputs(db);
-    const auto objects = inputs.select("surface", params.surfaceUuids);
-    const auto scales = detail::coordinateScales(objects, params, report);
+    const auto selected = inputs.select("surface", params.surfaceUuids);
+    const auto fresh = detail::newAmong(params.newUuids, {&selected}, "surface-overlap");
+    const auto scales = detail::coordinateScales(selected, params, report);
     if (report.failed()) return report;
 
+    // An incremental run loads the new surfaces and the selected surfaces
+    // whose stored bounds come within the pair search's bbox pad of one.
+    // Each keeps its index in the selection, which seeds its pairs' fits.
+    std::vector<objects::ObjectRecord> objects;
+    std::vector<size_t> selectionIndex;
+    if (fresh) {
+        objects::util::reportProgress(progress, "finding partners of new surfaces");
+        std::set<std::string> wanted = *fresh, all;
+        for (const auto& object : selected) all.insert(object.uuid);
+        for (const auto& object : selected) {
+            if (!fresh->contains(object.uuid)) continue;
+            const auto box = inputs.workingBounds(object, params);
+            if (!box) { wanted = all; break; }  // no stored bounds: every surface is a partner
+            for (const auto& uuid : inputs.objectsNear("surface", *box, params.tolerance, params))
+                if (all.contains(uuid)) wanted.insert(uuid);
+        }
+        for (size_t i = 0; i < selected.size(); ++i)
+            if (wanted.contains(selected[i].uuid)) { objects.push_back(selected[i]); selectionIndex.push_back(i); }
+    } else {
+        objects = selected;
+    }
+
     std::vector<LoadedSurface> surfaces;
+    std::vector<size_t> seedIndex;  // per loaded surface: its index for pair seeds
     size_t loadedCount = 0;
-    for (const auto& object : objects) {
+    for (size_t oi = 0; oi < objects.size(); ++oi) {
+        const auto& object = objects[oi];
         objects::util::reportProgress(progress, "loading surfaces", loadedCount++, objects.size(), object.uuid);
         if (cancelled()) {
             detail::reportFailure(report, "cancel", "", "cancelled", "surface-overlap: cancelled during loading");
             return report;
         }
         PhaseTimer loadingTimer(profile.enabled ? &profile.loading : nullptr);
-        if (auto loaded = loadSurface(inputs, object, params, report, scales.at(object.uuid)))
+        if (auto loaded = loadSurface(inputs, object, params, report, scales.at(object.uuid))) {
             surfaces.push_back(std::move(*loaded));
+            seedIndex.push_back(fresh ? selectionIndex[oi] : surfaces.size() - 1);
+        }
     }
     objects::util::reportProgress(progress, "loading surfaces", objects.size(), objects.size());
+    std::vector<char> isNew(surfaces.size(), 0);
+    if (fresh)
+        for (size_t i = 0; i < surfaces.size(); ++i) isNew[i] = fresh->contains(surfaces[i].uuid);
+    // Pairs examined: all of them, or those with a new surface.
+    auto pairsAfter = [&](size_t si) -> uint64_t {
+        if (!fresh || isNew[si]) return surfaces.size() - si - 1;
+        return uint64_t(std::count(isNew.begin() + si + 1, isNew.end(), 1));
+    };
     report.objectsConsidered = int64_t(surfaces.size());
     for (const auto& surface : surfaces) profile.samples += surface.samples.size();
 
@@ -705,7 +740,8 @@ DetectorReport linkSurfaceOverlaps(objects::ObjectStore& db,
     const double agreementRadius = params.tolerance + params.uvInlierTolerance;
     std::vector<LinkCandidate> candidates;
     std::map<std::string, std::size_t> rejections;
-    const uint64_t totalPairs = surfaces.empty() ? 0 : uint64_t(surfaces.size()) * (surfaces.size() - 1) / 2;
+    uint64_t totalPairs = 0;
+    for (size_t si = 0; si < surfaces.size(); ++si) totalPairs += pairsAfter(si);
     uint64_t processedPairs = 0;
     objects::util::reportProgress(progress, "checking surface pairs", 0, totalPairs);
     for (std::size_t si = 0; si < surfaces.size(); ++si) {
@@ -715,7 +751,8 @@ DetectorReport linkSurfaceOverlaps(objects::ObjectStore& db,
             processedPairs, totalPairs, item);
         std::vector<size_t> targets;
         for (size_t ti = si + 1; ti < surfaces.size(); ++ti)
-            if (bboxOverlap(seed, surfaces[ti], params.tolerance)) targets.push_back(ti);
+            if ((!fresh || isNew[si] || isNew[ti]) && bboxOverlap(seed, surfaces[ti], params.tolerance))
+                targets.push_back(ti);
         profile.bboxPairs += targets.size();
         auto matches = [&] {
             PhaseTimer timer(profile.enabled ? &profile.harvest : nullptr);
@@ -734,7 +771,8 @@ DetectorReport linkSurfaceOverlaps(objects::ObjectStore& db,
             const LoadedSurface& target = surfaces[ti];
             const auto correspondences = collector.take();
             if (correspondences.size() < params.minInliers) continue;
-            const std::uint64_t pairSeed = splitmix64(std::uint64_t(si + 1) * 0x9E3779B9ULL ^ std::uint64_t(ti + 1));
+            const std::uint64_t pairSeed = splitmix64(std::uint64_t(seedIndex[si] + 1) * 0x9E3779B9ULL ^
+                                                      std::uint64_t(seedIndex[ti] + 1));
             ++profile.fitPairs;
             FitResult fit = [&] {
                 PhaseTimer timer(profile.enabled ? &profile.fit : nullptr);
@@ -802,7 +840,7 @@ DetectorReport linkSurfaceOverlaps(objects::ObjectStore& db,
             candidate.meta = metadata.dump();
             candidates.push_back(std::move(candidate));
         }
-        processedPairs += surfaces.size() - si - 1;
+        processedPairs += pairsAfter(si);
         objects::util::reportProgress(progress, "checking surface pairs", processedPairs, totalPairs, item);
     }
     objects::util::reportProgress(progress, "checking surface pairs", totalPairs, totalPairs);
@@ -811,9 +849,20 @@ DetectorReport linkSurfaceOverlaps(objects::ObjectStore& db,
             "surface-overlap: " + std::to_string(count) + " pair(s) rejected: " + reason, int64_t(count));
 
     StaleEdgeScope scope{{params.edgeKind}, {}};
-    for (const auto& surface : surfaces) scope.objectUuids.push_back(surface.uuid);
+    if (fresh) {
+        // Edges of a new surface, with both endpoints selected and loaded or
+        // not examined (a partner that failed to load keeps its edges).
+        const auto failed = detail::failedObjects(report);
+        for (const auto& object : selected)
+            if (!failed.contains(object.uuid)) scope.objectUuids.push_back(object.uuid);
+        for (const auto& uuid : *fresh)
+            if (!failed.contains(uuid)) scope.touching.push_back(uuid);
+        if (scope.touching.empty()) scope.objectUuids.clear();  // no new surface loaded: remove nothing
+    } else {
+        for (const auto& surface : surfaces) scope.objectUuids.push_back(surface.uuid);
+    }
     auto txn = db.write();
-    DetectorReport committed = detail::commitStoredCandidates(db, inputs, txn, kSurfaceOverlapDetector, 1, candidates, params.replaceStalePending, &scope, progress);
+    DetectorReport committed = detail::commitStoredCandidates(db, inputs, txn, kSurfaceOverlapDetector, kSurfaceOverlapVersion, candidates, params.replaceStalePending, &scope, progress);
     if (cancelled()) throw std::runtime_error("surface-overlap: cancelled before commit");
     txn.commit();
     report.committed = true;

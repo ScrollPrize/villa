@@ -164,6 +164,16 @@ struct StorePositions {
 // nullopt unless a plain store that records positions.
 std::optional<StorePositions> storePositions(ObjectStore& store);
 
+// A store's link marker: a client's note of what its last link refresh
+// covered (a JSON object the client defines), so a later one can tell
+// whether the links are still current. Not journaled: writing one adds no
+// journal entry and no position, no hub sync carries it, and hubRevert
+// leaves it. It belongs to the replica identity that wrote it, so a copy of
+// the store (a clone, forkReplica) reads none. One per store; a write
+// replaces it.
+std::optional<std::string> linkMarker(ObjectStore& store);
+void setLinkMarker(ObjectStore& store, const std::string& json);
+
 // Local state only; no hub contact.
 std::optional<HubStatus> hubStatus(ObjectStore& store);
 // keep = "hub": install the hub record here. keep = "local": push this
