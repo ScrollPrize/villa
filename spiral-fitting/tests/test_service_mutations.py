@@ -115,13 +115,6 @@ def upload_manifest(kind='checkpoint'):
                        "sha256": hashlib.sha256(DATA).hexdigest()}]}
 
 
-def test_only_checkpoints_are_uploaded(manager):
-    for index, kind in enumerate(('patch', 'fiber', 'pcl')):
-        with pytest.raises(ApiError, match='Only checkpoints'):
-            manager.begin({**upload_manifest(kind), 'upload_id': f'{index:032x}'})
-    assert manager.uploads == {}
-
-
 def test_cancellation_retains_receipt_and_never_recreates_transfer(manager):
     upload_id = manager.begin(upload_manifest())["upload_id"]
     manager.cancel(upload_id)

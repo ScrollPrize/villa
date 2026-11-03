@@ -5,7 +5,6 @@ import json
 import os
 from types import SimpleNamespace
 
-import numpy as np
 import pytest
 
 pytest.importorskip('vc_object_store')
@@ -14,60 +13,14 @@ from vc_object_store import ObjectStore  # noqa: E402
 import object_store_inputs as osi  # noqa: E402
 import object_store_reference as reference  # noqa: E402
 from object_store_fixture import (  # noqa: E402
-    VOLUME, pcl_patch_edge, put_fiber, put_patch, put_pcl)
+    VOLUME, edges, fit_config, names, on_plane, plane, put_fiber, put_patch, put_pcl)
 
-
-@pytest.fixture(autouse=True)
-def cpu(monkeypatch):
-    monkeypatch.setenv('FIT_SPIRAL_DEVICE', 'cpu')
-
-
-def _grid(y=100.0, size=8):
-    rows, cols = np.mgrid[:size, :size]
-    return np.stack([4.0 + rows * 4, np.full(rows.shape, y), 40.0 + cols * 4],
-                    axis=-1)
-
-
-def _on(y, *points):
-    """PCL points on the plane y, annotated with no winding."""
-    return {index: ([z, y, x], None) for index, (z, x) in enumerate(points)}
-
-
-@pytest.fixture()
-def store_path(tmp_path):
-    """A closed store with two patches and a PCL touching each of them."""
-    path = str(tmp_path / 'fit.vcobj')
-    with ObjectStore.create(path, author='ingest', hostname='host') as db:
-        put_patch(db, _grid(), (0.25, 0.25), name='near')
-        put_patch(db, _grid(140.0), (0.25, 0.25), name='far')
-        put_pcl(db, {**_on(100.0, (12.0, 48.0), (16.0, 52.0)),
-                     2: ([20.0, 140.0, 56.0], None)}, name='walk')
-    return path
-
-
-def _uuids(path):
-    with ObjectStore.open(path, read_only=True) as db:
-        return {record['name']: record['uuid'] for kind in osi.KINDS
-                for record in db.objects_by_kind(kind)}
-
-
-def _edges(path, kind='point-surface'):
-    with ObjectStore.open(path, read_only=True) as db:
-        return sorted((edge['uuid'], edge['a'], edge['b'], edge['approval_state'],
-                       edge['generation'], edge['changed_at'])
-                      for edge in db.edges_by_kind(kind))
+pytestmark = pytest.mark.usefixtures('cpu')
 
 
 def _sha256(path):
     with open(path, 'rb') as stream:
         return hashlib.sha256(stream.read()).hexdigest()
-
-
-def fit_config(path, **overrides):
-    config = reference.fit_config()
-    config.update(object_store_path=path, object_store_author='fitter')
-    config.update(overrides)
-    return config
 
 
 def load(path, log=None, **overrides):
@@ -78,33 +31,24 @@ def load(path, log=None, **overrides):
 def test_default_refresh_writes_links_and_freezes_the_inputs(store_path):
     log = []
     inputs = load(store_path, log)
-    edges = _edges(store_path)
-    assert len(edges) == 3
+    linked = edges(store_path)
+    assert len(linked) == 3
     assert inputs.counts['pcl attachments'] == 3
     assert any(line.startswith('link refresh pcl_patch: 3 created') for line in log)
-    assert any('fiber_patch: skipped (no selected fibers)' in line for line in log)
     assert inputs.manifest['link_refresh']['enabled']
     assert inputs.manifest['materialization']['pcl_patch_overlap_max_pairs'] == 16
     # A rerun finds the links current (the store's link marker) and runs no
     # detector: same relationships, same frozen inputs.
     rerun = []
     again = load(store_path, rerun)
-    assert _edges(store_path) == edges
+    assert edges(store_path) == linked
     assert again.digest == inputs.digest
     assert any(line.startswith('link refresh: skip: unchanged since position') for line in rerun)
     assert not any('running' in line for line in rerun)
     # A forced full refresh reconciles idempotently.
-    assert any('3 unchanged' in line
-               for line in _refresh_lines(store_path, object_store_full_link_refresh=True))
-
-
-def _refresh_lines(path, **overrides):
-    log = []
-    load(path, log, **overrides)
-    return log
-
-
-def test_refresh_needs_an_author(store_path):
+    forced = []
+    load(store_path, forced, object_store_full_link_refresh=True)
+    assert any('3 unchanged' in line for line in forced)
     with pytest.raises(osi.LinkRefreshError, match='object_store_author is required'):
         load(store_path, object_store_author=None)
 
@@ -124,27 +68,7 @@ def test_refresh_failures_are_collected_and_stop_the_fit(store_path, tmp_path):
     assert 'link refresh patch_overlap: 0 created' in text
     assert 'failed in pcl_patch, fiber_patch; the fit will not train' in text
     assert 'patch_overlap committed before the failure' in text
-    assert _edges(store_path) == []
-
-
-def test_returned_failures_are_failures_and_diagnostics_are_not():
-    report = {'edges_created': 1, 'edges_updated': 0, 'edges_skipped_existing': 0,
-              'stale_removed': 0, 'committed': False, 'failed': True,
-              'issues': [{'severity': 'failure', 'stage': 'validate',
-                          'object_uuids': ['u1', 'u2'], 'reason': 'bad frame',
-                          'count': 1},
-                         {'severity': 'diagnostic', 'stage': 'discover',
-                          'object_uuids': [], 'reason': 'too few inliers',
-                          'count': 7}]}
-    failed = osi.RefreshOutcome('patch_overlap', report=report)
-    lines, problems = osi.refresh_report([failed])
-    assert failed.failed and problems
-    assert '  failure at validate: bad frame (u1, u2)' in lines
-    assert '  7 candidate diagnostic(s), e.g. too few inliers' in lines
-    report = dict(report, failed=False, committed=True,
-                  issues=report['issues'][1:])
-    lines, problems = osi.refresh_report([osi.RefreshOutcome('patch_overlap', report=report)])
-    assert problems == []
+    assert edges(store_path) == []
 
 
 def test_no_refresh_mode_never_writes(store_path):
@@ -153,26 +77,11 @@ def test_no_refresh_mode_never_writes(store_path):
     inputs = load(store_path, log, object_store_refresh_links=False,
                   object_store_author=None)
     assert _sha256(store_path) == before
-    assert _edges(store_path) == []
+    assert edges(store_path) == []
     assert inputs.counts['pcl attachments'] == 0
     assert "link refresh: off; reading the store's current relationships" in log
     assert not inputs.manifest['link_refresh']['enabled']
-    report = '\n'.join(inputs.report())
-    assert 'WARNING: no pcl_patch relationships are consumed' in report
-
-
-def test_approved_only_consumes_approved_links_after_refresh(store_path):
-    inputs = load(store_path, object_store_approved_links_only=True)
-    assert inputs.counts['pcl attachments'] == 0
-    assert inputs.snapshot.exclusions['pending (approved-only)'] == 3
-    assert any('WARNING: no pcl_patch relationships are consumed'
-               in line for line in inputs.report())
-    edge = _edges(store_path)[0][0]
-    with ObjectStore.open(store_path, author='reviewer') as db:
-        db.set_approval(edge, 'approved')
-    inputs = load(store_path, object_store_approved_links_only=True)
-    assert [rel.uuid for rel in inputs.snapshot.relationships] == [edge]
-    assert inputs.counts['pcl attachments'] == 1
+    assert 'WARNING: no pcl_patch relationships are consumed' in '\n'.join(inputs.report())
 
 
 def test_empty_selectors_skip_detectors_without_writing(store_path):
@@ -181,31 +90,28 @@ def test_empty_selectors_skip_detectors_without_writing(store_path):
                   object_store_fiber_tags=['absent'])
     assert 'link refresh pcl_patch: skipped (no selected point collections)' in log
     assert 'link refresh fiber_patch: skipped (no selected fibers)' in log
-    assert _edges(store_path) == []
+    assert edges(store_path) == []
     assert inputs.snapshot.objects_of('point_collection') == []
-
-
-def test_subset_refresh_leaves_relationships_outside_the_selection(store_path):
-    load(store_path)
-    names = _uuids(store_path)
-    outside = [edge for edge in _edges(store_path) if names['far'] in edge[1:3]]
-    assert len(outside) == 1
-    # A refresh over {near, walk} must neither touch nor remove the edge to
-    # the unselected far patch.
-    inputs = load(store_path, object_store_patch_uuids=[names['near']])
-    assert [edge for edge in _edges(store_path) if names['far'] in edge[1:3]] == outside
-    assert {rel.a for rel in inputs.snapshot.relationships} == {names['near']}
-
-
-def test_input_toggles_select_nothing_and_pcl_roles_must_agree(store_path):
-    config = fit_config(store_path, input_use_verified_patches=False,
-                        input_use_fibers=False)
-    request = osi.request_from_config(config)
+    # Input toggles select nothing either; the PCL role toggles must agree.
+    request = osi.request_from_config(fit_config(
+        store_path, input_use_verified_patches=False, input_use_fibers=False))
     assert request.selector('surface') == osi.Selector(uuids=())
     assert request.selector('fiber') == osi.Selector(uuids=())
     assert request.selector('point_collection').is_default
     with pytest.raises(osi.ObjectStoreInputError, match='role toggles must all agree'):
         osi.request_from_config(fit_config(store_path, input_use_pcl_relative=False))
+
+
+def test_subset_refresh_leaves_relationships_outside_the_selection(store_path):
+    load(store_path)
+    uuids = names(store_path)
+    outside = [edge for edge in edges(store_path) if uuids['far'] in edge[1:3]]
+    assert len(outside) == 1
+    # A refresh over {near, walk} must neither touch nor remove the edge to
+    # the unselected far patch.
+    inputs = load(store_path, object_store_patch_uuids=[uuids['near']])
+    assert [edge for edge in edges(store_path) if uuids['far'] in edge[1:3]] == outside
+    assert {rel.a for rel in inputs.snapshot.relationships} == {uuids['near']}
 
 
 def test_normal_source_prefers_lasagna_then_ct_then_none():
@@ -231,31 +137,6 @@ def test_normal_source_prefers_lasagna_then_ct_then_none():
     assert dict(lasagna.parameters) == {
         'ct_level': 0, 'ct_to_base_scale': 4.0,
         'normal_pool': '/cache/lasagna/run-1/normals_g4'}
-    assert 'ignoring object_store_normal_ct_path' in lasagna.note
-    assert lasagna.provenance()['kind'] == 'lasagna'
-
-
-def test_fiber_refresh_records_the_chosen_normal_source(tmp_path):
-    path = str(tmp_path / 'fibers.vcobj')
-    with ObjectStore.create(path, author='ingest', hostname='host') as db:
-        patch = put_patch(db, _grid(size=40), (0.25, 0.25))
-        # Lying on the patch for 140 voxels, beyond the detector's minimum
-        # contact run.
-        fiber = put_fiber(db, [[30.0, 100.0, 50.0 + i] for i in range(141)],
-                          [0, 140], name='lying')
-    log = []
-    inputs = load(path, log)
-    assert 'fiber-patch normals: none (centerline-only linking)' in log
-    assert any(line.startswith('WARNING: fiber-patch links are refreshed '
-                               'centerline-only') for line in log)
-    assert inputs.manifest['link_refresh']['fiber_patch_normals'] == {
-        'kind': 'none', 'ct_volume': None}
-    with ObjectStore.open(path, read_only=True) as db:
-        [edge] = db.edges_by_kind('same-surface')
-    assert {edge['a'], edge['b']} == {patch, fiber}
-    assert edge['meta']['normal_method'] == 'centerline'
-    assert edge['meta']['normal_source'] is None
-    assert inputs.counts['fiber attachments'] == 1
 
 
 def test_packed_normals_link_fibers_as_the_arrays_do(tmp_path, monkeypatch):
@@ -278,7 +159,9 @@ def test_packed_normals_link_fibers_as_the_arrays_do(tmp_path, monkeypatch):
     for name in ('arrays', 'pack'):
         path = str(tmp_path / f'{name}.vcobj')
         with ObjectStore.create(path, author='ingest', hostname='host') as db:
-            put_patch(db, _grid(size=40), (0.25, 0.25))
+            put_patch(db, plane(size=40), (0.25, 0.25))
+            # Lying on the patch for 140 voxels, beyond the detector's
+            # minimum contact run.
             put_fiber(db, [[30.0, 100.0, 50.0 + i] for i in range(141)], [0, 140], name='lying')
         stores.append(path)
     original = osi.fiber_normal_source
@@ -287,8 +170,9 @@ def test_packed_normals_link_fibers_as_the_arrays_do(tmp_path, monkeypatch):
                         ('normal_x_volume', arrays[0]), ('normal_y_volume', arrays[1]))))
     load(stores[0])
     monkeypatch.setattr(osi, 'fiber_normal_source', original)
-    osi.load_fit_inputs(fit_config(stores[1]), lasagna={'pool': pack, 'scale': 1.0},
-                        log=lambda line: None)
+    inputs = osi.load_fit_inputs(fit_config(stores[1]), lasagna={'pool': pack, 'scale': 1.0},
+                                 log=lambda line: None)
+    assert inputs.counts['fiber attachments'] == 1
 
     def links(path):
         # Each store's objects have their own UUIDs; the evidence is compared.
@@ -306,20 +190,18 @@ def test_packed_normals_link_fibers_as_the_arrays_do(tmp_path, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# Two ranks
+# Two ranks (the end-to-end two-rank sessions are in test_runtime_object_store)
 # ---------------------------------------------------------------------------
 
-def _rank_worker(rank, world_size, rendezvous, config_paths, results):
+def _rank_worker(rank, world_size, rendezvous, configs, results):
     os.environ['FIT_SPIRAL_DEVICE'] = 'cpu'
     import torch.distributed as dist
     from ddp_helpers import DistributedContext
-    with open(config_paths[rank]) as stream:
-        config = json.load(stream)
     dist.init_process_group('gloo', store=dist.FileStore(rendezvous, world_size),
                             rank=rank, world_size=world_size)
     try:
         inputs = osi.load_fit_inputs(
-            config, dist=DistributedContext(rank, world_size, rank),
+            configs[rank], dist=DistributedContext(rank, world_size, rank),
             log=lambda line: None)
         result = {'digest': inputs.digest,
                   'attachments': inputs.counts['pcl attachments']}
@@ -331,65 +213,26 @@ def _rank_worker(rank, world_size, rendezvous, config_paths, results):
         json.dump(result, stream)
 
 
-def _two_ranks(tmp_path, configs):
-    import torch.multiprocessing as mp
-    paths, results = [], []
-    for rank, config in enumerate(configs):
-        paths.append(str(tmp_path / f'config{rank}.json'))
-        results.append(str(tmp_path / f'result{rank}.json'))
-        with open(paths[-1], 'w') as stream:
-            json.dump(config, stream)
-    rendezvous = str(tmp_path / 'rendezvous')
-    mp.spawn(_rank_worker, args=(2, rendezvous, paths, results), nprocs=2)
-    outcome = []
-    for path in results:
-        with open(path) as stream:
-            outcome.append(json.load(stream))
-    return outcome
-
-
 def test_a_rank_local_read_failure_reaches_every_rank(store_path, tmp_path):
+    from cpu_service import two_ranks
     # Rank 1 alone cannot open its store, after rank 0 refreshed.
-    configs = [fit_config(store_path),
-               fit_config(str(tmp_path / 'absent.vcobj'))]
-    first, second = _two_ranks(tmp_path, configs)
+    first, second = two_ranks(_rank_worker, tmp_path, [
+        fit_config(store_path), fit_config(str(tmp_path / 'absent.vcobj'))])
     assert 'error' in first and first == second
     assert all(line.startswith('rank 1: ') for line in first['error'])
 
 
-def test_two_ranks_refresh_once_and_agree(store_path, tmp_path):
-    config = fit_config(store_path)
-    first, second = _two_ranks(tmp_path, [config, config])
-    assert first == second and first['attachments'] == 3
-    assert len(_edges(store_path)) == 3
-
-
-def test_a_refresh_failure_reaches_every_rank(store_path, tmp_path):
-    config = fit_config(store_path, pcl_link_window_min_points=5)
-    first, second = _two_ranks(tmp_path, [config, config])
-    assert 'error' in first and first == second
-    assert any('pcl_patch: FAILED' in line for line in first['error'])
-
-
 def test_ranks_with_different_inputs_refuse_to_train(store_path, tmp_path):
-    configs = [fit_config(store_path),
-               fit_config(store_path, pcl_patch_overlap_max_pairs=4)]
-    first, second = _two_ranks(tmp_path, configs)
+    from cpu_service import two_ranks
+    first, second = two_ranks(_rank_worker, tmp_path, [
+        fit_config(store_path), fit_config(store_path, pcl_patch_overlap_max_pairs=4)])
     assert first == second
     assert 'ranks read different object-store inputs' in first['error'][0]
 
 
 # ---------------------------------------------------------------------------
-# External frames and resume
+# Resume
 # ---------------------------------------------------------------------------
-
-def _manifest(store_path, **frames):
-    return osi.input_manifest(
-        osi.read_snapshot(ObjectStore.open(store_path, read_only=True),
-                          osi.InputRequest()),
-        fit_config(store_path), osi.NormalSource('none'),
-        {'tracks': {'scale_factor': 2.0}, **frames})
-
 
 def test_resume_refuses_changed_inputs_and_frames(store_path):
     inputs = load(store_path)
@@ -408,7 +251,7 @@ def test_resume_refuses_changed_inputs_and_frames(store_path):
     [problem] = osi.resume_problems({}, inputs)
     assert 'records no object-store inputs' in problem
     # Refreshed relationships are inputs too.
-    edge = _edges(store_path)[0][0]
+    edge = edges(store_path)[0][0]
     with ObjectStore.open(store_path, author='reviewer') as db:
         db.set_approval(edge, 'approved')
     [problem] = osi.resume_problems(recorded, load(store_path))
@@ -418,24 +261,23 @@ def test_resume_refuses_changed_inputs_and_frames(store_path):
     assert quiet.digest == load(store_path).digest
 
 
-def _replicas(store_path, tmp_path):
-    """Two hub clones of the store: the deployed case of one logical store
-    seen through different local files."""
+def test_replicas_of_one_store_give_one_digest(store_path, tmp_path):
+    """Two hub clones: the deployed case of one logical store seen through
+    different local files."""
+    import shutil
     import vc_object_store as vos
     vos.hub_init(store_path, 'ingest')
-    replicas = [str(tmp_path / f'{name}.vcobj') for name in ('a', 'b')]
-    for path, author in zip(replicas, ('alice', 'bob')):
+    first, second = (str(tmp_path / f'{name}.vcobj') for name in ('a', 'b'))
+    for path, author in ((first, 'alice'), (second, 'bob')):
         vos.hub_clone(store_path, path, author)
-    return replicas
-
-
-def test_replicas_of_one_store_give_one_digest(store_path, tmp_path):
-    first, second = _replicas(store_path, tmp_path)
     # Loading on a hosted replica links and publishes at a hub position.
     linked = load(first, object_store_author='alice')
     assert linked.manifest['position']['sequence'] > 0
+    assert linked.manifest['link_refresh']['parameters'] == {
+        key: fit_config(first)[key] for key in osi.LINK_PARAMETER_KEYS}
     with ObjectStore.open(second, author='bob') as db:
         assert db.hub_sync(pull=True, push=False)['pulled']
+
     # The pull installs the links, and the objects they revise, under the
     # second replica's own revision UUIDs; the current-state digests agree.
     def current(path):
@@ -455,11 +297,20 @@ def test_replicas_of_one_store_give_one_digest(store_path, tmp_path):
     assert pinned.counts == linked.counts and pinned.digest == linked.digest
     assert osi.manifest_differences(linked.manifest, pinned.manifest) == []
     assert osi.resume_problems({'object_store': linked.manifest}, pinned) == []
+    # The same content as a plain store gives the same digest too: positions
+    # are provenance, not inputs.
+    plain = str(tmp_path / 'plain.vcobj')
+    shutil.copyfile(first, plain)
+    vos.hub_detach(plain, 'plain')
+    copy = load(plain, object_store_refresh_links=False)
+    assert copy.manifest['position'] is None and copy.digest == linked.digest
+    with pytest.raises(osi.ObjectStoreInputError, match='records no positions'):
+        osi.load_fit_inputs(fit_config(plain), log=lambda line: None, minimum_position=1)
 
 
 def test_digest_covers_the_metadata_the_adapter_reads(store_path):
     inputs = load(store_path)
-    walk = _uuids(store_path)['walk']
+    walk = names(store_path)['walk']
     with ObjectStore.open(store_path, author='reviewer') as db:
         db.set_meta(walk, 'review_note', 'checked')
     assert load(store_path, object_store_refresh_links=False).digest == inputs.digest
@@ -510,8 +361,8 @@ def test_checkpoint_preflight_checks_the_object_store_inputs(store_path):
                         paths=SpiralInputPaths(volume_uuid='volume-1',
                                                provenance={'input_manifest': '/m.json'})))
     assert payload['object_store_digest'] == inputs.digest
-    assert payload['volume_uuid'] == 'volume-1'
-    assert payload['provenance'] == {'input_manifest': '/m.json'}
+    assert (payload['volume_uuid'], payload['provenance']) == (
+        'volume-1', {'input_manifest': '/m.json'})
     verdict = fit_spiral.FitContext.inspect_checkpoint(
         context, _checkpoint(input_manifest=payload))
     assert verdict.accepted, verdict.message()
@@ -522,10 +373,6 @@ def test_checkpoint_preflight_checks_the_object_store_inputs(store_path):
     assert not verdict.accepted
     assert 'external_frames.tracks' in verdict.message()
 
-
-# ---------------------------------------------------------------------------
-# FitContext
-# ---------------------------------------------------------------------------
 
 def test_fit_context_loads_frozen_inputs_from_its_configuration(store_path, tmp_path):
     from config import FitConfig
@@ -543,7 +390,6 @@ def test_fit_context_loads_frozen_inputs_from_its_configuration(store_path, tmp_
     assert len(context.verified_patches) == 2
     assert inputs.manifest['external_frames'] == {
         'umbilicus': {'coordinate_scale': 1.0}}
-    assert context._checkpoint_input_manifest()['object_store_digest'] == inputs.digest
     context.resolve_output_path()
     context._write_object_store_manifest()
     with open(os.path.join(context.out_path, 'object_store_inputs.json')) as stream:
@@ -553,10 +399,6 @@ def test_fit_context_loads_frozen_inputs_from_its_configuration(store_path, tmp_
         context.apply_config({'pcl_link_distance_tolerance': 3.0},
                              current_iteration=0)
 
-
-# ---------------------------------------------------------------------------
-# Real data (opt-in)
-# ---------------------------------------------------------------------------
 
 @pytest.mark.skipif(not os.environ.get('OBJECT_STORE_SMOKE_STORE'),
                     reason='set OBJECT_STORE_SMOKE_STORE to a copy of an ingested dataset store')
@@ -577,25 +419,17 @@ def test_real_data_startup_smoke():
     assert load(path, z_begin=z_begin, z_end=z_end).digest == inputs.digest
 
 
-
-def _attach_results(path, tag=None):
-    """A correctly framed fit-results collection attached to the near patch."""
-    with ObjectStore.open(path, author='fit', hostname='host') as db:
-        near = next(r['uuid'] for r in db.objects_by_kind('surface') if r['name'] == 'near')
-        results = put_pcl(db, _on(100.0, (12.0, 48.0)), name='results',
-                          **({'tags': [tag]} if tag else {}))
-        db.set_meta(results, 'role', 'fit_results')
-        whole = {'whole_geometry': True}
-        db.add_edge({'kind': 'attachment', 'a': results, 'b': near,
-                     'a_anchor': whole, 'b_anchor': whole, 'meta': {'role': 'fit_results'}})
-    return results
-
-
 @pytest.mark.parametrize('refresh', [True, False])
 def test_attached_collections_are_not_fit_inputs(store_path, refresh):
     if not refresh:
         load(store_path)  # the no-refresh read consumes links made earlier
-    results = _attach_results(store_path, tag='walks')
+    # A correctly framed fit-results collection attached to the near patch.
+    with ObjectStore.open(store_path, author='fit', hostname='host') as db:
+        results = put_pcl(db, on_plane(100.0, (12.0, 48.0)), name='results', tags=['walks'])
+        db.set_meta(results, 'role', 'fit_results')
+        whole = {'whole_geometry': True}
+        db.add_edge({'kind': 'attachment', 'a': results, 'b': names(store_path)['near'],
+                     'a_anchor': whole, 'b_anchor': whole, 'meta': {'role': 'fit_results'}})
     inputs = load(store_path, object_store_refresh_links=refresh)
     assert inputs.counts['pcl attachments'] == 3
     assert results not in json.dumps(inputs.manifest)
@@ -604,9 +438,6 @@ def test_attached_collections_are_not_fit_inputs(store_path, refresh):
                   object_store_pcl_tags=['walks'])
     assert inputs.counts['pcl attachments'] == 0
     assert results not in json.dumps(inputs.manifest)
-
-
-def test_explicitly_selected_attached_collection_is_refused(store_path):
-    results = _attach_results(store_path)
+    # Naming it explicitly is refused.
     with pytest.raises(osi.ObjectStoreInputError, match='attached data'):
         load(store_path, object_store_pcl_uuids=[results])

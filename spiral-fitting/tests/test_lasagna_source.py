@@ -20,11 +20,11 @@ def write_manifest(directory, name='s.lasagna.json', **extra):
     return path
 
 
-def test_a_manifest_without_provenance_is_identified_by_its_bytes(tmp_path):
+def test_a_local_manifest_is_identified_by_its_run_or_its_bytes(tmp_path):
     path = write_manifest(tmp_path)
     source = read_lasagna_manifest(path)
-    assert source.identity == 'sha256-' + hashlib.sha256(path.read_bytes()).hexdigest()
-    assert source.group == '4'
+    digest = 'sha256-' + hashlib.sha256(path.read_bytes()).hexdigest()
+    assert source.identity == digest and source.group == '4'
     assert source.stores == {key: str(tmp_path / f's_{channel}.ome.zarr')
                              for key, channel in (('normal_x', 'nx'), ('normal_y', 'ny'),
                                                   ('gradient_magnitude', 'grad_mag'))}
@@ -33,16 +33,14 @@ def test_a_manifest_without_provenance_is_identified_by_its_bytes(tmp_path):
     copy.mkdir()
     (copy / 's.lasagna.json').write_bytes(path.read_bytes())
     assert read_lasagna_manifest(copy / 's.lasagna.json').identity == source.identity
-
-
-def test_a_published_manifest_is_identified_by_its_run(tmp_path):
+    # A published manifest is identified by its run; a run of another
+    # manifest, or an unsafe one, does not identify this one.
+    published = write_manifest(tmp_path, name='p.lasagna.json', provenance='inference.json')
+    with pytest.raises(LasagnaSourceError, match='provenance record'):
+        read_lasagna_manifest(published)
     (tmp_path / 'inference.json').write_text(json.dumps(
-        {'run_uuid': '5b17ff6c-3c47-4f7f-8042-9326a683933b', 'manifest': 's.lasagna.json'}))
-    path = write_manifest(tmp_path, provenance='inference.json')
-    assert read_lasagna_manifest(path).identity == '5b17ff6c-3c47-4f7f-8042-9326a683933b'
-
-
-def test_a_run_of_another_manifest_does_not_identify_this_one():
+        {'run_uuid': '5b17ff6c-3c47-4f7f-8042-9326a683933b', 'manifest': 'p.lasagna.json'}))
+    assert read_lasagna_manifest(published).identity == '5b17ff6c-3c47-4f7f-8042-9326a683933b'
     data = b'{"version": 2}'
     digest = 'sha256-' + hashlib.sha256(data).hexdigest()
     assert manifest_identity(data, 's.lasagna.json', {'run_uuid': 'r', 'manifest': 'o.lasagna.json'}) == digest
@@ -50,13 +48,7 @@ def test_a_run_of_another_manifest_does_not_identify_this_one():
     assert manifest_identity(data, 's.lasagna.json', {'run_uuid': '../r'}) == digest
 
 
-def test_a_named_but_missing_provenance_is_refused(tmp_path):
-    path = write_manifest(tmp_path, provenance='inference.json')
-    with pytest.raises(LasagnaSourceError, match='provenance record'):
-        read_lasagna_manifest(path)
-
-
-def test_a_remote_dataset_is_identified_by_its_url():
+def test_a_remote_dataset_and_its_local_copies_are_identified_by_its_url(tmp_path):
     url = 's3://Bucket/scroll/s.lasagna.json'
     identity = url_identity(url)
     assert identity.startswith('url-') and LasagnaSource(identity, '', '4').identity == identity
@@ -68,10 +60,8 @@ def test_a_remote_dataset_is_identified_by_its_url():
     assert url_identity('s3://bucket/scroll/S.lasagna.json') != identity
     with pytest.raises(LasagnaSourceError, match='not a remote'):
         url_identity('/data/s.lasagna.json')
-
-
-def test_a_local_copy_of_a_remote_dataset_is_that_dataset(tmp_path):
-    # Its provenance record need not have been copied: the URL identifies it.
+    # A local copy's provenance record need not have been copied: the URL
+    # identifies it; its stores are the copy's.
     path = write_manifest(tmp_path, provenance='inference.json')
     url = 'https://data.example/s.lasagna.json'
     source = read_lasagna_manifest(path, url=url)
@@ -103,7 +93,8 @@ def test_a_service_s_source_document_round_trips(tmp_path):
     assert load_lasagna_source(write_manifest(tmp_path)).group == '4'
 
 
-def test_packs_live_under_the_identity():
+def test_packs_live_under_the_identity(tmp_path):
+    from fit_session import lasagna_normal_inputs
     source = LasagnaSource(identity='run-1', location='', group='4',
                            stores={'normal_x': '/nx', 'normal_y': '/ny'})
     assert source.pack_directory('/cache', 'normals') == '/cache/lasagna/run-1/normals_g4'
@@ -112,12 +103,7 @@ def test_packs_live_under_the_identity():
         source.arrays('grad_mag')
     with pytest.raises(LasagnaSourceError, match='identity'):
         LasagnaSource(identity='../x', location='', group='4')
-
-
-def test_the_link_refresh_reads_the_normals_pack_when_the_cache_has_it(tmp_path):
-    from fit_session import lasagna_normal_inputs
-    source = LasagnaSource(identity='run-1', location='', group='4',
-                           stores={'normal_x': '/nx', 'normal_y': '/ny'})
+    # The link refresh reads the normals pack when the cache has it.
     config = {'input_use_normals': True}
     assert lasagna_normal_inputs(source, config, 4, tmp_path) is None
     pack = tmp_path / 'lasagna' / 'run-1' / 'normals_g4'
@@ -160,56 +146,45 @@ def test_a_manifest_s_frame_gives_the_arrays_downsampling(tmp_path):
     assert load_lasagna_source(write_lasagna_source(tmp_path / 'c', copy)) == copy
     assert lasagna_scale_for(copy, (400, 800, 1200))[0] == 16
 
+    # Nothing is derived without a frame or a matching shape.
+    bare = read_lasagna_manifest(write_manifest(tmp_path, name='b.lasagna.json'))
+    assert lasagna_scale_for(bare, (400, 800, 1200)) == (
+        None, f'{bare.location} does not state its base_shape_zyx')
+    assert lasagna_scale_for(source, None)[0] is None
+    scale, why = lasagna_scale_for(source, (300, 800, 1200))
+    assert scale is None and 'not levels of one grid' in why
+    scale, why = lasagna_scale_for(source, (13, 25, 38))  # coarser than the arrays
+    assert scale is None and 'not a whole downsampling' in why
     # Levels counted from a pre-downsampled volume: no agreed convention yet.
     scaled = read_lasagna_manifest(write_manifest(
         tmp_path, name='t.lasagna.json', base_shape_zyx=[200, 400, 600], source_to_base=2.0))
     scale, why = lasagna_scale_for(scaled, (400, 800, 1200))
     assert scale is None and 'source_to_base 2' in why
-
-
-def write_published_manifest(directory, name, base_shape_zyx, normal_scaledown):
-    """The frame of a published open-data manifest (version 2, one
-    single-channel store per channel, source_to_base 1)."""
-    stem = name.removesuffix('.lasagna.json')
-    path = directory / name
-    path.write_text(json.dumps({
-        'version': 2, 'source_to_base': 1.0, 'base_shape_zyx': base_shape_zyx,
-        'groups': {channel: {'zarr': f'{stem}_{channel}.ome.zarr/{normal_scaledown}',
-                             'scaledown': normal_scaledown, 'channels': [channel]}
-                   for channel in ('nx', 'ny', 'grad_mag')}}))
-    return path
-
-
-def test_published_datasets_give_their_scales(tmp_path):
-    # PHercParis4: inferred on level 2 of the 2.4 um volume, its levels still
-    # count from that volume's level 0 (normals at 16 full-resolution voxels).
-    paris4 = read_lasagna_manifest(write_published_manifest(
-        tmp_path, 'p4.lasagna.json', [75784, 32693, 32693], 4))
-    assert lasagna_scale_for(paris4, (75784, 32693, 32693))[0] == 16
-    assert lasagna_scale_for(paris4, (18946, 8174, 8174))[0] == 4
-    # PHerc1447: inferred at the native 8.64 um resolution.
-    pherc1447 = read_lasagna_manifest(write_published_manifest(
-        tmp_path, 'h.lasagna.json', [24297, 8343, 8343], 2))
-    assert lasagna_scale_for(pherc1447, (24297, 8343, 8343))[0] == 4
-    assert lasagna_scale_for(pherc1447, (24296, 8342, 8342))[0] == 4
-
-
-def test_the_downsampling_is_not_derived_without_a_frame_or_a_matching_shape(tmp_path):
-    bare = read_lasagna_manifest(write_manifest(tmp_path))
-    assert bare.base_shape_zyx is None
-    assert lasagna_scale_for(bare, (400, 800, 1200)) == (
-        None, f'{bare.location} does not state its base_shape_zyx')
-    framed = read_lasagna_manifest(write_manifest(
-        tmp_path, name='t.lasagna.json', base_shape_zyx=[400, 800, 1200]))
-    assert lasagna_scale_for(framed, None)[0] is None
-    scale, why = lasagna_scale_for(framed, (300, 800, 1200))
-    assert scale is None and 'not levels of one grid' in why
-    # A fit volume coarser than the arrays.
-    scale, why = lasagna_scale_for(framed, (13, 25, 38))
-    assert scale is None and 'not a whole downsampling' in why
     for bad in ({'base_shape_zyx': [1, 2]}, {'source_to_base': 0}):
         with pytest.raises(LasagnaSourceError):
             read_lasagna_manifest(write_manifest(tmp_path, name='u.lasagna.json', **bad))
+
+
+def test_published_datasets_give_their_scales(tmp_path):
+    def published(name, base_shape_zyx, normal_scaledown):
+        """The frame of a published open-data manifest (version 2, one
+        single-channel store per channel, source_to_base 1)."""
+        stem = name.removesuffix('.lasagna.json')
+        (tmp_path / name).write_text(json.dumps({
+            'version': 2, 'source_to_base': 1.0, 'base_shape_zyx': base_shape_zyx,
+            'groups': {channel: {'zarr': f'{stem}_{channel}.ome.zarr/{normal_scaledown}',
+                                 'scaledown': normal_scaledown, 'channels': [channel]}
+                       for channel in ('nx', 'ny', 'grad_mag')}}))
+        return read_lasagna_manifest(tmp_path / name)
+    # PHercParis4: inferred on level 2 of the 2.4 um volume, its levels still
+    # count from that volume's level 0 (normals at 16 full-resolution voxels).
+    paris4 = published('p4.lasagna.json', [75784, 32693, 32693], 4)
+    assert lasagna_scale_for(paris4, (75784, 32693, 32693))[0] == 16
+    assert lasagna_scale_for(paris4, (18946, 8174, 8174))[0] == 4
+    # PHerc1447: inferred at the native 8.64 um resolution.
+    pherc1447 = published('h.lasagna.json', [24297, 8343, 8343], 2)
+    assert lasagna_scale_for(pherc1447, (24297, 8343, 8343))[0] == 4
+    assert lasagna_scale_for(pherc1447, (24296, 8342, 8342))[0] == 4
 
 
 def test_a_stated_scale_is_derived_cross_checked_or_required(tmp_path):
@@ -218,6 +193,8 @@ def test_a_stated_scale_is_derived_cross_checked_or_required(tmp_path):
     from fit_session import ScrollSpec, ScrollSpecError, resolve_lasagna_scale
     framed = read_lasagna_manifest(write_manifest(tmp_path, base_shape_zyx=[400, 800, 1200]))
     bare = read_lasagna_manifest(write_manifest(tmp_path, name='t.lasagna.json'))
+    fine = read_lasagna_manifest(write_manifest(
+        tmp_path, name='f.lasagna.json', base_shape_zyx=[200, 400, 600], source_to_base=2))
     spec = ScrollSpec(name='s', voxel_size_um=8.0, spiral_outward_sense='CW',
                       base_shape_zyx=(400, 800, 1200))
     assert resolve_lasagna_scale(spec, framed).lasagna_scale == 16
@@ -225,8 +202,10 @@ def test_a_stated_scale_is_derived_cross_checked_or_required(tmp_path):
     with pytest.raises(ScrollSpecError, match='lasagna_scale 4 contradicts'):
         resolve_lasagna_scale(replace(spec, lasagna_scale=4), framed)
     # Underivable: the stated scale stands, and without one the fit is refused.
-    assert resolve_lasagna_scale(replace(spec, lasagna_scale=4), bare).lasagna_scale == 4
-    with pytest.raises(ScrollSpecError, match='state scroll.lasagna_scale'):
-        resolve_lasagna_scale(spec, bare)
+    for underivable, why in ((bare, 'state scroll.lasagna_scale'), (fine, 'source_to_base')):
+        assert resolve_lasagna_scale(replace(spec, lasagna_scale=4), underivable
+                                     ).lasagna_scale == 4
+        with pytest.raises(ScrollSpecError, match=why):
+            resolve_lasagna_scale(spec, underivable)
     with pytest.raises(ScrollSpecError, match='base_shape_zyx'):
         resolve_lasagna_scale(replace(spec, base_shape_zyx=None), framed)

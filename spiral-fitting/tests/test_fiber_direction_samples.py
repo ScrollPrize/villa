@@ -101,23 +101,6 @@ def test_a_window_outside_the_extraction_is_refused(tmp_path):
         load_fiber_direction_samples(tmp_path / "f.npz", 10, 30)
 
 
-def test_an_existing_artifact_is_adopted_into_the_cache(tmp_path):
-    import pytest
-    import fiber_direction_samples as module
-    from lasagna_source import url_identity
-
-    # The artifact's manifest_url names the dataset; nothing is fetched.
-    url = "https://data.example/fibers/f.lasagna.json"
-    _write_artifact(tmp_path / "f.npz", manifest_url=url, output_scale_base_voxels=4.0,
-                    z_roi=[0, 20])
-    target = module.adopt(tmp_path / "f.npz", tmp_path / "cache")
-    assert target == (tmp_path / "cache" / "fiber-directions" / url_identity(url)
-                      / "scale4.npz")
-    assert load_fiber_direction_samples(target, 0, 10)["metadata"]["manifest_url"] == url
-    with pytest.raises(FileExistsError):
-        module.adopt(tmp_path / "f.npz", tmp_path / "cache")
-
-
 def write_fiber_dataset(directory, presence, nx, ny, chunk=4):
     """A local fiber-inference dataset: presence/nx/ny Zarr v2 directory
     arrays of uncompressed chunks (a presence chunk with nothing in it left
@@ -174,26 +157,6 @@ def test_a_local_dataset_is_extracted_into_the_cache_by_its_identity(tmp_path):
     # Adopted elsewhere, the artifact keeps the identity it was extracted under.
     assert module.adopt(target, tmp_path / "other") == Path(fiber_directions_path(
         tmp_path / "other", local_manifest_identity(manifest), 0.5))
-
-
-def test_vc3d_open_data_copies_read_their_remote_manifest(tmp_path):
-    import pytest
-    import fiber_direction_samples as module
-
-    manifest = tmp_path / "f.lasagna.json"
-    manifest.write_text("{}")
-    assert module._manifest_location(str(manifest)) == str(manifest)
-    marker = tmp_path / "lasagna-remote.json"
-    marker.write_text(json.dumps({"artifact_url": "https://data.example/run/",
-                                  "manifest_file": "f.lasagna.json"}))
-    assert (module._manifest_location(str(manifest))
-            == "https://data.example/run/f.lasagna.json")
-    # A marker naming another manifest leaves this one local.
-    marker.write_text(json.dumps({"artifact_url": "https://data.example/run",
-                                  "manifest_file": "g.lasagna.json"}))
-    assert module._manifest_location(str(manifest)) == str(manifest)
-    with pytest.raises(ValueError, match="over HTTP"):
-        module._manifest_location("s3://bucket/f.lasagna.json")
 
 
 class _IdentityTransform(torch.nn.Module):

@@ -474,13 +474,18 @@ PYTHONPATH=spiral-fitting:$VC_OBJECT_STORE_BUILD/python spiral-fitting/.venv/bin
   spiral-fitting/tests/test_object_store_fibers.py \
   spiral-fitting/tests/test_object_store_overlaps.py \
   spiral-fitting/tests/test_object_store_tracks.py \
-  spiral-fitting/tests/test_object_store_startup.py
+  spiral-fitting/tests/test_object_store_startup.py \
+  spiral-fitting/tests/test_object_store_positions.py \
+  spiral-fitting/tests/test_object_store_lazy_relink.py
 ```
 
-These build small stores and cover selection, frames and scales, refresh and
-its idempotency, aggregated failures, read-only and approved-only modes,
-two-rank startup (success, failure, manifest mismatch), resume refusal, tracks
-and their crossings (equal to the ones Spiral's own exact-crossing builder
+These build small stores (`tests/object_store_fixture.py`; shared fixtures in
+`tests/conftest.py`) and cover selection, frames and scales, refresh and its
+idempotency, aggregated failures, read-only and approved-only modes, two-rank
+startup (a rank-local failure, manifest mismatch), resume refusal, positions
+linked and pinned on a hub replica or a store shared in place (including
+edits racing the link refresh), lazy and incremental relinking, tracks and
+their crossings (equal to the ones Spiral's own exact-crossing builder
 finds), and the runtime constraints against
 `tests/data/object_store_reference.json`, which the removed file loader
 produced from the same fixture. An opt-in startup test refreshes and
@@ -1270,6 +1275,7 @@ repository root; `vc_object_store`'s Python module on `PYTHONPATH`):
 AGENTS_AGENT_MODE=1 PYTHONPATH=spiral-fitting:<store-build>/python spiral-fitting/.venv/bin/python -m pytest -q \
   spiral-fitting/tests/test_service_object_store.py \
   spiral-fitting/tests/test_runtime_object_store.py \
+  spiral-fitting/tests/test_service_hub_positions.py \
   spiral-fitting/tests/test_service_mutations.py \
   spiral-fitting/tests/test_workspace_cleanup.py \
   spiral-fitting/tests/test_spiral_service_v2.py
