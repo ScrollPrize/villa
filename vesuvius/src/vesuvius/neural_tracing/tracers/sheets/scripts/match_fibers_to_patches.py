@@ -1,18 +1,19 @@
-"""Match AFV fibers of one family (e.g. horizontal) to the tifxyz patches whose surface they lie on.
+"""Match fiber-store fibers of one family (e.g. horizontal) to the tifxyz patches whose surface they lie on.
 
 Every valid patch node gets a surface normal from its grid neighbours; all nodes go into one KD-tree. Each fiber
-(``AFVFibers``, plus VC3D fiber JSONs with ``--fiber-jsons``; coordinates divided by ``--grid-scale`` into the
+(``FiberStore``, plus VC3D fiber JSONs with ``--fiber-jsons``; coordinates divided by ``--grid-scale`` into the
 patches' level-0 voxels) is sampled every ``--sample`` voxels; a sample lies on a patch when one of its
 ``--candidates`` nearest nodes of that patch is within ``--max-tangential`` grid cells of it sideways and, along the
 node's normal turned outward (away from the scroll's umbilicus at that height), between ``--max-inward`` voxels
 inward and ``--max-outward`` voxels outward of it. A fiber is a thin tube on its sheet's surface, so it touches the
-patch; the next sheet is about 12 voxels away. (On the Paris4 AFV, matched horizontal fibers sit at +0.1 voxels on
-average with a +-2 window.) Runs of consecutive on-patch samples at least ``--min-run`` voxels long are written, one
-JSON line each: fiber id, patch (root, name), the run's arc-length start and end on the fiber (voxels), mean outward
-offset, and each sample's patch grid position (row, col of its node) and position (xyz). A summary of how many
-patches have runs long enough for each front size follows.
+patch; the next sheet is about 12 voxels away. (On the automated Paris4 fibers, matched horizontal fibers sit at
++0.1 voxels on average with a +-2 window.) Runs of consecutive on-patch samples at least ``--min-run`` voxels long are
+written, one JSON line each: fiber key (``fiber:<UUID>`` of a store fiber, ``json:<file stem>`` of a JSON fiber),
+patch (root, name), the run's arc-length start and end on the fiber (voxels), mean outward offset, and each sample's
+patch grid position (row, col of its node) and position (xyz). A summary of how many patches have runs long enough
+for each front size follows.
 
-  python scripts/match_fibers_to_patches.py --afv PARIS4.afv --grid-scale 4 --patches-dir P1 P2 \\
+  python scripts/match_fibers_to_patches.py --fibers PARIS4.vcobj --grid-scale 4 --patches-dir P1 P2 \\
       --umbilicus umbilicus.json --out matches.jsonl
 """
 from __future__ import annotations
@@ -29,7 +30,7 @@ from scipy.spatial import cKDTree
 
 from vesuvius.neural_tracing.tracers.shared.annotations.vc3d import fiber_tag
 from vesuvius.neural_tracing.tracers.shared.geometry import arclength, resample_polyline
-from vesuvius.neural_tracing.tracers.shared.annotations.afv import AFVFibers
+from vesuvius.neural_tracing.tracers.shared.annotations.fiber_store import FiberStore, fiber_volume
 from vesuvius.neural_tracing.tracers.sheets import config as C
 from vesuvius.neural_tracing.tracers.sheets.data.patches import build_index
 
@@ -52,12 +53,13 @@ def patch_nodes(info) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
 
 
 def match_fiber(job) -> list[dict]:
-    """``job``: an AFV catalog index (geometry read in this process, on its own connection), or (fiber id, points)."""
+    """``job``: a fiber-store catalog index (geometry read in this process, on its own handle), or (fiber key,
+    points)."""
     s = _STATE
     if isinstance(job, tuple):
-        fiber_id, points = job
+        fiber_key, points = job
     else:
-        fiber_id, points = s['fibers'].catalog[job][0], s['fibers'].geometry(job).points
+        fiber_key, points = f"fiber:{s['fibers'].catalog[job]['id']}", s['fibers'].geometry(job).points
     samples = resample_polyline(points, s['sample'])  # shared.geometry
     at = np.arange(len(samples))*s['sample'] if len(samples) > 2 or arclength(points)[-1] >= s['sample'] \
         else arclength(points)[[0, -1]]
@@ -80,7 +82,7 @@ def match_fiber(job) -> list[dict]:
             if (b-a-1)*s['sample'] < s['min_run']:
                 continue
             node = idx[np.arange(a, b), best[a:b]]
-            out.append(dict(fiber=fiber_id if isinstance(fiber_id, str) else int(fiber_id), root=s['roots'][p], patch=s['names'][p], start=float(at[a]),
+            out.append(dict(fiber=fiber_key, root=s['roots'][p], patch=s['names'][p], start=float(at[a]),
                             end=float(at[b-1]), offset=float(offset[np.arange(a, b), best[a:b]].mean()),
                             rc=s['rc'][node].tolist(), xyz=np.round(samples[a:b], 2).tolist()))
     return out
@@ -88,10 +90,10 @@ def match_fiber(job) -> list[dict]:
 
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument('--afv', required=True)
-    ap.add_argument('--grid-scale', type=float, default=4., help='AFV voxels per patch level-0 voxel')
+    ap.add_argument('--fibers', required=True, help='fiber store (.vcobj)')
+    ap.add_argument('--grid-scale', type=float, default=4., help='fiber voxels per patch level-0 voxel')
     ap.add_argument('--patches-dir', nargs='+', required=True)
-    ap.add_argument('--fiber-jsons', help='also a directory of VC3D fiber JSONs (line_points in AFV voxels)')
+    ap.add_argument('--fiber-jsons', help='also a directory of VC3D fiber JSONs (line_points in fiber voxels)')
     ap.add_argument('--family', default='H')
     ap.add_argument('--sample', type=float, default=5.)
     ap.add_argument('--candidates', type=int, default=32)
@@ -124,8 +126,8 @@ def main(argv=None):
                   max_tangential=args.max_tangential, min_run=args.min_run,
                   reach=float(cells.max()*args.max_tangential+max(args.max_inward, args.max_outward)),
                   roots=[info.root for info in index], names=[info.name for info in index])
-    fibers = AFVFibers(args.afv, grid_scale=args.grid_scale, split='all')
-    chosen = [i for i, row in enumerate(fibers.catalog) if row[2] == args.family]
+    fibers = FiberStore(args.fibers, fiber_volume(args.fibers), grid_scale=args.grid_scale, split='all')
+    chosen = [i for i, row in enumerate(fibers.catalog) if row['family'] == args.family]
     print(f'{len(chosen)} {args.family} fibers of {len(fibers)}', flush=True)
     _STATE['fibers'] = fibers
     jobs = list(chosen)

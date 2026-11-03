@@ -481,37 +481,6 @@ TEST_CASE("ChunkedPlaneSampler fine-to-coarse skips empty high-res scale")
     CHECK(out(0, 0) == 42);
 }
 
-TEST_CASE("ChunkedPlaneSampler coarse-to-fine lets ready high-res overwrite coarse preview")
-{
-    PyramidChunkedArray array(vc::render::ChunkStatus::Data, 7,
-                              vc::render::ChunkStatus::Data, 42);
-    cv::Mat_<uint8_t> out(1, 1, uint8_t(0));
-    cv::Mat_<uint8_t> coverage(1, 1, uint8_t(0));
-
-    vc::render::ChunkedPlaneSampler::sampleCoordsCoarseToFine(
-        array, 0, singleCoord({1.0f, 1.0f, 1.0f}), out, coverage,
-        {vc::Sampling::Nearest, 1});
-
-    CHECK(coverage(0, 0) == 1);
-    CHECK(out(0, 0) == 7);
-}
-
-TEST_CASE("ChunkedPlaneSampler coarse-to-fine keeps coarse preview when high-res scale is empty")
-{
-    PyramidChunkedArray array(vc::render::ChunkStatus::AllFill, 0,
-                              vc::render::ChunkStatus::Data, 42,
-                              {0, 0, 0}, {2, 2, 2});
-    cv::Mat_<uint8_t> out(1, 1, uint8_t(0));
-    cv::Mat_<uint8_t> coverage(1, 1, uint8_t(0));
-
-    vc::render::ChunkedPlaneSampler::sampleCoordsCoarseToFine(
-        array, 0, singleCoord({1.0f, 1.0f, 1.0f}), out, coverage,
-        {vc::Sampling::Nearest, 1});
-
-    CHECK(coverage(0, 0) == 1);
-    CHECK(out(0, 0) == 42);
-}
-
 TEST_CASE("ChunkedPlaneSampler fallback leaves sentinel surface coords uncovered")
 {
     PyramidChunkedArray array(vc::render::ChunkStatus::Data, 7,

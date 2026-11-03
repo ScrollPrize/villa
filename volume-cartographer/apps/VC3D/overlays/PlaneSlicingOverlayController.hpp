@@ -21,7 +21,6 @@ public:
     void setRotationSetter(std::function<void(const std::string&, float)> setter);
     void setAxisAlignedOverlayOpacity(float opacity);
     void setRotationFinishedCallback(std::function<void()> callback);
-    float axisAlignedOverlayOpacity() const { return _overlayOpacity; }
 
     bool isVolumePointNearRotationHandle(VolumeViewerBase* viewer,
                                          const cv::Vec3f& volumePoint,
@@ -39,8 +38,6 @@ private:
     struct PlaneVisual {
         cv::Vec3f origin;
         cv::Vec3f directionXY; // normalized 2D direction embedded in XY plane
-        cv::Vec3f handlePositiveVolume;
-        cv::Vec3f handleNegativeVolume;
         QPointF handlePositiveScene;
         QPointF handleNegativeScene;
         float baseAngleDegrees{0.0f};

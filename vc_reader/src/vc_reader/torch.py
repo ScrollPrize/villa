@@ -161,8 +161,7 @@ def _submit(pipeline, batch, seeds, device=None, stream=None, params=None):
                 if continuous and value.dtype not in (torch.float32, torch.float64):
                     raise TypeError(f"{key}: continuous targets require uint8, float32 or float64")
                 arrays[key] = value.contiguous()
-            outputs, _, owner = pipeline._engine.run_batch(
-                arrays, seeds, params, False, True, {}, allocator=allocate, stream=stream.cuda_stream)
+            outputs, _, owner = pipeline._engine.run_batch(arrays, seeds, params, allocate, stream.cuda_stream)
             event = stream.record_event()
         result = {k: v for k, v in batch.items() if k not in targets}
         result.update(outputs)

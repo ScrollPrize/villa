@@ -263,10 +263,6 @@ void ViewerControlsPanel::setupIntersectionControls()
             _viewerManager->setIntersectionThickness(static_cast<float>(spinIntersectionThickness->value()));
         }
     }
-
-    if (_viewerManager) {
-        _viewerManager->setSurfacePatchSamplingStride(1, false);
-    }
 }
 
 void ViewerControlsPanel::updateOverlayWindowControlsEnabled()

@@ -1,4 +1,4 @@
-"""Portable launcher for the shared native AFV constraint exporter."""
+"""Portable launcher for the shared native object-store fiber constraint exporter."""
 from pathlib import Path
 import shutil
 import subprocess

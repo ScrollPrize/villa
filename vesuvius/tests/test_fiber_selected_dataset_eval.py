@@ -5,6 +5,10 @@ from vesuvius.neural_tracing.fiber_trace_3d.fiber_selected_dataset_eval import i
 from vesuvius.neural_tracing.fiber_trace_3d.fiber_selected_dataset_eval import aligned_widths
 
 
+def U(n):
+    return f'00000000-0000-4000-8000-{n:012d}'
+
+
 def test_width_alignment_and_unmapped_tails():
     radial=np.array([10.,20.,30.,40.]);donor=np.array([100.,200.,300.])
     result,count=aligned_widths(radial,donor,-1)
@@ -25,7 +29,7 @@ def test_zero_width_learning_rate_is_supported():
 def test_initialization_keeps_weights_not_old_gt_or_state():
     template=dict(lr=.1,steps=1000,initial_solution='old',reference_subset='old',
         fixed_reference_events='gt',tensor_sha256='old',soft_samples='old',code_provenance={})
-    config={k:'new' for k in ('tensor_cache','afv','umbilicus','devices','gpu_manager','layout_mode','filter_constraint_families')}
+    config={k:'new' for k in ('tensor_cache','fibers','umbilicus','devices','gpu_manager','layout_mode','filter_constraint_families')}
     result=initialization_config(template,config,'output')
     assert result['lr']==.1 and result['steps']==1000
     assert not any(k in result for k in ('reference_subset','fixed_reference_events','initial_solution','soft_samples','tensor_sha256','code_provenance'))
@@ -45,18 +49,18 @@ def test_prepared_soft_run_does_not_rebuild_graph(tmp_path,monkeypatch):
 
 
 def test_remap_preserves_full_source_events_and_later_piece_boundary():
-    d=dict(source_id=np.array([10,10,20]),start=np.array([0.,5.,0.]),end=np.array([5.,10.,20.]))
-    events=[dict(test_source=10,test_arc=5.,test_piece=99),dict(test_source=30,test_arc=3.,test_piece=100),
-            dict(test_source=20,test_arc=19.,test_piece=101)]
+    d=dict(source_id=np.array([U(10),U(10),U(20)]),start=np.array([0.,5.,0.]),end=np.array([5.,10.,20.]))
+    events=[dict(test_source=U(10),test_arc=5.,test_piece=99),dict(test_source=U(30),test_arc=3.,test_piece=100),
+            dict(test_source=U(20),test_arc=19.,test_piece=101)]
     result=remap_events(events,d)
     assert [e['test_piece'] for e in result]==[1,2]
     assert events[0]['test_piece']==99
 
 
 def test_selected_source_missing_arc_raises():
-    d=dict(source_id=np.array([10]),start=np.array([0.]),end=np.array([5.]))
+    d=dict(source_id=np.array([U(10)]),start=np.array([0.]),end=np.array([5.]))
     with pytest.raises(ValueError,match='lost GT event arc'):
-        remap_events([dict(test_source=10,test_arc=6.)],d)
+        remap_events([dict(test_source=U(10),test_arc=6.)],d)
 
 
 def test_checkpoint_report_map_scoring_and_unpublished_tail(tmp_path,monkeypatch):
@@ -65,16 +69,16 @@ def test_checkpoint_report_map_scoring_and_unpublished_tail(tmp_path,monkeypatch
     root=tmp_path/'run';solve=root/'solve';(solve/'checkpoints').mkdir(parents=True)
     gt=tmp_path/'gt';(gt/'uv_whole').mkdir(parents=True)
     ds=tmp_path/'dataset';(ds/'cross').mkdir(parents=True)
-    data=dict(source_id=np.array([10]),start=np.array([0.]),end=np.array([10.]),family=np.array([0]))
+    data=dict(source_id=np.array([U(10)]),start=np.array([0.]),end=np.array([10.]),family=np.array([0]))
     np.savez(root/'tensors.npz',**data)
-    np.savez(gt/'tensors.npz',**dict(data,source_id=np.array([20])))
+    np.savez(gt/'tensors.npz',**dict(data,source_id=np.array([U(20)])))
     np.savez(gt/'uv_whole/solution.npz',state=np.zeros((1,4)),widths=np.ones(3)*1000)
     (gt/'uv_whole/config.json').write_text(json.dumps(dict(tensor_cache=str(gt/'tensors.npz'))))
     (solve/'config.json').write_text(json.dumps(dict(tensor_cache=str(root/'tensors.npz'))))
     (solve/'history.json').write_text(json.dumps([dict(iteration=0),dict(iteration=100)]))
     np.savez(solve/'checkpoints/000000.npz',state=np.array([[3.2,.1,0,4]]),widths=np.ones(3)*1000)
-    (ds/'cross/cross_events.json').write_text(json.dumps(dict(events=[dict(test_source=10,
-        test_arc=5,gt_piece=0,gt_source=20,parallel=False)])))
+    (ds/'cross/cross_events.json').write_text(json.dumps(dict(events=[dict(test_source=U(10),
+        test_arc=5,gt_piece=0,gt_source=U(20),parallel=False)])))
     monkeypatch.setattr(mod.uv,'hard_assignment',lambda *a,**kw:(None,None,np.array([True]),np.array([0])))
     def residual(events,d,state,*args,**kwargs):
         assert state[0,0]==3.;return np.array([.1])

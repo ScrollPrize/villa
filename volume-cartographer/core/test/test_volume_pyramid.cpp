@@ -1,10 +1,11 @@
-// Push Volume coverage further: pyramid downsample on write, additional
-// missing-policy values, normalize/derive helpers, write-then-shape variants.
+// Volume reads on a multi-level pyramid: missing-level policies, per-level
+// shapes and raw chunk reads.
 
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
 #include <doctest/doctest.h>
 
 #include "vc/core/types/Volume.hpp"
+#include "support/TestZarrVolume.hpp"
 #include "vc/core/types/Array3D.hpp"
 
 #include "utils/Json.hpp"
@@ -31,14 +32,12 @@ fs::path tmpDir(const std::string& tag)
     return p;
 }
 
-Volume::ZarrCreateOptions optsMultiLevel()
+vc::test::ZarrVolumeSpec optsMultiLevel()
 {
-    Volume::ZarrCreateOptions o;
+    vc::test::ZarrVolumeSpec o;
     o.shapeZYX = {64, 64, 64};
     o.chunkShapeZYX = {32, 32, 32};
-    o.numLevels = 3; // L0, L1, L2 — write to L0 cascades to L1 + L2
-    o.compressor = "none";
-    o.overwriteExisting = true;
+    o.numLevels = 3;
     o.uuid = "pyr-vol";
     o.name = "pyr-vol";
     return o;
@@ -46,68 +45,13 @@ Volume::ZarrCreateOptions optsMultiLevel()
 
 } // namespace
 
-TEST_CASE("Volume::writeZYX (uint8) into a multi-level volume cascades to coarser levels")
-{
-    auto d = tmpDir("u8_pyr");
-    auto v = Volume::New(d, optsMultiLevel());
-    REQUIRE(v);
-    CHECK(v->numScales() == 3);
-
-    Array3D<uint8_t> in({16, 16, 16}, /*fill=*/77);
-    v->writeZYX(in, {0, 0, 0}, /*level=*/0);
-
-    // L0 chunk (0,0,0) should be present with our data.
-    CHECK(v->chunkExists(/*level=*/0, {0, 0, 0}));
-
-    // L1 chunk that covers the same region should also exist (downsampled).
-    CHECK(v->chunkExists(/*level=*/1, {0, 0, 0}));
-
-    // Read back L1 and verify it has the downsampled value (constant input
-    // remains constant under mean downsample).
-    Array3D<uint8_t> outL1({8, 8, 8});
-    CHECK(v->readZYX(outL1, {0, 0, 0}, 1));
-    CHECK(int(outL1(0, 0, 0)) == 77);
-    fs::remove_all(d);
-}
-
-TEST_CASE("Volume::writeZYX (uint16) multi-level")
-{
-    auto d = tmpDir("u16_pyr");
-    auto opts = optsMultiLevel();
-    opts.dtype = vc::render::ChunkDtype::UInt16;
-    auto v = Volume::New(d, opts);
-    REQUIRE(v);
-
-    Array3D<uint16_t> in({16, 16, 16}, /*fill=*/30000);
-    v->writeZYX(in, {0, 0, 0}, 0);
-
-    Array3D<uint16_t> outL1({8, 8, 8});
-    CHECK(v->readZYX(outL1, {0, 0, 0}, /*level=*/1));
-    CHECK(outL1(0, 0, 0) == 30000);
-    fs::remove_all(d);
-}
-
-TEST_CASE("Volume::writeXYZ uint16 cascades the same way")
-{
-    auto d = tmpDir("u16_xyz_pyr");
-    auto opts = optsMultiLevel();
-    opts.dtype = vc::render::ChunkDtype::UInt16;
-    auto v = Volume::New(d, opts);
-    REQUIRE(v);
-    Array3D<uint16_t> in({8, 8, 8}, /*fill=*/12345);
-    v->writeXYZ(in, {0, 0, 0}, 0);
-    Array3D<uint16_t> out({4, 4, 4});
-    CHECK(v->readXYZ(out, {0, 0, 0}, 1));
-    fs::remove_all(d);
-}
-
 TEST_CASE("Volume::readZYX (uint16) with missing-policy AllFill")
 {
     auto d = tmpDir("u16_allfill");
     auto opts = optsMultiLevel();
     opts.dtype = vc::render::ChunkDtype::UInt16;
     opts.fillValue = 7000;
-    auto v = Volume::New(d, opts);
+    auto v = vc::test::createZarrVolume(d, opts);
     REQUIRE(v);
     Array3D<uint16_t> out({8, 8, 8});
     bool ok = v->readZYX(out, {0, 0, 0}, /*level=*/0,
@@ -121,7 +65,7 @@ TEST_CASE("Volume::readZYX (uint16) with missing-policy AllFill")
 TEST_CASE("Volume::readZYX (uint16) Error policy on missing level throws")
 {
     auto d = tmpDir("u16_err");
-    auto v = Volume::New(d, optsMultiLevel());
+    auto v = vc::test::createZarrVolume(d, optsMultiLevel());
     REQUIRE(v);
     Array3D<uint16_t> out({8, 8, 8});
     // Level 99 doesn't exist; policy Error throws (or returns false).
@@ -138,7 +82,7 @@ TEST_CASE("Volume::readZYX (uint16) Error policy on missing level throws")
 TEST_CASE("Volume::readZYX (uint8) Empty policy returns false without filling")
 {
     auto d = tmpDir("u8_empty");
-    auto v = Volume::New(d, optsMultiLevel());
+    auto v = vc::test::createZarrVolume(d, optsMultiLevel());
     REQUIRE(v);
     Array3D<uint8_t> out({4, 4, 4}, /*fill=*/55);
     bool ok = v->readZYX(out, {0, 0, 0}, /*level=*/99,
@@ -147,27 +91,10 @@ TEST_CASE("Volume::readZYX (uint8) Empty policy returns false without filling")
     fs::remove_all(d);
 }
 
-TEST_CASE("Volume: writeMetadata + updateMetadata work in-memory")
-{
-    auto d = tmpDir("meta_persist");
-    auto v = Volume::New(d, optsMultiLevel());
-    REQUIRE(v);
-    utils::Json m = utils::Json::object();
-    m["voxel_size_um"] = 7.91;
-    v->writeMetadata(m);
-    CHECK(v->metadata().contains("voxel_size_um"));
-    utils::Json patch = utils::Json::object();
-    patch["scan"] = "test-scan";
-    v->updateMetadata(patch);
-    CHECK(v->metadata().contains("scan"));
-    CHECK(v->metadata().contains("voxel_size_um"));
-    fs::remove_all(d);
-}
-
 TEST_CASE("Volume::shape(level) for all levels matches numScales")
 {
     auto d = tmpDir("levels_shape");
-    auto v = Volume::New(d, optsMultiLevel());
+    auto v = vc::test::createZarrVolume(d, optsMultiLevel());
     REQUIRE(v);
     for (size_t lvl = 0; lvl < v->numScales(); ++lvl) {
         auto s = v->shape(static_cast<int>(lvl));
@@ -178,14 +105,14 @@ TEST_CASE("Volume::shape(level) for all levels matches numScales")
     fs::remove_all(d);
 }
 
-TEST_CASE("Volume: writeChunk with raw bytes round-trips through readChunkInto")
+TEST_CASE("Volume: a stored raw chunk round-trips through readChunkInto")
 {
     auto d = tmpDir("chunkinto");
-    auto v = Volume::New(d, optsMultiLevel());
+    auto v = vc::test::createZarrVolume(d, optsMultiLevel());
     REQUIRE(v);
     std::vector<std::byte> in(v->chunkByteSize(0));
     std::memset(in.data(), 0xCD, in.size());
-    v->writeChunk(0, {0, 0, 0}, in);
+    vc::test::writeChunk(*v, 0, {0, 0, 0}, in);
 
     std::vector<std::byte> out(v->chunkByteSize(0));
     CHECK(v->readChunkInto(0, {0, 0, 0}, out));

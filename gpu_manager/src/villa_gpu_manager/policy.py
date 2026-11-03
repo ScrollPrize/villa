@@ -56,7 +56,8 @@ def fits(allocations, inventory):
                     for g, size in inventory["gpus"].items()))
 
 
-def targets(tasks, inventory, override=None, reasons=None):
+def targets(tasks, inventory, override=None, reasons=None, allowed_gpus=None):
+    allowed_gpus = set(inventory["gpus"]) if allowed_gpus is None else set(allowed_gpus)
     reasons = {} if reasons is None else reasons
     result = {key: empty() for key in tasks}
     active = [key for key, t in tasks.items() if not t["terminal"] and not any(t["paused"].values())]
@@ -70,6 +71,9 @@ def targets(tasks, inventory, override=None, reasons=None):
         for key, allocation in override["allocations"].items():
             require(key in active or allocation == empty(), "override conflicts with inactive task")
             validate_allocation(allocation, tasks[key]["request"], inventory)
+            require(set(allocation["gpus"]) <= allowed_gpus or
+                    (key in pinned and allocation == tasks[key]["granted"]),
+                    "override uses administratively disabled GPU")
             result[key] = allocation
         for key in active:
             require(key not in pinned or result[key] == tasks[key]["granted"],
@@ -87,8 +91,13 @@ def targets(tasks, inventory, override=None, reasons=None):
     def options(key):
         request = tasks[key]["request"]
         allowed = request["allowed_gpu_uuids"] or list(inventory["gpus"])
-        held = tasks[key]["granted"]["gpus"]
-        return sorted(allowed, key=lambda g: (any(a["gpus"].get(g, 0) for a in result.values()), g not in held, g))
+        allowed = [g for g in allowed if g in allowed_gpus]
+        held = tasks[key]["granted"]["gpus"] or tasks[key].get("preferred_gpus", ())
+        other_held = {g for k in active if k != key for g in tasks[k]["granted"]["gpus"]}
+        # Placement is a preference, not a reservation: assign() still checks
+        # capacity and priority/minimum-share rules remain authoritative.
+        return sorted(allowed, key=lambda g: (g not in held,
+                      any(a["gpus"].get(g, 0) for a in result.values()), g in other_held, g))
 
     def assign(key, gpu, size):
         gpus = dict(result[key]["gpus"], **{gpu: size})
@@ -102,6 +111,8 @@ def targets(tasks, inventory, override=None, reasons=None):
     def minimum(key):
         fixed = tasks[key].get("fixed_allocation")
         if fixed:
+            if not set(fixed["gpus"]) <= allowed_gpus:
+                return False
             if fits([a for k, a in result.items() if k != key] + [fixed], inventory):
                 result[key] = fixed
                 return True

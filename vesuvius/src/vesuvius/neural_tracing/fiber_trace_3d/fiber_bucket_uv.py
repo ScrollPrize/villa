@@ -137,13 +137,14 @@ class BucketUV(torch.nn.Module):
         event_mask=((~d['parallel'].astype(bool)) & (d['family'][d['i']]!=d['family'][d['j']])
                     if self.perpendicular_nodes_only else None)
         self.saved=topology(d,0.,event_mask=event_mask,piece_local=split)
-        for k,v in self.saved.items():self.register_buffer(k,torch.as_tensor(v,device=device))
+        for k,v in self.saved.items():
+            if k!='v_offset_source':self.register_buffer(k,torch.as_tensor(v,device=device))
         padding=int(config.get('bucket_uv_padding',64))
         if padding<1:raise ValueError('Bucket UV padding must be positive')
         self.low=-padding;self.count=int(config['winding_count'])+2*padding
         self.values=(None if self.predicted_only else torch.nn.Parameter(torch.zeros(len(self.v_offset_arc),self.count,2,device=device)))
-        source=np.arange(len(d['family'])) if split else d['source_id'];index={int(s):i for i,s in enumerate(source)}
-        self.register_buffer('owner',torch.tensor([index[int(s)] for s in self.saved['v_offset_source']],device=device,dtype=torch.long))
+        source=np.arange(len(d['family'])) if split else d['source_id'];index={s:i for i,s in enumerate(np.asarray(source).tolist())}
+        self.register_buffer('owner',torch.tensor([index[s] for s in self.saved['v_offset_source'].tolist()],device=device,dtype=torch.long))
         owners=self.owner.cpu().numpy()
         self.register_buffer('node_ds',torch.as_tensor(
             (self.saved['v_offset_arc']-d['start'][owners])*np.sign(d['node_ds'][owners,-1]),
@@ -756,7 +757,7 @@ def u_validity(ext,state,widths,source_ids,threshold=.2):
         broken=[]
         for f in torch.unique(owner[(selected>threshold)&(prob[owner]>.5)]).tolist():
             ids=nodes[owner==f];worst=ids[selected[ids].argmax()]
-            broken.append(dict(source_id=int(source_ids[f]),piece_index=f,probability=float(prob[f]),
+            broken.append(dict(source_id=str(source_ids[f]),piece_index=f,probability=float(prob[f]),
                 max_windings=float(selected[worst]),arc=float(ext.v_offset_arc[worst]),
                 offending_nodes=int((selected[ids]>threshold).sum())))
         out[name]=dict(cohorts=cohorts,fibers=sorted(broken,key=lambda x:-x['max_windings']))

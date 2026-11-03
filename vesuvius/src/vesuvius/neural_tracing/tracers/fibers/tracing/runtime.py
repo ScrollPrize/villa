@@ -70,7 +70,7 @@ def default_cache_dir():
 def resolve_frame_checkpoint(cfg, checkpoint, given=None):
     """Bind the follower's learned frame model on this machine (see the module notes); a no-op for CT frames."""
     from vesuvius.neural_tracing.tracers.fibers.frames.learned import bind_frame_checkpoint
-    from vesuvius.neural_tracing.tracers.shared.annotations.afv import file_sha256
+    from vesuvius.neural_tracing.tracers.shared.annotations.open_data import file_sha256
     from vesuvius.neural_tracing.tracers.shared.paths import recorded_path
     if given:
         bind_frame_checkpoint(cfg, given)

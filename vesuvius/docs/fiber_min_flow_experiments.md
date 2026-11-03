@@ -1,6 +1,6 @@
 # Minimum-cost-flow winding experiments
 
-Run whole-fiber or independently split-fiber solves from existing AFV geometry,
+Run whole-fiber or independently split-fiber solves from existing fiber store geometry,
 umbilicus and tensor caches. This runner uses the production `Paths`, `graph`,
 `Pieces` and certified circulation solver. It does not regenerate measurements.
 It runs on CPU with the project's existing NumPy/SciPy dependencies.
@@ -31,7 +31,7 @@ with a letter or digit.
 | `evaluation` | Optional GT scoring object |
 | `baseline` | Optional path to a saved `solution.npz` |
 
-A dataset object requires `afv`, `umbilicus` and `tensor_cache`. It may provide
+A dataset object requires `fibers` (the fiber store), `umbilicus` and `tensor_cache`. It may provide
 `tensor_sha256` (enforced), `lasagna_winding_scale` (default 1),
 `perpendicular_offset` (default 0.5) and `perpendicular_relative_weight`
 (default 1). Existing solver config files may be supplied as dataset objects;
@@ -44,7 +44,7 @@ experiment file. There are no implicit project-directory conventions.
 
 The `split` object accepts `minimum_length_vx` (default 1000),
 `minimum_perpendicular` (default 4), and `protected_sources` (default empty).
-Protected source IDs remain intact; their winding labels are still optimized.
+Protected source IDs (fiber UUID strings) remain intact; their winding labels are still optimized.
 Minimum length zero gives identity splitting. All pieces remain enabled, with
 zero continuation penalty. Split thresholds operate on cached perpendicular
 observations; they do not guarantee that every faulty fiber can be split.
@@ -52,7 +52,7 @@ observations; they do not guarantee that every faulty fiber can be split.
 ## Evaluation
 
 `evaluation` requires `mode` and a `reference` JSON path. The reference contains
-`fiber_offsets`, mapping source IDs to integer offsets relative to cached
+`fiber_offsets`, mapping source IDs (fiber UUID strings) to integer offsets relative to cached
 unwrapped phase. Its optional `excluded_source_ids` list documents exclusions;
 excluded IDs must be omitted from `fiber_offsets`. Only IDs present in
 `fiber_offsets` are scored. No reference labels are fixed during optimization.

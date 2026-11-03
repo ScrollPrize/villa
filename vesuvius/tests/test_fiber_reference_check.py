@@ -3,11 +3,15 @@ import numpy as np
 from vesuvius.neural_tracing.fiber_trace_3d.fiber_reference_check import align,evaluate
 
 
+def fid(k):
+    return f'00000000-0000-4000-8000-{k:012d}'
+
+
 def fixture():
     points=np.array([[x,y] for x in range(4) for y in (0.,100.,200.)])
     ident=np.column_stack((np.repeat(np.arange(4),3),np.tile([0,1,2],4)))
     ref=dict(consensus=points,scale=np.array([3.,200.]),identity=ident,
-             source_id=np.arange(4),family=np.array([0,1,0,1]),direction=np.ones(4),
+             source_id=np.array([fid(k) for k in range(4)]),family=np.array([0,1,0,1]),direction=np.ones(4),
              a=np.array([0]),b=np.array([0]),events=np.array([0]))
     metrics={f:{k:dict(mean=0.,p95=0.,max=0.) for k in ('length_percent','angle_degrees')} for f in ('H','V')}
     meta=dict(v_tolerance_vx=1.,affine_tolerance=.1,winding_tolerance=.1,meeting_tolerance_vx=1.,
@@ -52,7 +56,7 @@ def test_tolerances_come_from_reference_metadata():
 
 
 def test_explicit_exclusion_does_not_influence_alignment_or_confidence():
-    c,r,m=fixture();m['excluded_source_ids']=[3]
+    c,r,m=fixture();m['excluded_source_ids']=[fid(3)]
     c['layers']['bucket'][9:]+=np.array([100.,100000.]);c['prob'][3]=0
     result=evaluate(c,r,m)
     assert result['passed']

@@ -1,5 +1,9 @@
 #pragma once
 
+#include <vc_object_store/objects/GeometryCoordinates.hpp>
+#include <vc_object_store/store/GeometryViews.hpp>
+#include <vc_object_store/objects/ObjectStoreSession.hpp>
+
 #include <QColor>
 #include <QFuture>
 #include <QObject>
@@ -27,6 +31,7 @@
 #include "../volume_viewers/VolumeViewerBase.hpp"
 #include "tools/SegmentationEditManager.hpp"
 #include "tools/ManualAddTool.hpp"
+#include "tools/SheetNormalField.hpp"
 #include "growth/SegmentationGrowth.hpp"
 #include "SegmentationPushPullConfig.hpp"
 #include "SegmentationUndoHistory.hpp"
@@ -45,6 +50,7 @@ class CState;
 class PlaneSurface;
 class Surface;
 class QuadSurface;
+class SurfaceStoreEdit;
 class SegmentationEditManager;
 class SegmentationOverlayController;
 class SegmentationWidget;
@@ -52,9 +58,7 @@ class VCCollection;
 class ViewerManager;
 class QKeyEvent;
 class QTimer;
-class SegmentationLineTool;
 class SegmentationPushPullTool;
-class ApprovalMaskBrushTool;
 class SurfaceMaskBrushTool;
 
 class SegmentationModule : public QObject
@@ -73,17 +77,15 @@ public:
     ~SegmentationModule();
 
     [[nodiscard]] bool editingEnabled() const { return _editingEnabled; }
-    [[nodiscard]] SurfacePatchIndex* activeEditSurfacePatchIndex() const;
-    [[nodiscard]] bool annotateMode() const { return _annotateMode; }
-    bool ensureActiveSurfaceEditableForModification();
     void setEditingEnabled(bool enabled);
     void setAnnotateMode(bool enabled);
     void setIgnoreSegSurfaceChange(bool ignore);
+    // The edited surface changed outside the edit manager (growth, mask): its
+    // draft follows `vertices` of it, or its whole grid.
+    void publishEditDraft(const std::optional<cv::Rect>& vertices = std::nullopt);
     [[nodiscard]] bool ignoreSegSurfaceChange() const { return _ignoreSegSurfaceChange; }
     void setDragRadius(float radiusSteps);
     void setDragSigma(float sigmaSteps);
-    void setLineRadius(float radiusSteps);
-    void setLineSigma(float sigmaSteps);
     void setPushPullRadius(float radiusSteps);
     void setPushPullSigma(float sigmaSteps);
     void setPushPullStepMultiplier(float multiplier);
@@ -93,39 +95,13 @@ public:
     void setAlphaPushPullConfig(const AlphaPushPullConfig& config);
     void setHoverPreviewEnabled(bool enabled);
 
-    void setShowApprovalMask(bool enabled);
-    void setEditApprovedMask(bool enabled);
-    void setEditUnapprovedMask(bool enabled);
     void setDrawMaskEnabled(bool enabled);
+    // Radius of the "Draw mask" brush, in voxels.
+    void setMaskBrushRadius(float radius);
     void onActiveSegmentChanged(QuadSurface* newSurface);
-    [[nodiscard]] bool showApprovalMask() const { return _showApprovalMask; }
-    [[nodiscard]] bool editApprovedMask() const { return _editApprovedMask; }
-    [[nodiscard]] bool editUnapprovedMask() const { return _editUnapprovedMask; }
     [[nodiscard]] bool drawMaskEnabled() const { return _drawMaskEnabled; }
-    [[nodiscard]] bool autoApprovalEnabled() const { return _autoApprovalEnabled; }
-    [[nodiscard]] float autoApprovalRadius() const { return _autoApprovalRadius; }
-    [[nodiscard]] float autoApprovalThreshold() const { return _autoApprovalThreshold; }
-    [[nodiscard]] float autoApprovalMaxDistance() const { return _autoApprovalMaxDistance; }
-
-    [[nodiscard]] bool isEditingApprovalMask() const { return _editApprovedMask || _editUnapprovedMask; }
-    void setAutoApprovalEnabled(bool enabled);
-    void setAutoApprovalRadius(float radius);
-    void setAutoApprovalThreshold(float threshold);
-    void setAutoApprovalMaxDistance(float distance);
-    std::vector<std::pair<int, int>> filterVerticesForAutoApproval(
-        const std::vector<SegmentationEditManager::VertexEdit>& edits,
-        const std::optional<std::pair<int, int>>& dragCenter) const;
-
-    void performAutoApproval(const std::vector<std::pair<int, int>>& vertices);
-    void setApprovalMaskBrushRadius(float radiusSteps);
-    void setApprovalBrushDepth(float depth);
-    void setApprovalBrushColor(const QColor& color);
-    [[nodiscard]] SegmentationOverlayController* overlay() const { return _overlay; }
+    [[nodiscard]] float maskBrushRadius() const { return _maskBrushRadius; }
     [[nodiscard]] ViewerManager* viewerManager() const { return _viewerManager; }
-    [[nodiscard]] float approvalMaskBrushRadius() const { return _approvalMaskBrushRadius; }
-    [[nodiscard]] float approvalBrushDepth() const { return _approvalBrushDepth; }
-    [[nodiscard]] QColor approvalBrushColor() const { return _approvalBrushColor; }
-    void undoApprovalStroke();
 
     void applyEdits();
     void resetEdits();
@@ -135,6 +111,20 @@ public:
     bool prepareEditingDestination(const std::shared_ptr<QuadSurface>& surface);
     void setEditingDestinationResolver(std::function<bool(const std::shared_ptr<QuadSurface>&)> resolver)
     { _editingDestinationResolver = std::move(resolver); }
+    // The store pin a surface was opened at (nothing for surfaces not opened
+    // from the object store); edits of the active surface commit to it.
+    // The store object an opened surface's edits commit to, and the view it was read through.
+    struct StoreOrigin {
+        vc::objects::PinnedObject pin;
+        vc::objects::ViewFrame view;
+    };
+    using StorePinResolver = std::function<std::optional<StoreOrigin>(const QuadSurface*)>;
+    void setStorePinResolver(StorePinResolver resolver) { _storePinResolver = std::move(resolver); }
+    // Synchronously publish `surface` to its store object: its changed vertices
+    // (with `vertices`) and its loaded `channels` (every channel when empty).
+    bool saveSurface(QuadSurface* surface, bool vertices = true, const std::vector<std::string>& channels = {});
+    // The store revisions the surface's edits continue from.
+    std::optional<vc::objects::PinnedObject> storePin(QuadSurface* surface);
     void endEditingSession();
     [[nodiscard]] bool hasActiveSession() const;
     [[nodiscard]] QuadSurface* activeBaseSurface() const;
@@ -142,13 +132,13 @@ public:
     void refreshSessionFromSurface(QuadSurface* surface);
     bool applySurfaceUpdateFromGrowth(const cv::Rect& vertexRect);
     void requestAutosaveFromGrowth();
-    void updateApprovalToolAfterGrowth(QuadSurface* surface);
     void applyCorrectionAnchorOffset(float offsetX, float offsetY);
-    void saveCorrectionPoints(const std::filesystem::path& segmentPath);
+    // The active surface's correction point collections in the store.
+    void loadCorrections(QuadSurface* surface);
+    void saveCorrections();
 
     void attachViewer(VolumeViewerBase* viewer);
     void detachViewer(VolumeViewerBase* viewer);
-    void updateViewerCursors();
 
     bool handleKeyPress(QKeyEvent* event);
     bool handleKeyRelease(QKeyEvent* event);
@@ -162,7 +152,6 @@ public:
     [[nodiscard]] SegmentationCorrectionsPayload buildCorrectionsPayload(bool onlyActiveCollection = false) const;
     void clearPendingCorrections();
     [[nodiscard]] std::optional<std::pair<int, int>> correctionsZRange() const;
-    [[nodiscard]] bool hoverPreviewEnabled() const { return _hoverPreviewEnabled; }
     bool ensureHoverTarget();
 
     struct HoverInfo
@@ -195,6 +184,33 @@ public:
     bool setManualAddModeActive(bool active, bool apply = true);
     // Returns false when there is no manual-add constraint to remove.
     bool undoManualAddConstraint();
+    // Start a manual-add edge extension: `cells` new vertices past the last
+    // valid vertex of every line on `side` (optionally only lines span.first
+    // to span.last), growing the grid when it has no room. Enters manual-add
+    // mode first if needed. Apply or cancel it like any manual-add preview.
+    bool extendManualAdd(ManualAddTool::ExtendSide side,
+                         int cells,
+                         std::optional<ManualAddTool::EdgeSpan> span = std::nullopt,
+                         QString* errorMessage = nullptr);
+    // The same, except that when an extension of `side` is already pending it
+    // is applied first and the next one starts from the new edge, as soon as
+    // the save that Apply starts has finished (the direction keys and panel
+    // buttons use this, so pressing the same direction again walks on).
+    bool extendOrContinueManualAdd(ManualAddTool::ExtendSide side, int cells, QString* errorMessage = nullptr);
+    // Re-walk the pending extension along the CT sheet (see
+    // ManualAddTool::sheetWalk) in the background; the preview updates when
+    // it finishes. Extensions start one on their own when the panel's
+    // "Follow the sheet" is on. Returns false when there is nothing to walk
+    // or no volume.
+    std::shared_ptr<Volume> manualGrowthVolume() const;
+    bool followSheetForManualAdd();
+    [[nodiscard]] bool manualAddSheetWalkRunning() const { return _sheetWalkRunning; }
+    // True while a repeated extension waits for the save of the one before it.
+    [[nodiscard]] bool manualAddContinuationQueued() const { return _manualAddContinuation.has_value(); }
+    // Pin the pending manual-add geometry to a world point, as a Shift+click in
+    // a plane view does, choosing the pending vertex nearest to it within
+    // `radius` (the configured constraint radius when radius <= 0).
+    bool addManualAddConstraintAtWorld(const cv::Vec3f& world, float radius, QString* errorMessage = nullptr);
     // Toggle correction-point authoring mode without a keypress.
     // Activating enforces the same preconditions as the key handler; on failure sets
     // errorMessage to "editing_disabled" | "no_session" | "growth_in_progress". Unlike the
@@ -225,12 +241,9 @@ public slots:
 
 signals:
     void editingEnabledChanged(bool enabled);
-    void segmentationFolderChanged(const QString& surfaceId);
     void annotateModeChanged(bool enabled);
     void statusMessageRequested(const QString& text, int timeoutMs);
-    void pendingChangesChanged(bool pending);
     void stopToolsRequested();
-    void focusPoiRequested(const cv::Vec3f& position, QuadSurface* surface);
     void growSurfaceRequested(SegmentationGrowthMethod method,
                               SegmentationGrowthDirection direction,
                               int steps,
@@ -238,25 +251,19 @@ signals:
     void growthInProgressChanged(bool running);
     // Emitted when an in-flight autosave reaches non-stale completion.
     void autosaveCompleted(bool success);
-    void surfaceSavedTo(const QString& path);
-    void approvalMaskSaved(const std::string& segmentId);
     void annotationPointSelected(vc::PointRef point);
     void annotationSelectionCleared();
     void annotationCollectionSelected(uint64_t collectionId);
     void annotationPointFocused(vc::PointRef point);
 
 private:
-    friend class SegmentationLineTool;
     friend class SegmentationPushPullTool;
-    friend class ApprovalMaskBrushTool;
     friend class SurfaceMaskBrushTool;
-    friend class SegmentationBrushTool;
     friend class segmentation::CorrectionsState;
 
     enum class FalloffTool
     {
         Drag,
-        Line,
         PushPull
     };
 
@@ -332,6 +339,9 @@ private:
 
     void emitPendingChanges();
     void refreshOverlay();
+    // Redraws an in-progress edit: the viewer it is made in, plus every viewer
+    // showing the segmentation, which only the edited region invalidates.
+    void refreshEditedRegion(VolumeViewerBase* editViewer);
     void updateCorrectionsWidget();
     void setActiveCorrectionCollection(uint64_t collectionId, bool userInitiated);
     void clearActiveCorrectionCollection();
@@ -349,7 +359,6 @@ private:
     void updatePointMoveDrag(const cv::Vec3f& worldPos);
     void finishPointMoveDrag();
 
-    void pruneMissingCorrections();
     void onCorrectionsCreateRequested();
     void onCorrectionsCollectionSelected(uint64_t id);
     void onCorrectionsZRangeChanged(bool enabled, int zMin, int zMax);
@@ -369,10 +378,14 @@ private:
                                    Qt::MouseButton button,
                                    Qt::KeyboardModifiers modifiers,
                                    const QPointF& scenePos);
+    bool handleManualAddMouseRelease(VolumeViewerBase* viewer, Qt::MouseButton button);
     bool handleManualAddMouseMove(VolumeViewerBase* viewer,
                                   Qt::MouseButtons buttons,
                                   const QPointF& scenePos);
-    void clearLineDragStroke();
+    // Grows (sign > 0) or shrinks (sign < 0) the session's grid by `padding`,
+    // keeping channels, correction anchors and the editing session in step.
+    bool resizeSessionGrid(const ManualAddTool::GridPadding& padding, int sign);
+    void undoManualAddGridPadding();
 
     void handleMousePress(VolumeViewerBase* viewer,
                           const cv::Vec3f& worldPos,
@@ -419,21 +432,17 @@ private:
 
     void updateHover(VolumeViewerBase* viewer, const cv::Vec3f& worldPos, const QPointF& scenePos);
     [[nodiscard]] bool isNearRotationHandle(VolumeViewerBase* viewer, const cv::Vec3f& worldPos) const;
-    SegmentationEditManager::GridSearchResolution hoverLookupDetail(const cv::Vec3f& worldPos);
-    void resetHoverLookupDetail();
     bool recoverHoverPointerFromCursor();
     void recordPointerSample(VolumeViewerBase* viewer, const cv::Vec3f& worldPos);
 
     bool startPushPull(int direction, std::optional<bool> alphaOverride = std::nullopt);
     void stopPushPull(int direction);
     void stopAllPushPull();
-    bool applyPushPullStep();
 
     void markAutosaveNeeded(bool immediate = false);
     void performAutosave();
     void ensureAutosaveTimer();
     void updateAutosaveState();
-    void saveApprovalMaskToDisk();
     void queueAutosaveVertexUpdates(const std::vector<SegmentationEditManager::VertexEdit>& edits);
 
     SegmentationWidget* _widget{nullptr};
@@ -448,8 +457,6 @@ private:
     bool _editingEnabled{false};
     float _dragRadiusSteps{5.0f};
     float _dragSigmaSteps{2.0f};
-    float _lineRadiusSteps{5.0f};
-    float _lineSigmaSteps{2.0f};
     float _pushPullRadiusSteps{2.0f};
     float _pushPullSigmaSteps{2.0f};
     FalloffTool _activeFalloff{FalloffTool::Drag};
@@ -465,9 +472,6 @@ private:
 
     DragState _drag;
     HoverState _hover;
-    bool _forceFullSurfaceAutosave{false};
-    int _pendingGridOffsetColDelta{0};
-    int _pendingGridOffsetRowDelta{0};
     CorrectionDragState _correctionDrag;
     PointMoveDragState _pointMoveDrag;
     std::optional<uint64_t> _selectedAnnotationCollectionId;
@@ -475,32 +479,43 @@ private:
 
     std::function<bool(VolumeViewerBase*, const cv::Vec3f&)> _rotationHandleHitTester;
 
-    bool _lineDrawKeyActive{false};
     std::optional<std::vector<SegmentationGrowthDirection>> _pendingShortcutDirections;
 
-    std::unique_ptr<SegmentationLineTool> _lineTool;
     std::unique_ptr<SegmentationPushPullTool> _pushPullTool;
-    std::unique_ptr<ApprovalMaskBrushTool> _approvalTool;
     std::unique_ptr<SurfaceMaskBrushTool> _surfaceMaskTool;
     std::unique_ptr<ManualAddTool> _manualAddTool;
     bool _manualAddMode{false};
     QElapsedTimer _manualAddHoverThrottle;
     cv::Mat _pendingManualAddTracerMask;
-    SegmentationGrowthMethod _previousGrowthMethodBeforeManualAdd{SegmentationGrowthMethod::Tracer};
+    // Grid rows and columns added for a pending edge extension; removed again
+    // if the extension is canceled.
+    ManualAddTool::GridPadding _manualAddGridPadding;
+    struct ManualAddContinuation
+    {
+        ManualAddTool::ExtendSide side{ManualAddTool::ExtendSide::Right};
+        int cells{0};
+        std::optional<ManualAddTool::EdgeSpan> span;
+    };
+    std::optional<ManualAddContinuation> _manualAddContinuation;
+    std::shared_ptr<SheetNormalField> _sheetNormals;
+    std::shared_ptr<Volume> _sheetNormalsVolume;
+    bool _sheetWalkRunning{false};
+    void setSheetWalkRunning(bool running);
+    void failSheetWalk(const QString& message);
+    // Shift+drag in the segmentation view that picks an edge stretch.
+    struct ManualAddSpanDrag
+    {
+        bool active{false};
+        VolumeViewerBase* viewer{nullptr};
+        cv::Point from;
+        cv::Point to;
+    };
+    ManualAddSpanDrag _manualAddSpanDrag;
+    void runManualAddContinuation();
 
-    bool _showApprovalMask{false};
-    bool _editApprovedMask{false};
-    bool _editUnapprovedMask{false};
     bool _drawMaskEnabled{false};
     bool _shiftDrawMaskActive{false};
-    bool _autoApprovalEnabled{true};
-    float _autoApprovalRadius{0.5f};
-    float _autoApprovalThreshold{0.0f};
-    float _autoApprovalMaxDistance{0.0f};
-
-    float _approvalMaskBrushRadius{50.0f};  // Mask pixels in flattened view; native voxels in plane views
-    float _approvalBrushDepth{15.0f};       // Cylinder depth
-    QColor _approvalBrushColor{0, 255, 0};  // RGB color for approval painting
+    float _maskBrushRadius{50.0f};
 
     segmentation::UndoHistory _undoHistory;
     bool _suppressUndoCapture{false};
@@ -519,26 +534,27 @@ private:
 
     QFuture<std::shared_ptr<QuadSurface>> _saveFuture;
     std::shared_ptr<QuadSurface> _saveSnapshot;
+    // Set when the grid size or a channel changed, which the vertex-only
+    // autosave path cannot carry; the next save writes the whole surface.
+    bool _autosaveFullSurfaceNeeded{false};
     std::function<bool(const std::shared_ptr<QuadSurface>&)> _editingDestinationResolver;
+    StorePinResolver _storePinResolver;
+    // The store edit of the active surface, kept across editing sessions so
+    // saves continue from their own revisions.
+    std::shared_ptr<SurfaceStoreEdit> _storeEdit;
+    // The edited object's hold (ObjectStoreSession::holdForEditing) while a session lasts.
+    vc::objects::LeaseHold _editLease;
+    std::shared_ptr<SurfaceStoreEdit> storeEditFor(QuadSurface* surface);
     std::vector<AutosaveVertexUpdate> _pendingAutosaveVertexUpdates;
     std::unordered_map<std::uint64_t, std::size_t> _pendingAutosaveVertexUpdateIndex;
 
     // Correction points auto-save
     static constexpr int kCorrectionsSaveDelayMs = 2000;
     QTimer* _correctionsSaveTimer{nullptr};
-    std::filesystem::path _correctionsSegmentPath;
+    std::string _correctionsSurfaceId;
     void scheduleCorrectionsAutoSave();
     void performCorrectionsAutoSave();
 
-    struct HoverLookupMetrics
-    {
-        bool initialized{false};
-        cv::Vec3f lastWorld{0.0f, 0.0f, 0.0f};
-        float smoothedWorldUnitsPerSecond{0.0f};
-        QElapsedTimer timer;
-    };
-
-    HoverLookupMetrics _hoverLookup;
     struct HoverPointerSample
     {
         bool valid{false};

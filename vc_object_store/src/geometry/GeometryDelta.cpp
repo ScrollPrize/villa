@@ -3,7 +3,12 @@
 
 namespace vc::objects::detail {
 namespace {
-constexpr size_t maxDeltaBytes = 256 * 1024 * 1024;
+constexpr size_t maxDeltaBytes = maxGeometryDeltaBytes;
+size_t numberSize(uint64_t n) {
+    size_t size = 1;
+    while (n > 127) { n >>= 7; ++size; }
+    return size;
+}
 void number(std::vector<uint8_t>& out, uint64_t n) {
     do { out.push_back(uint8_t(n & 127) | (n > 127 ? 128 : 0)); n >>= 7; } while (n);
 }
@@ -30,6 +35,18 @@ nlohmann::json loadGeometryManifest(sqlite3* db, const std::string& revision,
         throw std::runtime_error("geometry delta: corrupt or unsupported revision manifest");
     return manifest;
 }
+size_t geometryDeltaRawSize(const std::vector<GeometryChunkChange>& chunks) {
+    size_t size = 0;
+    for (const auto& c : chunks) {
+        size += numberSize(c.changes.size());
+        int64_t end = 0;
+        for (const auto& change : c.changes) {
+            size += numberSize(change.offset - end) + numberSize(change.length) + 2 * change.length;
+            end = change.offset + change.length;
+        }
+    }
+    return size;
+}
 EncodedGeometryDelta encodeGeometryDelta(const std::vector<GeometryChunkChange>& chunks) {
     std::vector<uint8_t> raw;
     auto descriptions = nlohmann::json::array();
@@ -38,13 +55,16 @@ EncodedGeometryDelta encodeGeometryDelta(const std::vector<GeometryChunkChange>&
                                 {"before", c.beforeHash}, {"after", c.afterHash}});
         number(raw, c.changes.size());
         int64_t end = 0;
+        size_t run = 0;
         for (const auto& change : c.changes) {
-            number(raw, change.offset - end); number(raw, change.before.size());
-            if (change.before.size() > (maxDeltaBytes - std::min(maxDeltaBytes, raw.size())) / 2)
+            const auto length = size_t(change.length);
+            number(raw, change.offset - end); number(raw, length);
+            if (length > (maxDeltaBytes - std::min(maxDeltaBytes, raw.size())) / 2)
                 throw std::invalid_argument("geometry delta: edit exceeds 256 MiB encoded limit; split the edit");
-            raw.insert(raw.end(), change.before.begin(), change.before.end());
-            for (size_t i = 0; i < change.before.size(); ++i) raw.push_back(change.before[i] ^ change.after[i]);
-            end = change.offset + change.before.size();
+            raw.insert(raw.end(), c.before.begin() + run, c.before.begin() + run + length);
+            for (size_t i = run; i < run + length; ++i) raw.push_back(c.before[i] ^ c.after[i]);
+            end = change.offset + change.length;
+            run += length;
         }
     }
     if (raw.size() > maxDeltaBytes) throw std::invalid_argument("geometry delta: edit exceeds encoded limit");
@@ -69,8 +89,8 @@ std::vector<GeometryChunkChange> decodeGeometryDelta(sqlite3* db, const std::str
     if (readRequest) {
         Statement size(db, "SELECT length(data) FROM geometry_deltas WHERE revision_uuid=?", parseUuid(revision));
         if (!size.row()) throw std::runtime_error("geometry delta: missing payload");
-        requestBytes(size.i64(0), &FiberRegionStats::payloadBytes);
-        requestBytes(rawSize, &FiberRegionStats::reconstructedBytes);
+        requestBytes(size.i64(0), &RegionStats::payloadBytes);
+        requestBytes(rawSize, &RegionStats::reconstructedBytes);
     }
     Statement payload(db, "SELECT data FROM geometry_deltas WHERE revision_uuid=?", parseUuid(revision));
     if (!payload.row()) throw std::runtime_error("geometry delta: missing payload");
@@ -93,7 +113,7 @@ std::vector<GeometryChunkChange> decodeGeometryDelta(sqlite3* db, const std::str
     std::vector<GeometryChunkChange> result;
     std::set<GeometryChunkKey> seen;
     for (const auto& entry : d.at("chunks")) {
-        GeometryChunkChange c{{entry.at("array"), entry.at("index")}, entry.at("before"), entry.at("after"), {}};
+        GeometryChunkChange c{{entry.at("array"), entry.at("index")}, entry.at("before"), entry.at("after"), {}, {}, {}};
         if (!seen.insert(c.key).second) throw std::runtime_error("geometry delta: duplicate chunk");
         // Descriptors omit chunk hashes, but retain shape and physical layout.
         const auto layout = geometryLayout(manifest.at("arrays").at(c.key.first), false);
@@ -105,12 +125,10 @@ std::vector<GeometryChunkChange> decodeGeometryDelta(sqlite3* db, const std::str
             const auto gap = number(bytes, pos), size = number(bytes, pos);
             if (gap > length - end || !size || size > length - end - gap || size > (bytes.size() - pos) / 2)
                 throw std::runtime_error("geometry delta: invalid range");
-            GeometryByteChange change{int64_t(end + gap), {}, {}};
-            change.before.assign(bytes.begin() + pos, bytes.begin() + pos + size); pos += size;
-            change.after.resize(size);
-            for (size_t j = 0; j < size; ++j) change.after[j] = change.before[j] ^ bytes[pos++];
+            c.changes.push_back({int64_t(end + gap), int64_t(size)});
+            c.before.insert(c.before.end(), bytes.begin() + pos, bytes.begin() + pos + size); pos += size;
+            for (size_t j = 0; j < size; ++j) c.after.push_back(c.before[c.before.size() - size + j] ^ bytes[pos++]);
             end += gap + size;
-            c.changes.push_back(std::move(change));
         }
         result.push_back(std::move(c));
     }
@@ -118,16 +136,20 @@ std::vector<GeometryChunkChange> decodeGeometryDelta(sqlite3* db, const std::str
     return result;
 }
 void applyGeometryDelta(std::vector<uint8_t>& bytes, const GeometryChunkChange& c, bool reverse) {
-    requestBytes(bytes.size(), &FiberRegionStats::reconstructedBytes);
+    requestBytes(bytes.size(), &RegionStats::reconstructedBytes);
     if (geometryPayloadHash(c.key.first, bytes) != (reverse ? c.afterHash : c.beforeHash))
         throw std::runtime_error("geometry delta: parent chunk mismatch");
+    const auto& before = reverse ? c.after : c.before;
+    const auto& after = reverse ? c.before : c.after;
+    size_t run = 0;
     for (const auto& edit : c.changes) {
-        const auto& before = reverse ? edit.after : edit.before;
-        const auto& after = reverse ? edit.before : edit.after;
-        if (edit.offset < 0 || uint64_t(edit.offset) > bytes.size() || before.size() > bytes.size() - edit.offset ||
-            !std::equal(before.begin(), before.end(), bytes.begin() + edit.offset))
+        const auto length = size_t(edit.length);
+        if (edit.offset < 0 || uint64_t(edit.offset) > bytes.size() || length > bytes.size() - edit.offset ||
+            run + length > before.size() ||
+            !std::equal(before.begin() + run, before.begin() + run + length, bytes.begin() + edit.offset))
             throw std::runtime_error("geometry delta: original bytes mismatch");
-        std::copy(after.begin(), after.end(), bytes.begin() + edit.offset);
+        std::copy(after.begin() + run, after.begin() + run + length, bytes.begin() + edit.offset);
+        run += length;
     }
     if (geometryPayloadHash(c.key.first, bytes) != (reverse ? c.beforeHash : c.afterHash))
         throw std::runtime_error("geometry delta: result chunk mismatch");

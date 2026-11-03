@@ -14,7 +14,7 @@ int main()
         multiply.factor = 2.;
         Flip flip{"x", 1., 1.};
         Pipeline pipeline({multiply, flip}, {{"image", image}});
-        auto result = pipeline.run(input, 42, true, false);
+        auto result = pipeline.run(input, 42, true);
         auto replay = pipeline.replay(input, load_plan(pipeline.program(), save_plan(result.plan)));
         const auto* actual = static_cast<const float*>(result.sample.at("image").array.data());
         for (int i = 0; i < 12; ++i)

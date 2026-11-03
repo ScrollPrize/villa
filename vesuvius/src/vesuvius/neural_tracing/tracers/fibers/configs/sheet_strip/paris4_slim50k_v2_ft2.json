@@ -5,7 +5,7 @@
  "model": {},
  "data": {
   "index": "../../output/sheet_strip_data/index_slim50k",
-  "afv": "/home/sean/Documents/villa4/vesuvius/src/vesuvius/neural_tracing/tracers/fibers/output/paris4_fibers_ctz7000_17000_slim50k_20261012/fibers.afv",
+  "fibers": "/home/sean/Documents/villa4/vesuvius/src/vesuvius/neural_tracing/tracers/fibers/output/paris4_fibers_ctz7000_17000_slim50k_20261012/fibers.vcobj",
   "full_tube_share": 0.5,
   "umbilicus": "/mnt/raid_nvme/spiral_dataset_working/umbilicus.json"
  },

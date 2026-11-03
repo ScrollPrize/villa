@@ -92,11 +92,10 @@ inline std::uint64_t split_seed(std::uint64_t base, const std::string& name) {
 struct Uniform { double low, high; };
 struct Normal { double mean = 0, std = .1; };
 struct Choice { std::vector<double> values; };
-struct BalancedContrast { double low = .75, high = 1.25; };
 // A value supplied per sample at call time (params={name: value}); it draws no
 // random numbers, so other parameters keep their streams.
 struct Named { std::string name; };
-using Scalar = std::variant<double, Uniform, Normal, Choice, BalancedContrast, Named>;
+using Scalar = std::variant<double, Uniform, Normal, Choice, Named>;
 using NamedValues = std::map<std::string, double>;
 inline const NamedValues*& named_values() { thread_local const NamedValues* values = nullptr; return values; }
 struct NamedScope {
@@ -116,13 +115,10 @@ inline double draw(const Scalar& value, Random& r) {
             require(std::isfinite(v.mean) && std::isfinite(v.std) && v.std >= 0, "invalid normal distribution");
             return v.mean + v.std * r.normal();
         } else if constexpr (std::is_same_v<T, Choice>) return v.values[r.index(v.values.size())];
-        else if constexpr (std::is_same_v<T, Named>) {
+        else {
             const auto* values = named_values();
             require(values && values->count(v.name), "missing per-sample parameter: " + v.name);
             return values->at(v.name);
-        } else {
-            require(v.low > 0 && v.low <= 1 && v.high >= 1 && std::isfinite(v.high), "balanced contrast must bracket one");
-            return r.chance(.5) ? v.low + (1 - v.low) * r.uniform() : 1 + (v.high - 1) * r.uniform();
         }
     }, value);
     require(std::isfinite(result), "sampled parameter must be finite"); return result;
@@ -450,7 +446,6 @@ struct ChannelPlan {
     std::shared_ptr<void> device_field;
     // Voxel indices are integers, not floating-point deformation samples.
     std::vector<std::size_t> indices;
-    std::shared_ptr<void> device_indices;
     // Device-resident selection state, materialized as indices when recording.
     std::shared_ptr<void> device_selection;
 };

@@ -50,7 +50,7 @@ def run(settings):
     centers, widths = uv.radial_initial_geometry(d, cfg)
     d.update(radial_initial_centers=centers, radial_initial_widths=widths)
     np.savez(root/'tensors.npz', **d)
-    cfg.update(afv=old['afv'], tensor_cache=str(root/'tensors.npz'),
+    cfg.update(fibers=old['fibers'], tensor_cache=str(root/'tensors.npz'),
                output_root=str(root/'solve'), initial_solution=str(root/'init/solution.npz'),
                devices=settings.get('devices',cfg.get('devices','0')),
                force_keep_fibers=True)

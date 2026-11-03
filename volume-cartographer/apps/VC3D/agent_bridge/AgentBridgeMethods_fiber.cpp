@@ -74,6 +74,7 @@ void AgentBridgeServer::registerFiberHandlers()
                 Params::optionalArray(
                     QStringLiteral("span"),
                     nonNegativeIndex(QString())),
+                Params::optionalBoolean(QStringLiteral("editable"), false),
             },
             .errors = {-32602, -32000, -32010, -32007, -32005},
             .mcp = Mcp::snakeCase(QStringLiteral("vc3d_fiber_open")),
@@ -124,17 +125,6 @@ void AgentBridgeServer::registerFiberHandlers()
             .mcp = Mcp::snakeCase(QStringLiteral("vc3d_fiber_set_tag")),
         },
         [this](const QJsonValue& p) { return handleFiberSetTag(p); });
-
-    registerMethod(
-        {
-            .name = QStringLiteral("fiber.create_atlas"),
-            .params = {
-                fiberId(QStringLiteral("fiberId")),
-            },
-            .errors = {-32602, -32000, -32010, -32007, -32005},
-            .mcp = Mcp::snakeCase(QStringLiteral("vc3d_fiber_create_atlas")),
-        },
-        [this](const QJsonValue& p) { return handleFiberCreateAtlas(p); });
 
     registerMethod(
         {

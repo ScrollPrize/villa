@@ -1,6 +1,6 @@
 """Pre-launch sampler check: delivered task shares, replay supply and fresh-trace geometry.
 
-Builds each dataset source exactly as the trainer does (fibers, AFV neighbors, replay caches,
+Builds each dataset source exactly as the trainer does (fibers, fiber-store neighbors, replay caches,
 task budget) and draws batch plans without reading CT. Reports requested and delivered
 shares, fallbacks, replay classes, distinct fibers/episodes/events, startup draws and
 realized seed ages, and excursion head offsets, heading error and path curvature. Exits
@@ -80,8 +80,8 @@ def summarize(items, fibers):
 
 def main(argv=None):
     from vesuvius.neural_tracing.tracers.fibers.data.observations import IdentityObservationBuilder, IdentitySampling
-    from vesuvius.neural_tracing.tracers.fibers.data.afv_neighbors import AFVBank
-    from vesuvius.neural_tracing.tracers.fibers.data.datasets import load_primary_dataset, open_afv_source, read_dataset_config
+    from vesuvius.neural_tracing.tracers.fibers.data.fiber_bank import FiberBank
+    from vesuvius.neural_tracing.tracers.fibers.data.datasets import load_primary_dataset, open_fiber_source, read_dataset_config
     from vesuvius.neural_tracing.tracers.models.model import config_from_checkpoint
     from vesuvius.neural_tracing.tracers.models.checkpoint import read_checkpoint
     from vesuvius.neural_tracing.tracers.shared.crop_sampling.volume import CTVolumeSpec
@@ -115,8 +115,8 @@ def main(argv=None):
             _, fibers, _, _ = load_primary_dataset(document, spec)
             neighbors = None
         else:
-            fibers, _, spec, _ = open_afv_source(source, document['cache_dir'])
-            neighbors = AFVBank(fibers)
+            fibers, _, spec = open_fiber_source(source, document['cache_dir'])
+            neighbors = FiberBank(fibers)
         caches = [OnPolicyStates.load(replay[source['name']])] if source['name'] in replay else []
         builder = IdentityObservationBuilder(cfg, fibers, sampling, augment=True, neighbors=neighbors)
         dataset = FollowDataset(fibers, spec, sample, chunk=args.batch, seed=11, budget=budget,

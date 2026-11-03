@@ -154,7 +154,7 @@ def run(config):
                 fiber_percent=float(100*keep.mean()),length_percent=float(100*length[keep].sum()/length.sum()))
             with (out/'attachment_support.csv').open('w',newline='') as f:
                 w=csv.writer(f);w.writerow(['source_id','piece_index','support','perp_constraints','visible'])
-                w.writerows((int(s),i,float(support[i]),int(counts[i]),bool(keep[i])) for i,s in enumerate(d['source_id']))
+                w.writerows((str(s),i,float(support[i]),int(counts[i]),bool(keep[i])) for i,s in enumerate(d['source_id']))
             with (out/'attachment_edge_support.csv').open('w',newline='') as f:
                 w=csv.writer(f);w.writerow(['edge','mean_activation']);w.writerows(zip(edges,edge_support))
         background_only=False
@@ -204,7 +204,7 @@ def run(config):
         same=e in ext.visualization_edges
         if not same:continue
         da=np.abs(actual[a]-predicted[a]);db=np.abs(actual[b]-predicted[b])
-        row=dict(edge=e,source_a=int(d['source_id'][i]),source_b=int(d['source_id'][j]),
+        row=dict(edge=e,source_a=str(d['source_id'][i]),source_b=str(d['source_id'][j]),
                  same_sheet_map=bool(same),a_u=float(da[0]),a_v=float(da[1]),b_u=float(db[0]),b_v=float(db[1]))
         for name,xy in points.items():
             connections[name].append([xy[a].tolist(),xy[b].tolist()])
@@ -250,11 +250,11 @@ def run(config):
                 entry=flagged.setdefault(i,dict(u=0.,v=0.,partners=set(),count=0))
                 entry['u']=max(entry['u'],row['bucket_meeting_u'])
                 entry['v']=max(entry['v'],row['bucket_meeting_v'])
-                entry['partners'].add(int(d['source_id'][j]));entry['count']+=1
+                entry['partners'].add(str(d['source_id'][j]));entry['count']+=1
         image_ids={i:n+1 for n,i in enumerate(sorted(flagged))}
         with (out/'image_fiber_ids.csv').open('w',newline='') as f:
             writer=csv.writer(f);writer.writerow(['image_id','source_id','piece_index'])
-            writer.writerows((number,int(d['source_id'][i]),i) for i,number in image_ids.items())
+            writer.writerows((number,str(d['source_id'][i]),i) for i,number in image_ids.items())
         for name,g in geometries.items():
             for n,i in enumerate(ids):
                 if i in flagged:
@@ -274,7 +274,7 @@ def run(config):
             '| Image ID | Source ID | Piece index | H/V | MAP label | Joint p | Conditional p | Max U/V (vx) | Meetings | Partner source IDs | Its since entry | Mean p last 100 |',
             '|---|---|---:|---|---:|---:|---:|---|---:|---|---|---|']
         for i,r in sorted(flagged.items(),key=lambda item:max(item[1]['u'],item[1]['v']),reverse=True):
-            lines.append(f"| {image_ids[i]} | {int(d['source_id'][i])} | {i} | {'H' if d['family'][i]==0 else 'V'} | {int(labels[i])} | "
+            lines.append(f"| {image_ids[i]} | {d['source_id'][i]} | {i} | {'H' if d['family'][i]==0 else 'V'} | {int(labels[i])} | "
                          f"{joint_by_id[i]:.3f} | {conditional_by_id[i]:.3f} | {r['u']:.0f}/{r['v']:.0f} | "
                          f"{r['count']} | {', '.join(map(str,sorted(r['partners'])))} | unavailable | unavailable |")
         if (root/'winding_history.npz').exists():
@@ -289,10 +289,10 @@ def run(config):
             lines=lines[:10]
             for i,r in sorted(flagged.items(),key=lambda item:max(item[1]['u'],item[1]['v']),reverse=True):
                 t=temporal[i]
-                lines.append(f"| {image_ids[i]} | {int(d['source_id'][i])} | {i} | {'H' if d['family'][i]==0 else 'V'} | {int(labels[i])} | "
+                lines.append(f"| {image_ids[i]} | {d['source_id'][i]} | {i} | {'H' if d['family'][i]==0 else 'V'} | {int(labels[i])} | "
                     f"{joint_by_id[i]:.3f} | {r['u']:.0f}/{r['v']:.0f} | {', '.join(map(str,sorted(r['partners'])))} | "
                     f"{t['entry']} | {t['age']} | {t['mean100']:.3f} | {t['min100']:.3f} | {t['visible100']} | {t['switches100']} | {t['map_switches100']} |")
-            audit=[dict(image_id=image_ids[i],piece=i,source_id=int(d['source_id'][i]),joint=float(joint_by_id[i]),
+            audit=[dict(image_id=image_ids[i],piece=i,source_id=str(d['source_id'][i]),joint=float(joint_by_id[i]),
                         max_u=r['u'],max_v=r['v'],partners=sorted(r['partners']),**temporal[i])
                    for i,r in flagged.items()]
             soft.uv.atomic_write(out/'meeting_history.json',dict(fibers=audit,
@@ -308,7 +308,7 @@ def run(config):
             j=min(k+1,len(g[1][n])-1)
             annotations[name].append(dict(uv=[float((g[1][n][k]+g[1][n][j])*.5),
                 float((g[2][n][k]+g[2][n][j])*.5)],family=int(d['family'][i]),
-                text=('H' if d['family'][i]==0 else 'V')+str(int(d['source_id'][i]))))
+                text=('H' if d['family'][i]==0 else 'V')+str(d['source_id'][i])))
     common=dict(cfg,render_height=config.get('render_height',1000),raster_map_only=True,vector_pdf=True,
                 diagnostic_label_layout=True,
                 diagnostic_label_font_size=config.get('diagnostic_label_font_size',6),
@@ -326,7 +326,7 @@ def run(config):
         writer=csv.DictWriter(f,fieldnames=list(records[0]) if records else ['edge']);writer.writeheader();writer.writerows(records)
     with (out/'fibers.csv').open('w',newline='') as f:
         writer=csv.writer(f);writer.writerow(['source_id','max_component_displacement_vx','displacement_over_200vx'])
-        for i in ids:writer.writerow([int(d['source_id'][i]),maximum[i],bool(maximum[i]>200)])
+        for i in ids:writer.writerow([str(d['source_id'][i]),maximum[i],bool(maximum[i]>200)])
     result=dict(views=reports,red_fibers=0,displacement_over_200vx_fibers=int((maximum[ids]>200).sum()),metric_meetings=len(records),
                 metric_cohort_verified=not ext.predicted_only,metrics=ext.last,annotations={k:len(v) for k,v in annotations.items()},
                 solution_sha256=soft.uv.sha256_file(root/'solution.npz'),

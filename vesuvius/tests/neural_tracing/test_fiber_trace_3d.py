@@ -840,6 +840,18 @@ def test_inference_device_defaults_to_available_cuda(monkeypatch: pytest.MonkeyP
     assert _resolve_inference_device("cpu") == torch.device("cpu")
 
 
+def test_inference_auto_device_preserves_bf16_on_mps_host(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    monkeypatch.setattr(torch.cuda, "device_count", lambda: 0)
+    monkeypatch.setattr(torch.backends.mps, "is_available", lambda: True)
+    for device in (None, "auto"):
+        devices = fiber_infer_module.resolve_inference_devices(device=device)
+        assert devices == (torch.device("cpu"),)
+        assert _resolve_inference_precision(
+            "bf16", checkpoint=None, devices=devices
+        ) == ("bf16", "cli")
+
+
 def test_inference_precision_auto_uses_checkpoint_policy(tmp_path: Path) -> None:
     checkpoint = tmp_path / "snapshot.pt"
     torch.save({"config": {"training": {"mixed_precision": "bf16"}}}, checkpoint)
@@ -4392,7 +4404,8 @@ def test_3d_fiber_output_adapter_requires_all_option_channels(tmp_path: Path) ->
     )
 
 
-def test_3d_fiber_infer_writes_lasagna_presence_normal_products(tmp_path: Path) -> None:
+@pytest.mark.parametrize("output_format", ["legacy", "compact"])
+def test_3d_fiber_infer_writes_lasagna_presence_normal_products(tmp_path: Path, output_format) -> None:
     input_path = tmp_path / "input.zarr"
     arr = create_v2_array(
         input_path,
@@ -4426,6 +4439,7 @@ def test_3d_fiber_infer_writes_lasagna_presence_normal_products(tmp_path: Path) 
 
     run_fiber_trace_3d_inference(
         config_path=config_path,
+        output_format=output_format,
         input_path=str(input_path),
         output_path=output_path,
         checkpoint=None,
@@ -4445,6 +4459,19 @@ def test_3d_fiber_infer_writes_lasagna_presence_normal_products(tmp_path: Path) 
         accumulator_workers=0,
     )
 
+    if output_format == "compact":
+        from lasagna.lasagna_volume import LasagnaVolume
+        manifest = LasagnaVolume.load(tmp_path / "fiber_out.zarr")
+        assert manifest.validity_channel == "presence"
+        assert manifest.base_shape_zyx == (8, 8, 8)
+        data = zarr.open_array(str(tmp_path / "fiber_out.zarr/sd0/0"), mode="r")
+        assert data.shape == (3,8,8,8)
+        assert data.chunks == (3,4,4,4)
+        assert (tmp_path / "fiber_out.zarr/sd0/1/.zarray").exists()
+        provenance = json.loads((tmp_path / "inference.json").read_text())
+        assert provenance["status"] == "completed"
+        assert provenance["artifacts"][0]["attribute"] == "lasagna"
+        return
     for channel_name in FIBER_TRACE_3D_PERSISTED_CHANNELS:
         channel_level = tmp_path / f"fiber_out_{channel_name}.ome.zarr" / "0"
         assert (channel_level / ".zarray").is_file()
@@ -4480,7 +4507,8 @@ def test_3d_fiber_inference_scale_defaults_and_validates_all_axes() -> None:
     import inspect
 
     parameters = inspect.signature(run_fiber_trace_3d_inference).parameters
-    assert parameters["inference_scaledown_power"].default == 2
+    # None selects the model's native output stride.
+    assert parameters["inference_scaledown_power"].default is None
     assert parameters["ome_chunk"].default == 64
     assert parameters["ome_compressor"].default == "blosc-zstd"
     assert _input_scaledown_from_base((17, 33, 65), (5, 9, 17)) == 4

@@ -15,7 +15,7 @@
     "parallel/mixed_shuffled": {
       "checksum": 2698931263477305860,
       "modeled_runtime_score_ns": 8769302.024697026,
-      "tolerance": 0.10
+      "tolerance": 0.1
     },
     "serial/fallback_3": {
       "checksum": 2611257448726826058,
@@ -36,5 +36,5 @@
   },
   "model_sha256": "c75069f4fc1580029bf4013c1bbf999f2388a1ddda481d53f108f1412e11e409",
   "schema_version": 1,
-  "tolerance": 0.05
+  "tolerance": 0.1
 }

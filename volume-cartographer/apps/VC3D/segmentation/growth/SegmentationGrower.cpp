@@ -1,9 +1,10 @@
 #include "SegmentationGrower.hpp"
+#include <vc_object_store/store/GeometryViews.hpp>
 
-#include "OpenDataCoordinateIdentity.hpp"
 
 #include "../../NeuralTraceServiceManager.hpp"
 #include "../SegmentationModule.hpp"
+#include "../SurfaceCorrections.hpp"
 #include "../SegmentationWidget.hpp"
 
 #include "../../CState.hpp"
@@ -15,7 +16,6 @@
 #include "vc/core/util/Surface.hpp"
 #include "vc/core/util/QuadSurface.hpp"
 #include "vc/core/util/Slicing.hpp"
-#include "vc/core/util/SurfacePatchIndex.hpp"
 
 #include <QtConcurrent/QtConcurrent>
 
@@ -49,7 +49,6 @@
 Q_DECLARE_LOGGING_CATEGORY(lcSegGrowth);
 
 const QString kCopyLatestSentinel = QStringLiteral("copy_displacement_latest");
-const QString kDenseLatestSentinel = QStringLiteral("extrap_displacement_latest");
 
 namespace
 {
@@ -59,60 +58,16 @@ QString cacheRootForVolumePkg(const std::shared_ptr<VolumePkg>& pkg)
         return QString();
     }
 
-    const QString base = QString::fromStdString(pkg->getVolpkgDirectory());
+    const QString base = QString::fromStdString(pkg->directory().string());
     return QDir(base).filePath(QStringLiteral("cache"));
 }
 
-// NOTE: SegmentationGrowth.cpp has an equivalent ensureGenerationsChannel with a bool
-// return value. These two live in separate anonymous namespaces (different TUs) and
-// cannot easily be merged without a shared header; keep them in sync if modified.
-void ensureGenerationsChannel(QuadSurface* surface)
+// The valid grid vertex nearest `worldPos` on `surface` (stored, or a draft):
+// the vertex at its nearest point, else the nearest valid one around it.
+std::optional<std::pair<int, int>> locateGridIndex(QuadSurface* surface, ViewerManager* viewerManager,
+                                                   const cv::Vec3f& worldPos)
 {
-    if (!surface) {
-        return;
-    }
-
-    cv::Mat generations = surface->channel("generations");
-    if (!generations.empty()) {
-        return;
-    }
-
-    cv::Mat_<cv::Vec3f>* points = surface->rawPointsPtr();
-    if (!points || points->empty()) {
-        return;
-    }
-
-    cv::Mat_<uint16_t> seeded(points->rows, points->cols, static_cast<uint16_t>(1));
-    surface->setChannel("generations", seeded);
-}
-
-void ensureSurfaceMetaObject(QuadSurface* surface)
-{
-    if (!surface) {
-        return;
-    }
-
-    if (!surface->meta.is_null() && surface->meta.is_object()) {
-        return;
-    }
-
-    surface->meta = utils::Json::object();
-}
-
-
-bool isInvalidPoint(const cv::Vec3f& value)
-{
-    return !std::isfinite(value[0]) || !std::isfinite(value[1]) || !std::isfinite(value[2]) ||
-           (value[0] == -1.0f && value[1] == -1.0f && value[2] == -1.0f);
-}
-
-std::optional<std::pair<int, int>> worldToGridIndexApprox(QuadSurface* surface,
-                                                          const cv::Vec3f& worldPos,
-                                                          cv::Vec3f& pointerSeed,
-                                                          bool& pointerSeedValid,
-                                                          SurfacePatchIndex* patchIndex = nullptr)
-{
-    if (!surface) {
+    if (!surface || !viewerManager) {
         return std::nullopt;
     }
 
@@ -121,26 +76,20 @@ std::optional<std::pair<int, int>> worldToGridIndexApprox(QuadSurface* surface,
         return std::nullopt;
     }
 
-    if (!pointerSeedValid) {
-        pointerSeed = cv::Vec3f(0, 0, 0);
-        pointerSeedValid = true;
+    // Anywhere on the surface.
+    constexpr float kAnywhere = 1e6f;
+    const auto hit = viewerManager->locate(*surface, worldPos, kAnywhere);
+    if (!hit) {
+        return std::nullopt;
     }
-
-    surface->pointTo(pointerSeed, worldPos, std::numeric_limits<float>::max(), 400, patchIndex);
-    cv::Vec3f raw = surface->loc_raw(pointerSeed);
+    const cv::Vec2f grid = surface->ptrToGrid(hit->ptr);
 
     const int rows = points->rows;
     const int cols = points->cols;
-    if (rows <= 0 || cols <= 0) {
-        return std::nullopt;
-    }
+    int approxCol = std::clamp(static_cast<int>(std::lround(grid[0])), 0, cols - 1);
+    int approxRow = std::clamp(static_cast<int>(std::lround(grid[1])), 0, rows - 1);
 
-    int approxCol = static_cast<int>(std::lround(raw[0]));
-    int approxRow = static_cast<int>(std::lround(raw[1]));
-    approxRow = std::clamp(approxRow, 0, rows - 1);
-    approxCol = std::clamp(approxCol, 0, cols - 1);
-
-    if (isInvalidPoint((*points)(approxRow, approxCol))) {
+    if (!vc::geometry::validSurfacePoint((*points)(approxRow, approxCol))) {
         constexpr int kMaxRadius = 12;
         float bestDistSq = std::numeric_limits<float>::max();
         int bestRow = -1;
@@ -148,7 +97,7 @@ std::optional<std::pair<int, int>> worldToGridIndexApprox(QuadSurface* surface,
 
         auto accumulateCandidate = [&](int r, int c) {
             const cv::Vec3f& candidate = (*points)(r, c);
-            if (isInvalidPoint(candidate)) {
+            if (!vc::geometry::validSurfacePoint(candidate)) {
                 return;
             }
             const cv::Vec3f diff = candidate - worldPos;
@@ -185,48 +134,6 @@ std::optional<std::pair<int, int>> worldToGridIndexApprox(QuadSurface* surface,
     return std::make_pair(approxRow, approxCol);
 }
 
-std::optional<std::pair<int, int>> locateGridIndexWithPatchIndex(QuadSurface* surface,
-                                                                 SurfacePatchIndex* patchIndex,
-                                                                 const cv::Vec3f& worldPos,
-                                                                 cv::Vec3f& pointerSeed,
-                                                                 bool& pointerSeedValid)
-{
-    if (!surface) {
-        return std::nullopt;
-    }
-
-    const cv::Mat_<cv::Vec3f>* points = surface->rawPointsPtr();
-    if (!points || points->empty()) {
-        return std::nullopt;
-    }
-
-    if (patchIndex) {
-        cv::Vec2f gridScale = surface->scale();
-        float scale = std::max(gridScale[0], gridScale[1]);
-        if (!std::isfinite(scale) || scale <= 0.0f) {
-            scale = 1.0f;
-        }
-        const float tolerance = std::max(8.0f, scale * 8.0f);
-        // Query without surface filter, then verify result matches our surface
-        SurfacePatchIndex::PointQuery query;
-        query.worldPoint = worldPos;
-        query.tolerance = tolerance;
-        if (auto hit = patchIndex->locate(query)) {
-            if (hit->surface.get() == surface) {
-                const int col = std::clamp(static_cast<int>(std::round(hit->ptr[0])),
-                                           0,
-                                           points->cols - 1);
-                const int row = std::clamp(static_cast<int>(std::round(hit->ptr[1])),
-                                           0,
-                                           points->rows - 1);
-                return std::make_pair(row, col);
-            }
-        }
-    }
-
-    return worldToGridIndexApprox(surface, worldPos, pointerSeed, pointerSeedValid, patchIndex);
-}
-
 std::optional<cv::Rect> computeCorrectionsAffectedBounds(QuadSurface* surface,
                                                       const SegmentationCorrectionsPayload& corrections,
                                                       ViewerManager* viewerManager)
@@ -239,11 +146,6 @@ std::optional<cv::Rect> computeCorrectionsAffectedBounds(QuadSurface* surface,
     if (!points || points->empty()) {
         return std::nullopt;
     }
-
-    SurfacePatchIndex* patchIndex = viewerManager ? viewerManager->surfacePatchIndex() : nullptr;
-
-    cv::Vec3f pointerSeed{0.0f, 0.0f, 0.0f};
-    bool pointerSeedValid = false;
 
     const int rows = points->rows;
     const int cols = points->cols;
@@ -267,11 +169,7 @@ std::optional<cv::Rect> computeCorrectionsAffectedBounds(QuadSurface* surface,
         int collectionMaxCol = -1;
 
         for (const auto& colPoint : collection.points) {
-            auto gridIndex = locateGridIndexWithPatchIndex(surface,
-                                                           patchIndex,
-                                                           colPoint.p,
-                                                           pointerSeed,
-                                                           pointerSeedValid);
+            auto gridIndex = locateGridIndex(surface, viewerManager, colPoint.p);
             if (!gridIndex) {
                 continue;
             }
@@ -375,7 +273,7 @@ std::optional<CorrectionsBounds> computeCorrectionsBounds(
     for (int r = 0; r < rows; ++r) {
         for (int c = 0; c < cols; ++c) {
             const cv::Vec3f& pt = (*points)(r, c);
-            if (isInvalidPoint(pt)) {
+            if (!vc::geometry::validSurfacePoint(pt)) {
                 continue;
             }
 
@@ -408,230 +306,6 @@ std::optional<CorrectionsBounds> computeCorrectionsBounds(
     return bounds;
 }
 
-// Crop a QuadSurface to a 2D grid region
-std::unique_ptr<QuadSurface> cropSurfaceToGridRegion(
-    const QuadSurface* surface,
-    const cv::Rect& gridRegion)
-{
-    if (!surface) {
-        return nullptr;
-    }
-
-    const cv::Mat_<cv::Vec3f>* points = surface->rawPointsPtr();
-    if (!points || points->empty()) {
-        return nullptr;
-    }
-
-    const int rows = points->rows;
-    const int cols = points->cols;
-
-    // Clamp region to valid bounds
-    int x0 = std::clamp(gridRegion.x, 0, cols - 1);
-    int y0 = std::clamp(gridRegion.y, 0, rows - 1);
-    int x1 = std::clamp(gridRegion.x + gridRegion.width, 1, cols);
-    int y1 = std::clamp(gridRegion.y + gridRegion.height, 1, rows);
-
-    if (x1 <= x0 || y1 <= y0) {
-        return nullptr;
-    }
-
-    // Extract ROI
-    cv::Mat_<cv::Vec3f> roi(*points, cv::Range(y0, y1), cv::Range(x0, x1));
-    cv::Mat_<cv::Vec3f> roiClone = roi.clone();
-
-    // Create new QuadSurface with the cropped data
-    auto cropped = std::make_unique<QuadSurface>(roiClone, surface->scale());
-
-    return cropped;
-}
-
-// Generate ISO 8601 timestamp string for folder naming
-std::string generateTimestampString()
-{
-    auto now = std::chrono::system_clock::now();
-    auto time = std::chrono::system_clock::to_time_t(now);
-    std::tm tm{};
-#if defined(_WIN32)
-    gmtime_s(&tm, &time);
-#else
-    gmtime_r(&time, &tm);
-#endif
-
-    char buffer[32];
-    std::strftime(buffer, sizeof(buffer), "%Y-%m-%dT%H-%M-%S", &tm);
-    return std::string(buffer);
-}
-
-// Save correction annotation data
-void saveCorrectionsAnnotation(
-    const std::filesystem::path& volpkgRoot,
-    const std::string& segmentId,
-    const QuadSurface* beforeCrop,
-    const QuadSurface* afterCrop,
-    const SegmentationCorrectionsPayload& corrections,
-    const std::vector<std::string>& volumeIds,
-    const std::string& growthVolumeId,
-    const CorrectionsBounds& bounds)
-{
-    if (!beforeCrop || !afterCrop || corrections.empty()) {
-        return;
-    }
-
-    // Create timestamped folder
-    std::string timestamp = generateTimestampString();
-    std::filesystem::path correctionsDir = volpkgRoot / "corrections" / timestamp;
-
-    std::error_code ec;
-    std::filesystem::create_directories(correctionsDir, ec);
-    if (ec) {
-        qCWarning(lcSegGrowth) << "Failed to create corrections directory:" << ec.message().c_str();
-        return;
-    }
-
-    // Save before tifxyz
-    std::filesystem::path beforePath = correctionsDir / "before";
-    try {
-        auto* mutableBefore = const_cast<QuadSurface*>(beforeCrop);
-        mutableBefore->saveAsNew(beforePath, true);
-    } catch (const std::exception& ex) {
-        qCWarning(lcSegGrowth) << "Failed to save before tifxyz:" << ex.what();
-    }
-
-    // Save after tifxyz
-    std::filesystem::path afterPath = correctionsDir / "after";
-    try {
-        auto* mutableAfter = const_cast<QuadSurface*>(afterCrop);
-        mutableAfter->saveAsNew(afterPath, true);
-    } catch (const std::exception& ex) {
-        qCWarning(lcSegGrowth) << "Failed to save after tifxyz:" << ex.what();
-    }
-
-    // Build corrections.json
-    utils::Json j = utils::Json::object();
-    j["timestamp"] = timestamp;
-    j["segment_id"] = segmentId;
-    {
-        utils::Json volArr = utils::Json::array();
-        for (const auto& vid : volumeIds) volArr.push_back(utils::Json(vid));
-        j["volumes"] = std::move(volArr);
-    }
-    j["volume_used"] = growthVolumeId;
-    {
-        utils::Json bboxMin = utils::Json::array();
-        bboxMin.push_back(utils::Json(bounds.worldMin[0]));
-        bboxMin.push_back(utils::Json(bounds.worldMin[1]));
-        bboxMin.push_back(utils::Json(bounds.worldMin[2]));
-        utils::Json bboxMax = utils::Json::array();
-        bboxMax.push_back(utils::Json(bounds.worldMax[0]));
-        bboxMax.push_back(utils::Json(bounds.worldMax[1]));
-        bboxMax.push_back(utils::Json(bounds.worldMax[2]));
-        j["bbox"] = {{"min", std::move(bboxMin)}, {"max", std::move(bboxMax)}};
-    }
-
-    // Build collections array with points sorted by creation_time
-    utils::Json collectionsJson = utils::Json::array();
-    for (const auto& collection : corrections.collections) {
-        utils::Json collJson = utils::Json::object();
-        collJson["id"] = static_cast<uint64_t>(collection.id);
-        collJson["name"] = collection.name;
-        {
-            utils::Json colorArr = utils::Json::array();
-            colorArr.push_back(utils::Json(static_cast<double>(collection.color[0])));
-            colorArr.push_back(utils::Json(static_cast<double>(collection.color[1])));
-            colorArr.push_back(utils::Json(static_cast<double>(collection.color[2])));
-            collJson["color"] = std::move(colorArr);
-        }
-
-        // Sort points by creation_time to preserve placement order
-        std::vector<ColPoint> sortedPoints = collection.points;
-        std::sort(sortedPoints.begin(), sortedPoints.end(),
-                  [](const ColPoint& a, const ColPoint& b) {
-                      return a.creation_time < b.creation_time;
-                  });
-
-        utils::Json pointsJson = utils::Json::array();
-        for (const auto& pt : sortedPoints) {
-            utils::Json ptJson = utils::Json::object();
-            ptJson["id"] = static_cast<uint64_t>(pt.id);
-            {
-                utils::Json posArr = utils::Json::array();
-                posArr.push_back(utils::Json(static_cast<double>(pt.p[0])));
-                posArr.push_back(utils::Json(static_cast<double>(pt.p[1])));
-                posArr.push_back(utils::Json(static_cast<double>(pt.p[2])));
-                ptJson["position"] = std::move(posArr);
-            }
-            ptJson["creation_time"] = static_cast<int64_t>(pt.creation_time);
-            pointsJson.push_back(std::move(ptJson));
-        }
-        collJson["points"] = std::move(pointsJson);
-
-        collectionsJson.push_back(std::move(collJson));
-    }
-    j["collections"] = std::move(collectionsJson);
-
-    // Write corrections.json
-    std::filesystem::path jsonPath = correctionsDir / "corrections.json";
-    try {
-        std::ofstream ofs(jsonPath);
-        if (ofs.is_open()) {
-            ofs << j.dump(2);
-            ofs.close();
-            qCInfo(lcSegGrowth) << "Saved corrections annotation to" << jsonPath.c_str();
-        } else {
-            qCWarning(lcSegGrowth) << "Failed to open corrections.json for writing";
-        }
-    } catch (const std::exception& ex) {
-        qCWarning(lcSegGrowth) << "Failed to write corrections.json:" << ex.what();
-    }
-}
-
-void queueIndexUpdateForBounds(SurfacePatchIndex* index,
-                               const SurfacePatchIndex::SurfacePtr& surface,
-                               const cv::Rect& vertexRect)
-{
-    if (!index || !surface || vertexRect.width <= 0 || vertexRect.height <= 0) {
-        return;
-    }
-
-    const int rowStart = vertexRect.y;
-    const int rowEnd = vertexRect.y + vertexRect.height;
-    const int colStart = vertexRect.x;
-    const int colEnd = vertexRect.x + vertexRect.width;
-
-    index->queueCellRangeUpdate(surface, rowStart, rowEnd, colStart, colEnd);
-}
-
-void synchronizeSurfaceMeta(const std::shared_ptr<VolumePkg>& pkg,
-                            QuadSurface* surface,
-                            SurfacePanelController* panel)
-{
-    if (!pkg || !surface) {
-        return;
-    }
-
-    // getSurface now returns the QuadSurface directly, so we just need to refresh the panel
-    const auto loadedIds = pkg->getLoadedSurfaceIDs();
-    for (const auto& id : loadedIds) {
-        auto loadedSurface = pkg->getSurface(id);
-        if (!loadedSurface) {
-            continue;
-        }
-
-        if (loadedSurface->path == surface->path) {
-            // Sync metadata if needed
-            if (!surface->meta.is_null()) {
-                loadedSurface->meta = surface->meta;
-            } else {
-                loadedSurface->meta = utils::Json();
-            }
-
-            if (panel) {
-                panel->refreshSurfaceMetrics(id);
-            }
-        }
-    }
-}
-
 void refreshSegmentationViewers(ViewerManager* manager)
 {
     if (!manager) {
@@ -649,311 +323,38 @@ void refreshSegmentationViewers(ViewerManager* manager)
         }
     });
 }
-struct DenseDisplacementJob
-{
-    QString socketPath;
-    QString tifxyzInputPath;
-    QString volumeZarrPath;
-    int volumeScale{0};
-    int iterations{1};
-    QString checkpointPath;
-    DenseTtaMode ttaMode{DenseTtaMode::Mirror};
-    QString ttaMergeMethod{QStringLiteral("vector_geomedian")};
-    double ttaOutlierDropThresh{1.25};
-    utils::Json customParams;
-    std::vector<SegmentationGrowthDirection> directions;
-};
-
 struct CopyDisplacementJob
 {
     QString socketPath;
-    QString tifxyzInputPath;
+    // The input surface, read at geometryRevision from the store file the
+    // service shares with this session; the outputs are new surfaces there.
+    QString store;
+    std::string surfaceUuid, geometryRevision, volumeUuid;
     QString volumeZarrPath;
     int volumeScale{0};
     QString checkpointPath;
-    DenseTtaMode ttaMode{DenseTtaMode::Mirror};
+    TtaMode ttaMode{TtaMode::Mirror};
     QString ttaMergeMethod{QStringLiteral("vector_geomedian")};
     double ttaOutlierDropThresh{1.25};
     utils::Json customParams;
 };
-
-std::optional<std::string> denseDirectionToToken(SegmentationGrowthDirection direction)
-{
-    switch (direction) {
-    case SegmentationGrowthDirection::Left:
-        return std::string("left");
-    case SegmentationGrowthDirection::Right:
-        return std::string("right");
-    case SegmentationGrowthDirection::Up:
-        return std::string("up");
-    case SegmentationGrowthDirection::Down:
-        return std::string("down");
-    case SegmentationGrowthDirection::All:
-        return std::string("all");
-    default:
-        return std::nullopt;
-    }
-}
-
-std::vector<SegmentationGrowthDirection> resolveDenseDirections(
-    SegmentationGrowthDirection primaryDirection,
-    const std::vector<SegmentationGrowthDirection>& allowedDirections)
-{
-    if (primaryDirection != SegmentationGrowthDirection::All) {
-        return {primaryDirection};
-    }
-
-    const std::vector<SegmentationGrowthDirection> order = {
-        SegmentationGrowthDirection::Left,
-        SegmentationGrowthDirection::Right,
-        SegmentationGrowthDirection::Up,
-        SegmentationGrowthDirection::Down,
-    };
-
-    std::set<SegmentationGrowthDirection> allowedSet;
-    for (auto dir : allowedDirections) {
-        if (dir == SegmentationGrowthDirection::All) {
-            allowedSet.insert(order.begin(), order.end());
-            break;
-        }
-        if (dir == SegmentationGrowthDirection::Left ||
-            dir == SegmentationGrowthDirection::Right ||
-            dir == SegmentationGrowthDirection::Up ||
-            dir == SegmentationGrowthDirection::Down) {
-            allowedSet.insert(dir);
-        }
-    }
-    if (allowedSet.empty()) {
-        allowedSet.insert(order.begin(), order.end());
-    }
-
-    if (allowedSet.size() == order.size()) {
-        return {SegmentationGrowthDirection::All};
-    }
-
-    std::vector<SegmentationGrowthDirection> resolved;
-    resolved.reserve(4);
-    for (auto dir : order) {
-        if (allowedSet.count(dir) > 0) {
-            resolved.push_back(dir);
-        }
-    }
-    return resolved;
-}
-
-QString createDenseSnapshotPath(const QString& preferredDir)
-{
-    QString outputDir = preferredDir.trimmed();
-    if (outputDir.isEmpty()) {
-        outputDir = QDir::tempPath();
-    }
-
-    QDir dir(outputDir);
-    if (!dir.exists() && !dir.mkpath(QStringLiteral("."))) {
-        dir = QDir(QDir::tempPath());
-    }
-
-    const QString suffix = QUuid::createUuid().toString(QUuid::WithoutBraces);
-    return dir.filePath(QStringLiteral("vc_dense_input_%1").arg(suffix));
-}
-
-QString defaultPatchTracerSourcePath(const std::shared_ptr<VolumePkg>& pkg)
-{
-    if (!pkg) {
-        return QString();
-    }
-    return QDir(QString::fromStdString(pkg->getVolpkgDirectory())).filePath(QStringLiteral("paths"));
-}
-
-std::filesystem::path normalizedExistingPath(const QString& path)
-{
-    if (path.trimmed().isEmpty()) {
-        return {};
-    }
-    std::error_code ec;
-    const std::filesystem::path raw(path.toStdString());
-    auto normalized = std::filesystem::weakly_canonical(raw, ec);
-    return ec ? raw.lexically_normal() : normalized;
-}
-
-bool sameFilesystemPath(const QString& a, const QString& b)
-{
-    return normalizedExistingPath(a) == normalizedExistingPath(b);
-}
-
-std::vector<std::shared_ptr<QuadSurface>> loadPatchTracerSurfacesFromFolder(const QString& sourcePath,
-                                                                            QuadSurface* seedSurface)
-{
-    std::vector<std::shared_ptr<QuadSurface>> surfaces;
-    const std::filesystem::path root(sourcePath.toStdString());
-    std::error_code ec;
-    if (!std::filesystem::exists(root, ec) || !std::filesystem::is_directory(root, ec)) {
-        throw std::runtime_error("Patch Tracer source folder does not exist: " + root.string());
-    }
-
-    for (const auto& entry : std::filesystem::directory_iterator(root, ec)) {
-        if (ec) {
-            break;
-        }
-        if (!entry.is_directory(ec)) {
-            continue;
-        }
-        const std::filesystem::path path = entry.path();
-        if (seedSurface && !seedSurface->path.empty() &&
-            normalizedExistingPath(QString::fromStdString(path.string())) ==
-                normalizedExistingPath(QString::fromStdString(seedSurface->path.string()))) {
-            continue;
-        }
-        try {
-            auto loaded = load_quad_from_tifxyz(path.string());
-            if (loaded) {
-                surfaces.emplace_back(std::shared_ptr<QuadSurface>(loaded.release()));
-            }
-        } catch (const std::exception& ex) {
-            qCInfo(lcSegGrowth) << "Skipping Patch Tracer surface"
-                                << QString::fromStdString(path.string())
-                                << ex.what();
-        }
-    }
-
-    if (surfaces.empty()) {
-        throw std::runtime_error("Patch Tracer source folder contains no loadable surfaces: " + root.string());
-    }
-    return surfaces;
-}
-
-std::shared_ptr<SurfacePatchIndex> buildPatchTracerIndex(const std::vector<std::shared_ptr<QuadSurface>>& surfaces,
-                                                         QuadSurface* seedSurface)
-{
-    std::vector<SurfacePatchIndex::SurfacePtr> patchSurfaces;
-    patchSurfaces.reserve(surfaces.size() + 1);
-    std::set<QuadSurface*> seen;
-    auto append = [&](const std::shared_ptr<QuadSurface>& surface) {
-        if (surface && seen.insert(surface.get()).second) {
-            patchSurfaces.emplace_back(surface);
-        }
-    };
-    for (const auto& surface : surfaces) {
-        append(surface);
-    }
-    if (seedSurface && seen.insert(seedSurface).second) {
-        patchSurfaces.emplace_back(SurfacePatchIndex::SurfacePtr(seedSurface, [](QuadSurface*) {}));
-    }
-
-    auto index = std::make_shared<SurfacePatchIndex>();
-    index->rebuild(patchSurfaces, 0.0f);
-    return index;
-}
-
-bool uiPatchIndexMatchesSourceFolder(CState* state,
-                                     SurfacePatchIndex* index,
-                                     const QString& sourcePath,
-                                     std::vector<std::shared_ptr<QuadSurface>>& matchingSurfaces)
-{
-    matchingSurfaces.clear();
-    if (!state || !index || sourcePath.trimmed().isEmpty()) {
-        return false;
-    }
-
-    std::map<std::filesystem::path, std::shared_ptr<QuadSurface>> loadedByPath;
-    for (const auto& surface : state->surfaces()) {
-        auto quad = std::dynamic_pointer_cast<QuadSurface>(surface);
-        if (!quad || quad->path.empty()) {
-            continue;
-        }
-        loadedByPath[normalizedExistingPath(QString::fromStdString(quad->path.string()))] = std::move(quad);
-    }
-
-    const std::filesystem::path root(sourcePath.toStdString());
-    std::error_code ec;
-    if (!std::filesystem::exists(root, ec) || !std::filesystem::is_directory(root, ec)) {
-        return false;
-    }
-
-    int candidateCount = 0;
-    for (const auto& entry : std::filesystem::directory_iterator(root, ec)) {
-        if (ec) {
-            return false;
-        }
-        if (!entry.is_directory(ec)) {
-            continue;
-        }
-        candidateCount++;
-        const auto key = normalizedExistingPath(QString::fromStdString(entry.path().string()));
-        auto it = loadedByPath.find(key);
-        if (it == loadedByPath.end() || !it->second || !index->containsSurface(it->second)) {
-            matchingSurfaces.clear();
-            return false;
-        }
-        matchingSurfaces.push_back(it->second);
-    }
-
-    if (candidateCount == 0) {
-        matchingSurfaces.clear();
-        return false;
-    }
-    return true;
-}
 
 utils::Json sendSocketJsonRequest(const QString& socketPath, const utils::Json& request)
 {
     return utils::Json::parse(vc3d::socketRequestLine(
-        socketPath.toStdString(), request.dump(), 300, "dense displacement"));  // 5 minute timeout
-}
-
-std::string sanitizeSegmentId(const std::string& value)
-{
-    std::string out;
-    out.reserve(value.size());
-    for (unsigned char ch : value) {
-        if (std::isalnum(ch) || ch == '_' || ch == '-') {
-            out.push_back(static_cast<char>(ch));
-        } else {
-            out.push_back('_');
-        }
-    }
-    while (!out.empty() && out.back() == '_') {
-        out.pop_back();
-    }
-    if (out.empty()) {
-        out = "dense_displacement";
-    }
-    return out;
-}
-
-std::string makeUniqueSegmentId(const std::filesystem::path& pathsDir, const std::string& base)
-{
-    std::string candidate = base;
-    int suffix = 1;
-    while (std::filesystem::exists(pathsDir / candidate)) {
-        candidate = base + "_" + std::to_string(suffix++);
-    }
-    return candidate;
+        socketPath.toStdString(), request.dump(), 300, "displacement copy"));  // 5 minute timeout
 }
 
 TracerGrowthResult runCopyDisplacementGrowth(const CopyDisplacementJob& job)
 {
     TracerGrowthResult result;
-    std::vector<std::filesystem::path> temporaryPaths;
-    temporaryPaths.reserve(3);
-    if (!job.tifxyzInputPath.isEmpty()) {
-        temporaryPaths.emplace_back(job.tifxyzInputPath.toStdString());
-    }
-
-    auto finalizeResult = [&]() -> TracerGrowthResult {
-        result.temporarySurfacePaths.clear();
-        result.temporarySurfacePaths.reserve(temporaryPaths.size());
-        for (const auto& path : temporaryPaths) {
-            if (!path.empty()) {
-                result.temporarySurfacePaths.push_back(path);
-            }
-        }
-        return result;
-    };
 
     utils::Json request = utils::Json::object();
     request["request_type"] = "displacement_copy_grow";
-    request["tifxyz_path"] = job.tifxyzInputPath.toStdString();
+    request["store"] = job.store.toStdString();
+    request["surface_uuid"] = job.surfaceUuid;
+    request["geometry_revision"] = job.geometryRevision;
+    request["volume_uuid"] = job.volumeUuid;
     request["volume_path"] = job.volumeZarrPath.toStdString();
     request["volume_scale"] = std::max(0, job.volumeScale);
     request["checkpoint_path"] = job.checkpointPath.toStdString();
@@ -961,14 +362,14 @@ TracerGrowthResult runCopyDisplacementGrowth(const CopyDisplacementJob& job)
     request["tta_outlier_drop_thresh"] = job.ttaOutlierDropThresh;
 
     switch (job.ttaMode) {
-    case DenseTtaMode::Rotate3:
+    case TtaMode::Rotate3:
         request["tta"] = true;
         request["tta_transform"] = "rotate3";
         break;
-    case DenseTtaMode::None:
+    case TtaMode::None:
         request["tta"] = false;
         break;
-    case DenseTtaMode::Mirror:
+    case TtaMode::Mirror:
     default:
         request["tta"] = true;
         request["tta_transform"] = "mirror";
@@ -989,7 +390,7 @@ TracerGrowthResult runCopyDisplacementGrowth(const CopyDisplacementJob& job)
         response = sendSocketJsonRequest(job.socketPath, request);
     } catch (const std::exception& ex) {
         result.error = QStringLiteral("Displacement copy request failed: %1").arg(ex.what());
-        return finalizeResult();
+        return result;
     }
 
     if (response.contains("error")) {
@@ -1000,152 +401,28 @@ TracerGrowthResult runCopyDisplacementGrowth(const CopyDisplacementJob& job)
             serviceError = QString::fromStdString(response["error"].dump());
         }
         result.error = QStringLiteral("Displacement copy service error: %1").arg(serviceError);
-        return finalizeResult();
+        return result;
     }
 
-    if (!response.contains("output_tifxyz_paths") || !response["output_tifxyz_paths"].is_object()) {
-        result.error = QStringLiteral("Displacement copy response missing output_tifxyz_paths.");
-        return finalizeResult();
+    if (!response.contains("output_surfaces") || !response["output_surfaces"].is_object()) {
+        result.error = QStringLiteral("Displacement copy response missing output_surfaces.");
+        return result;
     }
 
-    const auto& outputs = response["output_tifxyz_paths"];
+    const auto& outputs = response["output_surfaces"];
     if (!outputs.contains("front") || !outputs["front"].is_string()) {
         result.error = QStringLiteral("Displacement copy response missing front output.");
-        return finalizeResult();
+        return result;
     }
     if (!outputs.contains("back") || !outputs["back"].is_string()) {
         result.error = QStringLiteral("Displacement copy response missing back output.");
-        return finalizeResult();
-    }
-
-    const QString frontPath = QString::fromStdString(outputs["front"].get_string());
-    const QString backPath = QString::fromStdString(outputs["back"].get_string());
-    if (!frontPath.isEmpty()) {
-        temporaryPaths.emplace_back(frontPath.toStdString());
-    }
-    if (!backPath.isEmpty()) {
-        temporaryPaths.emplace_back(backPath.toStdString());
-    }
-
-    result.statusMessage = QStringLiteral("Displacement copy completed");
-    return finalizeResult();
-}
-TracerGrowthResult runDenseDisplacementGrowth(const DenseDisplacementJob& job)
-{
-    TracerGrowthResult result;
-    std::vector<std::filesystem::path> temporaryPaths;
-    temporaryPaths.reserve(job.directions.size() + 1);
-    if (!job.tifxyzInputPath.isEmpty()) {
-        temporaryPaths.emplace_back(job.tifxyzInputPath.toStdString());
-    }
-
-    auto finalizeResult = [&]() -> TracerGrowthResult {
-        result.temporarySurfacePaths.clear();
-        result.temporarySurfacePaths.reserve(temporaryPaths.size());
-        for (const auto& path : temporaryPaths) {
-            if (!path.empty()) {
-                result.temporarySurfacePaths.push_back(path);
-            }
-        }
         return result;
-    };
-
-    QString currentInputPath = job.tifxyzInputPath;
-    QString finalOutputPath = job.tifxyzInputPath;
-
-    for (auto direction : job.directions) {
-        const auto directionToken = denseDirectionToToken(direction);
-        if (!directionToken.has_value()) {
-            continue;
-        }
-
-        utils::Json request = utils::Json::object();
-        request["request_type"] = "dense_displacement_grow";
-        request["tifxyz_path"] = currentInputPath.toStdString();
-        request["grow_direction"] = *directionToken;
-        request["iterations"] = std::max(1, job.iterations);
-        request["edge_input_rowscols"] = 40;
-        request["volume_path"] = job.volumeZarrPath.toStdString();
-        request["volume_scale"] = std::max(0, job.volumeScale);
-        request["checkpoint_path"] = job.checkpointPath.toStdString();
-        request["tta_merge_method"] = job.ttaMergeMethod.toStdString();
-        request["tta_outlier_drop_thresh"] = job.ttaOutlierDropThresh;
-        switch (job.ttaMode) {
-        case DenseTtaMode::Rotate3:
-            request["tta"] = true;
-            request["tta_transform"] = "rotate3";
-            break;
-        case DenseTtaMode::None:
-            request["tta"] = false;
-            break;
-        case DenseTtaMode::Mirror:
-        default:
-            request["tta"] = true;
-            request["tta_transform"] = "mirror";
-            break;
-        }
-
-        if (!job.customParams.is_null()) {
-            if (job.customParams.contains("dense_args") && job.customParams["dense_args"].is_object()) {
-                request["dense_args"] = job.customParams["dense_args"];
-            }
-            if (job.customParams.contains("dense_overrides") && job.customParams["dense_overrides"].is_object()) {
-                request["overrides"] = job.customParams["dense_overrides"];
-            }
-        }
-
-        utils::Json response;
-        try {
-            response = sendSocketJsonRequest(job.socketPath, request);
-        } catch (const std::exception& ex) {
-            result.error = QStringLiteral("Dense displacement request failed: %1").arg(ex.what());
-            return finalizeResult();
-        }
-
-        if (response.contains("error")) {
-            QString serviceError;
-            if (response["error"].is_string()) {
-                serviceError = QString::fromStdString(response["error"].get_string());
-            } else {
-                serviceError = QString::fromStdString(response["error"].dump());
-            }
-            result.error = QStringLiteral("Dense displacement service error: %1").arg(serviceError);
-            return finalizeResult();
-        }
-        if (!response.contains("output_tifxyz_path") || !response["output_tifxyz_path"].is_string()) {
-            result.error = QStringLiteral("Dense displacement response missing output_tifxyz_path.");
-            return finalizeResult();
-        }
-
-        finalOutputPath = QString::fromStdString(response["output_tifxyz_path"].get_string());
-        currentInputPath = finalOutputPath;
-        if (!finalOutputPath.isEmpty()) {
-            temporaryPaths.emplace_back(finalOutputPath.toStdString());
-        }
     }
 
-    if (finalOutputPath.isEmpty()) {
-        result.error = QStringLiteral("Dense displacement did not produce an output path.");
-        return finalizeResult();
-    }
-
-    std::unique_ptr<QuadSurface> loaded;
-    try {
-        loaded = load_quad_from_tifxyz(finalOutputPath.toStdString());
-    } catch (const std::exception& ex) {
-        result.error = QStringLiteral("Failed to load dense displacement output: %1").arg(ex.what());
-        return finalizeResult();
-    }
-    if (!loaded) {
-        result.error = QStringLiteral("Dense displacement output could not be loaded.");
-        return finalizeResult();
-    }
-
-    result.surface = loaded.release();
-    result.statusMessage = QStringLiteral("Dense displacement growth completed");
-    return finalizeResult();
+    result.createdSurfaces = {outputs["front"].get_string(), outputs["back"].get_string()};
+    result.statusMessage = QStringLiteral("Displacement copy completed");
+    return result;
 }
-
 } // namespace
 
 SegmentationGrower::SegmentationGrower(Context context,
@@ -1160,11 +437,6 @@ SegmentationGrower::SegmentationGrower(Context context,
 void SegmentationGrower::updateContext(Context context)
 {
     _context = std::move(context);
-}
-
-void SegmentationGrower::updateUiCallbacks(UiCallbacks callbacks)
-{
-    _callbacks = std::move(callbacks);
 }
 
 void SegmentationGrower::setSurfacePanel(SurfacePanelController* panel)
@@ -1203,149 +475,6 @@ bool SegmentationGrower::start(const VolumeContext& volumeContext,
     }
 
     ensureGenerationsChannel(segmentationSurface.get());
-
-    if (method == SegmentationGrowthMethod::PatchTracer) {
-        if (_context.module->growthInProgress()) {
-            showStatus(tr("Surface growth already in progress"), kStatusMedium);
-            return false;
-        }
-        if (!_context.widget->customParamsValid()) {
-            const QString errorText = _context.widget->customParamsError();
-            const QString message = errorText.isEmpty()
-                ? tr("Custom params JSON is invalid. Fix the contents and try again.")
-                : tr("Custom params JSON is invalid: %1").arg(errorText);
-            showStatus(message, kStatusLong);
-            return false;
-        }
-
-        const int sanitizedSteps = std::max(1, steps);
-        const SegmentationGrowthDirection effectiveDirection = inpaintOnly
-            ? SegmentationGrowthDirection::All
-            : direction;
-
-        SegmentationGrowthRequest request;
-        request.method = method;
-        request.direction = effectiveDirection;
-        request.steps = sanitizedSteps;
-        request.inpaintOnly = false;
-
-        if (auto overrideDirs = _context.module->takeShortcutDirectionOverride()) {
-            request.allowedDirections = std::move(*overrideDirs);
-        }
-        if (request.allowedDirections.empty()) {
-            request.allowedDirections = _context.widget->allowedGrowthDirections();
-        }
-        if (request.allowedDirections.empty()) {
-            request.allowedDirections = {
-                SegmentationGrowthDirection::Up,
-                SegmentationGrowthDirection::Down,
-                SegmentationGrowthDirection::Left,
-                SegmentationGrowthDirection::Right
-            };
-        }
-
-        request.customParams = _context.widget->patchTracerParamsJson();
-        auto customParams = _context.widget->customParamsJson();
-        if (!customParams.is_null()) {
-            if (request.customParams.is_null()) {
-                request.customParams = utils::Json::object();
-            }
-            for (auto it = customParams.begin(); it != customParams.end(); ++it) {
-                request.customParams[it.key()] = *it;
-            }
-        }
-
-        const QString defaultSource = defaultPatchTracerSourcePath(volumeContext.package);
-        QString sourcePath = _context.widget->patchTracerSourcePath().trimmed();
-        if (sourcePath.isEmpty()) {
-            sourcePath = defaultSource;
-        }
-        sourcePath = QDir::cleanPath(sourcePath);
-        SurfacePatchIndex* uiPatchIndex = _context.viewerManager ? _context.viewerManager->surfacePatchIndex() : nullptr;
-        std::vector<std::shared_ptr<QuadSurface>> uiMatchedSurfaces;
-        const bool useUiPatchIndex = uiPatchIndexMatchesSourceFolder(_context.state,
-                                                                     uiPatchIndex,
-                                                                     sourcePath,
-                                                                     uiMatchedSurfaces);
-
-        TracerGrowthContext ctx;
-        ctx.resumeSurface = segmentationSurface.get();
-        ctx.cacheRoot = cacheRootForVolumePkg(volumeContext.package);
-        ctx.voxelSize = volumeContext.activeVolume ? volumeContext.activeVolume->voxelSize() : 1.0;
-        if (volumeContext.package) {
-            ctx.volpkgRoot = std::filesystem::path(volumeContext.package->getVolpkgDirectory());
-            ctx.volumeIds = volumeContext.package->volumeIDs();
-        }
-
-        if (useUiPatchIndex) {
-            ctx.surfacePatchIndex = uiPatchIndex;
-            ctx.patchSurfaces = std::move(uiMatchedSurfaces);
-        } else if (_patchTracerCachedIndex &&
-                   sameFilesystemPath(sourcePath, _patchTracerCachedSourcePath)) {
-            ctx.surfacePatchIndex = _patchTracerCachedIndex.get();
-            ctx.patchSurfaces = _patchTracerCachedSurfaces;
-        }
-
-        qCInfo(lcSegGrowth) << "Patch Tracer requested"
-                            << "source" << sourcePath
-                            << "useUiPatchIndex" << useUiPatchIndex
-                            << "steps" << sanitizedSteps;
-
-        _running = true;
-        _context.module->setGrowthInProgress(true);
-
-        ActiveRequest pending;
-        pending.volumeContext = volumeContext;
-        pending.growthVolume = volumeContext.activeVolume;
-        pending.growthVolumeId = volumeContext.activeVolumeId;
-        pending.segmentationSurface = segmentationSurface;
-        pending.growthVoxelSize = ctx.voxelSize;
-        pending.usingCorrections = false;
-        pending.inpaintOnly = false;
-        _activeRequest = std::move(pending);
-
-        showStatus(useUiPatchIndex
-                       ? tr("Running Patch Tracer growth...")
-                       : (ctx.surfacePatchIndex
-                              ? tr("Running Patch Tracer growth with cached folder index...")
-                              : tr("Building Patch Tracer index and running growth...")),
-                   kStatusMedium);
-
-        auto future = QtConcurrent::run([request, ctx, sourcePath]() mutable {
-            try {
-                std::shared_ptr<SurfacePatchIndex> builtIndex;
-                std::vector<std::shared_ptr<QuadSurface>> builtSurfaces;
-                if (!ctx.surfacePatchIndex) {
-                    builtSurfaces = loadPatchTracerSurfacesFromFolder(sourcePath, ctx.resumeSurface);
-                    builtIndex = buildPatchTracerIndex(builtSurfaces, ctx.resumeSurface);
-                    ctx.surfacePatchIndex = builtIndex.get();
-                    ctx.patchSurfaces = builtSurfaces;
-                }
-                TracerGrowthResult result = runPatchTracerGrowth(request, ctx);
-                if (builtIndex) {
-                    result.patchTracerCacheSourcePath = sourcePath;
-                    result.patchTracerCachedSurfaces = std::move(builtSurfaces);
-                    result.patchTracerCachedIndex = std::move(builtIndex);
-                }
-                return result;
-            } catch (const std::exception& e) {
-                qCWarning(lcSegGrowth) << "Patch Tracer worker failed:" << e.what();
-                TracerGrowthResult result;
-                result.error = QStringLiteral("Patch Tracer failed: %1").arg(e.what());
-                return result;
-            } catch (...) {
-                qCWarning(lcSegGrowth) << "Patch Tracer worker failed with an unknown exception";
-                TracerGrowthResult result;
-                result.error = QStringLiteral("Patch Tracer failed with an unknown exception");
-                return result;
-            }
-        });
-        _watcher = std::make_unique<QFutureWatcher<TracerGrowthResult>>(this);
-        connect(_watcher.get(), &QFutureWatcher<TracerGrowthResult>::finished,
-                this, &SegmentationGrower::onFutureFinished);
-        _watcher->setFuture(future);
-        return true;
-    }
 
     std::shared_ptr<Volume> growthVolume;
     std::string growthVolumeId = volumeContext.requestedVolumeId;
@@ -1469,151 +598,7 @@ bool SegmentationGrower::start(const VolumeContext& volumeContext,
             request.customParams["normal_grid_level"] = growthScale;
         }
     }
-    const bool manualAddTracerMask = !request.allowedGrowthMask.empty();
     const bool neuralTracerEnabled = _context.widget->neuralTracerEnabled();
-    const bool denseMode = neuralTracerEnabled &&
-        !inpaintOnly &&
-        _context.widget->neuralModelType() == NeuralTracerModelType::DenseDisplacement &&
-        !manualAddTracerMask;
-
-    if (denseMode) {
-        const QString denseCheckpointPath = _context.widget->denseCheckpointPath().trimmed();
-        const QString pythonPath = _context.widget->neuralPythonPath();
-        const QString volumeZarr = _context.widget->volumeZarrPath().trimmed();
-        const int volumeScale = _context.widget->neuralVolumeScale();
-        const DenseTtaMode denseTtaMode = _context.widget->denseTtaMode();
-        const QString denseTtaMergeMethod = _context.widget->denseTtaMergeMethod().trimmed();
-        const double denseTtaOutlierDropThresh = _context.widget->denseTtaOutlierDropThresh();
-        const auto outputMode = _context.widget->neuralOutputMode();
-
-        if (denseCheckpointPath.isEmpty()) {
-            showStatus(tr("Dense displacement requires a dense checkpoint path."), kStatusLong);
-            return false;
-        }
-        const bool usingDenseLatestPreset = denseCheckpointPath == kDenseLatestSentinel;
-        if (!usingDenseLatestPreset &&
-            (!QFileInfo::exists(denseCheckpointPath) || !QFileInfo(denseCheckpointPath).isFile())) {
-            showStatus(tr("Dense checkpoint does not exist: %1").arg(denseCheckpointPath), kStatusLong);
-            return false;
-        }
-        if (volumeZarr.isEmpty()) {
-            showStatus(tr("Dense displacement requires a volume zarr path."), kStatusLong);
-            return false;
-        }
-
-        auto& serviceManager = NeuralTraceServiceManager::instance();
-        showStatus(tr("Starting neural trace service for dense displacement..."), kStatusLong);
-        if (!serviceManager.ensureServiceRunning(denseCheckpointPath, volumeZarr, volumeScale, pythonPath)) {
-            const QString error = serviceManager.lastError();
-            showStatus(tr("Failed to start neural trace service: %1").arg(error), kStatusLong);
-            return false;
-        }
-        const QString socketPath = serviceManager.socketPath();
-        if (socketPath.isEmpty()) {
-            showStatus(tr("Neural trace service is running but socket path is unavailable."), kStatusLong);
-            return false;
-        }
-
-        const auto denseDirections = resolveDenseDirections(effectiveDirection, request.allowedDirections);
-        if (denseDirections.empty()) {
-            showStatus(tr("No valid dense growth directions are enabled."), kStatusLong);
-            return false;
-        }
-
-        const QString segmentationPath = QString::fromStdString(segmentationSurface->path.string());
-        const QString denseSnapshotDir = segmentationPath.isEmpty()
-            ? QString()
-            : QFileInfo(segmentationPath).dir().absolutePath();
-        const QString denseInputPath = createDenseSnapshotPath(denseSnapshotDir);
-        try {
-            // QuadSurface::save mutates the instance path/id/meta. Preserve and restore
-            // so taking a dense snapshot does not retarget the live segmentation surface.
-            const std::filesystem::path originalSurfacePath = segmentationSurface->path;
-            const std::string originalSurfaceId = segmentationSurface->id;
-            utils::Json originalSurfaceMeta = segmentationSurface->meta;
-
-            const auto restoreLiveSurfaceState = [&]() {
-                segmentationSurface->path = originalSurfacePath;
-                segmentationSurface->id = originalSurfaceId;
-                segmentationSurface->meta = originalSurfaceMeta;
-            };
-
-            try {
-                segmentationSurface->saveAsNew(denseInputPath.toStdString(), false);
-            } catch (...) {
-                restoreLiveSurfaceState();
-                throw;
-            }
-            restoreLiveSurfaceState();
-        } catch (const std::exception& ex) {
-            showStatus(tr("Failed to prepare dense displacement input: %1").arg(ex.what()), kStatusLong);
-            return false;
-        }
-
-        DenseDisplacementJob denseJob;
-        denseJob.socketPath = socketPath;
-        denseJob.tifxyzInputPath = denseInputPath;
-        denseJob.volumeZarrPath = volumeZarr;
-        denseJob.volumeScale = volumeScale;
-        denseJob.iterations = std::max(1, sanitizedSteps);
-        denseJob.checkpointPath = denseCheckpointPath;
-        denseJob.ttaMode = denseTtaMode;
-        denseJob.ttaMergeMethod = denseTtaMergeMethod.isEmpty()
-            ? QStringLiteral("vector_geomedian")
-            : denseTtaMergeMethod;
-        denseJob.ttaOutlierDropThresh = std::max(0.01, denseTtaOutlierDropThresh);
-        if (!request.customParams.is_null())
-            denseJob.customParams = request.customParams;
-        denseJob.directions = denseDirections;
-
-        qCInfo(lcSegGrowth) << "Dense displacement enabled:"
-                            << "socket" << socketPath
-                            << "iterations" << denseJob.iterations
-                            << "directions" << static_cast<int>(denseDirections.size());
-
-        _running = true;
-        _context.module->setGrowthInProgress(true);
-
-        ActiveRequest pending;
-        pending.volumeContext = volumeContext;
-        pending.growthVolume = growthVolume;
-        pending.growthVolumeId = growthVolumeId;
-        pending.segmentationSurface = segmentationSurface;
-        pending.growthVoxelSize = growthVolume->voxelSize();
-        pending.usingCorrections = false;
-        pending.inpaintOnly = inpaintOnly;
-        pending.denseDisplacement = true;
-        pending.denseCreateNewSegment = outputMode == NeuralTracerOutputMode::CreateNewSegment;
-        _activeRequest = std::move(pending);
-
-        showStatus(
-            outputMode == NeuralTracerOutputMode::CreateNewSegment
-                ? tr("Running dense displacement (create new segment)...")
-                : tr("Running dense displacement (overwrite current segment)..."),
-            kStatusMedium);
-
-        auto future = QtConcurrent::run([denseJob]() {
-            try {
-                return runDenseDisplacementGrowth(denseJob);
-            } catch (const std::exception& e) {
-                qCWarning(lcSegGrowth) << "Dense displacement worker failed:" << e.what();
-                TracerGrowthResult result;
-                result.error = QStringLiteral("Dense displacement failed: %1").arg(e.what());
-                return result;
-            } catch (...) {
-                qCWarning(lcSegGrowth) << "Dense displacement worker failed with an unknown exception";
-                TracerGrowthResult result;
-                result.error = QStringLiteral("Dense displacement failed with an unknown exception");
-                return result;
-            }
-        });
-        _watcher = std::make_unique<QFutureWatcher<TracerGrowthResult>>(this);
-        connect(_watcher.get(), &QFutureWatcher<TracerGrowthResult>::finished,
-                this, &SegmentationGrower::onFutureFinished);
-        _watcher->setFuture(future);
-        return true;
-    }
-
     // Heatmap neural tracer integration - pass neural_socket when enabled, GrowPatch will use it as needed
     if (neuralTracerEnabled && !inpaintOnly) {
         const QString checkpointPath = _context.widget->neuralCheckpointPath();
@@ -1688,14 +673,8 @@ bool SegmentationGrower::start(const VolumeContext& volumeContext,
     ctx.cacheRoot = cacheRootForVolumePkg(volumeContext.package);
     ctx.voxelSize = growthVolume->voxelSize();
     ctx.normalGridPath = volumeContext.normalGridPath;
-    ctx.normal3dZarrPath = volumeContext.normal3dZarrPath;
     ctx.allowedGrowthMask = request.allowedGrowthMask;
 
-    // Populate fields for corrections annotation saving
-    if (volumeContext.package) {
-        ctx.volpkgRoot = std::filesystem::path(volumeContext.package->getVolpkgDirectory());
-        ctx.volumeIds = volumeContext.package->volumeIDs();
-    }
     ctx.growthVolumeId = growthVolumeId;
 
     if (ctx.cacheRoot.isEmpty()) {
@@ -1751,11 +730,7 @@ bool SegmentationGrower::start(const VolumeContext& volumeContext,
         auto bounds = computeCorrectionsBounds(corrections, segmentationSurface.get());
         if (bounds) {
             pending.correctionsBounds = bounds;
-            pending.beforeCrop = cropSurfaceToGridRegion(segmentationSurface.get(), bounds->gridRegion);
-            if (pending.beforeCrop) {
-                qCInfo(lcSegGrowth) << "Captured before-crop for corrections annotation:"
-                                    << bounds->gridRegion.width << "x" << bounds->gridRegion.height;
-            }
+            pending.beforePin = _context.module ? _context.module->storePin(segmentationSurface.get()) : std::nullopt;
         }
     }
 
@@ -1791,19 +766,6 @@ void SegmentationGrower::finalize(bool ok)
     }
     _running = false;
     _activeRequest.reset();
-}
-
-void SegmentationGrower::handleFailure(const QString& message)
-{
-    auto showStatus = [&](const QString& text, int timeout) {
-        if (_callbacks.showStatus) {
-            _callbacks.showStatus(text, timeout);
-        }
-    };
-    if (!message.isEmpty()) {
-        showStatus(message, kStatusLong);
-    }
-    finalize(false);
 }
 
 bool SegmentationGrower::startCopyWithNt(const VolumeContext& volumeContext)
@@ -1867,9 +829,9 @@ bool SegmentationGrower::startCopyWithNt(const VolumeContext& volumeContext)
     const QString pythonPath = _context.widget->neuralPythonPath();
     const QString volumeZarr = _context.widget->volumeZarrPath().trimmed();
     const int volumeScale = _context.widget->neuralVolumeScale();
-    const DenseTtaMode ttaMode = _context.widget->denseTtaMode();
-    const QString ttaMergeMethod = _context.widget->denseTtaMergeMethod().trimmed();
-    const double ttaOutlierDropThresh = _context.widget->denseTtaOutlierDropThresh();
+    const TtaMode ttaMode = _context.widget->ttaMode();
+    const QString ttaMergeMethod = _context.widget->ttaMergeMethod().trimmed();
+    const double ttaOutlierDropThresh = _context.widget->ttaOutlierDropThresh();
     const bool usingCopyLatestPreset = copyCheckpointPath == kCopyLatestSentinel;
 
     if (copyCheckpointPath.isEmpty()) {
@@ -1900,31 +862,30 @@ bool SegmentationGrower::startCopyWithNt(const VolumeContext& volumeContext)
         return false;
     }
 
-    const QString segmentationPath = QString::fromStdString(segmentationSurface->path.string());
-    const QString snapshotDir = segmentationPath.isEmpty()
-        ? QString()
-        : QFileInfo(segmentationPath).dir().absolutePath();
-    const QString snapshotPath = createDenseSnapshotPath(snapshotDir);
+    // The service reads the stored surface: publish unsaved edits first, then
+    // pin the revision on screen. Its outputs are new surfaces in the same store.
+    auto* catalog = _surfacePanel ? _surfacePanel->catalog() : nullptr;
+    if (!catalog || !catalog->attachment() || !catalog->volume()) {
+        showStatus(tr("Displacement copy needs an attached object store and an open volume."), kStatusLong);
+        return false;
+    }
+    const auto autosave = _context.module->autosaveStatus();
+    if ((autosave.pending || autosave.saveInProgress) && !_context.module->saveSurface(segmentationSurface.get())) {
+        showStatus(tr("Save the surface's edits before using Copy with NT."), kStatusLong);
+        return false;
+    }
+    const auto pin = _context.module->storePin(segmentationSurface.get());
+    const auto* row = catalog->row(segmentationSurface->id);
+    if (!pin || !pin->geometryRevision || !row || !row->bound()) {
+        showStatus(tr("Copy with NT needs a surface of the writable object store that opens in the current volume."),
+                   kStatusLong);
+        return false;
+    }
+    SurfaceCatalog::ToolStore toolStore;
     try {
-        const std::filesystem::path originalSurfacePath = segmentationSurface->path;
-        const std::string originalSurfaceId = segmentationSurface->id;
-        utils::Json originalSurfaceMeta2 = segmentationSurface->meta;
-
-        const auto restoreLiveSurfaceState = [&]() {
-            segmentationSurface->path = originalSurfacePath;
-            segmentationSurface->id = originalSurfaceId;
-            segmentationSurface->meta = originalSurfaceMeta2;
-        };
-
-        try {
-            segmentationSurface->saveAsNew(snapshotPath.toStdString(), false);
-        } catch (...) {
-            restoreLiveSurfaceState();
-            throw;
-        }
-        restoreLiveSurfaceState();
-    } catch (const std::exception& ex) {
-        showStatus(tr("Failed to prepare displacement copy input: %1").arg(ex.what()), kStatusLong);
+        toolStore = catalog->toolStore();
+    } catch (const std::exception& error) {
+        showStatus(QString::fromUtf8(error.what()), kStatusLong);
         return false;
     }
 
@@ -1932,7 +893,12 @@ bool SegmentationGrower::startCopyWithNt(const VolumeContext& volumeContext)
 
     CopyDisplacementJob copyJob;
     copyJob.socketPath = socketPath;
-    copyJob.tifxyzInputPath = snapshotPath;
+    copyJob.store = QString::fromStdString(toolStore.store.string());
+    copyJob.surfaceUuid = pin->object.objectUuid;
+    copyJob.geometryRevision = *pin->geometryRevision;
+    // The service works in level-0 voxels of the zarr it is given, not in the
+    // open volume's working level: the store volume's own voxels.
+    copyJob.volumeUuid = toolStore.volume.volume;
     copyJob.volumeZarrPath = volumeZarr;
     copyJob.volumeScale = volumeScale;
     copyJob.checkpointPath = copyCheckpointPath;
@@ -1954,8 +920,6 @@ bool SegmentationGrower::startCopyWithNt(const VolumeContext& volumeContext)
     pending.growthVoxelSize = growthVolume->voxelSize();
     pending.usingCorrections = false;
     pending.inpaintOnly = false;
-    pending.denseDisplacement = false;
-    pending.denseCreateNewSegment = true;
     pending.copyDisplacement = true;
     _activeRequest = std::move(pending);
 
@@ -1984,93 +948,6 @@ bool SegmentationGrower::startCopyWithNt(const VolumeContext& volumeContext)
     return true;
 }
 
-// Compute bounding box of cells that changed between two point matrices
-// Returns bounds in the NEW surface's coordinate system
-static cv::Rect computeChangedBounds(const cv::Mat_<cv::Vec3f>& oldPts,
-                                     const cv::Mat_<cv::Vec3f>& newPts)
-{
-    // Handle size differences - the new surface may have padding around it
-    // The old content is centered in the new surface
-    const int padX = (newPts.cols - oldPts.cols) / 2;
-    const int padY = (newPts.rows - oldPts.rows) / 2;
-
-    int minRow = newPts.rows, maxRow = -1;
-    int minCol = newPts.cols, maxCol = -1;
-
-    // Compare the overlapping region (old surface embedded in new)
-    for (int oldRow = 0; oldRow < oldPts.rows; ++oldRow) {
-        const int newRow = oldRow + padY;
-        if (newRow < 0 || newRow >= newPts.rows) continue;
-
-        for (int oldCol = 0; oldCol < oldPts.cols; ++oldCol) {
-            const int newCol = oldCol + padX;
-            if (newCol < 0 || newCol >= newPts.cols) continue;
-
-            const auto& o = oldPts(oldRow, oldCol);
-            const auto& n = newPts(newRow, newCol);
-            if (o[0] != n[0] || o[1] != n[1] || o[2] != n[2]) {
-                minRow = std::min(minRow, newRow);
-                maxRow = std::max(maxRow, newRow);
-                minCol = std::min(minCol, newCol);
-                maxCol = std::max(maxCol, newCol);
-            }
-        }
-    }
-
-    // Check padding cells for valid (non-empty) content that was added
-    // Invalid points have x == -1
-    auto isValid = [](const cv::Vec3f& p) { return p[0] != -1.0f; };
-
-    // Check top/bottom padding rows
-    for (int row = 0; row < padY && row < newPts.rows; ++row) {
-        for (int col = 0; col < newPts.cols; ++col) {
-            if (isValid(newPts(row, col))) {
-                minRow = std::min(minRow, row);
-                maxRow = std::max(maxRow, row);
-                minCol = std::min(minCol, col);
-                maxCol = std::max(maxCol, col);
-            }
-        }
-    }
-    for (int row = newPts.rows - padY; row < newPts.rows; ++row) {
-        if (row < 0) continue;
-        for (int col = 0; col < newPts.cols; ++col) {
-            if (isValid(newPts(row, col))) {
-                minRow = std::min(minRow, row);
-                maxRow = std::max(maxRow, row);
-                minCol = std::min(minCol, col);
-                maxCol = std::max(maxCol, col);
-            }
-        }
-    }
-    // Check left/right padding cols
-    for (int row = 0; row < newPts.rows; ++row) {
-        for (int col = 0; col < padX && col < newPts.cols; ++col) {
-            if (isValid(newPts(row, col))) {
-                minRow = std::min(minRow, row);
-                maxRow = std::max(maxRow, row);
-                minCol = std::min(minCol, col);
-                maxCol = std::max(maxCol, col);
-            }
-        }
-        for (int col = newPts.cols - padX; col < newPts.cols; ++col) {
-            if (col < 0) continue;
-            if (isValid(newPts(row, col))) {
-                minRow = std::min(minRow, row);
-                maxRow = std::max(maxRow, row);
-                minCol = std::min(minCol, col);
-                maxCol = std::max(maxCol, col);
-            }
-        }
-    }
-
-    if (maxRow < 0) {
-        return cv::Rect();  // No changes
-    }
-
-    return cv::Rect(minCol, minRow, maxCol - minCol + 1, maxRow - minRow + 1);
-}
-
 void SegmentationGrower::onFutureFinished()
 {
     if (!_watcher) {
@@ -2095,182 +972,30 @@ void SegmentationGrower::onFutureFinished()
     ActiveRequest request = std::move(*_activeRequest);
     _activeRequest.reset();
 
-    if (result.patchTracerCachedIndex && !result.patchTracerCacheSourcePath.isEmpty()) {
-        _patchTracerCachedSourcePath = result.patchTracerCacheSourcePath;
-        _patchTracerCachedSurfaces = result.patchTracerCachedSurfaces;
-        _patchTracerCachedIndex = result.patchTracerCachedIndex;
-    }
-
-    auto cleanupDisplacementTemporarySurfaces = [&](const std::filesystem::path& preservePath = std::filesystem::path()) {
-        if (!request.denseDisplacement && !request.copyDisplacement) {
-            return;
-        }
-        if (result.temporarySurfacePaths.empty()) {
-            return;
-        }
-
-        const std::filesystem::path preserved = preservePath.lexically_normal();
-        std::unordered_set<std::string> visited;
-        for (const auto& rawPath : result.temporarySurfacePaths) {
-            if (rawPath.empty()) {
-                continue;
-            }
-            const std::filesystem::path candidate = rawPath.lexically_normal();
-            if (!preserved.empty() && candidate == preserved) {
-                continue;
-            }
-
-            const std::string key = candidate.string();
-            if (!visited.insert(key).second) {
-                continue;
-            }
-
-            std::error_code existsEc;
-            if (!std::filesystem::exists(candidate, existsEc) || existsEc) {
-                continue;
-            }
-
-            std::error_code rmEc;
-            std::filesystem::remove_all(candidate, rmEc);
-            if (rmEc) {
-                qCInfo(lcSegGrowth) << "Failed to remove displacement temporary surface"
-                                    << QString::fromStdString(candidate.string())
-                                    << QString::fromStdString(rmEc.message());
-            }
-        }
-    };
-
     if (!result.error.isEmpty()) {
         qCInfo(lcSegGrowth) << "Tracer growth error" << result.error;
-        cleanupDisplacementTemporarySurfaces(request.segmentationSurface
-                                                 ? request.segmentationSurface->path
-                                                 : std::filesystem::path());
         showStatus(result.error, kStatusLong);
         finalize(false);
         return;
     }
 
     if (request.copyDisplacement) {
-        if (!request.volumeContext.package) {
-            showStatus(tr("Displacement copy requires an active volume package."), kStatusLong);
-            cleanupDisplacementTemporarySurfaces();
-            finalize(false);
-            return;
-        }
-
-        if (result.temporarySurfacePaths.size() < 3) {
+        // The service created the surfaces; they reach the panel through commit events.
+        if (result.createdSurfaces.size() != 2) {
             showStatus(tr("Displacement copy did not produce front/back outputs."), kStatusLong);
-            cleanupDisplacementTemporarySurfaces();
             finalize(false);
             return;
         }
-
-        const std::filesystem::path frontPath = result.temporarySurfacePaths[result.temporarySurfacePaths.size() - 2];
-        const std::filesystem::path backPath = result.temporarySurfacePaths.back();
-        if (frontPath.empty() || backPath.empty()) {
-            showStatus(tr("Displacement copy did not produce front/back outputs."), kStatusLong);
-            cleanupDisplacementTemporarySurfaces();
-            finalize(false);
-            return;
-        }
-
-        std::unique_ptr<QuadSurface> frontSurface;
-        std::unique_ptr<QuadSurface> backSurface;
-        try {
-            frontSurface = load_quad_from_tifxyz(frontPath.string());
-            backSurface = load_quad_from_tifxyz(backPath.string());
-        } catch (const std::exception& ex) {
-            showStatus(tr("Failed to load displacement copy outputs: %1").arg(ex.what()), kStatusLong);
-            cleanupDisplacementTemporarySurfaces();
-            finalize(false);
-            return;
-        }
-        if (!frontSurface || !backSurface) {
-            showStatus(tr("Failed to load displacement copy outputs."), kStatusLong);
-            cleanupDisplacementTemporarySurfaces();
-            finalize(false);
-            return;
-        }
-
-        const std::filesystem::path volpkgRoot(request.volumeContext.package->getVolpkgDirectory());
-        const std::string segmentationDir = request.volumeContext.package->getSegmentationDirectory();
-        const std::filesystem::path segmentsDir = volpkgRoot / segmentationDir;
-        std::error_code mkdirEc;
-        std::filesystem::create_directories(segmentsDir, mkdirEc);
-        if (mkdirEc) {
-            showStatus(tr("Failed to create %1 directory for displacement copy: %2")
-                           .arg(QString::fromStdString(segmentationDir))
-                           .arg(QString::fromStdString(mkdirEc.message())),
-                       kStatusLong);
-            cleanupDisplacementTemporarySurfaces();
-            finalize(false);
-            return;
-        }
-
-        auto persistAsNewSegment = [&](QuadSurface* surface, const std::string& fallbackBaseId) -> std::optional<std::string> {
-            if (!surface) {
-                return std::nullopt;
-            }
-            const std::string baseId = sanitizeSegmentId(surface->id.empty() ? fallbackBaseId : surface->id);
-            const std::string newSegmentId = makeUniqueSegmentId(segmentsDir, baseId);
-            const std::filesystem::path newSegmentPath = segmentsDir / newSegmentId;
-            try {
-                vc3d::opendata::copyVolumeCoordinateIdentityToSurface(
-                    *surface, *request.volumeContext.package,
-                    request.volumeContext.activeVolumeId);
-                surface->saveAsNew(newSegmentPath, false);
-            } catch (const std::exception& ex) {
-                showStatus(tr("Failed to save displacement copy result: %1").arg(ex.what()), kStatusLong);
-                return std::nullopt;
-            }
-
-            if (!request.volumeContext.package->addSingleSegmentation(newSegmentId)) {
-                request.volumeContext.package->refreshSegmentations();
-            }
-            return newSegmentId;
-        };
-
-        const auto frontId = persistAsNewSegment(frontSurface.get(), "copy_displacement_front");
-        const auto backId = persistAsNewSegment(backSurface.get(), "copy_displacement_back");
-        if (!frontId || !backId) {
-            cleanupDisplacementTemporarySurfaces();
-            finalize(false);
-            return;
-        }
-
-        cleanupDisplacementTemporarySurfaces();
-
-        if (_surfacePanel) {
-            _surfacePanel->addSingleSegmentation(*frontId);
-            _surfacePanel->refreshSurfaceMetrics(*frontId);
-            _surfacePanel->addSingleSegmentation(*backId);
-            _surfacePanel->refreshSurfaceMetrics(*backId);
-        } else if (_context.state) {
-            auto loadedFront = request.volumeContext.package->loadSurface(*frontId);
-            if (loadedFront) {
-                _context.state->setSurface(*frontId, loadedFront, true, false);
-            }
-            auto loadedBack = request.volumeContext.package->loadSurface(*backId);
-            if (loadedBack) {
-                _context.state->setSurface(*backId, loadedBack, true, false);
-            }
-        }
-
-        refreshSegmentationViewers(_context.viewerManager);
-        showStatus(
-            tr("Displacement copy created new segments '%1' and '%2'.")
-                .arg(QString::fromStdString(*frontId))
-                .arg(QString::fromStdString(*backId)),
-            kStatusLong);
+        showStatus(tr("Displacement copy created surfaces %1 (front) and %2 (back).")
+                       .arg(QString::fromStdString(result.createdSurfaces[0]),
+                            QString::fromStdString(result.createdSurfaces[1])),
+                   kStatusLong);
         finalize(true);
         return;
     }
 
     if (!result.surface) {
         qCInfo(lcSegGrowth) << "Tracer growth returned null surface";
-        cleanupDisplacementTemporarySurfaces(request.segmentationSurface
-                                                 ? request.segmentationSurface->path
-                                                 : std::filesystem::path());
         showStatus(tr("Tracer growth did not return a surface."), kStatusMedium);
         finalize(false);
         return;
@@ -2287,81 +1012,11 @@ void SegmentationGrower::onFutureFinished()
         return;
     }
 
-    if (request.denseDisplacement && request.denseCreateNewSegment) {
-        if (!request.volumeContext.package) {
-            showStatus(tr("Dense displacement new-segment mode requires an active volume package."), kStatusLong);
-            cleanupDisplacementTemporarySurfaces();
-            delete result.surface;
-            finalize(false);
-            return;
-        }
-
-        const std::filesystem::path volpkgRoot(request.volumeContext.package->getVolpkgDirectory());
-        const std::string segmentationDir = request.volumeContext.package->getSegmentationDirectory();
-        const std::filesystem::path segmentsDir = volpkgRoot / segmentationDir;
-        std::error_code mkdirEc;
-        std::filesystem::create_directories(segmentsDir, mkdirEc);
-        if (mkdirEc) {
-            showStatus(tr("Failed to create %1 directory for new segment: %2")
-                           .arg(QString::fromStdString(segmentationDir))
-                           .arg(QString::fromStdString(mkdirEc.message())),
-                       kStatusLong);
-            cleanupDisplacementTemporarySurfaces();
-            delete result.surface;
-            finalize(false);
-            return;
-        }
-
-        const std::string baseId = sanitizeSegmentId(
-            result.surface->id.empty() ? std::string("dense_displacement") : result.surface->id);
-        const std::string newSegmentId = makeUniqueSegmentId(segmentsDir, baseId);
-        const std::filesystem::path newSegmentPath = segmentsDir / newSegmentId;
-
-        try {
-            vc3d::opendata::copyVolumeCoordinateIdentityToSurface(
-                *result.surface, *request.volumeContext.package,
-                request.volumeContext.activeVolumeId);
-            result.surface->saveAsNew(newSegmentPath, false);
-        } catch (const std::exception& ex) {
-            showStatus(tr("Failed to save dense displacement result: %1").arg(ex.what()), kStatusLong);
-            cleanupDisplacementTemporarySurfaces();
-            delete result.surface;
-            finalize(false);
-            return;
-        }
-
-        if (!request.volumeContext.package->addSingleSegmentation(newSegmentId)) {
-            request.volumeContext.package->refreshSegmentations();
-        }
-
-        cleanupDisplacementTemporarySurfaces(newSegmentPath);
-        delete result.surface;
-
-        if (_surfacePanel) {
-            _surfacePanel->addSingleSegmentation(newSegmentId);
-            _surfacePanel->refreshSurfaceMetrics(newSegmentId);
-        } else if (_context.state) {
-            auto loadedSurface = request.volumeContext.package->loadSurface(newSegmentId);
-            if (loadedSurface) {
-                _context.state->setSurface(newSegmentId, loadedSurface, true, false);
-            }
-        }
-
-        refreshSegmentationViewers(_context.viewerManager);
-        showStatus(
-            tr("Dense displacement created new segment '%1'.")
-                .arg(QString::fromStdString(newSegmentId)),
-            kStatusLong);
-        finalize(true);
-        return;
-    }
-
-    const double voxelSize = request.growthVoxelSize;
     cv::Mat generations = result.surface->channel("generations");
 
-    std::vector<SurfacePatchIndex::SurfacePtr> surfacesToUpdate;
+    std::vector<std::shared_ptr<QuadSurface>> surfacesToUpdate;
     surfacesToUpdate.reserve(3);
-    auto appendUniqueSurface = [&](const SurfacePatchIndex::SurfacePtr& surface) {
+    auto appendUniqueSurface = [&](const std::shared_ptr<QuadSurface>& surface) {
         if (!surface) {
             return;
         }
@@ -2379,21 +1034,10 @@ void SegmentationGrower::onFutureFinished()
     cv::Mat_<cv::Vec3f>* primaryPoints = primarySurface ? primarySurface->rawPointsPtr() : nullptr;
     cv::Mat_<cv::Vec3f>* resultPoints = result.surface->rawPointsPtr();
 
-    // Compute the changed region before swapping points (for efficient R-tree update)
-    // Only use region update when sizes match; otherwise grid coordinates shift
-    cv::Rect changedBounds;
-    bool sizeChanged = false;
     if (primarySurface && primaryPoints && resultPoints) {
-        sizeChanged = (primaryPoints->size() != resultPoints->size());
-        if (!sizeChanged) {
-            changedBounds = computeChangedBounds(*primaryPoints, *resultPoints);
-            qCInfo(lcSegGrowth) << "Changed bounds:" << changedBounds.x << changedBounds.y
-                                << changedBounds.width << "x" << changedBounds.height
-                                << "(surface:" << resultPoints->cols << "x" << resultPoints->rows << ")";
-        } else {
+        if (primaryPoints->size() != resultPoints->size()) {
             qCInfo(lcSegGrowth) << "Surface size changed:" << primaryPoints->cols << "x" << primaryPoints->rows
-                                << "->" << resultPoints->cols << "x" << resultPoints->rows
-                                << "- using full update";
+                                << "->" << resultPoints->cols << "x" << resultPoints->rows;
         }
     }
 
@@ -2424,54 +1068,8 @@ void SegmentationGrower::onFutureFinished()
             targetSurface->invalidateCache();
         }
 
-        // The grown result replaces the target's meta below; the target keeps
-        // its object identity.
-        const std::string preservedUuid = targetSurface->objectUuid();
-        utils::Json preservedTags = utils::Json::object();
-        bool hadPreservedTags = false;
-        if (!targetSurface->meta.is_null() && targetSurface->meta.is_object()) {
-            if (targetSurface->meta.contains("tags") && targetSurface->meta["tags"].is_object()) {
-                preservedTags = targetSurface->meta["tags"];
-                hadPreservedTags = true;
-            }
-        }
-
         if (!generations.empty()) {
             targetSurface->setChannel("generations", generations);
-        }
-
-        // Copy preserved approval mask from result surface
-        cv::Mat approval = result.surface->channel("approval", SURF_CHANNEL_NORESIZE);
-        if (!approval.empty()) {
-            targetSurface->setChannel("approval", approval);
-        }
-
-        if (!result.surface->meta.is_null()) {
-            targetSurface->meta = result.surface->meta;
-        } else {
-            ensureSurfaceMetaObject(targetSurface);
-        }
-
-        if (hadPreservedTags && !targetSurface->meta.is_null() && targetSurface->meta.is_object()) {
-            utils::Json mergedTags = preservedTags;
-            if (targetSurface->meta.contains("tags") && targetSurface->meta["tags"].is_object()) {
-                mergedTags.update(targetSurface->meta["tags"]);
-            }
-            targetSurface->meta["tags"] = mergedTags;
-        }
-        if (!preservedUuid.empty() && targetSurface->meta.is_object()) {
-            targetSurface->meta["uuid"] = preservedUuid;
-        }
-
-        updateSegmentationSurfaceMetadata(targetSurface, voxelSize);
-
-        // Refresh intersection index for this surface so renderIntersections() has up-to-date data
-        if (_context.viewerManager) {
-            if (!changedBounds.empty()) {
-                _context.viewerManager->refreshSurfacePatchIndex(targetSurfacePtr, changedBounds);
-            } else {
-                _context.viewerManager->refreshSurfacePatchIndex(targetSurfacePtr);
-            }
         }
     }
 
@@ -2488,49 +1086,17 @@ void SegmentationGrower::onFutureFinished()
     if (surfaceToPersist) {
         surfaceToPersist->invalidateMask();
     }
+    // The grid (and its validity) changed: an edit's draft follows it; without
+    // an edit the grown surface is saved below.
+    if (sessionActive) {
+        _context.module->publishEditDraft();
+    }
 
     if (!sessionActive) {
-        try {
-            if (surfaceToPersist) {
-                ensureSurfaceMetaObject(surfaceToPersist);
-                surfaceToPersist->saveOverwrite();
-
-                // Dense overwrite mode persists an updated segment in-place;
-                // force reload from disk so in-app references observe the new geometry.
-                if (request.denseDisplacement && !request.denseCreateNewSegment) {
-                    std::shared_ptr<QuadSurface> reloadedSurface;
-                    const std::string persistedId = surfaceToPersist->id;
-
-                    if (request.volumeContext.package && !persistedId.empty()) {
-                        request.volumeContext.package->unloadSurface(persistedId);
-                        reloadedSurface = request.volumeContext.package->loadSurface(persistedId);
-                    }
-
-                    if (!reloadedSurface && !surfaceToPersist->path.empty()) {
-                        try {
-                            auto loadedFromDisk = load_quad_from_tifxyz(surfaceToPersist->path.string());
-                            if (loadedFromDisk) {
-                                reloadedSurface.reset(loadedFromDisk.release());
-                            }
-                        } catch (const std::exception& ex) {
-                            qCInfo(lcSegGrowth) << "Dense overwrite reload fallback failed" << ex.what();
-                        }
-                    }
-
-                    if (reloadedSurface) {
-                        if (_context.state && !persistedId.empty() && _context.state->surface(persistedId)) {
-                            _context.state->setSurface(persistedId, reloadedSurface, true, false);
-                        }
-                        request.segmentationSurface = reloadedSurface;
-                        surfaceToPersist = reloadedSurface.get();
-                    } else {
-                        qCInfo(lcSegGrowth) << "Dense overwrite reload skipped; using in-memory geometry";
-                    }
-                }
+        if (surfaceToPersist && _context.module) {
+            if (!_context.module->saveSurface(surfaceToPersist)) {
+                showStatus(tr("Failed to save the grown segmentation to the object store."), kStatusLong);
             }
-        } catch (const std::exception& ex) {
-            qCInfo(lcSegGrowth) << "Failed to save tracer result" << ex.what();
-            showStatus(tr("Failed to save segmentation: %1").arg(ex.what()), kStatusLong);
         }
     } else if (_context.module) {
         _context.module->requestAutosaveFromGrowth();
@@ -2551,7 +1117,6 @@ void SegmentationGrower::onFutureFinished()
 
     if (_context.state) {
         _context.state->setSurface("segmentation", request.segmentationSurface, false, true);
-        // Note: SurfacePatchIndex is automatically updated via handleSurfaceChanged signal
     }
 
     if (!resetDefaults.empty()) {
@@ -2591,43 +1156,6 @@ void SegmentationGrower::onFutureFinished()
         currentSegSurface = request.segmentationSurface.get();
     }
 
-    // Update approval tool after surface replacement (handles case with no active editing session)
-    if (_context.module) {
-        _context.module->updateApprovalToolAfterGrowth(currentSegSurface);
-    }
-
-    QuadSurface* metaSurface = surfaceToPersist ? surfaceToPersist : request.segmentationSurface.get();
-    synchronizeSurfaceMeta(request.volumeContext.package, metaSurface, _surfacePanel);
-
-    if (_surfacePanel) {
-        std::vector<std::string> idsToRefresh;
-        idsToRefresh.reserve(surfacesToUpdate.size() + 1);
-
-        auto maybeAddId = [&idsToRefresh](QuadSurface* surface) {
-            if (!surface) {
-                return;
-            }
-            const std::string& surfaceId = surface->id;
-            if (surfaceId.empty()) {
-                return;
-            }
-            if (std::find(idsToRefresh.begin(), idsToRefresh.end(), surfaceId) == idsToRefresh.end()) {
-                idsToRefresh.push_back(surfaceId);
-            }
-        };
-
-        for (const auto& surface : surfacesToUpdate) {
-            maybeAddId(surface.get());
-        }
-        maybeAddId(currentSegSurface);
-        if (_context.module && _context.module->hasActiveSession()) {
-            maybeAddId(_context.module->activeBaseSurfaceShared().get());
-        }
-
-        for (const auto& id : idsToRefresh) {
-            _surfacePanel->refreshSurfaceMetrics(id);
-        }
-    }
 
     if (_callbacks.applySliceOrientation) {
         _callbacks.applySliceOrientation(currentSegSurface);
@@ -2635,30 +1163,29 @@ void SegmentationGrower::onFutureFinished()
 
     refreshSegmentationViewers(_context.viewerManager);
 
-    // Save corrections annotation if we have a before-crop and bounds
-    if (request.usingCorrections && request.beforeCrop && request.correctionsBounds) {
-        // Crop the "after" surface using the same grid region
-        auto afterCrop = cropSurfaceToGridRegion(primarySurface ? primarySurface : request.segmentationSurface.get(),
-                                                  request.correctionsBounds->gridRegion);
-        if (afterCrop) {
-            // Get volpkg root from the package
-            std::filesystem::path volpkgRoot;
-            std::vector<std::string> volumeIds;
-            if (request.volumeContext.package) {
-                volpkgRoot = std::filesystem::path(request.volumeContext.package->getVolpkgDirectory());
-                volumeIds = request.volumeContext.package->volumeIDs();
-            }
-
-            if (!volpkgRoot.empty()) {
-                saveCorrectionsAnnotation(
-                    volpkgRoot,
-                    request.segmentationSurface ? request.segmentationSurface->id : "",
-                    request.beforeCrop.get(),
-                    afterCrop.get(),
-                    request.corrections,
-                    volumeIds,
-                    request.growthVolumeId,
-                    *request.correctionsBounds);
+    // Keep the growth's corrections with the revisions before and after it.
+    auto* annotated = primarySurface ? primarySurface : request.segmentationSurface.get();
+    if (request.usingCorrections && request.beforePin && request.correctionsBounds && _context.module && annotated &&
+        _context.state && _context.state->currentVolume() && _context.module->saveSurface(annotated)) {
+        if (const auto afterPin = _context.module->storePin(annotated)) {
+            vc3d::corrections::GrowthAnnotation annotation;
+            annotation.surfaceUuid = afterPin->object.objectUuid;
+            annotation.beforeGeometry = request.beforePin->geometryRevision.value_or("");
+            annotation.afterGeometry = afterPin->geometryRevision.value_or("");
+            annotation.volumeUsed = request.growthVolumeId;
+            const auto& bounds = *request.correctionsBounds;
+            annotation.gridRegion = {bounds.gridRegion.x, bounds.gridRegion.y, bounds.gridRegion.width, bounds.gridRegion.height};
+            annotation.boundsMin = {bounds.worldMin[0], bounds.worldMin[1], bounds.worldMin[2]};
+            annotation.boundsMax = {bounds.worldMax[0], bounds.worldMax[1], bounds.worldMax[2]};
+            for (const auto& collection : request.corrections.collections)
+                for (const auto& point : collection.points)
+                    annotation.points.push_back({collection.id, point.id, collection.name,
+                                                 {point.p[0], point.p[1], point.p[2]}, int64_t(point.creation_time)});
+            try {
+                vc3d::corrections::writeGrowthAnnotation(*_context.state->objectStoreSession(), afterPin->attachment, annotation,
+                                                         _context.state->annotationVolume().value_or(vc::project::AnnotationVolume{}));
+            } catch (const std::exception& ex) {
+                qCWarning(lcSegGrowth) << "Failed to save the corrections annotation:" << ex.what();
             }
         }
     }
@@ -2673,10 +1200,8 @@ void SegmentationGrower::onFutureFinished()
             float offsetY = result.surface->meta["grid_offset"][static_cast<size_t>(1)].get_float();
             if (offsetX != 0.0f || offsetY != 0.0f) {
                 _context.module->applyCorrectionAnchorOffset(offsetX, offsetY);
-                // Save corrections with updated anchors to the new surface path
-                if (surfaceToPersist && !surfaceToPersist->path.empty()) {
-                    _context.module->saveCorrectionPoints(surfaceToPersist->path);
-                }
+                // The anchors moved with the grown grid.
+                _context.module->saveCorrections();
             }
         }
     }
@@ -2686,7 +1211,6 @@ void SegmentationGrower::onFutureFinished()
     }
 
     qCInfo(lcSegGrowth) << "Tracer growth completed successfully";
-    cleanupDisplacementTemporarySurfaces(surfaceToPersist ? surfaceToPersist->path : std::filesystem::path());
     delete result.surface;
 
     QString message;

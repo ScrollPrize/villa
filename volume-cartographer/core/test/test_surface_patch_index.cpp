@@ -14,15 +14,15 @@
 
 #include <filesystem>
 #include <memory>
-#include <random>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 namespace fs = std::filesystem;
 
 namespace {
 
-cv::Mat_<cv::Vec3f> makePlanarGrid(int rows, int cols, float z = 0.f)
+cv::Mat_<cv::Vec3f> makePlanarGrid(int rows, int cols, float z = 1.f)
 {
     cv::Mat_<cv::Vec3f> m(rows, cols);
     for (int r = 0; r < rows; ++r)
@@ -31,18 +31,9 @@ cv::Mat_<cv::Vec3f> makePlanarGrid(int rows, int cols, float z = 0.f)
     return m;
 }
 
-std::shared_ptr<QuadSurface> makeSurface(int rows = 16, int cols = 16, float z = 0.f)
+std::shared_ptr<QuadSurface> makeSurface(int rows = 16, int cols = 16, float z = 1.f)
 {
     return std::make_shared<QuadSurface>(makePlanarGrid(rows, cols, z), cv::Vec2f(1.f, 1.f));
-}
-
-fs::path tmpDir(const std::string& tag)
-{
-    std::mt19937_64 rng(std::random_device{}());
-    auto p = fs::temp_directory_path() /
-             ("vc_spi_" + tag + "_" + std::to_string(rng()));
-    fs::create_directories(p);
-    return p;
 }
 
 } // namespace
@@ -58,7 +49,7 @@ TEST_CASE("Default ctor is empty")
 TEST_CASE("rebuild populates surface and patch counts")
 {
     SurfacePatchIndex idx;
-    auto a = makeSurface(8, 8, 0.f);
+    auto a = makeSurface(8, 8, 1.f);
     auto b = makeSurface(8, 8, 5.f);
     idx.rebuild({a, b});
     CHECK_FALSE(idx.empty());
@@ -97,7 +88,7 @@ TEST_CASE("locate point on the surface yields a result")
     idx.rebuild({a});
 
     SurfacePatchIndex::PointQuery q;
-    q.worldPoint = cv::Vec3f(4.f, 4.f, 0.f); // on the plane
+    q.worldPoint = cv::Vec3f(4.f, 4.f, 1.f); // on the plane
     q.tolerance = 0.5f;
     auto r = idx.locate(q);
     REQUIRE(r.has_value());
@@ -120,11 +111,11 @@ TEST_CASE("locate point off-surface returns nullopt")
 TEST_CASE("locateAll returns all hits within tolerance")
 {
     SurfacePatchIndex idx;
-    auto a = makeSurface(16, 16, 0.f);
-    auto b = makeSurface(16, 16, 0.f); // coincident
+    auto a = makeSurface(16, 16, 1.f);
+    auto b = makeSurface(16, 16, 1.f); // coincident
     idx.rebuild({a, b});
     SurfacePatchIndex::PointQuery q;
-    q.worldPoint = cv::Vec3f(4.f, 4.f, 0.f);
+    q.worldPoint = cv::Vec3f(4.f, 4.f, 1.f);
     q.tolerance = 0.5f;
     auto rs = idx.locateAll(q);
     CHECK(rs.size() >= 1);
@@ -136,7 +127,7 @@ TEST_CASE("locateSurfaces deduplicates surface results")
     auto a = makeSurface(16, 16);
     idx.rebuild({a});
     SurfacePatchIndex::PointQuery q;
-    q.worldPoint = cv::Vec3f(4.f, 4.f, 0.f);
+    q.worldPoint = cv::Vec3f(4.f, 4.f, 1.f);
     q.tolerance = 0.5f;
     auto ss = idx.locateSurfaces(q);
     CHECK_FALSE(ss.empty());
@@ -150,8 +141,8 @@ TEST_CASE("forEachTriangle with TriangleQuery visits triangles inside the bounds
     idx.rebuild({a});
 
     SurfacePatchIndex::TriangleQuery q;
-    q.bounds.low = cv::Vec3f(0, 0, -1);
-    q.bounds.high = cv::Vec3f(8, 8, 1);
+    q.bounds.low = cv::Vec3f(0, 0, 0);
+    q.bounds.high = cv::Vec3f(8, 8, 2);
     int count = 0;
     idx.forEachTriangle(q,
         [&](const SurfacePatchIndex::TriangleCandidate& tc) {
@@ -256,47 +247,15 @@ TEST_CASE("generation advances after updateSurface")
 TEST_CASE("computePlaneIntersections returns segments for an intersecting plane")
 {
     SurfacePatchIndex idx;
-    auto a = makeSurface(16, 16, 0.f);
+    auto a = makeSurface(16, 16, 1.f);
     idx.rebuild({a});
 
-    PlaneSurface plane(cv::Vec3f(0, 0, 0), cv::Vec3f(0, 0, 1));
+    PlaneSurface plane(cv::Vec3f(0, 0, 1), cv::Vec3f(0, 0, 1));
     std::unordered_set<SurfacePatchIndex::SurfacePtr> targets{a};
     auto result = idx.computePlaneIntersections(plane, cv::Rect(0, 0, 16, 16), targets);
     // For a Z=0 surface intersected by Z=0 plane, every triangle should
     // produce a segment. We don't pin the count; just that something came back.
     CHECK_FALSE(result.empty());
-}
-
-TEST_CASE("cacheKeyForSurfaces is stable for the same input")
-{
-    auto a = makeSurface(8, 8);
-    auto b = makeSurface(8, 8, 1.f);
-    auto k1 = SurfacePatchIndex::cacheKeyForSurfaces({a, b}, /*stride=*/1, /*padding=*/0.0f);
-    auto k2 = SurfacePatchIndex::cacheKeyForSurfaces({a, b}, 1, 0.0f);
-    CHECK(k1 == k2);
-    // Different stride yields different key.
-    auto k3 = SurfacePatchIndex::cacheKeyForSurfaces({a, b}, 2, 0.0f);
-    CHECK(k3 != k1);
-}
-
-TEST_CASE("save/load cache round-trips empty index")
-{
-    auto d = tmpDir("cache");
-    auto cache = d / "spi.cache";
-    auto a = makeSurface(8, 8);
-    {
-        SurfacePatchIndex idx;
-        idx.rebuild({a});
-        auto key = SurfacePatchIndex::cacheKeyForSurfaces({a}, idx.samplingStride(), 0.0f);
-        CHECK(idx.saveCache(cache, key));
-    }
-    SurfacePatchIndex idx2;
-    auto key = SurfacePatchIndex::cacheKeyForSurfaces({a}, idx2.samplingStride(), 0.0f);
-    bool loaded = idx2.loadCache(cache, {a}, key);
-    if (loaded) {
-        CHECK(idx2.surfaceCount() == 1);
-    }
-    fs::remove_all(d);
 }
 
 TEST_CASE("Move ctor / assignment transfer state")
@@ -310,4 +269,52 @@ TEST_CASE("Move ctor / assignment transfer state")
     SurfacePatchIndex c;
     c = std::move(b);
     CHECK(c.surfaceCount() == 1);
+}
+
+TEST_CASE("locate with SurfaceFilter include and exclude")
+{
+    const auto seg = fs::path(VC_TEST_FIXTURES_DIR) / "segments" / "20241113070770";
+    if (!fs::exists(seg / "meta.json")) return;
+    auto a = std::make_shared<QuadSurface>(seg);
+    a->ensureLoaded();
+    auto b = std::make_shared<QuadSurface>(seg); // same fixture, distinct surface
+    b->ensureLoaded();
+
+    SurfacePatchIndex idx;
+    idx.rebuild({a, b});
+
+    SurfacePatchIndex::PointQuery q;
+    auto bb = a->bbox();
+    q.worldPoint = (bb.low + bb.high) * 0.5f;
+    q.tolerance = 5.0f;
+
+    std::unordered_set<SurfacePatchIndex::SurfacePtr> incl{a};
+    q.surfaces.include = &incl;
+    auto rs = idx.locateAll(q);
+    // All results (if any) must be surface a.
+    for (const auto& r : rs) CHECK(r.surface == a);
+
+    std::unordered_set<SurfacePatchIndex::SurfacePtr> excl{a};
+    SurfacePatchIndex::PointQuery q2;
+    q2.worldPoint = q.worldPoint;
+    q2.tolerance = q.tolerance;
+    q2.surfaces.exclude = &excl;
+    auto rs2 = idx.locateAll(q2);
+    for (const auto& r : rs2) CHECK(r.surface != a);
+
+    std::unordered_set<QuadSurface*> rawIncl{a.get()};
+    SurfacePatchIndex::PointQuery q3;
+    q3.worldPoint = q.worldPoint;
+    q3.tolerance = q.tolerance;
+    q3.surfaces.includeRaw = &rawIncl;
+    auto rs3 = idx.locateAll(q3);
+    for (const auto& r : rs3) CHECK(r.surface == a);
+
+    std::unordered_set<QuadSurface*> rawExcl{a.get()};
+    SurfacePatchIndex::PointQuery q4;
+    q4.worldPoint = q.worldPoint;
+    q4.tolerance = q.tolerance;
+    q4.surfaces.excludeRaw = &rawExcl;
+    auto rs4 = idx.locateAll(q4);
+    for (const auto& r : rs4) CHECK(r.surface != a);
 }

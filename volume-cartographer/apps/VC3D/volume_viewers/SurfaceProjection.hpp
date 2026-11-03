@@ -63,7 +63,8 @@ inline float depthBandDistance(const cv::Vec3f& point,
 // cannot drift out of sync with the viewer.
 struct SurfaceProjectionContext {
     const Surface* surface{nullptr};
-    std::uint64_t patchIndexGeneration{0};
+    // Bumped by every edit of the viewer's surface.
+    std::uint64_t surfaceEditEpoch{0};
     float depthLo{0.0f};
     float depthHi{0.0f};
     // A plane can be moved while keeping the same Surface pointer, so its
@@ -75,7 +76,7 @@ struct SurfaceProjectionContext {
     bool operator==(const SurfaceProjectionContext& other) const
     {
         return surface == other.surface &&
-               patchIndexGeneration == other.patchIndexGeneration &&
+               surfaceEditEpoch == other.surfaceEditEpoch &&
                depthLo == other.depthLo &&
                depthHi == other.depthHi &&
                planeOrigin == other.planeOrigin &&

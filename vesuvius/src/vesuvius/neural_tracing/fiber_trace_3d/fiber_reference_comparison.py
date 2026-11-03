@@ -181,9 +181,10 @@ def visualization_offset(settings,reference,fitted,weights):
 def load_metric_projection(path,d,config=None):
     """Load existing geometry-only projection; fail on mismatched piece identity."""
     if config is not None:
+        from vesuvius.neural_tracing.tracers.shared.annotations.fiber_store import fibers_digest
         signature=json.loads(Path(path).with_name('projection_signature.json').read_text())
-        if signature['afv']!=uv.sha256_file(config['afv']):
-            raise ValueError('Reference projection AFV provenance mismatch')
+        if signature['fibers']!=fibers_digest(config['fibers']):
+            raise ValueError('Reference projection fiber provenance mismatch')
     with np.load(path) as src:
         for key in ('source_id','start','end'):
             if not np.array_equal(src[key],d[key]):raise ValueError('Reference projection identity mismatch')
@@ -199,7 +200,7 @@ def prepare_metric_cache(d,projection):
     if cache is None or cache['identity']!=identity:
         direction=(d['node_ds'][:,2]-d['node_ds'][:,0])/d['lengths']
         ds=(projection['arc']-d['start'][owner])*direction[owner]
-        starts=np.r_[0,np.flatnonzero(np.diff(d['source_id']))+1,len(d['family'])]
+        starts=np.r_[0,np.flatnonzero(d['source_id'][1:]!=d['source_id'][:-1])+1,len(d['family'])]
         cache=projection['_metric_cache']=dict(starts=starts,identity=identity,
             displacement=(d['family'][owner]==0)*ds,offsets=projection['offset'][starts])
     return cache
@@ -322,11 +323,11 @@ class Surface:
 
 
 def samples(d, cfg, spacing):
-    from vesuvius.neural_tracing.tracers.shared.annotations.afv import read_afv_polylines
-    source_ids = np.unique(d['source_id']); curves = read_afv_polylines(cfg['afv'], source_ids)
+    from vesuvius.neural_tracing.tracers.shared.annotations.fiber_store import read_polylines
+    source_ids = np.unique(d['source_id']); curves = read_polylines(cfg['fibers'], source_ids)
     counts=[]; xyzs=[]; arcs=[]; weights=[]
     # Source pieces are sorted by source and arc in the tensor cache.
-    if np.any(np.diff(d['source_id']) < 0): raise ValueError('Unsorted source pieces')
+    if np.any(d['source_id'][1:] < d['source_id'][:-1]): raise ValueError('Unsorted source pieces')
     for row, xyz in curves:
         sid = row['id']; arc = np.r_[0., np.cumsum(np.linalg.norm(np.diff(xyz,axis=0),axis=1))]
         first = np.searchsorted(d['source_id'], sid, side='left')
@@ -339,7 +340,7 @@ def samples(d, cfg, spacing):
             xyzs.append(np.stack([np.interp(s,arc,xyz[:,axis]) for axis in range(3)],axis=1))
             delta=np.diff(s); weights.append(np.r_[delta[0]/2,(delta[:-1]+delta[1:])/2,delta[-1]/2])
     counts=np.asarray(counts)
-    if len(counts)!=len(d['source_id']):raise ValueError('Missing AFV geometry')
+    if len(counts)!=len(d['source_id']):raise ValueError('Missing source fiber geometry')
     return dict(xyz=np.concatenate(xyzs).astype(np.float32),arc=np.concatenate(arcs),weight=np.concatenate(weights),
                 owner=np.repeat(np.arange(len(counts)),counts),offset=np.r_[0,np.cumsum(counts)])
 
@@ -348,7 +349,7 @@ def assign_sources(d, sample, reference_q, distance, maximum, limits=None):
     winding = discrete_winding(reference_q,limits)
     winding = np.where(distance<=maximum,winding,np.nan)
     chosen = np.full(len(d['source_id']),np.nan)
-    starts = np.r_[0,np.flatnonzero(np.diff(d['source_id']))+1,len(d['source_id'])]
+    starts = np.r_[0,np.flatnonzero(d['source_id'][1:]!=d['source_id'][:-1])+1,len(d['source_id'])]
     for a,b in zip(starts[:-1],starts[1:]):
         lo,hi=sample['offset'][[a,b]]
         chosen[a:b]=weighted_median(winding[lo:hi],sample['weight'][lo:hi])
@@ -650,7 +651,8 @@ def run(settings):
     if not uv.anchored(cfg):raise ValueError('Reference comparison requires shared-anchor geometry')
     keys=('source_id','start','end','family','node_ds','lengths','phase','z')
     with np.load(cfg['tensor_cache']) as src:d={k:src[k] for k in keys}
-    signature=dict(afv=uv.sha256_file(cfg['afv']),reference={c:uv.sha256_file(surface.root/(c+'.tif')) for c in 'xyz'},
+    from vesuvius.neural_tracing.tracers.shared.annotations.fiber_store import fibers_digest
+    signature=dict(fibers=fibers_digest(cfg['fibers']),reference={c:uv.sha256_file(surface.root/(c+'.tif')) for c in 'xyz'},
                    metadata=uv.sha256_file(surface.root/'meta.json'),
                    parameters={k:settings.get(k) for k in ('xyz_scale','surface_stride','sample_spacing_base','max_distance_base','candidates')},
                    version=2)
@@ -668,7 +670,7 @@ def run(settings):
             rc=src['nearest_rc'];distance=src['nearest_distance'];ref_q=src['nearest_q'];chosen=src['chosen_winding']
             placed=src['placed_rc'];placed_dist=src['placed_distance']
     else:
-        print('reference: sampling original AFV curves',flush=True)
+        print('reference: sampling original source fiber curves',flush=True)
         sample=samples(d,cfg,settings.get('sample_spacing_base',200.))
         print(f'reference: {len(sample["xyz"]):,} curve samples',flush=True)
         rc,distance=surface.project(sample['xyz'])
@@ -765,7 +767,7 @@ def run(settings):
             writer.writerows(zip(range(len(keep)),d['source_id'],d['start'],d['end'],keep,chosen,inverse_u(u,widths)+offset,p[np.arange(len(p)),pick]))
         uv.atomic_write(dest/'summary.json',report,durable=False);reports.append(report)
     uv.atomic_write(root/'summary.json',dict(config=settings,results=reports,seconds=time.monotonic()-started,
-        reference_metadata_sha256=uv.sha256_file(surface.root/'meta.json'),afv_sha256=uv.sha256_file(cfg['afv']),
+        reference_metadata_sha256=uv.sha256_file(surface.root/'meta.json'),fibers_digest=signature['fibers'],
         implementation_sha256=uv.sha256_file(__file__),landmark_columns=surface.x.tolist(),landmark_windings=surface.q.tolist(),
         notes='Approximate triangle patches; bounded nearest-center candidates; rectangle winding labels; no path optimization; original-source median before restricted projection'),durable=False)
     return reports

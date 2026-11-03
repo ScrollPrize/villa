@@ -1,8 +1,8 @@
 #pragma once
 
-#include "SegmentationGrowth.hpp"
+#include <vc_object_store/objects/ObjectStoreSession.hpp>
 
-#include "vc/core/util/SurfacePatchIndex.hpp"
+#include "SegmentationGrowth.hpp"
 
 #include <QFutureWatcher>
 #include <QObject>
@@ -58,7 +58,6 @@ public:
         std::string activeVolumeId;
         std::string requestedVolumeId;
         QString normalGridPath;
-        QString normal3dZarrPath;
     };
 
     SegmentationGrower(Context context,
@@ -66,7 +65,6 @@ public:
                        QObject* parent = nullptr);
 
     void updateContext(Context context);
-    void updateUiCallbacks(UiCallbacks callbacks);
     void setSurfacePanel(SurfacePanelController* panel);
 
     bool start(const VolumeContext& volumeContext,
@@ -89,19 +87,17 @@ private:
         double growthVoxelSize{0.0};
         bool usingCorrections{false};
         bool inpaintOnly{false};
-        bool denseDisplacement{false};
-        bool denseCreateNewSegment{false};
         bool copyDisplacement{false};
         bool manualAddPreview{false};
         std::optional<cv::Rect> correctionsAffectedBounds;
         // For corrections annotation saving
         std::optional<CorrectionsBounds> correctionsBounds;
-        std::unique_ptr<QuadSurface> beforeCrop;
+        // The surface's store revisions when the growth started.
+        std::optional<vc::objects::PinnedObject> beforePin;
         SegmentationCorrectionsPayload corrections;
     };
 
     void finalize(bool ok);
-    void handleFailure(const QString& message);
     void onFutureFinished();
 
     Context _context;
@@ -110,7 +106,4 @@ private:
     bool _running{false};
     std::unique_ptr<QFutureWatcher<TracerGrowthResult>> _watcher;
     std::optional<ActiveRequest> _activeRequest;
-    QString _patchTracerCachedSourcePath;
-    std::vector<std::shared_ptr<QuadSurface>> _patchTracerCachedSurfaces;
-    std::shared_ptr<SurfacePatchIndex> _patchTracerCachedIndex;
 };

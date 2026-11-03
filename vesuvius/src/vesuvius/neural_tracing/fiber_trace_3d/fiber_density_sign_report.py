@@ -137,7 +137,7 @@ def run(settings):
             rows[-1].update(mean_wrong_probability=float(wrong_probability[eligible].mean()) if count else None,
                 above_threshold_percent=float(100*(wrong_probability[eligible]>config.get('sign_probability_threshold',0.)).mean()) if count else None)
     bad=np.flatnonzero(signed&(order<0))
-    events=[dict(event=int(e),source_a=int(d['source_id'][i[e]]),source_b=int(d['source_id'][j[e]]),
+    events=[dict(event=int(e),source_a=str(d['source_id'][i[e]]),source_b=str(d['source_id'][j[e]]),
                  parallel=bool(d['parallel'][e]),signed_order=float(order[e]),both_enabled=bool(cohorts['both_enabled'][e]),
                  both_confident=bool(cohorts['both_joint_above_half'][e])) for e in bad]
     atomic_write(out/'violations.json',events,durable=False)

@@ -11,6 +11,7 @@ import json
 import os
 import subprocess
 import sys
+import uuid
 
 import numpy as np
 import pytest
@@ -52,12 +53,12 @@ def _segment():
     }
 
 
-def _fiber_doc(zyx, control_every, tag, branches=None, version=3):
+def _fiber_doc(zyx, control_every, tag, branches=None, version=4):
     line_xyz = _to_file_xyz(zyx)
     control_indices = list(range(0, len(line_xyz), control_every))
     if control_indices[-1] != len(line_xyz) - 1:
         control_indices.append(len(line_xyz) - 1)
-    if version == 3:
+    if version == 4:
         controls = []
         for k, i in enumerate(control_indices):
             entry = {'position': line_xyz[i]}
@@ -67,7 +68,7 @@ def _fiber_doc(zyx, control_every, tag, branches=None, version=3):
     else:
         controls = [line_xyz[i] for i in control_indices]
     return {
-        'type': 'vc3d_fiber', 'version': version, 'generation': 3,
+        'type': 'vc3d_fiber', 'version': version, 'uuid': str(uuid.uuid4()), 'generation': 3,
         'optimization_mode': 'native_fiber_trace3d',
         'line_points': line_xyz, 'control_points': controls,
         'branches': branches or [],
@@ -110,13 +111,13 @@ def dataset(tmp_path):
     o_doc, o_controls = _fiber_doc(o_zyx, 50, 'H')
     last_v = len(v_controls) - 1
     o_doc['branches'].append({
-        'control_point_index': 0, 'branch_fiber_id': 0, 'branch_control_point_index': last_v,
+        'control_point_index': 0, 'target_uuid': v_doc['uuid'], 'branch_control_point_index': last_v,
         'control_point_direction': [1.0, 0.0, 0.0], 'branch_control_point_direction': [0.0, 0.0, 1.0],
         'control_point_position': o_doc['line_points'][0],
         'branch_control_point_position': v_doc['line_points'][v_controls[-1]],
         'branch_file': 'test_20260101T000000000_000007.json'})
     v_doc['branches'].append({
-        'control_point_index': last_v, 'branch_fiber_id': 0, 'branch_control_point_index': 0,
+        'control_point_index': last_v, 'target_uuid': o_doc['uuid'], 'branch_control_point_index': 0,
         'control_point_direction': [0.0, 0.0, 1.0], 'branch_control_point_direction': [1.0, 0.0, 0.0],
         'control_point_position': v_doc['line_points'][v_controls[-1]],
         'branch_control_point_position': o_doc['line_points'][0],
@@ -194,6 +195,8 @@ def test_dry_run_writes_nothing_and_apply_writes_valid_reciprocal_links(dataset)
     hv = [b for b in h['branches'] if b['branch_file'] == 'test_20260101T000000000_000007.json']
     vh = [b for b in v['branches'] if b['branch_file'] == 'horizontal.json']
     assert len(hv) == 1 and len(vh) == 1
+    assert hv[0]['target_uuid'] == v['uuid'] and vh[0]['target_uuid'] == h['uuid']
+    assert 'branch_fiber_id' not in hv[0] and 'branch_fiber_id' not in vh[0]
     assert hv[0]['control_point_index'] == vh[0]['branch_control_point_index']
     assert vh[0]['control_point_index'] == hv[0]['branch_control_point_index']
     assert h['control_points'][hv[0]['control_point_index']]['position'] == hv[0]['control_point_position']

@@ -85,8 +85,8 @@ bool isVolumeChunk(const fs::path& path, const fs::path& root)
         return false;
     for (const auto& component : relative) {
         const auto value = component.string();
-        if (value == "segments" || value == "normal_grids" ||
-            value == "normal-grid" || value == "projects")
+        if (value == "normal_grids" || value == "normal-grid" ||
+            value == "projects")
             return false;
     }
     const auto levelName = level.filename().string();

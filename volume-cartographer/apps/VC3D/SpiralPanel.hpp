@@ -65,7 +65,6 @@ signals:
     void previewDiagnosticsChanged(bool enabled);
     void windingRangeChanged(int minimum, int maximum);
     void surfaceIntersectionsChanged(bool shown);
-    void surfaceIntersectionStrideChanged(int stride);
     void surfaceOverlapChanged(bool shown);
     void pclOverlayChanged(vc3d::spiral::PclRole role, bool shown);
     void pointViewToleranceChanged(double tolerance);
@@ -89,7 +88,6 @@ private:
     QJsonObject runAdvancedConfig() const;
     void applyTrackSamplingConfig(QJsonObject& config) const;
     void syncTrackSamplingControlsFromAdvanced();
-    void writeTrackSamplingControlsToAdvanced();
     void updateTrackSamplingUi();
     void syncVerticalFiberOffsetControls(const QJsonObject& effectiveConfig);
     void applySessionRunConfig(const QJsonObject& config, qint64 sessionGeneration);
@@ -126,7 +124,6 @@ private:
     QHash<QString, QLineEdit*> _paths;
     QHash<QString, QToolButton*> _pathBrowseButtons;
     QHash<QString, QCheckBox*> _visibilityChecks;
-    QHash<QString, bool> _pathDirectories;
     QDialog* _displayDialog = nullptr;
     QSpinBox* _minimumDisplayedWinding = nullptr;
     QSpinBox* _maximumDisplayedWinding = nullptr;

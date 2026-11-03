@@ -208,16 +208,22 @@ jobs:
         run: |
           set -euo pipefail
 
+          # Retag the old release before moving stable; its assets stay in place.
+          # An interrupted publication may require manual recovery.
+          release_id="$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/stable" --jq '.id')"
+          git fetch --no-tags origin refs/tags/stable
+          old_oid="$(git rev-parse FETCH_HEAD)"
+          archive_tag="vc3d-archive-stable-$release_id"
+          # A non-forced push accepts an identical alias but never overwrites one.
+          git push origin "$old_oid:refs/tags/$archive_tag"
+          gh api --method PATCH "repos/$GITHUB_REPOSITORY/releases/$release_id" \
+            -f "tag_name=$archive_tag" >/dev/null
+
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git tag --force --annotate stable "$PROMOTION_SHA" \
             --message "VC3D stable release at $PROMOTION_SHA"
-          git push --force origin refs/tags/stable
-
-          # The stable channel changes only through this manual workflow.
-          if gh release view stable >/dev/null 2>&1; then
-            gh release delete stable --yes
-          fi
+          git push --force-with-lease="refs/tags/stable:$old_oid" origin refs/tags/stable
 
       - name: Publish stable release
         shell: bash

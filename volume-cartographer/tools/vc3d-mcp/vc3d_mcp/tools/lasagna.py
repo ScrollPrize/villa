@@ -37,9 +37,9 @@ async def vc3d_lasagna_ensure_service(
 ) -> dict[str, Any]:
     """Ensure a Lasagna fit service is available, starting or connecting to one
     as needed. This service powers ONLY the vc3d_lasagna_* optimization panel;
-    fiber tracing (vc3d_fiber_launch) and atlas creation do NOT use it -- they
-    need a "lasagna"-kind dataset resolvable for the current volume, not this
-    service. Two modes, selected by whether host+port are given:
+    fiber tracing (vc3d_fiber_launch) does NOT use it -- it needs a
+    "lasagna"-kind dataset resolvable for the current volume, not this service.
+    Two modes, selected by whether host+port are given:
 
     - Internal (default): omit both host and port. Launches a local service
     process (optionally using python_path as the interpreter) and blocks until
@@ -67,9 +67,9 @@ async def vc3d_lasagna_ensure_service(
 async def vc3d_lasagna_list_datasets() -> dict[str, Any]:
     """List the datasets the Lasagna fit service knows about -- the optimization
     panel's server-side datasets, NOT the "lasagna"-kind dataset that
-    vc3d_fiber_launch / atlas creation resolve for the current volume. Requires
-    the service to be running (see vc3d_lasagna_ensure_service). Deferred
-    (~10 s cap) while the service is queried.
+    vc3d_fiber_launch resolves for the current volume. Requires the service to
+    be running (see vc3d_lasagna_ensure_service). Deferred (~10 s cap) while the
+    service is queried.
 
     Returns {"datasets": [...]} -- the service's dataset objects passed through
     verbatim (the bridge does not reshape service JSON). Errors: -32005 (service
@@ -80,11 +80,9 @@ async def vc3d_lasagna_list_datasets() -> dict[str, Any]:
 
 @mcp.tool()
 async def vc3d_lasagna_start_optimization(
-    mode: Literal["reoptimize", "new_model", "offset", "atlas"],
+    mode: Literal["reoptimize", "new_model", "offset"],
     config_path: Optional[str] = None,
     seed: Optional[_Vec3] = None,
-    atlas_path: Optional[str] = None,
-    init_shell_dir: Optional[str] = None,
     wait: bool = False,
     ctx: Optional[Context] = None,
 ) -> dict[str, Any]:
@@ -92,17 +90,12 @@ async def vc3d_lasagna_start_optimization(
     source:"lasagna" job -- poll vc3d_job_status, or pass wait=true). Requires
     the Lasagna service running and the Lasagna panel constructed.
 
-    mode: "reoptimize" | "new_model" | "offset" | "atlas".
+    mode: "reoptimize" | "new_model" | "offset".
     config_path: path to the optimization config; default is the panel's
     selected config for the chosen mode. Resolving to nothing on disk fails
     -32007 (data.kind:"config").
     seed: optional volume-space {"x","y","z"} seed; its components are rounded to
     integers.
-    atlas_path: required for mode "atlas" unless the panel already has an atlas
-    selected; missing fails -32007 (data.kind:"atlas"). Ignored for other modes.
-    init_shell_dir: shell directory visible to the fit-service host. For
-    new_model shell-dir-crop initialization this overrides init_shell_dir in
-    the input manifest.
     wait: if true (MCP-server-side only, not part of the underlying RPC), block
     until the job finishes (30-minute cap) and return the terminal job.status
     inline instead of just the jobId; on timeout the jobId is returned with an
@@ -112,7 +105,7 @@ async def vc3d_lasagna_start_optimization(
     -32000 (no volume package), -32004 (data.source:"lasagna" -- the bridge
     allows one in-flight bridge-submitted optimization; use vc3d_lasagna_jobs for
     the service's own queue), -32005 (service not running / submission failed,
-    data.detail), -32007 (config/atlas, see above), -32009 (Lasagna panel
+    data.detail), -32007 (config, see above), -32009 (Lasagna panel
     unavailable), -32602 (bad mode string or malformed seed).
     """
     result = await _call(
@@ -122,8 +115,6 @@ async def vc3d_lasagna_start_optimization(
                 "mode": mode,
                 "configPath": config_path,
                 "seed": seed,
-                "atlasPath": atlas_path,
-                "initShellDir": init_shell_dir,
             }
         ),
     )
@@ -132,9 +123,8 @@ async def vc3d_lasagna_start_optimization(
 
 @mcp.tool()
 async def vc3d_lasagna_jobs() -> dict[str, Any]:
-    """List the Lasagna service's job queue (including the local-upload overlay
-    entries the manager merges in). Requires the service to be running. Deferred
-    (~10 s cap).
+    """List the Lasagna service's job queue. Requires the service to be running.
+    Deferred (~10 s cap).
 
     Returns {"jobs": [...]} -- service job objects passed through verbatim.
     Errors: -32005 (service not running, or the fetch timed out).
@@ -159,17 +149,18 @@ async def vc3d_lasagna_cancel(job_id: Optional[str] = None) -> dict[str, Any]:
 
 
 @mcp.tool()
-async def vc3d_lasagna_select_output(name: str) -> dict[str, Any]:
-    """Activate a Lasagna output segment by name -- the programmatic twin of
-    picking a lasagna output in the panel. Requires a volume package to be open.
+async def vc3d_lasagna_select_output(segment_id: str) -> dict[str, Any]:
+    """Activate a Lasagna output segment -- the programmatic twin of picking a
+    lasagna output in the panel. Requires a volume package to be open.
 
-    name: the output segment id/name; must be non-empty (empty fails -32602).
+    segment_id: the output surface's UUID (as vc3d_list_segments reports it);
+    must be non-empty (empty fails -32602).
 
-    Returns {"selected": true, "name": str}. Errors: -32000 (no volume package),
-    -32602 (empty name), -32007 (data.kind:"segment" -- unknown or unselectable
-    segment).
+    Returns {"selected": true, "segmentId": str}. Errors: -32000 (no volume
+    package), -32602 (empty segmentId), -32007 (data.kind:"segment" -- unknown or
+    unselectable segment).
     """
-    return await _call("lasagna.select_output_segment", {"name": name})
+    return await _call("lasagna.select_output_segment", {"segmentId": segment_id})
 
 
 @mcp.tool()

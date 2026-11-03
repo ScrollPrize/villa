@@ -32,6 +32,7 @@ from vesuvius.ink_detection.data.geometry import (
 )
 from vesuvius.ink_detection.data.normalization import normalize_image
 from vesuvius.ink_detection.inference.inference_runtime import (
+    DEVICE_CHOICES,
     TargetModel,
     flip_spatial,
     iter_mirror_axes,
@@ -144,6 +145,12 @@ def parse_args(argv: Sequence[str] | None = None):
     parser.add_argument("--compile-mode", default="reduce-overhead")
     parser.add_argument("--no-compile", dest="compile_model", action="store_false")
     parser.set_defaults(compile_model=True)
+    parser.add_argument(
+        "--device",
+        choices=DEVICE_CHOICES,
+        default="auto",
+        help="Device for the model. auto picks CUDA, then MPS, then CPU; --gpus implies CUDA.",
+    )
     parser.add_argument("--gpus", default=None)
     parser.add_argument("--plan-only", action="store_true")
     parser.add_argument("--max-target-chunks", type=int, default=None)
@@ -520,8 +527,10 @@ def logits_to_probabilities(
     if logits.ndim != 5:
         raise ValueError(f"Expected logits [B,C,Z,Y,X], got {tuple(logits.shape)}")
     if tuple(logits.shape[-3:]) != patch_size_zyx:
+        # Same resize as native training (train.prepare_loss_inputs), e.g. for
+        # the output of a model_config.input_pad_depth_to padded input.
         logits = F.interpolate(
-            logits.float(), size=patch_size_zyx, mode="trilinear", align_corners=False
+            logits.float(), size=patch_size_zyx, mode="trilinear", align_corners=True
         )
     return logits.float().sigmoid()
 
@@ -992,10 +1001,14 @@ def _load_native_model(payload, config, args) -> NativeModelBundle:
     )
     base_model = make_model(config)
     load_model_state(base_model, state)
-    model = TargetModel(base_model.eval()).eval()
+    model = TargetModel(
+        base_model.eval(),
+        input_pad_depth_to=config.model.input_pad_depth_to,
+    ).eval()
     model, device = prepare_model_for_inference(
         model,
         gpu_ids=args.gpu_ids,
+        device_type=args.device,
         compile_model=bool(args.compile_model),
         compile_mode=str(args.compile_mode),
     )

@@ -988,6 +988,7 @@ def preprocess_surface(
             else:
                 cv2.imwrite(str(resized_path), label_img)
             print(f"  Saved resized label to: {resized_path}")
+            label_file = resized_path
         else:
             # Small difference - use padding/cropping
             new_label = np.zeros((surf_h, surf_w), dtype=label_img.dtype)
