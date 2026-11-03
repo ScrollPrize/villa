@@ -49,4 +49,16 @@ std::uint64_t fetchedBytes(CState&)
     return 0;
 }
 
+void cacheMetadata(const VolumeSource&) {}
+
+std::uint64_t offlineMisses(CState&)
+{
+    return 0;
+}
+
+std::pair<std::uint64_t, std::uint64_t> fetchOfflineMisses(CState&, const std::filesystem::path&)
+{
+    throw std::logic_error("this tree does not read offline");
+}
+
 } // namespace vcbench::pipeline

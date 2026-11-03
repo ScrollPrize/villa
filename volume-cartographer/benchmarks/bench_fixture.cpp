@@ -455,13 +455,18 @@ std::vector<Fiber> Fixture::loadFibers(int count)
     return out;
 }
 
-VolumeSource Fixture::volumeSource(const fs::path& configDir)
+VolumeSource Fixture::volumeSource(const fs::path& configDir, bool recordsMisses)
 {
     const auto& v = volume();
     auto levels = numbers("partial_levels");  // read in every state, so a case may set it
     VolumeSource source;
-    if (cacheState_ == "cached") {
-        source.location = v.path.string();
+#ifndef VC_BENCH_VC_READER
+    // This tree cannot read offline: the cached copy as a local folder.
+    source.location = v.path.string();
+    return source;
+#endif
+    if (cacheState_ == "cached" && v.url.empty()) {
+        source.location = v.path.string();  // a local volume of the manifest
         return source;
     }
     if (v.url.empty())
@@ -469,9 +474,14 @@ VolumeSource Fixture::volumeSource(const fs::path& configDir)
                                     " has a local path and no url to fetch from");
     source.location = v.url;
     source.remote = true;
-    if (prefetch_) {
-        // Fetched chunks land in the cached copy timed runs open.
+    if (cacheState_ == "cached") {
         source.cacheRoot = cacheRoot_;
+        source.offline = recordsMisses ? "fill" : "on";
+    } else if (prefetch_) {
+        // Fetched chunks land in the cache timed runs read. The viewer harnesses plan
+        // offline and fetch what they missed; others read through the network.
+        source.cacheRoot = cacheRoot_;
+        source.offline = recordsMisses ? "fill" : "";
     } else {
         if (!scratch_.empty())
             throw std::logic_error("Fixture::volumeSource called twice");
@@ -524,6 +534,8 @@ VolumeSource Fixture::volumeSource(const fs::path& configDir)
     }
     writeVc3dCacheConfig(configDir, source.cacheRoot);
     config_["volume_cache_root"] = source.cacheRoot.string();
+    if (!source.offline.empty())
+        config_["remote_offline"] = source.offline;
     return source;
 }
 

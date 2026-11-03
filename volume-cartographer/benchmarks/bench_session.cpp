@@ -53,12 +53,21 @@ Session::Session(int& argc, char** argv, Fixture& fixture) : fixture_(fixture)
     prefetch_ = fixture.prefetching();
     margin_ = prefetch_ ? fixture.num("prefetch_margin", 1.5) : 1.0;
     fetchMaxBytes_ = std::uint64_t(fixture.num("fetch_max_gb", 100) * double(1ull << 30));
-    expectCached_ = prefetch_ && fixture.flag("expect_cached");
-    // Before any VC3D object reads VC3D_CONFIG_DIR's cache.json.
-    const auto source = fixture.volumeSource(configDir_->path().toStdString());
-    remote_ = source.remote;
+    // Before any VC3D object reads VC3D_CONFIG_DIR's cache.json and remote settings.
+    source_ = fixture.volumeSource(configDir_->path().toStdString(), true);
+    remote_ = source_.remote;
+    offline_ = !source_.offline.empty();
+    if (offline_) {
+        QSettings settings(ini, QSettings::IniFormat);
+        // vc::settings::kRemoteOffline (by name: origin/main's tree has no such setting,
+        // and its sources are never offline).
+        settings.setValue(QStringLiteral("perf/remote_offline"), QString::fromStdString(source_.offline));
+        settings.sync();
+        if (prefetch_)
+            pipeline::cacheMetadata(source_);
+    }
     const auto start = Clock::now();
-    volume_ = pipeline::openVolume(source);
+    volume_ = pipeline::openVolume(source_);
     if (prefetch_)
         config_["prefetch_margin"] = std::to_string(margin_);
     config_["max_resolution"] = std::to_string(maxResolution);
@@ -93,13 +102,34 @@ void Session::noteCaches()
 {
     for (const auto& [key, value] : pipeline::cacheSummary(*state_, *volume_))
         config_[key] = value;
-    if (expectCached_) {
-        if (const auto fetched = pipeline::fetchedBytes(*state_); fetched > 0)
-            std::fprintf(stderr,
-                         "warning: %s/%s still fetched %llu MB: the cache does not hold everything it reads yet\n",
-                         fixture_.benchmark().c_str(), fixture_.caseName().c_str(),
-                         static_cast<unsigned long long>(fetched >> 20));
+}
+
+int Session::verifyCache()
+{
+    if (!offline_)
+        return 0;
+    const auto missing = pipeline::offlineMisses(*state_);
+    const auto label = fixture_.benchmark() + "/" + fixture_.caseName();
+    if (prefetch_) {
+        if (missing == 0) {
+            std::fprintf(stderr, "prefetch: %s: the cache holds every chunk the case reads\n", label.c_str());
+            return 0;
+        }
+        std::fprintf(stderr, "prefetch: %s: fetching %llu chunks the cache lacks\n", label.c_str(),
+                     static_cast<unsigned long long>(missing));
+        const auto [chunks, bytes] = pipeline::fetchOfflineMisses(*state_, source_.cacheRoot);
+        std::fprintf(stderr, "prefetch: %s: fetched %llu chunks, %llu MB\n", label.c_str(),
+                     static_cast<unsigned long long>(chunks), static_cast<unsigned long long>(bytes >> 20));
+        return 2;
     }
+    if (missing > 0) {
+        std::fprintf(stderr,
+                     "error: %s: the cache lacks %llu chunks this case reads (they read as empty), so its "
+                     "results are not recorded: run benchmarks/prefetch.sh\n",
+                     label.c_str(), static_cast<unsigned long long>(missing));
+        return 3;
+    }
+    return 0;
 }
 
 void Session::checkFetchBudget()

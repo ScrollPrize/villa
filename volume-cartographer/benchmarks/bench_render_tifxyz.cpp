@@ -15,6 +15,7 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <fstream>
 #include <sstream>
 
 extern char** environ;
@@ -139,9 +140,16 @@ int main(int argc, char** argv)
         // cold, partial and --prefetch read the volume's URL through the cache root the
         // fixture names in this config folder's cache.json.
         const auto vc3dConfig = workDir / ("vc3d-config-" + std::to_string(::getpid()));
-        const auto source = fixture.volumeSource(vc3dConfig);
+        const auto source = fixture.volumeSource(vc3dConfig, false);
         if (source.remote)
             extraEnv.push_back("VC3D_CONFIG_DIR=" + vc3dConfig.string());
+        if (!source.offline.empty()) {
+            // Cache state cached: the tool reads the cache only, and fails on a chunk it lacks.
+            std::ofstream ini(vc3dConfig / "VC3D.ini");
+            ini << "[perf]\nremote_offline=" << source.offline << "\n";
+            if (!ini)
+                throw std::runtime_error("cannot write " + (vc3dConfig / "VC3D.ini").string());
+        }
         const auto& volumeArg = source.location;
         fixture.rejectUnused();
 
@@ -171,7 +179,11 @@ int main(int argc, char** argv)
             }
             const auto run = spawn(argvFull, extraEnv);
             if (!WIFEXITED(run.status) || WEXITSTATUS(run.status) != 0)
-                throw std::runtime_error("vc_render_tifxyz failed (status " + std::to_string(run.status) + ")");
+                throw std::runtime_error(
+                    "vc_render_tifxyz failed (status " + std::to_string(run.status) + ")" +
+                    (source.offline.empty() ? std::string()
+                                            : std::string("; it reads the cache offline, so a chunk the cache lacks "
+                                                          "fails it: run benchmarks/prefetch.sh render_tifxyz")));
             const std::string step = i == 0 ? "first run" : "repeat run";
             report.add(step, "wall_ms", run.wallMs);
             report.add(step, "cpu_ms", run.userMs + run.sysMs);

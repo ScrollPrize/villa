@@ -150,10 +150,15 @@ int main(int argc, char** argv)
 
         session.note("fibers", names);
         session.noteCaches();
-        report.setConfig(session.config());
-        report.finish();
+        // Prefetch plan passes fetch what they lacked; a timed run the cache did not
+        // fully serve records nothing (verifyCache).
+        const int code = session.verifyCache();
+        if (code == 0 && !fixture.prefetching()) {
+            report.setConfig(session.config());
+            report.finish();
+        }
         owned.clear();
-        return 0;
+        return code;
     } catch (const std::exception& e) {
         std::fprintf(stderr, "bench_line_annotation: %s\n", e.what());
         return 1;

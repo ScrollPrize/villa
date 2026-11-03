@@ -10,7 +10,10 @@
 // every tree reads what the prefetch recorded in the cache's index.
 //
 // The timed volume's cache state (parameter cache_state):
-//   cached   every chunk read is on disk (the prefetched copy, opened as a local folder);
+//   cached   every chunk read is on disk. vc_reader trees read the volume's URL from the
+//            cache offline (remote_offline): nothing is fetched, and a read the cache
+//            lacks is detected (the run fails). origin/main opens the cached copy as a
+//            local folder;
 //   cold     nothing on disk: the volume is streamed from its URL into an empty scratch cache;
 //   partial  the scratch cache starts with the cached copy's partial_levels (default: all
 //            but level 0); the rest is fetched from the URL during the run.
@@ -104,6 +107,9 @@ struct VolumeSource {
     std::string location;              // a local folder, or the URL when remote
     bool remote = false;
     std::filesystem::path cacheRoot;   // remote: VC3D's cache root for the run
+    // remote: VC3D's perf/remote_offline for the run. "" reads the network; "on" fails
+    // a read the cache lacks; "fill" reads it as fill and records it.
+    std::string offline;
 };
 
 class Fixture {
@@ -150,9 +156,12 @@ public:
 
     // Prepares the volume for the run's cache state. Remote sources write VC3D's
     // cache.json into `configDir` (the process's VC3D_CONFIG_DIR) with the run's cache
-    // root: the fixture's cache with --prefetch, a fresh scratch cache for cold and
-    // partial (seeded for partial). Call once.
-    VolumeSource volumeSource(const std::filesystem::path& configDir);
+    // root: the fixture's cache for cached and --prefetch, a fresh scratch cache for
+    // cold and partial (seeded for partial); the caller sets source.offline in VC3D's
+    // settings. `recordsMisses`: the caller reads the misses of offline "fill" reads
+    // (the viewer harnesses); otherwise cached reads use "on" and --prefetch reads online.
+    // Call once.
+    VolumeSource volumeSource(const std::filesystem::path& configDir, bool recordsMisses);
 
     // Fixture facts for the report (case, cache, data locations).
     std::map<std::string, std::string> config() const { return config_; }

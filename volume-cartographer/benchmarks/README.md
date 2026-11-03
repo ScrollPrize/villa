@@ -94,7 +94,7 @@ manifest. Pass another one with `--config` (or `CONFIG=` for the scripts).
 
 Options that aren't parameters: `--config`, `--case`, `--list-cases`, `--json <file>`
 and `--csv <file>` (append results), `--run-id`, `--commit`, `--dump <dir>` (save viewer frames as PNG), `--prefetch`,
-`--expect-cached`, `--keep-scratch`.
+`--keep-scratch`.
 
 ## Cache states
 
@@ -102,7 +102,7 @@ and `--csv <file>` (append results), `--run-id`, `--commit`, `--dump <dir>` (sav
 
 | state | volume source | needs |
 |-------|---------------|-------|
-| `cached`  | The prefetched copy, opened as a local OME-Zarr folder. Nothing is fetched. | `prefetch.sh` |
+| `cached`  | The volume's URL, read from the cache offline (VC3D's `perf/remote_offline`): nothing is fetched. A run that reads a chunk the cache lacks fails (exit 3) and records nothing; `vc_render_tifxyz` fails on it. origin/main's tree opens the cached copy as a local folder and cannot check. | `prefetch.sh` |
 | `partial` | The volume's URL, through a scratch cache seeded with the cached copy's metadata and `partial_levels` (hard links). The rest is fetched during the run. | `prefetch.sh`, network |
 | `cold`    | The volume's URL, through an empty scratch cache. Everything is fetched during the run. | network |
 
@@ -122,17 +122,23 @@ volume-cartographer/benchmarks/prefetch.sh                    # every case of ev
 volume-cartographer/benchmarks/prefetch.sh viewer_navigation  # one harness
 ```
 
-`prefetch.sh` needs a vc_reader build, and does the following:
+`prefetch.sh` needs a vc_reader build. It never fetches what the cache already
+holds, so after a parameter change it fetches only the difference, and on a
+complete cache it only confirms that, in seconds. It does the following:
 
 1. Downloads the cases' remote segments and fiber folders into the cache
    (`vcr::cache::downloadPrefix`).
-2. Replays every viewer case on the volume's URL with VC3D's cache root set to
-   the cache, and views grown by `prefetch_margin`, so the cached copy also
-   holds what other pipelines' level and fallback choices read nearby. Replays
-   stop once more than `fetch_max_gb` has been fetched.
-3. Runs a second round with `--expect-cached`, which warns about anything still
-   fetched.
-4. Runs each `render_tifxyz` case once on the URL.
+2. **Plans** each viewer case instead of replaying it online. A plan pass drives
+   the case's inputs against the cache offline in `fill` mode, where a chunk the
+   cache lacks reads as empty at once and is recorded
+   (`vcr::Array::offline_misses`). So no step waits on the network, and every
+   missing chunk shows up. Views are grown by `prefetch_margin`, so the cache
+   also holds what other pipelines' level and fallback choices read nearby. The
+   pass then fetches exactly the recorded chunks (`vcr::cache::prefill` with a
+   chunk list) and exits 2. Passes repeat until one finds nothing missing (exit
+   0), at most `MAX_PASSES` (6).
+3. Runs each `render_tifxyz` case once on the URL through the cache. The tool's
+   reads are what its timed runs read.
 
 Each item's cached location (`vcr::zarr::decodedCachePath` of its URL) is recorded
 in `<cache>/benchmark-index.json`. Every tree, origin/main included, finds the
@@ -255,7 +261,11 @@ own format marker. Here it only opens the cached copy as a local folder.
   start with empty decoded caches, but the disk is not cold.
 - `cold` and `partial` include real network time, which varies from run to run.
   Compare them over several runs.
-- The line annotation replay can read a few chunks on the second prefetch round
-  that the first didn't fetch. The `--expect-cached` warning reports it, and a
-  third run of `prefetch.sh line_annotation` fills them.
+- Plan passes find the chunks the viewers request with views grown by
+  `prefetch_margin`. origin/main's pipeline can choose other levels than that
+  covers, and its tree cannot detect a miss, so its `cached` runs rely on the
+  margin.
+- `cached` runs on vc_reader read the cache as VC3D reads a remote volume
+  (the decoded cache of its URL). Before this, they read the cached copy as a
+  local folder, so compare such results only with runs that read the same way.
 - The branch links vc_reader as `libvc_reader_native.so` (`VC_READER_SHARED_READER`).

@@ -38,10 +38,18 @@ std::unique_ptr<CState> makeState(Fixture& fixture);
 // Opens the timed volume from Fixture::volumeSource: a local OME-Zarr folder, or
 // (vc_reader trees only) its URL through the cache root VC3D's cache.json names.
 std::shared_ptr<Volume> openVolume(const VolumeSource& source);
+// Before an offline plan pass on a cache that may not hold the volume yet: reads the
+// volume's metadata online into the source's cache root (chunks stay offline).
+void cacheMetadata(const VolumeSource& source);
 // Decoded cache occupancy and chunk traffic, for the report.
 std::map<std::string, std::string> cacheSummary(CState& state, Volume& volume);
 // Bytes fetched from remote sources so far (0 for local volumes).
 std::uint64_t fetchedBytes(CState& state);
+// Distinct chunks offline "fill" reads lacked so far.
+std::uint64_t offlineMisses(CState& state);
+// Fetches every chunk offline "fill" reads lacked into `cacheRoot`; returns the chunks
+// fetched (empty-on-S3 chunks count) and bytes.
+std::pair<std::uint64_t, std::uint64_t> fetchOfflineMisses(CState& state, const std::filesystem::path& cacheRoot);
 } // namespace pipeline
 
 // The headless application: settings, Qt, CState, ViewerManager and the volume.
@@ -62,9 +70,13 @@ public:
     // pipeline's level and fallback choices read around them.
     bool prefetching() const { return prefetch_; }
     int viewSize(int pixels) const { return int(pixels * margin_); }
-    // Adds the pipeline's cache and traffic counters to the config. With --prefetch
-    // and --expect-cached, warns when the run still fetched data.
+    // Adds the pipeline's cache and traffic counters to the config.
     void noteCaches();
+    // After the scenario, the process's exit code. --prefetch: fetches the chunks the
+    // offline plan pass lacked; 0 when there were none (the cache is complete), 2 when
+    // some were fetched (plan again). Cache state cached: 3 when the cache lacked chunks
+    // the case read (its results are not valid; nothing should be recorded), else 0.
+    int verifyCache();
     // Remote volumes (prefetch, cold, partial): throws once more than fetch_max_gb
     // (100) has been fetched.
     void checkFetchBudget();
@@ -81,8 +93,9 @@ private:
     std::unique_ptr<VCCollection> points_;
     std::unique_ptr<ViewerManager> manager_;
     std::shared_ptr<Volume> volume_;
+    VolumeSource source_;
     std::map<std::string, std::string> config_;
-    bool prefetch_ = false, remote_ = false, expectCached_ = false;
+    bool prefetch_ = false, remote_ = false, offline_ = false;
     double margin_ = 1.0;
     std::uint64_t fetchMaxBytes_ = 0;
     Clock::time_point lastBudgetCheck_{};

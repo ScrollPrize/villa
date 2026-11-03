@@ -1,20 +1,27 @@
 #!/usr/bin/env bash
 # Fills the benchmark cache (benchmarks.json "cache"; default: cache/ beside this
 # script) with everything the cases read, so cache state "cached" runs need no
-# network: remote segments and fiber folders are downloaded, then every case's
-# scenarios are replayed on the volume's remote source with views grown by
-# prefetch_margin (1.5), filling the cached copy of the volume. A second replay
-# round warns about anything it still had to fetch. Needs a vc_reader build.
+# network. Needs a vc_reader build. Already cached data is never fetched again.
 #
 #   benchmarks/prefetch.sh [viewer_navigation|line_annotation|render_tifxyz]...   (default: all)
 #
+# - Remote segments and fiber folders are downloaded (files already there are kept).
+# - Viewer harnesses plan instead of replaying online: each pass drives the case's
+#   inputs on the cache offline (remote_offline "fill": a chunk the cache lacks reads
+#   as empty at once and is recorded), with views grown by prefetch_margin (1.5) to
+#   cover other pipelines' level and fallback choices, then fetches exactly the
+#   recorded chunks. Passes repeat until one finds nothing missing (exit 0), which is
+#   also all a pass costs when the cache is already complete.
+# - render_tifxyz runs the tool once online through the cache.
+#
 # Environment: CONFIG (the manifest), BUILD (build tree, default ../build),
-# EXTRA (extra arguments for every run).
+# MAX_PASSES (plan passes per case, default 6), EXTRA (extra arguments for every run).
 set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CONFIG="$(realpath "${CONFIG:-$here/benchmarks.json}")"
 BUILD="${BUILD:-$here/../build}"
+MAX_PASSES="${MAX_PASSES:-6}"
 EXTRA=(${EXTRA:-})
 benches=("$@")
 [ ${#benches[@]} -eq 0 ] && benches=(viewer_navigation line_annotation render_tifxyz)
@@ -27,10 +34,19 @@ for bench in "${benches[@]}"; do
             "$bin" --config "$CONFIG" --case "$case" --prefetch "${EXTRA[@]}"
             continue
         fi
-        for round in 1 2; do
-            echo "== prefetch $bench / $case, round $round"
-            check=(); [ $round -eq 2 ] && check=(--expect-cached)
-            "$bin" --config "$CONFIG" --case "$case" --prefetch --passes 1 "${check[@]}" "${EXTRA[@]}"
+        for ((pass = 1; ; ++pass)); do
+            echo "== prefetch $bench / $case, plan pass $pass"
+            status=0
+            "$bin" --config "$CONFIG" --case "$case" --prefetch --passes 1 "${EXTRA[@]}" || status=$?
+            [ $status -eq 0 ] && break                        # nothing missing: complete
+            if [ $status -ne 2 ]; then                        # 2: fetched what it lacked
+                echo "prefetch: $bench / $case failed (exit $status)" >&2
+                exit $status
+            fi
+            if [ $pass -ge "$MAX_PASSES" ]; then
+                echo "prefetch: $bench / $case still lacked chunks after $pass passes" >&2
+                exit 1
+            fi
         done
     done
 done
