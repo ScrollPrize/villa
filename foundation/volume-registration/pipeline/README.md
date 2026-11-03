@@ -9,15 +9,24 @@ and why. Built so far:
 - **step 4**: every automatic stage. Capture check, hold-out draw and measurement, sampling
   and fitting run on `cores/fit_session.py`; scoring and storing run on the record.
 
-Still to do: **step 5**, the review UI (judging the hold-out set and the blind round; until
-then answers go in with `volreg answer`), and **step 6**, the container. The capture check's
-thresholds (12 probes, at least half matching 0.85) are a first guess from the first runs.
+- **step 5**: the review UI, one server for every pair (see below).
+
+Still to do: **step 6**, the container. The capture check's thresholds (12 probes, at least
+half matching 0.85) are a first guess from the first runs.
 
 Two things behave differently from the first runs:
 
 - **A hold-out measurement is frozen once drawn.** The first runs re-measured test patches on
   every fit pass, so a measurement could move after it had been judged. The fit stage now
   measures fit patches only (`correlate(skip_test=True)`, the one change to the cores).
+  Since a patch measured under a rough start could move once the fit is better, the
+  `recheck` stage measures the hold-out set again under each fit, changes nothing, and
+  records how far each would move. Lining-up patches that would move more than half a fine
+  voxel are listed to be judged again. On PHerc0814 (2.4 to 9.36 µm) they move 0.10 fine
+  voxels median and 0.23 at most.
+- **The hold-out stage renders what a person judges, once.** The images are stored under
+  `work/images/`, and their digests go into `holdout.json`. The review page only reads them,
+  so judging needs no volume access.
 - **The block sampler adds every textured block in a read batch.** So it can draw more than
   asked: 21 probes for 12 on PHerc0814. That is unchanged from the first runs, and harmless.
 
@@ -32,6 +41,34 @@ Two things behave differently from the first runs:
 | `volreg/stages.py` | the stage table of `DESIGN.md`, and what each stage does |
 | `volreg/cli.py` | `run`, `status`, `answer`, `more`, `redo`, `job`, `check`, `migrate` |
 | `volreg/cores/` | algorithms merged in from the research modules, unchanged except for imports: `deformable.py`, `transform_fit.py`, `dense_correlation.py`, the transform file I/O, point fits and volume reading of `transform_utils.py`, and `read_patch` of `blob_snap.py`, `fit_session.py` and `session_overview.py` |
+
+## Stages
+
+| stage | who | |
+|---|---|---|
+| `capture` | auto | draws probe patches under the start and fails, saying how well they matched, if too few match |
+| `holdout` | auto | draws the hold-out set (no more than asked for), measures it under the start, renders it |
+| `judge-holdout` | you | done when enough patches line up, or all are answered |
+| `fit` | auto | samples fit patches, then correlates and fits; starts while you judge |
+| `recheck` | auto | measures the hold-out set again under the fit, and flags drift |
+| `score` | auto | the bend and the affine against your answers, and the bar |
+| `blind` | auto | draws and renders a blind round of bend against affine on the patches lining up or partly |
+| `final-review` | you | the blind picks, then the decision; publishing what misses the bar needs a reason, and is stored as an override |
+| `store` | auto | writes the decided transform and its scores into the record |
+
+A job that finishes starts whatever its result made ready, and so does an answer or a
+decision on the review page. So a pair moves on by itself until you are next.
+
+## Review UI
+
+    VOLREG_HANDLE=... VOLREG_EMAIL=... uv run --python 3.12 --with-requirements requirements.txt \
+        python -m volreg.review.server PAIRS_DIR --port 8790
+
+The page at `/` lists every pair under `PAIRS_DIR` with its stages, and has buttons to run,
+redo and ask for more patches. The judging page uses the first runs' keys: `1`–`5` to
+answer, `space` to flip, `m` for mode, `n` for a note, `u` to undo, and `?unit=octants` to
+judge octants. The blind page uses `1`/`2`, `Enter` to pick, `x` for can't tell, `n` for
+neither, and `j`/`k` to move. It ends in the decision. The server never reads a volume.
 
 ## Run
 

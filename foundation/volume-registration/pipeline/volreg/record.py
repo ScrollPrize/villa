@@ -12,8 +12,10 @@ Files other than `events.jsonl` are replaced whole, in one step, so a reader nev
 a file. Coordinates are ZYX level-0 voxels of their own volume, as in the cores.
 """
 
+import fcntl
 import json
 import os
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -33,6 +35,8 @@ ANSWERS = ("lines-up", "partly", "no", "cant-tell", "not-scroll")
 LINES_UP = "lines-up"
 # What a person can pick in a blind round instead of an option.
 BLIND_ANSWERS = ("unsure", "none")
+# What a decision can publish.
+PUBLISH = ("bend", "affine", "nothing")
 
 
 def now():
@@ -81,6 +85,18 @@ class Record:
             os.fsync(handle.fileno())
         os.replace(scratch, target)
 
+    @contextmanager
+    def lock(self):
+        """Held while a view (`holdout.json`, `final-review.json`) is rewritten from the
+        log, so a page and a job doing it at once cannot lose each other's answers."""
+        self.directory.mkdir(parents=True, exist_ok=True)
+        with open(self.directory / ".lock", "w") as handle:
+            fcntl.flock(handle, fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(handle, fcntl.LOCK_UN)
+
     def log(self, kind, **fields):
         """Append one event; `at` defaults to now. Never rewrites what is there."""
         self.directory.mkdir(parents=True, exist_ok=True)
@@ -120,19 +136,93 @@ class Record:
                                           "by": event.get("by")})
         return latest
 
-    def refresh_holdout(self, patches=None):
-        """Rewrite `holdout.json` with `patches` (or the ones it holds) and the latest answers."""
+    def refresh_holdout(self, patches=None, **fields):
+        """Rewrite `holdout.json` with `patches` (or the ones it holds), `fields`, and the
+        latest answers and notes."""
+        with self.lock():
+            return self._refresh_holdout(patches, fields)
+
+    def _refresh_holdout(self, patches, fields):
         held = self.read(HOLDOUT) if self.exists(HOLDOUT) else {"patches": []}
+        held |= fields
         if patches is not None:
             held = held | {"patches": patches}
         latest = self.answers()
+        notes = self.notes()
         for patch in held["patches"]:
             patch["answer"] = latest.get(patch["id"])
+            if patch["id"] in notes:
+                patch["note"] = notes[patch["id"]]
             for octant in patch.get("octants") or []:
                 octant["answer"] = latest.get(f"{patch['id']}.{octant['index']}")
         held.pop("schema", None)
         self.write(HOLDOUT, held)
         return held
+
+
+    # ------------------------------------------------------- notes and the final review
+
+    def note(self, patch_id, text, reviewer):
+        """What a person saw in a patch, in their words; empty to remove it."""
+        text = (text or "").strip()
+        self.log("note", patch=patch_id, text=text, by=reviewer)
+        self.refresh_holdout()
+
+
+    def notes(self):
+        latest = {}
+        for event in self.events():
+            if event["kind"] == "note":
+                latest[event["patch"]] = ({"text": event["text"], "at": event["at"], "by": event.get("by")}
+                                          if event["text"] else None)
+        return latest
+
+
+    def blind_pick(self, round_id, index, choice, reviewer):
+        """The option a person picked for item `index` of a round, or one of `BLIND_ANSWERS`."""
+        final = self.read(FINAL_REVIEW)
+        round_ = next(r for r in final["rounds"] if r["id"] == round_id)
+        item = round_["items"][index]
+        if choice not in BLIND_ANSWERS and not (isinstance(choice, int)
+                                                and 0 <= choice < len(item["options"])):
+            raise ValueError(f"no option {choice!r}")
+        self.log("blind-pick", round=round_id, item=index, patch=item["patch"], choice=choice,
+                 by=reviewer)
+        self.refresh_final()
+
+
+    def decide(self, decision, reviewer):
+        """The final decision: `{"fit", "publish", "reason", "override"}`; logged, then shown."""
+        if decision["publish"] not in PUBLISH:
+            raise ValueError(f"publish one of {', '.join(PUBLISH)}")
+        self.log("decision", **decision, by=reviewer)
+        self.refresh_final()
+
+
+    def refresh_final(self, rounds=None):
+        """Rewrite `final-review.json` with the latest picks and decision from the log. Rounds
+        and anything else it holds (a migrated decision, open questions) are kept."""
+        with self.lock():
+            final = self.read(FINAL_REVIEW) if self.exists(FINAL_REVIEW) else {"rounds": [], "decision": None}
+            final.pop("schema", None)
+            if rounds is not None:
+                final["rounds"] = rounds
+            picks, decision = {}, None
+            for event in self.events():
+                if event["kind"] == "blind-pick" and not event.get("migrated"):
+                    picks[(event["round"], event["item"])] = event["choice"]
+                elif event["kind"] == "decision":
+                    decision = {key: event[key] for key in ("fit", "publish", "reason", "override")
+                                } | {"by": event.get("by"), "at": event["at"]}
+            for round_ in final["rounds"]:
+                for index, item in enumerate(round_["items"]):
+                    if (round_["id"], index) in picks:
+                        item["choice"] = picks[(round_["id"], index)]
+            if decision:
+                final["decision"] = decision
+                final["status"] = "decided"
+            self.write(FINAL_REVIEW, final)
+            return final
 
 
 def holdout_units(held):
@@ -141,4 +231,3 @@ def holdout_units(held):
         units.add(patch["id"])
         units.update(f"{patch['id']}.{octant['index']}" for octant in patch.get("octants") or [])
     return units
-

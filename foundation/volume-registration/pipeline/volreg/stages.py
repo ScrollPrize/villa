@@ -15,6 +15,7 @@ import numpy as np
 
 from . import migrate
 from . import record as rec
+from . import render
 from .cores import fit_session as fs
 from .cores import session_overview
 from .engine import Pipeline, Stage
@@ -78,8 +79,9 @@ def run_capture(pipeline, params):
 
 
 def run_holdout(pipeline, params):
-    """Draw the hold-out set -- or, after `volreg more`, the patches it is short of -- and
-    measure the new ones under the start, then list them in the record for judging."""
+    """Draw the hold-out set -- or, after `volreg more`, the patches it is short of --
+    measure the new ones under the start, render what a person will judge, and list them in
+    the record. Only measured patches are listed: an unmeasured one has nothing to judge."""
     with session_lock(pipeline):
         session = open_session(pipeline)
         have = sum(1 for patch in session.state["patches"] if patch.get("test"))
@@ -91,13 +93,32 @@ def run_holdout(pipeline, params):
             keep_only_asked(session, added, missing)
             session.correlate(only_new=True)
         held = migrate.holdout(migrate.Session(session.directory), None, every_octant=True)
-    pipeline.record.refresh_holdout(held["patches"])
-    held_now = pipeline.record.read(rec.HOLDOUT)
-    pipeline.record.write(rec.HOLDOUT, {key: value for key, value in held_now.items()
-                                        if key != "schema"}
-                          | {"patch_coarse_voxels": held["patch_coarse_voxels"],
-                             "stretches": held["stretches"]})
+        patches = [patch for patch in held["patches"] if "centre_zyx" in patch]
+        render_holdout(pipeline, session, patches)
+    pipeline.record.refresh_holdout(patches, patch_coarse_voxels=held["patch_coarse_voxels"],
+                                    stretches=held["stretches"])
     return [rec.HOLDOUT]
+
+
+def render_holdout(pipeline, session, patches):
+    """Pictures of every hold-out unit not rendered yet -- the measurements are frozen, so a
+    picture once made stays right -- with their digests on the record's entries."""
+    out = pipeline.work("images", "holdout")
+    overview = (session.directory / "overview").exists()
+    for patch in patches:
+        source = session.patch(patch["id"])
+        units = [(patch, patch["id"], (0, 0, 0), fs.dense.BLOCK)] + [
+            (octant, f"{patch['id']}.{octant['index']}", tuple(octant["corner_zyx"]),
+             fs.dense.BLOCK // 2) for octant in patch.get("octants") or []]
+        for entry, unit_id, corner, size in units:
+            digests = out / unit_id / "digests.json"
+            if not digests.exists():
+                found = render.holdout_unit(session, out, source, unit_id, entry["centre_zyx"],
+                                            entry["fine_zyx"], corner, size)
+                digests.write_text(json.dumps(found))
+            entry["image_sha256"] = json.loads(digests.read_text())
+        if overview and not (out / patch["id"] / "section.png").exists():
+            render.section(session, out, source)
 
 
 def keep_only_asked(session, added, asked):
@@ -152,6 +173,43 @@ def run_fit(pipeline, params):
     return ["work/fit/transform.json", "work/fit/fit.json"]
 
 
+def run_recheck(pipeline, params):
+    """Measure every hold-out patch again under the fit, the way the first runs did after
+    each pass, without changing the frozen measurement a person judged; record how far
+    each would move. A patch measured under a rough start can move once the fit is better;
+    one that moves more than `drift_fine_voxels` is flagged to be judged again."""
+    with session_lock(pipeline):
+        session = open_session(pipeline)
+        _levels, fine_array, fine_scale = session.open()
+        fine_to_coarse = session.fine_to_coarse()
+        to_fine = np.linalg.inv(fine_to_coarse)
+        sign = session.state["sampling"]["sign"]
+        moved = {}
+        for patch in session.state["patches"]:
+            if not patch.get("test") or not patch["measurement"]:
+                continue
+            measured = fs.dense.measure_block(
+                np.asarray(patch["origin_zyx"]), session.coarse_block(patch["id"]), fine_array,
+                fine_scale, fine_to_coarse, sign, session._fine, patch["id"], with_check=True)
+            if isinstance(measured, str):
+                moved[patch["id"]] = {"refused": measured}
+                continue
+            centre, _fine, _shift, _error, _match, check, _octants = measured
+            optimum = fs.dense.apply(to_fine, centre + sign * np.asarray(check["peak_zyx"]))
+            frozen = np.asarray(patch["measurement"]["fine_zyx"], float)
+            moved[patch["id"]] = {"fine_voxels": round(float(np.linalg.norm(optimum - frozen)), 4),
+                                  "match": check["peak_match"]}
+    distances = np.array([entry["fine_voxels"] for entry in moved.values() if "fine_voxels" in entry])
+    flagged = sorted(patch_id for patch_id, entry in moved.items()
+                     if entry.get("fine_voxels", 0) > params["drift_fine_voxels"])
+    result = {"under": session.state["current"], "drift_fine_voxels": params["drift_fine_voxels"],
+              "median": float(np.median(distances)) if len(distances) else None,
+              "max": float(distances.max()) if len(distances) else None,
+              "flagged": flagged, "patches": moved}
+    pipeline.work("recheck.json").write_text(json.dumps(result, indent=1) + "\n")
+    return ["work/recheck.json"]
+
+
 def holdout_judged(pipeline, params):
     """Enough hold-out patches line up, or every one is answered."""
     if not pipeline.record.exists(rec.HOLDOUT):
@@ -175,9 +233,57 @@ def run_score(pipeline, params):
               for name in ("bend", "affine")}
     for value in scores.values():
         value["bar"] = bar_check(value)
+    recheck = json.loads(pipeline.work("recheck.json").read_text())
+    lining_up = {patch["id"] for patch in held["patches"]
+                 if (patch.get("answer") or {}).get("answer") == rec.LINES_UP}
+    drift = {"median": recheck["median"], "max": recheck["max"],
+             "limit": recheck["drift_fine_voxels"],
+             # Lining-up patches whose measurement would move under the fit: their answer
+             # was given to a picture that may be off, so they are worth judging again.
+             "judge_again": [patch_id for patch_id in recheck["flagged"] if patch_id in lining_up]}
     out = pipeline.work("scores.json")
-    out.write_text(json.dumps({"bar": BAR, "scores": scores}, indent=1) + "\n")
+    out.write_text(json.dumps({"bar": BAR, "scores": scores, "drift": drift}, indent=1) + "\n")
     return ["work/scores.json"]
+
+
+def run_blind(pipeline, params):
+    """A blind round for the fit: the hold-out patches answered "lines up" or "partly" where
+    its bend and its affine part place the patch furthest apart, the two options shuffled.
+    A round for this fit already in the record is kept; a new fit gets a new round."""
+    fit = json.loads(pipeline.work("fit", "fit.json").read_text())
+    candidates = [fit["fit"], fit["fit"] + fs.AFFINE]
+    final = pipeline.record.read(rec.FINAL_REVIEW) if pipeline.record.exists(rec.FINAL_REVIEW) else {}
+    rounds = final.get("rounds") or []
+    if any(round_["candidates"] == candidates for round_ in rounds):
+        return [rec.FINAL_REVIEW]
+    held = {patch["id"]: patch for patch in pipeline.record.read(rec.HOLDOUT)["patches"]}
+    eligible = {patch_id for patch_id, patch in held.items()
+                if (patch.get("answer") or {}).get("answer") in params["answers"]}
+    with session_lock(pipeline):
+        session = open_session(pipeline)
+        rng = np.random.default_rng(params["seed"] + len(rounds))
+        to_coarse = session.fine_um / session.coarse_um
+        ranked = []
+        for patch_id in sorted(eligible):
+            patch = session.patch(patch_id)
+            placed = [session.placement(candidate, patch) for candidate in candidates]
+            spread = float(np.linalg.norm(placed[0] - placed[1]) * to_coarse)
+            if spread >= fs.SAME_PLACE_VOXELS:
+                ranked.append((spread, patch_id))
+        ranked.sort(key=lambda item: (-item[0], item[1]))
+        round_id = f"c{len(rounds) + 1:03d}"
+        items = []
+        for index, (spread, patch_id) in enumerate(ranked[:params["count"]]):
+            options = [[candidates[i]] for i in rng.permutation(len(candidates))]
+            digests = render.blind_item(session, pipeline.work("images", "blind", round_id, str(index)),
+                                        session.patch(patch_id), options)
+            items.append({"patch": patch_id, "spread": round(spread, 4), "options": options,
+                          "choice": None, "image_sha256": digests})
+    rounds.append({"id": round_id, "at": rec.now(), "candidates": candidates, "test_only": True,
+                   "items": items})
+    pipeline.record.refresh_final(rounds)
+    pipeline.record.log("blind-round", round=round_id, candidates=candidates, items=len(items))
+    return [rec.FINAL_REVIEW]
 
 
 def final_decided(pipeline, params):
@@ -189,15 +295,19 @@ def run_store(pipeline, params):
     """Put the decided fit into the record: the transform as it will be published (without
     its bend when the decision says affine), how it was fitted, and its scores."""
     decision = pipeline.record.read(rec.FINAL_REVIEW)["decision"]
+    fit = json.loads(pipeline.work("fit", "fit.json").read_text())
+    scores = json.loads(pipeline.work("scores.json").read_text())
+    stamp = pipeline.stamp("fit") or {}
+    if decision["publish"] == "nothing":
+        pipeline.record.path(rec.TRANSFORM).unlink(missing_ok=True)
+        pipeline.record.write(rec.FIT, fit | scores | {"code": stamp.get("code")})
+        return [rec.FIT]
     transform = json.loads(pipeline.work("fit", "transform.json").read_text())
     if decision["publish"] == "affine":
         transform = {key: value for key, value in transform.items() if key != "deformation"}
         if transform.get("schema_version") in ("1.2.0", "1.3.0"):
             transform["schema_version"] = "1.1.0" if transform.get("fit") else "1.0.0"
     transform["fixed_volume"] = transform["fixed_volume"].rstrip("/").rsplit("/", 1)[-1]
-    fit = json.loads(pipeline.work("fit", "fit.json").read_text())
-    scores = json.loads(pipeline.work("scores.json").read_text())
-    stamp = pipeline.stamp("fit") or {}
     pipeline.record.write(rec.TRANSFORM, transform)
     pipeline.record.write(rec.FIT, fit | scores | {"code": stamp.get("code")})
     if pipeline.work("fit", "points.json").exists():
@@ -218,9 +328,14 @@ def stages():
         # Starts right after the hold-out set is drawn, while a person judges it.
         Stage("fit", "sample, measure and fit", needs=("holdout",),
               run=run_fit, params={"patches": 200, "passes": 2, "seed": 2000}),
-        Stage("score", "score against the hold-out set", needs=("fit", "judge-holdout"),
+        Stage("recheck", "measure the hold-out set again under the fit", needs=("fit",),
+              run=run_recheck, params={"drift_fine_voxels": 0.5}),
+        Stage("score", "score against the hold-out set", needs=("recheck", "judge-holdout"),
               run=run_score),
-        Stage("final-review", "judge the final fit", needs=("score",),
+        Stage("blind", "draw the blind round of bend against affine", needs=("score",),
+              run=run_blind, params={"count": 20, "seed": 3000,
+                                     "answers": [rec.LINES_UP, "partly"]}),
+        Stage("final-review", "judge the final fit", needs=("blind",),
               complete=final_decided, answers=(rec.FINAL_REVIEW,)),
         Stage("store", "store the decided fit", needs=("final-review",), run=run_store),
     ]

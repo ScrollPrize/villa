@@ -75,10 +75,16 @@ def show(pipeline):
         print(line)
 
 
-def run(args):
-    pipeline = pipeline_stages.pipeline(args.pair)
-    command = [sys.executable, "-m", "volreg.cli", "job", str(args.pair)]
+def advance(pair):
+    """Start every stage of a pair that can run, each as a background `volreg job`."""
+    pipeline = pipeline_stages.pipeline(pair)
+    command = [sys.executable, "-m", "volreg.cli", "job", str(pair)]
     _states, started = pipeline.advance(lambda name: pipeline.start(name, command + [name]))
+    return pipeline, started
+
+
+def run(args):
+    pipeline, started = advance(args.pair)
     print(f"{args.pair}: started {', '.join(started) if started else 'nothing'}")
     show(pipeline)
 
@@ -177,7 +183,13 @@ def main(argv=None):
     elif args.command == "run":
         run(args)
     elif args.command == "job":
-        return engine.main_job(pipeline_stages.pipeline(args.pair), args.stage)
+        # A job that finished starts what its result made ready, so a pair moves on by
+        # itself until a person is next. Two jobs finishing at once may both try to start
+        # the same stage; its lock lets only one run.
+        status = engine.main_job(pipeline_stages.pipeline(args.pair), args.stage)
+        if status == 0:
+            advance(args.pair)
+        return status
     elif args.command == "redo":
         affected = pipeline_stages.pipeline(args.pair).redo(args.stage)
         print(f"will run again: {', '.join(affected)}")

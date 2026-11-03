@@ -1,0 +1,70 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Registration Pairs</title>
+<link rel="stylesheet" href="/common.css">
+<style>
+.pair { margin-bottom: 10px; }
+.pair h3 { margin: 0 0 4px; font-size: 14px; }
+.stages { display: flex; gap: 4px; flex-wrap: wrap; margin: 6px 0; }
+.stage { border: 1px solid var(--line); border-radius: 6px; padding: 3px 7px; }
+.stage small { display: block; color: var(--muted); }
+.stage.done { border-color: var(--good); }
+.stage.waiting { border-color: var(--select); background: color-mix(in srgb, var(--select) 18%, transparent); }
+.stage.running { border-color: var(--accent); }
+.stage.failed { border-color: var(--bad); }
+.stage.stale, .stage.ready { border-style: dashed; }
+.err { color: var(--bad); font-size: 12px; }
+</style>
+</head>
+<body>
+<header><h1>Registration pairs</h1><span id="who" class="muted"></span><span id="error"></span></header>
+<main class="single"><div id="pairs"></div></main>
+<script src="/common.js"></script>
+<script>
+const PAGE = {"judge-holdout": "holdout", "final-review": "blind"};
+
+async function load() {
+  const state = await call("/api/pairs");
+  $("who").textContent = `reviewing as ${state.reviewer.handle}`;
+  $("pairs").innerHTML = state.pairs.map(p => {
+    const waiting = p.stages.filter(s => s.state === "waiting");
+    const h = p.holdout;
+    return `<section class="pair" data-name="${escapeHtml(p.name)}">
+      <h3>${escapeHtml(p.name)} <span class="muted">${escapeHtml(p.pair)}</span></h3>
+      <div class="stages">${p.stages.map(s => `<div class="stage ${s.state}" title="${escapeHtml(s.title)}">
+        ${PAGE[s.name] && s.state !== "blocked" ? `<a href="/pairs/${encodeURIComponent(p.name)}/${PAGE[s.name]}">${s.name}</a>` : s.name}
+        <small>${s.human ? "you · " : ""}${s.state}</small></div>`).join("")}</div>
+      ${p.stages.filter(s => s.error).map(s => `<div class="err">${s.name}: ${escapeHtml(s.error)}</div>`).join("")}
+      ${h ? `<div class="muted">hold-out: ${h.lines_up} line up · ${h.stretches.map(s => s.left).reduce((a, b) => a + b, 0)} left to answer</div>` : ""}
+      <div class="row" style="margin-top:6px">
+        <button data-act="run">Run what can run</button>
+        <select data-sel="redo">${p.stages.filter(s => !s.human).map(s => `<option>${s.name}</option>`).join("")}</select>
+        <button data-act="redo">Redo</button>
+        <input data-in="holdout" type="number" min="0" step="10" value="20" style="width:5em"> <button data-act="more-holdout">more hold-out</button>
+        <input data-in="fit" type="number" min="0" step="50" value="100" style="width:5em"> <button data-act="more-fit">more fit patches</button>
+        ${waiting.map(s => PAGE[s.name] ? `<a href="/pairs/${encodeURIComponent(p.name)}/${PAGE[s.name]}"><b>→ ${s.title}</b></a>` : "").join(" ")}
+      </div></section>`;
+  }).join("") || `<p class="muted">No pairs with a pipeline under this folder.</p>`;
+  for (const box of document.querySelectorAll(".pair")) {
+    const name = box.dataset.name, api = `/api/pairs/${encodeURIComponent(name)}`;
+    const act = async (path, body) => { try { await call(`${api}/${path}`, body); $("error").textContent = ""; await load(); }
+                                      catch (e) { $("error").textContent = e.message; } };
+    box.querySelector('[data-act="run"]').onclick = () => act("run", {});
+    box.querySelector('[data-act="redo"]').onclick = () => {
+      const stage = box.querySelector('[data-sel="redo"]').value;
+      if (confirm(`Run ${stage} and everything after it again?`)) act("redo", {stage});
+    };
+    box.querySelector('[data-act="more-holdout"]').onclick = () =>
+      act("more", {holdout: Number(box.querySelector('[data-in="holdout"]').value)});
+    box.querySelector('[data-act="more-fit"]').onclick = () =>
+      act("more", {fit: Number(box.querySelector('[data-in="fit"]').value)});
+  }
+}
+load().catch(e => { $("error").textContent = e.message; });
+setInterval(() => { if (!document.activeElement || document.activeElement.tagName !== "INPUT") load().catch(() => {}); }, 10000);
+</script>
+</body>
+</html>

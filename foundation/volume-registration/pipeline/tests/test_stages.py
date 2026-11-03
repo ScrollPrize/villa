@@ -61,6 +61,9 @@ def test_a_pair_through_every_stage(tmp_path, stores):
     assert states["judge-holdout"] == WAITING and states["fit"] == READY
 
     held = record.read(rec.HOLDOUT)["patches"]
+    for patch in held:      # every unit rendered once, its digests on the record
+        assert set(patch["image_sha256"]) == {"coarse", "own"}
+        assert (pipeline.work("images", "holdout", patch["id"], "own.png")).exists()
     # Never more than asked for. Only the two outer stretches of this small store hold whole
     # blocks, so it gives 4 of the 10.
     assert 4 <= len(held) <= 10 and all("centre_zyx" in patch for patch in held)
@@ -75,9 +78,13 @@ def test_a_pair_through_every_stage(tmp_path, stores):
     for patch in held:
         record.answer(patch["id"], "lines-up", REVIEWER)
     assert pipeline.states()["judge-holdout"] == DONE
+    assert pipeline.run_stage("recheck")["status"] == "ok", pipeline.stamp("recheck").get("traceback")
+    recheck = json.loads(pipeline.work("recheck.json").read_text())
+    assert recheck["max"] < 0.5 and not recheck["flagged"]     # a planted offset: nothing drifts
     assert pipeline.run_stage("score")["status"] == "ok"
     scores = json.loads(pipeline.work("scores.json").read_text())["scores"]
     assert scores["bend"]["lines_up"] == len(held) and scores["bend"]["median_fine_voxels"] < 1.0
+    assert json.loads(pipeline.work("scores.json").read_text())["drift"]["judge_again"] == []
 
     # A new answer makes the score stale; scoring again picks it up.
     record.answer(held[0]["id"], "partly", REVIEWER)
@@ -85,9 +92,22 @@ def test_a_pair_through_every_stage(tmp_path, stores):
     pipeline.run_stage("score")
     assert json.loads(pipeline.work("scores.json").read_text())["scores"]["bend"]["lines_up"] == len(held) - 1
 
+    assert pipeline.states()["blind"] == READY
+    assert pipeline.run_stage("blind")["status"] == "ok", pipeline.stamp("blind").get("traceback")
     assert pipeline.states()["final-review"] == WAITING
-    record.write(rec.FINAL_REVIEW, {"rounds": [], "decision": {
-        "fit": fit["fit"], "publish": "affine", "reason": "test", "by": REVIEWER, "override": None}})
+    round_ = record.read(rec.FINAL_REVIEW)["rounds"][0]
+    assert round_["candidates"] == [fit["fit"], fit["fit"] + "/affine"]
+    for index, item in enumerate(round_["items"]):
+        assert pipeline.work("images", "blind", round_["id"], str(index), "1.png").exists()
+        record.blind_pick(round_["id"], index, "unsure", REVIEWER)
+    assert all(item["choice"] == "unsure" for item in record.read(rec.FINAL_REVIEW)["rounds"][0]["items"])
+    # Running the stage again keeps the round of this fit, and the picks.
+    pipeline.redo("blind"); pipeline.run_stage("blind")
+    assert len(record.read(rec.FINAL_REVIEW)["rounds"]) == 1
+
+    record.decide({"fit": fit["fit"], "publish": "affine", "reason": "test", "override": None},
+                  REVIEWER)
+    assert pipeline.states()["final-review"] == DONE
     assert pipeline.run_stage("store")["status"] == "ok"
     stored = record.read(rec.TRANSFORM)
     assert "deformation" not in stored and stored["fixed_volume"] == "coarse.zarr"
