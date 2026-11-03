@@ -40,6 +40,17 @@ int main(){
             cold.array->read_many({{0,0,0}},{{4,4,4}},{nullptr});
             require(cold.array->cached_chunk({0,0,0}).first,"read_many with a null output caches the chunk");
         }
+        {   // Cancelled reads throw and name the regions they did not write in full.
+            auto cold=vcr::zarr::openPyramidLevel(path.string(),0,[&]{auto o=options;o.memoryCache=std::make_shared<vcr::MemoryCache>(64<<20);return o;}());
+            std::array<uint8_t,8> a{},b{};std::vector<uint8_t> complete;
+            const std::atomic<bool> stop{true},go{false};
+            bool threw=false;
+            try{cold.array->read_many({{0,0,0},{2,2,2}},{{2,2,2},{2,2,2}},{a.data(),b.data()},nullptr,false,&stop,&complete);}
+            catch(const vcr::Cancelled&){threw=true;}
+            require(threw&&complete==std::vector<uint8_t>{0,0}&&!cold.array->cached_chunk({0,0,0}).first,"a cancelled read reads nothing");
+            cold.array->read_many({{0,0,0},{2,2,2}},{{2,2,2},{2,2,2}},{a.data(),b.data()},nullptr,false,&go,&complete);
+            require(complete==std::vector<uint8_t>{1,1}&&a[7]==data[109*109+109+1],"an uncancelled read is complete");
+        }
         std::array<std::array<double,3>,3> points{{{54,54,54},{55.25,56.5,54.125},{53.99,54,54}}};
         std::array<std::array<float,4>,3> result{};
         vcr::sheetNormals(ct,points.front().data(),points.size(),result.front().data());

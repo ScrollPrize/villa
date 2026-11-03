@@ -400,8 +400,9 @@ public:
         mark();
     }
     // Makes the bricks with these keys (see Source: z-major brick-grid indices)
-    // resident, reading them from the array. Throws when they exceed the cache budget,
-    // and Cancelled (nothing made resident) once `cancel` is set while reading.
+    // resident, reading them from the array. Throws when they exceed the cache budget.
+    // Once `cancel` is set while reading, the bricks read in full are still made
+    // resident, then Cancelled is thrown.
     void load_bricks(const std::vector<std::int64_t>& keys, const std::atomic<bool>* cancel=nullptr) {
         ready();
         std::set<std::int64_t> needed;
@@ -418,6 +419,7 @@ public:
         }
         device::Guard guard(device_);
         device::Storage bricks;
+        bool cancelled=false;
         if (!staged.empty()) {
             std::vector<std::uint8_t> host(staged.size()*brick_bytes_);
             std::vector<Index> starts, sizes(staged.size(),Index(source_.brick,source_.brick+3));
@@ -426,7 +428,24 @@ public:
                 auto idx=index(staged[i]); for (int a=0;a<3;++a) idx[a]*=source_.brick[a];
                 starts.push_back(std::move(idx)); outputs.push_back(host.data()+i*brick_bytes_);
             }
-            array_.read_many(starts,sizes,outputs,nullptr,false,cancel);
+            std::vector<std::uint8_t> complete;
+            try { array_.read_many(starts,sizes,outputs,nullptr,false,cancel,&complete); }
+            catch (const Cancelled&) { cancelled=true; }
+            if (cancelled) {
+                // Keep the bricks read in full (in order, so staged stays sorted); the
+                // others are no longer needed by this load.
+                std::size_t kept=0;
+                for (std::size_t i=0;i<staged.size();++i) {
+                    if (!complete[i]) { needed.erase(staged[i]); continue; }
+                    if (kept!=i) {
+                        staged[kept]=staged[i];
+                        std::memcpy(host.data()+kept*brick_bytes_,host.data()+i*brick_bytes_,brick_bytes_);
+                    }
+                    ++kept;
+                }
+                staged.resize(kept); host.resize(kept*brick_bytes_);
+                if (staged.empty()) throw Cancelled("read cancelled");
+            }
             bricks=device::allocate(host.size(),device_);
             // Pageable: the host buffer is free once this returns.
             device::check(cudaMemcpyAsync(bricks->ptr,host.data(),host.size(),cudaMemcpyHostToDevice,device::stream()));
@@ -458,6 +477,7 @@ public:
             throw;
         }
         mark();
+        if (cancelled) throw Cancelled("read cancelled");
     }
     void clear() {
         ready(); std::lock_guard lock(mutex_); device::Guard guard(device_); chain();

@@ -398,12 +398,15 @@ public:
     // into the outputs without being read whole and inserted (callers with their
     // own cache, e.g. the CUDA reader). Memory-cache hits are still used.
     // `cancel`: once set, no further chunk is started and the read throws Cancelled
-    // (chunks already started finish; outputs are then partly written).
+    // (chunks already started finish; outputs are then partly written). `complete`,
+    // when given, is set per region before returning or throwing: 1 when the region's
+    // output was written in full (always 1 for regions with a null output).
     void read_many(const std::vector<Index>& starts, const std::vector<Index>& sizes,
                    const std::vector<std::uint8_t*>& outs, const BoxOutput* output = nullptr,
-                   bool stream = false, const std::atomic<bool>* cancel = nullptr)
+                   bool stream = false, const std::atomic<bool>* cancel = nullptr,
+                   std::vector<std::uint8_t>* complete = nullptr)
     {
-        read_many(starts, sizes, outs, Bounds::Fill, output, stream, cancel);
+        read_many(starts, sizes, outs, Bounds::Fill, output, stream, cancel, complete);
     }
 
     // Strict reads reject nonempty regions outside the array before touching
@@ -411,7 +414,7 @@ public:
     void read_many(const std::vector<Index>& starts, const std::vector<Index>& sizes,
                    const std::vector<std::uint8_t*>& outs, Bounds bounds,
                    const BoxOutput* output = nullptr, bool stream = false,
-                   const std::atomic<bool>* cancel = nullptr)
+                   const std::atomic<bool>* cancel = nullptr, std::vector<std::uint8_t>* complete = nullptr)
     {
         const std::size_t nd = spec_.shape.size();
         if (starts.size() != sizes.size() || starts.size() != outs.size())
@@ -489,7 +492,18 @@ public:
         ordered.reserve(work.size());
         for (auto& [linear, i] : slot)
             ordered.push_back(std::move(work[i]));
-        run(ordered, out_strides, nullptr, output, stream, cancel);
+        if (complete)
+            complete->assign(starts.size(), 1);
+        std::vector<std::uint8_t> resolved;
+        try {
+            run(ordered, out_strides, nullptr, output, stream, cancel, complete ? &resolved : nullptr);
+        } catch (const Cancelled&) {
+            for (std::size_t w = 0; complete && w < ordered.size(); ++w)
+                if (!resolved[w])
+                    for (const auto& piece : ordered[w].pieces)
+                        (*complete)[piece.region] = 0;
+            throw;
+        }
     }
 
     void read_many_float(const std::vector<Index>& starts, const std::vector<Index>& sizes,
@@ -828,20 +842,33 @@ private:
     };
 
     // Resolves every chunk in parallel, in the order given. Once `cancel` is set, no
-    // further chunk is started and Cancelled is thrown.
+    // further chunk is started and Cancelled is thrown; `resolved` (when given) then
+    // marks the chunks resolved before it.
     void run(std::vector<Work>& work, const std::vector<Index>& out_strides, const PointOp* op,
-             const BoxOutput* output = nullptr, bool stream = false, const std::atomic<bool>* cancel = nullptr)
+             const BoxOutput* output = nullptr, bool stream = false, const std::atomic<bool>* cancel = nullptr,
+             std::vector<std::uint8_t>* resolved = nullptr)
     {
-        const auto check = [cancel] {
-            if (cancel && cancel->load(std::memory_order_acquire))
-                throw Cancelled("read cancelled");
-        };
+        const auto cancelled = [cancel] { return cancel && cancel->load(std::memory_order_acquire); };
         if (spec_.hint && (!cache_ || stream))
-            pool_->parallel_for(work.size(), [&](std::size_t i) { check(); hint(work[i]); });
+            pool_->parallel_for(work.size(), [&](std::size_t i) {
+                if (!cancelled())
+                    hint(work[i]);
+            });
+        if (!cancel) {
+            pool_->parallel_for(work.size(), [&](std::size_t i) { resolve(work[i], out_strides, op, output, stream); });
+            return;
+        }
+        std::vector<std::uint8_t> local;
+        auto& done = resolved ? *resolved : local;
+        done.assign(work.size(), 0);
         pool_->parallel_for(work.size(), [&](std::size_t i) {
-            check();
+            if (cancelled())
+                return;
             resolve(work[i], out_strides, op, output, stream);
+            done[i] = 1;
         });
+        if (std::find(done.begin(), done.end(), 0) != done.end())
+            throw Cancelled("read cancelled");
     }
 
     std::size_t plan_segments(std::size_t n) const
