@@ -802,6 +802,7 @@ class ZarrDataset(Dataset):
                 patch_size=self.patch_size,
                 no_spatial=no_spatial,
                 no_scaling=no_scaling,
+                allowed_rotation_axes=getattr(self.mgr, "allowed_rotation_axes", None),
                 skeleton_targets=skeleton_targets if skeleton_targets else None,
                 skeleton_ignore_values=skeleton_ignore_values if skeleton_ignore_values else None,
             )
