@@ -448,10 +448,17 @@ def object_frame(meta, volume_uuid, fit_scale=1):
 def _relationship_family(record, kinds):
     endpoint_kinds = tuple(sorted((kinds[record['a']], kinds[record['b']]),
                                   key=KINDS.index))
-    family = FAMILIES.get((record['kind'], endpoint_kinds))
-    if family == 'fiber_branch' and (record['meta'] or {}).get('adjacent'):
-        return 'adjacent_branch'
-    return family
+    return FAMILIES.get((record['kind'], endpoint_kinds))
+
+
+def adjacent_winding_offset(fiber_a, fiber_b):
+    """W_b - W_a an adjacent-winding branch between two fiber objects
+    asserts: the vertical fiber lies one winding inside the horizontal one.
+    None unless one is H and the other V by stored family (the effective
+    manual-else-automatic tag VC3D signed the branch with; VC3D's
+    adjacentWindingOffset)."""
+    families = tuple((fiber.fiber or {}).get('family') for fiber in (fiber_a, fiber_b))
+    return {('H', 'V'): -1, ('V', 'H'): 1}.get(families)
 
 
 def _ordered_endpoints(entry, kinds):
@@ -470,7 +477,8 @@ def filter_relationships(view_relationships, objects, approved_links_only):
     A relationship is consumed when both endpoints are selected, it applies
     to their selected revisions, it belongs to a family the fitter uses and
     its approval state is allowed (never 'rejected'; only 'approved' in
-    approved-only mode). Adjacent fiber branches are excluded explicitly.
+    approved-only mode). Adjacent-winding fiber branches are consumed like
+    ordinary ones; materialize_fibers signs them.
     """
     kinds = {uuid: obj.kind for uuid, obj in objects.items()}
     consumed, exclusions = [], Counter()
@@ -485,9 +493,6 @@ def filter_relationships(view_relationships, objects, approved_links_only):
         family = _relationship_family(record, kinds)
         if family is None:
             exclusions[f'unused kind {record["kind"]}'] += 1
-            continue
-        if family == 'adjacent_branch':
-            exclusions['adjacent fiber branch'] += 1
             continue
         state = record['approval_state']
         if state == 'rejected':
@@ -749,7 +754,8 @@ class FitInputs:
     order. ``point_collections`` maps resident collection ids to regular PCLs
     whose attached points carry ``on_patch`` ({'id', 'ij', 'edge_uuid'}).
     ``fibers`` maps fiber UUIDs to fiber collections (materialize_fibers) and
-    ``fiber_links`` holds their resolved same-winding branch links.
+    ``fiber_links`` holds their resolved branch links, each with the
+    ``winding_offset`` it asserts (0 same-winding, +-1 adjacent).
     ``patch_overlaps`` maps resident ids to the two-point same-surface
     collections of materialize_patch_overlaps. ``tracks`` holds the track
     collection and its crossings (materialize_tracks), or None when no track
@@ -1036,7 +1042,11 @@ def materialize_fibers(store, snapshot, patches, *, min_point_spacing,
     attach to several patches. A contact on a quad the losses do not sample
     is not attached, and is appended to ``dropped`` as ``(edge UUID, reason)``.
     ``links`` are resolved branch links keyed by resident collection id and
-    raw line index.
+    raw line index; each carries the winding gap it asserts between its
+    ends, ``winding_offset`` = W_b - W_a: 0 for a same-winding branch, -1 or
+    +1 for an adjacent-winding one (adjacent_winding_offset). An adjacent
+    branch whose fibers are not one H and one V asserts no direction and is
+    left out.
     """
     from vc_object_store import fiber_branch_control_index, fiber_hv_classification
     from spiral_helpers import (_decimate_ordered_points_min_spacing,
@@ -1154,10 +1164,18 @@ def materialize_fibers(store, snapshot, patches, *, min_point_spacing,
 
     links = []
     for rel in snapshot.relationships_of('fiber_branch'):
+        winding_offset = 0
+        if rel.meta.get('adjacent'):
+            winding_offset = adjacent_winding_offset(
+                snapshot.objects[rel.a], snapshot.objects[rel.b])
+            if winding_offset is None:
+                counts['adjacent fiber branches not one H and one V'] += 1
+                continue
         links.append({
             'a_coll': resident_id[rel.a], 'a_point': branch_points[rel.a][rel.uuid],
             'b_coll': resident_id[rel.b], 'b_point': branch_points[rel.b][rel.uuid],
             'pending': rel.approval_state != 'approved', 'edge_uuid': rel.uuid,
+            'winding_offset': winding_offset,
         })
     counts['fiber branches'] = len(links)
     return catalog, links, counts

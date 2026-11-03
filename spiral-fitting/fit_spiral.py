@@ -1168,7 +1168,7 @@ class FitContext:
         """Rebuild the unattached link-component view in place.
 
         Each entry of self.unattached_components is the list of member strip
-        indices connected by same-winding links (singletons for unlinked
+        indices connected by fiber links (singletons for unlinked
         strips). The 'unattached' sampling strata index these components; each
         step the loss samples a chain *walk* through a chosen component -- along
         a strip, optionally hopping to the linked strip at each junction -- and

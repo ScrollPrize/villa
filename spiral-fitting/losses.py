@@ -1279,15 +1279,17 @@ def get_unattached_pcl_strip_losses(
     # (but excluded from) the random loss samples).
     #
     # Graph awareness (cross-fiber links): sampling_strata indexes *components* --
-    # groups of strips joined by same-winding links (component_strip_lists gives
+    # groups of strips joined by fiber links (component_strip_lists gives
     # each component's member strip indices, component_edges its junctions as
     # (strip_a, pos_a, strip_b, pos_b)). Each chosen component contributes one row
     # sampled along a chain *walk* through its strips (_sample_component_walk):
     # along a strip, hopping to the linked strip at a junction with
     # cfg['loss_fiber_link_branch_probability'], so a junction hop is an ordinary
     # registered step and cached crossings continue through it. The constant-shifted-radius target (1) along the
-    # walk then pulls points on either side of every traversed junction onto one
-    # shared winding; over steps, random walks cover all of a component's
+    # walk then pulls points on either side of every traversed junction onto
+    # their linked windings (one shared winding, or one apart across an
+    # adjacent-winding link: the fibers' winding annotations differ by it);
+    # over steps, random walks cover all of a component's
     # junctions. Rows can mix strips, but every walk begins at one endpoint of
     # one member strip, which supplies a canonical DT frame anchor. A singleton
     # component reduces exactly to the legacy per-strip row.

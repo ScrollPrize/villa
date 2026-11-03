@@ -323,9 +323,10 @@ that each number their points from 0) and are recorded on the objects.
 What the ingest covers: tifxyz patches (`--surface`, one directory each,
 stored as kind `surface`), the outer shell (a tifxyz surface tagged
 `spiral-outer-shell`), the PCL role documents, and the fiber directory with
-its same-winding branches
-(which become `fiber_branch` relationships; adjacent branches are kept but
-never used by the fit), and tracks (`--tracks`, one object per track, keyed by
+its same-winding and adjacent-winding branches
+(which become `fiber_branch` relationships; the fit ties an adjacent branch's
+V fiber one winding inside its H fiber, and leaves out one whose fibers are
+not one H and one V), and tracks (`--tracks`, one object per track, keyed by
 its packed store and source ID). A collection is absolute-winding when its
 `meta.source.winding_is_absolute` is true, which the ingest sets for a
 document named `abs_winding.json`; otherwise its points' `wind_a` annotations

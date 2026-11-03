@@ -550,8 +550,10 @@ class Config:
         self.pcl_link_distance_tolerance = 2.5
         self.pcl_link_window_points = 1
         self.pcl_link_window_min_points = 1
-        # Cross-fiber links (the store's ordinary fiber_branch relationships):
-        # same-winding continuations between fibers. When on, linked fibers
+        # Cross-fiber links (the store's fiber_branch relationships):
+        # same-winding continuations between fibers, or adjacent-winding
+        # links between an H and a V fiber (the V one winding inside). When
+        # on, linked fibers
         # merge into per-component cross-patch pcls with an explicit fiber
         # graph (winding ties propagate through junctions whether or not the
         # junction points attach to patches), and the unattached-strip loss

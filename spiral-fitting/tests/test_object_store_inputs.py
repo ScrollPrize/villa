@@ -154,14 +154,14 @@ def test_relationship_filtering_and_endpoint_order(db):
     db.set_approval(rejected, 'rejected')
     outside = pcl_patch_edge(db, pcl, 1, other_patch, (1.0, 1.0))
     ordinary = branch(db, b, 30, a, 20)
-    branch(db, a, 10, b, 40, adjacent=True)
+    adjacent = branch(db, a, 10, b, 40, adjacent=True)
 
     snapshot = osi.read_snapshot(db, request(surface={'uuids': (patch,)}))
     consumed = {rel.uuid: rel for rel in snapshot.relationships}
-    assert set(consumed) == {pending, approved, ordinary}
+    assert set(consumed) == {pending, approved, ordinary, adjacent}
     assert outside not in consumed
-    assert snapshot.exclusions == {
-        'rejected': 1, 'endpoint outside selection': 1, 'adjacent fiber branch': 1}
+    assert snapshot.exclusions == {'rejected': 1, 'endpoint outside selection': 1}
+    assert consumed[adjacent].family == 'fiber_branch'
     edge = consumed[pending]
     assert (edge.family, edge.a, edge.b) == ('pcl_patch', patch, pcl)
     assert edge.b_anchor['points'][0]['array'] == 'point_ids'
@@ -171,7 +171,7 @@ def test_relationship_filtering_and_endpoint_order(db):
     approved_only = osi.read_snapshot(db, request(
         surface={'uuids': (patch,)}, approved=True))
     assert [rel.uuid for rel in approved_only.relationships] == [approved]
-    assert approved_only.exclusions['pending (approved-only)'] == 2
+    assert approved_only.exclusions['pending (approved-only)'] == 3
 
 
 def test_manifest_records_frames_and_its_digest_follows_inputs(db, tmp_path):

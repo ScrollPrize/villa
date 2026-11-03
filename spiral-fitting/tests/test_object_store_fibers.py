@@ -80,13 +80,98 @@ def test_missing_anchored_control_ids_fail(db):
         osi.materialize_fibers(db, snapshot, {}, min_point_spacing=0.0)
 
 
-def test_adjacent_branches_never_link(db):
-    a = put_fiber(db, _dense_line(10), [0, 9], [1, 2])
-    b = put_fiber(db, _dense_line(10, y=130.0), [0, 9], [3, 4])
-    branch(db, a, 2, b, 3, adjacent=True)
+def _hv_fiber(db, family, y):
+    return put_fiber(db, _dense_line(10, y=y), [0, 9], [1, 2],
+                     fiber={'family': family, 'manual_family': False})
+
+
+def _link_offsets(inputs):
+    """{edge UUID: winding_offset as W_b - W_a, oriented by fiber UUID}."""
+    uuid_of = {pcl['id']: uuid for uuid, pcl in inputs.fibers.items()}
+    return {link['edge_uuid']: (uuid_of[link['a_coll']], uuid_of[link['b_coll']],
+                                link['winding_offset'])
+            for link in inputs.fiber_links}
+
+
+def test_adjacent_branches_put_the_vertical_fiber_one_winding_inside(db):
+    h = _hv_fiber(db, 'H', 104.0)
+    v = _hv_fiber(db, 'V', 120.0)
+    other_h = _hv_fiber(db, 'H', 136.0)
+    # Either stored order: the sign comes from the fibers' families.
+    forward = branch(db, h, 1, v, 1, adjacent=True)
+    backward = branch(db, v, 2, other_h, 2, adjacent=True)
+    same = branch(db, h, 2, other_h, 1)
+    links = _link_offsets(materialize(db))
+    winding = lambda a, b, offset, fiber: {a: 0, b: offset}[fiber]
+    for edge in (forward, backward):
+        a, b, offset = links[edge]
+        horizontal = h if edge == forward else other_h
+        assert winding(a, b, offset, v) == winding(a, b, offset, horizontal) - 1
+    assert links[same][2] == 0
+
+
+def test_adjacent_branches_need_one_h_and_one_v(db):
+    a = _hv_fiber(db, 'H', 104.0)
+    b = _hv_fiber(db, 'H', 120.0)
+    untagged = put_fiber(db, _dense_line(10, y=136.0), [0, 9], [1, 2])
+    branch(db, a, 1, b, 1, adjacent=True)
+    branch(db, a, 2, untagged, 1, adjacent=True)
     inputs = materialize(db)
     assert inputs.fiber_links == []
-    assert inputs.snapshot.exclusions['adjacent fiber branch'] == 1
+    assert inputs.counts['adjacent fiber branches not one H and one V'] == 2
+
+
+def test_adjacent_links_offset_whole_fibers_and_drop_contradicting_loops(db):
+    from pcl_views import fiber_training_views, prepare_fiber_catalog
+    h = _hv_fiber(db, 'H', 104.0)
+    v = _hv_fiber(db, 'V', 120.0)
+    other_h = _hv_fiber(db, 'H', 136.0)
+    branch(db, h, 1, v, 1, adjacent=True)
+    branch(db, v, 2, other_h, 2, adjacent=True)
+    # h and other_h are each one winding outside v, so a same-winding tie
+    # between them agrees; one claiming them a winding apart cannot.
+    branch(db, h, 2, other_h, 1)
+    inputs = materialize(db)
+    fibers = prepare_fiber_catalog(inputs.fibers)
+    _, strips, _, components = fiber_training_views(
+        fibers, inputs.fiber_links, {}, z_begin=0, z_end=100, z_margin=0,
+        min_point_spacing=0.0)
+    winding = {strip['logical_input_id']: set(strip['windings'].tolist())
+               for strip in strips}
+    assert len(winding[h]) == len(winding[v]) == len(winding[other_h]) == 1
+    assert winding[h] == winding[other_h]
+    assert winding[v] == {next(iter(winding[h])) - 1}
+    [(_, member_links)] = components
+    assert len(member_links) == 3
+
+
+def test_a_contradicting_fiber_link_leaves_the_component(db):
+    from pcl_views import fiber_training_views, prepare_fiber_catalog
+    h = _hv_fiber(db, 'H', 104.0)
+    v = _hv_fiber(db, 'V', 120.0)
+    branch(db, h, 1, v, 1, adjacent=True)
+    branch(db, h, 2, v, 2)
+    inputs = materialize(db)
+    _, strips, _, components = fiber_training_views(
+        prepare_fiber_catalog(inputs.fibers), inputs.fiber_links, {},
+        z_begin=0, z_end=100, z_margin=0, min_point_spacing=0.0)
+    [(members, [kept])] = components
+    assert len(members) == 2
+    winding = {strip['logical_input_id']: strip['windings'][0] for strip in strips}
+    assert winding[v] - winding[h] == kept['winding_offset'] * (
+        1 if inputs.fibers[v]['id'] == kept['b_coll'] else -1)
+
+
+def test_fiber_winding_offsets_flag_the_link_closing_a_bad_loop():
+    from pcl_views import fiber_winding_offsets
+    links = [{'a_coll': 0, 'b_coll': 1, 'winding_offset': -1},
+             {'a_coll': 1, 'b_coll': 2, 'winding_offset': 1},
+             {'a_coll': 0, 'b_coll': 2, 'winding_offset': 1}]
+    offsets, contradicting = fiber_winding_offsets([([0, 1, 2], links)])
+    # Breadth first from 0: both of 0's links place 1 and 2, so 1-2 closes
+    # the loop and disagrees (-1 + 1 != 1).
+    assert offsets == {0: 0, 1: -1, 2: 1}
+    assert contradicting == [links[1]]
 
 
 def test_attachments_to_several_patches_share_one_physical_node(db, tmp_path):
