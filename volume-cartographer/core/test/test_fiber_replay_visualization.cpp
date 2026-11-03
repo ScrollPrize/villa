@@ -3,6 +3,7 @@
 
 #include "vc/core/types/Array3D.hpp"
 #include "vc/core/types/Volume.hpp"
+#include "support/TestZarrVolume.hpp"
 #include "vc/core/util/QuadSurface.hpp"
 #include "vc/fiber_tracer/FiberReplayVisualization.hpp"
 #include "vc/fiber_tracer/FiberJson.hpp"
@@ -22,94 +23,6 @@
 #include <random>
 #include <opencv2/imgcodecs.hpp>
 #include <thread>
-
-TEST_CASE("real Paris4 replay renders aligned CT and prediction inspection")
-{
-    using namespace vc::fiber_tracer;
-    const char* ctPath = std::getenv("LASAGNA_TEST_VOLUME");
-    const char* normalPath = std::getenv("VC_TEST_GRAPH_NORMALS");
-    const char* predictionPath = std::getenv("VC_TEST_GRAPH_PREDICTIONS");
-    const char* fiberPath = std::getenv("VC_TEST_WIDTH_FIBER");
-    const char* outputPath = std::getenv("VC_TEST_REPLAY_VIS_OUTPUT");
-    if (!ctPath || !normalPath || !predictionPath || !fiberPath || !outputPath) {
-        std::cout << "Real replay visualization not configured; skipping optional fixture\n";
-        return;
-    }
-    nlohmann::json input;
-    std::ifstream(fiberPath) >> input;
-    const auto points = vc3dFiberPointArrayFromJson(input, "line_points", input.at("version"), "real fiber");
-    const auto full = makePolylineArcGeometry(points);
-    REQUIRE(full.length() > 128);
-    const auto reference = slicePolylineArc(full, 0, 128);
-    vc::lasagna::LasagnaDatasetOpenOptions options;
-    options.workingToBaseScale = 8;
-    const auto normalData = vc::lasagna::LasagnaDataset::open(normalPath, options);
-    const auto predictionData = vc::lasagna::LasagnaDataset::open(predictionPath, options);
-    const vc::lasagna::LasagnaNormalSampler normals(normalData);
-    const FiberPredictionField predictions(predictionData);
-    FiberTraceConfig config;
-    config.traceToBaseScale = 8;
-    config.coneGridSize = 5;
-    const auto replay = replayFiberBeamCase(predictions, config, 8, normals, normals, 8,
-        FiberEvaluationCase{reference}, FiberChunkReplayConfig{});
-    REQUIRE_FALSE(replay.segments.empty());
-    auto volume = Volume::New(ctPath);
-    const auto source = validateFiberReplayStripCtVolume(*volume, ctPath);
-    CHECK(source.scaleFromBaseXYZ == std::array<double,3>{0.5,0.5,0.5});
-    size_t ctNonzero = 0, presenceNonzero = 0;
-    std::vector<cv::Mat_<cv::Vec3f>> ctCoordinates, presenceCoordinates;
-    const auto ct = [&](const cv::Mat_<cv::Vec3f>& coordinates, int scale) -> cv::Mat_<uint8_t> {
-        ctCoordinates.push_back(coordinates.clone());
-        cv::Mat_<uint8_t> image = vc::core::util::renderCoordsTextureFineToCoarse(
-            coordinates, *volume, 0, scale, "Real replay CT");
-        ctNonzero += cv::countNonZero(image);
-        return image;
-    };
-    const auto presence = [&](const cv::Mat_<cv::Vec3f>& coordinates, int scale) {
-        presenceCoordinates.push_back(coordinates.clone());
-        auto image = renderFiberReplayPresenceTexture(coordinates, scale, source, 8, predictions);
-        presenceNonzero += cv::countNonZero(image);
-        return image;
-    };
-    const auto inspection = renderFiberReplayInspection(reference, replay, normals, 8,
-        source, ct, presence, 20, false, 2.4);
-    REQUIRE_FALSE(inspection.pages.empty());
-    CHECK(ctNonzero > 0);
-    CHECK(presenceNonzero > 0);
-    REQUIRE(ctCoordinates.size() == presenceCoordinates.size());
-    for (size_t i = 0; i < ctCoordinates.size(); ++i) {
-        REQUIRE(ctCoordinates[i].size() == presenceCoordinates[i].size());
-        CHECK(cv::norm(ctCoordinates[i], presenceCoordinates[i], cv::NORM_INF) == 0);
-    }
-    const auto repeated = renderFiberReplayInspection(reference, replay, normals, 8,
-        source, ct, presence, 20, false, 2.4);
-    CHECK(repeated.metadata == inspection.metadata);
-    REQUIRE(repeated.pages.size() == inspection.pages.size());
-    const std::filesystem::path output(outputPath);
-    std::filesystem::create_directories(output);
-    for (size_t i = 0; i < inspection.pages.size(); ++i) {
-        CHECK(cv::norm(repeated.pages[i], inspection.pages[i], cv::NORM_INF) == 0);
-        vc::core::util::writeUncompressedTextureTiff(output / ("inspection_" + std::to_string(i) + ".tif"), inspection.pages[i]);
-        REQUIRE(cv::imwrite((output / ("inspection_" + std::to_string(i) + ".png")).string(), inspection.pages[i]));
-    }
-    vc::core::util::atomicWriteString(output / "inspection.json", inspection.metadata.dump(2));
-    const auto center = reference.front();
-    writeFiberletCropBoxVisualization(*volume, ctPath, center - cv::Vec3d::all(32),
-        center + cv::Vec3d::all(32), output / "crop", 128);
-    for (const char* face : {"x_min", "x_max", "y_min", "y_max", "z_min", "z_max"}) {
-        const auto texture = output / (std::string("crop_") + face + ".tif");
-        const auto image = cv::imread(texture.string(), cv::IMREAD_UNCHANGED);
-        CHECK(image.size() == cv::Size(33, 33));
-        CHECK(image.type() == CV_8UC1);
-        CHECK(cv::countNonZero(image) > 0);
-        CHECK(std::filesystem::exists(output / (std::string("crop_") + face + ".obj")));
-    }
-    std::cout << "Real Paris4 inspection: " << inspection.pages.size() << " pages, "
-              << inspection.metadata.at("cross_sections").size() << " sections, "
-              << replay.failures.size() << " restarts; exact CT/presence coordinate alignment"
-              << " and repeated pixels/metadata; six CT crop faces\n";
-}
-
 
 namespace
 {
@@ -139,13 +52,12 @@ TEST_CASE("crop CT source validates concrete uint8 arrays and preserves OME offs
 {
     using namespace vc::fiber_tracer;
     const auto directory = temporaryDirectory();
-    Volume::ZarrCreateOptions options;
+    vc::test::ZarrVolumeSpec options;
     options.shapeZYX = {8,8,8};
     options.chunkShapeZYX = {4,4,4};
     options.dtype = vc::render::ChunkDtype::UInt8;
     options.numLevels = 2;
-    options.compressor = "none";
-    auto pyramid = Volume::New(directory / "ct", options);
+    auto pyramid = vc::test::createZarrVolume(directory / "ct", options);
     REQUIRE(pyramid);
     CHECK_THROWS(validateFiberReplayStripCtVolume(*pyramid, (directory / "ct").string()));
     pyramid.reset();
@@ -195,7 +107,7 @@ TEST_CASE("crop CT source validates concrete uint8 arrays and preserves OME offs
     volume.reset();
     options.dtype = vc::render::ChunkDtype::UInt16;
     options.numLevels = 1;
-    auto wider = Volume::New(directory / "uint16", options);
+    auto wider = vc::test::createZarrVolume(directory / "uint16", options);
     wider.reset();
     wider = Volume::New(directory / "uint16/0");
     CHECK_THROWS(validateFiberReplayStripCtVolume(*wider, (directory / "uint16/0").string()));
@@ -481,13 +393,12 @@ bool cyanDominant(const cv::Vec3b& pixel)
 TEST_CASE("long-span overview maps overlays and endpoint markers to resampled columns")
 {
     const auto directory = temporaryDirectory();
-    Volume::ZarrCreateOptions options;
+    vc::test::ZarrVolumeSpec options;
     options.shapeZYX = {64, 64, 64};
     options.chunkShapeZYX = {16, 16, 16};
     options.dtype = vc::render::ChunkDtype::UInt8;
     options.numLevels = 1;
-    options.compressor = "none";
-    auto volume = Volume::New(directory / "ct", options);
+    auto volume = vc::test::createZarrVolume(directory / "ct", options);
     volume.reset();
     const auto ct = (directory / "ct/0").string();
     volume = Volume::New(ct);
@@ -544,17 +455,15 @@ TEST_CASE("long-span overview maps overlays and endpoint markers to resampled co
 TEST_CASE("full replay overview renders selected top and side strips with disconnected trace overlays")
 {
     const auto directory = temporaryDirectory() / "overview_ct";
-    Volume::ZarrCreateOptions options;
+    vc::test::ZarrVolumeSpec options;
     options.shapeZYX = {32, 32, 32};
     options.chunkShapeZYX = {16, 16, 16};
     options.dtype = vc::render::ChunkDtype::UInt8;
     options.numLevels = 2;
-    options.compressor = "none";
-    options.overwriteExisting = true;
-    auto pyramid = Volume::New(directory, options);
+    auto pyramid = vc::test::createZarrVolume(directory, options);
     REQUIRE(pyramid);
     Array3D<uint8_t> values({32, 32, 32}, uint8_t(96));
-    pyramid->writeZYX(values, {0, 0, 0});
+    vc::test::writeZYX(*pyramid, values, {0, 0, 0});
     pyramid.reset();
     auto volume = Volume::New(directory / "1");
     REQUIRE(volume);

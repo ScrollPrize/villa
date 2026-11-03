@@ -81,6 +81,17 @@ int runChild(const QStringList& arguments)
         std::raise(SIGKILL);
         return 1;
     }
+    if (mode == "report") {
+        // A report line split across writes, and one without a final newline.
+        QFile out;
+        out.open(stdout, QIODevice::WriteOnly);
+        out.write("progress\nsurface_uu");
+        out.flush();
+        QThread::msleep(50);
+        out.write("id: 11111111-1111-1111-1111-111111111111\nsurface_uuid: 22222222-2222-2222-2222-222222222222");
+        out.flush();
+        return 0;
+    }
     if (mode == "write-omp" && marker + 2 < arguments.size()) {
         QFile output(arguments.at(marker + 2));
         if (!output.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
@@ -150,7 +161,7 @@ private slots:
 
         QVERIFY(!completionSucceeded(finished));
         QVERIFY(completionMessage(finished).contains(
-            "failed to start", Qt::CaseInsensitive));
+            "could not be started", Qt::CaseInsensitive));
         QVERIFY(!runner.isRunning());
     }
 
@@ -170,25 +181,6 @@ private slots:
         QVERIFY(startHelper(runner, "success"));
         QTRY_COMPARE_WITH_TIMEOUT(finished.count(), 2, 3000);
         QVERIFY(completionSucceeded(finished, 1));
-    }
-
-    void pendingProcessErrorOverridesCleanExit()
-    {
-        CommandLineToolRunner runner(nullptr, {});
-        QSignalSpy finished(&runner, &CommandLineToolRunner::toolFinished);
-
-        QVERIFY(startHelper(runner, "delayed-success"));
-        QTRY_VERIFY_WITH_TIMEOUT(runner.isRunning(), 1000);
-        QVERIFY(QMetaObject::invokeMethod(
-            &runner,
-            "onProcessError",
-            Qt::DirectConnection,
-            Q_ARG(QProcess::ProcessError, QProcess::ReadError)));
-        expectSingleCompletion(finished);
-
-        QVERIFY(!completionSucceeded(finished));
-        QVERIFY(completionMessage(finished).contains(
-            "read error", Qt::CaseInsensitive));
     }
 
     void completionObserverCanStartNextRun()
@@ -269,7 +261,8 @@ private slots:
     {
         CommandLineToolRunner runner(nullptr, {});
         runner.setVolumePath("volume.zarr");
-        runner.setSegmentPath("surface");
+        runner.setStore("objects.vcobj", 1.0);
+        runner.setSurface("surface-uuid");
         const QString zarrPath = QDir::temp().filePath("render.zarr");
         runner.setOutputPattern(zarrPath);
         runner.setRenderParams(1.0f, 0, 4);
@@ -280,7 +273,6 @@ private slots:
             runner.argumentsForTesting(CommandLineToolRunner::Tool::RenderTifXYZ);
         QCOMPARE(arguments.count("--zarr-output"), 1);
         QCOMPARE(arguments.count("--tif-output"), 1);
-        QVERIFY(!arguments.contains("--include-tifs"));
 
         const int tifOption = arguments.indexOf("--tif-output");
         QVERIFY(tifOption >= 0 && tifOption + 1 < arguments.size());
@@ -293,7 +285,8 @@ private slots:
     {
         CommandLineToolRunner runner(nullptr, {});
         runner.setVolumePath("volume.zarr");
-        runner.setSegmentPath("surface");
+        runner.setStore("objects.vcobj", 1.0);
+        runner.setSurface("surface-uuid");
         runner.setOutputPattern(QDir::temp().filePath("render_layers"));
         runner.setRenderParams(1.0f, 0, 4);
         runner.setRenderOutputFormat(CommandLineToolRunner::RenderOutputFormat::TifStack);
@@ -303,7 +296,84 @@ private slots:
             runner.argumentsForTesting(CommandLineToolRunner::Tool::RenderTifXYZ);
         QCOMPARE(arguments.count("--tif-output"), 1);
         QCOMPARE(arguments.count("--zarr-output"), 0);
-        QVERIFY(!arguments.contains("--include-tifs"));
+    }
+
+    void renderReadsTheStoredSurface()
+    {
+        CommandLineToolRunner runner(nullptr, {});
+        runner.setVolumePath("volume.zarr");
+        runner.setStore("objects.vcobj", 1.0);
+        runner.setSurface("surface-uuid");
+        runner.setOutputPattern(QDir::temp().filePath("render_layers"));
+        const QStringList arguments =
+            runner.argumentsForTesting(CommandLineToolRunner::Tool::RenderTifXYZ);
+        const int store = arguments.indexOf("--store");
+        const int surface = arguments.indexOf("--surface");
+        QVERIFY(store >= 0 && surface >= 0);
+        QCOMPARE(arguments.at(store + 1), QString("objects.vcobj"));
+        QCOMPARE(arguments.at(surface + 1), QString("surface-uuid"));
+        QVERIFY(!arguments.contains("--segmentation"));
+    }
+
+    // Every store tool takes the one store contract: --store, --volume-uuid,
+    // its inputs as --surface, a new surface's --name, --tag.
+    void storeToolsTakeOneContract()
+    {
+        const auto value = [](const QStringList& args, const QString& option) {
+            const int at = args.indexOf(option);
+            return at >= 0 && at + 1 < args.size() ? args.at(at + 1) : QString();
+        };
+        CommandLineToolRunner runner(nullptr, {});
+        runner.setStore("objects.vcobj", 1.0);
+
+        runner.setTraceParams("volume.zarr", "vol", "source", "trace", "params.json", "src-uuid");
+        auto args = runner.argumentsForTesting(CommandLineToolRunner::Tool::GrowSegFromSegment);
+        QCOMPARE(value(args, "--store"), QString("objects.vcobj"));
+        QCOMPARE(value(args, "--surface"), QString("src-uuid"));
+        QCOMPARE(value(args, "--volume-uuid"), QString("vol"));
+        QVERIFY2(!args.contains("--voxel-scale"), "the volume's own voxels need no scale");
+        QCOMPARE(value(args, "--tag"), QString("trace"));
+
+        runner.setNeighborCopyParams("volume.zarr", "params.json", "resume-uuid", "vol", "copy", "");
+        args = runner.argumentsForTesting(CommandLineToolRunner::Tool::NeighborCopy);
+        QCOMPARE(value(args, "--surface"), QString("resume-uuid"));
+        QCOMPARE(value(args, "--tag"), QString("copy"));
+
+        runner.setObjRefineParams("volume.zarr", "src-uuid", "refined", "params.json", "vol");
+        args = runner.argumentsForTesting(CommandLineToolRunner::Tool::AlphaCompRefine);
+        QCOMPARE(value(args, "--surface"), QString("src-uuid"));
+        QCOMPARE(value(args, "--name"), QString("refined"));
+        QCOMPARE(args.mid(args.indexOf("volume.zarr"), 2), QStringList({"volume.zarr", "params.json"}));
+        runner.setObjRefineParams("volume.zarr", "src-uuid", "", "params.json", "vol");
+        args = runner.argumentsForTesting(CommandLineToolRunner::Tool::AlphaCompRefine);
+        QVERIFY2(!args.contains("--name"), "no name refines in place");
+
+        runner.setMergePatchParams("parent-uuid", "child-uuid", true, 16, 6, 4, 3000, 5, 10, 3, 0, 0);
+        args = runner.argumentsForTesting(CommandLineToolRunner::Tool::MergePatch);
+        QCOMPARE(args.count("--surface"), 2);
+        QCOMPARE(args.at(args.indexOf("--surface") + 1), QString("parent-uuid"));
+        QCOMPARE(args.at(args.lastIndexOf("--surface") + 1), QString("child-uuid"));
+        QVERIFY(args.contains("--explicit-roles"));
+        QVERIFY(!args.contains("--parent") && !args.contains("--child"));
+
+        // At a working level the tools work in that level's voxels of the volume.
+        runner.setStore("objects.vcobj", 0.25);
+        runner.setTraceParams("volume.zarr", "vol", "source", "trace", "params.json", "src-uuid");
+        args = runner.argumentsForTesting(CommandLineToolRunner::Tool::GrowSegFromSegment);
+        QCOMPARE(value(args, "--volume-uuid"), QString("vol"));
+        QCOMPARE(value(args, "--voxel-scale"), QString("0.25"));
+    }
+
+    void createdSurfacesComeFromReportLines()
+    {
+        CommandLineToolRunner runner(nullptr, {});
+        QSignalSpy finished(&runner, &CommandLineToolRunner::toolFinished);
+        QVERIFY(startHelper(runner, "report"));
+        expectSingleCompletion(finished);
+        QVERIFY(completionSucceeded(finished));
+        QCOMPARE(runner.createdSurfaces(),
+                 QStringList({"11111111-1111-1111-1111-111111111111",
+                              "22222222-2222-2222-2222-222222222222"}));
     }
 };
 

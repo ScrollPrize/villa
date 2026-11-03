@@ -29,11 +29,6 @@ from .disk_cache import VC3D, atomic_write, cached_node_dirs, cached_source_zarr
 from .zarr_reader import MemoryCache, ZarrReader, _make_spec
 from .transport import cache_url, read_node_file
 
-#: Settings of ZarrGroup.open that its arrays are opened with.
-_READER_OPTIONS = ("cache_dir", "cache_writes", "cache_max_bytes", "compress_cache", "allow_lossy_cache", "threads", "connections",
-                   "read_mode", "offline", "prefetcher")
-
-
 class ZarrGroup:
     """A Zarr v2/v3 group opened for reading. Use :meth:`open`."""
 
@@ -66,7 +61,6 @@ class ZarrGroup:
         connections: int = 16,
         read_mode: str = "mmap",
         offline: bool = False,
-        prefetcher=None,
     ) -> ZarrGroup:
         """Open the Zarr v2/v3 group at ``location`` (a directory, ``http(s)://`` or ``s3://`` URL).
 
@@ -78,7 +72,7 @@ class ZarrGroup:
         options = dict(cache_dir=cache_dir, cache_writes=cache_writes, compress_cache=compress_cache,
                        cache_max_bytes=cache_max_bytes,
                        allow_lossy_cache=allow_lossy_cache, threads=threads, connections=connections,
-                       read_mode=read_mode, offline=offline, prefetcher=prefetcher)
+                       read_mode=read_mode, offline=offline)
         # Validates the options and resolves the credentials once for the whole group.
         spec, cache = _make_spec(loc, auth=auth, memory_cache=memory_cache, **options)
         access: Access = spec["access"]
@@ -298,14 +292,6 @@ class ZarrGroup:
 
     def __iter__(self) -> Iterator[str]:
         return iter(self.keys())
-
-    def array_keys(self) -> list[str]:
-        """Names of immediate child arrays, sorted; same listing limits as keys()."""
-        return [key for key in self.keys() if (node := self._node(key)) is not None and node[0] == "array"]
-
-    def group_keys(self) -> list[str]:
-        """Names of immediate child groups, sorted; same listing limits as keys()."""
-        return [key for key in self.keys() if (node := self._node(key)) is not None and node[0] == "group"]
 
     def _list_s3(self) -> list[str]:
         """Immediate sub-prefixes of this group's S3 prefix (ListObjectsV2)."""

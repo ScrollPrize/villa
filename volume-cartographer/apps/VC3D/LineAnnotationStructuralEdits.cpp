@@ -119,6 +119,12 @@ std::optional<MergePlan> planFiberMerge(const StoredFiber& clicked,
         const auto b = geometryCoordinates(far.coordinateIdentity.value("coordinates", nlohmann::json::object()));
         // Advisory bindings (volume labels, dimensions) do not define a frame.
         if (a != b) throw std::invalid_argument("different coordinate frames");
+        // Both must be in the same voxels too: the merged fiber's positions are
+        // mapped back to the stored frame through the clicked fiber's frame.
+        const bool sameView = clicked.frame.has_value() == far.frame.has_value() &&
+            (!clicked.frame || (clicked.frame->volume == far.frame->volume &&
+                                clicked.frame->storedToVolume == far.frame->storedToVolume));
+        if (!sameView) throw std::invalid_argument("different coordinate frames");
         (void)mergeGeometryCoordinates(a, b); // Also check exact mixed integer/float scales.
     } catch (const std::exception&) {
         fail(error, "Cannot merge fibers from different coordinate frames");
@@ -188,9 +194,9 @@ std::optional<MergePlan> planFiberMerge(const StoredFiber& clicked,
     // The join span has no real geometry until the merged line is re-fit.
     addUniqueSorted(merged.tags, std::string{kNeedsReoptimizationTag});
     merged.hvClassification =
-        classifyFiberHv(storedControlPointPositions(merged.controlPoints));
-    merged.coordinateBaseShapeZYX = clicked.coordinateBaseShapeZYX;
+        vc::fiber_tracer::classifyFiberHv(storedControlPointPositions(merged.controlPoints));
     merged.coordinateIdentity = clicked.coordinateIdentity;
+    merged.frame = clicked.frame;
     // Third-party links only: the pair link between the merge endpoints is
     // consumed, and other mutual links were rejected above. Directions are
     // left as stored; the batch canonicalization recomputes them from the
@@ -243,8 +249,8 @@ std::optional<SplitPlanResult> planFiberSplit(const StoredFiber& parent,
         addUniqueSorted(half.tags, std::string{kNeedsReoptimizationTag});
         half.optimizationMode = parent.optimizationMode;
         half.modelOnly = parent.modelOnly;
-        half.coordinateBaseShapeZYX = parent.coordinateBaseShapeZYX;
         half.coordinateIdentity = parent.coordinateIdentity;
+        half.frame = parent.frame;
     };
     StoredFiber& prefix = result.prefix;
     StoredFiber& suffix = result.suffix;
@@ -278,8 +284,8 @@ std::optional<SplitPlanResult> planFiberSplit(const StoredFiber& parent,
         moved.controlPointIndex = remapped->second;
         (remapped->first ? suffix : prefix).branches.push_back(std::move(moved));
     }
-    prefix.hvClassification = classifyFiberHv(storedControlPointPositions(prefix.controlPoints));
-    suffix.hvClassification = classifyFiberHv(storedControlPointPositions(suffix.controlPoints));
+    prefix.hvClassification = vc::fiber_tracer::classifyFiberHv(storedControlPointPositions(prefix.controlPoints));
+    suffix.hvClassification = vc::fiber_tracer::classifyFiberHv(storedControlPointPositions(suffix.controlPoints));
 
     if (linkHalves) {
         // "Split and link, same winding": record the boundary connection as

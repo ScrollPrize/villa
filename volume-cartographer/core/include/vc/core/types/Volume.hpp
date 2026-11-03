@@ -4,7 +4,6 @@
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
-#include <functional>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -45,48 +44,10 @@ public:
 
     static std::shared_ptr<Volume> New(std::filesystem::path path);
 
-    // Open an existing local volume and apply project-entry metadata (see
-    // vc::project::volumeMetadataFromEntryTags) over its meta.json, as
-    // NewFromUrl does for a remote volume. A catalog volume ID gives a local
-    // copy of a catalog volume the same identity as the streamed volume.
+    // Open an existing local volume and apply metadata (uuid, voxelsize, name)
+    // over its meta.json, as NewFromUrl does for a remote volume.
     static std::shared_ptr<Volume> New(std::filesystem::path path,
                                        const utils::Json& metadata);
-
-    struct PyramidPolicy {
-        enum class Reduction {
-            Mean,
-            Max,
-            BinaryOr,
-        };
-
-        // Per-level downsample from one level to the next in zarr/storage order
-        // [z, y, x]. The default creates a conventional 2x pyramid in all dims.
-        std::array<double, 3> downsampleZYX{2.0, 2.0, 2.0};
-        Reduction reduction = Reduction::Mean;
-    };
-
-    struct ZarrCreateOptions {
-        // Base level shape in zarr/storage order: [z, y, x].
-        std::array<size_t, 3> shapeZYX{};
-        std::array<size_t, 3> chunkShapeZYX{64, 64, 64};
-        vc::render::ChunkDtype dtype = vc::render::ChunkDtype::UInt8;
-        size_t numLevels = 1;
-        PyramidPolicy pyramid;
-        double fillValue = 0.0;
-        double voxelSize = 1.0;
-        std::string voxelUnit;
-        std::string uuid;
-        std::string name;
-        std::string compressor = "blosc";
-        int compressionLevel = 3;
-        bool overwriteExisting = false;
-    };
-
-    // Open an existing local volume, or create a local OME-Zarr pyramid when
-    // the path does not already contain a volume/zarr. Existing volumes are
-    // opened as-is unless overwriteExisting is set.
-    static std::shared_ptr<Volume> New(std::filesystem::path path,
-                                       const ZarrCreateOptions& options);
 
     // Create a Volume backed by a remote zarr store over HTTP.
     // If auth is provided, it is used as-is. Otherwise credentials are read
@@ -99,21 +60,11 @@ public:
         const utils::Json& metadata = {},
         bool discoverAwsCredentials = true);
 
-    // Construct a normal 3D Volume from a caller-prepared chunk source. The
-    // source factory is invoked again when a cache is recreated. It must return
-    // only 3D level descriptors; interpretation of higher-dimensional backing
-    // data belongs to the preparing module.
-    static std::shared_ptr<Volume> NewFromPreparedChunkedSource(std::function<vc::render::OpenedChunkedZarr()> sourceFactory, const utils::Json& metadata);
-
     [[nodiscard]] bool isRemote() const noexcept { return isRemote_; }
     [[nodiscard]] std::string id() const;
     [[nodiscard]] std::string name() const;
     [[nodiscard]] const utils::Json& metadata() const noexcept { return metadata_; }
     [[nodiscard]] utils::Json rootAttributes() const;
-    void writeRootAttributes(const utils::Json& attrs);
-    void updateRootAttributes(const utils::Json& attrs);
-    void writeMetadata(const utils::Json& metadata);
-    void updateMetadata(const utils::Json& metadata);
     [[nodiscard]] const std::string& remoteUrl() const noexcept { return remoteUrl_; }
     [[nodiscard]] const std::string& remoteLocator() const noexcept { return remoteLocator_; }
     [[nodiscard]] const vc::HttpAuth& remoteAuth() const noexcept { return remoteAuth_; }
@@ -141,6 +92,9 @@ public:
     [[nodiscard]] double fillValue() const noexcept { return zarrFillValue_; }
 
     [[nodiscard]] size_t numScales() const noexcept;
+    // The working level: the source pyramid level this volume opened as its
+    // level 0 (a remote locator's #vc-base-scale=N), so one voxel is 2^N
+    // source voxels. The volume keeps its ID at every working level.
     [[nodiscard]] int baseScaleLevel() const noexcept { return baseScaleLevel_; }
     [[nodiscard]] bool hasExplicitVoxelSizeOverride() const noexcept
     {
@@ -150,10 +104,6 @@ public:
     [[nodiscard]] std::vector<int> presentScaleLevels() const;
     [[nodiscard]] int firstPresentScaleLevel() const;
     [[nodiscard]] int finestPresentScaleLevelAtOrBelow(int level) const;
-    [[nodiscard]] PyramidPolicy::Reduction pyramidReduction() const noexcept
-    {
-        return pyramidReduction_;
-    }
 
     enum class MissingScaleLevelPolicy {
         Error,
@@ -185,6 +135,8 @@ public:
     // Blocking integer reads through the chunked local/remote cache.
     // ZYX order matches zarr storage and numpy-style volume indexing:
     //   offset = [z, y, x], shape = [z, y, x].
+    // A successful read overwrites every output voxel. Reuse an already-sized
+    // output to avoid allocation. On exceptions the partial output is unusable.
     bool readZYX(Array3D<uint8_t>& out,
                  const std::array<int, 3>& offsetZYX,
                  int level = 0,
@@ -196,11 +148,16 @@ public:
     static void readZYX(Array3D<uint8_t>& out,
                         const std::array<int, 3>& offsetZYX,
                         vc::render::IChunkedArray& array,
-                        int level = 0);
+                        int level = 0, const vc::render::ChunkRequestContext& request = {});
     static void readZYX(Array3D<uint16_t>& out,
                         const std::array<int, 3>& offsetZYX,
                         vc::render::IChunkedArray& array,
-                        int level = 0);
+                        int level = 0, const vc::render::ChunkRequestContext& request = {});
+    // Float scalar channels, preserving physical values and fill value.
+    static void readZYX(Array3D<float>& out,
+                        const std::array<int, 3>& offsetZYX,
+                        vc::render::IChunkedArray& array,
+                        int level = 0, const vc::render::ChunkRequestContext& request = {});
 
     // UI/coordinate-order convenience:
     //   offset = [x, y, z], shape = [x, y, z].
@@ -214,23 +171,7 @@ public:
                  int level = 0,
                  MissingScaleLevelPolicy missingPolicy = MissingScaleLevelPolicy::Error);
 
-    // Local zarr region writes. Input arrays are indexed/stored as [z, y, x].
-    // Writes update coarser pyramid levels by mean downsampling using each
-    // adjacent level's shape ratio.
-    void writeZYX(const Array3D<uint8_t>& data,
-                  const std::array<int, 3>& offsetZYX,
-                  int level = 0);
-    void writeZYX(const Array3D<uint16_t>& data,
-                  const std::array<int, 3>& offsetZYX,
-                  int level = 0);
-    void writeXYZ(const Array3D<uint8_t>& data,
-                  const std::array<int, 3>& offsetXYZ,
-                  int level = 0);
-    void writeXYZ(const Array3D<uint16_t>& data,
-                  const std::array<int, 3>& offsetXYZ,
-                  int level = 0);
-
-    // Local zarr chunk I/O. Chunk coordinates are [z, y, x]. Data is raw,
+    // Local zarr chunk reads. Chunk coordinates are [z, y, x]. Data is raw,
     // uncompressed chunk payload with exactly chunk_elems * dtype_size bytes.
     [[nodiscard]] std::optional<std::vector<std::byte>> readChunk(
         int level,
@@ -253,23 +194,6 @@ public:
     [[nodiscard]] bool chunkExists(
         int level,
         const std::array<size_t, 3>& chunkZYX) const;
-    struct ChunkWriteOptions {
-        // When false, chunks containing only the zarr fill value are removed
-        // instead of written, matching zarr's write_empty_chunks=false behavior.
-        bool writeEmptyChunks = true;
-    };
-    void writeChunk(int level,
-                    const std::array<size_t, 3>& chunkZYX,
-                    std::span<const std::byte> data);
-    void writeChunk(int level,
-                    const std::array<size_t, 3>& chunkZYX,
-                    std::span<const std::byte> data,
-                    ChunkWriteOptions options);
-    bool removeChunk(int level,
-                     const std::array<size_t, 3>& chunkZYX);
-
-    [[nodiscard]] static bool checkDir(const std::filesystem::path& path);
-
 protected:
     std::filesystem::path path_;
     utils::Json metadata_;
@@ -284,7 +208,6 @@ protected:
     std::vector<std::array<int, 3>> zarrLevelStorageChunkShapes_;
     vc::render::ChunkDtype zarrDtype_ = vc::render::ChunkDtype::UInt8;
     double zarrFillValue_ = 0.0;
-    PyramidPolicy::Reduction pyramidReduction_ = PyramidPolicy::Reduction::Mean;
     void zarrOpen();
 
     // Cache ownership
@@ -314,5 +237,4 @@ protected:
     vc::HttpAuth remoteAuth_;
     std::filesystem::path remoteCacheRoot_;
     size_t remoteNumScales_ = 0;
-    std::function<vc::render::OpenedChunkedZarr()> preparedSourceFactory_;
 };

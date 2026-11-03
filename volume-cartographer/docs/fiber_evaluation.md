@@ -304,8 +304,3 @@ implementation. Matching, failure/filter accounting, live dependencies and
 bounded case scheduling remain shared. Build `vc_fiber_trace_metric` and
 `vc_cache_root` to use the training entrypoints.
 
-The opt-in `python/tests/test_training_trace_cli.py` compares both directions
-against an existing historical binary on cached real predictions. It checks
-unfiltered, forward/backward and presence-filtered runs: committed geometry and
-outcomes are exact; accumulated float costs permit bounded independent-build
-roundoff. No production tolerance is relaxed by that test.

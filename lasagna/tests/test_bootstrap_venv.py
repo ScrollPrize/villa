@@ -24,7 +24,7 @@ class BootstrapVenvTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "CUDA 12.8 or newer"):
             select_backend((12, 7))
 
-    def test_dry_run_installs_sibling_volume_cartographer(self):
+    def test_dry_run_installs_native_siblings(self):
         villa = Path(__file__).resolve().parents[2]
         with patch(
             "lasagna.scripts.bootstrap_venv.shutil.which",
@@ -41,16 +41,19 @@ class BootstrapVenvTests(unittest.TestCase):
             ]), 0)
 
         commands = [call.args[0] for call in mocked_run.call_args_list]
-        self.assertTrue(any(
-            command[-2:] == ["-e", str(villa / "volume-cartographer")]
-            for command in commands
-        ))
+        native = [["-e", str(villa / "volume-cartographer")], ["-e", str(villa / "vc_object_store")]]
+        for sibling in native:
+            self.assertIn(sibling, [command[-2:] for command in commands])
+        # The object store is installed before Lasagna, which requires it.
+        installs = [command[-1] for command in commands if command[-2] == "-e"]
+        self.assertLess(installs.index(str(villa / "vc_object_store")), installs.index(str(villa / "lasagna")))
         native_calls = [
             call for call in mocked_run.call_args_list
-            if call.args[0][-2:] == ["-e", str(villa / "volume-cartographer")]
+            if call.args[0][-2:] in native
         ]
-        self.assertEqual(len(native_calls), 1)
-        self.assertEqual(native_calls[0].kwargs["environment"], build_environment.return_value)
+        self.assertEqual(len(native_calls), 2)
+        for call in native_calls:
+            self.assertEqual(call.kwargs["environment"], build_environment.return_value)
         for call in mocked_run.call_args_list:
             if call not in native_calls:
                 self.assertNotIn("environment", call.kwargs)

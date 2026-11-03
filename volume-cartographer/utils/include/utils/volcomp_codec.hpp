@@ -9,7 +9,6 @@
 // wrapping header is needed.  Decoding needs nothing but the bytes; q is only
 // an encode parameter.
 
-#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <optional>
@@ -87,9 +86,5 @@ struct VolcompSurfaceInfo {
 void volcomp_decode_smooth_into(std::span<const std::byte> compressed,
                                 std::span<std::byte> out, float strength,
                                 bool zero_guard = true);
-
-// volcomp chunks are always 128^3; {Z, Y, X} for symmetry with c3d_header_dims().
-[[nodiscard]] inline std::array<int, 3> volcomp_header_dims(
-    std::span<const std::byte>) noexcept { return {128, 128, 128}; }
 
 }  // namespace utils

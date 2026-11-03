@@ -57,27 +57,4 @@ std::string string_or(const utils::Json& m, const char* key, const std::string& 
     return def;
 }
 
-utils::Json tags_or_empty(const utils::Json& m) {
-    if (m.is_null() || !m.is_object()) return utils::Json::object();
-    if (m.contains("tags") && m["tags"].is_object()) return m["tags"];
-    return utils::Json::object();
-}
-
-bool has_tag(const utils::Json& m, const char* tag) {
-    auto t = tags_or_empty(m);
-    return t.contains(tag);
-}
-
-void ensure_object(utils::Json& m) {
-    if (m.is_null() || !m.is_object()) m = utils::Json::object();
-}
-
-utils::Json& ensure_tags(utils::Json& m) {
-    ensure_object(m);
-    if (!m.contains("tags") || !m["tags"].is_object()) {
-        m["tags"] = utils::Json::object();
-    }
-    return m["tags"];
-}
-
 } // namespace vc::json

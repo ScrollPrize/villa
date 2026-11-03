@@ -28,14 +28,10 @@ public:
     // Getters
     [[nodiscard]] std::vector<SegmentationDirectionFieldConfig> directionFieldConfigs() const;
 
-    // Group accessor (for expand/collapse state persistence by coordinator)
-    CollapsibleSettingsGroup* directionFieldGroup() const { return _groupDirectionField; }
-
     void restoreSettings(QSettings& settings);
     void syncUiState(bool editingEnabled);
 
 signals:
-    void directionFieldConfigsChanged();
 
 private:
     void writeSetting(const QString& key, const QVariant& value);

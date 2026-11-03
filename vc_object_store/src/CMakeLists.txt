@@ -1,3 +1,17 @@
+set(VC_OBJECT_STORE_READER_SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/../../vc_reader" CACHE PATH "vc_reader source checkout")
+if(NOT TARGET vc_reader::catalog)
+    find_package(vc_reader CONFIG QUIET)
+endif()
+if(NOT TARGET vc_reader::catalog)
+    set(VC_READER_BUILD_PYTHON OFF)
+    set(VC_READER_BUILD_READER ${VC_OBJECT_STORE_BUILD_LINKING})
+    # This adapter uses CPU normals; an explicit reader CUDA option is still honored.
+    if(NOT DEFINED VC_READER_ENABLE_CUDA)
+        set(VC_READER_ENABLE_CUDA OFF)
+    endif()
+    add_subdirectory("${VC_OBJECT_STORE_READER_SOURCE}" "${CMAKE_CURRENT_BINARY_DIR}/reader")
+endif()
+
 if(VC_OBJECT_STORE_SHARED)
     set(_vc_store_library_type SHARED)
 else()
@@ -8,7 +22,7 @@ endif()
 add_library(vc_geometry ${_vc_store_library_type} geometry/TypedGeometry.cpp)
 target_include_directories(vc_geometry PUBLIC "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/../include>" "$<INSTALL_INTERFACE:include>"
     PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
-target_link_libraries(vc_geometry PRIVATE nlohmann_json::nlohmann_json)
+target_link_libraries(vc_geometry PRIVATE nlohmann_json::nlohmann_json vc_reader::catalog)
 target_compile_features(vc_geometry PUBLIC cxx_std_20)
 
 # SFTP v3 client over the system OpenSSH program; no SQLite or application types.
@@ -32,7 +46,10 @@ add_library(vc_objects ${_vc_store_library_type}
     internal/JsonFields.cpp
     formats/FiberJson.cpp
     Database.cpp
+    VolumeTransforms.cpp
     ObjectStoreSession.cpp
+    Project.cpp
+    FetchQueue.cpp
     Transactions.cpp
     History.cpp
     Lifecycle.cpp
@@ -43,7 +60,17 @@ add_library(vc_objects ${_vc_store_library_type}
     Queries.cpp
     Spatial.cpp
     GeometryRegion.cpp
-    sync/Synchronize.cpp
+    SurfaceProximity.cpp
+    SurfaceDrafts.cpp
+    SurfaceTileCache.cpp
+    spatial/SurfaceTiles.cpp
+    ObjectCopy.cpp
+    VolumeUmbilicus.cpp
+    UmbilicusFile.cpp
+    ToolObjects.cpp
+    AttachedDocument.cpp
+    SurfaceCreate.cpp
+    sync/Replica.cpp
     sync/GeometryTransfer.cpp
     sync/Apply.cpp
     hub/HubRules.cpp
@@ -72,7 +99,7 @@ if(TARGET SQLite3::SQLite3)
 else()
     target_link_libraries(vc_objects PUBLIC SQLite::SQLite3)
 endif()
-target_link_libraries(vc_objects PUBLIC vc_geometry vc_sftp nlohmann_json::nlohmann_json PRIVATE OpenSSL::Crypto zstd::libzstd)
+target_link_libraries(vc_objects PUBLIC vc_geometry vc_sftp vc_reader::catalog nlohmann_json::nlohmann_json PRIVATE OpenSSL::Crypto zstd::libzstd)
 target_compile_features(vc_objects PUBLIC cxx_std_20)
 add_library(vc_object_store::vc_objects ALIAS vc_objects)
 add_library(vc_object_store::vc_geometry ALIAS vc_geometry)
@@ -81,40 +108,35 @@ if(NOT VC_OBJECT_STORE_BUILD_ADAPTERS)
     return()
 endif()
 find_package(TIFF REQUIRED)
-add_library(vc_object_formats ${_vc_store_library_type} Tiff.cpp MemMap.cpp PackedTrackStore.cpp spatial/PatchGrid.cpp)
+find_package(CURL REQUIRED)
+# vc_reader's HTTP client fetches remote sources; its Zarr reader is only needed
+# by the relationship detectors.
+add_library(vc_object_formats ${_vc_store_library_type} Tiff.cpp MemMap.cpp PackedTrackStore.cpp spatial/SurfaceGrid.cpp)
+add_library(vc_object_store::vc_object_formats ALIAS vc_object_formats)
 target_include_directories(vc_object_formats PUBLIC "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/../include>" "$<INSTALL_INTERFACE:include>" PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
-target_link_libraries(vc_object_formats PUBLIC opencv_core TIFF::TIFF PRIVATE nlohmann_json::nlohmann_json)
+target_link_libraries(vc_object_formats PUBLIC opencv_core TIFF::TIFF vc_geometry PRIVATE nlohmann_json::nlohmann_json)
 target_compile_features(vc_object_formats PUBLIC cxx_std_20)
 add_library(vc_object_geometry ${_vc_store_library_type} geometry/GeometryIngest.cpp geometry/GeometryExport.cpp geometry/SourceMetadata.cpp
-    formats/GeometryInput.cpp formats/FiberInput.cpp formats/PatchInput.cpp
-    formats/PointCollectionInput.cpp formats/TrackInput.cpp formats/GeometryOutput.cpp)
+    formats/GeometryInput.cpp formats/FiberInput.cpp formats/SurfaceInput.cpp
+    formats/PointCollectionInput.cpp formats/UmbilicusInput.cpp formats/TrackInput.cpp formats/GeometryOutput.cpp formats/RemoteSource.cpp
+    catalog/CatalogStore.cpp)
 add_library(vc_object_store::vc_object_geometry ALIAS vc_object_geometry)
 target_include_directories(vc_object_geometry PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
-target_link_libraries(vc_object_geometry PUBLIC vc_objects PRIVATE vc_object_formats nlohmann_json::nlohmann_json)
+target_link_libraries(vc_object_geometry PUBLIC vc_objects PRIVATE vc_object_formats vc_reader::headers CURL::libcurl nlohmann_json::nlohmann_json)
 if(NOT VC_OBJECT_STORE_BUILD_LINKING)
     return()
 endif()
-set(VC_OBJECT_STORE_READER_SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/../../vc_reader" CACHE PATH "vc_reader source checkout")
 if(NOT TARGET vc_reader::reader)
-    find_package(vc_reader CONFIG QUIET)
-endif()
-if(NOT TARGET vc_reader::reader)
-    set(VC_READER_BUILD_PYTHON OFF)
-    set(VC_READER_BUILD_READER ON)
-    # This adapter uses CPU normals; an explicit reader CUDA option is still honored.
-    if(NOT DEFINED VC_READER_ENABLE_CUDA)
-        set(VC_READER_ENABLE_CUDA OFF)
-    endif()
-    add_subdirectory("${VC_OBJECT_STORE_READER_SOURCE}" "${CMAKE_CURRENT_BINARY_DIR}/reader")
+    message(FATAL_ERROR "Relationship detectors require vc_reader's reader library")
 endif()
 add_library(vc_track_crossings STATIC TrackCrossings.cpp)
 target_include_directories(vc_track_crossings PUBLIC "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/../include>" "$<INSTALL_INTERFACE:include>")
 target_link_libraries(vc_track_crossings PRIVATE OpenMP::OpenMP_CXX)
 target_compile_features(vc_track_crossings PUBLIC cxx_std_20)
 add_library(vc_object_links STATIC
-    CtSheetNormal.cpp spatial/PatchIndex.cpp
-    linking/LinkCandidates.cpp linking/PatchOverlap.cpp linking/FiberPatch.cpp
-    linking/TrackTrack.cpp linking/StoredGeometry.cpp linking/LinePatch.cpp
-    linking/TrackPatch.cpp linking/PointCollectionPatch.cpp)
+    CtSheetNormal.cpp spatial/SurfaceIndex.cpp
+    linking/LinkCandidates.cpp linking/SurfaceOverlap.cpp linking/FiberSurface.cpp
+    linking/TrackTrack.cpp linking/StoredGeometry.cpp linking/LineSurface.cpp
+    linking/TrackSurface.cpp linking/PointCollectionSurface.cpp)
 target_include_directories(vc_object_links PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
 target_link_libraries(vc_object_links PUBLIC vc_objects PRIVATE vc_track_crossings vc_object_formats vc_reader::reader opencv_core nlohmann_json::nlohmann_json)

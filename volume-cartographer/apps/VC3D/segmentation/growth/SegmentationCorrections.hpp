@@ -45,7 +45,6 @@ public:
     [[nodiscard]] bool hasActiveCollection() const { return _activeCollectionId.has_value(); }
     [[nodiscard]] std::optional<std::pair<int, int>> zRange() const;
     [[nodiscard]] SegmentationCorrectionsPayload buildPayload(bool onlyActiveCollection = false) const;
-    [[nodiscard]] SegmentationCorrectionsPayload buildPayloadForCollection(uint64_t collectionId) const;
     [[nodiscard]] bool hasCorrections() const;
 
     void onCollectionRemoved(uint64_t id);

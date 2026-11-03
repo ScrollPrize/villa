@@ -57,14 +57,6 @@ public:
      */
     [[nodiscard]] QString lastError() const { return _lastError; }
 
-    /**
-     * Get current service configuration.
-     */
-    [[nodiscard]] QString currentCheckpointPath() const { return _currentCheckpointPath; }
-    [[nodiscard]] QString currentVolumeZarr() const { return _currentVolumeZarr; }
-    [[nodiscard]] int currentVolumeScale() const { return _currentVolumeScale; }
-    [[nodiscard]] QString currentPythonPath() const { return _currentPythonPath; }
-
 signals:
     /**
      * Emitted when the service starts successfully.

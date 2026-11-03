@@ -34,8 +34,3 @@ RUN install -m 0755 /dev/stdin /usr/local/bin/vc3d <<'BASH'
 set -euo pipefail
 exec env OMP_NUM_THREADS=8 OMP_WAIT_POLICY=PASSIVE OMP_NESTED=FALSE nice ionice VC3D "$@"
 BASH
-
-COPY docker_s3_entrypoint.sh /usr/local/bin/entrypoint.sh
-RUN chmod +x /usr/local/bin/entrypoint.sh
-
-ENV WANDB_ENTITY="vesuvius-challenge"

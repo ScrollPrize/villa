@@ -3,9 +3,10 @@
 
 #include "CState.hpp"
 #include "vc/core/types/Volume.hpp"
+#include "support/TestZarrVolume.hpp"
 #include <QTemporaryDir>
-#include "FiberSliceGeometry.hpp"
-#include "LineAnnotationFiberClassification.hpp"
+#include "FiberLineGeometry.hpp"
+#include "vc/fiber_tracer/FiberHvClassification.hpp"
 #include "LineAnnotationFiberNaming.hpp"
 #include "LineAnnotationFiberSegments.hpp"
 #include "vc/lasagna/LineSpline.hpp"
@@ -632,7 +633,7 @@ TEST_CASE("Direction handles use a valid local frame even on two-column strips")
 {
     cv::Mat_<cv::Vec3f> points(7,2);
     for (int y=0;y<7;++y)
-        for (int x=0;x<2;++x) points(y,x)={float(x*10),float(y-3),0};
+        for (int x=0;x<2;++x) points(y,x)={float(x*10),float(y+10),1};
     QuadSurface surface(points,{1,1});
     const auto frame=vc3d::line_annotation::generatedStripFrame(
         &surface,surface.gridToSurface({0.5,3}));
@@ -1415,14 +1416,18 @@ TEST_CASE("Zero display correction preserves smoothed ribbon geometry")
 
 TEST_CASE("Ribbons retain ordinary QuadSurface rendering and picking after origin shifts")
 {
+    // Above z = 0, where the ribbon's vertices are valid on both sides of the line.
+    constexpr double z=50;
     auto model=lineModel();
     model.points[2].position={10,20,0};
+    for (auto& point : model.points) point.position[2]+=z;
+    for (auto& segment : model.segmentSamples)
+        for (auto& sample : segment.samples) sample.position[2]+=z;
     vc::lasagna::LineViewConfig config;
     config.targetSpacingBaseVoxels=50; // Deliberately coarse support grid.
     config.controlPointLinePositions={0,1,2};
     config.displayPointNormals.assign(3,cv::Vec3f(0,0,1));
     const auto views=vc::lasagna::buildLineViewSurfaces(model,config);
-    const std::vector<cv::Vec3f> p{{0,0,0},{10,0,0},{10,20,0}};
     for (const auto& surface : {views.lineSurface,views.lineSideSlice}) {
         CHECK(typeid(*surface) == typeid(QuadSurface));
         surface->shiftSurfaceOrigin({123,-17});
@@ -1430,7 +1435,7 @@ TEST_CASE("Ribbons retain ordinary QuadSurface rendering and picking after origi
         const auto uv=surface->gridToSurface({col,3});
         const auto sample=surface->sampleAtSurface(uv);
         REQUIRE(sample.valid());
-        const auto expected=cv::Vec3f(5,0,0);
+        const auto expected=cv::Vec3f(5,0,float(z));
         CHECK(cv::norm(sample.volume-expected)<1e-5);
         for (float scale : {0.5f,2.0f}) {
             cv::Mat_<cv::Vec3f> coords,normals;
@@ -1462,10 +1467,9 @@ TEST_CASE("focus bounds state distinguishes configured and active bounds")
 {
     QTemporaryDir directory;
     REQUIRE(directory.isValid());
-    Volume::ZarrCreateOptions options;
+    vc::test::ZarrVolumeSpec options;
     options.shapeZYX = {64, 64, 64};
-    options.compressor = "none";
-    auto volume = Volume::New(directory.path().toStdString(), options);
+    auto volume = vc::test::createZarrVolume(directory.path().toStdString(), options);
     REQUIRE(volume);
     CState state;
     state.setCurrentVolume(volume);
@@ -1818,7 +1822,7 @@ TEST_CASE("line annotation straight-ahead distance follows the marker's actual a
 
     // A notch that clamps at the line end moves the plane only as far as the
     // marker got (196 -> 200 is 4 vx, not 8), and a notch AT the end moves nothing.
-    from = vc3d::fiber_slice::linePositionAtArclength(arclengths, 196.0);
+    from = vc3d::fiber_line::linePositionAtArclength(arclengths, 196.0);
     to = shiftedLinePositionByArclength(from, 1, 1, arclengths);
     CHECK(to == doctest::Approx(15.0));
     CHECK(straightAheadDistanceForShiftScroll(from, to, arclengths) == doctest::Approx(4.0));
@@ -2210,18 +2214,6 @@ TEST_CASE("arrow pan stop target picks the next control point in the direction")
     CHECK(*skipped == doctest::Approx(28.0));
 }
 
-TEST_CASE("line annotation closest control point chooses nearest valid position")
-{
-    const std::vector<double> positions{12.0, 20.0, 40.0};
-
-    const auto closest = vc3d::line_annotation::closestGeneratedControlPointLinePosition(
-        26.0,
-        positions);
-
-    REQUIRE(closest.has_value());
-    CHECK(*closest == doctest::Approx(20.0));
-}
-
 TEST_CASE("line annotation control point navigation ignores invalid positions")
 {
     using vc3d::line_annotation::GeneratedOverlay;
@@ -2244,16 +2236,11 @@ TEST_CASE("line annotation control point navigation ignores invalid positions")
     const auto next = vc3d::line_annotation::nextGeneratedControlPointLinePosition(
         20.0,
         positions);
-    const auto closest = vc3d::line_annotation::closestGeneratedControlPointLinePosition(
-        26.0,
-        positions);
 
     REQUIRE(previous.has_value());
     REQUIRE(next.has_value());
-    REQUIRE(closest.has_value());
     CHECK(*previous == doctest::Approx(10.0));
     CHECK(*next == doctest::Approx(30.0));
-    CHECK(*closest == doctest::Approx(30.0));
 }
 
 TEST_CASE("line annotation remapped line position follows the same fiber spot")
@@ -2372,7 +2359,7 @@ TEST_CASE("line annotation anchor remap keeps a pane position on its own fiber p
         // The regression this guards: resolving the position through the
         // click picked the return pass, thousands of vertices away on a real
         // fiber, so the edit collapsed into that pass's control point.
-        CHECK(vc3d::fiber_slice::nearestLinePointIndex(line, click) == 16);
+        CHECK(vc3d::fiber_line::nearestLinePointIndex(line, click) == 16);
     }
 
     SUBCASE("the anchor keeps the position on the outbound pass")
@@ -3917,8 +3904,8 @@ TEST_CASE("line annotation fiber naming uses username timestamp and sequence")
 
 TEST_CASE("line annotation fiber h/v classification scores endpoint z distance")
 {
-    using vc3d::line_annotation::FiberHvTag;
-    using vc3d::line_annotation::classifyFiberHv;
+    using vc::fiber_tracer::FiberHvTag;
+    using vc::fiber_tracer::classifyFiberHv;
 
     const auto horizontal = classifyFiberHv({
         {0.0, 0.0, 0.0},
@@ -4033,8 +4020,8 @@ TEST_CASE("line annotation branch metadata json field set is a compatibility bou
 
 TEST_CASE("line annotation intersection display h side uses manual tags before scores")
 {
-    using vc3d::line_annotation::FiberHvClassification;
-    using vc3d::line_annotation::firstFiberDisplaysAsH;
+    using vc::fiber_tracer::FiberHvClassification;
+    using vc::fiber_tracer::firstFiberDisplaysAsH;
 
     FiberHvClassification first;
     first.horizontalScore = 0.25;
@@ -4075,7 +4062,6 @@ TEST_CASE("line annotation generated strip overlay includes controls and current
         {7,
          {0.0f, 0.0f, 0.0f},
          {1.0f, 0.0f, 0.0f},
-         {0.0f, 0.0f, 1.0f},
          {0.0f, 0.0f, 1.0f},
          {0.0f, 0.0f, 1.0f},
          false},
@@ -4123,29 +4109,6 @@ TEST_CASE("branch overlay replacement retains supplied native span diagnostics")
     CHECK(views.fiberIntersections.empty());
 }
 
-TEST_CASE("line annotation generated overlays include pred-snap connector endpoints")
-{
-    vc3d::line_annotation::GeneratedViews views;
-    views.linePoints = {
-        {0.0f, 0.0f, 0.0f},
-        {1.0f, 0.0f, 0.0f},
-        {2.0f, 0.0f, 0.0f},
-    };
-    views.controlPoints = {
-        {{1.0f, 0.0f, 0.0f}, 1.0, false},
-    };
-    views.predSnapPoints = {
-        {{1.0f, 0.0f, 0.0f}, {1.0f, 0.0f, 1.0f}, 1.0, 0, true},
-    };
-
-    const auto overlay = vc3d::line_annotation::makeGeneratedStripOverlay(views, 1.0, {});
-
-    REQUIRE(overlay.predSnapPoints.size() == 1);
-    CHECK(overlay.predSnapPoints[0].controlIndex == 0);
-    CHECK(overlay.predSnapPoints[0].controlPoint[0] == doctest::Approx(1.0f));
-    CHECK(overlay.predSnapPoints[0].snapPoint[2] == doctest::Approx(1.0f));
-}
-
 TEST_CASE("line annotation generated strip static and dynamic overlays split ownership")
 {
     vc3d::line_annotation::GeneratedViews views;
@@ -4166,7 +4129,6 @@ TEST_CASE("line annotation generated strip static and dynamic overlays split own
         {7,
          {0.0f, 0.0f, 0.0f},
          {1.0f, 0.0f, 0.0f},
-         {0.0f, 0.0f, 1.0f},
          {0.0f, 0.0f, 1.0f},
          {0.0f, 0.0f, 1.0f},
          false},
@@ -4620,121 +4582,6 @@ TEST_CASE("line annotation generated cross slice filters indexed candidates then
     CHECK(overlay.controlPoints[0].linePosition == doctest::Approx(1.0));
 }
 
-TEST_CASE("fiber slice control span uses nearest control line indices")
-{
-    using namespace vc3d::fiber_slice;
-    const std::vector<cv::Vec3d> linePoints{
-        {0.0, 0.0, 0.0},
-        {1.0, 0.0, 0.0},
-        {2.0, 0.0, 0.0},
-        {3.0, 0.0, 0.0},
-        {4.0, 0.0, 0.0},
-    };
-    const std::vector<cv::Vec3d> controls{
-        {3.1, 0.0, 0.0},
-        {1.1, 0.0, 0.0},
-    };
-
-    const auto span = selectControlSpan(linePoints, controls);
-    CHECK(span.valid);
-    CHECK(span.firstLineIndex == 1);
-    CHECK(span.lastLineIndex == 3);
-    CHECK(span.samples.size() == 3);
-    CHECK(span.centroid[0] == doctest::Approx(2.0));
-}
-
-TEST_CASE("fiber slice rejects insufficient controls or fit samples")
-{
-    using namespace vc3d::fiber_slice;
-    CHECK_FALSE(selectControlSpan({{0.0, 0.0, 0.0},
-                                   {1.0, 0.0, 0.0},
-                                   {2.0, 0.0, 0.0}},
-                                  {{0.0, 0.0, 0.0}}).valid);
-    CHECK_FALSE(selectControlSpan({{0.0, 0.0, 0.0},
-                                   {1.0, 0.0, 0.0}},
-                                  {{0.0, 0.0, 0.0},
-                                   {1.0, 0.0, 0.0}}).valid);
-}
-
-TEST_CASE("fiber slice plane fit recovers synthetic plane")
-{
-    using namespace vc3d::fiber_slice;
-    std::vector<cv::Vec3d> linePoints;
-    for (int i = -3; i <= 3; ++i) {
-        const double x = static_cast<double>(i);
-        const double y = static_cast<double>(i * i - 2);
-        const double z = 2.0 * x + 3.0 * y + 5.0;
-        linePoints.push_back({x, y, z});
-    }
-    const auto span = selectControlSpan(linePoints, {linePoints.front(), linePoints.back()});
-    const auto fit = fitLeastSquaresPlane(span, linePoints);
-    CHECK(fit.valid);
-
-    const cv::Vec3d expected = normalizedOrZero({-2.0, -3.0, 1.0});
-    CHECK(std::abs(fit.normal.dot(expected)) == doctest::Approx(1.0).epsilon(1e-6));
-    for (const auto& point : linePoints) {
-        CHECK(std::abs(signedDistanceToPlane(point, {fit.origin, fit.normal})) <= 1.0e-6);
-    }
-}
-
-TEST_CASE("fiber slice distance scaling clamps at viewport thresholds")
-{
-    using namespace vc3d::fiber_slice;
-    CHECK(distanceScaledSize(0.5, 100.0, 10.0, 2.0) == doctest::Approx(10.0));
-    CHECK(distanceScaledSize(1.0, 100.0, 10.0, 2.0) == doctest::Approx(10.0));
-    CHECK(distanceScaledSize(10.0, 100.0, 10.0, 2.0) == doctest::Approx(2.0));
-    CHECK(distanceScaledSize(20.0, 100.0, 10.0, 2.0) == doctest::Approx(2.0));
-    CHECK(distanceScaledSize(5.5, 100.0, 10.0, 2.0) == doctest::Approx(6.0));
-}
-
-TEST_CASE("fiber slice focused marker uses five percent viewport threshold")
-{
-    using namespace vc3d::fiber_slice;
-    CHECK(focusedIntersectionMarkerThreshold(100.0) == doctest::Approx(5.0));
-    CHECK(focusedIntersectionMarkerVisible(5.0, 100.0));
-    CHECK(focusedIntersectionMarkerVisible(-5.0, 100.0));
-    CHECK_FALSE(focusedIntersectionMarkerVisible(5.001, 100.0));
-    CHECK_FALSE(focusedIntersectionMarkerVisible(std::numeric_limits<double>::infinity(), 100.0));
-}
-
-TEST_CASE("fiber slice segment-plane intersection handles crossings")
-{
-    using namespace vc3d::fiber_slice;
-    const Plane plane{{0.0, 0.0, 0.0}, {0.0, 0.0, 1.0}};
-    const auto crossing = segmentPlaneIntersection({0.0, 0.0, -1.0},
-                                                   {2.0, 0.0, 1.0},
-                                                   plane);
-    REQUIRE(crossing.has_value());
-    CHECK(crossing->point[0] == doctest::Approx(1.0));
-    CHECK(crossing->point[1] == doctest::Approx(0.0));
-    CHECK(crossing->point[2] == doctest::Approx(0.0));
-
-    CHECK_FALSE(segmentPlaneIntersection({0.0, 0.0, 1.0},
-                                         {2.0, 0.0, 1.0},
-                                         plane).has_value());
-    CHECK_FALSE(segmentPlaneIntersection({0.0, 0.0, 1.0},
-                                         {2.0, 0.0, 2.0},
-                                         plane).has_value());
-    CHECK_FALSE(segmentPlaneIntersection({0.0, 0.0, 0.0},
-                                         {0.0, 0.0, 0.0},
-                                         plane).has_value());
-}
-
-TEST_CASE("fiber slice intersection opacity fades from 45 to 90 degrees")
-{
-    using namespace vc3d::fiber_slice;
-    CHECK(intersectionOpacityForAngle(20.0) == doctest::Approx(1.0));
-    CHECK(intersectionOpacityForAngle(45.0) == doctest::Approx(1.0));
-    CHECK(intersectionOpacityForAngle(67.5) == doctest::Approx(0.5));
-    CHECK(intersectionOpacityForAngle(90.0) == doctest::Approx(0.0));
-    CHECK(intersectionOpacityForAngle(100.0) == doctest::Approx(0.0));
-
-    const auto round = ellipseStyleForAngle(45.0, 3.0);
-    const auto flat = ellipseStyleForAngle(89.0, 3.0);
-    CHECK(flat.majorRadius > round.majorRadius);
-    CHECK(flat.minorRadius < round.minorRadius);
-}
-
 TEST_CASE("fiber segment metadata round trips with its owning control point")
 {
     vc3d::line_annotation::StoredControlPoint control{{1.0, 2.0, 3.0}};
@@ -4804,7 +4651,7 @@ TEST_CASE("fiber segment metadata round trips with its owning control point")
     strictRoot["optimization_mode"] = "native_fiber_trace3d";
     strictRoot["line_points"] = {{1.0, 2.0, 3.0}, {4.0, 5.0, 6.0}};
     CHECK_THROWS_AS(vc::fiber_tracer::parseVc3dFiberJson(strictRoot, "test fiber"), std::runtime_error);
-    strictRoot["uuid"] = vc::util::newUuid();
+    strictRoot["uuid"] = vc::objects::util::newUuid();
     CHECK(vc::fiber_tracer::parseVc3dFiberJson(strictRoot, "test fiber").uuid ==
           strictRoot.at("uuid").get<std::string>());
     auto invalidUuid = strictRoot;
@@ -5048,7 +4895,7 @@ TEST_CASE("fiber mode falls back only the failed native span")
     }
     REQUIRE(sharedDistance < 1.0e-9);
     REQUIRE(sharedIndex + 1 < points.size());
-    const cv::Vec3d fallbackDirection = vc3d::fiber_slice::normalizedOrZero(
+    const cv::Vec3d fallbackDirection = cv::normalize(
         points[sharedIndex + 1].position - points[sharedIndex].position);
     CHECK(fallbackDirection.dot(cv::Vec3d{1.0, 0.0, 0.0}) ==
           doctest::Approx(1.0).epsilon(1.0e-10));
@@ -5496,73 +5343,13 @@ TEST_CASE("line spline honors hard endpoint directions")
 }
 
 // ---------------------------------------------------------------------------
-// Orientation freshness: the decisions behind the umbilicus cache and the
-// stale-view refresh, extracted so they are asserted rather than read.
-
-#include "UmbilicusOrientationFreshness.hpp"
-
-namespace {
-
-vc3d::annotation::UmbilicusCacheInputs cacheInputs()
-{
-    vc3d::annotation::UmbilicusCacheInputs inputs;
-    inputs.root = "/proj";
-    inputs.volumeId = "vol-a";
-    inputs.dependencyToken = "field|/proj/umbilicus.json=100:1";
-    inputs.frame = vc3d::annotation::deriveAnnotationFrame(
-        2.4, 0, std::nullopt, std::nullopt, {100.0, 100.0, 1000.0});
-    return inputs;
-}
-
-} // namespace
-
-TEST_CASE("umbilicus cache: reused only while every input it was built from holds")
-{
-    using vc3d::annotation::umbilicusReloadNeeded;
-
-    const auto cached = cacheInputs();
-
-    // Never attempted resolves regardless of the inputs matching.
-    CHECK(umbilicusReloadNeeded(false, cached, cached));
-    // Identical inputs reuse.
-    CHECK_FALSE(umbilicusReloadNeeded(true, cached, cached));
-
-    auto otherRoot = cached;
-    otherRoot.root = "/other";
-    CHECK(umbilicusReloadNeeded(true, cached, otherRoot));
-
-    // The finding this pins: a volume switch whose annotation frame is
-    // byte-identical must still re-resolve, because the legacy reading's
-    // registration transform and the volume-centre fallback belong to the
-    // volume, not to the frame.
-    auto otherVolume = cached;
-    otherVolume.volumeId = "vol-b";
-    CHECK(umbilicusReloadNeeded(true, cached, otherVolume));
-
-    // Any resolver dependency changing on disk — the attached file fixed in
-    // place, a discovery candidate appearing, the registration transform
-    // edited — lands in the token.
-    auto editedFile = cached;
-    editedFile.dependencyToken = "field|/proj/umbilicus.json=100:2";
-    CHECK(umbilicusReloadNeeded(true, cached, editedFile));
-
-    // A frame change rescales the cached points, so it cannot be reused...
-    auto otherFrame = cached;
-    otherFrame.frame = vc3d::annotation::deriveAnnotationFrame(
-        2.4, 0, std::nullopt, std::nullopt, {100.0, 100.0, 2000.0});
-    CHECK(umbilicusReloadNeeded(true, cached, otherFrame));
-
-    // ...but an imprecisely round-tripped voxel size is the same frame.
-    auto rounded = cached;
-    rounded.frame = vc3d::annotation::deriveAnnotationFrame(
-        2.4 + 1e-12, 0, std::nullopt, std::nullopt, {100.0, 100.0, 1000.0});
-    CHECK_FALSE(umbilicusReloadNeeded(true, cached, rounded));
-}
+// Orientation freshness: the stale-view refresh, extracted so it is asserted
+// rather than read.
 
 TEST_CASE("stale-view refresh: rebuilds exactly the panes built before the change")
 {
-    using vc3d::annotation::GeneratedViewsPaneState;
-    using vc3d::annotation::paneNeedsOrientationRefresh;
+    using vc3d::line_annotation::GeneratedViewsPaneState;
+    using vc3d::line_annotation::paneNeedsOrientationRefresh;
 
     constexpr int kEpoch = 3;
 
@@ -5649,70 +5436,6 @@ TEST_CASE("controlled span keeps only the line between the outer control points"
         CHECK(span[1] == c);
         CHECK(span[2] == a);
     }
-}
-
-TEST_CASE("Generated markers map every position into the downsampled viewer")
-{
-    using namespace vc3d::line_annotation;
-    for (const double scale : {1.0, 0.25}) for (const double linkedScale : {scale, scale * 2}) {
-        GeneratedOverlay::BranchLinkMarker branch;
-        branch.localControlPoint = {120, 240, 360};
-        branch.linkedControlPoint = {160, 280, 400};
-        branch.planePoint = branch.linkedControlPoint;
-        branch.localDirection = {1, 0, 0};
-        branch.linkedDirection = {0, 1, 0};
-        branch.linkedFiberId = 42;
-        scaleGeneratedMarkerForVolume(branch, scale, linkedScale);
-        CHECK(branch.localControlPoint == cv::Vec3f(120, 240, 360) * scale);
-        CHECK(branch.linkedControlPoint == cv::Vec3f(160, 280, 400) * linkedScale);
-        CHECK(branch.planePoint == branch.linkedControlPoint);
-        CHECK(branch.localDirection == cv::Vec3f(1, 0, 0));
-        CHECK(branch.linkedDirection == cv::Vec3f(0, 1, 0));
-        CHECK(branch.linkedFiberId == 42);
-
-        GeneratedOverlay::PredSnapMarker snap;
-        snap.controlPoint = {120, 240, 360};
-        snap.snapPoint = {124, 248, 372};
-        snap.linePosition = 2.5;
-        snap.controlIndex = 3;
-        snap.manual = true;
-        scaleGeneratedMarkerForVolume(snap, scale);
-        CHECK(snap.controlPoint == cv::Vec3f(120, 240, 360) * scale);
-        CHECK(snap.snapPoint == cv::Vec3f(124, 248, 372) * scale);
-        CHECK(snap.linePosition == 2.5);
-        CHECK(snap.controlIndex == 3);
-        CHECK(snap.manual);
-    }
-}
-
-TEST_CASE("Winding queries use the center frame at every volume level")
-{
-    using namespace vc3d::line_annotation;
-    std::vector<cv::Vec3f> basePoints;
-    // Off-origin, z-dependent center exposes both XY and Z frame mismatches.
-    const auto towardCenter = [](const cv::Vec3f& p) -> cv::Vec3f {
-        return {1000.0f + p[2] - p[0], 2000.0f - p[2] - p[1], 0};
-    };
-    for (int i = 0; i < 40; ++i) {
-        const float z = 100.0f + i * 4.0f;
-        const float angle = i * 0.3f;
-        basePoints.push_back({1000.0f + z + 100.0f * std::cos(angle),
-                              2000.0f - z + 100.0f * std::sin(angle), z});
-    }
-    const auto expected = unwrappedGeneratedWindingAngles(basePoints, towardCenter);
-    auto viewerPoints = basePoints;
-    for (auto& point : viewerPoints) {
-        point *= 0.25f;
-    }
-    const auto actual = unwrappedGeneratedWindingAngles(viewerPoints, towardCenter, 4.0f);
-    REQUIRE(actual.size() == expected.size());
-    for (size_t i = 0; i < actual.size(); ++i) {
-        CHECK(actual[i] == doctest::Approx(expected[i]));
-    }
-    CHECK(generatedLineIndexRangeWithinWinding(actual, actual.size(), 20.0,
-                                               kGeneratedSideCutHalfWrapAngle) ==
-          generatedLineIndexRangeWithinWinding(expected, expected.size(), 20.0,
-                                               kGeneratedSideCutHalfWrapAngle));
 }
 
 TEST_CASE("control point tags round trip and travel with the point")

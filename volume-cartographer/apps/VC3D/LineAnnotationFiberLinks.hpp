@@ -21,7 +21,7 @@
 
 #include <opencv2/core/types.hpp>
 
-#include "FiberSliceGeometry.hpp"
+#include "FiberLineGeometry.hpp"
 #include "LineAnnotationFiberSegments.hpp"
 #include "LineAnnotationStoredFiber.hpp"
 
@@ -167,7 +167,7 @@ inline cv::Vec3d endpointTangentFromLinePoints(const std::vector<cv::Vec3d>& lin
                                                const cv::Vec3d& fallback = {0.0, 0.0, 0.0})
 {
     if (linePoints.size() >= 2 && finitePoint(controlPoint)) {
-        const std::size_t index = vc3d::fiber_slice::nearestLinePointIndex(linePoints, controlPoint);
+        const std::size_t index = vc3d::fiber_line::nearestLinePointIndex(linePoints, controlPoint);
         const cv::Vec3d tangent = tangentAtLinePosition(linePoints, static_cast<double>(index));
         if (finiteDirection(tangent)) {
             return normalizedOrZero(tangent);

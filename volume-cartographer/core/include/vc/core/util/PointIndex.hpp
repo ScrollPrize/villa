@@ -1,9 +1,9 @@
 #pragma once
 
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <optional>
-#include <tuple>
 #include <vector>
 
 #include <opencv2/core/mat.hpp>
@@ -29,30 +29,11 @@ public:
 
     void clear();
     bool empty() const;
-    size_t size() const;
 
-    void insert(uint64_t id, uint64_t collectionId, const cv::Vec3f& position);
-    void bulkInsert(const std::vector<std::tuple<uint64_t, uint64_t, cv::Vec3f>>& points);
     void buildFromMat(const cv::Mat_<cv::Vec3f>& points, uint64_t collectionId = 0);
-    void remove(uint64_t id);
-    bool update(uint64_t id, const cv::Vec3f& newPosition);
-
-    std::optional<QueryResult> nearestInCollection(
-        const cv::Vec3f& position,
-        uint64_t collectionId,
-        float maxDistance = std::numeric_limits<float>::max()) const;
-
-    std::vector<QueryResult> queryRadius(
-        const cv::Vec3f& center,
-        float radius) const;
 
     std::optional<QueryResult> nearest(
         const cv::Vec3f& position,
-        float maxDistance = std::numeric_limits<float>::max()) const;
-
-    std::vector<QueryResult> kNearest(
-        const cv::Vec3f& position,
-        size_t k,
         float maxDistance = std::numeric_limits<float>::max()) const;
 
 private:

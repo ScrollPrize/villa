@@ -38,7 +38,7 @@
 #include "MenuActionController.hpp"
 #include "OpenDataManifest.hpp"
 #include "OpenDataSampleProject.hpp"
-#include "OpenDataSegmentCache.hpp"
+#include "OpenDataManifest.hpp"
 #include "SeedingWidget.hpp"
 #include "SegmentationCommandHandler.hpp"
 #include "SurfacePanelController.hpp"
@@ -54,7 +54,6 @@
 #include "volume_viewers/CChunkedVolumeViewer.hpp"
 #include "volume_viewers/VolumeViewerBase.hpp"
 
-#include "vc/core/types/Segmentation.hpp"
 #include "vc/core/types/Volume.hpp"
 #include "vc/core/types/VolumePkg.hpp"
 #include "vc/ui/VCCollection.hpp"
@@ -121,7 +120,7 @@ uint64_t jsonToFiberId(const QJsonValue& value, const char* paramName)
 LineAnnotationController* AgentBridgeServer::fiberController() const
 {
     CState* state = _window ? _window->_state : nullptr;
-    if (!state || !state->objectStoreSession()->attachment())
+    if (!state || !state->storeFor("fiber"))
         throw AgentBridgeError{-32000, "Attach an object store before using fibers", {}};
     LineAnnotationController* ctrl =
         _window->_lineAnnotationController ? _window->_lineAnnotationController.get() : nullptr;
@@ -458,36 +457,6 @@ QJsonObject AgentBridgeServer::handleFiberSetTag(const QJsonValue& params)
 }
 
 
-QJsonObject AgentBridgeServer::handleFiberCreateAtlas(const QJsonValue& params)
-{
-    LineAnnotationController* ctrl = fiberController();
-    const QJsonObject p = params.toObject();
-
-    const uint64_t fiberId = jsonToFiberId(p.value("fiberId"), "fiberId");
-    requireKnownFiber(ctrl, fiberId);
-
-    // createAtlasFromFiber is synchronous, but its error and rebuild dialogs are
-    // unsafe for remote calls. Run the dialog-free split and display the result
-    // through displayAtlasFromDirectoryHeadless.
-    QString err;
-    std::filesystem::path atlasDir;
-    if (!ctrl->createAtlasFromFiberHeadless(fiberId, &err, &atlasDir)) {
-        QJsonObject data;
-        data["detail"] = err;
-        throw AgentBridgeError{-32005, "Atlas creation failed", data};
-    }
-
-    QString displayErr;
-    const bool displayed = _window->displayAtlasFromDirectoryHeadless(atlasDir, &displayErr);
-
-    QJsonObject result;
-    result["atlasDir"] = QString::fromStdString(atlasDir.string());
-    result["displayed"] = displayed;
-    if (!displayed && !displayErr.isEmpty())
-        result["displayDetail"] = displayErr;
-    return result;
-}
-
 
 QJsonObject AgentBridgeServer::handleFiberExport(const QJsonValue& params)
 {
@@ -500,9 +469,6 @@ QJsonObject AgentBridgeServer::handleFiberExport(const QJsonValue& params)
         data["param"] = "path";
         throw AgentBridgeError{-32602, "path is required", data};
     }
-    if (p.contains("scale"))
-        throw AgentBridgeError{-32602,
-            "Fiber import/export preserves coordinates; scale is not supported", {}};
 
     QString err;
     int exported = 0;
@@ -531,9 +497,6 @@ QJsonObject AgentBridgeServer::handleFiberImport(const QJsonValue& params)
         data["param"] = "path";
         throw AgentBridgeError{-32602, "path is required", data};
     }
-    if (p.contains("scale"))
-        throw AgentBridgeError{-32602,
-            "Fiber import/export preserves coordinates; scale is not supported", {}};
 
     const std::filesystem::path importPath(pathStr.toStdString());
     std::error_code ec;

@@ -60,7 +60,7 @@ void remove_component_cuda(DeviceArray& a,const ChannelPlan& c) {
         auto selection=std::static_pointer_cast<ComponentSelection>(c.device_selection);
         a.typed([&](auto v){launch(blocks(n),256,0,vcr::device::stream(),EraseSelectedComponent{},v.ptr,n,c.channel,selection->parents.ptr,selection->choice.ptr);});
     } else {
-        auto field=c.device_indices ? std::static_pointer_cast<Buffer<std::size_t>>(c.device_indices) : std::make_shared<Buffer<std::size_t>>(c.indices);
+        auto field=std::make_shared<Buffer<std::size_t>>(c.indices);
         a.typed([&](auto v){launch(blocks(field->size),256,0,vcr::device::stream(),erase_component_launch{},v.ptr,n,c.channel,static_cast<long long>(c.values[0]),field->ptr,field->size);});
     }
     check(cudaGetLastError());

@@ -80,11 +80,11 @@ class SourceTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 make()
 
-    def test_discovery_is_stdlib_only_and_offline(self):
+    def test_discovery_needs_no_array_backend_and_is_offline(self):
         root = Path(__file__).resolve().parents[1]
         code = f"""
 import sys
-sys.path[:0] = [{str(root / 'src')!r}, {str(root / 'tests')!r}]
+sys.path[:0] = [{str(Path(__import__('vc_reader').__file__).resolve().parent.parent)!r}, {str(root / 'tests')!r}]
 from unittest.mock import patch
 from test_sources import catalog
 with patch('urllib.request.urlopen', side_effect=AssertionError('network request')):

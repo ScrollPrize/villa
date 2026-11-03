@@ -55,11 +55,7 @@ def http_url(url: str) -> str:
         return url
     from ..artifacts import to_https
 
-    https = to_https(url)
-    if https is None:
-        bucket, _, key = url[len("s3://"):].partition("/")
-        https = f"https://{bucket}.s3.amazonaws.com/{key}"
-    return https
+    return to_https(url)
 
 
 def split_s3(url: str) -> tuple[str, str]:
@@ -83,12 +79,6 @@ class S3Credentials:
     session_token: str | None = field(default=None, repr=False)
     region: str | None = None
     endpoint_url: str | None = None
-
-    @classmethod
-    def from_environment(cls, profile: str | None = None) -> S3Credentials | None:
-        """A snapshot of the credentials ``auth="aws"`` would use (``profile`` overrides ``AWS_PROFILE``), or None."""
-        source = _AwsSource(profile)
-        return source.current()
 
 
 def _config_sections(path: Path) -> configparser.ConfigParser:

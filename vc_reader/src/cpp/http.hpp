@@ -44,6 +44,7 @@ struct HttpOptions {
     long stall_timeout_s = 10;     // abort an attempt after this long without receiving data
     int retries = 5;
     Auth auth;
+    long request_timeout_ms = 0;
 };
 
 struct HttpResponse {
@@ -143,9 +144,17 @@ public:
             curl_easy_setopt(h, CURLOPT_USERAGENT, "vc_reader");
             curl_easy_setopt(h, CURLOPT_ACCEPT_ENCODING, "");
             curl_easy_setopt(h, CURLOPT_CONNECTTIMEOUT_MS, options_.connect_timeout_ms);
+            curl_easy_setopt(h, CURLOPT_TIMEOUT_MS, options_.request_timeout_ms);
             curl_easy_setopt(h, CURLOPT_LOW_SPEED_LIMIT, 1L);
             curl_easy_setopt(h, CURLOPT_LOW_SPEED_TIME, options_.stall_timeout_s);
             curl_easy_setopt(h, CURLOPT_TCP_KEEPALIVE, 1L);
+#if defined(_WIN32)
+            // MSYS2's OpenSSL-backed libcurl defaults to a CA bundle under /ucrt64
+            // that end-user machines lack; verify against the Windows store instead.
+            curl_easy_setopt(h, CURLOPT_SSL_OPTIONS, static_cast<long>(CURLSSLOPT_NATIVE_CA));
+            // An HTTPS proxy is verified with its own options.
+            curl_easy_setopt(h, CURLOPT_PROXY_SSL_OPTIONS, static_cast<long>(CURLSSLOPT_NATIVE_CA));
+#endif
             curl_easy_setopt(h, CURLOPT_WRITEFUNCTION, &HttpClient::receive);
             curl_easy_setopt(h, CURLOPT_WRITEDATA, &transfer);
             curl_easy_setopt(h, CURLOPT_HEADERFUNCTION, &HttpClient::header);

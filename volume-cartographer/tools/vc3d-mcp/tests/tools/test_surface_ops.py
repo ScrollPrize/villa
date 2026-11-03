@@ -5,8 +5,7 @@ small in-process fake Agent Bridge (AF_UNIX, newline-delimited JSON-RPC 2.0),
 asserting:
   * method + params land on the wire with None stripped and snake_case mapped to
     the RPC's camelCase keys;
-  * synchronous ops (crop, recalc_area) and deferred ops (masks) pass their
-    result straight through;
+  * the synchronous crop passes its result straight through;
   * async "tool" ops (reoptimize, refine) honor wait vs no-wait, mirroring the
     run_trace / grow idiom (wait=True polls job.status to a terminal state).
 
@@ -24,10 +23,7 @@ import unittest
 from tests.support import FakeBridgeServer
 from vc3d_mcp import core
 from vc3d_mcp.tools.surface_ops import (
-    vc3d_append_segment_mask,
     vc3d_crop_segment_bounds,
-    vc3d_generate_segment_mask,
-    vc3d_recalc_segment_area,
     vc3d_refine_segment_alpha_comp,
     vc3d_reoptimize_segment,
 )
@@ -57,37 +53,18 @@ class SurfaceOpsBridge(FakeBridgeServer):
             else:
                 await self.reply(writer, req_id,
                                   result={"cropped": True, "segmentId": params.get("segmentId")})
-        elif method == "segment.recalc_area":
-            results = [
-                {"segmentId": sid, "areaVx2": 100.0, "areaCm2": 1.5,
-                 "success": True, "errorReason": None}
-                for sid in params.get("segmentIds", [])
-            ]
-            await self.reply(writer, req_id, result={"results": results})
         elif method == "segment.reoptimize":
             job_id = "job-ro"
             self._jobs[job_id] = {"jobId": job_id, "kind": "segment.reoptimize"}
             await self.reply(writer, req_id, result={
                 "jobId": job_id, "kind": "segment.reoptimize", "source": "tool",
-                "outputDir": "/vpkg/paths/seg", "volumeId": "vol-a"})
+                "volumeId": "vol-a"})
         elif method == "segment.refine_alpha_comp":
             job_id = "job-ac"
             self._jobs[job_id] = {"jobId": job_id, "kind": "segment.refine_alpha_comp"}
             await self.reply(writer, req_id, result={
                 "jobId": job_id, "kind": "segment.refine_alpha_comp", "source": "tool",
-                "outputDir": "/vpkg/paths/seg_refined", "segmentId": params.get("segmentId")})
-        elif method == "segment.generate_mask":
-            # Deferred on the real bridge; the client just sees a normal reply.
-            await self.reply(writer, req_id, result={
-                "generated": True, "appended": False,
-                "maskPath": "/vpkg/paths/seg/mask.tif",
-                "segmentId": params.get("segmentId"), "message": "Mask saved"})
-        elif method == "segment.append_mask":
-            await self.reply(writer, req_id, result={
-                "generated": True, "appended": True,
-                "maskPath": "/vpkg/paths/seg/mask.tif",
-                "segmentId": params.get("segmentId"),
-                "message": "Appended surface image to existing mask (now 2 layers)"})
+                "segmentId": params.get("segmentId")})
         elif method == "job.status":
             job_id = params.get("jobId")
             rec = self._jobs.get(job_id, {"jobId": job_id, "kind": "segment.reoptimize"})
@@ -129,14 +106,6 @@ class SurfaceOpsTest(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result["cropped"])
         self.assertEqual(result["segmentId"], "seg-1")
         self.assertEqual(self.bridge.params_for("segment.crop_bounds"), {"segmentId": "seg-1"})
-
-    async def test_recalc_area_passthrough(self) -> None:
-        result = await vc3d_recalc_segment_area(["seg-1", "seg-2"])
-        self.assertEqual(len(result["results"]), 2)
-        self.assertEqual(result["results"][0]["segmentId"], "seg-1")
-        self.assertTrue(result["results"][0]["success"])
-        self.assertEqual(self.bridge.params_for("segment.recalc_area"),
-                         {"segmentIds": ["seg-1", "seg-2"]})
 
     # Async external-tool operations
 
@@ -186,9 +155,9 @@ class SurfaceOpsTest(unittest.IsolatedAsyncioTestCase):
                 "borderOff": 1.0,
                 "radius": 3,
                 "genVertexColor": False,
-                "overwrite": True,
                 "readerScale": 0.5,
                 "scaleGroup": "1",
+                "inPlace": False,
             },
         )
 
@@ -201,60 +170,17 @@ class SurfaceOpsTest(unittest.IsolatedAsyncioTestCase):
     async def test_refine_alpha_comp_optionals_mapped_to_camelcase(self) -> None:
         await vc3d_refine_segment_alpha_comp(
             "seg-1", refine=False, start=-3.0, stop=20.0, step=1.0, low=10, high=200,
-            border_off=2.0, radius=5, gen_vertex_color=True, overwrite=False,
-            reader_scale=0.25, scale_group="2", omp_threads=8, output_dir="refined",
+            border_off=2.0, radius=5, gen_vertex_color=True,
+            reader_scale=0.25, scale_group="2", omp_threads=8, output_name="refined",
+            in_place=True,
             wait=False)
         self.assertEqual(
             self.bridge.params_for("segment.refine_alpha_comp"),
             {"segmentId": "seg-1", "refine": False, "start": -3.0, "stop": 20.0,
              "step": 1.0, "low": 10, "high": 200, "borderOff": 2.0, "radius": 5,
-             "genVertexColor": True, "overwrite": False, "readerScale": 0.25,
-             "scaleGroup": "2", "ompThreads": 8, "outputDir": "refined"},
+             "genVertexColor": True, "readerScale": 0.25,
+             "scaleGroup": "2", "ompThreads": 8, "outputName": "refined", "inPlace": True},
         )
-
-    # Deferred mask operations
-
-    async def test_generate_mask_passthrough(self) -> None:
-        result = await vc3d_generate_segment_mask("seg-1")
-        self.assertTrue(result["generated"])
-        self.assertFalse(result["appended"])
-        self.assertEqual(result["segmentId"], "seg-1")
-        self.assertEqual(self.bridge.params_for("segment.generate_mask"), {"segmentId": "seg-1"})
-
-    async def test_append_mask_passthrough(self) -> None:
-        result = await vc3d_append_segment_mask("seg-1")
-        self.assertTrue(result["generated"])
-        self.assertTrue(result["appended"])
-        self.assertEqual(result["segmentId"], "seg-1")
-        self.assertEqual(self.bridge.params_for("segment.append_mask"), {"segmentId": "seg-1"})
-
-    async def test_mask_tools_use_timeout_above_server_cap(self) -> None:
-        """The mask tools pass a per-call timeout past the bridge's 120s deferred
-        cap; other tools leave it at the client default (None). The timeout is a
-        client-side wait, not a wire field, so spy on BridgeClient.call."""
-        from vc3d_mcp.tools import surface_ops
-
-        client = core._get_client()
-        seen: list[tuple[str, float | None]] = []
-        orig_call = client.call
-
-        async def spy(method, params=None, timeout=None):
-            seen.append((method, timeout))
-            return await orig_call(method, params, timeout=timeout)
-
-        client.call = spy  # type: ignore[method-assign]
-        try:
-            await vc3d_generate_segment_mask("seg-1")
-            await vc3d_append_segment_mask("seg-1")
-            await vc3d_crop_segment_bounds("seg-1")
-        finally:
-            client.call = orig_call  # type: ignore[method-assign]
-
-        timeouts = {method: timeout for method, timeout in seen}
-        self.assertGreater(surface_ops.MASK_RENDER_TIMEOUT_S, 120.0)
-        self.assertEqual(timeouts["segment.generate_mask"], surface_ops.MASK_RENDER_TIMEOUT_S)
-        self.assertEqual(timeouts["segment.append_mask"], surface_ops.MASK_RENDER_TIMEOUT_S)
-        self.assertIsNone(timeouts["segment.crop_bounds"])
 
     async def test_crop_bounds_failure_propagates(self) -> None:
         """A crop core failure surfaces as a BridgeError (-32005), not a false

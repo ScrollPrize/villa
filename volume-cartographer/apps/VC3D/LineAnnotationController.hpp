@@ -29,9 +29,8 @@
 #include <nlohmann/json.hpp>
 #include <opencv2/core/mat.hpp>
 
-#include "AnnotationFrame.hpp"
-#include "UmbilicusOrientationFreshness.hpp"
-#include "LineAnnotationFiberClassification.hpp"
+#include "OpenDataVolumeOrientation.hpp"
+#include "vc/fiber_tracer/FiberHvClassification.hpp"
 #include "LineAnnotationFiberDeletion.hpp"
 #include "LineAnnotationFiberSegments.hpp"
 #include "LineAnnotationFiberLinkValidation.hpp"
@@ -39,18 +38,16 @@
 #include "FiberMapAutoLink.hpp"
 #include "LineAnnotationStructuralEdits.hpp"
 #include "LineAnnotationGeneratedViews.hpp"
-#include "vc/atlas/FiberIntersections.hpp"
+#include "vc/fiber_tracer/FiberSideStripIntersections.hpp"
 #include "vc/core/util/Umbilicus.hpp"
-#include "vc/core/util/ScrollUmbilicus.hpp"
-#include "vc/core/util/Uuid.hpp"
+#include <vc_object_store/Uuid.hpp>
+#include <vc_object_store/objects/VolumeUmbilicus.hpp>
 #include "vc/lasagna/LineOptimizer.hpp"
 #include "volume_viewers/CChunkedVolumeViewer.hpp"
 
 class CState;
 class FiberSaveBatchTracker;
-class FiberSliceOverlayController;
 class LineAnnotationDialog;
-class QMdiArea;
 class QEvent;
 class QPoint;
 class Surface;
@@ -96,7 +93,7 @@ public:
     // owning session's line revision/edit epoch), so a query no longer
     // deep-copies and re-hashes every candidate fiber per placement.
     struct SideStripFiberSnapshot {
-        std::shared_ptr<const vc::atlas::FiberPolyline> polyline;
+        std::shared_ptr<const vc::fiber_tracer::FiberPolyline> polyline;
         uint64_t geometryHash = 0;
     };
 
@@ -131,8 +128,8 @@ public:
         std::string name;
         int controlPointCount = 0;
         int linePointCount = 0;
-        // The whole stored line, open tails included: what the atlas search
-        // and the agent bridge measure arclengths against.
+        // The whole stored line, open tails included: what the agent bridge
+        // measures arclengths against.
         double lengthVx = 0.0;
         // The line between the outermost control points (the sum of the
         // spans; nothing when they all sit on one line point), what the
@@ -206,34 +203,30 @@ public:
 
     struct FiberMapSnapshot {
         std::vector<FiberMapFiber> fibers;
-        // The frame this snapshot's geometry was derived in. Reported rather than
-        // left for a holder to re-derive: a second call to annotationFrame()
-        // reads live volume state and so could answer differently, which would
-        // tag a layout with a frame it was not built in.
-        vc3d::annotation::AnnotationFrame frame;
+        // The volume this snapshot's geometry is in (CState::annotationVolume).
+        // Reported rather than left for a holder to re-derive: live volume
+        // state could answer differently, which would tag a layout with a
+        // volume it was not built in.
+        std::string annotationVolume;
         // fiberDataGeneration() when this snapshot was taken; a holder compares
         // it to know whether what it built from this is still current.
         uint64_t generation = 0;
-        // Umbilicus control points scaled into the fibers' frame, sorted by z;
+        // Umbilicus control points in that volume, sorted by z;
         // empty when no plausible umbilicus was found.
         std::vector<cv::Vec3f> umbilicusCenters;
-        // Physical size of one voxel of the frame the fibers are annotated in,
-        // in µm. Unset when the package cannot say: no coordinate identity to
-        // read it from and no volume to fall back on. There is no default on
+        // Physical size of one voxel of that volume, in µm. Unset when nothing
+        // can say. There is no default on
         // purpose — a guessed voxel size turns every derived physical figure
         // (cm, reference radii, scroll height) silently wrong, so consumers
         // must handle the unset case and show voxels instead.
         std::optional<double> voxelSizeUm;
-        // Scroll z extent in the fibers' frame, i.e. the current volume's slice
-        // count scaled back to the annotation (level 0) resolution; 0 when the
-        // volume is unknown.
+        // Scroll z extent in that volume (the current volume's slice count
+        // mapped into it); 0 when the volume is unknown.
         int annotationZSlices = 0;
-        // The current volume's open-data coordinate space
-        // ("<sample>/<volume>@L<level>", from its vc-open-data tags), which
-        // names the catalog entry that orients it; empty for a volume without
-        // the tags.
-        std::string coordinateSpace;
-        QString umbilicusMessage;           // resolver error / ambiguity text; empty on success
+        // The catalog volume the current volume shows and its orientation;
+        // nullopt for a volume the catalog does not publish.
+        std::optional<vc3d::opendata::CatalogVolumeSense> catalogVolume;
+        QString umbilicusMessage;           // why there is no umbilicus; empty on success
         // Ready-to-display description of the frame the scale maps from, for
         // workspace status bars: the stamped volume and its level offset when
         // the ratio is a power of two, the stamped grid size otherwise, or the
@@ -251,40 +244,11 @@ public:
         QString text;
     };
 
-    struct FiberSnapshotWithPath {
-        std::filesystem::path fiberPath;
-        vc::atlas::FiberPolyline fiber;
-        uint64_t storedFiberId = 0;
-        vc3d::line_annotation::FiberHvClassification hvClassification;
-        std::string manualHvTag;
-        std::vector<std::string> tags;
-    };
-
-    // Persisted branch-link metadata. Live branch refs are coupled to
-    // LineAnnotationSession::controlPoints, reciprocal refs in linked fibers, and
-    // saved-fiber control-point ordering. Any live mutation of control points or
-    // branches must go through the private session paths that call
-    // syncLinkedBranchMetadataAfterFiberModification().
-    // Adjacent links have the same entry schema as ordinary branches, in a
-    // separate top-level array in explicit transfer JSON. Store links carry
-    // their kind on a single shared edge.
-    static constexpr const char* kAdjacentBranchesJsonKey = "adjacent_branches";
-
     using FiberBranchRef = vc3d::line_annotation::FiberBranchRef;
 
     using DatasetPicker =
         std::function<std::optional<std::string>(QWidget*, const std::filesystem::path&)>;
     using VolumeSelectorFactory = std::function<QWidget*(QWidget*)>;
-    using OptimizationTaskFactory =
-        std::function<OptimizationTaskResult(std::filesystem::path,
-                                             std::vector<vc3d::line_annotation::LineControlPoint>,
-                                             std::vector<cv::Vec3d>,
-                                             cv::Vec3d,
-                                             InitialDirectionMode,
-                                             int,
-                                             bool,
-                                             int,
-                                             int)>;
 
     struct ResolvedFiberOptimizationInputs {
         std::shared_ptr<vc::lasagna::LasagnaDataset> normalDataset;
@@ -324,6 +288,8 @@ public:
     // Opens a fiber imported from an Automated Fiber Volume, fitting the whole
     // line in both strips. A Lasagna dataset is optional. Errors are returned
     // through error instead of dialogs.
+    // Immutable, worker-safe reference used by the Line Annotation strips.
+    std::function<cv::Vec3f(const cv::Vec3f&)> displayCenterReference();
     LineAnnotationDialog* openCollectionFiber(uint64_t fiberId, QString* error = nullptr);
     // Opens a fiber annotation (with line_points) read-only, without adding it
     // to the package: nothing is written, optimized or edited, and the fiber
@@ -342,8 +308,7 @@ public:
     };
     // Phase B: finalizes, saves and closes every live session of the two
     // fibers (dialogs through the ordinary open preparation, dialog-less
-    // panes and the intersection inspection explicitly, each saved before
-    // its pane is erased), then the structural-edit preflight. After it, no
+    // panes explicitly, each saved before its pane is erased), then the structural-edit preflight. After it, no
     // session of either fiber exists; the caller re-verifies its map
     // dependencies (a save may have moved the fiber generation) before
     // locating the meeting on the map.
@@ -381,7 +346,6 @@ public:
     // setting is on. Enables editing in the most recent pane of this fiber
     // (as its Enable editing button does); false when it cannot.
     bool enableFiberEditing(uint64_t fiberId);
-    void deleteFiber(uint64_t fiberId);
     // Retire the selected object UUIDs and remove their links in one checked action.
     vc3d::line_annotation::FiberDeleteOutcome deleteFibers(std::vector<uint64_t> fiberIds);
     void renameFiberFile(uint64_t fiberId);
@@ -392,23 +356,11 @@ public:
     void recalculateFiberHvClassification(uint64_t fiberId);
     void calculateFiberAlignmentMetrics(std::vector<uint64_t> orderedFiberIds);
     void requestFiberAlignmentMetrics(uint64_t fiberId);
-    void createAtlasFromFiber(uint64_t fiberId);
     void addFiberToPointCollection(uint64_t fiberId);
     void addFibersToPointCollections(std::vector<uint64_t> fiberIds);
-    void showFiberSlice(uint64_t fiberId, QMdiArea* targetArea);
-    void showIntersectionInspection(const vc::atlas::FiberIntersectionResult& result,
-                                    QMdiArea* targetArea,
-                                    std::optional<std::filesystem::path> atlasDir = std::nullopt);
-    // Shows an intersection inspection without a dialog, reporting failures
-    // through errorMessage.
-    bool showIntersectionInspectionHeadless(const vc::atlas::FiberIntersectionResult& result,
-                                            QMdiArea* targetArea,
-                                            std::optional<std::filesystem::path> atlasDir,
-                                            QString* errorMessage = nullptr);
     void saveOpenFibers();
     using FiberSaveCompletion = std::function<void(bool, const QString&)>;
     void saveOpenFibersHeadless(FiberSaveCompletion onFinished);
-    void closeFiberWindowForSurface(const std::string& surfaceName);
     bool showGeneratedControlPointContextMenu(CChunkedVolumeViewer* viewer,
                                               const QPointF& scenePoint,
                                               const QPoint& globalPos);
@@ -423,10 +375,12 @@ public:
     [[nodiscard]] std::string fiberUuidForId(uint64_t id) const;
     // The current head of an active fiber, read from the store.
     std::optional<vc::objects::PinnedObject> fiberPin(uint64_t id) const;
-    std::optional<double> fiberCoordinateScale(uint64_t id, bool prompt = false);
-    [[nodiscard]] std::optional<double> fiberCoordinateScaleForVolume(uint64_t fiberId, const std::shared_ptr<Volume>& volume) const;
+    // Fibers bound to the open volume (by scale or a registration) are read
+    // and edited in its voxels. Optionally prompts to bind an unbound fiber.
+    bool ensureFiberInVolume(uint64_t id, bool prompt = false);
+    [[nodiscard]] bool fiberBoundToVolume(uint64_t fiberId, const std::shared_ptr<Volume>& volume) const;
     [[nodiscard]] FiberMapSnapshot fiberMapSnapshot() const;
-    // Resolves the package's umbilicus for a status line only; nothing is
+    // The current volume's stored umbilicus for a status line only; nothing is
     // cached, so call it on user-visible state changes rather than per frame.
     [[nodiscard]] UmbilicusStatus umbilicusStatus() const;
     // The frame line points and control points are expressed in: the current
@@ -434,20 +388,12 @@ public:
     // Default-constructed (no voxel size, zero extent) when no volume is loaded.
     // Holders of derived geometry compare it to know whether what they built is
     // still in a frame that means anything.
-    [[nodiscard]] vc3d::annotation::AnnotationFrame annotationFrame() const;
-    // Cheap token over everything resolveScrollUmbilicus() depends on: the
-    // project's field plus a stat() of each path the resolver's own scan reports,
-    // and no JSON parse. Size and mtime, so it is a metadata token rather than a
-    // guarantee -- a same-size rewrite inside one timestamp tick is invisible to
-    // it. It covers the file changing underneath VC3D, which no counter reports;
-    // for attach and detach it overlaps umbilicusGeneration(), which holders
-    // still compare as the reviewer-prescribed mechanism for in-app changes.
+    // The stored umbilicus of the current volume as uuid@revision, or why there
+    // is none: changes whenever the umbilicus derived views depend on does.
     [[nodiscard]] QString umbilicusFingerprint() const;
-    // The current volume's open-data coordinate space
-    // ("<sample>/<volume>@L<level>", from its vc-open-data tags), naming the
-    // catalog entry that orients it; empty for a volume without the tags.
-    // A tag read, no parse, so it is cheap enough for dependency checks.
-    [[nodiscard]] std::string fiberMapCoordinateSpace() const;
+    // The catalog volume the current volume shows and its orientation
+    // (catalogVolumeSense); cheap enough for dependency checks.
+    [[nodiscard]] std::optional<vc3d::opendata::CatalogVolumeSense> fiberMapCatalogVolume() const;
     // Bumped on every store commit (local or external) and attachment change.
     // Holders of derived data compare it to decide whether what they built is
     // still current; runtime fiber ids are only meaningful within one
@@ -479,10 +425,6 @@ public:
     [[nodiscard]] QString fiberDisplayNameForId(uint64_t fiberId) const;
     // 'reviewed' first, then every tag on an active store fiber.
     [[nodiscard]] std::vector<std::string> knownFiberTags() const;
-    // Every active store fiber, in full (whole-store tools such as the atlas search).
-    [[nodiscard]] std::vector<FiberSnapshotWithPath> fiberSnapshotsFromStorageWithPaths();
-    [[nodiscard]] std::optional<uint64_t> fiberIdForAtlasPath(
-        const std::filesystem::path& atlasFiberPath) const;
 
     // Dialog-free operation entry points. Distinct names avoid ambiguity where
     // their interactive counterparts are used in connect().
@@ -494,14 +436,6 @@ public:
     bool importFibersFromPath(const std::filesystem::path& path,
                               QString* errorMessage = nullptr,
                               int* importedCount = nullptr, int* skippedCount = nullptr);
-    // Adds one unlinked vc3d_fiber to the attached store; returns its id, or 0
-    // with errorMessage set.
-    uint64_t importFiberJson(const nlohmann::json& fiber, const std::string& fileName,
-                             QString* errorMessage = nullptr);
-    // Creates an atlas without dialogs. It does not emit atlasCreated because
-    // that signal is connected to the interactive display path.
-    bool createAtlasFromFiberHeadless(uint64_t fiberId, QString* errorMessage = nullptr,
-                                      std::filesystem::path* atlasDirOut = nullptr);
     // Most recently opened live line-annotation workspace, or nullptr.
     [[nodiscard]] LineAnnotationDialog* mostRecentLineAnnotationDialog() const;
     // Short-lived presentation guard for direct operations. Sessions created
@@ -510,23 +444,8 @@ public:
     [[nodiscard]] bool errorDialogsSuppressed() const;
     [[nodiscard]] QString takeLastSuppressedError();
 
-    void setDatasetPickerForTesting(DatasetPicker picker);
-    void setOptimizationTaskFactoryForTesting(OptimizationTaskFactory factory);
-    // Replaces the modal QMessageBox that guards fiber optimization-mode
-    // switches; the callback receives the requested mode and returns
-    // whether to proceed.
-    void setModeChangeConfirmationForTesting(
-        std::function<bool(vc3d::line_annotation::FiberOptimizationMode)> confirmer);
-    // Replaces the modal QMessageBox shown when the two fibers of a merge
-    // carry different optimization modes; the callback receives (clicked,
-    // candidate) modes and returns the mode to keep, or nullopt to cancel.
-    void setMergeModePickerForTesting(
-        std::function<std::optional<vc3d::line_annotation::FiberOptimizationMode>(
-            vc3d::line_annotation::FiberOptimizationMode,
-            vc3d::line_annotation::FiberOptimizationMode)> picker);
     void setVolumeSelectorFactory(VolumeSelectorFactory factory);
     void setSurfacePanel(SurfacePanelController* panel);
-    void setCurrentAtlasDirectory(std::optional<std::filesystem::path> atlasDir);
 
     // Temporary native transport artifact from a pinned committed revision.
     [[nodiscard]] std::map<std::string, std::filesystem::path> fiberTransportPaths(const std::vector<uint64_t>& fiberIds) const;
@@ -559,15 +478,11 @@ signals:
     void lineAnnotationWorkspaceRequested(LineAnnotationDialog* dialog, const QString& title);
     // Store fibers changed: a commit, an external change or a new attachment.
     void fibersChanged();
-    void fiberAlignmentMetricsReset(bool pending);
     void fiberAlignmentMetricsUpdated(
         uint64_t fiberId,
         LineAnnotationController::FiberSummary::AlignmentMetrics alignment,
         std::vector<LineAnnotationController::FiberSummary::AlignmentMetrics> spanAlignments);
-    void fiberSaved(uint64_t fiberId, uint64_t generation);
     void fiberRetired(const QString& objectUuid);
-    void fibersDeleted(std::vector<uint64_t> fiberIds);
-    void atlasCreated(std::filesystem::path atlasDir);
 
 private slots:
     void onSurfaceChanged(std::string name, std::shared_ptr<Surface> surf, bool isEditUpdate = false);
@@ -594,7 +509,6 @@ private:
     // state private prevents external code from mutating controlPoints/branches
     // without the branch metadata synchronization hook.
     struct LineAnnotationSession;
-    struct IntersectionInspectionSession;
     struct FiberMetricsTaskResult;
     struct ControlSpanRecord {
         int spanIndex = 0;
@@ -645,7 +559,7 @@ private:
         std::vector<uint64_t> excludedFiberIds;
         cv::Mat_<cv::Vec3f> stripPoints;
         std::vector<SideStripFiberSnapshot> fibers;
-        std::vector<vc::atlas::FiberSideStripLineQuery> branchLinks;
+        std::vector<vc::fiber_tracer::FiberSideStripLineQuery> branchLinks;
     };
 
     struct SideStripIntersectionTaskResult {
@@ -750,8 +664,6 @@ private:
                                                   const cv::Vec3d& seedPoint,
                                                   const cv::Vec3d& requestedLinkDirection,
                                                   const LineAnnotationSession& templateSession);
-    void handleGeneratedPredSnapPoint(const std::string& surfaceName,
-                                      cv::Vec3f volumePoint);
     // Debouncing entry point (signal-connected): one placement triggers
     // several overlay rebuilds, each re-requesting intersections; they
     // coalesce into one dispatch per quiet window so the all-fiber snapshot
@@ -1128,8 +1040,7 @@ private:
     void invalidateScrollUmbilicus();
     // Rebuilds the generated views of panes whose recorded orientation epoch is
     // behind the controller's — which is what actually re-applies sheet normals
-    // after the umbilicus or the active volume changed — and the intersection
-    // inspection's strips, which have no generated-view sessions of their own.
+    // after the umbilicus or the active volume changed.
     // Failures are logged per pane and do not stop the others.
     void refreshStaleGeneratedViews();
     // Coalesces refreshStaleGeneratedViews() onto the next event-loop turn:
@@ -1137,31 +1048,22 @@ private:
     // before focus and navigation are restored, and materialization reads pane
     // camera state. Also collapses rapid switching into one rebuild.
     void scheduleStaleViewRefresh();
-    // Cheap fingerprint over everything the resolved umbilicus was read from: a
-    // stat() of every resolver candidate (the attached file when the project
-    // field is set, the discovery candidates otherwise) plus the registration
-    // transform the legacy reading would consult — no JSON parse. Part of the
-    // cached umbilicus's key, so fixing a refused file, editing a transform in
-    // place, or a new candidate appearing all reach the views.
-    [[nodiscard]] QString umbilicusCacheToken() const;
-    // The umbilicus half of fiberMapSnapshot(): the resolver's answer brought
-    // into the fibers' frame through the shared derivation, or the message
-    // saying why it could not be. Empty centers with an empty message mean the
-    // resolved file had no points, or no package is loaded.
+    // The umbilicus half of fiberMapSnapshot(): the stored umbilicus brought
+    // into the fibers' frame, or the message saying why it could not be. Empty
+    // centers with an empty message mean no state is loaded.
     struct SnapshotUmbilicus {
         std::vector<cv::Vec3f> centers;  // scaled into the fibers' frame, z-sorted
-        QString label;                   // frame description; empty when refused
-        QString message;                 // resolver/frame error; empty on success
+        QString label;                   // the umbilicus' name; empty when refused
+        QString message;                 // why there is none; empty on success
     };
-    [[nodiscard]] SnapshotUmbilicus umbilicusForSnapshot(
-        const vc3d::annotation::AnnotationFrame& frame) const;
+    [[nodiscard]] SnapshotUmbilicus umbilicusForSnapshot(const std::string& annotationVolume) const;
     void onActiveVolumeChanged();
     // Pushes _umbilicusNotice to every open pane's dialog.
     void publishUmbilicusNotice();
     void finishOptimization(const std::string& surfaceName);
-    // Loads the volpkg's scroll umbilicus into the session frame on first use
-    // and caches the (possibly empty) result; re-attempted when the volpkg
-    // root changes.
+    // Loads the stored umbilicus into the session frame on first use and caches
+    // the (possibly empty) result; reloaded when the volume, frame or stored
+    // umbilicus changes.
     const std::optional<vc::core::util::Umbilicus>& ensureScrollUmbilicusLoaded();
     // Per-line-point sampled sheet normals, sign-oriented away from the
     // scroll center (umbilicus when available, volume XY center otherwise);
@@ -1174,18 +1076,11 @@ private:
     // false right after it returns false without publishing anything.
     bool materializeGeneratedViews(LineAnnotationSession& session,
                                    const std::function<bool()>& stillValid = {});
-    bool materializeGeneratedViews(LineAnnotationSession& session,
-                                   const std::string& surfacePrefix);
     void handleShowAsMesh(const std::string& surfaceName);
-    [[nodiscard]] std::filesystem::path resolveMeshExportPathsDir() const;
-    [[nodiscard]] std::filesystem::path nextMeshExportPath(const std::filesystem::path& pathsDir,
-                                                           const std::string& stem) const;
-    [[nodiscard]] std::vector<std::filesystem::path> saveGeneratedQuadMeshes(LineAnnotationSession& session);
+    [[nodiscard]] std::vector<std::string> saveGeneratedQuadMeshes(LineAnnotationSession& session);
     [[nodiscard]] PaneRecord* paneForSurface(const std::string& surfaceName);
     [[nodiscard]] const PaneRecord* paneForSurface(const std::string& surfaceName) const;
-    [[nodiscard]] cv::Vec3f fiberBasePointFromViewer(
-        const std::string& surfaceName,
-        cv::Vec3f volumePoint) const;
+
     // "H"/"V" from the manual tag, falling back to the automatic classification;
     // empty when unknown or the fiber is not in the store.
     [[nodiscard]] QString fiberHvDirectionTag(uint64_t fiberId) const;
@@ -1193,33 +1088,28 @@ private:
     void pushFiberUiState(const PaneRecord& pane) const;
     [[nodiscard]] std::optional<std::string> pickDataset(QWidget* parent,
                                                           const std::filesystem::path& startDir) const;
-    [[nodiscard]] OptimizationTaskResult runOptimizationTask(std::filesystem::path manifestPath,
-                                                             std::vector<vc3d::line_annotation::LineControlPoint> controlPoints,
-                                                             std::vector<cv::Vec3d> initialLinePoints,
-                                                             cv::Vec3d sourceSliceNormal,
-                                                             InitialDirectionMode directionMode,
-                                                             int initialCenterlineLengthVx,
-                                                             bool fullOptimization = false,
-                                                             int activeStart = -1,
-                                                             int activeEnd = -1) const;
     // Current heads of the given fiber UUIDs (nullopt: every active fiber),
     // decoded for editing. Branch refs resolve against their endpoints in the
     // same snapshot; missing and retired objects are skipped. Line points are
     // read on request, otherwise loaded on demand by ensureFiberLines().
+    struct StoredFiberDependencies {
+        std::map<std::string, std::optional<uint64_t>> peers;
+        std::set<std::string> relationships;
+    };
+    using FiberDependencies = std::unordered_map<std::string, StoredFiberDependencies>;
     [[nodiscard]] std::vector<StoredFiber> readStoredFibers(
-        const std::optional<std::vector<std::string>>& uuids, bool lines = false) const;
+        const std::optional<std::vector<std::string>>& uuids, bool lines = false,
+        FiberDependencies* dependencies = nullptr) const;
     [[nodiscard]] std::optional<StoredFiber> readStoredFiber(uint64_t id, bool lines = false) const;
     // readStoredFibers() for hot UI paths: reuses decoded fibers whose object
-    // generation is unchanged. Cleared on every store commit and attachment.
+    // and peer generations are unchanged. Store events invalidate old and new
+    // relationship endpoints; attachment and transform changes clear all.
     [[nodiscard]] std::vector<StoredFiber> readStoredFibersCached(
         const std::vector<std::string>& uuids, bool lines = false) const;
-    // Active fibers bound to the current volume whose bounds overlap a box in
-    // volume voxels.
-    [[nodiscard]] std::vector<StoredFiber> readStoredFibersInVolumeBox(
-        const std::array<double, 6>& volumeBox, bool lines = false) const;
+    void invalidateStoredFiberCaches(const vc::objects::StoreSessionEvent& event);
     [[nodiscard]] std::string storedFiberFileName(uint64_t fiberId) const;
-    // Stored units -> current volume voxels for a fiber read from the store.
-    [[nodiscard]] std::optional<double> storedFiberScale(const StoredFiber& fiber) const;
+    // A fiber read from the store in the open volume's voxels.
+    [[nodiscard]] bool fiberInVolume(const StoredFiber& fiber) const;
     void registerFiberId(const std::string& uuid, uint64_t id) const;
     // Drops everything derived from the previous attachment.
     void resetStoreDerivedState();
@@ -1245,16 +1135,7 @@ private:
             vc3d::line_annotation::FiberOptimizationMode clickedMode,
             vc3d::line_annotation::FiberOptimizationMode candidateMode);
     void reoptimizeMergedFibers(const std::vector<uint64_t>& fiberIds);
-    void retainStoredFiberCoordinateBaseShape(StoredFiber& fiber) const;
-    [[nodiscard]] std::filesystem::path relativeFiberPath(const StoredFiber& fiber) const;
     [[nodiscard]] std::filesystem::path currentVolpkgRoot() const;
-    [[nodiscard]] std::vector<std::string> atlasPathKeysForFiber(const StoredFiber& fiber) const;
-    [[nodiscard]] std::optional<std::filesystem::path> resolveAtlasFiberPath(
-        const StoredFiber& fiber,
-        const std::filesystem::path& atlasDir) const;
-    void attachAtlasPredSnaps(const StoredFiber& fiber,
-                              LineAnnotationSession& session,
-                              const std::filesystem::path& atlasDir);
     [[nodiscard]] uint64_t nextFiberId() const;
     [[nodiscard]] uint64_t nextFiberSequenceForUsername(const std::string& username) const;
     [[nodiscard]] std::string currentFiberUsername() const;
@@ -1376,7 +1257,6 @@ private:
     void runDialogAutoLink(const DialogAutoLinkCapture& capture);
     [[nodiscard]] AutoLinkChoiceSource choiceSourceFromSession(
         const LineAnnotationSession& session, const std::vector<cv::Vec3d>* linePoints) const;
-    static void scaleStoredFiber(StoredFiber& fiber, double scale);
     [[nodiscard]] static vc::lasagna::LineModel lineModelFromPoints(
         const std::vector<cv::Vec3d>& points,
         const vc::lasagna::NormalSampler* normalSampler);
@@ -1456,43 +1336,13 @@ private:
         const vc::lasagna::NormalSampler& sampler);
     void finishFiberAlignmentMetrics(QFutureWatcher<FiberMetricsTaskResult>* watcher);
     void showError(const QString& message, bool suppressDialog = false) const;
-    // Shared core of createAtlasFromFiber / createAtlasFromFiberHeadless.
-    // Returns the created atlas directory; throws std::exception on failure.
-    // Does not emit atlasCreated (callers decide).
-    std::filesystem::path createAtlasFromFiberCore(uint64_t fiberId);
     // Shared worker and write barrier for saveOpenFibers /
     // saveOpenFibersHeadless.
-    [[nodiscard]] StoredFiber fiberInVolumeCoordinates(const StoredFiber& fiber) const;
     void refreshChangedStoreFibers();
     void discardFiberPanes(const std::vector<uint64_t>& fiberIds);
     std::vector<vc3d::line_annotation::GeneratedOverlay::BranchLinkMarker> generatedBranchLinkMarkers(
-        const std::vector<FiberBranchRef>& branches, double localScale) const;
+        const std::vector<FiberBranchRef>& branches) const;
     void saveOpenFibersCore();
-    void cleanupIntersectionInspectionSurfaces();
-    // Tears down the intersection-inspection workspace when one of its
-    // editing sessions holds a fiber that was just retired (split/merge);
-    // otherwise the pane would stay open and editable with all saves
-    // suppressed.
-    void closeIntersectionInspectionForRetiredFibers(
-        const std::vector<uint64_t>& fiberIds);
-    // Closes every dialog pane whose session holds one of the fibers. The
-    // single-dialog invariant means at most the invoking pane matches
-    // today; sweeping by fiber id keeps split/merge retirement correct by
-    // construction rather than by that invariant.
-    void closeDialogPanesForFibers(const std::vector<uint64_t>& fiberIds);
-    // Returns false on failure; with a non-null `errorMessage` the failure is
-    // reported there (dialog-free), otherwise via showError (interactive).
-    bool rebuildIntersectionInspection(QString* errorMessage = nullptr);
-    bool updateIntersectionFollowSlice(bool sourceSideFlag,
-                                       double linePosition,
-                                       const char* reason);
-    void toggleIntersectionFollowSlice(bool sourceSideFlag);
-    bool handleIntersectionFollowKeyPress(int key, Qt::KeyboardModifiers modifiers);
-    bool eventFilter(QObject* watched, QEvent* event) override;
-    void refreshIntersectionInspectionAfterEdit(uint64_t editedFiberId,
-                                                double oldSourceArclength,
-                                                double oldTargetArclength);
-    bool acceptIntersectionSameWindingChoice();
     [[nodiscard]] std::shared_ptr<LineAnnotationSession> makeIntersectionLineSession(
         const StoredFiber& fiber,
         double focusLinePosition,
@@ -1515,31 +1365,21 @@ private:
     uint64_t _nextFiberAlignmentMetricToken = 0;
     uint64_t _fiberMetricsGeneration = 0;
     bool _fiberMetricsPending = false;
-    std::unique_ptr<IntersectionInspectionSession> _intersectionInspection;
-    std::unique_ptr<FiberSliceOverlayController> _fiberSliceOverlay;
-    // Scroll-center reference for orienting generated-view normals; loaded
-    // lazily from the volpkg's umbilicus file and re-attempted when the
-    // volpkg root changes. nullopt after a failed attempt (volume-center
-    // fallback is used instead).
+    // The stored umbilicus of each volume asked about (by store and volume),
+    // read once until the store announces an umbilicus or registration change.
+    struct StoredUmbilicus {
+        std::optional<vc::objects::VolumeUmbilicus> umbilicus;
+        QString problem;  // why there is none
+    };
+    // In `voxels` (a volume of the store at a scale), cached per store and voxels.
+    const StoredUmbilicus& storedUmbilicus(const vc::objects::VolumeVoxels& voxels) const;
+    mutable std::map<std::string, StoredUmbilicus> _storedUmbilici;
+    // Scroll-center reference for orienting generated-view normals: the stored
+    // umbilicus of the current volume, in its voxels. nullopt after a failed
+    // attempt (volume-center fallback is used instead).
     std::optional<vc::core::util::Umbilicus> _scrollUmbilicus;
-    std::filesystem::path _scrollUmbilicusRoot;
-    // The resolver's dependencies as of the cached load — a stat of every
-    // candidate plus the legacy transform — so any of them changing underneath
-    // VC3D (fixed, replaced, removed, or newly appearing) is noticed.
-    QString _scrollUmbilicusToken;
-    // The annotation frame _scrollUmbilicus was scaled into. Part of the cache
-    // key because the cached value is not the file's contents: its points are
-    // already multiplied by a frame-dependent factor and its per-slice centres
-    // sized to that frame's extent. Keyed on the project directory alone, a
-    // volume switch handed the orientation vote geometry from the previous frame.
-    vc3d::annotation::AnnotationFrame _scrollUmbilicusFrame;
-    // The volume the cached umbilicus was read for. Deliberately conservative:
-    // the volume-centre fallback and the legacy reading depend on the volume's
-    // raw shape and its registration transform, not only on the annotation
-    // frame, so any volume switch re-resolves rather than proving the previous
-    // geometry equivalent. Re-resolution is a few stats and one JSON parse.
+    // The store and voxels the cached reference was built for (empty: none built).
     std::string _scrollUmbilicusVolumeId;
-    bool _scrollUmbilicusLoadAttempted = false;
     // Bumped whenever the orientation inputs change out from under built views
     // (umbilicus attach/detach, active volume switch). Sessions record the
     // value their generated views were built at; refreshStaleGeneratedViews()
@@ -1550,10 +1390,11 @@ private:
     // decide staleness of derived geometry; a volume switch is deliberately not
     // an attachment change.
     uint64_t _umbilicusGeneration = 0;
-    // The volumeId of the last volumeChanged this controller acted on, so a
-    // reselection of the current volume is not treated as a switch. Cleared on
-    // package change.
-    std::string _lastVolumeChangedId;
+    // The volume of the last volumeChanged this controller acted on, so a
+    // reselection of the current volume is not treated as a switch (a new
+    // working level is a new Volume under the same ID). Cleared on package
+    // change.
+    std::weak_ptr<Volume> _lastVolumeChanged;
     // Why the package's umbilicus could not be used, for the strip notice.
     // Empty when one was applied, and when none exists to complain about.
     // Orienting off the volume centre instead is exactly the silent degradation
@@ -1620,6 +1461,10 @@ private:
         _sideStripSessionSnapshotCache;
     // See readStoredFibersCached: decoded fibers keyed by uuid.
     mutable std::unordered_map<std::string, StoredFiber> _storedFiberDecodeCache;
+    mutable FiberDependencies _storedFiberDependencies;
+    mutable std::optional<int64_t> _storedFiberCacheJournalPosition;
+    // The voxels _storedFiberDecodeCache was decoded in.
+    mutable vc::objects::VolumeVoxels _storedFiberDecodeVolume;
     // See cachedControlSpansForFiber: keyed by fiber id, valid while the
     // fiber's save generation and the package generation match.
     struct ControlSpanCacheEntry {
@@ -1638,15 +1483,7 @@ private:
         _pendingSideStripIntersectionRequests;
     // Surfaces with a debounced side-strip dispatch scheduled.
     std::unordered_set<std::string> _pendingSideStripQuerySurfaces;
-    std::optional<std::filesystem::path> _currentAtlasDir;
     DatasetPicker _datasetPicker;
-    OptimizationTaskFactory _optimizationTaskFactory;
-    std::function<bool(vc3d::line_annotation::FiberOptimizationMode)>
-        _modeChangeConfirmation;
-    std::function<std::optional<vc3d::line_annotation::FiberOptimizationMode>(
-        vc3d::line_annotation::FiberOptimizationMode,
-        vc3d::line_annotation::FiberOptimizationMode)>
-        _mergeModePicker;
     bool _errorDialogsSuppressed = false;
     // Off while changed store fibers reopen: each keeps the editing state it had.
     bool _applyOpenFibersEditable = true;
@@ -1718,9 +1555,6 @@ private:
     // read-only), so an operation can refuse BEFORE it mutates anything.
     [[nodiscard]] std::optional<QString> linkPairEligibilityError(const StoredFiber& local,
                                                                   const StoredFiber& far) const;
-    // Deduplicates the deferred re-optimization prompt across reentrant
-    // fiber (re)loads.
-    bool _reoptimizationPromptPending = false;
     mutable QString _lastSuppressedError;
 
     // Transient (in-memory only) staging state for a designated control
@@ -1742,7 +1576,7 @@ private:
     // global one so teardown is bounded by waitForDone() in the destructor
     // (after requesting cooperative cancellation) and so long solves cannot
     // starve the global pool's other users. Two threads: one live editing
-    // session plus one intersection-inspection or merged-fiber reopt session
+    // session plus one merged-fiber reopt session
     // can solve concurrently; solves within one session are serialized by the
     // per-session coalescing queue.
     QThreadPool _lineSolvePool;

@@ -13,30 +13,15 @@ import subprocess
 import sys
 from pathlib import Path
 
-from render_valgrind_common import SCENARIOS
-
+SCENARIOS = (
+    "full_res",
+    "fallback_3",
+    "mixed_correlated",
+    "mixed_shuffled",
+)
 SCHEMA_VERSION = 1
 NATIVE_EVALUATION_SCHEMA_VERSIONS = {2, 3}
 DEFAULT_TOLERANCE = 0.05
-DATA_READ_FEATURE_NAMES = (
-    "non_data_instructions",
-    "data_reads",
-    "data_writes",
-    "l1_data_misses",
-    "last_level_data_misses",
-    "branch_misses",
-    "branch_weighted_l1_misses",
-)
-REPLAY_CONFIGURATION = {
-    "workers": 4,
-    "cores": 5,
-    "tie_policy": "fifo",
-    "split_policy": "equal",
-    "residual_fraction": 0.5,
-    "wake_latency_ns": 0.0,
-    "replay_idle_scale": 1.0,
-    "dependency_excess_scale": 1.0,
-}
 
 
 def collect_evaluate(args: argparse.Namespace) -> None:
@@ -202,44 +187,6 @@ def freeze_reference(args: argparse.Namespace) -> None:
     )
 
 
-def freeze_model(args: argparse.Namespace) -> None:
-    calibration = json.loads(args.calibration.read_text())
-    if calibration.get("renderer_inputs_used") is not False:
-        raise RuntimeError("calibration is not synthetic-only")
-    if not calibration.get("candidate_accepted", False) and not args.allow_unpromoted:
-        raise RuntimeError(
-            "calibration was not accepted; pass --allow-unpromoted only after "
-            "explicitly reviewing and approving the experimental model"
-        )
-    event_model = calibration.get("event_cost_model", {})
-    if tuple(event_model.get("feature_names", ())) != DATA_READ_FEATURE_NAMES:
-        raise RuntimeError("calibration does not use the required data-read basis")
-    coefficients = event_model.get("coefficients_ns", ())
-    if len(coefficients) != len(DATA_READ_FEATURE_NAMES):
-        raise RuntimeError("calibration has an invalid event coefficient count")
-    parameters = calibration.get("parameters", {})
-    if "cross_thread_release_ns" not in parameters:
-        raise RuntimeError("calibration has no cross-thread release parameter")
-    model = {
-        "schema_version": SCHEMA_VERSION,
-        "model_id": args.model_id,
-        "source": "synthetic thread-pool calibration only",
-        "renderer_inputs_used": False,
-        "timing_claims_enabled": False,
-        "score_semantics": "relative modeled runtime, not absolute wall time",
-        "cross_thread_release_ns": float(parameters["cross_thread_release_ns"]),
-        "event_cost_model": {
-            "feature_names": list(DATA_READ_FEATURE_NAMES),
-            "coefficients_ns": [float(value) for value in coefficients],
-            "stall_overlap_fraction": float(
-                event_model.get("stall_overlap_fraction", 0.0)
-            ),
-        },
-        "replay": REPLAY_CONFIGURATION,
-    }
-    write_json_atomic(args.output.resolve(), model)
-
-
 def set_tolerance(args: argparse.Namespace) -> None:
     reference_path = args.reference.resolve()
     reference = json.loads(reference_path.read_text())
@@ -270,13 +217,6 @@ def parse_args() -> argparse.Namespace:
     freeze.add_argument("--tolerance", type=float, default=DEFAULT_TOLERANCE)
     freeze.add_argument("results", nargs="+", type=Path)
     freeze.set_defaults(function=freeze_reference)
-
-    freeze_model_parser = subparsers.add_parser("freeze-model")
-    freeze_model_parser.add_argument("--calibration", required=True, type=Path)
-    freeze_model_parser.add_argument("--model-id", required=True)
-    freeze_model_parser.add_argument("--output", required=True, type=Path)
-    freeze_model_parser.add_argument("--allow-unpromoted", action="store_true")
-    freeze_model_parser.set_defaults(function=freeze_model)
 
     set_tolerance_parser = subparsers.add_parser("set-tolerance")
     set_tolerance_parser.add_argument("--reference", required=True, type=Path)

@@ -54,7 +54,7 @@ void publish(const fs::path& source, const fs::path& destination, bool overwrite
 } // namespace
 
 std::string exportGeometry(ObjectStore& db, const std::string& objectUuid, const fs::path& destination,
-    const std::optional<std::string>& revisionUuid, bool overwrite)
+    const std::optional<std::string>& revisionUuid, bool overwrite, bool validOnly)
 {
     if (destination.empty()) throw std::invalid_argument("export destination is empty");
     const auto dest = fs::absolute(destination).lexically_normal();
@@ -102,12 +102,14 @@ std::string exportGeometry(ObjectStore& db, const std::string& objectUuid, const
         const std::set<std::string> names = revision->kind == "fiber" ? std::set<std::string>{"control_points", "line_points", "control_point_ids"} :
             revision->kind == "point_collection" ? std::set<std::string>{"points", "point_ids"} : std::set<std::string>{"points"};
         if (revision->kind != "fiber") for (const auto& array : revision->arrays) {
-            if (!names.contains(array.name)) throw std::runtime_error("native export cannot represent auxiliary array: " + array.name);
+            // tifxyz carries surface channels as sidecar TIFFs.
+            if (!names.contains(array.name) && revision->kind != "surface")
+                throw std::runtime_error("native export cannot represent auxiliary array: " + array.name);
             snapshot.arrays[array.name] = db.readGeometryArray(read, revision->uuid, array.name);
         }
     }
     const auto& kind = snapshot.revision.kind;
-    const bool directory = kind == "patch" || kind == "track";
+    const bool directory = kind == "surface" || kind == "track";
     const auto stagingPath = dest.parent_path() / (".vc-export-" + util::newUuid());
     if (!fs::create_directory(stagingPath)) throw std::runtime_error("cannot create export staging directory");
     Stage stage{stagingPath};
@@ -120,8 +122,9 @@ std::string exportGeometry(ObjectStore& db, const std::string& objectUuid, const
         file.close();
     }
     else if (kind == "point_collection") formats::collection(snapshot, attributes, output);
-    else if (kind == "patch") formats::patch(snapshot, attributes, output);
+    else if (kind == "surface") formats::surface(snapshot, attributes, output, validOnly);
     else if (kind == "track") formats::track(snapshot, attributes, output);
+    else if (kind == "umbilicus") formats::umbilicus(snapshot, attributes, output);
     else throw std::runtime_error("unsupported geometry kind for export");
     publish(output, dest, overwrite, directory);
     return snapshot.revision.uuid;

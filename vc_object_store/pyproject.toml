@@ -14,8 +14,8 @@ license = {text = "MIT"}
 [tool.scikit-build]
 cmake.version = ">=3.22"
 wheel.packages = []
-# Only the Python module; the C++ headers, archives and CMake packages of the store,
-# vc_reader and vc_delta3d belong to `cmake --install`, not the wheel.
+# Only the Python module; the C++ headers, archives and CMake packages of the store
+# and vc_reader belong to `cmake --install`, not the wheel.
 install.components = ["python"]
 
 [tool.scikit-build.cmake.define]

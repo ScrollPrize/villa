@@ -87,7 +87,7 @@ void SegmentationCustomParamsPanel::handleCustomParamsEdited()
     }
 
     _customParamsText = _customParamsEditor->customText();
-    writeSetting(QStringLiteral("custom_params_text"), _customParamsText);
+    writeSetting(vc3d::settings::segmentation::CUSTOM_PARAMS_TEXT, _customParamsText);
     validateCustomParamsText();
 }
 

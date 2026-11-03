@@ -199,7 +199,11 @@ struct S3Key {
 inline std::string amz_date(std::time_t t)
 {
     std::tm tm{};
+#ifdef _WIN32
+    gmtime_s(&tm, &t);
+#else
     gmtime_r(&t, &tm);
+#endif
     char buf[17];
     std::strftime(buf, sizeof buf, "%Y%m%dT%H%M%SZ", &tm);
     return buf;

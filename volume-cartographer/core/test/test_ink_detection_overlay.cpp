@@ -2,11 +2,22 @@
 #include <doctest/doctest.h>
 
 #include "CState.hpp"
+#include "vc/ui/VCCollection.hpp"
+#include "SurfaceCatalog.hpp"
 #include "overlays/InkDetectionOverlayController.hpp"
+#include "vc/core/types/Volume.hpp"
+#include "support/TestZarrVolume.hpp"
+#include "support/TestProject.hpp"
 #include "vc/core/types/VolumePkg.hpp"
 #include "vc/core/util/QuadSurface.hpp"
 
+#include <QCoreApplication>
+#include <QElapsedTimer>
 #include <QImage>
+#include <QThread>
+
+#include <nlohmann/json.hpp>
+#include <vc_object_store/Uuid.hpp>
 
 #include <opencv2/imgcodecs.hpp>
 
@@ -59,6 +70,70 @@ std::shared_ptr<QuadSurface> makeSurface(std::string id)
     return surface;
 }
 
+// An Open Data sample store with one catalog surface published with an ink
+// detection, listed by a catalog for the catalog volume.
+struct CatalogFixture {
+    fs::path root;
+    CState state;
+    std::shared_ptr<Volume> volume;
+    std::unique_ptr<SurfaceCatalog> catalog;
+    std::string surfaceUuid;
+    fs::path inkFile;
+
+    explicit CatalogFixture(const std::string& tag, const std::string& inkName)
+        : root(tempRoot(tag))
+    {
+        namespace vo = vc::objects;
+        vc::test::ZarrVolumeSpec options;
+        options.shapeZYX = {4, 4, 4};
+        options.chunkShapeZYX = {4, 4, 4};
+        options.uuid = "catalog-volume";
+        volume = vc::test::createZarrVolume(root / "ct.zarr", options);
+        const auto storePath = root / "sample.vcobj";
+        vo::OpenOptions storeOptions;
+        storeOptions.author = "ink-test";
+        {
+            auto db = vo::ObjectStore::create(storePath, storeOptions);
+            surfaceUuid = vo::util::newUuid();
+            auto txn = db.write({{surfaceUuid, std::nullopt}});
+            vo::ObjectRecord record;
+            record.uuid = surfaceUuid;
+            record.kind = "surface";
+            record.name = "segment";
+            record.meta = nlohmann::json{
+                {"coordinates", {{"volume_uuid", "catalog-volume"}, {"scale_factor", 1}}},
+                {"catalog", {{"sample", "sample"}, {"segment", "segment"}, {"files", {{
+                    {"name", inkName},
+                    {"label", "model-a"},
+                    {"url", "https://example.test/" + inkName},
+                }}}}}}.dump();
+            db.upsertObject(txn, record);
+            txn.commit();
+        }
+        state.objectStoreSession()->setGeometryFetcher("catalog",
+            [](vo::ObjectStore&, const std::string&, const vo::ObjectStoreSession::FetchWrite&) {
+                throw std::runtime_error("offline");
+            });
+        const auto attachment = state.objectStoreSession()->attach(storePath, storeOptions);
+        inkFile = state.objectStoreSession()->artifactDirectory(attachment, surfaceUuid) / inkName;
+        catalog = std::make_unique<SurfaceCatalog>(state.objectStoreSession());
+        catalog->setSource(attachment, volume, {volume->id()});
+        QElapsedTimer timer;
+        timer.start();
+        while ((catalog->loading() || catalog->rows().empty()) && timer.elapsed() < 10000) {
+            QCoreApplication::processEvents();
+            QThread::msleep(1);
+        }
+        REQUIRE(catalog->rows().size() == 1);
+    }
+    ~CatalogFixture()
+    {
+        catalog.reset();
+        std::error_code ec;
+        fs::remove_all(root, ec);
+    }
+};
+
 } // namespace
 
 TEST_CASE("CState batches surface catalog mutations into one notification")
@@ -108,125 +183,63 @@ TEST_CASE("CState batches surface catalog mutations into one notification")
     QObject::disconnect(deleteConnection);
 }
 
-TEST_CASE("ink detection options survive transformed segmentation previews with source id")
+TEST_CASE("CState::closeAll clears the project's surfaces and keeps the view planes")
 {
-    const std::string segmentId = "20260623144957-w053-058";
-    const std::string segmentLongId = "PHercParis4-" + segmentId;
+    for (const bool withProject : {false, true}) {
+        CState state;
+        if (withProject) {
+            const auto store = vc::test::createTestProject();
+            state.setVpkg(VolumePkg::open(store.path));
+        }
+        state.setSurface("segmentation", makeSurface("segmentation"));
+        state.setSurface("other", makeSurface("other"));
+        const auto xy = state.surface("xy plane");
+        REQUIRE(xy);
 
-    const fs::path root = tempRoot("preview_id");
-    const fs::path segmentDir = root / "segment";
-    writeFile(segmentDir / "ink-detections" / "prediction.jpg", "not-empty");
-    writeFile(segmentDir / "ink-detections.json",
-              R"([{
-                "label":"model-a",
-                "sample_id":"PHercParis4",
-                "segment_id":")" + segmentId + R"(",
-                "segment_long_id":")" + segmentLongId + R"(",
-                "artifact_type":"ink_detection",
-                "resolved_http_url":"https://example.test/prediction.jpg",
-                "local_file":"ink-detections/prediction.jpg"
-              }])");
+        state.closeAll();
 
-    auto package = VolumePkg::newDetached();
-    REQUIRE(package->addSegmentsEntry(segmentDir.string()));
-
-    CState state;
-    state.setVpkg(package);
-
-    auto source = makeSurface(segmentLongId);
-    state.setActiveSurface(segmentLongId, source);
-    state.setSurface("segmentation", source, false, false);
-
-    InkDetectionOverlayController overlay(&state);
-    REQUIRE(overlay.options().size() == 1);
-    CHECK(overlay.options().front().segmentLongId == segmentLongId);
-
-    auto previewWithSourceId = makeSurface(segmentLongId);
-    previewWithSourceId->path.clear();
-    state.setSurface("segmentation", previewWithSourceId, false, false);
-    CHECK(overlay.options().size() == 1);
-
-    auto anonymousPreview = makeSurface({});
-    state.setSurface("segmentation", anonymousPreview, false, false);
-    CHECK(overlay.options().empty());
-
-    fs::remove_all(root);
+        CHECK(state.surface("segmentation") == nullptr);
+        CHECK(state.surface("other") == nullptr);
+        CHECK(state.surface("xy plane") == xy);
+        CHECK(state.surface("xz plane"));
+        CHECK(state.surface("yz plane"));
+    }
 }
 
-TEST_CASE("ink detection options match open-data representation metadata")
+TEST_CASE("ink detection options follow the active catalog surface")
 {
-    const std::string segmentId = "20240304144031";
-    const std::string segmentLongId =
-        "20240304144031-w018_20240304144031_flatboi";
-    const std::string representationId =
-        segmentLongId + "-published-20231117161658-L0-1e9dae161d154013";
+    int argc = 0;
+    QCoreApplication app(argc, nullptr);
+    CatalogFixture fixture("options", "prediction.jpg");
+    writeFile(fixture.inkFile, "not-empty");
 
-    const fs::path root = tempRoot("catalog_representation_id");
-    const fs::path aggregateRoot = root / "20231117161658";
-    const fs::path segmentDir =
-        aggregateRoot / "published-L0" / representationId;
-    writeFile(segmentDir / "ink-detections" / "prediction.jpg", "not-empty");
-    writeFile(segmentDir / "ink-detections.json",
-              R"([{
-                "label":"model-a",
-                "sample_id":"PHerc1667",
-                "segment_id":")" + segmentId + R"(",
-                "segment_long_id":")" + segmentLongId + R"(",
-                "artifact_type":"ink_detection",
-                "resolved_http_url":"https://example.test/prediction.jpg",
-                "local_file":"ink-detections/prediction.jpg"
-              }])");
+    auto source = makeSurface(fixture.surfaceUuid);
+    fixture.state.setSurface("segmentation", source, false, false);
 
-    auto package = VolumePkg::newDetached();
-    REQUIRE(package->addSegmentsEntry(aggregateRoot.string()));
-
-    CState state;
-    state.setVpkg(package);
-
-    auto surface = makeSurface(representationId);
-    surface->meta["vc_open_data_segment_id"] = segmentId;
-    surface->meta["vc_open_data_segment_long_id"] = segmentLongId;
-    surface->meta["vc_open_data_catalog_segment_lineage_id"] = segmentLongId;
-    state.setActiveSurface(representationId, surface);
-    state.setSurface("segmentation", surface, false, false);
-
-    InkDetectionOverlayController overlay(&state);
+    InkDetectionOverlayController overlay(&fixture.state);
+    overlay.setSurfaceCatalog(fixture.catalog.get());
     REQUIRE(overlay.options().size() == 1);
-    CHECK(overlay.options().front().segmentLongId == segmentLongId);
+    CHECK(overlay.options().front().localPath == fixture.inkFile);
+    CHECK(overlay.options().front().name == "prediction.jpg");
 
-    fs::remove_all(root);
+    // A preview of the same surface keeps them; another surface has none.
+    fixture.state.setSurface("segmentation", makeSurface(fixture.surfaceUuid), false, false);
+    CHECK(overlay.options().size() == 1);
+    fixture.state.setSurface("segmentation", makeSurface({}), false, false);
+    CHECK(overlay.options().empty());
 }
 
 TEST_CASE("ink detection overlay flips the displayed image")
 {
-    const std::string segmentId = "20260630120000-w001-002";
-    const std::string segmentLongId = "PHercParis4-" + segmentId;
+    int argc = 0;
+    QCoreApplication app(argc, nullptr);
+    CatalogFixture fixture("flip", "prediction.png");
+    writeGrayImage(fixture.inkFile);
 
-    const fs::path root = tempRoot("flip");
-    const fs::path segmentDir = root / "segment";
-    writeGrayImage(segmentDir / "ink-detections" / "prediction.png");
-    writeFile(segmentDir / "ink-detections.json",
-              R"([{
-                "label":"model-a",
-                "sample_id":"PHercParis4",
-                "segment_id":")" + segmentId + R"(",
-                "segment_long_id":")" + segmentLongId + R"(",
-                "artifact_type":"ink_detection",
-                "resolved_http_url":"https://example.test/prediction.png",
-                "local_file":"ink-detections/prediction.png"
-              }])");
+    fixture.state.setSurface("segmentation", makeSurface(fixture.surfaceUuid), false, false);
 
-    auto package = VolumePkg::newDetached();
-    REQUIRE(package->addSegmentsEntry(segmentDir.string()));
-
-    CState state;
-    state.setVpkg(package);
-
-    auto source = makeSurface(segmentLongId);
-    state.setActiveSurface(segmentLongId, source);
-    state.setSurface("segmentation", source, false, false);
-
-    InkDetectionOverlayController overlay(&state);
+    InkDetectionOverlayController overlay(&fixture.state);
+    overlay.setSurfaceCatalog(fixture.catalog.get());
     REQUIRE(overlay.options().size() == 1);
     overlay.setSelectedPath(overlay.options().front().localPath);
 
@@ -248,6 +261,90 @@ TEST_CASE("ink detection overlay flips the displayed image")
     CHECK(!overlay.horizontalFlip());
     CHECK(qRed(overlay.selectedImageForTesting().pixel(0, 0)) == 40);
     CHECK(qRed(overlay.selectedImageForTesting().pixel(2, 1)) == 30);
+}
 
-    fs::remove_all(root);
+TEST_CASE("Project stores are peers with independent persistent per-kind selections")
+{
+    const auto project = vc::test::createTestProject();
+    const auto other = vc::test::createTestProject();
+    CState state;
+    state.setVpkg(project.open());
+    const auto first = state.storeFor("surface");
+    REQUIRE(first);
+    const auto second = state.attachStore(other.storePath, "vc-test");
+    REQUIRE(state.attachedStores().size() == 2);
+    CHECK(state.storeFor("fiber") == first);
+    for (const auto& kind : CState::routableKinds()) {
+        state.setStoreFor(kind, second);
+        CHECK(state.storeFor(kind) == second);
+        state.setStoreFor(kind, first);
+    }
+    state.setStoreFor("fiber", second);
+    state.setStoreFor("umbilicus", second);
+    CHECK(state.storeFor("surface") == first);
+    CHECK(state.storeFor("volume_transform") == first);
+    auto document = vc::project::ProjectDocument::load(project.path);
+    CHECK(document.data()["selections"]["fiber"] != document.data()["selections"]["surface"]);
+    state.prepareStoreSwitch = [] { return false; };
+    CHECK_THROWS(state.setStoreFor("fiber", first));
+    CHECK(state.storeFor("fiber") == second);
+    state.prepareStoreSwitch = {};
+    state.detachStore(second);
+    CHECK_FALSE(state.storeFor("fiber"));
+    CHECK_FALSE(state.storeFor("umbilicus"));
+    CHECK(fs::exists(other.storePath));
+    CHECK_THROWS(state.detachStore(*first));
+    state.closeProject();
+    state.setVpkg(project.open());
+    CHECK_FALSE(state.storeFor("fiber"));
+    CHECK(state.storeFor("surface"));
+}
+
+TEST_CASE("Unavailable store references survive opening and can be relocated")
+{
+    const auto project = vc::test::createTestProject();
+    const auto other = vc::test::createTestProject();
+    auto document = vc::project::ProjectDocument::load(project.path);
+    auto data = document.data();
+    data["stores"].push_back({{"id", "unavailable"}, {"location", "missing.vcobj"}, {"read_only", true}});
+    data["selections"]["fiber"] = "unavailable";
+    document.replace(data);
+    CState state;
+    state.setVpkg(project.open());
+    CHECK(state.hasVpkg());
+    CHECK_FALSE(state.storeFor("fiber"));
+    CHECK(state.storeFor("surface"));
+    CHECK(state.vpkg()->document().data() == data);
+    state.replaceStoreReference("unavailable", other.storePath);
+    REQUIRE(state.storeFor("fiber"));
+    CHECK_FALSE(state.objectStoreSession()->writable(*state.storeFor("fiber")));
+    CHECK(state.vpkg()->document().data()["selections"]["fiber"] == "unavailable");
+}
+
+TEST_CASE("A failed point-collection save prevents switching its store")
+{
+    const auto project = vc::test::createTestProject();
+    const auto other = vc::test::createTestProject();
+    CState state;
+    state.setVpkg(project.open());
+    const auto first = state.storeFor("point_collection");
+    REQUIRE(first);
+    const auto second = state.attachStore(other.storePath, "vc-test");
+    vc::test::ZarrVolumeSpec spec;
+    spec.uuid = "point-save-failure";
+    spec.shapeZYX = {4, 4, 4};
+    spec.chunkShapeZYX = {4, 4, 4};
+    auto volume = vc::test::createZarrVolume(vc::test::testProjectDirectory() / spec.uuid, spec);
+    state.setCurrentVolume(volume);
+    state.pointCollection()->addPoint("unsaved", {1, 2, 3});
+    const auto before = state.vpkg()->document().data();
+    // Simulate a lost store connection while the debounce has pending work.
+    state.objectStoreSession()->detach(*first);
+    CHECK_THROWS(state.setStoreFor("point_collection", second));
+    CHECK(state.storeFor("point_collection") == first);
+    CHECK(state.vpkg()->document().data() == before);
+    CHECK(state.pointCollection()->getCollectionId("unsaved").has_value());
+    CHECK_THROWS(state.savePointCollections()); // Still pending, not silently dropped.
+    CHECK_THROWS(state.closeAll());
+    CHECK(state.pointCollection()->getCollectionId("unsaved").has_value());
 }
