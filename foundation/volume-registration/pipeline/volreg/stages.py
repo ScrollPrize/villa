@@ -97,7 +97,12 @@ def run_holdout(pipeline, params):
         render_holdout(pipeline, session, patches)
     pipeline.record.refresh_holdout(patches, patch_coarse_voxels=held["patch_coarse_voxels"],
                                     stretches=held["stretches"])
-    return [rec.HOLDOUT]
+    # What the stages after this one rest on: which patches are held out, and where. Not
+    # `holdout.json`, which also changes with every answer and every new rendering -- a fit
+    # need not run again because a picture was redrawn.
+    listed = pipeline.work("holdout-patches.json")
+    listed.write_text(json.dumps([[patch["id"], patch["origin_zyx"]] for patch in patches]) + "\n")
+    return ["work/holdout-patches.json"]
 
 
 def render_holdout(pipeline, session, patches):
@@ -105,6 +110,13 @@ def render_holdout(pipeline, session, patches):
     picture once made stays right -- with their digests on the record's entries."""
     out = pipeline.work("images", "holdout")
     overview = (session.directory / "overview").exists()
+    grey_anchors = display_anchors(pipeline, session)
+    stored = pipeline.work("images", "anchors.json")
+    if not stored.exists() or json.loads(stored.read_text()) != grey_anchors:
+        # New grey levels: every picture is drawn again, so all of a pair's pictures share them.
+        shutil.rmtree(out, ignore_errors=True)
+        stored.parent.mkdir(parents=True, exist_ok=True)
+        stored.write_text(json.dumps(grey_anchors, indent=1) + "\n")
     for patch in patches:
         source = session.patch(patch["id"])
         units = [(patch, patch["id"], (0, 0, 0), fs.dense.BLOCK)] + [
@@ -114,7 +126,7 @@ def render_holdout(pipeline, session, patches):
             digests = out / unit_id / "digests.json"
             if not digests.exists():
                 found = render.holdout_unit(session, out, source, unit_id, entry["centre_zyx"],
-                                            entry["fine_zyx"], corner, size)
+                                            entry["fine_zyx"], grey_anchors, corner, size)
                 digests.write_text(json.dumps(found))
             entry["image_sha256"] = json.loads(digests.read_text())
         if overview and not (out / patch["id"] / "section.png").exists():
@@ -139,6 +151,16 @@ def keep_only_asked(session, added, asked):
             else:
                 patch["test"] = False
     session.save()
+
+
+def display_anchors(pipeline, session):
+    """The pair's grey-level anchors (see render.py), measured once when the hold-out set is
+    first rendered and kept after, so pictures drawn later -- more hold-out patches, a blind
+    round -- share them."""
+    stored = pipeline.work("images", "anchors.json")
+    if stored.exists():
+        return json.loads(stored.read_text())
+    return render.pair_anchors(session)
 
 
 def run_fit(pipeline, params):
@@ -276,7 +298,8 @@ def run_blind(pipeline, params):
         for index, (spread, patch_id) in enumerate(ranked[:params["count"]]):
             options = [[candidates[i]] for i in rng.permutation(len(candidates))]
             digests = render.blind_item(session, pipeline.work("images", "blind", round_id, str(index)),
-                                        session.patch(patch_id), options)
+                                        session.patch(patch_id), options,
+                                        display_anchors(pipeline, session))
             items.append({"patch": patch_id, "spread": round(spread, 4), "options": options,
                           "choice": None, "image_sha256": digests})
     rounds.append({"id": round_id, "at": rec.now(), "candidates": candidates, "test_only": True,
