@@ -13,6 +13,8 @@
 #include "VCSettings.hpp"
 
 #include <QSettings>
+#include <QLabel>
+#include <QProgressBar>
 #include <QVBoxLayout>
 #include <QVariant>
 
@@ -35,6 +37,17 @@ void SegmentationWidget::buildUi()
     auto* layout = new QVBoxLayout(this);
     layout->setContentsMargins(8, 8, 8, 8);
     layout->setSpacing(12);
+
+    _manualAddProgress = new QWidget(this);
+    _manualAddProgress->setObjectName(QStringLiteral("manualAddProgress"));
+    auto* progressLayout = new QVBoxLayout(_manualAddProgress);
+    progressLayout->setContentsMargins(0, 0, 0, 0);
+    progressLayout->addWidget(new QLabel(tr("Computing extension — editing is locked…"), _manualAddProgress));
+    auto* progress = new QProgressBar(_manualAddProgress);
+    progress->setRange(0, 0);
+    progressLayout->addWidget(progress);
+    _manualAddProgress->hide();
+    layout->addWidget(_manualAddProgress);
 
     _headerRow = new SegmentationHeaderRow(this);
     layout->addWidget(_headerRow);
@@ -115,8 +128,6 @@ void SegmentationWidget::buildUi()
     connect(_growthPanel, &SegmentationGrowthPanel::growthMethodChanged,
             this, &SegmentationWidget::growthMethodChanged);
     connect(_growthPanel, &SegmentationGrowthPanel::growthMethodChanged,
-            this, &SegmentationWidget::noteGrowthMethod);
-    connect(_growthPanel, &SegmentationGrowthPanel::growthMethodChanged,
             this, &SegmentationWidget::syncUiState);
     connect(_growthPanel, &SegmentationGrowthPanel::volumeSelectionChanged,
             this, &SegmentationWidget::volumeSelectionChanged);
@@ -181,7 +192,7 @@ void SegmentationWidget::syncUiState()
     const bool manualAddVisible = _manualAddActive || manualAddSelected;
     _growthPanel->setManualAddUiActive(manualAddVisible);
     _manualAddPanel->setVisible(manualAddVisible);
-    _manualAddPanel->syncUiState(_editingEnabled, _manualAddActive);
+    _manualAddPanel->syncUiState(_editingEnabled && !_manualAddBusy, _manualAddActive);
 
     _growthPanel->syncUiState(_editingEnabled, _growthInProgress);
     _editingPanel->setVisible(true);
@@ -195,6 +206,10 @@ void SegmentationWidget::syncUiState()
     _correctionsPanel->syncUiState(_editingEnabled, _growthInProgress);
     _neuralTracerPanel->syncUiState();
     _lasagnaPanel->syncUiState(_editingEnabled, false);
+    _headerRow->setEnabled(!_manualAddBusy);
+    _growthPanel->setEnabled(!_manualAddBusy);
+    _editingPanel->setEnabled(!_manualAddBusy);
+    _manualAddProgress->setVisible(_manualAddBusy);
 }
 
 void SegmentationWidget::restoreSettings()
@@ -219,7 +234,6 @@ void SegmentationWidget::restoreSettings()
 
     settings.endGroup();
     _restoringSettings = false;
-    noteGrowthMethod(_growthPanel->growthMethod());
 }
 
 void SegmentationWidget::writeSetting(const QString& key, const QVariant& value)
@@ -241,13 +255,6 @@ void SegmentationWidget::updateEditingState(bool enabled, bool notifyListeners)
 
     if (notifyListeners) {
         emit editingModeChanged(_editingEnabled);
-    }
-}
-
-void SegmentationWidget::noteGrowthMethod(SegmentationGrowthMethod method)
-{
-    if (method != SegmentationGrowthMethod::ManualAdd) {
-        _lastNonManualGrowthMethod = method;
     }
 }
 
@@ -286,6 +293,7 @@ void SegmentationWidget::setPendingChanges(bool pending)
 
 void SegmentationWidget::setEditingEnabled(bool enabled)
 {
+    if (_manualAddBusy) return;
     updateEditingState(enabled, false);
 }
 
@@ -318,14 +326,17 @@ ManualAddTool::Config SegmentationWidget::manualAddConfig() const { return _manu
 int SegmentationWidget::manualAddExtendCells() const { return _manualAddPanel->extendCells(); }
 ManualAddTool::LinePreviewMode SegmentationWidget::cycleManualAddLinePreviewMode()
 {
+    if (_manualAddBusy) return manualAddConfig().linePreviewMode;
     return _manualAddPanel->cycleLinePreviewMode();
 }
 ManualAddTool::LinePreviewMode SegmentationWidget::setManualAddLinePreviewMode(ManualAddTool::LinePreviewMode mode)
 {
+    if (_manualAddBusy) return manualAddConfig().linePreviewMode;
     return _manualAddPanel->setLinePreviewMode(mode);
 }
 ManualAddTool::InterpolationMode SegmentationWidget::setManualAddInterpolationMode(ManualAddTool::InterpolationMode mode)
 {
+    if (_manualAddBusy) return manualAddConfig().interpolationMode;
     return _manualAddPanel->setInterpolationMode(mode);
 }
 std::vector<SegmentationGrowthDirection> SegmentationWidget::allowedGrowthDirections() const { return _growthPanel->allowedGrowthDirections(); }
@@ -333,9 +344,15 @@ std::optional<std::pair<int, int>> SegmentationWidget::correctionsZRange() const
 
 void SegmentationWidget::setGrowthMethod(SegmentationGrowthMethod method)
 {
-    noteGrowthMethod(method);
+    if (_manualAddBusy) return;
     _growthPanel->setGrowthMethod(method);
 }
+void SegmentationWidget::setManualAddBusy(bool busy)
+{
+    _manualAddBusy = busy;
+    syncUiState();
+}
+
 void SegmentationWidget::setManualAddActive(bool active)
 {
     if (_manualAddActive == active) {

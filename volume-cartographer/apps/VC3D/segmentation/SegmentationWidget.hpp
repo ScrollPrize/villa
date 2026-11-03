@@ -45,7 +45,6 @@ public:
     [[nodiscard]] float smoothingStrength() const;
     [[nodiscard]] int smoothingIterations() const;
     [[nodiscard]] SegmentationGrowthMethod growthMethod() const;
-    [[nodiscard]] SegmentationGrowthMethod lastNonManualGrowthMethod() const { return _lastNonManualGrowthMethod; }
     [[nodiscard]] int growthSteps() const;
     [[nodiscard]] QString customParamsText() const;
     [[nodiscard]] QString customParamsProfile() const;
@@ -86,6 +85,7 @@ public:
     void setGrowthInProgress(bool running);
     void setShowHoverMarker(bool enabled);
     void setManualAddActive(bool active);
+    void setManualAddBusy(bool busy);
     ManualAddTool::LinePreviewMode cycleManualAddLinePreviewMode();
     // Route direct changes through the panel so manualAddConfigChanged reaches
     // the module just as it does for a combo-box edit.
@@ -205,7 +205,6 @@ private:
     void restoreSettings();
     void writeSetting(const QString& key, const QVariant& value);
     void updateEditingState(bool enabled, bool notifyListeners);
-    void noteGrowthMethod(SegmentationGrowthMethod method);
 
     bool _editingEnabled{false};
     bool _drawMaskEnabled{false};
@@ -224,6 +223,7 @@ private:
     SegmentationLasagnaPanel* _lasagnaPanel{nullptr};
     SegmentationManualAddPanel* _manualAddPanel{nullptr};
     bool _manualAddActive{false};
-    SegmentationGrowthMethod _lastNonManualGrowthMethod{SegmentationGrowthMethod::Tracer};
+    bool _manualAddBusy{false};
+    QWidget* _manualAddProgress{nullptr};
 
 };

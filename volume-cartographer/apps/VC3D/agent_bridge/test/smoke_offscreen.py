@@ -74,11 +74,12 @@ def launch(
     name: str,
     project: str | None = None,
     config_home: str | None = None,
+    platform: str = "offscreen",
 ) -> VC3DProcess:
     args = ["--agent-bridge", "--agent-bridge-name", name]
     if project is not None:
         args.extend(["--project", project])
-    env = dict(OFFSCREEN_ENV)
+    env = dict(OFFSCREEN_ENV, QT_QPA_PLATFORM=platform)
     if config_home is not None:
         config = Path(config_home)
         config.mkdir(parents=True, exist_ok=True)

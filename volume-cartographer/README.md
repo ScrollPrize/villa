@@ -150,7 +150,13 @@ In Manual Add, enable **Extensions follow the sheet**, choose **Sheet walk**
 step length in volume voxels. Zero means one step per output vertex. A positive
 value subdivides each mesh interval into equal steps no longer than that value;
 it does not add mesh vertices. Settings persist and apply to the next extension.
+While a sheet-following extension computes, its unfinished strip stays hidden,
+editing and surface selection are locked, and an animated progress indicator
+is shown. The completed strip appears when calculation finishes; failures
+discard the unfinished extension and release the lock.
 Streamline offers **Midpoint (RK2)**, **Heun (RK2)**, and **RK4**.
+Applying or canceling an extension ends the editing session but keeps **Manual
+Add** selected as the growth method until you choose another method.
 
 The CLI exposes the same options:
 

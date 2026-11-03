@@ -41,6 +41,7 @@
 #include <limits>
 #include <exception>
 #include <thread>
+#include <mutex>
 #include <set>
 #include <utility>
 #include <vector>
@@ -552,6 +553,7 @@ void SegmentationModule::setAnnotateMode(bool enabled)
 
 void SegmentationModule::setEditingEnabled(bool enabled)
 {
+    if (_sheetWalkRunning) return;
     if (_editingEnabled == enabled) {
         return;
     }
@@ -649,6 +651,7 @@ void SegmentationModule::setMaskBrushRadius(float radius)
 
 void SegmentationModule::applyEdits()
 {
+    if (_sheetWalkRunning) return;
     if (!_editManager || !_editManager->hasSession()) {
         return;
     }
@@ -677,6 +680,7 @@ void SegmentationModule::applyEdits()
 
 void SegmentationModule::resetEdits()
 {
+    if (_sheetWalkRunning) return;
     if (!_editManager || !_editManager->hasSession()) {
         return;
     }
@@ -828,7 +832,7 @@ void SegmentationModule::refreshOverlay()
         state.displayRadiusSteps = _maskBrushRadius;
     }
 
-    if (_manualAddMode && _manualAddTool) {
+    if (_manualAddMode && _manualAddTool && !_sheetWalkRunning) {
         state.manualAddActive = true;
         state.manualAddTintOpacity = _manualAddTool->config().tintOpacity;
         state.manualAddRevision = _manualAddTool->revision();
@@ -1506,10 +1510,6 @@ bool SegmentationModule::beginManualAdd()
     cancelDrag();
     cancelCorrectionDrag();
     setAnnotateMode(false);
-    _previousGrowthMethodBeforeManualAdd = _widget->growthMethod();
-    if (_previousGrowthMethodBeforeManualAdd == SegmentationGrowthMethod::ManualAdd) {
-        _previousGrowthMethodBeforeManualAdd = _widget->lastNonManualGrowthMethod();
-    }
     _widget->setGrowthMethod(SegmentationGrowthMethod::ManualAdd);
     if (!_manualAddTool) {
         _manualAddTool = std::make_unique<ManualAddTool>();
@@ -1528,6 +1528,7 @@ bool SegmentationModule::beginManualAdd()
 
 bool SegmentationModule::finishManualAdd(bool apply)
 {
+    if (_sheetWalkRunning) return false;
     if (!_manualAddMode || !_manualAddTool) {
         return false;
     }
@@ -1607,11 +1608,8 @@ bool SegmentationModule::finishManualAdd(bool apply)
     _manualAddHoverThrottle.invalidate();
     _manualAddTool->clear();
     if (_widget) {
+        // Ending a session does not change the selected growth method.
         _widget->setManualAddActive(false);
-        const auto fallback = _previousGrowthMethodBeforeManualAdd == SegmentationGrowthMethod::ManualAdd
-            ? SegmentationGrowthMethod::Tracer
-            : _previousGrowthMethodBeforeManualAdd;
-        _widget->setGrowthMethod(fallback);
     }
     refreshOverlay();
     return true;
@@ -1716,6 +1714,15 @@ bool SegmentationModule::extendManualAdd(ManualAddTool::ExtendSide side,
         return fail(QString::fromStdString(status), QStringLiteral("no_edge"));
     }
 
+    if (config.followSheet) {
+        if (followSheetForManualAdd()) {
+            return true;
+        }
+        clearManualAddPending();
+        return fail(tr("Could not start sheet following. No extension was added."),
+                    QStringLiteral("sheet_walk_unavailable"));
+    }
+
     std::optional<cv::Rect> bounds;
     if (!_editManager->setPreviewPointsOnly(_manualAddTool->previewPoints(),
                                             _manualAddTool->changedVertices(),
@@ -1730,10 +1737,26 @@ bool SegmentationModule::extendManualAdd(ManualAddTool::ExtendSide side,
     emitPendingChanges();
     refreshOverlay();
     emit statusMessageRequested(QString::fromStdString(status), kStatusMedium);
-    if (config.followSheet) {
-        followSheetForManualAdd();
-    }
     return true;
+}
+
+void SegmentationModule::setSheetWalkRunning(bool running)
+{
+    _sheetWalkRunning = running;
+    if (_widget) {
+        _widget->setManualAddBusy(running);
+    }
+    // Reuse the surface-selection lock and growth guards used by the tracer.
+    setGrowthInProgress(running);
+}
+
+void SegmentationModule::failSheetWalk(const QString& message)
+{
+    // Drop the private straight guess before unlocking/refreshing the UI.
+    _sheetWalkRunning = false;
+    clearManualAddPending();
+    setSheetWalkRunning(false);
+    emit statusMessageRequested(message, kStatusLong);
 }
 
 bool SegmentationModule::followSheetForManualAdd()
@@ -1750,10 +1773,11 @@ bool SegmentationModule::followSheetForManualAdd()
         _sheetNormals = std::make_shared<SheetNormalField>(volume);
         _sheetNormalsVolume = volume;
     }
-    _sheetWalkRunning = true;
-    emit statusMessageRequested(tr("Following the sheet in the CT..."), kStatusShort);
+    setSheetWalkRunning(true);
+    emit statusMessageRequested(tr("Computing extension — editing is locked…"), 0);
     auto normals = _sheetNormals;
     const ManualAddTool::SheetWalk job = *walk;
+    const auto surface = _editManager ? _editManager->baseSurface() : nullptr;
     QtConcurrent::run([job, normals]() {
         std::vector<cv::Vec3f> guess(job.origins.size() * static_cast<std::size_t>(job.cells));
         const ManualAddTool::SheetNormalFn normal = [normals, job](const cv::Vec3f& world) {
@@ -1762,26 +1786,40 @@ bool SegmentationModule::followSheetForManualAdd()
         // Lines are independent; spread them over the cores.
         std::atomic<std::size_t> next{0};
         const unsigned workers = std::max(1u, std::min(8u, std::thread::hardware_concurrency()));
-        std::vector<std::thread> threads;
+        std::exception_ptr failure;
+        std::mutex failureMutex;
+        std::atomic<bool> failed{false};
+        std::vector<std::jthread> threads;
         for (unsigned t = 0; t < workers; ++t) {
             threads.emplace_back([&]() {
-                for (std::size_t line = next++; line < job.origins.size(); line = next++) {
-                    ManualAddTool::walkSheetLine(job, line, normal, guess);
+                try {
+                    for (std::size_t line = next++; line < job.origins.size() && !failed; line = next++) {
+                        ManualAddTool::walkSheetLine(job, line, normal, guess);
+                    }
+                } catch (...) {
+                    std::lock_guard lock(failureMutex);
+                    if (!failure) failure = std::current_exception();
+                    failed = true;
                 }
             });
         }
         for (auto& thread : threads) {
             thread.join();
         }
+        if (failure) std::rethrow_exception(failure);
         return guess;
-    }).then(this, [this, id = job.extensionId](std::vector<cv::Vec3f> guess) {
-        _sheetWalkRunning = false;
+    }).then(this, [this, id = job.extensionId, volume, surface](std::vector<cv::Vec3f> guess) {
         if (!_manualAddMode || !_manualAddTool || !_editManager) {
+            setSheetWalkRunning(false);
+            return;
+        }
+        if (!_state || _state->currentVolume() != volume || _editManager->baseSurface() != surface) {
+            failSheetWalk(tr("The surface or volume changed. The unfinished extension was discarded."));
             return;
         }
         std::string status;
         if (!_manualAddTool->applySheetWalk(id, std::move(guess), &status)) {
-            emit statusMessageRequested(QString::fromStdString(status), kStatusShort);
+            failSheetWalk(QString::fromStdString(status));
             return;
         }
         std::optional<cv::Rect> bounds;
@@ -1789,16 +1827,20 @@ bool SegmentationModule::followSheetForManualAdd()
                                                 _manualAddTool->changedVertices(),
                                                 true,
                                                 &bounds)) {
-            emit statusMessageRequested(tr("Manual Add preview update failed."), kStatusMedium);
+            failSheetWalk(tr("Manual Add preview update failed. No extension was added."));
             return;
         }
         if (_state && _editManager->previewSurface()) {
             _state->setSurface("segmentation", _editManager->previewSurface(), false, true);
         }
         emitPendingChanges();
+        // Only now may the completed surface and its editable overlay appear.
+        setSheetWalkRunning(false);
         refreshOverlay();
         emit statusMessageRequested(tr("The extension now follows the sheet. Shift+click where it still misses."),
                                     kStatusMedium);
+    }).onFailed(this, [this]() {
+        failSheetWalk(tr("Sheet following failed. No extension was added; please retry."));
     });
     return true;
 }
@@ -1807,6 +1849,10 @@ bool SegmentationModule::extendOrContinueManualAdd(ManualAddTool::ExtendSide sid
                                                    int cells,
                                                    QString* errorMessage)
 {
+    if (_sheetWalkRunning) {
+        if (errorMessage) *errorMessage = QStringLiteral("sheet_walk_running");
+        return false;
+    }
     if (!_manualAddMode || !_manualAddTool || _manualAddTool->extensionSide() != side) {
         return extendManualAdd(side, cells, std::nullopt, errorMessage);
     }
@@ -1855,6 +1901,9 @@ bool SegmentationModule::addManualAddConstraintAtWorld(const cv::Vec3f& world, f
         emit statusMessageRequested(QString::fromStdString(message), kStatusMedium);
         return false;
     };
+    if (_sheetWalkRunning) {
+        return fail("Wait for the extension to finish.", QStringLiteral("sheet_walk_running"));
+    }
     if (!_manualAddMode || !_manualAddTool || !_editManager) {
         return fail("Manual Add is not active.", QStringLiteral("manual_add_session"));
     }
@@ -1943,13 +1992,8 @@ void SegmentationModule::resetManualAddState(bool restorePreview)
     _manualAddHoverThrottle.invalidate();
 
     if (_widget) {
+        // Ending a session does not change the selected growth method.
         _widget->setManualAddActive(false);
-        if (_widget->growthMethod() == SegmentationGrowthMethod::ManualAdd) {
-            const auto fallback = _previousGrowthMethodBeforeManualAdd == SegmentationGrowthMethod::ManualAdd
-                ? SegmentationGrowthMethod::Tracer
-                : _previousGrowthMethodBeforeManualAdd;
-            _widget->setGrowthMethod(fallback);
-        }
     }
 
     if (wasManualAddMode) {
@@ -1959,6 +2003,7 @@ void SegmentationModule::resetManualAddState(bool restorePreview)
 
 bool SegmentationModule::recomputeManualAdd()
 {
+    if (_sheetWalkRunning) return false;
     if (!_manualAddMode || !_manualAddTool || !_editManager) {
         return false;
     }
@@ -2019,6 +2064,7 @@ bool SegmentationModule::recomputeManualAdd()
 
 bool SegmentationModule::clearManualAddPending()
 {
+    if (_sheetWalkRunning) return false;
     if (!_manualAddMode || !_manualAddTool || !_editManager) {
         return false;
     }
@@ -2045,6 +2091,7 @@ bool SegmentationModule::clearManualAddPending()
 
 bool SegmentationModule::undoManualAddPlaneConstraint()
 {
+    if (_sheetWalkRunning) return false;
     if (!_manualAddMode || !_manualAddTool || !_editManager) {
         return false;
     }

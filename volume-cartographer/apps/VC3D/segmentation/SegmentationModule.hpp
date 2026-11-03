@@ -486,7 +486,6 @@ private:
     bool _manualAddMode{false};
     QElapsedTimer _manualAddHoverThrottle;
     cv::Mat _pendingManualAddTracerMask;
-    SegmentationGrowthMethod _previousGrowthMethodBeforeManualAdd{SegmentationGrowthMethod::Tracer};
     // Grid rows and columns added for a pending edge extension; removed again
     // if the extension is canceled.
     ManualAddTool::GridPadding _manualAddGridPadding;
@@ -500,6 +499,8 @@ private:
     std::shared_ptr<SheetNormalField> _sheetNormals;
     std::shared_ptr<Volume> _sheetNormalsVolume;
     bool _sheetWalkRunning{false};
+    void setSheetWalkRunning(bool running);
+    void failSheetWalk(const QString& message);
     // Shift+drag in the segmentation view that picks an edge stretch.
     struct ManualAddSpanDrag
     {

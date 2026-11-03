@@ -26,6 +26,10 @@ bool SegmentationModule::handleKeyPress(QKeyEvent* event)
         return false;
     }
 
+    if (_sheetWalkRunning) {
+        event->accept();
+        return true;
+    }
     const Qt::KeyboardModifiers keyPressMods = event->modifiers() & ~Qt::KeypadModifier;
     if (event->key() == Qt::Key_G && keyPressMods == Qt::NoModifier && !event->isAutoRepeat()) {
         if (_editingEnabled && !_growthInProgress && _editManager && _editManager->hasSession()) {
@@ -344,6 +348,7 @@ void SegmentationModule::handleMousePress(VolumeViewerBase* viewer,
                                           Qt::KeyboardModifiers modifiers,
                                           const QPointF& scenePos)
 {
+    if (_sheetWalkRunning) return;
     const bool isLeftButton = (button == Qt::LeftButton);
     const bool isRightButton = (button == Qt::RightButton);
 
@@ -468,6 +473,7 @@ void SegmentationModule::handleMouseMove(VolumeViewerBase* viewer,
                                          Qt::KeyboardModifiers modifiers,
                                          const QPointF& scenePos)
 {
+    if (_sheetWalkRunning) return;
     if (_manualAddMode && handleManualAddMouseMove(viewer, buttons, scenePos)) {
         return;
     }
@@ -523,6 +529,7 @@ void SegmentationModule::handleMouseRelease(VolumeViewerBase* viewer,
                                             Qt::KeyboardModifiers /*modifiers*/,
                                             const QPointF& scenePos)
 {
+    if (_sheetWalkRunning) return;
     if (_manualAddMode) {
         handleManualAddMouseRelease(viewer, button);
         Q_UNUSED(worldPos);
@@ -578,6 +585,7 @@ void SegmentationModule::handleMouseDoubleClick(VolumeViewerBase* /*viewer*/,
                                                  Qt::MouseButton button,
                                                  Qt::KeyboardModifiers /*modifiers*/)
 {
+    if (_sheetWalkRunning) return;
     if (!_annotateMode || button != Qt::LeftButton) {
         return;
     }

@@ -262,6 +262,9 @@ dialog.
 - `ping` reports process, application, and protocol identity.
 - `state.get` is a non-mutating snapshot of the current package, volume,
   active segment, editing modes, viewers, point state, and active jobs.
+  `segmentationGrowthMethod` reports the selected method even outside an active
+  editing session. `manualAddFollowingSheet` indicates that an extension is
+  computing; editing remains locked until its completed preview is available.
 - A project is a JSON `.vcproj` file referencing volumes, normal grids, Lasagna
   datasets, and one or more `.vcobj` stores. Each of surfaces, fibers, point
   collections, umbilici, and registrations selects one attached store for

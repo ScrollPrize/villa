@@ -219,6 +219,7 @@ void SegmentationModule::discardLastUndoSnapshot()
 
 bool SegmentationModule::restoreUndoSnapshot()
 {
+    if (_sheetWalkRunning) return false;
     if (_suppressUndoCapture) {
         return false;
     }
