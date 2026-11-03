@@ -1,0 +1,270 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "version": "1.3.0",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "fixed_volume",
+    "transformation_matrix",
+    "fixed_landmarks",
+    "moving_landmarks"
+  ],
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "enum": [
+        "1.0.0",
+        "1.1.0",
+        "1.2.0",
+        "1.3.0"
+      ],
+      "description": "Version of the transformation data format schema. 1.1.0 adds the optional 'fit' record; 1.2.0 adds the optional 'deformation'; 1.3.0 adds that deformation's 'inverse'. Each is additive, so a file without them is a valid file of the earlier version."
+    },
+    "fixed_volume": {
+      "type": "string",
+      "description": "Path or identifier of the fixed volume to which this volume is registered"
+    },
+    "transformation_matrix": {
+      "type": "array",
+      "description": "3x4 affine transformation matrix in XYZ coordinate order (homogeneous coordinate row omitted). First 3x3 is the affine linear component, last column is the translation vector. Applied as p_fixed = M @ p_moving after the homogeneous row is added to the matrix. The fixed side is always the fixed volume's XYZ coordinate system. The moving side is the moving source's native XYZ coordinate system: moving-volume voxel coordinates for zarr-to-zarr registration, or native mesh XYZ coordinates for zarr-to-mesh registration. When a 'deformation' is present this matrix is still the whole affine part and is unchanged by its presence: a reader that does not implement the deformation gets exactly the transform it would have been given without one, and the deformation is a displacement added on top.",
+      "items": {
+        "type": "array",
+        "items": {
+          "type": "number"
+        },
+        "minItems": 4,
+        "maxItems": 4
+      },
+      "minItems": 3,
+      "maxItems": 3
+    },
+    "fixed_landmarks": {
+      "type": "array",
+      "description": "Array of (x, y, z) points in the fixed volume (voxel coordinates)",
+      "items": {
+        "type": "array",
+        "items": {
+          "type": "number"
+        },
+        "minItems": 3,
+        "maxItems": 3
+      }
+    },
+    "moving_landmarks": {
+      "type": "array",
+      "description": "Corresponding (x, y, z) points in the moving source's native XYZ coordinate system. For moving zarr volumes these are moving-volume voxel coordinates; for moving meshes these are native mesh XYZ coordinates.",
+      "items": {
+        "type": "array",
+        "items": {
+          "type": "number"
+        },
+        "minItems": 3,
+        "maxItems": 3
+      }
+    },
+    "fit": {
+      "type": "object",
+      "description": "How this transform was produced. Optional, and absent in files written before schema 1.1.0.",
+      "required": [
+        "method"
+      ],
+      "properties": {
+        "method": {
+          "type": "string",
+          "description": "What set the transform: 'landmark-fit', 'manual-adjustment', 'simpleitk-fine-align', or 'loaded'"
+        },
+        "model": {
+          "type": "string",
+          "description": "Transform model used for a landmark fit, e.g. 'scaled-rigid9'"
+        },
+        "parameters": {
+          "type": "integer",
+          "description": "Number of free parameters in that model"
+        },
+        "selection": {
+          "type": "string",
+          "description": "'auto' when the model was chosen by held-out error, 'forced' when the operator picked it"
+        },
+        "landmark_pairs": {
+          "type": "integer",
+          "description": "Number of landmark pairs the fit used"
+        },
+        "in_sample_rms": {
+          "type": "number",
+          "description": "RMS residual over the pairs the fit was given, in fixed-volume voxels"
+        },
+        "held_out_rms": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "description": "RMS error on pairs held out of the fit, in fixed-volume voxels. Null when too few pairs to hold one out."
+        },
+        "candidates": {
+          "type": "array",
+          "description": "Every model that was scored, so the choice can be second-guessed",
+          "items": {
+            "type": "object"
+          }
+        },
+        "geometry": {
+          "type": "object",
+          "description": "Scale, anisotropy, shear and handedness of the fitted linear part"
+        },
+        "source": {
+          "type": "string",
+          "description": "For method 'loaded', the file the transform came from"
+        }
+      }
+    },
+    "deformation": {
+      "type": "object",
+      "description": "An optional smooth correction to 'transformation_matrix', for registrations where the two volumes disagree by more than any one linear map can absorb. Applied as p_fixed = M @ p_moving + D(p_moving), with D in fixed-volume voxels. D is a regularised thin-plate spline: normalise a moving point by u = (p - centre) / scale, then D(p) = [1 u] @ affine + sum_i weights[i] * -|u - control_u[i]|, where control_u is 'control_points' normalised the same way. The control points are the 'moving_landmarks' of this file, written out in full so the map can be evaluated without assuming it. The inverse has no closed form. Schema 1.3.0 therefore carries it: 'inverse' is that same spline fitted with the two landmark arrays exchanged, which composes with the forward map to within the 'round_trip_max' it records. A 1.2.0 file has no 'inverse' and a reader needing one must fit it itself, the same way, from the two landmark arrays.",
+      "required": [
+        "model",
+        "centre",
+        "scale",
+        "regularisation",
+        "control_points",
+        "weights",
+        "affine"
+      ],
+      "properties": {
+        "model": {
+          "type": "string",
+          "enum": [
+            "thin-plate-spline"
+          ],
+          "description": "Form of the correction. A reader that does not know the value must refuse the deformation rather than ignore it."
+        },
+        "kernel": {
+          "type": "string",
+          "description": "The spline's Green's function, '-r' in three dimensions. Recorded because the sign is what makes the regularisation smooth rather than roughen."
+        },
+        "centre": {
+          "type": "array",
+          "items": {
+            "type": "number"
+          },
+          "minItems": 3,
+          "maxItems": 3,
+          "description": "Origin of the normalisation, in moving XYZ."
+        },
+        "scale": {
+          "type": "number",
+          "exclusiveMinimum": 0,
+          "description": "Radius of the normalisation, in moving voxels, so that 'regularisation' means the same on volumes of different voxel size."
+        },
+        "regularisation": {
+          "type": "number",
+          "minimum": 0,
+          "description": "Smoothing weight. Zero interpolates every landmark; large values collapse the correction to an affine and then to nothing."
+        },
+        "effective_parameters": {
+          "type": "number",
+          "description": "Three times the trace of the smoother: how many free quantities the correction really costs, between 12 at the affine limit and three per landmark."
+        },
+        "control_points": {
+          "type": "array",
+          "description": "Where the correction is anchored, in the moving source's native XYZ. Equal to 'moving_landmarks'.",
+          "items": {
+            "type": "array",
+            "items": {
+              "type": "number"
+            },
+            "minItems": 3,
+            "maxItems": 3
+          }
+        },
+        "weights": {
+          "type": "array",
+          "description": "One kernel weight vector per control point, in fixed-volume voxels.",
+          "items": {
+            "type": "array",
+            "items": {
+              "type": "number"
+            },
+            "minItems": 3,
+            "maxItems": 3
+          }
+        },
+        "affine": {
+          "type": "array",
+          "description": "The correction's own 4x3 polynomial part, on normalised coordinates, rows ordered [1, x, y, z]. Small by construction: it is what separates 'transformation_matrix' from a full least-squares affine over the same landmarks.",
+          "minItems": 4,
+          "maxItems": 4,
+          "items": {
+            "type": "array",
+            "items": {
+              "type": "number"
+            },
+            "minItems": 3,
+            "maxItems": 3
+          }
+        },
+        "inverse": {
+          "type": "object",
+          "description": "The fixed-to-moving spline, so the transform can be used in both directions without refitting. Applied as p_moving = inv(M) @ p_fixed + D_inv(p_fixed), with the same normalise-then-evaluate rule as the forward map and the same 'model', 'kernel' and 'regularisation' as the deformation it sits in. Its control points are the 'fixed_landmarks'. It is a separate fit, not an algebraic inverse, so 'round_trip_max' records how nearly the two compose to the identity. Absent in files written before schema 1.3.0.",
+          "required": [
+            "centre",
+            "scale",
+            "control_points",
+            "weights",
+            "affine"
+          ],
+          "properties": {
+            "centre": {
+              "type": "array",
+              "items": {"type": "number"},
+              "minItems": 3,
+              "maxItems": 3,
+              "description": "Origin of the normalisation, in fixed XYZ."
+            },
+            "scale": {
+              "type": "number",
+              "exclusiveMinimum": 0,
+              "description": "Radius of the normalisation, in fixed voxels."
+            },
+            "control_points": {
+              "type": "array",
+              "description": "Where the inverse correction is anchored, in the fixed volume's XYZ. Equal to 'fixed_landmarks'.",
+              "items": {
+                "type": "array",
+                "items": {"type": "number"},
+                "minItems": 3,
+                "maxItems": 3
+              }
+            },
+            "weights": {
+              "type": "array",
+              "description": "One kernel weight vector per control point, in moving-source units.",
+              "items": {
+                "type": "array",
+                "items": {"type": "number"},
+                "minItems": 3,
+                "maxItems": 3
+              }
+            },
+            "affine": {
+              "type": "array",
+              "description": "The inverse correction's own 4x3 polynomial part, on normalised fixed coordinates, rows ordered [1, x, y, z].",
+              "minItems": 4,
+              "maxItems": 4,
+              "items": {
+                "type": "array",
+                "items": {"type": "number"},
+                "minItems": 3,
+                "maxItems": 3
+              }
+            },
+            "round_trip_max": {
+              "type": "number",
+              "description": "Worst |M(D_inv(p)) - p| over a grid reaching half again beyond the control points, in fixed-volume voxels. A reader that needs a tighter inverse than this should iterate the forward map rather than assume one."
+            }
+          }
+        }
+      }
+    }
+  },
+  "additionalProperties": false
+}
