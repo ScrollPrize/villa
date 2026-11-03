@@ -32,8 +32,9 @@ private:
     std::shared_ptr<Volume> _volume;
     std::mutex _mutex;
     std::map<std::array<int, 3>, std::optional<cv::Vec3f>> _cache;
-    // At most 32 filtered patches (~27 MiB); queries hold shared references
-    // so eviction cannot invalidate another worker's in-flight evaluation.
+    // 512 MiB of filtered patch data, excluding container/allocation overhead.
+    // Queries hold shared references, so evicted patches still in use may
+    // temporarily exceed that budget without invalidating worker evaluations.
     std::map<std::array<int, 3>, std::shared_ptr<const vcr::sheet_normal::CpuPatch>> _patchCache;
     std::deque<std::array<int, 3>> _patchOrder;
 };

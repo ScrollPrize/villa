@@ -40,3 +40,23 @@ these can be used together, or independently -- the mesh deformation at times cr
 9. once you've completed all your corrections, set the number of `steps` (aka generations) you would like to grow, the directions you'd like to grow in , and any z limits you may want to apply. 
 10. click the `grow` button , and the patch will grow for that number of generations. i'd stick with a small number of steps for now, likely somewhere between 5-20, as its easier to correct a small error than one that has gone on for some time
 11. repeat steps 9-10 until you feel like stopping. Edits, corrections and growth are committed to the surface in the store as you go; its revision history replaces backups.
+
+**manual fill and grow**
+
+The surface growth method dropdown has two manual methods:
+
+- **Manual Fill**: press Shift+E to start, then use the crosshair to select a fill. The panel includes the yellow-line modes (including Cross-fill) and Thin-plate spline / Tracer inside fill.
+- **Manual Grow**: use the edge-extension buttons, or press Shift+E and use keys 1–4 or Shift+drag along an edge. The panel includes normal projection and streamline integration options. Moving over the surface does not show a fill crosshair.
+
+For Manual Grow, the **Volume** selector under Surface Growth lists the package volumes and selects the CT source for both projection and streamline integration. It shares the source selection with Tracer without changing the displayed volume. Selection is locked while an extension is computing; changing it afterward affects the next extension. With sheet following disabled, straight extensions do not read volume data.
+
+Manual Grow caches up to 512 MiB of filtered structure-tensor patches for substep and streamline queries (previously about 27 MiB). Container overhead and in-flight worker data are additional.
+
+Both methods share preview correction, Apply & Exit, and Cancel. Existing saved Manual Add selections open as Manual Fill.
+
+The UI regression test checks method selection, control visibility, extension-button dispatch, and saved settings. From `volume-cartographer`, with an existing test-enabled build:
+
+```sh
+ninja -C build VC3D test_manual_growth_panel test_manual_add_extend
+ctest --test-dir build -R '^(manual_growth_panel|manual_add_extend)$' --output-on-failure
+```

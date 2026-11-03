@@ -202,6 +202,7 @@ public:
     // it finishes. Extensions start one on their own when the panel's
     // "Follow the sheet" is on. Returns false when there is nothing to walk
     // or no volume.
+    std::shared_ptr<Volume> manualGrowthVolume() const;
     bool followSheetForManualAdd();
     [[nodiscard]] bool manualAddSheetWalkRunning() const { return _sheetWalkRunning; }
     // True while a repeated extension waits for the save of the one before it.

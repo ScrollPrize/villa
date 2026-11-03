@@ -7,6 +7,8 @@
 class QCheckBox;
 class QComboBox;
 class QDoubleSpinBox;
+class QFormLayout;
+class QGroupBox;
 class QPushButton;
 class QSettings;
 class QSpinBox;
@@ -25,6 +27,7 @@ public:
     ManualAddTool::LinePreviewMode setLinePreviewMode(ManualAddTool::LinePreviewMode mode);
     ManualAddTool::InterpolationMode setInterpolationMode(ManualAddTool::InterpolationMode mode);
     void restoreSettings(QSettings& settings);
+    void setGrowMode(bool grow);
     void syncUiState(bool editingEnabled, bool manualAddActive);
 
 signals:
@@ -39,6 +42,9 @@ private:
     void writeSetting(const QString& key, const QVariant& value);
     void persistFromUi();
 
+    QGroupBox* _group{nullptr};
+    QFormLayout* _form{nullptr};
+    QWidget* _growControls{nullptr};
     QString _settingsGroup;
     bool _restoringSettings{false};
 

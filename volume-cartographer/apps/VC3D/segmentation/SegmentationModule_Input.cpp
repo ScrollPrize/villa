@@ -71,7 +71,7 @@ bool SegmentationModule::handleKeyPress(QKeyEvent* event)
             !event->isAutoRepeat() &&
             event->key() == Qt::Key_Q &&
             event->modifiers() == Qt::ShiftModifier;
-        if (manualAddLineModeCycle && _widget && _manualAddTool) {
+        if (manualAddLineModeCycle && _growthMethod != SegmentationGrowthMethod::ManualGrow && _widget && _manualAddTool) {
             const ManualAddTool::LinePreviewMode mode = _widget->cycleManualAddLinePreviewMode();
             _manualAddTool->setConfig(_widget->manualAddConfig());
             if (auto hover = _manualAddTool->hoverVertex()) {
@@ -97,9 +97,10 @@ bool SegmentationModule::handleKeyPress(QKeyEvent* event)
             event->accept();
             return true;
         }
-        // The Grow left/up/down/right keys extend that edge in Manual Add;
+        // The Grow left/up/down/right keys extend that edge in Manual Grow;
         // the same key again applies the extension and walks on.
-        if (!event->isAutoRepeat() && keyPressMods == Qt::NoModifier) {
+        if (_growthMethod == SegmentationGrowthMethod::ManualGrow &&
+            !event->isAutoRepeat() && keyPressMods == Qt::NoModifier) {
             std::optional<ManualAddTool::ExtendSide> side;
             const int key = event->key();
             if (key == vc3d::keybinds::keypress::GrowthLeft.key) {

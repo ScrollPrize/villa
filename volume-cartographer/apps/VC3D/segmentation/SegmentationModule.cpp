@@ -400,6 +400,11 @@ void SegmentationModule::bindWidgetSignals()
     connect(_widget, &SegmentationWidget::growthMethodChanged,
             this, [this](SegmentationGrowthMethod method) {
                 _growthMethod = method;
+                if (_manualAddTool && method == SegmentationGrowthMethod::ManualGrow) {
+                    _manualAddTool->updateHover(-1, -1);
+                }
+                _manualAddSpanDrag = {};
+                refreshOverlay();
             });
     connect(_widget, &SegmentationWidget::pushPullStepChanged,
             this, &SegmentationModule::setPushPullStepMultiplier);
@@ -1241,8 +1246,8 @@ void SegmentationModule::handleGrowSurfaceRequested(SegmentationGrowthMethod met
                                                     int steps,
                                                     bool inpaintOnly)
 {
-    if (method == SegmentationGrowthMethod::ManualAdd) {
-        emit statusMessageRequested(tr("Manual Add is interactive; use Shift+E and the Manual Add panel."), kStatusMedium);
+    if (isManualGrowthMethod(method)) {
+        emit statusMessageRequested(tr("Manual Fill and Manual Grow are interactive; use Shift+E or the edge-extension buttons."), kStatusMedium);
         return;
     }
     if (_manualAddMode) {
@@ -1508,7 +1513,9 @@ bool SegmentationModule::beginManualAdd()
     cancelDrag();
     cancelCorrectionDrag();
     setAnnotateMode(false);
-    _widget->setGrowthMethod(SegmentationGrowthMethod::ManualAdd);
+    if (!isManualGrowthMethod(_widget->growthMethod())) {
+        _widget->setGrowthMethod(SegmentationGrowthMethod::ManualAdd);
+    }
     if (!_manualAddTool) {
         _manualAddTool = std::make_unique<ManualAddTool>();
     }
@@ -1757,13 +1764,24 @@ void SegmentationModule::failSheetWalk(const QString& message)
     emit statusMessageRequested(message, kStatusLong);
 }
 
+std::shared_ptr<Volume> SegmentationModule::manualGrowthVolume() const
+{
+    if (!_state) return nullptr;
+    const auto id = _state->segmentationGrowthVolumeId();
+    if (id.empty()) return _state->currentVolume();
+    const auto package = _state->vpkg();
+    // Never silently compute from a different volume than the selected source.
+    if (!package || !package->hasVolume(id)) return nullptr;
+    return package->volume(id);
+}
+
 bool SegmentationModule::followSheetForManualAdd()
 {
     if (!_manualAddMode || !_manualAddTool || _sheetWalkRunning) {
         return false;
     }
     const auto walk = _manualAddTool->sheetWalk();
-    std::shared_ptr<Volume> volume = _state ? _state->currentVolume() : nullptr;
+    std::shared_ptr<Volume> volume = manualGrowthVolume();
     if (!walk || !volume) {
         return false;
     }
@@ -1790,7 +1808,7 @@ bool SegmentationModule::followSheetForManualAdd()
             setSheetWalkRunning(false);
             return;
         }
-        if (!_state || _state->currentVolume() != volume || _editManager->baseSurface() != surface) {
+        if (manualGrowthVolume() != volume || _editManager->baseSurface() != surface) {
             failSheetWalk(tr("The surface or volume changed. The unfinished extension was discarded."));
             return;
         }
@@ -2105,7 +2123,8 @@ bool SegmentationModule::handleManualAddMousePress(VolumeViewerBase* viewer,
     if (!_manualAddMode || !_manualAddTool || !viewer) {
         return false;
     }
-    if (viewer->surfName() == "segmentation" && button == Qt::LeftButton && modifiers == Qt::ShiftModifier) {
+    if (_growthMethod == SegmentationGrowthMethod::ManualGrow &&
+        viewer->surfName() == "segmentation" && button == Qt::LeftButton && modifiers == Qt::ShiftModifier) {
         // Shift+drag along an edge picks the stretch to extend.
         const auto& entry = _manualAddTool->entrySnapshotPoints();
         if (const auto grid = segmentationSceneToGrid(viewer, scenePos, entry.rows, entry.cols, true)) {
@@ -2118,6 +2137,7 @@ bool SegmentationModule::handleManualAddMousePress(VolumeViewerBase* viewer,
         return true;
     }
     if (viewer->surfName() == "segmentation" && button == Qt::LeftButton && modifiers == Qt::NoModifier) {
+        if (_growthMethod == SegmentationGrowthMethod::ManualGrow) return true;
         const auto grid = segmentationSceneToGrid(viewer,
                                                   scenePos,
                                                   _manualAddTool->entrySnapshotPoints().rows,
@@ -2185,7 +2205,7 @@ bool SegmentationModule::handleManualAddMouseMove(VolumeViewerBase* viewer,
     if (!_manualAddMode || !_manualAddTool || !viewer || buttons != Qt::NoButton) {
         return false;
     }
-    if (viewer->surfName() != "segmentation") {
+    if (_growthMethod == SegmentationGrowthMethod::ManualGrow || viewer->surfName() != "segmentation") {
         return true;
     }
     const auto grid = segmentationSceneToGrid(viewer,

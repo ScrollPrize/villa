@@ -20,6 +20,12 @@ namespace
 {
 constexpr int kWidth = vcr::sheet_normal::width; // 109 voxel patch
 constexpr int kHalf = 54;                         // patch start = lattice point - 54
+constexpr std::size_t kPatchCacheBytes = 512ULL * 1024 * 1024;
+// CpuPatch owns six gradient arrays, each with `count` floats.
+constexpr std::size_t kPatchBytes = sizeof(vcr::sheet_normal::CpuPatch) +
+                                    6ULL * vcr::sheet_normal::count * sizeof(float);
+constexpr std::size_t kPatchCacheCapacity = kPatchCacheBytes / kPatchBytes;
+static_assert(kPatchCacheCapacity > 0, "The normal cache must hold at least one patch");
 
 // Callers walk many lines at once on their own threads. Volume::readZYX opens
 // an OpenMP team as wide as the machine, so each walk thread would start its
@@ -165,7 +171,7 @@ std::optional<cv::Vec3f> SheetNormalField::normalAt(const cv::Vec3f& world, bool
                 // only one copy in the bounded cache; their values are identical.
                 if (_patchCache.emplace(lattice, patch).second) {
                     _patchOrder.push_back(lattice);
-                    if (_patchOrder.size() > 32) {
+                    if (_patchOrder.size() > kPatchCacheCapacity) {
                         _patchCache.erase(_patchOrder.front());
                         _patchOrder.pop_front();
                     }

@@ -188,9 +188,10 @@ void SegmentationWidget::syncUiState()
         }
     }
 
-    const bool manualAddSelected = _growthPanel->growthMethod() == SegmentationGrowthMethod::ManualAdd;
+    const bool manualAddSelected = isManualGrowthMethod(_growthPanel->growthMethod());
     const bool manualAddVisible = _manualAddActive || manualAddSelected;
     _growthPanel->setManualAddUiActive(manualAddVisible);
+    _manualAddPanel->setGrowMode(_growthPanel->growthMethod() == SegmentationGrowthMethod::ManualGrow);
     _manualAddPanel->setVisible(manualAddVisible);
     _manualAddPanel->syncUiState(_editingEnabled && !_manualAddBusy, _manualAddActive);
 

@@ -25,9 +25,11 @@ SegmentationManualAddPanel::SegmentationManualAddPanel(const QString& settingsGr
     auto* outer = new QVBoxLayout(this);
     outer->setContentsMargins(0, 0, 0, 0);
 
-    auto* group = new QGroupBox(tr("Manual Add"), this);
+    auto* group = new QGroupBox(tr("Manual Fill"), this);
+    _group = group;
     auto* layout = new QVBoxLayout(group);
     auto* form = new QFormLayout();
+    _form = form;
 
     _spinMaxPreviewSpan = new QSpinBox(group);
     _spinMaxPreviewSpan->setRange(4, 4096);
@@ -97,12 +99,17 @@ SegmentationManualAddPanel::SegmentationManualAddPanel(const QString& settingsGr
     _chkAllowBoundarySmoothing->setChecked(false);
     layout->addWidget(_chkAllowBoundarySmoothing);
 
+    _growControls = new QWidget(group);
+    auto* growLayout = new QVBoxLayout(_growControls);
+    growLayout->setContentsMargins(0, 0, 0, 0);
+    layout->addWidget(_growControls);
+
     _chkFollowSheet = new QCheckBox(tr("Extensions follow the sheet (CT)"), group);
     _chkFollowSheet->setChecked(true);
     _chkFollowSheet->setToolTip(tr("Walk each new extension along the papyrus using the CT structure tensor "
                                    "(vc_reader sheet normals) instead of continuing it straight. "
                                    "Your Shift+clicks still correct it."));
-    layout->addWidget(_chkFollowSheet);
+    growLayout->addWidget(_chkFollowSheet);
     auto* walkForm = new QFormLayout();
     _spinNormalStep = new QDoubleSpinBox(group);
     _spinNormalStep->setRange(0, 10000);
@@ -128,7 +135,7 @@ SegmentationManualAddPanel::SegmentationManualAddPanel(const QString& settingsGr
     connect(_comboWalkMode, &QComboBox::currentIndexChanged, this, [this](int mode) {
         _comboIntegrator->setEnabled(mode == 1);
     });
-    layout->addLayout(walkForm);
+    growLayout->addLayout(walkForm);
 
     auto* extendRow = new QHBoxLayout();
     extendRow->addWidget(new QLabel(tr("Extend edge"), group));
@@ -148,14 +155,14 @@ SegmentationManualAddPanel::SegmentationManualAddPanel(const QString& settingsGr
                                  "Shift+click the sheet in a slice view to bend the preview onto it, "
                                  "Shift+right-click to remove a click, then Apply or Cancel. "
                                  "Pressing it again applies the pending strip and extends on from the new edge. "
-                                 "Keys 1 to 4 do the same in Manual Add, and Shift+drag along an edge "
+                                 "Keys 1 to 4 do the same in Manual Grow, and Shift+drag along an edge "
                                  "in the segment view extends only that stretch.");
     _btnExtendUp = makeExtendButton(tr("Up"), extendTip.arg(tr("top")));
     _btnExtendDown = makeExtendButton(tr("Down"), extendTip.arg(tr("bottom")));
     _btnExtendLeft = makeExtendButton(tr("Left"), extendTip.arg(tr("left")));
     _btnExtendRight = makeExtendButton(tr("Right"), extendTip.arg(tr("right")));
     extendRow->addStretch(1);
-    layout->addLayout(extendRow);
+    growLayout->addLayout(extendRow);
 
     auto* buttons = new QHBoxLayout();
     _btnClearPending = new QPushButton(tr("Clear Pending"), group);
@@ -204,6 +211,18 @@ SegmentationManualAddPanel::SegmentationManualAddPanel(const QString& settingsGr
         connect(button, &QPushButton::clicked, this, [this, side = side]() {
             emit extendRequested(static_cast<int>(side), _spinExtendCells->value());
         });
+    }
+}
+
+void SegmentationManualAddPanel::setGrowMode(bool grow)
+{
+    _group->setTitle(grow ? tr("Manual Grow") : tr("Manual Fill"));
+    _growControls->setVisible(grow);
+    for (QWidget* field : {static_cast<QWidget*>(_spinMaxPreviewSpan),
+                           static_cast<QWidget*>(_spinPreviewThrottle),
+                           static_cast<QWidget*>(_comboLinePreviewMode),
+                           static_cast<QWidget*>(_comboInterpolationMode)}) {
+        _form->setRowVisible(field, !grow);
     }
 }
 
