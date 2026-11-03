@@ -122,6 +122,9 @@ void bloscDecompressInto(std::span<const std::byte> input, std::span<std::byte> 
     if (rc < 0) {
         throw std::runtime_error("blosc_decompress_ctx failed with code " + std::to_string(rc));
     }
+    if (static_cast<size_t>(rc) != output.size()) {
+        throw std::runtime_error("blosc_decompress_ctx returned unexpected byte count");
+    }
 }
 
 std::vector<std::byte> bloscDecompress(std::span<const std::byte> input, size_t outputSize)
@@ -280,6 +283,9 @@ void gzipDecompressInto(std::span<const std::byte> input, std::span<std::byte> o
     inflateEnd(&stream);
     if (rc != Z_STREAM_END && rc != Z_OK) {
         throw std::runtime_error("gzip inflate failed with code " + std::to_string(rc));
+    }
+    if (rc != Z_STREAM_END || stream.total_out != output.size()) {
+        throw std::runtime_error("gzip inflate returned unexpected byte count or incomplete stream");
     }
 }
 

@@ -75,11 +75,12 @@ def launch(
     name: str,
     project: str | None = None,
     config_home: str | None = None,
+    platform: str = "offscreen",
 ) -> VC3DProcess:
     args = ["--agent-bridge", "--agent-bridge-name", name]
     if project is not None:
         args.extend(["--project", project])
-    env = dict(OFFSCREEN_ENV)
+    env = dict(OFFSCREEN_ENV, QT_QPA_PLATFORM=platform)
     if config_home is not None:
         config = Path(config_home)
         config.mkdir(parents=True, exist_ok=True)
@@ -290,10 +291,10 @@ def check_rpc_describe(
         coverage = description.get("coverage", {})
         complete = (
             description.get("undocumented") == []
-            and coverage.get("described") == 112
-            and coverage.get("registered") == 112
+            and coverage.get("described") == 114
+            and coverage.get("registered") == 114
             and coverage.get("complete") is True
-            and len(snapshot["methods"]) == 112
+            and len(snapshot["methods"]) == 114
         )
         rendered = json.dumps(snapshot, indent=2, sort_keys=True) + "\n"
         if update_snapshot:

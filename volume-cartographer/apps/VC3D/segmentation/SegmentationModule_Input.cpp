@@ -26,6 +26,10 @@ bool SegmentationModule::handleKeyPress(QKeyEvent* event)
         return false;
     }
 
+    if (_sheetWalkRunning) {
+        event->accept();
+        return true;
+    }
     const Qt::KeyboardModifiers keyPressMods = event->modifiers() & ~Qt::KeypadModifier;
     if (event->key() == Qt::Key_G && keyPressMods == Qt::NoModifier && !event->isAutoRepeat()) {
         if (_editingEnabled && !_growthInProgress && _editManager && _editManager->hasSession()) {
@@ -64,7 +68,7 @@ bool SegmentationModule::handleKeyPress(QKeyEvent* event)
             !event->isAutoRepeat() &&
             event->key() == Qt::Key_Q &&
             event->modifiers() == Qt::ShiftModifier;
-        if (manualAddLineModeCycle && _widget && _manualAddTool) {
+        if (manualAddLineModeCycle && _growthMethod != SegmentationGrowthMethod::ManualGrow && _widget && _manualAddTool) {
             const ManualAddTool::LinePreviewMode mode = _widget->cycleManualAddLinePreviewMode();
             _manualAddTool->setConfig(_widget->manualAddConfig());
             if (auto hover = _manualAddTool->hoverVertex()) {
@@ -89,6 +93,27 @@ bool SegmentationModule::handleKeyPress(QKeyEvent* event)
             emit statusMessageRequested(tr("Manual Add yellow line: %1").arg(label), kStatusShort);
             event->accept();
             return true;
+        }
+        // The Grow left/up/down/right keys extend that edge in Manual Grow;
+        // the same key again applies the extension and walks on.
+        if (_growthMethod == SegmentationGrowthMethod::ManualGrow &&
+            !event->isAutoRepeat() && keyPressMods == Qt::NoModifier) {
+            std::optional<ManualAddTool::ExtendSide> side;
+            const int key = event->key();
+            if (key == vc3d::keybinds::keypress::GrowthLeft.key) {
+                side = ManualAddTool::ExtendSide::Left;
+            } else if (key == vc3d::keybinds::keypress::GrowthUp.key) {
+                side = ManualAddTool::ExtendSide::Up;
+            } else if (key == vc3d::keybinds::keypress::GrowthDown.key) {
+                side = ManualAddTool::ExtendSide::Down;
+            } else if (key == vc3d::keybinds::keypress::GrowthRight.key) {
+                side = ManualAddTool::ExtendSide::Right;
+            }
+            if (side) {
+                extendOrContinueManualAdd(*side, _widget ? _widget->manualAddExtendCells() : 16);
+                event->accept();
+                return true;
+            }
         }
         if (event->key() == vc3d::keybinds::keypress::CancelOperation.key) {
             finishManualAdd(false);
@@ -317,6 +342,7 @@ void SegmentationModule::handleMousePress(VolumeViewerBase* viewer,
                                           Qt::KeyboardModifiers modifiers,
                                           const QPointF& scenePos)
 {
+    if (_sheetWalkRunning) return;
     const bool isLeftButton = (button == Qt::LeftButton);
     const bool isRightButton = (button == Qt::RightButton);
 
@@ -441,6 +467,7 @@ void SegmentationModule::handleMouseMove(VolumeViewerBase* viewer,
                                          Qt::KeyboardModifiers modifiers,
                                          const QPointF& scenePos)
 {
+    if (_sheetWalkRunning) return;
     if (_manualAddMode && handleManualAddMouseMove(viewer, buttons, scenePos)) {
         return;
     }
@@ -496,10 +523,10 @@ void SegmentationModule::handleMouseRelease(VolumeViewerBase* viewer,
                                             Qt::KeyboardModifiers /*modifiers*/,
                                             const QPointF& scenePos)
 {
+    if (_sheetWalkRunning) return;
     if (_manualAddMode) {
-        Q_UNUSED(viewer);
+        handleManualAddMouseRelease(viewer, button);
         Q_UNUSED(worldPos);
-        Q_UNUSED(button);
         Q_UNUSED(scenePos);
         return;
     }
@@ -552,6 +579,7 @@ void SegmentationModule::handleMouseDoubleClick(VolumeViewerBase* /*viewer*/,
                                                  Qt::MouseButton button,
                                                  Qt::KeyboardModifiers /*modifiers*/)
 {
+    if (_sheetWalkRunning) return;
     if (!_annotateMode || button != Qt::LeftButton) {
         return;
     }

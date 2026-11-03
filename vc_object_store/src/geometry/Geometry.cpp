@@ -21,8 +21,8 @@ GeometryRevision readGeometryRevision(const Statement& s)
     const auto text = s.text(4);
     const auto manifest = loadGeometryManifest(sqlite3_db_handle(s.value), r.uuid, text, r.contentHash);
     r.gridOrigin = manifest.value("grid_origin", std::array<int64_t,2>{0,0});
-    r.kind = manifest.at("kind"); r.formatVersion = manifest.at("format_version");
-    r.coordinateSystem = manifest.at("coordinate_system"); r.attributes = manifest.at("attributes").dump();
+    r.kind = manifest.at("kind").get<std::string>(); r.formatVersion = manifest.at("format_version");
+    r.coordinateSystem = manifest.at("coordinate_system").get<std::string>(); r.attributes = manifest.at("attributes").dump();
     r.objectGeneration = s.i64(5); r.createdBy = s.text(6); r.createdAt = s.text(7); r.createdHost = s.text(8);
     for (const auto& [name, a] : manifest.at("arrays").items())
         r.arrays.push_back({name, a.at("dtype"), a.at("shape").get<std::vector<int64_t>>(), a.at("byte_length")});

@@ -104,6 +104,7 @@ private:
     QCheckBox* _chkCorrectionsUseZRange{nullptr};
     QSpinBox* _spinCorrectionsZMin{nullptr};
     QSpinBox* _spinCorrectionsZMax{nullptr};
+    QWidget* _volumeRow{nullptr};
     QComboBox* _comboVolumes{nullptr};
     QLabel* _lblNormalGrid{nullptr};
     QLineEdit* _editNormalGridPath{nullptr};

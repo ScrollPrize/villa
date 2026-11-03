@@ -13,6 +13,7 @@
 #include "vc/core/types/Volume.hpp"
 #include "vc/core/render/ChunkCache.hpp"
 #include "vc/core/util/StreamOperators.hpp"
+#include "vc/core/util/RemoteCacheSettings.hpp"
 #include "vc/tracer/Tracer.hpp"
 #include "vc/core/util/StoreToolOptions.hpp"
 
@@ -231,6 +232,7 @@ static int run_main(int argc, char *argv[])
 {
     std::filesystem::path vol_path, tgt_dir, params_path, resume_path, correct_path;
     cv::Vec3d origin;
+    bool explicit_seed = false;
     Json params;
     PointCollections corrections;
     std::string segment_name;
@@ -322,6 +324,7 @@ static int run_main(int argc, char *argv[])
                 return EXIT_FAILURE;
             }
             origin = {seed_coords[0], seed_coords[1], seed_coords[2]};
+            explicit_seed = true;
         }
         if (vm.count("resume")) {
             resume_path = vm["resume"].as<std::string>();
@@ -392,6 +395,10 @@ static int run_main(int argc, char *argv[])
     utils::Json remote_metadata;
     if (std::isfinite(requested_voxelsize) && requested_voxelsize > 0.0)
         remote_metadata["voxelsize"] = requested_voxelsize;
+    if (remote_volume) {
+        // Same VC3D.ini disk budget as the VC3D app, so long traces cannot fill the disk.
+        vc::settings::configureRemoteCacheBudget();
+    }
     auto volume = remote_volume
         ? Volume::NewFromUrl(volume_arg, {}, remote_metadata)
         : Volume::New(vol_path);
@@ -667,7 +674,7 @@ static int run_main(int argc, char *argv[])
             double v;
             interpolator.Evaluate(origin[2], origin[1], origin[0], &v);
             std::cout << "seed location " << origin << " value is " << v << std::endl;
-        } else if (!use_old_args && origin[0] != 0 && origin[1] != 0 && origin[2] != 0) {
+        } else if (!use_old_args && explicit_seed) {
             mode = "explicit_seed";
             double v;
             interpolator.Evaluate(origin[2], origin[1], origin[0], &v);

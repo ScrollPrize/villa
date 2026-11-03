@@ -132,90 +132,6 @@ std::optional<cv::Rect> computeValidSurfaceBounds(const cv::Mat_<cv::Vec3f>& poi
                     maxRow - minRow + 1);
 }
 
-bool selectGrowPatchSeedParams(QWidget* parent,
-                               const QVector<VolumeSelector::VolumeOption>& volumeOptions,
-                               QString* selectedVolumeId,
-                               QString* selectedVolumePath,
-                               int* iterations,
-                               double* minAreaCm,
-                               QString* outputTag)
-{
-    QDialog dlg(parent);
-    dlg.setWindowTitle(QObject::tr("Create Segment (GrowPatch)"));
-
-    auto* layout = new QVBoxLayout(&dlg);
-    auto* form = new QFormLayout();
-
-    auto* volumeCombo = new QComboBox(&dlg);
-    for (const auto& option : volumeOptions) {
-        const QString label = option.name.isEmpty()
-            ? option.id
-            : QStringLiteral("%1 (%2)").arg(option.name, option.id);
-        volumeCombo->addItem(label, option.id);
-        volumeCombo->setItemData(volumeCombo->count() - 1, option.path, Qt::UserRole + 1);
-    }
-    if (selectedVolumeId && !selectedVolumeId->isEmpty()) {
-        const int idx = volumeCombo->findData(*selectedVolumeId);
-        if (idx >= 0) {
-            volumeCombo->setCurrentIndex(idx);
-        }
-    }
-    form->addRow(QObject::tr("Volume:"), volumeCombo);
-
-    auto* iterationsSpin = new QSpinBox(&dlg);
-    iterationsSpin->setRange(1, 100000);
-    iterationsSpin->setValue(iterations ? std::clamp(*iterations, 1, 100000) : 200);
-    form->addRow(QObject::tr("Iterations:"), iterationsSpin);
-
-    auto* minAreaSpin = new QDoubleSpinBox(&dlg);
-    minAreaSpin->setRange(0.0, 1000000.0);
-    minAreaSpin->setDecimals(6);
-    minAreaSpin->setSingleStep(0.001);
-    minAreaSpin->setValue(minAreaCm ? std::clamp(*minAreaCm, 0.0, 1000000.0) : 0.002);
-    minAreaSpin->setToolTip(QObject::tr("Writes the min_area_cm parameter for vc_grow_seg_from_seed."));
-    form->addRow(QObject::tr("Min size:"), minAreaSpin);
-
-    auto* tagEdit = new QLineEdit(outputTag ? *outputTag : QStringLiteral("paths"), &dlg);
-    tagEdit->setToolTip(QObject::tr("Tag for the new surface."));
-    form->addRow(QObject::tr("Output tag:"), tagEdit);
-
-    layout->addLayout(form);
-
-    auto* buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dlg);
-    layout->addWidget(buttons);
-
-    QObject::connect(buttons, &QDialogButtonBox::rejected, &dlg, &QDialog::reject);
-    QObject::connect(buttons, &QDialogButtonBox::accepted, &dlg, [&]() {
-        const QString tag = tagEdit->text().trimmed();
-        if (tag.isEmpty()) {
-            QMessageBox::warning(&dlg, QObject::tr("Create Segment"), QObject::tr("Output tag cannot be empty."));
-            return;
-        }
-        if (volumeCombo->currentIndex() < 0) {
-            QMessageBox::warning(&dlg, QObject::tr("Create Segment"), QObject::tr("Select a volume."));
-            return;
-        }
-        if (selectedVolumeId) {
-            *selectedVolumeId = volumeCombo->currentData().toString();
-        }
-        if (selectedVolumePath) {
-            *selectedVolumePath = volumeCombo->currentData(Qt::UserRole + 1).toString();
-        }
-        if (iterations) {
-            *iterations = iterationsSpin->value();
-        }
-        if (minAreaCm) {
-            *minAreaCm = minAreaSpin->value();
-        }
-        if (outputTag) {
-            *outputTag = tag;
-        }
-        dlg.accept();
-    });
-
-    return dlg.exec() == QDialog::Accepted;
-}
-
 static QJsonObject readJsonObject(const QString& path)
 {
     QFile f(path);
@@ -1893,8 +1809,19 @@ bool SegmentationCommandHandler::startGrowPatchFromSeedImpl(
     }
 
     // The normal grids paired with the open volume (CWindow's catalog-aware lookup).
-    const QString normalGridPath = _normalGridPathGetter ? _normalGridPathGetter() : QString();
-    if (normalGridPath.isEmpty()) {
+    const bool sheetGrowth = params.growthMethod != QStringLiteral("default");
+    if (sheetGrowth && params.growthMethod != QStringLiteral("projection") &&
+        params.growthMethod != QStringLiteral("streamline"))
+        return fail(tr("Unknown GrowPatch growth mode."));
+    if (sheetGrowth && (params.iterations < 1 || params.iterations > 1024 ||
+        !std::isfinite(params.meshSpacing) || params.meshSpacing < 0.1 || params.meshSpacing > 1000 ||
+        !std::isfinite(params.integrationStep) || params.integrationStep < 0 || params.integrationStep > 1000 ||
+        params.workers < 1 || params.workers > 256 ||
+        (params.integrator != QStringLiteral("midpoint") && params.integrator != QStringLiteral("heun") &&
+         params.integrator != QStringLiteral("rk4"))))
+        return fail(tr("Invalid projection/streamline growth parameters."));
+    const QString normalGridPath = !sheetGrowth && _normalGridPathGetter ? _normalGridPathGetter() : QString();
+    if (!sheetGrowth && normalGridPath.isEmpty()) {
         return fail(tr("No normal grid is available for GrowPatch."),
                     CommandLaunchError::InvalidState);
     }
@@ -1937,7 +1864,15 @@ bool SegmentationCommandHandler::startGrowPatchFromSeedImpl(
     paramsJson.insert(QStringLiteral("min_area_cm"), minAreaCm);
     paramsJson.insert(QStringLiteral("generations"), iterations);
     paramsJson.insert(QStringLiteral("thread_limit"), 1);
-    paramsJson.insert(QStringLiteral("normal_grid_path"), normalGridPath);
+    if (sheetGrowth) {
+        paramsJson.insert(QStringLiteral("growth_method"), params.growthMethod);
+        paramsJson.insert(QStringLiteral("step_size"), params.meshSpacing);
+        paramsJson.insert(QStringLiteral("walk_step_size"), params.integrationStep);
+        paramsJson.insert(QStringLiteral("walk_integrator"), params.integrator);
+        paramsJson.insert(QStringLiteral("thread_limit"), params.workers);
+    } else {
+        paramsJson.insert(QStringLiteral("normal_grid_path"), normalGridPath);
+    }
     paramsJson.insert(QStringLiteral("cache_root"), QDir(volpkgRoot).filePath(QStringLiteral("cache")));
     if (std::isfinite(selectedVoxelSize) && selectedVoxelSize > 0.0) {
         paramsJson.insert(QStringLiteral("voxelsize"), selectedVoxelSize);
@@ -2065,35 +2000,15 @@ void SegmentationCommandHandler::onCreateSegmentGrowPatchFromSeed(const QVector3
                                                    [&](const auto& option) { return option.id == selectedVolumeId; })) {
         selectedVolumeId = defaultVolumeId;
     }
-    QString selectedVolumePath;
-    for (const auto& option : volumeOptions) {
-        if (option.id == selectedVolumeId) {
-            selectedVolumePath = option.path;
-            break;
-        }
-    }
-
-    int iterations = 200;
-    double minAreaCm = 0.002;
-    QString outputTag = settings.value(QStringLiteral("growpatch_seed/output_tag"), QStringLiteral("paths")).toString();
-    if (!selectGrowPatchSeedParams(_parentWidget,
-                                   volumeOptions,
-                                   &selectedVolumeId,
-                                   &selectedVolumePath,
-                                   &iterations,
-                                   &minAreaCm,
-                                   &outputTag)) {
+    GrowPatchSeedParams patchParams;
+    patchParams.volumeId = selectedVolumeId;
+    patchParams.outputTag = settings.value(QStringLiteral("growpatch_seed/output_tag"), QStringLiteral("paths")).toString();
+    if (!selectGrowPatchSeedParams(_parentWidget, volumeOptions, patchParams)) {
         emit statusMessage(tr("Create segment cancelled"), 3000);
         return;
     }
-    settings.setValue(QStringLiteral("growpatch_seed/output_tag"), outputTag);
-    settings.setValue(QStringLiteral("growpatch_seed/volume_id"), selectedVolumeId);
-
-    GrowPatchSeedParams patchParams;
-    patchParams.volumeId = selectedVolumeId;
-    patchParams.iterations = iterations;
-    patchParams.minAreaCm = minAreaCm;
-    patchParams.outputTag = outputTag;
+    settings.setValue(QStringLiteral("growpatch_seed/output_tag"), patchParams.outputTag);
+    settings.setValue(QStringLiteral("growpatch_seed/volume_id"), patchParams.volumeId);
 
     CommandLaunchError error;
     if (!startGrowPatchFromSeedImpl(

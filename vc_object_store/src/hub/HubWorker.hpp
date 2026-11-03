@@ -11,6 +11,7 @@ struct HubLeaseCounts {
     std::mutex mutex;
     std::map<std::string, int> counts;
     std::set<std::string> held();
+    bool retain(const std::vector<std::string>& objects, const HubStatus& status, int64_t validThroughUs);
 };
 
 // Background sync of one session's hosted replica: periodic pull/push, a push

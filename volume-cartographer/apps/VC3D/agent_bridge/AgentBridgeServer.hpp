@@ -269,6 +269,8 @@ private:
     QJsonObject handleManualAddSetLineMode(const QJsonValue& params);
     QJsonObject handleManualAddSetInterpolation(const QJsonValue& params);
     QJsonObject handleManualAddUndoConstraint(const QJsonValue& params);
+    QJsonObject handleManualAddExtend(const QJsonValue& params);
+    QJsonObject handleManualAddAddConstraint(const QJsonValue& params);
     QJsonObject handleCorrectionsSetPointMode(const QJsonValue& params);
     // Editing settings (AgentBridgeHandlers_editsettings.cpp)
     // over SegmentationWidget and SegmentationModule.

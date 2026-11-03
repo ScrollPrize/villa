@@ -40,7 +40,7 @@ concurrency:
 jobs:
   build-windows:
     name: ${{ github.event_name == 'pull_request' && 'Compile' || 'Build + package' }} (MSYS2 UCRT64)
-    runs-on: windows-latest
+    runs-on: blacksmith-4vcpu-windows-2025
     timeout-minutes: 150
     env:
       SCCACHE_GHA_ENABLED: 'true'
@@ -241,7 +241,7 @@ jobs:
     name: Attach Windows package to release
     if: github.event_name == 'release'
     needs: build-windows
-    runs-on: ubuntu-24.04
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 10
     permissions:
       actions: read

@@ -48,7 +48,9 @@ FiberReplayTraceResult traceReferenceReplayCore(
         !std::isfinite(stepBound) || stepBound >= std::numeric_limits<int>::max())
         throw std::invalid_argument("reference replay budget exceeds supported integer range");
     if (!std::isfinite(consistency.intervalBase) || consistency.intervalBase < 0 ||
-        (consistency.intervalBase > 0 && (!consistency.verify || !consistency.nextSeed)) ||
+        (consistency.intervalBase > 0 && ((!consistency.verify && !consistency.verifyCheckpoint) || !consistency.nextSeed)) ||
+        (consistency.delaySteps > 0 && (!consistency.verifyCheckpoint || !consistency.toStart)) ||
+        (consistency.delaySteps > 0 && consistency.delaySteps*nominalStepBase >= consistency.intervalBase) ||
         (consistency.acceptPoint && !consistency.nextSeed) ||
         (consistency.seedAllStarts && !consistency.nextSeed))
         throw std::invalid_argument("invalid replay consistency policy");
@@ -95,13 +97,39 @@ FiberReplayTraceResult traceReferenceReplayCore(
         bool distanceFailed = false;
         bool filtered = false;
         bool presenceFiltered = false;
+        bool rejectedObservedPoint = false;
         size_t checkedPoint = 0;
         size_t checkedMatches = 0;
         double checkedArc = segmentStartArc;
         double uncheckedTravel = 0;
-        const auto checkSpan = [&]() {
+        std::optional<size_t> pendingCheckpoint;
+        const auto verifyAt=[&](size_t target,bool atEnd,const std::vector<cv::Vec3d>& points) {
+            ++result.reverseChecks;
+            const auto check=consistency.verifyCheckpoint(points,target,std::min(checkedPoint,target),atEnd);
+            result.reverseDiagnostics.push_back({double(target),double(check.historyCount),
+                check.travelled,check.converged?1.:0.,atEnd?1.:0.,check.seconds});
+            if(!check.passed){filtered=true;return false;}
+            checkedPoint=target;
+            checkedMatches=target; // one match per committed non-seed point
+            checkedArc=target ? segment.matches.at(target-1).matchedReferenceArcBase : segmentStartArc;
+            uncheckedTravel=0;
+            for(size_t i=target+1;i<segment.tracePointsBase.size();++i)
+                uncheckedTravel+=cv::norm(segment.tracePointsBase[i]-segment.tracePointsBase[i-1]);
+            return true;
+        };
+        const auto checkSpan = [&](bool terminal = false) {
             if (consistency.intervalBase <= 0 || segment.tracePointsBase.size() <= checkedPoint + 1)
                 return true;
+            if (consistency.verifyCheckpoint) {
+                const size_t last=segment.tracePointsBase.size()-1;
+                if (!pendingCheckpoint && !terminal) pendingCheckpoint=last;
+                if(pendingCheckpoint && (terminal || last-*pendingCheckpoint>=consistency.delaySteps)) {
+                    if(!verifyAt(*pendingCheckpoint,false,segment.tracePointsBase))return false;
+                    pendingCheckpoint.reset();
+                }
+                if(terminal && last>checkedPoint) return verifyAt(last,true,segment.tracePointsBase);
+                return true;
+            }
             ++result.reverseChecks;
             const std::vector<cv::Vec3d> span(segment.tracePointsBase.begin() + (consistency.toStart ? 0 : checkedPoint),
                                              segment.tracePointsBase.end());
@@ -155,6 +183,7 @@ FiberReplayTraceResult traceReferenceReplayCore(
                         segment.tracePointsBase[segment.tracePointsBase.size()-2])) {
                     filtered = true;
                     presenceFiltered = true;
+                    rejectedObservedPoint = true;
                     return false;
                 }
                 if (consistency.nextSeed && consistency.intervalBase <= 0) {
@@ -166,7 +195,7 @@ FiberReplayTraceResult traceReferenceReplayCore(
                 // check below audits any failure subsequently rejected by reverse tracing.
                 if (!distanceFailed && consistency.intervalBase > 0 &&
                     (uncheckedTravel >= consistency.intervalBase || referenceExhausted))
-                    if (!checkSpan()) return false;
+                    if (!checkSpan(referenceExhausted)) return false;
                 return !distanceFailed && !referenceExhausted;
             };
 
@@ -192,7 +221,7 @@ FiberReplayTraceResult traceReferenceReplayCore(
             start, endArcBase - segmentStartArc, maximumSteps, observe,
             segmentProgress);
 
-        if (terminationReason == "invalid_width" || terminationReason == "presence_cutoff") {
+        if (terminationReason == "invalid_width" || terminationReason == "presence_cutoff" || terminationReason == "width_cutoff") {
             if (!consistency.nextSeed) throw std::logic_error("invalid-width filtering requires restart search");
             filtered = true;
             presenceFiltered = true;
@@ -200,9 +229,44 @@ FiberReplayTraceResult traceReferenceReplayCore(
 
         if (excursion.outsideTravel) distanceFailed = true;
 
+        if (presenceFiltered && consistency.verifyCheckpoint && consistency.delaySteps > 0) {
+            const size_t acceptedLast=segment.tracePointsBase.size()-1-(rejectedObservedPoint ? 1 : 0);
+            if(acceptedLast>0) {
+                const size_t target=acceptedLast>consistency.delaySteps ? acceptedLast-consistency.delaySteps : 0;
+                // A rejected observer point is not usable incoming history. Do
+                // not erase it yet: failure metadata still refers to detection.
+                std::vector<cv::Vec3d> accepted;
+                if(rejectedObservedPoint)
+                    accepted.assign(segment.tracePointsBase.begin(),segment.tracePointsBase.begin()+acceptedLast+1);
+                const auto& points=rejectedObservedPoint ? accepted : segment.tracePointsBase;
+                bool keep=false;
+                if(target==0) {
+                    // Entire accepted piece fits inside the requested history
+                    // tail: nothing precedes it to reverse-trace. Do not count
+                    // this retention as a successful verification.
+                    ++result.reverseStopTailHistoryOnly;
+                    keep=true;
+                } else {
+                    ++result.reverseStopTailChecks;
+                    keep=verifyAt(target,false,points);
+                    if(keep) ++result.reverseStopTailPassed;
+                }
+                if(keep) {
+                    // User policy: keep the accepted incoming-history tail too.
+                    checkedPoint=acceptedLast;checkedMatches=acceptedLast;
+                    checkedArc=segment.matches.at(acceptedLast-1).matchedReferenceArcBase;
+                    pendingCheckpoint.reset();
+                } else {
+                    // Verification failed, so the filtering reason is reverse
+                    // consistency rather than the original presence/width stop.
+                    presenceFiltered=false;
+                }
+            }
+        }
+
         // Optional terminal check includes ordinary GT-failure endpoints.
         // Its acceptance still depends only on the saved forward geometry.
-        if (!filtered && (!distanceFailed || consistency.allEndpoints)) (void)checkSpan();
+        if (!filtered && (!distanceFailed || consistency.allEndpoints)) (void)checkSpan(true);
         if (filtered) {
             const double detectedArc = previousArcBase;
             if (distanceFailed) {

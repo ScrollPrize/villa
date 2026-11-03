@@ -627,6 +627,12 @@ public:
     [[nodiscard]] std::vector<std::byte>
     decode_chunk_payload(std::span<const std::byte> payload) const;
 
+    /// Decode an already-fetched payload into reusable caller storage. The
+    /// destination must cover the full (sub-)chunk; trailing bytes are untouched.
+    /// Codec callbacks must completely initialize their destination or throw.
+    void decode_chunk_payload_into(std::span<const std::byte> payload,
+                                   std::span<std::byte> output) const;
+
     [[nodiscard]] bool stores_chunks_with_codec(std::string_view codec_name) const noexcept;
 
     /// Read a chunk and decompress it directly into the caller-provided
@@ -635,9 +641,8 @@ public:
     /// exactly sub_chunk_byte_size() bytes into `output` and returns true.
     ///
     /// When the codec exposes `decompress_into`, decompression skips the
-    /// per-call heap allocation that `read_chunk` performs. v2 filters and
-    /// host-byte-order mismatches force a fallback to the allocating path
-    /// (and a final memcpy into `output`).
+    /// per-call heap allocation that `read_chunk` performs. v2 filters force
+    /// a fallback to allocating decode; byte swapping is done in place.
     [[nodiscard]] bool
     read_chunk_into(std::span<const std::size_t> chunk_indices,
                     std::span<std::byte> output) const;
@@ -756,6 +761,8 @@ private:
 
     [[nodiscard]] bool needs_compression() const noexcept;
     [[nodiscard]] bool needs_decompression() const noexcept;
+    bool decodePayloadInto(std::span<const std::byte> payload,
+                           std::span<std::byte> output, bool exactSize) const;
     [[nodiscard]] bool needs_byteswap() const noexcept;
 
     // -- Chunk key generation ------------------------------------------------

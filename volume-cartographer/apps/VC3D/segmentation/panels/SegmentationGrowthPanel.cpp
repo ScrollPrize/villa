@@ -70,10 +70,12 @@ SegmentationGrowthPanel::SegmentationGrowthPanel(const QString& settingsGroup, Q
     auto* methodLabel = new QLabel(tr("Method:"), _groupGrowth);
     _comboGrowthMethod = new QComboBox(_groupGrowth);
     _comboGrowthMethod->addItem(tr("Tracer"), static_cast<int>(SegmentationGrowthMethod::Tracer));
-    _comboGrowthMethod->addItem(tr("Manual Add"), static_cast<int>(SegmentationGrowthMethod::ManualAdd));
+    _comboGrowthMethod->addItem(tr("Manual Fill"), static_cast<int>(SegmentationGrowthMethod::ManualAdd));
+    _comboGrowthMethod->addItem(tr("Manual Grow"), static_cast<int>(SegmentationGrowthMethod::ManualGrow));
     _comboGrowthMethod->setToolTip(tr("Select the growth algorithm:\n"
                                       "- Tracer: Neural-guided growth using volume data\n"
-                                      "- Manual Add: Interactive invalid-region bridging"));
+                                      "- Manual Fill: Interactive invalid-region bridging\n"
+                                      "- Manual Grow: Extend edges using projection or streamlines"));
     methodRow->addWidget(methodLabel);
     methodRow->addWidget(_comboGrowthMethod);
     methodRow->addStretch(1);
@@ -155,7 +157,9 @@ SegmentationGrowthPanel::SegmentationGrowthPanel(const QString& settingsGroup, Q
     growButtonsRow->addStretch(1);
     growthLayout->addLayout(growButtonsRow);
 
-    auto* volumeRow = new QHBoxLayout();
+    _volumeRow = new QWidget(_groupGrowth);
+    auto* volumeRow = new QHBoxLayout(_volumeRow);
+    volumeRow->setContentsMargins(0, 0, 0, 0);
     auto* volumeLabel = new QLabel(tr("Volume:"), _groupGrowth);
     auto* volumeSelector = new VolumeSelector(_groupGrowth);
     volumeSelector->setLabelVisible(false);
@@ -164,7 +168,7 @@ SegmentationGrowthPanel::SegmentationGrowthPanel(const QString& settingsGroup, Q
     _comboVolumes->setToolTip(tr("Select which volume provides source data for segmentation growth."));
     volumeRow->addWidget(volumeLabel);
     volumeRow->addWidget(volumeSelector, 1);
-    growthLayout->addLayout(volumeRow);
+    growthLayout->addWidget(_volumeRow);
 
     _groupGrowth->setLayout(growthLayout);
     panelLayout->addWidget(_groupGrowth);
@@ -625,7 +629,7 @@ int SegmentationGrowthPanel::normalizeGrowthDirectionMask(int mask)
 
 void SegmentationGrowthPanel::updateGrowthUiState()
 {
-    const bool manual = _manualAddUiActive || _growthMethod == SegmentationGrowthMethod::ManualAdd;
+    const bool manual = _manualAddUiActive || isManualGrowthMethod(_growthMethod);
     const bool enableGrowth = _editingEnabled && !_growthInProgress && !manual;
     if (_spinGrowthSteps) {
         _spinGrowthSteps->setVisible(!manual);
@@ -663,10 +667,11 @@ void SegmentationGrowthPanel::updateGrowthUiState()
     if (_spinCorrectionsZMax) {
         _spinCorrectionsZMax->setVisible(!manual);
     }
+    if (_volumeRow) {
+        _volumeRow->setVisible(!manual || _growthMethod == SegmentationGrowthMethod::ManualGrow);
+    }
     if (_comboVolumes) {
-        if (auto* parent = _comboVolumes->parentWidget()) {
-            parent->setVisible(!manual);
-        }
+        _comboVolumes->setEnabled(!_volumeEntries.isEmpty() && !_growthInProgress);
     }
     if (_lblNormalGrid) {
         _lblNormalGrid->setVisible(!manual);
@@ -719,7 +724,7 @@ void SegmentationGrowthPanel::triggerGrowthRequest(SegmentationGrowthDirection d
     if (!_editingEnabled || _growthInProgress) {
         return;
     }
-    if (_growthMethod == SegmentationGrowthMethod::ManualAdd) {
+    if (isManualGrowthMethod(_growthMethod)) {
         return;
     }
 

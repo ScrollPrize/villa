@@ -110,6 +110,7 @@ bool SegmentationModule::beginEditingSession(std::shared_ptr<QuadSurface> surfac
 
 void SegmentationModule::endEditingSession()
 {
+    _manualAddContinuation.reset();
     stopAllPushPull();
     clearUndoStack();
     cancelDrag();
@@ -226,6 +227,7 @@ void SegmentationModule::discardLastUndoSnapshot()
 // replaces on the opposite stack, so every step can be reversed.
 bool SegmentationModule::applyHistoryEntry(bool redo)
 {
+    if (_sheetWalkRunning) return false;
     if (_suppressUndoCapture) {
         return false;
     }

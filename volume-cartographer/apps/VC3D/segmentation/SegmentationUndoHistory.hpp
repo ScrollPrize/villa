@@ -6,7 +6,7 @@
 #include <utility>
 #include <vector>
 
-#include <opencv2/core/mat.hpp>
+#include <opencv2/core.hpp>
 
 namespace segmentation
 {
@@ -165,6 +165,24 @@ public:
         if (size != _gridSize) {
             clear();
             _gridSize = size;
+        }
+    }
+
+    // Keeps the history valid after the grid grows by the given counts:
+    // deltas move with their vertices and full snapshots get invalid borders.
+    void padGrid(int top, int bottom, int left, int right)
+    {
+        for (auto& entry : _states) {
+            for (auto& delta : entry.deltas) {
+                delta.row += top;
+                delta.col += left;
+            }
+            if (!entry.points.empty()) {
+                cv::Mat padded;
+                cv::copyMakeBorder(entry.points, padded, top, bottom, left, right,
+                                   cv::BORDER_CONSTANT, cv::Scalar(-1.0, -1.0, -1.0));
+                entry.points = cv::Mat_<cv::Vec3f>(padded);
+            }
         }
     }
 

@@ -7,6 +7,10 @@ target_link_libraries(vc_fiber_view PUBLIC vc_object_store::vc_geometry)
 set_target_properties(vc_fiber_view PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 add_library(vc_core
+        src/SheetSeed.cpp
+        src/SheetWalk.cpp
+        src/SheetFront.cpp
+        src/SheetNormalField.cpp
         src/PolylineObj.cpp
         src/AtomicFile.cpp
         src/TexturedMesh.cpp
@@ -53,13 +57,18 @@ add_library(vc_core
         src/render/DecodedChunkCacheBudget.cpp
         src/render/PersistentZarrCacheBudget.cpp
         src/render/ChunkedPlaneSampler.cpp
+        src/render/SamplingWaitProfile.cpp
         src/render/PinnedChunkRegion.cpp
         src/render/SurfaceCache.cpp
         src/render/Colormaps.cpp
         src/render/PostProcess.cpp
         src/render/ZarrChunkFetcher.cpp
+    src/render/ChunkChannelHints.cpp
+    src/render/ChunkLoadQueue.cpp
         ${CMAKE_CURRENT_BINARY_DIR}/Version.cpp
 )
+
+target_include_directories(vc_core PRIVATE ${CMAKE_SOURCE_DIR}/../vc_reader/src/cpp)
 
 target_link_libraries(vc_core
     PUBLIC vc_object_store::vc_objects vc_object_store::vc_object_formats vc_reader::catalog
@@ -206,6 +215,7 @@ add_library(vc_fiber_tracer
     src/fiber_tracer/FiberChunkTrace.cpp
     src/fiber_tracer/FiberChunkFilter.cpp
     src/fiber_tracer/FiberChunkGpuBridge.cpp
+    src/fiber_tracer/FiberChunkTensor.cpp
     src/fiber_tracer/FiberChunkRoute.cpp
     src/fiber_tracer/FiberLiveBridge.cpp
     src/fiber_tracer/FiberEvaluation.cpp
@@ -219,10 +229,12 @@ add_library(vc_fiber_tracer
     src/fiber_tracer/FiberletOnDemand.cpp
     src/fiber_tracer/FiberletPipeline.cpp
     src/fiber_tracer/FiberTrace.cpp
+    src/fiber_tracer/FiberVolumeCoverage.cpp
+    src/fiber_tracer/FiberStreamVolume.cpp
     src/fiber_tracer/FiberSideStripIntersections.cpp
 )
 target_link_libraries(vc_fiber_tracer PUBLIC vc_core vc_lasagna PRIVATE Eigen3::Eigen Ceres::ceres)
-target_link_libraries(vc_fiber_tracer PRIVATE ${CMAKE_DL_LIBS})
+target_link_libraries(vc_fiber_tracer PRIVATE ${CMAKE_DL_LIBS} zstd::libzstd)
 
 # Optional backend; CPU builds do not need a CUDA toolkit.
 option(VC_BUILD_FIBER_CHUNK_CUDA "Build resident CUDA chunk tracing backend" OFF)
@@ -244,6 +256,7 @@ endif()
 
 add_library(vc_tracer
     src/GrowPatch.cpp
+    src/SheetGrowth.cpp
     src/GrowSurface.cpp
     src/SurfTrackerData.cpp
     src/NeuralTracerConnection.cpp

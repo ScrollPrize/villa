@@ -21,14 +21,14 @@ def _with_magic(payload, source: bytes, target: bytes) -> bytes:
 def compress(raw, z, y, x, elem_size, quant=1, codec="rans"):
     if codec != "rans":
         raise ValueError("VCZ1 compatibility only supports rANS entropy coding")
-    encoded = _compress(raw, z, y, x, elem_size, quant)
+    encoded = _compress(raw, z, y, x, elem_size, quant, predictor="delta")
     return _with_magic(encoded, _DELTA3D_MAGIC, _VCZ1_MAGIC)
 
 
 def compress_array(array, quant=1, codec="rans"):
     if codec != "rans":
         raise ValueError("VCZ1 compatibility only supports rANS entropy coding")
-    encoded = _compress_array(array, quant)
+    encoded = _compress_array(array, quant, predictor="delta")
     return _with_magic(encoded, _DELTA3D_MAGIC, _VCZ1_MAGIC)
 
 

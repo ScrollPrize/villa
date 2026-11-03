@@ -136,6 +136,9 @@ void ViewerCompositePanel::setViewerManagers(
     _managerConnections.clear();
     _viewerManagers = std::move(unique);
     for (auto* manager : _viewerManagers) {
+        _managerConnections.push_back(connect(manager, &ViewerManager::volumetricModeRequested, this, [this](bool enabled) {
+            if (_uiRefs.compositeMode) _uiRefs.compositeMode->setCurrentIndex(enabled ? 4 : 0);
+        }));
         _managerConnections.push_back(connect(
             manager, &ViewerManager::baseViewerCreated,
             this, &ViewerCompositePanel::applyInitialSettingsToViewer));
@@ -345,11 +348,8 @@ void ViewerCompositePanel::setupControls()
     if (_uiRefs.compositeMode) {
         connect(_uiRefs.compositeMode, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this](int index) {
             const std::string method = compositeMethodForModeIndex(index);
-            applyToAllViewers([&method](VolumeViewerBase* viewer) {
-                auto s = viewer->compositeRenderSettings();
-                s.params.method = method;
-                viewer->setCompositeRenderSettings(s);
-            });
+            for (auto* manager : _viewerManagers)
+                manager->setCompositeMethod(method);
             updateCompositeParamsVisibility();
         });
     }

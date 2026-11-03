@@ -13,6 +13,10 @@
 
 namespace vc::render {
 
+class ChunkChannelHints;
+class IChunkedArray;
+namespace detail { struct ChunkReadBatch; }
+
 enum class ChunkStatus {
     MissQueued,
     Missing,
@@ -47,6 +51,9 @@ struct ChunkRequestContext {
     // View-independent interactive computation (e.g. tracing). Survives render
     // replacement and shares admission fairly with GUI work.
     bool foreground = false;
+    // Optional run/read hint. Companion channels are prefetched/decoded into
+    // their REGULAR caches. Subsequent ordinary reads need no special view.
+    std::shared_ptr<const ChunkChannelHints> channelHints;
 
     [[nodiscard]] bool interactive() const noexcept { return viewId != 0; }
 };
@@ -57,6 +64,17 @@ struct ChunkViewportSample {
     // Offset from this view's requested level. Larger values are coarser
     // fallback levels and therefore have higher interactive priority.
     int relativeLevel = 0;
+};
+
+// Channels share a logical voxel grid, but storage chunk sizes may differ.
+// Hints populate ordinary caches; they do not change values or cache identity.
+class ChunkChannelHints final {
+public:
+    explicit ChunkChannelHints(std::vector<std::shared_ptr<IChunkedArray>> channels);
+    void prefetch(const IChunkedArray& origin,const std::vector<ChunkKey>& keys,
+                  int priority,const ChunkRequestContext& request) const;
+private:
+    std::vector<std::shared_ptr<IChunkedArray>> channels_;
 };
 
 class IChunkedArray {
@@ -77,7 +95,22 @@ public:
     virtual ChunkDtype dtype() const = 0;
     virtual double fillValue() const = 0;
     virtual LevelTransform levelTransform(int level) const = 0;
+    // Equal identities share one physical decoded payload (e.g. packed CZYX).
+    virtual const void* physicalCacheIdentity() const noexcept {return this;}
+protected:
+    // Implementation hooks for ROI loading. Worker callers use Volume::readZYX;
+    // chunk-list scheduling is deliberately not an additional public API.
+    friend struct detail::ChunkReadBatch;
+    virtual bool prefersBatchReads() const noexcept {return false;}
+    virtual std::vector<ChunkResult> getChunksBlocking(const std::vector<ChunkKey>& keys,
+                                                      const ChunkRequestContext& request = {})
+    {
+        std::vector<ChunkResult> results;results.reserve(keys.size());
+        for(const auto& key:keys)results.push_back(getChunkBlocking(key.level,key.iz,key.iy,key.ix,request));
+        return results;
+    }
 
+public:
     // Interactive viewers must use tryGetChunk() only. A miss queues I/O and
     // returns immediately; chunk-ready listeners are responsible for scheduling
     // a later repaint on the UI thread.
@@ -85,7 +118,7 @@ public:
     virtual ChunkResult tryGetChunk(int level, int iz, int iy, int ix,
                                     const ChunkRequestContext& request)
     {
-        (void)request;
+        if(request.channelHints)request.channelHints->prefetch(*this,{{level,iz,iy,ix}},0,request);
         return tryGetChunk(level, iz, iy, ix);
     }
 
@@ -111,7 +144,7 @@ public:
     virtual ChunkResult getChunkBlocking(int level, int iz, int iy, int ix,
                                          const ChunkRequestContext& request)
     {
-        (void)request;
+        if(request.channelHints)request.channelHints->prefetch(*this,{{level,iz,iy,ix}},-1024,request);
         return getChunkBlocking(level, iz, iy, ix);
     }
     virtual void prefetchChunks(const std::vector<ChunkKey>& keys, bool wait, int priorityOffset = 0) = 0;
@@ -120,7 +153,7 @@ public:
                                 int priorityOffset,
                                 const ChunkRequestContext& request)
     {
-        (void)request;
+        if(request.channelHints)request.channelHints->prefetch(*this,keys,priorityOffset,request);
         prefetchChunks(keys, wait, priorityOffset);
     }
 

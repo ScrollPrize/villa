@@ -337,10 +337,13 @@ dialog.
 
 - `ping` reports process, application, and protocol identity.
 - `state.get` is a non-mutating snapshot of the current package, volume,
-  active segment, editing modes, viewers, point state, and active jobs. Each
-  viewer entry names its `workspace` (null outside an addressable tab) and
-  whether it is `visible`. `workspace.current` is the current tab's id (null
-  for an unnamed line-annotation tab) and `workspace.available` lists
+  active segment, editing modes, viewers, point state, and active jobs.
+  `segmentationGrowthMethod` reports the selected method even outside an active
+  editing session. `manualAddFollowingSheet` indicates that an extension is
+  computing; editing remains locked until its completed preview is available.
+  Each viewer entry names its `workspace` (null outside an addressable tab)
+  and whether it is `visible`. `workspace.current` is the current tab's id
+  (null for an unnamed line-annotation tab) and `workspace.available` lists
   `{id, title}` in tab order. `heldKeys` lists the keys `canvas.key` holds
   (`key`, `modifiers`, `viewerId`). `revision` is the observation revision
   described under State changes, current as of this snapshot.
@@ -752,7 +755,9 @@ is the sole bridge method without an MCP tool; `vc3d_wait_job` and
 | `vc3d_list_points` | `points.list` | List point collections and their points. |
 | `vc3d_list_segments` | `segments.list` | List the surfaces of the open volume (your store and Open Data sample stores) by UUID, with name, tags and active/catalog/bound flags. |
 | `vc3d_list_attached_volumes` | `volume.list` | List volume ids already attached to the open package; this does not discover catalog data available to open. |
+| `vc3d_manual_add_add_constraint` | `segmentation.manual_add.add_constraint` |
 | `vc3d_manual_add_begin` | `segmentation.manual_add.begin` |
+| `vc3d_manual_add_extend` | `segmentation.manual_add.extend` |
 | `vc3d_manual_add_finish` | `segmentation.manual_add.finish` |
 | `vc3d_manual_add_set_interpolation` | `segmentation.manual_add.set_interpolation` |
 | `vc3d_manual_add_set_line_mode` | `segmentation.manual_add.set_line_mode` |
