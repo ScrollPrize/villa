@@ -12,6 +12,8 @@
 
 #include <filesystem>
 #include <random>
+#include <utility>
+#include <vc_reader/grid.hpp>
 
 namespace fs = std::filesystem;
 
@@ -175,29 +177,44 @@ TEST_CASE("coord and normal follow edits made through the points, in place or re
         const cv::Vec3f surfacePoint(float(c) - surface.center()[0], float(r) - surface.center()[1], 0.f);
         return std::pair{surface.coord(surface.pointer(), surfacePoint), surface.normal(surface.pointer(), surfacePoint)};
     };
+    // The point a surface built now from the current points has there (whatever the
+    // interpolation): coord must not answer from geometry cached before an edit.
+    const auto current = [&](float c, float r) {
+        const auto& p = *std::as_const(surface).rawPointsPtr();
+        const auto grid = vcr::grid::Surface::snapshot(
+            {reinterpret_cast<const float*>(p.ptr()), p.rows, p.cols, p.step1()}, surface.gridOptions());
+        const float xy[2]{c, r};
+        cv::Vec3f point;
+        grid->pointsAt(xy, 1, point.val, nullptr);
+        return point;
+    };
+    const auto follows = [&](float c, float r) { return cv::norm(at(c, r).first - current(c, r)) < 1e-5; };
     CHECK(at(3.5f, 3.5f).first == cv::Vec3f(3.5f, 3.5f, 5.f));
     CHECK(std::abs(at(3.5f, 3.5f).second[2]) == doctest::Approx(1.f));
 
     // Geometry edited in place.
     for (int r = 3; r <= 4; ++r)
         for (int c = 3; c <= 4; ++c) (*surface.rawPointsPtr())(r, c)[2] = 9.f;
-    CHECK(at(3.5f, 3.5f).first[2] == doctest::Approx(9.f));
+    CHECK(at(3.f, 3.f).first[2] == doctest::Approx(9.f));
+    CHECK(at(3.5f, 3.5f).first[2] > 8.f);
+    CHECK(follows(3.5f, 3.5f));
 
     // Valid to invalid: no point, no normal; a patch away is untouched.
     (*surface.rawPointsPtr())(3, 3) = cv::Vec3f(-1.f, -1.f, -1.f);
     CHECK(at(3.5f, 3.5f).first == cv::Vec3f(-1.f, -1.f, -1.f));
     CHECK_FALSE(std::isfinite(at(3.5f, 3.5f).second[0]));
-    CHECK(at(5.5f, 5.5f).first[2] == doctest::Approx(5.f));
+    CHECK(follows(5.5f, 5.5f));
 
     // Invalid to valid, as an undo does.
     (*surface.rawPointsPtr())(3, 3) = cv::Vec3f(3.f, 3.f, 9.f);
-    CHECK(at(3.5f, 3.5f).first[2] == doctest::Approx(9.f));
+    CHECK(at(3.5f, 3.5f).first[2] > 8.f);
+    CHECK(follows(3.5f, 3.5f));
 
     // A piece boundary set later stops interpolation across it.
     surface.setComponents({{0, 4}, {4, 8}});
     CHECK(at(3.5f, 3.5f).first == cv::Vec3f(-1.f, -1.f, -1.f));
     surface.setComponents({});
-    CHECK(at(3.5f, 3.5f).first[2] == doctest::Approx(9.f));
+    CHECK(follows(3.5f, 3.5f));
 
     // Replaced, with a new size.
     cv::Mat_<cv::Vec3f> smaller(4, 4);
