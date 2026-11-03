@@ -9,6 +9,7 @@ set_target_properties(vc_fiber_view PROPERTIES POSITION_INDEPENDENT_CODE ON)
 add_library(vc_core
         src/SheetSeed.cpp
         src/SheetWalk.cpp
+        src/SheetFront.cpp
         src/SheetNormalField.cpp
         src/PolylineObj.cpp
         src/AtomicFile.cpp

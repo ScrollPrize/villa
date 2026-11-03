@@ -118,3 +118,81 @@ TEST_CASE("sheet seed does not report completed growth after a failed query")
         }));
     CHECK_FALSE(rowsCompleted);
 }
+
+TEST_CASE("a growing edge reseeds converging rays and preserves transverse spacing")
+{
+    const SheetNormalFn normal = [](const cv::Vec3f&) { return std::optional<cv::Vec3f>({0, 0, 1}); };
+    for (auto mode : {SheetWalkMode::Projection, SheetWalkMode::Streamline}) {
+        SheetWalk walk;
+        walk.cells = 20;
+        walk.options = {0.5, mode, SheetIntegrator::Midpoint};
+        for (int row = -4; row <= 4; ++row) {
+            walk.origins.emplace_back(100, 100 + row * 2, 100);
+            cv::Vec3f heading(20, -row * 2, 0);
+            walk.steps.push_back(heading * static_cast<float>(2.0 / cv::norm(heading)));
+        }
+        std::vector<cv::Vec3f> independent(walk.origins.size() * walk.cells);
+        walkSheetLines(walk, normal, independent, 1);
+        // This is the old failure: rows pass each other although every ray
+        // keeps moving forward. A normal-sign or turn-angle fix cannot help.
+        CHECK(independent.back()[1] < independent[walk.cells - 1][1]);
+        std::vector<cv::Vec3f> coherent(independent.size());
+        std::size_t completed = 0;
+        walkSheetStrip(walk, normal, coherent, 4, [&] { ++completed; });
+        CHECK(completed == coherent.size());
+        for (std::size_t row = 0; row < walk.origins.size(); ++row)
+            for (int cell = 0; cell < walk.cells; ++cell) {
+                const cv::Vec3f expected(102 + 2 * cell, 92 + 2 * row, 100);
+                CHECK(cv::norm(coherent[row * walk.cells + cell] - expected) < 1e-4);
+            }
+        std::vector<cv::Vec3f> serial(coherent.size());
+        walkSheetStrip(walk, normal, serial, 1);
+        CHECK(coherent == serial);
+    }
+}
+
+TEST_CASE("a contracting curved front redistributes points instead of losing mesh spacing")
+{
+    SheetWalk walk;
+    walk.cells = 8;
+    walk.options = {0.5, SheetWalkMode::Streamline, SheetIntegrator::Midpoint};
+    for (int row = -4; row <= 4; ++row) {
+        const float angle = row * 0.1f;
+        const cv::Vec3f radial(std::cos(angle), std::sin(angle), 0);
+        walk.origins.push_back(cv::Vec3f(100, 100, 100) + radial * 40.f);
+        walk.steps.push_back(-radial * 2.f);
+    }
+    const auto origins = walk.origins;
+    const SheetNormalFn normal = [](const cv::Vec3f&) { return std::optional<cv::Vec3f>({0, 0, 1}); };
+    std::vector<cv::Vec3f> points(walk.origins.size() * walk.cells);
+    walkSheetStrip(walk, normal, points, 4);
+    const double spacing = cv::norm(origins[1] - origins[0]);
+    for (int k = 0; k < walk.cells; ++k)
+        for (std::size_t row = 1; row < origins.size(); ++row) {
+            const double gap = cv::norm(points[row * walk.cells + k] - points[(row - 1) * walk.cells + k]);
+            CHECK(gap > spacing * 0.95);
+            CHECK(gap < spacing * 1.01);
+        }
+    CHECK(walk.origins == origins);
+}
+
+TEST_CASE("front spacing remains fixed when normals disappear after a curve")
+{
+    SheetWalk walk;
+    walk.cells = 8;
+    walk.options.maxStep = 1;
+    walk.origins = {{40, 0, 10}, {40, 0, 12}, {40, 0, 14}};
+    walk.steps = {{0, 4, 0}, {0, 4, 0}, {0, 4, 0}};
+    const SheetNormalFn normal = [](const cv::Vec3f& p) -> std::optional<cv::Vec3f> {
+        if (p[1] >= 8) return std::nullopt;
+        cv::Vec3f n(p[0], p[1], 0);
+        return n / cv::norm(n);
+    };
+    std::vector<cv::Vec3f> points(walk.origins.size() * walk.cells);
+    walkSheetStrip(walk, normal, points, 2);
+    for (std::size_t row = 0; row < walk.origins.size(); ++row)
+        for (int k = 4; k < walk.cells; ++k)
+            CHECK(std::abs(cv::norm(points[row * walk.cells + k] - points[row * walk.cells + k - 1]) - 4) < 1e-5);
+    walk.steps[0] = {0, 0, 0};
+    CHECK_THROWS(walkSheetStrip(walk, normal, points, 2));
+}

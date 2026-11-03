@@ -11,6 +11,7 @@
 #include <map>
 #include <queue>
 #include <set>
+#include <stdexcept>
 #include <tuple>
 #include <unordered_map>
 
@@ -1275,6 +1276,38 @@ void ManualAddTool::walkSheetLines(const SheetWalk& walk, const SheetNormalFn& n
                                    std::vector<cv::Vec3f>& guess, unsigned workers)
 {
     vc::sheet::walkSheetLines(walk, normal, guess, workers);
+}
+
+void ManualAddTool::walkSheetExtension(const SheetWalk& walk,
+                                       const std::vector<SegmentationEditManager::GridKey>& fill,
+                                       const SheetNormalFn& normal,
+                                       std::vector<cv::Vec3f>& guess,
+                                       unsigned workers)
+{
+    if (walk.cells < 1 || walk.steps.size() != walk.origins.size() ||
+        fill.size() != walk.origins.size() * static_cast<std::size_t>(walk.cells) ||
+        guess.size() != fill.size())
+        throw std::invalid_argument("Sheet growth edge and grid dimensions disagree.");
+    std::size_t begin = 0;
+    while (begin < walk.origins.size()) {
+        std::size_t end = begin + 1;
+        while (end < walk.origins.size()) {
+            const auto& previous = fill[(end - 1) * walk.cells];
+            const auto& current = fill[end * walk.cells];
+            if (std::abs(current.row - previous.row) + std::abs(current.col - previous.col) != 1)
+                break;
+            ++end;
+        }
+        SheetWalk strip;
+        strip.cells = walk.cells;
+        strip.options = walk.options;
+        strip.origins.assign(walk.origins.begin() + begin, walk.origins.begin() + end);
+        strip.steps.assign(walk.steps.begin() + begin, walk.steps.begin() + end);
+        std::vector<cv::Vec3f> grown((end - begin) * walk.cells);
+        vc::sheet::walkSheetStrip(strip, normal, grown, workers);
+        std::copy(grown.begin(), grown.end(), guess.begin() + begin * walk.cells);
+        begin = end;
+    }
 }
 
 bool ManualAddTool::applySheetWalk(std::uint64_t extensionId, std::vector<cv::Vec3f> guess, std::string* status)

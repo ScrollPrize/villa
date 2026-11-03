@@ -97,24 +97,24 @@ cv::Mat_<cv::Vec3f> growSheetSeed(const cv::Vec3f& seed,
             advance(SeedStage::RowDirections, 2 * radius);
         }
     }
-    SheetWalk rows;
-    rows.cells = radius;
-    rows.options = options.walk;
-    for (int row = 0; row < size; ++row) {
-        for (int sign : {-1, 1}) {
+    const std::size_t total = static_cast<std::size_t>(size) * radius * 2;
+    beginStage(SeedStage::Rows, total);
+    if (progress) vertexCompleted = [&] { advance(SeedStage::Rows, total); };
+    // Each half is an ordered front; mixing left/right rays would make
+    // alternating neighbors point in opposite directions.
+    for (int sign : {-1, 1}) {
+        SheetWalk rows;
+        rows.cells = radius;
+        rows.options = options.walk;
+        for (int row = 0; row < size; ++row) {
             rows.origins.push_back(points(row, radius));
             rows.steps.push_back(rowDirections[row] * (sign * spacing));
         }
-    }
-    std::vector<cv::Vec3f> grown(rows.origins.size() * radius);
-    beginStage(SeedStage::Rows, grown.size());
-    if (progress) vertexCompleted = [&] { advance(SeedStage::Rows, grown.size()); };
-    walkSheetLines(rows, normal, grown, options.workers, vertexCompleted);
-    for (int row = 0; row < size; ++row) {
-        for (int k = 0; k < radius; ++k) {
-            points(row, radius - k - 1) = grown[(2 * row) * radius + k];
-            points(row, radius + k + 1) = grown[(2 * row + 1) * radius + k];
-        }
+        std::vector<cv::Vec3f> grown(rows.origins.size() * radius);
+        walkSheetStrip(rows, normal, grown, options.workers, vertexCompleted);
+        for (int row = 0; row < size; ++row)
+            for (int k = 0; k < radius; ++k)
+                points(row, radius + sign * (k + 1)) = grown[row * radius + k];
     }
     return points;
 }

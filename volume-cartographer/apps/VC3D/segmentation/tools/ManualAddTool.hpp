@@ -163,8 +163,8 @@ public:
                         std::string* status = nullptr);
     [[nodiscard]] bool extensionActive() const { return _extension.has_value(); }
     [[nodiscard]] std::optional<ExtendSide> extensionSide() const;
-    // Following the sheet. Each line of the pending extension is walked
-    // again from its edge vertex. Projection turns each step into the plane
+    // Following the sheet. The GUI and AutoExtend advance a coherent front,
+    // respacing/reseeding it after each output step. Projection turns each step into the plane
     // across the midpoint normal; optional streamline integration transports
     // its tangent with midpoint, Heun or RK4. sheetWalk() copies
     // what the walk needs, so the volume reads can run off the GUI thread;
@@ -185,6 +185,13 @@ public:
                                const SheetNormalFn& normal,
                                std::vector<cv::Vec3f>& guess,
                                unsigned workers);
+    // Rebuild/respacing fronts only across contiguous grid edges. Gaps and
+    // differing edge endpoints start separate strips; never bridge a hole.
+    static void walkSheetExtension(const SheetWalk& walk,
+                                   const std::vector<SegmentationEditManager::GridKey>& fill,
+                                   const SheetNormalFn& normal,
+                                   std::vector<cv::Vec3f>& guess,
+                                   unsigned workers);
     bool applySheetWalk(std::uint64_t extensionId, std::vector<cv::Vec3f> guess, std::string* status = nullptr);
     [[nodiscard]] bool extensionFollowsSheet() const { return _extension && _extension->guided; }
 

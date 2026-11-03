@@ -13,8 +13,9 @@ namespace segmentation
 
 // Grows a surface past its edges without a user: each round extends every
 // row or column of each chosen side by `cells` vertices with Manual Add's
-// edge extension, walks every new line along the sheet normals (as
-// "Extensions follow the sheet" does in the GUI) and keeps the result.
+// edge extension, advances and respaces its front after each mesh step along
+// the sheet normals (as "Extensions follow the sheet" does in the GUI), and
+// keeps the result.
 // Rounds start from the edge the previous round left. The grid is padded as
 // needed and every channel stays aligned; cells under a mask are marked valid
 // so the new vertices survive a reload. Successful extensions materialize all

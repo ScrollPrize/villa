@@ -43,4 +43,10 @@ void walkSheetLine(const SheetWalk& walk, std::size_t line,
 void walkSheetLines(const SheetWalk& walk, const SheetNormalFn& normal,
                     std::vector<cv::Vec3f>& guess, unsigned workers,
                     const SheetWalkProgress& vertexCompleted);
+// Grow one ordered edge as a front. After each output step, redistribute
+// vertices at the source edge's spacing and choose tangents from the new edge.
+// Origins must be ordered along one side, all growing in the same direction.
+void walkSheetStrip(const SheetWalk& walk, const SheetNormalFn& normal,
+                    std::vector<cv::Vec3f>& guess, unsigned workers,
+                    const SheetWalkProgress& vertexCompleted = {});
 } // namespace vc::sheet

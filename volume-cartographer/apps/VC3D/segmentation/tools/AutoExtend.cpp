@@ -89,7 +89,7 @@ std::optional<AutoExtendResult> autoExtendSurface(QuadSurface& surface,
                 return fail("The extension and its walk disagree in size.");
             }
 
-            // Lines are independent; normals are read on a worker pool.
+            // Advance and redistribute one coherent edge at a time.
             std::vector<cv::Vec3f> guess(fill.size());
             std::atomic<int> missing{0};
             const ManualAddTool::SheetNormalFn counted = [&](const cv::Vec3f& world) {
@@ -100,7 +100,7 @@ std::optional<AutoExtendResult> autoExtendSurface(QuadSurface& surface,
                 return n;
             };
             try {
-                ManualAddTool::walkSheetLines(*walk, counted, guess, static_cast<unsigned>(threads));
+                ManualAddTool::walkSheetExtension(*walk, fill, counted, guess, static_cast<unsigned>(threads));
             } catch (...) {
                 // No guessed vertices have been published. Undo this step's
                 // padding as well before returning the error to the CLI.

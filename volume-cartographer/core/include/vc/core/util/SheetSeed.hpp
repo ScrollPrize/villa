@@ -16,7 +16,7 @@ struct SeedOptions
 };
 
 // Construct a coordinate patch: walk a central column in both directions,
-// then walk rows perpendicular to that column in the local tangent plane.
+// then advance and redistribute a front on each side of that column.
 // The seed remains the center vertex. Normal-query failures propagate; callers
 // decide whether a missing normal permits straight-line continuation.
 cv::Mat_<cv::Vec3f> growSheetSeed(const cv::Vec3f& seed,

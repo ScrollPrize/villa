@@ -22,7 +22,10 @@ CT volume for these modes; they do not require a normal-grid file.
 
 The seed's CT normal defines a tangent plane. The grid's central column follows
 projected volume Z (Y when nearly parallel to the normal), in both directions.
-Rows grow perpendicular to this column in the local tangent plane. The seed
+Rows grow on each side as a coherent front: after every mesh step, vertices
+are redistributed at the starting edge's spacing and directions are recomputed
+from the new edge and its CT normals. Manual Grow extensions use the same
+front update. This avoids independently traced rows crossing or bunching up. The seed
 remains the center vertex. This constructs a new coordinate patch rather than
 running GrowPatch's optimizer. Missing normals or leaving the CT volume fail
 the run without publishing a surface. These are seed-only modes: resume,
@@ -84,13 +87,13 @@ build/bin/VC3D
 
 The geometry regression tests cover fixed seeds, planar/cylindrical geometry,
 all integrators, unsigned normals, invalid parameters, query failures, and
-serial/parallel equivalence. The dialog test covers default values, mode
+serial/parallel equivalence, and spacing on converging/contracting fronts. The dialog test covers default values, mode
 controls, accepted parameters, and cancellation. Existing manual-extension
 tests exercise the extracted shared integration routines.
 
-## Real CT validation
+## Initial seed-mode validation
 
-On Ubuntu arm64, RelWithDebInfo, the seed `(2574.79541015625,
+Before the front-respacing update described below, on Ubuntu arm64, RelWithDebInfo, the seed `(2574.79541015625,
 2697.93798828125, 4293.798828125)` from the existing real
 `build/streamline-bench/input` PHerc0139 crop was grown against:
 
@@ -128,3 +131,6 @@ ctest --test-dir build -R '^(test_sheet_seed|manual_add_extend|test_grow_seg_sto
 
 An already running seed process retains its old code. New launches from VC3D
 pick up the rebuilt tool; progress reporting does not require restarting VC3D.
+
+For the long-growth seam fix and its PHerc0175A before/after evidence, see
+[keeping the growing edge spaced](sheet_growth_fronts.md).

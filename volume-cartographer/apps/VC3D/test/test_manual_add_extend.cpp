@@ -69,6 +69,7 @@ private slots:
     void extensionKeepsItsSpan();
     void undoHistoryFollowsGridPadding();
     void sheetWalkFollowsACurvedSheet();
+    void sheetFrontDoesNotBridgeGridGaps();
     void streamlineConverges_data();
     void streamlineConverges();
     void streamlineReusesEndpointNormals();
@@ -548,7 +549,8 @@ void TestManualAddExtend::autoExtendGrowsAlongTheSheet()
     const auto none = segmentation::autoExtendSurface(
         flat, [](const cv::Vec3f&) { return std::optional<cv::Vec3f>(); }, options, &status);
     QVERIFY2(none, status.c_str());
-    QCOMPARE(none->steps[0].stepsWithoutNormal, 6 * 5);
+    // Each vertex queries the front normal and then the projection midpoint.
+    QCOMPARE(none->steps[0].stepsWithoutNormal, 2 * 6 * 5);
     QVERIFY(distance((*flat.rawPointsPtr())(3, 14), cv::Vec3f(14 * kSpacing, 3 * kSpacing, 100.0f)) < 1e-3f);
 }
 
@@ -589,6 +591,28 @@ void TestManualAddExtend::autoExtendPreservesLazyChannelsWithoutResizing()
     QCOMPARE(savedInk.size(), ink.size());
     QCOMPARE(savedInk.type(), ink.type());
     QCOMPARE(cv::norm(savedInk, ink, cv::NORM_INF), 0.0);
+}
+
+void TestManualAddExtend::sheetFrontDoesNotBridgeGridGaps()
+{
+    for (bool staggered : {false, true}) {
+        ManualAddTool::SheetWalk walk;
+        walk.cells = 3;
+        walk.origins = {{100, 100, 100}, {100, 102, 100}, {120, 200, 100}, {120, 202, 100}};
+        walk.steps = {{2, 0, 0}, {2, 0, 0}, {-2, 0, 0}, {-2, 0, 0}};
+        std::vector<SegmentationEditManager::GridKey> fill;
+        for (int line = 0; line < 4; ++line) {
+            const int row = staggered ? line : (line < 2 ? line : line + 8);
+            const int start = staggered && line >= 2 ? 20 : 10;
+            for (int k = 0; k < walk.cells; ++k) fill.push_back({row, start + k});
+        }
+        std::vector<cv::Vec3f> result(fill.size());
+        ManualAddTool::walkSheetExtension(walk, fill,
+            [](const cv::Vec3f&) { return std::optional<cv::Vec3f>({0, 0, 1}); }, result, 4);
+        for (int line = 0; line < 4; ++line)
+            for (int k = 0; k < walk.cells; ++k)
+                QCOMPARE(result[line * walk.cells + k], walk.origins[line] + walk.steps[line] * float(k + 1));
+    }
 }
 
 void TestManualAddExtend::streamlineConverges_data()
