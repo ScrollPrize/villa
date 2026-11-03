@@ -72,6 +72,7 @@ QJsonObject AgentBridgeServer::handleStateGet(const QJsonValue&)
         result["segmentationGrowthVolumeId"] = QString();
         result["segmentationEditingEnabled"] = false;
         result["manualAddMode"] = false;
+        result["segmentationGrowthMethod"] = QJsonValue::Null;
         result["manualAddLineMode"] = QJsonValue::Null;
         result["manualAddInterpolation"] = QJsonValue::Null;
         result["correctionsPointMode"] = false;
@@ -153,6 +154,7 @@ QJsonObject AgentBridgeServer::handleStateGet(const QJsonValue&)
     // Line and interpolation modes persist when manual-add is inactive.
     if (SegmentationModule* mod = _window->_segmentationModule.get()) {
         result["manualAddMode"] = mod->manualAddMode();
+        result["manualAddFollowingSheet"] = mod->manualAddSheetWalkRunning();
         result["correctionsPointMode"] = mod->correctionPointMode();
         // Explicit save/flush bookkeeping.
         const SegmentationModule::AutosaveStatus save = mod->autosaveStatus();
@@ -163,6 +165,7 @@ QJsonObject AgentBridgeServer::handleStateGet(const QJsonValue&)
         result["autosave"] = autosave;
     } else {
         result["manualAddMode"] = false;
+        result["manualAddFollowingSheet"] = false;
         result["correctionsPointMode"] = false;
         result["autosave"] = QJsonValue::Null;
     }
@@ -180,10 +183,12 @@ QJsonObject AgentBridgeServer::handleStateGet(const QJsonValue&)
         result["axisAlignedSlices"] = QJsonValue::Null;
     }
     if (SegmentationWidget* widget = _window->_segmentationWidget) {
+        result["segmentationGrowthMethod"] = segmentationGrowthMethodToString(widget->growthMethod());
         const ManualAddTool::Config cfg = widget->manualAddConfig();
         result["manualAddLineMode"] = linePreviewModeToString(cfg.linePreviewMode);
         result["manualAddInterpolation"] = interpolationModeToString(cfg.interpolationMode);
     } else {
+        result["segmentationGrowthMethod"] = QJsonValue::Null;
         result["manualAddLineMode"] = QJsonValue::Null;
         result["manualAddInterpolation"] = QJsonValue::Null;
     }

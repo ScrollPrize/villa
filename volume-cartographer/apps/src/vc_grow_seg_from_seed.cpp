@@ -164,6 +164,7 @@ static int run_main(int argc, char *argv[])
 {
     std::filesystem::path vol_path, tgt_dir, params_path, resume_path, correct_path;
     cv::Vec3d origin;
+    bool explicit_seed = false;
     Json params;
     PointCollections corrections;
     std::string segment_name;
@@ -255,6 +256,7 @@ static int run_main(int argc, char *argv[])
                 return EXIT_FAILURE;
             }
             origin = {seed_coords[0], seed_coords[1], seed_coords[2]};
+            explicit_seed = true;
         }
         if (vm.count("resume")) {
             resume_path = vm["resume"].as<std::string>();
@@ -580,7 +582,7 @@ static int run_main(int argc, char *argv[])
             mode = "explicit_seed";
             const double v = volume_value(tracing_volume, origin);
             std::cout << "seed location " << origin << " value is " << v << std::endl;
-        } else if (!use_old_args && origin[0] != 0 && origin[1] != 0 && origin[2] != 0) {
+        } else if (!use_old_args && explicit_seed) {
             mode = "explicit_seed";
             const double v = volume_value(tracing_volume, origin);
             std::cout << "seed location " << origin << " value is " << v << std::endl;

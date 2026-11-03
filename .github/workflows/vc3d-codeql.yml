@@ -137,7 +137,7 @@ jobs:
     runs-on: ubuntu-26.04
     timeout-minutes: 360
     container:
-      image: ghcr.io/scrollprize/vc3d-deps/linux:sha-0c371b1d472c5281b703d65517e980d945da693f
+      image: ghcr.io/scrollprize/villa/volume-cartographer@sha256:1bebf104edbd6c290ddbaf8036c919635259f3722e8eddb31340b240baf1ed68
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}

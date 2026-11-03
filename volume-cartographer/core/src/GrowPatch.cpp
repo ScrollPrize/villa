@@ -1,4 +1,5 @@
 #include <utility>
+#include "vc/tracer/SheetGrowth.hpp"
 #include <opencv2/core.hpp>
 #include <opencv2/imgproc.hpp>
 
@@ -1825,6 +1826,17 @@ QuadSurface *tracer(vcr::Array& volume, float scale, cv::Vec3f origin, const nlo
 {
     if (volume.itemsize() != 1)
         throw std::runtime_error("the tracer reads uint8 volumes");
+    const auto growthMethod = params.value("growth_method", std::string("default"));
+    if (growthMethod != "default") {
+        if (growthMethod != "projection" && growthMethod != "streamline")
+            throw std::invalid_argument("growth_method must be default, projection or streamline");
+        if (resume_surf || scale != 1.0f || allowed_growth_mask ||
+            params.value("growth_scale", 0) != 0 || params.contains("neural_socket") ||
+            params.contains("seed_anchor_xyz") || params.value("cell_reopt_mode", false) ||
+            params.value("inpaint", false) || !corrections.getAllCollections().empty())
+            throw std::invalid_argument("Projection and streamline GrowPatch modes support new level-0 CT seeds only");
+        return growSheetPatch(volume, origin, params, voxelsize, meta_params);
+    }
     // Opt-in only. Existing jobs and unsupported editing/scaling modes retain
     // their old behavior unless an anchor is explicitly requested.
     const bool anchor_requested = params.contains("seed_anchor_xyz");

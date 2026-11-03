@@ -96,17 +96,31 @@ VCR_SHEET_HD inline void contribution(int i,const float* g,const float* center,
     sums[0]+=weight*gx*gx; sums[1]+=weight*gx*gy; sums[2]+=weight*gx*gz;
     sums[3]+=weight*gy*gy; sums[4]+=weight*gy*gz; sums[5]+=weight*gz*gz; sums[6]+=weight;
 }
-template<class T> inline void cpu(const T* image,const float* centers,float* output,std::size_t batch) {
-    check_centers(centers,batch);
+// Filtered gradients depend only on the patch, not the query center. Keep
+// them immutable while evaluating nearby centers (e.g. integration stages).
+struct CpuPatch {
+    std::unique_ptr<float[]> gradients=std::make_unique_for_overwrite<float[]>(6*count);
+    float floor=0;
+    void evaluate(const float* center,float* output) const {
+        std::fill_n(output,4,0.f);
+        if(!center[3]) return;
+        double normal[3]{},gap=0; bool valid=true;
+        for(int pass=0;pass<4 && valid;++pass) {
+            double sums[7]{};
+            for(int i=0;i<count;++i) contribution(i,gradients.get()+(pass ? 3*count : 0),center,normal,floor,pass!=0,sums);
+            valid=principal(sums,normal,gap);
+        }
+        if(valid) { for(int j=0;j<3;++j) output[j]=float(normal[j]); output[3]=float(gap); }
+    }
+};
+
+struct CpuWorkspace {
     Kernels k;
-    auto z=std::make_unique_for_overwrite<float[]>(4*zcount);
-    auto y=std::make_unique_for_overwrite<float[]>(6*ycount);
-    auto g=std::make_unique_for_overwrite<float[]>(6*count);
-    std::vector<float> mags(count);
-    for(std::size_t b=0;b<batch;++b) {
-        std::fill_n(output+b*4,4,0.f);
-        if(!centers[4*b+3]) continue;
-        const T* src=image+b*width*width*width;
+    std::unique_ptr<float[]> z=std::make_unique_for_overwrite<float[]>(4*zcount);
+    std::unique_ptr<float[]> y=std::make_unique_for_overwrite<float[]>(6*ycount);
+    std::vector<float> mags=std::vector<float>(count);
+    template<class T> void prepare(const T* src,CpuPatch& patch) {
+        float* g=patch.gradients.get();
         for(int c=0;c<4;++c) for(int zz=0;zz<sites;++zz) {
             float* dst=z.get()+c*zcount+zz*width*width;
             std::fill_n(dst,width*width,0.f);
@@ -133,14 +147,19 @@ template<class T> inline void cpu(const T* image,const float* centers,float* out
         }
         for(int i=0;i<count;++i) mags[i]=magnitude(g[3*count+i],g[4*count+i],g[5*count+i]);
         std::nth_element(mags.begin(),mags.begin()+count/2,mags.end());
-        float floor=std::max(mags[count/2],1e-8f);
-        double normal[3]{},gap=0; bool valid=true;
-        for(int pass=0;pass<4 && valid;++pass) {
-            double sums[7]{};
-            for(int i=0;i<count;++i) contribution(i,g.get()+(pass ? 3*count : 0),centers+b*4,normal,floor,pass!=0,sums);
-            valid=principal(sums,normal,gap);
-        }
-        if(valid) { for(int j=0;j<3;++j) output[4*b+j]=float(normal[j]); output[4*b+3]=float(gap); }
+        patch.floor=std::max(mags[count/2],1e-8f);
+    }
+};
+
+template<class T> inline void cpu(const T* image,const float* centers,float* output,std::size_t batch) {
+    check_centers(centers,batch);
+    CpuWorkspace workspace;
+    CpuPatch patch;
+    for(std::size_t b=0;b<batch;++b) {
+        std::fill_n(output+b*4,4,0.f);
+        if(!centers[4*b+3]) continue;
+        workspace.prepare(image+b*width*width*width,patch);
+        patch.evaluate(centers+b*4,output+b*4);
     }
 }
 }

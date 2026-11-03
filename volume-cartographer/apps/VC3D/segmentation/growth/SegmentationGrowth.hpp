@@ -22,8 +22,15 @@ class Volume;
 enum class SegmentationGrowthMethod {
     Tracer = 0,
     Corrections = 1,
-    ManualAdd = 4,
+    ManualAdd = 4, // Manual Fill; keep the persisted value.
+    ManualGrow = 5,
 };
+
+inline bool isManualGrowthMethod(SegmentationGrowthMethod method)
+{
+    return method == SegmentationGrowthMethod::ManualAdd ||
+           method == SegmentationGrowthMethod::ManualGrow;
+}
 
 inline QString segmentationGrowthMethodToString(SegmentationGrowthMethod method)
 {
@@ -33,7 +40,9 @@ inline QString segmentationGrowthMethodToString(SegmentationGrowthMethod method)
     case SegmentationGrowthMethod::Corrections:
         return QStringLiteral("Corrections");
     case SegmentationGrowthMethod::ManualAdd:
-        return QStringLiteral("Manual Add");
+        return QStringLiteral("Manual Fill");
+    case SegmentationGrowthMethod::ManualGrow:
+        return QStringLiteral("Manual Grow");
     }
     return QStringLiteral("Unknown");
 }
@@ -45,6 +54,9 @@ inline SegmentationGrowthMethod segmentationGrowthMethodFromInt(int value)
     }
     if (value == static_cast<int>(SegmentationGrowthMethod::ManualAdd)) {
         return SegmentationGrowthMethod::ManualAdd;
+    }
+    if (value == static_cast<int>(SegmentationGrowthMethod::ManualGrow)) {
+        return SegmentationGrowthMethod::ManualGrow;
     }
     return SegmentationGrowthMethod::Tracer;
 }

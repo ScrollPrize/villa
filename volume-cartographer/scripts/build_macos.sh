@@ -4,7 +4,7 @@ set -euo pipefail
 usage() {
   cat <<'USAGE'
 Usage:
-  scripts/build_macos.sh [--install-deps] [--ccache|--sccache] [--build-dir DIR] [--jobs N]
+  scripts/build_macos.sh [--install-deps] [--ccache|--sccache] [--quickbuild] [--build-dir DIR] [--jobs N]
 
 Build VC3D natively on macOS with Homebrew LLVM/Clang.
 
@@ -12,6 +12,8 @@ Options:
   --install-deps   Install missing Homebrew formulae before configuring.
   --ccache         Enable ccache (installed when combined with --install-deps).
   --sccache        Enable sccache (installed when combined with --install-deps).
+  --quickbuild     Use QuickBuild (O1, PCH, no LTO) for compile checks.
+                   Defaults to the preset's RelWithDebInfo for packaging.
   --build-dir DIR  Override the default build directory: build-macos
   --jobs N         Parallel build jobs. Defaults to the host CPU count.
 USAGE
@@ -30,6 +32,7 @@ cd "$script_dir/.."
 install_deps=0
 use_ccache=0
 use_sccache=0
+quickbuild=0
 build_dir="build-macos"
 jobs="$(sysctl -n hw.ncpu 2>/dev/null || echo 8)"
 
@@ -45,6 +48,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --sccache)
       use_sccache=1
+      shift
+      ;;
+    --quickbuild)
+      quickbuild=1
       shift
       ;;
     --build-dir)
@@ -79,6 +86,7 @@ fi
 
 brew_prefix="$(brew --prefix)"
 export HOMEBREW_PREFIX="$brew_prefix"
+deps_started=$SECONDS
 required_formulae=(
   llvm
   # LLVM's Fortran frontend; lives in its own keg (Homebrew's llvm formula
@@ -88,7 +96,13 @@ required_formulae=(
   cmake
   ninja
   pkgconf
-  qt
+  # qtbase includes all linked Qt modules, qmake and macdeployqt. Retain SVG,
+  # image-format plugins and translations without pulling in the entire Qt
+  # suite (WebEngine, Quick3D, Charts, Virtual Keyboard, etc.).
+  qtbase
+  qtsvg
+  qtimageformats
+  qttranslations
   ceres-solver
   eigen
   opencv
@@ -140,6 +154,7 @@ if (( ${#missing[@]} > 0 )); then
     exit 1
   fi
 fi
+echo "macOS build: Homebrew dependency setup: $((SECONDS - deps_started))s"
 
 llvm_bin="$brew_prefix/opt/llvm/bin"
 if [[ ! -x "$llvm_bin/clang++" ]]; then
@@ -160,6 +175,9 @@ if command -v xcrun >/dev/null 2>&1; then
 fi
 
 extra_cmake_args=()
+if (( quickbuild )); then
+  extra_cmake_args+=("-DCMAKE_BUILD_TYPE=QuickBuild" "-DVC_QUICKBUILD_OPT_LEVEL=1")
+fi
 if (( use_ccache )); then
   extra_cmake_args+=("-DVC_USE_CCACHE=ON" "-DVC_USE_SCCACHE=OFF")
   ccache --zero-stats
@@ -205,11 +223,15 @@ else
   exit 1
 fi
 
+configure_started=$SECONDS
 cmake --preset macos-homebrew-llvm \
   -B "$build_dir" \
   "${extra_cmake_args[@]}"
+echo "macOS build: CMake configure: $((SECONDS - configure_started))s"
 
-cmake --build "$build_dir" -j "$jobs"
+build_started=$SECONDS
+ninja -C "$build_dir" -j "$jobs"
+echo "macOS build: Ninja build: $((SECONDS - build_started))s"
 
 if (( use_ccache )); then
   ccache --show-stats

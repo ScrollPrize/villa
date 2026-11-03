@@ -7,6 +7,10 @@ target_link_libraries(vc_fiber_view PUBLIC vc_object_store::vc_geometry)
 set_target_properties(vc_fiber_view PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 add_library(vc_core
+        src/SheetSeed.cpp
+        src/SheetWalk.cpp
+        src/SheetFront.cpp
+        src/SheetNormalField.cpp
         src/PolylineObj.cpp
         src/OutputDirectory.cpp
         src/TexturedMesh.cpp
@@ -213,6 +217,7 @@ endif()
 
 add_library(vc_tracer
     src/GrowPatch.cpp
+    src/SheetGrowth.cpp
     src/GrowSurface.cpp
     src/SurfTrackerData.cpp
     src/NeuralTracerConnection.cpp

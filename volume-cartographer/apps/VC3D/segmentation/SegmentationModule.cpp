@@ -6,8 +6,10 @@
 #include "volume_viewers/CChunkedVolumeViewer.hpp"
 #include "volume_viewers/CVolumeViewerView.hpp"
 #include "CState.hpp"
+#include "OpenedVolumes.hpp"
 #include "tools/SegmentationEditManager.hpp"
 #include "SegmentationWidget.hpp"
+#include "SurfaceGridEdit.hpp"
 #include "tools/SegmentationPushPullTool.hpp"
 #include "tools/SurfaceMaskBrushTool.hpp"
 #include "tools/ThinPlateSpline3d.hpp"
@@ -38,6 +40,7 @@
 #include <tuple>
 #include <limits>
 #include <exception>
+#include <thread>
 #include <set>
 #include <utility>
 #include <vector>
@@ -65,7 +68,8 @@ float averageScale(const cv::Vec2f& scale)
 std::optional<std::pair<int, int>> segmentationSceneToGrid(VolumeViewerBase* viewer,
                                                            const QPointF& scenePos,
                                                            int rows,
-                                                           int cols)
+                                                           int cols,
+                                                           bool clampToGrid = false)
 {
     if (!viewer || rows <= 0 || cols <= 0) {
         return std::nullopt;
@@ -87,10 +91,29 @@ std::optional<std::pair<int, int>> segmentationSceneToGrid(VolumeViewerBase* vie
         row = static_cast<int>(std::lround(surfaceCoords[1]));
     }
 
+    if (clampToGrid) {
+        row = std::clamp(row, 0, rows - 1);
+        col = std::clamp(col, 0, cols - 1);
+    }
     if (row < 0 || row >= rows || col < 0 || col >= cols) {
         return std::nullopt;
     }
     return std::make_pair(row, col);
+}
+
+QString extendSideName(ManualAddTool::ExtendSide side)
+{
+    switch (side) {
+    case ManualAddTool::ExtendSide::Up:
+        return QObject::tr("top");
+    case ManualAddTool::ExtendSide::Down:
+        return QObject::tr("bottom");
+    case ManualAddTool::ExtendSide::Left:
+        return QObject::tr("left");
+    case ManualAddTool::ExtendSide::Right:
+    default:
+        return QObject::tr("right");
+    }
 }
 }
 
@@ -185,6 +208,19 @@ SegmentationModule::SegmentationModule(SegmentationWidget* widget,
     useFalloff(FalloffTool::Drag);
 
     bindWidgetSignals();
+
+    // A repeated extension waits for the save of the one before it.
+    connect(this, &SegmentationModule::autosaveCompleted, this, [this](bool success) {
+        if (!_manualAddContinuation) {
+            return;
+        }
+        if (!success) {
+            _manualAddContinuation.reset();
+            emit statusMessageRequested(tr("The save failed, so the next extension did not start."), kStatusMedium);
+            return;
+        }
+        QTimer::singleShot(0, this, [this]() { runManualAddContinuation(); });
+    });
 
     if (_viewerManager) {
         _viewerManager->setSegmentationModule(this);
@@ -364,6 +400,11 @@ void SegmentationModule::bindWidgetSignals()
     connect(_widget, &SegmentationWidget::growthMethodChanged,
             this, [this](SegmentationGrowthMethod method) {
                 _growthMethod = method;
+                if (_manualAddTool && method == SegmentationGrowthMethod::ManualGrow) {
+                    _manualAddTool->updateHover(-1, -1);
+                }
+                _manualAddSpanDrag = {};
+                refreshOverlay();
             });
     connect(_widget, &SegmentationWidget::pushPullStepChanged,
             this, &SegmentationModule::setPushPullStepMultiplier);
@@ -401,6 +442,10 @@ void SegmentationModule::bindWidgetSignals()
             this, [this]() { finishManualAdd(true); });
     connect(_widget, &SegmentationWidget::manualAddCancelRequested,
             this, [this]() { finishManualAdd(false); });
+    connect(_widget, &SegmentationWidget::manualAddExtendRequested,
+            this, [this](int side, int cells) {
+                extendOrContinueManualAdd(static_cast<ManualAddTool::ExtendSide>(side), cells);
+            });
 }
 
 void SegmentationModule::bindViewerSignals(VolumeViewerBase* viewer)
@@ -511,6 +556,7 @@ void SegmentationModule::setAnnotateMode(bool enabled)
 
 void SegmentationModule::setEditingEnabled(bool enabled)
 {
+    if (_sheetWalkRunning) return;
     if (_editingEnabled == enabled) {
         return;
     }
@@ -608,6 +654,7 @@ void SegmentationModule::setMaskBrushRadius(float radius)
 
 void SegmentationModule::applyEdits()
 {
+    if (_sheetWalkRunning) return;
     if (!_editManager || !_editManager->hasSession()) {
         return;
     }
@@ -636,6 +683,7 @@ void SegmentationModule::applyEdits()
 
 void SegmentationModule::resetEdits()
 {
+    if (_sheetWalkRunning) return;
     if (!_editManager || !_editManager->hasSession()) {
         return;
     }
@@ -787,7 +835,7 @@ void SegmentationModule::refreshOverlay()
         state.displayRadiusSteps = _maskBrushRadius;
     }
 
-    if (_manualAddMode && _manualAddTool) {
+    if (_manualAddMode && _manualAddTool && !_sheetWalkRunning) {
         state.manualAddActive = true;
         state.manualAddTintOpacity = _manualAddTool->config().tintOpacity;
         state.manualAddRevision = _manualAddTool->revision();
@@ -1198,8 +1246,8 @@ void SegmentationModule::handleGrowSurfaceRequested(SegmentationGrowthMethod met
                                                     int steps,
                                                     bool inpaintOnly)
 {
-    if (method == SegmentationGrowthMethod::ManualAdd) {
-        emit statusMessageRequested(tr("Manual Add is interactive; use Shift+E and the Manual Add panel."), kStatusMedium);
+    if (isManualGrowthMethod(method)) {
+        emit statusMessageRequested(tr("Manual Fill and Manual Grow are interactive; use Shift+E or the edge-extension buttons."), kStatusMedium);
         return;
     }
     if (_manualAddMode) {
@@ -1465,11 +1513,9 @@ bool SegmentationModule::beginManualAdd()
     cancelDrag();
     cancelCorrectionDrag();
     setAnnotateMode(false);
-    _previousGrowthMethodBeforeManualAdd = _widget->growthMethod();
-    if (_previousGrowthMethodBeforeManualAdd == SegmentationGrowthMethod::ManualAdd) {
-        _previousGrowthMethodBeforeManualAdd = _widget->lastNonManualGrowthMethod();
+    if (!isManualGrowthMethod(_widget->growthMethod())) {
+        _widget->setGrowthMethod(SegmentationGrowthMethod::ManualAdd);
     }
-    _widget->setGrowthMethod(SegmentationGrowthMethod::ManualAdd);
     if (!_manualAddTool) {
         _manualAddTool = std::make_unique<ManualAddTool>();
     }
@@ -1487,12 +1533,15 @@ bool SegmentationModule::beginManualAdd()
 
 bool SegmentationModule::finishManualAdd(bool apply)
 {
+    if (_sheetWalkRunning) return false;
     if (!_manualAddMode || !_manualAddTool) {
         return false;
     }
 
     if (apply) {
-        if (_manualAddTool->config().interpolationMode == ManualAddTool::InterpolationMode::TracerRestrictedToFill) {
+        const bool extending = _manualAddTool->extensionActive();
+        if (!extending &&
+            _manualAddTool->config().interpolationMode == ManualAddTool::InterpolationMode::TracerRestrictedToFill) {
             if (!_editManager || !_editManager->hasPendingChanges()) {
                 emit statusMessageRequested(tr("Manual Add tracer preview is not ready yet."), kStatusMedium);
                 return false;
@@ -1512,13 +1561,45 @@ bool SegmentationModule::finishManualAdd(bool apply)
             emitPendingChanges();
             refreshOverlay();
         }
+        // Older undo entries follow their vertices into the grown grid, so the
+        // extension and everything before it stay undoable.
+        _undoHistory.padGrid(_manualAddGridPadding.top,
+                             _manualAddGridPadding.bottom,
+                             _manualAddGridPadding.left,
+                             _manualAddGridPadding.right);
+        if (_manualAddGridPadding.any()) {
+            _autosaveFullSurfaceNeeded = true;
+            // The anchors moved with the grown grid.
+            saveCorrections();
+        }
+        _manualAddGridPadding = {};
+        // Tracer fills went through growth, which already dropped the mask.
+        const bool tracerFill = !extending &&
+            _manualAddTool->config().interpolationMode == ManualAddTool::InterpolationMode::TracerRestrictedToFill;
+        if (!tracerFill && _editManager && _editManager->baseSurface()) {
+            std::vector<cv::Point> cells;
+            cells.reserve(_manualAddTool->changedVertices().size());
+            for (const auto& key : _manualAddTool->changedVertices()) {
+                cells.emplace_back(key.col, key.row);
+            }
+            if (segmentation::markMaskCellsValid(*_editManager->baseSurface(), cells)) {
+                _autosaveFullSurfaceNeeded = true;
+                // The validity changed: the edit's draft follows it.
+                publishEditDraft();
+            }
+        }
         if (_editManager && _editManager->hasPendingChanges()) {
             applyEdits();
+        } else if (_autosaveFullSurfaceNeeded) {
+            markAutosaveNeeded(true);
         }
-        emit statusMessageRequested(tr("Manual Add applied and saved."), kStatusMedium);
+        emit statusMessageRequested(extending ? tr("Manual Add extension applied and saved.")
+                                              : tr("Manual Add applied and saved."),
+                                    kStatusMedium);
     } else {
         if (_editManager) {
             _editManager->restorePreviewSnapshot(_manualAddTool->entrySnapshotPoints());
+            undoManualAddGridPadding();
             if (_state && _editManager->previewSurface()) {
                 _state->setSurface("segmentation", _editManager->previewSurface(), false, true);
             }
@@ -1528,14 +1609,12 @@ bool SegmentationModule::finishManualAdd(bool apply)
     }
 
     _manualAddMode = false;
+    _manualAddSpanDrag = {};
     _manualAddHoverThrottle.invalidate();
     _manualAddTool->clear();
     if (_widget) {
+        // Ending a session does not change the selected growth method.
         _widget->setManualAddActive(false);
-        const auto fallback = _previousGrowthMethodBeforeManualAdd == SegmentationGrowthMethod::ManualAdd
-            ? SegmentationGrowthMethod::Tracer
-            : _previousGrowthMethodBeforeManualAdd;
-        _widget->setGrowthMethod(fallback);
     }
     refreshOverlay();
     return true;
@@ -1552,6 +1631,311 @@ bool SegmentationModule::setManualAddModeActive(bool active, bool apply)
 bool SegmentationModule::undoManualAddConstraint()
 {
     return undoManualAddPlaneConstraint();
+}
+
+bool SegmentationModule::resizeSessionGrid(const ManualAddTool::GridPadding& padding, int sign)
+{
+    if (!_editManager || !_editManager->hasSession() || !padding.any()) {
+        return false;
+    }
+    auto base = _editManager->baseSurface();
+    if (!base) {
+        return false;
+    }
+    const int s = sign < 0 ? -1 : 1;
+    if (!segmentation::resizeSurfaceGrid(*base,
+                                         s * padding.top,
+                                         s * padding.bottom,
+                                         s * padding.left,
+                                         s * padding.right)) {
+        return false;
+    }
+    if (padding.top != 0 || padding.left != 0) {
+        applyCorrectionAnchorOffset(static_cast<float>(s * padding.left), static_cast<float>(s * padding.top));
+    }
+    // The cached save copy has the old size; the next save writes it all.
+    _saveSnapshot.reset();
+    _autosaveFullSurfaceNeeded = true;
+    refreshSessionFromSurface(base.get());
+    return true;
+}
+
+void SegmentationModule::undoManualAddGridPadding()
+{
+    if (!_manualAddGridPadding.any()) {
+        return;
+    }
+    const ManualAddTool::GridPadding padding = _manualAddGridPadding;
+    _manualAddGridPadding = {};
+    resizeSessionGrid(padding, -1);
+}
+
+bool SegmentationModule::extendManualAdd(ManualAddTool::ExtendSide side,
+                                         int cells,
+                                         std::optional<ManualAddTool::EdgeSpan> span,
+                                         QString* errorMessage)
+{
+    auto fail = [&](const QString& message, const QString& code) {
+        if (errorMessage) {
+            *errorMessage = code;
+        }
+        emit statusMessageRequested(message, kStatusMedium);
+        return false;
+    };
+    if (_growthInProgress) {
+        return fail(tr("Wait for surface growth to finish before extending an edge."),
+                    QStringLiteral("growth_in_progress"));
+    }
+    if (!_manualAddMode && !beginManualAdd()) {
+        return fail(tr("Manual Add could not start."), QStringLiteral("manual_add_unavailable"));
+    }
+    if (!_manualAddTool || !_editManager || !_editManager->hasSession()) {
+        return fail(tr("Open a segmentation editing session before extending an edge."),
+                    QStringLiteral("no_session"));
+    }
+    if (_manualAddTool->extensionActive() || _manualAddTool->initialFillCommitted() ||
+        _editManager->hasPendingChanges()) {
+        return fail(tr("Apply or clear the pending Manual Add geometry before extending an edge."),
+                    QStringLiteral("pending_geometry"));
+    }
+
+    const ManualAddTool::Config config = _widget ? _widget->manualAddConfig() : _manualAddTool->config();
+    cells = std::clamp(cells, 1, config.maxPreviewSpan);
+    const ManualAddTool::GridPadding padding =
+        ManualAddTool::paddingForExtension(_manualAddTool->entrySnapshotPoints(), side, cells, span);
+    if (padding.any()) {
+        if (!resizeSessionGrid(padding, 1)) {
+            return fail(tr("Manual Add could not make room past that edge."), QStringLiteral("resize_failed"));
+        }
+        _manualAddGridPadding = padding;
+        _manualAddTool->begin(_editManager->previewPoints(), config);
+    }
+
+    std::string status;
+    if (!_manualAddTool->beginExtension(side, cells, span, &status)) {
+        undoManualAddGridPadding();
+        _manualAddTool->begin(_editManager->previewPoints(), config);
+        refreshOverlay();
+        return fail(QString::fromStdString(status), QStringLiteral("no_edge"));
+    }
+
+    if (config.followSheet) {
+        if (followSheetForManualAdd()) {
+            return true;
+        }
+        clearManualAddPending();
+        return fail(tr("Could not start sheet following. No extension was added."),
+                    QStringLiteral("sheet_walk_unavailable"));
+    }
+
+    std::optional<cv::Rect> bounds;
+    if (!_editManager->setPreviewPointsOnly(_manualAddTool->previewPoints(),
+                                            _manualAddTool->changedVertices(),
+                                            true,
+                                            &bounds)) {
+        clearManualAddPending();
+        return fail(tr("Manual Add preview update failed."), QStringLiteral("preview_failed"));
+    }
+    if (_state && _editManager->previewSurface()) {
+        _state->setSurface("segmentation", _editManager->previewSurface(), false, true);
+    }
+    emitPendingChanges();
+    refreshOverlay();
+    emit statusMessageRequested(QString::fromStdString(status), kStatusMedium);
+    return true;
+}
+
+void SegmentationModule::setSheetWalkRunning(bool running)
+{
+    _sheetWalkRunning = running;
+    if (_widget) {
+        _widget->setManualAddBusy(running);
+    }
+    // Reuse the surface-selection lock and growth guards used by the tracer.
+    setGrowthInProgress(running);
+}
+
+void SegmentationModule::failSheetWalk(const QString& message)
+{
+    // Drop the private straight guess before unlocking/refreshing the UI.
+    _sheetWalkRunning = false;
+    clearManualAddPending();
+    setSheetWalkRunning(false);
+    emit statusMessageRequested(message, kStatusLong);
+}
+
+std::shared_ptr<Volume> SegmentationModule::manualGrowthVolume() const
+{
+    if (!_state) return nullptr;
+    const auto id = _state->segmentationGrowthVolumeId();
+    if (id.empty()) return _state->currentVolume();
+    const auto package = _state->vpkg();
+    // Never silently compute from a different volume than the selected source.
+    if (!package || !package->hasVolume(id)) return nullptr;
+    return package->volume(id);
+}
+
+bool SegmentationModule::followSheetForManualAdd()
+{
+    if (!_manualAddMode || !_manualAddTool || _sheetWalkRunning) {
+        return false;
+    }
+    const auto walk = _manualAddTool->sheetWalk();
+    std::shared_ptr<Volume> volume = manualGrowthVolume();
+    if (!walk || !volume) {
+        return false;
+    }
+    if (!_sheetNormals || _sheetNormalsVolume != volume) {
+        // Working level 0, whose indices are the surface's world coordinates; the
+        // array stays open while the field holds it.
+        auto opened = _state->openedVolumes()->level(*volume, 0).array;
+        _sheetNormals = std::make_shared<SheetNormalField>(std::shared_ptr<vcr::Array>(opened, opened->array.get()));
+        _sheetNormalsVolume = volume;
+    }
+    setSheetWalkRunning(true);
+    emit statusMessageRequested(tr("Computing extension — editing is locked…"), 0);
+    auto normals = _sheetNormals;
+    const ManualAddTool::SheetWalk job = *walk;
+    const auto surface = _editManager ? _editManager->baseSurface() : nullptr;
+    const unsigned requestedWorkers = static_cast<unsigned>(_widget ? _widget->manualGrowWorkers() : 8);
+    const unsigned workers = std::max(1u, std::min(requestedWorkers, std::thread::hardware_concurrency()));
+    const auto fill = _manualAddTool->fillVertices();
+    QtConcurrent::run([job, fill, normals, workers]() {
+        std::vector<cv::Vec3f> guess(job.origins.size() * static_cast<std::size_t>(job.cells));
+        const ManualAddTool::SheetNormalFn normal = [normals, job](const cv::Vec3f& world) {
+            return normals->normalAt(world, job.options.continuousNormals());
+        };
+        // Advance one coherent edge at a time; integrate each step in parallel.
+        ManualAddTool::walkSheetExtension(job, fill, normal, guess, workers);
+        return guess;
+    }).then(this, [this, id = job.extensionId, volume, surface](std::vector<cv::Vec3f> guess) {
+        if (!_manualAddMode || !_manualAddTool || !_editManager) {
+            setSheetWalkRunning(false);
+            return;
+        }
+        if (manualGrowthVolume() != volume || _editManager->baseSurface() != surface) {
+            failSheetWalk(tr("The surface or volume changed. The unfinished extension was discarded."));
+            return;
+        }
+        std::string status;
+        if (!_manualAddTool->applySheetWalk(id, std::move(guess), &status)) {
+            failSheetWalk(QString::fromStdString(status));
+            return;
+        }
+        std::optional<cv::Rect> bounds;
+        if (!_editManager->setPreviewPointsOnly(_manualAddTool->previewPoints(),
+                                                _manualAddTool->changedVertices(),
+                                                true,
+                                                &bounds)) {
+            failSheetWalk(tr("Manual Add preview update failed. No extension was added."));
+            return;
+        }
+        if (_state && _editManager->previewSurface()) {
+            _state->setSurface("segmentation", _editManager->previewSurface(), false, true);
+        }
+        emitPendingChanges();
+        // Only now may the completed surface and its editable overlay appear.
+        setSheetWalkRunning(false);
+        refreshOverlay();
+        emit statusMessageRequested(tr("The extension now follows the sheet. Shift+click where it still misses."),
+                                    kStatusMedium);
+    }).onFailed(this, [this]() {
+        failSheetWalk(tr("Sheet following failed. No extension was added; please retry."));
+    });
+    return true;
+}
+
+bool SegmentationModule::extendOrContinueManualAdd(ManualAddTool::ExtendSide side,
+                                                   int cells,
+                                                   QString* errorMessage)
+{
+    if (_sheetWalkRunning) {
+        if (errorMessage) *errorMessage = QStringLiteral("sheet_walk_running");
+        return false;
+    }
+    if (!_manualAddMode || !_manualAddTool || _manualAddTool->extensionSide() != side) {
+        return extendManualAdd(side, cells, std::nullopt, errorMessage);
+    }
+    std::optional<ManualAddTool::EdgeSpan> span = _manualAddTool->extensionSpan();
+    if (span) {
+        // The span counts lines along the edge; rows or columns added before
+        // the first one move it.
+        const bool linesAreRows = side == ManualAddTool::ExtendSide::Left || side == ManualAddTool::ExtendSide::Right;
+        const int shift = linesAreRows ? _manualAddGridPadding.top : _manualAddGridPadding.left;
+        span->first += shift;
+        span->last += shift;
+    }
+    if (!finishManualAdd(true)) {
+        if (errorMessage) {
+            *errorMessage = QStringLiteral("apply_failed");
+        }
+        return false;
+    }
+    _manualAddContinuation = ManualAddContinuation{side, cells, span};
+    runManualAddContinuation();
+    return true;
+}
+
+void SegmentationModule::runManualAddContinuation()
+{
+    if (!_manualAddContinuation) {
+        return;
+    }
+    if (_autosaveState.saveInProgress() || _autosaveState.pending()) {
+        // autosaveCompleted brings us back here.
+        emit statusMessageRequested(tr("Extension applied; the next one starts when the save finishes."),
+                                    kStatusShort);
+        return;
+    }
+    const ManualAddContinuation next = *_manualAddContinuation;
+    _manualAddContinuation.reset();
+    extendManualAdd(next.side, next.cells, next.span);
+}
+
+bool SegmentationModule::addManualAddConstraintAtWorld(const cv::Vec3f& world, float radius, QString* errorMessage)
+{
+    auto fail = [&](const std::string& message, const QString& code) {
+        if (errorMessage) {
+            *errorMessage = code;
+        }
+        emit statusMessageRequested(QString::fromStdString(message), kStatusMedium);
+        return false;
+    };
+    if (_sheetWalkRunning) {
+        return fail("Wait for the extension to finish.", QStringLiteral("sheet_walk_running"));
+    }
+    if (!_manualAddMode || !_manualAddTool || !_editManager) {
+        return fail("Manual Add is not active.", QStringLiteral("manual_add_session"));
+    }
+    if (radius <= 0.0f) {
+        radius = static_cast<float>(_manualAddTool->config().planeConstraintRadius);
+    }
+    const auto& preview = _manualAddTool->previewPoints();
+    double bestDistSq = static_cast<double>(radius) * static_cast<double>(radius);
+    std::optional<SegmentationEditManager::GridKey> best;
+    for (const auto& key : _manualAddTool->fillVertices()) {
+        if (key.row < 0 || key.row >= preview.rows || key.col < 0 || key.col >= preview.cols) {
+            continue;
+        }
+        const cv::Vec3f delta = preview(key.row, key.col) - world;
+        const double distSq = static_cast<double>(delta.dot(delta));
+        if (distSq <= bestDistSq) {
+            bestDistSq = distSq;
+            best = key;
+        }
+    }
+    if (!best) {
+        return fail("No pending Manual Add vertex lies within the radius of that point.",
+                    QStringLiteral("no_vertex_in_radius"));
+    }
+    std::string status;
+    if (!_manualAddTool->addOrReplacePlaneConstraint(best->row, best->col, world, &status)) {
+        return fail(status, QStringLiteral("constraint_rejected"));
+    }
+    if (!recomputeManualAdd()) {
+        return fail("Manual Add could not fit the constraint.", QStringLiteral("fit_failed"));
+    }
+    return true;
 }
 
 bool SegmentationModule::setCorrectionPointMode(bool active, QString* errorMessage)
@@ -1585,10 +1969,12 @@ bool SegmentationModule::setCorrectionPointMode(bool active, QString* errorMessa
 
 void SegmentationModule::resetManualAddState(bool restorePreview)
 {
+    _manualAddSpanDrag = {};
     _pendingManualAddTracerMask.release();
 
     if (_manualAddMode && _manualAddTool && restorePreview && _editManager) {
         _editManager->restorePreviewSnapshot(_manualAddTool->entrySnapshotPoints());
+        undoManualAddGridPadding();
         if (_state && _editManager->previewSurface()) {
             _state->setSurface("segmentation", _editManager->previewSurface(), false, true);
         }
@@ -1598,19 +1984,16 @@ void SegmentationModule::resetManualAddState(bool restorePreview)
     if (_manualAddTool) {
         _manualAddTool->clear();
     }
+    // Without a restore the padded rows stay; they hold only invalid points.
+    _manualAddGridPadding = {};
 
     const bool wasManualAddMode = _manualAddMode;
     _manualAddMode = false;
     _manualAddHoverThrottle.invalidate();
 
     if (_widget) {
+        // Ending a session does not change the selected growth method.
         _widget->setManualAddActive(false);
-        if (_widget->growthMethod() == SegmentationGrowthMethod::ManualAdd) {
-            const auto fallback = _previousGrowthMethodBeforeManualAdd == SegmentationGrowthMethod::ManualAdd
-                ? SegmentationGrowthMethod::Tracer
-                : _previousGrowthMethodBeforeManualAdd;
-            _widget->setGrowthMethod(fallback);
-        }
     }
 
     if (wasManualAddMode) {
@@ -1620,6 +2003,7 @@ void SegmentationModule::resetManualAddState(bool restorePreview)
 
 bool SegmentationModule::recomputeManualAdd()
 {
+    if (_sheetWalkRunning) return false;
     if (!_manualAddMode || !_manualAddTool || !_editManager) {
         return false;
     }
@@ -1629,7 +2013,8 @@ bool SegmentationModule::recomputeManualAdd()
         return false;
     }
 
-    if (_manualAddTool->config().interpolationMode == ManualAddTool::InterpolationMode::TracerRestrictedToFill) {
+    if (!_manualAddTool->extensionActive() &&
+        _manualAddTool->config().interpolationMode == ManualAddTool::InterpolationMode::TracerRestrictedToFill) {
         if (_growthInProgress) {
             emit statusMessageRequested(tr("Surface growth already in progress"), kStatusMedium);
             return false;
@@ -1679,6 +2064,7 @@ bool SegmentationModule::recomputeManualAdd()
 
 bool SegmentationModule::clearManualAddPending()
 {
+    if (_sheetWalkRunning) return false;
     if (!_manualAddMode || !_manualAddTool || !_editManager) {
         return false;
     }
@@ -1686,6 +2072,11 @@ bool SegmentationModule::clearManualAddPending()
         return false;
     }
     _editManager->restorePreviewSnapshot(_manualAddTool->entrySnapshotPoints());
+    if (_manualAddGridPadding.any()) {
+        undoManualAddGridPadding();
+        _manualAddTool->begin(_editManager->previewPoints(),
+                              _widget ? _widget->manualAddConfig() : _manualAddTool->config());
+    }
     if (_state && _editManager->previewSurface()) {
         _state->setSurface("segmentation", _editManager->previewSurface(), false, true);
     }
@@ -1700,6 +2091,7 @@ bool SegmentationModule::clearManualAddPending()
 
 bool SegmentationModule::undoManualAddPlaneConstraint()
 {
+    if (_sheetWalkRunning) return false;
     if (!_manualAddMode || !_manualAddTool || !_editManager) {
         return false;
     }
@@ -1736,7 +2128,21 @@ bool SegmentationModule::handleManualAddMousePress(VolumeViewerBase* viewer,
     if (!_manualAddMode || !_manualAddTool || !viewer) {
         return false;
     }
+    if (_growthMethod == SegmentationGrowthMethod::ManualGrow &&
+        viewer->surfName() == "segmentation" && button == Qt::LeftButton && modifiers == Qt::ShiftModifier) {
+        // Shift+drag along an edge picks the stretch to extend.
+        const auto& entry = _manualAddTool->entrySnapshotPoints();
+        if (const auto grid = segmentationSceneToGrid(viewer, scenePos, entry.rows, entry.cols, true)) {
+            _manualAddSpanDrag.active = true;
+            _manualAddSpanDrag.viewer = viewer;
+            _manualAddSpanDrag.from = cv::Point(grid->second, grid->first);
+            _manualAddSpanDrag.to = _manualAddSpanDrag.from;
+            emit statusMessageRequested(tr("Drag along the edge to extend, then release."), kStatusShort);
+        }
+        return true;
+    }
     if (viewer->surfName() == "segmentation" && button == Qt::LeftButton && modifiers == Qt::NoModifier) {
+        if (_growthMethod == SegmentationGrowthMethod::ManualGrow) return true;
         const auto grid = segmentationSceneToGrid(viewer,
                                                   scenePos,
                                                   _manualAddTool->entrySnapshotPoints().rows,
@@ -1764,26 +2170,9 @@ bool SegmentationModule::handleManualAddMousePress(VolumeViewerBase* viewer,
             return recomputeManualAdd();
         }
 
-        const auto& preview = _manualAddTool->previewPoints();
-        const cv::Vec2f clickPlane = viewer->sceneToSurfaceCoords(scenePos);
-        const double radiusSq = _manualAddTool->config().planeConstraintRadius *
-                                _manualAddTool->config().planeConstraintRadius;
-        double bestDistSq = radiusSq;
-        std::optional<SegmentationEditManager::GridKey> best;
-        for (const auto& key : _manualAddTool->fillVertices()) {
-            if (key.row < 0 || key.row >= preview.rows || key.col < 0 || key.col >= preview.cols) {
-                continue;
-            }
-            const cv::Vec3f projected = planeSurf->project(preview(key.row, key.col), 1.0f, 1.0f);
-            const double dx = static_cast<double>(projected[0]) - clickPlane[0];
-            const double dy = static_cast<double>(projected[1]) - clickPlane[1];
-            const double distSq = dx * dx + dy * dy;
-            if (distSq <= bestDistSq) {
-                bestDistSq = distSq;
-                best = key;
-            }
-        }
-        std::string status;
+        const auto best = _manualAddTool->pickPlaneConstraintVertex(
+            *planeSurf, viewer->sceneToSurfaceCoords(scenePos), _manualAddTool->config().planeConstraintRadius);
+        std::string status = "No Manual Add vertex within the plane constraint radius of the click.";
         if (!best || !_manualAddTool->addOrReplacePlaneConstraint(best->row, best->col, worldPos, &status)) {
             emit statusMessageRequested(QString::fromStdString(status), kStatusMedium);
             return true;
@@ -1798,10 +2187,30 @@ bool SegmentationModule::handleManualAddMouseMove(VolumeViewerBase* viewer,
                                                   Qt::MouseButtons buttons,
                                                   const QPointF& scenePos)
 {
+    if (_manualAddMode && _manualAddTool && _manualAddSpanDrag.active && viewer == _manualAddSpanDrag.viewer) {
+        const auto& entry = _manualAddTool->entrySnapshotPoints();
+        if (const auto grid = segmentationSceneToGrid(viewer, scenePos, entry.rows, entry.cols, true)) {
+            const cv::Point to(grid->second, grid->first);
+            if (to != _manualAddSpanDrag.to) {
+                _manualAddSpanDrag.to = to;
+                if (const auto pick = ManualAddTool::edgeFromDrag(entry, _manualAddSpanDrag.from, to)) {
+                    const bool rows = pick->side == ManualAddTool::ExtendSide::Left ||
+                                      pick->side == ManualAddTool::ExtendSide::Right;
+                    emit statusMessageRequested(tr("Release to extend the %1 edge along %2 %3 to %4.")
+                                                    .arg(extendSideName(pick->side),
+                                                         rows ? tr("rows") : tr("columns"))
+                                                    .arg(pick->span.first)
+                                                    .arg(pick->span.last),
+                                                kStatusShort);
+                }
+            }
+        }
+        return true;
+    }
     if (!_manualAddMode || !_manualAddTool || !viewer || buttons != Qt::NoButton) {
         return false;
     }
-    if (viewer->surfName() != "segmentation") {
+    if (_growthMethod == SegmentationGrowthMethod::ManualGrow || viewer->surfName() != "segmentation") {
         return true;
     }
     const auto grid = segmentationSceneToGrid(viewer,
@@ -1828,6 +2237,27 @@ bool SegmentationModule::handleManualAddMouseMove(VolumeViewerBase* viewer,
     if (changed) {
         refreshOverlay();
     }
+    return true;
+}
+
+bool SegmentationModule::handleManualAddMouseRelease(VolumeViewerBase* viewer, Qt::MouseButton button)
+{
+    if (!_manualAddSpanDrag.active || button != Qt::LeftButton || viewer != _manualAddSpanDrag.viewer) {
+        return false;
+    }
+    const cv::Point from = _manualAddSpanDrag.from;
+    const cv::Point to = _manualAddSpanDrag.to;
+    _manualAddSpanDrag = {};
+    if (!_manualAddMode || !_manualAddTool) {
+        return true;
+    }
+    const auto pick = ManualAddTool::edgeFromDrag(_manualAddTool->entrySnapshotPoints(), from, to);
+    if (!pick) {
+        emit statusMessageRequested(tr("Drag along at least two vertices of an edge to extend that stretch."),
+                                    kStatusMedium);
+        return true;
+    }
+    extendManualAdd(pick->side, _widget ? _widget->manualAddExtendCells() : 16, pick->span);
     return true;
 }
 
@@ -2251,6 +2681,12 @@ void SegmentationModule::performAutosave()
     if (snapshot && (snapshot->id != surfacePtr->id ||
                      snapshot->rawPointsPtr()->size() != surfacePtr->rawPointsPtr()->size())) {
         snapshot.reset();
+    }
+    if (_autosaveFullSurfaceNeeded) {
+        // Vertex updates address the grid as it was when they were queued and
+        // carry no channel edits (the Manual Add mask), so write the whole surface.
+        vertexUpdates.clear();
+        _autosaveFullSurfaceNeeded = false;
     }
     std::vector<std::string> channels;
     cv::Rect rect;

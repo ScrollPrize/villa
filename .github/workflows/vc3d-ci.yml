@@ -25,7 +25,7 @@ concurrency:
 jobs:
   changes:
     name: Detect changes
-    runs-on: ubuntu-24.04
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 15
     outputs:
       vc: ${{ steps.filter.outputs.vc }}
@@ -135,7 +135,7 @@ jobs:
     name: Skip (no volume-cartographer changes)
     needs: changes
     if: needs.changes.outputs.vc != 'true'
-    runs-on: ubuntu-24.04
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 15
     steps:
       - run: echo "No volume-cartographer changes — skipping build."
@@ -144,17 +144,18 @@ jobs:
     name: Linux base tests (Clang QuickBuild)
     needs: changes
     if: needs.changes.outputs.test_core == 'true'
-    runs-on: ubuntu-24.04
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 20
+    # Published by vc3d-publish-ghcr.yml; deps recipe hash: 675836fc3d478d17.
     container:
-      image: ghcr.io/scrollprize/vc3d-deps/linux:sha-0c371b1d472c5281b703d65517e980d945da693f
+      image: ghcr.io/scrollprize/villa/volume-cartographer@sha256:1bebf104edbd6c290ddbaf8036c919635259f3722e8eddb31340b240baf1ed68
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
     env:
       SCCACHE_GHA_ENABLED: 'true'
       SCCACHE_IGNORE_SERVER_IO_ERROR: '1'
-      SCCACHE_C_CUSTOM_CACHE_BUSTER: vc3d-linux-ubuntu-26.04-deps-0c371b1d-clang-quickbuild-o0
+      SCCACHE_C_CUSTOM_CACHE_BUSTER: vc3d-linux-ubuntu-26.04-deps-675836fc3d478d17-clang-quickbuild-o0
     steps:
       - name: Checkout Villa
         id: checkout
@@ -179,6 +180,8 @@ jobs:
         env:
           AGENTS_ALLOW_INSTALL: '1'
         run: bash volume-cartographer/scripts/install_build_deps.sh minimal-build
+      # Fibers 3D tests need a real X server and software OpenGL. The pinned
+      # builder already contains the database headers, but not these runtimes.
       - name: Install headless OpenGL runtime
         run: |
           apt-get update
@@ -213,17 +216,17 @@ jobs:
     name: Linux Lasagna/fiber/GUI tests (Clang QuickBuild)
     needs: changes
     if: needs.changes.outputs.test_specialized == 'true'
-    runs-on: ubuntu-24.04
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 20
     container:
-      image: ghcr.io/scrollprize/vc3d-deps/linux:sha-0c371b1d472c5281b703d65517e980d945da693f
+      image: ghcr.io/scrollprize/villa/volume-cartographer@sha256:1bebf104edbd6c290ddbaf8036c919635259f3722e8eddb31340b240baf1ed68
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
     env:
       SCCACHE_GHA_ENABLED: 'true'
       SCCACHE_IGNORE_SERVER_IO_ERROR: '1'
-      SCCACHE_C_CUSTOM_CACHE_BUSTER: vc3d-linux-ubuntu-26.04-deps-0c371b1d-clang-quickbuild-o0
+      SCCACHE_C_CUSTOM_CACHE_BUSTER: vc3d-linux-ubuntu-26.04-deps-675836fc3d478d17-clang-quickbuild-o0
     steps:
       - name: Checkout Villa
         id: checkout
@@ -272,17 +275,17 @@ jobs:
     name: Linux VC3D compile and smoke (Clang QuickBuild)
     needs: changes
     if: needs.changes.outputs.vc3d == 'true'
-    runs-on: ubuntu-24.04
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 20
     container:
-      image: ghcr.io/scrollprize/vc3d-deps/linux:sha-0c371b1d472c5281b703d65517e980d945da693f
+      image: ghcr.io/scrollprize/villa/volume-cartographer@sha256:1bebf104edbd6c290ddbaf8036c919635259f3722e8eddb31340b240baf1ed68
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
     env:
       SCCACHE_GHA_ENABLED: 'true'
       SCCACHE_IGNORE_SERVER_IO_ERROR: '1'
-      SCCACHE_C_CUSTOM_CACHE_BUSTER: vc3d-linux-ubuntu-26.04-deps-0c371b1d-clang-quickbuild-o0
+      SCCACHE_C_CUSTOM_CACHE_BUSTER: vc3d-linux-ubuntu-26.04-deps-675836fc3d478d17-clang-quickbuild-o0
     steps:
       - name: Checkout Villa
         id: checkout
@@ -337,17 +340,17 @@ jobs:
     name: Linux CLI compile coverage (Clang QuickBuild)
     needs: changes
     if: needs.changes.outputs.cli == 'true'
-    runs-on: ubuntu-24.04
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 20
     container:
-      image: ghcr.io/scrollprize/vc3d-deps/linux:sha-0c371b1d472c5281b703d65517e980d945da693f
+      image: ghcr.io/scrollprize/villa/volume-cartographer@sha256:1bebf104edbd6c290ddbaf8036c919635259f3722e8eddb31340b240baf1ed68
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
     env:
       SCCACHE_GHA_ENABLED: 'true'
       SCCACHE_IGNORE_SERVER_IO_ERROR: '1'
-      SCCACHE_C_CUSTOM_CACHE_BUSTER: vc3d-linux-ubuntu-26.04-deps-0c371b1d-clang-quickbuild-o0
+      SCCACHE_C_CUSTOM_CACHE_BUSTER: vc3d-linux-ubuntu-26.04-deps-675836fc3d478d17-clang-quickbuild-o0
     steps:
       - name: Checkout Villa
         id: checkout
@@ -398,17 +401,17 @@ jobs:
     name: Linux Flatboi/PaStiX compile coverage (Clang QuickBuild)
     needs: changes
     if: needs.changes.outputs.flatboi == 'true'
-    runs-on: ubuntu-24.04
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 20
     container:
-      image: ghcr.io/scrollprize/vc3d-deps/linux:sha-0c371b1d472c5281b703d65517e980d945da693f
+      image: ghcr.io/scrollprize/villa/volume-cartographer@sha256:1bebf104edbd6c290ddbaf8036c919635259f3722e8eddb31340b240baf1ed68
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
     env:
       SCCACHE_GHA_ENABLED: 'true'
       SCCACHE_IGNORE_SERVER_IO_ERROR: '1'
-      SCCACHE_C_CUSTOM_CACHE_BUSTER: vc3d-linux-ubuntu-26.04-deps-0c371b1d-clang-quickbuild-o0
+      SCCACHE_C_CUSTOM_CACHE_BUSTER: vc3d-linux-ubuntu-26.04-deps-675836fc3d478d17-clang-quickbuild-o0
     steps:
       - name: Checkout Villa
         id: checkout
@@ -456,7 +459,7 @@ jobs:
     name: MCP unit tests
     needs: changes
     if: needs.changes.outputs.mcp == 'true'
-    runs-on: ubuntu-24.04
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 15
     steps:
       - name: Checkout Villa
@@ -490,13 +493,13 @@ jobs:
           PYTHONWARNINGS: error::ResourceWarning
         run: python -m unittest discover -p 'test*.py'
 
-  # macOS compile is a hard PR gate (parity with the Ubuntu Release cells).
-  # Full packaging and packaged-app smoke checks run after merge and on releases.
+  # macOS QuickBuild compile is a hard PR gate. Optimized builds, packaging,
+  # and packaged-app smoke checks run after merge and on releases.
   macos-build:
     name: macOS compile (${{ matrix.os }}, Homebrew LLVM)
     needs: changes
-    # The packaging workflow builds and seeds this same toolchain on main.
     # Keep the required compile gate on PRs without rebuilding it after merge.
+    # Compiler flags distinguish QuickBuild cache entries from packaging builds.
     if: needs.changes.outputs.vc == 'true' && github.event_name == 'pull_request'
     runs-on: ${{ matrix.os }}
     timeout-minutes: 90
@@ -511,7 +514,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-15]
+        os: [blacksmith-6vcpu-macos-15]
     steps:
       - name: Checkout Villa
         id: checkout
@@ -538,8 +541,8 @@ jobs:
         with:
           version: v0.15.0
 
-      - name: Install Homebrew dependencies + build
-        run: volume-cartographer/scripts/build_macos.sh --install-deps --sccache
+      - name: Install Homebrew dependencies + QuickBuild
+        run: volume-cartographer/scripts/build_macos.sh --install-deps --sccache --quickbuild
 
       - uses: actions/setup-python@v5
         with:
@@ -555,7 +558,7 @@ jobs:
     name: CI
     needs: [changes, skip, test-core, test-specialized, vc3d-compile-smoke, cli-compile, flatboi-compile, mcp-test, macos-build]
     if: always()
-    runs-on: ubuntu-24.04
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 15
     steps:
       - name: Aggregate required-check result

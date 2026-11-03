@@ -109,6 +109,7 @@ bool SegmentationModule::beginEditingSession(std::shared_ptr<QuadSurface> surfac
 
 void SegmentationModule::endEditingSession()
 {
+    _manualAddContinuation.reset();
     stopAllPushPull();
     clearUndoStack();
     cancelDrag();
@@ -218,6 +219,7 @@ void SegmentationModule::discardLastUndoSnapshot()
 
 bool SegmentationModule::restoreUndoSnapshot()
 {
+    if (_sheetWalkRunning) return false;
     if (_suppressUndoCapture) {
         return false;
     }
