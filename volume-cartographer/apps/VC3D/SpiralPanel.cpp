@@ -375,6 +375,12 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
     addPathRow(outputForm, "output_directory", tr("Output directory"), true);
     _zBegin = new QSpinBox(outputContents); _zBegin->setRange(0, 1000000); _zBegin->setValue(4000);
     _zEnd = new QSpinBox(outputContents); _zEnd->setRange(1, 1000000); _zEnd->setValue(17000);
+    // A fit setting (fit_volume_level): the fit volume's pyramid level the
+    // fit works in, so a fit voxel is 2^level of the volume's voxels.
+    _fitVolumeLevel = new QSpinBox(outputContents);
+    _fitVolumeLevel->setObjectName(QStringLiteral("spiralFitVolumeLevel"));
+    _fitVolumeLevel->setRange(0, 16);
+    _fitVolumeLevel->setValue(0);
     // The scroll's name and voxel resolution are not here: the project's fit
     // volume is their only source, and the service rejects a request that
     // restates them.
@@ -387,12 +393,14 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
     _advanced = _advancedProfiles->textEdit();
     outputForm->addRow(tr("z begin"), _zBegin);
     outputForm->addRow(tr("z end"), _zEnd);
+    outputForm->addRow(tr("Fit volume level"), _fitVolumeLevel);
     outputForm->addRow(tr("Run tag"), _runTag);
     outputForm->addRow(tr("Render-volume scale"), _renderVolumeScale);
     outputForm->addRow(_savePngVisualizations);
     outputForm->addRow(tr("Advanced config JSON"), _advancedProfiles);
     describe(QStringLiteral("z_begin"), {_zBegin});
     describe(QStringLiteral("z_end"), {_zEnd});
+    describe(QStringLiteral("fit_volume_level"), {_fitVolumeLevel});
     describe(QStringLiteral("run_tag"), {_runTag});
     describe(QStringLiteral("render_volume_scale"), {_renderVolumeScale});
     describe(QStringLiteral("advanced_config"), {_advancedProfiles});
@@ -1349,7 +1357,7 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
         if (menu.exec(_inputList->viewport()->mapToGlobal(position)) == discard)
             emit removeLocalPatchRequested(row.value("alias").toString(id));
     });
-    for (QSpinBox* spin : {_zBegin, _zEnd, _renderVolumeScale})
+    for (QSpinBox* spin : {_zBegin, _zEnd, _fitVolumeLevel, _renderVolumeScale})
         connect(spin, qOverload<int>(&QSpinBox::valueChanged), this, [this](int) { refreshReloadRequired(); });
     for (QLineEdit* edit : {_runTag})
         connect(edit, &QLineEdit::textEdited, this, [this](const QString&) { refreshReloadRequired(); });
@@ -1974,6 +1982,7 @@ QJsonObject SpiralPanel::sessionRequest() const
         const QString sense = _outwardSense->currentData().toString();
         config[QStringLiteral("spiral_outward_sense")] =
             sense.isEmpty() ? QJsonValue(QJsonValue::Null) : QJsonValue(sense);
+        config[QStringLiteral("fit_volume_level")] = _fitVolumeLevel->value();
     }
     QJsonObject run{{"z_begin", _zBegin->value()}, {"z_end", _zEnd->value()},
                     {"storage_backend", QStringLiteral("sparse_cuda")},
@@ -2105,6 +2114,13 @@ void SpiralPanel::syncOutwardSense(const QJsonObject& effectiveConfig)
     _outwardSense->setCurrentIndex(qMax(0, index));
 }
 
+void SpiralPanel::syncFitVolumeLevel(const QJsonObject& effectiveConfig)
+{
+    const QSignalBlocker blocker(_fitVolumeLevel);
+    _fitVolumeLevel->setValue(
+        effectiveConfig.value(QStringLiteral("fit_volume_level")).toInt(0));
+}
+
 void SpiralPanel::syncVerticalFiberOffsetControls(const QJsonObject& effectiveConfig)
 {
     const QSignalBlocker enabledBlocker(_verticalFiberOffsetEnabled);
@@ -2190,6 +2206,7 @@ void SpiralPanel::synchronizeSession(const QJsonObject& request,
             .toBool(false));
     syncVerticalFiberOffsetControls(effectiveConfig);
     syncOutwardSense(effectiveConfig);
+    syncFitVolumeLevel(effectiveConfig);
     syncTrackSamplingControlsFromAdvanced();
     if (!activeRunConfig.isEmpty())
         applySessionRunConfig(activeRunConfig, sessionGeneration);
@@ -2289,6 +2306,7 @@ void SpiralPanel::updateStatus(const QJsonObject& status)
                 .toBool(false));
         syncVerticalFiberOffsetControls(effectiveConfig);
     syncOutwardSense(effectiveConfig);
+    syncFitVolumeLevel(effectiveConfig);
         syncTrackSamplingControlsFromAdvanced();
         _applyingResolution = false;
         applySessionRunConfig(runConfig, sessionGeneration);
@@ -2613,6 +2631,7 @@ void SpiralPanel::persist() const
         settings.setValue(prefix + QStringLiteral("paths/") + it.key(), it.value()->text());
     settings.setValue(prefix + "z_begin", _zBegin->value());
     settings.setValue(prefix + "z_end", _zEnd->value());
+    settings.setValue(prefix + "fit_volume_level", _fitVolumeLevel->value());
     settings.setValue(prefix + "storage_backend", QStringLiteral("sparse_cuda"));
     settings.setValue(prefix + "run_tag", _runTag->text());
     settings.setValue(prefix + "render_volume_scale", _renderVolumeScale->value());
@@ -2656,6 +2675,7 @@ void SpiralPanel::restore()
                               "object store.").arg(ignored.join(QStringLiteral(", ")));
     _zBegin->setValue(settings.value(prefix + "z_begin", 4000).toInt());
     _zEnd->setValue(settings.value(prefix + "z_end", 17000).toInt());
+    _fitVolumeLevel->setValue(settings.value(prefix + "fit_volume_level", 0).toInt());
     _runTag->setText(settings.value(prefix + "run_tag").toString());
     _renderVolumeScale->setValue(settings.value(prefix + "render_volume_scale", 16).toInt());
     _savePngVisualizations->setChecked(

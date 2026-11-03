@@ -104,6 +104,7 @@ private:
     void updateTrackSamplingUi();
     void syncVerticalFiberOffsetControls(const QJsonObject& effectiveConfig);
     void syncOutwardSense(const QJsonObject& effectiveConfig);
+    void syncFitVolumeLevel(const QJsonObject& effectiveConfig);
     void applySessionRunConfig(const QJsonObject& config, qint64 sessionGeneration);
     void synchronizeSession(const QJsonObject& request,
                             const QJsonObject& status);
@@ -155,6 +156,7 @@ private:
     QLabel* _lossMapLegend = nullptr;
     QSpinBox* _zBegin = nullptr;
     QSpinBox* _zEnd = nullptr;
+    QSpinBox* _fitVolumeLevel = nullptr;
     QSpinBox* _iterations = nullptr;
     QCheckBox* _backgroundPreview = nullptr;
     QSpinBox* _previewCadence = nullptr;
