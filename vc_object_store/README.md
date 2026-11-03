@@ -298,51 +298,14 @@ volume_xyz = stored_xyz * multiplier  # stored_xyz / scale_factor
 
 Consumers must preserve invalid vertex sentinels when applying the multiplier to arrays.
 
-Run regression tests against an existing native build and Python environment:
+Run regression tests against an existing build configured with
+`-DVC_OBJECT_STORE_BUILD_PYTHON=ON`:
 
 ```sh
-cmake --build /tmp/vc-object-coordinate-build -j 6
-ctest --test-dir /tmp/vc-object-coordinate-build --output-on-failure
-VC_OBJECT_STORE_BUILD_PYTHON_PATH=/tmp/vc-object-coordinate-build/python \
-  python -m pytest -q vc_object_store/tests/python
-PYTHONPATH=/tmp/vc-object-coordinate-build/python \
-  python vc_object_store/tests/smoke/coordinate_frames.py \
-  ../spiral/dataset /tmp/coordinate-real-smoke
+cmake --build <build> -j 6
+ctest --test-dir <build> --output-on-failure
+VC_OBJECT_STORE_BUILD_PYTHON_PATH=<build>/python python -m pytest -q vc_object_store/tests/python
 ```
-
-The real-data smoke command requires a new output directory. It ingests one patch
-and five PCLs (assigning UUIDs in temporary import wrappers, since the source
-files lack them), declares a local frame at ingest, and compares
-explicit scaling with mixed source scales (patch 2; PCLs 0.25 and 4). It checks exact
-attachment/surface-grid agreement and idempotent reruns; it does not train a fitter.
-
-Validated on Ubuntu amd64, GCC 13.3, Release, Python 3.14.5. The local build used
-existing cached nanobind and vc-delta3d sources, with downloads disabled:
-
-```sh
-export AGENTS_AGENT_MODE=1
-coordinate_build_python=/home/paul/.cache/uv/builds-v0/.tmp3Merin/bin/python
-coordinate_test_python=/mnt/bcache/projects/vesuvius-scrolls/villa-spiral-simplification/spiral-fitting/.venv/bin/python
-coordinate_delta_source=/tmp/claude-1000/-mnt-bcache-projects-vesuvius-scrolls-villa/aa6c6e86-9c08-4d44-a30b-e17a92fd9821/scratchpad/build-tests/_deps/vc_delta3d-src
-cmake -S vc_object_store -B /tmp/vc-object-coordinate-build -G Ninja \
-  -DCMAKE_BUILD_TYPE=Release -DVC_OBJECT_STORE_BUILD_PYTHON=ON \
-  -DCMAKE_MAKE_PROGRAM=/home/paul/.cache/uv/builds-v0/.tmp3Merin/bin/ninja \
-  -DPython_EXECUTABLE="$coordinate_build_python" \
-  -DFETCHCONTENT_SOURCE_DIR_VC_DELTA3D="$coordinate_delta_source" \
-  -DFETCHCONTENT_FULLY_DISCONNECTED=ON
-cmake --build /tmp/vc-object-coordinate-build -j 6
-ctest --test-dir /tmp/vc-object-coordinate-build --output-on-failure
-VC_OBJECT_STORE_BUILD_PYTHON_PATH=/tmp/vc-object-coordinate-build/python \
-  "$coordinate_test_python" -m pytest -q vc_object_store/tests/python
-PYTHONPATH=/tmp/vc-object-coordinate-build/python \
-  "$coordinate_test_python" vc_object_store/tests/smoke/coordinate_frames.py \
-  ../spiral/dataset /tmp/vc-object-coordinate-real-smoke-final
-```
-
-The real subset produced 32 identical attachments in both coordinate modes, with
-zero duplicates, updates or removals on repeat discovery. macOS and arm64 were not
-run locally. This validates store coordinate conversion only; the spiral CLI port
-and training acceptance remain separate stages.
 
 ## Transformed geometry views
 

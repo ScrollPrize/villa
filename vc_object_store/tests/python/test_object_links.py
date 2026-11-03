@@ -4,25 +4,7 @@ import uuid
 import numpy as np
 import pytest
 
-from object_helpers import edge_choice
-
-
-def array(name, values, dtype):
-    data = np.asarray(values, dtype=dtype)
-    return {"name": name, "dtype": dtype, "shape": list(data.shape), "data": data.tobytes()}
-
-
-def put(db, kind, arrays, attributes=None, **record):
-    uid = db.upsert_object({"kind": kind, "storage_ref": "/missing/source", **record})
-    geometry = {"kind": kind, "attributes": attributes or {}, "arrays": arrays}
-    db.put_geometry(uid, geometry)
-    return uid, geometry
-
-
-def plane(db, offset=0, name="surface"):
-    y, x = np.mgrid[:33, :33]
-    points = np.stack([x + offset, y, np.full_like(x, 20)], axis=-1)
-    return put(db, "surface", [array("points", points, "<f4")], {"scale": [1, 1]}, name=name)
+from object_helpers import array, edge_choice, plane, put
 
 
 def test_surface_discovery_uses_current_revisions_and_preserves_review(db):

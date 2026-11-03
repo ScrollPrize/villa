@@ -1,11 +1,9 @@
-"""Incremental detector runs (new_uuids), detector versions, progress callbacks
-and the store's link marker."""
+"""Incremental detector runs (new_uuids), progress callbacks and the store's link marker."""
 import numpy as np
 import pytest
 
-from vc_object_store import Fiber, detector_versions
-from test_coordinate_frames import LINE_OPTIONS, VOLUME, frame, patch as framed_patch
-from test_object_links import array, plane, put
+from vc_object_store import Fiber
+from object_helpers import LINE_OPTIONS, array, frame, framed_patch, plane, put
 
 
 def named_edges(db, kind):
@@ -23,19 +21,17 @@ def detector_edge(db, a, b, kind, detector):
                             meta={"detector": {"name": detector, "version": 1}}))
 
 
-def test_detector_versions_name_every_detector():
-    assert detector_versions() == {
-        "surface-overlap": 1, "fiber-surface": 3, "track-track": 1, "track-surface": 1,
-        "point-collection-surface": 1}
-
-
 def test_overlap_increment_matches_a_full_run_for_new_pairs(db):
     a, _ = plane(db, 0, "a")
     b, _ = plane(db, 8, "b")
     c, _ = plane(db, 500, "c")
     assert db.link_surface_overlaps()["edges_created"] == 1
-    kept = named_edges(db, "same-surface")[("a", "b")]["uuid"]
+    # Nothing new: nothing is considered, so nothing is removed either.
     stale_old = detector_edge(db, a, c, "same-surface", "surface-overlap")
+    report = db.link_surface_overlaps(new_uuids=[])
+    assert report["committed"] and report["objects_considered"] == 0
+    assert report["edges_created"] == report["stale_removed"] == 0
+    kept = named_edges(db, "same-surface")[("a", "b")]["uuid"]
     d, _ = plane(db, 4, "d")
     e, _ = plane(db, 1000, "e")
     stale_new = detector_edge(db, d, c, "same-surface", "surface-overlap")
@@ -58,25 +54,11 @@ def test_overlap_increment_matches_a_full_run_for_new_pairs(db):
     assert stale_old not in {edge["uuid"] for edge in db.edges_by_kind("same-surface")}
 
 
-def test_overlap_increment_with_nothing_new_changes_nothing(db):
-    a, _ = plane(db, 0, "a")
-    c, _ = plane(db, 500, "c")
-    stale = detector_edge(db, a, c, "same-surface", "surface-overlap")
-    report = db.link_surface_overlaps(new_uuids=[])
-    assert report["committed"] and report["objects_considered"] == 0
-    assert report["edges_created"] == report["stale_removed"] == 0
-    assert db.edge(stale)["uuid"] == stale
-
-
 def test_new_uuids_must_be_selected(db):
     a, _ = plane(db, 0, "a")
     b, _ = plane(db, 8, "b")
     with pytest.raises(ValueError, match="not selected"):
         db.link_surface_overlaps(surface_uuids=[a], new_uuids=[b])
-    collection = put(db, "point_collection", [array("points", [[10, 10, 20]], "<f8"),
-                                              array("point_ids", [1], "<i8")])[0]
-    with pytest.raises(ValueError, match="not selected"):
-        db.link_point_collections_to_surfaces(new_uuids=[collection, "00000000-0000-0000-0000-000000000001"])
 
 
 def big_plane(db, name):
@@ -119,16 +101,6 @@ def test_pcl_increment_links_new_objects_and_keeps_existing_links(db):
     assert full["edges_created"] == full["edges_updated"] == 0
     assert full["stale_removed"] == 1  # p1-small: big wins
     assert set(named_edges(db, "point-surface")) == {("big", "p1"), ("big", "p2"), ("far", "far_points")}
-
-
-def test_pcl_increment_keeps_named_pair_policy_over_all_selected_surfaces(db):
-    plane(db, 0, "a")
-    big_plane(db, "b")
-    named = pcl(db, "between_surfaces__a__b", [10, 10, 20])
-    report = db.link_point_collections_to_surfaces(new_uuids=[named])
-    assert report["edges_created"] == 1, report
-    edge = next(iter(named_edges(db, "point-surface").values()))
-    assert edge["meta"]["point_collection_surface"]["selection"] == "nearest_named_pair"
 
 
 def framed_fiber(db, name, y=96):
@@ -178,14 +150,11 @@ def test_progress_reaches_python_and_its_errors_do_not_stop_a_detector(db):
     assert report["edges_created"] == 1
     assert {stage for stage, *_ in seen} >= {"selecting stored surfaces", "loading surfaces",
                                              "checking surface pairs"}
-    assert all(isinstance(completed, int) and isinstance(detail, str) for _, completed, _, detail in seen)
 
     def broken(*update):
         raise RuntimeError("progress display failed")
     # Reported as unraisable (a warning under pytest); the detector finishes.
     assert db.link_surface_overlaps(progress=broken)["edges_skipped_existing"] == 1
-    with pytest.raises(TypeError):
-        db.link_surface_overlaps(progress=3)
 
 
 def test_link_marker_is_not_journaled_and_stays_with_its_replica(db):

@@ -379,7 +379,7 @@ int main() try
     { auto closing = std::move(bob); }
     detachHub(bobPath, "bob");
     bob = ObjectStore::open(bobPath, as("bob"));
-    require(!hubStatus(bob), "detached");
+    require(!hubStatus(bob) && !storePositions(bob), "detached, without the hub's positions");
     setNote(bob, a, "standalone");
     std::cout << "object_store_hub: ok\n";
     return 0;
