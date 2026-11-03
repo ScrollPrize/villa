@@ -1,5 +1,17 @@
 find_package(Qt6 REQUIRED COMPONENTS Concurrent Core Network Test Widgets)
 
+add_executable(test_manual_add_extend test_manual_add_extend.cpp
+    ../segmentation/SurfaceGridEdit.cpp
+    ../segmentation/tools/AutoExtend.cpp
+    ../segmentation/tools/ManualAddTool.cpp
+    ../segmentation/tools/ThinPlateSpline3d.cpp)
+set_target_properties(test_manual_add_extend PROPERTIES AUTOMOC ON AUTOUIC OFF AUTORCC OFF)
+target_include_directories(test_manual_add_extend PRIVATE ${PROJECT_SOURCE_DIR}/apps/VC3D)
+target_link_libraries(test_manual_add_extend PRIVATE Qt6::Core Qt6::Test vc_core)
+add_test(NAME manual_add_extend COMMAND test_manual_add_extend)
+vc_register_test_target(test_manual_add_extend)
+vc_register_ctest(manual_add_extend test_manual_add_extend)
+
 add_executable(test_volume_path_labels test_volume_path_labels.cpp
     ../elements/VolumeSelector.cpp ../elements/VolumeSelector.hpp)
 set_target_properties(test_volume_path_labels PROPERTIES AUTOMOC ON AUTOUIC OFF AUTORCC OFF)
@@ -736,3 +748,24 @@ target_link_libraries(test_fiber_3d_canvas PRIVATE Qt6::Core Qt6::Gui Qt6::Widge
 add_test(NAME fiber_3d_canvas COMMAND test_fiber_3d_canvas)
 vc_register_test_target(test_fiber_3d_canvas)
 vc_register_ctest(fiber_3d_canvas test_fiber_3d_canvas)
+
+add_executable(test_manual_growth_panel test_manual_growth_panel.cpp
+    ../segmentation/panels/SegmentationGrowthPanel.cpp
+    ../segmentation/panels/SegmentationManualAddPanel.cpp
+    ../elements/VolumeSelector.cpp)
+set_target_properties(test_manual_growth_panel PROPERTIES AUTOMOC ON AUTOUIC OFF AUTORCC OFF)
+target_include_directories(test_manual_growth_panel PRIVATE ${PROJECT_SOURCE_DIR}/apps/VC3D)
+target_link_libraries(test_manual_growth_panel PRIVATE Qt6::Widgets Qt6::Test vc_core)
+add_test(NAME manual_growth_panel COMMAND test_manual_growth_panel)
+set_tests_properties(manual_growth_panel PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
+vc_register_test_target(test_manual_growth_panel)
+vc_register_ctest(manual_growth_panel test_manual_growth_panel)
+
+add_executable(test_grow_patch_seed_dialog test_grow_patch_seed_dialog.cpp ../GrowPatchSeedDialog.cpp)
+set_target_properties(test_grow_patch_seed_dialog PROPERTIES AUTOMOC ON AUTOUIC OFF AUTORCC OFF)
+target_include_directories(test_grow_patch_seed_dialog PRIVATE ${PROJECT_SOURCE_DIR}/apps/VC3D)
+target_link_libraries(test_grow_patch_seed_dialog PRIVATE vc_core Qt6::Widgets Qt6::Test)
+add_test(NAME grow_patch_seed_dialog COMMAND test_grow_patch_seed_dialog)
+set_tests_properties(grow_patch_seed_dialog PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
+vc_register_test_target(test_grow_patch_seed_dialog)
+vc_register_ctest(grow_patch_seed_dialog test_grow_patch_seed_dialog)

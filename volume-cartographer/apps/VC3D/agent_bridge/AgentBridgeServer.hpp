@@ -168,6 +168,8 @@ private:
     QJsonObject handleManualAddSetLineMode(const QJsonValue& params);
     QJsonObject handleManualAddSetInterpolation(const QJsonValue& params);
     QJsonObject handleManualAddUndoConstraint(const QJsonValue& params);
+    QJsonObject handleManualAddExtend(const QJsonValue& params);
+    QJsonObject handleManualAddAddConstraint(const QJsonValue& params);
     QJsonObject handleCorrectionsSetPointMode(const QJsonValue& params);
     // Same-winding wrap annotation (tutorial's shift+E). set_mode drives the
     // WrapAnnotationWidget checkbox; commit/undo mirror the shift+E / Ctrl+Z
