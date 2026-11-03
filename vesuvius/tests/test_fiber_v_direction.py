@@ -37,12 +37,12 @@ def test_families_and_h_prior_preserved():
 
 
 def test_inherited_h_labels_are_immutable():
-    ids=np.arange(5);labels=np.array([0,1,0,2,1])
+    ids=np.array([f'00000000-0000-4000-8000-00000000000{k}' for k in range(5)]);labels=np.array([0,1,0,2,1])
     h=dict(ids=ids,labels=np.array([0,1,2,2,1]),newly_broken=np.array([0,0,1,0,0],bool),
            direction_sign_ccw=np.array([-1,0,0,0,0]),direction_sign_cw=np.array([1,0,0,0,0]))
     np.testing.assert_array_equal(inherit_h_labels(ids,labels,h),h['labels'])
     np.testing.assert_array_equal(labels,[0,1,0,2,1])
-    for wrong in [dict(h,ids=ids+1),dict(h,labels=labels),
+    for wrong in [dict(h,ids=np.roll(ids,1)),dict(h,labels=labels),
                   dict(h,newly_broken=np.array([0,1,0,0,0],bool)),dict(h,direction_sign_cw=-h['direction_sign_cw'])]:
         with pytest.raises(ValueError):inherit_h_labels(ids,labels,wrong)
 

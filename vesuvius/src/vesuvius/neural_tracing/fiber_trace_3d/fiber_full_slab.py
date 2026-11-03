@@ -4,6 +4,7 @@ from pathlib import Path
 import time
 import numpy as np
 from lasagna.inference_provenance import atomic_write, sha256_file
+from vesuvius.neural_tracing.tracers.shared.annotations.fiber_store import fibers_digest
 from . import fiber_uv_layout as uv, fiber_soft_winding as soft
 from . import fiber_uv_reference_subset as subset
 from .fiber_gt_constraint_score import arrays
@@ -156,7 +157,7 @@ def run(settings):
         code={Path(m.__file__).name:sha256_file(m.__file__) for m in (subset,uv,soft,density,cavity,ref)},
         orchestration=sha256_file(__file__),
         reference={name:sha256_file(Path(settings['reference'])/name) for name in ('x.tif','y.tif','z.tif','meta.json')},
-        inputs={k:sha256_file(config[k]) for k in ('afv','database','features','stage1','hv_solution',
+        inputs={k:(fibers_digest if k=='fibers' else sha256_file)(config[k]) for k in ('fibers','database','features','stage1','hv_solution',
                      'h_direction_solution','v_direction_solution','umbilicus')})
     stamp=root/'inputs.json'
     if stamp.exists() and json.loads(stamp.read_text())!=signature:raise ValueError('Slab inputs changed')

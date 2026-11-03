@@ -85,15 +85,15 @@ def run(settings):
                 cm,cp=captures
                 pair_derivatives.append((cp['cost']-cm['cost'])/(2*step))
                 changed=np.flatnonzero(np.logical_or.reduce([cm[k]!=cp[k] for k in ('shift','ka','kb')]))
-                checks[-1]['pair_branch_changes']=[dict(edge=int(i),source_a=int(d['source_id'][d['i'][i]]),
-                    source_b=int(d['source_id'][d['j'][i]]),parallel=bool(d['parallel'][i]),
+                checks[-1]['pair_branch_changes']=[dict(edge=int(i),source_a=str(d['source_id'][d['i'][i]]),
+                    source_b=str(d['source_id'][d['j'][i]]),parallel=bool(d['parallel'][i]),
                     minus={k:float(cm[k][i]) for k in cm},plus={k:float(cp[k][i]) for k in cp}) for i in changed]
         rows.append(dict(name=name,count=p.numel(),scaled_gradient_norm=norm,
             scaled_gradient_max=float(z.abs().max()),analytic_derivative=analytic,finite_difference=checks))
         if pair_derivatives:
             discrepancy=pair_derivatives[1]-pair_derivatives[0]
             rows[-1]['largest_pair_derivative_changes']=[dict(edge=int(i),
-                source_a=int(d['source_id'][d['i'][i]]),source_b=int(d['source_id'][d['j'][i]]),
+                source_a=str(d['source_id'][d['i'][i]]),source_b=str(d['source_id'][d['j'][i]]),
                 parallel=bool(d['parallel'][i]),derivatives=[float(a[i]) for a in pair_derivatives])
                 for i in np.argsort(abs(discrepancy))[-8:][::-1]]
     gaps=(ext.curve.arc[1:]-ext.curve.arc[:-1])[ext.curve.owner[1:]==ext.curve.owner[:-1]].numpy()

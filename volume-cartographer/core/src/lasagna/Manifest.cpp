@@ -4,6 +4,7 @@
 #include <cmath>
 #include <fstream>
 #include <stdexcept>
+#include <unordered_set>
 
 namespace vc::lasagna {
 namespace {
@@ -217,14 +218,38 @@ std::vector<std::string> LasagnaDatasetManifest::fiberPredictionPrefixes() const
 
 LasagnaDatasetManifest LasagnaDatasetManifest::parseFile(const std::filesystem::path& manifestPath)
 {
-    std::ifstream input(manifestPath);
+    const bool compact = std::filesystem::is_directory(manifestPath);
+    std::ifstream input(compact ? manifestPath / ".zattrs" : manifestPath);
     if (!input) {
         throw std::runtime_error("Failed to open Lasagna manifest: " + manifestPath.string());
     }
 
     nlohmann::json root;
     input >> root;
-    LasagnaDatasetManifest manifest = parseText(root.dump(), manifestPath);
+    if (compact) {
+        root = root.at("lasagna");
+        if (root.at("version") != 3)
+            throw std::runtime_error("embedded Lasagna manifest must have version 3");
+        if (!root.at("source_to_base").is_number() ||
+            !root.at("base_shape_zyx").is_array() || root.at("base_shape_zyx").size() != 3)
+            throw std::runtime_error("embedded manifest requires source scale and base shape");
+        const auto validity = root.at("validity_channel").get<std::string>();
+        bool found = false;
+        std::unordered_set<std::string> channels;
+        for (const auto& [name, group] : root.at("groups").items()) {
+            const auto n = group.at("scaledown").get<int>();
+            if (n < 0 || n > 30 || name != "sd" + std::to_string(n) ||
+                group.at("zarr") != name + "/" + std::to_string(n))
+                throw std::runtime_error("invalid embedded resolution group");
+            for (const auto& channel : group.at("channels")) {
+                if (!channels.insert(channel.get<std::string>()).second)
+                    throw std::runtime_error("duplicate embedded channel");
+                found = found || channel == validity;
+            }
+        }
+        if (!found) throw std::runtime_error("invalid embedded validity_channel");
+    }
+    LasagnaDatasetManifest manifest = parseText(root.dump(), compact ? manifestPath / ".zattrs" : manifestPath);
     manifest.raw = std::move(root);
     return manifest;
 }
@@ -314,6 +339,25 @@ bool lasagnaChannelShapeCompatible(
         }
     }
     return true;
+}
+
+LasagnaDatasetManifest fiberNormalManifest(const LasagnaDatasetManifest& source)
+{
+    auto result=source;
+    result.groups.clear();
+    for(const auto* name:{"nx","ny","grad_mag"}) {
+        const std::string original=std::string("sheet_")+name;
+        const auto* group=source.groupForChannel(original);
+        if(!group)throw std::invalid_argument("missing predicted normal channel "+original);
+        auto alias=*group;
+        alias.name=name;
+        for(auto& channel:alias.channels)
+            channel=channel==original?name:"unused_fiber_normal_"+channel;
+        result.groups.push_back(std::move(alias));
+    }
+    result.raw["grad_mag_encode_scale"]=1.0;
+    result.raw["grad_mag_factor"]=1.0;
+    return result;
 }
 
 } // namespace vc::lasagna

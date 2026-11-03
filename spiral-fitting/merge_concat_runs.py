@@ -69,7 +69,7 @@ def invalid_mask(pts):
 
 def resample_to(pts, target_hw):
     """Linear-resample (H,W,3) points to target (H,W), re-masking invalid regions
-    with -1 (same approach as scripts/repair_tifxyz_spacing.py:resample_points)."""
+    with -1."""
     th, tw = target_hw
     if pts.shape[:2] == (th, tw):
         out = pts.copy()
@@ -77,10 +77,9 @@ def resample_to(pts, target_hw):
         out[inv] = -1.0
         return out, ~inv
     out = cv2.resize(pts, (tw, th), interpolation=cv2.INTER_LINEAR)
-    inv = invalid_mask(pts).astype(np.uint8) * 255
-    inv_r = cv2.resize(inv, (tw, th), interpolation=cv2.INTER_NEAREST)
-    inv_r = cv2.dilate(inv_r, np.ones((3, 3), np.uint8), iterations=1)
-    bad = inv_r > 0
+    inv_r = cv2.resize(invalid_mask(pts).astype(np.float32), (tw, th), interpolation=cv2.INTER_LINEAR)
+    bad = cv2.dilate((inv_r > 0).astype(np.uint8), np.ones((3, 3), np.uint8), iterations=1) > 0
+    bad |= ~np.isfinite(out).all(axis=-1)
     out[bad] = -1.0
     return out, ~bad
 

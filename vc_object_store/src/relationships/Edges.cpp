@@ -1,6 +1,7 @@
 #include "internal/EdgeSql.hpp"
 #include "geometry/Dependencies.hpp"
 #include "internal/History.hpp"
+#include <nlohmann/json.hpp>
 
 namespace vc::objects {
 using namespace detail;
@@ -70,10 +71,11 @@ void ObjectStore::removeEdge(WriteTxn& txn, const std::string& uuid)
     sqlite3* db = static_cast<sqlite3*>(connection(txn));
     Savepoint savepoint(db);
     const auto bytes = parseUuid(uuid);
-    auto id = edgeIdByUuid(db, bytes);
-    if (!id) throw std::runtime_error("object store: edge not found: " + uuid);
-    execute(db, "DELETE FROM edges WHERE id=?", *id);
-    appendJournal(db, impl_->options.author, impl_->hostname, bytes, 0, "remove_edge");
+    Statement row(db, "SELECT id,kind FROM edges WHERE uuid=?", bytes);
+    if (!row.row()) throw std::runtime_error("object store: edge not found: " + uuid);
+    const auto kind = row.text(1);
+    execute(db, "DELETE FROM edges WHERE id=?", row.i64(0));
+    appendJournal(db, impl_->options.author, impl_->hostname, bytes, 0, "remove_edge", kind);
     savepoint.release();
 }
 
@@ -110,6 +112,7 @@ std::unique_ptr<Statement> detail::edgeSelectionQuery(sqlite3* db, const EdgeSel
         return "?" + std::to_string(parameters.size());
     };
     if (selection.kind) sql += " AND kind=" + parameter(*selection.kind);
+    if (!selection.attachments) sql += " AND kind<>" + parameter(kAttachmentEdgeKind);
     if (selection.approvalStates.size() == 1)
         sql += " AND approval_state=" + parameter(selection.approvalStates.front());
     else if (!selection.approvalStates.empty())
@@ -168,6 +171,32 @@ std::vector<EdgeRecord> ObjectStore::selectEdges(const Txn& txn, const EdgeSelec
     }
     auto rows = edgeSelectionQuery(db, selection, columns);
     return readEdgeRows(db, *rows, fields);
+}
+
+std::string ObjectStore::attach(WriteTxn& txn, const std::string& dataUuid, const std::string& ownerUuid, const std::string& role)
+{
+    EdgeRecord edge;
+    edge.kind = kAttachmentEdgeKind;
+    edge.aUuid = dataUuid;
+    edge.bUuid = ownerUuid;
+    edge.aAnchor.wholeGeometry = true;
+    edge.bAnchor.wholeGeometry = true;
+    edge.meta = nlohmann::json{{"role", role}}.dump();
+    return addEdge(txn, edge);
+}
+
+std::vector<EdgeRecord> ObjectStore::attachments(const Txn& txn, const std::string& ownerUuid,
+                                                 const std::optional<std::string>& role) const
+{
+    EdgeSelection selection;
+    selection.kind = kAttachmentEdgeKind;
+    selection.endpointUuids = std::vector<std::string>{ownerUuid};
+    auto edges = selectEdges(txn, selection);
+    if (role)
+        std::erase_if(edges, [&](const EdgeRecord& edge) {
+            return nlohmann::json::parse(edge.meta).value("role", std::string{}) != *role;
+        });
+    return edges;
 }
 
 } // namespace vc::objects

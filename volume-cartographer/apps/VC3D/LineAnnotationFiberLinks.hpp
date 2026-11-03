@@ -5,8 +5,7 @@
 // and the loader's link validation can share ONE definition of "these two
 // link entries agree" and be unit-tested without the controller.
 //
-// Numeric contract (mirrored by scripts/fiber_merge.py's loader port; do not
-// change without changing both): positions agree within 1e-6, directions
+// Numeric contract: positions agree within 1e-6, directions
 // agree when |dot| is within 1e-5 of 1, the tangent at a control point is the
 // forward difference at its nearest line point.
 
@@ -20,15 +19,30 @@
 #include <string>
 #include <vector>
 
-#include <nlohmann/json.hpp>
 #include <opencv2/core/types.hpp>
 
-#include "FiberSliceGeometry.hpp"
-#include "LineAnnotationFiberDeletion.hpp"
+#include "FiberLineGeometry.hpp"
 #include "LineAnnotationFiberSegments.hpp"
 #include "LineAnnotationStoredFiber.hpp"
 
 namespace vc3d::line_annotation {
+
+template<class Fiber, class Branch, class PointsEqual, class DirectionsCompatible>
+bool reciprocalBranchRefMatches(const Fiber& fiber, const Branch& branch,
+                                const Branch& candidate, PointsEqual pointsEqual,
+                                DirectionsCompatible directionsCompatible)
+{
+    return candidate.adjacent == branch.adjacent &&
+           candidate.branchFiberId == fiber.id &&
+           candidate.controlPointIndex == branch.branchControlPointIndex &&
+           candidate.branchControlPointIndex == branch.controlPointIndex &&
+           pointsEqual(candidate.controlPointPosition, branch.branchControlPointPosition) &&
+           pointsEqual(candidate.branchControlPointPosition, branch.controlPointPosition) &&
+           directionsCompatible(candidate.controlPointDirection,
+                                branch.branchControlPointDirection) &&
+           directionsCompatible(candidate.branchControlPointDirection,
+                                branch.controlPointDirection);
+}
 
 inline constexpr double kLinkEpsilon = 1.0e-12;
 
@@ -116,16 +130,16 @@ inline bool branchDirectionsCompatible(const cv::Vec3d& a,
     return std::abs(std::abs(na.dot(nb)) - 1.0) <= tolerance;
 }
 
-// Runtime ids are unique across every registered source and stable across
-// reloads (FiberRuntimeIds). Once both sides have one, do not let an equal
-// filename in another source create a false match. Filename matching remains
-// the legacy/on-load fallback. The rule is sameFiberIdentity, shared with the
-// deletion helpers and the branch synchronizers.
-inline bool branchReferencesFiber(const FiberBranchRef& branch,
-                                  uint64_t fiberId,
-                                  const std::string& fileName)
+// Runtime handles identify UUIDs within the attached store. Unresolved handles
+// never match; display names are labels only.
+inline bool sameFiberIdentity(uint64_t a, uint64_t b)
 {
-    return sameFiberIdentity(branch.branchFiberId, branch.branchFileName, fiberId, fileName);
+    return a != 0 && a == b;
+}
+
+inline bool branchReferencesFiber(const FiberBranchRef& branch, uint64_t fiberId)
+{
+    return sameFiberIdentity(branch.branchFiberId, fiberId);
 }
 
 // Forward difference at the line position; the loader, the save-time
@@ -153,7 +167,7 @@ inline cv::Vec3d endpointTangentFromLinePoints(const std::vector<cv::Vec3d>& lin
                                                const cv::Vec3d& fallback = {0.0, 0.0, 0.0})
 {
     if (linePoints.size() >= 2 && finitePoint(controlPoint)) {
-        const std::size_t index = vc3d::fiber_slice::nearestLinePointIndex(linePoints, controlPoint);
+        const std::size_t index = vc3d::fiber_line::nearestLinePointIndex(linePoints, controlPoint);
         const cv::Vec3d tangent = tangentAtLinePosition(linePoints, static_cast<double>(index));
         if (finiteDirection(tangent)) {
             return normalizedOrZero(tangent);
@@ -185,33 +199,6 @@ inline CombinedReviewState combineReviewStates(bool pendingA, bool autoA,
     state.pending = pendingA || pendingB;
     const bool humanPending = (pendingA && !autoA) || (pendingB && !autoB);
     state.autoLink = state.pending && !humanPending && (autoA || autoB) && !adjacent;
-    return state;
-}
-
-// The two JSON review-state keys of a link entry: "pending" and, only with
-// it and only on an ordinary link, "auto". Written true-or-absent, never
-// false (the same convention fiber_merge.py's snap_flag keeps).
-inline void writeBranchReviewStateJson(nlohmann::json& entry, const FiberBranchRef& ref)
-{
-    if (!ref.pending) {
-        return;
-    }
-    entry["pending"] = true;
-    if (ref.autoLink && !ref.adjacent) {
-        entry["auto"] = true;
-    }
-}
-
-struct BranchReviewState {
-    bool pending = false;
-    bool autoLink = false;
-};
-
-inline BranchReviewState readBranchReviewStateJson(const nlohmann::json& entry, bool adjacent)
-{
-    BranchReviewState state;
-    state.pending = entry.value("pending", false);
-    state.autoLink = state.pending && !adjacent && entry.value("auto", false);
     return state;
 }
 
@@ -373,7 +360,7 @@ void canonicalizeFiberSaveSnapshots(std::vector<Snapshot>& snapshots)
 {
     auto findSnapshotForBranch = [&snapshots](const FiberBranchRef& branch) -> Snapshot* {
         for (auto& snapshot : snapshots) {
-            if (branchReferencesFiber(branch, snapshot.fiber.id, snapshot.fiber.fileName)) {
+            if (branchReferencesFiber(branch, snapshot.fiber.id)) {
                 return &snapshot;
             }
         }
@@ -440,9 +427,7 @@ void canonicalizeFiberSaveSnapshots(std::vector<Snapshot>& snapshots)
                 target->fiber.branches.end(),
                 [&snapshot, &branch](const FiberBranchRef& candidate) {
                     return candidate.adjacent == branch.adjacent &&
-                           branchReferencesFiber(candidate,
-                                                 snapshot.fiber.id,
-                                                 snapshot.fiber.fileName) &&
+                           branchReferencesFiber(candidate, snapshot.fiber.id) &&
                            (candidate.controlPointIndex ==
                                 branch.branchControlPointIndex ||
                             pointsApproximatelyEqual(candidate.controlPointPosition,
@@ -487,22 +472,14 @@ void canonicalizeFiberSaveSnapshots(std::vector<Snapshot>& snapshots)
 template<class Snapshot>
 void validateFiberSaveSnapshots(const std::vector<Snapshot>& snapshots)
 {
-    // Geometry guard for every snapshot, linked or not: the v3 loader (and
+    // Geometry guard for every snapshot, linked or not: the traced-fiber loader (and
     // split/merge planning) requires control points to be an exact ordered
     // subset of line_points. A violation here means a session was serialized
     // before its geometry was finalized by a solve; writing it would produce
     // a fiber that fails to load. Refuse the save instead.
     for (const auto& snapshot : snapshots) {
-        if (snapshot.fiber.controlPoints.empty()) {
+        if (snapshot.fiber.controlPoints.empty() || snapshot.fiber.linePoints.empty()) {
             continue;
-        }
-        if (snapshot.fiber.linePoints.empty()) {
-            // Control points with no line at all cannot satisfy the subset
-            // contract either; the loader would reject the file.
-            throw std::runtime_error(
-                fiberErrorName(snapshot.fiber.fileName) +
-                ": control points present but line_points is empty; the "
-                "fiber was not finalized before saving");
         }
         if (!orderedControlPointLineIndices(
                 storedControlPointPositions(snapshot.fiber.controlPoints),
@@ -520,7 +497,7 @@ void validateFiberSaveSnapshots(const std::vector<Snapshot>& snapshots)
 
     auto findSnapshotForBranch = [&snapshots](const FiberBranchRef& branch) -> const Snapshot* {
         for (const auto& snapshot : snapshots) {
-            if (branchReferencesFiber(branch, snapshot.fiber.id, snapshot.fiber.fileName)) {
+            if (branchReferencesFiber(branch, snapshot.fiber.id)) {
                 return &snapshot;
             }
         }
@@ -560,9 +537,7 @@ void validateFiberSaveSnapshots(const std::vector<Snapshot>& snapshots)
                 target->fiber.branches.end(),
                 [&snapshot, &branch](const FiberBranchRef& candidate) {
                     return candidate.adjacent == branch.adjacent &&
-                           branchReferencesFiber(candidate,
-                                                 snapshot.fiber.id,
-                                                 snapshot.fiber.fileName) &&
+                           branchReferencesFiber(candidate, snapshot.fiber.id) &&
                            candidate.controlPointIndex == branch.branchControlPointIndex &&
                            candidate.branchControlPointIndex == branch.controlPointIndex &&
                            pointsApproximatelyEqual(candidate.controlPointPosition,

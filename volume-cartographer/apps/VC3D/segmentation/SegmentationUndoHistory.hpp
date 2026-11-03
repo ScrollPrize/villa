@@ -4,7 +4,7 @@
 #include <optional>
 #include <vector>
 
-#include <opencv2/core/mat.hpp>
+#include <opencv2/core.hpp>
 
 namespace segmentation
 {
@@ -20,7 +20,7 @@ struct VertexDelta
 class UndoHistory
 {
 public:
-    // Capture full surface state (legacy method - memory intensive)
+    // Capture full surface state (memory intensive)
     bool capture(const cv::Mat_<cv::Vec3f>& points)
     {
         if (points.empty()) {
@@ -68,7 +68,7 @@ public:
         Entry entry = std::move(_states.back());
         _states.pop_back();
 
-        // Return full points if available (legacy)
+        // Return full points if this was a snapshot entry
         if (!entry.points.empty()) {
             return entry.points;
         }
@@ -114,6 +114,24 @@ public:
         _states.push_back({std::move(points), {}});
     }
 
+    // Keeps the history valid after the grid grows by the given counts:
+    // deltas move with their vertices and full snapshots get invalid borders.
+    void padGrid(int top, int bottom, int left, int right)
+    {
+        for (auto& entry : _states) {
+            for (auto& delta : entry.deltas) {
+                delta.row += top;
+                delta.col += left;
+            }
+            if (!entry.points.empty()) {
+                cv::Mat padded;
+                cv::copyMakeBorder(entry.points, padded, top, bottom, left, right,
+                                   cv::BORDER_CONSTANT, cv::Scalar(-1.0, -1.0, -1.0));
+                entry.points = cv::Mat_<cv::Vec3f>(padded);
+            }
+        }
+    }
+
     void clear()
     {
         _states.clear();
@@ -132,7 +150,7 @@ public:
 private:
     struct Entry
     {
-        cv::Mat_<cv::Vec3f> points;        // Full snapshot (legacy, memory intensive)
+        cv::Mat_<cv::Vec3f> points;        // Full snapshot (memory intensive)
         std::vector<VertexDelta> deltas;   // Delta-based (memory efficient)
     };
 

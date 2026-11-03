@@ -78,7 +78,7 @@ void AgentBridgeServer::registerEditingHandlers()
 
     registerMethod(
         {
-            .name = QStringLiteral("segmentation.grow_patch_from_seed"),
+            .name = QStringLiteral("segmentation.grow_surface_from_seed"),
             .params = {
                 Params::requiredObject(
                     QStringLiteral("seed"),
@@ -94,14 +94,14 @@ void AgentBridgeServer::registerEditingHandlers()
                     1,
                     100000),
                 nonNegativeNumber(QStringLiteral("minAreaCm"), 0.002),
-                Params::optionalString(QStringLiteral("outputDir")),
+                Params::optionalString(QStringLiteral("outputTag"), QStringLiteral("paths")),
             },
             .errors = {
                 -32602, -32000, -32001, -32004, -32005, -32006, -32007,
                 -32009,
             },
             .mcp = Mcp::snakeCase(
-                QStringLiteral("vc3d_grow_patch_from_seed"),
+                QStringLiteral("vc3d_grow_surface_from_seed"),
                 {QStringLiteral("wait")}),
         },
         [this](const QJsonValue& p) {
@@ -189,6 +189,43 @@ void AgentBridgeServer::registerEditingHandlers()
         [this](const QJsonValue& p) {
             return handleManualAddUndoConstraint(p);
         });
+
+    registerMethod(
+        {
+            .name = QStringLiteral("segmentation.manual_add.extend"),
+            .params = {
+                Params::requiredStringEnum(
+                    QStringLiteral("side"),
+                    {
+                        QStringLiteral("up"),
+                        QStringLiteral("down"),
+                        QStringLiteral("left"),
+                        QStringLiteral("right"),
+                    }),
+                boundedInteger(QStringLiteral("cells"), 16, 1, 4096),
+                Params::optionalInteger(QStringLiteral("first")),
+                Params::optionalInteger(QStringLiteral("last")),
+                Params::optionalBoolean(QStringLiteral("applyPending"), false),
+            },
+            .errors = {-32602, -32000, -32005, -32007, -32008},
+            .mcp = Mcp::exact(QStringLiteral("vc3d_manual_add_extend")),
+        },
+        [this](const QJsonValue& p) { return handleManualAddExtend(p); });
+
+    registerMethod(
+        {
+            .name = QStringLiteral("segmentation.manual_add.add_constraint"),
+            .params = {
+                Params::requiredArray(
+                    QStringLiteral("world"),
+                    AgentBridgeParamType::Number),
+                nonNegativeNumber(QStringLiteral("radius"), 0.0),
+            },
+            .errors = {-32602, -32000, -32005, -32007},
+            .mcp = Mcp::exact(
+                QStringLiteral("vc3d_manual_add_add_constraint")),
+        },
+        [this](const QJsonValue& p) { return handleManualAddAddConstraint(p); });
 
     registerMethod(
         {

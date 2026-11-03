@@ -579,60 +579,9 @@ QJsonObject AgentBridgeServer::handlePointsApplyAnchorOffset(const QJsonValue& p
 
 
 // ---------------------------------------------------------------------------
-// Persistence: whole-collection JSON + per-segment correction paths
+// Per-segment correction paths
 // ---------------------------------------------------------------------------
 
-QJsonObject AgentBridgeServer::handlePointsSaveJson(const QJsonValue& params)
-{
-    const QJsonObject p = params.toObject();
-    CState* state = _window ? _window->_state : nullptr;
-    VCCollection* pc = requirePointStore(state);
-
-    const QString path = p.value("path").toString();
-
-    QJsonObject result;
-    result["saved"] = pc->saveToJSON(path.toStdString());
-    return result;
-}
 
 
-QJsonObject AgentBridgeServer::handlePointsLoadJson(const QJsonValue& params)
-{
-    const QJsonObject p = params.toObject();
-    CState* state = _window ? _window->_state : nullptr;
-    VCCollection* pc = requirePointStore(state);
 
-    const QString path = p.value("path").toString();
-
-    QJsonObject result;
-    result["loaded"] = pc->loadFromJSON(path.toStdString());
-    return result;
-}
-
-
-QJsonObject AgentBridgeServer::handlePointsSaveSegmentPath(const QJsonValue& params)
-{
-    const QJsonObject p = params.toObject();
-    CState* state = _window ? _window->_state : nullptr;
-    VCCollection* pc = requirePointStore(state);
-
-    const QString segmentPath = p.value("segmentPath").toString();
-
-    QJsonObject result;
-    result["saved"] = pc->saveToSegmentPath(std::filesystem::path(segmentPath.toStdString()));
-    return result;
-}
-
-
-QJsonObject AgentBridgeServer::handlePointsLoadSegmentPath(const QJsonValue& params)
-{
-    const QJsonObject p = params.toObject();
-    CState* state = _window ? _window->_state : nullptr;
-    VCCollection* pc = requirePointStore(state);
-
-    const QString segmentPath = p.value("segmentPath").toString();
-
-    QJsonObject result;
-    result["loaded"] = pc->loadFromSegmentPath(std::filesystem::path(segmentPath.toStdString()));
-    return result;
-}

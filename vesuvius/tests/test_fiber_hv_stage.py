@@ -1,4 +1,6 @@
+from pathlib import Path
 import numpy as np
+import pytest
 import torch
 from vesuvius.neural_tracing.fiber_trace_3d.fiber_hv_stage import losses, probabilities, hard_metrics
 
@@ -7,28 +9,46 @@ def test_preparation_freezes_stage1_and_active_degree(tmp_path):
     import json,sqlite3
     from lasagna.inference_provenance import sha256_file
     from vesuvius.neural_tracing.fiber_trace_3d.fiber_hv_stage import prepare
-    afvpath=tmp_path/'source.afv';afv=sqlite3.connect(afvpath)
-    afv.execute('CREATE TABLE fibers(id,length)');afv.executemany('INSERT INTO fibers VALUES(?,?)',[(i,100) for i in (10,20,30,40)])
-    afv.commit();afv.close()
+    from vesuvius.neural_tracing.tracers.shared.annotations.fiber_store import fibers_digest, write_fibers
+    ids=[f'00000000-0000-4000-8000-0000000000{k}' for k in (10,20,30,40)]
+    store=tmp_path/'source.vcobj'
+    write_fibers(store,[(dict(id=f),np.array([[0.,0,k],[100.,0,k]])) for k,f in enumerate(ids)],volume='123')
     dbpath=tmp_path/'input.sqlite';db=sqlite3.connect(dbpath)
     db.executescript('CREATE TABLE metadata(key,value);CREATE TABLE fibers(id,source_index,length_base);'
         'CREATE TABLE constraints(id,fiber_a,fiber_b,parallel_score,perpendicular_score);')
     db.executemany('INSERT INTO metadata VALUES(?,?)',[(k,json.dumps(v)) for k,v in
-        dict(complete=True,provenance=dict(afv_uuid='test',config=dict(afv=str(afvpath)))).items()])
-    db.executemany('INSERT INTO fibers VALUES(?,?,?)',[(10,0,100),(20,1,100),(30,2,100),(40,3,100)])
-    db.executemany('INSERT INTO constraints VALUES(?,?,?,?,?)',[(0,10,20,1,0),(1,10,30,0,1)])
+        dict(complete=True,provenance=dict(fibers_store_uuid='test',config=dict(fibers=str(store),coordinate_space='scroll/123'))).items()])
+    db.executemany('INSERT INTO fibers VALUES(?,?,?)',[(f,k,100) for k,f in enumerate(ids)])
+    db.executemany('INSERT INTO constraints VALUES(?,?,?,?,?)',[(0,ids[0],ids[1],1,0),(1,ids[0],ids[2],0,1)])
     db.commit();db.close()
-    solution=tmp_path/'solution.npz';np.savez(solution,ids=[10,20,30,40],broken=[False,True,False,False])
+    solution=tmp_path/'solution.npz';np.savez(solution,ids=ids,broken=[False,True,False,False])
     (tmp_path/'summary.json').write_text(json.dumps(dict(input=dict(signature=dict(database_sha256=sha256_file(dbpath))))))
     feature=tmp_path/'features.json';feature.write_text(json.dumps(dict(format='fiber-axial-priors',version=1,
-        afv_uuid='test',source_ids=[10,20,30,40],agreement=[1,1,-1,0],afv_sha256=sha256_file(afvpath),umbilicus_sha256='b')))
+        fibers_store_uuid='test',source_ids=ids,agreement=[1,1,-1,0],fibers_digest=fibers_digest(store),umbilicus_sha256='b')))
     cache=tmp_path/'tensors.npz';config=dict(database=str(dbpath),features=str(feature),stage1=str(solution),tensor_cache=str(cache))
     prepare(config)
     with np.load(cache) as data:
         np.testing.assert_array_equal(data['active'],[0,2,3]);np.testing.assert_array_equal(data['degree'],[1,1,0])
         np.testing.assert_array_equal(data['i'],[0]);np.testing.assert_array_equal(data['j'],[1])
         np.testing.assert_array_equal(data['inherited'],[False,True,False,False])
+        assert data['ids'].dtype.kind=='U' and list(data['ids'])==ids
     before=cache.stat().st_mtime_ns;prepare(config);assert cache.stat().st_mtime_ns==before
+    db=sqlite3.connect(dbpath);db.execute('UPDATE fibers SET length_base=99 WHERE source_index=3');db.commit();db.close()
+    with pytest.raises(ValueError,match='lengths differ'):prepare(config)
+
+
+def test_feature_export_records_store_identity(tmp_path,monkeypatch):
+    import json
+    from vesuvius.neural_tracing.fiber_trace_3d import constraint_extraction as native
+    from vesuvius.neural_tracing.fiber_trace_3d.fiber_hv_stage import run_features
+    from vesuvius.neural_tracing.tracers.shared.annotations.fiber_store import fibers_digest, write_fibers
+    store=tmp_path/'source.vcobj';write_fibers(store,[(dict(),np.array([[0.,0,0],[1.,0,0]]))],volume='123')
+    axis=tmp_path/'axis.json';axis.write_text('{}')
+    (tmp_path/'native.json').write_text(json.dumps(dict(fibers=str(store),umbilicus=str(axis),axial_prior_output=str(tmp_path/'features.json'))))
+    calls=[]
+    monkeypatch.setattr(native,'run_native_constraints',lambda path,settings:calls.append(json.loads(Path(path).read_text())))
+    run_features(dict(native_config=str(tmp_path/'native.json'),output_root=str(tmp_path/'out')))
+    assert calls[0]['fibers_digest']==fibers_digest(store) and len(calls[0]['umbilicus_sha256'])==64
 
 
 def test_scalar_objective_and_gradients():

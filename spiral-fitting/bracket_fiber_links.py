@@ -418,8 +418,7 @@ def build_branch(local: Fiber, local_index: int, target: Fiber, target_index: in
                  local_control: int, target_control: int, pending: bool) -> dict:
     entry = {
         'control_point_index': int(local_control),
-        # VC3D rebinds this from branch_file at load time.
-        'branch_fiber_id': 0,
+        'target_uuid': target.data['uuid'],
         'branch_control_point_index': int(target_control),
         'control_point_direction': _unit_tangent(local.line_xyz, local_index),
         'branch_control_point_direction': _unit_tangent(target.line_xyz, target_index),

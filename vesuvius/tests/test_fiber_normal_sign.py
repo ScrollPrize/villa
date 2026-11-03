@@ -69,22 +69,24 @@ def test_cached_tensor_identity_and_invalid_edges(tmp_path):
                      'CREATE TABLE constraints(id,fiber_a,fiber_b,perpendicular_score,parallel_score,normal_a,normal_b);')
     for key,value in dict(schema_version=2,complete=True,normal_orientation=dict(sample_spacing_base=16)).items():
         db.execute('INSERT INTO metadata VALUES(?,?)',(key,json.dumps(value)))
-    db.executemany('INSERT INTO fibers VALUES(?,?,?)',[(11,0,1),(12,1,1),(23,2,1)])
+    a,b,c=ids=[f'00000000-0000-4000-8000-0000000000{k}' for k in (11,12,23)]
+    db.executemany('INSERT INTO fibers VALUES(?,?,?)',[(a,0,1),(b,1,1),(c,2,1)])
     pos=json.dumps(dict(valid=True,xyz=[0,0,1],reason=''))
     neg=json.dumps(dict(valid=True,xyz=[0,0,-1],reason=''))
     invalid=json.dumps(dict(valid=False,xyz=None,reason='missing'))
     db.executemany('INSERT INTO constraints VALUES(?,?,?,?,?,?,?)',[
-        (0,11,12,1.,0.,pos,neg),(1,11,23,1.,0.,pos,invalid),(2,12,23,0.,1.,pos,pos)])
+        (0,a,b,1.,0.,pos,neg),(1,a,c,1.,0.,pos,invalid),(2,b,c,0.,1.,pos,pos)])
     db.commit();db.close()
     prior=tmp_path/'prior.json'
     prior.write_text(json.dumps(dict(format='fiber-outward-priors',source_database=str(path),
-        source_database_sha256=sha256_file(path),source_ids=[11,12,23],agreement=[1.,-1.,0.],
+        source_database_sha256=sha256_file(path),source_ids=ids,agreement=[1.,-1.,0.],
         statistics=dict(sample_spacing_base=16))))
     config=dict(database=str(path),priors=str(prior),tensor_cache=str(tmp_path/'tensor.npz'))
     cache=prepare(config)
     with np.load(cache) as data:
         assert data['dot'].tolist()==[-1.]
         assert data['i'].tolist()==[0] and data['j'].tolist()==[1]
+        assert data['ids'].tolist()==ids and data['event_ids'].tolist()==[0]
     stats=json.loads(cache.with_suffix('.json').read_text())
     assert stats['invalid_events_skipped']==1 and stats['isolated_fibers']==1
     assert prepare(config)==cache

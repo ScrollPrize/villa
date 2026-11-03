@@ -5,9 +5,13 @@ from vesuvius.neural_tracing.fiber_trace_3d import fiber_uv_surface_refinement a
 from vesuvius.neural_tracing.fiber_trace_3d import fiber_uv_event_offsets as eo
 
 
+def fid(k):
+    return f'00000000-0000-4000-8000-{k:012d}'
+
+
 def graph(family,buckets,source,i,j,shift,sign):
     n=len(family);k=3;s=np.zeros((n,3*k+3));s[:,:k+1]=-20;s[np.arange(n),buckets]=20
-    d=dict(family=np.array(family),source_id=np.array(source),phase=np.full(n,.2),z=np.zeros(n),
+    d=dict(family=np.array(family),source_id=np.array([fid(k) for k in source]),phase=np.full(n,.2),z=np.zeros(n),
         i=np.array(i),j=np.array(j),bucket_shift=np.array(shift),sign=np.array(sign),
         phase_delta=np.zeros(len(i)),ds_a=np.zeros(len(i)),ds_b=np.zeros(len(i)),
         parallel=np.array(family)[i]==np.array(family)[j],links=np.empty((0,4)))
@@ -17,7 +21,7 @@ def graph(family,buckets,source,i,j,shift,sign):
 def test_unconditional_probability_and_whole_source_removal():
     d,s,w,c=graph([0,0,0,1],[1,0,1,1],[11,22,11,33],[0],[1],[0],[1])
     result=ref.select(d,s,w,c)
-    assert result['removed_sources'].tolist()==[11,22]
+    assert result['removed_sources'].tolist()==[fid(11),fid(22)]
     assert result['retained'].tolist()==[False,False,False,True]
     s[3,:4]=np.log([.05,.49,.06,.40])
     assert not ref.select(d,s,w,c)['confident'][3]
@@ -37,11 +41,11 @@ def test_same_sheet_layer_order_seam_and_adjacent_winding():
 def test_sign_filter_simultaneous_not_order_dependent():
     d,s,w,c=graph([0,0,0],[2,1,0],[1,2,3],[0,1],[1,2],[0,0],[1,1])
     result=ref.select(d,s,w,c)
-    assert result['removed_sources'].tolist()==[1,2,3]
+    assert result['removed_sources'].tolist()==[fid(1),fid(2),fid(3)]
 
 
 def test_quadratic_matches_dense_and_reduces_uv():
-    meta=eo.adjacency([1,2],[0.,0.],[0,1],4.)
+    meta=eo.adjacency([fid(1),fid(2)],[0.,0.],[0,1],4.)
     meta['piece']=np.array([0,1])
     model=dict(meta=meta,piece=np.array([0,1]),edges=np.array([0]),links=np.array([],dtype=int),
         selection=dict(same_sheet=np.array([True])),base=np.array([[0.,10.],[20.,0.]]),
@@ -65,8 +69,8 @@ def test_sparse_duplicate_columns_and_disconnected_anchor():
 
 
 def test_refined_curve_interpolation_and_source_boundaries():
-    s=dict(source_id=np.array([11,22,33]),family=np.array([0,1,0]),piece_uv_base=np.zeros((3,2)),
-        endpoint_source=np.array([11,11,22,22]),endpoint_arc=np.array([0.,10.,0.,10.]),
+    s=dict(source_id=np.array([fid(11),fid(22),fid(33)]),family=np.array([0,1,0]),piece_uv_base=np.zeros((3,2)),
+        endpoint_source=np.array([fid(11),fid(11),fid(22),fid(22)]),endpoint_arc=np.array([0.,10.,0.,10.]),
         endpoint_uv_offset_base=np.array([[0.,0.],[10.,20.],[100.,100.],[200.,200.]]))
     p=ref.evaluate_points(s,[0,1,2],[5.,20.,5.],[7.,8.,9.])
     np.testing.assert_allclose(p,[[12,10],[200,208],[9,0]])
@@ -80,8 +84,8 @@ def test_initialize_filtered_links_and_nonzero_parent_offsets(tmp_path):
         links=np.array([[0,1,10,0],[1,2,10,0]],dtype=float))
     db=tmp_path/'constraints.sqlite'
     with sqlite3.connect(db) as con:
-        con.execute('CREATE TABLE constraints(id INTEGER,fiber_a INTEGER,fiber_b INTEGER,arc_a REAL,arc_b REAL)')
-        con.executemany('INSERT INTO constraints VALUES (?,?,?,?,?)',[(100,1,2,5,5),(101,1,2,25,25)])
+        con.execute('CREATE TABLE constraints(id INTEGER,fiber_a TEXT,fiber_b TEXT,arc_a REAL,arc_b REAL)')
+        con.executemany('INSERT INTO constraints VALUES (?,?,?,?,?)',[(100,fid(1),fid(2),5,5),(101,fid(1),fid(2),25,25)])
     c.update(database=str(db),event_uv_offsets=True,event_offset_tie_distance_base=4.)
     meta=eo.prepare(d,c)
     parent=dict(state=s,widths=w,event_ids=d['event_ids'],

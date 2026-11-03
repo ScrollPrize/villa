@@ -217,9 +217,49 @@ grants without starting workers and retries registration until the requested
 allocation is available. This is opt-in; it can wait indefinitely and each new
 registration joins the FIFO queue anew.
 
+For commands that can size their workers at startup, `accept_partial=True`
+instead accepts any nonempty granted GPU subset and positive CPU count within
+the request. Each admitted GPU must still have its requested VRAM budget.
+This conflicts with `wait_for_exact`. The child receives only admitted GPUs in
+`CUDA_VISIBLE_DEVICES` (in requested order), and the actual allocation as JSON
+in `VILLA_GPU_MANAGER_GRANT` (`cpu_cores`, `gpus` mapping UUIDs to bytes).
+The child must size CPU/GPU workers to this allocation. It remains fixed for
+the cohort lifetime; this is admission flexibility, not live worker resizing.
+Ownership checks and join-before-release cleanup remain unchanged. The default
+continues to require the complete requested allocation.
+
 `ProcessOwner` provides a separate ownership root for sibling cohorts managed
 by one coordinator. Pass its identity as `Client(registration_root=...)`,
 track each worker session before authorizing it, and retire it only after joining
 its workers. Closing the owner or losing the coordinator triggers cleanup of
 tracked sessions. This uses the existing explicit-root/worker protocol and does
 not claim unrelated coordinator children.
+# Global GPU constraints
+
+The production service reads `~/.config/villa-gpu-manager/constraints.json`
+from the **service owner's** home (not each client's). Override its path with
+`VILLA_GPU_MANAGER_CONSTRAINTS` when starting the service; shared deployments
+can point this at an administrator-owned common file. Every client of the same
+manager obeys it. This does not coordinate independently launched managers.
+
+```json
+{"allowed_gpu_uuids": ["GPU-your-full-uuid"]}
+```
+
+Use physical UUIDs from `nvidia-smi --query-gpu=index,uuid --format=csv,noheader`.
+`villa-gpu-manager constraints` shows the local file; `villa-gpu-manager
+constraints --gpu-uuids GPU-... GPU-...` writes it atomically. Run this as the
+service owner, or with the same explicit constraints path as the service.
+Edits automatically reload within approximately one second; no reload command
+or service restart is needed. Write atomically where possible. An empty list
+disables new GPU grants; `{}` restores the service's full inventory. A missing
+file uses the journaled policy (all inventoried GPUs on first startup). Deleting
+a loaded file does not relax restrictions. Invalid live edits retain the last
+valid policy and log an error; invalid startup configuration prevents startup.
+
+Removed GPUs drain through normal acknowledgement: reservations remain charged
+until released. Already running non-pausable tasks finish naturally; they are
+not killed or falsely declared released. Conflicting manual allocation overrides
+are cleared on reload. The physical inventory and journal remain intact, so
+clients may still request excluded UUIDs but cannot receive new grants on them.
+This is cooperative scheduling, not hardware access control.

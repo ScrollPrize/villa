@@ -90,11 +90,6 @@ inline void bind(nb::module_& m) {
         nb::gil_scoped_release release; device::Guard guard(out.device);
         launch_many(grids,keys,pointers,fill.data(),type,out.storage->ptr,static_cast<bool*>(valid.storage->ptr),out.device);
     });
-    m.def("_aligned_valid_cuda",[](const Plan& p,Owned& valid) {
-        if(valid.storage->bytes!=p.grid.output_count) throw nb::value_error("validity size mismatch");
-        nb::gil_scoped_release release; device::Guard guard(valid.device);
-        launch_valid(p.grid,static_cast<bool*>(valid.storage->ptr)); device::complete();
-    });
     m.def("_aligned_box_valid_cuda",[](Triple source,Triple start,Triple shape,Owned& valid) {
         std::size_t n=1;
         for(int a=0;a<3;++a) {

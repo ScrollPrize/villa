@@ -96,18 +96,6 @@ inline ChannelPlan channel_parameters(const Smear& t, const Array& a, Random&) {
     return {"", 0, {double(axis(t.axis, a.shape.size() - 1))}};
 }
 
-// Normalized intensity powers need only image precision. Preserve the wider
-// calculation when conversion would underflow, or a large exponent would
-// amplify rounding a normalized base close to one.
-template<class T> inline double intensity_power(double base, double exponent) {
-    if constexpr (std::is_same_v<T, float>) {
-        if ((base == 0 || base >= std::numeric_limits<float>::min()) &&
-            exponent >= std::numeric_limits<float>::min() && exponent <= 16)
-            return std::pow(float(base), float(exponent));
-    }
-    return std::pow(base, exponent);
-}
-
 // Share the transform with compact palette consumers. Their statistics and
 // bounds must be weighted by the actual number of voxels at each palette entry.
 template<class T, class Statistics, class Bounds>

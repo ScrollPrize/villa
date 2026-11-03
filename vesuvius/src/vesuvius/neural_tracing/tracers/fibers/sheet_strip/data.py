@@ -1,4 +1,4 @@
-"""Sheet-strip training data: decisions on AFV fibers where they lie on a verified patch, their tube inputs and strip
+"""Sheet-strip training data: decisions on fiber-store fibers where they lie on a verified patch, their tube inputs and strip
 targets.
 
 A decision is the fiber tracer's own training state (data/samples.make_sample: a simulated trace of the fiber up to
@@ -32,13 +32,13 @@ from vesuvius.neural_tracing.tracers.fibers.data.observations import IdentityObs
 from vesuvius.neural_tracing.tracers.fibers.sheet_strip.build_index import SPLITS
 from vesuvius.neural_tracing.tracers.fibers.sheet_strip.model import strip_grid
 from vesuvius.neural_tracing.tracers.fibers.sheet_strip.targets import strip_targets
-from vesuvius.neural_tracing.tracers.shared.annotations.afv import AFVFibers
+from vesuvius.neural_tracing.tracers.shared.annotations.fiber_store import FiberStore, fiber_volume
 from vesuvius.neural_tracing.tracers.shared.geometry import dense_line
 from vesuvius.neural_tracing.tracers.sheets.data.patches import PatchInfo, PatchStore
 
 
 class StripIndex:
-    """The run index (memory-mapped) of one split: its fibers ('units', AFV catalog indices) and their runs."""
+    """The run index (memory-mapped) of one split: its fibers ('units', fiber-store catalog indices) and their runs."""
 
     def __init__(self, path, split):
         path = Path(path)
@@ -81,11 +81,11 @@ def merged_spans(start, end):
 
 
 class RunFibers(Sequence):
-    """The index's units as fibers (AFVFibers geometry in trace voxels), with their matched lengths as sampling
+    """The index's units as fibers (FiberStore geometry in trace voxels), with their matched lengths as sampling
     weights (``lengths``, read by FollowDataset)."""
 
-    def __init__(self, afv, index: StripIndex, grid_scale, length_power=1.):
-        self.afv = AFVFibers(afv, grid_scale, split='all', cache_size=64)
+    def __init__(self, fibers, index: StripIndex, grid_scale, length_power=1.):
+        self.fibers = FiberStore(fibers, fiber_volume(fibers), grid_scale, split='all', cache_size=64)
         self.index = index
         self.lengths = index.unit_length**length_power
 
@@ -93,7 +93,7 @@ class RunFibers(Sequence):
         return len(self.index)
 
     def __getitem__(self, unit):
-        return self.afv[int(self.index.units[unit])]
+        return self.fibers[int(self.index.units[unit])]
 
 
 class StripDataset(FollowDataset):

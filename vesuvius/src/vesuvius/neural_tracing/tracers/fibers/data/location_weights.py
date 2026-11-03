@@ -17,6 +17,7 @@ from pathlib import Path
 import numpy as np
 from scipy.ndimage import gaussian_filter1d, map_coordinates
 
+from vesuvius.neural_tracing.tracers.shared.annotations.fiber_store import fibers_digest
 from vesuvius.neural_tracing.tracers.shared.geometry import interp_at
 
 STRIDE = 8.
@@ -26,22 +27,23 @@ DEFAULT_DIR = Path(__file__).resolve().parents[1]/'output'/'location_weights'
 
 
 def cache_path(source, directory=None):
-    """The cache file of a dataset source: its name and the identity of its annotations."""
+    """The cache file of a dataset source: its name and the identity of its annotations (a fiber store's content
+    digest)."""
     if source['kind'] == 'paris4':
         identity = hashlib.sha256(str(Path(source['fibers']).resolve()).encode()).hexdigest()[:12]
     else:
-        identity = str(source['sha256'])[:12]
+        identity = fibers_digest(source['path'])[:12]
     return Path(directory or DEFAULT_DIR)/f"{source['name']}_{identity}_v{VERSION}.npz"
 
 
 def load(path, fibers, bend_boost=1., compression_boost=1.):
-    """Per fiber (aligned with ``fibers`` by name): (arclength positions, location weights), or None for a fiber the
-    cache does not hold (uniform)."""
+    """Per fiber (aligned with ``fibers`` by name, or by UUID for a fiber store): (arclength positions, location
+    weights), or None for a fiber the cache does not hold (uniform)."""
     with np.load(path) as data:  # read each array once: an npz decompresses on every access
         names, starts, arcs = data['names'], data['starts'], data['arcs'].astype(np.float64)
         weight = 1.+bend_boost*data['bent']+compression_boost*data['compressed']
     index = {str(n): i for i, n in enumerate(names)}
-    wanted = [row[1] for row in fibers.catalog] if hasattr(fibers, 'catalog') else [f.name for f in fibers]
+    wanted = [row['id'] for row in fibers.catalog] if hasattr(fibers, 'catalog') else [f.name for f in fibers]
     out = []
     for name in wanted:
         i = index.get(str(name))

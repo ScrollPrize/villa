@@ -4,22 +4,25 @@ from vesuvius.neural_tracing.fiber_trace_3d.fiber_piece_split import split_graph
 from vesuvius.neural_tracing.fiber_trace_3d.fiber_v_endpoint_offsets import topology
 
 
+A,B='00000000-0000-4000-8000-000000000010','00000000-0000-4000-8000-000000000020'
+
+
 def graph():
     arcs=np.arange(500,8000,500,dtype=float);n=len(arcs)
-    d=dict(source_id=np.array([10,20]),source_index=np.arange(2),family=np.array([0,1]),
+    d=dict(source_id=np.array([A,B]),source_index=np.arange(2),family=np.array([0,1]),
         start=np.zeros(2),end=np.full(2,8000.),lengths=np.full(2,8000.),
         phase=np.zeros(2),z=np.zeros(2),radius=np.ones(2)*100,
         initial_k=np.zeros(2),node_ds=np.array([[0,4000,8000],[0,-4000,-8000]]),
         i=np.zeros(n,int),j=np.ones(n,int),ds_a=arcs,ds_b=-arcs,
         parallel=np.zeros(n,bool),links=np.empty((0,4)))
-    curves={10:np.array([[100,0,0],[100,0,8000.]]),20:np.array([[100,0,0],[100,0,8000.]])}
+    curves={A:np.array([[100,0,0],[100,0,8000.]]),B:np.array([[100,0,0],[100,0,8000.]])}
     return d,curves,np.array([[0,0,0],[0,0,8000.]])
 
 
 def test_split_preserves_arcs_lengths_support_and_protected_gt():
-    d,c,a=graph();s=split_graph_geometry(d,2000,4,c,a,protected_sources=[20])
+    d,c,a=graph();s=split_graph_geometry(d,2000,4,c,a,protected_sources=[B])
     assert len(s['family'])==4 and len(s['links'])==2
-    assert np.sum(s['lengths'][s['source_id']==10])==8000
+    assert np.sum(s['lengths'][s['source_id']==A])==8000
     np.testing.assert_allclose(s['start'][s['i']]+s['ds_a'],d['ds_a'])
     np.testing.assert_allclose(s['start'][s['j']]-s['ds_b'],-d['ds_b'])
     assert np.all(np.bincount(s['i'],minlength=4)[:3]>=4)

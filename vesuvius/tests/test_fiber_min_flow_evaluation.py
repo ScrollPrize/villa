@@ -10,17 +10,21 @@ from vesuvius.neural_tracing.fiber_trace_3d.fiber_min_flow_evaluation import (
 from vesuvius.neural_tracing.fiber_trace_3d.fiber_min_flow_experiment import load_config, run
 
 
+def U(n):
+    return f'00000000-0000-4000-8000-{n:012d}'
+
+
 def reference_inputs():
-    data = dict(source_id=np.array([10]))
-    gt = dict(source_id=np.array([20]), node_phase=np.zeros((1, 2)))
+    data = dict(source_id=np.array([U(10)]))
+    gt = dict(source_id=np.array([U(20)]), node_phase=np.zeros((1, 2)))
     solution = dict(winding=np.array([2]), component=np.array([0]))
     # First comparison crosses the seam; both fibers also cross on their way
     # to the endpoints. Second comparison has no crossings. Both should be +1.
     paths = SimpleNamespace(at=lambda source, arc: (arc, int(arc == 1)),
                             seam=SimpleNamespace(segment=lambda a, b: int(a == 1)))
     gt_paths = SimpleNamespace(at=lambda source, arc: (arc, 2*int(arc == 1)))
-    reference = dict(fiber_offsets={'20': 3}, excluded_source_ids=[])
-    events = [dict(event_id=i, gt_source=20, test_source=10, test_arc=i, gt_arc=i,
+    reference = dict(fiber_offsets={U(20): 3}, excluded_source_ids=[])
+    events = [dict(event_id=i, gt_source=U(20), test_source=U(10), test_arc=i, gt_arc=i,
                    gt_piece=0, signed_distance=1., family_delta=0, parallel=True) for i in (0, 1)]
     return data, solution, paths, reference, events, gt, gt_paths
 
@@ -41,7 +45,7 @@ def test_reference_compensates_both_fibers_and_connector():
 
 def test_empty_reference_coverage_and_unknown_signs():
     args = list(reference_inputs())
-    args[3] = dict(fiber_offsets={}, excluded_source_ids=[20])
+    args[3] = dict(fiber_offsets={}, excluded_source_ids=[U(20)])
     result = large_reference(*args)
     assert result['all']['events'] == 0
     assert result['all']['l1'] is None
@@ -55,9 +59,9 @@ def test_empty_reference_coverage_and_unknown_signs():
 
 def test_component_alignment_reports_global_disagreement():
     args = list(reference_inputs())
-    args[0] = dict(source_id=np.array([10, 11]))
+    args[0] = dict(source_id=np.array([U(10), U(11)]))
     args[1] = dict(winding=np.array([2, 7]), component=np.array([0, 1]))
-    args[4][1]['test_source'] = 11
+    args[4][1]['test_source'] = U(11)
     result = large_reference(*args)
     assert result['all']['l1'] == 0
     assert result['single_global_gauge']['metrics']['all']['l1'] > 0
@@ -83,12 +87,12 @@ def test_baseline_comparison_checks_topology_and_aligns_gauge():
 def test_config_resolves_declaring_file_paths_and_rejects_name_collisions(tmp_path):
     nested = tmp_path/'nested'
     nested.mkdir()
-    (nested/'dataset.json').write_text(json.dumps(dict(afv='fibers.afv', umbilicus='axis.json', tensor_cache='cache.npz')))
+    (nested/'dataset.json').write_text(json.dumps(dict(fibers='fibers.vcobj', umbilicus='axis.json', tensor_cache='cache.npz')))
     config = dict(output_root='results', cases=[dict(name='a', dataset='nested/dataset.json')])
     path = tmp_path/'run.json'
     path.write_text(json.dumps(config))
     resolved, dependencies = load_config(path)
-    assert resolved['cases'][0]['dataset']['afv'] == str(nested/'fibers.afv')
+    assert resolved['cases'][0]['dataset']['fibers'] == str(nested/'fibers.vcobj')
     assert str(nested/'dataset.json') in dependencies
     config['cases'] *= 2
     path.write_text(json.dumps(config))
@@ -102,12 +106,12 @@ def test_config_resolves_declaring_file_paths_and_rejects_name_collisions(tmp_pa
 
 def test_runner_without_gt_or_baseline_and_split_sign_direction(tmp_path, monkeypatch):
     from vesuvius.neural_tracing.fiber_trace_3d import fiber_min_flow_experiment as module
-    d = dict(source_id=np.array([10,20]), family=np.array([0,0]), i=np.array([0]), j=np.array([1]),
+    d = dict(source_id=np.array([U(10),U(20)]), family=np.array([0,0]), i=np.array([0]), j=np.array([1]),
              sign=np.array([-1]), parallel=np.array([True]), links=np.empty((0,4)),
              node_ds=np.array([[0,10],[0,10]]), start=np.zeros(2), end=np.full(2,10.),
              ds_a=np.array([5]), ds_b=np.array([5]))
     np.savez(tmp_path/'cache.npz', **d)
-    for name in ('fibers.afv','axis.json'):
+    for name in ('fibers.vcobj','axis.json'):
         (tmp_path/name).write_text('unused synthetic geometry')
     monkeypatch.setattr(module, 'Paths', lambda *args: None)
     def graph(*args):
@@ -116,7 +120,7 @@ def test_runner_without_gt_or_baseline_and_split_sign_direction(tmp_path, monkey
                 dict(valid=np.array([True]), fiber_a=np.array([0]), fiber_b=np.array([0]),
                      connector=np.array([0]), flow_event_index=np.array([0])))
     monkeypatch.setattr(module, 'graph', graph)
-    case = dict(name='test', dataset=dict(afv='fibers.afv', umbilicus='axis.json', tensor_cache='cache.npz'),
+    case = dict(name='test', dataset=dict(fibers='fibers.vcobj', umbilicus='axis.json', tensor_cache='cache.npz'),
                 sign_only=True, split=dict(minimum_length_vx=0))
     path=tmp_path/'config.json'
     path.write_text(json.dumps(dict(output_root='output', cases=[case])))
@@ -134,9 +138,9 @@ def test_runner_without_gt_or_baseline_and_split_sign_direction(tmp_path, monkey
 def test_reference_rejects_contradictory_or_fractional_labels():
     from vesuvius.neural_tracing.fiber_trace_3d.fiber_min_flow_evaluation import reference_offsets
     with pytest.raises(ValueError, match='Excluded'):
-        reference_offsets(dict(fiber_offsets={'1': 2}, excluded_source_ids=[1]))
+        reference_offsets(dict(fiber_offsets={U(1): 2}, excluded_source_ids=[U(1)]))
     with pytest.raises(ValueError, match='integers'):
-        reference_offsets(dict(fiber_offsets={'1': .5}))
+        reference_offsets(dict(fiber_offsets={U(1): .5}))
 
 
 def test_generated_cross_event_document_matches_bare_list():
@@ -164,7 +168,7 @@ def test_invalid_gt_piece_indices_rejected(piece):
 
 def test_gt_piece_source_mismatch_rejected_even_without_reference_coverage():
     args = list(reference_inputs())
-    args[5]['source_id'][0] = 999
+    args[5]['source_id'][0] = U(999)
     for reference in (args[3], dict(fiber_offsets={})):
         args[3] = reference
         with pytest.raises(ValueError, match='GT piece/source mismatch'):
@@ -173,9 +177,9 @@ def test_gt_piece_source_mismatch_rejected_even_without_reference_coverage():
 
 def test_relation_scores_ignore_unidentifiable_gauges():
     from vesuvius.neural_tracing.fiber_trace_3d.fiber_min_flow_evaluation import small_reference
-    d = dict(source_id=np.array([10, 20, 30, 40]), i=np.array([0, 1, 2]),
+    d = dict(source_id=np.array([U(10), U(20), U(30), U(40)]), i=np.array([0, 1, 2]),
              j=np.array([1, 2, 3]), node_phase=np.zeros((4, 1)), parallel=np.array([True]*3))
-    reference = dict(fiber_offsets={'10': 0, '20': 1, '30': 1})
+    reference = dict(fiber_offsets={U(10): 0, U(20): 1, U(30): 1})
     transport = dict(fiber_a=np.zeros(3, int), fiber_b=np.zeros(3, int))
     def score(shift):
         return small_reference(d, dict(winding=np.array([0, 1, 1+shift, 1+shift]),

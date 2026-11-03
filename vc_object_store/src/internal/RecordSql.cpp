@@ -1,6 +1,6 @@
 #include "internal/RecordSql.hpp"
 #include "internal/RecordFields.hpp"
-#include "internal/GeometryCoordinates.hpp"
+#include "vc_object_store/objects/GeometryCoordinates.hpp"
 
 namespace vc::objects::detail {
 const char* kObjectCols =
@@ -23,7 +23,7 @@ std::string projectedObjectColumns(const ObjectFields& fields)
         {"approved_host", "NULL"}, {"approved_generation", "NULL"}, {"format_version", "0"},
         {"storage_kind", "''"}, {"storage_ref", "''"}, {"data_generation", "0"},
         {"data_checksum", "NULL"}, {"meta", "'{}'"}};
-    std::set<std::string> valid{"tags", "fiber", "patch", "track", "retired", "lifecycle_epoch"};
+    std::set<std::string> valid{"tags", "fiber", "surface", "track", "retired", "lifecycle_epoch"};
     std::string sql = "id";
     for (const auto& [name, fallback] : columns) {
         valid.insert(name);
@@ -35,21 +35,25 @@ std::string projectedObjectColumns(const ObjectFields& fields)
 }
 
 void appendJournal(sqlite3* db, const std::string& author, const std::string& hostname,
-                   const std::array<unsigned char, 16>& uuid, int64_t generation, const char* changeKind)
+                   const std::array<unsigned char, 16>& uuid, int64_t generation, const char* changeKind,
+                   const std::string& deletedKind)
 {
-    Statement state(db, "SELECT approval_state,approved_by,approved_at,approved_host,approved_generation FROM objects WHERE uuid=? "
-        "UNION ALL SELECT approval_state,approved_by,approved_at,approved_host,approved_generation FROM edges WHERE uuid=?",
+    Statement state(db, "SELECT kind,approval_state,approved_by,approved_at,approved_host,approved_generation FROM objects WHERE uuid=? "
+        "UNION ALL SELECT kind,approval_state,approved_by,approved_at,approved_host,approved_generation FROM edges WHERE uuid=?",
         uuid, uuid);
     const bool hasState = state.row();
-    Statement s(db, "INSERT INTO journal(record_uuid,generation,author,hostname,timestamp,change_kind,"
-                    "approval_state,approved_by,approved_at,approved_host,approved_generation) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-        uuid, generation, author, hostname, nowIsoUtc(), std::string(changeKind));
+    // Deleted records no longer have a row; their caller read the kind first.
+    const std::string kind = hasState ? state.text(0) : deletedKind;
+    if (kind.empty()) throw std::logic_error("object store: journal entry without record kind");
+    Statement s(db, "INSERT INTO journal(record_uuid,record_kind,generation,author,hostname,timestamp,change_kind,"
+                    "approval_state,approved_by,approved_at,approved_host,approved_generation) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+        uuid, kind, generation, author, hostname, nowIsoUtc(), std::string(changeKind));
     for (int i = 0; i < 4; ++i) {
-        if (hasState && !state.isNull(i)) s.bind(7 + i, state.text(i));
-        else s.bindNull(7 + i);
+        if (hasState && !state.isNull(1 + i)) s.bind(8 + i, state.text(1 + i));
+        else s.bindNull(8 + i);
     }
-    if (hasState && !state.isNull(4)) s.bind(11, state.i64(4));
-    else s.bindNull(11);
+    if (hasState && !state.isNull(5)) s.bind(12, state.i64(5));
+    else s.bindNull(12);
     s.stepDone();
 }
 
@@ -114,9 +118,9 @@ template<class Visit> void detailTables(Visit visit)
     visit("fiber", "fibers", "family,manual_family,control_point_count,line_point_count,length,width,"
         "width_gap_fraction,optimization_mode,bbox_min_x,bbox_min_y,bbox_min_z,bbox_max_x,bbox_max_y,bbox_max_z",
         &ObjectRecord::fiber, readDetail<FiberDetail>, 14);
-    visit("patch", "patches", "grid_width,grid_height,scale,scale_y,"
+    visit("surface", "surfaces", "grid_width,grid_height,scale,scale_y,area,"
         "bbox_min_x,bbox_min_y,bbox_min_z,bbox_max_x,bbox_max_y,bbox_max_z",
-        &ObjectRecord::patch, readDetail<PatchDetail>, 10);
+        &ObjectRecord::surface, readDetail<SurfaceDetail>, 11);
     visit("track", "tracks", "dataset_ref,external_key,family,point_count,length,"
         "bbox_min_x,bbox_min_y,bbox_min_z,bbox_max_x,bbox_max_y,bbox_max_z",
         &ObjectRecord::track, readDetail<TrackDetail>, 11);
@@ -153,7 +157,7 @@ ObjectRecord readObjectRow(sqlite3* db, const Statement& s, bool details)
 
 std::vector<ObjectRecord> readObjectRows(sqlite3* db, Statement& rows, const ObjectFields& fields)
 {
-    const bool hydrate = wants(fields, "tags") || wants(fields, "fiber") || wants(fields, "patch") || wants(fields, "track");
+    const bool hydrate = wants(fields, "tags") || wants(fields, "fiber") || wants(fields, "surface") || wants(fields, "track");
     std::vector<ObjectRecord> result;
     nlohmann::json ids = nlohmann::json::array();
     std::unordered_map<int64_t, size_t> positions;
@@ -201,7 +205,15 @@ void validateObjectDetail(const ObjectRecord& rec)
 
 void writeObjectDetail(sqlite3* db, int64_t id, const ObjectRecord& rec)
 {
-    for (const char* table : {"fibers", "patches", "tracks"}) {
+    // A surface's area is the store's (refreshSurfaceArea), kept across record
+    // writes, as is its detail row when a record carries none.
+    std::optional<double> storedArea;
+    {
+        Statement area(db, "SELECT area FROM surfaces WHERE object_id=?", id);
+        if (area.row()) storedArea = area.f64(0);
+    }
+    for (const char* table : {"fibers", "surfaces", "tracks"}) {
+        if (storedArea && rec.kind == "surface" && !rec.surface && std::string(table) == "surfaces") continue;
         execute(db, std::string("DELETE FROM ") + table + " WHERE object_id=?", id);
     }
     bool written = false;
@@ -228,6 +240,7 @@ void writeObjectDetail(sqlite3* db, int64_t id, const ObjectRecord& rec)
         row.stepDone();
         written = true;
     });
+    if (storedArea && rec.surface) execute(db, "UPDATE surfaces SET area=? WHERE object_id=?", *storedArea, id);
 }
 
 void writeTags(sqlite3* db, const char* table, const char* idColumn, int64_t id, const std::vector<std::string>& tags)
@@ -249,6 +262,13 @@ void restoreCommon(sqlite3* db, const char* table, const RecordCommon& rec)
         rec.approvedGeneration, parseUuid(rec.uuid));
 }
 
+void validateGeometrySourceMetadata(sqlite3* db, const std::string& uuid, const nlohmann::json& source)
+{
+    for (const auto* key : {"point_attributes", "control_points_attributes", "line_points_attributes", "points_attributes"})
+        if (source.contains(key) && geometryHead(db, uuid))
+            throw std::invalid_argument("point annotations belong to geometry; use sequence editing");
+}
+
 std::string upsertObjectImpl(sqlite3* db, const std::string& author, const std::string& host, const ObjectRecord& input,
                              bool preserveRecord, const char* importOperation)
 {
@@ -256,10 +276,10 @@ std::string upsertObjectImpl(sqlite3* db, const std::string& author, const std::
     Savepoint savepoint(db);
     if (input.kind.empty())
         throw std::runtime_error("object store: object kind must be non-empty");
-    if (input.patch)
-        for (double axis : input.patch->scale)
+    if (input.surface)
+        for (double axis : input.surface->scale)
             if (!std::isfinite(axis) || axis < 0)
-                throw std::runtime_error("object store: patch scale must be finite and nonnegative");
+                throw std::runtime_error("object store: surface scale must be finite and nonnegative");
     ObjectRecord rec = input;
     if (rec.uuid.empty())
         rec.uuid = util::newUuid();
@@ -272,6 +292,7 @@ std::string upsertObjectImpl(sqlite3* db, const std::string& author, const std::
             meta["coordinates"] = geometryCoordinates(meta["coordinates"]);
         else if (!preserveRecord && !objectIdByUuid(db, uuid))
             meta["coordinates"] = geometryCoordinates(nlohmann::json::object());
+        validateGeometrySourceMetadata(db, rec.uuid, meta.value("source", nlohmann::json::object()));
         rec.meta = meta.dump();
     }
     const auto bounds = detail::recordBounds(rec);

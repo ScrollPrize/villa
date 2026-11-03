@@ -46,10 +46,10 @@
    9
   ],
   "unpadded_blocks": true,
-  "fiber_runs": "/ephemeral/sean/sheet_tracing/data/afv/paris4_H_fiber_runs.jsonl",
+  "fiber_runs": "/ephemeral/sean/sheet_tracing/data/fiber_store/paris4_H_fiber_runs.jsonl",
   "fiber_fraction": 0.25,
   "follow_fraction": 0.2,
-  "fiber_pool": "/ephemeral/sean/sheet_tracing/data/afv/paris4_fiber_pool"
+  "fiber_pool": "/ephemeral/sean/sheet_tracing/data/fiber_store/paris4_fiber_pool"
  },
  "model": {
   "crop": [

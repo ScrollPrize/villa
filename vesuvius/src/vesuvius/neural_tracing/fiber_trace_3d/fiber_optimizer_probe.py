@@ -189,7 +189,7 @@ def summarize(root):
                 col=lp.argmax(1);p=ext.positions()[torch.arange(len(ext.owner)),col[ext.owner]]
                 r,l,_,_,gap,owners=direction_plan(ext.owner,ext.v_offset_arc,ext.curve.family,ext.curve.direction)
                 length=(p[r]-p[l]).norm(dim=1);worst=int((length/gap-1).abs().argmax())
-                row['worst_length_segment']=dict(fiber=int(d['source_id'][owners[worst]]),
+                row['worst_length_segment']=dict(fiber=str(d['source_id'][owners[worst]]),
                     reference_length=float(gap[worst]),fitted_length=float(length[worst]))
                 prob=(lp.exp().amax(1)*state[:,3].sigmoid()).numpy()
                 row['meeting_events']=current_eligible_edges(d,ext,state,torch.as_tensor(s['widths']),col,prob).tolist()

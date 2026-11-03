@@ -395,19 +395,6 @@ TEST_CASE("compact chunk pixel lookup reports uint16 ID overflow")
     CHECK(lookup[0].pixelIds(0, distinctChunks - 1) == 0);
 }
 
-TEST_CASE("requestPlaneDependencies / requestCoordsDependencies run without crashing")
-{
-    AllDataArray a;
-    cv::Mat_<uint8_t> coverage(4, 4, uint8_t{0});
-    ChunkedPlaneSampler::requestPlaneDependencies(
-        a, 0, cv::Vec3f(0, 0, 0), cv::Vec3f(1, 0, 0), cv::Vec3f(0, 1, 0), coverage);
-    auto coords = axisAlignedCoords(4, 4);
-    ChunkedPlaneSampler::requestCoordsDependencies(a, 0, coords, coverage);
-    // The exact prefetch count depends on internal heuristics; we just
-    // verify the call surface is reachable and doesn't throw.
-    CHECK(a.prefetchCalls >= 0);
-}
-
 TEST_CASE("samplePlaneLevel: covers all pixels of a fully-resident plane")
 {
     AllDataArray a(42, 0);
@@ -511,26 +498,10 @@ TEST_CASE("samplePlaneFineToCoarse: queued chunks remain uncovered")
     CHECK(out(0, 0) == 123);
 }
 
-TEST_CASE("samplePlaneCoarseToFine: paints coarse first, overwrites with fine")
-{
-    AllDataArray a(/*lvl0=*/55, /*lvl1=*/22);
-    cv::Mat_<uint8_t> out(2, 2, uint8_t{0});
-    cv::Mat_<uint8_t> coverage(2, 2, uint8_t{0});
-    ChunkedPlaneSampler::samplePlaneCoarseToFine(
-        a, /*finestLevel=*/0,
-        cv::Vec3f(0, 0, 0), cv::Vec3f(1, 0, 0), cv::Vec3f(0, 1, 0),
-        out, coverage, {vc::Sampling::Nearest, 2});
-    // Fine value should win.
-    CHECK(out(0, 0) == 55);
-}
-
-TEST_CASE("sampleCoords coarse/fine variants run without crashing")
+TEST_CASE("sampleCoordsFineToCoarse runs without errors")
 {
     AllDataArray a(1, 2);
     auto coords = axisAlignedCoords(2, 2);
-    cv::Mat_<uint8_t> out1(2, 2, uint8_t{0}), cov1(2, 2, uint8_t{0});
-    auto s1 = ChunkedPlaneSampler::sampleCoordsCoarseToFine(a, 0, coords, out1, cov1);
-    CHECK(s1.errorChunks == 0);
     cv::Mat_<uint8_t> out2(2, 2, uint8_t{0}), cov2(2, 2, uint8_t{0});
     auto s2 = ChunkedPlaneSampler::sampleCoordsFineToCoarse(a, 0, coords, out2, cov2);
     CHECK(s2.errorChunks == 0);

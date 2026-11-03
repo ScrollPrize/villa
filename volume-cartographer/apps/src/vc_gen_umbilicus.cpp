@@ -5,7 +5,7 @@
 // it to the single point the sheet normals of that section point away from. This tool runs that
 // function, the one in core/src/normalgridtools.cpp and not a copy of it, over a set of slices
 // and writes the points it returns as an umbilicus file, which is the form
-// Umbilicus::FromFile and resolveScrollUmbilicus already read.
+// vc::objects::readUmbilicusFile and VC3D's Import Umbilicus read.
 //
 // Only the xy plane is offered, because an umbilicus is a curve with one point per z, and the xy
 // grids are the slices whose centre that point is. The xz and yz grids of the same volume hold
@@ -198,7 +198,7 @@ int main(int argc, char** argv)
         ("input,i", po::value<std::string>(),
             "Normal grid volume directory, a directory of NNNNNN.grid files, or one .grid file")
         ("output,o", po::value<std::string>(),
-            "Umbilicus json to write (control_points, as Umbilicus::FromFile reads them)")
+            "Umbilicus json to write (control_points, as Import Umbilicus reads them)")
         ("csv", po::value<std::string>(),
             "Also write every single estimate here, one row per slice and repeat")
         ("slices", po::value<std::string>(),
@@ -209,6 +209,11 @@ int main(int argc, char** argv)
         ("seed", po::value<std::uint32_t>(),
             "Base seed. Slice z repeat r uses seed + z + 1000 * r, so a run repeats exactly. "
             "Without it the library's shared hardware seeded generator is used, as published")
+        ("uncrush", po::value<double>()->default_value(0.0),
+            "Un-crush strength for crushed scrolls: each slice is stretched along the axis its "
+            "segment normals crowd towards before the search, each part of the slice counting once "
+            "however densely it was sampled. Slices spanning under half a turn are left as they "
+            "are. 0 is the estimator unchanged; 1.5 is the measured setting")
         ("repeats", po::value<int>()->default_value(1),
             "Estimates per slice. The control point written is their coordinatewise median")
         ("threads", po::value<int>()->default_value(1),
@@ -254,12 +259,17 @@ int main(int argc, char** argv)
     const int level = vm["level"].as<int>();
     const int repeats = vm["repeats"].as<int>();
     const int threads = vm["threads"].as<int>();
+    const double uncrush = vm["uncrush"].as<double>();
     const std::optional<std::uint32_t> baseSeed =
         vm.count("seed") ? std::optional<std::uint32_t>(vm["seed"].as<std::uint32_t>())
                          : std::nullopt;
 
     if (repeats < 1) {
         std::cerr << "Error: --repeats must be at least 1." << std::endl;
+        return EXIT_FAILURE;
+    }
+    if (!(uncrush >= 0.0 && uncrush <= 4.0)) {
+        std::cerr << "Error: --uncrush must be between 0 and 4." << std::endl;
         return EXIT_FAILURE;
     }
     if (threads < 1) {
@@ -402,7 +412,7 @@ int main(int argc, char** argv)
                     e.seed = static_cast<std::uint32_t>(*baseSeed + slice +
                                                         1000 * static_cast<std::uint32_t>(task.repeat));
                 }
-                e.point = align_and_extract_umbilicus(*grid, e.seed);
+                e.point = align_and_extract_umbilicus(*grid, e.seed, static_cast<float>(uncrush));
                 if (std::isnan(e.point[0]) || std::isnan(e.point[1])) {
                     std::lock_guard<std::mutex> lock(reportMutex);
                     std::cerr << "slice " << slice << ": no segments, skipped" << std::endl;
@@ -493,6 +503,7 @@ int main(int argc, char** argv)
     metadata["plane"] = "xy";
     metadata["coordinate_scale"] = coordinateScale;
     metadata["repeats"] = repeats;
+    metadata["uncrush"] = uncrush;
     if (baseSeed) {
         metadata["seed"] = static_cast<int64_t>(*baseSeed);
     }
@@ -503,7 +514,7 @@ int main(int argc, char** argv)
         metadata["voxelsize_um"] = vm["voxelsize-um"].as<double>();
     }
     // The grid dimension triplet is stamped only when all three are given. Two of three is read
-    // by Umbilicus::LoadFileInfo as a malformed statement and refuses the file, and the tool
+    // by vc::objects::readUmbilicusFile as a malformed statement and refuses the file, and the tool
     // cannot supply the third itself: the grids state their extent in x and y but not the slice
     // count of the volume they came from, since a sparse or partial set of grid files is
     // indistinguishable from a short volume.

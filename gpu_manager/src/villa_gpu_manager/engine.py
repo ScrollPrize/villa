@@ -31,11 +31,13 @@ class Engine:
         self.max_tasks = max_tasks
         self.draining = False
         self.blocked_gpus = set()
+        self.allowed_gpus = set(inventory["gpus"])
         self.epoch = str(uuid.uuid4())
         self.state = copy.deepcopy(state) if state is not None else {
             "inventory": inventory, "tasks": {}, "override": None,
             "policy_revision": 0, "next_order": 0, "dedup": {}, "retired_ids": []}
         require(self.state["inventory"] == inventory, "journal inventory differs; reconcile before changing pool")
+        self.allowed_gpus = set(self.state.get("allowed_gpu_uuids", inventory["gpus"]))
         self.state["dedup"] = {}
         self._exclude_service_members()
         if state is not None:
@@ -66,6 +68,13 @@ class Engine:
     def tasks(self):
         return self.state["tasks"]
 
+    def set_allowed_gpus(self, allowed):
+        self.allowed_gpus = set(allowed)
+        self.state["allowed_gpu_uuids"] = sorted(allowed)
+        self.state["policy_revision"] += 1
+        self._invalidate_override()
+        self._reconcile()
+
     def _exclude_service_members(self):
         """Service children are infrastructure, never workload ownership evidence.
 
@@ -80,7 +89,8 @@ class Engine:
         return [p for p in self.discover(root, uid) if p not in self._protected]
 
     def _public(self, task):
-        return {k: copy.deepcopy(v) for k, v in task.items() if k not in ("token", "last_report", "processes", "fixed_allocation")}
+        # Keep legacy response shape unchanged; mode is immutable registration state.
+        return {k: copy.deepcopy(v) for k, v in task.items() if k not in ("token", "last_report", "processes", "fixed_allocation", "reconfigure_mode", "preferred_gpus")}
 
     def _authorize(self, body, uid, *, controller=False):
         key = identity(body["task_id"])
@@ -95,7 +105,8 @@ class Engine:
         reasons = {}
         desired = ({key: (task["granted"] if not task["pausable"] and not any(task["paused"].values()) else empty())
                     for key, task in self.tasks.items()} if self.draining
-                   else targets(self.tasks, self.inventory, self.state["override"], reasons))
+                   else targets(self.tasks, self.inventory, self.state["override"], reasons,
+                                allowed_gpus=self.allowed_gpus))
         for key, task in self.tasks.items():
             task["target"] = copy.deepcopy(desired[key])
             if task["terminal"]:
@@ -105,6 +116,14 @@ class Engine:
                                              else "waiting_for_resources")
             if task["phase"] in ("applied", "waiting") and task["granted"] != task["target"]:
                 if task["granted"] != empty():
+                    if (task["phase"] == "waiting"
+                            and task.get("reconfigure_mode") == "incremental_release"
+                            and task["granted"]["cpu_cores"] <= task["target"]["cpu_cores"]
+                            and all(v <= task["target"]["gpus"].get(g, 0)
+                                    for g, v in task["granted"]["gpus"].items())):
+                        # Already acknowledged the shrink. Retained resources
+                        # remain reserved while a dependent expansion waits.
+                        continue
                     task["generation"] += 1
                     task["phase"] = "release"
                     task["reason"] = "allocation_changed"
@@ -128,6 +147,7 @@ class Engine:
             if fits(others + [task["target"]], self.inventory):
                 task["generation"] += 1
                 task["granted"] = copy.deepcopy(task["target"])
+                task["preferred_gpus"] = list(task["granted"]["gpus"])
                 task["phase"] = "initialize"
                 task["reason"] = "grant_available"
                 if not task["adaptable"] and task["fixed_allocation"] is None:
@@ -139,7 +159,7 @@ class Engine:
     def _invalidate_override(self):
         if self.state["override"] is not None:
             try:
-                targets(self.tasks, self.inventory, self.state["override"])
+                targets(self.tasks, self.inventory, self.state["override"], allowed_gpus=self.allowed_gpus)
             except ProtocolError:
                 self.state["override"] = None
                 self.state["policy_revision"] += 1
@@ -197,7 +217,9 @@ class Engine:
             require(type(body["token"]) is str and len(body["token"]) == 64
                     and all(c in "0123456789abcdef" for c in body["token"]), "registration requires client-generated 256-bit hex token")
             require(type(body["label"]) is str and 0 < len(body["label"]) <= 256, "invalid label")
-            require(body["reconfigure_mode"] == "full_release", "only full_release capability supported")
+            require(body["reconfigure_mode"] in ("full_release", "incremental_release"), "unsupported reconfiguration mode")
+            require(body["reconfigure_mode"] != "incremental_release" or (pausable and adaptable),
+                    "incremental reconfiguration requires pausable and adaptable")
             validate_request(body["request"], self.inventory)
             validate_process(body["root"])
             require(body["root"] not in self._protected, "manager service cannot register as a task")
@@ -207,6 +229,8 @@ class Engine:
                 require(not task["terminal"], "task is terminal", "terminal")
                 require((pausable, adaptable) == (task["pausable"], task["adaptable"]),
                         "registration capabilities are immutable", "conflict")
+                require(body["reconfigure_mode"] == task.get("reconfigure_mode", "full_release"),
+                        "reconfiguration mode is immutable", "conflict")
                 return {"task": self._public(task), "token": task["token"]}
             require(not self.draining, "manager is draining", "unavailable")
             require(sum(not t["terminal"] for t in self.tasks.values()) < self.max_tasks, "active task capacity reached", "capacity")
@@ -226,6 +250,7 @@ class Engine:
                     "root": body["root"], "processes": members, "request": body["request"],
                     "token": body["token"], "request_revision": 0,
                     "pausable": pausable, "adaptable": adaptable, "fixed_allocation": None,
+                    "reconfigure_mode": body["reconfigure_mode"],
                     "order": self.state["next_order"], "generation": 0,
                     "phase": "waiting", "reason": "registered", "paused": {"self": False, "controller": False},
                     "held": empty(), "granted": empty(), "target": empty(),
@@ -259,7 +284,7 @@ class Engine:
                 bound = body["bound_task_id"]
                 require(bound is None or type(bound) is str and bound in self.tasks and not self.tasks[bound]["terminal"], "invalid bound task")
                 self.state["override"] = {"allocations": body["allocations"], "bound_task_id": bound}
-                targets(self.tasks, self.inventory, self.state["override"])
+                targets(self.tasks, self.inventory, self.state["override"], allowed_gpus=self.allowed_gpus)
             self.state["policy_revision"] += 1
             self._reconcile()
             return {"policy_revision": self.state["policy_revision"]}
@@ -326,7 +351,11 @@ class Engine:
                 task["held"] = copy.deepcopy(body["held"])
                 task["phase"] = "applied"
             elif phase in ("released", "failed"):
-                require(task["phase"] in ("release", "initialize", "applied"), "no active grant to release")
+                retained_waiting = (task["phase"] == "waiting"
+                                    and task.get("reconfigure_mode") == "incremental_release"
+                                    and task["granted"] != empty())
+                require(task["phase"] in ("release", "initialize", "applied") or retained_waiting,
+                        "no active grant to release")
                 # Nonzero reports preserve *all* reservations until both GPU and CPU drain.
                 held = body["held"]
                 fields(held, ("cpu_cores", "gpus"))
@@ -336,8 +365,12 @@ class Engine:
                         and all(g in task["granted"]["gpus"] and type(v) is int and 0 <= v <= task["granted"]["gpus"][g]
                                 for g, v in held["gpus"].items()), "held exceeds grant")
                 task["held"] = copy.deepcopy(held)
-                if held == empty():
-                    task["granted"] = empty()
+                incremental = (task.get("reconfigure_mode") == "incremental_release"
+                               and phase == "released" and task["reason"] != "server_restart")
+                if held == empty() or incremental:
+                    # Only acknowledged release frees capacity. Neither a
+                    # target change nor an unacknowledged shrink does so.
+                    task["granted"] = copy.deepcopy(held)
                     task["phase"] = "waiting"
                     task["processes"] = [task["root"]] + [p for p in task["processes"]
                         if p != task["root"] and self.inspect(p, uid) != "dead"]

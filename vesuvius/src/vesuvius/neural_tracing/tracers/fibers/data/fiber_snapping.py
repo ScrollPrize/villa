@@ -5,7 +5,7 @@ resampled every ``step`` voxels; at each point the presence is sampled on a disk
 to the local tangent (grid ``grid`` voxels) and averaged over ``along`` voxels each way along the fiber; the point's
 offset is the centroid of the disk region at or above half way between the disk minimum and maximum. Offsets are
 smoothed along each fiber (Gaussian ``sigma``, in voxels) and applied. ``passes`` repeats this on the snapped curve.
-Validated on Paris4 AFV against manual annotations (output/paris4_annotation_audit_20261006): label distance to the
+Validated on the automated Paris4 fibers against manual annotations (output/paris4_annotation_audit_20261006): label distance to the
 manual fiber median 1.46 -> 0.68 trace voxels, within 1 voxel 25% -> 77% (radius 2.5, sigma 2, two passes).
 
 The presence volume is read in ``tile``-voxel blocks (plus a margin covering the disk) in spatial order on worker
@@ -170,14 +170,20 @@ def snap_native(polylines, presence, scale, offset, cfg, device, output_step):
     return [(resample(c, output_step)+offset)*scale for c in curves]
 
 
-def snap_afv(source, destination, presence, scale, offset, cfg, device, output_step, limit, provenance):
-    from vesuvius.neural_tracing.tracers.shared.annotations.afv import read_afv_polylines, write_afv
-    fibers = read_afv_polylines(source)
+def snap_store(source, destination, presence, scale, offset, cfg, device, output_step, limit, provenance):
+    """A new fiber store of ``source``'s fibers (UUIDs, names, families and meta kept) with the snapped geometry and
+    the snapping parameters in each fiber's meta['snapping']."""
+    from vesuvius.neural_tracing.tracers.shared.annotations.fiber_store import fiber_volume, read_polylines, write_fibers
+    volume = fiber_volume(source)
+    fibers = read_polylines(source, volume=volume)
     if limit:
         fibers = fibers[:limit]
     snapped = snap_native([p for _, p in fibers], presence, scale, offset, cfg, device, output_step)
-    return write_afv(source, destination, [(row, xyz) for (row, _), xyz in zip(fibers, snapped)],
-                     dict(snapping=provenance, snapped_from=str(Path(source).resolve())))
+    snapping = dict(provenance, snapped_from=str(Path(source).resolve()))
+    result = write_fibers(destination, [(dict(id=row['id'], name=row['name'], family=row['family'],
+                                              meta=dict(row['meta'], snapping=snapping)), xyz)
+                                        for (row, _), xyz in zip(fibers, snapped)], volume=volume)
+    return dict(fibers=result['fibers'], points=result['points'])
 
 
 def snap_json(paths, destination, presence, scale, offset, cfg, device, output_step, provenance):

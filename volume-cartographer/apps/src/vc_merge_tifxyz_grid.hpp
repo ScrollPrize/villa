@@ -25,7 +25,8 @@ struct GMEdgeSpec {
 // Parse a row-major grid of tifxyz directory names from merge.json and
 // emit deduplicated surfaces + horizontal/vertical adjacency edges. The
 // grid is loaded from `merge_path`; cell strings are resolved as
-// `paths_dir / name` and validated to be directories. Throws
+// `paths_dir / name` and validated to be directories; with an empty
+// `paths_dir` they are stored surface UUIDs, kept as given. Throws
 // std::runtime_error on malformed input, missing directories, or a grid
 // containing fewer than 2 distinct surfaces.
 void gmResolveGrid(const std::filesystem::path& merge_path,

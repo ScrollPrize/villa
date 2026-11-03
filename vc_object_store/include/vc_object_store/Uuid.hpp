@@ -6,6 +6,7 @@
 #include <cctype>
 #include <random>
 #include <string>
+#include <string_view>
 
 namespace vc::objects::util {
 
@@ -51,5 +52,12 @@ inline std::string newUuid()
     }
     return uuid;
 }
+
+// Name-based (RFC 4122 version 5) UUID in the object store's namespace: the
+// same name always yields the same UUID, so independent imports of one
+// UUID-less source agree on its identity.
+std::string nameUuid(std::string_view name);
+// The same in another namespace (a UUID), e.g. one shared with other tools.
+std::string nameUuid(const std::string& namespaceUuid, std::string_view name);
 
 } // namespace vc::objects::util

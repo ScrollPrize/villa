@@ -187,8 +187,14 @@ class FiberTrace3DPredictAdapter:
         embedding_bank: str | None = None,
         emit_width: bool = False,
         emit_normals: bool = False,
+        width_uint8_base: bool = False,
+        input_to_base: float = 1.0,
     ) -> None:
         self.checkpoint = None if checkpoint is None else Path(checkpoint)
+        self.width_uint8_base = bool(width_uint8_base)
+        self.input_to_base = float(input_to_base)
+        if not np.isfinite(self.input_to_base) or self.input_to_base <= 0:
+            raise ValueError("input_to_base must be positive")
         self.config = _config_from_checkpoint(config, self.checkpoint)
         self.native_output_stride = int(
             _model_cfg_from_raw(self.config).get("output_stride", 1)
@@ -259,7 +265,7 @@ class FiberTrace3DPredictAdapter:
             self._products += (OutputProductSpec(
                 name=f"{self.product_prefix}_width", level=int(level), scaledown=int(scaledown),
                 channels=(OutputChannelSpec('width', relative_path=f"{self.zarr_path_prefix}_width.ome.zarr"),),
-                chunk_size=int(chunk_size), dtype=np.float32, value_range=None,
+                chunk_size=int(chunk_size), dtype=np.uint8 if self.width_uint8_base else np.float32, value_range=None,
                 pyramid_policy=PYRAMID_POLICY_CUSTOM, accumulator_channel_count=1,
                 inference_scaledown=int(inference_scaledown)),)
 
@@ -477,7 +483,9 @@ class FiberTrace3DPredictAdapter:
         if self.emit_width and product.name == f'{self.product_prefix}_width':
             if slab.ndim != 4 or slab.shape[0] != 1 or not np.isfinite(slab).all() or (slab < 0).any():
                 raise ValueError('invalid width product slab')
-            return {'width': slab[0]}
+            width = (np.clip(np.rint(slab[0] * self.input_to_base), 0, 255).astype(np.uint8)
+                     if self.width_uint8_base else slab[0])
+            return {'width': width}
         if self.embedding_channels and product.name == f'{self.product_prefix}_embedding':
             if slab.ndim != 4 or slab.shape[0] != self.embedding_channels or not np.isfinite(slab).all():
                 raise ValueError("invalid embedding product slab")

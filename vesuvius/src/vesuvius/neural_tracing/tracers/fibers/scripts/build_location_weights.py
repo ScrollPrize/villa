@@ -31,13 +31,13 @@ def _compression_task(task):
     return m['sheetness'], m['sheet_modulation']
 
 
-def build(source, document_path, fibers, out, workers=16):
-    """Score every fiber of ``source`` (a dataset-config source entry; ``fibers`` its annotated fibers) and write the
-    cache to ``out``."""
+def build(source, document_path, fibers, out, workers=16, keys=None):
+    """Score every fiber of ``source`` (a dataset-config source entry; ``fibers`` its annotated fibers, cached under
+    ``keys``, default their names) and write the cache to ``out``."""
     names, starts, arcs, bends, positions = [], [0], [], [], []
-    for f in fibers:
+    for i, f in enumerate(fibers):
         at, bend = bend_profile(np.asarray(f.points), np.asarray(f.s))
-        names.append(f.name)
+        names.append(f.name if keys is None else keys[i])
         arcs.append(at)
         bends.append(bend)
         positions.append(np.stack([np.interp(at, f.s, f.points[:, k]) for k in range(3)], -1))
@@ -64,7 +64,7 @@ def build(source, document_path, fibers, out, workers=16):
 
 def main(argv=None):
     from vesuvius.neural_tracing.tracers.fibers.data import location_weights
-    from vesuvius.neural_tracing.tracers.shared.annotations.afv import AFVFibers
+    from vesuvius.neural_tracing.tracers.shared.annotations.fiber_store import FiberStore
     from vesuvius.neural_tracing.tracers.shared.annotations.vc3d import load_fibers
     from vesuvius.neural_tracing.tracers.fibers.data.datasets import read_dataset_config
     ap = argparse.ArgumentParser(description=__doc__)
@@ -82,12 +82,15 @@ def main(argv=None):
         if out.exists() and not args.force:
             print(f"{source['name']}: {out} exists", flush=True)
             continue
+        keys = None
         if source['kind'] == 'paris4':
             fibers = load_fibers(source['fibers'], grid_scale=source['grid_scale'])
         else:
-            collection = AFVFibers(source['path'], source['grid_scale'], split='all', sha256=source.get('sha256'))
+            collection = FiberStore(source['path'], source['coordinate_space'].split('/')[-1], source['grid_scale'],
+                                    split='all')
             fibers = [collection.geometry(i) for i in range(len(collection))]
-        build(source, Path(args.dataset_config).resolve(), fibers, out, args.workers)
+            keys = [row['id'] for row in collection.catalog]
+        build(source, Path(args.dataset_config).resolve(), fibers, out, args.workers, keys)
 
 
 if __name__ == '__main__':
