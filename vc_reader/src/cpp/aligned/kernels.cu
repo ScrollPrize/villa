@@ -7,11 +7,6 @@ template<class T> __global__ void samples(const Job* jobs,T fill,void* out,bool*
     for(std::size_t i=blockIdx.x*blockDim.x+threadIdx.x;i<job.grid.count;i+=std::size_t(blockDim.x)*gridDim.x)
         sample(job.grid,job.keys,reinterpret_cast<const T* const*>(job.tiles),job.count,fill,out,valid,i);
 }
-__global__ void validity(Grid g,bool* valid) {
-    for(std::size_t i=blockIdx.x*blockDim.x+threadIdx.x;i<g.count;i+=std::size_t(blockDim.x)*gridDim.x) {
-        valid[output_index(g,i)]=supported(g,i);
-    }
-}
 __global__ void fields(float* data,bool* valid,std::size_t n,Field f) {
     for(std::size_t i=blockIdx.x*blockDim.x+threadIdx.x;i<n;i+=std::size_t(blockDim.x)*gridDim.x) if(valid[i]) field(data,valid,n,i,f);
 }
@@ -60,10 +55,6 @@ void launch_many(const std::vector<Grid>& grids,const std::vector<std::vector<st
 void launch(const Grid& g,const std::vector<std::int64_t>& keys,const std::vector<const void*>& tiles,const void* fill,
             ElementType type,void* out,bool* valid,int id) {
     launch_many({g},{keys},{tiles},fill,type,out,valid,id);
-}
-void launch_valid(const Grid& g,bool* valid) {
-    if(g.count) validity<<<unsigned((g.count+255)/256),256,0,device::stream()>>>(g,valid);
-    device::check(cudaGetLastError());
 }
 __global__ void box_valid(Grid g,bool* valid) {
     for(std::size_t i=blockIdx.x*blockDim.x+threadIdx.x;i<g.count;i+=std::size_t(blockDim.x)*gridDim.x) {

@@ -306,7 +306,7 @@ def test_managed_adapter_initializes_curve_and_publishes_early_completion(tmp_pa
         val=(state[:,0]-1).square().sum()+((soft.decode_widths(raw,config)-1000)/1000).square().sum()
         return val,dict(test=val)
     monkeypatch.setattr(soft,'objective',objective)
-    d={k:np.array([0]) for k in ('source_id','start','end','family')}
+    d={k:np.array([0]) for k in ('start','end','family')};d['source_id']=np.array(['00000000-0000-4000-8000-000000000000'])
     result=managed_solve(config,
         state,raw,torch.tensor([2000.]),{}, {},d,ext,None,None)
     assert result['completed'] and result['final']['iteration']<100

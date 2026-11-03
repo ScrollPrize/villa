@@ -1,15 +1,11 @@
 from __future__ import annotations
 
 import copy
-import json
 import math
-import shutil
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Any
 
 import numpy as np
-import tifffile
 
 
 SHAPE_TOL = 0.01
@@ -231,44 +227,3 @@ def tifxyz_source_shape(meta: dict, fallback_shape_zyx: tuple[int, int, int] | N
 		if shape is not None:
 			return shape
 	return fallback_shape_zyx
-
-
-def read_tifxyz_meta(path: str | Path) -> dict:
-	meta_path = Path(path) / "meta.json"
-	if not meta_path.exists():
-		return {}
-	try:
-		obj = json.loads(meta_path.read_text(encoding="utf-8"))
-	except Exception:
-		return {}
-	return obj if isinstance(obj, dict) else {}
-
-
-def copy_scaled_tifxyz_dir(
-	src: str | Path,
-	dst: str | Path,
-	*,
-	factor: float,
-	base_shape_zyx: tuple[int, int, int] | None,
-) -> Path:
-	src_p = Path(src)
-	dst_p = Path(dst)
-	if dst_p.exists():
-		shutil.rmtree(dst_p)
-	shutil.copytree(src_p, dst_p)
-	x = tifffile.imread(str(dst_p / "x.tif")).astype(np.float32)
-	y = tifffile.imread(str(dst_p / "y.tif")).astype(np.float32)
-	z = tifffile.imread(str(dst_p / "z.tif")).astype(np.float32)
-	x, y, z = scale_tifxyz_arrays(x, y, z, factor)
-	tifffile.imwrite(str(dst_p / "x.tif"), x, compression=None)
-	tifffile.imwrite(str(dst_p / "y.tif"), y, compression=None)
-	tifffile.imwrite(str(dst_p / "z.tif"), z, compression=None)
-	meta = read_tifxyz_meta(dst_p)
-	meta = scale_tifxyz_meta(
-		meta,
-		factor,
-		base_shape_zyx=base_shape_zyx,
-		lasagna_base_shape_zyx=base_shape_zyx,
-	)
-	(dst_p / "meta.json").write_text(json.dumps(meta, indent=2) + "\n", encoding="utf-8")
-	return dst_p

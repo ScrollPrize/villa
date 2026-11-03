@@ -39,10 +39,6 @@ public:
         return ss.str();
     }
 
-    const std::vector<std::pair<std::string, double>>& getMarks() const {
-        return _marks;
-    }
-
     double seconds() const {
         auto end = std::chrono::high_resolution_clock::now();
         return std::chrono::duration<double>(end-start).count();

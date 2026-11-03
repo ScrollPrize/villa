@@ -36,8 +36,9 @@ state = ServiceState(dataset_root=dataset, dataset_resolution=resolve_dataset_ro
 session = _attach_fake_session(state, root / 'output', dataset)
 if native:
     state.session = session = actual
-(root / 'fiber-template.json').write_text(json.dumps({'type': 'vc3d_fiber', 'version': 1,
-    'points': [], 'line_points': [], 'control_points': [[v * 4 for v in xyz] for xyz in endpoints]}))
+(root / 'fiber-template.json').write_text(json.dumps({'type': 'vc3d_fiber', 'version': 4,
+    'uuid': '12345678-1234-1234-1234-123456789abe',
+    'line_points': [], 'control_points': [{'position': [v * 4 for v in xyz]} for xyz in endpoints]}))
 (root / 'pcl-template.json').write_text(json.dumps({'vc_pointcollections_json_version': '1',
     'collections': {'0': {'name': 'client-pcl', 'points': {str(i): {'p': xyz, 'creation_time': i}
                                                         for i, xyz in enumerate(endpoints)}}}}))

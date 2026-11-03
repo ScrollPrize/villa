@@ -160,20 +160,6 @@ TEST_CASE("Fixture: gridNormal yields a unit-length normal somewhere on the surf
     CHECK(found);
 }
 
-TEST_CASE("Fixture: resample(0.5) halves dimensions and doubles scale")
-{
-    if (!haveFixture(kSeg770)) return;
-    QuadSurface qs(segPath(kSeg770));
-    qs.ensureLoaded();
-    int rowsBefore = qs.rawPointsPtr()->rows;
-    int colsBefore = qs.rawPointsPtr()->cols;
-    auto scaleBefore = qs.scale();
-    qs.resample(0.5f);
-    CHECK(qs.rawPointsPtr()->rows == rowsBefore / 2 + (rowsBefore % 2));
-    CHECK(qs.rawPointsPtr()->cols == colsBefore / 2 + (colsBefore % 2));
-    CHECK(qs.scale()[0] == doctest::Approx(scaleBefore[0] * 2.0f).epsilon(1e-5));
-}
-
 TEST_CASE("Fixture: three segments share the same uuid pattern (date_id)")
 {
     int found = 0;

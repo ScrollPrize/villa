@@ -311,16 +311,16 @@ private slots:
         h2.id = 4;
         h2.hvTag = 'H';
         // CP0: automatic to V + human pending to the seed -> pending, not auto.
-        h.links.push_back({0, 2, 0, true, false, true, true});
-        h.links.push_back({0, 3, 0, true, false, true, false});
+        h.links.push_back({0, 2, 0, true, false, true});
+        h.links.push_back({0, 3, 0, true, false, false});
         // CP1: automatic to V + approved to H2 -> pending, auto, no warning.
-        h.links.push_back({1, 2, 1, true, false, true, true});
-        h.links.push_back({1, 4, 0, false, false, true, false});
+        h.links.push_back({1, 2, 1, true, false, true});
+        h.links.push_back({1, 4, 0, false, false, false});
         // CP2: automatic H-V + pending H-H -> pending, auto, same-H/V warning;
         // plus an approved adjacent link -> triangle.
-        h.links.push_back({2, 2, 2, true, false, true, true});
-        h.links.push_back({2, 4, 1, true, false, true, true});
-        h.links.push_back({2, 4, 2, false, true, true, false});
+        h.links.push_back({2, 2, 2, true, false, true});
+        h.links.push_back({2, 4, 1, true, false, true});
+        h.links.push_back({2, 4, 2, false, true, false});
         const auto reviews = vc3d::fiber_map::aggregateEndpointReviews({h, v, seed, h2});
         const auto at = [&](int cp) { return reviews.at(vc3d::fiber_map::EndpointKey{1, cp}); };
         QVERIFY(at(0).pending);

@@ -628,11 +628,12 @@ class ServiceState:
             while pending:
                 current = pending.pop()
                 document = json.loads(Path(current.content.json()['path']).read_text())
-                for branch in document.get('branches', []):
-                    peer = by_name.get(branch.get('branch_file'))
-                    if peer is not None and peer.id not in selected:
-                        selected.add(peer.id)
-                        pending.append(peer)
+                for key in ('branches', 'adjacent_branches'):
+                    for branch in document.get(key, []):
+                        peer = by_name.get(branch.get('branch_file'))
+                        if peer is not None and peer.id not in selected:
+                            selected.add(peer.id)
+                            pending.append(peer)
             siblings = tuple(r for r in desired if r.id in selected and r.id != input_id)
         key = (input_id, revision.number, tuple((r.id, r.number) for r in siblings))
         with self._input_content_artifact_lock:

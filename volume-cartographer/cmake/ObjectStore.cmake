@@ -1,0 +1,25 @@
+# Prefer an installed package, otherwise build the sibling store and native formats.
+# No installation, FetchContent, or dependency download is performed here.
+function(vc_find_object_store)
+    if(TARGET vc_object_store::vc_object_geometry)
+        return()
+    endif()
+    find_package(vc_object_store CONFIG QUIET)
+    if(NOT TARGET vc_object_store::vc_object_geometry)
+        set(VC_OBJECT_STORE_SOURCE "${CMAKE_SOURCE_DIR}/../vc_object_store" CACHE PATH
+            "vc_object_store source checkout")
+        if(NOT EXISTS "${VC_OBJECT_STORE_SOURCE}/CMakeLists.txt")
+            message(FATAL_ERROR "Install vc_object_store or set VC_OBJECT_STORE_SOURCE to its checkout")
+        endif()
+        set(VC_OBJECT_STORE_BUILD_ADAPTERS ON)
+        set(VC_OBJECT_STORE_BUILD_LINKING OFF)
+        set(VC_OBJECT_STORE_BUILD_TOOLS OFF)
+        set(VC_OBJECT_STORE_BUILD_PYTHON OFF)
+        set(VC_OBJECT_STORE_BUILD_TESTS ${VC_TESTING})
+        # Each vc_* DLL would otherwise embed and re-export its own copy of the
+        # static store, and PE has no symbol interposition to merge them.
+        set(VC_OBJECT_STORE_SHARED ${WIN32})
+        add_subdirectory("${VC_OBJECT_STORE_SOURCE}" "${CMAKE_BINARY_DIR}/object_store")
+    endif()
+endfunction()
+vc_find_object_store()

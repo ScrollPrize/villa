@@ -309,7 +309,7 @@ def topology(d, merge_distance=4., *, event_mask=None, piece_local=False):
             left.append(node-1); right.append(node)
         sources.append(source[first]); positions.append(arc[group].mean()); families.append(family[0])
         cursor = stop
-    return dict(v_offset_source=np.asarray(sources, dtype=np.int64),
+    return dict(v_offset_source=np.asarray(sources, dtype=source.dtype),
         v_offset_arc=np.asarray(positions), v_offset_family=np.asarray(families, dtype=np.int64),
         v_offset_left=np.asarray(left, dtype=np.int64), v_offset_right=np.asarray(right, dtype=np.int64),
         v_offset_a=mapping[:len(d['i'])], v_offset_b=mapping[len(d['i']):])
@@ -331,8 +331,9 @@ class EndpointOffsets(torch.nn.Module):
                 if not np.isfinite(config[key]) or config[key] < 0:
                     raise ValueError(key+' must be finite and nonnegative')
             self.u_values = torch.nn.Parameter(torch.zeros_like(self.values))
+        # v_offset_source holds fiber UUID strings: kept in numpy (self.saved), never a torch buffer.
         for key, val in self.saved.items():
-            self.register_buffer(key, torch.as_tensor(val, device=device))
+            if key != 'v_offset_source':self.register_buffer(key, torch.as_tensor(val, device=device))
         from .fiber_soft_winding import constraint_family_compatible
         keep = constraint_family_compatible(d) if config.get('filter_constraint_families') else np.ones(len(d['i']), dtype=bool)
         self.register_buffer('a', self.v_offset_a[keep])

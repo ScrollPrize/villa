@@ -15,14 +15,14 @@ def statistics(values):
 
 
 def compare(d,s,reference):
-    offsets={int(k):float(v) for k,v in reference['fiber_offsets'].items()}
+    offsets={str(k):float(v) for k,v in reference['fiber_offsets'].items()}
     targets=[];actual=[];owners=[]
     realized=map_state(torch.as_tensor(s['state'])).numpy()
     for side in ('a','b'):
         ids=d['i' if side=='a' else 'j'];ds=d['ds_'+side]
         q,_,_=saved_points(d,s,realized,s['widths'],ids,ds,shared_only=True)
         for event,record in enumerate(reference['events']):
-            e=record['index'];source=int(d['source_id'][ids[e]])
+            e=record['index'];source=str(d['source_id'][ids[e]])
             if source!=record['source_'+side] or not np.isclose(d['phase_'+side][e],record['phase_'+side],rtol=0,atol=1e-6):
                 raise ValueError('GT winding reference endpoint identity/phase mismatch')
             targets.append(offsets[source]+record['phase_'+side]);actual.append(q[e]);owners.append(source)
@@ -31,7 +31,7 @@ def compare(d,s,reference):
     return dict(definition='MAP integer winding plus endpoint phase; lower label wins exact ties; one global additive shift removed, no affine or per-fiber fit',
         realized_labels=realized[:,0].tolist(),
         global_shift=shift,error_windings=statistics(error),
-        per_fiber={str(i):statistics(error[owners==i]) for i in sorted(offsets)},
+        per_fiber={i:statistics(error[owners==i]) for i in sorted(offsets)},
         excluded_source_ids=reference['excluded_source_ids'])
 
 

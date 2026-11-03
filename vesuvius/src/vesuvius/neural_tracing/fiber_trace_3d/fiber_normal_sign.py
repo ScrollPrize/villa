@@ -67,11 +67,11 @@ def prepare(config):
     meta = {k:json.loads(v) for k,v in db.execute('SELECT key,value FROM metadata')}
     if meta['schema_version']!=2 or not meta['complete']:
         raise ValueError('Signed schema2 database required')
-    fibers = np.asarray(db.execute('SELECT id,normal_sign FROM fibers ORDER BY source_index').fetchall(), dtype=np.int64)
-    ids = fibers[:,0]
-    if not np.all(fibers[:,1]==1) or not np.all(np.diff(ids)>0):
+    fibers = db.execute('SELECT id,normal_sign FROM fibers ORDER BY source_index').fetchall()
+    ids = np.asarray([f[0] for f in fibers], dtype=str)
+    if not all(f[1]==1 for f in fibers) or not np.all(ids[1:]>ids[:-1]):
         raise ValueError('Expected original +1 gauge multipliers and ascending source IDs')
-    if not np.array_equal(ids,np.asarray(prior['source_ids'],dtype=np.int64)):
+    if not np.array_equal(ids,np.asarray(prior['source_ids'],dtype=str)):
         raise ValueError('Prior/source fiber IDs differ')
     a = np.asarray(prior['agreement'],dtype=np.float32)
     if len(a)!=len(ids) or not np.isfinite(a).all() or np.any(abs(a)>1.000001):
@@ -85,14 +85,15 @@ def prepare(config):
     cursor = db.execute(f'SELECT id,fiber_a,fiber_b,{"+".join(terms)} FROM constraints WHERE {eligible} AND {valid} ORDER BY id')
     chunks=[]
     while rows:=cursor.fetchmany(65536):
-        chunks.append(np.asarray(rows,dtype=np.float64))
-    edges=np.concatenate(chunks) if chunks else np.empty((0,4),dtype=np.float64)
-    event_ids=edges[:,0].astype(np.int64)
-    endpoints=edges[:,1:3].astype(np.int64)
+        chunks.append((np.asarray([r[0] for r in rows],dtype=np.int64),np.asarray([r[1:3] for r in rows],dtype=str),
+                       np.asarray([r[3] for r in rows],dtype=np.float64)))
+    event_ids=np.concatenate([c[0] for c in chunks]) if chunks else np.empty(0,dtype=np.int64)
+    endpoints=np.concatenate([c[1] for c in chunks]) if chunks else np.empty((0,2),dtype=ids.dtype)
+    dot=np.concatenate([c[2] for c in chunks]) if chunks else np.empty(0,dtype=np.float64)
     indices=np.searchsorted(ids,endpoints)
     if np.any(indices>=len(ids)) or not np.array_equal(ids[indices],endpoints):
         raise ValueError('Unknown constraint fiber')
-    dot=edges[:,3].astype(np.float32)
+    dot=dot.astype(np.float32)
     if not np.isfinite(dot).all() or np.any(abs(dot)>1.000001):
         raise ValueError('Invalid normal dot products')
     dot=np.clip(dot,-1,1)

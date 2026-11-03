@@ -77,7 +77,7 @@ class VC3DLasagnaTransportBoundaryTest(unittest.TestCase):
 	def test_vc3d_checks_transport_error_before_api_version(self) -> None:
 		self.assertIn("bool isTransportError(const QNetworkReply* reply)", self.manager_source)
 		start = self.manager_source.index("void LasagnaServiceManager::handleStatusReply")
-		end = self.manager_source.index("void LasagnaServiceManager::downloadResults", start)
+		end = self.manager_source.index("QJsonArray LasagnaServiceManager::discoverServices", start)
 		method_source = self.manager_source[start:end]
 		self.assertLess(
 			method_source.index("isTransportError(reply)"),

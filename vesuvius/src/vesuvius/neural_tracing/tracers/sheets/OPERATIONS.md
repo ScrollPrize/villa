@@ -58,7 +58,7 @@ and `scripts/trace_from_fibers.py`), or use `scripts/bench_local.sh`, which has 
 | `/ephemeral/sean/sheet_tracing/data/verified_patches_old` | `/home/sean/Desktop/spiral_dataset/verified_patches` |
 | `/ephemeral/sean/sheet_tracing/data/verified_patches_working` | `/home/sean/Desktop/spiral_dataset_working/verified_patches` |
 
-The PHerc0139 and PHerc1667 patches and volumes (`data/unseen/`) and the fiber data (`data/afv/`) exist only on the
+The PHerc0139 and PHerc1667 patches and volumes (`data/unseen/`) and the fiber data (`data/fiber_store/`) exist only on the
 H100.
 
 ## 3. Running a model (this machine)
@@ -153,7 +153,7 @@ The patch index is cached in `output/cache/`. It is rebuilt automatically when t
 | path | what |
 | --- | --- |
 | `villa/vesuvius/src/vesuvius/neural_tracing/sheet_tracing/` | the code (a copy of this package); `output/` holds the runs, `configs/` the configs |
-| `data/` | `s1_ds2.zarr` (levels 0 and 1 decompressed in place), both Scroll 1 patch sets, `cut_windings_square/`, `unseen/PHerc0139` and `unseen/PHerc1667` (volumes and train patches), `afv/` (the PHercParis4 AFV, `paris4_H_fiber_runs.jsonl`, `paris4_fiber_pool/`), `fibers/`, `umbilicus_s1_ds2.json` |
+| `data/` | `s1_ds2.zarr` (levels 0 and 1 decompressed in place), both Scroll 1 patch sets, `cut_windings_square/`, `unseen/PHerc0139` and `unseen/PHerc1667` (volumes and train patches), `fiber_store/` (the PHercParis4 fiber store `.vcobj`, `paris4_H_fiber_runs.jsonl`, `paris4_fiber_pool/`), `fibers/`, `umbilicus_s1_ds2.json` |
 | `logs/` | `RUN.log` (training output, tqdm with `\r`) and `RUN.pid` |
 | `env.sh`, `launch.sh` | the environment, and the detached launcher |
 | `cache/` | all temp and cache files |

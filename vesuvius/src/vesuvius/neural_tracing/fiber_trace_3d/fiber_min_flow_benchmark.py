@@ -1,8 +1,4 @@
-"""Read-only AFV/cache adapter for the existing minimum-flow solver."""
-import json
-from pathlib import Path
-import sqlite3
-
+"""Read-only fiber store/cache adapter for the existing minimum-flow solver."""
 import numpy as np
 
 from .fiber_min_flow import Seam, corrected_targets, integer_targets, fractional_targets, split_fractional_edges
@@ -12,15 +8,14 @@ from .fiber_min_flow import Seam, corrected_targets, integer_targets, fractional
 class Paths:
     def __init__(self, config, data, angle=-np.pi/2):
         from .fiber_normal_sign_visualization import load_umbilicus_frame
-        from vesuvius.neural_tracing.tracers.shared.annotations.afv import read_afv_polylines
-        with sqlite3.connect(Path(config['afv']).resolve().as_uri()+'?mode=ro', uri=True) as db:
-            root = json.loads(db.execute("SELECT value FROM metadata WHERE key='root'").fetchone()[0])
-        self.seam = Seam(load_umbilicus_frame(config['umbilicus'], root), angle)
+        from vesuvius.neural_tracing.tracers.shared.annotations.fiber_store import fiber_volume, read_polylines
+        volume = fiber_volume(config['fibers'])
+        self.seam = Seam(load_umbilicus_frame(config['umbilicus'], volume), angle)
         self.paths = {}
-        for row, points in read_afv_polylines(config['afv'], data['source_id']):
+        for row, points in read_polylines(config['fibers'], data['source_id'], volume=volume):
             arc = np.r_[0., np.cumsum(np.linalg.norm(np.diff(points, axis=0), axis=1))]
             transport = self.seam.polyline(points)
-            self.paths[int(row['id'])] = (arc, points, transport)
+            self.paths[row['id']] = (arc, points, transport)
         self.data = data
         if len(data['links']) or len(np.unique(data['source_id'])) != len(data['source_id']):
             raise ValueError('Benchmark expects whole unsplit fibers')
@@ -28,7 +23,7 @@ class Paths:
             raise ValueError('Benchmark anchors must be original fiber starts')
 
     def at(self, source, arc):
-        s, points, transport = self.paths[int(source)]
+        s, points, transport = self.paths[str(source)]
         # Saved endpoint offsets are float32, while original polyline arc is f64.
         if arc < -1e-4 or arc > s[-1]+max(1e-4, 2e-7*s[-1]):
             raise ValueError(f'Endpoint outside fiber {source}: {arc}, {s[-1]}')

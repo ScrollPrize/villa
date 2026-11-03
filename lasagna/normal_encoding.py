@@ -147,6 +147,28 @@ def encode_normal_nxny_u8(
 ) -> tuple[np.ndarray, np.ndarray]:
     """Encode Lasagna compact normal ``nx``/``ny`` uint8 channels."""
 
+    arrays = tuple(np.asarray(a) for a in (dir0_z, dir1_z, dir0_y, dir1_y, dir0_x, dir1_x))
+    shape = arrays[0].shape
+    # The decoder is entirely pointwise, but its many temporary arrays otherwise
+    # exceed cache when dozens of flush workers finalize full chunks at once.
+    # Preserve its arithmetic/dtypes, including the historical float64 promotion.
+    block = 16384
+    if arrays[0].size <= block or any(a.shape != shape for a in arrays):
+        return _encode_normal_nxny_u8(*arrays, eps=eps)
+    flat = tuple(a.reshape(-1) for a in arrays)
+    nx = np.empty(arrays[0].size, dtype=np.uint8)
+    ny = np.empty_like(nx)
+    for begin in range(0, nx.size, block):
+        end = begin + block
+        nx[begin:end], ny[begin:end] = _encode_normal_nxny_u8(
+            *(a[begin:end] for a in flat), eps=eps)
+    return nx.reshape(shape), ny.reshape(shape)
+
+
+def _encode_normal_nxny_u8(
+    dir0_z, dir1_z, dir0_y, dir1_y, dir0_x, dir1_x, eps=1e-12,
+) -> tuple[np.ndarray, np.ndarray]:
+
     _, _, _, nx_n, ny_n, nz_n = estimate_normal(
         dir0_z,
         dir1_z,

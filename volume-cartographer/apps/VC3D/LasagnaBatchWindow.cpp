@@ -111,12 +111,7 @@ QString submittedTimeText(const QJsonObject& job)
 
 QString outputNameText(const QJsonObject& job)
 {
-    const QString outputName = job[QStringLiteral("output_name")].toString().trimmed();
-    if (!outputName.isEmpty()) {
-        return outputName;
-    }
-    const QString outputDir = job[QStringLiteral("output_dir")].toString().trimmed();
-    return outputDir.isEmpty() ? QString() : QFileInfo(outputDir).fileName();
+    return job[QStringLiteral("output_name")].toString().trimmed();
 }
 
 }
@@ -182,9 +177,9 @@ LasagnaBatchWindow::LasagnaBatchWindow(QWidget* parent)
         if (job[QStringLiteral("state")].toString() != QStringLiteral("finished")) {
             return;
         }
-        const QString outputName = outputNameText(job);
-        if (!outputName.isEmpty()) {
-            emit finishedOutputActivated(outputName);
+        const QJsonArray surfaces = job[QStringLiteral("output_surfaces")].toArray();
+        if (!surfaces.isEmpty()) {
+            emit finishedOutputActivated(surfaces.first().toString());
         }
     });
 

@@ -101,9 +101,11 @@ void writeTiff(const std::filesystem::path& outPath, const cv::Mat& img, int cvT
 
     if (tileW == 0 || tileH == 0) {
         TIFFSetField(tf, TIFFTAG_ROWSPERSTRIP, H);
+        // The predictor encodes the scanline buffer in place; never hand it the caller's image.
+        std::vector<uint8_t> row(static_cast<size_t>(W) * params.elemSize);
         for (uint32_t y = 0; y < H; ++y) {
-            const uint8_t* row = outImg.ptr<uint8_t>(static_cast<int>(y));
-            if (TIFFWriteScanline(tf, const_cast<uint8_t*>(row), y, 0) < 0)
+            std::memcpy(row.data(), outImg.ptr<uint8_t>(static_cast<int>(y)), row.size());
+            if (TIFFWriteScanline(tf, row.data(), y, 0) < 0)
                 throw std::runtime_error("TIFFWriteScanline failed at row " +
                                         std::to_string(y) + " in " + outPath.string());
         }
@@ -264,4 +266,36 @@ TiffSamples readTiffSamples(const std::filesystem::path& path, bool strictLayout
             }
     }
     return result;
+}
+
+void writeTiffSamples(const std::filesystem::path& path, const TiffSamples& samples)
+{
+    const size_t scalar = samples.bits / 8, pixel = scalar * samples.components;
+    if (!samples.width || !samples.height || !samples.components || !scalar || samples.bits % 8 ||
+        samples.bytes.size() != size_t(samples.width) * samples.height * pixel)
+        throw std::invalid_argument("invalid TIFF samples for " + path.string());
+    const char* mode = samples.bytes.size() > 0xffff0000ULL ? "w8" : "w";
+    std::unique_ptr<TIFF, decltype(&TIFFClose)> file(TIFFOpen(path.string().c_str(), mode), TIFFClose);
+    TIFF* tf = file.get();
+    if (!tf) throw std::runtime_error("Failed to open TIFF for writing: " + path.string());
+    TIFFSetField(tf, TIFFTAG_IMAGEWIDTH, samples.width);
+    TIFFSetField(tf, TIFFTAG_IMAGELENGTH, samples.height);
+    TIFFSetField(tf, TIFFTAG_SAMPLESPERPIXEL, samples.components);
+    TIFFSetField(tf, TIFFTAG_BITSPERSAMPLE, samples.bits);
+    TIFFSetField(tf, TIFFTAG_SAMPLEFORMAT, samples.sampleFormat);
+    TIFFSetField(tf, TIFFTAG_PLANARCONFIG, PLANARCONFIG_CONTIG);
+    TIFFSetField(tf, TIFFTAG_PHOTOMETRIC, PHOTOMETRIC_MINISBLACK);
+    if (samples.components > 1) {
+        std::vector<uint16_t> extra(samples.components - 1, EXTRASAMPLE_UNSPECIFIED);
+        TIFFSetField(tf, TIFFTAG_EXTRASAMPLES, uint16_t(extra.size()), extra.data());
+    }
+    TIFFSetField(tf, TIFFTAG_COMPRESSION, COMPRESSION_LZW);
+    TIFFSetField(tf, TIFFTAG_ROWSPERSTRIP, TIFFDefaultStripSize(tf, 0));
+    std::vector<uint8_t> row(size_t(samples.width) * pixel);
+    for (uint32_t y = 0; y < samples.height; ++y) {
+        std::memcpy(row.data(), samples.bytes.data() + size_t(y) * row.size(), row.size());
+        if (TIFFWriteScanline(tf, row.data(), y, 0) < 0)
+            throw std::runtime_error("TIFFWriteScanline failed at row " + std::to_string(y) + " in " + path.string());
+    }
+    if (!TIFFWriteDirectory(tf)) throw std::runtime_error("TIFFWriteDirectory failed for " + path.string());
 }

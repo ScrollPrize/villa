@@ -11,7 +11,7 @@ def fixture():
     d = dict(family=np.array([0, 1]), phase=np.array([.2, .3]), z=np.array([0., 10.]),
         i=np.array([0]), j=np.array([1]), ds_a=np.array([0.]), ds_b=np.array([0.]),
         sign=np.array([1.]), distance=np.array([.5]), parallel=np.array([False]),
-        links=np.array([[0., 1., 0., 0.]]), source_id=np.array([1, 2]),
+        links=np.array([[0., 1., 0., 0.]]), source_id=np.array(['00000000-0000-4000-8000-000000000001', '00000000-0000-4000-8000-000000000002']),
         start=np.zeros(2), end=np.ones(2), radius=np.array([100., 200.]),
         radial_initial_centers=np.array([1., 1.]), radial_initial_widths=np.array([1000., 1200., 1400.]))
     nodes = dict(owner=np.array([0, 1]), ds=np.zeros(2), phase=d['phase'],
@@ -234,26 +234,23 @@ def test_continuation_cannot_hide_whole_turn_jump():
 
 def test_sample_preparation_reuses_signed_geometry(monkeypatch):
     from vesuvius.neural_tracing.fiber_trace_3d import fiber_normal_sign_visualization as vis
-    from vesuvius.neural_tracing.tracers.shared.annotations import afv
-    class Database:
-        def __enter__(self): return self
-        def __exit__(self, *args): pass
-        def execute(self, *args): return [('root', '{}')]
-    monkeypatch.setattr(soft.uv, '_ro', lambda path: Database())
+    from vesuvius.neural_tracing.tracers.shared.annotations import fiber_store
+    fid = lambda k: f'00000000-0000-4000-8000-{k:012d}'
+    monkeypatch.setattr(fiber_store, 'fiber_volume', lambda path: '123')
     monkeypatch.setattr(vis, 'load_umbilicus_frame', lambda *args: np.array([[0., 0., 0.], [0., 0., 20.]]))
     xyz = np.array([[10., 0., 0.], [10., 0., 20.]])
-    monkeypatch.setattr(afv, 'read_afv_polylines', lambda *args: [({'id': 5}, xyz)])
-    d = dict(source_id=np.array([5]), family=np.array([1]), start=np.array([2.]), end=np.array([18.]),
+    monkeypatch.setattr(fiber_store, 'read_polylines', lambda *args, **kwargs: [({'id': fid(5)}, xyz)])
+    d = dict(source_id=np.array([fid(5)]), family=np.array([1]), start=np.array([2.]), end=np.array([18.]),
              node_ds=np.array([[0., -8., -16.]]), i=np.array([0]), j=np.array([0]),
              ds_a=np.array([-3.]), ds_b=np.array([-10.]))
-    samples = soft.prepare_samples(dict(afv='unused', umbilicus='unused'), d)
+    samples = soft.prepare_samples(dict(fibers='unused', umbilicus='unused'), d)
     np.testing.assert_allclose(samples['ds'], [0., -16.])
     np.testing.assert_allclose(samples['z'], [2., 18.])
     np.testing.assert_allclose(samples['v_z'], [5., 12.])
     assert samples['weight'].sum() == pytest.approx(1.)
     assert samples['v_weight'].sum() == pytest.approx(1.)
 
-    cfg_dense=dict(afv='unused',umbilicus='unused',arc_prior_spacing_vx=5.)
+    cfg_dense=dict(fibers='unused',umbilicus='unused',arc_prior_spacing_vx=5.)
     dense=soft.prepare_samples(cfg_dense,d,existing=samples)
     np.testing.assert_allclose(dense['ds'],samples['ds'])  # V: no extra phase prior
     np.testing.assert_allclose(dense['v_ds'],[-16.,-15.,-10.,-5.,-3.,0.])
@@ -270,14 +267,14 @@ def test_sample_preparation_reuses_signed_geometry(monkeypatch):
 
     # Node-only priors use exact perpendicular topology, deduplicating equal
     # base arcs; parallel bases and endpoint fallbacks must not reappear.
-    monkeypatch.setattr(afv, 'read_afv_polylines', lambda *args: [({'id': k}, xyz) for k in (5,6,7)])
-    d=dict(source_id=np.array([5,6,7]),family=np.array([1,0,0]),
+    monkeypatch.setattr(fiber_store, 'read_polylines', lambda *args, **kwargs: [({'id': fid(k)}, xyz) for k in (5,6,7)])
+    d=dict(source_id=np.array([fid(k) for k in (5,6,7)]),family=np.array([1,0,0]),
         start=np.full(3,2.),end=np.full(3,18.),
         node_ds=np.array([[0.,-8.,-16.],[0.,8.,16.],[0.,8.,16.]]),
         i=np.array([0,0,0,1]),j=np.array([1,1,1,2]),
         ds_a=np.array([-3.,-10.,-3.,1.]),ds_b=np.array([4.,9.,4.,15.]),
         parallel=np.array([False,False,False,True]))
-    cfg=dict(afv='unused',umbilicus='unused',shared_curve_geometry=True,shared_node_priors_only=True)
+    cfg=dict(fibers='unused',umbilicus='unused',shared_curve_geometry=True,shared_node_priors_only=True)
     nodes=soft.prepare_samples(cfg,d)
     np.testing.assert_array_equal(nodes['owner'],[0,0,1,1])
     np.testing.assert_array_equal(nodes['v_owner'],nodes['owner'])

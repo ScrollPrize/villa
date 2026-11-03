@@ -18,7 +18,8 @@ def request_store_key(keys, array, channel_indices):
 def write_mixed_manifest(root, prediction_path, embedding_path):
     """Compose ordinary scalar-channel manifests without copying any array."""
     paths = [Path(prediction_path).resolve(), Path(embedding_path).resolve()]
-    manifests = [json.loads(p.read_text()) for p in paths]
+    manifests = [json.loads(((p / '.zattrs') if p.is_dir() else p).read_text()) for p in paths]
+    manifests = [m['lasagna'] if p.is_dir() else m for p,m in zip(paths, manifests)]
     identities = [json.loads((p.parent / "cache_identity.json").read_text()) for p in paths]
     if identities[0]["identity"]["source"] != identities[1]["identity"]["source"]:
         raise ValueError("mixed inference requires the identical physical source/coordinate lattice")
@@ -27,22 +28,29 @@ def write_mixed_manifest(root, prediction_path, embedding_path):
             raise ValueError(f"mixed inference incompatible {field}")
     groups = {}
     for role, names in ((0, ("presence", "nx", "ny")), (1, None)):
-        for group in manifests[role]["groups"].values():
+        for group_id, group in manifests[role]["groups"].items():
             selected = [c for c in group["channels"]
                         if c in names] if names is not None else [
                             c for c in group["channels"] if c.startswith("embedding_")]
             if not selected:
                 continue
+            if paths[role].is_dir():
+                channels = [c if c in selected else f'unused_{role}_{group_id}_{i}'
+                            for i,c in enumerate(group['channels'])]
+                groups[f'role{role}_{group_id}'] = {**group, 'channels': channels,
+                    'zarr': str((paths[role] / group['zarr']).resolve())}
+                continue
             if len(group["channels"]) != 1:
-                raise ValueError("mixed inference requires scalar channel groups")
+                raise ValueError("legacy mixed inference requires scalar channel groups")
             channel, = selected
             if channel in groups:
                 raise ValueError(f"duplicate mixed channel {channel}")
             groups[channel] = {**group, "zarr": str((paths[role].parent / group["zarr"]).resolve())}
-    if not all(name in groups for name in ("presence", "nx", "ny")):
+    all_channels = [c for g in groups.values() for c in g['channels']]
+    if not all(name in all_channels for name in ("presence", "nx", "ny")):
         raise ValueError("mixed inference requires canonical presence/nx/ny")
-    count = len(groups) - 3
-    if not 1 <= count <= 256 or not all(f"embedding_{i:03d}" in groups for i in range(count)):
+    count = sum(c.startswith('embedding_') for c in all_channels)
+    if not 1 <= count <= 256 or not all(f"embedding_{i:03d}" in all_channels for i in range(count)):
         raise ValueError("mixed inference requires contiguous embedding_NNN channels")
     if len({g["scaledown"] for g in groups.values()}) != 1:
         raise ValueError("mixed inference channels must share the output lattice")
@@ -51,7 +59,8 @@ def write_mixed_manifest(root, prediction_path, embedding_path):
     provenance = {"schema": 1, "presence_nx_ny": str(paths[0]), "embedding": str(paths[1]),
                   "identities": identities}
     destination = Path(root) / json_digest(provenance) / "inference.lasagna.json"
-    document = {**manifests[0], "groups": groups, "mixed_inference": provenance}
+    document = {**manifests[0], "version": 2, "groups": groups, "mixed_inference": provenance,
+                "packed_channel_view": any(p.is_dir() for p in paths)}
     document.pop("provenance", None)  # The old relative inference.json belongs to the base cache.
     if destination.exists():
         if json.loads(destination.read_text()) != document:

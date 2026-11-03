@@ -6,7 +6,7 @@ pkg_check_modules(ZSTD REQUIRED IMPORTED_TARGET libzstd)
 find_package(SQLite3 3.24 REQUIRED)
 find_package(nlohmann_json CONFIG REQUIRED)
 if(NOT TARGET vc_delta3d::vc_delta3d)
-    find_package(vc_delta3d CONFIG QUIET)
+    find_package(vc_delta3d 0.3 CONFIG QUIET)
 endif()
 if(NOT TARGET vc_delta3d::vc_delta3d)
     include(FetchContent)
@@ -15,13 +15,21 @@ if(NOT TARGET vc_delta3d::vc_delta3d)
     set(VC_DELTA3D_INSTALL_CPP ON CACHE BOOL "" FORCE)
     FetchContent_Declare(vc_delta3d
         GIT_REPOSITORY https://github.com/ScrollPrize/vc-delta3d.git
-        GIT_TAG 103b502ad784df14c876100d87f601c0b6c46888) # v0.2.0
-    FetchContent_MakeAvailable(vc_delta3d)
+        GIT_TAG 45339743b450ff707d21fb742dc1b3b2bf99306d) # ScrollPrize/vc-delta3d#7
+    include("${CMAKE_CURRENT_LIST_DIR}/FetchDelta3D.cmake")
+    vc_fetch_delta3d()
 endif()
 if(TARGET vc_delta3d)
     set_target_properties(vc_delta3d PROPERTIES POSITION_INDEPENDENT_CODE ON)
 endif()
-add_library(vc_reader_native SHARED "${CMAKE_CURRENT_LIST_DIR}/../src/cpp/native_reader.cpp")
+# Embedding builds (the object store's Python module) link the reader statically so
+# the module carries no shared library of its own to install.
+option(VC_READER_SHARED_READER "Build the native reader as a shared library" ON)
+if(VC_READER_SHARED_READER)
+    add_library(vc_reader_native SHARED "${CMAKE_CURRENT_LIST_DIR}/../src/cpp/native_reader.cpp")
+else()
+    add_library(vc_reader_native STATIC "${CMAKE_CURRENT_LIST_DIR}/../src/cpp/native_reader.cpp")
+endif()
 add_library(vc_reader::reader ALIAS vc_reader_native)
 set_target_properties(vc_reader_native PROPERTIES POSITION_INDEPENDENT_CODE ON EXPORT_NAME reader)
 target_compile_features(vc_reader_native PUBLIC cxx_std_20)
@@ -29,7 +37,7 @@ target_include_directories(vc_reader_native PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_LIST_DIR}/../include>
     $<INSTALL_INTERFACE:include>)
 target_link_libraries(vc_reader_native PUBLIC vc_reader::headers CURL::libcurl PkgConfig::BLOSC PkgConfig::ZSTD
-    SQLite::SQLite3 vc_delta3d::vc_delta3d Threads::Threads nlohmann_json::nlohmann_json)
+    SQLite::SQLite3 vc_delta3d::vc_delta3d Threads::Threads nlohmann_json::nlohmann_json PRIVATE vc_reader::catalog)
 
 
 if(VC_READER_ENABLE_CUDA)

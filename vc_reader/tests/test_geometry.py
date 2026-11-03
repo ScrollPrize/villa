@@ -1,16 +1,11 @@
 """Independent references and CPU/CUDA agreement for general geometry queries."""
 import gc
-import os
-from pathlib import Path
-import sys
 
 import numpy as np
 import pytest
 
-if os.environ.get('VC_READER_BUILD_DIR'):
-    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'benchmarks'))
-    from extension_build import load_extensions
-    load_extensions(Path(os.environ['VC_READER_BUILD_DIR']))
+from build_support import load_build
+load_build()
 
 from vc_reader import cuda, _reader
 from vc_reader.geometry import PolylineSet, VoxelSet, transform_points

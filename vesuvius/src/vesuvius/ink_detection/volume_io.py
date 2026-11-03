@@ -19,6 +19,14 @@ _PUBLIC_S3_VOLUME_SUBSTRING = "vesuvius-challenge-open-data"
 ZARR_V3 = int(zarr.__version__.split(".", 1)[0]) >= 3
 
 
+def normalized_source_path(volume_path: str | Path) -> str:
+    """Resolve local path aliases while preserving remote source URLs."""
+    volume_path = str(volume_path)
+    if "://" in volume_path:
+        return volume_path.rstrip("/")
+    return str(Path(volume_path).expanduser().resolve())
+
+
 def _cache_snapshot(cache_dir: Path) -> list[tuple[int, int, Path]]:
     snapshot = []
     for directory, _, filenames in os.walk(cache_dir):

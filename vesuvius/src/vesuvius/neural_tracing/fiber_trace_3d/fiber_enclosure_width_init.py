@@ -51,7 +51,7 @@ def fit_enclosure_widths(d,samples,offsets,widths,gauge,active):
         di=float(d['ds_a'][inner] if d['i'][inner]==h else d['ds_b'][inner])
         do=float(d['ds_a'][outer] if d['i'][outer]==h else d['ds_b'][outer])
         add(qv[v],h,di,10);add(qv[v]+1,h,do,10)
-        bracket_rows.append(dict(h=int(d['source_id'][h]),v=int(d['source_id'][v]),
+        bracket_rows.append(dict(h=str(d['source_id'][h]),v=str(d['source_id'][v]),
             inner=inner,outer=outer,turn_arc_vx=do-di,q_inner=qv[v]))
     if not bracket_rows:raise ValueError('Enclosure width initialization needs an H-V-H bracket')
     for f,ds,phase in zip(samples['owner'],samples['ds'],samples['phase']):

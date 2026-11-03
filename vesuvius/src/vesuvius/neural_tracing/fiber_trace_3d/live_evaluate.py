@@ -272,7 +272,7 @@ def validate_input_lattice(attrs, level):
 
 
 def implementation_identity():
-    modules = ["lasagna.tiled_predict3d", "lasagna.demand_predict3d", "lasagna.normal_encoding",
+    modules = ["lasagna.tiled_predict3d", "lasagna.demand_predict3d", "lasagna.normal_encoding", "lasagna.compact_zarr",
                "vesuvius.neural_tracing.fiber_trace_3d.inference_adapter",
                "vesuvius.neural_tracing.fiber_trace_3d.infer",
                "vesuvius.neural_tracing.fiber_trace_3d.model",
@@ -327,6 +327,8 @@ def create_demand_store(cache, source_identity, model_identity, geometry, effect
         emit_embeddings=bool(settings.get("emit_embeddings", False)),
         emit_width=bool(settings.get("emit_width", False)),
         emit_normals=bool(settings.get("emit_normals", False)),
+        width_uint8_base=bool(settings.get("width_uint8_base", True)),
+        input_to_base=1 << level,
         **adapter_options)
     # Construction restores checkpoint config; reapply the resolved precision.
     adapter.config["training"] = {**adapter.config.get("training", {}),
@@ -335,13 +337,15 @@ def create_demand_store(cache, source_identity, model_identity, geometry, effect
         adapter.config['inference'] = {**adapter.config.get('inference', {}),
                                        'allow_tf32': settings['allow_tf32']}
     products = adapter.output_products
-    output = tiled.OmeZarrOutputAdapter(products=products, n_levels=level + power + 1)
+    from lasagna.compact_zarr import CompactOutputAdapter
+    validity = next(c.name for p in products for c in p.channels if c.name == "presence" or c.name.endswith("_presence"))
+    output = CompactOutputAdapter(root=cache / "prediction.zarr", products=products,
+        n_levels=level + power + 1, validity_channel=validity,
+        blank_invalid=settings.get("blank_invalid", True))
     def prepare_output():
-        tiled.create_product_omezarr_groups(products=products, base_shape_zyx=source_identity["base_shape"],
-            n_levels=level + power + 1, ome_chunk=geometry.chunk, ome_compressor=settings.get("compressor", "blosc-zstd"))
-        if not (cache / "inference.lasagna.json").exists():
-            tiled.write_lasagna_product_manifest(output_path=cache / "inference.lasagna.json", products=products,
-                base_shape_zyx=source_identity["base_shape"], provenance_json="inference.json")
+        output.prepare(base_shape_zyx=source_identity["base_shape"], ome_chunk=geometry.chunk,
+            ome_compressor=settings.get("compressor", "blosc-zstd"), provenance="../inference.json",
+            extra_fields={"width_encoding": "uint8-base-voxels" if settings.get("width_uint8_base", True) else "float32-input-voxels"})
         if not (cache / "inference.json").exists():
             atomic_write(cache / "inference.json", {"source": source_identity, "model": model_identity,
                 "coverage": "partial; readiness requires complete published sibling chunks; live scheduling state is RAM-only",
@@ -396,7 +400,9 @@ def resolve_inference_model(cache_root, checkpoint, model_config, settings, devi
             raise ValueError('TTA requires valid variant, precision off and max_batch_size1')
         model_identity['tta'] = SCHEMA  # Selection is a view, not a new prediction.
     if settings.get('emit_width'):
-        model_identity['width_channel'] = 'float32-input-voxels-v1'
+        model_identity['width_channel'] = ('uint8-base-voxels-v1' if settings.get('width_uint8_base', True) else 'float32-input-voxels-v1')
+    model_identity['prediction_format'] = 'lasagna-v3-czyx'
+    model_identity['blank_invalid'] = bool(settings.get('blank_invalid', True))
     if settings.get('emit_normals'):
         model_identity['sheet_normal_channels'] = 'six-sigmoid-compact-axis-u8-v1'
     return dict(snapshot=snapshot, effective=effective, settings=settings,
@@ -588,15 +594,15 @@ def run(config_path, checkpoint, devices, native_binary, model_config=None, *, r
                     model_cache_root / source_key, source_identity, model["identity"], geometry, model["settings"])
                 key = source_key if mixed is None else str(cache.resolve())
                 role_keys.append(key)
-                manifests.append(cache / "inference.lasagna.json")
+                manifests.append(cache / "prediction.zarr")
                 print(f"live-eval cache source={source_id} existing={(cache / 'cache_identity.json').is_file()} path={cache}", flush=True)
                 if key not in stores:
                     store = cleanup.enter_context(create_demand_store(cache, source_identity, stored_model_identity,
                         geometry, model["effective"], model["snapshot"], level, model["settings"]))
                     stores[key] = store
                     readers[key] = NativeTileReader(sampler, geometry, sampler.volume.dtype)
-                    channel_indices[key] = {str((Path(c.relative_path) / str(p.level)).resolve()): geometry
-                        for p in store.products for c in p.channels}
+                    channel_indices[key] = {str(store.output_adapter.array_path(p).resolve()): geometry
+                        for p in store.products}
                     backgrounds[key] = set()
                     group_key = json_digest(model["identity"])
                     group = pool_groups.setdefault(group_key, {"keys": [], "settings": model["settings"]})

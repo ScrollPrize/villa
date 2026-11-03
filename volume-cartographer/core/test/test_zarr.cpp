@@ -1,5 +1,5 @@
 // Coverage for core/src/Zarr.cpp — focuses on the downsample helpers,
-// createPyramidDatasets, writeZarrAttrs, and writeZarrRegionU8ByChunk.
+// createPyramidDatasets and writeZarrAttrs.
 
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
 #include <doctest/doctest.h>
@@ -40,52 +40,6 @@ std::vector<uint8_t> ramp(size_t n)
 }
 
 } // namespace
-
-TEST_CASE("downsampleChunk<uint8>: 2x2x2 mean of a constant block is the constant")
-{
-    std::vector<uint8_t> src(4 * 4 * 4, 100);
-    std::vector<uint8_t> dst(2 * 2 * 2, 0);
-    downsampleChunk<uint8_t>(src.data(), 4, 4, 4, dst.data(), 2, 2, 2,
-                             /*actual=*/4, 4, 4);
-    for (auto v : dst) CHECK(v == 100);
-}
-
-TEST_CASE("downsampleChunk<uint16>: handles a non-uniform input")
-{
-    std::vector<uint16_t> src(4 * 4 * 4);
-    for (size_t i = 0; i < src.size(); ++i) src[i] = static_cast<uint16_t>(i);
-    std::vector<uint16_t> dst(2 * 2 * 2, 0);
-    downsampleChunk<uint16_t>(src.data(), 4, 4, 4, dst.data(), 2, 2, 2, 4, 4, 4);
-    // dst[0] = mean of indices forming the 2x2x2 corner at (0,0,0).
-    // Indices: 0,1,4,5,16,17,20,21 -> sum=84, mean=10 (with rounding +/-)
-    CHECK(int(dst[0]) >= 9);
-    CHECK(int(dst[0]) <= 11);
-}
-
-TEST_CASE("downsampleChunk: edge tile with srcActual smaller than chunk shape")
-{
-    std::vector<uint8_t> src(4 * 4 * 4, 50);
-    std::vector<uint8_t> dst(2 * 2 * 2, 0);
-    // srcActual = 3 in z; effectively only 3 z-slabs contribute.
-    downsampleChunk<uint8_t>(src.data(), 4, 4, 4, dst.data(), 2, 2, 2,
-                             /*actualZ=*/3, /*actualY=*/4, /*actualX=*/4);
-    // dst[0] should still be 50 (all sources are 50)
-    CHECK(dst[0] == 50);
-}
-
-TEST_CASE("downsampleTileInto<uint8>: writes at an offset within dst")
-{
-    std::vector<uint8_t> src(4 * 4 * 4, 200);
-    std::vector<uint8_t> dst(2 * 4 * 4, 0);
-    downsampleTileInto<uint8_t>(src.data(), 4, 4, 4,
-                                dst.data(), /*dstZ=*/2, /*dstY=*/4, /*dstX=*/4,
-                                /*actual=*/4, 4, 4,
-                                /*dstOffY=*/2, /*dstOffX=*/2);
-    // Wrote into (zz in [0,2), y in [2,4), x in [2,4)) — top-left of dst is 0.
-    CHECK(dst[0] == 0);
-    // bottom-right corner (last writable cell):
-    CHECK(dst[1 * 4 * 4 + 3 * 4 + 3] == 200);
-}
 
 TEST_CASE("downsampleTileIntoPreserveZ<uint8>: preserves Z dim, halves Y/X")
 {
@@ -308,45 +262,6 @@ TEST_CASE("writeZarrAttrs keeps multiscales and only relative scaling when the s
     // The non-multiscales attributes still describe the render.
     CHECK(j["num_slices"] == 64);
     CHECK(j["note_axes_order"] == "ZYX (slice, row, col)");
-    fs::remove_all(d);
-}
-
-TEST_CASE("writeZarrRegionU8ByChunk writes data into multiple chunks")
-{
-    auto d = tmpDir("region_chunks");
-    auto ds = vc::createZarrDataset(d, "arr",
-        /*shape=*/{16, 16, 16}, /*chunks=*/{8, 8, 8},
-        vc::VcDtype::uint8, /*compressor=*/"none");
-    REQUIRE(ds);
-
-    std::vector<uint8_t> in = ramp(16 * 16 * 16);
-    writeZarrRegionU8ByChunk(ds.get(),
-                             /*offset=*/{0, 0, 0},
-                             /*regionShape=*/{16, 16, 16},
-                             in.data(),
-                             /*fillValue=*/0);
-    // Read back chunk (0,0,0) and confirm it matches.
-    std::vector<uint8_t> out(8 * 8 * 8, 0);
-    CHECK(ds->readChunk(0, 0, 0, out.data()));
-    CHECK(out[0] == in[0]);
-    fs::remove_all(d);
-}
-
-TEST_CASE("writeZarrRegionU8ByChunk with a partial region")
-{
-    auto d = tmpDir("region_partial");
-    auto ds = vc::createZarrDataset(d, "arr",
-        /*shape=*/{16, 16, 16}, /*chunks=*/{8, 8, 8},
-        vc::VcDtype::uint8, /*compressor=*/"none");
-    REQUIRE(ds);
-    // Write only the first 4x4x4 corner.
-    std::vector<uint8_t> in(4 * 4 * 4, 199);
-    writeZarrRegionU8ByChunk(ds.get(), {0, 0, 0}, {4, 4, 4}, in.data(), 0);
-    std::vector<uint8_t> out(8 * 8 * 8, 0);
-    CHECK(ds->readChunk(0, 0, 0, out.data()));
-    CHECK(out[0] == 199);
-    // Chunks that are outside the region should still report as absent.
-    CHECK_FALSE(ds->chunkExists(1, 0, 0));
     fs::remove_all(d);
 }
 

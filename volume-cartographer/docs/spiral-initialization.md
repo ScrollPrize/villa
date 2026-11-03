@@ -29,7 +29,6 @@ From `volume-cartographer/`, using the existing configured build and dependencie
 
 ```sh
 AGENTS_AGENT_MODE=1 ninja -C build VC3D test_spiral_input_workflow -j2
-python3 apps/VC3D/test/check_spiral_initialize_ownership.py
 QT_QPA_PLATFORM=offscreen \
 SPIRAL_TEST_PYTHON="$PWD/../spiral-fitting/.venv/bin/python" \
 SPIRAL_TEST_COPY_SOURCE=/path/to/real/dataset/fibers \
@@ -37,8 +36,7 @@ build/bin/test_spiral_input_workflow
 build/bin/VC3D
 ```
 
-The ownership harness executes the production button handler and checks that
-initialization and rebuild retain the lease. The copy tests verify bytes from a
+The copy tests verify bytes from a
 real directory, completion on the UI thread, UI heartbeat activity, coalescing,
 reuse, cancellation, and error delivery. They write only to temporary directories.
 The complete workflow suite also starts a local test service. Qt's `QFile::copy`

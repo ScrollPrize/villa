@@ -1,3 +1,5 @@
+#include "vc/core/util/AtomicFile.hpp"
+#include "vc/core/util/Time.hpp"
 #include "vc/core/types/VcDataset.hpp"
 #include "vc/core/util/BinaryPyramid.hpp"
 #include "vc/core/util/OpenCvCompat.hpp"
@@ -120,6 +122,9 @@ static bool chunkIndexLess(const ChunkIndex& a, const ChunkIndex& b)
 struct Config {
     fs::path inputRoot;
     fs::path outputRoot;
+    // The published output's name (its meta.json uuid); outputRoot may be its
+    // staging directory.
+    std::string outputName;
     ProcessingMode mode = ProcessingMode::chunkAlphaWrap;
     int ignoreValue = kDefaultIgnoreValue;
     double alpha = kDefaultAlpha;
@@ -608,21 +613,6 @@ static void writeJsonFile(const fs::path& path, const utils::Json& j)
     if (!out) {
         throw std::runtime_error("failed to write json file: " + path.string());
     }
-}
-
-static std::string nowIsoUtc()
-{
-    const auto now = std::chrono::system_clock::now();
-    const auto t = std::chrono::system_clock::to_time_t(now);
-    std::tm tmUtc{};
-#if defined(_WIN32)
-    gmtime_s(&tmUtc, &t);
-#else
-    gmtime_r(&t, &tmUtc);
-#endif
-    std::ostringstream oss;
-    oss << std::put_time(&tmUtc, "%Y-%m-%dT%H:%M:%SZ");
-    return oss.str();
 }
 
 static Shape3 toShape3(const std::vector<std::size_t>& shape)
@@ -1252,50 +1242,6 @@ static SliceMaskPair detectIgnoreMasks(const cv::Mat1b& labelSlice,
     }
 
     return result;
-}
-
-static cv::Mat1b detectInnerRegion(const cv::Mat1b& labelSlice,
-                                   int nAngleBins,
-                                   double shrinkFactor,
-                                   int smoothingWindow,
-                                   bool useFastAtan2,
-                                   bool useSquaredDist,
-                                   AlgoMode algoMode)
-{
-    return detectIgnoreMasks(labelSlice,
-                             nAngleBins,
-                             kDefaultAlpha,
-                             kDefaultOuterSmoothing,
-                             shrinkFactor,
-                             smoothingWindow,
-                             false,
-                             true,
-                             useFastAtan2,
-                             useSquaredDist,
-                             algoMode)
-        .inner;
-}
-
-static cv::Mat1b detectOuterRegion(const cv::Mat1b& labelSlice,
-                                   int nAngleBins,
-                                   double alpha,
-                                   int smoothingWindow,
-                                   bool useFastAtan2,
-                                   bool useSquaredDist,
-                                   AlgoMode algoMode)
-{
-    return detectIgnoreMasks(labelSlice,
-                             nAngleBins,
-                             alpha,
-                             smoothingWindow,
-                             kDefaultShrink,
-                             kDefaultInnerSmoothing,
-                             true,
-                             false,
-                             useFastAtan2,
-                             useSquaredDist,
-                             algoMode)
-        .outer;
 }
 
 static cv::Mat1b upscaleMaskNearest(const cv::Mat1b& mask, int outH, int outW)
@@ -2785,7 +2731,7 @@ static void writeOutputMetadata(const Config& cfg,
 {
     utils::Json meta = inputMeta;
 
-    const std::string uuid = cfg.outputRoot.filename().string();
+    const std::string& uuid = cfg.outputName;
     meta["type"] = "vol";
     meta["uuid"] = uuid;
     meta["name"] = uuid;
@@ -2801,7 +2747,7 @@ static void writeOutputMetadata(const Config& cfg,
     meta["max"] = maxValue;
     meta["label_volume"] = "rasterized";
     meta["ignore_label_value"] = cfg.ignoreValue;
-    meta["ignore_label_added_at"] = nowIsoUtc();
+    meta["ignore_label_added_at"] = vc::core::util::nowIsoUtc();
     meta["ignore_label_tool"] = "vc_add_ignore_label";
     meta["source_zarr"] = fs::weakly_canonical(cfg.inputRoot).string();
     meta["ignore_label_params"] = {
@@ -3844,7 +3790,7 @@ static bool runSelfTest()
     return true;
 }
 
-static int process(const Config& cfg)
+static int process(Config cfg)
 {
     if (cfg.selfTest) {
         return runSelfTest() ? EXIT_SUCCESS : EXIT_FAILURE;
@@ -3890,14 +3836,18 @@ static int process(const Config& cfg)
         }
         // Auto-enable reuse when output exists and overwrite is not requested.
         reuseOutputTree = cfg.reuseOutputTree || !cfg.overwrite;
-        if (!reuseOutputTree) {
-            fs::remove_all(cfg.outputRoot);
-            fs::create_directories(cfg.outputRoot);
-        } else if (cfg.verbose && !cfg.reuseOutputTree) {
+        if (reuseOutputTree && cfg.verbose && !cfg.reuseOutputTree) {
             std::cerr << "[output] existing tree detected; auto-enabling reuse-output-tree" << '\n';
         }
-    } else {
-        fs::create_directories(cfg.outputRoot);
+    }
+    // A new (or overwritten) output is written under a hidden name and
+    // published, replacing the old one, only when complete; a reused tree is
+    // updated in place.
+    cfg.outputName = cfg.outputRoot.filename().string();
+    std::optional<vc::core::util::StagedDirectory> staged;
+    if (!reuseOutputTree) {
+        staged.emplace(cfg.outputRoot);
+        cfg.outputRoot = staged->path();
     }
 
     const std::size_t workers = cfg.workers > 0
@@ -3961,7 +3911,7 @@ static int process(const Config& cfg)
     }
 
     if (cfg.mode == ProcessingMode::chunkAlphaWrap) {
-        return processChunkAlphaWrap(cfg,
+        const int result = processChunkAlphaWrap(cfg,
                                      levels,
                                      inputMeta,
                                      existingByLevel,
@@ -3973,6 +3923,8 @@ static int process(const Config& cfg)
                                      outChunk,
                                      zStart,
                                      zStop);
+        if (result == EXIT_SUCCESS && staged) staged->commit();
+        return result;
     }
 
     const std::size_t zCount = static_cast<std::size_t>(zStop - zStart);
@@ -4608,6 +4560,7 @@ static int process(const Config& cfg)
                   << '\n';
         std::cerr.unsetf(std::ios::floatfield);
     }
+    if (staged) staged->commit();
     std::cout << "vc_add_ignore_label completed\n";
     return EXIT_SUCCESS;
 }

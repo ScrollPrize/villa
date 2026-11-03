@@ -1,9 +1,8 @@
 # Volume Class API
 
-The `Volume` class is the main API for opening, creating, reading, and writing
-3D zarr volumes. It supports local OME-Zarr-like pyramids, remote HTTP/S3-backed
-zarr stores, cached sampling, typed region reads/writes, raw chunk I/O, and
-metadata/root attribute updates.
+The `Volume` class is the main API for opening and reading 3D zarr volumes. It
+supports local OME-Zarr-like pyramids, remote HTTP/S3-backed zarr stores,
+cached sampling, typed region reads and raw chunk reads. Volumes are read-only.
 
 **Header:** `core/include/vc/core/types/Volume.hpp`
 **Implementation:** `core/src/Volume.cpp`
@@ -15,12 +14,11 @@ A `Volume` represents a 3D image dataset with:
 - Volume metadata such as name, UUID, dimensions, voxel size, dtype, and format.
 - Local or remote zarr pyramid access.
 - Cached sampling through `vc::render::ChunkCache`.
-- Typed region reads/writes in `uint8_t` and `uint16_t`.
-- Raw local zarr chunk reads/writes for tools that need chunk-level control.
-- File-based persistence through `meta.json` and root `.zattrs` for local volumes.
+- Typed region reads in `uint8_t` and `uint16_t`.
+- Raw local zarr chunk reads for tools that need chunk-level control.
 
 Volumes are typically managed through a `VolumePkg` container, but can also be
-opened or created directly.
+opened directly.
 
 ## Coordinate Ordering
 
@@ -39,9 +37,9 @@ The `meta.json` dimension fields are:
 Use `shape()` and `shape(level)` for storage order `{z, y, x}`. Use
 `shapeXyz()` when UI or coordinate-order code needs `{x, y, z}`.
 
-`Array3D<T>` is also indexed and shaped as `{z, y, x}`. The `readXYZ()` and
-`writeXYZ()` helpers accept offsets in `{x, y, z}` order, but the `Array3D`
-payload remains `{z, y, x}`.
+`Array3D<T>` is also indexed and shaped as `{z, y, x}`. The `readXYZ()` helpers
+accept offsets in `{x, y, z}` order, but the `Array3D` payload remains
+`{z, y, x}`.
 
 ## Factory Methods
 
@@ -49,9 +47,9 @@ payload remains `{z, y, x}`.
 // Open an existing local volume.
 static std::shared_ptr<Volume> New(std::filesystem::path path);
 
-// Open an existing local volume, or create one when no zarr array exists.
+// Open an existing local volume and apply metadata over its meta.json.
 static std::shared_ptr<Volume> New(std::filesystem::path path,
-                                   const ZarrCreateOptions& options);
+                                   const utils::Json& metadata);
 
 // Open a remote HTTP or s3:// zarr volume. s3:// URLs are resolved to HTTPS.
 static std::shared_ptr<Volume> NewFromUrl(
@@ -62,45 +60,6 @@ static std::shared_ptr<Volume> NewFromUrl(
 Remote volumes always use the process-wide remote cache root configured by
 VC3D.
 
-`New(path, options)` creates a local zarr pyramid when `path` has no existing
-zarr array, or when `options.overwriteExisting` is true. Existing volumes are
-opened as-is by default.
-
-## Creation Options
-
-```cpp
-struct PyramidPolicy {
-    enum class Reduction {
-        Mean,
-        Max,
-        BinaryOr,
-    };
-
-    std::array<double, 3> downsampleZYX{2.0, 2.0, 2.0};
-    Reduction reduction = Reduction::Mean;
-};
-
-struct ZarrCreateOptions {
-    std::array<size_t, 3> shapeZYX{};
-    std::array<size_t, 3> chunkShapeZYX{64, 64, 64};
-    vc::render::ChunkDtype dtype = vc::render::ChunkDtype::UInt8;
-    size_t numLevels = 1;
-    PyramidPolicy pyramid;
-    double fillValue = 0.0;
-    double voxelSize = 1.0;
-    std::string voxelUnit;
-    std::string uuid;
-    std::string name;
-    std::string compressor = "blosc";
-    int compressionLevel = 3;
-    bool overwriteExisting = false;
-};
-```
-
-Creation writes `meta.json`, `.zattrs`, `.zgroup`, and one zarr array per scale
-level named `0`, `1`, `2`, and so on. Only `uint8_t` and `uint16_t` volume data
-are currently supported by this API.
-
 ## API Reference
 
 ### Metadata and Identity
@@ -110,18 +69,11 @@ are currently supported by this API.
 | `id()` | `std::string` | Volume UUID from metadata |
 | `name()` | `std::string` | Display name from metadata |
 | `metadata()` | `const utils::Json&` | Current volume metadata |
-| `writeMetadata(const utils::Json&)` | `void` | Replace local `meta.json` and update cached dimensions |
-| `updateMetadata(const utils::Json&)` | `void` | Merge fields into existing metadata and persist |
 | `rootAttributes()` | `utils::Json` | Read local root `.zattrs`, or `{}` if absent |
-| `writeRootAttributes(const utils::Json&)` | `void` | Replace local root `.zattrs` |
-| `updateRootAttributes(const utils::Json&)` | `void` | Merge fields into local root `.zattrs` |
 | `path()` | `std::filesystem::path` | Local volume path; empty for remote volumes |
 | `isRemote()` | `bool` | Whether the volume is backed by a remote zarr store |
 | `remoteUrl()` | `const std::string&` | Normalized remote URL for remote volumes |
 | `remoteAuth()` | `const vc::HttpAuth&` | Auth used for remote chunk reads |
-
-`writeMetadata()`, `updateMetadata()`, `writeRootAttributes()`, and
-`updateRootAttributes()` are local-only operations and throw for remote volumes.
 
 ### Dimensions, Dtype, and Scales
 
@@ -136,15 +88,14 @@ are currently supported by this API.
 | `voxelSize()` | `double` | Physical voxel size from metadata |
 | `dtype()` | `vc::render::ChunkDtype` | Volume dtype |
 | `numScales()` | `size_t` | Number of scale slots known to the volume |
-| `baseScaleLevel()` | `int` | Always `0` |
+| `baseScaleLevel()` | `int` | Working level: the source pyramid level opened as level 0 (remote `#vc-base-scale=N`), else `0`; the ID does not change with it |
 | `hasScaleLevel(int level)` | `bool` | Whether a physical zarr array exists for the level |
 | `presentScaleLevels()` | `std::vector<int>` | Physical scale levels |
 | `firstPresentScaleLevel()` | `int` | Finest available physical scale |
 | `finestPresentScaleLevelAtOrBelow(int level)` | `int` | Finer source level for virtual downsampling |
-| `pyramidReduction()` | `PyramidPolicy::Reduction` | Reduction method used for pyramid writes |
 
 `numScales()` can include missing scale slots. Check `hasScaleLevel()` or
-`presentScaleLevels()` before reading or writing a specific level.
+`presentScaleLevels()` before reading a specific level.
 
 ### Cache and Sampling
 
@@ -204,40 +155,20 @@ When a requested level is missing, `MissingScaleLevelPolicy` controls behavior:
 | `Empty` | Leave the output unchanged and return `false` |
 | `VirtualDownsample` | Read the finest available lower level and downsample into the output |
 
-### Typed Region Writes
-
-| Method | Returns | Description |
-|--------|---------|-------------|
-| `writeZYX(const Array3D<uint8_t>&, offsetZYX, level)` | `void` | Write an 8-bit local region using `{z, y, x}` offset |
-| `writeZYX(const Array3D<uint16_t>&, offsetZYX, level)` | `void` | Write a 16-bit local region using `{z, y, x}` offset |
-| `writeXYZ(const Array3D<uint8_t>&, offsetXYZ, level)` | `void` | Write an 8-bit local region using `{x, y, z}` offset |
-| `writeXYZ(const Array3D<uint16_t>&, offsetXYZ, level)` | `void` | Write a 16-bit local region using `{x, y, z}` offset |
-
-Writes are local-only. They update the target level, propagate the affected
-region into coarser present pyramid levels using the configured reduction, and
-invalidate the shared cache.
-
-### Raw Chunk I/O
+### Raw Chunk Reads
 
 | Method | Returns | Description |
 |--------|---------|-------------|
 | `readChunk(level, chunkZYX)` | `std::optional<std::vector<std::byte>>` | Read a local raw chunk, or `std::nullopt` when absent |
 | `readChunkOrFill(level, chunkZYX)` | `std::vector<std::byte>` | Read a local raw chunk, or synthesize fill bytes |
 | `chunkExists(level, chunkZYX)` | `bool` | Check local chunk presence |
-| `writeChunk(level, chunkZYX, data)` | `void` | Write a local raw chunk |
-| `writeChunk(level, chunkZYX, data, options)` | `void` | Write a local raw chunk with options |
-| `removeChunk(level, chunkZYX)` | `bool` | Remove or mark a local chunk empty |
-
-Chunk coordinates are `{z, y, x}` chunk indices. `writeChunk()` expects the raw,
-uncompressed chunk payload to have exactly `chunk_elems * dtype_size` bytes.
-When `ChunkWriteOptions::writeEmptyChunks` is false, chunks containing only the
-zarr fill value are removed instead of stored.
+Chunk coordinates are `{z, y, x}` chunk indices. Payloads are raw,
+uncompressed chunk bytes, exactly `chunk_elems * dtype_size` long.
 
 ### Utilities
 
 | Method | Returns | Description |
 |--------|---------|-------------|
-| `static checkDir(const std::filesystem::path&)` | `bool` | Accepts directories with `meta.json`, `metadata.json`, or any local zarr array |
 | `skipShapeCheck` | `thread_local bool` | Debug/import escape hatch to skip zarr shape validation |
 
 ## Metadata Files
@@ -279,23 +210,6 @@ std::cout << volume->name() << ": "
           << std::endl;
 ```
 
-### Creating a Local Volume
-
-```cpp
-#include "vc/core/types/Volume.hpp"
-
-Volume::ZarrCreateOptions opts;
-opts.shapeZYX = {256, 1024, 1024};
-opts.chunkShapeZYX = {64, 64, 64};
-opts.dtype = vc::render::ChunkDtype::UInt16;
-opts.numLevels = 4;
-opts.voxelSize = 5.0;
-opts.voxelUnit = "nm";
-opts.name = "scan";
-
-auto volume = Volume::New("/path/to/output.zarr", opts);
-```
-
 ### Opening a Remote Volume
 
 ```cpp
@@ -307,9 +221,6 @@ if (volume->isRemote()) {
     std::cout << volume->remoteUrl() << std::endl;
 }
 ```
-
-Remote volumes are read-only through `Volume`: metadata/root attribute writes,
-region writes, and raw chunk writes throw.
 
 ### Reading a Region
 
@@ -347,29 +258,6 @@ if (!ok) {
 }
 ```
 
-### Writing a Region
-
-```cpp
-Array3D<uint8_t> mask({32, 128, 128}, uint8_t{1});
-
-volume->writeZYX(mask, {50, 100, 100});
-```
-
-The write updates level 0 and any coarser present levels affected by the region.
-
-### Raw Chunk Read/Write
-
-```cpp
-const int level = 0;
-const std::array<size_t, 3> chunkZYX{0, 0, 0};
-
-auto bytes = volume->readChunkOrFill(level, chunkZYX);
-
-Volume::ChunkWriteOptions options;
-options.writeEmptyChunks = false;
-volume->writeChunk(level, chunkZYX, bytes, options);
-```
-
 ### Sampling a Slice
 
 ```cpp
@@ -395,14 +283,6 @@ Coordinates passed to `sample()` are base-scale coordinates in zarr order
 `(z, y, x)`. When `params.level > 0`, `Volume` scales them to the requested
 level before sampling.
 
-### Updating Metadata
-
-```cpp
-utils::Json patch;
-patch["name"] = "renamed-volume";
-volume->updateMetadata(patch);
-```
-
 ## Implementation Notes
 
 - Shape validation checks physical zarr level shapes against metadata dimensions
@@ -418,5 +298,3 @@ volume->updateMetadata(patch);
   never changes either policy. Low-level standalone cache factories create a
   fully independent service and budget; normal `Volume` users cannot attach a
   private or partially shared service.
-- Region writes and raw chunk writes are local-only and invalidate the shared
-  cache after successful mutation.

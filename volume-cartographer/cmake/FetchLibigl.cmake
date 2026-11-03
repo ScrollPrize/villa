@@ -1,6 +1,4 @@
-# libigl via FetchContent, shared by flatboi (SLIM) and apps (vc_obj_uv_lift).
-# Lives outside libs/flatboi so platforms that can't build flatboi's PaStiX
-# dependency (Windows) still get the header-only igl::core target.
+# libigl via FetchContent for flatboi (SLIM).
 
 include(FetchContent)
 

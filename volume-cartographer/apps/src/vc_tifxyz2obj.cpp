@@ -6,6 +6,8 @@
 #include "vc/core/util/Slicing.hpp"
 #include "vc/core/util/Surface.hpp"
 #include "vc/core/util/QuadSurface.hpp"
+#include "vc/core/util/StoreToolOptions.hpp"
+#include "vc/core/util/SurfaceMeshing.hpp"
 
 #include "vc/core/types/VcDataset.hpp"
 #include "utils/Json.hpp"
@@ -15,6 +17,7 @@
 #include <iomanip>
 #include <iostream>
 #include <cmath>
+#include <algorithm>
 #include <limits>
 
 
@@ -46,98 +49,36 @@ static inline cv::Vec3f fd_fallback_normal(const cv::Mat_<cv::Vec3f>& P, int y, 
 }
 // ---------------------------------------------------------------------------
 
-// Decimates a grid by a target ratio (e.g., 0.5 keeps ~50% of points)
-// Computes the appropriate stride from the ratio: stride = 1/sqrt(ratio)
-static cv::Mat_<cv::Vec3f> decimate_grid_ratio(const cv::Mat_<cv::Vec3f>& points, float ratio)
+// Writes the OBJ lines of one mesh vertex: v, vt (grid position scaled, or
+// normalized) and vn.
+static void write_vertex(std::ofstream& out,
+                         const cv::Mat_<cv::Vec3f>& points,
+                         const cv::Mat_<cv::Vec3f>& normals,
+                         cv::Vec2i loc,
+                         bool normalize_uv,
+                         float uv_fac_x,
+                         float uv_fac_y)
 {
-    if (ratio <= 0.0f || ratio >= 1.0f) return points.clone();
+    const cv::Vec3f p = points(loc);
+    out << "v " << p[0] << " " << p[1] << " " << p[2] << '\n';
 
-    // For ratio r, we want 1/s² = r, so s = 1/sqrt(r)
-    int stride = std::max(2, static_cast<int>(std::round(1.0f / std::sqrt(ratio))));
+    // UVs: scaled by SCALE = 20
+    const float u = normalize_uv ? float(loc[1]) / float(points.cols - 1) : float(loc[1]) * uv_fac_x;
+    const float v = normalize_uv ? float(loc[0]) / float(points.rows - 1) : float(loc[0]) * uv_fac_y;
+    out << "vt " << u << " " << v << '\n';
 
-    // Calculate new dimensions
-    int new_rows = (points.rows + stride - 1) / stride;
-    int new_cols = (points.cols + stride - 1) / stride;
+    // Prefer precomputed per-vertex normal; validate; then fallback.
+    cv::Vec3f n = normals(loc);
+    bool ok = finite3(n);
+    if (ok) n = unit_or_default(n);
 
-    cv::Mat_<cv::Vec3f> decimated(new_rows, new_cols);
-
-    // Sample every stride-th point
-    for (int j = 0; j < new_rows; ++j) {
-        for (int i = 0; i < new_cols; ++i) {
-            int src_j = j * stride;
-            int src_i = i * stride;
-
-            // Ensure we don't go out of bounds
-            if (src_j < points.rows && src_i < points.cols) {
-                decimated(j, i) = points(src_j, src_i);
-            } else {
-                // Handle edge case - use the last valid point
-                src_j = std::min(src_j, points.rows - 1);
-                src_i = std::min(src_i, points.cols - 1);
-                decimated(j, i) = points(src_j, src_i);
-            }
-        }
+    if (!ok || (n[0] == 0.f && n[1] == 0.f && n[2] == 0.f)) {
+        // fall back to grid_normal (expects x,y), then to finite-diff
+        cv::Vec3f ng = grid_normal(points, cv::Vec3f(float(loc[1]), float(loc[0]), 0.f));
+        if (finite3(ng)) n = unit_or_default(ng);
+        else             n = fd_fallback_normal(points, loc[0], loc[1]);
     }
-
-    float actual_ratio = float(new_rows * new_cols) / float(points.rows * points.cols);
-    std::cout << "Decimation with ratio " << ratio << " (stride=" << stride << "): "
-              << "reduced to " << new_rows << " x " << new_cols
-              << " (" << (new_rows * new_cols) << " points, actual ratio: "
-              << std::fixed << std::setprecision(3) << actual_ratio << ")" << std::endl;
-
-    return decimated;
-}
-
-
-
-// ---------------------------------------------------------------------------
-
-// Adds vertex/texcoord/normal for grid location (y,x) if not already added.
-// Returns the (1-based) OBJ index for this vertex (and matching vt/vn).
-static int get_add_vertex(std::ofstream& out,
-                          std::ofstream* griduv,
-                          const cv::Mat_<cv::Vec3f>& points,
-                          const cv::Mat_<cv::Vec3f>& normals,
-                          cv::Mat_<int>& idxs,
-                          int& v_idx,
-                          cv::Vec2i loc,
-                          bool normalize_uv,
-                          float uv_fac_x,
-                          float uv_fac_y)
-{
-
-    if (idxs(loc) == -1) {
-        idxs(loc) = v_idx++;
-        const cv::Vec3f p = points(loc);
-        out << "v " << p[0] << " " << p[1] << " " << p[2] << '\n';
-
-        // Grid-UV sidecar: raw (col,row) of this vertex in source-grid space,
-        // one line per OBJ vertex in emit order. Carries the original grid
-        // cell through flatten so approval can be resampled. See vc_obj2tifxyz.
-        if (griduv) {
-            (*griduv) << loc[1] << ' ' << loc[0] << '\n';
-        }
-
-        // UVs: scaled by SCALE = 20
-        const float u = normalize_uv ? float(loc[1]) / float(points.cols - 1) : float(loc[1]) * uv_fac_x;
-        const float v = normalize_uv ? float(loc[0]) / float(points.rows - 1) : float(loc[0]) * uv_fac_y;
-        out << "vt " << u << " " << v << '\n';
-
-        // Prefer precomputed per-vertex normal; validate; then fallback.
-        cv::Vec3f n = normals(loc);
-        bool ok = finite3(n);
-        if (ok) n = unit_or_default(n);
-
-        if (!ok || (n[0] == 0.f && n[1] == 0.f && n[2] == 0.f)) {
-            // fall back to grid_normal (expects x,y), then to finite-diff
-            cv::Vec3f ng = grid_normal(points, cv::Vec3f(float(loc[1]), float(loc[0]), 0.f));
-            if (finite3(ng)) n = unit_or_default(ng);
-            else             n = fd_fallback_normal(points, loc[0], loc[1]);
-        }
-        out << "vn " << n[0] << " " << n[1] << " " << n[2] << '\n';
-    }
-
-    return idxs(loc);
+    out << "vn " << n[0] << " " << n[1] << " " << n[2] << '\n';
 }
 
 static cv::Mat_<cv::Vec3f> build_vertex_normals_from_faces(
@@ -223,12 +164,20 @@ static void surf_write_obj(QuadSurface *surf, const std::filesystem::path &out_f
     }
     
     // Apply decimation if requested: one pass, stride derived from the
-    // requested keep fraction (decimate_grid_ratio computes stride =
-    // round(1/sqrt(p))). Skip when keep_percent >= 100 (no decimation).
+    // requested keep fraction (decimationStride: round(1/sqrt(p))). Skip
+    // when keep_percent >= 100 (no decimation).
     if (keep_percent > 0.0f && keep_percent < 100.0f) {
         std::cout << "Original grid: " << points.rows << " x " << points.cols
                   << " (" << (points.rows * points.cols) << " points)" << std::endl;
-        points = decimate_grid_ratio(points, keep_percent / 100.0f);
+        const float ratio = keep_percent / 100.0f;
+        const int rows = points.rows, cols = points.cols;
+        const int stride = vc::meshing::decimationStride(ratio);
+        points = vc::meshing::decimateGrid(points, stride);
+        float actual_ratio = float(points.rows * points.cols) / float(rows * cols);
+        std::cout << "Decimation with ratio " << ratio << " (stride=" << stride << "): "
+                  << "reduced to " << points.rows << " x " << points.cols
+                  << " (" << (points.rows * points.cols) << " points, actual ratio: "
+                  << std::fixed << std::setprecision(3) << actual_ratio << ")" << std::endl;
     }
 
     // Fill isolated interior holes that would otherwise create extra boundary
@@ -242,28 +191,12 @@ static void surf_write_obj(QuadSurface *surf, const std::filesystem::path &out_f
         }
     }
 
-    cv::Mat_<int> idxs(points.size(), -1);
-
     std::ofstream out(out_fn);
     if (!out) {
         std::cerr << "Failed to open for write: " << out_fn << "\n";
         return;
     }
     out << std::fixed << std::setprecision(6);
-
-    // Emit a grid-UV sidecar only when the source carries an approval mask;
-    // it lets the flatten pipeline resample approval onto the new grid.
-    std::ofstream griduv;
-    std::ofstream* griduv_ptr = nullptr;
-    if (!surf->channel("approval", SURF_CHANNEL_NORESIZE).empty()) {
-        const std::filesystem::path griduv_fn = out_fn.string() + ".griduv";
-        griduv.open(griduv_fn);
-        if (griduv) {
-            griduv_ptr = &griduv;
-        } else {
-            std::cerr << "warning: could not write grid-UV sidecar: " << griduv_fn << "\n";
-        }
-    }
 
     cv::Mat_<cv::Vec3f> normals = build_vertex_normals_from_faces(points);
 
@@ -288,42 +221,51 @@ static void surf_write_obj(QuadSurface *surf, const std::filesystem::path &out_f
         std::cout << "      (meta scale = [" << s[0] << ", " << s[1] << "])\n";
     }
 
-    int v_idx = 1;
-    for (int j = 0; j < points.rows - 1; ++j)
-        for (int i = 0; i < points.cols - 1; ++i)
-            if (loc_valid(points, cv::Vec2d(j, i)))
-            {
-                const int c00 = get_add_vertex(out, griduv_ptr, points, normals, idxs, v_idx, {j,   i  }, normalize_uv, uv_fac_x, uv_fac_y);
-                const int c01 = get_add_vertex(out, griduv_ptr, points, normals, idxs, v_idx, {j,   i+1}, normalize_uv, uv_fac_x, uv_fac_y);
-                const int c10 = get_add_vertex(out, griduv_ptr, points, normals, idxs, v_idx, {j+1, i  }, normalize_uv, uv_fac_x, uv_fac_y);
-                const int c11 = get_add_vertex(out, griduv_ptr, points, normals, idxs, v_idx, {j+1, i+1}, normalize_uv, uv_fac_x, uv_fac_y);
-                // faces unchanged: use same index for v/vt/vn
-                out << "f " << c10 << "/" << c10 << "/" << c10 << " "
-                           << c00 << "/" << c00 << "/" << c00 << " "
-                           << c01 << "/" << c01 << "/" << c01 << '\n';
+    // Each quad's new vertices precede its two faces.
+    const auto mesh = vc::meshing::meshGrid(points);
+    std::size_t written = 0;
+    for (std::size_t f = 0; f + 1 < mesh.faces.size(); f += 2) {
+        const cv::Vec3i& a = mesh.faces[f];
+        const cv::Vec3i& b = mesh.faces[f + 1];
+        const std::size_t last = std::max({a[0], a[1], a[2], b[2]});
+        for (; written <= last; ++written)
+            write_vertex(out, points, normals, mesh.cells[written], normalize_uv, uv_fac_x, uv_fac_y);
+        // faces unchanged: use same index for v/vt/vn (1-based)
+        out << "f " << a[0] + 1 << "/" << a[0] + 1 << "/" << a[0] + 1 << " "
+                   << a[1] + 1 << "/" << a[1] + 1 << "/" << a[1] + 1 << " "
+                   << a[2] + 1 << "/" << a[2] + 1 << "/" << a[2] + 1 << '\n';
 
-                out << "f " << c10 << "/" << c10 << "/" << c10 << " "
-                           << c01 << "/" << c01 << "/" << c01 << " "
-                           << c11 << "/" << c11 << "/" << c11 << '\n';
-            }
+        out << "f " << b[0] + 1 << "/" << b[0] + 1 << "/" << b[0] + 1 << " "
+                   << b[1] + 1 << "/" << b[1] + 1 << "/" << b[1] + 1 << " "
+                   << b[2] + 1 << "/" << b[2] + 1 << "/" << b[2] + 1 << '\n';
+    }
 }
 
 int main(int argc, char *argv[])
 {
-    if (argc == 2 && (std::string(argv[1]) == "-h" || std::string(argv[1]) == "--help")) {
+    const auto usage = [&] {
         std::cout << "usage: " << argv[0] << " <tiffxyz> <obj> [--normalize-uv] [--align-grid] [--keep=<p>] [--clean [K]] [--no-inpaint]\n"
+                  << "       " << argv[0] << " --store <store> --surface <uuid> --name <obj-name> [--volume-uuid <id>] [options]\n"
+                  << "  store mode writes the OBJ into the surface's artifact directory and prints obj: <path>\n"
+                  << "  --volume-uuid <id> : store mode: export in that volume's voxels, through the store's view of the surface\n"
                   << "  --normalize-uv : Normalize UVs to [0,1] range\n"
                   << "  --align-grid   : Align grid Z only (flatten Z per row)\n"
                   << "  --keep=<p>     : Percent of source points to keep (1..100). 100 = no decimation. One pass; stride = round(1/sqrt(p/100)).\n"
                   << "  --clean [K]    : Remove outlier points far from surface using robust distance threshold; K is sigma multiplier (default 5.0)\n"
                   << "  --inpaint      : Fill isolated invalid cells via Ceres-smoothness solve before emitting OBJ. Off by default.\n"
                   << "  --no-inpaint   : Legacy alias (inpaint is off by default now).\n";
+    };
+    if (argc == 2 && (std::string(argv[1]) == "-h" || std::string(argv[1]) == "--help")) {
+        usage();
         return EXIT_SUCCESS;
     }
 
-    if (argc < 3) {
-    std::cerr << "error: too few arguments\n"
-                  << "usage: " << argv[0] << " <tiffxyz> <obj> [--normalize-uv] [--align-grid] [--keep=<p>] [--clean [K]] [--no-inpaint]\n";
+    std::vector<std::string> args(argv + 1, argv + argc);
+    std::optional<StoreToolOptions> store_options;
+    try {
+        store_options = StoreToolOptions::take(args, {.surfaces = true, .creates = false, .named = true});
+    } catch (const std::exception& error) {
+        std::cerr << "error: " << error.what() << "\n";
         return EXIT_FAILURE;
     }
 
@@ -333,10 +275,11 @@ int main(int argc, char *argv[])
     float clean_sigma_k = 5.0f; // default K
     float keep_percent = 100.0f; // 100 = no decimation
     bool inpaint_holes = false;
-    
+    std::vector<std::string> positional;
+
     // Parse optional arguments
-    for (int i = 3; i < argc; ++i) {
-        std::string arg = argv[i];
+    for (size_t i = 0; i < args.size(); ++i) {
+        const std::string& arg = args[i];
         if (arg == "--normalize-uv") {
             normalize_uv = true;
         } else if (arg == "--align-grid") {
@@ -360,11 +303,10 @@ int main(int argc, char *argv[])
         } else if (arg == "--clean") {
             clean_surface = true;
             // Optional numeric K argument following --clean
-            if (i + 1 < argc) {
-                std::string next = argv[i + 1];
+            if (i + 1 < args.size()) {
                 try {
                     // Allow floats (e.g., 3, 3.5)
-                    float k = std::stof(next);
+                    float k = std::stof(args[i + 1]);
                     if (std::isfinite(k) && k >= 0.0f) {
                         clean_sigma_k = k;
                         ++i; // consume K
@@ -373,25 +315,51 @@ int main(int argc, char *argv[])
                     // Next token is not a number; keep default K
                 }
             }
-        } else {
+        } else if (arg.rfind("--", 0) == 0) {
             std::cerr << "error: unknown option '" << arg << "'\n";
+            return EXIT_FAILURE;
+        } else {
+            positional.push_back(arg);
+        }
+    }
+    if (store_options ? !positional.empty() || store_options->surfaces.size() != 1 || !store_options->name
+                      : positional.size() != 2) {
+        std::cerr << "error: give <tiffxyz> <obj>, or --store with one --surface and --name\n";
+        usage();
+        return EXIT_FAILURE;
+    }
+
+    std::unique_ptr<QuadSurface> surf;
+    std::filesystem::path obj_path;
+    if (store_options) {
+        const std::filesystem::path name = *store_options->name;
+        const auto& uuid = store_options->surfaces.front();
+        if (name.has_parent_path() || name.empty()) {
+            std::cerr << "error: --name is a file name inside the artifact directory\n";
+            return EXIT_FAILURE;
+        }
+        try {
+            StoreSurfaces store(store_options->store, "vc_tifxyz2obj");
+            surf = store.load(uuid, true, store_options->volume);
+            obj_path = store.objects().session()->artifactDirectory(store.objects().attachment(), uuid) / name;
+        } catch (const std::exception& error) {
+            std::cerr << "error when loading " << uuid << ": " << error.what() << std::endl;
+            return EXIT_FAILURE;
+        }
+    } else {
+        const std::filesystem::path seg_path = positional[0];
+        obj_path = positional[1];
+        try {
+            surf = load_quad_from_tifxyz(seg_path);
+        }
+        catch (...) {
+            std::cerr << "error when loading: " << seg_path << std::endl;
             return EXIT_FAILURE;
         }
     }
 
-    const std::filesystem::path seg_path = argv[1];
-    const std::filesystem::path obj_path = argv[2];
-
-    std::unique_ptr<QuadSurface> surf;
-    try {
-        surf = load_quad_from_tifxyz(seg_path);
-    }
-    catch (...) {
-        std::cerr << "error when loading: " << seg_path << std::endl;
-        return EXIT_FAILURE;
-    }
-
     surf_write_obj(surf.get(), obj_path, normalize_uv, align_grid, keep_percent, clean_surface, clean_sigma_k, inpaint_holes);
+    if (store_options) std::cout << "obj: " << obj_path.string() << std::endl;
 
     return EXIT_SUCCESS;
 }

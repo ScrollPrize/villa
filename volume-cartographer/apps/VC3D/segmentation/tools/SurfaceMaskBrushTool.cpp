@@ -5,15 +5,12 @@
 #include "../../ViewerManager.hpp"
 
 #include <QCoreApplication>
-#include <QLoggingCategory>
 
 #include <algorithm>
 #include <cmath>
 #include <exception>
 
 #include "vc/core/util/QuadSurface.hpp"
-
-Q_LOGGING_CATEGORY(lcSurfaceMaskBrush, "vc.segmentation.surfacemask")
 
 namespace
 {
@@ -153,7 +150,7 @@ void SurfaceMaskBrushTool::extendStroke(const QPointF& surfacePos, bool forceSam
         const float avg = 0.5f * (std::abs(scale[0]) + std::abs(scale[1]));
         return avg > 1e-4f ? avg : 1.0f;
     }();
-    const float radius = std::max(1.0f, _module.approvalMaskBrushRadius() * avgScale);
+    const float radius = std::max(1.0f, _module.maskBrushRadius() * avgScale);
     const float sampleSpacing = std::max(1.0f, radius / 3.0f);
 
     if (_lastGridPosition) {
@@ -182,17 +179,6 @@ void SurfaceMaskBrushTool::extendStroke(const QPointF& surfacePos, bool forceSam
     invalidateOverlay();
 }
 
-void SurfaceMaskBrushTool::pauseStroke()
-{
-    if (!_strokeActive) {
-        return;
-    }
-
-    _strokeActive = false;
-    _lastGridPosition.reset();
-    invalidateOverlay();
-}
-
 void SurfaceMaskBrushTool::finishStroke()
 {
     if (!_strokeActive && _pendingCells.empty()) {
@@ -210,7 +196,6 @@ void SurfaceMaskBrushTool::finishStroke()
     if (_module.hasActiveSession() && _module.activeBaseSurface() == _surface && !changedRegion.empty()) {
         _module._editManager->applyExternalSurfaceUpdate(changedRegion);
     }
-    refreshSurfacePatchIndex(changedRegion);
     persistSurface();
     _paintedCells.clear();
     _pendingCells.clear();
@@ -320,7 +305,7 @@ void SurfaceMaskBrushTool::paintAt(int centerRow, int centerCol)
         return;
     }
     const float avgScale = 0.5f * (std::abs(scale[0]) + std::abs(scale[1]));
-    const int radius = static_cast<int>(std::ceil(std::max(1.0f, _module.approvalMaskBrushRadius() *
+    const int radius = static_cast<int>(std::ceil(std::max(1.0f, _module.maskBrushRadius() *
                                                                  (avgScale > 1e-4f ? avgScale : 1.0f))));
     const float radiusSq = static_cast<float>(radius * radius);
     if (_strokeGridPoints.empty() ||
@@ -423,13 +408,8 @@ void SurfaceMaskBrushTool::persistSurface()
     }
 
     _surface->invalidateCache();
-
-    if (_surface->path.empty()) {
-        Q_EMIT _module.statusMessageRequested(
-            QCoreApplication::translate("SurfaceMaskBrushTool", "Cannot save surface: surface has no tifxyz path."),
-            kStatusMedium);
-        return;
-    }
+    // The brushed validity is the surface's mask (validity) channel.
+    _surface->setChannel("mask", _mask.clone());
 
     if (_module.hasActiveSession()) {
         _module.emitPendingChanges();
@@ -437,16 +417,11 @@ void SurfaceMaskBrushTool::persistSurface()
         return;
     }
 
-    try {
-        _surface->saveOverwrite();
+    // The mask is the surface's validity: masked vertices keep their stored coordinates.
+    if (_module.saveSurface(_surface, false, {"mask"})) {
         Q_EMIT _module.statusMessageRequested(
             QCoreApplication::translate("SurfaceMaskBrushTool", "Saved surface."),
             kStatusShort);
-    } catch (const std::exception& e) {
-        qCWarning(lcSurfaceMaskBrush) << "Failed to save surface:" << e.what();
-        Q_EMIT _module.statusMessageRequested(
-            QCoreApplication::translate("SurfaceMaskBrushTool", "Failed to save surface."),
-            kStatusLong);
     }
 }
 
@@ -500,21 +475,6 @@ cv::Rect SurfaceMaskBrushTool::applyPendingCells()
     return cv::Rect(colStart, rowStart, colEnd - colStart, rowEnd - rowStart);
 }
 
-void SurfaceMaskBrushTool::refreshSurfacePatchIndex(const cv::Rect& changedRegion)
-{
-    if (!_surface || changedRegion.empty()) {
-        return;
-    }
-
-    auto* manager = _module.viewerManager();
-    if (!manager) {
-        return;
-    }
-
-    SurfacePatchIndex::SurfacePtr surface(_surface, [](QuadSurface*) {});
-    manager->refreshSurfacePatchIndex(surface, changedRegion);
-}
-
 void SurfaceMaskBrushTool::invalidateOverlay()
 {
     _module.refreshOverlay();
@@ -525,10 +485,6 @@ void SurfaceMaskBrushTool::invalidateViewers(bool surfaceChanged)
     if (auto* manager = _module.viewerManager()) {
         manager->forEachBaseViewer([surfaceChanged](VolumeViewerBase* viewer) {
             if (viewer) {
-                if (surfaceChanged) {
-                    viewer->invalidateIntersect();
-                    viewer->renderIntersections();
-                }
                 if (surfaceChanged && viewer->surfName() == "segmentation") {
                     viewer->renderVisible(true);
                 }

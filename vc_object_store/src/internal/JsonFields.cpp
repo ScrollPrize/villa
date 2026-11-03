@@ -17,11 +17,11 @@ std::array<double, 2> scaleFromJson(const nlohmann::json& value)
     } else if (value.is_array() && value.size() == 2) {
         scale = {value.at(0).get<double>(), value.at(1).get<double>()};
     } else {
-        throw std::runtime_error("object store: patch scale must be a number or a two-element array");
+        throw std::runtime_error("object store: surface scale must be a number or a two-element array");
     }
     for (double axis : scale)
         if (!std::isfinite(axis) || axis < 0)
-            throw std::runtime_error("object store: patch scale must be finite and nonnegative");
+            throw std::runtime_error("object store: surface scale must be finite and nonnegative");
     return scale;
 }
 } // namespace vc::objects::detail

@@ -15,7 +15,6 @@
 #include <nlohmann/json.hpp>
 #include <opencv2/core/types.hpp>
 
-#include "LineAnnotationAdjacentLinks.hpp"
 #include "LineAnnotationFiberLinkValidation.hpp"
 #include "LineAnnotationFiberLinks.hpp"
 #include "LineAnnotationStoredFiber.hpp"
@@ -32,7 +31,6 @@ using vc3d::line_annotation::StoredFiber;
 
 namespace {
 
-const std::filesystem::path kSource{"/proj/fibers"};
 
 // Snapshot type with the one member the batch helpers need.
 struct Snapshot {
@@ -46,7 +44,6 @@ StoredFiber makeFiber(uint64_t id, const std::string& name, double x0, double y0
     StoredFiber fiber;
     fiber.id = id;
     fiber.fileName = name;
-    fiber.sourceRoot = kSource;
     const int n = spans * 4 + 1;
     for (int i = 0; i < n; ++i) {
         const double t = static_cast<double>(i);
@@ -89,11 +86,6 @@ void link(StoredFiber& a, int ia, StoredFiber& b, int ib, bool adjacent = false)
     b.branches.push_back(ba);
 }
 
-std::string sourceKey(const StoredFiber& fiber, const std::string& fileName)
-{
-    return (fiber.sourceRoot / fileName).lexically_normal().string();
-}
-
 bool reciprocal(const StoredFiber& fiber, const FiberBranchRef& branch,
                 const FiberBranchRef& candidate)
 {
@@ -110,9 +102,7 @@ bool reciprocal(const StoredFiber& fiber, const FiberBranchRef& branch,
 std::vector<BranchLinkValidationIssue> collect(const std::vector<StoredFiber>& fibers)
 {
     return vc3d::line_annotation::collectFiberBranchIssues(
-        fibers, sourceKey,
-        [](const StoredFiber& fiber, const std::string& name) { return sourceKey(fiber, name); },
-        reciprocal);
+        fibers, reciprocal);
 }
 
 NewFiberIdentity identity(uint64_t id, const std::string& file)
@@ -123,7 +113,6 @@ NewFiberIdentity identity(uint64_t id, const std::string& file)
     out.startedAt = "20260930T120000000";
     out.sequence = id;
     out.fileName = file;
-    out.sourceRoot = kSource;
     return out;
 }
 
@@ -214,7 +203,6 @@ TEST_CASE("merge: every orientation combination writes loader-clean links (incid
             if (merged.modelOnly)
                 CHECK(merged.optimizationMode == vc3d::line_annotation::FiberOptimizationMode::NativeFiberTrace3d);
             CHECK(merged.branches.size() == 4);
-            CHECK(merged.coordinateBaseShapeZYX == a.coordinateBaseShapeZYX);
             CHECK(std::find(merged.tags.begin(), merged.tags.end(),
                             vc3d::line_annotation::kNeedsReoptimizationTag) != merged.tags.end());
             // The adjacent link keeps its kind through the redirect.
@@ -260,17 +248,19 @@ TEST_CASE("merge: consumes exactly the endpoint pair link and refuses other shap
             a, 4, b, 0, FiberOptimizationMode::Lasagna, identity(9, "m.json"), &error));
         CHECK(error.find("adjacent") != std::string::npos);
     }
-    SUBCASE("coordinate domains must agree")
+    SUBCASE("authoritative coordinate frames must agree; advisory bindings may differ")
     {
-        a.coordinateBaseShapeZYX = std::array<std::size_t, 3>{10, 20, 30};
+        a.coordinateIdentity = {{"coordinates", {{"volume_uuid", "12345678-1234-1234-1234-123456789abc"}, {"scale_factor", 2}}}};
         CHECK_FALSE(vc3d::line_annotation::planFiberMerge(
             a, 4, b, 0, FiberOptimizationMode::Lasagna, identity(9, "m.json"), &error));
         CHECK(error.find("coordinate") != std::string::npos);
-        b.coordinateBaseShapeZYX = a.coordinateBaseShapeZYX;
-        const auto plan = vc3d::line_annotation::planFiberMerge(
-            a, 4, b, 0, FiberOptimizationMode::Lasagna, identity(9, "m.json"), &error);
-        REQUIRE(plan);
-        CHECK(plan->merged.coordinateBaseShapeZYX == a.coordinateBaseShapeZYX);
+        b.coordinateIdentity = a.coordinateIdentity;
+        a.coordinateIdentity["coordinate_binding"] = {{"active_volume_id", "renamed"}};
+        REQUIRE(vc3d::line_annotation::planFiberMerge(
+            a, 4, b, 0, FiberOptimizationMode::Lasagna, identity(9, "m.json"), &error));
+        b.coordinateIdentity["coordinates"]["scale_factor"] = 4;
+        CHECK_FALSE(vc3d::line_annotation::planFiberMerge(
+            a, 4, b, 0, FiberOptimizationMode::Lasagna, identity(9, "m.json"), &error));
     }
     SUBCASE("kollesis termination at the join refuses")
     {
@@ -300,7 +290,6 @@ TEST_CASE("split: links on both sides of the cut land on the right half with cle
         CHECK(plan->prefix.modelOnly == parent.modelOnly);
         CHECK(plan->suffix.modelOnly == parent.modelOnly);
         CHECK(plan->suffix.controlPoints.size() == 4);
-        CHECK(plan->prefix.coordinateBaseShapeZYX == parent.coordinateBaseShapeZYX);
 
         std::vector<BranchRedirectSource> sources{
             {parent.id, parent.fileName, &parent,
@@ -392,10 +381,10 @@ TEST_CASE("graph check: a dangling reference to a retired original blocks, unrel
     REQUIRE(plan);
     // p was NOT redirected (the controller forgot a peer): it still names a.
     std::vector<StoredFiber> graph{plan->merged, p, u, v};
-    const std::unordered_set<std::string> batch{sourceKey(a, "m.json")};
-    const std::unordered_set<std::string> retired{sourceKey(a, "a.json"), sourceKey(b, "b.json")};
+    const std::unordered_set<uint64_t> batch{plan->merged.id};
+    const std::unordered_set<uint64_t> retired{a.id, b.id};
     const auto check = vc3d::line_annotation::checkStructuralEditGraph(
-        graph, batch, retired, collect, sourceKey);
+        graph, batch, retired, collect);
     // Both ends of the forgotten redirect block: the merged fiber's entry
     // has no reciprocal under its new name, and p's entry names a retired
     // file. The u-v defect is reported but does not block.
@@ -405,38 +394,4 @@ TEST_CASE("graph check: a dangling reference to a retired original blocks, unrel
     CHECK(graph[check.blocking[1].fiberIndex].fileName == "p.json");
     CHECK(check.blocking[1].reason == "missing linked fiber");
     CHECK(check.unrelated.size() == 2);
-}
-
-TEST_CASE("geometry key: identical geometry under another name is recognised")
-{
-    const auto a = makeFiber(1, "a.json", 0.0, 0.0);
-    auto copy = a;
-    copy.fileName = "copy.json";
-    CHECK(vc3d::line_annotation::fiberGeometryKey(a.controlPoints, a.linePoints) ==
-          vc3d::line_annotation::fiberGeometryKey(copy.controlPoints, copy.linePoints));
-    copy.linePoints.back()[0] += 1.0e-9;
-    CHECK(vc3d::line_annotation::fiberGeometryKey(a.controlPoints, a.linePoints) !=
-          vc3d::line_annotation::fiberGeometryKey(copy.controlPoints, copy.linePoints));
-}
-
-TEST_CASE("referenced file names: every branch_file counts, valid or not")
-{
-    const nlohmann::json root = nlohmann::json::parse(R"({
-        "branches": [
-            {"control_point_index": 2, "branch_file": "sub/dir/a.json"},
-            {"control_point_index": "nine", "branch_file": "b.json"},
-            {"control_point_index": 999},
-            "not an object",
-            {"branch_file": 7}
-        ],
-        "adjacent_branches": {"not": "an array"},
-        "control_points": []
-    })");
-    const auto names = vc3d::line_annotation::referencedFiberFileNames(root);
-    CHECK(names == std::vector<std::string>{"a.json", "b.json"});
-    CHECK(vc3d::line_annotation::referencedFiberFileNames(nlohmann::json::array()).empty());
-    const nlohmann::json adjacentOnly = nlohmann::json::parse(
-        R"({"adjacent_branches": [{"branch_file": "c.json"}]})");
-    CHECK(vc3d::line_annotation::referencedFiberFileNames(adjacentOnly) ==
-          std::vector<std::string>{"c.json"});
 }
