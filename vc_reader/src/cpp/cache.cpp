@@ -11,28 +11,23 @@
 
 namespace vcr::cache {
 
-PrefillResult prefill(Array& array, const std::atomic<bool>* cancel, const PrefillProgress& progress)
+namespace {
+
+// Reads chunks 0..total-1 (chunkAt maps one to its grid index) through the array's caches.
+template <typename ChunkAt>
+PrefillResult prefillChunks(Array& array, std::size_t total, ChunkAt chunkAt, const std::atomic<bool>* cancel,
+                            const PrefillProgress& progress)
 {
     PrefillResult result;
     const auto cancelled = [&] { return cancel && cancel->load(std::memory_order_acquire); };
     const auto fetchedBefore = array.stats().remote_fetches.load();
     const auto writeErrorsBefore = array.stats().write_errors.load();
     try {
-        const auto grid = array.chunk_grid();
-        result.totalChunks = 1;
-        for (const auto n : grid) {
-            if (n < 0 || (n && result.totalChunks > std::numeric_limits<std::size_t>::max() / n))
-                throw std::overflow_error("chunk grid size overflow");
-            result.totalChunks *= static_cast<std::size_t>(n);
-        }
+        result.totalChunks = total;
         std::mutex mutex;
         array.parallel_for(result.totalChunks, [&](std::size_t i) {
             if (cancelled()) return;
-            Index idx(grid.size());
-            for (std::size_t d = grid.size(); d-- > 0;) {
-                idx[d] = static_cast<std::int64_t>(i % static_cast<std::size_t>(grid[d]));
-                i /= static_cast<std::size_t>(grid[d]);
-            }
+            const Index idx = chunkAt(i);
             bool stored = false;
             std::string error;
             try { stored = array.chunk(idx) != nullptr; }
@@ -64,6 +59,37 @@ PrefillResult prefill(Array& array, const std::atomic<bool>* cancel, const Prefi
     }
     result.fetchedChunks = array.stats().remote_fetches.load() - fetchedBefore;
     return result;
+}
+
+} // namespace
+
+PrefillResult prefill(Array& array, const std::atomic<bool>* cancel, const PrefillProgress& progress)
+{
+    const auto grid = array.chunk_grid();
+    std::size_t total = 1;
+    for (const auto n : grid) {
+        if (n < 0 || (n && total > std::numeric_limits<std::size_t>::max() / n)) {
+            PrefillResult result;
+            result.status = PrefillResult::Status::Failed;
+            result.message = "chunk grid size overflow";
+            return result;
+        }
+        total *= static_cast<std::size_t>(n);
+    }
+    return prefillChunks(array, total, [&](std::size_t i) {
+        Index idx(grid.size());
+        for (std::size_t d = grid.size(); d-- > 0;) {
+            idx[d] = static_cast<std::int64_t>(i % static_cast<std::size_t>(grid[d]));
+            i /= static_cast<std::size_t>(grid[d]);
+        }
+        return idx;
+    }, cancel, progress);
+}
+
+PrefillResult prefill(Array& array, const std::vector<Index>& chunks, const std::atomic<bool>* cancel,
+                      const PrefillProgress& progress)
+{
+    return prefillChunks(array, chunks.size(), [&](std::size_t i) { return chunks[i]; }, cancel, progress);
 }
 
 DownloadResult downloadPrefix(const std::string& location, const zarr::OpenOptions& options,

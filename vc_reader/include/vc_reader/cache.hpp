@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <functional>
 #include <string>
+#include <vector>
 
 namespace vcr::cache {
 
@@ -24,6 +25,11 @@ using PrefillProgress = std::function<void(std::size_t resolved, std::size_t tot
 // if exact fetch counts are needed. Progress is serialized, every 32 chunks and
 // at completion. Cancellation leaves completed chunks cached for a later run.
 [[nodiscard]] PrefillResult prefill(Array& array,
+                                    const std::atomic<bool>* cancel = nullptr,
+                                    const PrefillProgress& progress = {});
+// The same for the listed chunk-grid indices only (e.g. an offline_fill array's
+// offline_misses), in order; totalChunks is their count.
+[[nodiscard]] PrefillResult prefill(Array& array, const std::vector<Index>& chunks,
                                     const std::atomic<bool>* cancel = nullptr,
                                     const PrefillProgress& progress = {});
 

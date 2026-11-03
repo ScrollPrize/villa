@@ -232,6 +232,7 @@ OpenedArray openArray(const std::string& input, const OpenOptions& options, Arra
     spec.fill = out.meta.fill;
     spec.separator = out.meta.separator;
     spec.offline = offline;
+    spec.offline_fill = offline && options.offlineFill;
     spec.read_mode = options.readMode;
     spec.http.connections = options.connections;
     std::string root;

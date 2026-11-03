@@ -29,6 +29,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <numeric>
 #include <optional>
 #include <span>
@@ -287,6 +288,10 @@ struct ArraySpec {
     Index shard_chunks;
     bool shard_index_end = true, shard_index_crc = false;
     bool offline = false;            // never fetch: a chunk in no layer raises CacheMiss
+    // Offline: a chunk in no layer reads as fill instead, is remembered as absent in the
+    // memory cache, and is recorded (Array::offline_misses), so a caller can complete a
+    // read and learn every chunk the caches lacked.
+    bool offline_fill = false;
     std::string read_mode = "slab";  // raw local chunks: "slab" (pread rows) or "mmap"
     bool hint = false;               // queue readahead for every piece before reading
     std::size_t threads = 16;
@@ -304,7 +309,8 @@ struct ArraySpec {
 struct Stats {
     std::atomic<std::uint64_t> memory_hits{0}, pending_hits{0}, disk_hits{0}, remote_fetches{0},
         remote_missing{0}, remote_bytes{0}, write_errors{0}, computed{0},
-        corrupt{0};  // chunks that did not decode (skipped; see Array::last_corrupt_chunk)
+        corrupt{0},          // chunks that did not decode (skipped; see Array::last_corrupt_chunk)
+        offline_misses{0};   // distinct chunks an offline_fill array read as fill (in no layer)
 };
 
 class Array {
@@ -646,8 +652,13 @@ public:
                 return *chunk;
             }
         }
-        if (spec_.offline)
+        if (spec_.offline) {
+            if (spec_.offline_fill) {
+                offline_miss(idx, ck);
+                return nullptr;
+            }
             throw CacheMiss("chunk " + k + " of " + spec_.identity + " is not in the disk cache (offline)");
+        }
         if (!http_ && !source_ && !spec_.compute)
             return nullptr;
         return fetch(idx, k, ck);
@@ -717,6 +728,13 @@ public:
     std::size_t chunk_bytes() const noexcept { return chunk_bytes_; }
 
     const Stats& stats() const noexcept { return stats_; }
+    // offline_fill: the chunk-grid indices read as fill because no layer held them,
+    // sorted, each once.
+    std::vector<Index> offline_misses() const
+    {
+        std::lock_guard lock(miss_mutex_);
+        return {misses_.begin(), misses_.end()};
+    }
     std::string last_write_error()
     {
         std::lock_guard lock(error_mutex_);
@@ -1652,9 +1670,26 @@ private:
             fill_pieces(w, out_strides, op, output);
             return;
         }
-        if (spec_.offline)
+        if (spec_.offline) {
+            if (spec_.offline_fill) {
+                offline_miss(w.idx, ck);
+                fill_pieces(w, out_strides, op, output);
+                return;
+            }
             throw CacheMiss("chunk " + k + " of " + spec_.identity + " is not in the disk cache (offline)");
+        }
         apply(fetch(w.idx, k, ck), w, out_strides, op, output);
+    }
+
+    // offline_fill: records a chunk no layer holds, and remembers it as absent in the
+    // memory cache so later reads (and cache-only samples) take it as fill at once.
+    void offline_miss(const Index& idx, const std::string& ck)
+    {
+        if (cache_)
+            cache_->put(ck, nullptr);
+        std::lock_guard lock(miss_mutex_);
+        if (misses_.insert(idx).second)
+            ++stats_.offline_misses;
     }
 
     // Fetches (or computes) a chunk once, however many reads want it at the same time,
@@ -1836,6 +1871,8 @@ private:
     std::atomic<bool> write_disabled_{false};
     std::mutex error_mutex_;
     std::string last_write_error_, last_corrupt_;
+    mutable std::mutex miss_mutex_;
+    std::set<Index> misses_;  // offline_fill
     // Last member: destroyed first, so queued writes finish while everything they use still exists.
     std::unique_ptr<WriteBehind> writes_;
 };

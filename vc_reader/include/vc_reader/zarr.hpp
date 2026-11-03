@@ -226,6 +226,9 @@ struct OpenOptions {
     int connections = 16;
     std::string readMode = "mmap";  // "mmap" or "slab"
     bool offline = false;           // remote arrays: metadata and chunks only from the caches
+    // offline: a chunk in no cache reads as fill and is recorded (Array::offline_misses)
+    // instead of raising CacheMiss. Metadata must still be cached.
+    bool offlineFill = false;
     MetadataReader metadata;        // replaces direct metadata requests (e.g. a caller's metadata cache)
 };
 

@@ -3,6 +3,7 @@
 #include <nanobind/nanobind.h>
 #include <nanobind/stl/function.h>
 #include <nanobind/stl/string.h>
+#include <nanobind/stl/vector.h>
 
 namespace vcr::cache::python {
 inline void bind(nanobind::module_& m)
@@ -38,8 +39,14 @@ inline void bind(nanobind::module_& m)
         .def_ro("progress", &DownloadResult::progress)
         .def_ro("cancelled", &DownloadResult::cancelled)
         .def_ro("error", &DownloadResult::error);
-    m.def("prefill", &prefill, "array"_a, "cancel"_a.none() = nullptr,
-          "progress"_a.none() = PrefillProgress{}, nb::call_guard<nb::gil_scoped_release>());
+    m.def("prefill", nb::overload_cast<Array&, const std::atomic<bool>*, const PrefillProgress&>(&prefill),
+          "array"_a, "cancel"_a.none() = nullptr, "progress"_a.none() = PrefillProgress{},
+          nb::call_guard<nb::gil_scoped_release>());
+    m.def("prefill_chunks", nb::overload_cast<Array&, const std::vector<Index>&, const std::atomic<bool>*,
+                                              const PrefillProgress&>(&prefill),
+          "array"_a, "chunks"_a, "cancel"_a.none() = nullptr, "progress"_a.none() = PrefillProgress{},
+          nb::call_guard<nb::gil_scoped_release>(),
+          "Prefill only the listed chunk-grid indices (e.g. Array.offline_misses()).");
     m.def("download_prefix", &downloadPrefix, "location"_a, "options"_a,
           "workers"_a = 16, "progress"_a.none() = DownloadCallback{}, "cancel"_a.none() = nullptr,
           nb::call_guard<nb::gil_scoped_release>());

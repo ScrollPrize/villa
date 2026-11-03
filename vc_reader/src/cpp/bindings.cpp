@@ -327,7 +327,7 @@ NB_MODULE(_reader, m)
         .def("__init__", [](OpenOptions* self, Access access, std::vector<std::string> cache_dirs, bool cache_writes,
                             std::optional<std::int64_t> cache_max_bytes, bool compress_cache, bool allow_lossy_cache,
                             std::shared_ptr<vcr::MemoryCache> memory_cache, std::size_t threads, int connections,
-                            std::string read_mode, bool offline) {
+                            std::string read_mode, bool offline, bool offline_fill) {
             new (self) OpenOptions();
             self->access = std::move(access);
             self->cacheDirs = std::move(cache_dirs);
@@ -340,8 +340,9 @@ NB_MODULE(_reader, m)
             self->connections = connections;
             self->readMode = std::move(read_mode);
             self->offline = offline;
+            self->offlineFill = offline_fill;
         }, "access"_a, "cache_dirs"_a, "cache_writes"_a, "cache_max_bytes"_a.none(), "compress_cache"_a, "allow_lossy_cache"_a,
-           "memory_cache"_a.none(), "threads"_a, "connections"_a, "read_mode"_a, "offline"_a);
+           "memory_cache"_a.none(), "threads"_a, "connections"_a, "read_mode"_a, "offline"_a, "offline_fill"_a = false);
 
     using vcr::zarr::OpenedArray;
     nb::class_<OpenedArray>(m, "OpenedArray")
@@ -1096,6 +1097,9 @@ NB_MODULE(_reader, m)
             d["last_write_error"] = a.last_write_error();
             d["corrupt"] = s.corrupt.load();
             d["last_corrupt_chunk"] = a.last_corrupt_chunk();
+            d["offline_misses"] = s.offline_misses.load();
             return d;
-        });
+        })
+        .def("offline_misses", &vcr::Array::offline_misses,
+             "offline_fill arrays: the chunk-grid indices read as fill because no cache held them.");
 }
