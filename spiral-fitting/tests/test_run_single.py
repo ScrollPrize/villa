@@ -185,6 +185,23 @@ def test_overwrite_output_refuses_to_delete_a_directory_containing_an_input(
     assert dataset.is_dir()
 
 
+@pytest.mark.parametrize("symlink", [False, True])
+def test_overwrite_refuses_output_containing_object_store(tmp_path, symlink):
+    args = _runner_args(tmp_path, "--overwrite")
+    args.output.mkdir()
+    store = args.output / "inputs.vcobj"
+    store.write_bytes(b"preserve object store")
+    if symlink:
+        args.object_store.symlink_to(store)
+    else:
+        args.object_store = store
+
+    with pytest.raises(ValueError, match="containing an input"):
+        run_single.run(args)
+
+    assert store.read_bytes() == b"preserve object store"
+
+
 def test_overwrite_and_resume_are_mutually_exclusive(tmp_path):
     args = _runner_args(tmp_path, "--overwrite", "--resume")
     output = tmp_path / "output"

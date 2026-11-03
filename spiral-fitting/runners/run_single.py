@@ -1126,7 +1126,7 @@ def run(args: argparse.Namespace) -> None:
     if overwrite and getattr(args, "resume", False):
         raise ValueError("--overwrite cannot be combined with --resume")
     if overwrite:
-        protected_paths = [args.inputs, args.ink_volume, args.vc_render_bin]
+        protected_paths = [args.inputs, args.object_store, args.ink_volume, args.vc_render_bin]
         if args.config is not None:
             protected_paths.append(args.config)
         overwrite_output(args.output, protected_paths=protected_paths)
