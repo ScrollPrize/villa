@@ -171,6 +171,9 @@ and its cached normals. Positive substeps or streamline mode evaluate the tensor
 weights at the actual query position, without rounding the query. The estimator
 still samples gradients on its existing 3-voxel grid within a 109³ patch; patch
 support changes at cache-cell boundaries, so the field is not perfectly smooth.
+Exact-position queries share a bounded cache of 32 filtered gradient patches
+(about 27 MiB per volume). Each query still evaluates its own tensor and normal;
+reuse does not round positions or change the estimator arithmetic.
 
 Streamline integrates minimum-turn tangent transport, `x' = v` and
 `v' = -n (v · Dn v)`, using unit normals and central directional differences

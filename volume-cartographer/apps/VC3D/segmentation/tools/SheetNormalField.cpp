@@ -125,39 +125,63 @@ std::optional<cv::Vec3f> SheetNormalField::normalAt(const cv::Vec3f& world, bool
         }
     }
 
-    std::vector<uint8_t> image(static_cast<size_t>(kWidth) * kWidth * kWidth);
+    std::shared_ptr<const vcr::sheet_normal::CpuPatch> patch;
+    if (continuous) {
+        std::lock_guard lock(_mutex);
+        if (auto it = _patchCache.find(lattice); it != _patchCache.end()) {
+            patch = it->second;
+        }
+    }
     std::optional<cv::Vec3f> result;
-    const std::array<int, 3> start{lattice[2] - kHalf, lattice[1] - kHalf, lattice[0] - kHalf};
-    bool read = readCube(*_volume, start, image);
-    if (!read) {
-        Array3D<uint8_t> patch({static_cast<size_t>(kWidth), static_cast<size_t>(kWidth), static_cast<size_t>(kWidth)});
-        {
-            const OneOmpThread oneThread;
-            read = _volume->readZYX(patch, start, 0);
+    if (!patch) {
+        std::vector<uint8_t> image(static_cast<size_t>(kWidth) * kWidth * kWidth);
+        const std::array<int, 3> start{lattice[2] - kHalf, lattice[1] - kHalf, lattice[0] - kHalf};
+        bool read = readCube(*_volume, start, image);
+        if (!read) {
+            Array3D<uint8_t> patch({static_cast<size_t>(kWidth), static_cast<size_t>(kWidth), static_cast<size_t>(kWidth)});
+            {
+                const OneOmpThread oneThread;
+                read = _volume->readZYX(patch, start, 0);
+            }
+            if (read) {
+                // Array3D is column-major (z fastest); estimator uses x fastest.
+                for (int z = 0; z < kWidth; ++z) {
+                    for (int y = 0; y < kWidth; ++y) {
+                        for (int x = 0; x < kWidth; ++x) {
+                            image[(static_cast<size_t>(z) * kWidth + y) * kWidth + x] = patch(z, y, x);
+                        }
+                    }
+                }
+            }
         }
         if (read) {
-            // Array3D is column-major (z fastest); the estimator wants ZYX with x fastest.
-            for (int z = 0; z < kWidth; ++z) {
-                for (int y = 0; y < kWidth; ++y) {
-                    for (int x = 0; x < kWidth; ++x) {
-                        image[(static_cast<size_t>(z) * kWidth + y) * kWidth + x] = patch(z, y, x);
+            auto prepared = std::make_shared<vcr::sheet_normal::CpuPatch>();
+            vcr::sheet_normal::CpuWorkspace workspace;
+            workspace.prepare(image.data(), *prepared);
+            patch = std::move(prepared);
+            if (continuous) {
+                std::lock_guard lock(_mutex);
+                // Two workers may prepare the same patch concurrently. Keep
+                // only one copy in the bounded cache; their values are identical.
+                if (_patchCache.emplace(lattice, patch).second) {
+                    _patchOrder.push_back(lattice);
+                    if (_patchOrder.size() > 32) {
+                        _patchCache.erase(_patchOrder.front());
+                        _patchOrder.pop_front();
                     }
                 }
             }
         }
     }
-    if (read) {
-        // The lattice point is voxel 54 of the patch, which is 48 in the
-        // estimator's site coordinates (its grid starts 6 voxels in).
+    if (patch) {
+        // Patch voxel 54 is estimator coordinate 48 (gradient grid starts at 6).
         const float center[4] = {
             48.0f + (continuous ? world[0] - lattice[0] : 0.0f),
             48.0f + (continuous ? world[1] - lattice[1] : 0.0f),
             48.0f + (continuous ? world[2] - lattice[2] : 0.0f), 1.0f};
-        float out[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-        vcr::sheet_normal::cpu<uint8_t>(image.data(), center, out, 1);
-        if (out[3] > 0.0f) {
-            result = cv::Vec3f(out[0], out[1], out[2]);
-        }
+        float out[4] = {};
+        patch->evaluate(center, out);
+        if (out[3] > 0.0f) result = cv::Vec3f(out[0], out[1], out[2]);
     }
 
     if (!continuous) {
