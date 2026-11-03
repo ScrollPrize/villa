@@ -16,5 +16,6 @@ Small, mostly standalone projects that support the rest of the repository.
 - [scroll-unwrap-pipeline](scroll-unwrap-pipeline/) — Renders scroll unwrap videos from wrap meshes, with optional ink overlays.
 - [scrollcase](scrollcase/) — Creates STL models of scroll cases for 3D printing.
 - [shift-optimizer](shift-optimizer/) — Assigns shifts to people for scan sessions at the synchrotron.
+- [teca-viewer](teca-viewer/) — Browser viewer for scroll CT: slice panes at any rotation, tifxyz surfaces, a 3D pane, and extensions for predictions, ink, paint and point annotations, served as static files.
 - [vesuvia-viewer](vesuvia-viewer/) — Browser viewer for scroll CT, tifxyz surfaces, ink images, and prediction volumes, served as static files.
 - [volume-registration](volume-registration/) — Tool for finding transforms between fixed and moving Zarr volumes or meshes.

@@ -1,0 +1,464 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>teça</title>
+    <link
+      rel="icon"
+      href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect x='1' y='1' width='6' height='6' rx='1' fill='%23a7c080'/%3E%3Crect x='9' y='1' width='6' height='6' rx='1' fill='%237fbbb3'/%3E%3Crect x='1' y='9' width='6' height='6' rx='1' fill='%23e67e80'/%3E%3Crect x='9' y='9' width='6' height='6' rx='1' fill='%23d699b6'/%3E%3C/svg%3E"
+    />
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <svg style="display: none" aria-hidden="true" xmlns="http://www.w3.org/2000/svg">
+      <symbol id="icon-plus" viewBox="0 0 20 20"><g fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M10 4v12M4 10h12"/></g></symbol>
+      <symbol id="icon-close" viewBox="0 0 20 20"><g fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M5 5l10 10M15 5 5 15"/></g></symbol>
+      <symbol id="icon-layers" viewBox="0 0 20 20"><g fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M10 3 3 6.5 10 10l7-3.5z"/><path d="M3 10l7 3.5L17 10M3 13.5 10 17l7-3.5"/></g></symbol>
+      <symbol id="icon-panel-left" viewBox="0 0 20 20"><g fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="14" height="12" rx="1"/><path d="M8 4v12"/></g></symbol>
+      <symbol id="icon-panel-right" viewBox="0 0 20 20"><g fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="14" height="12" rx="1"/><path d="M12 4v12"/></g></symbol>
+      <symbol id="icon-settings" viewBox="0 0 20 20"><g fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="10" cy="10" r="2.5"/><path d="M10 2.5v2M10 15.5v2M2.5 10h2M15.5 10h2M4.7 4.7l1.4 1.4M13.9 13.9l1.4 1.4M4.7 15.3l1.4-1.4M13.9 6.1l1.4-1.4"/><circle cx="10" cy="10" r="5.5"/></g></symbol>
+      <symbol id="icon-help" viewBox="0 0 20 20"><g fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="10" cy="10" r="7"/><path d="M8 8a2 2 0 1 1 2.6 1.9c-.4.15-.6.5-.6 1V11.5"/><circle cx="10" cy="14" r="0.6" fill="currentColor" stroke="none"/></g></symbol>
+      <symbol id="icon-info" viewBox="0 0 20 20"><g fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="10" cy="10" r="7"/><path d="M10 9v4"/><circle cx="10" cy="6.6" r="0.6" fill="currentColor" stroke="none"/></g></symbol>
+      <symbol id="icon-view-grid" viewBox="0 0 20 20"><g fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="6" height="6" rx="1"/><rect x="11" y="3" width="6" height="6" rx="1"/><rect x="3" y="11" width="6" height="6" rx="1"/><rect x="11" y="11" width="6" height="6" rx="1"/></g></symbol>
+      <symbol id="icon-lock" viewBox="0 0 20 20"><g fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect x="4.5" y="9" width="11" height="8" rx="1.5"/><path d="M7 9V6.5a3 3 0 0 1 6 0V9"/></g></symbol>
+      <symbol id="icon-chevron-down" viewBox="0 0 20 20"><g fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M5.5 8 10 12.5 14.5 8"/></g></symbol>
+    </svg>
+
+    <dialog id="startup-message" open aria-labelledby="startup-title">
+      <h2 id="startup-title">Starting viewer…</h2>
+      <p id="startup-detail">If this message stays visible, check that JavaScript is enabled and the viewer files are available.</p>
+      <div id="startup-local" hidden>
+        <p>From the viewer folder, start the static host:</p>
+        <pre>python3 serve.py --open</pre>
+        <p>Then open <a href="http://127.0.0.1:8767/">http://127.0.0.1:8767/</a> in your browser.</p>
+      </div>
+    </dialog>
+    <div id="app" inert>
+      <header id="top-bar">
+        <div class="wordmark">teça</div>
+        <div id="view-strip" class="view-strip source-dependent" role="group" aria-label="Views">
+          <button id="view-grid" type="button" class="icon-btn" data-view="grid" data-tip="Four panes (Z from a pane alone, U from the Surface)" aria-label="Four panes" aria-pressed="true"><svg class="icon"><use href="#icon-view-grid" /></svg></button>
+          <button id="view-xy" type="button" class="view-name" data-view="xy" data-tip="XY pane alone (1, then Z)" aria-pressed="false">XY</button>
+          <button id="view-zy" type="button" class="view-name" data-view="zy" data-tip="YZ pane alone (2, then Z)" aria-pressed="false">YZ</button>
+          <button id="view-xz" type="button" class="view-name" data-view="xz" data-tip="XZ pane alone (3, then Z)" aria-pressed="false">XZ</button>
+          <button id="view-3d" type="button" class="view-name" data-view="3d" data-tip="3D pane alone (4, then Z)" aria-pressed="false">3D</button>
+          <button id="view-surface" type="button" class="view-name" data-view="surface" data-tip="Surface (U)" aria-pressed="false">Surface</button>
+        </div>
+        <button id="surface-normal-lock" type="button" class="view-lock" aria-pressed="false" title="Keep this normal offset and normal direction while focusing and moving through depth (Shift+L)" hidden><svg class="icon"><use href="#icon-lock" /></svg><span>Lock normal</span></button>
+        <div class="top-bar-center">
+          <div class="position-strip">
+            <label class="pos-field"><span>XYZ</span><input id="position-number" type="text" inputmode="decimal" value="0, 0, 0" aria-label="Position XYZ" /></label>
+            <label class="pos-field"><span>ROT(XYZ)</span><input id="rotation-number" type="text" value="0, 0, 0" aria-label="Rotation XYZ in degrees" readonly /></label>
+          </div>
+          <div class="top-bar-actions">
+            <button id="toggle-left" type="button" class="icon-btn" data-tip="Toggle left panel (k)" aria-label="Toggle left panel" aria-controls="left-panel" aria-expanded="true"><svg class="icon"><use href="#icon-panel-left" /></svg></button>
+            <button id="toggle-right" type="button" class="icon-btn" data-tip="Toggle right panel (l)" aria-label="Toggle right panel" aria-controls="right-panel" aria-expanded="true"><svg class="icon"><use href="#icon-panel-right" /></svg></button>
+            <button id="open-settings" type="button" class="icon-btn" data-tip="Settings" aria-label="Settings" aria-haspopup="dialog"><svg class="icon"><use href="#icon-settings" /></svg></button>
+            <button id="open-shortcuts" type="button" class="icon-btn" data-tip="Keyboard shortcuts" aria-label="Keyboard shortcuts"><svg class="icon"><use href="#icon-help" /></svg></button>
+          </div>
+        </div>
+      </header>
+
+      <aside id="left-panel" class="side-panel">
+        <div class="tab-strip left-tabs" role="tablist">
+          <button class="ltab active" data-ltab="data" role="tab" aria-selected="true">Data</button>
+          <button class="ltab" data-ltab="view" role="tab" aria-selected="false">View</button>
+        </div>
+        <div class="panel-body">
+          <div class="lpanel" data-lpanel="data">
+            <section class="card source-card">
+              <div class="card-heading">
+                <h2>Volume</h2>
+                <button id="volume-display-menu" type="button" class="icon-btn layer-row-menu source-dependent" aria-label="Volume display" aria-haspopup="dialog" aria-expanded="false">⋯</button>
+                <div id="volume-display-popover" class="popover layer-row-popover" role="dialog" aria-label="Volume display" hidden>
+                  <label><span class="control-name">Channel</span>
+                    <select id="channel-select" disabled><option value="0">0</option></select>
+                  </label>
+                  <label><span class="control-name">Range low</span>
+                    <span class="range-pair">
+                      <input id="display-black" type="range" min="0" max="254" step="1" value="0" />
+                      <input id="display-black-number" type="number" min="0" max="254" step="1" value="0" />
+                    </span>
+                  </label>
+                  <label><span class="control-name">Range high</span>
+                    <span class="range-pair">
+                      <input id="display-white" type="range" min="1" max="255" step="1" value="255" />
+                      <input id="display-white-number" type="number" min="1" max="255" step="1" value="255" />
+                    </span>
+                  </label>
+                  <label><span class="control-name">Tone gamma</span>
+                    <span class="range-pair">
+                      <input id="display-gamma" type="range" min="0.25" max="3" step="0.05" value="1" />
+                      <input id="display-gamma-number" type="number" min="0.25" max="3" step="0.05" value="1" />
+                    </span>
+                  </label>
+                </div>
+              </div>
+              <div class="source-switcher">
+                <button id="source-switcher" type="button" class="source-switcher-button" aria-haspopup="true" aria-expanded="false">
+                  <span id="source-switcher-name" class="source-switcher-name">No source</span>
+                  <svg class="icon icon-chev" width="14" height="14"><use href="#icon-chevron-down" /></svg>
+                </button>
+                <button id="open-source-button" type="button" class="icon-btn" data-tip="Open source" aria-label="Open source">
+                  <svg class="icon"><use href="#icon-plus" /></svg>
+                </button>
+                <div id="source-popover" class="popover" hidden>
+                  <div id="source-items" class="source-items" aria-label="Session sources"></div>
+                </div>
+              </div>
+            </section>
+            <section id="surfaces-section" class="card source-dependent" aria-label="Surfaces">
+              <div class="card-heading">
+                <h2>Surfaces</h2>
+                <button id="overlay-display-menu" type="button" class="icon-btn layer-row-menu" aria-label="Overlay display" aria-haspopup="dialog" aria-expanded="false">⋯</button>
+                <div id="overlay-display-popover" class="popover layer-row-popover" role="dialog" aria-label="Overlay display" hidden>
+                  <label><span class="control-name">Line width</span>
+                    <span class="range-pair">
+                      <input id="overlay-line-width" type="range" step="0.5" />
+                      <input id="overlay-line-width-number" type="number" step="0.5" />
+                    </span>
+                  </label>
+                </div>
+              </div>
+              <div id="overlay-items" class="overlay-items"></div>
+              <form id="overlay-form" class="overlay-form">
+                <input id="overlay-path" type="text" aria-label="Overlay URL" placeholder="HTTP URL to a .tifxyz folder" spellcheck="false" autocomplete="off" />
+                <button id="overlay-add" type="submit">
+                  <span class="button-spinner" aria-hidden="true"></span>
+                  <span class="button-label">Add</span>
+                </button>
+              </form>
+              <p id="overlay-status" class="readout-line" role="status" aria-live="polite" hidden></p>
+              <button id="surface-display-settings" type="button" hidden>Surface display settings</button>
+            </section>
+            <div id="data-panels" class="lpanel-extensions"></div>
+          </div>
+
+          <div class="lpanel" data-lpanel="view" hidden>
+            <section class="card">
+              <h2>Position</h2>
+              <label><span class="control-name">Z</span><input id="pos-z" type="range" min="0" max="1" value="0" /></label>
+              <label><span class="control-name">Y</span><input id="pos-y" type="range" min="0" max="1" value="0" /></label>
+              <label><span class="control-name">X</span><input id="pos-x" type="range" min="0" max="1" value="0" /></label>
+              <div id="position-text" class="readout-line"></div>
+              <label><span class="control-name">Finest level</span><select id="scale-select" title="Choose the same level in both menus to pin it."></select></label>
+              <label><span class="control-name">Coarsest level</span><select id="coarsest-scale-select" title="Choose the same level in both menus to pin it."></select></label>
+              <label><span class="control-name">Zoom</span>
+                <span class="range-pair">
+                  <input id="zoom" type="range" step="0.05" />
+                  <input id="zoom-number" type="number" step="0.05" />
+                </span>
+              </label>
+            </section>
+            <section class="card">
+              <h2>Rotation</h2>
+              <div id="rotation-text" class="readout-line">All panes axis-aligned</div>
+              <div id="rotation-mode" class="segmented" aria-label="Tilt scope" title="All panes keeps the three slice planes orthogonal; Active pane tilts only the selected pane.">
+                <button type="button" data-rotation-mode="frame" class="active" aria-pressed="true">All panes</button>
+                <button type="button" data-rotation-mode="pane" aria-pressed="false">Active pane</button>
+              </div>
+              <div class="button-row">
+                <button id="rotation-reset" type="button" title="Reset CT plane rotation (0)">Reset active <kbd>0</kbd></button>
+                <button id="rotation-reset-all" type="button">Reset all</button>
+              </div>
+            </section>
+            <section id="surface-controls" class="card" hidden>
+              <h2>Surface view</h2>
+              <label><span class="control-name">Display</span><select id="workspace-view" aria-label="Surface display">
+                <option value="surface">CT section</option><option value="volume">CT slab</option><option value="both">Section and slab</option>
+              </select></label>
+              <div id="surface-path" class="readout-line"></div>
+              <label><span class="control-name">Arrange views</span><select id="surface-layout-mode">
+                <option value="solo">Surface only</option><option value="below">Other views below</option><option value="right">Other views beside</option>
+              </select></label>
+              <div id="surface-plane-choices" class="surface-plane-choices" aria-label="Companion views">
+                <label><input type="checkbox" data-surface-plane="xy" checked />XY</label>
+                <label><input type="checkbox" data-surface-plane="zy" />YZ</label>
+                <label><input type="checkbox" data-surface-plane="xz" />XZ</label>
+                <label data-view-capability="3d"><input type="checkbox" data-surface-plane="3d" />3D</label>
+              </div>
+              <div class="surface-plane-choices" aria-label="Surface orientation">
+                <label><input id="surface-flip-u" type="checkbox" />Flip H</label>
+                <label><input id="surface-flip-v" type="checkbox" />Flip V</label>
+              </div>
+              <label><span class="control-name">Normal offset (voxels)</span>
+                <span class="range-pair">
+                  <input id="surface-offset" type="range" min="-64" max="64" step="0.25" value="0" />
+                  <input id="surface-offset-number" type="number" min="-256" max="256" step="0.25" value="0" />
+                </span>
+              </label>
+              <label><span class="control-name">d/f step (voxels)</span>
+                <span class="range-pair">
+                  <input id="surface-step" type="range" min="0.05" max="4" step="0.05" value="0.25" />
+                  <input id="surface-step-number" type="number" min="0.01" max="32" step="0.05" value="0.25" />
+                </span>
+              </label>
+              <label class="checkbox-row">
+                <input id="surface-volumetric-enabled" type="checkbox" />
+                <span id="surface-sampling-label">Flattened surface slab</span>
+              </label>
+              <div id="surface-volumetric-controls" hidden>
+                <label><span class="control-name">Transfer curve</span>
+                  <select id="surface-volumetric-transfer-preset" title="Maps displayed intensity to color and opacity.">
+                    <option value="linear">Linear</option>
+                    <option value="ink">Ink contrast</option>
+                    <option value="fiber">Fiber structure</option>
+                    <option value="custom" disabled>Custom</option>
+                  </select>
+                </label>
+                <h3>Slab and opacity</h3>
+                <label><span class="control-name">Layers front</span>
+                  <span class="range-pair">
+                    <input id="surface-volumetric-layers-front" type="range" min="0" max="64" step="1" value="8" />
+                    <input id="surface-volumetric-layers-front-number" type="number" min="0" max="64" step="1" value="8" />
+                  </span>
+                </label>
+                <label><span class="control-name">Layers behind</span>
+                  <span class="range-pair">
+                    <input id="surface-volumetric-layers-behind" type="range" min="0" max="64" step="1" value="0" />
+                    <input id="surface-volumetric-layers-behind-number" type="number" min="0" max="64" step="1" value="0" />
+                  </span>
+                </label>
+                <label><span class="control-name">Layer spacing (voxels)</span>
+                  <span class="range-pair">
+                    <input id="surface-volumetric-spacing" type="range" min="0.05" max="4" step="0.05" value="1" />
+                    <input id="surface-volumetric-spacing-number" type="number" min="0.05" max="8" step="0.05" value="1" />
+                  </span>
+                </label>
+                <label><span class="control-name">Opacity low</span>
+                  <span class="range-pair">
+                    <input id="surface-volumetric-opacity-minimum" type="range" min="0" max="0.99" step="0.01" value="0" />
+                    <input id="surface-volumetric-opacity-minimum-number" type="number" min="0" max="0.99" step="0.01" value="0" />
+                  </span>
+                </label>
+                <label><span class="control-name">Opacity high</span>
+                  <span class="range-pair">
+                    <input id="surface-volumetric-opacity-maximum" type="range" min="0.01" max="1" step="0.01" value="0.86" />
+                    <input id="surface-volumetric-opacity-maximum-number" type="number" min="0.01" max="1" step="0.01" value="0.86" />
+                  </span>
+                </label>
+                <label><span class="control-name">Opacity</span>
+                  <span class="range-pair">
+                    <input id="surface-volumetric-opacity" type="range" min="0.001" max="1" step="0.001" value="0.9" />
+                    <input id="surface-volumetric-opacity-number" type="number" min="0.001" max="1" step="0.001" value="0.9" />
+                  </span>
+                </label>
+                <label><span class="control-name">Opacity gamma</span>
+                  <span class="range-pair">
+                    <input id="surface-volumetric-gamma" type="range" min="0.1" max="5" step="0.1" value="1.5" />
+                    <input id="surface-volumetric-gamma-number" type="number" min="0.1" max="5" step="0.1" value="1.5" />
+                  </span>
+                </label>
+                <h3>Transfer curve points</h3>
+                <div id="surface-volumetric-transfer-points" class="surface-transfer-points"></div>
+                <button id="surface-volumetric-transfer-add" type="button">Add curve point</button>
+                <h3>Geometry and camera</h3>
+                <label><span class="control-name">Azimuth (°)</span>
+                  <span class="range-pair">
+                    <input id="surface-volumetric-azimuth" type="range" min="-180" max="180" step="1" value="0" />
+                    <input id="surface-volumetric-azimuth-number" type="number" min="-180" max="180" step="1" value="0" />
+                  </span>
+                </label>
+                <label><span class="control-name">Tilt (°)</span>
+                  <span class="range-pair">
+                    <input id="surface-volumetric-tilt" type="range" min="0" max="85" step="1" value="0" />
+                    <input id="surface-volumetric-tilt-number" type="number" min="0" max="85" step="1" value="0" />
+                  </span>
+                </label>
+                <label><span class="control-name">Perspective</span>
+                  <span class="range-pair">
+                    <input id="surface-volumetric-perspective" type="range" min="0" max="1" step="0.01" value="0" />
+                    <input id="surface-volumetric-perspective-number" type="number" min="0" max="1" step="0.01" value="0" />
+                  </span>
+                </label>
+                <label><span class="control-name">Relief</span>
+                  <span class="range-pair">
+                    <input id="surface-volumetric-relief" type="range" min="0.1" max="8" step="0.1" value="1" />
+                    <input id="surface-volumetric-relief-number" type="number" min="0.1" max="8" step="0.1" value="1" />
+                  </span>
+                </label>
+                <h3>Lighting and diagnostics</h3>
+                <label><span class="control-name">Screen relief light</span>
+                  <span class="range-pair">
+                    <input id="surface-volumetric-lighting" type="range" min="0" max="1" step="0.01" value="0" />
+                    <input id="surface-volumetric-lighting-number" type="number" min="0" max="1" step="0.01" value="0" />
+                  </span>
+                </label>
+                <label><span class="control-name">Diagnostic feature</span>
+                  <select id="surface-volumetric-feature" title="Gradients use unfiltered CT per finest voxel; diagnostic colors describe derivatives, not ink.">
+                    <option value="intensity">Intensity</option>
+                    <option value="normal-gradient">Signed normal gradient (blue − / orange +)</option>
+                    <option value="tangent-gradient">Tangential gradient magnitude</option>
+                    <option value="gradient-magnitude">3D gradient magnitude</option>
+                  </select>
+                </label>
+                <label><span class="control-name">Gradient gain</span><input id="surface-volumetric-gradient-gain" type="number" min="0.1" max="256" step="0.1" value="16" /></label>
+                <label class="checkbox-row"><input id="surface-volumetric-constant-emission" type="checkbox" /> Constant diagnostic brightness</label>
+                <label><span class="control-name">Light direction (°)</span>
+                  <span class="range-pair">
+                    <input id="surface-volumetric-light-azimuth" type="range" min="-180" max="180" step="1" value="-135" />
+                    <input id="surface-volumetric-light-azimuth-number" type="number" min="-180" max="180" step="1" value="-135" />
+                  </span>
+                </label>
+                <label class="checkbox-row">
+                  <input id="surface-volumetric-reverse" type="checkbox" />
+                  <span>Reverse slab direction</span>
+                </label>
+                <h3>Relief mask</h3>
+                <label class="checkbox-row">
+                  <input id="surface-relief-mask-enabled" type="checkbox" title="Top and bottom masks bound slab depth across the surface." />
+                  <span>Relief mask</span>
+                </label>
+                <div id="surface-relief-mask-controls" hidden>
+                  <label class="checkbox-row">
+                    <input id="surface-relief-mask-overlay-visible" type="checkbox" checked title="Drag the blue top or orange bottom controls; Shift-drag changes slab depth." />
+                    <span>Show mask controls</span>
+                  </label>
+                  <label><span class="control-name">Boundary</span>
+                    <select id="surface-relief-mask-boundary">
+                      <option value="top">Top</option>
+                      <option value="bottom">Bottom</option>
+                    </select>
+                  </label>
+                  <label><span class="control-name">Slab depth</span>
+                    <span class="range-pair">
+                      <input id="surface-relief-mask-depth" type="range" min="0" max="1" step="0.01" value="0" />
+                      <input id="surface-relief-mask-depth-number" type="number" min="0" max="1" step="0.01" value="0" />
+                    </span>
+                  </label>
+                  <div class="button-row">
+                    <button id="surface-relief-mask-set" type="button">Set at view center</button>
+                    <button id="surface-relief-mask-remove" type="button">Remove nearest</button>
+                    <button id="surface-relief-mask-reset" type="button">Reset</button>
+                  </div>
+                  <div id="surface-relief-mask-status" class="readout-line"></div>
+                </div>
+              </div>
+              <div class="button-row">
+                <button id="surface-flip-normal" type="button" aria-pressed="false" title="Pressed while the normal is reversed">Flip normal</button>
+              </div>
+              <div id="surface-status" class="readout-line" role="status"></div>
+            </section>
+            <div id="view-panels" class="lpanel-extensions"></div>
+          </div>
+        </div>
+      </aside>
+
+      <main class="viewer-shell active-xy">
+        <section id="viewer-empty" class="viewer-empty">
+          <svg class="icon"><use href="#icon-layers" /></svg>
+          <h1>Explore a volume</h1>
+          <p>Open a source to begin.</p>
+          <button type="button" class="primary" data-open-source>Open source…</button>
+        </section>
+        <div id="ortho-grid" class="ortho-grid" aria-label="Composed viewports"></div>
+        <div id="tool-label" class="tool-label" hidden></div>
+      </main>
+
+      <aside id="right-panel" class="side-panel">
+        <div id="right-tabs" class="tab-strip right-tabs" role="tablist">
+          <button id="info-tab" class="rtab" data-rtab="info" role="tab" aria-selected="false" title="Info"><svg class="icon"><use href="#icon-info" /></svg><span>Info</span></button>
+        </div>
+        <div class="panel-body">
+          <div class="rpanel" data-rpanel="info" hidden>
+            <section class="card">
+              <h2>Source metadata</h2>
+              <dl id="source-metadata" class="metadata"><dt>State</dt><dd>No source</dd></dl>
+              <button id="copy-session" type="button">Copy session link</button>
+              <div class="button-row">
+                <button id="save-session" type="button">Save session</button>
+                <button id="open-session" type="button">Open session…</button>
+              </div>
+              <input id="session-file" type="file" accept=".json,application/json" hidden />
+            </section>
+            <section id="performance-controls" class="card"></section>
+          </div>
+        </div>
+      </aside>
+
+      <footer id="status-bar">
+        <div id="status" role="status" aria-live="polite" aria-atomic="true">Open a source to begin.</div>
+        <div id="network-status" class="readout-line" aria-label="Download activity"><span>↓ ≈0 B/s</span><span>0 B total</span></div>
+        <div id="cursor-value" class="readout-line">cursor: —</div>
+        <div id="mag-zoom" class="readout-line" title="Pane under the pointer (or last active pane). Mag is the target CT pyramid downsampling in Z×Y×X; zoom is that pane’s framing."></div>
+      </footer>
+    </div>
+
+    <div id="open-source-modal" class="modal-backdrop" hidden>
+      <div class="modal" role="dialog" aria-modal="true" aria-labelledby="open-source-title">
+        <header class="modal-header">
+          <h2 id="open-source-title">Open source</h2>
+          <button class="icon-btn modal-close" type="button" data-close-modal aria-label="Close"><svg class="icon"><use href="#icon-close" /></svg></button>
+        </header>
+        <form id="load-form" class="load-form">
+          <section class="source-open-group" aria-label="Open a URL">
+            <label for="zarr-url">Zarr URL</label>
+            <div class="source-url-row">
+              <input id="zarr-url" name="zarr-url" type="text" value="" data-modal-focus placeholder="https://…" spellcheck="false" autocomplete="off" />
+              <button type="submit" class="primary">Open source</button>
+            </div>
+          </section>
+        </form>
+      </div>
+    </div>
+
+    <div id="shortcuts-modal" class="modal-backdrop" hidden>
+      <div class="modal modal-shortcuts" role="dialog" aria-modal="true" aria-labelledby="shortcuts-title">
+        <header class="modal-header">
+          <h2 id="shortcuts-title">Keyboard shortcuts</h2>
+          <button class="icon-btn modal-close" type="button" data-close-modal aria-label="Close"><svg class="icon"><use href="#icon-close" /></svg></button>
+        </header>
+        <dl id="shortcuts" class="shortcuts"></dl>
+      </div>
+    </div>
+
+    <div id="settings-modal" class="modal-backdrop" hidden>
+      <div class="modal modal-settings" role="dialog" aria-modal="true" aria-labelledby="settings-title">
+        <header class="modal-header">
+          <h2 id="settings-title">Settings</h2>
+          <button class="icon-btn modal-close" type="button" data-close-modal aria-label="Close"><svg class="icon"><use href="#icon-close" /></svg></button>
+        </header>
+        <div class="settings">
+          <section id="gpu-memory-settings" class="settings-group">
+            <h3>Rendering</h3>
+            <label><span class="control-name">Live GPU budget (MiB)</span>
+              <input id="gpu-rendering-mib" type="number" min="256" step="1" value="384" data-modal-focus title="Pane images and the Surface pane's positions and volume bricks; the CT slices' bricks have a fixed budget of their own. Device texture limits still apply." />
+            </label>
+            <div class="button-row"><button id="gpu-rendering-apply" type="button">Apply GPU budget</button></div>
+            <div id="gpu-rendering-status" class="readout-line" role="status"></div>
+          </section>
+          <section id="download-cache-controls" class="settings-group">
+            <h3>Downloads</h3>
+            <label class="checkbox-row"><input id="download-cache-enabled" type="checkbox" title="Reuse downloads after reloads in this browser profile and viewer address; older downloads are removed when the budget fills." /> Save Zarr and TIFF downloads on disk</label>
+            <label><span class="control-name">Disk budget (GiB)</span>
+              <input id="download-cache-budget" type="number" min="0.25" max="1024" step="0.25" value="2" />
+            </label>
+            <div class="button-row"><button id="download-cache-apply" type="button">Apply download settings</button></div>
+            <div id="download-cache-status" class="readout-line" role="status"></div>
+          </section>
+          <section class="settings-group">
+            <h3>Memory</h3>
+            <label><span class="control-name">CPU chunks per reader (MiB)</span>
+              <input id="chunk-cache-mib" type="number" min="64" max="16384" step="1" value="256" title="RAM fills as you navigate up to this allowance; older chunks are evicted when full." />
+            </label>
+            <div class="button-row"><button id="chunk-cache-apply" type="button">Apply chunk memory</button></div>
+            <div id="chunk-cache-status" class="readout-line" role="status"></div>
+            <div class="button-row"><button id="geometry-cache-clear" type="button" title="Geometry downloads reuse up to 512 MiB of browser storage.">Clear stored geometry</button></div>
+            <div id="geometry-cache-status" class="readout-line" role="status"></div>
+          </section>
+          <section class="settings-group">
+            <h3>Storage</h3>
+            <div class="button-row">
+              <button id="download-cache-refresh" type="button">Refresh usage</button>
+              <button id="download-cache-clear" type="button">Clear all downloaded data</button>
+            </div>
+            <div id="download-cache-sources"></div>
+          </section>
+        </div>
+      </div>
+    </div>
+
+    <script src="./src/startup.js"></script>
+  </body>
+</html>

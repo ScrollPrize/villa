@@ -1,0 +1,13 @@
+{
+  "name": "teca",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "format": "biome format --write src tests styles.css",
+    "lint": "biome check src tests styles.css",
+    "test": "node --test"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "2.5.8"
+  }
+}
