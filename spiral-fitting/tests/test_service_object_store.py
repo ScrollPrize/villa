@@ -710,6 +710,30 @@ def test_fiber_directions_are_the_project_datasets_cached_samples(host, store_pa
     assert paths.fiber_directions == ''
 
 
+def test_fiber_directions_extract_from_the_copys_remote_manifest(host, store_path, monkeypatch):
+    import fiber_direction_samples
+    from lasagna_source import fiber_directions_path
+    calls = []
+
+    def extract(location, output, path, *, identity, **kwargs):
+        calls.append((location, identity))
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        Path(path).write_bytes(b'')
+    monkeypatch.setattr(fiber_direction_samples, 'extract', extract)
+    # VC3D's copy is not on this host; the manifest it was copied from is read,
+    # under the identity VC3D sent.
+    fibers = {'location': '/client/remote_cache/f/f.lasagna.json', 'identity': 'fibers-copy',
+              'remote_manifest': 'https://data.example/f/f.lasagna.json'}
+    body = initialize_body(input_use_fiber_directions=True, loss_weight_fiber_directions=1.0) | {
+        'project': project(fiber_inference=fibers, fiber_scale=4)}
+    paths, _ = _built(service(host, store_path, build_missing_lasagna_packs=True), body)
+    assert calls == [('https://data.example/f/f.lasagna.json', 'fibers-copy')]
+    assert paths.fiber_directions == fiber_directions_path(host.cache, 'fibers-copy', 4)
+    with pytest.raises(ApiError, match=r'remote_manifest must be an HTTP\(S\) URL'):
+        service(host, store_path).initialize(initialize_body() | {'project': project(
+            fiber_inference={**fibers, 'remote_manifest': 's3://data/f.lasagna.json'})})
+
+
 def test_a_changed_project_volume_rebuilds_everything(host, store_path):
     state = service(host, store_path)
     _built(state, initialize_body())

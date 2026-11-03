@@ -20,6 +20,7 @@ import math
 import os
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping
+from urllib.parse import urlsplit
 import zipfile
 
 from config import Config
@@ -990,11 +991,14 @@ class ProjectLasagna:
 class ProjectFiberInference:
     """The project's selected fiber-inference dataset: its identity
     (lasagna_source), keying the fiber-direction samples extracted from it;
-    ``error`` says why VC3D could not read it."""
+    ``error`` says why VC3D could not read it. ``remote_manifest`` is the
+    HTTP(S) manifest a local copy of a remote dataset was copied from, which
+    a host without that copy extracts from; it is not part of the record."""
 
     location: str = ""
     identity: str = ""
     error: str = ""
+    remote_manifest: str = ""
 
     def manifest(self) -> dict[str, Any]:
         result = {"location": self.location}
@@ -1004,7 +1008,16 @@ class ProjectFiberInference:
             result["identity"] = self.identity
         return result
 
-    to_mapping = manifest
+    def to_mapping(self) -> dict[str, Any]:
+        result = self.manifest()
+        if self.remote_manifest:
+            result["remote_manifest"] = self.remote_manifest
+        return result
+
+    def extraction_location(self) -> str:
+        """Where the fiber directions are extracted from: the remote
+        manifest a local copy came from, else the location itself."""
+        return self.remote_manifest or self.location
 
 
 @dataclass(frozen=True)
@@ -1168,8 +1181,12 @@ def _checked_fiber_inference(value: Any) -> ProjectFiberInference | None:
     location = str(value.get("location") or "")
     if value.get("error"):
         return ProjectFiberInference(location=location, error=str(value["error"]))
+    remote_manifest = str(value.get("remote_manifest") or "")
+    if remote_manifest and urlsplit(remote_manifest).scheme not in ("http", "https"):
+        raise ScrollSpecError(f"{source}: remote_manifest must be an HTTP(S) URL")
     return ProjectFiberInference(location=location,
-                                 identity=_project_dataset_identity(value, source))
+                                 identity=_project_dataset_identity(value, source),
+                                 remote_manifest=remote_manifest)
 
 
 def _checked_umbilicus(value: Any, source: str) -> ProjectUmbilicus:
@@ -1248,7 +1265,7 @@ class SessionScroll:
             raise ScrollSpecError(
                 f"no fiber directions of {dataset.location} (dataset {dataset.identity}) "
                 f"at scale {scale:g} in the cache: extract them with "
-                f"fiber_direction_samples.py {dataset.location} --cache <cache> "
+                f"fiber_direction_samples.py {dataset.extraction_location()} --cache <cache> "
                 f"--output-scale {scale:g} (or --adopt an existing artifact) and "
                 f"copy them to {path}")
         return path

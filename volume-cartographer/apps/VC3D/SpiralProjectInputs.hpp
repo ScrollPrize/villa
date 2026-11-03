@@ -99,9 +99,15 @@ std::optional<ProjectLasagna> projectLasagna(const VolumePkg& pkg,
 struct ProjectDataset {
     std::string location;
     std::string identity;
+    // The HTTP(S) manifest a local copy of a remote dataset was copied from,
+    // for a service host without the copy; empty otherwise.
+    std::string remoteManifest;
     std::optional<std::array<std::size_t, 3>> baseShapeZYX;
     std::string error;
 };
+// The HTTP(S) manifest a local copy of a remote dataset (opened beside its
+// lasagna-remote.json marker) was copied from; empty for any other manifest.
+std::string remoteManifestUrl(const vc::lasagna::LasagnaDatasetManifest& manifest);
 std::optional<ProjectDataset> projectFiberInference(const VolumePkg& pkg,
                                                     const std::filesystem::path& remoteCacheRoot);
 

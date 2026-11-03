@@ -2111,8 +2111,9 @@ class ServiceState:
             self.events.append("log", f"Fiber directions: {line}", source="service",
                                operation="preparing_inputs")
         dataset = scroll.project.fiber_inference
-        log(f"extracting from {dataset.location} into {path}")
-        extract(dataset.location, None, path, identity=dataset.identity,
+        location = dataset.extraction_location()
+        log(f"extracting from {location} into {path}")
+        extract(location, None, path, identity=dataset.identity,
                 output_scale=scroll.fiber_scale(volume, level),
                 workers=FIBER_DIRECTION_WORKERS, log=log)
 

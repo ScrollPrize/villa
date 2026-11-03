@@ -152,6 +152,21 @@ void describesTheFiberInferenceDataset()
     require(block.value("fiber_inference").toObject()
                 == QJsonObject{{"location", "/data/f.lasagna.json"}, {"identity", "run-4"}},
             "the dataset and its identity");
+    // A local copy of a remote dataset also names the manifest it was copied
+    // from, which a service host without the copy reads.
+    auto manifest = vc::lasagna::LasagnaDatasetManifest::parseText(kManifest);
+    manifest.manifestPath = "/cache/f/f.lasagna.json";
+    require(vc3d::spiral::remoteManifestUrl(manifest).empty(), "a local dataset has no remote manifest");
+    manifest.remoteBaseUrl = "https://data.example/f/";
+    fibers.remoteManifest = vc3d::spiral::remoteManifestUrl(manifest);
+    require(fibers.remoteManifest == "https://data.example/f/f.lasagna.json",
+            "the copy's manifest at its remote base: " + fibers.remoteManifest);
+    manifest.manifestIsRemote = true;
+    require(vc3d::spiral::remoteManifestUrl(manifest).empty(), "a remote dataset's location is its URL");
+    require(vc3d::spiral::projectBlock("PHerc", volumes, std::nullopt, fibers, nullptr, std::nullopt)
+                    .value("fiber_inference").toObject().value("remote_manifest").toString()
+                == "https://data.example/f/f.lasagna.json",
+            "the remote manifest is sent");
     const QJsonObject entries = block.value("volumes").toObject();
     require(entries.value("quarter").toObject().value("fiber_scale").toDouble() == 4,
             "4 base voxels per voxel of a quarter-resolution volume");
