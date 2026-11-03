@@ -1,12 +1,10 @@
 {
   "description": "Workflow benchmark data and cases. Relative paths are relative to this file. See README.md.",
   "cache": "cache",
+  "csv": "results.csv",
 
-  "baseline": "main-20261103",
-  "results": [
-    {"label": "main-20261103", "path": "saved/main-20261103.jsonl"},
-    {"label": "branch-743f1eb", "path": "saved/branch-743f1eb-20261103.jsonl"}
-  ],
+  "baseline": null,
+  "results": [],
 
   "volumes": {
     "paris4-2.4um": {
@@ -46,8 +44,9 @@
       {
         "name": "w028-037",
         "segment": "w028-037",
-        "width": 960,
-        "height": 540,
+        "description": "Each of VC3D's 2x2 main viewers on a 2448x1332 screen: half the width and height.",
+        "width": 1224,
+        "height": 666,
         "view_scale": 1.0,
         "pan_steps": 8,
         "zoom_steps": 4,
@@ -69,12 +68,13 @@
     ],
     "render_tifxyz": [
       {
-        "name": "w028-037-crop2k",
+        "name": "w028-037-full",
+        "description": "The whole segment: no crop. partial_levels leaves out level 2, the level it renders, so cache state partial fetches it.",
+        "partial_levels": [3, 4, 5],
         "segment": "w028-037",
         "group": 2,
         "scale": 1,
         "slices": 21,
-        "crop": [20750, 5500, 2048, 2048],
         "surface_interpolation": "linear",
         "iterations": 3
       }

@@ -183,7 +183,7 @@ int main(int argc, char** argv)
 
         session.noteCaches();
         report.setConfig(session.config());
-        report.finish(fixture.jsonPath());
+        report.finish();
         layout.viewers.clear();
         return 0;
     } catch (const std::exception& e) {

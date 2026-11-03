@@ -13,7 +13,9 @@
 #   BENCHES       harnesses (default "viewer_navigation line_annotation render_tifxyz")
 #   BRANCH_BUILD  this branch's build tree (default ../build), VC_BUILD_BENCHMARKS=ON
 #   MAIN_BUILD    origin/main's build tree for the "main" step (see README.md)
-#   OUT           results folder (default: out/ beside this script)
+#   OUT           results folder (default: out/ beside this script): results.jsonl and
+#                 results.csv, one row per step and metric, appended by every run
+#   RUN_ID        id written with every row of this invocation (default: a UTC timestamp)
 #   EXTRA         extra arguments for every run, e.g. "--passes 1 --pan-steps 2"
 set -euo pipefail
 
@@ -26,10 +28,21 @@ MAIN_BUILD="${MAIN_BUILD:-/mnt/raid_nvme/dev_builds/vc-main}"
 OUT="${OUT:-$here/out}"
 EXTRA=(${EXTRA:-})
 mkdir -p "$OUT"
-JSON="$OUT/results.jsonl"
+JSON="$OUT/results.jsonl"   # every harness also appends the same rows to $OUT/results.csv
+RUN_ID="${RUN_ID:-$(date -u +%Y%m%dT%H%M%SZ)}"
+
+# The commit a build tree was built from (its CMake source's checkout; -dirty with
+# uncommitted changes to tracked files).
+commit_of() {
+    local src
+    src="$(sed -n 's/^CMAKE_HOME_DIRECTORY:INTERNAL=//p' "$1/CMakeCache.txt" 2>/dev/null)"
+    local sha; sha="$(git -C "${src:-$1}" rev-parse --short=9 HEAD 2>/dev/null)" || { echo unknown; return; }
+    git -C "${src:-$1}" diff --quiet HEAD -- 2>/dev/null && echo "$sha" || echo "$sha-dirty"
+}
 
 run() {  # label build pipeline-args...
     local label="$1" build="$2"; shift 2
+    local commit; commit="$(commit_of "$build")"
     for state in "${STATES[@]}"; do
         for bench in "${BENCHES[@]}"; do
             local bin="$build/bin/bench_$bench" extra=()
@@ -37,7 +50,7 @@ run() {  # label build pipeline-args...
             for case in $("$bin" --config "$CONFIG" --list-cases); do
                 echo "== $bench / $case [$label, $state]"
                 "$bin" --config "$CONFIG" --case "$case" --cache-state "$state" --json "$JSON" \
-                       "${extra[@]}" "$@" "${EXTRA[@]}"
+                       --run-id "$RUN_ID" --commit "$commit" "${extra[@]}" "$@" "${EXTRA[@]}"
             done
         done
     done

@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <filesystem>
 #include <fstream>
 #include <numeric>
 #include <sstream>
@@ -89,9 +90,9 @@ Summary summarize(std::vector<double> values)
 }
 
 Report::Report(std::string benchmark, std::string pipeline, std::string caseName, std::string cacheState,
-               std::map<std::string, std::string> config)
+               std::map<std::string, std::string> config, RunInfo run)
     : benchmark_(std::move(benchmark)), pipeline_(std::move(pipeline)), case_(std::move(caseName)),
-      cacheState_(std::move(cacheState)), config_(std::move(config))
+      cacheState_(std::move(cacheState)), config_(std::move(config)), run_(std::move(run))
 {
 }
 
@@ -104,19 +105,31 @@ void Report::add(const std::string& group, const std::string& metric, double val
 }
 
 namespace {
-std::string jsonEscape(const std::string& text)
+
+// RFC 4180: fields with a comma, quote or line break are quoted, quotes doubled.
+std::string csvField(const std::string& text)
 {
-    std::string out;
-    for (const char c : text) {
-        if (c == '"' || c == '\\')
-            out += '\\';
-        out += c;
-    }
-    return out;
+    if (text.find_first_of(",\"\r\n") == std::string::npos)
+        return text;
+    std::string out = "\"";
+    for (const char c : text)
+        out += c == '"' ? std::string("\"\"") : std::string(1, c);
+    return out + "\"";
 }
+
+// The shortest text that reads back as the same double.
+std::string number(double value)
+{
+    return nlohmann::json(value).dump();
+}
+
+constexpr const char* kCsvColumns[] = {"timestamp", "run_id", "commit", "benchmark", "case", "pipeline",
+                                       "cache_state", "step", "metric", "n", "mean", "p50", "p95", "min",
+                                       "max", "total", "config"};
+
 } // namespace
 
-void Report::finish(const std::string& jsonPath) const
+void Report::finish() const
 {
     std::printf("\n== %s / %s [%s, %s]\n", benchmark_.c_str(), case_.c_str(), pipeline_.c_str(), cacheState_.c_str());
     for (const auto& [key, value] : config_)
@@ -130,27 +143,50 @@ void Report::finish(const std::string& jsonPath) const
                     key.substr(bar + 1).c_str(), s.n, s.mean, s.p50, s.p95, s.min, s.max);
     }
     std::fflush(stdout);
-    if (jsonPath.empty())
-        return;
-    std::ofstream out(jsonPath, std::ios::app);
-    if (!out)
-        throw std::runtime_error("cannot append to " + jsonPath);
-    std::ostringstream config;
-    config << "{";
-    bool first = true;
-    for (const auto& [key, value] : config_) {
-        config << (first ? "" : ",") << "\"" << jsonEscape(key) << "\":\"" << jsonEscape(value) << "\"";
-        first = false;
+
+    const nlohmann::json config(config_);
+    if (!run_.jsonPath.empty()) {
+        std::ofstream out(run_.jsonPath, std::ios::app);
+        if (!out)
+            throw std::runtime_error("cannot append to " + run_.jsonPath);
+        for (const auto& key : order_) {
+            const auto bar = key.find('|');
+            const auto s = summarize(samples_.at(key));
+            const nlohmann::json line{{"timestamp", run_.timestamp}, {"run_id", run_.runId}, {"commit", run_.commit},
+                                      {"benchmark", benchmark_},     {"case", case_},       {"pipeline", pipeline_},
+                                      {"cache_state", cacheState_},  {"step", key.substr(0, bar)},
+                                      {"metric", key.substr(bar + 1)}, {"n", s.n},          {"mean", s.mean},
+                                      {"p50", s.p50},                {"p95", s.p95},        {"min", s.min},
+                                      {"max", s.max},                {"total", s.total},    {"config", config}};
+            out << line.dump() << "\n";
+        }
     }
-    config << "}";
-    for (const auto& key : order_) {
-        const auto bar = key.find('|');
-        const auto s = summarize(samples_.at(key));
-        out << "{\"benchmark\":\"" << benchmark_ << "\",\"case\":\"" << jsonEscape(case_) << "\",\"pipeline\":\""
-            << pipeline_ << "\",\"cache_state\":\"" << cacheState_ << "\",\"step\":\""
-            << jsonEscape(key.substr(0, bar)) << "\",\"metric\":\"" << key.substr(bar + 1) << "\",\"n\":" << s.n
-            << ",\"mean\":" << s.mean << ",\"p50\":" << s.p50 << ",\"p95\":" << s.p95 << ",\"min\":" << s.min
-            << ",\"max\":" << s.max << ",\"total\":" << s.total << ",\"config\":" << config.str() << "}\n";
+    if (!run_.csvPath.empty()) {
+        std::error_code ec;
+        const bool header = !std::filesystem::exists(run_.csvPath, ec) || std::filesystem::file_size(run_.csvPath, ec) == 0;
+        std::ofstream out(run_.csvPath, std::ios::app);
+        if (!out)
+            throw std::runtime_error("cannot append to " + run_.csvPath);
+        if (header) {
+            std::string line;
+            for (const char* column : kCsvColumns)
+                line += (line.empty() ? "" : ",") + std::string(column);
+            out << line << "\n";
+        }
+        const auto configText = config.dump();
+        for (const auto& key : order_) {
+            const auto bar = key.find('|');
+            const auto s = summarize(samples_.at(key));
+            const std::vector<std::string> fields{
+                run_.timestamp,  run_.runId,         run_.commit,       benchmark_,         case_,
+                pipeline_,       cacheState_,        key.substr(0, bar), key.substr(bar + 1), std::to_string(s.n),
+                number(s.mean),  number(s.p50),      number(s.p95),     number(s.min),      number(s.max),
+                number(s.total), configText};
+            std::string line;
+            for (const auto& field : fields)
+                line += (line.empty() ? "" : ",") + csvField(field);
+            out << line << "\n";
+        }
     }
 }
 

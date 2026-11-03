@@ -151,7 +151,7 @@ int main(int argc, char** argv)
         session.note("fibers", names);
         session.noteCaches();
         report.setConfig(session.config());
-        report.finish(fixture.jsonPath());
+        report.finish();
         owned.clear();
         return 0;
     } catch (const std::exception& e) {

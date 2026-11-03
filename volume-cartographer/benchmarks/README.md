@@ -51,6 +51,7 @@ manifest. Pass another one with `--config` (or `CONFIG=` for the scripts).
 ```jsonc
 {
   "cache": "cache",          // where data is cached; default: cache/ beside the manifest
+  "csv": "results.csv",      // optional; the CSV every timed run appends to (see Run)
   "baseline": "<label>",     // optional; the saved results compare sets the others against
   "results": [ { "label": "<label>", "path": "saved/results.jsonl" } ],  // saved results, see below
   "scratch": "...",          // optional; scratch caches for cold/partial (default: <cache>-scratch)
@@ -92,7 +93,7 @@ manifest. Pass another one with `--config` (or `CONFIG=` for the scripts).
 | `group`, `scale`, `slices`, `crop`, `surface_interpolation`, `iterations`, `tool`, `work_dir` | `render_tifxyz` | 2, 1, 21, none, linear, 3, this tree's tool, `$TMPDIR/vc_bench_render_tifxyz` |
 
 Options that aren't parameters: `--config`, `--case`, `--list-cases`, `--json <file>`
-(append results), `--dump <dir>` (save viewer frames as PNG), `--prefetch`,
+and `--csv <file>` (append results), `--run-id`, `--commit`, `--dump <dir>` (save viewer frames as PNG), `--prefetch`,
 `--expect-cached`, `--keep-scratch`.
 
 ## Cache states
@@ -155,10 +156,33 @@ BENCHES=line_annotation volume-cartographer/benchmarks/run.sh cuda     # one har
 ```
 
 `run.sh` runs every case of the manifest for each harness, step and cache state.
-Results append to `$OUT/results.jsonl` (default `benchmarks/out/`), one line per
-step and metric. Each line has `benchmark`, `case`, `pipeline`, `cache_state`, n,
-mean, p50, p95, min, max, total, and the run's configuration: the fixture facts
-and every parameter's effective value. Each harness also prints a table.
+Every run appends one row per step and metric to two files:
+
+- **the CSV** (see below), for spreadsheets and quick comparisons across runs. Columns:
+  `timestamp, run_id, commit, benchmark, case, pipeline, cache_state, step,
+  metric, n, mean, p50, p95, min, max, total, config`. The header is written
+  when the file is new, and `config` is the run's configuration as one JSON
+  string.
+- **`$OUT/results.jsonl`** (default `benchmarks/out/`), the same rows as JSON
+  lines, which `compare` reads.
+
+`timestamp` is when the harness started (UTC). `run_id` is the same for every row
+of one `run.sh` invocation (`RUN_ID`, default a UTC timestamp), so the rows of
+one run can be filtered together. `commit` is the short hash of the build tree's
+source, with `-dirty` when tracked files had uncommitted changes. `config` holds
+the fixture facts and every parameter's effective value. Each harness also prints
+a table.
+
+Which CSV a run appends to, first match wins:
+
+1. `--csv <file>`.
+2. The manifest's `csv` (`benchmarks/results.csv` here). Every timed run of any
+   harness appends to it, whether from `run.sh` or run by hand, so it collects
+   the whole history in one file. `--prefetch` replays don't write to it.
+3. The `--json` file's path with `.csv`.
+
+`--run-id` and `--commit` set those columns (default: the timestamp and
+`unknown`).
 
 ## Saved results and baselines
 

@@ -58,19 +58,29 @@ struct Summary {
 };
 Summary summarize(std::vector<double> values);
 
+// Where and as what a run's results are written.
+struct RunInfo {
+    std::string timestamp;  // UTC, ISO 8601, when the harness started
+    std::string runId;      // --run-id (run.sh: one per invocation), else the timestamp
+    std::string commit;     // --commit (run.sh: the build tree's source commit), else "unknown"
+    std::string jsonPath;   // --json: append one JSON line per metric
+    std::string csvPath;    // --csv, else the manifest's "csv", else --json's path with .csv
+};
+
 // One benchmark run's results: steps with their samples (ms and counts).
 class Report {
 public:
     Report(std::string benchmark, std::string pipeline, std::string caseName, std::string cacheState,
-           std::map<std::string, std::string> config);
+           std::map<std::string, std::string> config, RunInfo run = {});
     void add(const std::string& group, const std::string& metric, double value);
     void setConfig(std::map<std::string, std::string> config) { config_ = std::move(config); }
-    // Prints a table and, when `jsonPath` is set, appends one JSON line per metric.
-    void finish(const std::string& jsonPath) const;
+    // Prints a table and appends the results to the run's JSON and CSV files, if set.
+    void finish() const;
 
 private:
     std::string benchmark_, pipeline_, case_, cacheState_;
     std::map<std::string, std::string> config_;
+    RunInfo run_;
     std::vector<std::string> order_;
     std::map<std::string, std::vector<double>> samples_;  // "group|metric"
 };
@@ -148,7 +158,7 @@ public:
     std::map<std::string, std::string> config() const { return config_; }
     void note(const std::string& key, const std::string& value) { config_[key] = value; }
     Report makeReport() const;
-    const std::string& jsonPath() const { return jsonPath_; }
+    const RunInfo& run() const { return run_; }
     const std::string& dumpDir() const { return dumpDir_; }
 
 private:
@@ -157,7 +167,8 @@ private:
     void recordInIndex(const DataItem& item);
 
     Args args_;
-    std::string benchmark_, caseName_, backend_, pipeline_, jsonPath_, dumpDir_;
+    std::string benchmark_, caseName_, backend_, pipeline_, dumpDir_;
+    RunInfo run_;
     std::filesystem::path configPath_, cacheRoot_;
     nlohmann::json manifest_, case_;
     std::set<std::string> usedCaseKeys_;

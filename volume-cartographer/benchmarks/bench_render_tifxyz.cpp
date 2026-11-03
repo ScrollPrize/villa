@@ -182,7 +182,7 @@ int main(int argc, char** argv)
                        summary.pixels ? 100.0 * double(summary.nonzero) / double(summary.pixels) : 0);
             report.add(step, "out_images", double(summary.images));
         }
-        report.finish(fixture.jsonPath());
+        report.finish();
         std::filesystem::remove_all(vc3dConfig);
         return 0;
     } catch (const std::exception& e) {

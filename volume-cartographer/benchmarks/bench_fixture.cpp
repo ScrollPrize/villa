@@ -9,6 +9,8 @@
 
 #include <algorithm>
 #include <cctype>
+#include <chrono>
+#include <ctime>
 #include <cmath>
 #include <cstdio>
 #include <fstream>
@@ -198,7 +200,24 @@ Fixture::Fixture(int argc, char** argv, std::string benchmark) : args_(argc, arg
         throw std::invalid_argument("--prefetch and cache states cold and partial need a vc_reader build; this "
                                     "tree only reads the cached copies");
 #endif
-    jsonPath_ = args_.str("json");
+    {
+        const auto now = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
+        std::tm utc{};
+        gmtime_r(&now, &utc);
+        char stamp[32];
+        std::strftime(stamp, sizeof stamp, "%Y-%m-%dT%H:%M:%SZ", &utc);
+        run_.timestamp = stamp;
+    }
+    run_.runId = args_.str("run-id", run_.timestamp);
+    run_.commit = args_.str("commit", "unknown");
+    run_.jsonPath = args_.str("json");
+    // One CSV collects every timed run: --csv, else the manifest's "csv" (not for
+    // --prefetch replays), else beside --json.
+    run_.csvPath = args_.str("csv");
+    if (run_.csvPath.empty() && !prefetch_ && manifest_.contains("csv") && manifest_["csv"].is_string())
+        run_.csvPath = resolveAgainst(configPath_.parent_path(), manifest_["csv"].get<std::string>()).string();
+    if (run_.csvPath.empty() && !run_.jsonPath.empty())
+        run_.csvPath = fs::path(run_.jsonPath).replace_extension(".csv").string();
     dumpDir_ = args_.str("dump");
 
     config_["config"] = configPath_.string();
@@ -510,7 +529,7 @@ VolumeSource Fixture::volumeSource(const fs::path& configDir)
 
 Report Fixture::makeReport() const
 {
-    return Report(benchmark_, pipeline_, caseName_, cacheState_, config_);
+    return Report(benchmark_, pipeline_, caseName_, cacheState_, config_, run_);
 }
 
 // ---------------------------------------------------------------------------
