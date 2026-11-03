@@ -10,20 +10,23 @@
 #   inputs on the cache offline (remote_offline "fill": a chunk the cache lacks reads
 #   as empty at once and is recorded), then fetches exactly the recorded chunks.
 #   Passes repeat until one finds nothing missing (exit 0), which is also all a pass
-#   costs when the cache is already complete. Each case is planned twice: exactly as
-#   its timed runs read (margin 1, its own passes), then with views grown by
+#   costs when the cache is already complete. Each case is planned exactly as its
+#   timed runs read (margin 1, its own passes) on every backend in BACKENDS (CUDA
+#   sampling reads chunks the CPU does not), then with views grown by
 #   prefetch_margin (1.5) to cover other pipelines' level and fallback choices. Grown
-#   views pan to other places, so they do not stand in for the exact plan.
+#   views pan to other places, so they do not stand in for the exact plans.
 # - render_tifxyz runs the tool once online through the cache.
 #
 # Environment: CONFIG (the manifest), BUILD (build tree, default ../build),
-# MAX_PASSES (plan passes per case, default 6), EXTRA (extra arguments for every run).
+# BACKENDS (exact plans, default "cpu cuda"), MAX_PASSES (plan passes per plan,
+# default 6), EXTRA (extra arguments for every run).
 set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CONFIG="$(realpath "${CONFIG:-$here/benchmarks.json}")"
 BUILD="${BUILD:-$here/../build}"
 MAX_PASSES="${MAX_PASSES:-6}"
+BACKENDS=(${BACKENDS:-cpu cuda})
 EXTRA=(${EXTRA:-})
 benches=("$@")
 [ ${#benches[@]} -eq 0 ] && benches=(viewer_navigation line_annotation render_tifxyz)
@@ -36,9 +39,15 @@ for bench in "${benches[@]}"; do
             "$bin" --config "$CONFIG" --case "$case" --prefetch "${EXTRA[@]}"
             continue
         fi
-        for plan in exact margin; do
-            args=(--prefetch-margin 1)                        # exact: what timed runs read
-            [ $plan = margin ] && args=(--passes 1)           # the manifest's prefetch_margin
+        plans=()
+        for backend in "${BACKENDS[@]}"; do plans+=("exact-$backend"); done
+        plans+=(margin)
+        for plan in "${plans[@]}"; do
+            if [ $plan = margin ]; then
+                args=(--passes 1)                             # the manifest's prefetch_margin
+            else
+                args=(--prefetch-margin 1 --backend "${plan#exact-}")  # what timed runs read
+            fi
             for ((pass = 1; ; ++pass)); do
                 echo "== prefetch $bench / $case, $plan plan pass $pass"
                 status=0
