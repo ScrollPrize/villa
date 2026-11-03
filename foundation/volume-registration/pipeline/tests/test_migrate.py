@@ -67,3 +67,17 @@ def test_check_reproduces_a_decided_record(tmp_path):
                                                          "reason": "test", "override": None}})
     class Args: records = [str(tmp_path / "out")]
     assert check(Args) == 0
+
+
+def test_revisit_is_kept_until_done(tmp_path):
+    from volreg.cli import main, stage_of
+    record = migrate.migrate(session(tmp_path), tmp_path / "out", REVIEWER)
+    final = record.read(rec.FINAL_REVIEW)
+    record.write(rec.FINAL_REVIEW, final | {"decision": {"fit": "f001", "publish": "affine",
+                                                         "reason": "test", "override": None}})
+    who = ["--handle", "j", "--email", "j@x"]
+    main(["revisit", str(tmp_path / "out"), "affine misses the bar", *who])
+    assert "revisit: affine misses the bar" in stage_of(record)
+    main(["revisit", str(tmp_path / "out"), "--done", "1", *who])
+    assert "revisit" not in stage_of(record)
+    assert [event["kind"] for event in record.events()][-2:] == ["revisit", "revisit-done"]

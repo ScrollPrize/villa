@@ -5,6 +5,7 @@
     python -m volreg.cli answer PAIR UNIT ANSWER   a hold-out answer (or "clear")
     python -m volreg.cli more PAIR --holdout N | --fit N
     python -m volreg.cli redo PAIR STAGE
+    python -m volreg.cli revisit PAIR TEXT         an open question for a later round (--done N closes it)
     python -m volreg.cli check RECORD [RECORD ...]
     python -m volreg.cli migrate SESSION OUT [--staged DIR]
 
@@ -50,7 +51,9 @@ def stage_of(record):
     if final.get("decision"):
         decision = final["decision"]
         override = " (override)" if decision.get("override") else ""
-        return f"decided: publish {decision['publish']} of {decision['fit']}{override}"
+        open_items = [item for item in final.get("revisit") or [] if not item.get("done")]
+        revisit = f"; revisit: {open_items[0]['text']}" if open_items else ""
+        return f"decided: publish {decision['publish']} of {decision['fit']}{override}{revisit}"
     return final.get("status") or "waiting: judge the final fit"
 
 
@@ -151,6 +154,10 @@ def main(argv=None):
     more.add_argument("pair")
     more.add_argument("--holdout", type=int, default=0)
     more.add_argument("--fit", type=int, default=0)
+    revisit = commands.add_parser("revisit", help="note an open question for a later round")
+    revisit.add_argument("pair")
+    revisit.add_argument("text", nargs="?")
+    revisit.add_argument("--done", type=int, metavar="N", help="close open question N")
     answer = commands.add_parser("answer", help="answer about a hold-out unit")
     answer.add_argument("pair")
     answer.add_argument("unit")
@@ -159,7 +166,7 @@ def main(argv=None):
     migrate.add_argument("session")
     migrate.add_argument("out")
     migrate.add_argument("--staged")
-    for command in (answer, migrate, more, redo):
+    for command in (answer, migrate, more, redo, revisit):
         command.add_argument("--handle")
         command.add_argument("--email")
     args = parser.parse_args(argv)
@@ -186,6 +193,20 @@ def main(argv=None):
         record.write(pipeline_stages.PARAMS, params)
         record.log("more", holdout=args.holdout, fit=args.fit, by=reviewer(args))
         print(params)
+    elif args.command == "revisit":
+        record = rec.Record(args.pair)
+        final = record.read(rec.FINAL_REVIEW) if record.exists(rec.FINAL_REVIEW) else {}
+        final.pop("schema", None)
+        items = final.setdefault("revisit", [])
+        if args.done is not None:
+            items[args.done - 1]["done"] = {"at": rec.now(), "by": reviewer(args)}
+            record.log("revisit-done", item=args.done, by=reviewer(args))
+        else:
+            items.append({"text": args.text, "at": rec.now(), "by": reviewer(args), "done": None})
+            record.log("revisit", text=args.text, by=reviewer(args))
+        record.write(rec.FINAL_REVIEW, final)
+        for index, item in enumerate(items, 1):
+            print(f"{index}. {'done' if item['done'] else 'open'}: {item['text']}")
     elif args.command == "answer":
         rec.Record(args.pair).answer(args.unit, None if args.answer == "clear" else args.answer,
                                      reviewer(args))
