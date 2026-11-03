@@ -271,6 +271,7 @@ _INPUT_TOGGLE_KEYS = {
     "verified_patches": "input_use_verified_patches",
     "tracks": "input_use_tracks",
     "fibers": "input_use_fibers",
+    "patch_overlaps": "input_use_patch_overlaps",
     "fiber_directions": "input_use_fiber_directions",
     "normals": "input_use_normals",
     "gradient_magnitude": "input_use_gradient_magnitude",

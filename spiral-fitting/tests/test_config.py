@@ -57,7 +57,8 @@ def test_input_participation_toggles_are_rebuild_scoped_booleans():
         "input_use_tracks", "input_use_fibers",
         "input_use_fiber_directions", "input_use_pcl_absolute",
         "input_use_pcl_relative", "input_use_pcl_same_winding",
-        "input_use_pcl_drawn_control_points", "input_use_normals",
+        "input_use_pcl_drawn_control_points", "input_use_patch_overlaps",
+        "input_use_normals",
         "input_use_gradient_magnitude",
         "input_use_winding_inference", "input_use_outer_shell",
     }

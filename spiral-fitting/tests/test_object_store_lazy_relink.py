@@ -196,3 +196,13 @@ def test_a_hub_replica_skips_and_records_a_marker_only_once_published(hub, detec
     assert recorded['position'] == updated.position.sequence and not recorded['exact']
     # A replica's marker is its own; the editor's replica has none.
     assert marker(hub['editor']) is None
+
+
+def test_patch_overlaps_off_skip_their_detector_and_turning_them_on_relinks(shared, detectors):
+    prepared, log = run(shared, fit_config(shared, input_use_patch_overlaps=False))
+    assert 'link refresh patch_overlap: skipped (input_use_patch_overlaps is off)' in prepared.lines
+    _, log = run(shared, fit_config(shared, input_use_patch_overlaps=False))
+    assert plan(log) == 'skip'
+    prepared, log = run(shared)
+    assert plan(log) == 'full'
+    assert any(line.startswith('link refresh patch_overlap: 0 created') for line in prepared.lines)

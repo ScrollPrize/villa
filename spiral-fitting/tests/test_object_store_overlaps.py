@@ -314,3 +314,16 @@ def test_sampling_units_draw_units_then_members():
                                 p=plain['member_probs'][0])
     np.random.seed(2)
     np.testing.assert_array_equal(losses._choose_pcl_indices(plain, 3, cfg), expected)
+
+
+def test_overlaps_off_are_not_materialized(db):
+    _put(db, _plane())
+    _put(db, _plane(10.0))
+    _detect(db)
+    snapshot = osi.read_snapshot(db, osi.InputRequest())
+    used = osi.materialize_from_config(db, snapshot, reference.fit_config())
+    assert used.patch_overlaps
+    off = osi.materialize_from_config(
+        db, snapshot, {**reference.fit_config(), 'input_use_patch_overlaps': False})
+    assert off.patch_overlaps == {}
+    assert off.counts['patch overlaps unused (input_use_patch_overlaps off)'] == 1

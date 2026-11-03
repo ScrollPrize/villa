@@ -118,6 +118,7 @@ _INPUT_TOGGLE_KEYS = frozenset({
     "input_use_pcl_relative",
     "input_use_pcl_same_winding",
     "input_use_pcl_drawn_control_points",
+    "input_use_patch_overlaps",
     "input_use_normals",
     "input_use_gradient_magnitude",
     "input_use_winding_inference",
@@ -527,6 +528,9 @@ class Config:
         self.input_use_pcl_relative = True
         self.input_use_pcl_same_winding = True
         self.input_use_pcl_drawn_control_points = True
+        # Patch-overlap links: refreshed by the store's overlap detector and
+        # materialized as same-surface point pairs. Off skips both.
+        self.input_use_patch_overlaps = True
         self.input_use_normals = True
         self.input_use_gradient_magnitude = True
         self.input_use_winding_inference = True

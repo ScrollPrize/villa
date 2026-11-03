@@ -402,7 +402,9 @@ off select none), validates every selected object's frame, then refreshes the
 PCL-patch, fiber-patch, patch-overlap and track-crossing links as
 `--object-store-author`,
 writing them back to the store. Detectors whose object kinds are not all
-selected are skipped. Every detector failure is reported together and stops
+selected are skipped. `input_use_patch_overlaps: false` skips the
+patch-overlap detector and adds no overlap pairs to the fit (a rebuild
+setting). Every detector failure is reported together and stops
 the fit before training (detectors that already committed are named; a rerun
 reconciles them). `object_store_refresh_links: false` reads the store's
 current relationships read-only.

@@ -153,6 +153,7 @@
     "input_use_fiber_directions": "Load packed fiber-direction samples and allow their orientation loss.",
     "input_use_pcl_absolute": "Read absolute-winding point collections from the object store. The PCL role toggles must agree: roles are read from each collection's metadata, so all three select every PCL or none.",
     "input_use_pcl_relative": "Read relative-winding point collections from the object store. The PCL role toggles must agree: roles are read from each collection's metadata, so all three select every PCL or none.",
+    "input_use_patch_overlaps": "Use patch-overlap links: refresh them with the store's overlap detector and add same-surface point pairs between overlapping patches to the fit. Off skips the detector (its existing links stay in the store, unused). Changing it rebuilds the fit.",
     "input_use_pcl_same_winding": "Read same-winding point collections from the object store. The PCL role toggles must agree: roles are read from each collection's metadata, so all three select every PCL or none.",
     "input_use_pcl_drawn_control_points": "Load drawn-control-point point-collection inputs.",
     "input_use_normals": "Allow dense normal stores, sampling, and normal-dependent losses. With an object store, it also decides whether startup fiber-patch link refresh uses the lasagna normals (before object_store_normal_ct_path).",

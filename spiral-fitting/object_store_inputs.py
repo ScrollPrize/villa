@@ -1391,13 +1391,14 @@ def materialize_tracks(store, snapshot, *, z_begin, z_end):
 
 def materialize(store, snapshot, *, z_begin, z_end, z_margin,
                 erode_cells_default, fiber_min_point_spacing=0.0,
-                overlap_pair_spacing=8.0, overlap_max_pairs=16):
+                overlap_pair_spacing=8.0, overlap_max_pairs=16, patch_overlaps=True):
     """Every runtime input of a frozen snapshot.
 
     Fibers are decimated to ``fiber_min_point_spacing`` (the fitter's
     pcl_fiber_min_point_spacing); patch overlaps yield at most
     ``overlap_max_pairs`` pairs ``overlap_pair_spacing`` voxels apart.
-    Resident ids number PCLs, then fibers, then overlap pairs.
+    Resident ids number PCLs, then fibers, then overlap pairs;
+    ``patch_overlaps`` False (input_use_patch_overlaps off) makes none.
     """
     patches, counts = materialize_patches(
         store, snapshot, z_begin=z_begin, z_end=z_end, z_margin=z_margin,
@@ -1410,16 +1411,21 @@ def materialize(store, snapshot, *, z_begin, z_end, z_margin,
         store, snapshot, patches, min_point_spacing=fiber_min_point_spacing,
         first_id=len(point_collections), dropped=dropped)
     counts.update(fiber_counts)
-    patch_overlaps, overlap_counts = materialize_patch_overlaps(
-        store, snapshot, patches, pair_spacing=overlap_pair_spacing,
-        max_pairs=overlap_max_pairs,
-        first_id=len(point_collections) + len(fibers), dropped=dropped)
-    counts.update(overlap_counts)
+    if patch_overlaps:
+        overlaps, overlap_counts = materialize_patch_overlaps(
+            store, snapshot, patches, pair_spacing=overlap_pair_spacing,
+            max_pairs=overlap_max_pairs,
+            first_id=len(point_collections) + len(fibers), dropped=dropped)
+        counts.update(overlap_counts)
+    else:
+        overlaps = {}
+        counts['patch overlaps unused (input_use_patch_overlaps off)'] = len(
+            snapshot.relationships_of('patch_overlap'))
     tracks, track_counts = materialize_tracks(store, snapshot, z_begin=z_begin, z_end=z_end)
     counts.update(track_counts)
     return FitInputs(snapshot, patches, point_collections, fibers,
                      fiber_links, counts, dropped_attachments=dropped,
-                     patch_overlaps=patch_overlaps,
+                     patch_overlaps=overlaps,
                      outer_shell=materialize_outer_shell(store, snapshot),
                      tracks=tracks)
 
@@ -1432,7 +1438,8 @@ def materialize_from_config(store, snapshot, config):
         erode_cells_default=config['patch_erode_patches'],
         fiber_min_point_spacing=config['pcl_fiber_min_point_spacing'],
         overlap_pair_spacing=config['pcl_patch_overlap_pair_spacing'],
-        overlap_max_pairs=config['pcl_patch_overlap_max_pairs'])
+        overlap_max_pairs=config['pcl_patch_overlap_max_pairs'],
+        patch_overlaps=bool(config['input_use_patch_overlaps']))
 
 
 @dataclasses.dataclass
@@ -1886,6 +1893,8 @@ def refresh_links(store, snapshot, config, normal_source, cache_directory=None, 
         empty = [KIND_LABELS[kind] for kind in kinds if not selected[kind]]
         if empty:
             outcome = RefreshOutcome(detector, skipped='no selected ' + ' or '.join(empty))
+        elif detector == 'patch_overlap' and not config['input_use_patch_overlaps']:
+            outcome = RefreshOutcome(detector, skipped='input_use_patch_overlaps is off')
         elif new is not None and detector not in INCREMENTAL_KINDS:
             outcome = RefreshOutcome(detector, skipped='incremental refresh: its inputs are unchanged')
         elif new is not None and not fresh(detector):
@@ -1939,13 +1948,15 @@ FRAME_RECORD_KINDS = frozenset({'volume_transform', 'volume_transform_choice'})
 
 def link_marker_key(volume_uuid, config, normal_source):
     """What links depend on outside the store: the fit volume, the
-    detector parameters and normal source (link_refresh_provenance) and the
-    store library's detector versions."""
+    detector parameters and normal source (link_refresh_provenance), the
+    store library's detector versions and which detectors run."""
     from vc_object_store import detector_versions
     return content_sha256({
         'volume_uuid': volume_uuid,
         'link_refresh': link_refresh_provenance(config, normal_source),
         'detectors': detector_versions(),
+        # Off leaves the overlap links unrefreshed: turning it on relinks.
+        'patch_overlaps': bool(config['input_use_patch_overlaps']),
     })
 
 
@@ -2440,7 +2451,7 @@ MATERIALIZATION_KEYS = (
     'pcl_fiber_min_point_spacing', 'pcl_patch_overlap_pair_spacing',
     'pcl_patch_overlap_max_pairs', 'pcl_unattached_pcl_min_point_spacing',
     'pcl_use_fiber_links', 'pcl_vertical_fiber_min_z_fraction',
-    'pcl_vertical_fiber_min_auto_certainty', 'fit_volume_level',
+    'pcl_vertical_fiber_min_auto_certainty', 'fit_volume_level', 'input_use_patch_overlaps',
 )
 
 
