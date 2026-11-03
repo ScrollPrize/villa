@@ -234,3 +234,19 @@ def test_a_skip_reports_its_reason_with_the_refresh_lines(shared):
     run(shared)
     prepared, _ = run(shared)
     assert prepared.lines[0].startswith('link refresh: skipped every detector (unchanged since position ')
+
+
+def test_the_store_reads_are_progress_stages(shared):
+    from spiral_progress import ProgressReporter
+    stages = []
+
+    def publish(snapshot):
+        if snapshot is not None and snapshot['stage_name'] not in stages:
+            stages.append(snapshot['stage_name'])
+    progress = ProgressReporter(publish)
+    prepared, _ = run(shared, progress=progress)
+    position = prepared.position.sequence
+    assert stages[0] == 'Reading the selected inputs'
+    assert stages[-1] == f'Reading the inputs at position {position}'
+    assert 'link refresh pcl_patch' in stages
+    assert progress.snapshot() is None  # every stage cleared

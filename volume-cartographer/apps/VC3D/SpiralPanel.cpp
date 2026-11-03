@@ -1903,7 +1903,7 @@ void SpiralPanel::updatePositionSummary()
     }
     const QJsonObject preparing = _lastInputStatus.value(QStringLiteral("input_preparation")).toObject();
     if (!preparing.isEmpty())
-        lines << tr("The service is linking and pinning a position%1…")
+        lines << tr("The service is preparing the fit's inputs (linking, then reading a pinned position%1)…")
                      .arg(preparing.value(QStringLiteral("requested_position")).isNull()
                               ? QString()
                               : tr(" including %1").arg(preparing.value(QStringLiteral("requested_position")).toInteger()));
@@ -2325,8 +2325,13 @@ void SpiralPanel::updateStatus(const QJsonObject& status)
     // Before explicit initialization there is no resident session to adopt.
     // Initialization/rebuild advances session_generation and synchronization
     // adopts the canonical request.
-    const QJsonObject progress =
+    // The session's own progress, else the input preparation's (linking and
+    // reading the store run beside the resident session, which stays Idle).
+    QJsonObject progress =
         status.value(QStringLiteral("progress")).toObject();
+    if (progress.isEmpty())
+        progress = status.value(QStringLiteral("input_preparation")).toObject()
+                       .value(QStringLiteral("progress")).toObject();
     const bool idle = state == QStringLiteral("Idle");
     const QString phase = status.value(QStringLiteral("phase")).toString();
     // An idle session reports "Idle" as both its state and its phase, so the

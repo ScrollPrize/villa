@@ -1006,3 +1006,22 @@ def test_pack_failure_preserves_resident_before_link_refresh(host, store,
     failure = _built(state, body)
     assert 'not an accessible local array' in failure['message']
     assert state.session is resident
+
+
+def test_input_preparation_progress_reports_a_live_elapsed_time(host, store, monkeypatch):
+    clock = [100.0]
+    monkeypatch.setattr(spiral_service, 'time', SimpleNamespace(monotonic=lambda: clock[0]))
+    state = service(host, store)
+    state._input_preparation = {'build_id': 1, 'requested_position': None}
+    progress = state._input_progress()
+    try:
+        progress.begin('preparing_inputs', 'Reading the selected inputs')
+        clock[0] += 42.0  # a store read that publishes nothing meanwhile
+        with state.lock:
+            reported = state._input_preparation_status()['progress']
+        assert reported['stage_name'] == 'Reading the selected inputs'
+        assert reported['elapsed_seconds'] == pytest.approx(42.0, abs=1.0)
+    finally:
+        progress.close()
+    with state.lock:
+        assert state._input_preparation_status()['progress'] is None

@@ -2199,6 +2199,29 @@ def _record_marker(store, result, position, lines):
 
 
 @contextlib.contextmanager
+def reading_stage(progress, stage, detail=None):
+    """A store read as a progress stage of the input preparation:
+    ``progress`` (a spiral_progress.ProgressReporter, or None) shows
+    ``stage`` while the block runs. The reads report no steps; the stage's
+    elapsed time shows they are still running."""
+    if progress is None:
+        yield
+        return
+    progress.begin('preparing_inputs', stage, detail=detail)
+    try:
+        yield
+    finally:
+        progress.clear()
+
+
+def resolve_pinned(store, request, position, progress=None):
+    """resolve_selection at a pinned position, as a progress stage."""
+    with reading_stage(progress, f'Reading the inputs at position {position.sequence}',
+                       'selection'):
+        return resolve_selection(store, dataclasses.replace(request, position=position))
+
+
+@contextlib.contextmanager
 def _console_progress():
     """Detector progress on stderr, for a refresh outside the service."""
     from spiral_progress import ProgressReporter
@@ -2263,8 +2286,9 @@ def _startup_phase(config, request, lasagna, cache_directory, log, minimum_posit
         # The head before the selection is read: a write in between shows
         # in the journal after it and keeps the marker from being recorded.
         head = store.journal_position()
-        uuids = resolve_selection(store, request)
-        snapshot = read_snapshot(store, request, uuids)
+        with reading_stage(progress, 'Reading the selected inputs'):
+            uuids = resolve_selection(store, request)
+            snapshot = read_snapshot(store, request, uuids)
         if not refresh:
             return uuids, ['link refresh: off; reading the store\'s current relationships'], None
         state = LinkState(None, head, lambda after: [
@@ -2301,12 +2325,14 @@ class PreparedPosition:
     lines: list
 
 
-def fit_volume_at(store, request, prepared):
+def fit_volume_at(store, request, prepared, progress=None):
     """The fit volume of a prepared position: the volume ``read_snapshot``
     infers (or checks a configured one against) for the selection pinned
     there, so it is the one the fit will read."""
     pinned = dataclasses.replace(request, position=prepared.position)
-    return read_snapshot(store, pinned, prepared.uuids).volume_uuid
+    with reading_stage(progress, f'Reading the inputs at position {prepared.position.sequence}',
+                       'fit volume'):
+        return read_snapshot(store, pinned, prepared.uuids).volume_uuid
 
 
 def _discard_unpublished(store):
@@ -2392,7 +2418,8 @@ def prepare_position(store, config, request, *, lasagna=None, minimum=None,
         if not refresh:
             position, lines = head, [f'link refresh: off; pinning hub position {head}']
             break
-        snapshot = read_snapshot(store, current)
+        with reading_stage(progress, 'Reading the selected inputs', f'hub position {head}'):
+            snapshot = read_snapshot(store, current)
         state = LinkState(hub, head, lambda after, head=head: store.hub_journal(after, head))
         result = _refresh(store, snapshot, config, lasagna, cache_directory, log, state=state,
                           incremental=incremental, progress=progress)
@@ -2432,7 +2459,7 @@ def prepare_position(store, config, request, *, lasagna=None, minimum=None,
         lines.append(f'position {position} includes hub commits after the requested {minimum}')
     return PreparedPosition(
         position=pinned, head=head, minimum=minimum, attempts=attempt,
-        uuids=resolve_selection(store, dataclasses.replace(request, position=pinned)),
+        uuids=resolve_pinned(store, request, pinned, progress),
         lines=notes + lines)
 
 
@@ -2460,7 +2487,8 @@ def _prepare_shared_position(store, config, request, *, lasagna, minimum, cache_
         if not refresh:
             position, lines = head, [f'link refresh: off; pinning position {head}']
             break
-        snapshot = read_snapshot(store, current)
+        with reading_stage(progress, 'Reading the selected inputs', f'position {head}'):
+            snapshot = read_snapshot(store, current)
         state = LinkState(owner, head, lambda after, head=head: [
             entry for entry in store.journal_since(after) if entry['seq'] <= head])
         result = _refresh(store, snapshot, config, lasagna, cache_directory, log, state=state,
@@ -2489,7 +2517,7 @@ def _prepare_shared_position(store, config, request, *, lasagna, minimum, cache_
         lines.append(f'position {position} includes commits after the requested {minimum}')
     return PreparedPosition(
         position=pinned, head=head, minimum=minimum, attempts=attempt,
-        uuids=resolve_selection(store, dataclasses.replace(request, position=pinned)),
+        uuids=resolve_pinned(store, request, pinned, progress),
         lines=notes + lines)
 
 

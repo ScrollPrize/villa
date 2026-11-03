@@ -1025,7 +1025,7 @@ class ServiceState:
             response["input_manifest_artifact"] = (
                 self._input_manifest[1] if self._input_manifest else None)
             response["input_position"] = copy.deepcopy(self._input_position)
-            response["input_preparation"] = copy.deepcopy(self._input_preparation)
+            response["input_preparation"] = self._input_preparation_status()
             response["input_preparation_error"] = copy.deepcopy(
                 self._input_preparation_error)
             response["input_update"] = copy.deepcopy(self._input_update)
@@ -2012,10 +2012,15 @@ class ServiceState:
         object_store_inputs.prepare_position, which must leave that volume
         the fit volume. Returns ``(prepared, volume, paths, ScrollSpec)``."""
         from vc_object_store import ObjectStore
-        from object_store_inputs import read_snapshot, request_from_config
+        from object_store_inputs import read_snapshot, reading_stage, request_from_config
         config = self._effective_config(paths, run)
-        with ObjectStore.open(self.object_store.path, read_only=True) as store:
-            volume = read_snapshot(store, request_from_config(config)).volume_uuid
+        progress = self._input_progress()
+        try:
+            with ObjectStore.open(self.object_store.path, read_only=True) as store, \
+                    reading_stage(progress, "Reading the selected inputs", "fit volume"):
+                volume = read_snapshot(store, request_from_config(config)).volume_uuid
+        finally:
+            progress.close()
         self._prepare_fiber_directions(scroll, volume, paths, config)
         paths, spec = self._resolve_session_scroll(scroll, volume, paths, config)
         prepared, pinned = self._prepare_position(config, paths, spec, minimum, volume=True)
@@ -2034,8 +2039,22 @@ class ServiceState:
             with self.lock:
                 if self._input_preparation is not None:
                     self._input_preparation["progress"] = snapshot
+                    # A stage without steps (a store read) publishes once:
+                    # its elapsed time is recomputed for every status.
+                    self._input_preparation_progress_started = (
+                        None if snapshot is None
+                        else time.monotonic() - snapshot["elapsed_seconds"])
                     self.status_generation += 1
         return ProgressReporter(publish, stream=sys.stderr)
+
+    def _input_preparation_status(self):
+        """``input_preparation`` for /session/status (call with the lock
+        held), its progress's elapsed time current."""
+        preparation = copy.deepcopy(self._input_preparation)
+        started = getattr(self, "_input_preparation_progress_started", None)
+        if preparation and preparation.get("progress") and started is not None:
+            preparation["progress"]["elapsed_seconds"] = time.monotonic() - started
+        return preparation
 
     def _prepare_position(self, config, paths, scroll, minimum, *, volume=False,
                           incremental=False):
@@ -2068,7 +2087,7 @@ class ServiceState:
                     incremental=incremental, progress=progress)
                 if not volume:
                     return prepared
-                return prepared, fit_volume_at(store, request, prepared)
+                return prepared, fit_volume_at(store, request, prepared, progress)
         finally:
             progress.close()
 
