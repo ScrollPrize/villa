@@ -25,7 +25,7 @@ kbd { font: 11px ui-monospace, monospace; border: 1px solid var(--line); border-
 main { display: grid; grid-template-columns: 1fr minmax(260px, 340px); gap: 10px; padding: 10px; }
 main.single { grid-template-columns: 1fr; }
 @media (max-width: 800px) { main { grid-template-columns: 1fr; } }
-section { background: var(--panel); border: 1px solid var(--line); border-radius: 8px;
+section, .section { background: var(--panel); border: 1px solid var(--line); border-radius: 8px;
           padding: 10px; min-width: 0; }
 h2 { font-size: 12px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted);
      margin: 0 0 6px; font-weight: 600; }

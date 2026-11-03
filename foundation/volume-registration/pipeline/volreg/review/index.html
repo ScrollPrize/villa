@@ -7,9 +7,15 @@
 <link rel="stylesheet" href="/common.css">
 <style>
 .pair { margin-bottom: 12px; }
-.pair-head { display: flex; gap: 10px; align-items: baseline; flex-wrap: wrap; }
+.pair > summary { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; cursor: pointer;
+                  list-style: none; }
+.pair > summary::-webkit-details-marker { display: none; }
+.pair > summary::before { content: "▸"; color: var(--muted); width: 1em; }
+.pair[open] > summary::before { content: "▾"; }
+.pair[open] > summary { margin-bottom: 8px; }
 .pair-head h3 { margin: 0; font-size: 15px; }
-.overview { display: flex; gap: 3px; margin: 8px 0; flex-wrap: wrap; }
+.overview { display: flex; gap: 3px; flex-wrap: wrap; }
+.filter { display: flex; gap: 5px; align-items: center; }
 .chip { width: 16px; height: 16px; border-radius: 4px; border: 1px solid var(--line); }
 .next { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; padding: 8px;
         border: 1px solid var(--line); border-radius: 6px; margin-bottom: 8px; }
@@ -37,7 +43,9 @@ table.steps td { vertical-align: top; padding: 5px 6px; }
 </style>
 </head>
 <body>
-<header><h1>Registration pairs</h1><span id="who" class="muted"></span><span id="error"></span></header>
+<header><h1>Registration pairs</h1><span id="who" class="muted"></span>
+  <label class="filter"><input type="checkbox" id="hide-done"> hide finished pairs <span id="hidden" class="muted"></span></label>
+  <span id="error"></span></header>
 <main class="single"><div id="pairs"></div></main>
 <script src="/common.js"></script>
 <script>
@@ -47,6 +55,24 @@ const STATE_TEXT = {done: "done", stale: "to run again", ready: "ready to run", 
 const ago = at => { if (!at) return ""; const s = (Date.now() - Date.parse(at)) / 1000;
   return s < 90 ? "just now" : s < 5400 ? `${Math.round(s / 60)} min ago` : s < 129600 ? `${Math.round(s / 3600)} h ago` : at.slice(0, 10); };
 let editing = false;      // a settings field has focus: do not redraw under the cursor
+
+// What a viewer chose to see is kept in this browser only: the filter, and which pairs are
+// open. A pair nobody opened or closed is open until it is finished.
+const remembered = (key, fallback) => { try { const v = localStorage.getItem(key); return v === null ? fallback : JSON.parse(v); } catch { return fallback; } };
+const remember = (key, value) => { try { localStorage.setItem(key, JSON.stringify(value)); } catch {} };
+const finished = p => p.stages.every(s => s.state === "done");
+const summary = p => {
+  const running = p.stages.filter(s => s.state === "running").map(s => s.name);
+  const yours = p.stages.filter(s => s.state === "waiting").map(s => s.title);
+  const failed = p.stages.filter(s => s.state === "failed").map(s => s.name);
+  if (finished(p)) return p.decision ? `finished: publish ${p.decision.publish} of ${p.decision.fit}` : "finished";
+  if (failed.length) return `<span class="err">${failed.join(", ")} failed</span>`;
+  if (yours.length) return `<b>your turn: ${yours.join(", ")}</b>`;
+  if (running.length) return `running: ${running.join(", ")}`;
+  return "ready to continue";
+};
+$("hide-done").checked = remembered("hide-done", true);
+$("hide-done").onchange = () => { remember("hide-done", $("hide-done").checked); load(); };
 
 function detail(p, s) {
   const link = `/pairs/${encodeURIComponent(p.name)}/${PAGE[s.name] || ""}`;
@@ -74,14 +100,19 @@ async function load() {
   if (editing) return;
   const state = await call("/api/pairs");
   $("who").textContent = `reviewing as ${state.reviewer.handle}`;
-  $("pairs").innerHTML = state.pairs.map(p => {
+  const shown = $("hide-done").checked ? state.pairs.filter(p => !finished(p)) : state.pairs;
+  const hidden = state.pairs.length - shown.length;
+  $("hidden").textContent = hidden ? `(${hidden} hidden)` : "";
+  $("pairs").innerHTML = shown.map(p => {
     const runnable = p.stages.filter(s => !s.human && (s.state === "ready" || s.state === "stale")).map(s => s.name);
     const running = p.stages.filter(s => s.state === "running").map(s => s.name);
     const yours = p.stages.filter(s => s.state === "waiting");
     const failed = p.stages.filter(s => s.state === "failed");
-    return `<section class="pair" data-name="${escapeHtml(p.name)}">
-      <div class="pair-head"><h3>${escapeHtml(p.name)}</h3><span class="muted">${escapeHtml(p.pair)}</span></div>
-      <div class="overview">${p.stages.map(s => `<div class="chip ${s.state}" title="${s.name}: ${STATE_TEXT[s.state]}"></div>`).join("")}</div>
+    const open = remembered(`open:${p.name}`, !finished(p));
+    return `<details class="pair section" data-name="${escapeHtml(p.name)}" ${open ? "open" : ""}>
+      <summary class="pair-head"><h3>${escapeHtml(p.name)}</h3>
+        <div class="overview">${p.stages.map(s => `<div class="chip ${s.state}" title="${s.name}: ${STATE_TEXT[s.state]}"></div>`).join("")}</div>
+        <span>${summary(p)}</span><span class="muted">${escapeHtml(p.pair)}</span></summary>
       ${(p.revisit || []).map(text => `<div class="revisit"><b>Open question</b> · ${escapeHtml(text)}</div>`).join("")}
       <div class="next">
         <button class="primary" data-act="continue" ${runnable.length ? "" : "disabled"}>Continue</button>
@@ -98,10 +129,11 @@ async function load() {
         <td>${s.human ? "" : `<button data-redo="${s.name}" ${["blocked", "running"].includes(s.state) ? "disabled" : ""}
              title="Mark this step and the ones after it to run again">Redo</button>`}</td>
       </tr>`).join("")}</tbody></table>
-    </section>`;
-  }).join("") || `<p class="muted">No pairs with a pipeline under this folder.</p>`;
+    </details>`;
+  }).join("") || `<p class="muted">${hidden ? "Every pair is finished." : "No pairs with a pipeline under this folder."}</p>`;
 
   for (const box of document.querySelectorAll(".pair")) {
+    box.ontoggle = () => remember(`open:${box.dataset.name}`, box.open);
     const api = `/api/pairs/${encodeURIComponent(box.dataset.name)}`;
     const act = async (path, body) => {
       try { await call(`${api}/${path}`, body); $("error").textContent = ""; }
