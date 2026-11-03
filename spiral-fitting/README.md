@@ -535,14 +535,14 @@ channels' `scaledown`) beside them. The command-line fit derives `lasagna_scale`
 frame (see "Input manifest").
 
 The command-line fit builds a missing pool from the arrays (reporting chunk
-progress; in DDP only rank 0 builds). By default a service requires prepared
-packs in its cache. VC3D automatically passes `--build-missing-lasagna-packs`
-when launching its owned local service. An independently launched service can
-opt in with the same flag:
+progress; in DDP only rank 0 builds). So does a service, by default. A
+shared host whose cache is curated (for example packs built with `--ct`
+masking, which a service's build does not apply) can refuse to build them
+instead, requiring prepared packs:
 
 ```sh
 python spiral_service.py --object-store /path/to/store --output /path/to/output \
-    --cache ~/.cache/vc3d/spiral --build-missing-lasagna-packs
+    --cache ~/.cache/vc3d/spiral --require-prepared-lasagna-packs
 ```
 
 The project supplies the dataset identity, array paths and scale. Missing packs
@@ -561,7 +561,8 @@ service's cache lacks into those directories (logging its progress), so the
 service packs them like local arrays; once packed, the cached arrays are no
 longer read.
 
-For a remote service, or one without this flag, pack where the arrays are and
+For a service launched with `--require-prepared-lasagna-packs`, or one on
+another host than VC3D's whose arrays are remote, pack where the arrays are and
 copy the packs over:
 
 ```sh
@@ -741,9 +742,9 @@ authenticated HTTP protocol:
 - **Localhost** — VC3D launches and owns the service on loopback. Nothing to
   set up beyond the Python environment; the optional output, cache and
   winding-inference paths are chosen in the connection panel and VC3D
-  launches the service bound to the project's store with those values and
-  `--build-missing-lasagna-packs`: local Lasagna arrays, and remote ones VC3D
-  first caches in full, are packed automatically on first use. Changing a
+  launches the service bound to the project's store with those values: local
+  Lasagna arrays, and remote ones VC3D first caches in full, are packed
+  automatically on first use. Changing a
   binding restarts the owned service.
   Automatic service startup waits until you first open the Spiral workspace.
   If no project is open then, it waits for the project's store. Disconnect
@@ -1654,9 +1655,10 @@ A service reads no `fiber_directions.npz` path: it reads the samples of the
 project's selected fiber-inference dataset, by that dataset's identity (see
 "Lasagna inputs must be packed first") and the fit volume's scale, from its
 cache: `<cache>/fiber-directions/<identity>/scale<output scale>.npz`. A service
-launched with `--build-missing-lasagna-packs` (as VC3D's owned local service
-is) extracts missing ones there itself during input preparation, over the
-prediction's whole height, logging its progress. For any other service,
+extracts missing ones there itself during input preparation, over the
+prediction's whole height, logging its progress (from the remote manifest a
+VC3D copy of an open-data dataset came from, when VC3D names one). For a
+service launched with `--require-prepared-lasagna-packs`,
 extract them over the whole height (no `--z-roi`), or place an existing
 artifact there, and copy the file to the service's cache:
 

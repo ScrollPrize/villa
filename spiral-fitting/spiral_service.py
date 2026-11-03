@@ -2092,10 +2092,10 @@ class ServiceState:
             progress.close()
 
     def _prepare_fiber_directions(self, scroll, volume, paths, config):
-        """Opted-in hosts extract the fiber directions a fit with the
-        fiber-direction loss reads, when the cache lacks them, from the
-        project's fiber-inference dataset (whose own problems the scroll's
-        resolution reports)."""
+        """Unless it requires prepared inputs, a host extracts the fiber
+        directions a fit with the fiber-direction loss reads, when the cache
+        lacks them, from the project's fiber-inference dataset (whose own
+        problems the scroll's resolution reports)."""
         if not self.build_missing_lasagna_packs or not fiber_directions_required(config):
             return
         try:
@@ -2131,7 +2131,8 @@ class ServiceState:
             self._effective_config(paths, run), load_lasagna_source(paths.lasagna)))}
 
     def _prepare_lasagna_packs(self, paths, config):
-        """Opted-in hosts build missing pools from local arrays before linking."""
+        """Unless it requires prepared packs, a host builds missing pools
+        from local arrays before linking."""
         if not self.build_missing_lasagna_packs or not paths.lasagna:
             return
         from lasagna_source import is_remote_location
@@ -4099,11 +4100,16 @@ def main(argv=None):
     parser.add_argument("--object-store-author", default=None, metavar="NAME",
                         help="Author of the links this service's refresh "
                              "writes (default: spiral-service@<host>)")
+    parser.add_argument("--require-prepared-lasagna-packs", action="store_true",
+                        help="Require Lasagna packs and fiber directions prepared in "
+                             "--cache (for a shared host whose cache is curated). By "
+                             "default missing packs are built from accessible local "
+                             "arrays, and missing fiber directions extracted from the "
+                             "project's fiber-inference dataset, during input "
+                             "preparation")
+    # The former opt-in, now the default; older VC3D builds still pass it.
     parser.add_argument("--build-missing-lasagna-packs", action="store_true",
-                        help="Build missing Lasagna packs from accessible local arrays, "
-                             "and extract missing fiber directions from the project's "
-                             "fiber-inference dataset, during input preparation "
-                             "(default: require both prepared in --cache)")
+                        help=argparse.SUPPRESS)
     parser.add_argument("--cache", default=None,
                         help="Directory for derived host caches: prepared "
                              "Lasagna packs and fiber directions (default: "
@@ -4227,7 +4233,7 @@ def main(argv=None):
                          events=events,
                          gpu_ids=args.gpus,
                          object_store=object_store,
-                         build_missing_lasagna_packs=args.build_missing_lasagna_packs,
+                         build_missing_lasagna_packs=not args.require_prepared_lasagna_packs,
                          startup_run={"z_begin": args.z_begin,
                                       "z_end": args.z_end,
                                       "config": startup_config})

@@ -642,6 +642,26 @@ def test_local_service_packs_before_linking_and_reuses_cache(host, store_path, t
     assert meta.stat().st_mtime_ns == before
 
 
+@pytest.mark.parametrize('flags, builds', [([], True), (['--build-missing-lasagna-packs'], True),
+                                            (['--require-prepared-lasagna-packs'], False)])
+def test_a_launched_service_builds_missing_packs_unless_told_not_to(
+        tmp_path, store_path, monkeypatch, flags, builds):
+    class Constructed(Exception):
+        pass
+
+    def construct(**kwargs):
+        raise Constructed(kwargs['build_missing_lasagna_packs'])
+    monkeypatch.setattr(spiral_service, 'ServiceState', construct)
+    import sys
+    monkeypatch.setattr(sys, 'stdout', sys.stdout)
+    monkeypatch.setattr(sys, 'stderr', sys.stderr)
+    with pytest.raises(Constructed) as constructed:
+        spiral_service.main(['--object-store', str(store_path), '--output', str(tmp_path / 'out'),
+                             '--cache', str(tmp_path / 'cache'),
+                             '--api-key-file', str(tmp_path / 'key'), *flags])
+    assert constructed.value.args == (builds,)
+
+
 @pytest.mark.parametrize('location', ['https://example.invalid/array', '/missing/array'])
 def test_pack_failure_preserves_resident_before_link_refresh(host, store_path,
                                                             monkeypatch, location):

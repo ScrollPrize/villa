@@ -91,7 +91,7 @@ def ensure_fit_sparse_stores(
     progress=None,
 ):
     """Build the resident pools one fit needs from the dataset's arrays when
-    they are absent (the command-line fit or an opted-in local service)."""
+    they are absent (the command-line fit, or a service that builds them)."""
     for kind in _fit_packs(use_normals, use_spacing):
         label, stage_name = _PACKS[kind]
         _ensure_sidecar(
