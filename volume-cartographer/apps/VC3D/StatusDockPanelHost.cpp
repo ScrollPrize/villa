@@ -1,5 +1,7 @@
 #include "StatusDockPanelHost.hpp"
 
+#include "FlowLayout.hpp"
+
 #include "VCSettings.hpp"
 
 #include <QApplication>
@@ -90,10 +92,10 @@ StatusDockPanelHost::StatusDockPanelHost(QWidget* centralWidget, QWidget* parent
     _barFrame = new QFrame(this);
     _barFrame->setObjectName(QStringLiteral("statusDockBar"));
     _barFrame->setFrameShape(QFrame::NoFrame);
-    _barLayout = new QHBoxLayout(_barFrame);
+    // Wrap the panel buttons onto extra rows instead of squeezing them: with
+    // a dozen panels the labels used to be clipped on 13-15" screens.
+    _barLayout = new FlowLayout(_barFrame, 4, 3);
     _barLayout->setContentsMargins(4, 3, 4, 3);
-    _barLayout->setSpacing(4);
-    _barLayout->addStretch(1);
     _layout->addWidget(_barFrame, 0);
 
     setStyleSheet(QStringLiteral(
@@ -222,7 +224,7 @@ void StatusDockPanelHost::addDock(QDockWidget* dock)
     item.pinButton = pin;
     _items.push_back(item);
     _stack->addWidget(page);
-    _barLayout->insertWidget(std::max(0, _barLayout->count() - 1), button);
+    _barLayout->insertWidget(_barLayout->count(), button);
     button->setVisible(item.visibleInBar);
 
     if (QAction* action = dock->toggleViewAction()) {
@@ -877,7 +879,7 @@ void StatusDockPanelHost::rebuildBarLayout()
     }
     for (const Item& item : _items) {
         if (item.button) {
-            _barLayout->insertWidget(std::max(0, _barLayout->count() - 1), item.button);
+            _barLayout->insertWidget(_barLayout->count(), item.button);
         }
     }
 }

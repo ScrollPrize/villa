@@ -62,6 +62,8 @@ set(srcs
     fibers3d/Fiber3DSurfaceControls.cpp
     LineAnnotationPolylineIndices.hpp
     CWindowContextMenu.cpp
+    FlowLayout.cpp
+    FlowLayout.hpp
     StatusDockPanelHost.cpp
     StatusDockPanelHost.hpp
     FileWatcherService.cpp
