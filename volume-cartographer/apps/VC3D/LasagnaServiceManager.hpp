@@ -10,8 +10,11 @@
 #include <QString>
 #include <QStringList>
 #include <QTimer>
+#include <vc_object_store/objects/ObjectStoreSession.hpp>
+#include <filesystem>
 #include <functional>
 #include <memory>
+#include <optional>
 
 class QNetworkAccessManager;
 class QNetworkReply;
@@ -20,8 +23,15 @@ class QNetworkReply;
  * Manages the lifecycle of the Python lasagna HTTP service.
  *
  * Supports two modes:
- *   - Internal: launches lasagna_service.py as a subprocess
- *   - External: connects to a pre-started service on a known host:port
+ *   - Internal: launches fit_service.py as a subprocess on the attached
+ *     object store's file (--store --shared-store; this process's session
+ *     syncs it)
+ *   - External: connects to a pre-started service on a known host:port; it
+ *     must work on the same store (a replica of the same hub)
+ *
+ * Jobs read stored surfaces by UUID and create their results as new surfaces
+ * in the store (results attached to them, the model checkpoint in their
+ * artifact directory); nothing travels as files.
  *
  * The service is kept alive so repeated optimizations avoid
  * Python/torch startup overhead.
@@ -31,6 +41,9 @@ class LasagnaServiceManager : public QObject
     Q_OBJECT
 
 public:
+    // Roles of the result documents a fit attaches to its surfaces.
+    static constexpr const char* kCorrResultsRole = "lasagna_corr_points_results";
+
     static LasagnaServiceManager& instance();
     /**
      * Create an isolated manager for a short-lived, locally owned service.
@@ -60,6 +73,12 @@ public:
     /** Stop the service process (internal) or disconnect (external). */
     void stopService();
 
+    /** The store jobs read and write (the surface catalog's attachment). */
+    void setObjectStore(std::shared_ptr<vc::objects::ObjectStoreSession> session,
+                        std::optional<vc::objects::AttachmentIdentity> attachment);
+    /** The model checkpoint a fit left with a stored surface, if any. */
+    std::optional<std::filesystem::path> surfaceModel(const std::string& surfaceUuid) const;
+
     [[nodiscard]] bool isRunning() const;
     [[nodiscard]] QString lastError() const { return _lastError; }
     [[nodiscard]] int port() const { return _port; }
@@ -67,17 +86,11 @@ public:
     [[nodiscard]] bool isExternal() const { return _isExternal; }
 
     /**
-     * Submit an optimization job.
-     * @param config  JSON body for POST /optimize.
-     * @param localOutputDir  Where to unpack results after completion.
+     * Submit an optimization job on the attached store.
+     * @param config  JSON body for POST /jobs (surface refs, volume_uuid);
+     *                the store's UUID is added here.
      */
-    void startOptimization(const QJsonObject& config,
-                           const QString& localOutputDir = QString());
-    void submitOptimization(const QJsonObject& config,
-                            const QString& localOutputDir = QString())
-    {
-        startOptimization(config, localOutputDir);
-    }
+    void startOptimization(const QJsonObject& config);
 
     /** Request cancellation of the running optimization. */
     void stopOptimization();
@@ -101,21 +114,8 @@ public:
     /** Locate a config beside the Lasagna service checkout. */
     static QString findConfigFile(const QString& fileName);
 
-    /** Describe a local tifxyz directory for the existing artifact-upload path. */
-    static QJsonObject makeTifxyzArtifactUpload(const QString& tifxyzDirectory);
-
     /** Fetch available datasets from the connected service (GET /datasets). */
     void fetchDatasets();
-
-    /**
-     * Queue Laplace snap-ranking jobs through the fit service.
-     * Completion callbacks are invoked on the Qt event thread.
-     */
-    void rankLaplaceSnapPairs(
-        const QJsonObject& request,
-        std::function<void(const QJsonObject&)> onSuccess,
-        std::function<void(const QString&)> onError,
-        std::function<void(int, const QJsonObject&)> onPartialResult = {});
 
 signals:
     void serviceStarted();
@@ -127,14 +127,12 @@ signals:
     void optimizationProgress(const QString& stage, int step, int totalSteps, double loss,
                               double stageProgress, double overallProgress,
                               const QString& stageName);
-    void artifactUploadProgress(const QString& jobId, int current, int total, double progress,
-                                const QString& label);
-    void optimizationFinished(const QString& outputDir);
-    void resultsPlaced(const QString& outputDir, const QStringList& segmentNames);
+    // The surfaces a job created (UUIDs in the attached store).
+    void optimizationFinished(const QStringList& surfaceUuids);
     void optimizationError(const QString& message);
     void jobsUpdated(const QJsonArray& jobs);
     void jobStarted(const QString& jobId);
-    void jobFinished(const QString& jobId, const QString& outputDir);
+    void jobFinished(const QString& jobId, const QStringList& surfaceUuids);
     void jobError(const QString& jobId, const QString& message);
 
     void visExportFinished(const QString& outputDir);
@@ -163,29 +161,15 @@ private:
     void pollStatus();
     void handleStatusReply(QNetworkReply* reply);
     void handleJobsReply(QNetworkReply* reply);
-    void handleOptimizeReply(QNetworkReply* reply, const QString& localUploadJobId = QString());
+    void handleOptimizeReply(QNetworkReply* reply);
     bool validateApiVersion(QNetworkReply* reply, const QString& context);
-    void postOptimizationRequest(const QJsonObject& requestConfig,
-                                 const QString& localOutputDir,
-                                 const QString& localUploadJobId = QString());
-    void enqueueArtifactUpload(const QJsonObject& requestConfig,
-                               const QJsonArray& objects,
-                               const QString& localOutputDir,
-                               const QString& source);
-    void processNextArtifactUpload();
-    void finishActiveArtifactUpload();
-    bool cancelLocalUploadJob(const QString& jobId);
-    void clearLocalUploadJobs();
-    void upsertLocalUploadJob(const QJsonObject& job);
-    void updateLocalUploadJob(const QString& jobId, const QJsonObject& updates);
-    void removeLocalUploadJob(const QString& jobId);
+    void postOptimizationRequest(const QJsonObject& requestConfig);
+    /** Run `then` once the store's hub has this replica's edits (an external
+     *  service reads the hub); right away for the internal service. */
+    void afterStoreSync(std::function<void()> then);
+    QString storeError() const;
     void updateCachedJobFromStatus(const QJsonObject& status);
-    QJsonArray jobsWithLocalUploads(const QJsonArray& serviceJobs) const;
-    void emitJobsUpdatedOverlay();
 
-    /** Download results archive from service and unpack locally. */
-    void downloadResults(const QString& jobId = QString(),
-                         const QString& outputDir = QString());
     QString localSourceName() const;
 
     std::unique_ptr<QProcess> _process;
@@ -196,40 +180,26 @@ private:
     void* _processJob{nullptr};
 #endif
 
-    struct ArtifactUploadJob
-    {
-        QString jobId;
-        QJsonObject requestConfig;
-        QJsonArray objects;
-        QString localOutputDir;
-        QString source;
-    };
-
     QString _host{"127.0.0.1"};
     int _port{0};
     bool _isExternal{false};
     QString _lastError;
     QString _dataDirectory;
+    // Not owned: the session belongs to the window's state and must not outlive
+    // it (this manager is a process-lifetime singleton).
+    std::weak_ptr<vc::objects::ObjectStoreSession> _storeSession;
+    std::optional<vc::objects::AttachmentIdentity> _storeAttachment;
+    QString _storePath;         // the attached store's file
+    QString _serviceStorePath;  // the file the internal service was started on
+    QString _serviceStoreUuid;  // the store the connected service writes to
     bool _serviceReady{false};
     bool _optimizationRunning{false};
-    QString _localOutputDir;  // where to unpack optimization results
     QString _visOutputDir;    // where to unpack vis export results
     QString _activeJobId;
     QSet<QString> _submittedJobIds;
     QSet<QString> _startedJobIds;
     QSet<QString> _completedJobIds;
-    QHash<QString, QString> _jobOutputDirs;
-    QHash<QString, QString> _jobOutputNames;
     QJsonArray _lastJobs;
-    QList<ArtifactUploadJob> _artifactUploadQueue;
-    ArtifactUploadJob _activeArtifactUpload;
-    bool _hasActiveArtifactUpload{false};
-    QNetworkReply* _activeArtifactReply{nullptr};
-    QString _activeArtifactReplyJobId;
-    QSet<QString> _cancelledLocalUploadJobs;
-    QHash<QString, QJsonObject> _localUploadJobs;
-    QStringList _localUploadOrder;
-    quint64 _nextLocalUploadId{1};
     qint64 _lastQueueGeneration{-1};
     qint64 _fetchedQueueGeneration{-1};
     quint64 _requestGeneration{0};

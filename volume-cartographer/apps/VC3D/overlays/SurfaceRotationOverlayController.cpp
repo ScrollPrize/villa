@@ -7,7 +7,6 @@
 #include "../volume_viewers/VolumeViewerBase.hpp"
 
 #include "vc/core/util/QuadSurface.hpp"
-#include "vc/core/types/VolumePkg.hpp"
 
 #include <QApplication>
 #include <QCheckBox>
@@ -44,44 +43,18 @@ struct RotationSaveResult {
     QString error;
 };
 
-bool hasFileMetadata(const std::shared_ptr<QuadSurface>& surface)
-{
-    return surface && !surface->path.empty() && !surface->id.empty();
-}
-
 vc3d::surface_rotation::TransformPersistenceCompatibility surfaceTransformPersistenceCompatibility(
     const std::shared_ptr<QuadSurface>& surface)
 {
     if (!surface) {
         return {};
     }
-
-    const bool hasComponents =
-        surface->meta.contains("components") && surface->meta["components"].is_array() && surface->meta["components"].size() > 0;
-    return vc3d::surface_rotation::transformPersistenceCompatibility(surface->path, hasComponents);
+    return {surface->meta.contains("components") && surface->meta["components"].is_array() &&
+            surface->meta["components"].size() > 0};
 }
 
-QString transformPersistenceUnavailableTooltip(const vc3d::surface_rotation::TransformPersistenceCompatibility& compatibility)
+QString transformPersistenceUnavailableTooltip(const vc3d::surface_rotation::TransformPersistenceCompatibility&)
 {
-    if (compatibility.isImmutableCatalogSegment) {
-        return QObject::tr(
-            "Apply is unavailable for immutable Open Data catalog segments. "
-            "Create an editable copy first.");
-    }
-    if (compatibility.maskInspectionFailed) {
-        return QObject::tr(
-            "Apply is unavailable because a mask TIFF could not be inspected safely.");
-    }
-    if (compatibility.hasMultipageMask && compatibility.hasDisconnectedComponents) {
-        return QObject::tr(
-            "Apply is unavailable because multipage masks and disconnected component "
-            "ranges cannot yet be transformed safely.");
-    }
-    if (compatibility.hasMultipageMask) {
-        return QObject::tr(
-            "Apply is unavailable because multipage mask TIFFs cannot yet be transformed "
-            "safely.");
-    }
     return QObject::tr(
         "Apply is unavailable because disconnected component ranges cannot yet be "
         "transformed safely.");
@@ -352,8 +325,7 @@ void SurfaceRotationOverlayController::cancelRotate()
 {
     // Restore the un-previewed source surface — but only if no save
     // worker is currently mutating it. Publishing _sourceSurface
-    // while applyRotation()'s background transform / saveOverwrite()
-    // is running would point surfaceChanged consumers at a cv::Mat
+    // while applyRotation()'s background transform is running would point surfaceChanged consumers at a cv::Mat
     // the worker is concurrently writing, racing on _points and the
     // ancillary channels. Whatever was previously active (typically
     // the last _previewSurface from a dial drag) stays in place; the
@@ -362,7 +334,7 @@ void SurfaceRotationOverlayController::cancelRotate()
     // cancelled-session's transformed output either. A user who
     // wants the on-disk transformed state can reopen the segment.
     if (_rotateActive && _state && _sourceSurface && !_saveInFlight) {
-        _state->setSurface("segmentation", _sourceSurface, false, true);
+        showActive(_sourceSurface);
     }
     _rotateActive = false;
     _angleDeg = 0.0;
@@ -374,8 +346,8 @@ void SurfaceRotationOverlayController::cancelRotate()
     // mismatched session id and drop its state changes. We do NOT
     // clear _saveInFlight here: the worker is still running and a
     // new Apply on a freshly begun session must wait for it to
-    // finish, otherwise two workers could race rotate()/saveOverwrite()
-    // on the same QuadSurface (the new session may target the very
+    // finish, otherwise two workers could race the transform on the
+    // same QuadSurface (the new session may target the very
     // same segment). The finished slot clears _saveInFlight whether
     // it applies or drops the result.
     ++_saveSessionId;
@@ -454,25 +426,8 @@ std::shared_ptr<QuadSurface> SurfaceRotationOverlayController::currentSourceSurf
         return nullptr;
     }
 
-    const std::string activeId = _state->activeSurfaceId();
-    if (!activeId.empty()) {
-        if (auto vpkg = _state->vpkg()) {
-            if (auto selected = vpkg->getSurface(activeId); hasFileMetadata(selected)) {
-                return selected;
-            }
-        }
-    }
-
-    auto segmentation = std::dynamic_pointer_cast<QuadSurface>(_state->surface("segmentation"));
-    if (hasFileMetadata(segmentation)) {
-        return segmentation;
-    }
-
-    auto active = _state->activeSurface().lock();
-    if (hasFileMetadata(active)) {
-        return active;
-    }
-    return nullptr;
+    // The surface opened from the store (the editing preview shares its id).
+    return _state->activeSurface().lock();
 }
 
 void SurfaceRotationOverlayController::ensureWidgetForTarget()
@@ -590,7 +545,7 @@ void SurfaceRotationOverlayController::updatePreview()
         return;
     }
     // While a save worker is running, _sourceSurface is being mutated
-    // (rotate + saveOverwrite) on the worker thread. Cloning it here on
+    // (the transform) on the worker thread. Cloning it here on
     // the UI thread would race the worker's writes — read while another
     // thread mutates the same cv::Mat data. Skip the preview update; the
     // worker will tear the controller down via its finished slot anyway.
@@ -602,7 +557,7 @@ void SurfaceRotationOverlayController::updatePreview()
     const vc3d::surface_rotation::Transform transform{static_cast<float>(_angleDeg), _horizontalFlip};
     if (transform.isNoOp()) {
         _previewSurface.reset();
-        _state->setSurface("segmentation", _sourceSurface, false, true);
+        showActive(_sourceSurface);
         return;
     }
 
@@ -611,7 +566,13 @@ void SurfaceRotationOverlayController::updatePreview()
         return;
     }
     transform.applyInMemory(*_previewSurface);
-    _state->setSurface("segmentation", _previewSurface, false, true);
+    showActive(_previewSurface);
+}
+
+void SurfaceRotationOverlayController::showActive(const std::shared_ptr<QuadSurface>& surface)
+{
+    // CState drafts the shown surface, so store queries see the preview's grid.
+    _state->setSurface("segmentation", surface, false, true);
 }
 
 void SurfaceRotationOverlayController::applyRotation()
@@ -622,8 +583,8 @@ void SurfaceRotationOverlayController::applyRotation()
     }
 
     // Reentrancy guard: another save is already running for this
-    // surface. A second rotate()/saveOverwrite() racing the first
-    // would mutate _points and the on-disk files concurrently.
+    // surface. A second transform racing the first would mutate
+    // _points concurrently.
     // Just ignore the duplicate Apply.
     if (_saveInFlight) {
         return;
@@ -642,31 +603,13 @@ void SurfaceRotationOverlayController::applyRotation()
 
     // No transform: no I/O, nothing to do off-thread.
     if (transform.isNoOp()) {
-        _state->setSurface("segmentation", _sourceSurface, false, true);
+        showActive(_sourceSurface);
         _rotateActive = false;
         _angleDeg = 0.0;
         _horizontalFlip = false;
         _previewSurface.reset();
         _sourceSurface.reset();
         clearWidgets();
-        return;
-    }
-
-    if (!hasFileMetadata(_sourceSurface)) {
-        QMessageBox::warning(nullptr, tr("Surface Transform Failed"), tr("Failed to save the transformed surface: the selected surface is missing file metadata."));
-        return;
-    }
-
-    // The menu materializes catalog segments before preview. Keep this final
-    // check here as well so another caller or a stale source can never write
-    // into the immutable Open Data cache.
-    if (surfaceTransformPersistenceCompatibility(_sourceSurface)
-            .isImmutableCatalogSegment) {
-        QMessageBox::warning(
-            nullptr,
-            tr("Open Data Segment"),
-            tr("This catalog segment is immutable. Create an editable copy "
-               "before applying the transform."));
         return;
     }
 
@@ -718,7 +661,7 @@ void SurfaceRotationOverlayController::applyRotation()
 
                 if (!result.error.isEmpty() || !result.surface) {
                     if (self->_sourceSurface) {
-                        self->_state->setSurface("segmentation", self->_sourceSurface, false, true);
+                        self->showActive(self->_sourceSurface);
                     }
                     self->clearWidgets();
                     self->_rotateActive = false;
@@ -733,10 +676,15 @@ void SurfaceRotationOverlayController::applyRotation()
                     return;
                 }
 
-                if (self->_viewerManager) {
-                    self->_viewerManager->refreshSurfacePatchIndex(result.surface);
+                if (!self->_saver || !self->_saver(result.surface.get())) {
+                    if (self->_sourceSurface) {
+                        self->showActive(self->_sourceSurface);
+                    }
+                    QMessageBox::warning(nullptr, tr("Surface Transform Failed"),
+                                         tr("Failed to save the transformed surface to the object store."));
+                    return;
                 }
-                self->_state->setSurface("segmentation", result.surface, false, true);
+                self->showActive(result.surface);
 
                 self->_rotateActive = false;
                 self->_angleDeg = 0.0;
@@ -747,12 +695,9 @@ void SurfaceRotationOverlayController::applyRotation()
             });
 
     auto future = QtConcurrent::run([surface, transform]() -> RotationSaveResult {
-        // applyInMemory() keeps rotation in memory and temporarily hides the
-        // backing path while flipping. saveOverwrite() remains the one
-        // persistence step and can snapshot the pre-transform files first.
+        // The transform runs here; publishing happens on the UI thread.
         try {
             transform.applyInMemory(*surface);
-            surface->saveOverwrite();
         } catch (const std::exception& e) {
             return RotationSaveResult{nullptr, QString::fromUtf8(e.what())};
         } catch (...) {
@@ -776,7 +721,6 @@ std::shared_ptr<QuadSurface> SurfaceRotationOverlayController::cloneSurface(cons
             clone->setChannel(name, channel.clone());
         }
     }
-    clone->path = surface->path;
     clone->id = surface->id;
     clone->meta = surface->meta;
     return clone;

@@ -8,11 +8,9 @@ import http.server
 import json
 import math
 import multiprocessing
-import os
 from pathlib import Path
 import pickle
 import sqlite3
-import sys
 import tempfile
 import threading
 import time
@@ -24,10 +22,8 @@ import numpy as np
 from PIL import Image
 import tifffile
 
-if os.environ.get('VC_READER_BUILD_DIR'):
-    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'benchmarks'))
-    from extension_build import load_extensions
-    load_extensions(Path(os.environ['VC_READER_BUILD_DIR']))
+from build_support import load_build
+load_build()
 
 from vc_reader import (Affine, Companion, Encoding, Frame, LevelRequest, Plane, QueryContext,
                        Selection, Source, Storage, VolumeRegistration, CacheMissError)

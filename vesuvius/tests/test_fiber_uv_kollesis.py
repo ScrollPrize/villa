@@ -4,6 +4,10 @@ from vesuvius.neural_tracing.fiber_trace_3d.fiber_uv_kollesis import (
     Maps, conditional_abs, conditional_discrepancy, length_maps, ratio, edge_maps, write_plots)
 
 
+def fid(k):
+    return f'00000000-0000-4000-8000-{k:012d}'
+
+
 def test_cumulative_expectation_matches_bruteforce():
     rng = np.random.default_rng(42)
     x = rng.normal(size=(13, 9)); w = rng.uniform(size=x.shape); w /= w.sum(1)[:, None]
@@ -44,7 +48,7 @@ def test_actual_edge_deposition_matches_all_pairs():
     p = np.array([[.5, .3, .2], [.2, .7, .1], [.4, .3, .3]])
     d = dict(i=np.array([0, 1]), j=np.array([1, 2]), family=np.array([0, 0, 1]),
         ds_a=np.array([150., -50.]), ds_b=np.array([-100., 50.]), phase_delta=np.array([.2, -.1]),
-        distance=np.array([.4, .7]), parallel=np.array([True, False]), source_id=np.array([10, 11, 12]))
+        distance=np.array([.4, .7]), parallel=np.array([True, False]), source_id=np.array([fid(10), fid(11), fid(12)]))
     geom = np.array([[12., 2., 1.], [25., 5., 1.]])
     maps = Maps((0., 0., 4000., 2000.), 1000.)
     edge_maps(maps, d, u, v, p, widths, boundaries, geom, {'event_batch': 1, 'event_workers': 2})

@@ -45,72 +45,6 @@
            </property>
           </widget>
          </item>
-         <item row="9" column="0" colspan="2">
-          <widget class="QCheckBox" name="chkShowDirectionHints">
-           <property name="text">
-            <string>Show direction hints (flip_x arrows)</string>
-           </property>
-           <property name="checked">
-            <bool>true</bool>
-           </property>
-          </widget>
-         </item>
-         <item row="10" column="0">
-          <widget class="QLabel" name="labelDirectionStep">
-           <property name="text">
-            <string>Direction step size (default)</string>
-           </property>
-          </widget>
-         </item>
-         <item row="10" column="1">
-          <widget class="QDoubleSpinBox" name="spinDirectionStep">
-           <property name="decimals">
-            <number>2</number>
-           </property>
-           <property name="minimum">
-            <double>0.010000000000000</double>
-           </property>
-           <property name="maximum">
-            <double>10000.000000000000000</double>
-           </property>
-           <property name="singleStep">
-            <double>1.000000000000000</double>
-           </property>
-           <property name="value">
-            <double>10.000000000000000</double>
-           </property>
-          </widget>
-         </item>
-         <item row="11" column="0" colspan="2">
-          <widget class="QCheckBox" name="chkUseSegStepForHints">
-           <property name="text">
-            <string>Use segmentation step for hints</string>
-           </property>
-           <property name="checked">
-            <bool>true</bool>
-           </property>
-          </widget>
-         </item>
-         <item row="12" column="0">
-          <widget class="QLabel" name="labelDirectionStepPoints">
-           <property name="text">
-            <string>Step points per direction</string>
-           </property>
-          </widget>
-         </item>
-         <item row="12" column="1">
-          <widget class="QSpinBox" name="spinDirectionStepPoints">
-           <property name="minimum">
-            <number>0</number>
-           </property>
-           <property name="maximum">
-            <number>100</number>
-           </property>
-           <property name="value">
-            <number>5</number>
-           </property>
-          </widget>
-         </item>
          </layout>
         </widget>
        </item>
@@ -747,32 +681,6 @@
             </property>
            </widget>
           </item>
-          <item row="7" column="0">
-           <widget class="QLabel" name="labelSegmentBackupCount">
-            <property name="text">
-             <string>Segment backups to keep</string>
-            </property>
-            <property name="toolTip">
-             <string>Number of rotating snapshots kept per segment in a backups/ folder beside the volpkg file. 0 disables backups. Snapshots are throttled to at most one every 2 minutes per segment.</string>
-            </property>
-           </widget>
-          </item>
-          <item row="7" column="1">
-           <widget class="QSpinBox" name="spinSegmentBackupCount">
-            <property name="minimum">
-             <number>0</number>
-            </property>
-            <property name="maximum">
-             <number>100</number>
-            </property>
-            <property name="value">
-             <number>10</number>
-            </property>
-            <property name="toolTip">
-             <string>Number of rotating snapshots kept per segment (0 disables). Throttled to at most one snapshot per segment every 2 minutes.</string>
-            </property>
-           </widget>
-          </item>
           <item row="8" column="0">
            <widget class="QLabel" name="labelViewerSurfaceCache">
             <property name="text">
@@ -828,6 +736,35 @@
             </property>
             <property name="toolTip">
              <string>Per-workspace budget for overlay surface tiles in the flattened segmentation view. 0 disables it. Applies without restart.</string>
+            </property>
+           </widget>
+          </item>
+          <item row="10" column="0">
+           <widget class="QLabel" name="labelSurfaceGeometryCache">
+            <property name="text">
+             <string>Surface geometry cache (GB)</string>
+            </property>
+            <property name="toolTip">
+             <string>RAM kept for surface geometry read from object stores (surface intersections and lookups), shared by all workspaces. 0 keeps none: every read decodes its surfaces again.</string>
+            </property>
+           </widget>
+          </item>
+          <item row="10" column="1">
+           <widget class="QSpinBox" name="spinSurfaceGeometryCacheGB">
+            <property name="minimum">
+             <number>0</number>
+            </property>
+            <property name="maximum">
+             <number>512</number>
+            </property>
+            <property name="value">
+             <number>8</number>
+            </property>
+            <property name="suffix">
+             <string> GB</string>
+            </property>
+            <property name="toolTip">
+             <string>RAM kept for decoded object-store surface geometry, shared by all workspaces and stores. Applies without restart.</string>
             </property>
            </widget>
           </item>

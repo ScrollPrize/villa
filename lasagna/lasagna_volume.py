@@ -62,6 +62,11 @@ class LasagnaVolume:
 	groups: dict[str, ChannelGroup] = field(default_factory=dict)
 	provenance_json: str = ""
 	extra_fields: dict = field(default_factory=dict)
+	validity_channel: str | None = None
+
+	@property
+	def base_directory(self) -> Path:
+		return self.path if self.version == 3 else self.path.parent
 
 	# --- queries ---
 
@@ -83,19 +88,19 @@ class LasagnaVolume:
 	def zarr_abs_path(self, group_name: str) -> Path:
 		"""Absolute path to a group's zarr."""
 		g = self.groups[group_name]
-		return self.path.parent / g.zarr_path
+		return self.base_directory / g.zarr_path
 
 	def umbilicus_abs_path(self) -> Path:
 		"""Absolute path to the optional umbilicus control-point JSON."""
 		if not self.umbilicus_json:
 			raise ValueError(f"lasagna volume {self.path} missing required 'umbilicus_json'")
-		return self.path.parent / self.umbilicus_json
+		return self.base_directory / self.umbilicus_json
 
 	def init_shell_dir_abs_path(self) -> Path:
 		"""Absolute path to the optional shell-dir-crop initialization directory."""
 		if not self.init_shell_dir:
 			raise ValueError(f"lasagna volume {self.path} missing required 'init_shell_dir'")
-		return self.path.parent / self.init_shell_dir
+		return self.base_directory / self.init_shell_dir
 
 	# --- persistence ---
 
@@ -115,6 +120,9 @@ class LasagnaVolume:
 
 	def save(self, *, backup_existing: bool = False, backup_suffix: str | None = None) -> None:
 		"""Write JSON to self.path atomically."""
+		if self.version == 3:
+			self._save_compact()
+			return
 		self.version = LASAGNA_VOLUME_VERSION
 		d: dict = {
 			"version": LASAGNA_VOLUME_VERSION,
@@ -172,16 +180,20 @@ class LasagnaVolume:
 	def load(path: str | Path, *, require_umbilicus: bool = False) -> LasagnaVolume:
 		"""Load a .lasagna.json file. Raises on any problem."""
 		p = Path(path)
-		if not p.name.endswith(".lasagna.json"):
+		compact = p.is_dir()
+		if not compact and not p.name.endswith(".lasagna.json"):
 			raise ValueError(
 				f"expected .lasagna.json file, got: {p.name}\n"
 				"Lasagna volumes must be described by a .lasagna.json manifest."
 			)
-		d = json.loads(p.read_text(encoding="utf-8"))
+		d = (json.loads((p / ".zattrs").read_text(encoding="utf-8"))["lasagna"]
+			 if compact else json.loads(p.read_text(encoding="utf-8")))
+		if compact:
+			LasagnaVolume.validate_compact(d)
 		known_fields = {
 			"version", "source_to_base", "grad_mag_encode_scale", "grad_mag_factor",
 			"groups", "umbilicus_json", "init_shell_dir", "crops", "base_shape_zyx",
-			"crop_xyzwhd", "provenance",
+			"crop_xyzwhd", "provenance", "validity_channel",
 		}
 		version = int(d.get("version", 1))
 		umbilicus_raw = d.get("umbilicus_json", "")
@@ -226,7 +238,62 @@ class LasagnaVolume:
 			groups=groups,
 			provenance_json=str(d.get("provenance", "")).strip(),
 			extra_fields={key: value for key, value in d.items() if key not in known_fields},
+			validity_channel=d.get("validity_channel"),
 		)
+
+	@staticmethod
+	def validate_compact(d: dict) -> None:
+		if d.get("version") != 3:
+			raise ValueError("embedded Lasagna manifest must have version 3")
+		shape = d.get("base_shape_zyx")
+		if not isinstance(shape, list) or len(shape) != 3 or any(type(v) is not int or v <= 0 for v in shape):
+			raise ValueError("v3 requires positive base_shape_zyx")
+		scale = d.get("source_to_base")
+		if isinstance(scale, bool) or not isinstance(scale, (int, float)) or not math.isfinite(scale) or scale <= 0:
+			raise ValueError("v3 requires positive source_to_base")
+		groups = d.get("groups")
+		if not isinstance(groups, dict) or not groups:
+			raise ValueError("v3 requires groups")
+		names = []
+		for name, group in groups.items():
+			n = group.get("scaledown")
+			if type(n) is not int or not 0 <= n <= 30 or name != f"sd{n}" or group.get("zarr") != f"sd{n}/{n}":
+				raise ValueError("invalid v3 resolution group")
+			channels = group.get("channels")
+			if not isinstance(channels, list) or not channels or any(not isinstance(c, str) or not c for c in channels):
+				raise ValueError("invalid v3 channels")
+			names.extend(channels)
+		if len(set(names)) != len(names) or d.get("validity_channel") not in names:
+			raise ValueError("v3 requires unique channels and a declared validity_channel")
+		if "blank_invalid" in d and type(d["blank_invalid"]) is not bool:
+			raise ValueError("blank_invalid must be boolean")
+		if "width_encoding" in d and d["width_encoding"] not in ("uint8-base-voxels", "float32-input-voxels"):
+			raise ValueError("unsupported width_encoding")
+		if "grad_mag" in names:
+			for field_name in ("grad_mag_encode_scale", "grad_mag_factor"):
+				value = d.get(field_name)
+				if not isinstance(value, (int, float)) or isinstance(value, bool) or not math.isfinite(value) or value <= 0:
+					raise ValueError(f"invalid {field_name}")
+
+	def _save_compact(self) -> None:
+		from lasagna.inference_provenance import atomic_write
+		d = dict(self.extra_fields)
+		d.update(version=3, source_to_base=self.source_to_base,
+			base_shape_zyx=list(self.base_shape_zyx or ()),
+			groups={name: group.to_dict() for name, group in self.groups.items()},
+			validity_channel=self.validity_channel)
+		if "grad_mag" in self.all_channels():
+			d.update(grad_mag_encode_scale=self.grad_mag_encode_scale, grad_mag_factor=self.grad_mag_factor)
+		for key, value in (("provenance", self.provenance_json), ("crops", self.crops),
+			("umbilicus_json", self.umbilicus_json), ("init_shell_dir", self.init_shell_dir)):
+			if value:
+				d[key] = value
+		self.validate_compact(d)
+		self.path.mkdir(parents=True, exist_ok=True)
+		attrs_path = self.path / ".zattrs"
+		attrs = json.loads(attrs_path.read_text()) if attrs_path.exists() else {}
+		attrs["lasagna"] = d
+		atomic_write(attrs_path, attrs)
 
 	def add_crop(self, crop: tuple[int, int, int, int, int, int]) -> None:
 		"""Append a crop region if not already present."""

@@ -5,8 +5,9 @@
 
 #include "vc/core/render/ZarrChunkFetcher.hpp"
 #include "vc/core/render/ChunkCache.hpp"
-#include "vc/core/render/ZarrDownloadBenchmark.hpp"
+#include "vc/core/render/ChunkedPlaneSampler.hpp"
 #include "vc/core/types/Volume.hpp"
+#include "support/TestZarrVolume.hpp"
 #include "vc/core/types/VcDataset.hpp"
 
 #include <utils/zarr.hpp>
@@ -47,14 +48,12 @@ fs::path tmpDir(const std::string& tag)
 fs::path makeLocalVolume(const fs::path& dir, size_t numLevels = 2,
                         vc::render::ChunkDtype dtype = vc::render::ChunkDtype::UInt8)
 {
-    Volume::ZarrCreateOptions opts;
+    vc::test::ZarrVolumeSpec opts;
     opts.shapeZYX = {64, 64, 64};
     opts.chunkShapeZYX = {32, 32, 32};
     opts.numLevels = numLevels;
-    opts.compressor = "none";
-    opts.overwriteExisting = true;
     opts.dtype = dtype;
-    auto v = Volume::New(dir, opts);
+    auto v = vc::test::createZarrVolume(dir, opts);
     REQUIRE(v);
     return dir;
 }
@@ -202,6 +201,30 @@ TEST_CASE("openLocalZarrPyramid: opens a multi-level local zarr")
     CHECK_FALSE(opened.fetchers[0]->measuresRemoteTransfer());
     CHECK_FALSE(opened.shapes.empty());
     CHECK(opened.shapes[0][0] == 64);
+    fs::remove_all(d);
+}
+
+TEST_CASE("local pyramid source selection skips unfetched scale levels")
+{
+    auto d = tmpDir("sparse_lod");
+    makeLocalVolume(d, 6);
+    // A partial local download may contain only numeric array directories.
+    fs::remove(d / ".zattrs");
+    for (int level : {0, 1, 4})
+        fs::remove_all(d / std::to_string(level));
+
+    auto array = createChunkCache(openLocalZarrPyramid(d), 1024 * 1024, 1);
+    REQUIRE(array->numLevels() == 6);
+    using vc::render::ChunkedPlaneSampler;
+    for (const auto& [zoom, expected] :
+         std::vector<std::pair<float, int>>{{0.03125f, 5}, {0.0625f, 5},
+                                           {0.125f, 3}, {0.25f, 3},
+                                           {0.5f, 2}, {1.0f, 2}, {4.0f, 2}}) {
+        CAPTURE(zoom);
+        CHECK(ChunkedPlaneSampler::sourceLevelForView(*array, zoom) == expected);
+    }
+    // The quality bias still controls the transition between present levels.
+    CHECK(ChunkedPlaneSampler::sourceLevelForView(*array, 0.25f, 1.0f) == 2);
     fs::remove_all(d);
 }
 
@@ -388,18 +411,16 @@ TEST_CASE("validateAndRebaseVcPyramid rejects gaps and invalid retained fill val
 TEST_CASE("ZarrChunkFetcher fetches a present chunk from local")
 {
     auto d = tmpDir("fetch_present");
-    auto v = Volume::New(d, []() {
-        Volume::ZarrCreateOptions o;
+    auto v = vc::test::createZarrVolume(d, []() {
+        vc::test::ZarrVolumeSpec o;
         o.shapeZYX = {32, 32, 32};
         o.chunkShapeZYX = {32, 32, 32};
         o.numLevels = 1;
-        o.compressor = "none";
-        o.overwriteExisting = true;
         return o;
     }());
     REQUIRE(v);
     Array3D<uint8_t> in({32, 32, 32}, /*fill=*/200);
-    v->writeZYX(in, {0, 0, 0}, 0);
+    vc::test::writeZYX(*v, in, {0, 0, 0}, 0);
 
     auto opened = openLocalZarrPyramid(d);
     REQUIRE_FALSE(opened.fetchers.empty());
@@ -408,6 +429,223 @@ TEST_CASE("ZarrChunkFetcher fetches a present chunk from local")
     CHECK(r.status == vc::render::ChunkFetchStatus::Found);
     CHECK_FALSE(r.bytes.empty());
     fs::remove_all(d);
+}
+
+TEST_CASE("payload decode into reused storage preserves codec bytes and rejects short output")
+{
+    const auto registry = vc::buildZarrCodecRegistry(1);
+    for (const std::string name : {"blosc", "zstd", "lz4", "gzip"}) {
+        INFO(name);
+        utils::ZarrMetadata meta;
+        meta.version = utils::ZarrVersion::v2;
+        meta.shape = meta.chunks = {4, 4, 4};
+        meta.dtype = utils::ZarrDtype::uint8;
+        meta.compressor_id = name;
+        const auto codec = registry.at(name);
+        const auto array = utils::ZarrArray::open_with_metadata({}, meta, codec);
+        std::vector<std::byte> original(64);
+        for (size_t i = 0; i < original.size(); ++i) original[i] = std::byte(i);
+        const auto encoded = codec.compress(original);
+        std::vector<std::byte> reused(80, std::byte{0xee});
+        array.decode_chunk_payload_into(encoded, reused);
+        CHECK(std::equal(original.begin(), original.end(), reused.begin()));
+        CHECK(std::all_of(reused.begin()+64, reused.end(), [](auto b){return b == std::byte{0xee};}));
+        CHECK_THROWS(array.decode_chunk_payload_into(encoded, std::span(reused).first(63)));
+        const auto shortEncoded = codec.compress(std::span(original).first(32));
+        CHECK_THROWS(array.decode_chunk_payload_into(shortEncoded, reused));
+        const auto again = array.decode_chunk_payload(encoded);
+        CHECK(again == original);
+    }
+}
+
+TEST_CASE("payload decode reuse retains filter fallback and endian handling")
+{
+    utils::ZarrMetadata meta;
+    meta.version = utils::ZarrVersion::v2;
+    meta.shape = meta.chunks = {2, 2, 2};
+    meta.dtype = utils::ZarrDtype::uint16;
+    meta.byte_order = utils::detail::is_little_endian() ? '>' : '<';
+    meta.compressor_id = "zstd";
+    const auto codec = vc::buildZarrCodecRegistry(2).at("zstd");
+    std::vector<std::byte> stored(16);
+    for (size_t i=0;i<stored.size();++i) stored[i]=std::byte(i+1);
+    for (const bool withFilter : {false,true}) {
+        INFO(withFilter);
+        auto encodedInput=stored;
+        if (withFilter) {
+            utils::ZarrFilter filter;
+            filter.dtype=filter.astype=utils::ZarrDtype::uint16;
+            meta.filters={filter};
+            encodedInput=filter.encode(stored);
+        }
+        const auto array=utils::ZarrArray::open_with_metadata({},meta,codec);
+        const auto encoded=codec.compress(encodedInput);
+        auto expected=stored;
+        for(size_t i=0;i<expected.size();i+=2)std::swap(expected[i],expected[i+1]);
+        std::vector<std::byte> reused(16,std::byte{0xee});
+        array.decode_chunk_payload_into(encoded,reused);
+        CHECK(reused==expected);
+        CHECK(reused==array.decode_chunk_payload(encoded));
+    }
+}
+
+TEST_CASE("payload decode avoids copying compressed input and preserves read-into fallback")
+{
+    utils::ZarrMetadata meta;
+    meta.version=utils::ZarrVersion::v2;meta.shape=meta.chunks={2,2,2};
+    meta.dtype=utils::ZarrDtype::uint8;meta.compressor_id="zstd";
+    std::vector<std::byte> encoded(3,std::byte{12});
+    utils::ZarrArray::Codec codec;
+    codec.decompress=[&](std::span<const std::byte> input,size_t n){
+        CHECK(input.data()==encoded.data());
+        return std::vector<std::byte>(n,std::byte{43});
+    };
+    auto array=utils::ZarrArray::open_with_metadata({},meta,codec);
+    CHECK(array.decode_chunk_payload(encoded)==std::vector<std::byte>(8,std::byte{43}));
+    std::vector<std::byte> out(8);
+    array.decode_chunk_payload_into(encoded,out); // no into callback: allocating fallback
+    CHECK(out==std::vector<std::byte>(8,std::byte{43}));
+
+    const auto dir=tmpDir("read_into_sizes");
+    meta.compressor_id="";
+    auto raw=utils::ZarrArray::create(dir,meta);
+    const std::array<size_t,3> key{0,0,0};
+    raw.write_chunk(key,std::vector<std::byte>(12,std::byte{9}));
+    CHECK(raw.read_chunk_into(key,out)); // historical prefix copy remains valid
+    CHECK(out==std::vector<std::byte>(8,std::byte{9}));
+    CHECK_THROWS(raw.decode_chunk_payload_into(std::vector<std::byte>(12),out));
+    raw.write_chunk(key,std::vector<std::byte>(4,std::byte{9}));
+    CHECK_FALSE(raw.read_chunk_into(key,out));
+    CHECK_THROWS(raw.decode_chunk_payload_into(std::vector<std::byte>(4),out));
+    fs::remove_all(dir);
+}
+
+TEST_CASE("native decoded storage recycles only after the final reader and obeys budget")
+{
+    const auto dir=tmpDir("decode_reuse");
+    auto dataset=vc::createZarrDataset(dir,"0",{4,4,8},{4,4,4},vc::VcDtype::uint8,"blosc");
+    REQUIRE(dataset);
+    auto array=std::make_shared<utils::ZarrArray>(utils::ZarrArray::open(dir/"0",vc::buildZarrCodecRegistry(1)));
+    const std::vector<std::byte> first(64,std::byte{17}),second(64,std::byte{93});
+    array->write_chunk(std::array<size_t,3>{0,0,0},first);
+    array->write_chunk(std::array<size_t,3>{0,0,1},second);
+    auto budget=std::make_shared<vc::render::DecodedChunkCacheBudget>(128);
+    vc::render::ChunkCacheService::Options options;
+    options.decodedByteBudget=budget;
+    auto cache=vc::render::createChunkCache(array,{},options);
+    auto lease=cache->getChunkBlocking(0,0,0,0);
+    REQUIRE(lease.bytes);
+    const auto* original=lease.bytes->data();
+    cache->invalidate();
+    CHECK(budget->stats().recycledBytes==0);
+    CHECK(*lease.bytes==first);
+    lease.bytes.reset();
+    CHECK(budget->stats().recycledBytes==64);
+    auto next=cache->getChunkBlocking(0,0,0,1);
+    REQUIRE(next.bytes);
+    CHECK(next.bytes->data()==original);
+    CHECK(*next.bytes==second);
+    CHECK(budget->stats().recycledBytes==0);
+    cache->invalidate();
+    budget->setMaximumBytes(0);
+    CHECK(*next.bytes==second);
+    next.bytes.reset();
+    CHECK(budget->stats().recycledBytes==0);
+    budget->setMaximumBytes(128);
+    cache->getChunkBlocking(0,0,0,0);
+    cache->invalidate();
+    CHECK(budget->stats().recycledBytes==64);
+    budget->setMaximumBytes(0);
+    CHECK(budget->stats().recycledBytes==0);
+    budget->setMaximumBytes(128);
+    auto surviving=cache->getChunkBlocking(0,0,0,1);
+    REQUIRE(surviving.bytes);
+    std::weak_ptr<vc::render::DecodedChunkCacheBudget> weakBudget=budget;
+    options.decodedByteBudget.reset();
+    cache.reset();
+    budget.reset();
+    CHECK(weakBudget.expired());
+    CHECK(*surviving.bytes==second);
+    surviving.bytes.reset(); // weak pool reference must not keep a service alive
+    fs::remove_all(dir);
+}
+
+TEST_CASE("all-fill decodes return borrowed storage without publishing stale bytes")
+{
+    const auto dir=tmpDir("decode_reuse_fill");
+    auto dataset=vc::createZarrDataset(dir,"0",{4,4,8},{4,4,4},vc::VcDtype::uint8,"blosc");
+    auto array=std::make_shared<utils::ZarrArray>(utils::ZarrArray::open(dir/"0",vc::buildZarrCodecRegistry(1)));
+    array->write_chunk(std::array<size_t,3>{0,0,0},std::vector<std::byte>(64,std::byte{17}));
+    array->write_chunk(std::array<size_t,3>{0,0,1},std::vector<std::byte>(64,std::byte{}));
+    auto budget=std::make_shared<vc::render::DecodedChunkCacheBudget>(128);
+    vc::render::ChunkCacheService::Options options;options.decodedByteBudget=budget;
+    auto cache=vc::render::createChunkCache(array,{},options);
+    REQUIRE(cache->getChunkBlocking(0,0,0,0).status==vc::render::ChunkStatus::Data);
+    cache->invalidate();
+    const auto limit=std::chrono::steady_clock::now()+std::chrono::seconds(2);
+    while(budget->stats().recycledBytes!=64 && std::chrono::steady_clock::now()<limit)
+        std::this_thread::yield();
+    REQUIRE(budget->stats().recycledBytes==64);
+    auto empty=cache->getChunkBlocking(0,0,0,1);
+    CHECK(empty.status==vc::render::ChunkStatus::AllFill);
+    CHECK_FALSE(empty.bytes);
+    CHECK(budget->stats().reusedBuffers==1);
+    const auto returned=std::chrono::steady_clock::now()+std::chrono::seconds(2);
+    while(budget->stats().recycledBytes!=64 && std::chrono::steady_clock::now()<returned)
+        std::this_thread::yield();
+    CHECK(budget->stats().recycledBytes==64);
+    cache->invalidate();
+    array->write_chunk(std::array<size_t,3>{0,0,0},std::vector<std::byte>(32,std::byte{83}));
+    auto malformed=cache->getChunkBlocking(0,0,0,0);
+    CHECK(malformed.status==vc::render::ChunkStatus::Error);
+    CHECK_FALSE(malformed.bytes); // old borrowed tail must not become valid data
+    CHECK(budget->stats().reusedBuffers==2);
+    fs::remove_all(dir);
+}
+
+TEST_CASE("native streaming reuses ordinary LRU evictions without invalidation")
+{
+    const auto dir=tmpDir("decode_reuse_stream");
+    auto dataset=vc::createZarrDataset(dir,"0",{4,4,128},{4,4,4},vc::VcDtype::uint8,"blosc");
+    auto array=std::make_shared<utils::ZarrArray>(utils::ZarrArray::open(dir/"0",vc::buildZarrCodecRegistry(1)));
+    for(size_t i=0;i<32;++i)
+        array->write_chunk(std::array<size_t,3>{0,0,i},std::vector<std::byte>(64,std::byte(i+1)));
+    for (const size_t capacity : {size_t(128), size_t(1024)}) {
+        auto budget=std::make_shared<vc::render::DecodedChunkCacheBudget>(capacity);
+        vc::render::ChunkCacheService::Options options;options.decodedByteBudget=budget;
+        auto cache=vc::render::createChunkCache(array,{},options);
+        for(int i=0;i<32;++i) {
+            {
+                auto chunk=cache->getChunkBlocking(0,0,0,i);
+                REQUIRE(chunk.bytes);
+                CHECK(*chunk.bytes==std::vector<std::byte>(64,std::byte(i+1)));
+            }
+            // A two-buffer cache has no anticipatory reserve; reuse there is
+            // opportunistic, not a synchronous eviction contract. With room
+            // for the two-buffer reserve, let background retirement finish
+            // before testing that the next reads reuse its buffers.
+            if (capacity == 1024 && i >= 15) {
+                const auto limit=std::chrono::steady_clock::now()+std::chrono::seconds(2);
+                while(budget->stats().recycledBytes<64 && std::chrono::steady_clock::now()<limit) {
+                    // A background try-lock may have met the publishing
+                    // worker. Re-request maintenance with the same budget.
+                    budget->setMaximumBytes(capacity);
+                    std::this_thread::yield();
+                }
+                // A pass can retire one chunk before meeting a busy source;
+                // that is already enough to test reuse on the next decode.
+                REQUIRE(budget->stats().recycledBytes>=64);
+            }
+        }
+        const auto stats=budget->stats();
+        if (capacity == 1024) {
+            CHECK(stats.reusedBuffers>=14);
+            CHECK(stats.backgroundPasses>0);
+        }
+        CHECK(stats.decodedBytes+stats.recycledBytes<=capacity);
+        CHECK(cache->stats().decodeAttempts==32);
+    }
+    fs::remove_all(dir);
 }
 
 TEST_CASE("storage-object decoding decompresses each inner chunk once")
@@ -523,18 +761,16 @@ TEST_CASE("Delta3D cache is a regular unsharded Zarr with the source layout")
 {
     auto source = tmpDir("delta3d_zarr_source");
     auto cacheDir = tmpDir("delta3d_zarr_cache");
-    auto volume = Volume::New(source, [] {
-        Volume::ZarrCreateOptions options;
+    auto volume = vc::test::createZarrVolume(source, [] {
+        vc::test::ZarrVolumeSpec options;
         options.shapeZYX = {32, 32, 32};
         options.chunkShapeZYX = {32, 32, 32};
         options.numLevels = 1;
-        options.compressor = "none";
-        options.overwriteExisting = true;
         return options;
     }());
     REQUIRE(volume);
     Array3D<std::uint8_t> values({32, 32, 32}, 173);
-    volume->writeZYX(values, {0, 0, 0}, 0);
+    vc::test::writeZYX(*volume, values, {0, 0, 0}, 0);
     volume.reset();
 
     auto store = std::make_shared<utils::FileSystemStore>(source);
@@ -826,18 +1062,16 @@ TEST_CASE("native mirror stores exact unsharded bytes and reopens without source
 {
     auto source = tmpDir("mirror_unsharded_source");
     auto mirror = tmpDir("mirror_unsharded_cache");
-    auto volume = Volume::New(source, [] {
-        Volume::ZarrCreateOptions options;
+    auto volume = vc::test::createZarrVolume(source, [] {
+        vc::test::ZarrVolumeSpec options;
         options.shapeZYX = {32, 32, 32};
         options.chunkShapeZYX = {32, 32, 32};
         options.numLevels = 1;
-        options.compressor = "none";
-        options.overwriteExisting = true;
         return options;
     }());
     REQUIRE(volume);
     Array3D<std::uint8_t> values({32, 32, 32}, 173);
-    volume->writeZYX(values, {0, 0, 0}, 0);
+    vc::test::writeZYX(*volume, values, {0, 0, 0}, 0);
     volume.reset();
 
     auto store = std::make_shared<utils::FileSystemStore>(source);
@@ -883,13 +1117,11 @@ TEST_CASE("native mirror stores exact unsharded bytes and reopens without source
 TEST_CASE("ZarrChunkFetcher fetches a Missing chunk")
 {
     auto d = tmpDir("fetch_missing");
-    auto v = Volume::New(d, []() {
-        Volume::ZarrCreateOptions o;
+    auto v = vc::test::createZarrVolume(d, []() {
+        vc::test::ZarrVolumeSpec o;
         o.shapeZYX = {32, 32, 32};
         o.chunkShapeZYX = {32, 32, 32};
         o.numLevels = 1;
-        o.compressor = "none";
-        o.overwriteExisting = true;
         return o;
     }());
     REQUIRE(v);
@@ -900,199 +1132,4 @@ TEST_CASE("ZarrChunkFetcher fetches a Missing chunk")
     auto r = opened.fetchers[0]->fetch({0, 0, 0, 0});
     CHECK(r.status == vc::render::ChunkFetchStatus::Missing);
     fs::remove_all(d);
-}
-
-TEST_CASE("Zarr download benchmark selects unique distributed logical chunks")
-{
-    const auto first = vc::render::selectZarrDownloadBenchmarkChunks(
-        {17, 9, 5}, {4, 4, 4}, 2, 100, 41);
-    const auto second = vc::render::selectZarrDownloadBenchmarkChunks(
-        {17, 9, 5}, {4, 4, 4}, 2, 100, 41);
-    REQUIRE(first.size() == 30);
-    CHECK(first == second);
-
-    std::unordered_set<vc::render::ChunkKey, vc::render::ChunkKeyHash> unique;
-    for (const auto& key : first) {
-        CHECK(key.level == 2);
-        CHECK(key.iz >= 0);
-        CHECK(key.iz < 5);
-        CHECK(key.iy >= 0);
-        CHECK(key.iy < 3);
-        CHECK(key.ix >= 0);
-        CHECK(key.ix < 2);
-        unique.insert(key);
-    }
-    CHECK(unique.size() == first.size());
-}
-
-TEST_CASE("Zarr download benchmark uses encoded fetches and fixed admission")
-{
-    class EncodedFetcher final : public vc::render::IChunkFetcher {
-    public:
-        vc::render::ChunkFetchResult fetch(const vc::render::ChunkKey&) override
-        {
-            ++decodedCalls;
-            return {};
-        }
-
-        vc::render::ChunkFetchResult fetchEncoded(
-            const vc::render::ChunkKey&) override
-        {
-            ++calls;
-            vc::render::ChunkFetchResult result;
-            result.status = vc::render::ChunkFetchStatus::Found;
-            result.bytes.resize(1024);
-            return result;
-        }
-
-        std::atomic_size_t calls{0};
-        std::atomic_size_t decodedCalls{0};
-    };
-
-    auto fetcher = std::make_shared<EncodedFetcher>();
-    OpenedChunkedZarr opened;
-    opened.shapes = {{64, 64, 64}};
-    opened.chunkShapes = {{16, 16, 16}};
-    opened.fetchers = {fetcher};
-
-    vc::render::ZarrDownloadBenchmarkOptions options;
-    options.chunkCount = 12;
-    options.workers = 1;
-    options.schedule = vc::render::ZarrDownloadSchedule::Fixed;
-    std::vector<vc::render::ZarrDownloadProgress> progress;
-    options.progressInterval = std::chrono::hours(1);
-    options.progressCallback = [&](const auto& update) {
-        progress.push_back(update);
-    };
-    const auto result = vc::render::runZarrDownloadBenchmark(opened, options);
-
-    CHECK(fetcher->calls.load() == 12);
-    CHECK(fetcher->decodedCalls.load() == 0);
-    CHECK(result.requestedChunks == 12);
-    CHECK(result.foundChunks == 12);
-    CHECK(result.encodedBytes == 12 * 1024);
-    CHECK(result.httpErrors == 0);
-    CHECK(result.ioErrors == 0);
-    CHECK(result.decodeErrors == 0);
-    CHECK(result.sinkErrors == 0);
-    CHECK(result.peakActive == 1);
-    CHECK(result.finalTransferStats.admissionLimit == 1);
-    CHECK_FALSE(result.finalTransferStats.adaptive);
-    CHECK(result.finalTransferStats.bytesPerSecond == 0.0);
-    REQUIRE(progress.size() == 1);
-    CHECK(progress[0].queuedChunks == 0);
-    CHECK(progress[0].downloadingChunks == 0);
-    CHECK(progress[0].completedChunks == 12);
-    CHECK(progress[0].encodedBytes == 12 * 1024);
-}
-
-TEST_CASE("Zarr download benchmark replenishes work until its duration")
-{
-    class EncodedFetcher final : public vc::render::IChunkFetcher {
-    public:
-        vc::render::ChunkFetchResult fetch(const vc::render::ChunkKey&) override
-        {
-            return {};
-        }
-
-        vc::render::ChunkFetchResult fetchEncoded(
-            const vc::render::ChunkKey&) override
-        {
-            ++calls;
-            std::this_thread::sleep_for(std::chrono::milliseconds(2));
-            vc::render::ChunkFetchResult result;
-            result.status = vc::render::ChunkFetchStatus::Found;
-            result.bytes.resize(1024);
-            return result;
-        }
-
-        std::atomic_size_t calls{0};
-    };
-
-    auto fetcher = std::make_shared<EncodedFetcher>();
-    OpenedChunkedZarr opened;
-    opened.shapes = {{64, 64, 64}};
-    opened.chunkShapes = {{16, 16, 16}};
-    opened.fetchers = {fetcher};
-
-    vc::render::ZarrDownloadBenchmarkOptions options;
-    options.chunkCount = 2;
-    options.runDuration = std::chrono::milliseconds(15);
-    options.workers = 2;
-    options.schedule = vc::render::ZarrDownloadSchedule::Fixed;
-    const auto result = vc::render::runZarrDownloadBenchmark(opened, options);
-
-    CHECK(result.requestedChunks == fetcher->calls.load());
-    CHECK(result.requestedChunks > options.chunkCount);
-    CHECK(result.foundChunks == result.requestedChunks);
-    CHECK(result.wallSeconds >= 0.015);
-}
-
-TEST_CASE("Zarr download benchmark rejects adaptive mode without remote measurement")
-{
-    class LocalFetcher final : public vc::render::IChunkFetcher {
-    public:
-        vc::render::ChunkFetchResult fetch(const vc::render::ChunkKey&) override
-        {
-            return {};
-        }
-    };
-
-    OpenedChunkedZarr opened;
-    opened.shapes = {{32, 32, 32}};
-    opened.chunkShapes = {{16, 16, 16}};
-    opened.fetchers = {std::make_shared<LocalFetcher>()};
-
-    vc::render::ZarrDownloadBenchmarkOptions options;
-    options.chunkCount = 1;
-    options.workers = 2;
-    options.schedule = vc::render::ZarrDownloadSchedule::Adaptive;
-    CHECK_THROWS_AS(
-        vc::render::runZarrDownloadBenchmark(opened, options),
-        std::invalid_argument);
-}
-
-TEST_CASE("Zarr download benchmark can write encoded payloads to a temporary sink")
-{
-    class EncodedFetcher final : public vc::render::IChunkFetcher {
-    public:
-        vc::render::ChunkFetchResult fetch(const vc::render::ChunkKey&) override
-        {
-            return {};
-        }
-
-        vc::render::ChunkFetchResult fetchEncoded(
-            const vc::render::ChunkKey&) override
-        {
-            vc::render::ChunkFetchResult result;
-            result.status = vc::render::ChunkFetchStatus::Found;
-            result.bytes.resize(17, std::byte{0x2a});
-            return result;
-        }
-    };
-
-    const auto output = tmpDir("download_benchmark_sink");
-    OpenedChunkedZarr opened;
-    opened.shapes = {{32, 32, 32}};
-    opened.chunkShapes = {{16, 16, 16}};
-    opened.fetchers = {std::make_shared<EncodedFetcher>()};
-
-    vc::render::ZarrDownloadBenchmarkOptions options;
-    options.chunkCount = 3;
-    options.workers = 1;
-    options.schedule = vc::render::ZarrDownloadSchedule::Fixed;
-    options.outputDirectory = output;
-    const auto result = vc::render::runZarrDownloadBenchmark(opened, options);
-
-    CHECK(result.foundChunks == 3);
-    CHECK(result.encodedBytes == 51);
-    CHECK(result.sinkErrors == 0);
-    std::size_t files = 0;
-    for (const auto& entry : fs::directory_iterator(output)) {
-        CHECK(entry.is_regular_file());
-        CHECK(entry.file_size() == 17);
-        ++files;
-    }
-    CHECK(files == 3);
-    fs::remove_all(output);
 }

@@ -36,7 +36,6 @@ void testCorrectionResults()
     QTemporaryDir tmp;
     require(tmp.isValid(), "Could not create correction test directory");
     const auto pointsPath = std::filesystem::path(tmp.path().toStdString()) / "points.json";
-    const auto resultsPath = pointsPath.parent_path() / "results.json";
     {
         std::ofstream out(pointsPath);
         out << R"({"vc_pointcollections_json_version":"1","collections":{
@@ -63,14 +62,11 @@ void testCorrectionResults()
         require(false, "Correction point row missing");
         return {};
     };
-    const auto load = [&](const char* json) {
-        { std::ofstream out(resultsPath); out << json; }
-        widget.loadCorrPointsResults(resultsPath);
-    };
+    const auto load = [&](const char* json) { widget.loadCorrPointsResults(utils::Json::parse(json)); };
     load(R"({"points_list":[
         {"collection_id":0,"point_id":0,"p":[1,2,3],"winding_obs":1,"winding_err":0.1},
         {"collection_id":7,"point_id":0,"p":[1,2,3],"winding_obs":2,"winding_err":0.2}
-    ],"points":{"0":{"collection_id":7,"p":[1,2,3],"winding_obs":99}}})");
+    ]})");
     const auto checkQualified = [&] {
         require(cell({0,0},2) == "1.000", "First collection lost its winding result");
         require(cell({7,0},2) == "2.000", "Second collection got the wrong winding result");
@@ -92,17 +88,9 @@ void testCorrectionResults()
     point.p = {1,2,3};
     collection.updatePoint(point);
 
-    load(R"({"points":{"0":{"collection_id":7,"p":[1,2,3],"winding_obs":3}}})");
-    require(cell({0,0},2).isEmpty(), "Qualified legacy result leaked to another collection");
-    require(cell({7,0},2) == "3.000", "Qualified legacy result was lost");
-    load(R"({"points":{
-        "0":{"p":[1,2,3],"winding_obs":4},
-        "5":{"p":[1,2,3],"winding_obs":5}
-    }})");
-    require(cell({0,0},2).isEmpty() && cell({7,0},2).isEmpty(), "Ambiguous legacy ID was accepted");
-    require(cell({0,5},2) == "5.000", "Unambiguous legacy result was lost");
-    load(R"({"points_list":[],"points":{"5":{"p":[1,2,3],"winding_obs":99}}})");
-    require(cell({0,5},2).isEmpty(), "Empty qualified list fell back to stale legacy results");
+    load(R"({"points_list":[{"collection_id":0,"point_id":5,"p":[1,2,3],"winding_obs":5}]})");
+    require(cell({0,0},2).isEmpty() && cell({7,0},2).isEmpty(), "Reloading kept stale results");
+    require(cell({0,5},2) == "5.000", "Reloaded result was lost");
     load(R"({"points_list":[
         {"collection_id":-1,"point_id":0,"p":[1,2,3],"winding_obs":9},
         {"collection_id":0,"point_id":0.5,"p":[1,2,3],"winding_obs":9},

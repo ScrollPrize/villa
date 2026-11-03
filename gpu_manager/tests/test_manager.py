@@ -294,7 +294,13 @@ def test_randomized_handoff_never_overcommits():
         if op == 0:
             task_call(e, client, "set_paused", paused=bool(rng.randrange(2)), scope="self")
         elif op == 1:
-            task_call(e, client, "set_request", request=request(max_cpu_cores=4, max_gpus=rng.randrange(1, 3), priority=rng.randrange(3), exclusive=rng.random() < 0.05),
+            update = request(max_cpu_cores=4, max_gpus=rng.randrange(1, 3),
+                             priority=rng.randrange(3), exclusive=rng.random() < 0.05)
+            # Placement changes alter which tasks hold grants. Do not generate
+            # forbidden live exclusivity changes in this capacity invariant test.
+            if task["granted"] != empty():
+                update["exclusive"] = task["request"]["exclusive"]
+            task_call(e, client, "set_request", request=update,
                       expected_request_revision=task["request_revision"])
         elif task["phase"] == "initialize":
             report(e, client, "applied")
@@ -337,7 +343,8 @@ def test_shared_directory_requires_sticky_and_private_journal(tmp_path):
             pass
 
 
-def test_real_socket_and_journal(tmp_path):
+@pytest.mark.parametrize("mode", ["full_release", "incremental_release"])
+def test_real_socket_and_journal(tmp_path, mode):
     directory = tmp_path / "private"
     with Server(directory / "manager.sock", POOL,
                 engine_options={"protected_processes": lambda: []}) as server:
@@ -352,10 +359,18 @@ def test_real_socket_and_journal(tmp_path):
         thread = threading.Thread(target=serve)
         thread.start()
         try:
-            with Client(directory / "manager.sock") as client:
+            with Client(directory / "manager.sock", reconfigure_mode=mode) as client:
                 task = client.register("test", request())
                 client.report("applied", task["granted"])
                 assert client.poll()["phase"] == "applied"
+                if mode == "incremental_release":
+                    changed = client.set_request(request(max_gpus=1, allowed_gpu_uuids=["GPU-a"]))
+                    assert changed["phase"] == "release"
+                    retained = {"cpu_cores": 8, "gpus": {"GPU-a": 100}}
+                    changed = client.report("released", retained)
+                    assert changed["phase"] == "initialize"
+                    assert changed["granted"]["gpus"] == retained["gpus"]
+                    client.report("applied", changed["granted"])
                 client.pause()
                 client.report("released", empty())
                 assert client.finish()["terminal"]

@@ -159,9 +159,12 @@ def main(argv: list[str] | None = None) -> int:
         prefetch_details["ended_at"] = utc_now()
         atomic_json(metadata_path, metadata)
     try:
+        from lasagna.cooperative_inference import runner_environment
+        environment = runner_environment(metadata)
         child = subprocess.Popen(
             command, cwd=run_dir, stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT, start_new_session=True,
+            env=environment,
         )
     except Exception:
         metadata.update(status="failed", ended_at=utc_now(), exit_code=None)

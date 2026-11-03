@@ -87,7 +87,7 @@ def wrong_continuation(bank, cfg, rng, *, tail_length_range=(4., 16.), prefix_le
     keep = 1-np.r_[np.zeros(len(prefix_t)), weight]
     path = path+np.stack([np.interp(distance, units, noise[:, k]) for k in range(3)], -1)*keep[:, None]
     # A clipped prefix/bridge join can repeat the first point (notably when
-    # a reversed AFV path's catalog length differs by roundoff). Preserve the
+    # a reversed fiber-store path's catalog length differs by roundoff). Preserve the
     # join indices below, but derive the seed heading from actual movement.
     moving = np.flatnonzero(np.linalg.norm(path-path[0],axis=1) > 1e-6)
     if not len(moving):

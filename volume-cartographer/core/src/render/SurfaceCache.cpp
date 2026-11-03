@@ -415,7 +415,6 @@ struct SurfaceGeometryTileCache::State {
     std::unordered_map<TileKey, std::shared_ptr<Slot>, TileKeyHash> slots;
     std::list<TileKey> lru;  // front = most recently used
     std::unordered_map<TileKey, std::list<TileKey>::iterator, TileKeyHash> lruPos;
-    std::uint64_t epoch = 0;
 
     void touchLocked(const TileKey& key)
     {
@@ -425,6 +424,8 @@ struct SurfaceGeometryTileCache::State {
         lruPos[key] = lru.begin();
     }
 
+    // Unpublishes a slot. One still being generated stays alive for the callers
+    // already waiting on it; the next get() of its key starts a fresh gen().
     void eraseLocked(const TileKey& key)
     {
         slots.erase(key);
@@ -469,10 +470,8 @@ SurfaceGeometryTileCache::get(int level, int tu, int tv)
 
     const TileKey key{level, tu, tv};
     std::shared_ptr<State::Slot> slot;
-    std::uint64_t epoch = 0;
     {
         std::unique_lock lock(_state->mutex);
-        epoch = _state->epoch;
         if (auto it = _state->slots.find(key); it != _state->slots.end()) {
             slot = it->second;
             _state->touchLocked(key);
@@ -537,13 +536,9 @@ SurfaceGeometryTileCache::get(int level, int tu, int tv)
         std::lock_guard lock(_state->mutex);
         slot->tile = tile;
         slot->ready = true;
-        if (epoch != _state->epoch) {
-            // Invalidated while generating: hand this caller what it computed
-            // but do not publish stale geometry for anyone else.
-            _state->eraseLocked(key);
-        } else {
-            _state->trimLocked();
-        }
+        // Invalidated while generating, the slot was unpublished: this caller
+        // and its waiters get what was computed, nobody else does.
+        _state->trimLocked();
         _state->ready.notify_all();
     }
     return tile;
@@ -597,15 +592,9 @@ void SurfaceGeometryTileCache::sampleView(
 void SurfaceGeometryTileCache::invalidateAll()
 {
     std::lock_guard lock(_state->mutex);
-    ++_state->epoch;
-    std::vector<TileKey> victims;
-    victims.reserve(_state->slots.size());
-    for (const auto& [key, slot] : _state->slots) {
-        if (slot->ready)
-            victims.push_back(key);
-    }
-    for (const TileKey& key : victims)
-        _state->eraseLocked(key);
+    _state->slots.clear();
+    _state->lru.clear();
+    _state->lruPos.clear();
 }
 
 cv::Rect2d SurfaceGeometryTileCache::gridCellsToNominal(const cv::Rect& gridCells) const
@@ -635,11 +624,8 @@ void SurfaceGeometryTileCache::invalidateSurfaceRegion(const cv::Rect& gridCells
     }
 
     std::lock_guard lock(_state->mutex);
-    ++_state->epoch;
     std::vector<TileKey> victims;
     for (const auto& [key, slot] : _state->slots) {
-        if (!slot->ready)
-            continue;
         if ((tileNominalRect(key.level, key.tu, key.tv) & region).area() > 0.0)
             victims.push_back(key);
     }
@@ -677,7 +663,10 @@ struct SurfaceCache::State {
     std::size_t bytes = 0;
     std::size_t capacity = 0;
     std::size_t incomplete = 0;
-    std::unordered_set<TileKey, TileKeyHash> outstanding;
+    // Admitted fills, with the epoch each was admitted under. A full
+    // invalidation forgets them: a fill it discards must not hold its key out
+    // of requestView, or the tile stays blank until the view next moves.
+    std::unordered_map<TileKey, std::uint64_t, TileKeyHash> outstanding;
     std::unordered_set<TileKey, TileKeyHash> viewTiles;
     // Fills that stored an incomplete tile, per tile. A tile can be incomplete
     // because a chunk was evicted mid-fill or is genuinely missing; re-queueing
@@ -686,7 +675,17 @@ struct SurfaceCache::State {
     // the backing array reports new chunk data -- the only event that can
     // actually change the outcome.
     std::unordered_map<TileKey, unsigned, TileKeyHash> failedAttempts;
+    // Resident tiles an edit has moved geometry under. They stay resident and
+    // keep being drawn until their refill replaces them: dropping them would
+    // blank the edited region, at every level, for as long as the edit runs.
+    std::unordered_set<TileKey, TileKeyHash> stale;
+    // Outstanding fills an edit reached after they started. Their result is
+    // still newer than what is drawn, so it is published, but as stale.
+    std::unordered_set<TileKey, TileKeyHash> editedDuringFill;
     IChunkedArray::ChunkReadyCallbackId chunkReadyId = 0;
+    // Bumped only by a full invalidation, which discards every fill in flight.
+    // A region edit must not: at an edit tool's tick rate it would discard
+    // every fill, anywhere in the view, before one could finish.
     std::uint64_t epoch = 0;
     bool shuttingDown = false;
     std::unordered_map<TileReadyCallbackId, std::function<void()>> listeners;
@@ -711,10 +710,22 @@ struct SurfaceCache::State {
             // reading the tile keeps it alive through its own shared_ptr.
             tiles.erase(it);
         }
+        stale.erase(key);
         if (auto pos = lruPos.find(key); pos != lruPos.end()) {
             lru.erase(pos->second);
             lruPos.erase(pos);
         }
+    }
+
+    // Ends the fill admitted for `key` under `epoch`, unless an invalidation
+    // already forgot it. Returns whether an edit reached the tile mid-fill.
+    bool releaseLocked(const TileKey& key, std::uint64_t epoch)
+    {
+        auto it = outstanding.find(key);
+        if (it == outstanding.end() || it->second != epoch)
+            return false;
+        outstanding.erase(it);
+        return editedDuringFill.erase(key) > 0;
     }
 
     void enforceCapacityLocked()
@@ -973,14 +984,14 @@ void SurfaceCache::State::runFill(const std::shared_ptr<State>& self,
     {
         std::lock_guard lock(self->mutex);
         if (self->shuttingDown || epoch != self->epoch || !self->viewTiles.count(key)) {
-            self->outstanding.erase(key);
+            self->releaseLocked(key, epoch);
             return;
         }
     }
 
     auto release = [&]() {
         std::lock_guard lock(self->mutex);
-        self->outstanding.erase(key);
+        self->releaseLocked(key, epoch);
     };
 
     std::shared_ptr<const SurfaceGeometryTileCache::Tile> geometry;
@@ -1142,13 +1153,16 @@ void SurfaceCache::State::runFill(const std::shared_ptr<State>& self,
 
     {
         std::lock_guard lock(self->mutex);
-        self->outstanding.erase(key);
+        const bool editedSinceStart = self->releaseLocked(key, epoch);
         if (epoch == self->epoch) {
             // Never discard computed work: an incomplete tile is stored and
-            // used anyway, and requestView re-queues it.
+            // used anyway, and requestView re-queues it. So is a tile an edit
+            // reached mid-fill: it is still newer than the one drawn.
             self->dropLocked(key);
             self->tiles.emplace(key, SurfaceTilePtr(std::move(tile)));
             self->bytes += self->tileBytes;
+            if (editedSinceStart)
+                self->stale.insert(key);
             if (complete) {
                 self->failedAttempts.erase(key);
             } else {
@@ -1239,8 +1253,6 @@ void SurfaceCache::shutdown()
         _state->volume->removeChunkReadyListener(chunkReadyId);
 }
 
-std::size_t SurfaceCache::fillWorkerCount() { return surfaceFillPool().worker_count(); }
-
 int SurfaceCache::levels() const { return _state->levels; }
 int SurfaceCache::wMin() const { return _state->wMin; }
 int SurfaceCache::wCount() const { return _state->wCount; }
@@ -1288,6 +1300,9 @@ void SurfaceCache::invalidateAll()
         _state->bytes = 0;
         _state->incomplete = 0;
         _state->failedAttempts.clear();
+        _state->stale.clear();
+        _state->outstanding.clear();
+        _state->editedDuringFill.clear();
         _state->viewTiles.clear();
     }
     if (_state->geometry)
@@ -1307,16 +1322,21 @@ void SurfaceCache::invalidateSurfaceRegion(const cv::Rect& gridCells)
     }
     _state->geometry->invalidateSurfaceRegion(gridCells);
 
+    // Mark, don't drop: the tiles over the edit keep being drawn until their
+    // refill lands, so the region updates in place instead of flashing blank.
     std::lock_guard lock(_state->mutex);
-    ++_state->epoch;
-    std::vector<TileKey> victims;
+    const auto touched = [&](const TileKey& key) {
+        return (tileNominalRect(key.level, key.tu, key.tv) & region).area() > 0.0;
+    };
     for (const auto& [key, tile] : _state->tiles) {
-        if ((tileNominalRect(key.level, key.tu, key.tv) & region).area() > 0.0)
-            victims.push_back(key);
+        if (touched(key)) {
+            _state->stale.insert(key);
+            _state->failedAttempts.erase(key);
+        }
     }
-    for (const TileKey& key : victims) {
-        _state->dropLocked(key);
-        _state->failedAttempts.erase(key);
+    for (const auto& fill : _state->outstanding) {
+        if (touched(fill.first))
+            _state->editedDuringFill.insert(fill.first);
     }
 }
 
@@ -1387,8 +1407,9 @@ void SurfaceCache::requestView(int startLevel,
                 viewTiles.insert(key);
                 auto it = _state->tiles.find(key);
                 const bool haveTile = it != _state->tiles.end() && it->second;
-                const bool haveComplete = haveTile && it->second->complete;
-                if (haveComplete || _state->outstanding.count(key))
+                const bool haveCurrent = haveTile && it->second->complete &&
+                                         !_state->stale.count(key);
+                if (haveCurrent || _state->outstanding.count(key))
                     continue;
                 // Incomplete tiles are re-queued so pixels a mid-fill eviction
                 // lost eventually resolve, but only while retrying can still
@@ -1424,9 +1445,9 @@ void SurfaceCache::requestView(int startLevel,
                 return;
             if (_state->outstanding.size() >= _state->maxOutstandingFills)
                 break;
-            if (!_state->outstanding.insert(candidate.key).second)
-                continue;
             epoch = _state->epoch;
+            if (!_state->outstanding.emplace(candidate.key, epoch).second)
+                continue;
         }
         ++admitted;
         auto state = _state;

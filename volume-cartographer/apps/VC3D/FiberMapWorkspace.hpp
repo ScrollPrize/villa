@@ -20,9 +20,7 @@
 #include <unordered_map>
 #include <vector>
 
-#include "vc/core/util/ScrollUmbilicus.hpp"
 
-#include "AnnotationFrame.hpp"
 #include "FiberMapGapField.hpp"
 #include "FiberMapKollesis.hpp"
 #include "FiberMapRebuildQueue.hpp"
@@ -32,6 +30,7 @@
 #include "vc/core/util/Rect3D.hpp"
 #include "OpenDataVolumeOrientation.hpp"
 
+class CState;
 class LineAnnotationController;
 class QCheckBox;
 class QDockWidget;
@@ -116,8 +115,8 @@ class FiberMapWorkspace : public QMainWindow
     Q_OBJECT
 
 public:
-    explicit FiberMapWorkspace(LineAnnotationController* controller,
-                               QWidget* parent = nullptr);
+    FiberMapWorkspace(CState* state, LineAnnotationController* controller,
+                      QWidget* parent = nullptr);
     // Shuts the rebuild queue down (pending dropped, in-flight publication
     // refused) and waits out the private worker pool; the worker owns its
     // own data, so the wait is for clean pool teardown, not for safety of
@@ -235,9 +234,6 @@ private:
     using StaleVerdict = vc3d::fiber_map::StaleVerdict;
     [[nodiscard]] vc3d::fiber_map::FiberMapDependencies currentDependencies() const;
     [[nodiscard]] vc3d::fiber_map::FiberMapDependencies layoutDependencies() const;
-    // The cached catalog manifest's version for a coordinate space
-    // (FiberMapDependencies::catalogManifestToken): a stat, no parse.
-    [[nodiscard]] QString catalogManifestTokenFor(const std::string& coordinateSpace) const;
     // Cheap enough to guard interaction — integer compares, a few volume metadata
     // reads, and stats of the umbilicus candidates. Mutates nothing.
     [[nodiscard]] StaleVerdict evaluateDependencies() const;
@@ -429,6 +425,7 @@ private:
 
     // QPointer: the controller is owned elsewhere and dies before this widget
     // during CWindow teardown; guards keep late signals harmless.
+    CState* _state;
     QPointer<LineAnnotationController> _controller;
     FiberMapView* _view = nullptr;
     QGraphicsScene* _scene = nullptr;
@@ -504,7 +501,6 @@ private:
     // worker of every rebuild (the lookup memoizes its one manifest parse
     // and locks internally; the job holds it by shared pointer so a
     // workspace torn down mid-flight cannot pull it from under the worker).
-    std::shared_ptr<vc3d::opendata::CatalogVolumeOrientationLookup> _catalogOrientation;
     bool _haveLastDigests = false;
     vc3d::fiber_map::ContentDigest _lastInputsDigest;
     vc3d::fiber_map::ContentDigest _lastOutputDigest;
@@ -602,10 +598,9 @@ private:
     // What the current layout was built from, and whether a change has been seen
     // since; a fresh workspace is stale until its first rebuild.
     uint64_t _layoutGeneration = 0;
-    vc3d::annotation::AnnotationFrame _layoutFrame;
+    QString _layoutAnnotationVolume;
     QString _layoutUmbilicusFingerprint;
-    QString _layoutCatalogVolume;
-    QString _layoutCatalogManifestToken;
+    QString _layoutCatalogOrientation;
     // Controller counters as of the build. Compared rather than observed, so that
     // this workspace existing costs annotation work nothing.
     uint64_t _layoutPackageGeneration = 0;

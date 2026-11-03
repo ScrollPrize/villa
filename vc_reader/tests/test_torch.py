@@ -1,15 +1,12 @@
 """Run with unittest; VC_READER_BUILD_DIR selects an existing CMake build."""
 import gc
-import os
 from pathlib import Path
 import subprocess
 import sys
 import unittest
 
-if os.environ.get("VC_READER_BUILD_DIR"):
-    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "benchmarks"))
-    from extension_build import load_extensions
-    load_extensions(Path(os.environ["VC_READER_BUILD_DIR"]))
+from build_support import load_build
+load_build()
 
 import numpy as np
 import torch
@@ -65,12 +62,10 @@ class ConfigurationTests(unittest.TestCase):
     def test_import_does_not_require_torch(self):
         # The catalog and ordinary augmentation APIs remain independent of Torch.
         code = """
-import sys, os
-if os.environ.get('VC_READER_BUILD_DIR'):
-    sys.path.insert(0, 'benchmarks')
-    from pathlib import Path
-    from extension_build import load_extensions
-    load_extensions(Path(os.environ['VC_READER_BUILD_DIR']))
+import sys
+sys.path.insert(0, 'tests')
+from build_support import load_build
+load_build()
 import vc_reader
 from vc_reader import transforms
 assert 'torch' not in sys.modules

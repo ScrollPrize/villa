@@ -1140,26 +1140,6 @@ struct SpanDeviationMetrics {
     return metrics;
 }
 
-[[nodiscard]] std::vector<LineOptimizationIterationReport> iterationReports(
-    const ceres::Solver::Summary& summary)
-{
-    std::vector<LineOptimizationIterationReport> reports;
-    reports.reserve(summary.iterations.size());
-    for (const auto& iteration : summary.iterations) {
-        reports.push_back({
-            iteration.iteration,
-            iteration.cost,
-            iteration.cost_change,
-            iteration.gradient_max_norm,
-            iteration.step_norm,
-            iteration.trust_region_radius,
-            iteration.linear_solver_iterations,
-            iteration.step_is_successful,
-        });
-    }
-    return reports;
-}
-
 void addResiduals(
     ceres::Problem& problem,
     std::vector<std::array<double, 3>>& points,
@@ -1400,141 +1380,11 @@ ceres::Solver::Options solverOptions(const LineOptimizationConfig& config, bool 
     return tangent;
 }
 
-struct SequentialSolveResult {
-    std::vector<std::array<double, 3>> points;
-    double initialCost = 0.0;
-    double finalCost = 0.0;
-    int iterations = 0;
-    bool usable = true;
-    std::string report;
-};
-
 using Clock = std::chrono::steady_clock;
 
 [[nodiscard]] double elapsedMs(Clock::time_point start, Clock::time_point end)
 {
     return std::chrono::duration<double, std::milli>(end - start).count();
-}
-
-[[nodiscard]] SequentialSolveResult growSequentialLine(
-    const cv::Vec3d& seedPoint,
-    const cv::Vec3d& seedTangent,
-    const NormalSampler& sampler,
-    const LineOptimizationConfig& config)
-{
-    SequentialSolveResult result;
-    std::vector<std::array<double, 3>> backward;
-    std::vector<std::array<double, 3>> forward;
-    backward.reserve(static_cast<size_t>(config.segmentsPerSide));
-    forward.reserve(static_cast<size_t>(config.segmentsPerSide));
-
-    auto solveStep = [&](const cv::Vec3d& fixedPoint,
-                         const std::optional<cv::Vec3d>& previousPoint,
-                         const cv::Vec3d& initialDirection,
-                         int sign,
-                         bool useTangentGuide,
-                         const char* label,
-                         int step) {
-        std::array<double, 3> previous;
-        std::array<double, 3>* previousPtr = nullptr;
-        if (previousPoint.has_value()) {
-            previous = toArray(*previousPoint);
-            previousPtr = &previous;
-        }
-        std::array<double, 3> fixed = toArray(fixedPoint);
-        const cv::Vec3d guide = guidedTangentAtPoint(fixedPoint, initialDirection, sampler, config, true);
-        const cv::Vec3d signedGuide = guide * static_cast<double>(sign);
-        std::array<double, 3> moving = toArray(fixedPoint + signedGuide * config.segmentLength);
-
-        LineOptimizationConfig stepConfig = config;
-        stepConfig.tangentGuideVector = normalizedOrZero(signedGuide);
-        stepConfig.tangentGuideMode = LineOptimizationConfig::TangentGuideMode::ProjectVectorOntoTangentPlane;
-
-        ceres::Problem problem;
-        if (previousPtr) {
-            problem.AddParameterBlock(previousPtr->data(), 3);
-            problem.SetParameterBlockConstant(previousPtr->data());
-        }
-        problem.AddParameterBlock(fixed.data(), 3);
-        problem.AddParameterBlock(moving.data(), 3);
-        problem.SetParameterBlockConstant(fixed.data());
-        addSingleSegmentResiduals(problem, previousPtr, fixed, moving, sampler, stepConfig, useTangentGuide);
-
-        double initialCost = 0.0;
-        problem.Evaluate(ceres::Problem::EvaluateOptions{}, &initialCost, nullptr, nullptr, nullptr);
-
-        ceres::Solver::Summary summary;
-        ceres::Solve(solverOptions(config, false), &problem, &summary);
-
-        result.initialCost += initialCost;
-        result.finalCost += summary.final_cost;
-        result.iterations += static_cast<int>(summary.iterations.size());
-        result.usable = result.usable && summary.IsSolutionUsable();
-        result.report += std::string(label) + " step " + std::to_string(step) + ":\n" +
-                         summary.FullReport() + "\n";
-        return toVec3d(moving);
-    };
-
-    const cv::Vec3d seedGuide = guidedTangentAtPoint(seedPoint, seedTangent, sampler, config, true);
-
-    cv::Vec3d prevPoint = seedPoint;
-    std::optional<cv::Vec3d> prevPrevPoint;
-    cv::Vec3d prevDirection = seedGuide;
-    for (int step = 0; step < config.segmentsPerSide; ++step) {
-        const cv::Vec3d next = solveStep(prevPoint,
-                                         prevPrevPoint,
-                                         prevDirection,
-                                         1,
-                                         step == 0,
-                                         "forward",
-                                         step + 1);
-        forward.push_back(toArray(next));
-        prevDirection = normalizedOrZero(next - prevPoint);
-        prevPrevPoint = prevPoint;
-        prevPoint = next;
-    }
-
-    prevPoint = seedPoint;
-    prevPrevPoint = std::nullopt;
-    prevDirection = seedGuide;
-    for (int step = 0; step < config.segmentsPerSide; ++step) {
-        const cv::Vec3d next = solveStep(prevPoint,
-                                         prevPrevPoint,
-                                         prevDirection,
-                                         -1,
-                                         step == 0,
-                                         "backward",
-                                         step + 1);
-        backward.push_back(toArray(next));
-        prevDirection = normalizedOrZero(prevPoint - next);
-        prevPrevPoint = prevPoint;
-        prevPoint = next;
-    }
-
-    result.points.reserve(backward.size() + 1 + forward.size());
-    for (auto it = backward.rbegin(); it != backward.rend(); ++it) {
-        result.points.push_back(*it);
-    }
-    result.points.push_back(toArray(seedPoint));
-    result.points.insert(result.points.end(), forward.begin(), forward.end());
-    return result;
-}
-
-[[nodiscard]] std::vector<std::array<double, 3>> straightLinePoints(
-    const cv::Vec3d& seedPoint,
-    const cv::Vec3d& tangent,
-    const LineOptimizationConfig& config)
-{
-    const int pointCount = config.segmentsPerSide * 2 + 1;
-    const int seedIndex = config.segmentsPerSide;
-    std::vector<std::array<double, 3>> points;
-    points.reserve(static_cast<size_t>(pointCount));
-    for (int i = 0; i < pointCount; ++i) {
-        const cv::Vec3d point = seedPoint +
-            tangent * (static_cast<double>(i - seedIndex) * config.segmentLength);
-        points.push_back(toArray(point));
-    }
-    return points;
 }
 
 [[nodiscard]] cv::Vec3d projectDirectionToNormalPlane(
@@ -2795,31 +2645,6 @@ struct LineDifference {
     }
     diff.rms = std::sqrt(sumSq / static_cast<double>(a.size()));
     return diff;
-}
-
-[[nodiscard]] std::string comparisonReport(const std::vector<GlobalSolveResult>& results)
-{
-    if (results.empty()) {
-        return {};
-    }
-    std::ostringstream out;
-    out.imbue(std::locale::classic());
-    out << std::scientific << std::setprecision(3);
-    out << "Line annotation Lasagna candidate comparison:\n"
-        << "candidate                   ms  iters     init_rms    final_rms   rms_vs_inc   max_vs_inc\n";
-    const auto& reference = results.front();
-    for (const auto& result : results) {
-        const LineDifference diff = compareLines(reference.points, result.points);
-        out << std::left << std::setw(24) << result.name
-            << std::right << std::setw(10) << result.milliseconds
-            << std::setw(7) << result.iterations
-            << std::setw(13) << result.initialRms
-            << std::setw(13) << result.finalRms
-            << std::setw(13) << diff.rms
-            << std::setw(13) << diff.max
-            << '\n';
-    }
-    return out.str();
 }
 
 [[nodiscard]] const LineReinitializationCandidateReport* spanCandidateReport(

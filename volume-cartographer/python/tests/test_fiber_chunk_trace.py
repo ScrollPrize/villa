@@ -13,6 +13,7 @@ from test_fiber_trace import fiber_trace as ft, _write_u8_zarr, _manifest
 
 def chunk_config():
     c = ft.ChunkConfig()
+    assert c.online_refine_iterations == 0
     c.core_base, c.halo_base, c.grid_base, c.nms_base = 64, 16, 4, 4
     c.tube_half_base, c.tube_step_base = 8, 4
     c.rim_normal_base = c.rim_tangent_base = 4
@@ -26,6 +27,25 @@ def trace_config():
                           smoothness_weight=0, smoothness_normal_weight=0,
                           smoothness_tangent_weight=0, cumulative_smoothness_tangent_weight=0,
                           replay_presence_cutoff=.1, replay_presence_modulated=True)
+
+
+def test_analytic_refinement_config_fields():
+    from vc.fiber_evaluation import CHUNK_KEYS
+    c = ft.ChunkConfig()
+    assert c.online_refine_mode == "legacy"
+    assert c.beam_commit_mode == "shared_prefix"
+    c.beam_commit_mode = "rolling"
+    assert c.gpu_batch_halves == 8192
+    assert c.gpu_batch_memory_mib == 2048
+    c.online_refine_mode = "analytic"
+    c.gpu_batch_halves = 4096
+    c.gpu_batch_memory_mib = 1024
+    values = {key: getattr(c, key) for key in CHUNK_KEYS}
+    assert values["online_refine_mode"] == "analytic"
+    assert values["online_refine_iterations"] == 0  # Selecting a mode does not enable it.
+    assert values["beam_commit_mode"] == "rolling"
+    assert values["gpu_batch_halves"] == 4096
+    assert values["gpu_batch_memory_mib"] == 1024
 
 
 @pytest.fixture

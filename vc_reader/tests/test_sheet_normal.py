@@ -2,6 +2,11 @@
 import numpy as np
 import pytest
 from scipy.ndimage import correlate1d
+
+from build_support import load_build
+load_build()
+
+from vc_reader import _reader
 from vc_reader.sheet_normal import sheet_normals, sheet_normal_regions
 
 
@@ -94,3 +99,42 @@ def test_invalid_and_float_input():
     with pytest.raises(ValueError):
         sheet_normals(image, [[3,0,0]])
     assert sheet_normals(np.empty((0,109,109,109),np.uint8)).shape == (0,4)
+
+
+def test_cpu_normal_output():
+    patches = examples()[:1]
+    expected = sheet_normals(patches)
+    out = np.empty((1,4),np.float32)
+    assert sheet_normals(patches, out=out) is out
+    np.testing.assert_array_equal(out, expected)
+    for bad in [np.empty((4,),np.float32), np.empty((1,4),np.int32), np.empty((1,8),np.float32)[:,::2]]:
+        with pytest.raises(ValueError):
+            sheet_normals(patches,out=bad)
+    floats = patches.astype(np.float32)
+    with pytest.raises(ValueError, match='overlap'):
+        sheet_normals(floats,out=floats.reshape(-1)[:4].reshape(1,4))
+
+
+def test_normal_output_other_stream(torch_cuda):
+    torch = torch_cuda
+    host = examples()[:2]
+    expected = sheet_normals(host)
+    stream = torch.cuda.Stream()
+    with torch.cuda.stream(stream):
+        patches = torch.as_tensor(host,device='cuda')
+        out = torch.empty((2,4),device='cuda')
+        stream.synchronize()
+        _reader._set_stream(stream.cuda_stream)
+        try:
+            assert sheet_normals(patches,out=out) is out
+            result = out.clone()
+            with pytest.raises(ValueError, match='out'):
+                sheet_normals(patches,out=torch.empty((2,4),device='cuda',dtype=torch.int32))
+            floats = patches.float()
+            stream.synchronize()
+            with pytest.raises(ValueError, match='overlap'):
+                sheet_normals(floats,out=floats.flatten()[:8].reshape(2,4))
+        finally:
+            stream.synchronize()
+            _reader._set_stream(0)
+    np.testing.assert_allclose(result.cpu(),expected,atol=2e-5)

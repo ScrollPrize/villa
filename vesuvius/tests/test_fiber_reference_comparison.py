@@ -153,23 +153,24 @@ def test_end_to_end_and_projection_cache(tmp_path,monkeypatch):
     import json
     import tifffile
     from vesuvius.neural_tracing.fiber_trace_3d import fiber_reference_comparison as module
-    from vesuvius.neural_tracing.tracers.shared.annotations import afv
+    from vesuvius.neural_tracing.tracers.shared.annotations.fiber_store import write_fibers
     root=tmp_path/'reference';root.mkdir()
     r,c=np.indices((7,16))
     for name,array in zip('xyz',(c*10,r*10,np.full(r.shape,100))):
         tifffile.imwrite(root/(name+'.tif'),array.astype(np.float32))
     bounds=[dict(winding=i,column_begin=a,column_end=b) for i,a,b in ((10,0,6),(11,4,11),(12,9,16))]
     (root/'meta.json').write_text(json.dumps(dict(winding_bounds=bounds,output_step_vx=10)))
-    source=tmp_path/'solve';source.mkdir();original=tmp_path/'source.afv';original.write_text('fixture')
+    source=tmp_path/'solve';source.mkdir();original=tmp_path/'source.vcobj'
+    fid='00000000-0000-4000-8000-000000000001'
+    write_fibers(original,[(dict(id=fid),np.array([[15.,20.,100.],[75.,20.,100.]]))],volume='20231117143551')
     tensors=tmp_path/'tensors.npz'
-    d=dict(source_id=np.array([1,1]),start=np.array([0.,30.]),end=np.array([30.,60.]),family=np.zeros(2,int),
+    d=dict(source_id=np.array([fid,fid]),start=np.array([0.,30.]),end=np.array([30.,60.]),family=np.zeros(2,int),
            node_ds=np.array([[0.,15.,30.]]*2),lengths=np.full(2,30.),phase=np.array([.1,.7]),z=np.full(2,20.))
     np.savez(tensors,**d)
-    cfg=dict(afv=str(original),tensor_cache=str(tensors),layout_mode='shared_anchor',broken_threshold=.5)
+    cfg=dict(fibers=str(original),tensor_cache=str(tensors),layout_mode='shared_anchor',broken_threshold=.5)
     (source/'summary.json').write_text(json.dumps(dict(config=cfg)))
     state=np.zeros((2,12));state[:,:4]=[5,-5,-5,-10]
     np.savez(source/'solution.npz',state=state,widths=np.full(3,50.),**{k:d[k] for k in ('source_id','start','end','family')})
-    monkeypatch.setattr(afv,'read_afv_polylines',lambda *args:[({'id':1},np.array([[15.,20.,100.],[75.,20.,100.]]))])
     out=tmp_path/'out'
     settings=dict(reference=str(root),output_root=str(out),xyz_scale=1,surface_stride=1,workers=1,
                   render_height=40,solutions=[dict(run_root=str(source),label='toy')])

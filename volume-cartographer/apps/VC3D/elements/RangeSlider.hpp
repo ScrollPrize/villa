@@ -12,22 +12,13 @@ public:
 
     void setRange(int minimum, int maximum);
     void setValues(int low, int high);
-    void setLowValue(int value);
-    void setHighValue(int value);
-    void setHandleBorderColor(const QColor& color);
 
-    int minimum() const { return _minimum; }
-    int maximum() const { return _maximum; }
     int lowValue() const { return _lowValue; }
     int highValue() const { return _highValue; }
-    QColor handleBorderColor() const { return _handleBorderColor; }
 
     void setMinimumSeparation(int separation);
-    int minimumSeparation() const { return _minimumSeparation; }
 
 signals:
-    void lowValueChanged(int value);
-    void highValueChanged(int value);
     void valuesChanged(int low, int high);
 
 protected:
@@ -46,7 +37,7 @@ private:
         High
     };
 
-    void updateValues(int low, int high, bool emitSignals);
+    void updateValues(int low, int high);
     int valueFromPosition(int position) const;
     int positionFromValue(int value) const;
     QRect handleRectForValue(int value) const;

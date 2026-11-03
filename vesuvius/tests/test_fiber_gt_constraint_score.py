@@ -48,10 +48,11 @@ def test_offset_votes_and_integer_gauge():
 
 
 def test_piece_boundary_and_gap():
-    d=dict(source_id=np.array([4,4,4]),start=np.array([0.,10.,25.]),end=np.array([10.,20.,30.]))
-    assert piece_at(d,4,10)==1
-    assert piece_at(d,4,22) is None
-    assert piece_at(d,5,5) is None
+    a,b='00000000-0000-4000-8000-000000000004','00000000-0000-4000-8000-000000000005'
+    d=dict(source_id=np.array([a,a,a]),start=np.array([0.,10.,25.]),end=np.array([10.,20.,30.]))
+    assert piece_at(d,a,10)==1
+    assert piece_at(d,a,22) is None
+    assert piece_at(d,b,5) is None
 
 
 def test_disabled_placement_not_last_bucket():

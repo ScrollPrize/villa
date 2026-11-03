@@ -40,7 +40,7 @@ concurrency:
 jobs:
   build-windows:
     name: ${{ github.event_name == 'pull_request' && 'Compile' || 'Build + package' }} (MSYS2 UCRT64)
-    runs-on: windows-latest
+    runs-on: blacksmith-4vcpu-windows-2025
     timeout-minutes: 150
     env:
       SCCACHE_GHA_ENABLED: 'true'
@@ -206,10 +206,10 @@ jobs:
           Write-Host "bundle bin dir: $bin"
           # Console CLI tool: loads the vc_core/OpenCV/Ceres DLL closure.
           # No-args prints usage and exits 1; anything else means load failure.
-          & "$bin\vc_tifxyz_trim.exe"
-          $trimExitCode = $LASTEXITCODE
-          if ($trimExitCode -notin 0,1) { throw "vc_tifxyz_trim failed to start (exit $trimExitCode)" }
-          Write-Host "vc_tifxyz_trim OK (exit $trimExitCode)"
+          & "$bin\vc_tifxyz2obj.exe"
+          $cliExitCode = $LASTEXITCODE
+          if ($cliExitCode -notin 0,1) { throw "vc_tifxyz2obj failed to start (exit $cliExitCode)" }
+          Write-Host "vc_tifxyz2obj OK (exit $cliExitCode)"
           # Start-Process below does not update $LASTEXITCODE. Clear the
           # accepted usage exit so the Actions pwsh wrapper does not fail the
           # step with this stale value after all smoke checks have passed.
@@ -241,7 +241,7 @@ jobs:
     name: Attach Windows package to release
     if: github.event_name == 'release'
     needs: build-windows
-    runs-on: ubuntu-24.04
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 10
     permissions:
       actions: read

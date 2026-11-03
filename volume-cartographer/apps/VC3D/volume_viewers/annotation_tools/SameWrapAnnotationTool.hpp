@@ -51,7 +51,6 @@ public:
     void setSpacing(double spacingVx);
     void setMergeExistingAnnotations(bool enabled);
     void setPathType(PathType pathType);
-    void setImageFilter(ImageFilterType filterType, int kernelSize);
     void setImageFilterType(ImageFilterType filterType);
     void setImageFilterKernelSize(int kernelSize);
     void noteShiftReleased();

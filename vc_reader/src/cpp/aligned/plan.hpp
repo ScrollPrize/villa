@@ -85,7 +85,6 @@ struct PointPlan : Plan {
 void launch(const Grid&,const std::vector<std::int64_t>&,const std::vector<const void*>&,const void*,ElementType,void*,bool*,int);
 void launch_many(const std::vector<Grid>&,const std::vector<std::vector<std::int64_t>>&,
                  const std::vector<std::vector<const void*>>&,const void*,ElementType,void*,bool*,int);
-void launch_valid(const Grid&,bool*);
 void launch_box(Triple,Triple,Triple,bool*);
 void launch_field(float*,bool*,std::size_t,Field);
 #endif

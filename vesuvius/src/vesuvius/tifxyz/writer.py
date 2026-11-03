@@ -304,6 +304,9 @@ class TifxyzWriter:
 
             # Atomic move if using temp directory
             if use_atomic and temp_dir:
+                for entry in original_path.iterdir():
+                    if entry.is_file() and not (self.path / entry.name).exists():
+                        shutil.copy2(entry, self.path / entry.name)
                 # Remove old directory and rename temp to final
                 shutil.rmtree(original_path)
                 shutil.move(str(self.path), str(original_path))

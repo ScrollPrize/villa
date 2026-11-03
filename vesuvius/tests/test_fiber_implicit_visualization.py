@@ -2,18 +2,21 @@ import numpy as np
 from vesuvius.neural_tracing.fiber_trace_3d.fiber_uv_visualization import segments
 
 
+A,B='00000000-0000-4000-8000-000000000007','00000000-0000-4000-8000-000000000008'
+
+
 def test_deformation_curves_reverse_arc_and_source_rates():
     from vesuvius.neural_tracing.fiber_trace_3d.fiber_uv_visualization import deformation_geometry
-    d=dict(family=np.array([0,1]),source_id=np.array([7,8]),start=np.array([0.,0.]),end=np.array([100.,100.]),
+    d=dict(family=np.array([0,1]),source_id=np.array([A,B]),start=np.array([0.,0.]),end=np.array([100.,100.]),
         node_ds=np.array([[0.,50.,100.],[0.,-50.,-100.]]))
     saved=dict(state=np.array([[1.,.5,10.,8.],[1.,.5,30.,8.]]),widths=np.ones(4)*100,
-        retained=np.ones(2,dtype=bool),v_offset_source=np.array([7,7,7,8,8]),v_offset_arc=np.array([0.,50.,100.,0.,100.]),
+        retained=np.ones(2,dtype=bool),v_offset_source=np.array([A,A,A,B,B]),v_offset_arc=np.array([0.,50.,100.,0.,100.]),
         v_offset_left=np.array([0,1,3]),v_offset_right=np.array([1,2,4]),
         u_offsets=np.array([0.,40.,0.,0.,0.]),v_offsets=np.array([0.,0.,0.,0.,20.]))
     a,b,r=deformation_geometry(d,saved,dict(winding_sigma=.5))
     np.testing.assert_allclose(b[1][0]-a[1][0],[0,40,0])
     np.testing.assert_allclose(b[2][1],[30,-50])
-    assert r[7]==(.8,0) and r[8]==(0,.2)
+    assert r[A]==(.8,0) and r[B]==(0,.2)
 
 
 def test_density_segments_and_integer_gauge():

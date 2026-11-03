@@ -44,7 +44,7 @@ def _factory(constructor):
 
 
 _constructors = (
-    "Param Uniform Normal Choice BalancedContrast Image Label ScalarField ValidMask Points "
+    "Param Uniform Normal Choice Image Label ScalarField ValidMask Points "
     "Vectors VectorField NormalField CoordinateField OneOf "
     "BrightnessMultiply BrightnessAdd Contrast Gamma Invert Normalize GaussianNoise RicianNoise "
     "ClipOutliers GaussianBlur MedianFilter Sharpen BrightnessGradient LocalContrast "

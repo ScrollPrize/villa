@@ -122,6 +122,9 @@ void bloscDecompressInto(std::span<const std::byte> input, std::span<std::byte> 
     if (rc < 0) {
         throw std::runtime_error("blosc_decompress_ctx failed with code " + std::to_string(rc));
     }
+    if (static_cast<size_t>(rc) != output.size()) {
+        throw std::runtime_error("blosc_decompress_ctx returned unexpected byte count");
+    }
 }
 
 std::vector<std::byte> bloscDecompress(std::span<const std::byte> input, size_t outputSize)
@@ -281,6 +284,9 @@ void gzipDecompressInto(std::span<const std::byte> input, std::span<std::byte> o
     if (rc != Z_STREAM_END && rc != Z_OK) {
         throw std::runtime_error("gzip inflate failed with code " + std::to_string(rc));
     }
+    if (rc != Z_STREAM_END || stream.total_out != output.size()) {
+        throw std::runtime_error("gzip inflate returned unexpected byte count or incomplete stream");
+    }
 }
 
 std::vector<std::byte> gzipDecompress(std::span<const std::byte> input, size_t outputSize)
@@ -383,8 +389,8 @@ std::vector<std::byte> compressBytes(const CompressorConfig& cfg,
         return volcompCompress(input, cfg);
     case CompressorId::Delta3d:
         // Encoding needs the chunk shape, which this byte-oriented layer
-        // does not have. Volumes are written in this format by
-        // scripts/recompress_zarr.py (or the chunk-cache writer).
+        // does not have. Volumes are written in this format by the
+        // chunk-cache writer.
         throw std::runtime_error(
             "writing delta3d zarr chunks is not supported here");
     }
@@ -564,8 +570,7 @@ struct VcDataset::Impl {
     void open(const std::filesystem::path& path) {
         fsPath = path;
         // Remote volumes stage source metadata as .zarray files, then store
-        // the local c3d disk cache beside it as zarr.json. openZarrLevels()
-        // only selects directories with .zarray, so prefer that source
+        // the local c3d disk cache beside it as zarr.json. Prefer that source
         // metadata here when both files exist; otherwise a reopened remote
         // cache would rebuild the HTTP source from the local cache metadata.
         if (std::filesystem::exists(path / ".zarray")) {
@@ -661,7 +666,6 @@ size_t VcDataset::defaultChunkSize() const { return impl_->chunkSize_; }
 VcDtype VcDataset::getDtype() const { return impl_->dtype_; }
 size_t VcDataset::dtypeSize() const { return impl_->dtypeSize_; }
 const std::filesystem::path& VcDataset::path() const { return impl_->fsPath; }
-const std::string& VcDataset::delimiter() const { return impl_->delimiter_; }
 
 void VcDataset::decompress(std::span<const uint8_t> compressed,
                             void* output, size_t nElements) const
@@ -926,181 +930,9 @@ bool VcDataset::readRegion(const std::vector<size_t>& offset,
     return iterChunks(0);
 }
 
-bool VcDataset::writeRegion(const std::vector<size_t>& offset,
-                             const std::vector<size_t>& regionShape,
-                             const void* data)
-{
-    for (size_t d = 0; d < regionShape.size(); ++d) {
-        if (regionShape[d] == 0) return true;
-    }
-    // Refuse a region that does not lie inside the dataset, as readRegion does (the bounds
-    // contract in VcDataset.hpp). Checked with subtraction so offset + extent cannot overflow.
-    const auto& dsShape = impl_->shape_;
-    if (offset.size() != dsShape.size() || regionShape.size() != dsShape.size()) return false;
-    for (size_t d = 0; d < dsShape.size(); ++d) {
-        if (offset[d] > dsShape[d] || regionShape[d] > dsShape[d] - offset[d]) return false;
-    }
-
-    const size_t ndim = offset.size();
-    const auto& chunkShape = impl_->chunkShape_;
-    const size_t elemSize = impl_->dtypeSize_;
-    const auto* inBytes = static_cast<const uint8_t*>(data);
-
-    size_t chunkElems = 1;
-    for (size_t d = 0; d < ndim; ++d) chunkElems *= chunkShape[d];
-
-    std::vector<size_t> chunkStart(ndim), chunkEnd(ndim);
-    for (size_t d = 0; d < ndim; ++d) {
-        chunkStart[d] = offset[d] / chunkShape[d];
-        chunkEnd[d] = (offset[d] + regionShape[d] - 1) / chunkShape[d];
-    }
-
-    std::vector<size_t> regionStrides(ndim);
-    regionStrides[ndim - 1] = elemSize;
-    for (int d = static_cast<int>(ndim) - 2; d >= 0; --d)
-        regionStrides[d] = regionStrides[d + 1] * regionShape[d + 1];
-
-    std::vector<size_t> chunkStrides(ndim);
-    chunkStrides[ndim - 1] = elemSize;
-    for (int d = static_cast<int>(ndim) - 2; d >= 0; --d)
-        chunkStrides[d] = chunkStrides[d + 1] * chunkShape[d + 1];
-
-    std::vector<uint8_t> chunkBuf(chunkElems * elemSize);
-
-    std::vector<size_t> ci(ndim);
-    std::function<bool(size_t)> iterChunks = [&](size_t dim) -> bool {
-        if (dim == ndim) {
-            std::array<size_t, 3> indices;
-            for (size_t d = 0; d < ndim && d < 3; ++d) indices[d] = ci[d];
-            auto idxSpan = std::span<const size_t>(indices.data(), ndim);
-
-            // Check if we're writing a full chunk
-            bool fullChunk = true;
-            for (size_t d = 0; d < ndim; ++d) {
-                size_t chunkGlobalStart = ci[d] * chunkShape[d];
-                if (chunkGlobalStart < offset[d] ||
-                    chunkGlobalStart + chunkShape[d] > offset[d] + regionShape[d]) {
-                    fullChunk = false;
-                    break;
-                }
-            }
-
-            // If partial, read existing chunk first
-            if (!fullChunk) {
-                auto existing = impl_->zarrArray_->read_chunk(idxSpan);
-                if (existing && existing->size() >= chunkElems * elemSize) {
-                    std::memcpy(chunkBuf.data(), existing->data(), chunkElems * elemSize);
-                } else {
-                    std::memset(chunkBuf.data(), 0, chunkElems * elemSize);
-                }
-            }
-
-            // Compute overlap
-            std::vector<size_t> copyStart(ndim), copySize(ndim);
-            for (size_t d = 0; d < ndim; ++d) {
-                size_t chunkGlobalStart = ci[d] * chunkShape[d];
-                size_t chunkGlobalEnd = chunkGlobalStart + chunkShape[d];
-                size_t regStart = offset[d];
-                size_t regEnd = offset[d] + regionShape[d];
-                copyStart[d] = std::max(chunkGlobalStart, regStart);
-                copySize[d] = std::min(chunkGlobalEnd, regEnd) - copyStart[d];
-            }
-
-            // Copy from input to chunk buffer
-            std::vector<size_t> pos(ndim, 0);
-            std::function<void(size_t)> copyLoop = [&](size_t d) {
-                if (d == ndim - 1) {
-                    size_t srcOff = 0, dstOff = 0;
-                    for (size_t dd = 0; dd < ndim; ++dd) {
-                        size_t regLocal = copyStart[dd] + pos[dd] - offset[dd];
-                        size_t chunkLocal = copyStart[dd] + pos[dd] - ci[dd] * chunkShape[dd];
-                        srcOff += regLocal * regionStrides[dd];
-                        dstOff += chunkLocal * chunkStrides[dd];
-                    }
-                    std::memcpy(chunkBuf.data() + dstOff, inBytes + srcOff, copySize[d] * elemSize);
-                    return;
-                }
-                for (size_t i = 0; i < copySize[d]; ++i) {
-                    pos[d] = i;
-                    copyLoop(d + 1);
-                }
-            };
-
-            copyLoop(0);
-
-            // Write the chunk
-            auto byteSpan = std::span<const std::byte>(
-                reinterpret_cast<const std::byte*>(chunkBuf.data()),
-                chunkElems * elemSize);
-            impl_->zarrArray_->write_chunk(idxSpan, byteSpan);
-            return true;
-        }
-        for (ci[dim] = chunkStart[dim]; ci[dim] <= chunkEnd[dim]; ++ci[dim]) {
-            if (!iterChunks(dim + 1)) return false;
-        }
-        return true;
-    };
-    return iterChunks(0);
-}
-
 // ============================================================================
 // Factory functions
 // ============================================================================
-
-std::vector<std::unique_ptr<VcDataset>> openZarrLevels(
-    const std::filesystem::path& zarrRoot)
-{
-    std::vector<std::string> levelNames;
-
-    // Prefer OME-Zarr .zattrs multiscales metadata for level discovery.
-    auto zattrs = readZarrAttributes(zarrRoot);
-    bool gotFromAttrs = false;
-    if (zattrs.contains("multiscales") && zattrs["multiscales"].is_array()
-        && zattrs["multiscales"].size() > 0) {
-        auto ms0 = zattrs["multiscales"][0];
-        if (ms0.contains("datasets") && ms0["datasets"].is_array()) {
-            for (const auto& ds : ms0["datasets"]) {
-                if (ds.contains("path")) {
-                    std::string p = ds["path"].get_string();
-                    // Verify the array actually exists on disk
-                    if (std::filesystem::exists(zarrRoot / p / ".zarray")) {
-                        levelNames.push_back(std::move(p));
-                    }
-                }
-            }
-            gotFromAttrs = !levelNames.empty();
-        }
-    }
-
-    // Fallback: scan subdirectories for .zarray (legacy / non-OME zarrs).
-    if (!gotFromAttrs) {
-        for (auto& entry : std::filesystem::directory_iterator(zarrRoot)) {
-            if (!entry.is_directory()) continue;
-            auto p = entry.path();
-            if (std::filesystem::exists(p / ".zarray")) {
-                levelNames.push_back(p.filename().string());
-            }
-        }
-        // Sort numerically where possible, lexicographically otherwise.
-        std::sort(levelNames.begin(), levelNames.end(),
-                  [](const std::string& a, const std::string& b) {
-                      int ia = 0, ib = 0;
-                      bool aNum = false, bNum = false;
-                      try { ia = std::stoi(a); aNum = true; } catch (...) {}
-                      try { ib = std::stoi(b); bNum = true; } catch (...) {}
-                      if (aNum && bNum) return ia < ib;
-                      if (aNum != bNum) return aNum;
-                      return a < b;
-                  });
-    }
-
-    std::vector<std::unique_ptr<VcDataset>> result;
-    result.reserve(levelNames.size());
-    for (auto& name : levelNames) {
-        result.push_back(std::make_unique<VcDataset>(zarrRoot / name));
-    }
-    return result;
-}
 
 utils::Json readZarrAttributes(const std::filesystem::path& groupPath)
 {

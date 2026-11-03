@@ -9,14 +9,14 @@ std::optional<std::filesystem::path> ObjectStore::resolveStoragePath(
     namespace fs = std::filesystem;
     const auto object = objectByUuid(txn, objectUuid);
     if (!object || (object->storageKind != "file" && object->storageKind != "sqlite") ||
-        (object->kind != "patch" && object->kind != "fiber" && object->kind != "point_collection"))
+        (object->kind != "surface" && object->kind != "fiber" && object->kind != "point_collection"))
         return std::nullopt;
 
-    const bool patch = object->kind == "patch";
+    const bool surface = object->kind == "surface";
     const auto uuid = parseUuid(object->uuid);
     const auto matches = [&](const fs::path& candidate) {
-        const auto metadata = patch ? candidate / "meta.json" : candidate;
-        if (!patch && metadata.extension() != ".json")
+        const auto metadata = surface ? candidate / "meta.json" : candidate;
+        if (!surface && metadata.extension() != ".json")
             return false;
         std::ifstream input(metadata);
         if (!input)
@@ -34,7 +34,7 @@ std::optional<std::filesystem::path> ObjectStore::resolveStoragePath(
             }
             if (!json.is_object() || !json.contains("uuid") || !json["uuid"].is_string())
                 return false;
-            if (!patch && !json.contains("control_points") && !json.contains("line_points"))
+            if (!surface && !json.contains("control_points") && !json.contains("line_points"))
                 return false;
             const auto sourceUuid = json["uuid"].get<std::string>();
             return util::isUuid(sourceUuid) && parseUuid(sourceUuid) == uuid;
@@ -51,8 +51,8 @@ std::optional<std::filesystem::path> ObjectStore::resolveStoragePath(
     }
     if (!fs::exists(root))
         return std::nullopt;
-    // The caller may supply the patch directory itself as the search root.
-    if (patch && matches(root))
+    // The caller may supply the surface directory itself as the search root.
+    if (surface && matches(root))
         return root;
 
     std::optional<fs::path> found;
@@ -67,13 +67,13 @@ std::optional<std::filesystem::path> ObjectStore::resolveStoragePath(
             }
             if (!fs::is_regular_file(entry.path() / "meta.json"))
                 continue;
-            // Patch geometry can be large; only its metadata is relevant.
+            // Surface geometry can be large; only its metadata is relevant.
             it.disable_recursion_pending();
-            if (!patch)
+            if (!surface)
                 continue;
             candidate = entry.path();
         } else {
-            if (patch || entry.path().filename() == "meta.json" || !entry.is_regular_file())
+            if (surface || entry.path().filename() == "meta.json" || !entry.is_regular_file())
                 continue;
             candidate = entry.path();
         }

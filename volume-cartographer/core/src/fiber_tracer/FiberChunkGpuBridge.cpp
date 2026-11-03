@@ -1,4 +1,5 @@
 #include "vc/fiber_tracer/FiberChunkTrace.hpp"
+#include "vc/fiber_tracer/detail/FiberChunkTensor.hpp"
 #include <atomic>
 #include "vc/core/util/AtomicFile.hpp"
 #include <condition_variable>
@@ -91,7 +92,8 @@ std::shared_ptr<void> acquireFiberChunkGpu(const FiberChunkTraceConfig& c,const 
 void runFiberChunkGpu(FiberChunkPaths& output,const FiberPredictionSource& source,
     const vc::lasagna::NormalSampler& normals,const FiberTraceConfig& cfg,
     const FiberChunkTraceConfig& c,double scale,const std::vector<Json>& gpuSeeds,
-    const std::shared_ptr<vc::render::PinnedChunkRegion>& pinned,const FiberChunkWait& wait)
+    const std::shared_ptr<vc::render::PinnedChunkRegion>& pinned,const FiberChunkWait& wait,
+    const detail::FiberChunkTensor* tensor)
 {
     if(c.gpuLibrary.empty())throw std::invalid_argument("GPU library required");
     auto& gpu=gpuChunks(c);
@@ -103,6 +105,7 @@ void runFiberChunkGpu(FiberChunkPaths& output,const FiberPredictionSource& sourc
         if(!field || !normalField || field->optionCount()!=1 || c.refineSeed || cfg.embeddingWeight>0)
             throw std::runtime_error("GPU fixture requires single native option, no embeddings/seed fit");
         const double spacing=field->storedGridInfo().predictionToBaseScale/scale;
+        const auto volumeShape=field->storedGridInfo().shapeZYX;
         const double margin=cfg.stepVoxels*std::max(1,cfg.beamLookaheadSteps)+
             (c.onlineRefineIterations?(c.onlineRefineCapBase+c.onlineRefineEpsilonBase)/scale:0);
         std::array<int,3> origin{},shape{};
@@ -113,7 +116,11 @@ void runFiberChunkGpu(FiberChunkPaths& output,const FiberPredictionSource& sourc
         std::vector<unsigned char> byteValues;std::vector<float> widthValues;
         byteValues.reserve(size_t(shape[0])*shape[1]*shape[2]*6);
         widthValues.reserve(size_t(shape[0])*shape[1]*shape[2]);
-        {
+        if(tensor) {
+            if(origin!=tensor->origin() || shape!=tensor->shape() || spacing!=tensor->spacing())
+                throw std::logic_error("GPU and owned tensor lattices disagree");
+            tensor->packGpu(byteValues,widthValues);
+        } else {
 
         for(int z=0;z<shape[2];++z) {
             std::vector<cv::Vec3f> points;
@@ -125,21 +132,31 @@ void runFiberChunkGpu(FiberChunkPaths& output,const FiberPredictionSource& sourc
             auto visitor=[](void* context,size_t i,const cv::Vec3f& fraction,bool valid,
                             std::span<const std::array<uint8_t,8>> values){
                 auto& c=*static_cast<vc::lasagna::LasagnaCornerBatch*>(context);
-                if(values.size()!=6)throw std::runtime_error("GPU export requires six aligned channels");
                 c.valid[i]=valid;c.fractionsXYZ[i]=fraction;
+                // Out-of-volume visitor callbacks carry no channel payload.
+                // Keep the same invalid padding as the owned ROI export.
+                if(!valid){for(auto& channel:c.values)channel[i]={};return;}
+                if(values.size()!=6)throw std::runtime_error("GPU export requires six aligned channels");
                 for(size_t k=0;k<6;++k)c.values[k][i]=values[k];
             };
             if(!field->visitCornerBatchWithNormals(*normalField,points,1,&corners,visitor,0,nullptr,pinned.get()))
                 throw std::runtime_error("GPU fixture requires aligned native corner grids");
             std::vector<float> widths;if(pinned)field->sampleWidths(points,widths,*pinned);else field->sampleWidths(points,widths);
             for(size_t i=0;i<points.size();++i) {
-                if(!corners.valid[i] || cv::norm(corners.fractionsXYZ[i])>1e-6)
-                    throw std::runtime_error("GPU fixture lattice mismatch/outside volume");
+                const int x=origin[0]+int(i%shape[0]),y=origin[1]+int(i/shape[0]),zz=origin[2]+z;
+                const bool inside=x>=0&&y>=0&&zz>=0&&size_t(x)<volumeShape[2]&&size_t(y)<volumeShape[1]&&size_t(zz)<volumeShape[0];
+                if(!inside){
+                    byteValues.insert(byteValues.end(),6,0);widths[i]=0;continue;
+                }
+                if(!corners.valid[i])throw std::runtime_error("GPU export invalid channels inside volume");
+                if(cv::norm(corners.fractionsXYZ[i])>1e-6)
+                    throw std::runtime_error("GPU fixture lattice mismatch");
                 for(int channel=0;channel<6;++channel) byteValues.push_back(corners.values[channel][i][0]);
             }
             widthValues.insert(widthValues.end(),widths.begin(),widths.end());
         }
         }
+        out->timings["gpu_pack_seconds"]=elapsed();
         Json seeds=Json::array();for(const auto& seed:gpuSeeds) if(!seed.is_null()) seeds.push_back(seed);
         Json meta={{"seeds",seeds},{"origin",origin},{"shape_xyz",shape},{"spacing",spacing},
             {"bounds",{xyz(out->lo/scale),xyz(out->hi/scale)}},{"trace_to_base",scale},
@@ -152,8 +169,13 @@ void runFiberChunkGpu(FiberChunkPaths& output,const FiberPredictionSource& sourc
             {"normal_smoothness",cfg.smoothnessNormalWeight},{"tangent_smoothness",cfg.smoothnessTangentWeight},
             {"free_angle",cfg.smoothnessFreeAngleDegrees},{"cumulative_weight",cfg.cumulativeSmoothnessTangentWeight},
             {"cumulative_steps",cfg.cumulativeSmoothnessSteps},{"mask_normals",normalField->masksInvalidCorners()}};
+        meta["volume_shape_xyz"]={volumeShape[2],volumeShape[1],volumeShape[0]};
         meta["online_refine_iterations"]=c.onlineRefineIterations;
         meta["online_refine_window"]=c.onlineRefineWindow;
+        meta["online_refine_mode"]=c.onlineRefineMode;
+        meta["beam_commit_mode"]=c.beamCommitMode;
+        meta["gpu_batch_halves"]=c.gpuBatchHalves;
+        meta["gpu_batch_memory_mib"]=c.gpuBatchMemoryMiB;
         meta["online_refine_epsilon"]=c.onlineRefineEpsilonBase/scale;
         meta["online_refine_step"]=c.onlineRefineStepBase/scale;
         meta["online_refine_cap"]=c.onlineRefineCapBase/scale;

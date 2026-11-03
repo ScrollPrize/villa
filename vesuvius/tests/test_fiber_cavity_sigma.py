@@ -4,6 +4,10 @@ import torch
 from vesuvius.neural_tracing.fiber_trace_3d.fiber_cavity_sigma import CavitySigma, combine, grouped_pairs
 
 
+def fid(k):
+    return f'00000000-0000-4000-8000-{k:012d}'
+
+
 def graph(edges, means, **cfg):
     n=len(means)
     state=torch.tensor([[m,0.,0.,4.] for m in means],requires_grad=True)
@@ -11,7 +15,7 @@ def graph(edges, means, **cfg):
     data=dict(i=i,j=j,family=torch.ones(n,dtype=torch.long),ds_a=torch.zeros(len(i)),ds_b=torch.zeros(len(i)),
         sign=torch.ones(len(i)),distance=torch.zeros(len(i)),parallel=torch.ones(len(i),dtype=torch.bool))
     config=dict(cavity_update_every=1,cavity_damping=1.,sigma_max=1.,winding_sigma=.5,**cfg)
-    ext=CavitySigma(dict(source_id=np.arange(n),**{k:v.numpy() for k,v in data.items()}),config,'cpu')
+    ext=CavitySigma(dict(source_id=np.array([fid(k) for k in range(n)]),**{k:v.numpy() for k,v in data.items()}),config,'cpu')
     return ext,state,data
 
 
@@ -104,7 +108,7 @@ def test_cap_and_isolated():
 
 def test_reject_split_sources():
     with pytest.raises(ValueError,match='whole distinct'):
-        CavitySigma(dict(source_id=[1,1],family=[0,0]),{},'cpu')
+        CavitySigma(dict(source_id=[fid(1),fid(1)],family=[0,0]),{},'cpu')
 
 
 def test_source_grouped_reentry_does_not_multiply_evidence():
@@ -112,7 +116,7 @@ def test_source_grouped_reentry_does_not_multiply_evidence():
     _,s,d=graph([(0,1),(2,1)],[0.,0.,2.])
     # Reanchoring piece2 by+2 leaves its physical anchor unchanged via phase−2.
     with torch.no_grad():s[2,1]=-2
-    raw=dict(source_id=np.array([10,20,10]),**{k:v.numpy() for k,v in d.items()})
+    raw=dict(source_id=np.array([fid(10),fid(20),fid(10)]),**{k:v.numpy() for k,v in d.items()})
     ext=CavitySigma(raw,dict(original.config,cavity_group_source_pieces=True),'cpu')
     step(ext,s,d)
     torch.testing.assert_close(ext.degree,original.degree)
@@ -144,7 +148,7 @@ def test_signed_translation_and_restore_rejection(tmp_path):
     d['family']=torch.tensor([0,1]);d['parallel'][:]=False
     d['sign'][:]=-1;d['distance'][:]=1.5;d['ds_a'][:]=150
     with torch.no_grad():s[:,1]=torch.tensor([.8,-.2])
-    raw=dict(source_id=np.arange(2),**{k:v.numpy() for k,v in d.items()})
+    raw=dict(source_id=np.array([fid(0),fid(1)]),**{k:v.numpy() for k,v in d.items()})
     ext=CavitySigma(raw,ext.config,'cpu');step(ext,s,d)
     expected,_p,_v=soft.pair_errors(s[:1],s[1:],d['family'][:1],d['family'][1:],d['ds_a'],d['ds_b'],
         torch.ones(20)*100,d['sign'],d['distance'],d['parallel'])

@@ -18,7 +18,8 @@ public:
     void setLinkedSurfaceNames(const QStringList& names);
 
 signals:
-    void finishedOutputActivated(const QString& outputName);
+    // A finished job's first output surface (its UUID).
+    void finishedOutputActivated(const QString& surfaceUuid);
 
 private:
     void setJobs(const QJsonArray& jobs);

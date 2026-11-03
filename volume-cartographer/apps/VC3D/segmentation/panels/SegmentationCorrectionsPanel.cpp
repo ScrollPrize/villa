@@ -72,7 +72,7 @@ void SegmentationCorrectionsPanel::setCorrectionsEnabled(bool enabled)
         return;
     }
     _correctionsEnabled = enabled;
-    writeSetting(QStringLiteral("corrections_enabled"), _correctionsEnabled);
+    writeSetting(vc3d::settings::segmentation::CORRECTIONS_ENABLED, _correctionsEnabled);
 }
 
 void SegmentationCorrectionsPanel::setCorrectionCollections(

@@ -108,30 +108,6 @@ TEST_CASE("save with extra channels writes ch_a.tif and ch_b.tif")
     fs::remove_all(root);
 }
 
-TEST_CASE("save_meta after save: meta.json is rewritten")
-{
-    auto root = tmpDir("save_meta");
-    auto segDir = root / "seg";
-    {
-        QuadSurface seed(grid(), cv::Vec2f(1.f, 1.f));
-        seed.id = "orig";
-        seed.save(segDir);
-    }
-    QuadSurface qs(segDir);
-    qs.path = segDir;
-    qs.meta = utils::Json::object();
-    qs.meta["uuid"] = "new-uuid";
-    qs.meta["type"] = "seg";
-    qs.meta["format"] = "tifxyz";
-    qs.meta["custom"] = "hi";
-    qs.id = "new-uuid";
-    qs.save_meta();
-
-    QuadSurface reloaded(segDir);
-    CHECK(reloaded.meta["custom"].get_string() == "hi");
-    fs::remove_all(root);
-}
-
 TEST_CASE("Rect3D operators: assignment + equality (cv::Vec3f compares per-component)")
 {
     Rect3D a;

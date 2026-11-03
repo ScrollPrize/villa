@@ -104,14 +104,19 @@ def structural_inventory(manifest_path: str | Path) -> list[dict[str, Any]]:
     """Describe manifest and Zarr metadata without walking data chunks."""
     manifest = Path(manifest_path)
     bundle = manifest.parent
-    value = json.loads(manifest.read_text(encoding="utf-8"))
+    embedded = manifest.is_dir()
+    metadata_file = manifest / ".zattrs" if embedded else manifest
+    value = json.loads(metadata_file.read_text(encoding="utf-8"))
+    if embedded:
+        value = value["lasagna"]
     inventory: list[dict[str, Any]] = [{
         "kind": "manifest",
-        "path": manifest.name,
-        "sha256": sha256_file(manifest),
+        "path": _relative(bundle, metadata_file),
+        "sha256": sha256_file(metadata_file),
+        **({"schema_version": 3, "attribute": "lasagna", "store": manifest.name} if embedded else {}),
     }]
     for name, group in sorted(value.get("groups", {}).items()):
-        level_path = bundle / str(group["zarr"])
+        level_path = (manifest if embedded else bundle) / str(group["zarr"])
         root = level_path.parent
         levels = []
         for candidate in sorted(root.iterdir(), key=lambda item: int(item.name) if item.name.isdigit() else 1 << 30):
@@ -121,14 +126,15 @@ def structural_inventory(manifest_path: str | Path) -> list[dict[str, Any]]:
             metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
             levels.append({
                 "level": int(candidate.name),
-                "shape_zyx": [int(v) for v in metadata["shape"]],
-                "chunks_zyx": [int(v) for v in metadata["chunks"]],
+                "shape_zyx": [int(v) for v in metadata["shape"][-3:]],
+                "chunks_zyx": [int(v) for v in metadata["chunks"][-3:]],
+                **({"shape_czyx": metadata["shape"], "chunks_czyx": metadata["chunks"]} if embedded else {}),
                 "dtype": str(metadata["dtype"]),
                 "compressor": metadata.get("compressor"),
                 "metadata_sha256": sha256_file(metadata_path),
             })
         inventory.append({
-            "kind": "ome-zarr-channel",
+            "kind": "ome-zarr-resolution-group" if embedded else "ome-zarr-channel",
             "name": str(name),
             "path": _relative(bundle, root),
             "channels": list(group.get("channels", [name])),
@@ -194,7 +200,7 @@ def finalize_document(
     updated = dict(document)
     updated["status"] = str(status)
     updated["updated_at"] = utc_now()
-    if manifest_path is not None and Path(manifest_path).is_file():
+    if manifest_path is not None and Path(manifest_path).exists():
         updated["artifacts"] = structural_inventory(manifest_path)
     if error:
         updated["error"] = str(error)

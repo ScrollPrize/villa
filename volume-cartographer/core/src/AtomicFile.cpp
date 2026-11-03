@@ -188,8 +188,9 @@ void atomicWriteBytes(
                 throw std::runtime_error("flush failed for " + temporary.string());
         }
 #if defined(_WIN32)
+        // FlushFileBuffers needs a handle with write access.
         HANDLE file = ::CreateFileW(
-            temporary.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
+            temporary.c_str(), GENERIC_WRITE, FILE_SHARE_READ, nullptr,
             OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
         if (file == INVALID_HANDLE_VALUE || !::FlushFileBuffers(file)) {
             const auto error = static_cast<int>(::GetLastError());
@@ -249,6 +250,35 @@ std::size_t cleanupAtomicWriteTemporaryFiles(
     for (const auto& path : abandoned)
         std::filesystem::remove(path);
     return abandoned.size();
+}
+
+StagedDirectory::StagedDirectory(std::filesystem::path target)
+    : target_(std::move(target))
+{
+    std::random_device random;
+    for (int attempt = 0; attempt < 100; ++attempt) {
+        staging_ = target_.parent_path() /
+                   ("." + target_.filename().string() + ".partial-" + std::to_string(random()));
+        std::error_code error;
+        if (std::filesystem::create_directories(staging_, error)) return;
+        if (error) throw std::system_error(error, "cannot create staging directory " + staging_.string());
+    }
+    throw std::runtime_error("cannot reserve a staging directory for " + target_.string());
+}
+
+StagedDirectory::~StagedDirectory()
+{
+    if (committed_) return;
+    std::error_code ignored;
+    std::filesystem::remove_all(staging_, ignored);
+}
+
+void StagedDirectory::commit()
+{
+    std::error_code error;
+    if (std::filesystem::exists(target_, error)) std::filesystem::remove_all(target_);
+    std::filesystem::rename(staging_, target_);
+    committed_ = true;
 }
 
 } // namespace vc::core::util
