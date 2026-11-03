@@ -87,13 +87,16 @@ std::optional<WalkState> integrate(WalkState s, double h, Walk::SheetIntegrator 
     return next;
 }
 void walkSheetSubsteps(const Walk::SheetWalk& walk, std::size_t line,
-                       const Walk::SheetNormalFn& normal, std::vector<cv::Vec3f>& guess)
+                       const Walk::SheetNormalFn& normal, std::vector<cv::Vec3f>& guess,
+                       const SheetWalkProgress& vertexCompleted)
 {
     const double length = cv::norm(walk.steps[line]);
     WalkState state{Vec(walk.origins[line]), Vec(walk.steps[line])};
     if (!std::isfinite(length) || length <= 0) {
-        for (int k = 0; k < walk.cells; ++k)
+        for (int k = 0; k < walk.cells; ++k) {
             guess[line * walk.cells + k] = walk.origins[line];
+            if (vertexCompleted) vertexCompleted();
+        }
         return;
     }
     state.v /= length;
@@ -117,21 +120,29 @@ void walkSheetSubsteps(const Walk::SheetWalk& walk, std::size_t line,
             state.x += h * state.v;
         }
         guess[line * walk.cells + k] = cv::Vec3f(state.x);
+        if (vertexCompleted) vertexCompleted();
     }
 }
 } // namespace
 
+void walkSheetLine(const SheetWalk& walk, std::size_t line,
+                   const SheetNormalFn& normal, std::vector<cv::Vec3f>& guess)
+{
+    walkSheetLine(walk, line, normal, guess, {});
+}
+
 void walkSheetLine(const SheetWalk& walk,
                                   std::size_t line,
                                   const SheetNormalFn& normal,
-                                  std::vector<cv::Vec3f>& guess)
+                                  std::vector<cv::Vec3f>& guess,
+                                  const SheetWalkProgress& vertexCompleted)
 {
     if (line >= walk.origins.size() || line >= walk.steps.size() ||
         guess.size() < (line + 1) * static_cast<std::size_t>(walk.cells)) {
         return;
     }
     if (walk.options.maxStep > 0 || walk.options.mode == SheetWalkMode::Streamline) {
-        walkSheetSubsteps(walk, line, normal, guess);
+        walkSheetSubsteps(walk, line, normal, guess, vertexCompleted);
         return;
     }
     cv::Vec3f point = walk.origins[line];
@@ -153,13 +164,21 @@ void walkSheetLine(const SheetWalk& walk,
         }
         point += step;
         guess[line * static_cast<std::size_t>(walk.cells) + static_cast<std::size_t>(k)] = point;
+        if (vertexCompleted) vertexCompleted();
     }
+}
+
+void walkSheetLines(const SheetWalk& walk, const SheetNormalFn& normal,
+                    std::vector<cv::Vec3f>& guess, unsigned workers)
+{
+    walkSheetLines(walk, normal, guess, workers, {});
 }
 
 void walkSheetLines(const SheetWalk& walk,
                                   const SheetNormalFn& normal,
                                   std::vector<cv::Vec3f>& guess,
-                                  unsigned workers)
+                                  unsigned workers,
+                                  const SheetWalkProgress& vertexCompleted)
 {
     if (walk.origins.empty()) return;
     const auto count = std::min<std::size_t>(std::max(1u, workers), walk.origins.size());
@@ -170,7 +189,7 @@ void walkSheetLines(const SheetWalk& walk,
     auto work = [&]() {
         try {
             for (std::size_t line = next++; line < walk.origins.size() && !failed; line = next++) {
-                walkSheetLine(walk, line, normal, guess);
+                walkSheetLine(walk, line, normal, guess, vertexCompleted);
             }
         } catch (...) {
             std::lock_guard lock(failureMutex);

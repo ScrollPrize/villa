@@ -1,5 +1,7 @@
 #pragma once
 
+#include "GrowPatchSeedDialog.hpp"
+
 #include <optional>
 #include <memory>
 #include <functional>
@@ -68,12 +70,7 @@ public:
     };
 
     // Arguments accepted by startGrowPatchFromSeed.
-    struct GrowPatchSeedParams {
-        QString volumeId;          // vpkg volume id; empty => current volume
-        int     iterations{200};   // clamped/validated to [1, 100000]
-        double  minAreaCm{0.002};  // >= 0
-        QString outputTag{QStringLiteral("paths")};  // tag of the new surface
-    };
+    using GrowPatchSeedParams = ::GrowPatchSeedParams;
 
     // Arguments accepted by startRunTrace.
     struct RunTraceParams {

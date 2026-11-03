@@ -829,3 +829,5 @@ vc_add_test(NAME test_volume_pkg_more)
 
 vc_add_test(NAME test_seed_anchor LIBS doctest::doctest Ceres::ceres
     INCLUDES "${CMAKE_CURRENT_SOURCE_DIR}/../include")
+
+vc_add_test(NAME test_sheet_seed)

@@ -117,6 +117,7 @@ set(srcs
     VolumeRegistrations.hpp
     CommandLaunchError.hpp
     FiberSaveBatchTracker.hpp
+    GrowPatchSeedDialog.cpp
     SegmentationCommandHandler.cpp
     SegmentationCommandHandler.hpp
     volume_viewers/annotation_tools/SameWrapAnnotationTool.cpp

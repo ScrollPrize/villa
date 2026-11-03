@@ -451,6 +451,10 @@ _Keybinds:_
 
 **Seeding** 
 
+Ctrl+right-click in a volume viewer and choose **Create Segment (GrowPatch)**
+to select default GrowPatch, projection, or streamline seed growth. See
+[seed growth modes and parameters](docs/grow_patch_sheet_seeds.md).
+
 _Widget for creating initial segmentations which can be used for traces or later growth actions_
 
 - `Draw paths` : while on, a left-drag in a viewer draws a path

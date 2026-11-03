@@ -33,4 +33,14 @@ void walkSheetLine(const SheetWalk& walk, std::size_t line,
                    const SheetNormalFn& normal, std::vector<cv::Vec3f>& guess);
 void walkSheetLines(const SheetWalk& walk, const SheetNormalFn& normal,
                     std::vector<cv::Vec3f>& guess, unsigned workers);
+// Called after each output vertex, including on worker threads. Observers
+// synchronize their own state and must not modify the walk. Keep the original
+// overloads for existing Manual Grow callers (including shared-library builds).
+using SheetWalkProgress = std::function<void()>;
+void walkSheetLine(const SheetWalk& walk, std::size_t line,
+                   const SheetNormalFn& normal, std::vector<cv::Vec3f>& guess,
+                   const SheetWalkProgress& vertexCompleted);
+void walkSheetLines(const SheetWalk& walk, const SheetNormalFn& normal,
+                    std::vector<cv::Vec3f>& guess, unsigned workers,
+                    const SheetWalkProgress& vertexCompleted);
 } // namespace vc::sheet
