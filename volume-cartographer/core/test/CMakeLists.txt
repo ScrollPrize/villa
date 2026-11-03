@@ -64,6 +64,9 @@ function(vc_add_test)
     vc_register_ctest(${T_NAME} ${T_NAME})
 endfunction()
 
+vc_add_test(NAME test_cache_compression LIBS doctest::doctest vc_delta3d::vc_delta3d
+    INCLUDES "${CMAKE_CURRENT_SOURCE_DIR}/../include")
+
 vc_add_test(NAME test_sampling_wait_profile)
 add_test(NAME test_sampling_wait_profile_enabled
     COMMAND ${CMAKE_COMMAND} -E env VC_SAMPLING_WAIT_PROFILE=1
@@ -826,3 +829,5 @@ vc_add_test(NAME test_volume_pkg_more)
 
 vc_add_test(NAME test_seed_anchor LIBS doctest::doctest Ceres::ceres
     INCLUDES "${CMAKE_CURRENT_SOURCE_DIR}/../include")
+
+vc_add_test(NAME test_sheet_seed)

@@ -35,6 +35,8 @@ std::shared_ptr<Mesh> build(const cv::Mat_<cv::Vec3f>& points, size_t maxBytes, 
             hasOrigin = true;
         }
         Vertex v{};
+        v.uv[0] = float(x) / (points.cols - 1);
+        v.uv[1] = float(y) / (points.rows - 1);
         for (int k = 0; k < 3; ++k) {
             v.position[k] = float(double(p[k]) - mesh->origin[k]);
             mesh->bounds.lower[k] = std::min(mesh->bounds.lower[k], double(p[k]));

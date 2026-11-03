@@ -6,6 +6,46 @@
 
 namespace vc3d::fibers3d::ct
 {
+cv::Mat_<uint8_t> displayBytes(const cv::Mat& values)
+{
+    if (values.type() != CV_8UC1 && values.type() != CV_16UC1)
+        throw std::invalid_argument("CT display supports uint8 and uint16 values");
+    cv::Mat_<uint8_t> bytes;
+    values.convertTo(bytes, CV_8U, values.type() == CV_16UC1 ? 1./256. : 1.);
+    return bytes;
+}
+cv::Mat_<cv::Vec2b> sampleCoordinates(const cv::Mat_<cv::Vec3f>& points, Volume& volume, int level)
+{
+    if (!volume.hasScaleLevel(level))
+        throw std::runtime_error("Requested CT level is unavailable");
+    const auto dtype = volume.dtype();
+    if (dtype != vc::render::ChunkDtype::UInt8 && dtype != vc::render::ChunkDtype::UInt16)
+        throw std::runtime_error("CT display supports uint8 and uint16 volumes");
+    const auto shape = volume.shapeXyz();
+    cv::Mat_<cv::Vec3f> coords = points.clone();
+    cv::Mat_<cv::Vec2b> result(points.size(), cv::Vec2b{0,0});
+    for (int r=0; r<coords.rows; ++r)
+        for (int c=0; c<coords.cols; ++c) {
+            const auto v = coords(r,c);
+            const bool valid = std::isfinite(v[0]) && std::isfinite(v[1]) && std::isfinite(v[2]) &&
+                v[0]>=0 && v[1]>=0 && v[2]>=0 && v[0]<=shape[0]-1 && v[1]<=shape[1]-1 && v[2]<=shape[2]-1;
+            if (valid) result(r,c)[1] = 255;
+            else coords(r,c) = {-1,-1,-1};
+        }
+    vc::SampleParams params;
+    params.level = level;
+    cv::Mat_<uint8_t> bytes;
+    if (dtype == vc::render::ChunkDtype::UInt16) {
+        cv::Mat_<uint16_t> values;
+        volume.sample(values, coords, params);
+        bytes = displayBytes(values);
+    } else
+        volume.sample(bytes, coords, params);
+    for (int r=0; r<coords.rows; ++r)
+        for (int c=0; c<coords.cols; ++c) result(r,c)[0] = bytes(r,c);
+    return result;
+}
+
 void sampleTile(Tile& tile, Volume& volume, int level, const std::atomic_bool* cancelled)
 {
     if (tile.width < 2 || tile.height < 2 || tile.width > 1024 || tile.height > 1024 || tile.left.size() != size_t(tile.height) ||
@@ -18,8 +58,6 @@ void sampleTile(Tile& tile, Volume& volume, int level, const std::atomic_bool* c
         throw std::runtime_error("CT display supports uint8 and uint16 volumes");
     tile.pixels.resize(size_t(tile.width) * tile.height * 2);
     const auto shape = volume.shapeXyz();
-    vc::SampleParams params;
-    params.level = level;
     for (int first = 0; first < tile.height; first += 32) {
         if (cancelled && cancelled->load(std::memory_order_relaxed))
             throw std::runtime_error("CT sampling cancelled");
@@ -33,16 +71,10 @@ void sampleTile(Tile& tile, Volume& volume, int level, const std::atomic_bool* c
                 coords(r, c) = valid ? cv::Vec3f(float(p[0]), float(p[1]), float(p[2])) : cv::Vec3f(-1, -1, -1);
                 tile.pixels[(size_t(first + r) * tile.width + c) * 2 + 1] = valid ? 255 : 0;
             }
-        cv::Mat_<uint8_t> bytes;
-        if (dtype == vc::render::ChunkDtype::UInt16) {
-            cv::Mat_<uint16_t> values;
-            volume.sample(values, coords, params);
-            values.convertTo(bytes, CV_8U, 1. / 256.);
-        } else
-            volume.sample(bytes, coords, params);
+        const auto samples = sampleCoordinates(coords, volume, level);
         for (int r = 0; r < rows; ++r)
             for (int c = 0; c < tile.width; ++c)
-                tile.pixels[(size_t(first + r) * tile.width + c) * 2] = bytes(r, c);
+                tile.pixels[(size_t(first + r) * tile.width + c) * 2] = samples(r, c)[0];
     }
 }
 Progress sampleTileProgressive(Tile& tile, vc::render::IChunkedArray& cache, int level, const std::atomic_bool* cancelled)

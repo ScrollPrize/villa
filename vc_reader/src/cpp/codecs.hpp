@@ -85,7 +85,9 @@ inline void decode(Codec codec, const std::uint8_t* src, std::size_t n, std::uin
 // A Delta3D payload written losslessly (quantization bin width 0 or 1).
 inline bool delta3d_lossless(const std::uint8_t* p, std::size_t n)
 {
-    return n >= 7 && std::memcmp(p, "D3D1", 4) == 0 && p[6] <= 1;
+    const auto quant = vc_delta3d::quantization(
+        std::span(reinterpret_cast<const std::byte*>(p), n));
+    return quant && *quant == vc_delta3d::kQuantizationLossless;
 }
 
 inline std::vector<std::uint8_t> encode_delta3d(const std::uint8_t* src, std::size_t n,

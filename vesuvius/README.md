@@ -27,6 +27,7 @@ _this package is in active development_
 | `vesuvius.predict`            | `models.run.inference`             | outputs logits from a pretrained nnUNet-v2 model or one trained within the Vesuvius training framework; currently only works on Zarr data and can be fully distributed with `--num_parts` and `--part_id` |
 | `vesuvius.blend_logits`       | `models.run.blending`              | blends the logits from `vesuvius.predict` using Gaussian blending                                                                                                                                         |
 | `vesuvius.finalize_outputs`   | `models.run.finalize_outputs`      | performs softmax / argmax / none on the blended array and writes a final `uint8` volume                                                                                                                   |
+| `vesuvius.afv_spline_generator` | `afv_spline_generator.cli`       | [predicts fibers](docs/afv_spline_generator.md) in a zone of a Zarr volume and writes their polylines in a fiber object store (`.vcobj`) for VC3D                                                       |
 | `vesuvius.compute_st`         | `structure_tensor.run_create_st`   | computes structure tensors on input data and derives eigen-values/vectors                                                                                                                                 |
 | `vesuvius.napari_trainer`     | `napari_trainer.main_window`       | launches a Napari window for interactive training and inference                                                                                                                                           |
 | `vesuvius.voxelize_obj`       | `image_proc.run.voxelize_objs`     | converts input `.obj` meshes to voxel grids and outputs `.tif` stacks                                                                                                                                     |
@@ -35,7 +36,6 @@ _this package is in active development_
 | `vesuvius.accept_terms`       | `install.accept_terms`             | accepts the data terms and conditions; pass `--yes` to accept non-interactively |
 | `vesuvius.blend_and_finalize` | `models.run.blending`              | fused `vesuvius.blend_logits` + `vesuvius.finalize_outputs` in a single pass |
 | `vesuvius.find_patches`       | `models.preprocessing.patches.cli` | scans a Zarr dataset and writes the valid-patch cache used by training |
-| `vesuvius.zarr_tasks`         | `image_proc.run.zarr_tasks.__main__` | runs a Zarr processing task (threshold, scale, transpose, recompress, ...); `--list-tasks` lists them |
 
 
 
@@ -111,7 +111,7 @@ Additionally, the augmentations provided within this package are from another of
 
 Copying the modules directly into `vesuvius` was a choice of end-user friendliness, as we were using highly modified branches of both libraries, which created conflicts if an end user were to attempt to run any of our models.
 
-_**Detailed documentation for training and inference are located in [the docs folder](docs/docs)**_
+_**Detailed documentation for training and inference are located in [the docs folder](docs)**_
 ___
 
 
@@ -125,7 +125,7 @@ ___
 6. Infer on the same layer, or another by importing an image, selecting it in the inference widget, and hitting `Run Inference`
 
 
-![alt text](docs/docs/images/napari_trainer.png)
+![alt text](docs/images/napari_trainer.png)
 
 ___
 
@@ -139,7 +139,7 @@ ___
 6. Skip patches or continue with `spacebar` or `next pair`
 7. Patches are saved in the output dir, and their locations in the .json progress file
 
-![alt text](docs/docs/images/proofreader.png)
+![alt text](docs/images/proofreader.png)
 
 ### Training with `vesuvius.train`
 

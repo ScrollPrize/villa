@@ -14,13 +14,14 @@ public:
     Fiber3DSurfaceRenderer();
     ~Fiber3DSurfaceRenderer();
     // True while uploading. Subsequent frames reuse the resident buffers.
-    bool draw(std::shared_ptr<const surface::Mesh>, const QMatrix4x4&, const Point& origin, const QQuaternion& rotation, float opacity);
+    bool draw(std::shared_ptr<const surface::Mesh>, const QMatrix4x4&, const Point& origin, const QQuaternion& rotation, float opacity, bool textured = true, float low = 0, float high = 255);
     QString error() const { return error_; }
 
 private:
     std::shared_ptr<const surface::Mesh> mesh_;
     QOpenGLShaderProgram program_;
-    GLuint vao_ = 0, vertices_ = 0, indices_ = 0;
+    GLuint vao_ = 0, vertices_ = 0, indices_ = 0, texture_ = 0;
+    int textureRows_ = 0;
     size_t vertexBytes_ = 0, indexBytes_ = 0;
     QString error_;
 };
