@@ -75,6 +75,7 @@ private slots:
     void projectionSubstepsReduceDrift();
     void guidedClicksStayLocal();
     void autoExtendGrowsAlongTheSheet();
+    void autoExtendPreservesLazyChannelsWithoutResizing();
     void autoExtendReportsNormalFailures();
 };
 
@@ -547,6 +548,45 @@ void TestManualAddExtend::autoExtendGrowsAlongTheSheet()
     QVERIFY2(none, status.c_str());
     QCOMPARE(none->steps[0].stepsWithoutNormal, 6 * 5);
     QVERIFY(distance((*flat.rawPointsPtr())(3, 14), cv::Vec3f(14 * kSpacing, 3 * kSpacing, 100.0f)) < 1e-3f);
+}
+
+void TestManualAddExtend::autoExtendPreservesLazyChannelsWithoutResizing()
+{
+    QTemporaryDir dir;
+    QVERIFY(dir.isValid());
+    const auto root = std::filesystem::path(dir.path().toStdString());
+    const auto input = root / "input";
+    const auto output = root / "output";
+    const auto points = flatSheet(4, 7, cv::Rect(0, 0, 4, 4));
+    cv::Mat_<uint16_t> ink(points.rows * 2, points.cols * 2);
+    for (int row = 0; row < ink.rows; ++row)
+        for (int col = 0; col < ink.cols; ++col)
+            ink(row, col) = static_cast<uint16_t>(row * ink.cols + col + 256);
+    {
+        QuadSurface surface(points, cv::Vec2f(0.5f, 0.5f));
+        surface.setChannel("ink", ink);
+        surface.save(input);
+    }
+    auto surface = load_quad_from_tifxyz(input);
+    QVERIFY(!surface->channelLoaded("ink"));
+    segmentation::AutoExtendOptions options;
+    options.sides = {ManualAddTool::ExtendSide::Right};
+    options.cells = 2;
+    options.rounds = 1;
+    options.threads = 1;
+    std::string status;
+    const auto result = segmentation::autoExtendSurface(*surface, {}, options, &status);
+    QVERIFY2(result, status.c_str());
+    QCOMPARE(result->added, 8);
+    QCOMPARE(surface->rawPointsPtr()->size(), points.size());
+    surface->saveAsNew(output);
+
+    auto reloaded = load_quad_from_tifxyz(output);
+    const cv::Mat savedInk = reloaded->channel("ink", SURF_CHANNEL_NORESIZE);
+    QVERIFY(!savedInk.empty());
+    QCOMPARE(savedInk.size(), ink.size());
+    QCOMPARE(savedInk.type(), ink.type());
+    QCOMPARE(cv::norm(savedInk, ink, cv::NORM_INF), 0.0);
 }
 
 void TestManualAddExtend::streamlineConverges_data()

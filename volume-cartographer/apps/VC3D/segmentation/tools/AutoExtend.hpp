@@ -17,7 +17,8 @@ namespace segmentation
 // "Extensions follow the sheet" does in the GUI) and keeps the result.
 // Rounds start from the edge the previous round left. The grid is padded as
 // needed and every channel stays aligned; cells under a mask are marked valid
-// so the new vertices survive a reload.
+// so the new vertices survive a reload. Successful extensions materialize all
+// channels so saving to a new directory preserves them even without padding.
 struct AutoExtendOptions
 {
     std::vector<ManualAddTool::ExtendSide> sides{ManualAddTool::ExtendSide::Up,

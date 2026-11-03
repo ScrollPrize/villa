@@ -133,6 +133,11 @@ std::optional<AutoExtendResult> autoExtendSurface(QuadSurface& surface,
             result.steps.push_back(step);
         }
     }
+    // saveAsNew writes only loaded channels. Resizing loads them already,
+    // but extensions within existing empty borders must preserve them too.
+    for (const auto& name : surface.channelNames()) {
+        surface.channel(name, SURF_CHANNEL_NORESIZE);
+    }
     return result;
 }
 
