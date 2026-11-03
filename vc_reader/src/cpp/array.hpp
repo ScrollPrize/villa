@@ -316,7 +316,7 @@ struct Stats {
 class Array {
 public:
     Array(ArraySpec spec, std::shared_ptr<MemoryCache> cache)
-        : spec_(std::move(spec)), cache_(std::move(cache)), pool_(spec_.threads), maps_(8192)
+        : spec_(std::move(spec)), cache_(std::move(cache)), pool_(sharedPool(spec_.threads)), maps_(8192)
     {
         const std::size_t nd = spec_.shape.size();
         if (nd == 0 || spec_.chunks.size() != nd)
@@ -365,7 +365,7 @@ public:
     std::size_t ndim() const noexcept { return spec_.shape.size(); }
     const ArraySpec& spec() const noexcept { return spec_; }
     const std::shared_ptr<MemoryCache>& memory_cache() const noexcept { return cache_; }
-    void parallel_for(std::size_t n, const std::function<void(std::size_t)>& fn) { pool_.parallel_for(n,fn); }
+    void parallel_for(std::size_t n, const std::function<void(std::size_t)>& fn) { pool_->parallel_for(n,fn); }
     std::size_t itemsize() const noexcept { return spec_.itemsize; }
 
     // Credentials for later fetches (e.g. refreshed temporary keys).
@@ -608,8 +608,8 @@ public:
                     if (resident) {
                         block.sample(coords,raw.data(),static_cast<float*>(out),
                             [&](std::size_t count,const auto& fn) {
-                                if (pool_.size()==1) for (std::size_t z=0;z<count;++z) fn(z);
-                                else pool_.parallel_for(count,fn);
+                                if (pool_->size()==1) for (std::size_t z=0;z<count;++z) fn(z);
+                                else pool_->parallel_for(count,fn);
                             });
                         return;
                     }
@@ -815,13 +815,13 @@ private:
              const BoxOutput* output = nullptr, bool stream = false)
     {
         if (spec_.hint && (!cache_ || stream))
-            pool_.parallel_for(work.size(), [&](std::size_t i) { hint(work[i]); });
-        pool_.parallel_for(work.size(), [&](std::size_t i) { resolve(work[i], out_strides, op, output, stream); });
+            pool_->parallel_for(work.size(), [&](std::size_t i) { hint(work[i]); });
+        pool_->parallel_for(work.size(), [&](std::size_t i) { resolve(work[i], out_strides, op, output, stream); });
     }
 
     std::size_t plan_segments(std::size_t n) const
     {
-        return std::clamp<std::size_t>(n / kPlanGrain, 1, 4 * (pool_.size() + 1));
+        return std::clamp<std::size_t>(n / kPlanGrain, 1, 4 * (pool_->size() + 1));
     }
 
     // Point planning only divides nonnegative voxel indices. Common power-of-two
@@ -947,7 +947,7 @@ private:
             }
         };
         std::vector<Segment> seg(segs);
-        pool_.parallel_for(segs, [&](std::size_t s) {
+        pool_->parallel_for(segs, [&](std::size_t s) {
             Segment& g = seg[s];
             const std::size_t p0 = n * s / segs, p1 = n * (s + 1) / segs;
             g.entries.reserve(p1 - p0);
@@ -1009,7 +1009,7 @@ private:
         }
         points.resize(start.back());
         runs.resize(run_start.back());
-        pool_.parallel_for(segs, [&](std::size_t s) {
+        pool_->parallel_for(segs, [&](std::size_t s) {
             Segment& g = seg[s];
             for (const Entry& e : g.entries) {
                 Point& pt = points[g.next[e.id]++];
@@ -1044,7 +1044,7 @@ private:
             fn(pts);
             return;
         }
-        pool_.parallel_for(parts, [&](std::size_t i) {
+        pool_->parallel_for(parts, [&](std::size_t i) {
             const std::size_t a = pts.size() * i / parts, b = pts.size() * (i + 1) / parts;
             fn(pts.subspan(a, b - a));
         });
@@ -1070,7 +1070,7 @@ private:
                 cut.push_back(i + 1);
         }
         cut.push_back(runs.size());
-        pool_.parallel_for(cut.size() - 1, [&](std::size_t i) { fn(runs.subspan(cut[i], cut[i + 1] - cut[i])); });
+        pool_->parallel_for(cut.size() - 1, [&](std::size_t i) { fn(runs.subspan(cut[i], cut[i + 1] - cut[i])); });
     }
 
     // Byte offset of the element at `idx` in the chunk whose first element is `base`.
@@ -1374,7 +1374,7 @@ private:
                 };
             }
             run(work, {}, &op);
-            pool_.parallel_for(split.size(), [&](std::size_t s) {
+            pool_->parallel_for(split.size(), [&](std::size_t s) {
                 Cell<N,Real> cell;
                 Coord coordinate[N ? N : kMaxSampleDims];
                 for (const Split& sp : split[s].points) {
@@ -1856,7 +1856,7 @@ private:
 
     ArraySpec spec_;
     std::shared_ptr<MemoryCache> cache_;
-    ThreadPool pool_;
+    std::shared_ptr<ThreadPool> pool_;  // shared with arrays asking for as many workers
     MapCache maps_;
     std::unique_ptr<HttpClient> http_;
     std::vector<ChunkCodec> codecs_;

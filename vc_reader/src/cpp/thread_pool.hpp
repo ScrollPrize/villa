@@ -8,10 +8,15 @@
 #include <deque>
 #include <exception>
 #include <functional>
+#include <iterator>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <thread>
+#include <utility>
 #include <vector>
+
+#include <unistd.h>
 
 namespace vcr {
 
@@ -132,6 +137,28 @@ private:
 inline ThreadPool& samplingPool()
 {
     static ThreadPool pool(std::min(8u, std::max(1u, std::thread::hardware_concurrency())));
+    return pool;
+}
+
+// The workers of every array asking for `threads` workers: arrays open at the same
+// time share them rather than each adding its own, so many open arrays do not
+// multiply threads. Each parallel_for still gets up to `threads` helpers, and its
+// caller runs items too, so nested reads (a computed array reading another array
+// on the same pool) always progress. A pool lives while an array holds it. A forked
+// child gets new pools: the parent's workers do not run there.
+inline std::shared_ptr<ThreadPool> sharedPool(std::size_t threads)
+{
+    static std::mutex mutex;
+    // Never destroyed, so arrays opened during static destruction still find it.
+    static auto* pools = new std::map<std::pair<pid_t, std::size_t>, std::weak_ptr<ThreadPool>>();
+    const std::pair<pid_t, std::size_t> key{getpid(), threads};
+    std::lock_guard lock(mutex);
+    for (auto it = pools->begin(); it != pools->end();)
+        it = it->second.expired() || it->first.first != key.first ? pools->erase(it) : std::next(it);
+    if (auto pool = (*pools)[key].lock())
+        return pool;
+    auto pool = std::make_shared<ThreadPool>(threads);
+    (*pools)[key] = pool;
     return pool;
 }
 

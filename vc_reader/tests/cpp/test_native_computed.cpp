@@ -3,11 +3,13 @@
 // persist on disk and are reused by a later open of the same identity; mismatched
 // persisted arrays are refused; fill chunks; point sampling of the computed array;
 // concurrent readers of an uncached chunk compute it once; caller-thread-only arrays
-// compute every chunk on the reading thread.
+// compute every chunk on the reading thread; arrays asking for as many workers share
+// them, and nested reads on a shared pool from concurrent callers finish.
 #include "vc_reader/computed.hpp"
 #include "vc_reader/zarr.hpp"
 #include "vc_reader/array.hpp"
 #include "vc_reader/zarr_write.hpp"
+#include "vc_reader/native/thread_pool.hpp"
 
 #include <atomic>
 #include <chrono>
@@ -258,6 +260,39 @@ void callerThreadOnly()
     secondDone.set_value();
     require(v == 3 && first.get() == 3 && calls == 2, "overlapping caller-thread-only reads compute independently");
 }
+// Arrays asking for as many workers share one pool. A computed array and the stored
+// array its chunks read from, both on a two-worker pool, read by four callers at once:
+// every nested read finishes and the values are right.
+void sharedWorkers(const Fixture& f)
+{
+    require(sharedPool(3) == sharedPool(3) && sharedPool(3) != sharedPool(4), "pools are shared by worker count");
+    zarr::OpenOptions open;
+    open.threads = 2;
+    auto stored = zarr::openArray((f.root / "input.zarr").string(), open).array;
+    Filter filter{*stored};
+    computed::Options o;
+    o.shape = {Z, Y, X};
+    o.chunks = {C, C, C};
+    o.identity = "shared workers";
+    o.threads = 2;
+    o.memoryCache = std::make_shared<MemoryCache>(1 << 20);
+    auto array = computed::open(o, [&](const Index& c, std::uint8_t* out) { return filter(c, out); });
+    std::vector<std::future<std::vector<std::uint8_t>>> reads;
+    for (int t = 0; t < 4; ++t)
+        reads.push_back(std::async(std::launch::async, [&] {
+            std::vector<std::uint8_t> all(std::size_t(Z) * Y * X);
+            array->read_many({{0, 0, 0}}, {{Z, Y, X}}, {all.data()});
+            return all;
+        }));
+    for (auto& read : reads) {
+        require(read.wait_for(std::chrono::seconds(20)) == std::future_status::ready, "nested reads on a shared pool finish");
+        const auto all = read.get();
+        for (int z = 0; z < Z; ++z)
+            for (int y = 0; y < Y; ++y)
+                for (int x = 0; x < X; ++x)
+                    require(all[(std::size_t(z) * Y + y) * X + x] == maxFiltered(z, y, x), "shared-pool computed values");
+    }
+}
 }  // namespace
 
 int main()
@@ -267,6 +302,7 @@ int main()
         computedArrays(f);
         concurrentReadersComputeOnce();
         callerThreadOnly();
+        sharedWorkers(f);
         std::cout << "computed arrays passed\n";
     } catch (const std::exception& e) {
         std::cerr << e.what() << '\n';
