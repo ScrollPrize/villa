@@ -184,7 +184,6 @@ set(srcs
     segmentation/tools/SurfaceMaskBrushTool.hpp
     segmentation/tools/ManualAddTool.cpp
     segmentation/tools/ManualAddTool.hpp
-    segmentation/tools/SheetNormalField.cpp
     segmentation/tools/SheetNormalField.hpp
     segmentation/tools/ThinPlateSpline3d.cpp
     segmentation/tools/ThinPlateSpline3d.hpp
@@ -431,7 +430,6 @@ add_executable(vc_extend_edge
     segmentation/SurfaceGridEdit.cpp
     segmentation/tools/AutoExtend.cpp
     segmentation/tools/ManualAddTool.cpp
-    segmentation/tools/SheetNormalField.cpp
     segmentation/tools/ThinPlateSpline3d.cpp)
 target_include_directories(vc_extend_edge PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}

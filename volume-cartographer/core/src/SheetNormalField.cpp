@@ -1,4 +1,4 @@
-#include "SheetNormalField.hpp"
+#include "vc/core/util/SheetNormalField.hpp"
 
 #include "vc/core/render/IChunkedArray.hpp"
 #include "vc/core/types/Array3D.hpp"

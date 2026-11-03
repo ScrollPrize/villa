@@ -1,6 +1,7 @@
 #pragma once
 
 #include "SegmentationEditManager.hpp"
+#include "vc/core/util/SheetWalk.hpp"
 
 #include <opencv2/core/mat.hpp>
 
@@ -57,17 +58,9 @@ public:
         int last{-1};
     };
 
-    enum class SheetWalkMode { Projection = 0, Streamline = 1 };
-    enum class SheetIntegrator { Midpoint = 0, Heun = 1, RK4 = 2 };
-    struct SheetWalkOptions
-    {
-        // Maximum internal arc-length step in volume voxels; 0 uses one
-        // step per output vertex. Output mesh spacing is unchanged.
-        double maxStep{0.0};
-        SheetWalkMode mode{SheetWalkMode::Projection};
-        SheetIntegrator integrator{SheetIntegrator::Midpoint};
-        bool continuousNormals() const { return maxStep > 0 || mode == SheetWalkMode::Streamline; }
-    };
+    using SheetWalkMode = vc::sheet::SheetWalkMode;
+    using SheetIntegrator = vc::sheet::SheetIntegrator;
+    using SheetWalkOptions = vc::sheet::SheetWalkOptions;
 
     struct Config
     {
@@ -177,15 +170,8 @@ public:
     // what the walk needs, so the volume reads can run off the GUI thread;
     // applySheetWalk() installs the result only if the same extension is
     // still pending.
-    using SheetNormalFn = std::function<std::optional<cv::Vec3f>(const cv::Vec3f& world)>;
-    struct SheetWalk
-    {
-        std::uint64_t extensionId{0};
-        int cells{0};
-        std::vector<cv::Vec3f> origins;
-        std::vector<cv::Vec3f> steps;
-        SheetWalkOptions options;
-    };
+    using SheetNormalFn = vc::sheet::SheetNormalFn;
+    using SheetWalk = vc::sheet::SheetWalk;
     [[nodiscard]] std::optional<SheetWalk> sheetWalk() const;
     // Walks line `line` of `walk`, writing its `cells` points into `guess`
     // (sized origins.size() * cells) at line * cells. Lines are independent.
