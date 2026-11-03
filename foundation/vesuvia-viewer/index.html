@@ -1,0 +1,128 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>vesuvia</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="stylesheet" href="ui/style.css">
+</head>
+<body>
+<canvas id="canvas"></canvas>
+<header>
+  <span class="title">vesuvia</span>
+  <button id="open-button" type="button">Open…</button>
+  <span class="spacer"></span>
+  <button id="help-button" type="button" data-tip="Keys and mouse (?)">?</button>
+  <button id="panel-button" type="button" data-tip="Show or hide the panel (Tab)">Panel</button>
+</header>
+<main>
+  <div class="grid" id="grid">
+    <div class="pane" id="pane-xy"><span class="label">XY</span></div>
+    <div class="pane" id="pane-xz"><span class="label">XZ</span></div>
+    <div class="pane" id="pane-yz"><span class="label">YZ</span></div>
+    <div class="pane" id="pane-surface"><span class="label">Surface</span></div>
+    <div class="empty">
+      <h1>Open a volume</h1>
+      <p>A zarr CT on any host that allows it.</p>
+      <div><button id="empty-open" type="button" class="primary">Open…</button></div>
+    </div>
+  </div>
+  <aside id="panel" class="panel">
+    <div id="extensions"></div>
+    <section class="needs-ct">
+      <h2>CT</h2>
+      <div class="row"><span>Black</span><input id="ct-black" type="range" min="0" max="255" step="1" aria-label="Black"><input id="ct-black-value" type="number" step="any" aria-label="Black, typed"></div>
+      <div class="row"><span>White</span><input id="ct-white" type="range" min="0" max="255" step="1" aria-label="White"><input id="ct-white-value" type="number" step="any" aria-label="White, typed"></div>
+      <div class="row"><span></span><button id="ct-auto" type="button" title="2nd..98th percentile of the resident chunks">Auto</button></div>
+    </section>
+    <section id="layers-section" hidden>
+      <h2>Layers</h2>
+      <div id="layers"></div>
+    </section>
+    <section id="surface-section" hidden>
+      <h2>Surface</h2>
+      <label class="row"><span>Offset</span><input id="surface-offset" type="number" required step="1"></label>
+      <label class="row"><span>Slab front</span><input id="surface-front" type="number" required min="0" step="1"></label>
+      <label class="row"><span>Slab back</span><input id="surface-back" type="number" required min="0" step="1"></label>
+      <label class="row"><span>Step</span><input id="surface-step" type="number" required min="0.01" step="any"></label>
+      <label class="row"><span>Mode</span><select id="surface-mode"><option value="mean">mean</option><option value="max">max</option><option value="min">min</option><option value="single">single</option></select></label>
+      <label class="check"><input id="surface-outline" type="checkbox"><span>Show outline</span></label>
+      <label class="row" id="surface-image-row" hidden><span>Image</span><input id="surface-image-opacity" type="range" min="0" max="1" step="0.01" title="Opacity of the surface image over the CT"></label>
+    </section>
+    <section class="folded needs-ct">
+      <h2>View</h2>
+      <label class="row"><span>Step</span><input id="view-step" type="number" required min="1" max="20" step="1" title="Voxels per held D / F step (G, H)"></label>
+      <label class="check"><input id="view-crosshair" type="checkbox"><span>Crosshair</span></label>
+    </section>
+    <section class="folded needs-ct">
+      <h2>Quality</h2>
+      <label class="row"><span>Max res.</span><select id="quality-level"></select></label>
+      <div class="row"><span>Atlas</span><div id="atlas-bar" class="bar"><span></span></div><output id="atlas-text"></output></div>
+    </section>
+  </aside>
+</main>
+<footer>
+  <span id="hint" class="hint"></span>
+  <span id="error" class="error"></span>
+  <span id="extensions-loaded" class="status"></span>
+  <span id="status" class="status"></span>
+</footer>
+
+<dialog id="open-dialog">
+  <form id="open-form" method="dialog">
+    <h2>Open</h2>
+    <label for="open-ct">CT URL</label><input id="open-ct" type="text" placeholder="…/volume.zarr" spellcheck="false">
+    <label for="open-surface">Surface URL</label><input id="open-surface" type="text" placeholder="…/segment.tifxyz" spellcheck="false">
+    <label for="open-image">Surface image URL</label><input id="open-image" type="text" placeholder="…/ink-detection/prediction.tif" spellcheck="false">
+    <label for="open-layer">Prediction URLs</label><textarea id="open-layer" rows="3" placeholder="One URL per line" spellcheck="false"></textarea>
+    <div class="buttons"><button id="open-cancel" type="button">Cancel</button><button id="open-load" type="submit" class="primary">Load</button></div>
+  </form>
+</dialog>
+
+<dialog id="extension-dialog">
+  <form method="dialog">
+    <h2>Load an extension?</h2>
+    <p>This link wants to load an extension from</p>
+    <p id="extension-url"></p>
+    <p>It will be able to do anything this page can. Load it only if you trust where the link came from.</p>
+    <div class="buttons"><button id="extension-load" type="submit" value="load">Load</button><button id="extension-skip" type="submit" value="skip" class="primary" autofocus>Skip</button></div>
+  </form>
+</dialog>
+
+<dialog id="help-dialog">
+  <h2>Bindings</h2>
+  <p class="note">Keys act on the active pane, outlined in blue: press or scroll in a pane, or use 1–4.</p>
+  <table class="bindings">
+    <tr><th colspan="2">Depth</th></tr>
+    <tr><td><kbd>d</kbd> <kbd>f</kbd></td><td>back / forward along the slice normal, or the surface offset; hold to run</td></tr>
+    <tr><td><kbd>g</kbd> <kbd>h</kbd></td><td>slower / faster held stepping (1 to 20 voxels)</td></tr>
+    <tr><td><kbd>Shift</kbd> + wheel</td><td>step one</td></tr>
+    <tr><td><kbd>PageUp</kbd> <kbd>PageDown</kbd></td><td>step ten</td></tr>
+    <tr><th colspan="2">View</th></tr>
+    <tr><td>wheel</td><td>zoom about the cursor</td></tr>
+    <tr><td><kbd>i</kbd> <kbd>o</kbd></td><td>zoom in / out, held, about the cursor</td></tr>
+    <tr><td><kbd>+</kbd> <kbd>−</kbd></td><td>zoom in / out one step</td></tr>
+    <tr><td><kbd>1</kbd> <kbd>2</kbd> <kbd>3</kbd> <kbd>4</kbd></td><td>make XY, XZ, YZ, Surface active</td></tr>
+    <tr><td><kbd>z</kbd></td><td>show the active pane alone, or restore the grid</td></tr>
+    <tr><td><kbd>r</kbd></td><td>centre every view at the cursor</td></tr>
+    <tr><td><kbd>←</kbd> <kbd>→</kbd> <kbd>↑</kbd> <kbd>↓</kbd></td><td>rotate all slice planes; a tap turns one degree</td></tr>
+    <tr><td><kbd>0</kbd></td><td>reset slice rotation</td></tr>
+    <tr><td><kbd>v</kbd></td><td>toggle the crosshair</td></tr>
+    <tr><td><kbd>l</kbd></td><td>hide every layer and the surface image, or show them all again</td></tr>
+    <tr><th colspan="2">Mouse</th></tr>
+    <tr><td>left drag</td><td>pan</td></tr>
+    <tr><td>right drag</td><td>rotate all slice planes about the focus (slice panes)</td></tr>
+    <tr><td>click</td><td>move the focus there</td></tr>
+    <tr><td><kbd>Space</kbd> + left drag</td><td>pan while a tool is active</td></tr>
+    <tr><th colspan="2">Window</th></tr>
+    <tr><td><kbd>Tab</kbd></td><td>toggle the panel</td></tr>
+    <tr><td><kbd>?</kbd></td><td>this help</td></tr>
+    <tr><td><kbd>Escape</kbd></td><td>close dialogs, put the active tool away</td></tr>
+    <tbody id="help-extensions"></tbody>
+  </table>
+  <div class="buttons"><button id="help-close" type="button" class="primary">Close</button></div>
+</dialog>
+
+<script type="module" src="main.js"></script>
+</body>
+</html>

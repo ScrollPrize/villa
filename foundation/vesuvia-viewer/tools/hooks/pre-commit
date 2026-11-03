@@ -1,0 +1,9 @@
+#!/bin/sh
+# Before every commit: the node tests; and, when a staged file is the page's, a check's or
+# the runner's, every browser check. A clone installs this once: git config core.hooksPath tools/hooks
+set -e
+cd "$(git rev-parse --show-toplevel)"
+node --test --test-reporter=dot
+if git diff --cached --name-only | grep -qE '\.(js|html)$|\.e2e\.py$|^tools/(browser|page|e2e)\.py$'; then
+  uv run tools/e2e.py
+fi

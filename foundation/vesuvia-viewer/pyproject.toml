@@ -1,0 +1,15 @@
+[project]
+name = "vesuvia"
+version = "0.1.0"
+description = "Python tools for the vesuvia browser viewer: test data, static server, headless browser driver"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "numpy",
+    "zarr<3",
+    "numcodecs<0.16",
+    "tifffile",
+    "aiohttp",
+]
+
+[tool.uv]
+package = false
