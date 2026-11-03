@@ -157,8 +157,9 @@ class BatchTests(unittest.TestCase):
         self.assertEqual(result.dtype, torch.float64)
         self.assertSame(result, x.flip(-1))
         device_array = cuda.asarray(image_batch().numpy())
-        self.assertSame(pipeline.batch({'image': device_array}, seeds=[1, 2, 3])['image'],
-                        image_batch().to('cuda', dtype=torch.float32).flip(-1))
+        native = pipeline.batch({'image': device_array}, seeds=[1, 2, 3])['image']
+        self.assertIsInstance(native, cuda.DeviceArray)  # DeviceArray batches stay DeviceArray, without Torch
+        self.assertSame(torch.from_dlpack(native), image_batch().to('cuda', dtype=torch.float32).flip(-1))
 
     def test_changed_shape_generated_target_and_removed_source(self):
         p = A.Pipeline([A.CropPad((3, 4, 5)), A.OneHot([0, 1], on='mask', remove_source=True)], backend='cuda')

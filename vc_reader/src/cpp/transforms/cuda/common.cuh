@@ -5,6 +5,9 @@
 #include "batch_queue.hpp"
 #include <cuda_runtime.h>
 #include <unistd.h>
+#include <array>
+#include <atomic>
+#include <memory>
 namespace vcr::transforms::cuda {
 inline void check(cudaError_t status) {
     if (status != cudaSuccess) throw std::runtime_error(std::string("CUDA transform: ") + cudaGetErrorString(status));
@@ -21,25 +24,50 @@ template<class T> struct Buffer {
     int device = 0;
     cudaStream_t stream = vcr::device::stream();
     pid_t pid = getpid();
+    std::shared_ptr<void> arena;  // set when carved from a batch's scratch chunk
     explicit Buffer(std::size_t n) : size(n) {
         check(cudaGetDevice(&device));
         if (!n) return;
 #if CUDART_VERSION >= 11020
-        int supported = 0;
-        check(cudaDeviceGetAttribute(&supported,cudaDevAttrMemoryPoolsSupported,device));
-        pooled = supported;
-        if (pooled) { vcr::device::prepare_pool(device); check(cudaMallocAsync(&ptr,n*sizeof(T),stream)); } else
+        pooled = pools_supported(device);
+        if (pooled) {
+            vcr::device::prepare_pool(device);
+            if (BatchQueue::current) {
+                auto [slice, chunk] = BatchQueue::current->carve(n*sizeof(T),stream,device);
+                ptr = static_cast<T*>(slice); arena = std::move(chunk);
+                BatchQueue::current->allocated(n*sizeof(T));
+                return;
+            }
+            check(cudaMallocAsync(&ptr,n*sizeof(T),stream));
+        } else
 #endif
         check(cudaMalloc(&ptr,n*sizeof(T)));
         if (BatchQueue::current) BatchQueue::current->allocated(n*sizeof(T));
     }
+    // Constant per device; queried once rather than per allocation.
+    static bool pools_supported(int device) {
+        static std::array<std::atomic<int>,64> known{};
+        if (device < 0 || device >= 64) { int value = 0; check(cudaDeviceGetAttribute(&value,cudaDevAttrMemoryPoolsSupported,device)); return value; }
+        int state = known[std::size_t(device)].load(std::memory_order_relaxed);
+        if (!state) {
+            int value = 0; check(cudaDeviceGetAttribute(&value,cudaDevAttrMemoryPoolsSupported,device));
+            state = value ? 1 : 2; known[std::size_t(device)].store(state,std::memory_order_relaxed);
+        }
+        return state == 1;
+    }
     explicit Buffer(const std::vector<T>& v) : Buffer(v.size()) { upload(v.data()); }
     Buffer(T* data, std::size_t n) : ptr(data),size(n),borrowed(true) { check(cudaGetDevice(&device)); }
-    Buffer(Buffer&& other) noexcept : ptr(std::exchange(other.ptr,nullptr)),size(other.size),pooled(other.pooled),borrowed(other.borrowed),exported(other.exported),device(other.device),stream(other.stream),pid(other.pid) {}
+    Buffer(Buffer&& other) noexcept : ptr(std::exchange(other.ptr,nullptr)),size(other.size),pooled(other.pooled),borrowed(other.borrowed),exported(other.exported),device(other.device),stream(other.stream),pid(other.pid),arena(std::move(other.arena)) {}
     Buffer(const Buffer&) = delete;
     Buffer& operator=(const Buffer&) = delete;
+    // Exchange storage with an equally sized buffer (ping-pong passes), including how each is freed.
+    void swap_storage(Buffer& other) noexcept {
+        std::swap(ptr,other.ptr); std::swap(pooled,other.pooled); std::swap(borrowed,other.borrowed);
+        std::swap(device,other.device); std::swap(stream,other.stream); std::swap(arena,other.arena);
+    }
     ~Buffer() {
         if (!ptr || borrowed || pid != getpid()) return;
+        if (arena) return;  // the chunk is freed after its batch and its last buffer
         if (BatchQueue::current && !exported) {
             BatchQueue::current->retire(ptr,pooled,stream);
             return;

@@ -22,16 +22,67 @@ inline Footprint norm_footprint(std::size_t dim, double radius, MorphFootprint s
     return result;
 }
 inline Footprint ball(std::size_t dim, double radius) { return norm_footprint(dim, radius, MorphFootprint::Ball); }
+// The unit cross (the centre and its 2*dim face neighbours), one pass: each output is the OR
+// (dilation) or AND (erosion) of the same neighbours morphology_mask's offsets read, with
+// `outside` beyond the grid, written once instead of through a padded copy.
+inline bool unit_cross(const Footprint& footprint, std::size_t dim) {
+    if (footprint.size() != 2 * dim + 1) return false;
+    for (const auto& q : footprint) {
+        int norm = 0; for (std::size_t a = 0; a < dim; ++a) norm += std::abs(q[a]);
+        for (std::size_t a = dim; a < 3; ++a) if (q[a]) return false;
+        if (norm > 1) return false;
+    }
+    return true;
+}
+VCR_TARGET_CLONES inline void cross_mask(std::vector<std::uint8_t>& values, const Grid& g, bool dilate, bool outside) {
+    const auto d = g.shape.size(), nz = d == 3 ? g.shape[0] : 1, ny = g.shape[d - 2], nx = g.shape.back();
+    std::vector<std::uint8_t> result(values.size());
+    const std::vector<std::uint8_t> border(nx, std::uint8_t(outside));
+    const std::uint8_t edge = std::uint8_t(outside);
+    for (std::size_t z = 0; z < nz; ++z) for (std::size_t y = 0; y < ny; ++y) {
+        const std::size_t row = (z * ny + y) * nx;
+        const std::uint8_t* __restrict c = values.data() + row;
+        const std::uint8_t* __restrict n = y ? c - nx : border.data();
+        const std::uint8_t* __restrict s = y + 1 < ny ? c + nx : border.data();
+        const std::uint8_t* __restrict f = d == 3 && z ? c - ny * nx : border.data();
+        const std::uint8_t* __restrict k = d == 3 && z + 1 < nz ? c + ny * nx : border.data();
+        std::uint8_t* __restrict out = result.data() + row;
+        const auto at = [&](std::size_t x, std::uint8_t left, std::uint8_t right) {
+            // morphology_mask starts from 0 (dilation) or 1 (erosion) and combines the neighbours.
+            std::uint8_t r = dilate ? std::uint8_t(c[x] | left | right | n[x] | s[x]) : std::uint8_t(1 & c[x] & left & right & n[x] & s[x]);
+            if (d == 3) r = dilate ? std::uint8_t(r | f[x] | k[x]) : std::uint8_t(r & f[x] & k[x]);
+            return r;
+        };
+        if (nx == 1) { out[0] = at(0, edge, edge); continue; }
+        out[0] = at(0, edge, c[1]);
+        if (dilate) {
+            if (d == 3) for (std::size_t x = 1; x + 1 < nx; ++x) out[x] = std::uint8_t(c[x] | c[x - 1] | c[x + 1] | n[x] | s[x] | f[x] | k[x]);
+            else for (std::size_t x = 1; x + 1 < nx; ++x) out[x] = std::uint8_t(c[x] | c[x - 1] | c[x + 1] | n[x] | s[x]);
+        } else {
+            if (d == 3) for (std::size_t x = 1; x + 1 < nx; ++x) out[x] = std::uint8_t(1 & c[x] & c[x - 1] & c[x + 1] & n[x] & s[x] & f[x] & k[x]);
+            else for (std::size_t x = 1; x + 1 < nx; ++x) out[x] = std::uint8_t(1 & c[x] & c[x - 1] & c[x + 1] & n[x] & s[x]);
+        }
+        out[nx - 1] = at(nx - 1, c[nx - 2], edge);
+    }
+    values.swap(result);
+}
 // Dilates (or erodes) a 0/1 mask by each footprint of `passes` in turn, in place.
 // One padded copy is reused; its border keeps `outside` throughout.
 inline void morphology_mask(std::vector<std::uint8_t>& values, const Grid& g, const std::vector<Footprint>& passes, bool dilate, bool outside = false) {
     const auto d = g.shape.size();
+    if (std::all_of(passes.begin(), passes.end(), [&](const Footprint& f) { return unit_cross(f, d); })) {
+        for (std::size_t i = 0; i < passes.size(); ++i) cross_mask(values, g, dilate, outside);
+        return;
+    }
     Shape padding(d, 0), padded_shape = g.shape;
     for (const auto& footprint : passes) for (const auto& offset : footprint) for (std::size_t a = 0; a < d; ++a)
         padding[a] = std::max(padding[a], std::size_t(std::abs(offset[a])));
     for (std::size_t a = 0; a < d; ++a) padded_shape[a] += 2 * padding[a];
     Grid padded(padded_shape);
-    std::vector<std::uint8_t> mask(padded.size, outside);
+    // Reused across calls (batches of small masks): only the padding must hold `outside`,
+    // and every interior row is overwritten before each pass reads it.
+    thread_local std::vector<std::uint8_t> mask;
+    mask.assign(padded.size, outside);
     const auto nz = d == 3 ? g.shape[0] : 1, ny = g.shape[d - 2], nx = g.shape.back();
     std::size_t origin = 0;
     for (std::size_t a = 0; a < d; ++a) origin += padding[a] * padded.stride[a];
@@ -47,14 +98,14 @@ inline void morphology_mask(std::vector<std::uint8_t>& values, const Grid& g, co
         for (std::size_t z = 0; z < nz; ++z) for (std::size_t y = 0; y < ny; ++y)
             std::copy_n(values.data() + (z * ny + y) * nx, nx, mask.data() + row_start(z, y));
         for (std::size_t z = 0; z < nz; ++z) for (std::size_t y = 0; y < ny; ++y) {
-            const auto* row = mask.data() + row_start(z, y);
-            auto* result_row = values.data() + (z * ny + y) * nx;
+            const std::uint8_t* __restrict row = mask.data() + row_start(z, y);
+            std::uint8_t* __restrict result_row = values.data() + (z * ny + y) * nx;
             // Small footprints benefit from contiguous, vectorizable boolean
             // operations. Large footprints retain early termination per voxel.
             if (offsets.size() <= 32) {
                 std::fill_n(result_row, nx, std::uint8_t(!dilate));
                 for (auto offset : offsets) {
-                    const auto* neighbor = row + offset;
+                    const std::uint8_t* __restrict neighbor = row + offset;
                     if (dilate) for (std::size_t x = 0; x < nx; ++x) result_row[x] |= neighbor[x];
                     else for (std::size_t x = 0; x < nx; ++x) result_row[x] &= neighbor[x];
                 }
@@ -142,6 +193,26 @@ inline Parameters sample(const Morphology& t, const Sample& s, Random& r) {
         for (std::size_t c = 0; c < f.array.shape[0]; ++c) p.channels.push_back({key, c, {draw(t.radius, r)}});
     return p;
 }
+// The channel maximum as std::max_element finds it on doubles, and the v > 0 mask.
+// Separate restrict-qualified loops: the label and mask buffers never alias.
+template<class T> VCR_TARGET_CLONES double binary_input(const T* __restrict values, std::uint8_t* __restrict mask, std::size_t n) {
+    double maximum = double(values[0]);
+    if constexpr (std::is_integral_v<T>) {
+        // Integers have no NaN or signed zero, and conversion to double is
+        // monotone: the native maximum gives the same double, vectorized.
+        T high = values[0];
+        for (std::size_t i = 0; i < n; ++i) { const T v = values[i]; high = high < v ? v : high; mask[i] = v > 0; }
+        maximum = double(high);
+    } else for (std::size_t i = 0; i < n; ++i) {
+        const double v = double(values[i]);
+        if (maximum < v) maximum = v;
+        mask[i] = v > 0;
+    }
+    return maximum;
+}
+template<class T> VCR_TARGET_CLONES void binary_output(const std::uint8_t* __restrict mask, T* __restrict values, std::size_t n, T set, T unset) {
+    for (std::size_t i = 0; i < n; ++i) values[i] = mask[i] ? set : unset;
+}
 inline void apply(const Morphology& t, Sample& s, const Parameters& p) {
     for (const auto& c : p.channels) {
         auto& a = s.at(c.key).array; const Grid g(a.spatial());
@@ -149,20 +220,13 @@ inline void apply(const Morphology& t, Sample& s, const Parameters& p) {
         a.typed([&](const auto* data) {
             using T = std::remove_cv_t<std::remove_pointer_t<decltype(data)>>;
             auto* values = const_cast<T*>(data) + c.channel * g.size;
-            // The channel maximum as std::max_element finds it on doubles.
-            double maximum = double(values[0]);
             std::vector<std::uint8_t> mask(g.size);
-            for (std::size_t i = 0; i < g.size; ++i) {
-                const double v = double(values[i]);
-                if (maximum < v) maximum = v;
-                mask[i] = v > 0;
-            }
+            const double maximum = binary_input(values, mask.data(), g.size);
             morphology_mask(mask, g, t.footprint, c.values[0], t.operation, t.neutral_border);
             // Binary results can only restore zero or the original channel maximum,
             // both already representable in this dtype; keep the double product
             // (including -0).
-            const T set = static_cast<T>(1. * maximum), unset = static_cast<T>(0. * maximum);
-            for (std::size_t i = 0; i < g.size; ++i) values[i] = mask[i] ? set : unset;
+            binary_output(mask.data(), values, g.size, static_cast<T>(1. * maximum), static_cast<T>(0. * maximum));
         });
     }
 }

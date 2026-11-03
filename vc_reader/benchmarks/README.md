@@ -10,6 +10,7 @@ local artifacts ignored by Git. Input fixtures remain versioned.
 | [`bench_pipeline.py`](bench_pipeline.py) | CPU/CUDA reading, sampling, normalization and transforms |
 | [`bench_transforms.py`](bench_transforms.py) | Individual transform recipes, including transfers and resident CUDA arrays |
 | [`bench_torch.py`](bench_torch.py) | Per-sample processing, CUDA batches and loader prefetch |
+| [`bench_reference_libraries.py`](bench_reference_libraries.py) | Image-processing operations against SciPy, scikit-image and OpenCV |
 | [`fiber_training/bench_fiber_trainer.py`](fiber_training/bench_fiber_trainer.py) | Full model and optimizer updates with the fiber trainer |
 
 ## Fiber trainer comparison
@@ -331,6 +332,34 @@ public-call copies and validation remain included. Inspect raw measurements
 when using a short repetition count. CPU/CUDA interpolation can differ slightly
 at nearest-neighbor label boundaries; numerical differences are reported rather
 than treated as model-quality results.
+
+## Reference library comparison
+
+[`bench_reference_libraries.py`](bench_reference_libraries.py) times traditional image
+processing (filters, morphology, histogram equalization, distances, structure tensors,
+ridges, components, hole filling, skeletons) on vc_reader CPU, CUDA resident and CUDA
+uploaded, against SciPy, scikit-image and OpenCV. Each case runs on ten dense level-2
+128³ PHercParis4 chunks near z = 13000 (mask CT > 127 covering 0.5% to 36%), as 3D
+volumes and as 128 independent YX images (OpenCV is 2D only); `--start` selects others.
+Rows record max/mean differences from each reference, and from CPU for CUDA.
+
+All CPU code is single-threaded: vc_reader transforms are, components get `threads=1`,
+OpenCV `setNumThreads(1)`, and BLAS/OpenMP pools are pinned before import (recorded with
+`threadpoolctl`). Each timing also records process CPU time per wall second to expose
+hidden threads. Pin the process to one performance core; on hybrid CPUs unpinned
+single-threaded timings move between core types.
+
+```bash
+taskset -c 2 ../vesuvius/.venv/bin/python benchmarks/bench_reference_libraries.py \
+  --build-dir build-native-cuda \
+  --array /mnt/raid_nvme/volume_cache/s3/vesuvius-challenge-open-data/PHercParis4/volumes/20260411134726-2.400um-0.2m-78keV-masked.zarr \
+  --output benchmarks/results/reference_libraries.json
+```
+
+`--dims 3D|2D`, `--only <case names>` and `--reps/--warmup` shorten runs. OpenCV's
+equalization and CLAHE take uint8 images, vc_reader float32; several references
+(CLAHE clip limits, affine axes, Frangi vs Hessian ridges, skeleton algorithms) are
+timing comparisons rather than equivalent outputs, as each row's note says.
 
 ## PyTorch CUDA batches
 

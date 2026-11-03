@@ -13,7 +13,7 @@ struct restore_maximum_launch {
 void apply_cuda(const Morphology& t,Sample&,const Parameters& p,Session& session) {
     for (const auto& c:p.channels) {
         auto& a=session.arrays.at(c.key); require_exact_labels(a,session); Layout g{Grid(a.spatial())};
-        std::vector<Buffer<Offset>> passes; for (const auto& f:morphology_passes(g.dim,c.values[0],t.footprint)) passes.push_back(footprint_offsets(f));
+        std::vector<DeviceFootprint> passes; for (const auto& f:morphology_passes(g.dim,c.values[0],t.footprint)) passes.push_back(footprint_offsets(f));
         Buffer<std::uint8_t> first(g.size),second(g.size); Buffer<volume_detail::Stats> maximum(1);
         a.typed([&](auto data) {
             const auto* input=data.ptr+c.channel*g.size;
@@ -22,7 +22,7 @@ void apply_cuda(const Morphology& t,Sample&,const Parameters& p,Session& session
             const auto stage=[&](bool dilate) {
                 for (const auto& footprint:passes) {
                     launch(blocks(g.size),256,0,vcr::device::stream(), morphology_kernel_launch{}, first.ptr,second.ptr,g,footprint.ptr,footprint.size,dilate,!dilate && t.neutral_border);
-                    std::swap(first.ptr,second.ptr);
+                    first.swap_storage(second);
                 }
             };
             if (t.operation==Morph::Dilate || t.operation==Morph::Close) stage(true);

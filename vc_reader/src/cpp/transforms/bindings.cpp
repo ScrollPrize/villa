@@ -94,6 +94,11 @@ static nb::object export_array(Array array, const std::map<std::string, Input>& 
     dtype.bits = std::uint8_t(ptr->bytes * 8); dtype.lanes = 1;
     return nb::cast(nb::ndarray<nb::numpy>(const_cast<void*>(std::as_const(*ptr).data()), ptr->shape.size(), ptr->shape.data(), ptr->borrowed ? input_owner : nb::borrow<nb::object>(capsule), nullptr, dtype));
 }
+// An array that owns its storage: borrowed views (here, of batch slots) are copied.
+static Array own(Array array) {
+    if (array.borrowed) { Array copy(array); return copy; }
+    return array;
+}
 static void writable_inputs(const std::map<std::string, Input>& inputs) {
     for (auto it = inputs.begin(); it != inputs.end(); ++it) {
         nb::ndarray<nb::c_contig, nb::device::cpu> writable;
@@ -134,6 +139,101 @@ static nb::tuple export_result(RunResult result, bool plan, const std::map<std::
         sources[nb::str(name.c_str())] = nb::str(f.source.c_str());
     }
     return nb::make_tuple(arrays, sources, plan ? nb::cast(std::move(result.plan)) : nb::none());
+}
+
+// CPU batch in one native loop, no per-sample Python. Sample b borrows slice b of each input,
+// with its slot of a (B, ...) output buffer as the copy-on-write destination (Array::spare):
+// transforms writing in place, or into Array::fresh(), leave results in their slots, with no
+// separate copy into the stacked output. Outputs that agree in shape and dtype across samples
+// are stacked (from their slots when possible); others are per-sample lists.
+static nb::tuple run_host_batch(const Pipeline& pipeline, const std::map<std::string, Input>& inputs,
+                                const std::vector<std::uint64_t>& seeds, const std::map<std::string, std::vector<double>>& params) {
+    require(!inputs.empty(), "batch has no declared array targets");
+    const auto count = seeds.size();
+    for (const auto& [name, input] : inputs)
+        require(input.ndim() >= 1 && input.shape(0) == count, name + ": batch dimension must match seeds");
+    for (const auto& [name, values] : params) require(values.size() == count, "parameter " + name + " needs one value per sample");
+    // Input dtype, then output dtype: uint8 images leave as float32, written into their slots.
+    struct Slots { Array stacked; Shape shape; char kind; std::size_t bytes, sample_bytes; std::vector<bool> in_place;
+                   char out_kind; std::size_t out_bytes, out_sample_bytes; };
+    std::map<std::string, Slots> slots;
+    for (const auto& [name, input] : inputs) {
+        require(pipeline.targets().count(name), "undeclared array field: " + name);
+        const auto type = input.dtype();
+        require(type.lanes == 1 && type.bits % 8 == 0, "unsupported input dtype");
+        const char kind = type.code == std::uint8_t(nb::dlpack::dtype_code::Float) ? 'f' : type.code == std::uint8_t(nb::dlpack::dtype_code::Int) ? 'i' :
+                          type.code == std::uint8_t(nb::dlpack::dtype_code::UInt) ? 'u' : type.code == std::uint8_t(nb::dlpack::dtype_code::Bool) ? 'b' : 0;
+        Shape full; for (std::size_t a = 0; a < input.ndim(); ++a) full.push_back(input.shape(a));
+        Shape shape(full.begin() + 1, full.end());
+        const auto bytes = std::size_t(type.bits / 8);
+        const bool widen = pipeline.targets().at(name).role == Role::Image && kind == 'u' && bytes == 1;
+        const char out_kind = widen ? 'f' : kind; const std::size_t out_bytes = widen ? 4 : bytes;
+        slots.emplace(name, Slots{Array::uninitialized(full, out_kind, out_bytes), shape, kind, bytes, product(shape) * bytes, std::vector<bool>(count, false),
+                                  out_kind, out_bytes, product(shape) * out_bytes});
+    }
+    std::vector<RunResult> results(count);
+    {
+        nb::gil_scoped_release release;
+        for (std::size_t b = 0; b < count; ++b) {
+            Sample sample;
+            for (auto& [name, slot] : slots) {
+                const auto* source = static_cast<const std::byte*>(inputs.at(name).data()) + b * slot.sample_bytes;
+                Array array(slot.shape, slot.kind, slot.bytes, source, name, false);
+                auto* destination = static_cast<std::byte*>(slot.stacked.data()) + b * slot.out_sample_bytes;
+                if (slot.out_kind == slot.kind) array.spare = destination; else array.widened = destination;
+                if (reinterpret_cast<std::uintptr_t>(source) % slot.bytes) array.data();
+                sample.emplace(name, Field{std::move(array), pipeline.targets().at(name), name});
+            }
+            NamedValues values; for (const auto& [name, v] : params) values[name] = v[b];
+            NamedScope named(&values);
+            results[b] = pipeline.run(std::move(sample), seeds[b], false);
+            for (auto& [name, slot] : slots) {
+                const auto it = results[b].sample.find(name);
+                const auto* target = static_cast<const std::byte*>(std::as_const(slot.stacked).data()) + b * slot.out_sample_bytes;
+                slot.in_place[b] = it != results[b].sample.end() && it->second.pyramid.empty() && it->second.array.borrowed == target &&
+                                   it->second.array.shape == slot.shape && it->second.array.kind == slot.out_kind && it->second.array.bytes == slot.out_bytes;
+            }
+        }
+    }
+    nb::dict arrays, sources;
+    for (auto& [name, first] : results.front().sample) {
+        bool stacked = first.pyramid.empty();
+        for (const auto& r : results) {
+            const auto it = r.sample.find(name);
+            require(it != r.sample.end(), "samples produced different fields");
+            stacked = stacked && it->second.pyramid.empty() && it->second.array.shape == first.array.shape &&
+                      it->second.array.kind == first.array.kind && it->second.array.bytes == first.array.bytes;
+        }
+        const auto slot = slots.find(name);
+        if (stacked && slot != slots.end() && first.array.shape == slot->second.shape &&
+            first.array.kind == slot->second.out_kind && first.array.bytes == slot->second.out_bytes && !slot->second.stacked.shape.empty()) {
+            // Samples left elsewhere are copied into their slots; the slot buffer is the output.
+            auto& s = slot->second;
+            auto* base = static_cast<std::byte*>(s.stacked.data());
+            for (std::size_t b = 0; b < count; ++b)
+                if (!s.in_place[b] && s.out_sample_bytes) std::memmove(base + b * s.out_sample_bytes, std::as_const(results[b].sample.at(name).array).data(), s.out_sample_bytes);
+            arrays[nb::str(name.c_str())] = export_array(std::move(s.stacked), inputs, false);
+            s.stacked.shape.clear();  // exported; later samples' views remain valid
+        } else if (stacked) {
+            Shape shape{count}; shape.insert(shape.end(), first.array.shape.begin(), first.array.shape.end());
+            Array out(shape, first.array.kind, first.array.bytes, nullptr, {}, false, false);
+            const auto bytes = first.array.size() * first.array.bytes;
+            auto* target = static_cast<std::byte*>(out.data());
+            for (std::size_t b = 0; b < count; ++b)
+                if (bytes) std::memcpy(target + b * bytes, std::as_const(results[b].sample.at(name).array).data(), bytes);
+            arrays[nb::str(name.c_str())] = export_array(std::move(out), inputs, false);
+        } else {
+            nb::list items;
+            for (auto& r : results) {
+                auto& f = r.sample.at(name);
+                if (f.pyramid.empty()) items.append(export_array(own(std::move(f.array)), inputs, false));
+                else { nb::list levels; for (auto& level : f.pyramid) levels.append(export_array(own(std::move(level)), inputs, false)); items.append(levels); }
+            }
+            arrays[nb::str(name.c_str())] = items;
+        }
+        sources[nb::str(name.c_str())] = nb::str(first.source.c_str());
+    }
+    return nb::make_tuple(arrays, sources);
 }
 
 #include "volumetric_bindings.hpp"
@@ -301,7 +401,8 @@ NB_MODULE(_transforms, m) {
 #ifdef VC_READER_CUDA
     nb::class_<BoundOutputs>(m, "DeviceOutputs")
         .def("export", &BoundOutputs::mark_exported)
-        .def("check", &BoundOutputs::check, nb::call_guard<nb::gil_scoped_release>());
+        .def("check", &BoundOutputs::check, nb::call_guard<nb::gil_scoped_release>())
+        .def("wait", &BoundOutputs::wait, nb::call_guard<nb::gil_scoped_release>());
 #endif
     nb::class_<Pipeline>(m, "Pipeline")
         .def(nb::init<std::vector<Op>, std::map<std::string, Target>, bool, std::string>(), "transforms"_a, "targets"_a, "compact"_a = true, "backend"_a = "cpu")
@@ -325,6 +426,7 @@ NB_MODULE(_transforms, m) {
             { nb::gil_scoped_release release; NamedScope named(&params); result = p.run(import_sample(p, inputs, inplace), seed, record); }
             return export_result(std::move(result), record, inputs, inplace);
         }, "inputs"_a, "seed"_a, "record"_a = false, "inplace"_a = false, "params"_a = NamedValues{})
+        .def("run_host_batch", &run_host_batch, "inputs"_a, "seeds"_a, "params"_a = std::map<std::string, std::vector<double>>{})
         .def("replay", [](const Pipeline& p, const std::map<std::string, Input>& inputs, const Plan& plan) {
             RunResult result; { nb::gil_scoped_release release; result = p.replay(import_sample(p, inputs), plan); }
             return export_result(std::move(result), false, inputs);

@@ -294,10 +294,10 @@ inline bool encode_median_palette(const Values& v, std::vector<std::uint8_t>& co
 
 // Exact rank selection shared by ordinary and compact images.
 template<class Output, class Values>
-inline void median_rank_filter(const std::vector<std::uint8_t>& codes, Output& v, const Values& values,
+inline void median_rank_filter(const std::uint8_t* codes, Output& v, const Values& values,
                                const Grid& g, std::size_t k, const std::vector<std::size_t>& iz,
                                const std::vector<std::size_t>& iy, const std::vector<std::size_t>& ix) {
-    if (g.shape.size() == 3 && k == 3) {
+    if (k == 3) {
         median_detail::median3_filter<64>(codes, v, g, iz, iy, ix,
                                         [&](std::uint8_t code) { return values[code]; });
         return;
@@ -309,7 +309,7 @@ inline void median_rank_filter(const std::vector<std::uint8_t>& codes, Output& v
     for (std::size_t z = 0; z < nz; ++z) for (std::size_t y = 0; y < ny; ++y) {
         std::array<std::uint32_t, limit> counts{};
         for (std::size_t dz = 0; dz < kz; ++dz) for (std::size_t dy = 0; dy < k; ++dy) {
-            const auto* row = codes.data() + iz[z * kz + dz] + iy[y * k + dy];
+            const auto* row = codes + iz[z * kz + dz] + iy[y * k + dy];
             for (std::size_t dx = 0; dx < k; ++dx) ++counts[row[ix[dx]]];
         }
         // Adjacent windows tend to have nearby medians. Maintain the count
@@ -322,7 +322,7 @@ inline void median_rank_filter(const std::vector<std::uint8_t>& codes, Output& v
             if (x + 1 == nx) break;
             const auto leave = ix[x * k], enter = ix[(x + 1) * k + k - 1];
             for (std::size_t dz = 0; dz < kz; ++dz) for (std::size_t dy = 0; dy < k; ++dy) {
-                const auto* row = codes.data() + iz[z * kz + dz] + iy[y * k + dy];
+                const auto* row = codes + iz[z * kz + dz] + iy[y * k + dy];
                 auto from = row[leave], to = row[enter];
                 if (from == to) continue;
                 --counts[from]; ++counts[to];
@@ -366,7 +366,7 @@ inline bool median_histogram(std::vector<T>& v, const Grid& g, std::size_t k,
     std::vector<std::uint8_t> codes;
     std::vector<T> values;
     if (!encode_median_palette(v, codes, values, quantize)) return false;
-    if (values.size() > 1) median_rank_filter(codes, v, values, g, k, iz, iy, ix);
+    if (values.size() > 1) median_rank_filter(codes.data(), v, values, g, k, iz, iy, ix);
     return true;
 }
 
@@ -380,8 +380,13 @@ inline void channel_apply(const MedianFilter& t, std::vector<T>& v, const Grid& 
     const auto nz = dim == 3 ? g.shape[0] : 1, ny = g.shape[dim - 2], nx = g.shape.back();
     const auto kz = dim == 3 ? k : 1;
     auto iz = median_indices(nz, kz, ny * nx), iy = median_indices(ny, k, nx), ix = median_indices(nx, k, 1);
+    // 2D size 3 selects directly on the values: the palette's per-voxel encoding costs more than
+    // the 9-input selector (in 3D the byte network over 27 inputs wins). Both give the exact
+    // median, and non-finite values already took this path.
+    // Quantization changes values, so it keeps the palette.
+    if (dim == 2 && k == 3 && !t.quantize && median_detail::median3(v, g, iz, iy, ix)) return;
     if (median_histogram(v, g, k, iz, iy, ix, t.quantize)) return;
-    if (dim == 3 && k == 3 && median_detail::median3(v, g, iz, iy, ix)) return;
+    if (k == 3 && median_detail::median3(v, g, iz, iy, ix)) return;
     auto src = v;
     std::vector<T> values(kz * k * k);
     for (std::size_t z = 0; z < nz; ++z) for (std::size_t y = 0; y < ny; ++y)
@@ -545,18 +550,84 @@ Parameters sample(const T& t, const Sample& s, Random& r) {
     }
     return result;
 }
+// 2D float32 size-3 median read straight from the (possibly borrowed) input and written once:
+// the same selection as channel_apply's median3 path, without its copies. False when that
+// path does not apply (mixed signed zeros keep the general selector).
+inline bool median3_plane_direct(const MedianFilter& t, Array& a, const Grid& g, const ChannelPlan& c) {
+    if (a.kind != 'f' || a.bytes != 4 || g.shape.size() != 2 || c.values[0] != 3 || t.quantize) return false;
+    const auto ny = g.shape[0], nx = g.shape[1];
+    const auto iy = median_indices(ny, 3, nx), ix = median_indices(nx, 3, 1);
+    const auto identity = [](float value) { return value; };
+    if (a.shape[0] == 1 && a.borrowed && !a.writable) {
+        // Read the view, write fresh storage (a batch slot when the view has one): no copy. The
+        // signed-zero check rides along; with both zeros the input is restored for the general path.
+        const auto* input = static_cast<const float*>(std::as_const(a).data());
+        auto* output = static_cast<float*>(a.fresh());
+        std::span<float> values(output, g.size);
+        if (median_detail::median9_plane<float, std::span<float>, decltype(identity), true>(input, values, ny, nx, iy, ix, identity)) {
+            std::copy_n(input, g.size, output);
+            return false;
+        }
+        return true;
+    }
+    auto* data = static_cast<float*>(a.data()) + c.channel * g.size;
+    if (median_detail::mixed_zeros(data, g.size)) return false;
+    median_detail::median9_plane_inplace(data, ny, nx, iy, ix);
+    return true;
+}
+// A uint8 channel's median or blur, written as float32: the float path's selection and
+// arithmetic on the same values (median ranks are value ranks; every sample converts exactly).
+inline void narrow_apply(const MedianFilter&, const ChannelPlan& c, const Grid& g, const std::uint8_t* input, float* output) {
+    const auto k = std::size_t(c.values[0]);
+    if (k == 1) { widen_values(input, output, g.size); return; }
+    const auto dim = g.shape.size();
+    const auto nz = dim == 3 ? g.shape[0] : 1, ny = g.shape[dim - 2], nx = g.shape.back();
+    const auto iz = median_indices(nz, dim == 3 ? k : 1, ny * nx), iy = median_indices(ny, k, nx), ix = median_indices(nx, k, 1);
+    if (dim == 2 && k == 3) {
+        // Select among bytes (vectorized, in place), then widen once.
+        std::vector<std::uint8_t> bytes(input, input + g.size);
+        median_detail::median9_plane_inplace(bytes.data(), ny, nx, iy, ix);
+        widen_values(bytes.data(), output, g.size);
+        return;
+    }
+    std::array<float, 256> levels; std::iota(levels.begin(), levels.end(), 0.f);
+    std::span<float> values(output, g.size);
+    // Quantization only applies beyond 256 distinct values, so it never changes uint8 medians.
+    median_rank_filter(input, values, levels, g, k, iz, iy, ix);
+}
+inline void narrow_apply(const GaussianBlur& t, const ChannelPlan& c, const Grid& g, const std::uint8_t* input, float* output) {
+    gaussian_blur_buffer(input, output, g, c.values, t.truncate, t.boundary, t.full_width);
+}
 template<class T> requires requires(T t) { t.options; }
-void apply(const T& t, Sample& s, const Parameters& p) {
+void apply(const T& t, Sample& s, const Parameters& planned) {
     if constexpr (std::is_same_v<T, Gamma> || std::is_same_v<T, GaussianBlur> || std::is_same_v<T, MedianFilter> ||
                   std::is_same_v<T, Sharpen> || std::is_same_v<T, LocalSmoothing>) {
+        Parameters narrowed;
+        if constexpr (std::is_same_v<T, GaussianBlur> || std::is_same_v<T, MedianFilter>)
+            narrowed = narrow_channels(s, planned, [&](const ChannelPlan& c, const Grid& g, const std::uint8_t* input, float* output) {
+                narrow_apply(t, c, g, input, output);
+            });
+        const auto& p = std::is_same_v<T, GaussianBlur> || std::is_same_v<T, MedianFilter> ? narrowed : planned;
         for (const auto& c : p.channels) {
             auto& a = s.at(c.key).array; Grid g(a.spatial());
+            if constexpr (std::is_same_v<T, MedianFilter>)
+                if (median3_plane_direct(t, a, g, c)) continue;
             const auto run_channel = [&](auto& values) {
                 if constexpr (std::is_same_v<T, Gamma>) {
                     const auto valid = t.masked ? normalization_detail::valid_voxels(s, c.key, c.channel) : std::vector<std::uint8_t>{};
                     channel_apply(t, values, g, c, valid);
                 } else channel_apply(t, values, g, c);
             };
+            if constexpr (std::is_same_v<T, GaussianBlur>) {
+                // A single-channel view: blur from it straight into fresh storage (its batch slot).
+                if (a.bytes == 4 && a.shape[0] == 1 && a.borrowed && !a.writable) {
+                    const auto* input = static_cast<const float*>(std::as_const(a).data());
+                    if (!magnitude_exceeds(input, g.size, std::numeric_limits<float>::max() / 64.)) {
+                        gaussian_blur_buffer(input, static_cast<float*>(a.fresh()), g, c.values, t.truncate, t.boundary, t.full_width);
+                        continue;
+                    }
+                }
+            }
             if (a.bytes == 4) {
                 auto* data = static_cast<float*>(a.data()) + c.channel * g.size;
                 // Float arithmetic is sufficient for ordinary images. Retain
@@ -565,13 +636,15 @@ void apply(const T& t, Sample& s, const Parameters& p) {
                 if constexpr (!std::is_same_v<T, MedianFilter> && !std::is_same_v<T, Gamma>) {
                     double limit = std::numeric_limits<float>::max() / 64.;
                     if constexpr (std::is_same_v<T, Sharpen>) limit /= std::max(1., std::abs(c.values[0]));
-                    if (std::any_of(data, data + g.size, [&](float x) { return std::abs(double(x)) > limit; }) ||
+                    if (magnitude_exceeds(data, g.size, limit) ||
                         (std::is_same_v<T, Sharpen> && std::abs(c.values[0]) > std::numeric_limits<float>::max())) {
                         auto values = a.channel(c.channel); run_channel(values); a.channel(c.channel, values);
                         continue;
                     }
                 }
-                if constexpr (std::is_same_v<T, LocalSmoothing>) {
+                if constexpr (std::is_same_v<T, GaussianBlur>) {
+                    gaussian_blur_buffer(data, data, g, c.values, t.truncate, t.boundary, t.full_width);
+                } else if constexpr (std::is_same_v<T, LocalSmoothing>) {
                     // The blur already owns a separate buffer. Blend directly
                     // into the writable image instead of copying out and back.
                     std::span<float> values(data, g.size);
@@ -591,7 +664,7 @@ void apply(const T& t, Sample& s, const Parameters& p) {
                   std::is_same_v<T, BlankRectangle> || std::is_same_v<T, SliceIllumination> ||
                   std::is_same_v<T, GaussianNoise> || std::is_same_v<T, RicianNoise> ||
                   std::is_same_v<T, BrightnessGradient> || std::is_same_v<T, LocalContrast> || std::is_same_v<T, LocalGamma>) {
-        for (const auto& c : p.channels) {
+        for (const auto& c : planned.channels) {
             auto& a = s.at(c.key).array; Grid g(a.spatial());
             if constexpr (std::is_same_v<T, BlankRectangle>) {
                 if (!t.statistic.empty()) { auto v = a.channel(c.channel); channel_apply(t, v, g, c); a.channel(c.channel, v); continue; }
@@ -628,6 +701,6 @@ void apply(const T& t, Sample& s, const Parameters& p) {
             else run(static_cast<double*>(a.data()));
         }
         restore_valid(s);
-    } else apply_channels(s, p, [&](auto& v, const Grid& g, const ChannelPlan& c) { channel_apply(t, v, g, c); });
+    } else apply_channels(s, planned, [&](auto& v, const Grid& g, const ChannelPlan& c) { channel_apply(t, v, g, c); });
 }
 } // namespace vcr::transforms

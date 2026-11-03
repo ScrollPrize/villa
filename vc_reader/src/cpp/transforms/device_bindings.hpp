@@ -7,6 +7,7 @@ struct BoundOutputs {
     std::vector<nb::object> working_owners;
     void mark_exported() { outputs->mark_exported(); }
     void check() { outputs->check(); }
+    void wait() { outputs->wait(); }
 };
 static char dlpack_kind(nb::dlpack::dtype dt) {
     return dt.code==std::uint8_t(nb::dlpack::dtype_code::Float) ? 'f' : dt.code==std::uint8_t(nb::dlpack::dtype_code::Int) ? 'i' :

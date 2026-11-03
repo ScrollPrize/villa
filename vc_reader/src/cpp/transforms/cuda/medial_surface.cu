@@ -29,7 +29,7 @@ void apply_cuda(const MedialSurface& t, Sample& s, const Parameters&, Session& s
         // dilate/erode ping-pong through scratch; erosion uses the neutral border.
         const auto morph = [&](bool dilate) {
             launch(blocks(grid.size),256,0,vcr::device::stream(), morphology_kernel_launch{}, skeleton.ptr,scratch.ptr,g,footprint.ptr,footprint.size,dilate,!dilate);
-            std::swap(skeleton.ptr,scratch.ptr);
+            skeleton.swap_storage(scratch);
         };
         for (std::size_t c = 0; c < a.shape[0]; ++c) {
             a.typed([&](auto labels) { launch(blocks(grid.size),256,0,vcr::device::stream(), binarize_launch{}, labels.ptr+c*grid.size,skeleton.ptr,values.ptr,grid.size,ignore,ignored); });

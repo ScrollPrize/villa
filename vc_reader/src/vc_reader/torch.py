@@ -12,6 +12,7 @@ import numpy as np
 import torch
 
 from .cuda import DeviceArray
+from .transforms._pipeline import _batch_params as _params, _batch_seeds as _seeds
 
 __all__ = ["CudaLoader", "structure_tensor", "sample_array", "surface_points", "surface_derivatives"]
 
@@ -42,39 +43,6 @@ def _targets(pipeline, batch):
         if isinstance(value, torch.Tensor) and value.requires_grad:
             raise ValueError("transform does not support autograd inputs")
     return targets, count
-
-
-def _seeds(values, count):
-    if isinstance(values, torch.Tensor):
-        if values.device.type != "cpu":
-            raise ValueError("seeds must be on CPU")
-        # Tensor.__index__ converts through signed int64 even for uint64.
-        # tolist() preserves the full range emitted by transforms.seed().
-        values = values.tolist()
-    result = [operator.index(value) for value in values]
-    if len(result) != count:
-        raise ValueError("seeds must contain one integer per sample")
-    if any(value < 0 or value >= 1 << 64 for value in result):
-        raise ValueError("seeds must be unsigned 64-bit integers")
-    return result
-
-
-def _params(params, count):
-    if params is None:
-        return {}
-    if not isinstance(params, Mapping):
-        raise TypeError("params must map parameter names to CPU scalar sequences")
-    result = {}
-    for name, values in params.items():
-        if not isinstance(name, str):
-            raise TypeError("parameter names must be strings")
-        if isinstance(values, DeviceArray) or (isinstance(values, torch.Tensor) and values.device.type != "cpu"):
-            raise ValueError("parameters must be on CPU")
-        values = np.asarray(values)
-        if values.shape != (count,):
-            raise ValueError(f"parameter {name} needs one value per sample")
-        result[name] = values.tolist()
-    return result
 
 
 def _device(device, targets):
@@ -156,10 +124,8 @@ def _submit(pipeline, batch, seeds, device=None, stream=None, params=None):
                     raise ValueError(f"{key}: expected CPU or CUDA input")
                 value = value.to(device, non_blocking=True)
                 _record(value, stream)
-                continuous = pipeline._engine.continuous(key)
-                if continuous and value.dtype == torch.uint8:
-                    value = value.to(torch.float32)
-                if continuous and value.dtype not in (torch.float32, torch.float64):
+                # uint8 continuous targets upload as uint8 and become float32 on the device.
+                if pipeline._engine.continuous(key) and value.dtype not in (torch.uint8, torch.float32, torch.float64):
                     raise TypeError(f"{key}: continuous targets require uint8, float32 or float64")
                 arrays[key] = value.contiguous()
             outputs, _, owner = pipeline._engine.run_batch(arrays, seeds, params, allocate, stream.cuda_stream)

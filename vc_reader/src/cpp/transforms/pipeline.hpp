@@ -51,7 +51,8 @@ using Executor = void (*)(const Op&, Sample&, const Parameters&, void*);
 namespace cuda {
 using vcr::cuda::available;
 void execute(const Op&, Sample&, const Parameters&, void*);
-std::shared_ptr<void> begin(const Sample&);
+// Uploads the sample; uint8 images become float32 on the device (their host fields then describe it).
+std::shared_ptr<void> begin(Sample&);
 void finish(Sample&, void*);
 void finish_device(void*);
 Parameters sample_parameters(const Op&, const Sample&, Random&, bool, void*);
@@ -74,6 +75,10 @@ void run_batch_steps(const Program&, std::vector<Sample>&, const std::vector<std
                      const std::map<std::string,std::vector<double>>&, const std::vector<std::shared_ptr<void>>&);
 }
 #endif
+// uint8 continuous targets other than images become float32 as a run starts (images: see narrow).
+inline void widen_entries(Sample& s) {
+    for (auto& [name, f] : s) if (narrow_continuous(f) && f.target.role != Role::Image) widen(f.array);
+}
 struct InputSpec {
     Shape shape; char kind; std::size_t bytes;
     bool operator==(const InputSpec&) const = default;
@@ -87,7 +92,8 @@ struct Plan {
 struct RunResult { Sample sample; Plan plan; };
 inline std::map<std::string, InputSpec> input_specs(const Sample& s) {
     std::map<std::string, InputSpec> result;
-    for (const auto& [name, f] : s) result[name] = {f.array.shape, f.array.kind, f.array.bytes};
+    // uint8 continuous inputs run as float32: either may replay the other's plan.
+    for (const auto& [name, f] : s) result[name] = narrow_continuous(f) ? InputSpec{f.array.shape, 'f', 4} : InputSpec{f.array.shape, f.array.kind, f.array.bytes};
     return result;
 }
 inline double chance(const Op& op) {
@@ -171,7 +177,8 @@ public:
         const bool resident = bool(context);
         require(!resident || executor_, "device inputs require a CUDA pipeline");
         validate(s, !resident); RunResult result; result.plan.program = program_; result.plan.inputs = input_specs(s);
-        CompactState compact(compact_);
+        if (!resident) widen_entries(s);
+        CompactState compact(compact_, program_->transforms.size() == 1);
 #ifdef VC_READER_CUDA
         if (executor_ && !resident) context = cuda::begin(s);
 #endif
@@ -183,7 +190,7 @@ public:
 #ifdef VC_READER_CUDA
         if (executor_) { if (resident) cuda::finish_device(context.get()); else cuda::finish(s,context.get()); }
 #endif
-        compact.flush(s);
+        compact.flush(s); widen_images(s);
         result.sample = std::move(s); return result;
     }
     RunResult replay(Sample s, const Plan& plan, std::shared_ptr<void> context = {}) const {
@@ -191,7 +198,8 @@ public:
         const bool resident = bool(context);
         require(!resident || executor_, "device inputs require a CUDA pipeline");
         validate(s, !resident); require(input_specs(s) == plan.inputs, "replay requires identical target names, shapes and dtypes");
-        CompactState compact(compact_);
+        if (!resident) widen_entries(s);
+        CompactState compact(compact_, program_->transforms.size() == 1);
 #ifdef VC_READER_CUDA
         if (executor_ && !resident) context = cuda::begin(s);
 #endif
@@ -206,7 +214,7 @@ public:
 #ifdef VC_READER_CUDA
         if (executor_) { if (resident) cuda::finish_device(context.get()); else cuda::finish(s,context.get()); }
 #endif
-        compact.flush(s);
+        compact.flush(s); widen_images(s);
         RunResult result; result.sample = std::move(s); return result;
     }
     static Pipeline direct(const Op& op, std::map<std::string, Target> targets, bool compact = true, std::string backend = "cpu");

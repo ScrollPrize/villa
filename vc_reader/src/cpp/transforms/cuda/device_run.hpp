@@ -61,6 +61,12 @@ struct DeviceOutputs {
         vcr::device::Guard guard(device); vcr::device::StreamScope scope(stream);
         check_devices(sessions);
     }
+    // check(), then completion of the run's stream: for callers without a stream-ordered consumer.
+    void wait() {
+        vcr::device::Guard guard(device); vcr::device::StreamScope scope(stream);
+        check_devices(sessions);
+        vcr::device::check(cudaStreamSynchronize(stream));
+    }
 };
 // A target of a batch: one stacked (B, ...) array when samples agree, else one array per sample.
 struct BatchArray { std::vector<DeviceInput> arrays; bool stacked = true; };
@@ -96,7 +102,10 @@ inline BatchRun run_batch(const Pipeline& pipeline, const std::map<std::string,D
     // Start in consumer-owned contiguous storage. Transforms that retain their
     // input allocation can return it directly, without a final batch-size copy.
     std::map<std::string,DeviceInput> working, destinations;
-    for(const auto& [key,in]:imported.arrays) {
+    for(const auto& [key,input]:imported.arrays) {
+        // uint8 continuous targets are widened to float32 while being copied into their working storage.
+        auto in=input;
+        if(narrow_continuous(imported.sample.at(key))) { in.kind='f'; in.bytes=4; }
         auto dest=allocate_array(stacked_shape(in.shape),in);
         destinations.emplace(key,DeviceInput{dest.data,in.shape,in.kind,in.bytes,in.device});
         working.emplace(key,std::move(dest));

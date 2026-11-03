@@ -1,6 +1,7 @@
 """Container adaptation, execution and replay for native transform pipelines."""
 from collections.abc import Mapping
 from copy import deepcopy
+import operator
 
 import numpy as np
 
@@ -27,6 +28,40 @@ def _as_array(value, inplace=False):
 
 def _is_torch(value):
     return type(value).__module__.split(".")[0] == "torch"
+
+
+def _batch_seeds(values, count):
+    if _is_torch(values):
+        if values.device.type != "cpu":
+            raise ValueError("seeds must be on CPU")
+        # Tensor.__index__ converts through signed int64 even for uint64.
+        # tolist() preserves the full range emitted by transforms.seed().
+        values = values.tolist()
+    result = [operator.index(value) for value in values]
+    if len(result) != count:
+        raise ValueError("seeds must contain one integer per sample")
+    if any(value < 0 or value >= 1 << 64 for value in result):
+        raise ValueError("seeds must be unsigned 64-bit integers")
+    return result
+
+
+def _batch_params(params, count):
+    from ..cuda import DeviceArray
+    if params is None:
+        return {}
+    if not isinstance(params, Mapping):
+        raise TypeError("params must map parameter names to CPU scalar sequences")
+    result = {}
+    for name, values in params.items():
+        if not isinstance(name, str):
+            raise TypeError("parameter names must be strings")
+        if isinstance(values, DeviceArray) or (_is_torch(values) and values.device.type != "cpu"):
+            raise ValueError("parameters must be on CPU")
+        values = np.asarray(values)
+        if values.shape != (count,):
+            raise ValueError(f"parameter {name} needs one value per sample")
+        result[name] = values.tolist()
+    return result
 
 
 def _direct_setup(config, data, targets, compact):
@@ -73,23 +108,12 @@ def _direct(config, data, targets, compact, inplace):
 def _direct_batch(config, data, targets, compact):
     pipeline, sample, key = _direct_setup(config, data, targets, compact)
     arrays = {k: v for k, v in sample.items() if k in pipeline.targets and v is not None}
-    sizes = {len(v) for v in arrays.values()}
+    sizes = {v.shape[0] if v.ndim else 0 for v in arrays.values()}
     if len(sizes) != 1 or not (count := sizes.pop()):
         raise ValueError("batch targets need one nonempty, shared leading dimension")
     if pipeline.backend == "cuda":
         return _direct_result(pipeline.batch(sample, seeds=[_transforms.DIRECT_SEED] * count), key)
-    results = [pipeline({k: v[i] if k in arrays else v for k, v in sample.items()}, seed=_transforms.DIRECT_SEED)
-               for i in range(count)]
-    out = dict(results[0])
-    for k in results[0]:
-        if k in arrays or k not in sample:
-            values = [r[k] for r in results]
-            if _is_torch(values[0]):
-                import torch
-                out[k] = torch.stack(values)
-            else:
-                out[k] = np.stack(values)
-    return _direct_result(out, key)
+    return _direct_result(pipeline._host_batch(sample, [_transforms.DIRECT_SEED] * count), key)
 
 
 class Plan:
@@ -118,7 +142,11 @@ class Pipeline:
     since geometry and shape-changing transforms allocate new buffers.
     compact=True keeps eligible float32 median/intensity chains in a lossless
     palette representation. Weighted statistics can differ slightly in rounding;
-    compact=False retains the ordinary reduction order. Outputs keep their dtype.
+    compact=False retains the ordinary reduction order. Outputs keep their dtype,
+    except uint8 continuous targets (intensities 0..255, e.g. CT reads), which
+    leave as float32 with the values float32 input would give; value-only
+    transforms (median, Equalize, CLAHE, HistogramMatching) and blurs read them
+    directly, and CUDA uploads them as uint8.
     backend="cpu" is the default. "cuda" requires the optional CUDA build and a
     device; "auto" selects CUDA when available, otherwise CPU. CUDA uses dense
     buffers regardless of compact. NumPy/CPU Torch inputs return host arrays;
@@ -197,12 +225,22 @@ class Pipeline:
     def _outputs(sample, converters, result):
         arrays, sources, _ = result
         out = {k: v for k, v in sample.items() if k not in converters}
+
+        def convert(value, converter):
+            return [convert(v, converter) for v in value] if isinstance(value, list) else converter(value)
         for key, value in arrays.items():
             converter = converters.get(key, converters.get(sources[key]))
-            out[key] = value if converter is None else (
-                [converter(level) for level in value] if isinstance(value, list) else converter(value)
-            )
+            out[key] = value if converter is None else convert(value, converter)
         return out
+
+    def _host_batch(self, sample, seeds, params=None):
+        """CPU (B, ...) batch in one native call; outputs stacked when samples agree in shape."""
+        arrays, converters = self._inputs(sample)
+        count = {v.shape[0] if v.ndim else 0 for v in arrays.values()}
+        if len(count) != 1 or not (n := count.pop()):
+            raise ValueError("batch targets need one nonempty, shared leading dimension")
+        result = self._engine.run_host_batch(arrays, _batch_seeds(seeds, n), _batch_params(params, n))
+        return self._outputs(sample, converters, (*result, None))
 
     def __call__(self, sample, *, seed, inplace=False, params=None):
         device = self._device_inputs(sample)
@@ -224,11 +262,13 @@ class Pipeline:
     def batch(self, batch, *, seeds, device=None, params=None):
         """Transform a batch, returning PyTorch CUDA tensors and unchanged metadata.
 
-        Requires the optional PyTorch integration and a CUDA pipeline. Dense
+        A batch whose targets are all vc_reader.cuda.DeviceArray runs without
+        PyTorch and returns DeviceArray outputs, complete when the call returns.
+        Otherwise this requires the optional PyTorch integration. Both need a CUDA pipeline. Dense
         targets use (B, C, Y, X) or (B, C, Z, Y, X); seeds has one uint64 per
         sample. NumPy/CPU targets are uploaded once per target; CUDA inputs stay
-        on device. uint8 continuous targets are cast to float32 on the GPU;
-        other dtypes are preserved. Inputs are not modified.
+        on device. uint8 continuous targets (intensities 0..255) become float32
+        on the GPU; other dtypes are preserved. Inputs are not modified.
 
         Work uses PyTorch's current stream and completes/checks once per batch.
         CudaLoader uses the same executor with one batch of GPU prefetch.
@@ -239,8 +279,43 @@ class Pipeline:
         Uniform outputs are stacked tensors; differing sample shapes are lists.
         Undeclared fields, including tensor metadata, pass through unchanged.
         """
+        device_batch = self._device_batch(batch, seeds, device, params)
+        if device_batch is not None:
+            return device_batch
         from ..torch import _batch
         return _batch(self, batch, seeds=seeds, device=device, params=params)
+
+    def _device_batch(self, batch, seeds, device, params):
+        from .. import _reader
+        from ..cuda import DeviceArray, empty
+        if not isinstance(batch, Mapping):
+            return None
+        targets = {k: v for k, v in batch.items() if k in self.targets and v is not None}
+        if not targets or not all(isinstance(v, DeviceArray) for v in targets.values()):
+            return None
+        if self.backend != "cuda":
+            raise ValueError("batch processing requires a CUDA pipeline")
+        counts = {v.shape[0] if v.ndim else 0 for v in targets.values()}
+        if len(counts) != 1 or not (count := counts.pop()):
+            raise ValueError("all targets must share one nonempty batch dimension")
+        selected = {v.device for v in targets.values()}
+        if len(selected) != 1 or (device is not None and _cuda_index(device) not in selected):
+            raise ValueError("CUDA targets must already be on the selected device")
+        arrays = {}
+        for key, value in targets.items():
+            value._ready()
+            if self._engine.continuous(key) and value.dtype not in (np.uint8, np.float32, np.float64):
+                raise TypeError(f"{key}: continuous targets require uint8, float32 or float64")
+            arrays[key] = value
+        # Outputs are the allocator's DeviceArrays (stacked, or one per sample when shapes differ).
+        outputs, _, owner = self._engine.run_batch(
+            {k: v._array for k, v in arrays.items()}, _batch_seeds(seeds, count), _batch_params(params, count),
+            lambda shape, dtype, index: empty(tuple(shape), np.dtype(dtype), device=index),
+            _reader._dlpack_stream())
+        owner.wait()
+        result = {k: v for k, v in batch.items() if k not in targets}
+        result.update(outputs)
+        return result
 
     def apply(self, sample, plan):
         if not isinstance(plan, Plan) or plan._pipeline is not self:

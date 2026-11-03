@@ -25,6 +25,21 @@
 #else
 #define VCR_HD
 #endif
+// Hot CPU loops also get an AVX2 clone, chosen at load time on x86-64 ELF (Linux) builds.
+// The clone has no FMA, so each lane performs the same IEEE operations as the baseline
+// SSE2 code: results are bit-identical. Elsewhere (macOS, arm64 NEON, CUDA) this is empty.
+#if defined(__x86_64__) && defined(__ELF__) && (defined(__GNUC__) || defined(__clang__)) && !defined(__CUDACC__) && !defined(VCR_NO_TARGET_CLONES)
+#ifndef VCR_CLONE_ISA
+#ifdef VCR_CLONE_FMA
+#define VCR_CLONE_ISA "arch=x86-64-v3"  // AVX2 with FMA: contracted products round once
+#else
+#define VCR_CLONE_ISA "avx2"
+#endif
+#endif
+#define VCR_TARGET_CLONES __attribute__((target_clones(VCR_CLONE_ISA, "default")))
+#else
+#define VCR_TARGET_CLONES
+#endif
 
 namespace vcr::transforms {
 inline void require(bool ok, const char* message) {
@@ -157,6 +172,11 @@ struct Array {
     const void* borrowed = nullptr;
     std::string owner;
     bool writable = false;
+    // Optional destination for this view's copy-on-write (e.g. its slot of a batch output),
+    // of the array's size. Copies of the array never carry it.
+    void* spare = nullptr;
+    // Optional float32 destination of this uint8 image's widened form (its batch output slot).
+    void* widened = nullptr;
     Array() = default;
     void allocate(bool clear) {
         const auto words = std::max<std::size_t>(1, (size() * bytes + 7) / 8);
@@ -187,6 +207,10 @@ struct Array {
     }
     std::size_t size() const { return product(shape); }
     void* data() {
+        if (borrowed && !writable && spare) {
+            if (size()) std::memcpy(spare, borrowed, size() * bytes);
+            borrowed = spare; spare = nullptr; writable = true;
+        }
         if (borrowed && !writable) {
             allocate(false);
             if (size()) std::memcpy(storage.get(), borrowed, size() * bytes);
@@ -195,6 +219,13 @@ struct Array {
         return borrowed ? const_cast<void*>(borrowed) : storage.get();
     }
     const void* data() const { return borrowed ? borrowed : storage.get(); }
+    // Writable storage for kernels that overwrite every element: the spare without copying,
+    // the existing storage when writable, else new uninitialized storage.
+    void* fresh() {
+        if (borrowed && !writable && spare) { borrowed = spare; spare = nullptr; writable = true; }
+        else if (borrowed && !writable) { allocate(false); borrowed = nullptr; owner.clear(); }
+        return data();
+    }
     Shape spatial() const { require(shape.size() >= 2, "expected a channel-first spatial array"); return Shape(shape.begin() + 1, shape.end()); }
     template<class F> decltype(auto) typed(F&& f) const {
         if (kind == 'f') { if (bytes == 4) return f(static_cast<const float*>(data())); return f(static_cast<const double*>(data())); }
@@ -285,6 +316,29 @@ struct Field { Array array; Target target; std::string source; std::vector<Array
 using Sample = std::map<std::string, Field>;
 inline bool sparse(Role r) { return r == Role::Points || r == Role::Vectors; }
 inline bool directional(Role r) { return r == Role::Vectors || r == Role::VectorField || r == Role::NormalField; }
+// uint8 images hold intensities 0..255 (the reader's CT dtype). They stay uint8 until a transform
+// needs float32: value-only transforms read them directly, others first widen them, exactly
+// (float(x) == x), so results equal those of the same values given as float32. Every image
+// leaves a pipeline as float32.
+inline bool narrow(const Array& a) { return a.kind == 'u' && a.bytes == 1; }
+inline bool narrow_image(const Field& f) { return f.target.role == Role::Image && narrow(f.array); }
+// Other continuous uint8 targets are widened when a run starts.
+inline bool narrow_continuous(const Field& f) { return continuous(f.target) && narrow(f.array); }
+VCR_TARGET_CLONES inline void widen_values(const std::uint8_t* __restrict in, float* __restrict out, std::size_t n) {
+    for (std::size_t i = 0; i < n; ++i) out[i] = float(in[i]);
+}
+// Uninitialized float32 storage of a's shape: its batch slot when it has one.
+inline Array widened_storage(const Array& a) {
+    if (!a.widened) return Array::uninitialized(a.shape, 'f', 4);
+    return Array(a.shape, 'f', 4, a.widened, {}, true);
+}
+inline void widen(Array& a) {
+    if (!narrow(a)) return;
+    auto out = widened_storage(a);
+    widen_values(static_cast<const std::uint8_t*>(std::as_const(a).data()), static_cast<float*>(out.data()), a.size());
+    a = std::move(out);
+}
+inline void widen_images(Sample& s) { for (auto& [name, f] : s) if (narrow_image(f)) widen(f.array); }
 inline Shape sample_shape(const Sample& s) {
     for (const auto& [name, f] : s) if (!sparse(f.target.role)) return f.array.spatial();
     throw std::invalid_argument("sample needs a spatial array");
@@ -296,7 +350,8 @@ inline void validate(const Sample& s, bool values = true) {
         const auto& a = f.array; const auto& t = f.target;
         if (sparse(t.role)) require(a.shape.size() == 2 && a.shape[1] == shape.size(), name + ": expected (N, D)");
         else require(a.shape.size() >= 3 && a.shape[0] && a.spatial() == shape, name + ": expected channel-first matching spatial shape");
-        if (t.role != Role::Label && t.role != Role::Valid) require(a.kind == 'f', name + ": continuous targets require float32 or float64");
+        if (t.role != Role::Label && t.role != Role::Valid)
+            require(a.kind == 'f' || narrow(a), name + ": continuous targets require uint8, float32 or float64");
         if (sparse(t.role) || directional(t.role) || t.role == Role::CoordinateField) {
             auto component_dim = t.role == Role::CoordinateField && t.external ? a.shape[0] : shape.size();
             auto order = t.components; std::sort(order.begin(), order.end()); auto expected = axes(component_dim); std::sort(expected.begin(), expected.end());
@@ -339,6 +394,8 @@ inline void restore_valid(Sample& s) {
                 (mask.shape[0] == 1 || mask.shape[0] == f.array.shape[0] ||
                  (pseudo && f.array.shape[0] % mask.shape[0] == 0)), "validity mask no longer matches image channels");
         auto n = product(f.array.spatial());
+        // A uint8 image keeps its dtype when the fill is one of its values.
+        if (narrow(f.array) && !(f.target.fill >= 0 && f.target.fill <= 255 && std::trunc(f.target.fill) == f.target.fill)) widen(f.array);
         for (std::size_t i = 0; i < f.array.size(); ++i)
             if (!mask.get(mask.shape[0] == 1 ? i % n : i % mask.size())) f.array.set(i, f.target.fill);
     }
@@ -374,15 +431,28 @@ VCR_HD inline long long neighbour(long long x, long long n, Boundary edge) {
     return x < n ? x : period - x - (mirror ? 0 : 1);
 }
 }
+// any(|x| > limit) over floats: for non-NaN floats |x| orders like its magnitude bits, so the
+// largest magnitude (a vectorizable integer max) decides. NaN bit patterns exceed infinity's;
+// then the ordinary scan (where |NaN| > limit is false) decides instead.
+VCR_TARGET_CLONES inline bool magnitude_exceeds(const float* values, std::size_t n, double limit) {
+    std::uint32_t largest = 0;
+    for (std::size_t i = 0; i < n; ++i) {
+        const auto bits = std::bit_cast<std::uint32_t>(values[i]) & 0x7fffffffu;
+        largest = largest < bits ? bits : largest;
+    }
+    if (largest > 0x7f800000u) return std::any_of(values, values + n, [&](float x) { return std::abs(double(x)) > limit; });
+    return std::abs(double(std::bit_cast<float>(largest))) > limit;
+}
 // Accumulate a few adjacent outputs in registers, then write them once. Tap
 // order is unchanged, including the initial addition to zero.
-template<class T, class Weight>
-inline void convolve_run(const T* source, T* output, std::size_t count,
+// The source may be narrower than T (uint8 images): each sample converts exactly in the product.
+template<class S, class T, class Weight>
+VCR_TARGET_CLONES inline void convolve_run(const S* source, T* output, std::size_t count,
                          const std::vector<Weight>& kernel, const std::size_t* offsets) {
     using Acc = std::common_type_t<T, Weight>;
-    constexpr std::size_t lanes = 16;
-    std::size_t i = 0;
-    for (; i + lanes <= count; i += lanes) {
+    // Wide blocks keep enough independent accumulators to hide addition latency;
+    // every output still sums its taps in order.
+    const auto block = [&]<std::size_t lanes>(std::size_t i) {
         std::array<Acc, lanes> sum{};
         for (std::size_t tap = 0; tap < kernel.size(); ++tap) {
             const auto* input = source + offsets[tap] + i;
@@ -390,7 +460,11 @@ inline void convolve_run(const T* source, T* output, std::size_t count,
             for (std::size_t j = 0; j < lanes; ++j) sum[j] += weight * input[j];
         }
         std::copy(sum.begin(), sum.end(), output + i);
-    }
+    };
+    constexpr std::size_t wide = sizeof(Acc) == 4 ? 64 : 32;
+    std::size_t i = 0;
+    for (; i + wide <= count; i += wide) block.template operator()<wide>(i);
+    for (; i + 16 <= count; i += 16) block.template operator()<16>(i);
     for (; i < count; ++i) {
         Acc sum = 0;
         for (std::size_t tap = 0; tap < kernel.size(); ++tap) sum += kernel[tap] * source[offsets[tap] + i];
@@ -416,8 +490,8 @@ inline std::vector<T> gaussian_kernel(double sigma, double truncate, bool full_w
     return kernel;
 }
 // Shared one-axis correlation. Weight precision selects the accumulation type.
-template<class T, class Weight>
-inline void convolve_axis(const T* data, T* tmp, const Grid& g,
+template<class S, class T, class Weight>
+inline void convolve_axis(const S* data, T* tmp, const Grid& g,
                           std::size_t a, const std::vector<Weight>& kernel, Boundary edge, bool reverse=false) {
     const auto radius = int(kernel.size() / 2);
     const auto extent = g.shape[a], step = g.stride[a], block = extent * step;
@@ -430,8 +504,13 @@ inline void convolve_axis(const T* data, T* tmp, const Grid& g,
         std::iota(offsets.begin(), offsets.end(), 0);
         if (reverse) std::reverse(offsets.begin(), offsets.end());
         std::vector<T> row(indices.size());
+        // Interior samples are the row itself (indices[radius + x] == x); only the margins
+        // need the boundary's indices.
+        const auto margin = std::min<std::size_t>(std::size_t(radius), indices.size());
         for (std::size_t base = 0; base < g.size; base += extent) {
-            for (std::size_t x = 0; x < row.size(); ++x) row[x] = indices[x] < 0 ? T(0) : data[base + indices[x]];
+            for (std::size_t x = 0; x < margin; ++x) row[x] = indices[x] < 0 ? T(0) : data[base + indices[x]];
+            std::copy_n(data + base, extent, row.data() + margin);
+            for (std::size_t x = margin + extent; x < row.size(); ++x) row[x] = indices[x] < 0 ? T(0) : data[base + indices[x]];
             convolve_run(row.data(), tmp + base, extent, kernel, offsets.data());
         }
     } else {
@@ -472,6 +551,39 @@ inline void gaussian_blur(std::vector<T>& data, const Grid& g, const std::vector
         convolve_axis(data, tmp, g, a, kernel, edge);
         data.swap(tmp);
     }
+}
+// gaussian_blur from `source` into `data` (they may be the same buffer): the blurred axes
+// alternate between `data` and one scratch buffer, starting so that the last lands in `data`;
+// a copy is needed only when no axis is blurred. Arithmetic is gaussian_blur's.
+template<class S, class T>
+inline void gaussian_blur_buffer(const S* source, T* data, const Grid& g, const std::vector<double>& sigmas, double truncate, Boundary edge, bool full_width) {
+    require(sigmas.size() == g.shape.size() && truncate > 0 && std::isfinite(truncate), "invalid Gaussian parameters");
+    std::size_t passes = 0;
+    for (auto sigma : sigmas) { require(sigma >= 0 && std::isfinite(sigma) && sigma * truncate < 100000, "invalid Gaussian sigma"); passes += sigma != 0; }
+    if (!passes) {
+        if constexpr (std::is_same_v<S, T>) { if (source != data) std::copy(source, source + g.size, data); }
+        else std::copy(source, source + g.size, data);
+        return;
+    }
+    std::vector<T> scratch(g.size);
+    const T* from = nullptr;  // the previous pass' output; the first pass reads `source`
+    std::size_t remaining = passes;
+    for (std::size_t a = 0; a < sigmas.size(); ++a) {
+        if (!sigmas[a]) continue;
+        // After this pass `remaining - 1` passes remain; the result must end in `data`.
+        T* to = (remaining - 1) % 2 == 0 ? data : scratch.data();
+        const auto kernel = gaussian_kernel<T>(sigmas[a], truncate, full_width);
+        if (!from) {
+            // In place: never read and write one buffer.
+            if constexpr (std::is_same_v<S, T>) if (to == source) to = to == data ? scratch.data() : data;
+            convolve_axis(source, to, g, a, kernel, edge);
+        } else {
+            if (to == from) to = to == data ? scratch.data() : data;
+            convolve_axis(from, to, g, a, kernel, edge);
+        }
+        from = to; --remaining;
+    }
+    if (from != data) std::copy(from, from + g.size, data);
 }
 struct ChannelOptions {
     double p = 1, p_channel = 1;
@@ -536,5 +648,36 @@ template<class F> void apply_channels(Sample& s, const Parameters& p, F&& apply_
         }
     }
     restore_valid(s);
+}
+// For transforms that read uint8 images directly: each such image becomes float32, its planned
+// channels written by write(plan, grid, input, output) from the uint8 values and the others
+// widened. Returns the plans left for the float path: those of other fields, and every plan of an
+// image that plans a channel twice (it is widened, so later plans see earlier results).
+template<class F> Parameters narrow_channels(Sample& s, const Parameters& p, F&& write) {
+    Parameters rest = p; rest.channels.clear();
+    std::map<std::string, std::vector<const ChannelPlan*>> images;
+    for (const auto& c : p.channels) {
+        if (narrow_image(s.at(c.key))) images[c.key].push_back(&c);
+        else rest.channels.push_back(c);
+    }
+    for (const auto& [key, plans] : images) {
+        auto& a = s.at(key).array; const Grid g(a.spatial());
+        std::vector<const ChannelPlan*> planned(a.shape[0], nullptr);
+        bool repeated = false;
+        for (const auto* c : plans) {
+            require(c->channel < a.shape[0], "channel out of bounds");
+            repeated |= planned[c->channel] != nullptr; planned[c->channel] = c;
+        }
+        if (repeated) { widen(a); for (const auto* c : plans) rest.channels.push_back(*c); continue; }
+        auto out = widened_storage(a);
+        const auto* input = static_cast<const std::uint8_t*>(std::as_const(a).data());
+        auto* output = static_cast<float*>(out.data());
+        for (std::size_t c = 0; c < a.shape[0]; ++c) {
+            if (planned[c]) write(*planned[c], g, input + c * g.size, output + c * g.size);
+            else widen_values(input + c * g.size, output + c * g.size, g.size);
+        }
+        a = std::move(out);
+    }
+    return rest;
 }
 } // namespace vcr::transforms
