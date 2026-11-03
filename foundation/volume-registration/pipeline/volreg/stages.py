@@ -232,6 +232,29 @@ def run_recheck(pipeline, params):
     return ["work/recheck.json"]
 
 
+def holdout_identity(pipeline):
+    """What judging the hold-out set decided: the answer per unit, nothing else."""
+    if not pipeline.record.exists(rec.HOLDOUT):
+        return {}
+    found = {}
+    for patch in pipeline.record.read(rec.HOLDOUT)["patches"]:
+        found[patch["id"]] = (patch.get("answer") or {}).get("answer")
+        for octant in patch.get("octants") or []:
+            found[f"{patch['id']}.{octant['index']}"] = (octant.get("answer") or {}).get("answer")
+    return found
+
+
+def final_identity(pipeline):
+    """What the final review decided: the picks of each round and the decision."""
+    if not pipeline.record.exists(rec.FINAL_REVIEW):
+        return {}
+    final = pipeline.record.read(rec.FINAL_REVIEW)
+    decision = final.get("decision") or {}
+    return {"picks": {round_["id"]: [item["choice"] for item in round_["items"]]
+                      for round_ in final.get("rounds") or []},
+            "decision": {key: decision.get(key) for key in ("fit", "publish", "override")}}
+
+
 def holdout_judged(pipeline, params):
     """Enough hold-out patches line up, or every one is answered."""
     if not pipeline.record.exists(rec.HOLDOUT):
@@ -346,7 +369,7 @@ def stages():
         Stage("holdout", "draw and measure the hold-out set", needs=("capture",),
               run=run_holdout, params={"patches": 60, "seed": 1000}),
         Stage("judge-holdout", "judge the hold-out set", needs=("holdout",),
-              complete=holdout_judged, answers=(rec.HOLDOUT,),
+              complete=holdout_judged, identity=holdout_identity,
               params={"min_lines_up": BAR["min_lines_up"]}),
         # Starts right after the hold-out set is drawn, while a person judges it.
         Stage("fit", "sample, measure and fit", needs=("holdout",),
@@ -359,7 +382,7 @@ def stages():
               run=run_blind, params={"count": 20, "seed": 3000,
                                      "answers": [rec.LINES_UP, "partly"]}),
         Stage("final-review", "judge the final fit", needs=("blind",),
-              complete=final_decided, answers=(rec.FINAL_REVIEW,)),
+              complete=final_decided, identity=final_identity),
         Stage("store", "store the decided fit", needs=("final-review",), run=run_store),
     ]
 

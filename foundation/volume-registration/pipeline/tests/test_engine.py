@@ -28,13 +28,17 @@ def make(tmp_path, fail=False, params=None):
         answers = json.loads((pipeline.directory / "answers.json").read_text())
         return [write(pipeline, "work/score.json", {"answers": len(answers)})]
 
+    def answers_of(pipeline):
+        path = pipeline.directory / "answers.json"
+        return json.loads(path.read_text()) if path.exists() else None
+
     def judged(pipeline, params):
         path = pipeline.directory / "answers.json"
         return path.exists() and len(json.loads(path.read_text())) >= params["enough"]
 
     return Pipeline(tmp_path, [
         Stage("draw", "draw", run=draw, params={"count": 10}),
-        Stage("judge", "judge", needs=("draw",), complete=judged, answers=("answers.json",),
+        Stage("judge", "judge", needs=("draw",), complete=judged, identity=answers_of,
               params={"enough": 2}),
         Stage("fit", "fit", needs=("draw",), run=fit),
         Stage("score", "score", needs=("fit", "judge"), run=score),

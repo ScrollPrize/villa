@@ -14,8 +14,10 @@ stage is
     blocked   something it needs is not done
 
 A human stage is done when its answers say so (see `Stage.complete`); its digest is the
-digest of those answers, so a new answer makes everything after it stale, and a rerun of
-scoring picks it up.
+digest of its `identity` -- what the person decided, and nothing else: the answers, not the
+notes beside them, the pictures they were shown, or when. So a new answer makes everything
+after it stale, and a rerun of scoring picks it up, while a note does not. The event log
+keeps all of it, for provenance; identity is only what the stages after it rest on.
 
     <pair>/                  the record (see record.py), shared
     <pair>/work/stages/      stamps and logs
@@ -47,8 +49,8 @@ class Stage:
     # to the pair. Human: None, and `complete(pair, params)` says whether the answers suffice.
     run: Optional[Callable] = None
     complete: Optional[Callable] = None
-    # The files a human stage's digest is taken over -- its answers.
-    answers: tuple = ()
+    # A human stage's output for the stages after it: `identity(pipeline)`, JSON-able.
+    identity: Optional[Callable] = None
     params: dict = field(default_factory=dict)
 
     @property
@@ -133,7 +135,7 @@ class Pipeline:
         """What a stage's dependents ran on: its outputs, or a human stage's answers."""
         stage = self.stages[name]
         if stage.human:
-            return digest_files(self.directory, stage.answers)
+            return digest_json(stage.identity(self))
         stamp = self.stamp(name)
         return None if stamp is None else stamp.get("output_digest")
 

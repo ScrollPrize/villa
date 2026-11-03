@@ -86,6 +86,9 @@ def test_a_pair_through_every_stage(tmp_path, stores):
     assert scores["bend"]["lines_up"] == len(held) and scores["bend"]["median_fine_voxels"] < 1.0
     assert json.loads(pipeline.work("scores.json").read_text())["drift"]["judge_again"] == []
 
+    # A note is provenance, not an answer: scoring stays done.
+    record.note(held[1]["id"], "a crack", REVIEWER)
+    assert pipeline.states()["score"] == DONE
     # A new answer makes the score stale; scoring again picks it up.
     record.answer(held[0]["id"], "partly", REVIEWER)
     assert pipeline.states()["score"] == STALE
