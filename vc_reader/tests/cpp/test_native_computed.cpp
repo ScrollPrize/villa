@@ -4,7 +4,8 @@
 // persisted arrays are refused; fill chunks; point sampling of the computed array;
 // concurrent readers of an uncached chunk compute it once; caller-thread-only arrays
 // compute every chunk on the reading thread; arrays asking for as many workers share
-// them, and nested reads on a shared pool from concurrent callers finish.
+// them, nested reads on a shared pool from concurrent callers finish, and concurrent
+// jobs share a pool's workers rather than the first one taking them all.
 #include "vc_reader/computed.hpp"
 #include "vc_reader/zarr.hpp"
 #include "vc_reader/array.hpp"
@@ -293,6 +294,28 @@ void sharedWorkers(const Fixture& f)
                     require(all[(std::size_t(z) * Y + y) * X + x] == maxFiltered(z, y, x), "shared-pool computed values");
     }
 }
+// A long job on a two-worker pool does not keep the workers from a second job:
+// some of the second job's items run on workers, not only on its caller.
+void fairWorkers()
+{
+    ThreadPool pool(2);
+    std::atomic<bool> longStarted{false};
+    auto longJob = std::async(std::launch::async, [&] {
+        pool.parallel_for(2000, [&](std::size_t) {
+            longStarted = true;
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        });
+    });
+    while (!longStarted) std::this_thread::yield();
+    const auto caller = std::this_thread::get_id();
+    std::atomic<int> onWorkers{0};
+    pool.parallel_for(50, [&](std::size_t) {
+        onWorkers += std::this_thread::get_id() != caller;
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    });
+    longJob.get();
+    require(onWorkers > 0, "a concurrent job gets items run by the pool's workers");
+}
 }  // namespace
 
 int main()
@@ -303,6 +326,7 @@ int main()
         concurrentReadersComputeOnce();
         callerThreadOnly();
         sharedWorkers(f);
+        fairWorkers();
         std::cout << "computed arrays passed\n";
     } catch (const std::exception& e) {
         std::cerr << e.what() << '\n';

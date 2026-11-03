@@ -1,11 +1,11 @@
 // Fixed-size worker pool with a blocking parallel_for. A pool of zero workers runs
-// every item on the calling thread.
+// every item on the calling thread. Concurrent parallel_for calls share the workers
+// item by item.
 #pragma once
 
 #include <atomic>
 #include <condition_variable>
 #include <cstddef>
-#include <deque>
 #include <exception>
 #include <functional>
 #include <iterator>
@@ -47,6 +47,8 @@ public:
 
     // Runs fn(i) for every i in [0, n) on the pool and the calling thread, and
     // waits. The first exception stops the remaining items and is rethrown.
+    // Workers take one item at a time from the active jobs in turn, so concurrent
+    // callers share the workers instead of the first job taking all of them.
     void parallel_for(std::size_t n, const std::function<void(std::size_t)>& fn)
     {
         if (n == 0)
@@ -59,18 +61,25 @@ public:
         job->n = n;
         job->fn = &fn;
         job->remaining = n;
-        const std::size_t helpers = std::min(n - 1, workers_.size());
-        {
-            std::lock_guard lock(mutex_);
-            for (std::size_t i = 0; i < helpers; ++i)
-                queue_.push_back(job);
+        if (!workers_.empty()) {
+            {
+                std::lock_guard lock(mutex_);
+                active_.push_back(job);
+                active_count_.store(active_.size(), std::memory_order_relaxed);
+            }
+            cv_.notify_all();
         }
-        cv_.notify_all();
-        run(*job);
-        // Wait for the items, not the helpers: a helper that wakes after every
-        // item has been taken just finds nothing to do, and must not delay us.
-        std::unique_lock lock(job->mutex);
-        job->done.wait(lock, [&] { return job->remaining == 0; });
+        while (run_one(*job)) {}
+        {
+            // Wait for the items, not the workers: a worker that picks the job after
+            // every item has been taken just finds nothing to do.
+            std::unique_lock lock(job->mutex);
+            job->done.wait(lock, [&] { return job->remaining == 0; });
+        }
+        if (!workers_.empty()) {
+            std::lock_guard lock(mutex_);
+            retire(job.get());
+        }
         if (job->error)
             std::rethrow_exception(job->error);
     }
@@ -78,7 +87,7 @@ public:
 private:
     struct Job {
         std::size_t n = 0;
-        const std::function<void(std::size_t)>* fn = nullptr;  // valid while remaining > 0
+        const std::function<void(std::size_t)>* fn = nullptr;  // valid while items remain to be taken
         std::atomic<std::size_t> next{0};
         std::atomic<bool> failed{false};
         std::size_t remaining = 0;  // items not yet finished; guarded by mutex
@@ -87,46 +96,81 @@ private:
         std::condition_variable done;
     };
 
-    static void run(Job& job)
+    // Runs one item of the job; false when every item has been taken.
+    static bool run_one(Job& job)
+    {
+        const std::size_t i = job.next.fetch_add(1, std::memory_order_relaxed);
+        if (i >= job.n)
+            return false;
+        if (!job.failed.load(std::memory_order_relaxed)) {  // after a failure, items are only counted
+            try {
+                (*job.fn)(i);
+            } catch (...) {
+                std::lock_guard lock(job.mutex);
+                if (!job.error)
+                    job.error = std::current_exception();
+                job.failed = true;
+            }
+        }
+        std::lock_guard lock(job.mutex);
+        if (--job.remaining == 0)
+            job.done.notify_all();
+        return true;
+    }
+
+    // Removes a job from the active ones (if still there). Holds mutex_.
+    void retire(const Job* job)
+    {
+        for (std::size_t k = 0; k < active_.size(); ++k)
+            if (active_[k].get() == job) {
+                active_.erase(active_.begin() + std::ptrdiff_t(k));
+                if (k < cursor_)
+                    --cursor_;
+                break;
+            }
+        active_count_.store(active_.size(), std::memory_order_relaxed);
+    }
+
+    // The next active job with items left, in turn; null when stopping.
+    std::shared_ptr<Job> next_job(std::unique_lock<std::mutex>& lock)
     {
         for (;;) {
-            const std::size_t i = job.next.fetch_add(1, std::memory_order_relaxed);
-            if (i >= job.n)
-                return;
-            if (!job.failed.load(std::memory_order_relaxed)) {  // after a failure, items are only counted
-                try {
-                    (*job.fn)(i);
-                } catch (...) {
-                    std::lock_guard lock(job.mutex);
-                    if (!job.error)
-                        job.error = std::current_exception();
-                    job.failed = true;
-                }
+            cv_.wait(lock, [&] { return stopping_ || !active_.empty(); });
+            if (active_.empty())
+                return nullptr;
+            if (cursor_ >= active_.size())
+                cursor_ = 0;
+            auto job = active_[cursor_];
+            if (job->next.load(std::memory_order_relaxed) >= job->n) {
+                retire(job.get());
+                continue;
             }
-            std::lock_guard lock(job.mutex);
-            if (--job.remaining == 0)
-                job.done.notify_all();
+            ++cursor_;
+            return job;
         }
     }
 
     void loop()
     {
+        std::shared_ptr<Job> job;
         for (;;) {
-            std::shared_ptr<Job> job;
+            // The only active job: keep taking its items without the pool's lock.
+            if (job && active_count_.load(std::memory_order_relaxed) == 1 && run_one(*job))
+                continue;
             {
                 std::unique_lock lock(mutex_);
-                cv_.wait(lock, [&] { return stopping_ || !queue_.empty(); });
-                if (stopping_ && queue_.empty())
+                job = next_job(lock);
+                if (!job)
                     return;
-                job = std::move(queue_.front());
-                queue_.pop_front();
             }
-            run(*job);
+            run_one(*job);
         }
     }
 
     std::vector<std::thread> workers_;
-    std::deque<std::shared_ptr<Job>> queue_;
+    std::vector<std::shared_ptr<Job>> active_;  // jobs that may have items left; guarded by mutex_
+    std::size_t cursor_ = 0;                    // the next of active_ to take from; guarded by mutex_
+    std::atomic<std::size_t> active_count_{0};  // active_.size(), read without the lock
     std::mutex mutex_;
     std::condition_variable cv_;
     bool stopping_ = false;
