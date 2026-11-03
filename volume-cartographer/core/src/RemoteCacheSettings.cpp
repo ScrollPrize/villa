@@ -247,9 +247,24 @@ std::optional<int> remoteDownloadParallelism()
         iniNumber("remote_download_parallelism", kRemoteDownloadParallelismDefault), 1, 64));
 }
 
+RemoteOffline remoteOffline()
+{
+    auto value = configuredIniValue(settingsFilePath(), "perf", "remote_offline");
+    std::transform(value.begin(), value.end(), value.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    if (value == "fill")
+        return RemoteOffline::Fill;
+    if (value == "on" || value == "1" || value == "true" || value == "yes")
+        return RemoteOffline::On;
+    return RemoteOffline::Off;
+}
+
 vcr::zarr::OpenOptions remoteOpenOptions(const fs::path& root)
 {
     vcr::zarr::OpenOptions options;
+    const auto offline = remoteOffline();
+    options.offline = offline != RemoteOffline::Off;
+    options.offlineFill = offline == RemoteOffline::Fill;
     if (!root.empty()) {
         options.cacheDirs = {root.string()};
         options.cacheMaxBytes = remoteCacheMaxBytes().value_or(std::numeric_limits<std::int64_t>::max());

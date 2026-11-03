@@ -57,8 +57,18 @@ public:
     CacheStats cacheStats() const { return {cache_->nbytes(), cache_->max_bytes()}; }
     struct TransferStats {
         std::uint64_t chunks = 0, bytes = 0;
+        std::uint64_t offlineMisses = 0;  // chunks offline reads lacked (remote_offline "fill")
     };
     TransferStats transferStats();
+
+    // With remote_offline "fill": per opened physical level, the chunk-grid indices that
+    // no cache held (read as fill). Levels without misses are left out.
+    struct OfflineMisses {
+        std::string location;
+        int level = 0;  // physical pyramid level
+        std::vector<std::vector<std::int64_t>> chunks;
+    };
+    std::vector<OfflineMisses> offlineMisses();
 
 private:
     std::shared_ptr<vcr::zarr::OpenedArray> open(const Volume& volume, int physical);

@@ -19,6 +19,11 @@ inline constexpr auto kRemoteDownloadAutomatic = "perf/remote_download_automatic
 inline constexpr bool kRemoteDownloadAutomaticDefault = true;
 inline constexpr auto kRemoteDownloadParallelism = "perf/remote_download_parallelism";
 inline constexpr int kRemoteDownloadParallelismDefault = 16;
+// Remote volumes read only from the cache root, never the network: "off" (default),
+// "on" (a chunk not in the cache is an error), "fill" (it reads as fill and is
+// recorded, vcr::Array::offline_misses). Metadata must be cached in both offline modes.
+inline constexpr auto kRemoteOffline = "perf/remote_offline";
+enum class RemoteOffline { Off, On, Fill };
 
 [[nodiscard]] std::filesystem::path settingsFilePath();
 // Resolved once on first use. Changes written to VC3D.ini take effect after
@@ -30,10 +35,12 @@ inline constexpr int kRemoteDownloadParallelismDefault = 16;
 [[nodiscard]] std::int64_t remoteCacheMinFreeBytes();
 // Simultaneous downloads; nullopt leaves the choice to vc_reader.
 [[nodiscard]] std::optional<int> remoteDownloadParallelism();
+// kRemoteOffline; an unknown value is "off".
+[[nodiscard]] RemoteOffline remoteOffline();
 // These settings as vc_reader options for the cache root `root`: the root as the cache
 // directory with its byte limit (unlimited lifts a limit stored there) and free-space
-// floor, and the download parallelism. An empty root sets the parallelism only. Access
-// is the caller's.
+// floor, the download parallelism, and remoteOffline(). An empty root sets the
+// parallelism and offline mode only. Access is the caller's.
 [[nodiscard]] vcr::zarr::OpenOptions remoteOpenOptions(const std::filesystem::path& root);
 
 } // namespace vc::settings

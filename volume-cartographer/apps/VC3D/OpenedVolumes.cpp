@@ -25,6 +25,20 @@ OpenedVolumes::TransferStats OpenedVolumes::transferStats()
         const auto& stats = level->array->stats();
         result.chunks += stats.remote_fetches.load();
         result.bytes += stats.remote_bytes.load();
+        result.offlineMisses += stats.offline_misses.load();
+    }
+    return result;
+}
+
+std::vector<OpenedVolumes::OfflineMisses> OpenedVolumes::offlineMisses()
+{
+    std::lock_guard lock(mutex_);
+    std::vector<OfflineMisses> result;
+    for (const auto& [key, level] : levels_) {
+        if (!level) continue;
+        auto chunks = level->array->offline_misses();
+        if (!chunks.empty())
+            result.push_back({key.first, key.second, std::move(chunks)});
     }
     return result;
 }
