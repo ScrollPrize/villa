@@ -30,6 +30,8 @@ class SheetCompressionTransform(BasicTransform):
         compression_axes: Candidate axes to compress (randomly selects one per sample)
     """
 
+    _is_spatial = True  # Skip per-transform padding restoration
+
     def __init__(
         self,
         compression_strength: RandomScalar = (0.1, 0.3),
@@ -104,11 +106,11 @@ class SheetCompressionTransform(BasicTransform):
                     displacement = blur_dimension(displacement, spatial_smoothing, dim)
             displacement = displacement[0]
 
-        # Normalize displacement to grid_sample coordinates [-1, 1]
-        # grid_sample expects coordinates in [-1, 1], so we need to convert
-        # displacement is in voxel units, we need to normalize by half the dimension size
+        # Normalize displacement to grid_sample coordinates [-1, 1].
+        # With align_corners=True, one voxel step spans 2/(dim-1) in grid
+        # coordinates, so voxel-unit displacement converts by that factor.
         dim_size = spatial_shape[chosen_axis]
-        displacement_normalized = displacement / (dim_size / 2.0)
+        displacement_normalized = displacement * (2.0 / max(dim_size - 1.0, 1.0))
 
         return {
             'apply': True,
@@ -138,8 +140,11 @@ class SheetCompressionTransform(BasicTransform):
         grid_axis_map = {0: 2, 1: 1, 2: 0}
         grid_idx = grid_axis_map[axis]
 
-        # Subtract displacement (positive displacement = sample from earlier position = compression)
-        grid[..., grid_idx] = grid[..., grid_idx] - displacement
+        # Add displacement: output[x] = input[x + d(x)] with d monotonically
+        # non-decreasing along the axis pulls content toward smaller indices,
+        # so accumulated gap width shrinks (local scale ds/dx = 1 + s*gap > 1).
+        # (Subtracting instead stretches the volume and *widens* gaps.)
+        grid[..., grid_idx] = grid[..., grid_idx] + displacement
 
         return grid.unsqueeze(0)  # (1, D, H, W, 3)
 
@@ -209,6 +214,42 @@ class SheetCompressionTransform(BasicTransform):
             output = output.to(original_dtype)
 
         return output
+
+    def apply(self, data_dict, **params):
+        data_dict = super().apply(data_dict, **params)
+        # _is_spatial stops BasicTransform from restoring padding from the
+        # un-warped mask, so the mask has to move with the image, like in
+        # SpatialTransform.
+        if data_dict.get('padding_mask') is not None:
+            data_dict['padding_mask'] = self._apply_to_padding_mask(data_dict['padding_mask'], **params)
+        return data_dict
+
+    def _apply_to_padding_mask(self, mask: torch.Tensor, **params) -> torch.Tensor:
+        """Warp the padding mask with the grid used for image and labels.
+
+        Nearest-neighbour keeps it binary. Zeros padding marks as padding the
+        tail that the compression pulls in from outside the volume (the image
+        repeats its border there).
+        """
+        if not params.get('apply', False):
+            return mask
+
+        displacement = params['displacement'].to(mask.device)
+        grid = self._create_sampling_grid(
+            params['spatial_shape'], displacement, params['chosen_axis'], mask.device
+        )
+
+        output = F.grid_sample(
+            mask.float().unsqueeze(0),
+            grid,
+            mode='nearest',
+            padding_mode='zeros',
+            align_corners=True
+        ).squeeze(0)
+
+        if mask.dtype == torch.bool:
+            return output > 0.5
+        return output.to(mask.dtype)
 
     def _apply_to_image(self, img: torch.Tensor, **params) -> torch.Tensor:
         return self._apply_compression(img, **params)
