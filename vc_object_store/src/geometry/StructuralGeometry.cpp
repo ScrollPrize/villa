@@ -45,8 +45,8 @@ Json annotations(const Txn& txn,const GeometryRevision& revision,GeometryReader&
 bool directional(const Json& value) {return annotationDirectional(value);}
 GeometryData snapshotData(GeometryReader& reader) {
     const auto& m=reader.manifest();
-    GeometryData data; data.kind=m.at("kind"); data.formatVersion=m.at("format_version");
-    data.coordinateSystem=m.at("coordinate_system"); data.attributes=m.at("attributes").dump();
+    GeometryData data; data.kind=m.at("kind").get<std::string>(); data.formatVersion=m.at("format_version");
+    data.coordinateSystem=m.at("coordinate_system").get<std::string>(); data.attributes=m.at("attributes").dump();
     for(const auto& [name,a]:m.at("arrays").items())
         data.arrays.push_back({name,a.at("dtype"),a.at("shape"),reader.read(name,0)});
     return data;

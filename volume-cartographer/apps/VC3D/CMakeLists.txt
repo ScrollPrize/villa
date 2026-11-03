@@ -15,11 +15,52 @@ set(srcs
     Keybinds.cpp
     Keybinds.hpp
     CWindow.cpp
+    FiberCollectionGenerator.cpp
+    FiberCollectionGeneratorDialog.cpp
     FiberCollectionController.cpp
     SurfaceCatalog.cpp
     SurfaceCatalog.hpp
     FiberCollectionController.hpp
     FiberDisplayOptions.hpp
+    FiberOverlayColors.hpp
+    fibers3d/Fiber3DScene.hpp
+    fibers3d/Fiber3DData.cpp
+    fibers3d/Fiber3DData.hpp
+    fibers3d/Fiber3DCanvas.cpp
+    scene3d/Scene3DCanvas.cpp
+    scene3d/Scene3DPanel.cpp
+    scene3d/Scene3DPanel.hpp
+    scene3d/MemoryBudgetInput.hpp
+    scene3d/VolumePreview.cpp
+    scene3d/VolumePreview.hpp
+    fibers3d/Fiber3DCanvas.hpp
+    fibers3d/Fiber3DRenderGeometry.hpp
+    fibers3d/Fiber3DColor.hpp
+    fibers3d/Fiber3DGeometry.hpp
+    fibers3d/Fiber3DPanel.cpp
+    fibers3d/Fiber3DPanel.hpp
+    fibers3d/Fiber3DRibbon.hpp
+    fibers3d/Fiber3DRibbon.cpp
+    fibers3d/Fiber3DRibbonControls.hpp
+    fibers3d/Fiber3DRibbonControls.cpp
+    fibers3d/Fiber3DCT.hpp
+    fibers3d/Fiber3DCT.cpp
+    fibers3d/Fiber3DSlices.hpp
+    fibers3d/Fiber3DSlices.cpp
+    fibers3d/Fiber3DVolumeRenderer.hpp
+    fibers3d/Fiber3DVolumeRenderer.cpp
+    fibers3d/Fiber3DSliceControls.hpp
+    fibers3d/Fiber3DSliceControls.cpp
+    fibers3d/Fiber3DSurfaceMesh.hpp
+    fibers3d/Fiber3DSurfaceTexture.cpp
+    fibers3d/Fiber3DSurfaceMesh.cpp
+    fibers3d/Fiber3DSurfaceProximity.hpp
+    fibers3d/Fiber3DSurfaceProximity.cpp
+    fibers3d/Fiber3DSurfaceRenderer.hpp
+    fibers3d/Fiber3DSurfaceRenderer.cpp
+    fibers3d/Fiber3DSurfaceControls.hpp
+    fibers3d/Fiber3DSurfaceControls.cpp
+    LineAnnotationPolylineIndices.hpp
     CWindowContextMenu.cpp
     StatusDockPanelHost.cpp
     StatusDockPanelHost.hpp
@@ -477,7 +518,7 @@ if(EXISTS "${_vc3d_fiber_format_src}/__init__.py")
 endif()
 
 if(VC_TESTING)
-    set_source_files_properties(LineAnnotationController.cpp SurfacePanelController.cpp VCAppMain.cpp PROPERTIES COMPILE_DEFINITIONS VC_TESTING)
+    set_source_files_properties(LineAnnotationController.cpp SurfacePanelController.cpp VCAppMain.cpp scene3d/Scene3DPanel.cpp PROPERTIES COMPILE_DEFINITIONS VC_TESTING)
     # The in-binary store tests build their fixture volumes with core/test/support.
     target_include_directories(VC3D PRIVATE ${PROJECT_SOURCE_DIR}/core/test)
 endif()

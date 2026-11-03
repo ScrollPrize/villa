@@ -197,10 +197,12 @@ namespace perf {
 
     // Shared budget for every managed remote Zarr chunk beneath the resolved
     // vc3d cache root. Zero maximum means unlimited.
-    constexpr auto REMOTE_CACHE_MAX_GIB = "perf/remote_cache_max_gib";
-    constexpr qulonglong REMOTE_CACHE_MAX_GIB_DEFAULT = 0;
-    constexpr auto REMOTE_CACHE_MIN_FREE_GIB = "perf/remote_cache_min_free_gib";
-    constexpr qulonglong REMOTE_CACHE_MIN_FREE_GIB_DEFAULT = 20;
+    constexpr auto REMOTE_CACHE_MAX_GIB = vc::settings::kRemoteCacheMaxGiB;
+    constexpr qulonglong REMOTE_CACHE_MAX_GIB_DEFAULT =
+        vc::settings::kRemoteCacheMaxGiBDefault;
+    constexpr auto REMOTE_CACHE_MIN_FREE_GIB = vc::settings::kRemoteCacheMinFreeGiB;
+    constexpr qulonglong REMOTE_CACHE_MIN_FREE_GIB_DEFAULT =
+        vc::settings::kRemoteCacheMinFreeGiBDefault;
 
     // Process-wide remote source-download admission. Automatic mode adapts
     // between 2 and the fixed worker capacity. Manual mode admits exactly the

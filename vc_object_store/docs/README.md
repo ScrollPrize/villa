@@ -250,7 +250,7 @@ A team shares one store by keeping a **hub** `.vcobj` on a network filesystem
 (an sshfs mount, NFS or SMB) or on any server reachable over SSH, addressed as
 `sftp://[user@]host[:port]/path/hub.vcobj` (`ssh://` works too). Nobody opens the hub to work. Each client clones
 it into a local **replica** and opens that replica like any other store, so reads
-and viewport queries stay on local disk. Hosting needs no server process. Public
+and viewport queries stay on local disk. Hosting needs no object-store installation or persistent service on the server. Public
 signatures are in [Hub.hpp](../include/vc_object_store/objects/Hub.hpp).
 
 ```sh
@@ -260,20 +260,67 @@ vc_object_hub clone /mnt/share/hub.vcobj ~/objects-replica.vcobj
 vc_object_hub lease acquire ~/objects-replica.vcobj UUID
 #   ... edit UUID with any client of the replica ...
 vc_object_hub sync ~/objects-replica.vcobj
-# or, with no mount at all:
+# Or use SSH, with every client stopped during this one-time opt-in:
+vc_object_hub enable-ssh-locking sftp://alice@data.example.org/share/hub.vcobj
 vc_object_hub clone sftp://alice@data.example.org/share/hub.vcobj ~/objects-replica.vcobj
 ```
 
-**SFTP addresses.** Hub files addressed as `sftp://` or `ssh://` open through
-the store's own SQLite VFS, which speaks SFTP v3 to the system OpenSSH `ssh`
-program (`ssh -s host sftp`), so `~/.ssh/config`, keys, the agent, ProxyJump and
-`known_hosts` apply as usual and nothing needs mounting. The protocol client is
-the `vc_object_store::vc_sftp` library (`include/vc_object_store/sftp/Sftp.hpp`),
-which VC3D also uses for remote volumes. It locks with the same `<hub>.lock`
-directory as the `unix-dotfile` VFS, so clients on a mount and clients using an
-address can share one hub. The server must offer OpenSSH's `fsync@openssh.com`
-extension (stock OpenSSH does), or writes could not be made durable; the VFS
-refuses to open a hub for writing without it.
+**SFTP addresses.** Hub files addressed as `sftp://` or `ssh://` use a dedicated
+SSH command session for each hub operation. The command runs the existing
+OpenSSH `sftp-server` under `flock --no-fork`, so the process doing all database
+and journal I/O also owns the kernel lock. On exit or crash its lock is released;
+the next operation checks for and recovers any hot journal. A lost
+connection fails the operation, including rollback attempts on that connection;
+individual reads/writes are never replayed on a newly acquired lock. Retry the
+whole hub operation. The existing push-outcome tracking handles a lost commit
+acknowledgment.
+
+The **server** needs Linux, SSH command execution permission, `flock` (util-linux),
+`timeout` (GNU coreutils), and an external OpenSSH `sftp-server` in one of
+`/usr/lib/openssh`, `/usr/lib/ssh`, `/usr/libexec/openssh`, or `/usr/libexec`.
+The hub and lock should live on the server's local filesystem. No root access,
+new listening port, or object-store software is required to run the command.
+Clients can run Linux, macOS or Windows with OpenSSH `ssh` on PATH; the Linux
+utilities run remotely. SSH config, keys, agent, ProxyJump and known_hosts still
+apply. SFTP-only accounts must be allowed to execute this command. Ordinary
+remote volumes continue to use the standard SFTP subsystem.
+
+On Linux/macOS clients, hub sessions share an application-private OpenSSH
+connection using a mode-0700 control directory under `/tmp`. An ordinary SFTP
+session keeps the transport connected; it holds no hub lock. Each operation
+still starts its own `flock`/`sftp-server` process and releases it on completion.
+This needs no SSH config changes or background daemon. Windows uses independent
+SSH connections and still benefits from SQLite cache reuse.
+
+**Migration:** stop every client and run `enable-ssh-locking HUB` once from an
+updated client. It creates `<hub>.lock/process-v1`, preserving the hub's access
+permissions. An existing legacy lock blocks migration: first establish that no
+client is using it, then use the legacy unlock command if necessary. Migration
+is idempotent and never replaces an existing lock inode. The permanent nonempty
+`.lock` directory blocks old SFTP and mounted `unix-dotfile` clients, including
+cached connections. Every client must upgrade and use the SSH address afterward;
+previously mounted replicas must be recloned through SSH after pushing their
+changes before migration. **Never delete this directory or its file**, including
+when it appears old: the kernel owns the live lock, not the file's existence.
+`unlock` refuses these hubs. Do not access the same database through alternate
+hard-linked paths with separate lock files.
+
+Lock acquisition waits at most 60 seconds. A server-side deadline terminates an
+operation after **30 minutes**, with a forced kill five seconds later if needed,
+so even a silently abandoned session eventually loses its lock. For long
+operations set `VC_HUB_SESSION_SECONDS` to a positive integer on the client
+before launching the application (for example `7200`). This bounds total
+session lifetime, not just idle time. Server-side SSH client-alive settings can
+shorten detection of unreachable clients. The SFTP inactivity timeout remains
+120 seconds. SQLite page reads still incur network round trips. Healthy SQLite
+connections retain their schema/page caches between operations and check the
+database change counter under the next lock. A failed operation or an unfinished
+transaction discards its cached connection before any retry.
+
+The protocol client is `vc_object_store::vc_sftp`
+(`include/vc_object_store/sftp/Sftp.hpp`). The server must provide OpenSSH's
+`fsync@openssh.com` extension for durable writes; the VFS refuses writes without
+it.
 - Without a registered authenticator, `ssh` runs in batch mode: keys and the
   agent only, and only hosts already in `known_hosts`.
 - With one (`vc::sftp::setAuthenticator`, Python `set_sftp_authenticator`), every
@@ -286,15 +333,12 @@ refuses to open a hub for writing without it.
   user is asked again. VC3D shows dialogs, `vc_object_hub` asks on the terminal
   (Python: `use_terminal_sftp_prompts()`). Prompts need Linux or macOS; on
   Windows `ssh` always runs in batch mode.
-- One ssh connection per destination serves every hub file and helper in a
-  process. A broken connection reconnects on next use, unless writes were still
-  unacknowledged; then the operation fails and SQLite rolls back from its journal.
 - Writes are pipelined and collected before any read, sync or unlock, so a
   commit costs about one round trip plus the bytes. Each page read is still one
   round trip, as over sshfs.
 
-The hub keeps SQLite's rollback journal and opens through the `unix-dotfile`
-VFS (`OpenOptions::sharedFile`). That VFS locks by creating `<hub>.lock` with an
+Both hub access methods keep SQLite's rollback journal. Hubs still accessed
+through filesystem paths open through the `unix-dotfile` VFS (`OpenOptions::sharedFile`). That VFS locks by creating `<hub>.lock` with an
 atomic `mkdir`, which works on network filesystems where WAL's shared memory and
 byte-range locks do not. Only hub operations open the file, and each holds the
 lock briefly. An ordinary open of a hub is refused, so nothing can switch it back
@@ -365,27 +409,25 @@ Object revision UUIDs are per replica. Geometry revision
 UUIDs and the store UUID are shared.
 
 **Operations.**
-- `clone` copies the hub file in large reads without holding the lock. It then
-  checks, under the lock, that the header's change counter and the file size are
-  unchanged; every commit changes the counter, so the copy is consistent. After
-  three interrupted attempts it falls back to SQLite's backup API in locked steps.
-  That fallback reads one page per request and is slow over a network.
-- A client that dies while holding the hub lock leaves `<hub>.lock` behind, and
-  every other client waits on it. Once no client is syncing, run
-  `vc_object_hub unlock HUB --force` (a path or an address; library
-  `hubLockAge`/`removeHubLock`); the next open rolls back the interrupted
-  write from its journal.
-- The share must apply `mkdir` atomically and must not serve stale cached data
-  to SQLite. Mount NFS with `noac`. Mount sshfs (3.x) with
-  `-o direct_io,dir_cache=no,entry_timeout=0,attr_timeout=0,negative_timeout=0`,
-  so page reads and the existence of `<hub>-journal` always come from the
-  server.
-- A process keeps one connection per hub and author open. SQLite then keeps
-  its page cache between operations while the hub is unchanged, instead of
-  rereading the header and schema over the network each time.
-- Hub operations wait up to 60 s for the lock. The lock is not fair, so heavy
-  contention can still time out an operation; retry it.
+- SSH `clone` holds the process lock for the copy and uses large pipelined reads.
+  Mounted `clone` copies without the lock, then verifies the header change
+  counter and size under the lock. After three interrupted copies it falls back
+  to copying under the lock.
+- For **legacy mounted hubs only**, a dead client can leave `<hub>.lock` behind.
+  Once no client is syncing, `vc_object_hub unlock HUB --force` removes it; the
+  next open recovers any interrupted write. Process-lock hubs recover without
+  removing the guard directory.
+- Legacy mounts must apply `mkdir` atomically and avoid stale caches. Mount NFS
+  with `noac`; mount sshfs (3.x) with
+  `-o direct_io,dir_cache=no,entry_timeout=0,attr_timeout=0,negative_timeout=0`.
+- Mounted and SSH hubs retain healthy SQLite connections/page caches between
+  operations. SSH file handles reopen under each new process lock; failed
+  sessions cannot reconnect or carry a transaction into a later operation.
+- Contention can time out an operation; retry it. No fairness is guaranteed.
 - `detach` turns a replica back into an ordinary store.
+
+The historical measurements below use the mounted transport, not SSH process
+locking.
 
 Measured on 2026-10-23 with RelWithDebInfo on Ubuntu arm64, median of 10
 iterations. "Local disk" uses a synthetic 20,000-fiber hub (354 MB). "Network"

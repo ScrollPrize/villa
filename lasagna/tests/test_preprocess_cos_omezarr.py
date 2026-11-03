@@ -340,7 +340,7 @@ class PreprocessCosOmezarrTests(unittest.TestCase):
 
 	def test_shared_multi_gpu_device_resolution(self):
 		self.assertEqual(
-			resolve_inference_devices(device=None, cuda_available=False, cuda_count=0),
+			resolve_inference_devices(device=None, cuda_available=False, cuda_count=0, mps_available=False),
 			(torch.device("cpu"),),
 		)
 		self.assertEqual(
@@ -355,6 +355,50 @@ class PreprocessCosOmezarrTests(unittest.TestCase):
 			resolve_inference_devices(device="cuda", devices="all", cuda_available=True, cuda_count=2)
 		with self.assertRaisesRegex(ValueError, "duplicate"):
 			resolve_inference_devices(devices="cuda,cuda:0", cuda_available=True, cuda_count=2)
+
+	def test_auto_device_keeps_shared_cuda_then_cpu_default(self):
+		# Other callers (including Fiber inference) have not opted into MPS.
+		with mock.patch.object(torch.backends.mps, "is_available", side_effect=AssertionError("MPS queried")):
+			for device in (None, "auto"):
+				for cuda in (False, True):
+					with self.subTest(device=device, cuda=cuda):
+						self.assertEqual(
+							resolve_inference_devices(device=device, cuda_available=cuda, cuda_count=int(cuda)),
+							(torch.device("cuda:0" if cuda else "cpu"),),
+						)
+		for auto_mps in (False, True):
+			with self.subTest(auto_mps=auto_mps):
+				self.assertEqual(
+					resolve_inference_devices(device="mps", auto_mps=auto_mps, cuda_available=False, cuda_count=0),
+					(torch.device("mps"),),
+				)
+
+	def test_auto_device_opt_in_prefers_cuda_then_mps_then_cpu(self):
+		# Auto selection asks torch, so both backends are mocked and no GPU is touched.
+		def resolve(*, cuda: bool, mps: bool, **kwargs):
+			with mock.patch.object(torch.cuda, "is_available", return_value=cuda), \
+				 mock.patch.object(torch.cuda, "device_count", return_value=1 if cuda else 0), \
+				 mock.patch.object(torch.backends.mps, "is_available", return_value=mps):
+				return resolve_inference_devices(auto_mps=True, **kwargs)
+
+		self.assertEqual(resolve(cuda=False, mps=True), (torch.device("mps"),))
+		self.assertEqual(resolve(cuda=False, mps=True, device="auto"), (torch.device("mps"),))
+		self.assertEqual(resolve(cuda=True, mps=True), (torch.device("cuda:0"),))
+		self.assertEqual(resolve(cuda=False, mps=False), (torch.device("cpu"),))
+		# An explicit device still wins over the automatic choice.
+		self.assertEqual(resolve(cuda=False, mps=True, device="cpu"), (torch.device("cpu"),))
+		self.assertEqual(resolve(cuda=True, mps=True, device="cpu"), (torch.device("cpu"),))
+		self.assertEqual(resolve(cuda=True, mps=False, device="cuda"), (torch.device("cuda:0"),))
+		self.assertEqual(
+			resolve_inference_devices(auto_mps=True, cuda_available=False, cuda_count=0, mps_available=True),
+			(torch.device("mps"),),
+		)
+		# CUDA hosts resolve exactly as before, without asking about MPS.
+		with mock.patch.object(torch.backends.mps, "is_available", side_effect=AssertionError("MPS queried")):
+			self.assertEqual(
+				resolve_inference_devices(auto_mps=True, cuda_available=True, cuda_count=2),
+				(torch.device("cuda:0"),),
+			)
 
 	def test_shared_auto_download_forwards_workers_to_input_and_pred_dt(self):
 		with mock.patch.object(shared_predict3d, "_download_one_path") as download_one:
@@ -1067,6 +1111,7 @@ class PreprocessCosOmezarrTests(unittest.TestCase):
 		output_path: Path,
 		pred_dt_path: Path | None = None,
 		crop_xyzwhd: tuple[int, int, int, int, int, int] | None = None,
+		device: str | None = "cpu",
 	) -> None:
 		gpu_pause_stub = types.ModuleType("gpu_pause")
 		gpu_pause_stub.gpu_pause_context = lambda: None
@@ -1077,7 +1122,7 @@ class PreprocessCosOmezarrTests(unittest.TestCase):
 						input_path=str(input_path),
 						output_path=str(output_path),
 						unet3d_checkpoint=str(output_path.parent / "missing_model.pt"),
-						device="cpu",
+						device=device,
 						crop_xyzwhd=crop_xyzwhd,
 						tile_size=8,
 						overlap=0,
@@ -1090,6 +1135,21 @@ class PreprocessCosOmezarrTests(unittest.TestCase):
 						n_levels=3,
 						ome_chunk=4,
 					)
+
+	def test_predict3d_opts_into_mps_without_overriding_explicit_cpu(self):
+		with tempfile.TemporaryDirectory() as td:
+			root = Path(td)
+			input_path = _write_zarr_array(root / "input.zarr", (8, 8, 8))
+			for device in (None, "auto", "cpu"):
+				with self.subTest(device=device), \
+					 mock.patch.object(torch.cuda, "is_available", return_value=False), \
+					 mock.patch.object(torch.cuda, "device_count", return_value=0), \
+					 mock.patch.object(torch.backends.mps, "is_available", return_value=True), \
+					 mock.patch.object(LasagnaCosPredict3DAdapter, "load_model", side_effect=_StopAfterManifest) as load_model:
+					self._run_predict3d_until_model_build(
+						input_path=input_path, output_path=root / f"{device}.lasagna.json", device=device,
+					)
+					load_model.assert_called_once_with(device=torch.device("cpu" if device == "cpu" else "mps"))
 
 	def _dispatch_predict3d_fixture(self, args):
 		"""Exercise real CLI provenance I/O; mock only expensive inference/procfs."""
@@ -2009,7 +2069,8 @@ class PreprocessCosOmezarrTests(unittest.TestCase):
 					tmp_dir=td,
 				)
 		self.assertEqual(output.written, [(0, 0, 0)])
-		self.assertEqual([name for name, _ in clear_calls], ["acc_identity", "weight_sd1"])
+		# Clearing belongs to the flush task, never the coordinator's band objects.
+		self.assertEqual(clear_calls, [])
 
 	def test_shared_runner_supports_global_crop_beyond_local_ring_at_sd4(self):
 		product = OutputProductSpec(

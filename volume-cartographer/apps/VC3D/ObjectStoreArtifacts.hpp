@@ -1,8 +1,8 @@
 #pragma once
 #include <vc_object_store/objects/ObjectStoreSession.hpp>
 #include <vc_object_store/Uuid.hpp>
+#include "vc/core/util/AtomicFile.hpp"
 #include <QCryptographicHash>
-#include <QSaveFile>
 #include <QTemporaryDir>
 #include <filesystem>
 #include <map>
@@ -31,10 +31,10 @@ inline std::map<std::string, std::filesystem::path> materializeJsonDocuments(
     for (const auto& [uuid, document] : documents) {
         const auto path = directory / (uuid + ".json");
         if (!std::filesystem::exists(path)) {
-            QSaveFile output(QString::fromStdString(path.string()));
-            if (!output.open(QIODevice::WriteOnly) ||
-                output.write(document.data(), document.size()) != qint64(document.size()) || !output.commit())
-                throw std::runtime_error("Cannot write object transport artifact " + path.string() + ": " + output.errorString().toStdString());
+            // Named temporary files also work where a sandbox cannot publish
+            // Qt's unnamed O_TMPFILE through /proc/self/fd. Keep atomic rename
+            // and durability in the shared writer.
+            vc::core::util::atomicWriteString(path, document);
         }
         paths.emplace(uuid, path);
     }

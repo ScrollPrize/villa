@@ -3,7 +3,8 @@
 
 namespace vc::sftp::detail {
 
-// The `ssh -s HOST sftp` child process and its byte stream. With an
+// The ssh child process and its byte stream: an SFTP subsystem or, for hubs,
+// an existing sftp-server running under a process-owned remote lock. With an
 // authenticator (Linux/macOS), ssh's prompts arrive through SSH_ASKPASS and are
 // answered on a background thread until authenticated() is called.
 class SshProcess {
@@ -19,6 +20,7 @@ public:
     // has exited or closed the stream.
     size_t read(std::span<std::byte> out, std::chrono::milliseconds wait);
     bool prompting() const;  // a prompt is waiting for the user's answer
+    bool closed() const;     // local EOF only; never consumes a protocol byte
     void authenticated();    // stop answering prompts; the session is established
     std::string diagnostics();  // the end of ssh's standard error
 

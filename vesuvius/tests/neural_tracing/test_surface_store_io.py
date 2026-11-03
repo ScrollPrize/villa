@@ -64,7 +64,9 @@ def test_create_surface_records_binding_provenance_and_missing_vertices(tmp_path
         assert record['name'] == 'copy'
         assert record['meta']['coordinates'] == {'volume_uuid': 'vol', 'scale_factor': 1}
         assert record['meta']['provenance'] == {'tool': 'test-tool', 'parameters': {'k': 1}, 'sources': [source]}
-        assert record['meta']['area_vx2'] == 4
+        # The store computes area from geometry and removes stale TIFXYZ area metadata.
+        assert 'area_vx2' not in record['meta']
+        assert record['surface']['area'] == 0
     surface = read_surface(tmp_path / 'objects.vcobj', uid, volume='vol')
     assert surface.get_scale_tuple() == (0.25, 0.25)
     assert not surface._mask[1, 1] and not surface._mask[2, 2] and surface._mask[0, 0]
@@ -87,9 +89,12 @@ def test_copy_store_mode_reads_the_pinned_revision_and_creates_sourced_outputs(t
     created = surfaces.save(grid, valid, 'source_front', step_size=2, voxel_size_um=8.0, source='ckpt',
                             metadata={'surface_role': 'front'}, apply_mesh_cleanup=False)
     with ObjectStore.open(str(store), read_only=True) as db:
-        meta = db.object(created)['meta']
+        record = db.object(created)
+        meta = record['meta']
         assert meta['provenance']['sources'] == [source]
-        assert meta['surface_role'] == 'front' and meta['area_vx2'] > 0
+        assert meta['surface_role'] == 'front'
+        assert 'area_vx2' not in meta
+        assert record['surface']['area'] > 0
 
 
 def test_copy_cli_takes_exactly_one_input_mode():

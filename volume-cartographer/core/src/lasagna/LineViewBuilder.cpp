@@ -786,6 +786,125 @@ double LineStripPositionMap::stripGridColumnToOriginalPosition(double stripGridC
                static_cast<double>(second - first);
 }
 
+LineModel lineModelFromSampledPoints(
+    const std::vector<cv::Vec3d>& points,
+    const vc::lasagna::NormalSampler* normalSampler)
+{
+    if (points.empty()) {
+        throw std::runtime_error("Fiber has no line points");
+    }
+    if (!normalSampler) {
+        throw std::runtime_error("No Lasagna normal sampler is available for this fiber");
+    }
+
+    std::vector<vc::lasagna::NormalSampleWithDerivative> samples;
+    const vc::lasagna::NormalBatchReport batchReport =
+        normalSampler->sampleNormalBatch(points, false, samples);
+    (void)batchReport;
+    if (samples.size() != points.size()) {
+        throw std::runtime_error("Normal sampler returned the wrong number of samples");
+    }
+
+    vc::lasagna::LineModel model;
+    model.points.reserve(points.size());
+    int bestAnchor = -1;
+    double bestAnchorDistance = std::numeric_limits<double>::infinity();
+    const double center = static_cast<double>(points.size() - 1) * 0.5;
+    for (size_t i = 0; i < points.size(); ++i) {
+        vc::lasagna::LinePoint linePoint;
+        linePoint.position = points[i];
+        linePoint.sampledNormal = samples[i].sample;
+        linePoint.sampledNormal.normal = normalizedOrZero(linePoint.sampledNormal.normal);
+        linePoint.sampledNormal.valid =
+            linePoint.sampledNormal.valid &&
+            validDirection(linePoint.sampledNormal.normal);
+        linePoint.valid = linePoint.sampledNormal.valid;
+        if (linePoint.valid) {
+            const double distance = std::abs(static_cast<double>(i) - center);
+            if (distance < bestAnchorDistance) {
+                bestAnchorDistance = distance;
+                bestAnchor = static_cast<int>(i);
+            }
+        }
+        model.points.push_back(std::move(linePoint));
+    }
+    if (bestAnchor < 0) {
+        throw std::runtime_error("Fiber line points have no valid sampled normals");
+    }
+    model.displayFrameAnchorIndex = bestAnchor;
+    return model;
+}
+
+
+std::vector<cv::Vec3f> orientedLineNormals(
+    const LineModel& line, const std::function<cv::Vec3f(const cv::Vec3f&)>& centerReference)
+{
+    constexpr float kNan = std::numeric_limits<float>::quiet_NaN();
+    std::vector<cv::Vec3f> normals;
+    normals.reserve(line.points.size());
+    // Pass 1: chain signs along the line. Each valid normal is aligned to
+    // the previous valid one, so a local sign flip -- whether from the field
+    // itself or from any per-point orientation test -- is structurally
+    // impossible, and the displayed frame cannot mirror mid-line.
+    cv::Vec3f previousNormal{kNan, kNan, kNan};
+    for (const auto& point : line.points) {
+        const cv::Vec3d sampled = normalizedOrZero(point.sampledNormal.normal);
+        if (!point.sampledNormal.valid || !validDirection(sampled)) {
+            normals.push_back({kNan, kNan, kNan});
+            continue;
+        }
+        cv::Vec3f normal = toVec3f(sampled);
+        if (std::isfinite(previousNormal[0]) &&
+            normal.dot(previousNormal) < 0.0f) {
+            normal = -normal;
+        }
+        previousNormal = normal;
+        normals.push_back(normal);
+    }
+
+    // Pass 2: one global majority vote decides the whole line's sign, so a
+    // noisy or imperfect center reference cannot flip individual stretches.
+    // The reference only needs to get the hemisphere right on balance; its z
+    // component is zeroed because orientation is radial-only (z is the
+    // scroll axis).
+    // Sign convention: normals point away from the scroll center. The dialog
+    // uses them directly as the cut view's up hint, and the viewer's scene y
+    // renders downward, so this puts the fiber's center-facing surface at
+    // the top of the view.
+    double awayScore = 0.0;
+    for (size_t index = 0; index < normals.size(); ++index) {
+        if (!std::isfinite(normals[index][0])) {
+            continue;
+        }
+        const cv::Vec3f position =
+            toVec3f(line.points[index].position);
+        cv::Vec3f towardCenter = centerReference ? centerReference(position)
+            : cv::Vec3f{kNan, kNan, kNan};
+        if (!std::isfinite(towardCenter[0])) {
+            continue;
+        }
+        // Cosine-weighted vote: normalize the reference so each point's
+        // influence reflects only how well its normal aligns with the radial
+        // direction, not its distance from the center -- a few large-radius
+        // points must not outvote the rest of the line.
+        towardCenter[2] = 0.0f;
+        const float towardNorm = cv::norm(towardCenter);
+        if (!(towardNorm > 1.0e-3f)) {
+            continue;
+        }
+        awayScore -= static_cast<double>(
+            normals[index].dot(towardCenter) / towardNorm);
+    }
+    if (awayScore < 0.0) {
+        for (cv::Vec3f& normal : normals) {
+            if (std::isfinite(normal[0])) {
+                normal = -normal;
+            }
+        }
+    }
+    return normals;
+}
+
 LineViewSurfaces buildLineViewSurfaces(const LineModel& line, const LineViewConfig& config)
 {
     if (!std::isfinite(config.targetSpacingBaseVoxels) ||

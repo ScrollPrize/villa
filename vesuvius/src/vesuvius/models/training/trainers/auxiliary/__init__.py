@@ -6,6 +6,7 @@ from .surface_normals_trainer import SurfaceNormalsTrainer
 from .structure_tensor_trainer import StructureTensorTrainer
 from .inplane_direction_trainer import InplaneDirectionTrainer
 from .nearest_component_trainer import NearestComponentTrainer
+from .auxiliary_trainer import AuxiliaryTrainer
 
 __all__ = [
     "BaseAuxTrainer",
@@ -14,4 +15,5 @@ __all__ = [
     "StructureTensorTrainer",
     "InplaneDirectionTrainer",
     "NearestComponentTrainer",
+    "AuxiliaryTrainer",
 ]
