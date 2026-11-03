@@ -134,6 +134,14 @@ launch bindings instead; see
 [The VC3D project's inputs](#the-vc3d-projects-inputs). This is not covered
 by scrollprize.org/tutorial_spiral.
 
+`runners/run_single.py --resume` records the object store's persistent UUID
+in its run state and checks it even when the fit stage is already complete.
+Moving the store or using a replica of the same store preserves this identity;
+switching to a different store is refused. Older runner state files without
+the UUID cannot establish which store was used and are refused too; use a new
+output directory. This check identifies the store, not its current contents;
+the fitter's checkpoint input-manifest checks still apply when fitting resumes.
+
 ```json
 {
   "schema_version": 1,
