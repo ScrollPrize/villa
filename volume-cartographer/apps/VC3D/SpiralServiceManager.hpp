@@ -377,6 +377,14 @@ private:
     // lacks needs them; `failed` says why the request was not sent.
     void withProject(QJsonObject body, std::function<void(QJsonObject)> send,
                      std::function<void(const QString&)> failed);
+    // Cache `groups` (remote Lasagna arrays `lasagna` packs from), then
+    // finish(body, cached); fails through `failed`.
+    void cacheLasagnaThenSend(
+        QJsonObject body, const vc3d::spiral::ProjectLasagna& lasagna,
+        const vc3d::spiral::ProjectLasagna& cached,
+        std::vector<vc::lasagna::LasagnaChannelGroup> groups,
+        std::function<void(QJsonObject, const std::optional<vc3d::spiral::ProjectLasagna>&)> finish,
+        std::function<void(const QString&)> failed);
     void prepareSessionRequest(QJsonObject request, bool initialize);
     void sendLoadCheckpoint(QJsonObject body, const QString& hostPath,
                             const QString& localPath);

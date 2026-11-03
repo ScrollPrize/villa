@@ -1025,3 +1025,15 @@ def test_input_preparation_progress_reports_a_live_elapsed_time(host, store, mon
         progress.close()
     with state.lock:
         assert state._input_preparation_status()['progress'] is None
+
+
+def test_lasagna_pack_kinds_follow_the_resolved_config():
+    from config import Config
+    source = SimpleNamespace(stores={'normal_x': 'x', 'normal_y': 'y', 'gradient_magnitude': 'g'})
+    config = Config().as_dict()
+    kinds = spiral_service._lasagna_pack_kinds
+    assert kinds({**config, 'dense_spacing_mode': 'winding_model'}, source) == {'normals'}
+    assert kinds({**config, 'dense_spacing_mode': 'grad_mag'}, source) == {'normals', 'grad_mag'}
+    # Normals without their loss: still read by the link refresh.
+    assert kinds({**config, 'dense_spacing_mode': 'winding_model',
+                  'loss_weight_dense_normals': 0}, source) == {'normals'}

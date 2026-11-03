@@ -2116,18 +2116,26 @@ class ServiceState:
                 output_scale=scroll.fiber_scale(volume, level),
                 workers=FIBER_DIRECTION_WORKERS, log=log)
 
+    def required_lasagna_packs(self, request):
+        """``{"packs": [...]}``: the Lasagna pack kinds a build of this
+        session request (as /session/initialize or /session/rebuild takes
+        it) reads, so a client caches only the remote arrays they are built
+        from."""
+        request = dict(request or {})
+        request.pop("command_id", None)
+        paths, run, _, _ = self._prepare_session_request(request, restore_checkpoint_z=True)
+        if not paths.lasagna:
+            return {"packs": []}
+        return {"packs": sorted(_lasagna_pack_kinds(
+            self._effective_config(paths, run), load_lasagna_source(paths.lasagna)))}
+
     def _prepare_lasagna_packs(self, paths, config):
         """Opted-in hosts build missing pools from local arrays before linking."""
         if not self.build_missing_lasagna_packs or not paths.lasagna:
             return
-        from fit_session import lasagna_packs_required, input_source_enabled
         from lasagna_source import is_remote_location
         source = load_lasagna_source(paths.lasagna)
-        kinds = set(lasagna_packs_required(config))
-        # Link refresh uses normals even when their dense loss is disabled.
-        if (input_source_enabled(config, "normals")
-                and source.stores.get("normal_x") and source.stores.get("normal_y")):
-            kinds.add("normals")
+        kinds = _lasagna_pack_kinds(config, source)
         if not kinds:
             return
         for kind in sorted(kinds):
@@ -3683,6 +3691,18 @@ def _route_upload_file(ctx):
         ctx.args[0], ctx.args[1], handler.rfile, length, offset=offset)
 
 
+def _lasagna_pack_kinds(config, source):
+    """The Lasagna pack kinds a build of ``config`` reads from ``source``:
+    the fit's (lasagna_packs_required), and normals for the link refresh
+    even when their dense loss is disabled."""
+    from fit_session import lasagna_packs_required, input_source_enabled
+    kinds = set(lasagna_packs_required(config))
+    if (input_source_enabled(config, "normals")
+            and source.stores.get("normal_x") and source.stores.get("normal_y")):
+        kinds.add("normals")
+    return kinds
+
+
 _UPLOAD_ID = r"[0-9a-f]{32}"
 
 _LEASE_OPERATIONS = frozenset({"lease_claim", "lease_release"})
@@ -3732,6 +3752,10 @@ ROUTES = (
           Idempotency.UPLOAD_ID, reads_body=True),
     Route("POST", "/session/inputs", "upload_begin",
           lambda ctx: ctx.state.begin_upload(ctx.body), Idempotency.NONE,
+          reads_body=True),
+    # A query, not a mutation: POST only to carry a session request.
+    Route("POST", "/session/lasagna-packs", "lasagna_packs",
+          lambda ctx: ctx.state.required_lasagna_packs(ctx.body), Idempotency.NONE,
           reads_body=True),
     Route("POST", "/session/initialize", "session_initialize",
           lambda ctx: ctx.state.initialize(ctx.body), Idempotency.COMMAND_ID,

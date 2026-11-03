@@ -227,6 +227,8 @@ void givesALocalServiceTheCachedArrays(const fs::path& directory)
     const auto needed = vc3d::spiral::lasagnaGroupsToCache(lasagna, spiral);
     require(needed.size() == 1 && needed.front().channels == std::vector<std::string>{"grad_mag"},
             "a packed kind's arrays are not needed");
+    require(vc3d::spiral::lasagnaGroupsToCache(lasagna, spiral, std::set<std::string>{"normals"}).empty(),
+            "a kind the build does not read is not cached");
     auto remote = lasagna;
     remote.identity.clear();
     require(vc3d::spiral::lasagnaGroupsToCache(remote, spiral).size() == 3,
