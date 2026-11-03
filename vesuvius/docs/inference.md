@@ -118,8 +118,21 @@ Memory: `(num_classes + 1) * 4` bytes per voxel of the region the patches cover,
 bbox grown by up to one patch on each side. For a 512³ bbox and the 2-class m7 surface model
 (192³ patches) that region is 862 × 863 × 863 voxels, 7.2 GiB. `predict` checks this against the
 available memory before inference starts.
-`--blend_in_memory` cannot be combined with `--num_parts > 1`; split whole-scroll runs still go
-through `blend_logits` / `blend_and_finalize`.
+
+With `--num_parts N --part_id I`, each part blends one Z slab of that region instead: the chunk
+rows the patches cover are divided between the parts (the same chunk-row split
+`blend_and_finalize --num_parts` uses), part `I` runs every patch that reaches into its slab,
+including the ones that start in the slab below, and writes only the chunks of its slab. The parts
+are independent jobs writing disjoint chunks of the same output, which part 0 creates (the others
+wait for it), and together they write exactly what a single process would. Memory per part is
+`(num_classes + 1) * 4` bytes per voxel of its slab, so more parts need less RAM each; the cost is
+that a patch crossing a slab boundary is run by both parts.
+
+```bash
+for i in 0 1 2 3; do
+  vesuvius.predict ... --blend_in_memory /tmp/final.zarr --num_parts 4 --part_id $i &
+done; wait
+```
 
 ## Stage 2 — `vesuvius.blend_logits`
 

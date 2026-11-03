@@ -9,7 +9,7 @@ import zarr
 
 from vesuvius.data.utils import open_zarr
 from vesuvius.models.run import inference
-from vesuvius.models.run.blending import InMemoryBlender, merge_inference_outputs
+from vesuvius.models.run.blending import InMemoryBlender, merge_inference_outputs, part_z_range, patches_in_z_range
 from vesuvius.models.run.finalize_outputs import FinalizeConfig
 from vesuvius.models.run.inference import Inferer, build_parser
 from vesuvius.models.run.patch_writer import BoundedPatchWriter
@@ -137,17 +137,94 @@ def test_main_passes_in_memory_blend_settings(monkeypatch: pytest.MonkeyPatch, t
     assert config["finalize_config"].threshold == 0.3
 
 
-def test_main_rejects_blend_in_memory_with_parts(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+def test_main_passes_parts_with_blend_in_memory(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    captured = {}
+    output = str(tmp_path / "blended.zarr")
+
+    class FakeInferer:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+        def infer(self):
+            return output, None
+
+    monkeypatch.setattr(inference, "Inferer", FakeInferer)
     monkeypatch.setattr(sys, "argv", [
         "vesuvius.predict", *_required_args(tmp_path), "--device", "cpu",
-        "--blend_in_memory", str(tmp_path / "blended.zarr"), "--num_parts", "2",
+        "--blend_in_memory", output, "--num_parts", "3", "--part_id", "1",
     ])
-    with pytest.raises(SystemExit):
-        inference.main()
+    assert inference.main() == 0
+    assert captured["num_parts"] == 3 and captured["part_id"] == 1
+    assert captured["in_memory_blend"]["output_path"] == output
 
 
-def test_inferer_rejects_in_memory_blend_with_parts(tmp_path: Path) -> None:
-    with pytest.raises(ValueError, match="num_parts"):
-        Inferer(model_path=str(tmp_path / "model.pth"), input_dir="https://example.org/volume.zarr",
-                output_dir=str(tmp_path / "out"), device="cpu", num_parts=2,
-                in_memory_blend={"output_path": str(tmp_path / "blended.zarr")})
+def _blend_in_parts(coords, logits, num_classes, num_parts, out, chunk, finalize_config):
+    """Run each part the way predict does: its own patch selection, its own slab, one shared output."""
+    slabs = []
+    for part in range(num_parts):  # part 0 first: it creates the output the others write into
+        z_range = part_z_range(coords, PATCH, VOLUME, chunk[0], num_parts, part)
+        keep = patches_in_z_range(coords, PATCH[0], z_range)
+        blender = InMemoryBlender(coords[keep], PATCH, num_classes, VOLUME, z_range=z_range)
+        for local, index in enumerate(keep):
+            blender.add(local, logits[index])
+        blender.write(str(out), chunk_size=chunk, finalize_config=finalize_config, verbose=False,
+                      create=part == 0, part_id=part)
+        slabs.append(z_range)
+    return slabs
+
+
+@pytest.mark.parametrize("num_parts", [2, 3, 4])
+@pytest.mark.parametrize("finalize_config", [FinalizeConfig(mode="binary"), None])
+def test_split_in_memory_blend_matches_blend_and_finalize(tmp_path: Path, num_parts, finalize_config) -> None:
+    coords, logits = _patches(2)
+    parent = tmp_path / "parts"
+    parent.mkdir()
+    _write_parts(parent, coords, logits)
+    staged = tmp_path / "staged.zarr"
+    merge_inference_outputs(str(parent), str(staged), chunk_size=(12, 12, 12), num_workers=1,
+                            verbose=False, finalize_config=finalize_config)
+
+    split = tmp_path / "split.zarr"
+    slabs = _blend_in_parts(coords, logits, 2, num_parts, split, (12, 12, 12), finalize_config)
+
+    # Chunk-aligned, disjoint slabs that together cover every chunk row the patches reach.
+    assert all(z0 % 12 == 0 for z0, _ in slabs)
+    assert [z1 for _, z1 in slabs[:-1]] == [z0 for z0, _ in slabs[1:]]
+    assert slabs[0][0] == 0 and slabs[-1][1] == VOLUME[0]
+    expected, actual = _read(staged), _read(split)
+    assert actual.dtype == expected.dtype and actual.shape == expected.shape
+    np.testing.assert_array_equal(actual, expected)
+
+
+def test_part_slabs_follow_the_covered_extent() -> None:
+    # Patches only in Z 24..56 of a 100-slice volume (a --bbox run): the parts split those chunk rows.
+    coords = np.array([(z, 0, 0) for z in (24, 32, 40)], dtype=np.int64)
+    slabs = [part_z_range(coords, PATCH, (100, 16, 16), 8, 4, part) for part in range(4)]
+    assert slabs == [(24, 32), (32, 40), (40, 48), (48, 56)]
+    # The patch starting at 24 reaches into the second slab, so that part runs it too.
+    assert list(patches_in_z_range(coords, PATCH[0], slabs[1])) == [0, 1]
+
+
+def test_write_rejects_a_slab_that_cuts_a_chunk(tmp_path: Path) -> None:
+    coords, logits = _patches(2)
+    blender = InMemoryBlender(coords, PATCH, 2, VOLUME, z_range=(0, 20))
+    with pytest.raises(ValueError, match="aligned"):
+        blender.write(str(tmp_path / "out.zarr"), chunk_size=(12, 12, 12), verbose=False)
+
+
+def test_inferer_runs_the_patches_that_reach_its_slab() -> None:
+    class Dataset:
+        input_shape = (64, 16, 16)
+        all_positions = [(z, 0, 0) for z in (0, 8, 16, 24, 32, 40, 48)]
+        non_empty_mask = np.array([True, False, True, True, True, False, True])
+
+    inferer = Inferer.__new__(Inferer)
+    inferer.in_memory_blend = {"output_path": "unused", "chunk_size": None}
+    inferer.num_parts, inferer.part_id, inferer.verbose = 2, 1, False
+    inferer.patch_size = PATCH
+    inferer.dataset = Dataset()
+    inferer._select_blend_part_patches()
+
+    assert inferer._blend_z_range == (32, 64)
+    assert inferer.dataset.all_positions == [(24, 0, 0), (32, 0, 0), (40, 0, 0), (48, 0, 0)]
+    assert inferer.dataset.non_empty_mask.tolist() == [True, True, False, True]
