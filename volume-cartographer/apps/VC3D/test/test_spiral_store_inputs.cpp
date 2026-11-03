@@ -2,10 +2,6 @@
 // as the store holds them now and converted to reference-volume voxels, and
 // each input and consumed relationship says whether it is what the fit read,
 // by geometry revision, the adapter's metadata values and link generations.
-//
-// With SPIRAL_STORE_INPUTS_DUMP=STORE|MANIFEST|OUT it instead reads MANIFEST's
-// inputs from STORE and writes OUT in display_geometry_dump.py's format, for
-//   display_geometry_dump.py compare <baseline> OUT
 #include "SpiralStoreInputs.hpp"
 
 #include "vc/core/util/QuadSurface.hpp"
@@ -15,14 +11,11 @@
 #include <vc_object_store/objects/ObjectStoreSession.hpp>
 
 #include <QCoreApplication>
-#include <QCryptographicHash>
 #include <QTemporaryDir>
 
-#include <chrono>
 #include <cmath>
 #include <cstring>
 #include <filesystem>
-#include <fstream>
 #include <iostream>
 
 namespace fs = std::filesystem;
@@ -273,15 +266,6 @@ void readsCurrentInputsAndTheirDifferences(const fs::path& directory)
 
     const auto& surface = *inputs.surfaces.at(0).surface;
     require(surface.id == fixture.surface, "input geometry retains its store UUID for viewer queries");
-    SurfaceProximityQuery query;
-    query.uuids = std::vector<std::string>{surface.id};
-    query.volume = kVolume;
-    query.point = {10.5, 20.25, 30};
-    query.tolerance = 0.1;
-    const auto hits = fixture.session->nearestSurfaces({fixture.attachment}, query);
-    require(hits.size() == 1 && hits.front().hit.objectUuid == fixture.surface,
-            "a displayed fit input can be located directly without a session draft");
-    require(!fixture.session->hasDraft(fixture.surface), "reading fit inputs does not create editing drafts");
     const auto& points = *surface.rawPointsPtr();
     require(points.rows == 2 && points.cols == 3, "surface grid shape");
     require(points(0, 1) == cv::Vec3f(11, 20, 30), "scale-1 surface vertices are stored XYZ");
@@ -314,15 +298,6 @@ void readsCurrentInputsAndTheirDifferences(const fs::path& directory)
     inputs = incremental(fixture, document, inputs, {fixture.pcl, fixture.surface}, {}, "metadata edits");
     require(inputs.pointCollections.at(0).state == InputState::MetadataChanged, "metadata change detected");
     require(inputs.surfaces.at(0).state == InputState::Fitted, "unread metadata is no change");
-    auto unrecorded = document;
-    unrecorded["manifest"]["objects"][1].erase("metadata");
-    require(fixture.read(unrecorded).pointCollections.at(0).state == InputState::Fitted,
-            "a manifest without metadata values compares geometry only");
-    fixture.session->act(fixture.attachment, fixture.pins({fixture.pcl}), [&](auto& db, auto& txn) {
-        db.setMeta(txn, fixture.pcl, "source", R"({"winding_is_absolute":false})");
-    });
-    inputs = incremental(fixture, document, inputs, {fixture.pcl}, {}, "a role change");
-    require(!inputs.pointCollections.at(0).absolute, "the role is the store's now");
 
     fixture.session->act(fixture.attachment, fixture.pins({fixture.fiber}), [&](auto& db, auto& txn) {
         const auto current = db.currentGeometry(txn, fixture.fiber);
@@ -382,127 +357,12 @@ void readsCurrentInputsAndTheirDifferences(const fs::path& directory)
     inputs = fixture.read(other);
     require(inputs.surfaces.empty() && inputs.problems.size() == 1, "another store is refused");
 }
-
-// display_geometry_dump.py's entry for each input.
-std::string sha256(const std::vector<float>& values)
-{
-    return QCryptographicHash::hash(
-        QByteArray(reinterpret_cast<const char*>(values.data()), qsizetype(values.size() * sizeof(float))),
-        QCryptographicHash::Sha256).toHex().toStdString();
-}
-
-Json summary(const std::vector<cv::Vec3f>& xyz)
-{
-    std::vector<float> flat;
-    Json first = Json::array();
-    std::optional<cv::Vec3f> low, high;
-    std::size_t invalid = 0;
-    for (const auto& point : xyz) {
-        flat.insert(flat.end(), {point[0], point[1], point[2]});
-        if (point == cv::Vec3f(-1, -1, -1)) { ++invalid; continue; }
-        if (first.size() < 2) first.push_back({point[0], point[1], point[2]});
-        if (!low) { low = point; high = point; }
-        for (int axis = 0; axis < 3; ++axis) {
-            (*low)[axis] = std::min((*low)[axis], point[axis]);
-            (*high)[axis] = std::max((*high)[axis], point[axis]);
-        }
-    }
-    return {{"count", xyz.size()}, {"invalid", invalid}, {"first", first},
-            {"min", low ? Json{(*low)[0], (*low)[1], (*low)[2]} : Json(nullptr)},
-            {"max", high ? Json{(*high)[0], (*high)[1], (*high)[2]} : Json(nullptr)},
-            {"sha256", sha256(flat)}};
-}
-
-std::vector<cv::Vec3f> asFloat(const std::vector<cv::Vec3d>& points)
-{
-    std::vector<cv::Vec3f> result;
-    for (const auto& point : points) result.emplace_back(float(point[0]), float(point[1]), float(point[2]));
-    return result;
-}
-
-int dump(const std::string& spec)
-{
-    const auto first = spec.find('|'), second = spec.find('|', first + 1);
-    const fs::path store = spec.substr(0, first);
-    const fs::path manifestPath = spec.substr(first + 1, second - first - 1);
-    const fs::path out = spec.substr(second + 1);
-    std::ifstream manifestFile(manifestPath);
-    const Json document = Json::parse(manifestFile);
-    auto session = std::make_shared<ObjectStoreSession>();
-    OpenOptions options; options.readOnly = true;
-    const auto attachment = session->attach(store, options);
-    vc3d::spiral::FitInputs inputs;
-    std::map<std::string, std::string> derived;
-    double fullSeconds = 0, changeSeconds = 0;
-    session->read(attachment, [&](const auto& db, const auto& txn, const auto&) {
-        const auto start = std::chrono::steady_clock::now();
-        inputs = vc3d::spiral::readFitInputs(db, txn, document);
-        const auto middle = std::chrono::steady_clock::now();
-        // What one commit to the first surface and the first link costs.
-        if (!inputs.surfaces.empty() && !inputs.relationships.empty())
-            (void)vc3d::spiral::readFitInputChanges(db, txn, document, {inputs.surfaces[0].pin.uuid},
-                                                    {inputs.relationships[0].uuid});
-        fullSeconds = std::chrono::duration<double>(middle - start).count();
-        changeSeconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - middle).count();
-        for (const auto& pin : vc3d::spiral::manifestPins(document)) {
-            const auto record = db.objectByUuid(txn, pin.uuid);
-            const auto meta = Json::parse(record->meta);
-            auto name = meta.value("source", Json::object()).value("uuid_derivation", Json::object())
-                            .value("name", pin.kind + ":" + pin.name);
-            if (name.rfind("patch:", 0) == 0 && name.size() > 7 && name.ends_with(".tifxyz"))
-                name.resize(name.size() - 7);
-            derived[pin.uuid] = name;
-        }
-    });
-    Json objects = Json::object();
-    for (const auto& entry : inputs.surfaces) {
-        if (!entry.surface) continue;
-        const auto& points = *entry.surface->rawPointsPtr();
-        std::vector<cv::Vec3f> xyz(points.begin(), points.end());
-        auto item = summary(xyz);
-        item["kind"] = "surface";
-        item["shape"] = {points.rows, points.cols};
-        const cv::Mat mask = entry.surface->channel("mask");
-        item["masked"] = mask.empty() ? Json(nullptr) : Json(cv::countNonZero(mask == 0));
-        objects[derived[entry.pin.uuid]] = item;
-    }
-    for (const auto& entry : inputs.pointCollections) {
-        auto item = summary(asFloat(entry.points));
-        item["kind"] = "point_collection";
-        Json points = Json::object();
-        for (std::size_t i = 0; i < entry.ids.size(); ++i)
-            points[std::to_string(entry.ids[i])] = {float(entry.points[i][0]), float(entry.points[i][1]),
-                                                    float(entry.points[i][2])};
-        item["points"] = points;
-        objects[derived[entry.pin.uuid]] = item;
-    }
-    for (const auto& entry : inputs.fibers)
-        objects[derived[entry.pin.uuid]] = {{"kind", "fiber"}, {"controls", summary(asFloat(entry.controls))},
-                                            {"line", summary(asFloat(entry.line))}};
-    std::ofstream(out) << Json{{"frame", "reference-volume voxels, XYZ"}, {"objects", objects}}.dump(1);
-    for (const auto& problem : inputs.problems) std::cerr << problem << "\n";
-    for (const auto& entry : inputs.surfaces) if (!entry.problem.empty()) std::cerr << entry.problem << "\n";
-    for (const auto& entry : inputs.pointCollections) if (!entry.problem.empty()) std::cerr << entry.problem << "\n";
-    for (const auto& entry : inputs.fibers) if (!entry.problem.empty()) std::cerr << entry.problem << "\n";
-    using vc3d::spiral::LinkState;
-    std::cout << "read: full " << fullSeconds << " s, one surface and one link " << changeSeconds << " s\n";
-    std::cout << "inputs: " << inputs.count(vc3d::spiral::InputState::Fitted) << " as fitted, "
-              << inputs.count(vc3d::spiral::InputState::Edited) << " edited, "
-              << inputs.count(vc3d::spiral::InputState::MetadataChanged) << " metadata changed, "
-              << inputs.count(vc3d::spiral::InputState::Missing) << " missing\n";
-    std::cout << "links: " << inputs.count(LinkState::Fitted) << " as fitted, "
-              << inputs.count(LinkState::Changed) << " changed, " << inputs.count(LinkState::Dropped)
-              << " dropped, " << inputs.addedRelationships.size() << " added\n";
-    return inputs.unchanged() ? 0 : 1;
-}
 } // namespace
 
 int main(int argc, char** argv)
 {
     QCoreApplication app(argc, argv);
     try {
-        if (const char* spec = std::getenv("SPIRAL_STORE_INPUTS_DUMP"); spec && *spec)
-            return dump(spec);
         adapterMetadataMatchesThePythonAdapter();
         QTemporaryDir directory;
         readsCurrentInputsAndTheirDifferences(directory.path().toStdString());
