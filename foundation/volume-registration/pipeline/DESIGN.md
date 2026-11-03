@@ -1,8 +1,8 @@
 # Registration pipeline — design
 
-The production version of the registration review process worked out in `../review-tool.md`:
+The production version of the registration review process worked out on branch `worktree-volreg-auto-refine` (`foundation/volume-registration/review-tool.md` there):
 a person judges a hold-out set and the final fit, and everything between is automatic. This
-directory is self-contained; the modules one level up stay as the research record, and the
+directory is self-contained; the research modules on that branch stay the research record, and the
 algorithms they hold that the process actually used are merged in here in a production pass.
 
 Decided with the reviewer on 2026-11-03.
