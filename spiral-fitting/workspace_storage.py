@@ -78,8 +78,12 @@ def reclaim_workspaces(output):
                 continue
             try:
                 remove_workspace(root)
+                # Release before unlink: an open lock handle holds its
+                # file on Windows, and storage_lock fences new claimants.
+                owner.release()
                 lock.unlink()
             except OSError:
                 logging.exception('Failed to reclaim Spiral workspace %s (lock %s)', root, lock)
             finally:
+                # Idempotent: a no-op on the success path, a safety net otherwise.
                 owner.release()

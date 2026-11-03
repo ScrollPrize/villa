@@ -1,4 +1,4 @@
-"""Train the crop-heading model on the follower's Paris 4 + AFV sources (see configs/heading/heading_model_l0_w16_centered_frame.json).
+"""Train the crop-heading model on the follower's Paris 4 + fiber-store sources (see configs/heading/heading_model_l0_w16_centered_frame.json).
 
 Batches are generated online in loader workers from the follower's own sampling code (heading_model.data). The
 run directory holds config.json, ct_normalization.json, log.jsonl, last.pt (resumable), ckpt_STEP.pt and best.pt

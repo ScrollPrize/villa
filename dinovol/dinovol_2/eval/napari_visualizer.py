@@ -15,10 +15,13 @@ from skimage.morphology.binary import binary_dilation
 
 from dinovol_2.dataset.normalization import NORMALIZATION_SCHEMES, get_normalization
 from dinovol_2.dataset.ssl_zarr_dataset import open_zarr_handle
-from dinovol_2.model.model import DinoVitStudentTeacher, _upgrade_weight_norm_state_dict_keys
+from dinovol_2.model.model import DinoVitStudentTeacher, PointDenseHead, _upgrade_weight_norm_state_dict_keys
+from dinovol_2.ops.point_embeddings import sample_grid_points
 
 DEFAULT_NORMALIZATION_SCHEME = "robust"
 PCA_CHUNK_SIZE = 16_384
+DENSE_POINT_CHUNK_SIZE = 65_536
+EMBEDDING_SOURCES = ("patch", "dense", "ink")
 
 
 @dataclass
@@ -33,6 +36,7 @@ class LoadedBackbone:
     intensity_properties: dict[str, Any] | None
     embedding_type: str
     global_input_size: tuple[int, int, int]
+    dense_head: PointDenseHead | None = None
 
 
 @dataclass
@@ -45,6 +49,7 @@ class EmbeddingCache:
     normalized_patch_embeddings: np.ndarray
     source_bbox: tuple[int, int, int, int, int, int]
     bbox_layer_name: str | None
+    embedding_source: str = "patch"
 
 
 @dataclass
@@ -62,6 +67,7 @@ class FrozenPcaBasis:
     source_bbox: tuple[int, int, int, int, int, int]
     mask_method: str
     mask_dilation_radius: int
+    embedding_source: str = "patch"
 
 
 @dataclass(frozen=True)
@@ -325,6 +331,63 @@ def _extract_backbone_state_dict(
     raise ValueError("checkpoint does not contain teacher.backbone or student.backbone weights")
 
 
+def _build_dense_head_from_checkpoint(
+    checkpoint: dict[str, Any],
+    *,
+    backbone: torch.nn.Module,
+    source_branch: str,
+    device: torch.device,
+) -> PointDenseHead | None:
+    down_proj = getattr(backbone, "down_projection", None)
+    skip_channels = getattr(down_proj, "skip_channels", None)
+    if not skip_channels:
+        return None
+
+    branch_state = checkpoint.get(source_branch)
+    if not isinstance(branch_state, dict):
+        return None
+    dense_state = {
+        key.replace("dense_head.", "", 1): value
+        for key, value in branch_state.items()
+        if key.startswith("dense_head.")
+    }
+    if not dense_state:
+        return None
+
+    config = checkpoint.get("config") if isinstance(checkpoint.get("config"), dict) else {}
+    obj_cfg = config.get("object_losses") if isinstance(config.get("object_losses"), dict) else {}
+    head_cfg = obj_cfg.get("head") if isinstance(obj_cfg.get("head"), dict) else {}
+
+    if "obj_proj.weight" in dense_state:
+        out_dim, hidden_dim = (int(v) for v in dense_state["obj_proj.weight"].shape)
+    else:
+        hidden_dim = int(head_cfg.get("hidden_dim", 256))
+        out_dim = int(head_cfg.get("out_dim", 64))
+
+    if "ink_proj.weight" in dense_state:
+        ink_dim = int(dense_state["ink_proj.weight"].shape[0])
+    else:
+        ink_dim = int(head_cfg.get("ink_dim", min(32, out_dim)))
+
+    if "fpn_in.weight" in dense_state:
+        fpn_dim: int | None = int(dense_state["fpn_in.weight"].shape[0])
+    else:
+        raw_fpn = head_cfg.get("fpn_dim")
+        fpn_dim = int(raw_fpn) if raw_fpn is not None else None
+
+    dense_head = PointDenseHead(
+        token_dim=int(backbone.embed_dim),
+        skip_channels=tuple(int(ch) for ch in skip_channels),
+        hidden_dim=hidden_dim,
+        out_dim=out_dim,
+        ink_dim=ink_dim,
+        fpn_dim=fpn_dim,
+    )
+    has_full_fpn_and_ink = ("fpn_in.weight" in dense_state) and ("ink_proj.weight" in dense_state)
+    dense_head.load_state_dict(dense_state, strict=has_full_fpn_and_ink)
+    return dense_head.to(device).eval()
+
+
 def load_backbone_from_checkpoint(
     checkpoint_path: str | Path,
     *,
@@ -344,6 +407,12 @@ def load_backbone_from_checkpoint(
 
     selected_device = device or _select_device()
     backbone = backbone.to(selected_device).eval()
+    dense_head = _build_dense_head_from_checkpoint(
+        checkpoint,
+        backbone=backbone,
+        source_branch=source_branch,
+        device=selected_device,
+    )
 
     normalization_scheme = str(
         dataset_config.get("normalization_scheme", DEFAULT_NORMALIZATION_SCHEME)
@@ -362,6 +431,7 @@ def load_backbone_from_checkpoint(
         intensity_properties=dataset_config.get("intensity_properties"),
         embedding_type=str(model_config.get("embedding_type", "default")).strip().lower(),
         global_input_size=_as_3tuple(model_config.get("global_crops_size", (16, 16, 16)), name="global_crops_size"),
+        dense_head=dense_head,
     )
 
 
@@ -372,8 +442,6 @@ def _configure_backbone_for_spatial_shape(backbone: torch.nn.Module, spatial_sha
     spatial_shape = tuple(int(v) for v in spatial_shape)
     backbone.global_crops_size = spatial_shape
     backbone.local_crops_size = spatial_shape
-    backbone.global_input_size = spatial_shape
-    backbone.local_input_size = spatial_shape
     backbone.global_ref_feat_shape = tuple(
         int(size) // int(patch) for size, patch in zip(spatial_shape, backbone.patch_size)
     )
@@ -469,6 +537,26 @@ def point_within_spatial_bbox(
     lower = np.asarray(spatial_bbox[:3], dtype=np.float64)
     upper = np.asarray(spatial_bbox[3:], dtype=np.float64)
     return bool(np.all(point >= lower) and np.all(point < upper))
+
+
+def resolve_z_slab_bounds(
+    source_z: int,
+    *,
+    z_center: float | None,
+    z_slab_thickness: int,
+) -> tuple[int, int]:
+    total_z = int(source_z)
+    if total_z <= 0:
+        raise ValueError(f"source_z must be positive, got {source_z}")
+    slab = int(z_slab_thickness)
+    if slab <= 0 or slab >= total_z:
+        return 0, total_z
+    center = (total_z / 2.0) if z_center is None else float(z_center)
+    half = slab // 2
+    z0 = int(np.floor(center)) - half
+    z0 = max(0, min(z0, total_z - slab))
+    z1 = z0 + slab
+    return int(z0), int(z1)
 
 
 def normalize_volume(
@@ -607,21 +695,108 @@ def _reshape_and_normalize_patch_tokens(
     return patch_grid.detach().cpu().to(torch.float32).numpy()
 
 
+def _evaluate_dense_head_grid(
+    dense_head: PointDenseHead,
+    token_grid: torch.Tensor,
+    skips: list[torch.Tensor],
+    spatial_shape: tuple[int, int, int],
+    *,
+    embedding_source: str,
+    stride: tuple[int, int, int] = (1, 1, 1),
+    chunk_size: int = DENSE_POINT_CHUNK_SIZE,
+) -> np.ndarray:
+    if embedding_source not in ("dense", "ink"):
+        raise ValueError(f"unsupported dense head embedding_source {embedding_source!r}")
+
+    dtype = token_grid.dtype
+    coarser_skips = skips[dense_head._fpn_skip_start:]
+    x = dense_head.fpn_in(token_grid.permute(0, 4, 1, 2, 3).contiguous())
+    for skip, lateral, refine in zip(reversed(coarser_skips), dense_head.fpn_laterals, dense_head.fpn_refines):
+        target_size = skip.shape[2:]
+        if x.shape[2:] != target_size:
+            x = F.interpolate(x, size=target_size, mode="trilinear", align_corners=False)
+        x = x + lateral(skip.to(dtype))
+        x = x + refine(x)
+    fpn_grid = x.permute(0, 2, 3, 4, 1).contiguous()
+    del x
+    skip_grids = [level.permute(0, 2, 3, 4, 1) for level in skips]
+
+    grid_shape = tuple(max(1, int(size) // int(st)) for size, st in zip(spatial_shape, stride))
+    axes = [
+        (torch.arange(g, device=token_grid.device, dtype=torch.float32) + 0.5) * float(st) - 0.5
+        if int(st) > 1
+        else torch.arange(g, device=token_grid.device, dtype=torch.float32)
+        for g, st in zip(grid_shape, stride)
+    ]
+    zz, yy, xx = torch.meshgrid(*axes, indexing="ij")
+    all_points = torch.stack([zz, yy, xx], dim=-1).reshape(-1, 3)
+
+    proj = dense_head.ink_proj if embedding_source == "ink" else dense_head.obj_proj
+    out_dim = int(dense_head.ink_dim if embedding_source == "ink" else dense_head.out_dim)
+    total_points = int(all_points.shape[0])
+    out_flat = np.empty((total_points, out_dim), dtype=np.float32)
+
+    for start in range(0, total_points, chunk_size):
+        stop = min(start + chunk_size, total_points)
+        pts = all_points[start:stop].unsqueeze(0)
+        tokens = sample_grid_points(token_grid, pts, spatial_shape)
+        fpn_pts = dense_head.fpn_norm(sample_grid_points(fpn_grid, pts, spatial_shape).to(dtype))
+        skip_parts = [
+            norm(sample_grid_points(sg, pts, spatial_shape).to(dtype))
+            for norm, sg in zip(dense_head.skip_norms, skip_grids)
+        ]
+        tokens_cast = tokens.to(dtype)
+        trunk = dense_head.trunk_norm(
+            dense_head.mlp(torch.cat([tokens_cast, *skip_parts, fpn_pts], dim=-1))
+            + dense_head.token_shortcut(tokens_cast)
+        )
+        emb = F.normalize(proj(trunk).float(), dim=-1).squeeze(0)
+        out_flat[start:stop] = emb.detach().cpu().numpy()
+
+    return out_flat.reshape(*grid_shape, out_dim)
+
+
 def _compute_patch_embedding_grid_full_volume(
     padded: np.ndarray,
     *,
     padded_shape: tuple[int, int, int],
     loaded_backbone: LoadedBackbone,
+    embedding_source: str = "patch",
+    dense_stride: tuple[int, int, int] = (1, 1, 1),
 ) -> np.ndarray:
     _configure_backbone_for_spatial_shape(loaded_backbone.backbone, padded_shape)
+    need_dense = embedding_source in ("dense", "ink")
+    if need_dense and loaded_backbone.dense_head is None:
+        raise ValueError(
+            f"checkpoint does not contain a PointDenseHead for embedding_source={embedding_source!r}; "
+            "select 'patch' instead"
+        )
 
-    tensor = torch.from_numpy(padded).unsqueeze(0).to(loaded_backbone.device)
-    outputs = loaded_backbone.backbone.forward_features(tensor, masks=None, view_kind="global")
-    patch_tokens = outputs["x_norm_patchtokens"][0]
-    return _reshape_and_normalize_patch_tokens(
-        patch_tokens,
-        patch_grid_shape=_patch_grid_shape_for_spatial_shape(padded_shape, loaded_backbone.patch_size),
-    )
+    prev_skips = getattr(loaded_backbone.backbone, "return_embed_skips", False)
+    loaded_backbone.backbone.return_embed_skips = need_dense
+    try:
+        tensor = torch.from_numpy(padded).unsqueeze(0).to(loaded_backbone.device)
+        outputs = loaded_backbone.backbone.forward_features(tensor, masks=None, view_kind="global")
+        patch_tokens = outputs["x_norm_patchtokens"]
+        patch_grid_shape = _patch_grid_shape_for_spatial_shape(padded_shape, loaded_backbone.patch_size)
+        if not need_dense:
+            return _reshape_and_normalize_patch_tokens(
+                patch_tokens[0],
+                patch_grid_shape=patch_grid_shape,
+            )
+        token_grid = patch_tokens.reshape(1, *patch_grid_shape, patch_tokens.shape[-1])
+        skips = outputs["embed_skips"]
+        assert loaded_backbone.dense_head is not None
+        return _evaluate_dense_head_grid(
+            loaded_backbone.dense_head,
+            token_grid,
+            skips,
+            padded_shape,
+            embedding_source=embedding_source,
+            stride=dense_stride,
+        )
+    finally:
+        loaded_backbone.backbone.return_embed_skips = prev_skips
 
 
 def _compute_patch_embedding_grid_windowed(
@@ -631,7 +806,16 @@ def _compute_patch_embedding_grid_windowed(
     loaded_backbone: LoadedBackbone,
     window_spatial_shape: tuple[int, int, int],
     window_overlap_patches: int | tuple[int, int, int],
+    embedding_source: str = "patch",
+    dense_stride: tuple[int, int, int] = (1, 1, 1),
 ) -> np.ndarray:
+    need_dense = embedding_source in ("dense", "ink")
+    if need_dense and loaded_backbone.dense_head is None:
+        raise ValueError(
+            f"checkpoint does not contain a PointDenseHead for embedding_source={embedding_source!r}; "
+            "select 'patch' instead"
+        )
+
     full_patch_shape = _patch_grid_shape_for_spatial_shape(padded_shape, loaded_backbone.patch_size)
     window_patch_shape = _patch_grid_shape_for_spatial_shape(window_spatial_shape, loaded_backbone.patch_size)
     overlap_patch_shape = _normalize_patch_overlap(
@@ -643,32 +827,59 @@ def _compute_patch_embedding_grid_windowed(
         _compute_window_starts(full, window, overlap)
         for full, window, overlap in zip(full_patch_shape, window_patch_shape, overlap_patch_shape)
     ]
-    weight_grid = _window_weight_grid(window_patch_shape, overlap_patch_shape)
+
+    effective_step = dense_stride if need_dense else loaded_backbone.patch_size
+    full_grid_shape = _patch_grid_shape_for_spatial_shape(padded_shape, effective_step)
+    window_grid_shape = _patch_grid_shape_for_spatial_shape(window_spatial_shape, effective_step)
+    scale_factors = tuple(int(p) // int(s) for p, s in zip(loaded_backbone.patch_size, effective_step))
+    overlap_grid_shape = tuple(int(ov) * int(sf) for ov, sf in zip(overlap_patch_shape, scale_factors))
+    weight_grid = _window_weight_grid(window_grid_shape, overlap_grid_shape)
 
     embedding_sum: np.ndarray | None = None
-    weight_sum = np.zeros(full_patch_shape, dtype=np.float32)
+    weight_sum = np.zeros(full_grid_shape, dtype=np.float32)
 
-    for patch_starts in product(*axis_starts):
-        patch_stops = tuple(start + size for start, size in zip(patch_starts, window_patch_shape))
-        voxel_slices = tuple(
-            slice(start * patch, stop * patch)
-            for start, stop, patch in zip(patch_starts, patch_stops, loaded_backbone.patch_size)
-        )
-        tile = padded[(slice(None), *voxel_slices)]
-        tensor = torch.from_numpy(tile).unsqueeze(0).to(loaded_backbone.device)
-        outputs = loaded_backbone.backbone.forward_features(tensor, masks=None, view_kind="global")
-        patch_tokens = outputs["x_norm_patchtokens"][0]
-        tile_grid = _reshape_and_normalize_patch_tokens(
-            patch_tokens,
-            patch_grid_shape=window_patch_shape,
-        )
+    prev_skips = getattr(loaded_backbone.backbone, "return_embed_skips", False)
+    loaded_backbone.backbone.return_embed_skips = need_dense
+    try:
+        for patch_starts in product(*axis_starts):
+            patch_stops = tuple(start + size for start, size in zip(patch_starts, window_patch_shape))
+            voxel_slices = tuple(
+                slice(start * patch, stop * patch)
+                for start, stop, patch in zip(patch_starts, patch_stops, loaded_backbone.patch_size)
+            )
+            tile = padded[(slice(None), *voxel_slices)]
+            _configure_backbone_for_spatial_shape(loaded_backbone.backbone, window_spatial_shape)
+            tensor = torch.from_numpy(tile).unsqueeze(0).to(loaded_backbone.device)
+            outputs = loaded_backbone.backbone.forward_features(tensor, masks=None, view_kind="global")
+            patch_tokens = outputs["x_norm_patchtokens"]
+            if not need_dense:
+                tile_grid = _reshape_and_normalize_patch_tokens(
+                    patch_tokens[0],
+                    patch_grid_shape=window_patch_shape,
+                )
+            else:
+                token_grid = patch_tokens.reshape(1, *window_patch_shape, patch_tokens.shape[-1])
+                assert loaded_backbone.dense_head is not None
+                tile_grid = _evaluate_dense_head_grid(
+                    loaded_backbone.dense_head,
+                    token_grid,
+                    outputs["embed_skips"],
+                    window_spatial_shape,
+                    embedding_source=embedding_source,
+                    stride=dense_stride,
+                )
 
-        if embedding_sum is None:
-            embedding_sum = np.zeros((*full_patch_shape, tile_grid.shape[-1]), dtype=np.float32)
+            if embedding_sum is None:
+                embedding_sum = np.zeros((*full_grid_shape, tile_grid.shape[-1]), dtype=np.float32)
 
-        destination = tuple(slice(start, stop) for start, stop in zip(patch_starts, patch_stops))
-        embedding_sum[destination] += tile_grid * weight_grid[..., None]
-        weight_sum[destination] += weight_grid
+            destination = tuple(
+                slice(start * sf, stop * sf)
+                for start, stop, sf in zip(patch_starts, patch_stops, scale_factors)
+            )
+            embedding_sum[destination] += tile_grid * weight_grid[..., None]
+            weight_sum[destination] += weight_grid
+    finally:
+        loaded_backbone.backbone.return_embed_skips = prev_skips
 
     if embedding_sum is None:
         raise RuntimeError("windowed patch embedding inference produced no tiles")
@@ -685,7 +896,18 @@ def compute_patch_embedding_grid(
     *,
     window_size: tuple[int, int, int] | None = None,
     window_overlap_patches: int | tuple[int, int, int] = 1,
+    embedding_source: str = "patch",
+    dense_stride: int | tuple[int, int, int] = 1,
 ) -> tuple[np.ndarray, tuple[int, int, int], tuple[int, int, int]]:
+    embedding_source = str(embedding_source).strip().lower()
+    if embedding_source not in EMBEDDING_SOURCES:
+        raise ValueError(f"embedding_source must be one of {EMBEDDING_SOURCES}, got {embedding_source!r}")
+    resolved_stride = _as_3tuple(dense_stride, name="dense_stride")
+    if any(s <= 0 or p % s != 0 for s, p in zip(resolved_stride, loaded_backbone.patch_size)):
+        raise ValueError(
+            f"dense_stride {resolved_stride} must be positive and divide patch_size {loaded_backbone.patch_size}"
+        )
+
     prepared = prepare_volume_array(volume, input_channels=loaded_backbone.input_channels)
     normalized = normalize_volume(
         prepared,
@@ -704,6 +926,8 @@ def compute_patch_embedding_grid(
             padded,
             padded_shape=padded_shape,
             loaded_backbone=loaded_backbone,
+            embedding_source=embedding_source,
+            dense_stride=resolved_stride,
         )
     else:
         patch_grid = _compute_patch_embedding_grid_windowed(
@@ -712,6 +936,8 @@ def compute_patch_embedding_grid(
             loaded_backbone=loaded_backbone,
             window_spatial_shape=window_spatial_shape,
             window_overlap_patches=window_overlap_patches,
+            embedding_source=embedding_source,
+            dense_stride=resolved_stride,
         )
     return (
         patch_grid,
@@ -1042,6 +1268,17 @@ if _QT_AVAILABLE:
             self.zarr_path_edit = QLineEdit()
             self.zarr_scale_combo = QComboBox()
             self.checkpoint_path_edit = QLineEdit()
+            self.embedding_source_combo = QComboBox()
+            for source in EMBEDDING_SOURCES:
+                self.embedding_source_combo.addItem(source)
+            self.dense_stride_spinbox = QSpinBox()
+            self.dense_stride_spinbox.setRange(1, 8)
+            self.dense_stride_spinbox.setValue(1)
+            self.z_slab_spinbox = QSpinBox()
+            self.z_slab_spinbox.setRange(0, 65536)
+            self.z_slab_spinbox.setSingleStep(8)
+            self.z_slab_spinbox.setSpecialValueText("0 (Full Z)")
+            self.z_slab_spinbox.setValue(0)
             self.normalization_combo = QComboBox()
             for scheme in NORMALIZATION_SCHEMES:
                 self.normalization_combo.addItem(scheme)
@@ -1074,6 +1311,9 @@ if _QT_AVAILABLE:
             browse_checkpoint_button = QPushButton("Browse")
             browse_checkpoint_button.clicked.connect(self._browse_checkpoint)
 
+            snap_z_button = QPushButton("Snap BBox Z to Slice")
+            snap_z_button.clicked.connect(self._snap_bbox_z_to_viewer_slice)
+
             refresh_button = QPushButton("Refresh Layers")
             refresh_button.clicked.connect(self.refresh_layer_choices)
 
@@ -1104,10 +1344,17 @@ if _QT_AVAILABLE:
             checkpoint_row.addWidget(self.checkpoint_path_edit)
             checkpoint_row.addWidget(browse_checkpoint_button)
 
+            z_slab_row = QHBoxLayout()
+            z_slab_row.addWidget(self.z_slab_spinbox)
+            z_slab_row.addWidget(snap_z_button)
+
             form_layout = QFormLayout()
             form_layout.addRow("OME-Zarr", zarr_path_row)
             form_layout.addRow("Zarr Scale", zarr_scale_row)
             form_layout.addRow("Checkpoint", checkpoint_row)
+            form_layout.addRow("Embedding Source", self.embedding_source_combo)
+            form_layout.addRow("Dense Stride", self.dense_stride_spinbox)
+            form_layout.addRow("Z Slab Thickness", z_slab_row)
             form_layout.addRow("Normalization", self.normalization_combo)
             form_layout.addRow("Image Layer", self.image_layer_combo)
             form_layout.addRow("Points Layer", self.points_layer_combo)
@@ -1140,6 +1387,9 @@ if _QT_AVAILABLE:
             layout.addWidget(scroll_area)
             self.setLayout(layout)
 
+            self.embedding_source_combo.currentTextChanged.connect(self._invalidate_cache_and_pca_basis)
+            self.dense_stride_spinbox.valueChanged.connect(self._invalidate_cache_and_pca_basis)
+            self.z_slab_spinbox.valueChanged.connect(self._invalidate_cache)
             self.normalization_combo.currentTextChanged.connect(self._invalidate_cache_and_pca_basis)
             self.image_layer_combo.currentTextChanged.connect(self._invalidate_cache)
             self.zarr_scale_combo.currentIndexChanged.connect(self._invalidate_cache)
@@ -1310,12 +1560,15 @@ if _QT_AVAILABLE:
             )
 
             bbox_layer = self._ensure_bbox_layer_for_image(image_layer)
+            selected_scale = self._selected_zarr_scale()
+            if selected_scale.spatial_shape[0] > 256 and int(self.z_slab_spinbox.value()) == 0:
+                self.z_slab_spinbox.setValue(128)
             self._invalidate_cache()
             self.refresh_layer_choices()
             self._restore_combo_text(self.image_layer_combo, image_layer.name)
             self._set_status(
                 f"Opened {layer_name} with {len(self.ome_zarr_spec.scales)} scale level(s). "
-                f"Draw a rectangle in {bbox_layer.name}; select scale for embedding resolution."
+                f"Draw a rectangle in {bbox_layer.name}; select scale and Z slab thickness for embeddings."
             )
 
         def refresh_layer_choices(self) -> None:
@@ -1356,6 +1609,59 @@ if _QT_AVAILABLE:
                 raise ValueError("select a points layer")
             return self.viewer.layers[name]
 
+        def _selected_embedding_source(self, loaded_backbone: LoadedBackbone) -> str:
+            source = str(self.embedding_source_combo.currentText()).strip().lower() or "patch"
+            if source in ("dense", "ink") and loaded_backbone.dense_head is None:
+                raise ValueError(
+                    f"checkpoint {loaded_backbone.checkpoint_path.name} does not contain a PointDenseHead "
+                    "('dense_head.*'); select 'patch' or load a checkpoint trained with dense/ink heads"
+                )
+            return source
+
+        def _selected_dense_stride(self) -> int:
+            return max(1, int(self.dense_stride_spinbox.value()))
+
+        def _selected_z_slab_thickness(self) -> int:
+            return max(0, int(self.z_slab_spinbox.value()))
+
+        def _viewer_z_in_spatial_coords(self, image_layer: Any) -> float | None:
+            dims_point = getattr(getattr(self.viewer, "dims", None), "point", None)
+            if dims_point is None or len(dims_point) < 3:
+                return None
+            world_z = float(dims_point[-3])
+            if self._is_ome_zarr_layer(image_layer):
+                selected_scale = self._selected_zarr_scale()
+                return (world_z - float(selected_scale.spatial_translate[0])) / float(selected_scale.spatial_scale[0])
+            scale_z = float(np.asarray(image_layer.scale, dtype=np.float64)[-3])
+            translate_z = float(np.asarray(image_layer.translate, dtype=np.float64)[-3])
+            return (world_z - translate_z) / scale_z
+
+        def _snap_bbox_z_to_viewer_slice(self) -> None:
+            image_layer = self._selected_image_layer()
+            bbox_layer = self._bbox_layer_for_image(image_layer)
+            if bbox_layer is None:
+                self._invalidate_cache()
+                self._set_status("Cleared embedding cache; Z slab will center on the current viewer Z slice.")
+                return
+            rectangle_index = self._primary_rectangle_index(bbox_layer)
+            dims_point = getattr(getattr(self.viewer, "dims", None), "point", None)
+            if dims_point is None or len(dims_point) < 3:
+                raise ValueError("viewer does not have a 3D world cursor position")
+            world_z = float(dims_point[-3])
+            scale_z = float(np.asarray(bbox_layer.scale, dtype=np.float64)[-3])
+            translate_z = float(np.asarray(bbox_layer.translate, dtype=np.float64)[-3])
+            bbox_z = (world_z - translate_z) / scale_z
+
+            shapes_data = [np.asarray(shape, dtype=np.float64).copy() for shape in bbox_layer.data]
+            shapes_data[rectangle_index][:, -3] = bbox_z
+            bbox_layer.data = shapes_data
+            self._invalidate_cache()
+            spatial_z = self._viewer_z_in_spatial_coords(image_layer)
+            z_label = f"{spatial_z:.1f}" if spatial_z is not None else f"{bbox_z:.1f}"
+            self._set_status(
+                f"Snapped {bbox_layer.name} rectangle #{rectangle_index} to current viewer Z slice ({z_label})."
+            )
+
         def _load_backbone(self) -> LoadedBackbone:
             checkpoint_text = self.checkpoint_path_edit.text().strip()
             if not checkpoint_text:
@@ -1372,10 +1678,15 @@ if _QT_AVAILABLE:
             if combo_index >= 0:
                 self.normalization_combo.setCurrentIndex(combo_index)
             loaded_backbone.normalization_scheme = self.normalization_combo.currentText()
+            if loaded_backbone.dense_head is None and self.embedding_source_combo.currentText() in ("dense", "ink"):
+                patch_index = self.embedding_source_combo.findText("patch")
+                if patch_index >= 0:
+                    self.embedding_source_combo.setCurrentIndex(patch_index)
             self.loaded_backbone = loaded_backbone
             self._invalidate_cache()
+            dense_info = " + PointDenseHead (dense/ink)" if loaded_backbone.dense_head is not None else ""
             self._set_status(
-                f"Loaded {loaded_backbone.source_branch} backbone from {checkpoint_path.name} on "
+                f"Loaded {loaded_backbone.source_branch} backbone{dense_info} from {checkpoint_path.name} on "
                 f"{loaded_backbone.device.type} with patch size {loaded_backbone.patch_size}."
             )
             return loaded_backbone
@@ -1466,9 +1777,16 @@ if _QT_AVAILABLE:
                     input_channels=loaded_backbone.input_channels,
                 )
 
+            z_slab_thickness = self._selected_z_slab_thickness()
             bbox_layer = self._bbox_layer_for_image(image_layer)
             if bbox_layer is None:
-                return SpatialCrop((0, 0, 0), source_shape, None)
+                z_center = self._viewer_z_in_spatial_coords(image_layer)
+                z0, z1 = resolve_z_slab_bounds(
+                    source_shape[0],
+                    z_center=z_center,
+                    z_slab_thickness=z_slab_thickness,
+                )
+                return SpatialCrop((z0, 0, 0), (z1, source_shape[1], source_shape[2]), None)
 
             rectangle_index = self._primary_rectangle_index(bbox_layer)
             rectangle_vertices = np.asarray(bbox_layer.data[rectangle_index], dtype=np.float64)
@@ -1488,6 +1806,12 @@ if _QT_AVAILABLE:
                 )
                 spatial_vertices = image_vertices[:, -3:]
 
+            z_center = float(np.mean(spatial_vertices[:, 0]))
+            z0, z1 = resolve_z_slab_bounds(
+                source_shape[0],
+                z_center=z_center,
+                z_slab_thickness=z_slab_thickness,
+            )
             y0 = max(0, int(np.floor(np.min(spatial_vertices[:, 1]))))
             x0 = max(0, int(np.floor(np.min(spatial_vertices[:, 2]))))
             y1 = min(source_shape[1], int(np.ceil(np.max(spatial_vertices[:, 1]))))
@@ -1496,16 +1820,20 @@ if _QT_AVAILABLE:
                 raise ValueError(f"bbox rectangle in {bbox_layer.name} collapses after scaling; redraw it")
 
             return SpatialCrop(
-                start_zyx=(0, y0, x0),
-                stop_zyx=(source_shape[0], y1, x1),
+                start_zyx=(z0, y0, x0),
+                stop_zyx=(z1, y1, x1),
                 bbox_layer_name=bbox_layer.name,
             )
 
         def _cache_embeddings(self) -> None:
             loaded_backbone = self._load_backbone()
+            embedding_source = self._selected_embedding_source(loaded_backbone)
+            dense_stride = self._selected_dense_stride()
             image_layer = self._selected_image_layer()
             spatial_crop = self._spatial_crop_for_image(image_layer=image_layer, loaded_backbone=loaded_backbone)
-            self._set_status(f"Computing patch embeddings for {image_layer.name} within bbox {spatial_crop.bounds}...")
+            self._set_status(
+                f"Computing {embedding_source} embeddings for {image_layer.name} within bbox {spatial_crop.bounds}..."
+            )
 
             if self._is_ome_zarr_layer(image_layer):
                 cropped_volume = self._read_zarr_crop(spatial_crop)
@@ -1518,25 +1846,40 @@ if _QT_AVAILABLE:
             patch_embeddings, source_shape, padded_shape = compute_patch_embedding_grid(
                 cropped_volume,
                 loaded_backbone,
+                embedding_source=embedding_source,
+                dense_stride=dense_stride,
+            )
+            effective_patch_size = (
+                loaded_backbone.patch_size
+                if embedding_source == "patch"
+                else (dense_stride, dense_stride, dense_stride)
             )
             self.embedding_cache = EmbeddingCache(
                 checkpoint_path=loaded_backbone.checkpoint_path,
                 image_layer_name=image_layer.name,
                 source_shape=source_shape,
                 padded_shape=padded_shape,
-                patch_size=loaded_backbone.patch_size,
+                patch_size=effective_patch_size,
                 normalized_patch_embeddings=patch_embeddings,
                 source_bbox=spatial_crop.bounds,
                 bbox_layer_name=spatial_crop.bbox_layer_name,
+                embedding_source=embedding_source,
             )
             patch_grid_shape = patch_embeddings.shape[:3]
             self._set_status(
-                f"Cached embeddings for {image_layer.name}: patch grid {patch_grid_shape}, "
+                f"Cached {embedding_source} embeddings for {image_layer.name}: grid {patch_grid_shape}, "
                 f"crop shape {source_shape}, crop bbox {spatial_crop.bounds}."
             )
 
         def _ensure_embedding_cache(self) -> tuple[LoadedBackbone, EmbeddingCache]:
             loaded_backbone = self._load_backbone()
+            embedding_source = self._selected_embedding_source(loaded_backbone)
+            dense_stride = self._selected_dense_stride()
+            effective_patch_size = (
+                loaded_backbone.patch_size
+                if embedding_source == "patch"
+                else (dense_stride, dense_stride, dense_stride)
+            )
             image_layer = self._selected_image_layer()
             spatial_crop = self._spatial_crop_for_image(image_layer=image_layer, loaded_backbone=loaded_backbone)
             if (
@@ -1545,6 +1888,8 @@ if _QT_AVAILABLE:
                 or self.embedding_cache.image_layer_name != image_layer.name
                 or self.embedding_cache.source_bbox != spatial_crop.bounds
                 or self.embedding_cache.bbox_layer_name != spatial_crop.bbox_layer_name
+                or self.embedding_cache.embedding_source != embedding_source
+                or self.embedding_cache.patch_size != effective_patch_size
             ):
                 self._cache_embeddings()
             if self.embedding_cache is None:
@@ -1715,6 +2060,7 @@ if _QT_AVAILABLE:
                 source_bbox=embedding_cache.source_bbox,
                 mask_method="otsu" if foreground_mask is not None else "none",
                 mask_dilation_radius=int(self.mask_dilation_spinbox.value()) if foreground_mask is not None else 0,
+                embedding_source=embedding_cache.embedding_source,
             )
             return basis, foreground_mask
 
@@ -1740,8 +2086,8 @@ if _QT_AVAILABLE:
                 else ""
             )
             self._set_status(
-                f"Frozen PCA basis from {basis.source_image_layer_name} within bbox {basis.source_bbox} "
-                f"using components 0:{basis.actual_components}{mask_suffix}."
+                f"Frozen PCA basis ({basis.embedding_source}) from {basis.source_image_layer_name} within bbox "
+                f"{basis.source_bbox} using components 0:{basis.actual_components}{mask_suffix}."
             )
 
         def _resolve_pca_basis(
@@ -1760,6 +2106,11 @@ if _QT_AVAILABLE:
                     raise ValueError("frozen PCA basis checkpoint does not match the current checkpoint")
                 if basis.normalization_scheme != loaded_backbone.normalization_scheme:
                     raise ValueError("frozen PCA basis normalization does not match the current normalization setting")
+                if basis.embedding_source != embedding_cache.embedding_source:
+                    raise ValueError(
+                        f"frozen PCA basis embedding source ({basis.embedding_source!r}) does not match "
+                        f"the current embedding source ({embedding_cache.embedding_source!r})"
+                    )
                 if basis.embedding_channels != int(embedding_cache.normalized_patch_embeddings.shape[-1]):
                     raise ValueError("frozen PCA basis embedding dimensionality does not match the current embeddings")
                 if basis.actual_components < requested_components:
@@ -1788,6 +2139,11 @@ if _QT_AVAILABLE:
             points_layer = self._selected_points_layer()
             patch_grid_shape = embedding_cache.normalized_patch_embeddings.shape[:3]
             crop_origin = np.asarray(embedding_cache.source_bbox[:3], dtype=np.float64)
+            source_prefix = (
+                "cosine"
+                if embedding_cache.embedding_source == "patch"
+                else f"cosine_{embedding_cache.embedding_source}"
+            )
 
             created_count = 0
             skipped_points: list[int] = []
@@ -1813,9 +2169,10 @@ if _QT_AVAILABLE:
                     patch_size=embedding_cache.patch_size,
                     output_shape=embedding_cache.source_shape,
                 )
-                layer_name = f"cosine_{points_layer.name}_{point_index:03d}"
+                layer_name = f"{source_prefix}_{points_layer.name}_{point_index:03d}"
                 metadata = {
                     "checkpoint_path": str(embedding_cache.checkpoint_path),
+                    "embedding_source": embedding_cache.embedding_source,
                     "reference_point_index": int(point_index),
                     "reference_point_zyx": image_coords.tolist(),
                     "reference_point_local_zyx": local_image_coords.tolist(),
@@ -1835,7 +2192,10 @@ if _QT_AVAILABLE:
             if created_count == 0:
                 raise ValueError("no requested points fall inside the active bbox")
 
-            status = f"Created {created_count} cosine similarity layer(s) within bbox {embedding_cache.source_bbox}."
+            status = (
+                f"Created {created_count} {embedding_cache.embedding_source} cosine similarity layer(s) "
+                f"within bbox {embedding_cache.source_bbox}."
+            )
             if skipped_points:
                 status += f" Skipped points outside bbox: {skipped_points}."
             self._set_status(status)
@@ -1846,7 +2206,7 @@ if _QT_AVAILABLE:
             requested_components = int(self.pca_components_spinbox.value())
             basis_label = "frozen" if self.use_frozen_pca_checkbox.isChecked() else "local"
             self._set_status(
-                f"Computing PCA visualization for {image_layer.name} within bbox "
+                f"Computing {embedding_cache.embedding_source} PCA visualization for {image_layer.name} within bbox "
                 f"using {requested_components} component(s) with {basis_label} basis..."
             )
 
@@ -1857,7 +2217,11 @@ if _QT_AVAILABLE:
                 requested_components=requested_components,
             )
             actual_components = min(int(basis.actual_components), requested_components)
-            base_layer_name = f"feature_pca_{image_layer.name}"
+            base_layer_name = (
+                f"feature_pca_{image_layer.name}"
+                if embedding_cache.embedding_source == "patch"
+                else f"feature_pca_{embedding_cache.embedding_source}_{image_layer.name}"
+            )
             created_layer_names: set[str] = set()
             created_count = 0
             for component_start in range(0, actual_components, 3):
@@ -1883,6 +2247,7 @@ if _QT_AVAILABLE:
                 created_layer_names.add(layer_name)
                 metadata = {
                     "checkpoint_path": str(embedding_cache.checkpoint_path),
+                    "embedding_source": embedding_cache.embedding_source,
                     "mask_method": "otsu" if foreground_mask is not None else "none",
                     "mask_dilation_radius": (
                         int(self.mask_dilation_spinbox.value()) if foreground_mask is not None else 0
@@ -1924,9 +2289,9 @@ if _QT_AVAILABLE:
                 else ""
             )
             self._set_status(
-                f"Created {created_count} PCA feature layer(s) for {image_layer.name} within bbox "
-                f"{embedding_cache.source_bbox} from components 0:{actual_components}{mask_suffix}"
-                f"{basis_suffix}."
+                f"Created {created_count} {embedding_cache.embedding_source} PCA feature layer(s) for "
+                f"{image_layer.name} within bbox {embedding_cache.source_bbox} from components "
+                f"0:{actual_components}{mask_suffix}{basis_suffix}."
             )
 
         def _create_layers_for_selected_points(self) -> None:

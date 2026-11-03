@@ -1,4 +1,5 @@
 #include <QApplication>
+#include <QMouseEvent>
 #include <QScrollBar>
 #include <QSignalSpy>
 #include <QTest>
@@ -31,6 +32,18 @@ QPoint tiltHandleCenter(const CVolumeViewerView& view)
 {
     return QPoint(view.viewport()->width() - 37,
                   view.viewport()->height() - 37);
+}
+
+void sendMouseMove(QWidget* widget, QPoint pos, Qt::MouseButtons buttons,
+                   Qt::KeyboardModifiers modifiers = Qt::NoModifier)
+{
+    // Qt 6.2's QTest::mouseMove moves the platform cursor, which does not
+    // deliver a move event offscreen. Its third argument is a delay, not
+    // modifiers. Send the event through the viewport with explicit input state.
+    QMouseEvent event(QEvent::MouseMove, QPointF(pos),
+                      QPointF(widget->mapToGlobal(pos)), Qt::NoButton,
+                      buttons, modifiers);
+    QApplication::sendEvent(widget, &event);
 }
 
 } // namespace
@@ -78,11 +91,15 @@ int main(int argc, char** argv)
             "Plain Right pan did not emit pan release");
 
     QTest::mousePress(view.viewport(), Qt::RightButton, Qt::ShiftModifier, pos);
-    QTest::mouseMove(view.viewport(), pos + QPoint(4, 3), Qt::ShiftModifier);
+    const int movesBeforeShiftDrag = moveSpy.count();
+    sendMouseMove(view.viewport(), pos + QPoint(4, 3), Qt::RightButton, Qt::ShiftModifier);
     QTest::mouseRelease(view.viewport(), Qt::RightButton, Qt::ShiftModifier, pos + QPoint(4, 3));
-    require(pressSpy.count() == 1 && moveSpy.count() >= 1 && releaseSpy.count() == 1 &&
+    require(pressSpy.count() == 1 && moveSpy.count() == movesBeforeShiftDrag + 1 && releaseSpy.count() == 1 &&
                 contextSpy.count() == 1 && panSpy.count() == 1,
             "Shift+Right did not forward tool mouse press/move/release without starting pan");
+    require(moveSpy.last().at(1).value<Qt::MouseButtons>() == Qt::RightButton &&
+                moveSpy.last().at(2).value<Qt::KeyboardModifiers>() == Qt::ShiftModifier,
+            "Shift+Right move should preserve button and modifier state");
 
     QTest::mousePress(view.viewport(), Qt::RightButton, Qt::NoModifier, pos);
     QTest::mouseRelease(view.viewport(), Qt::RightButton, Qt::NoModifier, pos);
@@ -90,7 +107,7 @@ int main(int argc, char** argv)
             "Right-button forwarding should clear after Shift+Right release");
 
     QTest::mousePress(view.viewport(), Qt::LeftButton, Qt::NoModifier, pos);
-    QTest::mouseMove(view.viewport(), pos + QPoint(3, 2));
+    sendMouseMove(view.viewport(), pos + QPoint(3, 2), Qt::LeftButton);
     QTest::mouseRelease(view.viewport(), Qt::LeftButton, Qt::NoModifier, pos + QPoint(3, 2));
     require(pressSpy.count() == 2 && clickSpy.count() == 1 && releaseSpy.count() == 2 &&
                 moveSpy.count() >= 2,
@@ -118,7 +135,7 @@ int main(int argc, char** argv)
     view.setTiltHandle(CVolumeViewerView::TiltHandleMode::Square, QPointF(0.0, 0.0));
     const QPoint handle = tiltHandleCenter(view);
     QTest::mousePress(view.viewport(), Qt::LeftButton, Qt::NoModifier, handle);
-    QTest::mouseMove(view.viewport(), handle + QPoint(8, 4));
+    sendMouseMove(view.viewport(), handle + QPoint(8, 4), Qt::LeftButton);
     QTest::mouseRelease(view.viewport(), Qt::LeftButton, Qt::NoModifier, handle + QPoint(8, 4));
     require(tiltChangedSpy.count() >= 3,
             "Tilt handle drag should emit changed values");
@@ -149,15 +166,21 @@ int main(int argc, char** argv)
     const int releaseBeforeErase = releaseSpy.count();
     QTest::mousePress(view.viewport(), Qt::RightButton,
                       Qt::ControlModifier | Qt::ShiftModifier, pos);
-    QTest::mouseMove(view.viewport(), pos + QPoint(5, 2),
-                     Qt::ControlModifier | Qt::ShiftModifier);
+    const int movesBeforeErase = moveSpy.count();
+    sendMouseMove(view.viewport(), pos + QPoint(5, 2), Qt::RightButton,
+                  Qt::ControlModifier | Qt::ShiftModifier);
     QTest::mouseRelease(view.viewport(), Qt::RightButton,
                         Qt::ControlModifier | Qt::ShiftModifier,
                         pos + QPoint(5, 2));
     require(contextSpy.count() == contextBeforeErase &&
                 pressSpy.count() == pressBeforeErase + 1 &&
+                moveSpy.count() == movesBeforeErase + 1 &&
                 releaseSpy.count() == releaseBeforeErase + 1,
             "Ctrl+Shift+Right should be forwarded to tools instead of opening the action menu");
+    require(moveSpy.last().at(1).value<Qt::MouseButtons>() == Qt::RightButton &&
+                moveSpy.last().at(2).value<Qt::KeyboardModifiers>() ==
+                    (Qt::ControlModifier | Qt::ShiftModifier),
+            "Ctrl+Shift+Right move should preserve button and modifier state");
 
     return 0;
 }

@@ -13,7 +13,7 @@ import {
 
 /*
  * "Can you find the ink?" — live ink detection on the real porphyras patch
- * (Scroll 1, PHerc. Paris 4: the first word ever read from a sealed scroll).
+ * (Scroll 1, PHerc. Paris. 4: the first word ever read from a sealed scroll).
  *
  * The user paints on the real surface render (top pane). Every brush stamp
  * is scored against the label mask — the model's own prediction thresholded

@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import os
+import time
+from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
@@ -160,7 +162,8 @@ class ModelTracer:
         for start in range(0, len(hist), chunk):
             part = slice(start, start+chunk)
             with self.autocast():
-                outputs.append(self.model(rows(x, part), hist[part], hmask[part], **rows(sampling, part)))
+                call = getattr(self, 'forward_model', self.model)
+                outputs.append(call(rows(x, part), hist[part], hmask[part], **rows(sampling, part)))
         if len(outputs) == 1:
             return outputs[0]
         def attempts(values):
@@ -264,6 +267,14 @@ class ModelTracer:
 
     def _trace(self, seeds_xyz, headings, on_decision, initial_states=None, families=None, feed=None, before_step=None,
                on_finished=None):
+        if not hasattr(self, 'stage_seconds'):
+            self.stage_seconds = defaultdict(float)
+        stamp = time.perf_counter()
+        def mark(stage):
+            nonlocal stamp
+            now = time.perf_counter()
+            self.stage_seconds[stage] += now-stamp
+            stamp = now
         n = len(seeds_xyz)
         seeds_xyz = list(seeds_xyz)  # streaming appends rows
         predictor = getattr(self, 'frame_predictor', None)
@@ -365,10 +376,12 @@ class ModelTracer:
                 references[i] = frames[i] = None
 
         while True:
+            stamp = time.perf_counter()
             if feed is not None:
                 more = feed(int(active.sum()))
                 if more is not None and len(more[0]):
                     grow(*more)
+            mark('feed')
             if not active.any():
                 break
             idx = np.flatnonzero(active)
@@ -383,6 +396,7 @@ class ModelTracer:
                     if not len(idx):
                         continue
             was_active = idx
+            mark('checks')
             pos = np.stack([paths[i][-1] for i in idx])
             fr = np.stack([frames[i] for i in idx])
             H = self.n_history
@@ -404,6 +418,7 @@ class ModelTracer:
                                          travelled=float(length[i]),
                                          **{**references[i], 'seed_age': references[i]['seed_age']+float(length[i])}) for i in idx]
             x = self.build_inputs(pos, fr, hist, hm, **context)
+            mark('inputs')
             if sequence is not None:
                 self.sequence_attach(x, idx, sequence, pos, fr, length)
             sampling = {}
@@ -419,6 +434,20 @@ class ModelTracer:
                                             self.model.cfg.max_recovery_distance, pp.gate, gate_horizon(self.model.cfg))
             commits, allowed = [v.cpu().numpy() for v in (commits, allowed)]
             points, confidence = [out[k].float().cpu().numpy() for k in ('points', 'confidence')]
+            mark('forward')
+            # Geometry of each accepted row depends only on that row. Reuse
+            # the process pool, preserving row order and all scalar arithmetic.
+            # Callbacks can inspect/change state, so keep their original serial
+            # ordering rather than speculatively advancing callback-controlled rows.
+            pool = getattr(self, 'axis_pool', None)
+            parallel_advanced = {}
+            if pool is not None and on_decision is None:
+                jobs = [(j, i) for j, i in enumerate(idx) if allowed[j] and commits[j] > 0]
+                tasks = [(paths[i], fr[j], points[j], int(commits[j]), int(heading_start[i]),
+                          self.vol.shape, pp, length[i], hist_start[i]) for j, i in jobs]
+                if tasks:
+                    parallel_advanced = dict(zip(
+                        [j for j, _ in jobs], pool.map(advance_trace_path, *zip(*tasks), chunksize=8)))
             # Next-step CT frames, resolved together after this step's commits.
             # Each depends only on its own trace, so the pool is a pure speedup.
             reframe = {}
@@ -463,9 +492,12 @@ class ModelTracer:
                 if would_stop:
                     active[i], reasons[i] = False, 'confidence'
                     continue
-                advanced, reason = advance_trace_path(
-                    paths[i], fr[j], points[j], commit, int(heading_start[i]),
-                    self.vol.shape, pp, length[i], hist_start[i])
+                if j in parallel_advanced:
+                    advanced, reason = parallel_advanced[j]
+                else:
+                    advanced, reason = advance_trace_path(
+                        paths[i], fr[j], points[j], commit, int(heading_start[i]),
+                        self.vol.shape, pp, length[i], hist_start[i])
                 if advanced is None:
                     active[i], reasons[i] = False, reason
                     continue
@@ -482,6 +514,7 @@ class ModelTracer:
                     active[i], reasons[i] = False, 'max_len'
             if sequence is not None:
                 self.sequence_record(out['sequence_cells'], committed, sequence)
+            mark('advance')
             if predictor is not None:
                 pending = [i for i in reframe if active[i]]
                 updated = predict_frames(predictor, self.vol, [paths[i][-1] for i in pending],
@@ -496,6 +529,7 @@ class ModelTracer:
                 for i, frame in zip(reframe, self.map(update, reframe)):
                     frames[i] = frame
             # Continuations: forward along the previous prediction's axis, roll from the frame just built. Each axis
+            mark('heading')
             # depends only on its own trace; an optional process pool (axis_pool) computes them in parallel with the
             # same values. (Threads are avoided here: running predicted_axis in the thread pool crashed CPython 3.14.)
             rows = [i for i in reframe if self.prediction_window and prediction[i] is not None and len(prediction[i])]
@@ -514,8 +548,10 @@ class ModelTracer:
                     frames[i] = frame_from_heading(axis, np.asarray(frames[i])[:, 0])
                     frame_diagnostics[i] = dict(frame_diagnostics[i], source=4)
                 predicted[i] = axis is not None
+            mark('axes')
             if on_finished is not None:
                 finish(was_active[~active[was_active]])
+            mark('finish')
         return [np.asarray(p[h:]) for p, h in zip(paths, hist_start)], reasons
 
 

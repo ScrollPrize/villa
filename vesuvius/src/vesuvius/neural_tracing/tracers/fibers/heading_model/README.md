@@ -55,7 +55,7 @@ inference uses the previous frame for sign continuity and a reproducible sign at
 `data.py` builds every state from the follower's modules:
 
 - sources, fiber splits and CT volumes come from the follower dataset config, through
-  `data.datasets.load_primary_dataset`, `open_afv_source` and `primary_source_spec`;
+  `data.datasets.load_primary_dataset`, `open_fiber_source` and `primary_source_spec`;
 - CT normalization comes from `tracers.shared.crop_sampling.normalization.prepare_normalization`. Pass a follower run's
   `ct_normalization.json` to reuse its exact records;
 - the simulated tracer states come from `data.samples.make_sample`: the startup mix, the calibrated tracing
@@ -80,7 +80,7 @@ python heading_model/train.py            # uses configs/heading/heading_model_l0
 ```
 
 `configs/heading/heading_model_l0_w16_centered_frame.json` is the frame run's configuration: width 16, the sources of
-`configs/datasets/paris50.json` (Paris 4, `0175A_5mm_v1.afv` and `1447_5mm_v1.afv` at 0.5/0.25/0.25), batch
+`configs/datasets/paris50.json` (Paris 4, `0175A_5mm_v1.vcobj` and `1447_5mm_v1.vcobj` at 0.5/0.25/0.25), batch
 128, `lr: 0.00015` with a cosine decay from step 40,000 (`lr_decay_start`) to zero at 70,000. `init_checkpoint`
 starts a new run from another checkpoint's weights (same architecture and model config; fresh optimizer; `--resume`
 ignores it); `lr_schedule: "constant"` holds `lr` after the warmup. A resume requires the same model config, normal

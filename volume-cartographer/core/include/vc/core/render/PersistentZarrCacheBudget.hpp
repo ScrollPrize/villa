@@ -43,7 +43,7 @@ public:
         ReadPin& operator=(const ReadPin&) = delete;
         ~ReadPin();
 
-        // Successful reads update the persistent approximate-LRU timestamp.
+        // Successful reads update the in-memory access generation, not mtime.
         void complete(bool successful = true);
 
     private:
@@ -99,9 +99,10 @@ public:
     const std::filesystem::path& root() const noexcept;
     void updateLimits(Limits limits);
     Stats stats();
-    void pollSpace();
 
     ReadPin pinRead(const std::filesystem::path& path);
+    // Pins paths and accounts pending bytes. Limits are soft: only the vacuum
+    // worker checks free space and evicts; callers still handle disk-write errors.
     WriteReservation reserveWrite(
         const std::filesystem::path& target,
         std::uint64_t newSize,
@@ -113,16 +114,16 @@ public:
         std::uint64_t newSize);
 
     // Atomically retires an exact cache subtree and forgets every managed entry
-    // beneath it as one budget-coordinated operation. Recursive deletion and
-    // accounting refresh then run in the background. Overlapping reads/writes
+    // beneath it as one budget-coordinated operation. Recursive deletion runs
+    // in the background; the index is updated directly. Overlapping reads/writes
     // are drained, but an in-progress startup scan is restarted rather than
     // blocking a format transition.
     bool removeCacheSubtree(const std::filesystem::path& subtree,
                             std::error_code& ec);
 
     // Atomically moves an exact cache subtree within this budget root. Budget
-    // accounting is refreshed asynchronously, including when a startup scan is
-    // already running, so callers do not wait on a whole-root index walk. The
+    // accounting paths are updated in memory. An in-progress startup scan is
+    // restarted, but an initialized cache is never rescanned. The
     // destination must not exist.
     bool moveCacheSubtree(const std::filesystem::path& source,
                           const std::filesystem::path& destination,

@@ -159,12 +159,40 @@ class PretrainSmokeTests(unittest.TestCase):
         self.assertTrue(report["train_step"]["checks"]["all_passed"])
         self.assertEqual(report["forward"]["losses"]["gram"], 0.0)
 
+    def test_cnn_tokens_without_final_projection_smoke_step(self) -> None:
+        config = self._base_config(embedding_type="deeper", output_name="cnn_tokens")
+        config["model"].update({
+            "model_type": "v3",
+            "attention_type": "axial",
+            "grad_checkpointing": True,
+            "patch_size": [4, 4, 4],
+            "deeper_embed_stage_channels": [4, 8, 72],
+            "deeper_embed_stage_strides": [1, 2, 2],
+            "deeper_embed_depth_per_level": [2, 2, 2],
+            "deeper_embed_use_stem": True,
+            "deeper_embed_stem_channels": 4,
+            "deeper_embed_stem_type": "conv",
+            "deeper_embed_final_projection": False,
+        })
+        report = build_verification_report(config, use_amp=False)
+        self.assertTrue(report["forward"]["checks"]["all_passed"])
+        self.assertTrue(report["train_step"]["checks"]["all_passed"])
+        self.assertEqual(report["forward"]["batch"]["global_crops"]["shape"][2:], (32, 32, 32))
+        self.assertEqual(report["forward"]["batch"]["local_crops"]["shape"][2:], (16, 16, 16))
+
     def test_gram_refinement_smoke_step(self) -> None:
         report = build_verification_report(self._gram_config(output_name="gram_smoke"), use_amp=False)
         self.assertTrue(report["forward"]["checks"]["all_passed"])
         self.assertTrue(report["train_step"]["checks"]["all_passed"])
         self.assertGreater(report["forward"]["losses"]["gram"], 0.0)
         self.assertIsNotNone(report["forward"]["batch"]["gram_teacher_crops"])
+
+    def test_axial_separate_norms_constant_lr_smoke_step(self) -> None:
+        config = self._base_config(output_name="axial_separate_norms")
+        config["model"]["model_type"] = "v3"
+        report = build_verification_report(config, use_amp=False)
+        self.assertTrue(report["forward"]["checks"]["all_passed"])
+        self.assertTrue(report["train_step"]["checks"]["all_passed"])
 
     def test_hr_mixed_resolution_default_smoke(self) -> None:
         trainer = DinoIBOTPretrainer(self._hr_config(embedding_type="default", output_name="hr_default"))

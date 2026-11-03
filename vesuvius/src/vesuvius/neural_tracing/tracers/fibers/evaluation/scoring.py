@@ -52,15 +52,24 @@ def trace_events(path, fiber, t0, sign, tol=3.0, patience=DEPARTURE_PATIENCE_LEN
     d, arc = matched_profile(path, lengths, fiber, t0, sign, tol)
     onsets = sustained_onsets(lengths, d > tol, patience)
     end = onsets[0] if onsets else len(path)
-    endpoint = fiber.points[-1 if sign > 0 else 0]
-    tangent = tangent_at(fiber.points, fiber.s, fiber.length if sign > 0 else 0.0) * sign
-    forward = (path - endpoint) @ tangent
     crossing = None
     # A seed at the endpoint has no annotated continuation.
     if len(path) and abs((fiber.length - t0) if sign > 0 else t0) < 1e-9 and d[0] <= tol:
         crossing = 0.0
+    if crossing is None:
+        crossing = endpoint_crossing(path, lengths, arc, fiber, sign, tol, reach=tol, stop=end)
+    return lengths, d, arc, end, crossing
+
+
+def endpoint_crossing(path, lengths, arc, fiber, sign, tol, reach, start=0, stop=None):
+    """Path length where the path crosses the annotation's end plane within ``reach`` of the endpoint."""
+    endpoint = fiber.points[-1 if sign > 0 else 0]
+    tangent = tangent_at(fiber.points, fiber.s, fiber.length if sign > 0 else 0.0) * sign
+    forward = (path - endpoint) @ tangent
     for i in np.flatnonzero((forward[:-1] < 0) & (forward[1:] >= 0)):
-        if i + 1 > end:
+        if i + 1 < start:
+            continue
+        if stop is not None and i + 1 > stop:
             break  # identity was lost before reaching the endpoint
         # A nearby winding can cross the endpoint plane long before the GT
         # traversal reaches its end. Require plausible along-fiber progress.
@@ -69,10 +78,9 @@ def trace_events(path, fiber, t0, sign, tol=3.0, patience=DEPARTURE_PATIENCE_LEN
             continue
         alpha = -forward[i] / (forward[i + 1] - forward[i])
         hit = path[i] + alpha * (path[i + 1] - path[i])
-        if np.linalg.norm(hit - endpoint) <= tol:
-            crossing = float(lengths[i] + alpha * (lengths[i + 1] - lengths[i]))
-            break
-    return lengths, d, arc, end, crossing
+        if np.linalg.norm(hit - endpoint) <= reach:
+            return float(lengths[i] + alpha * (lengths[i + 1] - lengths[i]))
+    return None
 
 
 MATCH_CHUNK = 8.0  # path length per correspondence update (about one commit)
@@ -109,7 +117,8 @@ def score_trace(path: np.ndarray, fiber: TracedFiber, t0: float, sign: float, to
                 patience: float = DEPARTURE_PATIENCE_LENGTH):
     """Partition every segment into supported, wrong, or unknown length.
 
-    An untagged annotation endpoint censors subsequent continuation. A tagged
+    An untagged annotation endpoint censors subsequent continuation, also after a
+    departure when the path passes the end within the recovery distance. A tagged
     physical endpoint makes subsequent length an endpoint overrun. A departure
     before that boundary remains wrong even if the path later returns to GT.
     """
@@ -134,6 +143,12 @@ def score_trace(path: np.ndarray, fiber: TracedFiber, t0: float, sign: float, to
         # Include the transition from the last supported point to the first bad point.
         correct = float(lengths[max(0, end - 1)])
         offtrack = total - correct
+        # Still beside the fiber when passing an untagged annotation end: what follows has no GT.
+        beyond = None if endpoint_known else endpoint_crossing(
+            np.asarray(path, np.float64).reshape(-1, 3), lengths, arc, fiber, sign, tol,
+            reach=tol + DEFAULT_MAX_RECOVERY_DISTANCE, start=end)
+        if beyond is not None:
+            offtrack, unknown = beyond - correct, total - beyond
     else:
         correct, offtrack = total, 0.0
     err_mask = np.arange(len(d)) < end

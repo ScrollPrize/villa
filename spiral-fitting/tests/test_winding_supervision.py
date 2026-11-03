@@ -189,3 +189,115 @@ def test_mixed_valid_and_invalid_pairs_reduce_only_valid_entries():
     assert metrics[f"{RELATIVE}_valid_fraction"] == 0.5
     torch.testing.assert_close(
         record.call_args_list[0].args[3], torch.tensor([True, False]))
+
+
+# --- ray orientation: crossing levels count along +t, not outward ---------
+
+import json
+
+import numpy as np
+
+from winding_supervision import (
+    ARTIFACT_TYPE, FORMAT_VERSION, WindingInferenceStore, _canonical_digest,
+    _sha256,
+)
+
+
+def _write_store(root, origins, steps, crossing_t, crossing_level, offsets):
+    """A one-shard crossing store laid out the way the exporter writes it."""
+    shard = root / "shard_0"
+    shard.mkdir(parents=True)
+    values = {
+        "ray_origin_zyx": np.asarray(origins, np.float32),
+        "ray_step_zyx": np.asarray(steps, np.float32),
+        "seed_winding": np.zeros(len(origins), np.int16),
+        "crossing_t": np.asarray(crossing_t, np.float32),
+        "crossing_level": np.asarray(crossing_level, np.int16),
+        "crossing_offsets": np.asarray(offsets, np.int64),
+    }
+    arrays = {}
+    for name, value in values.items():
+        path = shard / f"{name}.npy"
+        np.save(path, value, allow_pickle=False)
+        arrays[name] = {"file": path.name, "shape": list(value.shape),
+                        "dtype": value.dtype.str, "sha256": _sha256(path)}
+    manifest = {
+        "artifact_type": ARTIFACT_TYPE, "format_version": FORMAT_VERSION,
+        "coordinate_order": "zyx", "num_rays": len(origins),
+        "num_crossings": len(crossing_t),
+        "shards": [{"name": "shard_0", "arrays": arrays}],
+    }
+    manifest["fingerprint"] = _canonical_digest(manifest)
+    (root / "manifest.json").write_text(json.dumps(manifest))
+
+
+class _OpenShell:
+    def lookup(self, scan_zyx):
+        radius = torch.linalg.norm(scan_zyx[..., 1:], dim=-1)
+        ones = torch.ones_like(radius)
+        return ones * 1e6, radius, ones, torch.ones_like(radius, dtype=torch.bool)
+
+
+def _two_ray_store(tmp_path, **kwargs):
+    # Umbilicus on the z axis. Sheets every 10 voxels along +y (one winding
+    # per 10 voxels of radius). Ray 0 points outward from y=100, ray 1 points
+    # at the umbilicus from y=300. Both carry levels 0, 1, 2 along +t, as the
+    # exporter writes them (the model's phase always increases along the ray).
+    _write_store(
+        tmp_path,
+        origins=[[0.0, 100.0, 0.0], [0.0, 300.0, 0.0]],
+        steps=[[0.0, 1.0, 0.0], [0.0, -1.0, 0.0]],
+        crossing_t=[0.0, 10.0, 20.0, 0.0, 10.0, 20.0],
+        crossing_level=[0, 1, 2, 0, 1, 2],
+        offsets=[0, 3, 6],
+    )
+    return WindingInferenceStore(tmp_path, "cpu", **kwargs)
+
+
+def _umbilicus_on_z_axis(z):
+    return np.zeros((len(z), 2))
+
+
+def _perfect_spiral_loss(store):
+    # The identity transform is the true spiral here, so a correct target
+    # gives zero residual on every pair.
+    cfg = {
+        "sample_count_winding_model_relative_pairs": 256,
+        "sample_count_winding_model_density_pairs": 256,
+        "loss_weight_dense_spacing": 1.0,
+        "loss_weight_dense_spacing_density": 1.0,
+        "winding_model_relative_pair_delta": (1, 2),
+        "winding_model_huber_delta": 1.0,
+    }
+    with patch("winding_supervision.record_loss_samples"):
+        losses, metrics = get_winding_inference_losses(
+            _IdentityTransform(), torch.tensor(10.0), store, _OpenShell(), cfg,
+            z_begin=-1, z_end=1, generator=torch.Generator().manual_seed(0))
+    return losses, metrics
+
+
+def test_ray_pointing_at_the_umbilicus_is_flipped(tmp_path):
+    store = _two_ray_store(tmp_path, z_to_umbilicus_yx=_umbilicus_on_z_axis)
+
+    torch.testing.assert_close(store.orientation, torch.tensor([1.0, -1.0]))
+    assert store.num_inward_rays == 1
+    inward = store._materialize(
+        torch.tensor([1]), torch.tensor([0]), torch.tensor([2]))
+    torch.testing.assert_close(inward["target"], torch.tensor([-2.0]))
+
+
+def test_perfect_spiral_scores_zero_on_inward_rays(tmp_path):
+    store = _two_ray_store(tmp_path, z_to_umbilicus_yx=_umbilicus_on_z_axis)
+
+    losses, metrics = _perfect_spiral_loss(store)
+
+    for name in (RELATIVE, DENSITY):
+        assert metrics[f"{name}_valid_fraction"] == 1.0
+        torch.testing.assert_close(losses[name], torch.tensor(0.0))
+
+
+def test_without_an_umbilicus_rays_keep_their_exported_orientation(tmp_path):
+    store = _two_ray_store(tmp_path)
+
+    torch.testing.assert_close(store.orientation, torch.tensor([1.0, 1.0]))
+    assert store.num_inward_rays == 0

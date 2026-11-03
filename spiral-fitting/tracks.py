@@ -23,6 +23,7 @@ from tqdm import tqdm
 import prefetch
 from dt_targets import snap_dt_target, strip_dt_target_in_sample_frame
 from spiral_progress import progress_or_null
+from service_http import sha256_file
 from loss_maps import diagnostics_enabled, record_loss_samples
 import geom_utils
 from sample_spiral import (
@@ -38,6 +39,7 @@ TRACK_CROSSING_CACHE_SUFFIX = '.crossings.npz'
 TRACK_STORE_SUFFIX = '.vctracks'
 TRACK_STORE_VERSION = 1
 TRACK_STORE_MAGIC = b'VCTRK01\0'
+_DB_DIGEST_MEMO = {}
 
 
 def _load_native_track_crossings():
@@ -56,6 +58,18 @@ def _load_native_track_store():
         return importlib.import_module('vc_spiral.track_store')
     except ImportError:
         return None
+
+
+def _flatten_tracks(tracks):
+    """Concatenate ragged (n_i, 3) tracks into float32 points plus int64 offsets."""
+    lengths = np.fromiter(
+        (len(track) for track in tracks), dtype=np.int64, count=len(tracks))
+    offsets = np.empty(len(lengths) + 1, dtype=np.int64)
+    offsets[0] = 0
+    np.cumsum(lengths, out=offsets[1:])
+    flat = np.concatenate(
+        [np.asarray(track, dtype=np.float32) for track in tracks], axis=0)
+    return flat, offsets
 
 
 class PackedTrackCollection:
@@ -130,13 +144,7 @@ class PackedTrackCollection:
                 if workers is None else int(workers))
             return (np.asarray(result['coordinates']),
                     np.asarray(result['offsets']))
-        tracks = [self[index] for index in range(len(self))]
-        lengths = np.fromiter(
-            (len(track) for track in tracks), dtype=np.int64, count=len(tracks))
-        offsets = np.empty(len(lengths) + 1, dtype=np.int64)
-        offsets[0] = 0
-        np.cumsum(lengths, out=offsets[1:])
-        return np.concatenate(tracks, axis=0), offsets
+        return _flatten_tracks([self[index] for index in range(len(self))])
 
     def as_packed_polylines(self):
         """Return contiguous coordinates and offsets for bulk geometry output."""
@@ -201,7 +209,7 @@ def _is_sqlite_dbm(path):
 
 
 class _SQLiteTrackDBM:
-    """Read-only view of a dbm.sqlite3 store for interpreters without dbm.sqlite3.
+    """Read-only view of a dbm.sqlite3 store, independent of interpreter version.
 
     Uses the same single-table schema as CPython's Lib/dbm/sqlite3.py
     (``Dict(key BLOB, value BLOB)``) and only the read operations the track
@@ -210,7 +218,14 @@ class _SQLiteTrackDBM:
 
     def __init__(self, path):
         import sqlite3
-        uri = Path(os.path.abspath(path)).as_uri() + '?mode=ro'
+        # Complete, checkpointed stores need no reader-created sidecars. An
+        # existing WAL may hold committed pages, so retain normal SQLite
+        # locking and WAL reads while it is present.
+        # SQLite opens a symlink's target; check that target's WAL as well.
+        path = Path(path).resolve()
+        uri = path.as_uri() + '?mode=ro'
+        if not Path(str(path) + '-wal').exists():
+            uri += '&immutable=1'
         self._connection = sqlite3.connect(uri, uri=True)
 
     def keys(self):
@@ -239,9 +254,9 @@ class _SQLiteTrackDBM:
 
 
 def open_tracks_dbm(path):
-    """Open a tracks DBM read-only, including SQLite-backed stores on Python < 3.13."""
+    """Open a tracks DBM read-only, including SQLite-backed stores on every Python version."""
     text = os.fspath(path)
-    if not dbm.whichdb(text) and _is_sqlite_dbm(text):
+    if _is_sqlite_dbm(text):
         return _SQLiteTrackDBM(text)
     return dbm.open(text, 'r')
 
@@ -284,6 +299,79 @@ def _tracks_db_signature(path):
     if not result:
         raise FileNotFoundError(f'could not stat DBM backing files for {path}')
     return sorted(result)
+
+
+def _db_signatures_match(stored, expected):
+    """Compare a stored DBM signature with the current one.
+
+    Signatures are ``(name, size, mtime_ns)`` per backing file. Downloads and
+    copies routinely lose the sub-second part of mtime (HTTP Last-Modified has
+    one-second resolution), which made every cache shipped alongside a dataset
+    look stale after download even though name and size matched. Name and size
+    must match exactly. mtime must match exactly, except that when one side is
+    a whole second (a copy that dropped the sub-second part) the seconds must
+    match. Two nanosecond mtimes still have to agree, so an edit within the
+    same second on a local file is still detected.
+    """
+    if not isinstance(stored, list) or len(stored) != len(expected):
+        return False
+    try:
+        for item, want in zip(stored, expected):
+            if not isinstance(item, (list, tuple)) or len(item) != 3:
+                return False
+            if item[0] != want[0] or int(item[1]) != int(want[1]):
+                return False
+            have, need = int(item[2]), int(want[2])
+            if have != need:
+                truncated = have % 1_000_000_000 == 0 or need % 1_000_000_000 == 0
+                if not truncated or have // 1_000_000_000 != need // 1_000_000_000:
+                    return False
+    except (TypeError, ValueError):
+        return False                        # malformed metadata (e.g. null entries): treat as stale
+    return True
+
+
+def _tracks_db_digest(path, signature):
+    """Hash the backing files listed in a ``(name, size, mtime_ns)`` signature.
+
+    Returns ``{name: 'sha256:<hex>'}``, or ``None`` if a file no longer has
+    the size and mtime recorded in ``signature`` once it has been read. Each
+    file is hashed at most once per process for a given path, size and mtime.
+    """
+    folder = Path(normalize_tracks_dbm_path(path)).parent
+    digests = {}
+    for name, size, mtime_ns in signature:
+        file_path = folder / name
+        key = (os.fspath(file_path.resolve()), int(size), int(mtime_ns))
+        if key not in _DB_DIGEST_MEMO:
+            digest = sha256_file(file_path)
+            stat = file_path.stat()
+            if (stat.st_size, stat.st_mtime_ns) != key[1:]:
+                return None
+            _DB_DIGEST_MEMO[key] = 'sha256:' + digest
+        digests[name] = _DB_DIGEST_MEMO[key]
+    return digests
+
+
+def _db_contents_match(stored, stored_digest, path, expected):
+    """Whether a DBM that fails ``_db_signatures_match`` still has the same bytes.
+
+    Copies and downloads that stamp a new mtime (``cp``, ``curl`` without
+    ``-R``, Python ``requests``) fail the mtime check although the files are
+    identical. When the sidecar recorded content digests, names and sizes must
+    match and every backing file must hash the same. Size alone is not enough:
+    SQLite-backed DBMs (``dbm.sqlite3``, Python >= 3.14) rarely change size
+    when edited. Sidecars without digests keep the mtime rule.
+    """
+    if stored_digest is None or not isinstance(stored, list):
+        return False
+    try:
+        if [[str(name), int(size)] for name, size, _mtime in stored] != [
+                [name, size] for name, size, _mtime in expected]:
+            return False
+    except (TypeError, ValueError):
+        return False
+    return _tracks_db_digest(path, expected) == stored_digest
 
 
 def track_store_path(path):
@@ -403,9 +491,11 @@ def write_packed_track_store(
                 track_count, point_count, 0, 0, 0, 0))
             stream.flush()
             os.fsync(stream.fileno())
+        signature = _tracks_db_signature(logical)
         metadata = {
             'version': TRACK_STORE_VERSION,
-            'source_db_signature': [list(item) for item in _tracks_db_signature(logical)],
+            'source_db_signature': [list(item) for item in signature],
+            'source_db_digest': _tracks_db_digest(logical, signature),
             'track_count': track_count,
             'point_count': point_count,
         }
@@ -444,7 +534,10 @@ def _load_packed_track_collection(path, z_lo=None, z_hi=None, warn=True):
         if metadata.get('version') != TRACK_STORE_VERSION:
             raise ValueError('unsupported packed track-store version')
         expected = [list(item) for item in _tracks_db_signature(path)]
-        if metadata.get('source_db_signature') != expected:
+        stored = metadata.get('source_db_signature')
+        if not (_db_signatures_match(stored, expected)
+                or _db_contents_match(stored, metadata.get('source_db_digest'),
+                                      path, expected)):
             raise ValueError('source DBM changed after the packed store was written')
         result = native.load(
             os.fspath(store),
@@ -477,7 +570,10 @@ def _packed_store_if_current(path):
         if metadata.get('version') != TRACK_STORE_VERSION:
             return None
         expected = [list(item) for item in _tracks_db_signature(path)]
-        if metadata.get('source_db_signature') != expected:
+        stored = metadata.get('source_db_signature')
+        if not (_db_signatures_match(stored, expected)
+                or _db_contents_match(stored, metadata.get('source_db_digest'),
+                                      path, expected)):
             return None
         return store
     except (OSError, ValueError, KeyError, json.JSONDecodeError):
@@ -1649,6 +1745,7 @@ def write_track_crossing_cache(
     metadata = {
         'version': TRACK_CROSSING_CACHE_VERSION,
         'db_signature': [list(item) for item in signature],
+        'db_digest': _tracks_db_digest(path, signature),
         'angle_degrees': 30.0,
         'tangent_radius_voxels': 12.0,
         'cluster_local_index_radius': 4,
@@ -1696,7 +1793,10 @@ def load_track_crossing_cache(path, warn=True, expected_z_range=None):
                 raise ValueError(
                     f"unsupported version {metadata.get('version')!r}")
             expected_signature = [list(item) for item in _tracks_db_signature(path)]
-            if metadata.get('db_signature') != expected_signature:
+            stored_signature = metadata.get('db_signature')
+            if not (_db_signatures_match(stored_signature, expected_signature)
+                    or _db_contents_match(stored_signature, metadata.get('db_digest'),
+                                          path, expected_signature)):
                 raise ValueError('tracks DBM has changed since the cache was built')
             if (expected_z_range is not None
                     and metadata.get('z_range', [None, None])
@@ -1779,38 +1879,33 @@ def _aggregate_dt_track_losses(track_losses, across_p):
 
 
 def _build_track_flat_bundle(tracks, device):
-    valid_track_indices = [i for i, track in enumerate(tracks) if len(track) >= 2]
-    if not valid_track_indices:
-        return None, torch.zeros(0, dtype=torch.int64), valid_track_indices
+    if isinstance(tracks, PackedTrackCollection):
+        valid_np = np.flatnonzero(tracks.selected_lengths >= 2)
+        if valid_np.size == 0:
+            return None, valid_np
+        valid_tracks = tracks if len(valid_np) == len(tracks) else tracks.subset(valid_np)
+        zyxs_flat, starts_np = valid_tracks.materialize()
+        zyxs_flat = np.asarray(zyxs_flat[starts_np[0]:starts_np[-1]], dtype=np.float32)
+        # May alias tracks.coordinates (identity materialize), so forbid writes through it.
+        zyxs_flat.flags.writeable = False
+        starts_np = starts_np - starts_np[0]
+    else:
+        valid_np = np.fromiter(
+            (i for i, track in enumerate(tracks) if len(track) >= 2), dtype=np.int64)
+        if valid_np.size == 0:
+            return None, valid_np
+        zyxs_flat, starts_np = _flatten_tracks([tracks[i] for i in valid_np])
+    lengths_np = np.diff(starts_np)
 
-    pairs = [
-        (
-            np.asarray(tracks[i], dtype=np.float32),
-            np.zeros(len(tracks[i]), dtype=np.float32),
-        )
-        for i in valid_track_indices
-    ]
-    lengths_np = np.fromiter((len(z) for z, _ in pairs), dtype=np.int64, count=len(pairs))
-    starts_np = np.empty(len(pairs) + 1, dtype=np.int64)
-    starts_np[0] = 0
-    np.cumsum(lengths_np, out=starts_np[1:])
-    total = int(starts_np[-1])
-    if total == 0:
-        return None, torch.from_numpy(lengths_np), valid_track_indices
-
-    zyxs_flat = np.concatenate([z for z, _ in pairs], axis=0).astype(np.float32, copy=False)
-    windings_flat = np.concatenate([w for _, w in pairs], axis=0).astype(np.float32, copy=False)
-    strip_id_np = np.repeat(np.arange(len(pairs), dtype=np.int64), lengths_np)
+    strip_id_np = np.repeat(np.arange(len(lengths_np), dtype=np.int64), lengths_np)
     flat = {
         'zyxs': torch.from_numpy(zyxs_flat).to(device=device),
-        'windings': torch.from_numpy(windings_flat).to(device=device),
         'strip_id': torch.from_numpy(strip_id_np).to(device=device),
         'starts': torch.from_numpy(starts_np).to(device=device),
         'lengths': torch.from_numpy(lengths_np).to(device=device),
         'lengths_cpu': torch.from_numpy(lengths_np),
-        'total': total,
     }
-    return flat, flat['lengths_cpu'], valid_track_indices
+    return flat, valid_np
 
 
 def _build_track_spiral_context(slice_to_spiral_transform, dr_per_winding, flat, num_tracks, metrics_config):
@@ -1818,10 +1913,6 @@ def _build_track_spiral_context(slice_to_spiral_transform, dr_per_winding, flat,
     scan_tolerance = metrics_config['satisfaction_distance_tolerance']
     dr = dr_per_winding.detach()
     device = dr_per_winding.device
-
-    if flat is None or flat['total'] == 0:
-        lengths_cpu = flat['lengths_cpu'] if flat is not None else torch.zeros(num_tracks, dtype=torch.int64)
-        return None, lengths_cpu, num_tracks
 
     chunk = 65536
 
@@ -1834,31 +1925,26 @@ def _build_track_spiral_context(slice_to_spiral_transform, dr_per_winding, flat,
         return torch.cat(pieces, dim=0)
 
     zyxs = flat['zyxs']
-    windings = flat['windings']
     track_id = flat['strip_id']
     starts = flat['starts']
     lengths = flat['lengths']
     lengths_cpu = flat['lengths_cpu']
-    total = flat['total']
 
     with torch.no_grad():
         spiral_zyxs = transform_in_chunks(zyxs, slice_to_spiral_transform)
         theta, _, shifted_radii = get_theta_and_radii(spiral_zyxs[..., 1:], dr_per_winding)
 
-        if total > 1:
-            same_track = track_id[1:] == track_id[:-1]
-            step_adj = get_theta_crossing_step_adjustments(theta, dr)
-            step_adj = torch.where(same_track, step_adj, torch.zeros_like(step_adj))
-            cumsum_inner = torch.cumsum(step_adj, dim=0)
-            cumsum_flat = torch.cat([
-                torch.zeros(1, device=device, dtype=cumsum_inner.dtype),
-                cumsum_inner,
-            ], dim=0)
-            adjustments = cumsum_flat - cumsum_flat[starts[:-1][track_id]]
-        else:
-            adjustments = torch.zeros_like(shifted_radii)
+        # Every track has >= 2 points, so there is always at least one step.
+        same_track = track_id[1:] == track_id[:-1]
+        step_adj = get_theta_crossing_step_adjustments(theta, dr)
+        step_adj = torch.where(same_track, step_adj, torch.zeros_like(step_adj))
+        cumsum_inner = torch.cumsum(step_adj, dim=0)
+        cumsum_flat = torch.cat([
+            torch.zeros(1, device=device, dtype=cumsum_inner.dtype),
+            cumsum_inner,
+        ], dim=0)
+        adjustments = cumsum_flat - cumsum_flat[starts[:-1][track_id]]
         unwrapped_shifted = shifted_radii + adjustments
-        normalised_radii = unwrapped_shifted - windings * dr
 
     return {
         'spiral_tolerance': spiral_tolerance,
@@ -1869,15 +1955,13 @@ def _build_track_spiral_context(slice_to_spiral_transform, dr_per_winding, flat,
         'slice_to_spiral_transform': slice_to_spiral_transform,
         'transform_in_chunks': transform_in_chunks,
         'zyxs': zyxs,
-        'windings': windings,
         'track_id': track_id,
         'lengths_cpu': lengths_cpu,
         'spiral_zyxs': spiral_zyxs,
         'theta': theta,
         'adjustments': adjustments,
         'unwrapped_shifted': unwrapped_shifted,
-        'normalised_radii': normalised_radii,
-    }, lengths_cpu, num_tracks
+    }
 
 
 def _mode_winding_per_track(track_id, winding_idx_per_point, num_tracks, device):
@@ -1915,12 +1999,11 @@ def _mode_winding_per_track(track_id, winding_idx_per_point, num_tracks, device)
     return mode_winding_per_track
 
 
-def _track_satisfaction_from_target(ctx, target_normalised_per_track):
+def _track_satisfaction_from_target(ctx, target_normalised_per_track, return_per_point=True):
     dr = ctx['dr']
     device = ctx['device']
     num_tracks = ctx['num_tracks']
     track_id = ctx['track_id']
-    windings = ctx['windings']
     theta = ctx['theta']
     adjustments = ctx['adjustments']
     unwrapped_shifted = ctx['unwrapped_shifted']
@@ -1933,61 +2016,62 @@ def _track_satisfaction_from_target(ctx, target_normalised_per_track):
     slice_to_spiral_transform = ctx['slice_to_spiral_transform']
 
     with torch.no_grad():
-        target_normalised = target_normalised_per_track[track_id]
-        target_shifted = target_normalised + windings * dr
+        # Tracks carry no winding offset, so the normalised target is the shifted one.
+        target_shifted = target_normalised_per_track[track_id]
         spiral_in_band = (unwrapped_shifted - target_shifted).abs() <= spiral_tolerance
 
-        target_radii = radius_from_unwrapped_shifted(
-            theta, target_shifted, adjustments, dr,
-        )
-        target_spiral_zyxs = torch.stack([
-            spiral_zyxs[..., 0],
-            torch.sin(theta) * target_radii,
-            torch.cos(theta) * target_radii,
-        ], dim=-1)
-        target_scroll_zyxs = transform_in_chunks(target_spiral_zyxs, slice_to_spiral_transform.inv)
-        scan_distances = torch.linalg.norm(target_scroll_zyxs - zyxs, dim=-1)
-        scan_in_band = scan_distances <= scan_tolerance
-
-        satisfied = spiral_in_band & scan_in_band
+        # Only points already in the spiral band can be satisfied, so the
+        # inverse transform (the expensive part) is run on those alone.
+        in_band = torch.nonzero(spiral_in_band, as_tuple=True)[0]
+        satisfied = torch.zeros_like(spiral_in_band)
+        if in_band.numel() > 0:
+            theta_b = theta[in_band]
+            target_radii = radius_from_unwrapped_shifted(
+                theta_b, target_shifted[in_band], adjustments[in_band], dr,
+            )
+            target_spiral_zyxs = torch.stack([
+                spiral_zyxs[in_band, 0],
+                torch.sin(theta_b) * target_radii,
+                torch.cos(theta_b) * target_radii,
+            ], dim=-1)
+            target_scroll_zyxs = transform_in_chunks(target_spiral_zyxs, slice_to_spiral_transform.inv)
+            scan_distances = torch.linalg.norm(target_scroll_zyxs - zyxs[in_band], dim=-1)
+            satisfied[in_band] = scan_distances <= scan_tolerance
         satisfied_counts_dev = torch.zeros(num_tracks, dtype=torch.int64, device=device)
         satisfied_counts_dev.scatter_add_(0, track_id, satisfied.to(torch.int64))
         satisfied_counts = satisfied_counts_dev.cpu()
-        per_point_satisfaction = list(torch.split(satisfied.cpu(), lengths_cpu.tolist()))
+        per_point_satisfaction = (
+            list(torch.split(satisfied.cpu(), lengths_cpu.tolist())) if return_per_point else None)
 
     return satisfied_counts, per_point_satisfaction
 
 
-def get_track_satisfied_counts(slice_to_spiral_transform, dr_per_winding, tracks, metrics_config):
+def get_track_satisfied_counts(slice_to_spiral_transform, dr_per_winding, tracks, metrics_config,
+                               return_per_point=True):
+    # With return_per_point=False the per-point satisfaction slot is None.
     device = dr_per_winding.device
-    if not tracks:
+    flat, valid_np = _build_track_flat_bundle(tracks, device) if tracks else (None, None)
+    if flat is None:
         empty = torch.zeros(0, dtype=torch.int64)
-        return empty, empty, empty, [], empty
+        return empty, empty, empty, ([] if return_per_point else None), empty
 
-    flat, lengths_cpu, valid_track_indices = _build_track_flat_bundle(tracks, device)
-    if not valid_track_indices:
-        empty = torch.zeros(0, dtype=torch.int64)
-        return empty, empty, empty, [], empty
-
-    num_tracks = len(valid_track_indices)
-    ctx, lengths_cpu, num_tracks = _build_track_spiral_context(
+    num_tracks = len(valid_np)
+    ctx = _build_track_spiral_context(
         slice_to_spiral_transform, dr_per_winding, flat, num_tracks, metrics_config,
     )
-    valid_track_indices_t = torch.tensor(valid_track_indices, dtype=torch.int64)
-    if ctx is None:
-        per_point = [torch.zeros([int(n.item())], dtype=torch.bool) for n in lengths_cpu]
-        return valid_track_indices_t, torch.zeros(num_tracks, dtype=torch.int64), lengths_cpu.clone(), per_point, torch.zeros(num_tracks, dtype=torch.int64)
+    lengths_cpu = ctx['lengths_cpu']
+    valid_track_indices_t = torch.from_numpy(valid_np)
 
     dr = ctx['dr']
     track_id = ctx['track_id']
-    normalised_radii = ctx['normalised_radii']
 
     with torch.no_grad():
-        winding_idx_per_point = torch.round(normalised_radii / dr).to(torch.int64)
+        winding_idx_per_point = torch.round(ctx['unwrapped_shifted'] / dr).to(torch.int64)
         mode_winding_per_track = _mode_winding_per_track(track_id, winding_idx_per_point, num_tracks, device)
         target_normalised_per_track = mode_winding_per_track.to(dr.dtype) * dr
 
-    satisfied_counts, per_point_satisfaction = _track_satisfaction_from_target(ctx, target_normalised_per_track)
+    satisfied_counts, per_point_satisfaction = _track_satisfaction_from_target(
+        ctx, target_normalised_per_track, return_per_point=return_per_point)
     return (
         valid_track_indices_t,
         satisfied_counts,
@@ -2003,6 +2087,7 @@ def get_track_satisfied_counts_in_chunks(slice_to_spiral_transform, dr_per_windi
         chunk = tracks[start:start + chunk_size]
         _, sat, tot, _, _ = get_track_satisfied_counts(
             slice_to_spiral_transform, dr_per_winding, chunk, metrics_config,
+            return_per_point=False,
         )
         sat_parts.append(sat)
         tot_parts.append(tot)
@@ -2293,14 +2378,7 @@ def prepare_main_phase_tracks(
         flat_zyx_np = np.asarray(flat_zyx_np, dtype=np.float32)
         input_offsets = np.asarray(packed_offsets, dtype=np.int64)
     else:
-        input_lengths = np.fromiter(
-            (len(track) for track in working_tracks),
-            dtype=np.int64, count=len(working_tracks))
-        input_offsets = np.empty(len(input_lengths) + 1, dtype=np.int64)
-        input_offsets[0] = 0
-        np.cumsum(input_lengths, out=input_offsets[1:])
-        flat_zyx_np = np.concatenate(
-            [t.astype(np.float32) for t in working_tracks], axis=0)
+        flat_zyx_np, input_offsets = _flatten_tracks(working_tracks)
     keep_np = _track_points_far_from_anchors_mask(
         flat_zyx_np, anchor_tree, exclusion_radius, progress=progress)
     num_tracks_orig = len(working_tracks)

@@ -3,7 +3,6 @@
 // - setChannel with 3- and 4-channel masks (normalizeMaskChannel branches)
 // - channel(name) on-demand loading via file
 // - pointTo with a SurfacePatchIndex hint
-// - orientZUp with a deliberate Z gradient
 // - load_quad_from_tifxyz with a mask.tif present
 
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
@@ -183,27 +182,6 @@ TEST_CASE("pointTo with a SurfacePatchIndex hint")
     CHECK(d >= 0.0f);
 }
 
-TEST_CASE("orientZUp with deliberate Z gradient runs without crashing")
-{
-    cv::Mat_<cv::Vec3f> m(32, 32);
-    // Z increases with row — high Z at bottom.
-    for (int r = 0; r < 32; ++r)
-        for (int c = 0; c < 32; ++c)
-            m(r, c) = cv::Vec3f(float(c), float(r), float(r * 2));
-    QuadSurface qs(m, cv::Vec2f(1.f, 1.f));
-    qs.orientZUp();
-    CHECK(qs.rawPointsPtr() != nullptr);
-}
-
-TEST_CASE("orientZUp on flat surface is a no-op (angle below threshold)")
-{
-    auto pts = makePlanarGrid(16, 16, 5.f);
-    QuadSurface qs(pts, cv::Vec2f(1.f, 1.f));
-    int before = qs.countValidPoints();
-    qs.orientZUp();
-    CHECK(qs.countValidPoints() == before);
-}
-
 TEST_CASE("load_quad_from_tifxyz with an associated mask.tif trims invalid points")
 {
     auto seg = fixtureSeg("20241113070770");
@@ -281,7 +259,7 @@ TEST_CASE("mapped SurfacePatchIndex rebuild keeps disk-backed surfaces lazy")
 
     SurfacePatchIndex index;
     index.setSamplingStride(4);
-    index.rebuild({lazy});
+    index.rebuild({lazy}, 0.0f, /*useMappedSurfaces=*/true);
 
     CHECK_FALSE(index.empty());
     CHECK(index.containsSurface(lazy));

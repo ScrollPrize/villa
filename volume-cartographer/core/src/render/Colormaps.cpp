@@ -56,15 +56,15 @@ const std::vector<OverlayColormapSpec>& buildSpecs()
 {
     // tint values are now R, G, B order (matching output format)
     static const std::vector<OverlayColormapSpec> s = {
-        {"fire", "Fire", OverlayColormapKind::OpenCv, ColormapAudience::Shared, cv::COLORMAP_HOT, {}, nullptr},
-        {"viridis", "Viridis", OverlayColormapKind::OpenCv, ColormapAudience::Shared, cv::COLORMAP_VIRIDIS, {}, nullptr},
-        {"magma", "Magma", OverlayColormapKind::OpenCv, ColormapAudience::Shared, cv::COLORMAP_MAGMA, {}, nullptr},
-        {"red", "Red", OverlayColormapKind::Tint, ColormapAudience::Shared, 0, cv::Vec3f(1.0f, 0.0f, 0.0f), nullptr},
-        {"green", "Green", OverlayColormapKind::Tint, ColormapAudience::Shared, 0, cv::Vec3f(0.0f, 1.0f, 0.0f), nullptr},
-        {"blue", "Blue", OverlayColormapKind::Tint, ColormapAudience::Shared, 0, cv::Vec3f(0.0f, 0.0f, 1.0f), nullptr},
-        {"cyan", "Cyan", OverlayColormapKind::Tint, ColormapAudience::Shared, 0, cv::Vec3f(0.0f, 1.0f, 1.0f), nullptr},
-        {"magenta", "Magenta", OverlayColormapKind::Tint, ColormapAudience::Shared, 0, cv::Vec3f(1.0f, 0.0f, 1.0f), nullptr},
-        {"glasbey_black0", "Glasbey", OverlayColormapKind::DiscreteLut, ColormapAudience::OverlayOnly, 0, {}, kGlasbeyBlack0Lut.data()},
+        {"fire", "Fire", OverlayColormapKind::OpenCv, ColormapAudience::Shared, cv::COLORMAP_HOT, {}, nullptr, true},
+        {"viridis", "Viridis", OverlayColormapKind::OpenCv, ColormapAudience::Shared, cv::COLORMAP_VIRIDIS, {}, nullptr, false},
+        {"magma", "Magma", OverlayColormapKind::OpenCv, ColormapAudience::Shared, cv::COLORMAP_MAGMA, {}, nullptr, true},
+        {"red", "Red", OverlayColormapKind::Tint, ColormapAudience::Shared, 0, cv::Vec3f(1.0f, 0.0f, 0.0f), nullptr, true},
+        {"green", "Green", OverlayColormapKind::Tint, ColormapAudience::Shared, 0, cv::Vec3f(0.0f, 1.0f, 0.0f), nullptr, true},
+        {"blue", "Blue", OverlayColormapKind::Tint, ColormapAudience::Shared, 0, cv::Vec3f(0.0f, 0.0f, 1.0f), nullptr, true},
+        {"cyan", "Cyan", OverlayColormapKind::Tint, ColormapAudience::Shared, 0, cv::Vec3f(0.0f, 1.0f, 1.0f), nullptr, true},
+        {"magenta", "Magenta", OverlayColormapKind::Tint, ColormapAudience::Shared, 0, cv::Vec3f(1.0f, 0.0f, 1.0f), nullptr, true},
+        {"glasbey_black0", "Glasbey", OverlayColormapKind::DiscreteLut, ColormapAudience::OverlayOnly, 0, {}, kGlasbeyBlack0Lut.data(), false},
     };
     return s;
 }

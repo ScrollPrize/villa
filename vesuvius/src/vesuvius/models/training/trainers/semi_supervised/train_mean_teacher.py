@@ -5,7 +5,10 @@ from contextlib import nullcontext
 from torch.utils.data import DataLoader, SubsetRandomSampler
 
 from vesuvius.models.training.train import BaseTrainer
-from vesuvius.models.training.trainers.semi_supervised.two_stream_batch_sampler import TwoStreamBatchSampler
+from vesuvius.models.training.trainers.semi_supervised.two_stream_batch_sampler import (
+    TwoStreamBatchSampler,
+    split_labeled_indices,
+)
 from vesuvius.models.training.trainers.semi_supervised import ramps
 
 
@@ -141,7 +144,29 @@ class TrainMeanTeacher(BaseTrainer):
                 f"Insufficient unlabeled data: need at least {unlabeled_batch_size}, have {len(self.unlabeled_indices)}."
             )
 
-        print(f"Semi-supervised split: {len(self.labeled_indices)} labeled (from {len(labeled_idx)}), {len(self.unlabeled_indices)} unlabeled")
+        # --- choose validation indices ---
+        # If an external validation dataset is provided (e.g., via --val-dir),
+        # its indices are independent from the training dataset. In that case
+        # evaluate over the full validation set (or a sampler can downselect later).
+        train_path = getattr(train_dataset, 'data_path', None)
+        val_path = getattr(val_dataset, 'data_path', None)
+        same_source = (train_path == val_path) if (train_path and val_path) else False
+        if val_dataset is not train_dataset and not same_source:
+            if self.mgr.verbose:
+                print("Using external validation dataset for mean teacher; evaluating on full validation set")
+            val_indices = list(range(len(val_dataset)))
+        else:
+            self.labeled_indices, val_indices = split_labeled_indices(
+                self.labeled_indices,
+                self.mgr.tr_val_split,
+                self.labeled_batch_size,
+            )
+
+        print(
+            f"Semi-supervised split: {len(self.labeled_indices)} labeled train, "
+            f"{len(val_indices)} labeled validation (from {len(labeled_idx)}), "
+            f"{len(self.unlabeled_indices)} unlabeled train"
+        )
         print(
             f"Batch composition: {self.labeled_batch_size} labeled + {unlabeled_batch_size} unlabeled = {self.mgr.train_batch_size} total")
 
@@ -158,19 +183,6 @@ class TrainMeanTeacher(BaseTrainer):
             pin_memory=(True if getattr(self.device, 'type', str(self.device)) == 'cuda' else False),
             num_workers=self.mgr.train_num_dataloader_workers,
         )
-
-        # --- choose validation indices ---
-        # If an external validation dataset is provided (e.g., via --val-dir),
-        # its indices are independent from the training dataset. In that case
-        # evaluate over the full validation set (or a sampler can downselect later).
-        if val_dataset is not train_dataset:
-            if self.mgr.verbose:
-                print("Using external validation dataset for mean teacher; evaluating on full validation set")
-            val_indices = list(range(len(val_dataset)))
-        else:
-            train_val_split = self.mgr.tr_val_split
-            val_split = int(np.floor((1 - train_val_split) * max(1, len(self.labeled_indices))))
-            val_indices = self.labeled_indices[-val_split:] if val_split > 0 else self.labeled_indices[-min(5, len(self.labeled_indices)):]
 
         val_dataloader = DataLoader(
             val_dataset,

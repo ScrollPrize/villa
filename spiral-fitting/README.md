@@ -145,6 +145,16 @@ throws `RuntimeError: lasagna z-ROI [...] is empty` if the mismatch is
 large enough to push the requested z-range outside the (wrongly-scaled)
 store bounds.
 
+Optional `num_windings`: the scroll's winding count, where someone has
+estimated it (an integer of at least 2). It replaces the generic default of
+both `shell_outer_winding_idx` and `model_gap_expander_num_windings`, which is
+Scroll 1's count (130). The exporter writes windings up to
+`shell_outer_winding_idx`, so on a scroll with fewer windings the generic
+value exports windings that lie outside the papyrus. It is a default rather
+than a fact the scroll owns: `FIT_SPIRAL_CONFIG_OVERRIDES` and the Spiral panel
+still override it, and `model_gap_expander_capacity_windings` is raised to
+`num_windings + 3` only when the count would not otherwise fit.
+
 Example (PHerc0826, where group `"2"` is a 4x downsample for this scroll
 specifically):
 
@@ -390,7 +400,7 @@ This also builds Spiral's native helpers as `vc_spiral.spiral_sampling`,
 same modules build with serial kernels when it does not.
 
 or with conda/pip, install `torch` for your CUDA version and then
-`pip install -e .` from `spiral-fitting/`.
+`pip install -e . --group cuda` from `spiral-fitting/` (pip 25.1 or newer).
 
 On Linux x86-64, `uv sync` installs `brook-cu12`, CuPy and cuCIM for the GPU
 backend of `extract_surface_tracks.py` instead of Kimimaro, its CPU backend;
@@ -1074,6 +1084,18 @@ For a headless fit, pass the dataset root with `--dataset` and select inference
 mode (plus any independently disabled losses) through
 `FIT_SPIRAL_CONFIG_OVERRIDES`. The dataset's `spiral-scroll.json` and the
 declarative input catalog determine which conventional inputs are resolved.
+
+To follow a headless fit while it runs, set `FIT_SPIRAL_METRICS_HISTORY` to a
+file path: every 200 iterations the fit appends one JSON line,
+`{"iteration": N, "metrics": {...}}`, whose metrics hold `total_loss`, each
+`<term>_loss` and the other logged values (what it also prints, and what
+`runners/run_single.py` records for sweeps). For example:
+
+```bash
+FIT_SPIRAL_METRICS_HISTORY=/tmp/fit_metrics.jsonl \
+  ./.venv/bin/python fit_spiral.py --dataset /path/to/dataset > fit.log 2>&1 &
+tail -f /tmp/fit_metrics.jsonl
+```
 
 ## Fiber direction samples
 

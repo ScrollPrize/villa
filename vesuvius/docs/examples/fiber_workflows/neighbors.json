@@ -1,0 +1,14 @@
+{
+  "fiber_neighbor_expansion": {
+    "seed_solve": "/data/fiber-layout/results/joint/solve",
+    "parent_tensors": "/data/fiber-layout/whole-sources/tensors.npz",
+    "fibers": "/data/fiber-layout/sources.vcobj",
+    "gt_root": "/data/fiber-layout/gt",
+    "z_range": [30000, 50000],
+    "extract_template": "/configs/fiber-layout/extract.json",
+    "orient_template": "/configs/fiber-layout/orient.json",
+    "output_root": "/data/fiber-layout/expanded",
+    "confidence": 0.5,
+    "devices": "0"
+  }
+}

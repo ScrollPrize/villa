@@ -1,0 +1,10 @@
+{
+  "fiber_joint_gt_eval": {
+    "baseline_root": "/data/fiber-layout/prepared",
+    "base_config": "/configs/fiber-layout/base.json",
+    "gt_root": "/data/fiber-layout/gt",
+    "output_root": "/data/fiber-layout/results/joint",
+    "force_gt_enabled": true,
+    "devices": "1"
+  }
+}

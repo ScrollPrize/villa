@@ -39,12 +39,16 @@ CLI
 from __future__ import annotations
 
 import atexit
-import fcntl
 import os
 import socket
 import sys
 import threading
 from pathlib import Path
+
+try:
+    import fcntl
+except ImportError:  # Windows has no fcntl: GPU pausing is disabled there.
+    fcntl = None
 
 PROTOCOL_VERSION = "gpu_pause v1"
 LEGACY_SOCKET_PATH = "~/.gpu_pause.sock"
@@ -171,6 +175,10 @@ class GpuPauseServer:
     def __init__(self, socket_path: str | None = None, register: bool = True):
         global _socket_counter
         pid = os.getpid()
+        self._enabled = fcntl is not None
+        if not self._enabled:
+            self._closed = True
+            return
         if socket_path is None:
             with _socket_counter_lock:
                 seq = _socket_counter
@@ -257,6 +265,8 @@ class GpuPauseServer:
 
     def check(self, offload_fn, reload_fn):
         """Call once per batch.  Non-blocking unless pause is pending."""
+        if not self._enabled:
+            return
         with self._lock:
             conn = self._pending_pause_conn
             if conn is None:
@@ -302,6 +312,8 @@ class GpuPauseServer:
 
     def close(self):
         self._closed = True
+        if not self._enabled:
+            return
         try:
             self._server.close()
         except Exception:
@@ -404,6 +416,8 @@ class gpu_pause_context:
         self._server: GpuPauseServer | None = None
 
     def __enter__(self):
+        if fcntl is None:
+            return self  # no fcntl (Windows): nothing to pause, nothing to be paused by
         # Find and pause the current GPU owner.
         owner_sock = _find_owner_socket()
         if owner_sock is not None:
@@ -459,6 +473,11 @@ if __name__ == "__main__":
         print(f"Usage: {sys.argv[0]} pause|resume|status", file=sys.stderr)
         sys.exit(1)
     cmd = sys.argv[1]
+
+    if fcntl is None:
+        print("gpu_pause is not available on this platform (no fcntl).",
+              file=sys.stderr)
+        sys.exit(1)
 
     sock = _find_owner_socket()
     if sock is None:

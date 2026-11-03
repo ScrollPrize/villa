@@ -12,7 +12,6 @@ class QSlider;
 class QSpinBox;
 class ViewerManager;
 class WindowRangeWidget;
-class ViewerTransformsPanel;
 class ViewerNavigationPanel;
 class ViewerNormalVisualizationPanel;
 class ViewerViewExtrasPanel;
@@ -51,8 +50,6 @@ public:
                                  ViewerManager* viewerManager,
                                  QWidget* parent = nullptr);
 
-    ViewerTransformsPanel* transformsPanel() const { return _transformsPanel; }
-    void setTransformsPanel(ViewerTransformsPanel* panel) { _transformsPanel = panel; }
     void setViewerManager(ViewerManager* viewerManager);
     void setViewControlsEnabled(bool enabled);
     void setOverlayWindowAvailable(bool available);
@@ -78,7 +75,6 @@ private:
 
     UiRefs _uiRefs;
     ViewerManager* _viewerManager{nullptr};
-    ViewerTransformsPanel* _transformsPanel{nullptr};
     ViewerNavigationPanel* _navigationPanel{nullptr};
     ViewerNormalVisualizationPanel* _normalPanel{nullptr};
     ViewerViewExtrasPanel* _viewExtrasPanel{nullptr};

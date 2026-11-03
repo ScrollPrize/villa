@@ -1,0 +1,43 @@
+{
+  "source": "/mnt/raid_nvme/paris4_sheet_strips_v2/all_strips/fiber_132487",
+  "selection": "Longest family H strip by length_mm in fibers.tsv (118481 horizontal entries)",
+  "index_entry": {
+    "fiber": "132487",
+    "family": "H",
+    "length_mm": "183.244",
+    "nodes": "118350",
+    "expected_error_vox": "0.966",
+    "checkpoint": "v2_ft"
+  },
+  "coordinate_units": "XYZ voxels at 9.6 micrometers; PHercParis4 benchmark volume level 2",
+  "files": {
+    "x.tif": {
+      "bytes": 480272,
+      "sha256": "aefb213a9290d0240b5336a72b02267c1e2fc303ba60113bf5cabb3d7acf6c29"
+    },
+    "y.tif": {
+      "bytes": 480272,
+      "sha256": "a7d3f954fe983e6969d8aa982fe4203b47499306a5a33032a57ad6ca0f878c7d"
+    },
+    "z.tif": {
+      "bytes": 480272,
+      "sha256": "0d5c2c33fce7d6abcbc8f6979affb7b5534f48063dd9795969850c020634ca77"
+    },
+    "mask.tif": {
+      "bytes": 120256,
+      "sha256": "bcc69634665c8bcde3e0736232eea41e00c039f83ce52ce60244d041cc16166f"
+    },
+    "meta.json": {
+      "bytes": 402,
+      "sha256": "85831f4f02f759f56b7b98421613ed92b734a15a26e728374f083dc437a2dc64"
+    },
+    "trace.json": {
+      "bytes": 601,
+      "sha256": "b1339427e71788a25c821efdf5fd83fbf536b5b37e977baad79831cc0cbd3cbd"
+    },
+    "expected_error.tif": {
+      "bytes": 480272,
+      "sha256": "a5164de1daaf53973a76dd5862b82041ccf739f8c201923db126e67b73cb67f9"
+    }
+  }
+}

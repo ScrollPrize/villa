@@ -13,6 +13,7 @@ import multiprocessing
 import subprocess
 import threading
 import fsspec
+import psutil
 import numcodecs
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
 # fork causes issues on windows , force to spawn
@@ -20,6 +21,7 @@ multiprocessing.set_start_method('spawn', force=True)
 from tqdm.auto import tqdm
 from torch.utils.data import DataLoader
 from vesuvius.utils.models.load_nnunet_model import load_model_for_inference
+from vesuvius.models.utilities.get_accelerator import get_accelerator
 from vesuvius.data.vc_dataset import VCDataset
 from vesuvius.data.utils import open_zarr
 from pathlib import Path
@@ -27,6 +29,7 @@ from vesuvius.models.build.build_network_from_config import NetworkFromConfig
 from vesuvius.models.run.external_models.load_resnet import try_load_external_resnet34_model
 from vesuvius.models.run.tta import infer_with_tta
 from vesuvius.models.run.patch_writer import BoundedPatchWriter
+from vesuvius.models.run.blending import InMemoryBlender
 from vesuvius.utils.k8s import get_tqdm_kwargs
 from vesuvius.utils.cli import HyphenUnderscoreParser
 
@@ -315,6 +318,10 @@ def _resolve_model_path(model_path: str, cache_dir: str, verbose: bool = False) 
 
 
 class Inferer():
+    # Off unless __init__ is given in_memory_blend (class-level so partially built instances work too).
+    in_memory_blend = None
+    blender = None
+
     def __init__(self,
                  model_path: str = None,
                  input_dir: str = None,
@@ -331,7 +338,7 @@ class Inferer():
                  patch_size: [list, tuple] = None,
                  save_softmax: bool = False,
                  normalization_scheme: str = 'instance_zscore',
-                 device: str = 'cuda' if torch.cuda.is_available() else 'cpu',
+                 device: str = None,
                  num_dataloader_workers: int = 4,
                  writer_workers: int = None,
                  verbose: bool = False,
@@ -351,6 +358,7 @@ class Inferer():
                  max_patches: int = None,
                  bbox: [list, tuple] = None,
                  chunk_cache_mb: int = 0,
+                 in_memory_blend: dict = None,
                  ):
         print(f"Initializing Inferer with output_dir: '{output_dir}'")
         if output_dir and not output_dir.strip():
@@ -364,6 +372,8 @@ class Inferer():
         # self.tta_rotation_weights = tta_rotation_weights
         self.num_parts = num_parts
         self.part_id = part_id
+        if not 0.0 <= overlap < 1.0:
+            raise ValueError(f"overlap must be in [0, 1), got {overlap}")
         self.overlap = overlap
         self.batch_size = batch_size
         self.patch_size = tuple(patch_size) if patch_size is not None else None  # Can be None, will derive from model
@@ -371,7 +381,8 @@ class Inferer():
         self.verbose = verbose
         self.normalization_scheme = normalization_scheme
         self.input_format = input_format
-        self.device = torch.device(device)
+        # cuda, then mps, then cpu unless a device is given.
+        self.device = torch.device(device) if device else get_accelerator()
         self.num_dataloader_workers = num_dataloader_workers
         self.writer_workers = writer_workers
         self.skip_empty_patches = skip_empty_patches
@@ -389,6 +400,10 @@ class Inferer():
         self.max_patches = max_patches
         self.bbox = tuple(bbox) if bbox is not None else None
         self.chunk_cache_mb = chunk_cache_mb
+        # When set, patches are blended in RAM and written straight to
+        # in_memory_blend['output_path'] instead of to logits_part_*.zarr (see InMemoryBlender).
+        self.in_memory_blend = dict(in_memory_blend) if in_memory_blend else None
+        self.blender = None
         self.model_patch_size = None
         self.num_classes = None
 
@@ -420,6 +435,13 @@ class Inferer():
             raise ValueError(f"max_patches must be >= 1 when provided, got {self.max_patches}.")
         if self.chunk_cache_mb < 0:
             raise ValueError(f"chunk_cache_mb must be >= 0, got {self.chunk_cache_mb}.")
+        if self.in_memory_blend is not None:
+            if not self.in_memory_blend.get('output_path'):
+                raise ValueError("in_memory_blend needs an 'output_path'.")
+            if self.num_parts > 1:
+                raise ValueError(
+                    "In-memory blending needs the whole region in one process; it cannot be combined "
+                    "with num_parts > 1. Use blend_logits / blend_and_finalize for split runs.")
         # Defer patch size validation until after model loading if not explicitly provided
 
         # --- Output Setup ---
@@ -794,8 +816,8 @@ class Inferer():
             )
 
     def _create_dataset_and_loader(self):
-        # Use step_size instead of overlap (step_size is [0-1] representing stride as fraction of patch size)
-        # step_size of 0.5 means 50% overlap
+        # The dataset takes a stride as a fraction of the patch size, the complement of the
+        # overlap: overlap 0.25 is a stride of 0.75. A subclass may set step_size directly.
         
         # Use normalization from model checkpoint if available, otherwise use command line arg
         normalization_scheme = self.model_normalization_scheme or self.normalization_scheme
@@ -826,7 +848,7 @@ class Inferer():
         self.dataset = VCDataset(
             input_path=self.input,
             patch_size=self.patch_size,
-            step_size=self.overlap,
+            step_size=(getattr(self, 'step_size', None) or 1.0 - self.overlap),
             num_parts=self.num_parts,
             part_id=self.part_id,
             normalization_scheme=normalization_scheme,
@@ -846,13 +868,14 @@ class Inferer():
             read_retries=self.read_retries,
             cache=self.chunk_cache_mb > 0,
             cache_size_mb=self.chunk_cache_mb,
-            # The float16 default suits the CUDA autocast path. CPU convolutions
-            # have no float16 kernels, so half patches meet float32 weights and
-            # raise "Input type (c10::Half) and bias type (float) should be the
-            # same". Ask for the dtype the CPU model can actually consume.
+            # The float16 default suits the CUDA autocast path. Autocast only
+            # runs on CUDA here, so on CPU and MPS half patches would meet
+            # float32 weights and raise "Input type (c10::Half) and bias type
+            # (float) should be the same". Ask for the dtype the model can
+            # actually consume.
             return_as_type=(
-                "np.float32" if self.device.type == "cpu"
-                else "np.float16"
+                "np.float16" if self.device.type == "cuda"
+                else "np.float32"
             ),
         )
 
@@ -899,7 +922,7 @@ class Inferer():
             batch_size=self.batch_size,
             shuffle=False,
             num_workers=self.num_dataloader_workers,
-            pin_memory=True if self.device != torch.device('cpu') else False,
+            pin_memory=self.device.type == 'cuda',
             collate_fn=VCDataset.collate_fn  # we use custom collate fn here to tag patches that contain only zeros
                                              # so we don't run them through the model
         )
@@ -950,9 +973,38 @@ class Inferer():
         else:
             return numcodecs.Blosc(cname='zstd', clevel=1, shuffle=shuffle)
 
+    def _original_volume_shape(self):
+        """Spatial (Z, Y, X) shape of the input volume, or None if the dataset does not expose it."""
+        if not hasattr(self.dataset, 'input_shape'):
+            return None
+        if len(self.dataset.input_shape) == 4:  # has channel dimension
+            return list(self.dataset.input_shape[1:])
+        return list(self.dataset.input_shape)  # no channel dimension
+
+    def _create_in_memory_blender(self):
+        volume_shape = self._original_volume_shape()
+        if volume_shape is None:
+            raise RuntimeError("In-memory blending needs the input volume shape, which the dataset does not expose.")
+        coords = np.asarray(self.patch_start_coords_list, dtype=np.int64).reshape(-1, 3)
+        needed = InMemoryBlender.required_bytes(coords, self.patch_size, self.num_classes, volume_shape)
+        available = psutil.virtual_memory().available
+        print(f"In-memory blending: the blend sums need {needed / 2**30:.1f} GiB "
+              f"({available / 2**30:.1f} GiB available)")
+        if needed > available:
+            raise MemoryError(
+                f"In-memory blending needs {needed / 2**30:.1f} GiB for this region but only "
+                f"{available / 2**30:.1f} GiB is available. Use a smaller --bbox, or drop "
+                f"--blend_in_memory and blend the written logits with blend_and_finalize.")
+        self.blender = InMemoryBlender(coords, self.patch_size, self.num_classes, volume_shape,
+                                       sigma_scale=self.in_memory_blend.get('sigma_scale', 8.0))
+        self.coords_store_path = None
+        return self.blender
+
     def _create_output_stores(self):
         if self.num_classes is None or self.patch_size is None or self.num_total_patches is None:
             raise RuntimeError("Cannot create output stores: model/patch info missing.")
+        if self.in_memory_blend is not None:
+            return self._create_in_memory_blender()
         # An empty patch list is valid: we still write zarrs with shape[0]=0 so
         # blending can enumerate logits_part_*.zarr files uniformly across parts.
 
@@ -1000,14 +1052,9 @@ class Inferer():
         print(f"Created coordinates zarr array at {self.coords_store_path} with shape {coords_store.shape}")
         
         try:
-            original_volume_shape = None
-            if hasattr(self.dataset, 'input_shape'):
-                if len(self.dataset.input_shape) == 4:  # has channel dimension
-                    original_volume_shape = list(self.dataset.input_shape[1:])
-                else:  # no channel dimension
-                    original_volume_shape = list(self.dataset.input_shape)
-                if self.verbose:
-                    print(f"Derived original volume shape from dataset.input_shape: {original_volume_shape}")
+            original_volume_shape = self._original_volume_shape()
+            if original_volume_shape is not None and self.verbose:
+                print(f"Derived original volume shape from dataset.input_shape: {original_volume_shape}")
             
             # store some metadata we might later want 
             self.output_store.attrs['patch_size'] = list(self.patch_size)
@@ -1081,10 +1128,10 @@ class Inferer():
             print(error_msg)
             raise ValueError(error_msg)
 
-        if self.output_store is None:
+        if self.output_store is None and self.blender is None:
             raise RuntimeError(f"Error: output_store is None. Make sure _create_output_stores() was called successfully.")
 
-        if self.verbose:
+        if self.verbose and self.blender is None:
             print(f"Using existing output store: {zarr_path}")
             print(f"Output store shape: {self.output_store.shape}")
 
@@ -1099,11 +1146,18 @@ class Inferer():
                     self.current_patch_write_index += 1
                 pbar.update(1)
 
+            if self.blender is not None:
+                # One thread adds patches to the in-memory blend, in the order they are submitted,
+                # so the float32 sums are reproducible; it overlaps with the next batch's inference.
+                store, max_workers, max_inflight = self.blender, 1, max(2, 2 * self.batch_size)
+            else:
+                store, max_inflight = self.output_store, None
             with BoundedPatchWriter(
-                self.output_store,
+                store,
                 max_workers=max_workers,
                 pbar=pbar,
                 on_progress=on_progress,
+                max_inflight=max_inflight,
             ) as writer:
                 if self.verbose:
                     print(f"Writer pool: {writer.max_workers} workers, max in-flight: {writer.max_inflight}")
@@ -1204,11 +1258,30 @@ class Inferer():
         else:
             print(f"Part {self.part_id} has no patches; wrote empty output stores and skipped inference.")
 
+        if self.blender is not None:
+            self._write_in_memory_blend()
+
         if self.verbose: print("Inference complete.")
+
+    def _write_in_memory_blend(self):
+        config = self.in_memory_blend
+        finalize_config = config.get('finalize_config')
+        if finalize_config is not None:
+            finalize_config.is_multi_task = bool(self.is_multi_task and self.target_info)
+            finalize_config.target_info = self.target_info if finalize_config.is_multi_task else None
+        self.blender.write(
+            config['output_path'],
+            chunk_size=config.get('chunk_size'),
+            compression_level=config.get('compression_level', 1),
+            finalize_config=finalize_config,
+            verbose=self.verbose,
+        )
 
     def infer(self):
         try:
             self._run_inference()
+            if self.blender is not None:
+                return self.in_memory_blend['output_path'], None
             main_output_path = os.path.join(self.output_dir, f"logits_part_{self.part_id}.zarr")
             return main_output_path, self.coords_store_path
         except Exception as e:
@@ -1272,7 +1345,8 @@ def build_parser():
     parser.add_argument('--save_softmax', action='store_true', help='Save softmax outputs')
     parser.add_argument('--normalization', type=str, default='instance_zscore',
                       help='Normalization scheme (instance_zscore, global_zscore, instance_minmax, percentile_minmax, ct, none)')
-    parser.add_argument('--device', type=str, default='cuda', help='Device to use (cuda, cpu)')
+    parser.add_argument('--device', type=str, default=None,
+                        help='Device to use (cuda, mps, cpu). Default: cuda, then mps, then cpu')
     parser.add_argument('--num_workers', type=int, default=4,
                       help='Number of DataLoader workers. Use 0 in low /dev/shm environments (e.g. Docker).')
     parser.add_argument('--writer_workers', type=int, default=None,
@@ -1327,13 +1401,33 @@ def build_parser():
                            'Patch coordinates stay in the global frame, so blend_logits and '
                            'finalize_outputs need no extra flags. When streaming a remote '
                            'volume only the chunks intersecting the ROI are fetched.')
+    # In-memory blending: blend in RAM and write what blend_and_finalize would, with no per-patch logits.
+    parser.add_argument('--blend_in_memory', type=str, default=None, metavar='OUTPUT_PATH',
+                        help='Blend the patches in memory and write the finalized output Zarr here, '
+                             'instead of writing logits_part_*.zarr for blend_and_finalize. Needs '
+                             '(num_classes + 1) * 4 bytes of RAM per voxel of the region the patches cover; '
+                             'not combinable with --num_parts > 1.')
+    parser.add_argument('--mode', type=str, choices=['binary', 'multiclass'], default='binary',
+                        help='With --blend_in_memory: finalization mode, as in blend_and_finalize. Default: binary')
+    from vesuvius.models.run.finalize_outputs import add_threshold_arguments
+    add_threshold_arguments(parser)
+    parser.add_argument('--blend_sigma_scale', type=float, default=8.0,
+                        help='With --blend_in_memory: Gaussian sigma = patch_size / blend_sigma_scale, '
+                             'as blend_and_finalize --sigma_scale. Default: 8.0')
+    parser.add_argument('--blend_chunk_size', type=str, default=None,
+                        help='With --blend_in_memory: spatial chunk size (Z,Y,X) of the output. '
+                             'Default: the patch size')
+    parser.add_argument('--blend_compression_level', type=int, default=1, choices=range(10),
+                        help='With --blend_in_memory: compression level (0-9, 0=none) of the output, '
+                             'as blend_and_finalize --compression_level. Default: 1')
     return parser
 
 
 def main():
     import sys
 
-    args = build_parser().parse_args()
+    parser = build_parser()
+    args = parser.parse_args()
     
     # Parse optional patch size if provided
     patch_size = None
@@ -1353,6 +1447,28 @@ def main():
         except ValueError as e:
             parser.error(str(e))
         print(f"Restricting inference to bbox (z0,z1,y0,y1,x0,x1): {bbox}")
+
+    in_memory_blend = None
+    if args.blend_in_memory:
+        from vesuvius.models.run.finalize_outputs import FinalizeConfig, resolve_threshold
+        if args.num_parts > 1:
+            parser.error("--blend_in_memory blends the whole region in one process; it cannot be "
+                         "combined with --num_parts > 1.")
+        blend_chunk_size = None
+        if args.blend_chunk_size:
+            try:
+                blend_chunk_size = tuple(map(int, args.blend_chunk_size.split(',')))
+                if len(blend_chunk_size) != 3:
+                    raise ValueError()
+            except ValueError:
+                parser.error("Invalid --blend_chunk_size. Expected 3 comma-separated integers (Z,Y,X).")
+        in_memory_blend = {
+            'output_path': args.blend_in_memory,
+            'sigma_scale': args.blend_sigma_scale,
+            'chunk_size': blend_chunk_size,
+            'compression_level': args.blend_compression_level,
+            'finalize_config': FinalizeConfig(mode=args.mode, threshold=resolve_threshold(parser, args)),
+        }
 
     # Convert scroll_id and segment_id if needed
     scroll_id = args.scroll_id
@@ -1401,6 +1517,7 @@ def main():
         max_patches=args.max_patches,
         bbox=bbox,
         chunk_cache_mb=args.chunk_cache_mb,
+        in_memory_blend=in_memory_blend,
     )
 
     try:
@@ -1413,6 +1530,11 @@ def main():
             print("Inference raised the error shown above and wrote no output.")
             return 1
         logits_path, coords_path = result
+
+        if in_memory_blend is not None:
+            print(f"\n--- Inference Finished ---")
+            print(f"Blended output written to: {logits_path}")
+            return 0
 
         if logits_path and coords_path:
             # Check if paths exist, using fsspec for S3 paths

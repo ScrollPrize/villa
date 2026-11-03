@@ -91,6 +91,11 @@ def _parse_s3_uri(uri: str) -> tuple[str, str]:
     return rest[:idx], rest[idx + 1:].rstrip("/")
 
 
+def parse_s3_uri(uri: str) -> tuple[str, str]:
+    """Public S3 URI parser shared with manager catalogue consumers."""
+    return _parse_s3_uri(uri)
+
+
 # ---------------------------------------------------------------------------
 # Stats shared between scanner, downloaders, and progress display
 # ---------------------------------------------------------------------------
@@ -303,9 +308,11 @@ def _s3_exists(bucket: str, key: str, anon: bool) -> bool:
         return False
 
 
-def _s3_list_prefix(bucket: str, prefix: str, anon: bool) -> list[str]:
+def _s3_list_prefix(
+    bucket: str, prefix: str, anon: bool, *, region: str | None = None,
+) -> list[str]:
     """List immediate children (CommonPrefixes + Contents) under prefix."""
-    client = _get_s3_client(anon)
+    client = _get_s3_client(anon, region)
     if not prefix.endswith("/"):
         prefix += "/"
     result: list[str] = []
@@ -316,6 +323,13 @@ def _s3_list_prefix(bucket: str, prefix: str, anon: bool) -> list[str]:
         for obj in page.get("Contents", []):
             result.append(obj["Key"])
     return result
+
+
+def list_s3_prefix(
+    bucket: str, prefix: str, *, anon: bool = True, region: str | None = None,
+) -> list[str]:
+    """List immediate S3 children with the downloader's paginated client."""
+    return _s3_list_prefix(bucket, prefix, anon, region=region)
 
 
 def _s3_iter_objects(

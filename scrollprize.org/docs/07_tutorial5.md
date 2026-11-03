@@ -69,7 +69,7 @@ This is where one of the core difficulties of the Herculaneum Papyri comes in: t
 
 So why scan with X-rays at all? Because visible and infrared light can't see inside a *rolled* scroll — they don't penetrate the papyrus. X-ray CT does: it images the interior of an intact scroll at high resolution, but, as the fragment above shows, at the cost of the visible ink contrast. Ink detection exists to win that contrast back computationally.
 
-Not all of that contrast is lost, though. What does the surviving signal look like? In PHerc. Paris 4 in particular, ink can sit as a thin layer on the papyrus surface, and on the flattened surface volume it often shows up as a **crackle** — a texture like cracked mud, raised slightly above the papyrus. Crackle is one of several surface-morphology cues that can betray ink; on other scrolls the signal is more subtle and heterogeneous, and may instead depend on fine texture, local roughness, deposits, or deformation.
+Not all of that contrast is lost, though. What does the surviving signal look like? In PHerc. Paris. 4 in particular, ink can sit as a thin layer on the papyrus surface, and on the flattened surface volume it often shows up as a **crackle** — a texture like cracked mud, raised slightly above the papyrus. Crackle is one of several surface-morphology cues that can betray ink; on other scrolls the signal is more subtle and heterogeneous, and may instead depend on fine texture, local roughness, deposits, or deformation.
 
 <figure>
   <a href="/img/tutorials/ink-signal-volumetric.webp" target="_blank"><img src="/img/tutorials/ink-signal-volumetric.webp" /></a>
@@ -113,7 +113,7 @@ Now let's train a model. The rest of this tutorial is hands-on: you will set up 
 
 ### The dataset
 
-The tutorial uses the [`ink-labels` dataset](/data_datasets#ink-labels-2026-07), which lives in the [`scrollprize/datasets` storage bucket](https://huggingface.co/buckets/scrollprize/datasets/tree/ink) on Hugging Face, organized by scroll. The full dataset is hundreds of GB, so the whole tutorial runs end-to-end on **one segment** of PHerc. Paris 4 (Scroll 1) — about 25 GB:
+The tutorial uses the [`ink-labels` dataset](/data_datasets#ink-labels-2026-07), which lives in the [`scrollprize/datasets` storage bucket](https://huggingface.co/buckets/scrollprize/datasets/tree/ink) on Hugging Face, organized by scroll. The full dataset is hundreds of GB, so the whole tutorial runs end-to-end on **one segment** of PHerc. Paris. 4 (Scroll 1) — about 25 GB:
 
 ```bash
 uvx --from huggingface_hub hf buckets sync \
@@ -480,7 +480,7 @@ The figure below shows this loop in action on PHerc. 1667: with each iteration t
 
 ### Ink detection at 9 µm: pretrained cross-scroll models
 
-Everything above trains a model on one scroll and runs it on segments of that same scroll. But the goal — and the open [First Letters Prizes](/prizes#first-letters-prizes) — is finding ink in scrolls nobody has read yet, where there are no labels to train on. For that, we share pretrained **cross-scroll models**: ink detectors trained on aligned labels from four scrolls (PHerc. 0139, PHerc. 1667, PHerc. Paris 4, and PHerc. 0814) at a common working resolution of roughly 9&nbsp;µm isotropic.
+Everything above trains a model on one scroll and runs it on segments of that same scroll. But the goal — and the open [First Letters Prizes](/prizes#first-letters-prizes) — is finding ink in scrolls nobody has read yet, where there are no labels to train on. For that, we share pretrained **cross-scroll models**: ink detectors trained on aligned labels from four scrolls (PHerc. 0139, PHerc. 1667, PHerc. Paris. 4, and PHerc. 0814) at a common working resolution of roughly 9&nbsp;µm isotropic.
 
 The models live at [`scrollprize/ink_9um`](https://huggingface.co/scrollprize/ink_9um) on Hugging Face: a small local 3D stem feeding a 2D U-Net, trained twice with only the seed changed (`hybrid_3d2d-seed42/` and `hybrid_3d2d-seed43/`), with seven checkpoints each along the training trajectory (`step-010000.pth` up to `step-075000.pth`).
 

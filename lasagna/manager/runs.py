@@ -14,6 +14,7 @@ import subprocess
 import tempfile
 import uuid
 from typing import Any, Sequence
+from ..cooperative_inference import INFERENCE_ENV
 
 from .catalog import VolumeRecord
 from .config import ManagerConfig
@@ -69,6 +70,63 @@ def _json_default(value: Any) -> Any:
 def _slug(value: str, limit: int) -> str:
     value = re.sub(r"[^A-Za-z0-9_.-]+", "-", value).strip("-.") or "run"
     return value[:limit].rstrip("-.")
+
+
+def reserve_managed_run(
+    config: ManagerConfig,
+    *,
+    name_stem: str,
+    session_prefix: str,
+    tmux: Tmux,
+) -> tuple[str, str, str, Path]:
+    """Atomically reserve the common identity and directory for a managed job."""
+    output_root = config.resolved_path("output_dir", required=True)
+    assert output_root is not None
+    output_root.mkdir(parents=True, exist_ok=True)
+    for _attempt in range(10):
+        run_uuid = str(uuid.uuid4())
+        run_name = _slug(f"{name_stem}-{run_uuid[:8]}", 120)
+        session = _slug(f"{session_prefix}-{run_name}", 78)
+        run_dir = output_root / run_name
+        if tmux.has_session(session):
+            continue
+        try:
+            run_dir.mkdir(exist_ok=False)
+        except FileExistsError:
+            continue
+        return run_uuid, run_name, session, run_dir
+    raise RuntimeError("could not reserve a unique managed run name")
+
+
+def launch_recorded_job(
+    config: ManagerConfig,
+    *,
+    run_dir: Path,
+    record: dict[str, Any],
+    command_record: dict[str, Any],
+    window_name: str,
+    tmux: Tmux,
+) -> Path:
+    """Persist and launch a job through the one shared manager runner."""
+    atomic_json(run_dir / "metadata.json", record)
+    atomic_json(run_dir / "command.json", command_record)
+    python = _runtime_python(config)
+    wrapper = [str(python), "-m", "lasagna.manager.runner", str(run_dir)]
+    active_phase = str(record.get("active_lifecycle_phase") or "inference")
+    try:
+        record["tmux_window_name"] = window_name
+        record["tmux_window_id"] = tmux.create(
+            str(record["tmux_session"]), window_name, wrapper,
+            run_uuid=str(record["run_uuid"]),
+        )
+        atomic_json(run_dir / "metadata.json", record)
+    except Exception:
+        record["status"] = "failed"
+        record.setdefault("lifecycle", {})[active_phase] = "failed"
+        record["ended_at"] = utc_now()
+        atomic_json(run_dir / "metadata.json", record)
+        raise
+    return run_dir
 
 
 def _git_revision(root: Path) -> dict[str, Any]:
@@ -201,7 +259,8 @@ def build_fiber_command(
         raise FileNotFoundError(f"legacy Fiber config does not exist: {legacy_config}")
     context_file = run_dir / "provenance_context.json"
     atomic_json(context_file, provenance_context or {})
-    manifest = run_dir / "artifacts" / f"{run_dir.name}.lasagna.json"
+    legacy = _cli_option_value(extra_args, "--output-format") == "legacy"
+    manifest = run_dir / "artifacts" / (run_dir.name + (".lasagna.json" if legacy else ".zarr"))
     input_path = volume_cache_root(config, volume) / str(scale)
     command = [
         str(_runtime_python(config)), "-m", "vesuvius.neural_tracing.fiber_trace_3d.infer",
@@ -228,7 +287,8 @@ def build_lasagna_command(
         raise ValueError("scale must be a non-negative OME-Zarr group index")
     context_file = run_dir / "provenance_context.json"
     atomic_json(context_file, provenance_context or {})
-    manifest = run_dir / "artifacts" / f"{run_dir.name}.lasagna.json"
+    legacy = _cli_option_value(extra_args, "--output-format") == "legacy"
+    manifest = run_dir / "artifacts" / (run_dir.name + (".lasagna.json" if legacy else ".zarr"))
     input_path = volume_cache_root(config, volume) / str(scale)
     command = [
         str(_runtime_python(config)), "-m", "preprocess_cos_omezarr", "predict3d",
@@ -261,6 +321,11 @@ def launch_inference(
 ) -> Path:
     if snapshot.backend not in {"fiber3d", "lasagna"}:
         raise ValueError(f"unsupported inference backend: {snapshot.backend}")
+    if not snapshot.model_identifier:
+        raise ValueError(
+            f"snapshot {snapshot.selector!r} has no model_identifier; import it first with "
+            "`las_manager snapshot import CHECKPOINT --model-identifier OWNER/REPOSITORY`"
+        )
     if snapshot.backend == "lasagna" and legacy_config is not None:
         raise ValueError("--legacy-config applies only to Fiber checkpoints")
     if int(download_workers) <= 0:
@@ -284,8 +349,6 @@ def launch_inference(
         or resolved_live_lookahead <= 0
     ):
         raise ValueError("live cache target and lookahead must be > 0")
-    output_root = config.resolved_path("output_dir", required=True)
-    assert output_root is not None
     python = _runtime_python(config)
     if snapshot.backend == "lasagna":
         runtime_config = {
@@ -304,24 +367,12 @@ def launch_inference(
             raise ValueError(f"legacy Fiber config must contain a JSON object: {legacy_path}")
         runtime_config_source = "legacy-file"
     client = tmux or Tmux()
-    output_root.mkdir(parents=True, exist_ok=True)
-    for _attempt in range(10):
-        run_uuid = str(uuid.uuid4())
-        run_name = _slug(
-            f"{volume.sample_id}-{volume.volume_id}-las-sd{scale}-{run_uuid[:8]}",
-            120,
-        )
-        session = "las-" + _slug(run_name, 70)
-        run_dir = output_root / run_name
-        if client.has_session(session):
-            continue
-        try:
-            run_dir.mkdir(exist_ok=False)
-        except FileExistsError:
-            continue
-        break
-    else:
-        raise RuntimeError("could not reserve a unique inference run name")
+    run_uuid, run_name, session, run_dir = reserve_managed_run(
+        config,
+        name_stem=f"{volume.sample_id}-{volume.volume_id}-las-sd{scale}",
+        session_prefix="las",
+        tmux=client,
+    )
     (run_dir / "artifacts").mkdir()
     model_context = asdict(snapshot)
     model_context.pop("path", None)
@@ -357,7 +408,8 @@ def launch_inference(
         )
     elif not prefetch:
         generated_args = ("--download-workers", str(int(download_workers)))
-    backend_args = _inference_args(config.params, (*generated_args, *extra_args))
+    configured_args = config.lasagna_params if snapshot.backend == "lasagna" else config.params
+    backend_args = _inference_args(configured_args, (*generated_args, *extra_args))
     if live_fetch and _has_cli_option(backend_args, "--no-download"):
         raise ValueError("live fetch conflicts with --no-download in manager params/backend arguments")
     if live_fetch and any(
@@ -391,6 +443,8 @@ def launch_inference(
         artifact_kind = "lasagna"
     record = {
         "schema_version": SCHEMA_VERSION,
+        "job_kind": "inference",
+        "active_lifecycle_phase": "inference",
         "run_uuid": run_uuid,
         "run_name": run_name,
         "backend": snapshot.backend,
@@ -407,7 +461,7 @@ def launch_inference(
         "private": {"hostname": socket.gethostname(), "user": getpass.getuser()},
         "manager": {"version": "0.1", **_git_revision(Path(__file__).resolve().parents[2])},
         "runtime": _runtime_info(python),
-        "environment": {name: os.environ[name] for name in ("CUDA_VISIBLE_DEVICES",) if name in os.environ},
+        "environment": {name: os.environ[name] for name in INFERENCE_ENV if name in os.environ},
         "source": {
             "volume": {**asdict(volume), "selector": volume.selector},
             "scale": scale,
@@ -452,23 +506,14 @@ def launch_inference(
         "venv_activation": f"source {config.resolved_path('venv', required=True)}/bin/activate",
         "prefetch": prefetch_request,
     }
-    atomic_json(run_dir / "metadata.json", record)
-    atomic_json(run_dir / "command.json", command_record)
-    wrapper = [str(python), "-m", "lasagna.manager.runner", str(run_dir)]
-    try:
-        window_name = _slug(f"inf-{volume.sample_id}-{run_uuid[:4]}", 24)
-        record["tmux_window_name"] = window_name
-        record["tmux_window_id"] = client.create(
-            session, window_name, wrapper, run_uuid=run_uuid,
-        )
-        atomic_json(run_dir / "metadata.json", record)
-    except Exception:
-        record["status"] = "failed"
-        record["lifecycle"]["inference"] = "failed"
-        record["ended_at"] = utc_now()
-        atomic_json(run_dir / "metadata.json", record)
-        raise
-    return run_dir
+    return launch_recorded_job(
+        config,
+        run_dir=run_dir,
+        record=record,
+        command_record=command_record,
+        window_name=_slug(f"inf-{volume.sample_id}-{run_uuid[:4]}", 24),
+        tmux=client,
+    )
 
 
 def read_runs(config: ManagerConfig) -> list[tuple[Path, dict[str, Any]]]:
@@ -522,7 +567,8 @@ def reconcile_runs(config: ManagerConfig, tmux: Tmux | None = None) -> list[tupl
         status = "interrupted" if record.get("status") == "running" else "unknown"
         record["status"] = status
         record["ended_at"] = utc_now()
-        record.setdefault("lifecycle", {})["inference"] = status
+        phase = str(record.get("active_lifecycle_phase") or "inference")
+        record.setdefault("lifecycle", {})[phase] = status
         atomic_json(run_dir / "metadata.json", record)
     return read_runs(config)
 

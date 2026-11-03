@@ -18,7 +18,7 @@
 #include <bit>
 #include <filesystem>
 
-#include "vc/core/util/MemMap.hpp"
+#include <vc_object_store/MemMap.hpp>
 
 namespace vc::core::util {
 
@@ -50,7 +50,7 @@ inline uint32_t read_be_u32_at(const char* base, size_t byte_offset) {
 }
 
 struct MmappedData {
-    vc::memmap::MappedFileRO map;
+    vc::objects::memmap::MappedFileRO map;
     const void* data = nullptr;
     size_t size = 0;
 };
@@ -602,19 +602,6 @@ public:
     utils::Json meta_;
 
 private:
-    char* write_bucket(char* current, const std::vector<int>& bucket, const std::unordered_map<int, uint32_t>& path_offsets) const {
-        uint32_t num_indices = be32(bucket.size());
-        memcpy(current, &num_indices, sizeof(num_indices));
-        current += sizeof(num_indices);
-        for (int handle : bucket) {
-            uint32_t offset = path_offsets.at(handle);
-            uint32_t net_offset = be32(offset);
-            memcpy(current, &net_offset, sizeof(net_offset));
-            current += sizeof(net_offset);
-        }
-        return current;
-    }
-
     char* write_seglist(char* current, const LineSegList& seglist) const {
         cv::Point start = seglist.start_point();
         uint32_t start_x = be32(start.x);

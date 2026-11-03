@@ -116,3 +116,30 @@ def gather_variable_points(
         torch.cat([rank_embeddings[:count] for rank_embeddings, count in zip(gathered_embeddings, counts)]),
         torch.cat([rank_labels[:count] for rank_labels, count in zip(gathered_labels, counts)]),
     )
+
+
+def sample_grid_points(
+    grid: torch.Tensor,
+    coordinates_zyx: torch.Tensor,
+    input_shape: Sequence[int],
+) -> torch.Tensor:
+    """Trilinearly sample a [B, D, H, W, C] feature grid at [B, P, 3] input-voxel coordinates.
+
+    The grid covers the same field of view as the input at a lower resolution; voxel
+    centers are aligned (align_corners=False). The 8 neighbours are gathered in one
+    indexing operation, keeping the feature map in its dtype and memory layout, so the
+    backward pass scatters into a single grid-sized gradient.
+    """
+    batch, points = coordinates_zyx.shape[:2]
+    grid_shape = coordinates_zyx.new_tensor(tuple(float(size) for size in grid.shape[1:4]))
+    scale = grid_shape / coordinates_zyx.new_tensor(tuple(float(size) for size in input_shape))
+    position = ((coordinates_zyx + 0.5) * scale - 0.5).clamp(min=0.0)
+    position = torch.minimum(position, grid_shape - 1.0)
+    lower = position.floor()
+    fraction = position - lower
+    offsets = coordinates_zyx.new_tensor(tuple(product((0.0, 1.0), repeat=3)))  # [8, 3]
+    index = torch.minimum(lower[:, :, None, :] + offsets, grid_shape - 1.0).long()  # [B, P, 8, 3]
+    weight = torch.where(offsets > 0, fraction[:, :, None, :], 1.0 - fraction[:, :, None, :]).prod(-1)
+    rows = torch.arange(batch, device=grid.device)[:, None, None].expand(batch, points, 8)
+    corners = grid[rows, index[..., 0], index[..., 1], index[..., 2]]  # [B, P, 8, C]
+    return (corners.float() * weight[..., None]).sum(2)

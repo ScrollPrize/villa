@@ -50,6 +50,15 @@ struct NormalBatchReport {
 
 class NormalSampler {
 public:
+    [[nodiscard]] virtual NormalBatchReport sampleNormalBatch(
+        const std::vector<cv::Vec3d>& volumePoints,
+        bool withDerivative,
+        int parallelThreads,
+        std::vector<NormalSampleWithDerivative>& samples) const
+    {
+        (void)parallelThreads;
+        return sampleNormalBatch(volumePoints, withDerivative, samples);
+    }
     virtual ~NormalSampler() = default;
     [[nodiscard]] virtual bool supportsConcurrentSampling() const noexcept
     {

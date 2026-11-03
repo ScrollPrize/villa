@@ -1,7 +1,5 @@
 // Extra Volume coverage beyond test_volume_local.cpp:
-// - uint16 dtype write/read
-// - writeMetadata / updateMetadata
-// - writeRootAttributes / updateRootAttributes
+// - uint16 dtype reads
 // - process cache configuration
 // - sample (single-slice) on a seeded uint8 volume
 // - MissingScaleLevelPolicy::AllFill behaviour for a level that exists but is empty
@@ -10,6 +8,7 @@
 #include <doctest/doctest.h>
 
 #include "vc/core/types/Volume.hpp"
+#include "support/TestZarrVolume.hpp"
 #include "vc/core/types/Array3D.hpp"
 #include "vc/core/types/SampleParams.hpp"
 
@@ -35,18 +34,16 @@ fs::path tmpDir(const std::string& tag)
     return p;
 }
 
-Volume::ZarrCreateOptions optsU8()
+vc::test::ZarrVolumeSpec optsU8()
 {
-    Volume::ZarrCreateOptions o;
+    vc::test::ZarrVolumeSpec o;
     o.shapeZYX = {32, 32, 32};
     o.chunkShapeZYX = {16, 16, 16};
     o.numLevels = 1;
-    o.compressor = "none";
-    o.overwriteExisting = true;
     return o;
 }
 
-Volume::ZarrCreateOptions optsU16()
+vc::test::ZarrVolumeSpec optsU16()
 {
     auto o = optsU8();
     o.dtype = vc::render::ChunkDtype::UInt16;
@@ -58,7 +55,7 @@ Volume::ZarrCreateOptions optsU16()
 TEST_CASE("Volume uint16 round-trip via writeZYX/readZYX")
 {
     auto d = tmpDir("u16");
-    auto v = Volume::New(d, optsU16());
+    auto v = vc::test::createZarrVolume(d, optsU16());
     REQUIRE(v);
     CHECK(v->dtype() == vc::render::ChunkDtype::UInt16);
     CHECK(v->dtypeSize() == 2);
@@ -68,7 +65,7 @@ TEST_CASE("Volume uint16 round-trip via writeZYX/readZYX")
         for (size_t y = 0; y < 8; ++y)
             for (size_t x = 0; x < 8; ++x)
                 in(z, y, x) = static_cast<uint16_t>(z * 64 + y * 8 + x);
-    v->writeZYX(in, {0, 0, 0}, 0);
+    vc::test::writeZYX(*v, in, {0, 0, 0}, 0);
 
     Array3D<uint16_t> out({8, 8, 8});
     CHECK(v->readZYX(out, {0, 0, 0}, 0));
@@ -80,10 +77,10 @@ TEST_CASE("Volume uint16 round-trip via writeZYX/readZYX")
 TEST_CASE("Volume uint16: writeXYZ/readXYZ overload")
 {
     auto d = tmpDir("u16_xyz");
-    auto v = Volume::New(d, optsU16());
+    auto v = vc::test::createZarrVolume(d, optsU16());
     REQUIRE(v);
     Array3D<uint16_t> in({4, 4, 4}, 12345);
-    v->writeXYZ(in, {0, 0, 0}, 0);
+    vc::test::writeZYX(*v, in, {0, 0, 0}, 0);
     Array3D<uint16_t> out({4, 4, 4});
     CHECK(v->readXYZ(out, {0, 0, 0}, 0));
     CHECK(out(0, 0, 0) == 12345);
@@ -93,7 +90,7 @@ TEST_CASE("Volume uint16: writeXYZ/readXYZ overload")
 TEST_CASE("Volume::sample writes a Mat at the requested coords")
 {
     auto d = tmpDir("sample");
-    auto v = Volume::New(d, optsU8());
+    auto v = vc::test::createZarrVolume(d, optsU8());
     REQUIRE(v);
     // Seed the volume with a gradient.
     Array3D<uint8_t> seed({32, 32, 32}, 0);
@@ -101,7 +98,7 @@ TEST_CASE("Volume::sample writes a Mat at the requested coords")
         for (size_t y = 0; y < 32; ++y)
             for (size_t x = 0; x < 32; ++x)
                 seed(z, y, x) = static_cast<uint8_t>((z + y + x) & 0xFF);
-    v->writeZYX(seed, {0, 0, 0}, 0);
+    vc::test::writeZYX(*v, seed, {0, 0, 0}, 0);
 
     cv::Mat_<cv::Vec3f> coords(4, 4);
     for (int r = 0; r < 4; ++r)
@@ -117,13 +114,37 @@ TEST_CASE("Volume::sample writes a Mat at the requested coords")
     fs::remove_all(d);
 }
 
+TEST_CASE("Volume chunk cache reports cumulative decoder work")
+{
+    auto d = tmpDir("decode_stats");
+    auto v = vc::test::createZarrVolume(d, optsU8());
+    REQUIRE(v);
+    Array3D<uint8_t> seed({16, 16, 16}, 19);
+    vc::test::writeZYX(*v, seed, {0, 0, 0}, 0);
+    auto cache = v->sharedChunkCache();
+    REQUIRE(cache);
+    v->invalidateCache();
+    const auto before = cache->stats();
+
+    Array3D<uint8_t> out({16, 16, 16});
+    CHECK(v->readZYX(out, {0, 0, 0}, 0));
+    const auto after = cache->stats();
+
+    CHECK(after.decodeAttempts > before.decodeAttempts);
+    CHECK(after.decodedChunks > before.decodedChunks);
+    CHECK(after.decodeInputBytes > before.decodeInputBytes);
+    CHECK(after.decodedChunkBytes > before.decodedChunkBytes);
+    CHECK(after.decodeNanoseconds >= before.decodeNanoseconds);
+    fs::remove_all(d);
+}
+
 TEST_CASE("Volume::sample uint16 overload")
 {
     auto d = tmpDir("sample_u16");
-    auto v = Volume::New(d, optsU16());
+    auto v = vc::test::createZarrVolume(d, optsU16());
     REQUIRE(v);
     Array3D<uint16_t> seed({16, 16, 16}, 1000);
-    v->writeZYX(seed, {0, 0, 0}, 0);
+    vc::test::writeZYX(*v, seed, {0, 0, 0}, 0);
     cv::Mat_<cv::Vec3f> coords(2, 2);
     for (int r = 0; r < 2; ++r)
         for (int c = 0; c < 2; ++c)
@@ -136,49 +157,10 @@ TEST_CASE("Volume::sample uint16 overload")
     fs::remove_all(d);
 }
 
-TEST_CASE("Volume::writeMetadata / updateMetadata")
-{
-    auto d = tmpDir("meta");
-    auto v = Volume::New(d, optsU8());
-    REQUIRE(v);
-    utils::Json m = utils::Json::object();
-    m["voxel_size_um"] = 7.91;
-    v->writeMetadata(m);
-    CHECK(v->metadata()["voxel_size_um"].get_double() == doctest::Approx(7.91));
-
-    // updateMetadata merges into existing.
-    utils::Json patch = utils::Json::object();
-    patch["scan"] = "test-scan";
-    v->updateMetadata(patch);
-    CHECK(v->metadata().contains("voxel_size_um"));
-    CHECK(v->metadata()["scan"].get_string() == "test-scan");
-    fs::remove_all(d);
-}
-
-TEST_CASE("Volume::writeRootAttributes / updateRootAttributes")
-{
-    auto d = tmpDir("rootattrs");
-    auto v = Volume::New(d, optsU8());
-    REQUIRE(v);
-    utils::Json a = utils::Json::object();
-    a["foo"] = "bar";
-    v->writeRootAttributes(a);
-    auto loaded = v->rootAttributes();
-    CHECK(loaded["foo"].get_string() == "bar");
-    // updateRootAttributes merges.
-    utils::Json patch = utils::Json::object();
-    patch["count"] = 7;
-    v->updateRootAttributes(patch);
-    auto merged = v->rootAttributes();
-    CHECK(merged.contains("foo"));
-    CHECK(merged["count"].get_int64() == 7);
-    fs::remove_all(d);
-}
-
 TEST_CASE("Volume uses the process chunk-cache service")
 {
     auto d = tmpDir("knobs");
-    auto v = Volume::New(d, optsU8());
+    auto v = vc::test::createZarrVolume(d, optsU8());
     REQUIRE(v);
     auto service = vc::render::processChunkCacheService();
     service->configureDecodedByteCapacity(1ULL << 20);
@@ -186,6 +168,15 @@ TEST_CASE("Volume uses the process chunk-cache service")
     REQUIRE(cache);
     CHECK(cache->sourceId() != vc::render::VolumeSourceId{});
     fs::remove_all(d);
+}
+
+TEST_CASE("process chunk-cache decode concurrency is configurable")
+{
+    auto service = vc::render::processChunkCacheService();
+    const auto original = service->decodeConcurrency();
+    service->configureDecodeConcurrency(1);
+    CHECK(service->decodeConcurrency() == 1);
+    service->configureDecodeConcurrency(original);
 }
 
 TEST_CASE("process chunk-cache configuration preserves the service")
@@ -213,7 +204,7 @@ TEST_CASE("process chunk-cache configuration preserves the service")
 TEST_CASE("Volume::invalidateCache")
 {
     auto d = tmpDir("invalidate");
-    auto v = Volume::New(d, optsU8());
+    auto v = vc::test::createZarrVolume(d, optsU8());
     REQUIRE(v);
     // Just exercise; no observable state.
     v->invalidateCache();
@@ -224,7 +215,7 @@ TEST_CASE("Volume::invalidateCache")
 TEST_CASE("Volume::sharedChunkCache yields a non-null cache pointer")
 {
     auto d = tmpDir("createcache");
-    auto v = Volume::New(d, optsU8());
+    auto v = vc::test::createZarrVolume(d, optsU8());
     REQUIRE(v);
     auto c = v->sharedChunkCache();
     CHECK(c != nullptr);
@@ -235,7 +226,7 @@ TEST_CASE("Volume::sharedChunkCache yields a non-null cache pointer")
 TEST_CASE("Volume: missing chunk read returns fill with AllFill policy")
 {
     auto d = tmpDir("allfill_policy");
-    auto v = Volume::New(d, optsU8());
+    auto v = vc::test::createZarrVolume(d, optsU8());
     REQUIRE(v);
     // No writes — every chunk is absent and should fill with 0.
     Array3D<uint8_t> out({16, 16, 16});
@@ -254,7 +245,7 @@ TEST_CASE("Volume: missing chunk read returns fill with AllFill policy")
 TEST_CASE("Volume::chunkGridShape")
 {
     auto d = tmpDir("grid_shape");
-    auto v = Volume::New(d, optsU8());
+    auto v = vc::test::createZarrVolume(d, optsU8());
     REQUIRE(v);
     // shape=32^3, chunk=16^3 → 2x2x2 chunk grid
     auto g = v->chunkGridShape(0);
@@ -268,7 +259,7 @@ TEST_CASE("Volume::chunkGridShape")
 TEST_CASE("Volume::voxelSize defaults to 1.0 when not set in opts")
 {
     auto d = tmpDir("voxel");
-    auto v = Volume::New(d, optsU8());
+    auto v = vc::test::createZarrVolume(d, optsU8());
     REQUIRE(v);
     CHECK(v->voxelSize() > 0.0);
     fs::remove_all(d);

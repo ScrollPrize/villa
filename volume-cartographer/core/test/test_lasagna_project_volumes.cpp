@@ -4,6 +4,7 @@
 #include "vc/core/types/Volume.hpp"
 #include "vc/core/types/VolumePkg.hpp"
 #include "vc/lasagna/ProjectVolumes.hpp"
+#include "support/TestProject.hpp"
 #include "utils/zarr.hpp"
 
 #include <array>
@@ -149,7 +150,7 @@ TEST_CASE("Lasagna project preparation deduplicates shared source zarrs")
             std::move(item.tags),
             std::move(item.volume)});
     }
-    auto package = VolumePkg::newDetached();
+    auto package = vc::test::emptyProject();
     const auto result = package->attachPreparedLasagnaDataset(
         manifestPath.string(), {}, true, attachments);
     REQUIRE(result == VolumePkg::AttachLasagnaResult::Attached);
@@ -260,7 +261,7 @@ TEST_CASE("Lasagna project preparation keeps numeric scale group ids unique")
     CHECK(attachments[0].volume->id() != attachments[2].volume->id());
     CHECK(attachments[1].volume->id() != attachments[2].volume->id());
 
-    auto package = VolumePkg::newDetached();
+    auto package = vc::test::emptyProject();
     REQUIRE(package->attachPreparedLasagnaDataset(
                 manifestPath.string(), {}, true, attachments) ==
             VolumePkg::AttachLasagnaResult::Attached);
@@ -348,13 +349,12 @@ TEST_CASE("Lasagna project volumes reload without Lasagna-specific reconciliatio
 
     vc::project::LoadOptions options;
     options.deferResolution = true;
-    auto package = VolumePkg::newDetached(options);
+    const auto store = vc::test::createTestProject();
+    auto package = store.open(options);
     REQUIRE(package->attachPreparedLasagnaDataset(manifestPath.string(), {}, false, attachments) == VolumePkg::AttachLasagnaResult::Attached);
     REQUIRE(package->volumeEntries().size() == 2);
-    const auto projectPath = dir / "project.volpkg.json";
-    package->save(projectPath);
 
-    auto reloaded = VolumePkg::load(projectPath, options);
+    auto reloaded = store.open(options);
     CHECK(reloaded->numberOfVolumes() == 0);
     reloaded->resolveDeferredEntries();
     CHECK(reloaded->numberOfVolumes() == 2);

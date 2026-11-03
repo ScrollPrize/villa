@@ -7,6 +7,7 @@
 #include <vector>
 
 #include "FiberNetworkLayout.hpp"
+#include "FiberMapFocusBounds.hpp"
 
 using vc3d::fiber_map::InputFiber;
 using vc3d::fiber_map::PlacedFiber;
@@ -223,6 +224,39 @@ class TestFiberNetworkLayout : public QObject
     Q_OBJECT
 
 private slots:
+    void focusMaskClipsInWorldCoordinates()
+    {
+        PlacedFiber fiber;
+        vc3d::fiber_map::Run run;
+        run.points = {{100, 300}, {200, 300}};
+        run.worldPoints = {{-10, 5, 5}, {30, 5, 5}};
+        fiber.runs = {run};
+        const Rect3D box{{0, 0, 0}, {20, 10, 10}};
+        const auto paths = vc3d::fiber_map::focusRunPaths(fiber, 0, box);
+        QCOMPARE(paths.inside.elementCount(), 2);
+        QCOMPARE(paths.inside.elementAt(0).x, 125.0);
+        QCOMPARE(paths.inside.elementAt(1).x, 175.0);
+        QCOMPARE(paths.outside.elementCount(), 4);
+        QCOMPARE(paths.outside.elementAt(0).x, 100.0);
+        QCOMPARE(paths.outside.elementAt(3).x, 200.0);
+        fiber.runs[0].worldPoints = {{-10, 15, 5}, {30, 15, 5}};
+        QVERIFY(vc3d::fiber_map::focusRunPaths(fiber, 0, box).inside.isEmpty());
+        fiber.runs[0].worldPoints = {{0, 5, 5}, {20, 5, 5}};
+        QVERIFY(vc3d::fiber_map::focusRunPaths(fiber, 0, box).outside.isEmpty());
+
+        // Styled runs trim both coordinate arrays to their control endpoints.
+        fiber.controlPoints = {{125, 300}, {175, 300}};
+        fiber.controlWorldPoints = {{0, 5, 5}, {20, 5, 5}};
+        fiber.runs[0].worldPoints = run.worldPoints;
+        fiber.runs[0].gap = true;
+        fiber.runs[0].firstControl = 0;
+        fiber.runs[0].lastControl = 1;
+        const auto gap = vc3d::fiber_map::focusRunPaths(fiber, 0, box);
+        QVERIFY(gap.outside.isEmpty());
+        QCOMPARE(gap.inside.elementAt(0).x, 125.0);
+        QCOMPARE(gap.inside.elementAt(1).x, 175.0);
+    }
+
     void componentsAndFiltering()
     {
         const std::vector<cv::Vec3f> umbilicus = straightUmbilicus(40000);
@@ -250,6 +284,19 @@ private slots:
         QCOMPARE(result.networks[1].networkIndex, 0);
         QCOMPARE(result.networks[0].fibers.size(), std::size_t{3});
         QCOMPARE(result.networks[1].fibers.size(), std::size_t{4});
+        for (const auto& network : result.networks) {
+            for (const auto& placed : network.fibers) {
+                const auto input = std::find_if(fibers.begin(), fibers.end(),
+                    [&](const auto& f) { return f.id == placed.id; });
+                QVERIFY(input != fibers.end());
+                QVERIFY(placed.controlWorldPoints == input->controlPoints);
+                for (const auto& run : placed.runs) {
+                    QCOMPARE(run.worldPoints.size(), run.points.size());
+                    for (const auto& p : run.worldPoints)
+                        QVERIFY(std::isfinite(p[0]) && std::isfinite(p[1]) && std::isfinite(p[2]));
+                }
+            }
+        }
 
         params.maxNetworks = 1;
         const Result single = vc3d::fiber_map::buildLayout(fibers, umbilicus, params);

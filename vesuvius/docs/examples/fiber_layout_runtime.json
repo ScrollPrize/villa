@@ -1,0 +1,11 @@
+{
+  "output_root": "results/replay_v1",
+  "devices": {"free": "0", "joint": "1", "selectable": "2"},
+  "scoring_threads": 4,
+  "gpu_manager": {
+    "exclusive": false,
+    "cpu_cores": 4,
+    "priority": 100,
+    "vram_bytes_per_gpu": 21474836480
+  }
+}

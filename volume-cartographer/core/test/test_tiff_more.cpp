@@ -1,5 +1,5 @@
 // More Tiff coverage: TiffWriter move-assignment, partial-tile padding,
-// 32F dtype, atomicImwriteMulti error paths.
+// 32F dtype.
 
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
 #include <doctest/doctest.h>
@@ -132,30 +132,6 @@ TEST_CASE("writeTiff: 16U -> 32F and 32F -> 16U conversions")
     cv::Mat mf(32, 32, CV_32FC1, cv::Scalar(0.5f));
     writeTiff(d / "b.tif", mf, CV_16UC1, 0, 0);
     CHECK(fs::exists(d / "b.tif"));
-    fs::remove_all(d);
-}
-
-TEST_CASE("atomicImwriteMulti: throws on empty page vector")
-{
-    auto d = tmpDir("atomic_empty");
-    auto p = d / "x.tif";
-    std::vector<cv::Mat> empty;
-    CHECK_THROWS_AS(atomicImwriteMulti(p, empty), std::runtime_error);
-    fs::remove_all(d);
-}
-
-TEST_CASE("atomicImwriteMulti: writes multi-page TIFF atomically")
-{
-    auto d = tmpDir("atomic_ok");
-    auto p = d / "x.tif";
-    std::vector<cv::Mat> pages = {
-        cv::Mat(8, 8, CV_8UC1, cv::Scalar(10)),
-        cv::Mat(8, 8, CV_8UC1, cv::Scalar(20)),
-    };
-    atomicImwriteMulti(p, pages);
-    REQUIRE(fs::exists(p));
-    // No stray .tmp left over.
-    CHECK_FALSE(fs::exists((d / "x.tmp.tif")));
     fs::remove_all(d);
 }
 

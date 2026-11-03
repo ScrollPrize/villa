@@ -1,3 +1,14 @@
+# 2026-10-21
+
+- Extracted existing annotated Fiber3D heads, Gaussian/coarse supervision,
+  refinement, embeddings, EMA and training-compatible native trace evaluation.
+  Added shared annotation baking, AFV constraints, winding/U/V layout and
+  minimum-flow solving; experiments, data and surface reconstruction excluded.
+
+- Extracted existing native Fiber3D CPU loading, split augmentation, shared
+  volume/mask transport and source-tagged train/test queue APIs with their
+  regression coverage. Training entrypoint integration remains a later stage.
+
 # 2026-08-07
 
 - Simplified manager S3 staging to marker-only resumable rclone transfer and

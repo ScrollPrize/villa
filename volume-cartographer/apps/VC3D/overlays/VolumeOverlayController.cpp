@@ -1,12 +1,12 @@
 #include "VolumeOverlayController.hpp"
-#include "../OpenDataCoordinateIdentity.hpp"
+#include "VolumeComboTooltip.hpp"
 #include "../VolumeDisplayNames.hpp"
 
 #include "../ViewerManager.hpp"
-#include "../VolumeViewerCmaps.hpp"
 #include "../volume_viewers/VolumeViewerBase.hpp"
 #include "../VCSettings.hpp"
 
+#include "vc/core/render/Colormaps.hpp"
 #include "vc/core/types/Volume.hpp"
 #include "vc/core/types/VolumePkg.hpp"
 
@@ -81,17 +81,6 @@ int percentValueFromOpacity(float opacity)
     return static_cast<int>(std::round(std::clamp(opacity, 0.0f, 1.0f) * 100.0f));
 }
 
-float windowValueFromSpin(int spinValue)
-{
-    return std::clamp(static_cast<float>(spinValue), 0.0f, 255.0f);
-}
-
-int spinValueFromWindow(float value)
-{
-    const float clamped = std::clamp(value, 0.0f, 255.0f);
-    return static_cast<int>(std::round(clamped));
-}
-
 std::string sanitizedCompositeMethod(const std::string& method)
 {
     if (method == "max" || method == "mean" || method == "min") {
@@ -123,8 +112,7 @@ vc::Sampling samplingMethodFromName(const QString& name)
 
 std::string defaultOverlayColormap()
 {
-    const auto& entries = volume_viewer_cmaps::entries(
-        volume_viewer_cmaps::EntryScope::OverlayCompatible);
+    const auto& entries = vc::entries(vc::EntryScope::OverlayCompatible);
     return entries.empty() ? std::string{} : entries.front().id;
 }
 
@@ -154,6 +142,7 @@ VolumeOverlayController::State VolumeOverlayController::state() const
             .low = _overlayWindowLow,
             .high = _overlayWindowHigh,
         },
+        .intensityAsAlpha = _overlayIntensityAsAlpha,
         .maxDisplayedResolution = _overlayMaxDisplayedResolution,
         .composite = currentCompositeSettings(),
     };
@@ -185,10 +174,10 @@ VolumeOverlayController::apply(const Update& update)
             setColormap(*update.colormap);
         if (update.opacity)
             setOpacity(*update.opacity);
-        if (update.threshold)
-            setThreshold(*update.threshold);
         if (update.window)
             setWindowBounds(update.window->low, update.window->high);
+        if (update.intensityAsAlpha)
+            setIntensityAsAlpha(*update.intensityAsAlpha);
         if (update.maxDisplayedResolution)
             setMaxDisplayedResolution(*update.maxDisplayedResolution);
         if (update.composite)
@@ -244,6 +233,7 @@ void VolumeOverlayController::setViewerManagers(
         setOpacity(_overlayOpacity);
         setSamplingMethod(_overlaySamplingMethod);
         setWindowBounds(_overlayWindowLow, _overlayWindowHigh);
+        setIntensityAsAlpha(_overlayIntensityAsAlpha);
         setMaxDisplayedResolution(_overlayMaxDisplayedResolution);
         setComposite(currentCompositeSettings());
         updateUiEnabled();
@@ -264,9 +254,9 @@ void VolumeOverlayController::setUi(const UiRefs& ui)
         _ui.opacitySpin->setValue(percentValueFromOpacity(_overlayOpacity));
     }
 
-    if (_ui.thresholdSpin) {
-        _ui.thresholdSpin->setRange(0, 255);
-        _ui.thresholdSpin->setValue(spinValueFromWindow(_overlayWindowLow));
+    if (_ui.intensityAsAlphaCheck) {
+        QSignalBlocker blocker(_ui.intensityAsAlphaCheck);
+        _ui.intensityAsAlphaCheck->setChecked(_overlayIntensityAsAlpha);
     }
 
     if (_ui.maxDisplayedResolutionSpin) {
@@ -325,6 +315,7 @@ void VolumeOverlayController::setVolumePkg(const std::shared_ptr<VolumePkg>& pkg
     setOpacity(_overlayOpacity);
     setSamplingMethod(_overlaySamplingMethod);
     setWindowBounds(_overlayWindowLow, _overlayWindowHigh);
+    setIntensityAsAlpha(_overlayIntensityAsAlpha);
     setMaxDisplayedResolution(_overlayMaxDisplayedResolution);
     setComposite(currentCompositeSettings());
     updateUiEnabled();
@@ -362,6 +353,7 @@ void VolumeOverlayController::clearVolumePkg()
     _overlayOpacityBeforeToggle = _overlayOpacity;
     _overlayWindowLow = 0.0f;
     _overlayWindowHigh = 255.0f;
+    _overlayIntensityAsAlpha = false;
     _overlayMaxDisplayedResolution = vc3d::settings::volume_overlay::MAX_DISPLAYED_RESOLUTION_DEFAULT;
     _overlaySamplingMethod = vc::Sampling::Nearest;
     _compositeEnabled = vc3d::settings::volume_overlay::COMPOSITE_ENABLED_DEFAULT;
@@ -370,6 +362,7 @@ void VolumeOverlayController::clearVolumePkg()
     _compositeLayersBehind = vc3d::settings::volume_overlay::COMPOSITE_LAYERS_BEHIND_DEFAULT;
     setOpacity(_overlayOpacity);
     setWindowBounds(_overlayWindowLow, _overlayWindowHigh);
+    setIntensityAsAlpha(_overlayIntensityAsAlpha);
     setMaxDisplayedResolution(_overlayMaxDisplayedResolution);
     setSamplingMethod(_overlaySamplingMethod);
     setComposite(currentCompositeSettings());
@@ -394,9 +387,10 @@ void VolumeOverlayController::refreshVolumeOptions()
         const std::string baseVolumeId = primary
             ? primary->currentVolumeId()
             : std::string{};
+        const auto volumeSuffixes = vc3d::volumeDisplaySuffixes(*_volumePkg);
         for (const auto& id : vc3d::orderedDisplayVolumeIds(*_volumePkg)) {
             if (!baseVolumeId.empty() &&
-                !vc3d::opendata::overlayCoordinatesCompatible(*_volumePkg, baseVolumeId, id))
+                !_volumePkg->overlayCompatible(baseVolumeId, id))
                 continue;
             std::shared_ptr<Volume> volume;
             try {
@@ -406,9 +400,11 @@ void VolumeOverlayController::refreshVolumeOptions()
             }
 
             const QString idStr = QString::fromStdString(id);
-            const QString label = vc3d::volumeDisplayLabel(*_volumePkg, id, overlayVolumeLabel(volume, idStr));
+            const QString label = vc3d::volumeDisplayLabel(*_volumePkg, id,
+                overlayVolumeLabel(volume, idStr), volumeSuffixes.value(idStr));
             const int row = _ui.volumeSelect->count();
             _ui.volumeSelect->addItem(label, QVariant(idStr));
+            _ui.volumeSelect->setItemData(row, vc3d::volumeDisplayPath(*_volumePkg, id), Qt::ToolTipRole);
             if (!_overlayVolumeId.empty() && _overlayVolumeId == id) {
                 indexToSelect = row;
             }
@@ -416,6 +412,7 @@ void VolumeOverlayController::refreshVolumeOptions()
     }
 
     _ui.volumeSelect->setCurrentIndex(indexToSelect);
+    vc3d::refreshVolumeComboTooltip(_ui.volumeSelect);
     if (indexToSelect == 0 && !_overlayVolumeId.empty()) {
         _overlayVolumeId.clear();
     }
@@ -573,10 +570,10 @@ void VolumeOverlayController::connectUiSignals()
             this, [this](int value) { handleOpacityChanged(value); }));
     }
 
-    if (_ui.thresholdSpin) {
+    if (_ui.intensityAsAlphaCheck) {
         _connections.push_back(QObject::connect(
-            _ui.thresholdSpin, qOverload<int>(&QSpinBox::valueChanged),
-            this, [this](int value) { handleThresholdChanged(value); }));
+            _ui.intensityAsAlphaCheck, &QCheckBox::toggled,
+            this, [this](bool checked) { handleIntensityAsAlphaChanged(checked); }));
     }
 
     if (_ui.maxDisplayedResolutionSpin) {
@@ -624,8 +621,7 @@ void VolumeOverlayController::populateColormapOptions()
         return;
     }
 
-    const auto& entries = volume_viewer_cmaps::entries(
-        volume_viewer_cmaps::EntryScope::OverlayCompatible);
+    const auto& entries = vc::entries(vc::EntryScope::OverlayCompatible);
     const QSignalBlocker blocker(_ui.colormapSelect);
     _ui.colormapSelect->clear();
     _ui.colormapSelect->addItem(tr("Grayscale"), QVariant(QString()));
@@ -635,7 +631,8 @@ void VolumeOverlayController::populateColormapOptions()
 
     for (const auto& entry : entries) {
         const int row = _ui.colormapSelect->count();
-        _ui.colormapSelect->addItem(entry.label, QVariant(QString::fromStdString(entry.id)));
+        _ui.colormapSelect->addItem(QString::fromStdString(entry.label),
+                                    QVariant(QString::fromStdString(entry.id)));
         if (entry.id == _overlayColormapName) {
             indexToSelect = row;
             found = true;
@@ -661,9 +658,9 @@ void VolumeOverlayController::applyOverlayVolume()
             ? primary->currentVolumeId()
             : std::string{};
         if (!baseVolumeId.empty() &&
-            !vc3d::opendata::overlayCoordinatesCompatible(*_volumePkg, baseVolumeId, _overlayVolumeId)) {
+            !_volumePkg->overlayCompatible(baseVolumeId, _overlayVolumeId)) {
             emit requestStatusMessage(
-                tr("Overlay rejected: volume coordinate spaces do not match."), 5000);
+                tr("Overlay rejected: the catalog places it in another frame."), 5000);
             _overlayVolumeId.clear();
             if (_ui.volumeSelect) {
                 const QSignalBlocker blocker(_ui.volumeSelect);
@@ -706,8 +703,8 @@ void VolumeOverlayController::updateUiEnabled()
     if (_ui.opacitySpin) {
         _ui.opacitySpin->setEnabled(hasOverlay);
     }
-    if (_ui.thresholdSpin) {
-        _ui.thresholdSpin->setEnabled(hasOverlay);
+    if (_ui.intensityAsAlphaCheck) {
+        _ui.intensityAsAlphaCheck->setEnabled(hasOverlay);
     }
     if (_ui.maxDisplayedResolutionSpin) {
         _ui.maxDisplayedResolutionSpin->setEnabled(hasOverlay);
@@ -745,11 +742,6 @@ void VolumeOverlayController::syncWindowFromManager(float low, float high)
     const float minHigh = std::min(_overlayWindowLow + 1.0f, 255.0f);
     _overlayWindowHigh = std::clamp(high, minHigh, 255.0f);
 
-    if (_ui.thresholdSpin) {
-        const QSignalBlocker blocker(_ui.thresholdSpin);
-        _ui.thresholdSpin->setValue(spinValueFromWindow(_overlayWindowLow));
-    }
-
     for (auto* manager : _viewerManagers) {
         if (std::abs(manager->overlayWindowLow() - _overlayWindowLow) > 1e-6f ||
             std::abs(manager->overlayWindowHigh() - _overlayWindowHigh) > 1e-6f)
@@ -771,6 +763,7 @@ void VolumeOverlayController::loadState()
     _overlayWindowLow = 0.0f;
     _overlayWindowHigh = 255.0f;
     _overlayColormapName = defaultOverlayColormap();
+    _overlayIntensityAsAlpha = false;
     _overlaySamplingMethod = vc::Sampling::Nearest;
     _overlayMaxDisplayedResolution = vc3d::settings::volume_overlay::MAX_DISPLAYED_RESOLUTION_DEFAULT;
     _compositeEnabled = vc3d::settings::volume_overlay::COMPOSITE_ENABLED_DEFAULT;
@@ -800,14 +793,8 @@ void VolumeOverlayController::loadState()
     _overlayOpacity = std::clamp(settings.value(volume_overlay::OPACITY, _overlayOpacity).toFloat(), 0.0f, 1.0f);
     _overlayOpacityBeforeToggle = _overlayOpacity;
 
-    const QVariant storedWindowLow = settings.value(volume_overlay::WINDOW_LOW);
-    if (storedWindowLow.isValid()) {
-        _overlayWindowLow = std::clamp(storedWindowLow.toFloat(), 0.0f, 255.0f);
-    } else {
-        // Fall back to legacy threshold if present.
-        const float legacyThreshold = std::max(0.0f, settings.value(volume_overlay::THRESHOLD, _overlayWindowLow).toFloat());
-        _overlayWindowLow = std::clamp(legacyThreshold, 0.0f, 255.0f);
-    }
+    _overlayWindowLow = std::clamp(
+        settings.value(volume_overlay::WINDOW_LOW, _overlayWindowLow).toFloat(), 0.0f, 255.0f);
 
     const QVariant storedWindowHigh = settings.value(volume_overlay::WINDOW_HIGH);
     if (storedWindowHigh.isValid()) {
@@ -824,6 +811,8 @@ void VolumeOverlayController::loadState()
         _overlayColormapName =
             settings.value(volume_overlay::COLORMAP).toString().toStdString();
     }
+    _overlayIntensityAsAlpha =
+        settings.value(volume_overlay::INTENSITY_AS_ALPHA, false).toBool();
 
     _overlaySamplingMethod = samplingMethodFromName(
         settings.value(volume_overlay::SAMPLING_METHOD,
@@ -877,8 +866,8 @@ void VolumeOverlayController::saveState() const
     settings.setValue(volume_overlay::OPACITY, _overlayOpacity);
     settings.setValue(volume_overlay::WINDOW_LOW, _overlayWindowLow);
     settings.setValue(volume_overlay::WINDOW_HIGH, _overlayWindowHigh);
-    settings.setValue(volume_overlay::THRESHOLD, _overlayWindowLow); // legacy compatibility
     settings.setValue(volume_overlay::COLORMAP, QString::fromStdString(_overlayColormapName));
+    settings.setValue(volume_overlay::INTENSITY_AS_ALPHA, _overlayIntensityAsAlpha);
     settings.setValue(volume_overlay::SAMPLING_METHOD,
                       samplingMethodName(_overlaySamplingMethod));
     settings.setValue(volume_overlay::MAX_DISPLAYED_RESOLUTION, _overlayMaxDisplayedResolution);
@@ -967,12 +956,6 @@ void VolumeOverlayController::setSamplingMethod(vc::Sampling method)
         manager->setOverlaySamplingMethod(_overlaySamplingMethod);
 }
 
-void VolumeOverlayController::setThreshold(float value)
-{
-    const float clamped = std::clamp(value, 0.0f, 255.0f);
-    setWindowBounds(clamped, _overlayWindowHigh);
-}
-
 void VolumeOverlayController::setWindowBounds(float low, float high)
 {
     const float clampedLow = std::clamp(low, 0.0f, 255.0f);
@@ -984,14 +967,20 @@ void VolumeOverlayController::setWindowBounds(float low, float high)
     _overlayWindowLow = clampedLow;
     _overlayWindowHigh = clampedHigh;
 
-    if (_ui.thresholdSpin) {
-        const QSignalBlocker blocker(_ui.thresholdSpin);
-        _ui.thresholdSpin->setValue(spinValueFromWindow(_overlayWindowLow));
-    }
-
     const QScopedValueRollback<bool> broadcasting(_broadcastingWindow, true);
     for (auto* manager : _viewerManagers)
         manager->setOverlayWindow(_overlayWindowLow, _overlayWindowHigh);
+}
+
+void VolumeOverlayController::setIntensityAsAlpha(bool enabled)
+{
+    _overlayIntensityAsAlpha = enabled;
+    if (_ui.intensityAsAlphaCheck) {
+        const QSignalBlocker blocker(_ui.intensityAsAlphaCheck);
+        _ui.intensityAsAlphaCheck->setChecked(_overlayIntensityAsAlpha);
+    }
+    for (auto* manager : _viewerManagers)
+        manager->setOverlayIntensityAsAlpha(_overlayIntensityAsAlpha);
 }
 
 void VolumeOverlayController::setMaxDisplayedResolution(int value)
@@ -1196,9 +1185,9 @@ void VolumeOverlayController::handleSamplingMethodChanged(int index)
     }
 }
 
-void VolumeOverlayController::handleThresholdChanged(int value)
+void VolumeOverlayController::handleIntensityAsAlphaChanged(bool enabled)
 {
     Update update;
-    update.threshold = windowValueFromSpin(value);
+    update.intensityAsAlpha = enabled;
     apply(update);
 }

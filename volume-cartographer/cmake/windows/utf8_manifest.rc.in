@@ -1,0 +1,4 @@
+// Copied by cmake/WindowsUtf8Manifest.cmake next to vc_utf8.manifest: the
+// application manifest (CREATEPROCESS_MANIFEST_RESOURCE_ID, RT_MANIFEST). It
+// takes the place of the MinGW toolchain's default-manifest.o.
+1 24 "vc_utf8.manifest"

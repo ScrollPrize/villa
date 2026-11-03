@@ -5,7 +5,9 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <optional>
+#include <span>
 
 namespace vc::render {
 
@@ -21,6 +23,12 @@ public:
     ChunkRequestSelectionGate& operator=(const ChunkRequestSelectionGate&) = delete;
 
     void publish(const std::function<void()>& update);
+    // Acquire source prerequisites before freezing task selection. Never wait
+    // for a source mutex while holding the global selection gate. Callbacks
+    // already own these locks and must not acquire additional source locks.
+    void publish(std::mutex& prerequisite, const std::function<void()>& update);
+    void publish(std::span<std::mutex* const> prerequisites,
+                 const std::function<void()>& update);
 
 private:
     friend class ChunkRequestScheduler;
@@ -30,6 +38,8 @@ private:
 
 struct ChunkWorkPriority {
     bool interactive = false;
+    // Interactive computation without a viewport; alternates with GUI work.
+    bool foreground = false;
     // Maintenance shares this scheduler and its workers, but is selected only
     // after both interactive and ordinary background queues are empty.
     bool maintenance = false;

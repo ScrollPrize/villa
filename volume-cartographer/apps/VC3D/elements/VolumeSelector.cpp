@@ -1,10 +1,9 @@
 #include "elements/VolumeSelector.hpp"
+#include "VolumePathLabels.hpp"
+#include "VolumeComboTooltip.hpp"
 
 #include <QAbstractItemView>
 #include <QHBoxLayout>
-#include <QFileDialog>
-#include <QFileInfo>
-#include <QDir>
 
 VolumeSelector::VolumeSelector(QWidget* parent)
     : QWidget(parent)
@@ -14,14 +13,10 @@ VolumeSelector::VolumeSelector(QWidget* parent)
 
     _label = new QLabel(tr("Volume:"), this);
     _combo = new QComboBox(this);
-    _browseButton = new QToolButton(this);
-    _browseButton->setText(QStringLiteral("…"));
-    _browseButton->setToolTip(tr("Browse for a volume path"));
-    _browseButton->setVisible(false);
+    vc3d::refreshVolumeComboTooltip(_combo);
 
     layout->addWidget(_label);
     layout->addWidget(_combo, 1);
-    layout->addWidget(_browseButton);
 
     // Allow the selector to shrink arbitrarily; long items should elide instead of enforcing a wide minimum.
     setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
@@ -35,54 +30,6 @@ VolumeSelector::VolumeSelector(QWidget* parent)
     if (auto* v = _combo->view()) {
         v->setTextElideMode(Qt::ElideRight);
     }
-
-    connect(_browseButton, &QToolButton::clicked, this, [this]() {
-        if (!_combo) {
-            return;
-        }
-
-        QString title = _browseDialogTitle;
-        if (title.isEmpty()) {
-            title = tr("Select volume path");
-        }
-
-        QString startPath = selectedVolumePath();
-        if (startPath.isEmpty()) {
-            startPath = QDir::homePath();
-        }
-
-        QString pickedPath;
-        if (_browseMode == BrowseMode::File) {
-            pickedPath = QFileDialog::getOpenFileName(this, title, startPath);
-        } else {
-            pickedPath = QFileDialog::getExistingDirectory(this, title, startPath);
-        }
-
-        if (pickedPath.isEmpty()) {
-            return;
-        }
-
-        const QString cleanedPath = QDir::cleanPath(pickedPath);
-        int existingIndex = -1;
-        for (int i = 0; i < _combo->count(); ++i) {
-            if (_combo->itemData(i, Qt::UserRole).toString() == cleanedPath) {
-                existingIndex = i;
-                break;
-            }
-        }
-
-        if (existingIndex >= 0) {
-            _combo->setCurrentIndex(existingIndex);
-            return;
-        }
-
-        const QFileInfo info(cleanedPath);
-        const QString label = info.fileName().isEmpty() ? cleanedPath : info.fileName();
-        const int row = _combo->count();
-        _combo->addItem(label, cleanedPath);
-        _combo->setItemData(row, QString(), Qt::UserRole + 1);
-        _combo->setCurrentIndex(row);
-    });
 }
 
 void VolumeSelector::setLabelText(const QString& text)
@@ -99,34 +46,6 @@ void VolumeSelector::setLabelVisible(bool visible)
     }
 }
 
-void VolumeSelector::setAllowNone(bool allow, const QString& label)
-{
-    _allowNone = allow;
-    if (!label.isEmpty()) {
-        _noneLabel = label;
-    } else if (!_allowNone) {
-        _noneLabel.clear();
-    }
-}
-
-void VolumeSelector::setBrowseEnabled(bool enabled)
-{
-    _browseEnabled = enabled;
-    if (_browseButton) {
-        _browseButton->setVisible(enabled);
-    }
-}
-
-void VolumeSelector::setBrowseDialogTitle(const QString& title)
-{
-    _browseDialogTitle = title;
-}
-
-void VolumeSelector::setBrowseMode(BrowseMode mode)
-{
-    _browseMode = mode;
-}
-
 void VolumeSelector::setVolumes(const QVector<VolumeOption>& volumes, const QString& defaultVolumeId)
 {
     if (!_combo) {
@@ -136,37 +55,32 @@ void VolumeSelector::setVolumes(const QVector<VolumeOption>& volumes, const QStr
     _combo->clear();
 
     int defaultIndex = -1;
-    if (_allowNone) {
-        const QString label = _noneLabel.isEmpty() ? tr("None") : _noneLabel;
-        _combo->addItem(label, QVariant());
-        _combo->setItemData(0, QString(), Qt::UserRole + 1);
-        if (defaultVolumeId.isEmpty()) {
-            defaultIndex = 0;
-        }
-    }
-
+    QStringList paths;
+    for (const auto& opt : volumes) paths.push_back(opt.path);
+    const auto suffixes = vc3d::distinguishingVolumePaths(paths);
     for (int i = 0; i < volumes.size(); ++i) {
         const auto& opt = volumes[i];
-        const QString label = opt.name.isEmpty()
+        QString label = opt.name.isEmpty()
             ? opt.id
             : tr("%1 (%2)").arg(opt.name, opt.id);
+        if (suffixes[i].contains('/'))
+            label += QStringLiteral(" [%1]").arg(suffixes[i]);
         const int row = _combo->count();
         _combo->addItem(label, opt.path);
         _combo->setItemData(row, opt.id, Qt::UserRole + 1);
+        _combo->setItemData(row, vc3d::volumePathForDisplay(opt.path), Qt::ToolTipRole);
         if (defaultIndex == -1 && !defaultVolumeId.isEmpty() && opt.id == defaultVolumeId) {
             defaultIndex = row;
         }
     }
 
     if (_combo->count() > 0) {
-        if (defaultIndex < 0 && _allowNone) {
-            defaultIndex = 0;
-        }
         _combo->setCurrentIndex(defaultIndex >= 0 ? defaultIndex : 0);
         _combo->setEnabled(true);
     } else {
         _combo->setEnabled(false);
     }
+    vc3d::refreshVolumeComboTooltip(_combo);
 }
 
 QString VolumeSelector::selectedVolumeId() const

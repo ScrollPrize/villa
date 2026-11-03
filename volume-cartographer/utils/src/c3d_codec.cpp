@@ -17,12 +17,6 @@ namespace utils {
 static constexpr std::size_t kC3dChunkBytes =
     static_cast<std::size_t>(C3D_CHUNK_SIDE) * C3D_CHUNK_SIDE * C3D_CHUNK_SIDE;
 
-bool is_c3d_compressed(std::span<const std::byte> data) noexcept
-{
-    return c3d_is_chunk(
-        reinterpret_cast<const uint8_t*>(data.data()), data.size());
-}
-
 namespace {
 // C11 aligned_alloc is missing from the Windows UCRT; _aligned_malloc is the
 // equivalent but requires _aligned_free (plain free() is undefined on it).
@@ -114,9 +108,8 @@ std::vector<std::byte> c3d_encode(std::span<const std::byte> raw,
     out.resize(n);
     // c3d_chunk_encode_max_size is ~16 MiB but typical compressed payloads
     // are 200 KiB-2 MiB.  resize() alone keeps the full capacity around,
-    // so callers that retain many encoded chunks (e.g. vc_zarr_recompress
-    // accumulating 4096 chunks per shard) were paying 16 MiB × N of dead
-    // heap per shard.  Release the slack.
+    // so callers that retain many encoded chunks were paying 16 MiB × N of
+    // dead heap.  Release the slack.
     out.shrink_to_fit();
     return out;
 }

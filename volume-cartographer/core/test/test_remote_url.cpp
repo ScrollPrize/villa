@@ -136,6 +136,7 @@ TEST_CASE("remote object paths are joined before an unchanged query")
           "https://example.test/source.zarr/metadata.json");
 }
 
+
 TEST_CASE("fragment-free remote volume specs retain existing resolution")
 {
     const std::string input = "https://example.test/source.zarr?token=x/";

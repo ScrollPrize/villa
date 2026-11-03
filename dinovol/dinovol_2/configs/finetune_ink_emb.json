@@ -38,7 +38,6 @@
       8
     ],
     "embedding_type": "default",
-    "deeper_embed_patch_chunk_size": null,
     "deeper_embed_batch_chunk_size": 1,
     "depth": 24,
     "num_heads": 16,

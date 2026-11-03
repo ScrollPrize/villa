@@ -84,7 +84,7 @@ Less than a year later, in December 2023, they succeeded. Finally, after 275 yea
 
 <div className="mb-4">
   <a target="_blank" href="/img/grandprize/text_bcb-smaller.webp"><img src="/img/grandprize/text_bcb-smaller.webp" className="w-[100%]" alt="Recovered Greek text from PHerc. Paris. 4 (Institut de France), unseen for 2,000 years."/></a>
-  <figcaption className="mt-[-6px]">Text from PHerc.Paris. 4 (Institut de France), unseen for 2,000 years. Roughly 95% of the scroll remains to be read.</figcaption>
+  <figcaption className="mt-[-6px]">Text from PHerc. Paris. 4 (Institut de France), unseen for 2,000 years. Roughly 95% of the scroll remains to be read.</figcaption>
 </div>
 
 The thoughts of our ancestors, locked in mud and ash for 2000 years, hidden in darkness — now, with the light of a worldwide effort shining upon them, finally seen again.

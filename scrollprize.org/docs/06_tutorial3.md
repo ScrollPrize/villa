@@ -211,7 +211,7 @@ make install
 
 Now let's gather our scroll data and setup our folders...
 
-We're going to start with Scroll 1 (PHerc. Paris 4) as this is the scroll that the 2023 Grand Prize segments were from, and is also the easiest of the current scrolls to segment. VC requires all of the folders listed under the PHercParis4.volpkg, in addition to the config.json and meta.json files.
+We're going to start with Scroll 1 (PHerc. Paris. 4) as this is the scroll that the 2023 Grand Prize segments were from, and is also the easiest of the current scrolls to segment. VC requires all of the folders listed under the PHercParis4.volpkg, in addition to the config.json and meta.json files.
 
 
 This is the recommended structure for the full_scrolls folder (with a full example given for Scroll1):
@@ -258,7 +258,7 @@ rclone copy :http:/full-scrolls/Scroll1/PHercParis4.volpkg/volumes/2023020518073
 If you wish to begin with a smaller portion of Scroll 1, rather than the entire scroll, you can download 1cm of scan data from the center using:
 
 ```bash
-for i in `seq 6000 7250`; do wget http://dl.ash2txt.org/full-scrolls/Scroll1/PHercParis4.volpkg/volumes/20230205180739/0\$i.tif; done
+for i in `seq 6000 7250`; do wget http://dl.ash2txt.org/full-scrolls/Scroll1/PHercParis4.volpkg/volumes/20230205180739/0$i.tif; done
 ```
 
 Be sure to have the config.json file at the root of the `.volpkg` directory, and the meta.json file in the `volumes` directory so that VC can work with it.

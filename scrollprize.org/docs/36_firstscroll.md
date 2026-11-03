@@ -45,7 +45,7 @@ This announcement is from June 25th, 2026. See [Prizes](prizes) for what is open
 
 <div className="opacity-60 mb-8 italic">June 25th, 2026</div>
 
-**Read the preprint:** <a href="/pdf/main.pdf" target="_blank" rel="noopener"><em>Complete virtual unwrapping and reading of a rolled Herculaneum papyrus</em> (PDF)</a> and on <a href="https://arxiv.org/abs/2606.29085" target="_blank" rel="noopener">arXiv</a>. The data is openly available at [scrollprize.org/data](/data), and the code on [GitHub](https://github.com/ScrollPrize/villa).
+**Read the preprint:** <a href="/pdf/main-v2.pdf" target="_blank" rel="noopener"><em>Complete virtual unwrapping and reading of a rolled Herculaneum papyrus</em> (PDF)</a> and on <a href="https://arxiv.org/abs/2606.29085" target="_blank" rel="noopener">arXiv</a>. The data is openly available at [scrollprize.org/data](/data), and the code on [GitHub](https://github.com/ScrollPrize/villa).
 
 For almost 2,000 years, the carbonized library of Herculaneum has kept a cruel bargain: its scrolls survived the eruption of Mount Vesuvius, but only by becoming too fragile to open. To read one was to destroy it. Hundreds of rolls have therefore remained sealed, their contents preserved yet unreachable.
 
@@ -94,20 +94,20 @@ Because the papyrus is damaged, the readings are fragmentary, with gaps where th
 
 <div className="border-l-4 border-solid border-0 pl-4 mb-4 italic border-l-[var(--ifm-color-primary)]">“…such being the goods for us, even from the opposite evils there will be neither anything good — let alone beautiful — nor anything bad — let alone ugly — nor happiness…”</div>
 
-<div className="opacity-60 italic mb-4 text-sm">Translated from the Greek; the full column-by-column transcription is in the <a href="/pdf/main.pdf" target="_blank" rel="noopener">preprint</a>.</div>
+<div className="opacity-60 italic mb-4 text-sm">Translated from the Greek; the full column-by-column transcription is in the <a href="/pdf/main-v2.pdf" target="_blank" rel="noopener">preprint</a>.</div>
 
-### PHerc. Paris 4 — ink made visible by higher resolution
+### PHerc. Paris. 4 — ink made visible by higher resolution
 
-In a second scroll — **PHerc. Paris 4, the scroll the Vesuvius Challenge community knows as Scroll 1** — a higher-resolution imaging technique makes the ink **directly visible inside the scroll itself**, in the three-dimensional X-ray data, for the first time. Segmented in 3D and projected back onto the unwrapped page, that ink matches the text read in the 2023 Grand Prize **one-to-one** — an independent confirmation, from better data, that the reading is real.
+In a second scroll — **PHerc. Paris. 4, the scroll the Vesuvius Challenge community knows as Scroll 1** — a higher-resolution imaging technique makes the ink **directly visible inside the scroll itself**, in the three-dimensional X-ray data, for the first time. Segmented in 3D and projected back onto the unwrapped page, that ink matches the text read in the 2023 Grand Prize **one-to-one** — an independent confirmation, from better data, that the reading is real.
 
 <figure className="">
-  <img src="/img/firstscroll/fig2.webp" alt="Higher-resolution cross-section of PHerc. Paris 4 showing ink directly visible on the papyrus surface, with the ink segmented in three dimensions." />
-  <figcaption className="mt-0">Ink made visible by higher resolution in PHerc. Paris 4 (Scroll 1). In a cross-section of the X-ray scan, the ink sits directly on the papyrus surface (left); it can then be segmented in three dimensions (red) and projected onto the unwrapped page.</figcaption>
+  <img src="/img/firstscroll/fig2.webp" alt="Higher-resolution cross-section of PHerc. Paris. 4 showing ink directly visible on the papyrus surface, with the ink segmented in three dimensions." />
+  <figcaption className="mt-0">Ink made visible by higher resolution in PHerc. Paris. 4 (Scroll 1). In a cross-section of the X-ray scan, the ink sits directly on the papyrus surface (left); it can then be segmented in three dimensions (red) and projected onto the unwrapped page.</figcaption>
 </figure>
 
 <figure className="">
-  <img src="/img/firstscroll/fig3.webp" alt="PHerc. Paris 4: the 2023 Grand Prize reading compared with the 2024 high-resolution synchrotron result, showing markedly clearer letters." />
-  <figcaption className="mt-0">PHerc. Paris 4: the 2023 Vesuvius Challenge Grand Prize reading (top) and the new 3D ink segmentation (bottom) — the same text, recovered one-to-one from better data.</figcaption>
+  <img src="/img/firstscroll/fig3.webp" alt="PHerc. Paris. 4: the 2023 Grand Prize reading compared with the 2024 high-resolution synchrotron result, showing markedly clearer letters." />
+  <figcaption className="mt-0">PHerc. Paris. 4: the 2023 Vesuvius Challenge Grand Prize reading (top) and the new 3D ink segmentation (bottom) — the same text, recovered one-to-one from better data.</figcaption>
 </figure>
 
 ### PHerc. 139 — a title, and an author
@@ -145,7 +145,7 @@ PHerc. 1667 is one scroll. Hundreds more remain sealed — an entire library of 
 
 If you want to help read the rest of the library:
 
-- **Read the science:** the <a href="/pdf/main.pdf" target="_blank" rel="noopener">preprint (PDF)</a>, also on  <a href="https://arxiv.org/abs/2606.29085" target="_blank" rel="noopener">arXiv</a>.
+- **Read the science:** the <a href="/pdf/main-v2.pdf" target="_blank" rel="noopener">preprint (PDF)</a>, also on  <a href="https://arxiv.org/abs/2606.29085" target="_blank" rel="noopener">arXiv</a>.
 - **Get the data and code:** [scrollprize.org/data](/data) and [GitHub](https://github.com/ScrollPrize/villa).
 - **Join the effort:** [get started](/get_started) and become part of the community reading the scrolls.
 

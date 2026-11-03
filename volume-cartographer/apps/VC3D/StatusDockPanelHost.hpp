@@ -26,6 +26,9 @@ public:
 
     QWidget* takeBarWidget();
     void addDock(QDockWidget* dock);
+    // Expands the dock's panel (or raises it when detached), restoring its bar
+    // button first if the user closed it.
+    void showDock(QDockWidget* dock);
 
 protected:
     bool eventFilter(QObject* watched, QEvent* event) override;

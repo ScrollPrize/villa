@@ -53,6 +53,28 @@ from dinovol_2.augmentation.transforms.local import (
 # =============================================================================
 ENABLE_BLANK_RECTANGLE = False
 
+# DINO-style view augmentation: random resized crops (done by the dataset), flips,
+# right-angle rotations and axis transposes (so no axis keeps a fixed orientation),
+# and brightness/contrast jitter as the grayscale counterpart of colour jitter.
+_DINO_TRANSFORM_TYPES = (
+    MirrorTransform,
+    Rot90Transform,
+    TransposeAxesTransform,
+    ContrastTransform,
+    MultiplicativeBrightnessTransform,
+    BrightnessAdditiveTransform,
+)
+
+
+def _is_dino_transform(transform) -> bool:
+    inner = getattr(transform, "transform", None)
+    if inner is not None:
+        return _is_dino_transform(inner)
+    children = getattr(transform, "list_of_transforms", None)
+    if children:
+        return all(_is_dino_transform(child) for child in children)
+    return isinstance(transform, _DINO_TRANSFORM_TYPES)
+
 
 def create_training_transforms(
     patch_size: Tuple[int, ...],
@@ -62,6 +84,8 @@ def create_training_transforms(
     allowed_rotation_axes: Optional[List[int]] = None,
     skeleton_targets: Optional[List[str]] = None,
     skeleton_ignore_values: Optional[Dict[str, int]] = None,
+    gaussian_blur: bool = True,
+    dino_only: bool = False,
 ) -> ComposeTransforms:
     """
     Create the training augmentation pipeline.
@@ -83,6 +107,12 @@ def create_training_transforms(
         List of target names that need skeleton/medial surface transform.
     skeleton_ignore_values : Optional[Dict[str, int]]
         Ignore values for skeleton targets.
+    gaussian_blur : bool
+        If False, the Gaussian blur option is left out.
+    dino_only : bool
+        If True, keep only DINO-style augmentation: flips, right-angle rotations,
+        axis transposes and brightness/contrast jitter (random resized crops are
+        applied by the dataset).
 
     Returns
     -------
@@ -246,7 +276,8 @@ def create_training_transforms(
     # =========================================================================
     common_transforms = []
 
-    if not only_spatial_and_intensity:
+    # gaussian_blur=False omits the blur transform below.
+    if not only_spatial_and_intensity and gaussian_blur:
         # Blur OR Median filter (one of)
         common_transforms.append(
             OneOfTransform([
@@ -270,6 +301,7 @@ def create_training_transforms(
             ])
         )
 
+    if not only_spatial_and_intensity:
         # Gaussian noise
         common_transforms.append(RandomTransform(
             GaussianNoiseTransform(
@@ -392,8 +424,13 @@ def create_training_transforms(
         if blank_rectangle is not None:
             transforms.append(blank_rectangle)
 
+        # Simulated scanner artifacts act along fixed tensor axes. They go before the
+        # rotations, flips and transposes so they follow the volume's axes (as real
+        # scan artifacts do) and are reoriented with the content, instead of always
+        # lying along the same axes of the augmented view.
+        scanner_artifacts = []
         if not only_spatial_and_intensity:
-            transforms.append(RandomTransform(
+            scanner_artifacts.append(RandomTransform(
                 SmearTransform(
                     shift=(5, 0),
                     alpha=0.2,
@@ -403,7 +440,7 @@ def create_training_transforms(
                 apply_probability=0.3
             ))
 
-        transforms.append(RandomTransform(
+        scanner_artifacts.append(RandomTransform(
             InhomogeneousSliceIlluminationTransform(
                 num_defects=(2, 5),
                 defect_width=(25, 50),
@@ -444,6 +481,7 @@ def create_training_transforms(
         ))
 
         transforms.extend(common_transforms)
+        transforms[:0] = scanner_artifacts
 
     # =========================================================================
     # SKELETON TRANSFORMS (if needed)
@@ -467,6 +505,9 @@ def create_training_transforms(
 
     if only_spatial_and_intensity:
         print("Only spatial and intensity augmentations enabled (only_spatial_and_intensity=True)")
+
+    if dino_only:
+        transforms = [transform for transform in transforms if _is_dino_transform(transform)]
 
     return ComposeTransforms(transforms)
 

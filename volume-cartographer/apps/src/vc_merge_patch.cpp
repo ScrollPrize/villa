@@ -25,8 +25,8 @@
 //         (rotating 8-slot ring, same convention as grow / brush /
 //         rotation edits) and then atomically swaps the new
 //         x/y/z/mask/meta into place. Cells outside the footprint are
-//         written verbatim; aux files in the parent dir (approval.tif,
-//         generations.tif, etc.) are preserved.
+//         written verbatim; aux files in the parent dir
+//         (generations.tif, etc.) are preserved.
 //
 // Hard-coded fitting params (kThresholds, kRidgeLambda, kAnchorBinSize)
 // match vc_merge_tifxyz; the per-run CLI knobs cover RANSAC, border
@@ -34,6 +34,7 @@
 
 #include "vc/core/util/Surface.hpp"
 #include "vc/core/util/QuadSurface.hpp"
+#include "vc/core/util/StoreToolOptions.hpp"
 #include "vc/core/util/OpenCvCompat.hpp"
 #include "vc/core/util/SurfacePatchIndex.hpp"
 
@@ -657,13 +658,14 @@ struct PMSurface {
     int                          valid{0};
 };
 
-PMSurface pmLoadSurface(const fs::path& p)
+// A tifxyz directory, or a stored surface UUID when `store` is given.
+PMSurface pmLoadSurface(const fs::path& p, StoreSurfaces* store)
 {
-    auto up = load_quad_from_tifxyz(p.string());
+    auto up = store ? store->load(p.string()) : load_quad_from_tifxyz(p.string());
     if (!up) throw std::runtime_error("failed to load surface: " + p.string());
     PMSurface s;
-    s.name = p.filename().string();
-    s.path = p;
+    s.name = store ? up->id : p.filename().string();
+    s.path = store ? fs::path() : p;
     s.qs = std::shared_ptr<QuadSurface>(up.release());
     const cv::Mat_<cv::Vec3f> pts = s.qs->rawPoints();
     s.H = pts.rows; s.W = pts.cols;
@@ -1055,7 +1057,7 @@ PMPatchStats pmApplyPatch(cv::Mat_<cv::Vec3f>& parent_points,
     return stats;
 }
 
-int pmRun(PMSurface parent, PMSurface child, const PMConfig& cfg)
+int pmRun(PMSurface parent, PMSurface child, const PMConfig& cfg, StoreSurfaces* store)
 {
     std::cout << "[0/6] parent + child ready\n";
     std::cout << "  parent: " << parent.name
@@ -1077,7 +1079,7 @@ int pmRun(PMSurface parent, PMSurface child, const PMConfig& cfg)
     SurfacePatchIndex patchIndex;
     {
         std::vector<SurfacePatchIndex::SurfacePtr> all = { child.qs, parent.qs };
-        patchIndex.rebuild(all);
+        patchIndex.rebuild(all, 0.0f, true);
     }
 
     std::cout << "[3/6] per-edge overlap + anchor selection (border-only)\n";
@@ -1162,26 +1164,36 @@ int pmRun(PMSurface parent, PMSurface child, const PMConfig& cfg)
     //      failures are logged via the QuadSurface logger but never block
     //      the actual save.
     //   2. save(force_overwrite=true) -- writes new x/y/z/meta to a
-    //      sibling temp dir, carries forward aux files (approval.tif,
-    //      generations.tif, etc.) into that temp dir, then atomically
+    //      sibling temp dir, carries forward aux files
+    //      (generations.tif, etc.) into that temp dir, then atomically
     //      swaps temp <-> parent (renameat2 RENAME_EXCHANGE on Linux,
     //      remove+rename fallback elsewhere). Cells we didn't touch
     //      retain their parent values bit-identical to the input.
     // invalidateMask + writeValidMask re-derive mask.tif from the patched
     // points so any newly valid cells are reflected.
-    std::cout << "[6/6] overwriting parent tifxyz at " << parent.path
-              << " (snapshot to " << parent.path.parent_path().string()
-              << "/backups/" << parent.name << "/)\n";
+    fs::path summary_path;
+    if (store) {
+        // A stored parent is edited in place; its revision history replaces backups.
+        std::cout << "[6/6] publishing the patched parent " << parent.name << "\n";
+        const auto revision = store->update(parent.name, *parent.qs);
+        store->objects().finish();
+        std::cout << "geometry_revision: " << revision << "\n";
+        summary_path = store->objects().session()->artifactDirectory(store->objects().attachment(), parent.name) / "merge_patch_summary.json";
+    } else {
+        std::cout << "[6/6] overwriting parent tifxyz at " << parent.path
+                  << " (snapshot to " << parent.path.parent_path().string()
+                  << "/backups/" << parent.name << "/)\n";
 
-    parent.qs->invalidateMask();
-    parent.qs->saveOverwrite();
-    parent.qs->writeValidMask();
-
-    const fs::path summary_path = parent.path / (parent.name + "_summary.json");
+        parent.qs->invalidateMask();
+        parent.qs->saveOverwrite();
+        parent.qs->writeValidMask();
+        summary_path = parent.path / (parent.name + "_summary.json");
+    }
+    const auto identity = [&](const PMSurface& s) { return store ? s.name : s.path.string(); };
     json summary = {
-        {"parent",       parent.path.string()},
-        {"child",        child.path.string()},
-        {"output",       parent.path.string()},
+        {"parent",       identity(parent)},
+        {"child",        identity(child)},
+        {"output",       identity(parent)},
         {"border_cells", cfg.border_cells},
         {"blend_cells",  cfg.blend_cells},
         {"anchors", {
@@ -1254,12 +1266,14 @@ int main(int argc, char** argv)
         "edits in VC3D)");
     desc.add_options()
         ("help,h", "print help")
+        ("explicit-roles", po::bool_switch(),
+            "Store mode: the first --surface is the parent and the second the child "
+            "(otherwise detected as with positional inputs)")
         ("parent,p", po::value<std::string>(),
             "Parent tifxyz directory (explicit override). When both "
             "--parent and --child are set, auto-detection is skipped. "
             "Overwritten in place: x/y/z/mask/meta are replaced atomically; "
-            "aux files in the parent dir (approval.tif, generations.tif, "
-            "...) are preserved.")
+            "aux files in the parent dir (generations.tif, ...) are preserved.")
         ("child,c", po::value<std::string>(),
             "Child tifxyz directory (explicit override). Its border should "
             "already overlap parent geometry; alignment refines the seam, "
@@ -1301,6 +1315,8 @@ int main(int argc, char** argv)
     po::options_description hidden;
     hidden.add_options()
         ("inputs", po::value<std::vector<std::string>>(), "tifxyz inputs (positional)");
+    StoreToolOptions::add(desc, "Object store holding both surfaces (two --surface); the parent is edited in place "
+                                "(its revision history replaces backups)", {.surfaces = true, .creates = false});
     po::positional_options_description pos;
     pos.add("inputs", -1);
     po::options_description all_opts;
@@ -1316,15 +1332,30 @@ int main(int argc, char** argv)
         return EXIT_FAILURE;
     }
 
+    std::optional<StoreToolOptions> store_options;
+    try {
+        store_options = StoreToolOptions::from(vm);
+    } catch (const std::exception& e) {
+        std::cerr << e.what() << "\n";
+        return EXIT_FAILURE;
+    }
     const bool has_parent = vm.count("parent") > 0;
     const bool has_child  = vm.count("child")  > 0;
     const std::vector<std::string> positional = vm.count("inputs")
         ? vm["inputs"].as<std::vector<std::string>>()
         : std::vector<std::string>();
-    const bool explicit_roles = has_parent && has_child;
+    if (store_options && (has_parent || has_child || !positional.empty() || store_options->surfaces.size() != 2)) {
+        std::cerr << "store mode takes two --surface (and --explicit-roles), no paths\n";
+        return EXIT_FAILURE;
+    }
+    if (!store_options && vm["explicit-roles"].as<bool>()) {
+        std::cerr << "--explicit-roles needs --store; give --parent and --child instead\n";
+        return EXIT_FAILURE;
+    }
+    const bool explicit_roles = store_options ? vm["explicit-roles"].as<bool>() : has_parent && has_child;
 
     if (vm.count("help") ||
-        (!explicit_roles && positional.size() != 2) ||
+        (!store_options && !explicit_roles && positional.size() != 2) ||
         (has_parent != has_child) ||
         (explicit_roles && !positional.empty()))
     {
@@ -1351,7 +1382,10 @@ int main(int argc, char** argv)
     cfg.idw_k             = vm["idw-k"].as<int>();
 
     fs::path path_a, path_b;
-    if (explicit_roles) {
+    if (store_options) {
+        path_a = store_options->surfaces[0];
+        path_b = store_options->surfaces[1];
+    } else if (explicit_roles) {
         path_a = vm["parent"].as<std::string>();
         path_b = vm["child"].as<std::string>();
     } else {
@@ -1360,15 +1394,19 @@ int main(int argc, char** argv)
     }
 
     try {
-        if (!fs::is_directory(path_a))
-            throw std::runtime_error("not a directory: " + path_a.string());
-        if (!fs::is_directory(path_b))
-            throw std::runtime_error("not a directory: " + path_b.string());
+        std::optional<StoreSurfaces> store;
+        if (store_options) store.emplace(store_options->store, "vc_merge_patch");
+        else {
+            if (!fs::is_directory(path_a))
+                throw std::runtime_error("not a directory: " + path_a.string());
+            if (!fs::is_directory(path_b))
+                throw std::runtime_error("not a directory: " + path_b.string());
+        }
 
         std::cout << "[0/6] loading " << path_a.filename().string()
                   << " and " << path_b.filename().string() << "\n";
-        PMSurface a = pmLoadSurface(path_a);
-        PMSurface b = pmLoadSurface(path_b);
+        PMSurface a = pmLoadSurface(path_a, store ? &*store : nullptr);
+        PMSurface b = pmLoadSurface(path_b, store ? &*store : nullptr);
 
         PMSurface parent_surf, child_surf;
         if (explicit_roles) {
@@ -1402,7 +1440,7 @@ int main(int argc, char** argv)
             }
         }
 
-        return pmRun(std::move(parent_surf), std::move(child_surf), cfg);
+        return pmRun(std::move(parent_surf), std::move(child_surf), cfg, store ? &*store : nullptr);
     } catch (const std::exception& e) {
         std::cerr << "vc_merge_patch failed: " << e.what() << "\n";
         return EXIT_FAILURE;

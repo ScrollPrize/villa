@@ -20,17 +20,17 @@
 #include <unordered_map>
 #include <vector>
 
-#include "vc/core/util/ScrollUmbilicus.hpp"
 
-#include "AnnotationFrame.hpp"
 #include "FiberMapGapField.hpp"
 #include "FiberMapKollesis.hpp"
 #include "FiberMapRebuildQueue.hpp"
 #include "FiberMapRuler.hpp"
 #include "FiberMapStaleness.hpp"
 #include "FiberNetworkLayout.hpp"
+#include "vc/core/util/Rect3D.hpp"
 #include "OpenDataVolumeOrientation.hpp"
 
+class CState;
 class LineAnnotationController;
 class QCheckBox;
 class QDockWidget;
@@ -71,7 +71,9 @@ public:
     void setRulerStyle(const FiberMapRulerStyle& style);
 
 signals:
-    void clicked(QPointF scenePos);
+    // A left click without a drag, with the keyboard modifiers held (Shift
+    // extends the selection to a second fiber).
+    void clicked(QPointF scenePos, Qt::KeyboardModifiers modifiers);
     void controlPointMenuRequested(QPointF scenePos, QPoint globalPos);
     // The view scale changed (wheel zoom); fitInView callers refresh
     // scale-dependent state themselves.
@@ -113,13 +115,15 @@ class FiberMapWorkspace : public QMainWindow
     Q_OBJECT
 
 public:
-    explicit FiberMapWorkspace(LineAnnotationController* controller,
-                               QWidget* parent = nullptr);
+    FiberMapWorkspace(CState* state, LineAnnotationController* controller,
+                      QWidget* parent = nullptr);
     // Shuts the rebuild queue down (pending dropped, in-flight publication
     // refused) and waits out the private worker pool; the worker owns its
     // own data, so the wait is for clean pool teardown, not for safety of
     // any shared state.
     ~FiberMapWorkspace() override;
+    // Bounds expressed in the annotation frame, not flattened map coordinates.
+    void setFocusBounds(std::optional<Rect3D> bounds);
 
 signals:
     void openFiberAtControlPointRequested(uint64_t fiberId, int controlPointIndex);
@@ -140,6 +144,9 @@ protected:
     void hideEvent(QHideEvent* event) override;
 
 private:
+    void updateFocusBounds();
+    std::optional<Rect3D> _focusBounds;
+    bool _focusBoundsDirty = false;
     // Scene-space copy of the placed fiber (y negated once, so scroll z reads
     // upward) alongside the two path items carrying its geometry.
     struct FiberEntry {
@@ -194,6 +201,18 @@ private:
     // this is how applyStaleVerdict() surfaces staleness *derived* from the
     // dependency comparison, which clears itself when its cause reverts.
     void showStale(const QString& reason);
+    // The status line composed from its current floor (stale reason, build
+    // summary with the selection, or resting prompt) with the operation
+    // message in front of it. Every write of the label goes through
+    // composeStatus() so no floor change can erase the message.
+    [[nodiscard]] QString composeStatus(const QString& floor) const;
+    void redrawStatus();
+    // The outcome of the last user-started operation (an auto-link refusal,
+    // its retained-control explanation, "choose Link again"). It stays on
+    // the line through staleness polling and the automatic rebuild's
+    // publication, until the next user action on the map.
+    void setOperationStatus(const QString& message);
+    void clearOperationStatus();
     // The latching form, for staleness asserted rather than derived — the
     // invariant-violation defenses. Nothing in the dependency sets can prove a
     // latched reason wrong, so it survives every comparison until the layout it
@@ -215,9 +234,6 @@ private:
     using StaleVerdict = vc3d::fiber_map::StaleVerdict;
     [[nodiscard]] vc3d::fiber_map::FiberMapDependencies currentDependencies() const;
     [[nodiscard]] vc3d::fiber_map::FiberMapDependencies layoutDependencies() const;
-    // The cached catalog manifest's version for a coordinate space
-    // (FiberMapDependencies::catalogManifestToken): a stat, no parse.
-    [[nodiscard]] QString catalogManifestTokenFor(const std::string& coordinateSpace) const;
     // Cheap enough to guard interaction — integer compares, a few volume metadata
     // reads, and stats of the umbilicus candidates. Mutates nothing.
     [[nodiscard]] StaleVerdict evaluateDependencies() const;
@@ -297,6 +313,40 @@ private:
     [[nodiscard]] QRectF framedRect() const;
     void applySceneRect();
     void setHighlightedFiber(uint64_t fiberId);
+    // The selection: at most two fibers, most recent last. A plain click
+    // selects one (or none); Shift+click keeps the last two clicked. Both
+    // paint as selected with their control dots; the network glow and the
+    // dock row follow the most recent (_highlightedFiber).
+    void setSelectedFibers(std::vector<uint64_t> fibers);
+    void drawControlPointDots(uint64_t fiberId);
+    void updateSelectionStatus();
+    // "Link <A> and <B>": the deferred three-phase trigger (see the plan in
+    // the header comment of startAutoLink).
+    void startAutoLink(uint64_t subjectId, uint64_t otherId, QPointF scenePos,
+                       const vc3d::fiber_map::FiberMapDependencies& menuDependencies);
+    // The shared marker rule for one link endpoint of the published layout:
+    // true when the control point has at least one pending link and every
+    // pending link on it is an unreviewed automatic link
+    // (line_annotation::autoPendingMarker): its markers take the automatic
+    // palette.
+    [[nodiscard]] bool endpointAutoPending(uint64_t fiberId, int controlIndex) const;
+    // The one look of a link endpoint, from the endpoint's AGGREGATED review
+    // state (every link at that control point): pending outranks approved
+    // for the palette (as the annotation views' marker precedence), the
+    // automatic palette follows endpointAutoPending. Every dot drawer uses it.
+    struct EndpointLook {
+        QColor fill;
+        QColor pen;
+        bool pending = false;
+        // The automatic palette: every pending link on the point is automatic.
+        bool automatic = false;
+        // Any automatic link on the point (a mixed point keeps the pending
+        // palette solid; without one the pre-existing looks are untouched).
+        bool anyAuto = false;
+        // Any adjacent link on the point: triangle instead of circle.
+        bool adjacent = false;
+    };
+    [[nodiscard]] std::optional<EndpointLook> endpointLook(uint64_t fiberId, int controlIndex) const;
     // The gap heat map (FiberMapGapField.hpp). The field is a pure function of
     // the published layout and the toolbar's settings: it is built on the
     // rebuild worker alongside the layout, with the settings captured at job
@@ -343,7 +393,7 @@ private:
     enum class FiberEmphasis { Plain, Network, Selected };
     void paintFiberEmphasis(FiberEntry& entry, FiberEmphasis emphasis);
     void clearControlPointDots();
-    void handleSceneClick(const QPointF& scenePos);
+    void handleSceneClick(const QPointF& scenePos, Qt::KeyboardModifiers modifiers);
     // Ctrl+right-click on the map: acts on the selected fiber, and only when
     // the click lands on it. "Go to control point" when a dot was hit, and
     // "Delete" always.
@@ -375,6 +425,7 @@ private:
 
     // QPointer: the controller is owned elsewhere and dies before this widget
     // during CWindow teardown; guards keep late signals harmless.
+    CState* _state;
     QPointer<LineAnnotationController> _controller;
     FiberMapView* _view = nullptr;
     QGraphicsScene* _scene = nullptr;
@@ -433,6 +484,14 @@ private:
     std::vector<QImage> _pendingGapTiles;
     bool _pendingGapTilesDark = false;
     vc3d::fiber_map::GlobalResult _layout;
+    // The umbilicus centres _layout was built with (a copy of the job's
+    // snapshot), for unrolledLineArclengths when a drawn point is mapped back
+    // to a source line position (the auto-link locator).
+    std::vector<cv::Vec3f> _layoutUmbilicusCenters;
+    // Per link endpoint, the review state aggregated from EVERY link of the
+    // snapshot (the layout keeps only the links it could place): what the
+    // dot drawers and endpointLook decide from.
+    std::map<vc3d::fiber_map::EndpointKey, vc3d::fiber_map::EndpointReview> _endpointReviews;
     // Memoized rebuild state: the cache, whether a verification failure
     // benched it, and the last build's input/output digests for Full
     // rebuild's check.
@@ -442,7 +501,6 @@ private:
     // worker of every rebuild (the lookup memoizes its one manifest parse
     // and locks internally; the job holds it by shared pointer so a
     // workspace torn down mid-flight cannot pull it from under the worker).
-    std::shared_ptr<vc3d::opendata::CatalogVolumeOrientationLookup> _catalogOrientation;
     bool _haveLastDigests = false;
     vc3d::fiber_map::ContentDigest _lastInputsDigest;
     vc3d::fiber_map::ContentDigest _lastOutputDigest;
@@ -470,6 +528,45 @@ private:
     // it stands rather than take a fresh snapshot to work out the message again.
     QString _emptyMessage;
     uint64_t _highlightedFiber = 0;
+    // The ordered selection (<= 2, back = most recent = _highlightedFiber).
+    std::vector<uint64_t> _selectedFibers;
+    // "Link A and B" in flight: the menu entry is disabled and a delete
+    // refuses, like _deleteInFlight the other way round.
+    bool _autoLinkInFlight = false;
+    // A "Link A and B" that had to save an open annotation of one of its
+    // fibers first (phase B moved the fiber generation, so the map it was
+    // clicked on is stale): the request waits for the automatic Update and
+    // runs again by itself from publishRebuild when the rebuilt map draws
+    // both fibers exactly as the click saw them; a rebuilt map that draws
+    // them differently asks for Link again instead, because the click
+    // would then name geometry that no longer exists. Dropped by any other
+    // user action on the map (a click, a tree row, a new Link, a delete, a
+    // layout clear); a pressed Update keeps it, it is the rebuild it waits
+    // for.
+    struct AutoLinkResume {
+        uint64_t subjectId = 0;
+        uint64_t otherId = 0;
+        QPointF scenePos;
+        vc3d::fiber_map::PlacedFiber subject;
+        vc3d::fiber_map::PlacedFiber other;
+    };
+    std::optional<AutoLinkResume> _autoLinkResume;
+    // Bumped by every cancellation: the queued callback a publication hands
+    // the request to carries the token it was queued under and starts
+    // nothing when the token moved (a click between the publication and
+    // the callback must cancel the resume, not only the waiting request).
+    uint64_t _autoLinkResumeToken = 0;
+    // True from the moment a publication hands the request to its queued
+    // callback until that callback runs: a cancellation in between must
+    // clear the promise on the status line exactly like one of a waiting
+    // request.
+    bool _autoLinkResumeQueued = false;
+    void cancelAutoLinkResume();
+    void resumeAutoLinkAfterPublish();
+    // Same drawn geometry: the runs (flags, points, arclengths) and the
+    // control-point positions the locator reads.
+    [[nodiscard]] static bool sameDrawnFiber(const vc3d::fiber_map::PlacedFiber& a,
+                                             const vc3d::fiber_map::PlacedFiber& b);
     // Fibers currently carrying the subtle network emphasis, so the next
     // selection change can restore exactly them.
     std::vector<uint64_t> _networkEmphasized;
@@ -501,10 +598,9 @@ private:
     // What the current layout was built from, and whether a change has been seen
     // since; a fresh workspace is stale until its first rebuild.
     uint64_t _layoutGeneration = 0;
-    vc3d::annotation::AnnotationFrame _layoutFrame;
+    QString _layoutAnnotationVolume;
     QString _layoutUmbilicusFingerprint;
-    QString _layoutCatalogVolume;
-    QString _layoutCatalogManifestToken;
+    QString _layoutCatalogOrientation;
     // Controller counters as of the build. Compared rather than observed, so that
     // this workspace existing costs annotation work nothing.
     uint64_t _layoutPackageGeneration = 0;
@@ -538,6 +634,8 @@ private:
     // froze into itself: showEvent() recomposes the suffix from the live
     // package, which can change while nothing is built.
     QString _restingReason;
+    // See setOperationStatus(). Empty when the line shows only its floor.
+    QString _operationStatus;
     QString _umbilicusStatusText;
     QString _umbilicusStatusFingerprint;
     bool _umbilicusStatusValid = false;

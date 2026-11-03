@@ -56,6 +56,11 @@ class BasicTransform(abc.ABC):
         # Check if this is unlabeled data
         is_unlabeled = data_dict.get('is_unlabeled', False)
 
+        # Keep a second-resolution image geometrically aligned without applying
+        # intensity/noise augmentation or drawing a second set of parameters.
+        if getattr(self, '_is_spatial', False) and data_dict.get('paired_spatial_image') is not None:
+            data_dict['paired_spatial_image'] = self._apply_to_image(data_dict['paired_spatial_image'], **params)
+
         # Special handling for known keys
         if data_dict.get('image') is not None:
             # Always transform images, even for unlabeled data
@@ -95,7 +100,7 @@ class BasicTransform(abc.ABC):
             known_keys = {'image', 'regression_target', 'segmentation', 'dist_map',
                           'geols_labels', 'keypoints', 'bbox', 'ignore_masks', 'is_unlabeled',
                           'regression_keys', 'vector_keys', 'crop_shape', 'patch_info', 'padding_mask',
-                          '_aug_perf'}
+                          '_aug_perf', 'paired_spatial_image'}
             # Also skip vector_keys since they're handled by specific transforms
             known_keys.update(vector_keys)
 

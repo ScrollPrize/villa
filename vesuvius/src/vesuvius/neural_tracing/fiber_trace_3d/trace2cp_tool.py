@@ -42,6 +42,7 @@ from vesuvius.neural_tracing.fiber_trace_3d.train import (
 )
 from vesuvius.neural_tracing.fiber_trace_2d.loader import _Trace2CpSegmentSource
 from vesuvius.neural_tracing.fiber_trace_2d.strip_geometry import control_point_line_index
+from vesuvius.neural_tracing.nets.output_lattice import IsotropicOutputLattice
 
 
 _EPS = 1.0e-12
@@ -1000,6 +1001,12 @@ class NativeTraceFieldCache:
             inference_scaledown_power=int(inference_scaledown_power),
         )
         self.inference_scaledown_power = int(inference_scaledown_power)
+        self.native_output_stride = int(
+            getattr(self.prediction_adapter, "native_output_stride", 1)
+        )
+        self.residual_inference_scaledown = IsotropicOutputLattice(
+            self.native_output_stride
+        ).residual_to(self.inference_scaledown_factor)
         self.inference_blur_sigma_voxels = float(inference_blur_sigma_voxels)
         if self.inference_blur_sigma_voxels < 0.0:
             raise ValueError("inference_blur_sigma_voxels must be >= 0")
@@ -1272,6 +1279,9 @@ class NativeTraceFieldCache:
             with self._measure("inference_decode_cache", sync=True):
                 products = self.prediction_adapter.product_tensors_from_output(model_output)
                 product_tensors: list[torch.Tensor] = []
+                expected_native_shape = IsotropicOutputLattice(
+                    self.native_output_stride
+                ).shape(self.patch_shape_zyx)
                 for product in self.prediction_adapter.output_products:
                     tensor = products.get(product.name)
                     if tensor is None:
@@ -1287,22 +1297,29 @@ class NativeTraceFieldCache:
                             "fiber 3D prediction adapter product tensors must have shape "
                             f"B,7,D,H,W; got {tuple(int(v) for v in tensor.shape)}"
                         )
+                    observed_shape = tuple(int(v) for v in tensor.shape[-3:])
+                    if observed_shape != expected_native_shape:
+                        raise ValueError(
+                            "fiber 3D prediction adapter product has incompatible native "
+                            f"shape={observed_shape}; native_output_stride="
+                            f"{self.native_output_stride} requires {expected_native_shape}"
+                        )
                     product_tensors.append(tensor)
-                if int(self.inference_scaledown_factor) > 1:
-                    factor = int(self.inference_scaledown_factor)
+                if int(self.residual_inference_scaledown) > 1:
+                    factor = int(self.residual_inference_scaledown)
                     product_tensors = [
                         _pyramid_downsample_3d(tensor, factor)
                         for tensor in product_tensors
                     ]
-                    valid_for_cache = (
-                        _all_valid_downsample_3d(
-                            valid_batch.to(dtype=torch.float32),
-                            factor,
-                        )
-                        >= 1.0
+                valid_for_cache = (
+                    _all_valid_downsample_3d(
+                        valid_batch.to(dtype=torch.float32),
+                        int(self.inference_scaledown_factor),
                     )
-                else:
-                    valid_for_cache = valid_batch
+                    >= 1.0
+                    if int(self.inference_scaledown_factor) > 1
+                    else valid_batch
+                )
                 if self.inference_blur_sigma_voxels > 0.0:
                     scaled_sigma = (
                         float(self.inference_blur_sigma_voxels)

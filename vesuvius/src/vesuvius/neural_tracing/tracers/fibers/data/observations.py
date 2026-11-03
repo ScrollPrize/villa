@@ -54,7 +54,7 @@ class ObservationBuilder:
         x = dict(fine=self.crop_images(items,vol,self.cfg.fine,pool),seed=stack('visible_seed'),
                  seed_mask=stack('visible_seed_mask'),seed_age=stack('visible_seed_age'),
                  seed_tangent=stack('visible_seed_tangent'))
-        x.update(path_geometry_inputs(items))
+        x.update(path_geometry_inputs(items, pool=getattr(self, 'geometry_pool', None)))
         # Recorded replay frames have unknown quality unless it was supplied;
         # do not count them as newly successful CT estimates.
         quality = [item.get('ct_frame_diagnostics', {}) for item in items]
@@ -240,7 +240,7 @@ class IdentityObservationBuilder(ObservationBuilder):
                  augment=False,neighbors=None):
         super().__init__(cfg)
         self.fibers,self.sampling,self.augment = fibers,sampling,augment
-        self.neighbors = neighbors  # neighboring annotations (AFV sources); None: no known neighbors
+        self.neighbors = neighbors  # neighboring annotations (fiber-store sources); None: no known neighbors
         self.lateral = deque(maxlen=sampling.lateral_memory)
 
     def apply_roll(self, item, *, any_heading_planned=False):
@@ -386,7 +386,7 @@ class IdentityObservationBuilder(ObservationBuilder):
     def bank_targets(self, items, decision_mask=None):
         """Foreign-path masks and coverage feedback; no contrastive point queries.
 
-        Without neighbors (Paris 4) every foreign mask is empty: no known neighbor, as at an isolated AFV location.
+        Without neighbors (Paris 4) every foreign mask is empty: no known neighbor, as at an isolated fiber-store location.
         """
         cfg, bank = self.cfg, self.neighbors
         selected = np.ones(len(items), bool) if decision_mask is None else np.asarray(decision_mask, dtype=bool)

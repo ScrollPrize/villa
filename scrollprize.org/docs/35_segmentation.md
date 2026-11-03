@@ -58,11 +58,13 @@ import TOCInline from '@theme/TOCInline';
 
 
 ### Installation Instructions
-Due to a complex set of dependencies, it is *highly* recommended to use the docker image. We host an up-to-date image on the [github container registry](https://github.com/ScrollPrize/villa/pkgs/container/villa%2Fvolume-cartographer) which can be pulled with a simple command :
+Due to a complex set of dependencies, it is *highly* recommended to use a prebuilt package: the downloads on the [releases page](https://github.com/ScrollPrize/villa/releases) (see [Installing VC3D](/tutorial_VC3D#installing-vc3d); on Linux a single AppImage contains VC3D and the `vc_*` command-line tools) or the docker image. We host an image on the [github container registry](https://github.com/ScrollPrize/villa/pkgs/container/villa%2Fvolume-cartographer) which can be pulled with a simple command :
 
 ```bash
 docker pull ghcr.io/scrollprize/villa/volume-cartographer:edge
 ```
+
+The `edge` and `main` image tags currently carry the build of 2026-05-13 (see [issue #1588](https://github.com/ScrollPrize/villa/issues/1588)); the `latest` release downloads are rebuilt from `main`.
 
 If you want to install vc3d from source, the easiest path is to look at the [Dockerfile](https://github.com/ScrollPrize/villa/blob/main/volume-cartographer/Dockerfile) (and the shared [install_build_deps.sh](https://github.com/ScrollPrize/villa/blob/main/volume-cartographer/scripts/install_build_deps.sh) it uses) and adapt for your environment. Building from source presently requires a *nix like environment for atomic rename support. If you are on Windows, either use the docker image or WSL. 
 

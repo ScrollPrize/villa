@@ -1,0 +1,10 @@
+# Generated benchmark reports.
+/benchmarks/results/
+/docs/benchmarks/
+**/benchmarks/**/*.json
+!benchmarks/fixtures/**/*.json
+
+# Local implementation plans.
+/plans/
+
+/build*/

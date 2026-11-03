@@ -72,6 +72,7 @@ from fit_session import (API_VERSION, EDITABLE_PCL_ROLES, FIT_INPUT_CATALOG,
                          SessionState, SpiralInputPaths, default_user_cache_dir,
                          input_source_enabled, pcl_input_enabled,
                          winding_inference_enabled, load_scroll_spec,
+                         scroll_spec_config_defaults,
                          parse_session_request, resolve_dataset_root,
                          validate_session_request)
 from checkpoint_migrations import tolerate_config
@@ -627,11 +628,12 @@ class ServiceState:
             while pending:
                 current = pending.pop()
                 document = json.loads(Path(current.content.json()['path']).read_text())
-                for branch in document.get('branches', []):
-                    peer = by_name.get(branch.get('branch_file'))
-                    if peer is not None and peer.id not in selected:
-                        selected.add(peer.id)
-                        pending.append(peer)
+                for key in ('branches', 'adjacent_branches'):
+                    for branch in document.get(key, []):
+                        peer = by_name.get(branch.get('branch_file'))
+                        if peer is not None and peer.id not in selected:
+                            selected.add(peer.id)
+                            pending.append(peer)
             siblings = tuple(r for r in desired if r.id in selected and r.id != input_id)
         key = (input_id, revision.number, tuple((r.id, r.number) for r in siblings))
         with self._input_content_artifact_lock:
@@ -834,7 +836,21 @@ class ServiceState:
     def configuration_catalog(self):
         # Descriptions are re-read per request, so edited text reaches a
         # client when it reconnects, without restarting the service.
-        return {**self._base(), **describe_catalog(self.config_catalog)}
+        catalog = {**self._base(), **describe_catalog(self.config_catalog)}
+        generic = self.config_catalog["defaults"]
+        scroll_defaults = scroll_spec_config_defaults(self.scroll_spec, generic)
+        if scroll_defaults:
+            # The panel seeds its form from these, so a winding count in
+            # spiral-scroll.json reaches interactive fits as it reaches the
+            # CLI. A preset still holding the generic value inherits it; one
+            # that chose its own value keeps it.
+            catalog["defaults"] = {**generic, **scroll_defaults}
+            catalog["presets"] = {
+                name: {**preset, **{
+                    key: value for key, value in scroll_defaults.items()
+                    if preset.get(key) == generic.get(key)}}
+                for name, preset in self.config_catalog["presets"].items()}
+        return catalog
 
     def dataset(self):
         return {**self._base(), **self.dataset_resolution.to_dict(),

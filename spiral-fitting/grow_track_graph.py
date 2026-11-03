@@ -2243,14 +2243,17 @@ def resample_grid(
     return out
 
 
-def finalize_coarse_grid(grid: np.ndarray) -> np.ndarray:
+def finalize_coarse_grid(
+    grid: np.ndarray, keep: np.ndarray | None = None
+) -> np.ndarray:
     """Post-resample tidy: erode one cell (boundary cells whose fine
-    support straddled the cleaned rim), then keep only the largest
-    connected component."""
+    support straddled the cleaned rim) unless a `keep` mask is given,
+    then keep only the largest connected component."""
     from scipy import ndimage
 
-    valid = grid[..., 0] >= 0
-    keep = ndimage.binary_erosion(valid, iterations=1)
+    if keep is None:
+        valid = grid[..., 0] >= 0
+        keep = ndimage.binary_erosion(valid, iterations=1)
     labels, count = ndimage.label(keep)
     if count > 1:
         sizes = np.bincount(labels.ravel())
@@ -2259,6 +2262,51 @@ def finalize_coarse_grid(grid: np.ndarray) -> np.ndarray:
     grid = grid.copy()
     grid[~keep] = -1.0
     return grid
+
+
+def support_coarse_mask(
+    grid: np.ndarray, fine_valid: np.ndarray, factor: float
+) -> np.ndarray:
+    """Alternative to the one-cell erosion of finalize_coarse_grid for a
+    `resample_grid(fine, factor)` output: a coarse quad survives only if
+    every fine vertex under its bilinear footprint is valid. Corners of
+    unsupported quads are dropped one at a time, cheapest first (least
+    adjacent supported area lost; ties by row, then column)."""
+    keep = grid[..., 0] >= 0
+    bounds = []
+    for n in fine_valid.shape:
+        # Same lattice and 1e-9 endpoint rule as resample_grid.
+        pos = np.arange(0, n - 1 + 1e-9, factor)
+        lo = np.floor(pos).astype(np.int64)
+        hi = np.where(pos - lo > 1e-9, np.minimum(lo + 1, n - 1), lo)
+        bounds.append((lo[:-1], hi[1:] + 1))
+    (r0, r1), (c0, c1) = bounds
+    holes = np.pad(~fine_valid, ((1, 0), (1, 0))).cumsum(0).cumsum(1)
+    supported = (
+        holes[r1[:, None], c1]
+        - holes[r0[:, None], c1]
+        - holes[r1[:, None], c0]
+        + holes[r0[:, None], c0]
+    ) == 0
+    xyz = np.asarray(grid, dtype=np.float64)
+    a, b = xyz[:-1, :-1], xyz[:-1, 1:]
+    c, d = xyz[1:, :-1], xyz[1:, 1:]
+    # Two-triangle quad area in mm² (only used to rank deletions).
+    area = 0.5 * (
+        np.linalg.norm(np.cross(c - a, b - a), axis=-1)
+        + np.linalg.norm(np.cross(b - d, c - d), axis=-1)
+    ) * (VOXEL_SIZE_UM**2 / 1e6)
+    while True:
+        quad = keep[:-1, :-1] & keep[1:, :-1] & keep[:-1, 1:] & keep[1:, 1:]
+        bad = quad & ~supported
+        if not bad.any():
+            return keep
+        lost = np.pad(np.where(quad & supported, area, 0.0), 1)
+        lost = lost[:-1, :-1] + lost[:-1, 1:] + lost[1:, :-1] + lost[1:, 1:]
+        bad = np.pad(bad, 1)
+        corner = bad[:-1, :-1] | bad[:-1, 1:] | bad[1:, :-1] | bad[1:, 1:]
+        lost[~corner] = np.inf
+        keep[np.unravel_index(np.argmin(lost), lost.shape)] = False
 
 
 def median_edge_vx(grid: np.ndarray) -> float:
@@ -2276,18 +2324,31 @@ def median_edge_vx(grid: np.ndarray) -> float:
     return float(np.median(np.concatenate(edges)))
 
 
+def output_surface(grid: np.ndarray, meta_extra: dict) -> tuple[np.ndarray, dict]:
+    """The written grid (a one-cell missing border around ``grid``) and its
+    surface metadata, the same for a tifxyz directory and a stored surface."""
+    nv, nu = grid.shape[:2]
+    bordered = np.full((nv + 2, nu + 2, 3), -1.0, dtype=np.float32)
+    bordered[1:-1, 1:-1] = grid.astype(np.float32)
+    area_vx2 = surface_area_vx2(bordered)
+    meta = {
+        "source": "band grower prototype (crossing-corroborated UV)",
+        "area_vx2": area_vx2,
+        "area_cm2": area_vx2_to_cm2(area_vx2),
+        **meta_extra,
+    }
+    return bordered, meta
+
+
 def write_tifxyz(
     out: Path,
-    grid: np.ndarray,
-    meta_extra: dict,
+    bordered: np.ndarray,
+    meta: dict,
     scale: tuple = (1.0, 1.0),
 ) -> None:
     import tifffile
 
     out.mkdir(parents=True, exist_ok=False)
-    nv, nu = grid.shape[:2]
-    bordered = np.full((nv + 2, nu + 2, 3), -1.0, dtype=np.float32)
-    bordered[1:-1, 1:-1] = grid.astype(np.float32)
     for channel, name in enumerate(("x", "y", "z")):
         tifffile.imwrite(
             out / f"{name}.tif",
@@ -2296,9 +2357,7 @@ def write_tifxyz(
             compression=None,
             photometric="minisblack",
         )
-    valid = bordered[..., 0] >= 0
-    points = bordered[valid]
-    area_vx2 = surface_area_vx2(bordered)
+    points = bordered[bordered[..., 0] >= 0]
     meta = {
         "format": "tifxyz",
         "type": "seg",
@@ -2308,12 +2367,57 @@ def write_tifxyz(
             points.min(axis=0).astype(float).tolist(),
             points.max(axis=0).astype(float).tolist(),
         ],
-        "source": "band grower prototype (crossing-corroborated UV)",
-        "area_vx2": area_vx2,
-        "area_cm2": area_vx2_to_cm2(area_vx2),
-        **meta_extra,
+        **meta,
     }
     (out / "meta.json").write_text(json.dumps(meta, indent=2) + "\n")
+
+
+def store_surface(args, seed: int, bordered: np.ndarray, meta: dict, scale: tuple) -> str:
+    """A grown patch as a new surface in --store bound to --volume-uuid."""
+    from vc_object_store.surfaces import create_surface
+
+    stamp = time.strftime("%Y%m%d-%H%M%S", time.localtime())
+    return create_surface(
+        args.store,
+        bordered,
+        name=f"band-seed{seed}-{stamp}",
+        scale=scale,
+        volume=args.volume_uuid,
+        tool="grow_track_graph",
+        parameters={"seed_track_row": seed},
+        meta=meta,
+        tags=args.tag,
+    )
+
+
+def stored_seed_surfaces(store: str | Path, tracks_path: str | Path) -> dict[int, list[str]]:
+    """Live stored surfaces this tool grew from the packed store, by seed row."""
+    from vc_object_store import ObjectStore
+
+    target = str(Path(tracks_path).resolve())
+    found = collections.defaultdict(list)
+    with ObjectStore.open(str(store), read_only=True, reader_pool_size=1) as db:
+        for record in db.objects_by_kind("surface"):
+            meta = record.get("meta") or {}
+            if (
+                meta.get("provenance", {}).get("tool") == "grow_track_graph"
+                and meta.get("tracks_path") == target
+                and meta.get("seed_track_row") is not None
+            ):
+                found[int(meta["seed_track_row"])].append(record["uuid"])
+    return found
+
+
+def retire_surfaces(store: str | Path, uuids: list[str]) -> None:
+    import getpass
+
+    from vc_object_store import ObjectStore
+
+    with ObjectStore.open(str(store), author=getpass.getuser()) as db:
+        pins = {u: db.current_object_revision(u)["uuid"] for u in uuids}
+        with db.write(expected_revisions=pins) as tx:
+            for u in uuids:
+                tx.retire_object(u)
 
 
 def is_complete_tifxyz(path: str | Path) -> bool:
@@ -2356,7 +2460,9 @@ def _collect_trimmed_surface(grower, args, *, min_points: int = 0):
 
 
 def process_seed(seed, out, args, tracks, crossings) -> dict:
-    """Grow one seed and write its tifxyz; returns a result record."""
+    """Grow one seed and write its tifxyz; returns a result record. Without
+    ``out`` (store mode) the record carries the grid and metadata instead, for
+    the parent process to store."""
     start = time.time()
     stage_start = start
     timings = {}
@@ -2540,13 +2646,18 @@ def process_seed(seed, out, args, tracks, crossings) -> dict:
             )
             grid = grid.copy()
             grid[~cleaned] = -1.0
-            grid = finalize_coarse_grid(resample_grid(grid, factor))
+            coarse = resample_grid(grid, factor)
+            keep = None
+            if args.coarse_mask_mode == "support":
+                keep = support_coarse_mask(coarse, grid[..., 0] >= 0, factor)
+            grid = finalize_coarse_grid(coarse, keep)
             # tifxyz scale = grid units per voxel (20vx spacing -> 0.05)
             scale = (1.0 / args.output_spacing, 1.0 / args.output_spacing)
             stats["resample"] = {
                 "fine_edge_vx": fine_edge,
                 "factor": factor,
                 "border_erode_px": erode_px,
+                "coarse_mask_mode": args.coarse_mask_mode,
                 "coarse_valid_vertices": int((grid[..., 0] >= 0).sum()),
             }
         stage("cleanup_and_resample")
@@ -2563,8 +2674,7 @@ def process_seed(seed, out, args, tracks, crossings) -> dict:
                 "area_cm2": area_cm2,
                 "reason": f"{area_cm2:.6f} cm² {comparison} {limit:.6f} cm²",
             }
-        write_tifxyz(
-            out,
+        bordered, meta = output_surface(
             grid,
             {
                 "seed_track_row": seed,
@@ -2604,18 +2714,22 @@ def process_seed(seed, out, args, tracks, crossings) -> dict:
                 "timings_seconds": timings,
                 "diagnostics": dict(grower.diag),
             },
-            scale=scale,
         )
-        stage("write")
-        return {
+        result = {
             "ok": True,
             "seed": seed,
-            "out": str(out),
             "tracks": len(grower.accepted),
             "valid": stats["valid_vertices"],
             "area_cm2": area_cm2,
             "secs": time.time() - start,
         }
+        if out is None:
+            result.update(grid=bordered, meta=meta, scale=scale)
+        else:
+            write_tifxyz(out, bordered, meta, scale=scale)
+            result["out"] = str(out)
+        stage("write")
+        return result
     except Exception as error:
         return {
             "ok": False,
@@ -2645,7 +2759,8 @@ def _worker_task(task: tuple) -> dict:
     seed, out_text = task
     assert _WORKER is not None
     tracks, crossings, args = _WORKER
-    return process_seed(int(seed), Path(out_text), args, tracks, crossings)
+    out = None if out_text is None else Path(out_text)
+    return process_seed(int(seed), out, args, tracks, crossings)
 
 
 def main(argv=None) -> int:
@@ -2656,7 +2771,25 @@ def main(argv=None) -> int:
     parser.add_argument("tracks", type=Path, help="packed .vctracks directory")
     parser.add_argument("crossings", type=Path, help="uncompressed crossings .npz")
     parser.add_argument(
-        "output", type=Path, help="parent directory for .tifxyz outputs"
+        "output",
+        type=Path,
+        nargs="?",
+        help="parent directory for .tifxyz outputs (or --store)",
+    )
+    parser.add_argument(
+        "--store",
+        type=Path,
+        help="object store the patches are created in, as surfaces (instead of output)",
+    )
+    parser.add_argument(
+        "--volume-uuid",
+        help="store mode: the volume whose voxels the tracks are in",
+    )
+    parser.add_argument(
+        "--tag",
+        action="append",
+        default=[],
+        help="store mode: tag for the created surfaces (repeatable)",
     )
     parser.add_argument(
         "--seeds",
@@ -2782,6 +2915,16 @@ def main(argv=None) -> int:
         ),
     )
     parser.add_argument(
+        "--coarse-mask-mode",
+        choices=("erode", "support"),
+        default="erode",
+        help=(
+            "final mask of the resampled grid: erode one cell (default), or "
+            "keep each quad whose fine footprint is fully valid; support "
+            "needs --output-spacing a whole multiple of --resample-spacing"
+        ),
+    )
+    parser.add_argument(
         "--workers",
         type=int,
         default=1,
@@ -2789,6 +2932,12 @@ def main(argv=None) -> int:
     )
     parser.add_argument("--overwrite", action="store_true")
     args = parser.parse_args(argv)
+    if (args.output is None) == (args.store is None):
+        parser.error("pass exactly one of output and --store")
+    if args.store is not None and not args.volume_uuid:
+        parser.error("--store needs --volume-uuid")
+    if args.store is None and (args.volume_uuid or args.tag):
+        parser.error("--volume-uuid and --tag need --store")
     if (args.seeds is None) == (args.random_count is None):
         parser.error("pass exactly one of --seeds or --random-count")
     if args.random_count is not None and args.random_count <= 0:
@@ -2812,15 +2961,34 @@ def main(argv=None) -> int:
         parser.error("--growth-min-span must be non-negative")
     if not math.isfinite(args.resample_spacing) or args.resample_spacing <= 0:
         parser.error("--resample-spacing must be finite and positive")
+    if args.coarse_mask_mode == "support":
+        ratio = args.output_spacing / args.resample_spacing
+        if not (
+            math.isfinite(ratio)
+            and ratio >= 1.0
+            and math.isclose(ratio, round(ratio))
+        ):
+            parser.error(
+                "--coarse-mask-mode support needs --output-spacing to be a "
+                "whole multiple of --resample-spacing"
+            )
     tracks = PackedTracks(args.tracks)
     crossings = CrossingCsr(args.crossings, tracks)
-    args.output.mkdir(parents=True, exist_ok=True)
+    stored = None
+    if args.store is not None:
+        stored = stored_seed_surfaces(args.store, tracks.path)
+    else:
+        args.output.mkdir(parents=True, exist_ok=True)
 
     if args.seeds:
         candidates = list(args.seeds)
         target = len(candidates)
     else:
-        already_used = previously_used_seed_rows(args.output, tracks.path)
+        already_used = (
+            set(stored)
+            if stored is not None
+            else previously_used_seed_rows(args.output, tracks.path)
+        )
         selected, cutoff, _, _ = random_top_arclength_rows(
             tracks,
             random_seed=args.random_seed,
@@ -2847,6 +3015,15 @@ def main(argv=None) -> int:
         while cursor < len(candidates):
             seed = candidates[cursor]
             cursor += 1
+            if stored is not None:
+                if stored.get(seed):
+                    if not args.overwrite:
+                        print(f"skip existing stored surface {stored[seed][0]}")
+                        if args.seeds:
+                            successes += 1
+                        continue
+                    retire_surfaces(args.store, stored.pop(seed))
+                return seed, None
             existing = sorted(args.output.glob(f"band-seed{seed}-*.tifxyz")) + [
                 p for p in (args.output / f"band-seed{seed}.tifxyz",) if p.exists()
             ]
@@ -2880,6 +3057,10 @@ def main(argv=None) -> int:
             print(f"seed {result['seed']} discarded: {result['reason']}")
             return
         if result["ok"]:
+            if stored is not None:
+                result["out"] = store_surface(
+                    args, result["seed"], result["grid"], result["meta"], result["scale"]
+                )
             successes += 1
             print(
                 f"[{successes}/{target}] wrote {result['out']} "
@@ -2898,7 +3079,8 @@ def main(argv=None) -> int:
             if task is None:
                 break
             seed, out_text = task
-            report(process_seed(seed, Path(out_text), args, tracks, crossings))
+            out = None if out_text is None else Path(out_text)
+            report(process_seed(seed, out, args, tracks, crossings))
     else:
         import multiprocessing as mp
         from concurrent.futures import (

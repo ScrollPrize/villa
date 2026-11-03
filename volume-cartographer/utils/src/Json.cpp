@@ -243,14 +243,8 @@ uint64_t Json::value(const std::string& key, uint64_t def) const {
 std::vector<std::string> Json::get_string_array() const {
     return impl_->j().get<std::vector<std::string>>();
 }
-std::vector<int> Json::get_int_array() const {
-    return impl_->j().get<std::vector<int>>();
-}
 std::vector<double> Json::get_double_array() const {
     return impl_->j().get<std::vector<double>>();
-}
-std::vector<size_t> Json::get_size_t_array() const {
-    return impl_->j().get<std::vector<size_t>>();
 }
 
 // ---- Mutation ----

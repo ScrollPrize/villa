@@ -33,7 +33,7 @@ Notes:
 - Scripts currently write frames to a hardcoded SCRATCH dir near the top of
   each file — point it somewhere local before running.
 - `ink_thumb.py` reads a real ink-prediction jpg from a hardcoded local path
-  (PRED constant: PHerc. Paris 4, 2 µm, hann-blended tile inference); point
+  (PRED constant: PHerc. Paris. 4, 2 µm, hann-blended tile inference); point
   it at any grayscale prediction — the image is flipped upright and
   recolored to the strip palette at load.
 - The `?v=N` query on the component's URLs (`src/components/TutorialsTop.js`)

@@ -1,4 +1,5 @@
 #pragma once
+#include "LineAnnotationPolylineIndices.hpp"
 
 #include <cstddef>
 #include <atomic>
@@ -140,6 +141,7 @@ struct FiberTraceSegmentMetadata {
     std::string detail);
 
 struct LineControlPoint : vc::lasagna::LineControlPoint {
+    int64_t storeId = -1;
     std::optional<cv::Vec3d> direction;
     std::optional<cv::Vec3d> displayNormal;
     std::string displayNormalSource = "unknown";
@@ -192,6 +194,11 @@ struct ControlPointCollapseResult {
     double clickedLinePosition,
     const cv::Vec3d& clickedPoint);
 
+// Removes one control. Deleting the final control deletes the span that ended
+// at it, whose descriptor lives on the new final control: clearing it
+// restores the v3 final-CP contract.
+void eraseControlPoint(std::vector<LineControlPoint>& controls, size_t index);
+
 struct PreparedControlPointEdit {
     std::vector<cv::Vec3d> linePoints;
     std::vector<LineControlPoint> controlPointsBeforeLineUpdate;
@@ -236,6 +243,7 @@ struct PreparedControlPointEdit {
     double linePosition);
 
 struct StoredControlPoint : cv::Vec3d {
+    int64_t storeId = -1;
     std::optional<cv::Vec3d> direction;
     std::optional<cv::Vec3d> displayNormal;
     std::string displayNormalSource = "unknown";
@@ -248,9 +256,8 @@ struct StoredControlPoint : cv::Vec3d {
     explicit StoredControlPoint(const cv::Vec3d& position) : cv::Vec3d(position) {}
 };
 
-// Ordinary free-form fiber tag carrying the human review verdict; also the
-// default publish gate of scripts/vc_sync.py hfsync — keep the literal in
-// sync. A toolbar interpolation-mode switch strips it on the save after a
+// Ordinary free-form fiber tag carrying the human review verdict.
+// A toolbar interpolation-mode switch strips it on the save after a
 // successful re-optimization; nothing else touches it programmatically.
 inline constexpr const char* kReviewedTag = "reviewed";
 
@@ -327,11 +334,14 @@ struct GapSpanSync {
 };
 GapSpanSync syncGapSpanTags(std::vector<LineControlPoint>& controls);
 bool syncGapSpanTags(std::vector<StoredControlPoint>& controls);
-// syncGapSpanTags plus the gap goal policy for a structural edit that is
-// about to re-solve anyway: a span whose gap formed takes the cubic-spline
-// goal, one whose gap dissolved while still cspline returns to global (any
-// other goal is left alone). The break toggle applies the same policy through
-// the controller's goal path so it can start the re-solve itself.
+// syncGapSpanTags plus the gap goal policy: a span whose gap formed takes
+// the cubic-spline goal, one whose gap dissolved while still cspline returns
+// to global (any other goal is left alone). Applied by every structural edit
+// before its re-solve, and by the tag persist together with the break tag
+// (the controller then re-solves the spans whose goals actually changed
+// through startCommittedGoalSolve). The returned sync names the TAG
+// transitions; a formed gap whose goal was already cspline is a transition
+// without a goal change.
 GapSpanSync applyGapSpanPolicy(std::vector<LineControlPoint>& controls);
 // The same for stored controls (a merge's or split's result, held in memory
 // before it is saved): pairs by index, returns whether anything changed.
@@ -342,6 +352,120 @@ bool applyGapSpanPolicy(std::vector<StoredControlPoint>& controls);
 // Sets or clears a span tag on the span descriptor. Never creates a
 // descriptor (a control without one owns no span). Returns whether it changed.
 bool setSpanTag(std::optional<FiberTraceSegmentMetadata>& metadata, std::string_view tag, bool enabled);
+
+// Which open tails are drawn as a short straight ray instead of the global
+// mode's extrapolation. A side is a ray when its end control (first / last in
+// LINE-POSITION order; a single control is both ends) carries
+// kKollesisTerminationTag, or carries kBreakTag and is a LONE break: the one
+// span it touches is not a gap span (the gap is read from the SPAN tag,
+// spanIsGap, never inferred from the pair of point tags). A break that closes
+// a gap is the far edge of the damage, so the fiber continues past it with
+// the ordinary extrapolation.
+struct OpenTailPolicy {
+    bool headRay = false;
+    bool tailRay = false;
+    [[nodiscard]] bool any() const noexcept { return headRay || tailRay; }
+    bool operator==(const OpenTailPolicy&) const = default;
+};
+// Session controls: line-position order (controls without a finite line
+// position take no part, as in gapSpansForControls). Read-only.
+[[nodiscard]] OpenTailPolicy openTailPolicyForControls(const std::vector<LineControlPoint>& controls);
+// Stored controls are in line order by contract: index order.
+[[nodiscard]] OpenTailPolicy openTailPolicyForControls(const std::vector<StoredControlPoint>& controls);
+// Exactly one control and both its sides are rays: such a request traces no
+// tail, so the trace inputs (inference dataset, prediction field, trace
+// normal sampler) are not needed for it.
+[[nodiscard]] bool singleControlRayOnly(const std::vector<LineControlPoint>& controls);
+
+// The solver's span index (rank in line-position order) of each owner in
+// `owners` that has a successor in that order; owners without one (the last
+// control, non-finite positions, out-of-range indices) are dropped. Session
+// vectors can be out of line order after a reopen, which is why dirty spans
+// are named by rank, never by vector index.
+[[nodiscard]] std::vector<size_t> lineOrderSpanRanks(const std::vector<LineControlPoint>& controls,
+                                                     const std::vector<size_t>& owners);
+
+// Placement beyond a lone end break: when `prepared` is a pure append
+// (prepend) with no collapse whose new last (first) control attaches to a
+// control that was a lone end BREAK in `previousControls` (the pre-edit
+// session list), the new control is to be tagged kBreakTag as well, so the
+// span between them becomes a gap span. Returns the index in
+// prepared.controlPoints to tag, or nullopt. Kollesis ends never qualify
+// (placement beyond them is refused before prepare runs).
+[[nodiscard]] std::optional<size_t> appendedControlToTagAsBreak(
+    const std::vector<LineControlPoint>& previousControls,
+    const PreparedControlPointEdit& prepared);
+
+// Nearest line vertex to `target`; among equally near candidates (a line
+// that revisits its own coordinates) `tie` picks the first or the last, so
+// a head control resolves to its first visit and a tail control to its last.
+// Throws std::invalid_argument on an empty line.
+enum class NearestTie { First, Last };
+[[nodiscard]] size_t nearestLineIndex(const std::vector<cv::Vec3d>& points,
+                                      const cv::Vec3d& target,
+                                      NearestTie tie);
+
+// The sample positions of a straight ray from `endpoint` along `direction`
+// (normalised inside): k*spacing for k = 1..n, n = max(1, ceil(distance /
+// spacing)), the last clamped to exactly `distance`, so a ray always has at
+// least one point beyond the endpoint. Throws std::invalid_argument on a
+// non-positive or non-finite distance / spacing or a degenerate direction.
+[[nodiscard]] std::vector<cv::Vec3d> rayTailPoints(const cv::Vec3d& endpoint,
+                                                   const cv::Vec3d& direction,
+                                                   double distance,
+                                                   double spacing);
+
+// Replaces the open tails of `line` on the policy's ray sides with straight
+// rays; the other side(s) and every point in [firstControl, lastControl]
+// (the exact line indices of the outer control vertices) are kept as they
+// are. The ray direction is the annotated control direction when given
+// (negated on the head side, as the tracer does), else the line's own end
+// tangent (endpoint minus its inward neighbour). Ray points take
+// sampledNormal from `sampler` when one is given. Returns the index shift
+// applied to every retained point (newIndex = oldIndex + shift), like the
+// solver's replaceOpenTails. Throws std::invalid_argument on bad indices
+// or a line too short to give a tangent.
+int replaceRayTails(vc::lasagna::LineModel& line,
+                    int firstControl,
+                    int lastControl,
+                    OpenTailPolicy policy,
+                    const std::optional<cv::Vec3d>& headDirection,
+                    const std::optional<cv::Vec3d>& tailDirection,
+                    double distance,
+                    double spacing,
+                    const vc::lasagna::NormalSampler* sampler);
+
+// Mirroring a control-point edit (a tag toggle) into a peer session that
+// holds its own copies of the same fiber: the edit is applied to the control
+// nearest `editedPoint` in `live` and in each present rollback snapshot, then
+// applyGapSpanPolicy (span tags AND the gap goal policy) runs on every list
+// the edit changed, so a peer's descriptors agree with the initiating
+// session's. The outcome tells the caller what to invalidate: whether the
+// live list's tail policy changed, which gap span TAGS formed or dissolved
+// there (a transition that changes the goal unless it already was the
+// policy's), and whether a snapshot's tail policy or goals changed (a later
+// rollback must not restore it as optimized).
+// The control of `controls` that stands for the one at `point`: the NEAREST
+// within the position tolerance (pointsApproximatelyEqual), so an exact twin
+// wins over a distinct visit that merely passes within tolerance (a line
+// that revisits its own coordinates). Null when none.
+[[nodiscard]] LineControlPoint* nearestControlAtPoint(std::vector<LineControlPoint>& controls,
+                                                      const cv::Vec3d& point);
+[[nodiscard]] const LineControlPoint* nearestControlAtPoint(
+    const std::vector<LineControlPoint>& controls, const cv::Vec3d& point);
+
+struct MirroredControlEditOutcome {
+    bool changed = false;
+    bool livePolicyChanged = false;
+    GapSpanSync liveSync;
+    bool snapshotChanged = false;
+};
+MirroredControlEditOutcome applyMirroredControlPointEdit(
+    std::vector<LineControlPoint>& live,
+    std::vector<LineControlPoint>* beforeModeChange,
+    std::vector<LineControlPoint>* collapseRollback,
+    const cv::Vec3d& editedPoint,
+    const std::function<bool(LineControlPoint&)>& edit);
 
 enum class FiberTraceState {
     Legacy,       // no prediction-traced spans in the stored geometry
@@ -382,6 +506,10 @@ struct FiberModeOptimizationRequest {
     std::string fiberManifestLocation;
     double traceToBaseScale = 1.0;
     double extrapolationDistanceBaseVoxels = 0.0;
+    // Length of the straight ray drawn past a lone end break or a kollesis
+    // termination instead of the mode's extrapolation (OpenTailPolicy), in
+    // base voxels. Finite and > 0.
+    double breakExtrapolationDistanceBaseVoxels = 400.0;
     FiberOptimizationMode globalMode = FiberOptimizationMode::NativeFiberTrace3d;
     std::optional<std::vector<size_t>> dirtySegments;
     bool globalGoalsOnly = false;
@@ -422,14 +550,15 @@ struct FiberModeOptimizationResult {
     int csplineFallbackSegments = 0;
     int nativeExtrapolations = 0;
     int lasagnaFallbackExtrapolations = 0;
+    // Open tails drawn as straight rays (OpenTailPolicy sides).
+    int rayExtrapolations = 0;
 };
 
 [[nodiscard]] FiberModeOptimizationResult optimizeFiberWithNativeFallback(
     FiberModeOptimizationRequest request);
 
 [[nodiscard]] nlohmann::json fiberTraceSegmentMetadataToJson(const FiberTraceSegmentMetadata& metadata);
-// fiberVersion: the file's vc3d_fiber version; span tags are accepted from
-// version 4 on and rejected as an unknown field before that.
+// Only the current fiber transfer format (version 4) is accepted.
 [[nodiscard]] FiberTraceSegmentMetadata fiberTraceSegmentMetadataFromJson(const nlohmann::json& json,
                                                                           int fiberVersion = kFiberFormatVersion);
 [[nodiscard]] nlohmann::json storedControlPointToJson(const StoredControlPoint& control);
@@ -437,14 +566,10 @@ struct FiberModeOptimizationResult {
 
 void validateStoredControlPoints(const std::vector<StoredControlPoint>& controls);
 
-// The loader's exact-membership scan (kControlPointMatchEpsilon in
-// core/src/Atlas.cpp): every control must be an exact member (1e-8) of
+// The exact-membership scan: every control must be an exact member (1e-8) of
 // linePoints, in strictly increasing line order. Returns each control's line
 // index, or nullopt on the first violation. Split/merge planning and the
 // save-path geometry guard share this single implementation.
-[[nodiscard]] std::optional<std::vector<size_t>> orderedControlPointLineIndices(
-    const std::vector<cv::Vec3d>& controlPoints,
-    const std::vector<cv::Vec3d>& linePoints);
 
 // The controlled span of a fiber: linePoints from the first control's line
 // index to the last control's (inclusive), mapped with the ordered scan above.
@@ -541,8 +666,8 @@ struct FiberSplitPlan {
 
 // Returns nullopt when splitAfterControlIndex is out of range, either half
 // would keep fewer than 2 control points, or the control points are not an
-// ordered subset of linePoints under the loader's exact-membership
-// tolerance (vc::atlas::validateFiberInputControlPoints).
+// ordered subset of linePoints under the exact-membership tolerance
+// (orderedControlPointLineIndices).
 [[nodiscard]] std::optional<FiberSplitPlan> computeFiberSplitPlan(
     const std::vector<cv::Vec3d>& controlPoints,
     const std::vector<cv::Vec3d>& linePoints,
