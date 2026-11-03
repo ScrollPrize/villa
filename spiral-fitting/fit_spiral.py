@@ -2541,8 +2541,10 @@ class FitContext:
     # decision about its release is a visible omission instead of a leak.
     # prepared_main_tracks/preview_extent_tracks are deliberately absent: see
     # the retained_tracks note in _build_model_state.
+    # Not 'device': __init__ chooses it (devices.fit_device) once for the
+    # session, and the rebuild itself reads it.
     _MODEL_STAGE_ATTRIBUTES = (
-        'device', 'umbilicus_zyx',
+        'umbilicus_zyx',
         'start_iteration', 'model_z_begin', 'model_z_end',
         'flow_field_radius', 'flow_min_corner_spiral_zyx',
         'flow_max_corner_spiral_zyx', 'num_training_steps',
