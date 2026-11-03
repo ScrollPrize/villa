@@ -49,7 +49,7 @@
         "height": 666,
         "view_scale": 1.0,
         "pan_steps": 60,
-        "zoom_steps": 60,
+        "zoom_steps": 20,
         "slice_steps": 120,
         "jumps": 60,
         "burst": 120
