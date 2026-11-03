@@ -4,9 +4,10 @@
 // viewers, then stepped along the fiber the way scrolling the line position
 // does: the cuts follow LineAnnotationDialog::updatePlaneSurface /
 // updateSidePlaneSurface and the strip cameras recentre on the position.
-// Fibers are VC3D fiber JSON files (line_points in level-0 voxels).
+// Fibers are VC3D fiber JSON files (line_points in level-0 voxels), the longest
+// `count` of the case's fiber folder.
 
-#include "bench_common.hpp"
+#include "bench_session.hpp"
 
 #include "CState.hpp"
 #include "volume_viewers/CChunkedVolumeViewer.hpp"
@@ -15,51 +16,13 @@
 #include "vc/core/util/QuadSurface.hpp"
 #include "vc/lasagna/LineViewBuilder.hpp"
 
-#include <nlohmann/json.hpp>
-
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
-#include <fstream>
 
 using namespace vcbench;
 
 namespace {
-
-struct Fiber {
-    std::string name;
-    std::vector<cv::Vec3d> points;
-};
-
-// The `count` fibers with the most line points (ties by file name): the longest
-// walks along a fiber, and a deterministic choice.
-std::vector<Fiber> loadFibers(const std::filesystem::path& folder, int count, double coordinateScale)
-{
-    std::vector<std::filesystem::path> files;
-    for (const auto& entry : std::filesystem::directory_iterator(folder))
-        if (entry.path().extension() == ".json")
-            files.push_back(entry.path());
-    std::sort(files.begin(), files.end());
-    std::vector<Fiber> fibers;
-    for (const auto& file : files) {
-        std::ifstream in(file);
-        const auto doc = nlohmann::json::parse(in, nullptr, false);
-        if (doc.is_discarded() || !doc.contains("line_points") || !doc["line_points"].is_array())
-            continue;
-        Fiber fiber{file.filename().string(), {}};
-        for (const auto& p : doc["line_points"])
-            if (p.is_array() && p.size() == 3)
-                fiber.points.emplace_back(p[0].get<double>() * coordinateScale, p[1].get<double>() * coordinateScale,
-                                          p[2].get<double>() * coordinateScale);
-        if (fiber.points.size() >= 2)
-            fibers.push_back(std::move(fiber));
-    }
-    std::stable_sort(fibers.begin(), fibers.end(),
-                     [](const Fiber& a, const Fiber& b) { return a.points.size() > b.points.size(); });
-    if (int(fibers.size()) > count)
-        fibers.resize(std::size_t(count));
-    return fibers;
-}
 
 cv::Vec3f normalized(const cv::Vec3f& v)
 {
@@ -116,27 +79,20 @@ void moveTo(Views& views, double position, std::vector<Viewer*>& viewers)
 int main(int argc, char** argv)
 {
     try {
-        Args args(argc, argv);
-        Session session(argc, argv, args);
-        const auto fibersDir = args.str("fibers");
-        if (fibersDir.empty())
-            throw std::invalid_argument("--fibers <folder of fiber JSON> is required");
-        const int fiberCount = int(args.num("fiber-count", 4));
-        const double fiberScale = args.num("fiber-scale", 1);
-        const int steps = int(args.num("steps", 24));
-        const int passes = int(args.num("passes", 2));
-        const int stripW = session.viewSize(int(args.num("strip-width", 1600)));
-        const int stripH = session.viewSize(int(args.num("strip-height", 320)));
-        const int cutSize = session.viewSize(int(args.num("cut-size", 640)));
-        const double timeoutMs = args.num("timeout-ms", 120000);
-        const auto json = args.str("json");
-        const auto dump = args.str("dump");
-        args.rejectUnused();
-
-        const auto fibers = loadFibers(fibersDir, fiberCount, fiberScale);
-        if (fibers.empty())
-            throw std::runtime_error("no fiber with line_points in " + fibersDir);
-        Report report("line_annotation", session.pipelineName(), {});
+        Fixture fixture(argc, argv, "line_annotation");
+        if (fixture.listOnly())
+            return 0;
+        Session session(argc, argv, fixture);
+        const auto fibers = fixture.loadFibers(fixture.integer("count", 4));
+        const int steps = fixture.integer("steps", 24);
+        const int passes = fixture.integer("passes", 2);
+        const int stripW = session.viewSize(fixture.integer("strip_width", 1600));
+        const int stripH = session.viewSize(fixture.integer("strip_height", 320));
+        const int cutSize = session.viewSize(fixture.integer("cut_size", 640));
+        const double timeoutMs = fixture.num("timeout_ms", 120000);
+        const auto& dump = fixture.dumpDir();
+        fixture.rejectUnused();
+        auto report = fixture.makeReport();
 
         const std::string stripName = "line strip", sideName = "line side strip", cutName = "line cut",
                           sideCutName = "line side cut";
@@ -195,7 +151,7 @@ int main(int argc, char** argv)
         session.note("fibers", names);
         session.noteCaches();
         report.setConfig(session.config());
-        report.finish(json);
+        report.finish(fixture.jsonPath());
         owned.clear();
         return 0;
     } catch (const std::exception& e) {

@@ -1,6 +1,6 @@
 // The vc_reader render pipeline (OpenedVolumes + vcr::grid), CPU or CUDA.
 
-#include "bench_common.hpp"
+#include "bench_session.hpp"
 
 #include "CState.hpp"
 #include "OpenedVolumes.hpp"
@@ -12,69 +12,36 @@
 
 #include <vc_reader/cuda_available.hpp>
 
-#include <fstream>
 #include <stdexcept>
 
 namespace vcbench::pipeline {
 
-namespace {
-
-std::string backend(const Args& args)
-{
-    const auto value = args.str("backend", "cpu");
-    if (value != "cpu" && value != "cuda")
-        throw std::invalid_argument("--backend must be cpu or cuda");
-    return value;
-}
-
-// <root>/s3/<bucket>/<key> (vc_reader's cache layout) -> the cache root and s3://<bucket>/<key>.
-std::pair<std::string, std::string> remoteSourceOf(const std::string& localPath)
-{
-    const auto path = std::filesystem::weakly_canonical(localPath).generic_string();
-    const auto at = path.find("/s3/");
-    if (at == std::string::npos)
-        throw std::invalid_argument("--prefetch needs a --volume inside a vc_reader cache (<root>/s3/<bucket>/...): " +
-                                    path);
-    return {path.substr(0, at), "s3://" + path.substr(at + 4)};
-}
-
-} // namespace
-
-std::string name(const Args& args)
-{
-    return "vc_reader-" + backend(args);
-}
-
-void writeSettings(const Args& args, const std::string& iniPath)
+void writeSettings(Fixture& fixture, const std::string& iniPath)
 {
     using namespace vc3d::settings;
     QSettings settings(QString::fromStdString(iniPath), QSettings::IniFormat);
-    settings.setValue(perf::RENDER_CUDA, backend(args) == "cuda");
-    settings.setValue(perf::RENDER_GPU_CACHE_GB, int(args.num("gpu-cache-gb", 8)));
+    settings.setValue(perf::RENDER_CUDA, fixture.backend() == "cuda");
+    settings.setValue(perf::RENDER_GPU_CACHE_GB, fixture.integer("gpu_cache_gb", 8));
     settings.sync();
 }
 
-void initProcess(const Args& args)
+void initProcess(Fixture& fixture)
 {
-    if (backend(args) == "cuda" && !vcr::cuda::available())
+    if (fixture.backend() == "cuda" && !vcr::cuda::available())
         throw std::runtime_error("--backend cuda: no CUDA device or a build without CUDA");
 }
 
-std::unique_ptr<CState> makeState(const Args& args)
+std::unique_ptr<CState> makeState(Fixture& fixture)
 {
-    return std::make_unique<CState>(nullptr, nullptr, std::size_t(args.num("cache-gb", 16)) << 30);
+    return std::make_unique<CState>(nullptr, nullptr, std::size_t(fixture.num("cache_gb", 16)) << 30);
 }
 
-std::shared_ptr<Volume> openVolume(const Args& args, const std::string& localPath, const std::string& configDir)
+std::shared_ptr<Volume> openVolume(const VolumeSource& source)
 {
-    if (!args.flag("prefetch"))
-        return Volume::New(localPath);
-    const auto [root, url] = remoteSourceOf(localPath);
-    // VC3D's cache root is the cache the local folder lives in, so fetched chunks
-    // land in that folder (vcr::zarr::decodedCachePath of the URL).
-    std::ofstream(std::filesystem::path(configDir) / "cache.json")
-        << "{\"version\": 1, \"root\": \"" << root << "\"}\n";
-    return Volume::NewFromUrl(url, {}, false);
+    if (!source.remote)
+        return Volume::New(source.location);
+    // VC3D's cache root (the fixture wrote cache.json) holds what the run fetches.
+    return Volume::NewFromUrl(source.location, {}, false);
 }
 
 std::map<std::string, std::string> cacheSummary(CState& state, Volume&)

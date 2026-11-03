@@ -1,4 +1,4 @@
-#include "bench_common.hpp"
+#include "bench_fixture.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -18,7 +18,7 @@ double msSince(Clock::time_point start)
 // ---------------------------------------------------------------------------
 // Args
 
-Args::Args(int argc, char** argv) : program_(argc > 0 ? argv[0] : "")
+Args::Args(int argc, char** argv)
 {
     for (int i = 1; i < argc; ++i) {
         std::string key = argv[i];
@@ -36,17 +36,18 @@ Args::Args(int argc, char** argv) : program_(argc > 0 ? argv[0] : "")
     }
 }
 
-std::string Args::str(const std::string& key, const std::string& fallback) const
+std::optional<std::string> Args::get(const std::string& key) const
 {
-    used_[key] = true;
+    used_.insert(key);
     const auto it = values_.find(key);
-    return it == values_.end() ? fallback : it->second;
+    if (it == values_.end())
+        return std::nullopt;
+    return it->second;
 }
 
-double Args::num(const std::string& key, double fallback) const
+std::string Args::str(const std::string& key, const std::string& fallback) const
 {
-    const auto value = str(key);
-    return value.empty() ? fallback : std::stod(value);
+    return get(key).value_or(fallback);
 }
 
 bool Args::flag(const std::string& key) const
@@ -87,8 +88,10 @@ Summary summarize(std::vector<double> values)
     return s;
 }
 
-Report::Report(std::string benchmark, std::string pipeline, std::map<std::string, std::string> config)
-    : benchmark_(std::move(benchmark)), pipeline_(std::move(pipeline)), config_(std::move(config))
+Report::Report(std::string benchmark, std::string pipeline, std::string caseName, std::string cacheState,
+               std::map<std::string, std::string> config)
+    : benchmark_(std::move(benchmark)), pipeline_(std::move(pipeline)), case_(std::move(caseName)),
+      cacheState_(std::move(cacheState)), config_(std::move(config))
 {
 }
 
@@ -115,7 +118,7 @@ std::string jsonEscape(const std::string& text)
 
 void Report::finish(const std::string& jsonPath) const
 {
-    std::printf("\n== %s [%s]\n", benchmark_.c_str(), pipeline_.c_str());
+    std::printf("\n== %s / %s [%s, %s]\n", benchmark_.c_str(), case_.c_str(), pipeline_.c_str(), cacheState_.c_str());
     for (const auto& [key, value] : config_)
         std::printf("   %s: %s\n", key.c_str(), value.c_str());
     std::printf("%-34s %-14s %6s %10s %10s %10s %10s %10s\n", "step", "metric", "n", "mean", "p50", "p95", "min",
@@ -143,7 +146,8 @@ void Report::finish(const std::string& jsonPath) const
     for (const auto& key : order_) {
         const auto bar = key.find('|');
         const auto s = summarize(samples_.at(key));
-        out << "{\"benchmark\":\"" << benchmark_ << "\",\"pipeline\":\"" << pipeline_ << "\",\"step\":\""
+        out << "{\"benchmark\":\"" << benchmark_ << "\",\"case\":\"" << jsonEscape(case_) << "\",\"pipeline\":\""
+            << pipeline_ << "\",\"cache_state\":\"" << cacheState_ << "\",\"step\":\""
             << jsonEscape(key.substr(0, bar)) << "\",\"metric\":\"" << key.substr(bar + 1) << "\",\"n\":" << s.n
             << ",\"mean\":" << s.mean << ",\"p50\":" << s.p50 << ",\"p95\":" << s.p95 << ",\"min\":" << s.min
             << ",\"max\":" << s.max << ",\"total\":" << s.total << ",\"config\":" << config.str() << "}\n";

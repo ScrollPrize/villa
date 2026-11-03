@@ -1,0 +1,80 @@
+{
+  "description": "Workflow benchmark data and cases. Relative paths are relative to this file. See README.md.",
+  "cache": "cache",
+
+  "baseline": null,
+  "results": [],
+
+  "volumes": {
+    "paris4-2.4um": {
+      "url": "s3://vesuvius-challenge-open-data/PHercParis4/volumes/20260411134726-2.400um-0.2m-78keV-masked.zarr"
+    }
+  },
+  "segments": {
+    "w028-037": {
+      "description": "Segment w028-037 in paris4-2.4um's level-0 voxels.",
+      "url": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20260623142658-w028-037/mesh/20260623142658-on-20260411134726-2.4um.tifxyz",
+      "volume": "paris4-2.4um",
+      "scale": 1
+    }
+  },
+  "fibers": {
+    "spiral": {
+      "description": "VC3D fiber JSON, line_points in level-0 voxels of paris4-2.4um.",
+      "path": "/mnt/raid_nvme/spiral_dataset_working/fibers",
+      "volume": "paris4-2.4um",
+      "scale": 1
+    }
+  },
+
+  "defaults": {
+    "cache_gb": 16,
+    "gpu_cache_gb": 8,
+    "passes": 2,
+    "timeout_ms": 120000,
+    "max_resolution": 0,
+    "prefetch_margin": 1.5,
+    "fetch_max_gb": 100,
+    "cache_state": "cached"
+  },
+
+  "benchmarks": {
+    "viewer_navigation": [
+      {
+        "name": "w028-037",
+        "segment": "w028-037",
+        "width": 960,
+        "height": 540,
+        "view_scale": 1.0,
+        "pan_steps": 8,
+        "zoom_steps": 4,
+        "slice_steps": 8,
+        "jumps": 8,
+        "burst": 60
+      }
+    ],
+    "line_annotation": [
+      {
+        "name": "spiral-longest-4",
+        "fibers": "spiral",
+        "count": 4,
+        "steps": 24,
+        "strip_width": 1600,
+        "strip_height": 320,
+        "cut_size": 640
+      }
+    ],
+    "render_tifxyz": [
+      {
+        "name": "w028-037-crop2k",
+        "segment": "w028-037",
+        "group": 2,
+        "scale": 1,
+        "slices": 21,
+        "crop": [20750, 5500, 2048, 2048],
+        "surface_interpolation": "linear",
+        "iterations": 3
+      }
+    ]
+  }
+}

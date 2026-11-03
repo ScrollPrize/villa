@@ -1,4 +1,4 @@
-#include "bench_common.hpp"
+#include "bench_session.hpp"
 
 #include "CState.hpp"
 #include "VCSettings.hpp"
@@ -6,7 +6,6 @@
 #include "volume_viewers/CChunkedVolumeViewer.hpp"
 
 #include "vc/core/types/Volume.hpp"
-#include "vc/core/util/QuadSurface.hpp"
 #include "vc/ui/VCCollection.hpp"
 
 #include <QApplication>
@@ -18,7 +17,6 @@
 #include <QWidget>
 
 #include <algorithm>
-#include <cmath>
 #include <cstdio>
 #include <stdexcept>
 
@@ -27,12 +25,8 @@ namespace vcbench {
 // ---------------------------------------------------------------------------
 // Session
 
-Session::Session(int& argc, char** argv, Args& args)
+Session::Session(int& argc, char** argv, Fixture& fixture) : fixture_(fixture)
 {
-    const std::string volumePath = args.str("volume");
-    if (volumePath.empty())
-        throw std::invalid_argument("--volume <OME-Zarr folder> is required");
-
     // Isolated settings: nothing from the user's VC3D.ini leaks into a run.
     configDir_ = std::make_unique<QTemporaryDir>();
     if (!configDir_->isValid())
@@ -41,32 +35,42 @@ Session::Session(int& argc, char** argv, Args& args)
     if (qEnvironmentVariableIsEmpty("QT_QPA_PLATFORM"))
         qputenv("QT_QPA_PLATFORM", "offscreen");
     const auto ini = vc3d::settingsFilePath();
-    const int maxResolution = int(args.num("max-resolution", 0));
+    const int maxResolution = fixture.integer("max_resolution", 0);
     {
         QSettings settings(ini, QSettings::IniFormat);
         // VC3D's "max displayed resolution": 0 (the default) lets views reach level 0.
         settings.setValue(vc3d::settings::viewer::MAX_DISPLAYED_RESOLUTION, maxResolution);
         settings.sync();
     }
-    pipeline::writeSettings(args, ini.toStdString());
+    pipeline::writeSettings(fixture, ini.toStdString());
 
     app_ = std::make_unique<QApplication>(argc, argv);
-    pipeline::initProcess(args);
-    pipeline_ = pipeline::name(args);
-    state_ = pipeline::makeState(args);
+    pipeline::initProcess(fixture);
+    state_ = pipeline::makeState(fixture);
     points_ = std::make_unique<VCCollection>();
     manager_ = std::make_unique<ViewerManager>(state_.get(), points_.get());
 
-    prefetch_ = args.flag("prefetch");
-    margin_ = prefetch_ ? args.num("prefetch-margin", 1.5) : 1.0;
-    prefetchMaxBytes_ = std::uint64_t(args.num("prefetch-max-gb", 100) * double(1ull << 30));
+    prefetch_ = fixture.prefetching();
+    margin_ = prefetch_ ? fixture.num("prefetch_margin", 1.5) : 1.0;
+    fetchMaxBytes_ = std::uint64_t(fixture.num("fetch_max_gb", 100) * double(1ull << 30));
+    expectCached_ = prefetch_ && fixture.flag("expect_cached");
+    // Before any VC3D object reads VC3D_CONFIG_DIR's cache.json.
+    const auto source = fixture.volumeSource(configDir_->path().toStdString());
+    remote_ = source.remote;
     const auto start = Clock::now();
-    volume_ = pipeline::openVolume(args, volumePath, configDir_->path().toStdString());
-    config_["volume"] = prefetch_ ? volume_->remoteUrl() : volumePath;
+    volume_ = pipeline::openVolume(source);
     if (prefetch_)
         config_["prefetch_margin"] = std::to_string(margin_);
     config_["max_resolution"] = std::to_string(maxResolution);
     config_["volume_open_ms"] = std::to_string(msSince(start));
+}
+
+std::map<std::string, std::string> Session::config() const
+{
+    auto out = fixture_.config();
+    for (const auto& [key, value] : config_)
+        out[key] = value;
+    return out;
 }
 
 Session::~Session()
@@ -89,17 +93,24 @@ void Session::noteCaches()
 {
     for (const auto& [key, value] : pipeline::cacheSummary(*state_, *volume_))
         config_[key] = value;
+    if (expectCached_) {
+        if (const auto fetched = pipeline::fetchedBytes(*state_); fetched > 0)
+            std::fprintf(stderr,
+                         "warning: %s/%s still fetched %llu MB: the cache does not hold everything it reads yet\n",
+                         fixture_.benchmark().c_str(), fixture_.caseName().c_str(),
+                         static_cast<unsigned long long>(fetched >> 20));
+    }
 }
 
-void Session::checkPrefetchBudget()
+void Session::checkFetchBudget()
 {
-    if (!prefetch_ || Clock::now() - lastBudgetCheck_ < std::chrono::milliseconds(100))
+    if (!remote_ || Clock::now() - lastBudgetCheck_ < std::chrono::milliseconds(100))
         return;
     lastBudgetCheck_ = Clock::now();
     const auto fetched = pipeline::fetchedBytes(*state_);
-    if (fetched > prefetchMaxBytes_)
-        throw std::runtime_error("prefetch stopped: fetched " + std::to_string(fetched >> 20) +
-                                 " MB, over --prefetch-max-gb");
+    if (fetched > fetchMaxBytes_)
+        throw std::runtime_error("stopped: fetched " + std::to_string(fetched >> 20) +
+                                 " MB, over fetch_max_gb");
 }
 
 void Session::processEvents()
@@ -185,7 +196,7 @@ StepTiming waitSettled(Session& session, const std::vector<Viewer*>& viewers, Cl
             step.settledMs = msSince(start);
             break;
         }
-        session.checkPrefetchBudget();
+        session.checkFetchBudget();
         QThread::usleep(200);
     }
     step.frames = framesNow();
@@ -208,59 +219,6 @@ void record(Report& report, const std::string& group, const StepTiming& step)
         report.add(group, "timeouts", 1);
         std::fprintf(stderr, "warning: %s did not settle within the timeout\n", group.c_str());
     }
-}
-
-// ---------------------------------------------------------------------------
-// Surfaces
-
-namespace {
-bool validVertex(const cv::Vec3f& p)
-{
-    return std::isfinite(p[0]) && std::isfinite(p[1]) && std::isfinite(p[2]) && p[0] >= 0 && p[1] >= 0 &&
-           p[2] >= 0;
-}
-} // namespace
-
-std::shared_ptr<QuadSurface> loadSurface(const std::filesystem::path& tifxyz, float coordinateScale)
-{
-    auto loaded = load_quad_from_tifxyz(tifxyz);
-    if (!loaded)
-        throw std::runtime_error("cannot load " + tifxyz.string());
-    cv::Mat_<cv::Vec3f> points = loaded->rawPoints().clone();
-    for (auto& p : points)
-        if (validVertex(p))
-            p *= coordinateScale;
-    return std::make_shared<QuadSurface>(points, loaded->scale() / coordinateScale);
-}
-
-cv::Vec3f surfaceCenter(QuadSurface& surface)
-{
-    const auto& points = *surface.rawPointsPtr();
-    const int cy = points.rows / 2, cx = points.cols / 2;
-    for (int r = 0; r < std::max(points.rows, points.cols); ++r)
-        for (int y = std::max(0, cy - r); y <= std::min(points.rows - 1, cy + r); ++y)
-            for (int x = std::max(0, cx - r); x <= std::min(points.cols - 1, cx + r); ++x)
-                if (validVertex(points(y, x)))
-                    return points(y, x);
-    throw std::runtime_error("surface has no valid vertex");
-}
-
-std::vector<cv::Vec3f> surfaceSamplePoints(QuadSurface& surface, int count)
-{
-    const auto& points = *surface.rawPointsPtr();
-    std::vector<cv::Vec3f> valid;
-    // A coarse lattice keeps the choice deterministic and spread over the sheet.
-    const int step = std::max(1, int(std::sqrt(double(points.total()) / std::max(1, count * 4))));
-    for (int y = step / 2; y < points.rows; y += step)
-        for (int x = step / 2; x < points.cols; x += step)
-            if (validVertex(points(y, x)))
-                valid.push_back(points(y, x));
-    std::vector<cv::Vec3f> out;
-    if (valid.empty())
-        return out;
-    for (int i = 0; i < count; ++i)
-        out.push_back(valid[(std::size_t(i) * 7919) % valid.size()]);
-    return out;
 }
 
 } // namespace vcbench

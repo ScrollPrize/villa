@@ -1,7 +1,7 @@
 // VC's own render pipeline before vc_reader (origin/main): Volume's shared
 // vc::render::ChunkCache, sampled by ChunkedPlaneSampler. CPU only.
 
-#include "bench_common.hpp"
+#include "bench_session.hpp"
 
 #include "CState.hpp"
 
@@ -12,34 +12,28 @@
 
 namespace vcbench::pipeline {
 
-std::string name(const Args& args)
-{
-    if (args.str("backend", "cpu") != "cpu")
-        throw std::invalid_argument("this tree's pipeline (ChunkCache) has no --backend but cpu");
-    return "chunkcache";
-}
+void writeSettings(Fixture&, const std::string&) {}
 
-void writeSettings(const Args&, const std::string&) {}
-
-void initProcess(const Args& args)
+void initProcess(Fixture& fixture)
 {
     // As VCAppMain: one process-wide service, sized by the RAM cache.
     vc::render::ChunkCacheService::Options options;
-    options.decodedByteCapacity = std::size_t(args.num("cache-gb", 16)) << 30;
+    options.decodedByteCapacity = std::size_t(fixture.num("cache_gb", 16)) << 30;
     vc::render::configureProcessChunkCacheService(std::move(options));
 }
 
-std::unique_ptr<CState> makeState(const Args&)
+std::unique_ptr<CState> makeState(Fixture&)
 {
     return std::make_unique<CState>(nullptr);
 }
 
-std::shared_ptr<Volume> openVolume(const Args& args, const std::string& localPath, const std::string&)
+std::shared_ptr<Volume> openVolume(const VolumeSource& source)
 {
-    if (args.flag("prefetch"))
-        throw std::invalid_argument("--prefetch runs on a vc_reader build; this one reads the local folder only");
-    // A local volume has no persistent cache: the folder is only read.
-    return Volume::New(localPath);
+    // The cached copy as a local volume: this tree has no persistent cache for it, the
+    // folder is only read. (The fixture allows only cache state "cached" here.)
+    if (source.remote)
+        throw std::invalid_argument("this tree opens local volumes only");
+    return Volume::New(source.location);
 }
 
 std::map<std::string, std::string> cacheSummary(CState&, Volume& volume)

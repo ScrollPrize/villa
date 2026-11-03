@@ -5,7 +5,7 @@
 // is timed from the input to the first presented frame and to every viewer
 // settling (final frame shown, no reads left).
 
-#include "bench_common.hpp"
+#include "bench_session.hpp"
 
 #include "CState.hpp"
 #include "volume_viewers/CChunkedVolumeViewer.hpp"
@@ -50,37 +50,34 @@ void setPlanes(Session& session, Layout& layout, const cv::Vec3f& point)
 int main(int argc, char** argv)
 {
     try {
-        Args args(argc, argv);
-        Session session(argc, argv, args);
-        const auto segmentPath = args.str("segment");
-        if (segmentPath.empty())
-            throw std::invalid_argument("--segment <tifxyz folder> is required");
-        const float segmentScale = float(args.num("segment-scale", 1));
-        const int width = session.viewSize(int(args.num("width", 960)));
-        const int height = session.viewSize(int(args.num("height", 540)));
-        const int passes = int(args.num("passes", 2));
+        Fixture fixture(argc, argv, "viewer_navigation");
+        if (fixture.listOnly())
+            return 0;
+        Session session(argc, argv, fixture);
+        const int width = session.viewSize(fixture.integer("width", 960));
+        const int height = session.viewSize(fixture.integer("height", 540));
+        const int passes = fixture.integer("passes", 2);
         // Pixels per level-0 voxel the viewers are zoomed to after opening (VC3D opens
         // slice views on the whole scroll).
-        const float viewScale = float(args.num("view-scale", 1.0));
-        const int panSteps = int(args.num("pan-steps", 8));
-        const int zoomSteps = int(args.num("zoom-steps", 4));
-        const int sliceSteps = int(args.num("slice-steps", 8));
-        const int jumps = int(args.num("jumps", 8));
-        const int burst = int(args.num("burst", 60));
-        const double timeoutMs = args.num("timeout-ms", 120000);
-        const auto json = args.str("json");
-        const auto dump = args.str("dump");
-        args.rejectUnused();
+        const float viewScale = float(fixture.num("view_scale", 1.0));
+        const int panSteps = fixture.integer("pan_steps", 8);
+        const int zoomSteps = fixture.integer("zoom_steps", 4);
+        const int sliceSteps = fixture.integer("slice_steps", 8);
+        const int jumps = fixture.integer("jumps", 8);
+        const int burst = fixture.integer("burst", 60);
+        const double timeoutMs = fixture.num("timeout_ms", 120000);
+        const auto& dump = fixture.dumpDir();
 
         Layout layout;
-        layout.segment = loadSurface(segmentPath, segmentScale);
+        layout.segment = fixture.loadSegment();
+        fixture.rejectUnused();
         layout.focus = surfaceCenter(*layout.segment);
         const auto jumpPoints = surfaceSamplePoints(*layout.segment, jumps);
         layout.planes = {{"xy plane", std::make_shared<PlaneSurface>(layout.focus, cv::Vec3f(0, 0, 1))},
                          {"xz plane", std::make_shared<PlaneSurface>(layout.focus, cv::Vec3f(0, 1, 0))},
                          {"yz plane", std::make_shared<PlaneSurface>(layout.focus, cv::Vec3f(1, 0, 0))}};
 
-        Report report("viewer_navigation", session.pipelineName(), {});
+        auto report = fixture.makeReport();
 
         // Open: viewers exist, then the surfaces and the volume arrive (cold caches).
         for (const auto& [name, plane] : layout.planes)
@@ -186,7 +183,7 @@ int main(int argc, char** argv)
 
         session.noteCaches();
         report.setConfig(session.config());
-        report.finish(json);
+        report.finish(fixture.jsonPath());
         layout.viewers.clear();
         return 0;
     } catch (const std::exception& e) {
