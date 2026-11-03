@@ -28,6 +28,7 @@ struct AutoExtendOptions
     int rounds{8};
     // Worker threads for the walk; 0 uses the hardware concurrency.
     int threads{0};
+    ManualAddTool::SheetWalkOptions sheetWalk;
 };
 
 struct AutoExtendStep
@@ -36,7 +37,8 @@ struct AutoExtendStep
     int round{0};
     int lines{0};
     int added{0};
-    // Walk steps with no usable normal; those steps continue straight.
+    // Normal queries with no usable normal (includes RK stages and derivatives).
+    // Kept under the legacy steps_without_normal report key.
     int stepsWithoutNormal{0};
     // Set when the side had no edge to extend this round.
     std::string skipped;

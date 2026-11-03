@@ -103,6 +103,32 @@ SegmentationManualAddPanel::SegmentationManualAddPanel(const QString& settingsGr
                                    "(vc_reader sheet normals) instead of continuing it straight. "
                                    "Your Shift+clicks still correct it."));
     layout->addWidget(_chkFollowSheet);
+    auto* walkForm = new QFormLayout();
+    _spinNormalStep = new QDoubleSpinBox(group);
+    _spinNormalStep->setRange(0, 10000);
+    _spinNormalStep->setDecimals(2);
+    _spinNormalStep->setSingleStep(0.25);
+    _spinNormalStep->setSpecialValueText(tr("One step per vertex"));
+    _spinNormalStep->setSuffix(tr(" voxels"));
+    _spinNormalStep->setToolTip(tr("Maximum internal step length; mesh vertex spacing stays unchanged. "
+                                   "Smaller steps take longer. Changes apply to the next extension."));
+    walkForm->addRow(tr("Normal substep"), _spinNormalStep);
+    _comboWalkMode = new QComboBox(group);
+    _comboWalkMode->addItem(tr("Projection"));
+    _comboWalkMode->addItem(tr("Streamline"));
+    _comboWalkMode->setToolTip(tr("Streamline transports the tangent along the normal field. "
+                                  "Changes apply to the next extension."));
+    walkForm->addRow(tr("Sheet walk"), _comboWalkMode);
+    _comboIntegrator = new QComboBox(group);
+    _comboIntegrator->addItem(tr("Midpoint (RK2)"));
+    _comboIntegrator->addItem(tr("Heun (RK2)"));
+    _comboIntegrator->addItem(tr("RK4"));
+    _comboIntegrator->setEnabled(false);
+    walkForm->addRow(tr("Streamline method"), _comboIntegrator);
+    connect(_comboWalkMode, &QComboBox::currentIndexChanged, this, [this](int mode) {
+        _comboIntegrator->setEnabled(mode == 1);
+    });
+    layout->addLayout(walkForm);
 
     auto* extendRow = new QHBoxLayout();
     extendRow->addWidget(new QLabel(tr("Extend edge"), group));
@@ -160,6 +186,9 @@ SegmentationManualAddPanel::SegmentationManualAddPanel(const QString& settingsGr
     connect(_chkIncludeTouchedValidBorder, &QCheckBox::toggled, this, persist);
     connect(_chkAllowBoundarySmoothing, &QCheckBox::toggled, this, persist);
     connect(_chkFollowSheet, &QCheckBox::toggled, this, persist);
+    connect(_spinNormalStep, &QDoubleSpinBox::valueChanged, this, persist);
+    connect(_comboWalkMode, &QComboBox::currentIndexChanged, this, persist);
+    connect(_comboIntegrator, &QComboBox::currentIndexChanged, this, persist);
     connect(_btnClearPending, &QPushButton::clicked, this, &SegmentationManualAddPanel::clearPendingRequested);
     connect(_btnRecompute, &QPushButton::clicked, this, &SegmentationManualAddPanel::recomputeRequested);
     connect(_btnApplyExit, &QPushButton::clicked, this, &SegmentationManualAddPanel::applyExitRequested);
@@ -199,6 +228,9 @@ ManualAddTool::Config SegmentationManualAddPanel::config() const
     cfg.includeTouchedValidBorder = _chkIncludeTouchedValidBorder->isChecked();
     cfg.allowBoundarySmoothing = _chkAllowBoundarySmoothing->isChecked();
     cfg.followSheet = _chkFollowSheet->isChecked();
+    cfg.sheetWalk.maxStep = _spinNormalStep->value();
+    cfg.sheetWalk.mode = static_cast<ManualAddTool::SheetWalkMode>(_comboWalkMode->currentIndex());
+    cfg.sheetWalk.integrator = static_cast<ManualAddTool::SheetIntegrator>(_comboIntegrator->currentIndex());
     return cfg;
 }
 
@@ -282,6 +314,13 @@ void SegmentationManualAddPanel::restoreSettings(QSettings& settings)
         const QSignalBlocker blocker(_chkFollowSheet);
         _chkFollowSheet->setChecked(settings.value(QStringLiteral("manual_add_follow_sheet"), true).toBool());
     }
+    setSpin(_spinNormalStep, settings.value(QStringLiteral("manual_add_normal_step"), 0.0).toDouble());
+    {
+        const QSignalBlocker modeBlocker(_comboWalkMode), methodBlocker(_comboIntegrator);
+        _comboWalkMode->setCurrentIndex(std::clamp(settings.value(QStringLiteral("manual_add_walk_mode"), 0).toInt(), 0, 1));
+        _comboIntegrator->setCurrentIndex(std::clamp(settings.value(QStringLiteral("manual_add_integrator"), 0).toInt(), 0, 2));
+        _comboIntegrator->setEnabled(_comboWalkMode->currentIndex() == 1);
+    }
     _restoringSettings = false;
 }
 
@@ -335,4 +374,7 @@ void SegmentationManualAddPanel::persistFromUi()
     writeSetting(QStringLiteral("manual_add_include_touched_valid_border"), _chkIncludeTouchedValidBorder->isChecked());
     writeSetting(QStringLiteral("manual_add_allow_boundary_smoothing"), _chkAllowBoundarySmoothing->isChecked());
     writeSetting(QStringLiteral("manual_add_follow_sheet"), _chkFollowSheet->isChecked());
+    writeSetting(QStringLiteral("manual_add_normal_step"), _spinNormalStep->value());
+    writeSetting(QStringLiteral("manual_add_walk_mode"), _comboWalkMode->currentIndex());
+    writeSetting(QStringLiteral("manual_add_integrator"), _comboIntegrator->currentIndex());
 }

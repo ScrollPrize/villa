@@ -12,8 +12,8 @@ class Volume;
 
 // CT sheet normals at world points, from the anisotropic structure tensor in
 // vc_reader (sheet_normals, recipe ct-anisotropic-1-24-4-grid3-r48-v4).
-// Queries are rounded to the 3-voxel lattice that estimator works on and
-// cached, so walking neighboring lines reuses them. Thread-safe.
+// Legacy queries are rounded to a 3-voxel lattice and cached. Substep and
+// streamline queries evaluate at their actual position. Thread-safe.
 class SheetNormalField
 {
 public:
@@ -21,7 +21,10 @@ public:
 
     // Unit normal (unsigned) at the lattice point nearest `world`, or nothing
     // where the tensor is flat or ambiguous or the volume has no support.
-    std::optional<cv::Vec3f> normalAt(const cv::Vec3f& world);
+    // continuous=true evaluates tensor weights at the exact world point,
+    // without rounding the query. The patch and gradient
+    // sampling lattice stay fixed within each 3-voxel cache cell.
+    std::optional<cv::Vec3f> normalAt(const cv::Vec3f& world, bool continuous = false);
 
 private:
     std::shared_ptr<Volume> _volume;

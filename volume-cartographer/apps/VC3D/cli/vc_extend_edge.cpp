@@ -12,6 +12,7 @@
 #include <boost/program_options.hpp>
 
 #include <chrono>
+#include <cmath>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -54,6 +55,10 @@ int main(int argc, char** argv)
         ("cells", po::value<int>()->default_value(10), "vertices added per line per round")
         ("rounds", po::value<int>()->default_value(8), "rounds of growth")
         ("threads", po::value<int>()->default_value(0), "worker threads for the walk (0: all cores)")
+        ("normal-step", po::value<double>()->default_value(0),
+         "maximum internal step in voxels (0: one step per output vertex; positive minimum 0.01)")
+        ("walk-mode", po::value<std::string>()->default_value("projection"), "projection or streamline")
+        ("integrator", po::value<std::string>()->default_value("midpoint"), "streamline method: midpoint, heun, rk4")
         ("overwrite", po::bool_switch(), "replace --output if it exists")
         ("json", po::bool_switch(), "print the report as JSON")
         ("report", po::value<std::string>(), "also write the JSON report to this file");
@@ -75,6 +80,21 @@ int main(int argc, char** argv)
     options.cells = vm["cells"].as<int>();
     options.rounds = vm["rounds"].as<int>();
     options.threads = vm["threads"].as<int>();
+    options.sheetWalk.maxStep = vm["normal-step"].as<double>();
+    const auto mode = vm["walk-mode"].as<std::string>();
+    const auto integrator = vm["integrator"].as<std::string>();
+    if (!std::isfinite(options.sheetWalk.maxStep) || options.sheetWalk.maxStep < 0 ||
+        options.sheetWalk.maxStep > 10000 ||
+        (options.sheetWalk.maxStep > 0 && options.sheetWalk.maxStep < 0.01) ||
+        (mode != "projection" && mode != "streamline") ||
+        (integrator != "midpoint" && integrator != "heun" && integrator != "rk4")) {
+        std::cerr << "error: invalid normal-step, walk-mode or integrator\n";
+        return 2;
+    }
+    options.sheetWalk.mode = mode == "streamline" ? ManualAddTool::SheetWalkMode::Streamline
+                                                  : ManualAddTool::SheetWalkMode::Projection;
+    options.sheetWalk.integrator = integrator == "rk4" ? ManualAddTool::SheetIntegrator::RK4
+        : integrator == "heun" ? ManualAddTool::SheetIntegrator::Heun : ManualAddTool::SheetIntegrator::Midpoint;
     options.sides.clear();
     {
         std::stringstream list(vm["sides"].as<std::string>());
@@ -112,7 +132,7 @@ int main(int argc, char** argv)
     SheetNormalField normals(volume);
     std::string status;
     const auto result = segmentation::autoExtendSurface(
-        *surface, [&](const cv::Vec3f& world) { return normals.normalAt(world); }, options, &status);
+        *surface, [&](const cv::Vec3f& world) { return normals.normalAt(world, options.sheetWalk.continuousNormals()); }, options, &status);
     if (!result) {
         std::cerr << "error: " << status << '\n';
         return 1;
@@ -133,6 +153,9 @@ int main(int argc, char** argv)
         report["input"] = input.string();
         report["output"] = output.string();
         report["normals_volume"] = vm["normals-volume"].as<std::string>();
+        report["normal_step"] = options.sheetWalk.maxStep;
+        report["walk_mode"] = mode;
+        report["integrator"] = integrator;
         report["cells"] = options.cells;
         report["rounds"] = options.rounds;
         report["grid_before"] = utils::Json::array();
@@ -170,7 +193,7 @@ int main(int argc, char** argv)
                 std::cout << "skipped (" << step.skipped << ")\n";
             } else {
                 std::cout << step.added << " vertices on " << step.lines << " lines, "
-                          << step.stepsWithoutNormal << " steps without a normal\n";
+                          << step.stepsWithoutNormal << " normal queries without a usable normal\n";
             }
         }
         std::cout << "grid " << before.height << "x" << before.width << " -> " << after.height << "x"

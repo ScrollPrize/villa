@@ -52,6 +52,7 @@ std::optional<AutoExtendResult> autoExtendSurface(QuadSurface& surface,
     }
 
     ManualAddTool::Config config;
+    config.sheetWalk = options.sheetWalk;
     config.interpolationMode = ManualAddTool::InterpolationMode::ThinPlateSpline;
     config.maxPreviewSpan = std::max(config.maxPreviewSpan, options.cells);
     const int threads = options.threads > 0

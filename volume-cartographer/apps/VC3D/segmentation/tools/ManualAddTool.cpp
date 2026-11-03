@@ -211,6 +211,12 @@ std::optional<ManualAddTool::ExtendSide> ManualAddTool::extensionSide() const
 
 ManualAddTool::Config ManualAddTool::sanitize(Config config)
 {
+    if (!std::isfinite(config.sheetWalk.maxStep) || config.sheetWalk.maxStep < 0)
+        config.sheetWalk.maxStep = 0;
+    if (config.sheetWalk.maxStep > 0)
+        config.sheetWalk.maxStep = std::clamp(config.sheetWalk.maxStep, 0.01, 10000.0);
+    config.sheetWalk.mode = static_cast<SheetWalkMode>(std::clamp(static_cast<int>(config.sheetWalk.mode), 0, 1));
+    config.sheetWalk.integrator = static_cast<SheetIntegrator>(std::clamp(static_cast<int>(config.sheetWalk.integrator), 0, 2));
     config.maxPreviewSpan = std::clamp(config.maxPreviewSpan, 4, 4096);
     config.boundaryBand = std::clamp(config.boundaryBand, 1, 20);
     config.regularization = std::clamp(config.regularization, 0.0, 1.0);
@@ -1256,8 +1262,115 @@ std::optional<ManualAddTool::SheetWalk> ManualAddTool::sheetWalk() const
         _extension->guess.size() != _extension->origins.size() * static_cast<std::size_t>(_extension->cells)) {
         return std::nullopt;
     }
-    return SheetWalk{_extension->id, _extension->cells, _extension->origins, _extension->steps};
+    return SheetWalk{_extension->id, _extension->cells, _extension->origins, _extension->steps, _config.sheetWalk};
 }
+
+namespace {
+using Walk = ManualAddTool;
+using Vec = cv::Vec3d;
+struct WalkState { Vec x, v; };
+WalkState add(const WalkState& a, const WalkState& b, double h)
+{
+    return {a.x + h * b.x, a.v + h * b.v};
+}
+std::optional<Vec> walkNormal(const Walk::SheetNormalFn& normal, const Vec& x)
+{
+    if (!normal) return std::nullopt;
+    const auto n = normal(cv::Vec3f(x));
+    if (!n) return std::nullopt;
+    const double length = cv::norm(*n);
+    if (!std::isfinite(length) || length <= 0.5) return std::nullopt;
+    return Vec(*n) / length;
+}
+Vec tangent(const Vec& v, const Vec& n)
+{
+    const Vec t = v - n * v.dot(n);
+    const double length = cv::norm(t);
+    return length > 1e-3 * cv::norm(v) ? t / length : v / cv::norm(v);
+}
+// Minimum-turn transport: x' = v, v' = -n (v . Dn v).
+// Central differences require only unsigned normals, not tensor derivatives.
+// Align signs before differencing; reversing an eigenvector must not steer us.
+std::optional<WalkState> derivative(const WalkState& s, const Walk::SheetNormalFn& normal)
+{
+    const double speed = cv::norm(s.v);
+    if (!std::isfinite(speed) || speed < 1e-12) return std::nullopt;
+    const Vec direction = s.v / speed;
+    constexpr double epsilon = 0.25; // volume voxels; derivative accuracy floor
+    auto n = walkNormal(normal, s.x);
+    auto plus = walkNormal(normal, s.x + epsilon * direction);
+    auto minus = walkNormal(normal, s.x - epsilon * direction);
+    if (!n || !plus || !minus) return std::nullopt;
+    if (plus->dot(*n) < 0) *plus = -*plus;
+    if (minus->dot(*n) < 0) *minus = -*minus;
+    const Vec dn = (*plus - *minus) * (speed / (2 * epsilon));
+    return WalkState{s.v, -*n * s.v.dot(dn)};
+}
+std::optional<WalkState> integrate(WalkState s, double h, Walk::SheetIntegrator method,
+                                   const Walk::SheetNormalFn& normal)
+{
+    const auto n = walkNormal(normal, s.x);
+    if (!n) return std::nullopt;
+    s.v = tangent(s.v, *n);
+    const auto k1 = derivative(s, normal);
+    if (!k1) return std::nullopt;
+    WalkState next;
+    if (method == Walk::SheetIntegrator::Heun) {
+        const auto k2 = derivative(add(s, *k1, h), normal);
+        if (!k2) return std::nullopt;
+        next = add(add(s, *k1, h / 2), *k2, h / 2);
+    } else {
+        const auto k2 = derivative(add(s, *k1, h / 2), normal);
+        if (!k2) return std::nullopt;
+        if (method == Walk::SheetIntegrator::RK4) {
+            const auto k3 = derivative(add(s, *k2, h / 2), normal);
+            if (!k3) return std::nullopt;
+            const auto k4 = derivative(add(s, *k3, h), normal);
+            if (!k4) return std::nullopt;
+            next = add(add(add(add(s, *k1, h / 6), *k2, h / 3), *k3, h / 3), *k4, h / 6);
+        } else {
+            next = add(s, *k2, h);
+        }
+    }
+    const auto endNormal = walkNormal(normal, next.x);
+    if (!endNormal || !std::isfinite(cv::norm(next.v)) || cv::norm(next.v) < 1e-12)
+        return std::nullopt;
+    next.v = tangent(next.v, *endNormal);
+    return next;
+}
+void walkSheetSubsteps(const Walk::SheetWalk& walk, std::size_t line,
+                       const Walk::SheetNormalFn& normal, std::vector<cv::Vec3f>& guess)
+{
+    const double length = cv::norm(walk.steps[line]);
+    WalkState state{Vec(walk.origins[line]), Vec(walk.steps[line])};
+    if (!std::isfinite(length) || length <= 0) {
+        for (int k = 0; k < walk.cells; ++k)
+            guess[line * walk.cells + k] = walk.origins[line];
+        return;
+    }
+    state.v /= length;
+    const double maxStep = std::isfinite(walk.options.maxStep) && walk.options.maxStep > 0
+        ? std::max(0.01, walk.options.maxStep) : length;
+    const double count = std::max(1.0, std::ceil(length / maxStep));
+    const double h = length / count;
+    for (int k = 0; k < walk.cells; ++k) {
+        for (double j = 0; j < count; ++j) {
+            if (walk.options.mode == Walk::SheetWalkMode::Streamline) {
+                if (auto next = integrate(state, h, walk.options.integrator, normal)) {
+                    state = *next;
+                    continue;
+                }
+            }
+            // Projection mode, also the fallback if any integration stage
+            // lacks a normal. Missing midpoint normals continue straight.
+            if (auto n = walkNormal(normal, state.x + state.v * (h / 2)))
+                state.v = tangent(state.v, *n);
+            state.x += h * state.v;
+        }
+        guess[line * walk.cells + k] = cv::Vec3f(state.x);
+    }
+}
+} // namespace
 
 void ManualAddTool::walkSheetLine(const SheetWalk& walk,
                                   std::size_t line,
@@ -1266,6 +1379,10 @@ void ManualAddTool::walkSheetLine(const SheetWalk& walk,
 {
     if (line >= walk.origins.size() || line >= walk.steps.size() ||
         guess.size() < (line + 1) * static_cast<std::size_t>(walk.cells)) {
+        return;
+    }
+    if (walk.options.maxStep > 0 || walk.options.mode == SheetWalkMode::Streamline) {
+        walkSheetSubsteps(walk, line, normal, guess);
         return;
     }
     cv::Vec3f point = walk.origins[line];

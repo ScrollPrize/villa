@@ -1756,8 +1756,8 @@ bool SegmentationModule::followSheetForManualAdd()
     const ManualAddTool::SheetWalk job = *walk;
     QtConcurrent::run([job, normals]() {
         std::vector<cv::Vec3f> guess(job.origins.size() * static_cast<std::size_t>(job.cells));
-        const ManualAddTool::SheetNormalFn normal = [normals](const cv::Vec3f& world) {
-            return normals->normalAt(world);
+        const ManualAddTool::SheetNormalFn normal = [normals, job](const cv::Vec3f& world) {
+            return normals->normalAt(world, job.options.continuousNormals());
         };
         // Lines are independent; spread them over the cores.
         std::atomic<std::size_t> next{0};

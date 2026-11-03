@@ -13,6 +13,7 @@
 #include <cmath>
 #include <filesystem>
 #include <optional>
+#include <limits>
 
 namespace {
 
@@ -66,6 +67,10 @@ private slots:
     void extensionKeepsItsSpan();
     void undoHistoryFollowsGridPadding();
     void sheetWalkFollowsACurvedSheet();
+    void streamlineConverges_data();
+    void streamlineConverges();
+    void substepsPreserveSpacingAndHandleMissingNormals();
+    void projectionSubstepsReduceDrift();
     void guidedClicksStayLocal();
     void autoExtendGrowsAlongTheSheet();
 };
@@ -514,6 +519,94 @@ void TestManualAddExtend::autoExtendGrowsAlongTheSheet()
     QVERIFY2(none, status.c_str());
     QCOMPARE(none->steps[0].stepsWithoutNormal, 6 * 5);
     QVERIFY(distance((*flat.rawPointsPtr())(3, 14), cv::Vec3f(14 * kSpacing, 3 * kSpacing, 100.0f)) < 1e-3f);
+}
+
+void TestManualAddExtend::streamlineConverges_data()
+{
+    QTest::addColumn<int>("method");
+    QTest::newRow("midpoint") << 0;
+    QTest::newRow("heun") << 1;
+    QTest::newRow("rk4") << 2;
+}
+
+void TestManualAddExtend::streamlineConverges()
+{
+    QFETCH(int, method);
+    // A unit-speed great circle on a sphere: both exact position and tangent
+    // are known. This exercises direction transport, not just normal projection.
+    constexpr double radius = 40;
+    const auto run = [&](double h, bool flip) {
+        ManualAddTool::SheetWalk walk;
+        walk.cells = 8;
+        walk.origins = {cv::Vec3f(radius, 0, 0)};
+        walk.steps = {cv::Vec3f(0, 3, 4)};
+        walk.options.maxStep = h;
+        walk.options.mode = ManualAddTool::SheetWalkMode::Streamline;
+        walk.options.integrator = static_cast<ManualAddTool::SheetIntegrator>(method);
+        std::vector<cv::Vec3f> result(walk.cells);
+        ManualAddTool::walkSheetLine(walk, 0, [flip](const cv::Vec3f& p) -> std::optional<cv::Vec3f> {
+            const float sign = flip && static_cast<int>(std::floor(p[1])) % 2 ? -1.f : 1.f;
+            return p * (sign / static_cast<float>(cv::norm(p)));
+        }, result);
+        return result.back();
+    };
+    const cv::Vec3f expected(radius * std::cos(1.0), radius * 0.6 * std::sin(1.0),
+                             radius * 0.8 * std::sin(1.0));
+    const auto coarse = run(5, false), fine = run(1.25, false);
+    const float coarseError = distance(coarse, expected), fineError = distance(fine, expected);
+    QVERIFY2(fineError < 0.01f, qPrintable(QString::number(fineError)));
+    // RK4 reaches the fixed finite-difference / float-normal accuracy floor.
+    QVERIFY2(fineError < coarseError || fineError < 0.001f,
+             qPrintable(QString("coarse %1 fine %2").arg(coarseError).arg(fineError)));
+    QVERIFY(distance(fine, run(1.25, true)) < 1e-5f);
+}
+
+void TestManualAddExtend::substepsPreserveSpacingAndHandleMissingNormals()
+{
+    for (int mode = 0; mode < 2; ++mode) {
+        for (int method = 0; method < 3; ++method) {
+            ManualAddTool::SheetWalk walk;
+            walk.cells = 3;
+            walk.origins = {cv::Vec3f(10, 20, 30)};
+            walk.steps = {cv::Vec3f(2, 0, 0)};
+            walk.options.maxStep = 0.3;
+            walk.options.mode = static_cast<ManualAddTool::SheetWalkMode>(mode);
+            walk.options.integrator = static_cast<ManualAddTool::SheetIntegrator>(method);
+            for (int field = 0; field < 4; ++field) {
+                std::vector<cv::Vec3f> result(walk.cells);
+                ManualAddTool::walkSheetLine(walk, 0, [field](const cv::Vec3f&) -> std::optional<cv::Vec3f> {
+                    if (field == 0) return std::nullopt;
+                    if (field == 1) return cv::Vec3f(0, 0, 1);
+                    if (field == 2) return cv::Vec3f(1, 0, 0); // degenerate projection
+                    return cv::Vec3f(std::numeric_limits<float>::quiet_NaN(), 0, 0);
+                }, result);
+                for (int k = 0; k < walk.cells; ++k)
+                    QVERIFY(distance(result[k], walk.origins[0] + walk.steps[0] * float(k + 1)) < 1e-5f);
+            }
+            walk.steps[0] = cv::Vec3f(0, 0, 0);
+            std::vector<cv::Vec3f> stationary(walk.cells);
+            ManualAddTool::walkSheetLine(walk, 0, {}, stationary);
+            for (const auto& point : stationary) QCOMPARE(point, walk.origins[0]);
+        }
+    }
+}
+
+void TestManualAddExtend::projectionSubstepsReduceDrift()
+{
+    const auto run = [](double h) {
+        ManualAddTool::SheetWalk walk;
+        walk.cells = 10;
+        walk.origins = {cv::Vec3f(20, 0, 0)};
+        walk.steps = {cv::Vec3f(0, 4, 0)};
+        walk.options.maxStep = h;
+        std::vector<cv::Vec3f> result(walk.cells);
+        ManualAddTool::walkSheetLine(walk, 0, [](const cv::Vec3f& p) -> std::optional<cv::Vec3f> {
+            return p / static_cast<float>(cv::norm(p));
+        }, result);
+        const cv::Vec3f expected(20 * std::cos(2.0), 20 * std::sin(2.0), 0);
+        return distance(result.back(), expected);
+    };
+    QVERIFY(run(0.5) < run(0));
 }
 
 QTEST_APPLESS_MAIN(TestManualAddExtend)

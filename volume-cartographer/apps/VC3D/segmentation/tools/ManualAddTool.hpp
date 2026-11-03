@@ -57,6 +57,18 @@ public:
         int last{-1};
     };
 
+    enum class SheetWalkMode { Projection = 0, Streamline = 1 };
+    enum class SheetIntegrator { Midpoint = 0, Heun = 1, RK4 = 2 };
+    struct SheetWalkOptions
+    {
+        // Maximum internal arc-length step in volume voxels; 0 uses one
+        // step per output vertex. Output mesh spacing is unchanged.
+        double maxStep{0.0};
+        SheetWalkMode mode{SheetWalkMode::Projection};
+        SheetIntegrator integrator{SheetIntegrator::Midpoint};
+        bool continuousNormals() const { return maxStep > 0 || mode == SheetWalkMode::Streamline; }
+    };
+
     struct Config
     {
         int maxPreviewSpan{256};
@@ -70,6 +82,7 @@ public:
         double guidedClickReach{4.0};
         // Re-walk each new extension along the CT sheet (SegmentationModule).
         bool followSheet{true};
+        SheetWalkOptions sheetWalk;
         int previewThrottleMs{50};
         float tintOpacity{0.45f};
         double planeConstraintRadius{30.0};
@@ -158,9 +171,9 @@ public:
     [[nodiscard]] bool extensionActive() const { return _extension.has_value(); }
     [[nodiscard]] std::optional<ExtendSide> extensionSide() const;
     // Following the sheet. Each line of the pending extension is walked
-    // again from its edge vertex in steps of its own length, each step turned
-    // into the plane across the CT sheet normal at its midpoint, so the strip
-    // bends with the papyrus instead of running straight. sheetWalk() copies
+    // again from its edge vertex. Projection turns each step into the plane
+    // across the midpoint normal; optional streamline integration transports
+    // its tangent with midpoint, Heun or RK4. sheetWalk() copies
     // what the walk needs, so the volume reads can run off the GUI thread;
     // applySheetWalk() installs the result only if the same extension is
     // still pending.
@@ -171,6 +184,7 @@ public:
         int cells{0};
         std::vector<cv::Vec3f> origins;
         std::vector<cv::Vec3f> steps;
+        SheetWalkOptions options;
     };
     [[nodiscard]] std::optional<SheetWalk> sheetWalk() const;
     // Walks line `line` of `walk`, writing its `cells` points into `guess`
@@ -228,6 +242,7 @@ private:
         // its straight continuation.
         std::vector<cv::Vec3f> origins;
         std::vector<cv::Vec3f> steps;
+        SheetWalkOptions options;
         // Continuation of each line past its edge, parallel to _fillVertices.
         std::vector<cv::Vec3f> guess;
         // Valid vertices at and just inside the edge; they keep their place.

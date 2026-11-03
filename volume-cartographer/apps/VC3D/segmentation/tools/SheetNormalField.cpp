@@ -110,7 +110,7 @@ SheetNormalField::SheetNormalField(std::shared_ptr<Volume> volume)
 {
 }
 
-std::optional<cv::Vec3f> SheetNormalField::normalAt(const cv::Vec3f& world)
+std::optional<cv::Vec3f> SheetNormalField::normalAt(const cv::Vec3f& world, bool continuous)
 {
     if (!_volume || !std::isfinite(world[0]) || !std::isfinite(world[1]) || !std::isfinite(world[2])) {
         return std::nullopt;
@@ -118,7 +118,7 @@ std::optional<cv::Vec3f> SheetNormalField::normalAt(const cv::Vec3f& world)
     const std::array<int, 3> lattice{static_cast<int>(std::lround(world[0] / 3.0f)) * 3,
                                      static_cast<int>(std::lround(world[1] / 3.0f)) * 3,
                                      static_cast<int>(std::lround(world[2] / 3.0f)) * 3};
-    {
+    if (!continuous) {
         std::lock_guard<std::mutex> lock(_mutex);
         if (auto it = _cache.find(lattice); it != _cache.end()) {
             return it->second;
@@ -149,7 +149,10 @@ std::optional<cv::Vec3f> SheetNormalField::normalAt(const cv::Vec3f& world)
     if (read) {
         // The lattice point is voxel 54 of the patch, which is 48 in the
         // estimator's site coordinates (its grid starts 6 voxels in).
-        const float center[4] = {48.0f, 48.0f, 48.0f, 1.0f};
+        const float center[4] = {
+            48.0f + (continuous ? world[0] - lattice[0] : 0.0f),
+            48.0f + (continuous ? world[1] - lattice[1] : 0.0f),
+            48.0f + (continuous ? world[2] - lattice[2] : 0.0f), 1.0f};
         float out[4] = {0.0f, 0.0f, 0.0f, 0.0f};
         vcr::sheet_normal::cpu<uint8_t>(image.data(), center, out, 1);
         if (out[3] > 0.0f) {
@@ -157,7 +160,9 @@ std::optional<cv::Vec3f> SheetNormalField::normalAt(const cv::Vec3f& world)
         }
     }
 
-    std::lock_guard<std::mutex> lock(_mutex);
-    _cache[lattice] = result;
+    if (!continuous) {
+        std::lock_guard<std::mutex> lock(_mutex);
+        _cache[lattice] = result;
+    }
     return result;
 }

@@ -56,6 +56,9 @@ private:
     QCheckBox* _chkIncludeTouchedValidBorder{nullptr};
     QCheckBox* _chkAllowBoundarySmoothing{nullptr};
     QCheckBox* _chkFollowSheet{nullptr};
+    QDoubleSpinBox* _spinNormalStep{nullptr};
+    QComboBox* _comboWalkMode{nullptr};
+    QComboBox* _comboIntegrator{nullptr};
     QPushButton* _btnClearPending{nullptr};
     QPushButton* _btnRecompute{nullptr};
     QPushButton* _btnApplyExit{nullptr};
