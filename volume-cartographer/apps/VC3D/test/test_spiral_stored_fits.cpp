@@ -174,6 +174,11 @@ void onlyCommittedFitsAreListedAndRead(const fs::path& directory)
                   "is not a committed Spiral fit", "a surface not tagged spiral-fit");
     requireThrows([&] { vc3d::spiral::readStoredFit(fixture.session, fixture.attachment, util::newUuid()); },
                   "is not in the attached object store", "a fit the store does not hold");
+    // A changed surface the workspace counts as another input unless it is
+    // a committed fit (SpiralWorkspace::noteStoreChanges).
+    const auto fits = vc3d::spiral::spiralFitsAmong(*fixture.session, fixture.attachment,
+                                                    {fit, other, util::newUuid()});
+    require(fits == std::set<std::string>{fit}, "only the committed fit is recognized among changed surfaces");
 }
 
 void aFitWhoseMapDisagreesWithItsBoundsIsRefused(const fs::path& directory)

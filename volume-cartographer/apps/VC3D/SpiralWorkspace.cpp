@@ -1807,6 +1807,7 @@ void SpiralWorkspace::noteStoreChanges(const vc::objects::StoreSessionEvent& eve
                            "same-surface", "fiber_branch", "crossing"}))
         return;
     const auto before = _changedOtherInputs.size();
+    std::vector<std::string> otherSurfaces;
     for (const auto& change : event.changes) {
         const QString uuid = QString::fromStdString(change.recordUuid);
         const bool object = change.kind == "surface" || change.kind == "point_collection" || change.kind == "fiber"
@@ -1818,8 +1819,25 @@ void SpiralWorkspace::noteStoreChanges(const vc::objects::StoreSessionEvent& eve
         else if (change.kind == "point-surface" || change.kind == "same-surface" || change.kind == "fiber_branch"
                  || change.kind == "crossing")
             _pendingLinkChanges.insert(change.recordUuid);
+        else if (change.kind == "surface")
+            otherSurfaces.push_back(change.recordUuid);
         else if (object)
             _changedOtherInputs.insert(uuid);
+    }
+    if (!otherSurfaces.empty()) {
+        // A committed Spiral fit (a commit, or one pulled from the hub) is
+        // never in a rebuild's selection: leave it out. Should the read
+        // fail, every surface counts.
+        std::set<std::string> fits;
+        if (const auto session = _state ? _state->objectStoreSession() : nullptr) {
+            try {
+                fits = vc3d::spiral::spiralFitsAmong(*session, event.attachment, otherSurfaces);
+            } catch (const std::exception&) {
+                fits.clear();
+            }
+        }
+        for (const auto& uuid : otherSurfaces)
+            if (!fits.count(uuid)) _changedOtherInputs.insert(QString::fromStdString(uuid));
     }
     if (!_pendingObjectChanges.empty() || !_pendingLinkChanges.empty()) _fitInputReload->start();
     if (_changedOtherInputs.size() != before) updateInputFreshness();

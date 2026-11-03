@@ -14,6 +14,7 @@
 #include <chrono>
 #include <memory>
 #include <optional>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -22,6 +23,17 @@ class QuadSurface;
 namespace vc3d::spiral {
 
 inline constexpr char kSpiralFitTag[] = "spiral-fit";
+
+// Whether `record` is a committed Spiral fit (a surface tagged spiral-fit),
+// retired or not. A fit never takes one in as an input.
+bool isSpiralFit(const vc::objects::ObjectRecord& record);
+
+// The committed Spiral fits among `uuids` in the attachment (retired ones
+// included); a UUID it no longer holds is not one. Throws when the store
+// cannot be read.
+std::set<std::string> spiralFitsAmong(vc::objects::ObjectStoreSession&,
+                                      const vc::objects::AttachmentIdentity&,
+                                      const std::vector<std::string>& uuids);
 
 // One committed fit as a listing shows it.
 struct StoredFitEntry {

@@ -18,8 +18,7 @@ using Json = nlohmann::json;
 
 bool committedFit(const vc::objects::ObjectRecord& record)
 {
-    return record.kind == "surface" && !record.retired
-        && std::find(record.tags.begin(), record.tags.end(), kSpiralFitTag) != record.tags.end();
+    return isSpiralFit(record) && !record.retired;
 }
 
 QJsonArray qtArray(const Json& value)
@@ -30,6 +29,26 @@ QJsonArray qtArray(const Json& value)
 }
 
 }  // namespace
+
+bool isSpiralFit(const vc::objects::ObjectRecord& record)
+{
+    return record.kind == "surface"
+        && std::find(record.tags.begin(), record.tags.end(), kSpiralFitTag) != record.tags.end();
+}
+
+std::set<std::string> spiralFitsAmong(vc::objects::ObjectStoreSession& session,
+                                      const vc::objects::AttachmentIdentity& attachment,
+                                      const std::vector<std::string>& uuids)
+{
+    std::set<std::string> fits;
+    if (uuids.empty()) return fits;
+    session.read(attachment, [&](const auto& db, const auto& txn, const auto&) {
+        for (const auto& uuid : uuids)
+            if (const auto record = db.objectByUuid(txn, uuid); record && isSpiralFit(*record))
+                fits.insert(uuid);
+    });
+    return fits;
+}
 
 std::vector<StoredFitEntry> listStoredFits(vc::objects::ObjectStoreSession& session,
                                            const vc::objects::AttachmentIdentity& attachment)
