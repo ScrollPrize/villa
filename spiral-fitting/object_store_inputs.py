@@ -1946,18 +1946,45 @@ DETECTOR_EDGE_KINDS = frozenset({'point-surface', 'same-surface', 'crossing'})
 FRAME_RECORD_KINDS = frozenset({'volume_transform', 'volume_transform_choice'})
 
 
-def link_marker_key(volume_uuid, config, normal_source):
+def link_marker_key_parts(volume_uuid, config, normal_source):
     """What links depend on outside the store: the fit volume, the
     detector parameters and normal source (link_refresh_provenance), the
-    store library's detector versions and which detectors run."""
+    store library's detector versions and which detectors run. A marker
+    records them with their digest (``key``), so a mismatch names what
+    changed."""
     from vc_object_store import detector_versions
-    return content_sha256({
+    return {
         'volume_uuid': volume_uuid,
         'link_refresh': link_refresh_provenance(config, normal_source),
         'detectors': detector_versions(),
         # Off leaves the overlap links unrefreshed: turning it on relinks.
         'patch_overlaps': bool(config['input_use_patch_overlaps']),
-    })
+    }
+
+
+def _flatten(value, prefix=''):
+    if isinstance(value, dict) and value:
+        return {path: leaf for key, item in value.items()
+                for path, leaf in _flatten(item, f'{prefix}{key}.').items()}
+    return {prefix[:-1]: value}
+
+
+_UNRECORDED = object()
+
+
+def key_changes(recorded, current, limit=3):
+    """What differs between two link_marker_key_parts, as ``path: old -> new``
+    (at most ``limit``, then a count)."""
+    old, new = _flatten(recorded), _flatten(current)
+
+    def shown(value):
+        return 'not recorded' if value is _UNRECORDED else repr(value)
+    changes = [f'{path}: {shown(old.get(path, _UNRECORDED))} -> {shown(new.get(path, _UNRECORDED))}'
+               for path in sorted(set(old) | set(new))
+               if old.get(path, _UNRECORDED) != new.get(path, _UNRECORDED)]
+    if len(changes) > limit:
+        changes = changes[:limit] + [f'{len(changes) - limit} more']
+    return changes
 
 
 def _uuids_sha256(uuids):
@@ -2008,12 +2035,12 @@ class LinkPlan:
         return f'link refresh: {self.mode}: {self.reason}'
 
 
-def plan_link_refresh(marker, state, key, selection, selected, *, incremental):
+def plan_link_refresh(marker, state, key_parts, selection, selected, *, incremental):
     """Decide how to refresh (LinkPlan) from the store's link marker.
 
     Skip when the marker is this store's, was written by a full refresh
-    (any refresh, for an input update: ``incremental``) with the same
-    ``key``, the current ``selection`` is the marker's or a subset of it
+    (any refresh, for an input update: ``incremental``) with the same key
+    (``key_parts``, link_marker_key_parts), the current ``selection`` is the marker's or a subset of it
     (tracks: the same), and every journal entry since its position is for
     an object outside ``selected`` (the current selection's UUIDs) and no
     detector relationship or volume registration. With ``incremental``,
@@ -2029,8 +2056,11 @@ def plan_link_refresh(marker, state, key, selection, selected, *, incremental):
         return full('the link marker has another format')
     if marker.get('owner') != state.owner:
         return full('the link marker describes other positions')
-    if marker.get('key') != key:
-        return full('the fit volume, link parameters, normal source or detector versions changed')
+    if marker.get('key') != content_sha256(key_parts):
+        recorded = marker.get('key_parts')
+        if recorded is None:
+            return full('the link inputs changed (the marker records no details)')
+        return full('the link inputs changed: ' + '; '.join(key_changes(recorded, key_parts)))
     if not marker.get('exact') and not incremental:
         return full('the last refresh was incremental')
     position = int(marker['position'])
@@ -2089,17 +2119,17 @@ def _refresh(store, snapshot, config, lasagna, cache_directory, log, *, state=No
     if normal.note:
         log(normal.note)
     selection = link_marker_selection(snapshot)
-    key = link_marker_key(snapshot.volume_uuid, config, normal)
+    key_parts = link_marker_key_parts(snapshot.volume_uuid, config, normal)
     if state is None:
         plan = LinkPlan('full', 'the store records no link state')
     elif config.get('object_store_full_link_refresh'):
         plan = LinkPlan('full', 'object_store_full_link_refresh is set')
     else:
-        plan = plan_link_refresh(store.link_marker(), state, key, selection, snapshot.objects,
+        plan = plan_link_refresh(store.link_marker(), state, key_parts, selection, snapshot.objects,
                                  incremental=incremental)
     log(plan.line())  # as decided, before any detector runs
     if plan.mode == 'skip':
-        return LinkResult([], [], plan)
+        return LinkResult([f'link refresh: skipped every detector ({plan.reason})'], [], plan)
     if (normal.kind == 'none' and snapshot.objects_of('fiber')
             and snapshot.objects_of('surface')):
         log('WARNING: fiber-patch links are refreshed centerline-only: the fit '
@@ -2110,12 +2140,14 @@ def _refresh(store, snapshot, config, lasagna, cache_directory, log, *, state=No
     lines, problems = refresh_report(refresh_links(
         store, snapshot, config, normal, cache_directory,
         new=plan.new if plan.mode == 'incremental' else None, progress=progress, log=log))
-    lines = lines + [f'link refresh: {plan.mode} refresh took {time.monotonic() - started:.1f} s']
+    lines = lines + [f'link refresh: {plan.mode} refresh ({plan.reason}) took '
+                     f'{time.monotonic() - started:.1f} s']
     owner = None if state is None else state.owner
 
     def marker(position):
         return {'version': LINK_MARKER_VERSION, 'owner': owner, 'position': int(position),
-                'key': key, 'exact': plan.mode == 'full', 'selection': selection}
+                'key': content_sha256(key_parts), 'key_parts': key_parts,
+                'exact': plan.mode == 'full', 'selection': selection}
     return LinkResult(lines, problems, plan, marker)
 
 

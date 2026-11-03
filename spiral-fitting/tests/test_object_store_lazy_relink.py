@@ -206,3 +206,31 @@ def test_patch_overlaps_off_skip_their_detector_and_turning_them_on_relinks(shar
     prepared, log = run(shared)
     assert plan(log) == 'full'
     assert any(line.startswith('link refresh patch_overlap: 0 created') for line in prepared.lines)
+
+
+def test_a_full_refresh_names_the_changed_link_input(shared, detectors):
+    run(shared)
+    prepared, log = run(shared, fit_config(shared, pcl_link_distance_tolerance=3.0))
+    [line] = [line for line in log if line.startswith('link refresh: full: ')]
+    assert 'link_refresh.parameters.pcl_link_distance_tolerance: ' in line and '-> 3.0' in line
+    # The report ends with the decision too.
+    assert prepared.lines[-2].startswith('link refresh: full refresh (the link inputs changed: ')
+    _, log = run(shared, fit_config(shared, pcl_link_distance_tolerance=3.0,
+                                    input_use_patch_overlaps=False))
+    assert any('patch_overlaps: True -> False' in line for line in log)
+
+
+def test_a_marker_without_key_details_still_forces_a_full_refresh(shared, detectors):
+    run(shared)
+    with ObjectStore.open(shared, author='service') as db:
+        old = db.link_marker()
+        db.set_link_marker({key: value for key, value in old.items() if key != 'key_parts'}
+                           | {'key': 'older'})
+    _, log = run(shared)
+    assert 'link refresh: full: the link inputs changed (the marker records no details)' in log
+
+
+def test_a_skip_reports_its_reason_with_the_refresh_lines(shared):
+    run(shared)
+    prepared, _ = run(shared)
+    assert prepared.lines[0].startswith('link refresh: skipped every detector (unchanged since position ')
