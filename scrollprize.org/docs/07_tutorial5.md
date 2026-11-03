@@ -113,7 +113,7 @@ Now let's train a model. The rest of this tutorial is hands-on: you will set up 
 
 ### The dataset
 
-The tutorial uses the [`ink-labels` dataset](/data_datasets#ink-labels-2026-07), which lives in the [`scrollprize/datasets` storage bucket](https://huggingface.co/buckets/scrollprize/datasets/tree/ink) on Hugging Face, organized by scroll. The full dataset is hundreds of GB, so the whole tutorial runs end-to-end on **one segment** of PHerc. Paris. 4 (Scroll 1) — about 25 GB:
+The tutorial uses the [`ink-labels` dataset](/data_datasets#ink-labels-2026-07), which lives in the [`scrollprize/datasets` storage bucket](https://huggingface.co/buckets/scrollprize/datasets/tree/ink) on Hugging Face, organized by scroll. The full dataset is hundreds of GB, so the whole tutorial runs end-to-end on **one segment** of PHerc. Paris. 4 (Scroll 1) — about 92 GB, most of it the surface volume's full-resolution level (67 GB). Add `--dry-run` to the command below to print the file list and total size without downloading anything:
 
 ```bash
 uvx --from huggingface_hub hf buckets sync \
