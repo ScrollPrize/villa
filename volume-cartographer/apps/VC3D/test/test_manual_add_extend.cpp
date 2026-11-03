@@ -14,6 +14,7 @@
 #include <filesystem>
 #include <optional>
 #include <limits>
+#include <stdexcept>
 
 namespace {
 
@@ -74,6 +75,7 @@ private slots:
     void projectionSubstepsReduceDrift();
     void guidedClicksStayLocal();
     void autoExtendGrowsAlongTheSheet();
+    void autoExtendReportsNormalFailures();
 };
 
 void TestManualAddExtend::paddingCoversOnlyTheMissingRoom()
@@ -633,6 +635,43 @@ void TestManualAddExtend::projectionSubstepsReduceDrift()
         return distance(result.back(), expected);
     };
     QVERIFY(run(0.5) < run(0));
+}
+
+void TestManualAddExtend::autoExtendReportsNormalFailures()
+{
+    const auto points = flatSheet(8, 5, cv::Rect(0, 0, 5, 8));
+    cv::Mat_<uint8_t> mask(16, 10, uint8_t{255});
+    mask(0, 0) = 0;
+    for (int threads : {1, 4}) {
+        for (bool standardException : {true, false}) {
+            QuadSurface surface(points.clone(), cv::Vec2f(0.5f, 0.5f));
+            surface.setChannel("mask", mask.clone());
+            segmentation::AutoExtendOptions options;
+            options.sides = {ManualAddTool::ExtendSide::Right};
+            options.cells = 2;
+            options.rounds = 1;
+            options.threads = threads;
+            std::string status;
+            const auto result = segmentation::autoExtendSurface(surface,
+                [standardException](const cv::Vec3f&) -> std::optional<cv::Vec3f> {
+                    if (standardException) throw std::runtime_error("chunk fetch failed");
+                    throw 42;
+                }, options, &status);
+            QVERIFY(!result);
+            QCOMPARE(status, standardException ? std::string("Sheet following failed: chunk fetch failed")
+                                               : std::string("Sheet following failed: unknown error"));
+            QCOMPARE(surface.rawPointsPtr()->size(), points.size());
+            QCOMPARE(cv::norm(*surface.rawPointsPtr(), points, cv::NORM_INF), 0.0);
+            const auto restoredMask = surface.channel("mask", SURF_CHANNEL_NORESIZE);
+            QCOMPARE(restoredMask.size(), mask.size());
+            QCOMPARE(cv::norm(restoredMask, mask, cv::NORM_INF), 0.0);
+
+            const auto retry = segmentation::autoExtendSurface(surface,
+                [](const cv::Vec3f&) { return cv::Vec3f(0, 0, 1); }, options);
+            QVERIFY(retry);
+            QCOMPARE(retry->added, points.rows * options.cells);
+        }
+    }
 }
 
 QTEST_APPLESS_MAIN(TestManualAddExtend)

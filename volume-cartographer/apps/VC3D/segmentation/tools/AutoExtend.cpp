@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <exception>
 #include <thread>
 
 namespace segmentation
@@ -98,20 +99,21 @@ std::optional<AutoExtendResult> autoExtendSurface(QuadSurface& surface,
                 }
                 return n;
             };
-            std::atomic<std::size_t> next{0};
-            auto work = [&]() {
-                for (std::size_t line = next++; line < walk->origins.size(); line = next++) {
-                    ManualAddTool::walkSheetLine(*walk, line, counted, guess);
+            try {
+                ManualAddTool::walkSheetLines(*walk, counted, guess, static_cast<unsigned>(threads));
+            } catch (...) {
+                // No guessed vertices have been published. Undo this step's
+                // padding as well before returning the error to the CLI.
+                if (padding.any()) {
+                    resizeSurfaceGrid(surface, -padding.top, -padding.bottom, -padding.left, -padding.right);
                 }
-            };
-            std::vector<std::thread> pool;
-            const int workers = std::min<int>(threads, static_cast<int>(walk->origins.size()));
-            for (int i = 1; i < workers; ++i) {
-                pool.emplace_back(work);
-            }
-            work();
-            for (auto& t : pool) {
-                t.join();
+                try {
+                    throw;
+                } catch (const std::exception& e) {
+                    return fail(std::string("Sheet following failed: ") + e.what());
+                } catch (...) {
+                    return fail("Sheet following failed: unknown error");
+                }
             }
 
             auto* points = surface.rawPointsPtr();

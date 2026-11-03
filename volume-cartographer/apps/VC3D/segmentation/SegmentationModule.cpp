@@ -34,14 +34,12 @@
 
 #include <algorithm>
 #include <array>
-#include <atomic>
 #include <cmath>
 #include <optional>
 #include <tuple>
 #include <limits>
 #include <exception>
 #include <thread>
-#include <mutex>
 #include <set>
 #include <utility>
 #include <vector>
@@ -1784,29 +1782,8 @@ bool SegmentationModule::followSheetForManualAdd()
             return normals->normalAt(world, job.options.continuousNormals());
         };
         // Lines are independent; spread them over the cores.
-        std::atomic<std::size_t> next{0};
         const unsigned workers = std::max(1u, std::min(8u, std::thread::hardware_concurrency()));
-        std::exception_ptr failure;
-        std::mutex failureMutex;
-        std::atomic<bool> failed{false};
-        std::vector<std::jthread> threads;
-        for (unsigned t = 0; t < workers; ++t) {
-            threads.emplace_back([&]() {
-                try {
-                    for (std::size_t line = next++; line < job.origins.size() && !failed; line = next++) {
-                        ManualAddTool::walkSheetLine(job, line, normal, guess);
-                    }
-                } catch (...) {
-                    std::lock_guard lock(failureMutex);
-                    if (!failure) failure = std::current_exception();
-                    failed = true;
-                }
-            });
-        }
-        for (auto& thread : threads) {
-            thread.join();
-        }
-        if (failure) std::rethrow_exception(failure);
+        ManualAddTool::walkSheetLines(job, normal, guess, workers);
         return guess;
     }).then(this, [this, id = job.extensionId, volume, surface](std::vector<cv::Vec3f> guess) {
         if (!_manualAddMode || !_manualAddTool || !_editManager) {

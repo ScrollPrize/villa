@@ -6,12 +6,16 @@
 #include "vc/core/util/PlaneSurface.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
+#include <exception>
 #include <limits>
 #include <map>
+#include <mutex>
 #include <queue>
 #include <set>
 #include <tuple>
+#include <thread>
 #include <unordered_map>
 
 #include <opencv2/core.hpp>
@@ -1405,6 +1409,36 @@ void ManualAddTool::walkSheetLine(const SheetWalk& walk,
         point += step;
         guess[line * static_cast<std::size_t>(walk.cells) + static_cast<std::size_t>(k)] = point;
     }
+}
+
+void ManualAddTool::walkSheetLines(const SheetWalk& walk,
+                                  const SheetNormalFn& normal,
+                                  std::vector<cv::Vec3f>& guess,
+                                  unsigned workers)
+{
+    if (walk.origins.empty()) return;
+    const auto count = std::min<std::size_t>(std::max(1u, workers), walk.origins.size());
+    std::atomic<std::size_t> next{0};
+    std::exception_ptr failure;
+    std::mutex failureMutex;
+    std::atomic<bool> failed{false};
+    auto work = [&]() {
+        try {
+            for (std::size_t line = next++; line < walk.origins.size() && !failed; line = next++) {
+                walkSheetLine(walk, line, normal, guess);
+            }
+        } catch (...) {
+            std::lock_guard lock(failureMutex);
+            if (!failure) failure = std::current_exception();
+            failed = true;
+        }
+    };
+    // jthread also joins already-started workers if creating another fails.
+    std::vector<std::jthread> threads;
+    for (std::size_t t = 1; t < count; ++t) threads.emplace_back(work);
+    work();
+    for (auto& thread : threads) thread.join();
+    if (failure) std::rethrow_exception(failure);
 }
 
 bool ManualAddTool::applySheetWalk(std::uint64_t extensionId, std::vector<cv::Vec3f> guess, std::string* status)

@@ -193,6 +193,12 @@ public:
                               std::size_t line,
                               const SheetNormalFn& normal,
                               std::vector<cv::Vec3f>& guess);
+    // Runs independent lines in parallel. All workers are joined before a
+    // normal-query exception is rethrown; failed output must be discarded.
+    static void walkSheetLines(const SheetWalk& walk,
+                               const SheetNormalFn& normal,
+                               std::vector<cv::Vec3f>& guess,
+                               unsigned workers);
     bool applySheetWalk(std::uint64_t extensionId, std::vector<cv::Vec3f> guess, std::string* status = nullptr);
     [[nodiscard]] bool extensionFollowsSheet() const { return _extension && _extension->guided; }
 
