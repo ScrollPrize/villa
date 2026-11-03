@@ -7,6 +7,7 @@
 #include <QPushButton>
 #include <QSettings>
 #include <QSignalSpy>
+#include <QSpinBox>
 #include <QTemporaryDir>
 #include <QTest>
 
@@ -23,6 +24,43 @@ private slots:
         qputenv("VC3D_CONFIG_DIR", _configDir.path().toUtf8());
     }
     void cleanup() { qunsetenv("VC3D_CONFIG_DIR"); }
+    void manualGrowWorkers()
+    {
+        SegmentationManualAddPanel manual("workers_test");
+        auto* workers = manual.findChild<QSpinBox*>("manualGrowWorkers");
+        QVERIFY(workers);
+        QCOMPARE(manual.growWorkers(), 8);
+        manual.setGrowMode(true);
+        manual.syncUiState(true, false);
+        manual.show();
+        QVERIFY(workers->isVisible());
+        QSignalSpy configChanged(&manual, &SegmentationManualAddPanel::configChanged);
+        workers->setValue(12);
+        QCOMPARE(manual.growWorkers(), 12);
+        QCOMPARE(configChanged.count(), 0);
+        QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+        settings.beginGroup("workers_test");
+        QCOMPARE(settings.value("manual_grow_workers").toInt(), 12);
+        SegmentationManualAddPanel restored("workers_test");
+        restored.restoreSettings(settings);
+        QCOMPARE(restored.growWorkers(), 12);
+        manual.setGrowMode(false);
+        QVERIFY(!workers->isVisible());
+        manual.setGrowMode(true);
+        QCOMPARE(manual.growWorkers(), 12);
+        manual.syncUiState(false, true); // Editing is locked while a job runs.
+        QVERIFY(!workers->isEnabled());
+        settings.setValue("manual_grow_workers", -4);
+        restored.restoreSettings(settings);
+        QCOMPARE(restored.growWorkers(), 1);
+        settings.setValue("manual_grow_workers", 10000);
+        restored.restoreSettings(settings);
+        QCOMPARE(restored.growWorkers(), 256);
+        settings.remove("manual_grow_workers");
+        restored.restoreSettings(settings);
+        QCOMPARE(restored.growWorkers(), 8);
+    }
+
     void growthVolumeSelection()
     {
         SegmentationGrowthPanel growth("test");

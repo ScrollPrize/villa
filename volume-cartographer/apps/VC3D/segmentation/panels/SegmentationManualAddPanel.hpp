@@ -22,6 +22,7 @@ public:
 
     [[nodiscard]] ManualAddTool::Config config() const;
     [[nodiscard]] int extendCells() const;
+    [[nodiscard]] int growWorkers() const;
     ManualAddTool::LinePreviewMode cycleLinePreviewMode();
     // Direct changes emit configChanged through the same path as combo edits.
     ManualAddTool::LinePreviewMode setLinePreviewMode(ManualAddTool::LinePreviewMode mode);
@@ -54,6 +55,7 @@ private:
     QSpinBox* _spinSampleCap{nullptr};
     QSpinBox* _spinPreviewThrottle{nullptr};
     QSpinBox* _spinExtendCells{nullptr};
+    QSpinBox* _spinGrowWorkers{nullptr};
     QSpinBox* _spinTintOpacity{nullptr};
     QDoubleSpinBox* _spinPlaneConstraintRadius{nullptr};
     QDoubleSpinBox* _spinPlaneConstraintReplacementRadius{nullptr};

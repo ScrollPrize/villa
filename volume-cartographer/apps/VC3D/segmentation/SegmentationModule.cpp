@@ -1794,13 +1794,14 @@ bool SegmentationModule::followSheetForManualAdd()
     auto normals = _sheetNormals;
     const ManualAddTool::SheetWalk job = *walk;
     const auto surface = _editManager ? _editManager->baseSurface() : nullptr;
-    QtConcurrent::run([job, normals]() {
+    const unsigned requestedWorkers = static_cast<unsigned>(_widget ? _widget->manualGrowWorkers() : 8);
+    const unsigned workers = std::max(1u, std::min(requestedWorkers, std::thread::hardware_concurrency()));
+    QtConcurrent::run([job, normals, workers]() {
         std::vector<cv::Vec3f> guess(job.origins.size() * static_cast<std::size_t>(job.cells));
         const ManualAddTool::SheetNormalFn normal = [normals, job](const cv::Vec3f& world) {
             return normals->normalAt(world, job.options.continuousNormals());
         };
         // Lines are independent; spread them over the cores.
-        const unsigned workers = std::max(1u, std::min(8u, std::thread::hardware_concurrency()));
         ManualAddTool::walkSheetLines(job, normal, guess, workers);
         return guess;
     }).then(this, [this, id = job.extensionId, volume, surface](std::vector<cv::Vec3f> guess) {

@@ -56,6 +56,7 @@ public:
     [[nodiscard]] int growthScale() const;
     [[nodiscard]] ManualAddTool::Config manualAddConfig() const;
     [[nodiscard]] int manualAddExtendCells() const;
+    [[nodiscard]] int manualGrowWorkers() const;
     // Neural tracer getters — delegated to panel
     [[nodiscard]] bool neuralTracerEnabled() const;
     [[nodiscard]] QString neuralCheckpointPath() const;

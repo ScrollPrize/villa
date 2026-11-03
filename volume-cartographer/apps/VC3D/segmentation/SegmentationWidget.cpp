@@ -324,6 +324,7 @@ int SegmentationWidget::growthSteps() const { return _growthPanel->growthSteps()
 bool SegmentationWidget::growthKeybindsEnabled() const { return _growthPanel->growthKeybindsEnabled(); }
 int SegmentationWidget::growthScale() const { return _growthPanel->growthScale(); }
 ManualAddTool::Config SegmentationWidget::manualAddConfig() const { return _manualAddPanel->config(); }
+int SegmentationWidget::manualGrowWorkers() const { return _manualAddPanel->growWorkers(); }
 int SegmentationWidget::manualAddExtendCells() const { return _manualAddPanel->extendCells(); }
 ManualAddTool::LinePreviewMode SegmentationWidget::cycleManualAddLinePreviewMode()
 {

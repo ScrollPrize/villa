@@ -71,6 +71,8 @@ private slots:
     void sheetWalkFollowsACurvedSheet();
     void streamlineConverges_data();
     void streamlineConverges();
+    void streamlineReusesEndpointNormals();
+    void streamlineDropsEndpointNormalAfterFallback();
     void substepsPreserveSpacingAndHandleMissingNormals();
     void projectionSubstepsReduceDrift();
     void guidedClicksStayLocal();
@@ -627,6 +629,61 @@ void TestManualAddExtend::streamlineConverges()
     QVERIFY2(fineError < coarseError || fineError < 0.001f,
              qPrintable(QString("coarse %1 fine %2").arg(coarseError).arg(fineError)));
     QVERIFY(distance(fine, run(1.25, true)) < 1e-5f);
+}
+
+void TestManualAddExtend::streamlineReusesEndpointNormals()
+{
+    for (int method = 0; method < 3; ++method) {
+        ManualAddTool::SheetWalk walk;
+        walk.cells = 4;
+        walk.origins = {cv::Vec3f(40, 0, 0), cv::Vec3f(40, 0, 0)};
+        walk.steps = {cv::Vec3f(0, 3, 4), cv::Vec3f(0, 3, 4)};
+        walk.options.maxStep = 1.25; // Four substeps per output vertex.
+        walk.options.mode = ManualAddTool::SheetWalkMode::Streamline;
+        walk.options.integrator = static_cast<ManualAddTool::SheetIntegrator>(method);
+        std::vector<cv::Vec3f> points(walk.cells * walk.origins.size());
+        int calls = 0;
+        int starts = 0;
+        const auto normal = [&](const cv::Vec3f& p) -> std::optional<cv::Vec3f> {
+            ++calls;
+            if (p == walk.origins.front()) ++starts;
+            return p / static_cast<float>(cv::norm(p));
+        };
+        ManualAddTool::walkSheetLines(walk, normal, points, 1);
+        // The starting normal is requested once per line, not again for k1.
+        // Subsequent substeps reuse their predecessor's endpoint normal.
+        QCOMPARE(starts, 2);
+        const int stages = method == 2 ? 4 : 2;
+        QCOMPARE(calls, 2 * (1 + stages * 3 * 4 * walk.cells));
+        for (int k = 0; k < walk.cells; ++k) QCOMPARE(points[k], points[k + walk.cells]);
+        const auto serial = points;
+        ManualAddTool::walkSheetLines(walk, [](const cv::Vec3f& p) -> std::optional<cv::Vec3f> {
+            return p / static_cast<float>(cv::norm(p));
+        }, points, 2);
+        QCOMPARE(points, serial);
+    }
+}
+
+void TestManualAddExtend::streamlineDropsEndpointNormalAfterFallback()
+{
+    ManualAddTool::SheetWalk walk;
+    walk.cells = 3;
+    walk.origins = {cv::Vec3f(0, 0, 0)};
+    walk.steps = {cv::Vec3f(1, 0, 0)};
+    walk.options.maxStep = 1;
+    walk.options.mode = ManualAddTool::SheetWalkMode::Streamline;
+    walk.options.integrator = ManualAddTool::SheetIntegrator::Midpoint;
+    std::vector<cv::Vec3f> points(walk.cells);
+    int afterFallbackQueries = 0;
+    ManualAddTool::walkSheetLine(walk, 0, [&](const cv::Vec3f& p) -> std::optional<cv::Vec3f> {
+        // Fail a derivative stage on the second substep. Projection takes us
+        // to x=2, where the next step must fetch a fresh starting normal.
+        if (p[0] == 1.25f) return std::nullopt;
+        if (p[0] == 2.f) ++afterFallbackQueries;
+        return cv::Vec3f(0, 0, 1);
+    }, points);
+    QCOMPARE(afterFallbackQueries, 1);
+    for (int k = 0; k < walk.cells; ++k) QCOMPARE(points[k], cv::Vec3f(k + 1, 0, 0));
 }
 
 void TestManualAddExtend::substepsPreserveSpacingAndHandleMissingNormals()

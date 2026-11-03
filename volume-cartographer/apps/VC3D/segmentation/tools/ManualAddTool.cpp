@@ -1295,13 +1295,14 @@ Vec tangent(const Vec& v, const Vec& n)
 // Minimum-turn transport: x' = v, v' = -n (v . Dn v).
 // Central differences require only unsigned normals, not tensor derivatives.
 // Align signs before differencing; reversing an eigenvector must not steer us.
-std::optional<WalkState> derivative(const WalkState& s, const Walk::SheetNormalFn& normal)
+std::optional<WalkState> derivative(const WalkState& s, const Walk::SheetNormalFn& normal,
+                                    const Vec* startNormal = nullptr)
 {
     const double speed = cv::norm(s.v);
     if (!std::isfinite(speed) || speed < 1e-12) return std::nullopt;
     const Vec direction = s.v / speed;
     constexpr double epsilon = 0.25; // volume voxels; derivative accuracy floor
-    auto n = walkNormal(normal, s.x);
+    auto n = startNormal ? std::optional<Vec>(*startNormal) : walkNormal(normal, s.x);
     auto plus = walkNormal(normal, s.x + epsilon * direction);
     auto minus = walkNormal(normal, s.x - epsilon * direction);
     if (!n || !plus || !minus) return std::nullopt;
@@ -1311,12 +1312,16 @@ std::optional<WalkState> derivative(const WalkState& s, const Walk::SheetNormalF
     return WalkState{s.v, -*n * s.v.dot(dn)};
 }
 std::optional<WalkState> integrate(WalkState s, double h, Walk::SheetIntegrator method,
-                                   const Walk::SheetNormalFn& normal)
+                                   const Walk::SheetNormalFn& normal,
+                                   std::optional<Vec>& endpointNormal)
 {
-    const auto n = walkNormal(normal, s.x);
+    // A successful preceding substep evaluated this exact state.x already.
+    const auto n = endpointNormal ? endpointNormal : walkNormal(normal, s.x);
+    // Any failed stage falls back to projection, so its endpoint cannot be reused.
+    endpointNormal.reset();
     if (!n) return std::nullopt;
     s.v = tangent(s.v, *n);
-    const auto k1 = derivative(s, normal);
+    const auto k1 = derivative(s, normal, &*n);
     if (!k1) return std::nullopt;
     WalkState next;
     if (method == Walk::SheetIntegrator::Heun) {
@@ -1340,6 +1345,7 @@ std::optional<WalkState> integrate(WalkState s, double h, Walk::SheetIntegrator 
     if (!endNormal || !std::isfinite(cv::norm(next.v)) || cv::norm(next.v) < 1e-12)
         return std::nullopt;
     next.v = tangent(next.v, *endNormal);
+    endpointNormal = endNormal;
     return next;
 }
 void walkSheetSubsteps(const Walk::SheetWalk& walk, std::size_t line,
@@ -1357,10 +1363,11 @@ void walkSheetSubsteps(const Walk::SheetWalk& walk, std::size_t line,
         ? std::max(0.01, walk.options.maxStep) : length;
     const double count = std::max(1.0, std::ceil(length / maxStep));
     const double h = length / count;
+    std::optional<Vec> endpointNormal;
     for (int k = 0; k < walk.cells; ++k) {
         for (double j = 0; j < count; ++j) {
             if (walk.options.mode == Walk::SheetWalkMode::Streamline) {
-                if (auto next = integrate(state, h, walk.options.integrator, normal)) {
+                if (auto next = integrate(state, h, walk.options.integrator, normal, endpointNormal)) {
                     state = *next;
                     continue;
                 }

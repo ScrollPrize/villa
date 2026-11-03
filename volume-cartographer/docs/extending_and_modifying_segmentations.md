@@ -50,6 +50,8 @@ The surface growth method dropdown has two manual methods:
 
 For Manual Grow, the **Volume** selector under Surface Growth lists the package volumes and selects the CT source for both projection and streamline integration. It shares the source selection with Tracer without changing the displayed volume. Selection is locked while an extension is computing; changing it afterward affects the next extension. With sheet following disabled, straight extensions do not read volume data.
 
+**Workers** in the Manual Grow panel sets the maximum number of parallel growth lines (1–256, default 8). The setting is saved and applies to the next extension; actual concurrency is limited by available hardware threads and the number of lines. It is locked while growth is computing.
+
 Manual Grow caches up to 512 MiB of filtered structure-tensor patches for substep and streamline queries (previously about 27 MiB). Container overhead and in-flight worker data are additional.
 
 Both methods share preview correction, Apply & Exit, and Cancel. Existing saved Manual Add selections open as Manual Fill.

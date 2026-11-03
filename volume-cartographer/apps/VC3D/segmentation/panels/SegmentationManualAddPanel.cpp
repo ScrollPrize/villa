@@ -111,6 +111,13 @@ SegmentationManualAddPanel::SegmentationManualAddPanel(const QString& settingsGr
                                    "Your Shift+clicks still correct it."));
     growLayout->addWidget(_chkFollowSheet);
     auto* walkForm = new QFormLayout();
+    _spinGrowWorkers = new QSpinBox(group);
+    _spinGrowWorkers->setObjectName(QStringLiteral("manualGrowWorkers"));
+    _spinGrowWorkers->setRange(1, 256);
+    _spinGrowWorkers->setValue(8);
+    _spinGrowWorkers->setToolTip(tr("Maximum parallel growth workers, limited by available hardware threads "
+                                    "and growth lines. Changes apply to the next extension."));
+    walkForm->addRow(tr("Workers"), _spinGrowWorkers);
     _spinNormalStep = new QDoubleSpinBox(group);
     _spinNormalStep->setRange(0, 10000);
     _spinNormalStep->setDecimals(2);
@@ -201,6 +208,8 @@ SegmentationManualAddPanel::SegmentationManualAddPanel(const QString& settingsGr
     connect(_btnApplyExit, &QPushButton::clicked, this, &SegmentationManualAddPanel::applyExitRequested);
     connect(_btnCancel, &QPushButton::clicked, this, &SegmentationManualAddPanel::cancelRequested);
     connect(_spinExtendCells, QOverload<int>::of(&QSpinBox::valueChanged), this, [this]() { persistFromUi(); });
+    // Worker count affects the next job; it must not recompute pending geometry.
+    connect(_spinGrowWorkers, QOverload<int>::of(&QSpinBox::valueChanged), this, [this]() { persistFromUi(); });
     const std::pair<QPushButton*, ManualAddTool::ExtendSide> extendButtons[] = {
         {_btnExtendUp, ManualAddTool::ExtendSide::Up},
         {_btnExtendDown, ManualAddTool::ExtendSide::Down},
@@ -224,6 +233,11 @@ void SegmentationManualAddPanel::setGrowMode(bool grow)
                            static_cast<QWidget*>(_comboInterpolationMode)}) {
         _form->setRowVisible(field, !grow);
     }
+}
+
+int SegmentationManualAddPanel::growWorkers() const
+{
+    return _spinGrowWorkers->value();
 }
 
 int SegmentationManualAddPanel::extendCells() const
@@ -303,6 +317,7 @@ void SegmentationManualAddPanel::restoreSettings(QSettings& settings)
     setSpin(_spinRegularization, settings.value(QStringLiteral("manual_add_regularization"), 0.0001).toDouble());
     setSpin(_spinSampleCap, settings.value(QStringLiteral("manual_add_sample_cap"), 512).toInt());
     setSpin(_spinPreviewThrottle, settings.value(QStringLiteral("manual_add_preview_throttle_ms"), 50).toInt());
+    setSpin(_spinGrowWorkers, settings.value(QStringLiteral("manual_grow_workers"), 8).toInt());
     setSpin(_spinExtendCells, settings.value(QStringLiteral("manual_add_extend_cells"), 16).toInt());
     setSpin(_spinTintOpacity, settings.value(QStringLiteral("manual_add_tint_opacity_percent"), 45).toInt());
     setSpin(_spinPlaneConstraintRadius, settings.value(QStringLiteral("manual_add_plane_constraint_radius"), 30.0).toDouble());
@@ -384,6 +399,7 @@ void SegmentationManualAddPanel::persistFromUi()
     writeSetting(QStringLiteral("manual_add_regularization"), _spinRegularization->value());
     writeSetting(QStringLiteral("manual_add_sample_cap"), _spinSampleCap->value());
     writeSetting(QStringLiteral("manual_add_preview_throttle_ms"), _spinPreviewThrottle->value());
+    writeSetting(QStringLiteral("manual_grow_workers"), _spinGrowWorkers->value());
     writeSetting(QStringLiteral("manual_add_extend_cells"), _spinExtendCells->value());
     writeSetting(QStringLiteral("manual_add_tint_opacity_percent"), _spinTintOpacity->value());
     writeSetting(QStringLiteral("manual_add_plane_constraint_radius"), _spinPlaneConstraintRadius->value());
