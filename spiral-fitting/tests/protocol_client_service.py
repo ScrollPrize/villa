@@ -150,7 +150,8 @@ class FrozenInputsRuntime(FakeRuntime):
         self.preview_manifest = raw / 'manifest.json'
         self.preview_manifest.write_text(json.dumps({
             'model_state_sha256': MODEL_STATE, 'input_digest': self.digest,
-            'input_position': self.position, 'source_fit_iteration': self.completed}))
+            'input_position': self.position, 'source_fit_iteration': self.completed,
+            'applied_config': self.applied}))
         if self.status_callback is not None:
             self.status_callback(self.status())
         return {}
@@ -191,7 +192,8 @@ def main(argv=None):
         root = publish(output / '.spiral-published' / session_id / f'generation-{generation}',
                        input_digest=raw['input_digest'], input_position=raw['input_position'],
                        model_state_sha256=raw['model_state_sha256'],
-                       source_fit_iteration=raw['source_fit_iteration'])
+                       source_fit_iteration=raw['source_fit_iteration'],
+                       applied_config=raw['applied_config'])
         return SimpleNamespace(), PublishedPreview(
             manifest_path=root / 'manifest.json', surface_id='preview-lasagna.tifxyz',
             generation=generation, raw_manifest=raw, raw_manifest_path=Path(raw_manifest_path),

@@ -1184,6 +1184,32 @@ class ProtocolTests(unittest.TestCase):
         self.assertTrue(session._automatic_previews_disabled)
         self.assertIn("preview OOM", "\n".join(session._warnings))
 
+    def test_a_preview_records_the_configuration_it_was_captured_under(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            session = InteractiveFitSession.__new__(InteractiveFitSession)
+            session._condition = threading.Condition()
+            session._preview_generation = 0
+            session._completed = 10
+            session._preview_session_id = "spiral-1-test"
+            session.paths = SimpleNamespace(output_directory=temporary)
+            session._publish_status = lambda: None
+            session._applied_config = {"loss_weight": 1.0}
+
+            def export_preview(path, surface_id, diagnostics=False):
+                # A live configure lands while the preview is exported.
+                session._applied_config["loss_weight"] = 2.0
+                Path(path).mkdir(parents=True)
+                manifest_path = Path(path) / "manifest.json"
+                manifest_path.write_text("{}")
+                return {"manifest_path": str(manifest_path)}
+            session._context = SimpleNamespace(export_preview=export_preview)
+
+            session._publish_preview()
+
+            manifest = json.loads(Path(session._preview_manifest).read_text())
+            self.assertEqual(manifest["applied_config"], {"loss_weight": 1.0})
+            self.assertEqual(manifest["source_fit_iteration"], 10)
+
     def test_preview_capture_barriers_surround_rank_zero_export(self):
         session = self._idle_session(completed=10)
         session._state = SessionState.Running

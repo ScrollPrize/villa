@@ -59,6 +59,7 @@ def _fit(binding, tmp_path):
         number = next(serial)
         kwargs.setdefault('input_digest', inputs.digest)
         kwargs.setdefault('input_position', inputs.manifest['position'])
+        kwargs.setdefault('applied_config', config)
         root = publish(output / '.spiral-published' / SESSION / f'generation-{number}', **kwargs)
         return state.artifacts.register_directory(
             'spiral-preview', SESSION, number, root, 'manifest.json',
@@ -180,6 +181,17 @@ def test_a_commit_is_the_published_generation_with_its_provenance(fit):
                 **request.selectors, 'surface': osi.Selector(uuids=(uuid,))}))
 
 
+def test_a_commit_records_the_configuration_of_its_preview(fit):
+    artifact = fit.generation(applied_config={**fit.config, 'lr': 0.5})
+    # A live configure after the preview changes the session's configuration
+    # but not the model state the preview was captured from.
+    fit.status['applied_config'] = {**fit.config, 'lr': 0.25}
+    uuid = commit(fit, artifact)['surface_uuid']
+    with ObjectStore.open(fit.store, read_only=True) as db:
+        config = db.object(uuid)['meta']['provenance']['parameters']['config']
+    assert config['lr'] == 0.5
+
+
 def test_the_checkpoint_of_the_same_model_state_is_recorded(fit):
     fit.status['checkpoint_state'] = {'path': '/out/checkpoints/a.ckpt',
                                       'model_state_sha256': MODEL_STATE}
@@ -283,6 +295,7 @@ def test_a_shape_other_than_the_fit_volumes_is_refused(fit):
 def test_generations_a_commit_cannot_vouch_for_are_refused(fit):
     for kwargs, message in (
             ({'flatten_profile': None}, 'publish a new preview'),
+            ({'applied_config': None}, 'recorded their configuration'),
             ({'input_digest': 'f' * 64}, 'since replaced')):
         result = commit(fit, fit.generation(**kwargs))
         assert result['state'] == 'failed'

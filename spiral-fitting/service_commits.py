@@ -68,6 +68,10 @@ class PublishedGeneration:
     scale: tuple[float, float]
     winding_bounds: list
     input_position: Mapping[str, Any] | None
+    # The fit configuration as of the preview's capture; with
+    # input_position it reproduces the selection
+    # (object_store_inputs.request_from_config).
+    config: Mapping[str, Any]
     source_fit_iteration: int | None
     base_shape_zyx: tuple[int, int, int] | None
     # Vertices valid in the flattened surface that the store cannot hold
@@ -79,8 +83,6 @@ class PublishedGeneration:
 class CommitContext:
     """What a commit records besides the generation's own files: the session's.
 
-    ``config`` is the fit configuration; with ``input_position`` it
-    reproduces the selection (object_store_inputs.request_from_config).
     ``sources`` are the objects the fit is anchored to, never the whole
     selection, since meta is loaded with every catalog listing.
     ``base_shape_zyx`` is the fit volume's full-resolution shape, when the
@@ -90,7 +92,6 @@ class CommitContext:
     volume_uuid: str
     name: str
     author: str
-    config: Mapping[str, Any]
     input_digest: str
     sources: tuple[str, ...] = ()
     checkpoint: str | None = None
@@ -171,7 +172,7 @@ def read_published_generation(root, manifest_name="manifest.json"):
     """The generation published under ``root``, checked to be in the fit frame.
 
     Refuses a generation published before commits existed (no flatten
-    profile), one fitted without object-store inputs, and one whose Lasagna
+    profile or configuration), one fitted without object-store inputs, and one whose Lasagna
     export did not keep the fit frame (``export_coordinate_scale`` other
     than exactly 1.0, or absent).
     """
@@ -186,6 +187,11 @@ def read_published_generation(root, manifest_name="manifest.json"):
         raise CommitRefused(
             "the generation was published before commits recorded the flatten "
             "profile; publish a new preview and commit that")
+    config = manifest.get("applied_config")
+    if not isinstance(config, Mapping):
+        raise CommitRefused(
+            "the generation was published before previews recorded their "
+            "configuration; publish a new preview and commit that")
     model_state = str(manifest.get("model_state_sha256") or "")
     input_digest = str(manifest.get("input_digest") or "")
     if not model_state:
@@ -222,6 +228,7 @@ def read_published_generation(root, manifest_name="manifest.json"):
         scale=(float(scale[0]), float(scale[1])),
         winding_bounds=list(manifest.get("winding_bounds") or ()),
         input_position=manifest.get("input_position"),
+        config=dict(config),
         source_fit_iteration=None if iteration is None else int(iteration),
         base_shape_zyx=base_shape,
         unrepresentable=int(np.count_nonzero(flattened_valid & ~valid)))
@@ -279,7 +286,7 @@ def write_commit(store_path, generation, context):
     its UUID. ``create_surface`` opens and closes its own handle, so it never
     keeps a handle a later hub sync needs idle."""
     from vc_object_store.surfaces import create_surface
-    parameters = {"config": dict(context.config)}
+    parameters = {"config": dict(generation.config)}
     if context.checkpoint:
         parameters["checkpoint"] = context.checkpoint
     return create_surface(

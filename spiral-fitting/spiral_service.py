@@ -3550,8 +3550,8 @@ class ServiceState:
                 self.status_generation += 1
 
     def _commit_context(self, session_id, generation, model_state_sha256):
-        """What the session records with a commit: its fit volume, config,
-        anchors and project facts."""
+        """What the session records with a commit: its fit volume, anchors
+        and project facts (the configuration is the generation's own)."""
         with self.lock:
             if self.session_id != session_id or self.session is None:
                 raise CommitRefused("the session changed before the commit")
@@ -3572,7 +3572,6 @@ class ServiceState:
             name=(f"{project.get('name') or 'spiral'}-spiral-"
                   f"{session_id.removeprefix('spiral-')}-g{generation}"),
             author=self.object_store.author,
-            config=status.get("applied_config") or {},
             input_digest=status["input_digest"],
             sources=(volume,) + ((shell,) if shell else ()),
             checkpoint=(checkpoint.get("path")

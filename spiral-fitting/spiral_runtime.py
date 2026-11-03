@@ -1851,6 +1851,11 @@ class InteractiveFitSession:
         with self._condition:
             generation = self._preview_generation + 1
             source_iteration = getattr(self, "_completed", 0)
+            # The configuration the previewed model state was reached under,
+            # as of capture: a later live configure changes applied_config
+            # but not this generation (a commit records it).
+            applied_config = copy.deepcopy(
+                getattr(self, "_applied_config", None))
         generation_path = (Path(self.paths.output_directory) / ".spiral-preview" /
                            self._preview_session_id / f"generation-{generation}")
         surface_id = f"spiral-output-generation-{generation}"
@@ -1858,6 +1863,8 @@ class InteractiveFitSession:
             str(generation_path), surface_id, diagnostics=diagnostics)
         manifest = dict(manifest)
         manifest["source_fit_iteration"] = int(source_iteration)
+        if applied_config is not None:
+            manifest["applied_config"] = applied_config
         manifest_path = Path(str(manifest["manifest_path"]))
         if manifest_path.is_file():
             manifest_path.write_text(
