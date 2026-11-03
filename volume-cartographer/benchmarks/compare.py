@@ -33,10 +33,10 @@ DEFAULT_METRICS = ("settled_ms", "first_frame_ms", "wall_ms", "ms", "presented_f
 # Configuration that describes a run's outcome or machine-local paths, not its workload.
 VOLATILE = {
     "volume_open_ms", "decoded_cache_mb", "decoded_chunks", "known_empty_chunks", "fetched_chunks",
-    "fetched_mb", "config", "cache", "volume_cache_root", "partial_seeded_files", "tool", "backend", "work_dir",
+    "fetched_mb", "config", "cache", "volume_cache_root", "partial_seeded_files", "tool", "backend", "work_dir", "offline_misses",
 }
 # Parameters only some pipelines read: not a difference when the other side lacks them.
-PIPELINE_ONLY = {"gpu_cache_gb", "cuda", "cuda-cache-gb"}
+PIPELINE_ONLY = {"gpu_cache_gb", "cuda", "cuda-cache-gb", "remote_offline"}
 
 
 class Results:
