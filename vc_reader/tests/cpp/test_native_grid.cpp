@@ -453,7 +453,17 @@ int main()
             require(r.missingChunks.size() == 2 && !r.missingChunks[0].empty() &&
                         pending.target[0].chunks == r.missingChunks[0] && pending.coarse[0].chunks == r.missingChunks[1],
                     "a CPU frame names the chunks its reads fetch");
+            // Cancelled: no chunk read starts, in either part or in a blocking sample.
+            const std::atomic<bool> cancelled{true};
             int parts = 0;
+            vcr::grid::load(pending, [&] { ++parts; return true; }, &cancelled);
+            require(parts == 1 && p0->stats().disk_hits == 0 && p1->stats().disk_hits == 0, "a cancelled load reads nothing");
+            vcr::grid::Request blocking = view;
+            blocking.cancel = &cancelled;
+            bool threw = false;
+            try { vcr::grid::sample(frame, blocking); } catch (const vcr::Cancelled&) { threw = true; }
+            require(threw && p0->stats().disk_hits == 0, "a cancelled blocking sample throws Cancelled");
+            parts = 0;
             require(vcr::grid::load(pending, [&] { ++parts; return false; }).empty() && parts == 1, "load stops when told");
             vcr::grid::Pending rest;
             r = vcr::grid::sampleCached(frame, view, &rest);

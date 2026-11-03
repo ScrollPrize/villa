@@ -285,6 +285,7 @@ struct ChunkLookup {
     Array* array;
     Load loader;
     bool cachedOnly;
+    const std::atomic<bool>* cancel;
     float fill;
     std::int64_t shape[3], block[3], stride[3], grid[3];
     int shift[3];
@@ -298,7 +299,8 @@ struct ChunkLookup {
     std::size_t last = 0, next = 0;
     std::vector<std::int64_t> misses;  // cached-only: keys of chunks no cache held
 
-    ChunkLookup(const Level& L, Load l, bool cached) : array(L.array), loader(l), cachedOnly(cached)
+    ChunkLookup(const Level& L, Load l, bool cached, const std::atomic<bool>* stop)
+        : array(L.array), loader(l), cachedOnly(cached), cancel(stop)
     {
         const auto& spec = array->spec();
         fill = float(L.type.load(spec.fill.data()));
@@ -345,6 +347,8 @@ struct ChunkLookup {
             if (!found)
                 misses.push_back(key);
         } else {
+            if (cancel && cancel->load(std::memory_order_acquire))
+                throw Cancelled("read cancelled");
             slot.available = true;
             slot.chunk = array->chunk(idx);
         }
@@ -394,7 +398,7 @@ Result sampleTiles(int width, int height, const Request& request, const TilePoin
         std::vector<ChunkLookup<Load>> lookups;
         lookups.reserve(request.levels.size());
         for (const auto& L : request.levels)
-            lookups.emplace_back(L, load, request.cachedOnly);
+            lookups.emplace_back(L, load, request.cachedOnly, request.cancel);
         std::vector<float> xyz(std::size_t(w) * h * 3), nrm(needNormals ? xyz.size() : 0);
         points(i0, j0, w, h, xyz.data(), needNormals ? nrm.data() : nullptr);
         for (int j = 0; j < h; ++j)
@@ -747,7 +751,7 @@ Result sampleDevice(int width, int height, const Request& request, const std::ve
             device::complete();
             if (loads == kLoads)
                 throw std::runtime_error("a blocking request's bricks do not stay resident; increase the reader's budget");
-            readers.front()->load_bricks(keys);
+            readers.front()->load_bricks(keys, request.cancel);
             pass();
         }
     }
@@ -848,6 +852,8 @@ Result dispatch(const Request& request, Host&& host, Device&& device)
         std::string failure;
         try {
             return device(readers);
+        } catch (const Cancelled&) {
+            throw;  // not a GPU failure
         } catch (const std::exception& e) {
             failure = e.what();
         }

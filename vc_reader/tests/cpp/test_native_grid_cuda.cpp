@@ -6,6 +6,7 @@
 #include <vc_reader/grid.hpp>
 #include <vc_reader/native/cuda_available.hpp>
 
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <filesystem>
@@ -198,6 +199,19 @@ int main()
             auto dispatched = store(path / "dispatched", 128, 64);
             vcr::reader_cuda::Reader dispatchedGpu(*dispatched, 64 << 20, 0);
             request.levels = {{dispatched.get(), u8, L0.scale, L0.offset, std::nullopt, &dispatchedGpu}};
+            {
+                // Cancelled: the GPU pass reads no brick and does not fall back to the CPU.
+                const std::atomic<bool> cancelled{true};
+                auto stopped = request;
+                stopped.cancel = &cancelled;
+                bool threw = false;
+                try { vcr::grid::sample(plane, stopped); } catch (const vcr::Cancelled&) { threw = true; }
+                stopped.cancel = nullptr;
+                stopped.cachedOnly = true;
+                const auto after = vcr::grid::cuda::sample(plane, stopped, {&dispatchedGpu});
+                require(threw && std::count(after.level.begin(), after.level.end(), vcr::grid::Result::kMissing) > 0,
+                        "a cancelled GPU blocking sample throws Cancelled and makes nothing resident");
+            }
             const auto gpu = vcr::grid::sample(plane, request);
             require(gpu.cudaFailure.empty(), "a GPU request that succeeds reports no failure");
             compare(cpu, gpu, 0.0f, "dispatched plane");

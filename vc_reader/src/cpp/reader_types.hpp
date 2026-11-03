@@ -73,4 +73,9 @@ struct CacheMiss : std::runtime_error {
     using std::runtime_error::runtime_error;
 };
 
+// A read stopped because its cancel flag was set: chunks not started by then were not read.
+struct Cancelled : std::runtime_error {
+    using std::runtime_error::runtime_error;
+};
+
 }  // namespace vcr

@@ -400,8 +400,9 @@ public:
         mark();
     }
     // Makes the bricks with these keys (see Source: z-major brick-grid indices)
-    // resident, reading them from the array. Throws when they exceed the cache budget.
-    void load_bricks(const std::vector<std::int64_t>& keys) {
+    // resident, reading them from the array. Throws when they exceed the cache budget,
+    // and Cancelled (nothing made resident) once `cancel` is set while reading.
+    void load_bricks(const std::vector<std::int64_t>& keys, const std::atomic<bool>* cancel=nullptr) {
         ready();
         std::set<std::int64_t> needed;
         const std::int64_t total=source_.grid[0]*source_.grid[1]*source_.grid[2];
@@ -425,7 +426,7 @@ public:
                 auto idx=index(staged[i]); for (int a=0;a<3;++a) idx[a]*=source_.brick[a];
                 starts.push_back(std::move(idx)); outputs.push_back(host.data()+i*brick_bytes_);
             }
-            array_.read_many(starts,sizes,outputs);
+            array_.read_many(starts,sizes,outputs,nullptr,false,cancel);
             bricks=device::allocate(host.size(),device_);
             // Pageable: the host buffer is free once this returns.
             device::check(cudaMemcpyAsync(bricks->ptr,host.data(),host.size(),cudaMemcpyHostToDevice,device::stream()));

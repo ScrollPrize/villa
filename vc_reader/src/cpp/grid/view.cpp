@@ -191,7 +191,7 @@ namespace {
 
 // Brings the chunks into the array's caches: Array::read_many with null outputs
 // resolves each chunk once, in parallel, and copies nothing.
-void readChunks(Array& array, const std::vector<std::int64_t>& keys)
+void readChunks(Array& array, const std::vector<std::int64_t>& keys, const std::atomic<bool>* cancel)
 {
     const auto& grid = array.chunk_grid();
     const auto& shape = array.spec().chunks;
@@ -199,28 +199,34 @@ void readChunks(Array& array, const std::vector<std::int64_t>& keys)
     for (const auto key : keys)
         starts.push_back(Index{key / (grid[1] * grid[2]) * shape[0], key / grid[2] % grid[1] * shape[1],
                                key % grid[2] * shape[2]});
-    array.read_many(starts, sizes, std::vector<std::uint8_t*>(keys.size(), nullptr));
+    array.read_many(starts, sizes, std::vector<std::uint8_t*>(keys.size(), nullptr), nullptr, false, cancel);
 }
 
 }  // namespace
 
-std::string load(const Pending& pending, const std::function<bool()>& afterPart)
+std::string load(const Pending& pending, const std::function<bool()>& afterPart, const std::atomic<bool>* cancel)
 {
     std::string failure;
     for (const auto* part : {&pending.coarse, &pending.target}) {
-        for (const auto& read : *part) {
-            if (!read.chunks.empty()) {
-                readChunks(*read.request.levels.front().array, read.chunks);
-                continue;
+        try {
+            for (const auto& read : *part) {
+                if (!read.chunks.empty()) {
+                    readChunks(*read.request.levels.front().array, read.chunks, cancel);
+                    continue;
+                }
+                auto request = read.request;
+                request.cachedOnly = false;
+                request.pixels = read.pixels.empty() ? nullptr : read.pixels.data();
+                request.cancel = cancel;
+                const auto result = sample(read.frame, request);
+                if (failure.empty())
+                    failure = result.cudaFailure;
             }
-            auto request = read.request;
-            request.cachedOnly = false;
-            request.pixels = read.pixels.empty() ? nullptr : read.pixels.data();
-            const auto result = sample(read.frame, request);
-            if (failure.empty())
-                failure = result.cudaFailure;
+        } catch (const Cancelled&) {
         }
         if (!part->empty() && afterPart && !afterPart())
+            break;
+        if (cancel && cancel->load(std::memory_order_acquire))
             break;
     }
     return failure;

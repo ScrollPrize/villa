@@ -10,6 +10,7 @@
 #include "vc_reader/native/element_type.hpp"
 
 #include <array>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -156,6 +157,9 @@ struct Request {
     bool cachedOnly = false;
     // When set, only pixels p with pixels[p] != 0 are sampled.
     const std::uint8_t* pixels = nullptr;
+    // Blocking reads: once set, no further chunk read starts and sample throws
+    // vcr::Cancelled. Cache-only requests never wait on a read and ignore it.
+    const std::atomic<bool>* cancel = nullptr;
     // Reduce each pixel's layers to one value (layers without a sample are dropped).
     std::optional<composite::Options> composite;
 };
@@ -250,9 +254,12 @@ struct Pending {
 // it, and pixels no level held also read the last level first.
 Result sampleCached(const Frame& frame, Request request, Pending* pending);
 // Runs the reads, coarse then target, bringing their chunks into the caches.
-// `afterPart` runs after each part that had reads; returning false stops. Returns the
-// first GPU failure a read fell back from (Result::cudaFailure), else empty.
-std::string load(const Pending& pending, const std::function<bool()>& afterPart = {});
+// `afterPart` runs after each part that had reads (one cut short too); returning false
+// stops. Once `cancel` is set, no further chunk read starts (reads under way finish) and
+// load returns after that part's afterPart. Returns the first GPU failure a read fell back from
+// (Result::cudaFailure), else empty.
+std::string load(const Pending& pending, const std::function<bool()>& afterPart = {},
+                 const std::atomic<bool>* cancel = nullptr);
 
 }  // namespace vcr::grid
 

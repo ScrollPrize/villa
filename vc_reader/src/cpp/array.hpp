@@ -397,18 +397,21 @@ public:
     // `stream`: raw local chunks missing from the memory cache are copied straight
     // into the outputs without being read whole and inserted (callers with their
     // own cache, e.g. the CUDA reader). Memory-cache hits are still used.
+    // `cancel`: once set, no further chunk is started and the read throws Cancelled
+    // (chunks already started finish; outputs are then partly written).
     void read_many(const std::vector<Index>& starts, const std::vector<Index>& sizes,
                    const std::vector<std::uint8_t*>& outs, const BoxOutput* output = nullptr,
-                   bool stream = false)
+                   bool stream = false, const std::atomic<bool>* cancel = nullptr)
     {
-        read_many(starts, sizes, outs, Bounds::Fill, output, stream);
+        read_many(starts, sizes, outs, Bounds::Fill, output, stream, cancel);
     }
 
     // Strict reads reject nonempty regions outside the array before touching
     // any output. Missing chunks still read as fill. Empty regions are no-ops.
     void read_many(const std::vector<Index>& starts, const std::vector<Index>& sizes,
                    const std::vector<std::uint8_t*>& outs, Bounds bounds,
-                   const BoxOutput* output = nullptr, bool stream = false)
+                   const BoxOutput* output = nullptr, bool stream = false,
+                   const std::atomic<bool>* cancel = nullptr)
     {
         const std::size_t nd = spec_.shape.size();
         if (starts.size() != sizes.size() || starts.size() != outs.size())
@@ -486,7 +489,7 @@ public:
         ordered.reserve(work.size());
         for (auto& [linear, i] : slot)
             ordered.push_back(std::move(work[i]));
-        run(ordered, out_strides, nullptr, output, stream);
+        run(ordered, out_strides, nullptr, output, stream, cancel);
     }
 
     void read_many_float(const std::vector<Index>& starts, const std::vector<Index>& sizes,
@@ -824,13 +827,21 @@ private:
         std::function<void(const Work&)> miss;
     };
 
-    // Resolves every chunk in parallel, in the order given.
+    // Resolves every chunk in parallel, in the order given. Once `cancel` is set, no
+    // further chunk is started and Cancelled is thrown.
     void run(std::vector<Work>& work, const std::vector<Index>& out_strides, const PointOp* op,
-             const BoxOutput* output = nullptr, bool stream = false)
+             const BoxOutput* output = nullptr, bool stream = false, const std::atomic<bool>* cancel = nullptr)
     {
+        const auto check = [cancel] {
+            if (cancel && cancel->load(std::memory_order_acquire))
+                throw Cancelled("read cancelled");
+        };
         if (spec_.hint && (!cache_ || stream))
-            pool_->parallel_for(work.size(), [&](std::size_t i) { hint(work[i]); });
-        pool_->parallel_for(work.size(), [&](std::size_t i) { resolve(work[i], out_strides, op, output, stream); });
+            pool_->parallel_for(work.size(), [&](std::size_t i) { check(); hint(work[i]); });
+        pool_->parallel_for(work.size(), [&](std::size_t i) {
+            check();
+            resolve(work[i], out_strides, op, output, stream);
+        });
     }
 
     std::size_t plan_segments(std::size_t n) const
