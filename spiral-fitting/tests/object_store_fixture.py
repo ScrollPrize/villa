@@ -193,3 +193,90 @@ def write_reference_store(db, reference, *, fibers=True):
         branch(db, uuids[a], 100 + 7 * a_control, uuids[b], 100 + 7 * b_control)
         assert a_control < len(controls[a]) and b_control < len(controls[b])
     return uuids
+
+
+# ---------------------------------------------------------------------------
+# The small store the startup, position and service tests share
+# ---------------------------------------------------------------------------
+
+def plane(y=100.0, size=8):
+    """A patch grid in the plane y: row r at z 4+4r, column c at x 40+4c."""
+    rows, cols = np.mgrid[:size, :size]
+    return np.stack([4.0 + rows * 4, np.full(rows.shape, y), 40.0 + cols * 4],
+                    axis=-1)
+
+
+def on_plane(y, *points):
+    """PCL points on the plane y, annotated with no winding."""
+    return {index: ([z, y, x], None) for index, (z, x) in enumerate(points)}
+
+
+def write_walk_store(path, *, positions=False):
+    """Two patches ('near' at y=100, 'far' at y=140) and a PCL 'walk' with
+    two points on near and one on far. ``positions`` makes the store record
+    positions of its own (shared in place). Returns ``path``."""
+    from vc_object_store import ObjectStore
+    path = str(path)
+    with ObjectStore.create(path, author='ingest', hostname='host') as db:
+        put_patch(db, plane(), (0.25, 0.25), name='near')
+        put_patch(db, plane(140.0), (0.25, 0.25), name='far')
+        put_pcl(db, {**on_plane(100.0, (12.0, 48.0), (16.0, 52.0)),
+                     2: ([20.0, 140.0, 56.0], None)}, name='walk')
+        if positions:
+            db.enable_store_positions()
+    return path
+
+
+def names(path):
+    """{object name: UUID} of a store."""
+    import object_store_inputs as osi
+    from vc_object_store import ObjectStore
+    with ObjectStore.open(str(path), read_only=True) as db:
+        return {record['name']: record['uuid'] for kind in osi.KINDS
+                for record in db.objects_by_kind(kind)}
+
+
+def edges(path, kind='point-surface'):
+    """A store's edges of ``kind``, sorted, with their review state."""
+    from vc_object_store import ObjectStore
+    with ObjectStore.open(str(path), read_only=True) as db:
+        return sorted((edge['uuid'], edge['a'], edge['b'], edge['approval_state'],
+                       edge['generation'], edge['changed_at'])
+                      for edge in db.edges_by_kind(kind))
+
+
+def fit_config(path, author='fitter', **overrides):
+    """The reference fit configuration reading the store at ``path``."""
+    import object_store_reference as reference
+    config = reference.fit_config()
+    config.update(object_store_path=str(path), object_store_author=author)
+    config.update(overrides)
+    return config
+
+
+def hub_edit(path, change, author='editor'):
+    """An editor's saved edit on a hub replica, pushed: returns the hub
+    position it reached."""
+    from vc_object_store import ObjectStore
+    with ObjectStore.open(str(path), author=author) as db:
+        db.hub_sync(pull=True, push=False)
+        change(db)
+        report = db.hub_sync(pull=True, push=True)
+    assert not report['conflicts']
+    return report['published_position']
+
+
+def leased(uuid, edit):
+    """``edit`` of an object, under its lease (as an editor makes it)."""
+    def change(db):
+        db.acquire_leases([uuid])
+        edit(db)
+    return change
+
+
+def shared_edit(path, change):
+    """An editor's write to a store shared in place: returns its position."""
+    from vc_object_store import ObjectStore
+    with ObjectStore.open(str(path), author='editor') as db:
+        change(db)
+        return db.store_positions()['position']

@@ -5,18 +5,10 @@ import numpy as np
 import pytest
 
 pytest.importorskip('vc_object_store')
-from vc_object_store import ObjectStore  # noqa: E402
-
 import object_store_inputs as osi  # noqa: E402
+from config import Config  # noqa: E402
 from object_store_fixture import (  # noqa: E402
     VOLUME, array, branch, frame, pcl_patch_edge, put_fiber, put_patch, put_pcl)
-
-
-@pytest.fixture()
-def db(tmp_path):
-    with ObjectStore.create(str(tmp_path / 'inputs.vcobj'), author='test',
-                            hostname='host') as store:
-        yield store
 
 
 def _grid(z=20.0, size=6, scale=1):
@@ -81,7 +73,11 @@ def test_explicit_selection_problems_are_reported_together(db):
         osi.read_snapshot(db, request(surface={'uuids': (empty,)}))
 
 
-def test_volume_inference(db):
+def test_the_volume_is_inferred_configured_or_refused(db):
+    # Undeclared: it must be configured; an empty selection with one is valid.
+    with pytest.raises(osi.ObjectStoreInputError, match='configure fit_volume_uuid'):
+        osi.read_snapshot(db, request())
+    assert osi.read_snapshot(db, request(volume=VOLUME)).objects == {}
     put_patch(db, _grid())
     put_pcl(db, {0: ([20.0, 14.0, 14.0], None)})
     assert osi.read_snapshot(db, request()).volume_source == 'inferred'
@@ -89,24 +85,11 @@ def test_volume_inference(db):
     assert (explicit.volume_uuid, explicit.volume_source) == (VOLUME, 'configured')
     with pytest.raises(osi.ObjectStoreInputError, match='does not match'):
         osi.read_snapshot(db, request(volume='other-volume'))
-
-
-def test_conflicting_volumes_fail_even_when_one_is_configured(db):
-    put_patch(db, _grid())
+    # Conflicting volumes fail even when one is configured.
     put_patch(db, _grid(30.0), coordinates=frame(volume='other-volume'))
     for volume in (None, VOLUME):
         with pytest.raises(osi.ObjectStoreInputError, match='different volumes'):
             osi.read_snapshot(db, request(volume=volume))
-
-
-def test_undeclared_volume_requires_configuration(db):
-    with pytest.raises(osi.ObjectStoreInputError, match='configure fit_volume_uuid'):
-        osi.read_snapshot(db, request())
-    # An empty selection with a configured volume is valid.
-    assert osi.read_snapshot(db, request(volume=VOLUME)).objects == {}
-    put_patch(db, _grid(), coordinates=None)
-    with pytest.raises(osi.ObjectStoreInputError, match='configure fit_volume_uuid'):
-        osi.read_snapshot(db, request())
 
 
 def test_every_object_without_a_frame_is_reported(db):
@@ -138,6 +121,23 @@ def test_frame_conversion_round_trips_mixed_scales(db, scale):
     assert (zyxs[0, 0] == -1).all()
     np.testing.assert_allclose(
         obj.frame.grid_scale_to_fit(attributes['scale']), [0.25, 0.5])
+
+
+def test_a_fit_level_converts_frames_to_its_voxels(db):
+    patch = put_patch(db, _grid(), scale=(0.25, 0.5), coordinates=frame(2))
+    config = Config().as_dict()
+    config.update(fit_volume_level=2, input_use_outer_shell=False,
+                  loss_weight_shell_outer=0, dense_spacing_mode='grad_mag')
+    request = osi.request_from_config(config)
+    assert request.fit_volume_level == 2 and request.fit_scale == 4
+    obj = osi.read_snapshot(db, request).objects[patch]
+    arrays, attributes = osi.read_geometry(db, obj.geometry_revision, ['points'])
+    # Stored at 2x the volume's voxels; the fit's are 4 of the volume's.
+    np.testing.assert_allclose(obj.frame.xyz_to_fit_zyx(arrays['points']),
+                               _grid() / 4, atol=1e-4)
+    # Grid steps per fit voxel: 4x those per volume voxel.
+    np.testing.assert_allclose(obj.frame.grid_scale_to_fit(attributes['scale']),
+                               [0.25 * 4, 0.5 * 4])
 
 
 def test_relationship_filtering_and_endpoint_order(db):

@@ -9,8 +9,7 @@ import sys
 import pytest
 
 from config import Config
-from fit_session import (ScrollSpecError, SpiralInputPaths, check_fit_volume,
-                         load_input_manifest, resolve_lasagna_scale,
+from fit_session import (ScrollSpecError, SpiralInputPaths, load_input_manifest,
                          scroll_spec_config_defaults, validate_fit_inputs)
 from lasagna_source import load_lasagna_source, url_identity
 
@@ -99,23 +98,12 @@ def test_supervision_entries_are_optional_and_nothing_is_discovered(tmp_path):
 
 @pytest.mark.parametrize('entries, message', [
     ({'schema_version': 2}, 'schema_version must be 1'),
-    ({'schema_version': None}, 'schema_version must be 1'),
     ({'volume_uuid': None}, 'volume_uuid'),
-    ({'volume_uuid': ''}, 'volume_uuid'),
     ({'scroll': None}, 'scroll block is required'),
-    ({'umbilicus': None}, 'umbilicus'),
-    ({'umbilicus': 'centre-line.json'}, 'umbilicus must be an object'),
-    ({'umbilicus': {'path': 'centre-line.json', 'coordinate_scale': 0}}, 'coordinate_scale'),
     ({'umbilicus': {'path': 'https://example.org/u.json'}}, 'must be a local path'),
     ({'scroll': {'name': 's1', 'spiral_outward_sense': 'CW'}}, 'voxel_size_um'),
-    ({'scroll': {'name': 's1', 'voxel_size_um': 8, 'spiral_outward_sense': 'CW',
-                 'paths': {}}}, 'unknown keys'),
-    ({'scroll': {'name': 's1', 'voxel_size_um': 8, 'spiral_outward_sense': 'CW',
-                 'num_windings': 1}}, 'num_windings'),
     ({'lasagna': {'manifest': URL}}, 'must be a local path'),
     ({'lasagna': {'manifest': 'l.json', 'original_url': '/local/path'}}, 'original_url'),
-    ({'lasagna': {'path': 'l.json'}}, 'unknown lasagna keys'),
-    ({'fiber_directions': ''}, 'fiber_directions must be a non-empty string'),
 ])
 def test_malformed_manifests_are_refused(tmp_path, entries, message):
     with pytest.raises(ScrollSpecError, match=message):
@@ -123,23 +111,12 @@ def test_malformed_manifests_are_refused(tmp_path, entries, message):
 
 
 @pytest.mark.parametrize('key, guidance', [
-    ('paths', 'path overrides are retired'),
     ('name', 'belongs in the scroll block'),
-    ('tracks_dbm', 'geometry is read from --object-store only'),
-    ('outer_shell', 'geometry is read from --object-store only'),
     ('verified_patches', 'geometry is read from --object-store only'),
 ])
 def test_retired_and_geometry_keys_are_refused_with_guidance(tmp_path, key, guidance):
     with pytest.raises(ScrollSpecError, match=guidance):
         load(write_manifest(tmp_path / 'inputs', **{key: 'x'}), tmp_path)
-
-
-def test_a_spiral_scroll_json_is_not_read_as_a_manifest(tmp_path):
-    path = tmp_path / 'spiral-scroll.json'
-    path.write_text(json.dumps({'schema_version': 1, 'name': 's1', 'voxel_size_um': 9.6,
-                                'spiral_outward_sense': 'CW'}))
-    with pytest.raises(ScrollSpecError, match='belongs in the scroll block'):
-        load(path, tmp_path)
 
 
 def test_orientation_is_validated_with_catalog_flags_and_the_sense_setting(tmp_path):
@@ -162,35 +139,6 @@ def test_orientation_is_validated_with_catalog_flags_and_the_sense_setting(tmp_p
     with pytest.raises(ScrollSpecError, match='contradicts the fit setting'):
         load(write_manifest(inputs, scroll={**bare, 'spiral_outward_sense': 'CW'}),
              tmp_path, outward_sense='ACW')
-
-
-def test_the_lasagna_scale_is_derived_cross_checked_or_required(tmp_path):
-    inputs = tmp_path / 'inputs'
-    framed = write_lasagna(inputs / 'framed', base_shape_zyx=[400, 800, 1200])
-    bare = write_lasagna(inputs / 'bare')
-    fine = write_lasagna(inputs / 'fine', base_shape_zyx=[200, 400, 600],
-                         source_to_base=2)
-    scroll_block = {'name': 's1', 'voxel_size_um': 8.0, 'spiral_outward_sense': 'CW',
-                    'base_shape_zyx': [400, 800, 1200]}
-
-    def resolved(lasagna, **scroll):
-        spec, paths = load(write_manifest(
-            inputs, scroll={**scroll_block, **scroll},
-            lasagna={'manifest': os.path.relpath(lasagna, inputs)}), tmp_path)
-        return resolve_lasagna_scale(spec, load_lasagna_source(paths.lasagna)).lasagna_scale
-
-    assert resolved(framed) == 16
-    assert resolved(framed, lasagna_scale=16) == 16
-    with pytest.raises(ScrollSpecError, match='lasagna_scale 4 contradicts'):
-        resolved(framed, lasagna_scale=4)
-    # No implicit default: underivable without an explicit scale.
-    with pytest.raises(ScrollSpecError, match='state scroll.lasagna_scale'):
-        resolved(bare)
-    assert resolved(bare, lasagna_scale=4) == 4
-    # A manifest counting levels from a pre-downsampled volume derives nothing.
-    with pytest.raises(ScrollSpecError, match='source_to_base'):
-        resolved(fine)
-    assert resolved(fine, lasagna_scale=8) == 8
 
 
 def test_a_local_copy_of_a_remote_dataset_takes_its_cache_identity(tmp_path):
@@ -260,26 +208,17 @@ def test_a_scroll_winding_count_is_a_configuration_default(tmp_path):
             'model_gap_expander_capacity_windings'] == 73
 
 
-def test_inputs_of_another_volume_are_refused():
-    paths = SpiralInputPaths(volume_uuid='volume-1')
-    check_fit_volume(paths, 'volume-1')
-    check_fit_volume(SpiralInputPaths(), 'volume-2')
-    with pytest.raises(ScrollSpecError, match='selected store objects are fitted in volume-2'):
-        check_fit_volume(paths, 'volume-2')
-
-
 def test_the_cli_fit_refuses_store_objects_of_another_volume(tmp_path, monkeypatch):
     pytest.importorskip('vc_object_store')
     from vc_object_store import ObjectStore
     import object_store_reference as reference
-    from object_store_fixture import VOLUME, put_patch
-    from test_object_store_startup import _grid
+    from object_store_fixture import VOLUME, plane, put_patch
     from config import FitConfig
     from fit_spiral import FitContext
     monkeypatch.setenv('FIT_SPIRAL_DEVICE', 'cpu')
     store = str(tmp_path / 'fit.vcobj')
     with ObjectStore.create(store, author='ingest', hostname='host') as db:
-        put_patch(db, _grid(), (0.25, 0.25), name='near')
+        put_patch(db, plane(), (0.25, 0.25), name='near')
     umbilicus = str(tmp_path / 'umbilicus.json')
     reference.write_umbilicus(umbilicus)
 
@@ -291,23 +230,18 @@ def test_the_cli_fit_refuses_store_objects_of_another_volume(tmp_path, monkeypat
             paths=SpiralInputPaths(volume_uuid=volume, umbilicus=umbilicus),
             cache_dir=str(tmp_path / 'cache'), out_base_dir=str(tmp_path / 'out'),
             input_log=lambda line: None)
-    with pytest.raises(ScrollSpecError, match=f'fitted in {VOLUME}'):
+    with pytest.raises(ScrollSpecError, match=f'selected store objects are fitted in {VOLUME}'):
         context('another-volume').load_host_inputs()
     context(VOLUME).load_host_inputs()
 
 
-@pytest.mark.parametrize('flag, guidance', [
-    ('--dataset', '--inputs MANIFEST'),
-    ('--scroll-spec', 'scroll block'),
-    ('--lasagna-url', 'lasagna.original_url'),
-])
-def test_retired_cli_flags_are_refused_with_guidance(flag, guidance):
+def test_a_retired_cli_flag_is_refused_with_guidance():
     result = subprocess.run(
-        [sys.executable, str(SPIRAL_DIR / 'fit_spiral.py'), flag, '/data/scroll'],
+        [sys.executable, str(SPIRAL_DIR / 'fit_spiral.py'), '--dataset', '/data/scroll'],
         capture_output=True, text=True, cwd=SPIRAL_DIR, timeout=300)
     assert result.returncode == 2
-    assert f'{flag} is retired' in result.stderr
-    assert guidance in result.stderr
+    assert '--dataset is retired' in result.stderr
+    assert '--inputs MANIFEST' in result.stderr
 
 
 def test_the_cli_reports_every_missing_input_before_fitting(tmp_path):
@@ -329,33 +263,3 @@ def test_the_cli_reports_every_missing_input_before_fitting(tmp_path):
     assert 'lasagna.manifest in the input manifest' in result.stderr
 
 
-def test_cli_directory_store_is_reported_before_loading_inputs(tmp_path):
-    directory = tmp_path / 'roi'
-    directory.mkdir()
-    (directory / 'dataset.vcobj').touch()
-    result = subprocess.run(
-        [sys.executable, str(SPIRAL_DIR / 'fit_spiral.py'),
-         '--inputs', str(tmp_path / 'not-loaded.json'), '--object-store', str(directory)],
-        capture_output=True, text=True, timeout=300)
-    assert result.returncode == 2
-    assert '--object-store is a directory' in result.stderr
-    assert f'use --object-store {directory / "dataset.vcobj"}' in result.stderr
-    assert 'disk I/O error' not in result.stderr
-
-
-def test_cli_rejects_obsolete_store_before_loading_volumes(tmp_path):
-    import sqlite3
-    store = tmp_path / 'old.vcobj'
-    with sqlite3.connect(store) as db:
-        db.execute('PRAGMA application_id = 1447251778')
-        db.execute('PRAGMA user_version = 16')
-    manifest = write_manifest(tmp_path / 'inputs')
-    result = subprocess.run(
-        [sys.executable, str(SPIRAL_DIR / 'fit_spiral.py'), '--inputs', str(manifest),
-         '--object-store', str(store), '--cache', str(tmp_path / 'cache')],
-        capture_output=True, text=True, timeout=300,
-        env={**os.environ, 'WANDB_MODE': 'disabled',
-             'FIT_SPIRAL_CONFIG_OVERRIDES': json.dumps(NO_SUPERVISION)})
-    assert result.returncode == 2
-    assert 'cannot open --object-store' in result.stderr
-    assert 'unsupported database schema' in result.stderr

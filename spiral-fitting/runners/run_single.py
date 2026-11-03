@@ -734,6 +734,12 @@ def _atomic_write_json(path: Path, value: dict) -> None:
 def _resume_invocation(
     args: argparse.Namespace, overrides: dict, project: str, entity: str
 ) -> dict:
+    from vc_object_store import ObjectStore
+
+    # Store identity survives relocation and replication. Check it even when
+    # the saved fit is complete and the fitter's input checks will not run.
+    with ObjectStore.open(str(args.object_store), read_only=True) as store:
+        store_uuid = store.uuid
     gpu_ids = getattr(args, "gpus", None)
     return {
         "effective_config": {
@@ -743,6 +749,7 @@ def _resume_invocation(
         },
         "inputs": {
             "input_manifest": str(args.inputs.resolve()),
+            "object_store_uuid": store_uuid,
             "ink_volume": str(args.ink_volume.resolve()),
         },
         "operational_args": {
@@ -1126,7 +1133,7 @@ def run(args: argparse.Namespace) -> None:
     if overwrite and getattr(args, "resume", False):
         raise ValueError("--overwrite cannot be combined with --resume")
     if overwrite:
-        protected_paths = [args.inputs, args.ink_volume, args.vc_render_bin]
+        protected_paths = [args.inputs, args.object_store, args.ink_volume, args.vc_render_bin]
         if args.config is not None:
             protected_paths.append(args.config)
         overwrite_output(args.output, protected_paths=protected_paths)

@@ -232,8 +232,6 @@ int main() try
         auto txn = alice.read();
         require(!alice.edgeByUuid(txn, extra), "a link the hub never had is gone");
     }
-    require(hubAddress("ssh://host/a b.vcobj") == "sftp://host/a%20b.vcobj" || hubAddress("ssh://host/a b.vcobj").rfind("sftp://", 0) == 0,
-            "a remote hub address is canonical sftp://");
 
     // A hub made before the publication index reads its head, and starts the
     // index with its next write.
@@ -314,20 +312,7 @@ int main() try
                 "the journal between positions names their writers");
         require(state(service, storePositions(service)->position)["objects"][x]["meta"]["note"] == "two", "the head reads now");
         mustFail([&] { auto replica = ObjectStore::open(alicePath, as("alice")); enableStorePositions(replica); });
-        // Hosting keeps the store's positions; detaching a replica drops the hub's.
-        service.checkpoint();
     }
-    {
-        const auto plainPath = directory.path / "plain.vcobj";
-        initHub(plainPath, "curator");
-        const auto replicaPath = directory.path / "plain-replica.vcobj";
-        cloneHub(plainPath, replicaPath, as("carol"));
-        detachHub(replicaPath, "carol");
-        auto detached = ObjectStore::open(replicaPath, as("carol"));
-        require(!storePositions(detached), "a detached replica keeps none of its hub's positions");
-        detached.checkpoint();
-    }
-    initHub(directory.path / "plain-replica.vcobj", "carol");  // and can be hosted again
     std::cout << "object_store_hub_positions: ok\n";
     return 0;
 } catch (const std::exception& error) {

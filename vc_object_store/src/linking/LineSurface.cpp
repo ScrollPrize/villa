@@ -771,13 +771,13 @@ void validateLineSurfaceParams(const LineSurfaceParams& params, double sourceSca
 DetectorReport linkLinesToSurfaces(objects::ObjectStore& db, StoredGeometry& inputs, size_t lineCount, const LineLoader& load,
     const std::filesystem::path& ctVolume,
     const LineSurfaceParams& params, double sourceScale, const char* detector, int version,
-    const std::atomic_bool* cancel, DetectorReport report)
+    const std::atomic_bool* cancel, DetectorReport report, const LineIncremental* incremental)
 {
     validateLineSurfaceParams(params, sourceScale);
     const bool tracks = std::string(detector) == kTrackSurfaceDetector;
     try {
         checkCancelled(cancel);
-        const auto objects = inputs.select("surface", params.surfaceUuids);
+        const auto objects = incremental ? incremental->surfaces : inputs.select("surface", params.surfaceUuids);
         const auto surfaceScales = coordinateScales(objects, params, report, params.surfaceScale);
         if (report.failed()) return report;
         std::map<std::string, nlohmann::json> surfaceFrames;
@@ -836,7 +836,8 @@ DetectorReport linkLinesToSurfaces(objects::ObjectStore& db, StoredGeometry& inp
         discovery.rebuild(grids);
         std::vector<LinkCandidate> candidates;
         StaleEdgeScope scope{{params.edgeKind}, {}};
-        for (const auto& surface : surfaces) scope.objectUuids.push_back(surface.uuid);
+        if (!incremental)
+            for (const auto& surface : surfaces) scope.objectUuids.push_back(surface.uuid);
         auto settings = settingsJson(params);
         settings[tracks ? "track_scale" : "fiber_scale"] = sourceScale;
         const auto linkingStage = tracks ? "linking tracks" : "linking fibers";
@@ -854,6 +855,8 @@ DetectorReport linkLinesToSurfaces(objects::ObjectStore& db, StoredGeometry& inp
             auto lineParams = params;
             lineParams.progress = objects::util::subtaskProgress(params.progress, linkingStage, input, lineCount, item);
             std::map<size_t, std::vector<size_t>> contacts;
+            // An existing line is linked to the new surfaces alone.
+            const bool existing = incremental && !incremental->fresh.contains(fiber.uuid);
             for (size_t i = fiber.firstLine; i <= fiber.lastLine; ++i) {
                 if ((i & 255) == 0 || i == fiber.firstLine) {
                     checkCancelled(cancel);
@@ -862,8 +865,11 @@ DetectorReport linkLinesToSurfaces(objects::ObjectStore& db, StoredGeometry& inp
                 SurfaceIndex::PointQuery q;
                 q.worldPoint = cv::Vec3f(fiber.line[i]);
                 q.tolerance = float(params.proximity);
-                for (const auto& hit : discovery.locateAll(q))
-                    contacts[surfaceIndex.at(hit.surface.get())].push_back(i);
+                for (const auto& hit : discovery.locateAll(q)) {
+                    const auto surface = surfaceIndex.at(hit.surface.get());
+                    if (existing && !incremental->fresh.contains(surfaces[surface].uuid)) continue;
+                    contacts[surface].push_back(i);
+                }
             }
             objects::util::reportProgress(lineParams.progress, "finding surface contacts",
                 fiber.lastLine - fiber.firstLine + 1, fiber.lastLine - fiber.firstLine + 1);
@@ -899,7 +905,7 @@ DetectorReport linkLinesToSurfaces(objects::ObjectStore& db, StoredGeometry& inp
                     {"max_strip_same", maxSame}, {"max_strip_adjacent", maxAdjacent}};
                 std::fprintf(stderr, "FIBER_SURFACE_FIBER %s\n", profile.dump().c_str());
             }
-            scope.objectUuids.push_back(fiber.uuid);
+            if (!incremental) scope.objectUuids.push_back(fiber.uuid);
             for (const auto& p : proposals) {
                 if (p.round < 0) continue;
                 const auto& surface = surfaces[p.surface];
@@ -952,6 +958,15 @@ DetectorReport linkLinesToSurfaces(objects::ObjectStore& db, StoredGeometry& inp
         }
         checkCancelled(cancel);
         objects::util::reportProgress(params.progress, linkingStage, lineCount, lineCount);
+        if (incremental) {
+            // Edges of a new object, both endpoints selected and not failed.
+            const auto failed = failedObjects(report);
+            for (const auto& uuid : incremental->selected)
+                if (!failed.contains(uuid)) scope.objectUuids.push_back(uuid);
+            for (const auto& uuid : incremental->fresh)
+                if (!failed.contains(uuid)) scope.touching.push_back(uuid);
+            if (scope.touching.empty()) scope.objectUuids.clear();
+        }
         auto txn = db.write();
         checkCancelled(cancel);
         const auto committed = commitStoredCandidates(db, inputs, txn, detector, version, candidates, params.replaceStalePending, &scope, params.progress);

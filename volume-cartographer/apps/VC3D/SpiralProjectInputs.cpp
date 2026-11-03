@@ -157,12 +157,14 @@ ProjectLasagna withCachedStores(ProjectLasagna lasagna)
 }
 
 std::vector<vc::lasagna::LasagnaChannelGroup> lasagnaGroupsToCache(
-    const ProjectLasagna& lasagna, const std::filesystem::path& spiralCache)
+    const ProjectLasagna& lasagna, const std::filesystem::path& spiralCache,
+    const std::optional<std::set<std::string>>& kinds)
 {
     const std::pair<const char*, std::vector<const char*>> packs[] = {
         {"normals", {"normal_x", "normal_y"}}, {"grad_mag", {"gradient_magnitude"}}};
     std::vector<vc::lasagna::LasagnaChannelGroup> result;
     for (const auto& [kind, inputs] : packs) {
+        if (kinds && !kinds->contains(kind)) continue;
         std::error_code ec;
         if (!lasagna.identity.empty()
             && std::filesystem::is_regular_file(spiralCache / "lasagna" / lasagna.identity /

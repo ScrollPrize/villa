@@ -15,6 +15,7 @@
 #include "vc_object_store/CtSheetNormal.hpp"
 #include "vc_object_store/objects/GeometryCoordinates.hpp"
 #include "vc_object_store/objects/FiberJson.hpp"
+#include <mutex>
 using namespace vc::python;
 namespace {
 nb::dict objectRevisionToPy(const vo::ObjectRevision& revision)
@@ -173,6 +174,37 @@ nb::dict detectorReportToPy(const vc::object_links::DetectorReport& rep)
     return d;
 }
 
+// A Python progress callable as a detector's ProgressCallback:
+// progress(stage, completed, total, detail), total 0 when unknown. Detectors
+// report with the GIL released, sometimes from worker threads; calls are
+// serialized and take the GIL. An exception it raises is reported as
+// unraisable and does not stop the detector. The callable is borrowed: the
+// detector call's kwargs keep it alive.
+vc::objects::util::ProgressCallback pythonProgress(nb::handle callable)
+{
+    if (callable.is_none()) return {};
+    if (!PyCallable_Check(callable.ptr())) throw nb::type_error("progress must be callable or None");
+    auto serial = std::make_shared<std::mutex>();
+    PyObject* raw = callable.ptr();
+    return [serial, raw](const vc::objects::util::ProgressUpdate& update) {
+        const std::string stage(update.stage), detail(update.detail);
+        std::lock_guard lock(*serial);
+        nb::gil_scoped_acquire gil;
+        try {
+            const nb::handle report(raw);
+            report(stage, update.completed, update.total, detail);
+        } catch (nb::python_error& error) {
+            error.discard_as_unraisable(nb::handle(raw));
+        }
+    };
+}
+
+std::optional<std::vector<std::string>> newUuidsParameter(nb::handle value)
+{
+    if (value.is_none()) return std::nullopt;
+    return nb::cast<std::vector<std::string>>(value);
+}
+
 bool setCoordinateParameter(vc::object_links::CoordinateParams& p, const std::string& key, nb::handle value)
 {
     if (key == "volume_uuid") p.volumeUuid = nb::cast<std::string>(value);
@@ -211,6 +243,7 @@ bool setLineSurfaceParameter(vc::object_links::LineSurfaceParams& p, const std::
     else if (key == "max_rounds") p.maxRounds = nb::cast<int>(val);
     else if (key == "edge_kind") p.edgeKind = nb::cast<std::string>(val);
     else if (key == "replace_stale_pending") p.replaceStalePending = nb::cast<bool>(val);
+    else if (key == "progress") p.progress = pythonProgress(val);
     else if (key == "strip_weights") {
         const auto weights = nb::cast<std::vector<double>>(val);
         if (weights.size() != p.stripWeights.size())
@@ -404,6 +437,8 @@ NB_MODULE(_native, m)
         return vo::geometryScaleToVolume(nlohmann::json::parse(jsonDumps(meta)), volume);
     }, nb::arg("meta"), nb::arg("volume"),
        "Volume voxels per stored unit for an object whose meta binds it to volume; None when it is not.");
+    m.def("detector_versions", [] { return vc::object_links::detectorVersions(); },
+          "{detector name: version} of the link detectors, as recorded in their edges' meta.detector.");
     m.def("hub_address", [](const std::filesystem::path& hub) { return vo::hubAddress(hub); }, nb::arg("hub"),
           "A hub address as replicas record it (hub_status()['hub']).");
     m.def("create_project", [](const std::filesystem::path& path, const std::string& name, const nb::object& meta,
@@ -554,6 +589,8 @@ NB_MODULE(_native, m)
                 return out;
             },
             nb::arg("after_seq") = 0)
+        .def("journal_position", readMethod<&vo::ObjectStore::journalPosition>(),
+             "The journal's highest sequence (0 when empty): the store's head.")
         .def("geometry_point_annotations", [](PyObjectStore& self,const std::string& revision,const std::string& array) {
             return jsonLoads(self.withRead([&](vo::ObjectStore& db,vo::ReadTxn& txn) { return db.geometryPointAnnotations(txn,revision,array); }));
         },nb::arg("revision_uuid"),nb::arg("array_name"))
@@ -891,6 +928,19 @@ NB_MODULE(_native, m)
             return vo::enableStorePositions(db);
         }, "Record positions of this plain store from now on (every write, by any connection), so "
            "hub_read_view_at reads its states. Returns its head.")
+        .def("link_marker", [](PyObjectStore& self) -> nb::object {
+            const auto marker = vo::linkMarker(self.require());
+            return marker ? jsonLoads(*marker) : nb::none();
+        }, "The store's link marker (a dict a client wrote with set_link_marker), or None. A copy of the store "
+           "(a clone or fork_replica) reads none.")
+        .def("set_link_marker", [](PyObjectStore& self, const nb::dict& marker) {
+            const auto text = jsonDumps(marker);
+            auto& db = self.require();
+            nb::gil_scoped_release release;
+            vo::setLinkMarker(db, text);
+        }, nb::arg("marker"),
+           "Replace the store's link marker, a JSON-able dict describing the last link refresh. Not journaled: "
+           "it adds no position, no hub sync carries it and hub_revert keeps it.")
         .def("store_positions", [](PyObjectStore& self) -> nb::object {
             const auto positions = vo::storePositions(self.require());
             if (!positions) return nb::none();
@@ -924,6 +974,8 @@ NB_MODULE(_native, m)
                     else if (key == "absolute_winding") p.absoluteWinding = nb::cast<std::optional<bool>>(value);
                     else if (key == "edge_kind") p.edgeKind = nb::cast<std::string>(value);
                     else if (key == "replace_stale_pending") p.replaceStalePending = nb::cast<bool>(value);
+                    else if (key == "progress") p.progress = pythonProgress(value);
+                    else if (key == "new_uuids") p.newUuids = newUuidsParameter(value);
                     else throw std::runtime_error("link_point_collections_to_surfaces: unknown parameter '" + key + "'");
                 }
                 return detectorReportToPy(self.withStore<true>([&](auto& db) {
@@ -933,7 +985,10 @@ NB_MODULE(_native, m)
             nb::arg("kwargs"),
             "Link regular PCL points to surfaces using Spiral's largest-area/nearest-named-pair rules. "
             "Point IDs anchor the edges; winding annotations and surface grid coordinates are retained. "
-            "Defaults: tolerance=2.5, window_points=1, window_min_points=1; no CT required.")
+            "Defaults: tolerance=2.5, window_points=1, window_min_points=1; no CT required. "
+            "progress(stage, completed, total, detail) reports progress. new_uuids (selected collections and "
+            "surfaces) runs incrementally: a new collection is linked as in a full run, an existing one near a "
+            "new surface to the new surfaces alone; stale removal touches edges of new objects only.")
         .def(
             "link_surface_overlaps",
             [](PyObjectStore& self, const nb::kwargs& kwargs) {
@@ -960,6 +1015,8 @@ NB_MODULE(_native, m)
                     else if (key == "allow_reflection") p.allowReflection = nb::cast<bool>(val);
                     else if (key == "edge_kind") p.edgeKind = nb::cast<std::string>(val);
                     else if (key == "replace_stale_pending") p.replaceStalePending = nb::cast<bool>(val);
+                    else if (key == "progress") p.progress = pythonProgress(val);
+                    else if (key == "new_uuids") p.newUuids = newUuidsParameter(val);
                     else throw std::runtime_error("link_surface_overlaps: unknown parameter '" + key + "'");
                 }
                 return detectorReportToPy(self.withStore<true>([&](auto& db) {
@@ -967,7 +1024,9 @@ NB_MODULE(_native, m)
                 }));
             },
             "Run surface-overlap discovery using stored geometry; surface_uuids optionally selects objects. "
-            "kwargs mirror SurfaceOverlapParams (tolerance, min_minor_spread, ...).")
+            "kwargs mirror SurfaceOverlapParams (tolerance, min_minor_spread, ...). "
+            "progress(stage, completed, total, detail) reports progress. new_uuids (selected surfaces) examines "
+            "only pairs with a new surface, loading the surfaces near them; stale removal touches their edges only.")
         .def(
             "overlap_correspondences",
             [](PyObjectStore& self, const std::vector<std::string>& edges, const std::string& volume,
@@ -1023,6 +1082,7 @@ NB_MODULE(_native, m)
                     else if (key == "track_uuids") p.trackUuids = nb::cast<std::vector<std::string>>(value);
                     else if (key == "edge_kind") p.edgeKind = nb::cast<std::string>(value);
                     else if (key == "replace_stale_pending") p.replaceStalePending = nb::cast<bool>(value);
+                    else if (key == "progress") p.progress = pythonProgress(value);
                     else throw std::runtime_error("link_tracks_to_tracks: unknown parameter '" + key + "'");
                 }
                 return detectorReportToPy(self.withStore<true>([&](auto& db) {
@@ -1063,6 +1123,7 @@ NB_MODULE(_native, m)
                     else if (key == "cache_directory") p.cacheDirectory = nb::cast<std::string>(val);
                     else if (key == "fiber_scale") p.fiberScale = nb::cast<double>(val);
                     else if (key == "rebuild_strips") p.rebuildStrips = nb::cast<bool>(val);
+                    else if (key == "new_uuids") p.newUuids = newUuidsParameter(val);
                     else if (!setLineSurfaceParameter(p, key, val))
                         throw std::runtime_error("link_fibers_to_surfaces: unknown parameter '" + key + "'");
                 }
@@ -1073,7 +1134,10 @@ NB_MODULE(_native, m)
             nb::arg("ct_volume") = "", nb::arg("kwargs"),
             "Link stored fibers to stored surfaces; select with fiber_uuids and surface_uuids. "
             "Strip normals come from ct_volume, or from lasagna "
-            "normal_x_volume/normal_y_volume; with neither, the centerline alone gates anchors. Optional cache_directory stores disposable strips.")
+            "normal_x_volume/normal_y_volume; with neither, the centerline alone gates anchors. Optional cache_directory stores disposable strips. "
+            "progress(stage, completed, total, detail) reports progress. new_uuids (selected fibers and surfaces) "
+            "runs incrementally: a new fiber is linked as in a full run, an existing one near a new surface to "
+            "the new surfaces alone; stale removal touches edges of new objects only.")
         .def_prop_ro("uuid", readMethod<&vo::ObjectStore::uuid>())
         .def("current_object_revision", readMethod<&vo::ObjectStore::currentObjectRevision>(),
              nb::arg("object_uuid"))

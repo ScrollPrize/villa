@@ -10,6 +10,7 @@
 #include <atomic>
 #include <cstdint>
 #include <filesystem>
+#include <map>
 #include <optional>
 #include <string>
 #include <vector>
@@ -26,6 +27,17 @@ inline constexpr const char* kFiberSurfaceDetector = "fiber-surface";
 inline constexpr const char* kTrackTrackDetector = "track-track";
 inline constexpr const char* kTrackSurfaceDetector = "track-surface";
 inline constexpr const char* kPointCollectionSurfaceDetector = "point-collection-surface";
+
+// Detector versions recorded in edge meta ("detector.version"). Bump one
+// whenever its results change for the same inputs and parameters: callers
+// that cache "links are current" (a link marker) compare these.
+inline constexpr int kSurfaceOverlapVersion = 1;
+inline constexpr int kFiberSurfaceVersion = 3;
+inline constexpr int kTrackTrackVersion = 1;
+inline constexpr int kTrackSurfaceVersion = 1;
+inline constexpr int kPointCollectionSurfaceVersion = 1;
+// {detector name: version} of every detector above.
+std::map<std::string, int> detectorVersions();
 
 // One proposed connection. `kind` is the edge kind metadata to store
 // (detectors default it to "same-surface"); `score` and `meta` are
@@ -72,11 +84,25 @@ struct DetectorReport {
 // Other errors that abort a whole detector may throw; nothing is committed then.
 
 // Optional stale-edge scope for a partial detector run. Both endpoints
-// must be in objectUuids; empty sets deliberately remove nothing.
+// must be in objectUuids; empty sets deliberately remove nothing. A
+// nonempty `touching` also requires one endpoint in it (an incremental
+// run's new objects).
 struct StaleEdgeScope {
     std::vector<std::string> edgeKinds;
     std::vector<std::string> objectUuids;
+    std::vector<std::string> touching;
 };
+
+// Incremental runs (a detector's newUuids, set): the selection is the
+// partner set, and only pairs with at least one new object are examined.
+// Every new UUID must be among the selection (an empty selection: every
+// object of the kind). Partners are the selected objects of the other side
+// whose stored bounds overlap a new object's, grown by the detector's
+// search margin; only new objects and their partners are loaded. Stale
+// removal is limited to edges with a new endpoint and both endpoints
+// selected. Results for pairs of a new object are the full run's, except
+// where noted per detector; effects on pairs of existing objects (a new
+// surface winning a point over an older one) are not propagated.
 
 // Commits candidates as edges in one write transaction:
 // - each new edge gets meta.detector = {name, version, score?} merged
@@ -131,6 +157,10 @@ struct PointCollectionSurfaceParams : CoordinateParams {
     std::string edgeKind = "point-surface";
     bool replaceStalePending = true;
     objects::util::ProgressCallback progress;
+    // Incremental run (see above). A new collection is linked as in a full
+    // run; an existing collection near a new surface is linked to the new
+    // surfaces alone (its existing links are kept).
+    std::optional<std::vector<std::string>> newUuids;
 };
 
 // Stored point collections -> stored surfaces. Anchors retain point IDs and
@@ -173,6 +203,9 @@ struct SurfaceOverlapParams : CoordinateParams {
     bool allowReflection = true;
     std::string edgeKind = "same-surface";
     bool replaceStalePending = true;
+    // Incremental run (see above): pairs with a new surface. Each pair's
+    // result is the full run's.
+    std::optional<std::vector<std::string>> newUuids;
 };
 // Stored surfaces on the same sheet, using 3D correspondences, robust UV fitting
 // and dense overlap agreement. Accepted pairs become pending edges.
@@ -288,6 +321,11 @@ struct FiberSurfaceParams : LineSurfaceParams {
     // metadata invalidate the cache. CT/normal voxel data is assumed immutable;
     // set this after editing it in place without changing its metadata.
     bool rebuildStrips = false;
+    // Incremental run (see above), over fibers and surfaces. A new fiber is
+    // linked as in a full run; an existing fiber near a new surface is
+    // linked to the new surfaces alone (anchors and growth among them; its
+    // existing links are kept).
+    std::optional<std::vector<std::string>> newUuids;
 };
 
 // Stored fibers -> stored surfaces. CT (ctVolume) or lasagna normals

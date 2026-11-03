@@ -187,7 +187,7 @@ DetectorReport linkTracksToTracks(objects::ObjectStore& db, const TrackTrackPara
         }
         checkCancelled(cancel);
         auto transaction = db.write();
-        const auto committed = detail::commitStoredCandidates(db, inputs, transaction, kTrackTrackDetector, 1, candidates,
+        const auto committed = detail::commitStoredCandidates(db, inputs, transaction, kTrackTrackDetector, kTrackTrackVersion, candidates,
                                                  params.replaceStalePending, &scope, progressCallback);
         checkCancelled(cancel);
         objects::util::reportProgress(progressCallback, "committing links");

@@ -11,6 +11,7 @@
 #include <filesystem>
 #include <map>
 #include <optional>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -70,8 +71,11 @@ ProjectLasagna withCachedStores(ProjectLasagna lasagna);
 // normal_x and normal_y; grad_mag: gradient_magnitude) the cache holds no pack
 // of. The cache keys packs by identity, so a dataset without one here (a
 // remote manifest, which the service identifies by its URL) needs all of them.
+// `kinds`, when given, limits them to the pack kinds the build reads (the
+// service's POST /session/lasagna-packs).
 std::vector<vc::lasagna::LasagnaChannelGroup> lasagnaGroupsToCache(
-    const ProjectLasagna& lasagna, const std::filesystem::path& spiralCache);
+    const ProjectLasagna& lasagna, const std::filesystem::path& spiralCache,
+    const std::optional<std::set<std::string>>& kinds = std::nullopt);
 
 // The identity a Spiral cache keys a local Lasagna dataset's packs by
 // (spiral-fitting's lasagna_source.manifest_identity): the run_uuid of the

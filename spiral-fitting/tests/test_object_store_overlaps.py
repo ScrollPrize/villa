@@ -3,7 +3,6 @@ import numpy as np
 import pytest
 
 pytest.importorskip('vc_object_store')
-from vc_object_store import ObjectStore  # noqa: E402
 
 import object_store_inputs as osi  # noqa: E402
 import object_store_reference as reference  # noqa: E402
@@ -15,16 +14,7 @@ LOW = '00000000-0000-4000-8000-000000000001'
 HIGH = 'ffffffff-0000-4000-8000-000000000001'
 
 
-@pytest.fixture()
-def db(tmp_path):
-    with ObjectStore.create(str(tmp_path / 'fit.vcobj'), author='test',
-                            hostname='host') as store:
-        yield store
-
-
-@pytest.fixture(autouse=True)
-def cpu(monkeypatch):
-    monkeypatch.setenv('FIT_SPIRAL_DEVICE', 'cpu')
+pytestmark = pytest.mark.usefixtures('cpu')
 
 
 def _plane(dx=0.0, size=24, step=2.0):
@@ -99,17 +89,27 @@ def test_pairs_follow_the_stored_endpoint_order(db, first, second):
             a['ij'][1] + (shift[first] - shift[second]) / 2, abs=0.25)
 
 
-@pytest.mark.parametrize('scales', [(2, 0.5), (0.25, 4)])
-def test_non_unit_scales_land_in_fit_voxels(db, scales):
+@pytest.mark.parametrize('scales,level', [((2, 0.5), 0), ((0.25, 4), 0), ((1, 1), 1)])
+def test_pairs_land_in_fit_voxels(db, scales, level):
+    # Stored at non-unit scales, or fitted at a coarser level: the store's
+    # pairs are in the volume's voxels, the patches in the fit's, and the
+    # pairs must still sit on them.
     a = _put(db, _plane(), scale=scales[0])
     b = _put(db, _plane(10.0), scale=scales[1])
-    _detect(db)
-    inputs = materialize(db)
-    assert {inputs.snapshot.objects[a].frame.scale_factor,
-            inputs.snapshot.objects[b].frame.scale_factor} == set(scales)
+    [edge] = _detect(db)
+    inputs = materialize(db, fit_volume_level=level)
+    if not level:
+        assert {inputs.snapshot.objects[a].frame.scale_factor,
+                inputs.snapshot.objects[b].frame.scale_factor} == set(scales)
     assert_pairs_lie_on_their_patches(inputs)
     zs = [pcl['points'][0]['zyx'][0] for pcl in inputs.patch_overlaps.values()]
-    assert 4.0 <= min(zs) and max(zs) <= 50.0
+    assert 4.0 / 2 ** level <= min(zs) and max(zs) <= 50.0 / 2 ** level
+    # The requested spacing is the fit level's.
+    store_pairs = db.overlap_correspondences([edge['uuid']], VOLUME, 8.0 * 2 ** level,
+                                             16)[0]['pairs']
+    assert len(_pairs(inputs)) + inputs.counts['overlap pairs off sampled quads'] \
+        == len(store_pairs)
+    assert all(pcl['metadata']['pair_distance'] < 1 for pcl in _pairs(inputs))
 
 
 def test_pairs_off_sampled_quads_are_dropped(db):
@@ -146,17 +146,6 @@ def test_an_edge_with_no_sampled_pair_is_reported(db):
     assert inputs.counts['patch overlaps off sampled quads'] == 1
     warning = [line for line in inputs.report() if line.startswith('WARNING')]
     assert len(warning) == 1 and edge['uuid'] in warning[0]
-
-
-def test_edges_to_unfitted_patches_are_counted(db):
-    _put(db, _plane())
-    _put(db, _plane(10.0))
-    _detect(db)
-    snapshot = osi.read_snapshot(db, osi.InputRequest())
-    collections, counts = osi.materialize_patch_overlaps(
-        db, snapshot, {}, pair_spacing=8.0, max_pairs=16)
-    assert collections == {}
-    assert counts['patch overlaps with unfitted patches'] == 1
 
 
 def test_materialization_errors_and_stale_geometry_are_reported(db):

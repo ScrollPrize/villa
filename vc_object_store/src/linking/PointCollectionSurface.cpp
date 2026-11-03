@@ -121,12 +121,11 @@ std::vector<Collection> loadCollections(detail::StoredGeometry& inputs,
     return result;
 }
 
-std::vector<Surface> loadSurfaces(detail::StoredGeometry& inputs,
+std::vector<Surface> loadSurfaces(detail::StoredGeometry& inputs, const std::vector<objects::ObjectRecord>& objects,
     const PointCollectionSurfaceParams& params, const std::map<std::string, double>& scales,
     DetectorReport& report, const std::atomic_bool* cancel)
 {
     std::vector<Surface> surfaces;
-    const auto objects = inputs.select("surface", params.surfaceUuids);
     size_t loaded = 0;
     loadEach(objects, report, cancel, [&](const objects::ObjectRecord& object) {
         objects::util::reportProgress(params.progress, "loading PCL target surfaces", loaded++, objects.size(), object.uuid);
@@ -150,7 +149,8 @@ std::vector<Surface> loadSurfaces(detail::StoredGeometry& inputs,
     return surfaces;
 }
 
-std::set<size_t> betweenTargets(const std::string& name, const std::map<std::string, size_t>& surfaces)
+template <class Value>
+std::set<Value> betweenTargets(const std::string& name, const std::map<std::string, Value>& surfaces)
 {
     const std::string prefix = "between_surfaces__";
     if (!name.starts_with(prefix)) return {};
@@ -160,6 +160,15 @@ std::set<size_t> betweenTargets(const std::string& name, const std::map<std::str
         if (a != surfaces.end() && b != surfaces.end()) return {a->second, b->second};
     }
     return {}; // Spiral falls back to the general policy if either name is absent.
+}
+
+template <class Keep>
+std::vector<objects::ObjectRecord> keepOnly(const std::vector<objects::ObjectRecord>& objects, Keep keep)
+{
+    std::vector<objects::ObjectRecord> result;
+    for (const auto& object : objects)
+        if (keep(object.uuid)) result.push_back(object);
+    return result;
 }
 
 std::array<double, 3> projection(const Surface& surface, const SurfaceIndex::LookupResult& hit, double surfaceScale)
@@ -188,21 +197,73 @@ DetectorReport linkPointCollectionsToSurfaces(objects::ObjectStore& db,
     detail::StoredGeometry inputs(db);
     DetectorReport loading;
     const auto collectionObjects = linkableCollections(inputs, params);
+    const auto surfaceObjects = inputs.select("surface", params.surfaceUuids);
+    const auto fresh = detail::newAmong(params.newUuids, {&collectionObjects, &surfaceObjects},
+                                        "point-collection-surface");
     const auto pointScales = detail::coordinateScales(collectionObjects, params, loading, params.pointScale);
-    const auto surfaceScales = detail::coordinateScales(inputs.select("surface", params.surfaceUuids), params, loading, params.surfaceScale);
+    const auto surfaceScales = detail::coordinateScales(surfaceObjects, params, loading, params.surfaceScale);
     if (loading.failed()) return loading;
-    auto collections = loadCollections(inputs, collectionObjects, params, pointScales, loading, cancel);
-    auto surfaces = loadSurfaces(inputs, params, surfaceScales, loading, cancel);
-    std::map<std::string, size_t> byName;
+    // Named-pair targets of an incremental run come from every selected
+    // surface (the pair may not be loaded); a full run's from the loaded ones.
+    std::map<std::string, std::string> selectedByName;
+    auto collectionsToLoad = collectionObjects;
+    auto surfacesToLoad = surfaceObjects;
+    if (fresh) {
+        objects::util::reportProgress(params.progress, "finding partners of new objects");
+        std::set<std::string> surfaces, collections, allSurfaces, allCollections;
+        for (const auto& object : surfaceObjects) {
+            allSurfaces.insert(object.uuid);
+            selectedByName[object.name] = object.uuid;
+        }
+        for (const auto& object : collectionObjects) allCollections.insert(object.uuid);
+        auto near = [&](const objects::ObjectRecord& object, double scale, const std::string& kind, double otherScale,
+                        const std::set<std::string>& among, std::set<std::string>& into) {
+            const auto box = inputs.workingBounds(object, params, scale);
+            if (!box) { into.insert(among.begin(), among.end()); return; }
+            for (const auto& uuid : inputs.objectsNear(kind, *box, params.tolerance, params, otherScale))
+                if (among.contains(uuid)) into.insert(uuid);
+        };
+        for (const auto& object : collectionObjects) {
+            if (!fresh->contains(object.uuid)) continue;
+            collections.insert(object.uuid);
+            near(object, params.pointScale, "surface", params.surfaceScale, allSurfaces, surfaces);
+            for (const auto& uuid : betweenTargets(object.name, selectedByName)) surfaces.insert(uuid);
+        }
+        for (const auto& object : surfaceObjects) {
+            if (!fresh->contains(object.uuid)) continue;
+            surfaces.insert(object.uuid);
+            near(object, params.surfaceScale, "point_collection", params.pointScale, allCollections, collections);
+        }
+        collectionsToLoad = keepOnly(collectionObjects, [&](const std::string& uuid) { return collections.contains(uuid); });
+        surfacesToLoad = keepOnly(surfaceObjects, [&](const std::string& uuid) { return surfaces.contains(uuid); });
+    }
+    auto collections = loadCollections(inputs, collectionsToLoad, params, pointScales, loading, cancel);
+    auto surfaces = loadSurfaces(inputs, surfacesToLoad, params, surfaceScales, loading, cancel);
+    std::map<std::string, size_t> byName, byUuid;
     std::unordered_map<SurfaceGrid*, size_t> byGrid;
     std::vector<SurfaceIndex::SurfacePtr> grids;
     StaleEdgeScope scope{{params.edgeKind}, {}};
     for (size_t i = 0; i < surfaces.size(); ++i) {
         byName[surfaces[i].object.name] = i;
+        byUuid[surfaces[i].object.uuid] = i;
         byGrid[surfaces[i].grid.get()] = i;
         grids.push_back(surfaces[i].grid);
-        scope.objectUuids.push_back(surfaces[i].object.uuid);
+        if (!fresh) scope.objectUuids.push_back(surfaces[i].object.uuid);
     }
+    if (fresh) {
+        // Edges of a new object, both endpoints selected and not failed.
+        const auto failed = detail::failedObjects(loading);
+        for (const auto* objects : {&collectionObjects, &surfaceObjects})
+            for (const auto& object : *objects)
+                if (!failed.contains(object.uuid)) scope.objectUuids.push_back(object.uuid);
+        for (const auto& uuid : *fresh)
+            if (!failed.contains(uuid)) scope.touching.push_back(uuid);
+        if (scope.touching.empty()) scope.objectUuids.clear();
+    }
+    // Surfaces an incremental run may link an existing collection to: the new ones.
+    std::vector<char> newSurface(surfaces.size(), 0);
+    if (fresh)
+        for (size_t i = 0; i < surfaces.size(); ++i) newSurface[i] = fresh->contains(surfaces[i].object.uuid);
     SurfaceIndex index;
 
     objects::util::reportProgress(params.progress, "indexing PCL target surfaces");
@@ -212,9 +273,24 @@ DetectorReport linkPointCollectionsToSurfaces(objects::ObjectStore& db,
         checkCancelled(cancel);
         const auto& collection = collections[ci];
         const bool absolute = collection.absoluteWinding;
-        scope.objectUuids.push_back(collection.object.uuid);
+        if (!fresh) scope.objectUuids.push_back(collection.object.uuid);
         objects::util::reportProgress(params.progress, "linking point collections", ci, collections.size(), collection.object.name);
-        const auto targets = betweenTargets(collection.object.name, byName);
+        std::set<size_t> targets;
+        if (!fresh) {
+            targets = betweenTargets(collection.object.name, byName);
+        } else {
+            // As in a full run, a named surface that failed to load drops the pair policy.
+            const auto named = betweenTargets(collection.object.name, selectedByName);
+            for (const auto& uuid : named)
+                if (const auto found = byUuid.find(uuid); found != byUuid.end()) targets.insert(found->second);
+            if (targets.size() != named.size()) targets.clear();
+        }
+        // An existing collection is linked to the new surfaces alone.
+        const bool existing = fresh && !fresh->contains(collection.object.uuid);
+        if (existing && !targets.empty()) {
+            std::erase_if(targets, [&](size_t surface) { return !newSurface[surface]; });
+            if (targets.empty()) continue;  // neither named surface is new
+        }
         const auto count = collection.points.size();
         std::vector<std::map<size_t, SurfaceIndex::LookupResult>> hits(count);
         std::map<size_t, std::vector<size_t>> hitPoints;
@@ -223,6 +299,7 @@ DetectorReport linkPointCollectionsToSurfaces(objects::ObjectStore& db,
             for (const auto& hit : index.locateAll({collection.points[i].working, float(params.tolerance), {}})) {
                 const auto surface = byGrid.at(hit.surface.get());
                 if (!targets.empty() && !targets.contains(surface)) continue;
+                if (existing && !newSurface[surface]) continue;
                 hits[i].emplace(surface, hit);
                 hitPoints[surface].push_back(i);
             }
@@ -275,7 +352,7 @@ DetectorReport linkPointCollectionsToSurfaces(objects::ObjectStore& db,
     }
     checkCancelled(cancel);
     auto txn = db.write();
-    auto report = detail::commitStoredCandidates(db, inputs, txn, kPointCollectionSurfaceDetector, 1, candidates,
+    auto report = detail::commitStoredCandidates(db, inputs, txn, kPointCollectionSurfaceDetector, kPointCollectionSurfaceVersion, candidates,
         params.replaceStalePending, &scope, params.progress);
     checkCancelled(cancel);
     objects::util::reportProgress(params.progress, "committing point-collection links");

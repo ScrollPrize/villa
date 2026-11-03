@@ -790,6 +790,10 @@ class ServiceState:
         self.object_store = object_store
         self._startup_inputs = None
         self._startup_inputs_lock = threading.Lock()
+        # The store key a background read of startup_inputs is reading, and
+        # the lock that lets one read run at a time.
+        self._startup_inputs_reading = None
+        self._startup_inputs_read_lock = threading.Lock()
         self.service_name = service_name or socket.gethostname()
         self.session_name = str(session_name or "")
         self.events = events if events is not None else ServiceEventBuffer()
@@ -1051,7 +1055,7 @@ class ServiceState:
             response["input_manifest_artifact"] = (
                 self._input_manifest[1] if self._input_manifest else None)
             response["input_position"] = copy.deepcopy(self._input_position)
-            response["input_preparation"] = copy.deepcopy(self._input_preparation)
+            response["input_preparation"] = self._input_preparation_status()
             response["input_preparation_error"] = copy.deepcopy(
                 self._input_preparation_error)
             response["input_update"] = copy.deepcopy(self._input_update)
@@ -1154,10 +1158,10 @@ class ServiceState:
                     "capabilities": capabilities}
         if self.object_store is not None:
             response["object_store"] = self.object_store.advertisement()
-            response["inputs"] = self.startup_inputs()
+            response["inputs"] = self.startup_inputs(wait=False)
         return response
 
-    def startup_inputs(self):
+    def startup_inputs(self, *, wait=True):
         """What the launch configuration selects from the bound store.
 
         Patches, PCLs and fibers with their revision pins, labels, frames
@@ -1165,23 +1169,63 @@ class ServiceState:
         exclusions and the fit volume (object_store_inputs.snapshot_summary).
         Read-only: no link refresh, no materialization and no Torch. The
         result is reused until the store's files change.
+
+        Reading a large store takes minutes. Without ``wait`` (GET
+        /bindings) the caller never reads it: a summary not yet read for the
+        store as it stands is read in the background, and meanwhile
+        ``{"pending": True}`` is returned; ask again for the result.
         """
-        path = Path(self.object_store.path)
-        # An empty WAL (a read-only open after the last writer closed
-        # creates one) holds no writes: it keys as an absent one.
-        key = tuple((info.st_size, info.st_mtime_ns) if info and info.st_size else None
-                    for info in (_stat_or_none(path),
-                                 _stat_or_none(Path(f"{path}-wal"))))
+        key = self._startup_inputs_key()
         with self._startup_inputs_lock:
             cached = self._startup_inputs
             if cached is not None and cached[0] == key:
                 return cached[1]
+            if not wait:
+                if self._startup_inputs_reading != key:
+                    self._startup_inputs_reading = key
+                    threading.Thread(target=self._read_startup_inputs_logged,
+                                     args=(key,), name="spiral-startup-inputs",
+                                     daemon=True).start()
+                return {"pending": True}
+        return self._read_startup_inputs(key)
+
+    def _startup_inputs_key(self):
+        path = Path(self.object_store.path)
+        # An empty WAL (a read-only open after the last writer closed
+        # creates one) holds no writes: it keys as an absent one.
+        return tuple((info.st_size, info.st_mtime_ns) if info and info.st_size else None
+                     for info in (_stat_or_none(path),
+                                  _stat_or_none(Path(f"{path}-wal"))))
+
+    def _read_startup_inputs(self, key):
+        """Read the summary for the store as ``key`` stated it, once: a
+        concurrent reader of the same key waits for it instead."""
+        with self._startup_inputs_read_lock:
+            with self._startup_inputs_lock:
+                cached = self._startup_inputs
+                if cached is not None and cached[0] == key:
+                    return cached[1]
             from object_store_inputs import describe_selection
             config = Config(self.startup_run.get("config") or {}).as_dict()
             config.update(self.object_store.config())
             summary = describe_selection(config)
-            self._startup_inputs = (key, summary)
+            with self._startup_inputs_lock:
+                self._startup_inputs = (key, summary)
             return summary
+
+    def _read_startup_inputs_logged(self, key):
+        try:
+            self._read_startup_inputs(key)
+        except Exception as exc:
+            # Not cached: the next GET /bindings tries again.
+            self.events.append(
+                "log", f"Could not read the store's selection: "
+                f"{type(exc).__name__}: {exc}", severity="warning",
+                source="service")
+        finally:
+            with self._startup_inputs_lock:
+                if self._startup_inputs_reading == key:
+                    self._startup_inputs_reading = None
 
     def session_checkpoints(self):
         """Checkpoints under the session output directory, newest first.
@@ -1373,9 +1417,42 @@ class ServiceState:
         # The project's scroll, resolved for the fit volume when the build
         # knows it (_resolve_session_scroll).
         scroll = SessionScroll(project)
+        errors.extend(self._early_volume_problems(
+            scroll, paths, validation_run.config))
         if errors:
             raise ApiError(HTTPStatus.BAD_REQUEST, "Session validation failed", errors)
         return paths, run, preview, scroll
+
+    def _early_volume_problems(self, scroll, paths, config):
+        """What the project lacks for a fit volume known before the inputs
+        are read: the configured fit_volume_uuid, else the volume a resumed
+        checkpoint recorded. When the store's selection will name the volume
+        instead, a project with no volumes, or with no umbilicus for any of
+        them, cannot serve it either. Reading the store can take minutes on
+        a large one, so these are refused on the request, not after it
+        (_resolve_session_scroll repeats the check once the volume is
+        known)."""
+        project = scroll.project
+        volume = config.get("fit_volume_uuid")
+        if not volume and paths.checkpoint:
+            *_, manifest = self._checkpoint_durable_cfg(paths.checkpoint)
+            volume = ((manifest or {}).get("object_store") or {}).get("volume_uuid")
+        try:
+            if volume:
+                scroll.umbilicus(str(volume))
+            elif not project.volumes:
+                raise ScrollSpecError(
+                    f"the project {project.name!r} has no volumes: attach the "
+                    "volume the fit reads")
+            elif not any(entry.umbilicus is not None
+                         for entry in project.volumes.values()):
+                raise ScrollSpecError(
+                    f"the project {project.name!r} has no umbilicus for any of "
+                    f"its volumes ({', '.join(sorted(project.volumes))}): import "
+                    "one for the fit volume (File > Import Umbilicus)")
+        except ScrollSpecError as exc:
+            return [{"field": "project", "message": str(exc)}]
+        return []
 
     @staticmethod
     def _request_project(request):
@@ -1422,11 +1499,13 @@ class ServiceState:
         # Loaded whenever enabled, as the CLI loads its manifest's, so a later
         # run with the loss on finds them resident; required with the loss.
         fiber_directions = ""
+        level = config.get("fit_volume_level", 0)
         if fiber_directions_required(config):
-            fiber_directions = scroll.fiber_directions(volume, paths.cache_directory)
+            fiber_directions = scroll.fiber_directions(volume, paths.cache_directory, level)
         elif input_source_enabled(config, "fiber_directions"):
             try:
-                fiber_directions = scroll.fiber_directions(volume, paths.cache_directory)
+                fiber_directions = scroll.fiber_directions(
+                    volume, paths.cache_directory, level)
             except ScrollSpecError:
                 pass
         return dataclasses.replace(paths, volume_uuid=volume, umbilicus=umbilicus,
@@ -1693,7 +1772,8 @@ class ServiceState:
                 "error", f"The inputs could not be updated; the fit is unchanged: {cause}",
                 severity="error", source="service", operation="updating_inputs")
         try:
-            prepared = self._prepare_position(config, paths, scroll, minimum)
+            prepared = self._prepare_position(config, paths, scroll, minimum,
+                                              incremental=True)
         except BaseException as exc:
             refused(exc, "linking")
             return
@@ -1965,10 +2045,15 @@ class ServiceState:
         object_store_inputs.prepare_position, which must leave that volume
         the fit volume. Returns ``(prepared, volume, paths, ScrollSpec)``."""
         from vc_object_store import ObjectStore
-        from object_store_inputs import read_snapshot, request_from_config
+        from object_store_inputs import read_snapshot, reading_stage, request_from_config
         config = self._effective_config(paths, run)
-        with ObjectStore.open(self.object_store.path, read_only=True) as store:
-            volume = read_snapshot(store, request_from_config(config)).volume_uuid
+        progress = self._input_progress()
+        try:
+            with ObjectStore.open(self.object_store.path, read_only=True) as store, \
+                    reading_stage(progress, "Reading the selected inputs", "fit volume"):
+                volume = read_snapshot(store, request_from_config(config)).volume_uuid
+        finally:
+            progress.close()
         self._prepare_fiber_directions(scroll, volume, paths, config)
         paths, spec = self._resolve_session_scroll(scroll, volume, paths, config)
         prepared, pinned = self._prepare_position(config, paths, spec, minimum, volume=True)
@@ -1978,10 +2063,38 @@ class ServiceState:
                 "they were linked; retry")
         return prepared, volume, paths, spec
 
-    def _prepare_position(self, config, paths, scroll, minimum, *, volume=False):
+    def _input_progress(self):
+        """A ProgressReporter publishing to the input preparation's status
+        (``input_preparation.progress``) while one is active."""
+        from spiral_progress import ProgressReporter
+
+        def publish(snapshot):
+            with self.lock:
+                if self._input_preparation is not None:
+                    self._input_preparation["progress"] = snapshot
+                    # A stage without steps (a store read) publishes once:
+                    # its elapsed time is recomputed for every status.
+                    self._input_preparation_progress_started = (
+                        None if snapshot is None
+                        else time.monotonic() - snapshot["elapsed_seconds"])
+                    self.status_generation += 1
+        return ProgressReporter(publish, stream=sys.stderr)
+
+    def _input_preparation_status(self):
+        """``input_preparation`` for /session/status (call with the lock
+        held), its progress's elapsed time current."""
+        preparation = copy.deepcopy(self._input_preparation)
+        started = getattr(self, "_input_preparation_progress_started", None)
+        if preparation and preparation.get("progress") and started is not None:
+            preparation["progress"]["elapsed_seconds"] = time.monotonic() - started
+        return preparation
+
+    def _prepare_position(self, config, paths, scroll, minimum, *, volume=False,
+                          incremental=False):
         """Link and pin a position for ``config`` on the bound store; with
         ``volume``, also the fit volume pinned there (``(prepared,
-        volume)``)."""
+        volume)``). ``incremental`` (an input update) links only objects
+        selected since the store's last refresh, when nothing else changed."""
         from vc_object_store import ObjectStore
         from fit_session import lasagna_normal_inputs
         from object_store_inputs import (fit_volume_at, prepare_position,
@@ -1997,17 +2110,21 @@ class ServiceState:
             self.events.append("log", line, source="service",
                                operation="preparing_inputs")
         request = request_from_config(config)
+        progress = self._input_progress()
         with self._store_write_lock:
             try:
                 with ObjectStore.open(self.object_store.path,
                                       author=self.object_store.author) as store:
                     prepared = prepare_position(
                         store, config, request, lasagna=lasagna,
-                        minimum=minimum, cache_directory=cache, log=log)
+                        minimum=minimum, cache_directory=cache, log=log,
+                        incremental=incremental, progress=progress)
                     if not volume:
                         return prepared
-                    return prepared, fit_volume_at(store, request, prepared)
+                    return prepared, fit_volume_at(store, request, prepared,
+                                                   progress)
             finally:
+                progress.close()
                 # A publication carries pending commits along.
                 self._note_pending_commits()
 
@@ -2019,7 +2136,8 @@ class ServiceState:
         if not self.build_missing_lasagna_packs or not fiber_directions_required(config):
             return
         try:
-            path = scroll.fiber_directions_cache_path(volume, paths.cache_directory)
+            level = config.get("fit_volume_level", 0)
+            path = scroll.fiber_directions_cache_path(volume, paths.cache_directory, level)
         except ScrollSpecError:
             return
         if os.path.isfile(path):
@@ -2032,21 +2150,29 @@ class ServiceState:
         dataset = scroll.project.fiber_inference
         log(f"extracting from {dataset.location} into {path}")
         extract(dataset.location, None, path, identity=dataset.identity,
-                output_scale=scroll.volume(volume).fiber_scale,
+                output_scale=scroll.fiber_scale(volume, level),
                 workers=FIBER_DIRECTION_WORKERS, log=log)
+
+    def required_lasagna_packs(self, request):
+        """``{"packs": [...]}``: the Lasagna pack kinds a build of this
+        session request (as /session/initialize or /session/rebuild takes
+        it) reads, so a client caches only the remote arrays they are built
+        from."""
+        request = dict(request or {})
+        request.pop("command_id", None)
+        paths, run, _, _ = self._prepare_session_request(request, restore_checkpoint_z=True)
+        if not paths.lasagna:
+            return {"packs": []}
+        return {"packs": sorted(_lasagna_pack_kinds(
+            self._effective_config(paths, run), load_lasagna_source(paths.lasagna)))}
 
     def _prepare_lasagna_packs(self, paths, config):
         """Opted-in hosts build missing pools from local arrays before linking."""
         if not self.build_missing_lasagna_packs or not paths.lasagna:
             return
-        from fit_session import lasagna_packs_required, input_source_enabled
         from lasagna_source import is_remote_location
         source = load_lasagna_source(paths.lasagna)
-        kinds = set(lasagna_packs_required(config))
-        # Link refresh uses normals even when their dense loss is disabled.
-        if (input_source_enabled(config, "normals")
-                and source.stores.get("normal_x") and source.stores.get("normal_y")):
-            kinds.add("normals")
+        kinds = _lasagna_pack_kinds(config, source)
         if not kinds:
             return
         for kind in sorted(kinds):
@@ -2060,15 +2186,8 @@ class ServiceState:
                         "an accessible local array. Prepare the pack where the "
                         "arrays are and copy it into the service cache.")
         from lasagna_data import ensure_fit_sparse_stores, _require_sidecar
-        from spiral_progress import ProgressReporter
 
-        def publish(snapshot):
-            with self.lock:
-                if self._input_preparation is not None:
-                    self._input_preparation["progress"] = snapshot
-                    self.status_generation += 1
-
-        progress = ProgressReporter(publish, stream=sys.stderr)
+        progress = self._input_progress()
         try:
             ensure_fit_sparse_stores(
                 source=source, cache_directory=paths.cache_directory,
@@ -3780,6 +3899,18 @@ def _route_upload_file(ctx):
         ctx.args[0], ctx.args[1], handler.rfile, length, offset=offset)
 
 
+def _lasagna_pack_kinds(config, source):
+    """The Lasagna pack kinds a build of ``config`` reads from ``source``:
+    the fit's (lasagna_packs_required), and normals for the link refresh
+    even when their dense loss is disabled."""
+    from fit_session import lasagna_packs_required, input_source_enabled
+    kinds = set(lasagna_packs_required(config))
+    if (input_source_enabled(config, "normals")
+            and source.stores.get("normal_x") and source.stores.get("normal_y")):
+        kinds.add("normals")
+    return kinds
+
+
 _UPLOAD_ID = r"[0-9a-f]{32}"
 
 _LEASE_OPERATIONS = frozenset({"lease_claim", "lease_release"})
@@ -3829,6 +3960,10 @@ ROUTES = (
           Idempotency.UPLOAD_ID, reads_body=True),
     Route("POST", "/session/inputs", "upload_begin",
           lambda ctx: ctx.state.begin_upload(ctx.body), Idempotency.NONE,
+          reads_body=True),
+    # A query, not a mutation: POST only to carry a session request.
+    Route("POST", "/session/lasagna-packs", "lasagna_packs",
+          lambda ctx: ctx.state.required_lasagna_packs(ctx.body), Idempotency.NONE,
           reads_body=True),
     Route("POST", "/session/initialize", "session_initialize",
           lambda ctx: ctx.state.initialize(ctx.body), Idempotency.COMMAND_ID,

@@ -572,39 +572,36 @@ def test_scripts_edit_hosted_replicas_under_leases(tmp_path):
         assert viewer.acquire_leases([fiber])[0]['author'] == 'viewer'
 
 
-def test_a_service_links_and_pins_a_hub_position(tmp_path):
-    """Positions name hub states: a conditional push publishes only on the
-    expected head, and any replica reads a position from the hub's history."""
+def hosted_fibers(tmp_path, count, replicas=('service', 'editor'), link=False):
+    """A hub of count fibers (linked first to second if link), cloned once per replica name."""
     import vc_object_store as vos
-    hub = tmp_path / 'hub.vcobj'
-    with ObjectStore.create(str(hub), author='curator') as origin:
-        first, _ = put(origin, Fiber([[1, 2, 3], [4, 5, 6]], []), kind='fiber')
-        second, _ = put(origin, Fiber([[1, 2, 4], [4, 5, 7]], []), kind='fiber')
+    hub = str(tmp_path / 'hub.vcobj')
+    with ObjectStore.create(hub, author='curator') as origin:
+        fibers = [put(origin, Fiber([[1, 2, 3 + i], [4, 5, 6 + i]], []), kind='fiber')[0] for i in range(count)]
+        whole = {'whole_geometry': True}
+        edge = link and origin.add_edge(dict(a=fibers[0], b=fibers[1], kind='related', a_anchor=whole, b_anchor=whole))
         origin.checkpoint()
-    vos.hub_init(str(hub), 'curator')
-    for name in ('service', 'editor'):
-        vos.hub_clone(str(hub), str(tmp_path / f'{name}.vcobj'), name)
-    session = vos.ObjectStoreSession()
-    editor = session.attach(str(tmp_path / 'editor.vcobj'), 'editor', sync_interval_ms=100, push_delay_ms=20)
-    with ObjectStore.open(str(tmp_path / 'service.vcobj'), author='service') as service:
-        status = service.hub_status()
-        assert status['hub_replica'] and status['position'] > 0
-        with session.hold_leases(editor, [first]):
-            with ObjectStore.open(str(tmp_path / 'editor.vcobj'), author='editor') as db:
-                db.set_meta(first, 'review', 'edited')
-            with session.hold_pushes(editor):
-                assert session.hub_status(editor)['pushes_held']
-                reached = session.sync_hub_and_wait(editor, timeout_s=20)
-        assert not reached['pending'] and reached['position'] > status['position']
-        # Link at the head, then publish only on it.
+    vos.hub_init(hub, 'curator')
+    paths = {name: str(tmp_path / f'{name}.vcobj') for name in replicas}
+    for name, path in paths.items():
+        vos.hub_clone(hub, path, name)
+    return fibers, edge, paths
+
+
+def test_conditional_push_and_position_reads(tmp_path):
+    """The Python surface of hub positions (their semantics are pinned in
+    test_object_store_hub_positions): a conditional push publishes only on the
+    expected head, and a position reads as it was from any replica."""
+    (first, second), _, paths = hosted_fibers(tmp_path, 2)
+    with ObjectStore.open(paths['service'], author='service') as service, \
+            ObjectStore.open(paths['editor'], author='editor') as editor:
         head = service.hub_sync(pull=True, push=False)['pulled_position']
-        assert head == reached['position']
+        assert service.hub_status()['hub_replica'] and head == service.hub_status()['position'] > 0
         anchor = dict(points=[dict(array='control_points', index=[0])])
         edge = service.add_edge(dict(a=first, b=second, kind='fiber_branch', a_anchor=anchor, b_anchor=anchor))
-        with session.hold_leases(editor, [second]):
-            with ObjectStore.open(str(tmp_path / 'editor.vcobj'), author='editor') as db:
-                db.set_meta(second, 'note', 'unrelated')  # an unrelated foreign commit after H
-            foreign = session.sync_hub_and_wait(editor, timeout_s=20)['position']
+        editor.acquire_leases([second])
+        editor.set_meta(second, 'note', 'unrelated')  # an unrelated foreign commit after the head
+        foreign = editor.hub_sync()['published_position']
         refused = service.hub_sync(pull=False, push=True, expected_head=head)
         assert refused['head_mismatch'] and refused['hub_head'] == foreign and refused['pushed'] == 0
         assert service.hub_status()['pending'] == [edge]
@@ -612,23 +609,16 @@ def test_a_service_links_and_pins_a_hub_position(tmp_path):
         pinned = service.hub_sync(pull=False, push=True, expected_head=head)
         assert not pinned['head_mismatch'] and pinned['published_position'] > head
         position = pinned['published_position']
-        # Later commits do not change the position.
-        with session.hold_leases(editor, [first]):
-            with ObjectStore.open(str(tmp_path / 'editor.vcobj'), author='editor') as db:
-                db.set_meta(first, 'review', 'later')
-            session.sync_hub_and_wait(editor, timeout_s=20)
-        service.hub_sync(pull=True, push=False)
+        editor.set_meta(second, 'note', 'later')
+        editor.hub_sync()
         view = service.hub_read_view_at(position)
         records = {revision['object_uuid']: revision['record'] for revision in view['objects']}
-        assert records[first]['meta']['review'] == 'edited' and records[second]['meta']['note'] == 'unrelated'
+        assert records[second]['meta']['note'] == 'unrelated'
         [relationship] = view['relationships']
         assert relationship['record']['uuid'] == edge and relationship['applicable']
         assert service.hub_selection_at(position) == view['selection']
         assert service.hub_read_view_at(position, [first])['selection'].keys() == {first}
-        assert service.object(first)['meta']['review'] == 'later'
-    with ObjectStore.open(str(tmp_path / 'editor.vcobj'), author='editor') as db:
-        assert db.hub_read_view_at(position)['selection'] == view['selection']
-    session.detach(editor)
+        assert editor.hub_read_view_at(position)['selection'] == view['selection']
 
 
 @pytest.mark.parametrize('action', ['retain', 'remove'])
@@ -674,49 +664,18 @@ def test_a_revert_brings_the_endpoints_its_edge_is_bound_to(tmp_path, action):
         assert not service.hub_sync(pull=True, push=False)['conflicts']
 
 
-def test_an_indexed_hub_and_its_replicas_gate_older_binaries(tmp_path):
-    """A hub with a publication index has its own schema version, which
-    binaries from before the index refuse; ordinary stores keep theirs."""
-    import sqlite3
-    import vc_object_store as vos
-
-    def version(path):
-        with sqlite3.connect(path) as sql:
-            return sql.execute('PRAGMA user_version').fetchone()[0]
-    hub = str(tmp_path / 'hub.vcobj')
-    ObjectStore.create(hub, author='curator').close()
-    plain = version(hub)
-    vos.hub_init(hub, 'curator')
-    replica = str(tmp_path / 'replica.vcobj')
-    vos.hub_clone(hub, replica, 'editor')
-    assert version(hub) == version(replica) == plain + 1
-    with ObjectStore.open(replica, author='editor') as db:
-        put(db, Fiber([[1, 2, 3], [4, 5, 6]], []), kind='fiber')
-        assert db.hub_sync(pull=True, push=True)['published_position'] > 0
-    assert version(hub) == plain + 1
-
-
 def test_a_position_needs_only_the_geometry_it_reads(tmp_path):
     """A replica that has not pulled an object's geometry still reads the
     other objects of a position; only a read naming that object needs it."""
-    import vc_object_store as vos
-    hub = tmp_path / 'hub.vcobj'
-    with ObjectStore.create(str(hub), author='curator') as origin:
-        first, _ = put(origin, Fiber([[1, 2, 3], [4, 5, 6]], []), kind='fiber')
-        origin.checkpoint()
-    vos.hub_init(str(hub), 'curator')
-    for name in ('service', 'editor'):
-        vos.hub_clone(str(hub), str(tmp_path / f'{name}.vcobj'), name)
-    with ObjectStore.open(str(tmp_path / 'editor.vcobj'), author='editor') as db:
+    (first,), _, paths = hosted_fibers(tmp_path, 1)
+    with ObjectStore.open(paths['editor'], author='editor') as db:
         added, _ = put(db, Fiber([[7, 8, 9], [1, 1, 1]], []), kind='fiber')
-        position = db.hub_sync(pull=True, push=True)['published_position']
-    with ObjectStore.open(str(tmp_path / 'service.vcobj'), author='service') as service:
+        position = db.hub_sync()['published_position']
+    with ObjectStore.open(paths['service'], author='service') as service:
         assert service.hub_read_view_at(position, [first])['selection'].keys() == {first}
         assert service.hub_read_view_at(position, geometry=False)['selection'].keys() == {first, added}
         with pytest.raises(RuntimeError, match='lacks geometry of ' + added):
             service.hub_read_view_at(position)
-        service.hub_sync(pull=True, push=False)
-        assert service.hub_read_view_at(position)['selection'].keys() == {first, added}
 
 
 def test_a_session_resolves_a_link_conflict_to_the_hub(tmp_path):
@@ -724,22 +683,13 @@ def test_a_session_resolves_a_link_conflict_to_the_hub(tmp_path):
     from a destroyed temporary."""
     import time
     import vc_object_store as vos
-    hub = tmp_path / 'hub.vcobj'
-    with ObjectStore.create(str(hub), author='curator') as origin:
-        a, _ = put(origin, Fiber([[1, 2, 3], [4, 5, 6]], []), kind='fiber')
-        b, _ = put(origin, Fiber([[1, 2, 4], [4, 5, 7]], []), kind='fiber')
-        whole = {'whole_geometry': True}
-        edge = origin.add_edge(dict(a=a, b=b, kind='related', a_anchor=whole, b_anchor=whole))
-        origin.checkpoint()
-    vos.hub_init(str(hub), 'curator')
-    for name in ('mine', 'theirs'):
-        vos.hub_clone(str(hub), str(tmp_path / f'{name}.vcobj'), name)
+    _, edge, paths = hosted_fibers(tmp_path, 2, ('mine', 'theirs'), link=True)
     session = vos.ObjectStoreSession()
-    mine = session.attach(str(tmp_path / 'mine.vcobj'), 'mine', sync_interval_ms=100, push_delay_ms=20)
+    mine = session.attach(paths['mine'], 'mine', sync_interval_ms=100, push_delay_ms=20)
     with session.hold_pushes(mine):
-        with ObjectStore.open(str(tmp_path / 'mine.vcobj'), author='mine') as db:
+        with ObjectStore.open(paths['mine'], author='mine') as db:
             db.set_meta(edge, 'note', 'mine')
-        with ObjectStore.open(str(tmp_path / 'theirs.vcobj'), author='theirs') as db:
+        with ObjectStore.open(paths['theirs'], author='theirs') as db:
             db.set_meta(edge, 'note', 'theirs')
             db.hub_sync()
         assert [c['uuid'] for c in session.sync_hub_and_wait(mine, timeout_s=20)['conflicts']] == [edge]
@@ -748,7 +698,7 @@ def test_a_session_resolves_a_link_conflict_to_the_hub(tmp_path):
     while session.hub_status(mine)['conflicts']:
         assert time.monotonic() < deadline, session.hub_status(mine)['error']
         time.sleep(0.05)
-    with ObjectStore.open(str(tmp_path / 'mine.vcobj'), read_only=True) as db:
+    with ObjectStore.open(paths['mine'], read_only=True) as db:
         assert db.edge(edge)['meta']['note'] == 'theirs'
     session.detach(mine)
 

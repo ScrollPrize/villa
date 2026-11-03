@@ -7,6 +7,7 @@ import torch
 from tqdm import tqdm
 
 from devices import float_hi, scatter_reduce_
+from fit_session import fit_level_scale
 from sample_spiral import get_spiral_yxs, get_theta_and_radii
 from surface_orientation import GridLayout, export_metadata
 from tifxyz import save_tifxyz, save_combined_tifxyz
@@ -1289,6 +1290,7 @@ def save_mesh(
                     voxel_size_um=voxel_size_um,
                     source=f'fit_spiral {name}{uuid_suffix}',
                     layout_metadata=layout_metadata,
+                    coordinate_scale=fit_level_scale(cfg),
                 )
             offset += num_thetas
             output_done += 1
@@ -1457,6 +1459,7 @@ def save_combined_preview(
         first_winding=first_winding,
         cleanup_erosion_cells=3,
         base_shape_zyx=base_shape_zyx,
+        coordinate_scale=fit_level_scale(cfg),
     )
     return manifest
 

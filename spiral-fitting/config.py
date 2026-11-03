@@ -118,6 +118,7 @@ _INPUT_TOGGLE_KEYS = frozenset({
     "input_use_pcl_relative",
     "input_use_pcl_same_winding",
     "input_use_pcl_drawn_control_points",
+    "input_use_patch_overlaps",
     "input_use_normals",
     "input_use_gradient_magnitude",
     "input_use_winding_inference",
@@ -183,6 +184,7 @@ CHECKPOINT_MODEL_SHAPE_KEYS = (
     "model_gap_expander_lr_scale",
     "model_gap_expander_min_gap", "model_gap_expander_softplus_bias",
     "model_initial_dr_per_winding", "model_linear_z_resolution",
+    "fit_volume_level",
 )
 
 
@@ -281,6 +283,7 @@ OBJECT_STORE_INPUT_KEYS = frozenset({
     "object_store_author",
     "object_store_input_position",
     "object_store_refresh_links",
+    "object_store_full_link_refresh",
     "object_store_approved_links_only",
     "object_store_allow_changed_inputs",
     "object_store_patch_uuids",
@@ -296,6 +299,7 @@ OBJECT_STORE_INPUT_KEYS = frozenset({
     "object_store_normal_ct_downsampling",
     "object_store_normal_ct_volume_uuid",
     "fit_volume_uuid",
+    "fit_volume_level",
 })
 
 NEW_FIT_KEYS = frozenset(
@@ -402,6 +406,7 @@ def _field_spec(key, default):
                     "pcl_patch_overlap_max_pairs",
                 } else 0),
             maximum=(1_000_000 if key == "output_num_slices_for_visualization"
+                     else 16 if key == "fit_volume_level"
                      else 1_000_000_000),
             step=1 if kind == "integer" else .01,
         )
@@ -523,6 +528,9 @@ class Config:
         self.input_use_pcl_relative = True
         self.input_use_pcl_same_winding = True
         self.input_use_pcl_drawn_control_points = True
+        # Patch-overlap links: refreshed by the store's overlap detector and
+        # materialized as same-surface point pairs. Off skips both.
+        self.input_use_patch_overlaps = True
         self.input_use_normals = True
         self.input_use_gradient_magnitude = True
         self.input_use_winding_inference = True
@@ -665,6 +673,10 @@ class Config:
         # position it prepared; a client never does.
         self.object_store_input_position = None
         self.object_store_refresh_links = True
+        # A refresh skips the detectors when the store's link marker shows the
+        # links current, and an input update links only new objects; true
+        # always runs every detector over the whole selection.
+        self.object_store_full_link_refresh = False
         self.object_store_approved_links_only = False
         self.object_store_allow_changed_inputs = False
         # Object selection per kind: None selects every active object with
@@ -690,6 +702,10 @@ class Config:
         # The reference volume every fit coordinate is a voxel of; None infers
         # it from the selected objects' declared frames.
         self.fit_volume_uuid = None
+        # The pyramid level of that volume the fit works in: a fit voxel is
+        # 2^level of its voxels. Inputs and scroll facts are converted to it,
+        # and exported surfaces back to the volume's own voxels.
+        self.fit_volume_level = 0
         # The direction ("CW" or "ACW") the spiral winds outwards, where the
         # fit volume's orientation (the catalog's z direction and handedness)
         # does not decide it; one that disagrees with it is refused. Read off

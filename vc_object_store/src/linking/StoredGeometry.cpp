@@ -110,6 +110,63 @@ void StoredGeometry::validate(const objects::WriteTxn& txn) const
             throw std::runtime_error("geometry changed during discovery; retry: " + uuid);
     }
 }
+std::optional<Box> StoredGeometry::workingBounds(const objects::ObjectRecord& object, const CoordinateParams& params,
+    double explicitScale)
+{
+    objects::ObjectSelection selection;
+    selection.kind = object.kind;
+    selection.uuids = {object.uuid};
+    selection.bbox = Box{-1e30, -1e30, -1e30, 1e30, 1e30, 1e30};
+    if (params.volumeUuid) selection.volume = *params.volumeUuid;
+    std::optional<Box> result;
+    for (const auto& region : db_.spatialRegions(read_, selection)) {
+        if (!result) { result = region.bbox; continue; }
+        for (int axis = 0; axis < 3; ++axis) {
+            (*result)[axis] = std::min((*result)[axis], region.bbox[axis]);
+            (*result)[axis + 3] = std::max((*result)[axis + 3], region.bbox[axis + 3]);
+        }
+    }
+    if (result && !params.volumeUuid)
+        for (auto& value : *result) value *= explicitScale;
+    return result;
+}
+std::set<std::string> StoredGeometry::objectsNear(const std::string& kind, const Box& box, double margin,
+    const CoordinateParams& params, double explicitScale)
+{
+    objects::ObjectSelection selection;
+    selection.kind = kind;
+    Box query = box;
+    for (int axis = 0; axis < 3; ++axis) { query[axis] -= margin; query[axis + 3] += margin; }
+    if (params.volumeUuid) selection.volume = *params.volumeUuid;
+    else for (auto& value : query) value /= explicitScale;
+    selection.bbox = query;
+    std::set<std::string> result;
+    for (const auto& object : db_.selectObjects(read_, selection, std::vector<std::string>{})) result.insert(object.uuid);
+    return result;
+}
+std::optional<std::set<std::string>> newAmong(const std::optional<std::vector<std::string>>& newUuids,
+    const std::vector<const std::vector<objects::ObjectRecord>*>& selected, const char* detector)
+{
+    if (!newUuids) return std::nullopt;
+    std::set<std::string> all, result;
+    for (const auto* objects : selected)
+        for (const auto& object : *objects) all.insert(object.uuid);
+    for (const auto& uuid : *newUuids) {
+        const auto canonical = objects::util::canonicalUuid(uuid);
+        if (!all.contains(canonical))
+            throw std::invalid_argument(std::string(detector) + ": new object " + canonical + " is not selected");
+        result.insert(canonical);
+    }
+    return result;
+}
+std::set<std::string> failedObjects(const DetectorReport& report)
+{
+    std::set<std::string> result;
+    for (const auto& issue : report.issues)
+        if (issue.severity == DetectorIssue::Severity::Failure)
+            result.insert(issue.objectUuids.begin(), issue.objectUuids.end());
+    return result;
+}
 std::shared_ptr<SurfaceGrid> surfaceGrid(const objects::detail::GeometrySnapshot& geometry)
 {
     const auto descriptor = std::find_if(geometry.revision.arrays.begin(), geometry.revision.arrays.end(),

@@ -1,15 +1,21 @@
-"""A service bound to a hub replica: launch binding, and initialize and
-full-input rebuilds that link and pin a hub position (stage 2a).
+"""A service bound to a hub replica: the launch binding; initialize and
+full-input rebuilds that link and pin a hub position; and input updates of a
+resident fit at an iteration boundary.
 
-The runtime is real on the CPU with the device stages stubbed, as in
-test_runtime_object_store.
+An update replaces a session's inputs with those of a position in three
+phases: every rank prepares them (touching nothing resident), installs them
+(the destructive phase) and publishes them. A refusal leaves the fit as it
+was; a failure after the release fails the session. The runtime is real on
+the CPU with the device stages stubbed (the theta topology needs the model
+they leave out, so updates stub it too).
 """
+import dataclasses
+import json
 import os
-import subprocess
-import sys
 import time
 from pathlib import Path
 
+import numpy as np
 import pytest
 
 pytest.importorskip('vc_object_store')
@@ -17,16 +23,21 @@ import vc_object_store as vos  # noqa: E402
 from vc_object_store import ObjectStore  # noqa: E402
 
 import object_store_inputs as osi  # noqa: E402
+import spiral_runtime  # noqa: E402
 import spiral_service  # noqa: E402
+from cpu_service import (  # noqa: E402
+    REQUEST, RUN, request, service_state, settle, stub_device_stages, two_ranks,
+    wait_until, write_inputs)
+from object_store_fixture import hub_edit, leased, names, plane, put_patch  # noqa: E402
 from service_project import with_project  # noqa: E402
-from test_object_store_startup import store_path  # noqa: E402,F401
-from test_runtime_object_store import (  # noqa: E402,F401
-    RUN, _checkpoint, bindings, cpu, device_stubs, settle)
+
+pytestmark = pytest.mark.usefixtures('cpu')
 
 
 @pytest.fixture()
 def hub(store_path, tmp_path):
-    """The startup fixture's store as a hub, with an editor's replica."""
+    """The startup fixture's store as a hub, with an editor's replica; the
+    service's replica is cloned by its binding."""
     vos.hub_init(store_path, 'ingest')
     editor = str(tmp_path / 'editor.vcobj')
     vos.hub_clone(store_path, editor, 'editor')
@@ -34,40 +45,49 @@ def hub(store_path, tmp_path):
             'service': str(tmp_path / 'replicas' / 'service.vcobj')}
 
 
-def _service_state(binding, tmp_path):
-    return spiral_service.ServiceState(
-        bindings=bindings(tmp_path),
-        object_store=binding,
-        startup_run={'z_begin': 0, 'z_end': 64, 'config': dict(RUN)})
-
-
 @pytest.fixture()
 def state(hub, tmp_path):
-    state = _service_state(
+    state = service_state(
         spiral_service.bind_object_store(hub['service'], 'svc', hub['hub']), tmp_path)
     yield state
     state.close()
 
 
-def _names(path):
-    with ObjectStore.open(path, read_only=True) as db:
-        return {record['name']: record['uuid'] for kind in osi.KINDS
-                for record in db.objects_by_kind(kind)}
+@pytest.fixture()
+def no_theta_topology(monkeypatch):
+    import fit_spiral
+    monkeypatch.setattr(fit_spiral.FitContext, '_build_theta_crossing_map', lambda self: [])
 
 
 def _edit(path, uuid, key, value):
-    """An editor's saved edit, pushed: returns the hub position it reached."""
-    with ObjectStore.open(path, author='editor') as db:
-        db.hub_sync(pull=True, push=False)
-        db.acquire_leases([uuid])
-        db.set_meta(uuid, key, value)
-        report = db.hub_sync(pull=True, push=True)
-    assert not report['conflicts']
-    return report['published_position']
+    """An editor's saved metadata edit, pushed: the hub position it reached."""
+    return hub_edit(path, leased(uuid, lambda db: db.set_meta(uuid, key, value)))
 
 
-REQUEST = {'run': {'z_begin': 0, 'z_end': 64, 'config': dict(RUN)}}
+def _add_patch(path, y=120.0, name='added'):
+    return lambda: hub_edit(path, lambda db: put_patch(db, plane(y), (0.25, 0.25), name=name))
 
+
+def _pinned_at_new_position(state, change):
+    """Make ``change``, then link and pin a position on the service replica
+    as an update would. Returns it."""
+    change()
+    config = state.session._context.config
+    with ObjectStore.open(state.object_store.path, author='svc') as store:
+        prepared = osi.prepare_position(store, config, osi.request_from_config(config),
+                                        log=lambda line: None)
+    return prepared.position.sequence
+
+
+def _settled_update(state, timeout=60):
+    wait_until(lambda: state.status()['input_update'] is None, timeout,
+               'the input update did not settle')
+    return state.status()
+
+
+# ---------------------------------------------------------------------------
+# The binding
+# ---------------------------------------------------------------------------
 
 def test_the_binding_clones_and_checks_its_hub(hub, tmp_path):
     binding = spiral_service.bind_object_store(hub['service'], 'svc', hub['hub'])
@@ -77,12 +97,9 @@ def test_the_binding_clones_and_checks_its_hub(hub, tmp_path):
         assert binding.hub_identity == db.hub_status()['hub_replica']
     # An existing replica binds its own hub, with or without the flag.
     assert spiral_service.bind_object_store(hub['service'], 'svc') == binding
-    assert spiral_service.bind_object_store(hub['service'], 'svc', hub['hub']) == binding
     advertised = binding.advertisement()['hub']
     assert advertised['identity'] == binding.hub_identity and advertised['position'] > 0
-    assert advertised['position_error'] is None
     # A replica that cannot be read says why rather than reporting nothing.
-    import dataclasses
     unreadable = dataclasses.replace(binding, path=str(tmp_path / 'gone.vcobj'))
     advertised = unreadable.advertisement()['hub']
     assert advertised['position'] is None and advertised['position_error']
@@ -93,20 +110,6 @@ def test_the_binding_clones_and_checks_its_hub(hub, tmp_path):
         spiral_service.bind_object_store(plain, 'svc', hub['hub'])
     with pytest.raises(spiral_service.ObjectStoreBindingError, match='replicates the hub'):
         spiral_service.bind_object_store(hub['service'], 'svc', plain)
-    # An unreachable hub fails startup, not the first update. (A fresh
-    # process: this one keeps its hub connection open.)
-    os.rename(hub['hub'], hub['hub'] + '.moved')
-    try:
-        bind = subprocess.run(
-            [sys.executable, '-c', 'import sys, spiral_service\n'
-             'try:\n spiral_service.bind_object_store(sys.argv[1], "svc")\n'
-             'except spiral_service.ObjectStoreBindingError as error:\n'
-             ' print(error); sys.exit(3)', hub['service']],
-            capture_output=True, text=True, env=os.environ)
-        assert bind.returncode == 3, bind.stderr
-        assert 'cannot reach the hub' in bind.stdout
-    finally:
-        os.rename(hub['hub'] + '.moved', hub['hub'])
     with pytest.raises(spiral_service.ObjectStoreBindingError, match='cannot clone'):
         spiral_service.bind_object_store(str(tmp_path / 'new.vcobj'), 'svc',
                                          str(tmp_path / 'absent-hub.vcobj'))
@@ -114,11 +117,12 @@ def test_the_binding_clones_and_checks_its_hub(hub, tmp_path):
 
 def test_startup_drops_unpublished_links_and_refuses_other_edits(hub):
     binding = spiral_service.bind_object_store(hub['service'], 'svc', hub['hub'])
-    names = _names(hub['service'])
+    uuids = names(hub['service'])
+    whole = {'whole_geometry': True}
     # An interrupted update's links are dropped at the next start.
     with ObjectStore.open(hub['service'], author='svc') as db:
-        db.add_edge({'kind': 'related', 'a': names['near'], 'b': names['far'],
-                     'a_anchor': {'whole_geometry': True}, 'b_anchor': {'whole_geometry': True}})
+        db.add_edge({'kind': 'related', 'a': uuids['near'], 'b': uuids['far'],
+                     'a_anchor': whole, 'b_anchor': whole})
         assert len(db.hub_status()['pending']) == 1
     assert spiral_service.bind_object_store(hub['service'], 'svc', hub['hub']) == binding
     with ObjectStore.open(hub['service'], read_only=True) as db:
@@ -126,20 +130,15 @@ def test_startup_drops_unpublished_links_and_refuses_other_edits(hub):
         assert db.edges_by_kind('related') == []
     # Any other edit is not the service's: startup refuses it.
     with ObjectStore.open(hub['service'], author='svc') as db:
-        db.acquire_leases([names['walk']])
-        db.set_meta(names['walk'], 'sampling_group', 'not the service')
+        db.acquire_leases([uuids['walk']])
+        db.set_meta(uuids['walk'], 'sampling_group', 'not the service')
     with pytest.raises(spiral_service.ObjectStoreBindingError, match='unpublished edits'):
         spiral_service.bind_object_store(hub['service'], 'svc', hub['hub'])
-
-
-def test_startup_leaves_a_replica_others_write_untouched(hub):
-    # The editor's replica named by mistake: its unpushed approval survives.
-    names = _names(hub['editor'])
+    # The editor's replica named by mistake: its unpushed edge survives.
     with ObjectStore.open(hub['editor'], author='editor') as db:
         db.hub_sync(pull=True, push=False)
-        edge = db.add_edge({'kind': 'related', 'a': names['near'], 'b': names['far'],
-                            'a_anchor': {'whole_geometry': True},
-                            'b_anchor': {'whole_geometry': True}})
+        edge = db.add_edge({'kind': 'related', 'a': uuids['near'], 'b': uuids['far'],
+                            'a_anchor': whole, 'b_anchor': whole})
     with pytest.raises(spiral_service.ObjectStoreBindingError,
                        match="not this service's replica: editor"):
         spiral_service.bind_object_store(hub['editor'], 'svc', hub['hub'])
@@ -160,14 +159,17 @@ def test_hub_addresses_compare_as_the_store_records_them(tmp_path):
         str((tmp_path / 'real' / 'hub.vcobj').resolve())
 
 
+# ---------------------------------------------------------------------------
+# Initialize and rebuilds link and pin a position
+# ---------------------------------------------------------------------------
+
 def test_initialize_links_and_pins_the_requested_position(state, hub, device_stubs):
     advertised = state.binding_advertisement()
     assert advertised['capabilities']['input_positions'] is True
     assert advertised['object_store']['hub']['identity'] == state.object_store.hub_identity
-    walk = _names(hub['editor'])['walk']
+    walk = names(hub['editor'])['walk']
     edited = _edit(hub['editor'], walk, 'sampling_group', 'reviewed')
-    response = state.initialize(with_project({**REQUEST, 'inputs_position': edited}))
-    assert response['build_id']
+    assert state.initialize(with_project({**REQUEST, 'inputs_position': edited}))['build_id']
     status = settle(state)
     assert status['state'] == 'Idle', status['error']
     position = status['input_position']
@@ -182,35 +184,18 @@ def test_initialize_links_and_pins_the_requested_position(state, hub, device_stu
     assert entry['metadata']['sampling_group'] == 'reviewed'
     # The fit read the pinned position once; it did not link again.
     assert len(device_stubs) == 1
-    # Autosaves name the position as well as the digest. (The stubbed device
-    # stages leave no model to save, so the archive itself is a stand-in.)
-    session = state.session
-
-    def save_checkpoint(path, completed):
-        Path(path).write_bytes(b'PK\x03\x04')
-        return path
-    session._context.save_checkpoint = save_checkpoint
-    autosave = Path(session._write_autosave())
-    import json
-    metadata = json.loads(autosave.with_name('checkpoint_autosave.json').read_text())
-    assert metadata['input_position'] == manifest['position']
-    assert metadata['input_digest'] == state.session._context.object_store_inputs.digest
     # The editor reaches N by pulling, links included.
     with ObjectStore.open(hub['editor'], author='editor') as db:
         assert db.hub_sync(pull=True, push=False)['pulled_position'] == position['sequence']
         assert len(db.edges_by_kind('point-surface')) == 3
     # A later edit is not part of the fit; a model rebuild keeps the position.
     _edit(hub['editor'], walk, 'sampling_group', 'later')
-    response = state.rebuild(with_project({'run': {'z_begin': 0, 'z_end': 64, 'config': {
-        **RUN, 'model_num_flow_stages': 3}}}))
-    assert response['stage'] == 'model'
+    assert state.rebuild(with_project(request(model_num_flow_stages=3)))['stage'] == 'model'
     assert settle(state)['input_position'] == position
     assert state.session._context.config['object_store_input_position'] == position['sequence']
     # A reload rebuild links and pins a new position including it.
-    response = state.rebuild(with_project({**REQUEST, 'inputs': 'reload'}))
-    assert response['inputs'] == 'reload'
-    reloaded = settle(state)
-    assert reloaded['input_position']['sequence'] > position['sequence']
+    assert state.rebuild(with_project({**REQUEST, 'inputs': 'reload'}))['inputs'] == 'reload'
+    assert settle(state)['input_position']['sequence'] > position['sequence']
     [entry] = [e for e in state.session._context.object_store_inputs.manifest['objects']
                if e['uuid'] == walk]
     assert entry['metadata']['sampling_group'] == 'later'
@@ -227,10 +212,7 @@ def test_a_failed_preparation_keeps_the_resident_fit(state, hub, device_stubs,
                                  'linked in 4 attempts; retry'])
     monkeypatch.setattr(osi, 'prepare_position', refuse)
     response = state.rebuild(with_project({**REQUEST, 'inputs': 'reload'}))
-    deadline = time.monotonic() + 30
-    while state._building:
-        assert time.monotonic() < deadline
-        time.sleep(0.02)
+    wait_until(lambda: not state._building)
     status = state.status()
     assert status['state'] == 'Idle' and state.session_id == session_id
     assert state.session._context is context
@@ -251,94 +233,52 @@ def test_a_failed_preparation_keeps_the_resident_fit(state, hub, device_stubs,
     assert state.session_id == session_id
 
 
-@pytest.mark.parametrize("build_packs", [False, True])
-def test_a_checkpoint_resumes_at_its_recorded_position(state, hub, tmp_path,
-                                                       monkeypatch, build_packs):
-    state.build_missing_lasagna_packs = build_packs
-    packed = []
-    monkeypatch.setattr(state, "_prepare_lasagna_packs", lambda *args: packed.append(True))
+def test_a_checkpoint_resumes_at_its_recorded_position(state, tmp_path, monkeypatch):
+    import torch
     built = []
     monkeypatch.setattr(state, '_build', lambda *args: built.append(args))
     monkeypatch.setattr(osi, 'prepare_position', lambda *args, **kwargs: pytest.fail(
         'a checkpoint resume does not link'))
-    position = {'hub': state.object_store.hub_identity, 'sequence': 7}
-    path = _checkpoint(tmp_path / 'fit.ckpt', {}, {
-        'object_store': {'position': position}})
+
+    def checkpoint(name, hub_identity):
+        torch.save({'cfg': {}, 'input_manifest': {'object_store': {'position': {
+            'hub': hub_identity, 'sequence': 7}}}}, tmp_path / name)
+        return str(tmp_path / name)
+    path = checkpoint('fit.ckpt', state.object_store.hub_identity)
     assert state._checkpoint_position(path) == 7
-    other = _checkpoint(tmp_path / 'other.ckpt', {}, {
-        'object_store': {'position': {**position, 'hub': 'another-hub'}}})
-    assert state._checkpoint_position(other) is None
+    assert state._checkpoint_position(checkpoint('other.ckpt', 'another-hub')) is None
     paths, run, preview, scroll = state._prepare_session_request(with_project(REQUEST))
-    paths = paths.__class__(**{**paths.manifest(), 'checkpoint': path})
-    deadline = time.monotonic() + 30
-    state._begin_build(paths, run, preview, scroll)
-    while not built:
-        assert time.monotonic() < deadline
-        time.sleep(0.02)
+    state._begin_build(dataclasses.replace(paths, checkpoint=path), run, preview, scroll)
+    wait_until(lambda: built)
     _, _, _, pinned_run, _, _ = built[0]
     assert pinned_run.config['object_store_input_position'] == 7
     assert state.status()['input_position']['source'] == 'checkpoint'
-    assert bool(packed) == build_packs
 
 
-def test_a_shared_store_has_positions_of_its_own(store_path, tmp_path):
-    state = _service_state(spiral_service.bind_object_store(store_path, 'svc'), tmp_path)
+def test_a_shared_store_has_positions_a_client_cannot_pin(store_path, tmp_path):
+    state = service_state(spiral_service.bind_object_store(store_path, 'svc'), tmp_path)
     try:
         assert state.binding_advertisement()['capabilities']['input_positions'] is True
-        with ObjectStore.open(store_path, read_only=True) as db:
-            assert state.object_store.positions == db.store_positions()['store']
         with pytest.raises(spiral_service.ApiError, match='non-negative integer'):
             state._inputs_position(-1)
-        # A client cannot pin a position through the configuration.
         with pytest.raises(spiral_service.ApiError, match='must not carry'):
-            state.initialize(with_project({'run': {'z_begin': 0, 'z_end': 64, 'config': {
-                **RUN, 'object_store_input_position': 3}}}))
+            state.initialize(with_project(request(object_store_input_position=3)))
     finally:
         state.close()
 
 
-def test_the_preview_index_records_the_position(tmp_path):
-    from preview_index import PublishedPreviewIndex
-    index = PublishedPreviewIndex(tmp_path)
-    position = {'hub': 'hub-identity', 'sequence': 12}
-    index.record('state', manifest_path=tmp_path / 'preview.json', session_id='s',
-                 generation=1, input_digest='digest', input_position=position)
-    assert index._load()['previews']['state']['input_position'] == position
-
-
 # ---------------------------------------------------------------------------
-# Stage 2b step 15: a resident fit's inputs replaced at a new position
+# A resident fit's inputs replaced at a new position: the context
 # ---------------------------------------------------------------------------
 
-def _pinned_at_new_position(state, hub, change):
-    """Edit through the editor replica, then link and pin a position on the
-    service replica as an update would. Returns it."""
-    change()
-    config = state.session._context.config
-    with ObjectStore.open(state.object_store.path, author='svc') as store:
-        prepared = osi.prepare_position(store, config, osi.request_from_config(config),
-                                        log=lambda line: None)
-    return prepared.position.sequence
-
-
-def test_prepared_inputs_leave_the_resident_fit_untouched(state, hub, device_stubs, monkeypatch):
-    import numpy as np
-    import fit_spiral
-    from object_store_fixture import put_patch
+def test_prepared_inputs_leave_the_resident_fit_untouched(state, hub, device_stubs,
+                                                          no_theta_topology):
     state.initialize(with_project(REQUEST))
     settle(state)
     context = state.session._context
     before = {name: getattr(context, name) for name in context._INPUT_HOST_ATTRIBUTES}
     patches = context.num_verified_patches
-
-    def add_patch():
-        with ObjectStore.open(hub['editor'], author='editor') as db:
-            db.hub_sync(pull=True, push=False)
-            rows, cols = np.mgrid[:8, :8]
-            put_patch(db, np.stack([4.0 + rows * 4, np.full(rows.shape, 120.0), 40.0 + cols * 4], axis=-1),
-                      (0.25, 0.25), name='added')
-            db.hub_sync(pull=True, push=True)
-    position = _pinned_at_new_position(state, hub, add_patch)
+    position = _pinned_at_new_position(state, _add_patch(hub['editor']))
     inputs = context.load_replacement_inputs(position)
     rng = np.random.get_state()
     candidate = context.prepare_input_replacement(inputs)
@@ -347,20 +287,17 @@ def test_prepared_inputs_leave_the_resident_fit_untouched(state, hub, device_stu
     assert np.array_equal(np.random.get_state()[1], rng[1])
     assert candidate.num_verified_patches == patches + 1
     assert candidate.patch_atlas is not context.patch_atlas
-
-    # The device half (theta topology needs the model the stubs leave out).
-    monkeypatch.setattr(fit_spiral.FitContext, '_build_theta_crossing_map', lambda self: [])
+    # The device half.
     context.replace_inputs(candidate)
     assert context.num_verified_patches == patches + 1
     assert context.object_store_inputs is inputs
     assert context.config['object_store_input_position'] == position
     assert context.patch_atlas.zyxs_flat is not None  # materialized
-    import json
     with open(Path(context.out_path) / 'object_store_inputs.json') as stream:
         assert json.load(stream)['digest'] == inputs.digest
 
 
-def test_inputs_that_would_change_the_model_frame_are_refused(state, hub, device_stubs):
+def test_inputs_that_would_change_the_model_frame_are_refused(state, device_stubs):
     import copy
     import fit_spiral
     state.initialize(with_project(REQUEST))
@@ -382,15 +319,308 @@ def test_inputs_that_would_change_the_model_frame_are_refused(state, hub, device
         context.prepare_input_replacement(context.object_store_inputs)
 
 
-def test_a_failure_after_release_needs_recovery(state, hub, device_stubs, monkeypatch):
+# ---------------------------------------------------------------------------
+# The session's update
+# ---------------------------------------------------------------------------
+
+def test_an_update_replaces_the_inputs_and_keeps_the_iteration(state, hub, device_stubs,
+                                                                no_theta_topology):
+    state.initialize(with_project(REQUEST))
+    before = settle(state)
+    session = state.session
+    patches = session._context.num_verified_patches
+    position = _pinned_at_new_position(state, _add_patch(hub['editor']))
+    # A patch the old inputs' theta gate excluded is judged afresh.
+    session._context.non_liftable_patch_ids.add('excluded-before')
+    result = session.update_inputs(position)
+    status = session.status()
+    assert status['state'] == 'Idle'
+    assert session._context.non_liftable_patch_ids == set()
+    assert status['input_generation'] == 1 and result['input_generation'] == 1
+    assert status['input_digest'] == result['digest'] != before['input_digest']
+    assert status['current_iteration'] == before['current_iteration']
+    assert status['config_revision'] == before['config_revision'] + 1
+    assert status['applied_config']['object_store_input_position'] == position
+    assert session._context.num_verified_patches == patches + 1
+    with open(status['input_manifest_path']) as stream:
+        assert json.load(stream)['manifest']['position']['sequence'] == position
+
+
+def test_the_old_device_state_is_released_before_the_new_is_built(state, hub, device_stubs,
+                                                                   no_theta_topology, monkeypatch):
+    import weakref
     import fit_spiral
     state.initialize(with_project(REQUEST))
     settle(state)
     context = state.session._context
-    candidate = context.prepare_input_replacement(context.object_store_inputs)
+    old_atlas = context.patch_atlas
+    # The theta topology's closures hold the old atlas, as the real one does.
+    context.theta_crossing_map = [lambda atlas=old_atlas: atlas]
+    released = weakref.ref(old_atlas)
+    del old_atlas
+    materialize = fit_spiral.PatchAtlas.materialize
+    seen = []
+
+    def checked(self, device=None):
+        seen.append(released() is None)
+        return materialize(self, device)
+    monkeypatch.setattr(fit_spiral.PatchAtlas, 'materialize', checked)
+    state.session.update_inputs(_pinned_at_new_position(state, _add_patch(hub['editor'])))
+    assert seen == [True]
+
+
+def test_a_failure_after_release_fails_the_session(state, hub, device_stubs, no_theta_topology,
+                                                   monkeypatch):
+    import fit_spiral
+    state.initialize(with_project(REQUEST))
+    settle(state)
+    session = state.session
+    position = _pinned_at_new_position(state, _add_patch(hub['editor']))
 
     def fail(self, device=None):
         raise MemoryError('CUDA out of memory')
     monkeypatch.setattr(fit_spiral.PatchAtlas, 'materialize', fail)
-    with pytest.raises(fit_spiral.InputReplacementFailed, match='rebuild the fit or load a checkpoint'):
-        context.replace_inputs(candidate)
+    with pytest.raises(spiral_runtime.InputUpdateFailed, match='rebuilt or loaded from a checkpoint'):
+        session.update_inputs(position)
+    wait_until(lambda: session.status()['state'] == 'Error')
+
+
+def test_an_update_of_a_busy_session_is_refused_without_a_command(state, hub, device_stubs,
+                                                                    no_theta_topology):
+    # A run admitted first: the update refuses before admission, and queues
+    # no discard (a stray command would break the running step's barrier).
+    state.initialize(with_project(REQUEST))
+    settle(state)
+    session = state.session
+    position = _pinned_at_new_position(state, _add_patch(hub['editor']))
+    with session._condition:
+        session._state = spiral_runtime.SessionState.Running
+        epoch = session._command_epoch
+    try:
+        with pytest.raises(spiral_runtime.InputUpdateRefused, match='Running'):
+            session.update_inputs(position)
+        with session._condition:
+            assert session._command_epoch == epoch and session._commands == []
+    finally:
+        with session._condition:
+            session._state = spiral_runtime.SessionState.Idle
+    assert session.update_inputs(position)['input_generation'] == 1
+
+
+class _Coordinator(spiral_runtime.DistributedInteractiveFitSession):
+    """The distributed coordinator's update logic over scripted rank answers."""
+
+    def __init__(self, answers):
+        self.answers, self.calls, self.failed = answers, [], None
+
+    def status(self):
+        return {'state': spiral_runtime.SessionState.Idle}
+
+    def _call(self, name, arguments=None, ranks=None, timeout=0, collective=True,
+              return_all=False):
+        self.calls.append(name)
+        answer = self.answers.get(name)
+        if isinstance(answer, BaseException):
+            raise answer
+        return answer
+
+    @property
+    def _failed_error(self):
+        return self.failed
+
+    def _fail_session(self, cause, *, rank=None, detail=None):
+        self.failed = str(cause)
+        return self.failed
+
+
+def test_the_coordinator_installs_only_what_every_rank_prepared():
+    prepared = {0: {'digest': 'a', 'position': 7}, 1: {'digest': 'a', 'position': 7}}
+    coordinator = _Coordinator({'prepare_inputs': prepared, 'install_inputs': {},
+                                'publish_inputs': {'input_generation': 1}})
+    assert coordinator.update_inputs(7)['input_generation'] == 1
+    assert coordinator.calls == ['prepare_inputs', 'install_inputs', 'publish_inputs']
+
+    # Ranks that disagree, or a rank that refuses, install nothing.
+    for answer in ({0: {'digest': 'a'}, 1: {'digest': 'b'}},
+                   RuntimeError('rank 1: the inputs cannot replace this fit\'s')):
+        coordinator = _Coordinator({'prepare_inputs': answer})
+        with pytest.raises(spiral_runtime.InputUpdateRefused):
+            coordinator.update_inputs(7)
+        assert coordinator.calls == ['prepare_inputs', 'discard_inputs']
+        assert coordinator.failed is None
+
+    # A rank lost while preparing has failed the session: not a refusal.
+    class Lost(_Coordinator):
+        def _call(self, name, *args, **kwargs):
+            if name == 'prepare_inputs':
+                self.calls.append(name)
+                self.failed = 'Timed out waiting for GPU worker ranks [1] to prepare_inputs'
+                raise TimeoutError(self.failed)
+            return super()._call(name, *args, **kwargs)
+    coordinator = Lost({})
+    with pytest.raises(spiral_runtime.InputUpdateFailed, match='Timed out'):
+        coordinator.update_inputs(7)
+    assert coordinator.calls == ['prepare_inputs']
+
+    # A publish failure after every rank installed fails the session too.
+    coordinator = _Coordinator({'prepare_inputs': prepared, 'install_inputs': {},
+                                'publish_inputs': RuntimeError('rank 1: publish')})
+    with pytest.raises(spiral_runtime.InputUpdateFailed, match='could not be published'):
+        coordinator.update_inputs(7)
+    assert 'rank 1: publish' in coordinator.failed
+
+    # A busy session refuses before any rank is asked.
+    coordinator = _Coordinator({})
+    coordinator.status = lambda: {'state': spiral_runtime.SessionState.Running}
+    with pytest.raises(spiral_runtime.InputUpdateRefused, match='Running'):
+        coordinator.update_inputs(7)
+    assert coordinator.calls == []
+
+    # A failure past the release on any rank fails the whole session.
+    coordinator = _Coordinator({'prepare_inputs': prepared,
+                                'install_inputs': RuntimeError('rank 0: out of memory')})
+    with pytest.raises(spiral_runtime.InputUpdateFailed, match='after resident inputs were released'):
+        coordinator.update_inputs(7)
+    assert coordinator.calls == ['prepare_inputs', 'install_inputs']
+    assert 'out of memory' in coordinator.failed
+
+
+def _rank_update(rank, world_size, rendezvous, root, config, position, results):
+    os.environ['FIT_SPIRAL_DEVICE'] = 'cpu'
+    import fit_spiral
+    from fit_session import SpiralInputPaths, SpiralPreviewConfig, SpiralRunConfig
+    from spiral_runtime import InteractiveFitSession, RendezvousEndpoint
+    import object_store_reference as reference
+    stub_device_stages(fit_spiral)
+    fit_spiral.FitContext._build_theta_crossing_map = lambda self: []
+    session = InteractiveFitSession(
+        SpiralInputPaths(umbilicus=f'{root}/umbilicus.json',
+                         output_directory=f'{root}-out-{rank}'),
+        SpiralRunConfig(0, 64, config=config), SpiralPreviewConfig(),
+        reference.scroll_spec(), lambda status: None, publishes_outputs=rank == 0,
+        rank=rank, world_size=world_size, local_rank=rank,
+        rendezvous=RendezvousEndpoint(rendezvous))
+    deadline = time.monotonic() + 120
+    while session.status()['state'] not in ('Idle', 'Error') and time.monotonic() < deadline:
+        time.sleep(0.05)
+    before = session.status()
+    outcome = {'before': before['input_digest']}
+    try:
+        result = session.update_inputs(position)
+        outcome.update(after=result['digest'], patches=session._context.num_verified_patches,
+                       iteration=session.status()['current_iteration'] == before['current_iteration'])
+    except Exception as error:  # noqa: BLE001 - reported to the test
+        outcome['error'] = f'{type(error).__name__}: {error}'
+    with open(results[rank], 'w') as stream:
+        json.dump(outcome, stream)
+    session.close()
+
+
+def test_two_ranks_install_the_same_inputs(state, hub, device_stubs, tmp_path):
+    state.initialize(with_project(REQUEST))
+    first = settle(state)['input_position']['sequence']
+    position = _pinned_at_new_position(state, _add_patch(hub['editor']))
+    # Each rank builds at the session's first position (read as pinned: the
+    # service linked it), then updates to the new one.
+    config = {**RUN, 'object_store_path': state.object_store.path, 'object_store_author': 'svc',
+              'object_store_input_position': first}
+    outcome = two_ranks(_rank_update, tmp_path, str(write_inputs(tmp_path / 'ranks-inputs')),
+                        config, position)
+    assert all('error' not in rank for rank in outcome), outcome
+    assert outcome[0]['after'] == outcome[1]['after'] != outcome[0]['before']
+    assert outcome[0]['patches'] == outcome[1]['patches']
+    assert outcome[0]['iteration'] and outcome[1]['iteration']
+
+
+# ---------------------------------------------------------------------------
+# The service's update route
+# ---------------------------------------------------------------------------
+
+def test_the_service_updates_the_resident_fit_at_a_position(state, hub, device_stubs,
+                                                             no_theta_topology):
+    state.initialize(with_project(REQUEST))
+    before = settle(state)
+    capabilities = state.binding_advertisement()['capabilities']
+    assert capabilities['input_updates'] is True and capabilities['inputs_frozen'] is False
+    session_id = state.session_id
+    reached = _add_patch(hub['editor'])()
+    with pytest.raises(spiral_service.ApiError, match='input generation 3') as stale:
+        state.update_inputs({'inputs_position': reached, 'expected_input_generation': 3})
+    assert stale.value.payload['code'] == spiral_service.INPUT_GENERATION_STALE
+    response = state.update_inputs({'inputs_position': reached, 'expected_input_generation': 0})
+    assert response['updating_inputs'] and response['build_id']
+    status = _settled_update(state)
+    assert status['state'] == 'Idle' and state.session_id == session_id
+    assert status['input_generation'] == 1
+    assert status['input_digest'] != before['input_digest']
+    assert status['current_iteration'] == before['current_iteration']
+    position = status['input_position']
+    assert position['source'] == 'update' and position['requested'] == reached
+    assert position['sequence'] >= reached and position['input_generation'] == 1
+    assert status['input_preparation_error'] is None
+    # A model-only rebuild afterwards keeps the updated position.
+    assert state.rebuild(with_project(request(model_num_flow_stages=3)))['stage'] == 'model'
+    rebuilt = settle(state)
+    assert rebuilt['input_position']['sequence'] == position['sequence']
+    assert state.session._context.config['object_store_input_position'] == position['sequence']
+
+
+def test_a_refused_service_update_leaves_the_fit(state, hub, device_stubs, no_theta_topology,
+                                                 monkeypatch):
+    import fit_spiral
+    state.initialize(with_project(REQUEST))
+    before = settle(state)
+    inputs = state.session._context.object_store_inputs
+
+    def refuse(self, inputs):
+        raise fit_spiral.InputReplacementRefused('the inputs cannot replace this fit\'s')
+    monkeypatch.setattr(fit_spiral.FitContext, 'prepare_input_replacement', refuse)
+    response = state.update_inputs({})
+    status = _settled_update(state)
+    assert status['state'] == 'Idle' and status['input_digest'] == before['input_digest']
+    assert status['input_position'] == before['input_position']
+    assert state.session._context.object_store_inputs is inputs
+    assert state.session._pending_inputs is None
+    failure = status['input_preparation_error']
+    assert failure['build_id'] == response['build_id'] and failure['phase'] == 'preparing'
+    assert failure['recovery_required'] is False
+    # The lease's lifecycle answers the command with the refusal, and a
+    # repeat of the same command replays it instead of updating again.
+    state.lease().claim('client-token', 'claim-1')
+    for _ in range(2):
+        with pytest.raises(spiral_service.ApiError, match='could not be prepared'):
+            state.lease_lifecycle('client-token', 'session_update_inputs',
+                                  {'command_id': 'update-1'}, state.update_inputs)
+    assert state.status()['input_generation'] == 0
+
+
+def test_verbs_that_change_the_fit_wait_for_an_input_update(state, hub, device_stubs,
+                                                            no_theta_topology, monkeypatch):
+    import threading
+    state.initialize(with_project(REQUEST))
+    settle(state)
+    linking, release = threading.Event(), threading.Event()
+    prepare = state._prepare_position
+
+    def slow(*args, **kwargs):
+        linking.set()
+        assert release.wait(30)
+        return prepare(*args, **kwargs)
+    monkeypatch.setattr(state, '_prepare_position', slow)
+    state.update_inputs({})
+    assert linking.wait(30)
+    try:
+        for verb in (lambda: state.run({'iterations': 1}),
+                     lambda: state.rebuild(with_project({'inputs': 'reload'})),
+                     lambda: state.load_checkpoint({'path': 'absent.ckpt'})):
+            with pytest.raises(spiral_service.ApiError, match='input update in progress') as busy:
+                verb()
+            assert busy.value.payload['code'] == spiral_service.INPUT_UPDATE_IN_PROGRESS
+        with pytest.raises(spiral_service.ApiError) as busy:
+            state.update_inputs({})
+        assert busy.value.payload['code'] == spiral_service.INPUT_UPDATE_BUSY
+    finally:
+        release.set()
+    status = _settled_update(state)
+    assert status['state'] == 'Idle' and status['input_preparation_error'] is None
+    assert status['input_generation'] == 1

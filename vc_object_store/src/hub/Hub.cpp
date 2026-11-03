@@ -6,6 +6,7 @@
 #include "sftp/SftpVfs.hpp"
 #include <fstream>
 #include <mutex>
+#include <nlohmann/json.hpp>
 
 namespace vc::objects {
 using namespace detail;
@@ -819,6 +820,33 @@ std::optional<StorePositions> storePositions(ObjectStore& store)
     auto txn = store.read();
     if (detectHubRole(conn(txn)) != HubRole::None || !hasPublications(conn(txn))) return std::nullopt;
     return StorePositions{replicaIdentity(conn(txn)), hubHead(conn(txn))};
+}
+
+std::optional<std::string> linkMarker(ObjectStore& store)
+{
+    auto txn = store.read();
+    Statement table(conn(txn), "SELECT 1 FROM sqlite_master WHERE type='table' AND name='link_marker'");
+    if (!table.row()) return std::nullopt;
+    Statement row(conn(txn), "SELECT replica,value FROM link_marker WHERE singleton=1");
+    if (!row.row() || row.text(0) != replicaIdentity(conn(txn))) return std::nullopt;
+    return row.text(1);
+}
+
+void setLinkMarker(ObjectStore& store, const std::string& json)
+{
+    const auto value = nlohmann::json::parse(json);
+    if (!value.is_object()) throw std::invalid_argument("link marker: expected a JSON object");
+    auto txn = store.write();
+    exec(conn(txn), R"SQL(
+CREATE TABLE IF NOT EXISTS link_marker(
+  singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+  replica TEXT NOT NULL,
+  value TEXT NOT NULL,
+  written_us INTEGER NOT NULL
+);)SQL");
+    execute(conn(txn), "INSERT OR REPLACE INTO link_marker VALUES(1,?,?,?)", replicaIdentity(conn(txn)), value.dump(),
+            nowMicros());
+    txn.commit();
 }
 
 std::optional<HubStatus> hubStatus(ObjectStore& store)

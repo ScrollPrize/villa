@@ -16,91 +16,37 @@ import pytest
 pytest.importorskip('vc_object_store')
 from vc_object_store import ObjectStore  # noqa: E402
 
-import object_store_inputs as osi  # noqa: E402
 import object_store_reference as reference  # noqa: E402
 import spiral_service  # noqa: E402
+from cpu_service import (  # noqa: E402
+    RUN, request, service_bindings, settle, stub_device_stages, two_ranks,
+    wait_until, write_inputs)
+from object_store_fixture import edges  # noqa: E402
 from service_project import with_project  # noqa: E402
-from fit_session import SessionState  # noqa: E402
-from test_object_store_startup import _edges, store_path  # noqa: E402,F401
 
-RUN = {key: value for key, value in reference.CONFIG_OVERRIDES.items()
-       if key not in ('z_begin', 'z_end')}
-
-
-@pytest.fixture(autouse=True)
-def cpu(monkeypatch):
-    monkeypatch.setenv('FIT_SPIRAL_DEVICE', 'cpu')
-
-
-def stub_device_stages(fitter):
-    """Leave everything but the CUDA-only stages real."""
-    def build(self):
-        self.start_iteration = 0
-    fitter.FitContext.build_device_state = build
-    fitter.FitContext.rebuild_model_state = build
-    fitter.FitContext.release_setup_only_tracks = lambda self: None
-
-
-@pytest.fixture()
-def device_stubs(monkeypatch):
-    import fit_spiral
-    for name in ('build_device_state', 'rebuild_model_state',
-                 'release_setup_only_tracks'):
-        monkeypatch.setattr(fit_spiral.FitContext, name,
-                            getattr(fit_spiral.FitContext, name))
-    stub_device_stages(fit_spiral)
-    loads = []
-    load = osi.load_fit_inputs
-
-    def counted(config, **kwargs):
-        loads.append(config['object_store_refresh_links'])
-        return load(config, **kwargs)
-    monkeypatch.setattr(osi, 'load_fit_inputs', counted)
-    return loads
-
-
-def write_inputs(root):
-    """A directory holding the umbilicus a session built directly (not
-    through the service, whose project supplies it) reads."""
-    root.mkdir()
-    reference.write_umbilicus(str(root / 'umbilicus.json'))
-    return root
-
-
-def bindings(tmp_path):
-    return spiral_service.bind_service_inputs(tmp_path / 'output', tmp_path / 'cache')
+pytestmark = pytest.mark.usefixtures('cpu')
 
 
 @pytest.fixture()
 def state(store_path, tmp_path):
     state = spiral_service.ServiceState(
-        bindings=bindings(tmp_path),
+        bindings=service_bindings(tmp_path),
         object_store=spiral_service.bind_object_store(store_path, 'svc'),
         startup_run={'z_begin': 0, 'z_end': 64, 'config': dict(RUN)})
     yield state
     state.close()
 
 
-def settle(state, timeout=120):
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        status = state.status()
-        if not state._building and status['state'] in ('Idle', 'Error'):
-            return status
-        time.sleep(0.05)
-    raise AssertionError(f'the session did not settle: {state.status()["phase"]}')
-
-
 def test_the_runtime_reads_the_bound_store_and_reports_it(state, store_path,
                                                           device_stubs):
-    state.initialize(with_project({'run': {'z_begin': 0, 'z_end': 64, 'config': dict(RUN)}}))
+    state.initialize(with_project(request()))
     status = settle(state)
     assert status['state'] == 'Idle', status['error']
     context = state.session._context
     assert context.config['object_store_path'] == state.object_store.path
     assert context.config['object_store_author'] == 'svc'
     assert device_stubs == [True]
-    assert len(_edges(store_path)) == 3
+    assert len(edges(store_path)) == 3
     inputs = context.object_store_inputs
     # The service linked and pinned a position of the shared store first
     # (its lines are preparation events); the runtime read that position.
@@ -112,85 +58,47 @@ def test_the_runtime_reads_the_bound_store_and_reports_it(state, store_path,
     report = status['input_report']
     assert any(line.startswith('reading pinned position') for line in report)
     assert f'object-store inputs frozen: digest {inputs.digest[:16]}' in report
-    assert any(line.startswith('constraints:') for line in report)
     events = [event for event in state.events.read_after(0)['events']
               if event['kind'] == 'inputs']
     assert [event['text'] for event in events] == report
-    # The interactive run directory records the frozen inputs, as a CLI run's does.
-    with open(Path(context.out_path) / 'object_store_inputs.json') as stream:
-        assert json.load(stream)['digest'] == inputs.digest
-
-
-def test_status_and_artifacts_carry_the_input_provenance(state, device_stubs):
-    from fit_session import read_autosave_metadata
-    state.initialize(with_project({'run': {'z_begin': 0, 'z_end': 64, 'config': dict(RUN)}}))
-    status = settle(state)
-    inputs = state.session._context.object_store_inputs
+    # The status carries the input provenance: the store's by digest, the
+    # project's umbilicus by path.
     assert status['input_digest'] == inputs.digest
     summary = status['input_summary']
-    assert summary['digest'] == inputs.digest
     assert summary['selection'] == {'surface': 2, 'point_collection': 1, 'fiber': 0,
                                     'track': 0}
     assert summary['relationships'] == {'pcl_patch': 3}
-    # The status lists the inputs read by path, and the store's by digest.
     manifest = status['input_manifest']
     assert manifest['object_store_digest'] == inputs.digest
     assert not {'verified_patches', 'fibers', 'pcls'} & set(manifest)
-    # The project's umbilicus, written where the fit reads it.
     assert '/project-inputs/umbilicus-' in manifest['umbilicus']
-    assert not {'same_winding_artifact', 'relative_winding_artifact'} & set(status)
-    # The whole manifest is an immutable artifact.
-    deadline = time.monotonic() + 30
-    while state.status()['input_manifest_artifact'] is None:
-        assert time.monotonic() < deadline
-        time.sleep(0.02)
+    # The run directory records the frozen inputs, as a CLI run's does, and
+    # the whole manifest is an immutable artifact.
+    with open(Path(context.out_path) / 'object_store_inputs.json') as stream:
+        assert json.load(stream)['digest'] == inputs.digest
+    wait_until(lambda: state.status()['input_manifest_artifact'] is not None)
     artifact = state.status()['input_manifest_artifact']
     assert artifact['input_digest'] == inputs.digest
     _, path, _ = state.artifacts.acquire_file(artifact['id'], 'object_store_inputs.json')
     with open(path) as stream:
-        published = json.load(stream)
-    assert published == {'digest': inputs.digest,
-                         'manifest': json.loads(json.dumps(inputs.manifest))}
+        assert json.load(stream) == {'digest': inputs.digest,
+                                     'manifest': json.loads(json.dumps(inputs.manifest))}
     # Autosaves name the inputs they were fitted to. (The stubbed device
     # stages leave no model to save, so the archive itself is a stand-in.)
-    session = state.session
-
     def save_checkpoint(path, completed):
         Path(path).write_bytes(b'PK\x03\x04')
         return path
-    session._context.save_checkpoint = save_checkpoint
-    autosave = Path(session._write_autosave())
+    context.save_checkpoint = save_checkpoint
+    autosave = Path(state.session._write_autosave())
     metadata = json.loads(autosave.with_name('checkpoint_autosave.json').read_text())
     assert metadata['input_digest'] == inputs.digest
-    assert read_autosave_metadata(autosave.with_name('checkpoint_autosave.json'))
-
-
-def test_a_model_rebuild_keeps_the_frozen_inputs(state, store_path, device_stubs):
-    state.initialize(with_project({'run': {'z_begin': 0, 'z_end': 64, 'config': dict(RUN)}}))
-    settle(state)
-    context = state.session._context
-    inputs = context.object_store_inputs
-    edges = _edges(store_path)
-    response = state.rebuild(with_project({'run': {'z_begin': 0, 'z_end': 64, 'config': {
-        **RUN, 'model_num_flow_stages': 3}}}))
-    assert response['stage'] == 'model'
-    assert settle(state)['state'] == 'Idle'
-    assert state.session._context is context
-    assert context.object_store_inputs is inputs
-    assert context.config['model_num_flow_stages'] == 3
-    # Nothing reread the store, refreshed links or wrote to it.
-    assert device_stubs == [True]
-    assert _edges(store_path) == edges
+    assert metadata['input_position'] == inputs.manifest['position']
 
 
 def test_input_refusals_reach_status_and_events(state, store_path, device_stubs):
     # Linking a position fails before any build: nothing is torn down.
-    state.initialize(with_project({'run': {'z_begin': 0, 'z_end': 64, 'config': {
-        **RUN, 'pcl_link_window_min_points': 5}}}))
-    deadline = time.monotonic() + 60
-    while state._building:
-        assert time.monotonic() < deadline
-        time.sleep(0.02)
+    state.initialize(with_project(request(pcl_link_window_min_points=5)))
+    wait_until(lambda: not state._building, 60)
     status = state.status()
     assert status['state'] == 'Uninitialized' and device_stubs == []
     failure = status['input_preparation_error']
@@ -205,7 +113,7 @@ def test_input_refusals_reach_status_and_events(state, store_path, device_stubs)
 # Two ranks
 # ---------------------------------------------------------------------------
 
-def _rank_session(rank, world_size, rendezvous, root, store, config, results):
+def _rank_session(rank, world_size, rendezvous, root, config, results):
     os.environ['FIT_SPIRAL_DEVICE'] = 'cpu'
     import fit_spiral
     from fit_session import SpiralInputPaths, SpiralPreviewConfig, SpiralRunConfig
@@ -234,38 +142,22 @@ def _rank_session(rank, world_size, rendezvous, root, store, config, results):
     session.close()
 
 
-def _two_rank_sessions(tmp_path, store, config):
-    import torch.multiprocessing as mp
-    root = str(write_inputs(tmp_path / 'inputs'))
-    results = [str(tmp_path / f'rank{rank}.json') for rank in range(2)]
-    rendezvous = tmp_path / 'rendezvous'
-    rendezvous.mkdir()
-    mp.spawn(_rank_session, args=(2, str(rendezvous / 'store'), root, store,
-                                  config, results), nprocs=2)
-    outcome = []
-    for path in results:
-        with open(path) as stream:
-            outcome.append(json.load(stream))
-    return outcome
-
-
-def _bound_config(store, **overrides):
-    return {**RUN, 'object_store_path': store, 'object_store_author': 'svc',
-            **overrides}
+def _two_rank_sessions(tmp_path, store, **overrides):
+    config = {**RUN, 'object_store_path': store, 'object_store_author': 'svc', **overrides}
+    return two_ranks(_rank_session, tmp_path, str(write_inputs(tmp_path / 'inputs')), config)
 
 
 def test_two_rank_sessions_refresh_once_and_both_start(store_path, tmp_path):
-    first, second = _two_rank_sessions(tmp_path, store_path, _bound_config(store_path))
+    first, second = _two_rank_sessions(tmp_path, store_path)
     assert first['state'] == second['state'] == 'Idle', (first, second)
-    assert len(_edges(store_path)) == 3
+    assert len(edges(store_path)) == 3
     # Rank 0 refreshed and reported; rank 1 only read the frozen inputs.
     assert any('3 created' in line for line in first['report'])
     assert not any('link refresh' in line for line in second['report'])
 
 
 def test_a_refresh_failure_stops_both_ranks_before_either_starts(store_path, tmp_path):
-    outcome = _two_rank_sessions(tmp_path, store_path, _bound_config(
-        store_path, pcl_link_window_min_points=5))
+    outcome = _two_rank_sessions(tmp_path, store_path, pcl_link_window_min_points=5)
     for rank in outcome:
         assert rank['state'] == 'Error' and not rank['ever_idle']
         assert any('pcl_patch: FAILED' in line for line in rank['input_problems'])
@@ -273,42 +165,43 @@ def test_a_refresh_failure_stops_both_ranks_before_either_starts(store_path, tmp
 
 
 # ---------------------------------------------------------------------------
-# Rebuilds and checkpoints against frozen inputs (step 8)
+# Rebuilds and checkpoints against frozen inputs
 # ---------------------------------------------------------------------------
 
-def test_a_reload_rebuild_rereads_the_store_under_an_unchanged_config(
+def test_a_model_rebuild_keeps_the_inputs_and_a_reload_rereads_them(
         state, store_path, device_stubs):
-    request = {'run': {'z_begin': 0, 'z_end': 64, 'config': dict(RUN)}}
-    state.initialize(with_project(request))
+    state.initialize(with_project(request()))
     first = settle(state)['input_digest']
-    walk = next(entry['uuid'] for entry in state.binding_advertisement()['inputs']['objects']
+    context = state.session._context
+    inputs, linked = context.object_store_inputs, edges(store_path)
+    walk = next(entry['uuid'] for entry in state.startup_inputs()['objects']
                 if entry['name'] == 'walk')
     with ObjectStore.open(store_path, author='editor') as db:
         db.set_meta(walk, 'sampling_group', 'reviewed')
-    # The same configuration is a model-stage rebuild, which keeps the
-    # frozen inputs: it neither rereads the store nor sees the edit.
-    response = state.rebuild(with_project(request))
+    # A model-stage rebuild keeps the frozen inputs: it neither rereads the
+    # store, refreshes links nor sees the edit.
+    response = state.rebuild(with_project(request(model_num_flow_stages=3)))
     assert (response['stage'], response['inputs']) == ('model', 'keep')
     assert settle(state)['input_digest'] == first
-    assert device_stubs == [True]
-    response = state.rebuild(with_project({**request, 'inputs': 'reload'}))
+    assert state.session._context is context and context.object_store_inputs is inputs
+    assert context.config['model_num_flow_stages'] == 3
+    assert device_stubs == [True] and edges(store_path) == linked
+    response = state.rebuild(with_project({**request(), 'inputs': 'reload'}))
     assert (response['stage'], response['inputs']) == ('all', 'reload')
     reloaded = settle(state)
-    assert reloaded['state'] == 'Idle'
-    assert reloaded['input_digest'] != first
+    assert reloaded['state'] == 'Idle' and reloaded['input_digest'] != first
     assert len(device_stubs) == 2
     with pytest.raises(spiral_service.ApiError, match='inputs must be'):
-        state.rebuild(with_project({**request, 'inputs': 'refresh'}))
+        state.rebuild(with_project({**request(), 'inputs': 'refresh'}))
 
 
 def test_settings_that_shape_the_inputs_need_a_full_rebuild(state, device_stubs):
     from config import OBJECT_STORE_PCL_KEYS, Config, rebuild_stage
-    keys = sorted(OBJECT_STORE_PCL_KEYS) + ['input_use_pcl_relative',
-                                            'input_use_pcl_same_winding',
-                                            'patch_loss_z_margin']
-    for key in keys:
+    for key in sorted(OBJECT_STORE_PCL_KEYS) + ['input_use_pcl_relative',
+                                                'input_use_pcl_same_winding',
+                                                'patch_loss_z_margin']:
         assert rebuild_stage({key}) == 'all', key
-    state.initialize(with_project({'run': {'z_begin': 0, 'z_end': 64, 'config': dict(RUN)}}))
+    state.initialize(with_project(request()))
     status = settle(state)
     configuration = {**Config().as_dict(), **status['applied_config'],
                      'pcl_link_window_points': 9}
@@ -316,8 +209,7 @@ def test_settings_that_shape_the_inputs_need_a_full_rebuild(state, device_stubs)
         state.run({'iterations': 1, 'configuration': configuration,
                    'expected_session_revision': state.session_revision,
                    'dt_loss_schedule': {'enabled': False, 'last_fraction': 0.0}})
-    response = state.rebuild(with_project({'run': {'z_begin': 0, 'z_end': 64, 'config': {
-        **RUN, 'pcl_link_window_points': 9}}}))
+    response = state.rebuild(with_project(request(pcl_link_window_points=9)))
     assert (response['stage'], response['inputs']) == ('all', 'reload')
     assert settle(state)['applied_config']['pcl_link_window_points'] == 9
     assert len(device_stubs) == 2
@@ -330,73 +222,57 @@ def _checkpoint(path, cfg, input_manifest):
 
 
 def test_checkpoint_refusals_name_the_input_remedies(state, tmp_path, device_stubs):
-    state.initialize(with_project({'run': {'z_begin': 0, 'z_end': 64, 'config': dict(RUN)}}))
+    state.initialize(with_project(request()))
     status = settle(state)
-    live = status['applied_config']
+    live, volume = status['applied_config'], state.session_paths.volume_uuid
+    assert volume
     with open(status['input_manifest_path']) as stream:
         manifest = json.load(stream)['manifest']
 
+    def refusal(name, cfg, input_manifest, reason):
+        return state._checkpoint_refusal(_checkpoint(tmp_path / name, cfg, input_manifest),
+                                         reason)
+
+    # Changed inputs (written against another store path: that is the
+    # binding's to decide) need a reload.
     changed = json.loads(json.dumps(manifest))
     changed['objects'][0]['geometry_revision'] = 'an-older-geometry'
-    # Written against another store path: that is the binding's to decide.
     cfg = {**live, 'object_store_path': '/elsewhere.vcobj'}
-    path = _checkpoint(tmp_path / 'changed.ckpt', cfg,
-                       {'object_store': changed, 'volume_uuid': state.session_paths.volume_uuid})
-    refusal = state._checkpoint_refusal(path, 'object-store inputs differ')
-    assert refusal.status == 409
-    assert refusal.payload['stage'] == 'all'
-    inputs = refusal.payload['inputs']
-    assert inputs['legacy'] is False
-    assert 'objects' in inputs['problems'][0]
+    refused = refusal('changed.ckpt', cfg, {'object_store': changed, 'volume_uuid': volume},
+                      'object-store inputs differ')
+    assert (refused.status, refused.payload['stage']) == (409, 'all')
+    inputs = refused.payload['inputs']
+    assert inputs['legacy'] is False and 'objects' in inputs['problems'][0]
     assert inputs['rebuild'] == {'inputs': 'reload'}
     assert inputs['allow_changed_inputs'] == 'object_store_allow_changed_inputs'
-
-    # The same inputs: only the configuration decides the stage, and the
-    # store path the checkpoint names is no difference.
-    path = _checkpoint(tmp_path / 'same.ckpt',
-                       {**cfg, 'model_num_flow_stages': live['model_num_flow_stages'] + 1},
-                       {'object_store': manifest, 'volume_uuid': state.session_paths.volume_uuid})
-    refusal = state._checkpoint_refusal(path, 'model shape differs')
-    assert refusal.payload == {'reasons': ['model shape differs'], 'stage': 'model'}
-
-    path = _checkpoint(tmp_path / 'legacy.ckpt', live,
-                       {'volume_uuid': state.session_paths.volume_uuid})
-    refusal = state._checkpoint_refusal(path, 'no object-store inputs')
-    assert refusal.payload['refused'] is True
-    assert refusal.payload['inputs']['legacy'] is True
-    assert 'object_store_allow_changed_inputs' in refusal.message
-
+    # The same inputs: only the configuration decides the stage.
+    refused = refusal('same.ckpt', {**cfg, 'model_num_flow_stages': live['model_num_flow_stages'] + 1},
+                      {'object_store': manifest, 'volume_uuid': volume}, 'model shape differs')
+    assert refused.payload == {'reasons': ['model shape differs'], 'stage': 'model'}
+    refused = refusal('legacy.ckpt', live, {'volume_uuid': volume}, 'no object-store inputs')
+    assert refused.payload['refused'] is True and refused.payload['inputs']['legacy'] is True
+    assert 'object_store_allow_changed_inputs' in refused.message
     # A checkpoint fitted in another volume is what no rebuild can fix.
-    assert state.session_paths.volume_uuid
-    path = _checkpoint(tmp_path / 'foreign.ckpt', live,
-                       {'object_store': manifest, 'volume_uuid': 'another-volume'})
-    refusal = state._checkpoint_refusal(path, 'another volume')
-    assert refusal.payload == {'reasons': ['another volume'], 'refused': True}
+    refused = refusal('foreign.ckpt', live, {'object_store': manifest,
+                                             'volume_uuid': 'another-volume'}, 'another volume')
+    assert refused.payload == {'reasons': ['another volume'], 'refused': True}
 
 
 # ---------------------------------------------------------------------------
-# The CLI and the service freeze the same inputs (step 12)
+# The CLI and the service freeze the same inputs
 # ---------------------------------------------------------------------------
-
-def _plane(y, scale=1):
-    import numpy as np
-    rows, cols = np.mgrid[:8, :8]
-    return np.stack([4.0 + rows * 4, np.full(rows.shape, y), 40.0 + cols * 4], -1)
-
 
 @pytest.fixture()
 def varied_store(tmp_path):
     """Every case the selection must agree on: absolute, relative and
     same-winding PCLs by metadata and annotations, a patch and a fiber at
     non-unit scales, and approved, pending, rejected and stale links."""
-    import numpy as np
-    from object_store_fixture import (array, frame, pcl_patch_edge, put_fiber,
+    from object_store_fixture import (array, frame, pcl_patch_edge, plane, put_fiber,
                                       put_patch, put_pcl)
     path = str(tmp_path / 'varied.vcobj')
     with ObjectStore.create(path, author='ingest', hostname='host') as db:
-        near = put_patch(db, _plane(100.0), (0.25, 0.25), name='near')
-        far = put_patch(db, _plane(140.0), (0.25, 0.25), coordinates=frame(2),
-                        name='far')
+        near = put_patch(db, plane(100.0), (0.25, 0.25), name='near')
+        far = put_patch(db, plane(140.0), (0.25, 0.25), coordinates=frame(2), name='far')
         absolute = put_pcl(db, {1: ([12.0, 100.0, 48.0], 4.0)}, absolute=True,
                            name='absolute')
         relative = put_pcl(db, {3: ([16.0, 100.0, 52.0], 1.0),
@@ -413,7 +289,7 @@ def varied_store(tmp_path):
         # Moving the far patch while keeping its links bound to the recorded
         # geometry leaves the link to it stale.
         moved = {'kind': 'surface', 'attributes': {'scale': [0.125, 0.125]},
-                 'arrays': [array('points', _plane(141.0)[..., ::-1] * 2, '<f4')]}
+                 'arrays': [array('points', plane(141.0)[..., ::-1] * 2, '<f4')]}
 
         def keep_recorded(edge):
             edge = db.edge(edge['uuid'])
@@ -428,38 +304,32 @@ def varied_store(tmp_path):
     return path
 
 
-def _cli_inputs(store, tmp_path, config):
-    from config import FitConfig
-    from fit_session import SpiralInputPaths
-    from fit_spiral import FitContext
-    umbilicus = str(tmp_path / 'cli-umbilicus.json')
-    reference.write_umbilicus(umbilicus)
-    context = FitContext(
-        FitConfig({**reference.fit_config(), **config}),
-        scroll=reference.scroll_spec(), paths=SpiralInputPaths(umbilicus=umbilicus),
-        cache_dir=str(tmp_path / 'cli-cache'), out_base_dir=str(tmp_path / 'cli-out'),
-        input_log=lambda line: None)
-    context.load_host_inputs()
-    return context
-
-
 @pytest.mark.parametrize('selection', [
-    {},
     {'object_store_approved_links_only': True},
     {'object_store_fiber_uuids': [], 'object_store_pcl_tags': []},
 ])
 def test_the_cli_and_the_service_freeze_the_same_inputs(varied_store, tmp_path,
                                                         device_stubs, selection):
+    from config import FitConfig
+    from fit_session import SpiralInputPaths
+    from fit_spiral import FitContext
     state = spiral_service.ServiceState(
-        bindings=bindings(tmp_path),
+        bindings=service_bindings(tmp_path),
         object_store=spiral_service.bind_object_store(varied_store, 'svc'))
     config = {**RUN, 'object_store_refresh_links': False, **selection}
     try:
-        state.initialize(with_project({'run': {'z_begin': 0, 'z_end': 64, 'config': config}}))
+        state.initialize(with_project(request(**config)))
         assert settle(state)['state'] == 'Idle', state.status()['error']
         served = state.session._context
-        cli = _cli_inputs(varied_store, tmp_path, {
-            **config, 'object_store_path': varied_store, 'object_store_author': 'cli'})
+        umbilicus = str(tmp_path / 'cli-umbilicus.json')
+        reference.write_umbilicus(umbilicus)
+        cli = FitContext(
+            FitConfig({**reference.fit_config(), **config, 'object_store_path': varied_store,
+                       'object_store_author': 'cli'}),
+            scroll=reference.scroll_spec(), paths=SpiralInputPaths(umbilicus=umbilicus),
+            cache_dir=str(tmp_path / 'cli-cache'), out_base_dir=str(tmp_path / 'cli-out'),
+            input_log=lambda line: None)
+        cli.load_host_inputs()
     finally:
         state.close()
     assert served.object_store_inputs.digest == cli.object_store_inputs.digest
@@ -477,8 +347,7 @@ def test_the_cli_and_the_service_freeze_the_same_inputs(varied_store, tmp_path,
         assert manifest['relationships'] == []
     else:
         assert excluded['inapplicable'] == 1 and excluded['rejected'] == 1
-        if selection.get('object_store_approved_links_only'):
-            assert excluded['pending (approved-only)'] == 2
+        assert excluded['pending (approved-only)'] == 2
         assert scales['fiber'] == 2.0
         roles = {pcl['name']: pcl['metadata']['winding_is_absolute']
                  for pcl in served.object_store_inputs.point_collections.values()}

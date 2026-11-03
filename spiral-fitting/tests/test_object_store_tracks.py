@@ -5,7 +5,6 @@ import numpy as np
 import pytest
 
 pytest.importorskip('vc_object_store')
-from vc_object_store import ObjectStore  # noqa: E402
 
 import object_store_inputs as osi  # noqa: E402
 import object_store_reference as reference  # noqa: E402
@@ -13,16 +12,7 @@ from object_store_fixture import (  # noqa: E402
     crossing_edge, frame, put_patch, put_track, write_reference_store)
 
 
-@pytest.fixture()
-def db(tmp_path):
-    with ObjectStore.create(str(tmp_path / 'fit.vcobj'), author='test',
-                            hostname='host') as store:
-        yield store
-
-
-@pytest.fixture(autouse=True)
-def cpu(monkeypatch):
-    monkeypatch.setenv('FIT_SPIRAL_DEVICE', 'cpu')
+pytestmark = pytest.mark.usefixtures('cpu')
 
 
 def _line(start, axis, length):
@@ -120,15 +110,6 @@ def test_track_surface_links_are_not_consumed(db):
     assert snapshot.exclusions == {'unused kind same-surface': 1}
 
 
-def test_the_tracks_toggle_selects_no_track(db):
-    config = reference.fit_config()
-    assert osi.request_from_config(config).selector('track').uuids == ()
-    config['input_use_tracks'] = True
-    assert osi.request_from_config(config).selector('track').is_default
-    config['object_store_track_tags'] = ['curated']
-    assert osi.request_from_config(config).selector('track').tags == ('curated',)
-
-
 def test_a_fit_prepares_store_tracks_with_their_crossings(db, tmp_path):
     """A fit reads the tracks and crossings, builds its crossing graph and
     prepares the crossing index from it, after point exclusion as well."""
@@ -140,7 +121,12 @@ def test_a_fit_prepares_store_tracks_with_their_crossings(db, tmp_path):
     write_reference_store(db, reference.load_reference(), fibers=False)
     _lattice(db, z=40)
     config = reference.fit_config()
+    # The tracks toggle selects them (by tag when given), and none when off.
+    assert osi.request_from_config(config).selector('track').uuids == ()
     config.update(input_use_tracks=True)
+    assert osi.request_from_config(config).selector('track').is_default
+    assert osi.request_from_config({**config, 'object_store_track_tags': ['curated']}
+                                   ).selector('track').tags == ('curated',)
     db.link_tracks_to_tracks()
     snapshot = osi.read_snapshot(db, osi.request_from_config(config))
     inputs = osi.materialize_from_config(db, snapshot, config)

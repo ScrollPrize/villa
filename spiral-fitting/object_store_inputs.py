@@ -26,11 +26,13 @@ materializes and derives the training views exactly as a fit with that
 configuration would, failing on the same validation errors.
 """
 import argparse
+import contextlib
 import dataclasses
 import hashlib
 import json
 import os
 import sys
+import time
 from collections import Counter
 
 import numpy as np
@@ -151,6 +153,14 @@ class InputRequest:
     # false), 'optional' (it filters tracks when present) or 'required' (shell
     # losses, winding-model supervision; a store without one is refused).
     outer_shell: str = 'optional'
+    # The pyramid level of the fit volume the fit works in (fit_volume_level):
+    # a fit voxel is 2^level of the volume's voxels.
+    fit_volume_level: int = 0
+
+    @property
+    def fit_scale(self):
+        """Volume voxels per fit voxel."""
+        return 1 << int(self.fit_volume_level)
 
     def __post_init__(self):
         # An unknown key would otherwise leave its kind unselected-by-default:
@@ -165,7 +175,9 @@ class InputRequest:
 
 @dataclasses.dataclass(frozen=True)
 class ObjectFrame:
-    """One object's frame: stored XYZ = reference-volume XYZ x scale_factor."""
+    """One object's frame: stored XYZ = reference-volume XYZ x scale_factor,
+    and fit XYZ = stored XYZ x to_fit (the fit voxels are those of a pyramid
+    level of the reference volume)."""
     volume_uuid: str
     scale_factor: float
     # stored -> fit multiplier from the store's shared coordinate helper.
@@ -441,13 +453,14 @@ def infer_fit_volume(records, configured=None):
     return next(iter(declared)), 'inferred'
 
 
-def object_frame(meta, volume_uuid):
-    """The object's ObjectFrame in ``volume_uuid``; raises ValueError when its
-    frame is unknown, invalid or in another volume."""
+def object_frame(meta, volume_uuid, fit_scale=1):
+    """The object's ObjectFrame in ``volume_uuid``, whose fit voxels are
+    ``fit_scale`` of its voxels; raises ValueError when its frame is unknown,
+    invalid or in another volume."""
     from vc_object_store import geometry_scale_to_frame, resolve_geometry_coordinates
     coordinates = resolve_geometry_coordinates(meta, volume_uuid)
     return ObjectFrame(volume_uuid, float(coordinates['scale_factor']),
-                       float(geometry_scale_to_frame(meta, volume_uuid)))
+                       float(geometry_scale_to_frame(meta, volume_uuid)) / fit_scale)
 
 
 def _relationship_family(record, kinds):
@@ -538,9 +551,34 @@ def check_position(store, position):
             f'{store.path} reads the positions of {owner}'])
 
 
+def _at_head(store, position):
+    """Whether ``position`` is the head of the plain store whose positions
+    it names: nothing was written after it, so the store's current state is
+    the state at it."""
+    positions = store.store_positions()
+    return (positions is not None and positions['store'] == position.hub
+            and positions['position'] == position.sequence)
+
+
+def _read_at(store, position, current, historical):
+    """A read of the state at ``position``: ``current()`` (a read of the
+    store's current state) when the position is a plain store's head both
+    before and after it, so nothing was written in between; otherwise
+    ``historical()``, which rebuilds the state at the position from the
+    store's history (a hub's, for a hosted replica). The history read
+    scans every revision of every object, tracks included, so it costs
+    minutes on a large store; a service reads its inputs at the head it
+    just pinned, which the current state answers in a selection's time."""
+    check_position(store, position)
+    if _at_head(store, position):
+        result = current()
+        if _at_head(store, position):
+            return result
+    return historical()
+
+
 def _position_records(store, position):
     """{UUID: record} of every object at a position, retired ones included."""
-    check_position(store, position)
     view = store.hub_read_view_at(position.sequence, include_retired=True,
                                   relationships=False, geometry=False)
     return {revision['object_uuid']: revision['record'] for revision in view['objects']}
@@ -549,20 +587,29 @@ def _position_records(store, position):
 def resolve_selection(store, request):
     """{kind: sorted selected UUIDs} of a request's selectors, at the
     request's position when it names one."""
-    records = None if request.position is None else _position_records(store, request.position)
-    return {kind: resolve_selector(store, kind, request.selector(kind), records)
-            for kind in KINDS}
+    def resolve(records=None):
+        return {kind: resolve_selector(store, kind, request.selector(kind), records)
+                for kind in KINDS}
+    if request.position is None:
+        return resolve()
+    return _read_at(store, request.position, resolve,
+                    lambda: resolve(_position_records(store, request.position)))
 
 
 def resolve_outer_shell(store, request):
     """The active surface tagged OUTER_SHELL_TAG at the request's position
     (or now), or None; several are an error."""
-    if request.position is None:
-        shells = [record['uuid'] for record in store.select_objects(
+    def current():
+        return [record['uuid'] for record in store.select_objects(
             object_kind='surface', tag=OUTER_SHELL_TAG, fields=['uuid'])]
+
+    def historical():
+        return [uuid for uuid, record in _position_records(store, request.position).items()
+                if outer_shell(record) and not record.get('retired')]
+    if request.position is None:
+        shells = current()
     else:
-        shells = [uuid for uuid, record in _position_records(store, request.position).items()
-                  if outer_shell(record) and not record.get('retired')]
+        shells = _read_at(store, request.position, current, historical)
     if len(shells) > 1:
         raise ObjectStoreInputError([
             f'{len(shells)} surfaces are tagged {OUTER_SHELL_TAG} ({", ".join(sorted(shells))}); '
@@ -593,8 +640,9 @@ def read_snapshot(store, request, uuids=None):
     if request.position is None:
         view = store.revision_read_view(selection)
     else:
-        check_position(store, request.position)
-        view = store.hub_read_view_at(request.position.sequence, list(selection))
+        view = _read_at(
+            store, request.position, lambda: store.revision_read_view(selection),
+            lambda: store.hub_read_view_at(request.position.sequence, list(selection)))
         missing = sorted(set(selection) - set(view['selection']))
         if missing:
             raise ObjectStoreInputError([
@@ -634,7 +682,7 @@ def read_snapshot(store, request, uuids=None):
     def stored(revision):
         record = revision['record']
         try:
-            frame = object_frame(record['meta'], volume_uuid)
+            frame = object_frame(record['meta'], volume_uuid, request.fit_scale)
         except ValueError as error:
             problems.append(f'{record["kind"]} {record["uuid"]} '
                             f'({record["name"]!r}): {error}')
@@ -1148,8 +1196,8 @@ def materialize_patch_overlaps(store, snapshot, patches, *, pair_spacing,
 
     The store materializes each consumed overlap edge's point pairs from its
     stored pose (``overlap_correspondences``); nothing is matched here. Pairs
-    follow the stored endpoint order, with (row, col) grids and XYZ already in
-    fit-volume voxels, so only the axes are reversed. Each pair becomes one
+    follow the stored endpoint order, with (row, col) grids and XYZ in the
+    fit volume's own voxels, converted to the fit level's. Each pair becomes one
     collection of two points, the pair's point on either patch, with zero
     relative winding: the relative-winding loss then compares exactly that
     correspondence along its own two-node chain. Every pair of an edge
@@ -1180,9 +1228,10 @@ def materialize_patch_overlaps(store, snapshot, patches, *, pair_spacing,
                 'b_object_meta': json.dumps(snapshot.objects[b].meta),
                 'a_geometry_revision': snapshot.objects[a].geometry_revision,
                 'b_geometry_revision': snapshot.objects[b].geometry_revision}
+    fit_scale = snapshot.request.fit_scale
     results = store.overlap_correspondences_at(
         [pinned(rel) for rel in edges.values()], snapshot.volume_uuid,
-        float(pair_spacing), int(max_pairs))
+        float(pair_spacing) * fit_scale, int(max_pairs))
     cid = first_id
     for result in results:
         rel = edges.pop(result['edge_uuid'], None)
@@ -1223,8 +1272,10 @@ def materialize_patch_overlaps(store, snapshot, patches, *, pair_spacing,
             collections[cid] = {
                 'id': cid, 'name': f'overlap {rel.uuid} pair {index}',
                 'points': {
-                    0: _overlap_point(cid, 0, a, pair['a_grid'], pair['a_xyz'], rel.uuid),
-                    1: _overlap_point(cid, 1, b, pair['b_grid'], pair['b_xyz'], rel.uuid)},
+                    0: _overlap_point(cid, 0, a, pair['a_grid'],
+                                      np.asarray(pair['a_xyz']) / fit_scale, rel.uuid),
+                    1: _overlap_point(cid, 1, b, pair['b_grid'],
+                                      np.asarray(pair['b_xyz']) / fit_scale, rel.uuid)},
                 'color': [0.0, 0.0, 0.0], 'source_file': None,
                 'sampling_group': group,
                 'sampling_member_weight': 1.0 / len(kept),
@@ -1235,7 +1286,7 @@ def materialize_patch_overlaps(store, snapshot, patches, *, pair_spacing,
                     'resident_collection_id': cid,
                     'edge_uuid': rel.uuid,
                     'edge_revision': rel.revision,
-                    'pair_distance': float(pair['distance']),
+                    'pair_distance': float(pair['distance']) / fit_scale,
                 },
             }
             cid += 1
@@ -1393,13 +1444,14 @@ def materialize_tracks(store, snapshot, *, z_begin, z_end):
 
 def materialize(store, snapshot, *, z_begin, z_end, z_margin,
                 erode_cells_default, fiber_min_point_spacing=0.0,
-                overlap_pair_spacing=8.0, overlap_max_pairs=16):
+                overlap_pair_spacing=8.0, overlap_max_pairs=16, patch_overlaps=True):
     """Every runtime input of a frozen snapshot.
 
     Fibers are decimated to ``fiber_min_point_spacing`` (the fitter's
     pcl_fiber_min_point_spacing); patch overlaps yield at most
     ``overlap_max_pairs`` pairs ``overlap_pair_spacing`` voxels apart.
-    Resident ids number PCLs, then fibers, then overlap pairs.
+    Resident ids number PCLs, then fibers, then overlap pairs;
+    ``patch_overlaps`` False (input_use_patch_overlaps off) makes none.
     """
     patches, counts = materialize_patches(
         store, snapshot, z_begin=z_begin, z_end=z_end, z_margin=z_margin,
@@ -1412,16 +1464,21 @@ def materialize(store, snapshot, *, z_begin, z_end, z_margin,
         store, snapshot, patches, min_point_spacing=fiber_min_point_spacing,
         first_id=len(point_collections), dropped=dropped)
     counts.update(fiber_counts)
-    patch_overlaps, overlap_counts = materialize_patch_overlaps(
-        store, snapshot, patches, pair_spacing=overlap_pair_spacing,
-        max_pairs=overlap_max_pairs,
-        first_id=len(point_collections) + len(fibers), dropped=dropped)
-    counts.update(overlap_counts)
+    if patch_overlaps:
+        overlaps, overlap_counts = materialize_patch_overlaps(
+            store, snapshot, patches, pair_spacing=overlap_pair_spacing,
+            max_pairs=overlap_max_pairs,
+            first_id=len(point_collections) + len(fibers), dropped=dropped)
+        counts.update(overlap_counts)
+    else:
+        overlaps = {}
+        counts['patch overlaps unused (input_use_patch_overlaps off)'] = len(
+            snapshot.relationships_of('patch_overlap'))
     tracks, track_counts = materialize_tracks(store, snapshot, z_begin=z_begin, z_end=z_end)
     counts.update(track_counts)
     return FitInputs(snapshot, patches, point_collections, fibers,
                      fiber_links, counts, dropped_attachments=dropped,
-                     patch_overlaps=patch_overlaps,
+                     patch_overlaps=overlaps,
                      outer_shell=materialize_outer_shell(store, snapshot),
                      tracks=tracks)
 
@@ -1434,7 +1491,8 @@ def materialize_from_config(store, snapshot, config):
         erode_cells_default=config['patch_erode_patches'],
         fiber_min_point_spacing=config['pcl_fiber_min_point_spacing'],
         overlap_pair_spacing=config['pcl_patch_overlap_pair_spacing'],
-        overlap_max_pairs=config['pcl_patch_overlap_max_pairs'])
+        overlap_max_pairs=config['pcl_patch_overlap_max_pairs'],
+        patch_overlaps=bool(config['input_use_patch_overlaps']))
 
 
 @dataclasses.dataclass
@@ -1680,7 +1738,8 @@ def request_from_config(config):
              else 'optional' if input_source_enabled(config, 'outer_shell') else 'off')
     return InputRequest(selectors, config['fit_volume_uuid'],
                         bool(config['object_store_approved_links_only']),
-                        outer_shell=shell)
+                        outer_shell=shell,
+                        fit_volume_level=int(config['fit_volume_level']))
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1758,12 +1817,29 @@ DETECTORS = (
 )
 
 
+# Detectors that link incrementally (refresh_links ``new``), with the object
+# kinds whose new objects each examines.
+INCREMENTAL_KINDS = {
+    'pcl_patch': ('point_collection', 'surface'),
+    'fiber_patch': ('fiber', 'surface'),
+    'patch_overlap': ('surface',),
+}
+
+
 @dataclasses.dataclass
 class RefreshOutcome:
     detector: str
     skipped: str = None
     report: dict = None
     error: str = None
+    # 'full' or 'incremental over N new object(s)'; None when skipped.
+    mode: str = None
+    seconds: float = None
+
+    def _timing(self):
+        parts = [part for part in (self.mode, None if self.seconds is None
+                                   else f'{self.seconds:.1f} s') if part]
+        return f' [{", ".join(parts)}]' if parts else ''
 
     @property
     def failed(self):
@@ -1777,7 +1853,7 @@ class RefreshOutcome:
         if self.skipped is not None:
             return [f'link refresh {self.detector}: skipped ({self.skipped})']
         if self.error is not None:
-            return [f'link refresh {self.detector}: FAILED: {self.error}']
+            return [f'link refresh {self.detector}: FAILED: {self.error}{self._timing()}']
         report = self.report
         lines = [
             f'link refresh {self.detector}: {report["edges_created"]} created, '
@@ -1785,7 +1861,7 @@ class RefreshOutcome:
             f'{report["edges_skipped_existing"]} unchanged, '
             f'{report["stale_removed"]} stale removed '
             f'({"committed" if report["committed"] else "nothing committed"})'
-            + ('; FAILED' if report['failed'] else '')]
+            + ('; FAILED' if report['failed'] else '') + self._timing()]
         failures = [issue for issue in report['issues'] if issue['severity'] == 'failure']
         for issue in failures:
             objects = issue['object_uuids']
@@ -1800,45 +1876,98 @@ class RefreshOutcome:
         return lines
 
 
-def refresh_links(store, snapshot, config, normal_source, cache_directory=None):
+def _detector_progress(progress, detector):
+    """A detector's progress callback publishing through a ProgressReporter
+    (spiral_progress): the detector is the stage, its own stage and item the
+    detail; a total of 0 is unknown."""
+    if progress is None:
+        return None
+    progress.begin('linking', f'link refresh {detector}')
+
+    def report(stage, completed, total, detail):
+        progress.update(completed, total_steps=total,
+                        detail=f'{stage}: {detail}' if detail else stage)
+    return report
+
+
+def refresh_links(store, snapshot, config, normal_source, cache_directory=None, new=None,
+                  progress=None, log=None):
     """Run each automatic detector over the snapshot's objects.
 
     A detector runs only when every object kind it needs is selected, with
     exactly the selected UUIDs, so its writes and stale-link removal stay
     within the selection. Exceptions and reported failures are collected
     for every detector; none stops the others.
+
+    ``new`` ({kind: UUIDs}) makes the run incremental: each detector that
+    supports it examines only pairs with a new object of its kinds (the
+    store's new_uuids), and is skipped when none is new; track crossings
+    are skipped (an incremental refresh requires unchanged tracks).
+    ``progress`` (a spiral_progress.ProgressReporter) receives each
+    detector's progress, and ``log`` a line as each one starts; the
+    outcomes' report lines (refresh_report) carry each mode and duration.
     """
     selected = {kind: [obj.uuid for obj in snapshot.objects_of(kind)] for kind in KINDS}
     volume = snapshot.volume_uuid
+
+    def fresh(detector):
+        return sorted(uuid for kind in INCREMENTAL_KINDS[detector] for uuid in new.get(kind, ()))
+
+    def reporting(detector):
+        callback = _detector_progress(progress, detector)
+        return {'progress': callback} if callback else {}
+
+    def options(detector):
+        return {**reporting(detector), **({'new_uuids': fresh(detector)} if new is not None else {})}
     run = {
         'pcl_patch': lambda: store.link_point_collections_to_surfaces(
             volume_uuid=volume, collection_uuids=selected['point_collection'],
             surface_uuids=selected['surface'],
             tolerance=float(config['pcl_link_distance_tolerance']),
             window_points=int(config['pcl_link_window_points']),
-            window_min_points=int(config['pcl_link_window_min_points'])),
+            window_min_points=int(config['pcl_link_window_min_points']),
+            **options('pcl_patch')),
         'fiber_patch': lambda: store.link_fibers_to_surfaces(
             normal_source.ct_volume, volume_uuid=volume,
             fiber_uuids=selected['fiber'], surface_uuids=selected['surface'],
             **dict(normal_source.parameters),
-            **({'cache_directory': cache_directory} if cache_directory else {})),
+            **({'cache_directory': cache_directory} if cache_directory else {}),
+            **options('fiber_patch')),
         'patch_overlap': lambda: store.link_surface_overlaps(
-            volume_uuid=volume, surface_uuids=selected['surface']),
+            volume_uuid=volume, surface_uuids=selected['surface'], **options('patch_overlap')),
         # Crossings are exact shared voxels of the stored tracks, found with
         # the store's default angle, tangent and clustering parameters.
         'track_crossing': lambda: store.link_tracks_to_tracks(
-            track_uuids=selected['track'], workers=os.cpu_count() or 1),
+            track_uuids=selected['track'], workers=os.cpu_count() or 1,
+            **reporting('track_crossing')),
     }
     outcomes = []
     for detector, kinds in DETECTORS:
         empty = [KIND_LABELS[kind] for kind in kinds if not selected[kind]]
         if empty:
-            outcomes.append(RefreshOutcome(detector, skipped='no selected ' + ' or '.join(empty)))
-            continue
-        try:
-            outcomes.append(RefreshOutcome(detector, report=run[detector]()))
-        except Exception as error:  # noqa: BLE001 - every failure is reported
-            outcomes.append(RefreshOutcome(detector, error=f'{type(error).__name__}: {error}'))
+            outcome = RefreshOutcome(detector, skipped='no selected ' + ' or '.join(empty))
+        elif detector == 'patch_overlap' and not config['input_use_patch_overlaps']:
+            outcome = RefreshOutcome(detector, skipped='input_use_patch_overlaps is off')
+        elif new is not None and detector not in INCREMENTAL_KINDS:
+            outcome = RefreshOutcome(detector, skipped='incremental refresh: its inputs are unchanged')
+        elif new is not None and not fresh(detector):
+            outcome = RefreshOutcome(detector, skipped='incremental refresh: no new ' + ' or '.join(
+                KIND_LABELS[kind] for kind in INCREMENTAL_KINDS[detector]))
+        else:
+            mode = ('full' if new is None else
+                    f'incremental over {len(fresh(detector))} new object(s)')
+            if log is not None:
+                log(f'link refresh {detector}: running ({mode})')
+            started = time.monotonic()
+            try:
+                outcome = RefreshOutcome(detector, report=run[detector](), mode=mode)
+            except Exception as error:  # noqa: BLE001 - every failure is reported
+                outcome = RefreshOutcome(detector, error=f'{type(error).__name__}: {error}',
+                                         mode=mode)
+            outcome.seconds = time.monotonic() - started
+            if progress is not None:
+                progress.clear()
+        outcomes.append(outcome)
     return outcomes
 
 
@@ -1857,20 +1986,268 @@ def refresh_report(outcomes):
     return lines, problems
 
 
-def _refresh(store, snapshot, config, lasagna, cache_directory, log):
-    """Run the detectors over a snapshot's selection; returns the report
-    lines and problems (refresh_report)."""
+# ---------------------------------------------------------------------------
+# Link marker: skip the detectors when the links are current
+# ---------------------------------------------------------------------------
+
+LINK_MARKER_VERSION = 1
+# Edge kinds the detectors write (refresh_links runs them with their defaults):
+# any change to one since a refresh (a manual link, an approval, a deletion)
+# forces the next one to run in full.
+DETECTOR_EDGE_KINDS = frozenset({'point-surface', 'same-surface', 'crossing'})
+# Records that change how detectors map stored coordinates into the volume.
+FRAME_RECORD_KINDS = frozenset({'volume_transform', 'volume_transform_choice'})
+
+
+def link_marker_key_parts(volume_uuid, config, normal_source):
+    """What links depend on outside the store: the fit volume, the
+    detector parameters and normal source (link_refresh_provenance), the
+    store library's detector versions and which detectors run. A marker
+    records them with their digest (``key``), so a mismatch names what
+    changed."""
+    from vc_object_store import detector_versions
+    return {
+        'volume_uuid': volume_uuid,
+        'link_refresh': link_refresh_provenance(config, normal_source),
+        'detectors': detector_versions(),
+        # Off leaves the overlap links unrefreshed: turning it on relinks.
+        'patch_overlaps': bool(config['input_use_patch_overlaps']),
+    }
+
+
+def _flatten(value, prefix=''):
+    if isinstance(value, dict) and value:
+        return {path: leaf for key, item in value.items()
+                for path, leaf in _flatten(item, f'{prefix}{key}.').items()}
+    return {prefix[:-1]: value}
+
+
+_UNRECORDED = object()
+
+
+def key_changes(recorded, current, limit=3):
+    """What differs between two link_marker_key_parts, as ``path: old -> new``
+    (at most ``limit``, then a count)."""
+    old, new = _flatten(recorded), _flatten(current)
+
+    def shown(value):
+        return 'not recorded' if value is _UNRECORDED else repr(value)
+    changes = [f'{path}: {shown(old.get(path, _UNRECORDED))} -> {shown(new.get(path, _UNRECORDED))}'
+               for path in sorted(set(old) | set(new))
+               if old.get(path, _UNRECORDED) != new.get(path, _UNRECORDED)]
+    if len(changes) > limit:
+        changes = changes[:limit] + [f'{len(changes) - limit} more']
+    return changes
+
+
+def _uuids_sha256(uuids):
+    digest = hashlib.sha256()
+    for uuid in uuids:
+        digest.update(uuid.encode())
+        digest.update(b'\n')
+    return digest.hexdigest()
+
+
+def link_marker_selection(snapshot):
+    """The snapshot's selection as a marker records it: per kind the count
+    and digest of the sorted UUIDs, and the UUIDs themselves except for
+    tracks (which only the digest and selector describe)."""
+    selection = {}
+    for kind in KINDS:
+        uuids = sorted(obj.uuid for obj in snapshot.objects_of(kind))
+        entry = {'count': len(uuids), 'sha256': _uuids_sha256(uuids)}
+        if kind == 'track':
+            entry['selector'] = snapshot.request.selector(kind).provenance()
+        else:
+            entry['uuids'] = uuids
+        selection[kind] = entry
+    return selection
+
+
+@dataclasses.dataclass(frozen=True)
+class LinkState:
+    """The store state a refresh decision is made at: ``owner`` the
+    identity its positions belong to (None for a plain store without
+    positions), ``head`` the position the snapshot was read at, and
+    ``journal(after)`` the journal entries after a position up to ``head``
+    (the hub's on a hosted replica)."""
+    owner: str
+    head: int
+    journal: object
+
+
+@dataclasses.dataclass(frozen=True)
+class LinkPlan:
+    """How a refresh runs: 'skip' (the links are current), 'incremental'
+    (link ``new``, {kind: UUIDs}) or 'full', and why."""
+    mode: str
+    reason: str
+    new: dict = None
+
+    def line(self):
+        return f'link refresh: {self.mode}: {self.reason}'
+
+
+def plan_link_refresh(marker, state, key_parts, selection, selected, *, incremental):
+    """Decide how to refresh (LinkPlan) from the store's link marker.
+
+    Skip when the marker is this store's, was written by a full refresh
+    (any refresh, for an input update: ``incremental``) with the same key
+    (``key_parts``, link_marker_key_parts), the current ``selection`` is the marker's or a subset of it
+    (tracks: the same), and every journal entry since its position is for
+    an object outside ``selected`` (the current selection's UUIDs) and no
+    detector relationship or volume registration. With ``incremental``,
+    objects selected since the marker (created or newly selected) are
+    linked incrementally, provided the journal names no other selected
+    object. Anything else refreshes in full.
+    """
+    def full(reason):
+        return LinkPlan('full', reason)
+    if marker is None:
+        return full('the store has no link marker')
+    if marker.get('version') != LINK_MARKER_VERSION:
+        return full('the link marker has another format')
+    if marker.get('owner') != state.owner:
+        return full('the link marker describes other positions')
+    if marker.get('key') != content_sha256(key_parts):
+        recorded = marker.get('key_parts')
+        if recorded is None:
+            return full('the link inputs changed (the marker records no details)')
+        return full('the link inputs changed: ' + '; '.join(key_changes(recorded, key_parts)))
+    if not marker.get('exact') and not incremental:
+        return full('the last refresh was incremental')
+    position = int(marker['position'])
+    if position > state.head:
+        return full(f'the link marker is at position {position}, after the head {state.head}')
+    recorded = marker['selection']
+    if selection['track']['sha256'] != recorded['track']['sha256']:
+        return full('the track selection changed')
+    new = {}
+    for kind in KINDS:
+        if kind == 'track':
+            continue
+        added = sorted(set(selection[kind]['uuids']) - set(recorded[kind]['uuids']))
+        if added and not incremental:
+            return full(f'{len(added)} {KIND_LABELS[kind]} selected since position {position}')
+        if added:
+            new[kind] = added
+    fresh = {uuid for uuids in new.values() for uuid in uuids}
+    for entry in state.journal(position):
+        if entry['kind'] in DETECTOR_EDGE_KINDS:
+            return full(f'a {entry["kind"]} relationship changed at position {entry["seq"]}')
+        if entry['kind'] in FRAME_RECORD_KINDS:
+            return full(f'a volume registration changed at position {entry["seq"]}')
+        if entry['record_uuid'] in selected and entry['record_uuid'] not in fresh:
+            return full(f'selected {entry["kind"]} {entry["record_uuid"]} changed at position '
+                        f'{entry["seq"]}')
+    if fresh:
+        counts = ', '.join(f'{len(uuids)} {KIND_LABELS[kind]}' for kind, uuids in new.items())
+        return LinkPlan('incremental', f'new since position {position}: {counts}', new)
+    return LinkPlan('skip', f'unchanged since position {position}')
+
+
+@dataclasses.dataclass
+class LinkResult:
+    """A refresh's report ``lines`` and ``problems`` (refresh_report), its
+    LinkPlan, and the marker to record once its links are committed at a
+    position (``marker(position)``; None after a skip, which records none)."""
+    lines: list
+    problems: list
+    plan: LinkPlan
+    marker: object = None
+
+
+def _refresh(store, snapshot, config, lasagna, cache_directory, log, *, state=None,
+             incremental=False, progress=None):
+    """Refresh the links of a snapshot's selection (LinkResult).
+
+    With a ``state`` (LinkState of the store the snapshot was read from),
+    the store's link marker decides whether the detectors run at all
+    (plan_link_refresh; ``incremental`` for an input update);
+    object_store_full_link_refresh forces a full refresh. The caller
+    records ``result.marker(position)`` once the links are committed (and
+    published) at a position."""
     normal = fiber_normal_source(config, lasagna, snapshot.volume_uuid)
     log(normal.describe())
     if normal.note:
         log(normal.note)
+    selection = link_marker_selection(snapshot)
+    key_parts = link_marker_key_parts(snapshot.volume_uuid, config, normal)
+    if state is None:
+        plan = LinkPlan('full', 'the store records no link state')
+    elif config.get('object_store_full_link_refresh'):
+        plan = LinkPlan('full', 'object_store_full_link_refresh is set')
+    else:
+        plan = plan_link_refresh(store.link_marker(), state, key_parts, selection, snapshot.objects,
+                                 incremental=incremental)
+    log(plan.line())  # as decided, before any detector runs
+    if plan.mode == 'skip':
+        return LinkResult([f'link refresh: skipped every detector ({plan.reason})'], [], plan)
     if (normal.kind == 'none' and snapshot.objects_of('fiber')
             and snapshot.objects_of('surface')):
         log('WARNING: fiber-patch links are refreshed centerline-only: the fit '
             'loads no lasagna normals (input_use_normals with a Lasagna dataset '
             'whose normals pack is in the cache) and object_store_normal_ct_path '
             'is unset')
-    return refresh_report(refresh_links(store, snapshot, config, normal, cache_directory))
+    started = time.monotonic()
+    lines, problems = refresh_report(refresh_links(
+        store, snapshot, config, normal, cache_directory,
+        new=plan.new if plan.mode == 'incremental' else None, progress=progress, log=log))
+    lines = lines + [f'link refresh: {plan.mode} refresh ({plan.reason}) took '
+                     f'{time.monotonic() - started:.1f} s']
+    owner = None if state is None else state.owner
+
+    def marker(position):
+        return {'version': LINK_MARKER_VERSION, 'owner': owner, 'position': int(position),
+                'key': content_sha256(key_parts), 'key_parts': key_parts,
+                'exact': plan.mode == 'full', 'selection': selection}
+    return LinkResult(lines, problems, plan, marker)
+
+
+def _record_marker(store, result, position, lines):
+    """Record a refresh's marker at ``position``; a failure only loses the
+    next refresh's skip, so it is reported, not raised."""
+    if result.marker is None:
+        return
+    try:
+        store.set_link_marker(result.marker(position))
+    except Exception as exc:  # noqa: BLE001 - the links themselves are committed
+        lines.append(f'the link marker could not be recorded ({type(exc).__name__}: {exc}); '
+                     'the next refresh runs in full')
+
+
+@contextlib.contextmanager
+def reading_stage(progress, stage, detail=None):
+    """A store read as a progress stage of the input preparation:
+    ``progress`` (a spiral_progress.ProgressReporter, or None) shows
+    ``stage`` while the block runs. The reads report no steps; the stage's
+    elapsed time shows they are still running."""
+    if progress is None:
+        yield
+        return
+    progress.begin('preparing_inputs', stage, detail=detail)
+    try:
+        yield
+    finally:
+        progress.clear()
+
+
+def resolve_pinned(store, request, position, progress=None):
+    """resolve_selection at a pinned position, as a progress stage."""
+    with reading_stage(progress, f'Reading the inputs at position {position.sequence}',
+                       'selection'):
+        return resolve_selection(store, dataclasses.replace(request, position=position))
+
+
+@contextlib.contextmanager
+def _console_progress():
+    """Detector progress on stderr, for a refresh outside the service."""
+    from spiral_progress import ProgressReporter
+    reporter = ProgressReporter(stream=sys.stderr)
+    try:
+        yield reporter
+    finally:
+        reporter.close()
 
 
 def _position_owner(path):
@@ -1908,10 +2285,11 @@ def _startup_phase(config, request, lasagna, cache_directory, log, minimum_posit
         if not author:
             raise ObjectStoreInputError([
                 f'object_store_author is required to link a position of the store {path}'])
-        with ObjectStore.open(path, author=author) as store:
+        with ObjectStore.open(path, author=author) as store, _console_progress() as progress:
             prepared = prepare_position(store, config, request, lasagna=lasagna,
                                         minimum=minimum_position,
-                                        cache_directory=cache_directory, log=log)
+                                        cache_directory=cache_directory, log=log,
+                                        progress=progress)
         return prepared.uuids, prepared.lines, prepared.position
     if minimum_position is not None:
         raise ObjectStoreInputError([
@@ -1922,14 +2300,29 @@ def _startup_phase(config, request, lasagna, cache_directory, log, minimum_posit
             'object_store_author is required to refresh links '
             '(or set object_store_refresh_links false)'])
     options = {'author': author} if refresh else {'read_only': True}
-    with ObjectStore.open(path, **options) as store:
-        uuids = resolve_selection(store, request)
-        snapshot = read_snapshot(store, request, uuids)
+    with ObjectStore.open(path, **options) as store, _console_progress() as progress:
+        # The head before the selection is read: a write in between shows
+        # in the journal after it and keeps the marker from being recorded.
+        head = store.journal_position()
+        with reading_stage(progress, 'Reading the selected inputs'):
+            uuids = resolve_selection(store, request)
+            snapshot = read_snapshot(store, request, uuids)
         if not refresh:
             return uuids, ['link refresh: off; reading the store\'s current relationships'], None
-        lines, problems = _refresh(store, snapshot, config, lasagna, cache_directory, log)
-    if problems:
-        raise LinkRefreshError(problems)
+        state = LinkState(None, head, lambda after: [
+            entry for entry in store.journal_since(after) if entry['seq'] <= head])
+        result = _refresh(store, snapshot, config, lasagna, cache_directory, log, state=state,
+                          progress=progress)
+        lines = result.lines
+        if not result.problems:
+            others = sorted({entry['author'] for entry in store.journal_since(head)
+                             if entry['author'] != author})
+            if others:
+                lines.append(f'{", ".join(others)} wrote while linking; no link marker recorded')
+            else:
+                _record_marker(store, result, store.journal_position(), lines)
+    if result.problems:
+        raise LinkRefreshError(result.problems)
     return uuids, lines, None
 
 
@@ -1950,12 +2343,14 @@ class PreparedPosition:
     lines: list
 
 
-def fit_volume_at(store, request, prepared):
+def fit_volume_at(store, request, prepared, progress=None):
     """The fit volume of a prepared position: the volume ``read_snapshot``
     infers (or checks a configured one against) for the selection pinned
     there, so it is the one the fit will read."""
     pinned = dataclasses.replace(request, position=prepared.position)
-    return read_snapshot(store, pinned, prepared.uuids).volume_uuid
+    with reading_stage(progress, f'Reading the inputs at position {prepared.position.sequence}',
+                       'fit volume'):
+        return read_snapshot(store, pinned, prepared.uuids).volume_uuid
 
 
 def _discard_unpublished(store):
@@ -1987,7 +2382,8 @@ def _conditional_push(store, head):
 
 
 def prepare_position(store, config, request, *, lasagna=None, minimum=None,
-                     cache_directory=None, log=print, attempts=4):
+                     cache_directory=None, log=print, attempts=4, incremental=False,
+                     progress=None):
     """Link, then pin: the update loop of a hosted replica ``store`` (opened
     read-write as the service's author; it must hold no other edits than
     its own committed fits, which a publication carries to the hub too).
@@ -2002,6 +2398,12 @@ def prepare_position(store, config, request, *, lasagna=None, minimum=None,
     discarding the links), and leaves the caller's active inputs alone.
     With object_store_refresh_links off, the pulled head is the position.
 
+    The store's link marker lets the refresh skip the detectors when the
+    links at the head are current, and, with ``incremental`` (an input
+    update), link only objects selected since it (_refresh); the marker is
+    recorded only once the links are published. ``progress`` (a
+    spiral_progress.ProgressReporter) receives the detectors' progress.
+
     A plain store that records positions (shared with the client's
     processes on one machine) is linked in place instead
     (_prepare_shared_position).
@@ -2013,7 +2415,8 @@ def prepare_position(store, config, request, *, lasagna=None, minimum=None,
                 f'object store {store.path} records no positions (neither a hosted '
                 'replica nor a store a service shares)'])
         return _prepare_shared_position(store, config, request, lasagna=lasagna, minimum=minimum,
-                                        cache_directory=cache_directory, log=log, attempts=attempts)
+                                        cache_directory=cache_directory, log=log, attempts=attempts,
+                                        incremental=incremental, progress=progress)
     hub = status['hub_replica']
     refresh = bool(config['object_store_refresh_links'])
     current = dataclasses.replace(request, position=None)
@@ -2035,8 +2438,12 @@ def prepare_position(store, config, request, *, lasagna=None, minimum=None,
         if not refresh:
             position, lines = head, [f'link refresh: off; pinning hub position {head}']
             break
-        snapshot = read_snapshot(store, current)
-        lines, problems = _refresh(store, snapshot, config, lasagna, cache_directory, log)
+        with reading_stage(progress, 'Reading the selected inputs', f'hub position {head}'):
+            snapshot = read_snapshot(store, current)
+        state = LinkState(hub, head, lambda after, head=head: store.hub_journal(after, head))
+        result = _refresh(store, snapshot, config, lasagna, cache_directory, log, state=state,
+                          incremental=incremental, progress=progress)
+        lines, problems = result.lines, result.problems
         if problems:
             raise LinkRefreshError(notes + problems + ['no links were published']
                                    + _discard_unpublished(store))
@@ -2061,6 +2468,7 @@ def prepare_position(store, config, request, *, lasagna=None, minimum=None,
             continue
         position = pushed['published_position']
         lines = lines + [f'links published at hub position {position} (linked at {head})']
+        _record_marker(store, result, position, lines)
         break
     else:
         raise PositionError(notes + [
@@ -2071,12 +2479,12 @@ def prepare_position(store, config, request, *, lasagna=None, minimum=None,
         lines.append(f'position {position} includes hub commits after the requested {minimum}')
     return PreparedPosition(
         position=pinned, head=head, minimum=minimum, attempts=attempt,
-        uuids=resolve_selection(store, dataclasses.replace(request, position=pinned)),
+        uuids=resolve_pinned(store, request, pinned, progress),
         lines=notes + lines)
 
 
 def _prepare_shared_position(store, config, request, *, lasagna, minimum, cache_directory,
-                             log, attempts):
+                             log, attempts, incremental=False, progress=None):
     """prepare_position on a plain store others write as well (VC3D, on
     the same machine). Detectors commit straight into the store, so there
     is no conditional push: read the head H, link over the selection, and
@@ -2099,8 +2507,13 @@ def _prepare_shared_position(store, config, request, *, lasagna, minimum, cache_
         if not refresh:
             position, lines = head, [f'link refresh: off; pinning position {head}']
             break
-        snapshot = read_snapshot(store, current)
-        lines, problems = _refresh(store, snapshot, config, lasagna, cache_directory, log)
+        with reading_stage(progress, 'Reading the selected inputs', f'position {head}'):
+            snapshot = read_snapshot(store, current)
+        state = LinkState(owner, head, lambda after, head=head: [
+            entry for entry in store.journal_since(after) if entry['seq'] <= head])
+        result = _refresh(store, snapshot, config, lasagna, cache_directory, log, state=state,
+                          incremental=incremental, progress=progress)
+        lines, problems = result.lines, result.problems
         if problems:
             raise LinkRefreshError(notes + problems + [
                 'links the detectors committed stay as pending output; the next refresh '
@@ -2114,6 +2527,7 @@ def _prepare_shared_position(store, config, request, *, lasagna, minimum, cache_
             continue
         position = after
         lines = lines + [f'links written at position {position} (linked at {head})']
+        _record_marker(store, result, position, lines)
         break
     else:
         raise PositionError(notes + [
@@ -2123,7 +2537,7 @@ def _prepare_shared_position(store, config, request, *, lasagna, minimum, cache_
         lines.append(f'position {position} includes commits after the requested {minimum}')
     return PreparedPosition(
         position=pinned, head=head, minimum=minimum, attempts=attempt,
-        uuids=resolve_selection(store, dataclasses.replace(request, position=pinned)),
+        uuids=resolve_pinned(store, request, pinned, progress),
         lines=notes + lines)
 
 
@@ -2152,7 +2566,7 @@ MATERIALIZATION_KEYS = (
     'pcl_fiber_min_point_spacing', 'pcl_patch_overlap_pair_spacing',
     'pcl_patch_overlap_max_pairs', 'pcl_unattached_pcl_min_point_spacing',
     'pcl_use_fiber_links', 'pcl_vertical_fiber_min_z_fraction',
-    'pcl_vertical_fiber_min_auto_certainty',
+    'pcl_vertical_fiber_min_auto_certainty', 'fit_volume_level', 'input_use_patch_overlaps',
 )
 
 

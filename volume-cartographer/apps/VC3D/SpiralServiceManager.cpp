@@ -1095,11 +1095,48 @@ void SpiralServiceManager::withProject(QJsonObject body, std::function<void(QJso
         return;
     }
     const auto cached = vc3d::spiral::withCachedStores(*lasagna);
-    const QString spiralCache = _advertisedBindings.value(QStringLiteral("bindings")).toObject()
-                                    .value(QStringLiteral("cache_directory")).toString();
-    const auto groups = cached.error.empty()
-        ? vc3d::spiral::lasagnaGroupsToCache(*lasagna, spiralCache.toStdString())
-        : std::vector<vc::lasagna::LasagnaChannelGroup>{};
+    if (!cached.error.empty()) {
+        finish(body, cached);
+        return;
+    }
+    // Only the arrays of the packs this build reads: the service resolves
+    // the request's configuration (a checkpoint's included) and names them.
+    // Without an answer (an older service, a request it refuses), every
+    // missing pack's arrays are cached as before.
+    QJsonObject query = body;
+    try {
+        query[QStringLiteral("project")] = _projectSource(lasagna);
+    } catch (const std::exception& error) {
+        failed(tr("The project's Spiral inputs could not be read: %1").arg(QString::fromUtf8(error.what())));
+        return;
+    }
+    const quint64 queried = _connectionGeneration;
+    auto cacheFor = [this, queried, body, lasagna = *lasagna, cached, finish,
+                     failed](const std::optional<std::set<std::string>>& kinds) {
+        if (queried != _connectionGeneration) return;
+        const QString spiralCache = _advertisedBindings.value(QStringLiteral("bindings")).toObject()
+                                        .value(QStringLiteral("cache_directory")).toString();
+        cacheLasagnaThenSend(body, lasagna, cached,
+                             vc3d::spiral::lasagnaGroupsToCache(lasagna, spiralCache.toStdString(), kinds),
+                             finish, failed);
+    };
+    post(QStringLiteral("/session/lasagna-packs"), query, Timeout::Command,
+         [cacheFor](const QJsonObject& response) {
+             std::set<std::string> kinds;
+             for (const auto& kind : response.value(QStringLiteral("packs")).toArray())
+                 kinds.insert(kind.toString().toStdString());
+             cacheFor(kinds);
+         },
+         [cacheFor](const QString&) { cacheFor(std::nullopt); });
+}
+
+void SpiralServiceManager::cacheLasagnaThenSend(
+    QJsonObject body, const vc3d::spiral::ProjectLasagna& lasagna,
+    const vc3d::spiral::ProjectLasagna& cached,
+    std::vector<vc::lasagna::LasagnaChannelGroup> groups,
+    std::function<void(QJsonObject, const std::optional<vc3d::spiral::ProjectLasagna>&)> finish,
+    std::function<void(const QString&)> failed)
+{
     if (groups.empty()) {
         finish(body, cached);
         return;
@@ -1111,7 +1148,7 @@ void SpiralServiceManager::withProject(QJsonObject body, std::function<void(QJso
     auto cancel = std::make_shared<std::atomic<bool>>(false);
     _lasagnaCacheCancel = cancel;
     emit logMessage(tr("Caching the remote Lasagna arrays the local service packs from (%1)…")
-                        .arg(QString::fromStdString(lasagna->location)));
+                        .arg(QString::fromStdString(lasagna.location)));
     const quint64 generation = _connectionGeneration;
     auto* watcher = new QFutureWatcher<QString>(this);
     auto lastLogged = std::make_shared<int>(-1);
@@ -1655,7 +1692,15 @@ void SpiralServiceManager::handleReply(QNetworkReply* reply, quint64 generation,
     if (generation != _connectionGeneration) return;
     if (networkError != QNetworkReply::NoError && http == 0) {
         // Unreachable / timeout: distinguish from service-reported errors.
-        const QString message = tr("Spiral service is unreachable: %1").arg(networkErrorString);
+        // Nothing here aborts a reply, so a cancelled one hit its transfer
+        // timeout: the service is up but busy, which "unreachable" misstates.
+        const int timeoutMs = reply->request().transferTimeout();
+        const QString message =
+            networkError == QNetworkReply::OperationCanceledError && timeoutMs > 0
+                ? tr("Spiral service did not answer %1 within %2 s")
+                      .arg(reply->url().path())
+                      .arg(timeoutMs / 1000)
+                : tr("Spiral service is unreachable: %1").arg(networkErrorString);
         if (detailedFailure) detailedFailure(message, {});
         else if (failure) failure(message);
         else emit errorOccurred(message);

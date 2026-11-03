@@ -21,6 +21,7 @@ import json
 from pathlib import Path
 import sys
 import threading
+import time
 from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -28,12 +29,70 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import spiral_runtime  # noqa: E402
 import spiral_service  # noqa: E402
 from config import Config  # noqa: E402
+from fit_session import SessionState  # noqa: E402
 from lasagna_publish import PublishedPreview  # noqa: E402
 from published_generation import MODEL_STATE, publish  # noqa: E402
-from service_lifecycle_transcript import FakeRuntime  # noqa: E402
 
 NO_DENSE = {'dense_spacing_mode': 'grad_mag', 'loss_weight_dense_spacing': 0,
             'loss_weight_dense_normals': 0, 'loss_weight_shell_outer': 0}
+
+
+class FakeRuntime:
+    """Just enough of InteractiveFitSession for the service's lifecycle."""
+
+    def __init__(self, *args, **kwargs):
+        self.state = SessionState.Idle
+        self.completed = 0
+        self.target = 0
+        self.lock = threading.Lock()
+
+    def status(self):
+        with self.lock:
+            return {
+                "state": self.state, "phase": str(self.state),
+                "current_iteration": self.completed,
+                "target_iteration": self.target, "latest_metrics": {},
+                "warnings": [], "error": None, "preview_manifest_path": None,
+                "preview_generation": 0, "progress": None,
+                "applied_config": Config().as_dict(),
+                "run_config": {}, "default_advanced_config": {},
+            }
+
+    def run(self, count, **kwargs):
+        with self.lock:
+            self.state = SessionState.Running
+            self.target = self.completed + count
+
+        def finish():
+            time.sleep(0.05)
+            with self.lock:
+                self.completed = self.target
+                self.state = SessionState.Idle
+        threading.Thread(target=finish, daemon=True).start()
+        return self.target
+
+    def stop(self, barrier=None):
+        with self.lock:
+            self.state = SessionState.Idle
+            self.target = self.completed
+
+    def save_checkpoint(self, path, timeout=120.0):
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        Path(path).write_bytes(b"PK\x03\x04checkpoint")
+        return path
+
+    def load_checkpoint(self, path, timeout=600.0):
+        return {"completed_iterations": self.completed, "config_revision": 1}
+
+    def export_preview(self, timeout=600.0, diagnostics=False):
+        return {}
+
+    def disable_automatic_previews(self, error=None):
+        pass
+
+    def close(self, timeout=15.0):
+        with self.lock:
+            self.state = SessionState.Closing
 
 
 class FrozenInputsRuntime(FakeRuntime):

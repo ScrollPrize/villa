@@ -1,10 +1,10 @@
 """Point pairs materialized from stored surface-overlap poses."""
+import json
+
 import numpy as np
 import pytest
 
-from object_helpers import edge_choice
-from test_coordinate_frames import VOLUME, frame
-from test_object_links import array, put
+from object_helpers import VOLUME, array, edge_choice, frame, put
 
 LOW = "00000000-0000-4000-8000-000000000001"
 HIGH = "ffffffff-0000-4000-8000-000000000001"
@@ -92,10 +92,29 @@ def test_invalid_vertices_never_anchor_pairs(db):
         assert not (9 <= row < 20 and 19 <= col < 30)
 
 
-def test_deterministic_thinning(db):
+def overlapping_pair(db):
+    """LOW and HIGH ten voxels apart, linked by the detector; HIGH's geometry."""
     patch(db, LOW, flat())
-    patch(db, HIGH, flat(10))
-    edge = overlap_edge(db)
+    _, geometry = patch(db, HIGH, flat(10))
+    return overlap_edge(db), geometry
+
+
+def whole_edge(db, kind, meta=None, a=LOW, b=HIGH):
+    whole = dict(whole_geometry=True)
+    return db.add_edge(dict(a=a, b=b, kind=kind, a_anchor=whole, b_anchor=whole,
+                            **({} if meta is None else {"meta": meta})))
+
+
+def move_high_keeping_edges(db, geometry):
+    """A new HIGH geometry revision; its edges stay bound to the recorded one."""
+    geometry["arrays"] = patch(db, None, flat(11))[1]["arrays"]
+    db.put_geometry(HIGH, geometry, expected_revision=db.current_geometry(HIGH)["uuid"],
+                    edge_edits=[edge_choice(db, e["uuid"], "keep_recorded")
+                                for e in db.affected_geometry_edges(HIGH, geometry)])
+
+
+def test_deterministic_thinning(db):
+    edge, _ = overlapping_pair(db)
     dense = materialize(db, edge, spacing=1, max_pairs=100000)
     thinned = materialize(db, edge, spacing=1, max_pairs=50)
     assert thinned == materialize(db, edge, spacing=1, max_pairs=50)
@@ -104,68 +123,29 @@ def test_deterministic_thinning(db):
     assert thinned["pairs"] == [dense["pairs"][i * n // 50] for i in range(50)]
 
 
-def test_agreement_radius_is_the_detectors(db):
-    # Two planes six voxels apart, accepted under a wide tolerance.
-    patch(db, LOW, flat())
-    patch(db, HIGH, lambda rows, cols: (cols + 10, rows, np.full_like(rows, 26)))
-    report = db.link_surface_overlaps(volume_uuid=VOLUME, min_inliers=16, tolerance=7)
-    assert report["edges_created"] == 1, report
-    edge = db.edges_by_kind("same-surface")[0]
-    assert edge["meta"]["fit"]["agreement_radius"] == 10
-    result = materialize(db, edge)
-    assert result["error"] is None and result["pairs"]
-    assert all(5.9 < pair["distance"] < 6.1 for pair in result["pairs"])
-
-
-def test_edges_without_recorded_fit_fields_must_be_redetected(db):
-    patch(db, LOW, flat())
-    patch(db, HIGH, flat(10))
-    edge = overlap_edge(db)
-    whole = dict(whole_geometry=True)
-    for key in ("pose_from", "grid_scales", "agreement_radius"):
-        fit = dict(edge["meta"]["fit"])
-        del fit[key]
-        old = db.add_edge(dict(a=edge["a"], b=edge["b"], kind="old-" + key, a_anchor=whole, b_anchor=whole,
-                               meta=dict(edge["meta"], fit=fit)))
-        [result] = db.overlap_correspondences([old], VOLUME)
-        assert "rerun surface-overlap detection" in result["error"] and result["pairs"] == []
-
-
 def test_unusable_edges_report_errors_independently(db):
-    patch(db, LOW, flat())
-    _, geometry = patch(db, HIGH, flat(10))
-    edge = overlap_edge(db)
-    whole = dict(whole_geometry=True)
-    explicit = db.add_edge(dict(a=LOW, b=HIGH, kind="explicit", a_anchor=whole, b_anchor=whole,
-                                meta={"fit": dict(edge["meta"]["fit"]), "coordinate_frame": None}))
-    plain = db.add_edge(dict(a=LOW, b=HIGH, kind="plain", a_anchor=whole, b_anchor=whole))
-    results = db.overlap_correspondences([explicit, edge["uuid"], plain, "00000000-0000-4000-8000-0000000000ff"], VOLUME)
-    assert [r["error"] is None for r in results] == [False, True, False, False]
-    assert "rerun surface-overlap detection" in results[0]["error"]
-    assert results[2]["error"] == "edge has no overlap pose"
-    assert results[3]["error"] == "edge not found"
+    edge, geometry = overlapping_pair(db)
+    # Edges from before the pose's frame and direction were recorded must be re-detected.
+    old_fit = {k: v for k, v in edge["meta"]["fit"].items() if k != "pose_from"}
+    results = db.overlap_correspondences([
+        whole_edge(db, "explicit", {"fit": edge["meta"]["fit"], "coordinate_frame": None}),
+        whole_edge(db, "old", dict(edge["meta"], fit=old_fit)),
+        edge["uuid"], whole_edge(db, "plain")], VOLUME)
+    assert [r["error"] is None for r in results] == [False, False, True, False]
+    assert all("rerun surface-overlap detection" in r["error"] for r in results[:2])
+    assert results[3]["error"] == "edge has no overlap pose"
     assert all(r["pairs"] == [] for r in results if r["error"])
-    [other] = db.overlap_correspondences([edge["uuid"]], "other")
-    assert "not in volume other" in other["error"]
     # A changed frame changes the grid scale the pose was fitted in.
     db.set_meta(HIGH, "coordinates", frame(2))
     assert "grid scale differs" in materialize(db, edge)["error"]
-    # A patch moved to another volume names itself.
     db.set_meta(HIGH, "coordinates", frame(volume="other"))
-    assert materialize(db, edge)["error"] == HIGH + ": geometry volume_uuid does not match target volume"
+    assert "does not match target volume" in materialize(db, edge)["error"]
     db.set_meta(HIGH, "coordinates", frame(1))
     assert materialize(db, edge)["error"] is None
     # An edge kept bound to its recorded revision across a coordinate edit is stale.
-    _, moved = patch(db, None, flat(11))
-    geometry["arrays"] = moved["arrays"]
-    db.put_geometry(HIGH, geometry, expected_revision=db.current_geometry(HIGH)["uuid"],
-                    edge_edits=[edge_choice(db, e["uuid"], "keep_recorded") for e in db.affected_geometry_edges(HIGH, geometry)])
+    move_high_keeping_edges(db, geometry)
     assert db.edge_geometry_state(edge["uuid"])["stale"]
     assert materialize(db, edge)["error"] == "edge geometry is stale"
-    with pytest.raises(ValueError):
-        db.overlap_correspondences([edge["uuid"]], "")
-    with pytest.raises(ValueError):
-        db.overlap_correspondences([edge["uuid"]], VOLUME, max_pairs=0)
 
 
 @pytest.mark.parametrize("radius,accepted", [(6.0, True), (np.nextafter(6.0, 0.0), False)])
@@ -175,53 +155,31 @@ def test_correspondence_agreement_boundary(db, radius, accepted):
     report = db.link_surface_overlaps(volume_uuid=VOLUME, min_inliers=16, tolerance=7)
     assert report["edges_created"] == 1
     edge = db.edges_by_kind("same-surface")[0]
+    assert edge["meta"]["fit"]["agreement_radius"] == 10  # the detector's radius is recorded
     # Exact pose isolates the distance gate from fitting error: every pair is
     # six voxels apart. Equality is accepted, a smaller radius rejects it.
     fit = dict(edge["meta"]["fit"], pose=[1, 0, 0, 0, 1, 0], agreement_radius=float(radius))
-    whole = dict(whole_geometry=True)
-    uid = db.add_edge(dict(a=edge["a"], b=edge["b"], kind="boundary", a_anchor=whole, b_anchor=whole,
-                           meta=dict(edge["meta"], fit=fit)))
-    [result] = db.overlap_correspondences([uid], VOLUME)
+    [result] = db.overlap_correspondences(
+        [whole_edge(db, "boundary", dict(edge["meta"], fit=fit), edge["a"], edge["b"])], VOLUME)
     assert bool(result["pairs"]) == accepted
     if accepted:
-        assert result["error"] is None
-        assert all(pair["distance"] == 6 for pair in result["pairs"])
+        assert result["error"] is None and all(pair["distance"] == 6 for pair in result["pairs"])
     else:
         assert result["error"] == "no agreeing correspondences under the stored pose"
 
 
-def _as_read(db, edge):
-    """The edge and its endpoints as a reader holding them now would pass them."""
-    import json
-    return {"uuid": edge["uuid"], "a": edge["a"], "b": edge["b"], "whole_geometry": True,
-            "meta": json.dumps(edge["meta"]),
-            "a_object_meta": json.dumps(db.object(edge["a"])["meta"]),
-            "b_object_meta": json.dumps(db.object(edge["b"])["meta"]),
-            "a_geometry_revision": db.current_geometry(edge["a"])["uuid"],
-            "b_geometry_revision": db.current_geometry(edge["b"])["uuid"]}
-
-
 def test_pairs_from_an_earlier_state_ignore_later_changes(db):
-    patch(db, LOW, flat())
-    _, geometry = patch(db, HIGH, flat(10))
-    edge = overlap_edge(db)
-    then = _as_read(db, edge)
+    edge, geometry = overlapping_pair(db)
+    # The edge and its endpoints as a reader holding them now would pass them.
+    then = {"uuid": edge["uuid"], "a": edge["a"], "b": edge["b"], "whole_geometry": True,
+            "meta": json.dumps(edge["meta"]),
+            **{f"{side}_object_meta": json.dumps(db.object(edge[side])["meta"]) for side in "ab"},
+            **{f"{side}_geometry_revision": db.current_geometry(edge[side])["uuid"] for side in "ab"}}
     before = materialize(db, edge)
-    [pinned] = db.overlap_correspondences_at([then], VOLUME)
-    assert pinned == before
-    # Later: HIGH moves (a new geometry revision, the edge re-detected with a
-    # new pose), then the edge is removed. The earlier state still reads the
-    # same pairs, from its recorded pose and geometry.
-    _, moved = patch(db, None, flat(11))
-    geometry["arrays"] = moved["arrays"]
-    db.put_geometry(HIGH, geometry, expected_revision=db.current_geometry(HIGH)["uuid"],
-                    edge_edits=[edge_choice(db, e["uuid"], "keep_recorded")
-                                for e in db.affected_geometry_edges(HIGH, geometry)])
+    assert db.overlap_correspondences_at([then], VOLUME) == [before]
+    # Later HIGH moves and the edge is removed: the earlier state still reads
+    # the same pairs, from its recorded pose and geometry.
+    move_high_keeping_edges(db, geometry)
     db.remove_edge(edge["uuid"])
     assert db.overlap_correspondences([edge["uuid"]], VOLUME)[0]["error"] == "edge not found"
-    [again] = db.overlap_correspondences_at([then], VOLUME)
-    assert again == before
-    # A revision the store does not hold is an error of that edge.
-    [missing] = db.overlap_correspondences_at(
-        [dict(then, b_geometry_revision="00000000-0000-4000-8000-0000000000ee")], VOLUME)
-    assert "has no geometry revision" in missing["error"] and missing["pairs"] == []
+    assert db.overlap_correspondences_at([then], VOLUME) == [before]

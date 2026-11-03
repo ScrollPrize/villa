@@ -156,6 +156,7 @@
     "input_use_fiber_directions": "Load packed fiber-direction samples and allow their orientation loss.",
     "input_use_pcl_absolute": "Read absolute-winding point collections from the object store. The PCL role toggles must agree: roles are read from each collection's metadata, so all three select every PCL or none.",
     "input_use_pcl_relative": "Read relative-winding point collections from the object store. The PCL role toggles must agree: roles are read from each collection's metadata, so all three select every PCL or none.",
+    "input_use_patch_overlaps": "Use patch-overlap links: refresh them with the store's overlap detector and add same-surface point pairs between overlapping patches to the fit. Off skips the detector (its existing links stay in the store, unused). Changing it rebuilds the fit.",
     "input_use_pcl_same_winding": "Read same-winding point collections from the object store. The PCL role toggles must agree: roles are read from each collection's metadata, so all three select every PCL or none.",
     "input_use_pcl_drawn_control_points": "Load drawn-control-point point-collection inputs.",
     "input_use_normals": "Allow dense normal stores, sampling, and normal-dependent losses. With an object store, it also decides whether startup fiber-patch link refresh uses the lasagna normals (before object_store_normal_ct_path).",
@@ -242,7 +243,8 @@
     "object_store_path": "The vc_object_store database the fit reads patches, fibers, point collections and their relationships from. Required by the command-line fit, which loads no patch directories, fiber files or PCL documents.",
     "object_store_author": "Author recorded on the relationships the startup link refresh writes back to the object store. Required when link refresh is on.",
     "object_store_input_position": "The hub position (a journal sequence on the store's hub) this fit reads exactly, without linking. Unset, a hosted replica links and pins the hub head at load. Set by the Spiral service from the position it prepared; never by a client.",
-    "object_store_refresh_links": "At startup, rerun the store's automatic PCL-patch, fiber-patch and patch-overlap detectors over the selected objects and write their results back to the store before reading the fit's inputs. Any detector failure stops the fit before training. Off reads the store's current relationships without writing.",
+    "object_store_refresh_links": "At startup, rerun the store's automatic PCL-patch, fiber-patch and patch-overlap detectors over the selected objects and write their results back to the store before reading the fit's inputs. Any detector failure stops the fit before training. Off reads the store's current relationships without writing. The detectors are skipped when the store's link marker shows the links still current (nothing they depend on changed since the last full refresh), and an input update links only objects added since it.",
+    "object_store_full_link_refresh": "Always run every link detector over the whole selection, ignoring the store's link marker: no skip when nothing changed, and no incremental linking of added objects on an input update.",
     "object_store_approved_links_only": "Consume only approved relationships (automatic and explicit). Otherwise pending and approved ones are used; rejected ones never are. Refresh still runs, so newly detected links stay pending and are excluded.",
     "object_store_allow_changed_inputs": "Allow resuming a checkpoint whose recorded object-store inputs, frames or materialization settings differ from this fit's. Off refuses such a resume.",
     "object_store_patch_uuids": "Patches to fit, by UUID (with the tags below). Unset with no tags selects every active patch with geometry; an empty list selects none.",
@@ -258,6 +260,7 @@
     "object_store_normal_ct_downsampling": "Downsampling of the selected normal CT level relative to the fit volume (selected CT voxel = fit voxel / this).",
     "object_store_normal_ct_volume_uuid": "The volume the normal CT belongs to; must be the fit volume.",
     "fit_volume_uuid": "The reference volume whose voxels are the fit's units. Unset infers it from the frames the selected objects declare; it must agree with every declaration.",
+    "fit_volume_level": "The pyramid level of the fit volume the fit works in: a fit voxel is 2^level of the volume's voxels, so the z range and every setting in voxels are in that level's voxels. Inputs are converted to it, and exported surfaces back to the volume's own voxels. The winding-inference artifact and a CT array (scroll_zarr) must already be at that level.",
     "spiral_outward_sense": "The direction the spiral winds outwards (CW or ACW) where the fit volume's catalog orientation does not decide it; one that disagrees with the orientation is refused. Read it off the CT, or from an already-fitted spiral."
   }
 }

@@ -79,9 +79,44 @@ DetectorReport linkFibersToSurfaces(objects::ObjectStore& db, const std::filesys
 {
     detail::validateLineSurfaceParams(params, params.fiberScale);
     detail::StoredGeometry inputs(db);
-    const auto fibers = inputs.select("fiber", params.fiberUuids);
+    const auto selected = inputs.select("fiber", params.fiberUuids);
     DetectorReport validation;
-    const auto scales = detail::coordinateScales(fibers, params, validation, params.fiberScale);
+    const auto scales = detail::coordinateScales(selected, params, validation, params.fiberScale);
+    std::optional<detail::LineIncremental> incremental;
+    auto fibers = selected;
+    if (params.newUuids) {
+        // New fibers load the selected surfaces within contact proximity of
+        // their stored bounds; new surfaces, the fibers within it of theirs.
+        const auto surfaces = inputs.select("surface", params.surfaceUuids);
+        incremental.emplace();
+        incremental->fresh = *detail::newAmong(params.newUuids, {&selected, &surfaces}, kFiberSurfaceDetector);
+        std::set<std::string> allSurfaces, allFibers, wantedSurfaces, wantedFibers;
+        for (const auto& object : surfaces) allSurfaces.insert(object.uuid);
+        for (const auto& object : selected) allFibers.insert(object.uuid);
+        auto near = [&](const objects::ObjectRecord& object, double scale, const std::string& kind,
+                        double otherScale, const std::set<std::string>& among, std::set<std::string>& into) {
+            const auto box = inputs.workingBounds(object, params, scale);
+            if (!box) { into.insert(among.begin(), among.end()); return; }  // no stored bounds: all
+            for (const auto& uuid : inputs.objectsNear(kind, *box, params.proximity, params, otherScale))
+                if (among.contains(uuid)) into.insert(uuid);
+        };
+        for (const auto& object : selected)
+            if (incremental->fresh.contains(object.uuid)) {
+                wantedFibers.insert(object.uuid);
+                near(object, params.fiberScale, "surface", params.surfaceScale, allSurfaces, wantedSurfaces);
+            }
+        for (const auto& object : surfaces)
+            if (incremental->fresh.contains(object.uuid)) {
+                wantedSurfaces.insert(object.uuid);
+                near(object, params.surfaceScale, "fiber", params.fiberScale, allFibers, wantedFibers);
+            }
+        for (const auto& object : surfaces) {
+            incremental->selected.push_back(object.uuid);
+            if (wantedSurfaces.contains(object.uuid)) incremental->surfaces.push_back(object);
+        }
+        for (const auto& object : selected) incremental->selected.push_back(object.uuid);
+        std::erase_if(fibers, [&](const objects::ObjectRecord& object) { return !wantedFibers.contains(object.uuid); });
+    }
     auto load = [&](size_t index, DetectorReport& report) -> std::optional<detail::LineData> {
         auto fiber = loadFiber(inputs, fibers[index], scales.at(fibers[index].uuid), report);
         if (fiber && !params.cacheDirectory.empty()) {
@@ -91,6 +126,7 @@ DetectorReport linkFibersToSurfaces(objects::ObjectStore& db, const std::filesys
         return fiber;
     };
     return detail::linkLinesToSurfaces(db, inputs, fibers.size(), load, ctVolume,
-        params, params.fiberScale, kFiberSurfaceDetector, 3, cancel, std::move(validation));
+        params, params.fiberScale, kFiberSurfaceDetector, kFiberSurfaceVersion, cancel, std::move(validation),
+        incremental ? &*incremental : nullptr);
 }
 } // namespace vc::object_links

@@ -49,7 +49,7 @@ DetectorReport linkTracksToSurfaces(objects::ObjectStore& db, const std::filesys
             }
         };
         return detail::linkLinesToSurfaces(db, inputs, tracks.size(), load, ctVolume,
-            params, params.trackScale, kTrackSurfaceDetector, 1, cancel, std::move(validation));
+            params, params.trackScale, kTrackSurfaceDetector, kTrackSurfaceVersion, cancel, std::move(validation));
     } catch (const std::exception& error) {
         DetectorReport report;
         detail::reportFailure(report, "run", "", error.what(),

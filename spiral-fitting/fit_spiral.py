@@ -46,10 +46,10 @@ from checkpoint_migrations import (expand_gap_checkpoint_capacity,
                                    tolerate_checkpoint_config)
 from devices import fit_device
 from fit_session import (AUTOSAVE_INTERVAL_ITERATIONS, check_fit_volume,
-                         input_source_enabled, lasagna_enabled,
+                         fit_level_scale, input_source_enabled, lasagna_enabled,
                          lasagna_normal_inputs, outer_shell_required,
-                         resolve_lasagna_scale, shell_losses_enabled,
-                         winding_inference_enabled)
+                         resolve_lasagna_scale, scroll_at_fit_level,
+                         shell_losses_enabled, winding_inference_enabled)
 from lazy_moment_adamw import LazyMomentAdamW, robust_clip_
 
 
@@ -1009,7 +1009,12 @@ class FitContext:
             'dt_target_update_interval': self.config[
                 'theta_crossing_map_update_interval'],
         })
-        self.scroll = scroll
+        # The scroll's facts are in the reference volume's own voxels; the
+        # fit works in those of its pyramid level fit_volume_level, and
+        # exports surfaces back in the volume's (reference_scroll).
+        self.reference_scroll = scroll
+        self.fit_level_scale = fit_level_scale(config)
+        self.scroll = scroll = scroll_at_fit_level(scroll, config['fit_volume_level'])
         self.paths = paths
         self.interactive_driver = interactive_driver
         # object_store_inputs.FitInputs materialized from a frozen object-store
@@ -1633,9 +1638,12 @@ class FitContext:
 
     def _lasagna_normal_inputs(self):
         """The fit's lasagna normals as object_store_inputs.fiber_normal_source
-        takes them, or None when the fit loads none."""
+        takes them, or None when the fit loads none. Link refresh works in the
+        fit volume's own voxels, not the fit level's."""
         return lasagna_normal_inputs(
-            self.lasagna_source, self.config, self.lasagna_scale, self.cache_path)
+            self.lasagna_source, self.config,
+            self.lasagna_scale * self.fit_level_scale if self.lasagna_scale else None,
+            self.cache_path)
 
     def _external_input_frames(self):
         """Frames of the inputs read outside the object store, for the input
@@ -2533,8 +2541,10 @@ class FitContext:
     # decision about its release is a visible omission instead of a leak.
     # prepared_main_tracks/preview_extent_tracks are deliberately absent: see
     # the retained_tracks note in _build_model_state.
+    # Not 'device': __init__ chooses it (devices.fit_device) once for the
+    # session, and the rebuild itself reads it.
     _MODEL_STAGE_ATTRIBUTES = (
-        'device', 'umbilicus_zyx',
+        'umbilicus_zyx',
         'start_iteration', 'model_z_begin', 'model_z_end',
         'flow_field_radius', 'flow_min_corner_spiral_zyx',
         'flow_max_corner_spiral_zyx', 'num_training_steps',
@@ -3124,7 +3134,8 @@ class FitContext:
                 tracks=self.preview_extent_tracks,
                 surface_id=surface_id,
                 z_direction_is_top_to_bottom=self.z_direction_is_top_to_bottom,
-                base_shape_zyx=self.base_shape_zyx,
+                # The preview is written in the fit volume's own voxels.
+                base_shape_zyx=self.reference_scroll.base_shape_zyx,
                 progress=progress,
                 input_extent_transform=live_transform,
                 patch_atlas=self.patch_atlas,

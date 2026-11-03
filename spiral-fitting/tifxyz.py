@@ -235,13 +235,31 @@ def load_tifxyz(path):
                  erosion_cells_override)
 
 
-def save_tifxyz(zyxs, path, uuid, step_size, voxel_size_um, source, *, layout_metadata=None):
+def _to_written_voxels(zyxs, step_size, voxel_size_um, coordinate_scale):
+    """``zyxs`` (with their grid step and voxel size) in the voxels of a
+    volume ``coordinate_scale`` times finer; -1 sentinels are kept."""
+    if coordinate_scale == 1:
+        return zyxs, step_size, voxel_size_um
+    zyxs = np.asarray(zyxs, dtype=np.float32)
+    invalid = np.all(zyxs == -1, axis=-1)
+    zyxs = zyxs * np.float32(coordinate_scale)
+    zyxs[invalid] = -1.0
+    return zyxs, step_size * coordinate_scale, voxel_size_um / coordinate_scale
+
+
+def save_tifxyz(zyxs, path, uuid, step_size, voxel_size_um, source, *, layout_metadata=None,
+                coordinate_scale=1):
     """Write a NEW tifxyz surface to ``path/uuid``.
 
     ``uuid`` names the directory only; meta.json gets a fresh random
     identity, never one derived from the name. ``layout_metadata`` describes
-    the export layout of the supplied grid.
+    the export layout of the supplied grid. ``zyxs``, ``step_size`` and
+    ``voxel_size_um`` are in fit voxels; the surface is written in the
+    voxels of the volume ``coordinate_scale`` times finer (the fit volume's
+    own, for a fit at one of its pyramid levels).
     """
+    zyxs, step_size, voxel_size_um = _to_written_voxels(
+        zyxs, step_size, voxel_size_um, coordinate_scale)
     path = f'{path}/{uuid}'
     os.makedirs(path, exist_ok=True)
     Image.fromarray(np.asarray(zyxs[..., 2], dtype=np.float32)).save(f'{path}/x.tif')
@@ -285,6 +303,7 @@ def save_combined_tifxyz(
     first_winding=10,
     cleanup_erosion_cells=None,
     base_shape_zyx=None,
+    coordinate_scale=1,
 ):
     """Atomically write consecutive winding grids as one QuadSurface.
 
@@ -296,7 +315,10 @@ def save_combined_tifxyz(
     half-open column bounds, in the written grid, for display filtering, but
     they are not QuadSurface components: adjacent windings remain joined by
     quads across their shared seam. ``winding_column_ranges`` pairs with
-    ``component_winding_ids`` and runs left to right.
+    ``component_winding_ids`` and runs left to right. The grids, ``step_size``
+    and ``voxel_size_um`` are in fit voxels; the surface is written in those
+    of the volume ``coordinate_scale`` times finer, whose shape
+    ``base_shape_zyx`` is.
     """
     import os
     import shutil
@@ -342,6 +364,8 @@ def save_combined_tifxyz(
         cursor += block.shape[1]
         components.append([start, cursor])
     combined = np.concatenate(blocks, axis=1)
+    combined, step_size, voxel_size_um = _to_written_voxels(
+        combined, step_size, voxel_size_um, coordinate_scale)
     cleanup_metadata = None
     if cleanup_erosion_cells is not None:
         import scipy.ndimage

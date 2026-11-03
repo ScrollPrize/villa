@@ -5,7 +5,6 @@ import numpy as np
 import pytest
 
 pytest.importorskip('vc_object_store')
-from vc_object_store import ObjectStore  # noqa: E402
 
 import object_store_inputs as osi  # noqa: E402
 import object_store_reference as reference  # noqa: E402
@@ -13,16 +12,7 @@ from object_store_fixture import (  # noqa: E402
     frame, pcl_patch_edge, put_patch, put_pcl, write_reference_store)
 
 
-@pytest.fixture()
-def db(tmp_path):
-    with ObjectStore.create(str(tmp_path / 'fit.vcobj'), author='test',
-                            hostname='host') as store:
-        yield store
-
-
-@pytest.fixture(autouse=True)
-def cpu(monkeypatch):
-    monkeypatch.setenv('FIT_SPIRAL_DEVICE', 'cpu')
+pytestmark = pytest.mark.usefixtures('cpu')
 
 
 def materialize(db, fiber_min_point_spacing=0.0, **request):
@@ -150,8 +140,8 @@ def test_absolute_role_comes_from_metadata_not_names(db):
     absolute = put_pcl(db, {0: _point(0, 3.0)}, absolute=True, name='same_windings')
     relative = put_pcl(db, {0: _point(0, 3.0)}, name='abs_winding')
     unannotated = put_pcl(db, {0: _point(0)})
-    for uid in (absolute, relative, unannotated):
-        pcl_patch_edge(db, uid, 0, patch, (1.0, 1.0))
+    edges = {uid: pcl_patch_edge(db, uid, 0, patch, (1.0, 1.0))
+             for uid in (absolute, relative, unannotated)}
     inputs = materialize(db)
     by_uuid = {pcl['metadata']['object_uuid']: pcl
                for pcl in inputs.point_collections.values()}
@@ -159,23 +149,19 @@ def test_absolute_role_comes_from_metadata_not_names(db):
     assert by_uuid[absolute]['sampling_group'] == osi.ABSOLUTE_PCL_GROUP
     assert not by_uuid[relative]['metadata']['winding_is_absolute']
     assert by_uuid[unannotated]['sampling_group'] == osi.SAME_WINDING_PCL_GROUP
-
-
-def test_malformed_roles_fail(db):
-    put_pcl(db, {0: _point(0, 3.0)}, source={'winding_is_absolute': 'yes'})
-    with pytest.raises(osi.ObjectStoreInputError, match='non-boolean'):
-        materialize(db)
-
-
-def test_detected_role_must_match_the_metadata(db):
-    patch = put_patch(db, _grid())
-    pcl = put_pcl(db, {0: _point(0, 3.0)}, absolute=True)
-    edge = pcl_patch_edge(db, pcl, 0, patch, (1.0, 1.0))
-    record = db.edge(edge)
+    # A role the detector found otherwise is refused, as is a malformed one.
+    record = db.edge(edges[absolute])
     record['meta']['point_collection_surface']['winding_is_absolute'] = False
     with db.write() as tx:
         tx.update_edge(record)
     with pytest.raises(osi.ObjectStoreInputError, match='detected as relative'):
+        materialize(db)
+    record['meta']['point_collection_surface']['winding_is_absolute'] = True
+    with db.write() as tx:
+        tx.update_edge(db.edge(edges[absolute]) | {'meta': record['meta']})
+    materialize(db)
+    put_pcl(db, {0: _point(0, 3.0)}, source={'winding_is_absolute': 'yes'})
+    with pytest.raises(osi.ObjectStoreInputError, match='non-boolean'):
         materialize(db)
 
 
@@ -190,24 +176,6 @@ def test_absolute_points_need_explicit_positive_windings(db, tmp_path):
     with pytest.raises(ValueError, match='without a winding annotation'):
         regular_pcl_views(inputs.point_collections, inputs.patches, z_begin=0,
                           z_end=64, z_margin=0, min_point_spacing=0)
-
-
-def test_unmaterializable_attachments_are_reported(db):
-    patch = put_patch(db, _grid())
-    pcl = put_pcl(db, {0: _point(0, 1.0), 1: _point(1, 1.0)})
-    pcl_patch_edge(db, pcl, 0, patch, (1.0, 1.0))
-    pcl_patch_edge(db, pcl, 0, put_patch(db, _grid(z0=8.0)), (1.0, 1.0))
-    with pytest.raises(osi.ObjectStoreInputError) as error:
-        materialize(db)
-    assert 'attaches to patches' in str(error.value)
-
-
-def test_attachments_to_unfitted_patches_are_counted(db):
-    pcl = put_pcl(db, {0: _point(0, 1.0)})
-    pcl_patch_edge(db, pcl, 0, put_patch(db, _grid(z0=200.0)), (1.0, 1.0))
-    inputs = materialize(db)
-    assert 'on_patch' not in inputs.point_collections[0]['points'][0]
-    assert inputs.counts['pcl attachments to unfitted patches'] == 1
 
 
 def test_attachments_on_eroded_quads_are_dropped_and_reported(db, tmp_path):
@@ -263,11 +231,8 @@ def test_report_derives_the_runtime_views(db, capsys):
     report = capsys.readouterr().out
     assert 'pcl attachments 2' in report
     assert 'views: 1 cross-patch (relative_windings 1), 1 strips (relative_windings 1)' in report
-
-
-def test_report_fails_where_a_fit_would(db, capsys):
-    patch = put_patch(db, _grid())
-    pcl = put_pcl(db, {0: _point(0)}, absolute=True)
-    pcl_patch_edge(db, pcl, 0, patch, (1.0, 1.0))
+    # It fails where a fit would.
+    absolute = put_pcl(db, {0: _point(0)}, absolute=True)
+    pcl_patch_edge(db, absolute, 0, patch, (1.0, 1.0))
     assert osi.main([db.path, '--z-begin', '0', '--z-end', '64']) == 1
     assert 'without a winding annotation' in capsys.readouterr().err

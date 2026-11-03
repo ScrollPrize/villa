@@ -23,12 +23,11 @@ from vc_object_store.surfaces import read_surface  # noqa: E402
 import object_store_inputs as osi  # noqa: E402
 import spiral_service  # noqa: E402
 from lasagna_publish import flatten_profile  # noqa: E402
-from object_store_fixture import VOLUME  # noqa: E402
+from object_store_fixture import VOLUME, fit_config  # noqa: E402
 from published_generation import BASE_SHAPE, MODEL_STATE, STEP, publish  # noqa: E402
 from published_generation import grid as _grid  # noqa: E402
 from service_http import ApiError  # noqa: E402
 from service_project import UMBILICUS  # noqa: E402
-from test_object_store_startup import fit_config, store_path  # noqa: E402,F401
 
 SESSION = 'spiral-1-0123456789'
 

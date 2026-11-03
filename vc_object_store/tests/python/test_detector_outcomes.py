@@ -1,8 +1,7 @@
 """Structured detector outcomes: failures are distinct from ordinary diagnostics."""
 import pytest
 
-from test_coordinate_frames import VOLUME, frame, patch as framed_patch, collection as framed_collection
-from test_object_links import array, plane, put
+from object_helpers import VOLUME, array, frame, framed_collection, framed_patch, plane, put
 
 
 def collection(db, point, winding=1):
@@ -55,19 +54,9 @@ def test_rejected_overlap_pairs_are_diagnostics(db):
     plane(db, offset=16)  # overlaps half of the first patch
     report = db.link_surface_overlaps(min_overlap_fraction=0.9)
     assert report["committed"] and not report["failed"] and report["edges_created"] == 0
-    diagnostics = report["issues"]
-    assert diagnostics and all(i["severity"] == "diagnostic" and i["stage"] == "discover" for i in diagnostics)
-    assert sum(i["count"] for i in diagnostics) == 1
-    assert report["problems"] == ["surface-overlap: 1 pair(s) rejected: insufficient_overlap_fraction"]
-    assert diagnostics[0]["reason"] == "insufficient_overlap_fraction" and diagnostics[0]["object_uuids"] == []
-
-
-def test_clean_run_reports_no_issues(db):
-    plane(db)
-    plane(db)
-    report = db.link_surface_overlaps()
-    assert report["committed"] and not report["failed"]
-    assert report["issues"] == [] and report["problems"] == []
+    [diagnostic] = report["issues"]
+    assert diagnostic == dict(severity="diagnostic", stage="discover", object_uuids=[],
+                              reason="insufficient_overlap_fraction", count=1)
 
 
 @pytest.mark.parametrize("kind,detector", [

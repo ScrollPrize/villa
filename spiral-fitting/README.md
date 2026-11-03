@@ -121,61 +121,6 @@ comparing a CPU run with an MPS one. `get_ink_metrics.py --device` picks the
 nnU-Net device; without it the folds take CUDA, else MPS, else the CPU, whatever
 the fitting variables say.
 
-## Editing input snapshots
-
-`input_snapshot.py` snapshots directory trees (it served the file-input editing
-workspace, which the object store replaced; the service no longer calls it).
-It tries Linux `FICLONE` or macOS `clonefile` for independent copy-on-write
-files. Unsupported
-filesystems and cross-filesystem copies fall back to a streamed copy; other I/O
-errors propagate. Hard links are never used.
-
-The fallback hashes bytes while copying, verifies the destination, and compares
-the final source fingerprint with the captured tree. Clones are hashed once and
-compared with the final source. This reduces full content reads from four to
-three for ordinary copies and two for clones. Snapshots retain the existing
-SHA-256 format, sorted tree membership, empty directories and symlink rejection.
-Changes during capture that leave the source different from the captured bytes
-are rejected. No model inputs, precision or numerical algorithms change.
-
-Run the focused tests using the existing environment, from the repository root:
-
-```sh
-PYTHONPATH=spiral-fitting spiral-fitting/.venv/bin/python -m pytest -q \
-  spiral-fitting/tests/test_input_snapshot.py
-```
-
-Benchmark real patches (temporary copies are removed; sources stay unchanged):
-
-```sh
-PYTHONPATH=spiral-fitting spiral-fitting/.venv/bin/python \
-  spiral-fitting/tests/benchmark_input_snapshots.py \
-  /home/sean/Desktop/spiral_dataset/verified_patches --iterations 5 --profile
-```
-
-Use `--destination PATH` to test another filesystem. The default is `/tmp`.
-`--count` selects the first N sorted patch directories (default 32).
-
-Measured on Linux arm64, CPython 3.14, without Python optimization flags, with
-`cProfile` enabled for both versions: 32 real verified patches, 55,302,864 bytes,
-five iterations, ordinary-copy fallback on the local ext-family filesystem.
-These are cache-warm measurements, not end-to-end fit initialization times.
-
-| Snapshot implementation | Mean | Min | Median | Max |
-| --- | ---: | ---: | ---: | ---: |
-| Previous copy plus three hash passes | 166.8 ms | 160.8 ms | 162.2 ms | 181.0 ms |
-| Streamed copy/hash plus verification | 152.3 ms | 148.9 ms | 153.2 ms | 154.0 ms |
-
-Mean time decreased 8.7%. Before the change, fingerprint calls accounted for
-0.649 s of 0.834 s total across all five iterations; file copying accounted for
-0.177 s. Afterwards, hashing remains the largest cost (0.336 s in SHA-256 updates),
-but the separate source pre-read is eliminated. Reflink throughput and actual
-macOS cloning require validation on supporting filesystems; unit tests cover
-the platform dispatch and fallback/error paths.
-
-Filesystem API references: [Linux FICLONE](https://man7.org/linux/man-pages/man2/FICLONE.2const.html)
-and [Apple file cloning support](https://developer.apple.com/documentation/foundation/urlresourcevalues/volumesupportsfilecloning).
-
 ## Input manifest
 
 `fit_spiral.py --inputs MANIFEST` names every input a command-line fit reads
@@ -188,6 +133,14 @@ session takes the scroll's facts and inputs from the VC3D project and its own
 launch bindings instead; see
 [The VC3D project's inputs](#the-vc3d-projects-inputs). This is not covered
 by scrollprize.org/tutorial_spiral.
+
+`runners/run_single.py --resume` records the object store's persistent UUID
+in its run state and checks it even when the fit stage is already complete.
+Moving the store or using a replica of the same store preserves this identity;
+switching to a different store is refused. Older runner state files without
+the UUID cannot establish which store was used and are refused too; use a new
+output directory. This check identifies the store, not its current contents;
+the fitter's checkpoint input-manifest checks still apply when fitting resumes.
 
 ```json
 {
@@ -402,10 +355,28 @@ off select none), validates every selected object's frame, then refreshes the
 PCL-patch, fiber-patch, patch-overlap and track-crossing links as
 `--object-store-author`,
 writing them back to the store. Detectors whose object kinds are not all
-selected are skipped. Every detector failure is reported together and stops
+selected are skipped. `input_use_patch_overlaps: false` skips the
+patch-overlap detector and adds no overlap pairs to the fit (a rebuild
+setting). Every detector failure is reported together and stops
 the fit before training (detectors that already committed are named; a rerun
 reconciles them). `object_store_refresh_links: false` reads the store's
-current relationships read-only. Pending and approved relationships are used
+current relationships read-only.
+
+After a successful refresh the store records a link marker (not journaled;
+it adds no position and no hub sync carries it): the position, the fit
+volume, the link parameters, normal source and detector versions, and the
+selection. The next refresh skips the detectors when the marker's inputs
+match, the selection is the same or smaller, and nothing since its position
+touched a selected object, a detector relationship (point-surface,
+same-surface, crossing) or a volume registration. A service input update
+links only objects added since (pairs with a new object, partners found by
+stored bounds); those links are approximate (an existing PCL keeps its old
+surface link alongside one to a new surface), and the next startup refreshes
+in full. `object_store_full_link_refresh: true` always runs every detector.
+Each detector's mode and duration are logged, and its progress shows in the
+service's `input_preparation.progress` (stderr for a CLI fit).
+
+Pending and approved relationships are used
 and rejected ones never; `object_store_approved_links_only` uses approved ones
 only (refresh still runs, so new links stay pending and unused).
 
@@ -481,6 +452,16 @@ in fit-volume voxels. Tracks declare their frames like every other object;
 their crossings are found on the stored integer voxels and their arclength
 positions and clearances converted to fit voxels.
 
+`fit_volume_level` (default 0) fits at a pyramid level of the reference
+volume instead: a fit voxel is 2^level reference voxels, so the z range and
+every setting above are in that level's voxels. Object frames, the scroll's
+facts (shape, voxel size, umbilicus and Lasagna scales), the store's overlap
+pairs and the fiber directions a service extracts are converted to it; link
+refresh still works in the reference volume's own voxels, and exported
+surfaces and previews are written back in them. The winding-inference
+artifact and a `scroll_zarr` array are read as they are, so they must already
+be at that level. A checkpoint resumes only at the level it was written at.
+
 ### Tests and smoke checks
 
 From the repository root, with `vc_object_store`'s Python module on the path
@@ -493,13 +474,18 @@ PYTHONPATH=spiral-fitting:$VC_OBJECT_STORE_BUILD/python spiral-fitting/.venv/bin
   spiral-fitting/tests/test_object_store_fibers.py \
   spiral-fitting/tests/test_object_store_overlaps.py \
   spiral-fitting/tests/test_object_store_tracks.py \
-  spiral-fitting/tests/test_object_store_startup.py
+  spiral-fitting/tests/test_object_store_startup.py \
+  spiral-fitting/tests/test_object_store_positions.py \
+  spiral-fitting/tests/test_object_store_lazy_relink.py
 ```
 
-These build small stores and cover selection, frames and scales, refresh and
-its idempotency, aggregated failures, read-only and approved-only modes,
-two-rank startup (success, failure, manifest mismatch), resume refusal, tracks
-and their crossings (equal to the ones Spiral's own exact-crossing builder
+These build small stores (`tests/object_store_fixture.py`; shared fixtures in
+`tests/conftest.py`) and cover selection, frames and scales, refresh and its
+idempotency, aggregated failures, read-only and approved-only modes, two-rank
+startup (a rank-local failure, manifest mismatch), resume refusal, positions
+linked and pinned on a hub replica or a store shared in place (including
+edits racing the link refresh), lazy and incremental relinking, tracks and
+their crossings (equal to the ones Spiral's own exact-crossing builder
 finds), and the runtime constraints against
 `tests/data/object_store_reference.json`, which the removed file loader
 produced from the same fixture. An opt-in startup test refreshes and
@@ -1135,7 +1121,10 @@ and fiber-inference datasets from the VC3D project, and winding inference
 from `--winding-inference`. `GET /bindings` advertises the host bindings
 (`bindings.output_directory`, `cache_directory`, `winding_inference`), the
 capabilities, the bound store and its selection, and the checkpoints under
-the output directory that a load may name.
+the output directory that a load may name. Reading a large store's selection
+can take minutes, so `/bindings` never waits for it: until the background read
+for the store as it stands finishes, `inputs` is `{"pending": true}`; ask again
+for the summary.
 
 `--output` is required. Every piece
 of generated state — run directories, autosaves, previews, published
@@ -1286,6 +1275,7 @@ repository root; `vc_object_store`'s Python module on `PYTHONPATH`):
 AGENTS_AGENT_MODE=1 PYTHONPATH=spiral-fitting:<store-build>/python spiral-fitting/.venv/bin/python -m pytest -q \
   spiral-fitting/tests/test_service_object_store.py \
   spiral-fitting/tests/test_runtime_object_store.py \
+  spiral-fitting/tests/test_service_hub_positions.py \
   spiral-fitting/tests/test_service_mutations.py \
   spiral-fitting/tests/test_workspace_cleanup.py \
   spiral-fitting/tests/test_spiral_service_v2.py

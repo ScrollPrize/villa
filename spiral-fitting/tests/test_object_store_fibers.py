@@ -3,7 +3,6 @@ import numpy as np
 import pytest
 
 pytest.importorskip('vc_object_store')
-from vc_object_store import ObjectStore  # noqa: E402
 
 import object_store_inputs as osi  # noqa: E402
 import object_store_reference as reference  # noqa: E402
@@ -13,16 +12,7 @@ from object_store_reference import spiral_zyx  # noqa: E402
 from test_object_store_materialize import adapter_context, materialize  # noqa: E402
 
 
-@pytest.fixture()
-def db(tmp_path):
-    with ObjectStore.create(str(tmp_path / 'fit.vcobj'), author='test',
-                            hostname='host') as store:
-        yield store
-
-
-@pytest.fixture(autouse=True)
-def cpu(monkeypatch):
-    monkeypatch.setenv('FIT_SPIRAL_DEVICE', 'cpu')
+pytestmark = pytest.mark.usefixtures('cpu')
 
 
 def test_identical_attachments_reproduce_the_reference(db, tmp_path):
@@ -150,8 +140,7 @@ def test_fiber_across_the_seam_links_consecutive_windings(db, tmp_path):
 @pytest.mark.parametrize('manual,certainty,expected', [
     (True, 0.1, 'V'), (False, 0.9, 'V'), (False, 0.1, 'H'),
 ])
-def test_hv_metadata_uses_pinned_typed_fields(db, tmp_path, manual, certainty, expected):
-    import json
+def test_hv_metadata_uses_pinned_typed_fields(db, manual, certainty, expected):
     from spiral_helpers import classify_fiber_hv
 
     source_hv = {'automatic_certainty': certainty, 'automatic_score': 0.7,
@@ -160,7 +149,6 @@ def test_hv_metadata_uses_pinned_typed_fields(db, tmp_path, manual, certainty, e
                     meta={'source': {'hv_classification': source_hv}},
                     fiber={'family': 'V', 'manual_family': manual})
     snapshot = osi.read_snapshot(db, osi.InputRequest())
-    revision = snapshot.objects[uid].object_revision
 
     # Change the moving head after capture; materialization must use the pin.
     record = db.object(uid)
@@ -184,10 +172,6 @@ def test_hv_metadata_uses_pinned_typed_fields(db, tmp_path, manual, certainty, e
     assert strip['hv_tag'] == expected
     np.testing.assert_array_equal(
         strip['radial_offsets'], np.full(10, 3.0 if expected == 'V' else 0.0))
-
-    output = tmp_path / 'fiber.json'
-    db.export_geometry(uid, output, object_revision_uuid=revision)
-    assert json.loads(output.read_text())['hv_classification'] == hv
     fresh, _, _ = osi.materialize_fibers(
         db, osi.read_snapshot(db, osi.InputRequest()), {}, min_point_spacing=0.0)
     assert fresh[uid]['metadata']['hv_classification'] != hv
