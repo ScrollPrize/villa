@@ -67,10 +67,14 @@ target_sources(vc_reader_native PRIVATE
     "${CMAKE_CURRENT_LIST_DIR}/../src/cpp/zarr/store_metadata.cpp"
     "${CMAKE_CURRENT_LIST_DIR}/../src/cpp/zarr/writer.cpp")
 # CPU and CUDA composites evaluate the same unfused float32 formulas (the kernels
-# build with --fmad=false).
+# build with --fmad=false). Every translation unit holding a copy of the shared inline
+# surface math (grid/points.hpp) is unfused too: the linker keeps any one copy, and a
+# fused one (an FMA-capable -march) moves nearest-voxel ties.
 set_source_files_properties("${CMAKE_CURRENT_LIST_DIR}/../src/cpp/display/display.cpp"
     "${CMAKE_CURRENT_LIST_DIR}/../src/cpp/display/slab.cpp"
     "${CMAKE_CURRENT_LIST_DIR}/../src/cpp/composite/reduce.cpp"
+    "${CMAKE_CURRENT_LIST_DIR}/../src/cpp/projection/mask.cpp"
+    "${CMAKE_CURRENT_LIST_DIR}/../src/cpp/projection/transfer.cpp"
     "${CMAKE_CURRENT_LIST_DIR}/../src/cpp/grid/grid.cpp" PROPERTIES
     COMPILE_OPTIONS "$<$<CXX_COMPILER_ID:GNU,Clang,AppleClang>:-ffp-contract=off>")
 add_library(vc_reader::reader ALIAS vc_reader_native)
@@ -95,7 +99,7 @@ if(VC_READER_ENABLE_CUDA)
     # Separate float32 rounding preserves geometric ties and filter agreement.
     set_source_files_properties(src/cpp/projection/kernels.cu src/cpp/sheet_normal/kernels.cu
         src/cpp/geometry/kernels.cu src/cpp/composite/kernels.cu src/cpp/grid/kernels.cu src/cpp/display/kernels.cu
-        PROPERTIES COMPILE_OPTIONS "--fmad=false")
+        PROPERTIES COMPILE_OPTIONS "--fmad=false;$<$<CXX_COMPILER_ID:GNU,Clang>:-Xcompiler=-ffp-contract=off>")
     target_compile_definitions(vc_reader_reader_cuda PUBLIC VC_READER_CUDA=1)
     target_link_libraries(vc_reader_reader_cuda PUBLIC vc_reader::headers CUDA::cudart)
     target_link_libraries(vc_reader_native PUBLIC vc_reader::reader_cuda)
