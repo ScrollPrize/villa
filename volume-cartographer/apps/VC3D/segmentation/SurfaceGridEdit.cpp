@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <string>
+#include <utility>
 
 namespace segmentation
 {
@@ -61,6 +62,7 @@ bool resizeSurfaceGrid(QuadSurface& surface, int top, int bottom, int left, int 
     }
 
     const cv::Size oldSize = points->size();
+    std::vector<std::pair<std::string, cv::Mat>> resizedChannels;
     for (const std::string& name : surface.channelNames()) {
         // Loads the channel if it is still only on disk, so the saved copy is
         // rewritten at the new size instead of staying misaligned.
@@ -71,15 +73,17 @@ bool resizeSurfaceGrid(QuadSurface& surface, int top, int bottom, int left, int 
         const int fy = channelFactor(channel.rows, oldSize.height);
         const int fx = channelFactor(channel.cols, oldSize.width);
         if (fy == 0 || fx == 0) {
-            cv::resize(channel, channel, oldSize, 0, 0, cv::INTER_NEAREST);
-            surface.setChannel(name, resizeBorder(channel, top, bottom, left, right, cv::Scalar::all(0)));
-        } else {
-            surface.setChannel(name, resizeBorder(channel, top * fy, bottom * fy, left * fx, right * fx,
-                                                  cv::Scalar::all(0)));
+            // Resampling would lose pixels that cropping on Cancel cannot restore.
+            return false;
         }
+        resizedChannels.emplace_back(name, resizeBorder(channel, top * fy, bottom * fy, left * fx, right * fx,
+                                                         cv::Scalar::all(0)));
     }
 
     cv::Mat resized = resizeBorder(*points, top, bottom, left, right, cv::Scalar(-1.0, -1.0, -1.0));
+    for (const auto& [name, channel] : resizedChannels) {
+        surface.setChannel(name, channel);
+    }
     *points = cv::Mat_<cv::Vec3f>(resized);
     surface.invalidateCache();
     return true;

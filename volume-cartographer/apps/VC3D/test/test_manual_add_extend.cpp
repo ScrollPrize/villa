@@ -61,6 +61,7 @@ private slots:
     void extensionRefusesWithoutRoom();
     void clearPendingDropsTheExtension();
     void resizeSurfaceGridKeepsChannelsAligned();
+    void resizeSurfaceGridRejectsLossyChannels();
     void maskCellsBecomeValid();
     void maskedFillSurvivesReload();
     void dragPicksTheNearestEdgeStretch();
@@ -264,6 +265,31 @@ void TestManualAddExtend::resizeSurfaceGridKeepsChannelsAligned()
 
     QVERIFY(!segmentation::resizeSurfaceGrid(surface, -4, 0, 0, 0));
     QCOMPARE(surface.rawPointsPtr()->size(), points.size());
+}
+
+void TestManualAddExtend::resizeSurfaceGridRejectsLossyChannels()
+{
+    const auto points = flatSheet(4, 5, cv::Rect(0, 0, 5, 4));
+    QuadSurface surface(points.clone(), cv::Vec2f(0.5f, 0.5f));
+    cv::Mat_<uint8_t> aligned(8, 10, uint8_t{7});
+    cv::Mat_<uint8_t> unaligned(7, 9);
+    for (int y = 0; y < unaligned.rows; ++y)
+        for (int x = 0; x < unaligned.cols; ++x)
+            unaligned(y, x) = static_cast<uint8_t>(y * unaligned.cols + x);
+    surface.setChannel("aligned", aligned.clone());
+    surface.setChannel("unaligned", unaligned.clone());
+
+    for (int sign : {1, -1}) {
+        QVERIFY(!segmentation::resizeSurfaceGrid(surface, sign, 0, sign, 0));
+        QCOMPARE(surface.rawPointsPtr()->size(), points.size());
+        QCOMPARE(cv::norm(*surface.rawPointsPtr(), points, cv::NORM_INF), 0.0);
+        for (const auto& name : {"aligned", "unaligned"}) {
+            const cv::Mat expected = std::string(name) == "aligned" ? aligned : unaligned;
+            const cv::Mat actual = surface.channel(name, SURF_CHANNEL_NORESIZE);
+            QCOMPARE(actual.size(), expected.size());
+            QCOMPARE(cv::norm(actual, expected, cv::NORM_INF), 0.0);
+        }
+    }
 }
 
 void TestManualAddExtend::maskCellsBecomeValid()

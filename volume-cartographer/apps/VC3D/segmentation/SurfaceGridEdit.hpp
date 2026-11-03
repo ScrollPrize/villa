@@ -13,8 +13,9 @@ namespace segmentation
 // New vertices are invalid (-1, -1, -1); every channel, including ones not yet
 // loaded from disk, is padded or cropped with it so it stays aligned with the
 // points. Channels stored at an integer multiple of the grid resolution keep
-// that resolution. Returns false and leaves the surface unchanged if a crop
-// would remove the whole grid.
+// that resolution. Returns false and leaves the geometry and channel pixels
+// unchanged if a crop would remove the whole grid or a channel's dimensions
+// are not integer multiples of the grid dimensions.
 bool resizeSurfaceGrid(QuadSurface& surface, int top, int bottom, int left, int right);
 
 // Sets the "mask" channel to valid at the given grid cells (x = column,
