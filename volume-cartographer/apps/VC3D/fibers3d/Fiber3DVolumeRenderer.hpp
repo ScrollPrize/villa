@@ -26,7 +26,8 @@ public:
         float low,
         float high,
         float opacity,
-        bool interactive);
+        bool interactive,
+        int maxRaySamples = 512);
     const QString& error() const { return error_; }
 
 private:

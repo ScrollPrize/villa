@@ -2517,4 +2517,3 @@ void MenuActionController::importIntoObjectStore()
         }
     }));
 }
-

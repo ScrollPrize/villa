@@ -288,6 +288,18 @@ add_test(NAME seeding_batch_tracker COMMAND test_seeding_batch_tracker)
 vc_register_test_target(test_seeding_batch_tracker)
 vc_register_ctest(seeding_batch_tracker test_seeding_batch_tracker)
 
+add_executable(test_fiber_collection_generator
+    test_fiber_collection_generator.cpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/FiberCollectionGenerator.cpp)
+set_target_properties(test_fiber_collection_generator PROPERTIES
+    AUTOMOC ON AUTOUIC OFF AUTORCC OFF)
+target_include_directories(test_fiber_collection_generator PRIVATE
+    ${PROJECT_SOURCE_DIR}/apps/VC3D)
+target_link_libraries(test_fiber_collection_generator PRIVATE Qt6::Core Qt6::Test)
+add_test(NAME fiber_collection_generator COMMAND test_fiber_collection_generator)
+vc_register_test_target(test_fiber_collection_generator)
+vc_register_ctest(fiber_collection_generator test_fiber_collection_generator)
+
 add_executable(test_fiber_save_batch_tracker
     test_fiber_save_batch_tracker.cpp)
 
@@ -635,10 +647,13 @@ set_tests_properties(spiral_brush_patch PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=
 # The VC3D app target only exists with VC_BUILD_APPS; CI runs these tests from
 # the VC3D compile-and-smoke job.
 if(TARGET VC3D)
+    add_test(NAME scene_3d_panel COMMAND VC3D --test-scene-3d)
+    set_tests_properties(scene_3d_panel PROPERTIES TIMEOUT 180)
     add_test(NAME object_store_vc3d_controller COMMAND VC3D --test-object-store)
     set_tests_properties(object_store_vc3d_controller PROPERTIES
         ENVIRONMENT "QT_QPA_PLATFORM=offscreen" TIMEOUT 90)
     vc_register_test_target(VC3D)
+    vc_register_ctest(scene_3d_panel VC3D)
     vc_register_ctest(object_store_vc3d_controller VC3D)
     add_test(NAME surface_panel_store COMMAND VC3D --test-surface-panel)
     set_tests_properties(surface_panel_store PROPERTIES
@@ -710,6 +725,7 @@ vc_register_ctest(fiber_3d_surface test_fiber_3d_surface)
 
 add_executable(test_fiber_3d_canvas test_fiber_3d_canvas.cpp
     ../fibers3d/Fiber3DCanvas.cpp
+    ../scene3d/Scene3DCanvas.cpp
     ../fibers3d/Fiber3DSlices.cpp ../fibers3d/Fiber3DCT.cpp
     ../fibers3d/Fiber3DVolumeRenderer.cpp ../volume_viewers/VolumetricCompositor.cpp
     ../fibers3d/Fiber3DSurfaceRenderer.cpp ../fibers3d/Fiber3DSurfaceProximity.cpp)
