@@ -495,9 +495,10 @@ private:
     // The background read of chunks frames lacked: one at a time; the newest
     // frame's request waits and replaces older waiting ones. `_loadSuperseded`
     // cancels the running read's chunk reads not yet started when a newer request
-    // is waiting.
+    // of a moved view is waiting; `_loadJob` is the frame of the newest request.
     bool _loadRunning = false;
     std::optional<vc3d::ViewerLoad> _pendingLoad;
+    std::optional<PendingRenderJob> _loadJob;
     std::shared_ptr<std::atomic<bool>> _loadSuperseded;
     QString _loadError;
 

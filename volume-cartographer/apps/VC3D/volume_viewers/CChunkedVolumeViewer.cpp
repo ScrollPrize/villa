@@ -2089,10 +2089,14 @@ void CChunkedVolumeViewer::finishRenderOnMainThread(std::shared_ptr<RenderResult
     _framebuffer = std::move(result->framebuffer);
     _displayedRenderJob = result->renderJob;
     _lastRenderResult = result;
-    // Read what this frame lacked; it replaces an older waiting request.
+    // Read what this frame lacked; it replaces an older waiting request. A moved
+    // view cancels the running read; a repaint of the same view (one a read's own
+    // arrival asked for) lets it finish, or a GPU load would discard its bricks.
     if (!result->load.empty()) {
+        const bool viewMoved = !_loadJob || !renderJobsSameGeometry(*_loadJob, result->renderJob);
         _pendingLoad = std::move(result->load);
-        if (_loadSuperseded)
+        _loadJob = result->renderJob;
+        if (viewMoved && _loadSuperseded)
             _loadSuperseded->store(true);
         startPendingLoad();
     }
