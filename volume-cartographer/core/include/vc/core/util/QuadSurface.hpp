@@ -375,6 +375,14 @@ public:
         _components = std::move(components);
         dropPointSurface();
     }
+    // How positions between vertices are interpolated (gridOptions(); vcr::grid's
+    // default unless set). Surfaces built from polylines set linear to pass through them.
+    vcr::grid::Interpolation interpolation() const { return _interpolation; }
+    void setInterpolation(vcr::grid::Interpolation interpolation)
+    {
+        _interpolation = interpolation;
+        dropPointSurface();
+    }
 
     // The non-const accessors hand out the points to be edited, so they drop the
     // vcr::grid::Surface that coord() and normal() use; it is rebuilt on the next call.
@@ -483,6 +491,7 @@ protected:
     // Column ranges of disconnected surface components (meta "components").
     // Each pair is [col_start, col_end). Empty = single contiguous surface.
     std::vector<std::pair<int,int>> _components;
+    vcr::grid::Interpolation _interpolation = vcr::grid::SurfaceOptions{}.interpolation;
     float dpi_ = 0.f;
 
 private:

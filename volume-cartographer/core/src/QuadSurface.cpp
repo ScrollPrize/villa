@@ -355,6 +355,7 @@ vcr::grid::SurfaceOptions QuadSurface::gridOptions() const
 {
     vcr::grid::SurfaceOptions options;
     options.components = _components;
+    options.interpolation = _interpolation;
     return options;
 }
 

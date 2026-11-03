@@ -584,6 +584,9 @@ std::shared_ptr<QuadSurface> buildRibbon(const std::vector<SegmentNormalSample>&
         points,
         cv::Vec2f{static_cast<float>(1.0 / alongSpacing),
                   static_cast<float>(1.0 / crossSpacing)});
+    // The strips are built along the line's polyline: linear patches keep the line on
+    // them between support columns (bicubic would bow it off the line).
+    surface->setInterpolation(vcr::grid::Interpolation::Linear);
     return surface;
 }
 
