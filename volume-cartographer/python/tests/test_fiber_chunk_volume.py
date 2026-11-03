@@ -148,7 +148,7 @@ def test_resume_flags_and_legacy(inputs):
     c.conflict_normal_base, c.conflict_tangent_base = 10, 20
     assert run(inputs, c, keys=((2, 0, 0),))["annotated"] == 1
     files[0].write_bytes(b"invalid cache")
-    with pytest.raises(RuntimeError, match="chunk cache frame"):
+    with pytest.raises(RuntimeError, match="cannot decompress chunk paths"):
         run(inputs, c)
     assert files[0].read_bytes() == b"invalid cache"
 

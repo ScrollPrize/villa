@@ -2,6 +2,7 @@
 import importlib.abc
 import importlib.machinery
 import json
+import os
 from pathlib import Path
 import sys
 
@@ -44,6 +45,8 @@ def pytest_configure(config):
         raise pytest.UsageError(f"No built vc package in {root}")
     if any(name == "vc" or name.startswith("vc.") for name in sys.modules):
         raise pytest.UsageError("vc was imported before selecting the test build")
+    # Launchers the tests start (scripts/run_fiber_chunk_volume.py) load the same build.
+    os.environ["VC_BUILD_DIR"] = str(root.parent)
 
     class BuildFinder(importlib.abc.MetaPathFinder):
         def find_spec(self, fullname, path=None, target=None):
