@@ -121,61 +121,6 @@ comparing a CPU run with an MPS one. `get_ink_metrics.py --device` picks the
 nnU-Net device; without it the folds take CUDA, else MPS, else the CPU, whatever
 the fitting variables say.
 
-## Editing input snapshots
-
-`input_snapshot.py` snapshots directory trees (it served the file-input editing
-workspace, which the object store replaced; the service no longer calls it).
-It tries Linux `FICLONE` or macOS `clonefile` for independent copy-on-write
-files. Unsupported
-filesystems and cross-filesystem copies fall back to a streamed copy; other I/O
-errors propagate. Hard links are never used.
-
-The fallback hashes bytes while copying, verifies the destination, and compares
-the final source fingerprint with the captured tree. Clones are hashed once and
-compared with the final source. This reduces full content reads from four to
-three for ordinary copies and two for clones. Snapshots retain the existing
-SHA-256 format, sorted tree membership, empty directories and symlink rejection.
-Changes during capture that leave the source different from the captured bytes
-are rejected. No model inputs, precision or numerical algorithms change.
-
-Run the focused tests using the existing environment, from the repository root:
-
-```sh
-PYTHONPATH=spiral-fitting spiral-fitting/.venv/bin/python -m pytest -q \
-  spiral-fitting/tests/test_input_snapshot.py
-```
-
-Benchmark real patches (temporary copies are removed; sources stay unchanged):
-
-```sh
-PYTHONPATH=spiral-fitting spiral-fitting/.venv/bin/python \
-  spiral-fitting/tests/benchmark_input_snapshots.py \
-  /home/sean/Desktop/spiral_dataset/verified_patches --iterations 5 --profile
-```
-
-Use `--destination PATH` to test another filesystem. The default is `/tmp`.
-`--count` selects the first N sorted patch directories (default 32).
-
-Measured on Linux arm64, CPython 3.14, without Python optimization flags, with
-`cProfile` enabled for both versions: 32 real verified patches, 55,302,864 bytes,
-five iterations, ordinary-copy fallback on the local ext-family filesystem.
-These are cache-warm measurements, not end-to-end fit initialization times.
-
-| Snapshot implementation | Mean | Min | Median | Max |
-| --- | ---: | ---: | ---: | ---: |
-| Previous copy plus three hash passes | 166.8 ms | 160.8 ms | 162.2 ms | 181.0 ms |
-| Streamed copy/hash plus verification | 152.3 ms | 148.9 ms | 153.2 ms | 154.0 ms |
-
-Mean time decreased 8.7%. Before the change, fingerprint calls accounted for
-0.649 s of 0.834 s total across all five iterations; file copying accounted for
-0.177 s. Afterwards, hashing remains the largest cost (0.336 s in SHA-256 updates),
-but the separate source pre-read is eliminated. Reflink throughput and actual
-macOS cloning require validation on supporting filesystems; unit tests cover
-the platform dispatch and fallback/error paths.
-
-Filesystem API references: [Linux FICLONE](https://man7.org/linux/man-pages/man2/FICLONE.2const.html)
-and [Apple file cloning support](https://developer.apple.com/documentation/foundation/urlresourcevalues/volumesupportsfilecloning).
-
 ## Input manifest
 
 `fit_spiral.py --inputs MANIFEST` names every input a command-line fit reads
