@@ -34,6 +34,7 @@ vesuvius.predict \
 | `--tta_type` / `--disable_tta` | Choose `rotation` (default) or `mirroring`, or disable test-time augmentation.
 | `--num_parts` / `--part_id` | Partition inference so multiple machines can process different chunks.
 | `--bbox` | Restrict inference to a region of interest: `"z0:z1,y0:y1,x0:x1"` in global voxel coordinates, half-open. Omit a bound to reach the volume edge (`"1000:1400,:,2000:"`). See [Region-of-interest inference](#region-of-interest-inference).
+| `--blend_in_memory OUTPUT_PATH` | Blend the patches in RAM and write the finalized output (what `blend_and_finalize` would write) to `OUTPUT_PATH`, with no per-patch logits on disk. Takes `--mode`, `--threshold`/`--threshold_value`, `--blend_sigma_scale`, `--blend_chunk_size` and `--blend_compression_level`. See [Blending in memory](#blending-in-memory).
 | `--chunk_cache_mb` | Keep up to this many MB of fetched input chunks in an in-memory LRU cache (zarr 3), so overlapping patches do not download the same chunks again. Each DataLoader worker keeps its own cache. Default `0` (off).
 | `--overlap` | Fractional patch overlap (0–1, default `0.5`).
 | `--batch_size` | Inference batch size (default `1`).
@@ -93,6 +94,32 @@ Notes:
 - An ROI smaller than the model patch size along an axis is grown to the patch size and
   shifted back inside the volume, so the model always sees a full patch.
 - Bounds are clamped to the volume; a bbox entirely outside it is an error.
+
+### Blending in memory
+
+For a region that fits in RAM, `--blend_in_memory` replaces stages 1 and 2 (or
+`blend_and_finalize`) with one command. Instead of writing every patch's logits and reading
+them back, `predict` keeps the two running sums the blend needs, sum(w * logits) and sum(w),
+over the region the patches cover, and writes the finalized output when inference ends:
+
+```bash
+vesuvius.predict --model_path /path/to/model \
+    --input_dir s3://vesuvius-challenge-open-data/<scroll>/volumes/<volume>.zarr --input_anon \
+    --output_dir /tmp/unused --bbox "2000:2512,1000:1512,1000:1512" \
+    --blend_in_memory /tmp/final.zarr
+```
+
+The output has the same shape, chunks, dtype and values as
+`vesuvius.blend_and_finalize <output_dir> /tmp/final.zarr` on the logits the staged run would have
+written. Where patches overlap, the float32 sums are added in patch order rather than in the
+order the chunked blend visits them, so a voxel can occasionally differ by one uint8 step.
+
+Memory: `(num_classes + 1) * 4` bytes per voxel of the region the patches cover, which is the
+bbox grown by up to one patch on each side. For a 512³ bbox and the 2-class m7 surface model
+(192³ patches) that region is 862 × 863 × 863 voxels, 7.2 GiB. `predict` checks this against the
+available memory before inference starts.
+`--blend_in_memory` cannot be combined with `--num_parts > 1`; split whole-scroll runs still go
+through `blend_logits` / `blend_and_finalize`.
 
 ## Stage 2 — `vesuvius.blend_logits`
 
