@@ -75,13 +75,14 @@ template<class T> inline void cpu(const T* image,const float* centers,float* out
         std::fill_n(output+b*4,4,0.f);
         if(!centers[4*b+3]) continue;
         const T* src=image+b*width*width*width;
+        // Separate product and sum statements keep float32 rounding where Clang would fuse them (arm64), like --fmad=false in CUDA.
         for(int c=0;c<4;++c) for(int zz=0;zz<sites;++zz) {
             float* dst=z.get()+c*zcount+zz*width*width;
             std::fill_n(dst,width*width,0.f);
             for(int j=0;j<13;++j) {
                 const T* plane=src+(3*zz+j)*width*width;
                 const float w=k.taps[c][j];
-                for(int i=0;i<width*width;++i) dst[i]+=w*(float(plane[i])*(1.f/255.f));
+                for(int i=0;i<width*width;++i) { const float term=w*(float(plane[i])*(1.f/255.f)); dst[i]+=term; }
             }
         }
         for(int c=0;c<6;++c) for(int zz=0;zz<sites;++zz) for(int yy=0;yy<sites;++yy) {
@@ -90,13 +91,13 @@ template<class T> inline void cpu(const T* image,const float* centers,float* out
             std::fill_n(dst,width,0.f);
             for(int j=0;j<13;++j) {
                 const float* row=z.get()+zc*zcount+(zz*width+3*yy+j)*width;
-                for(int xx=0;xx<width;++xx) dst[xx]+=k.taps[yc][j]*row[xx];
+                for(int xx=0;xx<width;++xx) { const float term=k.taps[yc][j]*row[xx]; dst[xx]+=term; }
             }
         }
         for(int c=0;c<6;++c) for(int i=0;i<count;++i) {
             int xc=2*(c/3)+(c%3==0), x=i%sites, row=i/sites;
             float value=0;
-            for(int j=0;j<13;++j) value+=k.taps[xc][j]*y[c*ycount+row*width+3*x+j];
+            for(int j=0;j<13;++j) { const float term=k.taps[xc][j]*y[c*ycount+row*width+3*x+j]; value+=term; }
             g[c*count+i]=value;
         }
         for(int i=0;i<count;++i) mags[i]=magnitude(g[3*count+i],g[4*count+i],g[5*count+i]);

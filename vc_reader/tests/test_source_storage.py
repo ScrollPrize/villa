@@ -8,11 +8,13 @@ import http.server
 import json
 import math
 import multiprocessing
+import os
 from pathlib import Path
 import pickle
 import sqlite3
 import tempfile
 import threading
+import sys
 import time
 import unittest
 import zlib
@@ -41,6 +43,18 @@ def process_read(reader):
 def read_remote_source(source, options):
     with source.open(**options) as reader:
         return reader.read((0, 0), (5, 7))
+
+
+def open_new_caches(barrier, root, rounds):
+    from vc_reader import _reader
+    failures = 0
+    for i in range(rounds):
+        barrier.wait()
+        try:
+            _reader.DiskCache(os.path.join(root, str(i)), -1)
+        except RuntimeError:
+            failures += 1
+    sys.exit(failures)
 
 
 def array(path, data, attrs=None, fill=0):
@@ -362,6 +376,19 @@ class StorageTests(FixtureCase):
                         axes=('z', 'c', 'y', 'x'))
         with stack.open() as reader:
             np.testing.assert_array_equal(reader.read((0, 7, 9), (2, 5, 7)), 2**40)
+
+    def test_processes_released_together_open_one_new_cache(self):
+        # Each round releases every worker at once on a directory nobody has
+        # opened, so they all create and convert the same index together.
+        context = multiprocessing.get_context('spawn')
+        barrier = context.Barrier(4, timeout=60)
+        workers = [context.Process(target=open_new_caches, args=(barrier, str(self.root/'cache'), 10))
+                   for _ in range(4)]
+        for worker in workers:
+            worker.start()
+        for worker in workers:
+            worker.join(120)
+        self.assertEqual([worker.exitcode for worker in workers], [0]*4)
 
 
 class RemoteFixtureCase(FixtureCase):
@@ -703,10 +730,21 @@ class RemoteTests(RemoteFixtureCase):
             old.read((0, 0), (5, 7))
         old.close()
 
+    def test_uncached_remote_image_under_a_symlinked_temp_dir(self):
+        # The default temporary directory on macOS is under the /var -> /private/var symlink.
+        (self.root/'real-tmp').mkdir()
+        (self.root/'link-tmp').symlink_to(self.root/'real-tmp', target_is_directory=True)
+        source = Source('linked', Storage(self.url+'/image.png', 'png'))
+        with patch('tempfile.tempdir', str(self.root/'link-tmp')):
+            with source.open(cache_writes=False) as reader:
+                np.testing.assert_array_equal(reader.read((0, 0), (5, 7)), self.data)
+
     def test_remote_process_population_temporary_limit_and_shared_chunk_budget(self):
         source = Source('workers', Storage(self.url+'/image.png', 'png'))
+        # Forked children cannot open the disk cache with Apple's system SQLite ("locking protocol" or a crash).
+        methods = ('spawn',) if sys.platform == 'darwin' else ('spawn', 'fork')
         with source.open(cache_dir=self.cache) as reader:
-            for method in ('spawn', 'fork'):
+            for method in methods:
                 if method not in multiprocessing.get_all_start_methods():
                     continue
                 with multiprocessing.get_context(method).Pool(2) as pool:
@@ -728,7 +766,7 @@ class RemoteTests(RemoteFixtureCase):
         disk_budget(str(self.cache), limit)
         with zarr.open(cache_dir=self.cache) as reader:
             np.testing.assert_array_equal(reader.read((0, 0), (5, 7)), self.data)
-            self.assertEqual(reader._backend.reader.write_layer.budget_root, str(self.cache))
+            self.assertEqual(reader._backend.reader.write_layer.budget_root, str(self.cache.resolve()))
         with source.open(cache_dir=self.cache) as reader:
             np.testing.assert_array_equal(reader.read((0, 0), (5, 7)), self.data)
         import sqlite3

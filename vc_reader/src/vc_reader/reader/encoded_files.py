@@ -79,7 +79,8 @@ class EncodedFiles:
         if root is None or not self.cache_writes:
             if self._temp is None:
                 self._temp = tempfile.TemporaryDirectory(prefix='vc-reader-images-')
-            root = Path(self._temp.name)
+            # Resolved like the cache roots above: the disk budget canonicalizes its root.
+            root = Path(self._temp.name).resolve()
         # None reuses the configured directory limit, or the reader's 1 GiB default
         # for a new directory. It never resets another reader's explicit budget.
         budget = disk_budget(str(root), self.max_bytes)

@@ -31,7 +31,17 @@ public:
         }
         sqlite3_busy_timeout(db_, 60000);
         try {
-            exec("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;"
+            // Switching a new index to WAL takes a write lock while holding a read
+            // lock, and SQLite returns SQLITE_BUSY without calling the busy handler
+            // when another connection is switching it too. Retry: the next attempt
+            // finds the index already in WAL mode.
+            for (int waited = 0, delay = 1;; waited += delay, delay = std::min(2 * delay, 100)) {
+                const int rc = sqlite3_exec(db_, "PRAGMA journal_mode=WAL", nullptr, nullptr, nullptr);
+                if (rc == SQLITE_OK) break;
+                if (rc != SQLITE_BUSY || waited >= 60000) throw std::runtime_error(sqlite3_errmsg(db_));
+                sqlite3_sleep(delay);
+            }
+            exec("PRAGMA synchronous=NORMAL;"
                  "CREATE TABLE IF NOT EXISTS budget(id INTEGER PRIMARY KEY, max_bytes INTEGER,"
                  " total INTEGER NOT NULL DEFAULT 0, clock INTEGER NOT NULL DEFAULT 0);"
                  "INSERT OR IGNORE INTO budget(id,max_bytes) VALUES(1,1073741824);"
