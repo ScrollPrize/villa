@@ -83,6 +83,7 @@ fi
     libscotch-dev \
     libscotchmetis-dev \
     libsqlite3-dev \
+    libssl-dev \
     libsuitesparse-dev \
     libtiff-dev \
     libzstd-dev \
