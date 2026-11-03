@@ -282,6 +282,7 @@ OBJECT_STORE_INPUT_KEYS = frozenset({
     "object_store_author",
     "object_store_input_position",
     "object_store_refresh_links",
+    "object_store_full_link_refresh",
     "object_store_approved_links_only",
     "object_store_allow_changed_inputs",
     "object_store_patch_uuids",
@@ -668,6 +669,10 @@ class Config:
         # position it prepared; a client never does.
         self.object_store_input_position = None
         self.object_store_refresh_links = True
+        # A refresh skips the detectors when the store's link marker shows the
+        # links current, and an input update links only new objects; true
+        # always runs every detector over the whole selection.
+        self.object_store_full_link_refresh = False
         self.object_store_approved_links_only = False
         self.object_store_allow_changed_inputs = False
         # Object selection per kind: None selects every active object with

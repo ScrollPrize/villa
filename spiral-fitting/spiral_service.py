@@ -1739,7 +1739,8 @@ class ServiceState:
                 "error", f"The inputs could not be updated; the fit is unchanged: {cause}",
                 severity="error", source="service", operation="updating_inputs")
         try:
-            prepared = self._prepare_position(config, paths, scroll, minimum)
+            prepared = self._prepare_position(config, paths, scroll, minimum,
+                                              incremental=True)
         except BaseException as exc:
             refused(exc, "linking")
             return
@@ -2024,10 +2025,24 @@ class ServiceState:
                 "they were linked; retry")
         return prepared, volume, paths, spec
 
-    def _prepare_position(self, config, paths, scroll, minimum, *, volume=False):
+    def _input_progress(self):
+        """A ProgressReporter publishing to the input preparation's status
+        (``input_preparation.progress``) while one is active."""
+        from spiral_progress import ProgressReporter
+
+        def publish(snapshot):
+            with self.lock:
+                if self._input_preparation is not None:
+                    self._input_preparation["progress"] = snapshot
+                    self.status_generation += 1
+        return ProgressReporter(publish, stream=sys.stderr)
+
+    def _prepare_position(self, config, paths, scroll, minimum, *, volume=False,
+                          incremental=False):
         """Link and pin a position for ``config`` on the bound store; with
         ``volume``, also the fit volume pinned there (``(prepared,
-        volume)``)."""
+        volume)``). ``incremental`` (an input update) links only objects
+        selected since the store's last refresh, when nothing else changed."""
         from vc_object_store import ObjectStore
         from fit_session import lasagna_normal_inputs
         from object_store_inputs import (fit_volume_at, prepare_position,
@@ -2043,14 +2058,19 @@ class ServiceState:
             self.events.append("log", line, source="service",
                                operation="preparing_inputs")
         request = request_from_config(config)
-        with ObjectStore.open(self.object_store.path,
-                              author=self.object_store.author) as store:
-            prepared = prepare_position(
-                store, config, request, lasagna=lasagna,
-                minimum=minimum, cache_directory=cache, log=log)
-            if not volume:
-                return prepared
-            return prepared, fit_volume_at(store, request, prepared)
+        progress = self._input_progress()
+        try:
+            with ObjectStore.open(self.object_store.path,
+                                  author=self.object_store.author) as store:
+                prepared = prepare_position(
+                    store, config, request, lasagna=lasagna,
+                    minimum=minimum, cache_directory=cache, log=log,
+                    incremental=incremental, progress=progress)
+                if not volume:
+                    return prepared
+                return prepared, fit_volume_at(store, request, prepared)
+        finally:
+            progress.close()
 
     def _prepare_fiber_directions(self, scroll, volume, paths, config):
         """Opted-in hosts extract the fiber directions a fit with the
@@ -2102,15 +2122,8 @@ class ServiceState:
                         "an accessible local array. Prepare the pack where the "
                         "arrays are and copy it into the service cache.")
         from lasagna_data import ensure_fit_sparse_stores, _require_sidecar
-        from spiral_progress import ProgressReporter
 
-        def publish(snapshot):
-            with self.lock:
-                if self._input_preparation is not None:
-                    self._input_preparation["progress"] = snapshot
-                    self.status_generation += 1
-
-        progress = ProgressReporter(publish, stream=sys.stderr)
+        progress = self._input_progress()
         try:
             ensure_fit_sparse_stores(
                 source=source, cache_directory=paths.cache_directory,

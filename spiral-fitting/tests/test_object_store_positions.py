@@ -78,8 +78,8 @@ def _lease_and(uuid, edit):
     return change
 
 
-def prepare(path, **options):
-    config = fit_config(path)
+def prepare(path, config=None, **options):
+    config = config or fit_config(path)
     request = osi.request_from_config(config)
     log = []
     with ObjectStore.open(path, author='service') as store:
@@ -231,7 +231,8 @@ def test_a_conflicting_approval_keeps_the_hub_side(hub, monkeypatch):
         return outcomes
 
     monkeypatch.setattr(osi, 'refresh_links', conflicting)
-    prepared = prepare(hub['service'])
+    prepared = prepare(hub['service'], config=fit_config(hub['service'],
+                                                          object_store_full_link_refresh=True))
     assert prepared.position.sequence > first.position.sequence and prepared.attempts >= 2
     with ObjectStore.open(hub['service'], read_only=True) as db:
         view = db.hub_read_view_at(prepared.position.sequence)

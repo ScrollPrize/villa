@@ -85,16 +85,22 @@ def test_default_refresh_writes_links_and_freezes_the_inputs(store_path):
     assert any('fiber_patch: skipped (no selected fibers)' in line for line in log)
     assert inputs.manifest['link_refresh']['enabled']
     assert inputs.manifest['materialization']['pcl_patch_overlap_max_pairs'] == 16
-    # A rerun reconciles idempotently: same relationships, same frozen inputs.
-    again = load(store_path)
+    # A rerun finds the links current (the store's link marker) and runs no
+    # detector: same relationships, same frozen inputs.
+    rerun = []
+    again = load(store_path, rerun)
     assert _edges(store_path) == edges
     assert again.digest == inputs.digest
-    assert any('3 unchanged' in line for line in _refresh_lines(store_path))
+    assert any(line.startswith('link refresh: skip: unchanged since position') for line in rerun)
+    assert not any('running' in line for line in rerun)
+    # A forced full refresh reconciles idempotently.
+    assert any('3 unchanged' in line
+               for line in _refresh_lines(store_path, object_store_full_link_refresh=True))
 
 
-def _refresh_lines(path):
+def _refresh_lines(path, **overrides):
     log = []
-    load(path, log)
+    load(path, log, **overrides)
     return log
 
 

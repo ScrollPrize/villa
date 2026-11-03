@@ -26,11 +26,13 @@ materializes and derives the training views exactly as a fit with that
 configuration would, failing on the same validation errors.
 """
 import argparse
+import contextlib
 import dataclasses
 import hashlib
 import json
 import os
 import sys
+import time
 from collections import Counter
 
 import numpy as np
@@ -1755,12 +1757,29 @@ DETECTORS = (
 )
 
 
+# Detectors that link incrementally (refresh_links ``new``), with the object
+# kinds whose new objects each examines.
+INCREMENTAL_KINDS = {
+    'pcl_patch': ('point_collection', 'surface'),
+    'fiber_patch': ('fiber', 'surface'),
+    'patch_overlap': ('surface',),
+}
+
+
 @dataclasses.dataclass
 class RefreshOutcome:
     detector: str
     skipped: str = None
     report: dict = None
     error: str = None
+    # 'full' or 'incremental over N new object(s)'; None when skipped.
+    mode: str = None
+    seconds: float = None
+
+    def _timing(self):
+        parts = [part for part in (self.mode, None if self.seconds is None
+                                   else f'{self.seconds:.1f} s') if part]
+        return f' [{", ".join(parts)}]' if parts else ''
 
     @property
     def failed(self):
@@ -1774,7 +1793,7 @@ class RefreshOutcome:
         if self.skipped is not None:
             return [f'link refresh {self.detector}: skipped ({self.skipped})']
         if self.error is not None:
-            return [f'link refresh {self.detector}: FAILED: {self.error}']
+            return [f'link refresh {self.detector}: FAILED: {self.error}{self._timing()}']
         report = self.report
         lines = [
             f'link refresh {self.detector}: {report["edges_created"]} created, '
@@ -1782,7 +1801,7 @@ class RefreshOutcome:
             f'{report["edges_skipped_existing"]} unchanged, '
             f'{report["stale_removed"]} stale removed '
             f'({"committed" if report["committed"] else "nothing committed"})'
-            + ('; FAILED' if report['failed'] else '')]
+            + ('; FAILED' if report['failed'] else '') + self._timing()]
         failures = [issue for issue in report['issues'] if issue['severity'] == 'failure']
         for issue in failures:
             objects = issue['object_uuids']
@@ -1797,45 +1816,96 @@ class RefreshOutcome:
         return lines
 
 
-def refresh_links(store, snapshot, config, normal_source, cache_directory=None):
+def _detector_progress(progress, detector):
+    """A detector's progress callback publishing through a ProgressReporter
+    (spiral_progress): the detector is the stage, its own stage and item the
+    detail; a total of 0 is unknown."""
+    if progress is None:
+        return None
+    progress.begin('linking', f'link refresh {detector}')
+
+    def report(stage, completed, total, detail):
+        progress.update(completed, total_steps=total,
+                        detail=f'{stage}: {detail}' if detail else stage)
+    return report
+
+
+def refresh_links(store, snapshot, config, normal_source, cache_directory=None, new=None,
+                  progress=None, log=None):
     """Run each automatic detector over the snapshot's objects.
 
     A detector runs only when every object kind it needs is selected, with
     exactly the selected UUIDs, so its writes and stale-link removal stay
     within the selection. Exceptions and reported failures are collected
     for every detector; none stops the others.
+
+    ``new`` ({kind: UUIDs}) makes the run incremental: each detector that
+    supports it examines only pairs with a new object of its kinds (the
+    store's new_uuids), and is skipped when none is new; track crossings
+    are skipped (an incremental refresh requires unchanged tracks).
+    ``progress`` (a spiral_progress.ProgressReporter) receives each
+    detector's progress, and ``log`` a line as each one starts; the
+    outcomes' report lines (refresh_report) carry each mode and duration.
     """
     selected = {kind: [obj.uuid for obj in snapshot.objects_of(kind)] for kind in KINDS}
     volume = snapshot.volume_uuid
+
+    def fresh(detector):
+        return sorted(uuid for kind in INCREMENTAL_KINDS[detector] for uuid in new.get(kind, ()))
+
+    def reporting(detector):
+        callback = _detector_progress(progress, detector)
+        return {'progress': callback} if callback else {}
+
+    def options(detector):
+        return {**reporting(detector), **({'new_uuids': fresh(detector)} if new is not None else {})}
     run = {
         'pcl_patch': lambda: store.link_point_collections_to_surfaces(
             volume_uuid=volume, collection_uuids=selected['point_collection'],
             surface_uuids=selected['surface'],
             tolerance=float(config['pcl_link_distance_tolerance']),
             window_points=int(config['pcl_link_window_points']),
-            window_min_points=int(config['pcl_link_window_min_points'])),
+            window_min_points=int(config['pcl_link_window_min_points']),
+            **options('pcl_patch')),
         'fiber_patch': lambda: store.link_fibers_to_surfaces(
             normal_source.ct_volume, volume_uuid=volume,
             fiber_uuids=selected['fiber'], surface_uuids=selected['surface'],
             **dict(normal_source.parameters),
-            **({'cache_directory': cache_directory} if cache_directory else {})),
+            **({'cache_directory': cache_directory} if cache_directory else {}),
+            **options('fiber_patch')),
         'patch_overlap': lambda: store.link_surface_overlaps(
-            volume_uuid=volume, surface_uuids=selected['surface']),
+            volume_uuid=volume, surface_uuids=selected['surface'], **options('patch_overlap')),
         # Crossings are exact shared voxels of the stored tracks, found with
         # the store's default angle, tangent and clustering parameters.
         'track_crossing': lambda: store.link_tracks_to_tracks(
-            track_uuids=selected['track'], workers=os.cpu_count() or 1),
+            track_uuids=selected['track'], workers=os.cpu_count() or 1,
+            **reporting('track_crossing')),
     }
     outcomes = []
     for detector, kinds in DETECTORS:
         empty = [KIND_LABELS[kind] for kind in kinds if not selected[kind]]
         if empty:
-            outcomes.append(RefreshOutcome(detector, skipped='no selected ' + ' or '.join(empty)))
-            continue
-        try:
-            outcomes.append(RefreshOutcome(detector, report=run[detector]()))
-        except Exception as error:  # noqa: BLE001 - every failure is reported
-            outcomes.append(RefreshOutcome(detector, error=f'{type(error).__name__}: {error}'))
+            outcome = RefreshOutcome(detector, skipped='no selected ' + ' or '.join(empty))
+        elif new is not None and detector not in INCREMENTAL_KINDS:
+            outcome = RefreshOutcome(detector, skipped='incremental refresh: its inputs are unchanged')
+        elif new is not None and not fresh(detector):
+            outcome = RefreshOutcome(detector, skipped='incremental refresh: no new ' + ' or '.join(
+                KIND_LABELS[kind] for kind in INCREMENTAL_KINDS[detector]))
+        else:
+            mode = ('full' if new is None else
+                    f'incremental over {len(fresh(detector))} new object(s)')
+            if log is not None:
+                log(f'link refresh {detector}: running ({mode})')
+            started = time.monotonic()
+            try:
+                outcome = RefreshOutcome(detector, report=run[detector](), mode=mode)
+            except Exception as error:  # noqa: BLE001 - every failure is reported
+                outcome = RefreshOutcome(detector, error=f'{type(error).__name__}: {error}',
+                                         mode=mode)
+            outcome.seconds = time.monotonic() - started
+            if progress is not None:
+                progress.clear()
+        outcomes.append(outcome)
     return outcomes
 
 
@@ -1854,20 +1924,211 @@ def refresh_report(outcomes):
     return lines, problems
 
 
-def _refresh(store, snapshot, config, lasagna, cache_directory, log):
-    """Run the detectors over a snapshot's selection; returns the report
-    lines and problems (refresh_report)."""
+# ---------------------------------------------------------------------------
+# Link marker: skip the detectors when the links are current
+# ---------------------------------------------------------------------------
+
+LINK_MARKER_VERSION = 1
+# Edge kinds the detectors write (refresh_links runs them with their defaults):
+# any change to one since a refresh (a manual link, an approval, a deletion)
+# forces the next one to run in full.
+DETECTOR_EDGE_KINDS = frozenset({'point-surface', 'same-surface', 'crossing'})
+# Records that change how detectors map stored coordinates into the volume.
+FRAME_RECORD_KINDS = frozenset({'volume_transform', 'volume_transform_choice'})
+
+
+def link_marker_key(volume_uuid, config, normal_source):
+    """What links depend on outside the store: the fit volume, the
+    detector parameters and normal source (link_refresh_provenance) and the
+    store library's detector versions."""
+    from vc_object_store import detector_versions
+    return content_sha256({
+        'volume_uuid': volume_uuid,
+        'link_refresh': link_refresh_provenance(config, normal_source),
+        'detectors': detector_versions(),
+    })
+
+
+def _uuids_sha256(uuids):
+    digest = hashlib.sha256()
+    for uuid in uuids:
+        digest.update(uuid.encode())
+        digest.update(b'\n')
+    return digest.hexdigest()
+
+
+def link_marker_selection(snapshot):
+    """The snapshot's selection as a marker records it: per kind the count
+    and digest of the sorted UUIDs, and the UUIDs themselves except for
+    tracks (which only the digest and selector describe)."""
+    selection = {}
+    for kind in KINDS:
+        uuids = sorted(obj.uuid for obj in snapshot.objects_of(kind))
+        entry = {'count': len(uuids), 'sha256': _uuids_sha256(uuids)}
+        if kind == 'track':
+            entry['selector'] = snapshot.request.selector(kind).provenance()
+        else:
+            entry['uuids'] = uuids
+        selection[kind] = entry
+    return selection
+
+
+@dataclasses.dataclass(frozen=True)
+class LinkState:
+    """The store state a refresh decision is made at: ``owner`` the
+    identity its positions belong to (None for a plain store without
+    positions), ``head`` the position the snapshot was read at, and
+    ``journal(after)`` the journal entries after a position up to ``head``
+    (the hub's on a hosted replica)."""
+    owner: str
+    head: int
+    journal: object
+
+
+@dataclasses.dataclass(frozen=True)
+class LinkPlan:
+    """How a refresh runs: 'skip' (the links are current), 'incremental'
+    (link ``new``, {kind: UUIDs}) or 'full', and why."""
+    mode: str
+    reason: str
+    new: dict = None
+
+    def line(self):
+        return f'link refresh: {self.mode}: {self.reason}'
+
+
+def plan_link_refresh(marker, state, key, selection, selected, *, incremental):
+    """Decide how to refresh (LinkPlan) from the store's link marker.
+
+    Skip when the marker is this store's, was written by a full refresh
+    (any refresh, for an input update: ``incremental``) with the same
+    ``key``, the current ``selection`` is the marker's or a subset of it
+    (tracks: the same), and every journal entry since its position is for
+    an object outside ``selected`` (the current selection's UUIDs) and no
+    detector relationship or volume registration. With ``incremental``,
+    objects selected since the marker (created or newly selected) are
+    linked incrementally, provided the journal names no other selected
+    object. Anything else refreshes in full.
+    """
+    def full(reason):
+        return LinkPlan('full', reason)
+    if marker is None:
+        return full('the store has no link marker')
+    if marker.get('version') != LINK_MARKER_VERSION:
+        return full('the link marker has another format')
+    if marker.get('owner') != state.owner:
+        return full('the link marker describes other positions')
+    if marker.get('key') != key:
+        return full('the fit volume, link parameters, normal source or detector versions changed')
+    if not marker.get('exact') and not incremental:
+        return full('the last refresh was incremental')
+    position = int(marker['position'])
+    if position > state.head:
+        return full(f'the link marker is at position {position}, after the head {state.head}')
+    recorded = marker['selection']
+    if selection['track']['sha256'] != recorded['track']['sha256']:
+        return full('the track selection changed')
+    new = {}
+    for kind in KINDS:
+        if kind == 'track':
+            continue
+        added = sorted(set(selection[kind]['uuids']) - set(recorded[kind]['uuids']))
+        if added and not incremental:
+            return full(f'{len(added)} {KIND_LABELS[kind]} selected since position {position}')
+        if added:
+            new[kind] = added
+    fresh = {uuid for uuids in new.values() for uuid in uuids}
+    for entry in state.journal(position):
+        if entry['kind'] in DETECTOR_EDGE_KINDS:
+            return full(f'a {entry["kind"]} relationship changed at position {entry["seq"]}')
+        if entry['kind'] in FRAME_RECORD_KINDS:
+            return full(f'a volume registration changed at position {entry["seq"]}')
+        if entry['record_uuid'] in selected and entry['record_uuid'] not in fresh:
+            return full(f'selected {entry["kind"]} {entry["record_uuid"]} changed at position '
+                        f'{entry["seq"]}')
+    if fresh:
+        counts = ', '.join(f'{len(uuids)} {KIND_LABELS[kind]}' for kind, uuids in new.items())
+        return LinkPlan('incremental', f'new since position {position}: {counts}', new)
+    return LinkPlan('skip', f'unchanged since position {position}')
+
+
+@dataclasses.dataclass
+class LinkResult:
+    """A refresh's report ``lines`` and ``problems`` (refresh_report), its
+    LinkPlan, and the marker to record once its links are committed at a
+    position (``marker(position)``; None after a skip, which records none)."""
+    lines: list
+    problems: list
+    plan: LinkPlan
+    marker: object = None
+
+
+def _refresh(store, snapshot, config, lasagna, cache_directory, log, *, state=None,
+             incremental=False, progress=None):
+    """Refresh the links of a snapshot's selection (LinkResult).
+
+    With a ``state`` (LinkState of the store the snapshot was read from),
+    the store's link marker decides whether the detectors run at all
+    (plan_link_refresh; ``incremental`` for an input update);
+    object_store_full_link_refresh forces a full refresh. The caller
+    records ``result.marker(position)`` once the links are committed (and
+    published) at a position."""
     normal = fiber_normal_source(config, lasagna, snapshot.volume_uuid)
     log(normal.describe())
     if normal.note:
         log(normal.note)
+    selection = link_marker_selection(snapshot)
+    key = link_marker_key(snapshot.volume_uuid, config, normal)
+    if state is None:
+        plan = LinkPlan('full', 'the store records no link state')
+    elif config.get('object_store_full_link_refresh'):
+        plan = LinkPlan('full', 'object_store_full_link_refresh is set')
+    else:
+        plan = plan_link_refresh(store.link_marker(), state, key, selection, snapshot.objects,
+                                 incremental=incremental)
+    log(plan.line())  # as decided, before any detector runs
+    if plan.mode == 'skip':
+        return LinkResult([], [], plan)
     if (normal.kind == 'none' and snapshot.objects_of('fiber')
             and snapshot.objects_of('surface')):
         log('WARNING: fiber-patch links are refreshed centerline-only: the fit '
             'loads no lasagna normals (input_use_normals with a Lasagna dataset '
             'whose normals pack is in the cache) and object_store_normal_ct_path '
             'is unset')
-    return refresh_report(refresh_links(store, snapshot, config, normal, cache_directory))
+    started = time.monotonic()
+    lines, problems = refresh_report(refresh_links(
+        store, snapshot, config, normal, cache_directory,
+        new=plan.new if plan.mode == 'incremental' else None, progress=progress, log=log))
+    lines = lines + [f'link refresh: {plan.mode} refresh took {time.monotonic() - started:.1f} s']
+    owner = None if state is None else state.owner
+
+    def marker(position):
+        return {'version': LINK_MARKER_VERSION, 'owner': owner, 'position': int(position),
+                'key': key, 'exact': plan.mode == 'full', 'selection': selection}
+    return LinkResult(lines, problems, plan, marker)
+
+
+def _record_marker(store, result, position, lines):
+    """Record a refresh's marker at ``position``; a failure only loses the
+    next refresh's skip, so it is reported, not raised."""
+    if result.marker is None:
+        return
+    try:
+        store.set_link_marker(result.marker(position))
+    except Exception as exc:  # noqa: BLE001 - the links themselves are committed
+        lines.append(f'the link marker could not be recorded ({type(exc).__name__}: {exc}); '
+                     'the next refresh runs in full')
+
+
+@contextlib.contextmanager
+def _console_progress():
+    """Detector progress on stderr, for a refresh outside the service."""
+    from spiral_progress import ProgressReporter
+    reporter = ProgressReporter(stream=sys.stderr)
+    try:
+        yield reporter
+    finally:
+        reporter.close()
 
 
 def _position_owner(path):
@@ -1905,10 +2166,11 @@ def _startup_phase(config, request, lasagna, cache_directory, log, minimum_posit
         if not author:
             raise ObjectStoreInputError([
                 f'object_store_author is required to link a position of the store {path}'])
-        with ObjectStore.open(path, author=author) as store:
+        with ObjectStore.open(path, author=author) as store, _console_progress() as progress:
             prepared = prepare_position(store, config, request, lasagna=lasagna,
                                         minimum=minimum_position,
-                                        cache_directory=cache_directory, log=log)
+                                        cache_directory=cache_directory, log=log,
+                                        progress=progress)
         return prepared.uuids, prepared.lines, prepared.position
     if minimum_position is not None:
         raise ObjectStoreInputError([
@@ -1919,14 +2181,28 @@ def _startup_phase(config, request, lasagna, cache_directory, log, minimum_posit
             'object_store_author is required to refresh links '
             '(or set object_store_refresh_links false)'])
     options = {'author': author} if refresh else {'read_only': True}
-    with ObjectStore.open(path, **options) as store:
+    with ObjectStore.open(path, **options) as store, _console_progress() as progress:
+        # The head before the selection is read: a write in between shows
+        # in the journal after it and keeps the marker from being recorded.
+        head = store.journal_position()
         uuids = resolve_selection(store, request)
         snapshot = read_snapshot(store, request, uuids)
         if not refresh:
             return uuids, ['link refresh: off; reading the store\'s current relationships'], None
-        lines, problems = _refresh(store, snapshot, config, lasagna, cache_directory, log)
-    if problems:
-        raise LinkRefreshError(problems)
+        state = LinkState(None, head, lambda after: [
+            entry for entry in store.journal_since(after) if entry['seq'] <= head])
+        result = _refresh(store, snapshot, config, lasagna, cache_directory, log, state=state,
+                          progress=progress)
+        lines = result.lines
+        if not result.problems:
+            others = sorted({entry['author'] for entry in store.journal_since(head)
+                             if entry['author'] != author})
+            if others:
+                lines.append(f'{", ".join(others)} wrote while linking; no link marker recorded')
+            else:
+                _record_marker(store, result, store.journal_position(), lines)
+    if result.problems:
+        raise LinkRefreshError(result.problems)
     return uuids, lines, None
 
 
@@ -1983,7 +2259,8 @@ def _conditional_push(store, head):
 
 
 def prepare_position(store, config, request, *, lasagna=None, minimum=None,
-                     cache_directory=None, log=print, attempts=4):
+                     cache_directory=None, log=print, attempts=4, incremental=False,
+                     progress=None):
     """Link, then pin: the update loop of a hosted replica ``store`` (opened
     read-write as the service's author; it must hold no other edits).
 
@@ -1997,6 +2274,12 @@ def prepare_position(store, config, request, *, lasagna=None, minimum=None,
     discarding the links), and leaves the caller's active inputs alone.
     With object_store_refresh_links off, the pulled head is the position.
 
+    The store's link marker lets the refresh skip the detectors when the
+    links at the head are current, and, with ``incremental`` (an input
+    update), link only objects selected since it (_refresh); the marker is
+    recorded only once the links are published. ``progress`` (a
+    spiral_progress.ProgressReporter) receives the detectors' progress.
+
     A plain store that records positions (shared with the client's
     processes on one machine) is linked in place instead
     (_prepare_shared_position).
@@ -2008,7 +2291,8 @@ def prepare_position(store, config, request, *, lasagna=None, minimum=None,
                 f'object store {store.path} records no positions (neither a hosted '
                 'replica nor a store a service shares)'])
         return _prepare_shared_position(store, config, request, lasagna=lasagna, minimum=minimum,
-                                        cache_directory=cache_directory, log=log, attempts=attempts)
+                                        cache_directory=cache_directory, log=log, attempts=attempts,
+                                        incremental=incremental, progress=progress)
     hub = status['hub_replica']
     refresh = bool(config['object_store_refresh_links'])
     current = dataclasses.replace(request, position=None)
@@ -2031,7 +2315,10 @@ def prepare_position(store, config, request, *, lasagna=None, minimum=None,
             position, lines = head, [f'link refresh: off; pinning hub position {head}']
             break
         snapshot = read_snapshot(store, current)
-        lines, problems = _refresh(store, snapshot, config, lasagna, cache_directory, log)
+        state = LinkState(hub, head, lambda after, head=head: store.hub_journal(after, head))
+        result = _refresh(store, snapshot, config, lasagna, cache_directory, log, state=state,
+                          incremental=incremental, progress=progress)
+        lines, problems = result.lines, result.problems
         if problems:
             raise LinkRefreshError(notes + problems + ['no links were published']
                                    + _discard_unpublished(store))
@@ -2056,6 +2343,7 @@ def prepare_position(store, config, request, *, lasagna=None, minimum=None,
             continue
         position = pushed['published_position']
         lines = lines + [f'links published at hub position {position} (linked at {head})']
+        _record_marker(store, result, position, lines)
         break
     else:
         raise PositionError(notes + [
@@ -2071,7 +2359,7 @@ def prepare_position(store, config, request, *, lasagna=None, minimum=None,
 
 
 def _prepare_shared_position(store, config, request, *, lasagna, minimum, cache_directory,
-                             log, attempts):
+                             log, attempts, incremental=False, progress=None):
     """prepare_position on a plain store others write as well (VC3D, on
     the same machine). Detectors commit straight into the store, so there
     is no conditional push: read the head H, link over the selection, and
@@ -2095,7 +2383,11 @@ def _prepare_shared_position(store, config, request, *, lasagna, minimum, cache_
             position, lines = head, [f'link refresh: off; pinning position {head}']
             break
         snapshot = read_snapshot(store, current)
-        lines, problems = _refresh(store, snapshot, config, lasagna, cache_directory, log)
+        state = LinkState(owner, head, lambda after, head=head: [
+            entry for entry in store.journal_since(after) if entry['seq'] <= head])
+        result = _refresh(store, snapshot, config, lasagna, cache_directory, log, state=state,
+                          incremental=incremental, progress=progress)
+        lines, problems = result.lines, result.problems
         if problems:
             raise LinkRefreshError(notes + problems + [
                 'links the detectors committed stay as pending output; the next refresh '
@@ -2109,6 +2401,7 @@ def _prepare_shared_position(store, config, request, *, lasagna, minimum, cache_
             continue
         position = after
         lines = lines + [f'links written at position {position} (linked at {head})']
+        _record_marker(store, result, position, lines)
         break
     else:
         raise PositionError(notes + [

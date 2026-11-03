@@ -405,7 +405,23 @@ writing them back to the store. Detectors whose object kinds are not all
 selected are skipped. Every detector failure is reported together and stops
 the fit before training (detectors that already committed are named; a rerun
 reconciles them). `object_store_refresh_links: false` reads the store's
-current relationships read-only. Pending and approved relationships are used
+current relationships read-only.
+
+After a successful refresh the store records a link marker (not journaled;
+it adds no position and no hub sync carries it): the position, the fit
+volume, the link parameters, normal source and detector versions, and the
+selection. The next refresh skips the detectors when the marker's inputs
+match, the selection is the same or smaller, and nothing since its position
+touched a selected object, a detector relationship (point-surface,
+same-surface, crossing) or a volume registration. A service input update
+links only objects added since (pairs with a new object, partners found by
+stored bounds); those links are approximate (an existing PCL keeps its old
+surface link alongside one to a new surface), and the next startup refreshes
+in full. `object_store_full_link_refresh: true` always runs every detector.
+Each detector's mode and duration are logged, and its progress shows in the
+service's `input_preparation.progress` (stderr for a CLI fit).
+
+Pending and approved relationships are used
 and rejected ones never; `object_store_approved_links_only` uses approved ones
 only (refresh still runs, so new links stay pending and unused).
 
