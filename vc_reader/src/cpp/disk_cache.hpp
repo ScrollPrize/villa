@@ -1,5 +1,6 @@
 // Cross-process FIFO budget for decoded chunk caches. SQLite serializes the
-// rename, accounting and eviction together; reads never wait on this index.
+// rename, accounting and eviction together (payloads are written before that);
+// reads never wait on this index.
 #pragma once
 
 #include "chunk_io.hpp"
@@ -128,15 +129,19 @@ public:
     void write(const std::string& path, const std::uint8_t* data, std::size_t size)
     {
         check_path(path);
+        if (!leaves_free_space(size))
+            return;
+        // The payload goes to its per-thread temporary outside the index's lock, so writers
+        // only serialize on the rename, accounting and eviction. Unpublished, it is unlinked.
+        AtomicFile file(path);
+        file.write(data, size);
         std::lock_guard lock(mutex_);
         transaction([&] {
             const auto available = number("SELECT max_bytes FROM budget WHERE id=1") - reserved_bytes();
             if (size > static_cast<std::uint64_t>(available))
                 return;  // A chunk larger than the budget is served without caching.
-            if (!leaves_free_space(size))
-                return;
             evict_to(available - static_cast<std::int64_t>(size));
-            atomic_write(path, data, size);
+            file.publish();
             record(path, static_cast<std::int64_t>(size));
             evict();
         });
