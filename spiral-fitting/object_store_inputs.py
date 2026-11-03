@@ -533,9 +533,34 @@ def check_position(store, position):
             f'{store.path} reads the positions of {owner}'])
 
 
+def _at_head(store, position):
+    """Whether ``position`` is the head of the plain store whose positions
+    it names: nothing was written after it, so the store's current state is
+    the state at it."""
+    positions = store.store_positions()
+    return (positions is not None and positions['store'] == position.hub
+            and positions['position'] == position.sequence)
+
+
+def _read_at(store, position, current, historical):
+    """A read of the state at ``position``: ``current()`` (a read of the
+    store's current state) when the position is a plain store's head both
+    before and after it, so nothing was written in between; otherwise
+    ``historical()``, which rebuilds the state at the position from the
+    store's history (a hub's, for a hosted replica). The history read
+    scans every revision of every object, tracks included, so it costs
+    minutes on a large store; a service reads its inputs at the head it
+    just pinned, which the current state answers in a selection's time."""
+    check_position(store, position)
+    if _at_head(store, position):
+        result = current()
+        if _at_head(store, position):
+            return result
+    return historical()
+
+
 def _position_records(store, position):
     """{UUID: record} of every object at a position, retired ones included."""
-    check_position(store, position)
     view = store.hub_read_view_at(position.sequence, include_retired=True,
                                   relationships=False, geometry=False)
     return {revision['object_uuid']: revision['record'] for revision in view['objects']}
@@ -544,20 +569,29 @@ def _position_records(store, position):
 def resolve_selection(store, request):
     """{kind: sorted selected UUIDs} of a request's selectors, at the
     request's position when it names one."""
-    records = None if request.position is None else _position_records(store, request.position)
-    return {kind: resolve_selector(store, kind, request.selector(kind), records)
-            for kind in KINDS}
+    def resolve(records=None):
+        return {kind: resolve_selector(store, kind, request.selector(kind), records)
+                for kind in KINDS}
+    if request.position is None:
+        return resolve()
+    return _read_at(store, request.position, resolve,
+                    lambda: resolve(_position_records(store, request.position)))
 
 
 def resolve_outer_shell(store, request):
     """The active surface tagged OUTER_SHELL_TAG at the request's position
     (or now), or None; several are an error."""
-    if request.position is None:
-        shells = [record['uuid'] for record in store.select_objects(
+    def current():
+        return [record['uuid'] for record in store.select_objects(
             object_kind='surface', tag=OUTER_SHELL_TAG, fields=['uuid'])]
+
+    def historical():
+        return [uuid for uuid, record in _position_records(store, request.position).items()
+                if outer_shell(record) and not record.get('retired')]
+    if request.position is None:
+        shells = current()
     else:
-        shells = [uuid for uuid, record in _position_records(store, request.position).items()
-                  if outer_shell(record) and not record.get('retired')]
+        shells = _read_at(store, request.position, current, historical)
     if len(shells) > 1:
         raise ObjectStoreInputError([
             f'{len(shells)} surfaces are tagged {OUTER_SHELL_TAG} ({", ".join(sorted(shells))}); '
@@ -588,8 +622,9 @@ def read_snapshot(store, request, uuids=None):
     if request.position is None:
         view = store.revision_read_view(selection)
     else:
-        check_position(store, request.position)
-        view = store.hub_read_view_at(request.position.sequence, list(selection))
+        view = _read_at(
+            store, request.position, lambda: store.revision_read_view(selection),
+            lambda: store.hub_read_view_at(request.position.sequence, list(selection)))
         missing = sorted(set(selection) - set(view['selection']))
         if missing:
             raise ObjectStoreInputError([
