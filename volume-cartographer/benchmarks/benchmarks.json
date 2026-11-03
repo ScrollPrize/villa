@@ -68,8 +68,9 @@
     ],
     "render_tifxyz": [
       {
-        "name": "w028-037-full",
-        "description": "The whole segment: no crop. partial_levels leaves out level 2, the level it renders, so cache state partial fetches it.",
+        "name": "w028-037-center-quarter",
+        "description": "The central quarter of the segment: half its width and height of the 44200x11600 group-2 canvas. partial_levels leaves out level 2, the level it renders, so cache state partial fetches it.",
+        "crop": [11050, 2900, 22100, 5800],
         "partial_levels": [3, 4, 5],
         "segment": "w028-037",
         "group": 2,
