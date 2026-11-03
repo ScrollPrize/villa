@@ -2,7 +2,8 @@
 
 // SFTP v3 client over the system OpenSSH `ssh` program (`ssh -s HOST sftp`).
 // OpenSSH alone handles configuration, keys, the agent, ProxyJump and host
-// verification; no SSH library is linked and no remote shell runs. Without an
+// verification; no SSH library is linked. Ordinary access uses the subsystem;
+// process-locked hubs run a quoted remote command around sftp-server. Without an
 // authenticator ssh runs in batch mode and never prompts. With one, every ssh
 // prompt (password, key passphrase, one-time code, new host key) is answered by
 // the application through SSH_ASKPASS (Linux and macOS).
@@ -60,6 +61,16 @@ struct Options {
     // waiting for the user to answer a prompt does not count.
     std::chrono::milliseconds idleTimeout{30000};
     std::function<bool()> cancelled;  // polled while waiting
+    // Hub-only: run the existing remote sftp-server under a process-owned
+    // flock on this file. Requires SSH command execution, flock and timeout.
+    // Empty keeps ordinary SFTP subsystem access (e.g. remote volumes).
+    std::string processLock;
+    // Server-side hard deadline, including lock acquisition. Killing the
+    // writer releases its lock even if the connection silently disappears.
+    std::chrono::seconds processLifetime{1800};
+    // Share an application-private SSH transport on POSIX clients. Sessions
+    // and their server locks remain independent. Ignored on Windows.
+    bool shareConnection = false;
 };
 
 enum Status : uint32_t {
@@ -99,6 +110,9 @@ public:
     void setOptions(Options options);
     const Url& destination() const;
     bool supports(std::string_view extension) const;  // e.g. "fsync@openssh.com"
+    // Best-effort local EOF check, without a network request. False does not
+    // prove the server is reachable; normal request deadlines still apply.
+    bool transportClosed() const;
 
     Attributes stat(const std::string& path);
     Attributes lstat(const std::string& path);
@@ -115,6 +129,7 @@ public:
     Attributes fstat(const Handle& handle);
     void truncate(const Handle& handle, uint64_t size);
     void setPermissions(const Handle& handle, uint32_t mode);  // not subject to the server's umask
+    void setPathPermissions(const std::string& path, uint32_t mode);
     void fsync(const Handle& handle);  // requires fsync@openssh.com
     // Reads up to out.size() bytes with several requests in flight; returns
     // fewer only at end of file.

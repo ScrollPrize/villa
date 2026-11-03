@@ -188,8 +188,9 @@ void atomicWriteBytes(
                 throw std::runtime_error("flush failed for " + temporary.string());
         }
 #if defined(_WIN32)
+        // FlushFileBuffers needs a handle with write access.
         HANDLE file = ::CreateFileW(
-            temporary.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
+            temporary.c_str(), GENERIC_WRITE, FILE_SHARE_READ, nullptr,
             OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
         if (file == INVALID_HANDLE_VALUE || !::FlushFileBuffers(file)) {
             const auto error = static_cast<int>(::GetLastError());

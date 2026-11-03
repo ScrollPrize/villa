@@ -1371,14 +1371,14 @@ ZarrArray::read_chunk_encoded(std::span<const std::size_t> chunk_indices) const 
 
 std::vector<std::byte>
 ZarrArray::decode_chunk_payload(std::span<const std::byte> payload) const {
-    std::vector<std::byte> data(payload.begin(), payload.end());
     const std::size_t expected = is_sharded()
         ? meta_.sub_chunk_byte_size()
         : meta_.chunk_byte_size();
-
-    if (codec_.decompress && needs_decompression()) {
-        data = codec_.decompress(data, expected);
-    }
+    // The codec already accepts a const span: do not copy compressed bytes
+    // into a temporary vector just to immediately replace that vector.
+    auto data = codec_.decompress && needs_decompression()
+        ? codec_.decompress(payload, expected)
+        : std::vector<std::byte>(payload.begin(), payload.end());
 
     if (meta_.version == ZarrVersion::v2) {
         for (auto it = meta_.filters.rbegin(); it != meta_.filters.rend(); ++it)
@@ -1390,6 +1390,42 @@ ZarrArray::decode_chunk_payload(std::span<const std::byte> payload) const {
     }
 
     return data;
+}
+
+void ZarrArray::decode_chunk_payload_into(std::span<const std::byte> payload,
+                                         std::span<std::byte> output) const {
+    if (!decodePayloadInto(payload, output, true))
+        throw std::runtime_error("zarr: decoded payload byte count mismatch or missing codec");
+}
+
+bool ZarrArray::decodePayloadInto(std::span<const std::byte> payload,
+                                  std::span<std::byte> output, bool exactSize) const {
+    const auto expected = meta_.sub_chunk_byte_size();
+    if (output.size() < expected)
+        throw std::runtime_error("zarr: decode output buffer too small");
+    auto out = output.first(expected);
+    const bool filters = meta_.version == ZarrVersion::v2 && !meta_.filters.empty();
+    if (needs_decompression() && codec_.decompress_into && !filters) {
+        codec_.decompress_into(payload, out);
+        if (needs_byteswap())
+            detail::byteswap_inplace(out, dtype_size(meta_.dtype));
+        return true;
+    }
+    if (needs_decompression() && !codec_.decompress)
+        return false;
+    if (!needs_decompression() && !filters) {
+        if (payload.size() < expected || (exactSize && payload.size() != expected))
+            return false;
+        std::memmove(out.data(), payload.data(), expected);
+        if (needs_byteswap())
+            detail::byteswap_inplace(out, dtype_size(meta_.dtype));
+        return true;
+    }
+    auto decoded = decode_chunk_payload(payload);
+    if (decoded.size() < expected || (exactSize && decoded.size() != expected))
+        return false;
+    std::memcpy(out.data(), decoded.data(), expected);
+    return true;
 }
 
 bool ZarrArray::stores_chunks_with_codec(std::string_view codec_name) const noexcept {
@@ -1423,33 +1459,9 @@ bool ZarrArray::read_chunk_into(std::span<const std::size_t> chunk_indices,
     }
     if (!raw_opt) return false;
 
-    const bool has_v2_filters =
-        (meta_.version == ZarrVersion::v2 && !meta_.filters.empty());
-    const bool needs_decode = needs_decompression();
-
-    if (needs_decode && codec_.decompress_into && !has_v2_filters && !needs_byteswap()) {
-        codec_.decompress_into(*raw_opt, out);
-        return true;
-    }
-
-    std::vector<std::byte> data;
-    if (needs_decode) {
-        if (!codec_.decompress) return false;
-        data = codec_.decompress(*raw_opt, expected);
-    } else {
-        data = std::move(*raw_opt);
-    }
-
-    if (has_v2_filters) {
-        for (auto it = meta_.filters.rbegin(); it != meta_.filters.rend(); ++it)
-            data = it->decode(data);
-    }
-    if (needs_byteswap()) {
-        detail::byteswap_inplace(data, dtype_size(meta_.dtype));
-    }
-    if (data.size() < expected) return false;
-    std::memcpy(out.data(), data.data(), expected);
-    return true;
+    // Preserve this API's historical prefix-copy behavior for oversized
+    // fallback payloads and false result for short/missing-codec payloads.
+    return decodePayloadInto(*raw_opt, out, false);
 }
 
 void ZarrArray::write_chunk(std::span<const std::size_t> chunk_indices,

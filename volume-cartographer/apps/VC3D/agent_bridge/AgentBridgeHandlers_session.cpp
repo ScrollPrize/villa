@@ -11,6 +11,8 @@
 #include <QImage>
 #include <QJsonArray>
 #include <QPixmap>
+#include <QOpenGLWidget>
+#include <QPainter>
 #include <QPointF>
 #include <QRegularExpression>
 #include <QWidget>
@@ -70,6 +72,7 @@ QJsonObject AgentBridgeServer::handleStateGet(const QJsonValue&)
         result["segmentationGrowthVolumeId"] = QString();
         result["segmentationEditingEnabled"] = false;
         result["manualAddMode"] = false;
+        result["segmentationGrowthMethod"] = QJsonValue::Null;
         result["manualAddLineMode"] = QJsonValue::Null;
         result["manualAddInterpolation"] = QJsonValue::Null;
         result["correctionsPointMode"] = false;
@@ -151,6 +154,7 @@ QJsonObject AgentBridgeServer::handleStateGet(const QJsonValue&)
     // Line and interpolation modes persist when manual-add is inactive.
     if (SegmentationModule* mod = _window->_segmentationModule.get()) {
         result["manualAddMode"] = mod->manualAddMode();
+        result["manualAddFollowingSheet"] = mod->manualAddSheetWalkRunning();
         result["correctionsPointMode"] = mod->correctionPointMode();
         // Explicit save/flush bookkeeping.
         const SegmentationModule::AutosaveStatus save = mod->autosaveStatus();
@@ -161,6 +165,7 @@ QJsonObject AgentBridgeServer::handleStateGet(const QJsonValue&)
         result["autosave"] = autosave;
     } else {
         result["manualAddMode"] = false;
+        result["manualAddFollowingSheet"] = false;
         result["correctionsPointMode"] = false;
         result["autosave"] = QJsonValue::Null;
     }
@@ -178,10 +183,12 @@ QJsonObject AgentBridgeServer::handleStateGet(const QJsonValue&)
         result["axisAlignedSlices"] = QJsonValue::Null;
     }
     if (SegmentationWidget* widget = _window->_segmentationWidget) {
+        result["segmentationGrowthMethod"] = segmentationGrowthMethodToString(widget->growthMethod());
         const ManualAddTool::Config cfg = widget->manualAddConfig();
         result["manualAddLineMode"] = linePreviewModeToString(cfg.linePreviewMode);
         result["manualAddInterpolation"] = interpolationModeToString(cfg.interpolationMode);
     } else {
+        result["segmentationGrowthMethod"] = QJsonValue::Null;
         result["manualAddLineMode"] = QJsonValue::Null;
         result["manualAddInterpolation"] = QJsonValue::Null;
     }
@@ -381,6 +388,22 @@ QJsonObject AgentBridgeServer::handleScreenshotCapture(const QJsonValue& params)
     }
 
     QPixmap pixmap = widget->grab();
+    // QWidget's raster grab does not support QOpenGLWidget contents. Composite
+    // each visible GL child's framebuffer in logical coordinates so 3D colours
+    // and legends survive full-window captures, including on Retina displays.
+    {
+        QPainter painter(&pixmap);
+        for (auto* gl : widget->findChildren<QOpenGLWidget*>()) {
+            if (!gl->isVisibleTo(widget) || gl->window() != widget->window()) continue;
+            const QImage frame = gl->grabFramebuffer();
+            if (frame.isNull()) continue;
+            const QPoint position = gl->mapTo(widget, QPoint{});
+            painter.save();
+            painter.setClipRegion(gl->visibleRegion().translated(position));
+            painter.drawImage(QRect(position, gl->size()), frame);
+            painter.restore();
+        }
+    }
 
     static constexpr int kMinCaptureDim = 8;
     if (pixmap.width() < kMinCaptureDim || pixmap.height() < kMinCaptureDim) {

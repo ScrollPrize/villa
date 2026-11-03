@@ -218,9 +218,9 @@ nnUNetv2_predict -d 060 -f 0 -c 3d_fullres -i /path/to/input/grids -o /path/to/o
 
 for multi-gpu setups, you can run inference like so, repeating for as many gpus as you have available
 ```bash
-CUDA_VISIBLE_DEVICES=0 nnUNetv2_predict d 060 -f 0 -c 3d_fullres -i /path/to/input/folder -o /path/to/output/folder -p nnUNetResEncUNetMPlans -num_parts 2 -part_id 0  &
+CUDA_VISIBLE_DEVICES=0 nnUNetv2_predict -d 060 -f 0 -c 3d_fullres -i /path/to/input/folder -o /path/to/output/folder -p nnUNetResEncUNetMPlans -num_parts 2 -part_id 0  &
 
-CUDA_VISIBLE_DEVICES=1 nnUNetv2_predict d 060 -f 0 -c 3d_fullres -i /path/to/input/folder -o /path/to/output/folder -p nnUNetResEncUNetMPlans -num_parts 2 -part_id 1 
+CUDA_VISIBLE_DEVICES=1 nnUNetv2_predict -d 060 -f 0 -c 3d_fullres -i /path/to/input/folder -o /path/to/output/folder -p nnUNetResEncUNetMPlans -num_parts 2 -part_id 1 
 ```
 :::tip
 To export the probabilities, append --save_probabilities to the end of the inference commands. This will save an npz and a pkl file, which you can turn into uint8 tifs with [this script](https://dl.ash2txt.org/community-uploads/bruniss/scrolls/helper-scripts/mp-softmax.py)

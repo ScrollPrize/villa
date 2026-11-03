@@ -100,6 +100,8 @@ sqlite3* openConnection(const std::filesystem::path& path, int flags, const Open
     if (remote && !options.sharedFile)
         throw std::invalid_argument("object store: only hosted hubs open from sftp:// or ssh:// locations; clone one to a local replica");
     const auto name = remote ? canonicalRemotePath(path) : path.string();
+    if (!remote && options.sharedFile && std::filesystem::exists(path.string() + ".lock/" + kProcessLockName))
+        throw std::runtime_error("hub: this hub uses SSH process locking; access it through its sftp:// address");
     // Network filesystems lack the shared memory and byte-range locks WAL needs.
     const char* vfs = remote ? sftpVfs() : options.sharedFile ? "unix-dotfile" : nullptr;
     if (vfs && !sqlite3_vfs_find(vfs))

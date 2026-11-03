@@ -4393,18 +4393,11 @@ wheels = [
 
 [[package]]
 name = "vc-delta3d"
-version = "0.2.0"
-source = { registry = "https://pypi.org/simple" }
+version = "0.3.0"
+source = { git = "https://github.com/ScrollPrize/vc-delta3d.git?rev=45339743b450ff707d21fb742dc1b3b2bf99306d#45339743b450ff707d21fb742dc1b3b2bf99306d" }
 dependencies = [
     { name = "numcodecs" },
     { name = "numpy" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/b8/8c/2652137ca2b2c132735db2d2e7530cb2433023b4fc5dcc0f6da64e097bfc/vc_delta3d-0.2.0.tar.gz", hash = "sha256:6a9af20ed68a92d9d8cfffe4f72bfc820acd5eb3c50c7c79db0594186b3d3c87", size = 51032, upload-time = "2026-10-22T10:12:16.544Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/7a/86/06db18bf8ccb357d63d10343e91862509649cf02c979d0668422e0ec5627/vc_delta3d-0.2.0-cp314-cp314-macosx_11_0_arm64.whl", hash = "sha256:b02e1f82ae6fa740da81907fd9124b98115c95e566a0a2bc90f0664a04e83ba2", size = 81854, upload-time = "2026-10-22T10:12:11.872Z" },
-    { url = "https://files.pythonhosted.org/packages/c6/05/7551aba065b5db53f323c39b71eb7af49bfd4e411c5fd0a306a7f2ee6bd1/vc_delta3d-0.2.0-cp314-cp314-manylinux_2_26_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:24bef4e1b563af7eb4e32023d6442748a89f3b79432e2b78e73aa0d46dd5e3ce", size = 92157, upload-time = "2026-10-22T10:12:12.867Z" },
-    { url = "https://files.pythonhosted.org/packages/00/2c/c86aac08a7d4eaaed727e36f834d6e2b75d9ed643d9174f9d7d59265d4f6/vc_delta3d-0.2.0-cp314-cp314-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:10014635b4ae0a8cabe2fc2f6aedea98f5dc1ba2652824d716f1c3f733308f17", size = 97803, upload-time = "2026-10-22T10:12:14.277Z" },
-    { url = "https://files.pythonhosted.org/packages/f5/60/a758d3c654f23bbe5cd289b6bb9fadd52a690bc9b0f16699e7a1e68e6210/vc_delta3d-0.2.0-cp314-cp314-win_amd64.whl", hash = "sha256:072880e96db7e5dc02b9ce645ffa902bf9f7c07ed1668fd97587e8d5faf6bb38", size = 307719, upload-time = "2026-10-22T10:12:15.369Z" },
 ]
 
 [[package]]
@@ -4707,8 +4700,8 @@ requires-dist = [
     { name = "trimesh", marker = "extra == 'render'", specifier = ">=4.8.2" },
     { name = "typed-argument-parser", marker = "extra == 'all'", specifier = ">=1.11.0" },
     { name = "typed-argument-parser", marker = "extra == 'models'", specifier = ">=1.11.0" },
-    { name = "vc-delta3d", specifier = ">=0.2.0,<0.3" },
-    { name = "vc-delta3d", marker = "extra == 'volume-only'", specifier = ">=0.2.0,<0.3" },
+    { name = "vc-delta3d", specifier = ">=0.2.0,<0.4" },
+    { name = "vc-delta3d", marker = "extra == 'volume-only'", specifier = ">=0.2.0,<0.4" },
     { name = "vc-object-store", marker = "extra == 'all'", editable = "../vc_object_store" },
     { name = "vc-object-store", marker = "extra == 'models'", editable = "../vc_object_store" },
     { name = "villa-gpu-manager", marker = "extra == 'all'", editable = "../gpu_manager" },
@@ -4778,7 +4771,7 @@ dependencies = [
 requires-dist = [
     { name = "numcodecs", specifier = ">=0.15.1,<0.17" },
     { name = "numpy" },
-    { name = "vc-delta3d", specifier = ">=0.2.0,<0.3" },
+    { name = "vc-delta3d", git = "https://github.com/ScrollPrize/vc-delta3d.git?rev=45339743b450ff707d21fb742dc1b3b2bf99306d" },
 ]
 
 [[package]]
