@@ -33,7 +33,9 @@ Decided with the reviewer on 2026-11-03.
 | 1 | draw the hold-out set, measure it, render its review images | auto | hold-out patches, measurements, images |
 | **2** | **judge the hold-out set** | **reviewer** | answers, per patch or per octant |
 | 3 | sample fit patches, measure, fit | auto | fits (affine and bend); **starts right after 1**, in parallel with 2 |
+| 3b | measure the hold-out set again under the fit | auto | how far each frozen measurement would move; lining-up patches that drift past half a fine voxel are listed to be judged again (added 2026-11-03) |
 | 4 | score against the hold-out set, and the bar check | auto | scores of each fit and of the atlas transform; waits for 2 and 3 |
+| 4b | draw and render the blind round | auto | bend against affine, on hold-out patches lining up or partly |
 | **5** | **judge the final fit** | **reviewer** | blind round of bend against affine, and the decision |
 | 6 | store | auto | the release record, ready for the atlas to ingest (ingesting happens there) |
 
