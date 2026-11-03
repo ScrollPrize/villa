@@ -8,10 +8,12 @@
 # - Remote segments and fiber folders are downloaded (files already there are kept).
 # - Viewer harnesses plan instead of replaying online: each pass drives the case's
 #   inputs on the cache offline (remote_offline "fill": a chunk the cache lacks reads
-#   as empty at once and is recorded), with views grown by prefetch_margin (1.5) to
-#   cover other pipelines' level and fallback choices, then fetches exactly the
-#   recorded chunks. Passes repeat until one finds nothing missing (exit 0), which is
-#   also all a pass costs when the cache is already complete.
+#   as empty at once and is recorded), then fetches exactly the recorded chunks.
+#   Passes repeat until one finds nothing missing (exit 0), which is also all a pass
+#   costs when the cache is already complete. Each case is planned twice: exactly as
+#   its timed runs read (margin 1, its own passes), then with views grown by
+#   prefetch_margin (1.5) to cover other pipelines' level and fallback choices. Grown
+#   views pan to other places, so they do not stand in for the exact plan.
 # - render_tifxyz runs the tool once online through the cache.
 #
 # Environment: CONFIG (the manifest), BUILD (build tree, default ../build),
@@ -34,19 +36,23 @@ for bench in "${benches[@]}"; do
             "$bin" --config "$CONFIG" --case "$case" --prefetch "${EXTRA[@]}"
             continue
         fi
-        for ((pass = 1; ; ++pass)); do
-            echo "== prefetch $bench / $case, plan pass $pass"
-            status=0
-            "$bin" --config "$CONFIG" --case "$case" --prefetch --passes 1 "${EXTRA[@]}" || status=$?
-            [ $status -eq 0 ] && break                        # nothing missing: complete
-            if [ $status -ne 2 ]; then                        # 2: fetched what it lacked
-                echo "prefetch: $bench / $case failed (exit $status)" >&2
-                exit $status
-            fi
-            if [ $pass -ge "$MAX_PASSES" ]; then
-                echo "prefetch: $bench / $case still lacked chunks after $pass passes" >&2
-                exit 1
-            fi
+        for plan in exact margin; do
+            args=(--prefetch-margin 1)                        # exact: what timed runs read
+            [ $plan = margin ] && args=(--passes 1)           # the manifest's prefetch_margin
+            for ((pass = 1; ; ++pass)); do
+                echo "== prefetch $bench / $case, $plan plan pass $pass"
+                status=0
+                "$bin" --config "$CONFIG" --case "$case" --prefetch "${args[@]}" "${EXTRA[@]}" || status=$?
+                [ $status -eq 0 ] && break                    # nothing missing: complete
+                if [ $status -ne 2 ]; then                    # 2: fetched what it lacked
+                    echo "prefetch: $bench / $case failed (exit $status)" >&2
+                    exit $status
+                fi
+                if [ $pass -ge "$MAX_PASSES" ]; then
+                    echo "prefetch: $bench / $case still lacked chunks after $pass passes" >&2
+                    exit 1
+                fi
+            done
         done
     done
 done

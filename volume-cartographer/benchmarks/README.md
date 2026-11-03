@@ -132,11 +132,12 @@ complete cache it only confirms that, in seconds. It does the following:
    the case's inputs against the cache offline in `fill` mode, where a chunk the
    cache lacks reads as empty at once and is recorded
    (`vcr::Array::offline_misses`). So no step waits on the network, and every
-   missing chunk shows up. Views are grown by `prefetch_margin`, so the cache
-   also holds what other pipelines' level and fallback choices read nearby. The
-   pass then fetches exactly the recorded chunks (`vcr::cache::prefill` with a
+   missing chunk shows up. The pass then fetches exactly the recorded chunks (`vcr::cache::prefill` with a
    chunk list) and exits 2. Passes repeat until one finds nothing missing (exit
-   0), at most `MAX_PASSES` (6).
+   0), at most `MAX_PASSES` (6). Each case is planned twice: first exactly as
+   its timed runs read (margin 1, the case's passes), then with grown views
+   (one pass each). The grown views don't replace the exact plan, because a
+   larger viewer pans by a larger step and so visits other places.
 3. Runs each `render_tifxyz` case once on the URL through the cache. The tool's
    reads are what its timed runs read.
 
