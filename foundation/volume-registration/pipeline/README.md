@@ -64,8 +64,11 @@ decision on the review page. So a pair moves on by itself until you are next.
     VOLREG_HANDLE=... VOLREG_EMAIL=... uv run --python 3.12 --with-requirements requirements.txt \
         python -m volreg.review.server PAIRS_DIR --port 8790
 
-The page at `/` lists every pair under `PAIRS_DIR` with its stages, and has buttons to run,
-redo and ask for more patches. The judging page uses the first runs' keys: `1`–`5` to
+The page at `/` shows each pair under `PAIRS_DIR` in three parts. At the top is a compact
+overview of its steps. Below it, **Continue** starts every step that can run, beside a link
+to whatever waits for you. Then every step is listed with its state, its settings (the
+hold-out set's size, the fit's patches and passes, the blind round's size) and a Redo
+button. A changed setting is logged under your id, and the step runs again on Continue. The judging page uses the first runs' keys: `1`–`5` to
 answer, `space` to flip, `m` for mode, `n` for a note, `u` to undo, and `?unit=octants` to
 judge octants. The blind page uses `1`/`2`, `Enter` to pick, `x` for can't tell, `n` for
 neither, and `j`/`k` to move. It ends in the decision. The server never reads a volume.

@@ -6,17 +6,34 @@
 <title>Registration Pairs</title>
 <link rel="stylesheet" href="/common.css">
 <style>
-.pair { margin-bottom: 10px; }
-.pair h3 { margin: 0 0 4px; font-size: 14px; }
-.stages { display: flex; gap: 4px; flex-wrap: wrap; margin: 6px 0; }
-.stage { border: 1px solid var(--line); border-radius: 6px; padding: 3px 7px; }
-.stage small { display: block; color: var(--muted); }
-.stage.done { border-color: var(--good); }
-.stage.waiting { border-color: var(--select); background: color-mix(in srgb, var(--select) 18%, transparent); }
-.stage.running { border-color: var(--accent); }
-.stage.failed { border-color: var(--bad); }
-.stage.stale, .stage.ready { border-style: dashed; }
-.err { color: var(--bad); font-size: 12px; }
+.pair { margin-bottom: 12px; }
+.pair-head { display: flex; gap: 10px; align-items: baseline; flex-wrap: wrap; }
+.pair-head h3 { margin: 0; font-size: 15px; }
+.overview { display: flex; gap: 3px; margin: 8px 0; flex-wrap: wrap; }
+.chip { width: 16px; height: 16px; border-radius: 4px; border: 1px solid var(--line); }
+.next { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; padding: 8px;
+        border: 1px solid var(--line); border-radius: 6px; margin-bottom: 8px; }
+.next .you { font-weight: 600; }
+button.primary { background: var(--accent); color: white; border-color: var(--accent); padding: 5px 14px; }
+button.primary:disabled { background: var(--bg); color: var(--muted); border-color: var(--line); }
+table.steps td { vertical-align: top; padding: 5px 6px; }
+.badge { display: inline-block; min-width: 64px; text-align: center; border-radius: 10px; padding: 0 7px;
+         font-size: 11px; border: 1px solid var(--line); }
+.done { border-color: var(--good); color: var(--good); }
+.chip.done { background: var(--good); }
+.waiting { border-color: var(--select); color: var(--ink); background: color-mix(in srgb, var(--select) 30%, transparent); }
+.chip.waiting { background: var(--select); }
+.running { border-color: var(--accent); color: var(--accent); }
+.chip.running { background: var(--accent); }
+.failed { border-color: var(--bad); color: var(--bad); }
+.chip.failed { background: var(--bad); }
+.ready, .stale { border-style: dashed; }
+.blocked { color: var(--muted); }
+.who { font-size: 11px; color: var(--muted); }
+.err { color: var(--bad); }
+.settings { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; margin-top: 3px; }
+.settings input { width: 5.5em; }
+.revisit { border: 1px solid var(--select); border-radius: 6px; padding: 5px 8px; margin-bottom: 8px; }
 </style>
 </head>
 <body>
@@ -25,46 +42,89 @@
 <script src="/common.js"></script>
 <script>
 const PAGE = {"judge-holdout": "holdout", "final-review": "blind"};
+const STATE_TEXT = {done: "done", stale: "to run again", ready: "ready to run", running: "running",
+                    failed: "failed", waiting: "waiting for you", blocked: "not yet"};
+const ago = at => { if (!at) return ""; const s = (Date.now() - Date.parse(at)) / 1000;
+  return s < 90 ? "just now" : s < 5400 ? `${Math.round(s / 60)} min ago` : s < 129600 ? `${Math.round(s / 3600)} h ago` : at.slice(0, 10); };
+let editing = false;      // a settings field has focus: do not redraw under the cursor
+
+function detail(p, s) {
+  const link = `/pairs/${encodeURIComponent(p.name)}/${PAGE[s.name] || ""}`;
+  if (s.name === "judge-holdout" && p.holdout) {
+    const left = p.holdout.stretches.reduce((a, x) => a + x.left, 0);
+    return `${p.holdout.lines_up} of ${p.target} line up · ${left} left to answer` +
+      (s.state !== "blocked" ? ` · <a href="${link}">judge →</a>` : "");
+  }
+  if (s.name === "final-review") {
+    const d = p.decision;
+    if (d) return `publish ${d.publish} of ${d.fit}${d.override ? ` <span class="err">(override: misses ${d.override.bar_missed.join(", ")})</span>` : ""} · <a href="${link}">open →</a>`;
+    return s.state !== "blocked" ? `<a href="${link}">blind round and decision →</a>` : "after the blind round is drawn";
+  }
+  return s.finished && s.state !== "running" ? `<span class="muted">last run ${ago(s.finished)}</span>` : "";
+}
+
+function settings(s) {
+  if (!s.settings.length) return "";
+  return `<div class="settings">${s.settings.map(x =>
+    `<label>${x.label} <input type="number" min="1" data-stage="${s.name}" data-key="${x.key}" value="${x.value}"></label>`).join("")}
+    <button data-apply="${s.name}">Apply</button></div>`;
+}
 
 async function load() {
+  if (editing) return;
   const state = await call("/api/pairs");
   $("who").textContent = `reviewing as ${state.reviewer.handle}`;
   $("pairs").innerHTML = state.pairs.map(p => {
-    const waiting = p.stages.filter(s => s.state === "waiting");
-    const h = p.holdout;
+    const runnable = p.stages.filter(s => !s.human && (s.state === "ready" || s.state === "stale")).map(s => s.name);
+    const running = p.stages.filter(s => s.state === "running").map(s => s.name);
+    const yours = p.stages.filter(s => s.state === "waiting");
+    const failed = p.stages.filter(s => s.state === "failed");
     return `<section class="pair" data-name="${escapeHtml(p.name)}">
-      <h3>${escapeHtml(p.name)} <span class="muted">${escapeHtml(p.pair)}</span></h3>
-      <div class="stages">${p.stages.map(s => `<div class="stage ${s.state}" title="${escapeHtml(s.title)}">
-        ${PAGE[s.name] && s.state !== "blocked" ? `<a href="/pairs/${encodeURIComponent(p.name)}/${PAGE[s.name]}">${s.name}</a>` : s.name}
-        <small>${s.human ? "you · " : ""}${s.state}</small></div>`).join("")}</div>
-      ${p.stages.filter(s => s.error).map(s => `<div class="err">${s.name}: ${escapeHtml(s.error)}</div>`).join("")}
-      ${h ? `<div class="muted">hold-out: ${h.lines_up} line up · ${h.stretches.map(s => s.left).reduce((a, b) => a + b, 0)} left to answer</div>` : ""}
-      <div class="row" style="margin-top:6px">
-        <button data-act="run">Run what can run</button>
-        <select data-sel="redo">${p.stages.filter(s => !s.human).map(s => `<option>${s.name}</option>`).join("")}</select>
-        <button data-act="redo">Redo</button>
-        <input data-in="holdout" type="number" min="0" step="10" value="20" style="width:5em"> <button data-act="more-holdout">more hold-out</button>
-        <input data-in="fit" type="number" min="0" step="50" value="100" style="width:5em"> <button data-act="more-fit">more fit patches</button>
-        ${waiting.map(s => PAGE[s.name] ? `<a href="/pairs/${encodeURIComponent(p.name)}/${PAGE[s.name]}"><b>→ ${s.title}</b></a>` : "").join(" ")}
-      </div></section>`;
+      <div class="pair-head"><h3>${escapeHtml(p.name)}</h3><span class="muted">${escapeHtml(p.pair)}</span></div>
+      <div class="overview">${p.stages.map(s => `<div class="chip ${s.state}" title="${s.name}: ${STATE_TEXT[s.state]}"></div>`).join("")}</div>
+      ${(p.revisit || []).map(text => `<div class="revisit"><b>Open question</b> · ${escapeHtml(text)}</div>`).join("")}
+      <div class="next">
+        <button class="primary" data-act="continue" ${runnable.length ? "" : "disabled"}>Continue</button>
+        <span>${runnable.length ? `starts: ${runnable.join(", ")}` :
+                running.length ? `running: ${running.join(", ")}` :
+                failed.length ? `<span class="err">stopped: ${failed.map(s => s.name).join(", ")} failed</span>` :
+                "nothing to run"}</span>
+        ${yours.map(s => `<span class="you">· your turn: <a href="/pairs/${encodeURIComponent(p.name)}/${PAGE[s.name]}">${s.title} →</a></span>`).join("")}
+      </div>
+      <table class="steps"><tbody>${p.stages.map(s => `<tr>
+        <td><span class="badge ${s.state}">${STATE_TEXT[s.state]}</span></td>
+        <td><b>${s.title}</b><div class="who">${s.human ? "you" : "automatic"} · ${s.name}</div></td>
+        <td>${detail(p, s)}${s.error ? `<div class="err">${escapeHtml(s.error)}</div>` : ""}${settings(s)}</td>
+        <td>${s.human ? "" : `<button data-redo="${s.name}" ${["blocked", "running"].includes(s.state) ? "disabled" : ""}
+             title="Mark this step and the ones after it to run again">Redo</button>`}</td>
+      </tr>`).join("")}</tbody></table>
+    </section>`;
   }).join("") || `<p class="muted">No pairs with a pipeline under this folder.</p>`;
+
   for (const box of document.querySelectorAll(".pair")) {
-    const name = box.dataset.name, api = `/api/pairs/${encodeURIComponent(name)}`;
-    const act = async (path, body) => { try { await call(`${api}/${path}`, body); $("error").textContent = ""; await load(); }
-                                      catch (e) { $("error").textContent = e.message; } };
-    box.querySelector('[data-act="run"]').onclick = () => act("run", {});
-    box.querySelector('[data-act="redo"]').onclick = () => {
-      const stage = box.querySelector('[data-sel="redo"]').value;
-      if (confirm(`Run ${stage} and everything after it again?`)) act("redo", {stage});
+    const api = `/api/pairs/${encodeURIComponent(box.dataset.name)}`;
+    const act = async (path, body) => {
+      try { await call(`${api}/${path}`, body); $("error").textContent = ""; }
+      catch (e) { $("error").textContent = e.message; }
+      editing = false; await load();
     };
-    box.querySelector('[data-act="more-holdout"]').onclick = () =>
-      act("more", {holdout: Number(box.querySelector('[data-in="holdout"]').value)});
-    box.querySelector('[data-act="more-fit"]').onclick = () =>
-      act("more", {fit: Number(box.querySelector('[data-in="fit"]').value)});
+    box.querySelector('[data-act="continue"]').onclick = () => act("run", {});
+    for (const b of box.querySelectorAll("[data-redo]")) b.onclick = () => {
+      if (confirm(`Run "${b.dataset.redo}" and the steps after it again? Press Continue afterwards.`)) act("redo", {stage: b.dataset.redo});
+    };
+    for (const b of box.querySelectorAll("[data-apply]")) b.onclick = () => {
+      const values = {};
+      for (const input of box.querySelectorAll(`input[data-stage="${b.dataset.apply}"]`)) values[input.dataset.key] = Number(input.value);
+      act("params", {stage: b.dataset.apply, values});
+    };
+    for (const input of box.querySelectorAll("input")) {
+      input.onfocus = () => { editing = true; };
+      input.onblur = () => { setTimeout(() => { if (!box.contains(document.activeElement) || document.activeElement.tagName !== "INPUT") editing = false; }, 200); };
+    }
   }
 }
 load().catch(e => { $("error").textContent = e.message; });
-setInterval(() => { if (!document.activeElement || document.activeElement.tagName !== "INPUT") load().catch(() => {}); }, 10000);
+setInterval(() => load().catch(() => {}), 5000);
 </script>
 </body>
 </html>

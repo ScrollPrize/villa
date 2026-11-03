@@ -18,6 +18,7 @@ server was started for. Jobs it starts run as `volreg job`, as `volreg run` star
     POST /api/pairs/<pair>/run                start every stage that can run
     POST /api/pairs/<pair>/redo               {"stage": ...}
     POST /api/pairs/<pair>/more               {"holdout": n, "fit": n}
+    POST /api/pairs/<pair>/params             {"stage": ..., "values": {setting: n}}
     POST /api/pairs/<pair>/answer             {"unit": ..., "answer": ... or null}
     POST /api/pairs/<pair>/note               {"patch": ..., "text": ...}
     POST /api/pairs/<pair>/pick               {"round": ..., "index": i, "choice": i or "unsure"/"none"}
@@ -39,6 +40,11 @@ from .. import stages as pipeline_stages
 HERE = Path(__file__).resolve().parent
 PAGES = {"": "index.html", "holdout": "holdout.html", "blind": "blind.html"}
 TEST_STRETCHES = 5
+# The settings the pair page offers, per stage: what a person may want to change between
+# runs. Everything else stays as `stages.py` sets it, and `params.json` can still hold it.
+EDITABLE = {"holdout": {"patches": "hold-out patches"},
+            "fit": {"patches": "fit patches", "passes": "passes"},
+            "blind": {"count": "patches in a round"}}
 
 
 class Reviews:
@@ -72,15 +78,47 @@ class Reviews:
             pipeline = pipeline_stages.pipeline(path)
             states = pipeline.states()
             entry = {"name": path.name, "pair": pipeline.record.read(rec.PAIR)["pair"],
-                     "stages": [{"name": name, "title": pipeline.stages[name].title,
-                                 "human": pipeline.stages[name].human, "state": states[name],
-                                 "error": (pipeline.stamp(name) or {}).get("error")
-                                 if states[name] == engine.FAILED else None}
+                     "stages": [self.stage_entry(pipeline, name, states[name])
                                 for name in pipeline.order]}
             if pipeline.record.exists(rec.HOLDOUT):
                 entry["holdout"] = self.progress(pipeline.record.read(rec.HOLDOUT), False)
+                entry["target"] = pipeline.stage_params("judge-holdout")["min_lines_up"]
+            if pipeline.record.exists(rec.FINAL_REVIEW):
+                final = pipeline.record.read(rec.FINAL_REVIEW)
+                entry["decision"] = final.get("decision")
+                entry["revisit"] = [item["text"] for item in final.get("revisit") or []
+                                    if not item.get("done")]
             found.append(entry)
         return {"pairs": found, "reviewer": self.reviewer}
+
+    @staticmethod
+    def stage_entry(pipeline, name, state):
+        stage, stamp = pipeline.stages[name], pipeline.stamp(name) or {}
+        params = pipeline.stage_params(name)
+        return {"name": name, "title": stage.title, "human": stage.human, "state": state,
+                "error": stamp.get("error") if state == engine.FAILED else None,
+                "finished": stamp.get("finished"),
+                "settings": [{"key": key, "label": label, "value": params.get(key)}
+                             for key, label in EDITABLE.get(name, {}).items()]}
+
+    def set_params(self, name, stage, values):
+        """Change a stage's settings; the stage and what follows it run again on Continue."""
+        allowed = EDITABLE.get(stage, {})
+        if not values or set(values) - set(allowed):
+            raise ValueError(f"{stage} has no setting {sorted(set(values) - set(allowed))}")
+        clean = {}
+        for key, value in values.items():
+            value = int(value)
+            if value < 1:
+                raise ValueError(f"{allowed[key]} must be at least 1")
+            clean[key] = value
+        record = self.record(name)
+        params = record.read(pipeline_stages.PARAMS) if record.exists(pipeline_stages.PARAMS) else {}
+        params.pop("schema", None)
+        params.setdefault(stage, {}).update(clean)
+        record.write(pipeline_stages.PARAMS, params)
+        record.log("params", stage=stage, values=clean, by=self.reviewer)
+        return params
 
     def run(self, name):
         _pipeline, started = cli.advance(self.pair_dir(name))
@@ -298,6 +336,8 @@ def handler_for(reviews):
                     self.send_json(reviews.redo(name, body["stage"]))
                 elif action == "more":
                     self.send_json(reviews.more(name, body.get("holdout", 0), body.get("fit", 0)))
+                elif action == "params":
+                    self.send_json(reviews.set_params(name, body["stage"], body["values"]))
                 elif action == "answer":
                     reviews.answer(name, body["unit"], body.get("answer"))
                     self.send_json({"ok": True})

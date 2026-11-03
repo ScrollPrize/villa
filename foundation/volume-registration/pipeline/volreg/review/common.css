@@ -12,7 +12,8 @@ body { margin: 0; background: var(--bg); color: var(--ink);
 header { display: flex; gap: 16px; align-items: center; padding: 8px 14px;
          border-bottom: 1px solid var(--line); background: var(--panel); flex-wrap: wrap; }
 header h1 { font-size: 14px; margin: 0; font-weight: 600; }
-header a { color: var(--accent); text-decoration: none; }
+a, a:visited { color: var(--accent); }
+header a, header a:visited { text-decoration: none; }
 button, input, select, textarea { font: inherit; color: inherit; background: var(--bg);
   border: 1px solid var(--line); border-radius: 6px; padding: 3px 9px; }
 button { cursor: pointer; }

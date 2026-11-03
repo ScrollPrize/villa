@@ -122,3 +122,13 @@ def test_over_http_and_no_way_out_of_the_images(pairs):
             assert b"Registration pairs" in response.read()
     finally:
         server.shutdown()
+
+
+def test_settings_change_a_stage_and_are_logged(pairs):
+    reviews, record = pairs
+    reviews.set_params("pair-a", "fit", {"patches": 300, "passes": 3})
+    assert record.read("params.json")["fit"] == {"patches": 300, "passes": 3}
+    assert record.events()[-1]["kind"] == "params"
+    for stage, values in (("fit", {"seed": 1}), ("capture", {"probes": 5}), ("fit", {"patches": 0})):
+        with pytest.raises(ValueError):
+            reviews.set_params("pair-a", stage, values)
