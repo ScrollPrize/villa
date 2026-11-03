@@ -529,7 +529,7 @@ TEST_CASE("vc::cuda point sampling matches the CPU, and tools get a reader only 
 }
 #endif
 
-TEST_CASE("the background read stops when told to, and volumetric views have no reduction")
+TEST_CASE("a cancelled background read stops, and volumetric views have no reduction")
 {
     Fixture f;
     OpenedVolumes opened(64 << 20);
@@ -540,8 +540,9 @@ TEST_CASE("the background read stops when told to, and volumetric views have no 
     REQUIRE(load.pending.coarse.size() == 1);
     REQUIRE(load.pending.target.size() == 1);
 
+    std::atomic<bool> cancel{false};
     int parts = 0;
-    vc3d::loadPending(load, [&] { ++parts; return false; });
+    vc3d::loadPending(load, [&] { ++parts; cancel = true; }, &cancel);
     CHECK(parts == 1);
     vc3d::ViewerLoad remaining;
     sampleWhat(planeAt(5), what, &remaining);

@@ -494,7 +494,8 @@ private:
     std::shared_ptr<const vc3d::ViewerLevels> _levels;
     // The background read of chunks frames lacked: one at a time; the newest
     // frame's request waits and replaces older waiting ones. `_loadSuperseded`
-    // tells the running read that a newer request is waiting.
+    // cancels the running read's chunk reads not yet started when a newer request
+    // is waiting.
     bool _loadRunning = false;
     std::optional<vc3d::ViewerLoad> _pendingLoad;
     std::shared_ptr<std::atomic<bool>> _loadSuperseded;

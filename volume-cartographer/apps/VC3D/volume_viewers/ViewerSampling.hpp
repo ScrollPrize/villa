@@ -73,8 +73,9 @@ vcr::grid::Result sampleCached(const std::shared_ptr<const ViewerLevels>& levels
                                const vcr::grid::Request& request, ViewerLoad* load);
 
 // vcr::grid::load: coarse reads, then target ones; `afterPart` runs after each part
-// that had reads, returning false stops. A GPU failure renders the load's levels on
-// the CPU from then on.
-void loadPending(const ViewerLoad& load, const std::function<bool()>& afterPart);
+// that had reads. Once `cancel` is set no further chunk read starts and loading stops.
+// A GPU failure renders the load's levels on the CPU from then on.
+void loadPending(const ViewerLoad& load, const std::function<void()>& afterPart,
+                 const std::atomic<bool>* cancel = nullptr);
 
 } // namespace vc3d

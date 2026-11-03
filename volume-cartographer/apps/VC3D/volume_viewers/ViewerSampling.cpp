@@ -132,9 +132,13 @@ vcr::grid::Result sampleCached(const std::shared_ptr<const ViewerLevels>& levels
     return result;
 }
 
-void loadPending(const ViewerLoad& load, const std::function<bool()>& afterPart)
+void loadPending(const ViewerLoad& load, const std::function<void()>& afterPart, const std::atomic<bool>* cancel)
 {
-    const auto failure = vcr::grid::load(load.pending, afterPart);
+    const auto failure = vcr::grid::load(load.pending, [&] {
+        if (afterPart)
+            afterPart();
+        return true;
+    }, cancel);
     for (const auto& levels : load.levels)
         renderOnCpu(*levels, failure);
 }

@@ -481,7 +481,7 @@ void CChunkedVolumeViewer::quiesceForClose()
     _displayedRenderJob.reset();
     ++_renderSerial;
 
-    // A running background read finishes its current part and stops.
+    // A running background read finishes the chunks it started and stops.
     _pendingLoad.reset();
     if (_loadSuperseded)
         _loadSuperseded->store(true);
@@ -607,7 +607,8 @@ void CChunkedVolumeViewer::startPendingLoad()
     _loadSuperseded = std::make_shared<std::atomic<bool>>(false);
     QPointer<CChunkedVolumeViewer> guard(this);
     (void)QtConcurrent::run([guard, load, superseded = _loadSuperseded]() {
-        // Each part's arrival repaints; a newer waiting request stops this one.
+        // Each part's arrival repaints; a newer waiting request cancels this one's
+        // chunk reads not yet started.
         const auto loaded = [guard]() {
             QMetaObject::invokeMethod(qApp, [guard]() {
                 if (!guard || guard->_closing)
@@ -618,10 +619,7 @@ void CChunkedVolumeViewer::startPendingLoad()
         };
         QString error;
         try {
-            vc3d::loadPending(*load, [&]() {
-                loaded();
-                return !superseded->load();
-            });
+            vc3d::loadPending(*load, loaded, superseded.get());
         } catch (const std::exception& e) {
             error = QString::fromUtf8(e.what());
         }
