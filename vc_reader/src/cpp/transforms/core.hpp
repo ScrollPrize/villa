@@ -28,7 +28,8 @@
 // Hot CPU loops also get an AVX2 clone, chosen at load time on x86-64 ELF (Linux) builds.
 // The clone has no FMA, so each lane performs the same IEEE operations as the baseline
 // SSE2 code: results are bit-identical. Elsewhere (macOS, arm64 NEON, CUDA) this is empty.
-#if defined(__x86_64__) && defined(__ELF__) && (defined(__GNUC__) || defined(__clang__)) && !defined(__CUDACC__) && !defined(VCR_NO_TARGET_CLONES)
+// GCC only: Clang (through 21) rejects target_clones on function templates.
+#if defined(__x86_64__) && defined(__ELF__) && defined(__GNUC__) && !defined(__clang__) && !defined(__CUDACC__) && !defined(VCR_NO_TARGET_CLONES)
 #ifndef VCR_CLONE_ISA
 #ifdef VCR_CLONE_FMA
 #define VCR_CLONE_ISA "arch=x86-64-v3"  // AVX2 with FMA: contracted products round once

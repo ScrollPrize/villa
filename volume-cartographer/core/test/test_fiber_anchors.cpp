@@ -820,17 +820,17 @@ std::filesystem::path temporaryDirectory(const std::string& tag)
     return path;
 }
 
-void createConstantZarr(const std::filesystem::path& path, const std::array<size_t, 3>& shape, const std::array<size_t, 3>& chunks, uint8_t value)
+void createConstantZarr(const std::filesystem::path& path, const std::array<std::int64_t, 3>& shape, const std::array<std::int64_t, 3>& chunks, uint8_t value)
 {
     vcr::zarr::CreateOptions create;
     create.shape = {shape[0], shape[1], shape[2]};
     create.chunks = {chunks[0], chunks[1], chunks[2]};
     create.compressor.clear();
     auto array = vcr::zarr::Writer::create(path, create);
-    std::vector<std::uint8_t> payload(chunks[0] * chunks[1] * chunks[2], value);
-    for (size_t z = 0; z < (shape[0] + chunks[0] - 1) / chunks[0]; ++z) {
-        for (size_t y = 0; y < (shape[1] + chunks[1] - 1) / chunks[1]; ++y) {
-            for (size_t x = 0; x < (shape[2] + chunks[2] - 1) / chunks[2]; ++x) {
+    std::vector<std::uint8_t> payload(static_cast<std::size_t>(chunks[0] * chunks[1] * chunks[2]), value);
+    for (std::int64_t z = 0; z < (shape[0] + chunks[0] - 1) / chunks[0]; ++z) {
+        for (std::int64_t y = 0; y < (shape[1] + chunks[1] - 1) / chunks[1]; ++y) {
+            for (std::int64_t x = 0; x < (shape[2] + chunks[2] - 1) / chunks[2]; ++x) {
                 array.writeChunk({z, y, x}, payload.data(), payload.size());
             }
         }
