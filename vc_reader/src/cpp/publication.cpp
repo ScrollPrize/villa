@@ -6,28 +6,13 @@
 #include <unordered_map>
 #include <string>
 #include <system_error>
-#ifdef _WIN32
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
-#include <windows.h>
-#endif
+#include "platform_io.hpp"
 namespace vcr::files {
 void replaceFile(
     const std::filesystem::path& source,
     const std::filesystem::path& destination)
 {
-#if defined(_WIN32)
-    if (!::MoveFileExW(source.c_str(), destination.c_str(),
-                       MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
-        const std::error_code error(
-            static_cast<int>(::GetLastError()), std::system_category());
-        throw std::filesystem::filesystem_error(
-            "cannot replace file", source, destination, error);
-    }
-#else
-    std::filesystem::rename(source, destination);
-#endif
+    platform::replace_file(source, destination, true);
 }
 
 constexpr auto kSaveRollbackDir = ".vc-save-rollback";

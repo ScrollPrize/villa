@@ -53,7 +53,7 @@ add_library(vc_reader::sftp ALIAS vc_reader_sftp)
 set_target_properties(vc_reader_sftp PROPERTIES EXPORT_NAME sftp POSITION_INDEPENDENT_CODE ON AUTOMOC OFF AUTOUIC OFF)
 target_link_libraries(vc_reader_sftp PUBLIC vc_reader::headers PRIVATE Threads::Threads)
 target_compile_features(vc_reader_sftp PUBLIC cxx_std_20)
-add_library(vc_reader_catalog STATIC src/cpp/catalog.cpp src/cpp/catalog_io.cpp src/cpp/registrations.cpp
+add_library(vc_reader_catalog STATIC src/cpp/catalog.cpp src/cpp/catalog_io.cpp src/cpp/registrations.cpp src/cpp/platform_io.cpp
     src/cpp/s3_listing.cpp src/cpp/sources.cpp src/cpp/browsing.cpp)
 add_library(vc_reader::catalog ALIAS vc_reader_catalog)
 set_target_properties(vc_reader_catalog PROPERTIES EXPORT_NAME catalog POSITION_INDEPENDENT_CODE ON AUTOMOC OFF AUTOUIC OFF)

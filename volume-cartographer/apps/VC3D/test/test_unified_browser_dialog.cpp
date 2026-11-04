@@ -1,5 +1,7 @@
 #include "UnifiedBrowserDialog.hpp"
-#include "support/LoopbackHttpServer.hpp"
+#ifndef _WIN32
+#include "support/LoopbackHttpServer.hpp"  // POSIX sockets: Linux and macOS
+#endif
 #include <QRegularExpression>
 
 #include <QDir>
@@ -238,6 +240,9 @@ private slots:
 
     void remoteListingThroughTheReader()
     {
+#ifdef _WIN32
+        QSKIP("the loopback HTTP server fixture runs on Linux and macOS only");
+#else
         // A signed loopback bucket, reached with the environment's keys and endpoint; the
         // dialog lists one level at a time through vc_reader and keeps the location's URIs.
         QTemporaryDir temporary(QDir::current().filePath("browser-remote-XXXXXX"));
@@ -289,6 +294,7 @@ private slots:
         if (status) QTRY_VERIFY_WITH_TIMEOUT(status->text().contains(QStringLiteral("Browsing is available")), 10000);
         for (const char* name : {"AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_REGION", "AWS_ENDPOINT_URL"})
             qunsetenv(name);
+#endif
     }
 
     void typedLocalDirectoryOpen()

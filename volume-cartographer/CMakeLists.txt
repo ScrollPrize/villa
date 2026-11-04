@@ -296,6 +296,11 @@ else()
         endif()
     endif()
 endif()
+if(WIN32)
+    # vc_reader's headers include libcurl's, which include windows.h. Its ERROR macro
+    # makes glog (included by Ceres) fail unless glog omits its abbreviated severities.
+    add_compile_definitions(GLOG_NO_ABBREVIATED_SEVERITIES)
+endif()
 if(NOT MSVC AND CMAKE_BUILD_TYPE STREQUAL "QuickBuild")
     # QuickBuild is used for fast compile-and-test iteration. Line tables keep
     # crash reports actionable without paying to emit unused types, locals,

@@ -280,10 +280,10 @@ class Stream {
         auto& d=pair->half[half];const auto p=d.points.back();std::vector<uint8_t> outside;
         ct.sample({p},outside);
         const auto generation=epoch.fetch_add(1);
-        const bool near=coverage.owner(p,d.direction,radius,d.widthMean,tolerance)>=0 ||
+        const bool nearHit=coverage.owner(p,d.direction,radius,d.widthMean,tolerance)>=0 ||
             coverage.liveHit(p,d.direction,radius,pair->id,generation,d.widthMean,tolerance);
         coverage.addLive(d.previous,p,pair->id,generation,d.widthMean);d.previous=p;
-        d.streak=near?d.streak+1:0;d.outsideStreak=outside[0]?d.outsideStreak+1:0;++checks;
+        d.streak=nearHit?d.streak+1:0;d.outsideStreak=outside[0]?d.outsideStreak+1:0;++checks;
         for(int a=0;a<3;++a)if(p[a]<lo[a]-4*grid||p[a]>hi[a]+4*grid)d.reason="bounds";
         if(d.reason.empty()&&d.outsideStreak>=2)d.reason="outside_ct";
         if(d.reason.empty()&&d.streak>=3)d.reason="owned_or_live";

@@ -503,7 +503,7 @@ bool detail::writeCacheMetadata(const fs::path& path, const std::string& data, c
     const auto under = [](const fs::path& file, const fs::path& dir) {
         std::error_code ec;
         const auto rel = fs::weakly_canonical(file, ec).lexically_relative(fs::weakly_canonical(dir, ec));
-        return !rel.empty() && rel.native() != "." && *rel.begin() != "..";
+        return !rel.empty() && rel != "." && *rel.begin() != "..";
     };
     std::optional<fs::path> root;
     for (const auto& candidate : cacheRoots(cacheDirs))

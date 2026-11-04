@@ -853,7 +853,7 @@ void prepareSampleReader(AlignedEngine::Impl& s, const Source& reference, const 
             continue;
         }
         auto target = s.prepare(source, reader);
-        for (const auto& companion : source.companions) target.companions.emplace_back(companion.name, s.prepare(*companion.source, reader->companion(companion.name)));
+        for (const auto& companion : source.companions) target.companions.push_back({companion.name, s.prepare(*companion.source, reader->companion(companion.name))});
         s.targets.emplace_back(name, std::move(target));
     }
     json frames = json::object();

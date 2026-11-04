@@ -1,7 +1,9 @@
 // Atomic file publication shared by catalog, image, and chunk writers.
 #pragma once
+#include "platform_io.hpp"
 #include <fcntl.h>
 #include <unistd.h>
+#include <algorithm>
 #include <cerrno>
 #include <cstddef>
 #include <cstdint>
@@ -34,7 +36,7 @@ public:
         const auto parent = std::filesystem::path(path).parent_path();
         if (!parent.empty()) std::filesystem::create_directories(parent);
         tmp_ = vcr::temporary_path(path);
-        fd_ = ::open(tmp_.c_str(), O_RDWR | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+        fd_ = platform::open_file(tmp_, O_RDWR | O_CREAT | O_TRUNC, 0644);
         if (fd_ < 0) throw std::system_error(errno, std::generic_category(), "create " + tmp_);
     }
     ~AtomicFile() { if (fd_ >= 0) ::close(fd_); if (!tmp_.empty()) ::unlink(tmp_.c_str()); }
@@ -50,7 +52,8 @@ public:
     void write(const std::uint8_t* data, std::size_t n)
     {
         for (std::size_t done = 0; done < n;) {
-            const ssize_t k = ::write(fd_, data+done, n-done);
+            // At most 1 GiB per call: Windows write() takes a 32-bit count.
+            const auto k = ::write(fd_, data+done, std::min<std::size_t>(n-done, std::size_t(1) << 30));
             if (k < 0 && errno == EINTR) continue;
             if (k <= 0) throw std::system_error(k < 0 ? errno : EIO, std::generic_category(), "write " + tmp_);
             done += static_cast<std::size_t>(k);
@@ -61,22 +64,15 @@ public:
     // writes back in its own time (chunk and cache writes).
     void publish(bool durable = false)
     {
-        if (durable && ::fsync(fd_)) throw std::system_error(errno, std::generic_category(), "fsync " + tmp_);
+        if (durable && platform::fsync(fd_)) throw std::system_error(errno, std::generic_category(), "fsync " + tmp_);
         const int fd = fd_;
         fd_ = -1;
         if (::close(fd)) throw std::system_error(errno, std::generic_category(), "close " + tmp_);
-        if (::rename(tmp_.c_str(), path_.c_str()))
-            throw std::system_error(errno, std::generic_category(), "rename " + tmp_);
+        platform::replace_file(tmp_, path_, durable);
         tmp_.clear();
         if (durable) {
             const auto parent = std::filesystem::path(path_).parent_path();
-            const int dir = ::open((parent.empty() ? std::filesystem::path(".") : parent).c_str(), O_RDONLY | O_DIRECTORY);
-            if (dir < 0 || ::fsync(dir)) {
-                const int error = errno;
-                if (dir >= 0) ::close(dir);
-                throw std::system_error(error, std::generic_category(), "fsync directory of " + path_);
-            }
-            ::close(dir);
+            platform::sync_directory(parent.empty() ? std::filesystem::path(".") : parent, path_);
         }
     }
 private:

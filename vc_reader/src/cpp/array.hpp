@@ -15,8 +15,6 @@
 #include "write_behind.hpp"
 #include "zarr_storage.hpp"
 
-#include <sys/mman.h>
-
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -1553,10 +1551,7 @@ private:
             if (m->size != chunk_bytes_)
                 throw std::runtime_error(path + ": chunk file has the wrong size");
             const auto advise = [&](std::int64_t first, std::int64_t len) {
-                const std::int64_t page = ::sysconf(_SC_PAGESIZE);
-                const std::int64_t a = first / page * page;
-                ::madvise(const_cast<std::uint8_t*>(m->data) + a, static_cast<std::size_t>(first + len - a),
-                          MADV_WILLNEED);
+                platform::advise_willneed(m->data, first, len);
             };
             // Many pieces of one chunk (sub-chunk blocks) share one hint over their
             // span unless it would advise much more than the pieces themselves.

@@ -6,6 +6,8 @@
 #include <tiffio.h>
 #include <unistd.h>
 
+#include "../platform_io.hpp"
+
 #include <algorithm>
 #include <cmath>
 #include <csetjmp>
@@ -13,7 +15,6 @@
 #include <cstring>
 #include <numeric>
 #include <set>
-#include <sys/stat.h>
 
 namespace vcr::sources {
 using nlohmann::json;
@@ -44,7 +45,7 @@ struct DupFile {
     std::FILE* file = nullptr;
     explicit DupFile(int fd)
     {
-        const int copy = ::dup(fd);
+        const int copy = platform::reopen_read(fd);
         if (copy < 0 || !(file = ::fdopen(copy, "rb"))) throw ImageFormatError("cannot read image file");
         std::rewind(file);
     }
@@ -74,13 +75,13 @@ struct PngHandles {
 bool pngAnimated(int fd)
 {
     std::uint8_t header[8];
-    off_t at = 8;
+    std::int64_t at = 8;
     for (;;) {
-        if (::pread(fd, header, 8, at) != 8) return false;
+        if (platform::pread(fd, header, 8, at) != 8) return false;
         if (!std::memcmp(header + 4, "IDAT", 4)) return false;
         if (!std::memcmp(header + 4, "acTL", 4)) return true;
         const std::uint32_t length = (std::uint32_t(header[0]) << 24) | (header[1] << 16) | (header[2] << 8) | header[3];
-        at += off_t(length) + 12;
+        at += std::int64_t(length) + 12;
     }
 }
 
@@ -233,8 +234,73 @@ Block jpegPixels(int fd, const Raster& raster)
 // ---- TIFF ----
 using TiffHandle = std::unique_ptr<TIFF, void (*)(TIFF*)>;
 
+#ifdef _WIN32
+// Libtiff built with Win32 I/O (MSYS2's) takes a HANDLE, not a descriptor, in
+// TIFFFdOpen, so Windows reads through its own descriptor with positional reads.
+struct TiffStream {
+    int fd = -1;
+    std::uint64_t position = 0;
+};
+TiffStream& tiffStream(thandle_t handle) { return *reinterpret_cast<TiffStream*>(handle); }
+tmsize_t tiffRead(thandle_t handle, void* buffer, tmsize_t n)
+{
+    auto& s = tiffStream(handle);
+    tmsize_t done = 0;
+    while (done < n) {
+        const auto k = platform::pread(s.fd, static_cast<char*>(buffer) + done, std::size_t(n - done), std::int64_t(s.position) + done);
+        if (k < 0) return -1;
+        if (k == 0) break;
+        done += tmsize_t(k);
+    }
+    s.position += std::uint64_t(done);
+    return done;
+}
+tmsize_t tiffWrite(thandle_t, void*, tmsize_t) { return 0; }
+toff_t tiffSize(thandle_t handle)
+{
+    platform::FileStat st;
+    return platform::fstat(tiffStream(handle).fd, st) == 0 ? toff_t(st.size) : 0;
+}
+toff_t tiffSeek(thandle_t handle, toff_t offset, int whence)
+{
+    auto& s = tiffStream(handle);
+    if (whence == SEEK_SET) s.position = offset;
+    else if (whence == SEEK_CUR) s.position += offset;
+    else if (whence == SEEK_END) s.position = tiffSize(handle) + offset;
+    return s.position;
+}
+int tiffClose(thandle_t handle)
+{
+    auto* s = &tiffStream(handle);
+    ::close(s->fd);
+    delete s;
+    return 0;
+}
+int tiffMap(thandle_t, void**, toff_t*) { return 0; }
+void tiffUnmap(thandle_t, void*, toff_t) {}
+#endif
+
 TiffHandle openTiffHandle(int fd, const std::string& name)
 {
+#ifdef _WIN32
+    const int copy = platform::reopen_read(fd);
+    if (copy < 0) throw ImageFormatError(name + ": cannot read TIFF");
+    const auto handle = reinterpret_cast<thandle_t>(new TiffStream{copy});
+#if TIFFLIB_VERSION >= 20221213
+    TIFFOpenOptions* options = TIFFOpenOptionsAlloc();
+    TIFFOpenOptionsSetErrorHandlerExtR(options, [](TIFF*, void*, const char*, const char*, va_list) { return 1; }, nullptr);
+    TIFFOpenOptionsSetWarningHandlerExtR(options, [](TIFF*, void*, const char*, const char*, va_list) { return 1; }, nullptr);
+    TIFF* tif = TIFFClientOpenExt(name.c_str(), "r", handle, tiffRead, tiffWrite, tiffSeek, tiffClose, tiffSize, tiffMap, tiffUnmap, options);
+    TIFFOpenOptionsFree(options);
+#else
+    TIFF* tif = TIFFClientOpen(name.c_str(), "r", handle, tiffRead, tiffWrite, tiffSeek, tiffClose, tiffSize, tiffMap, tiffUnmap);
+#endif
+    if (!tif) {
+        tiffClose(handle);
+        throw ImageFormatError(name + ": cannot read this TIFF");
+    }
+    return TiffHandle(tif, TIFFClose);
+#else
     const int copy = ::dup(fd);
     if (copy < 0) throw ImageFormatError(name + ": cannot read TIFF");
     ::lseek(copy, 0, SEEK_SET);
@@ -252,6 +318,7 @@ TiffHandle openTiffHandle(int fd, const std::string& name)
         throw ImageFormatError(name + ": cannot read this TIFF");
     }
     return TiffHandle(tif, TIFFClose);
+#endif
 }
 
 struct TiffPage {
@@ -339,7 +406,7 @@ std::optional<std::array<std::uint32_t, 2>> rationalTag(int fd, TIFF* tif, std::
 {
     const bool swapped = TIFFIsByteSwapped(tif), big = TIFFIsBigTIFF(tif);
     const auto read = [&](std::uint64_t at, void* out, std::size_t n) {
-        if (::pread(fd, out, n, off_t(at)) != ssize_t(n)) throw ImageFormatError("truncated TIFF directory");
+        if (platform::pread(fd, out, n, std::int64_t(at)) != std::int64_t(n)) throw ImageFormatError("truncated TIFF directory");
     };
     const auto swap = [&](auto value) {
         if (swapped) {
@@ -666,9 +733,9 @@ ImageFile::ImageFile(std::string location, const std::optional<std::string>& for
     if (selection.arrayPath || selection.corresponding) bad("image files select series/level, not Zarr array paths or implicit corresponding levels");
     const auto opened = files_->open(location_);
     token_ = opened.token;
-    struct stat st{};
-    ::fstat(opened.fd, &st);
-    encodedSize_ = std::size_t(st.st_size);
+    platform::FileStat st;
+    platform::fstat(opened.fd, st);
+    encodedSize_ = std::size_t(st.size);
     if (format_ == "tiff") {
         openTiff(opened.fd, selection, axes, namePageAxis);
     } else {
@@ -706,7 +773,7 @@ std::vector<std::int64_t> ImageFile::prefixShape() const
 void ImageFile::openRaster(int fd, const std::optional<std::vector<std::string>>& axes)
 {
     std::uint8_t magic[8]{};
-    (void)!::pread(fd, magic, 8, 0);
+    (void)!platform::pread(fd, magic, 8, 0);
     const char* found = !std::memcmp(magic, "\x89PNG\r\n\x1a\n", 8) ? "png" : (magic[0] == 0xFF && magic[1] == 0xD8) ? "jpeg" : nullptr;
     if (!found) throw ImageFormatError(location_ + ": cannot identify image file");
     if (format_ != found) bad("declared format " + format_ + " contradicts file format " + found);
@@ -972,9 +1039,9 @@ Block ImageFile::region(std::int64_t pageIndex, const std::vector<PageSlice>& sl
                     if (raw) {
                         for (std::int64_t zz = z0; zz < z1; ++zz)
                             for (std::int64_t yy = y0; yy < y1; ++yy) {
-                                const off_t at = off_t(offset) + ((zz - atZ) * tileHeight + (yy - atY)) * tileWidth * pixel + (x0 - atX) * pixel + s0 * std::int64_t(itemsize);
+                                const std::int64_t at = std::int64_t(offset) + ((zz - atZ) * tileHeight + (yy - atY)) * tileWidth * pixel + (x0 - atX) * pixel + s0 * std::int64_t(itemsize);
                                 auto* to = target(zz, yy);
-                                if (::pread(opened.fd, to, run, at) != ssize_t(run)) bad("truncated TIFF segment");
+                                if (platform::pread(opened.fd, to, run, at) != std::int64_t(run)) bad("truncated TIFF segment");
                                 if (swapped) swapElements(to, run, itemsize);
                                 bytesRead_ += run;
                             }

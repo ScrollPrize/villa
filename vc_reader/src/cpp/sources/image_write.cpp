@@ -144,7 +144,11 @@ TiffWriter::TiffWriter(std::filesystem::path path, const std::string& dtype, std
     s.temporary = temporary_path(s.path.string());
     const auto bytes = std::size_t(s.options.pages) * std::size_t(rows) * std::size_t(cols) * s.pixel;
     // Large output, or compressed output that may not shrink, needs 64-bit offsets.
+#ifdef _WIN32
+    s.tif.reset(TIFFOpenW(s.temporary.c_str(), bytes >= (1ULL << 31) ? "w8" : "w"));
+#else
     s.tif.reset(TIFFOpen(s.temporary.c_str(), bytes >= (1ULL << 31) ? "w8" : "w"));
+#endif
     if (!s.tif) throw std::runtime_error("cannot create " + s.temporary.string());
     s.tags();
 }

@@ -2858,75 +2858,75 @@ LineAnnotationController::prepareAutoLinkParticipants(
 }
 
 std::optional<QString> LineAnnotationController::linkPairEligibilityError(
-    const StoredFiber& local, const StoredFiber& far) const
+    const StoredFiber& local, const StoredFiber& farFiber) const
 {
-    if (local.id == far.id) {
+    if (local.id == farFiber.id) {
         return tr("Select two different fibers.");
     }
-    if (local.readOnly || far.readOnly) {
-        return tr("%1 is read-only.").arg(fiberDisplayName(local.readOnly ? local.id : far.id));
+    if (local.readOnly || farFiber.readOnly) {
+        return tr("%1 is read-only.").arg(fiberDisplayName(local.readOnly ? local.id : farFiber.id));
     }
     return std::nullopt;
 }
 
 std::optional<QString> LineAnnotationController::linkStoredControlPoints(StoredFiber& local,
                                                                          int localControlIndex,
-                                                                         StoredFiber& far,
+                                                                         StoredFiber& farFiber,
                                                                          int farControlIndex,
                                                                          bool autoLink)
 {
     namespace la = vc3d::line_annotation;
     if (localControlIndex < 0 ||
         static_cast<size_t>(localControlIndex) >= local.controlPoints.size() ||
-        farControlIndex < 0 || static_cast<size_t>(farControlIndex) >= far.controlPoints.size()) {
+        farControlIndex < 0 || static_cast<size_t>(farControlIndex) >= farFiber.controlPoints.size()) {
         return tr("A control point index is out of range.");
     }
-    if (const auto error = linkPairEligibilityError(local, far)) {
+    if (const auto error = linkPairEligibilityError(local, farFiber)) {
         return error;
     }
     const QString localName = fiberDisplayNameFromFileName(local.fileName);
-    const QString farName = fiberDisplayNameFromFileName(far.fileName);
+    const QString farName = fiberDisplayNameFromFileName(farFiber.fileName);
     if (controlPointHasBranchLink(local.branches, static_cast<size_t>(localControlIndex))) {
         return tr("%1 / CP %2 is already linked.").arg(localName).arg(localControlIndex);
     }
-    if (controlPointHasBranchLink(far.branches, static_cast<size_t>(farControlIndex))) {
+    if (controlPointHasBranchLink(farFiber.branches, static_cast<size_t>(farControlIndex))) {
         return tr("%1 / CP %2 is already linked.").arg(farName).arg(farControlIndex);
     }
     const cv::Vec3d localPoint = local.controlPoints[static_cast<size_t>(localControlIndex)];
-    const cv::Vec3d farPoint = far.controlPoints[static_cast<size_t>(farControlIndex)];
+    const cv::Vec3d farPoint = farFiber.controlPoints[static_cast<size_t>(farControlIndex)];
     if (!finitePoint(localPoint) || !finitePoint(farPoint)) {
         return tr("Could not determine finite endpoints for the link.");
     }
     // The two fibers may be stored in different frames: the fallback
     // direction (used only where a line gives no tangent) is taken in the
     // volume's.
-    if (!fiberInVolume(local) || !fiberInVolume(far)) {
+    if (!fiberInVolume(local) || !fiberInVolume(farFiber)) {
         return tr("Bind both fibers to the active volume before linking.");
     }
     const cv::Vec3d fallbackDirection = normalizedOrZero(farPoint - localPoint);
     const cv::Vec3d localDirection =
         endpointTangentFromLinePoints(local.linePoints, localPoint, fallbackDirection);
     const cv::Vec3d farDirection =
-        endpointTangentFromLinePoints(far.linePoints, farPoint, -fallbackDirection);
+        endpointTangentFromLinePoints(farFiber.linePoints, farPoint, -fallbackDirection);
     if (!finiteDirection(localDirection) || !finiteDirection(farDirection)) {
         return tr("Could not determine finite link directions between the control points.");
     }
     const FiberBranchRef localRef = la::makeBranchRef(
-        localControlIndex, localPoint, localDirection, far.id, far.fileName, farControlIndex,
+        localControlIndex, localPoint, localDirection, farFiber.id, farFiber.fileName, farControlIndex,
         farPoint, farDirection, /*pending=*/true, /*adjacent=*/false, autoLink);
     local.branches.push_back(localRef);
-    far.branches.push_back(la::reciprocalBranchRef(localRef, local.id, local.fileName));
+    farFiber.branches.push_back(la::reciprocalBranchRef(localRef, local.id, local.fileName));
     try {
-        commitFibers({&local, &far});
+        commitFibers({&local, &farFiber});
     } catch (const std::exception& ex) {
         local.branches.pop_back();
-        far.branches.pop_back();
+        farFiber.branches.pop_back();
         return tr("Could not save linked fibers: %1").arg(QString::fromStdString(ex.what()));
     }
     invalidateFiberAlignmentMetrics(local.id, true);
-    invalidateFiberAlignmentMetrics(far.id, true);
+    invalidateFiberAlignmentMetrics(farFiber.id, true);
     refreshBranchLineViews(local.id);
-    refreshBranchLineViews(far.id);
+    refreshBranchLineViews(farFiber.id);
     return std::nullopt;
 }
 
@@ -7517,16 +7517,16 @@ void LineAnnotationController::commitFiberMerge(StructuralEditCapture capture)
         // Planning snapshots: a session's current state where one is open
         // (its unsaved edits included), the stored record otherwise.
         const StoredFiber clicked = makeStoredFiberSessionSnapshot(*clickedSession).fiber;
-        StoredFiber far;
+        StoredFiber farFiber;
         if (farSession) {
-            far = makeStoredFiberSessionSnapshot(*farSession).fiber;
+            farFiber = makeStoredFiberSessionSnapshot(*farSession).fiber;
         } else {
             auto stored = readStoredFiber(capture.farId, true);
             if (!stored || stored->fileName != capture.farFileName) {
                 abort(tr("the merge candidate's fiber no longer exists"));
                 return;
             }
-            far = std::move(*stored);
+            farFiber = std::move(*stored);
         }
         const auto clickedIndex = matchingStoredControlPointIndex(
             clicked.controlPoints, capture.firstHint, capture.firstPoint);
@@ -7535,7 +7535,7 @@ void LineAnnotationController::commitFiberMerge(StructuralEditCapture capture)
             return;
         }
         const auto candidateIndex =
-            matchingStoredControlPointIndex(far.controlPoints, capture.farHint, capture.farPoint);
+            matchingStoredControlPointIndex(farFiber.controlPoints, capture.farHint, capture.farPoint);
         if (!candidateIndex) {
             abort(tr("the merge candidate control point no longer exists"));
             return;
@@ -7550,11 +7550,11 @@ void LineAnnotationController::commitFiberMerge(StructuralEditCapture capture)
         identity.sequence = nextFiberSequenceForUsername(identity.username);
         identity.fileName =
             la::fiberFileName(identity.username, identity.startedAt, identity.sequence);
-        identity.id = std::max(nextFiberId(), std::max(clicked.id, far.id) + 1);
+        identity.id = std::max(nextFiberId(), std::max(clicked.id, farFiber.id) + 1);
 
         auto plan = std::make_shared<la::MergePlan>();
         {
-            auto planned = la::planFiberMerge(clicked, *clickedIndex, far, *candidateIndex,
+            auto planned = la::planFiberMerge(clicked, *clickedIndex, farFiber, *candidateIndex,
                                               capture.mode, identity, &reason);
             if (!planned) {
                 abort(QString::fromStdString(reason));
@@ -7569,13 +7569,13 @@ void LineAnnotationController::commitFiberMerge(StructuralEditCapture capture)
         StructuralEditRequest request;
         request.verb = "merge";
         request.newFibers.push_back(plan->merged);
-        request.originals = {clicked, far};
+        request.originals = {clicked, farFiber};
         request.sources.push_back({clicked.id, clicked.fileName, nullptr,
                                    [plan, mergedId, mergedFileName](int index) {
                                        return la::RedirectTarget{mergedId, mergedFileName,
                                                                  plan->clickedRemap(index)};
                                    }});
-        request.sources.push_back({far.id, far.fileName, nullptr,
+        request.sources.push_back({farFiber.id, farFiber.fileName, nullptr,
                                    [plan, mergedId, mergedFileName](int index) {
                                        return la::RedirectTarget{mergedId, mergedFileName,
                                                                  plan->farRemap(index)};
@@ -7595,7 +7595,7 @@ void LineAnnotationController::commitFiberMerge(StructuralEditCapture capture)
                           .arg(QString::fromStdString(outcome.warning)),
                       capture.suppressErrors);
         }
-        Logger()->info("Merged {} and {} into {}", clicked.fileName, far.fileName, mergedFileName);
+        Logger()->info("Merged {} and {} into {}", clicked.fileName, farFiber.fileName, mergedFileName);
 
         // The re-fit yields (dataset picker, save drain): release the guard
         // first. Its outcome does not change the committed graph.

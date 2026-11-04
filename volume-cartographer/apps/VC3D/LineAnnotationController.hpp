@@ -1548,13 +1548,13 @@ private:
     // error names what refused.
     std::optional<QString> linkStoredControlPoints(StoredFiber& local,
                                                    int localControlIndex,
-                                                   StoredFiber& far,
+                                                   StoredFiber& farFiber,
                                                    int farControlIndex,
                                                    bool autoLink);
     // The pair-level part of linkStoredControlPoints' checks (same fiber,
     // read-only), so an operation can refuse BEFORE it mutates anything.
     [[nodiscard]] std::optional<QString> linkPairEligibilityError(const StoredFiber& local,
-                                                                  const StoredFiber& far) const;
+                                                                  const StoredFiber& farFiber) const;
     mutable QString _lastSuppressedError;
 
     // Transient (in-memory only) staging state for a designated control

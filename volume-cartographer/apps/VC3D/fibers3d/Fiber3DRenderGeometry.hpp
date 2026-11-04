@@ -454,10 +454,10 @@ struct View {
     double pixelsPerUnit(const Bounds& b) const
     {
         const double wmin = extent(b, m[3]).first;
-        std::array<double, 4> near;
+        std::array<double, 4> nearPlane;
         for (int i = 0; i < 4; ++i)
-            near[i] = m[2][i] + m[3][i];
-        if (wmin <= 0 || extent(b, near).first <= 0)
+            nearPlane[i] = m[2][i] + m[3][i];
+        if (wmin <= 0 || extent(b, nearPlane).first <= 0)
             return std::numeric_limits<double>::infinity();
         const double wn = std::hypot(m[3][0], m[3][1], m[3][2]);
         double squared = 0;

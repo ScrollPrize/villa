@@ -48,6 +48,8 @@ struct FieldSpec {
     bool normalize = false, normal = false;
 };
 
+struct TargetCompanion;
+
 // One aligned array: how a reader's values reach the shared grid.
 struct Target {
     Source source;
@@ -63,8 +65,15 @@ struct Target {
     std::optional<FieldSpec> field;
     aligned::Field fieldState{};
     nlohmann::json metadata;
-    std::vector<std::pair<std::string, Target>> companions;
+    std::vector<TargetCompanion> companions;
     std::shared_ptr<void> cuda;  // reader_cuda::Reader of its array, once a render needs it
+};
+
+// A named struct rather than std::pair<std::string, Target>: Clang with libstdc++ evaluates
+// that pair's constructor traits while Target is still incomplete and rejects the recursion.
+struct TargetCompanion {
+    std::string name;
+    Target target;
 };
 
 // A tile on the host or device.

@@ -82,17 +82,17 @@ private:
     static bool local_read(const std::string& path, std::vector<std::uint8_t>& body,
                            std::optional<std::uint64_t> offset, std::size_t length, std::size_t maximum)
     {
-        int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+        int fd = platform::open_file(path, O_RDONLY);
         if (fd < 0) {
             if (errno == ENOENT) return false;
             throw std::system_error(errno, std::generic_category(), "open " + path);
         }
         try {
-            struct stat stat{};
-            if (::fstat(fd, &stat) != 0) throw std::system_error(errno, std::generic_category(), "fstat " + path);
-            if (!offset) length = static_cast<std::size_t>(stat.st_size);
-            if (length > maximum || offset.value_or(0) > std::uint64_t(stat.st_size) ||
-                length > std::uint64_t(stat.st_size)-offset.value_or(0))
+            platform::FileStat stat;
+            if (platform::fstat(fd, stat) != 0) throw std::system_error(errno, std::generic_category(), "fstat " + path);
+            if (!offset) length = static_cast<std::size_t>(stat.size);
+            if (length > maximum || offset.value_or(0) > std::uint64_t(stat.size) ||
+                length > std::uint64_t(stat.size)-offset.value_or(0))
                 throw std::runtime_error("truncated or oversized Zarr object: " + path);
             body.resize(length);
             pread_exact(fd, body.data(), length, static_cast<std::int64_t>(offset.value_or(0)), path);

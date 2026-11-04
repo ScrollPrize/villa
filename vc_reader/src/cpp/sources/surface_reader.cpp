@@ -311,7 +311,7 @@ Target prepareSurfaceTarget(AlignedEngine::Impl& impl, const Source& source, std
         auto child = opened->companion(companion.name);
         const auto* childReg = surfaceOf(child->registration());
         if (!childReg || childReg->surface.id != reg->surface.id || !childReg->pixelToUv) bad("surface companions require an explicit shared surface registration");
-        target.companions.emplace_back(companion.name, impl.samplingTarget(*companion.source, child, VolumeTransform{pixelAffine(*childReg->pixelToUv).forward.inverse(), {}}, true, true));
+        target.companions.push_back({companion.name, impl.samplingTarget(*companion.source, child, VolumeTransform{pixelAffine(*childReg->pixelToUv).forward.inverse(), {}}, true, true)});
     }
     return target;
 }

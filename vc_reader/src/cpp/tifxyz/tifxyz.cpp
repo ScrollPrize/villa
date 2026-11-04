@@ -9,6 +9,7 @@
 #include "vc_reader/zarr_write.hpp"
 #include "../element_type.hpp"
 #include "../rounding.hpp"
+#include "../platform_io.hpp"
 
 #ifdef _WIN32
 #include <process.h>
@@ -43,9 +44,9 @@ std::string readText(const std::string& location, const sources::OptionsFor& opt
     const auto opened = files.open(location);
     std::string text;
     char block[1 << 16];
-    ssize_t n;
-    off_t at = 0;
-    while ((n = ::pread(opened.fd, block, sizeof block, at)) > 0) {
+    std::int64_t n;
+    std::int64_t at = 0;
+    while ((n = platform::pread(opened.fd, block, sizeof block, at)) > 0) {
         text.append(block, std::size_t(n));
         at += n;
     }

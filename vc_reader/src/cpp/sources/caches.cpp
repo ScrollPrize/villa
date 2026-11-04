@@ -57,7 +57,7 @@ std::size_t Block::itemsize() const { return std::size_t(dtype[2] - '0'); }
 
 // ---- decoded cache ----
 struct DecodedCache::State {
-    long pid = ::getpid();
+    long pid = platform::process_id();
     std::recursive_mutex mutex;
     explicit State(std::size_t limit) : entries(limit) {}
     Lru<Block> entries;
@@ -89,7 +89,7 @@ DecodedCache::DecodedCache(std::size_t maxBytes, std::size_t maxDecodeBytes) : m
 std::shared_ptr<DecodedCache::State> DecodedCache::state()
 {
     std::lock_guard guard(stateMutex_);
-    if (state_->pid != ::getpid()) {
+    if (state_->pid != platform::process_id()) {
         // The inherited lock may have been held across fork: leave it alone.
         new std::shared_ptr<State>(state_);
         state_ = std::make_shared<State>(maxBytes_);
@@ -171,7 +171,7 @@ EncodedFiles::Opened::~Opened()
     if (fd >= 0) ::close(fd);
 }
 
-EncodedFiles::EncodedFiles(OptionsFor options) : options_(std::move(options)), pid_(::getpid()) {}
+EncodedFiles::EncodedFiles(OptionsFor options) : options_(std::move(options)), pid_(platform::process_id()) {}
 EncodedFiles::~EncodedFiles()
 {
     try {
@@ -182,13 +182,13 @@ EncodedFiles::~EncodedFiles()
 
 void EncodedFiles::process()
 {
-    if (pid_ != ::getpid()) {
+    if (pid_ != platform::process_id()) {
         // A child must not unlink the parent's temporary cache.
         temporary_.clear();
         identities_.clear();
         resolved_.clear();
         bytesRead_ = cacheHits_ = 0;
-        pid_ = ::getpid();
+        pid_ = platform::process_id();
     }
 }
 
@@ -207,10 +207,10 @@ void EncodedFiles::close()
 
 std::string EncodedFiles::identity(const std::string& location, int fd)
 {
-    struct stat st{};
-    if (::fstat(fd, &st) != 0) throw std::system_error(errno, std::generic_category(), "fstat " + location);
-    const auto signature = std::to_string(st.st_dev) + ":" + std::to_string(st.st_ino) + ":" + std::to_string(st.st_size) + ":" +
-                           std::to_string(st.st_mtime) + ":" + std::to_string(st.st_ctime);
+    platform::FileStat st;
+    if (platform::fstat(fd, st) != 0) throw std::system_error(errno, std::generic_category(), "fstat " + location);
+    const auto signature = std::to_string(st.device) + ":" + std::to_string(st.inode) + ":" + std::to_string(st.size) + ":" +
+                           std::to_string(st.modified.seconds) + ":" + std::to_string(st.changed.seconds);
     {
         std::lock_guard guard(mutex_);
         const auto known = identities_.find(location);
@@ -220,9 +220,9 @@ std::string EncodedFiles::identity(const std::string& location, int fd)
     // Hashed outside the lock, so one file's digest does not hold up another's download.
     Sha256 hash;
     std::vector<char> block(1 << 16);
-    off_t at = 0;
+    std::int64_t at = 0;
     for (;;) {
-        const auto n = ::pread(fd, block.data(), block.size(), at);
+        const auto n = platform::pread(fd, block.data(), block.size(), at);
         if (n < 0) throw std::system_error(errno, std::generic_category(), "read " + location);
         if (n == 0) break;
         hash.update(block.data(), std::size_t(n));
@@ -245,18 +245,18 @@ EncodedFiles::Opened EncodedFiles::open(const std::string& location)
         std::string path = location;
         if (path.starts_with("~/") || path == "~")
             if (const char* home = std::getenv("HOME")) path = std::string(home) + path.substr(1);
-        const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+        const int fd = platform::open_file(path, O_RDONLY);
         if (fd < 0) {
             if (errno == ENOENT || errno == ENOTDIR) throw zarr::NotFound(path + ": no such file");
             throw fs::filesystem_error("open", path, std::error_code(errno, std::generic_category()));
         }
         Opened opened(fd, {});
-        struct stat st{};
-        if (::fstat(fd, &st) != 0) throw fs::filesystem_error("fstat", path, std::error_code(errno, std::generic_category()));
-        if (S_ISDIR(st.st_mode)) throw fs::filesystem_error("open", path, std::make_error_code(std::errc::is_a_directory));
-        opened.token = fs::absolute(path).string() + "|" + std::to_string(st.st_dev) + "|" + std::to_string(st.st_ino) + "|" + std::to_string(st.st_size) + "|" +
-                       std::to_string(st.st_mtim.tv_sec) + "." + std::to_string(st.st_mtim.tv_nsec) + "|" +
-                       std::to_string(st.st_ctim.tv_sec) + "." + std::to_string(st.st_ctim.tv_nsec);
+        platform::FileStat st;
+        if (platform::fstat(fd, st) != 0) throw fs::filesystem_error("fstat", path, std::error_code(errno, std::generic_category()));
+        if (st.directory) throw fs::filesystem_error("open", path, std::make_error_code(std::errc::is_a_directory));
+        opened.token = fs::absolute(path).string() + "|" + std::to_string(st.device) + "|" + std::to_string(st.inode) + "|" + std::to_string(st.size) + "|" +
+                       std::to_string(st.modified.seconds) + "." + std::to_string(st.modified.nanoseconds) + "|" +
+                       std::to_string(st.changed.seconds) + "." + std::to_string(st.changed.nanoseconds);
         return opened;
     }
     // The lock covers this object's state only: downloads of different files overlap, and
@@ -282,7 +282,7 @@ EncodedFiles::Opened EncodedFiles::open(const std::string& location)
     }
     for (const auto& root : lookIn) {
         const auto path = zarr::decodedCachePath(root, location);
-        const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+        const int fd = platform::open_file(path, O_RDONLY);
         if (fd < 0) {
             if (errno == ENOENT || errno == ENOTDIR) continue;
             throw fs::filesystem_error("open", path, std::error_code(errno, std::generic_category()));
@@ -303,9 +303,7 @@ EncodedFiles::Opened EncodedFiles::open(const std::string& location)
         limit = limit.value_or(std::int64_t{1} << 30);
         std::lock_guard guard(mutex_);
         if (temporary_.empty()) {
-            auto pattern = (fs::temp_directory_path() / "vc-reader-images-XXXXXX").string();
-            if (!::mkdtemp(pattern.data())) throw std::system_error(errno, std::generic_category(), "mkdtemp");
-            temporary_ = pattern;
+            temporary_ = platform::make_temp_directory((fs::temp_directory_path() / "vc-reader-images-XXXXXX").string());
         }
         root = temporary_;
     }

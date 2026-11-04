@@ -16,7 +16,6 @@
 #include <memory>
 #include <mutex>
 #include <tuple>
-#include <sys/file.h>
 
 namespace vcr {
 
@@ -187,10 +186,10 @@ public:
     std::pair<int, std::size_t> open_file(const std::string& path, const std::string& url, const Auth& auth)
     {
         check_path(path);
-        if (int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC); fd >= 0 || errno != ENOENT) {
+        if (int fd = platform::open_file(path, O_RDONLY); fd >= 0 || errno != ENOENT) {
             if (fd < 0) throw std::system_error(errno, std::generic_category(), "open " + path);
-            struct stat st;
-            if (::fstat(fd, &st) != 0 || !S_ISREG(st.st_mode)) {
+            platform::FileStat st;
+            if (platform::fstat(fd, st) != 0 || !st.regular) {
                 ::close(fd);
                 throw std::runtime_error("cached file is not a regular file: " + path);
             }
@@ -201,10 +200,10 @@ public:
         const auto locks = root_ / ".vc_reader_locks";
         std::filesystem::create_directories(locks);
         const auto lock_path = locks / (std::to_string(std::hash<std::string>{}(path)) + ".lock");
-        File object_lock(::open(lock_path.c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0644));
+        File object_lock(platform::open_file(lock_path, O_RDWR | O_CREAT, 0644));
         if (!object_lock) throw std::system_error(errno, std::generic_category(), "open cache file lock");
         lock_file(object_lock.fd());
-        if (int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC); fd >= 0)
+        if (int fd = platform::open_file(path, O_RDONLY); fd >= 0)
             return {fd, 0};  // another owner published it while we waited
         int fd = -1;
         std::unique_ptr<AtomicFile> output;
@@ -246,7 +245,7 @@ public:
                 grows = !size;
                 if (size && !leaves_free_space(*size)) refuse_low_space(url);
                 if (grows && unsized_turn.fd() < 0 && max_bytes() != std::numeric_limits<std::int64_t>::max()) {
-                    unsized_turn = File(::open((locks / "unsized.lock").c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0644));
+                    unsized_turn = File(platform::open_file(locks / "unsized.lock", O_RDWR | O_CREAT, 0644));
                     if (unsized_turn.fd() < 0) throw std::system_error(errno, std::generic_category(), "open cache file lock");
                     lock_file(unsized_turn.fd());
                 }
@@ -260,7 +259,7 @@ public:
                     record(path, static_cast<std::int64_t>(received));
                     Statement f(db_, "INSERT OR IGNORE INTO files(path) VALUES(?)");
                     f.text(1, path); f.step();
-                    fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+                    fd = platform::open_file(path, O_RDONLY);
                     if (fd < 0) throw std::system_error(errno, std::generic_category(), "open " + path);
                 }
                 output.reset();
@@ -355,7 +354,7 @@ private:
 
     static void lock_file(int fd)
     {
-        while (::flock(fd, LOCK_EX) != 0)
+        while (platform::lock_exclusive(fd, true) != 0)
             if (errno != EINTR) throw std::system_error(errno, std::generic_category(), "lock cache file");
     }
 
@@ -365,7 +364,7 @@ private:
     {
         auto file = File::open_read(path);
         if (!file) return true;
-        if (::flock(file.fd(), LOCK_EX | LOCK_NB) != 0) {
+        if (platform::lock_exclusive(file.fd(), false) != 0) {
             if (errno == EWOULDBLOCK || errno == EAGAIN) return false;
             throw std::system_error(errno, std::generic_category(), "check download lock");
         }

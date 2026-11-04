@@ -4,10 +4,9 @@
 #include "reader_types.hpp"
 #include "atomic_file.hpp"
 #include "lru.hpp"
+#include "platform_io.hpp"
 
 #include <fcntl.h>
-#include <sys/mman.h>
-#include <sys/stat.h>
 #include <unistd.h>
 
 #include <cerrno>
@@ -146,7 +145,7 @@ public:
     // Opens for reading; an empty File if it does not exist.
     static File open_read(const std::string& path)
     {
-        const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+        const int fd = platform::open_file(path, O_RDONLY);
         if (fd < 0 && errno != ENOENT && errno != ENOTDIR)
             throw std::system_error(errno, std::generic_category(), "open " + path);
         return File(fd);
@@ -158,8 +157,8 @@ private:
 
 inline bool exists(const std::string& path)
 {
-    struct stat st;
-    return ::stat(path.c_str(), &st) == 0;
+    std::error_code error;
+    return std::filesystem::exists(path, error);
 }
 
 // Reads exactly n bytes at offset; throws on a short read.
@@ -167,7 +166,7 @@ inline void pread_exact(int fd, std::uint8_t* dst, std::size_t n, std::int64_t o
 {
     std::size_t got = 0;
     while (got < n) {
-        const ssize_t k = ::pread(fd, dst + got, n - got, static_cast<off_t>(offset + got));
+        const auto k = platform::pread(fd, dst + got, n - got, offset + static_cast<std::int64_t>(got));
         if (k < 0) {
             if (errno == EINTR)
                 continue;
@@ -181,10 +180,10 @@ inline void pread_exact(int fd, std::uint8_t* dst, std::size_t n, std::int64_t o
 
 inline std::vector<std::uint8_t> read_whole(int fd, const std::string& what)
 {
-    struct stat st;
-    if (::fstat(fd, &st) != 0)
+    platform::FileStat st;
+    if (platform::fstat(fd, st) != 0)
         throw std::system_error(errno, std::generic_category(), "stat " + what);
-    std::vector<std::uint8_t> data(static_cast<std::size_t>(st.st_size));
+    std::vector<std::uint8_t> data(static_cast<std::size_t>(st.size));
     if (!data.empty())
         pread_exact(fd, data.data(), data.size(), 0, what);
     return data;
@@ -205,7 +204,7 @@ public:
     struct Mapping {
         const std::uint8_t* data = nullptr;
         std::size_t size = 0;
-        ~Mapping() { if (data) ::munmap(const_cast<std::uint8_t*>(data), size); }
+        ~Mapping() { if (data) platform::unmap(data, size); }
     };
     using MappingPtr = std::shared_ptr<const Mapping>;
 
@@ -222,16 +221,15 @@ public:
         File f = File::open_read(path);
         if (!f)
             return nullptr;
-        struct stat st;
-        if (::fstat(f.fd(), &st) != 0)
+        platform::FileStat st;
+        if (platform::fstat(f.fd(), st) != 0)
             throw std::system_error(errno, std::generic_category(), "stat " + path);
         auto m = std::make_shared<Mapping>();
-        m->size = static_cast<std::size_t>(st.st_size);
+        m->size = static_cast<std::size_t>(st.size);
         if (m->size) {
-            void* p = ::mmap(nullptr, m->size, PROT_READ, MAP_SHARED, f.fd(), 0);
-            if (p == MAP_FAILED)
+            m->data = platform::map_read(f.fd(), m->size);
+            if (!m->data)
                 throw std::system_error(errno, std::generic_category(), "mmap " + path);
-            m->data = static_cast<const std::uint8_t*>(p);
         }
         std::lock_guard lock(mutex_);
         if (const auto* value = entries_.get(path)) return *value;
