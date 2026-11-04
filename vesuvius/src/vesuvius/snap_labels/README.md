@@ -22,10 +22,16 @@ over 1.8 times the mesh's 25th percentile band thickness, which is how two sheet
 An abstaining vertex may still move by an offset filled in from measured neighbors; nothing at that vertex vouches
 for it, so it is flagged.
 
-The optional --min-gap N rule abstains when either measured gap from the chosen band to a neighboring band is less
+The optional `--min-gap N` rule abstains when either measured gap from the chosen band to a neighboring band is less
 than N voxels. It marks the reason as "touching neighbor", leaves the vertex at its input coordinates, and excludes
 its offset from filling and smoothing. The option is off by default. It changes coverage, and has not been shown to
 increase the share of vertices within 1 voxel of a true face.
+
+It only sees a gap the band finder can measure, so it does not catch sheets that really touch. Where the blur has
+merged two sheets into one band there is no gap to measure, the vertex does not abstain, and it can still snap to
+the wrong sheet; `--merged` is the rule for that case. The blur also moves the measured gap away from the true one
+(on a synthetic profile a true 2 voxel gap read as about 2.6), so N is a threshold on the measured gap, not a true
+distance.
 
 `--half 16 --fallback-half 12 --min-contrast 0` reads the same face on a +-16 voxel window, and again on +-12 where
 +-16 abstains, with no contrast floor (`face.FACE_SNAP_WINDOW16`). The level comes from the window's 10th and 90th
