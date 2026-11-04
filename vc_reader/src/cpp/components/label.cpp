@@ -82,6 +82,7 @@ std::size_t label(const std::uint8_t* mask, std::span<const std::size_t> shape, 
                   std::int32_t* labels, std::size_t threads) {
     const auto dim = shape.size();
     if (dim != 2 && dim != 3) throw std::invalid_argument("label expects a 2D or 3D mask");
+    connectivity = detail::planar_connectivity(dim, connectivity);
     const auto table = neighbor_rows(dim, connectivity);
     const std::span neighbors(table.rows.data(), std::size_t(table.count));
     const std::size_t nz = dim == 3 ? shape[0] : 1, ny = shape[dim - 2], nx = shape[dim - 1];

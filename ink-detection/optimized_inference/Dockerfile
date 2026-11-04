@@ -12,6 +12,17 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     git \
     build-essential \
+    pkg-config \
+    libblosc-dev \
+    libcurl4-openssl-dev \
+    liblz4-dev \
+    libzstd-dev \
+    libsqlite3-dev \
+    libtiff-dev \
+    libpng-dev \
+    libjpeg-dev \
+    zlib1g-dev \
+    nlohmann-json3-dev \
     && rm -rf /var/lib/apt/lists/*
 
 # Install uv
@@ -19,6 +30,17 @@ RUN curl -LsSf https://astral.sh/uv/install.sh | sh
 ENV PATH="/root/.local/bin:$PATH"
 
 WORKDIR /app
+
+# vc_reader (zarr/image I/O, object stores) is a C++ package built from this monorepo, not
+# PyPI; build.sh passes its source as the `vc_reader` build context. Built without CUDA:
+# inference only uses it for I/O, torch does the GPU work.
+COPY --from=vc_reader pyproject.toml CMakeLists.txt README.md /opt/vc_reader/
+COPY --from=vc_reader cmake /opt/vc_reader/cmake
+COPY --from=vc_reader include /opt/vc_reader/include
+COPY --from=vc_reader src /opt/vc_reader/src
+COPY --from=vc_reader third_party /opt/vc_reader/third_party
+RUN CMAKE_ARGS="-DVC_READER_ENABLE_CUDA=OFF" uv pip install --system --break-system-packages --no-cache /opt/vc_reader \
+    && rm -rf /opt/vc_reader
 
 COPY requirements.txt /app
 # should only install additional dependencies, not torch, cuda, etc.
@@ -56,6 +78,17 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     git \
     build-essential \
+    pkg-config \
+    libblosc-dev \
+    libcurl4-openssl-dev \
+    liblz4-dev \
+    libzstd-dev \
+    libsqlite3-dev \
+    libtiff-dev \
+    libpng-dev \
+    libjpeg-dev \
+    zlib1g-dev \
+    nlohmann-json3-dev \
     && rm -rf /var/lib/apt/lists/*
 
 # Install uv
@@ -63,6 +96,15 @@ RUN curl -LsSf https://astral.sh/uv/install.sh | sh
 ENV PATH="/root/.local/bin:$PATH"
 
 WORKDIR /app
+
+# vc_reader from the monorepo, as in the gpu stage.
+COPY --from=vc_reader pyproject.toml CMakeLists.txt README.md /opt/vc_reader/
+COPY --from=vc_reader cmake /opt/vc_reader/cmake
+COPY --from=vc_reader include /opt/vc_reader/include
+COPY --from=vc_reader src /opt/vc_reader/src
+COPY --from=vc_reader third_party /opt/vc_reader/third_party
+RUN CMAKE_ARGS="-DVC_READER_ENABLE_CUDA=OFF" uv pip install --system --no-cache /opt/vc_reader \
+    && rm -rf /opt/vc_reader
 
 COPY requirements-cpu-only.txt /app
 RUN uv pip install --system --no-cache -r requirements-cpu-only.txt

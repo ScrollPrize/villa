@@ -129,6 +129,7 @@ std::size_t label(const std::uint8_t* mask, std::span<const std::size_t> shape, 
                   std::int32_t* labels) {
     const auto dim = shape.size();
     if (dim != 2 && dim != 3) throw std::invalid_argument("label expects a 2D or 3D mask");
+    connectivity = detail::planar_connectivity(dim, connectivity);
     int reach = 0;
     if (dim == 2 && (connectivity == 4 || connectivity == 8)) reach = connectivity == 4 ? 1 : 2;
     if (dim == 3 && (connectivity == 6 || connectivity == 18 || connectivity == 26)) reach = connectivity == 6 ? 1 : connectivity == 18 ? 2 : 3;

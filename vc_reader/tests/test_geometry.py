@@ -368,7 +368,19 @@ def test_label_components_match_scipy(backend, connectivity, dims, structure):
             assert n == count and host(labels).dtype == np.int32
             np.testing.assert_array_equal(host(labels), expected)
     with pytest.raises(ValueError, match='connectivity'):
-        label_components(np.zeros((3,) * dims, bool), connectivity=26 if dims == 2 else 8)
+        label_components(np.zeros((3,) * dims, bool), connectivity=5 if dims == 2 else 8)
+
+
+@pytest.mark.parametrize('connectivity,planar', [(6, 4), (18, 8), (26, 8)])
+def test_label_components_reads_3d_connectivity_in_plane_for_2d(backend, connectivity, planar):
+    # cc3d's reading: a 2D mask is one plane, so 6 labels it as 4 and 18 or 26 as 8.
+    mask = np.random.default_rng(connectivity).random((120, 90)) < .45
+    expected, count = label_components(mask, connectivity=planar)
+    labels, n = label_components(upload(mask, backend), connectivity=connectivity)
+    assert n == count
+    np.testing.assert_array_equal(host(labels), expected)
+    filled = fill_holes(upload(mask, backend), connectivity=connectivity)
+    np.testing.assert_array_equal(host(filled), fill_holes(mask, connectivity=planar))
 
 
 @pytest.mark.parametrize('connectivity,dims,structure', [(0,2,1),(8,2,2),(0,3,1),(18,3,2),(26,3,3)])

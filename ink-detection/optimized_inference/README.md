@@ -88,16 +88,19 @@ The `Dockerfile` builds a slim runtime with a prebuilt virtualenv layer.
 
 ### Build
 
+Both images build `vc_reader` from this monorepo, passed as the `vc_reader` build context
+(BuildKit; `build.sh` does this):
+
 ```bash
 # GPU inference image
-docker build --target gpu -t ink-detection-optimized-inference:gpu .
+docker build --build-context vc_reader=../../vc_reader --target gpu -t ink-detection-optimized-inference:gpu .
 
 # CPU utility image
-docker build --target cpu -t ink-detection-optimized-inference:cpu .
+docker build --build-context vc_reader=../../vc_reader --target cpu -t ink-detection-optimized-inference:cpu .
 
 # Agent mode with explicit opt-in
-AGENTS_AGENT_MODE=1 AGENTS_ALLOW_INSTALL=1 docker build --target gpu -t ink-detection-optimized-inference:gpu .
-AGENTS_AGENT_MODE=1 AGENTS_ALLOW_INSTALL=1 docker build --target cpu -t ink-detection-optimized-inference:cpu .
+AGENTS_AGENT_MODE=1 AGENTS_ALLOW_INSTALL=1 docker build --build-context vc_reader=../../vc_reader --target gpu -t ink-detection-optimized-inference:gpu .
+AGENTS_AGENT_MODE=1 AGENTS_ALLOW_INSTALL=1 docker build --build-context vc_reader=../../vc_reader --target cpu -t ink-detection-optimized-inference:cpu .
 ```
 
 Notes:

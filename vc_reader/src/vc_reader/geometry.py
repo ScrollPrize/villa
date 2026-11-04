@@ -280,9 +280,9 @@ def label_components(mask, *, connectivity, threads=0, out=None):
 
     Returns ``(labels, count)``: int32 labels 1..count, numbered in scan order of
     each component's first voxel as scipy.ndimage.label numbers them, and 0 for
-    background. connectivity is 4 or 8 in 2D, 6, 18 or 26 in 3D. CUDA masks
-    (bool or uint8) give CUDA labels. threads (CPU; 0 uses all) does not change
-    the result.
+    background. connectivity is 4 or 8 in 2D, 6, 18 or 26 in 3D; on a 2D mask 6
+    means 4 and 18 or 26 mean 8, as cc3d reads them. CUDA masks (bool or uint8)
+    give CUDA labels. threads (CPU; 0 uses all) does not change the result.
     """
     device = _device(mask)
     if device >= 0:
@@ -302,8 +302,9 @@ def fill_holes(mask, *, connectivity=0, threads=0, out=None):
 
     Returns a bool mask: the input plus every background component not connected
     to the array border. connectivity is the background's: 4 or 8 in 2D, 6, 18
-    or 26 in 3D; 0 is scipy's default structure (4 or 6). CUDA masks (bool or
-    uint8) give CUDA results; ``out`` may be the mask itself.
+    or 26 in 3D (on a 2D mask 6 means 4 and 18 or 26 mean 8, as for
+    label_components); 0 is scipy's default structure (4 or 6). CUDA masks (bool
+    or uint8) give CUDA results; ``out`` may be the mask itself.
     """
     device = _device(mask)
     if device >= 0:
