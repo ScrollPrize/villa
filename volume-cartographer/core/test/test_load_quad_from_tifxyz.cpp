@@ -5,7 +5,10 @@
 
 #include "vc/core/util/QuadSurface.hpp"
 
+#include <vc_reader/image_write.hpp>
+
 #include <filesystem>
+#include <fstream>
 #include <opencv2/core.hpp>
 #include <random>
 #include <stdexcept>
@@ -29,17 +32,32 @@ fs::path fixtureSegment(const std::string& name)
 TEST_CASE("load_quad_from_tifxyz: returns a valid surface for a real fixture")
 {
     auto seg = fixtureSegment("20241113070770");
-    if (!fs::exists(seg / "meta.json")) {
-        MESSAGE("Skipping: fixture missing at " << seg);
-        return;
-    }
+    REQUIRE(fs::exists(seg / "meta.json"));
     auto qs = load_quad_from_tifxyz(seg.string(), 0);
     REQUIRE(qs);
     qs->ensureLoaded();
     CHECK(qs->rawPointsPtr() != nullptr);
     CHECK(qs->rawPointsPtr()->rows == 129);
     CHECK(qs->rawPointsPtr()->cols == 129);
-    CHECK(qs->meta["uuid"].get_string() == "20241113070770");
+    CHECK(qs->meta["uuid"].get<std::string>() == "20241113070770");
+}
+
+TEST_CASE("load_quad_from_tifxyz: a negative coordinate marks the vertex invalid")
+{
+    const auto dir = fs::temp_directory_path() / ("vc_negative_vertex_" + std::to_string(std::random_device{}()));
+    fs::create_directories(dir);
+    const float x[] = {1, -2.5f, 3, 4}, y[] = {1, 2, -0.5f, 4}, z[] = {1, 2, 3, 4};
+    vcr::sources::writeTiff(dir / "x.tif", x, "<f4", 2, 2);
+    vcr::sources::writeTiff(dir / "y.tif", y, "<f4", 2, 2);
+    vcr::sources::writeTiff(dir / "z.tif", z, "<f4", 2, 2);
+    std::ofstream(dir / "meta.json") << R"({"scale": [1.0, 1.0], "uuid": "negative"})";
+    const auto qs = load_quad_from_tifxyz(dir);
+    const auto& points = *qs->rawPointsPtr();
+    CHECK(points(0, 0) == cv::Vec3f(1, 1, 1));
+    CHECK(points(0, 1) == cv::Vec3f(-1, -1, -1));
+    CHECK(points(1, 0) == cv::Vec3f(-1, -1, -1));
+    CHECK(points(1, 1) == cv::Vec3f(4, 4, 4));
+    fs::remove_all(dir);
 }
 
 TEST_CASE("load_quad_from_tifxyz: missing path throws")
@@ -51,22 +69,19 @@ TEST_CASE("load_quad_from_tifxyz: works for the other fixtures too")
 {
     for (const char* name : {"20241113080880", "20241113090990"}) {
         auto seg = fixtureSegment(name);
-        if (!fs::exists(seg / "meta.json")) continue;
+        REQUIRE(fs::exists(seg / "meta.json"));
         auto qs = load_quad_from_tifxyz(seg.string(), 0);
         REQUIRE(qs);
         qs->ensureLoaded();
         CHECK(qs->rawPointsPtr() != nullptr);
-        CHECK(qs->meta["uuid"].get_string() == std::string(name));
+        CHECK(qs->meta["uuid"].get<std::string>() == std::string(name));
     }
 }
 
 TEST_CASE("load_quad_from_tifxyz_region: decodes only the requested grid region")
 {
     const auto seg = fixtureSegment("20241113070770");
-    if (!fs::exists(seg / "meta.json")) {
-        MESSAGE("Skipping: fixture missing at " << seg);
-        return;
-    }
+    REQUIRE(fs::exists(seg / "meta.json"));
 
     QuadSurface lazy(seg);
     CHECK_FALSE(lazy.isLoaded());
@@ -89,9 +104,6 @@ TEST_CASE("load_quad_from_tifxyz_region: decodes only the requested grid region"
 TEST_CASE("load_quad_from_tifxyz_region: rejects an out-of-bounds region")
 {
     const auto seg = fixtureSegment("20241113070770");
-    if (!fs::exists(seg / "meta.json")) {
-        MESSAGE("Skipping: fixture missing at " << seg);
-        return;
-    }
+    REQUIRE(fs::exists(seg / "meta.json"));
     CHECK_THROWS(load_quad_from_tifxyz_region(seg, cv::Rect(120, 0, 20, 10)));
 }

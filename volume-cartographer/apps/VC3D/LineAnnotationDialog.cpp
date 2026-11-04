@@ -151,7 +151,6 @@ CChunkedVolumeViewer::CameraState generatedPaneCamera(CChunkedVolumeViewer* view
     camera.surfacePtrX = 0.0f;
     camera.surfacePtrY = 0.0f;
     camera.zOffset = 0.0f;
-    camera.zOffsetWorldDir = {0, 0, 0};
 
     auto* quad = viewer ? dynamic_cast<QuadSurface*>(viewer->currentSurface()) : nullptr;
     if (!quad) {
@@ -2238,7 +2237,7 @@ CChunkedVolumeViewer* LineAnnotationDialog::addPane(
         });
     }
 
-    viewer->applyCameraState(camera, false);
+    viewer->applyCameraState(camera);
     bindPaneInteractions(surfaceName, viewer, true);
     _panes.push_back(Pane{surfaceName, viewer, subWindow});
     return viewer;
@@ -2686,15 +2685,15 @@ bool LineAnnotationDialog::setGeneratedLineViews(
         _currentCutViewer->setProperty("vc_custom_normal_offset_vx", 0.0);
         _sideCutViewer->setProperty("vc_custom_normal_offset_vx", 0.0);
         _currentCutViewer->markSurfaceGeometryChanged();
-        _currentCutViewer->renderVisible(true, "line annotation views updated");
+        _currentCutViewer->renderVisible("line annotation views updated");
         _sideCutViewer->markSurfaceGeometryChanged();
-        _sideCutViewer->renderVisible(true, "line annotation views updated");
+        _sideCutViewer->renderVisible("line annotation views updated");
         for (const auto& stripViewer : _stripViewers) {
             if (stripViewer) {
                 // Bump the strip's geometry epoch too, so the swap hooks below
                 // can tell post-update frames from stale in-flight ones.
                 stripViewer->markSurfaceGeometryChanged();
-                stripViewer->renderVisible(true, "line annotation views updated");
+                stripViewer->renderVisible("line annotation views updated");
             }
         }
         // Adopting the re-registered surfaces cleared each viewer's scene
@@ -2934,9 +2933,9 @@ bool LineAnnotationDialog::setGeneratedLineViews(
     if (!haveCurrentCutCamera && _haveSavedCurrentCutZoom) {
         currentApplyCamera.scale = _savedCurrentCutZoom;
     }
-    currentViewer->applyCameraState(currentApplyCamera, false);
+    currentViewer->applyCameraState(currentApplyCamera);
     if (!haveCurrentCutCamera && finitePoint(_generatedViews.focusPoint)) {
-        currentViewer->centerOnVolumePoint(_generatedViews.focusPoint, false);
+        currentViewer->centerOnVolumePoint(_generatedViews.focusPoint);
     }
     currentViewer->setShiftScrollOverride(
         [this](int steps, QPointF, Qt::KeyboardModifiers modifiers) {
@@ -2991,9 +2990,9 @@ bool LineAnnotationDialog::setGeneratedLineViews(
     if (!haveSideCutCamera && _haveSavedSideCutZoom) {
         sideApplyCamera.scale = _savedSideCutZoom;
     }
-    sideViewer->applyCameraState(sideApplyCamera, false);
+    sideViewer->applyCameraState(sideApplyCamera);
     if (!haveSideCutCamera && finitePoint(_generatedViews.focusPoint)) {
-        sideViewer->centerOnVolumePoint(_generatedViews.focusPoint, false);
+        sideViewer->centerOnVolumePoint(_generatedViews.focusPoint);
     }
     sideViewer->setProperty("vc_show_custom_normal_offset", true);
     sideViewer->setProperty("vc_custom_normal_offset_vx", _sideCutNormalOffsetVx);
@@ -3105,7 +3104,7 @@ bool LineAnnotationDialog::setGeneratedLineViews(
         // strip along the line only and zooms are anchored on the centre row.
         viewer->setPinnedSurfaceY(generatedStripCenterlineSurfaceY(
             dynamic_cast<QuadSurface*>(viewer->currentSurface())));
-        viewer->applyCameraState(stripCamera, false);
+        viewer->applyCameraState(stripCamera);
         bindPaneInteractions(surfaceName, viewer, false);
         connect(viewer,
                 &CChunkedVolumeViewer::sendMouseMoveVolume,
@@ -3234,7 +3233,7 @@ bool LineAnnotationDialog::setGeneratedLineViews(
             float scale = std::numeric_limits<float>::infinity();
             for (const auto& viewer : _stripViewers) {
                 if (viewer) {
-                    viewer->resetViewForCurrentContent(false);
+                    viewer->resetViewForCurrentContent();
                     scale = std::min(scale, viewer->cameraState().scale);
                 }
             }
@@ -3242,7 +3241,7 @@ bool LineAnnotationDialog::setGeneratedLineViews(
             // even when the user gave their panes different heights.
             auto camera = firstStrip->cameraState();
             camera.scale = scale;
-            firstStrip->applyCameraState(camera, false);
+            firstStrip->applyCameraState(camera);
             syncLinkedStripCamera(firstStrip);
             rebuildGeneratedOverlays();
             captureInitialGeneratedViewState();
@@ -3797,7 +3796,7 @@ void LineAnnotationDialog::setCurrentLinePosition(double position,
     if (_currentCutViewer) {
         // Non-force: let the global render tick coalesce a burst of cursor moves into one
         // render per tick instead of force-submitting synchronously on every mouse event.
-        _currentCutViewer->renderVisible(false, "line annotation current cut");
+        _currentCutViewer->renderVisible("line annotation current cut");
     }
     if (_generatedViews.sideCutSurface) {
         (void)updateSidePlaneSurface(_generatedViews.sideCutSurface.get(), _currentLinePosition);
@@ -3810,9 +3809,9 @@ void LineAnnotationDialog::setCurrentLinePosition(double position,
         // (coalesced) render, so no separate renderVisible call is needed here.
         const cv::Vec3f sidePoint = interpolatedLinePoint(_currentLinePosition);
         if (finitePoint(sidePoint)) {
-            _sideCutViewer->centerOnVolumePoint(sidePoint, false);
+            _sideCutViewer->centerOnVolumePoint(sidePoint);
         } else {
-            _sideCutViewer->renderVisible(false, "line annotation side cut");
+            _sideCutViewer->renderVisible("line annotation side cut");
         }
     }
     rebuildGeneratedDynamicOverlays(updateCurrentCutOverlay, false);
@@ -3903,7 +3902,7 @@ bool LineAnnotationDialog::shiftCurrentCutStraightAheadByScrollSteps(int steps)
     _currentCutStraightAheadDirection = direction;
     if (_currentCutViewer) {
         _currentCutViewer->markSurfaceGeometryChanged();
-        _currentCutViewer->renderVisible(true, "line annotation current cut straight ahead");
+        _currentCutViewer->renderVisible("line annotation current cut straight ahead");
     }
     rebuildGeneratedDynamicOverlays();
     return true;
@@ -4292,7 +4291,7 @@ void LineAnnotationDialog::centerStripsOnLinePosition(double linePosition, bool 
             if (includeVertical) {
                 camera.surfacePtrY = (*center)[1];
             }
-            stripViewer->applyCameraState(camera, false);
+            stripViewer->applyCameraState(camera);
         }
         if (!includeVertical) {
             // Per-tick X recentering only touches the first strip: the linked
@@ -4382,7 +4381,7 @@ bool LineAnnotationDialog::shiftCutPlaneNormalOffsetByScrollSteps(PlaneSurface* 
     if (viewer) {
         viewer->setProperty("vc_custom_normal_offset_vx", offsetVx);
         viewer->markSurfaceGeometryChanged();
-        viewer->renderVisible(true, renderReason);
+        viewer->renderVisible(renderReason);
     }
     rebuildGeneratedDynamicOverlays();
     return true;
@@ -4436,7 +4435,7 @@ void LineAnnotationDialog::resetGeneratedCutNormalOffsets(bool forceRender)
             if (_currentCutViewer) {
                 _currentCutViewer->markSurfaceGeometryChanged();
                 if (forceRender) {
-                    _currentCutViewer->renderVisible(true, "line annotation current cut offset reset");
+                    _currentCutViewer->renderVisible("line annotation current cut offset reset");
                 }
             }
         }
@@ -4449,11 +4448,11 @@ void LineAnnotationDialog::resetGeneratedCutNormalOffsets(bool forceRender)
                 if (recenterSide) {
                     const cv::Vec3f sidePoint = interpolatedLinePoint(_currentLinePosition);
                     if (finitePoint(sidePoint)) {
-                        _sideCutViewer->centerOnVolumePoint(sidePoint, false);
+                        _sideCutViewer->centerOnVolumePoint(sidePoint);
                     }
                 }
                 if (forceRender) {
-                    _sideCutViewer->renderVisible(true, "line annotation side cut offset reset");
+                    _sideCutViewer->renderVisible("line annotation side cut offset reset");
                 }
             }
         }
@@ -4768,9 +4767,9 @@ bool LineAnnotationDialog::rotateCurrentCut(vc3d::line_annotation::GeneratedCutR
     }
     _currentCutViewer->markSurfaceGeometryChanged();
     if (finitePoint(centerVolumePoint)) {
-        _currentCutViewer->centerOnVolumePoint(centerVolumePoint, false);
+        _currentCutViewer->centerOnVolumePoint(centerVolumePoint);
     }
-    _currentCutViewer->renderVisible(true, "line annotation current cut rotation");
+    _currentCutViewer->renderVisible("line annotation current cut rotation");
     rebuildGeneratedDynamicOverlays();
     return true;
 }
@@ -4801,14 +4800,14 @@ void LineAnnotationDialog::captureInitialGeneratedViewState()
 void LineAnnotationDialog::restoreInitialGeneratedViewerCameras()
 {
     if (_currentCutViewer && _haveInitialCurrentCutCamera) {
-        _currentCutViewer->applyCameraState(_initialCurrentCutCamera, false);
+        _currentCutViewer->applyCameraState(_initialCurrentCutCamera);
     }
     if (_sideCutViewer && _haveInitialSideCutCamera) {
-        _sideCutViewer->applyCameraState(_initialSideCutCamera, false);
+        _sideCutViewer->applyCameraState(_initialSideCutCamera);
     }
     for (size_t i = 0; i < _stripViewers.size() && i < _initialStripCameras.size(); ++i) {
         if (_stripViewers[i]) {
-            _stripViewers[i]->applyCameraState(_initialStripCameras[i], false);
+            _stripViewers[i]->applyCameraState(_initialStripCameras[i]);
         }
     }
 }
@@ -4850,14 +4849,14 @@ void LineAnnotationDialog::resetGeneratedViews()
     // pause badge in sync.
     updatePauseIndicator();
     if (_currentCutViewer) {
-        _currentCutViewer->renderVisible(true, "line annotation reset current cut");
+        _currentCutViewer->renderVisible("line annotation reset current cut");
     }
     if (_sideCutViewer) {
-        _sideCutViewer->renderVisible(true, "line annotation reset side cut");
+        _sideCutViewer->renderVisible("line annotation reset side cut");
     }
     for (const auto& viewer : _stripViewers) {
         if (viewer) {
-            viewer->renderVisible(true, "line annotation reset strip view");
+            viewer->renderVisible("line annotation reset strip view");
         }
     }
     rebuildGeneratedOverlays();
@@ -6365,7 +6364,10 @@ bool LineAnnotationDialog::handleDirectionDragEvent(QObject* watched, QEvent* ev
                 grid[1]<0 || grid[1]>surface->rawPointsPtr()->rows-1) return true;
             inserted.linePosition=_generatedViews.stripPositionMap.stripGridColumnToOriginalPosition(grid[0]);
             if (!controlPointPlacementAllowedAt(inserted.linePosition)) return true;
-            inserted.point=surface->sampleAtSurface(chosenUV).volume;
+            const cv::Vec2f sampleGrid(grid);
+            cv::Vec3f position;
+            surface->pointSurface()->pointsAt(sampleGrid.val, 1, position.val, nullptr);
+            inserted.point=position;
             if (!std::isfinite(cv::norm(inserted.point))) return true;
             chosen=&inserted;
         }
@@ -6856,7 +6858,7 @@ void LineAnnotationDialog::snapPanesToOverviewCursor()
             CChunkedVolumeViewer::CameraState camera = stripViewer->cameraState();
             camera.surfacePtrX = (*center)[0];
             camera.surfacePtrY = (*center)[1];
-            stripViewer->applyCameraState(camera, false);
+            stripViewer->applyCameraState(camera);
         }
     }
 }
@@ -6883,7 +6885,7 @@ void LineAnnotationDialog::syncLinkedStripCamera(CChunkedVolumeViewer* source)
         camera.surfacePtrX = sourceCamera.surfacePtrX;
         camera.scale = sourceCamera.scale;
         _syncingStripCameras = true;
-        other->applyCameraState(camera, false);
+        other->applyCameraState(camera);
         _syncingStripCameras = false;
     }
 }

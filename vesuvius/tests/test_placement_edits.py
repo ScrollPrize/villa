@@ -7,10 +7,10 @@ import json
 import numpy as np
 import pytest
 import tifffile
-from vesuvius.image_proc.run import surface_placement_audit as spa
+from vesuvius.label_processing import surface_placement_audit as spa
 from vesuvius.scripts import placement_edits
-from vesuvius.tifxyz.types import Tifxyz
-from vesuvius.tifxyz.writer import write_tifxyz
+
+pytest.importorskip("vc_reader")  # tifxyz surfaces are read through vc_reader
 
 
 
@@ -23,8 +23,12 @@ def sheet_volume(shape=(64, 64, 64), z0=30.0, width=2.0):
 def _seg(path, z_right):
     yy, xx = np.meshgrid(np.linspace(4, 60, 40), np.linspace(4, 60, 40))
     z = np.where(xx >= 32, z_right, 30.0)
-    return str(write_tifxyz(path, Tifxyz(_x=xx.astype(np.float32), _y=yy.astype(np.float32),
-                                         _z=z.astype(np.float32), _scale=(1.0, 1.0), path=None)))
+    path.mkdir(parents=True)
+    for name, a in (("x", xx), ("y", yy), ("z", z)):
+        tifffile.imwrite(path / f"{name}.tif", a.astype(np.float32))
+    (path / "meta.json").write_text(json.dumps({"uuid": path.name, "scale": [1.0, 1.0], "format": "tifxyz",
+                                                "type": "seg", "bbox": [[-1, -1, -1], [-1, -1, -1]]}))
+    return str(path)
 
 
 def test_drag_onto_the_sheet_reads_as_the_measured_offset(tmp_path):

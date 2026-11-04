@@ -50,14 +50,10 @@ CELL = 32.0
 
 def grid_points(path: str):
     """zyx grid points, validity, and unit normals (zyx) of a tifxyz segment."""
-    from vesuvius.tifxyz import read_tifxyz
+    from vesuvius.label_processing.surface_placement_audit import read_tifxyz_grid
 
-    s = read_tifxyz(path)
-    x, y, z = s._x, s._y, s._z
-    ok = np.isfinite(x) & np.isfinite(y) & np.isfinite(z) & (x > 0) & (y > 0) & (z > 0)
-    if s._mask is not None:
-        ok &= s._mask.astype(bool)
-    nx, ny, nz = s.compute_normals()
+    x, y, z, valid, (nx, ny, nz) = read_tifxyz_grid(path)
+    ok = np.isfinite(x) & np.isfinite(y) & np.isfinite(z) & (x > 0) & (y > 0) & (z > 0) & valid
     N = np.stack([nz, ny, nx], -1).astype(np.float64)
     N /= np.linalg.norm(N, axis=-1, keepdims=True) + 1e-12
     return np.stack([z, y, x], -1).astype(np.float64), ok, N
@@ -117,7 +113,7 @@ def measure_offsets(vol, P: np.ndarray, ok: np.ndarray, N: np.ndarray, where: np
                     prof: Optional[dict], workers: int = 8) -> np.ndarray:
     """The audit's own measurement (nearest CT peak along the normal) at the grid points in
     ``where``; NaN where no valid peak. ``prof`` carries the audit's profile settings."""
-    from vesuvius.image_proc.run.surface_placement_audit import nearest_peak, read_profiles
+    from vesuvius.label_processing.surface_placement_audit import nearest_peak, read_profiles
 
     prof = prof or {}
     pick = where & ok & np.isfinite(N).all(-1)
@@ -206,7 +202,7 @@ def main(argv=None):
     arrays = {}
     vols = {}
     if a.volume or a.prediction:
-        from vesuvius.image_proc.run.label_topology_audit import open_volume
+        from vesuvius.label_processing.label_topology_audit import open_volume
         for key, src in (("ct", a.volume), ("pred", a.prediction)):
             if src:
                 vols[key] = open_volume(src, a.level)

@@ -8,6 +8,7 @@ from __future__ import annotations
 import argparse
 from collections import deque
 from contextlib import ExitStack
+import functools
 import hashlib
 import itertools
 import importlib
@@ -24,7 +25,6 @@ import subprocess
 import tempfile
 import time
 from urllib.parse import urlsplit
-from urllib.request import urlopen
 
 import numpy as np
 import torch
@@ -32,7 +32,8 @@ import torch
 from lasagna import tiled_predict3d as tiled
 from lasagna import demand_predict3d as demand
 from lasagna.inference_provenance import atomic_write, json_digest, sha256_file
-from vesuvius.neural_tracing.fiber_trace_2d.sampling import Vc3dCoordinateSampler
+from vc_reader.reader import open_group
+from vesuvius.neural_tracing.fiber_trace_2d.sampling import volume_cache_dirs
 from vesuvius.neural_tracing.fiber_trace_3d import inference_adapter
 from vesuvius.neural_tracing.fiber_trace_3d.inference_cache import resolve_prediction_cache
 from vesuvius.neural_tracing.fiber_trace_3d.infer import _checkpoint_config_for_inference, _resolve_inference_precision
@@ -210,22 +211,6 @@ def resume_visualization_selection(output, source_ids, limit):
             return selected
 
 
-def input_root_attributes(volume):
-    """Read OME metadata without calling the local-only native root_attrs API.
-
-    Native remote_url is the canonical HTTP group root used for chunk reads.
-    This requests metadata only; all voxel loading remains native.
-    """
-    remote = getattr(volume, "remote_url", "")
-    if not remote:
-        return volume.root_attrs
-    with urlopen(str(remote).rstrip("/") + "/.zattrs", timeout=30) as response:
-        attrs = json.load(response)
-    if not isinstance(attrs, dict):
-        raise ValueError("input OME root attributes must be an object")
-    return attrs
-
-
 def validate_input_lattice(attrs, level):
     """Only zero-offset, isotropic OME ZYX pyramids are supported initially.
 
@@ -288,27 +273,10 @@ def implementation_identity():
     return files
 
 
-def native_reader_options(settings):
-    """Identical native-cache budgets for live evaluation and its profiler."""
-    return dict(cache_budget_bytes=int(settings.get("input_cache_bytes", 4 << 30)),
-                io_threads=int(settings.get("input_io_threads", 16)),
-                decode_threads=int(settings.get("input_decode_threads", 8)), sample_threads=1)
-
-
-class NativeTileReader:
-    """Read exact-level integer bboxes directly from the shared native cache."""
-    def __init__(self, sampler, geometry, dtype, *, profile_samples=None):
-        self.sampler, self.geometry, self.dtype = sampler, geometry, np.dtype(dtype)
-        self.profile_samples = profile_samples
-
-    def __call__(self, tile):
-        start = tuple(int(v) - self.geometry.border for v in tile)
-        shape = (self.geometry.tile,) * 3
-        with demand.stage_timing(self.profile_samples, "reader.native_block"):
-            raw = self.sampler.volume.read_zyx(start, shape, self.sampler.level)
-        if raw.dtype != self.dtype or raw.shape != shape or not raw.flags.c_contiguous:
-            raise ValueError("native bbox reader returned incompatible shape/dtype/layout")
-        return raw
+def read_input_tile(reader, geometry, tile):
+    """The input block of a demand tile, border included, at the reader's level (fill outside the volume)."""
+    start = tuple(int(v) - geometry.border for v in tile)
+    return reader.read_region(start, (geometry.tile,) * 3)
 
 
 def create_demand_store(cache, source_identity, model_identity, geometry, effective, snapshot, level, settings):
@@ -573,11 +541,14 @@ def run(config_path, checkpoint, devices, native_binary, model_config=None, *, r
             level = int(source.get("input_level", 0))
             if not 0 <= level <= 30:
                 raise ValueError("invalid input level")
-            sampler = Vc3dCoordinateSampler(input_path, level=level, cache_root=str(cache_root),
-                **native_reader_options(settings))
-            volume_shape = tuple(int(v) for v in sampler.volume.shape_at(level))
-            base_shape = tuple(int(v) for v in sampler.volume.shape_at(0))
-            root_attrs = input_root_attributes(sampler.volume)
+            # cache_root is VC3D's cache root, which "vc3d" names.
+            input_group = open_group(input_path, cache_dir=volume_cache_dirs(input_path, None),
+                memory_cache=int(settings.get("input_cache_bytes", 4 << 30)),
+                threads=int(settings.get("input_io_threads", 16)))
+            input_reader = input_group.level(level)
+            volume_shape = tuple(int(v) for v in input_reader.shape)
+            base_shape = tuple(int(v) for v in input_group.level(0).shape)
+            root_attrs = input_group.attrs
             validate_input_lattice(root_attrs, level)
             if volume_shape != tuple((n + (1 << level) - 1) // (1 << level) for n in base_shape):
                 raise ValueError("selected input level is not the expected isotropic power-of-two lattice")
@@ -600,7 +571,7 @@ def run(config_path, checkpoint, devices, native_binary, model_config=None, *, r
                     store = cleanup.enter_context(create_demand_store(cache, source_identity, stored_model_identity,
                         geometry, model["effective"], model["snapshot"], level, model["settings"]))
                     stores[key] = store
-                    readers[key] = NativeTileReader(sampler, geometry, sampler.volume.dtype)
+                    readers[key] = functools.partial(read_input_tile, input_reader, geometry)
                     channel_indices[key] = {str(store.output_adapter.array_path(p).resolve()): geometry
                         for p in store.products}
                     backgrounds[key] = set()

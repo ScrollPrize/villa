@@ -1,7 +1,7 @@
 #include "vc/core/util/RemoteCacheSettings.hpp"
-#include "vc/core/util/GlobalCacheRoot.hpp"
-#include "vc/core/render/PersistentZarrCacheBudget.hpp"
+#include <vc_reader/zarr.hpp>
 
+#include <charconv>
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -76,21 +76,6 @@ std::string decodeIniValue(std::string value)
     return decoded;
 }
 
-fs::path homeDirectory()
-{
-#ifdef _WIN32
-    if (const wchar_t* profile = _wgetenv(L"USERPROFILE"); profile && *profile)
-        return profile;
-    const wchar_t* drive = _wgetenv(L"HOMEDRIVE");
-    const wchar_t* path = _wgetenv(L"HOMEPATH");
-    if (drive && *drive && path && *path)
-        return std::wstring(drive) + path;
-#endif
-    if (const char* home = std::getenv("HOME"); home && *home)
-        return pathFromUtf8(home);
-    throw std::runtime_error("Cannot determine the user home directory for VC3D settings");
-}
-
 std::string configuredIniValue(
     const fs::path& settingsPath,
     std::string_view section,
@@ -122,13 +107,6 @@ std::string configuredIniValue(
         return decodeIniValue(stripped.substr(separator + 1));
     }
     return {};
-}
-
-fs::path configuredRemoteCachePath(const fs::path& settingsPath)
-{
-    const auto configured = configuredIniValue(
-        settingsPath, "viewer", "remote_cache_dir");
-    return configured.empty() ? fs::path{} : pathFromUtf8(configured);
 }
 
 std::uint64_t configuredGiB(
@@ -203,71 +181,22 @@ fs::path ensureWritableDirectory(fs::path path)
 
 fs::path settingsFilePath()
 {
-#ifdef _WIN32
-    if (const wchar_t* configured = _wgetenv(L"VC3D_CONFIG_DIR");
-        configured && *configured) {
-        return ensureDirectory(configured) / "VC3D.ini";
-    }
-#else
-    if (const char* configured = std::getenv("VC3D_CONFIG_DIR");
-        configured && *configured) {
-        return ensureDirectory(pathFromUtf8(configured)) / "VC3D.ini";
-    }
-#endif
-    return ensureDirectory(homeDirectory() / ".VC3D") / "VC3D.ini";
+    return ensureDirectory(vcr::zarr::vc3dConfigDirectory()) / "VC3D.ini";
 }
 
 fs::path remoteCachePath()
 {
-    static const fs::path active = [] {
-        // Preserve the explicit host override used by headless fiber tools.
-        // Without it, use the shared upstream INI settings and mount defaults.
-        if (fs::exists(vc::core::util::vc3dConfigDirectory() / "cache.json")) {
-            return ensureWritableDirectory(vc::core::util::globalCacheRoot());
-        }
-        if (auto configured = configuredRemoteCachePath(settingsFilePath());
-            !configured.empty()) {
-            return ensureWritableDirectory(std::move(configured));
-        }
-
-        for (const fs::path root : {fs::path("/volpkgs"), fs::path("/ephemeral")}) {
-            std::error_code ec;
-            if (!fs::exists(root, ec) || ec)
-                continue;
-            if (!fs::is_directory(root, ec) || ec) {
-                throw std::runtime_error(
-                    "Remote cache root '" + root.string() + "' is not a directory");
-            }
-            return ensureWritableDirectory(root / "remote_cache");
-        }
-
-        return ensureWritableDirectory(homeDirectory() / ".VC3D" / "remote_cache");
-    }();
+    static const fs::path active = ensureWritableDirectory(vcr::zarr::selectedVc3dCacheRoot());
     return active;
 }
 
-void configureRemoteCacheBudget()
-{
-    constexpr std::uint64_t gib = 1024ULL * 1024ULL * 1024ULL;
-    constexpr std::uint64_t maxGiB = UINT64_MAX / gib;  // keep GiB -> bytes from overflowing
-    const auto settingsPath = settingsFilePath();
-    vc::render::PersistentZarrCacheBudget::Limits limits;
-    if (const auto maximumGiB = configuredGiB(
-            settingsPath, kRemoteCacheMaxGiB, kRemoteCacheMaxGiBDefault);
-        maximumGiB > 0) {
-        limits.maximumBytes = std::min(maximumGiB, maxGiB) * gib;
-    }
-    limits.minimumFreeBytes = std::min(configuredGiB(
-        settingsPath, kRemoteCacheMinFreeGiB, kRemoteCacheMinFreeGiBDefault), maxGiB) * gib;
-    vc::render::PersistentZarrCacheBudget::configure(remoteCachePath(), limits);
-}
+namespace {
 
-bool remoteCacheDelta3dEnabled()
+bool iniBool(const char* key, bool fallback)
 {
-    const auto configured = configuredIniValue(
-        settingsFilePath(), "perf", "remote_cache_delta3d");
+    const auto configured = configuredIniValue(settingsFilePath(), "perf", key);
     if (configured.empty())
-        return kRemoteCacheDelta3dDefault;
+        return fallback;
 
     std::string normalized;
     normalized.reserve(configured.size());
@@ -276,6 +205,76 @@ bool remoteCacheDelta3dEnabled()
         [](unsigned char value) { return static_cast<char>(std::tolower(value)); });
     return normalized == "1" || normalized == "true" || normalized == "yes" ||
            normalized == "on";
+}
+
+unsigned long long iniNumber(const char* key, unsigned long long fallback)
+{
+    const auto configured = configuredIniValue(settingsFilePath(), "perf", key);
+    unsigned long long value = fallback;
+    const auto* end = configured.data() + configured.size();
+    if (std::from_chars(configured.data(), end, value).ptr != end)
+        return fallback;
+    return value;
+}
+
+constexpr std::int64_t kGib = std::int64_t{1} << 30;
+
+}  // namespace
+
+bool remoteCacheDelta3dEnabled()
+{
+    return iniBool("remote_cache_delta3d", kRemoteCacheDelta3dDefault);
+}
+
+std::optional<std::int64_t> remoteCacheMaxBytes()
+{
+    const auto gib = iniNumber("remote_cache_max_gib", kRemoteCacheMaxGibDefault);
+    if (gib == 0)
+        return std::nullopt;
+    return static_cast<std::int64_t>(gib) * kGib;
+}
+
+std::int64_t remoteCacheMinFreeBytes()
+{
+    return static_cast<std::int64_t>(iniNumber("remote_cache_min_free_gib", kRemoteCacheMinFreeGibDefault)) * kGib;
+}
+
+std::optional<int> remoteDownloadParallelism()
+{
+    if (iniBool("remote_download_automatic", kRemoteDownloadAutomaticDefault))
+        return std::nullopt;
+    return static_cast<int>(std::clamp<unsigned long long>(
+        iniNumber("remote_download_parallelism", kRemoteDownloadParallelismDefault), 1, 64));
+}
+
+RemoteOffline remoteOffline()
+{
+    auto value = configuredIniValue(settingsFilePath(), "perf", "remote_offline");
+    std::transform(value.begin(), value.end(), value.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    if (value == "fill")
+        return RemoteOffline::Fill;
+    if (value == "on" || value == "1" || value == "true" || value == "yes")
+        return RemoteOffline::On;
+    return RemoteOffline::Off;
+}
+
+vcr::zarr::OpenOptions remoteOpenOptions(const fs::path& root)
+{
+    vcr::zarr::OpenOptions options;
+    const auto offline = remoteOffline();
+    options.offline = offline != RemoteOffline::Off;
+    options.offlineFill = offline == RemoteOffline::Fill;
+    if (!root.empty()) {
+        options.cacheDirs = {root.string()};
+        options.cacheMaxBytes = remoteCacheMaxBytes().value_or(std::numeric_limits<std::int64_t>::max());
+        options.cacheMinFreeBytes = remoteCacheMinFreeBytes();
+    }
+    if (const auto parallelism = remoteDownloadParallelism()) {
+        options.connections = *parallelism;
+        options.threads = static_cast<std::size_t>(*parallelism);
+    }
+    return options;
 }
 
 } // namespace vc::settings

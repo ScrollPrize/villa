@@ -1,33 +1,32 @@
 #pragma once
 
-#include "vc/core/util/RemoteFileCache.hpp"
+#include <vc_reader/native/reader_types.hpp>
 #include "vc/lasagna/Manifest.hpp"
 
 #include <filesystem>
+#include <optional>
 #include <string>
 #include <string_view>
 
-namespace utils { class ZarrArray; }
+namespace vcr { class MemoryCache; }
+namespace vcr::zarr { struct OpenedArray; }
 
 namespace vc::lasagna {
 
 inline constexpr const char* kLasagnaRemoteMarker = "lasagna-remote.json";
 
-[[nodiscard]] bool isRemoteLasagnaLocation(std::string_view location);
 
 struct LasagnaDatasetOpenOptions {
     double workingToBaseScale = 1.0;
     std::filesystem::path remoteCacheRoot;
-    vc::HttpAuth remoteAuth;
-    vc::core::util::RemoteFileCachePolicy cachePolicy = vc::core::util::RemoteFileCachePolicy::CacheFirst;
-    vc::core::util::RemoteFileFetcher remoteFileFetcher;
+    bool refreshManifest = false;  // read a remote manifest again even when it is cached
     // False forces anonymous S3 access for both the manifest and its groups.
     bool discoverAwsCredentials = true;
 };
 
 struct MaterializedLasagnaManifest {
     std::filesystem::path path;
-    std::string normalizedLocation;
+    std::string location;  // where requests went: the location as given, query kept, no slash ending its path
     bool cacheHit = false;
 };
 
@@ -48,17 +47,14 @@ public:
 
     [[nodiscard]] const LasagnaDatasetManifest& manifest() const noexcept;
     [[nodiscard]] bool hasNormalSource() const noexcept;
-    [[nodiscard]] const std::filesystem::path& normalSourcePath() const;
 
 private:
     LasagnaDatasetManifest manifest_;
 };
 
-// Open a channel group's Zarr through the local filesystem or, for a
-// manifest-backed catalog cache, through its persistent read-through store.
-[[nodiscard]] utils::ZarrArray openLasagnaChannelArray(
-    const LasagnaDatasetManifest& manifest,
-    const LasagnaChannelGroup& group,
-    std::size_t dtypeSize = 1);
+// A channel group's Zarr array opened through vc_reader, with `cache` as its
+// memory cache: a local array, or a remote array cached under the group's remote cache root.
+[[nodiscard]] vcr::zarr::OpenedArray openLasagnaGroupArray(
+    const LasagnaChannelGroup& group, std::shared_ptr<vcr::MemoryCache> cache);
 
 } // namespace vc::lasagna

@@ -11,16 +11,12 @@ from pathlib import Path
 from typing import List, Optional, Tuple
 
 import numpy as np
-import tifffile as tiff
+from vc_reader import images
+import vc_reader.transforms as A
+from vc_reader.geometry import fill_holes, label_components
 from scipy import ndimage as ndi
 from tqdm import tqdm
 
-try:
-    import cc3d
-    _HAS_CC3D = True
-except Exception:
-    cc3d = None
-    _HAS_CC3D = False
 try:
     import alphashape
     from shapely.geometry import Polygon, MultiPolygon
@@ -38,6 +34,9 @@ except Exception:
     _HAS_CV2 = False
 
 TIFF_EXTS = {".tif", ".tiff"}
+
+# Voxels 26-adjacent to (or in) a mask: dilation by the full 3x3x3 neighbourhood.
+_TOUCHING = A.Morphology("dilate", radius=1, footprint="cube")
 
 
 def _find_label_file(folder: Path, pattern: str) -> Optional[Path]:
@@ -66,12 +65,11 @@ def _fix_2d_hole_fill(
     label_mask = (label == fg_value) & (~ignore_mask)
     hole_mask = hole_mask.astype(bool)
     if mask_dilate and mask_dilate > 0:
-        struct = ndi.generate_binary_structure(label.ndim, 1)
-        hole_mask = ndi.binary_dilation(hole_mask, structure=struct, iterations=int(mask_dilate))
+        hole_mask = A.Morphology("dilate", radius=int(mask_dilate), footprint="cross")(hole_mask[None])[0]
 
     filled = np.zeros_like(label_mask, dtype=bool)
     for z in range(label_mask.shape[0]):
-        filled[z] = ndi.binary_fill_holes(label_mask[z])
+        filled[z] = fill_holes(label_mask[z])
 
     to_add = filled & hole_mask & (~ignore_mask)
 
@@ -99,20 +97,16 @@ def _fix_morph_close(
     if kernel < 1:
         raise ValueError("--closing-kernel must be >= 1")
 
-    if not _HAS_CC3D:
-        raise ImportError("cc3d is required for component-wise closing. Install with: pip install cc3d")
 
     ignore_mask = (label == ignore_value) if ignore_value is not None else np.zeros(label.shape, dtype=bool)
     label_mask = (label == fg_value) & (~ignore_mask)
-    struct = ndi.generate_binary_structure(label.ndim, 1)
     hole_mask = hole_mask.astype(bool)
     if mask_dilate and mask_dilate > 0:
-        hole_mask = ndi.binary_dilation(hole_mask, structure=struct, iterations=int(mask_dilate))
-    if kernel > 1:
-        struct = ndi.iterate_structure(struct, kernel)
-    struct_conn = ndi.generate_binary_structure(label.ndim, label.ndim)  # 26-connectivity in 3D
+        hole_mask = A.Morphology("dilate", radius=int(mask_dilate), footprint="cross")(hole_mask[None])[0]
+    # The six-connected cross iterated `kernel` times.
+    closing = A.Morphology("close", radius=kernel, footprint="cross")
 
-    labels_cc, n_cc = cc3d.connected_components(label_mask.astype(np.uint8), connectivity=26, return_N=True)
+    labels_cc, n_cc = label_components(label_mask, connectivity=26)
     if n_cc == 0:
         return label.copy()
     slices = ndi.find_objects(labels_cc)
@@ -130,7 +124,7 @@ def _fix_morph_close(
         if not region.any():
             continue
 
-        closed = ndi.binary_closing(comp, structure=struct)
+        closed = closing(comp[None])[0]
         # Only add voxels (do not remove original component)
         proposed = comp | (closed & region)
         added = proposed & (~comp)
@@ -141,12 +135,12 @@ def _fix_morph_close(
         # Skip if this would merge with other components (26-neighborhood adjacency).
         others = label_mask[slc] & (~comp)
         if others.any():
-            if np.any(added & ndi.binary_dilation(others, structure=struct_conn)):
+            if np.any(added & _TOUCHING(others[None])[0]):
                 print(f"[WARN] Skipping close on component {comp_id}: would merge with neighbor")
                 continue
 
         # Skip if closing would change component connectivity (should remain 1).
-        _, n_after = cc3d.connected_components(proposed.astype(np.uint8), connectivity=26, return_N=True)
+        _, n_after = label_components(proposed, connectivity=26)
         if n_after != 1:
             print(f"[WARN] Skipping close on component {comp_id}: connectivity {n_after}")
             continue
@@ -225,18 +219,14 @@ def _fix_alpha_wrap(
         raise ValueError(f"hole_mask shape {hole_mask.shape} does not match label {label.shape}")
     if alpha <= 0:
         raise ValueError("--alpha must be > 0")
-    if not _HAS_CC3D:
-        raise ImportError("cc3d is required for component-wise alpha wrap. Install with: pip install cc3d")
 
     ignore_mask = (label == ignore_value) if ignore_value is not None else np.zeros(label.shape, dtype=bool)
     label_mask = (label == fg_value) & (~ignore_mask)
     hole_mask = hole_mask.astype(bool)
     if mask_dilate and mask_dilate > 0:
-        struct = ndi.generate_binary_structure(label.ndim, 1)
-        hole_mask = ndi.binary_dilation(hole_mask, structure=struct, iterations=int(mask_dilate))
-    struct_conn = ndi.generate_binary_structure(label.ndim, label.ndim)  # 26-connectivity in 3D
+        hole_mask = A.Morphology("dilate", radius=int(mask_dilate), footprint="cross")(hole_mask[None])[0]
 
-    labels_cc, n_cc = cc3d.connected_components(label_mask.astype(np.uint8), connectivity=26, return_N=True)
+    labels_cc, n_cc = label_components(label_mask, connectivity=26)
     if n_cc == 0:
         return label.copy()
     slices = ndi.find_objects(labels_cc)
@@ -280,12 +270,12 @@ def _fix_alpha_wrap(
         # Skip if this would merge with other components (26-neighborhood adjacency).
         others = label_mask[slc] & (~comp)
         if others.any():
-            if np.any(added & ndi.binary_dilation(others, structure=struct_conn)):
+            if np.any(added & _TOUCHING(others[None])[0]):
                 print(f"[WARN] Skipping alpha wrap on component {comp_id}: would merge with neighbor")
                 continue
 
         # Skip if alpha wrap would change component connectivity (should remain 1).
-        _, n_after = cc3d.connected_components(proposed.astype(np.uint8), connectivity=26, return_N=True)
+        _, n_after = label_components(proposed, connectivity=26)
         if n_after != 1:
             print(f"[WARN] Skipping alpha wrap on component {comp_id}: connectivity {n_after}")
             continue
@@ -305,13 +295,11 @@ def _count_components_26(
     fg_value: int,
     ignore_value: Optional[int],
 ) -> int:
-    if not _HAS_CC3D:
-        raise ImportError("cc3d is required for component-count checks. Install with: pip install cc3d")
     label_cc = label.copy()
     if ignore_value is not None:
         label_cc[label_cc == ignore_value] = 0
     mask = (label_cc == fg_value).astype(np.uint8)
-    _labels, n = cc3d.connected_components(mask, connectivity=26, return_N=True)
+    _labels, n = label_components(mask, connectivity=26)
     return int(n)
 
 
@@ -374,8 +362,8 @@ def _process_folder(
     if label_path is None or label_path.suffix.lower() not in TIFF_EXTS:
         return False, f"[WARN] Missing label in {folder} (glob={label_glob})"
 
-    label = tiff.imread(str(label_path))
-    hole_mask = tiff.imread(str(hole_path))
+    label = images.read(str(label_path))
+    hole_mask = images.read(str(hole_path))
 
     if label.shape != hole_mask.shape:
         return False, f"[WARN] Shape mismatch in {folder}: label {label.shape} vs hole_mask {hole_mask.shape}"
@@ -432,7 +420,7 @@ def _process_folder(
 
     out_name = f"{label_path.stem}_{suffix}{label_path.suffix}"
     out_path = folder / out_name
-    tiff.imwrite(str(out_path), fixed.astype(label.dtype))
+    images.write_tiff(str(out_path), fixed.astype(label.dtype))
     ok_msg = f"[OK] Wrote {out_path}"
     if n_veto:
         ok_msg = f"[VETO] {n_veto} hole(s) left open in {folder.name} | " + ok_msg
@@ -483,8 +471,6 @@ def main() -> None:
     root = args.in_dir
     if not root.exists():
         raise FileNotFoundError(root)
-    if not _HAS_CC3D:
-        raise ImportError("cc3d is required for component-count checks. Install with: pip install cc3d")
 
     subfolders = _list_subfolders(root)
     if not subfolders:

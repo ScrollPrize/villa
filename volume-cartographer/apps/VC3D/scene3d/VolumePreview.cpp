@@ -1,13 +1,15 @@
 #include "VolumePreview.hpp"
 #include "fibers3d/Fiber3DCT.hpp"
+#include "OpenedVolumes.hpp"
 #include "vc/core/types/Volume.hpp"
+#include <array>
 #include <algorithm>
 #include <cmath>
 #include <stdexcept>
 
 namespace vc3d::scene3d
 {
-std::shared_ptr<VolumeData> sampleVolume(Volume& volume, int requestedLevel, size_t maxBytes,
+std::shared_ptr<VolumeData> sampleVolume(OpenedVolumes& volumes, const Volume& volume, int requestedLevel, size_t maxBytes,
                                        const std::atomic_bool& cancelled, int maxEdge)
 {
     auto checkCancelled = [&] {
@@ -19,8 +21,11 @@ std::shared_ptr<VolumeData> sampleVolume(Volume& volume, int requestedLevel, siz
     const auto native = volume.shapeXyz();
     if (std::any_of(native.begin(), native.end(), [](int n) { return n <= 0; }))
         throw std::runtime_error("Invalid CT volume dimensions");
-    auto levels = volume.presentScaleLevels();
-    std::sort(levels.begin(), levels.end());
+    const auto levels = volumes.pyramid(volume).levels;
+    auto levelShape = [&](int level) {
+        const auto& zyx = volumes.level(volume, level).array->meta.shape;
+        return std::array<int,3>{int(zyx[0]), int(zyx[1]), int(zyx[2])};
+    };
     if (levels.empty()) throw std::runtime_error("CT volume has no available Zarr levels");
     const size_t scratchBytes = std::min(maxBytes/4, size_t(256*1024));
     const size_t textureBytes = maxBytes-scratchBytes;
@@ -36,9 +41,9 @@ std::shared_ptr<VolumeData> sampleVolume(Volume& volume, int requestedLevel, siz
     };
     auto selected = std::lower_bound(levels.begin(), levels.end(), std::max(0, requestedLevel));
     if (selected == levels.end()) selected = std::prev(levels.end());
-    while (std::next(selected) != levels.end() && !fits(volume.levelShape(*selected))) ++selected;
+    while (std::next(selected) != levels.end() && !fits(levelShape(*selected))) ++selected;
     const int level = *selected;
-    const auto sourceZYX = volume.levelShape(level);
+    const auto sourceZYX = levelShape(level);
     if (std::any_of(sourceZYX.begin(), sourceZYX.end(), [](int n) { return n <= 0; }))
         throw std::runtime_error("Invalid CT pyramid dimensions");
     std::array<int,3> shape{sourceZYX[2],sourceZYX[1],sourceZYX[0]};
@@ -91,7 +96,7 @@ std::shared_ptr<VolumeData> sampleVolume(Volume& volume, int requestedLevel, siz
                 coords(0,i)[k]=float(std::clamp(center,0.,last));
             }
         }
-        const auto samples=fibers3d::ct::sampleCoordinates(coords,volume,level);
+        const auto samples=fibers3d::ct::sampleCoordinates(coords,volumes,volume,level);
         for (int i=0; i<count; ++i) {
             slab.pixels[2*(first+i)]=samples(0,i)[0];
             slab.pixels[2*(first+i)+1]=samples(0,i)[1];

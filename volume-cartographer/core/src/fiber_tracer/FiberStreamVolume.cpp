@@ -1,11 +1,13 @@
+#include "vc/core/util/CudaSampling.hpp"
 #include "vc/fiber_tracer/FiberStreamVolume.hpp"
 #include "vc/fiber_tracer/FiberVolumeCoverage.hpp"
 #include "vc/fiber_tracer/FiberAttributes.hpp"
 #include "vc/fiber_tracer/detail/FiberChunkTensor.hpp"
 #include "vc/fiber_tracer/detail/FiberPackedStorage.hpp"
 #include "vc/core/types/Volume.hpp"
-#include "vc/core/render/ChunkedPlaneSampler.hpp"
-#include "vc/core/render/ChunkCache.hpp"
+#include <vc_reader/array.hpp>
+#include <vc_reader/array.hpp>
+#include <vc_reader/zarr.hpp>
 #include <algorithm>
 #include <cmath>
 #include <condition_variable>
@@ -76,77 +78,32 @@ public:
     }
 };
 
+// Collision checks against the CT volume: nearest voxels of one opened level, with a
+// plain blocking read. Zero is outside the scroll, and so is any point outside the array.
 class CTChecks {
-    // Cache notifications can already have been copied by a publisher when
-    // removeChunkReadyListener runs. Keep their lifetime separate from ours.
-    struct ListenerGate {std::mutex mutex; CTChecks* owner=nullptr;};
-    std::shared_ptr<ListenerGate> listenerGate=std::make_shared<ListenerGate>();
     std::shared_ptr<Volume> volume;
-    vc::render::IChunkedArray* cache;
-    int level;double baseScale;
-    WorkQueue& pool;
-    std::mutex mutex;
-    std::unordered_map<vc::render::ChunkKey,std::vector<std::function<void()>>,vc::render::ChunkKeyHash> waiting;
-    std::atomic_bool wakeQueued{false};
-    vc::render::IChunkedArray::ChunkReadyCallbackId listener;
-    void wake() {
-        if(wakeQueued.exchange(true))return;
-        pool.push(0,[this]{
-            std::vector<std::function<void()>> ready;
-            {
-                std::lock_guard lock(mutex);wakeQueued=false;
-                for(auto i=waiting.begin();i!=waiting.end();) {
-                    // A notification is not a lease: pressure can evict the
-                    // chunk before this queued wake runs. Re-request it rather
-                    // than waiting forever on a fetch that already completed.
-                    const auto& k=i->first;auto r=cache->tryGetChunk(k.level,k.iz,k.iy,k.ix);
-                    if(r.status==vc::render::ChunkStatus::MissQueued){++i;continue;}
-                    for(auto& f:i->second)ready.push_back(std::move(f));i=waiting.erase(i);
-                }
-            }
-            for(auto& f:ready)pool.push(0,std::move(f));
-        });
+    vcr::zarr::OpenedArray ct;
+    static vcr::zarr::OpenedArray open(const Volume& v,int level,std::size_t cacheBytes) {
+        auto options=v.sourceOpenOptions();options.memoryCache=std::make_shared<vcr::MemoryCache>(cacheBytes);
+        try {
+            return vcr::zarr::openPyramidLevel(v.sourceLocation(),level,options);
+        } catch(const std::out_of_range&) {
+            throw std::invalid_argument("CT level unavailable");
+        }
     }
 public:
-    std::atomic<uint64_t> suspensions{0};
-    CTChecks(const std::string& path,int requestedLevel,WorkQueue& q):
+    CTChecks(const std::string& path,int requestedLevel,std::size_t cacheBytes):
         volume(path.find("://")==std::string::npos ? Volume::New(path) : Volume::NewFromUrl(path)),
-        cache(volume->chunkedCache()),level(requestedLevel-volume->baseScaleLevel()),
-        baseScale(std::pow(2.,volume->baseScaleLevel())),pool(q) {
-        if(level<0||level>=cache->numLevels())throw std::invalid_argument("CT level unavailable");
-        listenerGate->owner=this;
-        listener=cache->addChunkReadyListener([gate=listenerGate]{
-            std::lock_guard lock(gate->mutex);
-            if(gate->owner)gate->owner->wake();
-        });
+        ct(open(*volume,requestedLevel,cacheBytes)) {
+        if(ct.meta.type.kind!='u'||ct.meta.itemsize()!=1)throw std::invalid_argument("CT checks read uint8 volumes");
     }
-    ~CTChecks(){
-        {std::lock_guard lock(listenerGate->mutex);listenerGate->owner=nullptr;}
-        cache->removeChunkReadyListener(listener);
-    }
-    bool sample(const std::vector<Vec>& points,std::vector<uint8_t>& outside,std::function<void()> retry) {
-        using Sampler=vc::render::ChunkedPlaneSampler;
-        cv::Mat_<cv::Vec3f> coords(1,int(points.size()));
-        for(size_t i=0;i<points.size();++i)coords(0,int(i))=cv::Vec3f(points[i]/baseScale);
-        cv::Mat_<uint8_t> coverage(1,int(points.size()),uint8_t{0}),values(1,int(points.size()),uint8_t{0});
-        Sampler::Options opts(vc::Sampling::Nearest,64);opts.parallelThreads=1;
-        const auto keys=Sampler::collectCoordsDependencies(*cache,level,coords,coverage,opts);
-        std::vector<vc::render::ChunkResult> pinned;bool pending=false;vc::render::ChunkKey missing;
-        for(const auto& k:keys) {
-            auto r=cache->tryGetChunk(k.level,k.iz,k.iy,k.ix);
-            if(r.status==vc::render::ChunkStatus::Error)throw std::runtime_error(r.error);
-            if(r.status==vc::render::ChunkStatus::MissQueued){if(!pending)missing=k;pending=true;}
-            pinned.push_back(std::move(r));
-        }
-        if(pending) {
-            {std::lock_guard lock(mutex);waiting[missing].push_back(std::move(retry));}
-            ++suspensions;wake(); // close the ready-before-registration race
-            return false;
-        }
-        Sampler::sampleCoordsLevelBlockingRequestedLevel(*cache,level,coords,values,coverage,opts);
+    void sample(const std::vector<Vec>& points,std::vector<uint8_t>& outside) {
+        std::vector<double> coords;coords.reserve(points.size()*3);
+        for(const auto& p:points)for(int axis=0;axis<3;++axis)coords.push_back(ct.placement.fromLevel0(axis,p[2-axis]));
+        std::vector<uint8_t> values(points.size());
+        vc::cuda::sampleNearest(*ct.array,vc::cuda::toolReader(ct),coords.data(),points.size(),values.data());
         outside.resize(points.size());
-        for(size_t i=0;i<points.size();++i)outside[i]=values(0,int(i))==0;
-        return true;
+        for(size_t i=0;i<points.size();++i)outside[i]=values[i]==0;
     }
 };
 
@@ -230,8 +187,7 @@ class Stream {
                 const auto* field=dynamic_cast<const FiberPredictionField*>(&predictions);
                 const auto* normalField=dynamic_cast<const vc::lasagna::LasagnaNormalSampler*>(&normals);
                 if(!field||!normalField)throw std::invalid_argument("native seeds require channel fields");
-                detail::FiberChunkTensor tensor(*field,*normalField,bounds.lo/scale,bounds.hi/scale,true,
-                    chunks.channelHints,chunks.workerCacheBytes);
+                detail::FiberChunkTensor tensor(*field,*normalField,bounds.lo/scale,bounds.hi/scale,true);
                 tile->seeds=findFiberChunkSeeds(tensor,tensor,predictions,bounds,chunks,scale,true);
                 std::erase_if(tile->seeds,[&](const auto& seed){
                     for(int a=0;a<3;++a)if(seed.point[a]<tile->key[a]*chunks.coreBase||seed.point[a]>=(tile->key[a]+1)*chunks.coreBase)return true;
@@ -322,12 +278,12 @@ class Stream {
     }
     void check(const std::shared_ptr<Pair>& pair,int half) {
         auto& d=pair->half[half];const auto p=d.points.back();std::vector<uint8_t> outside;
-        if(!ct.sample({p},outside,[this,pair,half]{check(pair,half);} ))return;
+        ct.sample({p},outside);
         const auto generation=epoch.fetch_add(1);
-        const bool near=coverage.owner(p,d.direction,radius,d.widthMean,tolerance)>=0 ||
+        const bool nearHit=coverage.owner(p,d.direction,radius,d.widthMean,tolerance)>=0 ||
             coverage.liveHit(p,d.direction,radius,pair->id,generation,d.widthMean,tolerance);
         coverage.addLive(d.previous,p,pair->id,generation,d.widthMean);d.previous=p;
-        d.streak=near?d.streak+1:0;d.outsideStreak=outside[0]?d.outsideStreak+1:0;++checks;
+        d.streak=nearHit?d.streak+1:0;d.outsideStreak=outside[0]?d.outsideStreak+1:0;++checks;
         for(int a=0;a<3;++a)if(p[a]<lo[a]-4*grid||p[a]>hi[a]+4*grid)d.reason="bounds";
         if(d.reason.empty()&&d.outsideStreak>=2)d.reason="outside_ct";
         if(d.reason.empty()&&d.streak>=3)d.reason="owned_or_live";
@@ -368,7 +324,7 @@ class Stream {
             pair->attributes=joinFiberAttributes(bw.attributes,fw.attributes);pair->resampled=true;}
         std::vector<Vec> p(bw.points.rbegin(),bw.points.rend());p.insert(p.end(),fw.points.begin()+1,fw.points.end());
         if(!pair->prepared) {
-            if(p.size()>=48 && !ct.sample(p,pair->combinedOutside,[this,pair]{finish(pair);} )){fw.outside={1};return;}
+            if(p.size()>=48)ct.sample(p,pair->combinedOutside);
             pair->prepared=true;
             std::lock_guard lock(publish);publishQueue.push_back(pair);
             if(!publishing){publishing=true;pool.push(1,[this]{publishNext();});}
@@ -436,7 +392,7 @@ public:
         lo(vectorOf(cfg.at("box_base_xyz")[0])),hi(vectorOf(cfg.at("box_base_xyz")[1])),
         workers(cfg.value("workers",size_t{128})),capacity(cfg.value("active_fibers",10*workers)),
         seedWorkers(cfg.value("seed_workers",size_t{8})),maxOpen(cfg.value("max_open",size_t{32})),
-        pool(workers,cancel),ct(cfg.at("ct_locator").get<std::string>(),cfg.value("ct_level",2),pool),coverage(c.coreBase) {
+        pool(workers,cancel),ct(cfg.at("ct_locator").get<std::string>(),cfg.value("ct_level",2),cfg.value("ct_cache_bytes",size_t(4)<<30)),coverage(c.coreBase) {
         if(workers==0||capacity==0||decisionSteps<1||seedWorkers==0||maxOpen==0||tolerance<=0)
             throw std::invalid_argument("invalid native stream settings");
         std::filesystem::create_directories(output/"tiles");
@@ -470,17 +426,11 @@ public:
             {"next_fiber_id",nextFiber.load()},{"wall_seconds",seconds(began)},
             {"cpu_seconds",double(std::clock()-cpuBegin)/CLOCKS_PER_SEC},
             {"workers",workers},{"active_fiber_limit",capacity},{"peak_active_fibers",peakActive.load()},
-            {"busy_workers",pool.busy.load()},{"ct_suspensions",ct.suspensions.load()},{"complete",complete}};
+            {"busy_workers",pool.busy.load()},{"complete",complete}};
         {std::lock_guard lock(admission);r["active_fibers"]=active.size();r["open_tiles"]=open.size();}
         {std::lock_guard lock(reasonMutex);for(const auto&[reason,count]:reasons)r["stop_"+reason]=count;}
         for(size_t i=0;i<4;++i){r["worker_tier_seconds"].push_back(pool.workSeconds[i].load());r["worker_tier_jobs"].push_back(pool.jobs[i].load());}
-        const auto budget=vc::render::processChunkCacheService()->decodedByteBudget()->stats();
-        r["decoded_cache"]={{"bytes",budget.decodedBytes},{"capacity",budget.maximumBytes},
-            {"recycled_bytes",budget.recycledBytes},{"reserve_bytes",budget.reserveBytes},
-            {"pending_requests",budget.pendingRequests},{"background_passes",budget.backgroundPasses},
-            {"background_evicted_bytes",budget.backgroundEvictedBytes},{"hard_limit_passes",budget.hardLimitPasses}};
-        auto path=output/(complete?"summary.json":"progress.json"),tmp=path;tmp+=".partial";
-        {std::ofstream f(tmp);f<<r.dump(2)<<'\n';}std::filesystem::rename(tmp,path);std::cout<<r.dump()<<std::endl;return r;
+        vcr::zarr::atomicWrite(output/(complete?"summary.json":"progress.json"),r.dump(2)+'\n');std::cout<<r.dump()<<std::endl;return r;
     }
     Json run() {
         {std::lock_guard lock(admission);loadMore();}

@@ -31,7 +31,8 @@ def sparse_keys(path, channel, spacing, base_shape_zyx, core_base):
     and other channel chunks cannot create jobs.
     """
     path = Path(path)
-    metadata = json.loads((path / ".zarray").read_text())
+    from vc_reader import zarr_inventory
+    metadata, stored_chunks = zarr_inventory(os.fspath(path))
     shape, chunks = metadata["shape"], metadata["chunks"]
     if metadata.get("zarr_format") != 2 or len(shape) not in (3, 4) or len(chunks) != len(shape):
         raise ValueError("enumeration requires Zarr v2 ZYX or CZYX storage")
@@ -61,21 +62,7 @@ def sparse_keys(path, channel, spacing, base_shape_zyx, core_base):
             raise ValueError("recursive native pooling inventory")
         return sparse_keys(source, 0, spacing / 2, base_shape_zyx, core_base)
     keys = set()
-    # Walk only numeric paths; never descend into unrelated metadata/scratch.
-    def chunks_on_disk(root, prefix=()):
-        with os.scandir(root) as entries:
-            for entry in entries:
-                if separator == ".":
-                    parts = entry.name.split(".")
-                    if entry.is_file() and len(parts) == len(shape) and all(p.isdecimal() for p in parts):
-                        yield tuple(map(int, parts))
-                elif entry.name.isdecimal():
-                    key = prefix + (int(entry.name),)
-                    if len(key) == len(shape) and entry.is_file():
-                        yield key
-                    elif len(key) < len(shape) and entry.is_dir():
-                        yield from chunks_on_disk(entry.path, key)
-    for index in chunks_on_disk(path):
+    for index in stored_chunks:
         if any(i * c >= n for i, c, n in zip(index, chunks, shape)):
             raise ValueError(f"stored chunk outside array shape: {index}")
         if len(shape) == 4 and index[0] != channel // chunks[0]:
@@ -109,7 +96,7 @@ def load_config(path):
     path = Path(path).resolve()
     cfg = json.loads(path.read_text())
     _keys(cfg, ("prediction_manifest", "normal_manifest", "source_identity", "scaledown_power",
-                "enable_width", "cache_bytes", "trace", "chunks", "keys_xyz", "loader", "routes"), "volume config")
+                "enable_width", "cache_bytes", "trace", "chunks", "keys_xyz", "routes"), "volume config")
     if not isinstance(cfg.get("source_identity"), str) or not cfg["source_identity"]:
         raise ValueError("source_identity must identify immutable predictions AND normals")
     for name in ("prediction_manifest", "normal_manifest"):
@@ -144,30 +131,6 @@ def open_inputs(cfg):
     if trace.parallel_threads != 1:
         raise ValueError("parallel_threads must be 1; shared queue owns CPU parallelism")
     return field, normals, trace, chunks
-
-
-def configure_loader(cfg, workers):
-    loader = cfg.get("loader", {})
-    _keys(loader, ("resource_scaled", "backend", "queued_chunk_window"), "loader")
-    scaled = loader.get("resource_scaled", True)
-    if type(scaled) is not bool:
-        raise ValueError("loader.resource_scaled must be boolean")
-    # Explicit legacy control for matched benchmarks / already initialized hosts.
-    if not scaled:
-        if loader.get("backend", "direct") != "direct" or loader.get("queued_chunk_window", 0):
-            raise ValueError("queued loader configuration requires resource_scaled=true")
-        return {"resource_scaled": False}
-    backend=loader.get("backend", "direct")
-    window=loader.get("queued_chunk_window", 0)
-    if backend not in ("direct", "queued") or type(window) is not int or window < 0:
-        raise ValueError("invalid loader backend or queued_chunk_window")
-    if backend=="direct" and window:
-        raise ValueError("queued_chunk_window requires the queued backend")
-    if backend == "queued" and cfg.get("chunks", {}).get("worker_cache_bytes", 0):
-        raise ValueError("queued loader and worker-local partitions are separate backends")
-    args=(workers,cfg.get("cache_bytes",512 << 20))
-    return json.loads(ft.configure_chunk_loader(*args) if backend=="direct" and not window
-                      else ft.configure_chunk_loader(*args,backend,window))
 
 
 def job_keys(cfg, field, chunks):
@@ -233,7 +196,6 @@ def execute(cfg, output, workers, contexts, *, progress=None, route_cache=None):
         workers = min(workers, int(grant["cpu_cores"]))
         if workers < 1:
             raise RuntimeError("manager grant contains no CPU workers")
-    loader = configure_loader(cfg, workers)
     field, normals, trace, chunks = open_inputs(cfg)
     keys = job_keys(cfg, field, chunks) if route_cache is None else None
     if route_cache is None and chunks.gpu_library and missing_outputs(output, keys) and not chunks.cache_only:
@@ -272,10 +234,8 @@ def execute(cfg, output, workers, contexts, *, progress=None, route_cache=None):
             control.cancel("volume command interrupted or failed")
             raise  # Executor joins all native work before releasing resources.
     result = dict(control.status(), wall_seconds=time.monotonic()-began,
-                  workers=workers, contexts_per_worker=contexts, loader=loader,
+                  workers=workers, contexts_per_worker=contexts,
                   stage="routes" if route_cache is not None else "chunks")
-    if hasattr(ft,"chunk_loader_stats"):
-        result["loader_stats"]=json.loads(ft.chunk_loader_stats())
     if progress:
         progress(result, result["wall_seconds"])
     return result

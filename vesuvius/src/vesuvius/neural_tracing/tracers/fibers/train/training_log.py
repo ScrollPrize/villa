@@ -186,14 +186,6 @@ def _interval_training_lines(row):
         lines.append('  datasets (IDs from dataset_configuration): '+', '.join(
             f'{key}: {value}/{int(m["decisions"])} ({value/max(1,m["decisions"]):.1%})'
             for key,value in sorted(m['dataset_counts'].items())))
-    if 'remote_prefetch' in row:
-        p = row['remote_prefetch']
-        lines.append(f"  remote CT prefetch (cumulative): alive={p['alive']} | active {p['active']}"
-                     f" | completed {p['completed']} chunks / {p['completed_bytes']/2**20:.1f} MiB"
-                     f" | promoted {p['promoted']} | preempted {p['preempted']}"
-                     f" | deferred {p['deferred']} | errors {p['errors']}")
-        if 'lookahead_chunks' in p:
-            lines[-1] += f" | lookahead {p['lookahead_chunks']} chunk references / {p['lookahead_windows']} windows"
     if m.get('live_rows'):
         lines.append(f"  live chains: {int(m['live_rows'])} rows | mean depth {m['live_depth_sum']/m['live_rows']:.0f} decisions"
                      f" | mean travel {m.get('live_travelled_sum', 0)/m['live_rows']:.0f} vox"

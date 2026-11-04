@@ -5,13 +5,12 @@ import json
 import numpy as np
 import pytest
 import torch
-import zarr
+from vc_reader.reader import ZarrWriter, create_group, open_group, open_zarr
 
 from lasagna.qualzz_inference import (
     QualzzModelAdapter, ProbabilityZarrOutputAdapter, _NormalizedModel, _pool2,
     _quantize, run_inference,
 )
-from lasagna.compact_zarr import chunk_file, _open_group, _create_array
 from lasagna.tiled_predict3d import run_tiled_inference_3d
 
 
@@ -54,9 +53,9 @@ def test_standard_arrays_and_pool_before_quantization(tmp_path):
         writer.write_product_chunk(product, chunk_origin_zyx=origin,
                                    data=adapter.finalize_product_slab(product, block))
         assert writer.product_chunk_complete(product, chunk_origin_zyx=origin)
-    group = zarr.open_group(writer.root, mode="r")
+    group = open_group(writer.root)
     assert set(group.array_keys()) == {"semantic", "tracing"}
-    assert "lasagna" not in group.attrs
+    assert "lasagna" not in json.loads((tmp_path / "prediction.zarr/.zattrs").read_text())
     np.testing.assert_array_equal(group["semantic"][:], _quantize(values))
     np.testing.assert_array_equal(group["tracing"][:], _quantize(_pool2(values)))
     assert group["semantic"].dtype == np.uint8
@@ -74,7 +73,7 @@ def test_completion_requires_both_scales_and_resume_validates(tmp_path):
     writer.write_product_chunk(product, chunk_origin_zyx=(0, 0, 0),
                                data=adapter.finalize_product_slab(product, values))
     writer.prepare()
-    chunk_file(tmp_path / "prediction.zarr/tracing", (0, 0, 0)).unlink()
+    ZarrWriter.open(tmp_path / "prediction.zarr/tracing").remove_chunk((0, 0, 0, 0))
     assert not writer.product_chunk_complete(product, chunk_origin_zyx=(0, 0, 0))
     writer.provenance = {"test": False}
     with pytest.raises(ValueError, match="provenance"):
@@ -95,11 +94,10 @@ class TinyModel(torch.nn.Module):
 def test_tiled_engine_and_resume(tmp_path, flush_workers):
     shape = (12, 10, 8)
     adapter, product, writer = output(tmp_path, shape)
-    group = _open_group(tmp_path / "ct.zarr")
-    _create_array(group, "0", shape, (4, 4, 4), np.uint8, None,
-                  array_path=tmp_path / "ct.zarr/0")
-    source = group["0"]
-    source[:] = np.random.default_rng(2).integers(1, 256, size=shape, dtype=np.uint8)
+    writer_ct = ZarrWriter.create(tmp_path / "ct.zarr/0", shape=shape, chunks=(4, 4, 4), dtype=np.uint8,
+                                  compressor=None, separator="/")
+    writer_ct[:] = np.random.default_rng(2).integers(1, 256, size=shape, dtype=np.uint8)
+    source = open_zarr(tmp_path / "ct.zarr/0")
     progress = {}
     model = TinyModel()
     def run():
@@ -112,7 +110,7 @@ def test_tiled_engine_and_resume(tmp_path, flush_workers):
             tmp_dir=str(tmp_path), progress=progress, product_accumulator_dtype="float32",
             flush_workers=flush_workers)
     run()
-    predicted = zarr.open_group(writer.root, mode="r")
+    predicted = open_group(writer.root)
     expected = adapter.product_tensors_from_output(model(torch.from_numpy(source[:].copy())
                     .float()[None,None]/255))["semantic"][0].numpy()
     np.testing.assert_array_equal(predicted["semantic"][:], _quantize(expected))
@@ -144,15 +142,13 @@ def normalize_ct(x):
 ''')
     (folder / "plans.json").write_text("{}")
     (folder / "checkpoint_final.pth").write_bytes(b"fixture")
-    group = _open_group(tmp_path / "ct.zarr")
-    _create_array(group, "0", (8,8,8), (8,8,8), np.uint8, None,
-                  array_path=tmp_path / "ct.zarr/0")
-    group["0"][:] = 128
+    ZarrWriter.create(tmp_path / "ct.zarr/0", shape=(8,8,8), chunks=(8,8,8), dtype=np.uint8,
+                      compressor=None, separator="/")[:] = 128
     path = run_inference(model_dir=folder, input_path=tmp_path / "ct.zarr/0",
                          output=tmp_path / "out.zarr", voxel_size_um=9.6,
                          devices=(torch.device("cpu"),), chunk_size=4,
                          flush_workers=0, accumulator_workers=0)
-    result = zarr.open_group(str(path), mode="r")
+    result = open_group(path)
     p = torch.arange(4.).softmax(0)[1:3].numpy()
     np.testing.assert_array_equal(result["semantic"][:],
                                   np.broadcast_to(_quantize(p)[:,None,None,None], (2,8,8,8)))

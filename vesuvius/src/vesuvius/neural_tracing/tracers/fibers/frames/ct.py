@@ -3,12 +3,11 @@ from __future__ import annotations
 
 import numpy as np
 
-from vesuvius.neural_tracing.tracers.shared.crop_sampling.crops import tight_block
 from vesuvius.neural_tracing.tracers.shared.ct_structure import (
     CT_CONTEXT_RADIUS, CT_DERIVATIVE_SIGMA, CT_INTEGRATION_SIGMA, MIN_EIGENGAP, SeedHeadingError, ct_sheet_normal,
     ct_structure_tensor)
 from vesuvius.neural_tracing.tracers.shared.geometry import (
-    arclength, interp_at, frame_from_heading, normalize, block_start)
+    arclength, interp_at, frame_from_heading, normalize)
 
 SEED_HEADING_POLICY = 'ct_sheet_hv_sigma2_8_v2'
 TRACE_HEADING_POLICY = 'linear12_trusted_v1'
@@ -44,7 +43,7 @@ def sheet_heading(normal, family):
 
 
 def normal_context(pos_xyz, input_scale):
-    """Native CT bounds for normal estimation, also used by remote prefetch."""
+    """Native CT bounds for normal estimation."""
     pos = np.asarray(pos_xyz, dtype=np.float64)
     if pos.shape != (3,) or not np.isfinite(pos).all():
         raise SeedHeadingError('Seed position must be a finite xyz vector')
@@ -53,35 +52,35 @@ def normal_context(pos_xyz, input_scale):
     return start, np.full(3, 2*CT_CONTEXT_RADIUS+1, dtype=np.int64)
 
 
-def _ct_context(vol, pos_xyz):
-    start, size = normal_context(pos_xyz, vol.input_scale)
-    if np.any(start < 0) or np.any(start+size > np.asarray(vol.ct.shape)):
+def _ct_context(ct, spec, pos_xyz):
+    start, size = normal_context(pos_xyz, spec.input_scale)
+    if np.any(start < 0) or np.any(start+size > np.asarray(ct.shape)):
         raise SeedHeadingError('CT seed context crosses the volume boundary')
-    center = np.asarray(pos_xyz)[::-1]*vol.input_scale-start
-    return vol.ct.read(start, size), center
+    center = np.asarray(pos_xyz)[::-1]*spec.input_scale-start
+    return ct.read_region(start, size), center
 
 
-def ct_normal(vol, pos_xyz):
-    return ct_sheet_normal(*_ct_context(vol, pos_xyz))
+def ct_normal(ct, spec, pos_xyz):
+    return ct_sheet_normal(*_ct_context(ct, spec, pos_xyz))
 
 
-def ct_tensor(vol, pos_xyz):
-    return ct_structure_tensor(*_ct_context(vol, pos_xyz), derivative_sigma=CT_DERIVATIVE_SIGMA,
+def ct_tensor(ct, spec, pos_xyz):
+    return ct_structure_tensor(*_ct_context(ct, spec, pos_xyz), derivative_sigma=CT_DERIVATIVE_SIGMA,
                                integration_sigma=CT_INTEGRATION_SIGMA)
 
 
-def ct_seed_heading(vol, pos_xyz, family):
+def ct_seed_heading(ct, spec, pos_xyz, family):
     """Read only CT around the unchanged seed. No presence/direction readers."""
-    return sheet_heading(ct_normal(vol, pos_xyz), family)
+    return sheet_heading(ct_normal(ct, spec, pos_xyz), family)
 
 
-def oriented_seed_heading(vol, pos_xyz, family, direction):
+def oriented_seed_heading(ct, spec, pos_xyz, family, direction):
     """The tracer's seed heading: the CT sheet axis for the family, signed along ``direction``.
 
     Only the sign comes from ``direction`` (annotation or a simulated trace's own
     path); the axis itself is CT-only, exactly as in inference and collection.
     """
-    axis = ct_seed_heading(vol, pos_xyz, family)
+    axis = ct_seed_heading(ct, spec, pos_xyz, family)
     return -axis if np.dot(axis, direction) < 0 else axis
 
 
@@ -132,10 +131,10 @@ def transverse_frame(tensor, heading, previous=None, *, fallback=None, diagnosti
     return frame
 
 
-def ct_frame(vol, pos, heading, previous=None, *, fallback=None, diagnostics=None):
+def ct_frame(ct, spec, pos, heading, previous=None, *, fallback=None, diagnostics=None):
     # Invalid input and CT I/O errors remain explicit. Only weak orientation
     # evidence falls back; initial H/V heading selection still uses ct_normal.
-    return transverse_frame(ct_tensor(vol, pos), heading, previous,
+    return transverse_frame(ct_tensor(ct, spec, pos), heading, previous,
                             fallback=fallback, diagnostics=diagnostics)
 
 
@@ -155,38 +154,16 @@ def reframe_item(item, frame):
     item['frame'] = frame
 
 
-def orient_item(item, vol):
+def orient_item(item, ct, spec):
     """Resolve synthetic geometry once; recorded tracing frames are immutable."""
     if 'frame_policy' in item:
         if item['frame_policy'] not in FRAME_POLICIES:
             raise ValueError('Unsupported crop frame policy; recollect replay')
         return
     diagnostics = {}
-    reframe_item(item, ct_frame(vol, item['pos'], np.asarray(item['frame'])[:, 2], diagnostics=diagnostics))
+    reframe_item(item, ct_frame(ct, spec, item['pos'], np.asarray(item['frame'])[:, 2], diagnostics=diagnostics))
     item['ct_frame_diagnostics'] = diagnostics
     item['frame_policy'] = FRAME_POLICY
-
-
-def frame_prefetch_bounds(item, crop, input_scale):
-    """Cover every roll until CT is available, plus the normal's CT context."""
-    if item.get('frame_policy') in FRAME_POLICIES:
-        yield tight_block(item['pos'], item['frame'], crop, input_scale)
-    else:
-        # block_start encloses the crop's circumsphere, independent of u/v.
-        lo = np.floor(block_start(item['pos'], item['frame'], crop)*input_scale).astype(np.int64)-1
-        hi = np.ceil((block_start(item['pos'], item['frame'], crop)+crop.block_size)*input_scale).astype(np.int64)+2
-        yield lo, hi-lo
-        yield normal_context(item['pos'], input_scale)
-
-
-def heading_free_bounds(pos, crop, input_scale):
-    """Native CT block holding the crop for any heading and roll about ``pos``."""
-    lateral = (crop.width-1)*crop.spacing/2
-    reach = np.sqrt(2*lateral**2+(max(crop.behind, crop.depth-1-crop.behind)*crop.spacing)**2)+1.
-    center = np.asarray(pos, dtype=np.float64)[::-1]*input_scale
-    lo = np.floor(center-reach*input_scale).astype(np.int64)-1
-    hi = np.ceil(center+reach*input_scale).astype(np.int64)+2
-    return lo, hi-lo
 
 
 def trace_heading(path, start, held):

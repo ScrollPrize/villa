@@ -10,7 +10,7 @@ import tifffile
 pytest.importorskip("cc3d")
 pytest.importorskip("skimage")
 
-from vesuvius.image_proc.run import label_topology_audit as lta  # noqa: E402
+from vesuvius.label_processing import label_topology_audit as lta  # noqa: E402
 
 
 def sheet(shape=(40, 40, 40), z0=18, z1=20):
@@ -165,12 +165,11 @@ def test_batch_writes_ranked_csv(tmp_path):
     assert len(lines) == 2 and lines[1].startswith("1,b_holed,")
 
 
-def test_detect_holes_cpu_topology_matches_known_shapes():
-    # detect_holes/hole_viewer now get their CPU Betti numbers from the shared helper;
-    # both connectivity pairings must still give the textbook answers
-    dh = pytest.importorskip("vesuvius.scripts.detect_holes")
+def test_component_betti_matches_known_shapes():
+    # the shared Betti helper must give the textbook answers under both connectivity pairings
+    from vesuvius.label_processing.topology import component_betti
     for fg, bg in ((26, 6), (6, 26)):
-        topo = lambda v: dh.compute_component_topology(v, fg_connectivity=fg, bg_connectivity=bg, use_cpu=True)[:2]
+        topo = lambda v: component_betti(v, fg, bg)[:2]
         assert (topo(torus()), topo(shell()), topo(sheet())) == ((1, 0), (0, 1), (0, 0))
 
 
@@ -485,7 +484,7 @@ def test_empty_crop_cannot_reach_a_gate_with_a_missing_value(tmp_path):
 
 
 def test_url_input_is_zarr_unless_it_names_a_tif():
-    from vesuvius.image_proc.run.label_topology_audit import _is_zarr
+    from vesuvius.label_processing.label_topology_audit import _is_zarr
     assert _is_zarr("https://host/vol.zarr")
     assert _is_zarr("s3://bucket/vol")
     assert not _is_zarr("https://host/label.tif")

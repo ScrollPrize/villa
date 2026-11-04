@@ -1,15 +1,15 @@
-"""Fast oriented scalar crops.
+"""Oriented scalar crops of uint8 CT, sampled by vc_reader.
 
-Read only each oriented crop's tight source block. ChunkedArray memory-maps
-uncompressed Zarr chunks; the fused Numba kernel interpolates them.
+A crop (``CropSpec``, frame columns ``u, v, f``) is laid out ``(D, H, W)`` = forward (f), v, u; sample ``(i, j, k)``
+lies at CT-array xyz ``pos*scale + (frame*scale) @ (lateral[k], vertical[j], forward[i])``. ``crop_grids`` turns that
+into the origin and axes of ``ZarrReader.read_affine_many`` (CPU) and ``CudaReader.read_affine_batch`` (CUDA): the
+same trilinear values, CT/255, with the array's fill value outside it.
 """
 import numpy as np
 import torch
 
-from vesuvius.neural_tracing.tracers.shared.crop_sampling.volume import CTVolume
 from vesuvius.neural_tracing.tracers.shared.geometry import CropSpec
-from vesuvius.neural_tracing.tracers.shared.crop_sampling.fast_sample import sample_scalar_crop
-from vesuvius.neural_tracing.tracers.shared.crop_sampling.normalization import normalize_ct
+from vesuvius.neural_tracing.tracers.shared.crop_sampling.normalization import normalize_ct, zscore_crops
 
 
 def empty_image_batch(shape):
@@ -43,76 +43,49 @@ def unique_crop_indices(items):
     return sources
 
 
-def scalar_crops(items, vol, crop, pool=None, *, out=None, normalize=True):
+def crop_grids(items, crop: CropSpec, scale: float):
+    """Output shape (D, H, W), zyx origins (B, 3) and zyx axes (B, 3, 3; columns: steps along f, v, u) of the items'
+    crops in CT-array voxels (``scale`` CT voxels per trace voxel)."""
+    frames = np.stack([np.asarray(item['frame'], np.float64) for item in items])*scale  # rows xyz, columns u, v, f
+    pos = np.stack([np.asarray(item['pos'], np.float64) for item in items])*scale
+    first = np.array([crop.lateral_coords[0], crop.vertical_coords[0], crop.forward_coords[0]])
+    origins = (pos + frames @ first)[:, ::-1]
+    axes = frames[:, ::-1, ::-1]*crop.spacing
+    return (crop.depth, crop.height or crop.width, crop.width), np.ascontiguousarray(origins), np.ascontiguousarray(axes)
+
+
+def scalar_crops(items, ct, spec, crop, *, out=None, normalize=True):
+    """(B, 1, D, H, W) float32 crops of the uint8 CT ``ct`` (a vc_reader ``ZarrReader``): CT/255, then normalized
+    with ``spec.ct_normalization`` unless ``normalize`` is false."""
+    if ct.dtype != np.uint8:
+        raise ValueError('CT intensity normalization currently requires uint8 data')
     sources = unique_crop_indices(items)
     unique = [j for j, source in enumerate(sources) if j == source]
-    raw, starts = read_tight_blocks([items[j] for j in unique], vol, crop, pool)
-    scale = vol.input_scale
     shape = (len(items), 1, crop.depth, crop.height or crop.width, crop.width)
     result = np.empty(shape, np.float32) if out is None else out
     if result.shape != shape or result.dtype != np.float32:
         raise ValueError('Scalar crop destination must have the expected shape and float32 dtype')
     if any(not result[j].flags.c_contiguous for j in range(len(items))):
         raise ValueError('Each scalar crop destination must be contiguous')
-    def sample(k):
-        j = unique[k]
-        item = items[j]
-        sample_scalar_crop(raw[k], starts[k], item['pos']*scale, item['frame']*scale,
-                           crop, result[j])
+    if unique:
+        size, origins, axes = crop_grids([items[j] for j in unique], crop, spec.input_scale)
+        ct.read_affine_many([(size, o, a) for o, a in zip(origins, axes)], out=[result[j, 0] for j in unique])
+    for j in unique:
+        result[j] *= np.float32(1/255)
         if normalize:
-            normalize_ct(result[j, 0], vol.spec.ct_normalization)
-    # Rows are independent and the Numba kernel releases the GIL, so a pool only
-    # changes scheduling; each row's values are identical to the serial loop.
-    if pool is None:
-        for k in range(len(unique)):
-            sample(k)
-    else:
-        list(pool.map(sample, range(len(unique))))
+            normalize_ct(result[j, 0], spec.ct_normalization)
     for j, source in enumerate(sources):
         if j != source:
             result[j] = result[source]
     return torch.from_numpy(result)
 
 
-_CORNER_CACHE: dict = {}
-
-
-def crop_corners(crop: CropSpec) -> np.ndarray:
-    """Eight local (a, b, c) corners; the crop's sample points are their convex hull."""
-    corners = _CORNER_CACHE.get(crop)
-    if corners is None:
-        lc, vc, fc = crop.lateral_coords, crop.vertical_coords, crop.forward_coords
-        corners = _CORNER_CACHE[crop] = np.array([(a, b, c) for a in (lc[0], lc[-1])
-                                                  for b in (vc[0], vc[-1]) for c in (fc[0], fc[-1])], np.float64)
-    return corners
-
-
-def tight_block(pos, frame, crop: CropSpec, scale: float = 1.):
-    """zyx start and size of the smallest axis-aligned block around one oriented crop.
-
-    Source-array coordinates (``scale`` source voxels per trace voxel). The block
-    holds every sample point plus the trilinear/nearest support voxel above it
-    and one guard voxel on each side, so a per-sample sampler that zero-pads
-    beyond the block reads exactly the values it reads from the larger
-    rotation-invariant ``block_start`` block (arrays fill outside with zero too).
-    Unlike ``block_start`` the footprint depends on the frame, so the holdout
-    guard keeps using the rotation-invariant block.
-    """
-    world = np.asarray(pos, np.float64)*scale + crop_corners(crop) @ (np.asarray(frame, np.float64)*scale).T
-    zyx = world[:, ::-1]
-    lo = np.floor(zyx.min(0)).astype(np.int64) - 1
-    hi = np.floor(zyx.max(0)).astype(np.int64) + 3
-    return lo, hi - lo
-
-
-def read_tight_blocks(items, vol: CTVolume, crop: CropSpec, pool=None):
-    """Per-item minimal blocks for per-sample CPU sampling: (list of raw, list of zyx starts).
-
-    Same values as the rotation-invariant ``block_start`` block at every sample point, reading roughly a
-    third of the voxels and touching about half the chunks per item.
-    """
-    scale = getattr(vol, 'input_scale', 1.)
-    bounds = [tight_block(it["pos"], it["frame"], crop, scale) for it in items]
-    read = lambda b: vol.raw_block(b[0], b[1])
-    raw = list(map(read, bounds) if pool is None else pool.map(read, bounds))
-    return raw, [start for start, _ in bounds]
+def cuda_scalar_crops(items, cuda, spec, crop) -> torch.Tensor:
+    """``scalar_crops`` on the GPU from a vc_reader ``CudaReader`` (``ZarrReader.cuda()``): (B, 1, D, H, W) float32
+    crops on its device, z-scored per crop (``zscore_crops``)."""
+    out = torch.empty((len(items), crop.depth, crop.height or crop.width, crop.width), dtype=torch.float32,
+                      device=torch.device('cuda', cuda.device))
+    if items:
+        size, origins, axes = crop_grids(items, crop, spec.input_scale)
+        cuda.read_affine_batch(size, origins, axes, order=1, out=out)
+    return zscore_crops(out[:, None]/255.)

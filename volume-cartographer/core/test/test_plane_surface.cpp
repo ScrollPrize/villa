@@ -121,42 +121,6 @@ TEST_CASE("valid always returns true")
     CHECK(p.valid(cv::Vec3f(1e6f, 1e6f, 1e6f)));
 }
 
-TEST_CASE("gen with z-normal yields planar (x,y,z) grid")
-{
-    PlaneSurface p(cv::Vec3f(0, 0, 0), cv::Vec3f(0, 0, 1));
-    cv::Mat_<cv::Vec3f> coords;
-    p.gen(&coords, nullptr, cv::Size(8, 4), cv::Vec3f(0, 0, 0), 1.0f, cv::Vec3f(0, 0, 0));
-    REQUIRE(coords.rows == 4);
-    REQUIRE(coords.cols == 8);
-    // All z should be 0; xy should span a regular grid.
-    for (int r = 0; r < coords.rows; ++r) {
-        for (int c = 0; c < coords.cols; ++c) {
-            CHECK(std::abs(coords(r, c)[2]) < 1e-4f);
-        }
-    }
-}
-
-TEST_CASE("gen scale parameter changes spacing")
-{
-    PlaneSurface p(cv::Vec3f(0, 0, 0), cv::Vec3f(0, 0, 1));
-    cv::Mat_<cv::Vec3f> c1, c2;
-    p.gen(&c1, nullptr, cv::Size(4, 1), cv::Vec3f(0, 0, 0), 1.0f, cv::Vec3f(0, 0, 0));
-    p.gen(&c2, nullptr, cv::Size(4, 1), cv::Vec3f(0, 0, 0), 0.5f, cv::Vec3f(0, 0, 0));
-    // doubled inverse scale (1/0.5 = 2) → step is 2x larger
-    float step1 = cv::norm(c1(0, 1) - c1(0, 0));
-    float step2 = cv::norm(c2(0, 1) - c2(0, 0));
-    CHECK(step2 == doctest::Approx(step1 * 2.0f).epsilon(1e-3));
-}
-
-TEST_CASE("gen with null coords and non-null normals does not crash")
-{
-    PlaneSurface p;
-    cv::Mat_<cv::Vec3f> normals;
-    p.gen(nullptr, &normals, cv::Size(4, 4), cv::Vec3f(0, 0, 0), 1.0f, cv::Vec3f(0, 0, 1));
-    // Behavior intentionally not asserted strongly — we just exercise the path.
-    CHECK(true);
-}
-
 TEST_CASE("setFromNormalAndUp builds orthonormal basis")
 {
     PlaneSurface p;

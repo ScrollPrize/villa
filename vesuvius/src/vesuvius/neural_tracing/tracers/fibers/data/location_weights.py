@@ -15,7 +15,7 @@ import hashlib
 from pathlib import Path
 
 import numpy as np
-from scipy.ndimage import gaussian_filter1d, map_coordinates
+from scipy.ndimage import gaussian_filter1d
 
 from vesuvius.neural_tracing.tracers.shared.annotations.fiber_store import fibers_digest
 from vesuvius.neural_tracing.tracers.shared.geometry import interp_at
@@ -58,44 +58,36 @@ def smoothed(annotation, s, sigma=4.):
     return gaussian_filter1d(interp_at(annotation, s, arcs), sigma, axis=0, mode='nearest'), arcs
 
 
-def sample_ct(vol, pts):
-    """CT values (raw) at trace-coordinate points of any shape (..., 3); zero outside the volume."""
+def sample_ct(ct, spec, pts):
+    """CT values (raw, trilinear) at trace-coordinate points of any shape (..., 3); the fill value outside the volume."""
     pts = np.asarray(pts, float)
-    zyx = pts.reshape(-1, 3)[:, ::-1]*vol.input_scale
-    shape = np.asarray(vol.ct.shape)
-    lo, hi = np.floor(zyx.min(0)).astype(int)-1, np.ceil(zyx.max(0)).astype(int)+2
-    lo_c, hi_c = lo.clip(0, shape), hi.clip(0, shape)
-    if not np.isfinite(zyx).all() or (hi_c <= lo_c).any():
-        return np.zeros(pts.shape[:-1], np.float32)
-    cube = np.zeros(hi-lo, np.float32)
-    cube[tuple(slice(l-o, h-o) for l, h, o in zip(lo_c, hi_c, lo))] = vol.ct.read(lo_c, hi_c-lo_c)
-    return map_coordinates(cube, (zyx-lo).T, order=1, mode='constant', cval=0.).reshape(pts.shape[:-1])
+    return ct.sample(pts[..., ::-1]*spec.input_scale, order=1, dtype=np.float64).astype(np.float32)
 
 
-def sheet_normal(vol, centre, half=6.):
+def sheet_normal(ct, spec, centre, half=6.):
     """Largest eigenvector of the CT gradient structure tensor over a (2*half+1)^3 vox block, and sheetness."""
     g = np.arange(-half, half+.01, 1.)
-    block = sample_ct(vol, centre+np.stack(np.meshgrid(g, g, g, indexing='ij'), -1))
+    block = sample_ct(ct, spec, centre+np.stack(np.meshgrid(g, g, g, indexing='ij'), -1))
     grads = np.stack(np.gradient(block), -1).reshape(-1, 3)
     w, v = np.linalg.eigh(grads.T @ grads)
     return v[:, -1], float((w[-1]-w[-2])/max(w[-1], 1e-9))
 
 
-def sheet_modulation(vol, centre, normal, half=20.):
+def sheet_modulation(ct, spec, centre, normal, half=20.):
     """(p90 - p10)/mean of the CT profile along the sheet normal (3x3 vox patch mean): how clearly sheets separate."""
     e1 = np.cross(normal, np.eye(3)[np.argmin(np.abs(normal))])
     e1 /= np.linalg.norm(e1)
     e2 = np.cross(normal, e1)
     offsets = np.arange(-half, half+.01, .5)
-    profile = np.stack([sample_ct(vol, centre+u*e1+v*e2+offsets[:, None]*normal)
+    profile = np.stack([sample_ct(ct, spec, centre+u*e1+v*e2+offsets[:, None]*normal)
                         for u in (-1., 0., 1.) for v in (-1., 0., 1.)]).mean(0)
     return float(np.percentile(profile, 90)-np.percentile(profile, 10))/max(float(profile.mean()), 1e-6)
 
 
-def compression(vol, a):
+def compression(ct, spec, a):
     """Sheetness and sheet modulation of the CT at point ``a``."""
-    normal, sheetness = sheet_normal(vol, a)
-    return dict(sheetness=sheetness, sheet_modulation=sheet_modulation(vol, a, normal))
+    normal, sheetness = sheet_normal(ct, spec, a)
+    return dict(sheetness=sheetness, sheet_modulation=sheet_modulation(ct, spec, a, normal))
 
 
 _VOLUMES, _DOCUMENT = {}, None
@@ -109,12 +101,12 @@ def init_volumes(config):
 
 
 def volume(name):
-    """The CT volume of source ``name`` (opened once per process)."""
+    """The CT reader and volume spec of source ``name`` (opened once per process)."""
     if name not in _VOLUMES:
+        from vc_reader.reader import open_zarr
         from vesuvius.neural_tracing.tracers.fibers.data.datasets import ct_source_spec, primary_source_spec
-        from vesuvius.neural_tracing.tracers.shared.crop_sampling.volume import CTVolume
         source = next(s for s in _DOCUMENT['sources'] if s['name'] == name)
         spec = primary_source_spec(_DOCUMENT) if source['kind'] == 'paris4' else ct_source_spec(source, _DOCUMENT['cache_dir'])
-        _VOLUMES[name] = CTVolume(spec)
+        _VOLUMES[name] = open_zarr(spec.ct_zarr, level=spec.ct_level, cache_dir=spec.cache_dir, memory_cache=3 << 30), spec
     return _VOLUMES[name]
 

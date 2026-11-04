@@ -15,7 +15,7 @@ import torch
 from vesuvius.neural_tracing.tracers.shared.geometry import CropSpec, frame_from_heading, normalize
 from vesuvius.neural_tracing.tracers.shared.policy import (DEFAULT_CONFIDENCE, DEFAULT_GATE, DEFAULT_N_COMMIT, GATES, gate_horizon,
     commit_count, selection_window)
-from vesuvius.neural_tracing.tracers.shared.crop_sampling.volume import CTVolume
+from vesuvius.neural_tracing.tracers.shared.crop_sampling.volume import CTVolumeSpec
 from vesuvius.neural_tracing.tracers.shared.reference import SEED_FIELDS, observed_path, trace_history
 from vesuvius.neural_tracing.tracers.fibers.data.observations import observation_builder
 from vesuvius.neural_tracing.tracers.fibers.frames.ct import (
@@ -25,6 +25,7 @@ from vesuvius.neural_tracing.tracers.fibers.frames.learned import (frame_predict
 
 if TYPE_CHECKING:
     from torch.nn import Module as FollowNet
+    from vc_reader.reader import ZarrReader
 
 
 @dataclass
@@ -130,9 +131,9 @@ class ModelTracer:
     # When set, build_inputs also receives each trace's seed segment and length.
     path_context = False
 
-    def __init__(self, model: FollowNet, vol: CTVolume, crop: CropSpec, n_history: int = 128,
+    def __init__(self, model: FollowNet, ct: ZarrReader, spec: CTVolumeSpec, crop: CropSpec, n_history: int = 128,
                  params: TraceParams | None = None, device: str = "cuda"):
-        self.model, self.vol, self.crop = model, vol, crop
+        self.model, self.ct, self.spec, self.crop = model, ct, spec, crop
         self.n_history, self.p, self.device = n_history, params or TraceParams(), str(device)
         self.frame_predictor = frame_predictor(model.cfg)
         self.frame_policy = configured_frame_policy(model.cfg)
@@ -302,11 +303,11 @@ class ModelTracer:
         if initial_states is not None:
             frames = [np.asarray(s['frame']).copy() for s in initial_states]
         elif predictor is not None:
-            frames = predict_frames(predictor, self.vol, seeds_xyz, headings, [np.asarray(p) for p in paths], families,
-                                    pool=getattr(self, 'pool', None))
+            frames = predict_frames(predictor, self.ct, self.spec, seeds_xyz, headings, [np.asarray(p) for p in paths],
+                                    families)
             frame_diagnostics = [dict(source=3, energy=0., gap=0.) for _ in range(n)]
         else:
-            frames = list(self.map(lambda a: ct_frame(self.vol, a[0], a[1], diagnostics=a[2]),
+            frames = list(self.map(lambda a: ct_frame(self.ct, self.spec, a[0], a[1], diagnostics=a[2]),
                                    zip(seeds_xyz, headings, frame_diagnostics)))
         # Resumed states carry the exact acceptance boundary saved at their decision.
         heading_start = np.zeros(n, dtype=np.int64)
@@ -334,6 +335,7 @@ class ModelTracer:
         predicted = np.zeros(n, bool)  # this decision's crop came from the previous prediction
         retried = np.zeros(n, bool)  # this head already had its confidence-stop retry
         pp = self.p
+        shape = np.ceil(np.asarray(self.ct.shape)/self.spec.input_scale).astype(int)  # trace-grid extent
 
         def grow(new_seeds, new_headings, new_families):
             """Start fresh traces as new rows: the same initial state as the seeds above."""
@@ -344,12 +346,12 @@ class ModelTracer:
                 raise ValueError('Learned crop frames require one H/V family per trace')
             new_paths = [np.asarray(q, np.float64)[None] for q in new_seeds]
             if predictor is not None:
-                new_frames = predict_frames(predictor, self.vol, list(new_seeds), list(new_headings),
-                                            [np.asarray(q) for q in new_paths], new_families, pool=getattr(self, 'pool', None))
+                new_frames = predict_frames(predictor, self.ct, self.spec, list(new_seeds), list(new_headings),
+                                            [np.asarray(q) for q in new_paths], new_families)
                 new_diag = [dict(source=3, energy=0., gap=0.) for _ in range(m)]
             else:
                 new_diag = [{} for _ in range(m)]
-                new_frames = list(self.map(lambda a: ct_frame(self.vol, a[0], a[1], diagnostics=a[2]),
+                new_frames = list(self.map(lambda a: ct_frame(self.ct, self.spec, a[0], a[1], diagnostics=a[2]),
                                            zip(new_seeds, new_headings, new_diag)))
             seeds_xyz.extend(new_seeds)
             families.extend(new_families)
@@ -444,7 +446,7 @@ class ModelTracer:
             if pool is not None and on_decision is None:
                 jobs = [(j, i) for j, i in enumerate(idx) if allowed[j] and commits[j] > 0]
                 tasks = [(paths[i], fr[j], points[j], int(commits[j]), int(heading_start[i]),
-                          self.vol.shape, pp, length[i], hist_start[i]) for j, i in jobs]
+                          shape, pp, length[i], hist_start[i]) for j, i in jobs]
                 if tasks:
                     parallel_advanced = dict(zip(
                         [j for j, _ in jobs], pool.map(advance_trace_path, *zip(*tasks), chunksize=8)))
@@ -497,7 +499,7 @@ class ModelTracer:
                 else:
                     advanced, reason = advance_trace_path(
                         paths[i], fr[j], points[j], commit, int(heading_start[i]),
-                        self.vol.shape, pp, length[i], hist_start[i])
+                        shape, pp, length[i], hist_start[i])
                 if advanced is None:
                     active[i], reasons[i] = False, reason
                     continue
@@ -517,14 +519,14 @@ class ModelTracer:
             mark('advance')
             if predictor is not None:
                 pending = [i for i in reframe if active[i]]
-                updated = predict_frames(predictor, self.vol, [paths[i][-1] for i in pending],
+                updated = predict_frames(predictor, self.ct, self.spec, [paths[i][-1] for i in pending],
                     [reframe[i] for i in pending], [np.asarray(paths[i]) for i in pending],
-                    [families[i] for i in pending], previous=[frames[i] for i in pending], pool=getattr(self, 'pool', None))
+                    [families[i] for i in pending], previous=[frames[i] for i in pending])
                 for i, frame in zip(pending, updated):
                     frames[i] = frame
                     frame_diagnostics[i] = dict(source=3, energy=0., gap=0.)
             else:
-                update = lambda i: ct_frame(self.vol, paths[i][-1], reframe[i], frames[i],
+                update = lambda i: ct_frame(self.ct, self.spec, paths[i][-1], reframe[i], frames[i],
                                             diagnostics=frame_diagnostics[i])
                 for i, frame in zip(reframe, self.map(update, reframe)):
                     frames[i] = frame
@@ -573,4 +575,4 @@ class FiberTracer(ModelTracer):
                     item['fiber_family'] = path['fiber_family']
         def move(value):
             return {k: move(v) for k, v in value.items()} if isinstance(value, dict) else value.to(self.device)
-        return move(self.observations.images(items,self.vol,self.pool))
+        return move(self.observations.images(items,self.ct,self.spec))

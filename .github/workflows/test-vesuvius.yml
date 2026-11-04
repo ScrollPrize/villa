@@ -9,8 +9,6 @@ on:
       - 'volume-cartographer/**'
       - 'vc_object_store/**'
       - 'vc_reader/**'
-      - 'segmentation/models/batchgeneratorsv2/**'
-      - 'segmentation/models/arch/nnunet/**'
       - '.github/workflows/test-vesuvius.yml'
 
 jobs:
@@ -53,6 +51,8 @@ jobs:
             libopencv-contrib-dev \
             libopencv-dev \
             libsuitesparse-dev \
+            libjpeg-dev \
+            libpng-dev \
             libtiff-dev \
             libzstd-dev \
             ninja-build \

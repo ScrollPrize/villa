@@ -7,18 +7,19 @@
 #include "panels/SegmentationCorrectionsPanel.hpp"
 #include "panels/SegmentationCustomParamsPanel.hpp"
 #include "panels/SegmentationNeuralTracerPanel.hpp"
-#include "panels/SegmentationDirectionFieldPanel.hpp"
 #include "panels/SegmentationLasagnaPanel.hpp"
 #include "panels/SegmentationManualAddPanel.hpp"
 #include "VCSettings.hpp"
 
 #include <QSettings>
+#include <QLabel>
+#include <QProgressBar>
 #include <QVBoxLayout>
 #include <QVariant>
 
 #include <algorithm>
 
-#include "utils/Json.hpp"
+#include <nlohmann/json.hpp>
 
 Q_LOGGING_CATEGORY(lcSegWidget, "vc.segmentation.widget")
 
@@ -36,6 +37,17 @@ void SegmentationWidget::buildUi()
     layout->setContentsMargins(8, 8, 8, 8);
     layout->setSpacing(12);
 
+    _manualAddProgress = new QWidget(this);
+    _manualAddProgress->setObjectName(QStringLiteral("manualAddProgress"));
+    auto* progressLayout = new QVBoxLayout(_manualAddProgress);
+    progressLayout->setContentsMargins(0, 0, 0, 0);
+    progressLayout->addWidget(new QLabel(tr("Computing extension — editing is locked…"), _manualAddProgress));
+    auto* progress = new QProgressBar(_manualAddProgress);
+    progress->setRange(0, 0);
+    progressLayout->addWidget(progress);
+    _manualAddProgress->hide();
+    layout->addWidget(_manualAddProgress);
+
     _headerRow = new SegmentationHeaderRow(this);
     layout->addWidget(_headerRow);
 
@@ -47,9 +59,6 @@ void SegmentationWidget::buildUi()
 
     _editingPanel = new SegmentationEditingPanel(QStringLiteral("segmentation_edit"), this);
     layout->addWidget(_editingPanel);
-
-    _directionFieldPanel = new SegmentationDirectionFieldPanel(QStringLiteral("segmentation_edit"), this);
-    layout->addWidget(_directionFieldPanel);
 
     _neuralTracerPanel = new SegmentationNeuralTracerPanel(QStringLiteral("segmentation_edit"), this);
     layout->addWidget(_neuralTracerPanel);
@@ -115,8 +124,6 @@ void SegmentationWidget::buildUi()
     connect(_growthPanel, &SegmentationGrowthPanel::growthMethodChanged,
             this, &SegmentationWidget::growthMethodChanged);
     connect(_growthPanel, &SegmentationGrowthPanel::growthMethodChanged,
-            this, &SegmentationWidget::noteGrowthMethod);
-    connect(_growthPanel, &SegmentationGrowthPanel::growthMethodChanged,
             this, &SegmentationWidget::syncUiState);
     connect(_growthPanel, &SegmentationGrowthPanel::volumeSelectionChanged,
             this, &SegmentationWidget::volumeSelectionChanged);
@@ -133,6 +140,8 @@ void SegmentationWidget::buildUi()
             this, &SegmentationWidget::manualAddApplyExitRequested);
     connect(_manualAddPanel, &SegmentationManualAddPanel::cancelRequested,
             this, &SegmentationWidget::manualAddCancelRequested);
+    connect(_manualAddPanel, &SegmentationManualAddPanel::extendRequested,
+            this, &SegmentationWidget::manualAddExtendRequested);
 
     // Forward corrections panel signals
     connect(_correctionsPanel, &SegmentationCorrectionsPanel::correctionsCreateRequested,
@@ -175,24 +184,27 @@ void SegmentationWidget::syncUiState()
         }
     }
 
-    const bool manualAddSelected = _growthPanel->growthMethod() == SegmentationGrowthMethod::ManualAdd;
+    const bool manualAddSelected = isManualGrowthMethod(_growthPanel->growthMethod());
     const bool manualAddVisible = _manualAddActive || manualAddSelected;
     _growthPanel->setManualAddUiActive(manualAddVisible);
+    _manualAddPanel->setGrowMode(_growthPanel->growthMethod() == SegmentationGrowthMethod::ManualGrow);
     _manualAddPanel->setVisible(manualAddVisible);
-    _manualAddPanel->syncUiState(_editingEnabled, _manualAddActive);
+    _manualAddPanel->syncUiState(_editingEnabled && !_manualAddBusy, _manualAddActive);
 
     _growthPanel->syncUiState(_editingEnabled, _growthInProgress);
     _editingPanel->setVisible(true);
-    _directionFieldPanel->setVisible(!manualAddVisible);
     _neuralTracerPanel->setVisible(!manualAddVisible);
     _correctionsPanel->setVisible(!manualAddVisible);
     _customParamsPanel->setVisible(!manualAddVisible);
     _editingPanel->syncUiState(_editingEnabled, _growthInProgress);
     _customParamsPanel->syncUiState(_editingEnabled);
-    _directionFieldPanel->syncUiState(_editingEnabled);
     _correctionsPanel->syncUiState(_editingEnabled, _growthInProgress);
     _neuralTracerPanel->syncUiState();
     _lasagnaPanel->syncUiState(_editingEnabled, false);
+    _headerRow->setEnabled(!_manualAddBusy);
+    _growthPanel->setEnabled(!_manualAddBusy);
+    _editingPanel->setEnabled(!_manualAddBusy);
+    _manualAddProgress->setVisible(_manualAddBusy);
 }
 
 void SegmentationWidget::restoreSettings()
@@ -206,7 +218,6 @@ void SegmentationWidget::restoreSettings()
     _editingPanel->restoreSettings(settings);
     _growthPanel->restoreSettings(settings);
     _manualAddPanel->restoreSettings(settings);
-    _directionFieldPanel->restoreSettings(settings);
     _correctionsPanel->restoreSettings(settings);
     _customParamsPanel->restoreSettings(settings);
     _maskBrushRadius = std::clamp(settings.value(segmentation::MASK_BRUSH_RADIUS,
@@ -217,7 +228,6 @@ void SegmentationWidget::restoreSettings()
 
     settings.endGroup();
     _restoringSettings = false;
-    noteGrowthMethod(_growthPanel->growthMethod());
 }
 
 void SegmentationWidget::writeSetting(const QString& key, const QVariant& value)
@@ -239,13 +249,6 @@ void SegmentationWidget::updateEditingState(bool enabled, bool notifyListeners)
 
     if (notifyListeners) {
         emit editingModeChanged(_editingEnabled);
-    }
-}
-
-void SegmentationWidget::noteGrowthMethod(SegmentationGrowthMethod method)
-{
-    if (method != SegmentationGrowthMethod::ManualAdd) {
-        _lastNonManualGrowthMethod = method;
     }
 }
 
@@ -284,6 +287,7 @@ void SegmentationWidget::setPendingChanges(bool pending)
 
 void SegmentationWidget::setEditingEnabled(bool enabled)
 {
+    if (_manualAddBusy) return;
     updateEditingState(enabled, false);
 }
 
@@ -313,16 +317,21 @@ int SegmentationWidget::growthSteps() const { return _growthPanel->growthSteps()
 bool SegmentationWidget::growthKeybindsEnabled() const { return _growthPanel->growthKeybindsEnabled(); }
 int SegmentationWidget::growthScale() const { return _growthPanel->growthScale(); }
 ManualAddTool::Config SegmentationWidget::manualAddConfig() const { return _manualAddPanel->config(); }
+int SegmentationWidget::manualGrowWorkers() const { return _manualAddPanel->growWorkers(); }
+int SegmentationWidget::manualAddExtendCells() const { return _manualAddPanel->extendCells(); }
 ManualAddTool::LinePreviewMode SegmentationWidget::cycleManualAddLinePreviewMode()
 {
+    if (_manualAddBusy) return manualAddConfig().linePreviewMode;
     return _manualAddPanel->cycleLinePreviewMode();
 }
 ManualAddTool::LinePreviewMode SegmentationWidget::setManualAddLinePreviewMode(ManualAddTool::LinePreviewMode mode)
 {
+    if (_manualAddBusy) return manualAddConfig().linePreviewMode;
     return _manualAddPanel->setLinePreviewMode(mode);
 }
 ManualAddTool::InterpolationMode SegmentationWidget::setManualAddInterpolationMode(ManualAddTool::InterpolationMode mode)
 {
+    if (_manualAddBusy) return manualAddConfig().interpolationMode;
     return _manualAddPanel->setInterpolationMode(mode);
 }
 std::vector<SegmentationGrowthDirection> SegmentationWidget::allowedGrowthDirections() const { return _growthPanel->allowedGrowthDirections(); }
@@ -330,9 +339,15 @@ std::optional<std::pair<int, int>> SegmentationWidget::correctionsZRange() const
 
 void SegmentationWidget::setGrowthMethod(SegmentationGrowthMethod method)
 {
-    noteGrowthMethod(method);
+    if (_manualAddBusy) return;
     _growthPanel->setGrowthMethod(method);
 }
+void SegmentationWidget::setManualAddBusy(bool busy)
+{
+    _manualAddBusy = busy;
+    syncUiState();
+}
+
 void SegmentationWidget::setManualAddActive(bool active)
 {
     if (_manualAddActive == active) {
@@ -368,20 +383,13 @@ void SegmentationWidget::setCorrectionCollections(const QVector<QPair<uint64_t, 
     _correctionsPanel->syncUiState(_editingEnabled, _growthInProgress);
 }
 
-// --- Direction field delegations ---
-
-std::vector<SegmentationDirectionFieldConfig> SegmentationWidget::directionFieldConfigs() const
-{
-    return _directionFieldPanel->directionFieldConfigs();
-}
-
 // --- Custom params delegations ---
 
 QString SegmentationWidget::customParamsText() const { return _customParamsPanel->customParamsText(); }
 QString SegmentationWidget::customParamsProfile() const { return _customParamsPanel->customParamsProfile(); }
 bool SegmentationWidget::customParamsValid() const { return _customParamsPanel->customParamsValid(); }
 QString SegmentationWidget::customParamsError() const { return _customParamsPanel->customParamsError(); }
-utils::Json SegmentationWidget::customParamsJson() const { return _customParamsPanel->customParamsJson(); }
+nlohmann::json SegmentationWidget::customParamsJson() const { return _customParamsPanel->customParamsJson(); }
 
 // --- Neural tracer delegations ---
 

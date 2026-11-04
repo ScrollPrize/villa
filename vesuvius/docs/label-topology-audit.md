@@ -165,7 +165,7 @@ crops `--method close --closing-kernel 2` is the safer blind default (it filled
 | `largest_component_frac` | share of foreground in the biggest component |
 
 Betti numbers use the Euler characteristic (26-connected foreground, 6-connected
-background), via `vesuvius.image_proc.topology.component_betti`, which the CPU
+background), via `vesuvius.label_processing.topology.component_betti`, which the CPU
 path of `scripts/detect_holes.py` also uses. Thresholds (tiny 100, thick 7,
 piece 500, junction ratio 0.3) are heuristics.
 

@@ -1,6 +1,6 @@
 #include "agent_bridge/AgentBridgeServer.hpp"
 
-#include "vc/core/render/Colormaps.hpp"
+#include "Colormaps.hpp"
 
 namespace {
 
@@ -128,6 +128,23 @@ void AgentBridgeServer::registerViewerHandlers()
                 Params::optionalInteger(QStringLiteral("normalMaxArrows")),
                 Params::optionalBoolean(QStringLiteral("segmentationCursorMirroring")),
                 Params::optionalNumber(QStringLiteral("zScrollSensitivity")),
+                Params::optionalObject(
+                    QStringLiteral("composite"),
+                    {
+                        Params::optionalBoolean(QStringLiteral("enabled")),
+                        Params::optionalStringEnum(
+                            QStringLiteral("method"),
+                            {
+                                QStringLiteral("mean"),
+                                QStringLiteral("max"),
+                                QStringLiteral("min"),
+                                QStringLiteral("alpha"),
+                                QStringLiteral("beerLambert"),
+                                QStringLiteral("volumetric"),
+                            }),
+                        Params::optionalInteger(QStringLiteral("layersFront")),
+                        Params::optionalInteger(QStringLiteral("layersBehind")),
+                    }),
             },
             .errors = {-32602, -32010},
             .mcp = {

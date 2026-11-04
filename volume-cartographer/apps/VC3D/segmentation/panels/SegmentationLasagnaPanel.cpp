@@ -50,7 +50,7 @@
 #include <QToolButton>
 #include <QVBoxLayout>
 
-#include "utils/Json.hpp"
+#include <nlohmann/json.hpp>
 
 #include <algorithm>
 #include <cctype>
@@ -1920,21 +1920,21 @@ QString SegmentationLasagnaPanel::lasagnaConfigText() const
     return QString::fromUtf8(raw);
 }
 
-utils::Json SegmentationLasagnaPanel::lasagnaConfigJson() const
+nlohmann::json SegmentationLasagnaPanel::lasagnaConfigJson() const
 {
     QString text = lasagnaConfigText().trimmed();
-    if (text.isEmpty()) return utils::Json{};
+    if (text.isEmpty()) return nlohmann::json{};
 
     try {
         QByteArray utf8 = text.toUtf8();
-        utils::Json parsed = utils::Json::parse(
+        nlohmann::json parsed = nlohmann::json::parse(
             std::string_view(utf8.constData(), utf8.size()));
         if (parsed.is_object()) return parsed;
     } catch (const std::exception& e) {
         std::cerr << "[lasagna] ERROR: invalid config JSON: " << e.what() << std::endl;
     }
 
-    return utils::Json{};
+    return nlohmann::json{};
 }
 
 // ---------------------------------------------------------------------------

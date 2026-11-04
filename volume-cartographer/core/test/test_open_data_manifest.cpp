@@ -1,15 +1,20 @@
+#include "vc/lasagna/Catalog.hpp"
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
 #include <doctest/doctest.h>
 
-#include "OpenDataManifest.hpp"
+#include <vc_reader/zarr.hpp>
+#include "vc/core/util/NormalGridVolume.hpp"
+
+#include "OpenDataResourceSelection.hpp"
 #include "OpenDataLasagna.hpp"
 #include "OpenDataNormalGrids.hpp"
 #include "OpenDataSampleProject.hpp"
 #include "ProjectCreationDefaults.hpp"
 #include "VCSettings.hpp"
 #include "vc/core/types/VolumePkg.hpp"
+#include "support/LoopbackHttpServer.hpp"
 #include "support/TestProject.hpp"
-#include "vc/core/util/MemMap.hpp"
+#include "vc/core/util/AnonymousPages.hpp"
 #include "vc/core/util/QuadSurface.hpp"
 #include "vc/lasagna/Dataset.hpp"
 
@@ -280,7 +285,7 @@ TEST_CASE("OpenDataManifest parses Lasagna as a distinct typed artifact")
     REQUIRE(volume.shapeZYX.has_value());
     CHECK(*volume.shapeZYX == std::array<std::size_t, 3>{100, 200, 300});
 
-    REQUIRE(lasagnaArtifacts(volume) == std::vector<std::size_t>{0});
+    REQUIRE(vc::lasagna::catalogArtifacts(volume) == std::vector<std::size_t>{0});
     const auto& artifact = volume.artifacts.front();
     CHECK(artifact.url() == "https://example.test/lasagna/volume");
     CHECK(artifact.modelId == "model-7");
@@ -298,13 +303,13 @@ TEST_CASE("OpenDataManifest parses Lasagna as a distinct typed artifact")
         "ny":{"zarr":"ny.zarr","channels":["ny"]}
       }
     })");
-    CHECK(validateOpenDataLasagnaManifest(volume, artifact, inner) ==
-          OpenDataLasagnaDatasetKind::Normal);
+    CHECK(vc::lasagna::validateCatalogManifest(volume, artifact, inner) ==
+          vc::lasagna::CatalogDatasetKind::Normal);
 
     auto missingLevelVolume = volume;
     missingLevelVolume.artifacts.front().levelParameterPresent = false;
     missingLevelVolume.artifacts.front().sourceCoordinateLevel.reset();
-    CHECK(lasagnaArtifacts(missingLevelVolume).empty());
+    CHECK(vc::lasagna::catalogArtifacts(missingLevelVolume).empty());
 }
 
 TEST_CASE("Open-data fiber Lasagna accepts authoritative inner metadata")
@@ -349,7 +354,7 @@ TEST_CASE("Open-data fiber Lasagna accepts authoritative inner metadata")
   }
 })");
     const auto& volume = manifest.samples.front().volumes.front();
-    REQUIRE(lasagnaArtifacts(volume).size() == 1);
+    REQUIRE(vc::lasagna::catalogArtifacts(volume).size() == 1);
     const auto& artifact = volume.artifacts.front();
     CHECK_FALSE(artifact.lasagnaVersionPresent);
     CHECK_FALSE(artifact.sourceToBasePresent);
@@ -364,8 +369,8 @@ TEST_CASE("Open-data fiber Lasagna accepts authoritative inner metadata")
         "ny":{"zarr":"ny.zarr/3","scaledown":3,"channels":["ny"]}
       }
     })");
-    CHECK(validateOpenDataLasagnaManifest(volume, artifact, inner) ==
-          OpenDataLasagnaDatasetKind::FiberInference);
+    CHECK(vc::lasagna::validateCatalogManifest(volume, artifact, inner) ==
+          vc::lasagna::CatalogDatasetKind::FiberInference);
 }
 
 TEST_CASE("Open-data Lasagna still rejects incompatible inner metadata")
@@ -387,14 +392,14 @@ TEST_CASE("Open-data Lasagna still rejects incompatible inner metadata")
       }
     })");
     CHECK_THROWS_WITH_AS(
-        validateOpenDataLasagnaManifest(volume, artifact, wrongShape),
+        vc::lasagna::validateCatalogManifest(volume, artifact, wrongShape),
         doctest::Contains("base_shape_zyx"),
         std::runtime_error);
 
     volume.shapeZYX = std::array<std::size_t, 3>{100, 202, 300};
     artifact.lasagnaVersionPresent = true;
     CHECK_THROWS_WITH_AS(
-        validateOpenDataLasagnaManifest(volume, artifact, wrongShape),
+        vc::lasagna::validateCatalogManifest(volume, artifact, wrongShape),
         doctest::Contains("lasagna_version"),
         std::runtime_error);
 }
@@ -416,7 +421,7 @@ TEST_CASE("Open-data Lasagna attachment handles level artifacts independently")
     }
     sample.volumes.push_back(std::move(volume));
 
-    REQUIRE(lasagnaArtifacts(sample.volumes.front()) == std::vector<std::size_t>{0, 1});
+    REQUIRE(vc::lasagna::catalogArtifacts(sample.volumes.front()) == std::vector<std::size_t>{0, 1});
 
     OpenDataResourceSelection selection;
     selection.representations =
@@ -435,7 +440,7 @@ TEST_CASE("Open-data Lasagna attachment handles level artifacts independently")
 TEST_CASE("Open-data Lasagna resolution requires exact parent volume and dyadic level")
 {
     const auto root = std::filesystem::temp_directory_path() /
-        ("vc_open_data_lasagna_pairing_" + std::to_string(vc::memmap::pid()));
+        ("vc_open_data_lasagna_pairing_" + std::to_string(vc::pages::pid()));
     std::filesystem::remove_all(root);
     vc::project::LoadOptions options;
     options.catalog = lasagnaCatalog(
@@ -467,19 +472,18 @@ TEST_CASE("Open-data Lasagna resolution requires exact parent volume and dyadic 
 TEST_CASE("Manual project Lasagna resolution materializes a selected remote manifest")
 {
     const auto root = std::filesystem::temp_directory_path() /
-        ("vc_open_data_remote_manual_" + std::to_string(vc::memmap::pid()));
+        ("vc_open_data_remote_manual_" + std::to_string(vc::pages::pid()));
     std::filesystem::remove_all(root);
-    const std::string location =
-        "https://example.test/manual/data.lasagna.json";
-    int fetches = 0;
+    vc::test::LoopbackHttpServer server;
+    const auto served = root / "served";
+    std::filesystem::create_directories(served / "manual");
+    writeFile(served / "manual" / "data.lasagna.json", R"({"version":2,"groups":{
+        "nx":{"zarr":"nx.ome.zarr/4","scaledown":4,"channels":["nx"]}
+    }})");
+    server.serveDirectory(served);
+    const std::string location = server.url() + "/manual/data.lasagna.json";
     vc::lasagna::LasagnaDatasetOpenOptions openOptions;
     openOptions.remoteCacheRoot = root;
-    openOptions.remoteFileFetcher = [&](const std::string&, const std::filesystem::path& temporary) {
-        ++fetches;
-        std::ofstream(temporary) << R"({"version":2,"groups":{
-            "nx":{"zarr":"nx.ome.zarr/4","scaledown":4,"channels":["nx"]}
-        }})";
-    };
     const auto cached = vc::lasagna::LasagnaDataset::openLocation(
         location, openOptions);
 
@@ -509,18 +513,19 @@ TEST_CASE("Manual project Lasagna resolution materializes a selected remote mani
     REQUIRE(metricsDataset->manifest().groups.size() == 1);
     const auto& channel = metricsDataset->manifest().groups.front();
     CHECK(channel.isRemote());
-    CHECK(channel.remoteZarrBaseUrl == "https://example.test/manual");
-    CHECK(channel.remoteZarrKey == "nx.ome.zarr/4");
+    CHECK(channel.sourceLocation == server.url() + "/manual/nx.ome.zarr/4");
     CHECK(metricsDataset->manifest().workingToBaseScale == resolved->workingToBaseScale);
-    CHECK(fetches == 1);
-    qputenv("VC3D_CONFIG_DIR", previousConfigDir);
-    std::filesystem::remove_all(root);
+    CHECK(server.requestCount("/manual/data.lasagna.json") == 1);
+    if (previousConfigDir.isNull()) qunsetenv("VC3D_CONFIG_DIR");
+    else qputenv("VC3D_CONFIG_DIR", previousConfigDir);
+    // resolveLasagnaForView pinned the process-wide remote cache root to
+    // `root`; it stays so later cases in this process keep a writable root.
 }
 
 TEST_CASE("Open-data Lasagna derives and verifies coordinate scale from volume shape")
 {
     const auto root = std::filesystem::temp_directory_path() /
-        ("vc_open_data_lasagna_shape_" + std::to_string(vc::memmap::pid()));
+        ("vc_open_data_lasagna_shape_" + std::to_string(vc::pages::pid()));
     std::filesystem::remove_all(root);
     vc::project::LoadOptions options;
     options.catalog = lasagnaCatalog(R"({"vol-a": {"id": "vol-a", "data": [)" + publishedArtifact("zarr", "vol-a.zarr") +
@@ -618,7 +623,7 @@ TEST_CASE("Selected Lasagna does not implicitly attach scan views")
     CHECK(withScan->volumeEntries().front().location == source.resolvedUrl);
     // The L0 scan resolves the level-2 Lasagna directly.
     const auto root = std::filesystem::temp_directory_path() /
-        ("vc_open_data_selected_lasagna_" + std::to_string(vc::memmap::pid()));
+        ("vc_open_data_selected_lasagna_" + std::to_string(vc::pages::pid()));
     std::filesystem::remove_all(root);
     auto catalog = std::make_shared<vcr::catalog::OpenDataManifest>();
     catalog->samples = {sample};
@@ -710,17 +715,131 @@ TEST_CASE("OpenDataNormalGrids preserves distinct level artifacts and cache iden
     CHECK(infos[1].sourceCoordinateLevel == 2);
     CHECK(infos[1].artifactIndex == 1);
 
-    // Each level streams from its own cache entry.
+    // Each store streams from its own cache entry.
     const auto root = std::filesystem::temp_directory_path() /
-        ("vc_open_data_normal_grids_" + std::to_string(vc::memmap::pid()));
+        ("vc_open_data_normal_grids_" + std::to_string(vc::pages::pid()));
     std::filesystem::remove_all(root);
     auto pkg = vc::test::emptyProject();
     CHECK(attachOpenDataNormalGrids(*pkg, sample, root) == 2);
     const auto entries = pkg->normalGridEntries();
     REQUIRE(entries.size() == 2);
-    CHECK(entries[0].location.find("L0-") != std::string::npos);
-    CHECK(entries[1].location.find("L2-") != std::string::npos);
+    // At the URL's own place under the root, nothing beside it.
+    CHECK(entries[0].location == vcr::zarr::decodedCachePath(root, infos[0].url).string());
+    CHECK(entries[1].location == vcr::zarr::decodedCachePath(root, infos[1].url).string());
+
+    // The cache state counts the store's own files: grids and metadata, not the markers,
+    // not what the file cache has in flight, not markers an older VC3D left.
+    {
+        const auto dir = vcr::zarr::decodedCachePath(root, infos[0].url);
+        std::filesystem::create_directories(dir / "xy");
+        std::ofstream(dir / "metadata.json") << "{}";
+        std::ofstream(dir / "xy" / "000000.grid") << "0123456789";
+        std::ofstream(dir / "xy" / "000001.grid.tmp.123.456") << "abc";
+        std::ofstream(dir / "xy" / "000002.grid.missing").flush();
+        const auto state = normalGridsCacheState(root, sample.id, sample.volumes.front());
+        CHECK(state.hasArtifact);
+        CHECK_FALSE(state.complete);
+        CHECK(state.cachedFiles == 2);
+        CHECK(state.cachedBytes == 12);
+    }
+
+    // A store attached from another cache directory gives way to this one.
+    const auto other = root / "normal_grids" / "old";
+    REQUIRE(vc::core::util::writeNormalGridsRemoteMarker(other, infos[0].url));
+    pkg->addNormalGridEntry(other.string());
+    REQUIRE(pkg->normalGridEntries().size() == 3);
+    CHECK(attachOpenDataNormalGrids(*pkg, sample, root) == 2);
+    CHECK(pkg->normalGridEntries().size() == 2);
     std::filesystem::remove_all(root);
+}
+
+TEST_CASE("Normal grids download through the file cache: listing, signed objects, resume, completion")
+{
+    // A signed bucket on a loopback server, reached through the environment's keys and endpoint.
+    const auto scratch = std::filesystem::temp_directory_path() /
+        ("vc_open_data_grid_download_" + std::to_string(vc::pages::pid()));
+    std::filesystem::remove_all(scratch);
+    const auto bucket = scratch / "bucket", root = scratch / "cache";
+    for (const char* plane : {"xy", "xz", "yz"}) {
+        std::filesystem::create_directories(bucket / "ng" / plane);
+        for (int slice = 0; slice < 3; ++slice) {
+            char name[32];
+            std::snprintf(name, sizeof name, "%06d.grid", slice);
+            std::ofstream(bucket / "ng" / plane / name) << plane << slice << std::string(100, 'g');
+        }
+    }
+    std::ofstream(bucket / "ng" / "metadata.json") << R"({"sparse-volume": 1, "spiral-step": 20.0})";
+    std::filesystem::create_directories(bucket / "ng" / "empty-dir");
+    vc::test::LoopbackHttpServer server;
+    server.serveBucket("grids", bucket, true);
+    setenv("AWS_ACCESS_KEY_ID", "key", 1);
+    setenv("AWS_SECRET_ACCESS_KEY", "secret", 1);
+    setenv("AWS_REGION", "us-east-1", 1);
+    setenv("AWS_ENDPOINT_URL", server.url().c_str(), 1);
+    setenv("VC3D_CONFIG_DIR", (scratch / "config").c_str(), 1);
+    std::filesystem::create_directories(scratch / "config");
+    std::ofstream(scratch / "config" / "VC3D.ini") << "[perf]\nremote_cache_min_free_gib=0\n";
+
+    OpenDataNormalGridsInfo info;
+    info.sampleId = "sample";
+    info.volumeId = "volume";
+    info.url = "s3://grids/ng";
+    const auto finalDir = vcr::zarr::decodedCachePath(root, info.url);
+    std::filesystem::create_directories(finalDir / "xy");
+    std::ofstream(finalDir / "xy" / "000007.grid.missing").flush();  // unrelated existing artifact
+
+    // Cancelled after the first file: what was fetched stays, nothing is complete.
+    std::atomic<bool> cancel{false};
+    std::vector<std::string> statuses;
+    std::string error;
+    auto dir = downloadOpenDataNormalGrids(info, root, 2, [&](const NormalGridsDownloadProgress& p) {
+        if (statuses.empty() || statuses.back() != p.status) statuses.push_back(p.status);
+        if (p.completedFiles >= 1) cancel.store(true);
+    }, &cancel, &error);
+    CHECK(dir.empty());
+    CHECK(error == "cancelled");
+    CHECK(statuses == std::vector<std::string>{"listing", "downloading"});
+    CHECK_FALSE(std::filesystem::exists(finalDir / "normal-grids-complete.json"));
+    std::size_t fetched = 0;  // grids and metadata.json fetched before the cancel
+    for (const auto& entry : std::filesystem::recursive_directory_iterator(finalDir))
+        if (entry.is_regular_file() && (entry.path().extension() == ".grid" || entry.path().filename() == "metadata.json")) ++fetched;
+    CHECK(fetched >= 1);
+    CHECK(fetched < 10);
+
+    // The rerun lists again, fetches only what is missing, preserves artifacts and completes.
+    const auto requestsBefore = server.requests().size();
+    cancel.store(false);
+    NormalGridsDownloadProgress last;
+    dir = downloadOpenDataNormalGrids(info, root, 4, [&](const NormalGridsDownloadProgress& p) { last = p; }, &cancel, &error);
+    CHECK(dir == finalDir);
+    CHECK(last.totalFiles == 10);
+    CHECK(last.completedFiles == 10);
+    CHECK(last.failedFiles == 0);
+    std::uint64_t servedBytes = 0;
+    for (const auto& entry : std::filesystem::recursive_directory_iterator(bucket / "ng"))
+        if (entry.is_regular_file()) servedBytes += entry.file_size();
+    CHECK(last.totalBytes == servedBytes);
+    CHECK(last.completedBytes == servedBytes);
+    CHECK(std::filesystem::is_regular_file(finalDir / "normal-grids-complete.json"));
+    CHECK(std::filesystem::is_regular_file(finalDir / "yz" / "000002.grid"));
+    CHECK(std::filesystem::exists(finalDir / "xy" / "000007.grid.missing"));
+    CHECK(vc::core::util::normalGridsRemoteUrl(finalDir) == info.url);
+    std::size_t objectGets = 0;
+    for (const auto& request : server.requests()) {
+        CHECK(request.signedV4());
+        if (request.method == "GET" && request.path.ends_with(".grid")) ++objectGets;
+    }
+    CHECK(objectGets == 9);  // every grid once across both runs
+    CHECK(server.requests().size() > requestsBefore);
+    const auto state = normalGridsCacheState(root, info.sampleId, vcr::catalog::OpenDataVolume{});
+    CHECK_FALSE(state.hasArtifact);  // a volume without the artifact
+
+    // Complete: no request at all.
+    const auto requestsAfter = server.requests().size();
+    CHECK(downloadOpenDataNormalGrids(info, root, 4, {}, &cancel, &error) == finalDir);
+    CHECK(server.requests().size() == requestsAfter);
+    for (const char* name : {"AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_REGION", "AWS_ENDPOINT_URL"}) unsetenv(name);
+    std::filesystem::remove_all(scratch);
 }
 
 TEST_CASE("OpenDataManifest propagates catalog pixel size from volume properties or referenced scan")
@@ -776,44 +895,27 @@ TEST_CASE("OpenDataManifest propagates catalog pixel size from volume properties
 
     const auto* sample = manifest.findSample("sample-a");
     REQUIRE(sample != nullptr);
-    REQUIRE(sample->scans.size() == 1);
-    REQUIRE(sample->scans.front().pixelSizeUm.has_value());
-    CHECK(*sample->scans.front().pixelSizeUm == doctest::Approx(2.403));
-    REQUIRE(sample->volumes.size() == 2);
 
-    const auto byId = [&](const std::string& id) -> const vcr::catalog::OpenDataVolume* {
-        const auto it = std::find_if(
-            sample->volumes.begin(), sample->volumes.end(), [&](const vcr::catalog::OpenDataVolume& volume) {
-                return volume.id == id;
-            });
-        return it == sample->volumes.end() ? nullptr : &*it;
-    };
-
-    const auto* volumeWithProperties = byId("volume-with-properties");
-    REQUIRE(volumeWithProperties != nullptr);
-    REQUIRE(volumeWithProperties->pixelSizeUm.has_value());
-    CHECK(*volumeWithProperties->pixelSizeUm == doctest::Approx(7.91));
-    const auto* volumeFromScan = byId("volume-from-scan");
-    REQUIRE(volumeFromScan != nullptr);
-    REQUIRE(volumeFromScan->pixelSizeUm.has_value());
-    CHECK(*volumeFromScan->pixelSizeUm == doctest::Approx(2.403));
-
-    auto pkg = vc::test::emptyProject();
+    // Deferred: the catalog's URLs are not opened.
+    vc::project::LoadOptions deferred;
+    deferred.deferResolution = true;
+    auto pkg = vc::test::emptyProject(deferred);
     const auto result = attachOpenDataSampleVolumes(*pkg, *sample);
     CHECK(result.supportedVolumes == 2);
     REQUIRE(pkg->volumeEntries().size() == 2);
 
-    // The catalog names each entry when it opens, with the pixel size it states.
+    // The catalog names each entry when it opens; its pixel size reaches the volume through
+    // vcr::zarr::volumeMetadata, where the store's documents win.
     const auto metadataFor = [&](const std::string& id) {
         for (const auto& entry : pkg->volumeEntries()) {
             const auto metadata = vc::project::catalogVolumeMetadata(&manifest, entry.location);
-            if (metadata.contains("uuid") && metadata.at("uuid").get_string() == id) return metadata;
+            if (metadata.contains("uuid") && metadata.at("uuid").get<std::string>() == id) return metadata;
         }
         FAIL("no entry shows " << id);
-        return utils::Json::object();
+        return nlohmann::json::object();
     };
-    CHECK(metadataFor("volume-with-properties").at("voxelsize").get_double() == doctest::Approx(7.91));
-    CHECK(metadataFor("volume-from-scan").at("voxelsize").get_double() == doctest::Approx(2.403));
+    CHECK_FALSE(metadataFor("volume-with-properties").contains("voxelsize"));
+    CHECK(metadataFor("volume-from-scan").at("uuid").get<std::string>() == "volume-from-scan");
 }
 
 TEST_CASE("OpenDataSampleProject attaches all supported zarr artifacts for a catalog volume")
@@ -862,8 +964,8 @@ TEST_CASE("OpenDataSampleProject attaches all supported zarr artifacts for a cat
     const auto source = vc::project::catalogVolumeView(&catalog, pkg->volumeEntries()[0].location);
     REQUIRE(source);
     CHECK((source->volumeId == "scan-volume" && source->level == 0 && source->source));
-    CHECK(vc::project::catalogVolumeMetadata(&catalog, pkg->volumeEntries()[0].location).at("voxelsize").get_double() ==
-          doctest::Approx(7.91));
+    CHECK(vc::project::catalogVolumeMetadata(&catalog, pkg->volumeEntries()[0].location).at("uuid").get<std::string>() ==
+          "scan-volume");
     CHECK_FALSE(vc::project::catalogVolumeView(&catalog, pkg->volumeEntries()[1].location));
     CHECK_FALSE(vc::project::catalogVolumeView(&catalog, pkg->volumeEntries()[2].location));
     CHECK(std::any_of(
@@ -877,7 +979,10 @@ TEST_CASE("OpenDataSampleProject attaches all supported zarr artifacts for a cat
 TEST_CASE("Project creation defaults to the chosen directory, else VC3D's projects")
 {
     const auto root = std::filesystem::current_path() /
-        ("project_defaults_test_" + std::to_string(vc::memmap::pid()));
+        ("project_defaults_test_" + std::to_string(vc::pages::pid()));
+    // projectsDirectory() creates VC3D's AppData projects directory.
+    const QByteArray previousDataHome = qgetenv("XDG_DATA_HOME");
+    qputenv("XDG_DATA_HOME", QByteArray::fromStdString((root / "xdg-data").string()));
     {
         QSettings settings(QString::fromStdString((root / "settings.ini").string()), QSettings::IniFormat);
         CHECK(vc3d::defaultNewProjectDirectory(settings) == vc3d::projectsDirectory());
@@ -885,6 +990,8 @@ TEST_CASE("Project creation defaults to the chosen directory, else VC3D's projec
         settings.setValue(vc3d::settings::project::DEFAULT_PATH, "chosen-directory");
         CHECK(vc3d::defaultNewProjectDirectory(settings) == QStringLiteral("chosen-directory"));
     }
+    if (previousDataHome.isNull()) qunsetenv("XDG_DATA_HOME");
+    else qputenv("XDG_DATA_HOME", previousDataHome);
     std::filesystem::remove_all(root);
 }
 
@@ -974,7 +1081,7 @@ TEST_CASE("A sample's project file names its sample and references its store")
     auto manifest = vcr::catalog::parseOpenDataManifest(kFixture);
     const auto sample = *manifest.findSample("PHerc0139");
     const auto root = std::filesystem::current_path() /
-        ("selective_catalog_test_" + std::to_string(vc::memmap::pid()));
+        ("selective_catalog_test_" + std::to_string(vc::pages::pid()));
     std::filesystem::remove_all(root);
     vc::objects::OpenOptions options;
     options.author = "vc-test";
@@ -1035,7 +1142,9 @@ TEST_CASE("OpenDataSampleProject prefers the volume sourcing the most segments")
     sample.segments.push_back(segment("vol-b"));
     sample.segments.push_back(segment("vol-c"));
 
-    auto pkg = vc::test::emptyProject();
+    vc::project::LoadOptions deferred;
+    deferred.deferResolution = true;
+    auto pkg = vc::test::emptyProject(deferred);
     const auto result = attachOpenDataSampleVolumes(*pkg, sample);
 
     CHECK(result.supportedVolumes == 3);
@@ -1045,7 +1154,7 @@ TEST_CASE("OpenDataSampleProject prefers the volume sourcing the most segments")
     for (auto& derived : sample.segments)
         if (derived.originalVolumeId == "vol-b")
             derived.creation.derivedFrom = vcr::catalog::OpenDataReference{"volume", "vol-c"};
-    auto derivedPkg = vc::test::emptyProject();
+    auto derivedPkg = vc::test::emptyProject(deferred);
     CHECK(attachOpenDataSampleVolumes(*derivedPkg, sample).preferredVolumeId == "vol-c");
 }
 
@@ -1056,7 +1165,7 @@ TEST_CASE("Reopening a sample's project keeps what the user changed")
     sample.id = "Sample With Spaces";
 
     const auto root = std::filesystem::temp_directory_path() /
-                      ("vc_open_data_sample_project_test_" + std::to_string(vc::memmap::pid()));
+                      ("vc_open_data_sample_project_test_" + std::to_string(vc::pages::pid()));
     std::filesystem::remove_all(root);
     const auto path = sampleProjectPath(root, sample);
     CHECK(path == root / "open_data" / "Sample_With_Spaces.vcproj");

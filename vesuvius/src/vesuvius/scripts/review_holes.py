@@ -176,7 +176,7 @@ def export_training(data: Path, audit: Path, out: Path, dest: Path, half: int = 
 
 
 def render_hole(data: Path, audit: Path, crop: str, hole: dict, png: Path, half: int) -> Path:
-    from vesuvius.image_proc.run.label_topology_audit import hole_tiles
+    from vesuvius.label_processing.label_topology_audit import hole_tiles
 
     img = tifffile.imread(data / "images" / f"{crop}.tif").astype(np.float32)
     lab = tifffile.imread(data / "labels" / f"{crop}.tif")

@@ -5,7 +5,6 @@
   "strip_z_offset_step": 2.0,
   "seed": 0,
   "prefetch_workers": 16,
-  "prefetch_sampler_workers": 4,
   "loader_workers": 0,
   "augment_enabled": true,
   "augment_seed": 0,

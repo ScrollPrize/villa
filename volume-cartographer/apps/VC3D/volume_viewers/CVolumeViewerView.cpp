@@ -7,7 +7,6 @@
 #include <QPainter>
 #include <QPaintEvent>
 #include <QPolygonF>
-#include <QScrollBar>
 #include <cmath>
 #include <algorithm>
 #include "vc/core/util/PlaneSurface.hpp"
@@ -277,13 +276,12 @@ void CVolumeViewerView::drawScaleBar(QPainter* p) const
     // Recompute cached scalebar only when inputs change
     if (_cachedM11 != m11 || _cachedVpW != vpW ||
         _cachedVpH != vpH || _cachedVx != m_vx ||
-        _cachedPhysicalUnits != m_physicalUnits || _scalebarCacheDirty) {
+        _cachedPhysicalUnits != m_physicalUnits) {
         _cachedM11 = m11;
         _cachedVpW = vpW;
         _cachedVpH = vpH;
         _cachedVx = m_vx;
         _cachedPhysicalUnits = m_physicalUnits;
-        _scalebarCacheDirty = false;
 
         _cachedFont = p->font();
         _cachedFont.setPointSizeF(12);
@@ -330,7 +328,6 @@ void CVolumeViewerView::drawBackground(QPainter* painter, const QRectF& /*rect*/
 void CVolumeViewerView::paintEvent(QPaintEvent* event)
 {
     QGraphicsView::paintEvent(event);
-    emit paintCompleted();
 }
 
 void CVolumeViewerView::wheelEvent(QWheelEvent *event)
@@ -437,7 +434,6 @@ void CVolumeViewerView::mouseReleaseEvent(QMouseEvent *event)
         sendVolumeClicked(scene_loc, event->button(), event->modifiers());
         sendMouseRelease(scene_loc, event->button(), event->modifiers());
         
-        _left_button_pressed = false;
         event->accept();
         return;
     }
@@ -446,19 +442,17 @@ void CVolumeViewerView::mouseReleaseEvent(QMouseEvent *event)
 
 void CVolumeViewerView::keyPressEvent(QKeyEvent *event)
 {
-    if (_scrollPanDisabled) {
-        switch (event->key()) {
-        case Qt::Key_Escape:
-        case Qt::Key_Left:
-        case Qt::Key_Right:
-        case Qt::Key_Up:
-        case Qt::Key_Down:
-            emit sendKeyPress(event->key(), event->modifiers());
-            event->accept();
-            return;
-        default:
-            break;
-        }
+    switch (event->key()) {
+    case Qt::Key_Escape:
+    case Qt::Key_Left:
+    case Qt::Key_Right:
+    case Qt::Key_Up:
+    case Qt::Key_Down:
+        emit sendKeyPress(event->key(), event->modifiers());
+        event->accept();
+        return;
+    default:
+        break;
     }
 
     QGraphicsView::keyPressEvent(event);
@@ -542,7 +536,6 @@ void CVolumeViewerView::mousePressEvent(QMouseEvent *event)
         QPointF scene_loc = mapToScene({int(global_loc.x()),int(global_loc.y())});
         
         sendMousePress(scene_loc, event->button(), event->modifiers());
-        _left_button_pressed = true;
         event->accept();
         return;
     }
@@ -589,21 +582,8 @@ void CVolumeViewerView::mouseMoveEvent(QMouseEvent *event)
 
     if (_regular_pan)
     {
-        if (!_scrollPanDisabled) {
-            QPoint scroll = _last_pan_position - QPoint(event->position().x(), event->position().y());
-
-            int x = horizontalScrollBar()->value() + scroll.x();
-            horizontalScrollBar()->setValue(x);
-            int y = verticalScrollBar()->value() + scroll.y();
-            verticalScrollBar()->setValue(y);
-        }
-
         _last_pan_position = QPoint(event->position().x(), event->position().y());
         event->accept();
-
-        if (!_scrollPanDisabled) {
-            return;
-        }
     }
 
     QPointF global_loc = viewport()->mapFromGlobal(event->globalPosition());

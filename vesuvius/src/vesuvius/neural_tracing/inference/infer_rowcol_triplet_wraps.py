@@ -7,30 +7,21 @@ import tempfile
 from pathlib import Path
 
 import numpy as np
-from scipy import ndimage
 import torch
-import torch.nn.functional as F
+from vc_reader.torch import sample_array
+from vc_reader.resident import GridField
 from tqdm import tqdm
-
-try:
-    import vc
-except ImportError:  # vc ships with the monorepo-only volume-cartographer package (not on PyPI)
-    vc = None
-
-try:
-    import trimesh
-except Exception:  # pragma: no cover - optional dependency at runtime
-    trimesh = None
+from vc_reader.reader import open_group
 
 try:
     from numba import njit
 except Exception:  # pragma: no cover - optional dependency at runtime
     njit = None
 
-from vesuvius.neural_tracing.datasets.common import (
-    _read_volume_crop,
-    voxelize_surface_grid_masked,
-)
+import vc_reader.transforms as A
+
+_ZSCORE = A.Normalize("zscore", nonzero=False, eps=1e-8)
+from vesuvius.neural_tracing.datasets.common import voxelize_surface_grid_masked
 from vesuvius.neural_tracing.inference.displacement_tta import (
     TTA_MERGE_METHODS,
     TTA_TRANSFORM_MODES,
@@ -46,9 +37,9 @@ from vesuvius.neural_tracing.inference.generate_segment_cover_bboxes import (
     _serialize_bbox_record,
 )
 from vesuvius.neural_tracing.heatmap_single_point.tifxyz import get_area, save_tifxyz
-from vesuvius.tifxyz import read_tifxyz
+from vc_reader import tifxyz
 from vc_object_store import ObjectStore
-from vesuvius.tifxyz.store import create_surface, read_surface
+from vesuvius.neural_tracing.inference.surface_store import create_surface, read_surface
 
 _TTA_TRANSFORM_ALIASES = {
     "mirror+rot90": "rotate3",
@@ -72,8 +63,6 @@ _COPY_ARG_TO_CLI = {
     "checkpoint_path": "--checkpoint-path",
     "device": "--device",
     "volume_scale": "--volume-scale",
-    "volume_cache_dir": "--volume-cache-dir",
-    "volume_cache_retry_seconds": "--volume-cache-retry-seconds",
     "volume_chunk_cache_gb": "--volume-chunk-cache-gb",
     "compile_mode": "--compile-mode",
     "crop_size": "--crop-size",
@@ -103,165 +92,22 @@ _COPY_ARG_TO_CLI = {
 _DEFAULT_VOLUME_CHUNK_CACHE_GB = 20.0
 
 
-class _VcVolumeLevel:
-    """Small array adapter over vc.Volume for the crop reader used here."""
-
-    def __init__(self, volume, level):
-        self._volume = volume
-        self._level = int(level)
-        self.shape = tuple(int(v) for v in volume.shape_at(self._level))
-        self.dtype = np.dtype(volume.dtype)
-        self.chunks = tuple(int(v) for v in volume.chunk_shape(self._level))
-
-    def __getitem__(self, key):
-        if not isinstance(key, tuple) or len(key) != 3:
-            raise TypeError(f"vc volume reads require 3 ZYX slices, got {key!r}")
-        starts = []
-        stops = []
-        for axis, item in enumerate(key):
-            if not isinstance(item, slice):
-                raise TypeError(f"vc volume reads require slices, got axis {axis}: {item!r}")
-            step = 1 if item.step is None else int(item.step)
-            if step != 1:
-                raise ValueError(f"vc volume reads only support unit-step slices, got axis {axis} step={step}")
-            start = 0 if item.start is None else int(item.start)
-            stop = self.shape[axis] if item.stop is None else int(item.stop)
-            starts.append(start)
-            stops.append(stop)
-        read_shape = [stop - start for start, stop in zip(starts, stops)]
-        if any(v < 0 for v in read_shape):
-            raise ValueError(f"Invalid vc volume slice {key!r} for shape {self.shape}")
-        if any(v == 0 for v in read_shape):
-            return np.empty(tuple(read_shape), dtype=self.dtype)
-        return np.asarray(
-            self._volume.read_zyx(starts, read_shape, level=self._level, missing_policy="all_fill")
-        )
-
-
-class _ZarrVolume:
-    """zarr-python stand-in for the vc.Volume calls made here, used when vc is not installed.
-
-    Voxels outside the volume and missing chunks read as the array's fill_value (0 when it is
-    unset), where vc reads 0 outside the volume. missing_policy is accepted for call
-    compatibility only (in vc it is the policy for missing scale levels). It keeps no disk
-    cache: --volume-cache-dir and --volume-chunk-cache-gb are not used on this path.
-    """
-
-    def __init__(self, path):
-        import zarr
-
-        from vesuvius.neural_tracing.datasets.common import _make_remote_store
-        from vesuvius.neural_tracing.s3_utils import s3_storage_options_for_path
-
-        path = str(path)
-        if path.startswith(("http://", "https://", "s3://")):
-            store = _make_remote_store(
-                path, s3_storage_options_for_path(path), missing_exceptions=(KeyError, FileNotFoundError)
-            )
-        else:
-            store = path
-        node = zarr.open(store, mode="r")
-        self.single_array = not hasattr(node, "array_keys")
-        if self.single_array:
-            self._levels = {0: node}
-        else:
-            multiscales = node.attrs.get("multiscales") or [{}]
-            names = [str(d.get("path")) for d in multiscales[0].get("datasets", [])]
-            names = [n for n in names if n.isdigit()] or [k for k in node.array_keys() if str(k).isdigit()]
-            self._levels = {}
-            for name in names:
-                try:
-                    self._levels[int(name)] = node[str(name)]
-                except KeyError:  # listed in .zattrs but not in the store (a partial local copy)
-                    continue
-        if not self._levels:
-            raise RuntimeError(f"no zarr scale levels found at {path!r}")
-        self.dtype = np.dtype(self._levels[min(self._levels)].dtype)
-
-    def has_scale_level(self, level):
-        return int(level) in self._levels
-
-    def present_scale_levels(self):
-        return sorted(self._levels)
-
-    def shape_at(self, level):
-        return tuple(self._levels[int(level)].shape)
-
-    def chunk_shape(self, level):
-        return tuple(self._levels[int(level)].chunks)
-
-    def read_zyx(self, starts, shape, level=0, missing_policy="all_fill"):
-        array = self._levels[int(level)]
-        fill = 0 if array.fill_value is None else array.fill_value
-        starts = [int(v) for v in starts]
-        shape = [int(v) for v in shape]
-        out = np.full(shape, fill, dtype=self.dtype)
-        lo = [max(0, s) for s in starts]
-        hi = [min(int(n), s + d) for n, s, d in zip(array.shape, starts, shape)]
-        if all(h > l for l, h in zip(lo, hi)):
-            out[tuple(slice(l - s, h - s) for l, h, s in zip(lo, hi, starts))] = array[
-                tuple(slice(l, h) for l, h in zip(lo, hi))
-            ]
-        return out
-
-
-_ZARR_FALLBACK_NOTICE_SHOWN = False
-
-
-def _open_zarr_volume_level(volume_path, volume_scale):
-    """Open one OME-Zarr scale level with zarr-python (the path used when vc is not installed)."""
-    global _ZARR_FALLBACK_NOTICE_SHOWN
-    if not _ZARR_FALLBACK_NOTICE_SHOWN:
-        _ZARR_FALLBACK_NOTICE_SHOWN = True
-        print(
-            "vc (volume-cartographer) is not installed: reading the volume with zarr-python "
-            "(no chunk cache; --volume-cache-dir and --volume-chunk-cache-gb are ignored)",
-            file=sys.stderr,
-        )
-    volume = _ZarrVolume(volume_path)
-    target_level = int(volume_scale)
-    if volume.single_array:
-        return _VcVolumeLevel(volume, 0), target_level
-    if volume.has_scale_level(target_level):
-        level = target_level
-    else:
-        level = min(volume.present_scale_levels(), key=lambda v: abs(v - target_level))
-    return _VcVolumeLevel(volume, level), level
-
-
-def _open_vc_volume_level(volume_path, volume_scale, cache_dir, chunk_cache_gb):
+def _open_volume_level(volume_path, volume_scale, chunk_cache_gb):
+    """Open pyramid level ``volume_scale`` of the OME-Zarr at ``volume_path``, or the nearest existing level."""
     path = str(volume_path)
-    if vc is None:
-        return _open_zarr_volume_level(path, volume_scale)
-    cache_bytes = int(round(float(chunk_cache_gb) * (1024 ** 3)))
-    vc.set_chunk_cache_budget(cache_bytes)
-
+    remote = path.startswith(("http://", "https://", "s3://"))
+    # Remote chunks are cached under VC3D's remote cache root (viewer/remote_cache_dir).
+    group = open_group(
+        path,
+        cache_dir="vc3d" if remote else None,
+        memory_cache=int(round(float(chunk_cache_gb) * (1024 ** 3))),
+    )
+    levels = [int(v) for v in group.levels if v.isdigit()]
+    if not levels:
+        raise RuntimeError(f"volume {path!r} does not have any scale levels")
     target_level = int(volume_scale)
-    if path.startswith(("http://", "https://", "s3://")):
-        # Remote chunks are cached under VC3D's remote cache root (viewer/remote_cache_dir).
-        volume = vc.Volume.open_url(path)
-    else:
-        try:
-            volume = vc.Volume.open(path)
-        except RuntimeError as exc:
-            scale_path = Path(path) / str(target_level)
-            if not scale_path.exists():
-                raise
-            try:
-                volume = vc.Volume.open(str(scale_path))
-            except RuntimeError:
-                raise exc
-            return _VcVolumeLevel(volume, 0), target_level
-
-    if volume.has_scale_level(target_level):
-        level = target_level
-    else:
-        present_levels = [int(v) for v in volume.present_scale_levels()]
-        if not present_levels:
-            raise RuntimeError(f"vc volume {path!r} does not report any scale levels")
-        level = min(present_levels, key=lambda v: abs(v - target_level))
-
-    return _VcVolumeLevel(volume, level), level
+    level = target_level if target_level in levels else min(levels, key=lambda v: abs(v - target_level))
+    return group.array(str(level)), level
 
 
 def _empty_uv(dtype=np.int64):
@@ -361,38 +207,6 @@ def resolve_tifxyz_params(args, model_config, volume_scale, input_scale=None):
     return tifxyz_step_size, tifxyz_voxel_size_um, stored_scale_rc
 
 
-def _resolve_segment_volume(segment, volume_scale=None):
-    volume = segment.volume
-    if hasattr(volume, "read_zyx") and hasattr(volume, "shape_at"):
-        target_level = 0 if volume_scale is None else int(volume_scale)
-        return _VcVolumeLevel(volume, target_level)
-    if hasattr(volume, "keys") and not hasattr(volume, "shape"):
-        target_level = None
-        if volume_scale is not None:
-            target_level = int(volume_scale)
-        else:
-            extra = getattr(segment, "extra", None)
-            if isinstance(extra, dict):
-                for key in ("volume_scale", "vol_scale", "zarr_level", "volume_level", "level"):
-                    if key in extra:
-                        try:
-                            target_level = int(extra[key])
-                            break
-                        except (TypeError, ValueError):
-                            continue
-        if target_level is None:
-            target_level = 0
-        level_key = str(target_level)
-        if level_key in volume:
-            return volume[level_key]
-        numeric_levels = sorted([k for k in volume.keys() if k.isdigit()], key=int)
-        if numeric_levels:
-            level_ints = [int(k) for k in numeric_levels]
-            nearest = min(level_ints, key=lambda v: abs(v - target_level))
-            return volume[str(nearest)]
-    return volume
-
-
 def _bbox_to_min_corner_and_bounds_array(bbox):
     z_min, z_max, y_min, y_max, x_min, x_max = bbox
     min_corner = np.floor([z_min, y_min, x_min]).astype(np.int64)
@@ -419,17 +233,6 @@ def _as_displacement_tensor(disp):
     if disp_np.ndim != 4 or disp_np.shape[0] < 3:
         raise RuntimeError(f"Expected displacement array with shape [3+, D, H, W], got {tuple(disp_np.shape)}")
     return torch.from_numpy(disp_np[:3]).unsqueeze(0).contiguous()
-
-
-def _coords_local_to_grid(coords_t, d, h, w):
-    d_denom = max(int(d) - 1, 1)
-    h_denom = max(int(h) - 1, 1)
-    w_denom = max(int(w) - 1, 1)
-    coords_norm = coords_t.clone()
-    coords_norm[:, 0] = 2.0 * coords_norm[:, 0] / float(d_denom) - 1.0
-    coords_norm[:, 1] = 2.0 * coords_norm[:, 1] / float(h_denom) - 1.0
-    coords_norm[:, 2] = 2.0 * coords_norm[:, 2] / float(w_denom) - 1.0
-    return coords_norm[:, [2, 1, 0]].view(1, -1, 1, 1, 3)
 
 
 def _displacement_sample_offsets_rc(radius, spacing):
@@ -504,13 +307,7 @@ def _sample_displacement_at_local_coords_tensor(disp_t, coords_t):
     sampled_disp_t = torch.zeros((coords_t.shape[0], 3), dtype=disp_t.dtype, device=disp_t.device)
     if bool(valid_mask_t.any()):
         valid_coords_t = coords_t[valid_mask_t]
-        grid = _coords_local_to_grid(valid_coords_t, d=d, h=h, w=w)
-        sampled_valid_t = F.grid_sample(
-            disp_t,
-            grid,
-            mode="bilinear",
-            align_corners=True,
-        ).view(3, -1).permute(1, 0)
+        sampled_valid_t = sample_array(disp_t, valid_coords_t[None])[0].T
         sampled_disp_t[valid_mask_t] = sampled_valid_t
     return sampled_disp_t, valid_mask_t
 
@@ -556,36 +353,10 @@ def _sample_local_surface_coords_from_uv_tensor(uv_rc, local_zyx, query_uv_t):
     grid_np[rr, cc] = local_arr
     mask_np[rr, cc] = 1.0
 
-    value_t = torch.from_numpy(grid_np.transpose(2, 0, 1)).unsqueeze(0).contiguous()
-    mask_t = torch.from_numpy(mask_np).unsqueeze(0).unsqueeze(0).contiguous()
-    q_t = query_uv_t.to(dtype=torch.float32, device="cpu")
-    q_r = q_t[:, 0] - float(r_min)
-    q_c = q_t[:, 1] - float(c_min)
-    y_norm = (2.0 * q_r / float(max(h - 1, 1))) - 1.0
-    x_norm = (2.0 * q_c / float(max(w - 1, 1))) - 1.0
-    query_grid_t = torch.stack([x_norm, y_norm], dim=1).view(1, -1, 1, 2)
-    with torch.no_grad():
-        sampled_num_t = F.grid_sample(
-            value_t,
-            query_grid_t,
-            mode="bilinear",
-            padding_mode="zeros",
-            align_corners=True,
-        )
-        sampled_den_t = F.grid_sample(
-            mask_t,
-            query_grid_t,
-            mode="bilinear",
-            padding_mode="zeros",
-            align_corners=True,
-        )
-    sampled_num_t = sampled_num_t.view(3, -1).permute(1, 0).contiguous()
-    sampled_den_t = sampled_den_t.view(-1)
-    can_sample_t = sampled_den_t > 1e-6
-    sampled_coords_t = torch.zeros_like(sampled_num_t)
-    if bool(can_sample_t.any()):
-        sampled_coords_t[can_sample_t] = sampled_num_t[can_sample_t] / sampled_den_t[can_sample_t, None]
-    return sampled_coords_t, can_sample_t
+    field = GridField(grid_np, mask_np.astype(bool))
+    queries = query_uv_t.detach().cpu().numpy() - np.array([r_min, c_min], np.float32)
+    sampled, supported = field.sample(queries)
+    return torch.from_numpy(sampled), torch.from_numpy(supported)
 
 
 def _sample_trilinear_displacement_stack_tensor(
@@ -703,7 +474,7 @@ def _surface_to_stored_uv_samples_lattice(
     phase_c = int(phase_rc[1])
 
     empty_meta = {
-        "mode": "lattice_bilinear_torch",
+        "mode": "lattice_vc_reader",
         "stride_rc": [sub_r, sub_c],
         "phase_rc": [phase_r, phase_c],
         "n_full_valid": 0,
@@ -756,44 +527,8 @@ def _surface_to_stored_uv_samples_lattice(
     q_r = q_r[in_grid].astype(np.float32, copy=False)
     q_c = q_c[in_grid].astype(np.float32, copy=False)
 
-    denom_r = float(max(h - 1, 1))
-    denom_c = float(max(w - 1, 1))
-    value_np = np.where(support[..., None], grid, 0.0).astype(np.float32, copy=False)
-    value_t = torch.from_numpy(value_np.transpose(2, 0, 1)).unsqueeze(0).contiguous()
-    mask_t = torch.from_numpy(support.astype(np.float32, copy=False)).unsqueeze(0).unsqueeze(0).contiguous()
-
-    def _sample_world_and_mask(qr, qc):
-        y_norm = (2.0 * qr / denom_r) - 1.0
-        x_norm = (2.0 * qc / denom_c) - 1.0
-        query_grid = np.stack([x_norm, y_norm], axis=-1).astype(np.float32, copy=False)
-        query_t = torch.from_numpy(query_grid.reshape(1, -1, 1, 2)).contiguous()
-        with torch.no_grad():
-            sampled_num_t = F.grid_sample(
-                value_t,
-                query_t,
-                mode="bilinear",
-                padding_mode="zeros",
-                align_corners=True,
-            )
-            sampled_den_t = F.grid_sample(
-                mask_t,
-                query_t,
-                mode="bilinear",
-                padding_mode="zeros",
-                align_corners=True,
-            )
-        sampled_num = (
-            sampled_num_t[0, :, :, 0]
-            .permute(1, 0)
-            .cpu()
-            .numpy()
-            .astype(np.float32, copy=False)
-        )
-        sampled_den = sampled_den_t[0, 0, :, 0].cpu().numpy().astype(np.float32, copy=False)
-        return sampled_num, sampled_den
-
-    sampled_num, sampled_den = _sample_world_and_mask(q_r, q_c)
-    can_sample = sampled_den > 1e-6
+    field = GridField(grid, support)
+    sampled, can_sample = field.sample(np.stack((q_r, q_c), axis=-1))
     n_anchor_sampled = int(can_sample.sum())
     n_fallback_tried = 0
     n_fallback_recovered = 0
@@ -804,12 +539,10 @@ def _surface_to_stored_uv_samples_lattice(
         if n_fallback_tried > 0:
             q_r_fallback = (q_r[fallback_idx] + (0.5 * float(sub_r - 1))).astype(np.float32, copy=False)
             q_c_fallback = (q_c[fallback_idx] + (0.5 * float(sub_c - 1))).astype(np.float32, copy=False)
-            sampled_num_fb, sampled_den_fb = _sample_world_and_mask(q_r_fallback, q_c_fallback)
-            can_fb = sampled_den_fb > 1e-6
+            sampled_fb, can_fb = field.sample(np.stack((q_r_fallback, q_c_fallback), axis=-1))
             if bool(can_fb.any()):
                 recovered_idx = fallback_idx[can_fb]
-                sampled_num[recovered_idx] = sampled_num_fb[can_fb]
-                sampled_den[recovered_idx] = sampled_den_fb[can_fb]
+                sampled[recovered_idx] = sampled_fb[can_fb]
                 can_sample[recovered_idx] = True
                 n_fallback_recovered = int(can_fb.sum())
 
@@ -819,12 +552,10 @@ def _surface_to_stored_uv_samples_lattice(
         return _empty_uv_world(uv_dtype=np.int64, world_dtype=np.float32) + (meta,)
 
     uv_keep = uv_q[can_sample].astype(np.int64, copy=False)
-    pts_bilinear = (
-        sampled_num[can_sample] / sampled_den[can_sample, None]
-    ).astype(np.float32, copy=False)
+    points = sampled[can_sample]
 
     projection_meta = {
-        "mode": "lattice_bilinear_torch",
+        "mode": "lattice_vc_reader",
         "stride_rc": [sub_r, sub_c],
         "phase_rc": [phase_r, phase_c],
         "n_full_valid": n_full_valid,
@@ -833,7 +564,7 @@ def _surface_to_stored_uv_samples_lattice(
         "n_fallback_recovered": n_fallback_recovered,
         "n_stored_valid": int(uv_keep.shape[0]),
     }
-    return uv_keep, pts_bilinear, projection_meta
+    return uv_keep, points, projection_meta
 
 
 def parse_args(argv=None):
@@ -855,8 +586,6 @@ def parse_args(argv=None):
     parser.add_argument("--checkpoint-path", type=str, required=True)
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--volume-scale", type=int, default=0)
-    parser.add_argument("--volume-cache-dir", type=str, default="/tmp/vesuvius-volume-cache")
-    parser.add_argument("--volume-cache-retry-seconds", type=float, default=60.0)
     parser.add_argument("--volume-chunk-cache-gb", type=float, default=_DEFAULT_VOLUME_CHUNK_CACHE_GB)
     parser.add_argument("--compile", dest="compile_model", action="store_true", default=True)
     parser.add_argument("--no-compile", dest="compile_model", action="store_false")
@@ -999,8 +728,6 @@ def parse_args(argv=None):
         parser.error("--bbox-overlap must be finite and satisfy 0.0 <= overlap < 1.0")
     if args.crop_size is not None and any(v < 1 for v in args.crop_size):
         parser.error("--crop-size values must be >= 1")
-    if args.volume_cache_retry_seconds < 0.0:
-        parser.error("--volume-cache-retry-seconds must be >= 0")
     if args.volume_chunk_cache_gb < 0.0:
         parser.error("--volume-chunk-cache-gb must be >= 0")
     if args.displacement_scale is not None and not is_auto_displacement_scale(args.displacement_scale):
@@ -1112,19 +839,13 @@ def _canonicalize_tta_settings(args):
 
 
 def _load_input_grid(tifxyz_path, retarget_factor=1):
-    return _surface_grid(read_tifxyz(tifxyz_path), retarget_factor)
+    return _surface_grid(tifxyz.read(tifxyz_path), retarget_factor)
 
 
 def _surface_grid(surface, retarget_factor=1):
     if float(retarget_factor) != 1.0:
         surface = surface.retarget(float(retarget_factor))
-    surface.use_stored_resolution()
-    x_s, y_s, z_s, valid_s = surface[:]
-    grid = np.stack([z_s, y_s, x_s], axis=-1).astype(np.float32, copy=False)
-    valid = np.asarray(valid_s, dtype=bool) & np.isfinite(grid).all(axis=2)
-    grid = grid.copy()
-    grid[~valid] = -1.0
-    return surface, grid, valid
+    return surface, surface.xyz[..., ::-1].copy(), surface.valid
 
 
 def _generate_cover_bboxes_from_points(
@@ -1764,7 +1485,8 @@ def _merge_with_original(original_grid, original_valid, pred_grid, pred_valid):
     needs_fill = original_mask & ~support
     if bool(needs_fill.any()) and bool(support.any()):
         # Map each unresolved original-valid cell to its nearest predicted support cell in UV.
-        _, nearest_idx = ndimage.distance_transform_edt(~support, return_indices=True)
+        nearest_idx = A.DistanceTransform(mode="outside", indices="_nearest", implicit_background=True)(
+            {"mask": support[None]})["mask_nearest"]
         nearest_r = nearest_idx[0][needs_fill]
         nearest_c = nearest_idx[1][needs_fill]
         merged[needs_fill] = pred_arr[nearest_r, nearest_c]
@@ -1856,8 +1578,8 @@ def _prepare_bbox_item(record, crop_size, world_points, uv_points, volume_arr):
     local_sel = (world_sel - min_corner[None, :].astype(np.float32, copy=False)).astype(np.float32, copy=False)
 
     cond_vox = _voxelize_local_surface_from_uv_points(local_sel, uv_sel, crop_size).astype(np.float32, copy=False)
-    vol_crop = _read_volume_crop(volume_arr, crop_size, min_corner, max_corner)
-    vol_crop = vol_crop.astype(np.float32, copy=False)
+    vol_crop = volume_arr.read_region(min_corner, crop_size).astype(np.float32, copy=False)
+    vol_crop = _ZSCORE(vol_crop.reshape(1, 1, -1)).reshape(vol_crop.shape)
 
     return {
         "bbox_id": int(record.get("bbox_id", -1)),
@@ -2582,22 +2304,17 @@ def _cleanup_surface_grid_before_save(grid, valid, target_step_size):
     out = grid_arr.copy()
 
     cleanup_meta = {
-        "mesh_cleanup_enabled": bool(trimesh is not None),
         "mesh_cleanup_target_step": float(target_step_size),
         "mesh_cleanup_duplicate_vertices_fixed": 0,
         "mesh_cleanup_unique_edges": 0,
         "mesh_cleanup_relaxation_applied": False,
     }
 
-    if trimesh is None:
-        return out, cleanup_meta
-
     vr, vc = np.where(valid_mask)
     if vr.size < 3:
         return out, cleanup_meta
 
-    faces = _build_valid_grid_triangles(valid_mask)
-    if faces.shape[0] == 0:
+    if _build_valid_grid_triangles(valid_mask).shape[0] == 0:
         return out, cleanup_meta
 
     edges_unique = _build_valid_grid_edges(valid_mask)
@@ -2606,14 +2323,6 @@ def _cleanup_surface_grid_before_save(grid, valid, target_step_size):
 
     verts = out[vr, vc].astype(np.float64, copy=True)
     if not np.isfinite(verts).all():
-        return out, cleanup_meta
-
-    try:
-        mesh = trimesh.Trimesh(vertices=verts, faces=faces, process=False, validate=False)
-        mesh.update_faces(mesh.unique_faces())
-        mesh.update_faces(mesh.nondegenerate_faces())
-        mesh.remove_unreferenced_vertices()
-    except ValueError:
         return out, cleanup_meta
 
     cleanup_meta["mesh_cleanup_unique_edges"] = int(edges_unique.shape[0])
@@ -2894,7 +2603,7 @@ def run(args):
         args,
         model_config,
         args.volume_scale,
-        input_scale=surface.get_scale_tuple(),
+        input_scale=surface.scale,
     )
     volume_voxel_size_um = args.tifxyz_voxel_size_um
     if volume_voxel_size_um is None:
@@ -2919,15 +2628,14 @@ def run(args):
                 "Triplet wrap inference currently requires isotropic stored scale; "
                 f"got scale={stored_scale_rc!r} -> steps ({step_y}, {step_x})."
             )
-    volume_arr, resolved_volume_level = _open_vc_volume_level(
+    volume_arr, resolved_volume_level = _open_volume_level(
         args.volume_path,
         volume_scale=args.volume_scale,
-        cache_dir=args.volume_cache_dir,
         chunk_cache_gb=args.volume_chunk_cache_gb,
     )
     _log(
         args.verbose,
-        "resolved vc volume level "
+        "resolved volume level "
         f"shape={tuple(int(v) for v in volume_arr.shape)} "
         f"volume_scale={int(args.volume_scale)} "
         f"resolved_level={int(resolved_volume_level)} "
