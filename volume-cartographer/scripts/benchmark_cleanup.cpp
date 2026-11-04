@@ -11,7 +11,7 @@
 #include <vector>
 int main(int argc,char** argv){
  if(argc<2 || std::string(argv[1])!="spatial") for(int side:{32,128,512}) {
-  std::mt19937 rng(42);std::vector<float> weights(side*side);for(auto& w:weights)w=1+rng()%20;
+  std::mt19937 rng(42);std::vector<float> weights(std::size_t(side)*side);for(auto& w:weights)w=1+rng()%20;
   for(bool gpu:{false,true}) {
    std::vector<double> times;std::vector<uint32_t> path;
    for(int i=0;i<6;++i){auto start=std::chrono::steady_clock::now();
