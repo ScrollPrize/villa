@@ -29,8 +29,9 @@ from pathlib import Path
 
 import click
 import numpy as np
+import zarr
+from numcodecs import Zstd
 from tqdm import tqdm
-from vc_reader.reader import create_group, open_group
 
 
 LABEL_COUNT = 255
@@ -466,7 +467,7 @@ def _infer_shape(databases):
 
 
 def _reference_geometry(path, group_name):
-    root = open_group(path)
+    root = zarr.open_group(path, mode='r')
     if group_name not in root:
         raise click.UsageError(f'group {group_name!r} not found in reference {path}')
     array = root[group_name]
@@ -517,11 +518,12 @@ def _create_output(output_path, shape, chunk_edge, scale, unit, sources, paramet
     if resume and not exists:
         raise click.UsageError(f'--resume given but {output_path} does not exist')
 
-    root = create_group(output_path, version=2)
+    root = zarr.open_group(output_path, mode='a', zarr_format=2)
     if '0' not in root:
         root.create_array(
             '0', shape=shape, chunks=(chunk_edge,) * 3, dtype='uint8', fill_value=0,
-            compressor='zstd', level=3, separator='/',
+            compressors=Zstd(level=3),
+            chunk_key_encoding={'name': 'v2', 'separator': '/'},
         )
     array = root['0']
     if tuple(array.shape) != tuple(shape) or np.dtype(array.dtype) != np.dtype('uint8'):

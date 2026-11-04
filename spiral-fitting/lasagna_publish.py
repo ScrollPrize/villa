@@ -48,7 +48,6 @@ from urllib.parse import quote
 
 import numpy as np
 from PIL import Image
-from vc_reader import images, tifxyz
 import scipy.ndimage
 
 from surface_orientation import GridLayout
@@ -125,7 +124,8 @@ def _prepare_cleaned_lasagna_surface(surface_dir, destination,
     shape = None
     valid = None
     for name in ("x.tif", "y.tif", "z.tif"):
-        coordinate = images.read(surface_dir / name).astype(np.float32)
+        with Image.open(surface_dir / name) as image:
+            coordinate = np.asarray(image, dtype=np.float32)
         if coordinate.ndim != 2:
             raise RuntimeError(
                 f"Spiral preview {name} must be a two-dimensional TIFF")
@@ -134,6 +134,7 @@ def _prepare_cleaned_lasagna_surface(surface_dir, destination,
         elif coordinate.shape != shape:
             raise RuntimeError(
                 "Spiral preview coordinate TIFF dimensions do not match")
+        coordinate = coordinate.copy()
         coordinates.append(coordinate)
         coordinate_valid = coordinate != -1.0
         valid = (coordinate_valid if valid is None
@@ -154,7 +155,7 @@ def _prepare_cleaned_lasagna_surface(surface_dir, destination,
     shutil.copytree(surface_dir, destination)
     for coordinate, name in zip(coordinates, ("x.tif", "y.tif", "z.tif")):
         coordinate[~cleaned] = -1.0
-        images.write_tiff(destination / name, coordinate)
+        Image.fromarray(coordinate).save(destination / name)
 
     metadata_path = destination / "meta.json"
     metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
@@ -224,8 +225,16 @@ def _prepare_lasagna_surface_object(surface_dir, object_store):
 
 def _surface_xyz(surface_dir):
     """Load one TIFXYZ grid as HxWx3 float32 plus its validity mask."""
-    surface = tifxyz.read(surface_dir)
-    return surface.xyz, surface.valid
+    coordinates = []
+    for name in ("x.tif", "y.tif", "z.tif"):
+        with Image.open(Path(surface_dir) / name) as image:
+            coordinates.append(np.asarray(image, dtype=np.float32).copy())
+    if not coordinates or any(value.shape != coordinates[0].shape
+                              for value in coordinates[1:]):
+        raise RuntimeError("TIFXYZ coordinate TIFF dimensions do not match")
+    xyz = np.stack(coordinates, axis=-1)
+    valid = np.isfinite(xyz).all(axis=-1) & ~np.all(xyz == -1.0, axis=-1)
+    return xyz, valid
 
 
 def _validate_tifxyz_output_step(metadata, expected_step):
@@ -938,8 +947,9 @@ class LasagnaPublisher:
                 # OpenCV/Qt do not portably decode signed-int TIFF samples.
                 # IEEE float32 represents every supported winding id exactly
                 # and is converted back to int32 after validation in VC3D.
-                images.write_tiff(
-                    publish_root / winding_map_name, winding_ids.astype(np.float32))
+                Image.fromarray(
+                    winding_ids.astype(np.float32), mode="F").save(
+                    publish_root / winding_map_name)
 
                 self._stage(
                     "mapping", "Building preview run difference",

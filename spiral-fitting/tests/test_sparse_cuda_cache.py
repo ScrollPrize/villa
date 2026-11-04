@@ -7,7 +7,7 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 import torch
-from vc_reader.reader import ZarrWriter
+import zarr
 
 import lasagna_data
 from pack_resident_pools import _make_chunk_reader, pack_arrays, sidecar_path
@@ -16,9 +16,10 @@ from sparse_cuda_cache import ResidentBrickPool
 
 
 def write_array(path, data):
-    array = ZarrWriter.create(
-        path, shape=data.shape, chunks=(16, 16, 16), dtype='|u1',
-        compressor=None, fill_value=0, separator='/', overwrite=True, skip_empty=True,
+    array = zarr.open(
+        str(path), mode='w', shape=data.shape, chunks=(16, 16, 16),
+        dtype='|u1', compressor=None, fill_value=0, zarr_format=2,
+        dimension_separator='/',
     )
     array[:] = data
     return str(path)
@@ -256,9 +257,10 @@ def test_pack_ct_mask_zeroes_and_drops_bricks(tmp_path):
     # so only target voxels [0:16, 0:16, 0:16] survive the mask.
     ct = np.zeros((16, 16, 16), dtype=np.uint8)
     ct[:8, :8, :8] = 7
-    ZarrWriter.create(
-        tmp_path / 'ct' / '2', shape=ct.shape, chunks=(8, 8, 8), dtype='|u1',
-        compressor=None, fill_value=0, separator='.', skip_empty=True,
+    zarr.open(
+        str(tmp_path / 'ct' / '2'), mode='w', shape=ct.shape, chunks=(8, 8, 8),
+        dtype='|u1', compressor=None, fill_value=0, zarr_format=2,
+        dimension_separator='.',
     )[:] = ct
 
     masker = CtMasker(tmp_path / 'ct', '2', data.shape)

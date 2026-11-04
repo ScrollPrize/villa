@@ -876,7 +876,9 @@ Every option defaults to the configuration at the top of the script, which
 also holds the slab geometry, the size thresholds and `path_mode`. Its two
 paths are placeholders: the script stops with an error until they are set or
 passed as `--predictions` and `--out`. `--predictions` takes a local path or a
-URL such as `s3://...`, opened with `vc_reader`. The z
+URL such as `s3://...`, opened with `open_zarr` from `../vesuvius/src`; the GPU
+backend reads a local zarr v2 array in the layout of the surface predictions
+(uint8, blosc, `/` chunk keys) straight from its chunk files instead. The z
 range is half-open (`[z-min, z-max)`).
 
 Two backends write the same keys in the same format:
@@ -958,7 +960,8 @@ fixed and random graphs, check the backend selection and the command line
 without a GPU or Kimimaro, and run the CPU backend on a small synthetic volume
 when Kimimaro is installed. With Brook, CuPy, cuCIM and a GPU of compute
 capability 8.0 or newer, they also run the GPU backend on one GPU on two small
-synthetic zarr stores, of different chunk shapes and key separators, and compare the DBMs with the per-slab loop run with
+synthetic zarr stores, one read by the direct chunk reader and one through the
+fallback reader, and compare the DBMs with the per-slab loop run with
 `brook.skeletonize`.
 
 ## Packing large track databases
