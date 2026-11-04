@@ -250,14 +250,15 @@ Wire protocol (version 1, JSON unless noted):
 | Request | Answer |
 | --- | --- |
 | `GET /v1/status` | store, generation, commit sequence, feed start |
-| `PUT /v1/payloads/{sha256}` (bytes) | stages one payload until it expires |
+| `GET /v1/service` | the service's own state: connections, queue depths, staging use, unsent response bytes, WAL checkpoints |
+| `PUT /v1/payloads/{sha256}` (bytes, `Content-Length` required) | stages one payload until it expires; 400 hash/length mismatch, 411 no length, 413 too large, 507 staging full |
 | `POST /v1/transactions` (canonical request JSON) | receipt; 409 conflict; 422 `missing` payload hashes; 400 invalid |
 | `GET /v1/receipts/{request}` | saved receipt or 404 |
 | `GET /v1/changes?store&generation&sequence&offset&max` | feed page |
 | `GET /v1/objects/{uuid}` | current revision and the status of the same snapshot |
 | `GET /v1/objects/{uuid}/versions/{n}?store&generation` | that numbered revision or 404 |
 | `GET /v1/geometry/{revision}` | geometry descriptor (immutable) |
-| `GET /v1/geometry/{revision}/arrays/{name}?offset&count` | array bytes |
+| `GET /v1/geometry/{revision}/arrays/{name}?offset&count` | array bytes; 413 with `max_response_bytes` above the response limit |
 | `GET /v1/objects/{uuid}/history` | every recorded revision, or 404 |
 | `POST /v1/query/objects` (`selection`, `fields`) | one page of records; `limit` required, at most `maxQueryResults` |
 | `POST /v1/query/edges` (`selection`, `fields`) | one page of edges; same limit rule |
@@ -280,10 +281,44 @@ receipt when there is one. Otherwise it names the missing payloads, and the
 client uploads them again and resubmits the identical request. The in-process
 form is `ObjectStore::submit(requestJson, payloadLookup)`. Storage work never
 runs on network threads. Checked transactions go to one writer queue. Reads,
-feed pages and staging go to bounded read workers. Status and receipt checks
-have their own lane. A full queue answers 503, which clients retry.
-`ServerOptions` sets the queues, body, payload and staging limits, the staging
-lifetime, per-request deadlines, query page size and region budgets.
+feed pages and queries go to bounded read workers. Status and receipt checks
+have their own lane. A full queue answers 503 with `Retry-After`, which
+clients retry.
+
+Payload uploads stream to files in the staging directory (`<store>.staging`
+unless `ServerOptions::stagingDirectory` names another), one chunk at a time.
+A dedicated transfer lane writes and hashes each chunk, and the connection reads
+the next chunk only once the previous one is on disk. A slow disk therefore
+slows the sender instead of filling memory. An upload reserves its declared
+length up front. When staged plus reserved bytes would exceed `maxStagedBytes`,
+the server answers 507 instead of queueing the upload. A client that
+disconnects mid-upload leaves no partial file or reservation. Staging is not
+durable: the server removes payload files left by a previous run when it
+starts. Uploads are bounded in memory, but a transaction still loads its
+payloads into memory when it runs.
+
+A geometry array read is answered in one response of at most
+`maxResponseBytes`. `HostedStore::readGeometryArray` reads larger arrays as
+ranges within both its own `rangeBytes` and the server's limit. While unsent
+response bytes exceed `maxResponseBytesInFlight`, new array reads get 503.
+Together with the per-request deadline, this bounds the memory that slow
+receivers can hold.
+
+The writer lane also runs WAL upkeep between transactions. Every
+`checkpointInterval` it runs a passive checkpoint
+(`ObjectStore::checkpointWal`). When that copied everything and the WAL file is
+larger than `walTruncateBytes`, it truncates the WAL, waiting at most
+`truncateWait` for readers. A run of incomplete checkpoints means long-lived
+readers are holding old snapshots and the WAL is growing; the server logs it,
+and `/v1/service` reports it. SQLite's automatic checkpoints on commit still
+run.
+
+`ServerOptions` sets the queues, body, payload, staging and response limits,
+the staging lifetime and directory, per-request deadlines, checkpoint
+scheduling, query page size and region budgets. `test_object_store_hosted_limits`
+checks these bounds. It also measures status latency while four clients upload
+at once and submit latency for 2 and 4 concurrent writers, and it recovers a
+transaction whose client hung up before the reply.
 
 ## Relationships and graphs
 

@@ -5,6 +5,7 @@
 #include <nlohmann/json.hpp>
 #include <vc_reader/http.hpp>
 
+#include <algorithm>
 #include <stdexcept>
 
 namespace vc::objects {
@@ -29,7 +30,8 @@ struct HostedStore::Impl {
 };
 
 HostedStore::HostedStore(std::string endpoint, HostedStoreOptions options)
-    : endpoint_(std::move(endpoint)), impl_(std::make_unique<Impl>(options))
+    : endpoint_(std::move(endpoint)), rangeBytes_(std::max<int64_t>(options.rangeBytes, 1)),
+      impl_(std::make_unique<Impl>(options))
 {
     while (!endpoint_.empty() && endpoint_.back() == '/') endpoint_.pop_back();
     if (endpoint_.empty()) throw std::invalid_argument("hosted store: endpoint required");
@@ -53,6 +55,11 @@ const vcr::http::Response& expectOk(const vcr::http::Response& response, const s
 StoreStatus HostedStore::status()
 {
     return storeStatusFromJson(expectOk(impl_->http.request("GET", endpoint_ + "/v1/status"), "status").body);
+}
+
+std::string HostedStore::serviceReport()
+{
+    return expectOk(impl_->http.request("GET", endpoint_ + "/v1/service"), "service").body;
 }
 
 TransactionReceipt HostedStore::submit(const TransactionRequest& request)
@@ -131,9 +138,35 @@ std::optional<GeometryRevision> HostedStore::geometryRevision(const std::string&
 std::vector<uint8_t> HostedStore::readGeometryArray(const std::string& revisionUuid, const std::string& arrayName,
                                                     int64_t byteOffset, const std::optional<int64_t>& byteCount)
 {
-    auto url = endpoint_ + "/v1/geometry/" + revisionUuid + "/arrays/" + arrayName + "?offset=" + std::to_string(byteOffset);
-    if (byteCount) url += "&count=" + std::to_string(*byteCount);
-    const auto response = impl_->http.request("GET", url);
+    auto get = [&](int64_t offset, const std::optional<int64_t>& count) {
+        auto url = endpoint_ + "/v1/geometry/" + revisionUuid + "/arrays/" + arrayName + "?offset=" + std::to_string(offset);
+        if (count) url += "&count=" + std::to_string(*count);
+        return impl_->http.request("GET", url);
+    };
+    auto ranged = [&](int64_t total, int64_t range) {
+        std::vector<uint8_t> result;
+        result.reserve(static_cast<std::size_t>(total));
+        for (int64_t done = 0; done < total; done += range) {
+            const auto response = get(byteOffset + done, std::min(range, total - done));
+            const auto& body = expectOk(response, "geometry array").body;
+            result.insert(result.end(), body.begin(), body.end());
+        }
+        return result;
+    };
+    if (byteCount && *byteCount > rangeBytes_) return ranged(*byteCount, rangeBytes_);
+    const auto response = get(byteOffset, byteCount);
+    if (response.status == 413) {
+        // Larger than the server answers at once: read ranges it accepts.
+        int64_t serverMax = 0;
+        try { serverMax = Json::parse(response.body).value("max_response_bytes", int64_t(0)); } catch (const Json::exception&) {}
+        if (serverMax > 0) {
+            if (byteCount) return ranged(*byteCount, std::min(rangeBytes_, serverMax));
+            const auto revision = geometryRevision(revisionUuid);
+            if (!revision) throw std::invalid_argument("hosted store: no geometry revision " + revisionUuid);
+            for (const auto& info : revision->arrays)
+                if (info.name == arrayName) return ranged(info.byteLength - byteOffset, std::min(rangeBytes_, serverMax));
+        }
+    }
     const auto& body = expectOk(response, "geometry array").body;
     return {body.begin(), body.end()};
 }

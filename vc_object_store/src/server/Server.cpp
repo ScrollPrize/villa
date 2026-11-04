@@ -17,9 +17,12 @@
 #include <algorithm>
 #include <atomic>
 #include <condition_variable>
+#include <ctime>
 #include <deque>
+#include <fstream>
 #include <functional>
 #include <iostream>
+#include <limits>
 #include <map>
 #include <mutex>
 #include <optional>
@@ -52,6 +55,11 @@ public:
         }
         cv_.notify_one();
         return true;
+    }
+    std::size_t queued()
+    {
+        std::lock_guard lock(mutex_);
+        return queue_.size();
     }
     void stop()
     {
@@ -86,52 +94,6 @@ private:
     std::vector<std::thread> threads_;
 };
 
-// Uploaded payload bytes by SHA-256, until they expire. Staging is not
-// part of a request's identity: an expired payload is uploaded again.
-class Staging {
-public:
-    Staging(std::size_t limit, std::chrono::seconds lifetime) : limit_(limit), lifetime_(lifetime) {}
-    bool put(const std::string& hash, std::vector<uint8_t> bytes)
-    {
-        std::lock_guard lock(mutex_);
-        const auto now = Clock::now();
-        if (auto found = entries_.find(hash); found != entries_.end()) {
-            found->second.expires = now + lifetime_;
-            return true;
-        }
-        purge(now);
-        if (bytes.size() > limit_ - total_) return false;
-        total_ += bytes.size();
-        entries_.emplace(hash, Entry{std::move(bytes), now + lifetime_});
-        return true;
-    }
-    std::optional<std::vector<uint8_t>> get(const std::string& hash)
-    {
-        std::lock_guard lock(mutex_);
-        const auto found = entries_.find(hash);
-        if (found == entries_.end() || found->second.expires <= Clock::now()) return std::nullopt;
-        return found->second.bytes;
-    }
-private:
-    struct Entry {
-        std::vector<uint8_t> bytes;
-        Clock::time_point expires;
-    };
-    void purge(Clock::time_point now)
-    {
-        for (auto it = entries_.begin(); it != entries_.end();) {
-            if (it->second.expires <= now) {
-                total_ -= it->second.bytes.size();
-                it = entries_.erase(it);
-            } else ++it;
-        }
-    }
-    std::size_t limit_, total_ = 0;
-    std::chrono::seconds lifetime_;
-    std::mutex mutex_;
-    std::map<std::string, Entry> entries_;
-};
-
 struct Reply {
     http::status status = http::status::ok;
     std::string contentType = "application/json", body;
@@ -141,6 +103,171 @@ Reply jsonReply(std::string body, http::status status = http::status::ok) { retu
 Reply errorReply(http::status status, const std::string& message)
 {
     return jsonReply(Json{{"error", message}}.dump(), status);
+}
+
+// Uploaded payload files by SHA-256, until they expire. Staging is not part
+// of a request's identity: an expired payload is uploaded again. Uploads in
+// progress reserve their declared length so the total stays bounded. Files
+// get unique names, and a file is removed only when its last reader is done,
+// so expiry never deletes bytes a transaction is reading.
+class Staging {
+public:
+    Staging(std::filesystem::path directory, std::size_t limit, std::chrono::seconds lifetime)
+        : directory_(std::move(directory)), limit_(limit), lifetime_(lifetime)
+    {
+        std::filesystem::create_directories(directory_);
+        // Staging does not survive a restart: drop payload files a previous
+        // run left (names are "<sha256>.<n>" and "<sha256>.<n>.part").
+        for (const auto& entry : std::filesystem::directory_iterator(directory_)) {
+            const auto name = entry.path().filename().string();
+            if (entry.is_regular_file() && name.size() > 65 && name[64] == '.' && isHash(name.substr(0, 64)))
+                std::filesystem::remove(entry.path());
+        }
+    }
+
+    static bool isHash(std::string_view text)
+    {
+        return text.size() == 64 && std::all_of(text.begin(), text.end(), [](char c) {
+            return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f');
+        });
+    }
+
+    // One upload being written: removed (and its reservation released)
+    // unless finished into an entry.
+    class Upload {
+    public:
+        Upload(Staging& staging, std::string hash, std::size_t length, std::filesystem::path path)
+            : staging_(staging), hash_(std::move(hash)), length_(length), path_(std::move(path)) {}
+        ~Upload()
+        {
+            if (file_.is_open()) file_.close();
+            if (!finished_) {
+                std::error_code ignored;
+                std::filesystem::remove(path_, ignored);
+            }
+            staging_.release(length_);
+        }
+        // Transfer lane only.
+        void write(const char* data, std::size_t size)
+        {
+            if (!file_.is_open()) {
+                file_.open(path_, std::ios::binary | std::ios::trunc);
+                if (!file_) throw std::runtime_error("cannot create staging file " + path_.string());
+            }
+            hasher_.update(data, size);
+            file_.write(data, static_cast<std::streamsize>(size));
+            if (!file_) throw std::runtime_error("cannot write staging file " + path_.string());
+            written_ += size;
+        }
+        // Transfer lane only: verify and publish the staged bytes.
+        Reply finish();
+        const std::string& hash() const { return hash_; }
+    private:
+        Staging& staging_;
+        std::string hash_;
+        std::size_t length_, written_ = 0;
+        std::filesystem::path path_;
+        std::ofstream file_;
+        PayloadHasher hasher_;
+        bool finished_ = false;
+    };
+
+    // Room for `length` bytes, or nullptr when staging is full.
+    std::unique_ptr<Upload> begin(const std::string& hash, std::size_t length)
+    {
+        std::lock_guard lock(mutex_);
+        purge(Clock::now());
+        if (length > limit_ - std::min(limit_, total_ + reserved_)) return nullptr;
+        reserved_ += length;
+        const auto name = hash + "." + std::to_string(++counter_);
+        return std::make_unique<Upload>(*this, hash, length, directory_ / (name + ".part"));
+    }
+
+    std::optional<std::vector<uint8_t>> get(const std::string& hash)
+    {
+        std::shared_ptr<Entry> entry;
+        {
+            std::lock_guard lock(mutex_);
+            const auto found = entries_.find(hash);
+            if (found == entries_.end() || found->second->expires <= Clock::now()) return std::nullopt;
+            entry = found->second;
+        }
+        std::ifstream in(entry->path, std::ios::binary);
+        std::vector<uint8_t> bytes(entry->size);
+        if (!in.read(reinterpret_cast<char*>(bytes.data()), static_cast<std::streamsize>(bytes.size())))
+            throw std::runtime_error("cannot read staged payload " + hash);
+        return bytes;
+    }
+
+    Json report()
+    {
+        std::lock_guard lock(mutex_);
+        return {{"directory", directory_.string()}, {"payloads", entries_.size()}, {"staged_bytes", total_},
+                {"reserved_bytes", reserved_}, {"limit_bytes", limit_}};
+    }
+
+private:
+    struct Entry {
+        Entry() = default;
+        Entry(const Entry&) = delete;
+        Entry& operator=(const Entry&) = delete;
+        std::filesystem::path path;
+        std::size_t size = 0;
+        Clock::time_point expires;
+        ~Entry()
+        {
+            std::error_code ignored;
+            std::filesystem::remove(path, ignored);
+        }
+    };
+    void release(std::size_t length)
+    {
+        std::lock_guard lock(mutex_);
+        reserved_ -= length;
+    }
+    // The upload's file becomes the entry for its hash (or refreshes it).
+    void publish(const std::string& hash, const std::filesystem::path& part, std::size_t size)
+    {
+        auto final = part;
+        final.replace_extension();  // drop ".part"
+        std::filesystem::rename(part, final);
+        auto entry = std::make_shared<Entry>();
+        entry->path = final;
+        entry->size = size;
+        entry->expires = Clock::now() + lifetime_;
+        std::lock_guard lock(mutex_);
+        auto& slot = entries_[hash];
+        if (slot) total_ -= slot->size;
+        slot = std::move(entry);  // a replaced file goes once its readers finish
+        total_ += size;
+    }
+    void purge(Clock::time_point now)
+    {
+        for (auto it = entries_.begin(); it != entries_.end();) {
+            if (it->second->expires <= now) {
+                total_ -= it->second->size;
+                it = entries_.erase(it);
+            } else ++it;
+        }
+    }
+    std::filesystem::path directory_;
+    std::size_t limit_, total_ = 0, reserved_ = 0;
+    uint64_t counter_ = 0;
+    std::chrono::seconds lifetime_;
+    std::mutex mutex_;
+    std::map<std::string, std::shared_ptr<Entry>> entries_;
+};
+
+Reply Staging::Upload::finish()
+{
+    if (!file_.is_open()) write(nullptr, 0);  // an empty payload still gets a file
+    file_.close();
+    if (!file_) throw std::runtime_error("cannot write staging file " + path_.string());
+    if (written_ != length_) return errorReply(http::status::bad_request, "payload shorter than its Content-Length");
+    if (hasher_.finish() != hash_) return errorReply(http::status::bad_request, "payload does not match its SHA-256");
+    staging_.publish(hash_, path_, written_);
+    finished_ = true;
+    return jsonReply(Json{{"sha256", hash_}, {"length", written_}}.dump());
 }
 
 // Path segments and query parameters of a request target (no percent-escapes:
@@ -197,28 +324,65 @@ std::string uuidSegment(const std::string& text)
 
 using Request = http::request<http::string_body>;
 
+std::filesystem::path stagingDirectory(const std::filesystem::path& store, const ServerOptions& options)
+{
+    return options.stagingDirectory.empty() ? std::filesystem::path(store.string() + ".staging") : options.stagingDirectory;
+}
+
+// What the last scheduled WAL checkpoints did (writer lane writes, control reads).
+struct WalUpkeep {
+    std::mutex mutex;
+    std::optional<ObjectStore::WalCheckpoint> last;
+    std::string lastAt;
+    int64_t checkpoints = 0, truncations = 0, incompleteStreak = 0;
+    bool reported = false;  // the current incomplete streak was logged
+};
+
+std::string utcNow()
+{
+    const auto now = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
+    std::tm tm{};
+#if defined(_WIN32)
+    gmtime_s(&tm, &now);
+#else
+    gmtime_r(&now, &tm);
+#endif
+    char text[32];
+    std::strftime(text, sizeof text, "%Y-%m-%dT%H:%M:%SZ", &tm);
+    return text;
+}
+
 struct ServerState {
     ServerOptions options;
     std::optional<ObjectStore> store;
     Staging staging;
-    // Before io: connections still queued in io decrement it as io is destroyed.
-    std::atomic<std::size_t> connections{0};
+    // Before io: connections still queued in io decrement them as io is destroyed.
+    std::atomic<std::size_t> connections{0}, responseBytes{0};
+    WalUpkeep wal;
     net::io_context io;
     tcp::acceptor acceptor;
-    std::unique_ptr<Lane> writer, readers, control;
+    std::unique_ptr<Lane> writer, readers, control, transfers;
     std::vector<std::thread> network;
+    std::thread checkpointer;
     std::mutex runMutex;
     std::condition_variable runCv;
     bool started = false, stopped = false, stopRequested = false;
 
-    ServerState(const std::filesystem::path& path, ServerOptions o)
-        : options(std::move(o)), staging(options.maxStagedBytes, options.stagingLifetime), acceptor(io)
+    // The store opens (and takes service ownership) before staging is
+    // touched: a second service refused ownership leaves the first's files.
+    static ObjectStore openOwned(const std::filesystem::path& path, const ServerOptions& options)
     {
         OpenOptions open;
         open.author = options.author;
         open.serviceOwner = true;
         open.readerPoolSize = options.readWorkers + 2; // workers, control, writer-side receipt reads
-        store.emplace(ObjectStore::open(path, open));
+        return ObjectStore::open(path, open);
+    }
+
+    ServerState(const std::filesystem::path& path, ServerOptions o)
+        : options(std::move(o)), store(openOwned(path, options)),
+          staging(stagingDirectory(path, options), options.maxStagedBytes, options.stagingLifetime), acceptor(io)
+    {
         const tcp::endpoint endpoint(net::ip::make_address(options.listenAddress), options.port);
         acceptor.open(endpoint.protocol());
         acceptor.set_option(net::socket_base::reuse_address(true));
@@ -242,13 +406,52 @@ struct ServerState {
         return jsonReply(transactionReceiptToJson(*saved));
     }
 
-    Reply stage(const std::string& hash, const std::string& body)
+    // The service's own state; no database access.
+    Reply service()
     {
-        std::vector<uint8_t> bytes(body.begin(), body.end());
-        if (payloadHash(bytes) != hash) return errorReply(http::status::bad_request, "payload does not match its SHA-256");
-        if (!staging.put(hash, std::move(bytes)))
-            return errorReply(http::status::insufficient_storage, "payload staging is full; retry later");
-        return jsonReply(Json{{"sha256", hash}, {"length", body.size()}}.dump());
+        Json walJson{{"checkpoint_interval_ms", options.checkpointInterval.count()}};
+        {
+            std::lock_guard lock(wal.mutex);
+            walJson["checkpoints"] = wal.checkpoints;
+            walJson["truncations"] = wal.truncations;
+            walJson["incomplete_streak"] = wal.incompleteStreak;
+            if (wal.last)
+                walJson["last"] = {{"at", wal.lastAt}, {"log_frames", wal.last->logFrames},
+                                   {"checkpointed_frames", wal.last->checkpointedFrames}, {"busy", wal.last->busy},
+                                   {"wal_bytes", wal.last->walBytes}};
+        }
+        return jsonReply(Json{
+            {"connections", connections.load()}, {"max_connections", options.maxConnections},
+            {"queues", {{"writer", writer->queued()}, {"read", readers->queued()}, {"control", control->queued()},
+                        {"transfer", transfers->queued()}}},
+            {"response_bytes_in_flight", responseBytes.load()},
+            {"staging", staging.report()}, {"wal", walJson}}.dump());
+    }
+
+    // Writer lane: one scheduled checkpoint between transactions.
+    void upkeepWal()
+    {
+        auto result = store->checkpointWal(ObjectStore::WalCheckpointMode::Passive);
+        bool truncated = false;
+        if (result.complete() && result.walBytes > options.walTruncateBytes) {
+            result = store->checkpointWal(ObjectStore::WalCheckpointMode::Truncate, options.truncateWait);
+            truncated = !result.busy;
+        }
+        std::lock_guard lock(wal.mutex);
+        ++wal.checkpoints;
+        wal.truncations += truncated;
+        wal.last = result;
+        wal.lastAt = utcNow();
+        if (result.complete()) {
+            wal.incompleteStreak = 0;
+            wal.reported = false;
+        } else if (++wal.incompleteStreak >= 6 && !wal.reported) {
+            // Long-lived readers keep the WAL from being copied back: it grows.
+            wal.reported = true;
+            std::cerr << "vc_object_server: WAL checkpoints incomplete " << wal.incompleteStreak << " times in a row ("
+                      << result.checkpointedFrames << "/" << result.logFrames << " frames, " << result.walBytes
+                      << " bytes); long-lived readers are holding old snapshots\n";
+        }
     }
 
     Reply submit(const std::string& body)
@@ -301,11 +504,17 @@ struct ServerState {
         const auto offset = target.integer("offset", 0);
         std::optional<int64_t> count;
         if (target.query.contains("count")) count = target.integer("count");
-        if (count && *count > int64_t(options.maxPayloadBytes))
-            return errorReply(http::status::payload_too_large, "geometry read exceeds the response limit; read ranges");
         auto txn = store->read();
         const auto revision = store->geometryRevision(txn, uuidSegment(revisionUuid));
         if (!revision) return errorReply(http::status::not_found, "no geometry revision " + revisionUuid);
+        const auto info = std::find_if(revision->arrays.begin(), revision->arrays.end(),
+                                       [&](const GeometryArrayInfo& a) { return a.name == array; });
+        const auto size = count ? *count : info == revision->arrays.end() ? 0 : info->byteLength - offset;
+        if (size > int64_t(options.maxResponseBytes))
+            return jsonReply(Json{{"error", "geometry read exceeds the response limit of " +
+                                            std::to_string(options.maxResponseBytes) + " bytes; read ranges"},
+                                  {"max_response_bytes", options.maxResponseBytes}}.dump(),
+                             http::status::payload_too_large);
         const auto bytes = store->readGeometryArray(txn, revision->uuid, array, offset, count);
         return {http::status::ok, "application/octet-stream", std::string(bytes.begin(), bytes.end())};
     }
@@ -374,6 +583,7 @@ struct ServerState {
     struct Route {
         Lane* lane = nullptr;
         std::function<Reply()> work;
+        bool busy = false;
     };
 
     Route route(const Request& request)
@@ -393,10 +603,9 @@ struct ServerState {
             return true;
         };
         if (method == http::verb::get && is({"v1", "status"})) return {control.get(), [this] { return status(); }};
+        if (method == http::verb::get && is({"v1", "service"})) return {control.get(), [this] { return service(); }};
         if (method == http::verb::get && is({"v1", "receipts", "*"}))
             return {control.get(), [this, target] { return receipt(target->path[2]); }};
-        if (method == http::verb::put && is({"v1", "payloads", "*"}))
-            return {readers.get(), [this, target, body] { return stage(target->path[2], *body); }};
         if (method == http::verb::post && is({"v1", "transactions"}))
             return {writer.get(), [this, body] { return submit(*body); }};
         if (method == http::verb::get && is({"v1", "changes"}))
@@ -419,8 +628,12 @@ struct ServerState {
             return {readers.get(), [this, body] { return queryNearestSurfaces(*body); }};
         if (method == http::verb::get && is({"v1", "geometry", "*"}))
             return {readers.get(), [this, target] { return geometry(target->path[2]); }};
-        if (method == http::verb::get && is({"v1", "geometry", "*", "arrays", "*"}))
+        if (method == http::verb::get && is({"v1", "geometry", "*", "arrays", "*"})) {
+            // Bounded download memory: unsent replies stay below the limit
+            // (plus the replies being produced, each maxResponseBytes at most).
+            if (responseBytes.load() > options.maxResponseBytesInFlight) return {nullptr, nullptr, true};
             return {readers.get(), [this, target] { return geometryArray(target->path[2], target->path[4], *target); }};
+        }
         return {};
     }
 
@@ -455,6 +668,10 @@ struct ServerState {
             done(errorReply(http::status::bad_request, e.what()));
             return;
         }
+        if (r.busy) {
+            done(errorReply(http::status::service_unavailable, "server busy; retry"));
+            return;
+        }
         if (!r.lane) {
             done(errorReply(http::status::not_found, "unknown endpoint"));
             return;
@@ -463,12 +680,32 @@ struct ServerState {
         if (!r.lane->tryPost(job)) done(errorReply(http::status::service_unavailable, "server busy; retry"));
     }
 
-    std::size_t bodyLimit(const Request& header) const
+    // The payload hash of a staging upload ("PUT /v1/payloads/<sha256>").
+    static std::optional<std::string> uploadHash(const http::request_header<>& header)
     {
+        if (header.method() != http::verb::put) return std::nullopt;
         const auto raw = header.target();
-        const std::string_view target(raw.data(), raw.size());
-        return header.method() == http::verb::put && target.starts_with("/v1/payloads/") ? options.maxPayloadBytes
-                                                                                         : options.maxCommandBytes;
+        const auto target = parseTarget(std::string_view(raw.data(), raw.size()));
+        if (target.path.size() != 3 || target.path[0] != "v1" || target.path[1] != "payloads") return std::nullopt;
+        return target.path[2];
+    }
+
+    void scheduleCheckpoints()
+    {
+        if (options.checkpointInterval.count() <= 0) return;
+        checkpointer = std::thread([this] {
+            std::unique_lock lock(runMutex);
+            while (!runCv.wait_for(lock, options.checkpointInterval, [this] { return stopped; })) {
+                // A full writer queue skips this round; transactions come first.
+                writer->tryPost([this] {
+                    try {
+                        upkeepWal();
+                    } catch (const std::exception& e) {
+                        std::cerr << "vc_object_server: WAL checkpoint failed: " << e.what() << "\n";
+                    }
+                });
+            }
+        });
     }
 
     void accept();
@@ -482,46 +719,129 @@ public:
 private:
     void readHeader()
     {
-        parser_.emplace();
-        parser_->header_limit(64 * 1024);
+        header_.emplace();
+        header_->header_limit(64 * 1024);
+        // Body limits depend on the request; they are set once the header names it.
+        header_->body_limit(std::numeric_limits<std::uint64_t>::max());
         stream_.expires_after(server_.options.requestDeadline);
-        http::async_read_header(stream_, buffer_, *parser_,
+        http::async_read_header(stream_, buffer_, *header_,
             [self = shared_from_this()](beast::error_code ec, std::size_t) { self->onHeader(ec); });
     }
     void onHeader(beast::error_code ec)
     {
         if (ec) return close();
-        parser_->body_limit(server_.bodyLimit(parser_->get()));
-        http::async_read(stream_, buffer_, *parser_,
-            [self = shared_from_this()](beast::error_code ec, std::size_t) { self->onBody(ec); });
+        keepAlive_ = header_->get().keep_alive();
+        version_ = header_->get().version();
+        if (const auto hash = ServerState::uploadHash(header_->get())) return startUpload(*hash);
+        command_.emplace(std::move(*header_));
+        command_->body_limit(server_.options.maxCommandBytes);
+        http::async_read(stream_, buffer_, *command_,
+            [self = shared_from_this()](beast::error_code ec, std::size_t) { self->onCommand(ec); });
     }
-    void onBody(beast::error_code ec)
+    void onCommand(beast::error_code ec)
     {
-        if (ec == http::error::body_limit) {
-            keepAlive_ = false;
-            return write(errorReply(http::status::payload_too_large, "request body exceeds the server limit"));
-        }
+        if (ec == http::error::body_limit) return refuse(http::status::payload_too_large, "request body exceeds the server limit");
         if (ec) return close();
-        auto request = parser_->release();
-        keepAlive_ = request.keep_alive();
-        version_ = request.version();
+        auto request = command_->release();
+        command_.reset();
         // Wait for the reply before reading on: one request at a time per connection.
         stream_.expires_never();
         server_.dispatch(request, [self = shared_from_this()](Reply reply) {
             net::post(self->stream_.get_executor(), [self, reply = std::move(reply)]() mutable { self->write(std::move(reply)); });
         });
     }
+
+    // ---- Payload uploads: streamed to a staging file in bounded chunks. ----
+
+    void startUpload(const std::string& hash)
+    {
+        if (!Staging::isHash(hash)) return refuse(http::status::bad_request, "payload name is not a lowercase SHA-256");
+        const auto length = header_->content_length();
+        if (!length) return refuse(http::status::length_required, "payload uploads need a Content-Length");
+        if (*length > server_.options.maxPayloadBytes)
+            return refuse(http::status::payload_too_large, "payload exceeds the server limit of " +
+                          std::to_string(server_.options.maxPayloadBytes) + " bytes");
+        upload_ = server_.staging.begin(hash, static_cast<std::size_t>(*length));
+        if (!upload_) return refuse(http::status::insufficient_storage, "payload staging is full; retry later");
+        body_.emplace(std::move(*header_));
+        body_->body_limit(*length);
+        chunk_.resize(std::max<std::size_t>(server_.options.uploadChunkBytes, 4096));
+        if (body_->is_done()) {  // empty payload: nothing to read
+            body_->get().body().size = chunk_.size();
+            return onChunk({});
+        }
+        readChunk();
+    }
+    void readChunk()
+    {
+        auto& body = body_->get().body();
+        body.data = chunk_.data();
+        body.size = chunk_.size();
+        stream_.expires_after(server_.options.requestDeadline);
+        http::async_read_some(stream_, buffer_, *body_,
+            [self = shared_from_this()](beast::error_code ec, std::size_t) { self->onChunk(ec); });
+    }
+    void onChunk(beast::error_code ec)
+    {
+        if (ec == http::error::need_buffer) ec = {};
+        if (ec) {
+            upload_.reset();  // removes the partial file and its reservation
+            return close();
+        }
+        const auto used = chunk_.size() - body_->get().body().size;
+        const bool done = body_->is_done();
+        if (!used && !done) return readChunk();
+        // File I/O and hashing run on the transfer lane; the next chunk is
+        // read only after this one is written, so a slow disk slows the sender.
+        stream_.expires_never();
+        auto job = [self = shared_from_this(), used, done] {
+            std::optional<Reply> reply;
+            try {
+                self->upload_->write(self->chunk_.data(), used);
+                if (done) reply = self->upload_->finish();
+            } catch (const std::exception& e) {
+                std::cerr << "vc_object_server: staging failed: " << e.what() << "\n";
+                reply = errorReply(http::status::internal_server_error, e.what());
+            }
+            net::post(self->stream_.get_executor(), [self, done, reply = std::move(reply)]() mutable {
+                if (!reply) return self->readChunk();
+                self->upload_.reset();
+                self->body_.reset();
+                // A failure before the end leaves unread body bytes: close.
+                if (!done) self->keepAlive_ = false;
+                self->write(std::move(*reply));
+            });
+        };
+        // The lane holds one job per connection at most, so this only fails
+        // while the server stops.
+        if (!server_.transfers->tryPost(std::move(job))) {
+            upload_.reset();
+            return refuse(http::status::service_unavailable, "server busy; retry");
+        }
+    }
+
+    // Answers without reading the rest of the request, then closes.
+    void refuse(http::status status, const std::string& message)
+    {
+        keepAlive_ = false;
+        write(errorReply(status, message));
+    }
+
     void write(Reply reply)
     {
         auto response = std::make_shared<http::response<http::string_body>>(reply.status, version_);
         response->set(http::field::server, "vc_object_server");
         response->set(http::field::content_type, reply.contentType);
-        if (reply.status == http::status::service_unavailable) response->set(http::field::retry_after, "1");
+        if (reply.status == http::status::service_unavailable || reply.status == http::status::insufficient_storage)
+            response->set(http::field::retry_after, "1");
         response->keep_alive(keepAlive_);
         response->body() = std::move(reply.body);
         response->prepare_payload();
+        const auto bytes = response->body().size();
+        server_.responseBytes += bytes;
         stream_.expires_after(server_.options.requestDeadline);
-        http::async_write(stream_, *response, [self = shared_from_this(), response](beast::error_code ec, std::size_t) {
+        http::async_write(stream_, *response, [self = shared_from_this(), response, bytes](beast::error_code ec, std::size_t) {
+            self->server_.responseBytes -= bytes;
             if (ec || !self->keepAlive_) return self->close();
             self->readHeader();
         });
@@ -534,7 +854,11 @@ private:
 
     beast::tcp_stream stream_;
     beast::flat_buffer buffer_;
-    std::optional<http::request_parser<http::string_body>> parser_;
+    std::optional<http::request_parser<http::empty_body>> header_;
+    std::optional<http::request_parser<http::string_body>> command_;
+    std::optional<http::request_parser<http::buffer_body>> body_;
+    std::unique_ptr<Staging::Upload> upload_;
+    std::vector<char> chunk_;
     ServerState& server_;
     bool keepAlive_ = true;
     unsigned version_ = 11;
@@ -576,7 +900,9 @@ void Server::start()
     s.writer = std::make_unique<Lane>(1, s.options.writeQueue);
     s.readers = std::make_unique<Lane>(s.options.readWorkers, s.options.readQueue);
     s.control = std::make_unique<Lane>(1, s.options.controlQueue);
+    s.transfers = std::make_unique<Lane>(s.options.transferWorkers, s.options.maxConnections + 1);
     s.accept();
+    s.scheduleCheckpoints();
     for (int i = 0; i < std::max(s.options.networkThreads, 1); ++i) s.network.emplace_back([&s] { s.io.run(); });
 }
 
@@ -597,7 +923,9 @@ void Server::stop()
         beast::error_code ignored;
         s.acceptor.close(ignored);
     });
+    if (s.checkpointer.joinable()) s.checkpointer.join();
     // Finish accepted storage work; its replies go to sockets still served.
+    s.transfers->stop();
     s.writer->stop();
     s.readers->stop();
     s.control->stop();

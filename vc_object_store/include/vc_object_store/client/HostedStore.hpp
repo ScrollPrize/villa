@@ -35,6 +35,9 @@ struct HostedStoreOptions {
     long stallTimeoutS = 60;
     int retries = 5;
     long requestTimeoutMs = 0;
+    // Geometry array reads larger than this are fetched as several ranges
+    // (the server refuses single responses above its own limit).
+    int64_t rangeBytes = 32 << 20;
 };
 
 class HostedStore {
@@ -46,6 +49,9 @@ public:
 
     const std::string& endpoint() const { return endpoint_; }
     StoreStatus status();
+    // The service's own state as JSON text (queues, staging, connections,
+    // WAL checkpoints); see vc_object_server.
+    std::string serviceReport();
     // Stages the request's payloads, then submits it. Payloads the server
     // reports missing (expired staging) are uploaded again and the identical
     // request resubmitted.
@@ -58,7 +64,9 @@ public:
     std::optional<int64_t> currentVersion(const std::string& objectUuid);
     std::optional<ObjectRevision> objectAtVersion(const ObjectVersion&);
     // Geometry payloads by their immutable revision identity (from
-    // ObjectRevision::geometryRevision): safe to cache by that key.
+    // ObjectRevision::geometryRevision): safe to cache by that key. Reads
+    // above rangeBytes, and reads the server refuses as too large for one
+    // response, arrive as several range requests within both limits.
     std::optional<GeometryRevision> geometryRevision(const std::string& revisionUuid);
     std::vector<uint8_t> readGeometryArray(const std::string& revisionUuid, const std::string& arrayName,
                                            int64_t byteOffset = 0, const std::optional<int64_t>& byteCount = std::nullopt);
@@ -92,6 +100,7 @@ public:
 private:
     struct Impl;
     std::string endpoint_;
+    int64_t rangeBytes_;
     std::unique_ptr<Impl> impl_;
 };
 
