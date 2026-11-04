@@ -991,6 +991,7 @@ class Inferer():
                                        sigma_scale=self.in_memory_blend.get('sigma_scale', 8.0),
                                        z_range=z_range)
         self.coords_store_path = None
+        self._prepare_in_memory_blend()
         return self.blender
 
     def _create_output_stores(self):
@@ -1251,13 +1252,13 @@ class Inferer():
 
         if self.verbose: print("Inference complete.")
 
-    def _write_in_memory_blend(self):
+    def _prepare_in_memory_blend(self):
         config = self.in_memory_blend
         finalize_config = config.get('finalize_config')
         if finalize_config is not None:
             finalize_config.is_multi_task = bool(self.is_multi_task and self.target_info)
             finalize_config.target_info = self.target_info if finalize_config.is_multi_task else None
-        self.blender.write(
+        self.blender.prepare_output(
             config['output_path'],
             chunk_size=config.get('chunk_size'),
             compression_level=config.get('compression_level', 1),
@@ -1265,6 +1266,15 @@ class Inferer():
             verbose=self.verbose,
             create=self.part_id == 0,
             part_id=self.part_id,
+        )
+
+    def _write_in_memory_blend(self):
+        config = self.in_memory_blend
+        self.blender.write(
+            config['output_path'],
+            chunk_size=config.get('chunk_size'),
+            finalize_config=config.get('finalize_config'),
+            verbose=self.verbose,
         )
 
     def infer(self):

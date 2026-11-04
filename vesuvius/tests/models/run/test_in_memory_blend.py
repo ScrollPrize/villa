@@ -73,6 +73,8 @@ def test_in_memory_blend_matches_blend_and_finalize(tmp_path: Path, num_classes,
         for index, patch in enumerate(logits):
             blender.add(index, patch)
     in_memory = tmp_path / "in_memory.zarr"
+    blender.prepare_output(str(in_memory), chunk_size=(12, 12, 12),
+                           finalize_config=finalize_config, verbose=False)
     blender.write(str(in_memory), chunk_size=(12, 12, 12), finalize_config=finalize_config, verbose=False)
 
     assert blender.patches_skipped_empty == 1
@@ -90,6 +92,7 @@ def test_in_memory_blend_covers_only_the_patch_extent(tmp_path: Path) -> None:
     blender = InMemoryBlender(coords, PATCH, 2, VOLUME)
     blender.add(0, np.ones((2, *PATCH), dtype=np.float16))
     out = tmp_path / "out.zarr"
+    blender.prepare_output(str(out), finalize_config=FinalizeConfig(mode="binary"), verbose=False)
     blender.write(str(out), finalize_config=FinalizeConfig(mode="binary"), verbose=False)
     result = _read(out)
     assert result.shape == (1, *VOLUME)
@@ -159,16 +162,20 @@ def test_main_passes_parts_with_blend_in_memory(monkeypatch: pytest.MonkeyPatch,
 
 def _blend_in_parts(coords, logits, num_classes, num_parts, out, chunk, finalize_config):
     """Run each part the way predict does: its own patch selection, its own slab, one shared output."""
-    slabs = []
+    slabs, blenders = [], []
     for part in range(num_parts):  # part 0 first: it creates the output the others write into
         z_range = part_z_range(coords, PATCH, VOLUME, chunk[0], num_parts, part)
         keep = patches_in_z_range(coords, PATCH[0], z_range)
         blender = InMemoryBlender(coords[keep], PATCH, num_classes, VOLUME, z_range=z_range)
         for local, index in enumerate(keep):
             blender.add(local, logits[index])
-        blender.write(str(out), chunk_size=chunk, finalize_config=finalize_config, verbose=False,
-                      create=part == 0, part_id=part)
+        blender.prepare_output(str(out), chunk_size=chunk, finalize_config=finalize_config, verbose=False,
+                               create=part == 0, part_id=part)
         slabs.append(z_range)
+        blenders.append(blender)
+    # Part 0 finishing last must not erase any of the earlier writes.
+    for blender in reversed(blenders):
+        blender.write(str(out), chunk_size=chunk, finalize_config=finalize_config, verbose=False)
     return slabs
 
 
@@ -208,7 +215,7 @@ def test_write_rejects_a_slab_that_cuts_a_chunk(tmp_path: Path) -> None:
     coords, logits = _patches(2)
     blender = InMemoryBlender(coords, PATCH, 2, VOLUME, z_range=(0, 20))
     with pytest.raises(ValueError, match="aligned"):
-        blender.write(str(tmp_path / "out.zarr"), chunk_size=(12, 12, 12), verbose=False)
+        blender.prepare_output(str(tmp_path / "out.zarr"), chunk_size=(12, 12, 12), verbose=False)
 
 
 def test_inferer_runs_the_patches_that_reach_its_slab() -> None:
@@ -227,3 +234,30 @@ def test_inferer_runs_the_patches_that_reach_its_slab() -> None:
     assert inferer._blend_z_range == (32, 64)
     assert inferer.dataset.all_positions == [(24, 0, 0), (32, 0, 0), (40, 0, 0), (48, 0, 0)]
     assert inferer.dataset.non_empty_mask.tolist() == [True, True, False, True]
+
+
+@pytest.mark.parametrize("empty", [False, True])
+def test_inferer_prepares_blend_output_before_processing(tmp_path, monkeypatch, empty):
+    inferer = Inferer.__new__(Inferer)
+    inferer.verbose = False
+    inferer.in_memory_blend = {"output_path": str(tmp_path / "out.zarr")}
+    inferer.num_classes, inferer.patch_size = 2, PATCH
+    inferer.part_id = 0
+    inferer.is_multi_task, inferer.target_info = False, None
+    inferer.blender = None
+    inferer.patch_start_coords_list = [] if empty else [(0, 0, 0)]
+    inferer.num_total_patches = len(inferer.patch_start_coords_list)
+    monkeypatch.setattr(inferer, "_load_model", lambda: None)
+    monkeypatch.setattr(inferer, "_create_dataset_and_loader", lambda: None)
+    monkeypatch.setattr(inferer, "_original_volume_shape", lambda: VOLUME)
+    processed = []
+
+    def process():
+        assert _read(inferer.in_memory_blend["output_path"]).shape == (2, *VOLUME)
+        inferer.blender.add(0, np.ones((2, *PATCH), dtype=np.float16))
+        processed.append(True)
+
+    monkeypatch.setattr(inferer, "_process_batches", process)
+    inferer._run_inference()
+    assert bool(processed) == (not empty)
+    assert _read(inferer.in_memory_blend["output_path"]).any() == (not empty)

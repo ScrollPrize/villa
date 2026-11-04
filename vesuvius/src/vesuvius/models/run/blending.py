@@ -708,27 +708,35 @@ class InMemoryBlender:
         """`blender[i] = logits` adds a patch, so the blender can stand in for the logits store."""
         self.add(patch_index, patch_logits)
 
-    def write(self, output_path, chunk_size=None, compression_level=1, finalize_config=None,
-              verbose=True, epsilon=1e-8, num_workers=None, create=True, part_id=0):
-        """Normalise, optionally finalize, and write every chunk that received a patch.
-
-        Chunks are disjoint, so they are finalized and written by `num_workers` threads
-        (default: the CPUs this process may use, at most 8; each thread holds one chunk's copy).
-        In a split run one part creates the output array (`create=True`) and the others wait for
-        it and only write the chunks of their own `z_range`.
-        """
-        if create:
-            output_chunks = create_blend_output(output_path, self.volume_shape, self.num_classes, self.patch_size,
-                                                chunk_size, compression_level, finalize_config, verbose)
-        else:
-            output_chunks = _blend_output_chunks(self.patch_size, chunk_size)
-            wait_for_zarr_creation(output_path, verbose=verbose, part_id=part_id)
+    def _output_chunks(self, chunk_size):
+        output_chunks = _blend_output_chunks(self.patch_size, chunk_size)
         if self.z_range is not None:
             z_chunk = output_chunks[1]
             z0, z1 = self.z_range
             if z0 % z_chunk or (z1 % z_chunk and z1 != self.volume_shape[0]):
                 raise ValueError(f"z_range {self.z_range} is not aligned to the output chunk size {z_chunk}; "
                                  "parts would overwrite each other's chunks.")
+        return output_chunks
+
+    def prepare_output(self, output_path, chunk_size=None, compression_level=1, finalize_config=None,
+                       verbose=True, create=True, part_id=0):
+        """Create or wait for the shared output before any part starts inference."""
+        self._output_chunks(chunk_size)  # Validate the slab before replacing an existing output.
+        if create:
+            create_blend_output(output_path, self.volume_shape, self.num_classes, self.patch_size,
+                                chunk_size, compression_level, finalize_config, verbose)
+        else:
+            wait_for_zarr_creation(output_path, verbose=verbose, part_id=part_id)
+
+    def write(self, output_path, chunk_size=None, finalize_config=None,
+              verbose=True, epsilon=1e-8, num_workers=None):
+        """Normalise, optionally finalize, and write to an already prepared output.
+
+        Chunks are disjoint, so they are finalized and written by `num_workers` threads
+        (default: the CPUs this process may use, at most 8; each thread holds one chunk's copy).
+        This never creates or clears the array: other parts may already have written their slabs.
+        """
+        output_chunks = self._output_chunks(chunk_size)
         output_store = ZarrWriter.open(output_path, skip_empty=True)
         steps = output_chunks[1:]
         ranges = [range((o // c) * c, o + n, c) for o, n, c in zip(self.origin, self.shape, steps)]
