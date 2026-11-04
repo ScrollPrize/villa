@@ -1,92 +1,39 @@
-# Task log: rolling live OME-Zarr input cache for shared 3D inference
+# Task log: vc_reader migration
 
-## Planning findings
+## Implementation and scope
 
-- Bulk auto-download currently completes before inference. TensorStore's
-  existing bounded read-ahead only reads already-local chunks and is not a
-  remote materialization cache.
-- The shared runner currently uses transient local chunk existence both to
-  skip model tiles and to classify supported output chunks. Live caching must
-  make these checks authoritative against remote inventory or an initially
-  empty/evicted cache can incorrectly suppress valid inference.
-- Canonical traversal is Z-major with lazily materialized axis lattices. The
-  live window can therefore remain bounded at 10,000 events and a safe eviction
-  frontier can advance only after a complete canonical model Z row commits.
-- At the current 512/96/32 defaults, PHercParis4 scale 0 has 6,241 tiles per
-  model Z row. A 10,000-tile window spans at most three model Z positions and
-  approximately 7--12 128-voxel input Zarr planes. The configured 10 TiB cache
-  target is much larger than the immediate forward working set.
-- A conservative target requires no ahead/LRU deletion: when over target,
-  delete oldest whole planes strictly behind the safe boundary; if none are
-  available, report and temporarily remain over target.
-- `preprocess_cos_omezarr.py` still contains a duplicated automatic-download
-  wrapper even though Fiber imports the shared runner helper. This task will
-  remove that divergence rather than add another backend-specific cache path.
-- Independent review required remote inventory to remain active-plane bounded,
-  clarified sparse-plane eviction, preserved `.noremote` as advisory only,
-  separated the 10,000 descriptor/materialization window from the much smaller
-  TensorStore tile-array window, and strengthened local accounting, metadata
-  validation, shared/exclusive locking, and fatal transport-error behavior.
-- Current uncommitted downloader retry/progress/scanner-failure changes are the
-  baseline for this task and must be preserved rather than rewritten away.
+- Completed audit items 1, 2, 3, 7 and 8. Deleted prepare_scroll.py and the orphaned data/volume.py and tifxyz/writer.py modules, plus stale references.
+- Winding phase samples use resident.sample_array; winding surface points use tifxyz.Surface.points_at. Surface-coordinate sampling uses resident.GridField. Torch callers use vc_reader.torch.sample_array with explicit index order and application masks.
+- Raw CT rendering uses ZarrReader.render_points, a thin adapter to the existing native grid renderer. Added prepared per-pixel geometry input to that renderer in C++ with CPU and CUDA implementations. The Python ZarrReader adapter uses its CPU array; the C++ request exposes GPU selection.
+- Removed the duplicate Python surface-transfer rasterizer; all rasterization uses vc_reader.SurfaceTransfer.
+- Items 4–6 (Zarr metadata/chunk interpretation, tifxyz metadata parsing, projection) remain unchanged at the user's explicit request.
 
-## Deviations
+## Review and behavior
 
-- Live fetching initially manages only the primary selected input scale.
-  Lasagna `pred_dt` is an independent post-inference external source; live mode
-  rejects a separately remote `pred_dt` rather than silently materializing a
-  second unbounded cache. Already-local `pred_dt` behavior remains unchanged.
-- S3 list responses are consumed as keys, not object-size projections. Progress
-  therefore reports exact completed resident/downloaded bytes, current transfer
-  rate, and in-flight chunk count, but does not invent a projected-byte total.
-  Actual completed bytes remain the sole eviction trigger as required.
-
-## Implementation
-
-- Added `lasagna/live_omezarr_cache.py` with selected-level metadata validation,
-  authoritative lazy per-Z remote inventory, atomic retrying raw-chunk transfer,
-  aggregate local accounting, shared/exclusive advisory locking, and
-  conservative whole-plane eviction.
-- Kept canonical event generation lazy while separating the 10,000-item live
-  materialization window from the existing bounded TensorStore/full-tile read
-  window. Durable completed outputs are skipped before fetch. Serial and
-  multi-device paths call the same shared scheduler.
-- Changed live source-support checks to use authoritative remote inventory,
-  never transient local cache contents or `.noremote` state.
-- Removed the duplicate Lasagna downloader implementation and routed Fiber and
-  Lasagna through the shared automatic-download helper. Bulk download takes the
-  same exclusive selected-level lock used by live mutation; ordinary tiled
-  readers take a shared lock.
-- Added Fiber, Lasagna, and manager CLI flags, manager completion, source-link
-  initialization without bulk prefetch, portable provenance, and final manager
-  cache statistics. Normal non-live prefetch and no-prefetch behavior remains
-  unchanged.
-- Made progress refresh once per second through both terminals and manager
-  pipes, with newline history checkpoints at most once per minute while work
-  advances. Remote-missing accounting now counts each absent chunk once when
-  its Z-plane inventory is first listed instead of counting overlapping tile
-  requests repeatedly.
-- Updated shared inference specs, code-structure documentation, Lasagna README,
-  manager documentation, and changelog.
+- Independent plan review identified boundary, nearest-tie, and precision differences. The user explicitly directed use of vc_reader defaults, so no compatibility handling was added.
+- Adopted float32 resident interpolation, half-up nearest ties, default bicubic surface interpolation and shared quad validity. Rendering uses array fill outside bounds and the default composite cutoff of zero; no accepted layer produces NaN, displayed as black.
+- The initial spec.md lookup found no file; final review located specs.md (plural), read the relevant fused-map requirements, and obtained independent review against it. Updated its sampling ownership wording. No conflict with fused-map construction or batched line/CP lookup was found. local_development.md is absent.
+- No dependency installation or environment bootstrap was performed. Initial Python checks selected stale installed extensions; the documented load_build helper selects the freshly built modules without installation. The wider vesuvius tests require its directory on PYTHONPATH for tests.zarr_utils.
 
 ## Validation
 
-- `python -m py_compile` passed for the new cache, shared runner, downloader,
-  both inference entry points, and manager modules.
-- `pytest lasagna/tests/test_live_omezarr_cache.py
-  lasagna/tests/test_live_tiled_predict3d.py
-  lasagna/tests/test_download_omezarr.py lasagna/tests/test_manager.py -q`:
-  **77 passed**.
-- Two focused legacy shared-runner tests covering normal Python-Zarr/TensorStore
-  serial equivalence and lazy canonical events: **2 passed**.
-- Fiber CLI/signature tests including live options and invalid combinations:
-  **7 passed, 199 deselected**.
-- Fiber, Lasagna, and manager `--help` smoke checks expose all three live flags.
-- `git diff --check` passed.
-- Focused progress/missing-accounting regression validation: **11 passed**.
-- No real S3/full-volume performance run was made, so no throughput or peak-cache
-  claim is reported. The focused synthetic tests verify window ordering,
-  pre-fetch resume rejection, selected-scale isolation, exact accounting, and
-  safe-plane deletion. A broader local suite attempt encountered an existing
-  Zarr 3/Python 3.14 synchronous `open_group` stall in an unrelated atomic-output
-  test; the focused normal-runner tests complete successfully.
+Run from the repository root:
+
+```bash
+AGENTS_AGENT_MODE=1 CCACHE_DISABLE=1 cmake --build vc_reader/build-native-cuda --target _reader _transforms _catalog test_native_grid test_native_grid_cuda -j 2
+
+AGENTS_AGENT_MODE=1 PYTHONDONTWRITEBYTECODE=1 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 VC_READER_BUILD_DIR="$PWD/vc_reader/build-native-cuda" vesuvius/.venv/bin/python -m pytest -q -p no:cacheprovider vc_reader/tests/test_render_points.py vesuvius/tests/neural_tracing/test_shared_sampling_migration.py vesuvius/tests/tifxyz_label_transfer
+
+AGENTS_AGENT_MODE=1 PYTHONDONTWRITEBYTECODE=1 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 VC_READER_BUILD_DIR="$PWD/vc_reader/build-native-cuda" PYTHONPATH="$PWD/vc_reader/tests:$PWD/vesuvius" vesuvius/.venv/bin/python -c 'from build_support import load_build; load_build(); import pytest; raise SystemExit(pytest.main(["-q", "-p", "no:cacheprovider", "vesuvius/tests/neural_tracing/test_fiber_trace_2d_loader.py", "vesuvius/tests/neural_tracing/test_fiber_trace.py", "vesuvius/tests/neural_tracing/test_rowcol_triplet_merge.py"]))'
+
+AGENTS_AGENT_MODE=1 ctest --test-dir vc_reader/build-native-cuda -R '^test_native_grid(_cuda)?$' --output-on-failure
+git diff --check
+```
+
+- Native extension and test builds passed.
+- Rendering, transfer and migration checks: 149 passed, including 14 subtests.
+- Existing fiber tracing and row/column merge suites: 346 passed.
+- Native grid CPU test passed. The sandbox skipped the CUDA test; rerunning with GPU access passed, including CPU/CUDA prepared-geometry comparison.
+- Synthetic Zarr and tifxyz fixtures cover fractional sampling, nearest ties, singleton axes, anisotropic scales, isolated valid pixels, negative and positive fill, composite cutoff, native tile boundaries, gradients, coordinate ordering, and default surface validity/interpolation.
+- Numeric checks include the quadratic surface's default bicubic value 11.5625 at column 1.25 (the previous bilinear value was 11.75), exact linear field/phase expectations, and matching CPU/CUDA render values. Different boundary/tie behavior is intentional, not a numerical-equivalence claim.
+- No performance claim or benchmark was made. No real-scroll end-to-end workload or macOS/arm64 run was performed.

@@ -16,8 +16,7 @@ import tempfile
 import uuid as uuidlib
 
 import numpy as np
-from vc_object_store import ObjectStore
-
+from vc_object_store import Fiber, ObjectStore, geometry_scale_to_volume
 from vesuvius.neural_tracing.tracers.shared.annotations.repair import ANNOTATION_REPAIR, repair_kinks
 from vesuvius.neural_tracing.tracers.shared.annotations.traced import TracedFiber
 from vesuvius.neural_tracing.tracers.shared.annotations.splits import heldout_ids
@@ -32,14 +31,6 @@ def open_store(path):
     return ObjectStore.open(str(path), read_only=True, reader_pool_size=1)
 
 
-def volume_scale(meta, volume):
-    """Stored-to-volume-voxel factor of a fiber bound to ``volume``, else None."""
-    coordinates = (meta or {}).get('coordinates') or {}
-    if coordinates.get('volume_uuid') != volume or not coordinates.get('scale_factor'):
-        return None
-    return 1.0/float(coordinates['scale_factor'])
-
-
 def fiber_volume(path):
     """The one volume every fiber of the store is bound to; raises when they are unbound or bound to several."""
     with open_store(path) as store:
@@ -49,7 +40,7 @@ def fiber_volume(path):
         volume = (first[0]['meta'].get('coordinates') or {}).get('volume_uuid')
         if volume is None:
             raise ValueError(f'Fibers in {path} are not bound to a volume')
-        if len(store.select_objects(object_kind='fiber', volume=volume, fields=[])) != store.object_count('fiber'):
+        if store.unbound_object_count('fiber', volume):
             raise ValueError(f'Fibers in {path} are bound to several volumes; name one')
     return volume
 
@@ -67,8 +58,8 @@ def fiber_catalog(path, volume):
                 return rows
             for record in page:
                 fiber = record.get('fiber') or {}
-                scale = volume_scale(record['meta'], volume)
-                if scale is None or fiber.get('line_point_count', 0) < 2:
+                scale = geometry_scale_to_volume(record['meta'], volume)
+                if fiber.get('line_point_count', 0) < 2:
                     continue
                 bbox = fiber.get('bbox')
                 rows.append(dict(id=record['uuid'], name=record['name'], family=fiber.get('family', ''),
@@ -96,7 +87,7 @@ def read_polylines(path, fiber_ids=None, *, volume=None):
             values, offsets = packed.values, packed.offsets
             out = {}
             for node, record in enumerate(records):
-                scale = volume_scale(record['meta'], volume)
+                scale = geometry_scale_to_volume(record['meta'], volume)
                 xyz = np.array(values[offsets[node]:offsets[node+1]], dtype=np.float64)
                 if scale is None or len(xyz) < 2:
                     raise ValueError(f'Fiber {record["uuid"]} is not bound to volume {volume} or has no line')
@@ -160,12 +151,7 @@ def write_fibers(destination, fibers, *, volume, author=None):
                                          length=float(np.linalg.norm(np.diff(xyz, axis=0), axis=1).sum()),
                                          bbox=[*map(float, xyz.min(0)), *map(float, xyz.max(0))]),
                               meta={**(row.get('meta') or {}), 'coordinates': coordinates})
-                ends = np.ascontiguousarray(xyz[[0, -1]])
-                geometry = dict(kind='fiber', arrays=[
-                    dict(name='control_points', dtype='<f8', shape=[2, 3], data=ends.tobytes()),
-                    dict(name='control_point_ids', dtype='<i8', shape=[2], data=np.array([0, 1], '<i8').tobytes()),
-                    dict(name='line_points', dtype='<f8', shape=[len(xyz), 3], data=xyz.tobytes())])
-                pending.append((record, geometry))
+                pending.append((record, Fiber.from_arrays(np.ascontiguousarray(xyz[[0, -1]]), xyz)))
                 if len(pending) >= WRITE_BATCH:
                     flush()
             flush()
@@ -238,9 +224,8 @@ class FiberStore(Sequence):
     def geometry(self, index):
         if index not in self._cache:
             row = self.catalog[index]
-            store = self.store()
-            revision = store.current_geometry(row['id'])['uuid']
-            xyz = np.frombuffer(store.read_geometry_array(revision, 'line_points'), dtype='<f8').reshape(-1, 3)
+            with self.store().geometry_snapshot() as snapshot:
+                xyz = snapshot.fiber(row['id']).line_points_array()
             if len(xyz) < 2 or not np.isfinite(xyz).all():
                 raise ValueError(f'Invalid fiber geometry: {row["id"]}')
             points = xyz*(row['scale']/self.grid_scale)
@@ -263,16 +248,15 @@ class FiberStore(Sequence):
 
     def _blocks(self, lo, hi):
         """The overlapping blocks' points in trace grid units: (fiber id, first vertex, points)."""
-        store = self.store()
         regions = self._regions(lo, hi)
-        by_revision = OrderedDict()
-        for r in regions:
-            by_revision.setdefault((r['object_uuid'], r['revision_uuid']), []).append(r)
-        for (fid, revision), rows in by_revision.items():
-            scale = self.catalog[self.id_to_index[fid]]['scale']/self.grid_scale
-            ranges = [[int(r['start'][0])*24, int(r['shape'][0])*24] for r in rows]
-            for r, blob in zip(rows, store.read_geometry_ranges(revision, 'line_points', ranges)):
-                yield fid, int(r['start'][0]), np.frombuffer(blob, dtype='<f8').reshape(-1, 3)*scale
+        blocks = []
+        with self.store().geometry_snapshot() as snapshot:
+            for r in regions:
+                fid = r['object_uuid']
+                scale = self.catalog[self.id_to_index[fid]]['scale']/self.grid_scale
+                line = snapshot.fiber(fid, r['revision_uuid'])
+                blocks.append((fid, int(r['start'][0]), line.line_points_array(int(r['start'][0]), int(r['shape'][0]))*scale))
+        yield from blocks
 
     def nearby_blocks(self, bounds_xyz, exclude_id, *, records=False):
         lo, hi = np.asarray(bounds_xyz)

@@ -24,7 +24,6 @@ public:
 
     void startStroke(const QPointF& surfacePos);
     void extendStroke(const QPointF& surfacePos, bool forceSample);
-    void pauseStroke();
     void finishStroke();
     void cancelStroke();
     void refreshFromSurface();
@@ -38,7 +37,6 @@ private:
     void fillEnclosedStrokeArea();
     void persistSurface();
     [[nodiscard]] cv::Rect applyPendingCells();
-    void refreshSurfacePatchIndex(const cv::Rect& changedRegion);
     void invalidateOverlay();
     void invalidateViewers(bool surfaceChanged);
 

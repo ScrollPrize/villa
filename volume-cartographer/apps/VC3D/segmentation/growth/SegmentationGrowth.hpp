@@ -10,22 +10,27 @@
 #include <utility>
 #include <vector>
 
-#include "utils/Json.hpp"
+#include <nlohmann/json.hpp>
 
 #include <opencv2/core/mat.hpp>
 
 #include "vc/ui/VCCollection.hpp"
 
 class QuadSurface;
-class SurfacePatchIndex;
 class Volume;
 
 enum class SegmentationGrowthMethod {
     Tracer = 0,
     Corrections = 1,
-    PatchTracer = 3,
-    ManualAdd = 4,
+    ManualAdd = 4, // Manual Fill; keep the persisted value.
+    ManualGrow = 5,
 };
+
+inline bool isManualGrowthMethod(SegmentationGrowthMethod method)
+{
+    return method == SegmentationGrowthMethod::ManualAdd ||
+           method == SegmentationGrowthMethod::ManualGrow;
+}
 
 inline QString segmentationGrowthMethodToString(SegmentationGrowthMethod method)
 {
@@ -34,10 +39,10 @@ inline QString segmentationGrowthMethodToString(SegmentationGrowthMethod method)
         return QStringLiteral("Tracer");
     case SegmentationGrowthMethod::Corrections:
         return QStringLiteral("Corrections");
-    case SegmentationGrowthMethod::PatchTracer:
-        return QStringLiteral("Patch Tracer");
     case SegmentationGrowthMethod::ManualAdd:
-        return QStringLiteral("Manual Add");
+        return QStringLiteral("Manual Fill");
+    case SegmentationGrowthMethod::ManualGrow:
+        return QStringLiteral("Manual Grow");
     }
     return QStringLiteral("Unknown");
 }
@@ -47,11 +52,11 @@ inline SegmentationGrowthMethod segmentationGrowthMethodFromInt(int value)
     if (value == static_cast<int>(SegmentationGrowthMethod::Corrections)) {
         return SegmentationGrowthMethod::Corrections;
     }
-    if (value == static_cast<int>(SegmentationGrowthMethod::PatchTracer)) {
-        return SegmentationGrowthMethod::PatchTracer;
-    }
     if (value == static_cast<int>(SegmentationGrowthMethod::ManualAdd)) {
         return SegmentationGrowthMethod::ManualAdd;
+    }
+    if (value == static_cast<int>(SegmentationGrowthMethod::ManualGrow)) {
+        return SegmentationGrowthMethod::ManualGrow;
     }
     return SegmentationGrowthMethod::Tracer;
 }
@@ -84,64 +89,6 @@ inline QString segmentationGrowthDirectionToString(SegmentationGrowthDirection d
     return QStringLiteral("All");
 }
 
-inline SegmentationGrowthDirection segmentationGrowthDirectionFromInt(int value)
-{
-    switch (value) {
-    case static_cast<int>(SegmentationGrowthDirection::Up):
-        return SegmentationGrowthDirection::Up;
-    case static_cast<int>(SegmentationGrowthDirection::Down):
-        return SegmentationGrowthDirection::Down;
-    case static_cast<int>(SegmentationGrowthDirection::Left):
-        return SegmentationGrowthDirection::Left;
-    case static_cast<int>(SegmentationGrowthDirection::Right):
-        return SegmentationGrowthDirection::Right;
-    case static_cast<int>(SegmentationGrowthDirection::Fill):
-        return SegmentationGrowthDirection::Fill;
-    default:
-        return SegmentationGrowthDirection::All;
-    }
-}
-
-enum class SegmentationDirectionFieldOrientation {
-    Normal = 0,
-    Horizontal = 1,
-    Vertical = 2,
-};
-
-inline QString segmentationDirectionFieldOrientationKey(SegmentationDirectionFieldOrientation orientation)
-{
-    switch (orientation) {
-    case SegmentationDirectionFieldOrientation::Horizontal:
-        return QStringLiteral("horizontal");
-    case SegmentationDirectionFieldOrientation::Vertical:
-        return QStringLiteral("vertical");
-    case SegmentationDirectionFieldOrientation::Normal:
-    default:
-        return QStringLiteral("normal");
-    }
-}
-
-inline SegmentationDirectionFieldOrientation segmentationDirectionFieldOrientationFromInt(int value)
-{
-    switch (value) {
-    case static_cast<int>(SegmentationDirectionFieldOrientation::Horizontal):
-        return SegmentationDirectionFieldOrientation::Horizontal;
-    case static_cast<int>(SegmentationDirectionFieldOrientation::Vertical):
-        return SegmentationDirectionFieldOrientation::Vertical;
-    default:
-        return SegmentationDirectionFieldOrientation::Normal;
-    }
-}
-
-struct SegmentationDirectionFieldConfig {
-    QString path;
-    SegmentationDirectionFieldOrientation orientation{SegmentationDirectionFieldOrientation::Normal};
-    int scale{0};
-    double weight{1.0};
-
-    [[nodiscard]] bool isValid() const { return !path.isEmpty(); }
-};
-
 struct SegmentationCorrectionsPayload {
     struct Collection {
         uint64_t id{0};
@@ -164,8 +111,7 @@ struct SegmentationGrowthRequest {
     std::vector<SegmentationGrowthDirection> allowedDirections;
     SegmentationCorrectionsPayload corrections;
     std::optional<std::pair<int, int>> correctionsZRange;
-    std::vector<SegmentationDirectionFieldConfig> directionFields;
-    utils::Json customParams;
+    nlohmann::json customParams;
     cv::Mat allowedGrowthMask;
     bool manualAddPreview{false};
     bool inpaintOnly{false};
@@ -174,34 +120,24 @@ struct SegmentationGrowthRequest {
 struct TracerGrowthContext {
     QuadSurface* resumeSurface{nullptr};
     class Volume* volume{nullptr};
-    int level{0};
-    QString cacheRoot;
     double voxelSize{1.0};
     QString normalGridPath;
-    QString normal3dZarrPath;
     cv::Mat allowedGrowthMask;
-    // For corrections annotation saving
-    std::filesystem::path volpkgRoot;
-    std::vector<std::string> volumeIds;
     std::string growthVolumeId;
-    SurfacePatchIndex* surfacePatchIndex{nullptr};
-    std::vector<std::shared_ptr<QuadSurface>> patchSurfaces;
 };
 
 struct TracerGrowthResult {
     QuadSurface* surface{nullptr};
     QString error;
     QString statusMessage;
-    std::vector<std::filesystem::path> temporarySurfacePaths;
-    QString patchTracerCacheSourcePath;
-    std::vector<std::shared_ptr<QuadSurface>> patchTracerCachedSurfaces;
-    std::shared_ptr<SurfacePatchIndex> patchTracerCachedIndex;
+    // UUIDs of the surfaces a displacement copy created (front, back).
+    std::vector<std::string> createdSurfaces;
 };
+
+// Give a surface without a "generations" channel one (every vertex generation
+// 1), which tracer growth resumes from; false for a surface without points.
+bool ensureGenerationsChannel(QuadSurface* surface);
 
 TracerGrowthResult runTracerGrowth(const SegmentationGrowthRequest& request,
                                    const TracerGrowthContext& context);
-TracerGrowthResult runPatchTracerGrowth(const SegmentationGrowthRequest& request,
-                                        const TracerGrowthContext& context);
 
-void updateSegmentationSurfaceMetadata(QuadSurface* surface,
-                                       double voxelSize);

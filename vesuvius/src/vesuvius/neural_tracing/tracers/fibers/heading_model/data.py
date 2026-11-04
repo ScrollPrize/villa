@@ -14,6 +14,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
+from vc_reader.reader import open_zarr
 
 from vesuvius.neural_tracing.tracers.fibers.heading_model.model import (
     HeadingConfig, model_inputs, prior_frames)
@@ -23,10 +24,8 @@ from vesuvius.neural_tracing.tracers.fibers.data.datasets import WeightedDataset
 from vesuvius.neural_tracing.tracers.fibers.data.follow_dataset import FollowDataset
 from vesuvius.neural_tracing.tracers.fibers.data.samples import SampleConfig, simulated_trace
 from vesuvius.neural_tracing.tracers.shared.geometry import traversal_curve
-from vesuvius.neural_tracing.tracers.shared.crop_sampling.crops import tight_block
 from vesuvius.neural_tracing.tracers.shared.geometry import arclength, interp_at, normalize
 from vesuvius.neural_tracing.tracers.fibers.frames.ct import linear12_heading
-from vesuvius.neural_tracing.tracers.shared.crop_sampling.volume import CTVolume
 
 HISTORY_BINS = (('seed', 0., 1e-9), ('1-11', 1e-9, 12.), ('12-31', 12., 32.), ('32+', 32., float('inf')))
 
@@ -142,11 +141,11 @@ def plan_states(fibers, weights, n, rng, cfg, sampling, *, roll_rng=None):
     return states
 
 
-def finish_states(states, vol, cfg, pool=None):
+def finish_states(states, ct, spec, cfg, pool=None):
     """Targets, CT patches and path features for planned states; targets in each patch frame."""
     targets = in_crop_heading(np.stack([s['future'] for s in states]), np.stack([s['init'] for s in states]))
     frames = [s['frame'] for s in states]
-    inputs = model_inputs(vol, cfg, [s['pos'] for s in states], frames, [s['path'] for s in states], pool,
+    inputs = model_inputs(ct, spec, cfg, [s['pos'] for s in states], frames, [s['path'] for s in states], pool,
                           normal_targets=cfg.predict_normals)
     patch, path = inputs[:2]
     if cfg.predict_normals:
@@ -160,24 +159,19 @@ def finish_states(states, vol, cfg, pool=None):
     return patch, path, local
 
 
-def build_states(fibers, weights, vol, n, rng, cfg, sampling, *, roll_rng=None, pool=None):
+def build_states(fibers, weights, ct, spec, n, rng, cfg, sampling, *, roll_rng=None, pool=None):
     """Planned and finished states in one call (held-out sets)."""
     states = plan_states(fibers, weights, n, rng, cfg, sampling, roll_rng=roll_rng)
-    return (states, *finish_states(states, vol, cfg, pool))
+    return (states, *finish_states(states, ct, spec, cfg, pool))
 
 
 class HeadingBatchBuilder:
-    """FollowDataset batch builder: exact patch footprints for prefetch, then targets and model inputs."""
+    """FollowDataset batch builder: targets and model inputs."""
     def __init__(self, cfg: HeadingConfig):
         self.cfg = cfg
 
-    def prefetch_bounds(self, item, vol):
-        from vesuvius.neural_tracing.tracers.fibers.heading_model.normals import training_crop
-        crop = training_crop(self.cfg, vol)[0] if self.cfg.predict_normals else self.cfg.patch
-        yield tight_block(np.asarray(item['pos']), item['frame'], crop, vol.input_scale)
-
-    def __call__(self, items, vol):
-        patch, path, target = finish_states(items, vol, self.cfg)
+    def __call__(self, items, ct, spec):
+        patch, path, target = finish_states(items, ct, spec, self.cfg)
         batch = dict(patch=patch, path=path, target=target)
         if self.cfg.predict_normals:
             batch.update(normal_target=torch.from_numpy(np.stack([s['normal_target'] for s in items])),
@@ -190,8 +184,8 @@ class HeadingBatchBuilder:
 class HeadingStates(FollowDataset):
     """One source's endless heading batches through the follower's loader pipeline.
 
-    Only the plans (``_iter_plans``) and batch builder differ from the follower: cache-only volumes,
-    remote prefetch lookahead, ``ensure`` before reads and the length-weighted fiber draws are FollowDataset's.
+    Only the plans (``_iter_plans``) and batch builder differ from the follower: the CT reader and the
+    length-weighted fiber draws are FollowDataset's.
     """
     def __init__(self, source: Source, cfg: HeadingConfig, sampling: HeadingSampling, batch, seed=0,
                  cache_bytes=512 << 20):
@@ -201,20 +195,18 @@ class HeadingStates(FollowDataset):
         # Length-weighted like the follower, restricted to fibers long enough for the target span.
         self.weights = fiber_weights(source.train, cfg.forward+8)
 
-    def _iter_plans(self, vol, windows):
+    def _iter_plans(self, windows):
         info = torch.utils.data.get_worker_info()
         rng = np.random.default_rng(np.random.SeedSequence([self.seed, 0 if info is None else info.id]))
         while True:
-            states = plan_states(self.fibers, self.weights, self.chunk, rng, self.heading_cfg, self.sampling, roll_rng=rng)
-            self.prefetch_items(states, vol)
-            yield states
+            yield plan_states(self.fibers, self.weights, self.chunk, rng, self.heading_cfg, self.sampling, roll_rng=rng)
 
 
 def mixed_heading_states(sources, cfg, sampling, batch, seed=0, cache_bytes=512 << 20):
     """Per-source datasets mixed by dataset-config weight with the follower's WeightedDatasets."""
     datasets = [HeadingStates(s, cfg, sampling, batch, seed=seed+100003*(k+1), cache_bytes=cache_bytes)
                 for k, s in enumerate(sources)]
-    return WeightedDatasets(datasets, [s.name for s in sources], [s.weight for s in sources], seed=seed), datasets
+    return WeightedDatasets(datasets, [s.name for s in sources], [s.weight for s in sources], seed=seed)
 
 
 def validation_states(sources, cfg, sampling, n, seed, pool=None):
@@ -222,9 +214,10 @@ def validation_states(sources, cfg, sampling, n, seed, pool=None):
     out = {}
     for k, source in enumerate(sources):
         rng = np.random.default_rng(np.random.SeedSequence([seed, 7349, k]))
-        vol = CTVolume(source.spec)
-        out[source.name] = build_states(source.validation, fiber_weights(source.validation, cfg.forward+8), vol, n,
-                                        rng, cfg, sampling, pool=pool)
+        spec = source.spec
+        ct = open_zarr(spec.ct_zarr, level=spec.ct_level, cache_dir=spec.cache_dir, memory_cache=3 << 30)
+        out[source.name] = build_states(source.validation, fiber_weights(source.validation, cfg.forward+8), ct, spec,
+                                        n, rng, cfg, sampling, pool=pool)
     return out
 
 

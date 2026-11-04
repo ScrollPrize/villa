@@ -221,8 +221,7 @@ def test_consumer_metadata_allows_only_allocation_local_changes(tmp_path):
     from tests.neural_tracing.test_sample_pipeline import _real_paris4_loader
     loader = _real_paris4_loader(tmp_path)
     metadata = pickle.loads(pickle.dumps(loader.dataset_metadata))
-    config = replace(loader.config, batch_size=1, volume_io_threads=1,
-                     volume_decode_threads=1, volume_sample_threads=1)
+    config = replace(loader.config, batch_size=1, volume_io_threads=1)
     assert metadata.for_config(config).sample_count == loader.sample_count
     with pytest.raises(ValueError, match="differs"):
         metadata.for_config(replace(config, seed=config.seed + 1))

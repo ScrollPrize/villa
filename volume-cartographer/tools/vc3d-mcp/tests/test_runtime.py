@@ -158,8 +158,8 @@ class RegistryResolutionTest(unittest.IsolatedAsyncioTestCase):
 class AutoLaunchTest(unittest.TestCase):
     def test_volume_package_uses_its_own_cli_option(self) -> None:
         self.assertEqual(
-            server_module._launch_command("/tmp/VC3D", "/tmp/demo.volpkg.json"),
-            ["/tmp/VC3D", "--agent-bridge", "--volpkg", "/tmp/demo.volpkg.json"],
+            server_module._launch_command("/tmp/VC3D", "/tmp/demo.vcproj"),
+            ["/tmp/VC3D", "--agent-bridge", "--project", "/tmp/demo.vcproj"],
         )
 
     def test_path_binary_is_used_before_repo_builds(self) -> None:

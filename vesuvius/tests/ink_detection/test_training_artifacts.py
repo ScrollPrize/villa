@@ -20,7 +20,7 @@ from vesuvius.ink_detection.training.train import (
 
 from vesuvius.ink_detection.config import TrainingConfig, resolve_training_mapping
 
-from .test_model_foundation import _config_mapping
+from .helpers import config_mapping
 from vesuvius.ink_detection.training.visualization import (
     PreviewAccumulator,
     central_full_3d_preview,
@@ -169,7 +169,7 @@ def test_benchmark_summary_uses_global_examples_and_cpu_zero_peaks():
 
 
 def test_checkpoint_payload_uses_canonical_mapping_and_optional_ema_state():
-    authored = _config_mapping(depth=1, side=4)
+    authored = config_mapping(depth=1, side=4)
     authored.update(
         {
             "num_iterations": 6,

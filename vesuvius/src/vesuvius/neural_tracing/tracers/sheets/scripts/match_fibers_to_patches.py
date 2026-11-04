@@ -25,7 +25,7 @@ import time
 from pathlib import Path
 
 import numpy as np
-import tifffile
+from vc_reader import tifxyz
 from scipy.spatial import cKDTree
 
 from vesuvius.neural_tracing.tracers.shared.annotations.vc3d import fiber_tag
@@ -40,7 +40,7 @@ _STATE = {}  # node arrays and tree, shared with forked workers
 
 def patch_nodes(info) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Valid nodes (N, 3), their unit normals (N, 3) and grid (row, col) (N, 2) of one patch."""
-    xyz = np.stack([np.asarray(tifffile.memmap(info.path/f'{c}.tif'), np.float32) for c in 'xyz'], -1)
+    xyz = tifxyz.read(info.path, mask=False).xyz
     if min(xyz.shape[:2]) < 2:  # a single row or column has no surface normal
         return np.zeros((0, 3), np.float32), np.zeros((0, 3), np.float32), np.zeros((0, 2), np.int32)
     ok = np.all(xyz != -1, -1) & np.all(np.isfinite(xyz), -1)

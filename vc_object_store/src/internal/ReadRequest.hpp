@@ -31,4 +31,6 @@ inline thread_local ReadRequest* readRequest = nullptr;
 inline void requestPoll() { if (readRequest) readRequest->poll(); }
 inline void requestBytes(uint64_t n, uint64_t RegionStats::* counter) { if (readRequest) readRequest->bytes(n, counter); }
 inline void requestWork(uint64_t RegionStats::* counter) { if (readRequest) readRequest->work(counter); }
+// Reported, not budgeted: bytes served from data already verified and charged.
+inline void requestServed(uint64_t n, uint64_t RegionStats::* counter) { if (readRequest) readRequest->result.stats.*counter += n; }
 }

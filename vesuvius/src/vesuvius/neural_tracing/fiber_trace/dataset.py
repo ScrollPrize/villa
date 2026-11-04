@@ -25,11 +25,8 @@ from vesuvius.neural_tracing.fiber_trace.geometry import (
 from vesuvius.neural_tracing.fiber_trace.labels import IGNORE_ID, IGNORE_INDEX
 from vesuvius.neural_tracing.datasets.common import (
     _read_volume_crop_from_patch as _common_read_volume_crop_from_patch,
-    begin_zarr_cache_trace,
-    end_zarr_cache_trace,
     open_zarr as _common_open_zarr,
 )
-from vesuvius.neural_tracing.zarr_support import zarr_chunk_key
 
 
 @dataclass(frozen=True)
@@ -106,14 +103,6 @@ class FiberTraceBatch:
 class FiberTraceDebugTableState:
     rows: int = 0
     legend_printed: bool = False
-
-
-@dataclass(frozen=True)
-class ZarrChunkRequest:
-    store: Any
-    store_identity: str
-    key: str
-    label: str
 
 
 @dataclass(frozen=True)
@@ -547,86 +536,6 @@ def _chunk_ranges_for_bbox(
     return tuple((int(first[axis]), int(last[axis])) for axis in range(3))  # type: ignore[return-value]
 
 
-def _zarr_store_identity(store: Any) -> str:
-    url = getattr(store, "_url", None)
-    cache_dir = getattr(store, "_cache_dir", None)
-    if url is not None:
-        return f"{type(store).__module__}.{type(store).__name__}:{url}:{cache_dir}"
-    path = getattr(store, "path", None)
-    if path is not None:
-        return f"{type(store).__module__}.{type(store).__name__}:{path}"
-    return f"{type(store).__module__}.{type(store).__name__}:{repr(store)}"
-
-
-def _is_remote_cached_store(store: Any) -> bool:
-    return getattr(store, "_url", None) is not None and getattr(
-        store, "_cache_dir", None
-    ) is not None
-
-
-def _chunk_requests_for_bbox(
-    array: Any,
-    bbox: tuple[np.ndarray, np.ndarray] | None,
-    *,
-    label: str,
-) -> list[ZarrChunkRequest]:
-    if bbox is None:
-        return []
-
-    channel_index: int | None = None
-    spatial_array = array
-    zarr_array = array
-    if isinstance(array, _SpatialChannelView):
-        spatial_array = array
-        zarr_array = array.array
-        channel_index = int(array.channel_index)
-
-    chunks = _array_chunks_zyx(spatial_array)
-    store = getattr(zarr_array, "store", None)
-    if chunks is None or store is None:
-        return []
-    if not _is_remote_cached_store(store):
-        return []
-
-    starts, ends = bbox
-    chunk_np = np.asarray(chunks, dtype=np.int64)
-    first = np.asarray(starts, dtype=np.int64) // chunk_np
-    last = (np.asarray(ends, dtype=np.int64) - 1) // chunk_np
-    if np.any(last < first):
-        return []
-
-    zarr_chunks = tuple(int(v) for v in getattr(zarr_array, "chunks", ()))
-    zarr_shape = tuple(int(v) for v in getattr(zarr_array, "shape", ()))
-    store_identity = _zarr_store_identity(store)
-    requests: list[ZarrChunkRequest] = []
-    for chunk_z in range(int(first[0]), int(last[0]) + 1):
-        for chunk_y in range(int(first[1]), int(last[1]) + 1):
-            for chunk_x in range(int(first[2]), int(last[2]) + 1):
-                spatial_coords = (chunk_z, chunk_y, chunk_x)
-                if len(zarr_shape) == 4:
-                    if channel_index is None:
-                        channel_index = 0
-                    if len(zarr_chunks) != 4 or int(zarr_chunks[0]) <= 0:
-                        continue
-                    coords = (int(channel_index) // int(zarr_chunks[0]),) + spatial_coords
-                elif len(zarr_shape) == 3:
-                    coords = spatial_coords
-                else:
-                    continue
-                key = zarr_chunk_key(zarr_array, coords)
-                if key is None:
-                    continue
-                requests.append(
-                    ZarrChunkRequest(
-                        store=store,
-                        store_identity=store_identity,
-                        key=key,
-                        label=str(label),
-                    )
-                )
-    return requests
-
-
 def _chunk_index_for_zyx(
     array: Any, array_zyx: np.ndarray
 ) -> tuple[int, int, int] | None:
@@ -1014,7 +923,6 @@ class FiberTraceBatchBuilder:
         self._record_random_negative_pool_keys: list[tuple[Any, ...]] = []
         self._build_random_negative_center_pools()
         self._sample_batch_count = 0
-        self.last_cache_stats: Any | None = None
         self.last_sample_ms = 0.0
 
     def __len__(self) -> int:
@@ -1203,7 +1111,6 @@ class FiberTraceBatchBuilder:
         *,
         iteration: int | None,
         total_ms: float,
-        cache_stats: Any,
     ) -> None:
         if not self.debug_sampling:
             return
@@ -1213,37 +1120,19 @@ class FiberTraceBatchBuilder:
         every = max(1, int(self._debug_batch_header_every))
         if not state.legend_printed:
             print(
-                "fiber_trace batch columns: it=iteration data=batch data-loading ms "
-                "hit/dl/mis=cache events hms/dms=cache-hit/download ms "
-                "hMiB/s/dMiB/s=cache-hit/download throughput",
+                "fiber_trace batch columns: it=iteration data=batch data-loading ms",
                 flush=True,
             )
             state.legend_printed = True
         if state.rows % every == 0:
             print(
-                "   it      data  hit  dl mis      hms      dms   hMiB/s   dMiB/s",
+                "   it      data",
                 flush=True,
             )
         state.rows += 1
-        cache_mib = float(getattr(cache_stats, "cache_hit_bytes", 0)) / (1024.0 * 1024.0)
-        download_mib = float(getattr(cache_stats, "download_bytes", 0)) / (1024.0 * 1024.0)
-        cache_ms = float(getattr(cache_stats, "cache_hit_ms", 0.0))
-        download_ms = float(getattr(cache_stats, "download_ms", 0.0))
-        cache_mib_s = cache_mib / max(cache_ms / 1000.0, 1e-9) if cache_mib > 0.0 else 0.0
-        download_mib_s = (
-            download_mib / max(download_ms / 1000.0, 1e-9)
-            if download_mib > 0.0
-            else 0.0
-        )
-
         print(
             f"{'-' if iteration is None else int(iteration):>5} "
-            f"{total_ms:9.1f} "
-            f"{int(getattr(cache_stats, 'cache_hits', 0)):3d} "
-            f"{int(getattr(cache_stats, 'downloads', 0)):2d} "
-            f"{int(getattr(cache_stats, 'missing', 0)) + int(getattr(cache_stats, 'negative_hits', 0)):3d} "
-            f"{cache_ms:8.1f} {download_ms:8.1f} "
-            f"{cache_mib_s:8.1f} {download_mib_s:8.1f}",
+            f"{total_ms:9.1f}",
             flush=True,
         )
 
@@ -1547,81 +1436,6 @@ class FiberTraceBatchBuilder:
             "direction_kind": direction_kind,
         }
 
-    def prefetch_chunk_requests_for_iteration(
-        self,
-        *,
-        iteration: int,
-        record_index: int | None = None,
-    ) -> list[ZarrChunkRequest]:
-        batch_ordinal = self._limited_batch_ordinal(int(iteration))
-        specs = self._batch_crop_specs(
-            record_index=record_index,
-            batch_ordinal=batch_ordinal,
-        )
-        requests: list[ZarrChunkRequest] = []
-        read_crop_size_np = np.asarray(self.augmentation_crop_size, dtype=np.int64)
-        crop_offset = self._post_augmentation_crop_offset
-        for spec in specs:
-            record = spec["record"]
-            center = np.asarray(spec["center_zyx"], dtype=np.int64)
-            sample_local_zyx = np.asarray(spec["sample_local_zyx"], dtype=np.int64)
-            read_min_corner = center - sample_local_zyx - crop_offset
-            read_shape = tuple(int(v) for v in read_crop_size_np)
-
-            requests.extend(
-                _chunk_requests_for_bbox(
-                    record.volume,
-                    _raw_source_bbox_zyx(
-                        record.volume,
-                        read_shape,
-                        read_min_corner,
-                    ),
-                    label="base",
-                )
-            )
-            requests.extend(
-                _chunk_requests_for_bbox(
-                    record.mask,
-                    _scaled_source_bbox_zyx(
-                        record.mask,
-                        read_shape,
-                        read_min_corner,
-                        dst_spacing_base=record.volume_spacing_base,
-                        src_spacing_base=record.mask_spacing_base,
-                    ),
-                    label="grad_mag",
-                )
-            )
-            if record.nx is not None and record.nx_spacing_base is not None:
-                requests.extend(
-                    _chunk_requests_for_bbox(
-                        record.nx,
-                        _scaled_source_bbox_zyx(
-                            record.nx,
-                            read_shape,
-                            read_min_corner,
-                            dst_spacing_base=record.volume_spacing_base,
-                            src_spacing_base=record.nx_spacing_base,
-                        ),
-                        label="nx",
-                    )
-                )
-            if record.ny is not None and record.ny_spacing_base is not None:
-                requests.extend(
-                    _chunk_requests_for_bbox(
-                        record.ny,
-                        _scaled_source_bbox_zyx(
-                            record.ny,
-                            read_shape,
-                            read_min_corner,
-                            dst_spacing_base=record.volume_spacing_base,
-                            src_spacing_base=record.ny_spacing_base,
-                        ),
-                        label="ny",
-                    )
-                )
-        return requests
-
     def sample_batch(
         self,
         *,
@@ -1633,10 +1447,7 @@ class FiberTraceBatchBuilder:
         trace_enabled = bool(
             self.debug_sampling if debug is None else self.debug_sampling and debug
         )
-        self.last_cache_stats = None
         self.last_sample_ms = 0.0
-        if trace_enabled:
-            begin_zarr_cache_trace()
         batch_t0 = time.perf_counter()
         requested_batch_ordinal = (
             int(iteration) if iteration is not None else self._sample_batch_count
@@ -1731,14 +1542,11 @@ class FiberTraceBatchBuilder:
             fiber_paths=tuple(fiber_path for _ in samples),
             direction_kinds=tuple(str(s["direction_kind"]) for s in samples),
         )
-        cache_stats = end_zarr_cache_trace() if trace_enabled else None
-        self.last_cache_stats = cache_stats
         self.last_sample_ms = (time.perf_counter() - batch_t0) * 1000.0
         if trace_enabled and emit_debug_row:
             self._debug_batch_row(
                 iteration=iteration,
                 total_ms=self.last_sample_ms,
-                cache_stats=cache_stats,
             )
         self._sample_batch_count += 1
         return batch

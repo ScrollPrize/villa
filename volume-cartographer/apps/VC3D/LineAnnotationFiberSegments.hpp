@@ -1,4 +1,5 @@
 #pragma once
+#include "LineAnnotationPolylineIndices.hpp"
 
 #include <cstddef>
 #include <atomic>
@@ -565,14 +566,10 @@ struct FiberModeOptimizationResult {
 
 void validateStoredControlPoints(const std::vector<StoredControlPoint>& controls);
 
-// The loader's exact-membership scan (kControlPointMatchEpsilon in
-// core/src/Atlas.cpp): every control must be an exact member (1e-8) of
+// The exact-membership scan: every control must be an exact member (1e-8) of
 // linePoints, in strictly increasing line order. Returns each control's line
 // index, or nullopt on the first violation. Split/merge planning and the
 // save-path geometry guard share this single implementation.
-[[nodiscard]] std::optional<std::vector<size_t>> orderedControlPointLineIndices(
-    const std::vector<cv::Vec3d>& controlPoints,
-    const std::vector<cv::Vec3d>& linePoints);
 
 // The controlled span of a fiber: linePoints from the first control's line
 // index to the last control's (inclusive), mapped with the ordered scan above.
@@ -669,8 +666,8 @@ struct FiberSplitPlan {
 
 // Returns nullopt when splitAfterControlIndex is out of range, either half
 // would keep fewer than 2 control points, or the control points are not an
-// ordered subset of linePoints under the loader's exact-membership
-// tolerance (vc::atlas::validateFiberInputControlPoints).
+// ordered subset of linePoints under the exact-membership tolerance
+// (orderedControlPointLineIndices).
 [[nodiscard]] std::optional<FiberSplitPlan> computeFiberSplitPlan(
     const std::vector<cv::Vec3d>& controlPoints,
     const std::vector<cv::Vec3d>& linePoints,

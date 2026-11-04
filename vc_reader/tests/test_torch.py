@@ -1,15 +1,12 @@
 """Run with unittest; VC_READER_BUILD_DIR selects an existing CMake build."""
 import gc
-import os
 from pathlib import Path
 import subprocess
 import sys
 import unittest
 
-if os.environ.get("VC_READER_BUILD_DIR"):
-    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "benchmarks"))
-    from extension_build import load_extensions
-    load_extensions(Path(os.environ["VC_READER_BUILD_DIR"]))
+from build_support import load_build
+load_build()
 
 import numpy as np
 import torch
@@ -65,12 +62,10 @@ class ConfigurationTests(unittest.TestCase):
     def test_import_does_not_require_torch(self):
         # The catalog and ordinary augmentation APIs remain independent of Torch.
         code = """
-import sys, os
-if os.environ.get('VC_READER_BUILD_DIR'):
-    sys.path.insert(0, 'benchmarks')
-    from pathlib import Path
-    from extension_build import load_extensions
-    load_extensions(Path(os.environ['VC_READER_BUILD_DIR']))
+import sys
+sys.path.insert(0, 'tests')
+from build_support import load_build
+load_build()
 import vc_reader
 from vc_reader import transforms
 assert 'torch' not in sys.modules
@@ -162,8 +157,9 @@ class BatchTests(unittest.TestCase):
         self.assertEqual(result.dtype, torch.float64)
         self.assertSame(result, x.flip(-1))
         device_array = cuda.asarray(image_batch().numpy())
-        self.assertSame(pipeline.batch({'image': device_array}, seeds=[1, 2, 3])['image'],
-                        image_batch().to('cuda', dtype=torch.float32).flip(-1))
+        native = pipeline.batch({'image': device_array}, seeds=[1, 2, 3])['image']
+        self.assertIsInstance(native, cuda.DeviceArray)  # DeviceArray batches stay DeviceArray, without Torch
+        self.assertSame(torch.from_dlpack(native), image_batch().to('cuda', dtype=torch.float32).flip(-1))
 
     def test_changed_shape_generated_target_and_removed_source(self):
         p = A.Pipeline([A.CropPad((3, 4, 5)), A.OneHot([0, 1], on='mask', remove_source=True)], backend='cuda')
@@ -458,6 +454,59 @@ class GeometryTests(unittest.TestCase):
                         repeated = pipeline(sample, seed=456)
                         for key in sample:
                             self.assertEqual(actual[key].numpy().tobytes(), repeated[key].numpy().tobytes())
+
+
+class NormalizeTests(unittest.TestCase):
+    def devices(self):
+        return ['cpu', 'cuda'] if cuda.is_available() and torch.cuda.is_available() else ['cpu']
+
+    @staticmethod
+    def normalize(x, mode='zscore', valid=None, eps=1e-6):
+        options = dict(nonzero=False) if mode == 'zscore' else {}
+        if valid is None:
+            return A.Normalize(mode, eps=eps, **options).batch(x)
+        return A.Normalize(mode, masked=True, eps=eps, **options).batch(
+            {'image': x, 'valid': valid},
+            targets={'image': A.Image(valid='valid', refill=False), 'valid': A.ValidMask()})['image']
+
+    def expected(self, x, mode, valid, eps=1e-6):
+        # Statistics of the valid voxels of each sample, every voxel transformed.
+        out = np.empty_like(x)
+        for i in range(len(x)):
+            values = x[i][valid[i] > 0].astype(np.float64)
+            if mode == 'zscore':
+                out[i] = (x[i] - values.mean()) / max(values.std(), eps)
+            else:
+                out[i] = (x[i] - values.min()) / max(values.max() - values.min(), eps)
+        return out
+
+    def test_every_voxel_is_transformed_from_the_valid_statistics(self):
+        rng = np.random.default_rng(0)
+        x = rng.normal(100, 20, (3, 1, 16, 16, 16)).astype(np.float32)
+        valid = (rng.random(x.shape) > .3).astype(np.uint8)
+        for device in self.devices():
+            for mode in ('zscore', 'minmax'):
+                with self.subTest(device=device, mode=mode):
+                    result = self.normalize(torch.from_numpy(x).to(device), mode, valid=torch.from_numpy(valid).to(device).bool())
+                    self.assertEqual(result.device.type, device)
+                    np.testing.assert_allclose(result.cpu().numpy(), self.expected(x, mode, valid), atol=2e-5)
+
+    def test_without_a_mask_and_in_two_dimensions(self):
+        x = np.random.default_rng(1).normal(0, 5, (2, 1, 32, 32)).astype(np.float32)
+        for device in self.devices():
+            with self.subTest(device=device):
+                result = self.normalize(torch.from_numpy(x).to(device)).cpu().numpy()
+                np.testing.assert_allclose(result, self.expected(x, 'zscore', np.ones_like(x)), atol=2e-5)
+
+    def test_divisor_floor_and_constants(self):
+        for device in self.devices():
+            with self.subTest(device=device):
+                flat = torch.full((1, 1, 4, 4, 4), 7.).to(device)
+                self.assertEqual(self.normalize(flat).abs().max().item(), 0)
+                self.assertEqual(self.normalize(flat, 'minmax').abs().max().item(), 0)
+                tiny = torch.zeros_like(flat)
+                tiny[0, 0, 0, 0, 0] = 1e-7
+                self.assertAlmostEqual(self.normalize(tiny, 'minmax', eps=1e-6).max().item(), .1, places=5)
 
 
 if __name__ == '__main__':

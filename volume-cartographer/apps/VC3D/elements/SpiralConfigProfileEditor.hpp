@@ -69,8 +69,6 @@ private:
     StoredProfile* findStored(const QString& id);
     const StoredProfile* findStored(const QString& id) const;
 
-    void popOut();
-    void popIn();
     void rebuildControls();
     void controlsToJson();
     void jsonToControls();
@@ -93,7 +91,6 @@ private:
     QPushButton* _saveAsButton = nullptr;
     QPushButton* _renameButton = nullptr;
     QPushButton* _deleteButton = nullptr;
-    QPushButton* _popButton = nullptr;
     QPushButton* _inlinePopInButton = nullptr;
     QPlainTextEdit* _textEdit = nullptr;
     QLabel* _statusLabel = nullptr;
@@ -116,5 +113,4 @@ private:
     QString _errorText;
     bool _dirty = false;
     bool _programmatic = false;
-    bool _poppedOut = false;
 };

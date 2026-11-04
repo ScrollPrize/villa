@@ -1,6 +1,10 @@
 #pragma once
 
 #include "FiberDisplayOptions.hpp"
+#include "FiberCollectionGenerator.hpp"
+#include <QProcess>
+#include <QTemporaryDir>
+#include <tuple>
 #include "overlays/ViewerOverlayControllerBase.hpp"
 #include "vc/core/types/FiberView.hpp"
 #include <vc_object_store/objects/ObjectStoreSession.hpp>
@@ -14,6 +18,12 @@
 #include <vector>
 
 class CState;
+class QMainWindow;
+class Volume;
+class QPushButton;
+class QLabel;
+class QProgressBar;
+class QDialog;
 class LineAnnotationController;
 
 // The attached store's fibers: the catalog pages listed by the Fibers panel,
@@ -34,8 +44,9 @@ public:
     // One listed fiber: its record (name, tags, typed summary, metadata) and links.
     struct CatalogRow {
         vc::objects::ObjectRecord record;
-        // Stored units -> volume voxels; unset for a fiber not bound to the volume.
-        std::optional<double> toVolume;
+        // Stored coordinates -> volume voxels (by scale or a registration);
+        // unset for a fiber not bound to the volume.
+        std::optional<vc::objects::VolumeAffine> mapping;
         int links = 0;
         int pendingLinks = 0;
         // Fibers connected through links, this one included.
@@ -51,7 +62,7 @@ public:
     [[nodiscard]] const FiberDisplayOptions& options() const { return options_; }
     void setOptions(const FiberDisplayOptions& options);
     void setLineAnnotationActive(bool active);
-    void openCollection(const QString& path, const QString& author);
+    void createCollection();
     void firstPage();
     void nextPage();
     // A listed fiber was clicked: select it, focusing the main views while
@@ -59,6 +70,7 @@ public:
     void activateFiber(int64_t id);
     void selectFiber(int64_t id, bool focusView = true, bool openAnnotation = false);
     void navigate(int index);
+    void clearSelection();
     void showInLineAnnotation(int64_t id);
     // Selects the trace under a plain left click that no native tool, collection
     // point or fiber annotation used. Returns true if a trace was selected.
@@ -69,6 +81,7 @@ public:
     void detachViewer(VolumeViewerBase* viewer) override;
 
 signals:
+    void optionsChanged();
     void catalogChanged(std::vector<FiberCollectionController::CatalogRow> rows, bool morePages);
     void statusChanged(bool attached, const QString& text);
     void selectionChanged(const FiberCollectionController::Selection& selection);
@@ -86,6 +99,29 @@ protected:
     bool eventFilter(QObject* watched, QEvent* event) override;
 
 private:
+    std::weak_ptr<Volume> generatorVolume_;
+    QMainWindow* window_{};
+    QDialog* generatorDialog_{};
+    QPushButton* generatorCancel_{};
+    QProgressBar* generatorProgress_{};
+    QLabel* generatorStatus_{};
+    QPointer<QProcess> generator_;
+    QString generatorOutput_, generatorError_, generatorSpace_, generatorPython_;
+    QStringList generatorLog_;
+    std::unique_ptr<QTemporaryDir> generatorPreview_;
+    std::optional<vc::objects::AttachmentIdentity> previewAttachment_;
+    std::vector<vc3d::fibergen::Block> generationBlocks_;
+    std::vector<QString> generationStates_;
+    uint64_t generationRevision_{};
+    std::unordered_map<VolumeViewerBase*, std::tuple<uint64_t, QRectF, std::optional<vc::fibers::ViewRegion>>> drawnGeneration_;
+    std::optional<vc::objects::AttachmentIdentity> displayedStore() const;
+    void openPreview(const QString& path);
+    void closePreview();
+    void readGeneratorOutput();
+    void finishGenerator(int exitCode, bool crashed);
+    void showGeneratorStatus(const QString& text);
+    void showGenerationBlocks(std::vector<vc3d::fibergen::Block> blocks);
+    void drawGenerationBlocks(VolumeViewerBase* viewer, OverlayBuilder& builder);
     struct View;
     using Slice = vc::fibers::ViewRegion;
     // The last listed row: its UUID and, when bound, its volume length.
@@ -102,11 +138,10 @@ private:
     bool annotationBusy_{false};
     bool lineAnnotationActive_{false};
     int64_t pendingAnnotation_{};
-    double nativeToViewer_{1.0};
     double nativeVoxelMm_{1.0};
     int64_t selected_{0};
     std::optional<vc::objects::PinnedObject> selectedPin_;
-    std::optional<double> selectedToVolume_;
+    bool selectedBound_{false};
     Selection selection_;
     uint64_t revision_{0}, selectionRevision_{0}, navigationRevision_{0}, annotationRevision_{0};
     bool enabled_{false}, catalogBusy_{false}, catalogPending_{false}, navigationBusy_{false};

@@ -3,7 +3,7 @@ import argparse
 from typing import Optional, List
 
 import numpy as np
-import tifffile
+from vc_reader import images
 import torch
 from PIL import Image
 
@@ -23,7 +23,7 @@ def _ensure_out_dir(out_dir: Path) -> None:
 
 def _load_stack(path: Path) -> np.ndarray:
 	"""Load a TIFF stack as (L,H,W) or (1,H,W)."""
-	arr = tifffile.imread(str(path))
+	arr = images.read(str(path))
 	if arr.ndim == 2:
 		arr = arr[None, ...]
 	elif arr.ndim != 3:

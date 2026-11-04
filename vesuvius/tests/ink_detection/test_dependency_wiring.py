@@ -9,12 +9,7 @@ import tomllib
 
 _INK_RUNTIME_DISTRIBUTIONS = {
     "accelerate",
-    "connected-components-3d",
-    "cucim-cu13",
-    "diffusers",
-    "imagecodecs",
     "opencv-python-headless",
-    "tifffile",
 }
 
 

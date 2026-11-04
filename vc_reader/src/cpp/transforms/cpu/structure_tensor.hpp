@@ -79,6 +79,39 @@ template<class T> std::vector<std::vector<T>> structure_gradients(const Structur
     for (std::size_t a = 0; a < d; ++a) separable(gradient[a], g, taps[a], t.boundary);
     return gradient;
 }
+// With zero extension, transposed correlation reverses each filter's taps.
+inline std::vector<filter_detail::Taps> transpose_taps(std::vector<filter_detail::Taps> taps) {
+    for (auto& axis : taps) std::reverse(axis.weights.begin(), axis.weights.end());
+    return taps;
+}
+template<class T> std::vector<T> structure_backward(const StructureTensor& t, const Array& a, const Array& cotangent, const Grid& g) {
+    using namespace structure_tensor_detail;
+    const auto d = g.shape.size();
+    require(cotangent.shape[0] == std::size_t(component_count(int(d))) && cotangent.spatial() == g.shape,
+            "structure tensor cotangent shape mismatch");
+    auto gradients = structure_gradients(t, a.channel<T>(t.channel), g);
+    std::vector<std::vector<T>> dg(d, std::vector<T>(g.size, T(0)));
+    const auto integration = transpose_taps(integration_taps(t, d));
+    for (int c = 0; c < component_count(int(d)); ++c) {
+        auto v = cotangent.channel<T>(c);
+        separable(v, g, integration, Boundary::Zero);
+        int x, y; component_axes(c, int(d), x, y);
+        for (std::size_t i = 0; i < g.size; ++i) {
+            dg[x][i] += v[i] * gradients[y][i];
+            dg[y][i] += v[i] * gradients[x][i];
+        }
+    }
+    const auto taps = gradient_taps(t, d);
+    std::vector<T> result(g.size, T(0));
+    for (std::size_t axis = 0; axis < d; ++axis) {
+        separable(dg[axis], g, transpose_taps(taps[axis]), Boundary::Zero);
+        for (std::size_t i = 0; i < g.size; ++i) result[i] += dg[axis][i];
+    }
+    if (t.derivative == Derivative::Pavel && t.sigma > 0)
+        separable(result, g, std::vector<Taps>(d, torch_gaussian(t.sigma)), Boundary::Zero);
+    for (auto& v : result) v = T(double(v) * t.scale);
+    return result;
+}
 inline void apply(const StructureTensor& t, Sample& s, const Parameters&) {
     using namespace structure_tensor_detail;
     const auto& f = s.at(t.on); const auto& a = f.array; Grid g(a.spatial()); const int d = int(g.shape.size());
@@ -87,6 +120,14 @@ inline void apply(const StructureTensor& t, Sample& s, const Parameters&) {
     std::vector<std::pair<std::string, Field>> outputs;
     const auto run = [&](auto tag) {
         using T = decltype(tag);
+        if (!t.gradient.empty()) {
+            const auto values = structure_backward<T>(t, a, s.at(t.gradient).array, g);
+            Shape shape{1}; shape.insert(shape.end(), g.shape.begin(), g.shape.end());
+            Field out{Array(shape, 'f', sizeof(T)), derived(Role::Scalar), t.on};
+            out.array.channel(0, values);
+            outputs.emplace_back(name, std::move(out));
+            return;
+        }
         const auto input = a.channel<T>(t.channel);
         auto gradient = structure_gradients(t, input, g);
         const int count = component_count(d);

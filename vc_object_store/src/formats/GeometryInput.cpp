@@ -23,7 +23,8 @@ ObjectRecord sourceObject(const Json& root, const std::string& kind, const fs::p
     result.name = root.value("name", result.name);
     if (root.contains("tags") && root.at("tags").is_array())
         for (const auto& tag : root.at("tags")) result.tags.push_back(tag.get<std::string>());
-    if (kind == "point_collection" && root.contains("tags") && root.at("tags").is_object())
+    // VC's meta.json keeps status tags as an object keyed by tag name.
+    if (root.contains("tags") && root.at("tags").is_object())
         for (const auto& [name, value] : root.at("tags").items()) result.tags.push_back(name);
     return result;
 }

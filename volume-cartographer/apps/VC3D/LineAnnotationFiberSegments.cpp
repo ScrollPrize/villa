@@ -2420,36 +2420,8 @@ void invalidateSegmentsAdjacentToControl(std::vector<LineControlPoint>& controls
     (void)found;
 }
 
-// The loader's exact-membership scan (kControlPointMatchEpsilon in
-// core/src/Atlas.cpp): controls must be an ordered subset of the dense
+// The exact-membership scan: controls must be an ordered subset of the dense
 // line, so geometry sliced at these indices reloads cleanly.
-std::optional<std::vector<size_t>> orderedControlPointLineIndices(
-    const std::vector<cv::Vec3d>& controlPoints,
-    const std::vector<cv::Vec3d>& linePoints)
-{
-    constexpr double kMatchEpsilon = 1.0e-8;
-    constexpr double kMaxDistanceSq = kMatchEpsilon * kMatchEpsilon;
-    std::vector<size_t> lineIndices;
-    lineIndices.reserve(controlPoints.size());
-    size_t nextLineIndex = 0;
-    for (const auto& control : controlPoints) {
-        std::optional<size_t> matched;
-        for (size_t j = nextLineIndex; j < linePoints.size(); ++j) {
-            const cv::Vec3d delta = control - linePoints[j];
-            if (delta.dot(delta) <= kMaxDistanceSq) {
-                matched = j;
-                break;
-            }
-        }
-        if (!matched) {
-            return std::nullopt;
-        }
-        lineIndices.push_back(*matched);
-        nextLineIndex = *matched + 1;
-    }
-    return lineIndices;
-}
-
 std::vector<cv::Vec3d> linePointsBetweenOuterControlPoints(
     const std::vector<cv::Vec3d>& linePoints,
     const std::vector<cv::Vec3d>& controlPoints)

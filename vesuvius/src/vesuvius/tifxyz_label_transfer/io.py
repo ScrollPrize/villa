@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import os
 from pathlib import Path
 import queue
@@ -14,70 +13,24 @@ from typing import Optional, Sequence, Tuple
 import numpy as np
 from numpy.typing import NDArray
 from PIL import Image
-import tifffile
+from vc_reader import images
 
-from .core import Surface
+from vc_reader import tifxyz
+
+from .core import Surface, close_memmap
 
 
 def _read_tiff(path: Path) -> NDArray:
     try:
-        return tifffile.memmap(path, mode="r")
+        return images.memmap(path)
     except ValueError:
-        return tifffile.imread(path)
-
-
-def load_tifxyz_mask(
-    path: Path | str,
-    xyz_shape: Sequence[int],
-) -> NDArray[np.bool_]:
-    """Load a TIFXYZ mask using the canonical stored-grid semantics."""
-    mask_path = Path(path)
-    target_shape = int(xyz_shape[0]), int(xyz_shape[1])
-    mask = np.asarray(_read_tiff(mask_path))
-
-    # mask.tif may be multipage; the first page is the validity mask.
-    if (
-        mask.ndim > 2
-        and mask.shape[-2] % target_shape[0] == 0
-        and mask.shape[-1] % target_shape[1] == 0
-    ):
-        mask = mask.reshape((-1, mask.shape[-2], mask.shape[-1]))[0]
-    elif (
-        mask.ndim > 2
-        and mask.shape[0] % target_shape[0] == 0
-        and mask.shape[1] % target_shape[1] == 0
-    ):
-        mask = mask.reshape((mask.shape[0], mask.shape[1], -1))[:, :, 0]
-
-    if mask.shape == target_shape:
-        return np.asarray(mask >= 255)
-    if (
-        mask.ndim == 2
-        and mask.shape[0] % target_shape[0] == 0
-        and mask.shape[1] % target_shape[1] == 0
-    ):
-        # QuadSurface accepts a higher-resolution mask when each dimension is
-        # an integer multiple of the XYZ grid. A stored-grid point is retained
-        # only when its complete mask block is valid.
-        factor_y = mask.shape[0] // target_shape[0]
-        factor_x = mask.shape[1] // target_shape[1]
-        return np.all(
-            mask.reshape(
-                target_shape[0], factor_y, target_shape[1], factor_x
-            )
-            >= 255,
-            axis=(1, 3),
-        )
-    raise ValueError(
-        f"mask shape {mask.shape} is incompatible with XYZ shape "
-        f"{target_shape}"
-    )
+        return images.read(path)
 
 
 def _open_zarr_label(path: Path):
-    import zarr
+    from vc_reader.reader import open_group
 
-    group = zarr.open_group(str(path), mode="r")
+    group = open_group(path)
     if "0" not in group:
         raise ValueError(f"label Zarr {path} has no level-0 array")
     return group["0"]
@@ -106,8 +59,7 @@ def read_image(path: Path | str) -> NDArray:
     elif image_path.suffix.lower() in {".tif", ".tiff"}:
         image = np.asarray(_read_tiff(image_path))
     else:
-        with Image.open(image_path) as handle:
-            image = np.asarray(handle)
+        image = images.read(image_path)
     image = np.squeeze(image)
     if image.ndim != 2:
         raise ValueError(
@@ -121,68 +73,35 @@ def read_image_shape(path: Path | str) -> Tuple[int, int]:
     image_path = Path(path)
     if image_path.is_dir() and image_path.suffix.lower() == ".zarr":
         return _zarr_label_shape(_open_zarr_label(image_path), image_path)
-    if image_path.suffix.lower() in {".tif", ".tiff"}:
-        with tifffile.TiffFile(image_path) as handle:
-            shape = tuple(int(value) for value in handle.series[0].shape)
-        while len(shape) > 2 and shape[0] == 1:
-            shape = shape[1:]
-        if len(shape) != 2:
-            raise ValueError(
-                f"reference image must be 2D grayscale; "
-                f"{image_path} has shape {shape}"
-            )
-        return shape[0], shape[1]
-    with Image.open(image_path) as handle:
-        width, height = handle.size
-        if len(handle.getbands()) != 1:
-            raise ValueError(
-                f"reference image must be grayscale; "
-                f"{image_path} has bands {handle.getbands()}"
-            )
-    return int(height), int(width)
+    with images.open(image_path) as reader:
+        shape = tuple(int(value) for value in reader.shape)
+    while len(shape) > 2 and shape[0] == 1:
+        shape = shape[1:]
+    if len(shape) != 2:
+        raise ValueError(
+            f"reference image must be 2D grayscale; "
+            f"{image_path} has shape {shape}"
+        )
+    return shape[0], shape[1]
 
 
 def load_surface(path: Path | str, use_mask: bool = True) -> Surface:
     surface_path = Path(path)
-    required = [
-        surface_path / "x.tif",
-        surface_path / "y.tif",
-        surface_path / "z.tif",
-        surface_path / "meta.json",
-    ]
-    missing = [str(item) for item in required if not item.is_file()]
-    if missing:
-        raise FileNotFoundError(
-            f"not a TIFXYZ directory; missing: {', '.join(missing)}"
-        )
-
-    with (surface_path / "meta.json").open("r", encoding="utf-8") as handle:
-        metadata = json.load(handle)
-    scale = metadata.get("scale", [1.0, 1.0])
-    if not isinstance(scale, list) or len(scale) < 2:
-        raise ValueError(f"invalid scale in {surface_path / 'meta.json'}")
-    # C++ metadata stores [x_scale, y_scale]; array indexing uses (y, x).
-    scale_yx = float(scale[1]), float(scale[0])
-
-    x = np.asarray(_read_tiff(surface_path / "x.tif"), dtype=np.float32)
-    y = np.asarray(_read_tiff(surface_path / "y.tif"), dtype=np.float32)
-    z = np.asarray(_read_tiff(surface_path / "z.tif"), dtype=np.float32)
-    valid = None
-    mask_path = surface_path / "mask.tif"
-    if use_mask and mask_path.is_file():
-        try:
-            valid = load_tifxyz_mask(mask_path, x.shape)
-        except ValueError as exc:
-            raise ValueError(
-                f"{exc}; pass --ignore-tifxyz-mask only if this mask should "
-                "intentionally be ignored"
-            ) from exc
+    try:
+        stored = tifxyz.read(surface_path, mask=use_mask)
+    except ValueError as exc:
+        if "mask" not in str(exc):
+            raise
+        raise ValueError(
+            f"{exc}; pass --ignore-tifxyz-mask only if this mask should "
+            "intentionally be ignored"
+        ) from exc
     return Surface(
-        x=x,
-        y=y,
-        z=z,
-        scale_yx=scale_yx,
-        valid=valid,
+        x=stored.xyz[..., 0],
+        y=stored.xyz[..., 1],
+        z=stored.xyz[..., 2],
+        scale_yx=stored.scale,
+        valid=stored.valid,
         name=surface_path.name,
     )
 
@@ -193,13 +112,7 @@ def write_image(path: Path | str, image: NDArray) -> None:
     suffix = output_path.suffix.lower()
     if suffix in {".tif", ".tiff"}:
         estimated_bytes = int(np.prod(image.shape)) * int(image.dtype.itemsize)
-        tifffile.imwrite(
-            output_path,
-            image,
-            bigtiff=estimated_bytes >= (4 * 1024**3),
-            compression="zlib",
-            metadata=None,
-        )
+        images.write_tiff(output_path, image, compression="deflate")
         return
     if suffix != ".png":
         raise ValueError("output image extension must be .tif, .tiff, or .png")
@@ -234,8 +147,14 @@ class TemporaryRaster:
         self.array[:] = fill_value
 
     def close(self) -> None:
+        # Every read of this raster happens before its owner calls close(), so
+        # ending the mapping here is safe. Dropping the reference alone leaves
+        # the file mapped on Windows, where the unlink below then fails; close
+        # the mapping explicitly first.
         self.array.flush()
+        mapping = self.array
         del self.array
+        close_memmap(mapping)
         self.path.unlink(missing_ok=True)
 
     def __enter__(self) -> "TemporaryRaster":
@@ -316,20 +235,14 @@ class StreamingTiffOutputs:
     ) -> None:
         ended = threading.Event()
         try:
-            tifffile.imwrite(
+            with images.TiffWriter(
                 temporary,
-                self._tile_iterator(output_queue, ended),
-                shape=self.shape,
-                dtype=dtype,
-                bigtiff=(
-                    int(np.prod(self.shape)) * dtype.itemsize >= 4 * 1024**3
-                ),
+                self.shape,
+                dtype,
                 tile=(self.tile_size, self.tile_size),
-                compression="zlib",
-                photometric="minisblack",
-                metadata=None,
-                maxworkers=1,
-            )
+                compression="deflate",
+            ) as writer:
+                writer.write_tiles(self._tile_iterator(output_queue, ended))
         except BaseException as error:
             self._record_error(error)
             # Unblock a producer waiting on this bounded queue.

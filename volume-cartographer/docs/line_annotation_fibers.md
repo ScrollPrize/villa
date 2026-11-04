@@ -2,8 +2,9 @@
 
 ## Storage and coordinates
 
-Attach an existing `.vcobj` database with **File → Object Store → Attach Object Store**.
-**Attach Read-only Object Store** supports browsing without permitting writes.
+Fibers live in the open project's store (`.vcobj`), or in a store attached beside
+it and chosen for fibers (**File → Stores**). **Attach Read-only Store** supports
+browsing without permitting writes.
 VC3D edits geometry, annotations, relationships and retirement directly through
 the database APIs in one `ObjectStoreSession::act` transaction. Splits create two
 objects and retire the original in that transaction. VC3D retains pinned working
@@ -29,8 +30,8 @@ read-only store attachment the button stays disabled.
 
 Each fiber's explicit coordinate binding determines its transform into the active
 volume. Unbound fibers remain listed but are excluded from spatial overlays and
-search until bound. Slice, intersection, map and point-collection views apply the
-same per-fiber transform. Stored geometry and solver coordinates remain unchanged.
+search until bound. Slice, map and point-collection views apply the same
+per-fiber transform. Stored geometry and solver coordinates remain unchanged.
 `coordinate_base_shape_zyx`, when present, describes the stored coordinate grid.
 
 Import/export is an explicit transfer operation. VC3D imports current **version 4**
@@ -45,18 +46,27 @@ Spiral stages newly drawn and reopened fibers, including their linked endpoints,
 as input drafts. Subsequent edits refresh those drafts; applying them to the fit
 remains an explicit action. Fiber identity is the object UUID, not its display name.
 
-Atlas mappings require object-store revision pins. The atlas inspection,
-constraint export and pred-snap rebuild tools accept `--object-store PATH` and
-open that database read-only. Native JSON needed by external processing tools is
-materialized explicitly from pinned revisions into temporary transfer files.
+Native JSON needed by external processing tools is materialized explicitly from
+pinned revisions into temporary transfer files.
+
+The scroll umbilicus (Fiber Map unrolling, generated-view normal orientation) is
+an `umbilicus` object in the attached store, bound to a volume like a fiber. **File → Import Umbilicus...** reads an umbilicus
+file (JSON, text or CSV) for the active volume and decides its frame once: a file
+stamping its grid (`volume_width/height/slices` or `voxelsize_um`) is scaled from
+that stamp, a stamp contradicting the volume it names is refused, and a file that
+states nothing (or only matches by inference) asks for its units per voxel.
+Importing replaces the volume's previous umbilicus; **Remove Umbilicus** retires
+it. A volume uses the one live umbilicus bound to it; with none, or several, the
+consumers report it and use none. An umbilicus drawn in a registration's
+fixed-volume frame must be transformed before import: a binding is a scale.
+`vc_object_ingest --umbilicus FILE` imports the store's own `vc_umbilicus` JSON.
 
 Example build and checks (existing configured Ninja build):
 
 ```sh
-ninja -C build VC3D test_atlas vc_atlas_inspect vc_atlas_constraints_export vc_atlas_pred_snap_rebuild
+ninja -C build VC3D test_fiber_side_strip_intersections
 QT_QPA_PLATFORM=offscreen build/bin/VC3D --test-object-store
-build/bin/test_atlas
-build/bin/vc_atlas_inspect /path/to/atlas --object-store /path/to/objects.vcobj
+build/bin/test_fiber_side_strip_intersections
 ```
 
 ## CP direction annotations
@@ -303,10 +313,9 @@ the next dispatch, and a goal change or tail refresh from such an interior
 solves the whole line rather than certifying provisional spans.
 
 A gap span is closed to placement: the click, the `/` and `0` keys and the
-current-position marker (cut views, strips, overview bar and the
-intersection-inspection panes) treat any line position strictly inside it as
-blocked (red marker) until one of the breaks is removed. A break is refused
-at or immediately next to a kollesis termination (line-order neighbours), from
+current-position marker (cut views, strips and overview bar) treat any line
+position strictly inside it as blocked (red marker) until one of the breaks is
+removed. A break is refused at or immediately next to a kollesis termination (line-order neighbours), from
 the point menu and the span menu alike, so the span next to a sheet join can
 never become a gap. When a gap span
 forms, its `interp_goal` becomes `cspline` and the span is re-solved (the
@@ -416,8 +425,7 @@ of its dots) adds **Link <this> and <other>** to the menu, above Delete. It:
 
 1. finalizes, saves and closes any open Line Annotation of either fiber (what
    opening another fiber does; annotations of other fibers stay open), and
-   every dialog-less session of them (the intersection inspection included),
-   saving each first. If that saved something the map is stale: it updates
+   every dialog-less session of them, saving each first. If that saved something the map is stale: it updates
    by itself and the link continues on the rebuilt map without a second
    gesture, as long as both fibers still draw where the click saw them. If
    the saved work moved one of them on the map, the status line asks you to
@@ -666,8 +674,8 @@ is stored per project together with its enabled state. UI fields and viewer
 mask APIs use the current volume's voxel coordinates, but `focus_bounds` in
 the project JSON uses the source annotation grid (`coordinate_frame:
 "annotation"`). The same frame derivation used by the Fiber Map supplies the
-conversion: exact catalog coordinate factors take precedence, and untagged
-rebased volumes use their pyramid-base factor. Bounds are converted on read,
+conversion: the open volume's store voxels (`vc::project::annotationVolume`),
+whose scale is 2^-level at a working level or a prediction's level. Bounds are converted on read,
 not repeatedly rewritten on volume changes, so switching pyramid levels or
 reopening with another preferred level preserves the region. With no usable
 volume frame, the mask is unavailable; stored bounds are retained. Bounds with
@@ -927,17 +935,8 @@ that depends on trace provenance requires the per-span descriptors.
 
 VC3D uses the database's checked transactions, geometry edit APIs, relationships
 and retirement. It does not maintain merge bases, reconcile remote fiber JSONs,
-or publish fibers to Hugging Face. S3/SFTP fiber merging and one-off fiber tag
-migration scripts have been retired. Generic file transfers remain available
-through `scripts/vc_sync.py`.
-
-`vc_lasagna_line_probe --reopt` and `--reinit-reopt` write a coherent version-4
-Lasagna result: exact CP positions and existing goals are retained, actual span
-modes become `lasagna`, the input normal manifest and per-span maximum normal
-alignment error are recorded, trace-only diagnostics are cleared, and geometry
-and descriptors receive one generation update. The probe validates this result
-before atomically replacing its output. Without either optimization flag,
-`--output` copies the validated input without inventing new producer metadata.
+or publish fibers to Hugging Face. S3/SFTP fiber merging, one-off fiber tag
+migration scripts and `vc_sync.py` have been retired.
 
 The line-annotation extrapolation control is in base voxels. Lasagna mode grows
 normal-based tails. Native mode attempts each tail with the shared one-way

@@ -203,7 +203,6 @@ TEST_CASE("merge: every orientation combination writes loader-clean links (incid
             if (merged.modelOnly)
                 CHECK(merged.optimizationMode == vc3d::line_annotation::FiberOptimizationMode::NativeFiberTrace3d);
             CHECK(merged.branches.size() == 4);
-            CHECK(merged.coordinateBaseShapeZYX == a.coordinateBaseShapeZYX);
             CHECK(std::find(merged.tags.begin(), merged.tags.end(),
                             vc3d::line_annotation::kNeedsReoptimizationTag) != merged.tags.end());
             // The adjacent link keeps its kind through the redirect.
@@ -257,7 +256,6 @@ TEST_CASE("merge: consumes exactly the endpoint pair link and refuses other shap
         CHECK(error.find("coordinate") != std::string::npos);
         b.coordinateIdentity = a.coordinateIdentity;
         a.coordinateIdentity["coordinate_binding"] = {{"active_volume_id", "renamed"}};
-        a.coordinateBaseShapeZYX = std::array<std::size_t, 3>{10, 20, 30};
         REQUIRE(vc3d::line_annotation::planFiberMerge(
             a, 4, b, 0, FiberOptimizationMode::Lasagna, identity(9, "m.json"), &error));
         b.coordinateIdentity["coordinates"]["scale_factor"] = 4;
@@ -292,7 +290,6 @@ TEST_CASE("split: links on both sides of the cut land on the right half with cle
         CHECK(plan->prefix.modelOnly == parent.modelOnly);
         CHECK(plan->suffix.modelOnly == parent.modelOnly);
         CHECK(plan->suffix.controlPoints.size() == 4);
-        CHECK(plan->prefix.coordinateBaseShapeZYX == parent.coordinateBaseShapeZYX);
 
         std::vector<BranchRedirectSource> sources{
             {parent.id, parent.fileName, &parent,

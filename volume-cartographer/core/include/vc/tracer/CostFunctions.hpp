@@ -1,6 +1,6 @@
 #pragma once
+#include <vc_reader/grid.hpp>
 
-#include "vc/core/types/ChunkedTensor.hpp"
 #include <iostream>
 #include "vc/core/util/NormalGridVolume.hpp"
 #include "vc/core/util/GridStore.hpp"
@@ -18,88 +18,6 @@
 static double  val(const double &v) { return v; }
 template <typename JetT>
 double  val(const JetT &v) { return v.a; }
-
-// -----------------------------------------------------------------------------
-// Normal-fit quality weighting (from vc_ngrids diagnostics zarr)
-// -----------------------------------------------------------------------------
-// Encapsulates reading auxiliary uint8 volumes (fit_rms, fit_frac_short_paths)
-// and turning them into a multiplicative weight in [0,1].
-//
-// IMPORTANT:
-// - Sampling is trilinear but NON-differentiable (coordinates are unjetted before sampling).
-// - Weight mapping:
-//     rms: 0.0 -> 1.0, 0.5 -> 0.0 (linear ramp, clamped)
-//     frac_short_paths: 0.0 -> 1.0, 1.0 -> 0.0 (linear ramp, clamped)
-//   final = w_rms * w_frac
-struct NormalFitQualityWeightField {
-    NormalFitQualityWeightField(std::unique_ptr<vc::VcDataset>&& rms_ds,
-                                std::unique_ptr<vc::VcDataset>&& frac_ds,
-                                float scale,
-                                const std::string& cache_root,
-                                const std::string& unique_id)
-        : _passthrough_rms{unique_id + "_fit_rms"},
-          _passthrough_frac{unique_id + "_fit_frac"},
-          _cacheRms(openChunkedArrayCache(rms_ds->path(), 128ULL << 20)),
-          _cacheFrac(openChunkedArrayCache(frac_ds->path(), 128ULL << 20)),
-          _rms(_passthrough_rms, rms_ds.get(), _cacheRms.get(), 0, cache_root),
-          _frac(_passthrough_frac, frac_ds.get(), _cacheFrac.get(), 0, cache_root),
-          _scale(scale),
-          _rms_ds(std::move(rms_ds)),
-          _frac_ds(std::move(frac_ds)),
-          _interp_rms(_rms),
-          _interp_frac(_frac)
-    {}
-
-    NormalFitQualityWeightField(const NormalFitQualityWeightField&) = delete;
-    NormalFitQualityWeightField& operator=(const NormalFitQualityWeightField&) = delete;
-
-    // Canonical XYZ input.
-    template <typename E>
-    inline double weight_xyz(const E& x, const E& y, const E& z) const {
-        const double xx = unjet(x);
-        const double yy = unjet(y);
-        const double zz = unjet(z);
-        return weight_xyz_d(xx, yy, zz);
-    }
-
-    inline double weight_xyz_d(double x, double y, double z) const {
-        // Convert canonical XYZ to dataset ZYX coordinate space.
-        const double dz = z * static_cast<double>(_scale);
-        const double dy = y * static_cast<double>(_scale);
-        const double dx = x * static_cast<double>(_scale);
-
-        double rms_u8 = 0.0;
-        double frac_u8 = 0.0;
-        _interp_rms.Evaluate(dz, dy, dx, &rms_u8);
-        _interp_frac.Evaluate(dz, dy, dx, &frac_u8);
-
-        const double rms = std::clamp(rms_u8 / 255.0, 0.0, 1.0);
-        const double frac = std::clamp(frac_u8 / 255.0, 0.0, 1.0);
-
-        // rms weighting: 0 -> 1, 0.5 -> 0
-        const double w_rms = std::clamp(1.0 - (rms / 0.5), 0.0, 1.0);
-        // frac-short weighting: 0 -> 1, 1 -> 0
-        const double w_frac = std::clamp(1.0 - frac, 0.0, 1.0);
-        return w_rms * w_frac;
-    }
-
-private:
-    static double unjet(const double& v) { return v; }
-    template <typename JetT>
-    static double unjet(const JetT& v) { return v.a; }
-
-    passTroughComputor _passthrough_rms;
-    passTroughComputor _passthrough_frac;
-    std::unique_ptr<vc::render::IChunkedArray> _cacheRms;
-    std::unique_ptr<vc::render::IChunkedArray> _cacheFrac;
-    Chunked3d<uint8_t, passTroughComputor> _rms;
-    Chunked3d<uint8_t, passTroughComputor> _frac;
-    float _scale;
-    std::unique_ptr<vc::VcDataset> _rms_ds;
-    std::unique_ptr<vc::VcDataset> _frac_ds;
-    CachedChunked3dInterpolator<uint8_t, passTroughComputor> _interp_rms;
-    CachedChunked3dInterpolator<uint8_t, passTroughComputor> _interp_frac;
-};
 
 struct DistLoss {
     DistLoss(float dist, float w) : _d(dist), _w(w) {};
@@ -195,44 +113,6 @@ struct DistLoss2D {
     }
 };
 
-struct SignedDistanceToSurfaceCost {
-    using Sampler = std::function<float(const cv::Vec3f&)>;
-
-    SignedDistanceToSurfaceCost(Sampler sampler, double weight, float max_move)
-        : sampler_(std::move(sampler)), weight_(weight), max_move_(max_move) {}
-
-    bool operator()(const double* candidate, double* residual) const {
-        if (!sampler_ || weight_ <= 0.0) {
-            residual[0] = 0.0;
-            return true;
-        }
-        if (!std::isfinite(candidate[0]) || !std::isfinite(candidate[1]) || !std::isfinite(candidate[2])) {
-            residual[0] = 0.0;
-            return true;
-        }
-        const cv::Vec3f p(static_cast<float>(candidate[0]),
-                          static_cast<float>(candidate[1]),
-                          static_cast<float>(candidate[2]));
-        float dist = sampler_(p);
-        if (!std::isfinite(dist)) {
-            residual[0] = 0.0;
-            return true;
-        }
-        if (max_move_ > 0.0f) {
-            dist = std::clamp(dist, -max_move_, max_move_);
-        }
-        residual[0] = weight_ * static_cast<double>(dist);
-        return true;
-    }
-
-private:
-    Sampler sampler_;
-    double weight_;
-    float max_move_;
-};
-
-
-
 struct StraightLoss {
     StraightLoss(float w) : _w(w) {};
     static constexpr double kStraightAngleCosThreshold = 0.86602540378443864676; // cos(30°); deviations beyond 30° incur penalty
@@ -274,30 +154,6 @@ struct StraightLoss {
     }
 };
 
-struct StraightLoss2 {
-    StraightLoss2(float w) : _w(w) {};
-    template <typename T>
-    bool operator()(const T* const a, const T* const b, const T* const c, T* residual) const {
-        T avg[3];
-        avg[0] = (a[0]+c[0])*T(0.5);
-        avg[1] = (a[1]+c[1])*T(0.5);
-        avg[2] = (a[2]+c[2])*T(0.5);
-        
-        residual[0] = T(_w)*(b[0]-avg[0]);
-        residual[1] = T(_w)*(b[1]-avg[1]);
-        residual[2] = T(_w)*(b[2]-avg[2]);
-        
-        return true;
-    }
-    
-    float _w;
-    
-    static ceres::CostFunction* Create(float w = 1.0)
-    {
-        return new ceres::AutoDiffCostFunction<StraightLoss2, 3, 3, 3, 3>(new StraightLoss2(w));
-    }
-};
-
 struct StraightLoss2D {
     StraightLoss2D(float w) : _w(w) {};
     template <typename T>
@@ -333,194 +189,39 @@ struct StraightLoss2D {
     }
 };
 
-struct ParamMetricLoss2D {
-    ParamMetricLoss2D(double unit, double du0, double du1, double dv0, double dv1,
-                      double w, double min_area_ratio, double area_w,
-                      double eps_abs, double eps_rel)
-      : _unit(unit),
-        _du0(du0),
-        _du1(du1),
-        _dv0(dv0),
-        _dv1(dv1),
-        _w(w),
-        _min_area_ratio(min_area_ratio),
-        _area_w(area_w),
-        _eps_abs(eps_abs),
-        _eps_rel(eps_rel) {}
+struct SurfaceLossD : ceres::SizedCostFunction<3, 3, 2> {
+    SurfaceLossD(std::shared_ptr<const vcr::grid::Surface> surface, float weight)
+        : surface_(std::move(surface)), weight_(weight) {}
 
-    template <typename T>
-    bool operator()(const T* const p,
-                    const T* const pu,
-                    const T* const pv,
-                    T* residual) const
-    {
-        for (int i = 0; i < 2; ++i) {
-            if (!std::isfinite(val(p[i])) || !std::isfinite(val(pu[i])) || !std::isfinite(val(pv[i])) ||
-                val(p[i]) == -1.0 || val(pu[i]) == -1.0 || val(pv[i]) == -1.0) {
-                residual[0] = T(0);
-                residual[1] = T(0);
-                return true;
+    // Parameter locations are row, column; native sampling takes column, row.
+    bool Evaluate(double const* const* parameters, double* residual, double** jacobians) const override {
+        const float xy[]{float(parameters[1][1]), float(parameters[1][0])};
+        float point[3], du[3], dv[3];
+        surface_->pointsAt(xy, 1, point, nullptr, du, dv);
+        std::fill_n(residual, 3, 0.);
+        if (jacobians) {
+            if (jacobians[0]) std::fill_n(jacobians[0], 9, 0.);
+            if (jacobians[1]) std::fill_n(jacobians[1], 6, 0.);
+        }
+        if (!std::isfinite(point[0])) return true;
+        for (int axis = 0; axis < 3; ++axis) {
+            residual[axis] = weight_ * (double(point[axis]) - parameters[0][axis]);
+            if (jacobians) {
+                if (jacobians[0]) jacobians[0][axis * 3 + axis] = -weight_;
+                if (jacobians[1]) {
+                    jacobians[1][axis * 2] = weight_ * dv[axis];
+                    jacobians[1][axis * 2 + 1] = weight_ * du[axis];
+                }
             }
         }
-
-        const T inv_unit = T(1.0) / T(_unit);
-        T eu[2] = { (pu[0]-p[0])*inv_unit, (pu[1]-p[1])*inv_unit };
-        T ev[2] = { (pv[0]-p[0])*inv_unit, (pv[1]-p[1])*inv_unit };
-
-        T a = eu[0]*eu[0] + eu[1]*eu[1];
-        T c = ev[0]*ev[0] + ev[1]*ev[1];
-        T b = eu[0]*ev[0] + eu[1]*ev[1];
-        if (!std::isfinite(val(a)) || !std::isfinite(val(b)) || !std::isfinite(val(c))) {
-            residual[0] = T(0);
-            residual[1] = T(0);
-            return true;
-        }
-
-        const T ea = T(_du0 * _du0 + _du1 * _du1);
-        const T ec = T(_dv0 * _dv0 + _dv1 * _dv1);
-        const T eb = T(_du0 * _dv0 + _du1 * _dv1);
-        const T e_det = ea * ec - eb * eb;
-        if (val(e_det) <= 1e-12) {
-            residual[0] = T(0);
-            residual[1] = T(0);
-            return true;
-        }
-
-        const T m00 = (ec * a - eb * b) / e_det;
-        const T m11 = (-eb * b + ea * c) / e_det;
-        const T m01 = (ec * b - eb * c) / e_det;
-        const T m10 = (-eb * a + ea * b) / e_det;
-        const T trM = m00 + m11;
-        const T detM = m00 * m11 - m01 * m10;
-        const T det_floor = T(_eps_abs) + T(_eps_rel) * ceres::abs(trM);
-        const T det_safe = detM + det_floor;
-
-        T E = trM + trM / det_safe;
-        if (!std::isfinite(val(E))) {
-            residual[0] = T(0);
-            residual[1] = T(0);
-            return true;
-        }
-        residual[0] = T(_w) * (E - T(4.0));
-
-        // loc is stored as [row, col]. A regular cell has negative signed
-        // row/col cross product, so negate it to make the expected area positive.
-        T expected_area = T(std::abs(_du0 * _dv1 - _du1 * _dv0));
-        if (val(expected_area) <= 1e-12) {
-            residual[0] = T(0);
-            residual[1] = T(0);
-            return true;
-        }
-        T signed_area = -(eu[0]*ev[1] - eu[1]*ev[0]) / expected_area;
-        T deficit = T(_min_area_ratio) - signed_area;
-        if (val(deficit) > 0.0)
-            residual[1] = T(_area_w) * deficit;
-        else
-            residual[1] = T(0);
-
         return true;
     }
-
-    static ceres::CostFunction* Create(double unit, double w = 1.0,
-                                       double min_area_ratio = 0.25,
-                                       double area_w = 2.0,
-                                       double eps_abs = 1e-8,
-                                       double eps_rel = 1e-2)
-    {
-        return new ceres::AutoDiffCostFunction<ParamMetricLoss2D, 2, 2, 2, 2>(
-            new ParamMetricLoss2D(unit, 0.0, 1.0, 1.0, 0.0,
-                                  w, min_area_ratio, area_w, eps_abs, eps_rel));
+    static ceres::CostFunction* Create(std::shared_ptr<const vcr::grid::Surface> surface, float weight = 1) {
+        return new SurfaceLossD(std::move(surface), weight);
     }
-
-    static ceres::CostFunction* Create(double unit,
-                                       const cv::Vec2i& du,
-                                       const cv::Vec2i& dv,
-                                       double w = 1.0,
-                                       double min_area_ratio = 0.25,
-                                       double area_w = 2.0,
-                                       double eps_abs = 1e-8,
-                                       double eps_rel = 1e-2)
-    {
-        return new ceres::AutoDiffCostFunction<ParamMetricLoss2D, 2, 2, 2, 2>(
-            new ParamMetricLoss2D(unit,
-                                  static_cast<double>(du[0]),
-                                  static_cast<double>(du[1]),
-                                  static_cast<double>(dv[0]),
-                                  static_cast<double>(dv[1]),
-                                  w, min_area_ratio, area_w, eps_abs, eps_rel));
-    }
-
-    double _unit;
-    double _du0;
-    double _du1;
-    double _dv0;
-    double _dv1;
-    double _w;
-    double _min_area_ratio;
-    double _area_w;
-    double _eps_abs;
-    double _eps_rel;
-};
-
-template<typename T, typename E, int C>
-void interp_lin_2d(const cv::Mat_<cv::Vec<E,C>> &m, const T &y, const T &x, T *v) {
-    int yi = val(y);
-    int xi = val(x);
-
-    T fx = x - T(xi);
-    T fy = y - T(yi);
-
-    cv::Vec<E,C> c00 = m(yi,xi);
-    cv::Vec<E,C> c01 = m(yi,xi+1);
-    cv::Vec<E,C> c10 = m(yi+1,xi);
-    cv::Vec<E,C> c11 = m(yi+1,xi+1);
-
-    for (int i=0;i<C;i++) {
-        T c0 = (T(1)-fx)*T(c00[i]) + fx*T(c01[i]);
-        T c1 = (T(1)-fx)*T(c10[i]) + fx*T(c11[i]);
-        v[i] = (T(1)-fy)*c0 + fy*c1;
-    }
-}
-
-template<typename E1, typename E2, int C>
-cv::Vec<E2,C> interp_lin_2d(const cv::Mat_<cv::Vec<E2,C>> &m, const cv::Vec<E1,2> &l)
-{
-    cv::Vec<E1,C> v;
-    interp_lin_2d(m, l[0], l[1], &v[0]);
-    return v;
-}
-
-struct SurfaceLossD {
-    //NOTE we expect loc to be [y, x]
-    SurfaceLossD(const cv::Mat_<cv::Vec3f> &m, float w) : _m(m), _w(w) {};
-    template <typename T>
-    bool operator()(const T* const p, const T* const l, T* residual) const {
-        T v[3];
-
-        if (!loc_valid(_m, {val(l[0]), val(l[1])})) {
-            residual[0] = T(0);
-            residual[1] = T(0);
-            residual[2] = T(0);
-            return true;
-        }
-
-        interp_lin_2d(_m, l[0], l[1], v);
-
-        residual[0] = T(_w)*(v[0] - p[0]);
-        residual[1] = T(_w)*(v[1] - p[1]);
-        residual[2] = T(_w)*(v[2] - p[2]);
-
-        return true;
-    }
-
-    const cv::Mat_<cv::Vec3f> _m;
-    float _w;
-
-    static ceres::CostFunction* Create(const cv::Mat_<cv::Vec3f> &m, float w = 1.0)
-    {
-        return new ceres::AutoDiffCostFunction<SurfaceLossD, 3, 3, 2>(new SurfaceLossD(m, w));
-    }
-
+private:
+    std::shared_ptr<const vcr::grid::Surface> surface_;
+    double weight_;
 };
 
 struct LinChkDistLoss {
@@ -553,452 +254,27 @@ struct LinChkDistLoss {
 
 };
 
-struct ZCoordLoss {
-    ZCoordLoss(float z, float w) :  _z(z), _w(w) {};
-    template <typename T>
-    bool operator()(const T* const p, T* residual) const {
-        residual[0] = T(_w)*(p[2] - T(_z));
-        
-        return true;
-    }
-    
-    float _z;
-    float _w;
-    
-    static ceres::CostFunction* Create(float z, float w = 1.0)
-    {
-        return new ceres::AutoDiffCostFunction<ZCoordLoss, 1, 3>(new ZCoordLoss(z, w));
-    }
-    
-};
-
-template <typename V>
-struct ZLocationLoss {
-    ZLocationLoss(const cv::Mat_<V> &m, float z, float w) :  _m(m), _z(z), _w(w) {};
-    template <typename T>
-    bool operator()(const T* const l, T* residual) const {
-        T p[3];
-        
-        if (!loc_valid(_m, {val(l[0]), val(l[1])})) {
-            residual[0] = T(0);
-            return true;
+struct ZLocationLoss : ceres::SizedCostFunction<1, 2> {
+    ZLocationLoss(std::shared_ptr<const vcr::grid::Surface> surface, float z, float weight)
+        : surface_(std::move(surface)), z_(z), weight_(weight) {}
+    bool Evaluate(double const* const* parameters, double* residual, double** jacobians) const override {
+        const float xy[]{float(parameters[0][1]), float(parameters[0][0])};
+        float point[3], du[3], dv[3];
+        surface_->pointsAt(xy, 1, point, nullptr, du, dv);
+        const bool valid = std::isfinite(point[0]);
+        residual[0] = valid ? weight_ * (double(point[2]) - z_) : 0.;
+        if (jacobians && jacobians[0]) {
+            jacobians[0][0] = valid ? weight_ * dv[2] : 0.;
+            jacobians[0][1] = valid ? weight_ * du[2] : 0.;
         }
-        
-        interp_lin_2d(_m, l[0], l[1], p);
-        
-        residual[0] = T(_w)*(p[2] - T(_z));
-        
         return true;
     }
-    
-    const cv::Mat_<V> _m;
-    float _z;
-    float _w;
-    
-    static ceres::CostFunction* Create(const cv::Mat_<V> &m, float z, float w = 1.0)
-    {
-        return new ceres::AutoDiffCostFunction<ZLocationLoss, 1, 2>(new ZLocationLoss(m, z, w));
+    static ceres::CostFunction* Create(std::shared_ptr<const vcr::grid::Surface> surface, float z, float weight = 1) {
+        return new ZLocationLoss(std::move(surface), z, weight);
     }
-    
-};
-
-template <typename T, typename C>
-struct SpaceLossAcc {
-    SpaceLossAcc(Chunked3d<T,C> &t, float w) : _interpolator(std::make_unique<CachedChunked3dInterpolator<T,C>>(t)), _w(w) {};
-    template <typename E>
-    bool operator()(const E* const l, E* residual) const {
-        E v;
-
-        _interpolator->template Evaluate<E>(l[2], l[1], l[0], &v);
-
-        residual[0] = E(_w)*v;
-
-        return true;
-    }
-
-    float _w;
-    std::unique_ptr<CachedChunked3dInterpolator<T,C>> _interpolator;
-
-    static ceres::CostFunction* Create(Chunked3d<T,C> &t, float w = 1.0)
-    {
-        return new ceres::AutoDiffCostFunction<SpaceLossAcc<T,C>, 1, 3>(new SpaceLossAcc<T,C>(t, w));
-    }
-
-};
-
-template <typename T, typename C>
-struct SpaceLineLossAcc {
-    SpaceLineLossAcc(Chunked3d<T,C> &t, int steps, float w) : _steps(steps), _w(w)
-    {
-        _interpolator.resize(_steps-1);
-        for(int i=1;i<_steps;i++)
-            _interpolator[i-1].reset(new CachedChunked3dInterpolator<T,C>(t));
-    };
-    template <typename E>
-    bool operator()(const E* const la, const E* const lb, E* residual) const {
-        E v;
-        E sum = E(0);
-
-        bool ign = false;
-
-        for(int i=1;i<_steps;i++) {
-            E f2 = E(float(i)/_steps);
-            E f1 = E(1.0f-float(i)/_steps);
-            _interpolator[i-1].get()->template Evaluate<E>(f1*la[2]+f2*lb[2], f1*la[1]+f2*lb[1], f1*la[0]+f2*lb[0], &v);
-            sum += E(_w)*v;
-        }
-
-        residual[0] = sum/E(_steps-1);
-
-        return true;
-    }
-
-    std::vector<std::unique_ptr<CachedChunked3dInterpolator<T,C>>> _interpolator;
-    int _steps;
-    float _w;
-
-    static ceres::CostFunction* Create(Chunked3d<T,C> &t, int steps, float w = 1.0)
-    {
-        return new ceres::AutoDiffCostFunction<SpaceLineLossAcc, 1, 3, 3>(new SpaceLineLossAcc(t, steps, w));
-    }
-
-};
-
-struct FiberDirectionLoss {
-    FiberDirectionLoss(Chunked3dVec3fFromUint8 &fiber_dirs, Chunked3dFloatFromUint8 *maybe_weights, float w) :
-        _fiber_dirs(fiber_dirs), _maybe_weights(maybe_weights), _w(w) {};
-    template <typename E>
-    bool operator()(const E* const l_base, const E* const l_u_off, E* residual) const {
-
-        // Both l_base and l_u_off are indexed xyz!
-
-        // Note this does *not* sample the direction volume differentiably. This makes sense for now since the volume
-        // is piecewise constant, and interpolating it is non-trivial anyway (since its values live in RP2)
-        cv::Vec3f fiber_dir_zyx_vec = _fiber_dirs(unjet(l_base[2]), unjet(l_base[1]), unjet(l_base[0]));
-        E fiber_dir_zyx[3] = {E(fiber_dir_zyx_vec[0]), E(fiber_dir_zyx_vec[1]), E(fiber_dir_zyx_vec[2])};
-
-        E const patch_u_disp_zyx[3] {
-            l_u_off[2] - l_base[2],
-            l_u_off[1] - l_base[1],
-            l_u_off[0] - l_base[0],
-        };
-
-        // fiber_dir is now a unit vector in zyx order, pointing along our fibers (so in U-/V-direction of patch)
-        // l_u_off is assumed to be the location for a 2D point that is shifted along the U-/V-direction from l_base
-        // patch_u_disp is the displacement between l_base and l_u_off, which we want to be aligned with the fiber direction, modulo flips
-
-        E const patch_u_dist = sqrt(patch_u_disp_zyx[0] * patch_u_disp_zyx[0]
-                                    + patch_u_disp_zyx[1] * patch_u_disp_zyx[1]
-                                    + patch_u_disp_zyx[2] * patch_u_disp_zyx[2]
-                                    + E(1e-12));
-        using std::abs;
-        E const abs_dot = abs(patch_u_disp_zyx[0] * fiber_dir_zyx[0]
-                              + patch_u_disp_zyx[1] * fiber_dir_zyx[1]
-                              + patch_u_disp_zyx[2] * fiber_dir_zyx[2]) / patch_u_dist;
-
-        E const weight_at_point = _maybe_weights ? E((*_maybe_weights)(unjet(l_base[2]), unjet(l_base[1]), unjet(l_base[0]))) : E(1);
-
-        residual[0] = E(_w) * (E(1) - abs_dot) * weight_at_point;
-
-        return true;
-    }
-
-    static double unjet(const double& v) { return v; }
-    template<typename JetT> static double unjet(const JetT& v) { return v.a; }
-
-    float _w;
-    Chunked3dVec3fFromUint8 &_fiber_dirs;
-    Chunked3dFloatFromUint8 *_maybe_weights;
-
-    static ceres::CostFunction* Create(Chunked3dVec3fFromUint8 &fiber_dirs, Chunked3dFloatFromUint8 *maybe_weights, float w = 1.0)
-    {
-        return new ceres::AutoDiffCostFunction<FiberDirectionLoss, 1, 3, 3>(new FiberDirectionLoss(fiber_dirs, maybe_weights, w));
-    }
-};
-
-struct NormalDirectionLoss {
-    NormalDirectionLoss(Chunked3dVec3fFromUint8 &normal_dirs, Chunked3dFloatFromUint8 *maybe_weights, float w) :
-        _normal_dirs(normal_dirs), _maybe_weights(maybe_weights), _w(w) {};
-    template <typename E>
-    bool operator()(const E* const l_base, const E* const l_u_off, const E* const l_v_off, E* residual) const {
-
-        // All l_* are indexed xyz, while fiber_field zarr _normal_dirs is indexed zyx (and contains zyx-ordered vectors)
-
-        // Note this does *not* sample the direction volume differentiably, i.e. there is a gradient moving the points to
-        // be more-normal, but not moving the surface to be in a region where the normal field better matches the current
-        // surface orientation
-        cv::Vec3f target_normal_zyx_vec = _normal_dirs(unjet(l_base[2]), unjet(l_base[1]), unjet(l_base[0]));
-        E target_normal_zyx[3] = {E(target_normal_zyx_vec[0]), E(target_normal_zyx_vec[1]), E(target_normal_zyx_vec[2])};
-
-        E const patch_u_disp_zyx[3] {
-            l_u_off[2] - l_base[2],
-            l_u_off[1] - l_base[1],
-            l_u_off[0] - l_base[0],
-        };
-        E const patch_v_disp_zyx[3] {
-            l_v_off[2] - l_base[2],
-            l_v_off[1] - l_base[1],
-            l_v_off[0] - l_base[0],
-        };
-
-        // target_normal_zyx is a unit vector, hopefully pointing normal to the surface
-        // patch_*_disp are horizontal and vertical displacements in the surface plane, tangent at l_base
-        // patch_normal_zyx will be the cross of the above, i.e. actual normal of the surface
-        // we want patch_normal and target_normal to be aligned, modulo flips
-
-        E const patch_normal_zyx[3] {
-            patch_u_disp_zyx[1] * patch_v_disp_zyx[2] - patch_u_disp_zyx[2] * patch_v_disp_zyx[1],
-            patch_u_disp_zyx[2] * patch_v_disp_zyx[0] - patch_u_disp_zyx[0] * patch_v_disp_zyx[2],
-            patch_u_disp_zyx[0] * patch_v_disp_zyx[1] - patch_u_disp_zyx[1] * patch_v_disp_zyx[0],
-        };
-        E const patch_normal_length = sqrt(patch_normal_zyx[0] * patch_normal_zyx[0] + patch_normal_zyx[1] * patch_normal_zyx[1] + patch_normal_zyx[2] * patch_normal_zyx[2]);
-
-        using std::abs;
-        E const abs_dot = abs(patch_normal_zyx[0] * target_normal_zyx[0] + patch_normal_zyx[1] * target_normal_zyx[1] + patch_normal_zyx[2] * target_normal_zyx[2]) / patch_normal_length;
-
-        E const weight_at_point = _maybe_weights ? E((*_maybe_weights)(unjet(l_base[2]), unjet(l_base[1]), unjet(l_base[0]))) : E(1);
-
-        residual[0] = E(_w) * (E(1) - abs_dot) * weight_at_point;
-
-        return true;
-    }
-
-    static double unjet(const double& v) { return v; }
-    template<typename JetT> static double unjet(const JetT& v) { return v.a; }
-
-    float _w;
-    Chunked3dVec3fFromUint8 &_normal_dirs;
-    Chunked3dFloatFromUint8 *_maybe_weights;
-
-    static ceres::CostFunction* Create(Chunked3dVec3fFromUint8 &normal_dirs, Chunked3dFloatFromUint8 *maybe_weights, float w = 1.0)
-    {
-        return new ceres::AutoDiffCostFunction<NormalDirectionLoss, 1, 3, 3, 3>(new NormalDirectionLoss(normal_dirs, maybe_weights, w));
-    }
-};
-
-// Penalize that an in-surface edge direction is perpendicular to the directed target normal field.
-//
-// For an edge vector e and (unit) target normal n, we want angle(e,n)=90°, i.e. dot(e,n)=0.
-// This uses three points:
-// - p_base: edge base point
-// - p_off:  edge end point (the segment whose direction we constrain)
-// - p_clockwise: the next quad corner in clockwise direction from p_base when walking towards p_off.
-//   This is used only to disambiguate the sign / orientation of the directed normal field.
-//
-// The 90° constraint is enforced only from the p_base->p_off segment.
-struct Normal3DLineLoss {
-    Normal3DLineLoss(Chunked3dVec3fFromUint8 &normal_dirs,
-                     const NormalFitQualityWeightField* maybe_fit_quality,
-                     float w)
-        : _normal_dirs(normal_dirs), _maybe_fit_quality(maybe_fit_quality), _w(w) {}
-
-    template <typename E>
-    bool operator()(const E* const p_base, const E* const p_off, const E* const p_clockwise, E* residual) const {
-        // p_* are XYZ, while _normal_dirs is indexed ZYX and returns ZYX-ordered vectors.
-
-        // Sample at the center of the edge.
-        const E mid_xyz[3] = {
-            (p_base[0] + p_off[0]) * E(0.5),
-            (p_base[1] + p_off[1]) * E(0.5),
-            (p_base[2] + p_off[2]) * E(0.5),
-        };
-
-        E target_zyx[3];
-        if (!sample_trilinear_normal_zyx(_normal_dirs,
-                                         /*z=*/mid_xyz[2],
-                                         /*y=*/mid_xyz[1],
-                                         /*x=*/mid_xyz[0],
-                                         target_zyx)) {
-            residual[0] = E(0);
-            return true;
-        }
-
-        // Edge vector in ZYX ordering (base -> off). This is what the 90° constraint is based on.
-        const E e_zyx[3] = { p_off[2] - p_base[2], p_off[1] - p_base[1], p_off[0] - p_base[0] };
-        const E e_len = ceres::sqrt(e_zyx[0]*e_zyx[0] + e_zyx[1]*e_zyx[1] + e_zyx[2]*e_zyx[2] + E(1e-12));
-        // cos between edge direction and target normal. For the intended 90° constraint
-        // we want this value close to 0.
-        const E cos_angle = (e_zyx[0] * target_zyx[0] + e_zyx[1] * target_zyx[1] + e_zyx[2] * target_zyx[2]) / e_len;
-
-        // Additional fit-quality weight (non-differentiable sample).
-        E fit_w = E(1);
-        if (_maybe_fit_quality) {
-            fit_w = E(_maybe_fit_quality->weight_xyz(mid_xyz[0], mid_xyz[1], mid_xyz[2]));
-        }
-
-        // Use the third point (clockwise neighbor) to disambiguate which *side* of the target normal we're on.
-        // We treat p_clockwise as non-differentiable for this decision.
-        const E pcw_xyz_const[3] = {
-            E(unjet(p_clockwise[0])),
-            E(unjet(p_clockwise[1])),
-            E(unjet(p_clockwise[2])),
-        };
-
-        // v is the clockwise direction in the surface plane.
-        const E v_zyx[3] = {
-            pcw_xyz_const[2] - p_base[2],
-            pcw_xyz_const[1] - p_base[1],
-            pcw_xyz_const[0] - p_base[0],
-        };
-
-        // Surface normal (right-hand rule): n_surf = e x v (in ZYX ordering).
-        E n_surf_zyx[3] = {
-            e_zyx[1] * v_zyx[2] - e_zyx[2] * v_zyx[1],
-            e_zyx[2] * v_zyx[0] - e_zyx[0] * v_zyx[2],
-            e_zyx[0] * v_zyx[1] - e_zyx[1] * v_zyx[0],
-        };
-        const E n_surf_len = ceres::sqrt(n_surf_zyx[0]*n_surf_zyx[0] + n_surf_zyx[1]*n_surf_zyx[1] + n_surf_zyx[2]*n_surf_zyx[2] + E(1e-12));
-        n_surf_zyx[0] /= n_surf_len;
-        n_surf_zyx[1] /= n_surf_len;
-        n_surf_zyx[2] /= n_surf_len;
-
-        // Compare sidedness against target normal.
-        const E side_dot = (n_surf_zyx[0] * target_zyx[0] + n_surf_zyx[1] * target_zyx[1] + n_surf_zyx[2] * target_zyx[2]);
-
-        // We want the edge direction to be in-plane => perpendicular to target normal.
-        // Use |cos| to keep the objective non-negative and bounded.
-        const E cos = ceres::abs(cos_angle);
-
-        // Direction-aware term:
-        // - On the correct side of the directed normal, minimize loss = cos.
-        // - On the wrong side, use loss = 2 - cos (escape objective).
-        const E loss = (side_dot >= E(0)) ? cos : (E(2) - cos);
-
-        residual[0] = E(_w) * fit_w * loss;
-        return true;
-    }
-
-    static double unjet(const double& v) { return v; }
-    template<typename JetT> static double unjet(const JetT& v) { return v.a; }
-
-    float _w;
-    Chunked3dVec3fFromUint8 &_normal_dirs;
-    const NormalFitQualityWeightField* _maybe_fit_quality;
-
-public:
-    static ceres::CostFunction* Create(Chunked3dVec3fFromUint8 &normal_dirs,
-                                       const NormalFitQualityWeightField* maybe_fit_quality,
-                                       float w = 1.0f)
-    {
-        return new ceres::AutoDiffCostFunction<Normal3DLineLoss, 1, 3, 3, 3>(
-            new Normal3DLineLoss(normal_dirs, maybe_fit_quality, w));
-    }
-
 private:
-    template <typename E>
-    static inline void clamp01(E& t)
-    {
-        if (val(t) < 0.0) t = E(0);
-        if (val(t) > 1.0) t = E(1);
-    }
-
-    template <typename E>
-    static inline bool sample_trilinear_normal_zyx(Chunked3dVec3fFromUint8 &dirs,
-                                                   const E& z_canon,
-                                                   const E& y_canon,
-                                                   const E& x_canon,
-                                                   E* out_zyx)
-    {
-        const E zf = z_canon * E(dirs._scale);
-        const E yf = y_canon * E(dirs._scale);
-        const E xf = x_canon * E(dirs._scale);
-
-        int z0 = static_cast<int>(std::floor(unjet(zf)));
-        int y0 = static_cast<int>(std::floor(unjet(yf)));
-        int x0 = static_cast<int>(std::floor(unjet(xf)));
-
-        const auto shape = dirs._x.shape(); // z,y,x
-        if (!shape.empty()) {
-            z0 = std::clamp(z0, 0, std::max(0, shape[0] - 2));
-            y0 = std::clamp(y0, 0, std::max(0, shape[1] - 2));
-            x0 = std::clamp(x0, 0, std::max(0, shape[2] - 2));
-        } else {
-            z0 = std::max(0, z0);
-            y0 = std::max(0, y0);
-            x0 = std::max(0, x0);
-        }
-
-        const int z1 = z0 + 1;
-        const int y1 = y0 + 1;
-        const int x1 = x0 + 1;
-
-        // Placeholder / unset normals are stored as the neutral uint8 triplet (128,128,128).
-        // If *any* trilinear corner is a placeholder, treat the sample as invalid.
-        auto is_fill_triplet = [&](int z, int y, int x) -> bool {
-            const auto rx = dirs._x.safe_at(z, y, x);
-            const auto ry = dirs._y.safe_at(z, y, x);
-            const auto rz = dirs._z.safe_at(z, y, x);
-            return (rx == 128) && (ry == 128) && (rz == 128);
-        };
-        const bool any_fill =
-            is_fill_triplet(z0, y0, x0) || is_fill_triplet(z1, y0, x0) || is_fill_triplet(z0, y1, x0) || is_fill_triplet(z1, y1, x0) ||
-            is_fill_triplet(z0, y0, x1) || is_fill_triplet(z1, y0, x1) || is_fill_triplet(z0, y1, x1) || is_fill_triplet(z1, y1, x1);
-        if (any_fill)
-            return false;
-
-        E dz = zf - E(z0);
-        E dy = yf - E(y0);
-        E dx = xf - E(x0);
-        clamp01(dz);
-        clamp01(dy);
-        clamp01(dx);
-
-        auto lerp = [](const E& a, const E& b, const E& t) { return (E(1) - t) * a + t * b; };
-        auto decode_u8_to_unit = [](const E& u8) { return (u8 - E(128.0)) / E(127.0); };
-
-        auto tri = [&](const E& c000, const E& c100, const E& c010, const E& c110,
-                       const E& c001, const E& c101, const E& c011, const E& c111) -> E {
-            const E c00 = lerp(c000, c001, dx);
-            const E c01 = lerp(c010, c011, dx);
-            const E c10 = lerp(c100, c101, dx);
-            const E c11 = lerp(c110, c111, dx);
-            const E c0  = lerp(c00,  c01,  dy);
-            const E c1  = lerp(c10,  c11,  dy);
-            return lerp(c0, c1, dz);
-        };
-
-        const E x000 = decode_u8_to_unit(E(static_cast<double>(dirs._x.safe_at(z0, y0, x0))));
-        const E x100 = decode_u8_to_unit(E(static_cast<double>(dirs._x.safe_at(z1, y0, x0))));
-        const E x010 = decode_u8_to_unit(E(static_cast<double>(dirs._x.safe_at(z0, y1, x0))));
-        const E x110 = decode_u8_to_unit(E(static_cast<double>(dirs._x.safe_at(z1, y1, x0))));
-        const E x001 = decode_u8_to_unit(E(static_cast<double>(dirs._x.safe_at(z0, y0, x1))));
-        const E x101 = decode_u8_to_unit(E(static_cast<double>(dirs._x.safe_at(z1, y0, x1))));
-        const E x011 = decode_u8_to_unit(E(static_cast<double>(dirs._x.safe_at(z0, y1, x1))));
-        const E x111 = decode_u8_to_unit(E(static_cast<double>(dirs._x.safe_at(z1, y1, x1))));
-
-        const E y000 = decode_u8_to_unit(E(static_cast<double>(dirs._y.safe_at(z0, y0, x0))));
-        const E y100 = decode_u8_to_unit(E(static_cast<double>(dirs._y.safe_at(z1, y0, x0))));
-        const E y010 = decode_u8_to_unit(E(static_cast<double>(dirs._y.safe_at(z0, y1, x0))));
-        const E y110 = decode_u8_to_unit(E(static_cast<double>(dirs._y.safe_at(z1, y1, x0))));
-        const E y001 = decode_u8_to_unit(E(static_cast<double>(dirs._y.safe_at(z0, y0, x1))));
-        const E y101 = decode_u8_to_unit(E(static_cast<double>(dirs._y.safe_at(z1, y0, x1))));
-        const E y011 = decode_u8_to_unit(E(static_cast<double>(dirs._y.safe_at(z0, y1, x1))));
-        const E y111 = decode_u8_to_unit(E(static_cast<double>(dirs._y.safe_at(z1, y1, x1))));
-
-        const E z000 = decode_u8_to_unit(E(static_cast<double>(dirs._z.safe_at(z0, y0, x0))));
-        const E z100 = decode_u8_to_unit(E(static_cast<double>(dirs._z.safe_at(z1, y0, x0))));
-        const E z010 = decode_u8_to_unit(E(static_cast<double>(dirs._z.safe_at(z0, y1, x0))));
-        const E z110 = decode_u8_to_unit(E(static_cast<double>(dirs._z.safe_at(z1, y1, x0))));
-        const E z001 = decode_u8_to_unit(E(static_cast<double>(dirs._z.safe_at(z0, y0, x1))));
-        const E z101 = decode_u8_to_unit(E(static_cast<double>(dirs._z.safe_at(z1, y0, x1))));
-        const E z011 = decode_u8_to_unit(E(static_cast<double>(dirs._z.safe_at(z0, y1, x1))));
-        const E z111 = decode_u8_to_unit(E(static_cast<double>(dirs._z.safe_at(z1, y1, x1))));
-
-        out_zyx[0] = tri(z000, z100, z010, z110, z001, z101, z011, z111);
-        out_zyx[1] = tri(y000, y100, y010, y110, y001, y101, y011, y111);
-        out_zyx[2] = tri(x000, x100, x010, x110, x001, x101, x011, x111);
-
-        const E n = ceres::sqrt(out_zyx[0] * out_zyx[0]
-                                + out_zyx[1] * out_zyx[1]
-                                + out_zyx[2] * out_zyx[2]
-                                + E(1e-12));
-        out_zyx[0] /= n;
-        out_zyx[1] /= n;
-        out_zyx[2] /= n;
-
-        return true;
-    }
-
+    std::shared_ptr<const vcr::grid::Surface> surface_;
+    double z_, weight_;
 };
 
 /**
@@ -1022,7 +298,6 @@ struct NormalConstraintPlane {
     const int plane_idx; // 0: XY, 1: XZ, 2: YZ
     const double w_normal;
     const double w_snap;
-    const NormalFitQualityWeightField* maybe_fit_quality;
     const int z_min;
     const int z_max;
     bool invert_dir;
@@ -1032,9 +307,12 @@ struct NormalConstraintPlane {
          cv::Point2f p1_ = {-1, -1}, p2_ = {-1, -1};
          T payload_;
          const vc::core::util::NormalGridVolume* grid_source = nullptr;
+         std::weak_ptr<const vc::core::util::GridStore> selected_grid_owner;
  
-         bool valid(const cv::Point2f& p1, const cv::Point2f& p2, float th, const vc::core::util::NormalGridVolume* current_grid_source) const {
+         bool valid(const cv::Point2f& p1, const cv::Point2f& p2, float th, const vc::core::util::NormalGridVolume* current_grid_source, const std::shared_ptr<const vc::core::util::GridStore>& current_grid) const {
              if (grid_source != current_grid_source) return false;
+             const auto prior_grid = selected_grid_owner.lock();
+             if (!prior_grid || prior_grid.get() != current_grid.get() || selected_grid_owner.owner_before(current_grid) || current_grid.owner_before(selected_grid_owner)) return false;
              cv::Point2f d1 = p1 - p1_;
              cv::Point2f d2 = p2 - p2_;
              return (d1.dot(d1) + d2.dot(d2)) < th * th;
@@ -1042,11 +320,12 @@ struct NormalConstraintPlane {
  
          const T& get() const { return payload_; }
  
-         void put(const cv::Point2f& p1, const cv::Point2f& p2, T payload, const vc::core::util::NormalGridVolume* new_grid_source) {
+         void put(const cv::Point2f& p1, const cv::Point2f& p2, T payload, const vc::core::util::NormalGridVolume* new_grid_source, const std::shared_ptr<const vc::core::util::GridStore>& current_grid) {
              p1_ = p1;
              p2_ = p2;
              payload_ = std::move(payload);
              grid_source = new_grid_source;
+             selected_grid_owner = current_grid;
          }
      };
  
@@ -1073,7 +352,6 @@ struct NormalConstraintPlane {
                            int plane_idx,
                            double w_normal,
                            double w_snap,
-                           const NormalFitQualityWeightField* maybe_fit_quality,
                            bool direction_aware = false,
                            int z_min = -1,
                            int z_max = -1,
@@ -1082,7 +360,6 @@ struct NormalConstraintPlane {
            plane_idx(plane_idx),
            w_normal(w_normal),
            w_snap(w_snap),
-           maybe_fit_quality(maybe_fit_quality),
            direction_aware_(direction_aware),
            z_min(z_min),
            z_max(z_max),
@@ -1175,8 +452,8 @@ struct NormalConstraintPlane {
         // }
 
         // Calculate normal loss for both grid planes and interpolate.
-        // T loss1 = calculate_normal_snapping_loss(pA_2d, pE_2d, *grid_query->grid1, 0);
-        // T loss2 = calculate_normal_snapping_loss(pA_2d, pE_2d, *grid_query->grid2, 1);
+        // T loss1 = calculate_normal_snapping_loss(pA_2d, pE_2d, grid_query->grid1, 0);
+        // T loss2 = calculate_normal_snapping_loss(pA_2d, pE_2d, grid_query->grid2, 1);
         // T interpolated_loss = (T(1.0) - T(grid_query->weight)) * loss1 + T(grid_query->weight) * loss2;
 
         auto grid_ptr = normal_grid_volume.query_nearest(query_point, plane_idx);
@@ -1185,9 +462,9 @@ struct NormalConstraintPlane {
 
         T interpolated_loss;
         if (invert_dir)
-            interpolated_loss = calculate_normal_snapping_loss(pE_2d, pA_2d, *grid_ptr, 0);
+            interpolated_loss = calculate_normal_snapping_loss(pE_2d, pA_2d, grid_ptr, 0);
         else
-            interpolated_loss = calculate_normal_snapping_loss(pA_2d, pE_2d, *grid_ptr, 0);
+            interpolated_loss = calculate_normal_snapping_loss(pA_2d, pE_2d, grid_ptr, 0);
 
         // Calculate angular weight.
         double v1[3], v2[3];
@@ -1220,10 +497,7 @@ struct NormalConstraintPlane {
         else if (plane_idx == 1) angle_weight = 0.5 * w_y; // XZ plane
         else angle_weight = 0.5 * w_x; // YZ plane
 
-        // Optional fit-quality modulation (non-differentiable sample).
-        // Use query_point (based on A) as the canonical XYZ position.
-        const double fit_w = maybe_fit_quality ? maybe_fit_quality->weight_xyz_d(query_point.x, query_point.y, query_point.z) : 1.0;
-        residual[0] = interpolated_loss * T(angle_weight) * T(fit_w);
+        residual[0] = interpolated_loss * T(angle_weight);
 
         return true;
     }
@@ -1297,7 +571,9 @@ struct NormalConstraintPlane {
     }
 
     template <typename T>
-    T calculate_normal_snapping_loss(const T* p1, const T* p2, const vc::core::util::GridStore& normal_grid, int grid_idx) const {
+    T calculate_normal_snapping_loss(const T* p1, const T* p2, const std::shared_ptr<const vc::core::util::GridStore>& current_grid, int grid_idx) const {
+        const auto& normal_grid = *current_grid;
+
         T edge_vec_x = p2[0] - p1[0];
         T edge_vec_y = p2[1] - p1[1];
 
@@ -1312,11 +588,11 @@ struct NormalConstraintPlane {
 
         auto& path_cache = path_caches_[grid_idx];
 
-        if (!path_cache.valid(p1_cv, p2_cv, cache_radius_normal_, &normal_grid_volume)) {
+        if (!path_cache.valid(p1_cv, p2_cv, cache_radius_normal_, &normal_grid_volume, current_grid)) {
             cv::Point2f midpoint_cv = 0.5f * (p1_cv + p2_cv);
             auto raw_paths = normal_grid.get(midpoint_cv, query_radius_);
             auto filtered_paths = filter_and_split_paths(raw_paths, p1_cv, p2_cv);
-            path_cache.put(p1_cv, p2_cv, std::move(filtered_paths), &normal_grid_volume);
+            path_cache.put(p1_cv, p2_cv, std::move(filtered_paths), &normal_grid_volume, current_grid);
             // Invalidate snapping cache whenever the path cache is updated
             snap_loss_caches_[grid_idx] = {};
         }
@@ -1372,7 +648,7 @@ struct NormalConstraintPlane {
             return T(w_normal)*normal_loss;
 
         auto& snap_cache = snap_loss_caches_[grid_idx];
-        if (!snap_cache.valid(p1_cv, p2_cv, cache_radius_snap_, &normal_grid_volume)) {
+        if (!snap_cache.valid(p1_cv, p2_cv, cache_radius_snap_, &normal_grid_volume, current_grid)) {
             SnapLossPayload payload;
             float closest_dist_norm = std::numeric_limits<float>::max();
  
@@ -1410,7 +686,7 @@ struct NormalConstraintPlane {
                      }
                  }
              }
-            snap_cache.put(p1_cv, p2_cv, payload, &normal_grid_volume);
+            snap_cache.put(p1_cv, p2_cv, payload, &normal_grid_volume, current_grid);
         }
 
         const auto& snap_payload = snap_cache.get();
@@ -1460,157 +736,22 @@ struct NormalConstraintPlane {
         return d.x*d.x+d.y*d.y;
     }
 
-    static float seg_dist_sq(cv::Point2f p1, cv::Point2f p2, cv::Point2f p3, cv::Point2f p4) {
-        auto dot = [](cv::Point2f a, cv::Point2f b) { return a.x * b.x + a.y * b.y; };
-        auto dist_sq = [&](cv::Point2f p) { return p.x * p.x + p.y * p.y; };
-        cv::Point2f u = p2 - p1;
-        cv::Point2f v = p4 - p3;
-        cv::Point2f w = p1 - p3;
-        float a = dot(u, u); float b = dot(u, v); float c = dot(v, v);
-        float d = dot(u, w); float e = dot(v, w); float D = a * c - b * b;
-        float sc, sN, sD = D; float tc, tN, tD = D;
-        if (D < 1e-7) { sN = 0.0; sD = 1.0; tN = e; tD = c; }
-        else { sN = (b * e - c * d); tN = (a * e - b * d);
-            if (sN < 0.0) { sN = 0.0; tN = e; tD = c; }
-            else if (sN > sD) { sN = sD; tN = e + b; tD = c; }
-        }
-        if (tN < 0.0) { tN = 0.0;
-            if (-d < 0.0) sN = 0.0; else if (-d > a) sN = sD;
-            else { sN = -d; sD = a; }
-        } else if (tN > tD) { tN = tD;
-            if ((-d + b) < 0.0) sN = 0.0; else if ((-d + b) > a) sN = sD;
-            else { sN = (-d + b); sD = a; }
-        }
-        sc = (std::abs(sN) < 1e-7 ? 0.0 : sN / sD);
-        tc = (std::abs(tN) < 1e-7 ? 0.0 : tN / tD);
-        cv::Point2f dP = w + (sc * u) - (tc * v);
-        return dist_sq(dP);
-    }
-
     static ceres::CostFunction* Create(const vc::core::util::NormalGridVolume& normal_grid_volume,
                                        int plane_idx,
                                        double w_normal,
                                        double w_snap,
-                                       const NormalFitQualityWeightField* maybe_fit_quality,
                                        bool direction_aware = false,
                                        int z_min = -1,
                                        int z_max = -1,
                                        bool invert_dir = false) {
         return new ceres::AutoDiffCostFunction<NormalConstraintPlane, 1, 3, 3, 3, 3>(
-            new NormalConstraintPlane(normal_grid_volume, plane_idx, w_normal, w_snap, maybe_fit_quality, direction_aware, z_min, z_max, invert_dir)
+            new NormalConstraintPlane(normal_grid_volume, plane_idx, w_normal, w_snap, direction_aware, z_min, z_max, invert_dir)
         );
     }
 
     bool direction_aware_;
 };
 
-
-struct PointCorrectionLoss2P {
-    PointCorrectionLoss2P(const cv::Vec3f& correction_src, const cv::Vec3f& correction_tgt, const cv::Vec2i& grid_loc_int)
-        : correction_src_(correction_src), correction_tgt_(correction_tgt), grid_loc_int_(grid_loc_int) {}
-
-    template <typename T>
-    bool operator()(const T* const p00, const T* const p01, const T* const p10, const T* const p11, const T* const grid_loc, T* residual) const {
-        // Calculate the local coordinates (u,v) within the quad by subtracting the integer grid location.
-        T u = grid_loc[0] - T(grid_loc_int_[0]);
-        T v = grid_loc[1] - T(grid_loc_int_[1]);
-
-        // If the grid location is outside this specific quad (i.e., u,v not in [0,1]), this loss is zero.
-        if (u < T(0.0) || u >= T(1.0) || v < T(0.0) || v >= T(1.0)) {
-            residual[0] = T(0.0);
-            residual[1] = T(0.0);
-            return true;
-        }
-
-        // Bilinear interpolation to find the 3D point on the surface patch corresponding to the grid location.
-        T p_interp[3];
-        p_interp[0] = (T(1) - u) * (T(1) - v) * p00[0] + u * (T(1) - v) * p10[0] + (T(1) - u) * v * p01[0] + u * v * p11[0];
-        p_interp[1] = (T(1) - u) * (T(1) - v) * p00[1] + u * (T(1) - v) * p10[1] + (T(1) - u) * v * p01[1] + u * v * p11[1];
-        p_interp[2] = (T(1) - u) * (T(1) - v) * p00[2] + u * (T(1) - v) * p10[2] + (T(1) - u) * v * p01[2] + u * v * p11[2];
-
-        // Residual 1: 3D Euclidean distance between the interpolated point and the target correction point.
-        T dx_abs = p_interp[0] - T(correction_tgt_[0]);
-        T dy_abs = p_interp[1] - T(correction_tgt_[1]);
-        T dz_abs = p_interp[2] - T(correction_tgt_[2]);
-        residual[0] = T(100)*ceres::sqrt(dx_abs * dx_abs + dy_abs * dy_abs + dz_abs * dz_abs);
-
-        // Residual 2: 3D point-to-line distance from the interpolated point to the line defined by src -> tgt.
-        T p1[3] = {T(correction_src_[0]), T(correction_src_[1]), T(correction_src_[2])};
-        T p2[3] = {T(correction_tgt_[0]), T(correction_tgt_[1]), T(correction_tgt_[2])};
-
-        T v_line[3] = {p2[0] - p1[0], p2[1] - p1[1], p2[2] - p1[2]};
-        T w_line[3] = {p_interp[0] - p1[0], p_interp[1] - p1[1], p_interp[2] - p1[2]};
-
-        T c1 = w_line[0] * v_line[0] + w_line[1] * v_line[1] + w_line[2] * v_line[2];
-        T c2 = v_line[0] * v_line[0] + v_line[1] * v_line[1] + v_line[2] * v_line[2];
-
-        T b = c1 / c2;
-        T pb[3] = {p1[0] + b * v_line[0], p1[1] + b * v_line[1], p1[2] + b * v_line[2]};
-
-        T dx_line = p_interp[0] - pb[0];
-        T dy_line = p_interp[1] - pb[1];
-        T dz_line = p_interp[2] - pb[2];
-
-        residual[1] = T(100)*ceres::sqrt(dx_line * dx_line + dy_line * dy_line + dz_line * dz_line);
-
-        return true;
-    }
-
-    static ceres::CostFunction* Create(const cv::Vec3f& correction_src, const cv::Vec3f& correction_tgt, const cv::Vec2i& grid_loc_int) {
-        return new ceres::AutoDiffCostFunction<PointCorrectionLoss2P, 2, 3, 3, 3, 3, 2>(
-            new PointCorrectionLoss2P(correction_src, correction_tgt, grid_loc_int)
-        );
-    }
-
-private:
-    const cv::Vec3f correction_src_;
-    const cv::Vec3f correction_tgt_;
-    const cv::Vec2i grid_loc_int_;
-};
-
-
-struct PointCorrectionLoss {
-    PointCorrectionLoss(const cv::Vec3f& correction_src, const cv::Vec3f& correction_tgt, const cv::Vec2i& grid_loc_int)
-    : correction_src_(correction_src), correction_tgt_(correction_tgt), grid_loc_int_(grid_loc_int) {}
-
-    template <typename T>
-    bool operator()(const T* const p00, const T* const p01, const T* const p10, const T* const p11, const T* const grid_loc, T* residual) const {
-        // Calculate the local coordinates (u,v) within the quad by subtracting the integer grid location.
-        T u = grid_loc[0] - T(grid_loc_int_[0]);
-        T v = grid_loc[1] - T(grid_loc_int_[1]);
-
-        // If the grid location is outside this specific quad (i.e., u,v not in [0,1]), this loss is zero.
-        if (u < T(0.0) || u >= T(1.0) || v < T(0.0) || v >= T(1.0)) {
-            residual[0] = T(0.0);
-            return true;
-        }
-
-        // Bilinear interpolation to find the 3D point on the surface patch corresponding to the grid location.
-        T p_interp[3];
-        p_interp[0] = (T(1) - u) * (T(1) - v) * p00[0] + u * (T(1) - v) * p10[0] + (T(1) - u) * v * p01[0] + u * v * p11[0];
-        p_interp[1] = (T(1) - u) * (T(1) - v) * p00[1] + u * (T(1) - v) * p10[1] + (T(1) - u) * v * p01[1] + u * v * p11[1];
-        p_interp[2] = (T(1) - u) * (T(1) - v) * p00[2] + u * (T(1) - v) * p10[2] + (T(1) - u) * v * p01[2] + u * v * p11[2];
-
-        // Residual 1: 3D Euclidean distance between the interpolated point and the target correction point.
-        T dx_abs = p_interp[0] - T(correction_tgt_[0]);
-        T dy_abs = p_interp[1] - T(correction_tgt_[1]);
-        T dz_abs = p_interp[2] - T(correction_tgt_[2]);
-        residual[0] = T(100)*ceres::sqrt(dx_abs * dx_abs + dy_abs * dy_abs + dz_abs * dz_abs);
-
-        return true;
-    }
-
-    static ceres::CostFunction* Create(const cv::Vec3f& correction_src, const cv::Vec3f& correction_tgt, const cv::Vec2i& grid_loc_int) {
-        return new ceres::AutoDiffCostFunction<PointCorrectionLoss, 1, 3, 3, 3, 3, 2>(
-            new PointCorrectionLoss(correction_src, correction_tgt, grid_loc_int)
-        );
-    }
-
-private:
-    const cv::Vec3f correction_src_;
-    const cv::Vec3f correction_tgt_;
-    const cv::Vec2i grid_loc_int_;
-};
 
 struct PointsCorrectionLoss {
     PointsCorrectionLoss(std::vector<cv::Vec3f> tgts, std::vector<cv::Vec2f> grid_locs, cv::Vec2i grid_loc_int, double w)

@@ -1,22 +1,13 @@
 import os
 import numpy as np
 import torch
-import zarr
+from vc_reader.reader import ZarrWriter, create_group
 
 from vesuvius.structure_tensor.vf_io import load_density_mask, load_eigenvector_field
 
 
 def _save_array(path, data, *, chunks):
-    if hasattr(zarr, "create_array"):
-        return zarr.create_array(store=path, data=data, chunks=chunks)
-    return zarr.save_array(path, data, chunks=chunks)
-
-
-def _create_group_array(group, name, data, *, chunks):
-    create_array = getattr(group, "create_array", None)
-    if create_array is not None:
-        return create_array(name, data=data, chunks=chunks)
-    return group.create_dataset(name, shape=data.shape, data=data, chunks=chunks)
+    ZarrWriter.create(path, shape=data.shape, chunks=chunks, dtype=data.dtype)[...] = data
 
 
 def test_load_density_mask_with_and_without_channel(tmp_path):
@@ -47,8 +38,7 @@ def test_load_eigenvector_field(tmp_path):
     ev[0] = 1.0  # v0.x
     ev[4] = 1.0  # v1.y  (since layout is [v0x,v0y,v0z, v1x,v1y,v1z, v2x,v2y,v2z])
     eigen_path = os.path.join(tmp_path, "ev.zarr")
-    root = zarr.open_group(eigen_path, mode="w")
-    _create_group_array(root, "eigenvectors", ev, chunks=(1, Z, Y, X))
+    create_group(eigen_path).create_array("eigenvectors", shape=ev.shape, chunks=(1, Z, Y, X), dtype=ev.dtype)[...] = ev
 
     # principal (index 0)
     block0 = load_eigenvector_field(eigen_path, eig_index=0, bounds=(0, Z, 0, Y, 0, X))

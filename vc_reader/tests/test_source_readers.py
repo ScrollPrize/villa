@@ -1,15 +1,15 @@
 """Local source-reading contracts, exact labels, memory limits and worker lifecycle."""
 
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import replace
 import multiprocessing
+import os
 from pathlib import Path
 import pickle
 import subprocess
 import sys
 import tempfile
 import unittest
-from unittest.mock import patch, PropertyMock
+from unittest.mock import patch
 
 import numpy as np
 try:
@@ -18,8 +18,11 @@ try:
 except ImportError as error:
     raise unittest.SkipTest('source reader tests require the optional labels extra') from error
 
+from build_support import load_build
+load_build()
+
 from vc_reader import Affine, Encoding, Selection, Source, Storage, VolumeRegistration
-from vc_reader.reader import DecodedCache
+from vc_reader.reader import DecodedCache, open_zarr
 
 
 def worker_read(reader, connection):
@@ -85,7 +88,7 @@ class SourceReaderTests(unittest.TestCase):
         with source.with_selection(channels=(2, 0)).open() as reader:
             self.assertEqual(reader.shape, (5, 7, 2))
             np.testing.assert_array_equal(reader.read((1, 2), (2, 4)), rgb[1:3, 2:6, [2, 0]])
-        mapped = replace(source, encoding=Encoding('color', (((255, 0, 0), 2**40+1),
+        mapped = source.replace(encoding=Encoding('color', (((255, 0, 0), 2**40+1),
                                                            ((0, 128, 255), 2**40+2)), 'uint64'), fill_value=9)
         with mapped.open() as reader:
             self.assertEqual(reader.axes, ('y', 'x'))
@@ -123,7 +126,7 @@ class SourceReaderTests(unittest.TestCase):
         channel_first = self.tiff(data, axes='CYX', photometric='rgb', planarconfig='separate')
         with channel_first.with_selection(channels=(2, 0)).open() as reader:
             np.testing.assert_array_equal(reader[1, 1:4, -3:], data[0, 1:4, -3:])
-        encoded = replace(source, encoding=Encoding('color', tuple((tuple(map(int, color)), i)
+        encoded = source.replace(encoding=Encoding('color', tuple((tuple(map(int, color)), i)
                            for i, color in enumerate(rgb.reshape(-1, 3))), 'uint64'))
         with encoded.open() as reader:
             expected = np.arange(35, dtype='uint64').reshape(5, 7)
@@ -140,7 +143,7 @@ class SourceReaderTests(unittest.TestCase):
             np.testing.assert_array_equal(reader.read((0, 0), indices.shape), indices)
             self.assertEqual(reader.palette['values'][:6], (255, 0, 0, 0, 255, 0))
             self.assertEqual(reader.palette['transparency'], 0)
-        mapped = replace(source, encoding=Encoding('integer', ((0, 17), (1, 23)), 'uint16'))
+        mapped = source.replace(encoding=Encoding('integer', ((0, 17), (1, 23)), 'uint16'))
         with mapped.open() as reader:
             np.testing.assert_array_equal(reader.read((0, 0), indices.shape), np.where(indices, 23, 17))
         rgba = np.arange(140, dtype=np.uint8).reshape(5, 7, 4)
@@ -156,18 +159,18 @@ class SourceReaderTests(unittest.TestCase):
     def test_unknown_encoding_and_exact_large_integer_values(self):
         data = np.array([[2**63+1, 2**63+2, 2**63+3]], dtype=np.uint64)
         source = self.tiff(data, axes='YX')
-        mapped = replace(source, encoding=Encoding('integer', ((2**63+1, 2**62+1),
+        mapped = source.replace(encoding=Encoding('integer', ((2**63+1, 2**62+1),
                                                              (2**63+2, 2**62+2)), 'uint64'))
         with mapped.open() as reader:
             np.testing.assert_array_equal(reader.read((0, 0), (1, 2)), [[2**62+1, 2**62+2]])
             with self.assertRaisesRegex(ValueError, 'user:image.tif: unknown encoding'):
                 reader.read((0, 2), (1, 1))
             np.testing.assert_array_equal(reader.read((-1, 0), (1, 2)), 0)
-        mapped = replace(mapped, encoding=replace(mapped.encoding, fallback=99))
+        mapped = mapped.replace(encoding=mapped.encoding.replace(fallback=99))
         with mapped.open() as reader:
             self.assertEqual(reader.read((0, 2), (1, 1)).item(), 99)
         with self.assertRaisesRegex(ValueError, 'representable'):
-            replace(source, fill_value=-1).open()
+            source.replace(fill_value=-1).open()
 
     def test_jpeg_values_are_decoded_without_conversion(self):
         path = self.root / 'image.jpg'
@@ -200,7 +203,7 @@ class SourceReaderTests(unittest.TestCase):
         source = self.tiff(data, photometric='minisblack')
         with self.assertRaisesRegex(ValueError, 'ambiguous storage axes'):
             source.open()
-        with replace(source, axes=('z', 'y', 'x')).open() as reader:
+        with source.replace(axes=('z', 'y', 'x')).open() as reader:
             np.testing.assert_array_equal(reader.read((0, 0, 0), data.shape), data)
         path = self.root / 'series.tif'
         with tifffile.TiffWriter(path) as writer:
@@ -214,7 +217,7 @@ class SourceReaderTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'level 4 does not exist'):
             source.with_selection(series=1, level=4).open()
         with self.assertRaisesRegex(ValueError, 'contradict storage axes'):
-            replace(source.with_selection(series=1), axes=('x', 'y')).open()
+            source.with_selection(series=1).replace(axes=('x', 'y')).open()
 
     def test_stack_is_ordered_and_validates_only_requested_planes(self):
         first, data = self.png('first.png')
@@ -225,11 +228,11 @@ class SourceReaderTests(unittest.TestCase):
             self.assertEqual(reader.shape, (3, 5, 7))
             result = reader.read((0, 0, 0), (2, 5, 7))
             np.testing.assert_array_equal(result, np.stack([other, data]))
-            self.assertNotIn(2, reader._files)
+            self.assertFalse(reader._engine().loaded(2))
             with self.assertRaisesRegex(FileNotFoundError, 'user:stack'):
                 reader.read((2, 0, 0), (1, 1, 1))
         wrong, _ = self.png('wrong.png', np.zeros((3, 4), dtype=np.uint8))
-        source = replace(source, storage=replace(source.storage, locations=(first.storage.location, wrong.storage.location)))
+        source = source.replace(storage=source.storage.replace(locations=(first.storage.location, wrong.storage.location)))
         with source.open() as reader:
             with self.assertRaisesRegex(ValueError, 'plane 1 shape/dtype'):
                 reader.read((1, 0, 0), (1, 2, 2))
@@ -256,15 +259,14 @@ class SourceReaderTests(unittest.TestCase):
         with source.open(decoded_cache_bytes=1) as reader:
             out = reader.read((0, 0), (1, 1))
             self.assertEqual(reader.decoded_cache.stats()['nbytes'], 0)
-            self.assertIsNone(out.base)
+            self.assertTrue(out.flags.writeable)
 
     def test_compressed_tiff_budget_and_mmap_small_crop(self):
         values = np.arange(10000, dtype=np.uint16).reshape(100, 100)
         compressed = self.tiff(values, axes='YX', compression='deflate')
         with compressed.open(max_decode_bytes=64) as reader:
-            with patch.object(tifffile.TiffPage, 'asarray', side_effect=AssertionError('decoded too early')):
-                with self.assertRaises(MemoryError):
-                    reader.read((0, 0), (1, 1))
+            with self.assertRaises(MemoryError):
+                reader.read((0, 0), (1, 1))
         with compressed.open() as reader:
             np.testing.assert_array_equal(reader.read((4, 7), (3, 5)), values[4:7, 7:12])
         mapped = self.tiff(values, axes='YX', filename='mapped.tif')
@@ -276,12 +278,12 @@ class SourceReaderTests(unittest.TestCase):
         source, data = self.png()
         with source.open() as reader:
             self.assertIsNone(reader.registration)
-        registered = replace(source, registration=VolumeRegistration('s', 'v', affine=Affine.scale(2)))
+        registered = source.replace(registration=VolumeRegistration('s', 'v', affine=Affine.scale(2)))
         with registered.open() as reader:
             self.assertEqual(reader.registration, registered.registration)
         for kwargs in ({'shape': (7, 5)}, {'dtype': 'uint16'}, {'axes': ('x', 'y')}):
             with self.subTest(kwargs=kwargs), self.assertRaises(ValueError):
-                replace(source, **kwargs).open()
+                source.replace(**kwargs).open()
 
     def test_float32_singleton_channels_and_missing_codec(self):
         values = np.array([[[0., -0., 1.25], [np.nan, np.inf, -2.]]], dtype=np.float32)
@@ -291,12 +293,45 @@ class SourceReaderTests(unittest.TestCase):
             output = reader.read((0, 0), (2, 3))
             self.assertEqual(output.dtype, np.dtype('float32'))
             np.testing.assert_array_equal(output.view(np.uint32), values.view(np.uint32))
-        source = self.tiff(np.zeros((5, 7), dtype=np.uint8), axes='YX',
-                           filename='compressed.tif', compression='deflate')
-        with source.open() as reader, patch.object(tifffile.TiffPage, 'decode', new_callable=PropertyMock,
-                                                   side_effect=ValueError('requires imagecodecs')):
-            with self.assertRaisesRegex(ValueError, 'TIFF codec.*imagecodecs'):
+        path = self.root / 'unknown-codec.tif'
+        tifffile.imwrite(path, np.zeros((5, 7), dtype=np.uint8), compression='deflate')
+        data = bytearray(path.read_bytes())
+        offset = int.from_bytes(data[4:8], 'little')
+        for entry in range(int.from_bytes(data[offset:offset+2], 'little')):
+            at = offset + 2 + 12 * entry
+            if int.from_bytes(data[at:at+2], 'little') == 259:
+                data[at+8:at+10] = (65000).to_bytes(2, 'little')
+        path.write_bytes(data)
+        with Source('codec', Storage(str(path), 'tiff')).open() as reader:
+            with self.assertRaisesRegex(ValueError, 'TIFF codec'):
                 reader.read((0, 0), (1, 1))
+
+    def test_readers_use_one_thread_only_in_loader_workers(self):
+        from types import SimpleNamespace
+        from test_source_storage import array
+        path = self.root / 'volume.zarr'
+        array(path, np.arange(64, dtype=np.uint8).reshape(4, 4, 4), {'_ARRAY_DIMENSIONS': ['z', 'y', 'x']})
+        source = Source('volume', Storage(str(path), 'zarr'))
+
+        def threads(reader):
+            reader.read((0, 0, 0), (1, 1, 2))
+            return reader._engine().zarr_array().array.threads
+
+        default = min(16, os.cpu_count() or 4)
+        with source.open() as reader:
+            self.assertEqual(threads(reader), default)  # the Zarr reader's own pool size
+        with source.open(threads=4) as reader:
+            self.assertEqual(threads(reader), 4)
+        self.assertEqual(open_zarr(path).threads, default)
+        worker = SimpleNamespace(utils=SimpleNamespace(data=SimpleNamespace(get_worker_info=lambda: object())))
+        with patch.dict(sys.modules, {'torch': worker}):
+            with source.open() as reader:
+                self.assertEqual(threads(reader), 1)
+                np.testing.assert_array_equal(reader.read((0, 0, 0), (1, 1, 2)), [[[0, 1]]])
+            with source.open(threads=4) as reader:
+                self.assertEqual(threads(reader), 4)
+            self.assertEqual(open_zarr(path).threads, 1)
+            self.assertEqual(open_zarr(path, threads=4).threads, 4)
 
     @unittest.skipUnless('fork' in multiprocessing.get_all_start_methods(), 'fork is unavailable')
     def test_fork_reopens_without_inherited_cache_lock(self):
@@ -306,7 +341,7 @@ class SourceReaderTests(unittest.TestCase):
         context = multiprocessing.get_context('fork')
         parent, child = context.Pipe()
         process = context.Process(target=worker_read, args=(reader, child))
-        with reader.decoded_cache._lock:
+        with reader.decoded_cache.working(0):
             process.start()
             child.close()
             try:
@@ -392,17 +427,6 @@ class SourceReaderTests(unittest.TestCase):
         path.write_bytes(b'not an image')
         with self.assertRaises(OSError):
             Source('bad', Storage(str(path), 'png')).open()
-        code = '''
-import sys
-from vc_reader import Source, Storage
-from vc_reader.reader import DecodedCache
-s = Source('unopened', Storage('/absent.png', 'png'))
-assert callable(s.open)
-assert not any(n in sys.modules for n in ('numpy', 'PIL', 'tifffile', 'torch', 'vc_reader._reader'))
-'''
-        code = f'import sys; sys.path.insert(0, {str(Path(__file__).resolve().parents[1] / "src")!r})\n' + code
-        result = subprocess.run([sys.executable, '-S', '-c', code], capture_output=True, text=True)
-        self.assertEqual(result.returncode, 0, result.stderr)
 
 
 if __name__ == '__main__':

@@ -11,7 +11,7 @@
 
 #include <opencv2/core/mat.hpp>
 
-#include "vc/core/util/SurfacePatchIndex.hpp"
+#include <vc_object_store/objects/ObjectStoreSession.hpp>
 
 class QuadSurface;
 class ViewerManager;
@@ -21,13 +21,6 @@ class SegmentationEditManager : public QObject
     Q_OBJECT
 
 public:
-    enum class GridSearchResolution
-    {
-        Low,
-        Medium,
-        High
-    };
-
     struct GridKey
     {
         int row{0};
@@ -81,15 +74,26 @@ public:
     void setViewerManager(ViewerManager* manager) { _viewerManager = manager; }
     [[nodiscard]] ViewerManager* viewerManager() const { return _viewerManager; }
 
-    bool beginSession(std::shared_ptr<QuadSurface> baseSurface);
+    // The edited surface's draft in the store session (vc::objects drafts):
+    // the coordinates its points are in and the attachment it is edited in.
+    // Its object is the surface's id.
+    struct DraftTarget {
+        std::shared_ptr<vc::objects::ObjectStoreSession> session;
+        vc::objects::CoordinateJson coordinates;
+        vc::objects::AttachmentIdentity attachment;
+    };
+    // Edits keep the draft current (the open surface's, kept by CState).
+    bool beginSession(std::shared_ptr<QuadSurface> baseSurface, DraftTarget draft);
     void endSession();
 
     [[nodiscard]] bool hasSession() const { return static_cast<bool>(_baseSurface); }
     [[nodiscard]] std::shared_ptr<QuadSurface> baseSurface() const { return _baseSurface; }
     [[nodiscard]] std::shared_ptr<QuadSurface> previewSurface() const { return _baseSurface; }
-    [[nodiscard]] SurfacePatchIndex* editSurfacePatchIndex() const { return _editSurfacePatchIndex.get(); }
-    [[nodiscard]] SurfacePatchIndex* preferredSurfacePatchIndex() const;
-    bool flushEditSurfacePatchIndex();
+    // For changes made to the preview surface outside this manager: publish
+    // `vertices` (grid rows/columns) of it, or the whole grid (its size or
+    // validity changed), to the draft.
+    void publishDraft(const cv::Rect& vertices);
+    void publishWholeDraft();
 
     // Synchronize a rectangular region with the latest base-surface data without rebuilding the session.
     bool applyExternalSurfaceUpdate(const cv::Rect& vertexRect);
@@ -112,11 +116,6 @@ public:
                               const std::vector<GridKey>& editedVertices,
                               bool markAsPendingEdit,
                               std::optional<cv::Rect>* outDiffBounds = nullptr);
-    bool setResizedPreviewPoints(const cv::Mat_<cv::Vec3f>& points,
-                                 const cv::Mat_<cv::Vec3f>& originalPoints,
-                                 const std::vector<GridKey>& editedVertices,
-                                 bool markAsPendingEdit,
-                                 std::optional<cv::Rect>* outDiffBounds = nullptr);
     bool restorePreviewSnapshot(const cv::Mat_<cv::Vec3f>& points);
 
     void resetPreview();
@@ -125,8 +124,6 @@ public:
 
     std::optional<std::pair<int, int>> worldToGridIndex(const cv::Vec3f& worldPos,
                                                         float* outDistance = nullptr,
-                                                        GridSearchResolution detail =
-                                                            GridSearchResolution::High,
                                                         bool warnOnFailure = true) const;
     std::optional<cv::Vec3f> vertexWorldPosition(int row, int col) const;
 
@@ -140,38 +137,33 @@ public:
 
     [[nodiscard]] const ActiveDrag& activeDrag() const { return _activeDrag; }
     [[nodiscard]] const std::vector<GridKey>& recentTouched() const { return _recentTouched; }
-    [[nodiscard]] std::optional<cv::Rect> recentTouchedBounds() const;
     [[nodiscard]] std::vector<VertexEdit> editedVertices() const;
 
     void markNextEditsAsGrowth();
 
-    void bakePreviewToOriginal();
-    bool invalidateRegion(int centerRow, int centerCol, int radius);
-    bool markInvalidRegion(int centerRow, int centerCol, float radiusSteps);
     void clearInvalidatedEdits();
 
     void resetPointerSeed();
 
 private:
-    static bool isInvalidPoint(const cv::Vec3f& value);
     void rebuildPreviewFromOriginal();
     bool buildActiveSamples(const std::pair<int, int>& gridIndex);
     void applyGaussianToSamples(const cv::Vec3f& delta);
-    void recordVertexEdit(int row, int col, const cv::Vec3f& newWorld, bool queuePatchIndexUpdate = true);
-    void queuePatchIndexRangeForVertices(int minRow, int maxRow, int minCol, int maxCol);
+    void recordVertexEdit(int row, int col, const cv::Vec3f& newWorld, bool markDraftVertex = true);
     void clearActiveDrag();
     float stepNormalization() const;
     cv::Mat_<cv::Vec3f>* previewPointsPtr();
     const cv::Mat_<cv::Vec3f>* previewPointsPtr() const;
-    void rebuildEditSurfacePatchIndex();
-    void queueEditSurfacePatchIndexVertex(int row, int col);
-    void queueEditSurfacePatchIndexRange(int minRow, int maxRow, int minCol, int maxCol);
+    // Vertices changed since the draft was last published.
+    void markDraft(int minRow, int maxRow, int minCol, int maxCol);
+    void flushDraft();
 
     std::shared_ptr<QuadSurface> _baseSurface;
     ViewerManager* _viewerManager{nullptr};
     std::unique_ptr<cv::Mat_<cv::Vec3f>> _originalPoints;
     std::unique_ptr<cv::Mat_<cv::Vec3f>> _preResizeOriginalPoints;
-    std::unique_ptr<SurfacePatchIndex> _editSurfacePatchIndex;
+    std::optional<DraftTarget> _draft;
+    std::optional<cv::Rect> _draftDirty;
 
     float _radiusSteps{3.0f};
     float _sigmaSteps{1.5f};

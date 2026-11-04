@@ -8,8 +8,22 @@ from unittest import mock
 
 import numpy as np
 import tifffile
+from vc_reader.reader import ZarrWriter, create_group
 
 from vesuvius.tifxyz_label_transfer import view_alignment_napari as viewer
+from vesuvius.tifxyz_label_transfer.core import close_memmap
+
+
+def _own_render(array: np.ndarray) -> np.ndarray:
+    """Copy a (possibly memory-mapped) render and release its file mapping.
+
+    The viewer hands back live memory maps of cache files. A test that lets its
+    TemporaryDirectory be torn down while still holding one fails on Windows
+    with a sharing violation, so own the data and then close the mapping.
+    """
+    owned = np.array(array)
+    close_memmap(array)
+    return owned
 
 
 class SurfaceVolumeCompositeTests(unittest.TestCase):
@@ -118,20 +132,13 @@ class SurfaceVolumeCompositeTests(unittest.TestCase):
                     np.testing.assert_array_equal(actual, expected)
 
     def test_label_display_prefers_existing_zarr_pyramid(self) -> None:
-        import zarr
-
         with tempfile.TemporaryDirectory() as temp_dir:
             path = Path(temp_dir) / "labels.tif"
             path.touch()
-            group_kwargs = {"mode": "w"}
-            if int(zarr.__version__.split(".", 1)[0]) >= 3:
-                group_kwargs["zarr_format"] = 2
-            group = zarr.open_group(
-                str(path.with_suffix(".zarr")), **group_kwargs
-            )
-            create = getattr(group, "create_array", None) or group.create_dataset
-            fine = create("0", shape=(65, 8, 10), dtype="u1")
-            coarse = create("1", shape=(65, 4, 5), dtype="u1")
+            root = path.with_suffix(".zarr")
+            create_group(root, auth=None)
+            fine = ZarrWriter.create(root / "0", shape=(65, 8, 10), chunks=(65, 8, 10), dtype="u1", auth=None)
+            coarse = ZarrWriter.create(root / "1", shape=(65, 4, 5), chunks=(65, 4, 5), dtype="u1", auth=None)
             values = np.arange(20, dtype=np.uint8).reshape(4, 5)
             fine[32] = viewer.resize_nearest(values, (8, 10))
             coarse[32] = values
@@ -171,7 +178,9 @@ class SurfaceVolumeCompositeTests(unittest.TestCase):
             )
             case = mock.Mock(root=root)
 
-            actual = viewer.evidence_center_render(case, "source_render")
+            actual = _own_render(
+                viewer.evidence_center_render(case, "source_render")
+            )
 
         np.testing.assert_array_equal(actual, expected)
 
@@ -199,8 +208,10 @@ class SurfaceVolumeCompositeTests(unittest.TestCase):
                 )
             )
 
-            actual = viewer.evidence_center_render(
-                mock.Mock(root=root), "source_render"
+            actual = _own_render(
+                viewer.evidence_center_render(
+                    mock.Mock(root=root), "source_render"
+                )
             )
 
         np.testing.assert_array_equal(actual, expected)
@@ -226,10 +237,12 @@ class SurfaceVolumeCompositeTests(unittest.TestCase):
                 )
             )
 
-            actual = viewer.evidence_comparison_render(
-                mock.Mock(root=root),
-                "annotation-matched-slab",
-                "source_render",
+            actual = _own_render(
+                viewer.evidence_comparison_render(
+                    mock.Mock(root=root),
+                    "annotation-matched-slab",
+                    "source_render",
+                )
             )
 
         np.testing.assert_array_equal(actual, expected)
@@ -295,7 +308,7 @@ class SurfaceVolumeCompositeTests(unittest.TestCase):
         self.assertEqual(case.target_resolution, 7.91)
         self.assertEqual(set(case.surface_volume_urls), {2.4})
 
-    def test_discovery_defaults_need_no_private_rclone_remote(self) -> None:
+    def test_discovery_defaults_need_no_private_root(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             (root / "open-data" / "2.4um-updated.tifxyz").mkdir(parents=True)
@@ -322,35 +335,34 @@ class SurfaceVolumeCompositeTests(unittest.TestCase):
 
             default_case = viewer.discover_case(root)
             mirrored_case = viewer.discover_case(
-                root, ink_rclone_root="my-mirror:bucket/ink"
+                root, ink_root="s3://my-mirror/ink"
             )
 
         # The private ink dataset has no implicit default; the public
-        # open-data root reads anonymously without local rclone config.
+        # open-data root reads anonymously.
         self.assertIsNone(default_case.source_surface_volume_url)
         self.assertTrue(
-            default_case.surface_volume_urls[2.4].startswith(":s3,")
-        )
-        self.assertIn(
-            "env_auth=false", default_case.surface_volume_urls[2.4]
+            default_case.surface_volume_urls[2.4].startswith("s3://vesuvius-challenge-open-data/")
         )
         self.assertEqual(
             mirrored_case.source_surface_volume_url,
-            "my-mirror:bucket/ink/scroll-x/source.zarr",
+            "s3://my-mirror/ink/scroll-x/source.zarr",
         )
 
-    def test_cached_rclone_composite_needs_no_remote_metadata(self) -> None:
+    def test_cached_composite_needs_no_remote_metadata(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             cache = Path(temp_dir) / "middle3.tif"
             expected = np.arange(12, dtype=np.uint8).reshape(3, 4)
             tifffile.imwrite(cache, expected)
             with mock.patch.object(
                 viewer,
-                "inspect_rclone_zarr",
+                "inspect_zarr",
                 side_effect=AssertionError("unexpected remote read"),
             ):
-                actual = viewer.load_middle_three_max(
-                    "remote:bucket/render.zarr", cache, preferred_level=2
+                actual = _own_render(
+                    viewer.load_middle_three_max(
+                        "s3://bucket/render.zarr", cache, preferred_level=2
+                    )
                 )
         np.testing.assert_array_equal(actual, expected)
 
@@ -364,6 +376,7 @@ class SurfaceVolumeCompositeTests(unittest.TestCase):
 
             self.assertIsInstance(actual, np.memmap)
             np.testing.assert_array_equal(actual, expected)
+            close_memmap(actual)
 
     def test_centered_thirteen_plane_max_selects_six_each_side(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -377,31 +390,20 @@ class SurfaceVolumeCompositeTests(unittest.TestCase):
 
             with (
                 mock.patch.object(
-                    viewer, "inspect_rclone_zarr", return_value=info
+                    viewer, "inspect_zarr", return_value=info
                 ),
                 mock.patch.object(
                     viewer,
-                    "extract_rclone_composite",
+                    "extract_composite",
                     side_effect=write_composite,
                 ),
             ):
                 viewer.load_middle_three_max(
-                    "remote:bucket/render.zarr",
+                    "s3://bucket/render.zarr",
                     cache,
                     preferred_level=2,
                     plane_count=13,
                 )
-
-    def test_rejects_http_urls(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            cache = Path(temp_dir) / "middle3.tif"
-            with self.assertRaisesRegex(ValueError, "rclone"):
-                viewer.load_middle_three_max(
-                    "https://example.test/volume.zarr",
-                    cache,
-                    preferred_level=0,
-                )
-            self.assertFalse(cache.exists())
 
 
 class _FakeLayer:
@@ -491,16 +493,18 @@ class ViewerLayerSemanticsTests(unittest.TestCase):
                     return_value=(projected, validity, None, stats),
                 ) as transfer,
             ):
-                actual = viewer.register_render(
-                    case,
-                    source_path,
-                    target_path,
-                    source_render,
-                    projected.shape,
-                    affine,
-                    report,
-                    "projected.tif",
-                    label_offset_render_yx=(1.25, -2.5),
+                actual = _own_render(
+                    viewer.register_render(
+                        case,
+                        source_path,
+                        target_path,
+                        source_render,
+                        projected.shape,
+                        affine,
+                        report,
+                        "projected.tif",
+                        label_offset_render_yx=(1.25, -2.5),
+                    )
                 )
 
         np.testing.assert_array_equal(actual, projected)

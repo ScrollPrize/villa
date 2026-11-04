@@ -7,7 +7,9 @@
 // without the controller or Qt Widgets. The controller keeps `using` aliases
 // under its former nested names.
 
+#include <vc_object_store/objects/GeometryCoordinates.hpp>
 #include <vc_object_store/objects/ObjectStoreSession.hpp>
+#include <vc_object_store/objects/VolumeTransforms.hpp>
 #include <array>
 #include <nlohmann/json.hpp>
 #include <cstddef>
@@ -19,10 +21,10 @@
 
 #include <opencv2/core/types.hpp>
 
-#include "LineAnnotationFiberClassification.hpp"
+#include "vc/fiber_tracer/FiberHvClassification.hpp"
 #include "LineAnnotationFiberSegments.hpp"
 #include "vc/fiber_tracer/FiberDisplay.hpp"
-#include "vc/core/util/Uuid.hpp"
+#include <vc_object_store/Uuid.hpp>
 
 namespace vc3d::line_annotation {
 
@@ -60,15 +62,29 @@ struct FiberBranchRef {
     // merged or written; approving the link clears it with `pending`.
     // Mirrored on both reciprocal refs like `pending` (JSON key "auto").
     bool autoLink = false;
+    // The peer was read in the open volume, so its position and direction
+    // are in the volume's voxels. Links are only made to such fibers.
+    bool branchInVolume = true;
+};
+
+// A fiber read in an open volume: positions, vectors and widths are in that
+// volume's voxels (`volume`, its store volume at its scale), mapped from the
+// stored frame by the store's transform.
+struct FiberVolumeFrame {
+    vc::objects::VolumeVoxels volume;
+    vc::objects::VolumeAffine storedToVolume;
 };
 
 struct StoredFiber {
     std::optional<vc::objects::PinnedObject> storePin;
+    // Set when read in the open volume (bound to it by scale or through a
+    // registration); unset for a fiber in its stored frame, which is unbound.
+    std::optional<FiberVolumeFrame> frame;
     nlohmann::json coordinateIdentity = nlohmann::json::object();
     double width = 0.0;
     double widthGapFraction = vc::fiber_tracer::kDefaultFiberWidthGapFraction;
     uint64_t id = 0;
-    std::string uuid = vc::util::newUuid();
+    std::string uuid = vc::objects::util::newUuid();
     std::string username;
     std::string startedAt;
     uint64_t sequence = 0;
@@ -77,20 +93,15 @@ struct StoredFiber {
     std::vector<StoredControlPoint> controlPoints;
     mutable std::vector<cv::Vec3d> linePoints;
     mutable bool linePointsLoaded = true;
-    std::optional<vc::objects::FiberDetail> catalogDetail;
     // Stored snapshots only. Live-session branch metadata must be converted
     // through storedFiberFromSession()/saveSessionAsFiber() so the central
     // hook can remap linked control-point indices before serialization.
     std::vector<FiberBranchRef> branches;
-    FiberHvClassification hvClassification;
+    vc::fiber_tracer::FiberHvClassification hvClassification;
     std::string manualHvTag;
     std::vector<std::string> tags;
     FiberOptimizationMode optimizationMode = FiberOptimizationMode::Lasagna;
     bool modelOnly = false;
-    // Coordinate domain in which control_points and line_points are
-    // stored. New Spiral-created fibers record the fiber manifest's L0
-    // shape so a downsampled active volume can display them correctly.
-    std::optional<std::array<std::size_t, 3>> coordinateBaseShapeZYX;
     // Inspection of a read-only object-store attachment.
     bool readOnly = false;
     std::string editorError;

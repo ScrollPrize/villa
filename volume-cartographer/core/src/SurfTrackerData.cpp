@@ -4,28 +4,6 @@
 #include <iostream>
 #include <stdexcept>
 
-namespace {
-
-cv::Vec3f at_int_inv(const cv::Mat_<cv::Vec3f>& points, cv::Vec2f p)
-{
-    int x = p[1];
-    int y = p[0];
-    float fx = p[1] - x;
-    float fy = p[0] - y;
-
-    const cv::Vec3f& p00 = points(y, x);
-    const cv::Vec3f& p01 = points(y, x + 1);
-    const cv::Vec3f& p10 = points(y + 1, x);
-    const cv::Vec3f& p11 = points(y + 1, x + 1);
-
-    cv::Vec3f p0 = (1 - fx) * p00 + fx * p01;
-    cv::Vec3f p1 = (1 - fx) * p10 + fx * p11;
-
-    return (1 - fy) * p0 + fy * p1;
-}
-
-} // namespace
-
 resId_t::resId_t() : _type(0), _sm(nullptr)
 {
 }
@@ -138,7 +116,10 @@ cv::Vec3d SurfTrackerData::lookup_int(QuadSurface *sm, const cv::Vec2i& p)
     if (!loc_valid(points, l))
         return {-1, -1, -1};
 
-    return at_int_inv(points, l);
+    const float xy[]{float(l[1]), float(l[0])};
+    cv::Vec3f position;
+    sm->pointSurface()->pointsAt(xy, 1, position.val, nullptr);
+    return std::isfinite(position[0]) ? cv::Vec3d(position) : cv::Vec3d(-1, -1, -1);
 }
 
 bool SurfTrackerData::valid_int(QuadSurface *sm, const cv::Vec2i& p)
@@ -161,7 +142,10 @@ cv::Vec3d SurfTrackerData::lookup_int_loc(QuadSurface *sm, const cv::Vec2f& l)
     if (!loc_valid(points, loc))
         return {-1, -1, -1};
 
-    return at_int_inv(points, l);
+    const float xy[]{float(l[1]), float(l[0])};
+    cv::Vec3f position;
+    sm->pointSurface()->pointsAt(xy, 1, position.val, nullptr);
+    return std::isfinite(position[0]) ? cv::Vec3d(position) : cv::Vec3d(-1, -1, -1);
 }
 
 void SurfTrackerData::flip_x(int x0)

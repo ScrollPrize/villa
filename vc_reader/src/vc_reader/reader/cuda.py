@@ -40,18 +40,25 @@ def _device_points(points, device, dtype):
     return array.reshape(-1, 3), array.shape[:-1]
 
 
-class PointRequest:
-    """Immutable point coordinates/planning retained for repeated device reads."""
-    def __init__(self, reader, plan, shape, dtype):
-        self.reader, self._plan, self.shape, self.dtype = reader, plan, shape, dtype
+class CudaPool:
+    """A device cache that several :class:`CudaReader` share: one byte budget and one
+    least-recently-used order over all their bricks (e.g. every level of a pyramid)."""
 
-    def read(self, *, source="auto", valid=False):
-        self.reader._ready()
-        outputs = self.reader._engine.read_plan(self._plan, source, valid)
-        return self.reader._point_outputs(outputs, self.dtype, self.shape, valid)
+    def __init__(self, cache_bytes=512 << 20, *, device=0):
+        cache_bytes, device = operator.index(cache_bytes), operator.index(device)
+        if cache_bytes < 0 or device < 0:
+            raise ValueError("cache_bytes and device must be nonnegative")
+        if not is_available():
+            raise RuntimeError("CUDA reader unavailable: build with VC_READER_ENABLE_CUDA=ON and use a CUDA device")
+        self.device, self._engine = device, _reader.CudaPool(cache_bytes, device)
 
-    def __getstate__(self):
-        raise TypeError("CUDA point requests cannot be pickled")
+    @property
+    def cache_bytes(self) -> int:
+        return self._engine.budget
+
+    @property
+    def resident_bytes(self) -> int:
+        return self._engine.resident_bytes
 
 
 class CudaReader:
@@ -61,10 +68,11 @@ class CudaReader:
     and falls back to CPU sampling/upload if the request exceeds cache_bytes.
     source='chunks' requires device sampling and a sufficient chunk budget.
     source='cpu' explicitly samples/crops on CPU and uploads the result.
-    The cache is private to this reader adapter and device; clear_cache() drops
+    The cache is private to this reader adapter and device, unless ``pool`` (a
+    :class:`CudaPool`) shares one with other readers; clear_cache() drops this reader's
     resident source chunks. Arrays retain independent ownership after close().
     """
-    def __init__(self, reader, *, cache_bytes=512 << 20, device=0):
+    def __init__(self, reader, *, cache_bytes=512 << 20, device=0, pool=None):
         reader._ready()
         if reader.ndim != 3 or reader.dtype != np.uint8:
             raise TypeError("CUDA sampling supports 3-D uint8 CT")
@@ -73,8 +81,11 @@ class CudaReader:
             raise ValueError("cache_bytes and device must be nonnegative")
         if not is_available():
             raise RuntimeError("CUDA reader unavailable: build with VC_READER_ENABLE_CUDA=ON and use a CUDA device")
-        self.reader, self.device, self._pid = reader, device, os.getpid()
-        self._engine = _reader.CudaReader(reader._array, cache_bytes, device)
+        if pool is not None:
+            device = pool.device
+        self.reader, self.device, self._pid, self.pool = reader, device, os.getpid(), pool
+        self._engine = (_reader.CudaReader(reader._array, cache_bytes, device) if pool is None
+                        else _reader.CudaReader(reader._array, pool._engine))
 
     def _ready(self):
         if self._pid != os.getpid():
@@ -273,20 +284,3 @@ class CudaReader:
         flat, shape = _integer_points(_host_input(points))
         return self._point_outputs(self._engine.points(flat, [0, 0, 0], 3, 0, source, valid), np.uint8, shape, valid)
 
-    def prepare_points(self, points, *, integer=False, order=1, coordinate_origin=None):
-        """Plan/upload coordinates once; request.read() reuses them on device.
-
-        Source chunks still obey the cache budget and may be evicted between
-        reads. Caller mutations of points do not change the prepared request.
-        """
-        self._ready()
-        if order not in (0, 1): raise ValueError("order must be 0 or 1")
-        if integer:
-            if coordinate_origin is not None: raise ValueError("integer points use absolute coordinates")
-            local, shape = _integer_points(points)
-            base, kind, order, dtype = [0, 0, 0], 3, 0, np.uint8
-        else:
-            local, base, shape = points32(points, coordinate_origin)
-            kind, dtype = 2, np.float32 if order else np.uint8
-        plan = self._engine.prepare_points(local, base, kind, order)
-        return PointRequest(self, plan, shape, dtype)

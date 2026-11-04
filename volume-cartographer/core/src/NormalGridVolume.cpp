@@ -1,26 +1,28 @@
 #include "vc/core/util/NormalGridVolume.hpp"
 #include "vc/core/util/HashFunctions.hpp"
 
-#include "utils/Json.hpp"
-#include <utils/http_fetch.hpp>
+#include <nlohmann/json.hpp>
+#include "vc/core/util/RemoteCacheSettings.hpp"
+
+#include <vc_reader/source_reader.hpp>
+#include <vc_reader/zarr.hpp>
 
  #include <filesystem>
  #include <fstream>
 #include <algorithm>
 #include <cmath>
 #include <cstdlib>
-#include <condition_variable>
-#include <deque>
 #include <iostream>
 #include <unordered_map>
-#include <unordered_set>
 #include <vector>
 #include <random>
 #include <chrono>
 #include <atomic>
+#include <condition_variable>
 #include <mutex>
 #include <shared_mutex>
 #include <thread>
+#include <unordered_set>
 
  namespace fs = std::filesystem;
  
@@ -70,7 +72,7 @@
      struct NormalGridVolume::pimpl {
          std::string base_path;
          int sparse_volume;
-         utils::Json metadata;
+         nlohmann::json metadata;
          double coordinate_scale = 1.0;
          double output_spiral_step = 20.0;
          int selected_level = 0;
@@ -192,29 +194,35 @@
 
          std::vector<std::string> plane_dirs = {"xy", "xz", "yz"};
 
-         // Remote streaming (enabled by kNormalGridsRemoteMarker in base_path):
-         // grid files missing locally are fetched from remote_url on demand and
-         // cached in base_path. 404s leave a "<file>.missing" marker so they
-         // are not re-fetched across runs.
+         // Remote streaming (kNormalGridsRemoteMarker in base_path): base_path is
+         // remote_url's place under a cache root, <root>/<scheme>/<host>/<path>, and
+         // files missing there are downloaded by vc_reader's file cache under the
+         // root's disk budget and free-space floor (VC3D's cache settings). A grid
+         // the store does not have is remembered in grid_cache as a null entry.
          bool remote = false;
          std::string remote_url;
-         utils::HttpClient http_client;
-         static constexpr int prefetch_radius = 4;
-         static constexpr int prefetch_worker_count = 4;
-         static constexpr size_t prefetch_queue_limit = 256;
-         mutable std::mutex prefetch_mutex;
-         mutable std::condition_variable prefetch_cv;
-         mutable std::deque<std::pair<int, int>> prefetch_queue;
-         mutable std::unordered_set<uint64_t> prefetch_pending;
-         std::vector<std::thread> prefetch_threads;
-         bool prefetch_stop = false;
+         mutable std::unique_ptr<vcr::sources::EncodedFiles> files;
+         mutable std::atomic<uint64_t> fetch_failures{0};
+         mutable std::mutex fetch_error_mutex;
+         mutable std::string last_fetch_error;
+         // Read-ahead: when a slice has to be fetched, its neighbours on the same plane (the
+         // tracer's frontier reaches them next) are opened too, each as one plain blocking
+         // open on its own background thread. No queue: a neighbour already cached, already
+         // in flight, or over the in-flight limit is simply not started; the file cache's
+         // per-file lock makes a tracer thread that needs one of them wait for that download.
+         static constexpr int readahead_radius = 4;
+         static constexpr int readahead_limit = 16;
+         mutable std::mutex readahead_mutex;
+         mutable std::condition_variable readahead_cv;
+         mutable std::unordered_set<uint64_t> readahead_inflight;
+         mutable int readahead_running = 0;
 
          pimpl(const std::string& path, int requested_level) : base_path(path) {
             load_remote_marker();
             if (!ensure_local_file("metadata.json")) {
                 throw std::runtime_error(missing_file_error("metadata.json"));
             }
-            metadata = utils::Json::parse_file(fs::path(base_path) / "metadata.json");
+            metadata = nlohmann::json::parse(std::ifstream(fs::path(base_path) / "metadata.json"));
             multiscale = metadata.value("format", std::string()) == "normal-grid-multiscale";
             if (multiscale) {
                 const int min_level = metadata.value("min-level", 0);
@@ -227,13 +235,13 @@
                               << "; using level " << selected_level << std::endl;
                 }
 
-                utils::Json level_metadata;
+                nlohmann::json level_metadata;
                 const std::string level_metadata_name =
                     "metadata.level" + std::to_string(selected_level) + ".json";
                 const fs::path level_metadata_path = fs::path(base_path) / level_metadata_name;
                 const bool level_present = ensure_local_file(level_metadata_name);
                 if (level_present && fs::exists(level_metadata_path)) {
-                    level_metadata = utils::Json::parse_file(level_metadata_path);
+                    level_metadata = nlohmann::json::parse(std::ifstream(level_metadata_path));
                 } else if (metadata.contains("source-metadata")) {
                     level_metadata = metadata["source-metadata"];
                 } else if (remote && !level_present) {
@@ -262,44 +270,83 @@
                 output_spiral_step = metadata.value("spiral-step", 20.0);
             }
 
-            if (remote) {
-                prefetch_threads.reserve(prefetch_worker_count);
-                for (int i = 0; i < prefetch_worker_count; ++i) {
-                    prefetch_threads.emplace_back([this]() { prefetch_loop(); });
-                }
-            }
         }
 
         ~pimpl() {
-            {
-                std::lock_guard<std::mutex> lock(prefetch_mutex);
-                prefetch_stop = true;
-            }
-            prefetch_cv.notify_all();
-            for (auto& thread : prefetch_threads) {
-                if (thread.joinable()) {
-                    thread.join();
+            std::unique_lock<std::mutex> lock(readahead_mutex);
+            readahead_cv.wait(lock, [&] { return readahead_running == 0; });
+        }
+
+        static uint64_t slice_key(int plane_idx, int slice_idx) {
+            return (static_cast<uint64_t>(static_cast<uint32_t>(plane_idx)) << 32) | static_cast<uint32_t>(slice_idx);
+        }
+
+        // Start background opens of the slices around (plane_idx, slice_idx) that are not cached yet.
+        void read_ahead(int plane_idx, int slice_idx) const {
+            std::error_code ec;
+            std::lock_guard<std::mutex> lock(readahead_mutex);
+            for (int distance = 1; distance <= readahead_radius; ++distance) {
+                for (const int sign : {1, -1}) {
+                    const int slice = slice_idx + sign * distance * sparse_volume;
+                    if (slice < 0 || readahead_running >= readahead_limit) continue;
+                    const uint64_t key = slice_key(plane_idx, slice);
+                    if (readahead_inflight.count(key)) continue;
+                    const std::string rel = relative_grid_path(plane_idx, slice);
+                    if (fs::exists(fs::path(base_path) / rel, ec)) continue;
+                    {
+                        std::shared_lock<std::shared_mutex> cache(mutex);
+                        if (grid_cache.count(cv::Vec2i(plane_idx, slice))) continue;  // known, present or absent
+                    }
+                    readahead_inflight.insert(key);
+                    ++readahead_running;
+                    std::thread([this, key, rel, plane_idx, slice] {
+                        try {
+                            (void)files->open(remote_url + "/" + rel);
+                        } catch (const vcr::zarr::NotFound&) {
+                            // The store does not have it: remember that, so nobody asks again.
+                            std::unique_lock<std::shared_mutex> cache(mutex);
+                            if (!grid_cache.count(cv::Vec2i(plane_idx, slice))) insert_locked(cv::Vec2i(plane_idx, slice), nullptr);
+                        } catch (const std::exception&) {
+                            // The tracer's own open reports failures.
+                        }
+                        std::lock_guard<std::mutex> done(readahead_mutex);
+                        readahead_inflight.erase(key);
+                        --readahead_running;
+                        readahead_cv.notify_all();
+                    }).detach();
                 }
             }
         }
 
+        // The cache root under which `dir` is `url`'s place, <root>/<scheme>/<host>/<path>
+        // (vcr::zarr::decodedCachePath), so that files vc_reader caches for url/<rel> land at dir/<rel>.
+        static fs::path streamingCacheRoot(const fs::path& dir, const std::string& url) {
+            const fs::path place = vcr::zarr::decodedCachePath(fs::path(), url);
+            auto root = fs::absolute(dir).lexically_normal();
+            if (root.filename().empty()) root = root.parent_path();
+            const std::vector<fs::path> parts(place.begin(), place.end());
+            for (auto it = parts.rbegin(); it != parts.rend(); ++it) {
+                if (root.filename() != *it) {
+                    throw std::runtime_error("streaming normal grids for " + url + " must be cached at <root>/" +
+                                             place.generic_string() + ", not at " + dir.string());
+                }
+                root = root.parent_path();
+            }
+            return root;
+        }
+
         void load_remote_marker() {
-            const fs::path marker = fs::path(base_path) / kNormalGridsRemoteMarker;
-            std::error_code ec;
-            if (!fs::is_regular_file(marker, ec)) {
-                return;
-            }
-            try {
-                const auto json = utils::Json::parse_file(marker);
-                remote_url = json.value("url", std::string());
-            } catch (const std::exception& e) {
-                std::cerr << "Ignoring unreadable " << marker << ": " << e.what() << std::endl;
-                return;
-            }
-            while (!remote_url.empty() && remote_url.back() == '/') {
-                remote_url.pop_back();
-            }
+            remote_url = normalGridsRemoteUrl(base_path).value_or(std::string());
             remote = !remote_url.empty();
+            if (!remote) {
+                return;
+            }
+            const fs::path root = streamingCacheRoot(base_path, remote_url);
+            files = std::make_unique<vcr::sources::EncodedFiles>([root](const std::string& location) {
+                auto options = vc::settings::remoteOpenOptions(root);
+                options.access = vcr::zarr::resolveAccess(location);
+                return options;
+            });
         }
 
         // Build an intentional, actionable error message for a normal-grid file
@@ -309,10 +356,12 @@
         // "Cannot open" thrown by Json::parse_file on a still-absent file.
         std::string missing_file_error(const std::string& rel) const {
             if (remote) {
+                std::lock_guard<std::mutex> lock(fetch_error_mutex);
                 return "Failed to fetch remote normal-grid file '" + rel +
                        "' from " + remote_url +
-                       " (cached under " + base_path +
-                       "); see preceding stderr for the HTTP status or network error";
+                       " (cached under " + base_path + ")" +
+                       (last_fetch_error.empty() ? std::string(": the store does not have it")
+                                                 : ": " + last_fetch_error);
             }
             return "normal-grid file not found: " +
                    (fs::path(base_path) / rel).string();
@@ -330,127 +379,33 @@
             return rel;
         }
 
-        // Make base_path/rel exist locally, fetching it from remote_url when
-        // streaming. Returns false when the file is genuinely missing (locally
-        // for plain stores, remotely for streaming stores) or the fetch failed.
-        bool ensure_local_file(const std::string& rel) const {
-            const fs::path local = fs::path(base_path) / rel;
-            std::error_code ec;
-            if (fs::exists(local, ec)) {
-                return true;
-            }
+        // Make base_path/rel available: present for a plain store; for a streaming store,
+        // cached already or downloaded now by vc_reader (one download per file, concurrent
+        // misses wait for it; budget and free-space floor apply). `pinned` keeps the
+        // streamed file's descriptor, so eviction cannot take it before it is mapped.
+        // False when the store does not have the file, or when fetching it failed: that
+        // is counted, kept in last_fetch_error and reported on stderr once per message.
+        bool ensure_local_file(const std::string& rel,
+                               std::optional<vcr::sources::EncodedFiles::Opened>* pinned = nullptr) const {
             if (!remote) {
-                return false;
+                std::error_code ec;
+                return fs::exists(fs::path(base_path) / rel, ec);
             }
-            const fs::path missing_marker = local.string() + ".missing";
-            if (fs::exists(missing_marker, ec)) {
-                return false;
-            }
-
-            utils::HttpResponse resp;
             try {
-                resp = http_client.get(remote_url + "/" + rel);
-            } catch (const std::exception& e) {
-                std::cerr << "normal-grid fetch failed for " << rel << ": " << e.what()
-                          << std::endl;
-                return false;
-            }
-
-            if (resp.ok()) {
-                fs::create_directories(local.parent_path(), ec);
-                // Unique temp + rename so concurrent readers (and concurrent
-                // processes streaming into the same cache) never see partial files.
-                const auto tick = std::chrono::steady_clock::now().time_since_epoch().count();
-                const fs::path tmp = local.string() + ".tmp-" +
-                    std::to_string(std::hash<std::thread::id>{}(std::this_thread::get_id())) +
-                    "-" + std::to_string(tick);
-                {
-                    std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
-                    if (!out) {
-                        return false;
-                    }
-                    if (!resp.body.empty()) {
-                        out.write(reinterpret_cast<const char*>(resp.body.data()),
-                                  static_cast<std::streamsize>(resp.body.size()));
-                    }
-                    out.close();
-                    if (!out) {
-                        fs::remove(tmp, ec);
-                        return false;
-                    }
-                }
-                fs::rename(tmp, local, ec);
-                if (ec) {
-                    fs::remove(tmp, ec);
-                    return fs::exists(local, ec);
-                }
+                auto opened = files->open(remote_url + "/" + rel);
+                if (pinned) pinned->emplace(std::move(opened));
                 return true;
-            }
-
-            if (resp.not_found()) {
-                fs::create_directories(local.parent_path(), ec);
-                std::ofstream(missing_marker.string()).flush();
+            } catch (const vcr::zarr::NotFound&) {
+                return false;
+            } catch (const std::exception& e) {
+                fetch_failures.fetch_add(1, std::memory_order_relaxed);
+                std::lock_guard<std::mutex> lock(fetch_error_mutex);
+                if (last_fetch_error != e.what()) {
+                    last_fetch_error = e.what();
+                    std::cerr << "normal-grid fetch failed for " << rel << ": " << e.what() << std::endl;
+                }
                 return false;
             }
-
-            std::cerr << "normal-grid fetch for " << rel << " returned HTTP "
-                      << resp.status_code << std::endl;
-            return false;
-        }
-
-        void prefetch_loop() {
-            while (true) {
-                std::pair<int, int> item;
-                {
-                    std::unique_lock<std::mutex> lock(prefetch_mutex);
-                    prefetch_cv.wait(lock, [&]() {
-                        return prefetch_stop || !prefetch_queue.empty();
-                    });
-                    if (prefetch_stop) {
-                        return;
-                    }
-                    item = prefetch_queue.front();
-                    prefetch_queue.pop_front();
-                }
-                ensure_local_file(relative_grid_path(item.first, item.second));
-                {
-                    std::lock_guard<std::mutex> lock(prefetch_mutex);
-                    prefetch_pending.erase(prefetch_key(item.first, item.second));
-                }
-            }
-        }
-
-        static uint64_t prefetch_key(int plane_idx, int slice_idx) {
-            return (static_cast<uint64_t>(static_cast<uint32_t>(plane_idx)) << 32) |
-                   static_cast<uint32_t>(slice_idx);
-        }
-
-        // Queue nearby slices of the same plane so the tracer's advancing
-        // frontier mostly hits warm files.
-        void schedule_prefetch(int plane_idx, int slice_idx) const {
-            std::error_code ec;
-            std::lock_guard<std::mutex> lock(prefetch_mutex);
-            for (int distance = 1; distance <= prefetch_radius; ++distance) {
-                for (const int sign : {1, -1}) {
-                    const int slice = slice_idx + sign * distance * sparse_volume;
-                    if (slice < 0 || prefetch_queue.size() >= prefetch_queue_limit) {
-                        continue;
-                    }
-                    const uint64_t key = prefetch_key(plane_idx, slice);
-                    if (prefetch_pending.count(key)) {
-                        continue;
-                    }
-                    const fs::path local =
-                        fs::path(base_path) / relative_grid_path(plane_idx, slice);
-                    if (fs::exists(local, ec) ||
-                        fs::exists(fs::path(local.string() + ".missing"), ec)) {
-                        continue;
-                    }
-                    prefetch_pending.insert(key);
-                    prefetch_queue.push_back({plane_idx, slice});
-                }
-            }
-            prefetch_cv.notify_all();
         }
 
         std::optional<GridQueryResult> query(const cv::Point3f& point, int plane_idx) const {
@@ -527,10 +482,12 @@
             const std::string rel = relative_grid_path(plane_idx, slice_idx);
             std::string grid_path = (fs::path(base_path) / rel).string();
 
+            std::optional<vcr::sources::EncodedFiles::Opened> pinned;
             if (remote) {
-                schedule_prefetch(plane_idx, slice_idx);
+                std::error_code ec;
+                if (!fs::exists(fs::path(base_path) / rel, ec)) read_ahead(plane_idx, slice_idx);
             }
-            if (!ensure_local_file(rel)) {
+            if (!ensure_local_file(rel, &pinned)) {
                 std::unique_lock<std::shared_mutex> lock(mutex);
                 insert_locked(key, nullptr);
                 return nullptr;
@@ -672,6 +629,11 @@
             NormalGridVolume::CacheStats stats;
             stats.gridHits = cache_hits.load(std::memory_order_relaxed);
             stats.gridMisses = cache_misses.load(std::memory_order_relaxed);
+            stats.fetchFailures = fetch_failures.load(std::memory_order_relaxed);
+            {
+                std::lock_guard<std::mutex> lock(fetch_error_mutex);
+                stats.lastFetchError = last_fetch_error;
+            }
 
             std::shared_lock<std::shared_mutex> lock(mutex);
             stats.liveGridEntries = grid_cache.size();
@@ -764,7 +726,52 @@
     NormalGridVolume::~NormalGridVolume() = default;
     NormalGridVolume::NormalGridVolume(NormalGridVolume&&) noexcept = default;
     NormalGridVolume& NormalGridVolume::operator=(NormalGridVolume&&) noexcept = default;
-    const utils::Json& NormalGridVolume::metadata() const {
+    const nlohmann::json& NormalGridVolume::metadata() const {
         return pimpl_->metadata;
     }
+std::optional<std::string> normalGridsRemoteUrl(const std::filesystem::path& dir)
+{
+    const fs::path marker = dir / kNormalGridsRemoteMarker;
+    std::error_code ec;
+    if (!fs::is_regular_file(marker, ec)) {
+        return std::nullopt;
+    }
+    std::string url;
+    try {
+        url = nlohmann::json::parse(std::ifstream(marker)).value("url", std::string());
+    } catch (const std::exception& e) {
+        std::cerr << "Ignoring unreadable " << marker << ": " << e.what() << std::endl;
+        return std::nullopt;
+    }
+    while (!url.empty() && url.back() == '/') {
+        url.pop_back();
+    }
+    return url;
+}
+
+bool writeNormalGridsRemoteMarker(const std::filesystem::path& dir, const std::string& url)
+{
+    if (normalGridsRemoteUrl(dir) == url) {
+        return true;
+    }
+    std::error_code ec;
+    fs::create_directories(dir, ec);
+    if (ec) {
+        return false;
+    }
+    auto marker = nlohmann::json::object();
+    marker["url"] = url;
+    std::ofstream out(dir / kNormalGridsRemoteMarker, std::ios::trunc);
+    out << marker.dump(2);
+    out.close();
+    return static_cast<bool>(out);
+}
+
+bool hasNormalGridFiles(const std::filesystem::path& dir)
+{
+    std::error_code ec;
+    return fs::is_directory(dir / "xy", ec) && fs::is_directory(dir / "xz", ec) &&
+           fs::is_directory(dir / "yz", ec) && fs::is_regular_file(dir / "metadata.json", ec);
+}
+
 } // namespace vc::core::util
