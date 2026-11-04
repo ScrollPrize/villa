@@ -13,7 +13,7 @@ from scipy.ndimage import gaussian_filter
 from tqdm.auto import tqdm
 
 from vc_reader.reader import ObjectStore, ZarrWriter, open_zarr
-from vesuvius.utils.io.zarr_utils import wait_for_zarr_creation
+from vesuvius.utils.io.zarr_utils import mark_zarr_ready, wait_for_zarr_creation
 from vesuvius.utils.k8s import get_tqdm_kwargs
 from vesuvius.utils.cli import HyphenUnderscoreParser
 
@@ -719,14 +719,23 @@ class InMemoryBlender:
         return output_chunks
 
     def prepare_output(self, output_path, chunk_size=None, compression_level=1, finalize_config=None,
-                       verbose=True, create=True, part_id=0):
-        """Create or wait for the shared output before any part starts inference."""
+                       verbose=True, create=True, part_id=0, run_id=None, wait_timeout=300):
+        """Create or wait for the shared output before any part starts inference.
+
+        Split jobs must share a fresh run_id, so an old output cannot release waiting parts.
+        Part 0 publishes readiness only after creation completes, including on an empty slab.
+        """
         self._output_chunks(chunk_size)  # Validate the slab before replacing an existing output.
+        if self.z_range is not None and (not run_id or not run_id.strip()):
+            raise ValueError("Split in-memory blending requires a non-empty run_id shared by all parts.")
         if create:
             create_blend_output(output_path, self.volume_shape, self.num_classes, self.patch_size,
                                 chunk_size, compression_level, finalize_config, verbose)
+            if run_id is not None:
+                mark_zarr_ready(output_path, run_id)
         else:
-            wait_for_zarr_creation(output_path, verbose=verbose, part_id=part_id)
+            wait_for_zarr_creation(output_path, max_wait_time=wait_timeout, verbose=verbose,
+                                   part_id=part_id, run_id=run_id)
 
     def write(self, output_path, chunk_size=None, finalize_config=None,
               verbose=True, epsilon=1e-8, num_workers=None):

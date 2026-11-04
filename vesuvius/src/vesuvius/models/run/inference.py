@@ -422,6 +422,13 @@ class Inferer():
         if self.in_memory_blend is not None:
             if not self.in_memory_blend.get('output_path'):
                 raise ValueError("in_memory_blend needs an 'output_path'.")
+            run_id = self.in_memory_blend.get('run_id')
+            if self.num_parts > 1 and (not run_id or not run_id.strip()):
+                raise ValueError("Split in-memory blending requires --blend_run_id shared by all parts; "
+                                 "use a fresh ID for each run.")
+            wait_timeout = self.in_memory_blend.get('wait_timeout', 300)
+            if not np.isfinite(wait_timeout) or wait_timeout <= 0:
+                raise ValueError("blend_wait_timeout must be finite and positive.")
         # Defer patch size validation until after model loading if not explicitly provided
 
         # --- Output Setup ---
@@ -1266,6 +1273,8 @@ class Inferer():
             verbose=self.verbose,
             create=self.part_id == 0,
             part_id=self.part_id,
+            run_id=config.get('run_id'),
+            wait_timeout=config.get('wait_timeout', 300),
         )
 
     def _write_in_memory_blend(self):
@@ -1397,6 +1406,12 @@ def build_parser():
                              'With --num_parts N, part --part_id blends and writes one chunk-aligned Z slab '
                              'of that region (running the patches that reach into it), so the parts are '
                              'independent jobs writing disjoint chunks of the same output; part 0 creates it.')
+    parser.add_argument('--blend_run_id', type=str, default=None,
+                        help='With split --blend_in_memory: required ID shared by all parts. Use a fresh '
+                             'ID for every run so existing output cannot release waiting parts.')
+    parser.add_argument('--blend_wait_timeout', type=int, default=300, metavar='SECONDS',
+                        help='With --blend_in_memory: seconds to wait for part 0 to initialize this run '
+                             'before inference (positive integer; default: 300). Increase for scheduler delays.')
     parser.add_argument('--mode', type=str, choices=['binary', 'multiclass'], default='binary',
                         help='With --blend_in_memory: finalization mode, as in blend_and_finalize. Default: binary')
     from vesuvius.models.run.finalize_outputs import add_threshold_arguments
@@ -1441,6 +1456,11 @@ def main():
     in_memory_blend = None
     if args.blend_in_memory:
         from vesuvius.models.run.finalize_outputs import FinalizeConfig, resolve_threshold
+        if args.num_parts > 1 and (not args.blend_run_id or not args.blend_run_id.strip()):
+            parser.error("--blend_run_id is required with split --blend_in_memory; "
+                         "share one fresh ID across all parts of each run.")
+        if args.blend_wait_timeout <= 0:
+            parser.error("--blend_wait_timeout must be positive.")
         blend_chunk_size = None
         if args.blend_chunk_size:
             try:
@@ -1451,6 +1471,8 @@ def main():
                 parser.error("Invalid --blend_chunk_size. Expected 3 comma-separated integers (Z,Y,X).")
         in_memory_blend = {
             'output_path': args.blend_in_memory,
+            'run_id': args.blend_run_id,
+            'wait_timeout': args.blend_wait_timeout,
             'sigma_scale': args.blend_sigma_scale,
             'chunk_size': blend_chunk_size,
             'compression_level': args.blend_compression_level,

@@ -123,14 +123,28 @@ With `--num_parts N --part_id I`, each part blends one Z slab of that region ins
 rows the patches cover are divided between the parts (the same chunk-row split
 `blend_and_finalize --num_parts` uses), part `I` runs every patch that reaches into its slab,
 including the ones that start in the slab below, and writes only the chunks of its slab. The parts
-are independent jobs writing disjoint chunks of the same output, which part 0 creates (the others
-wait for it), and together they write exactly what a single process would. Memory per part is
+are independent jobs writing disjoint chunks of the same output. Part 0 creates the output before
+inference; the others wait for it before starting inference. No part recreates the array when it
+finishes, so they can finish in any order and together write exactly what a single process would.
+Memory per part is
 `(num_classes + 1) * 4` bytes per voxel of its slab, so more parts need less RAM each; the cost is
 that a patch crossing a slab boundary is run by both parts.
 
+Split in-memory runs require `--blend_run_id`: generate it once and pass the same value to every
+part, including jobs submitted separately on other machines. Use a **new ID for every fresh run**.
+Part 0 publishes that ID only after output creation succeeds; an existing array from an older run
+does not release waiting parts. Do not run different runs concurrently against the same output.
+
+`--blend_wait_timeout SECONDS` controls how long a part waits for initialization (default: 300).
+Increase it for scheduler delays. It does not limit inference time, and a timeout stops that part
+before inference begins. Wait for all parts to finish before consuming the output; the run marker
+indicates initialization, not completion.
+
 ```bash
+blend_run_id=$(python -c 'import uuid; print(uuid.uuid4())')
 for i in 0 1 2 3; do
-  vesuvius.predict ... --blend_in_memory /tmp/final.zarr --num_parts 4 --part_id $i &
+  vesuvius.predict ... --blend_in_memory /tmp/final.zarr --num_parts 4 --part_id "$i" \
+    --blend_run_id "$blend_run_id" --blend_wait_timeout 3600 &
 done; wait
 ```
 
