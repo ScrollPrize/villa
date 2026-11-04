@@ -254,7 +254,7 @@ void detail::publishHistory(sqlite3* db, bool importedBindings)
         while (required.row()) {
             Statement expected(db, "SELECT revision_uuid FROM history_expected WHERE uuid=?", required.text(0));
             if (!expected.row() || expected.optText(0) != head(db, required.text(0)))
-                throw std::runtime_error("object history: missing expected validation endpoint " + required.text(0));
+                throw std::invalid_argument("object history: missing expected validation endpoint " + required.text(0));
         }
     }
     while (dirty.row()) {
@@ -264,7 +264,7 @@ void detail::publishHistory(sqlite3* db, bool importedBindings)
         if (strict) {
             Statement expected(db, "SELECT revision_uuid FROM history_expected WHERE uuid=?", object);
             if (!expected.row() || expected.optText(0) != p.parent)
-                throw std::runtime_error("object history: missing or conflicting expected revision for " + object);
+                throw std::invalid_argument("object history: missing or conflicting expected revision for " + object);
         }
         Statement row(db, std::string("SELECT ") + kObjectCols + " FROM objects WHERE uuid=?", parseUuid(object));
         p.exists = row.row();

@@ -423,6 +423,12 @@ public:
     // request returns its saved receipt without re-executing; the same request
     // UUID with different contents fails. Conflicts throw TransactionConflict.
     TransactionReceipt submit(const TransactionRequest&);
+    // The same, from the canonical JSON form (transactionRequestToJson). A
+    // saved receipt of the identical request answers before any payload is
+    // needed, so a retry recovers a committed result even after its staged
+    // bytes expired. Otherwise every payload must be available or
+    // MissingPayloads names those that are not.
+    TransactionReceipt submit(const std::string& requestJson, const PayloadLookup&);
     std::optional<TransactionReceipt> receipt(const Txn&, const std::string& requestUuid) const;
     StoreStatus status(const Txn&) const;
     // Changes after the cursor, whole commits in sequence order, at most

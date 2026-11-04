@@ -15,6 +15,7 @@
 // ordered feed. A transaction that changes nothing advances nothing.
 
 #include <cstdint>
+#include <functional>
 #include <map>
 #include <optional>
 #include <stdexcept>
@@ -113,6 +114,21 @@ private:
     Reason reason_;
     std::vector<ConflictDetail> details_;
 };
+
+// The request's binary payloads (by SHA-256) are not available, and no
+// saved receipt of that exact request answers it: stage them and retry.
+class MissingPayloads : public std::runtime_error {
+public:
+    explicit MissingPayloads(std::vector<std::string> hashes)
+        : std::runtime_error("transaction: payloads not available (" + std::to_string(hashes.size()) + ")"),
+          hashes_(std::move(hashes)) {}
+    const std::vector<std::string>& hashes() const { return hashes_; }
+private:
+    std::vector<std::string> hashes_;
+};
+
+// Staged payload bytes by SHA-256; nullopt when not (or no longer) staged.
+using PayloadLookup = std::function<std::optional<std::vector<uint8_t>>(const std::string& sha256)>;
 
 // ---- Change feed ----------------------------------------------------------
 

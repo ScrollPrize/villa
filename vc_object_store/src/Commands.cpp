@@ -9,6 +9,8 @@
 
 #include <openssl/evp.h>
 
+#include <algorithm>
+
 namespace vc::objects {
 using namespace detail;
 using Json = nlohmann::json;
@@ -492,6 +494,61 @@ TransactionReceipt ObjectStore::submit(const TransactionRequest& request)
     for (const auto& op : request.operations) std::visit(apply, op);
     txn.commit();
     return *txn.receipt();
+}
+
+} // namespace vc::objects
+
+namespace vc::objects {
+namespace {
+void collectPayloads(const Json& op, std::vector<std::string>& hashes)
+{
+    const auto name = op.at("op").get<std::string>();
+    auto add = [&](const Json& ref) { hashes.push_back(ref.at("sha256").get<std::string>()); };
+    if (name == "put_geometry")
+        for (const auto& array : op.at("data").at("arrays")) add(array.at("bytes"));
+    else if (name == "edit_geometry")
+        for (const auto& edit : op.at("edits")) add(edit.at("bytes"));
+    else if (name == "edit_geometry_rectangle")
+        add(op.at("bytes"));
+}
+
+std::vector<std::string> payloadHashesIn(const Json& request)
+{
+    std::vector<std::string> hashes;
+    for (const auto& op : request.at("operations")) collectPayloads(op, hashes);
+    std::sort(hashes.begin(), hashes.end());
+    hashes.erase(std::unique(hashes.begin(), hashes.end()), hashes.end());
+    return hashes;
+}
+} // namespace
+
+std::vector<std::string> transactionJsonPayloadHashes(const std::string& text) { return payloadHashesIn(Json::parse(text)); }
+
+TransactionReceipt ObjectStore::submit(const std::string& text, const PayloadLookup& lookup)
+{
+    auto j = Json::parse(text);
+    TransactionPayloads payloads;
+    std::vector<std::string> missing;
+    for (const auto& hash : payloadHashesIn(j)) {
+        if (auto bytes = lookup ? lookup(hash) : std::nullopt) payloads.emplace(hash, std::move(*bytes));
+        else missing.push_back(hash);
+    }
+    if (missing.empty()) return submit(transactionRequestFromJson(text, payloads));
+    // Without the bytes only the saved receipt of this exact request can
+    // answer. The digest of canonical JSON text equals the digest of its
+    // decoded request; a non-canonical text just has to re-stage.
+    const auto requestUuid = canonical(j.at("request").get<std::string>());
+    j.erase("request");
+    const auto canonicalText = j.dump();
+    const auto textDigest = sha256(reinterpret_cast<const uint8_t*>(canonicalText.data()), canonicalText.size());
+    auto txn = read();
+    std::string savedDigest;
+    if (auto saved = savedReceipt(static_cast<sqlite3*>(connection(txn)), requestUuid, &savedDigest);
+        saved && savedDigest == textDigest) {
+        saved->replayed = true;
+        return *saved;
+    }
+    throw MissingPayloads(std::move(missing));
 }
 
 } // namespace vc::objects

@@ -32,6 +32,7 @@ add_library(vc_objects ${_vc_store_library_type}
     internal/Ownership.cpp
     Versions.cpp
     Commands.cpp
+    Wire.cpp
     internal/Sqlite.cpp
     internal/RecordSql.cpp
     internal/EdgeSql.cpp

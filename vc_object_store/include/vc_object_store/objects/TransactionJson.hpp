@@ -14,6 +14,7 @@
 #include <string>
 #include <vector>
 
+#include "vc_object_store/objects/ObjectStore.hpp"
 #include "vc_object_store/objects/Transactions.hpp"
 
 namespace vc::objects {
@@ -38,5 +39,17 @@ std::string transactionReceiptToJson(const TransactionReceipt&);
 TransactionReceipt transactionReceiptFromJson(const std::string&);
 std::string storeStatusToJson(const StoreStatus&);
 std::string changePageToJson(const ChangePage&);
+
+// Wire forms shared by the hosted service and its clients.
+std::vector<std::string> transactionJsonPayloadHashes(const std::string& requestJson);
+std::string transactionConflictToJson(const TransactionConflict&);
+TransactionConflict transactionConflictFromJson(const std::string&);
+StoreStatus storeStatusFromJson(const std::string&);
+ChangePage changePageFromJson(const std::string&);
+std::string feedCursorQuery(const FeedCursor&); // URL query parameters
+std::string objectRevisionToJson(const ObjectRevision&);
+ObjectRevision objectRevisionFromJson(const std::string&);
+std::string geometryRevisionToJson(const GeometryRevision&);
+GeometryRevision geometryRevisionFromJson(const std::string&);
 
 } // namespace vc::objects
