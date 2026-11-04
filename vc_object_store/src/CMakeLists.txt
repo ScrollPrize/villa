@@ -31,6 +31,7 @@ add_library(vc_objects ${_vc_store_library_type}
     internal/Anchors.cpp
     internal/Ownership.cpp
     Versions.cpp
+    Artifacts.cpp
     Commands.cpp
     Wire.cpp
     client/HostedStore.cpp

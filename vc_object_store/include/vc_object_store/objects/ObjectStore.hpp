@@ -702,6 +702,17 @@ public:
     // automatic passive checkpoints still run on commit). Passive never
     // waits; Truncate waits up to `wait` for readers, then empties the WAL
     // file only if every frame was copied. Same restriction as checkpoint().
+    // Artifact bytes (objects/Artifacts.hpp). putArtifact copies `file` (or
+    // moves it, when `move` and it is on the same filesystem) into the
+    // store's content-addressed directory and syncs it to disk before
+    // returning its SHA-256, so a transaction may then reference it. Content
+    // already held is kept. Writable handles only (under service ownership,
+    // the service). Reads work on any handle; ranges past the end throw.
+    std::string putArtifact(const std::filesystem::path& file, bool move = false);
+    std::optional<uint64_t> artifactLength(const std::string& sha256) const;
+    std::vector<uint8_t> readArtifact(const std::string& sha256, uint64_t offset = 0,
+                                      const std::optional<uint64_t>& count = std::nullopt) const;
+
     enum class WalCheckpointMode { Passive, Truncate };
     struct WalCheckpoint {
         int64_t logFrames = 0;           // frames in the WAL after the call

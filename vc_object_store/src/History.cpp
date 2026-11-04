@@ -1,4 +1,6 @@
 #include "internal/History.hpp"
+#include "internal/Artifacts.hpp"
+#include "vc_object_store/objects/Artifacts.hpp"
 #include "internal/Versions.hpp"
 #include "internal/RecordJson.hpp"
 #include "internal/RecordSql.hpp"
@@ -279,6 +281,24 @@ void detail::publishHistory(sqlite3* db, bool importedBindings)
             }
         }
         objects.emplace(object, std::move(p));
+    }
+    // A changed artifact manifest may only name bytes the store holds, whichever
+    // API wrote it (hub imports bring manifests whose bytes live elsewhere).
+    if (!importedBindings) {
+        std::optional<std::filesystem::path> storePath;
+        for (const auto& [object, p] : objects) {
+            if (!p.exists || !p.changed) continue;
+            const auto& meta = p.record.at("meta");
+            if (!meta.is_object() || !meta.contains(kArtifactsMetaKey)) continue;
+            const auto& manifest = meta.at(kArtifactsMetaKey);
+            if (p.parent) {
+                const auto before = metadata(db, *p.parent).at("meta");
+                if (before.is_object() && before.contains(kArtifactsMetaKey) && before.at(kArtifactsMetaKey) == manifest)
+                    continue;
+            }
+            if (!storePath) storePath = std::filesystem::path(sqlite3_db_filename(db, "main"));
+            checkArtifactReferences(*storePath, object, manifest);
+        }
     }
     // Ordinary metadata is independent unless the relationship declares a
     // dependency. Check the final state, not the order of earlier API calls.
