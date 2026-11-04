@@ -112,8 +112,30 @@ command-line only. See [hosted hub and replicas](docs/README.md#hosted-hub-and-r
 
 See the [API guide](docs/README.md) for checked revisions, geometry reads and
 edits, graph snapshots, spatial queries, and hosted hubs. Detector distances
-and scale options use working voxels. CT normals use uint8 Zarr data with complete
-109³ support. Native CT opening supports local and anonymous HTTP/S3 arrays and
+and scale options use working voxels.
+
+Fiber- and track-surface linking widens each centerline into a strip that follows
+the sheet normal. The normal source is one of:
+
+- CT (`--ct`, `ct_volume`): structure-tensor normals from uint8 Zarr data with
+  complete 109³ support.
+- Lasagna normals (`--normal-x/--normal-y`, `normal_x_volume`/`normal_y_volume`):
+  paired uint8 nx/ny stores, read at `<store>/<ct_level>` and decoded as the
+  spiral fitter does: `(v - 128) / 127`, `nz = sqrt(1 - nx² - ny²)`, with
+  `nx = ny = 0` meaning no data. Nearest-voxel lookup; `ct_to_base_scale` is the
+  store's downsampling (the spiral's `lasagna_scale`).
+- Packed lasagna normals (`normal_pool`): the same normals from a resident-pool
+  pack (spiral-fitting's `pack_resident_pools.py`: `meta.json`, `table.npy`,
+  `channel_0.u8`/`channel_1.u8`), sampled and decoded identically, bricks read
+  on demand; a brick the pack dropped reads as no data. `ct_level` does not
+  apply. The fiber strip cache keys it by the pack's recorded dataset identity
+  and CT mask rather than its path.
+- Neither: no strip is built. Anchors compare the centerline points themselves
+  with each surface, by distance only (same sheet within `same_sheet`, adjacent
+  within `adjacent_low..adjacent_high`), under the same strip gate ratio/margin.
+
+Edges record the choice in `meta.normal_method` (`ct-…`, `lasagna-…` or
+`centerline`) and `meta.normal_source`. Native CT opening supports local and anonymous HTTP/S3 arrays and
 pyramid levels; credentials and disk-cache configuration are not exposed by this
 adapter. Codec support follows vc_reader.
 
@@ -158,6 +180,132 @@ remain unbuffered. The hub lock still protects one consistent SQLite snapshot.
 Incoming geometry is staged before taking the replica's write lock.
 See [read-ahead measurements and validation](docs/sftp-read-ahead.md) for the
 tradeoff between latency and extra bytes, and the optional real-fiber pull benchmark.
+
+### Detector outcomes
+
+Detector reports (`DetectorReport`; a dict in Python) separate failures from
+ordinary results. `issues` lists each outcome as `{severity, stage,
+object_uuids, reason, count}` in Python, and `problems` provides their messages:
+
+- `failure`: a selected object could not be loaded or validated (`load`),
+  linking an object raised an error (`discover`), the run was cancelled
+  (`cancel`), or a whole-run error was caught (`run`). A failed object is left
+  out of the run and of stale-edge removal, so its existing edges are unchanged;
+  independent objects still commit after successful frame preflight.
+- `diagnostic`: an ordinary result, such as rejected overlap pairs (`count`
+  pairs per `reason`), an object too degenerate to link, or an unavailable strip
+  cache. Diagnostics alone do not fail a run.
+
+`failed` is true when any issue is a failure, and `committed` says whether the
+reported edge counts were committed. Invalid object frames are collected as
+`validate` failures across all selected input kinds; any such failure skips
+discovery and writes for that detector. Invalid caller parameters still raise.
+The native report stores readable messages on issues; Python derives the
+compatibility `problems` list from those messages.
+`vc_object_links` exits nonzero only for failures, printing them with `!` (to
+stderr) and diagnostics with `-`. Each detector commits on its own; a failure in
+one does not roll back another, and a rerun reconciles pending edges.
+
+### Coordinate-aware detectors
+
+The Python and C++ PCL-surface, surface-overlap, fiber-surface and stored-track-surface
+APIs accept an optional `volume_uuid` (`CoordinateParams::volumeUuid` in C++).
+With this option, every selected object's `meta.coordinates` must declare that
+volume and a finite positive `scale_factor`, where **stored XYZ = volume XYZ ×
+scale_factor**. Detectors resolve scales individually within one discovery pass;
+all tolerances, strip distances and overlap UV poses then use
+reference-volume voxels (surface areas use squared voxels). The selection and stale-edge scope are unchanged.
+
+```python
+report = store.link_point_collections_to_surfaces(
+    volume_uuid="20260411134726", collection_uuids=collections, surface_uuids=surfaces)
+report = store.link_surface_overlaps(volume_uuid="20260411134726", surface_uuids=surfaces)
+report = store.link_fibers_to_surfaces(
+    "/data/ct.zarr", volume_uuid="20260411134726",
+    fiber_uuids=fibers, surface_uuids=surfaces, ct_level=1, ct_to_base_scale=2)
+```
+
+In this mode, leave `point_scale`, `surface_scale`, `fiber_scale`, `track_scale`
+and `working_to_base_scale` at their identity defaults (1). Nonidentity values
+are rejected rather than overriding metadata or applying scaling twice.
+`ct_to_base_scale` is the selected CT level's downsampling relative to the declared
+volume; `ct_level` selects data and does not add another scaling factor. The caller
+is responsible for binding the CT path to that volume. Without `volume_uuid`,
+existing explicit-scale behavior is preserved; unknown metadata remains allowed.
+
+Frames are declared on the objects, never per detector run. Source files that do
+not declare one (for example the Spiral dataset's tifxyz patches, fibers and PCL
+JSONs) get it at ingest: `vc_object_ingest --volume-uuid V --scale-factor s`, or
+`coordinate_context={"volume_uuid": V, "scale_factor": s}` on
+`ingest_geometry_source` / `ingest_registered_geometry`. The context fills in
+missing fields for every object in that run; a conflicting source declaration is
+an ingest error. Objects already in a store are declared with
+`set_meta(uuid, "coordinates", {...})`, as VC3D's Bind Fiber Coordinates does.
+Generated edges record each endpoint's resolved frame in `meta.coordinate_frame`.
+Explicit-scale reruns set this field to null, clearing any previous metadata-mode
+declaration. Frame validation runs before geometry processing or relationship
+writes. Existing geometry/load failure reporting remains unchanged.
+
+Stored arrays and source anchors remain unchanged. Grid indices do not scale;
+working surface grid steps per voxel are divided by the XYZ conversion multiplier.
+Invalid surface vertices retain their sentinels. Overlap edges record
+`meta.fit.pose` (row-major `[r00, r01, tx, r10, r11, ty]`), mapping metric UV of
+surface `pose_from` to `pose_to`, with `pose_units = "volume_voxels"` and per-surface
+`grid_scales` (`{uuid: [u, v]}`, grid steps per voxel), and the
+`agreement_radius` (`tolerance + uv_inlier_tolerance`, volume voxels) its dense
+agreement check used. Direction and scales are keyed by UUID because stored
+edges order their endpoints independently of the detector.
+
+### Overlap correspondences
+
+`materializeOverlapCorrespondences` (Python `overlap_correspondences`) turns
+accepted overlap edges into concrete point pairs, applying each edge's stored
+pose to the current endpoint geometry rather than repeating the detector's
+matching:
+
+```python
+for result in store.overlap_correspondences(edge_uuids, volume_uuid,
+                                            spacing=8, max_pairs=256):
+    if result["error"]:
+        ...  # report; never drop silently
+    for pair in result["pairs"]:
+        pair["a_grid"], pair["b_grid"]  # (row, column) in each stored grid
+        pair["a_xyz"], pair["b_xyz"]    # volume voxels; "distance" between them
+```
+
+Surface a's valid vertices are sampled every `spacing` voxels in row-major order
+and mapped to surface b's metric UV; a pair is kept when b's containing quad is
+valid and the points lie within the edge's recorded `agreement_radius`, the same
+bound detection accepted it with; callers wanting a tighter bound filter on
+`distance`. Agreeing pairs above `max_pairs` are thinned
+evenly in sample order, so results are deterministic. Pairs follow the stored
+edge's a/b order. Each edge reports an `error` instead of pairs when it has no
+volume-frame pose (including edges detected before the direction, scales and
+radius were recorded), its geometry is stale, an endpoint's grid scale has changed
+since detection, or no pair agrees. Approval filtering is the caller's choice.
+
+Python exposes the existing native `geometry_coordinates`,
+`merge_geometry_coordinates` and `geometry_scale_to_volume` helpers, plus strict
+`resolve_geometry_coordinates` and `geometry_scale_to_frame`. The volume helper
+returns `None` for unknown or mismatched frames. The strict helpers raise instead.
+To convert stored coordinates to volume voxels:
+
+```python
+from vc_object_store import geometry_scale_to_frame
+multiplier = geometry_scale_to_frame(metadata, V)
+volume_xyz = stored_xyz * multiplier  # stored_xyz / scale_factor
+```
+
+Consumers must preserve invalid vertex sentinels when applying the multiplier to arrays.
+
+Run regression tests against an existing build configured with
+`-DVC_OBJECT_STORE_BUILD_PYTHON=ON`:
+
+```sh
+cmake --build <build> -j 6
+ctest --test-dir <build> --output-on-failure
+VC_OBJECT_STORE_BUILD_PYTHON_PATH=<build>/python python -m pytest -q vc_object_store/tests/python
+```
 
 ## Transformed geometry views
 

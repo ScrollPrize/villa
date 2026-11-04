@@ -1,0 +1,2898 @@
+"""Fit inputs read from a vc_object_store database.
+
+Patches, fibers, point collections (PCLs) and tracks, and the relationships
+between them, come from one object store. This module turns a selection of them into
+the fitter's runtime inputs in three stages:
+
+1. Snapshot extraction (read_snapshot): resolve object selectors to explicit
+   UUID sets, read every selected object, its geometry revision and the
+   relationships between selected objects in one read view, and filter the
+   relationships by applicability, approval and semantics.
+2. Frame conversion (ObjectFrame): every selected object declares its frame in
+   ``meta.coordinates``; geometry and anchors convert once from stored XYZ to
+   ZYX voxels of one reference volume, the only units the fitter uses.
+3. Runtime materialization: patches, PCL and fiber constraints and the track
+   collection with its crossings, built from the frozen snapshot
+   (materialize_* below).
+
+The store's automatic detectors are authoritative: their relationships are
+consumed as they are, never relinked by proximity here.
+
+    python object_store_inputs.py STORE.vcobj [--volume V] \
+        [--z-begin Z0 --z-end Z1 [--config FIT.json]]
+
+prints the selection's report without training. Given a z window it also
+materializes and derives the training views exactly as a fit with that
+configuration would, failing on the same validation errors.
+"""
+import argparse
+import contextlib
+import dataclasses
+import hashlib
+import json
+import os
+import sys
+import time
+from collections import Counter
+
+import numpy as np
+
+KINDS = ('surface', 'point_collection', 'fiber', 'track')
+# The tag of the scroll's outer shell: a surface the fit reads on its own
+# (InputSnapshot.outer_shell, FitInputs.outer_shell), never as a patch.
+OUTER_SHELL_TAG = 'spiral-outer-shell'
+KIND_LABELS = {'surface': 'surfaces', 'point_collection': 'point collections',
+               'fiber': 'fibers', 'track': 'tracks'}
+
+# Relationship families the fitter consumes, keyed by (edge kind, endpoint
+# kinds in KINDS order). Surface overlaps and fiber-surface contacts share the
+# detectors' 'same-surface' edge kind and differ by endpoint kinds. Family
+# names are Spiral's roles and keep the fitter's "patch" vocabulary. Track
+# crossings feed the track graph; track-surface edges ('same-surface' between
+# a surface and a track) constrain nothing in the fit and are excluded.
+FAMILIES = {
+    ('point-surface', ('surface', 'point_collection')): 'pcl_patch',
+    ('same-surface', ('surface', 'fiber')): 'fiber_patch',
+    ('same-surface', ('surface', 'surface')): 'patch_overlap',
+    ('fiber_branch', ('fiber', 'fiber')): 'fiber_branch',
+    ('crossing', ('track', 'track')): 'track_crossing',
+}
+
+# The coordinates the fitter works in, recorded with every provenance.
+FIT_UNITS = 'reference-volume voxels (ZYX)'
+
+# Manifest fields that name one replica's local records. Object revision and
+# relationship version UUIDs are per replica (a pull installs the hub's
+# records under new local revisions), so they resolve inputs locally but are
+# left out of the digest. Geometry revisions, record UUIDs, generations and
+# approval states are shared by every replica of a store.
+REPLICA_LOCAL_FIELDS = {'objects': ('object_revision',),
+                        'relationships': ('revision',)}
+
+
+class ObjectStoreInputError(ValueError):
+    """A selection, frame or relationship the fitter cannot consume."""
+
+    def __init__(self, problems):
+        self.problems = list(problems)
+        super().__init__('\n'.join(self.problems))
+
+
+@dataclasses.dataclass(frozen=True)
+class Selector:
+    """Selects objects of one kind.
+
+    ``uuids`` and ``tags`` both None selects every active object of the kind
+    with a geometry revision (the default selection). Otherwise the selection
+    is the union of the listed UUIDs, which must exist, be active and have
+    geometry, and the active objects carrying any listed tag. An explicit
+    selector that matches nothing selects nothing.
+    """
+    uuids: tuple = None
+    tags: tuple = None
+
+    @property
+    def is_default(self):
+        return self.uuids is None and self.tags is None
+
+    def provenance(self):
+        """The selector as JSON holds it (lists, not tuples), so a recorded
+        manifest compares equal to the live one."""
+        return {key: None if value is None else list(value)
+                for key, value in dataclasses.asdict(self).items()}
+
+    def describe(self):
+        if self.is_default:
+            return 'all active'
+        parts = []
+        if self.uuids is not None:
+            parts.append(f'{len(self.uuids)} UUID(s)')
+        if self.tags is not None:
+            parts.append(f'tags {list(self.tags)}')
+        return ' + '.join(parts)
+
+
+@dataclasses.dataclass(frozen=True)
+class InputPosition:
+    """An immutable store state: the identity positions belong to and a
+    journal sequence of it. For a hosted store that is its hub (the
+    ``hub_replica`` of every replica's hub_status): every replica reads the
+    same inputs at one position. A plain store that records positions
+    (store_positions(), shared by the processes of one machine) owns its
+    own."""
+    hub: str
+    sequence: int
+
+    def provenance(self):
+        return {'hub': self.hub, 'sequence': self.sequence}
+
+    @classmethod
+    def from_provenance(cls, value):
+        return None if value is None else cls(str(value['hub']), int(value['sequence']))
+
+
+@dataclasses.dataclass(frozen=True)
+class InputRequest:
+    """What to read: per-kind selectors, the fit volume and the approval policy.
+
+    ``fit_volume_uuid`` None infers the volume from the selected objects'
+    declarations. ``approved_links_only`` consumes only approved
+    relationships; otherwise pending and approved ones are consumed. Rejected
+    relationships are never consumed. ``position`` None reads the store as
+    it is now; an InputPosition reads that hub state through the hub's
+    history (selector membership included), whatever the replica holds now.
+    """
+    selectors: dict = dataclasses.field(default_factory=dict)
+    fit_volume_uuid: str = None
+    approved_links_only: bool = False
+    position: InputPosition = None
+    # Whether the fit reads the outer shell: 'off' (input_use_outer_shell
+    # false), 'optional' (it filters tracks when present) or 'required' (shell
+    # losses, winding-model supervision; a store without one is refused).
+    outer_shell: str = 'optional'
+    # The pyramid level of the fit volume the fit works in (fit_volume_level):
+    # a fit voxel is 2^level of the volume's voxels.
+    fit_volume_level: int = 0
+
+    @property
+    def fit_scale(self):
+        """Volume voxels per fit voxel."""
+        return 1 << int(self.fit_volume_level)
+
+    def __post_init__(self):
+        # An unknown key would otherwise leave its kind unselected-by-default:
+        # every active object.
+        unknown = sorted(set(self.selectors) - set(KINDS))
+        if unknown:
+            raise ValueError(f'unknown object kinds {unknown}; expected {list(KINDS)}')
+
+    def selector(self, kind):
+        return self.selectors.get(kind) or Selector()
+
+
+@dataclasses.dataclass(frozen=True)
+class ObjectFrame:
+    """One object's frame: stored XYZ = reference-volume XYZ x scale_factor,
+    and fit XYZ = stored XYZ x to_fit (the fit voxels are those of a pyramid
+    level of the reference volume)."""
+    volume_uuid: str
+    scale_factor: float
+    # stored -> fit multiplier from the store's shared coordinate helper.
+    to_fit: float
+
+    def xyz_to_fit_zyx(self, xyz, invalid=None):
+        """Stored XYZ (..., 3) -> float32 fit ZYX. Rows where ``invalid`` is
+        True keep the -1 sentinel rather than becoming scaled coordinates."""
+        xyz = np.asarray(xyz, dtype=np.float64)
+        zyx = (xyz[..., ::-1] * self.to_fit).astype(np.float32)
+        if invalid is not None:
+            zyx[np.asarray(invalid, dtype=bool)] = -1.0
+        return zyx
+
+    def grid_scale_to_fit(self, scale):
+        """Patch grid steps per stored unit -> grid steps per fit voxel."""
+        return [float(value) / self.to_fit for value in scale]
+
+
+def content_sha256(value):
+    """SHA-256 of a JSON value in canonical form."""
+    text = json.dumps(value, sort_keys=True, separators=(',', ':'))
+    return hashlib.sha256(text.encode()).hexdigest()
+
+
+def adapter_metadata(kind, meta, fiber=None, track=None):
+    """The metadata the adapter reads from one object of ``kind``.
+
+    With the geometry revision (points, arrays and point annotations) it is
+    everything materialization reads, so its hash identifies the object's
+    input content on any replica. Other metadata (review notes, ingest
+    diagnostics) does not reach the fit and does not change the digest.
+    """
+    meta = meta or {}
+    source = meta.get('source') or {}
+    read = {'coordinates': meta.get('coordinates')}
+    if kind == 'surface':
+        read['spiral_patch_erode_cells'] = source.get('spiral_patch_erode_cells')
+    elif kind == 'point_collection':
+        read['winding_is_absolute'] = source.get('winding_is_absolute')
+        read['sampling_group'] = meta.get('sampling_group')
+    elif kind == 'fiber':
+        read['hv_classification'] = source.get('hv_classification')
+        read['family'] = (fiber or {}).get('family')
+        read['manual_family'] = (fiber or {}).get('manual_family')
+    elif kind == 'track':
+        # The family gates crossings; the dataset and key order the tracks.
+        for key in ('family', 'dataset_ref', 'external_key'):
+            read[key] = (track or {}).get(key)
+    return read
+
+
+@dataclasses.dataclass
+class StoredObject:
+    uuid: str
+    kind: str
+    name: str
+    meta: dict
+    tags: list
+    object_revision: str
+    geometry_revision: str
+    frame: ObjectFrame = None
+    fiber: dict = None
+    track: dict = None
+
+    @property
+    def metadata_sha256(self):
+        return content_sha256(adapter_metadata(self.kind, self.meta, self.fiber, self.track))
+
+    def provenance(self):
+        """``metadata`` is what the adapter read, so a client compares it
+        with an object's current metadata as values; ``metadata_sha256`` is
+        its identity in the digest."""
+        return {'uuid': self.uuid, 'kind': self.kind, 'name': self.name,
+                'object_revision': self.object_revision,
+                'geometry_revision': self.geometry_revision,
+                'metadata': adapter_metadata(self.kind, self.meta, self.fiber, self.track),
+                'metadata_sha256': self.metadata_sha256,
+                'scale_factor': self.frame.scale_factor}
+
+
+@dataclasses.dataclass
+class StoredRelationship:
+    """A consumed relationship with endpoints ordered by kind (KINDS order;
+    UUID order between objects of one kind), not by stored order."""
+    uuid: str
+    revision: str
+    kind: str
+    family: str
+    approval_state: str
+    generation: int
+    a: str
+    b: str
+    a_anchor: dict
+    b_anchor: dict
+    meta: dict
+    a_geometry_revision: str = None
+    b_geometry_revision: str = None
+    stored_order: tuple = None  # (a, b) as the record stores them
+
+    def provenance(self):
+        """Identity by content: the shared record, its endpoints' geometry
+        and a hash of the anchors and metadata materialization reads.
+        ``revision`` (the local edge version) only resolves it locally."""
+        return {'uuid': self.uuid, 'revision': self.revision,
+                'kind': self.kind, 'family': self.family,
+                'approval_state': self.approval_state,
+                'generation': self.generation,
+                'a': self.a, 'a_geometry_revision': self.a_geometry_revision,
+                'b': self.b, 'b_geometry_revision': self.b_geometry_revision,
+                'content_sha256': content_sha256(
+                    {'a_anchor': self.a_anchor, 'b_anchor': self.b_anchor,
+                     'meta': self.meta})}
+
+
+@dataclasses.dataclass
+class InputSnapshot:
+    """The frozen selection: objects, their frames and consumed relationships."""
+    store_path: str
+    store_uuid: str
+    volume_uuid: str
+    volume_source: str
+    request: InputRequest
+    objects: dict
+    relationships: list
+    exclusions: Counter
+    notes: list
+    # The outer shell (StoredObject), read with the selection but not part
+    # of it; None when the store has none.
+    outer_shell: StoredObject = None
+
+    @property
+    def position(self):
+        return self.request.position
+
+    def objects_of(self, kind):
+        return [obj for obj in self.objects.values() if obj.kind == kind]
+
+    def relationships_of(self, family):
+        return [rel for rel in self.relationships if rel.family == family]
+
+    def manifest(self):
+        """Complete input/frame provenance, in stable order."""
+        return {
+            'store': {'path': self.store_path, 'uuid': self.store_uuid},
+            'position': self.position.provenance() if self.position else None,
+            'volume_uuid': self.volume_uuid,
+            'volume_source': self.volume_source,
+            'units': FIT_UNITS,
+            'approved_links_only': self.request.approved_links_only,
+            'selection': {
+                kind: {'selector': self.request.selector(kind).provenance(),
+                       'count': len(self.objects_of(kind))}
+                for kind in KINDS},
+            'objects': [obj.provenance() for obj in self.objects.values()],
+            'outer_shell': self.outer_shell.provenance() if self.outer_shell else None,
+            'relationships': [rel.provenance() for rel in self.relationships],
+            'excluded_relationships': dict(sorted(self.exclusions.items())),
+        }
+
+    def digest(self):
+        """SHA-256 of the manifest without its replica-local fields."""
+        return manifest_digest(self.manifest())
+
+
+def attached_data(record):
+    """Whether an object is data attached to another (``meta.role``, e.g. fit
+    results) rather than a fit input. The store's PCL-surface detector refuses
+    such collections, so they are never selected as inputs."""
+    return record['kind'] == 'point_collection' and 'role' in (record.get('meta') or {})
+
+
+def outer_shell(record):
+    """Whether an object is the scroll's outer shell (OUTER_SHELL_TAG): read
+    on its own, never as a patch."""
+    return record['kind'] == 'surface' and OUTER_SHELL_TAG in (record.get('tags') or ())
+
+
+def resolve_selector(store, kind, selector, records=None):
+    """Explicit sorted UUIDs selected by ``selector`` among active objects.
+
+    Default and tag selections leave out attached data and the outer shell;
+    naming either by UUID is an error. ``records`` ({UUID: record} of every
+    object at a position, retired ones included) replaces the store's current
+    objects."""
+    def matching(tag=None):
+        if records is not None:
+            return [uuid for uuid, record in records.items()
+                    if record['kind'] == kind and not record.get('retired')
+                    and (tag is None or tag in (record.get('tags') or ()))
+                    and not attached_data(record) and not outer_shell(record)]
+        query = {} if tag is None else {'tag': tag}
+        return [record['uuid'] for record in store.select_objects(
+            object_kind=kind, fields=['uuid', 'kind', 'meta', 'tags'], **query)
+            if not attached_data(record) and not outer_shell(record)]
+
+    if selector.is_default:
+        return sorted(matching())
+    selected = set()
+    problems = []
+    for uuid in selector.uuids or ():
+        record = store.object(uuid) if records is None else records.get(uuid)
+        if record is None:
+            problems.append(f'selected {kind} {uuid} does not exist'
+                            + ('' if records is None else ' at this position'))
+        elif record['kind'] != kind:
+            problems.append(f'selected {kind} {uuid} is a {record["kind"]}')
+        elif record.get('retired'):
+            problems.append(f'selected {kind} {uuid} is retired')
+        elif attached_data(record):
+            problems.append(f'selected {kind} {uuid} is attached data with role '
+                            f'{record["meta"]["role"]!r}, not a fit input')
+        elif outer_shell(record):
+            problems.append(f'selected {kind} {uuid} is the outer shell (tagged '
+                            f'{OUTER_SHELL_TAG}), not a patch')
+        else:
+            selected.add(record['uuid'])
+    if problems:
+        raise ObjectStoreInputError(problems)
+    for tag in selector.tags or ():
+        selected.update(matching(tag=tag))
+    return sorted(selected)
+
+
+def declared_coordinates(meta):
+    """The normalized ``meta.coordinates`` declaration of an object."""
+    from vc_object_store import geometry_coordinates
+    return geometry_coordinates(meta.get('coordinates') or {})
+
+
+def infer_fit_volume(records, configured=None):
+    """Return ``(volume_uuid, 'inferred' | 'configured')``.
+
+    Selected objects declaring different volumes are an error, even when one
+    of them matches a configured volume: a configuration cannot override a
+    conflict or silently drop objects. Without any declaration (including an
+    empty selection) the volume must be configured.
+    """
+    declared = {}
+    for record in records:
+        volume = declared_coordinates(record['meta'])['volume_uuid']
+        if volume is not None:
+            declared.setdefault(volume, []).append(record['uuid'])
+    if len(declared) > 1:
+        raise ObjectStoreInputError([
+            'selected objects declare different volumes: ' + '; '.join(
+                f'{volume} ({len(uuids)} object(s), e.g. {uuids[0]})'
+                for volume, uuids in sorted(declared.items()))])
+    if configured is not None:
+        if declared and configured not in declared:
+            raise ObjectStoreInputError([
+                f'fit volume {configured} does not match the volume '
+                f'{next(iter(declared))} the selected objects declare'])
+        return configured, 'configured'
+    if not declared:
+        raise ObjectStoreInputError([
+            'no selected object declares a volume; configure fit_volume_uuid'])
+    return next(iter(declared)), 'inferred'
+
+
+def object_frame(meta, volume_uuid, fit_scale=1):
+    """The object's ObjectFrame in ``volume_uuid``, whose fit voxels are
+    ``fit_scale`` of its voxels; raises ValueError when its frame is unknown,
+    invalid or in another volume."""
+    from vc_object_store import geometry_scale_to_frame, resolve_geometry_coordinates
+    coordinates = resolve_geometry_coordinates(meta, volume_uuid)
+    return ObjectFrame(volume_uuid, float(coordinates['scale_factor']),
+                       float(geometry_scale_to_frame(meta, volume_uuid)) / fit_scale)
+
+
+def _relationship_family(record, kinds):
+    endpoint_kinds = tuple(sorted((kinds[record['a']], kinds[record['b']]),
+                                  key=KINDS.index))
+    return FAMILIES.get((record['kind'], endpoint_kinds))
+
+
+def adjacent_winding_offset(fiber_a, fiber_b):
+    """W_b - W_a an adjacent-winding branch between two fiber objects
+    asserts: the vertical fiber lies one winding inside the horizontal one.
+    None unless one is H and the other V by stored family (the effective
+    manual-else-automatic tag VC3D signed the branch with; VC3D's
+    adjacentWindingOffset)."""
+    families = tuple((fiber.fiber or {}).get('family') for fiber in (fiber_a, fiber_b))
+    return {('H', 'V'): -1, ('V', 'H'): 1}.get(families)
+
+
+def _ordered_endpoints(entry, kinds):
+    """(a, a_anchor, a geometry pin, b, b_anchor, b geometry pin) of a view
+    relationship, ordered by kind, then UUID."""
+    record = entry['record']
+    ends = [(record[side], record[f'{side}_anchor'],
+             entry.get(f'{side}_geometry_revision')) for side in ('a', 'b')]
+    ends.sort(key=lambda end: (KINDS.index(kinds[end[0]]), end[0]))
+    return (*ends[0], *ends[1])
+
+
+def filter_relationships(view_relationships, objects, approved_links_only):
+    """Consumed relationships and exclusion counts.
+
+    A relationship is consumed when both endpoints are selected, it applies
+    to their selected revisions, it belongs to a family the fitter uses and
+    its approval state is allowed (never 'rejected'; only 'approved' in
+    approved-only mode). Adjacent-winding fiber branches are consumed like
+    ordinary ones; materialize_fibers signs them.
+    """
+    kinds = {uuid: obj.kind for uuid, obj in objects.items()}
+    consumed, exclusions = [], Counter()
+    for entry in view_relationships:
+        record = entry['record']
+        if record['a'] not in kinds or record['b'] not in kinds:
+            exclusions['endpoint outside selection'] += 1
+            continue
+        if not entry['applicable']:
+            exclusions['inapplicable'] += 1
+            continue
+        family = _relationship_family(record, kinds)
+        if family is None:
+            exclusions[f'unused kind {record["kind"]}'] += 1
+            continue
+        state = record['approval_state']
+        if state == 'rejected':
+            exclusions['rejected'] += 1
+            continue
+        if approved_links_only and state != 'approved':
+            exclusions[f'{state} (approved-only)'] += 1
+            continue
+        a, a_anchor, a_geometry, b, b_anchor, b_geometry = _ordered_endpoints(entry, kinds)
+        consumed.append(StoredRelationship(
+            uuid=record['uuid'], revision=entry['uuid'], kind=record['kind'],
+            family=family, approval_state=state,
+            generation=record['generation'], a=a, b=b, a_anchor=a_anchor,
+            b_anchor=b_anchor, meta=record['meta'] or {},
+            a_geometry_revision=a_geometry, b_geometry_revision=b_geometry,
+            stored_order=(record['a'], record['b'])))
+    consumed.sort(key=lambda rel: (rel.family, rel.a, rel.b, rel.uuid))
+    return consumed, exclusions
+
+
+def position_owner(store):
+    """The identity this store's positions belong to: its hub's for a
+    hosted replica, its own for a plain store that records positions, else
+    None."""
+    status = store.hub_status()
+    if status is not None:
+        return status['hub_replica']
+    positions = store.store_positions()
+    return None if positions is None else positions['store']
+
+
+def check_position(store, position):
+    """Refuse a position this store cannot read: it must be a replica of the
+    position's hub, or the plain store the position is of."""
+    owner = position_owner(store)
+    if owner is None:
+        raise ObjectStoreInputError([
+            f'object store {store.path} records no positions (neither a hosted '
+            'replica nor a store a service shares)'])
+    if owner != position.hub:
+        raise ObjectStoreInputError([
+            f'input position {position.sequence} belongs to {position.hub}; '
+            f'{store.path} reads the positions of {owner}'])
+
+
+def _at_head(store, position):
+    """Whether ``position`` is the head of the plain store whose positions
+    it names: nothing was written after it, so the store's current state is
+    the state at it."""
+    positions = store.store_positions()
+    return (positions is not None and positions['store'] == position.hub
+            and positions['position'] == position.sequence)
+
+
+def _read_at(store, position, current, historical):
+    """A read of the state at ``position``: ``current()`` (a read of the
+    store's current state) when the position is a plain store's head both
+    before and after it, so nothing was written in between; otherwise
+    ``historical()``, which rebuilds the state at the position from the
+    store's history (a hub's, for a hosted replica). The history read
+    scans every revision of every object, tracks included, so it costs
+    minutes on a large store; a service reads its inputs at the head it
+    just pinned, which the current state answers in a selection's time."""
+    check_position(store, position)
+    if _at_head(store, position):
+        result = current()
+        if _at_head(store, position):
+            return result
+    return historical()
+
+
+def _position_records(store, position):
+    """{UUID: record} of every object at a position, retired ones included."""
+    view = store.hub_read_view_at(position.sequence, include_retired=True,
+                                  relationships=False, geometry=False)
+    return {revision['object_uuid']: revision['record'] for revision in view['objects']}
+
+
+def resolve_selection(store, request):
+    """{kind: sorted selected UUIDs} of a request's selectors, at the
+    request's position when it names one."""
+    def resolve(records=None):
+        return {kind: resolve_selector(store, kind, request.selector(kind), records)
+                for kind in KINDS}
+    if request.position is None:
+        return resolve()
+    return _read_at(store, request.position, resolve,
+                    lambda: resolve(_position_records(store, request.position)))
+
+
+def resolve_outer_shell(store, request):
+    """The active surface tagged OUTER_SHELL_TAG at the request's position
+    (or now), or None; several are an error."""
+    def current():
+        return [record['uuid'] for record in store.select_objects(
+            object_kind='surface', tag=OUTER_SHELL_TAG, fields=['uuid'])]
+
+    def historical():
+        return [uuid for uuid, record in _position_records(store, request.position).items()
+                if outer_shell(record) and not record.get('retired')]
+    if request.position is None:
+        shells = current()
+    else:
+        shells = _read_at(store, request.position, current, historical)
+    if len(shells) > 1:
+        raise ObjectStoreInputError([
+            f'{len(shells)} surfaces are tagged {OUTER_SHELL_TAG} ({", ".join(sorted(shells))}); '
+            'the outer shell must be one'])
+    return shells[0] if shells else None
+
+
+def read_snapshot(store, request, uuids=None):
+    """Resolve, validate and freeze one selection of the store.
+
+    Selectors resolve to explicit UUID sets before any volume filter, so
+    conflicting frame declarations among selected objects are seen and fail.
+    ``uuids`` (resolve_selection's result) reuses a selection resolved
+    earlier, so one startup reads exactly the objects it refreshed.
+    Every selected object must declare a frame in the fit volume; all frame
+    problems are reported together. The outer shell (resolve_outer_shell) is
+    read alongside, in the same volume, but is not among ``objects``.
+    """
+    if uuids is None:
+        uuids = resolve_selection(store, request)
+    shell = None if request.outer_shell == 'off' else resolve_outer_shell(store, request)
+    if shell is None and request.outer_shell == 'required':
+        raise ObjectStoreInputError([
+            f'the fit needs the outer shell, and no surface is tagged {OUTER_SHELL_TAG}'])
+    selection = {uuid: None for kind in KINDS for uuid in uuids[kind]}
+    if shell is not None:
+        selection[shell] = None
+    if request.position is None:
+        view = store.revision_read_view(selection)
+    else:
+        view = _read_at(
+            store, request.position, lambda: store.revision_read_view(selection),
+            lambda: store.hub_read_view_at(request.position.sequence, list(selection)))
+        missing = sorted(set(selection) - set(view['selection']))
+        if missing:
+            raise ObjectStoreInputError([
+                f'selected object {uuid} is not active at input position '
+                f'{request.position.sequence}' for uuid in missing])
+
+    notes, problems = [], []
+    revisions = {revision['object_uuid']: revision for revision in view['objects']}
+    usable = []
+    for kind in KINDS:
+        without_geometry = []
+        for uuid in uuids[kind]:
+            revision = revisions[uuid]
+            if revision['geometry_revision'] is None:
+                without_geometry.append(uuid)
+            else:
+                usable.append(revision)
+        if not without_geometry:
+            continue
+        if request.selector(kind).is_default:
+            notes.append(f'skipped {len(without_geometry)} {KIND_LABELS[kind]} '
+                         'without geometry')
+        else:
+            problems.extend(f'selected {kind} {uuid} has no geometry'
+                            for uuid in without_geometry)
+    shell_revision = None if shell is None else revisions[shell]
+    if shell_revision is not None and shell_revision['geometry_revision'] is None:
+        problems.append(f'the outer shell {shell} has no geometry')
+    if problems:
+        raise ObjectStoreInputError(problems)
+
+    volume_uuid, volume_source = infer_fit_volume(
+        [revision['record'] for revision in usable]
+        + ([shell_revision['record']] if shell_revision is not None else []),
+        request.fit_volume_uuid)
+
+    def stored(revision):
+        record = revision['record']
+        try:
+            frame = object_frame(record['meta'], volume_uuid, request.fit_scale)
+        except ValueError as error:
+            problems.append(f'{record["kind"]} {record["uuid"]} '
+                            f'({record["name"]!r}): {error}')
+            return None
+        return StoredObject(
+            uuid=record['uuid'], kind=record['kind'], name=record['name'],
+            meta=record['meta'] or {}, tags=list(record.get('tags') or ()),
+            object_revision=revision['uuid'],
+            geometry_revision=revision['geometry_revision'], frame=frame,
+            fiber=record.get('fiber'), track=record.get('track'))
+
+    objects = {}
+    for revision in usable:
+        if (obj := stored(revision)) is not None:
+            objects[obj.uuid] = obj
+    shell_object = None if shell_revision is None else stored(shell_revision)
+    if problems:
+        raise ObjectStoreInputError(problems)
+
+    relationships, exclusions = filter_relationships(
+        view['relationships'], objects, request.approved_links_only)
+    return InputSnapshot(
+        store_path=store.path, store_uuid=store.uuid, volume_uuid=volume_uuid,
+        volume_source=volume_source, request=request, objects=objects,
+        relationships=relationships, exclusions=exclusions, notes=notes,
+        outer_shell=shell_object)
+
+
+# ---------------------------------------------------------------------------
+# Geometry reads (pinned by geometry revision, so independent of later heads)
+# ---------------------------------------------------------------------------
+
+def read_geometry(store, geometry_revision, names, optional=()):
+    """``({name: ndarray}, attributes)`` of an immutable geometry revision.
+    Arrays named in ``optional`` are returned only when stored."""
+    descriptor = store.geometry_revision(geometry_revision)
+    arrays = {array['name']: array for array in descriptor['arrays']}
+    result = {}
+    for name in [*names, *(name for name in optional if name in arrays)]:
+        if name not in arrays:
+            raise ObjectStoreInputError(
+                [f'geometry {geometry_revision} has no {name!r} array'])
+        array = arrays[name]
+        data = store.read_geometry_array(geometry_revision, name)
+        result[name] = np.frombuffer(data, dtype=np.dtype(array['dtype'])).reshape(
+            array['shape'])
+    return result, descriptor['attributes'] or {}
+
+
+def point_annotations(store, geometry_revision, point_ids):
+    """{point id: annotation dict} aligned to the stored point order."""
+    annotations = store.geometry_point_annotations(geometry_revision, 'points')
+    if annotations is None:
+        return {}
+    if len(annotations) != len(point_ids):
+        raise ObjectStoreInputError(
+            [f'geometry {geometry_revision} annotations do not match its points'])
+    return {int(point_id): annotation or {}
+            for point_id, annotation in zip(point_ids, annotations)}
+
+
+# ---------------------------------------------------------------------------
+# Runtime materialization
+# ---------------------------------------------------------------------------
+
+# Deterministic default sampling groups (the stems of the conventional PCL
+# documents, so existing pcl_sampling_weights keep applying). An object's
+# ``meta.sampling_group`` overrides them.
+ABSOLUTE_PCL_GROUP = 'abs_winding'
+RELATIVE_PCL_GROUP = 'relative_windings'
+SAME_WINDING_PCL_GROUP = 'same_windings'
+# Patch-overlap pairs default to their own group, so a dense overlap graph
+# cannot crowd out the PCL groups; an edge's ``meta.sampling_group`` overrides it.
+PATCH_OVERLAP_GROUP = 'patch_overlaps'
+
+
+@dataclasses.dataclass
+class FitInputs:
+    """Runtime inputs materialized from a frozen snapshot.
+
+    ``patches`` maps patch UUIDs to fit-frame tifxyz.Patch objects in UUID
+    order. ``point_collections`` maps resident collection ids to regular PCLs
+    whose attached points carry ``on_patch`` ({'id', 'ij', 'edge_uuid'}).
+    ``fibers`` maps fiber UUIDs to fiber collections (materialize_fibers) and
+    ``fiber_links`` holds their resolved branch links, each with the
+    ``winding_offset`` it asserts (0 same-winding, +-1 adjacent).
+    ``patch_overlaps`` maps resident ids to the two-point same-surface
+    collections of materialize_patch_overlaps. ``tracks`` holds the track
+    collection and its crossings (materialize_tracks), or None when no track
+    is selected.
+    ``dropped_attachments`` lists ``(edge UUID, reason)`` for consumed
+    attachments whose quad the patch losses do not sample (on_retained_quad).
+    """
+    snapshot: InputSnapshot
+    patches: dict
+    point_collections: dict
+    fibers: dict
+    fiber_links: list
+    counts: Counter
+    dropped_attachments: list = dataclasses.field(default_factory=list)
+    patch_overlaps: dict = dataclasses.field(default_factory=dict)
+    # The outer shell as a fit-frame tifxyz.Patch (materialize_outer_shell),
+    # or None.
+    outer_shell: object = None
+    tracks: 'TrackInputs' = None
+    # Complete input/frame provenance and its digest (load_fit_inputs).
+    manifest: dict = None
+    digest: str = None
+
+    def report(self, max_named=5):
+        lines = snapshot_report(self.snapshot) + [
+            'constraints: ' + ', '.join(
+                f'{name} {count}' for name, count in sorted(self.counts.items()))]
+        if self.dropped_attachments:
+            named = ', '.join(edge for edge, _ in self.dropped_attachments[:max_named])
+            more = len(self.dropped_attachments) - max_named
+            lines.append(
+                f'WARNING: {len(self.dropped_attachments)} consumed attachment(s) '
+                f'lie on patch quads the losses do not sample (eroded, outside '
+                f'the z window or a detached island) and were dropped: {named}'
+                + (f', and {more} more' if more > 0 else ''))
+        return lines
+
+
+def _surface_zyxs(store, obj, what):
+    """``(zyxs, grid scale)`` of a stored surface in the fit frame; invalid
+    vertices (and holes in its ``valid`` channel) carry the -1 sentinel."""
+    arrays, attributes = read_geometry(store, obj.geometry_revision, ['points'],
+                                       optional=['valid'])
+    points = arrays['points']
+    if points.ndim != 3 or points.shape[-1] != 3:
+        raise ObjectStoreInputError([f'{what} {obj.uuid} points have shape {points.shape}'])
+    invalid = np.all(points == -1, axis=-1)
+    if 'valid' in arrays:
+        # The store's per-vertex validity channel (ingested from mask.tif):
+        # zero marks a hole even where coordinates remain.
+        if arrays['valid'].shape != invalid.shape:
+            raise ObjectStoreInputError(
+                [f'{what} {obj.uuid} validity has shape {arrays["valid"].shape}'])
+        invalid |= arrays['valid'] == 0
+    return (obj.frame.xyz_to_fit_zyx(points, invalid), invalid,
+            obj.frame.grid_scale_to_fit(attributes['scale']))
+
+
+def materialize_outer_shell(store, snapshot):
+    """The snapshot's outer shell as a fit-frame tifxyz.Patch (whole: no z
+    window or erosion), or None."""
+    obj = snapshot.outer_shell
+    if obj is None:
+        return None
+    import torch
+    from tifxyz import Patch
+    zyxs, _, scale = _surface_zyxs(store, obj, 'outer shell')
+    return Patch(torch.from_numpy(zyxs), torch.tensor(scale), None, None, obj.uuid, None)
+
+
+def materialize_patches(store, snapshot, *, z_begin, z_end, z_margin,
+                        erode_cells_default):
+    """Fit-frame patches of the snapshot, keyed by UUID; and drop counts.
+
+    Grid rows and columns are the stored ones: nothing is cropped or
+    subsampled, so stored (row, col) anchors are runtime (i, j). Invalid
+    vertices keep the -1 sentinel. A patch's own erosion request is
+    ``meta.source.spiral_patch_erode_cells``, as in its tifxyz metadata.
+    Each patch carries its loss sampling mask (``z_margin`` is the fit's
+    patch_loss_z_margin), so attachments can be checked against it.
+    """
+    import torch
+    from spiral_helpers import (patch_intersects_z_roi, patch_sampling_quad_mask,
+                                prepare_patch_for_fit)
+    from tifxyz import Patch
+
+    patches, counts = {}, Counter()
+    for obj in snapshot.objects_of('surface'):
+        zyxs, invalid, scale = _surface_zyxs(store, obj, 'patch')
+        valid_quads = (~invalid[:-1, :-1] & ~invalid[1:, :-1]
+                       & ~invalid[:-1, 1:] & ~invalid[1:, 1:])
+        if not valid_quads.any():
+            counts['patches without valid quads'] += 1
+            continue
+        erosion = (obj.meta.get('source') or {}).get('spiral_patch_erode_cells')
+        patch = Patch(torch.from_numpy(zyxs), torch.tensor(scale),
+                      None, None, obj.uuid, erosion)
+        if not patch_intersects_z_roi(patch, z_begin, z_end):
+            counts['patches outside z ROI'] += 1
+            continue
+        reason = prepare_patch_for_fit(patch, z_begin, z_end, erode_cells_default)
+        if reason is not None:
+            counts[f'patches dropped by {reason}'] += 1
+            continue
+        patch._sampling_valid_quad_mask_np = patch_sampling_quad_mask(
+            patch, z_begin, z_end, z_margin)
+        patches[obj.uuid] = patch
+    counts['patches'] = len(patches)
+    return patches, counts
+
+
+def pcl_role(obj, relationships):
+    """True for an absolute-winding PCL, from ``meta.source.winding_is_absolute``.
+
+    A non-boolean value, or detector evidence recorded under the other role,
+    is an error rather than a guess.
+    """
+    value = (obj.meta.get('source') or {}).get('winding_is_absolute', False)
+    if not isinstance(value, bool):
+        raise ObjectStoreInputError([
+            f'point collection {obj.uuid} ({obj.name!r}) has a non-boolean '
+            f'winding_is_absolute {value!r}'])
+    for rel in relationships:
+        recorded = (rel.meta.get('point_collection_surface') or {}).get(
+            'winding_is_absolute')
+        if recorded is not None and recorded != value:
+            raise ObjectStoreInputError([
+                f'point collection {obj.uuid} ({obj.name!r}) is '
+                f'{"absolute" if value else "relative"}, but edge {rel.uuid} '
+                f'was detected as {"absolute" if recorded else "relative"}; '
+                'refresh its links'])
+    return value
+
+
+def _winding_annotation(obj, point_id, annotation):
+    value = annotation.get('wind_a')
+    if value is None:
+        return float('nan')
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ObjectStoreInputError([
+            f'point collection {obj.uuid} point {point_id} has a non-numeric '
+            f'wind_a {value!r}'])
+    return float(value)
+
+
+def on_retained_quad(patch, ij):
+    """Whether (row, col) ``ij`` lies on a quad the fitted patch's losses keep.
+
+    The quads are the patch's sampling mask (spiral_helpers.
+    patch_sampling_quad_mask, stored by materialize_patches exactly as the fit
+    computes it): eroded, restricted to the z window and to the largest
+    connected piece. The quad is the floor of ``ij``, clamped to the grid, as
+    in losses._valid_patch_annotation. Stored attachments were detected on
+    the whole un-eroded grid, so any of these steps can remove their quad.
+    """
+    mask = patch._sampling_valid_quad_mask_np
+    row = min(max(int(ij[0]), 0), mask.shape[0] - 1)
+    col = min(max(int(ij[1]), 0), mask.shape[1] - 1)
+    return bool(mask[row, col])
+
+
+def _anchor_index(anchor, array):
+    points = anchor.get('points') or []
+    if len(points) < 1 or points[0]['array'] != array or len(points[0]['index']) != 1:
+        return None
+    return int(points[0]['index'][0])
+
+
+def _pcl_attachment(rel, patches):
+    """``(point id, on_patch)`` of a pcl-patch edge, or (point id, None) when
+    its patch is not fitted; raises when the edge cannot be materialized."""
+    point_id = _anchor_index(rel.b_anchor, 'point_ids')
+    ij = (rel.meta.get('point_collection_surface') or {}).get('ij')
+    if point_id is None or not isinstance(ij, list) or len(ij) != 2:
+        raise ObjectStoreInputError([
+            f'point-surface edge {rel.uuid} lacks a point ID anchor or surface ij'])
+    if rel.a not in patches:
+        return point_id, None
+    return point_id, {'id': rel.a, 'ij': [float(ij[0]), float(ij[1])],
+                      'edge_uuid': rel.uuid}
+
+
+def materialize_point_collections(store, snapshot, patches, first_id=0,
+                                  dropped=None):
+    """Regular PCLs of the snapshot, keyed by resident id in UUID order.
+
+    Points are keyed by their stable IDs and carry fit-frame ZYX and their
+    aligned ``wind_a`` annotation. Each consumed point-surface edge attaches its
+    point to its patch at the recorded (row, col); edges to patches dropped
+    from the fit are counted and ignored. An attachment on a quad the losses
+    do not sample (on_retained_quad) leaves its point unattached and is appended to ``dropped`` as
+    ``(edge UUID, reason)``.
+    """
+    edges_by_pcl = {}
+    for rel in snapshot.relationships_of('pcl_patch'):
+        edges_by_pcl.setdefault(rel.b, []).append(rel)
+    collections, counts, problems = {}, Counter(), []
+    for cid, obj in enumerate(snapshot.objects_of('point_collection'), start=first_id):
+        arrays, _ = read_geometry(store, obj.geometry_revision, ['points', 'point_ids'])
+        point_ids = [int(point_id) for point_id in arrays['point_ids']]
+        if len(set(point_ids)) != len(point_ids):
+            raise ObjectStoreInputError(
+                [f'point collection {obj.uuid} repeats point IDs'])
+        annotations = point_annotations(store, obj.geometry_revision, point_ids)
+        edges = edges_by_pcl.get(obj.uuid, [])
+        absolute = pcl_role(obj, edges)
+        zyxs = obj.frame.xyz_to_fit_zyx(arrays['points'])
+        points = {}
+        for point_id, zyx in sorted(zip(point_ids, zyxs), key=lambda item: item[0]):
+            points[point_id] = {
+                'id': point_id, 'collectionId': cid, 'p': zyx[::-1].tolist(),
+                'zyx': zyx,
+                'winding_annotation': _winding_annotation(
+                    obj, point_id, annotations.get(point_id, {})),
+                'creation_time': 0,
+            }
+        for rel in edges:
+            try:
+                point_id, attachment = _pcl_attachment(rel, patches)
+            except ObjectStoreInputError as error:
+                problems.extend(error.problems)
+                continue
+            point = points.get(point_id)
+            if point is None:
+                problems.append(f'point-surface edge {rel.uuid} names point '
+                                f'{point_id}, absent from {obj.uuid}')
+            elif attachment is None:
+                counts['pcl attachments to unfitted patches'] += 1
+            elif not on_retained_quad(patches[attachment['id']], attachment['ij']):
+                counts['pcl attachments off sampled quads'] += 1
+                if dropped is not None:
+                    dropped.append((rel.uuid, 'quad not sampled'))
+            elif 'on_patch' in point:
+                problems.append(
+                    f'point {point_id} of point collection {obj.uuid} attaches '
+                    f'to patches {point["on_patch"]["id"]} and {attachment["id"]}')
+            else:
+                point['on_patch'] = attachment
+                counts['pcl attachments'] += 1
+        annotated = any(np.isfinite(p['winding_annotation']) for p in points.values())
+        group = obj.meta.get('sampling_group') or (
+            ABSOLUTE_PCL_GROUP if absolute else
+            RELATIVE_PCL_GROUP if annotated else SAME_WINDING_PCL_GROUP)
+        collections[cid] = {
+            'id': cid, 'name': obj.name, 'points': points, 'color': [0.0, 0.0, 0.0],
+            'source_file': None, 'sampling_group': group,
+            'metadata': {
+                'winding_is_absolute': absolute,
+                'input_role': 'absolute' if absolute else 'object_store',
+                'resident_collection_id': cid,
+                'object_uuid': obj.uuid,
+                'object_revision': obj.object_revision,
+                'geometry_revision': obj.geometry_revision,
+            },
+        }
+        counts['absolute point collections' if absolute
+               else 'relative point collections'] += 1
+    if problems:
+        raise ObjectStoreInputError(problems)
+    return collections, counts
+
+
+def _fiber_contact(rel):
+    """``(raw line index, ij)`` of a fiber-surface edge's representative contact."""
+    line_index = _anchor_index(rel.b_anchor, 'line_points')
+    grid = (rel.meta.get('fiber_surface') or {}).get('surface_grid')
+    if line_index is None or not isinstance(grid, list) or len(grid) != 2:
+        raise ObjectStoreInputError([
+            f'fiber-surface edge {rel.uuid} lacks a line-point anchor or surface_grid'])
+    # surface_grid is (column, row); attachments use (row, column).
+    return line_index, [float(grid[1]), float(grid[0])]
+
+
+def materialize_fibers(store, snapshot, patches, *, min_point_spacing,
+                       first_id=0, dropped=None):
+    """Fit-frame fibers, their contacts and same-winding branch links.
+
+    Returns ``(fiber_catalog, links, counts)``. The catalog maps fiber UUIDs
+    (in UUID order) to fiber collections whose points are keyed by raw line
+    index: trimming to the control span and min-spacing decimation never
+    renumber them. Every consumed contact and branch endpoint is kept through
+    both. A contact's point lists each patch it attaches to in
+    ``point['attachments']``, so one physical point (one chain/theta node) can
+    attach to several patches. A contact on a quad the losses do not sample
+    is not attached, and is appended to ``dropped`` as ``(edge UUID, reason)``.
+    ``links`` are resolved branch links keyed by resident collection id and
+    raw line index; each carries the winding gap it asserts between its
+    ends, ``winding_offset`` = W_b - W_a: 0 for a same-winding branch, -1 or
+    +1 for an adjacent-winding one (adjacent_winding_offset). An adjacent
+    branch whose fibers are not one H and one V asserts no direction and is
+    left out.
+    """
+    from vc_object_store import fiber_branch_control_index, fiber_hv_classification
+    from spiral_helpers import (_decimate_ordered_points_min_spacing,
+                                fiber_control_span)
+
+    fibers = snapshot.objects_of('fiber')
+    resident_id = {obj.uuid: cid for cid, obj in enumerate(fibers, start=first_id)}
+    contacts = {obj.uuid: {} for obj in fibers}
+    counts, problems = Counter(), []
+    for rel in snapshot.relationships_of('fiber_patch'):
+        try:
+            line_index, ij = _fiber_contact(rel)
+        except ObjectStoreInputError as error:
+            problems.extend(error.problems)
+            continue
+        if rel.a not in patches:
+            counts['fiber contacts with unfitted patches'] += 1
+            continue
+        if not on_retained_quad(patches[rel.a], ij):
+            counts['fiber contacts off sampled quads'] += 1
+            if dropped is not None:
+                dropped.append((rel.uuid, 'quad not sampled'))
+            continue
+        contacts[rel.b].setdefault(line_index, []).append(
+            {'id': rel.a, 'ij': ij, 'edge_uuid': rel.uuid})
+
+    geometry, endpoints = {}, {obj.uuid: {} for obj in fibers}
+    for obj in fibers:
+        arrays, _ = read_geometry(store, obj.geometry_revision,
+                                  ['control_points', 'line_points', 'control_point_ids'])
+        geometry[obj.uuid] = arrays
+    for rel in snapshot.relationships_of('fiber_branch'):
+        try:
+            control = {
+                uuid: fiber_branch_control_index(
+                    [int(v) for v in geometry[uuid]['control_point_ids']], anchor)
+                for uuid, anchor in ((rel.a, rel.a_anchor), (rel.b, rel.b_anchor))}
+        except RuntimeError as error:
+            problems.append(f'fiber branch {rel.uuid}: {error}')
+            continue
+        endpoints[rel.a][rel.uuid] = control[rel.a]
+        endpoints[rel.b][rel.uuid] = control[rel.b]
+    if problems:
+        raise ObjectStoreInputError(problems)
+
+    catalog, branch_points = {}, {}
+    for obj in fibers:
+        arrays = geometry[obj.uuid]
+        # Fit-frame XYZ, in the stored point order.
+        line = np.ascontiguousarray(
+            obj.frame.xyz_to_fit_zyx(arrays['line_points'])[:, ::-1])
+        controls = np.ascontiguousarray(
+            obj.frame.xyz_to_fit_zyx(arrays['control_points'])[:, ::-1])
+        if len(controls) < 1:
+            raise ObjectStoreInputError([f'fiber {obj.uuid} has no control points'])
+        own_contacts = contacts[obj.uuid]
+        polyline, span_begin, control_line = fiber_control_span(controls, line)
+        if polyline is controls:
+            # No usable dense polyline: the controls are the fiber, and line
+            # point contacts cannot be placed on it.
+            if own_contacts:
+                raise ObjectStoreInputError([
+                    f'fiber {obj.uuid} has contacts but no usable line points'])
+            line = controls
+        span_end = span_begin + len(polyline) - 1
+        outside = [i for i in own_contacts if not span_begin <= i <= span_end]
+        if any(not 0 <= i < len(line) for i in outside):
+            raise ObjectStoreInputError(
+                [f'fiber {obj.uuid} contact outside its {len(line)} line points'])
+        if outside:
+            # The detector's control-span rule can differ by a line point at
+            # each end; keep consumed contacts rather than dropping them.
+            counts['fiber spans widened to keep contacts'] += 1
+            span_begin = min(span_begin, *outside)
+            span_end = max(span_end, *outside)
+        branch_lines = {edge: int(control_line[index])
+                        for edge, index in endpoints[obj.uuid].items()}
+        keep = set(own_contacts) | set(branch_lines.values())
+        span = np.arange(span_begin, span_end + 1)
+        _, kept = _decimate_ordered_points_min_spacing(
+            line[span], min_point_spacing,
+            return_indices=True,
+            force_keep={i - span_begin for i in keep})
+        cid = resident_id[obj.uuid]
+        points = {}
+        for position in kept:
+            raw = int(span[position])
+            xyz = line[raw]
+            point = {'id': raw, 'collectionId': cid, 'p': xyz.tolist(),
+                     'zyx': np.asarray(xyz[::-1], dtype=np.float32),
+                     'winding_annotation': float('nan'), 'creation_time': 0,
+                     'orig_index': raw}
+            if raw in own_contacts:
+                point['attachments'] = own_contacts[raw]
+                counts['fiber attachments'] += len(own_contacts[raw])
+            points[raw] = point
+        source = obj.meta.get('source') or {}
+        hv = source.get('hv_classification') or {}
+        if obj.fiber is not None:
+            hv = fiber_hv_classification(
+                hv, obj.fiber['family'], obj.fiber['manual_family'])
+        catalog[obj.uuid] = {
+            'id': cid, 'name': obj.name, 'points': points,
+            'color': [0.0, 0.0, 0.0], 'source_file': None,
+            'metadata': {
+                'hv_classification': hv,
+                'logical_input_revision': obj.object_revision,
+                'object_uuid': obj.uuid,
+                'geometry_revision': obj.geometry_revision,
+                'fiber_num_control_points': len(controls),
+            },
+        }
+        branch_points[obj.uuid] = branch_lines
+        counts['fibers'] += 1
+
+    links = []
+    for rel in snapshot.relationships_of('fiber_branch'):
+        winding_offset = 0
+        if rel.meta.get('adjacent'):
+            winding_offset = adjacent_winding_offset(
+                snapshot.objects[rel.a], snapshot.objects[rel.b])
+            if winding_offset is None:
+                counts['adjacent fiber branches not one H and one V'] += 1
+                continue
+        links.append({
+            'a_coll': resident_id[rel.a], 'a_point': branch_points[rel.a][rel.uuid],
+            'b_coll': resident_id[rel.b], 'b_point': branch_points[rel.b][rel.uuid],
+            'pending': rel.approval_state != 'approved', 'edge_uuid': rel.uuid,
+            'winding_offset': winding_offset,
+        })
+    counts['fiber branches'] = len(links)
+    return catalog, links, counts
+
+
+def _overlap_point(cid, index, patch_uuid, grid, xyz, edge_uuid):
+    zyx = np.asarray(xyz, dtype=np.float64)[::-1].astype(np.float32)
+    return {'id': index, 'collectionId': cid, 'p': zyx[::-1].tolist(),
+            'zyx': zyx, 'winding_annotation': 0.0, 'creation_time': 0,
+            'on_patch': {'id': patch_uuid,
+                         'ij': [float(grid[0]), float(grid[1])],
+                         'edge_uuid': edge_uuid}}
+
+
+def materialize_patch_overlaps(store, snapshot, patches, *, pair_spacing,
+                               max_pairs, first_id=0, dropped=None):
+    """Same-surface pair collections of the snapshot's patch overlaps.
+
+    The store materializes each consumed overlap edge's point pairs from its
+    stored pose (``overlap_correspondences``); nothing is matched here. Pairs
+    follow the stored endpoint order, with (row, col) grids and XYZ in the
+    fit volume's own voxels, converted to the fit level's. Each pair becomes one
+    collection of two points, the pair's point on either patch, with zero
+    relative winding: the relative-winding loss then compares exactly that
+    correspondence along its own two-node chain. Every pair of an edge
+    carries ``sampling_member_weight`` 1 / (its retained pairs) and the
+    edge's UUID as ``sampling_unit``: the sampler draws edges, then one pair
+    of each, so an edge weighs the same however many pairs it produces.
+
+    A pair on a quad either patch's losses do not sample is dropped; an edge
+    losing every pair is appended to ``dropped``. Edge errors, and pairs
+    computed from geometry other than the snapshot's, are reported together.
+    Returns ``(collections keyed by resident id, counts)``.
+    """
+    edges = {rel.uuid: rel for rel in snapshot.relationships_of('patch_overlap')}
+    collections, counts, problems = {}, Counter(), []
+    if not edges:
+        return collections, counts
+    # From the snapshot's records (the edge's pose, its endpoints' frames and
+    # geometry revisions), not the store's current state: a replica pulled
+    # past the snapshot's position must materialize what the digest names.
+    def pinned(rel):
+        a, b = rel.stored_order or (rel.a, rel.b)
+        anchors = {rel.a: rel.a_anchor, rel.b: rel.b_anchor}
+        return {'uuid': rel.uuid, 'a': a, 'b': b,
+                'whole_geometry': all(bool((anchors[end] or {}).get('whole_geometry'))
+                                      for end in (a, b)),
+                'meta': json.dumps(rel.meta),
+                'a_object_meta': json.dumps(snapshot.objects[a].meta),
+                'b_object_meta': json.dumps(snapshot.objects[b].meta),
+                'a_geometry_revision': snapshot.objects[a].geometry_revision,
+                'b_geometry_revision': snapshot.objects[b].geometry_revision}
+    fit_scale = snapshot.request.fit_scale
+    results = store.overlap_correspondences_at(
+        [pinned(rel) for rel in edges.values()], snapshot.volume_uuid,
+        float(pair_spacing) * fit_scale, int(max_pairs))
+    cid = first_id
+    for result in results:
+        rel = edges.pop(result['edge_uuid'], None)
+        if rel is None:
+            problems.append(f'patch overlap {result["edge_uuid"]} was not requested')
+            continue
+        if result['error'] is not None:
+            problems.append(f'patch overlap {rel.uuid}: {result["error"]}')
+            continue
+        ends = ((result['a'], result['a_geometry_revision']),
+                (result['b'], result['b_geometry_revision']))
+        if sorted(uuid for uuid, _ in ends) != sorted((rel.a, rel.b)):
+            problems.append(f'patch overlap {rel.uuid} was materialized between '
+                            f'{result["a"]} and {result["b"]}')
+            continue
+        stale = [uuid for uuid, revision in ends
+                 if snapshot.objects[uuid].geometry_revision != revision]
+        if stale:
+            problems.append(f'patch overlap {rel.uuid} was materialized from '
+                            f'geometry of {", ".join(stale)} other than the snapshot\'s')
+            continue
+        a, b = result['a'], result['b']
+        if a not in patches or b not in patches:
+            counts['patch overlaps with unfitted patches'] += 1
+            continue
+        kept = [pair for pair in result['pairs']
+                if on_retained_quad(patches[a], pair['a_grid'])
+                and on_retained_quad(patches[b], pair['b_grid'])]
+        if len(kept) < len(result['pairs']):
+            counts['overlap pairs off sampled quads'] += len(result['pairs']) - len(kept)
+        if not kept:
+            counts['patch overlaps off sampled quads'] += 1
+            if dropped is not None:
+                dropped.append((rel.uuid, 'no pair on sampled quads'))
+            continue
+        group = rel.meta.get('sampling_group') or PATCH_OVERLAP_GROUP
+        for index, pair in enumerate(kept):
+            collections[cid] = {
+                'id': cid, 'name': f'overlap {rel.uuid} pair {index}',
+                'points': {
+                    0: _overlap_point(cid, 0, a, pair['a_grid'],
+                                      np.asarray(pair['a_xyz']) / fit_scale, rel.uuid),
+                    1: _overlap_point(cid, 1, b, pair['b_grid'],
+                                      np.asarray(pair['b_xyz']) / fit_scale, rel.uuid)},
+                'color': [0.0, 0.0, 0.0], 'source_file': None,
+                'sampling_group': group,
+                'sampling_member_weight': 1.0 / len(kept),
+                'sampling_unit': rel.uuid,
+                'metadata': {
+                    'winding_is_absolute': False,
+                    'input_role': 'patch_overlap',
+                    'resident_collection_id': cid,
+                    'edge_uuid': rel.uuid,
+                    'edge_revision': rel.revision,
+                    'pair_distance': float(pair['distance']) / fit_scale,
+                },
+            }
+            cid += 1
+        counts['patch overlaps'] += 1
+        counts['overlap pairs'] += len(kept)
+    problems.extend(f'patch overlap {uuid} returned no result' for uuid in edges)
+    if problems:
+        raise ObjectStoreInputError(problems)
+    return collections, counts
+
+
+@dataclasses.dataclass
+class TrackInputs:
+    """The selected tracks as the track losses read them.
+
+    ``tracks`` is a fit-frame tracks.PackedTrackCollection of the tracks lying
+    entirely inside the z window, ordered by dataset and source key (the
+    order of the packed store they were ingested from); a track's source id is
+    its row among every selected track. ``crossings`` is the exact-crossing
+    CSR over every selected track (rows are source ids): partner rows,
+    crossing point indices on both tracks, and the crossing's arclength
+    position and clearance in fit voxels.
+    """
+    tracks: object
+    crossings: dict
+
+
+# Stored track family -> the crossing kernel's family code.
+TRACK_FAMILY_CODES = {'horizontal': 0, 'vertical': 1}
+
+
+def _track_order(obj):
+    """Tracks sort by dataset, then numeric source key, then UUID."""
+    track = obj.track or {}
+    key = str(track.get('external_key') or '')
+    return (str(track.get('dataset_ref') or ''), not key.isdigit(),
+            int(key) if key.isdigit() else 0, key, obj.uuid)
+
+
+def _track_crossing_csr(snapshot, tracks, lengths, problems):
+    """The crossing CSR of the snapshot's track crossings over ``tracks``."""
+    row = {obj.uuid: index for index, obj in enumerate(tracks)}
+    records = []
+    for rel in snapshot.relationships_of('track_crossing'):
+        meta = rel.meta.get('track_crossing') or {}
+        endpoints = meta.get('endpoints') or {}
+        ends = []
+        for uuid, anchor in ((rel.a, rel.a_anchor), (rel.b, rel.b_anchor)):
+            local = _anchor_index(anchor, 'points')
+            arclength = (endpoints.get(uuid) or {}).get('arclength_voxels')
+            if local is None or arclength is None:
+                problems.append(f'track crossing {rel.uuid} lacks a point anchor '
+                                f'or arclength for {uuid}')
+            elif not 0 <= local < lengths[row[uuid]]:
+                problems.append(f'track crossing {rel.uuid} anchors point {local} '
+                                f'outside the {lengths[row[uuid]]} points of {uuid}')
+            else:
+                ends.append((row[uuid], local,
+                             float(arclength) * tracks[row[uuid]].frame.to_fit))
+        clearance = meta.get('clearance_voxels')
+        if clearance is None:
+            problems.append(f'track crossing {rel.uuid} lacks its clearance')
+        if len(ends) < 2 or clearance is None:
+            continue
+        clearance = float(clearance) * tracks[ends[0][0]].frame.to_fit
+        (a, a_local, a_position), (b, b_local, b_position) = ends
+        records.append((a, b, a_local, b_local, a_position, clearance))
+        records.append((b, a, b_local, a_local, b_position, clearance))
+    table = np.array(records, dtype=np.float64).reshape(-1, 6)
+    table = table[np.lexsort((table[:, 1], table[:, 0]))]
+    rows = table[:, 0].astype(np.int64)
+    offsets = np.zeros(len(tracks) + 1, dtype=np.int64)
+    np.cumsum(np.bincount(rows, minlength=len(tracks)), out=offsets[1:])
+    return {
+        'source_ids': np.arange(len(tracks), dtype=np.uint64),
+        'offsets': offsets,
+        'partners': table[:, 1].astype(np.int32),
+        'self_local': table[:, 2].astype(np.int32),
+        'partner_local': table[:, 3].astype(np.int32),
+        'positions': table[:, 4].copy(),
+        'clearances': table[:, 5].copy(),
+    }
+
+
+def materialize_tracks(store, snapshot, *, z_begin, z_end):
+    """The snapshot's tracks and crossings (TrackInputs), or None without
+    tracks; and counts.
+
+    A track is kept when every point's fit-frame z lies in ``[z_begin,
+    z_end)``. Arclengths and tortuosities are measured on the stored integer
+    voxels, as the packed track store measures them, then converted to fit
+    voxels.
+    """
+    from tracks import PackedTrackCollection
+
+    tracks = sorted(snapshot.objects_of('track'), key=_track_order)
+    counts = Counter()
+    if not tracks:
+        return None, counts
+    problems = []
+    lengths = np.zeros(len(tracks), dtype=np.int64)
+    kept, stored, fit, families, scales = [], [], [], [], []
+    for index, obj in enumerate(tracks):
+        arrays, _ = read_geometry(store, obj.geometry_revision, ['points'])
+        xyz = arrays['points']
+        if xyz.ndim != 2 or xyz.shape[1] != 3:
+            problems.append(f'track {obj.uuid} points have shape {xyz.shape}')
+            continue
+        lengths[index] = len(xyz)
+        if not len(xyz):
+            continue
+        z = xyz[:, 2].astype(np.float64) * obj.frame.to_fit
+        if z.min() < z_begin or z.max() >= z_end:
+            counts['tracks outside the z window'] += 1
+            continue
+        family = (obj.track or {}).get('family') or ''
+        kept.append(index)
+        stored.append(np.ascontiguousarray(xyz[:, ::-1], dtype=np.int32))
+        fit.append(obj.frame.xyz_to_fit_zyx(xyz))
+        families.append(TRACK_FAMILY_CODES.get(family, -1))
+        scales.append(obj.frame.to_fit)
+    crossings = _track_crossing_csr(snapshot, tracks, lengths, problems)
+    if problems:
+        raise ObjectStoreInputError(problems)
+
+    track_lengths = np.array([len(points) for points in stored], dtype=np.int64)
+    offsets = np.zeros(len(stored) + 1, dtype=np.int64)
+    np.cumsum(track_lengths, out=offsets[1:])
+    if stored:
+        coordinates = np.concatenate(stored)
+        starts = offsets[:-1]
+        steps = np.empty(len(coordinates), dtype=np.float64)
+        steps[0] = 0.0
+        deltas = np.subtract(coordinates[1:], coordinates[:-1], dtype=np.float64)
+        steps[1:] = np.linalg.norm(deltas, axis=1)
+        steps[starts] = 0.0
+        arclengths = np.add.reduceat(steps, starts)
+        chords = np.linalg.norm(
+            coordinates[offsets[1:] - 1].astype(np.float64)
+            - coordinates[starts].astype(np.float64), axis=1)
+        tortuosities = np.full(len(stored), np.inf, dtype=np.float64)
+        np.divide(arclengths, chords, out=tortuosities, where=chords > 0)
+        arclengths = arclengths * np.asarray(scales, dtype=np.float64)
+        points = np.concatenate(fit)
+    else:
+        arclengths = tortuosities = np.empty(0, dtype=np.float64)
+        points = np.empty((0, 3), dtype=np.float32)
+    collection = PackedTrackCollection(
+        points, offsets, np.asarray(kept, dtype=np.uint64),
+        np.asarray(families, dtype=np.int8), arclengths, tortuosities)
+    counts['tracks'] = len(kept)
+    counts['track crossings'] = len(crossings['partners']) // 2
+    return TrackInputs(collection, crossings), counts
+
+
+def materialize(store, snapshot, *, z_begin, z_end, z_margin,
+                erode_cells_default, fiber_min_point_spacing=0.0,
+                overlap_pair_spacing=8.0, overlap_max_pairs=16, patch_overlaps=True):
+    """Every runtime input of a frozen snapshot.
+
+    Fibers are decimated to ``fiber_min_point_spacing`` (the fitter's
+    pcl_fiber_min_point_spacing); patch overlaps yield at most
+    ``overlap_max_pairs`` pairs ``overlap_pair_spacing`` voxels apart.
+    Resident ids number PCLs, then fibers, then overlap pairs;
+    ``patch_overlaps`` False (input_use_patch_overlaps off) makes none.
+    """
+    patches, counts = materialize_patches(
+        store, snapshot, z_begin=z_begin, z_end=z_end, z_margin=z_margin,
+        erode_cells_default=erode_cells_default)
+    dropped = []
+    point_collections, pcl_counts = materialize_point_collections(
+        store, snapshot, patches, dropped=dropped)
+    counts.update(pcl_counts)
+    fibers, fiber_links, fiber_counts = materialize_fibers(
+        store, snapshot, patches, min_point_spacing=fiber_min_point_spacing,
+        first_id=len(point_collections), dropped=dropped)
+    counts.update(fiber_counts)
+    if patch_overlaps:
+        overlaps, overlap_counts = materialize_patch_overlaps(
+            store, snapshot, patches, pair_spacing=overlap_pair_spacing,
+            max_pairs=overlap_max_pairs,
+            first_id=len(point_collections) + len(fibers), dropped=dropped)
+        counts.update(overlap_counts)
+    else:
+        overlaps = {}
+        counts['patch overlaps unused (input_use_patch_overlaps off)'] = len(
+            snapshot.relationships_of('patch_overlap'))
+    tracks, track_counts = materialize_tracks(store, snapshot, z_begin=z_begin, z_end=z_end)
+    counts.update(track_counts)
+    return FitInputs(snapshot, patches, point_collections, fibers,
+                     fiber_links, counts, dropped_attachments=dropped,
+                     patch_overlaps=overlaps,
+                     outer_shell=materialize_outer_shell(store, snapshot),
+                     tracks=tracks)
+
+
+def materialize_from_config(store, snapshot, config):
+    """materialize() with the fit configuration's window and settings."""
+    return materialize(
+        store, snapshot, z_begin=config['z_begin'], z_end=config['z_end'],
+        z_margin=config['patch_loss_z_margin'],
+        erode_cells_default=config['patch_erode_patches'],
+        fiber_min_point_spacing=config['pcl_fiber_min_point_spacing'],
+        overlap_pair_spacing=config['pcl_patch_overlap_pair_spacing'],
+        overlap_max_pairs=config['pcl_patch_overlap_max_pairs'],
+        patch_overlaps=bool(config['input_use_patch_overlaps']))
+
+
+@dataclasses.dataclass
+class PointViews:
+    """The training views FitContext installs (FitContext._install_point_views)."""
+    cross_patch: list
+    strips: list
+    strip_groups: list
+    resolved_links: list
+    link_components: list
+
+    def report(self):
+        def by_group(groups):
+            counts = Counter(str(group) for group in groups)
+            return ', '.join(f'{group} {count}' for group, count in sorted(counts.items()))
+        merged = [pcl for pcl in self.cross_patch if pcl.get('link_member_cids')]
+        return [
+            f'views: {len(self.cross_patch)} cross-patch ('
+            + (by_group(pcl['sampling_group'] for pcl in self.cross_patch) or 'none')
+            + f'), {len(self.strips)} strips ('
+            + (by_group(self.strip_groups) or 'none') + ')',
+            f'fiber links: {len(self.resolved_links)} in '
+            f'{len(self.link_components)} component(s); {len(merged)} merged '
+            'cross-patch fiber component(s)',
+            f'patch overlaps: {len(self.overlap_edges)} edge(s) as '
+            f'{self.overlap_pairs} pair view(s)',
+        ]
+
+    @property
+    def overlap_edges(self):
+        return {pcl['metadata']['edge_uuid'] for pcl in self.cross_patch
+                if pcl['metadata'].get('input_role') == 'patch_overlap'}
+
+    @property
+    def overlap_pairs(self):
+        return sum(1 for pcl in self.cross_patch
+                   if pcl['metadata'].get('input_role') == 'patch_overlap')
+
+
+def derive_point_views(inputs, patches, config):
+    """Classify materialized inputs into training views; no linking.
+
+    The store's relationships already attach points to patches, so the
+    collections go straight to the shared classification: regular PCLs
+    through regular_pcl_views, fibers through fiber_training_views, where
+    every fiber with a usable in-ROI path keeps its strip. Patch-overlap
+    pairs are cross-patch views as they are, after the regular and fiber ones.
+    ``patches`` are the patches the fit uses; ``config`` the fit
+    configuration. Raises the runtime validation errors (e.g. unannotated
+    absolute points).
+    """
+    from pcl_views import (fiber_training_views, group_points_by_patch,
+                           prepare_fiber_catalog, regular_pcl_views,
+                           vertical_fiber_radial_offset)
+    from spiral_helpers import SequenceChain
+
+    point_collections = inputs.point_collections
+    for pcl in point_collections.values():
+        pcl['chain'] = SequenceChain(pcl)
+    cross_patch, strips, strip_groups = regular_pcl_views(
+        point_collections, patches,
+        z_begin=config['z_begin'], z_end=config['z_end'],
+        z_margin=config['patch_loss_z_margin'],
+        min_point_spacing=config['pcl_unattached_pcl_min_point_spacing'])
+    fibers = prepare_fiber_catalog(inputs.fibers)
+    resolved_links = (list(inputs.fiber_links)
+                      if config['pcl_use_fiber_links'] else [])
+    fiber_cross_patch, fiber_strips, fiber_groups, link_components = \
+        fiber_training_views(
+            fibers, resolved_links, patches,
+            z_begin=config['z_begin'], z_end=config['z_end'],
+            z_margin=config['patch_loss_z_margin'],
+            min_point_spacing=config['pcl_unattached_pcl_min_point_spacing'],
+            vertical_min_z_fraction=config['pcl_vertical_fiber_min_z_fraction'],
+            vertical_min_auto_certainty=config['pcl_vertical_fiber_min_auto_certainty'],
+            vertical_radial_offset=vertical_fiber_radial_offset(config))
+    strips.extend(fiber_strips)
+    strip_groups.extend(fiber_groups)
+    overlaps = []
+    for pcl in inputs.patch_overlaps.values():
+        pcl['chain'] = SequenceChain(pcl)
+        group_points_by_patch(pcl, patches)
+        if len(pcl['points_by_patch']) == 2:
+            overlaps.append(pcl)
+    return PointViews(
+        list(cross_patch.values()) + fiber_cross_patch + overlaps, strips,
+        strip_groups, resolved_links, link_components)
+
+
+# ---------------------------------------------------------------------------
+# Report
+# ---------------------------------------------------------------------------
+
+def snapshot_summary(snapshot):
+    """The selection a snapshot holds, as data; snapshot_report prints it.
+
+    Per object its provenance (UUID, kind, name, revision pins, metadata
+    hash, scale) and, for point collections, the role its metadata
+    declares; then per-kind counts, consumed relationship families,
+    exclusions and the fit volume. Reads nothing beyond the snapshot, so a
+    service can describe a selection without refreshing or materializing.
+    """
+    selection = {}
+    for kind in KINDS:
+        objects = snapshot.objects_of(kind)
+        selector = snapshot.request.selector(kind)
+        selection[kind] = {
+            'selector': dataclasses.asdict(selector),
+            'description': selector.describe(),
+            'count': len(objects),
+            'scales': [[scale, count] for scale, count in sorted(
+                Counter(obj.frame.scale_factor for obj in objects).items())],
+        }
+    objects = []
+    for obj in snapshot.objects.values():
+        entry = obj.provenance()
+        entry['volume_uuid'] = obj.frame.volume_uuid
+        if obj.kind == 'point_collection':
+            absolute = (obj.meta.get('source') or {}).get('winding_is_absolute', False)
+            entry['pcl_role'] = 'absolute' if absolute is True else 'relative'
+        objects.append(entry)
+    return {
+        'store': {'path': snapshot.store_path, 'uuid': snapshot.store_uuid},
+        'volume_uuid': snapshot.volume_uuid,
+        'volume_source': snapshot.volume_source,
+        'units': FIT_UNITS,
+        'approved_links_only': snapshot.request.approved_links_only,
+        'selection': selection,
+        'objects': objects,
+        'outer_shell': (snapshot.outer_shell.provenance()
+                        if snapshot.outer_shell else None),
+        'relationships': dict(sorted(
+            Counter(rel.family for rel in snapshot.relationships).items())),
+        'excluded_relationships': dict(sorted(snapshot.exclusions.items())),
+        'notes': list(snapshot.notes),
+        'warnings': empty_family_warnings(snapshot),
+    }
+
+
+def snapshot_report(snapshot):
+    """Human-readable lines describing the selection and its relationships."""
+    summary = snapshot_summary(snapshot)
+    lines = [
+        f'object store {summary["store"]["path"]} ({summary["store"]["uuid"]})',
+        f'fit volume {summary["volume_uuid"]} ({summary["volume_source"]}); '
+        f'units: {FIT_UNITS}',
+    ]
+    for kind in KINDS:
+        selected = summary['selection'][kind]
+        scale_text = ', '.join(f'{count} at scale {scale:g}'
+                               for scale, count in selected['scales'])
+        lines.append(
+            f'{KIND_LABELS[kind]}: {selected["count"]} selected '
+            f'({selected["description"]})'
+            + (f'; {scale_text}' if scale_text else ''))
+    shell = summary['outer_shell']
+    lines.append(f'outer shell: {shell["name"]!r} ({shell["uuid"]})' if shell
+                 else f'outer shell: none (no surface tagged {OUTER_SHELL_TAG})')
+    mode = 'approved only' if summary['approved_links_only'] else 'pending and approved'
+    lines.append(f'relationships consumed ({mode}): ' + (', '.join(
+        f'{family} {count}' for family, count in summary['relationships'].items())
+        or 'none'))
+    if summary['excluded_relationships']:
+        lines.append('relationships excluded: ' + ', '.join(
+            f'{reason} {count}'
+            for reason, count in summary['excluded_relationships'].items()))
+    lines.extend(summary['notes'])
+    lines.extend(f'WARNING: {warning}' for warning in summary['warnings'])
+    return lines
+
+
+def empty_family_warnings(snapshot):
+    """Constraint families the selection could hold but that consume nothing."""
+    count = Counter(obj.kind for obj in snapshot.objects.values())
+    expected = {
+        'pcl_patch': count['surface'] and count['point_collection'],
+        'fiber_patch': count['surface'] and count['fiber'],
+        'patch_overlap': count['surface'] > 1,
+        'track_crossing': count['track'] > 1,
+    }
+    families = Counter(rel.family for rel in snapshot.relationships)
+    excluded = sum(snapshot.exclusions.values())
+    return [
+        f'no {family} relationships are consumed although the selection has '
+        f'objects for them' + (f' ({excluded} relationship(s) excluded in all)'
+                               if excluded else '')
+        for family, possible in expected.items()
+        if possible and not families[family]]
+
+
+def constraints_report(store, snapshot, config):
+    """Materialize and derive the runtime views as a fit would, and describe
+    them; raises the same validation errors a fit would."""
+    inputs = materialize_from_config(store, snapshot, config)
+    views = derive_point_views(inputs, inputs.patches, config)
+    return inputs.report() + views.report()
+
+
+# ---------------------------------------------------------------------------
+# Startup lifecycle: selection from the fit configuration, one link refresh
+# on rank zero, then a frozen read every rank verifies against the others
+# ---------------------------------------------------------------------------
+
+class LinkRefreshError(ObjectStoreInputError):
+    """Startup link refresh failed; the fit must not train."""
+
+
+_SELECTOR_CONFIG = {'surface': 'patch', 'point_collection': 'pcl', 'fiber': 'fiber',
+                    'track': 'track'}
+_NONE = Selector(uuids=())
+
+
+def request_from_config(config):
+    """The InputRequest of a fit configuration.
+
+    Each kind's ``object_store_<kind>_uuids``/``_tags`` select objects (both
+    None: every active object). Switching a source's input toggle off
+    selects none of it. The PCL role toggles cannot apply before the roles
+    are read from metadata, so they must agree: all on, or all off.
+    """
+    selectors = {}
+    for kind, name in _SELECTOR_CONFIG.items():
+        uuids = config[f'object_store_{name}_uuids']
+        tags = config[f'object_store_{name}_tags']
+        selectors[kind] = Selector(None if uuids is None else tuple(uuids),
+                                   None if tags is None else tuple(tags))
+    if not config['input_use_verified_patches'] or config['input_disable_patches']:
+        selectors['surface'] = _NONE
+    if not config['input_use_fibers']:
+        selectors['fiber'] = _NONE
+    if not config['input_use_tracks']:
+        selectors['track'] = _NONE
+    roles = {key: config[key] for key in (
+        'input_use_pcl_absolute', 'input_use_pcl_relative', 'input_use_pcl_same_winding')}
+    if len(set(roles.values())) > 1:
+        raise ObjectStoreInputError([
+            'object-store PCLs are selected by UUID or tag, not by role: the '
+            f'PCL role toggles must all agree ({roles})'])
+    if not any(roles.values()):
+        selectors['point_collection'] = _NONE
+    from fit_session import input_source_enabled, outer_shell_required
+    shell = ('required' if outer_shell_required(config)
+             else 'optional' if input_source_enabled(config, 'outer_shell') else 'off')
+    return InputRequest(selectors, config['fit_volume_uuid'],
+                        bool(config['object_store_approved_links_only']),
+                        outer_shell=shell,
+                        fit_volume_level=int(config['fit_volume_level']))
+
+
+@dataclasses.dataclass(frozen=True)
+class NormalSource:
+    """Strip normals for fiber-patch link refresh.
+
+    ``kind`` is 'lasagna' (the fit's own normals), 'ct' (structure-tensor
+    normals of a CT zarr) or 'none' (centerline-only gating).
+    """
+    kind: str
+    ct_volume: str = ''
+    parameters: tuple = ()
+    note: str = None
+
+    def describe(self):
+        if self.kind == 'none':
+            return 'fiber-patch normals: none (centerline-only linking)'
+        values = dict(self.parameters)
+        if self.kind == 'lasagna':
+            where = (f'pack {values["normal_pool"]}' if 'normal_pool' in values
+                     else f'{values["normal_x_volume"]}, {values["normal_y_volume"]}')
+            return (f'fiber-patch normals: lasagna at '
+                    f'scale {values["ct_to_base_scale"]:g} ({where})')
+        return (f'fiber-patch normals: CT {self.ct_volume}, downsampling '
+                f'{values["ct_to_base_scale"]:g}')
+
+    def provenance(self):
+        return {'kind': self.kind, 'ct_volume': self.ct_volume or None,
+                **dict(self.parameters)}
+
+
+def fiber_normal_source(config, lasagna=None, volume_uuid=None):
+    """The fiber-patch normal source: lasagna, else normal CT, else none.
+
+    ``lasagna`` describes the fit's lasagna normals when they are configured
+    (input_use_normals with a dataset whose normals pack is at hand, whether
+    or not the dense-normal loss is on; fit_session.lasagna_normal_inputs):
+    ``{'pool', 'scale'}``, the pack the fitter loads (lasagna_source) and its
+    array's downsampling relative to the fit volume. The store reads the
+    pack, never the dataset's arrays; a normal CT's level names its group.
+    Lasagna and CT normals are exclusive; a configured CT is then ignored
+    with a note.
+    """
+    ct_path = config['object_store_normal_ct_path']
+    if lasagna is not None:
+        return NormalSource(
+            'lasagna', '', (
+                ('ct_level', 0),
+                ('ct_to_base_scale', float(lasagna['scale'])),
+                ('normal_pool', str(lasagna['pool']))),
+            note=(f'ignoring object_store_normal_ct_path {ct_path!r}: the fit '
+                  'loads lasagna normals') if ct_path else None)
+    if not ct_path:
+        return NormalSource('none')
+    ct_volume = config['object_store_normal_ct_volume_uuid']
+    if ct_volume is None:
+        raise ObjectStoreInputError([
+            'object_store_normal_ct_path needs object_store_normal_ct_volume_uuid'])
+    if volume_uuid is not None and ct_volume != volume_uuid:
+        raise ObjectStoreInputError([
+            f'the normal CT belongs to volume {ct_volume}, not the fit volume '
+            f'{volume_uuid}'])
+    level = str(config['object_store_normal_ct_level'])
+    return NormalSource('ct', os.path.join(str(ct_path), level), (
+        ('ct_level', 0),
+        ('ct_to_base_scale', float(config['object_store_normal_ct_downsampling']))))
+
+
+# Detectors the refresh runs, with the object kinds each needs selected.
+DETECTORS = (
+    ('pcl_patch', ('surface', 'point_collection')),
+    ('fiber_patch', ('surface', 'fiber')),
+    ('patch_overlap', ('surface',)),
+    ('track_crossing', ('track',)),
+)
+
+
+# Detectors that link incrementally (refresh_links ``new``), with the object
+# kinds whose new objects each examines.
+INCREMENTAL_KINDS = {
+    'pcl_patch': ('point_collection', 'surface'),
+    'fiber_patch': ('fiber', 'surface'),
+    'patch_overlap': ('surface',),
+}
+
+
+@dataclasses.dataclass
+class RefreshOutcome:
+    detector: str
+    skipped: str = None
+    report: dict = None
+    error: str = None
+    # 'full' or 'incremental over N new object(s)'; None when skipped.
+    mode: str = None
+    seconds: float = None
+
+    def _timing(self):
+        parts = [part for part in (self.mode, None if self.seconds is None
+                                   else f'{self.seconds:.1f} s') if part]
+        return f' [{", ".join(parts)}]' if parts else ''
+
+    @property
+    def failed(self):
+        return self.error is not None or bool(self.report and self.report['failed'])
+
+    @property
+    def committed(self):
+        return bool(self.report and self.report['committed'])
+
+    def lines(self, max_listed=5):
+        if self.skipped is not None:
+            return [f'link refresh {self.detector}: skipped ({self.skipped})']
+        if self.error is not None:
+            return [f'link refresh {self.detector}: FAILED: {self.error}{self._timing()}']
+        report = self.report
+        lines = [
+            f'link refresh {self.detector}: {report["edges_created"]} created, '
+            f'{report["edges_updated"]} updated, '
+            f'{report["edges_skipped_existing"]} unchanged, '
+            f'{report["stale_removed"]} stale removed '
+            f'({"committed" if report["committed"] else "nothing committed"})'
+            + ('; FAILED' if report['failed'] else '') + self._timing()]
+        failures = [issue for issue in report['issues'] if issue['severity'] == 'failure']
+        for issue in failures:
+            objects = issue['object_uuids']
+            named = ', '.join(objects[:max_listed]) + (
+                f' and {len(objects) - max_listed} more' if len(objects) > max_listed else '')
+            lines.append(f'  failure at {issue["stage"]}: {issue["reason"]}'
+                         + (f' ({named})' if objects else ''))
+        diagnostics = [issue for issue in report['issues'] if issue['severity'] != 'failure']
+        if diagnostics:
+            lines.append(f'  {sum(issue["count"] or 1 for issue in diagnostics)} '
+                         f'candidate diagnostic(s), e.g. {diagnostics[0]["reason"]}')
+        return lines
+
+
+def _detector_progress(progress, detector):
+    """A detector's progress callback publishing through a ProgressReporter
+    (spiral_progress): the detector is the stage, its own stage and item the
+    detail; a total of 0 is unknown."""
+    if progress is None:
+        return None
+    progress.begin('linking', f'link refresh {detector}')
+
+    def report(stage, completed, total, detail):
+        progress.update(completed, total_steps=total,
+                        detail=f'{stage}: {detail}' if detail else stage)
+    return report
+
+
+def refresh_links(store, snapshot, config, normal_source, cache_directory=None, new=None,
+                  progress=None, log=None):
+    """Run each automatic detector over the snapshot's objects.
+
+    A detector runs only when every object kind it needs is selected, with
+    exactly the selected UUIDs, so its writes and stale-link removal stay
+    within the selection. Exceptions and reported failures are collected
+    for every detector; none stops the others.
+
+    ``new`` ({kind: UUIDs}) makes the run incremental: each detector that
+    supports it examines only pairs with a new object of its kinds (the
+    store's new_uuids), and is skipped when none is new; track crossings
+    are skipped (an incremental refresh requires unchanged tracks).
+    ``progress`` (a spiral_progress.ProgressReporter) receives each
+    detector's progress, and ``log`` a line as each one starts; the
+    outcomes' report lines (refresh_report) carry each mode and duration.
+    """
+    selected = {kind: [obj.uuid for obj in snapshot.objects_of(kind)] for kind in KINDS}
+    volume = snapshot.volume_uuid
+
+    def fresh(detector):
+        return sorted(uuid for kind in INCREMENTAL_KINDS[detector] for uuid in new.get(kind, ()))
+
+    def reporting(detector):
+        callback = _detector_progress(progress, detector)
+        return {'progress': callback} if callback else {}
+
+    def options(detector):
+        return {**reporting(detector), **({'new_uuids': fresh(detector)} if new is not None else {})}
+    run = {
+        'pcl_patch': lambda: store.link_point_collections_to_surfaces(
+            volume_uuid=volume, collection_uuids=selected['point_collection'],
+            surface_uuids=selected['surface'],
+            tolerance=float(config['pcl_link_distance_tolerance']),
+            window_points=int(config['pcl_link_window_points']),
+            window_min_points=int(config['pcl_link_window_min_points']),
+            **options('pcl_patch')),
+        'fiber_patch': lambda: store.link_fibers_to_surfaces(
+            normal_source.ct_volume, volume_uuid=volume,
+            fiber_uuids=selected['fiber'], surface_uuids=selected['surface'],
+            **dict(normal_source.parameters),
+            **({'cache_directory': cache_directory} if cache_directory else {}),
+            **options('fiber_patch')),
+        'patch_overlap': lambda: store.link_surface_overlaps(
+            volume_uuid=volume, surface_uuids=selected['surface'], **options('patch_overlap')),
+        # Crossings are exact shared voxels of the stored tracks, found with
+        # the store's default angle, tangent and clustering parameters.
+        'track_crossing': lambda: store.link_tracks_to_tracks(
+            track_uuids=selected['track'], workers=os.cpu_count() or 1,
+            **reporting('track_crossing')),
+    }
+    outcomes = []
+    for detector, kinds in DETECTORS:
+        empty = [KIND_LABELS[kind] for kind in kinds if not selected[kind]]
+        if empty:
+            outcome = RefreshOutcome(detector, skipped='no selected ' + ' or '.join(empty))
+        elif detector == 'patch_overlap' and not config['input_use_patch_overlaps']:
+            outcome = RefreshOutcome(detector, skipped='input_use_patch_overlaps is off')
+        elif new is not None and detector not in INCREMENTAL_KINDS:
+            outcome = RefreshOutcome(detector, skipped='incremental refresh: its inputs are unchanged')
+        elif new is not None and not fresh(detector):
+            outcome = RefreshOutcome(detector, skipped='incremental refresh: no new ' + ' or '.join(
+                KIND_LABELS[kind] for kind in INCREMENTAL_KINDS[detector]))
+        else:
+            mode = ('full' if new is None else
+                    f'incremental over {len(fresh(detector))} new object(s)')
+            if log is not None:
+                log(f'link refresh {detector}: running ({mode})')
+            started = time.monotonic()
+            try:
+                outcome = RefreshOutcome(detector, report=run[detector](), mode=mode)
+            except Exception as error:  # noqa: BLE001 - every failure is reported
+                outcome = RefreshOutcome(detector, error=f'{type(error).__name__}: {error}',
+                                         mode=mode)
+            outcome.seconds = time.monotonic() - started
+            if progress is not None:
+                progress.clear()
+        outcomes.append(outcome)
+    return outcomes
+
+
+def refresh_report(outcomes):
+    """Report lines of a refresh, and its problems ([] on success)."""
+    lines = [line for outcome in outcomes for line in outcome.lines()]
+    failed = [outcome.detector for outcome in outcomes if outcome.failed]
+    if not failed:
+        return lines, []
+    committed = [outcome.detector for outcome in outcomes if outcome.committed]
+    problems = lines + [
+        f'link refresh failed in {", ".join(failed)}; the fit will not train. '
+        + (f'{", ".join(committed)} committed before the failure (detectors '
+           'are not rolled back together; a rerun reconciles them)'
+           if committed else 'No detector committed changes.')]
+    return lines, problems
+
+
+# ---------------------------------------------------------------------------
+# Link marker: skip the detectors when the links are current
+# ---------------------------------------------------------------------------
+
+LINK_MARKER_VERSION = 1
+# Edge kinds the detectors write (refresh_links runs them with their defaults):
+# any change to one since a refresh (a manual link, an approval, a deletion)
+# forces the next one to run in full.
+DETECTOR_EDGE_KINDS = frozenset({'point-surface', 'same-surface', 'crossing'})
+# Records that change how detectors map stored coordinates into the volume.
+FRAME_RECORD_KINDS = frozenset({'volume_transform', 'volume_transform_choice'})
+
+
+def link_marker_key_parts(volume_uuid, config, normal_source):
+    """What links depend on outside the store: the fit volume, the
+    detector parameters and normal source (link_refresh_provenance), the
+    store library's detector versions and which detectors run. A marker
+    records them with their digest (``key``), so a mismatch names what
+    changed."""
+    from vc_object_store import detector_versions
+    return {
+        'volume_uuid': volume_uuid,
+        'link_refresh': link_refresh_provenance(config, normal_source),
+        'detectors': detector_versions(),
+        # Off leaves the overlap links unrefreshed: turning it on relinks.
+        'patch_overlaps': bool(config['input_use_patch_overlaps']),
+    }
+
+
+def _flatten(value, prefix=''):
+    if isinstance(value, dict) and value:
+        return {path: leaf for key, item in value.items()
+                for path, leaf in _flatten(item, f'{prefix}{key}.').items()}
+    return {prefix[:-1]: value}
+
+
+_UNRECORDED = object()
+
+
+def key_changes(recorded, current, limit=3):
+    """What differs between two link_marker_key_parts, as ``path: old -> new``
+    (at most ``limit``, then a count)."""
+    old, new = _flatten(recorded), _flatten(current)
+
+    def shown(value):
+        return 'not recorded' if value is _UNRECORDED else repr(value)
+    changes = [f'{path}: {shown(old.get(path, _UNRECORDED))} -> {shown(new.get(path, _UNRECORDED))}'
+               for path in sorted(set(old) | set(new))
+               if old.get(path, _UNRECORDED) != new.get(path, _UNRECORDED)]
+    if len(changes) > limit:
+        changes = changes[:limit] + [f'{len(changes) - limit} more']
+    return changes
+
+
+def _uuids_sha256(uuids):
+    digest = hashlib.sha256()
+    for uuid in uuids:
+        digest.update(uuid.encode())
+        digest.update(b'\n')
+    return digest.hexdigest()
+
+
+def link_marker_selection(snapshot):
+    """The snapshot's selection as a marker records it: per kind the count
+    and digest of the sorted UUIDs, and the UUIDs themselves except for
+    tracks (which only the digest and selector describe)."""
+    selection = {}
+    for kind in KINDS:
+        uuids = sorted(obj.uuid for obj in snapshot.objects_of(kind))
+        entry = {'count': len(uuids), 'sha256': _uuids_sha256(uuids)}
+        if kind == 'track':
+            entry['selector'] = snapshot.request.selector(kind).provenance()
+        else:
+            entry['uuids'] = uuids
+        selection[kind] = entry
+    return selection
+
+
+@dataclasses.dataclass(frozen=True)
+class LinkState:
+    """The store state a refresh decision is made at: ``owner`` the
+    identity its positions belong to (None for a plain store without
+    positions), ``head`` the position the snapshot was read at, and
+    ``journal(after)`` the journal entries after a position up to ``head``
+    (the hub's on a hosted replica)."""
+    owner: str
+    head: int
+    journal: object
+
+
+@dataclasses.dataclass(frozen=True)
+class LinkPlan:
+    """How a refresh runs: 'skip' (the links are current), 'incremental'
+    (link ``new``, {kind: UUIDs}) or 'full', and why."""
+    mode: str
+    reason: str
+    new: dict = None
+
+    def line(self):
+        return f'link refresh: {self.mode}: {self.reason}'
+
+
+def plan_link_refresh(marker, state, key_parts, selection, selected, *, incremental):
+    """Decide how to refresh (LinkPlan) from the store's link marker.
+
+    Skip when the marker is this store's, was written by a full refresh
+    (any refresh, for an input update: ``incremental``) with the same key
+    (``key_parts``, link_marker_key_parts), the current ``selection`` is the marker's or a subset of it
+    (tracks: the same), and every journal entry since its position is for
+    an object outside ``selected`` (the current selection's UUIDs) and no
+    detector relationship or volume registration. With ``incremental``,
+    objects selected since the marker (created or newly selected) are
+    linked incrementally, provided the journal names no other selected
+    object. Anything else refreshes in full.
+    """
+    def full(reason):
+        return LinkPlan('full', reason)
+    if marker is None:
+        return full('the store has no link marker')
+    if marker.get('version') != LINK_MARKER_VERSION:
+        return full('the link marker has another format')
+    if marker.get('owner') != state.owner:
+        return full('the link marker describes other positions')
+    if marker.get('key') != content_sha256(key_parts):
+        recorded = marker.get('key_parts')
+        if recorded is None:
+            return full('the link inputs changed (the marker records no details)')
+        return full('the link inputs changed: ' + '; '.join(key_changes(recorded, key_parts)))
+    if not marker.get('exact') and not incremental:
+        return full('the last refresh was incremental')
+    position = int(marker['position'])
+    if position > state.head:
+        return full(f'the link marker is at position {position}, after the head {state.head}')
+    recorded = marker['selection']
+    if selection['track']['sha256'] != recorded['track']['sha256']:
+        return full('the track selection changed')
+    new = {}
+    for kind in KINDS:
+        if kind == 'track':
+            continue
+        added = sorted(set(selection[kind]['uuids']) - set(recorded[kind]['uuids']))
+        if added and not incremental:
+            return full(f'{len(added)} {KIND_LABELS[kind]} selected since position {position}')
+        if added:
+            new[kind] = added
+    fresh = {uuid for uuids in new.values() for uuid in uuids}
+    for entry in state.journal(position):
+        if entry['kind'] in DETECTOR_EDGE_KINDS:
+            return full(f'a {entry["kind"]} relationship changed at position {entry["seq"]}')
+        if entry['kind'] in FRAME_RECORD_KINDS:
+            return full(f'a volume registration changed at position {entry["seq"]}')
+        if entry['record_uuid'] in selected and entry['record_uuid'] not in fresh:
+            return full(f'selected {entry["kind"]} {entry["record_uuid"]} changed at position '
+                        f'{entry["seq"]}')
+    if fresh:
+        counts = ', '.join(f'{len(uuids)} {KIND_LABELS[kind]}' for kind, uuids in new.items())
+        return LinkPlan('incremental', f'new since position {position}: {counts}', new)
+    return LinkPlan('skip', f'unchanged since position {position}')
+
+
+@dataclasses.dataclass
+class LinkResult:
+    """A refresh's report ``lines`` and ``problems`` (refresh_report), its
+    LinkPlan, and the marker to record once its links are committed at a
+    position (``marker(position)``; None after a skip, which records none)."""
+    lines: list
+    problems: list
+    plan: LinkPlan
+    marker: object = None
+
+
+def _refresh(store, snapshot, config, lasagna, cache_directory, log, *, state=None,
+             incremental=False, progress=None):
+    """Refresh the links of a snapshot's selection (LinkResult).
+
+    With a ``state`` (LinkState of the store the snapshot was read from),
+    the store's link marker decides whether the detectors run at all
+    (plan_link_refresh; ``incremental`` for an input update);
+    object_store_full_link_refresh forces a full refresh. The caller
+    records ``result.marker(position)`` once the links are committed (and
+    published) at a position."""
+    normal = fiber_normal_source(config, lasagna, snapshot.volume_uuid)
+    log(normal.describe())
+    if normal.note:
+        log(normal.note)
+    selection = link_marker_selection(snapshot)
+    key_parts = link_marker_key_parts(snapshot.volume_uuid, config, normal)
+    if state is None:
+        plan = LinkPlan('full', 'the store records no link state')
+    elif config.get('object_store_full_link_refresh'):
+        plan = LinkPlan('full', 'object_store_full_link_refresh is set')
+    else:
+        plan = plan_link_refresh(store.link_marker(), state, key_parts, selection, snapshot.objects,
+                                 incremental=incremental)
+    log(plan.line())  # as decided, before any detector runs
+    if plan.mode == 'skip':
+        return LinkResult([f'link refresh: skipped every detector ({plan.reason})'], [], plan)
+    if (normal.kind == 'none' and snapshot.objects_of('fiber')
+            and snapshot.objects_of('surface')):
+        log('WARNING: fiber-patch links are refreshed centerline-only: the fit '
+            'loads no lasagna normals (input_use_normals with a Lasagna dataset '
+            'whose normals pack is in the cache) and object_store_normal_ct_path '
+            'is unset')
+    started = time.monotonic()
+    lines, problems = refresh_report(refresh_links(
+        store, snapshot, config, normal, cache_directory,
+        new=plan.new if plan.mode == 'incremental' else None, progress=progress, log=log))
+    lines = lines + [f'link refresh: {plan.mode} refresh ({plan.reason}) took '
+                     f'{time.monotonic() - started:.1f} s']
+    owner = None if state is None else state.owner
+
+    def marker(position):
+        return {'version': LINK_MARKER_VERSION, 'owner': owner, 'position': int(position),
+                'key': content_sha256(key_parts), 'key_parts': key_parts,
+                'exact': plan.mode == 'full', 'selection': selection}
+    return LinkResult(lines, problems, plan, marker)
+
+
+def _record_marker(store, result, position, lines):
+    """Record a refresh's marker at ``position``; a failure only loses the
+    next refresh's skip, so it is reported, not raised."""
+    if result.marker is None:
+        return
+    try:
+        store.set_link_marker(result.marker(position))
+    except Exception as exc:  # noqa: BLE001 - the links themselves are committed
+        lines.append(f'the link marker could not be recorded ({type(exc).__name__}: {exc}); '
+                     'the next refresh runs in full')
+
+
+@contextlib.contextmanager
+def reading_stage(progress, stage, detail=None):
+    """A store read as a progress stage of the input preparation:
+    ``progress`` (a spiral_progress.ProgressReporter, or None) shows
+    ``stage`` while the block runs. The reads report no steps; the stage's
+    elapsed time shows they are still running."""
+    if progress is None:
+        yield
+        return
+    progress.begin('preparing_inputs', stage, detail=detail)
+    try:
+        yield
+    finally:
+        progress.clear()
+
+
+def resolve_pinned(store, request, position, progress=None):
+    """resolve_selection at a pinned position, as a progress stage."""
+    with reading_stage(progress, f'Reading the inputs at position {position.sequence}',
+                       'selection'):
+        return resolve_selection(store, dataclasses.replace(request, position=position))
+
+
+@contextlib.contextmanager
+def _console_progress():
+    """Detector progress on stderr, for a refresh outside the service."""
+    from spiral_progress import ProgressReporter
+    reporter = ProgressReporter(stream=sys.stderr)
+    try:
+        yield reporter
+    finally:
+        reporter.close()
+
+
+def _position_owner(path):
+    """position_owner of the store at ``path``."""
+    from vc_object_store import ObjectStore
+    with ObjectStore.open(path, read_only=True) as store:
+        return position_owner(store)
+
+
+def _startup_phase(config, request, lasagna, cache_directory, log, minimum_position=None):
+    """Rank zero's startup: resolve the selection once, validate it and its
+    frames, then (unless refresh is off) run the detectors as
+    object_store_author. A store with positions (a hosted replica, or a
+    plain store a service shares) links and pins a position
+    (prepare_position) instead. Returns ``(selected UUIDs by kind, report
+    lines, InputPosition or None)``; raises ObjectStoreInputError on any
+    failure."""
+    from vc_object_store import ObjectStore
+
+    refresh = bool(config['object_store_refresh_links'])
+    author = config['object_store_author']
+    path = config['object_store_path']
+    pinned = config['object_store_input_position']
+    if pinned is not None:
+        # Prepared already (the service linked and pinned it): read it exactly.
+        owner = _position_owner(path)
+        if owner is None:
+            raise ObjectStoreInputError([
+                f'object store {path} records no positions; it has no position {pinned}'])
+        position = InputPosition(owner, int(pinned))
+        with ObjectStore.open(path, read_only=True) as store:
+            uuids = resolve_selection(store, dataclasses.replace(request, position=position))
+        return uuids, [f'reading pinned position {pinned}'], position
+    if _position_owner(path) is not None:
+        if not author:
+            raise ObjectStoreInputError([
+                f'object_store_author is required to link a position of the store {path}'])
+        with ObjectStore.open(path, author=author) as store, _console_progress() as progress:
+            prepared = prepare_position(store, config, request, lasagna=lasagna,
+                                        minimum=minimum_position,
+                                        cache_directory=cache_directory, log=log,
+                                        progress=progress)
+        return prepared.uuids, prepared.lines, prepared.position
+    if minimum_position is not None:
+        raise ObjectStoreInputError([
+            f'object store {path} records no positions; it has no position '
+            f'{minimum_position}'])
+    if refresh and not author:
+        raise ObjectStoreInputError([
+            'object_store_author is required to refresh links '
+            '(or set object_store_refresh_links false)'])
+    options = {'author': author} if refresh else {'read_only': True}
+    with ObjectStore.open(path, **options) as store, _console_progress() as progress:
+        # The head before the selection is read: a write in between shows
+        # in the journal after it and keeps the marker from being recorded.
+        head = store.journal_position()
+        with reading_stage(progress, 'Reading the selected inputs'):
+            uuids = resolve_selection(store, request)
+            snapshot = read_snapshot(store, request, uuids)
+        if not refresh:
+            return uuids, ['link refresh: off; reading the store\'s current relationships'], None
+        state = LinkState(None, head, lambda after: [
+            entry for entry in store.journal_since(after) if entry['seq'] <= head])
+        result = _refresh(store, snapshot, config, lasagna, cache_directory, log, state=state,
+                          progress=progress)
+        lines = result.lines
+        if not result.problems:
+            others = sorted({entry['author'] for entry in store.journal_since(head)
+                             if entry['author'] != author})
+            if others:
+                lines.append(f'{", ".join(others)} wrote while linking; no link marker recorded')
+            else:
+                _record_marker(store, result, store.journal_position(), lines)
+    if result.problems:
+        raise LinkRefreshError(result.problems)
+    return uuids, lines, None
+
+
+class PositionError(ObjectStoreInputError):
+    """No position could be linked and pinned; the active fit is kept."""
+
+
+@dataclasses.dataclass
+class PreparedPosition:
+    """A linked, pinned hub position: ``position`` (N) holds the hub head the
+    links were made at (``head``, H) plus this replica's links; ``minimum``
+    (M) is the position the caller asked to include."""
+    position: InputPosition
+    head: int
+    minimum: int
+    attempts: int
+    uuids: dict
+    lines: list
+
+
+def fit_volume_at(store, request, prepared, progress=None):
+    """The fit volume of a prepared position: the volume ``read_snapshot``
+    infers (or checks a configured one against) for the selection pinned
+    there, so it is the one the fit will read."""
+    pinned = dataclasses.replace(request, position=prepared.position)
+    with reading_stage(progress, f'Reading the inputs at position {prepared.position.sequence}',
+                       'fit volume'):
+        return read_snapshot(store, pinned, prepared.uuids).volume_uuid
+
+
+def _discard_unpublished(store):
+    """Restore the hub's relationships over this replica's unpublished
+    detector output (and any relationship conflicts): it was computed for
+    an older head, and a link to an object retired or deselected since
+    would never be replaced by relinking only the current selection. The
+    service replica writes only relationships, so nothing else is lost.
+    Returns report lines."""
+    try:
+        discarded = store.hub_revert()
+    except Exception as exc:  # noqa: BLE001 - the next attempt or update retries
+        return [f'unpublished detector writes could not be discarded: {exc}']
+    return ([f'discarded {discarded} unpublished detector write(s)'] if discarded else [])
+
+
+def _conditional_push(store, head):
+    """Publish this replica's links only on ``head``. An exception may have
+    lost the response of a publication that happened: the retry recognizes
+    it and reports its original position instead of a mismatch."""
+    try:
+        return store.hub_sync(pull=False, push=True, expected_head=head)
+    except Exception:  # noqa: BLE001 - reconcile once, then report
+        # Recovery matches the pushed records by value: if one was changed
+        # on the hub meanwhile, a publication that did land reads as a
+        # mismatch (``retried`` lets the caller say so).
+        return {**store.hub_sync(pull=False, push=True, expected_head=head), 'retried': True}
+
+
+def prepare_position(store, config, request, *, lasagna=None, minimum=None,
+                     cache_directory=None, log=print, attempts=4, incremental=False,
+                     progress=None):
+    """Link, then pin: the update loop of a hosted replica ``store`` (opened
+    read-write as the service's author; it must hold no other edits).
+
+    Pull the hub head H (at least ``minimum``, the position a client's edits
+    reached), refresh links over the whole selection at H, then publish them
+    only if the hub is still at H. Success pins N, H plus these links, which
+    later commits never change. A head mismatch (any commit after H,
+    related or not) or a conflict discards this replica's unpublished links
+    (the hub's side wins), pulls and relinks; ``attempts`` bounds the loop.
+    A detector failure or the bound raises, publishing nothing (and
+    discarding the links), and leaves the caller's active inputs alone.
+    With object_store_refresh_links off, the pulled head is the position.
+
+    The store's link marker lets the refresh skip the detectors when the
+    links at the head are current, and, with ``incremental`` (an input
+    update), link only objects selected since it (_refresh); the marker is
+    recorded only once the links are published. ``progress`` (a
+    spiral_progress.ProgressReporter) receives the detectors' progress.
+
+    A plain store that records positions (shared with the client's
+    processes on one machine) is linked in place instead
+    (_prepare_shared_position).
+    """
+    status = store.hub_status()
+    if status is None:
+        if store.store_positions() is None:
+            raise ObjectStoreInputError([
+                f'object store {store.path} records no positions (neither a hosted '
+                'replica nor a store a service shares)'])
+        return _prepare_shared_position(store, config, request, lasagna=lasagna, minimum=minimum,
+                                        cache_directory=cache_directory, log=log, attempts=attempts,
+                                        incremental=incremental, progress=progress)
+    hub = status['hub_replica']
+    refresh = bool(config['object_store_refresh_links'])
+    current = dataclasses.replace(request, position=None)
+    notes = []
+    for attempt in range(1, attempts + 1):
+        # Every attempt links from a clean head: earlier output, from a
+        # failed update or a previous attempt, is discarded first.
+        notes.extend(f'attempt {attempt}: {line}' for line in _discard_unpublished(store))
+        pulled = store.hub_sync(pull=True, push=False)
+        if pulled['conflicts']:
+            notes.append(f'attempt {attempt}: {len(pulled["conflicts"])} conflict(s) '
+                         'resolved to the hub')
+            continue
+        head = pulled['pulled_position']
+        if minimum is not None and head < minimum:
+            raise PositionError([
+                f'hub {hub} is at position {head}, before the requested position '
+                f'{minimum}; is this the hub the edits were pushed to?'])
+        if not refresh:
+            position, lines = head, [f'link refresh: off; pinning hub position {head}']
+            break
+        with reading_stage(progress, 'Reading the selected inputs', f'hub position {head}'):
+            snapshot = read_snapshot(store, current)
+        state = LinkState(hub, head, lambda after, head=head: store.hub_journal(after, head))
+        result = _refresh(store, snapshot, config, lasagna, cache_directory, log, state=state,
+                          incremental=incremental, progress=progress)
+        lines, problems = result.lines, result.problems
+        if problems:
+            raise LinkRefreshError(notes + problems + ['no links were published']
+                                   + _discard_unpublished(store))
+        try:
+            pushed = _conditional_push(store, head)
+        except Exception as exc:  # noqa: BLE001 - reported with what is known
+            raise PositionError(notes + lines + [
+                f'the links made at hub position {head} could not be confirmed as '
+                f'published ({type(exc).__name__}: {exc}); they may have reached the '
+                'hub. The fit is unchanged; the next update reconciles them']
+                + _discard_unpublished(store)) from exc
+        if pushed['conflicts']:
+            notes.append(f'attempt {attempt}: {len(pushed["conflicts"])} conflict(s) '
+                         'resolved to the hub')
+            continue
+        if pushed['head_mismatch']:
+            notes.append(f'attempt {attempt}: the hub moved from {head} to '
+                         f'{pushed["hub_head"]} while linking; relinking'
+                         + (' (the first publication\'s response was lost: it may have '
+                            'landed after the head and been changed since)'
+                            if pushed.get('retried') else ''))
+            continue
+        position = pushed['published_position']
+        lines = lines + [f'links published at hub position {position} (linked at {head})']
+        _record_marker(store, result, position, lines)
+        break
+    else:
+        raise PositionError(notes + [
+            f'inputs kept changing: no hub position could be linked in {attempts} '
+            'attempts; retry'] + _discard_unpublished(store))
+    pinned = InputPosition(hub, position)
+    if minimum is not None and position > minimum:
+        lines.append(f'position {position} includes hub commits after the requested {minimum}')
+    return PreparedPosition(
+        position=pinned, head=head, minimum=minimum, attempts=attempt,
+        uuids=resolve_pinned(store, request, pinned, progress),
+        lines=notes + lines)
+
+
+def _prepare_shared_position(store, config, request, *, lasagna, minimum, cache_directory,
+                             log, attempts, incremental=False, progress=None):
+    """prepare_position on a plain store others write as well (VC3D, on
+    the same machine). Detectors commit straight into the store, so there
+    is no conditional push: read the head H, link over the selection, and
+    pin the new head N only if every write after H is this service's own
+    (N is then H plus its links, as a conditional push would publish).
+    Another writer in between (a save, a deletion, an approval) relinks at
+    the new head; links already written stay as pending detector output,
+    which the next refresh replaces. ``attempts`` bounds the loop."""
+    owner = store.store_positions()['store']
+    author = config['object_store_author']
+    refresh = bool(config['object_store_refresh_links'])
+    current = dataclasses.replace(request, position=None)
+    notes = []
+    for attempt in range(1, attempts + 1):
+        head = store.store_positions()['position']
+        if minimum is not None and head < minimum:
+            raise PositionError([
+                f'store {owner} is at position {head}, before the requested position '
+                f'{minimum}; is this the store the edits were saved to?'])
+        if not refresh:
+            position, lines = head, [f'link refresh: off; pinning position {head}']
+            break
+        with reading_stage(progress, 'Reading the selected inputs', f'position {head}'):
+            snapshot = read_snapshot(store, current)
+        state = LinkState(owner, head, lambda after, head=head: [
+            entry for entry in store.journal_since(after) if entry['seq'] <= head])
+        result = _refresh(store, snapshot, config, lasagna, cache_directory, log, state=state,
+                          incremental=incremental, progress=progress)
+        lines, problems = result.lines, result.problems
+        if problems:
+            raise LinkRefreshError(notes + problems + [
+                'links the detectors committed stay as pending output; the next refresh '
+                'replaces them'])
+        after = store.store_positions()['position']
+        others = sorted({entry['author'] for entry in store.journal_since(head)
+                         if entry['seq'] <= after and entry['author'] != author})
+        if others:
+            notes.append(f'attempt {attempt}: {", ".join(others)} wrote while linking at '
+                         f'{head}; relinking')
+            continue
+        position = after
+        lines = lines + [f'links written at position {position} (linked at {head})']
+        _record_marker(store, result, position, lines)
+        break
+    else:
+        raise PositionError(notes + [
+            f'inputs kept changing: no position could be linked in {attempts} attempts; retry'])
+    pinned = InputPosition(owner, position)
+    if minimum is not None and head > minimum:
+        lines.append(f'position {position} includes commits after the requested {minimum}')
+    return PreparedPosition(
+        position=pinned, head=head, minimum=minimum, attempts=attempt,
+        uuids=resolve_pinned(store, request, pinned, progress),
+        lines=notes + lines)
+
+
+def _broadcast(value, dist):
+    if dist is None or not dist.is_distributed:
+        return value
+    import torch.distributed
+    holder = [value]
+    torch.distributed.broadcast_object_list(holder, src=0)
+    return holder[0]
+
+
+def _all_gather(value, dist):
+    if dist is None or not dist.is_distributed:
+        return [value]
+    import torch.distributed
+    gathered = [None] * dist.world_size
+    torch.distributed.all_gather_object(gathered, value)
+    return gathered
+
+
+# Configuration that shapes the materialized constraints, recorded in the
+# manifest so a resume can tell when they changed.
+MATERIALIZATION_KEYS = (
+    'z_begin', 'z_end', 'patch_loss_z_margin', 'patch_erode_patches',
+    'pcl_fiber_min_point_spacing', 'pcl_patch_overlap_pair_spacing',
+    'pcl_patch_overlap_max_pairs', 'pcl_unattached_pcl_min_point_spacing',
+    'pcl_use_fiber_links', 'pcl_vertical_fiber_min_z_fraction',
+    'pcl_vertical_fiber_min_auto_certainty', 'fit_volume_level', 'input_use_patch_overlaps',
+)
+
+
+def input_manifest(snapshot, config, normal_source, external_frames=None):
+    """The snapshot manifest extended with materialization settings,
+    external-input frames and the link-refresh mode."""
+    manifest = snapshot.manifest()
+    manifest['materialization'] = {key: config[key] for key in MATERIALIZATION_KEYS}
+    manifest['external_frames'] = dict(sorted((external_frames or {}).items()))
+    manifest['link_refresh'] = link_refresh_provenance(config, normal_source)
+    return manifest
+
+
+# Detector parameters a link refresh runs with (refresh_links), recorded so a
+# later change shows the fit's links as stale.
+LINK_PARAMETER_KEYS = ('pcl_link_distance_tolerance', 'pcl_link_window_points',
+                       'pcl_link_window_min_points')
+
+
+def link_refresh_provenance(config, normal_source):
+    """How links are refreshed: whether, with which detector parameters and
+    which fiber-patch normal source (its identity: kind, volume paths, level
+    and scale)."""
+    return {
+        'enabled': bool(config['object_store_refresh_links']),
+        'parameters': {key: config[key] for key in LINK_PARAMETER_KEYS},
+        'fiber_patch_normals': normal_source.provenance(),
+    }
+
+
+def stale_link_reasons(manifest, config, normal_source):
+    """Why the links a manifest's inputs consumed would not be the ones a
+    refresh makes now: changed detector parameters or normal source. Links
+    are results of the refresh, so these never change the digest; the next
+    refresh (an input update) relinks."""
+    recorded = (manifest or {}).get('link_refresh') or {}
+    current = link_refresh_provenance(config, normal_source)
+    reasons = []
+    if not recorded.get('enabled'):
+        return reasons
+    if 'parameters' not in recorded:
+        reasons.append('the fit predates recorded link parameters')
+    else:
+        reasons.extend(f'{key} changed from {recorded["parameters"].get(key)!r} to {value!r}'
+                       for key, value in current['parameters'].items()
+                       if recorded['parameters'].get(key) != value)
+    if recorded.get('fiber_patch_normals') != current['fiber_patch_normals']:
+        reasons.append('the fiber-patch normal source changed')
+    return reasons
+
+
+def _compared(manifest):
+    """The manifest without what does not define the inputs: the store's
+    local path, the replica-local revision UUIDs (REPLICA_LOCAL_FIELDS), how
+    links were refreshed (their results are recorded) and the position they
+    were read at (equal inputs at two positions are equal). Two replicas of
+    one store holding the same inputs compare equal."""
+    manifest = dict(manifest)
+    manifest['store'] = {'uuid': (manifest.get('store') or {}).get('uuid')}
+    manifest.pop('link_refresh', None)
+    manifest.pop('position', None)
+    for section, fields in REPLICA_LOCAL_FIELDS.items():
+        if section in manifest:
+            manifest[section] = [
+                {key: value for key, value in entry.items() if key not in fields}
+                for entry in manifest[section] or ()]
+    return manifest
+
+
+# Identities a manifest recorded before objects carried metadata hashes and
+# relationships their content: geometry revisions, relationship generations
+# and approval states only.
+_GEOMETRY_IDENTITY = {
+    'objects': ('uuid', 'kind', 'name', 'geometry_revision', 'scale_factor'),
+    'relationships': ('uuid', 'kind', 'family', 'approval_state', 'generation'),
+}
+
+
+def records_content_identity(manifest):
+    """Whether a manifest identifies objects and relationships by content
+    (metadata hashes, relationship content), as every manifest written since
+    replica-independent digests does."""
+    objects = (manifest or {}).get('objects') or ()
+    return all('metadata_sha256' in entry for entry in objects)
+
+
+def _geometry_identity(manifest):
+    manifest = dict(manifest)
+    for section, fields in _GEOMETRY_IDENTITY.items():
+        if section in manifest:
+            manifest[section] = [{key: entry.get(key) for key in fields}
+                                 for entry in manifest[section] or ()]
+    return manifest
+
+
+def track_identity(manifest):
+    """The tracks and track crossings a manifest records, by the identities
+    every replica shares (REPLICA_LOCAL_FIELDS left out): a fit consumes them
+    at build, so two manifests with different ones need a rebuild."""
+    compared = _compared(manifest)
+    return {
+        'objects': [entry for entry in compared.get('objects') or ()
+                    if entry.get('kind') == 'track'],
+        'relationships': [entry for entry in compared.get('relationships') or ()
+                          if entry.get('family') == 'track_crossing'],
+    }
+
+
+def input_summary(inputs):
+    """A small description of materialized inputs for a status poll: their
+    identity (digest, store, fit volume) and counts. The manifest holds the
+    per-object detail."""
+    manifest = inputs.manifest
+    return {
+        'digest': inputs.digest,
+        'store_uuid': manifest['store']['uuid'],
+        'volume_uuid': manifest['volume_uuid'],
+        'selection': {kind: entry['count']
+                      for kind, entry in manifest['selection'].items()},
+        'relationships': dict(sorted(Counter(
+            rel['family'] for rel in manifest['relationships']).items())),
+        'excluded_relationships': manifest['excluded_relationships'],
+        'constraints': dict(sorted(inputs.counts.items())),
+        'link_refresh': manifest['link_refresh']['enabled'],
+        'outer_shell': (manifest.get('outer_shell') or {}).get('uuid'),
+    }
+
+
+def manifest_digest(manifest):
+    text = json.dumps(_compared(manifest), sort_keys=True, separators=(',', ':'))
+    return hashlib.sha256(text.encode()).hexdigest()
+
+
+def manifest_differences(recorded, current):
+    """Names of the manifest entries (``section`` or ``section.key``) that
+    differ between two manifests."""
+    recorded, current = _compared(recorded), _compared(current)
+    differences = []
+    for key in sorted(set(recorded) | set(current)):
+        old, new = recorded.get(key), current.get(key)
+        if old == new:
+            continue
+        if isinstance(old, dict) and isinstance(new, dict):
+            differences.extend(f'{key}.{sub}' for sub in sorted(set(old) | set(new))
+                               if old.get(sub) != new.get(sub))
+        else:
+            differences.append(key)
+    return differences
+
+
+def resume_problems(checkpoint_input_manifest, inputs, allow_changed=False, log=print):
+    """Reasons a checkpoint may not resume against these frozen inputs.
+
+    The checkpoint must record the same inputs, frames and materialization
+    settings; ``allow_changed`` (object_store_allow_changed_inputs) resumes
+    anyway, with a warning naming what changed.
+    """
+    recorded = (checkpoint_input_manifest or {}).get('object_store')
+    if recorded is None:
+        problem = 'checkpoint records no object-store inputs'
+    else:
+        current = inputs.manifest
+        legacy = not records_content_identity(recorded)
+        if legacy:
+            # Written before inputs were identified by content: its object
+            # revisions name another replica's (or this one's older) records,
+            # and it holds no metadata hashes, so compare what it does hold.
+            recorded, current = _geometry_identity(recorded), _geometry_identity(current)
+        differences = manifest_differences(recorded, current)
+        if not differences:
+            if legacy:
+                log('WARNING: the checkpoint predates content-identified object-store '
+                    'inputs (metadata hashes, relationship content); compared on '
+                    'geometry revisions and relationship generations only')
+            return []
+        problem = ('checkpoint object-store inputs differ from this fit\'s in '
+                   + ', '.join(differences))
+    if allow_changed:
+        log(f'WARNING: {problem}; resuming anyway (object_store_allow_changed_inputs)')
+        return []
+    return [f'{problem}; set object_store_allow_changed_inputs to resume anyway']
+
+
+def load_fit_inputs(config, *, lasagna=None, external_frames=None, dist=None,
+                    cache_directory=None, log=print, minimum_position=None):
+    """Refresh, freeze and materialize a fit's object-store inputs.
+
+    Rank zero (the only process when ``dist`` is None or single-rank) runs
+    the one refresh phase unless object_store_refresh_links is off; the
+    other ranks wait for its result, and every rank fails when it fails.
+    On a hosted replica that phase links and pins a hub position, including
+    at least ``minimum_position`` (prepare_position), unless
+    object_store_input_position names the position to read. Every rank then reads
+    the now-immutable store (or position) read-only, materializes the same
+    frozen snapshot and closes the store; their manifests must agree before
+    anyone trains. Returns FitInputs carrying ``manifest`` and ``digest``.
+    """
+    from vc_object_store import ObjectStore
+
+    if not config['object_store_path']:
+        raise ObjectStoreInputError(['object_store_path is not configured'])
+    main = dist is None or dist.is_main_process
+    status = None
+    if main:
+        try:
+            uuids, lines, position = _startup_phase(
+                config, request_from_config(config), lasagna, cache_directory, log,
+                minimum_position)
+            status = {'ok': True, 'uuids': uuids, 'lines': lines,
+                      'position': position.provenance() if position else None}
+        except ObjectStoreInputError as error:
+            status = {'ok': False, 'problems': error.problems}
+        except Exception as error:  # noqa: BLE001 - other ranks must hear of it
+            status = {'ok': False, 'problems': [f'{type(error).__name__}: {error}']}
+    status = _broadcast(status, dist)
+    if not status['ok']:
+        raise LinkRefreshError(status['problems'])
+    if main:
+        for line in status['lines']:
+            log(line)
+
+    # Every rank reads and materializes on its own; a failure on any rank is
+    # gathered with the others' results, so all ranks fail together instead
+    # of some entering a collective the failed rank never joins.
+    inputs, outcome = None, None
+    request = dataclasses.replace(
+        request_from_config(config),
+        position=InputPosition.from_provenance(status['position']))
+    try:
+        with ObjectStore.open(config['object_store_path'], read_only=True) as store:
+            snapshot = read_snapshot(store, request, status['uuids'])
+            normal = fiber_normal_source(config, lasagna, snapshot.volume_uuid)
+            inputs = materialize_from_config(store, snapshot, config)
+        inputs.manifest = input_manifest(snapshot, config, normal, external_frames)
+        inputs.digest = manifest_digest(inputs.manifest)
+        outcome = {'digest': inputs.digest}
+    except ObjectStoreInputError as error:
+        outcome = {'problems': error.problems}
+    except Exception as error:  # noqa: BLE001 - other ranks must hear of it
+        outcome = {'problems': [f'{type(error).__name__}: {error}']}
+    outcomes = _all_gather(outcome, dist)
+    failed = [(rank, result['problems']) for rank, result in enumerate(outcomes)
+              if 'problems' in result]
+    if failed:
+        raise ObjectStoreInputError([
+            (f'rank {rank}: {problem}' if len(outcomes) > 1 else problem)
+            for rank, problems in failed for problem in problems])
+    digests = [result['digest'] for result in outcomes]
+    if len(set(digests)) > 1:
+        raise ObjectStoreInputError([
+            'ranks read different object-store inputs: '
+            + ', '.join(f'rank {rank} {digest[:12]}' for rank, digest in enumerate(digests))])
+    if main:
+        log(f'object-store inputs frozen: digest {inputs.digest[:16]}')
+    return inputs
+
+
+def describe_selection(config):
+    """snapshot_summary of the selection a fit configuration names, read
+    from its store as it stands: read-only, without refreshing links or
+    materializing anything, and without importing Torch. A selection the
+    fitter would refuse reports its problems instead of raising."""
+    from vc_object_store import ObjectStore
+    try:
+        request = request_from_config(config)
+        with ObjectStore.open(config['object_store_path'], read_only=True) as store:
+            return {'ok': True, **snapshot_summary(read_snapshot(store, request))}
+    except ObjectStoreInputError as error:
+        return {'ok': False, 'problems': error.problems}
+
+
+def _report_config(args):
+    from config import Config
+    overrides = {}
+    if args.config:
+        with open(args.config) as stream:
+            overrides = json.load(stream)
+    config = Config(overrides).as_dict()
+    config.update(z_begin=args.z_begin, z_end=args.z_end)
+    return config
+
+
+def _parse_args(argv):
+    parser = argparse.ArgumentParser(description=__doc__.split('\n\n')[0])
+    parser.add_argument('store')
+    parser.add_argument('--volume', help='fit volume UUID (default: inferred)')
+    parser.add_argument('--approved-only', action='store_true')
+    for kind, flag in _SELECTOR_CONFIG.items():
+        parser.add_argument(f'--{flag}-uuid', action='append', dest=f'{kind}_uuids')
+        parser.add_argument(f'--{flag}-tag', action='append', dest=f'{kind}_tags')
+    parser.add_argument('--z-begin', type=int,
+                        help='with --z-end, also materialize the constraints of this z window')
+    parser.add_argument('--z-end', type=int)
+    parser.add_argument('--config', help='fit configuration JSON overriding the defaults')
+    parser.add_argument('--json', help='write the manifest and report here')
+    return parser.parse_args(argv)
+
+
+def main(argv=None):
+    from vc_object_store import ObjectStore
+
+    args = _parse_args(argv)
+    selectors = {}
+    for kind in KINDS:
+        uuids, tags = getattr(args, f'{kind}_uuids'), getattr(args, f'{kind}_tags')
+        selectors[kind] = Selector(
+            tuple(uuids) if uuids is not None else None,
+            tuple(tags) if tags is not None else None)
+    request = InputRequest(selectors, args.volume, args.approved_only)
+    with ObjectStore.open(args.store, read_only=True) as store:
+        try:
+            snapshot = read_snapshot(store, request)
+            if args.z_begin is not None and args.z_end is not None:
+                lines = constraints_report(store, snapshot, _report_config(args))
+            else:
+                lines = snapshot_report(snapshot)
+        except ValueError as error:
+            for problem in getattr(error, 'problems', None) or [str(error)]:
+                print(f'error: {problem}', file=sys.stderr)
+            return 1
+    print('\n'.join(lines))
+    if args.json:
+        with open(args.json, 'w') as stream:
+            json.dump({'manifest': snapshot.manifest(),
+                       'digest': snapshot.digest(), 'report': lines},
+                      stream, indent=1)
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())

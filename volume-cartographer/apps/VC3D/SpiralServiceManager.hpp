@@ -1,13 +1,9 @@
 #pragma once
 
-#include "SpiralPclRole.hpp"
+#include "SpiralProjectInputs.hpp"
 #include "SpiralServiceProfile.hpp"
-#include "SpiralInputDraft.hpp"
-#include "SpiralInputCopy.hpp"
 #include <QSet>
-#include <QFutureWatcher>
 #include <QJsonArray>
-#include <QTemporaryDir>
 #include <memory>
 
 #include <QJsonObject>
@@ -19,7 +15,16 @@
 #include <QTimer>
 
 #include <array>
+#include <atomic>
 #include <functional>
+#include <memory>
+#include <optional>
+
+namespace vc::objects {
+class ObjectStoreSession;
+class PushHold;
+struct AttachmentIdentity;
+}
 
 class QNetworkAccessManager;
 class QNetworkReply;
@@ -48,7 +53,57 @@ public:
 
     // The one service API version this build speaks; the handshake refuses
     // anything else. Reported to the user so a mismatch is self-explanatory.
-    static constexpr int kApiVersion = 35;
+    static constexpr int kApiVersion = 45;
+
+    // The object store a service reads its fit inputs from, beside the one
+    // attached in this VC3D. Inputs are displayed as fitted only when both
+    // are the same store (the same UUID: a hub replica shares it). A service
+    // bound to a hub replica fits hub positions; it matches only a replica
+    // of the same hub (the hub identity), whose positions are comparable.
+    // A local service on a plain store shares the file with this VC3D and
+    // fits positions of the store itself.
+    struct StoreBinding {
+        QString serviceUuid;   // /bindings object_store.uuid
+        QString servicePath;   // where the service host opened it
+        QString serviceHub;    // the hub address on the service host
+        QString serviceHubIdentity;
+        qint64 servicePosition = -1;  // the service replica's last pull (a shared store's head)
+        QString servicePositionError;  // why it could not be read
+        // Whose positions the service fits: its hub's, or (a plain store
+        // shared in place) the store's own; empty when it fits none.
+        QString servicePositions;
+        // The attachment is the service's own store file: a local service
+        // on the same path, which saves reach without a hub.
+        bool sameFile = false;
+        QString localUuid;     // the attachment's store UUID
+        QString localPath;
+        QString localHub;      // the attachment's hub, when it is a replica
+        QString localHubIdentity;
+        qint64 localPosition = -1;    // the hub position the last sync reached
+        int localPending = 0;         // saved edits not yet pushed
+        int localConflicts = 0;
+        bool advertised() const { return !serviceUuid.isEmpty(); }
+        bool hosted() const { return !serviceHubIdentity.isEmpty(); }
+        bool localHosted() const { return !localHubIdentity.isEmpty(); }
+        bool matches() const
+        {
+            return advertised() && serviceUuid == localUuid
+                && (!hosted() || serviceHubIdentity == localHubIdentity);
+        }
+        // The service fits positions; a client can name one (its saved
+        // edits) when it replicates the service's hub or shares its file.
+        bool positioned() const { return !servicePositions.isEmpty(); }
+        bool shared() const { return positioned() && !hosted() && sameFile && matches(); }
+        bool canUpdate() const { return matches() && (hosted() || shared()); }
+        // Which stores are bound, without sync progress (positions, pending
+        // edits, conflicts), which every hub sync updates.
+        QStringList identity() const
+        {
+            return {serviceUuid, serviceHubIdentity, servicePositions, localUuid, localPath,
+                    localHubIdentity, matches() ? QStringLiteral("matches") : QString(),
+                    shared() ? QStringLiteral("shared") : QString()};
+        }
+    };
 
     explicit SpiralServiceManager(QObject* parent = nullptr);
     ~SpiralServiceManager() override;
@@ -65,23 +120,70 @@ public:
 
     bool isReady() const { return _connectionState == ConnectionState::Ready; }
     bool hasActiveSession() const { return _hasActiveSession; }
-    QJsonObject advertisedDataset() const { return _advertisedDataset; }
+    // GET /bindings: the service's host-owned output/cache roots, its
+    // winding-inference binding, capabilities, store binding and checkpoints.
+    QJsonObject advertisedBindings() const { return _advertisedBindings; }
+    // Whether the service can run winding-model supervision (a usable
+    // --winding-inference artifact is bound on its host), and if not, why.
+    bool windingInferenceAvailable(QString* reason = nullptr) const;
+    // The "project" block every initialize and rebuild carries
+    // (SpiralProjectInputs), made from the project's Lasagna dataset that
+    // `lasagna` gives: the service reads the project's facts and umbilicus
+    // from it, not from the project file. Either throws when the project
+    // cannot be described; the request is then not sent.
+    void setProjectSource(
+        std::function<std::optional<vc3d::spiral::ProjectLasagna>()> lasagna,
+        std::function<QJsonObject(const std::optional<vc3d::spiral::ProjectLasagna>&)> block)
+    {
+        _projectLasagna = std::move(lasagna);
+        _projectSource = std::move(block);
+    }
     const SpiralServiceProfile& profile() const { return _profile; }
     bool ownsProcess() const;
     qint64 displayedPreviewSourceIteration() const
     {
         return _displayedPreviewSourceIteration;
     }
+    QString displayedPreviewInputDigest() const { return _displayedPreviewInputDigest; }
+    qint64 displayedPreviewInputPosition() const { return _displayedPreviewInputPosition; }
 
-    // Create the first resident session. The service exposes dataset and
+    // Create the first resident session. The service exposes its bindings and
     // checkpoint discovery before this without importing the fit runtime.
     void initializeSession(QJsonObject request);
     // Replace an initialized session. This is also the only later verb that
     // may change the model domain or structural configuration.
-    void rebuildSession(QJsonObject request);
+    // ``reloadInputs`` asks for the whole build, which rereads the service's
+    // object store, even when the request changes nothing else.
+    void rebuildSession(QJsonObject request, bool reloadInputs = false);
     // Rebuild from the service's own launch defaults, ignoring any autosave.
     // This is how a service stuck in Error recovers.
     void rebuildWithDefaults();
+
+    // One "Update fit inputs": the resident fit's inputs replaced in place
+    // (or a rebuild) at a position. Needs a service that fits positions and
+    // either a replica of its hub or its own store file attached here
+    // (storeBinding().canUpdate()).
+    struct InputUpdate {
+        qint64 requested = -1;  // M: where this store's saved (pushed) edits reached
+        qint64 head = -1;       // H: the head the service linked at
+        qint64 fitted = -1;     // N: H plus the service's links; the fit's inputs
+        QString error;          // empty on success
+        QStringList problems;   // the service's reasons, or the hub conflicts
+        bool conflicts = false; // hub conflicts blocked the push
+        // Commits the position includes beyond M by other writers, and
+        // commits after N (excluded: they show as stale).
+        QStringList includedBeyondRequested;
+        QStringList afterFitted;
+    };
+    // Hold this replica's background pushes, push its saved edits and wait
+    // (stopping on hub conflicts), then initialize or rebuild the fit from a
+    // hub position including them; finally release the hold and pull to the
+    // position the service fitted. ``request`` is the panel's session request.
+    // With an idle resident fit this updates its inputs in place
+    // (POST /session/update-inputs: model and optimiser state are kept);
+    // without a session it initializes one, and a failed session is rebuilt.
+    void updateFitInputs(QJsonObject request);
+    bool inputUpdateActive() const { return _inputUpdateActive; }
     void runIterations(int iterations, const QJsonObject& runConfig,
                        const QJsonObject& dtLossSchedule,
                        const QJsonObject& previewSchedule = {});
@@ -91,9 +193,28 @@ public:
     // Download checkpoint: creates a checkpoint on the service, registers it
     // as an artifact, and streams it to a VC3D-local path.
     void downloadCheckpoint(const QString& localPath);
-    // Every checkpoint the service says it can load: GET /dataset's
-    // session_checkpoints (newest first) followed by detected_checkpoints.
+    // Every checkpoint the service says it can load: GET /bindings'
+    // session_checkpoints (newest first).
     QStringList serviceCheckpoints() const;
+    // The store this VC3D has attached. A local service is launched bound to
+    // it (and relaunched when it changes); any service is compared with it.
+    void setObjectStore(std::shared_ptr<vc::objects::ObjectStoreSession> session,
+                        std::optional<vc::objects::AttachmentIdentity> attachment,
+                        const QString& unavailableReason = {});
+    const StoreBinding& storeBinding() const { return _storeBinding; }
+    // Re-read the attachment's hub state (its sync position), e.g. after a
+    // hub session event.
+    void refreshLocalHub();
+    // Where this machine reaches the service's hub: the profile's hub
+    // address, else for an SSH profile the advertised path on its host
+    // (sftp://destination/path), else the advertised address itself.
+    QString serviceHubAddress() const;
+    // The local service's own replica of the attachment's hub (under the
+    // output root, by hub identity): client and service never share one.
+    static QString localServiceReplica(const QString& outputRoot, const QString& hubIdentity);
+    // Configuration keys the service's launch binding owns
+    // (schema.fields[*].service_owned): requests never choose them.
+    const QSet<QString>& serviceOwnedKeys() const { return _serviceOwnedKeys; }
     // Load a checkpoint into the fit. Exactly one of hostPath (a checkpoint
     // the service advertised) and localPath (a file on this machine, uploaded
     // first) is set; the service, which owns the filesystem, resolves it
@@ -112,36 +233,15 @@ public:
     // after the surface, so this follows what the panel is displaying rather
     // than being on by default.
     void setPreviewDiagnostics(bool enabled) { _previewDiagnosticsWanted = enabled; }
-    void commitInputs();
-    void applyInputDrafts(bool commit = false, const QStringList& selection = {});
-    void refreshInputCatalog();
-    QJsonArray inputDraftStatus() const;
-    bool hasInputDrafts() const;
-    bool ownsInputWorkspace() const { return _inputOwner; }
-    void restoreInputDraft(const QString& id);
-    void editInputDraft(const QString& id);
-    void resolveInputConflict(const QJsonObject& conflict, const QString& action);
-    void discardInputDraft(const QString& id);
-    void discardInputWorkspace(std::function<void()> done);
-    void releaseInputWorkspace(std::function<void()> done);
-    void invalidateWorkingCopy(const QString& source);
-    void workingCopyAsync(const QString& source, FetchPreviewFileCallback done);
-    QString workingCopy(const QString& source, QString* error = nullptr);
-    QString inputWorkspaceId() const { return _inputWorkspaceId; }
-    void setInputSelection(const QStringList& ids) { _inputSelection = ids; _inputSelectionExplicit = true; }
+    // How input changes reach a fit: saved in the store, then an input update
+    // (or, without a hub, a rebuild with current inputs).
+    static QString inputChangesMessage();
+    // Whether this client holds the service's session lease, which every
+    // mutating request needs.
+    bool ownsSessionLease() const { return _leaseOwner; }
+    void releaseSessionLease(std::function<void()> done);
+    QString sessionLeaseId() const { return _sessionLeaseId; }
 
-    void stagePatch(const QString& directory, const QString& inputId, bool deleted = false);
-    void stageJsonInput(const QString& kind, const QString& filePath,
-                         const QString& inputId, const QString& role = {});
-    // Stage a revision of an existing editable point collection.
-    void stagePclReplacement(vc3d::spiral::PclRole role,
-                              const QString& filePath,
-                              const QString& inputId,
-                              const QString& operation,
-                              const QString& targetCollectionId,
-                              const QString& sourceIdentity = {});
-    // Stage a deletion; Apply removes supervision and Commit persists it.
-    void removeInputDraft(const QString& inputId);
     // Fetch a file intentionally omitted from the initial preview transfer.
     // Only files declared by the currently installed diagnostics artifact are
     // accepted by the cache.
@@ -149,18 +249,11 @@ public:
                           FetchPreviewFileCallback done);
 
 signals:
-    void inputPreparationProgress(const QString& message);
-    void inputCopyProgress(int activeCopies, const QString& message);
-    void inputDraftsChanged();
-    void inputWorkspaceReleased();
-    void inputDraftStaged(const QString& alias);
-    void inputDraftDiscarded(const QString& alias);
-    void inputConflict(const QJsonObject& conflict);
-    void inputEditorRequested(const QJsonObject& input, const QString& workingPath);
-    void inputBatchFinished(const QString& error);
+    void sessionLeaseReleased();
+    void storeBindingChanged();
     void connectionStateChanged(SpiralServiceManager::ConnectionState state,
                                 const QString& message);
-    void datasetResolved(const QJsonObject& resolution);
+    void bindingsAdvertised(const QJsonObject& bindings);
     void configurationCatalogChanged(const QJsonObject& catalog);
     // Emitted once when this connection first observes a resident session,
     // whether VC3D loaded it or attached after another client did.
@@ -174,11 +267,10 @@ signals:
     // service as a second artifact once the surface was on its way.
     void previewDiagnosticsAvailable(const QString& manifestPath,
                                      qint64 generation);
-    // Immutable display-only PCL snapshot of one editable role resolved by
-    // the service. The descriptor carries the source coordinate domain.
-    void pclArtifactAvailable(vc3d::spiral::PclRole role,
-                              const QString& manifestPath,
-                              const QJsonObject& artifactRef);
+    // The current session's input manifest (object_store_inputs.json: the
+    // digest and every object and relationship the fit froze, with revision
+    // pins), downloaded from the service's input manifest artifact.
+    void inputManifestAvailable(const QString& manifestPath, const QString& digest);
     void previewTransferProgress(const QString& phase, const QString& fileName,
                                  int filesComplete, int totalFiles,
                                  qint64 bytesReceived, qint64 totalBytes);
@@ -195,22 +287,20 @@ signals:
     void checkpointLoadRefused(const QString& hostPath, const QString& localPath,
                                const QStringList& reasons, const QString& stage,
                                const QString& message);
-    void inputUploadFinished(const QString& inputId, const QString& error);
-    void commitInputsFinished(const QStringList& committedIds, const QString& error);
     void logMessage(const QString& message);
     void errorOccurred(const QString& message);
+    // Update fit inputs: a phase ("pushing", "linking", "pulling") as it
+    // starts, then the outcome.
+    void inputUpdateProgress(const QString& phase, const QString& text);
+    void inputUpdateFinished(const SpiralServiceManager::InputUpdate& update);
 
 private:
-    friend class SpiralInputWorkflowTests;
-    void copyInputAsync(const QString& source, FetchPreviewFileCallback done, bool reuseWorkingCopy);
-    void fetchInputContent(const QString& id, quint64 revision, const QString& kind,
-                           std::function<void(const QString&)> done);
     // Per-operation-class request timeouts: a single global timeout is wrong.
     enum class Timeout : int {
         Quick = 5000,          // health checks and status polls
         Command = 30000,       // run/stop and small mutations
         LongCommand = 240000,  // save-checkpoint blocks up to two minutes
-        Load = 600000,         // session load tears down and validates datasets
+        Load = 600000,         // session load tears down and validates inputs
     };
 
     // Failure callback that also receives the parsed error body, for
@@ -251,67 +341,50 @@ private:
     void pollEvents();
     void handleStatus(const QJsonObject& status);
     void syncArtifacts(const QJsonObject& status);
-    void fetchAdvertisedDataset();
+    void fetchAdvertisedBindings();
     QString commandId();
     QString endpointFingerprint() const;
-    struct DraftTransfer {
-        QString id, directory, uploadId;
-        QJsonObject manifest;
-    };
-    struct DraftCommand {
-        vc3d::spiral::InputDraftBatch batch;
-        QVector<DraftTransfer> transfers;
-        QJsonObject request;
-        QJsonArray revisions;
-        QStringList localDeletions;
-        QString commitId;
-        bool commit = false;
-        bool applied = false;
-        bool preparing = true;
-        QString preparationError;
-        std::shared_ptr<QTemporaryDir> directory;
-    };
-    void stageInput(const QString& kind, const QString& path, const QString& alias,
-                    const QString& role = {}, const QString& targetCollection = {}, bool deleted = false,
-                    const QString& sourceIdentity = {});
-    void resumeInputCommand();
-    void transferInput(int index);
-    void sendInputChanges();
-    void finishInputChanges(const QJsonObject& response);
-    void persistInputCommand();
-    void failInputCommand(const QString& error, const QJsonObject& body = {});
-    void finishInputCommand();
-    void installInputCatalog(const QJsonArray& inputs);
-    void claimInputWorkspace();
-    void clearInputWorkspace();
-    QString logicalInputId(const QString& kind, const QString& alias,
-                           const QString& role, const QString& targetCollection,
-                           const QString& sourceIdentity);
-    QMap<QString, std::shared_ptr<vc3d::spiral::InputDraft>> _inputDrafts;
-    QMap<QString, QJsonObject> _inputCatalog;
-    QStringList _inputOrder;
-    mutable QJsonArray _inputRowsCache;
-    mutable bool _inputRowsDirty = true;
-    QMap<QString, QString> _inputAliases;
-    QMap<QString, QString> _inputErrors;
-    QMap<QString, QString> _workingCopies;
-    QMap<QString, QSet<QString>> _inputWorkingCopySources;
-    QMap<QString, std::shared_ptr<QTemporaryDir>> _workingCopyDirectories;
-    QMap<QString, QFutureWatcher<vc3d::spiral::InputCopyResult>*> _workingCopyJobs;
-    quint64 _workingCopyGeneration = 0;
-    void cancelWorkingCopies();
-    void reportInputPreparation(const QString& message);
-    QStringList _inputSelection;
-    bool _inputSelectionExplicit = false;
-    QString _inputWorkspaceId;
-    bool _inputOwner = false;
-    bool _inputCommandBusy = false;
-    std::shared_ptr<DraftCommand> _inputCommand;
-    std::function<void()> _afterInputCommand;
-    vc3d::spiral::InputDraftSubmission _inputSubmission;
-    QTemporaryDir _inputCopies;
+    void claimSessionLease();
+    void clearSessionLease();
+    void updateStoreBinding();
+    void updateSameFile();
+    // A store's journal head: the position a shared store's saves reached.
+    static qint64 storeHead(vc::objects::ObjectStoreSession&, const vc::objects::AttachmentIdentity&);
+    QString _sessionLeaseId;
+    bool _leaseOwner = false;
+    // Update fit inputs in flight: its push hold, released when it finishes.
+    bool _inputUpdateActive = false;
+    // The resident session's state and input generation, as last reported.
+    QString _sessionState;
+    qint64 _inputGeneration = 0;
+    qint64 _forwardSyncPosition = -1;  // the fitted position a sync was last asked to reach
+    std::shared_ptr<vc::objects::PushHold> _inputUpdateHold;
+    // Each update's callbacks carry its serial; abandoning one (the
+    // connection changed under it) bumps the serial, so the late callbacks
+    // of the abandoned update are ignored.
+    quint64 _inputUpdateSerial = 0;
+    void finishInputUpdate(InputUpdate update, quint64 serial);
+    void sendInputUpdate(QJsonObject request, qint64 requested, quint64 serial);
+    // The attachment an update holds pushes on: its hold ends with it.
+    std::unique_ptr<vc::objects::AttachmentIdentity> _inputUpdateAttachment;
+    void abandonInputUpdate(const QString& reason);
     void sendRebuildRequest(QJsonObject request);
     void sendInitializeRequest(QJsonObject request);
+    // Adds the project block to `body`; the error when it cannot be read.
+    // Add the project block to `body`, then `send` it. A service on this host
+    // that builds missing Lasagna packs is given the project's remote arrays
+    // as their read-through cache directories, filled first when a pack it
+    // lacks needs them; `failed` says why the request was not sent.
+    void withProject(QJsonObject body, std::function<void(QJsonObject)> send,
+                     std::function<void(const QString&)> failed);
+    // Cache `groups` (remote Lasagna arrays `lasagna` packs from), then
+    // finish(body, cached); fails through `failed`.
+    void cacheLasagnaThenSend(
+        QJsonObject body, const vc3d::spiral::ProjectLasagna& lasagna,
+        const vc3d::spiral::ProjectLasagna& cached,
+        std::vector<vc::lasagna::LasagnaChannelGroup> groups,
+        std::function<void(QJsonObject, const std::optional<vc3d::spiral::ProjectLasagna>&)> finish,
+        std::function<void(const QString&)> failed);
     void prepareSessionRequest(QJsonObject request, bool initialize);
     void sendLoadCheckpoint(QJsonObject body, const QString& hostPath,
                             const QString& localPath);
@@ -324,7 +397,14 @@ private:
 
     SpiralServiceProfile _profile;
     QProcess* _process = nullptr;       // owned local service process, if any
-    QStringList _ownedLaunchBinding;    // --dataset/--output/--cache of _process
+    QStringList _ownedLaunchBinding;    // --output/--cache/--object-store/--winding-inference of _process
+    bool _waitingForLocalStore = false;
+    std::weak_ptr<vc::objects::ObjectStoreSession> _storeSession;
+    std::unique_ptr<vc::objects::AttachmentIdentity> _storeAttachment;
+    QString _localStorePath;
+    QString _localStoreUnavailableReason;
+    StoreBinding _storeBinding;
+    QSet<QString> _serviceOwnedKeys;
     QNetworkAccessManager* _network = nullptr;
     SpiralSshTunnel* _tunnel = nullptr;
     SpiralArtifactCache* _artifactCache = nullptr;
@@ -341,7 +421,11 @@ private:
     bool _eventsInFlight = false;
     int _eventFailures = 0;
     qint64 _lastEventCursor = 0;
-    QJsonObject _advertisedDataset;
+    QJsonObject _advertisedBindings;
+    std::function<std::optional<vc3d::spiral::ProjectLasagna>()> _projectLasagna;
+    std::function<QJsonObject(const std::optional<vc3d::spiral::ProjectLasagna>&)> _projectSource;
+    // Set to stop the Lasagna arrays being cached for a request; one at a time.
+    std::shared_ptr<std::atomic<bool>> _lasagnaCacheCancel;
     QJsonObject _configurationDefaults;
     QJsonObject _appliedConfiguration;
     qint64 _sessionRevision = 0;
@@ -354,20 +438,22 @@ private:
     QString _installedPreviewArtifact;
     QString _installedPreviewSession;
     qint64 _displayedPreviewSourceIteration = -1;
+    QString _displayedPreviewInputDigest;
+    qint64 _displayedPreviewInputPosition = -1;
     QString _fetchingPreviewArtifact;
     QString _installedDiagnosticsArtifact;
     QString _fetchingDiagnosticsArtifact;
-    // Per editable PCL role, indexed by vc3d::spiral::pclRoleIndex.
-    std::array<QString, vc3d::spiral::kEditablePclRoles.size()> _installedPclArtifact;
-    std::array<QString, vc3d::spiral::kEditablePclRoles.size()> _fetchingPclArtifact;
+    QString _installedInputManifest;
+    QString _fetchingInputManifest;
     bool _previewDiagnosticsWanted = false;
     QString _fetchingCheckpointArtifact;
-    std::array<quint64, vc3d::spiral::kEditablePclRoles.size()> _pclSequence{};
     qint64 _previewSequence = 0;
     QString _lastPreviewLocalPath;
     QString _lastDiagnosticsLocalPath;
-    std::array<QString, vc3d::spiral::kEditablePclRoles.size()> _lastPclLocalPath;
+    QString _lastInputManifestLocalPath;
     QString _synchronizedSessionId;
 
-    QStringList pclArtifactCachePins() const;
+    QStringList artifactCachePins() const;
 };
+
+Q_DECLARE_METATYPE(SpiralServiceManager::InputUpdate)

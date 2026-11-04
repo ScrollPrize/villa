@@ -69,7 +69,11 @@ std::vector<AttachedCollection> volumeCollections(ObjectStoreSession&, const Att
 std::vector<AttachedCollection> pointCollections(const ObjectStore&, const Txn&, const std::vector<std::string>& uuids,
                                                  const VolumeVoxels& volume);
 // In one commit: `changed` (in `volume`) are created, bound to `volume`, or
-// revised keeping their points' identity; `removed` are retired.
+// revised keeping their points' identity; `removed` are retired. `expected`
+// pins objects at the revisions an edit started from (null: the edit creates
+// it); the commit refuses when one has moved on. Unpinned objects are pinned
+// at their current revisions.
 void writeVolumeCollections(ObjectStoreSession&, const AttachmentIdentity&, const VolumeVoxels& volume,
-                            const std::vector<AttachedCollection>& changed, const std::vector<std::string>& removed);
+                            const std::vector<AttachedCollection>& changed, const std::vector<std::string>& removed,
+                            const RevisionSelection& expected = {});
 }

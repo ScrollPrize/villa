@@ -40,6 +40,8 @@ class SpiralPanel : public QWidget
     Q_OBJECT
 public:
     explicit SpiralPanel(SpiralServiceManager* service, QWidget* parent = nullptr);
+    // Auto-connect the built-in local profile only on the workspace's first use.
+    void activateWorkspace();
     QComboBox* volumeSelectionControl() const
     {
         return _volumeSelector ? _volumeSelector->comboBox() : nullptr;
@@ -48,10 +50,17 @@ public:
     void setLossMapLegend(const QString& text);
     void setLocalPatchDrafts(const QJsonArray& drafts);
     void setLocalDraftsReady(bool ready);
+    // Update Fit Inputs, as its button does (after saving drafts).
+    void requestInputUpdate() { startInputUpdate(true); }
+    // Whether the store still holds the fitted inputs as fitted, and what
+    // changed since; shown with the session's input summary.
+    void setInputFreshness(const QString& text);
     // Enables the Display toggle of one editable PCL role's overlay; an
     // unavailable overlay is unchecked and explains itself in the tooltip.
     void setPclOverlayAvailable(vc3d::spiral::PclRole role, bool available,
                                 const QString& reason = {});
+    // The same for the fitted-fiber overlay.
+    void setFiberOverlayAvailable(bool available, const QString& reason = {});
     [[nodiscard]] double pointViewTolerance() const;
     void setSessionExitGuard(
         std::function<void(std::function<void()>)> guard) { _sessionExitGuard = std::move(guard); }
@@ -67,9 +76,13 @@ signals:
     void surfaceIntersectionsChanged(bool shown);
     void surfaceOverlapChanged(bool shown);
     void pclOverlayChanged(vc3d::spiral::PclRole role, bool shown);
+    void fiberOverlayChanged(bool shown);
     void pointViewToleranceChanged(double tolerance);
     void pythonOutputRequested();
     void removeLocalPatchRequested(const QString& id);
+    // Clone the service's hub to a local replica (prefilled with its address
+    // as this machine reaches it) and attach that.
+    void cloneHubRequested(const QString& hubAddress);
     void addDraftsRequested(bool commitAfterAdd);
 
 private:
@@ -82,7 +95,7 @@ private:
     void applyDescriptions();
     QLineEdit* addPathRow(QFormLayout* form, const QString& key, const QString& label,
                           bool directory);
-    void addPclItem(const QString& path, const QString& role, bool required = false);
+    void updateObjectStoreSummary();
     QJsonObject sessionRequest() const;
     QJsonObject sessionAdvancedConfig() const;
     QJsonObject runAdvancedConfig() const;
@@ -90,11 +103,16 @@ private:
     void syncTrackSamplingControlsFromAdvanced();
     void updateTrackSamplingUi();
     void syncVerticalFiberOffsetControls(const QJsonObject& effectiveConfig);
+    void syncOutwardSense(const QJsonObject& effectiveConfig);
+    void syncFitVolumeLevel(const QJsonObject& effectiveConfig);
     void applySessionRunConfig(const QJsonObject& config, qint64 sessionGeneration);
     void synchronizeSession(const QJsonObject& request,
                             const QJsonObject& status);
-    void applyResolution(const QJsonObject& resolution, bool force);
-    void applyScrollSpec(const QJsonObject& spec);
+    void applyBindings(const QJsonObject& advertisement);
+    void resetScrollSummaries();
+    // The scroll the session fits and its project volume (its request's
+    // "scroll" and "project").
+    void applySessionScroll(const QJsonObject& request);
     void updateStatus(const QJsonObject& status);
     void updateWarnings(const QJsonObject& status);
     void refreshInputVisibility();
@@ -118,6 +136,7 @@ private:
     void guardSessionExit(std::function<void()> action);
 
     SpiralServiceManager* _service = nullptr;
+    bool _workspaceUsed = false;
     SpiralDescriptions* _descriptions = nullptr;
     QHash<QWidget*, QString> _descriptionIds;
     QHash<QWidget*, QString> _toolTipNotes;
@@ -129,6 +148,7 @@ private:
     QSpinBox* _maximumDisplayedWinding = nullptr;
     QCheckBox* _showSurfaceIntersections = nullptr;
     std::array<QCheckBox*, vc3d::spiral::kEditablePclRoles.size()> _showPclOverlays{};
+    QCheckBox* _showFiberOverlay = nullptr;
     QDoubleSpinBox* _pointViewTolerance = nullptr;
     QComboBox* _lossMap = nullptr;
     QCheckBox* _lossMapDiagnostics = nullptr;
@@ -136,25 +156,26 @@ private:
     QLabel* _lossMapLegend = nullptr;
     QSpinBox* _zBegin = nullptr;
     QSpinBox* _zEnd = nullptr;
+    QSpinBox* _fitVolumeLevel = nullptr;
     QSpinBox* _iterations = nullptr;
     QCheckBox* _backgroundPreview = nullptr;
     QSpinBox* _previewCadence = nullptr;
     QSpinBox* _renderVolumeScale = nullptr;
-    // Read-only reports of what spiral-scroll.json specifies.
+    // Read-only reports of the project's scroll facts and Lasagna dataset.
     QLabel* _scrollSummary = nullptr;
     QLabel* _lasagnaSummary = nullptr;
+    // Whether the service can run winding-model supervision (its bound
+    // --winding-inference artifact), from /bindings.
+    QLabel* _windingInferenceSummary = nullptr;
+    QComboBox* _outwardSense = nullptr;
     // The checkpoint the resident fit was built from, reported by the service
     // and carried back in later rebuild requests.
     QString _sessionCheckpoint;
     QLabel* _sessionCheckpointLabel = nullptr;
     QComboBox* _checkpointChoice = nullptr;
     QLineEdit* _runTag = nullptr;
-    QLineEdit* _pclPath = nullptr;
-    QListWidget* _pclList = nullptr;
-    QComboBox* _pclRole = nullptr;
-    QPushButton* _removePcl = nullptr;
-    QPushButton* _addPclButton = nullptr;
-    QToolButton* _browsePclButton = nullptr;
+    QLabel* _objectStoreSummary = nullptr;
+    QPushButton* _cloneHub = nullptr;
     QCheckBox* _savePngVisualizations = nullptr;
     QCheckBox* _trackLengthBinSampling = nullptr;
     QCheckBox* _verticalFiberOffsetEnabled = nullptr;
@@ -167,6 +188,12 @@ private:
     QPlainTextEdit* _advanced = nullptr;
     VolumeSelector* _volumeSelector = nullptr;
     QPushButton* _load = nullptr;
+    QPushButton* _updateInputs = nullptr;
+    QLabel* _positionSummary = nullptr;
+    QString _inputUpdateText;
+    void updatePositionSummary();
+    void startInputUpdate(bool confirm);
+    void updateDraftActions();
     QPushButton* _run = nullptr;
     QCheckBox* _dtLossScheduleEnabled = nullptr;
     QSpinBox* _dtLossLastPct = nullptr;
@@ -174,12 +201,12 @@ private:
     QPushButton* _save = nullptr;
     QPushButton* _downloadCheckpoint = nullptr;
     QPushButton* _loadCheckpoint = nullptr;
-    QLineEdit* _datasetRoot = nullptr;
     QLineEdit* _outputRoot = nullptr;
     QLineEdit* _cacheRoot = nullptr;
-    QWidget* _datasetRow = nullptr;
+    QLineEdit* _windingInferenceRoot = nullptr;
     QWidget* _outputRow = nullptr;
     QWidget* _cacheRow = nullptr;
+    QWidget* _windingInferenceRow = nullptr;
     QLabel* _checkpointDownloadStatus = nullptr;
     QProgressBar* _checkpointDownloadProgress = nullptr;
     QTimer* _checkpointDownloadTimer = nullptr;
@@ -198,14 +225,12 @@ private:
     QLineEdit* _sshDestination = nullptr;
     QSpinBox* _sshPort = nullptr;
     QLineEdit* _apiKey = nullptr;
-    QLineEdit* _mapLocalRoot = nullptr;
     QLabel* _connectionStatus = nullptr;
     QPushButton* _connectButton = nullptr;
     QPushButton* _disconnectButton = nullptr;
     QWidget* _endpointRow = nullptr;
     QWidget* _sshRow = nullptr;
     QWidget* _apiKeyRow = nullptr;
-    QWidget* _mappingRow = nullptr;
 
     // Input drafts
     QListWidget* _inputList = nullptr;
@@ -213,6 +238,10 @@ private:
     QPushButton* _addInputs = nullptr;
     QPushButton* _removeInput = nullptr;
     QLabel* _commitHint = nullptr;
+    QLabel* _fitInputs = nullptr;
+    QString _inputFreshness;
+    QJsonObject _lastInputSummary;
+    void updateFitInputs();
     QJsonArray _localPatchDrafts;
     QJsonArray _lastInputDrafts;
     QHash<QString, QListWidgetItem*> _inputItems;
@@ -239,13 +268,14 @@ private:
     bool _remoteMode = false;
     bool _connected = false;
     QString _editingAccessError;
+    // Why this profile's saved PCL documents or patch/fiber paths were dropped.
+    QString _legacyInputNote;
     bool _previewTransferActive = false;
     bool _checkpointDownloadActive = false;
     bool _localDraftsReady = false;
     QString _previewTransferText;
     // Last reported session lifecycle state; "Error" is the recovery case.
     QString _sessionState;
-    int _uncommittedCount = 0;
     std::function<void(std::function<void()>)> _sessionExitGuard;
     bool _runningGuardedExit = false;
 };

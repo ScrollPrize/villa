@@ -20,19 +20,21 @@ struct SpiralServiceProfile
     int remoteServicePort = 0; // Tunnel: fixed loopback port of the host service
     QString apiKey;            // held separately from the persisted profile fields
     bool autoLaunch = false;   // launch and own a local service process (Localhost only)
-    // Optional local mount of the dataset root the service advertises, so input
-    // overlays can be loaded locally when both machines mount the same dataset.
-    // The service side of the mapping is never configured here: it is whatever
-    // /dataset advertises as its root.
-    QString localRootPrefix;
     // Local launch bindings: the owned service is started with
-    // --dataset/--output/--cache from these values (dataset is required;
-    // empty output derives a per-dataset default outside the dataset; empty
-    // cache uses the service's documented user-cache default). Remote
-    // profiles never carry these — their paths are advertised by /dataset.
-    QString datasetRoot;
+    // --output/--cache/--winding-inference from these values (empty output
+    // derives a per-store default under the app data directory; empty cache
+    // uses the service's documented user-cache default; empty winding
+    // inference launches without winding-model supervision). Remote profiles
+    // never carry these: their services are configured on their hosts and
+    // advertise their bindings through /bindings.
     QString outputRoot;
     QString cacheRoot;
+    QString windingInference;
+    // The hub of the service's object store as this machine reaches it (a
+    // mount path, or sftp://[user@]host/path), for cloning a local replica
+    // when the attached store is not one; empty uses the advertised address
+    // (through the SSH destination for an SSH profile).
+    QString hubAddress;
 
     bool isLocalhost() const { return autoLaunch; }
     bool isRemote() const { return !autoLaunch; }
@@ -46,9 +48,10 @@ struct SpiralServiceProfile
         profile.autoLaunch = true;
         if (settings) {
             settings->beginGroup(QStringLiteral("spiral/profiles/localhost"));
-            profile.datasetRoot = settings->value(QStringLiteral("dataset_root")).toString();
             profile.outputRoot = settings->value(QStringLiteral("output_root")).toString();
             profile.cacheRoot = settings->value(QStringLiteral("cache_root")).toString();
+            profile.windingInference =
+                settings->value(QStringLiteral("winding_inference")).toString();
             settings->endGroup();
         }
         return profile;
@@ -66,10 +69,13 @@ struct SpiralServiceProfile
         settings.setValue(QStringLiteral("base_url"), baseUrl.toString());
         settings.setValue(QStringLiteral("ssh_destination"), sshDestination);
         settings.setValue(QStringLiteral("remote_service_port"), remoteServicePort);
-        settings.setValue(QStringLiteral("local_root_prefix"), localRootPrefix);
-        settings.setValue(QStringLiteral("dataset_root"), datasetRoot);
         settings.setValue(QStringLiteral("output_root"), outputRoot);
         settings.setValue(QStringLiteral("cache_root"), cacheRoot);
+        settings.setValue(QStringLiteral("winding_inference"), windingInference);
+        // Retired: services take no dataset root, and nothing maps one.
+        settings.remove(QStringLiteral("dataset_root"));
+        settings.remove(QStringLiteral("local_root_prefix"));
+        settings.setValue(QStringLiteral("hub_address"), hubAddress);
         settings.endGroup();
     }
 
@@ -86,10 +92,10 @@ struct SpiralServiceProfile
         profile.baseUrl = QUrl(settings.value(QStringLiteral("base_url")).toString());
         profile.sshDestination = settings.value(QStringLiteral("ssh_destination")).toString();
         profile.remoteServicePort = settings.value(QStringLiteral("remote_service_port"), 0).toInt();
-        profile.localRootPrefix = settings.value(QStringLiteral("local_root_prefix")).toString();
-        profile.datasetRoot = settings.value(QStringLiteral("dataset_root")).toString();
         profile.outputRoot = settings.value(QStringLiteral("output_root")).toString();
         profile.cacheRoot = settings.value(QStringLiteral("cache_root")).toString();
+        profile.windingInference = settings.value(QStringLiteral("winding_inference")).toString();
+        profile.hubAddress = settings.value(QStringLiteral("hub_address")).toString();
         settings.endGroup();
         return profile;
     }

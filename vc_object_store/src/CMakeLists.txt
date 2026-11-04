@@ -122,7 +122,7 @@ add_library(vc_object_geometry ${_vc_store_library_type} geometry/GeometryIngest
     catalog/CatalogStore.cpp)
 add_library(vc_object_store::vc_object_geometry ALIAS vc_object_geometry)
 target_include_directories(vc_object_geometry PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
-target_link_libraries(vc_object_geometry PUBLIC vc_objects PRIVATE vc_object_formats vc_reader::headers CURL::libcurl nlohmann_json::nlohmann_json)
+target_link_libraries(vc_object_geometry PUBLIC vc_objects PRIVATE vc_object_formats vc_reader::headers CURL::libcurl nlohmann_json::nlohmann_json OpenSSL::Crypto)
 if(NOT VC_OBJECT_STORE_BUILD_LINKING)
     return()
 endif()

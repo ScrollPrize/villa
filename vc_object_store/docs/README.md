@@ -36,6 +36,48 @@ A surface placeholder with `storage_kind="url"` and an `http(s)://` or `s3://`
 decodes them like a local directory and stores the geometry, so the remote is
 read once. The placeholder, not the remote `meta.json`, supplies the identity.
 
+Files written before objects carried UUIDs (VC3D tifxyz patches, whose `uuid` is
+their directory name; PCL collections; version-1/3 fibers) can receive dataset
+identities when a UUID namespace is supplied: `vc_object_ingest --derive-uuids NAMESPACE` or
+`ingest_geometry_source(..., uuid_namespace=NAMESPACE)`. Each such source then
+gets `uuid5(NAMESPACE, "<kind>:<key>")`, matching Python's `uuid.uuid5`:
+
+| Kind | Key |
+| --- | --- |
+| `patch` | `meta.json` `uuid` string, else the directory name |
+| `fiber` | file stem; version-3 `branch_file` targets resolve the same way |
+| `point_collection` | `<document stem>:<collection id>` |
+
+Without a namespace, UUID-less fibers retain the default fixed-namespace
+`vc3d_fiber/<filename>` identity; patches and PCLs still require canonical UUIDs.
+
+The object records `meta.source.uuid_derivation = {namespace, name}`. Canonical
+source UUIDs are kept, and tracks keep their `(dataset_ref, external_key)`
+identity. Use one namespace per dataset; the same files then always map to the
+same identities, so a repeated import fails as an existing identity rather than
+duplicating objects. Keys do not depend on absolute paths, but renaming a file or
+directory changes its identity.
+
+Two dataset defects are also errors by default, with explicit repairs that the
+report lists under `notices` (and `vc_object_ingest` prints):
+
+- A fiber branch naming an absent target file. `--drop-dangling-branches`
+  (`drop_dangling_branches=True`) drops the declaration and records it, with its
+  `declaration` key (`branches`/`adjacent_branches`), in the declaring fiber's
+  `meta.source.dropped_branches`. Resolvable branches are unaffected.
+- PCL collections of one document sharing point IDs (for example collections
+  that each number from 0). `--renumber-point-ids` (`renumber_point_ids=True`)
+  gives every collection involved new IDs above the document's largest, in
+  collection then point-ID order, so point order is kept. Each renumbered point
+  keeps its file ID as the point annotation `source_point_id`, and the collection
+  is marked `meta.source.point_ids_renumbered`. Documents with point `links` are
+  refused, since their targets would be ambiguous. A later import that extends
+  the same document must not reuse the new IDs.
+
+For the Spiral dataset (`../spiral/dataset`, 2026-10) these repair 47 branch
+declarations to 37 absent fiber files and 202 collections of
+`same_windings.json`.
+
 PCL source links use document-scoped collection/point identities. The namespace
 is `meta.source.origin`, the absolute lexically normalized import path; symlink
 aliases and moved files are different namespaces. Import only new collections
@@ -369,6 +411,43 @@ journal sequence) of each record it installed, and its own unpushed changes.
   relationship dependencies, and verifies the result.
 - A retry after a push whose outcome was lost recognizes its own records.
 
+**Positions.** A hub position names one immutable hub state: the hub's journal
+sequence after a hub write, the same on every replica (pair it with
+`HubStatus::hubReplica`, the hub's identity). `HubSyncReport::pulledPosition` is
+the state a pull installed, `publishedPosition` the state holding a push, and
+`HubStatus::position` the state this replica last pulled. Each hub write that
+journals records its position and publication time in `hub_publications`, so
+`readHubPosition(replica, position, read)` reads that state through the hub's
+own history: records, tags, approvals, deletions and relationship membership as
+they were, whatever this replica pulled since. Geometry revisions are shared and
+are read locally; the replica must have pulled to the position, or published
+it. A hub made before the index reads only its head until its next write.
+`hubJournal(replica, after, upTo)` (session `hubJournal`, Python
+`hub_journal`) lists the hub's journal entries between two positions: what a
+position includes beyond another, and by whom.
+- A plain store can have positions without a hub, for processes on one
+  machine that share its file (a Spiral service and VC3D).
+  `enableStorePositions(store)` (Python `enable_store_positions`) starts its
+  own `hub_publications` index: from then on every write records its
+  position, whichever connection or process makes it (the check is per
+  write), and the store's schema version becomes 18, as an indexed hub's.
+  `storePositions(store)` (Python `store_positions`) gives the store's
+  identity, which its positions belong to, and its head. `readHubPosition`
+  and `hubJournal` then read the store's own history and journal. There is no
+  conditional publication: a writer that must pin its own writes on top of a
+  head checks the journal between the head and its result for other authors.
+  `detachHub` drops a replica's index (the hub's positions are not its own),
+  and `initHub` keeps a plain store's: its positions become the hub's.
+- `hubPush(replica, expectedHead)` publishes only while the hub is still at
+  that position, checked in the publishing hub transaction. Otherwise it
+  publishes nothing and reports `headMismatch` with the hub's head, even when the
+  newer commits touch unrelated records. With nothing to publish it validates
+  the head the same way and reports it as the position. A retry whose earlier
+  publication on top of the same head succeeded, but whose response was lost,
+  reports that publication's position again rather than a mismatch. This is
+  how a service links on top of a head and pins the result: per-record version
+  checks alone let a push land on top of foreign commits.
+
 **Applications** do not drive sync themselves. When an `ObjectStoreSession`
 attaches a writable hosted replica, it starts a background worker. The worker
 pulls and pushes every `HubSessionOptions::syncInterval`, and pushes shortly
@@ -379,8 +458,12 @@ renewed while it lives. Once no hold remains and the changes are pushed, the
 worker releases the lease. A hold pulls once first if the hub is ahead, and it
 is a no-op for ordinary stores, so callers need not check what they attached.
 `hubStatus(attachment)` reports pending records, conflicts, the last error and
-sync time for that replica, and a `StoreSessionEvent::Kind::Hub` event tagged with
-the attachment announces each change. `syncHub(attachment)` and
+sync time for that replica, and the hub position the last sync reached (its
+push's, when it pushed); a `StoreSessionEvent::Kind::Hub` event tagged with
+the attachment announces each change. `holdPushes(attachment)` returns a
+`PushHold` that keeps background syncs from pushing while it lives (local edits
+still commit, and push once no hold remains); `syncHubAndWait` pushes regardless
+and reports the position that includes everything committed before it. `syncHub(attachment)` and
 `resolveHubConflicts(attachment, keep)` act asynchronously. Scripts that
 do not use a session call `hub_sync` and the lease functions directly.
 

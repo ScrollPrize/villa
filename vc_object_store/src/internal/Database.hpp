@@ -41,7 +41,7 @@ struct StatementPool {
     // cursors at BEGIN, and whether this write applies hub state verbatim.
     bool hubApply = false;
     std::optional<std::string> actingHolder;
-    int64_t startJournal = 0, startGeometry = 0;
+    int64_t startJournal = 0, startGeometry = 0, startPublishedUs = 0;
     std::map<std::string, std::vector<int64_t>> components;
     size_t componentNodes = 0;
     std::shared_ptr<detail::GeometryReadCache> geometryCache;

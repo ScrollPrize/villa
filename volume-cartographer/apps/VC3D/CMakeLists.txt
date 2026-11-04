@@ -227,6 +227,8 @@ set(srcs
     overlays/ViewerOverlayControllerBase.hpp
     overlays/SpiralOverlayController.cpp
     overlays/SpiralOverlayController.hpp
+    overlays/SpiralFiberOverlayController.cpp
+    overlays/SpiralFiberOverlayController.hpp
     SurfacePanelController.cpp
     SurfacePanelController.hpp
     MenuActionController.cpp
@@ -273,6 +275,12 @@ set(srcs
     SpiralServiceManager.hpp
     SpiralServiceProfile.hpp
     SpiralSessionSync.hpp
+    SpiralProjectInputs.cpp
+    SpiralProjectInputs.hpp
+    SpiralStoreInputs.cpp
+    SpiralStoreInputs.hpp
+    SpiralStoreEdits.cpp
+    SpiralStoreEdits.hpp
     SpiralSshTunnel.cpp
     SpiralSshTunnel.hpp
     SpiralDescriptions.cpp

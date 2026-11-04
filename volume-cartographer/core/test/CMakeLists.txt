@@ -647,6 +647,9 @@ vc_add_test(NAME test_load_json)
 
 vc_add_test(NAME test_lasagna_manifest LIBS doctest::doctest vc_lasagna)
 vc_add_test(NAME test_lasagna_project_volumes LIBS doctest::doctest vc_lasagna)
+# Live S3: a published Lasagna array cached whole as a directory Zarr.
+vc_add_test(NAME test_lasagna_cache_live_s3 LIBS doctest::doctest vc_lasagna)
+set_property(TEST test_lasagna_cache_live_s3 APPEND PROPERTY LABELS network)
 vc_add_test(NAME test_remote_file_cache)
 vc_add_test(NAME test_remote_cache_budget_settings)
 vc_add_test(NAME test_remote_metadata_cache)

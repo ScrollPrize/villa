@@ -3,6 +3,7 @@
 
 #include "vc/core/types/Volume.hpp"
 #include "vc/core/render/PersistentZarrCacheBudget.hpp"
+#include "vc/core/util/HttpFetch.hpp"
 #include "vc/core/util/RemoteFileCache.hpp"
 #include "vc/core/util/RemoteUrl.hpp"
 #include "vc/core/util/S3AuthFallback.hpp"
@@ -23,11 +24,13 @@
 #include <mutex>
 #include <nlohmann/json.hpp>
 #include <span>
+#include <thread>
 
 #include <stdexcept>
 #include <string_view>
 #include <unordered_map>
 #include <unordered_set>
+#include <vector>
 #include <utility>
 
 namespace vc::lasagna {
@@ -204,12 +207,16 @@ void resolveGroupLocations(
 class PersistentHttpStore final : public utils::Store {
 public:
     bool is_remote() const noexcept override { return true; }
+    // An unbudgeted store writes its chunks outside the cache budget's
+    // accounting, so its eviction cannot take them while this process runs;
+    // the next startup scan accounts them as ordinary cached data.
     PersistentHttpStore(std::string baseUrl,
                         std::filesystem::path cacheRoot,
                         vc::HttpAuth remoteAuth,
-                        bool discoverAwsCredentials)
+                        bool discoverAwsCredentials,
+                        bool budgeted = true)
         : cacheRoot_(std::move(cacheRoot)),
-          budget_(vc::render::PersistentZarrCacheBudget::findForPath(cacheRoot_))
+          budget_(budgeted ? vc::render::PersistentZarrCacheBudget::findForPath(cacheRoot_) : nullptr)
     {
         const auto endpoint = resolveRemoteEndpoint(baseUrl);
         baseUrl_ = endpoint.httpsUrl;
@@ -574,6 +581,26 @@ LasagnaDataset::LasagnaDataset(LasagnaDatasetManifest manifest)
 {
 }
 
+void cacheLasagnaProvenance(const LasagnaDatasetManifest& manifest,
+                            const vc::core::util::RemoteFileFetcher& fetcher)
+{
+    if (manifest.manifestIsRemote || manifest.remoteBaseUrl.empty()) return;
+    const auto it = manifest.raw.find("provenance");
+    if (it == manifest.raw.end() || !it->is_string() || it->get<std::string>().empty()) return;
+    const std::filesystem::path name(it->get<std::string>());
+    if (name.is_absolute() || name.lexically_normal() != name || *name.begin() == "..")
+        throw std::runtime_error("Lasagna manifest names an unsafe provenance record: " + name.string());
+    if (std::filesystem::is_regular_file(manifest.baseDirectory / name)) return;
+    vc::core::util::RemoteFileCacheOptions options;
+    options.cacheRoot = manifest.baseDirectory;
+    options.destination = name;
+    options.discoverAwsCredentials = manifest.discoverAwsCredentials;
+    options.fetcher = fetcher;
+    auto base = manifest.remoteBaseUrl;
+    while (!base.empty() && base.back() == '/') base.pop_back();
+    (void)vc::core::util::cacheRemoteFile(base + "/" + name.generic_string(), options);
+}
+
 bool isRemoteLasagnaLocation(std::string_view location)
 {
     return isRemoteLocation(location);
@@ -731,4 +758,173 @@ utils::ZarrArray openLasagnaChannelArray(
     return utils::ZarrArray::open(group.zarrPath, std::move(registry));
 }
 
+std::optional<std::filesystem::path> lasagnaChannelArrayCacheDirectory(
+    const LasagnaChannelGroup& group)
+{
+    if (!group.isRemote()) return std::nullopt;
+    return (group.remoteZarrKey.empty()
+                ? group.remoteCacheRoot
+                : group.remoteCacheRoot / group.remoteZarrKey).lexically_normal();
+}
+
+namespace {
+
+constexpr const char* kCachedArrayMarker = ".vc-cached-array.json";
+constexpr int kCachedArrayWorkers = 64;
+
+struct ListedObject {
+    std::string relative;  // under the array's key
+    std::uint64_t size = 0;
+};
+
+// The objects a marker records, empty when there is none (or an unreadable one).
+std::vector<ListedObject> markedObjects(const std::filesystem::path& marker)
+{
+    std::vector<ListedObject> objects;
+    try {
+        std::ifstream in(marker);
+        if (!in) return {};
+        const auto document = nlohmann::json::parse(in);
+        if (document.value("version", 0) != 1) return {};
+        for (const auto& entry : document.at("objects"))
+            objects.push_back({entry.at(0).get<std::string>(), entry.at(1).get<std::uint64_t>()});
+    } catch (const std::exception&) {
+        return {};
+    }
+    return objects;
+}
+
+bool cachedWhole(const std::filesystem::path& directory, const ListedObject& object)
+{
+    std::error_code ec;
+    const auto size = std::filesystem::file_size(directory / object.relative, ec);
+    return !ec && size == object.size;
+}
+
+void writeWhole(const std::filesystem::path& path, std::span<const std::byte> bytes)
+{
+    std::filesystem::create_directories(path.parent_path());
+    const auto tmp = std::filesystem::path(path.string() + ".tmp");
+    {
+        std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
+        out.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+        if (!out) throw std::runtime_error("Failed to write " + tmp.string());
+    }
+    std::filesystem::rename(tmp, path);
+}
+
+// nullopt when `cancelled` stops the listing.
+std::optional<std::vector<ListedObject>> listArrayObjects(
+    const LasagnaChannelGroup& group, const std::function<bool()>& cancelled)
+{
+    const auto url = group.remoteZarrKey.empty()
+        ? group.remoteZarrBaseUrl
+        : vc::joinRemoteUrlPath(group.remoteZarrBaseUrl, group.remoteZarrKey);
+    const auto prefix = vcr::s3::splitPrefixUrl(url);
+    if (!prefix || prefix->key.empty())
+        throw std::runtime_error("Lasagna array " + url + " is not a listable S3 prefix");
+    std::optional<std::vector<vcr::s3::Object>> listed;
+    try {
+        listed = vc::listS3Prefix(*prefix, {}, cancelled);
+    } catch (const std::exception&) {
+        const auto endpoint = vc::resolveRemoteUrl(url);
+        if (!endpoint.useAwsSigv4 || !group.discoverAwsCredentials) throw;
+        listed = vc::listS3Prefix(
+            *prefix, vc::DeferredAwsAuth(group.remoteAuth, true, endpoint.awsRegion).resolve(), cancelled);
+    }
+    if (!listed) return std::nullopt;
+    std::vector<ListedObject> objects;
+    for (const auto& object : *listed) {
+        if (object.key.size() <= prefix->key.size() || object.key.back() == '/') continue;
+        objects.push_back({object.key.substr(prefix->key.size()), object.size});
+    }
+    if (objects.empty()) throw std::runtime_error("Lasagna array " + url + " lists no objects");
+    return objects;
+}
+
+} // namespace
+
+bool cacheLasagnaChannelArray(
+    const LasagnaChannelGroup& group,
+    const std::function<void(const LasagnaArrayCacheProgress&)>& progress,
+    const std::function<bool()>& cancelled)
+{
+    const auto directory = lasagnaChannelArrayCacheDirectory(group);
+    if (!directory) throw std::runtime_error("Lasagna group " + group.name + " is not remote");
+    const auto marker = *directory / kCachedArrayMarker;
+    auto objects = markedObjects(marker);
+    const bool marked = !objects.empty();
+    if (!marked) {
+        auto listed = listArrayObjects(group, cancelled);
+        if (!listed) return false;
+        objects = std::move(*listed);
+    }
+
+    std::vector<const ListedObject*> missing;
+    for (const auto& object : objects)
+        if (!cachedWhole(*directory, object)) missing.push_back(&object);
+    if (marked && missing.empty()) return true;
+
+    // Unbudgeted: eviction must not take the array before it is read whole.
+    PersistentHttpStore store(group.remoteZarrBaseUrl, group.remoteCacheRoot,
+                              group.remoteAuth, group.discoverAwsCredentials, false);
+    std::atomic<std::size_t> next{0};
+    std::atomic<std::size_t> done{0};
+    std::atomic<bool> stop{false};
+    std::mutex reportMutex;
+    std::exception_ptr failure;
+    auto work = [&]() {
+        for (std::size_t i = next++; i < missing.size() && !stop; i = next++) {
+            if (cancelled && cancelled()) {
+                stop = true;
+                return;
+            }
+            try {
+                const auto& object = *missing[i];
+                const auto key = group.remoteZarrKey.empty()
+                    ? object.relative
+                    : group.remoteZarrKey + "/" + object.relative;
+                const auto bytes = store.get_if_exists(key);
+                if (!bytes) throw std::runtime_error("Remote Lasagna object vanished: " + key);
+                // The store keeps metadata apart from the chunks; a plain
+                // Zarr reader finds it beside them.
+                const auto name = std::filesystem::path(object.relative).filename().string();
+                if (name == ".zarray" || name == ".zattrs" || name == ".zgroup" || name == "zarr.json")
+                    writeWhole(*directory / object.relative, *bytes);
+                const LasagnaArrayCacheProgress snapshot{++done, missing.size()};
+                if (progress) {
+                    std::lock_guard lock(reportMutex);
+                    progress(snapshot);
+                }
+            } catch (...) {
+                std::lock_guard lock(reportMutex);
+                if (!failure) failure = std::current_exception();
+                stop = true;
+            }
+        }
+    };
+    std::vector<std::thread> workers;
+    for (int i = 0; i < kCachedArrayWorkers - 1; ++i) workers.emplace_back(work);
+    work();
+    for (auto& worker : workers) worker.join();
+    if (failure) std::rethrow_exception(failure);
+    if (stop) return false;
+
+    std::size_t refused = 0;
+    for (const auto* object : missing)
+        if (!cachedWhole(*directory, *object)) ++refused;
+    if (refused)
+        throw std::runtime_error(
+            "The remote cache kept " + std::to_string(missing.size() - refused) + " of " +
+            std::to_string(missing.size()) + " objects of " + directory->string());
+    if (!marked) {
+        nlohmann::json listing = nlohmann::json::array();
+        for (const auto& object : objects) listing.push_back({object.relative, object.size});
+        const auto text = nlohmann::json{{"version", 1}, {"objects", listing}}.dump();
+        writeWhole(marker, std::as_bytes(std::span(text.data(), text.size())));
+    }
+    return true;
+}
+
 } // namespace vc::lasagna
+

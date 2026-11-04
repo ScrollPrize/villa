@@ -782,6 +782,21 @@ void processLocks(const std::filesystem::path& root, const std::filesystem::path
     unsetenv("VC_SFTP_TEST_LATENCY_MS");
     recovered();
 
+    // Hub positions, their journal and a no-op push read the hub under the lock.
+    {
+        const auto replicaPath = root / "positions.vcobj";
+        cloneHub(url, replicaPath, as("alice"));
+        auto replica = ObjectStore::open(replicaPath, as("alice"));
+        const auto head = hubStatus(replica)->position;
+        require(hubPull(replica).pulledPosition == head, "an idle locked pull reports the head");
+        require(hubPush(replica, head).publishedPosition == head, "a no-op locked push confirms the head");
+        hubJournal(replica, 0, head);
+        bool read = false;
+        readHubPosition(replica, head, [&](ObjectStore&, const ReadTxn&, const RevisionSelection&) { read = true; });
+        require(read, "a locked hub position is read");
+    }
+    recovered();
+
     if (!realStore.empty()) {
         const auto alicePath = root / "real-alice.vcobj", bobPath = root / "real-bob.vcobj";
         cloneHub(url, alicePath, as("alice"));

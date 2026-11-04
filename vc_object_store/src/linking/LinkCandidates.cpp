@@ -40,6 +40,33 @@ bool isDetectorsOwnEdge(const EdgeRecord& e, const std::string& detectorName)
 
 }  // namespace
 
+std::map<std::string, int> detectorVersions()
+{
+    return {{kSurfaceOverlapDetector, kSurfaceOverlapVersion}, {kFiberSurfaceDetector, kFiberSurfaceVersion},
+            {kTrackTrackDetector, kTrackTrackVersion}, {kTrackSurfaceDetector, kTrackSurfaceVersion},
+            {kPointCollectionSurfaceDetector, kPointCollectionSurfaceVersion}};
+}
+
+bool DetectorReport::failed() const
+{
+    return std::any_of(issues.begin(), issues.end(),
+        [](const DetectorIssue& issue) { return issue.severity == DetectorIssue::Severity::Failure; });
+}
+
+void detail::reportFailure(DetectorReport& report, const std::string& stage, const std::string& object,
+    const std::string& reason, const std::string& text)
+{
+    report.issues.push_back({DetectorIssue::Severity::Failure, stage,
+        object.empty() ? std::vector<std::string>{} : std::vector{object}, reason, text});
+}
+
+void detail::reportDiagnostic(DetectorReport& report, const std::string& stage, const std::string& object,
+    const std::string& reason, const std::string& text, int64_t count)
+{
+    report.issues.push_back({DetectorIssue::Severity::Diagnostic, stage,
+        object.empty() ? std::vector<std::string>{} : std::vector{object}, reason, text, count});
+}
+
 static DetectorReport commitCandidatesImpl(objects::ObjectStore& db, objects::WriteTxn& txn,
                                 const std::string& detectorName, int detectorVersion,
                                 const std::vector<LinkCandidate>& candidates, bool replaceStalePending,
@@ -52,10 +79,11 @@ static DetectorReport commitCandidatesImpl(objects::ObjectStore& db, objects::Wr
 
     std::set<std::string> kinds;
     for (const auto& c : candidates) kinds.insert(c.kind);
-    std::set<std::string> scopedKinds, scopedObjects;
+    std::set<std::string> scopedKinds, scopedObjects, touching;
     if (staleScope) {
         scopedKinds.insert(staleScope->edgeKinds.begin(), staleScope->edgeKinds.end());
         scopedObjects.insert(staleScope->objectUuids.begin(), staleScope->objectUuids.end());
+        touching.insert(staleScope->touching.begin(), staleScope->touching.end());
         kinds.insert(scopedKinds.begin(), scopedKinds.end());
     }
 
@@ -88,6 +116,7 @@ static DetectorReport commitCandidatesImpl(objects::ObjectStore& db, objects::Wr
         for (const auto& [key, e] : existing) {
             if (staleScope && (!scopedKinds.contains(e.kind) || !scopedObjects.contains(e.aUuid) ||
                                !scopedObjects.contains(e.bUuid))) continue;
+            if (!touching.empty() && !touching.contains(e.aUuid) && !touching.contains(e.bUuid)) continue;
             if (candidateKeys.contains(key)) continue;
             if (e.approvalState != "pending") continue;  // reviewed edges are never touched
             if (!isDetectorsOwnEdge(e, detectorName)) continue;
@@ -169,6 +198,7 @@ DetectorReport commitCandidates(objects::ObjectStore& db, const std::string& det
                                    replaceStalePending, staleScope, progress);
     objects::util::reportProgress(progress, "committing links");
     txn.commit();
+    report.committed = true;
     return report;
 }
 

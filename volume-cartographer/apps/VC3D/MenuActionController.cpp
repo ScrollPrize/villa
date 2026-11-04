@@ -2288,7 +2288,8 @@ void MenuActionController::refreshStoresMenu()
     }
 }
 
-void MenuActionController::cloneHostedStore(bool asProject)
+void MenuActionController::cloneHostedStore(bool asProject, const QString& prefilledHub,
+                                            const std::vector<std::string>& routeKinds)
 {
     if (!asProject && !requireProject(QObject::tr("Attaching a hosted store"))) return;
     const auto filter = QObject::tr("Object store (*.vcobj);;All files (*)");
@@ -2301,6 +2302,7 @@ void MenuActionController::cloneHostedStore(bool asProject)
     auto* location = new QLineEdit(&chooser);
     location->setMinimumWidth(480);
     location->setPlaceholderText(QStringLiteral("sftp://user@host/path/hub.vcobj"));
+    location->setText(prefilledHub);
     auto* browse = new QPushButton(QObject::tr("Browse..."), &chooser);
     QObject::connect(browse, &QPushButton::clicked, &chooser, [&] {
         const auto file = QFileDialog::getOpenFileName(&chooser,
@@ -2338,7 +2340,8 @@ void MenuActionController::cloneHostedStore(bool asProject)
         }, Qt::QueuedConnection);
     };
     auto* watcher = new QFutureWatcher<QString>(this);
-    connect(watcher, &QFutureWatcher<QString>::finished, this, [this, watcher, progressDialog, replica, author, asProject] {
+    connect(watcher, &QFutureWatcher<QString>::finished, this,
+            [this, watcher, progressDialog, replica, author, asProject, routeKinds] {
         const auto error = watcher->result();
         watcher->deleteLater();
         progressDialog->close();
@@ -2360,7 +2363,8 @@ void MenuActionController::cloneHostedStore(bool asProject)
             return;
         }
         try {
-            _window->_state->attachStore(replica.toStdString(), author);
+            const auto attachment = _window->_state->attachStore(replica.toStdString(), author);
+            for (const auto& kind : routeKinds) _window->_state->setStoreFor(kind, attachment);
         } catch (const std::exception& attachError) {
             QMessageBox::critical(_window, QObject::tr("Cannot attach store"), QString::fromUtf8(attachError.what()));
         }

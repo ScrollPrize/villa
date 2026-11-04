@@ -900,6 +900,9 @@ CWindow::CWindow(size_t cacheSizeGB, bool debugDownloadQueue) :
         if (auto* tabBar = _workspaceTabs->tabBar()) tabBar->setTabButton(spiralIndex, QTabBar::RightSide, nullptr);
         shell->deleteLater();
         connectVolumeSelector(_spiralWorkspace->volumeSelectionControl());
+        connect(_spiralWorkspace, &SpiralWorkspace::hubReplicaRequested, this, [this](const QString& hub) {
+            if (_menuController) _menuController->cloneHostedStore(false, hub, SpiralWorkspace::inputKinds());
+        });
         connect(_spiralWorkspace, &SpiralWorkspace::patchEditorRequested, this,
                 [this](const QString& id, const QString& path) {
                     try {
@@ -955,10 +958,6 @@ CWindow::CWindow(size_t cacheSizeGB, bool debugDownloadQueue) :
             &LineAnnotationController::lineAnnotationWorkspaceRequested,
             this,
             &CWindow::openLineAnnotationWorkspace);
-    connect(_lineAnnotationController.get(), &LineAnnotationController::fiberRetired,
-            this, [this](const QString& path) {
-                if (_spiralWorkspace) _spiralWorkspace->noteFiberRetired(path);
-            });
     _fiberMapWorkspace = new FiberMapWorkspace(_state, _lineAnnotationController.get(), this);
     _fiberMapWorkspace->setProperty("workspaceId", QStringLiteral("fiber-map"));
     const int fiberMapIndex = _workspaceTabs->addTab(_fiberMapWorkspace, tr("Fiber Map"));
@@ -3051,7 +3050,7 @@ void CWindow::CreateWidgets(void)
             showStatusBarMessage(error, 15000);
             return false;
         }
-        return !_spiralWorkspace || _spiralWorkspace->prepareManagedPatch(surface);
+        return true;
     });
     // Edits of the active surface commit to the store object it was opened from.
     _segmentationModule->setStorePinResolver([this](const QuadSurface* surface) -> std::optional<SegmentationModule::StoreOrigin> {

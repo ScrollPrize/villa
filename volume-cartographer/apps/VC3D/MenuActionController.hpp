@@ -58,8 +58,10 @@ public:
     // Empty means cancelled.
     QString objectStoreAuthor();
     // Clones a hosted store to a local replica, then opens it as the project
-    // or attaches it beside the project.
-    void cloneHostedStore(bool asProject);
+    // or attaches it beside the project. ``hub`` prefills the hub address (e.g.
+    // a Spiral service's hub); the replica is routed to ``routeKinds``.
+    void cloneHostedStore(bool asProject, const QString& hub = {},
+                          const std::vector<std::string>& routeKinds = {});
     // Collects a kind, a source folder and an optional volume binding, then ingests
     // it into the kind's store in the background (vc::objects::ingestGeometrySource).
     void importIntoObjectStore();

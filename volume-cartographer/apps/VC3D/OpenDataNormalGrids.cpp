@@ -34,29 +34,27 @@ std::vector<RemoteObject> listRemotePrefix(const vcr::s3::Prefix& prefix,
                                            const std::atomic<bool>* cancelRequested,
                                            std::string* errorOut)
 {
+    std::optional<std::vector<vcr::s3::Object>> listed;
+    try {
+        listed = vc::listS3Prefix(prefix, {}, [cancelRequested]() {
+            return cancelRequested && cancelRequested->load(std::memory_order_acquire);
+        });
+    } catch (const std::exception& e) {
+        if (errorOut) *errorOut = std::string("listing failed: ") + e.what();
+        return {};
+    }
+    if (!listed) {
+        if (errorOut) *errorOut = "cancelled";
+        return {};
+    }
     std::vector<RemoteObject> objects;
-    std::string continuationToken;
-    do {
-        if (cancelRequested && cancelRequested->load(std::memory_order_acquire)) {
-            if (errorOut) *errorOut = "cancelled";
-            return {};
+    for (const auto& object : *listed) {
+        if (object.key.rfind(prefix.key, 0) != 0 || object.key.size() == prefix.key.size() ||
+            object.key.back() == '/') {
+            continue;
         }
-        vcr::s3::ListPage page;
-        try {
-            page = vcr::s3::parseListPage(vc::httpGetString(vcr::s3::listUrl(prefix, {}, continuationToken)));
-        } catch (const std::exception& e) {
-            if (errorOut) *errorOut = std::string("listing failed: ") + e.what();
-            return {};
-        }
-        for (const auto& object : page.objects) {
-            if (object.key.rfind(prefix.key, 0) != 0 || object.key.size() == prefix.key.size() ||
-                object.key.back() == '/') {
-                continue;
-            }
-            objects.push_back({object.key.substr(prefix.key.size()), object.size});
-        }
-        continuationToken = std::move(page.nextContinuationToken);
-    } while (!continuationToken.empty());
+        objects.push_back({object.key.substr(prefix.key.size()), object.size});
+    }
 
     if (objects.empty() && errorOut) {
         *errorOut = "no objects found under " + prefix.key;

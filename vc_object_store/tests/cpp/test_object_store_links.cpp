@@ -94,8 +94,8 @@ std::string upper(std::string text)
 
 bool hasProblem(const links::DetectorReport& report, const std::string& text)
 {
-    return std::any_of(report.problems.begin(), report.problems.end(),
-                       [&](const std::string& problem) { return problem.find(text) != std::string::npos; });
+    return std::any_of(report.issues.begin(), report.issues.end(),
+                       [&](const links::DetectorIssue& issue) { return issue.message.find(text) != std::string::npos; });
 }
 
 ObjectStore create(const TemporaryDirectory& directory, const std::string& name)
@@ -168,7 +168,7 @@ void storedTrackCrossingsSelectionAndAtomicFailure(const TemporaryDirectory& dir
     track(db, "11", vertical, "vertical", "other-dataset");
     links::TrackTrackParams params; params.workers = 2;
     const auto report = links::linkTracksToTracks(db, params);
-    require(report.problems.empty() && report.edgesCreated == 1, "one crossing");
+    require(report.issues.empty() && report.edgesCreated == 1, "one crossing");
     const auto edge = edgesOf(db, a).at(0);
     require(edge.aAnchor.position == std::array<double, 3>{15, 15, 20} && edge.bAnchor.position == std::array<double, 3>{15, 15, 20},
             "anchors at the crossing");
@@ -187,7 +187,7 @@ void storedTrackCrossingsSelectionAndAtomicFailure(const TemporaryDirectory& dir
     require(hasProblem(links::linkTracksToTracks(db), "no stored geometry"), "missing geometry is a problem");
     require(journal() == before, "a failed run writes nothing");
     params = {}; params.trackUuids = {badUuid}; params.datasetRef = "other";
-    require(!links::linkTracksToTracks(db, params).problems.empty(), "a selection outside the dataset is a problem");
+    require(links::linkTracksToTracks(db, params).failed(), "a selection outside the dataset is a problem");
 }
 
 void storedCollectionIdsWindingScalingAndRerun(const TemporaryDirectory& directory)

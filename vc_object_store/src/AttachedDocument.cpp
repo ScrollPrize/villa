@@ -252,11 +252,14 @@ std::vector<AttachedCollection> volumeCollections(ObjectStoreSession& session, c
 }
 
 void writeVolumeCollections(ObjectStoreSession& session, const AttachmentIdentity& attachment, const VolumeVoxels& volume,
-                            const std::vector<AttachedCollection>& changed, const std::vector<std::string>& removed)
+                            const std::vector<AttachedCollection>& changed, const std::vector<std::string>& removed,
+                            const RevisionSelection& expected)
 {
     RevisionSelection pins;
+    for (const auto& [uuid, revision] : expected) pins[util::canonicalUuid(uuid)] = revision;
     session.read(attachment, [&](const auto& store, const auto& txn, const auto&) {
         auto pin = [&](const std::string& uuid) {
+            if (pins.contains(util::canonicalUuid(uuid))) return;
             const auto head = store.currentObjectRevision(txn, uuid);
             pins[util::canonicalUuid(uuid)] = head ? std::optional(head->uuid) : std::nullopt;
         };

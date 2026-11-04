@@ -33,6 +33,8 @@ nb::object sessionHubStatus(const std::optional<vo::HubSessionStatus>& status)
     nb::dict result; result["pending"] = status->pending; result["conflicts"] = hubConflicts(status->conflicts);
     result["error"] = status->error; result["synced_at_us"] = status->syncedAtUs;
     result["leases"] = hubLeases(status->leases);
+    result["position"] = status->position; result["pushes_held"] = status->pushesHeld;
+    result["hub"] = status->hub; result["hub_replica"] = status->hubReplica;
     return result;
 }
 
@@ -40,6 +42,8 @@ nb::dict hubReport(const vo::HubSyncReport& report)
 {
     nb::dict result; result["pulled"] = report.pulled; result["pushed"] = report.pushed;
     result["conflicts"] = hubConflicts(report.conflicts);
+    result["pulled_position"] = report.pulledPosition; result["published_position"] = report.publishedPosition;
+    result["head_mismatch"] = report.headMismatch; result["hub_head"] = report.hubHead;
     return result;
 }
 }
@@ -61,6 +65,10 @@ inline void bindObjectStoreSession(nb::module_& m)
         .def("release", &vo::LeaseHold::reset, nb::call_guard<nb::gil_scoped_release>())
         .def("__enter__", [](nb::object self) { return self; })
         .def("__exit__", [](vo::LeaseHold& self, nb::args) { nb::gil_scoped_release release; self.reset(); });
+    nb::class_<vo::PushHold>(m, "PushHold")
+        .def("release", &vo::PushHold::reset, nb::call_guard<nb::gil_scoped_release>())
+        .def("__enter__", [](nb::object self) { return self; })
+        .def("__exit__", [](vo::PushHold& self, nb::args) { nb::gil_scoped_release release; self.reset(); });
     nb::class_<vo::ObjectStoreSession>(m, "ObjectStoreSession")
         .def(nb::init<>())
         .def("attach", [](vo::ObjectStoreSession& self, const std::filesystem::path& path, const std::string& author,
@@ -82,6 +90,9 @@ inline void bindObjectStoreSession(nb::module_& m)
         .def("hold_leases", &vo::ObjectStoreSession::holdLeases, nb::arg("attachment"), nb::arg("uuids"),
              nb::call_guard<nb::gil_scoped_release>(),
              "Lease objects before editing them; renewed in the background until released.")
+        .def("hold_pushes", &vo::ObjectStoreSession::holdPushes, nb::arg("attachment"),
+             nb::call_guard<nb::gil_scoped_release>(),
+             "Keep background sync from pushing until the hold is released; sync_hub_and_wait still pushes.")
         .def("hub_status", [](const vo::ObjectStoreSession& self, const vo::AttachmentIdentity& attachment) {
             return sessionHubStatus(self.hubStatus(attachment));
         }, nb::arg("attachment"))
@@ -109,7 +120,7 @@ inline void bindObjectStoreSession(nb::module_& m)
             { nb::gil_scoped_release release; events = self.takeEvents(); }
             nb::list result;
             for (const auto& event : events) {
-                static constexpr const char* kinds[] = {"attached", "detached", "committed", "hub"};
+                static constexpr const char* kinds[] = {"attached", "detached", "committed", "hub", "draft"};
                 nb::dict item; item["kind"] = kinds[int(event.kind)]; item["attachment"] = event.attachment;
                 item["journal_position"] = event.journalPosition;
                 nb::list changes;

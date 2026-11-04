@@ -7,6 +7,7 @@
 #include <array>
 #include <chrono>
 #include <cstddef>
+#include <iterator>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -145,6 +146,23 @@ std::vector<std::byte> httpGetBytes(const std::string& url, const HttpAuth& auth
             "HTTP transport error fetching " + url + ": " + resp.error_message);
     }
     return {};
+}
+
+std::optional<std::vector<vcr::s3::Object>> listS3Prefix(
+    const vcr::s3::Prefix& prefix, const HttpAuth& auth,
+    const std::function<bool()>& cancelled)
+{
+    std::vector<vcr::s3::Object> objects;
+    std::string continuationToken;
+    do {
+        if (cancelled && cancelled()) return std::nullopt;
+        auto page = vcr::s3::parseListPage(
+            httpGetString(vcr::s3::listUrl(prefix, {}, continuationToken), auth));
+        objects.insert(objects.end(), std::make_move_iterator(page.objects.begin()),
+                       std::make_move_iterator(page.objects.end()));
+        continuationToken = std::move(page.nextContinuationToken);
+    } while (!continuationToken.empty());
+    return objects;
 }
 
 } // namespace vc

@@ -7,6 +7,10 @@
 #include "SpiralSshTunnel.hpp"
 #include "VCSettings.hpp"
 
+#include "vc/lasagna/Dataset.hpp"
+
+#include <vc_object_store/objects/ObjectStoreSession.hpp>
+
 #include <QCoreApplication>
 #include <QApplication>
 #include <QCryptographicHash>
@@ -14,6 +18,7 @@
 #include <QDirIterator>
 #include <QFile>
 #include <QFileInfo>
+#include <QHostAddress>
 #include <QFutureWatcher>
 #include <QJsonArray>
 #include <QJsonDocument>
@@ -30,6 +35,7 @@
 #include <QStandardPaths>
 #include <QUrl>
 #include <QUuid>
+#include <QPromise>
 #include <QtConcurrent/QtConcurrent>
 
 #include <cmath>
@@ -46,11 +52,13 @@ constexpr int kEventPollMs = 500;
 constexpr int kMutationRetries = 2;
 constexpr int kPreviewCacheKept = 3;
 
-// Deterministic per-dataset default output root, outside the dataset: the
-// service requires --output and rejects a location under --dataset.
-QString defaultLocalOutputRoot(const QString& datasetRoot)
+// Deterministic default output root per attached object store: the service
+// requires --output, and two stores fitted on this computer must not share
+// generated state (autosaves, previews, replicas). Keyed by the store's
+// absolute path, so reattaching the same store reuses its output.
+QString defaultLocalOutputRoot(const QString& storePath)
 {
-    const QString canonical = QFileInfo(datasetRoot).absoluteFilePath();
+    const QString canonical = QFileInfo(storePath).absoluteFilePath();
     const QString digest = QString::fromLatin1(
         QCryptographicHash::hash(canonical.toUtf8(), QCryptographicHash::Sha256)
             .toHex().left(8));
@@ -102,7 +110,6 @@ QString formatEventRecord(const QJsonObject& event)
 
 SpiralServiceManager::SpiralServiceManager(QObject* parent) : QObject(parent)
 {
-    connect(this, &SpiralServiceManager::inputDraftsChanged, this, [this]() { _inputRowsDirty = true; });
     _network = new QNetworkAccessManager(this);
     _artifactCache = new SpiralArtifactCache(this);
     _tunnel = new SpiralSshTunnel(this);
@@ -237,11 +244,9 @@ void SpiralServiceManager::connectToService(const SpiralServiceProfile& profile)
     _fetchingPreviewArtifact.clear();
     _installedDiagnosticsArtifact.clear();
     _fetchingDiagnosticsArtifact.clear();
-    for (const auto role : vc3d::spiral::kEditablePclRoles) {
-        _installedPclArtifact[vc3d::spiral::pclRoleIndex(role)].clear();
-        _fetchingPclArtifact[vc3d::spiral::pclRoleIndex(role)].clear();
-        _lastPclLocalPath[vc3d::spiral::pclRoleIndex(role)].clear();
-    }
+    _installedInputManifest.clear();
+    _fetchingInputManifest.clear();
+    _lastInputManifestLocalPath.clear();
     _lastPreviewLocalPath.clear();
     _lastDiagnosticsLocalPath.clear();
     _synchronizedSessionId.clear();
@@ -250,7 +255,7 @@ void SpiralServiceManager::connectToService(const SpiralServiceProfile& profile)
     _eventsInFlight = false;
     _eventFailures = 0;
     _lastEventCursor = 0;
-    _advertisedDataset = {};
+    _advertisedBindings = {};
 
     _credential = profile.apiKey;
     if (_credential.isEmpty())
@@ -307,22 +312,40 @@ void SpiralServiceManager::startTunnel()
 
 void SpiralServiceManager::startLocalProcess()
 {
-    // The owned service is bound to one dataset/output/cache triple at
-    // startup; a different selection is a different service instance.
-    if (_profile.datasetRoot.trimmed().isEmpty()) {
-        const QString message = tr("The local Spiral service needs a dataset root. "
-                                   "Set it in the Spiral Service connection panel.");
-        setConnectionState(ConnectionState::Failed, message);
-        emit errorOccurred(message);
+    // The owned service is bound to one store/output/cache/winding-inference
+    // selection at startup; a different selection is a different service
+    // instance.
+    // Patches, PCLs and fibers come from an object store: the local service
+    // is launched bound to the one attached here.
+    if (_localStorePath.isEmpty()) {
+        _waitingForLocalStore = true;
+        setConnectionState(ConnectionState::Starting,
+            _localStoreUnavailableReason.isEmpty()
+                ? tr("Waiting for the project's object store.")
+                : _localStoreUnavailableReason);
         return;
     }
+    _waitingForLocalStore = false;
     QString outputRoot = _profile.outputRoot.trimmed();
     if (outputRoot.isEmpty())
-        outputRoot = defaultLocalOutputRoot(_profile.datasetRoot.trimmed());
-    QStringList binding{QStringLiteral("--dataset"), _profile.datasetRoot.trimmed(),
-                        QStringLiteral("--output"), outputRoot};
+        outputRoot = defaultLocalOutputRoot(_localStorePath);
+    QStringList binding{QStringLiteral("--output"), outputRoot,
+                        QStringLiteral("--build-missing-lasagna-packs")};
+    // A hosted replica's service works on its own replica of the same hub
+    // (cloned at first launch, reattached later), never on this one.
+    if (_storeBinding.localHosted())
+        binding << QStringLiteral("--object-store")
+                << localServiceReplica(outputRoot, _storeBinding.localHubIdentity)
+                << QStringLiteral("--object-store-hub") << _storeBinding.localHub;
+    else
+        binding << QStringLiteral("--object-store") << _localStorePath;
     if (!_profile.cacheRoot.trimmed().isEmpty())
         binding << QStringLiteral("--cache") << _profile.cacheRoot.trimmed();
+    // A directly consumed supervision artifact on this host; VC3D never reads
+    // it, only names it to the service it launches.
+    if (!_profile.windingInference.trimmed().isEmpty())
+        binding << QStringLiteral("--winding-inference")
+                << _profile.windingInference.trimmed();
 
     if (ownsProcess()) {
         if (binding == _ownedLaunchBinding) {
@@ -330,10 +353,10 @@ void SpiralServiceManager::startLocalProcess()
             beginHandshake();
             return;
         }
-        // A different dataset/output/cache selection restarts the owned
-        // process with the new binding.
+        // A different output/cache/store/winding-inference selection
+        // restarts the owned process with the new binding.
         emit logMessage(tr("Restarting the local Spiral service for a different "
-                           "dataset binding"));
+                           "launch binding"));
         stopService();
     }
     const QString python = findPython();
@@ -458,15 +481,21 @@ void SpiralServiceManager::handleHealth(const QJsonObject& health)
             ? tr("session %1").arg(sessionName)
             : tr(" / session %1").arg(sessionName);
     setConnectionState(ConnectionState::Ready, identity);
-    claimInputWorkspace();
+    claimSessionLease();
     _statusFailures = 0;
     _poll->setInterval(kPollMs);
     _poll->start();
-    fetchAdvertisedDataset();
+    fetchAdvertisedBindings();
     get(QStringLiteral("/configuration"), Timeout::Quick,
         [this](const QJsonObject& catalog) {
             _configurationDefaults =
                 catalog.value(QStringLiteral("defaults")).toObject();
+            _serviceOwnedKeys.clear();
+            const QJsonObject fields = catalog.value(QStringLiteral("schema")).toObject()
+                                           .value(QStringLiteral("fields")).toObject();
+            for (auto it = fields.begin(); it != fields.end(); ++it)
+                if (it.value().toObject().value(QStringLiteral("service_owned")).toBool())
+                    _serviceOwnedKeys.insert(it.key());
             emit configurationCatalogChanged(catalog);
         });
     // Reconnect protocol: read the durable status snapshot first, then
@@ -476,24 +505,189 @@ void SpiralServiceManager::handleHealth(const QJsonObject& health)
     pollEvents();
 }
 
-void SpiralServiceManager::fetchAdvertisedDataset()
+void SpiralServiceManager::fetchAdvertisedBindings()
 {
     const quint64 generation = _connectionGeneration;
-    get(QStringLiteral("/dataset"), Timeout::Command,
-        [this, generation](const QJsonObject& dataset) {
+    get(QStringLiteral("/bindings"), Timeout::Command,
+        [this, generation](const QJsonObject& bindings) {
             if (generation != _connectionGeneration) return;
-            _advertisedDataset = dataset;
-            emit datasetResolved(dataset);
+            _advertisedBindings = bindings;
+            updateStoreBinding();
+            emit bindingsAdvertised(bindings);
         });
+}
+
+bool SpiralServiceManager::windingInferenceAvailable(QString* reason) const
+{
+    const QJsonObject binding =
+        _advertisedBindings.value(QStringLiteral("bindings")).toObject()
+            .value(QStringLiteral("winding_inference")).toObject();
+    const bool available = _advertisedBindings.value(QStringLiteral("capabilities"))
+                               .toObject().value(QStringLiteral("winding_inference")).toBool();
+    if (reason) {
+        if (available)
+            reason->clear();
+        else if (!binding.value(QStringLiteral("bound")).toBool())
+            *reason = tr("The service was launched without --winding-inference");
+        else
+            *reason = tr("The service's winding-inference artifact %1 is unusable: %2")
+                          .arg(binding.value(QStringLiteral("path")).toString(),
+                               binding.value(QStringLiteral("error")).toString());
+    }
+    return available;
+}
+
+void SpiralServiceManager::setObjectStore(
+    std::shared_ptr<vc::objects::ObjectStoreSession> session,
+    std::optional<vc::objects::AttachmentIdentity> attachment,
+    const QString& unavailableReason)
+{
+    _localStoreUnavailableReason = unavailableReason;
+    if (_inputUpdateActive && _inputUpdateAttachment
+        && (session != _storeSession.lock() || !attachment || *attachment != *_inputUpdateAttachment))
+        abandonInputUpdate(tr("The attached object store changed"));
+    _storeSession = session;
+    _storeAttachment = attachment ? std::make_unique<vc::objects::AttachmentIdentity>(*attachment) : nullptr;
+    QString path;
+    QString uuid;
+    if (session && attachment) {
+        path = QString::fromStdString(session->path(*attachment).string());
+        uuid = QString::fromStdString(attachment->storeUuid);
+    }
+    const QString hub = _storeBinding.localHub;
+    const bool changed = path != _localStorePath;
+    _localStorePath = path;
+    _storeBinding.localPath = path;
+    _storeBinding.localUuid = uuid;
+    updateSameFile();
+    refreshLocalHub();
+    // The workspace may be opened before a project. Complete its requested
+    // connection when a store arrives, or update the reason it is waiting.
+    if (_waitingForLocalStore) {
+        startLocalProcess();
+        return;
+    }
+    // A local service is bound to the store at launch: follow the attachment.
+    if ((changed || hub != _storeBinding.localHub) && ownsProcess() && _profile.autoLaunch
+        && _connectionState != ConnectionState::Disconnected) {
+        emit logMessage(tr("The attached object store changed; restarting the local Spiral service"));
+        connectToService(_profile);
+    }
+}
+
+void SpiralServiceManager::refreshLocalHub()
+{
+    const auto session = _storeSession.lock();
+    std::optional<vc::objects::HubSessionStatus> status;
+    if (session && _storeAttachment) status = session->hubStatus(*_storeAttachment);
+    _storeBinding.localHub = status ? QString::fromStdString(status->hub) : QString();
+    _storeBinding.localHubIdentity = status ? QString::fromStdString(status->hubReplica) : QString();
+    _storeBinding.localPosition = status && status->syncedAtUs ? status->position : -1;
+    _storeBinding.localPending = status ? int(status->pending.size()) : 0;
+    _storeBinding.localConflicts = status ? int(status->conflicts.size()) : 0;
+    emit storeBindingChanged();
+}
+
+QString SpiralServiceManager::localServiceReplica(const QString& outputRoot,
+                                                  const QString& hubIdentity)
+{
+    return QDir(outputRoot).filePath(QStringLiteral("object-store-replicas/%1.vcobj").arg(hubIdentity));
+}
+
+QString SpiralServiceManager::serviceHubAddress() const
+{
+    if (!_profile.hubAddress.trimmed().isEmpty()) return _profile.hubAddress.trimmed();
+    const QString advertised = _storeBinding.serviceHub;
+    if (advertised.isEmpty() || advertised.contains(QStringLiteral("://"))) return advertised;
+    if (_profile.transport == SpiralServiceProfile::Transport::SshTunnel && !_profile.sshDestination.isEmpty())
+        return QStringLiteral("sftp://%1%2").arg(_profile.sshDestination, advertised);
+    return advertised;
+}
+
+void SpiralServiceManager::updateStoreBinding()
+{
+    const QJsonObject store = _advertisedBindings.value(QStringLiteral("object_store")).toObject();
+    _storeBinding.serviceUuid = store.value(QStringLiteral("uuid")).toString();
+    _storeBinding.servicePath = store.value(QStringLiteral("path")).toString();
+    const QJsonObject hub = store.value(QStringLiteral("hub")).toObject();
+    _storeBinding.serviceHub = hub.value(QStringLiteral("address")).toString();
+    _storeBinding.serviceHubIdentity = hub.value(QStringLiteral("identity")).toString();
+    _storeBinding.servicePosition = hub.value(QStringLiteral("position")).toInteger(-1);
+    _storeBinding.servicePositionError = hub.value(QStringLiteral("position_error")).toString();
+    const QJsonObject positions = store.value(QStringLiteral("positions")).toObject();
+    _storeBinding.servicePositions = _storeBinding.hosted()
+        ? _storeBinding.serviceHubIdentity : positions.value(QStringLiteral("identity")).toString();
+    if (!_storeBinding.hosted() && !positions.isEmpty()) {
+        _storeBinding.servicePosition = positions.value(QStringLiteral("position")).toInteger(-1);
+        _storeBinding.servicePositionError = positions.value(QStringLiteral("position_error")).toString();
+    }
+    updateSameFile();
+    if (_storeBinding.advertised() && !_storeBinding.matches())
+        emit logMessage(
+            _storeBinding.localUuid.isEmpty()
+                ? tr("The Spiral service reads object store %1, and the project routes Spiral's "
+                     "inputs to no one store here: its fit inputs cannot be displayed")
+                      .arg(_storeBinding.serviceUuid)
+            : _storeBinding.serviceUuid == _storeBinding.localUuid
+                ? tr("The Spiral service fits positions of hub %1 (%2); the attached store is "
+                     "not a replica of it: clone that hub to edit and update the fit's inputs")
+                      .arg(_storeBinding.serviceHubIdentity, serviceHubAddress())
+                : tr("The Spiral service reads object store %1, not the attached store %2: "
+                     "its fit inputs are not displayed as fitted")
+                      .arg(_storeBinding.serviceUuid, _storeBinding.localUuid));
+    emit storeBindingChanged();
+}
+
+qint64 SpiralServiceManager::storeHead(vc::objects::ObjectStoreSession& session,
+                                      const vc::objects::AttachmentIdentity& attachment)
+{
+    qint64 head = -1;
+    session.read(attachment, [&](const vc::objects::ObjectStore& store, const vc::objects::ReadTxn& txn,
+                                 const std::atomic_bool&) { head = store.journalPosition(txn); });
+    return head;
+}
+
+void SpiralServiceManager::updateSameFile()
+{
+    // Only a service on this machine opens the path it advertises here: a
+    // launched one, or one reached directly at a loopback address (an SSH
+    // tunnel's local end is not).
+    const QString host = _profile.baseUrl.host();
+    const bool here = _profile.isLocalhost()
+        || (_profile.transport == SpiralServiceProfile::Transport::Direct
+            && (host == QStringLiteral("localhost") || QHostAddress(host).isLoopback()));
+    const QFileInfo local(_storeBinding.localPath), service(_storeBinding.servicePath);
+    _storeBinding.sameFile = here && !_storeBinding.localPath.isEmpty()
+        && local.exists() && local.canonicalFilePath() == service.canonicalFilePath();
+}
+
+void SpiralServiceManager::abandonInputUpdate(const QString& reason)
+{
+    // The replies of the old connection are dropped (or its hold ended with
+    // the attachment), so an update waiting on them would never finish: end
+    // it here. Its outcome on the service is unknown until the next status
+    // names the fit's position.
+    if (!_inputUpdateActive) return;
+    ++_inputUpdateSerial;
+    _inputUpdateHold.reset();
+    _inputUpdateAttachment.reset();
+    _inputUpdateActive = false;
+    InputUpdate abandoned;
+    abandoned.error = tr("%1 during the update; its outcome is unknown: check the fit's input position")
+                          .arg(reason);
+    emit inputUpdateFinished(abandoned);
 }
 
 void SpiralServiceManager::disconnectFromService()
 {
-    cancelWorkingCopies();
+    _waitingForLocalStore = false;
+    if (_lasagnaCacheCancel) {
+        _lasagnaCacheCancel->store(true);
+        _lasagnaCacheCancel.reset();
+    }
+    abandonInputUpdate(tr("The connection to the Spiral service changed"));
     ++_connectionGeneration;
-    _inputOwner = false;
-    _inputCommandBusy = false;
-    if (_inputCommand) _inputSubmission.transportInterrupted();
+    _leaseOwner = false;
     _poll->stop();
     _eventPoll->stop();
     _statusInFlight = false;
@@ -516,10 +710,9 @@ void SpiralServiceManager::reconnect()
 {
     if (_profile.id.isEmpty()) return;
     if (ownsProcess()) {
-        cancelWorkingCopies();
+        abandonInputUpdate(tr("The connection to the Spiral service changed"));
         ++_connectionGeneration;
-        _inputOwner = false;
-        _inputCommandBusy = false;
+        _leaseOwner = false;
         _statusInFlight = false;
         _eventsInFlight = false;
         _synchronizedSessionId.clear();
@@ -558,7 +751,7 @@ QNetworkRequest SpiralServiceManager::makeRequest(const QString& path, int timeo
     if (!_credential.isEmpty())
         request.setRawHeader("Authorization", QStringLiteral("Bearer %1").arg(_credential).toUtf8());
     request.setRawHeader("X-Spiral-Client", _clientId.toUtf8());
-    request.setRawHeader("X-Spiral-Workspace-Token", _clientId.toUtf8());
+    request.setRawHeader("X-Spiral-Session-Token", _clientId.toUtf8());
     request.setTransferTimeout(timeoutMs);
     return request;
 }
@@ -568,23 +761,29 @@ void SpiralServiceManager::initializeSession(QJsonObject request)
     prepareSessionRequest(std::move(request), true);
 }
 
-void SpiralServiceManager::rebuildSession(QJsonObject request)
+void SpiralServiceManager::rebuildSession(QJsonObject request, bool reloadInputs)
 {
+    if (reloadInputs) request[QStringLiteral("inputs")] = QStringLiteral("reload");
     prepareSessionRequest(std::move(request), false);
 }
 
 void SpiralServiceManager::prepareSessionRequest(QJsonObject request,
                                                  bool initialize)
 {
-    // The service owns its base inputs (it is launched with --dataset), so a
-    // session construction request carries run
-    // parameters plus the client-selectable checkpoint/tracks values only.
+    // The service owns its host inputs (its launch bindings and the project
+    // block), so a session construction request carries run parameters plus
+    // the client-selectable checkpoint only.
     const QJsonObject requested =
         request.value(QStringLiteral("paths")).toObject();
     QJsonObject selectable;
-    const QString tracks = requested.value(QStringLiteral("tracks_dbm")).toString().trimmed();
-    if (!tracks.isEmpty()) selectable[QStringLiteral("tracks_dbm")] = tracks;
     const QString checkpoint = requested.value(QStringLiteral("checkpoint")).toString().trimmed();
+    // The service's launch binding owns these (its object store and the
+    // author of its link refreshes); a request never chooses them.
+    QJsonObject run = request.value(QStringLiteral("run")).toObject();
+    QJsonObject config = run.value(QStringLiteral("config")).toObject();
+    for (const QString& key : _serviceOwnedKeys) config.remove(key);
+    run[QStringLiteral("config")] = config;
+    request[QStringLiteral("run")] = run;
 
     auto finish = [this, request, selectable, initialize](
                       const QString& checkpointHostPath) mutable {
@@ -607,9 +806,9 @@ void SpiralServiceManager::prepareSessionRequest(QJsonObject request,
     // uploaded first and the load resumes from the returned host path.
     bool serviceSide = false;
     for (const QJsonValue& value :
-         _advertisedDataset.value(QStringLiteral("detected_checkpoints")).toArray())
+         _advertisedBindings.value(QStringLiteral("session_checkpoints")).toArray())
         if (value.toString() == checkpoint) serviceSide = true;
-    const QString outputDir = _advertisedDataset.value(QStringLiteral("resolved")).toObject()
+    const QString outputDir = _advertisedBindings.value(QStringLiteral("bindings")).toObject()
                                   .value(QStringLiteral("output_directory")).toString();
     if (!outputDir.isEmpty() && checkpoint.startsWith(outputDir)) serviceSide = true;
     if (serviceSide || !QFileInfo(checkpoint).isFile()) {
@@ -632,6 +831,220 @@ void SpiralServiceManager::prepareSessionRequest(QJsonObject request,
                               });
 }
 
+void SpiralServiceManager::updateFitInputs(QJsonObject request)
+{
+    // A second request while one runs is dropped, not reported as that
+    // update's outcome: inputUpdateFinished belongs to the running one.
+    if (_inputUpdateActive) {
+        emit logMessage(tr("An input update is already in progress"));
+        return;
+    }
+    InputUpdate refused;
+    const auto session = _storeSession.lock();
+    if (!isReady() || !_leaseOwner)
+        refused.error = tr("Connect to the Spiral service and own its session lease first");
+    else if (!_storeBinding.positioned())
+        refused.error = tr("The Spiral service fits no store positions: rebuild with current inputs instead");
+    else if (_storeBinding.hosted() && (!_storeBinding.matches() || !session || !_storeAttachment))
+        refused.error = tr("Attach a replica of the service's hub (%1) to update the fit's inputs")
+                            .arg(_storeBinding.serviceHubIdentity);
+    else if (!_storeBinding.hosted() && (!_storeBinding.shared() || !session || !_storeAttachment))
+        refused.error = tr("Spiral's store here is not the service's store file (%1): saved edits "
+                           "cannot reach the fit").arg(_storeBinding.servicePath);
+    if (!refused.error.isEmpty()) {
+        emit inputUpdateFinished(refused);
+        return;
+    }
+    _inputUpdateActive = true;
+    const quint64 serial = ++_inputUpdateSerial;
+    const vc::objects::AttachmentIdentity attachment = *_storeAttachment;
+    _inputUpdateAttachment = std::make_unique<vc::objects::AttachmentIdentity>(attachment);
+    if (!_storeBinding.hosted()) {
+        // The service's own file: saves are already there. The update
+        // includes everything saved so far, at the store's head now.
+        try {
+            sendInputUpdate(request, storeHead(*session, attachment), serial);
+        } catch (const std::exception& error) {
+            refused.error = QString::fromUtf8(error.what());
+            finishInputUpdate(refused, serial);
+        }
+        return;
+    }
+    // Held before pushing: the waited sync below still pushes everything
+    // saved so far, and nothing pushed meanwhile can slip in between it and
+    // the service's link-then-pin loop (which would only make it relink).
+    try {
+        _inputUpdateHold = std::make_shared<vc::objects::PushHold>(session->holdPushes(attachment));
+    } catch (const std::exception& error) {
+        _inputUpdateActive = false;
+        _inputUpdateAttachment.reset();
+        refused.error = QString::fromUtf8(error.what());
+        emit inputUpdateFinished(refused);
+        return;
+    }
+    emit inputUpdateProgress(QStringLiteral("pushing"), tr("Pushing saved edits to the hub…"));
+    using Pushed = std::pair<std::optional<vc::objects::HubSessionStatus>, QString>;
+    auto* watcher = new QFutureWatcher<Pushed>(this);
+    connect(watcher, &QFutureWatcher<Pushed>::finished, this, [this, watcher, request, serial]() {
+        const auto [status, exception] = watcher->result();
+        watcher->deleteLater();
+        if (serial != _inputUpdateSerial) return;  // abandoned
+        InputUpdate update;
+        if (!exception.isEmpty() || !status) {
+            update.error = tr("The hub could not be reached: %1").arg(exception.isEmpty() ? tr("no hub") : exception);
+        } else if (!status->conflicts.empty()) {
+            update.conflicts = true;
+            update.error = tr("Hub conflicts block the update: resolve them (File > Stores > "
+                              "Sync Hosted Stores Now), then update again");
+            for (const auto& conflict : status->conflicts)
+                update.problems << QString::fromStdString(conflict.uuid);
+        } else if (!status->error.empty()) {
+            update.error = tr("Saved edits could not be pushed: %1").arg(QString::fromStdString(status->error));
+        } else if (!status->pending.empty()) {
+            update.error = tr("%n saved edit(s) were not pushed", nullptr, int(status->pending.size()));
+        }
+        if (!update.error.isEmpty()) {
+            finishInputUpdate(update, serial);
+            return;
+        }
+        sendInputUpdate(request, status->position, serial);
+    });
+    watcher->setFuture(QtConcurrent::run([session, attachment]() -> Pushed {
+        try {
+            return {session->syncHubAndWait(attachment, std::chrono::seconds(120)), QString()};
+        } catch (const std::exception& error) {
+            return {std::nullopt, QString::fromUtf8(error.what())};
+        }
+    }));
+}
+
+void SpiralServiceManager::sendInputUpdate(QJsonObject request, qint64 requested, quint64 serial)
+{
+    emit inputUpdateProgress(QStringLiteral("linking"),
+                             tr("Linking and pinning a position including %1…").arg(requested));
+    QJsonObject run = request.value(QStringLiteral("run")).toObject();
+    QJsonObject config = run.value(QStringLiteral("config")).toObject();
+    for (const QString& key : _serviceOwnedKeys) config.remove(key);
+    run[QStringLiteral("config")] = config;
+    QJsonObject body{{QStringLiteral("run"), run},
+                     {QStringLiteral("inputs_position"), requested},
+                     {QStringLiteral("command_id"), commandId()}};
+    const bool initialize = !_hasActiveSession;
+    // An idle fit keeps training across the update; a failed one is rebuilt.
+    // Any other state (a run, a build) is the user's to stop first: a
+    // rebuild would discard the model the update means to keep.
+    const bool update = !initialize && _sessionState == QStringLiteral("Idle");
+    if (!initialize && !update && _sessionState != QStringLiteral("Error")) {
+        InputUpdate busy;
+        busy.requested = requested;
+        busy.error = tr("The fit is %1: stop it, then update its inputs").arg(_sessionState);
+        finishInputUpdate(busy, serial);
+        return;
+    }
+    QString route = QStringLiteral("/session/initialize");
+    if (update) {
+        route = QStringLiteral("/session/update-inputs");
+        body = {{QStringLiteral("inputs_position"), requested},
+                {QStringLiteral("expected_input_generation"), _inputGeneration},
+                {QStringLiteral("command_id"), commandId()}};
+    } else if (!initialize) {
+        route = QStringLiteral("/session/rebuild");
+        body[QStringLiteral("inputs")] = QStringLiteral("reload");
+    }
+    auto failed = [this, requested, serial](const QString& message, const QJsonObject& body) {
+        InputUpdate update;
+        update.requested = requested;
+        update.error = message;
+        const QJsonObject failure = body.value(QStringLiteral("input_preparation_error")).toObject();
+        for (const QJsonValue& problem : failure.value(QStringLiteral("problems")).toArray())
+            update.problems << problem.toString();
+        if (!body.isEmpty()) handleStatus(body);
+        finishInputUpdate(update, serial);
+    };
+    auto post = [this, route, requested, serial, failed](const QJsonObject& body) {
+        postWithRetry(route, body, Timeout::Load, kMutationRetries,
+                      [this, requested, serial](const QJsonObject& response) {
+                          handleStatus(response);
+                          const QJsonObject position = response.value(QStringLiteral("input_position")).toObject();
+                          InputUpdate update;
+                          update.requested = requested;
+                          update.head = position.value(QStringLiteral("head")).toInteger(-1);
+                          update.fitted = position.value(QStringLiteral("sequence")).toInteger(-1);
+                          if (update.fitted < 0) update.error = tr("The service reported no fitted position");
+                          finishInputUpdate(update, serial);
+                      },
+                      {}, failed);
+    };
+    // A build (not an update of the resident fit) reads the project again.
+    if (update)
+        post(body);
+    else
+        withProject(body, post, [failed](const QString& error) { failed(error, {}); });
+}
+
+void SpiralServiceManager::finishInputUpdate(InputUpdate update, quint64 serial)
+{
+    if (serial != _inputUpdateSerial) return;  // abandoned
+    // Pushes resume; then pull to (at least) the fitted position, so the
+    // service's links and any edits it included are here. A shared store
+    // holds them already.
+    _inputUpdateHold.reset();
+    _inputUpdateAttachment.reset();
+    const auto session = _storeSession.lock();
+    if (!update.error.isEmpty() || !session || !_storeAttachment) {
+        _inputUpdateActive = false;
+        emit inputUpdateFinished(update);
+        return;
+    }
+    const bool hub = _storeBinding.hosted();
+    if (hub)
+        emit inputUpdateProgress(QStringLiteral("pulling"), tr("Pulling the fitted position %1…").arg(update.fitted));
+    const vc::objects::AttachmentIdentity attachment = *_storeAttachment;
+    auto* watcher = new QFutureWatcher<InputUpdate>(this);
+    connect(watcher, &QFutureWatcher<InputUpdate>::finished, this, [this, watcher, serial]() {
+        const InputUpdate result = watcher->result();
+        watcher->deleteLater();
+        if (serial != _inputUpdateSerial) return;  // abandoned
+        _inputUpdateActive = false;
+        refreshLocalHub();
+        emit inputUpdateFinished(result);
+    });
+    watcher->setFuture(QtConcurrent::run([session, attachment, update, hub]() mutable {
+        auto describe = [](const vc::objects::JournalEntry& entry) {
+            return QStringLiteral("%1 %2 %3 (%4)").arg(QString::fromStdString(entry.changeKind),
+                QString::fromStdString(entry.kind), QString::fromStdString(entry.recordUuid),
+                QString::fromStdString(entry.author));
+        };
+        // The hub's journal, or a shared store's own.
+        auto journal = [&](int64_t after, int64_t upTo) {
+            if (hub) return session->hubJournal(attachment, after, upTo);
+            std::vector<vc::objects::JournalEntry> entries;
+            session->read(attachment, [&](const vc::objects::ObjectStore& store, const vc::objects::ReadTxn& txn,
+                                          const std::atomic_bool&) { entries = store.journalSince(txn, after); });
+            std::erase_if(entries, [&](const auto& entry) { return entry.seq > upTo; });
+            return entries;
+        };
+        try {
+            qint64 position = -1;
+            if (hub) {
+                if (const auto status = session->syncHubAndWait(attachment, std::chrono::seconds(120)))
+                    position = status->position;
+            } else {
+                position = storeHead(*session, attachment);
+            }
+            if (update.head > update.requested)
+                for (const auto& entry : journal(update.requested, update.head))
+                    update.includedBeyondRequested << describe(entry);
+            if (position > update.fitted)
+                for (const auto& entry : journal(update.fitted, position))
+                    update.afterFitted << describe(entry);
+        } catch (const std::exception& error) {
+            update.problems << QObject::tr("Pulling the fitted position failed: %1").arg(QString::fromUtf8(error.what()));
+        }
+        return update;
+    }));
+}
+
 void SpiralServiceManager::rebuildWithDefaults()
 {
     if (!isReady()) return;
@@ -639,20 +1052,167 @@ void SpiralServiceManager::rebuildWithDefaults()
                         {QStringLiteral("command_id"), commandId()}});
 }
 
+void SpiralServiceManager::withProject(QJsonObject body, std::function<void(QJsonObject)> send,
+                                       std::function<void(const QString&)> failed)
+{
+    std::optional<vc3d::spiral::ProjectLasagna> lasagna;
+    try {
+        if (!_projectSource) {
+            failed(tr("No project is open"));
+            return;
+        }
+        lasagna = _projectLasagna();
+    } catch (const std::exception& error) {
+        failed(tr("The project's Spiral inputs could not be read: %1").arg(QString::fromUtf8(error.what())));
+        return;
+    }
+    auto finish = [this, send, failed](QJsonObject body,
+                                       const std::optional<vc3d::spiral::ProjectLasagna>& lasagna) {
+        try {
+            body[QStringLiteral("project")] = _projectSource(lasagna);
+        } catch (const std::exception& error) {
+            failed(tr("The project's Spiral inputs could not be read: %1").arg(QString::fromUtf8(error.what())));
+            return;
+        }
+        send(body);
+    };
+    // Only a service on this host reads the cache's arrays, and only one that
+    // builds missing packs reads arrays at all.
+    const bool localPacking =
+        _profile.isLocalhost()
+        && _advertisedBindings.value(QStringLiteral("capabilities")).toObject()
+               .value(QStringLiteral("build_missing_lasagna_packs")).toBool();
+    if (!localPacking || !lasagna || !lasagna->error.empty() || lasagna->remoteGroups.empty()) {
+        finish(body, lasagna);
+        return;
+    }
+    const auto cached = vc3d::spiral::withCachedStores(*lasagna);
+    if (!cached.error.empty()) {
+        finish(body, cached);
+        return;
+    }
+    // Only the arrays of the packs this build reads: the service resolves
+    // the request's configuration (a checkpoint's included) and names them.
+    // Without an answer (an older service, a request it refuses), every
+    // missing pack's arrays are cached as before.
+    QJsonObject query = body;
+    try {
+        query[QStringLiteral("project")] = _projectSource(lasagna);
+    } catch (const std::exception& error) {
+        failed(tr("The project's Spiral inputs could not be read: %1").arg(QString::fromUtf8(error.what())));
+        return;
+    }
+    const quint64 queried = _connectionGeneration;
+    auto cacheFor = [this, queried, body, lasagna = *lasagna, cached, finish,
+                     failed](const std::optional<std::set<std::string>>& kinds) {
+        if (queried != _connectionGeneration) return;
+        const QString spiralCache = _advertisedBindings.value(QStringLiteral("bindings")).toObject()
+                                        .value(QStringLiteral("cache_directory")).toString();
+        cacheLasagnaThenSend(body, lasagna, cached,
+                             vc3d::spiral::lasagnaGroupsToCache(lasagna, spiralCache.toStdString(), kinds),
+                             finish, failed);
+    };
+    post(QStringLiteral("/session/lasagna-packs"), query, Timeout::Command,
+         [cacheFor](const QJsonObject& response) {
+             std::set<std::string> kinds;
+             for (const auto& kind : response.value(QStringLiteral("packs")).toArray())
+                 kinds.insert(kind.toString().toStdString());
+             cacheFor(kinds);
+         },
+         [cacheFor](const QString&) { cacheFor(std::nullopt); });
+}
+
+void SpiralServiceManager::cacheLasagnaThenSend(
+    QJsonObject body, const vc3d::spiral::ProjectLasagna& lasagna,
+    const vc3d::spiral::ProjectLasagna& cached,
+    std::vector<vc::lasagna::LasagnaChannelGroup> groups,
+    std::function<void(QJsonObject, const std::optional<vc3d::spiral::ProjectLasagna>&)> finish,
+    std::function<void(const QString&)> failed)
+{
+    if (groups.empty()) {
+        finish(body, cached);
+        return;
+    }
+    if (_lasagnaCacheCancel) {
+        failed(tr("The project's Lasagna arrays are already being cached for an earlier request"));
+        return;
+    }
+    auto cancel = std::make_shared<std::atomic<bool>>(false);
+    _lasagnaCacheCancel = cancel;
+    emit logMessage(tr("Caching the remote Lasagna arrays the local service packs from (%1)…")
+                        .arg(QString::fromStdString(lasagna.location)));
+    const quint64 generation = _connectionGeneration;
+    auto* watcher = new QFutureWatcher<QString>(this);
+    auto lastLogged = std::make_shared<int>(-1);
+    connect(watcher, &QFutureWatcher<QString>::progressTextChanged, this,
+            [this, watcher, lastLogged](const QString& text) {
+                // One line per tenth of the arrays.
+                const int tenth = watcher->progressValue() / 100;
+                if (tenth == *lastLogged) return;
+                *lastLogged = tenth;
+                emit logMessage(text);
+            });
+    connect(watcher, &QFutureWatcher<QString>::finished, this,
+            [this, watcher, cancel, generation, body, cached, finish, failed]() {
+                watcher->deleteLater();
+                if (_lasagnaCacheCancel == cancel) _lasagnaCacheCancel.reset();
+                if (generation != _connectionGeneration || cancel->load()) return;
+                const QString error = watcher->result();
+                if (!error.isEmpty()) {
+                    failed(tr("The project's remote Lasagna arrays could not be cached: %1").arg(error));
+                    return;
+                }
+                emit logMessage(tr("The remote Lasagna arrays are cached"));
+                finish(body, cached);
+            });
+    watcher->setFuture(QtConcurrent::run([groups, cancel](QPromise<QString>& promise) {
+        promise.setProgressRange(0, 1000);
+        try {
+            for (std::size_t i = 0; i < groups.size(); ++i) {
+                const auto directory = *vc::lasagna::lasagnaChannelArrayCacheDirectory(groups[i]);
+                const bool done = vc::lasagna::cacheLasagnaChannelArray(
+                    groups[i],
+                    [&](const vc::lasagna::LasagnaArrayCacheProgress& progress) {
+                        const double share = (double(i) + double(progress.done) / double(progress.total))
+                                             / double(groups.size());
+                        promise.setProgressValueAndText(
+                            int(share * 1000),
+                            QObject::tr("Caching Lasagna array %1 of %2 (%3): %4 of %5 objects")
+                                .arg(i + 1).arg(groups.size())
+                                .arg(QString::fromStdString(directory.string()))
+                                .arg(progress.done).arg(progress.total));
+                    },
+                    [&]() { return cancel->load() || promise.isCanceled(); });
+                if (!done) {
+                    promise.addResult(QObject::tr("cancelled"));
+                    return;
+                }
+            }
+            promise.addResult(QString());
+        } catch (const std::exception& error) {
+            promise.addResult(QString::fromUtf8(error.what()));
+        }
+    }));
+}
+
 void SpiralServiceManager::sendRebuildRequest(QJsonObject request)
 {
-    postWithRetry(QStringLiteral("/session/rebuild"), request, Timeout::Load, kMutationRetries,
-                  [this](const QJsonObject& response) {
-                      handleStatus(response);
-                  });
+    withProject(std::move(request), [this](QJsonObject request) {
+        postWithRetry(QStringLiteral("/session/rebuild"), request, Timeout::Load, kMutationRetries,
+                      [this](const QJsonObject& response) {
+                          handleStatus(response);
+                      });
+    }, [this](const QString& error) { emit errorOccurred(error); });
 }
 
 void SpiralServiceManager::sendInitializeRequest(QJsonObject request)
 {
-    postWithRetry(QStringLiteral("/session/initialize"), request, Timeout::Load,
-                  kMutationRetries, [this](const QJsonObject& response) {
-                      handleStatus(response);
-                  });
+    withProject(std::move(request), [this](QJsonObject request) {
+        postWithRetry(QStringLiteral("/session/initialize"), request, Timeout::Load,
+                      kMutationRetries, [this](const QJsonObject& response) {
+                          handleStatus(response);
+                      });
+    }, [this](const QString& error) { emit errorOccurred(error); });
 }
 
 void SpiralServiceManager::uploadCheckpointForResume(
@@ -807,7 +1367,7 @@ void SpiralServiceManager::saveCheckpoint(const QString& name)
                       handleStatus(response);
                       // The saved file joins the checkpoints the service
                       // advertises, which is what a load offers to choose from.
-                      fetchAdvertisedDataset();
+                      fetchAdvertisedBindings();
                   });
 }
 
@@ -837,10 +1397,9 @@ void SpiralServiceManager::requestPreview()
 QStringList SpiralServiceManager::serviceCheckpoints() const
 {
     QStringList paths;
-    for (const QString& key : {QStringLiteral("session_checkpoints"),
-                               QStringLiteral("detected_checkpoints")})
-        for (const QJsonValue& value : _advertisedDataset.value(key).toArray())
-            if (!value.toString().isEmpty()) paths.push_back(value.toString());
+    for (const QJsonValue& value :
+         _advertisedBindings.value(QStringLiteral("session_checkpoints")).toArray())
+        if (!value.toString().isEmpty()) paths.push_back(value.toString());
     return paths;
 }
 
@@ -1059,7 +1618,15 @@ void SpiralServiceManager::handleReply(QNetworkReply* reply, quint64 generation,
     if (generation != _connectionGeneration) return;
     if (networkError != QNetworkReply::NoError && http == 0) {
         // Unreachable / timeout: distinguish from service-reported errors.
-        const QString message = tr("Spiral service is unreachable: %1").arg(networkErrorString);
+        // Nothing here aborts a reply, so a cancelled one hit its transfer
+        // timeout: the service is up but busy, which "unreachable" misstates.
+        const int timeoutMs = reply->request().transferTimeout();
+        const QString message =
+            networkError == QNetworkReply::OperationCanceledError && timeoutMs > 0
+                ? tr("Spiral service did not answer %1 within %2 s")
+                      .arg(reply->url().path())
+                      .arg(timeoutMs / 1000)
+                : tr("Spiral service is unreachable: %1").arg(networkErrorString);
         if (detailedFailure) detailedFailure(message, {});
         else if (failure) failure(message);
         else emit errorOccurred(message);
@@ -1184,12 +1751,27 @@ void SpiralServiceManager::handleStatus(const QJsonObject& status)
     const QString sessionId =
         status.value(QStringLiteral("session_id")).toString();
     // A session identity appears when explicit initialization starts. Until
-    // then the service remains connected for dataset/checkpoint discovery.
+    // then the service remains connected for binding/checkpoint discovery.
     const bool active = !sessionId.isEmpty();
     if (active != _hasActiveSession) {
         _hasActiveSession = active;
         emit sessionActiveChanged(active);
     }
+    _sessionState = status.value(QStringLiteral("state")).toString();
+    _inputGeneration = status.value(QStringLiteral("input_generation")).toInteger();
+    // The display follows the fitted position: a replica behind it pulls
+    // forward (bringing the service's links); one ahead shows later edits
+    // as stale through the input freshness. One sync is asked for per fitted
+    // position; the session's periodic sync retries one that failed (an
+    // unreachable hub), rather than every status poll.
+    const qint64 fitted = status.value(QStringLiteral("input_position")).toObject()
+                              .value(QStringLiteral("sequence")).toInteger(-1);
+    if (_storeBinding.hosted() && fitted > _storeBinding.localPosition && fitted != _forwardSyncPosition
+        && _storeBinding.matches() && !_inputUpdateActive)
+        if (const auto session = _storeSession.lock(); session && _storeAttachment) {
+            _forwardSyncPosition = fitted;
+            session->syncHub(*_storeAttachment);
+        }
     if (!active) {
         _synchronizedSessionId.clear();
         _installedPreviewSession.clear();
@@ -1201,7 +1783,6 @@ void SpiralServiceManager::handleStatus(const QJsonObject& status)
         if (!request.isEmpty()) {
             _synchronizedSessionId = sessionId;
             emit sessionSynchronized(request, status);
-            if (_inputOwner) refreshInputCatalog();
         }
     }
     // Pausing no longer exports a preview by itself. Ask for one exactly
@@ -1257,8 +1838,12 @@ void SpiralServiceManager::syncArtifacts(const QJsonObject& status)
                     const auto provenance =
                         vc3d::spiralPreviewProvenance(manifest);
                     _displayedPreviewSourceIteration = provenance.sourceIteration;
+                    _displayedPreviewInputDigest = provenance.inputDigest;
+                    _displayedPreviewInputPosition = provenance.inputPosition;
                 } else {
                     _displayedPreviewSourceIteration = -1;
+                    _displayedPreviewInputDigest.clear();
+                    _displayedPreviewInputPosition = -1;
                 }
                 // A newly installed surface has no overlays until its own
                 // diagnostics artifact arrives; the previous generation's
@@ -1266,7 +1851,7 @@ void SpiralServiceManager::syncArtifacts(const QJsonObject& status)
                 _installedDiagnosticsArtifact.clear();
                 emit previewAvailable(entryPath, sequence);
                 _artifactCache->pruneSession(
-                    sessionId, kPreviewCacheKept, pclArtifactCachePins());
+                    sessionId, kPreviewCacheKept, artifactCachePins());
             });
     }
 
@@ -1299,55 +1884,44 @@ void SpiralServiceManager::syncArtifacts(const QJsonObject& status)
                 _lastDiagnosticsLocalPath = entryPath;
                 emit previewDiagnosticsAvailable(entryPath, sequence);
                 _artifactCache->pruneSession(
-                    sessionId, kPreviewCacheKept, pclArtifactCachePins());
+                    sessionId, kPreviewCacheKept, artifactCachePins());
             });
     }
 
-    // Each editable PCL role publishes its own display-only snapshot.
-    for (const auto role : vc3d::spiral::kEditablePclRoles) {
-        const std::size_t slot = vc3d::spiral::pclRoleIndex(role);
-        const QJsonObject artifactRef =
-            status.value(vc3d::spiral::pclRoleStatusKey(role)).toObject();
-        const QString artifactId = artifactRef.value(QStringLiteral("id")).toString();
-        if (artifactId.isEmpty() || artifactId == _installedPclArtifact[slot]
-            || artifactId == _fetchingPclArtifact[slot])
-            continue;
-        _fetchingPclArtifact[slot] = artifactId;
-        const quint64 sequence = ++_pclSequence[slot];
+    // The frozen inputs' manifest: one immutable artifact per session, from
+    // which the workspace reads the fitted inputs at their pinned revisions.
+    const QJsonObject manifestRef =
+        status.value(QStringLiteral("input_manifest_artifact")).toObject();
+    const QString manifestId = manifestRef.value(QStringLiteral("id")).toString();
+    if (!manifestId.isEmpty() && manifestId != _installedInputManifest
+        && manifestId != _fetchingInputManifest) {
+        _fetchingInputManifest = manifestId;
+        const QString digest = manifestRef.value(QStringLiteral("input_digest")).toString();
         const quint64 generation = _connectionGeneration;
         _artifactCache->fetchArtifact(
-            sessionId, artifactId,
-            [this, sessionId, role, slot, artifactId, artifactRef, generation, sequence](
+            sessionId, manifestId,
+            [this, sessionId, manifestId, digest, generation](
                 const QString& entryPath, const QString& error, bool gone) {
                 if (generation != _connectionGeneration) return;
-                // A later snapshot of this role supersedes this download,
-                // including its errors and source revision.
-                if (sequence != _pclSequence[slot]) return;
-                if (_fetchingPclArtifact[slot] == artifactId)
-                    _fetchingPclArtifact[slot].clear();
+                if (_fetchingInputManifest == manifestId) _fetchingInputManifest.clear();
                 if (entryPath.isEmpty()) {
                     if (!gone) emit errorOccurred(error);
                     return;
                 }
-                _installedPclArtifact[slot] = artifactId;
-                _lastPclLocalPath[slot] = entryPath;
-                emit pclArtifactAvailable(role, entryPath, artifactRef);
-                // PCL-only edits republish this artifact without a new
-                // preview, and only the preview callbacks pruned the cache,
-                // so repeated commits left every superseded snapshot on disk
-                // until the next preview arrived. The active preview,
-                // diagnostics and PCL snapshots are pinned.
+                _installedInputManifest = manifestId;
+                _lastInputManifestLocalPath = entryPath;
+                emit inputManifestAvailable(entryPath, digest);
                 _artifactCache->pruneSession(
-                    sessionId, kPreviewCacheKept, pclArtifactCachePins());
+                    sessionId, kPreviewCacheKept, artifactCachePins());
             });
     }
 }
 
-QStringList SpiralServiceManager::pclArtifactCachePins() const
+QStringList SpiralServiceManager::artifactCachePins() const
 {
     return vc3d::spiralArtifactCachePins(
         _lastPreviewLocalPath, _lastDiagnosticsLocalPath,
-        QStringList(_lastPclLocalPath.begin(), _lastPclLocalPath.end()));
+        {_lastInputManifestLocalPath});
 }
 
 void SpiralServiceManager::fetchPreviewFile(const QString& relativeName,

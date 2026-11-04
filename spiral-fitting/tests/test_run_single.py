@@ -144,7 +144,8 @@ def test_fit_environment_can_disable_wandb(tmp_path, monkeypatch):
 
 def test_parser_accepts_config_and_wandb_options(tmp_path):
     args = run_single.build_parser().parse_args([
-        "--dataset", str(tmp_path / "dataset"),
+        "--inputs", str(tmp_path / "spiral-inputs.json"),
+        "--object-store", str(tmp_path / "inputs.vcobj"),
         "--ink-volume", str(tmp_path / "ink"),
         "--config", str(tmp_path / "config.json"),
         "--wandb-group", "experiment-1",
@@ -182,6 +183,23 @@ def test_overwrite_output_refuses_to_delete_a_directory_containing_an_input(
         run_single.overwrite_output(output, protected_paths=(dataset,))
 
     assert dataset.is_dir()
+
+
+@pytest.mark.parametrize("symlink", [False, True])
+def test_overwrite_refuses_output_containing_object_store(tmp_path, symlink):
+    args = _runner_args(tmp_path, "--overwrite")
+    args.output.mkdir()
+    store = args.output / "inputs.vcobj"
+    store.write_bytes(b"preserve object store")
+    if symlink:
+        args.object_store.symlink_to(store)
+    else:
+        args.object_store = store
+
+    with pytest.raises(ValueError, match="containing an input"):
+        run_single.run(args)
+
+    assert store.read_bytes() == b"preserve object store"
 
 
 def test_overwrite_and_resume_are_mutually_exclusive(tmp_path):
@@ -235,7 +253,8 @@ def test_parse_gpu_ids_rejects_duplicates(text):
 def test_parser_no_longer_accepts_overrides(tmp_path):
     with pytest.raises(SystemExit):
         run_single.build_parser().parse_args([
-            "--dataset", str(tmp_path / "dataset"),
+            "--inputs", str(tmp_path / "spiral-inputs.json"),
+            "--object-store", str(tmp_path / "inputs.vcobj"),
             "--ink-volume", str(tmp_path / "ink"),
             "--overrides", str(tmp_path / "config.json"),
         ])
@@ -273,12 +292,17 @@ def test_run_id_rejects_unsafe_values(value):
 
 
 def _runner_args(tmp_path, *extra):
-    return run_single.build_parser().parse_args([
-        "--dataset", str(tmp_path / "dataset"),
+    args = run_single.build_parser().parse_args([
+        "--inputs", str(tmp_path / "spiral-inputs.json"),
+        "--object-store", str(tmp_path / "inputs.vcobj"),
         "--ink-volume", str(tmp_path / "ink"),
         "--output", str(tmp_path / "output"),
         *extra,
     ])
+    if args.resume and not args.object_store.exists():
+        vos = pytest.importorskip("vc_object_store")
+        vos.ObjectStore.create(str(args.object_store), author="pytest").close()
+    return args
 
 
 def test_render_artifact_requires_at_least_one_strip_image(tmp_path):
@@ -398,6 +422,39 @@ def _write_pending_resume_state(tmp_path, *, gpus="0"):
     return args, invocation, state, state_path
 
 
+@pytest.mark.parametrize("store_change", ["different", "relocated", "replica", "legacy"])
+def test_completed_fit_resume_checks_store_identity(tmp_path, store_change):
+    args, invocation, state, state_path = _write_pending_resume_state(tmp_path)
+    fitted = args.output / "fitted"
+    fitted.mkdir()
+    state["runs"]["1"]["fit"] = {"status": "complete", "fitted_output": "fitted"}
+    original_uuid = invocation["inputs"]["object_store_uuid"]
+    if store_change == "legacy":
+        del state["invocation"]["inputs"]["object_store_uuid"]
+    else:
+        destination = tmp_path / "other.vcobj"
+        if store_change == "different":
+            vos = pytest.importorskip("vc_object_store")
+            vos.ObjectStore.create(str(destination), author="pytest").close()
+        elif store_change == "relocated":
+            args.object_store.rename(destination)
+        else:
+            vos = pytest.importorskip("vc_object_store")
+            vos.hub_init(str(args.object_store), "pytest")
+            vos.hub_clone(str(args.object_store), str(destination), "replica")
+        args.object_store = destination
+    run_single._atomic_write_json(state_path, state)
+    resumed = run_single._resume_invocation(args, {}, "project", "entity")
+
+    if store_change in {"different", "legacy"}:
+        with pytest.raises(RuntimeError, match="does not match"):
+            run_single._load_or_create_state(args.output.resolve(), resumed)
+    else:
+        assert resumed["inputs"]["object_store_uuid"] == original_uuid
+        loaded, _ = run_single._load_or_create_state(args.output.resolve(), resumed)
+        assert loaded["runs"]["1"]["fit"]["status"] == "complete"
+
+
 def test_resume_can_change_gpu_count_while_fits_are_pending(tmp_path):
     _args, _invocation, _state, state_path = _write_pending_resume_state(
         tmp_path, gpus="0")
@@ -505,6 +562,9 @@ def test_one_gpu_pins_entire_pipeline_without_distributed_launch(
 
     assert calls[0][0][:2] == [
         run_single.sys.executable, str(run_single.SPIRAL_DIR / "fit_spiral.py")]
+    fit = calls[0][0]
+    assert fit[fit.index("--object-store") + 1] == str(tmp_path / "inputs.vcobj")
+    assert "--object-store-author" not in fit
     assert all(env["CUDA_VISIBLE_DEVICES"] == "3" for _command, env in calls)
 
 

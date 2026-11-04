@@ -6,7 +6,7 @@ import sys
 
 import numpy as np
 import pytest
-from vc_object_store import ObjectStore, PointCollection, Fiber, Track, Surface, Umbilicus
+from vc_object_store import ObjectStore, PointCollection, Fiber, Track, Surface, Umbilicus, fiber_branch_control_index
 from object_helpers import edge_choice
 
 
@@ -366,7 +366,7 @@ def test_fiber_branch_transfer_preserves_identity_approval_and_stable_ids(db, tm
     assert 'optimization_mode' not in first
     with ObjectStore.create(str(tmp_path / 'imported.vcobj'), author='test') as other:
         report = other.ingest_geometry_source('fiber', directory)
-        assert report == dict(ingested=2, edges_imported=1, problems=[])
+        assert report == dict(ingested=2, edges_imported=1, problems=[], notices=[])
         edge = other.edges_by_kind('fiber_branch')[0]
         assert edge['uuid'] == edge_uuid and edge['approval_state'] == 'approved'
     # Conflicting reciprocal declarations must roll back the whole batch.
@@ -375,6 +375,21 @@ def test_fiber_branch_transfer_preserves_identity_approval_and_stable_ids(db, tm
     with ObjectStore.create(str(tmp_path / 'conflict.vcobj'), author='test') as other:
         assert other.ingest_geometry_source('fiber', directory)['problems']
         assert other.object_count('fiber') == 0
+
+
+def test_fiber_branch_control_index_resolves_stable_ids_not_positions(db):
+    anchor = lambda array, ident: dict(points=[dict(array=array, index=[ident])])
+    # Reordered, noncontiguous IDs: the anchor names an ID, never a position.
+    ids = [90, 10, 55]
+    assert fiber_branch_control_index(ids, anchor('control_point_ids', 10)) == 1
+    assert fiber_branch_control_index(ids, anchor('control_point_ids', 55)) == 2
+    for bad in (anchor('control_point_ids', 1), anchor('control_points', 1)):
+        with pytest.raises(RuntimeError, match='absent from selected geometry'):
+            fiber_branch_control_index(ids, bad)
+    two = dict(points=[dict(array='control_point_ids', index=[90]),
+                       dict(array='control_point_ids', index=[10])])
+    with pytest.raises(RuntimeError, match='one control point'):
+        fiber_branch_control_index(ids, two)
 
 
 def test_fiber_collection_and_linked_file_import_use_uuid_endpoints(db, tmp_path):
@@ -458,7 +473,7 @@ def test_version3_fiber_directory_import_resolves_links_by_file(tmp_path):
     with ObjectStore.create(str(tmp_path / 'v3.vcobj'), author='test') as store:
         report = store.ingest_geometry_source(
             'fiber', tmp_path / 'fibers', coordinate_context=dict(volume_uuid='20260411134726', scale_factor=1))
-        assert report == dict(ingested=3, edges_imported=1, problems=[])
+        assert report == dict(ingested=3, edges_imported=1, problems=[], notices=[])
         edge = store.edges_by_kind('fiber_branch')[0]
         assert {edge['a'], edge['b']} == set(ids[:2]) and edge['approval_state'] == 'approved'
         for uid in ids:
@@ -496,7 +511,7 @@ def test_uuidless_fiber_files_are_named_from_their_file_names(tmp_path):
     for store_name in ('a.vcobj', 'b.vcobj'):
         with ObjectStore.create(str(tmp_path / store_name), author='test') as store:
             assert store.ingest_geometry_source('fiber', tmp_path / 'fibers') == dict(
-                ingested=3, edges_imported=1, problems=[])
+                ingested=3, edges_imported=1, problems=[], notices=[])
             edge = store.edges_by_kind('fiber_branch')[0]
             assert {edge['a'], edge['b']} == expected
             assert store.object(str(uuid.uuid5(namespace, 'vc3d_fiber/' + version1)))['kind'] == 'fiber'
@@ -546,13 +561,146 @@ def test_scripts_edit_hosted_replicas_under_leases(tmp_path):
         assert lease['author'] == 'script'
         script.set_meta(fiber, 'review', 'done')
         assert script.hub_status()['pending'] == [fiber]
-        assert script.hub_sync() == {'pulled': 0, 'pushed': 1, 'conflicts': []}
+        report = script.hub_sync()
+        assert (report['pulled'], report['pushed'], report['conflicts']) == (0, 1, [])
+        assert report['published_position'] > report['pulled_position'] == script.hub_status()['position']
         assert viewer.hub_sync()['pulled'] == 1
         assert viewer.object(fiber)['meta']['review'] == 'done'
         with pytest.raises(RuntimeError, match='leased to script'):
             viewer.acquire_leases([fiber])
         script.release_leases([fiber])
         assert viewer.acquire_leases([fiber])[0]['author'] == 'viewer'
+
+
+def hosted_fibers(tmp_path, count, replicas=('service', 'editor'), link=False):
+    """A hub of count fibers (linked first to second if link), cloned once per replica name."""
+    import vc_object_store as vos
+    hub = str(tmp_path / 'hub.vcobj')
+    with ObjectStore.create(hub, author='curator') as origin:
+        fibers = [put(origin, Fiber([[1, 2, 3 + i], [4, 5, 6 + i]], []), kind='fiber')[0] for i in range(count)]
+        whole = {'whole_geometry': True}
+        edge = link and origin.add_edge(dict(a=fibers[0], b=fibers[1], kind='related', a_anchor=whole, b_anchor=whole))
+        origin.checkpoint()
+    vos.hub_init(hub, 'curator')
+    paths = {name: str(tmp_path / f'{name}.vcobj') for name in replicas}
+    for name, path in paths.items():
+        vos.hub_clone(hub, path, name)
+    return fibers, edge, paths
+
+
+def test_conditional_push_and_position_reads(tmp_path):
+    """The Python surface of hub positions (their semantics are pinned in
+    test_object_store_hub_positions): a conditional push publishes only on the
+    expected head, and a position reads as it was from any replica."""
+    (first, second), _, paths = hosted_fibers(tmp_path, 2)
+    with ObjectStore.open(paths['service'], author='service') as service, \
+            ObjectStore.open(paths['editor'], author='editor') as editor:
+        head = service.hub_sync(pull=True, push=False)['pulled_position']
+        assert service.hub_status()['hub_replica'] and head == service.hub_status()['position'] > 0
+        anchor = dict(points=[dict(array='control_points', index=[0])])
+        edge = service.add_edge(dict(a=first, b=second, kind='fiber_branch', a_anchor=anchor, b_anchor=anchor))
+        editor.acquire_leases([second])
+        editor.set_meta(second, 'note', 'unrelated')  # an unrelated foreign commit after the head
+        foreign = editor.hub_sync()['published_position']
+        refused = service.hub_sync(pull=False, push=True, expected_head=head)
+        assert refused['head_mismatch'] and refused['hub_head'] == foreign and refused['pushed'] == 0
+        assert service.hub_status()['pending'] == [edge]
+        head = service.hub_sync(pull=True, push=False)['pulled_position']
+        pinned = service.hub_sync(pull=False, push=True, expected_head=head)
+        assert not pinned['head_mismatch'] and pinned['published_position'] > head
+        position = pinned['published_position']
+        editor.set_meta(second, 'note', 'later')
+        editor.hub_sync()
+        view = service.hub_read_view_at(position)
+        records = {revision['object_uuid']: revision['record'] for revision in view['objects']}
+        assert records[second]['meta']['note'] == 'unrelated'
+        [relationship] = view['relationships']
+        assert relationship['record']['uuid'] == edge and relationship['applicable']
+        assert service.hub_selection_at(position) == view['selection']
+        assert service.hub_read_view_at(position, [first])['selection'].keys() == {first}
+        assert editor.hub_read_view_at(position)['selection'] == view['selection']
+
+
+@pytest.mark.parametrize('action', ['retain', 'remove'])
+def test_a_revert_brings_the_endpoints_its_edge_is_bound_to(tmp_path, action):
+    """The hub's current edge can be bound to endpoint geometry changed since
+    this replica last pulled: reverting installs it with that geometry."""
+    import vc_object_store as vos
+    from test_overlap_correspondences import patch, flat, LOW, HIGH
+    hub = str(tmp_path / 'hub.vcobj')
+    whole = dict(whole_geometry=True)
+    with ObjectStore.create(hub, author='curator') as origin:
+        patch(origin, LOW, flat())
+        _, geometry = patch(origin, HIGH, flat(10))
+        edge = origin.add_edge(dict(a=LOW, b=HIGH, kind='related', a_anchor=whole, b_anchor=whole))
+        origin.checkpoint()
+    vos.hub_init(hub, 'curator')
+    for name in ('service', 'editor'):
+        vos.hub_clone(hub, str(tmp_path / f'{name}.vcobj'), name)
+    with ObjectStore.open(str(tmp_path / 'service.vcobj'), author='service') as service:
+        service.set_meta(edge, 'note', 'service')
+    with ObjectStore.open(str(tmp_path / 'editor.vcobj'), author='editor') as editor:
+        editor.acquire_leases([HIGH])
+        _, moved = patch(editor, None, flat(11))
+        geometry = dict(geometry, arrays=moved['arrays'])
+        editor.put_geometry(HIGH, geometry, expected_revision=editor.current_geometry(HIGH)['uuid'],
+                            edge_edits=[edge_choice(editor, e['uuid'], action)
+                                        for e in editor.affected_geometry_edges(HIGH, geometry)])
+        if action == 'retain':
+            editor.set_meta(edge, 'note', 'editor')
+        assert not editor.hub_sync(pull=True, push=True)['conflicts']
+        expected = editor.edge(edge)
+        state = expected and editor.edge_geometry_state(edge)
+        moved_geometry = editor.current_geometry(HIGH)['uuid']
+    with ObjectStore.open(str(tmp_path / 'service.vcobj'), author='service') as service:
+        assert service.hub_revert() == 1
+        status = service.hub_status()
+        assert status['pending'] == [] and status['conflicts'] == []
+        assert service.current_geometry(HIGH)['uuid'] == moved_geometry
+        assert service.edge(edge) == expected
+        if expected:
+            assert service.edge(edge)['meta']['note'] == 'editor'
+            assert service.edge_geometry_state(edge) == state
+        assert not service.hub_sync(pull=True, push=False)['conflicts']
+
+
+def test_a_position_needs_only_the_geometry_it_reads(tmp_path):
+    """A replica that has not pulled an object's geometry still reads the
+    other objects of a position; only a read naming that object needs it."""
+    (first,), _, paths = hosted_fibers(tmp_path, 1)
+    with ObjectStore.open(paths['editor'], author='editor') as db:
+        added, _ = put(db, Fiber([[7, 8, 9], [1, 1, 1]], []), kind='fiber')
+        position = db.hub_sync()['published_position']
+    with ObjectStore.open(paths['service'], author='service') as service:
+        assert service.hub_read_view_at(position, [first])['selection'].keys() == {first}
+        assert service.hub_read_view_at(position, geometry=False)['selection'].keys() == {first, added}
+        with pytest.raises(RuntimeError, match='lacks geometry of ' + added):
+            service.hub_read_view_at(position)
+
+
+def test_a_session_resolves_a_link_conflict_to_the_hub(tmp_path):
+    """Regression: the session worker's resolve loop read its conflicts
+    from a destroyed temporary."""
+    import time
+    import vc_object_store as vos
+    _, edge, paths = hosted_fibers(tmp_path, 2, ('mine', 'theirs'), link=True)
+    session = vos.ObjectStoreSession()
+    mine = session.attach(paths['mine'], 'mine', sync_interval_ms=100, push_delay_ms=20)
+    with session.hold_pushes(mine):
+        with ObjectStore.open(paths['mine'], author='mine') as db:
+            db.set_meta(edge, 'note', 'mine')
+        with ObjectStore.open(paths['theirs'], author='theirs') as db:
+            db.set_meta(edge, 'note', 'theirs')
+            db.hub_sync()
+        assert [c['uuid'] for c in session.sync_hub_and_wait(mine, timeout_s=20)['conflicts']] == [edge]
+    session.resolve_hub_conflicts(mine, 'hub')
+    deadline = time.monotonic() + 20
+    while session.hub_status(mine)['conflicts']:
+        assert time.monotonic() < deadline, session.hub_status(mine)['error']
+        time.sleep(0.05)
+    with ObjectStore.open(paths['mine'], read_only=True) as db:
+        assert db.edge(edge)['meta']['note'] == 'theirs'
+    session.detach(mine)
 
 
 def test_service_edits_a_hosted_surface_through_a_session(tmp_path):

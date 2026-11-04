@@ -1,6 +1,6 @@
 #include "SpiralPanel.hpp"
+#include "SpiralPreviewProvenance.hpp"
 #include "SpiralInputRows.hpp"
-#include "SpiralActivityWidget.hpp"
 #include "SpiralDescriptions.hpp"
 #include "SpiralInputFilter.hpp"
 
@@ -81,16 +81,6 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
     auto* statusDock = new QWidget(this);
     auto* statusDockLayout = new QVBoxLayout(statusDock);
     statusDockLayout->setContentsMargins(0, 0, 0, 0);
-    auto* inputActivity = new SpiralActivityWidget(statusDock);
-    statusDockLayout->addWidget(inputActivity);
-    connect(_service, &SpiralServiceManager::inputPreparationProgress,
-            inputActivity, &SpiralActivityWidget::setPreparation);
-    connect(_service, &SpiralServiceManager::inputCopyProgress,
-            inputActivity, &SpiralActivityWidget::setCopy);
-    connect(_service, &SpiralServiceManager::connectionStateChanged, inputActivity,
-            [inputActivity](SpiralServiceManager::ConnectionState state, const QString&) {
-                if (state != SpiralServiceManager::ConnectionState::Ready) inputActivity->reset();
-            });
 
     auto makeSection = [this, contents, layout](const QString& title,
                                                 const QString& objectName,
@@ -174,9 +164,9 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
     describe(QStringLiteral("service_api_key"), {_apiKeyRow});
 
     // Local launch binding: the owned service is started with these values as
-    // --dataset/--output/--cache; selecting a different dataset restarts the
-    // bound service instance. Remote services advertise their immutable paths
-    // through /dataset instead.
+    // --output/--cache/--winding-inference; changing one restarts the bound
+    // service instance. Remote services are configured on their hosts and
+    // advertise their bindings through /bindings instead.
     auto makeLaunchRow = [this, serviceContents, serviceForm](
                              QLineEdit*& edit, QWidget*& row,
                              const QString& label, const QString& placeholder) {
@@ -199,36 +189,15 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
             }
         });
     };
-    makeLaunchRow(_datasetRoot, _datasetRow, tr("Dataset"),
-                  tr("Dataset root (required for the local service)"));
-    describe(QStringLiteral("service_dataset"), {_datasetRow});
     makeLaunchRow(_outputRoot, _outputRow, tr("Output"),
-                  tr("Generated state root (default: per-dataset app data dir)"));
+                  tr("Generated state root (default: per-store app data dir)"));
     describe(QStringLiteral("service_output"), {_outputRow});
     makeLaunchRow(_cacheRoot, _cacheRow, tr("Cache"),
                   tr("Derived cache root (default: ~/.cache/vc3d/spiral)"));
     describe(QStringLiteral("service_cache"), {_cacheRow});
-
-    // One box, not a pair: the service advertises its own dataset root, so the
-    // only thing this viewer cannot know is where the same dataset is mounted
-    // here. Service paths are translated by swapping the advertised root for
-    // this local root.
-    _mappingRow = new QWidget(serviceContents);
-    auto* mappingLayout = new QHBoxLayout(_mappingRow);
-    mappingLayout->setContentsMargins(0, 0, 0, 0);
-    _mapLocalRoot = new QLineEdit(_mappingRow);
-    _mapLocalRoot->setPlaceholderText(tr("local mount of the service's dataset root"));
-    auto* browseLocalRoot = new QToolButton(_mappingRow);
-    browseLocalRoot->setText(QStringLiteral("…"));
-    mappingLayout->addWidget(_mapLocalRoot, 1);
-    mappingLayout->addWidget(browseLocalRoot);
-    serviceForm->addRow(tr("Local dataset path"), _mappingRow);
-    describe(QStringLiteral("service_local_dataset_path"), {_mappingRow});
-    connect(browseLocalRoot, &QToolButton::clicked, this, [this]() {
-        const QString chosen = QFileDialog::getExistingDirectory(
-            this, tr("Select the local dataset root"), _mapLocalRoot->text());
-        if (!chosen.isEmpty()) _mapLocalRoot->setText(chosen);
-    });
+    makeLaunchRow(_windingInferenceRoot, _windingInferenceRow, tr("Winding inference"),
+                  tr("Optional winding-inference directory (winding-model supervision)"));
+    describe(QStringLiteral("service_winding_inference"), {_windingInferenceRow});
 
     auto* connectRow = new QWidget(serviceContents);
     auto* connectLayout = new QHBoxLayout(connectRow);
@@ -248,70 +217,57 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
     describe(QStringLiteral("service_status"), {_connectionStatus});
 
     // ------------------------------------------------------------------
-    // Dataset and fit geometry
+    // Fit inputs and geometry
     // ------------------------------------------------------------------
-    auto* pathsGroup = makeSection(tr("Dataset and fit geometry"),
+    auto* pathsGroup = makeSection(tr("Fit inputs and geometry"),
                                    QStringLiteral("spiralDatasetGeometryGroup"),
                                    QStringLiteral("spiral/groups/dataset_geometry_expanded"));
     auto* pathsContents = new QWidget(pathsGroup->contentWidget());
     auto* pathsForm = new QFormLayout(pathsContents);
     pathsGroup->contentLayout()->addWidget(pathsContents);
 
-    addPathRow(pathsForm, "dataset_root", tr("Dataset root"), true);
-    // Read-only, because spiral-scroll.json in the dataset root is the only
-    // source of these: the service rejects a request that restates them. They
-    // are still shown, because a fit's meaning depends on them.
-    _scrollSummary = new QLabel(tr("No scroll specification loaded"), pathsContents);
+    // Read-only: the project's fit volume is the only source of these, and
+    // the service rejects a request that restates them. They are still shown,
+    // because a fit's meaning depends on them.
+    _scrollSummary = new QLabel(tr("From the project's fit volume when a fit is built"), pathsContents);
     _scrollSummary->setObjectName(QStringLiteral("spiralScrollSummary"));
     _scrollSummary->setWordWrap(true);
     _scrollSummary->setTextInteractionFlags(Qt::TextSelectableByMouse);
     pathsForm->addRow(tr("Scroll"), _scrollSummary);
     describe(QStringLiteral("scroll_summary"), {_scrollSummary});
+    // A fit setting (spiral_outward_sense): needed where the fit volume's
+    // orientation is not in the catalog, refused where it disagrees with it.
+    _outwardSense = new QComboBox(pathsContents);
+    _outwardSense->setObjectName(QStringLiteral("spiralOutwardSense"));
+    _outwardSense->addItem(tr("From the volume's orientation"), QString());
+    _outwardSense->addItem(tr("Clockwise (CW)"), QStringLiteral("CW"));
+    _outwardSense->addItem(tr("Anticlockwise (ACW)"), QStringLiteral("ACW"));
+    pathsForm->addRow(tr("Outward sense"), _outwardSense);
+    describe(QStringLiteral("outward_sense"), {_outwardSense});
     addPathRow(pathsForm, "umbilicus", tr("Umbilicus"), false);
+    _windingInferenceSummary = new QLabel(tr("Advertised by the service once connected"), pathsContents);
+    _windingInferenceSummary->setObjectName(QStringLiteral("spiralWindingInferenceSummary"));
+    _windingInferenceSummary->setWordWrap(true);
+    _windingInferenceSummary->setTextInteractionFlags(Qt::TextSelectableByMouse);
+    pathsForm->addRow(tr("Winding inference"), _windingInferenceSummary);
+    describe(QStringLiteral("winding_inference_summary"), {_windingInferenceSummary});
 
-    auto* pclContainer = new QWidget(pathsContents);
-    auto* pclLayout = new QVBoxLayout(pclContainer);
-    pclLayout->setContentsMargins(0, 0, 0, 0);
-    _pclList = new QListWidget(pclContainer);
-    _pclList->setObjectName(QStringLiteral("spiralPclList"));
-    _pclList->setSelectionMode(QAbstractItemView::SingleSelection);
-    _pclList->setMinimumHeight(60);
-    // Two thirds of the default scroll-area height: the list rarely holds more
-    // than a few roles, and the space is better spent on the rows below it.
-    _pclList->setMaximumHeight(_pclList->sizeHint().height() * 2 / 3);
-    pclLayout->addWidget(_pclList);
-    auto* pclInputRow = new QHBoxLayout;
-    _pclRole = new QComboBox(pclContainer);
-    _pclRole->setObjectName(QStringLiteral("spiralPclRole"));
-    _pclRole->addItem(tr("Absolute"), QStringLiteral("absolute"));
-    _pclRole->addItem(tr("Relative"), QStringLiteral("relative"));
-    _pclRole->addItem(tr("Same winding"), QStringLiteral("same_winding"));
-    _pclRole->addItem(tr("Drawn control points"), QStringLiteral("drawn_control_points"));
-    _pclPath = new QLineEdit(pclContainer);
-    _pclPath->setObjectName(QStringLiteral("spiralPclPath"));
-    _pclPath->setPlaceholderText(tr("PCL path"));
-    _browsePclButton = new QToolButton(pclContainer);
-    _browsePclButton->setText(QStringLiteral("…"));
-    _addPclButton = new QPushButton(QStringLiteral("+"), pclContainer);
-    _addPclButton->setObjectName(QStringLiteral("spiralAddPcl"));
-    _removePcl = new QPushButton(QStringLiteral("-"), pclContainer);
-    _removePcl->setObjectName(QStringLiteral("spiralRemovePcl"));
-    _removePcl->setEnabled(false);
-    pclInputRow->addWidget(_pclRole);
-    pclInputRow->addWidget(_pclPath, 1);
-    pclInputRow->addWidget(_browsePclButton);
-    pclInputRow->addWidget(_addPclButton);
-    pclInputRow->addWidget(_removePcl);
-    pclLayout->addLayout(pclInputRow);
-    pathsForm->addRow(tr("PCLs"), pclContainer);
-    describe(QStringLiteral("pcl_list"), {pclContainer});
-    describe(QStringLiteral("pcl_role"), {_pclRole});
-    describe(QStringLiteral("pcl_path"), {_pclPath});
-    describe(QStringLiteral("pcl_browse"), {_browsePclButton});
-    describe(QStringLiteral("pcl_add"), {_addPclButton});
-    describe(QStringLiteral("pcl_remove"), {_removePcl});
-
-    addPathRow(pathsForm, "fibers", tr("Fibers"), true);
+    // Patches, point collections and fibers come from the object store the
+    // service was launched with, not from files.
+    _objectStoreSummary = new QLabel(tr("No object store advertised"), pathsContents);
+    _objectStoreSummary->setObjectName(QStringLiteral("spiralObjectStoreSummary"));
+    _objectStoreSummary->setWordWrap(true);
+    _objectStoreSummary->setTextInteractionFlags(Qt::TextSelectableByMouse);
+    pathsForm->addRow(tr("Object store"), _objectStoreSummary);
+    describe(QStringLiteral("object_store"), {_objectStoreSummary});
+    _cloneHub = new QPushButton(tr("Clone the Service's Hub…"), pathsContents);
+    _cloneHub->setObjectName(QStringLiteral("spiralCloneHub"));
+    _cloneHub->setToolTip(tr("Edits reach a hub-bound fit through a replica of its hub: "
+                             "clone the hub to a local replica and attach it."));
+    _cloneHub->setVisible(false);
+    pathsForm->addRow(QString(), _cloneHub);
+    connect(_cloneHub, &QPushButton::clicked, this,
+            [this] { emit cloneHubRequested(_service->serviceHubAddress()); });
 
     // Vertical fibers lie on the back face of the papyrus sheet; the fitter can
     // expect them a few voxels radially outside the winding it fits to the
@@ -342,8 +298,6 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
     pathsForm->addRow(verticalOffset);
     describe(QStringLiteral("vertical_fiber_offset"), {_verticalFiberOffsetEnabled});
     describe(QStringLiteral("vertical_fiber_offset_voxels"), {_verticalFiberOffsetVoxels});
-
-    addPathRow(pathsForm, "tracks_dbm", tr("Tracks DBM"), false);
 
     _trackLengthBinSampling = new QCheckBox(tr("Sample tracks by length bins"), pathsContents);
     _trackLengthBinSampling->setObjectName(QStringLiteral("spiralTrackLengthBinSampling"));
@@ -394,8 +348,6 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
     }
     updateTrackSamplingUi();
 
-    addPathRow(pathsForm, "verified_patches", tr("Verified patches"), true);
-    addPathRow(pathsForm, "outer_shell", tr("Outer shell"), true);
 
     auto* lasagnaSection = makeSection(tr("Lasagna inputs"),
                                        QStringLiteral("spiralLasagnaInputsGroup"),
@@ -403,15 +355,11 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
     auto* lasagnaContents = new QWidget(lasagnaSection->contentWidget());
     auto* lasagnaForm = new QFormLayout(lasagnaContents);
     lasagnaSection->contentLayout()->addWidget(lasagnaContents);
-    addPathRow(lasagnaForm, "normal_x", tr("Normal X"), true);
-    addPathRow(lasagnaForm, "normal_y", tr("Normal Y"), true);
-    addPathRow(lasagnaForm, "surf_sdt", tr("Surface SDT"), true);
-    addPathRow(lasagnaForm, "gradient_magnitude", tr("Gradient magnitude"), true);
     addPathRow(lasagnaForm, "cache_directory", tr("Cache directory"), true);
-    // Also owned by spiral-scroll.json: the zarr level and coordinate scale
-    // describe how the dataset's Lasagna stores were written, so they are
-    // reported rather than chosen.
-    _lasagnaSummary = new QLabel(tr("No scroll specification loaded"), lasagnaContents);
+    // The project's selected Lasagna dataset: its identity, its array and
+    // the arrays' scale relative to the fit volume are reported rather than
+    // chosen. The fit reads the identity's packs from the service's cache.
+    _lasagnaSummary = new QLabel(tr("No fit built yet"), lasagnaContents);
     _lasagnaSummary->setObjectName(QStringLiteral("spiralLasagnaSummary"));
     _lasagnaSummary->setWordWrap(true);
     _lasagnaSummary->setTextInteractionFlags(Qt::TextSelectableByMouse);
@@ -425,12 +373,17 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
     auto* outputForm = new QFormLayout(outputContents);
     outputGroup->contentLayout()->addWidget(outputContents);
     addPathRow(outputForm, "output_directory", tr("Output directory"), true);
-    addPathRow(outputForm, "scroll_zarr", tr("Scroll/render Zarr"), true);
     _zBegin = new QSpinBox(outputContents); _zBegin->setRange(0, 1000000); _zBegin->setValue(4000);
     _zEnd = new QSpinBox(outputContents); _zEnd->setRange(1, 1000000); _zEnd->setValue(17000);
-    // The scroll's name and voxel resolution are not here: spiral-scroll.json
-    // in the dataset root is their only source, and the service rejects a
-    // request that restates them.
+    // A fit setting (fit_volume_level): the fit volume's pyramid level the
+    // fit works in, so a fit voxel is 2^level of the volume's voxels.
+    _fitVolumeLevel = new QSpinBox(outputContents);
+    _fitVolumeLevel->setObjectName(QStringLiteral("spiralFitVolumeLevel"));
+    _fitVolumeLevel->setRange(0, 16);
+    _fitVolumeLevel->setValue(0);
+    // The scroll's name and voxel resolution are not here: the project's fit
+    // volume is their only source, and the service rejects a request that
+    // restates them.
     _renderVolumeScale = new QSpinBox(outputContents); _renderVolumeScale->setRange(1, 4096); _renderVolumeScale->setValue(16);
     _savePngVisualizations = new QCheckBox(tr("Save diagnostic PNG visualizations"), outputContents);
     _savePngVisualizations->setChecked(false);
@@ -440,12 +393,14 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
     _advanced = _advancedProfiles->textEdit();
     outputForm->addRow(tr("z begin"), _zBegin);
     outputForm->addRow(tr("z end"), _zEnd);
+    outputForm->addRow(tr("Fit volume level"), _fitVolumeLevel);
     outputForm->addRow(tr("Run tag"), _runTag);
     outputForm->addRow(tr("Render-volume scale"), _renderVolumeScale);
     outputForm->addRow(_savePngVisualizations);
     outputForm->addRow(tr("Advanced config JSON"), _advancedProfiles);
     describe(QStringLiteral("z_begin"), {_zBegin});
     describe(QStringLiteral("z_end"), {_zEnd});
+    describe(QStringLiteral("fit_volume_level"), {_fitVolumeLevel});
     describe(QStringLiteral("run_tag"), {_runTag});
     describe(QStringLiteral("render_volume_scale"), {_renderVolumeScale});
     describe(QStringLiteral("advanced_config"), {_advancedProfiles});
@@ -535,6 +490,13 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
         displayDialogLayout->addWidget(toggle);
         _showPclOverlays[vc3d::spiral::pclRoleIndex(role)] = toggle;
     }
+    _showFiberOverlay = new QCheckBox(tr("Show fitted fibers"), _displayDialog);
+    _showFiberOverlay->setObjectName(QStringLiteral("spiralShowFittedFibers"));
+    _showFiberOverlay->setEnabled(false);
+    describe(QStringLiteral("display_fitted_fibers"), {_showFiberOverlay});
+    setToolTipNote(_showFiberOverlay, tr("The fit has no fibers to show"));
+    connect(_showFiberOverlay, &QCheckBox::toggled, this, &SpiralPanel::fiberOverlayChanged);
+    displayDialogLayout->addWidget(_showFiberOverlay);
 
     auto* pointToleranceRow = new QWidget(_displayDialog);
     auto* pointToleranceLayout = new QHBoxLayout(pointToleranceRow);
@@ -631,13 +593,10 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
 
     for (const auto& item : std::initializer_list<std::pair<const char*, const char*>>{
              {"output", "Output"}, {"verified", "Verified patches"},
-             {"pending_only", "Pending patches only"},
              {"shell", "Shell"}, {"lasagna", "Lasagna inputs"}}) {
         auto* check = new QCheckBox(tr(item.second), _displayDialog);
         const QString key = QString::fromLatin1(item.first);
         _visibilityChecks[key] = check;
-        if (key == QStringLiteral("pending_only"))
-            check->setObjectName(QStringLiteral("spiralPendingPatchesOnly"));
         describe(QStringLiteral("display_") + key, {check});
         check->setChecked(key == QStringLiteral("output"));
         connect(check, &QCheckBox::toggled, this, [this, key = QString::fromLatin1(item.first)](bool shown) {
@@ -734,7 +693,7 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
     auto* runLayout = new QVBoxLayout(runContents);
     runGroup->contentLayout()->addWidget(runContents);
     auto* controls = new QHBoxLayout;
-    // Connecting discovers the dataset but does not create a fit. This button
+    // Connecting discovers the service's bindings but does not create a fit. This button
     // initializes the first one and becomes Rebuild Fit afterward.
     _load = new QPushButton(tr("Initialize Fit"), runContents);
     _load->setEnabled(false);
@@ -775,8 +734,19 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
     controls->addWidget(_run);
     controls->addWidget(_stop);
     controls->addStretch(1);
+    _updateInputs = new QPushButton(tr("Update Fit Inputs"), runContents);
+    _updateInputs->setObjectName(QStringLiteral("spiralUpdateInputs"));
+    _updateInputs->setEnabled(false);
+    controls->addWidget(_updateInputs);
     controls->addWidget(_load);
     runLayout->addLayout(controls);
+    _positionSummary = new QLabel(runContents);
+    _positionSummary->setObjectName(QStringLiteral("spiralInputPosition"));
+    _positionSummary->setWordWrap(true);
+    _positionSummary->setTextInteractionFlags(Qt::TextSelectableByMouse);
+    runLayout->addWidget(_positionSummary);
+    describe(QStringLiteral("run_update_inputs"), {_updateInputs});
+    describe(QStringLiteral("run_input_position"), {_positionSummary});
     auto* previewScheduleRow = new QHBoxLayout;
     previewScheduleRow->addWidget(_backgroundPreview);
     previewScheduleRow->addWidget(_previewCadence);
@@ -826,14 +796,24 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
     connect(_checkpointDownloadTimer, &QTimer::timeout, this,
             refreshCheckpointDownload);
 
-    auto* ephemeralLabel = new QLabel(tr("Dataset inputs and local drafts:"), runContents);
+    // What the resident fit read from its object store, and whether the
+    // store still holds it.
+    _fitInputs = new QLabel(tr("No fit inputs yet"), runContents);
+    _fitInputs->setObjectName(QStringLiteral("spiralFitInputs"));
+    _fitInputs->setWordWrap(true);
+    _fitInputs->setTextInteractionFlags(Qt::TextSelectableByMouse);
+    runLayout->addWidget(_fitInputs);
+    describe(QStringLiteral("fit_inputs"), {_fitInputs});
+
+    auto* ephemeralLabel = new QLabel(tr("Local drafts (saved to the object store, then part of the fit "
+                                         "at its next input update):"), runContents);
     _inputList = new QListWidget(runContents);
     _inputList->setObjectName(QStringLiteral("spiralInputList"));
     _inputList->setMaximumHeight(80);
     _inputList->setSelectionMode(QAbstractItemView::SingleSelection);
-    _commitInputs = new QPushButton(tr("Commit"), runContents);
+    _commitInputs = new QPushButton(tr("Save and Update Fit Inputs"), runContents);
     _commitInputs->setEnabled(false);
-    _addInputs = new QPushButton(tr("Add/Apply changes"), runContents);
+    _addInputs = new QPushButton(tr("Save Drafts to Store"), runContents);
     _removeInput = new QPushButton(tr("Remove"), runContents);
     _removeInput->setEnabled(false);
     _commitHint = new QLabel(runContents);
@@ -848,7 +828,7 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
     _inputFilter->setPlaceholderText(tr("Filter inputs by name or kind"));
     connect(_inputFilter, &QLineEdit::textChanged, this, &SpiralPanel::refreshInputVisibility);
     runLayout->addWidget(_inputFilter);
-    _showOriginalInputs = new QCheckBox(tr("Show original dataset inputs"), runContents);
+    _showOriginalInputs = new QCheckBox(tr("Show original store inputs"), runContents);
     connect(_showOriginalInputs, &QCheckBox::toggled, this, &SpiralPanel::refreshInputVisibility);
     runLayout->addWidget(_showOriginalInputs);
     runLayout->addWidget(_inputList);
@@ -907,45 +887,20 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
     // ------------------------------------------------------------------
     // Wiring
     // ------------------------------------------------------------------
-    // A changed local launch binding (dataset/output/cache) restarts the
-    // owned service: it is bound to one dataset for its whole lifetime.
+    // A changed local launch binding (output/cache/winding inference)
+    // restarts the owned service: it is bound to them for its whole lifetime.
     auto launchBindingEdited = [this]() {
         if (_currentProfileId != kLocalhostProfileId) return;
         const SpiralServiceProfile& active = _service->profile();
-        if (active.datasetRoot.trimmed() == _datasetRoot->text().trimmed()
-            && active.outputRoot.trimmed() == _outputRoot->text().trimmed()
-            && active.cacheRoot.trimmed() == _cacheRoot->text().trimmed())
+        if (active.outputRoot.trimmed() == _outputRoot->text().trimmed()
+            && active.cacheRoot.trimmed() == _cacheRoot->text().trimmed()
+            && active.windingInference.trimmed() == _windingInferenceRoot->text().trimmed())
             return;
         if (!_service->isReady()) return; // Connect applies the new binding
         guardSessionExit([this]() { connectToSelectedProfile(); });
     };
-    for (QLineEdit* edit : {_datasetRoot, _outputRoot, _cacheRoot})
+    for (QLineEdit* edit : {_outputRoot, _cacheRoot, _windingInferenceRoot})
         connect(edit, &QLineEdit::editingFinished, this, launchBindingEdited);
-    auto appendPcl = [this]() {
-        const QString path = _pclPath->text().trimmed();
-        if (path.isEmpty()) return;
-        addPclItem(path, _pclRole->currentData().toString());
-        _pclPath->clear();
-        _hasManualEdits = true;
-        refreshReloadRequired();
-    };
-    connect(_addPclButton, &QPushButton::clicked, this, appendPcl);
-    connect(_pclPath, &QLineEdit::returnPressed, this, appendPcl);
-    connect(_browsePclButton, &QToolButton::clicked, this, [this]() {
-        const QString chosen = QFileDialog::getOpenFileName(
-            this, tr("Select PCL file"), _pclPath->text(), tr("JSON files (*.json);;All files (*)"));
-        if (!chosen.isEmpty()) _pclPath->setText(chosen);
-    });
-    connect(_pclList, &QListWidget::itemSelectionChanged, this, [this]() {
-        _removePcl->setEnabled(!_remoteMode && _pclList->currentItem() != nullptr);
-    });
-    connect(_removePcl, &QPushButton::clicked, this, [this]() {
-        if (auto* item = _pclList->takeItem(_pclList->currentRow())) {
-            delete item;
-            _hasManualEdits = true;
-            refreshReloadRequired();
-        }
-    });
 
     connect(_service, &SpiralServiceManager::connectionStateChanged, this,
             [this](SpiralServiceManager::ConnectionState state, const QString& message) {
@@ -953,7 +908,7 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
                 QString text;
                 switch (state) {
                 case CS::Disconnected: text = tr("Disconnected"); break;
-                case CS::Starting: text = tr("Starting…"); break;
+                case CS::Starting: text = message.isEmpty() ? tr("Starting…") : message; break;
                 case CS::Connecting: text = tr("Connecting…"); break;
                 case CS::Ready: text = tr("Connected — API v%1%2")
                         .arg(SpiralServiceManager::kApiVersion)
@@ -965,7 +920,7 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
                 _connected = state == CS::Ready;
                 _connectButton->setEnabled(state == CS::Disconnected || state == CS::Failed);
                 _disconnectButton->setEnabled(state != CS::Disconnected);
-                // Connection must succeed before dataset resolution or fit
+                // Connection must succeed before the bindings or fit
                 // controls are enabled. Nothing is enabled from here: the
                 // status poll decides which verbs the resident session can
                 // take, and Rebuild is one of them.
@@ -991,9 +946,9 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
                 }
                 if (state == CS::Starting || state == CS::Connecting) {
                     _editingAccessError.clear();
-                    // A new connection may be to another dataset entirely, so
-                    // the previous scroll specification stops being true here.
-                    applyScrollSpec({});
+                    // A new connection may be to another service entirely, so
+                    // the previous scroll and bindings stop being true here.
+                    resetScrollSummaries();
                     _hasSession = false;
                     _loadedSessionRequest = {};
                     _attachedAdvancedConfig = {};
@@ -1005,18 +960,10 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
                 }
                 _state->setText(tr("Service: %1").arg(text));
             });
-    connect(_service, &SpiralServiceManager::datasetResolved, this,
+    connect(_service, &SpiralServiceManager::bindingsAdvertised, this,
             [this](const QJsonObject&) { refreshCheckpointChoices(); });
-    connect(_service, &SpiralServiceManager::datasetResolved, this, [this](const QJsonObject& value) {
-        // The scroll specification belongs to the dataset, not to a session, so
-        // it is reported whether or not one is attached.
-        applyScrollSpec(value.value(QStringLiteral("scroll_spec")).toObject());
-        // A service-owned dataset advertisement describes what a future load
-        // would use. Once attached, the resident session's canonical request
-        // is authoritative and may intentionally differ.
-        if (!_hasSession)
-            applyResolution(value, true);
-    });
+    connect(_service, &SpiralServiceManager::bindingsAdvertised, this,
+            [this](const QJsonObject& value) { applyBindings(value); });
     connect(_service, &SpiralServiceManager::configurationCatalogChanged,
             _advancedProfiles, &SpiralConfigProfileEditor::setCatalog);
     connect(_service, &SpiralServiceManager::configurationCatalogChanged,
@@ -1086,8 +1033,11 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
             });
     connect(_service, &SpiralServiceManager::sessionSynchronized,
             this, &SpiralPanel::synchronizeSession);
+    connect(_service, &SpiralServiceManager::storeBindingChanged,
+            this, &SpiralPanel::updateObjectStoreSummary);
+    updateObjectStoreSummary();
     connect(_service, &SpiralServiceManager::errorOccurred, this, [this](const QString& error) {
-        if (_connected && !_service->ownsInputWorkspace())
+        if (_connected && !_service->ownsSessionLease())
             _editingAccessError = error;
         _warnings->setText(error);
     });
@@ -1129,14 +1079,6 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
                 _checkpointTotalBytes = total;
                 refreshCheckpointDownload();
             });
-    connect(_service, &SpiralServiceManager::inputUploadFinished, this,
-            [this](const QString& inputId, const QString& error) {
-                if (error.isEmpty())
-                    _warnings->setText(tr("Added %1 to the current fit; it is used on the next run").arg(inputId));
-                else
-                    _warnings->setText(tr("Adding %1 failed: %2").arg(inputId, error));
-            });
-
     connect(_load, &QPushButton::clicked, this, [this]() {
         QJsonParseError error;
         const QJsonDocument advanced = QJsonDocument::fromJson(_advanced->toPlainText().toUtf8(), &error);
@@ -1164,24 +1106,20 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
         // the same session again. Still allowed — starting a fit over is a
         // legitimate thing to want — but not by accident. A failed session
         // is exempt: rebuilding an identical request is the recovery.
-        if (!_reloadRequired && _sessionState != QStringLiteral("Error")
-            && QMessageBox::question(
-                   this, tr("Rebuild Fit"),
-                   tr("No fit input or session setting has changed. Rebuilding "
-                      "discards everything this session has trained and builds "
-                      "it again from the same request. Continue?"))
-                   != QMessageBox::Yes)
-            return;
-        // A model-stage rebuild keeps the loaded host inputs, and with
-        // them everything already incorporated into the fit, so there is
-        // nothing to warn about; only a full rebuild discards them.
-        if (_uncommittedCount > 0 && pendingRebuildStage() != QStringLiteral("model")
-            && QMessageBox::question(
-                   this, tr("Uncommitted inputs"),
-                   tr("The current session has %1 added input(s) that were not committed "
-                      "to the dataset. Rebuilding discards them. Continue?").arg(_uncommittedCount))
-                   != QMessageBox::Yes)
-            return;
+        bool reloadInputs = false;
+        if (!_reloadRequired && _sessionState != QStringLiteral("Error")) {
+            QMessageBox box(QMessageBox::Question, tr("Rebuild Fit"),
+                            tr("No session setting has changed. Rebuilding discards "
+                               "everything this session has trained and builds it "
+                               "again, reading the object store's current patches, "
+                               "point collections and fibers. Continue?"),
+                            QMessageBox::Cancel, this);
+            auto* reload = box.addButton(tr("Rebuild with Current Inputs"),
+                                         QMessageBox::AcceptRole);
+            box.exec();
+            if (box.clickedButton() != reload) return;
+            reloadInputs = true;
+        }
         // A session that failed to build may have failed because of what
         // it was pointed at — a poisoned autosave, or an input the panel
         // still names. The recovery case therefore also offers the
@@ -1205,8 +1143,40 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
         if (useDefaults)
             _service->rebuildWithDefaults();
         else
-            _service->rebuildSession(sessionRequest());
+            _service->rebuildSession(sessionRequest(), reloadInputs);
     });
+    connect(_updateInputs, &QPushButton::clicked, this, [this]() { startInputUpdate(true); });
+    connect(_service, &SpiralServiceManager::inputUpdateProgress, this,
+            [this](const QString&, const QString& text) {
+                _inputUpdateText = text;
+                updatePositionSummary();
+                _updateInputs->setEnabled(false);
+            });
+    connect(_service, &SpiralServiceManager::inputUpdateFinished, this,
+            [this](const SpiralServiceManager::InputUpdate& update) {
+                QStringList lines;
+                if (!update.error.isEmpty()) {
+                    lines << tr("Update failed: %1").arg(update.error);
+                    for (const QString& problem : update.problems) lines << QStringLiteral("  ") + problem;
+                    _warnings->setText(lines.join(QStringLiteral("\n")));
+                } else {
+                    lines << tr("Updated: the fit reads position %1 (your edits reached %2; linked at %3)")
+                                 .arg(update.fitted).arg(update.requested).arg(update.head);
+                    if (!update.includedBeyondRequested.isEmpty())
+                        lines << tr("It includes %n later hub commit(s) by others:", nullptr,
+                                    int(update.includedBeyondRequested.size()))
+                              << update.includedBeyondRequested.mid(0, 5);
+                    if (!update.afterFitted.isEmpty())
+                        lines << tr("%n commit(s) after it are not part of the fit:", nullptr,
+                                    int(update.afterFitted.size()))
+                              << update.afterFitted.mid(0, 5);
+                    lines << update.problems;
+                }
+                _inputUpdateText = lines.join(QStringLiteral("\n"));
+                updatePositionSummary();
+            });
+    connect(_service, &SpiralServiceManager::storeBindingChanged,
+            this, &SpiralPanel::updatePositionSummary);
     connect(_run, &QPushButton::clicked, this, [this]() {
         QJsonParseError error;
         const QJsonDocument advanced =
@@ -1326,8 +1296,8 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
                         .arg(detail);
                 question += wholeFit
                     ? tr("Loading it means rebuilding the whole fit — the "
-                         "dataset inputs are re-read, and any added inputs "
-                         "not committed to the dataset are discarded. Rebuild?")
+                         "fit inputs are re-read, and any drafts not saved "
+                         "to the object store are discarded. Rebuild?")
                     : tr("Loading it means rebuilding the model only. The "
                          "loaded inputs, including everything already added to "
                          "this fit, are kept. Rebuild?");
@@ -1363,77 +1333,31 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
             });
     connect(_commitInputs, &QPushButton::clicked, this, [this]() { emit addDraftsRequested(true); });
     connect(_addInputs, &QPushButton::clicked, this, [this]() { emit addDraftsRequested(false); });
-    connect(_service, &SpiralServiceManager::inputConflict, this, [this](const QJsonObject& conflict) {
-        QMessageBox dialog(QMessageBox::Warning, tr("Input changed in the dataset"),
-            tr("Review this input's base, current dataset content, and local draft. Other drafts are preserved."),
-            QMessageBox::NoButton, this);
-        dialog.setDetailedText(QString::fromUtf8(QJsonDocument(conflict).toJson(QJsonDocument::Indented)));
-        auto* current = dialog.addButton(conflict.value(QStringLiteral("current")).isNull()
-            ? tr("Discard Local") : tr("Use Current"), QMessageBox::AcceptRole);
-        auto* local = conflict.value(QStringLiteral("current")).isNull() ? nullptr
-            : dialog.addButton(tr("Apply Local After Review"), QMessageBox::ActionRole);
-        auto* copy = dialog.addButton(tr("Save Local as New"), QMessageBox::ActionRole);
-        dialog.addButton(QMessageBox::Cancel);
-        dialog.exec();
-        if (dialog.clickedButton() == current) _service->resolveInputConflict(conflict, QStringLiteral("use_current"));
-        else if (local && dialog.clickedButton() == local) _service->resolveInputConflict(conflict, QStringLiteral("apply_local_after_review"));
-        else if (dialog.clickedButton() == copy) _service->resolveInputConflict(conflict, QStringLiteral("save_as_new"));
-    });
-    connect(_service, &SpiralServiceManager::inputDraftsChanged, this, [this]() {
-        if (!_lastInputStatus.isEmpty()) updateStatus(_lastInputStatus);
-    });
+    // The list holds only local drawings: a frozen fit's inputs are shown
+    // from its manifest, and nothing here edits them.
     connect(_inputList, &QListWidget::itemSelectionChanged, this, [this]() {
         const auto* item = _inputList->currentItem();
-        const auto row = item ? item->data(Qt::UserRole + 4).toJsonObject() : QJsonObject();
-        _removeInput->setEnabled(_connected && _service->ownsInputWorkspace() && item
-            && (!row.value(QStringLiteral("deleted")).toBool() || row.value(QStringLiteral("can_restore")).toBool()));
-        _removeInput->setText(item && item->data(Qt::UserRole + 3).toBool() ? tr("Restore") : tr("Remove"));
-    });
-    connect(_inputList, &QListWidget::itemChanged, this, [this]() {
-        QStringList selected;
-        for (int index = 0; index < _inputList->count(); ++index) {
-            const auto* item = _inputList->item(index);
-            if (item->checkState() == Qt::Checked) selected.push_back(item->data(Qt::UserRole + 1).toString());
-        }
-        _service->setInputSelection(selected);
+        _removeInput->setEnabled(item != nullptr);
     });
     connect(_removeInput, &QPushButton::clicked, this, [this]() {
         const auto* item = _inputList->currentItem();
         if (!item) return;
         const auto id = item->data(Qt::UserRole + 1).toString();
         const auto row = item->data(Qt::UserRole + 4).toJsonObject();
-        if (row.value("local").toBool()) {
-            emit removeLocalPatchRequested(row.value("alias").toString(id));
-            return;
-        }
-        if (item->data(Qt::UserRole + 3).toBool()) _service->restoreInputDraft(id);
-        else _service->removeInputDraft(id);
+        emit removeLocalPatchRequested(row.value("alias").toString(id));
     });
     _inputList->setContextMenuPolicy(Qt::CustomContextMenu);
     connect(_inputList, &QListWidget::customContextMenuRequested, this, [this](const QPoint& position) {
         const auto* item = _inputList->itemAt(position);
         if (!item) return;
         const auto id = item->data(Qt::UserRole + 1).toString();
-        QMenu menu(this);
-        auto* edit = menu.addAction(tr("Edit"));
-        auto* retry = menu.addAction(tr("Retry"));
-        auto* discard = menu.addAction(tr("Discard Local Changes"));
         const auto row = item->data(Qt::UserRole + 4).toJsonObject();
-        const bool owner = _service->ownsInputWorkspace();
-        edit->setEnabled(owner && !row.value("local").toBool() && !row.value(QStringLiteral("deleted")).toBool());
-        retry->setEnabled(owner && !row.value("local").toBool() && (!row.value(QStringLiteral("committed")).toBool()
-            || !row.value(QStringLiteral("error")).toString().isEmpty()));
-        discard->setEnabled(owner && (row.value("local").toBool() || row.value(QStringLiteral("dirty")).toBool()));
-        const auto* choice = menu.exec(_inputList->viewport()->mapToGlobal(position));
-        if (row.value("local").toBool()) {
-            if (choice == discard) emit removeLocalPatchRequested(row.value("alias").toString(id));
-            return;
-        }
-        if (choice == edit) _service->editInputDraft(id);
-        else if (choice == retry) _service->applyInputDrafts(false, {id});
-        else if (choice == discard) _service->discardInputDraft(id);
+        QMenu menu(this);
+        auto* discard = menu.addAction(tr("Discard Local Changes"));
+        if (menu.exec(_inputList->viewport()->mapToGlobal(position)) == discard)
+            emit removeLocalPatchRequested(row.value("alias").toString(id));
     });
-    for (QSpinBox* spin : {_zBegin, _zEnd, _renderVolumeScale})
+    for (QSpinBox* spin : {_zBegin, _zEnd, _fitVolumeLevel, _renderVolumeScale})
         connect(spin, qOverload<int>(&QSpinBox::valueChanged), this, [this](int) { refreshReloadRequired(); });
     for (QLineEdit* edit : {_runTag})
         connect(edit, &QLineEdit::textEdited, this, [this](const QString&) { refreshReloadRequired(); });
@@ -1441,6 +1365,8 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
             [this](bool) { refreshReloadRequired(); });
     connect(_verticalFiberOffsetEnabled, &QCheckBox::toggled, this,
             [this](bool) { refreshReloadRequired(); });
+    connect(_outwardSense, qOverload<int>(&QComboBox::currentIndexChanged), this,
+            [this](int) { refreshReloadRequired(); });
     connect(_verticalFiberOffsetVoxels, qOverload<double>(&QDoubleSpinBox::valueChanged),
             this, [this](double) { refreshReloadRequired(); });
     connect(_advancedProfiles, &SpiralConfigProfileEditor::textChanged, this, [this]() {
@@ -1517,7 +1443,13 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
         selectProfile(_profileIds.contains(selected) || selected == kLocalhostProfileId
                           ? selected : kLocalhostProfileId);
     }
-    // Preserve the easy local experience: auto-connect the built-in profile.
+}
+
+void SpiralPanel::activateWorkspace()
+{
+    if (_workspaceUsed) return;
+    _workspaceUsed = true;
+    // Returning to the workspace must not undo an explicit Disconnect.
     if (_currentProfileId == kLocalhostProfileId) connectToSelectedProfile();
 }
 
@@ -1592,19 +1524,17 @@ void SpiralPanel::applyProfileFields(const SpiralServiceProfile& profile)
     _apiKey->setPlaceholderText(
         ssh ? tr("Optional override — read from the host over SSH when empty")
             : tr("Printed by the service at startup (or set SPIRAL_API_KEY)"));
-    _mappingRow->setVisible(!localhost);
     // The launch binding only exists for the locally owned service; remote
     // profiles display the service's advertised paths instead.
-    _datasetRow->setVisible(localhost);
     _outputRow->setVisible(localhost);
     _cacheRow->setVisible(localhost);
-    _datasetRoot->setText(profile.datasetRoot);
+    _windingInferenceRow->setVisible(localhost);
     _outputRoot->setText(profile.outputRoot);
     _cacheRoot->setText(profile.cacheRoot);
+    _windingInferenceRoot->setText(profile.windingInference);
     _endpointUrl->setText(profile.baseUrl.toString());
     _sshDestination->setText(profile.sshDestination);
     if (profile.remoteServicePort > 0) _sshPort->setValue(profile.remoteServicePort);
-    _mapLocalRoot->setText(profile.localRootPrefix);
     _apiKey->clear();
 }
 
@@ -1613,16 +1543,15 @@ SpiralServiceProfile SpiralPanel::profileFromFields() const
     QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
     if (_currentProfileId == kLocalhostProfileId) {
         SpiralServiceProfile profile = SpiralServiceProfile::localhostProfile();
-        profile.datasetRoot = _datasetRoot->text().trimmed();
         profile.outputRoot = _outputRoot->text().trimmed();
         profile.cacheRoot = _cacheRoot->text().trimmed();
+        profile.windingInference = _windingInferenceRoot->text().trimmed();
         return profile;
     }
     SpiralServiceProfile profile = SpiralServiceProfile::load(settings, _currentProfileId);
     profile.baseUrl = QUrl(_endpointUrl->text().trimmed());
     profile.sshDestination = _sshDestination->text().trimmed();
     profile.remoteServicePort = _sshPort->value();
-    profile.localRootPrefix = _mapLocalRoot->text().trimmed();
     profile.apiKey = _apiKey->text();
     return profile;
 }
@@ -1651,27 +1580,18 @@ void SpiralPanel::guardSessionExit(std::function<void()> action)
 void SpiralPanel::setRemoteMode(bool remote)
 {
     _remoteMode = remote;
-    // Every service owns its base inputs (local and remote alike): the path
-    // rows populate read-only from the service's advertised dataset
-    // resolution. The tracks selection stays editable because the client
-    // chooses among service-advertised values; checkpoints have their own
-    // section and are never a path the client types here.
-    const QStringList clientSelectable{QStringLiteral("tracks_dbm")};
+    // Every service owns its host paths (local and remote alike): the path
+    // rows populate read-only from the service's advertised bindings and the
+    // resident session. Checkpoints have their own section and are never a path
+    // the client types here.
     for (auto it = _paths.begin(); it != _paths.end(); ++it) {
-        it.value()->setReadOnly(!clientSelectable.contains(it.key()));
+        it.value()->setReadOnly(true);
         if (_pathBrowseButtons.contains(it.key()))
             _pathBrowseButtons[it.key()]->setVisible(false);
     }
-    // PCL collections are advertised by dataset resolution; extra collections
-    // join a session through ephemeral uploads, not the load request.
-    _pclRole->setEnabled(false);
-    _pclPath->setEnabled(false);
-    _addPclButton->setEnabled(false);
-    _browsePclButton->setVisible(false);
-    _removePcl->setEnabled(false);
     _save->setVisible(true);
-    for (QLineEdit* edit : {_paths["dataset_root"], _paths["umbilicus"]})
-        setToolTipNote(edit->parentWidget(), tr("Service-host path, owned by the service"));
+    setToolTipNote(_paths["umbilicus"]->parentWidget(),
+                   tr("The project's umbilicus of the fit volume, written by the service for the fit"));
 }
 
 QLineEdit* SpiralPanel::addPathRow(QFormLayout* form, const QString& key, const QString& label, bool directory)
@@ -1687,7 +1607,7 @@ QLineEdit* SpiralPanel::addPathRow(QFormLayout* form, const QString& key, const 
     _pathBrowseButtons[key] = browse;
     connect(edit, &QLineEdit::textEdited, this, [this, key](const QString&) {
         if (!_applyingResolution) {
-            if (key != QStringLiteral("dataset_root")) _hasManualEdits = true;
+            _hasManualEdits = true;
             refreshReloadRequired();
         }
     });
@@ -1697,26 +1617,11 @@ QLineEdit* SpiralPanel::addPathRow(QFormLayout* form, const QString& key, const 
             : QFileDialog::getOpenFileName(this, tr("Select file"), edit->text());
         if (!chosen.isEmpty()) {
             edit->setText(chosen);
-            if (key != QStringLiteral("dataset_root")) _hasManualEdits = true;
+            _hasManualEdits = true;
             refreshReloadRequired();
         }
     });
     return edit;
-}
-
-void SpiralPanel::addPclItem(const QString& path, const QString& role, bool required)
-{
-    if (path.trimmed().isEmpty()) return;
-    const int roleIndex = _pclRole->findData(role);
-    // A role the service no longer accepts (a retired role in settings saved
-    // by an older build) is dropped: sending it would fail session validation.
-    if (roleIndex < 0) return;
-    const QString roleLabel = _pclRole->itemText(roleIndex);
-    auto* item = new QListWidgetItem(tr("%1 — %2").arg(roleLabel, path), _pclList);
-    item->setData(Qt::UserRole, path);
-    item->setData(Qt::UserRole + 1, role);
-    item->setData(Qt::UserRole + 2, required);
-    item->setToolTip(path);
 }
 
 void SpiralPanel::setLossMapOptions(const QStringList& names)
@@ -1752,10 +1657,57 @@ void SpiralPanel::setLossMapLegend(const QString& text)
 void SpiralPanel::setLocalDraftsReady(bool ready)
 {
     _localDraftsReady = ready;
-    if (_addInputs) _addInputs->setEnabled(_connected && _hasSession && ready);
+    updateDraftActions();
+    updatePositionSummary();
+}
+
+void SpiralPanel::updateDraftActions()
+{
+    // Saving needs only a writable store; the update needs a service whose
+    // positions this store can name as well (the workspace and manager say
+    // why when not).
+    if (_addInputs) _addInputs->setEnabled(_localDraftsReady);
     if (_commitInputs)
-        _commitInputs->setEnabled(_connected && _hasSession
-                                  && (ready || _uncommittedCount > 0));
+        _commitInputs->setEnabled(_localDraftsReady && _service->storeBinding().canUpdate()
+                                  && _updateInputs && _updateInputs->isEnabled());
+    if (_commitHint)
+        _commitHint->setText(_service->storeBinding().canUpdate()
+            ? tr("Saved drafts reach the fit at its next input update.")
+            : tr("Saved drafts reach the fit when it is rebuilt with current inputs."));
+}
+
+void SpiralPanel::setInputFreshness(const QString& text)
+{
+    _inputFreshness = text;
+    updateFitInputs();
+}
+
+void SpiralPanel::updateFitInputs()
+{
+    if (!_fitInputs) return;
+    const QJsonObject& summary = _lastInputSummary;
+    if (summary.isEmpty()) {
+        _fitInputs->setText(_hasSession ? tr("The fit's inputs are being read from the object store")
+                                        : tr("No fit inputs yet"));
+        return;
+    }
+    const QJsonObject selection = summary.value(QStringLiteral("selection")).toObject();
+    QStringList links;
+    const QJsonObject relationships = summary.value(QStringLiteral("relationships")).toObject();
+    for (auto it = relationships.begin(); it != relationships.end(); ++it)
+        links << QStringLiteral("%1 %2").arg(it.key()).arg(it.value().toInteger());
+    QString text = tr("Fitted inputs %1: %2 surfaces, %3 point collections, %4 fibers in volume %5")
+                       .arg(summary.value(QStringLiteral("digest")).toString().left(12))
+                       .arg(selection.value(QStringLiteral("surface")).toInteger())
+                       .arg(selection.value(QStringLiteral("point_collection")).toInteger())
+                       .arg(selection.value(QStringLiteral("fiber")).toInteger())
+                       .arg(summary.value(QStringLiteral("volume_uuid")).toString());
+    text += tr("\nLinks: %1 (%2)")
+                .arg(links.isEmpty() ? tr("none") : links.join(QStringLiteral(", ")),
+                     summary.value(QStringLiteral("link_refresh")).toBool()
+                         ? tr("refreshed at startup") : tr("as stored, not refreshed"));
+    if (!_inputFreshness.isEmpty()) text += QStringLiteral("\n") + _inputFreshness;
+    _fitInputs->setText(text);
 }
 
 void SpiralPanel::setPclOverlayAvailable(vc3d::spiral::PclRole role,
@@ -1771,6 +1723,16 @@ void SpiralPanel::setPclOverlayAvailable(vc3d::spiral::PclRole role,
                                      ? tr("No compatible %1 artifact is available")
                                            .arg(vc3d::spiral::pclRoleDisplayName(role))
                                      : reason);
+}
+
+void SpiralPanel::setFiberOverlayAvailable(bool available, const QString& reason)
+{
+    if (!_showFiberOverlay) return;
+    _showFiberOverlay->setEnabled(available);
+    if (!available) _showFiberOverlay->setChecked(false);
+    setToolTipNote(_showFiberOverlay,
+                   available ? QString()
+                             : reason.isEmpty() ? tr("The fit has no fibers to show") : reason);
 }
 
 void SpiralPanel::describe(const QString& id, std::initializer_list<QWidget*> widgets)
@@ -1812,60 +1774,192 @@ double SpiralPanel::pointViewTolerance() const
         : kDefaultPointViewTolerance;
 }
 
-void SpiralPanel::applyResolution(const QJsonObject& resolution, bool force)
+void SpiralPanel::applyBindings(const QJsonObject& advertisement)
 {
-    if (!force && _hasManualEdits) {
-        if (QMessageBox::question(this, tr("Refill Spiral paths"),
-                tr("Replace manually edited path rows with the Dataset Root proposals?")) != QMessageBox::Yes) return;
+    // The service's host-owned roots. Once attached, the resident session's
+    // canonical request is authoritative for the path rows.
+    if (!_hasSession) {
+        const QJsonObject before = sessionRequest();
+        _applyingResolution = true;
+        const QJsonObject bindings =
+            advertisement.value(QStringLiteral("bindings")).toObject();
+        for (const QString& key : {QStringLiteral("output_directory"),
+                                   QStringLiteral("cache_directory")})
+            if (_paths.contains(key))
+                _paths[key]->setText(bindings.value(key).toString());
+        _applyingResolution = false;
+        _hasManualEdits = false;
+        // A re-advertisement of the same bindings (after a checkpoint save,
+        // say) must not disable Run on the live session.
+        if (sessionRequest() != before) refreshReloadRequired();
     }
-    const QJsonObject before = sessionRequest();
-    _applyingResolution = true;
-    const QString root = resolution.value(QStringLiteral("root")).toString();
-    if (!root.isEmpty()) _paths[QStringLiteral("dataset_root")]->setText(root);
-    const QJsonObject resolved = resolution.value("resolved").toObject();
-    for (auto it = resolved.begin(); it != resolved.end(); ++it)
-        if (_paths.contains(it.key())) _paths[it.key()]->setText(it.value().toString());
-    _pclList->clear();
-    for (const QJsonValue& value : resolution.value("pcl_inputs").toArray()) {
-        const QJsonObject item = value.toObject();
-        addPclItem(item.value("path").toString(), item.value("role").toString(),
-                   item.value("required").toBool());
-    }
-    _applyingResolution = false; _hasManualEdits = false;
-    // A refreshed resolution that resolves to the very same inputs (e.g. the
-    // re-advertisement after committing ephemeral inputs) must not disable Run
-    // on the live session; only an actual form change requires a reload.
-    if (sessionRequest() != before) refreshReloadRequired();
-    const QStringList missing = resolution.value("missing_required").toVariant().toStringList();
-    QStringList notes;
-    if (!missing.isEmpty()) notes << tr("Missing required: %1").arg(missing.join(", "));
-    const QStringList checkpoints = resolution.value("detected_checkpoints").toVariant().toStringList();
-    if (!checkpoints.isEmpty())
-        notes << tr("Detected resume checkpoints on the service: %1").arg(checkpoints.join(", "));
-    _warnings->setText(notes.join(QStringLiteral("\n")));
+    // Explained, never acted on: VC3D does not read the artifact.
+    QString reason;
+    _windingInferenceSummary->setText(
+        _service->windingInferenceAvailable(&reason)
+            ? tr("Available on the service host — winding-model supervision can run")
+            : tr("Unavailable — winding-model supervision cannot run. %1").arg(reason));
 }
 
-void SpiralPanel::applyScrollSpec(const QJsonObject& spec)
+void SpiralPanel::updateObjectStoreSummary()
 {
-    if (spec.isEmpty()) {
-        // A missing or invalid specification is a missing_required condition
-        // the service reports; the panel says so where the values would be.
-        const QString unavailable = tr("No valid spiral-scroll.json in the dataset root");
-        _scrollSummary->setText(unavailable);
-        _lasagnaSummary->setText(unavailable);
+    const auto& binding = _service->storeBinding();
+    _cloneHub->setVisible(binding.hosted() && !binding.matches());
+    auto position = [](qint64 value) {
+        return value < 0 ? tr("not synced yet") : tr("position %1").arg(value);
+    };
+    QString local = binding.localUuid.isEmpty()
+        ? QString()
+        : binding.localHosted()
+            ? tr("%1, a replica of hub %2 (%3), synced to %4")
+                  .arg(binding.localPath, binding.localHub, binding.localHubIdentity,
+                       position(binding.localPosition))
+            : binding.localPath;
+    if (!binding.advertised()) {
+        _objectStoreSummary->setText(binding.localUuid.isEmpty()
+            ? tr("No object store attached in VC3D")
+            : tr("Attached here: %1 (%2)").arg(binding.localUuid, local));
         return;
     }
-    const double voxelSize = spec.value(QStringLiteral("voxel_size_um")).toDouble();
+    QString text = tr("Service reads %1 (%2 on the service host)")
+                       .arg(binding.serviceUuid, binding.servicePath);
+    if (binding.hosted())
+        text += tr("\nIt fits positions of hub %1 (%2); its replica is at %3")
+                    .arg(binding.serviceHubIdentity, binding.serviceHub,
+                         binding.servicePositionError.isEmpty()
+                             ? position(binding.servicePosition)
+                             : tr("an unknown position (%1)").arg(binding.servicePositionError));
+    else if (binding.positioned())
+        text += tr("\nIt fits positions of the store itself, now at %1")
+                    .arg(binding.servicePositionError.isEmpty()
+                             ? position(binding.servicePosition)
+                             : tr("an unknown position (%1)").arg(binding.servicePositionError));
+    if (binding.matches())
+        text += binding.hosted()
+            ? tr("\nAttached here: %1").arg(local)
+            : binding.shared()
+                ? tr("\nThe same store file is attached here: saved edits reach the fit at its next update")
+                : tr("\nThe same store is attached here");
+    else if (binding.localUuid.isEmpty())
+        text += tr("\nNo store is attached here: fit inputs cannot be displayed");
+    else if (binding.serviceUuid == binding.localUuid)
+        text += tr("\nThe attached copy of this store (%1) is not a replica of the service's hub: "
+                   "edits cannot reach the fit until you clone the hub").arg(local);
+    else
+        text += tr("\nAnother store is attached here (%1): fit inputs are not displayed as fitted")
+                    .arg(binding.localUuid);
+    _objectStoreSummary->setText(text);
+}
+
+void SpiralPanel::startInputUpdate(bool confirm)
+{
+    if (!_service->storeBinding().positioned()) {
+        _warnings->setText(tr("The Spiral service fits no store positions: saved edits reach the fit "
+                              "when it is rebuilt with current inputs"));
+        return;
+    }
+    QJsonParseError error;
+    const QJsonDocument advanced = QJsonDocument::fromJson(_advanced->toPlainText().toUtf8(), &error);
+    if (error.error != QJsonParseError::NoError || !advanced.isObject()) {
+        QMessageBox::warning(this, tr("Invalid advanced configuration"),
+                             tr("Advanced config must be a JSON object: %1").arg(error.errorString()));
+        return;
+    }
+    if (confirm && _sessionState == QStringLiteral("Error")) {
+        const auto answer = QMessageBox::question(
+            this, tr("Update Fit Inputs"),
+            tr("The fit failed; updating its inputs rebuilds it from a position including "
+               "your saved edits. Continue?"));
+        if (answer != QMessageBox::Yes) return;
+    }
+    persist();
+    QJsonObject request = sessionRequest();
+    QJsonObject paths = request.value(QStringLiteral("paths")).toObject();
+    paths.remove(QStringLiteral("checkpoint"));
+    request[QStringLiteral("paths")] = paths;
+    _service->updateFitInputs(request);
+}
+
+void SpiralPanel::updatePositionSummary()
+{
+    const auto& binding = _service->storeBinding();
+    if (!binding.positioned()) {
+        _positionSummary->setVisible(false);
+        return;
+    }
+    QStringList lines;
+    const QJsonObject position = _lastInputStatus.value(QStringLiteral("input_position")).toObject();
+    if (!position.isEmpty()) {
+        const qint64 sequence = position.value(QStringLiteral("sequence")).toInteger();
+        const QJsonValue requested = position.value(QStringLiteral("requested"));
+        lines << (position.value(QStringLiteral("source")).toString() == QStringLiteral("checkpoint")
+                      ? tr("The fit reads position %1, recorded by its checkpoint").arg(sequence)
+                  : requested.isNull()
+                      ? tr("The fit reads position %1 (linked at %2)")
+                            .arg(sequence).arg(position.value(QStringLiteral("head")).toInteger())
+                      : tr("The fit reads position %1 (requested %2, linked at %3)")
+                            .arg(sequence).arg(requested.toInteger())
+                            .arg(position.value(QStringLiteral("head")).toInteger()));
+    }
+    const QJsonObject preparing = _lastInputStatus.value(QStringLiteral("input_preparation")).toObject();
+    if (!preparing.isEmpty())
+        lines << tr("The service is preparing the fit's inputs (linking, then reading a pinned position%1)…")
+                     .arg(preparing.value(QStringLiteral("requested_position")).isNull()
+                              ? QString()
+                              : tr(" including %1").arg(preparing.value(QStringLiteral("requested_position")).toInteger()));
+    const QJsonObject failed = _lastInputStatus.value(QStringLiteral("input_preparation_error")).toObject();
+    if (!failed.isEmpty() && _inputUpdateText.isEmpty())
+        lines << tr("The last input update failed; the fit is unchanged: %1")
+                     .arg(failed.value(QStringLiteral("message")).toString());
+    if (binding.matches())
+        lines << (binding.localPending > 0
+                      ? tr("This replica: %n saved edit(s) not yet pushed", nullptr, binding.localPending)
+                      : tr("This replica: every saved edit is pushed"))
+                     + (binding.localConflicts > 0
+                            ? tr("; %n hub conflict(s) to resolve", nullptr, binding.localConflicts)
+                            : QString())
+                     + (binding.localPosition >= 0 ? tr("; synced to position %1").arg(binding.localPosition)
+                                                   : QString());
+    if (_localDraftsReady)
+        lines << tr("Unsaved drawings in this workspace: save them to the store to include them");
+    if (!_inputUpdateText.isEmpty()) lines << _inputUpdateText;
+    _positionSummary->setText(lines.join(QStringLiteral("\n")));
+    _positionSummary->setVisible(!lines.isEmpty());
+}
+
+void SpiralPanel::resetScrollSummaries()
+{
+    // The project's fit volume and Lasagna dataset give these once a fit is
+    // built (applySessionScroll).
+    _scrollSummary->setText(tr("From the project's fit volume when a fit is built"));
+    _lasagnaSummary->setText(tr("From the project's selected Lasagna dataset when a fit is built"));
+    _windingInferenceSummary->setText(tr("Advertised by the service once connected"));
+}
+
+void SpiralPanel::applySessionScroll(const QJsonObject& request)
+{
+    const QJsonObject scroll = request.value(QStringLiteral("scroll")).toObject();
+    const QJsonObject project = request.value(QStringLiteral("project")).toObject();
     _scrollSummary->setText(
-        tr("%1 — %2 µm/voxel, outward %3")
-            .arg(spec.value(QStringLiteral("name")).toString())
-            .arg(voxelSize, 0, 'g', 4)
-            .arg(spec.value(QStringLiteral("spiral_outward_sense")).toString()));
+        tr("%1 — volume %2, %3 µm/voxel, outward %4; umbilicus revision %5")
+            .arg(scroll.value(QStringLiteral("name")).toString(),
+                 project.value(QStringLiteral("volume")).toString())
+            .arg(scroll.value(QStringLiteral("voxel_size_um")).toDouble(), 0, 'g', 4)
+            .arg(scroll.value(QStringLiteral("spiral_outward_sense")).toString(),
+                 project.value(QStringLiteral("umbilicus")).toObject()
+                     .value(QStringLiteral("revision")).toString()));
+    const QJsonObject lasagna = project.value(QStringLiteral("lasagna")).toObject();
     _lasagnaSummary->setText(
-        tr("normals in zarr group %1, SDT in %2, coordinate scale %3")
-            .arg(spec.value(QStringLiteral("normal_zarr_group")).toString())
-            .arg(spec.value(QStringLiteral("surf_sdt_zarr_group")).toString())
-            .arg(spec.value(QStringLiteral("lasagna_scale")).toInt()));
+        lasagna.isEmpty()
+            ? tr("The project selects no Lasagna dataset")
+            : lasagna.contains(QStringLiteral("error"))
+            ? tr("%1 — %2").arg(lasagna.value(QStringLiteral("location")).toString(),
+                                lasagna.value(QStringLiteral("error")).toString())
+            : tr("%1 (%2) — array %3, %4 fit-volume voxels per array voxel")
+                  .arg(lasagna.value(QStringLiteral("location")).toString(),
+                       lasagna.value(QStringLiteral("identity")).toString(),
+                       lasagna.value(QStringLiteral("group")).toString())
+                  .arg(scroll.value(QStringLiteral("lasagna_scale")).toInt()));
 }
 
 QJsonObject SpiralPanel::sessionRequest() const
@@ -1873,14 +1967,6 @@ QJsonObject SpiralPanel::sessionRequest() const
     QJsonObject paths;
     for (auto it = _paths.begin(); it != _paths.end(); ++it)
         paths[it.key()] = it.value()->text();
-    QJsonArray pcls;
-    for (int row = 0; row < _pclList->count(); ++row) {
-        const QListWidgetItem* item = _pclList->item(row);
-        pcls.append(QJsonObject{{"path", item->data(Qt::UserRole).toString()},
-                                {"role", item->data(Qt::UserRole + 1).toString()},
-                                {"required", item->data(Qt::UserRole + 2).toBool()}});
-    }
-    paths["pcls"] = pcls;
     // Not a panel field: a rebuild resumes whatever the live session was
     // built from unless the checkpoint section replaces it.
     paths["checkpoint"] = _sessionCheckpoint;
@@ -1893,6 +1979,10 @@ QJsonObject SpiralPanel::sessionRequest() const
             _verticalFiberOffsetEnabled->isChecked();
         config[QStringLiteral("pcl_vertical_fiber_radial_offset_voxels")] =
             _verticalFiberOffsetVoxels->value();
+        const QString sense = _outwardSense->currentData().toString();
+        config[QStringLiteral("spiral_outward_sense")] =
+            sense.isEmpty() ? QJsonValue(QJsonValue::Null) : QJsonValue(sense);
+        config[QStringLiteral("fit_volume_level")] = _fitVolumeLevel->value();
     }
     QJsonObject run{{"z_begin", _zBegin->value()}, {"z_end", _zEnd->value()},
                     {"storage_backend", QStringLiteral("sparse_cuda")},
@@ -1931,6 +2021,9 @@ QJsonObject SpiralPanel::sessionAdvancedConfig() const
     }
     config.remove(QStringLiteral("z_begin"));
     config.remove(QStringLiteral("z_end"));
+    // The service's launch binding owns its object store and refresh author;
+    // an attached session reports them, and a request must not restate them.
+    for (const QString& key : _service->serviceOwnedKeys()) config.remove(key);
     return config;
 }
 
@@ -2013,6 +2106,21 @@ void SpiralPanel::syncTrackSamplingControlsFromAdvanced()
     updateTrackSamplingUi();
 }
 
+void SpiralPanel::syncOutwardSense(const QJsonObject& effectiveConfig)
+{
+    const QSignalBlocker blocker(_outwardSense);
+    const int index = _outwardSense->findData(
+        effectiveConfig.value(QStringLiteral("spiral_outward_sense")).toString());
+    _outwardSense->setCurrentIndex(qMax(0, index));
+}
+
+void SpiralPanel::syncFitVolumeLevel(const QJsonObject& effectiveConfig)
+{
+    const QSignalBlocker blocker(_fitVolumeLevel);
+    _fitVolumeLevel->setValue(
+        effectiveConfig.value(QStringLiteral("fit_volume_level")).toInt(0));
+}
+
 void SpiralPanel::syncVerticalFiberOffsetControls(const QJsonObject& effectiveConfig)
 {
     const QSignalBlocker enabledBlocker(_verticalFiberOffsetEnabled);
@@ -2029,8 +2137,12 @@ void SpiralPanel::syncVerticalFiberOffsetControls(const QJsonObject& effectiveCo
 
 void SpiralPanel::updateTrackSamplingUi()
 {
-    const bool tracksEnabled =
-        !_paths.value(QStringLiteral("tracks_dbm"))->text().trimmed().isEmpty();
+    // Tracks come from the object store; the fit reads them when
+    // input_use_tracks is on.
+    const QJsonDocument advanced = _advanced
+        ? QJsonDocument::fromJson(_advanced->toPlainText().toUtf8()) : QJsonDocument();
+    const bool tracksEnabled = advanced.isObject()
+        && advanced.object().value(QStringLiteral("input_use_tracks")).toBool(false);
     _trackLengthBinSampling->setEnabled(tracksEnabled);
     _trackShortWeight->setEnabled(tracksEnabled && _trackLengthBinSampling->isChecked());
     _trackMediumWeight->setEnabled(tracksEnabled && _trackLengthBinSampling->isChecked());
@@ -2073,13 +2185,6 @@ void SpiralPanel::synchronizeSession(const QJsonObject& request,
         paths.value(QStringLiteral("checkpoint")).toString();
     setSessionCheckpoint(checkpoint);
 
-    _pclList->clear();
-    for (const QJsonValue& value : paths.value(QStringLiteral("pcls")).toArray()) {
-        const QJsonObject item = value.toObject();
-        addPclItem(item.value(QStringLiteral("path")).toString(),
-                   item.value(QStringLiteral("role")).toString(),
-                   item.value(QStringLiteral("required")).toBool());
-    }
 
     _zBegin->setValue(run.value(QStringLiteral("z_begin")).toInt(_zBegin->value()));
     _zEnd->setValue(run.value(QStringLiteral("z_end")).toInt(_zEnd->value()));
@@ -2100,6 +2205,8 @@ void SpiralPanel::synchronizeSession(const QJsonObject& request,
         effectiveConfig.value(QStringLiteral("output_save_png_visualizations"))
             .toBool(false));
     syncVerticalFiberOffsetControls(effectiveConfig);
+    syncOutwardSense(effectiveConfig);
+    syncFitVolumeLevel(effectiveConfig);
     syncTrackSamplingControlsFromAdvanced();
     if (!activeRunConfig.isEmpty())
         applySessionRunConfig(activeRunConfig, sessionGeneration);
@@ -2110,6 +2217,7 @@ void SpiralPanel::synchronizeSession(const QJsonObject& request,
 
     _hasManualEdits = false;
     _hasSession = true;
+    applySessionScroll(request);
     // Reload comparisons use the panel's adopted representation. The host
     // request is canonical and sparse, whereas the form expands the active
     // session defaults; both describe the same resident fit.
@@ -2129,16 +2237,17 @@ void SpiralPanel::refreshInputVisibility()
 
 void SpiralPanel::updateWarnings(const QJsonObject& status)
 {
-    // A healthy status response does not mean the editing claim succeeded.
-    // Retain its error until editing access is acquired or a new connection starts.
-    if (_service->ownsInputWorkspace()) _editingAccessError.clear();
+    // A healthy status response does not mean the lease claim succeeded.
+    // Retain its error until the lease is acquired or a new connection starts.
+    if (_service->ownsSessionLease()) _editingAccessError.clear();
     QStringList diagnostics;
-    if (_connected && !_service->ownsInputWorkspace()) {
+    if (_connected && !_service->ownsSessionLease()) {
         diagnostics.push_back(_editingAccessError.isEmpty()
-            ? tr("Waiting to acquire editing access to the service…")
-            : tr("Editing access unavailable: %1\nIf another VC3D client or service owns editing, "
-                 "release it there, then disconnect and reconnect here.").arg(_editingAccessError));
+            ? tr("Waiting to acquire the service's session lease…")
+            : tr("Session lease unavailable: %1\nIf another VC3D client owns this service's "
+                 "session, release it there, then disconnect and reconnect here.").arg(_editingAccessError));
     }
+    if (!_legacyInputNote.isEmpty()) diagnostics.push_back(_legacyInputNote);
     const QString error = status.value(QStringLiteral("error")).toString();
     if (!error.isEmpty()) diagnostics.push_back(error);
     const QString previewError =
@@ -2196,6 +2305,8 @@ void SpiralPanel::updateStatus(const QJsonObject& status)
                 .value(QStringLiteral("output_save_png_visualizations"))
                 .toBool(false));
         syncVerticalFiberOffsetControls(effectiveConfig);
+    syncOutwardSense(effectiveConfig);
+    syncFitVolumeLevel(effectiveConfig);
         syncTrackSamplingControlsFromAdvanced();
         _applyingResolution = false;
         applySessionRunConfig(runConfig, sessionGeneration);
@@ -2214,8 +2325,13 @@ void SpiralPanel::updateStatus(const QJsonObject& status)
     // Before explicit initialization there is no resident session to adopt.
     // Initialization/rebuild advances session_generation and synchronization
     // adopts the canonical request.
-    const QJsonObject progress =
+    // The session's own progress, else the input preparation's (linking and
+    // reading the store run beside the resident session, which stays Idle).
+    QJsonObject progress =
         status.value(QStringLiteral("progress")).toObject();
+    if (progress.isEmpty())
+        progress = status.value(QStringLiteral("input_preparation")).toObject()
+                       .value(QStringLiteral("progress")).toObject();
     const bool idle = state == QStringLiteral("Idle");
     const QString phase = status.value(QStringLiteral("phase")).toString();
     // An idle session reports "Idle" as both its state and its phase, so the
@@ -2235,7 +2351,14 @@ void SpiralPanel::updateStatus(const QJsonObject& status)
         stateText += tr("\nPreview: iteration %1 — lag %2")
             .arg(previewIteration)
             .arg(qMax<qint64>(0, currentIteration - previewIteration));
+        const QString inputs = vc3d::spiralPreviewInputNote(
+            {previewIteration, _service->displayedPreviewInputDigest(),
+             _service->displayedPreviewInputPosition()},
+            status.value(QStringLiteral("input_digest")).toString());
+        if (!inputs.isEmpty()) stateText += QStringLiteral(" — ") + inputs;
     }
+    _lastInputSummary = status.value(QStringLiteral("input_summary")).toObject();
+    updateFitInputs();
     if (status.value(QStringLiteral("preview_active")).toBool())
     {
         const qint64 activeIteration = status.value(
@@ -2333,7 +2456,7 @@ void SpiralPanel::updateStatus(const QJsonObject& status)
     if (_reloadRequired)
         stateText += QStringLiteral("\n")
             + tr("Reload required — fit inputs or training configuration changed");
-    if (_connected && !_service->ownsInputWorkspace())
+    if (_connected && !_service->ownsSessionLease())
         stateText += QStringLiteral("\n")
             + tr("Fit controls require editing access to the service. See warnings below.");
     _state->setText(stateText);
@@ -2345,16 +2468,32 @@ void SpiralPanel::updateStatus(const QJsonObject& status)
     const bool preparingInputs =
         progress.value(QStringLiteral("operation")).toString()
         == QStringLiteral("loading");
-    const bool runnable = idle && !preparingInputs;
+    // An input update in flight (pushing here, or linking and installing on
+    // the service) holds the fit too: the service refuses Run and rebuilds
+    // until it settles.
+    const bool updatingInputs = _service->inputUpdateActive()
+        || !status.value(QStringLiteral("input_update")).isNull();
+    const bool runnable = idle && !preparingInputs && !updatingInputs;
     _sessionRunnable = runnable;
     // Initialize is available without a session. Rebuild otherwise needs an
     // idle or failed session.
-    _load->setEnabled(_connected && _service->ownsInputWorkspace()
+    _load->setEnabled(_connected && _service->ownsSessionLease() && !updatingInputs
                       && (runnable || state == QStringLiteral("Error")
                           || state == QStringLiteral("Uninitialized")));
-    _run->setEnabled(_connected && _service->ownsInputWorkspace() && runnable && !_reloadRequired);
-    _stop->setEnabled(_service->ownsInputWorkspace() && state == "Running");
-    _save->setEnabled(_connected && _service->ownsInputWorkspace() && runnable);
+    const auto& binding = _service->storeBinding();
+    _updateInputs->setVisible(binding.positioned());
+    _updateInputs->setEnabled(_load->isEnabled() && binding.canUpdate()
+                              && status.value(QStringLiteral("input_preparation")).isNull());
+    if (!binding.matches() && binding.hosted())
+        setToolTipNote(_updateInputs, tr("Attach a replica of the service's hub first"));
+    else if (!binding.canUpdate() && binding.positioned())
+        setToolTipNote(_updateInputs, tr("Route Spiral's inputs to the service's own store file first"));
+    else
+        setToolTipNote(_updateInputs, {});
+    updatePositionSummary();
+    _run->setEnabled(_connected && _service->ownsSessionLease() && runnable && !_reloadRequired);
+    _stop->setEnabled(_service->ownsSessionLease() && state == "Running");
+    _save->setEnabled(_connected && _service->ownsSessionLease() && runnable);
     _downloadCheckpoint->setEnabled(
         _connected && runnable && !_checkpointDownloadActive);
     // An in-session load replaces resident model state, so it needs the same
@@ -2366,55 +2505,29 @@ void SpiralPanel::updateStatus(const QJsonObject& status)
             _connected, state,
             !_checkpointChoice->currentData().toString().isEmpty()));
 
-    // Baseline catalog entries and local revisioned drafts.
-    const QJsonArray ephemeral = vc3d::spiral::mergePatchDraftRows(
-        _service->inputDraftStatus(), _localPatchDrafts);
+    // Local drawings, which a frozen fit does not take.
+    const QJsonArray ephemeral = vc3d::spiral::mergePatchDraftRows({}, _localPatchDrafts);
     // Rebuild only on change: the 1 Hz status poll must not wipe the row the
     // user selected while aiming for Remove.
     if (ephemeral != _lastInputDrafts) {
         _lastInputDrafts = ephemeral;
-        _uncommittedCount = 0;
         QString selectedKind, selectedId;
         if (const QListWidgetItem* current = _inputList->currentItem()) {
             selectedKind = current->data(Qt::UserRole).toString();
             selectedId = current->data(Qt::UserRole + 1).toString();
         }
-        QSet<QString> excluded;
-        for (int index = 0; index < _inputList->count(); ++index) {
-            const auto* item = _inputList->item(index);
-            if (item->checkState() != Qt::Checked) excluded.insert(item->data(Qt::UserRole + 1).toString());
-        }
         const QSignalBlocker blocker(_inputList);
         QSet<QString> present;
-        QStringList selected;
         for (const QJsonValue& value : ephemeral) {
             const QJsonObject input = value.toObject();
             const QString kind = input.value(QStringLiteral("kind")).toString();
             const QString id = input.value(QStringLiteral("id")).toString();
             present.insert(id);
-            if (!input.value(QStringLiteral("committed")).toBool()) ++_uncommittedCount;
             auto* item = _inputItems.value(id);
-            if (item && item->data(Qt::UserRole + 4).toJsonObject() == input) {
-                if (item->checkState() == Qt::Checked) selected.push_back(id);
-                continue;
-            }
+            if (item && item->data(Qt::UserRole + 4).toJsonObject() == input) continue;
             const QString inputState =
                 input.value(QStringLiteral("state")).toString();
-            QString stateLabel = inputState;
-            if (inputState == QStringLiteral("queued"))
-                stateLabel = tr("queued for next optimizer step");
-            else if (inputState == QStringLiteral("pending"))
-                stateLabel = tr("pending for next Run");
-            QString name = input.value(QStringLiteral("name")).toString();
-            if (name.isEmpty()) name = QFileInfo(input.value(QStringLiteral("source")).toString()).fileName();
-            if (kind == QStringLiteral("pcl") && input.contains(QStringLiteral("collection_id")))
-                name += QStringLiteral(" #%1").arg(input.value(QStringLiteral("collection_id")).toInteger());
-            QString label = tr("%1 %2 — %3").arg(kind, name.isEmpty() ? id : name, stateLabel);
-            if (input.value(QStringLiteral("deleted")).toBool()) label += tr(" (removed)");
-            if (input.value(QStringLiteral("committed")).toBool())
-                label += tr(", committed");
-            const QString role = input.value(QStringLiteral("role")).toString();
-            if (!role.isEmpty()) label += tr(" (%1)").arg(role);
+            QString label = tr("%1 %2 — %3").arg(kind, id, inputState);
             if (!item) {
                 item = new QListWidgetItem(_inputList);
                 _inputItems[id] = item;
@@ -2426,29 +2539,18 @@ void SpiralPanel::updateStatus(const QJsonObject& status)
             item->setData(Qt::UserRole, kind);
             item->setData(Qt::UserRole + 1, id);
             item->setData(Qt::UserRole + 2, inputState);
-            item->setData(Qt::UserRole + 3, input.value(QStringLiteral("can_restore")).toBool());
-            item->setFlags(item->flags() | Qt::ItemIsUserCheckable);
-            item->setCheckState(excluded.contains(id) ? Qt::Unchecked : Qt::Checked);
-            if (!excluded.contains(id)) selected.push_back(id);
-            const QString incorporationError =
-                input.value(QStringLiteral("error")).toString();
-            if (!incorporationError.isEmpty()) {
-                item->setToolTip(tr("Input update failed: %1")
-                                     .arg(incorporationError));
-                label += tr(": %1").arg(incorporationError);
-                item->setText(label);
+            const QString error = input.value(QStringLiteral("error")).toString();
+            if (!error.isEmpty()) {
+                item->setToolTip(error);
+                item->setText(label + tr(": %1").arg(error));
             }
             if (kind == selectedKind && id == selectedId) _inputList->setCurrentItem(item);
         }
         for (const auto& id : _inputItems.keys())
             if (!present.contains(id)) delete _inputItems.take(id);
-        _service->setInputSelection(selected);
         refreshInputVisibility();
     }
-    const bool commitAvailable = status.value(QStringLiteral("commit_available")).toBool();
-    _commitInputs->setEnabled(_connected && _service->ownsInputWorkspace() && (commitAvailable || _localDraftsReady || _service->hasInputDrafts()));
-    _addInputs->setEnabled(_connected && _service->ownsInputWorkspace() && _hasSession && (_localDraftsReady || _service->hasInputDrafts()));
-    _commitHint->setText(tr("Checked inputs are selected. Saves update local drafts; Apply changes future fit steps; Commit writes the selected revisions."));
+    updateDraftActions();
 }
 
 void SpiralPanel::setSessionCheckpoint(const QString& hostPath)
@@ -2515,7 +2617,7 @@ void SpiralPanel::refreshReloadRequired()
     const bool wasReloadRequired = _reloadRequired;
     _reloadRequired = normalizedReloadRequest(current)
         != normalizedReloadRequest(_loadedSessionRequest);
-    _run->setEnabled(_connected && _service->ownsInputWorkspace() && _sessionRunnable && !_reloadRequired);
+    _run->setEnabled(_connected && _service->ownsSessionLease() && _sessionRunnable && !_reloadRequired);
     if (_reloadRequired)
         _state->setText(tr("Reload required — fit inputs or session configuration changed"));
     else if (wasReloadRequired)
@@ -2532,17 +2634,9 @@ void SpiralPanel::persist() const
     const QString prefix = formSettingsPrefix();
     for (auto it = _paths.begin(); it != _paths.end(); ++it)
         settings.setValue(prefix + QStringLiteral("paths/") + it.key(), it.value()->text());
-    QJsonArray pcls;
-    for (int row = 0; row < _pclList->count(); ++row) {
-        const QListWidgetItem* item = _pclList->item(row);
-        pcls.append(QJsonObject{{"path", item->data(Qt::UserRole).toString()},
-                                {"role", item->data(Qt::UserRole + 1).toString()},
-                                {"required", item->data(Qt::UserRole + 2).toBool()}});
-    }
-    settings.setValue(prefix + QStringLiteral("pcls"),
-                      QJsonDocument(pcls).toJson(QJsonDocument::Compact));
     settings.setValue(prefix + "z_begin", _zBegin->value());
     settings.setValue(prefix + "z_end", _zEnd->value());
+    settings.setValue(prefix + "fit_volume_level", _fitVolumeLevel->value());
     settings.setValue(prefix + "storage_backend", QStringLiteral("sparse_cuda"));
     settings.setValue(prefix + "run_tag", _runTag->text());
     settings.setValue(prefix + "render_volume_scale", _renderVolumeScale->value());
@@ -2551,6 +2645,7 @@ void SpiralPanel::persist() const
                       _verticalFiberOffsetEnabled->isChecked());
     settings.setValue(prefix + "vertical_fiber_offset_voxels",
                       _verticalFiberOffsetVoxels->value());
+    settings.setValue(prefix + "outward_sense", _outwardSense->currentData().toString());
     settings.setValue(prefix + "iterations", _iterations->value());
     settings.setValue(prefix + "dt_loss_schedule_enabled",
                       _dtLossScheduleEnabled->isChecked());
@@ -2570,19 +2665,22 @@ void SpiralPanel::restore()
     _applyingResolution = true;
     for (auto it = _paths.begin(); it != _paths.end(); ++it)
         it.value()->setText(settings.value(prefix + QStringLiteral("paths/") + it.key()).toString());
-    _pclList->clear();
-    const QByteArray savedPcls = settings.value(prefix + QStringLiteral("pcls")).toByteArray();
-    const QJsonDocument pclDocument = QJsonDocument::fromJson(savedPcls);
-    if (pclDocument.isArray()) {
-        for (const QJsonValue& value : pclDocument.array()) {
-            const QJsonObject item = value.toObject();
-            addPclItem(item.value(QStringLiteral("path")).toString(),
-                       item.value(QStringLiteral("role")).toString(),
-                       item.value(QStringLiteral("required")).toBool());
+    QStringList ignored;
+    for (const QString& key : {QStringLiteral("pcls"), QStringLiteral("paths/verified_patches"),
+                               QStringLiteral("paths/fibers")}) {
+        if (settings.contains(prefix + key)) {
+            ignored << key;
+            settings.remove(prefix + key);
         }
     }
+    if (!ignored.isEmpty())
+        _legacyInputNote = tr("Saved PCL documents and patch/fiber directories (%1) are no "
+                              "longer fit inputs and were dropped from this profile: the "
+                              "service reads patches, point collections and fibers from its "
+                              "object store.").arg(ignored.join(QStringLiteral(", ")));
     _zBegin->setValue(settings.value(prefix + "z_begin", 4000).toInt());
     _zEnd->setValue(settings.value(prefix + "z_end", 17000).toInt());
+    _fitVolumeLevel->setValue(settings.value(prefix + "fit_volume_level", 0).toInt());
     _runTag->setText(settings.value(prefix + "run_tag").toString());
     _renderVolumeScale->setValue(settings.value(prefix + "render_volume_scale", 16).toInt());
     _savePngVisualizations->setChecked(
@@ -2592,6 +2690,8 @@ void SpiralPanel::restore()
     _verticalFiberOffsetVoxels->setValue(
         settings.value(prefix + "vertical_fiber_offset_voxels", 4.0).toDouble());
     _verticalFiberOffsetVoxels->setEnabled(_verticalFiberOffsetEnabled->isChecked());
+    _outwardSense->setCurrentIndex(qMax(0, _outwardSense->findData(
+        settings.value(prefix + "outward_sense").toString())));
     _iterations->setValue(settings.value(prefix + "iterations", 100).toInt());
     _dtLossScheduleEnabled->setChecked(
         settings.value(prefix + "dt_loss_schedule_enabled", false).toBool());
@@ -2609,7 +2709,7 @@ void SpiralPanel::restore()
     }
     // Restoring is a profile switch: the previous service's scroll is not this
     // profile's, and nothing is known until the new connection advertises one.
-    applyScrollSpec({});
+    resetScrollSummaries();
     _applyingResolution = false;
     _hasManualEdits = false;
     _hasSession = false;

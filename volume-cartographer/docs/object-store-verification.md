@@ -27,7 +27,7 @@ AGENTS_AGENT_MODE=1 ninja -C ../volume-cartographer/build -j2 \
   VC3D test_fiber_widget test_fiber_view \
   test_line_annotation_structural_edits test_line_annotation_link_validation \
   test_line_annotation_generated_views test_line_annotation_fiber_deletion \
-  test_spiral_input_workflow test_open_data_manifest test_ink_detection_overlay \
+  test_open_data_manifest test_ink_detection_overlay \
   test_segmentation_lasagna_panel_ui
 AGENTS_AGENT_MODE=1 ctest --test-dir build --output-on-failure
 AGENTS_AGENT_MODE=1 PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=build/python \

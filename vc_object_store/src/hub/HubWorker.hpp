@@ -1,5 +1,6 @@
 #pragma once
 #include "vc_object_store/objects/ObjectStoreSession.hpp"
+#include <atomic>
 #include <condition_variable>
 #include <map>
 #include <set>
@@ -14,6 +15,14 @@ struct HubLeaseCounts {
     bool retain(const std::vector<std::string>& objects, const HubStatus& status, int64_t validThroughUs);
 };
 
+// Live PushHolds. The worker reads the count; a hold's release wakes the
+// worker (unless it is gone) so held pushes go out promptly.
+struct HubPushHolds {
+    std::atomic<int> count{0};
+    std::mutex mutex;
+    HubWorker* worker = nullptr;
+};
+
 // Background sync of one session's hosted replica: periodic pull/push, a push
 // shortly after local actions, renewal of held leases and release of the rest
 // once pushed. Hub operations are serialized with lease requests.
@@ -26,22 +35,25 @@ public:
     HubSessionStatus syncAndWait(std::chrono::milliseconds timeout);
     void requestResolve(const std::string& keep);
     LeaseHold hold(const std::vector<std::string>& objects);
+    PushHold holdPushes();
+    std::vector<JournalEntry> journal(int64_t after, int64_t upTo);
     HubSessionStatus status() const;
 
 private:
     void run();
     HubSessionStatus localStatus();
-    HubSessionStatus syncOnce(const std::optional<std::string>& resolve);
+    HubSessionStatus syncOnce(const std::optional<std::string>& resolve, bool push);
 
     ObjectStore& replica_;
     HubSessionOptions options_;
     std::function<void()> statusChanged_;
     std::shared_ptr<HubLeaseCounts> leases_ = std::make_shared<HubLeaseCounts>();
+    std::shared_ptr<HubPushHolds> pushHolds_ = std::make_shared<HubPushHolds>();
     std::mutex hub_;
     mutable std::mutex mutex_;
     std::condition_variable wake_, synced_;
     uint64_t started_ = 0, finished_ = 0;
-    bool stopping_ = false;
+    bool stopping_ = false, pushRequested_ = false;
     std::chrono::steady_clock::time_point due_;
     std::optional<std::string> resolve_;
     HubSessionStatus status_;

@@ -20,6 +20,30 @@ private slots:
     {
         const auto provenance = vc3d::spiralPreviewProvenance({});
         QCOMPARE(provenance.sourceIteration, qint64{-1});
+        QVERIFY(provenance.inputDigest.isEmpty());
+    }
+
+    void aPreviewOfOtherInputsIsLabelled()
+    {
+        auto provenance = vc3d::spiralPreviewProvenance({
+            {QStringLiteral("source_fit_iteration"), 200},
+            {QStringLiteral("input_digest"), QStringLiteral("aaaaaaaaaaaaaaaa")},
+        });
+        QCOMPARE(provenance.inputDigest, QStringLiteral("aaaaaaaaaaaaaaaa"));
+        QVERIFY(vc3d::spiralPreviewInputNote(provenance, QStringLiteral("aaaaaaaaaaaaaaaa")).isEmpty());
+        QCOMPARE(vc3d::spiralPreviewInputNote(provenance, QStringLiteral("bbbbbbbbbbbbbbbb")),
+                 QStringLiteral("fitted to other inputs (aaaaaaaaaaaa, not bbbbbbbbbbbb)"));
+        // A preview or session without a digest is not called different.
+        QVERIFY(vc3d::spiralPreviewInputNote({200, {}}, QStringLiteral("bbbb")).isEmpty());
+        QVERIFY(vc3d::spiralPreviewInputNote(provenance, {}).isEmpty());
+        // One fitted at a hub position names it.
+        provenance = vc3d::spiralPreviewProvenance({
+            {QStringLiteral("input_digest"), QStringLiteral("aaaaaaaaaaaaaaaa")},
+            {QStringLiteral("input_position"), QJsonObject{{QStringLiteral("sequence"), 41}}},
+        });
+        QCOMPARE(provenance.inputPosition, qint64{41});
+        QCOMPARE(vc3d::spiralPreviewInputNote(provenance, QStringLiteral("bbbbbbbbbbbbbbbb")),
+                 QStringLiteral("fitted to the inputs of hub position 41 (aaaaaaaaaaaa, not bbbbbbbbbbbb)"));
     }
 };
 

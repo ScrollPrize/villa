@@ -134,7 +134,7 @@ AGENTS_AGENT_MODE=1 ninja -C build -j2
 AGENTS_AGENT_MODE=1 ninja -C ../volume-cartographer/build -j6 VC3D \
   test_viewer_overlay_surface_primitives test_line_annotation_structural_edits \
   test_line_annotation_link_validation test_line_annotation_generated_views \
-  test_line_annotation_fiber_deletion test_spiral_input_workflow test_object_store_fiber_json
+  test_line_annotation_fiber_deletion test_object_store_fiber_json
 ctest --test-dir build --output-on-failure
 PYTHONPATH=build/python python3 -m pytest tests/python -q
 ctest --test-dir ../volume-cartographer/build --output-on-failure -R '(fiber|line_annotation|spiral|agent_bridge|object_store|viewer_overlay_surface_primitives)'
