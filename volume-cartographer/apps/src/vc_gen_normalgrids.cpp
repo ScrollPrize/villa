@@ -1,3 +1,5 @@
+#include <vc_reader/transforms.hpp>
+#include "vc/core/util/ImageMat.hpp"
 #include <iostream>
 #include <string>
 #include <vector>
@@ -11,7 +13,7 @@
 
 #include <boost/program_options.hpp>
 #include <opencv2/opencv.hpp>
-#include "utils/Json.hpp"
+#include <nlohmann/json.hpp>
 #include <fstream>
 #include <atomic>
 #include <chrono>
@@ -19,7 +21,7 @@
 #include <unordered_map>
 #include <bit>
 
-#include "vc/core/util/MemMap.hpp"
+#include "vc/core/util/AnonymousPages.hpp"
 
 #include <omp.h>
 
@@ -35,12 +37,11 @@ inline uint32_t be32(uint32_t v) {
 }
 
 
-#include "vc/core/types/Volume.hpp"
-#include "vc/core/render/ChunkCache.hpp"
+#include <vc_reader/zarr.hpp>
 #include <vc/core/util/GridStore.hpp>
-#include "vc/core/util/AtomicFile.hpp"
+#include <vc_reader/zarr.hpp>
 #include "vc/core/util/NormalGridGenerate.hpp"
-#include "vc/core/util/Thinning.hpp"
+#include <vc_reader/thinning.hpp>
 #include "vc/core/util/normalgridtools.hpp"
 #include "vc/core/util/LifeTime.hpp"
 
@@ -51,7 +52,7 @@ enum class SliceDirection { XY, XZ, YZ };
 
 namespace {
 
-using Json = utils::Json;
+using Json = nlohmann::json;
 
 struct DirectionMetrics {
     std::string direction;
@@ -74,7 +75,7 @@ struct DirectionMetrics {
     size_t thinningCalls = 0;
     std::unordered_map<std::string, double> timingTotals;
     std::unordered_map<std::string, size_t> timingCounts;
-    ThinningStats thinningStats;
+    vcr::thinning::Stats thinningStats;
 };
 
 struct RunMetrics {
@@ -130,12 +131,12 @@ struct ThreadSliceStats {
     size_t thinningCalls = 0;
     std::unordered_map<std::string, double> timingTotals;
     std::unordered_map<std::string, size_t> timingCounts;
-    ThinningStats thinningStats;
+    vcr::thinning::Stats thinningStats;
 };
 
 struct ThreadScratch {
-    std::vector<std::vector<cv::Point>> traces;
-    ThinningScratch thinning;
+    vcr::thinning::Traces traces;
+    vcr::thinning::Scratch thinning;
 };
 
 // Anonymous-mapped buffer (mmap MAP_ANONYMOUS / VirtualAlloc). The kernel
@@ -148,7 +149,7 @@ struct AnonMmap {
     explicit AnonMmap(size_t bytes) : bytes_(bytes) {
         if (bytes_ == 0) return;
         try {
-            ptr_ = vc::memmap::anonAlloc(bytes_);
+            ptr_ = vc::pages::anonAlloc(bytes_);
         } catch (...) {
             ptr_ = nullptr;
             bytes_ = 0;
@@ -175,7 +176,7 @@ struct AnonMmap {
     }
     ~AnonMmap() { reset(); }
     void reset() {
-        vc::memmap::anonFree(ptr_, bytes_);
+        vc::pages::anonFree(ptr_, bytes_);
         ptr_ = nullptr;
         bytes_ = 0;
     }
@@ -760,7 +761,7 @@ void run_pyramid(const po::variables_map& vm) {
         throw std::runtime_error("input normal_grids root is missing metadata.json: " + input_root.string());
     }
 
-    const Json source_metadata = Json::parse_file(input_root / "metadata.json");
+    const Json source_metadata = nlohmann::json::parse(std::ifstream(input_root / "metadata.json"));
     const int source_grid_step = source_metadata.value("grid-step", 64);
     const int source_sparse_volume = std::max(1, source_metadata.value("sparse-volume", 1));
     const double source_spiral_step = source_metadata.value("spiral-step", 20.0);
@@ -956,25 +957,27 @@ void run_pyramid(const po::variables_map& vm) {
                         if (level == 0) {
                             link_or_copy_file(src_path, dst_path, overwrite);
                         } else {
-                            cv::Mat img = cv::imread(src_path.string(), cv::IMREAD_UNCHANGED);
+                            cv::Mat img = vc::core::util::imageMat(vcr::sources::readImagePage(src_path.string(), 0));
                             if (img.empty()) {
                                 ++skipped;
                                 mark_progress();
                                 continue;
                             }
-                            cv::Mat scaled;
-                            cv::resize(
-                                img,
-                                scaled,
-                                cv::Size(scaled_extent(img.cols, scale),
-                                         scaled_extent(img.rows, scale)),
-                                0.0,
-                                0.0,
-                                cv::INTER_NEAREST);
-                            if (fs::exists(dst_path) && overwrite) {
-                                fs::remove(dst_path);
+                            std::vector<cv::Mat> channels;
+                            cv::split(img, channels);
+                            for (auto& channel : channels) {
+                                const auto* dtype = vc::core::util::tiffDtype(channel.depth());
+                                const vcr::transforms::Array input(
+                                    {1,std::size_t(channel.rows),std::size_t(channel.cols)},
+                                    dtype[1],channel.elemSize1(),channel.data);
+                                const auto resized = vcr::transforms::resize_array(input,
+                                    {std::size_t(scaled_extent(img.rows,scale)),std::size_t(scaled_extent(img.cols,scale))},true,true);
+                                channel = cv::Mat(int(resized.shape[1]),int(resized.shape[2]),channel.type(),
+                                    const_cast<void*>(resized.data())).clone();
                             }
-                            cv::imwrite(dst_path.string(), scaled);
+                            cv::Mat scaled;
+                            cv::merge(channels, scaled);
+                            vcr::sources::writeImage(dst_path, vc::core::util::imageBuffer(scaled).view());
                         }
                         ++written;
                     } catch (const std::exception& e) {
@@ -1126,7 +1129,7 @@ void run_generate(const po::variables_map& vm) {
         ? std::optional<fs::path>(fs::path(vm["metrics-json"].as<std::string>()))
         : std::nullopt;
 
-    ThinningPruneParams prune_params;
+    vcr::thinning::PruneParams prune_params;
     prune_params.minLengthPx = vm["prune-min-length-px"].as<double>();
     if (prune_params.minLengthPx < 0.0) {
         throw std::runtime_error("--prune-min-length-px must be >= 0");
@@ -1165,31 +1168,17 @@ void run_generate(const po::variables_map& vm) {
         std::cout << "Opening volume: " << input_path << std::endl;
     }
     const auto open_start = std::chrono::steady_clock::now();
-    Volume input_volume{fs::path(input_path)};
-    if (!input_volume.hasScaleLevel(input_level)) {
-        // Sparse pyramids keep absent levels as {0,0,0} placeholders; reading
-        // through one silently yields fill value instead of failing.
-        std::string levels;
-        for (int level : input_volume.presentScaleLevels())
-            levels += " " + std::to_string(level);
-        throw std::runtime_error("--level " + std::to_string(input_level) +
-                                 " is not present in this volume; present levels:" +
-                                 levels);
+    auto input_array = vcr::zarr::openPyramidLevel(input_path, input_level, {});
+    const std::vector<size_t> shape(input_array.meta.shape.begin(), input_array.meta.shape.end());
+    const std::vector<size_t> source_chunk_shape(input_array.meta.chunks.begin(), input_array.meta.chunks.end());
+    if (shape.size() != 3 || input_array.meta.dtype != "|u1")
+        throw std::runtime_error("vc_gen_normalgrids requires a 3D uint8 array");
+    for (size_t axis = 0; axis < 3; ++axis) {
+        if (shape[axis] > std::numeric_limits<int>::max() ||
+            source_chunk_shape[axis] > std::numeric_limits<int>::max())
+            throw std::runtime_error("source dimensions exceed the slice assembler's integer range");
     }
-    auto* input_chunks = input_volume.chunkedCache();
-    const auto level_shape = input_chunks->shape(input_level);
-    const auto level_chunk_shape = input_chunks->chunkShape(input_level);
-    const size_t dtype_size = input_chunks->dtype() == vc::render::ChunkDtype::UInt16 ? 2 : 1;
-    const std::vector<size_t> shape = {
-        static_cast<size_t>(level_shape[0]),
-        static_cast<size_t>(level_shape[1]),
-        static_cast<size_t>(level_shape[2]),
-    };
-    const std::vector<size_t> source_chunk_shape = {
-        static_cast<size_t>(level_chunk_shape[0]),
-        static_cast<size_t>(level_chunk_shape[1]),
-        static_cast<size_t>(level_chunk_shape[2]),
-    };
+    const size_t dtype_size = input_array.meta.itemsize();
     if (!print_plan) {
         const double open_seconds = std::chrono::duration<double>(
             std::chrono::steady_clock::now() - open_start).count();
@@ -1287,7 +1276,7 @@ void run_generate(const po::variables_map& vm) {
     // Every shard must validate before creating files or replacing metadata.
     // Older stores omitted the threshold and used any non-zero voxel.
     if (fs::exists(metadata_path)) {
-        const int previous_threshold = Json::parse_file(metadata_path).value("threshold", 1);
+        const int previous_threshold = Json::parse(std::ifstream(metadata_path)).value("threshold", 1);
         if (previous_threshold != threshold) {
             throw std::runtime_error(
                 "output directory uses threshold " + std::to_string(previous_threshold) +
@@ -1317,7 +1306,7 @@ void run_generate(const po::variables_map& vm) {
         metadata["debug-per-slice"] = debug_per_slice;
         metadata["prune-min-length-px"] = prune_params.minLengthPx;
         // Other shards may be validating this file while shard 0 updates it.
-        vc::core::util::atomicWriteString(metadata_path, metadata.dump(4) + "\n");
+        vcr::zarr::atomicWrite(metadata_path, metadata.dump(4) + "\n", vcr::zarr::Durability::Fsync);
     }
 
     int num_threads = omp_get_max_threads();
@@ -1336,11 +1325,6 @@ void run_generate(const po::variables_map& vm) {
     const size_t cache_budget_bytes = std::min<size_t>(
         256ull * 1024ull * 1024ull,
         std::max<size_t>(64ull * 1024ull * 1024ull, max_estimated_batch_bytes / 2));
-
-    std::cout << "Setting cache budget: " << (cache_budget_bytes / (1024 * 1024))
-              << " MiB" << std::endl;
-    vc::render::processChunkCacheService()->configureDecodedByteCapacity(
-        cache_budget_bytes);
 
     struct DirectionShardPlan {
         SliceDirection dir;
@@ -1564,9 +1548,8 @@ void run_generate(const po::variables_map& vm) {
                     };
 
                     const auto read_start = std::chrono::steady_clock::now();
-                    vc::core::util::fillBinarySliceBatchFromVolume(
-                        input_volume,
-                        input_level,
+                    vc::core::util::fillBinarySliceBatchFromArray(
+                        input_array,
                         to_normal_grid_direction(dir),
                         static_cast<int>(source_chunk_plan.sourceChunkIndex),
                         volume_shape_i,
@@ -1593,11 +1576,9 @@ void run_generate(const po::variables_map& vm) {
 
                 std::vector<ThreadSliceStats> thread_stats(static_cast<size_t>(num_threads));
 
-                // Cap the team size to the batch — each ThinningScratch slot
-                // holds 5 slice-sized CV_8U mats once a thread touches it,
-                // and slots are never freed. Letting OMP scatter 4 work items
-                // across 15 tids leaks ~5 GiB of resident scratch per fresh
-                // tid that happens to grab a slice.
+                // Each worker retains image and path scratch buffers. Cap the
+                // team to the batch so idle workers do not accumulate large
+                // per-slice allocations across successive batches.
                 const int slice_team_threads = std::max<int>(
                     1,
                     std::min<int>(num_threads,
@@ -1627,9 +1608,11 @@ void run_generate(const po::variables_map& vm) {
 
                     scratch.traces.clear();
                     const auto thinning_start = std::chrono::steady_clock::now();
-                    ThinningStats thinning_stats;
-                    customThinningTraceOnly(assembled.binarySlice, scratch.traces,
-                        &thinning_stats, scratch.thinning, prune_params);
+                    vcr::thinning::Stats thinning_stats;
+                    vcr::thinning::trace(assembled.binarySlice.data, assembled.binarySlice.rows,
+                        assembled.binarySlice.cols, nullptr, &scratch.traces, scratch.thinning,
+                        &thinning_stats, prune_params, vcr::thinning::Backend::Cpu,
+                        assembled.binarySlice.step);
                     const double thinning_seconds = seconds_since(thinning_start);
                     record_timing(local_stats, "thinning", thinning_seconds);
                     local_stats.thinningStats.accumulate(thinning_stats);
@@ -1668,7 +1651,7 @@ void run_generate(const po::variables_map& vm) {
                     const size_t written_index = written_counter.fetch_add(1, std::memory_order_relaxed) + 1;
                     if (preview_every > 0 && (written_index % static_cast<size_t>(preview_every)) == 0) {
                         const auto preview_start = std::chrono::steady_clock::now();
-                        cv::imwrite(task.previewPath.string(), assembled.binarySlice);
+                        vcr::sources::writeImage(task.previewPath, vc::core::util::imageBuffer(assembled.binarySlice).view());
                         record_timing(local_stats, "preview_image", seconds_since(preview_start));
                         ++local_stats.previewWrites;
                     }

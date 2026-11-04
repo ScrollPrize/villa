@@ -156,6 +156,12 @@ jobs:
         with:
           fetch-depth: 0  # history-aware queries if needed
 
+      - name: Install shared build dependencies
+        if: needs.changes.outputs.vc == 'true'
+        env:
+          AGENTS_ALLOW_INSTALL: '1'
+        run: bash volume-cartographer/scripts/install_build_deps.sh minimal-build
+
       - name: Initialize CodeQL
         if: needs.changes.outputs.vc == 'true'
         uses: github/codeql-action/init@v3

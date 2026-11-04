@@ -31,8 +31,6 @@ cmake -S vc_reader -B <reader-build> -DVC_READER_BUILD_PYTHON=OFF \
 cmake --build <reader-build> --target test_delta3d
 ctest --test-dir <reader-build> -R '^test_delta3d$' --output-on-failure
 
-python -m pytest volume-cartographer/python/tests/test_vcz1_codec.py
-
 # Minimal embedding regression: Qt autogen must not leak into codec C kernels.
 cmake -S vc_reader/tests/cmake/delta3d_embedding -B <embedding-build> \
   -DCMAKE_BUILD_TYPE=Release
@@ -61,7 +59,6 @@ These are integration checks, not a new throughput benchmark.
 | sheet_ny | 564,196 | 411,821 |
 | width | 487,384 | 366,605 |
 
-Native cache-facade tests and all eight Python VCZ1 tests passed. Full VC3D/reader
-build validation was unavailable on the test host: reader CMake configuration
+Full VC3D/reader build validation was unavailable on the test host: reader CMake configuration
 stopped at missing `nlohmann_json`; Blosc development headers were also absent.
 The new reader codec regression test is registered for builds with those dependencies.

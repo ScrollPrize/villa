@@ -220,6 +220,11 @@ shared behavior into a reusable helper/library first, then make both callers use
 that shared implementation. If extraction is genuinely impossible in the current
 task, treat that as an explicit deviation and report it before proceeding.
 
+Before writing code that reads, samples, interpolates, parses, caches or writes
+Vesuvius data (Zarr, tifxyz surfaces, images, catalog metadata, display kernels,
+transforms), check the [`vc_reader` capability map](vc_reader/README.md#capability-map)
+and call what it lists.
+
 ### 4.3 Document anything that affects developer workflow
 If you add:
 - new scripts

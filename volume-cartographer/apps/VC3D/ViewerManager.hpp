@@ -3,25 +3,19 @@
 #include <QObject>
 #include <QString>
 #include <QStringList>
-#include <QFutureWatcher>
 
-#include <atomic>
 #include <functional>
-#include <map>
 #include <memory>
 #include <optional>
 #include <string>
-#include <unordered_set>
 #include <vector>
 
 #include <opencv2/core/mat.hpp>
 #include <vc_reader/affine.hpp>
 
 #include "vc/core/util/Compositing.hpp"
-#include "vc/core/types/Sampling.hpp"
 #include "volume_viewers/ViewerHud.hpp"
 
-#include <array>
 
 class QMdiArea;
 class QTimer;
@@ -87,21 +81,6 @@ public:
     void setInkDetectionOverlay(InkDetectionOverlayController* overlay);
     InkDetectionOverlayController* inkDetectionOverlay() const { return _inkDetectionOverlay; }
 
-    // Re-read the derived surface-cache settings. Called during manager
-    // construction and whenever the settings dialog applies.
-    void applyViewerCacheSettings();
-
-    // --- SurfaceCache budgets (flattened segmentation view) ---
-    //
-    // Zero disables a channel and leaves it on the legacy render path.
-    void setSurfaceCacheBudgets(std::size_t baseBytes, std::size_t overlayBytes);
-
-    // Withhold raw-path viewport chunk demand from frames the SurfaceCache
-    // fully serves, so tile fills are not starved behind interactive fetches
-    // (see VolumeViewerBase::setPreferSurfaceTileFills). Applied to every
-    // viewer this manager owns; enabled by the main and Spiral workspaces.
-    void setPreferSurfaceTileFills(bool enabled);
-
     void setIntersectionOpacity(float opacity);
     float intersectionOpacity() const { return _intersectionOpacity; }
 
@@ -114,8 +93,8 @@ public:
     float overlayOpacity() const { return _overlayOpacity; }
 
     void setOverlayColormap(const std::string& colormapId);
-    void setOverlaySamplingMethod(vc::Sampling method);
-    vc::Sampling overlaySamplingMethod() const { return _overlaySamplingMethod; }
+    void setOverlaySamplingMethod(int method);
+    int overlaySamplingMethod() const { return _overlaySamplingMethod; }
     void setOverlayIntensityAsAlpha(bool enabled);
     bool overlayIntensityAsAlpha() const { return _overlayIntensityAsAlpha; }
 
@@ -251,7 +230,7 @@ signals:
     void zScrollSensitivityChanged(double sensitivity);
 
 private slots:
-    void onGlobalTick();
+    void onStatusTick();
     void handleFocusPoiChanged(std::string name, POI* poi);
     void handleVolumeClicked(cv::Vec3f volLoc, cv::Vec3f normal, Surface* surf,
                              Qt::MouseButton button, Qt::KeyboardModifiers modifiers);
@@ -275,16 +254,15 @@ private:
     VolumeViewerBase* _activeViewer{nullptr};
     VolumeClickInterceptor _volumeClickInterceptor;
     SurfacePicker _surfacePicker;
-    // The one maintenance clock for the whole app. Ticks ~60Hz; render requests
-    // submit immediately, while deferred intersections/status are serviced here.
-    QTimer* _globalClock{nullptr};
+    // Refreshes the viewers' status every 5 s.
+    QTimer* _statusClock{nullptr};
     std::unordered_map<VolumeViewerBase*, bool> _resetDefaults;
     float _intersectionOpacity{1.0f};
     float _intersectionThickness{0.0f};
     std::shared_ptr<Volume> _overlayVolume;
     float _overlayOpacity{0.5f};
     std::string _overlayColormapId;
-    vc::Sampling _overlaySamplingMethod{vc::Sampling::Nearest};
+    int _overlaySamplingMethod{0};
     float _overlayWindowLow{0.0f};
     float _overlayWindowHigh{255.0f};
     bool _overlayIntensityAsAlpha{false};
@@ -303,9 +281,6 @@ private:
     vc3d::hud::Options _hudOptions;
     double _zScrollSensitivity{1.0};
 
-    std::size_t _surfaceCacheBudgetBytes{0};
-    std::size_t _overlaySurfaceCacheBudgetBytes{0};
-    bool _preferSurfaceTileFills{false};
 
     VolumeOverlayController* _volumeOverlay{nullptr};
     InkDetectionOverlayController* _inkDetectionOverlay{nullptr};

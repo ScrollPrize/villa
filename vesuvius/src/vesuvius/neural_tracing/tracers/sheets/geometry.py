@@ -25,26 +25,10 @@ def _gather(flat: torch.Tensor, index: torch.Tensor) -> torch.Tensor:
     return torch.gather(flat, 1, index[..., None].expand(-1, -1, flat.shape[-1]))
 
 
-def grid_eval(gt: torch.Tensor, valid: torch.Tensor, uv: torch.Tensor):
-    """Bilinear surface ``S``, partials ``S_u``, ``S_v`` (per grid unit) and validity at ``uv`` (B, Q, 2)."""
-    B, Gu, Gv, _ = gt.shape
-    inside = (uv[..., 0] >= 0) & (uv[..., 0] <= Gu-1) & (uv[..., 1] >= 0) & (uv[..., 1] <= Gv-1)
-    u = uv[..., 0].clamp(0, Gu-1-1e-4)
-    v = uv[..., 1].clamp(0, Gv-1-1e-4)
-    u0, v0 = u.floor().long(), v.floor().long()
-    fu, fv = (u-u0)[..., None], (v-v0)[..., None]
-    flat, vflat = gt.reshape(B, Gu*Gv, 3), valid.reshape(B, Gu*Gv)
-    corners, ok = [], inside
-    for du in (0, 1):
-        for dv in (0, 1):
-            index = (u0+du)*Gv+v0+dv
-            corners.append(_gather(flat, index))
-            ok = ok & _gather(vflat, index)
-    p00, p01, p10, p11 = corners
-    S = (1-fu)*((1-fv)*p00+fv*p01)+fu*((1-fv)*p10+fv*p11)
-    Su = (1-fv)*(p10-p00)+fv*(p11-p01)
-    Sv = (1-fu)*(p01-p00)+fu*(p11-p10)
-    return S, Su, Sv, ok
+def grid_eval(gt: torch.Tensor, valid: torch.Tensor, uv: torch.Tensor, *, derivatives=None):
+    """Bicubic surface ``S``, partials ``S_u``, ``S_v`` (per grid unit) and validity at ``uv`` (B, Q, 2)."""
+    from vc_reader.torch import surface_points
+    return surface_points(gt, valid, uv, derivatives=derivatives)
 
 
 def surface_frame(Su: torch.Tensor, Sv: torch.Tensor) -> torch.Tensor:
@@ -56,9 +40,10 @@ _COMPILED_PROJECT = None
 
 
 def use_compiled_projection(enabled: bool = True) -> None:
-    """Route ``project`` through ``torch.compile`` (about 1.4x faster training on an H100: it fuses hundreds of tiny
-    kernels per call). Not bit-identical to eager: foot points differ by ~1e-3 vx typically, and a rare query can
-    settle on a different Gauss-Newton solution."""
+    """Compile projection tensor operations around vc_reader's native surface queries.
+
+    Floating-point fusion may change foot points and occasionally the selected solution.
+    """
     global _COMPILED_PROJECT
     _COMPILED_PROJECT = torch.compile(_project, **compile_options()) if enabled else None
 
@@ -72,7 +57,7 @@ def project(gt: torch.Tensor, valid: torch.Tensor, q: torch.Tensor, iters: int =
 def _project(gt: torch.Tensor, valid: torch.Tensor, q: torch.Tensor, iters: int = 3):
     """Closest GT surface point to each query ``q`` (B, Q, 3).
 
-    Nearest valid node, then Gauss-Newton on the bilinear patch (at most one cell per iteration, never
+    Nearest valid node, then Gauss-Newton on the bicubic patch (at most one cell per iteration, never
     moving onto an invalid cell). Returns ``uv``, ``S``, frame ``(t, a, n)`` and ``ok``: the cell is valid
     and the projection is not pinned to the grid border (where the true foot point may lie outside).
     """
@@ -83,7 +68,9 @@ def _project(gt: torch.Tensor, valid: torch.Tensor, q: torch.Tensor, iters: int 
     index = dist.argmin(-1)
     any_valid = vflat.any(1, keepdim=True)
     uv = torch.stack([index//Gv, index % Gv], -1).to(gt.dtype)
-    S, Su, Sv, ok = grid_eval(gt, valid, uv)
+    from vc_reader.torch import surface_derivatives
+    derivatives = surface_derivatives(gt, valid)
+    S, Su, Sv, ok = grid_eval(gt, valid, uv, derivatives=derivatives)
     for _ in range(iters):
         # 2x2 normal equations solved explicitly; degenerate cells (|det| tiny) do not move.
         a, b, c = (Su*Su).sum(-1), (Su*Sv).sum(-1), (Sv*Sv).sum(-1)
@@ -96,7 +83,7 @@ def _project(gt: torch.Tensor, valid: torch.Tensor, q: torch.Tensor, iters: int 
         dv = torch.where(good, (a*rv-b*ru)/det, torch.zeros_like(det))
         delta = torch.stack([du, dv], -1).clamp(-1, 1)
         trial = torch.stack([(uv[..., 0]+delta[..., 0]).clamp(0, Gu-1), (uv[..., 1]+delta[..., 1]).clamp(0, Gv-1)], -1)
-        S2, Su2, Sv2, ok2 = grid_eval(gt, valid, trial)
+        S2, Su2, Sv2, ok2 = grid_eval(gt, valid, trial, derivatives=derivatives)
         keep = ok2 | ~ok
         uv = torch.where(keep[..., None], trial, uv)
         S, Su, Sv = (torch.where(keep[..., None], new, old) for new, old in ((S2, S), (Su2, Su), (Sv2, Sv)))

@@ -783,4 +783,4 @@ Output is a JSON manifest describing channel groups, each stored in a separate z
 | `vesuvius/src/vesuvius/models/build/build_network_from_config.py` | `NetworkFromConfig` — shared encoder + decoder/task-heads UNet builder |
 | `vesuvius/src/vesuvius/neural_tracing/datasets/patch_finding.py` | `find_world_chunk_patches()` — world-chunk patch discovery |
 | `vesuvius/src/vesuvius/neural_tracing/datasets/common.py` | `open_zarr()`, `voxelize_surface_grid_masked()`, `ChunkPatch`, `_compute_wrap_order_stats()`, `_triplet_wraps_compatible()` |
-| `vesuvius/src/vesuvius/image_proc/edt.py` | GPU-accelerated EDT (CuPy > edt > scipy fallback) |
+| `vc_reader.transforms.DistanceTransform` | Native CPU/CUDA Euclidean distance transforms |

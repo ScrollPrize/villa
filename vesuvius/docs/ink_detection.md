@@ -20,8 +20,8 @@ uv run --extra models python -m vesuvius.ink_detection.training.train -h
 ```
 
 The `models` extra includes PyTorch, Accelerate, the model-building stack,
-OpenCV, TIFF/Zarr codecs, and the CUDA cuCIM package used by positive native-3D
-label dilation. The volume-only installation does not include the training
+OpenCV and TIFF/Zarr codecs. Positive native-3D label dilation uses
+vc_reader's exact distance transform on the batch's device. The volume-only installation does not include the training
 stack.
 
 ## Data layout
@@ -575,8 +575,6 @@ uv run --no-sync pytest tests -m "not slow and not network"
 - ResNet3D, TimeSformer/container inference, `normal_pooled_3d`, mean-teacher,
   Betti matching, sweeps, and the embedded sample viewer are not available in
   this package.
-- Positive native label or supervision dilation enters the CUDA/cuCIM path;
-  use zero dilation where that capability is unavailable.
 - Flat TIFF and native OME-Zarr encoding intentionally differ: flat output
   truncates scaled probabilities, while native output rounds probabilities and
   derived pyramid means.

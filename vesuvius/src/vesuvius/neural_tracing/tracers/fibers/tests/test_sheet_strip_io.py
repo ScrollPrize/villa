@@ -58,7 +58,7 @@ def inference_setup(monkeypatch):
         source = 'test-checkpoint'
         cfg, ck, data = SimpleNamespace(), {}, {}
         spec = SimpleNamespace(grid_scale=1.)
-        trace_per_patch, vol = 1., None
+        trace_per_patch, ct = 1., None
         f, v = np.array([-8., 0., 8.]), np.array([-4., 0., 4.])
 
         def predict(self, fiber, arcs, on_items=None, log=None):
@@ -73,7 +73,7 @@ def inference_setup(monkeypatch):
     monkeypatch.setattr(infer, 'FiberStore', lambda *args, **kwargs: Fibers())
     monkeypatch.setattr(infer, 'fiber_volume', lambda path: '1')
     # Exercise render_saved and its score handling without a CT volume or plotting.
-    monkeypatch.setattr(infer, 'render_strip', lambda vol, rows, keep, *args: np.where(keep, 1., np.nan))
+    monkeypatch.setattr(infer, 'render_strip', lambda ct, spec, rows, keep, *args: np.where(keep, 1., np.nan))
     renders = []
     monkeypatch.setattr(infer, 'save_render', lambda *args: renders.append(args))
     return fiber, renders

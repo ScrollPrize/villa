@@ -15,17 +15,17 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
+from vc_reader import images
 import torch
-import zarr
+from vc_reader.reader import ZarrReader, ZarrWriter, create_group, open_group, open_zarr
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from torch.utils.data import Dataset
 
 from vesuvius.utils.utils import pad_or_crop_3d
 from .find_valid_patches import find_valid_patches
 from .intensity_properties import initialize_intensity_properties
-from ..training.normalization import get_normalization
-from ..augmentation.pipelines import create_training_transforms
-from ..augmentation.transforms.utils.perf import collect_augmentation_names
+import vc_reader.transforms as A
+from ..augmentation.pipelines import create_training_transforms, sample_seed
 
 
 logger = logging.getLogger(__name__)
@@ -74,27 +74,19 @@ class TiffArrayHandle:
         self._path = path
         self._spatial_shape = spatial_shape
         self._dtype = dtype
-        self._zarr_store = None
+        self._reader = None
 
     @property
     def spatial_shape(self) -> Tuple[int, ...]:
         return self._spatial_shape
 
-    def _ensure_zarr(self):
-        if self._zarr_store is None:
-            import tifffile
-            self._zarr_store = tifffile.imread(str(self._path), aszarr=True)
-        return self._zarr_store
-
     def read(self) -> np.ndarray:
-        import tifffile
-        return tifffile.imread(str(self._path))
+        return images.read(self._path)
 
     def read_window(self, start: Tuple[int, ...], size: Tuple[int, ...]) -> np.ndarray:
-        store = self._ensure_zarr()
-        arr = zarr.open(store, mode='r')
-        slices = tuple(slice(s, s + sz) for s, sz in zip(start, size))
-        return np.asarray(arr[slices])
+        if self._reader is None:
+            self._reader = images.open(self._path)
+        return self._reader[tuple(slice(s, s + sz) for s, sz in zip(start, size))]
 
 
 # -----------------------------------------------------------------------------
@@ -130,9 +122,8 @@ class MutexAffinityDataset(Dataset):
 
     - ``image_dirname`` (default ``images``) holding volumetric intensities
       either as ``.zarr`` stores or 3D ``.tif/.tiff`` stacks.
-    - ``affinity_dirname`` (default ``affinity_graph``) containing the Zarr
-      stores produced by ``scripts/generate_mutex_graph.py``. Each store must
-      expose ``affinities/<name>`` and ``mask/<name>`` arrays.
+    - ``affinity_dirname`` (default ``affinity_graph``) containing Zarr stores
+      that expose ``affinities/<name>`` and ``mask/<name>`` arrays.
 
     Targets are declared in ``dataset_config.affinity_targets`` with entries of the form::
 
@@ -165,8 +156,6 @@ class MutexAffinityDataset(Dataset):
         self.mgr = mgr
         self.is_training = is_training
         self.targets = getattr(mgr, 'targets', {})
-        self._profile_augmentations = bool(getattr(mgr, 'profile_augmentations', False))
-        self._augmentation_names: List[str] = []
 
         # Configuration
         self.patch_size = tuple(mgr.train_patch_size)
@@ -299,7 +288,7 @@ class MutexAffinityDataset(Dataset):
                 )
 
             image_handle = self._open_image_handle(image_path)
-            graph_root = zarr.open_group(str(affinity_path), mode="r")
+            graph_root = open_group(affinity_path)
 
             self._volume_ids.append(volume_id)
             self._image_handles.append(image_handle)
@@ -353,7 +342,23 @@ class MutexAffinityDataset(Dataset):
                     mgr=self.mgr,
                 )
 
-        self.normalizer = get_normalization(self.normalization_scheme, self.intensity_properties)
+        scheme = self.normalization_scheme
+        if scheme == "ct":
+            props = self.intensity_properties
+            required = ("mean", "std", "percentile_00_5", "percentile_99_5")
+            if not props or any(key not in props for key in required):
+                raise ValueError("CT normalization requires mean, std and percentile bounds")
+            op = A.Normalize("fixed", center=float(props["mean"]), scale=max(float(props["std"]), 1e-8),
+                             bounds=(float(props["percentile_00_5"]), float(props["percentile_99_5"])))
+        elif scheme == "zscore":
+            op = A.Normalize("zscore", nonzero=False, eps=1e-8)
+        elif scheme in ("minmax", "rescale_to_01", "robust"):
+            op = A.Normalize("minmax" if scheme == "rescale_to_01" else scheme)
+        elif scheme == "none":
+            op = None
+        else:
+            raise ValueError(f"Unknown normalization scheme: {scheme}")
+        self.normalizer = A.Pipeline([op], backend="cpu") if op is not None else None
 
     def _build_patch_index(self) -> None:
         """Build the index of valid patches."""
@@ -461,22 +466,21 @@ class MutexAffinityDataset(Dataset):
 
             self.transforms = create_training_transforms(
                 patch_size=self.patch_size,
+                label_names=[n for name in self._affinity_handles for n in (name, f"{name}_mask")],
+                backend="cuda" if getattr(self.mgr, 'augment_on_device', False) else "cpu",
                 no_spatial=no_spatial,
                 no_scaling=no_scaling,
                 skeleton_targets=skeleton_targets if skeleton_targets else None,
                 skeleton_ignore_values=skeleton_ignore_values if skeleton_ignore_values else None,
             )
-            if self._profile_augmentations:
-                self._augmentation_names = collect_augmentation_names(self.transforms)
         elif skeleton_targets:
             # Validation: only apply skeleton generation (no augmentation)
             from vesuvius.models.augmentation.pipelines.training_transforms import create_validation_transforms
             self.transforms = create_validation_transforms(
+                label_names=[n for name in self._affinity_handles for n in (name, f"{name}_mask")],
                 skeleton_targets=skeleton_targets,
                 skeleton_ignore_values=skeleton_ignore_values if skeleton_ignore_values else None,
             )
-            if self._profile_augmentations:
-                self._augmentation_names = collect_augmentation_names(self.transforms)
 
     def _extract_patch(self, patch: PatchInfo) -> Dict[str, Any]:
         """Extract image and affinity patches."""
@@ -488,8 +492,11 @@ class MutexAffinityDataset(Dataset):
 
         # Extract image
         image_data = image_handle.read_window(start, size)
-        if self.normalizer is not None:
-            image_data = self.normalizer.run(image_data)
+        if self.normalizer is not None and image_data.size:
+            normalized = self.normalizer(
+                {"image": np.asarray(image_data, dtype=np.float32).reshape(1, 1, -1)}, seed=0
+            )["image"]
+            image_data = normalized.reshape(image_data.shape)
         if self.is_2d:
             from vesuvius.utils.utils import pad_or_crop_2d
             image_data = pad_or_crop_2d(image_data.astype(np.float32), size)
@@ -515,7 +522,7 @@ class MutexAffinityDataset(Dataset):
             if mask_handle is not None:
                 mask_data = mask_handle.read_window(start, size)
                 mask_bool = np.asarray(mask_data != 0)
-                result[f"{target_name}_mask"] = torch.from_numpy(np.ascontiguousarray(mask_bool))
+                result[f"{target_name}_mask"] = torch.from_numpy(np.ascontiguousarray(mask_bool))[None]
 
         return result
 
@@ -526,10 +533,8 @@ class MutexAffinityDataset(Dataset):
         patch = self._patches[index]
         data_dict = self._extract_patch(patch)
 
-        if self.transforms is not None:
-            if self._profile_augmentations and self._augmentation_names:
-                data_dict['_aug_perf'] = {name: 0.0 for name in self._augmentation_names}
-            data_dict = self.transforms(**data_dict)
+        if self.transforms is not None and not getattr(self.mgr, 'augment_on_device', False):
+            data_dict = self.transforms(data_dict, seed=sample_seed(index))
 
         return data_dict
 
@@ -577,7 +582,7 @@ class MutexAffinityDataset(Dataset):
 
     def _open_image_handle(self, path: Path):
         if path.suffix == ".zarr" and path.is_dir():
-            array = zarr.open(str(path), mode="r")
+            array = open_zarr(path)
             spatial_shape = self._infer_spatial_shape(array)
             return ZarrArrayHandle(array, path=path, spatial_shape=spatial_shape)
 
@@ -585,11 +590,9 @@ class MutexAffinityDataset(Dataset):
         if suffix not in {".tif", ".tiff"}:
             raise ValueError(f"Unsupported image format for {path}")
 
-        import tifffile
-        with tifffile.TiffFile(str(path)) as tif:
-            series = tif.series[0]
-            spatial_shape = tuple(int(v) for v in series.shape)
-            dtype = np.dtype(series.dtype)
+        with images.open(path) as reader:
+            spatial_shape = tuple(int(v) for v in reader.shape)
+            dtype = np.dtype(reader.dtype)
 
         return TiffArrayHandle(path, spatial_shape=spatial_shape, dtype=dtype)
 
@@ -601,7 +604,7 @@ class MutexAffinityDataset(Dataset):
         plan: Dict[Path, List[str]] = {}
         for path in affinity_paths:
             try:
-                group = zarr.open_group(str(path), mode="r")
+                group = open_group(path)
             except Exception as exc:
                 print(f"[MutexDataset] Warning: failed to inspect {path.name}: {exc}")
                 continue
@@ -711,7 +714,8 @@ def _convert_store_to_uint8(payload: Tuple[str, Sequence[str]]):
     converted: List[str] = []
     skipped: List[str] = []
 
-    group = zarr.open_group(str(store_path), mode="r+")
+    group = open_group(store_path)
+    root = create_group(store_path, auth=None)
 
     for key in keys:
         if key not in group:
@@ -724,28 +728,7 @@ def _convert_store_to_uint8(payload: Tuple[str, Sequence[str]]):
             skipped.append(key)
             continue
 
-        parent, leaf = key.rsplit("/", 1) if "/" in key else ("", key)
-        dest_group = group[parent] if parent else group
-
-        tmp_name = f"{leaf}__tmp_uint8"
-        if tmp_name in dest_group:
-            del dest_group[tmp_name]
-
-        chunks = getattr(array, "chunks", None)
-        if chunks is None:
-            chunks = tuple(int(dim) for dim in array.shape)
-        else:
-            chunks = tuple(int(c) if c is not None else int(dim) for c, dim in zip(chunks, array.shape))
-
-        compressor = getattr(array, "compressor", None)
-        tmp_ds = dest_group.create_dataset(
-            tmp_name,
-            shape=array.shape,
-            dtype=np.uint8,
-            chunks=chunks,
-            compressor=compressor,
-            overwrite=True,
-        )
+        chunks = tuple(int(c) for c in array.chunks)
 
         # First, check if all data is binary before writing
         is_binary = True
@@ -759,13 +742,15 @@ def _convert_store_to_uint8(payload: Tuple[str, Sequence[str]]):
             skipped.append(key)
             continue
 
-        # Now, write the data to the temporary dataset
+        # Now, write the data to a temporary array and put it in place
+        tmp_key = f"{key}__tmp_uint8"
+        tmp_ds = ZarrWriter.create_like(
+            store_path / tmp_key, array, dtype=np.uint8, fill_value=0, overwrite=True, auth=None
+        )
         for chunk_slices in _iter_chunk_slices(array.shape, chunks):
-            data = array[chunk_slices]
-            tmp_ds[chunk_slices] = data.astype(np.uint8, copy=False)
-        if leaf in dest_group:
-            del dest_group[leaf]
-        dest_group.move(tmp_name, leaf)
+            tmp_ds[chunk_slices] = array[chunk_slices].astype(np.uint8, copy=False)
+        del root[key]
+        os.replace(store_path / tmp_key, store_path / key)
         converted.append(key)
 
     return store_path_str, converted, skipped

@@ -1,5 +1,4 @@
 #include "ViewerManager.hpp"
-#include "OpenDataManifest.hpp"
 
 #include "AxisAlignedSliceController.hpp"
 #include "VCSettings.hpp"
@@ -19,27 +18,19 @@
 #include "vc/ui/VCCollection.hpp"
 #include "vc/core/types/Volume.hpp"
 #include "SurfaceCatalog.hpp"
-#include "vc/core/types/VolumePkg.hpp"
 #include "vc/core/util/Logging.hpp"
 
+#include <QLoggingCategory>
 #include <QApplication>
 #include <QCursor>
 #include <QPointer>
 #include <QMdiArea>
 #include <QTimer>
-#include <QThread>
 #include <QMdiSubWindow>
 #include <QSettings>
-#include <QtConcurrent/QtConcurrent>
-#include <QLoggingCategory>
 #include <algorithm>
 #include <cmath>
-#include <exception>
-#include <iostream>
 #include <optional>
-#include <string_view>
-#include <unordered_set>
-#include "utils/Json.hpp"
 #include <opencv2/core.hpp>
 
 #include "vc/core/util/PlaneSurface.hpp"
@@ -64,32 +55,11 @@ QString compactViewerLabel(const std::string& surfaceName, const QString& title)
     return {};
 }
 
-bool isChunkedViewer(VolumeViewerBase* viewer)
-{
-    return viewer && qobject_cast<CChunkedVolumeViewer*>(viewer->asQObject());
-}
-
 bool isAnnotationViewer(VolumeViewerBase* viewer)
 {
     return viewer &&
            viewer->asQObject() &&
            viewer->asQObject()->property("vc_viewer_role").toString() == QStringLiteral("annotation");
-}
-
-void centerViewerOnVolumePointForNavigation(VolumeViewerBase* viewer, const cv::Vec3f& position)
-{
-    if (!viewer) {
-        return;
-    }
-    viewer->centerOnVolumePoint(position, !isChunkedViewer(viewer));
-}
-
-void centerViewerOnSurfacePointForNavigation(VolumeViewerBase* viewer, const cv::Vec2f& position)
-{
-    if (!viewer) {
-        return;
-    }
-    viewer->centerOnSurfacePoint(position, !isChunkedViewer(viewer));
 }
 
 bool finiteVec3(const cv::Vec3f& v)
@@ -175,10 +145,6 @@ ViewerManager::ViewerManager(CState* state,
     const float storedThickness = settings.value(viewer::INTERSECTION_THICKNESS, viewer::INTERSECTION_THICKNESS_DEFAULT).toFloat();
     _intersectionThickness = std::max(0.0f, storedThickness);
 
-    // Derived surface tiles are workspace-local, while their decoded volume
-    // chunks come from the application-wide cache service.
-    applyViewerCacheSettings();
-
     if (_state) {
         connect(_state,
                 &CState::volumeChanged,
@@ -190,12 +156,11 @@ ViewerManager::ViewerManager(CState* state,
                 &ViewerManager::handleFocusPoiChanged);
     }
 
-    // The single maintenance clock for the whole app: ~60Hz, free-running. Render
-    // requests submit immediately; this services deferred intersections and status.
-    _globalClock = new QTimer(this);
-    _globalClock->setInterval(16);
-    connect(_globalClock, &QTimer::timeout, this, &ViewerManager::onGlobalTick);
-    _globalClock->start();
+    // Refresh transfer progress even while the pointer and camera are idle.
+    _statusClock = new QTimer(this);
+    _statusClock->setInterval(250);
+    connect(_statusClock, &QTimer::timeout, this, &ViewerManager::onStatusTick);
+    _statusClock->start();
 }
 
 ViewerManager::~ViewerManager()
@@ -209,53 +174,11 @@ const std::vector<ViewerManager*>& ViewerManager::allManagers()
     return managerRegistry();
 }
 
-void ViewerManager::applyViewerCacheSettings()
-{
-    using namespace vc3d::settings;
-    QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
-    constexpr std::size_t mib = 1024ULL * 1024ULL;
-    constexpr std::size_t gib = 1024ULL * mib;
-    const auto surfaceGb = std::max<qlonglong>(
-        0, settings.value(viewer_cache::SURFACE_CACHE_GB,
-                          viewer_cache::SURFACE_CACHE_GB_DEFAULT).toLongLong());
-    const auto overlayGb = std::max<qlonglong>(
-        0, settings.value(viewer_cache::OVERLAY_SURFACE_CACHE_GB,
-                          viewer_cache::OVERLAY_SURFACE_CACHE_GB_DEFAULT).toLongLong());
-
-    setSurfaceCacheBudgets(std::size_t(surfaceGb) * gib, std::size_t(overlayGb) * gib);
-}
-
-void ViewerManager::setSurfaceCacheBudgets(std::size_t baseBytes, std::size_t overlayBytes)
-{
-    if (_surfaceCacheBudgetBytes == baseBytes &&
-        _overlaySurfaceCacheBudgetBytes == overlayBytes) {
-        return;
-    }
-    _surfaceCacheBudgetBytes = baseBytes;
-    _overlaySurfaceCacheBudgetBytes = overlayBytes;
-    forEachBaseViewer([baseBytes, overlayBytes](VolumeViewerBase* viewer) {
-        if (viewer)
-            viewer->setSurfaceCacheBudgets(baseBytes, overlayBytes);
-    });
-}
-
-void ViewerManager::setPreferSurfaceTileFills(bool enabled)
-{
-    if (_preferSurfaceTileFills == enabled) {
-        return;
-    }
-    _preferSurfaceTileFills = enabled;
-    forEachBaseViewer([enabled](VolumeViewerBase* viewer) {
-        if (viewer)
-            viewer->setPreferSurfaceTileFills(enabled);
-    });
-}
-
-void ViewerManager::onGlobalTick()
+void ViewerManager::onStatusTick()
 {
     for (auto* v : _baseViewers) {
         if (v)
-            v->serviceRenderTick();
+            v->refreshStatus();
     }
 }
 
@@ -353,7 +276,16 @@ VolumeViewerBase* ViewerManager::initializeChunkedViewer(CChunkedVolumeViewer* c
                 this, &ViewerManager::handleVolumeClicked);
     }
     connect(chunkedViewer, &CChunkedVolumeViewer::sharedCacheStatsChanged,
-            this, &ViewerManager::sharedCacheStatsChanged);
+            this, [this](QStringList items) {
+                // The last idle viewer must not erase another viewer's load.
+                for (auto* base : _baseViewers) {
+                    const auto* viewer = dynamic_cast<CChunkedVolumeViewer*>(base);
+                    if (!viewer) continue;
+                    const auto status = viewer->loadingStatus();
+                    if (!status.isEmpty()) items << status;
+                }
+                emit sharedCacheStatsChanged(items);
+            });
 
     if (auto* graphicsView = chunkedViewer->graphicsView()) {
         auto markActiveViewer = [this, baseViewer]() { _activeViewer = baseViewer; };
@@ -385,9 +317,6 @@ VolumeViewerBase* ViewerManager::initializeChunkedViewer(CChunkedVolumeViewer* c
     baseViewer->setOverlayIntensityAsAlpha(_overlayIntensityAsAlpha);
     baseViewer->setOverlayMaxDisplayedResolution(_overlayMaxDisplayedResolution);
     baseViewer->setOverlayComposite(_overlayComposite);
-    baseViewer->setSurfaceCacheBudgets(_surfaceCacheBudgetBytes,
-                                       _overlaySurfaceCacheBudgetBytes);
-    baseViewer->setPreferSurfaceTileFills(_preferSurfaceTileFills);
 
     if (_segmentationModule && role != ViewerRole::Annotation) {
         _segmentationModule->attachViewer(baseViewer);
@@ -656,7 +585,7 @@ bool ViewerManager::recenterViewersOnCurrentFocus()
     const cv::Vec3f position = focus->p;
     forEachBaseViewer([&position](VolumeViewerBase* viewer) {
         if (viewer && !isAnnotationViewer(viewer)) {
-            centerViewerOnVolumePointForNavigation(viewer, position);
+            viewer->centerOnVolumePoint(position);
         }
     });
 
@@ -672,7 +601,7 @@ void ViewerManager::recenterPlaneViewersOn(const cv::Vec3f& position)
 
         const std::string name = viewer->surfName();
         if (name == "xy plane" || name == "seg xz" || name == "seg yz") {
-            centerViewerOnVolumePointForNavigation(viewer, position);
+            viewer->centerOnVolumePoint(position);
         }
     });
 }
@@ -696,7 +625,7 @@ void ViewerManager::recenterSegmentationViewerNear(const cv::Vec3f& position)
 
     if (const auto hit = locate(*activeSurface, position, kMaxDistanceVoxels)) {
         const cv::Vec3f loc = activeSurface->loc(hit->ptr);
-        centerViewerOnSurfacePointForNavigation(viewer, {loc[0], loc[1]});
+        viewer->centerOnSurfacePoint({loc[0], loc[1]});
     }
 }
 
@@ -817,6 +746,9 @@ struct ViewerManager::ViewerNavigationSnapshot {
         CChunkedVolumeViewer::CameraState camera;
         cv::Vec3f center{0, 0, 0};
         bool hasCenter{false};
+        std::string surfaceId;
+        std::shared_ptr<Surface> surface;
+        std::optional<cv::Vec2d> grid;
     };
     std::vector<Entry> entries;
 };
@@ -824,7 +756,7 @@ struct ViewerManager::ViewerNavigationSnapshot {
 std::shared_ptr<ViewerManager::ViewerNavigationSnapshot> ViewerManager::captureNavigation() const
 {
     auto snapshot = std::make_shared<ViewerNavigationSnapshot>();
-    forEachBaseViewer([&snapshot](VolumeViewerBase* baseViewer) {
+    forEachBaseViewer([this, &snapshot](VolumeViewerBase* baseViewer) {
         auto* viewer = dynamic_cast<CChunkedVolumeViewer*>(baseViewer);
         if (!viewer || !viewer->graphicsView()) {
             return;
@@ -832,6 +764,11 @@ std::shared_ptr<ViewerManager::ViewerNavigationSnapshot> ViewerManager::captureN
         ViewerNavigationSnapshot::Entry captured;
         captured.viewer = viewer;
         captured.camera = viewer->cameraState();
+        if (auto* quad = dynamic_cast<QuadSurface*>(viewer->currentSurface())) {
+            captured.surfaceId = quad->id;
+            captured.surface = _state->surface(viewer->surfName());
+            captured.grid = quad->surfaceToGrid({captured.camera.surfacePtrX, captured.camera.surfacePtrY});
+        }
         const QSize viewportSize = viewer->graphicsView()->viewport()->size();
         const QPointF centerScene(
             static_cast<qreal>(std::max(1, viewportSize.width())) * 0.5,
@@ -867,14 +804,22 @@ void ViewerManager::restoreNavigation(const std::shared_ptr<ViewerNavigationSnap
         if (captured.hasCenter) {
             transformedCenter = transformPoint(captured.center, transform);
         }
-        if (!transformedCenter) {
+        auto* quad = dynamic_cast<QuadSurface*>(viewer->currentSurface());
+        const bool sameGrid = quad && captured.grid && !captured.surfaceId.empty() &&
+                              quad->id == captured.surfaceId && quad != captured.surface.get();
+        if (!transformedCenter && !sameGrid) {
             continue;
         }
 
-        viewer->centerOnVolumePoint(
-            clampToVolumeBounds(*transformedCenter, _state->currentVolume()),
-            false);
+        if (!sameGrid)
+            viewer->centerOnVolumePoint(
+                clampToVolumeBounds(*transformedCenter, _state->currentVolume()));
         auto camera = viewer->cameraState();
+        if (sameGrid) {
+            const auto uv = quad->gridToSurface(*captured.grid);
+            camera.surfacePtrX = float(uv[0]);
+            camera.surfacePtrY = float(uv[1]);
+        }
         camera.scale = captured.camera.scale;
         if (navigationScale) {
             camera.scale = CChunkedVolumeViewer::clampCameraScale(
@@ -884,15 +829,7 @@ void ViewerManager::restoreNavigation(const std::shared_ptr<ViewerNavigationSnap
             ? static_cast<float>(static_cast<double>(captured.camera.zOffset) *
                                  *navigationScale)
             : captured.camera.zOffset;
-        camera.zOffsetWorldDir = captured.camera.zOffsetWorldDir;
-        if (cv::norm(captured.camera.zOffsetWorldDir) > 0.0f) {
-            const auto direction = transformNormal(
-                captured.camera.zOffsetWorldDir, transform);
-            if (finiteVec3(direction)) {
-                camera.zOffsetWorldDir = direction;
-            }
-        }
-        viewer->applyCameraState(camera, false);
+        viewer->applyCameraState(camera);
     }
 }
 
@@ -921,7 +858,7 @@ void ViewerManager::switchVolume(std::shared_ptr<Volume> volume,
         snapshot = captureNavigation();
     }
 
-    // CState handles cache budget and volume ID resolution, and emits volumeChanged
+    // CState resolves the volume ID and emits volumeChanged
     _state->setCurrentVolume(std::move(volume));
 
     resetFocusForVolumeChange(!hadVolume, transformedFocusPoint, transformedFocusNormal);
@@ -1061,11 +998,9 @@ void ViewerManager::setOverlayColormap(const std::string& colormapId)
     forEachBaseViewer([this](VolumeViewerBase* v) { v->setOverlayColormap(_overlayColormapId); });
 }
 
-void ViewerManager::setOverlaySamplingMethod(vc::Sampling method)
+void ViewerManager::setOverlaySamplingMethod(int method)
 {
-    _overlaySamplingMethod = method == vc::Sampling::Trilinear
-        ? vc::Sampling::Trilinear
-        : vc::Sampling::Nearest;
+    _overlaySamplingMethod = method;
     forEachBaseViewer([this](VolumeViewerBase* v) {
         v->setOverlaySamplingMethod(_overlaySamplingMethod);
     });
@@ -1160,7 +1095,7 @@ void ViewerManager::setCompositeMethod(const std::string& method)
 {
     forEachBaseViewer([&method](VolumeViewerBase* viewer) {
         auto settings = viewer->compositeRenderSettings();
-        settings.params.method = method;
+        ::setCompositeMethod(settings.params, method);
         viewer->setCompositeRenderSettings(settings);
     });
 }

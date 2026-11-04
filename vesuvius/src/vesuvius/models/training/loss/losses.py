@@ -4,10 +4,7 @@ from torch import nn as nn
 from torch.nn import MSELoss, SmoothL1Loss, L1Loss
 import sys
 import os
-from vesuvius.image_proc.geometry.structure_tensor import (
-    StructureTensorComputer,
-    components_to_matrix,
-)
+from vc_reader.torch import structure_tensor
 
 # Import nnUNet losses
 from vesuvius.models.training.loss.nnunet_losses import (
@@ -594,13 +591,6 @@ class PlanarityLoss(nn.Module):
         self.ignore_index = ignore_index
         self.normalization = nn.Sigmoid() if normalization == 'sigmoid' \
                              else (lambda x: x)
-        self._st_computer = StructureTensorComputer(
-            sigma=0.0,
-            component_sigma=rho if rho > 0 else None,
-            smooth_components=rho > 0,
-            device='cpu',
-            dtype=torch.float32,
-        )
 
     def _compute_eigenvalues_3x3_batch(self, J: torch.Tensor) -> torch.Tensor:
         """
@@ -664,22 +654,11 @@ class PlanarityLoss(nn.Module):
         else:
             valid = torch.ones_like(p, dtype=torch.bool)
 
-        # ---------- structure tensor via shared computer ---------------
-        rho = float(self.rho)
-        component_sigma = rho if rho > 0 else None
-        st_device = p.device
-        self._st_computer.device = st_device
-        self._st_computer.smooth_components = component_sigma is not None
-        self._st_computer.component_sigma = component_sigma
-        J_components = self._st_computer.compute(
-            p,
-            sigma=0.0,
-            component_sigma=component_sigma,
-            smooth_components=self._st_computer.smooth_components,
-            device=st_device,
-            spatial_dims=3,
-        )
-        J = components_to_matrix(J_components)
+        J_components = structure_tensor(p.float(), sigma=0.0, rho=max(float(self.rho), 0.0))
+        Jzz, Jzy, Jzx, Jyy, Jyx, Jxx = J_components.unbind(dim=1)
+        J = torch.stack((torch.stack((Jxx, Jyx, Jzx), dim=-1),
+                         torch.stack((Jyx, Jyy, Jzy), dim=-1),
+                         torch.stack((Jzx, Jzy, Jzz), dim=-1)), dim=-2)
 
         # Compute eigenvalues using optimized method
         try:

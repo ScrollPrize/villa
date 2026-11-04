@@ -4,6 +4,7 @@
 #include "scene3d/VolumePreview.hpp"
 #include "scene3d/MemoryBudgetInput.hpp"
 #include "CState.hpp"
+#include "OpenedVolumes.hpp"
 #include "VCSettings.hpp"
 #include "vc/core/util/QuadSurface.hpp"
 #include "vc/core/types/Volume.hpp"
@@ -313,8 +314,7 @@ struct Fiber3DSurfaceControls::Impl {
         const QSignalBlocker blocker(textureLevel);
         textureLevel->clear();
         if (const auto volume = state->currentVolume()) {
-            auto levels = volume->presentScaleLevels();
-            std::sort(levels.begin(), levels.end());
+            const auto levels = state->openedVolumes()->pyramid(*volume).levels;
             for (int level : levels)
                 textureLevel->addItem(q->tr("Level %1").arg(level), level);
             // Prefer the requested level, then the nearest coarser available
@@ -385,17 +385,17 @@ struct Fiber3DSurfaceControls::Impl {
             const int maxEdge = std::min(resolution->value(), canvas->maximumVolumeTextureEdge());
             cancelled = std::make_shared<std::atomic_bool>(false);
             busy = true;
-            watcher.setFuture(QtConcurrent::run([points = std::move(points), stop = cancelled, budget = maxBytes, scale, volume, level, overview, withTexture, maxEdge] {
+            watcher.setFuture(QtConcurrent::run([opened = state->openedVolumes(), points = std::move(points), stop = cancelled, budget = maxBytes, scale, volume, level, overview, withTexture, maxEdge] {
                 Result r;
                 try {
                     if (overview) {
-                        r.volume = scene3d::sampleVolume(*volume, level, budget, *stop, maxEdge);
+                        r.volume = scene3d::sampleVolume(*opened, *volume, level, budget, *stop, maxEdge);
                         return r;
                     }
                     auto mesh = surface::build(points, budget, *stop);
                     r.mesh = mesh;
                     if (mesh && !mesh->indices.empty() && volume && withTexture && !stop->load()) {
-                        mesh->texture = surface::sampleTexture(points, scale, *volume, *stop, level);
+                        mesh->texture = surface::sampleTexture(points, scale, *opened, *volume, *stop, level);
                     }
                 } catch (const std::exception& e) {
                     r.error = QString::fromUtf8(e.what());

@@ -5,7 +5,7 @@
 #include "SurfaceCatalog.hpp"
 #include "VCSettings.hpp"
 #include "OpenDataNormalGrids.hpp"
-#include "OpenDataManifest.hpp"
+#include "OpenDataResourceSelection.hpp"
 #include <vc_object_store/Uuid.hpp>
 
 #include <functional>
@@ -27,7 +27,6 @@
 #include <QFileDialog>
 #include <QFileInfo>
 #include <QCoreApplication>
-#include <QDateTime>
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QJsonArray>
@@ -47,8 +46,6 @@
 #include <QPointer>
 #include <QTimer>
 #include <QTemporaryFile>
-#include <QHash>
-#include <QSet>
 #include <QVector>
 #include <QSpinBox>
 #include <QDoubleSpinBox>
@@ -72,7 +69,7 @@
 #include "VolumeCommandPath.hpp"
 #include "elements/VolumeSelector.hpp"
 #include "elements/JsonProfilePresets.hpp"
-#include "utils/Json.hpp"
+#include <nlohmann/json.hpp>
 
 struct CommandLaunchErrorSetter {
     CommandLaunchError* error;
@@ -129,295 +126,6 @@ std::optional<cv::Rect> computeValidSurfaceBounds(const cv::Mat_<cv::Vec3f>& poi
                     minRow,
                     maxCol - minCol + 1,
                     maxRow - minRow + 1);
-}
-
-static QJsonObject readJsonObject(const QString& path)
-{
-    QFile f(path);
-    if (!f.open(QIODevice::ReadOnly)) return {};
-
-    const auto doc = QJsonDocument::fromJson(f.readAll());
-    if (!doc.isObject()) return {};
-    return doc.object();
-}
-
-struct RasterizeDialogResult {
-    int chunkSize{128};
-    int zMin{0};
-    int zMax{-1};
-};
-
-static bool selectRasterizeParams(QWidget* parent, RasterizeDialogResult* out)
-{
-    if (!out) {
-        return false;
-    }
-
-    QDialog dlg(parent);
-    dlg.setWindowTitle(QObject::tr("Rasterize"));
-
-    auto* main = new QVBoxLayout(&dlg);
-    auto* form = new QFormLayout();
-
-    QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
-    const int savedChunkSize = std::clamp(
-        settings.value(QStringLiteral("tools/rasterize_chunk_size"), 128).toInt(),
-        1, 4096);
-    const int savedZMin = std::max(0, settings.value(QStringLiteral("tools/rasterize_z_min"), 0).toInt());
-    const int savedZMax = settings.value(QStringLiteral("tools/rasterize_z_max"), -1).toInt();
-
-    auto* spChunkSize = new QSpinBox(&dlg);
-    spChunkSize->setRange(1, 4096);
-    spChunkSize->setValue(savedChunkSize);
-    spChunkSize->setToolTip(QObject::tr("Isotropic chunk size applied to all pyramid levels."));
-    form->addRow(QObject::tr("Chunk size:"), spChunkSize);
-
-    auto* spZMin = new QSpinBox(&dlg);
-    spZMin->setRange(0, 1000000000);
-    spZMin->setValue(savedZMin);
-    form->addRow(QObject::tr("Level-0 Z min:"), spZMin);
-
-    auto* spZMax = new QSpinBox(&dlg);
-    spZMax->setRange(-1, 1000000000);
-    spZMax->setValue(savedZMax);
-    spZMax->setToolTip(QObject::tr("-1 means the end of the level-0 volume."));
-    form->addRow(QObject::tr("Level-0 Z max (exclusive):"), spZMax);
-
-    main->addLayout(form);
-
-    auto* buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dlg);
-    QObject::connect(buttons, &QDialogButtonBox::accepted, &dlg, [&]() {
-        if (spZMax->value() >= 0 && spZMin->value() >= spZMax->value()) {
-            QMessageBox::warning(&dlg,
-                                 QObject::tr("Error"),
-                                 QObject::tr("Z min must be smaller than Z max unless Z max is -1."));
-            return;
-        }
-        settings.setValue(QStringLiteral("tools/rasterize_chunk_size"), spChunkSize->value());
-        settings.setValue(QStringLiteral("tools/rasterize_z_min"), spZMin->value());
-        settings.setValue(QStringLiteral("tools/rasterize_z_max"), spZMax->value());
-        dlg.accept();
-    });
-    QObject::connect(buttons, &QDialogButtonBox::rejected, &dlg, &QDialog::reject);
-    main->addWidget(buttons);
-
-    if (dlg.exec() != QDialog::Accepted) {
-        return false;
-    }
-
-    out->chunkSize = spChunkSize->value();
-    out->zMin = spZMin->value();
-    out->zMax = spZMax->value();
-    return true;
-}
-
-static bool isRasterizedLabelVolumePath(const QString& volumePath)
-{
-    if (volumePath.isEmpty()) {
-        return false;
-    }
-    const QString metaPath = QDir(volumePath).filePath(QStringLiteral("meta.json"));
-    const QJsonObject meta = readJsonObject(metaPath);
-    return meta.value(QStringLiteral("label_volume")).toString() == QStringLiteral("rasterized");
-}
-
-struct IgnoreLabelDialogResult {
-    QString volumePath;
-    QString outputName;
-    int ignoreValue{2};
-    double chunkAlphaL0{64.0};
-    int workers{0};
-    int zMin{0};
-    int zMax{-1};
-};
-
-struct IgnoreLabelProgressState {
-    QString pendingOutput;
-    QString stageName;
-    int stageLevel{-1};
-    int totalSteps{0};
-};
-
-static bool parseStructuredProgressLine(const QString& line,
-                                        QString* kindOut,
-                                        QHash<QString, QString>* fieldsOut)
-{
-    if (!kindOut || !fieldsOut) {
-        return false;
-    }
-
-    const QString trimmed = line.trimmed();
-    if (!trimmed.startsWith(QStringLiteral("VC_"))) {
-        return false;
-    }
-
-    const QStringList tokens = trimmed.split(QChar::Space, Qt::SkipEmptyParts);
-    if (tokens.isEmpty()) {
-        return false;
-    }
-
-    *kindOut = tokens.front();
-    fieldsOut->clear();
-    for (int i = 1; i < tokens.size(); ++i) {
-        const QString& token = tokens.at(i);
-        const int eq = token.indexOf(QChar('='));
-        if (eq <= 0 || eq >= token.size() - 1) {
-            continue;
-        }
-        fieldsOut->insert(token.left(eq), token.mid(eq + 1));
-    }
-    return true;
-}
-
-static int clampProgressCount(qint64 value)
-{
-    if (value <= 0) {
-        return 0;
-    }
-    if (value > std::numeric_limits<int>::max()) {
-        return std::numeric_limits<int>::max();
-    }
-    return static_cast<int>(value);
-}
-
-static QString ignoreLabelStageText(const QString& stageName,
-                                    int stageLevel,
-                                    int current,
-                                    int total)
-{
-    QString base;
-    if (stageName == QStringLiteral("copy")) {
-        base = QObject::tr("Copying input tree");
-    } else if (stageName == QStringLiteral("reuse")) {
-        base = QObject::tr("Reusing existing output tree");
-    } else if (stageName == QStringLiteral("wrap")) {
-        base = QObject::tr("Wrapping level-0 chunks");
-    } else if (stageName == QStringLiteral("pyramid")) {
-        base = stageLevel >= 0
-            ? QObject::tr("Building pyramid level %1").arg(stageLevel)
-            : QObject::tr("Building pyramid");
-    } else if (stageName == QStringLiteral("slice")) {
-        base = QObject::tr("Processing slices");
-    } else {
-        base = QObject::tr("Running %1").arg(stageName);
-    }
-
-    if (total > 0 && current >= 0) {
-        return QObject::tr("%1 (%2 / %3)").arg(base).arg(current).arg(total);
-    }
-    return base;
-}
-
-bool selectIgnoreLabelParams(QWidget* parent,
-                             const QVector<VolumeSelector::VolumeOption>& volumes,
-                             const QString& defaultVolumeId,
-                             IgnoreLabelDialogResult* out)
-{
-    if (!out) {
-        return false;
-    }
-
-    QDialog dlg(parent);
-    dlg.setWindowTitle(QObject::tr("Add Ignore Label"));
-
-    auto* main = new QVBoxLayout(&dlg);
-    auto* volumeSelector = new VolumeSelector(&dlg);
-    volumeSelector->setVolumes(volumes, defaultVolumeId);
-    main->addWidget(volumeSelector);
-
-    auto* form = new QFormLayout();
-
-    QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
-    const QString timestamp = QDateTime::currentDateTime().toString(QStringLiteral("yyyyMMddHHmmss"));
-    QString defaultOut = settings.value(QStringLiteral("tools/add_ignore_label_output_name"),
-                                        QStringLiteral("labels_ignore_%1.zarr").arg(timestamp))
-                             .toString()
-                             .trimmed();
-    if (defaultOut.isEmpty()) {
-        defaultOut = QStringLiteral("labels_ignore_%1.zarr").arg(timestamp);
-    }
-    if (!defaultOut.endsWith(QStringLiteral(".zarr"), Qt::CaseInsensitive)) {
-        defaultOut += QStringLiteral(".zarr");
-    }
-
-    auto* edtOutput = new QLineEdit(defaultOut, &dlg);
-    form->addRow(QObject::tr("Output folder name:"), edtOutput);
-
-    auto* spIgnore = new QSpinBox(&dlg);
-    spIgnore->setRange(1, 254);
-    spIgnore->setValue(settings.value(QStringLiteral("tools/add_ignore_label_ignore_value"), 2).toInt());
-    form->addRow(QObject::tr("Ignore value:"), spIgnore);
-
-    auto* lblMode = new QLabel(
-        QObject::tr("Runs 3D chunk alpha-wrap on level 0 and labels only the outer region."),
-        &dlg);
-    lblMode->setWordWrap(true);
-    form->addRow(QString(), lblMode);
-
-    auto* spChunkAlpha = new QDoubleSpinBox(&dlg);
-    spChunkAlpha->setDecimals(1);
-    spChunkAlpha->setSingleStep(1.0);
-    spChunkAlpha->setRange(1.0, 4096.0);
-    spChunkAlpha->setValue(
-        settings.value(QStringLiteral("tools/add_ignore_label_chunk_alpha_l0"), 64.0).toDouble());
-    spChunkAlpha->setToolTip(
-        QObject::tr("Absolute alpha-wrap radius in level-0 voxels."));
-    form->addRow(QObject::tr("Wrap radius (L0 voxels):"), spChunkAlpha);
-
-    auto* spWorkers = new QSpinBox(&dlg);
-    spWorkers->setRange(0, 256);
-    spWorkers->setValue(settings.value(QStringLiteral("tools/add_ignore_label_workers"), 0).toInt());
-    spWorkers->setToolTip(QObject::tr("0 uses all available hardware threads."));
-    form->addRow(QObject::tr("Workers (0=auto):"), spWorkers);
-
-    auto* spZMin = new QSpinBox(&dlg);
-    spZMin->setRange(0, 1000000000);
-    spZMin->setValue(settings.value(QStringLiteral("tools/add_ignore_label_z_min"), 0).toInt());
-    form->addRow(QObject::tr("Level-0 Z min:"), spZMin);
-
-    auto* spZMax = new QSpinBox(&dlg);
-    spZMax->setRange(-1, 1000000000);
-    spZMax->setValue(settings.value(QStringLiteral("tools/add_ignore_label_z_max"), -1).toInt());
-    spZMax->setToolTip(QObject::tr("-1 means the end of the level-0 volume."));
-    form->addRow(QObject::tr("Level-0 Z max (exclusive):"), spZMax);
-
-    main->addLayout(form);
-
-    auto* buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dlg);
-    QObject::connect(buttons, &QDialogButtonBox::accepted, &dlg, [&]() {
-        const QString outName = edtOutput->text().trimmed();
-        if (outName.isEmpty()) {
-            QMessageBox::warning(&dlg,
-                                 QObject::tr("Error"),
-                                 QObject::tr("Output folder name cannot be empty."));
-            return;
-        }
-        settings.setValue(QStringLiteral("tools/add_ignore_label_output_name"), outName);
-        settings.setValue(QStringLiteral("tools/add_ignore_label_ignore_value"), spIgnore->value());
-        settings.setValue(QStringLiteral("tools/add_ignore_label_chunk_alpha_l0"), spChunkAlpha->value());
-        settings.setValue(QStringLiteral("tools/add_ignore_label_workers"), spWorkers->value());
-        settings.setValue(QStringLiteral("tools/add_ignore_label_z_min"), spZMin->value());
-        settings.setValue(QStringLiteral("tools/add_ignore_label_z_max"), spZMax->value());
-        dlg.accept();
-    });
-    QObject::connect(buttons, &QDialogButtonBox::rejected, &dlg, &QDialog::reject);
-    main->addWidget(buttons);
-
-    if (dlg.exec() != QDialog::Accepted) {
-        return false;
-    }
-
-    out->volumePath = volumeSelector->selectedVolumePath();
-    out->outputName = edtOutput->text().trimmed();
-    if (!out->outputName.endsWith(QStringLiteral(".zarr"), Qt::CaseInsensitive)) {
-        out->outputName += QStringLiteral(".zarr");
-    }
-    out->ignoreValue = spIgnore->value();
-    out->chunkAlphaL0 = spChunkAlpha->value();
-    out->workers = spWorkers->value();
-    out->zMin = spZMin->value();
-    out->zMax = spZMax->value();
-    return !out->volumePath.isEmpty();
 }
 
 bool selectResumeLocalTracerParams(QWidget* parent,
@@ -514,8 +222,7 @@ bool selectResumeLocalTracerParams(QWidget* parent,
     return true;
 }
 
-// A flattening tool run on a stored surface (SLIM by flatboi,
-// vc_straighten): the tool reads the surface from the store and
+// A SLIM flattening tool run on a stored surface by flatboi: the tool reads the surface from the store and
 // creates the result there. Shows a progress dialog, reports the run through
 // flattenJobStarted/flattenJobFinished exactly once (an empty message means
 // cancelled), and deletes itself.
@@ -527,7 +234,7 @@ public:
         double voxelScale = 1;
         QStringList args;
         QString kind;         // flattenJobStarted's kind, e.g. "flatten.slim"
-        QString title;        // "SLIM-flatten", "Straighten"
+        QString title;        // "SLIM-flatten"
         QString running;      // the progress dialog's first label
         QString outputName;
         // A determinate bar over this many iterations, fed by "PROGRESS n / m"
@@ -846,28 +553,6 @@ SegmentationCommandHandler::buildVolumeOptionList(QString* defaultOut)
     return options;
 }
 
-void SegmentationCommandHandler::configureCommandRunnerForVolume(const std::string& volumeId)
-{
-    if (!_cmdRunner) {
-        return;
-    }
-    _cmdRunner->setRemoteVolumeUrl(QString());
-    _cmdRunner->setRemoteVolumeAuth(QString(), QString(), QString(), QString());
-    if (!_state || !_state->vpkg() || !_state->vpkg()->hasVolume(volumeId)) {
-        return;
-    }
-    const auto volume = _state->vpkg()->volume(volumeId);
-    if (!volume->isRemote()) {
-        return;
-    }
-    const auto& auth = volume->remoteAuth();
-    _cmdRunner->setRemoteVolumeUrl(QString::fromStdString(volume->remoteLocator()));
-    _cmdRunner->setRemoteVolumeAuth(QString::fromStdString(auth.access_key),
-                                    QString::fromStdString(auth.secret_key),
-                                    QString::fromStdString(auth.session_token),
-                                    QString::fromStdString(auth.region));
-}
-
 void SegmentationCommandHandler::onRenderSegment(const std::string& segmentId)
 {
     const auto stored = requireStoredSurface(segmentId, false, true);
@@ -955,22 +640,6 @@ void SegmentationCommandHandler::onSlimFlatten(const std::string& segmentId)
     if (!startSlimFlattenImpl(segmentId, params, /*interactive=*/true, &error, nullptr)) {
         QMessageBox::critical(_parentWidget, tr("Error"), error.message);
         emit statusMessage(tr("SLIM-flatten failed"), 5000);
-    }
-}
-
-void SegmentationCommandHandler::onStraighten(const std::string& segmentId)
-{
-    const auto stored = requireStoredSurface(segmentId, false, true);
-    if (!stored) return;
-
-    StraightenDialog dlg(_parentWidget, stored->name + QStringLiteral("_straightened"));
-    if (dlg.exec() != QDialog::Accepted) {
-        return;
-    }
-    CommandLaunchError error;
-    if (!startStraightenImpl(segmentId, dlg.request(), /*interactive=*/true, &error, nullptr)) {
-        QMessageBox::critical(_parentWidget, tr("Error"), error.message);
-        emit statusMessage(tr("Straighten failed"), 5000);
     }
 }
 
@@ -1216,7 +885,6 @@ bool SegmentationCommandHandler::startRenderImpl(const std::string& segmentId,
     }
 
     _cmdRunner->setVolumePath(volumePath);
-    configureCommandRunnerForVolume(renderVolume->id());
 
     // Read in the render volume's voxels: those of the volume it is kept in, at its level.
     const auto renderTarget = vc::project::annotationVolume(_state->vpkg().get(), *renderVolume);
@@ -1277,50 +945,6 @@ bool SegmentationCommandHandler::startSlimFlattenImpl(const std::string& segment
     new FlattenJob(_parentWidget, this, _surfacePanel->catalog(),
                    {flatboiExe, stored->store, stored->volumeUuid, stored->voxelScale, args, QStringLiteral("flatten.slim"), tr("SLIM-flatten"), tr("Running SLIM (flatboi)..."),
                     outputName, iters, /*modal=*/true},
-                   /*suppressDialogs=*/!interactive);
-
-    if (resolvedOutputName) *resolvedOutputName = outputName;
-    return true;
-}
-
-bool SegmentationCommandHandler::startStraighten(const std::string& segmentId,
-                                                 const StraightenParams& params,
-                                                 CommandLaunchError* error,
-                                                 QString* resolvedOutputName)
-{
-    return startStraightenImpl(segmentId, params, /*interactive=*/false, error, resolvedOutputName);
-}
-
-bool SegmentationCommandHandler::startStraightenImpl(const std::string& segmentId,
-                                                     const StraightenParams& params,
-                                                     bool interactive,
-                                                     CommandLaunchError* error,
-                                                     QString* resolvedOutputName)
-{
-    const CommandLaunchErrorSetter setErr{error};
-
-    const auto stored = storedSurface(segmentId, error, true);
-    if (!stored) return false;
-
-    const QString exe = vc3d::findToolExecutable(QStringLiteral("vc_straighten"));
-    if (exe.isEmpty()) {
-        setErr(tr("Could not find the 'vc_straighten' executable (known locations and PATH). "
-                  "Set it in VC.ini [tools] vc_straighten, or put it on PATH."),
-               CommandLaunchError::ToolUnavailable);
-        return false;
-    }
-
-    const QString outputName =
-        params.outputName.isEmpty() ? stored->name + QStringLiteral("_straightened") : params.outputName;
-
-    const QStringList args = straightenArgs(params);
-    std::cout << "[straighten] surface=" << segmentId << " out=" << outputName.toStdString()
-              << " exe=" << exe.toStdString() << " args=" << args.join(' ').toStdString() << std::endl;
-    new FlattenJob(_parentWidget, this, _surfacePanel->catalog(),
-                   {exe, stored->store, stored->volumeUuid, stored->voxelScale,
-                    QStringList{QStringLiteral("--surface"), QString::fromStdString(stored->uuid),
-                                QStringLiteral("--name"), outputName} + args,
-                    QStringLiteral("flatten.straighten"), tr("Straighten"), tr("Running vc_straighten..."), outputName},
                    /*suppressDialogs=*/!interactive);
 
     if (resolvedOutputName) *resolvedOutputName = outputName;
@@ -1433,7 +1057,6 @@ void SegmentationCommandHandler::onNeighborCopyRequested(const QString& segmentI
     paramsFile->write(QJsonDocument(params).toJson(QJsonDocument::Indented));
     paramsFile->flush();
 
-    configureCommandRunnerForVolume(dlg.selectedVolumeId().toStdString());
     _cmdRunner->setStore(stored->store, stored->voxelScale);
     _cmdRunner->setNeighborCopyParams(selectedVolumePath, paramsFile->fileName(), segmentId,
                                       dlg.selectedVolumeId(), outputTag, QString());
@@ -1640,7 +1263,6 @@ bool SegmentationCommandHandler::startResumeLocalGrowPatchImpl(
                                       selectedVolumeId,
                                       QStringLiteral("paths"),
                                       QStringLiteral("local"));
-    configureCommandRunnerForVolume(selectedVolumeId.toStdString());
     _cmdRunner->setNextOmpThreads(params.ompThreads);
     const auto options = interactive
         ? CommandLineToolRunner::ExecutionOptions{}
@@ -1786,7 +1408,6 @@ bool SegmentationCommandHandler::startGrowPatchFromSeedImpl(
     } else {
         paramsJson.insert(QStringLiteral("normal_grid_path"), normalGridPath);
     }
-    paramsJson.insert(QStringLiteral("cache_root"), QDir(volpkgRoot).filePath(QStringLiteral("cache")));
     if (std::isfinite(selectedVoxelSize) && selectedVoxelSize > 0.0) {
         paramsJson.insert(QStringLiteral("voxelsize"), selectedVoxelSize);
     }
@@ -1812,7 +1433,6 @@ bool SegmentationCommandHandler::startGrowPatchFromSeedImpl(
          << QString::number(seedPoint.y(), 'g', 10)
          << QString::number(seedPoint.z(), 'g', 10);
 
-    configureCommandRunnerForVolume(selectedVolumeId.toStdString());
 
     QPointer<SegmentationCommandHandler> guard(this);
     auto connection = std::make_shared<QMetaObject::Connection>();
@@ -1848,8 +1468,12 @@ bool SegmentationCommandHandler::startGrowPatchFromSeedImpl(
     const auto options = interactive
         ? CommandLineToolRunner::ExecutionOptions{}
         : CommandLineToolRunner::ExecutionOptions::silent();
+    // The tracer grows in the voxels of the selected volume's working level: the
+    // surface is recorded in those, in the volume they belong to.
+    const auto grownIn = vc::project::annotationVolume(_state->vpkg().get(), *_state->vpkg()->volume(selectedVolumeId.toStdString()));
     if (!_cmdRunner->executeCustomCommand(
-            executable, args, QStringLiteral("vc_grow_seg_from_seed"), options, store->store, selectedVolumeId)) {
+            executable, args, QStringLiteral("vc_grow_seg_from_seed"), options, store->store,
+            QString::fromStdString(grownIn.volume), grownIn.scale)) {
         QObject::disconnect(*connection);
         _growPatchSeedJob.reset();
         return fail(tr("Failed to start vc_grow_seg_from_seed."));
@@ -2292,183 +1916,6 @@ void SegmentationCommandHandler::handleNeighborCopyToolFinished(bool success)
                              5000);
 }
 
-void SegmentationCommandHandler::onRasterizeSegments(const QStringList& segmentIds)
-{
-    if (!_state || !_state->vpkg()) {
-        emit statusMessage(tr("No volume package loaded"), 3000);
-        return;
-    }
-
-    if (_cmdRunner && _cmdRunner->isRunning()) {
-        QMessageBox::warning(_parentWidget, tr("Warning"),
-                             tr("A command line tool is already running."));
-        return;
-    }
-
-    QStringList requestedIds = segmentIds;
-    requestedIds.removeAll(QString());
-    if (requestedIds.isEmpty()) {
-        emit statusMessage(tr("No segments selected"), 3000);
-        return;
-    }
-
-    QStringList rasterIds;
-    QStringList validIds;
-    QSet<QString> seenIds;
-    for (const QString& id : requestedIds) {
-        const QString normalized = id.trimmed();
-        if (normalized.isEmpty()) {
-            continue;
-        }
-        if (seenIds.contains(normalized)) {
-            continue;
-        }
-        seenIds.insert(normalized);
-        rasterIds << normalized;
-    }
-
-    if (rasterIds.isEmpty()) {
-        emit statusMessage(tr("No valid segments selected"), 3000);
-        return;
-    }
-
-    std::optional<StoredSurface> store;
-    QStringList missingIds;
-    for (const QString& segmentId : rasterIds) {
-        CommandLaunchError error;
-        if (auto stored = storedSurface(segmentId.toStdString(), &error, true)) {
-            store = stored;
-            validIds << segmentId;
-        } else {
-            missingIds << QStringLiteral("%1 (%2)").arg(segmentId, error.message);
-        }
-    }
-
-    if (validIds.isEmpty()) {
-        QMessageBox::warning(_parentWidget, tr("Error"),
-                             tr("None of the selected surfaces can be rasterized: %1")
-                                 .arg(missingIds.join(QStringLiteral(", "))));
-        return;
-    }
-    if (!missingIds.isEmpty()) {
-        emit statusMessage(
-            tr("Ignoring %1 surface(s) that cannot be rasterized.")
-                .arg(missingIds.size()),
-            3000);
-    }
-
-    const QString referenceZarr = getCurrentVolumePath();
-    if (referenceZarr.isEmpty()) {
-        QMessageBox::warning(_parentWidget, tr("Error"), tr("Load a volume first."));
-        return;
-    }
-
-    const QString executable = vc3d::findToolExecutable(QStringLiteral("vc_tifxyz2zarr_sparse"));
-    if (executable.isEmpty()) {
-        QMessageBox::warning(_parentWidget, tr("Error"),
-                             tr("vc_tifxyz2zarr_sparse tool not found. Configure tools/vc_tifxyz2zarr_sparse path."));
-        return;
-    }
-
-    RasterizeDialogResult rasterizeParams;
-    if (!selectRasterizeParams(_parentWidget, &rasterizeParams)) {
-        return;
-    }
-
-    const QString timestamp = QDateTime::currentDateTime().toString(QStringLiteral("yyyyMMddHHmmss"));
-    const auto baseOutputName = QStringLiteral("labels_%1.zarr").arg(timestamp);
-
-    std::error_code ec;
-    const std::filesystem::path volpkgDir(_state->vpkg()->directory().string());
-    const std::filesystem::path volumesDir = volpkgDir / "volumes";
-    std::filesystem::create_directories(volumesDir, ec);
-    if (ec) {
-        QMessageBox::critical(_parentWidget, tr("Error"),
-                              tr("Cannot create volumes directory: %1").arg(QString::fromStdString(ec.message())));
-        return;
-    }
-
-    std::filesystem::path finalOutputRoot = volumesDir / baseOutputName.toStdString();
-    for (int suffix = 1; std::filesystem::exists(finalOutputRoot, ec) && suffix < 1000; ++suffix) {
-        finalOutputRoot = volumesDir /
-            QStringLiteral("labels_%1_%2.zarr").arg(timestamp).arg(suffix).toStdString();
-    }
-    if (std::filesystem::exists(finalOutputRoot)) {
-        QMessageBox::critical(_parentWidget, tr("Error"),
-                              tr("Unable to reserve output directory after retries: %1")
-                                  .arg(QString::fromStdString(finalOutputRoot.string())));
-        return;
-    }
-
-    // The tool publishes the volume (staged, then renamed) with its meta.json.
-    const QString finalOutputRootStr = QString::fromStdString(finalOutputRoot.string());
-    QStringList args;
-    args << finalOutputRootStr
-         << QStringLiteral("--reference-zarr")
-         << referenceZarr
-         << QStringLiteral("--chunk-size")
-         << QString::number(rasterizeParams.chunkSize)
-         << QStringLiteral("--z-min")
-         << QString::number(rasterizeParams.zMin)
-         << QStringLiteral("--raster-mode")
-         << QStringLiteral("zyx-integer")
-         << QStringLiteral("--overwrite");
-    if (rasterizeParams.zMax >= 0) {
-        args << QStringLiteral("--z-max") << QString::number(rasterizeParams.zMax);
-    }
-    for (const QString& segmentId : validIds) {
-        args << QStringLiteral("--surface") << segmentId;
-    }
-
-    auto runner = _cmdRunner;
-    if (!runner) {
-        QMessageBox::critical(_parentWidget, tr("Error"),
-                              tr("Command runner is not available."));
-        return;
-    }
-
-    QPointer<SegmentationCommandHandler> guard(this);
-    auto connection = std::make_shared<QMetaObject::Connection>();
-    *connection = connect(runner, &CommandLineToolRunner::toolFinished,
-                         this,
-                         [this, guard, connection, runner, finalOutputRootStr,
-                          validIds](CommandLineToolRunner::Tool tool,
-                                                  bool success,
-                                                  const QString& message,
-                                                  const QString&,
-                                                  bool) {
-        if (!guard) {
-            disconnect(*connection);
-            return;
-        }
-        if (tool != CommandLineToolRunner::Tool::CustomCommand) {
-            return;
-        }
-        disconnect(*connection);
-
-        // The runner's completion handler reports a failure.
-        if (success) {
-            emit statusMessage(tr("Rasterized %1 segment(s) -> %2")
-                                   .arg(validIds.size())
-                                   .arg(QDir::toNativeSeparators(finalOutputRootStr)),
-                               5000);
-        } else {
-            emit statusMessage(tr("Rasterize failed"), 3000);
-        }
-    });
-
-    if (!runner->executeCustomCommand(executable, args, QStringLiteral("vc_tifxyz2zarr_sparse"), {}, store->store,
-                                      store->volumeUuid, store->voxelScale)) {
-        QObject::disconnect(*connection);
-        QMessageBox::critical(_parentWidget, tr("Error"),
-                              tr("Failed to start vc_tifxyz2zarr_sparse."));
-        return;
-    }
-
-    emit statusMessage(
-        tr("Rasterization started for %1 surface(s)...").arg(validIds.size()), 0);
-}
-
 std::vector<const SurfaceCatalog::Row*> SegmentationCommandHandler::toolSurfaces(bool throughView) const
 {
     std::vector<const SurfaceCatalog::Row*> rows;
@@ -2477,177 +1924,6 @@ std::vector<const SurfaceCatalog::Row*> SegmentationCommandHandler::toolSurfaces
             if (throughView ? row.bound() : row.toolInput()) rows.push_back(&row);
     }
     return rows;
-}
-
-void SegmentationCommandHandler::onMergeSurfaces(const QStringList& segmentIds)
-{
-    if (!_cmdRunner) {
-        QMessageBox::warning(_parentWidget, tr("Merge TIFXYZ"),
-                             tr("Command runner is not initialized."));
-        return;
-    }
-    if (_cmdRunner->isRunning()) {
-        QMessageBox::warning(_parentWidget, tr("Merge TIFXYZ"),
-                             tr("A command-line tool is already running."));
-        return;
-    }
-    CommandLaunchError error;
-    const auto store = storeForTools(&error);
-    if (!store) {
-        QMessageBox::warning(_parentWidget, tr("Merge TIFXYZ"), error.message);
-        return;
-    }
-
-    QMap<QString, QString> available;
-    for (const auto* row : toolSurfaces(true)) {
-        const auto& record = row->record;
-        available.insert(QString::fromStdString(record.uuid),
-                         QString::fromStdString(record.name.empty() ? record.uuid : record.name));
-    }
-    if (available.size() < 2) {
-        QMessageBox::warning(_parentWidget, tr("Merge TIFXYZ"),
-                             tr("The current volume has fewer than 2 surfaces; merge needs at least 2."));
-        return;
-    }
-
-    MergeSurfacesDialog dlg(_parentWidget, segmentIds, available);
-    if (dlg.exec() != QDialog::Accepted) {
-        emit statusMessage(tr("Merge cancelled"), 3000);
-        return;
-    }
-
-    auto mergeJson = std::make_shared<QTemporaryFile>(QDir::temp().filePath(QStringLiteral("vc3d_XXXXXX.merge.json")));
-    if (!mergeJson->open()) {
-        QMessageBox::critical(_parentWidget, tr("Merge TIFXYZ"), tr("Failed to write merge.json."));
-        return;
-    }
-    mergeJson->write(dlg.mergeJsonText().toUtf8());
-    mergeJson->flush();
-
-    // The merge is a new surface bound to the current volume.
-    _cmdRunner->setStore(store->store, store->voxelScale);
-    _cmdRunner->setMergeParams(mergeJson->fileName(),
-                               store->volumeUuid,
-                               QStringLiteral("paths"),
-                               dlg.refSurface(),
-                               dlg.ransacIters(),
-                               dlg.ransacMinThresh(),
-                               dlg.ransacMaxThresh(),
-                               dlg.ransacMadK(),
-                               dlg.ransacSeed(),
-                               dlg.anchorCap(),
-                               dlg.stripCols());
-    if (dlg.ompThreads() > 0) _cmdRunner->setNextOmpThreads(dlg.ompThreads());
-    // The merge.json lives until the tool finishes.
-    auto connection = std::make_shared<QMetaObject::Connection>();
-    *connection = connect(_cmdRunner, &CommandLineToolRunner::toolFinished, this,
-                          [connection, mergeJson](CommandLineToolRunner::Tool tool, bool, const QString&, const QString&, bool) {
-                              if (tool == CommandLineToolRunner::Tool::MergeTifxyz) disconnect(*connection);
-                          });
-    _cmdRunner->showConsoleOutput();
-    if (!_cmdRunner->execute(CommandLineToolRunner::Tool::MergeTifxyz)) {
-        disconnect(*connection);
-        return;
-    }
-    emit statusMessage(tr("Merging surfaces..."), 0);
-}
-
-void SegmentationCommandHandler::onMergePatch(const QStringList& segmentIds)
-{
-    if (!_cmdRunner) {
-        QMessageBox::warning(_parentWidget, tr("Patch Surface"),
-                             tr("Command runner is not initialized."));
-        return;
-    }
-    if (_cmdRunner->isRunning()) {
-        QMessageBox::warning(_parentWidget, tr("Patch Surface"),
-                             tr("A command-line tool is already running."));
-        return;
-    }
-    CommandLaunchError error;
-    const auto store = storeForTools(&error);
-    if (!store) {
-        QMessageBox::warning(_parentWidget, tr("Patch Surface"), error.message);
-        return;
-    }
-
-    QMap<QString, MergePatchDialog::Choice> available;
-    for (const auto* row : toolSurfaces()) {
-        const auto& record = row->record;
-        // The store's area; tool inputs are stored in the volume's voxels.
-        available.insert(QString::fromStdString(record.uuid),
-                         {QString::fromStdString(record.name.empty() ? record.uuid : record.name),
-                          record.surface && record.surface->area > 0 ? record.surface->area : -1.0});
-    }
-    if (available.size() < 2) {
-        QMessageBox::warning(_parentWidget, tr("Patch Surface"),
-                             tr("The current volume has fewer than 2 surfaces; "
-                                "patch needs a parent + child."));
-        return;
-    }
-
-    MergePatchDialog dlg(_parentWidget, segmentIds, available);
-    if (dlg.exec() != QDialog::Accepted) {
-        emit statusMessage(tr("Patch cancelled"), 3000);
-        return;
-    }
-
-    _cmdRunner->setStore(store->store, store->voxelScale);
-    _cmdRunner->setMergePatchParams(dlg.parentSurface(),
-                                    dlg.childSurface(),
-                                    dlg.explicitRoles(),
-                                    dlg.borderCells(),
-                                    dlg.blendCells(),
-                                    dlg.idwK(),
-                                    dlg.ransacIters(),
-                                    dlg.ransacMinThresh(),
-                                    dlg.ransacMaxThresh(),
-                                    dlg.ransacMadK(),
-                                    dlg.ransacSeed(),
-                                    dlg.anchorCap());
-    if (dlg.ompThreads() > 0) _cmdRunner->setNextOmpThreads(dlg.ompThreads());
-
-    // The parent's new revision reaches the panel and an opened copy through
-    // the store's commit events.
-    QPointer<SegmentationCommandHandler> guard(this);
-    auto connection = std::make_shared<QMetaObject::Connection>();
-    *connection = connect(_cmdRunner, &CommandLineToolRunner::toolFinished,
-                          this,
-                          [this, guard, connection]
-                          (CommandLineToolRunner::Tool tool,
-                           bool success,
-                           const QString& message,
-                           const QString& outputPath,
-                           bool) {
-        if (!guard) {
-            disconnect(*connection);
-            return;
-        }
-        if (tool != CommandLineToolRunner::Tool::MergePatch) {
-            return;
-        }
-        disconnect(*connection);
-        if (success) {
-            emit statusMessage(tr("Patch applied to %1").arg(outputPath), 5000);
-        } else {
-            QMessageBox::critical(_parentWidget, tr("Patch Surface"),
-                                  tr("vc_merge_patch failed.\n%1").arg(message));
-            emit statusMessage(tr("Patch failed"), 5000);
-        }
-    });
-
-    _cmdRunner->showConsoleOutput();
-    // If execute() rejects the launch (preflight failure, missing binary),
-    // it never emits toolFinished -- so the one-shot lambda above would
-    // stay attached and fire on the NEXT tool's toolFinished. Disconnect
-    // immediately on launch failure to keep the runner's signal table
-    // clean across subsequent runs.
-    if (!_cmdRunner->execute(CommandLineToolRunner::Tool::MergePatch)) {
-        QObject::disconnect(*connection);
-        emit statusMessage(tr("Failed to start vc_merge_patch"), 5000);
-        return;
-    }
-    emit statusMessage(tr("Patching surface..."), 0);
 }
 
 void SegmentationCommandHandler::onGrowTrackPatches()
@@ -2738,319 +2014,4 @@ void SegmentationCommandHandler::onGrowTrackPatches()
         return;
     }
     emit statusMessage(tr("Running grow_track_graph.py..."), 0);
-}
-
-void SegmentationCommandHandler::onAddIgnoreLabel()
-{
-    if (!_state || !_state->vpkg()) {
-        emit statusMessage(tr("No volume package loaded"), 3000);
-        return;
-    }
-
-    if (_cmdRunner && _cmdRunner->isRunning()) {
-        QMessageBox::warning(_parentWidget, tr("Warning"),
-                             tr("A command line tool is already running."));
-        return;
-    }
-
-    QVector<VolumeSelector::VolumeOption> rasterizedVolumes;
-    QString defaultVolumeId;
-    const QString currentVolumeId = QString::fromStdString(_state->currentVolumeId());
-
-    for (const auto& volumeId : _state->vpkg()->volumeIDs()) {
-        auto volume = _state->vpkg()->volume(volumeId);
-        if (!volume) {
-            continue;
-        }
-        const QString id = QString::fromStdString(volumeId);
-        const QString path = QString::fromStdString(volume->path().string());
-        if (!isRasterizedLabelVolumePath(path)) {
-            continue;
-        }
-
-        VolumeSelector::VolumeOption opt;
-        opt.id = id;
-        opt.name = QString::fromStdString(volume->name());
-        opt.path = path;
-        rasterizedVolumes.push_back(opt);
-
-        if (defaultVolumeId.isEmpty()) {
-            defaultVolumeId = id;
-        }
-        if (!currentVolumeId.isEmpty() && id == currentVolumeId) {
-            defaultVolumeId = id;
-        }
-    }
-
-    if (rasterizedVolumes.isEmpty()) {
-        QMessageBox::warning(_parentWidget,
-                             tr("Error"),
-                             tr("No rasterized label volumes found.\n"
-                                "Only volumes with meta.json field \"label_volume\": \"rasterized\" are supported."));
-        return;
-    }
-
-    IgnoreLabelDialogResult params;
-    if (!selectIgnoreLabelParams(_parentWidget, rasterizedVolumes, defaultVolumeId, &params)) {
-        emit statusMessage(tr("Add ignore label cancelled"), 3000);
-        return;
-    }
-
-    if (!isRasterizedLabelVolumePath(params.volumePath)) {
-        QMessageBox::warning(_parentWidget,
-                             tr("Error"),
-                             tr("Selected volume is not a rasterized label volume."));
-        return;
-    }
-
-    const QString executable = vc3d::findToolExecutable(QStringLiteral("vc_add_ignore_label"));
-    if (executable.isEmpty()) {
-        QMessageBox::warning(_parentWidget,
-                             tr("Error"),
-                             tr("vc_add_ignore_label tool not found. Configure tools/vc_add_ignore_label path."));
-        return;
-    }
-
-    std::error_code ec;
-    const std::filesystem::path volpkgDir(_state->vpkg()->directory().string());
-    const std::filesystem::path volumesDir = volpkgDir / "volumes";
-    std::filesystem::create_directories(volumesDir, ec);
-    if (ec) {
-        QMessageBox::critical(_parentWidget,
-                              tr("Error"),
-                              tr("Cannot create volumes directory: %1")
-                                  .arg(QString::fromStdString(ec.message())));
-        return;
-    }
-
-    QString outName = QFileInfo(params.outputName).fileName().trimmed();
-    if (outName.isEmpty()) {
-        outName = QStringLiteral("labels_ignore_%1.zarr")
-                      .arg(QDateTime::currentDateTime().toString(QStringLiteral("yyyyMMddHHmmss")));
-    }
-    if (!outName.endsWith(QStringLiteral(".zarr"), Qt::CaseInsensitive)) {
-        outName += QStringLiteral(".zarr");
-    }
-
-    const std::filesystem::path finalOutputRoot = volumesDir / outName.toStdString();
-    const bool outputExists = std::filesystem::exists(finalOutputRoot, ec);
-    if (ec) {
-        QMessageBox::critical(_parentWidget,
-                              tr("Error"),
-                              tr("Cannot inspect output path: %1")
-                                  .arg(QString::fromStdString(ec.message())));
-        return;
-    }
-    if (outputExists && !std::filesystem::is_directory(finalOutputRoot, ec)) {
-        QMessageBox::critical(_parentWidget,
-                              tr("Error"),
-                              tr("Output path exists and is not a directory: %1")
-                                  .arg(QString::fromStdString(finalOutputRoot.string())));
-        return;
-    }
-
-    // An existing output is updated in place; a new one the tool publishes
-    // (staged, then renamed) with its meta.json.
-    const bool reuseExistingOutput = outputExists;
-    const QString finalOutputRootStr = QString::fromStdString(finalOutputRoot.string());
-
-    QStringList args;
-    args << params.volumePath
-         << finalOutputRootStr
-         << QStringLiteral("--mode") << QStringLiteral("chunk-alpha-wrap")
-         << QStringLiteral("--chunk-alpha") << QString::number(params.chunkAlphaL0, 'g', 10)
-         << QStringLiteral("--compute-level") << QStringLiteral("0")
-         << QStringLiteral("--output-level") << QStringLiteral("0")
-         << QStringLiteral("--skip-inner")
-         << QStringLiteral("--verbose")
-         << QStringLiteral("--ignore-value") << QString::number(params.ignoreValue)
-         << QStringLiteral("--z-min") << QString::number(params.zMin);
-
-    if (params.zMax >= 0) {
-        args << QStringLiteral("--z-max") << QString::number(params.zMax);
-    }
-    if (params.workers > 0) {
-        args << QStringLiteral("--workers") << QString::number(params.workers);
-    }
-    if (reuseExistingOutput) {
-        args << QStringLiteral("--reuse-output-tree");
-    }
-
-    auto* runner = _cmdRunner;
-    if (!runner) {
-        QMessageBox::critical(_parentWidget, tr("Error"), tr("Command runner is not available."));
-        return;
-    }
-
-    QPointer<QProgressDialog> progressDialog = new QProgressDialog(
-        tr("Preparing add ignore label..."),
-        tr("Cancel"),
-        0,
-        0,
-        _parentWidget);
-    progressDialog->setWindowTitle(tr("Add Ignore Label"));
-    progressDialog->setWindowModality(Qt::WindowModal);
-    progressDialog->setAutoClose(false);
-    progressDialog->setAutoReset(false);
-    progressDialog->setMinimumDuration(0);
-    progressDialog->setRange(0, 0);
-    progressDialog->setValue(0);
-    progressDialog->setAttribute(Qt::WA_DeleteOnClose);
-    progressDialog->show();
-
-    QPointer<SegmentationCommandHandler> guard(this);
-    auto progressState = std::make_shared<IgnoreLabelProgressState>();
-    auto finishConnection = std::make_shared<QMetaObject::Connection>();
-    auto outputConnection = std::make_shared<QMetaObject::Connection>();
-
-    QObject::connect(progressDialog,
-                     &QProgressDialog::canceled,
-                     this,
-                     [this, runner, progressDialog]() {
-        if (progressDialog) {
-            progressDialog->setRange(0, 0);
-            progressDialog->setLabelText(tr("Canceling add ignore label..."));
-        }
-        runner->cancel();
-        emit statusMessage(tr("Canceling add ignore label..."), 0);
-    });
-
-    *outputConnection = connect(runner,
-                                &CommandLineToolRunner::consoleOutputReceived,
-                                this,
-                                [this, guard, progressDialog, progressState](const QString& output) {
-        if (!guard) {
-            return;
-        }
-        progressState->pendingOutput += output;
-
-        while (true) {
-            const int newline = progressState->pendingOutput.indexOf(QChar('\n'));
-            if (newline < 0) {
-                break;
-            }
-
-            QString line = progressState->pendingOutput.left(newline);
-            progressState->pendingOutput.remove(0, newline + 1);
-            line = line.trimmed();
-            if (line.isEmpty()) {
-                continue;
-            }
-
-            QString kind;
-            QHash<QString, QString> fields;
-            if (!parseStructuredProgressLine(line, &kind, &fields)) {
-                continue;
-            }
-
-            if (kind == QStringLiteral("VC_STAGE")) {
-                progressState->stageName = fields.value(QStringLiteral("name"));
-                progressState->stageLevel = fields.value(QStringLiteral("level"), QStringLiteral("-1")).toInt();
-                const int total = std::max(
-                    1,
-                    clampProgressCount(fields.value(QStringLiteral("total"), QStringLiteral("0")).toLongLong()));
-                progressState->totalSteps = total;
-
-                if (progressDialog) {
-                    progressDialog->setRange(0, total);
-                    progressDialog->setValue(0);
-                    progressDialog->setLabelText(
-                        ignoreLabelStageText(progressState->stageName,
-                                             progressState->stageLevel,
-                                             0,
-                                             total));
-                }
-                emit statusMessage(ignoreLabelStageText(progressState->stageName,
-                                                       progressState->stageLevel,
-                                                       0,
-                                                       total),
-                                   0);
-                continue;
-            }
-
-            if (kind == QStringLiteral("VC_PROGRESS")) {
-                const QString stageName =
-                    fields.value(QStringLiteral("name"), progressState->stageName);
-                const int stageLevel =
-                    fields.contains(QStringLiteral("level"))
-                        ? fields.value(QStringLiteral("level")).toInt()
-                        : progressState->stageLevel;
-                const int total = std::max(
-                    1,
-                    clampProgressCount(fields.value(QStringLiteral("total"),
-                                                    QString::number(progressState->totalSteps))
-                                           .toLongLong()));
-                const int current = std::clamp(
-                    clampProgressCount(fields.value(QStringLiteral("current"), QStringLiteral("0")).toLongLong()),
-                    0,
-                    total);
-
-                progressState->stageName = stageName;
-                progressState->stageLevel = stageLevel;
-                progressState->totalSteps = total;
-
-                if (progressDialog) {
-                    progressDialog->setRange(0, total);
-                    progressDialog->setValue(current);
-                    progressDialog->setLabelText(
-                        ignoreLabelStageText(stageName, stageLevel, current, total));
-                }
-                continue;
-            }
-
-            if (kind == QStringLiteral("VC_SUMMARY") && progressDialog) {
-                progressDialog->setRange(0, 0);
-                progressDialog->setLabelText(tr("Finalizing output..."));
-            }
-        }
-    });
-
-    *finishConnection = connect(runner,
-                          &CommandLineToolRunner::toolFinished,
-                          this,
-                          [this, guard, finishConnection, outputConnection, progressDialog,
-                           reuseExistingOutput, finalOutputRootStr]
-                          (CommandLineToolRunner::Tool tool,
-                           bool success,
-                           const QString& message,
-                           const QString&,
-                           bool) {
-        if (!guard) {
-            disconnect(*finishConnection);
-            disconnect(*outputConnection);
-            return;
-        }
-        if (tool != CommandLineToolRunner::Tool::CustomCommand) {
-            return;
-        }
-        disconnect(*finishConnection);
-        disconnect(*outputConnection);
-
-        // The runner's completion handler reports a failure.
-        if (!success) {
-            emit statusMessage(tr("Add ignore label failed"), 3000);
-        } else {
-            emit statusMessage((reuseExistingOutput ? tr("Ignore label volume updated -> %1")
-                                                    : tr("Ignore label volume created -> %1"))
-                                   .arg(QDir::toNativeSeparators(finalOutputRootStr)),
-                               5000);
-        }
-        if (progressDialog) {
-            progressDialog->close();
-        }
-    });
-
-    if (!runner->executeCustomCommand(executable, args, QStringLiteral("vc_add_ignore_label"))) {
-        QObject::disconnect(*finishConnection);
-        QObject::disconnect(*outputConnection);
-        if (progressDialog) {
-            progressDialog->close();
-        }
-        QMessageBox::critical(_parentWidget,
-                              tr("Error"),
-                              tr("Failed to start vc_add_ignore_label."));
-        return;
-    }
-
-    emit statusMessage(tr("Add ignore label started at level 0..."), 0);
 }

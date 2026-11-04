@@ -24,9 +24,8 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 import torch
 import torch.nn.functional as F
-import tifffile
-import zarr
-from zarr.codecs import BloscCodec
+from vc_reader import images
+from vc_reader.reader import create_group, open_group
 
 from train_unet_3d import (
     FittedZarrDataset,
@@ -197,10 +196,9 @@ def save_vis(
         "pred_dir1_z", "gt_dir1_z",
     ]
 
-    with tifffile.TiffWriter(str(out_path)) as tw:
+    with images.TiffWriter(out_path, pages[0].shape, pages[0].dtype, pages=len(pages)) as writer:
         for page, name in zip(pages, page_names):
-            # Tag 285 = PageName, read by GIMP as layer name
-            tw.write(page, extratags=[(285, 's', 0, name, False)])
+            writer.write_page(page, name=name)
 
 
 # ---------------------------------------------------------------------------
@@ -227,7 +225,7 @@ def evaluate_sample(
     """Run inference on one full sample and compute metrics."""
 
     # Load zarr labels (same logic as FittedZarrDataset.__getitem__, no crop)
-    root = zarr.open(str(zarr_path), mode="r")
+    root = open_group(zarr_path)
     origin = root.attrs["origin_fullres"]
     normal = np.array(root["normal"])       # (3, Z, Y, X)
     winding = np.array(root["winding"])     # (Z, Y, X)
@@ -240,7 +238,7 @@ def evaluate_sample(
     z0 = int(round(origin[2]))
 
     # Load CT, crop to zarr extent
-    image = tifffile.imread(str(img_path))
+    image = images.read(str(img_path))
     if image.dtype == np.uint16:
         image = (image // 257).astype(np.uint8)
     image = image[z0:z0 + Z * step, y0:y0 + Y * step, x0:x0 + X * step]
@@ -337,11 +335,11 @@ def evaluate_sample(
 
     # pred.zarr at step resolution
     pred_np = pred_step[0].cpu().numpy().astype(np.float32)  # (8, Z, Y, X)
-    zout = zarr.open_group(str(sample_dir / "pred.zarr"), mode="w")
+    zout = create_group(sample_dir / "pred.zarr", version=3, overwrite=True)
     zout.create_array(
-        "prediction", data=pred_np, chunks=(8, 32, 32, 32),
-        compressors=BloscCodec(cname="zstd", clevel=3),
-    )
+        "prediction", shape=pred_np.shape, chunks=(8, 32, 32, 32), dtype=np.float32,
+        cname="zstd", level=3, shuffle=1,
+    )[...] = pred_np
     zout.attrs["channel_names"] = _CHANNEL_NAMES
     zout.attrs["step"] = step
 
