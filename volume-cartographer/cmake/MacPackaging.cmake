@@ -5,7 +5,7 @@
 # Homebrew prefix, Contents/PlugIns the Qt plugins), then wraps it in a
 # drag-and-drop DMG via CPack (CI derives its ZIP from that deployed DMG):
 #
-#   cmake --build <build>            # as usual
+#   ninja -C <build>                # as usual
 #   cpack --config <build>/CPackConfig.cmake
 #
 # Everything is ad-hoc signed (codesign -s -): arm64 macOS refuses to load
@@ -46,9 +46,11 @@ install(FILES "${CMAKE_SOURCE_DIR}/apps/VC3D/logo.icns"
 # and Qt frameworks into Contents/Frameworks, deploys the Qt plugins, and
 # rewrites install names to @executable_path-relative paths.
 find_program(VC_MACDEPLOYQT NAMES macdeployqt macdeployqt6
-    HINTS "$ENV{HOMEBREW_PREFIX}/opt/qt/bin" "$ENV{HOMEBREW_PREFIX}/bin")
+    HINTS "$ENV{HOMEBREW_PREFIX}/opt/qtbase/bin"
+          "$ENV{HOMEBREW_PREFIX}/opt/qt/bin" "$ENV{HOMEBREW_PREFIX}/bin")
 find_program(VC_QMAKE NAMES qmake qmake6
-    HINTS "$ENV{HOMEBREW_PREFIX}/opt/qt/bin" "$ENV{HOMEBREW_PREFIX}/bin")
+    HINTS "$ENV{HOMEBREW_PREFIX}/opt/qtbase/bin"
+          "$ENV{HOMEBREW_PREFIX}/opt/qt/bin" "$ENV{HOMEBREW_PREFIX}/bin")
 set(_vc_qt_plugin_dir "")
 if(VC_QMAKE)
     execute_process(COMMAND "${VC_QMAKE}" -query QT_INSTALL_PLUGINS
@@ -56,158 +58,12 @@ if(VC_QMAKE)
 endif()
 
 if(VC_MACDEPLOYQT)
-    # Configure-time values the install-time code below needs.
-    install(CODE "
-        set(_vc_macdeployqt \"${VC_MACDEPLOYQT}\")
-        set(_vc_qt_plugin_dir \"${_vc_qt_plugin_dir}\")
-    " COMPONENT vc_runtime)
-
-    install(CODE [==[
-        set(_app "${CMAKE_INSTALL_PREFIX}/VC3D.app")
-
-        # Every CLI tool rides along via -executable so macdeployqt pulls its
-        # dependency closure and rewrites its install names too. (VC3D itself
-        # is the bundle's main executable — covered implicitly.)
-        file(GLOB _clis "${_app}/Contents/MacOS/*")
-        set(_exe_args "")
-        foreach(_cli IN LISTS _clis)
-            if(NOT _cli MATCHES "/VC3D$")
-                list(APPEND _exe_args "-executable=${_cli}")
-            endif()
-        endforeach()
-        message(STATUS "Running macdeployqt: ${_vc_macdeployqt}")
-        execute_process(
-            # The bundle is freshly staged, so overwriting existing deployed
-            # frameworks only repeats work shared by the many CLI executables.
-            # Signing here would also be wasted: the install-name normalization
-            # below invalidates those signatures and signs the finished files.
-            COMMAND "${_vc_macdeployqt}" "${_app}" -no-codesign ${_exe_args}
-            RESULT_VARIABLE _mdq_rc)
-        if(NOT _mdq_rc EQUAL 0)
-            message(FATAL_ERROR "macdeployqt failed (rc=${_mdq_rc})")
-        endif()
-
-        # macdeployqt only deploys the cocoa platform plugin. Headless runs
-        # (QT_QPA_PLATFORM=offscreen — used by the CI smoke test) need the
-        # offscreen plugin as well.
-        set(_offscreen "${_vc_qt_plugin_dir}/platforms/libqoffscreen.dylib")
-        if(EXISTS "${_offscreen}")
-            file(COPY "${_offscreen}"
-                 DESTINATION "${_app}/Contents/PlugIns/platforms")
-        else()
-            message(WARNING "offscreen Qt plugin not found at ${_offscreen}")
-        endif()
-
-        # macdeployqt copies the complete non-Qt dependency closure, but does
-        # not consistently rewrite dependencies between those copied dylibs.
-        # Normalize every non-system absolute install name, including each
-        # dylib LC_ID_DYLIB, after all bundle files are in place.
-        file(GLOB_RECURSE _bundle_files LIST_DIRECTORIES false
-            "${_app}/Contents/Frameworks/*"
-            "${_app}/Contents/PlugIns/*"
-            "${_app}/Contents/MacOS/*")
-        foreach(_f IN LISTS _bundle_files)
-            if(IS_SYMLINK "${_f}")
-                continue()
-            endif()
-            file(READ "${_f}" _magic LIMIT 4 HEX)
-            if(NOT _magic MATCHES "^(cffaedfe|cafebabe|bebafeca)")
-                continue()
-            endif()
-            execute_process(COMMAND otool -L "${_f}"
-                RESULT_VARIABLE _otool_rc OUTPUT_VARIABLE _deps_out
-                ERROR_VARIABLE _otool_err)
-            if(NOT _otool_rc EQUAL 0)
-                message(FATAL_ERROR "otool failed for ${_f}: ${_otool_err}")
-            endif()
-            string(REPLACE "\n" ";" _dep_lines "${_deps_out}")
-            set(_install_name_args "")
-            foreach(_line IN LISTS _dep_lines)
-                if(NOT _line MATCHES "^[ \t]+(/[^ ]+)")
-                    continue()
-                endif()
-                set(_dep "${CMAKE_MATCH_1}")
-                if(_dep MATCHES "^(/usr/lib|/System/)")
-                    continue()
-                endif()
-                if(_dep MATCHES "/([^/]+\\.framework/.+)$")
-                    set(_relative_dep "${CMAKE_MATCH_1}")
-                else()
-                    get_filename_component(_relative_dep "${_dep}" NAME)
-                endif()
-                if(NOT EXISTS "${_app}/Contents/Frameworks/${_relative_dep}")
-                    message(FATAL_ERROR
-                        "Bundled dependency for ${_dep} (needed by ${_f}) not found")
-                endif()
-                set(_new "@rpath/${_relative_dep}")
-                list(APPEND _install_name_args -change "${_dep}" "${_new}")
-            endforeach()
-
-            execute_process(COMMAND otool -D "${_f}"
-                RESULT_VARIABLE _id_rc OUTPUT_VARIABLE _id_out
-                ERROR_QUIET)
-            if(_id_rc EQUAL 0 AND _id_out MATCHES "\n(/[^ \n]+)")
-                set(_old_id "${CMAKE_MATCH_1}")
-                if(NOT _old_id MATCHES "^(/usr/lib|/System/)")
-                    if(_old_id MATCHES "/([^/]+\\.framework/.+)$")
-                        set(_relative_id "${CMAKE_MATCH_1}")
-                    else()
-                        get_filename_component(_relative_id "${_old_id}" NAME)
-                    endif()
-                    list(APPEND _install_name_args
-                        -id "@rpath/${_relative_id}")
-                endif()
-            endif()
-
-            # Homebrew dylibs can retain absolute LC_RPATH entries even after
-            # their dependency names have been rewritten. Those search paths
-            # take precedence over the app's Frameworks directory and can load
-            # a second OpenCV/OpenMP runtime on machines with Homebrew installed.
-            execute_process(COMMAND otool -l "${_f}"
-                RESULT_VARIABLE _rpath_rc OUTPUT_VARIABLE _load_commands
-                ERROR_VARIABLE _rpath_err)
-            if(NOT _rpath_rc EQUAL 0)
-                message(FATAL_ERROR "otool failed for ${_f}: ${_rpath_err}")
-            endif()
-            string(REGEX MATCHALL "cmd LC_RPATH\n[^\n]*\n[^\n]*"
-                _rpath_commands "${_load_commands}")
-            foreach(_command IN LISTS _rpath_commands)
-                if(_command MATCHES "\n[ \t]+path (/.*) \\(offset [0-9]+\\)$")
-                    set(_rpath "${CMAKE_MATCH_1}")
-                    if(NOT _rpath MATCHES "^(/usr/lib(/|$)|/System/)")
-                        list(APPEND _install_name_args -delete_rpath "${_rpath}")
-                    endif()
-                endif()
-            endforeach()
-
-            # install_name_tool rewrites the Mach-O for every invocation.
-            # Apply all dependency and ID changes in one pass per file.
-            if(_install_name_args)
-                execute_process(COMMAND install_name_tool
-                    ${_install_name_args} "${_f}"
-                    RESULT_VARIABLE _int_rc ERROR_VARIABLE _int_err)
-                if(NOT _int_rc EQUAL 0)
-                    message(FATAL_ERROR
-                        "install_name_tool failed for ${_f}: ${_int_err}")
-                endif()
-            endif()
-
-            # Install-name rewriting invalidates Mach-O signatures. Ad-hoc
-            # re-sign each file because arm64 macOS refuses to load it otherwise.
-            execute_process(COMMAND codesign --force --sign - "${_f}"
-                RESULT_VARIABLE _cs_rc ERROR_VARIABLE _cs_err)
-            if(NOT _cs_rc EQUAL 0)
-                message(FATAL_ERROR "codesign failed for ${_f}: ${_cs_err}")
-            endif()
-        endforeach()
-        # Bundle-level signature last (re-signs the main executable and seals
-        # the bundle) so the per-file signatures above stay valid beneath it.
-        execute_process(COMMAND codesign --force --sign - "${_app}"
-            RESULT_VARIABLE _cs_rc ERROR_VARIABLE _cs_err)
-        if(NOT _cs_rc EQUAL 0)
-            message(FATAL_ERROR "codesign failed for ${_app}: ${_cs_err}")
-        endif()
-    ]==] COMPONENT vc_runtime)
+    find_package(Python3 3.9 REQUIRED COMPONENTS Interpreter)
+    # The helper is run on the staged bundle, not installed into the app.
+    # Use configure_file so paths with spaces survive the install-time handoff.
+    configure_file("${CMAKE_SOURCE_DIR}/cmake/DeployMacOS.cmake.in"
+        "${CMAKE_BINARY_DIR}/DeployMacOS.cmake" @ONLY)
+    install(SCRIPT "${CMAKE_BINARY_DIR}/DeployMacOS.cmake" COMPONENT vc_runtime)
 else()
     message(WARNING "macdeployqt not found — the installed VC3D.app will not be self-contained")
 endif()

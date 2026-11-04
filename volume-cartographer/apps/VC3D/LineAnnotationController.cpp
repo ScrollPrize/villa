@@ -1,4 +1,5 @@
 #include <vc_object_store/Uuid.hpp>
+#include <vc_reader/zarr.hpp>
 #include <vc_object_store/objects/FiberJson.hpp>
 #include <vc_object_store/store/GeometryViews.hpp>
 #include <vc_object_store/objects/GeometryEdits.hpp>
@@ -11,7 +12,7 @@
 #include <vc_object_store/geometry/Geometry.hpp>
 #include "LineAnnotationController.hpp"
 #include <QTemporaryDir>
-#include "vc/core/util/AtomicFile.hpp"
+#include <vc_reader/zarr.hpp>
 #include "vc/fiber_tracer/FiberDisplay.hpp"
 
 #include "CState.hpp"
@@ -435,7 +436,7 @@ QString fiberDisplayNameFromFileName(const std::string& fileName)
 std::string datasetEntryMenuLabel(const vc::project::Entry& entry)
 {
     QString label;
-    if (!vc::project::isLocationRemote(entry.location)) {
+    if (!vcr::zarr::isRemote(entry.location)) {
         label = QFileInfo(QString::fromStdString(entry.location)).fileName();
     }
     if (label.isEmpty()) {
@@ -569,7 +570,7 @@ std::optional<FiberJsonPathOptions> showFiberJsonPathDialog(QWidget* parent,
 
 void writeJsonAtomic(const fs::path& finalPath, const nlohmann::json& root)
 {
-    vc::core::util::atomicWriteString(finalPath, root.dump(2) + '\n');
+    vcr::zarr::atomicWrite(finalPath, root.dump(2) + '\n', vcr::zarr::Durability::Fsync);
 }
 
 cv::Vec3f toVec3f(const cv::Vec3d& v);
@@ -1192,7 +1193,6 @@ void writeLineDebugJson(const std::string& eventName,
             {"converged", report->converged},
             {"normal_prefetch_calls", report->normalPrefetchCalls},
             {"ceres_solve_ms", report->ceresSolveMs},
-            {"normal_chunk_prefetch_ms", report->normalChunkPrefetchMs},
             {"normal_materialize_ms", report->normalMaterializeMs},
             {"total_ms", report->totalMs},
             {"message", report->message},
@@ -1341,7 +1341,6 @@ LineAnnotationController::OptimizationTaskResult optimizeLineWithSampler(
             }
         };
         throwIfCancelled();
-        (void)sampler.prefetchNormalSamples({task.seedPoint}, false);
         config.initialTangent = initialTangentForMode(
             directionMode,
             sourceSliceNormal,
@@ -2859,75 +2858,75 @@ LineAnnotationController::prepareAutoLinkParticipants(
 }
 
 std::optional<QString> LineAnnotationController::linkPairEligibilityError(
-    const StoredFiber& local, const StoredFiber& far) const
+    const StoredFiber& local, const StoredFiber& farFiber) const
 {
-    if (local.id == far.id) {
+    if (local.id == farFiber.id) {
         return tr("Select two different fibers.");
     }
-    if (local.readOnly || far.readOnly) {
-        return tr("%1 is read-only.").arg(fiberDisplayName(local.readOnly ? local.id : far.id));
+    if (local.readOnly || farFiber.readOnly) {
+        return tr("%1 is read-only.").arg(fiberDisplayName(local.readOnly ? local.id : farFiber.id));
     }
     return std::nullopt;
 }
 
 std::optional<QString> LineAnnotationController::linkStoredControlPoints(StoredFiber& local,
                                                                          int localControlIndex,
-                                                                         StoredFiber& far,
+                                                                         StoredFiber& farFiber,
                                                                          int farControlIndex,
                                                                          bool autoLink)
 {
     namespace la = vc3d::line_annotation;
     if (localControlIndex < 0 ||
         static_cast<size_t>(localControlIndex) >= local.controlPoints.size() ||
-        farControlIndex < 0 || static_cast<size_t>(farControlIndex) >= far.controlPoints.size()) {
+        farControlIndex < 0 || static_cast<size_t>(farControlIndex) >= farFiber.controlPoints.size()) {
         return tr("A control point index is out of range.");
     }
-    if (const auto error = linkPairEligibilityError(local, far)) {
+    if (const auto error = linkPairEligibilityError(local, farFiber)) {
         return error;
     }
     const QString localName = fiberDisplayNameFromFileName(local.fileName);
-    const QString farName = fiberDisplayNameFromFileName(far.fileName);
+    const QString farName = fiberDisplayNameFromFileName(farFiber.fileName);
     if (controlPointHasBranchLink(local.branches, static_cast<size_t>(localControlIndex))) {
         return tr("%1 / CP %2 is already linked.").arg(localName).arg(localControlIndex);
     }
-    if (controlPointHasBranchLink(far.branches, static_cast<size_t>(farControlIndex))) {
+    if (controlPointHasBranchLink(farFiber.branches, static_cast<size_t>(farControlIndex))) {
         return tr("%1 / CP %2 is already linked.").arg(farName).arg(farControlIndex);
     }
     const cv::Vec3d localPoint = local.controlPoints[static_cast<size_t>(localControlIndex)];
-    const cv::Vec3d farPoint = far.controlPoints[static_cast<size_t>(farControlIndex)];
+    const cv::Vec3d farPoint = farFiber.controlPoints[static_cast<size_t>(farControlIndex)];
     if (!finitePoint(localPoint) || !finitePoint(farPoint)) {
         return tr("Could not determine finite endpoints for the link.");
     }
     // The two fibers may be stored in different frames: the fallback
     // direction (used only where a line gives no tangent) is taken in the
     // volume's.
-    if (!fiberInVolume(local) || !fiberInVolume(far)) {
+    if (!fiberInVolume(local) || !fiberInVolume(farFiber)) {
         return tr("Bind both fibers to the active volume before linking.");
     }
     const cv::Vec3d fallbackDirection = normalizedOrZero(farPoint - localPoint);
     const cv::Vec3d localDirection =
         endpointTangentFromLinePoints(local.linePoints, localPoint, fallbackDirection);
     const cv::Vec3d farDirection =
-        endpointTangentFromLinePoints(far.linePoints, farPoint, -fallbackDirection);
+        endpointTangentFromLinePoints(farFiber.linePoints, farPoint, -fallbackDirection);
     if (!finiteDirection(localDirection) || !finiteDirection(farDirection)) {
         return tr("Could not determine finite link directions between the control points.");
     }
     const FiberBranchRef localRef = la::makeBranchRef(
-        localControlIndex, localPoint, localDirection, far.id, far.fileName, farControlIndex,
+        localControlIndex, localPoint, localDirection, farFiber.id, farFiber.fileName, farControlIndex,
         farPoint, farDirection, /*pending=*/true, /*adjacent=*/false, autoLink);
     local.branches.push_back(localRef);
-    far.branches.push_back(la::reciprocalBranchRef(localRef, local.id, local.fileName));
+    farFiber.branches.push_back(la::reciprocalBranchRef(localRef, local.id, local.fileName));
     try {
-        commitFibers({&local, &far});
+        commitFibers({&local, &farFiber});
     } catch (const std::exception& ex) {
         local.branches.pop_back();
-        far.branches.pop_back();
+        farFiber.branches.pop_back();
         return tr("Could not save linked fibers: %1").arg(QString::fromStdString(ex.what()));
     }
     invalidateFiberAlignmentMetrics(local.id, true);
-    invalidateFiberAlignmentMetrics(far.id, true);
+    invalidateFiberAlignmentMetrics(farFiber.id, true);
     refreshBranchLineViews(local.id);
-    refreshBranchLineViews(far.id);
+    refreshBranchLineViews(farFiber.id);
     return std::nullopt;
 }
 
@@ -5049,7 +5048,7 @@ LineAnnotationController::resolveAlignmentMetricsDataset()
         vc::lasagna::LasagnaDatasetOpenOptions options;
         options.workingToBaseScale = scale;
         options.remoteCacheRoot = vc3d::remoteCachePathFs();
-        const auto resolved = vc::project::isLocationRemote(location)
+        const auto resolved = vcr::zarr::isRemote(location)
             ? location
             : vc::project::resolveLocalPath(location, vpkg->path().parent_path()).string();
         return std::make_shared<vc::lasagna::LasagnaDataset>(
@@ -5896,7 +5895,7 @@ LineAnnotationController::applyGeometricControlPointEdit(
     // Purely geometric prepare: provisional display geometry only, in
     // microseconds and with NO GUI-thread chunk sampling - the freeze this
     // used to cause was up to four synchronous Ceres solves, and a residual
-    // one was the splice resampling normals through the chunk cache.
+    // one was the splice resampling normals through the volume reads.
     // Provisional normals are re-indexed/interpolated from the previous model
     // instead; the fiber-mode re-optimization the caller runs afterwards
     // rebuilds the dirty spans properly (per-span rollouts, native traces,
@@ -7518,16 +7517,16 @@ void LineAnnotationController::commitFiberMerge(StructuralEditCapture capture)
         // Planning snapshots: a session's current state where one is open
         // (its unsaved edits included), the stored record otherwise.
         const StoredFiber clicked = makeStoredFiberSessionSnapshot(*clickedSession).fiber;
-        StoredFiber far;
+        StoredFiber farFiber;
         if (farSession) {
-            far = makeStoredFiberSessionSnapshot(*farSession).fiber;
+            farFiber = makeStoredFiberSessionSnapshot(*farSession).fiber;
         } else {
             auto stored = readStoredFiber(capture.farId, true);
             if (!stored || stored->fileName != capture.farFileName) {
                 abort(tr("the merge candidate's fiber no longer exists"));
                 return;
             }
-            far = std::move(*stored);
+            farFiber = std::move(*stored);
         }
         const auto clickedIndex = matchingStoredControlPointIndex(
             clicked.controlPoints, capture.firstHint, capture.firstPoint);
@@ -7536,7 +7535,7 @@ void LineAnnotationController::commitFiberMerge(StructuralEditCapture capture)
             return;
         }
         const auto candidateIndex =
-            matchingStoredControlPointIndex(far.controlPoints, capture.farHint, capture.farPoint);
+            matchingStoredControlPointIndex(farFiber.controlPoints, capture.farHint, capture.farPoint);
         if (!candidateIndex) {
             abort(tr("the merge candidate control point no longer exists"));
             return;
@@ -7551,11 +7550,11 @@ void LineAnnotationController::commitFiberMerge(StructuralEditCapture capture)
         identity.sequence = nextFiberSequenceForUsername(identity.username);
         identity.fileName =
             la::fiberFileName(identity.username, identity.startedAt, identity.sequence);
-        identity.id = std::max(nextFiberId(), std::max(clicked.id, far.id) + 1);
+        identity.id = std::max(nextFiberId(), std::max(clicked.id, farFiber.id) + 1);
 
         auto plan = std::make_shared<la::MergePlan>();
         {
-            auto planned = la::planFiberMerge(clicked, *clickedIndex, far, *candidateIndex,
+            auto planned = la::planFiberMerge(clicked, *clickedIndex, farFiber, *candidateIndex,
                                               capture.mode, identity, &reason);
             if (!planned) {
                 abort(QString::fromStdString(reason));
@@ -7570,13 +7569,13 @@ void LineAnnotationController::commitFiberMerge(StructuralEditCapture capture)
         StructuralEditRequest request;
         request.verb = "merge";
         request.newFibers.push_back(plan->merged);
-        request.originals = {clicked, far};
+        request.originals = {clicked, farFiber};
         request.sources.push_back({clicked.id, clicked.fileName, nullptr,
                                    [plan, mergedId, mergedFileName](int index) {
                                        return la::RedirectTarget{mergedId, mergedFileName,
                                                                  plan->clickedRemap(index)};
                                    }});
-        request.sources.push_back({far.id, far.fileName, nullptr,
+        request.sources.push_back({farFiber.id, farFiber.fileName, nullptr,
                                    [plan, mergedId, mergedFileName](int index) {
                                        return la::RedirectTarget{mergedId, mergedFileName,
                                                                  plan->farRemap(index)};
@@ -7596,7 +7595,7 @@ void LineAnnotationController::commitFiberMerge(StructuralEditCapture capture)
                           .arg(QString::fromStdString(outcome.warning)),
                       capture.suppressErrors);
         }
-        Logger()->info("Merged {} and {} into {}", clicked.fileName, far.fileName, mergedFileName);
+        Logger()->info("Merged {} and {} into {}", clicked.fileName, farFiber.fileName, mergedFileName);
 
         // The re-fit yields (dataset picker, save drain): release the guard
         // first. Its outcome does not change the committed graph.
@@ -8213,7 +8212,7 @@ bool LineAnnotationController::ensureDatasetForSession(LineAnnotationSession& se
             selectedIdentity =
                 vc3d::opendata::lasagnaSourceManifestLocation(*vpkg, *selectedEntry);
         }
-        if (!vc::project::isLocationRemote(selected)) {
+        if (!vcr::zarr::isRemote(selected)) {
             manifestPath = vc::project::resolveLocalPath(selected, vpkg->path().parent_path());
         }
     } else {
@@ -8239,7 +8238,7 @@ bool LineAnnotationController::ensureDatasetForSession(LineAnnotationSession& se
         options.workingToBaseScale = workingToBaseScale;
         options.remoteCacheRoot = vc3d::remoteCachePathFs();
         const std::string resolved =
-            vc::project::isLocationRemote(location) ? location : vc::project::resolveLocalPath(location, vpkg->path().parent_path()).string();
+            vcr::zarr::isRemote(location) ? location : vc::project::resolveLocalPath(location, vpkg->path().parent_path()).string();
         return vc::lasagna::LasagnaDataset::openLocation(resolved, options);
     };
 
@@ -8446,7 +8445,7 @@ bool LineAnnotationController::ensureFiberInferenceDatasetForSession(
     }
 
     fs::path manifestPath;
-    if (!selected.empty() && !vc::project::isLocationRemote(selected)) {
+    if (!selected.empty() && !vcr::zarr::isRemote(selected)) {
         manifestPath = vc::project::resolveLocalPath(selected, vpkg->path().parent_path());
     }
     if (selected.empty()) {
@@ -8469,12 +8468,12 @@ bool LineAnnotationController::ensureFiberInferenceDatasetForSession(
         }
         selected = *picked;
         selectedIdentity = selected;
-        if (!vc::project::isLocationRemote(selected))
+        if (!vcr::zarr::isRemote(selected))
             manifestPath = vc::project::resolveLocalPath(selected, vpkg->path().parent_path());
         try {
             vc::lasagna::LasagnaDatasetOpenOptions options;
             options.remoteCacheRoot = vc3d::remoteCachePathFs();
-            const std::string resolved = vc::project::isLocationRemote(selected)
+            const std::string resolved = vcr::zarr::isRemote(selected)
                 ? selected
                 : vc::project::resolveLocalPath(
                       selected, vpkg->path().parent_path()).string();
@@ -8510,7 +8509,7 @@ bool LineAnnotationController::ensureFiberInferenceDatasetForSession(
         try {
             vc::lasagna::LasagnaDatasetOpenOptions options;
             options.remoteCacheRoot = vc3d::remoteCachePathFs();
-            const std::string resolved = vc::project::isLocationRemote(selected)
+            const std::string resolved = vcr::zarr::isRemote(selected)
                 ? selected
                 : vc::project::resolveLocalPath(
                       selected, vpkg->path().parent_path()).string();
@@ -8546,7 +8545,7 @@ bool LineAnnotationController::ensureFiberInferenceDatasetForSession(
             options.workingToBaseScale = session.fiberTraceToBaseScale;
             options.remoteCacheRoot = vc3d::remoteCachePathFs();
             const std::string normalLocation =
-                vc::project::isLocationRemote(session.selectedDatasetLocation)
+                vcr::zarr::isRemote(session.selectedDatasetLocation)
                     ? session.selectedDatasetLocation
                     : vc::project::resolveLocalPath(
                           session.selectedDatasetLocation,
@@ -9657,8 +9656,7 @@ bool LineAnnotationController::applyOptimizationTaskResult(LineAnnotationSession
         pane->dialog->activateWindow();
     }
 
-    const double prefetchPrepMs = session.optimizationReport.normalChunkPrefetchMs +
-                                  session.optimizationReport.normalMaterializeMs;
+    const double prefetchPrepMs = session.optimizationReport.normalMaterializeMs;
     Logger()->info("Line annotation Lasagna stage timing: event={} prefetch_prep_ms={:.3f} ceres_solve_ms={:.3f} overall_ms={:.3f} points={} iterations={} residuals={} converged={} prefetch_calls={}",
                    resultEvent,
                    prefetchPrepMs,
@@ -10146,11 +10144,6 @@ bool LineAnnotationController::ensureFiberFollowService(bool headless,
                            dialog, &LineAnnotationDialog::appendFiberTraceDetail);
     }
     const auto disconnectProgress = qScopeGuard([&]() { disconnect(progress); });
-    const auto volume = _state ? _state->currentVolume() : nullptr;
-    const QString volumeSource = volume && volume->isRemote()
-        ? QString::fromStdString(volume->remoteUrl()) : QString();
-    const QString volumeLocator = volume && volume->isRemote()
-        ? QString::fromStdString(volume->remoteLocator()) : QString();
     // The service start processes events: the dialog is only reached again
     // through a QPointer.
     const QPointer<LineAnnotationDialog> dialogGuard(dialog);
@@ -10158,7 +10151,7 @@ bool LineAnnotationController::ensureFiberFollowService(bool headless,
     const bool running = FiberFollowService::instance().ensureRunning(
         settings.value(vc3d::settings::line_annotation::FIBER_FOLLOW_CHECKPOINT).toString(),
         settings.value(vc3d::settings::line_annotation::FIBER_FOLLOW_PYTHON).toString(),
-        &error, volumeSource, volumeLocator);
+        &error);
     // The service start processes events while the model boots: an
     // operation that must not continue past a package switch or a teardown
     // says so here, before the dialog or the error path is touched.
@@ -11234,13 +11227,28 @@ LineAnnotationController::ensureScrollUmbilicusLoaded()
     return _scrollUmbilicus;
 }
 
+std::function<cv::Vec3f(const cv::Vec3f&)> LineAnnotationController::displayCenterReference()
+{
+    const auto umbilicus = ensureScrollUmbilicusLoaded();
+    const auto volume = _state ? _state->currentVolume() : nullptr;
+    if (!volume)
+        return {};
+    const cv::Vec3f center{float(volume->sliceWidth())*.5f, float(volume->sliceHeight())*.5f, 0.f};
+    return [umbilicus, center](const cv::Vec3f& p) {
+        if (umbilicus) {
+            try {
+                return umbilicus->vector_to_umbilicus(p);
+            } catch (...) {
+            }
+        }
+        return cv::Vec3f{center[0]-p[0], center[1]-p[1], 0.f};
+    };
+}
+
 std::vector<cv::Vec3f> LineAnnotationController::orientedLineNormalsForSession(
     const LineAnnotationSession& session)
 {
     constexpr float kNan = std::numeric_limits<float>::quiet_NaN();
-    std::vector<cv::Vec3f> normals;
-    normals.reserve(session.optimizedLine.points.size());
-
     ensureScrollUmbilicusLoaded();
 
     std::shared_ptr<Volume> volume;
@@ -11257,77 +11265,13 @@ std::vector<cv::Vec3f> LineAnnotationController::orientedLineNormalsForSession(
             static_cast<float>(volume->sliceHeight()) * 0.5f};
     }
 
-    // Pass 1: chain signs along the line. Each valid normal is aligned to
-    // the previous valid one, so a local sign flip -- whether from the field
-    // itself or from any per-point orientation test -- is structurally
-    // impossible, and the displayed frame cannot mirror mid-line.
-    cv::Vec3f previousNormal{kNan, kNan, kNan};
-    for (const auto& point : session.optimizedLine.points) {
-        const cv::Vec3d sampled = normalizedOrZero(point.sampledNormal.normal);
-        if (!point.sampledNormal.valid || !finiteDirection(sampled)) {
-            normals.push_back({kNan, kNan, kNan});
-            continue;
-        }
-        cv::Vec3f normal = toVec3f(sampled);
-        if (std::isfinite(previousNormal[0]) &&
-            normal.dot(previousNormal) < 0.0f) {
-            normal = -normal;
-        }
-        previousNormal = normal;
-        normals.push_back(normal);
-    }
-
-    // Pass 2: one global majority vote decides the whole line's sign, so a
-    // noisy or imperfect center reference cannot flip individual stretches.
-    // The reference only needs to get the hemisphere right on balance; its z
-    // component is zeroed because orientation is radial-only (z is the
-    // scroll axis).
-    // Sign convention: normals point away from the scroll center. The dialog
-    // uses them directly as the cut view's up hint, and the viewer's scene y
-    // renders downward, so this puts the fiber's center-facing surface at
-    // the top of the view.
-    double awayScore = 0.0;
-    for (size_t index = 0; index < normals.size(); ++index) {
-        if (!std::isfinite(normals[index][0])) {
-            continue;
-        }
-        const cv::Vec3f position =
-            toVec3f(session.optimizedLine.points[index].position);
-        cv::Vec3f towardCenter{kNan, kNan, kNan};
-        if (_scrollUmbilicus) {
-            try {
-                towardCenter = _scrollUmbilicus->vector_to_umbilicus(position);
-            } catch (...) {
+    return vc::lasagna::orientedLineNormals(session.optimizedLine,
+        [this, volumeCenterXY](const cv::Vec3f& position) {
+            if (_scrollUmbilicus) {
+                try { return _scrollUmbilicus->vector_to_umbilicus(position); } catch (...) {}
             }
-        }
-        if (!std::isfinite(towardCenter[0]) && std::isfinite(volumeCenterXY[0])) {
-            towardCenter = {volumeCenterXY[0] - position[0],
-                            volumeCenterXY[1] - position[1],
-                            0.0f};
-        }
-        if (!std::isfinite(towardCenter[0])) {
-            continue;
-        }
-        // Cosine-weighted vote: normalize the reference so each point's
-        // influence reflects only how well its normal aligns with the radial
-        // direction, not its distance from the center -- a few large-radius
-        // points must not outvote the rest of the line.
-        towardCenter[2] = 0.0f;
-        const float towardNorm = cv::norm(towardCenter);
-        if (!(towardNorm > 1.0e-3f)) {
-            continue;
-        }
-        awayScore -= static_cast<double>(
-            normals[index].dot(towardCenter) / towardNorm);
-    }
-    if (awayScore < 0.0) {
-        for (cv::Vec3f& normal : normals) {
-            if (std::isfinite(normal[0])) {
-                normal = -normal;
-            }
-        }
-    }
-    return normals;
+            return cv::Vec3f{volumeCenterXY[0]-position[0], volumeCenterXY[1]-position[1], 0.0f};
+        });
 }
 
 vc::fiber_tracer::FiberDisplayField LineAnnotationController::displayFieldForSession(
@@ -11649,7 +11593,6 @@ bool LineAnnotationController::materializeGeneratedViews(LineAnnotationSession& 
     if (!pane->dialog->panes().empty() && pane->dialog->panes().front().viewer) {
         camera = pane->dialog->panes().front().viewer->cameraState();
         camera.zOffset = 0.0f;
-        camera.zOffsetWorldDir = {0, 0, 0};
     }
 
     if (!pane->dialog->setGeneratedLineViews(std::move(generatedViews), camera)) {
@@ -12145,7 +12088,7 @@ LineAnnotationController::resolveFiberOptimizationInputs(
     vc::lasagna::LasagnaDatasetOpenOptions options;
     options.remoteCacheRoot = vc3d::remoteCachePathFs();
     const auto resolveLocation = [vpkg](const std::string& location) {
-        return vc::project::isLocationRemote(location)
+        return vcr::zarr::isRemote(location)
             ? location
             : vc::project::resolveLocalPath(
                   location, vpkg->path().parent_path()).string();
@@ -14001,49 +13944,7 @@ vc::lasagna::LineModel LineAnnotationController::lineModelFromPoints(
     const std::vector<cv::Vec3d>& points,
     const vc::lasagna::NormalSampler* normalSampler)
 {
-    if (points.empty()) {
-        throw std::runtime_error("Fiber has no line points");
-    }
-    if (!normalSampler) {
-        throw std::runtime_error("No Lasagna normal sampler is available for this fiber");
-    }
-
-    std::vector<vc::lasagna::NormalSampleWithDerivative> samples;
-    const vc::lasagna::NormalBatchReport batchReport =
-        normalSampler->sampleNormalBatch(points, false, samples);
-    (void)batchReport;
-    if (samples.size() != points.size()) {
-        throw std::runtime_error("Normal sampler returned the wrong number of samples");
-    }
-
-    vc::lasagna::LineModel model;
-    model.points.reserve(points.size());
-    int bestAnchor = -1;
-    double bestAnchorDistance = std::numeric_limits<double>::infinity();
-    const double center = static_cast<double>(points.size() - 1) * 0.5;
-    for (size_t i = 0; i < points.size(); ++i) {
-        vc::lasagna::LinePoint linePoint;
-        linePoint.position = points[i];
-        linePoint.sampledNormal = samples[i].sample;
-        linePoint.sampledNormal.normal = normalizedOrZero(linePoint.sampledNormal.normal);
-        linePoint.sampledNormal.valid =
-            linePoint.sampledNormal.valid &&
-            finiteDirection(linePoint.sampledNormal.normal);
-        linePoint.valid = linePoint.sampledNormal.valid;
-        if (linePoint.valid) {
-            const double distance = std::abs(static_cast<double>(i) - center);
-            if (distance < bestAnchorDistance) {
-                bestAnchorDistance = distance;
-                bestAnchor = static_cast<int>(i);
-            }
-        }
-        model.points.push_back(std::move(linePoint));
-    }
-    if (bestAnchor < 0) {
-        throw std::runtime_error("Fiber line points have no valid sampled normals");
-    }
-    model.displayFrameAnchorIndex = bestAnchor;
-    return model;
+    return vc::lasagna::lineModelFromSampledPoints(points, normalSampler);
 }
 
 

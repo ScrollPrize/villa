@@ -3,18 +3,17 @@ from __future__ import annotations
 
 import os
 import time
-from concurrent.futures import ThreadPoolExecutor, Future
-from typing import TYPE_CHECKING
 
 import numpy as np
 import torch
-import zarr
-
-if TYPE_CHECKING:
-    pass
 
 _CHUNK_SIZE = 32
 _PADDED = _CHUNK_SIZE + 2  # 34: 1 voxel margin each side
+READER_MEMORY_CACHE_BYTES = 8 << 30
+
+
+def _fmt_mib(value: int | float) -> str:
+    return f"{float(value) / 1024.0 ** 2:.1f}MiB"
 
 
 class SparseChunkGroupCache:
@@ -23,29 +22,32 @@ class SparseChunkGroupCache:
     chunk_table: int64 (cZ, cY, cX) on GPU — each entry is a device pointer
     to a uint8[C, 34, 34, 34] padded chunk, or 0 if not loaded.
 
-    Chunks are allocated in batches on GPU as needed. No fixed capacity limit —
-    memory grows until GPU OOM.
+    prefetch() records the chunks a sampling step will need; sync() reads them
+    with one batched call to the opened ZarrReader (in parallel, sharing the
+    store chunks they overlap) and uploads them. Chunks are allocated in
+    batches on GPU as needed. No fixed capacity limit — memory grows until GPU OOM.
     """
 
     def __init__(
         self,
         *,
         channels: list[str],
-        zarr_path: str,
+        reader,
         vol_shape_zyx: tuple[int, int, int],
         channel_indices: dict[str, int],
         is_3d_zarr: bool,
         device: torch.device,
-        n_workers: int = 8,
     ) -> None:
+        if reader.dtype != np.uint8:
+            raise ValueError(f"sparse sampling needs a uint8 array, {reader.location} is {reader.dtype}")
         self.channels = channels
-        self.zarr_path = zarr_path
+        self.reader = reader
         self.n_channels = len(channels)
-        self.vol_shape_zyx = vol_shape_zyx
+        self.vol_shape_zyx = tuple(int(v) for v in vol_shape_zyx)
         self.channel_indices = channel_indices  # channel_name -> index in zarr C dim
-        self.is_3d_zarr = is_3d_zarr
+        self.is_3d_zarr = bool(is_3d_zarr)
         self.device = device
-        Z, Y, X = vol_shape_zyx
+        Z, Y, X = self.vol_shape_zyx
         self.chunk_grid = (
             (Z + _CHUNK_SIZE - 1) // _CHUNK_SIZE,
             (Y + _CHUNK_SIZE - 1) // _CHUNK_SIZE,
@@ -56,13 +58,7 @@ class SparseChunkGroupCache:
         # GPU storage: chunk_table stores device pointers (0 = empty)
         self.chunk_table = torch.zeros(cZ, cY, cX, dtype=torch.int64, device=device)
         self._batches: list[torch.Tensor] = []  # keep alive to prevent GC
-
-        # Zarr handle kept open
-        self._zarr = zarr.open(zarr_path, mode="r")
-
-        # Background loader
-        self._executor = ThreadPoolExecutor(max_workers=n_workers)
-        self._pending: list[Future] = []
+        self._pending: dict[tuple[int, int, int], None] = {}  # in request order
         self._transfer_stream = torch.cuda.Stream(device=device)
 
         # Stats: accumulated over entire optimization
@@ -73,118 +69,71 @@ class SparseChunkGroupCache:
 
         table_mib = cZ * cY * cX * 8 / 1024**2
         print(f"[sparse_cache] {','.join(channels)}: chunk_grid={cZ}x{cY}x{cX} "
-              f"vol={Z}x{Y}x{X} table={table_mib:.1f}MiB "
-              f"prefetch=cuda", flush=True)
+              f"vol={Z}x{Y}x{X} table={table_mib:.1f}MiB", flush=True)
 
     def prefetch(self, xyz_fullres: torch.Tensor, origin: tuple[float, float, float],
                  spacing: tuple[float, float, float]) -> None:
-        """Start async loading of chunks needed for given sample positions.
+        """Record the chunks needed for given sample positions; sync() loads them.
 
         xyz_fullres: (..., 3) float32 GPU — sample positions in fullres coords.
         """
-        coords = self._missing_chunk_coords(xyz_fullres, origin, spacing)
-        if coords.numel() == 0:
-            return
-        n_missing = coords.shape[0]
-
-        # Submit reads to thread pool
-        for i in range(n_missing):
-            cz, cy, cx = int(coords[i, 0]), int(coords[i, 1]), int(coords[i, 2])
-            fut = self._executor.submit(self._load_chunk, cz, cy, cx)
-            self._pending.append(fut)
-
-    def _missing_chunk_coords(self, xyz_fullres: torch.Tensor,
-                              origin: tuple[float, float, float],
-                              spacing: tuple[float, float, float]) -> torch.Tensor:
-        """Return CPU int64 (N, 3) missing chunk coordinates as (cz, cy, cx)."""
-        cZ, cY, cX = self.chunk_grid
         dev = xyz_fullres.device
         origin_t = torch.tensor(origin, dtype=torch.float32, device=dev)
         spacing_t = torch.tensor(spacing, dtype=torch.float32, device=dev)
 
         with torch.no_grad():
             from sparse_prefetch_chunks import missing_chunks
-            return missing_chunks(
-                xyz_fullres, self.chunk_table, origin_t, spacing_t).cpu()
+            coords = missing_chunks(xyz_fullres, self.chunk_table, origin_t, spacing_t).cpu()
+        self._pending.update(dict.fromkeys(tuple(int(v) for v in row) for row in coords.tolist()))
 
-    def _load_chunk(self, cz: int, cy: int, cx: int) -> tuple[int, int, int, np.ndarray]:
-        """Read a 34³ padded chunk from zarr. Runs in thread pool."""
-        Z, Y, X = self.vol_shape_zyx
-        C = self.n_channels
-
-        # Global voxel range with 1-voxel margin
-        gz0 = cz * _CHUNK_SIZE - 1
-        gy0 = cy * _CHUNK_SIZE - 1
-        gx0 = cx * _CHUNK_SIZE - 1
-
-        # Clamp to volume bounds
-        rz0 = max(0, gz0)
-        ry0 = max(0, gy0)
-        rx0 = max(0, gx0)
-        rz1 = min(Z, gz0 + _PADDED)
-        ry1 = min(Y, gy0 + _PADDED)
-        rx1 = min(X, gx0 + _PADDED)
-
-        buf = np.zeros((C, _PADDED, _PADDED, _PADDED), dtype=np.uint8)
-
-        if rz1 > rz0 and ry1 > ry0 and rx1 > rx0:
-            # Destination slice in buf
-            dz0 = rz0 - gz0
-            dy0 = ry0 - gy0
-            dx0 = rx0 - gx0
-            dz1 = dz0 + (rz1 - rz0)
-            dy1 = dy0 + (ry1 - ry0)
-            dx1 = dx0 + (rx1 - rx0)
-
-            if self.is_3d_zarr:
-                # 3D zarr: (Z, Y, X) — one channel at index 0
-                data = np.asarray(self._zarr[rz0:rz1, ry0:ry1, rx0:rx1])
-                buf[0, dz0:dz1, dy0:dy1, dx0:dx1] = data
-            else:
-                # 4D zarr: (C_zarr, Z, Y, X) — read specific channels
-                for ch_name, ch_idx in self.channel_indices.items():
-                    i = self.channels.index(ch_name)
-                    data = np.asarray(self._zarr[ch_idx, rz0:rz1, ry0:ry1, rx0:rx1])
-                    buf[i, dz0:dz1, dy0:dy1, dx0:dx1] = data
-
-        return (cz, cy, cx, buf)
+    def _regions(self, coord: tuple[int, int, int], chunk: np.ndarray) -> list[tuple]:
+        """(start, size, destination) reads filling one (C, 34, 34, 34) padded chunk."""
+        start = tuple(c * _CHUNK_SIZE - 1 for c in coord)
+        if self.is_3d_zarr:
+            # 3D zarr: (Z, Y, X) — one channel at index 0
+            return [(start, (_PADDED,) * 3, chunk[0])]
+        # 4D zarr: (C_zarr, Z, Y, X) — read specific channels
+        return [
+            ((int(self.channel_indices[name]), *start), (1, *(_PADDED,) * 3), chunk[i:i + 1])
+            for i, name in enumerate(self.channels)
+        ]
 
     def sync(self) -> None:
-        """Wait for pending chunk loads, batch-transfer to GPU, update chunk_table."""
+        """Read pending chunks, batch-transfer to GPU, update chunk_table."""
         if not self._pending:
             self._last_sync_new = 0
             return
 
         t0 = time.perf_counter()
-        results = [f.result() for f in self._pending]
-        self._pending.clear()
-
-        n = len(results)
+        coords = list(self._pending)
+        self._pending = {}
+        n = len(coords)
         C = self.n_channels
+        chunk_bytes = C * _PADDED**3  # bytes per chunk
+        try:
+            # Read straight into a pinned CPU tensor for efficient transfer
+            cpu_batch = torch.empty(n, C, _PADDED, _PADDED, _PADDED, dtype=torch.uint8,
+                                    pin_memory=True)
+            buffers = cpu_batch.numpy()
+            reads = [read for i, coord in enumerate(coords) for read in self._regions(coord, buffers[i])]
+            self.reader.read_regions([read[:2] for read in reads], out=[read[2] for read in reads])
 
-        # Stack into pinned CPU tensor for efficient transfer
-        cpu_batch = torch.empty(n, C, _PADDED, _PADDED, _PADDED, dtype=torch.uint8,
-                                pin_memory=True)
-        coords_list = []
-        for i, (cz, cy, cx, buf) in enumerate(results):
-            cpu_batch[i] = torch.from_numpy(buf)
-            coords_list.append((cz, cy, cx))
-
-        # Batch transfer to GPU
-        with torch.cuda.stream(self._transfer_stream):
-            gpu_batch = cpu_batch.to(self.device, non_blocking=True)
-
-        self._transfer_stream.synchronize()
+            # Batch transfer to GPU
+            with torch.cuda.stream(self._transfer_stream):
+                gpu_batch = cpu_batch.to(self.device, non_blocking=True)
+            self._transfer_stream.synchronize()
+        except torch.OutOfMemoryError:
+            print(f"[sparse_cache_oom] sync: pending_chunks={n} pending={_fmt_mib(n * chunk_bytes)} "
+                  f"{self.cache_diagnostics()}", flush=True)
+            raise
 
         # Store batch to prevent GC
         self._batches.append(gpu_batch)
 
         # Update chunk_table with device pointers
-        chunk_bytes = C * _PADDED * _PADDED * _PADDED  # bytes per chunk
         base_ptr = gpu_batch.data_ptr()
-        for i, (cz, cy, cx) in enumerate(coords_list):
-            ptr = base_ptr + i * chunk_bytes
-            self.chunk_table[cz, cy, cx] = ptr
+        for i, (cz, cy, cx) in enumerate(coords):
+            self.chunk_table[cz, cy, cx] = base_ptr + i * chunk_bytes
 
         dt_ms = (time.perf_counter() - t0) * 1000.0
         self._last_sync_new = n
@@ -207,6 +156,19 @@ class SparseChunkGroupCache:
         print(f"[sparse_cache] {','.join(self.channels)}: "
               f"{n} chunks in {its}it ({ms_per_it:.1f}ms/it, {ms_per_chunk:.1f}ms/chunk) "
               f"total={total} ({total_mib:.1f}MiB)", flush=True)
+
+    def cache_diagnostics(self) -> str:
+        """One line about GPU memory held by this cache, for out-of-memory reports."""
+        table_bytes = self.chunk_table.numel() * self.chunk_table.element_size()
+        batch_bytes = sum(t.numel() * t.element_size() for t in self._batches)
+        return (
+            f"channels={','.join(self.channels)} device={self.device} "
+            f"chunk_grid={self.chunk_grid[0]}x{self.chunk_grid[1]}x{self.chunk_grid[2]} "
+            f"loaded_chunks_tracked={self._total_new_chunks} "
+            f"last_sync_new={self._last_sync_new} pending_chunks={len(self._pending)} "
+            f"batches={len(self._batches)} table={_fmt_mib(table_bytes)} "
+            f"batch_gpu={_fmt_mib(batch_bytes)}"
+        )
 
     def grid_sample(self, xyz_fullres: torch.Tensor, origin: torch.Tensor,
                     inv_scale: torch.Tensor, *, diff: bool = False,

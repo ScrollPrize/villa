@@ -123,7 +123,7 @@ def main(argv=None):
                                 batch_builder=builder, onpolicy=caches)
         if caches:
             dataset.set_step(int(caches[0].provenance['step']))
-        plans = dataset._iter_plans(None, [])
+        plans = dataset._iter_plans([])
         items = [item for _ in range(args.batches) for item in next(plans)]
         summary = summarize(items, fibers)
         if caches:

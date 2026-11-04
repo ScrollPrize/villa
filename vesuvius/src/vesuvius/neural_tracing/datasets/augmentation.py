@@ -4,6 +4,8 @@ from typing import Any, Callable
 
 import torch
 
+from vesuvius.models.augmentation.pipelines import sample_seed
+
 
 def augment_triplet_payload(
     *,
@@ -36,7 +38,7 @@ def augment_triplet_payload(
     if cond_surface_keypoints is not None:
         aug_kwargs["keypoints"] = cond_surface_keypoints
 
-    augmented = augmentations(**aug_kwargs)
+    augmented = augmentations(aug_kwargs, seed=sample_seed(0))
     vol_crop = augmented["image"].squeeze(0)
     cond_seg_gt = augmented["segmentation"][0]
     behind_seg = augmented["segmentation"][1]
@@ -114,7 +116,7 @@ def augment_split_payload(
     if keypoint_parts:
         aug_kwargs["keypoints"] = torch.cat(keypoint_parts, dim=0)
 
-    augmented = augmentations(**aug_kwargs)
+    augmented = augmentations(aug_kwargs, seed=sample_seed(0))
     vol_crop = augmented["image"].squeeze(0)
 
     unpacked = {}

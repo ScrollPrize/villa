@@ -132,6 +132,9 @@ public:
     SurfaceCatalog* catalog() const { return _catalog; }
     // The surface last opened by activation, pinned at the revisions it was read from.
     const std::optional<SurfaceCatalog::Opened>& opened() const { return _opened; }
+    // Replace the selected surface's materialization after a working-level
+    // change, without firing the user-selection/recenter path.
+    void replaceOpenedSurface(SurfaceCatalog::Opened opened);
     // Surfaces the filters show that can be drawn in the current volume.
     const std::vector<std::string>& visibleSurfaceIds() const { return _visibleSurfaceIds; }
 
@@ -149,15 +152,7 @@ signals:
     void visLasagnaObjRequested(const QString& segmentId);
     void cropBoundsRequested(const QString& segmentId);
     void slimFlattenRequested(const QString& segmentId);
-    void straightenRequested(const QString& segmentId);
     void alphaCompRefineRequested(const QString& segmentId);
-    void rasterizeSegmentsRequested(const QStringList& segmentIds);
-    void mergeSurfacesRequested(const QStringList& segmentIds);
-    // Emitted when the user right-clicks two selected segments and picks
-    // "Patch surface...". CWindow wires this to
-    // SegmentationCommandHandler::onMergePatch.
-    void mergePatchRequested(const QStringList& segmentIds);
-    void addIgnoreLabelRequested();
     void statusMessageRequested(const QString& message, int timeoutMs);
     void resumeLocalGrowPatchRequested(const QString& segmentId);
     void neighborCopyRequested(const QString& segmentId, bool copyOut);

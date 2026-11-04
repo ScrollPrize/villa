@@ -1,7 +1,7 @@
 #pragma once
 #include "vc_object_store/object_links/ObjectLinks.hpp"
 #include "geometry/GeometrySnapshot.hpp"
-#include "spatial/SurfaceGrid.hpp"
+#include <vc_object_store/geometry/SurfaceGrid.hpp>
 #include <map>
 #include <memory>
 

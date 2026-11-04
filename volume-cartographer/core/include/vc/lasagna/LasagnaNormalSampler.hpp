@@ -18,10 +18,11 @@ namespace vc::lasagna
 
 void validateLasagnaNormalDatasetStructure(const LasagnaDataset& dataset);
 
-// Compatibility overload: an explicit budget now applies to the shared process
-// cache, rather than creating a second independently budgeted channel cache.
+// The memory cache of the sampler's channel arrays: `memoryCache` when set (one
+// cache shared with other readers), else a new cache of maxCachedBytes.
 struct LasagnaNormalSamplerOptions {
     size_t maxCachedBytes = 512ULL * 1024ULL * 1024ULL;
+    std::shared_ptr<vcr::MemoryCache> memoryCache;
 };
 
 class LasagnaNormalSampler final : public NormalSampler
@@ -44,7 +45,6 @@ public:
     [[nodiscard]] bool supportsConcurrentSampling() const noexcept override { return true; }
     [[nodiscard]] bool masksInvalidCorners() const noexcept;
     [[nodiscard]] std::array<LasagnaChannelBinding,3> regionChannels() const; // grad_mag,nx,ny
-    void pinRegion(vc::render::PinnedChunkRegion&, const cv::Vec3d& lo, const cv::Vec3d& hi) const;
     [[nodiscard]] NormalSample sampleNormal(const cv::Vec3d& volumePoint) const override;
     [[nodiscard]] std::optional<double> sampleWindingDensity(const cv::Vec3d& volumePoint) const;
     [[nodiscard]] double windingDistance(const cv::Vec3d& a, const cv::Vec3d& b, double stepVx = 8.0) const;
@@ -54,19 +54,17 @@ public:
         const std::vector<std::pair<cv::Vec3d, cv::Vec3d>>& connectors,
         double stepVx = 8.0, int parallelThreads = 0) const;
     [[nodiscard]] NormalSampleWithDerivative sampleNormalWithDerivative(const cv::Vec3d& volumePoint) const override;
-    [[nodiscard]] NormalPrefetchReport prefetchNormalSamples(const std::vector<cv::Vec3d>& volumePoints, bool withDerivative) const override;
     [[nodiscard]] NormalBatchReport sampleNormalBatch(
         const std::vector<cv::Vec3d>& volumePoints, bool withDerivative, std::vector<NormalSampleWithDerivative>& samples) const override;
     [[nodiscard]] NormalBatchReport sampleNormalBatch(
         const std::vector<cv::Vec3d>& volumePoints, bool withDerivative, int parallelThreads, std::vector<NormalSampleWithDerivative>& samples) const override;
-    [[nodiscard]] NormalBatchReport sampleNormalBatch(const std::vector<cv::Vec3f>& volumePoints, int parallelThreads, std::vector<FloatNormalSample>& samples) const;
-    // Reuse decoded chunks across points, preserving sampleNormal arithmetic.
+    // Reuses chunks across points, preserving sampleNormal's arithmetic.
     [[nodiscard]] NormalBatchReport sampleNormalBatchScalarEquivalent(
         const std::vector<cv::Vec3d>& volumePoints, int parallelThreads,
         std::vector<NormalSampleWithDerivative>& samples) const;
-    [[nodiscard]] std::array<const LasagnaChannelCornerSampler*, 3> groupedCornerSamplers() const noexcept;
-    void materializeGroupedCorners(
-        const std::vector<std::vector<LasagnaCornerSample>>& corners, size_t firstVolume, int parallelThreads, std::vector<FloatNormalSample>& samples) const;
+    [[nodiscard]] NormalBatchReport sampleNormalBatch(const std::vector<cv::Vec3f>& volumePoints, int parallelThreads, std::vector<FloatNormalSample>& samples) const;
+    // grad_mag, nx and ny when they share one sampling grid (corner batches), else null.
+    [[nodiscard]] std::array<const LasagnaChannelBinding*, 3> groupedCornerBindings() const noexcept;
     void materializeGroupedCorners(const LasagnaCornerBatch& corners, size_t firstVolume, int parallelThreads, std::vector<FloatNormalSample>& samples) const;
 
 private:

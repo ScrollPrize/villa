@@ -1,6 +1,6 @@
 #include "vc/lasagna/LaplaceRank.hpp"
 
-#include "vc/core/util/Tiff.hpp"
+#include <vc_reader/image_write.hpp>
 #include "vc/lasagna/LaplaceAmgx.hpp"
 
 #include <algorithm>
@@ -300,7 +300,12 @@ void overlayYZ(cv::Mat& image, const MaxflowPredDtVolume& pred, const MaxflowInt
 
 void writeDebugTiff(const std::filesystem::path& path, const cv::Mat& image)
 {
-    writeTiff(path, image, CV_8UC1, 0, 0);
+    const cv::Mat bytes = [&] {
+        cv::Mat converted;
+        image.convertTo(converted, CV_8UC1);
+        return converted.isContinuous() ? converted : converted.clone();
+    }();
+    vcr::sources::writeTiff(path, bytes.data, "|u1", bytes.rows, bytes.cols);
 }
 
 void overlayAll(

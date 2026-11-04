@@ -11,7 +11,7 @@ import pytest
 import torch
 from torch import nn
 from torch._dynamo.exc import BackendCompilerFailed
-import zarr
+from vc_reader.reader import create_group
 
 from vesuvius.ink_detection.models.checkpoint import (
     config_from_checkpoint,
@@ -38,14 +38,10 @@ import os
 import sys
 import vesuvius
 os.environ.pop('OPENCV_IO_MAX_IMAGE_PIXELS', None)
-for name in tuple(sys.modules):
-    if name == 'vesuvius.tifxyz' or name.startswith('vesuvius.tifxyz.'):
-        sys.modules.pop(name)
 before = mp.get_start_method(allow_none=True)
 import vesuvius.ink_detection.inference.infer
 assert os.environ.get('OPENCV_IO_MAX_IMAGE_PIXELS') is None
 assert mp.get_start_method(allow_none=True) == before
-assert 'vesuvius.tifxyz.reader' not in sys.modules
 """
     environment = os.environ.copy()
     source_root = Path(__file__).parents[2] / "src"
@@ -147,6 +143,44 @@ class _BackendThatFailsWhenItRuns(nn.Module):
         )
 
 
+def test_device_cpu_is_honoured_even_when_an_accelerator_exists(monkeypatch):
+    from vesuvius.ink_detection.inference import inference_runtime
+
+    def accelerator_must_not_be_asked():
+        raise AssertionError("--device cpu must not ask get_accelerator()")
+
+    monkeypatch.setattr(inference_runtime, "get_accelerator", accelerator_must_not_be_asked)
+
+    _, device = prepare_model_for_inference(
+        nn.Linear(1, 1),
+        gpu_ids=(),
+        compile_model=False,
+        compile_mode="default",
+        device_type="cpu",
+    )
+
+    assert device == torch.device("cpu")
+
+
+def test_device_rejects_unavailable_backends_and_conflicting_requests(monkeypatch):
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    monkeypatch.setattr(torch.backends.mps, "is_available", lambda: False)
+
+    def prepare(**kwargs):
+        return prepare_model_for_inference(
+            nn.Linear(1, 1), compile_model=False, compile_mode="default", **kwargs
+        )
+
+    with pytest.raises(ValueError, match="MPS is unavailable"):
+        prepare(gpu_ids=(), device_type="mps")
+    with pytest.raises(ValueError, match="CUDA is unavailable"):
+        prepare(gpu_ids=(), device_type="cuda")
+    with pytest.raises(ValueError, match="cannot be combined with --device cpu"):
+        prepare(gpu_ids=(0,), device_type="cpu")
+    with pytest.raises(ValueError, match="--device must be one of"):
+        prepare(gpu_ids=(), device_type="tpu")
+
+
 def test_compile_falls_back_when_the_backend_fails_on_the_first_forward(monkeypatch, caplog):
     """torch.compile returns lazily, so a broken backend raises at the first call."""
 
@@ -208,14 +242,9 @@ def test_compile_wrapper_keeps_module_behaviour(monkeypatch):
 
 def test_root_volume_view_and_level_selection_share_one_open(tmp_path):
     root_path = tmp_path / "pyramid.zarr"
-    kwargs = {"mode": "w"}
-    zarr3 = int(zarr.__version__.split(".", 1)[0]) >= 3
-    if zarr3:
-        kwargs["zarr_format"] = 2
-    root = zarr.open_group(root_path, **kwargs)
-    create = root.create_array if zarr3 else root.create_dataset
-    create("0", shape=(3, 4, 5), chunks=(3, 4, 5), dtype="u1")
-    create("3", shape=(1, 1, 1), chunks=(1, 1, 1), dtype="u1")
+    root = create_group(root_path)
+    root.create_array("0", shape=(3, 4, 5), chunks=(3, 4, 5), dtype="u1")
+    root.create_array("3", shape=(1, 1, 1), chunks=(1, 1, 1), dtype="u1")
 
     opened = open_volume_root(root_path)
 

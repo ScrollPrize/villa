@@ -1,12 +1,15 @@
 #include "catalog/Catalog.hpp"
 #include "formats/GeometryInput.hpp"
 #include "formats/RemoteSource.hpp"
+#include "geometry/ArrayLayout.hpp"
 #include <vc_reader/native/http.hpp>
 #include <fstream>
 #include "vc_object_store/objects/GeometryCoordinates.hpp"
 #include "vc_object_store/Uuid.hpp"
 #include <nlohmann/json.hpp>
 #include <algorithm>
+#include <cmath>
+#include <cstring>
 
 namespace vc::objects {
 namespace {
@@ -55,6 +58,33 @@ ObjectRecord placeholder(const vcr::catalog::OpenDataSample& sample, const vcr::
     }
     record.surface = detail;
     return record;
+}
+
+// A surface authored in a downscaled level has its coordinates in that level's voxels, and
+// a level's voxel is centred on the block it reduces: voxel v of a level at factor f lies at
+// f * v + (f - 1) / 2 in the volume, while the store maps stored coordinates by scale alone.
+// Shift the valid vertices so that scale alone lands them where they were drawn; invalid
+// vertices keep their stored values.
+void centreOnReducedBlocks(GeometryData& geometry, double unitsPerVoxel)
+{
+    if (!(unitsPerVoxel > 0) || unitsPerVoxel >= 1) return;
+    const float shift = float((1.0 - unitsPerVoxel) / 2.0);
+    const auto points = std::find_if(geometry.arrays.begin(), geometry.arrays.end(),
+                                     [](const GeometryArray& array) { return array.name == "points"; });
+    if (points == geometry.arrays.end()) return;
+    const auto valid = std::find_if(geometry.arrays.begin(), geometry.arrays.end(),
+                                    [](const GeometryArray& array) { return array.name == detail::surfaceValidChannel; });
+    const std::size_t count = points->bytes.size() / (3 * sizeof(float));
+    for (std::size_t i = 0; i < count; ++i) {
+        float xyz[3];
+        std::memcpy(xyz, points->bytes.data() + i * sizeof(xyz), sizeof(xyz));
+        const bool sentinel = xyz[0] == -1.f && xyz[1] == -1.f && xyz[2] == -1.f;
+        if (sentinel || !std::isfinite(xyz[0]) || !std::isfinite(xyz[1]) || !std::isfinite(xyz[2]) ||
+            (valid != geometry.arrays.end() && !valid->bytes[i]))
+            continue;
+        for (auto& component : xyz) component += shift;
+        std::memcpy(points->bytes.data() + i * sizeof(xyz), xyz, sizeof(xyz));
+    }
 }
 
 // Fetches record their geometry head separately from user revisions. Old stores
@@ -208,6 +238,9 @@ void fetchCatalogSurface(ObjectStore& db, const std::string& uuid, const ObjectS
     } catch (...) { std::error_code ignored; fs::remove_all(staging, ignored); throw; }
     std::error_code ignored;
     fs::remove_all(staging, ignored);
+    const auto coordinates = Json::parse(record->meta.empty() ? std::string("{}") : record->meta).value("coordinates", Json::object());
+    if (const auto scale = coordinates.find("scale_factor"); scale != coordinates.end() && scale->is_number())
+        centreOnReducedBlocks(prepared.geometry, scale->get<double>());
     // Only the geometry is taken; the published meta.json is not the record.
     auto attributes = Json::parse(prepared.geometry.attributes);
     attributes["source_url"] = reference->url;

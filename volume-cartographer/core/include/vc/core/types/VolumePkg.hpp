@@ -11,7 +11,7 @@
 #include <string_view>
 #include <vector>
 
-#include "utils/Json.hpp"
+#include <nlohmann/json.hpp>
 #include "vc/core/util/Rect3D.hpp"
 
 #include "vc/core/types/ProjectDocument.hpp"
@@ -47,7 +47,6 @@ struct LoadOptions {
     std::shared_ptr<const vcr::catalog::OpenDataManifest> catalog;
 };
 
-bool isLocationRemote(const std::string& location);
 std::filesystem::path resolveLocalPath(const std::string& location,
                                        const std::filesystem::path& base = {});
 
@@ -60,7 +59,7 @@ std::optional<vcr::catalog::OpenDataVolumeView> catalogVolumeView(const vcr::cat
 // The volume metadata (uuid, voxelsize, name) a catalog gives a location: the
 // catalog volume's ID at every level and the voxel size of the opened grid.
 // Empty for other locations.
-utils::Json catalogVolumeMetadata(const vcr::catalog::OpenDataManifest*, const std::string& location);
+nlohmann::json catalogVolumeMetadata(const vcr::catalog::OpenDataManifest*, const std::string& location);
 
 // The open volume's voxels in the store: those of the volume objects made on it
 // are kept in (the catalog volume it shows, so every working level and derived
@@ -169,8 +168,6 @@ public:
     [[nodiscard]] bool hasLoadedVolumeEntry(const std::string& location) const;
     std::shared_ptr<Volume> volume() const;
     std::shared_ptr<Volume> volume(const std::string& id) const;
-    bool addSingleVolume(const std::string& volumeDirName);
-    bool removeSingleVolume(const std::string& volumeIdOrDirName);
 
     [[nodiscard]] std::vector<std::filesystem::path> normalGridPaths() const;
 

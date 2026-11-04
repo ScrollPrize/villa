@@ -163,9 +163,7 @@ class FiberTrace3DLoadFactory:
         )
         config = _pipeline_config(self.config_path)
         if self.single_core and getattr(config, "_array_records", None) is None:
-            from .cooperative_resources import initialize_worker_volume_cache
-            initialize_worker_volume_cache({"volume_cache_memory_mib": config.volume_cache_memory_mib})
-            config = replace(config, volume_io_threads=1, volume_decode_threads=1, volume_sample_threads=1)
+            config = replace(config, volume_io_threads=1)
         return FiberTrace3DLoadOperation(
             FiberTrace3DLoader(config),
             self.sample_index_limit,

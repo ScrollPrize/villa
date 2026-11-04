@@ -36,7 +36,6 @@ public:
 
     void setCollection(VCCollection* collection);
     void setViewTolerance(double tolerance);
-    [[nodiscard]] double viewTolerance() const { return _viewTolerance; }
     void setCoordinateScale(double scale);
     void setHiddenCollectionIds(const QSet<qulonglong>& ids);
     void setVisible(bool visible);

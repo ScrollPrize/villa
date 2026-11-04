@@ -1,14 +1,13 @@
 from typing import Dict, List, Tuple
 import numpy as np
 import torch
-import cc3d
+from vc_reader.geometry import label_components
 
 from .base_metric import BaseMetric
 
 
 def _label_components(mask: np.ndarray, connectivity: int) -> np.ndarray:
-    # cc3d supports 2D and 3D arrays
-    return cc3d.connected_components(mask.astype(np.uint8), connectivity=connectivity)
+    return label_components(mask, connectivity=connectivity)[0]
 
 
 def _compute_iou_matrix(gt_cc: np.ndarray, pred_cc: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:

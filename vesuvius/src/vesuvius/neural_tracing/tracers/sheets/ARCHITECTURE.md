@@ -317,8 +317,7 @@ threshold.
 
 * Scroll 1 (PHercParis4): two directories, on `s1_ds2`;
 * `fiber_ft` also uses `cut_windings`, resampled to square grids (`scripts/resample_isotropic.py`);
-* the registered segments of PHerc0139 and PHerc1667, on their own volumes at 9.6 um (`scripts/prepare_scroll.py`,
-  `data.patch_volumes`), masked where they leave the scan. The middle 20% of each scroll's z extent is held out.
+* the registered segments of PHerc0139 and PHerc1667, on their own volumes at 9.6 um (`data.patch_volumes`), masked where they leave the scan. The middle 20% of each scroll's z extent is held out.
 
 `data.dir_weights` sets each directory's share of the sampling weight. Within a directory, patches are sampled with
 weight `valid_nodes^0.5`. The patch index measures each patch's node spacing and uses it instead of `meta.json`'s

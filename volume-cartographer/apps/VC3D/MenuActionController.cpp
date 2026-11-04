@@ -1,4 +1,6 @@
 #include "MenuActionController.hpp"
+#include <vc_reader/zarr.hpp>
+#include "OpenedVolumes.hpp"
 #include <vc_object_store/Uuid.hpp>
 
 #include "VolumeAttachmentController.hpp"
@@ -9,7 +11,6 @@
 #include "OpenDataNormalGrids.hpp"
 #include "OpenDataSampleProject.hpp"
 #include "ProjectCreationDefaults.hpp"
-#include "OpenDataVolumePrefill.hpp"
 #include "CWindow.hpp"
 #include "SurfaceCatalog.hpp"
 #include "SurfacePanelController.hpp"
@@ -22,7 +23,6 @@
 #include "segmentation/SegmentationModule.hpp"
 #include "ui_VCMain.h"
 #include "Keybinds.hpp"
-#include "FileWatcherService.hpp"
 #include "LineAnnotationController.hpp"
 #include "LineAnnotationFiberNaming.hpp"
 
@@ -32,7 +32,6 @@
 #include "vc/core/util/Logging.hpp"
 #include "vc_object_store/objects/Hub.hpp"
 #include "vc/core/util/LoadJson.hpp"
-#include "vc/core/util/RemoteMetadataCache.hpp"
 #include <vc_object_store/objects/UmbilicusFile.hpp>
 #include "BindCoordinatesPrompt.hpp"
 #include <vc_object_store/objects/GeometryCoordinates.hpp>
@@ -89,7 +88,7 @@
 #include <QHBoxLayout>
 #include <QPushButton>
 
-#include "utils/Json.hpp"
+#include <nlohmann/json.hpp>
 
 #include <algorithm>
 #include <fstream>
@@ -101,8 +100,6 @@
 namespace
 {
 constexpr int kMaxStoredRemoteUrls = 10;
-bool isAuthError(const QString& msg);
-
 } // namespace
 
 // Kept local so the QtConcurrent result type does not leak into the header.
@@ -217,13 +214,7 @@ void MenuActionController::populateMenus(QMenuBar* menuBar)
     _rotateSurfaceAct = new QAction(QObject::tr("Rotate"), this);
     connect(_rotateSurfaceAct, &QAction::triggered, this, &MenuActionController::beginRotateSurfaceTransform);
 
-    _mergeSurfacesAct = new QAction(QObject::tr("Merge Surfaces..."), this);
-    connect(_mergeSurfacesAct, &QAction::triggered,
-            this, &MenuActionController::mergeSurfacesFromMenuRequested);
 
-    _mergePatchAct = new QAction(QObject::tr("Patch Surface..."), this);
-    connect(_mergePatchAct, &QAction::triggered,
-            this, &MenuActionController::mergePatchFromMenuRequested);
 
     _growTrackPatchesAct = new QAction(QObject::tr("Grow Track Patches..."), this);
     connect(_growTrackPatchesAct, &QAction::triggered,
@@ -282,8 +273,6 @@ void MenuActionController::populateMenus(QMenuBar* menuBar)
     _actionsMenu->addAction(_drawBBoxAct);
     _actionsMenu->addSeparator();
     _actionsMenu->addSeparator();
-    _actionsMenu->addAction(_mergeSurfacesAct);
-    _actionsMenu->addAction(_mergePatchAct);
     _actionsMenu->addAction(_growTrackPatchesAct);
     _actionsMenu->addSeparator();
     _transformsMenu = new QMenu(QObject::tr("&Transforms"), _actionsMenu);
@@ -485,7 +474,7 @@ void MenuActionController::showAttachRemoteZarrDialog(const QString& initialUrl)
     if (url.trimmed().isEmpty()) {
         return;
     }
-    if (!vc::project::isLocationRemote(url.toStdString())) {
+    if (!vcr::zarr::isRemote(url.toStdString())) {
         QMessageBox::warning(_window, QObject::tr("Attach failed"),
             QObject::tr("Select a remote volume, or use Attach Volume for a local one."));
         return;
@@ -526,11 +515,13 @@ void MenuActionController::showOpenDataCatalog()
     dialog->setRefreshSampleHandler([this](const vcr::catalog::OpenDataSample& sample) -> QString {
         if (!_window || !_window->_state) return tr("No viewer state.");
         QApplication::setOverrideCursor(Qt::WaitCursor);
-        // Volume metadata is cached as immutable; a refresh is how a sample
+        // Volume metadata is kept as immutable; a refresh is how a sample
         // republished in place is picked up on its next open.
+        vcr::zarr::OpenOptions options;
+        options.cacheDirs = {vc::settings::remoteCachePath().string()};
         for (const auto& volume : sample.volumes)
             for (const auto& artifact : volume.artifacts)
-                vc::core::util::remoteMetadataCache().invalidate(artifact.url());
+                vcr::zarr::forgetKeptMetadata(artifact.url(), options);
         try {
             auto& state = *_window->_state;
             const auto project = state.sampleStore();
@@ -569,7 +560,7 @@ void MenuActionController::resetOpenDataProject()
     auto original = _window->_state->vpkg();
     if (!original || !original->writable() || _openDataSampleOpenInFlight) return;
     const auto sampleId = vc3d::opendata::openDataProjectSample(*original);
-    const auto catalog = vc3d::opendata::cachedCatalog();
+    const auto catalog = vcr::catalog::cachedManifest(vcr::catalog::catalogCacheFile(std::string(vcr::catalog::kDefaultManifestUrl)));
     const auto* sample = sampleId && catalog ? catalog->findSample(*sampleId) : nullptr;
     if (!sample) {
         QMessageBox::warning(_window, tr("Reset to Open Data"), tr("The catalog no longer lists this sample."));
@@ -603,7 +594,7 @@ void MenuActionController::resetOpenDataProject()
             auto data = result.package->document().data();
             for (const auto& store : original->document().data().at("stores")) data["stores"].push_back(store);
             original->document().replace(std::move(data));
-            auto package = VolumePkg::open(original->path(), {.catalog = vc3d::opendata::cachedCatalog()});
+            auto package = VolumePkg::open(original->path(), {.catalog = vcr::catalog::cachedManifest(vcr::catalog::catalogCacheFile(std::string(vcr::catalog::kDefaultManifestUrl)))});
             _window->CloseVolume();
             _window->_state->setVpkg(std::move(package));
             _window->refreshCurrentVolumePackageUi();
@@ -672,6 +663,8 @@ bool MenuActionController::openOpenDataSample(const vcr::catalog::OpenDataSample
     // Do not interleave CloseVolume/setVpkg from overlapping opens. Only this
     // interactive wrapper waits through a nested event loop.
     if (_openDataSampleOpenInFlight) {
+        QMessageBox::warning(_window, QObject::tr("Open Data Sample"),
+            QObject::tr("Another Open Data sample is still opening."));
         return false;
     }
 
@@ -737,6 +730,9 @@ void MenuActionController::beginOpenDataSampleOpenTask(
     // Prepare edits now and check again before switching. Keep the old project
     // open while the sample is prepared, including when preparation fails.
     if (_window && _window->_state->prepareStoreSwitch && !_window->_state->prepareStoreSwitch()) {
+        if (interactive)
+            QMessageBox::warning(_window, QObject::tr("Open Data Sample"),
+                QObject::tr("Pending edits prevented the project switch."));
         if (onFinished) QMetaObject::invokeMethod(this, [onFinished = std::move(onFinished)]() {
             OpenDataSampleOpenOutcome outcome;
             outcome.success = false;
@@ -768,6 +764,12 @@ void MenuActionController::beginOpenDataSampleOpenTask(
         }
     }
     if (!setupError.isEmpty()) {
+        // The worker's failures are reported by finishOpenDataSampleOpen; these
+        // happen before it starts, and the interactive caller only sees a bool.
+        if (interactive)
+            QMessageBox::warning(_window, QObject::tr("Open Data Sample"),
+                QObject::tr("Could not create the project for %1:\n\n%2")
+                    .arg(QString::fromStdString(sample.id), setupError));
         if (onFinished) {
             QMetaObject::invokeMethod(this, [onFinished = std::move(onFinished), setupError]() {
                 OpenDataSampleOpenOutcome outcome;
@@ -889,7 +891,7 @@ void MenuActionController::beginOpenDataSampleOpenTask(
                         session, projectPath, attachment, sampleCopy, cacheDir.toStdString(),
                         &taskResult.result, progressCallback, hasSelection ? &selectionCopy : nullptr);
                 } else {
-                    taskResult.pkg = VolumePkg::open(projectPath, {.catalog = vc3d::opendata::cachedCatalog()});
+                    taskResult.pkg = VolumePkg::open(projectPath, {.catalog = vcr::catalog::cachedManifest(vcr::catalog::catalogCacheFile(std::string(vcr::catalog::kDefaultManifestUrl)))});
                 }
             } catch (const std::exception& e) {
                 taskResult.error = QString::fromUtf8(e.what());
@@ -962,12 +964,6 @@ void MenuActionController::finishOpenDataSampleOpen(OpenDataOpenTaskResult task,
         cancelOpenDataVolumePrefills();
         _window->CloseVolume();
         _window->_state->setVpkg(pkg);
-        // CloseVolume() stopped all file watches; the ordinary open flow
-        // restarts them after its own setVpkg, and the sample flow gets the
-        // same treatment — previously it left the watcher stopped entirely.
-        if (_window->_fileWatcher) {
-            _window->_fileWatcher->startWatching();
-        }
     }
     if (!pkg->path().empty()) {
         updateRecentVolpkgList(QString::fromStdString(pkg->path().string()));
@@ -1013,64 +1009,50 @@ void MenuActionController::finishOpenDataSampleOpen(OpenDataOpenTaskResult task,
 
 void MenuActionController::startOpenDataVolumePrefill(const std::shared_ptr<Volume>& volume)
 {
+    constexpr int physicalPrefillLevel = 5;
     const int logicalPrefillLevel = volume
-        ? vc3d::opendata::kOpenDataVolumePrefillLevel - volume->baseScaleLevel()
+        ? physicalPrefillLevel - volume->baseScaleLevel()
         : -1;
-    if (!volume || !volume->isRemote() || logicalPrefillLevel < 0 ||
-        !volume->hasScaleLevel(logicalPrefillLevel)) {
+    if (!volume || !volume->isRemote() || logicalPrefillLevel < 0) {
         return;
     }
-    if (volume->remotePersistentCachePath().empty()) {
-        return;
+    try {
+        if (!_window->_state->openedVolumes()->pyramid(*volume).has(logicalPrefillLevel))
+            return;
+    } catch (const std::exception&) {
+        return;  // the volume's viewers report what cannot be opened
     }
-    if (vc3d::opendata::openDataVolumePrefillMarkerMatches(
-            volume->remotePersistentCachePath(),
-            *volume,
-            logicalPrefillLevel)) {
-        Logger()->info(
-            "Open-data volume {} physical level {} (logical {}) already prefetched",
-            volume->id(),
-            vc3d::opendata::kOpenDataVolumePrefillLevel,
-            logicalPrefillLevel);
+    if (volume->remoteCacheRoot().empty()) {
         return;
     }
 
     auto cancelFlag = std::make_shared<std::atomic<bool>>(false);
     _openDataPrefillCancelFlag = cancelFlag;
-    auto* watcher = new QFutureWatcher<vc3d::opendata::OpenDataVolumePrefillResult>(this);
+    auto* watcher = new QFutureWatcher<VolumePrefillResult>(this);
     _openDataPrefillWatchers.push_back(watcher);
     _openDataPrefillCancelFlags.push_back(cancelFlag);
 
     const QString volumeId = QString::fromStdString(volume->id());
-    if (_window) {
-        _window->showStatusBarMessage(
-            QObject::tr("Caching remote volume %1 physical /%2 (logical /%3) in background...")
-                .arg(volumeId)
-                .arg(vc3d::opendata::kOpenDataVolumePrefillLevel)
-                .arg(logicalPrefillLevel),
-            7000);
-    }
-
     connect(watcher,
-            &QFutureWatcher<vc3d::opendata::OpenDataVolumePrefillResult>::finished,
+            &QFutureWatcher<VolumePrefillResult>::finished,
             this,
             [this, watcher, cancelFlag, volumeId]() {
-                vc3d::opendata::OpenDataVolumePrefillResult result;
+                VolumePrefillResult result;
                 // A canceled QFuture has no stored result. Check cancellation
                 // before result() when a stale finished signal arrives.
                 if (watcher->isCanceled()) {
-                    result.status = vc3d::opendata::OpenDataVolumePrefillResult::Status::Cancelled;
+                    result.status = VolumePrefillResult::Status::Cancelled;
                     result.volumeId = volumeId.toStdString();
                     result.message = "cancelled before completion";
                 } else {
                     try {
                         result = watcher->result();
                     } catch (const std::exception& e) {
-                        result.status = vc3d::opendata::OpenDataVolumePrefillResult::Status::Failed;
+                        result.status = VolumePrefillResult::Status::Failed;
                         result.volumeId = volumeId.toStdString();
                         result.message = e.what();
                     } catch (...) {
-                        result.status = vc3d::opendata::OpenDataVolumePrefillResult::Status::Failed;
+                        result.status = VolumePrefillResult::Status::Failed;
                         result.volumeId = volumeId.toStdString();
                         result.message = "unknown error";
                     }
@@ -1095,23 +1077,26 @@ void MenuActionController::startOpenDataVolumePrefill(const std::shared_ptr<Volu
                     return;
                 }
 
-                using Status = vc3d::opendata::OpenDataVolumePrefillResult::Status;
+                using Status = VolumePrefillResult::Status;
                 switch (result.status) {
                 case Status::Completed:
-                    _window->showStatusBarMessage(
-                        QObject::tr("Cached remote volume %1 physical /%2 (logical /%3): %4 chunks.")
-                            .arg(QString::fromStdString(result.volumeId))
-                            .arg(result.physicalLevel)
-                            .arg(result.level)
-                            .arg(result.totalChunks),
-                        7000);
+                    if (result.fetchedChunks > 0) {
+                        _window->showStatusBarMessage(
+                            QObject::tr("Cached remote volume %1 physical /%2 (logical /%3): %4 chunks fetched.")
+                                .arg(QString::fromStdString(result.volumeId))
+                                .arg(result.physicalLevel)
+                                .arg(result.level)
+                                .arg(result.fetchedChunks),
+                            7000);
+                    }
                     Logger()->info(
-                        "Open-data volume prefill completed for {} level {}: {} chunks (data={}, empty={})",
+                        "Open-data volume prefill completed for {} level {}: {} chunks (data={}, empty={}, fetched={})",
                         result.volumeId,
                         result.level,
                         result.totalChunks,
                         result.dataChunks,
-                        result.emptyChunks);
+                        result.emptyChunks,
+                        result.fetchedChunks);
                     break;
                 case Status::Failed:
                     _window->showStatusBarMessage(
@@ -1134,21 +1119,26 @@ void MenuActionController::startOpenDataVolumePrefill(const std::shared_ptr<Volu
                         result.resolvedChunks,
                         result.totalChunks);
                     break;
-                case Status::Skipped:
-                    Logger()->info(
-                        "Open-data volume prefill skipped for {} level {}: {}",
-                        result.volumeId,
-                        result.level,
-                        result.message);
-                    break;
                 }
             });
 
     watcher->setFuture(QtConcurrent::run([volume, cancelFlag, logicalPrefillLevel]() {
-        return vc3d::opendata::prefillOpenDataVolumeLevel(
-            volume,
-            logicalPrefillLevel,
-            cancelFlag.get());
+        VolumePrefillResult result;
+        result.volumeId = volume->id();
+        result.level = logicalPrefillLevel;
+        result.physicalLevel = volume->baseScaleLevel() + logicalPrefillLevel;
+        try {
+            // Populate disk only; opening without a memory cache keeps the level
+            // from displacing chunks the viewers are using.
+            auto opened = vcr::zarr::openPyramidLevel(
+                volume->sourceLocation(), result.physicalLevel, volume->sourceOpenOptions());
+            static_cast<vcr::cache::PrefillResult&>(result) =
+                vcr::cache::prefill(*opened.array, cancelFlag.get());
+        } catch (const std::exception& e) {
+            result.status = VolumePrefillResult::Status::Failed;
+            result.message = e.what();
+        }
+        return result;
     }));
 }
 
@@ -1227,29 +1217,6 @@ void MenuActionController::attachRemoteZarrUrl(const QString& url)
                 return;
             }
 
-            if (isAuthError(outcome.error)) {
-                QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
-                settings.remove(vc3d::settings::aws::ACCESS_KEY);
-                settings.remove(vc3d::settings::aws::SECRET_KEY);
-                settings.remove(vc3d::settings::aws::SESSION_TOKEN);
-
-                const auto reply = QMessageBox::warning(
-                    self->_window,
-                    QObject::tr("Authentication Error"),
-                    QObject::tr("Failed to attach remote zarr:\n%1\n\n"
-                                "Would you like to enter new AWS credentials and retry?")
-                        .arg(outcome.error),
-                    QMessageBox::Yes | QMessageBox::No);
-                if (reply == QMessageBox::Yes) {
-                    QTimer::singleShot(
-                        0, self, [self, persistedLocator]() {
-                            if (self)
-                                self->attachRemoteZarrUrl(persistedLocator);
-                        });
-                    return;
-                }
-            }
-
             QMessageBox::critical(
                 self->_window,
                 QObject::tr("Attach Remote Zarr Error"),
@@ -1268,15 +1235,6 @@ void MenuActionController::attachRemoteZarrUrl(const QString& url)
 
 namespace
 {
-
-bool isAuthError(const QString& msg)
-{
-    return msg.contains("Access denied", Qt::CaseInsensitive) ||
-           msg.contains("403", Qt::CaseInsensitive) ||
-           msg.contains("401", Qt::CaseInsensitive) ||
-           msg.contains("credential", Qt::CaseInsensitive) ||
-           msg.contains("Forbidden", Qt::CaseInsensitive);
-}
 
 } // namespace
 
@@ -1302,7 +1260,7 @@ void MenuActionController::showSettingsDialog()
                 viewer->setPlaneIntersectionLinesVisible(showPlaneLines);
                 // Re-read viewer settings so changes made in the dialog take effect immediately.
                 viewer->reloadPerfSettings();
-                viewer->renderVisible(true);
+                viewer->renderVisible();
             }
         });
     }
@@ -1319,12 +1277,6 @@ void MenuActionController::showSettingsDialog()
         settings.value(vc3d::settings::viewer::AXIS_OVERLAY_OPACITY,
                        vc3d::settings::viewer::AXIS_OVERLAY_OPACITY_DEFAULT).toInt());
 
-    // Cache budgets are independent per workspace. Re-read them for every live
-    // manager so changes take effect without reopening either workspace.
-    for (auto* manager : ViewerManager::allManagers()) {
-        if (manager)
-            manager->applyViewerCacheSettings();
-    }
     CState::applySurfaceGeometryCacheSettings();
 
     dialog->deleteLater();
@@ -1638,12 +1590,6 @@ QString MenuActionController::promptLocation(const QString& title,
     dlg.setLocalNameFilters(localFilters);
     dlg.setAcceptsFiles(acceptFiles);
     dlg.setAcceptsDirs(acceptDirs);
-    dlg.setAuthResolver([this](const QString& url, vc::HttpAuth* out, QString* err) {
-        auto* attachment = _window
-            ? _window->_volumeAttachmentController.get()
-            : nullptr;
-        return attachment && attachment->resolveRemoteAuth(url, out, err);
-    });
     dlg.setStartUri(defaultDir, startAtFile);
     if (dlg.exec() != QDialog::Accepted) return {};
     QString uri = dlg.selectedUri();
@@ -1925,7 +1871,7 @@ void MenuActionController::attachCatalogRepresentation(const vcr::catalog::OpenD
             _window->refreshCurrentVolumePackageUi();
             return;
         }
-        const auto result = vc3d::opendata::attachOpenDataSampleVolumes(*targetPackage, sample, &selection);
+        const auto result = vc3d::opendata::attachOpenDataSampleVolumes(*targetPackage, sample, &selection, vc3d::remoteCachePathFs());
         _window->refreshCurrentVolumePackageUi();
         if (result.failedVolumes)
             reportMessages(tr("Attach incomplete"), result.messages);
@@ -1952,7 +1898,7 @@ void MenuActionController::beginLasagnaManifestAttachment(bool remote)
             promptLocation(QObject::tr("Attach Remote Lasagna Manifest"), QObject::tr("Pick a remote .lasagna.json manifest."), QStringLiteral("s3://"), {QStringLiteral("*.lasagna.json")}, true, false, false);
         if (location.isEmpty())
             return;
-        if (!vc::lasagna::isRemoteLasagnaLocation(location.toStdString())) {
+        if (!vcr::zarr::isRemote(location.toStdString())) {
             QMessageBox::warning(_window, QObject::tr("Attach failed"), QObject::tr("The remote action requires an s3://, http://, https://, or sftp:// manifest."));
             return;
         }
@@ -1972,48 +1918,18 @@ void MenuActionController::beginLasagnaManifestAttachment(bool remote)
         return;
     const bool fiberInference = role == QObject::tr("Fiber inference");
 
+    // Requests are signed with the environment's AWS credentials where a bucket needs
+    // them (vcr::zarr::resolveAccess); a remote manifest or group needs a cache root.
     vc::lasagna::LasagnaDatasetOpenOptions openOptions;
     bool needsRemoteCache = remote;
-    bool needsRemoteAuth = remote;
-    QString authLocation = location;
     if (!remote) {
         try {
-            const auto localManifest = std::filesystem::path(location.toStdString());
-            const auto parsed = vc::lasagna::LasagnaDatasetManifest::parseFile(localManifest);
-            const auto remoteGroup = std::find_if(parsed.groups.begin(), parsed.groups.end(), [](const auto& group) {
-                return vc::lasagna::isRemoteLasagnaLocation(group.relativeZarrKey);
+            const auto parsed = vc::lasagna::LasagnaDatasetManifest::parseFile(std::filesystem::path(location.toStdString()));
+            needsRemoteCache = std::any_of(parsed.groups.begin(), parsed.groups.end(), [](const auto& group) {
+                return vcr::zarr::isRemote(group.relativeZarrKey);
             });
-            if (remoteGroup != parsed.groups.end()) {
-                needsRemoteCache = true;
-                needsRemoteAuth = true;
-                authLocation = QString::fromStdString(remoteGroup->relativeZarrKey);
-            } else {
-                const auto markerPath = localManifest.parent_path() /
-                    vc::lasagna::kLasagnaRemoteMarker;
-                if (std::filesystem::is_regular_file(markerPath)) {
-                    const auto marker = utils::Json::parse_file(markerPath);
-                    const auto artifactUrl = marker.value(
-                        "artifact_url", std::string{});
-                    if (vc::lasagna::isRemoteLasagnaLocation(artifactUrl)) {
-                        needsRemoteAuth = true;
-                        authLocation = QString::fromStdString(artifactUrl);
-                    }
-                }
-            }
         } catch (...) {
             // The background loader reports manifest parse errors uniformly.
-        }
-    }
-    if (needsRemoteAuth || needsRemoteCache) {
-        auto* attachment = _window->_volumeAttachmentController.get();
-        if (!attachment) {
-            QMessageBox::warning(_window, QObject::tr("Attach failed"), QObject::tr("Remote attachment settings are unavailable."));
-            return;
-        }
-        QString authError;
-        if (!attachment->resolveRemoteAuth(authLocation, &openOptions.remoteAuth, &authError)) {
-            QMessageBox::warning(_window, QObject::tr("Attach failed"), authError);
-            return;
         }
     }
     if (needsRemoteCache) {
@@ -2506,4 +2422,3 @@ void MenuActionController::importIntoObjectStore()
         }
     }));
 }
-

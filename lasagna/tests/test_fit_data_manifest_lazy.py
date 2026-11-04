@@ -6,10 +6,9 @@ from unittest import mock
 
 import numpy as np
 import torch
-import zarr
+from vc_reader.reader import ZarrWriter
 
 import fit_data
-import sparse_tensorstore_cache
 from lasagna_volume import ChannelGroup, LasagnaVolume
 
 
@@ -49,8 +48,8 @@ def _surface_group(zarr_name: str = "surface.zarr") -> dict:
 
 
 def _write_u8_zarr(path: Path, shape: tuple[int, ...]) -> None:
-	arr = zarr.open(str(path), mode="w", shape=shape, chunks=shape, dtype="uint8")
-	arr[:] = np.zeros(shape, dtype=np.uint8)
+	arr = ZarrWriter.create(path, shape=shape, chunks=shape, dtype="uint8")
+	arr[...] = np.zeros(shape, dtype=np.uint8)
 
 
 class _FakeSparseChunkGroupCache:
@@ -58,27 +57,18 @@ class _FakeSparseChunkGroupCache:
 		self,
 		*,
 		channels: list[str],
-		zarr_path: str,
+		reader,
 		vol_shape_zyx: tuple[int, int, int],
 		channel_indices: dict[str, int],
 		is_3d_zarr: bool,
 		device: torch.device,
 	) -> None:
 		self.channels = list(channels)
-		self.zarr_path = zarr_path
+		self.reader = reader
 		self.vol_shape_zyx = vol_shape_zyx
 		self.channel_indices = dict(channel_indices)
 		self.is_3d_zarr = bool(is_3d_zarr)
 		self.chunk_table = torch.zeros(1, dtype=torch.int64, device=device)
-
-
-class _FakeTensorStoreSparseChunkGroupCache(_FakeSparseChunkGroupCache):
-	created: list[tuple[str, bool]] = []
-
-	def __init__(self, *, zarr_path: str, remote: bool = False, **kwargs) -> None:
-		super().__init__(zarr_path=zarr_path, **kwargs)
-		self.remote = bool(remote)
-		type(self).created.append((zarr_path, self.remote))
 
 
 class FitDataManifestLazyTests(unittest.TestCase):
@@ -274,7 +264,6 @@ class FitDataManifestLazyTests(unittest.TestCase):
 				data = fit_data.load_3d_streaming(
 					path=str(manifest),
 					device=torch.device("cpu"),
-					sparse_prefetch_backend="python-zarr",
 				)
 
 			self.assertEqual(data.size, (4, 5, 6))
@@ -351,7 +340,7 @@ class FitDataManifestLazyTests(unittest.TestCase):
 			"https://example.test/artifacts/lasagna/surface.ome.zarr/4?token=a%2Fb#anchor",
 		)
 
-	def test_load_streaming_split_cache_uses_remote_tensorstore_not_partial_local_store(self) -> None:
+	def test_load_streaming_split_cache_opens_remote_not_partial_local_store(self) -> None:
 		with tempfile.TemporaryDirectory() as td:
 			root = Path(td)
 			manifest = _write_manifest(
@@ -371,26 +360,19 @@ class FitDataManifestLazyTests(unittest.TestCase):
 				}) + "\n",
 				encoding="utf-8",
 			)
-			_FakeTensorStoreSparseChunkGroupCache.created.clear()
+			reader = mock.Mock(shape=(3, 4, 5, 6))
 			with (
-				mock.patch.object(
-					fit_data, "_probe_tensorstore_zarr_shape", return_value=(3, 4, 5, 6)
-				),
-				mock.patch(
-					"sparse_tensorstore_cache.TensorStoreSparseChunkGroupCache",
-					_FakeTensorStoreSparseChunkGroupCache,
-				),
-				mock.patch.object(fit_data.zarr, "open", side_effect=AssertionError("partial local store opened")),
+				mock.patch.object(fit_data, "open_zarr", return_value=reader) as opened,
+				mock.patch("sparse_cache.SparseChunkGroupCache", _FakeSparseChunkGroupCache),
 			):
-				data = fit_data.load_3d_streaming(
-					path=str(manifest), device=torch.device("cpu"), sparse_prefetch_backend="tensorstore"
-				)
+				data = fit_data.load_3d_streaming(path=str(manifest), device=torch.device("cpu"))
 
 			self.assertEqual(data.size, (4, 5, 6))
 			self.assertEqual(
-				_FakeTensorStoreSparseChunkGroupCache.created,
-				[("https://example.test/artifacts/lasagna/surface.ome.zarr/4", True)],
+				[call.args[0] for call in opened.call_args_list],
+				["https://example.test/artifacts/lasagna/surface.ome.zarr/4"],
 			)
+			self.assertIs(data.sparse_caches["surface"].reader, reader)
 
 	def test_streaming_source_rejects_split_cache_without_valid_marker(self) -> None:
 		with tempfile.TemporaryDirectory() as td:
@@ -433,39 +415,6 @@ class FitDataManifestLazyTests(unittest.TestCase):
 			with self.assertRaisesRegex(ValueError, "safe relative path"):
 				fit_data.resolve_streaming_zarr_source(vol, vol.groups["surface"])
 
-	def test_tensorstore_kvstore_specs_cover_local_http_https_and_s3(self) -> None:
-		self.assertEqual(
-			sparse_tensorstore_cache.zarr_kvstore_spec("C:/data/a.zarr", remote=False),
-			{"driver": "file", "path": "C:/data/a.zarr"},
-		)
-		self.assertEqual(
-			sparse_tensorstore_cache.zarr_kvstore_spec(
-				"http://localhost/a.zarr/4", remote=True
-			),
-			{"driver": "http", "base_url": "http://localhost/a.zarr/4/"},
-		)
-		self.assertEqual(
-			sparse_tensorstore_cache.zarr_kvstore_spec(
-				"https://example.test/a.zarr/4", remote=True
-			),
-			{"driver": "http", "base_url": "https://example.test/a.zarr/4/"},
-		)
-		self.assertEqual(
-			sparse_tensorstore_cache.zarr_kvstore_spec(
-				"https://example.test/a.zarr/4?token=a%2Fb#ignored", remote=True
-			),
-			{
-				"driver": "http",
-				"base_url": "https://example.test/a.zarr/4/?token=a%2Fb",
-			},
-		)
-		self.assertEqual(
-			sparse_tensorstore_cache.zarr_kvstore_spec(
-				"s3://bucket/prefix/a.zarr/4", remote=True
-			),
-			{"driver": "s3", "bucket": "bucket", "path": "prefix/a.zarr/4"},
-		)
-
 	def test_load_3d_streaming_requires_umbilicus_when_requested(self) -> None:
 		with tempfile.TemporaryDirectory() as td:
 			root = Path(td)
@@ -480,7 +429,6 @@ class FitDataManifestLazyTests(unittest.TestCase):
 				fit_data.load_3d_streaming(
 					path=str(manifest),
 					device=torch.device("cpu"),
-					sparse_prefetch_backend="python-zarr",
 					require_umbilicus=True,
 				)
 
@@ -498,7 +446,6 @@ class FitDataManifestLazyTests(unittest.TestCase):
 				fit_data.load_3d_streaming(
 					path=str(manifest),
 					device=torch.device("cpu"),
-					sparse_prefetch_backend="python-zarr",
 				)
 
 	def test_umbilicus_xy_at_z_without_lookup_fails_clearly(self) -> None:

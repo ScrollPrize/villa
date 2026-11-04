@@ -317,8 +317,8 @@ connections retain their schema/page caches between operations and check the
 database change counter under the next lock. A failed operation or an unfinished
 transaction discards its cached connection before any retry.
 
-The protocol client is `vc_object_store::vc_sftp`
-(`include/vc_object_store/sftp/Sftp.hpp`). The server must provide OpenSSH's
+The protocol client is vc_reader's `vc_reader::sftp` library
+(`vc_reader/sftp.hpp`), which also serves remote volumes. The server must provide OpenSSH's
 `fsync@openssh.com` extension for durable writes; the VFS refuses writes without
 it.
 - Without a registered authenticator, `ssh` runs in batch mode: keys and the

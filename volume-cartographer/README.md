@@ -15,6 +15,15 @@ this repository (developed and maintained by the Vesuvius Challenge team).
 The original Volume Cartographer is a general purpose toolkit for virtual unwrapping, while this version is specialized for the frontier challenges of the Herculaneum papyri.
 
 ### Installation Instructions
+
+Debian/Ubuntu builds use `scripts/install_build_deps.sh minimal-build` for the
+required system packages. The Docker CI builder uses the `ci-tooling` profile,
+which additionally installs compiler/debugging tools and AWS CLI. The installer
+requires root or sudo; in agent mode (`AGENTS_AGENT_MODE=1`) installation also
+requires `AGENTS_ALLOW_INSTALL=1`. `build_from_src_debian.sh` invokes the minimal
+profile, then configures, builds and installs VC3D. Validate installer behavior
+without provisioning with `python3 scripts/test_install_build_deps.py`.
+
 Due to a complex set of dependencies, it is *highly* recommended to use a prebuilt package: the release downloads described below (Linux, Windows, macOS) or the docker image. We host an image on the [github container registry](https://github.com/ScrollPrize/villa/pkgs/container/villa%2Fvolume-cartographer) which can be pulled with a simple command :
 
 ```bash
@@ -25,7 +34,7 @@ The `edge` and `main` image tags currently carry the build of 2026-05-13 (see [#
 
 #### Linux
 
-A self-contained `VC3D-<version>-linux-x86_64.AppImage` (VC3D plus the `vc_*` command-line tools, with all dependencies bundled) is attached to each [GitHub release](https://github.com/ScrollPrize/villa/releases). Make it executable and pass the program to run as the first argument:
+A `VC3D-<version>-linux-x86_64.AppImage` containing VC3D and the `vc_*` command-line tools is attached to each [GitHub release](https://github.com/ScrollPrize/villa/releases). The host must provide graphics and font libraries, including for headless CLI use; see the [runtime prerequisites](scripts/appimage/README.md#prerequisites-what-the-host-must-provide). Make it executable and pass the program to run as the first argument:
 
 ```bash
 chmod +x VC3D-*-linux-x86_64.AppImage
@@ -104,7 +113,7 @@ cmake --preset windows-msvc
 cmake --build build\windows-msvc
 ```
 
-The first configure builds the dependency closure (Qt, OpenCV, Ceres, CGAL, ...)
+The first configure builds the dependency closure (Qt, OpenCV, Ceres, ...)
 from source via vcpkg — this takes a while, but later configures restore it from
 vcpkg's binary cache. The result is `build\windows-msvc\bin\VC3D.exe` with the Qt
 plugins and dependency DLLs deployed alongside it, runnable in place. To work in
@@ -142,6 +151,56 @@ Homebrew formulae.
 
 [running docker as a non-root user](https://docs.docker.com/engine/install/linux-postinstall/)
 
+
+### Sheet-following edge extension
+
+In Manual Add, enable **Extensions follow the sheet**, choose **Sheet walk**
+(`Projection` or `Streamline`), and set **Normal substep** to the maximum internal
+step length in volume voxels. Zero means one step per output vertex. A positive
+value subdivides each mesh interval into equal steps no longer than that value;
+it does not add mesh vertices. Settings persist and apply to the next extension.
+While a sheet-following extension computes, its unfinished strip stays hidden,
+editing and surface selection are locked, and an animated progress indicator
+is shown. The completed strip appears when calculation finishes; failures
+discard the unfinished extension and release the lock.
+Streamline offers **Midpoint (RK2)**, **Heun (RK2)**, and **RK4**.
+Applying or canceling an extension ends the editing session but keeps **Manual
+Add** selected as the growth method until you choose another method.
+
+The CLI exposes the same options:
+
+```bash
+build/bin/vc_extend_edge -i INPUT.tifxyz -o OUTPUT.tifxyz -n VOLUME.zarr \
+    --sides right --cells 10 --rounds 1 \
+    --normal-step 2 --walk-mode streamline --integrator rk4 --report report.json
+```
+
+Defaults (`--normal-step 0 --walk-mode projection`) preserve the original walk
+and its cached normals. Positive substeps or streamline mode evaluate the tensor
+weights at the actual query position, without rounding the query. The estimator
+still samples gradients on its existing 3-voxel grid within a 109³ patch; patch
+support changes at cache-cell boundaries, so the field is not perfectly smooth.
+Exact-position queries share a bounded cache of 32 filtered gradient patches
+(about 27 MiB per volume). Each query still evaluates its own tensor and normal;
+reuse does not round positions or change the estimator arithmetic.
+
+Streamline integrates minimum-turn tangent transport, `x' = v` and
+`v' = -n (v · Dn v)`, using unit normals and central directional differences
+at ±0.25 voxels. Normal signs are aligned before differencing. Each completed
+step reprojects and normalizes the tangent. The finite-difference scale and
+normal-field smoothness limit accuracy even with RK4. If an integration stage
+has no usable normal, that substep uses the projection walk; if its midpoint
+normal is also missing, it continues straight. There is no positional snapping
+or automatic stop rule. Smaller steps do not guarantee the correct winding.
+The report's legacy `steps_without_normal` field counts failed normal queries,
+including intermediate integration and derivative queries.
+
+Build and run the extension tests with existing dependencies:
+
+```bash
+ninja -C build test_manual_add_extend vc_extend_edge
+QT_QPA_PLATFORM=offscreen build/bin/test_manual_add_extend
+```
 
 ### Basic introduction to VC3D 
 The document below is a basic introduction to the ui and keybindings available in VC3D, more detailed documentation is available in the [segmentation tutorial](https://scrollprize.org/segmentation) on the scrollprize website.
@@ -269,9 +328,9 @@ the decoded chunk cache in bytes (default 1e9) and `thread_limit` the number
 of OpenMP threads. The tracer reads the voxel size from the volume's
 `metadata.json` (`voxelsize: 45.532` in the log) and writes the segment to
 `out/auto_grown_<timestamp>/` as `x.tif`, `y.tif`, `z.tif`, `generations.tif`
-and `meta.json`. It also keeps a copy of every chunk it fetches in VC3D's
-remote cache directory, `~/.VC3D/remote_cache/<volume>-<id>/` unless
-`remote_cache_dir` under `[viewer]` in `~/.VC3D/VC3D.ini` points elsewhere,
+and `meta.json`. It also keeps a copy of every chunk it fetches under VC3D's
+remote cache root (`~/.VC3D/remote_cache` unless `cache.json` or
+`remote_cache_dir` under `[viewer]` in `~/.VC3D/VC3D.ini` says otherwise),
 and later runs on the same volume read from there. On this volume the eight
 generations take ten to twenty seconds on a 14-core workstation and fetch
 about 2 MiB the first time.
@@ -297,13 +356,10 @@ This writes `render/00.tif` (360×360 pixels for the segment above, about
 17 MiB fetched). Things to know:
 
 - `-v` takes the URL itself, and nothing is written under a local directory.
-  `--remote-url` is a deprecated alias for the same locator: alone it fills
-  `-v`, next to an equal `-v` it warns, next to a different one it is an
-  error. Since #1657 the renderer opens the remote volume the same way the
-  tracer does, so the chunks it fetches persist in the shared remote cache
-  (`~/.VC3D/remote_cache/<volume>-<id>/`, or `remote_cache_dir` under
-  `[viewer]` in `VC3D.ini`); `--cache-gb` (default 16) sizes the process-wide
-  decoded-chunk cache and `--prefetch-remote` warms it before rendering starts.
+  Since #1657 the renderer opens the remote volume the same way the
+  tracer does, so the chunks it fetches persist in the shared remote cache root; `--cache-gb` (default 16) sizes the volume's
+  decoded-chunk memory cache. The renderer fetches only the chunks its samples
+  read, in parallel.
 - The renderer reads the voxel size from the remote volume's metadata, as the
   tracer does: without `--voxel-size` the log says
   `Voxel size (from volume metadata): 45.532` and the TIFF carries the
@@ -314,7 +370,7 @@ This writes `render/00.tif` (360×360 pixels for the segment above, about
 - `-g` selects the pyramid level: `-g 3` renders the same segment at 1/8
   scale (45×45 pixels, about 4 MiB fetched). A level the remote pyramid does
   not have fails immediately with
-  `Error: group index 6 not available in remote zarr (present levels: 0 1 2 3 4 5)`.
+  `Error opening remote zarr: group index 6: ...`.
 - The `#vc-base-scale=N` selector described above applies to the tracer as
   well: with `#vc-base-scale=2` it reports
   `zarr dataset size for scale group 0 [1017, 566, 566]` and
@@ -385,11 +441,6 @@ _Primary entry point for interacting with the segmentation, more info in [extend
   - `Radius` : the radius of the area to be affected by the action
   - `Sigma` : the _strength_ of the action on affected vertices other the original one (aka how quickly the influence tapers as we step away from the original point)
   - `Step` (`Push/Pull` only) : The step size (in world units) to take along the surface normal for each push/pull action
-- `Direction Fields`
-  - `Zarr folder` : the path containing the direction field you want to use for optimization (ex: `/path/to/fiber-directions.zarr/horizontal`) _these are optional_
-    - `Orientation` : the orientation/type of the direction field (normal, horizontal, or vertical)
-    - `Scale level` : the zarr resolution from which these were computed
-    - `Weight` : the weight to apply to the field when optimizing.
 - `Corrections` : group which controls / manages the "correction points" for the current growth session
   - `Active set` : chooses an existing correction set to apply
   - `New correction set` : creates a new point collection containing a single "correction"
@@ -400,6 +451,10 @@ _Keybinds:_
 > - `T` : toggle correction annotation mode (click adds a correction point, right-click removes one)
 
 **Seeding** 
+
+Ctrl+right-click in a volume viewer and choose **Create Segment (GrowPatch)**
+to select default GrowPatch, projection, or streamline seed growth. See
+[seed growth modes and parameters](docs/grow_patch_sheet_seeds.md).
 
 _Widget for creating initial segmentations which can be used for traces or later growth actions_
 

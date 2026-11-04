@@ -12,16 +12,17 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
+from vesuvius.models.augmentation.pipelines import sample_seed
 from vesuvius.ink_detection.data.augmentations import (
     build_augmentations,
     maybe_translate_crop_bbox,
-    split_augmentations_by_geometry,
+    build_split_augmentations,
 )
 from vesuvius.ink_detection.config import InkDataConfig
 from vesuvius.ink_detection.data.geometry import (
     SURFACE_MASK_MAX_DISTANCE_LEVEL0_VOXELS,
     StoredResolutionIndex,
-    catmull_rom_vertex_mask,
+    read_normals_on_flat_grid,
     compute_native_crop_bbox,
     filter_support_bands,
     native_tifxyz_pyramid_params,
@@ -40,6 +41,10 @@ from vesuvius.ink_detection.data.patch_cache import (
     load_patch_cache,
     patch_cache_path,
     save_patch_cache,
+)
+from vesuvius.ink_detection.data.heldout import (
+    has_heldout_validation,
+    partition_heldout,
 )
 from vesuvius.ink_detection.data.patch_finding_default import (
     find_segment_patches as find_default_patches,
@@ -88,6 +93,20 @@ def flat_z_window_bbox(
     offset = random.randint(-jitter.max_offset, jitter.max_offset)
     z0, y0, x0, z1, y1, x1 = canonical
     return (z0 + offset, y0, x0, z1 + offset, y1, x1), offset
+
+
+def label_z_window_bbox(bbox_zyx, image_volume, label_volume):
+    """Move an image Z window onto the label volume's own mid-plane.
+
+    A label store need not be as deep as the surface volume: ``create_label_zarrs``
+    writes 65 planes with the annotation on plane 32 whatever the image depth is.
+    Patch discovery reads each label at its own mid-plane, and a sample has to do the
+    same, or the window taken from a shallower image misses the annotated plane and
+    the patch trains with no supervision. Equal depths leave the window unchanged.
+    """
+    shift = int(label_volume.shape[0]) // 2 - int(image_volume.shape[0]) // 2
+    z0, y0, x0, z1, y1, x1 = bbox_zyx
+    return z0 + shift, y0, x0, z1 + shift, y1, x1
 
 
 def _require_real_z(volume, bbox_zyx, *, name: str) -> None:
@@ -151,11 +170,17 @@ class InkDataset(Dataset):
             (
                 self.geometric_augmentations,
                 self.photometric_augmentations,
-            ) = split_augmentations_by_geometry(self.augmentations)
+            ) = build_split_augmentations(
+                config.augmentation.preset,
+                config.patch_size,
+                rotation_axes=config.augmentation.rotation_axes,
+            )
 
         if patches is None:
             self.segments = list(gather_segments(config))
             self.patches = self._discover_or_load_patches()
+            if has_heldout_validation(config):
+                self.patches = partition_heldout(self.patches)
         else:
             self.patches = list(patches)
             if segments is not None:
@@ -228,8 +253,9 @@ class InkDataset(Dataset):
 
         training: list[Patch] = []
         validation: list[Patch] = []
+        # Discovery threads are not DataLoader workers: dataloader_workers 0 still needs one.
         with ThreadPoolExecutor(
-            max_workers=self.config.dataloader_workers
+            max_workers=max(1, self.config.dataloader_workers)
         ) as executor:
             for segment_training, segment_validation in executor.map(
                 process, self.segments
@@ -244,10 +270,9 @@ class InkDataset(Dataset):
         key = str(segment.segment_dir)
         value = self._tifxyz_cache.get(key)
         if value is None:
-            import vesuvius.tifxyz as tifxyz
+            from vc_reader import tifxyz
 
-            value = tifxyz.read_tifxyz(segment.segment_dir)
-            value.use_full_resolution()
+            value = tifxyz.read(segment.segment_dir)
             self._tifxyz_cache[key] = value
         return value
 
@@ -255,12 +280,7 @@ class InkDataset(Dataset):
         key = str(segment.segment_dir)
         value = self._stored_resolution_cache.get(key)
         if value is None:
-            positions = np.asarray(
-                patch_tifxyz.get_zyxs(stored_resolution=True), dtype=np.float32
-            )
-            valid = np.isfinite(positions).all(axis=-1)
-            valid &= (positions >= 0).all(axis=-1)
-            value = positions, valid
+            value = patch_tifxyz.xyz[..., ::-1], patch_tifxyz.valid
             self._stored_resolution_cache[key] = value
         return value
 
@@ -285,7 +305,7 @@ class InkDataset(Dataset):
         )
         key = str(segment.segment_dir)
         if key not in self._vertex_mask_cache:
-            self._vertex_mask_cache[key] = catmull_rom_vertex_mask(patch_tifxyz)
+            self._vertex_mask_cache[key] = patch_tifxyz.valid
         return select_flat_pixel_bands_via_stored_resolution(
             patch_tifxyz,
             crop_bbox,
@@ -325,25 +345,30 @@ class InkDataset(Dataset):
         else:
             supervision_volume = self._open(patch.supervision_mask, patch.segment.scale)
             labels_volume = self._open(patch.inklabels, patch.segment.scale)
+            supervision_bbox = label_z_window_bbox(bbox, image_volume, supervision_volume)
+            labels_bbox = label_z_window_bbox(bbox, image_volume, labels_volume)
             if self.config.jitter.enabled:
-                _require_real_z(supervision_volume, bbox, name="supervision")
-                _require_real_z(labels_volume, bbox, name="inklabels")
+                _require_real_z(supervision_volume, supervision_bbox, name="supervision")
+                _require_real_z(labels_volume, labels_bbox, name="inklabels")
             supervision, _ = read_bbox_with_padding(
-                supervision_volume, bbox, fill_value=0
+                supervision_volume, supervision_bbox, fill_value=0
             )
-            if not patch.is_validation and patch.segment.validation_mask is not None:
+            if (
+                not patch.is_validation or patch.exclude_validation_mask
+            ) and patch.segment.validation_mask is not None:
                 validation_volume = self._open(
                     patch.segment.validation_mask, patch.segment.scale
                 )
+                validation_bbox = label_z_window_bbox(bbox, image_volume, validation_volume)
                 if self.config.jitter.enabled:
-                    _require_real_z(validation_volume, bbox, name="validation")
+                    _require_real_z(validation_volume, validation_bbox, name="validation")
                 validation, _ = read_bbox_with_padding(
-                    validation_volume, bbox, fill_value=0
+                    validation_volume, validation_bbox, fill_value=0
                 )
                 supervision = exclude_validation_voxels(
                     supervision, validation
                 )
-            labels, _ = read_bbox_with_padding(labels_volume, bbox, fill_value=0)
+            labels, _ = read_bbox_with_padding(labels_volume, labels_bbox, fill_value=0)
         return self._tensor_sample(
             patch, image, valid_slices, labels, supervision, surface_mask=None
         )
@@ -435,14 +460,13 @@ class InkDataset(Dataset):
             x0=support_x0,
             x1=support_x1,
         )
-        nx, ny, nz = patch_tifxyz.get_normals(
-            support_y0 * stride,
-            support_y1 * stride,
-            support_x0 * stride,
-            support_x1 * stride,
-        )
-        normals = np.stack([nz, ny, nx], axis=-1)[::stride, ::stride].astype(
-            np.float32, copy=False
+        normals = read_normals_on_flat_grid(
+            patch_tifxyz,
+            y0=support_y0,
+            y1=support_y1,
+            x0=support_x0,
+            x1=support_x1,
+            flat_grid_stride=stride,
         )
         image, valid_slices = read_bbox_with_padding(
             image_volume, crop_bbox, fill_value=0
@@ -535,11 +559,8 @@ class InkDataset(Dataset):
                     x0=x0,
                     x1=x1,
                 )
-                nx, ny, nz = patch_tifxyz.get_normals(
-                    y0 * stride, y1 * stride, x0 * stride, x1 * stride
-                )
-                normals = np.stack([nz, ny, nx], axis=-1)[::stride, ::stride].astype(
-                    np.float32, copy=False
+                normals = read_normals_on_flat_grid(
+                    patch_tifxyz, y0=y0, y1=y1, x0=x0, x1=x1, flat_grid_stride=stride
                 )
                 other_labels, other_supervision = project_labels_and_supervision(
                     positions_zyx=positions,
@@ -601,23 +622,15 @@ class InkDataset(Dataset):
                 torch.from_numpy(image_mask).float().unsqueeze(0)
             )
         if self.geometric_augmentations is not None:
-            augmentation_data = data
-            if self.mode == "full_3d_single_wrap":
-                augmentation_data = dict(data)
-                augmentation_data["regression_keys"] = ["surface_mask"]
-            after_geometry = self.geometric_augmentations(**augmentation_data)
+            after_geometry = self.geometric_augmentations(data, seed=sample_seed(0))
             image_for_label = after_geometry["image"].clone()
             mask_for_label = after_geometry.pop("image_mask_for_label", None)
-            data = self.photometric_augmentations(**after_geometry)
+            data = self.photometric_augmentations(after_geometry, seed=sample_seed(0))
             data["image_for_label"] = image_for_label
             if mask_for_label is not None:
                 data["image_mask_for_label"] = (mask_for_label > 0.5).float()
         elif self.augmentations is not None:
-            augmentation_data = data
-            if self.mode == "full_3d_single_wrap":
-                augmentation_data = dict(data)
-                augmentation_data["regression_keys"] = ["surface_mask"]
-            data = self.augmentations(**augmentation_data)
+            data = self.augmentations(data, seed=sample_seed(0))
         elif self.emit_image_for_label:
             data["image_for_label"] = data["image"].clone()
             if "image_mask_for_label" in data:
