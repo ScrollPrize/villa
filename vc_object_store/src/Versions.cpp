@@ -347,6 +347,20 @@ ObjectVersion ObjectStore::versionReference(const Txn& txn, const ObjectRevision
     return {storeUuidText(static_cast<sqlite3*>(connection(txn))), revision.generation, revision.objectUuid, revision.version};
 }
 
+std::vector<SelectedRelationship> ObjectStore::relationshipsAt(const Txn& txn, const std::vector<ObjectVersion>& versions) const
+{
+    RevisionSelection selection;
+    for (const auto& reference : versions) {
+        const auto revision = objectAtVersion(txn, reference);
+        if (!revision)
+            throw std::invalid_argument("object history: version " + std::to_string(reference.version) + " of " +
+                                        reference.objectUuid + " is not recorded in this store and generation");
+        if (!selection.emplace(revision->objectUuid, revision->uuid).second)
+            throw std::invalid_argument("object history: object selected twice: " + revision->objectUuid);
+    }
+    return relationshipsAt(txn, selection);
+}
+
 ChangePage ObjectStore::changesSince(const Txn& txn, const FeedCursor& cursor, int64_t maxChanges) const
 {
     if (maxChanges <= 0) throw std::invalid_argument("object store: feed page size must be positive");

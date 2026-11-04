@@ -14,6 +14,7 @@
 #include <string>
 #include <vector>
 
+#include "vc_object_store/objects/GeometryRegion.hpp"
 #include "vc_object_store/objects/ObjectStore.hpp"
 #include "vc_object_store/objects/Transactions.hpp"
 
@@ -51,5 +52,41 @@ std::string objectRevisionToJson(const ObjectRevision&);
 ObjectRevision objectRevisionFromJson(const std::string&);
 std::string geometryRevisionToJson(const GeometryRevision&);
 GeometryRevision geometryRevisionFromJson(const std::string&);
+
+// Hosted queries. A request names its filters only: selections never carry
+// transforms (encoding one throws), so the service resolves volume targets
+// through the store's recorded transforms, as a local query without explicit
+// transforms does. Unknown request keys are rejected. Every answer carries the
+// status of the one read snapshot it came from; doubles are written in their
+// shortest round-trip form.
+std::string objectQueryRequestToJson(const ObjectSelection&, const std::optional<std::vector<std::string>>& fields);
+ObjectSelection objectQueryRequestFromJson(const std::string&, std::optional<std::vector<std::string>>* fields);
+std::string objectQueryResultToJson(const StoreStatus&, const std::vector<ObjectRecord>&,
+                                    const std::optional<std::vector<std::string>>& fields);
+std::vector<ObjectRecord> objectQueryResultFromJson(const std::string&, StoreStatus* asOf);
+
+std::string edgeQueryRequestToJson(const EdgeSelection&, const std::optional<std::vector<std::string>>& fields);
+EdgeSelection edgeQueryRequestFromJson(const std::string&, std::optional<std::vector<std::string>>* fields);
+std::string edgeQueryResultToJson(const StoreStatus&, const std::vector<EdgeRecord>&,
+                                  const std::optional<std::vector<std::string>>& fields);
+std::vector<EdgeRecord> edgeQueryResultFromJson(const std::string&, StoreStatus* asOf);
+
+std::string objectHistoryToJson(const StoreStatus&, const std::vector<ObjectRevision>&);
+std::vector<ObjectRevision> objectHistoryFromJson(const std::string&, StoreStatus* asOf);
+
+std::string relationshipQueryRequestToJson(const std::vector<ObjectVersion>&);
+std::vector<ObjectVersion> relationshipQueryRequestFromJson(const std::string&);
+std::string relationshipQueryResultToJson(const StoreStatus&, const std::vector<SelectedRelationship>&);
+std::vector<SelectedRelationship> relationshipQueryResultFromJson(const std::string&, StoreStatus* asOf);
+
+std::string regionQueryRequestToJson(const RegionSlice&, const RegionOptions&);
+std::pair<RegionSlice, RegionOptions> regionQueryRequestFromJson(const std::string&);
+std::string regionQueryResultToJson(const StoreStatus&, const RegionResult&);
+RegionResult regionQueryResultFromJson(const std::string&, StoreStatus* asOf);
+
+std::string proximityQueryRequestToJson(const SurfaceProximityQuery&);
+SurfaceProximityQuery proximityQueryRequestFromJson(const std::string&);
+std::string proximityQueryResultToJson(const StoreStatus&, const std::vector<SurfaceProximityHit>&);
+std::vector<SurfaceProximityHit> proximityQueryResultFromJson(const std::string&, StoreStatus* asOf);
 
 } // namespace vc::objects

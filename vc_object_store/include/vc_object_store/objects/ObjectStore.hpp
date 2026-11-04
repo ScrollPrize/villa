@@ -457,6 +457,9 @@ public:
     // Explicit, closed selection: omitted endpoints are not selected. null
     // selects the latest head (unlike write(), where null expects absence).
     std::vector<SelectedRelationship> relationshipsAt(const Txn&, const RevisionSelection&) const;
+    // Numbered form: each selected object at an exact recorded version of this
+    // store (one per object; deleted versions and unknown references fail).
+    std::vector<SelectedRelationship> relationshipsAt(const Txn&, const std::vector<ObjectVersion>&) const;
     // After endpoint edits, validate anchors/metadataKeys and retain the relationship.
     // The caller decides domain meaning.
     void retainRelationship(WriteTxn&, const std::string& edgeUuid);
