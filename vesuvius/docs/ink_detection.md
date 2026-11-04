@@ -469,6 +469,7 @@ the second output.
 | `--device` | `auto` (default), `cpu`, `mps` or `cuda`. `auto` picks CUDA, then MPS, then CPU; `--gpus` selects CUDA devices and cannot be combined with `cpu` or `mps`. |
 | `--compile-mode` | `torch.compile` mode, default `reduce-overhead`. |
 | `--no-compile` | Use eager inference. Multiple selected GPUs also disable compilation. |
+| `--backend` | `torch` (default) or `openvino`: run the model forward as an fp32 OpenVINO CPU graph (see [CPU inference](#cpu-inference)). |
 
 Flat inference requires a checkpoint with `mode: "flat"` and a square Y/X
 crop. It prefers `ema_model`, then common flat state-dict aliases, then
@@ -479,6 +480,44 @@ Flat inference has a narrower preprocessing contract than training. It accepts
 `robust_mad` only with the default 1st and 99th percentiles, and `divide` only
 with `divisor: 255`. Other normalization modes are rejected rather than being
 silently replaced with robust normalization.
+
+### CPU inference
+
+Without a GPU, run with `--device cpu --no-compile --loader-threads 4`.
+On CPU, `torch.compile` was slower than eager in our runs, also once compiled.
+
+`--backend openvino` (add `--extra cpu-inference` to the `uv sync` command in
+[Environment](#environment)) converts the checkpoint to an fp32 OpenVINO graph
+at startup (about 4 s per model) and runs only the model forward through it.
+Reading, normalisation and blending are unchanged. With `--batch-size 4` its
+TIFFs differ from torch by at most one uint8 level; at batch 1, by up to two
+(0.015% of pixels by two, about 0.4% by one). Torch's thread count caps
+OpenVINO's, which itself stops at one per physical core, so `OMP_NUM_THREADS`
+limits both backends; the count used is logged. It blocks OpenVINO's converter
+telemetry, which would otherwise start a usage-data sender process at every
+conversion. It refuses to start under a tcmalloc preload, because
+OpenVINO then aborts with heap corruption. It has been tested with the
+`_2p5d` and `_3d_stem_2d` model types.
+
+Over both directions of a 1.3 cm² window at `--batch-size 4`,
+`--backend openvino` was this much faster than the fastest torch run we
+measured on two Zen 3 Linux VMs (`--batch-size 8` with freed buffers kept in
+glibc's heap via `mallopt(M_MMAP_MAX=0)`; on the 2-core VM the one-model
+figure is the median of three runs, the rest are single runs):
+
+| VM | One model | Three-model ensemble |
+|---|---|---|
+| 2 cores / 4 threads | 1.27x | 1.29x |
+| 4 cores / 8 threads | 1.19x | 1.18x |
+
+On the 4-core VM torch was given all 8 hardware threads
+(`torch.set_num_threads(8)`), which made it faster than its default of 4;
+OpenVINO used 4. On a 0.9 cm² single-direction crop (2-core VM), where the
+fixed conversion cost weighs more, it was 1.13x (against the heap setting at
+batch 4). Against torch at the CLI
+defaults (`--batch-size 1`, glibc defaults) one model was 1.53x faster on the
+2-core VM. Peak RSS was about 0.5 GB higher than plain torch for one model and
+1.1–1.3 GB higher for the three-model ensemble.
 
 ## Native 3D inference
 
@@ -580,3 +619,5 @@ uv run --no-sync pytest tests -m "not slow and not network"
   derived pyramid means.
 - `torch.compile` is best effort. If compilation fails, inference logs a
   warning and continues eagerly.
+- `--backend openvino` is fp32 and CPU only, and has been measured on
+  two single-socket Linux x86-64 (Zen 3) VMs only, one process per machine.

@@ -34,8 +34,10 @@ from vesuvius.ink_detection.models.checkpoint import (
 )
 from vesuvius.ink_detection.config import InkConfig, NormalizationConfig
 from vesuvius.ink_detection.inference.inference_runtime import (
+    BACKEND_CHOICES,
     DEVICE_CHOICES,
     TargetModel,
+    convert_for_openvino,
     flip_spatial,
     iter_mirror_axes,
     parse_gpu_ids,
@@ -1717,10 +1719,19 @@ def parse_args(argv: Sequence[str] | None = None):
         help="Device for the model. auto picks CUDA, then MPS, then CPU; --gpus implies CUDA.",
     )
     parser.add_argument("--gpus")
+    parser.add_argument(
+        "--backend",
+        choices=BACKEND_CHOICES,
+        default="torch",
+        help="Model forward runtime. openvino runs an fp32 CPU graph converted "
+        "from the checkpoint at startup (needs the cpu-inference extra).",
+    )
     parser.add_argument("--compile-mode", default="reduce-overhead")
     parser.add_argument("--no-compile", dest="compile_model", action="store_false")
     parser.set_defaults(compile_model=True)
     args = parser.parse_args(argv)
+    if args.backend == "openvino" and (args.gpus or args.device not in ("auto", "cpu")):
+        parser.error("--backend openvino runs on the CPU; drop --gpus and use --device cpu")
     if args.num_workers < 0:
         parser.error("--num-workers must be nonnegative")
     if args.prefetch_factor <= 0:
@@ -1751,13 +1762,25 @@ def main(argv: Sequence[str] | None = None) -> int:
     if hasattr(torch, "set_float32_matmul_precision"):
         torch.set_float32_matmul_precision("high")
     configured = configure_model(args)
-    prepared_model, device = prepare_model_for_inference(
-        configured.model,
-        gpu_ids=args.gpu_ids,
-        device_type=args.device,
-        compile_model=args.compile_model,
-        compile_mode=args.compile_mode,
-    )
+    if args.backend == "openvino":
+        LOGGER.info("Converting the model to OpenVINO (fp32, CPU); torch.compile is not used")
+        shape = (1, configured.input_depth, configured.patch_size, configured.patch_size)
+        prepared_model, device = configured.model, torch.device("cpu")
+        if isinstance(prepared_model, ProbabilityMeanEnsemble):
+            # OpenVINO has no aten::logit, so the probability mean stays in torch.
+            prepared_model.members = nn.ModuleList(
+                convert_for_openvino(member, shape) for member in prepared_model.members
+            )
+        else:
+            prepared_model = convert_for_openvino(prepared_model, shape)
+    else:
+        prepared_model, device = prepare_model_for_inference(
+            configured.model,
+            gpu_ids=args.gpu_ids,
+            device_type=args.device,
+            compile_model=args.compile_model,
+            compile_mode=args.compile_mode,
+        )
     configured = replace(configured, model=prepared_model)
     if args.folder is not None:
         infer_folder(args, configured, device=device)
