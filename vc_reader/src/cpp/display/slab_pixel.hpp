@@ -79,7 +79,7 @@ VCR_SLAB inline void slabPixel(const Slab& slab,int x,int y,uint8_t* rgb,uint8_t
                 const float value = (w00 * float(v0[0]) + w10 * float(v0[1]) +
                                      w01 * float(v1[0]) + w11 * float(v1[1])) / wsum;
                 anyValid = true;
-                const int idx = int(clamp(float(int(value + 0.5f)),0,255));
+                const int idx = int(byte(value));
                 const float alpha = opacityLut[idx];
                 if (alpha <= 0.0f)
                     continue;
@@ -126,9 +126,9 @@ VCR_SLAB inline void slabPixel(const Slab& slab,int x,int y,uint8_t* rgb,uint8_t
                     break;
             }
             if (anyValid) {
-                rgb[0] = uint8_t(fminf(r,255.f));
-                rgb[1] = uint8_t(fminf(g,255.f));
-                rgb[2] = uint8_t(fminf(b,255.f));
+                rgb[0] = byte(r);
+                rgb[1] = byte(g);
+                rgb[2] = byte(b);
                 *coverage = 1;
             }
 }

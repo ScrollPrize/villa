@@ -1,4 +1,5 @@
 import numpy as np
+import pytest
 from build_support import load_build
 load_build()
 from vc_reader import _reader
@@ -9,10 +10,10 @@ def test_display_conversion_and_palette():
     output = np.empty(5, np.uint8)
     coverage = np.empty_like(output)
     _reader.display_to_uint8(values, output, coverage)
-    np.testing.assert_array_equal(output, [0, 1, 255, 0, 0])
+    np.testing.assert_array_equal(output, [0, 2, 255, 0, 0])
     np.testing.assert_array_equal(coverage, [1, 1, 1, 0, 0])
     ramp = _reader.window_level_lut(10, 110)
-    assert ramp[10] == 0xff000000 and ramp[60] == 0xff7f7f7f and ramp[110] == 0xffffffff
+    assert ramp[10] == 0xff000000 and ramp[60] == 0xff808080 and ramp[110] == 0xffffffff
 
 
 def test_pathfinding_entered_pixel_cost_and_ties():
@@ -116,9 +117,35 @@ def test_conversion_rounding_saturation_and_scaling():
         else:
             source, output, wide = values, np.empty(values.size, np.uint8), np.empty(values.size, np.uint16)
             host = np.asarray
-        _reader.display_to_uint8(source, output, rounding='nearest_even', saturate_infinity=True)
+        _reader.display_to_uint8(source, output, saturate_infinity=True)
         np.testing.assert_array_equal(host(output), [0, 0, 2, 2, 254, 255, 255, 0, 255, 0])
         _reader.display_to_uint16(source, wide)
-        np.testing.assert_array_equal(host(wide), [0, 1, 2, 3, 255, 256, 65535, 0, 65535, 0])
-        _reader.display_to_uint8(source, output, scale=1/256, rounding='nearest_even')
+        np.testing.assert_array_equal(host(wide), [0, 0, 2, 2, 254, 256, 65535, 0, 65535, 0])
+        _reader.display_to_uint8(source, output, rounding='truncate')
+        np.testing.assert_array_equal(host(output), [0, 0, 1, 2, 254, 255, 255, 0, 0, 0])
+        _reader.display_to_uint8(source, output, rounding='half_up')
+        np.testing.assert_array_equal(host(output), [0, 1, 2, 3, 255, 255, 255, 0, 0, 0])
+        _reader.display_to_uint8(source, output, scale=1/256)
         np.testing.assert_array_equal(host(output), [0, 0, 0, 0, 1, 1, 255, 0, 0, 0])
+
+
+@pytest.mark.parametrize('use_cuda', [False, True])
+def test_slab_rounds_interpolated_intensities_and_final_colors(use_cuda):
+    from vc_reader import cuda
+    if use_cuda and not cuda.is_available():
+        pytest.skip('CUDA unavailable')
+    colors = np.arange(256, dtype=np.uint32) * 0x010101 | 0xff000000
+    projection = _reader.SlabProjection()
+    mask = np.ones((1, 2, 2), np.uint8)
+    depths = np.zeros(1, np.float32)
+    # First case: interpolation is exactly .5; the table index rounds to 0.
+    # Remaining cases: final RGB is .5 or 1.5, rounding to 0 or 2.
+    cases = [(np.array([[[0, 1], [0, 1]]], np.uint8), .5, 1., 0),
+             (np.ones((1, 2, 2), np.uint8), 0., .5, 0),
+             (np.full((1, 2, 2), 3, np.uint8), 0., .5, 2)]
+    for values, offset, opacity, expected in cases:
+        offsets = np.array([[offset, 0]], np.float32)
+        rgb, coverage = _reader.composite_slab(
+            values, mask, colors, [opacity]*256, projection, offsets, depths, cuda=use_cuda)
+        assert coverage[0, 0] == 1
+        np.testing.assert_array_equal(rgb[0, 0], [expected]*3)

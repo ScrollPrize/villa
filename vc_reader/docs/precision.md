@@ -58,7 +58,9 @@ last bits.
   half-voxel ties to even and so differ from vc_reader exactly at those ties.
 - **Value ties** (rounding numbers: sizes from scale factors, counts, quantized
   intensities) round to even, as `np.rint`/`np.round` and `torch.round` do:
-  `round_half_even`. The SciPy Gaussian radius `int(truncate * sigma + .5)` is kept
+  `round_half_even`. Display conversion to uint8 and uint16 uses this rule
+  by default, after scaling and clamping; interpolation stays floating point.
+  The SciPy Gaussian radius `int(truncate * sigma + .5)` is kept
   as SciPy defines it.
 
 ## Where wider arithmetic remains
