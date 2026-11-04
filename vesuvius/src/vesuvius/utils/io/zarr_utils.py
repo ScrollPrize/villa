@@ -1,7 +1,16 @@
+import math
 import os
 import time
 
 from vc_reader.reader import ObjectStore
+
+
+_ZARR_RUN_MARKER = ".vesuvius-run-id"
+
+
+def mark_zarr_ready(zarr_path, run_id):
+    """Publish this run only after array creation completes; object replacement is atomic."""
+    ObjectStore(zarr_path).write(_ZARR_RUN_MARKER, run_id)
 
 
 def zarr_array_exists(zarr_path):
@@ -50,7 +59,8 @@ def zarr_array_exists(zarr_path):
     ) from last_error
 
 
-def wait_for_zarr_creation(zarr_path, max_wait_time=300, sleep_interval=5, verbose=True, part_id=None):
+def wait_for_zarr_creation(zarr_path, max_wait_time=300, sleep_interval=5, verbose=True, part_id=None,
+                           run_id=None):
     """
     Wait for a zarr array to be created by another process.
 
@@ -60,21 +70,32 @@ def wait_for_zarr_creation(zarr_path, max_wait_time=300, sleep_interval=5, verbo
         sleep_interval: Time to sleep between checks in seconds (default: 5)
         verbose: Whether to print progress messages
         part_id: Optional part ID for logging purposes
+        run_id: When set, wait for mark_zarr_ready() to publish this exact run, not an old array.
 
     Raises:
         RuntimeError: If timeout is reached without array being created
     """
-    wait_time = 0
+    if not math.isfinite(max_wait_time) or max_wait_time <= 0:
+        raise ValueError("max_wait_time must be finite and positive.")
+    if not math.isfinite(sleep_interval) or sleep_interval <= 0:
+        raise ValueError("sleep_interval must be finite and positive.")
+    start = time.monotonic()
     part_str = f"Part {part_id} " if part_id is not None else ""
+    store = ObjectStore(zarr_path) if run_id is not None else None
+    expected_run = run_id.encode() if run_id is not None else None
+    description = f"run {run_id!r} at {zarr_path}" if run_id is not None else f"array at {zarr_path}"
 
-    while not zarr_array_exists(zarr_path):
-        if wait_time >= max_wait_time:
-            raise RuntimeError(f"Timeout waiting for zarr array to be created. Waited {max_wait_time} seconds.")
-
+    while True:
+        ready = (store.read(_ZARR_RUN_MARKER) == expected_run if store is not None
+                 else zarr_array_exists(zarr_path))
+        if ready:
+            break
+        elapsed = time.monotonic() - start
+        if elapsed >= max_wait_time:
+            raise RuntimeError(f"Timeout waiting for {description}. Waited {max_wait_time} seconds.")
         if verbose:
-            print(f"  {part_str}waiting for array to be created... ({wait_time}s elapsed)")
-        time.sleep(sleep_interval)
-        wait_time += sleep_interval
+            print(f"  {part_str}waiting for {description}... ({elapsed:.0f}s elapsed)")
+        time.sleep(min(sleep_interval, max_wait_time - elapsed))
 
     if verbose:
-        print(f"Array found! {part_str}can now proceed.")
+        print(f"Ready: {description}. {part_str}can now proceed.")
