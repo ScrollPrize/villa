@@ -4,15 +4,31 @@
 #include <filesystem>
 #include <functional>
 #include <optional>
+#include <memory>
 #include <span>
 #include <string>
 
 namespace vc::objects::detail {
 
-// SQLite VFS for hub files addressed as sftp:// or ssh:// URLs. It locks with
-// the same `<file>.lock` directory as SQLite's unix-dotfile VFS, so clients on
-// network mounts and SFTP clients share one hub safely. One ssh connection per
-// destination serves every file and helper below.
+// A nonempty legacy lock directory prevents old clients from accessing hubs
+// that now use process locks. Never remove/recreate its lock file: flock is
+// attached to its inode, not its pathname.
+inline constexpr const char* kProcessLockName = "process-v1";
+class RemoteHubScope {
+public:
+    explicit RemoteHubScope(const std::filesystem::path& hub);
+    ~RemoteHubScope();
+    RemoteHubScope(const RemoteHubScope&) = delete;
+    RemoteHubScope& operator=(const RemoteHubScope&) = delete;
+private:
+    struct Impl;
+    std::unique_ptr<Impl> impl_;
+};
+// Stable across healthy scopes on this thread; changes after any failed scope.
+// Retaining it retains no server process or lock between operations.
+std::shared_ptr<const void> remoteHubCacheIdentity();
+// Remote SQLite access must be inside RemoteHubScope. One locked SSH process
+// serves all files of that operation, without reconnecting after any failure.
 const char* sftpVfs();
 bool isRemotePath(const std::filesystem::path& path);
 std::string canonicalRemotePath(const std::filesystem::path& path);
@@ -30,5 +46,6 @@ void remoteRead(const std::string& url, uint64_t offset, std::span<std::byte> ou
 // Streams the whole file to sink; returns the bytes delivered.
 uint64_t remoteCopy(const std::string& url, const std::function<void(std::span<const std::byte>)>& sink);
 void remoteRmdir(const std::string& url);
+void remoteEnableProcessLock(const std::string& hub);
 
 }  // namespace vc::objects::detail

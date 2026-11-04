@@ -9,11 +9,14 @@ enum class StructureField { Components, Normal, Tangent };
 // gaussian: SciPy Gaussian derivative (radius int(truncate*sigma + .5)) and
 // Gaussian integration, as tracers' ct_structure_tensor. at: evaluate one
 // tensor with Gaussian weights normalized over the whole grid.
+// Python's default boundary follows the derivative: zero for pavel, nearest for
+// gaussian. A native caller choosing gaussian sets boundary itself.
 struct StructureTensor {
     std::string on = "image"; std::size_t channel = 0; std::string output;
     double sigma = 1, rho = 1.5, truncate = 3, scale = 1;
     Derivative derivative = Derivative::Pavel; Boundary boundary = Boundary::Zero;
     StructureField field = StructureField::Components; std::string components = "zyx", confidence;
+    std::string gradient; // optional component cotangent; returns the selected input channel gradient
     std::vector<double> at;
     double p = 1;
 };

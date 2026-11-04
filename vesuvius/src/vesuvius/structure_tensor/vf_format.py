@@ -1,13 +1,30 @@
 #vf_format.py
 from __future__ import annotations
 import numpy as np
-import zarr
-from numcodecs import Blosc
-from vesuvius.data.utils import open_zarr_group, create_zarr_array
-from typing import Optional, Tuple
+from vc_reader.reader import ZarrWriteGroup, ZarrWriter, create_group
+from typing import Any, Dict, Optional, Tuple
 
-def _default_compressor() -> Blosc:
-    return Blosc(cname="zstd", clevel=1, shuffle=Blosc.SHUFFLE)
+_DEFAULT_CODEC = {"cname": "zstd", "level": 1, "shuffle": 1}
+
+def zarr_codec(name: str, level: int) -> Dict[str, Any]:
+    """``ZarrWriter.create`` arguments for ``--zarr-compressor``: an unknown name is zstd at level 1."""
+    name = name.lower()
+    if name == "none":
+        return {"compressor": None}
+    if name in ("zstd", "lz4", "zlib"):
+        return {"cname": name, "level": level, "shuffle": 1}
+    return dict(_DEFAULT_CODEC)
+
+def require_array(group: ZarrWriteGroup, name: str, *, shape, **create) -> ZarrWriter:
+    """The array ``name`` when it exists with this shape, keeping what it holds; otherwise a new one."""
+    if name in group:
+        existing = group[name]
+        if not isinstance(existing, ZarrWriter):
+            raise TypeError(f"{name!r} exists in {group.path!r} but is a group, not an array")
+        if existing.shape != tuple(int(n) for n in shape):
+            raise ValueError(f"array {name!r} in {group.path!r} has shape {existing.shape}, expected {tuple(shape)}")
+        return existing
+    return group.create_array(name, shape=shape, **create)
 
 def encode_dir_to_u8(d: np.ndarray) -> np.ndarray:
     """
@@ -43,13 +60,12 @@ class OMEU8VectorWriter:
         vol_shape_zyx: Tuple[int, int, int],
         *,
         chunks_zyx: Tuple[int, int, int] = (128, 128, 128),
-        compressor: Optional[Blosc] = None,
+        codec: Optional[Dict[str, Any]] = None,
         scale_name: str = "0",
         downsample: int = 1,
         make_confidence: bool = False,
     ):
-        if compressor is None:
-            compressor = _default_compressor()
+        codec = _DEFAULT_CODEC if codec is None else codec
         self.output_path = output_path
         self.group_name = group_name
         self.scale_name = str(scale_name)
@@ -64,35 +80,20 @@ class OMEU8VectorWriter:
         Xds = (X + self.ds - 1) // self.ds
         self.shape_ds = (Zds, Yds, Xds)
 
-        root = open_zarr_group(output_path, mode="a")
-        grp = root.require_group(group_name)
-        self.ds_z = self._require_scale(grp.require_group("z"), chunks_zyx, compressor)
-        self.ds_y = self._require_scale(grp.require_group("y"), chunks_zyx, compressor)
-        self.ds_x = self._require_scale(grp.require_group("x"), chunks_zyx, compressor)
+        root = create_group(output_path)
+        grp = root.create_group(group_name)
+        self.ds_z = self._require_scale(grp.create_group("z"), chunks_zyx, codec)
+        self.ds_y = self._require_scale(grp.create_group("y"), chunks_zyx, codec)
+        self.ds_x = self._require_scale(grp.create_group("x"), chunks_zyx, codec)
 
         self.ds_conf = None
         if self.make_conf:
-            conf_grp = root.require_group("confidence")
-            self.ds_conf = self._require_scale(conf_grp, chunks_zyx, compressor)
+            self.ds_conf = self._require_scale(root.create_group("confidence"), chunks_zyx, codec)
 
-    def _require_scale(self, g: zarr.Group, chunks, compressor):
-        if self.scale_name in g:
-            ds = g[self.scale_name]
-            if tuple(ds.shape) != self.shape_ds:
-                raise ValueError(
-                    f"Existing dataset at {g.path}/{self.scale_name} has shape {ds.shape}, "
-                    f"expected {self.shape_ds}"
-                )
-            return ds
-        return create_zarr_array(
-            g,
-            self.scale_name,
-            shape=self.shape_ds,
-            chunks=chunks,
-            dtype=np.uint8,
-            compressor=compressor,
-            write_empty_chunks=False,
-        )
+    def _require_scale(self, g: ZarrWriteGroup, chunks, codec):
+        array = require_array(g, self.scale_name, shape=self.shape_ds, chunks=chunks, dtype=np.uint8, **codec)
+        array.skip_empty = True
+        return array
 
     def _down_bounds(self, z0, z1, y0, y1, x0, x1):
         s = self.ds

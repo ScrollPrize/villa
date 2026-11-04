@@ -31,7 +31,7 @@
 #include "CFiberWidget.hpp"
 #include "CState.hpp"
 
-#include "OpenDataManifest.hpp"
+#include "OpenDataResourceSelection.hpp"
 #include "segmentation/tools/SegmentationEditManager.hpp"
 #include "overlays/SegmentationOverlayController.hpp"
 #include "overlays/PointsOverlayController.hpp"
@@ -80,7 +80,6 @@ class QSpinBox;
 class QStandardItemModel;
 class QTabWidget;
 class QFrame;
-class FileWatcherService;
 class AxisAlignedSliceController;
 class SegmentationCommandHandler;
 class LineAnnotationController;
@@ -92,6 +91,7 @@ class LineAnnotationDialog;
 class SpiralWorkspace;
 class ProjectWorkspace;
 class FiberMapWorkspace;
+namespace vc3d::fibers3d { class Fiber3DPanel; }
 
 class CWindow : public QMainWindow
 {
@@ -128,8 +128,7 @@ public:
         VolumeNotFound,
     };
 
-    explicit CWindow(size_t cacheSizeGB = CHUNK_CACHE_SIZE_GB,
-                     bool debugDownloadQueue = false);
+    explicit CWindow(size_t cacheSizeGB);
     ~CWindow(void);
 
     bool openVolumePackage(const QString& path,
@@ -279,6 +278,9 @@ private:
     CPointCollectionWidget* _point_collection_widget;
     WrapAnnotationWidget* _wrapAnnotationWidget{nullptr};
     CFiberWidget* _fiberWidget{nullptr};
+    QDockWidget* _fibers3DDock{nullptr};
+    vc3d::fibers3d::Fiber3DPanel* _fibers3DPanel{nullptr};
+    QDockWidget* _scene3DDock{nullptr};
 
     SurfaceTreeWidget *treeWidgetSurfaces;
 
@@ -323,7 +325,6 @@ private:
 
     bool can_change_volume_();
 
-    size_t _cacheSizeBytes = 0;
 
     std::unique_ptr<VolumeOverlayController> _volumeOverlay;
     std::unique_ptr<ViewerManager> _viewerManager;
@@ -355,11 +356,9 @@ private:
     CommandCatalog* _commandCatalog{nullptr};
     // runner for command line tools
     CommandLineToolRunner* _cmdRunner;
-    bool _debugDownloadQueue{false};
     bool _normalGridAvailable{false};
     QString _normalGridPath;
 
-    std::unique_ptr<FileWatcherService> _fileWatcher;
     std::unique_ptr<AxisAlignedSliceController> _axisAlignedSliceController;
     std::unique_ptr<SegmentationCommandHandler> _segmentationCommandHandler;
     std::unique_ptr<LineAnnotationController> _lineAnnotationController;

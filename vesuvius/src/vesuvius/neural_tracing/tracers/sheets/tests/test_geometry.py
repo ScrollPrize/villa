@@ -6,6 +6,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 import tifffile
+from vc_reader import images
 import torch
 
 from vesuvius.neural_tracing.tracers.shared.geometry import interp_at
@@ -34,7 +35,7 @@ def _write_plane_patch(patch: Path, rows: int, cols: int) -> None:
     patch.mkdir(parents=True)
     r, c = np.meshgrid(np.arange(rows), np.arange(cols), indexing='ij')
     for name, values in dict(x=np.full(r.shape, 60.5), y=20.+2*c, z=20.+2*r).items():
-        tifffile.imwrite(patch/f'{name}.tif', values.astype(np.float32))
+        images.write_tiff(patch/f'{name}.tif', values.astype(np.float32))
     (patch/'meta.json').write_text(json.dumps(dict(scale=[.5, .5])))
 
 
@@ -406,7 +407,7 @@ def test_index_uses_measured_cell_when_meta_scale_is_wrong(tmp_path):
         patch = tmp_path/'p'/name
         patch.mkdir(parents=True)
         for axis, values in dict(x=np.full(r.shape, 5.), y=2.*c, z=2.*r).items():
-            tifffile.imwrite(patch/f'{axis}.tif', values.astype(np.float32))
+            images.write_tiff(patch/f'{axis}.tif', values.astype(np.float32))
         (patch/'meta.json').write_text(json.dumps(dict(scale=[scale, scale])))
     infos = {i.name: i for i in build_index(tmp_path/'p', tmp_path/'cache')}
     assert infos['right'].cell == 2. and not infos['right'].stated_cell
@@ -629,10 +630,10 @@ def test_resample_isotropic_squares_the_grid(tmp_path):
     xyz = dict(x=np.full(r.shape, 60.5), y=10.+5*c, z=10.+20*r)
     xyz['x'][3, 8] = -1  # the node new column 2 starts from
     for name, values in xyz.items():
-        tifffile.imwrite(src/f'{name}.tif', values.astype(np.float32))
+        images.write_tiff(src/f'{name}.tif', values.astype(np.float32))
     (src/'meta.json').write_text(json.dumps(dict(scale=[.05, .05])))
     mod.main([str(tmp_path/'src'), str(tmp_path/'out')])
-    out = np.stack([tifffile.imread(tmp_path/'out'/'p0'/f'{n}.tif') for n in 'xyz'], -1)
+    out = np.stack([images.read(tmp_path/'out'/'p0'/f'{n}.tif') for n in 'xyz'], -1)
     ok = np.all(out != -1, -1)
     assert out.shape[:2] == (30, 20) and np.allclose(mod.steps(out, ok), (20., 20.))  # 79 * 5 / 20 + 1 columns
     assert not ok[3, 2] and ok.sum() == 30*20-1  # only the new node built from the invalid one is dropped
@@ -691,23 +692,40 @@ def test_written_tifxyz_mmap_layout(tmp_path):
     assert not tifffile.TiffFile(tmp_path/'mmap'/'mask.tif').pages[0].is_tiled
 
 
-def test_fiber_seed_directions_follow_the_tensor_normal():
+def test_trace_area_uses_the_voxel_size_of_the_traced_volume(tmp_path, monkeypatch):
+    """--volume of an 8.64 um scan: area_cm2 at its meta.json voxelsize (or --voxel-size), not the checkpoint's 9.6."""
+    from vesuvius.neural_tracing.tracers.sheets.tracing import inference
+    rows = np.stack([np.stack([np.full(13, 5.), np.arange(13.)*10, np.full(13, 20.*t)], -1) for t in range(4)])
+    monkeypatch.setattr(inference, 'load_checkpoint', lambda path, device: (None, C.load(None, []), None))
+    monkeypatch.setattr(inference, 'trace', lambda *a, **k: (rows, np.ones(rows.shape[:2])))
+    (tmp_path/'m.pt').touch()
+    (tmp_path/'seed.json').write_text(json.dumps(dict(points=[[5, 0, 0], [5, 120, 0]], direction=[0, 0, 1])))
+    cases = (('meta', dict(voxelsize=8.64), [], 8.64), ('flag', {}, ['--voxel-size', '7.91'], 7.91),
+             ('none', None, [], 9.6))  # no voxel size known: the checkpoint's data.voxel_size_um, as before
+    for name, volume_meta, extra, um in cases:
+        (tmp_path/name).mkdir()
+        if volume_meta is not None:
+            (tmp_path/name/'meta.json').write_text(json.dumps(volume_meta))
+        inference.main(['--checkpoint', str(tmp_path/'m.pt'), '--volume', str(tmp_path/name), '--seed-json',
+                        str(tmp_path/'seed.json'), '--out', str(tmp_path/'out'/name), '--device', 'cpu', *extra])
+        meta = json.loads((tmp_path/'out'/name/'meta.json').read_text())
+        assert meta['voxel_size_um'] == um and meta['area_cm2'] == pytest.approx(meta['area_vx2']*um**2/1e8)
+
+
+def test_fiber_seed_directions_follow_the_tensor_normal(tmp_path):
     """trace_from_fibers: the 2/8 structure-tensor normal of a tilted bright sheet, and an advance direction in the
     sheet, perpendicular to the fiber, pointing up."""
+    from vc_reader.reader import ZarrWriter, open_zarr
     mod = _script('trace_from_fibers')
     n = np.array([1., 0., .5])/np.linalg.norm([1., 0., .5])  # sheet normal (xyz), tilted from horizontal x
     z, y, x = np.meshgrid(*(np.arange(160.),)*3, indexing='ij')
-    vol = (255*np.exp(-.5*((x*n[0]+y*n[1]+z*n[2]-100.)/1.5)**2)).astype(np.uint8)
-
-    class Volume:
-        shape = vol.shape
-
-        def read(self, start, size):
-            return vol[tuple(slice(a, a+b) for a, b in zip(start, size))]
+    array = ZarrWriter.create(tmp_path/'ct', shape=x.shape, chunks=(64, 64, 64), dtype='u1', fill_value=0, compressor=None)
+    array[:] = (255*np.exp(-.5*((x*n[0]+y*n[1]+z*n[2]-100.)/1.5)**2)).astype(np.uint8)
+    volume = open_zarr(tmp_path/'ct')
     pts = np.stack([np.full(5, 80.), 60.+10*np.arange(5), np.full(5, (100.-80.*n[0])/n[2])], 1)  # on it, along y
-    normal = mod.sheet_normal(Volume(), pts[2])
+    normal = mod.sheet_normal(volume, pts[2])
     assert normal is not None and abs(normal@n) > .99
-    d = mod.advance_directions(pts, 1., Volume())
+    d = mod.advance_directions(pts, 1., volume)
     assert d is not None and np.all(d[:, 2] > 0) and np.allclose(d@n, 0, atol=.05) and np.allclose(d[:, 1], 0, atol=.05)
 
 
@@ -1081,7 +1099,7 @@ def test_two_way_fiber_traces_are_written_as_one_surface(tmp_path):
     conf_up[2, 6] = 0.  # one masked point
     conf_down[3] = 0.  # the last down row is not kept
     write_two_way_trace(tmp_path/'both', (up, conf_up), (down, conf_down), cfg, .5, dict(direction='both'))
-    x, z = (tifffile.imread(tmp_path/'both'/f'{c}.tif') for c in 'xz')
+    x, z = (images.read(tmp_path/'both'/f'{c}.tif') for c in 'xz')
     assert x.shape == (7, 13) and json.loads((tmp_path/'both'/'trace.json').read_text())['seed_row'] == 3
     assert np.allclose(z[1:, 0], [60., 80., 100., 120., 140., 160.]) and (x[0] == -1).all()  # down reversed, then up
     assert x[5, 6] == -1 and (x[1:] != -1).sum() == 6*13-1

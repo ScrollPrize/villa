@@ -288,6 +288,8 @@ public:
     // Opens a fiber imported from an Automated Fiber Volume, fitting the whole
     // line in both strips. A Lasagna dataset is optional. Errors are returned
     // through error instead of dialogs.
+    // Immutable, worker-safe reference used by the Line Annotation strips.
+    std::function<cv::Vec3f(const cv::Vec3f&)> displayCenterReference();
     LineAnnotationDialog* openCollectionFiber(uint64_t fiberId, QString* error = nullptr);
     // Opens a fiber annotation (with line_points) read-only, without adding it
     // to the package: nothing is written, optimized or edited, and the fiber
@@ -1090,14 +1092,21 @@ private:
     // decoded for editing. Branch refs resolve against their endpoints in the
     // same snapshot; missing and retired objects are skipped. Line points are
     // read on request, otherwise loaded on demand by ensureFiberLines().
+    struct StoredFiberDependencies {
+        std::map<std::string, std::optional<uint64_t>> peers;
+        std::set<std::string> relationships;
+    };
+    using FiberDependencies = std::unordered_map<std::string, StoredFiberDependencies>;
     [[nodiscard]] std::vector<StoredFiber> readStoredFibers(
-        const std::optional<std::vector<std::string>>& uuids, bool lines = false) const;
+        const std::optional<std::vector<std::string>>& uuids, bool lines = false,
+        FiberDependencies* dependencies = nullptr) const;
     [[nodiscard]] std::optional<StoredFiber> readStoredFiber(uint64_t id, bool lines = false) const;
     // readStoredFibers() for hot UI paths: reuses decoded fibers whose object
-    // generation is unchanged. Cleared on every store commit and attachment,
-    // and when the open volume changes.
+    // and peer generations are unchanged. Store events invalidate old and new
+    // relationship endpoints; attachment and transform changes clear all.
     [[nodiscard]] std::vector<StoredFiber> readStoredFibersCached(
         const std::vector<std::string>& uuids, bool lines = false) const;
+    void invalidateStoredFiberCaches(const vc::objects::StoreSessionEvent& event);
     [[nodiscard]] std::string storedFiberFileName(uint64_t fiberId) const;
     // A fiber read from the store in the open volume's voxels.
     [[nodiscard]] bool fiberInVolume(const StoredFiber& fiber) const;
@@ -1452,6 +1461,8 @@ private:
         _sideStripSessionSnapshotCache;
     // See readStoredFibersCached: decoded fibers keyed by uuid.
     mutable std::unordered_map<std::string, StoredFiber> _storedFiberDecodeCache;
+    mutable FiberDependencies _storedFiberDependencies;
+    mutable std::optional<int64_t> _storedFiberCacheJournalPosition;
     // The voxels _storedFiberDecodeCache was decoded in.
     mutable vc::objects::VolumeVoxels _storedFiberDecodeVolume;
     // See cachedControlSpansForFiber: keyed by fiber id, valid while the
@@ -1537,13 +1548,13 @@ private:
     // error names what refused.
     std::optional<QString> linkStoredControlPoints(StoredFiber& local,
                                                    int localControlIndex,
-                                                   StoredFiber& far,
+                                                   StoredFiber& farFiber,
                                                    int farControlIndex,
                                                    bool autoLink);
     // The pair-level part of linkStoredControlPoints' checks (same fiber,
     // read-only), so an operation can refuse BEFORE it mutates anything.
     [[nodiscard]] std::optional<QString> linkPairEligibilityError(const StoredFiber& local,
-                                                                  const StoredFiber& far) const;
+                                                                  const StoredFiber& farFiber) const;
     mutable QString _lastSuppressedError;
 
     // Transient (in-memory only) staging state for a designated control

@@ -1,7 +1,5 @@
-// Coverage for core/src/NormalGridVolume.cpp. We don't have real .grid
-// fixtures, so the tests exercise the path that returns nullopt/nullptr
-// when grid files are absent. That still covers the cache miss path,
-// metadata access, and cacheStats/resetCacheStats.
+// Coverage for core/src/NormalGridVolume.cpp's store handling and failure paths.
+// Streaming success paths are in test_normal_grid_stream.
 
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
 #include <doctest/doctest.h>
@@ -127,12 +125,14 @@ TEST_CASE("Constructor: remote marker whose fetch fails throws a clean, "
 {
     // Regression for the normal-grid remote-streaming crash: the constructor
     // used to ignore ensure_local_file()'s return value and call
-    // Json::parse_file() unconditionally, so a failed metadata fetch surfaced
+    // nlohmann::json::parse(std::ifstream()) unconditionally, so a failed metadata fetch surfaced
     // as an uncaught std::runtime_error("Cannot open: <path>") that crashed
     // vc_grow_seg_from_seed. It must now throw an intentional error that names
     // the remote source. The marker points at a port that refuses connections
     // so the fetch fails fast without touching external network.
-    auto d = tmpDir("remote_fetch_fail");
+    // The marker directory is the URL's place under a cache root.
+    auto d = tmpDir("remote_fetch_fail") / "http" / "127.0.0.1:1" / "nonexistent-normal-grids";
+    fs::create_directories(d);
     {
         std::ofstream f(d / "normal-grids-remote.json");
         f << "{\"url\": \"http://127.0.0.1:1/nonexistent-normal-grids\"}";
@@ -150,7 +150,7 @@ TEST_CASE("Constructor: remote marker whose fetch fails throws a clean, "
     CHECK(msg.find("Failed to fetch remote normal-grid") != std::string::npos);
     CHECK(msg.find("127.0.0.1:1") != std::string::npos);
     CHECK(msg.find("Cannot open") == std::string::npos);
-    fs::remove_all(d);
+    fs::remove_all(d.parent_path().parent_path().parent_path());
 }
 
 TEST_CASE("Constructor + metadata accessor")
@@ -158,7 +158,7 @@ TEST_CASE("Constructor + metadata accessor")
     auto d = makeEmptyNgvDir("meta_access", 8);
     NormalGridVolume v(d.string());
     CHECK(v.metadata().is_object());
-    CHECK(v.metadata()["sparse-volume"].get_int64() == 8);
+    CHECK(v.metadata()["sparse-volume"].get<int64_t>() == 8);
     fs::remove_all(d);
 }
 

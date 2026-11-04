@@ -51,39 +51,39 @@ TEST_CASE("unmeasured cells are skipped; no-sheet cells are counted but not summ
     cv::Mat_<float> alpha = (cv::Mat_<float>(2, 4) <<
         NaN, 0.1f, 1.f, 1.f,
         0.9f, 0.6f, 1.f, 0.5f);
-    utils::Json s = summarizeOffsets(off, alpha, allValid(2, 4), 5.f, 0.5f);
+    nlohmann::json s = summarizeOffsets(off, alpha, allValid(2, 4), 5.f, 0.5f);
 
-    CHECK(s["rows"].get_int() == 2);
-    CHECK(s["cols"].get_int() == 4);
-    CHECK(s["valid_vertices"].get_int() == 8);
-    CHECK(s["measured_vertices"].get_int() == 7);
-    CHECK(s["no_sheet_vertices"].get_int() == 1);
-    CHECK(s["summarized_vertices"].get_int() == 6);
-    CHECK(s["no_sheet_fraction"].get_double() == doctest::Approx(1.0 / 7.0));
+    CHECK(s["rows"].get<int>() == 2);
+    CHECK(s["cols"].get<int>() == 4);
+    CHECK(s["valid_vertices"].get<int>() == 8);
+    CHECK(s["measured_vertices"].get<int>() == 7);
+    CHECK(s["no_sheet_vertices"].get<int>() == 1);
+    CHECK(s["summarized_vertices"].get<int>() == 6);
+    CHECK(s["no_sheet_fraction"].get<double>() == doctest::Approx(1.0 / 7.0));
 
-    CHECK(s["beyond_threshold_vertices"].get_int() == 2);   // 6 and 10
-    CHECK(s["beyond_threshold_fraction"].get_double() == doctest::Approx(2.0 / 6.0));
+    CHECK(s["beyond_threshold_vertices"].get<int>() == 2);   // 6 and 10
+    CHECK(s["beyond_threshold_fraction"].get<double>() == doctest::Approx(2.0 / 6.0));
 
-    CHECK(s["offset"]["mean"].get_double() == doctest::Approx(14.0 / 6.0));
-    CHECK(s["offset"]["p05"].get_double() == doctest::Approx(-2.5));
-    CHECK(s["offset"]["p50"].get_double() == doctest::Approx(1.0));
-    CHECK(s["offset"]["p95"].get_double() == doctest::Approx(9.0));
+    CHECK(s["offset"]["mean"].get<double>() == doctest::Approx(14.0 / 6.0));
+    CHECK(s["offset"]["p05"].get<double>() == doctest::Approx(-2.5));
+    CHECK(s["offset"]["p50"].get<double>() == doctest::Approx(1.0));
+    CHECK(s["offset"]["p95"].get<double>() == doctest::Approx(9.0));
 
     // |offset| sorted: 0 1 2 3 6 10
-    CHECK(s["abs_offset"]["p50"].get_double() == doctest::Approx(2.5));
-    CHECK(s["abs_offset"]["p90"].get_double() == doctest::Approx(8.0));
-    CHECK(s["abs_offset"]["p95"].get_double() == doctest::Approx(9.0));
-    CHECK(s["abs_offset"]["p99"].get_double() == doctest::Approx(9.8));
-    CHECK(s["abs_offset"]["max"].get_double() == doctest::Approx(10.0));
+    CHECK(s["abs_offset"]["p50"].get<double>() == doctest::Approx(2.5));
+    CHECK(s["abs_offset"]["p90"].get<double>() == doctest::Approx(8.0));
+    CHECK(s["abs_offset"]["p95"].get<double>() == doctest::Approx(9.0));
+    CHECK(s["abs_offset"]["p99"].get<double>() == doctest::Approx(9.8));
+    CHECK(s["abs_offset"]["max"].get<double>() == doctest::Approx(10.0));
 }
 
 TEST_CASE("the threshold is strict and applies to the magnitude")
 {
     cv::Mat_<float> off = (cv::Mat_<float>(1, 4) << -5.f, 5.f, -5.5f, 4.9f);
     cv::Mat_<float> alpha(1, 4, 1.f);
-    utils::Json s = summarizeOffsets(off, alpha, allValid(1, 4), 5.f, 0.5f);
-    CHECK(s["beyond_threshold_vertices"].get_int() == 1);
-    CHECK(s["beyond_threshold_fraction"].get_double() == doctest::Approx(0.25));
+    nlohmann::json s = summarizeOffsets(off, alpha, allValid(1, 4), 5.f, 0.5f);
+    CHECK(s["beyond_threshold_vertices"].get<int>() == 1);
+    CHECK(s["beyond_threshold_fraction"].get<double>() == doctest::Approx(0.25));
 }
 
 TEST_CASE("nothing summarized gives null statistics, not zeros")
@@ -92,19 +92,19 @@ TEST_CASE("nothing summarized gives null statistics, not zeros")
     cv::Mat_<float> alpha(3, 3, NaN);
     off(1, 1) = 0.f;
     alpha(1, 1) = 0.f;
-    utils::Json s = summarizeOffsets(off, alpha, allValid(3, 3), 5.f, 0.5f);
-    CHECK(s["valid_vertices"].get_int() == 9);
-    CHECK(s["measured_vertices"].get_int() == 1);
-    CHECK(s["no_sheet_fraction"].get_double() == doctest::Approx(1.0));
-    CHECK(s["summarized_vertices"].get_int() == 0);
+    nlohmann::json s = summarizeOffsets(off, alpha, allValid(3, 3), 5.f, 0.5f);
+    CHECK(s["valid_vertices"].get<int>() == 9);
+    CHECK(s["measured_vertices"].get<int>() == 1);
+    CHECK(s["no_sheet_fraction"].get<double>() == doctest::Approx(1.0));
+    CHECK(s["summarized_vertices"].get<int>() == 0);
     CHECK(s["beyond_threshold_fraction"].is_null());
     CHECK(s["offset"].size() == 0);
     CHECK(s["abs_offset"].size() == 0);
 
     cv::Mat_<float> none(2, 2, NaN);
-    utils::Json e = summarizeOffsets(none, none, cv::Mat_<std::uint8_t>(2, 2, std::uint8_t(0)), 5.f, 0.5f);
-    CHECK(e["valid_vertices"].get_int() == 0);
-    CHECK(e["measured_vertices"].get_int() == 0);
+    nlohmann::json e = summarizeOffsets(none, none, cv::Mat_<std::uint8_t>(2, 2, std::uint8_t(0)), 5.f, 0.5f);
+    CHECK(e["valid_vertices"].get<int>() == 0);
+    CHECK(e["measured_vertices"].get<int>() == 0);
     CHECK(e["no_sheet_fraction"].is_null());
 }
 

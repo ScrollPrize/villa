@@ -14,10 +14,8 @@
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
 #include "vc_test.hpp"
 
-#include "support/TestZarrVolume.hpp"
-#include "utils/Json.hpp"
-#include "vc/core/types/Array3D.hpp"
-#include "vc/core/types/Volume.hpp"
+#include <vc_reader/zarr_write.hpp>
+#include <nlohmann/json.hpp>
 #include "vc/core/util/QuadSurface.hpp"
 
 #include <opencv2/core.hpp>
@@ -84,23 +82,17 @@ void write_tifxyz(const fs::path& dir)
 // SLAB_DIST voxels away, so an exact probe sample lands on its face.
 void write_volume(const fs::path& dir, float normalZ)
 {
-    vc::test::ZarrVolumeSpec spec;
-    spec.shapeZYX = {VOL_Z, VOL_XY, VOL_XY};
-    spec.chunkShapeZYX = {32, 32, 32};
-    spec.numLevels = 1;
-    spec.uuid = "objrefine-fixture-vol";
-    spec.name = "objrefine-fixture-vol";
-    auto vol = vc::test::createZarrVolume(dir, spec);
-    REQUIRE(vol);
-    Array3D<uint8_t> data({VOL_Z, VOL_XY, VOL_XY}, 0);
+    const vcr::zarr::CreateOptions levelZero{.shape = {VOL_Z, VOL_XY, VOL_XY}, .chunks = {32, 32, 32}, .compressor = "", .overwrite = true};
+    vcr::zarr::Writer::create(dir / "0", levelZero);
+    std::vector<uint8_t> data(std::size_t(VOL_Z) * VOL_XY * VOL_XY, 0);
     for (int z = 0; z < VOL_Z; ++z) {
         if (normalZ * (static_cast<float>(z) - SHEET_Z) < SLAB_DIST - 0.5f)
             continue;
         for (int y = 0; y < VOL_XY; ++y)
             for (int x = SLAB_X0; x < VOL_XY; ++x)
-                data(z, y, x) = 255;
+                data[(std::size_t(z) * VOL_XY + y) * VOL_XY + x] = 255;
     }
-    vc::test::writeZYX(*vol, data, {0, 0, 0}, 0);
+    vcr::zarr::Writer::open(dir / "0").writeRegion({0, 0, 0}, {VOL_Z, VOL_XY, VOL_XY}, data.data());
 }
 
 void write_params(const fs::path& path, bool refine, bool report)
@@ -191,7 +183,9 @@ TEST_CASE("offset report: known offset, grid-aligned maps, surface unchanged")
     float normalZ = 0.f;
     {
         auto surf = load_quad_from_tifxyz(src.string());
-        const cv::Vec3f n = surf->gridNormal(ROWS / 2, COLS / 2);
+        cv::Vec3f n;
+        const float grid[]{float(COLS / 2), float(ROWS / 2)};
+        surf->pointSurface()->pointsAt(grid, 1, nullptr, n.val);
         REQUIRE(std::fabs(std::fabs(n[2]) - 1.f) < 1e-5f);
         normalZ = n[2];
     }
@@ -237,29 +231,29 @@ TEST_CASE("offset report: known offset, grid-aligned maps, surface unchanged")
     REQUIRE(onSlab > 0);
     REQUIRE(offSlab > 0);
 
-    utils::Json j = utils::Json::parse_file(reportDir / "report.json");
-    CHECK(j["tool"].get_string() == "vc_objrefine");
-    CHECK(j["schema_version"].get_int() == 1);
-    CHECK(j["offset_map"].get_string() == "offset.tif");
-    CHECK(j["opacity_map"].get_string() == "opacity.tif");
-    CHECK(j["inputs"]["volume"].get_string() == fs::weakly_canonical(vol).string());
-    CHECK(j["inputs"]["source_surface"].get_string() == fs::weakly_canonical(src).string());
-    CHECK(j["inputs"]["source_uuid"].get_string() == "objrefine-fixture");
-    CHECK(!j["parameters"]["refine"].get_bool());
-    utils::Json& s = j["summary"];
-    CHECK(s["rows"].get_int() == ROWS);
-    CHECK(s["cols"].get_int() == COLS);
+    nlohmann::json j = nlohmann::json::parse(std::ifstream(reportDir / "report.json"));
+    CHECK(j["tool"].get<std::string>() == "vc_objrefine");
+    CHECK(j["schema_version"].get<int>() == 1);
+    CHECK(j["offset_map"].get<std::string>() == "offset.tif");
+    CHECK(j["opacity_map"].get<std::string>() == "opacity.tif");
+    CHECK(j["inputs"]["volume"].get<std::string>() == fs::weakly_canonical(vol).string());
+    CHECK(j["inputs"]["source_surface"].get<std::string>() == fs::weakly_canonical(src).string());
+    CHECK(j["inputs"]["source_uuid"].get<std::string>() == "objrefine-fixture");
+    CHECK(!j["parameters"]["refine"].get<bool>());
+    nlohmann::json& s = j["summary"];
+    CHECK(s["rows"].get<int>() == ROWS);
+    CHECK(s["cols"].get<int>() == COLS);
     // Every point is valid, but refine skips the last row and column.
-    CHECK(s["valid_vertices"].get_int() == ROWS * COLS);
+    CHECK(s["valid_vertices"].get<int>() == ROWS * COLS);
     CHECK(measured < ROWS * COLS);
-    CHECK(s["measured_vertices"].get_int() == measured);
-    CHECK(s["no_sheet_vertices"].get_int() >= offSlab);
-    CHECK(s["no_sheet_vertices"].get_int() + s["summarized_vertices"].get_int()
+    CHECK(s["measured_vertices"].get<int>() == measured);
+    CHECK(s["no_sheet_vertices"].get<int>() >= offSlab);
+    CHECK(s["no_sheet_vertices"].get<int>() + s["summarized_vertices"].get<int>()
           == measured);
     // Every vertex that saw the slab saw it at 10 voxels or more.
-    CHECK(s["beyond_threshold_vertices"].get_int()
-          == s["summarized_vertices"].get_int());
-    CHECK(s["offset"]["p05"].get_double()
+    CHECK(s["beyond_threshold_vertices"].get<int>()
+          == s["summarized_vertices"].get<int>());
+    CHECK(s["offset"]["p05"].get<double>()
           == doctest::Approx(SLAB_DIST).epsilon(1e-4));
 
     // The flag must not change the refined surface, and must agree with it.

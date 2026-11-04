@@ -189,7 +189,7 @@ per source is tracked:
 | `growth` | segmentation growth lifecycle |
 | `lasagna` | Lasagna optimization lifecycle |
 | `catalog` | Open Data sample open lifecycle |
-| `flatten` | SLIM and straighten lifecycle |
+| `flatten` | SLIM lifecycle |
 | `seeding` | bridge-started run or expand batch |
 | `autosave` | explicit dirty-segment save |
 
@@ -262,6 +262,9 @@ dialog.
 - `ping` reports process, application, and protocol identity.
 - `state.get` is a non-mutating snapshot of the current package, volume,
   active segment, editing modes, viewers, point state, and active jobs.
+  `segmentationGrowthMethod` reports the selected method even outside an active
+  editing session. `manualAddFollowingSheet` indicates that an extension is
+  computing; editing remains locked until its completed preview is available.
 - A project is a JSON `.vcproj` file referencing volumes, normal grids, Lasagna
   datasets, and one or more `.vcobj` stores. Each of surfaces, fibers, point
   collections, umbilici, and registrations selects one attached store for
@@ -366,7 +369,7 @@ and never open file pickers.
   are synchronous requests over the existing widget state.
 - `render.tifxyz`, trace, reoptimize, and alpha-composition refinement use the
   shared `tool` source.
-- SLIM and straighten share the `flatten` source and application
+- SLIM uses the `flatten` source and application
   lifecycle.
 - Crop and area recalculation are synchronous.
 - Result paths are returned only after successful launch or completion.
@@ -438,7 +441,6 @@ is the sole bridge method without an MCP tool.
 | `vc3d_fiber_set_follow` | `fiber.set_follow` |
 | `vc3d_fiber_set_tag` | `fiber.set_tag` |
 | `vc3d_flatten_slim` | `flatten.slim` |
-| `vc3d_flatten_straighten` | `flatten.straighten` |
 | `vc3d_get_cursor_point` | `canvas.get_cursor_volume_point` | Resolve a viewer scene position (or the current cursor) to a 3D volume point + surface normal. |
 | `vc3d_get_overlay` | `viewer.get_overlay` | Read the active workspace's overlay-volume settings, shared with the GUI controls. |
 | `vc3d_get_render_settings` | `viewer.get_render_settings` | Read the shared viewer render/overlay settings (intersection lines, overlay opacity, surface normals, highlighted surfaces). |
@@ -459,7 +461,9 @@ is the sole bridge method without an MCP tool.
 | `vc3d_list_points` | `points.list` | List point collections and their points. |
 | `vc3d_list_segments` | `segments.list` | List the surfaces of the open volume (your store and Open Data sample stores) by UUID, with name, tags and active/catalog/bound flags. |
 | `vc3d_list_attached_volumes` | `volume.list` | List volume ids already attached to the open package; this does not discover catalog data available to open. |
+| `vc3d_manual_add_add_constraint` | `segmentation.manual_add.add_constraint` |
 | `vc3d_manual_add_begin` | `segmentation.manual_add.begin` |
+| `vc3d_manual_add_extend` | `segmentation.manual_add.extend` |
 | `vc3d_manual_add_finish` | `segmentation.manual_add.finish` |
 | `vc3d_manual_add_set_interpolation` | `segmentation.manual_add.set_interpolation` |
 | `vc3d_manual_add_set_line_mode` | `segmentation.manual_add.set_line_mode` |

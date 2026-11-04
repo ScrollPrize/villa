@@ -10,7 +10,7 @@ def create_split_conditioning(dataset, patch_idx: int, wrap_idx: int, patch):
     r_min, r_max, c_min, c_max = wrap["bbox_2d"]
 
     # clamp bbox to segment bounds (bbox is inclusive in stored resolution)
-    seg_h, seg_w = seg._valid_mask.shape
+    seg_h, seg_w = seg.shape
     r_min = max(0, r_min)
     r_max = min(seg_h - 1, r_max)
     c_min = max(0, c_min)

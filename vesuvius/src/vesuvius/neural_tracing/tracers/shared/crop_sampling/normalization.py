@@ -1,14 +1,15 @@
 """Per-crop z-score normalization and persisted volume provenance."""
 import json
 from pathlib import Path
-import numba
 import numpy as np
+from vc_reader import transforms as A
+from vc_reader.reader import open_zarr
 
-from vesuvius.neural_tracing.tracers.shared.crop_sampling.volume import open_ct_array
 from vesuvius.neural_tracing.tracers.shared.io import atomic_write
 
 ZSCORE_METHOD = 'crop_zscore_v1'
 ZSCORE_EPSILON = 1e-6
+_ZSCORE = A.Normalize('zscore', nonzero=False, eps=ZSCORE_EPSILON)
 
 
 def volume_key(spec):
@@ -46,7 +47,7 @@ def prepare_normalization(out, specs, *, known=None):
     document = json.loads(json.dumps(document))
     for spec in specs:
         key = volume_key(spec)
-        ct = open_ct_array(spec, 32 << 20)
+        ct = open_zarr(spec.ct_zarr, level=spec.ct_level, cache_dir=spec.cache_dir)
         if (known is not None and key in known['volumes'] and key in document['volumes']
                 and known['volumes'][key] != document['volumes'][key]):
             print(f'Warning: CT normalization record differs from the checkpoint: {key}', flush=True)
@@ -76,24 +77,9 @@ def normalize_ct(image, record):
         raise ValueError('A z-score normalization record is required before sampling model inputs')
     if image.dtype != np.float32 or image.ndim != 3 or not image.flags.c_contiguous:
         raise ValueError('CT normalization requires a contiguous float32 3D crop')
-    mean = image.mean(dtype=np.float32)  # float32 statistics, as the GPU sampler's zscore_crops
-    # Any nonfinite value makes the sum nonfinite (finite crop values are bounded; the sum cannot overflow).
-    if not np.isfinite(mean):
-        raise ValueError('Z-score CT crop contains nonfinite values')
-    std = image.std(dtype=np.float32, mean=mean)  # numpy's own std, without summing the mean again
-    _center_scale(image.reshape(-1), mean, np.float32(max(float(std), ZSCORE_EPSILON)))
-
-
-@numba.njit(cache=True, fastmath=False, nogil=True)
-def _center_scale(values, mean, scale):
-    """``values -= mean; values /= scale`` in one pass: the same float32 operations."""
-    for p in range(len(values)):
-        values[p] = (values[p] - mean) / scale
+    _ZSCORE(image[None], inplace=True)
 
 
 def zscore_crops(crops):
-    """Per-crop z-score of torch crops (..., D, H, W) (population statistics in the crops' dtype, ``ZSCORE_EPSILON``):
-    the GPU sampler's counterpart of ``normalize_ct``."""
-    mean = crops.mean((-3, -2, -1), keepdim=True)
-    std = crops.std((-3, -2, -1), keepdim=True, unbiased=False)
-    return (crops-mean)/std.clamp_min(ZSCORE_EPSILON)
+    """Per-crop z-score of torch crops (..., D, H, W): the GPU sampler's counterpart of ``normalize_ct``."""
+    return _ZSCORE.batch(crops.reshape(-1, 1, *crops.shape[-3:])).view_as(crops)

@@ -5,7 +5,7 @@
 // core/test/test_objrefine_offset_report.cpp for the fixtures.
 #pragma once
 
-#include "utils/Json.hpp"
+#include <nlohmann/json.hpp>
 
 #include <opencv2/core.hpp>
 
@@ -37,7 +37,7 @@ inline double percentile(const std::vector<float>& sorted, double q)
 // inside the scan range: its offset is a weighted mean of almost nothing (0
 // when the opacity is 0), not a distance, so it is counted as no_sheet and
 // left out of the statistics.
-inline utils::Json summarizeOffsets(const cv::Mat_<float>& offset,
+inline nlohmann::json summarizeOffsets(const cv::Mat_<float>& offset,
                                     const cv::Mat_<float>& opacity,
                                     const cv::Mat_<std::uint8_t>& valid,
                                     float threshold,
@@ -73,7 +73,7 @@ inline utils::Json summarizeOffsets(const cv::Mat_<float>& offset,
     }
 
     const auto summarized = static_cast<std::uint64_t>(values.size());
-    utils::Json s = utils::Json::object();
+    nlohmann::json s = nlohmann::json::object();
     s["rows"] = offset.rows;
     s["cols"] = offset.cols;
     s["threshold"] = static_cast<double>(threshold);
@@ -90,8 +90,8 @@ inline utils::Json summarizeOffsets(const cv::Mat_<float>& offset,
         s["no_sheet_fraction"] = nullptr;
     }
 
-    utils::Json signedStats = utils::Json::object();
-    utils::Json absStats = utils::Json::object();
+    nlohmann::json signedStats = nlohmann::json::object();
+    nlohmann::json absStats = nlohmann::json::object();
     if (summarized > 0) {
         s["beyond_threshold_fraction"] =
             static_cast<double>(beyond) / static_cast<double>(summarized);

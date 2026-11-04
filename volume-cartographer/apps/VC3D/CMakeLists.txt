@@ -1,16 +1,15 @@
 set(CMAKE_AUTORCC ON)
 
-set(CHUNK_CACHE_SIZE_GB "10" CACHE STRING "size of the chunk cache in gigabytes")
-add_definitions(-DCHUNK_CACHE_SIZE_GB=${CHUNK_CACHE_SIZE_GB})
-
 # Qt shim + Qt image helpers formerly in vc_ui; wrap the shim header for MOC.
 qt6_wrap_cpp(vccollection_moc ${CMAKE_SOURCE_DIR}/core/include/vc/ui/VCCollection.hpp)
 
 set(srcs
+    DisplayPalette.cpp
+    Colormaps.cpp
     ${CMAKE_SOURCE_DIR}/core/src/VCCollection.cpp
     ${vccollection_moc}
-    VCAppMain.cpp
     CState.cpp
+    OpenedVolumes.cpp
     CState.hpp
     Keybinds.cpp
     Keybinds.hpp
@@ -21,16 +20,55 @@ set(srcs
     CommandPalette.cpp
     CommandPalette.hpp
     CWindow.cpp
+    FiberCollectionGenerator.cpp
+    FiberCollectionGeneratorDialog.cpp
     FiberCollectionController.cpp
     SurfaceCatalog.cpp
     SurfaceCatalog.hpp
     FiberCollectionController.hpp
     FiberDisplayOptions.hpp
+    FiberOverlayColors.hpp
+    fibers3d/Fiber3DScene.hpp
+    fibers3d/Fiber3DData.cpp
+    fibers3d/Fiber3DData.hpp
+    fibers3d/Fiber3DCanvas.cpp
+    scene3d/Scene3DCanvas.cpp
+    scene3d/Scene3DPanel.cpp
+    scene3d/Scene3DPanel.hpp
+    scene3d/MemoryBudgetInput.hpp
+    scene3d/VolumePreview.cpp
+    scene3d/VolumePreview.hpp
+    fibers3d/Fiber3DCanvas.hpp
+    fibers3d/Fiber3DRenderGeometry.hpp
+    fibers3d/Fiber3DColor.hpp
+    fibers3d/Fiber3DGeometry.hpp
+    fibers3d/Fiber3DPanel.cpp
+    fibers3d/Fiber3DPanel.hpp
+    fibers3d/Fiber3DRibbon.hpp
+    fibers3d/Fiber3DRibbon.cpp
+    fibers3d/Fiber3DRibbonControls.hpp
+    fibers3d/Fiber3DRibbonControls.cpp
+    fibers3d/Fiber3DCT.hpp
+    fibers3d/Fiber3DCT.cpp
+    fibers3d/Fiber3DSlices.hpp
+    fibers3d/Fiber3DSlices.cpp
+    fibers3d/Fiber3DVolumeRenderer.hpp
+    fibers3d/Fiber3DVolumeRenderer.cpp
+    fibers3d/Fiber3DSliceControls.hpp
+    fibers3d/Fiber3DSliceControls.cpp
+    fibers3d/Fiber3DSurfaceMesh.hpp
+    fibers3d/Fiber3DSurfaceTexture.cpp
+    fibers3d/Fiber3DSurfaceMesh.cpp
+    fibers3d/Fiber3DSurfaceProximity.hpp
+    fibers3d/Fiber3DSurfaceProximity.cpp
+    fibers3d/Fiber3DSurfaceRenderer.hpp
+    fibers3d/Fiber3DSurfaceRenderer.cpp
+    fibers3d/Fiber3DSurfaceControls.hpp
+    fibers3d/Fiber3DSurfaceControls.cpp
+    LineAnnotationPolylineIndices.hpp
     CWindowContextMenu.cpp
     StatusDockPanelHost.cpp
     StatusDockPanelHost.hpp
-    FileWatcherService.cpp
-    FileWatcherService.hpp
     AxisAlignedSliceController.cpp
     AxisAlignedSliceController.hpp
     LineAnnotationFiberDeletion.hpp
@@ -66,14 +104,12 @@ set(srcs
     LineAnnotationGeneratedViews.hpp
     OpenDataCatalogWindow.cpp
     OpenDataCatalogWindow.hpp
-    OpenDataManifest.cpp
+    OpenDataResourceSelection.cpp
     OpenDataLasagna.cpp
     OpenDataLasagna.hpp
-    OpenDataManifest.hpp
+    OpenDataResourceSelection.hpp
     OpenDataSampleProject.cpp
     OpenDataSampleProject.hpp
-    OpenDataVolumePrefill.cpp
-    OpenDataVolumePrefill.hpp
     OpenDataVolumeOrientation.cpp
     OpenDataVolumeOrientation.hpp
     OpenDataNormalGrids.cpp
@@ -82,6 +118,7 @@ set(srcs
     VolumeRegistrations.hpp
     CommandLaunchError.hpp
     FiberSaveBatchTracker.hpp
+    GrowPatchSeedDialog.cpp
     SegmentationCommandHandler.cpp
     SegmentationCommandHandler.hpp
     volume_viewers/annotation_tools/SameWrapAnnotationTool.cpp
@@ -107,11 +144,7 @@ set(srcs
     elements/RangeSlider.hpp
     elements/ViewerStatsBar.cpp
     elements/ViewerStatsBar.hpp
-    elements/DownloadQueueStats.cpp
-    elements/DownloadQueueStats.hpp
     elements/GrowOnlyLabel.hpp
-    elements/DownloadQueueDebugOverlay.cpp
-    elements/DownloadQueueDebugOverlay.hpp
     elements/ViewerSplitGrid.cpp
     elements/ViewerSplitGrid.hpp
     SettingsFilter.cpp
@@ -144,8 +177,6 @@ set(srcs
     segmentation/panels/SegmentationCustomParamsPanel.hpp
     segmentation/panels/SegmentationNeuralTracerPanel.cpp
     segmentation/panels/SegmentationNeuralTracerPanel.hpp
-    segmentation/panels/SegmentationDirectionFieldPanel.cpp
-    segmentation/panels/SegmentationDirectionFieldPanel.hpp
     segmentation/panels/SegmentationManualAddPanel.cpp
     segmentation/panels/SegmentationManualAddPanel.hpp
     segmentation/growth/SegmentationGrowth.cpp
@@ -157,11 +188,14 @@ set(srcs
     segmentation/tools/SurfaceMaskBrushTool.hpp
     segmentation/tools/ManualAddTool.cpp
     segmentation/tools/ManualAddTool.hpp
+    segmentation/tools/SheetNormalField.hpp
     segmentation/tools/ThinPlateSpline3d.cpp
     segmentation/tools/ThinPlateSpline3d.hpp
     segmentation/tools/SegmentationPushPullTool.cpp
     segmentation/tools/SegmentationPushPullTool.hpp
     segmentation/tools/SegmentationTool.hpp
+    segmentation/SurfaceGridEdit.cpp
+    segmentation/SurfaceGridEdit.hpp
     segmentation/SegmentationModule_Falloff.cpp
     segmentation/SegmentationModule_Input.cpp
     segmentation/SegmentationModule_Session.cpp
@@ -293,6 +327,8 @@ set(srcs
     elements/COutlinedTextItem.cpp
     volume_viewers/CChunkedVolumeViewer.cpp
     volume_viewers/CChunkedVolumeViewer.hpp
+    volume_viewers/ViewerSampling.cpp
+    volume_viewers/ViewerSampling.hpp
     volume_viewers/CameraGizmoWidget.cpp
     volume_viewers/CameraGizmoWidget.hpp
     volume_viewers/VolumetricCompositor.cpp
@@ -335,7 +371,13 @@ if(VC_ENABLE_TSAN OR VC_ENABLE_LSAN OR VC_ENABLE_UBSAN OR VC_ENABLE_ASAN)
 endif()
 
 
-add_executable(VC3D ${srcs} resources.qrc themes/themes.qrc)
+# Everything but main() is one object library, so the app and the benchmarks
+# (VC_BUILD_BENCHMARKS) link the same compiled viewer and controller code.
+add_library(vc3d_app OBJECT ${srcs} resources.qrc themes/themes.qrc)
+add_executable(VC3D VCAppMain.cpp)
+target_link_libraries(VC3D PRIVATE vc3d_app)
+# Its uic headers (ui_*.h) are included by VCAppMain.cpp and the benchmarks too.
+target_include_directories(vc3d_app PUBLIC ${CMAKE_CURRENT_BINARY_DIR}/vc3d_app_autogen/include)
 
 if(WIN32)
     # GUI subsystem so double-click launch doesn't open a console window.
@@ -344,11 +386,10 @@ if(WIN32)
     target_sources(VC3D PRIVATE VC3D.rc)
 endif()
 
-target_include_directories(VC3D
-    PRIVATE
+target_include_directories(vc3d_app
+    PUBLIC
         ${CMAKE_CURRENT_SOURCE_DIR}
         ${CMAKE_SOURCE_DIR}/core/src
-        ${CMAKE_SOURCE_DIR}/libs/djikstra3d
 )
 
 # Avahi for mDNS service discovery (Linux only)
@@ -360,17 +401,17 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
 endif()
 
 if(AVAHI_FOUND)
-    target_compile_definitions(VC3D PRIVATE VC_HAVE_AVAHI=1)
+    target_compile_definitions(vc3d_app PUBLIC VC_HAVE_AVAHI=1)
 else()
-    target_compile_definitions(VC3D PRIVATE VC_HAVE_AVAHI=0)
+    target_compile_definitions(vc3d_app PUBLIC VC_HAVE_AVAHI=0)
 endif()
 
 find_package(mimalloc QUIET)
 if(mimalloc_FOUND)
-    target_compile_definitions(VC3D PRIVATE VC_HAVE_MIMALLOC=1)
+    target_compile_definitions(vc3d_app PUBLIC VC_HAVE_MIMALLOC=1)
 endif()
 
-target_link_libraries(VC3D
+target_link_libraries(vc3d_app PUBLIC
     # mimalloc first so its symbols win malloc/free resolution.
     $<$<BOOL:${mimalloc_FOUND}>:mimalloc>
     vc_core
@@ -388,8 +429,18 @@ target_link_libraries(VC3D
     Qt6::OpenGLWidgets
     opencv_ximgproc
     $<$<BOOL:${AVAHI_FOUND}>:PkgConfig::AVAHI>
-    Blosc::blosc
 )
+
+# Headless Manual Add edge extension along the sheet (no GUI). Qt Core only
+# because ManualAddTool's headers use it.
+add_executable(vc_extend_edge
+    cli/vc_extend_edge.cpp
+    segmentation/SurfaceGridEdit.cpp
+    segmentation/tools/AutoExtend.cpp
+    segmentation/tools/ManualAddTool.cpp
+    segmentation/tools/ThinPlateSpline3d.cpp)
+target_include_directories(vc_extend_edge PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(vc_extend_edge PRIVATE vc_core Qt6::Core Boost::program_options)
 
 # Build-tree Qt plugin deployment (MSVC/vcpkg). vcpkg copies the Qt DLLs next to
 # the executable but not the plugin tree, so a freshly built VC3D.exe cannot find
@@ -435,7 +486,7 @@ if(VC_USE_PCH)
     # headers. Qt stays out of vc_core's shared PCH so the Qt-free CLI apps that
     # REUSE_FROM it don't pay to parse Qt. (Can't REUSE_FROM vc_core and add Qt
     # — a target has one PCH — so build VC3D's directly from the same list.)
-    target_precompile_headers(VC3D PRIVATE
+    target_precompile_headers(vc3d_app PRIVATE
         ${VC_PCH_HEADERS}
         "$<$<COMPILE_LANGUAGE:CXX>:<QtCore/QtCore>>"
         "$<$<COMPILE_LANGUAGE:CXX>:<QtWidgets/QtWidgets>>"
@@ -471,7 +522,7 @@ if(EXISTS "${_vc3d_fiber_format_src}/__init__.py")
 endif()
 
 if(VC_TESTING)
-    set_source_files_properties(LineAnnotationController.cpp SurfacePanelController.cpp VCAppMain.cpp PROPERTIES COMPILE_DEFINITIONS VC_TESTING)
+    set_source_files_properties(LineAnnotationController.cpp SurfacePanelController.cpp VCAppMain.cpp scene3d/Scene3DPanel.cpp PROPERTIES COMPILE_DEFINITIONS VC_TESTING)
     # The in-binary store tests build their fixture volumes with core/test/support.
-    target_include_directories(VC3D PRIVATE ${PROJECT_SOURCE_DIR}/core/test)
+    target_include_directories(vc3d_app PUBLIC ${PROJECT_SOURCE_DIR}/core/test)
 endif()

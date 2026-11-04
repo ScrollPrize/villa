@@ -1,21 +1,23 @@
-#include "utils/Json.hpp"
+#include <nlohmann/json.hpp>
 #include "vc_objrefine_offset_report.hpp"
 
 
-#include "vc/core/types/Volume.hpp"
-#include "vc/core/render/ChunkCache.hpp"
+#include <vc_reader/grid.hpp>
+#include <vc_reader/display.hpp>
+#include <vc_reader/zarr.hpp>
+#include <vc_reader/array.hpp>
 
-#include <opencv2/imgcodecs.hpp>
 #include <opencv2/core.hpp>
 #include <opencv2/imgproc.hpp>
 
+#include "vc/core/util/CudaSampling.hpp"
 #include "vc/core/util/Geometry.hpp"
 #include "vc/core/util/PlaneSurface.hpp"
 #include "vc/core/util/QuadSurface.hpp"
 #include "vc/core/util/StoreToolOptions.hpp"
 #include "vc/core/util/StreamOperators.hpp"
 #include "vc/core/util/Surface.hpp"
-#include "vc/core/util/Tiff.hpp"
+#include <vc_reader/image_write.hpp>
 
 #include <filesystem>
 #include <fstream>
@@ -55,51 +57,51 @@ struct RefinementConfig {
     float offset_min_opacity = 0.5f;
 };
 
-static RefinementConfig parse_config(const utils::Json& params)
+static RefinementConfig parse_config(const nlohmann::json& params)
 {
     RefinementConfig cfg;
-    if (params.contains("refine")) cfg.refine = params.at("refine").get_bool();
-    if (params.contains("start")) cfg.start = params.at("start").get_float();
-    if (params.contains("stop")) cfg.stop = params.at("stop").get_float();
-    if (params.contains("step")) cfg.step = params.at("step").get_float();
-    if (params.contains("border_off")) cfg.border_off = params.at("border_off").get_float();
-    if (params.contains("r")) cfg.r = params.at("r").get_int();
-    if (params.contains("gen_vertexcolor")) cfg.gen_vertexcolor = params.at("gen_vertexcolor").get_bool();
-    if (params.contains("overwrite")) cfg.overwrite = params.at("overwrite").get_bool();
-    if (params.contains("reader_scale")) cfg.reader_scale = params.at("reader_scale").get_float();
-    if (params.contains("offset_report")) cfg.offset_report = params.at("offset_report").get_bool();
-    if (params.contains("offset_threshold")) cfg.offset_threshold = params.at("offset_threshold").get_float();
-    if (params.contains("offset_min_opacity")) cfg.offset_min_opacity = params.at("offset_min_opacity").get_float();
+    if (params.contains("refine")) cfg.refine = params.at("refine").get<bool>();
+    if (params.contains("start")) cfg.start = params.at("start").get<float>();
+    if (params.contains("stop")) cfg.stop = params.at("stop").get<float>();
+    if (params.contains("step")) cfg.step = params.at("step").get<float>();
+    if (params.contains("border_off")) cfg.border_off = params.at("border_off").get<float>();
+    if (params.contains("r")) cfg.r = params.at("r").get<int>();
+    if (params.contains("gen_vertexcolor")) cfg.gen_vertexcolor = params.at("gen_vertexcolor").get<bool>();
+    if (params.contains("overwrite")) cfg.overwrite = params.at("overwrite").get<bool>();
+    if (params.contains("reader_scale")) cfg.reader_scale = params.at("reader_scale").get<float>();
+    if (params.contains("offset_report")) cfg.offset_report = params.at("offset_report").get<bool>();
+    if (params.contains("offset_threshold")) cfg.offset_threshold = params.at("offset_threshold").get<float>();
+    if (params.contains("offset_min_opacity")) cfg.offset_min_opacity = params.at("offset_min_opacity").get<float>();
     if (params.contains("cache_bytes")) {
-        const auto bytes = params.at("cache_bytes").get_uint64();
+        const auto bytes = params.at("cache_bytes").get<uint64_t>();
         cfg.cache_bytes = static_cast<std::size_t>(bytes);
     } else if (params.contains("cache_mb")) {
-        const auto mb = params.at("cache_mb").get_double();
+        const auto mb = params.at("cache_mb").get<double>();
         cfg.cache_bytes = static_cast<std::size_t>(std::max(1.0, mb) * 1024.0 * 1024.0);
     } else if (params.contains("cache_gb")) {
-        const auto gb = params.at("cache_gb").get_double();
+        const auto gb = params.at("cache_gb").get<double>();
         cfg.cache_bytes = static_cast<std::size_t>(std::max(0.001, gb) * 1024.0 * 1024.0 * 1024.0);
     }
 
     if (params.contains("low")) {
-        double v = params.at("low").get_double();
+        double v = params.at("low").get<double>();
         if (v > 1.0) v /= 255.0;
         cfg.low = static_cast<float>(std::clamp(v, 0.0, 1.0));
     }
     if (params.contains("high")) {
-        double v = params.at("high").get_double();
+        double v = params.at("high").get<double>();
         if (v > 1.0) v /= 255.0;
         cfg.high = static_cast<float>(std::clamp(v, 0.0, 1.0));
     }
 
     if (params.contains("scale_group")) {
         const auto& v = params.at("scale_group");
-        cfg.dataset_group = v.is_string() ? v.get_string()
-                                          : std::to_string(v.get_int());
+        cfg.dataset_group = v.is_string() ? v.get<std::string>()
+                                          : std::to_string(v.get<int>());
     } else if (params.contains("scale_level")) {
         const auto& v = params.at("scale_level");
-        cfg.dataset_group = v.is_string() ? v.get_string()
-                                          : std::to_string(v.get_int());
+        cfg.dataset_group = v.is_string() ? v.get<std::string>()
+                                          : std::to_string(v.get<int>());
     }
 
     return cfg;
@@ -141,16 +143,40 @@ bool istype(const std::string &line, const std::string &type)
 }
 
 
+// The sampled pyramid level of the volume and the placement of its level 0.
 struct DSReader {
-    Volume* volume;
+    vcr::zarr::OpenedArray& level;
+    vcr::zarr::LevelPlacement base;
     float scale;
-    int level;
-    std::mutex read_mutex;
+    std::filesystem::path path;  // the volume, for the offset report
 };
 
-// Opacity-weighted offset along `normal` of the first papyrus the scan meets.
-// `opacity`, when given, receives the accumulated opacity in [0, 1]; near 0
-// means no papyrus was found between start and stop.
+// Trilinear samples at volume XYZ points (mapped through the levels' placements),
+// rounded to 8 bits only for output.
+static cv::Mat_<uint8_t> sample(DSReader& reader, const cv::Mat_<cv::Vec3f>& xyz)
+{
+    const auto map = reader.level.placement.indexMapFrom(reader.base);
+    const std::size_t n = xyz.total();
+    std::vector<double> zyx(3 * n);
+    for (std::size_t i = 0; i < n; ++i) {
+        const cv::Vec3f& p = xyz(int(i));
+        for (std::size_t a = 0; a < 3; ++a)
+            zyx[3 * i + a] = map.scale[a] * double(p[2 - int(a)]) + map.offset[a];
+    }
+    std::vector<float> values(n);
+    vc::cuda::sampleLinear(*reader.level.array, reader.level.meta.type, vc::cuda::toolReader(reader.level), zyx.data(), n, values.data());
+    cv::Mat_<uint8_t> out(xyz.size());
+    vcr::display::toUint8(values.data(), n, out.ptr(), nullptr,
+                         {1, vcr::display::Rounding::NearestEven, true});
+    return out;
+}
+
+// The opacity-weighted offset along `normal` of the volume around `point`: the layers
+// of a d x d plane patch (pixel (0, 0) at the point, steps of the plane's basis / scale)
+// sampled linearly at start, start + step, ... stop, kept in float, blurred and
+// composited front to back at the patch's centre pixel. `opacity`, when given,
+// receives the accumulated opacity in [0, 1]; near 0 means no papyrus was found
+// between start and stop.
 float alphacomp_offset(DSReader &reader, cv::Vec3f point, cv::Vec3f normal, float start, float stop, float step, float low, float high, int r,
                        float* opacity = nullptr)
 {
@@ -158,28 +184,30 @@ float alphacomp_offset(DSReader &reader, cv::Vec3f point, cv::Vec3f normal, floa
     cv::Size size = {d,d};
     cv::Point2i c = {r,r};
 
+    float s = copysignf(1.0,step);
+    std::vector<float> offsets;
+    for(double off=start;off*s<=stop*s;off+=step)
+        offsets.push_back(float(off));
+
+    const PlaneSurface plane(point, normal);
+    const float m = 1.0f / reader.scale;
+    const cv::Vec3f dx = plane.basisX() * m, dy = plane.basisY() * m;
+    vcr::grid::Request request;
+    request.levels = {vcr::zarr::gridLevel(reader.level, reader.base, vc::cuda::toolReader(reader.level))};
+    request.offsets = offsets;
+    const auto layers = vcr::grid::sample(vcr::grid::Plane{{point[0], point[1], point[2]}, {dx[0], dx[1], dx[2]},
+                                                           {dy[0], dy[1], dy[2]}, {normal[0], normal[1], normal[2]}, d, d},
+                                          request);
+
     float transparent = 1;
     cv::Mat_<float> blur(size, 0);
     float integ_z = 0;
-
-    cv::Mat_<cv::Vec3f> coords;
-    PlaneSurface plane(point, normal);
-    plane.gen(&coords, nullptr, size, cv::Vec3f(0,0,0), reader.scale, {0,0,0});
-
-    float s = copysignf(1.0,step);
-
-    for(double off=start;off*s<=stop*s;off+=step) {
-        cv::Mat_<uint8_t> slice;
-        cv::Mat_<cv::Vec3f> offmat(size, normal*off);
-        {
-            std::lock_guard<std::mutex> lock(reader.read_mutex);
-            vc::SampleParams sp;
-            sp.level = reader.level;
-            reader.volume->sample(slice, coords+offmat, sp);
+    cv::Mat_<float> floatslice(size);
+    for (std::size_t k = 0; k < offsets.size(); ++k) {
+        for (int i = 0; i < d * d; ++i) {
+            const float v = layers.values[k * std::size_t(d * d) + std::size_t(i)];
+            floatslice(i) = (std::isnan(v) ? 0.0f : std::clamp(v, 0.0f, 255.0f)) / 255.0f;
         }
-
-        cv::Mat floatslice;
-        slice.convertTo(floatslice, CV_32F, 1/255.0);
 
         cv::GaussianBlur(floatslice, blur, {d,d}, 0);
         cv::Mat_<float> opaq_slice = blur;
@@ -189,7 +217,7 @@ float alphacomp_offset(DSReader &reader, cv::Vec3f point, cv::Vec3f normal, floa
         opaq_slice = cv::max(opaq_slice,0);
 
         float joint = transparent*opaq_slice(c);
-        integ_z += joint * off;
+        integ_z += joint * offsets[k];
         transparent = transparent-joint;
     }
 
@@ -279,11 +307,8 @@ int process_obj(const std::string& src,
     cv::Mat_<uint8_t> slice;
     bool vertexcolor = cfg.gen_vertexcolor;
     if (vertexcolor) {
-        std::lock_guard<std::mutex> lock(reader.read_mutex);
         cv::Mat_<cv::Vec3f> vs_mat(static_cast<int>(vs.size()), 1, vs.data());
-        vc::SampleParams sp;
-        sp.level = reader.level;
-        reader.volume->sample(slice, vs_mat, sp);
+        slice = sample(reader, vs_mat);
     }
 
     obj.clear();
@@ -372,7 +397,7 @@ std::string reportOnlyRefusal(const fs::path& src, const fs::path& dst, bool ove
 void writeOffsetReport(const fs::path& dir,
                        const cv::Mat_<float>& offsetMap,
                        const cv::Mat_<float>& opacityMap,
-                       const utils::Json& report,
+                       const nlohmann::json& report,
                        float dpi)
 {
     const fs::path tmp = dir.parent_path() / ("." + dir.filename().string() + ".tmp");
@@ -380,8 +405,12 @@ void writeOffsetReport(const fs::path& dir,
     fs::remove_all(tmp, ec);
     try {
         fs::create_directories(tmp);
-        writeTiff(tmp / "offset.tif", offsetMap, -1, 0, 0, -1.0f, COMPRESSION_NONE, dpi);
-        writeTiff(tmp / "opacity.tif", opacityMap, -1, 0, 0, -1.0f, COMPRESSION_NONE, dpi);
+        vcr::sources::TiffOptions tiff;
+        if (dpi > 0) tiff.pixelUm = 25400.0 / dpi;
+        const cv::Mat_<float> offsets = offsetMap.isContinuous() ? offsetMap : offsetMap.clone();
+        const cv::Mat_<float> opacities = opacityMap.isContinuous() ? opacityMap : opacityMap.clone();
+        vcr::sources::writeTiff(tmp / "offset.tif", offsets.ptr(), "<f4", offsets.rows, offsets.cols, 1, tiff);
+        vcr::sources::writeTiff(tmp / "opacity.tif", opacities.ptr(), "<f4", opacities.rows, opacities.cols, 1, tiff);
         {
             std::ofstream out(tmp / "report.json");
             out << report.dump(4) << std::endl;
@@ -404,7 +433,7 @@ void writeOffsetReport(const fs::path& dir,
 // With offsetMap and opacityMap (the offset report), each vertex's offset and
 // accumulated opacity also land there, on the surface grid; NaN marks vertices
 // where no ray was cast: the same ones refine leaves in place (loc_valid fails,
-// which includes the last row and column, or gridNormal has no valid normal there).
+// which includes the last row and column, or the surface has no valid normal there).
 std::unique_ptr<QuadSurface> refine_surface(QuadSurface& surf, DSReader& reader, const RefinementConfig& cfg,
                                             cv::Mat_<float>* offsetMap = nullptr,
                                             cv::Mat_<float>* opacityMap = nullptr)
@@ -433,7 +462,9 @@ std::unique_ptr<QuadSurface> refine_surface(QuadSurface& surf, DSReader& reader,
                 if (!loc_valid(original, cv::Vec2d(y, x))) {
                     continue;
                 }
-                const cv::Vec3f normal = surf.gridNormal(y, x);
+                cv::Vec3f normal;
+                const float normalGrid[]{float(x),float(y)};
+                surf.pointSurface()->pointsAt(normalGrid,1,nullptr,normal.val);
                 if (!normal_is_valid(normal)) {
                     continue;
                 }
@@ -513,31 +544,31 @@ int process_tifxyz(const std::filesystem::path& src,
         }
 
         if (!cfg.offset_report) {
-            // An earlier report described the geometry just replaced. The
-            // save already drops subfolders on Linux and macOS, not on Windows.
+            // An earlier report described the geometry just replaced, and
+            // saving over a segment keeps its subfolders, so remove it.
             std::error_code ec;
             std::filesystem::remove_all(reportDir, ec);
         }
     }
 
     if (cfg.offset_report) {
-        utils::Json report = utils::Json::object();
+        nlohmann::json report = nlohmann::json::object();
         report["tool"] = "vc_objrefine";
         report["schema_version"] = 1;
         report["offset_map"] = "offset.tif";
         report["opacity_map"] = "opacity.tif";
         report["units"] = "source surface coordinates (full-resolution voxels) along the grid normal; positive is the normal direction";
-        utils::Json inputs = utils::Json::object();
-        inputs["volume"] = normalizedPath(reader.volume->path()).string();
+        nlohmann::json inputs = nlohmann::json::object();
+        inputs["volume"] = normalizedPath(reader.path).string();
         inputs["source_surface"] = normalizedPath(src).string();
         if (surf->meta.is_object() && surf->meta.contains("uuid") &&
             surf->meta["uuid"].is_string()) {
-            inputs["source_uuid"] = surf->meta["uuid"].get_string();
+            inputs["source_uuid"] = surf->meta["uuid"].get<std::string>();
         } else {
             inputs["source_uuid"] = nullptr;
         }
         report["inputs"] = std::move(inputs);
-        utils::Json params = utils::Json::object();
+        nlohmann::json params = nlohmann::json::object();
         params["refine"] = cfg.refine;
         params["start"] = static_cast<double>(cfg.start);
         params["stop"] = static_cast<double>(cfg.stop);
@@ -626,6 +657,7 @@ int main(int argc, char *argv[])
     // Store mode: the --surface is refined in place, or into a new surface
     // when --name is given; with --volume-uuid it is read in that volume's
     // voxels (the zarr's) through the store's view of it.
+    vc::cuda::applyToolOptions(argc, argv);
     std::vector<std::string> args(argv + 1, argv + argc);
     std::optional<StoreToolOptions> store;
     try {
@@ -641,8 +673,8 @@ int main(int argc, char *argv[])
                   << " <zarr-volume> <json-params>" << std::endl
                   << "  in store mode the surface is refined in place, or into a new surface named --name; with"
                   << " --volume-uuid it is read in that volume's voxels (the zarr's) through the store's view of it"
-                  << std::endl;
-        return EXIT_SUCCESS;
+                  << std::endl << vc::cuda::toolOptionsHelp();
+        return EXIT_FAILURE;
     }
 
     const std::filesystem::path vol_path = args[0];
@@ -656,7 +688,7 @@ int main(int argc, char *argv[])
         return EXIT_FAILURE;
     }
 
-    const utils::Json params = utils::Json::parse_file(params_path);
+    const nlohmann::json params = nlohmann::json::parse(std::ifstream(params_path));
     const RefinementConfig cfg = parse_config(params);
     if (cfg.offset_report &&
         !(std::isfinite(cfg.offset_threshold) && cfg.offset_threshold >= 0.0f &&
@@ -667,36 +699,33 @@ int main(int argc, char *argv[])
     }
 
     const int level = std::stoi(cfg.dataset_group);
-    Volume volume(vol_path);
-    if (!volume.hasScaleLevel(level)) {
-        // Sparse pyramids keep absent levels as {0,0,0} placeholders; reading
-        // through one silently yields fill value instead of failing.
-        std::cerr << "Error: dataset group " << cfg.dataset_group
-                  << " is not present in this volume; present levels:";
-        for (int presentLevel : volume.presentScaleLevels())
-            std::cerr << " " << presentLevel;
-        std::cerr << std::endl;
+    vcr::zarr::OpenOptions options;
+    options.memoryCache = std::make_shared<vcr::MemoryCache>(cfg.cache_bytes);
+    std::optional<vcr::zarr::OpenedArray> opened;
+    vcr::zarr::LevelPlacement base;
+    try {
+        opened = vcr::zarr::openPyramidLevel(vol_path.string(), level, options);
+        base = level == 0 ? opened->placement : vcr::zarr::openPyramidLevel(vol_path.string(), 0, {}).placement;
+    } catch (const std::exception& e) {
+        std::cerr << "Error: dataset group " << cfg.dataset_group << ": " << e.what() << std::endl;
         return EXIT_FAILURE;
     }
-    vc::render::processChunkCacheService()->configureDecodedByteCapacity(
-        cfg.cache_bytes);
-    auto* chunk_cache = volume.chunkedCache();
 
-    const auto shape = chunk_cache->shape(level);
-    const auto chunk_shape = chunk_cache->chunkShape(level);
+    const auto& shape = opened->meta.shape;
+    const auto& chunk_shape = opened->meta.chunks;
     std::cout << "zarr dataset size for scale group " << cfg.dataset_group
               << " [" << shape[0] << ", " << shape[1] << ", " << shape[2] << "]" << std::endl;
     std::cout << "chunk shape shape "
               << "[" << chunk_shape[0] << ", " << chunk_shape[1] << ", " << chunk_shape[2] << "]" << std::endl;
-    std::cout << "chunk cache size (bytes) " << cfg.cache_bytes << std::endl;
+    std::cout << "memory cache size (bytes) " << cfg.cache_bytes << std::endl;
 
-    DSReader reader = {&volume, cfg.reader_scale, level};
+    DSReader reader{*opened, base, cfg.reader_scale, vol_path};
 
     MeasureLife timer("processing surface ...\n");
 
     if (store) {
         StoreSurfaces surfaces(store->store, "vc_objrefine");
-        return process_stored(surfaces, *store, nlohmann::json::parse(params.dump()), reader, cfg);
+        return process_stored(surfaces, *store, params, reader, cfg);
     }
 
     int ret = EXIT_FAILURE;

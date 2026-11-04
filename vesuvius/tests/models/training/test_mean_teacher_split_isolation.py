@@ -50,11 +50,14 @@ class _Dataset(Dataset):
 
 
 def _load_modules():
-    replacements = {}
+    # Test doubles must not replace the real trainer for subsequent test files.
+    with pytest.MonkeyPatch.context() as patch:
+        return _load_modules_with_patch(patch)
 
+
+def _load_modules_with_patch(patch):
     def install(name, module):
-        replacements[name] = sys.modules.get(name)
-        sys.modules[name] = module
+        patch.setitem(sys.modules, name, module)
 
     train_module = ModuleType("vesuvius.models.training.train")
     train_module.BaseTrainer = _BaseTrainer
@@ -104,6 +107,28 @@ def _load_modules():
 @pytest.fixture(scope="module")
 def modules():
     return _load_modules()
+
+
+def test_module_loader_restores_import_registry():
+    names = (
+        "vesuvius.models.training.train",
+        "vesuvius.models.training.trainers.semi_supervised",
+        "vesuvius.models.training.trainers.semi_supervised.ramps",
+        "vesuvius.models.training.trainers.semi_supervised.two_stream_batch_sampler",
+        "mean_teacher_split_mean_teacher_target",
+        "mean_teacher_split_uamt_target",
+    )
+    missing = object()
+    previous = {name: sys.modules.get(name, missing) for name in names}
+
+    loaded = _load_modules()
+
+    assert set(loaded) == {"sampler", "mean_teacher", "uamt"}
+    for name, original in previous.items():
+        if original is missing:
+            assert name not in sys.modules
+        else:
+            assert sys.modules[name] is original
 
 
 def _manager(split=0.75, seed=17):

@@ -109,6 +109,7 @@ bool SegmentationModule::beginEditingSession(std::shared_ptr<QuadSurface> surfac
 
 void SegmentationModule::endEditingSession()
 {
+    _manualAddContinuation.reset();
     stopAllPushPull();
     clearUndoStack();
     cancelDrag();
@@ -218,6 +219,7 @@ void SegmentationModule::discardLastUndoSnapshot()
 
 bool SegmentationModule::restoreUndoSnapshot()
 {
+    if (_sheetWalkRunning) return false;
     if (_suppressUndoCapture) {
         return false;
     }
@@ -390,7 +392,7 @@ void SegmentationModule::loadCorrections(QuadSurface* surface)
     if (!_pointCollection) {
         return;
     }
-    std::map<uint64_t, utils::Json> stored;
+    std::map<uint64_t, nlohmann::json> stored;
     if (const auto storeEdit = storeEditFor(surface)) {
         try {
             stored = vc3d::corrections::read(*_state->objectStoreSession(), storeEdit->pin().attachment, storeEdit->uuid(),

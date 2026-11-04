@@ -6,7 +6,9 @@
 
 inline vc::objects::OpenOptions as(const std::string& author)
 {
-    vc::objects::OpenOptions options; options.author = author; return options;
+    vc::objects::OpenOptions options; options.author = author;
+    // A loaded machine can hold a replica past the default 5 s during a hub sync.
+    options.busyTimeoutMs = 60000; return options;
 }
 
 inline std::string meta(vc::objects::ObjectStore& store, const std::string& uuid)

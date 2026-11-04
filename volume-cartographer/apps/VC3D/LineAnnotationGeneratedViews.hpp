@@ -51,8 +51,11 @@ inline std::optional<GeneratedStripFrame> generatedStripFrame(QuadSurface* surfa
     const auto left=surface->gridToSurface({std::max(0.0,col-0.5),row});
     const auto right=surface->gridToSurface({
         std::min(double(surface->rawPointsPtr()->cols-1),col+0.5),row});
-    const auto along=vc::fiber_tracer::displayUnit(cv::Vec3d(
-        surface->sampleAtSurface(right).volume-surface->sampleAtSurface(left).volume));
+    const cv::Vec2f leftGrid(surface->surfaceToGrid(left)), rightGrid(surface->surfaceToGrid(right));
+    const float xy[]{leftGrid[0],leftGrid[1],rightGrid[0],rightGrid[1]};
+    cv::Vec3f positions[2];
+    surface->pointSurface()->pointsAt(xy, 2, positions[0].val, nullptr);
+    const auto along=vc::fiber_tracer::displayUnit(cv::Vec3d(positions[1]-positions[0]));
     const auto normal=across && along ?
         vc::fiber_tracer::displayUnit(along->cross(*across)) : std::nullopt;
     if (!normal) return std::nullopt;
