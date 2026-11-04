@@ -5,13 +5,10 @@ from pathlib import Path
 
 import numpy as np
 import pytest
-import zarr
+from vc_reader.reader import ZarrWriter, create_group, open_group
 
 from vesuvius.ink_detection.eval import resolution_gap as rg
 from vesuvius.ink_detection.preprocessing.prepare_9um_isotropic_input import prepare_isotropic_input
-
-ZARR_V3 = int(zarr.__version__.split(".", 1)[0]) >= 3
-
 
 def _texture(shape, lam_lo, lam_hi, seed):
     """Band-limited unit-variance noise: wavelengths between lam_lo and lam_hi px."""
@@ -46,17 +43,11 @@ def _halve_in_plane(a_ZYX):
 
 
 def _write_group(path: Path, levels: dict, attrs: dict) -> None:
-    kwargs = {"mode": "w"}
-    if ZARR_V3:
-        kwargs["zarr_format"] = 2
-    group = zarr.open_group(path, **kwargs)
-    group.attrs.update(attrs)
+    create_group(path, attrs=attrs, overwrite=True)
     for name, data in levels.items():
         chunks = tuple(min(64, s) for s in data.shape)
-        if ZARR_V3:
-            group.create_array(name, data=data, chunks=chunks)
-        else:
-            group.create_dataset(name, data=data, chunks=chunks)
+        array = ZarrWriter.create(Path(path) / name, shape=data.shape, chunks=chunks, dtype=data.dtype)
+        array[...] = data
 
 
 def _multiscales(um):
@@ -154,7 +145,7 @@ def test_villa_planes_match_prepare_9um_isotropic_input(tmp_path):
     source = tmp_path / "fine.zarr"
     _write_group(source, {"2": level2}, {})
     out = prepare_isotropic_input(str(source), tmp_path / "prepared.zarr", level="2", workers=2)
-    prepared = zarr.open_group(out, mode="r")["0"][:]
+    prepared = open_group(out)["0"][:]
     pooled, (z0, z1) = rg.villa_pool(level2)
     assert (z0, z1) == (13, 97)
     np.testing.assert_array_equal(pooled, prepared)
