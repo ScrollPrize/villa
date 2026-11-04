@@ -187,6 +187,7 @@ static LevelMap mapToLevel(const vcr::zarr::LevelPlacement& working, const vcr::
 // rendered-level voxels.
 struct RenderSurface {
     cv::Mat_<cv::Vec3f> vertices;
+    std::vector<float> normals;
     std::unique_ptr<vcr::grid::Surface> grid;
 };
 
@@ -210,11 +211,24 @@ static RenderSurface renderSurface(const QuadSurface& surf, vcr::grid::Interpola
         for (int a = 0; a < 3; ++a)
             v[a] = v[a] * level.scale[a] + level.offset[a];
     }
+    // Vertex normals from the grid differences, so linear patches interpolate normals across cells instead of jumping at their edges.
+    const int rows = r.vertices.rows, cols = r.vertices.cols; const bool smooth = interpolation == vcr::grid::Interpolation::Linear;
+    if (smooth) r.normals.assign(std::size_t(rows) * cols * 3, NAN);
+    const auto ok = [&](int i, int j) { return i >= 0 && j >= 0 && i < rows && j < cols && valid[std::size_t(i) * cols + j]; };
+    const auto d = [&](int i, int j, int di, int dj) {  // central difference, one sided next to an invalid vertex
+        const int a = ok(i - di, j - dj) ? -1 : 0, b = ok(i + di, j + dj) ? 1 : 0;
+        return r.vertices(i + b * di, j + b * dj) - r.vertices(i + a * di, j + a * dj);
+    };
+    for (int i = 0; smooth && i < rows; ++i)
+        for (int j = 0; j < cols; ++j) {
+            const cv::Vec3f n = d(i, j, 0, 1).cross(d(i, j, 1, 0));
+            for (int k = 0; ok(i, j) && k < 3; ++k) r.normals[(std::size_t(i) * cols + j) * 3 + k] = n[k] / float(cv::norm(n));
+        }
     auto options = surf.gridOptions();
     options.interpolation = interpolation;
     r.grid = std::make_unique<vcr::grid::Surface>(
         vcr::grid::Vertices{reinterpret_cast<const float*>(r.vertices.ptr()), r.vertices.rows, r.vertices.cols,
-                            r.vertices.step1(), nullptr, valid.data()},
+                            r.vertices.step1(), r.normals.empty() ? nullptr : r.normals.data(), valid.data()},
         std::move(options));
     return r;
 }
