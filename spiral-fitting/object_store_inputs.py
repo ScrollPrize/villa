@@ -539,9 +539,18 @@ def check_position(store, position):
 
 
 def _at_head(store, position):
-    """Whether ``position`` is the head of the plain store whose positions
-    it names: nothing was written after it, so the store's current state is
-    the state at it."""
+    """Whether the store's current state is the state at ``position``: the
+    head of the plain store whose positions it names (nothing was written
+    after it), or the hub state a replica of that hub last pulled, with no
+    change of its own unpushed or in conflict (a replica holds the hub's
+    records as of its last pull, so its current state is that position's).
+    Both are local reads: the history read this avoids opens the hub, over
+    the network for an sftp:// one."""
+    status = store.hub_status()
+    if status is not None:
+        return (status['hub_replica'] == position.hub
+                and status['position'] == position.sequence
+                and not status['pending'] and not status['conflicts'])
     positions = store.store_positions()
     return (positions is not None and positions['store'] == position.hub
             and positions['position'] == position.sequence)
@@ -2380,6 +2389,25 @@ def _conditional_push(store, head):
         return {**store.hub_sync(pull=False, push=True, expected_head=head), 'retried': True}
 
 
+def _pull_to_published(store, position):
+    """Pull after this replica's links were published at ``position`` N, so
+    it records N (a push leaves it at the head H it pulled): reads of the
+    inputs at N then use its current state (_at_head) instead of rebuilding
+    N from the hub's history, which scans every revision on the hub. The
+    pull brings back only this replica's own links, unless the hub moved
+    past N, when the reads fall back to the history. A failed pull costs
+    only that fallback, so it is reported, not raised."""
+    try:
+        pulled = store.hub_sync(pull=True, push=False)
+    except Exception as exc:  # noqa: BLE001 - reads stay correct, only slower
+        return [f'could not pull the published position {position} ({type(exc).__name__}: '
+                f'{exc}); the inputs are read from the hub\'s history']
+    if pulled['conflicts'] or pulled['pulled_position'] != position:
+        return [f'the hub moved past the published position {position} (to '
+                f'{pulled["pulled_position"]}); the inputs are read from its history']
+    return []
+
+
 def prepare_position(store, config, request, *, lasagna=None, minimum=None,
                      cache_directory=None, log=print, attempts=4, incremental=False,
                      progress=None):
@@ -2466,6 +2494,7 @@ def prepare_position(store, config, request, *, lasagna=None, minimum=None,
             continue
         position = pushed['published_position']
         lines = lines + [f'links published at hub position {position} (linked at {head})']
+        lines.extend(_pull_to_published(store, position))
         _record_marker(store, result, position, lines)
         break
     else:
