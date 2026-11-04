@@ -9,12 +9,13 @@ import numpy as np
 from scipy.sparse import csr_array
 from scipy.sparse.csgraph import breadth_first_order, connected_components, maximum_flow
 import vc_spiral.track_store as track_store
+import vc_delta3d  # Registers VC-Delta3D with numcodecs.
+import zarr
+import fsspec
 import dask.array as da
 from huggingface_hub import sync_bucket as _sync_bucket
-from surface_export import new_surface
+from tifxyz import save_tifxyz
 from tqdm.auto import tqdm
-from vc_reader import tifxyz
-from vc_reader.reader import open_group
 
 family_names = {
   -1: "unknown",
@@ -472,10 +473,13 @@ def write_2d_grid_as_tifxyz(
 
     output_directory = Path(output_directory)
     output_directory.mkdir(parents=True, exist_ok=True)
-    tifxyz.write(
-        output_directory / surface_uuid,
-        new_surface(grid_zyx[..., ::-1], float(spacing), float(voxel_size_um), source),
-        compression="none", tile=None, mask=False, overwrite=True,
+    save_tifxyz(
+        grid_zyx,
+        output_directory,
+        surface_uuid,
+        step_size=float(spacing),
+        voxel_size_um=float(voxel_size_um),
+        source=source,
     )
     return output_directory / surface_uuid
 
@@ -898,7 +902,8 @@ if __name__ == "__main__":
             source_scale=track_scale,
             target_scale=ct_level,
         )
-        ct_group = open_group(ct_vol_path, auth=None)
+        ct_store = fsspec.get_mapper(ct_vol_path, anon=True)
+        ct_group = zarr.open_group(store=ct_store, mode="r")
         ct_data = ct_group[str(ct_level)]
 
         xy_padding = 25
@@ -918,7 +923,7 @@ if __name__ == "__main__":
             ct_data.shape[2],
             int(np.ceil(full_points_zyx[:, 2].max())) + xy_padding + 1,
         )
-        ct_image = da.from_array(ct_data, chunks=ct_data.chunks, name=False)[
+        ct_image = da.from_zarr(ct_data)[
             :,
             y_min:y_max,
             x_min:x_max,
@@ -932,10 +937,10 @@ if __name__ == "__main__":
     else:
         full_points_zyx = np.asarray(longest_track.points_zyx)
         interpolated_points_zyx = interpolated_grid_zyx.reshape(-1, 3)
-        ct_group = open_group(ct_vol_path)
+        ct_group = zarr.open_group(store=ct_vol_path, mode="r")
         datasets = ct_group.attrs["multiscales"][0]["datasets"]
         ct_image = [
-            da.from_array(ct_group[dataset["path"]], chunks=ct_group[dataset["path"]].chunks, name=False)
+            da.from_zarr(ct_group[dataset["path"]])
             for dataset in datasets
         ]
         ct_image_name = "CT multiscale"

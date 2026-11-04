@@ -8,7 +8,7 @@ import numpy as np
 import torch
 from tqdm import tqdm
 
-from patches import Patch
+from tifxyz import Patch
 
 
 _LINK_THREADS_DEFAULT_CAP = 16

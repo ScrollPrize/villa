@@ -12,6 +12,8 @@ def test_public_api_exports() -> None:
     """Package root should expose the documented public surface."""
 
     assert hasattr(vesuvius, "VCDataset")
+    assert callable(vesuvius.Cube)
+    assert callable(vesuvius.list_cubes)
     assert hasattr(vesuvius, "utils")
     assert hasattr(vesuvius, "models")
     assert not hasattr(vesuvius, "Volume")

@@ -20,6 +20,35 @@ print([segment.id for segment in scroll.segments][:5])
 
 See [discovery](../../vc_reader/docs/discovery.md) for segments, labels, surface volumes and their relationships.
 
+## Annotated cubes
+
+`list_cubes()` lists the packaged instance-annotated NRRD cubes, indexed by
+scroll, scan energy, resolution and cube origin. These pair CT intensities with
+instance labels for volumetric segmentation. Use the `volume-only` extra for
+loading and the `notebooks` extra for the plotting example.
+
+```python
+from vesuvius import Cube, list_cubes
+
+print(list_cubes())
+cube = Cube(scroll_id=1, energy=54, resolution=7.91,
+            z=2256, y=2512, x=4816, cache=True)
+volume, labels = cube[:, :, :]
+volume_slice, label_slice = cube[128, :, :]
+```
+
+`Cube` downloads both files through `vc_reader` and decodes them with `pynrrd`.
+It preserves the original NRRD array order (`index_order='F'`), dtypes and label
+IDs. `normalize=True` divides only CT values by their dtype maximum.
+`cache=True` reuses files under `~/vesuvius/annotated-instances`; `cache_dir`
+overrides that directory. `activate_caching(cache_dir=None)` and
+`deactivate_caching()` switch caching and reload the pair. Uncached downloads
+use temporary files that are removed after decoding.
+
+The existing `from vesuvius.data.volume import Cube` import remains supported.
+See the [cube notebook](../src/vesuvius/examples/notebooks/example3_cubes_bootstrap.ipynb)
+for side-by-side CT and label plots.
+
 ## Opening a volume
 
 ```python
