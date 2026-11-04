@@ -257,6 +257,36 @@ Json pageJson(const ChangePage& page)
 
 std::string payloadHash(const std::vector<uint8_t>& bytes) { return sha256(bytes.data(), bytes.size()); }
 
+PayloadHasher::PayloadHasher() : context_(EVP_MD_CTX_new())
+{
+    if (!context_ || EVP_DigestInit_ex(static_cast<EVP_MD_CTX*>(context_), EVP_sha256(), nullptr) != 1) {
+        EVP_MD_CTX_free(static_cast<EVP_MD_CTX*>(context_));
+        throw std::runtime_error("object store: SHA-256 failed");
+    }
+}
+
+PayloadHasher::~PayloadHasher() { EVP_MD_CTX_free(static_cast<EVP_MD_CTX*>(context_)); }
+
+void PayloadHasher::update(const void* data, std::size_t size)
+{
+    if (size && EVP_DigestUpdate(static_cast<EVP_MD_CTX*>(context_), data, size) != 1)
+        throw std::runtime_error("object store: SHA-256 failed");
+}
+
+std::string PayloadHasher::finish()
+{
+    unsigned char digest[EVP_MAX_MD_SIZE];
+    unsigned int length = 0;
+    if (EVP_DigestFinal_ex(static_cast<EVP_MD_CTX*>(context_), digest, &length) != 1)
+        throw std::runtime_error("object store: SHA-256 failed");
+    std::string result;
+    for (unsigned int i = 0; i < length; ++i) {
+        result += "0123456789abcdef"[digest[i] >> 4];
+        result += "0123456789abcdef"[digest[i] & 15];
+    }
+    return result;
+}
+
 std::string transactionRequestToJson(const TransactionRequest& request, TransactionPayloads* payloads)
 {
     return requestJson(request, payloads, true).dump();

@@ -169,4 +169,30 @@ void ObjectStore::checkpoint()
     check(sqlite3_wal_checkpoint_v2(impl_->writer, nullptr, SQLITE_CHECKPOINT_FULL, nullptr, nullptr), impl_->writer, "checkpoint");
 }
 
+ObjectStore::WalCheckpoint ObjectStore::checkpointWal(WalCheckpointMode mode, std::chrono::milliseconds wait)
+{
+    if (!impl_->writer)
+        throw std::runtime_error("object store: checkpoint on read-only handle");
+    std::lock_guard<std::mutex> lock(impl_->writerMutex);
+    WalCheckpoint result;
+    int log = 0, copied = 0;
+    int rc = SQLITE_OK;
+    if (mode == WalCheckpointMode::Passive) {
+        rc = sqlite3_wal_checkpoint_v2(impl_->writer, nullptr, SQLITE_CHECKPOINT_PASSIVE, &log, &copied);
+    } else {
+        // Truncate waits through the busy handler: bound it to `wait`.
+        sqlite3_busy_timeout(impl_->writer, static_cast<int>(std::clamp<int64_t>(wait.count(), 0, INT32_MAX)));
+        rc = sqlite3_wal_checkpoint_v2(impl_->writer, nullptr, SQLITE_CHECKPOINT_TRUNCATE, &log, &copied);
+        sqlite3_busy_timeout(impl_->writer, impl_->options.busyTimeoutMs);
+    }
+    if (rc == SQLITE_BUSY) result.busy = true;
+    else check(rc, impl_->writer, "checkpoint");
+    result.logFrames = log < 0 ? 0 : log;
+    result.checkpointedFrames = copied < 0 ? 0 : copied;
+    std::error_code ec;
+    const auto size = std::filesystem::file_size(impl_->path.string() + "-wal", ec);
+    result.walBytes = ec ? 0 : size;
+    return result;
+}
+
 } // namespace vc::objects

@@ -9,6 +9,7 @@
 #include "vc_object_store/objects/Transactions.hpp"
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
@@ -696,6 +697,20 @@ public:
     // Flush the WAL into the main DB file (safe copying). Must not be
     // called while a WriteTxn is live on this handle.
     void checkpoint();
+
+    // One WAL checkpoint, for services that schedule their own (SQLite's
+    // automatic passive checkpoints still run on commit). Passive never
+    // waits; Truncate waits up to `wait` for readers, then empties the WAL
+    // file only if every frame was copied. Same restriction as checkpoint().
+    enum class WalCheckpointMode { Passive, Truncate };
+    struct WalCheckpoint {
+        int64_t logFrames = 0;           // frames in the WAL after the call
+        int64_t checkpointedFrames = 0;  // of those, copied into the database
+        bool busy = false;               // readers or a writer prevented completion
+        uint64_t walBytes = 0;           // WAL file size after the call
+        bool complete() const { return !busy && checkpointedFrames == logFrames; }
+    };
+    WalCheckpoint checkpointWal(WalCheckpointMode, std::chrono::milliseconds wait = std::chrono::milliseconds(0));
 
 private:
     struct Impl;

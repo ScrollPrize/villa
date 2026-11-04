@@ -9,6 +9,7 @@
 // command version, store/generation, author, preconditions, ordered
 // operations and payload identities, but not how or when bytes were staged.
 
+#include <cstddef>
 #include <cstdint>
 #include <map>
 #include <string>
@@ -31,6 +32,18 @@ std::string transactionRequestDigest(const TransactionRequest&);
 // bytes: lets a client re-stage exactly these after an upload expires.
 std::vector<std::string> transactionPayloadHashes(const TransactionRequest&);
 std::string payloadHash(const std::vector<uint8_t>&);
+// payloadHash over bytes that arrive in pieces (streamed uploads).
+class PayloadHasher {
+public:
+    PayloadHasher();
+    ~PayloadHasher();
+    PayloadHasher(const PayloadHasher&) = delete;
+    PayloadHasher& operator=(const PayloadHasher&) = delete;
+    void update(const void* data, std::size_t size);
+    std::string finish();  // once; equals payloadHash of the concatenated bytes
+private:
+    void* context_;
+};
 
 // Record encodings used by CreateObjectOp/UpdateObjectOp and AddEdgeOp/UpdateEdgeOp.
 std::string objectRecordJson(const ObjectRecord&);
