@@ -192,6 +192,11 @@ template<class T> inline void channel_apply(const ClipOutliers&, std::vector<T>&
 }
 template<class T>
 inline void channel_apply(const GaussianBlur& t, std::vector<T>& v, const Grid& g, const ChannelPlan& p) { gaussian_blur(v, g, p.values, t.truncate, t.boundary, t.full_width); }
+// The std::array bounds below are namespace-scope constants, not function-local ones: CUDA
+// 13.0's cudafe++ prints a std::array type first named with a function-local bound as invalid
+// C++ (`unsigned long((256))`) wherever the same type is named again (voxel_transform.hpp).
+inline constexpr std::size_t palette_limit = 256;   // distinct values a uint8 code names
+inline constexpr std::size_t palette_slots = 1024;  // float_palette's open-addressing table
 // Exact palette compression, not quantization. This benefits CT patches and
 // pointwise intensity transforms of them; continuous-valued inputs use the
 // small-window network or nth_element. The bounded palette stays in L1 cache.
@@ -201,9 +206,9 @@ inline void channel_apply(const GaussianBlur& t, std::vector<T>& v, const Grid& 
 template<class Values>
 inline bool float_palette(const Values& v, std::vector<std::uint8_t>& codes,
                           std::vector<float>& values, bool sorted = true) {
-    constexpr std::size_t slots = 1024;
-    std::array<std::uint32_t, slots> keys{};
-    std::array<std::uint16_t, slots> indices;
+    constexpr std::size_t slots = palette_slots;
+    std::array<std::uint32_t, palette_slots> keys{};
+    std::array<std::uint16_t, palette_slots> indices;
     indices.fill(256);
     values.clear();
     bool positive_zero = false, negative_zero = false;
@@ -242,7 +247,7 @@ template<class Values, class T>
 inline bool median_palette(const Values& v, std::vector<std::uint8_t>& codes,
                            std::vector<T>& values) {
     if constexpr (std::is_same_v<T, float>) return float_palette(v, codes, values);
-    constexpr std::size_t limit = 256;
+    constexpr std::size_t limit = palette_limit;
     std::unordered_map<T, std::uint16_t> palette;
     palette.reserve(limit + 1);
     bool positive_zero = false, negative_zero = false;
@@ -264,7 +269,7 @@ inline bool median_palette(const Values& v, std::vector<std::uint8_t>& codes,
     }
     for (const auto& [value, code] : palette) values.push_back(value);
     std::sort(values.begin(), values.end());
-    std::array<std::uint8_t, limit> ranks{};
+    std::array<std::uint8_t, palette_limit> ranks{};
     for (std::size_t rank = 0; rank < values.size(); ++rank) ranks[palette.at(values[rank])] = static_cast<std::uint8_t>(rank);
     for (auto& code : codes) code = ranks[code];
     return true;
@@ -273,7 +278,7 @@ inline bool median_palette(const Values& v, std::vector<std::uint8_t>& codes,
 template<class Values, class T>
 inline bool encode_median_palette(const Values& v, std::vector<std::uint8_t>& codes,
                                   std::vector<T>& values, bool quantize) {
-    constexpr std::size_t limit = 256;
+    constexpr std::size_t limit = palette_limit;
     if (!median_palette(v, codes, values)) {
         if (!quantize || !std::all_of(v.begin(), v.end(), [](T x) { return std::isfinite(x); })) return false;
         const auto bounds = std::minmax_element(v.begin(), v.end());
@@ -302,12 +307,12 @@ inline void median_rank_filter(const std::uint8_t* codes, Output& v, const Value
                                         [&](std::uint8_t code) { return values[code]; });
         return;
     }
-    constexpr std::size_t limit = 256;
+    constexpr std::size_t limit = palette_limit;
     const auto dim = g.shape.size(), nz = dim == 3 ? g.shape[0] : 1;
     const auto ny = g.shape[dim - 2], nx = g.shape.back(), kz = dim == 3 ? k : 1;
     const auto middle = kz * k * k / 2;
     for (std::size_t z = 0; z < nz; ++z) for (std::size_t y = 0; y < ny; ++y) {
-        std::array<std::uint32_t, limit> counts{};
+        std::array<std::uint32_t, palette_limit> counts{};
         for (std::size_t dz = 0; dz < kz; ++dz) for (std::size_t dy = 0; dy < k; ++dy) {
             const auto* row = codes + iz[z * kz + dz] + iy[y * k + dy];
             for (std::size_t dx = 0; dx < k; ++dx) ++counts[row[ix[dx]]];
