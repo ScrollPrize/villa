@@ -80,10 +80,19 @@ public:
         const std::optional<std::vector<std::string>>& fields = std::nullopt, StoreStatus* asOf = nullptr);
     std::vector<EdgeRecord> selectEdges(const EdgeSelection&,
         const std::optional<std::vector<std::string>>& fields = std::nullopt, StoreStatus* asOf = nullptr);
-    // Every match, read in pages of `pageSize`. Pages read at different commit
-    // sequences are never combined: the listing restarts, and after
-    // `maxRestarts` restarts throws StoreBusy. The selection must not carry a
-    // limit; its starting cursor/offset is kept. `asOf` is the common snapshot.
+    // Every match, read in pages of `pageSize`, exact as of one commit
+    // sequence (`asOf`) without holding a server snapshot. UUID-ordered
+    // listings page by cursor; commits that land meanwhile are read from the
+    // change feed and their records selected again, until the feed is quiet.
+    // Each record carries its numbered version, so the result pins exactly
+    // what it returned. A listing restarts when a change can move membership
+    // beyond the records it touched (a recorded transform for volume
+    // selections, a relationship for connectedTo, an endpoint for
+    // applicableOnly edges, an expired feed position), and throws StoreBusy
+    // after `maxRestarts` restarts or when the feed never goes quiet
+    // (sustained writes far above interactive rates). Length-ordered and
+    // unbound-volume listings page by offset and restart on any commit. The
+    // selection must not carry a limit; its starting cursor/offset is kept.
     std::vector<ObjectRecord> selectAllObjects(ObjectSelection,
         const std::optional<std::vector<std::string>>& fields = std::nullopt, int64_t pageSize = 1000,
         int maxRestarts = 3, StoreStatus* asOf = nullptr);

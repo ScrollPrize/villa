@@ -303,10 +303,32 @@ from. Selections never carry transforms: volume targets resolve through the
 transforms recorded in the store (a client catalog cache cannot change a shared
 query), and a request that sets them is refused. Region budgets above the
 server's limits are clamped, so the answer reports the budget it stopped at
-instead of claiming completeness. `selectAllObjects`/`selectAllEdges` page
-with UUID cursors (offsets for length order and unbound volume listings) and
-restart when a page comes from a later commit than the first; after a bounded
-number of restarts they throw `StoreBusy` rather than combine snapshots.
+instead of claiming completeness. Every selected record carries `version` and `versionGeneration`, the numbered
+head it was read from, so a listing pins exactly what it returned (read
+transactions only: rows read inside a write may not be published yet).
+`selectAllObjects`/`selectAllEdges` page by UUID cursor without holding a
+server snapshot. When commits land between pages, the client reads them from
+the change feed and selects the touched records again, restricted to their
+UUIDs. It repeats until the feed is quiet, so the result is exact as of one
+commit sequence, whatever the store size.
+
+A listing restarts only when a change can move membership beyond the records it
+touched: a recorded transform during a volume listing, a relationship during a
+`connectedTo` listing, an endpoint during an `applicableOnly` edge listing, or
+an expired feed position. After a bounded number of restarts, or when the feed
+never goes quiet (sustained writes far above interactive rates), it throws
+`StoreBusy`. Length-ordered and unbound-volume listings page by offset and
+restart on any commit.
+
+`bench_object_store_selection` builds a synthetic store and times listings, as
+in this run (1M objects, 6.6 GB, Release, P-cores, 3 iterations, medians):
+
+| Listing of 500k fibers | Time |
+| --- | --- |
+| Local, UUIDs only, one snapshot | 0.99 s |
+| Hosted, UUIDs only, 10k pages | 2.31 s |
+| Hosted, with name/fiber/track fields | 5.29 s |
+| Hosted, UUIDs only, 60 commits landing during the listing | 2.79 s |
 
 The server answers a request whose payloads have expired from its saved
 receipt when there is one. Otherwise it names the missing payloads, and the

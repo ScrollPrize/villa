@@ -11,6 +11,9 @@
 
 #include <algorithm>
 #include <stdexcept>
+#include <set>
+#include <map>
+#include <functional>
 
 namespace vc::objects {
 using Json = nlohmann::json;
@@ -205,6 +208,109 @@ std::vector<Record> pageAll(int64_t pageSize, int maxRestarts, StoreStatus* asOf
     }
     throw StoreBusy("hosted store: the store kept changing while paging a listing; retry later");
 }
+
+// Catch-up listing: pages may come from different snapshots. Commits that
+// land while paging are read from the change feed, and the records they
+// touched are selected again (restricted to their UUIDs, one snapshot per
+// chunk) until the feed is quiet. The result is the exact listing as of the
+// feed position it ends at, whatever the store size; it restarts only when a
+// change can move membership for records it did not touch.
+enum class ChangeEffect { Ignore, Recheck, Restart };
+
+template<class Record>
+struct CatchUp {
+    HostedStore& store;
+    int64_t pageSize;
+    int maxRestarts, maxRounds = 32;
+    // (cursor uuid or nullopt for the first page, status out) -> one page
+    std::function<std::vector<Record>(const std::optional<std::string>&, StoreStatus*)> page;
+    // (uuids to re-select, status out) -> their current matches
+    std::function<std::vector<Record>(const std::vector<std::string>&, StoreStatus*)> requery;
+    // How one feed change affects this listing.
+    std::function<ChangeEffect(const ChangeRecord&)> effect;
+    // Extra check of the rechecked UUIDs (e.g. transform records): true restarts.
+    std::function<bool(const std::vector<std::string>&)> restartFor;
+
+    std::vector<Record> run(StoreStatus* asOf)
+    {
+        if (pageSize <= 0) throw std::invalid_argument("hosted store: page size must be positive");
+        for (int attempt = 0; attempt <= maxRestarts; ++attempt)
+            if (auto result = once(asOf)) return std::move(*result);
+        throw StoreBusy("hosted store: the store kept changing while paging a listing; retry later");
+    }
+
+private:
+    bool sameLineage(const StoreStatus& a, const StoreStatus& b)
+    {
+        return a.storeUuid == b.storeUuid && a.generation == b.generation;
+    }
+
+    std::optional<std::vector<Record>> once(StoreStatus* asOf)
+    {
+        std::map<std::string, Record> found;
+        StoreStatus first, status;
+        int64_t high = 0;
+        std::optional<std::string> cursor;
+        for (bool start = true;; start = false) {
+            auto records = page(cursor, start ? &first : &status);
+            if (start) status = first;
+            if (!sameLineage(first, status)) return std::nullopt;
+            high = std::max(high, status.commitSequence);
+            const bool last = int64_t(records.size()) < pageSize;
+            if (!records.empty()) cursor = records.back().uuid;
+            for (auto& record : records) found.insert_or_assign(record.uuid, std::move(record));
+            if (last) break;
+        }
+        FeedCursor feed{first.storeUuid, first.generation, first.commitSequence, 0};
+        for (int round = 0; round < maxRounds; ++round) {
+            std::set<std::string> changed;
+            StoreStatus end = first;
+            for (;;) {
+                const auto changes = store.changesSince(feed);
+                if (!changes.cursorValid) return std::nullopt;  // retention or lineage moved: start over
+                for (const auto& commit : changes.commits)
+                    for (const auto& change : commit.changes) {
+                        const auto e = effect(change);
+                        if (e == ChangeEffect::Restart) return std::nullopt;
+                        if (e == ChangeEffect::Recheck) changed.insert(change.uuid);
+                    }
+                feed = changes.next;
+                if (!changes.more) break;
+            }
+            end.commitSequence = feed.sequence;
+            if (changed.empty() && feed.sequence >= high) {
+                if (asOf) *asOf = end;
+                std::vector<Record> result;
+                result.reserve(found.size());
+                for (auto& [uuid, record] : found) result.push_back(std::move(record));
+                return result;
+            }
+            const std::vector<std::string> uuids(changed.begin(), changed.end());
+            if (restartFor && restartFor(uuids)) return std::nullopt;
+            for (std::size_t i = 0; i < uuids.size(); i += std::size_t(pageSize)) {
+                const std::vector<std::string> chunk(uuids.begin() + i,
+                    uuids.begin() + std::min(uuids.size(), i + std::size_t(pageSize)));
+                StoreStatus at;
+                auto matches = requery(chunk, &at);
+                if (!sameLineage(first, at)) return std::nullopt;
+                high = std::max(high, at.commitSequence);
+                for (const auto& uuid : chunk) found.erase(uuid);
+                for (auto& record : matches) found.insert_or_assign(record.uuid, std::move(record));
+            }
+        }
+        return std::nullopt;
+    }
+};
+
+std::vector<std::string> restrictTo(const std::vector<std::string>& chunk, const std::vector<std::string>& allowed)
+{
+    if (allowed.empty()) return chunk;
+    std::set<std::string> keep(allowed.begin(), allowed.end());
+    std::vector<std::string> result;
+    for (const auto& uuid : chunk)
+        if (keep.contains(uuid)) result.push_back(uuid);
+    return result;
+}
 } // namespace
 
 std::vector<ObjectRecord> HostedStore::selectObjects(const ObjectSelection& selection,
@@ -227,45 +333,100 @@ std::vector<ObjectRecord> HostedStore::selectAllObjects(ObjectSelection selectio
     const std::optional<std::vector<std::string>>& fields, int64_t pageSize, int maxRestarts, StoreStatus* asOf)
 {
     if (selection.limit) throw std::invalid_argument("hosted store: selectAllObjects pages itself; remove the limit");
-    // UUID order pages by cursor. Length order and volume listings with
-    // unbound objects page by offset, which is exact within one snapshot.
+    // UUID order pages by cursor and catches up from the feed. Length order
+    // and volume listings with unbound objects page by offset, which is exact
+    // only within one snapshot: they restart when a commit lands.
     const bool byCursor = selection.orderBy == "uuid" && !selection.includeUnbound;
     if (!byCursor && (selection.afterUuid || selection.afterLength))
         throw std::invalid_argument("hosted store: selectAllObjects starts length/unbound listings at an offset, not a cursor");
     const auto start = selection;
+    if (byCursor) {
+        CatchUp<ObjectRecord> listing{*this, pageSize, maxRestarts};
+        listing.page = [&](const std::optional<std::string>& after, StoreStatus* status) {
+            auto page = start;
+            page.limit = pageSize;
+            page.afterUuid = after ? after : start.afterUuid;
+            return selectObjects(page, fields, status);
+        };
+        listing.requery = [&](const std::vector<std::string>& uuids, StoreStatus* status) {
+            auto again = start;
+            again.uuids = restrictTo(uuids, start.uuids);
+            if (again.uuids.empty()) {
+                *status = this->status();
+                return std::vector<ObjectRecord>{};
+            }
+            again.limit = int64_t(again.uuids.size());
+            if (start.afterUuid) {  // the listing starts after this UUID
+                std::erase_if(again.uuids, [&](const std::string& u) { return u <= *start.afterUuid; });
+                if (again.uuids.empty()) { *status = this->status(); return std::vector<ObjectRecord>{}; }
+                again.afterUuid.reset();
+            }
+            return selectObjects(again, fields, status);
+        };
+        // Membership through relationships (connectedTo) changes with them.
+        const bool graph = start.connectedTo.has_value();
+        listing.effect = [&](const ChangeRecord& change) {
+            if (change.recordKind == "object") return ChangeEffect::Recheck;
+            return graph ? ChangeEffect::Restart : ChangeEffect::Ignore;
+        };
+        // A recorded transform or route choice can move every volume match.
+        if (start.volume || start.coordinates)
+            listing.restartFor = [&](const std::vector<std::string>& uuids) {
+                for (std::size_t i = 0; i < uuids.size(); i += std::size_t(pageSize)) {
+                    ObjectSelection kinds;
+                    kinds.uuids.assign(uuids.begin() + i, uuids.begin() + std::min(uuids.size(), i + std::size_t(pageSize)));
+                    kinds.limit = int64_t(kinds.uuids.size());
+                    kinds.includeRetired = true;
+                    for (const auto& record : selectObjects(kinds, std::vector<std::string>{"kind"}))
+                        if (record.kind.starts_with("volume_transform")) return true;
+                }
+                return false;
+            };
+        return listing.run(asOf);
+    }
     selection.limit = pageSize;
     return pageAll<ObjectRecord>(pageSize, maxRestarts, asOf,
         [&](bool first, const std::vector<ObjectRecord>& all, StoreStatus* status) {
-            if (first) {
-                selection.afterUuid = start.afterUuid;
-                selection.offset = start.offset;
-            } else if (!byCursor) {
-                selection.offset = start.offset + int64_t(all.size());
-            }
+            if (first) selection.offset = start.offset;
+            else selection.offset = start.offset + int64_t(all.size());
             return selectObjects(selection, fields, status);
         },
-        [&](const std::vector<ObjectRecord>& page) {
-            if (byCursor && !page.empty()) {
-                selection.afterUuid = page.back().uuid;
-                selection.offset = 0;
-            }
-        });
+        [&](const std::vector<ObjectRecord>&) {});
 }
 
 std::vector<EdgeRecord> HostedStore::selectAllEdges(EdgeSelection selection,
     const std::optional<std::vector<std::string>>& fields, int64_t pageSize, int maxRestarts, StoreStatus* asOf)
 {
     if (selection.limit) throw std::invalid_argument("hosted store: selectAllEdges pages itself; remove the limit");
-    const auto start = selection.afterUuid;
-    selection.limit = pageSize;
-    return pageAll<EdgeRecord>(pageSize, maxRestarts, asOf,
-        [&](bool first, const std::vector<EdgeRecord>&, StoreStatus* status) {
-            if (first) selection.afterUuid = start;
-            return selectEdges(selection, fields, status);
-        },
-        [&](const std::vector<EdgeRecord>& page) {
-            if (!page.empty()) selection.afterUuid = page.back().uuid;
-        });
+    const auto start = selection;
+    CatchUp<EdgeRecord> listing{*this, pageSize, maxRestarts};
+    listing.page = [&](const std::optional<std::string>& after, StoreStatus* status) {
+        auto page = start;
+        page.limit = pageSize;
+        page.afterUuid = after ? after : start.afterUuid;
+        return selectEdges(page, fields, status);
+    };
+    listing.requery = [&](const std::vector<std::string>& uuids, StoreStatus* status) {
+        auto again = start;
+        auto chosen = restrictTo(uuids, start.uuids ? *start.uuids : std::vector<std::string>{});
+        if (start.uuids && start.uuids->empty()) chosen.clear();
+        if (start.afterUuid) std::erase_if(chosen, [&](const std::string& u) { return u <= *start.afterUuid; });
+        if (chosen.empty()) {
+            *status = this->status();
+            return std::vector<EdgeRecord>{};
+        }
+        again.uuids = chosen;
+        again.limit = int64_t(chosen.size());
+        again.afterUuid.reset();
+        return selectEdges(again, fields, status);
+    };
+    // Applicability depends on the endpoints' current state.
+    const bool endpoints = start.applicableOnly;
+    listing.effect = [&](const ChangeRecord& change) {
+        if (change.recordKind == "relationship") return ChangeEffect::Recheck;
+        return endpoints ? ChangeEffect::Restart : ChangeEffect::Ignore;
+    };
+    return listing.run(asOf);
 }
 
 std::vector<ObjectRevision> HostedStore::objectHistory(const std::string& objectUuid, StoreStatus* asOf)

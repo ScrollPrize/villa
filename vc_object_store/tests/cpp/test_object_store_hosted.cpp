@@ -11,6 +11,7 @@
 #include "vc_object_store/server/Server.hpp"
 
 #include <atomic>
+#include <chrono>
 #include <cstring>
 #include <fstream>
 #include <iostream>
@@ -242,6 +243,10 @@ try {
             require(all[i].meta == localTracks[i].meta && all[i].generation == localTracks[i].generation &&
                 all[i].changedBy == localTracks[i].changedBy && all[i].track->externalKey == localTracks[i].track->externalKey,
                 "record parity");
+            // Listings pin what they returned: the published head's numbered version.
+            require(all[i].version && all[i].version == localTracks[i].version &&
+                all[i].version == local.currentVersion(txn, localTracks[i].uuid) &&
+                all[i].versionGeneration == hostedInitial.generation, "selected record versions");
         }
         auto byLength = tracks; byLength.orderBy = "length_desc";
         require(ids(hosted.selectAllObjects(byLength, std::nullopt, 3)) == ids(local.selectObjects(txn, byLength)),
@@ -252,6 +257,12 @@ try {
         const auto localProjected = local.selectObjects(txn, page, metaOnly);
         require(ids(projected) == ids(localProjected) && projected[0].meta == localProjected[0].meta &&
             !projected[0].track && projected[0].createdBy.empty(), "projected selection parity");
+        require(projected[0].version == localProjected[0].version && projected[0].version.has_value(),
+            "projected selections still carry versions");
+        {
+            const auto none = hosted.selectObjects(page, std::vector<std::string>{});
+            require(none[0].version == localProjected[0].version, "uuid-only selections carry versions");
+        }
         {
             auto withTransforms = tracks; withTransforms.limit = 1;
             withTransforms.transforms = std::make_shared<VolumeTransforms>(local.volumeTransforms(txn));
@@ -261,6 +272,11 @@ try {
         EdgeSelection links; links.kind = "test_link";
         require(ids(hosted.selectAllEdges(links, std::nullopt, 1)) == ids(local.selectEdges(txn, links)) &&
             ids(local.selectEdges(txn, links)) == std::vector<std::string>{edge}, "edge listing parity");
+        {
+            const auto hostedEdges = hosted.selectAllEdges(links, std::nullopt, 1);
+            require(hostedEdges[0].version && hostedEdges[0].version == local.selectEdges(txn, links)[0].version &&
+                hostedEdges[0].version == local.currentRelationshipVersion(txn, edge), "selected relationship versions");
+        }
 
         std::vector<int64_t> localVersions, hostedVersions;
         for (const auto& r : local.objectHistory(txn, a)) localVersions.push_back(r.version);
@@ -332,32 +348,80 @@ try {
         require(!std::filesystem::exists(directory.path / "fetched" / "wrong.bin"), "failed fetch leaves no file");
     }
 
-    // A listing never combines pages from different snapshots: with commits
-    // landing between its pages it restarts, then gives up.
+    // A listing across commits catches up from the change feed: while a writer
+    // creates, edits and retires tracks between its pages, every listing is the
+    // exact membership and versions as of the feed position it reports.
+    std::vector<std::string> churned;
     {
         std::atomic<bool> done{false};
         std::string writerError;
         std::thread writer([&] {
             try {
                 HostedStore client(endpoint);
-                for (int64_t version = 1; !done; ++version) {
-                    auto r = request({{extra[0], version}}, {SetMetaOp{extra[0], "tick", std::to_string(version)}}).hosted;
-                    client.submit(r);
+                // About 200 commits per second: far above interactive editing
+                // (a few hundred changes over a whole run), still busy.
+                for (int i = 0; !done; ++i) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+                    if (i % 3 == 0) {
+                        const auto created = util::newUuid();
+                        client.submit(request({{created, std::nullopt}},
+                            {CreateObjectOp{objectRecordJson(trackRecord(created))}}).hosted);
+                        churned.push_back(created);
+                    } else if (i % 3 == 1) {
+                        const auto v = *client.currentVersion(extra[0]);
+                        client.submit(request({{extra[0], v}}, {SetMetaOp{extra[0], "tick", std::to_string(i)}}).hosted);
+                    } else {
+                        const auto& last = churned.back();
+                        client.submit(request({{last, 1}}, {RetireObjectOp{last}}).hosted);
+                    }
                 }
             } catch (const std::exception& e) {
                 writerError = e.what();
             }
         });
         ObjectSelection tracks; tracks.kind = "track";
-        bool busy = false;
-        for (int attempt = 0; attempt < 50 && !busy; ++attempt) {
-            try { (void)hosted.selectAllObjects(tracks, std::vector<std::string>{}, 1, 0); } catch (const StoreBusy&) { busy = true; }
+        std::vector<std::pair<StoreStatus, std::vector<ObjectRecord>>> listings;
+        std::string listingError;
+        try {
+            const auto until = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+            while (std::chrono::steady_clock::now() < until || listings.size() < 20) {
+                StoreStatus asOf;
+                auto listed = hosted.selectAllObjects(tracks, std::vector<std::string>{}, 1, 0, &asOf);
+                listings.emplace_back(asOf, std::move(listed));
+            }
+        } catch (const std::exception& e) {
+            listingError = e.what();
         }
         done = true;
         writer.join();
+        if (!listingError.empty()) throw std::runtime_error("listing during churn: " + listingError);
         if (!writerError.empty()) throw std::runtime_error("concurrent writer: " + writerError);
-        require(busy, "a listing across commits gives up instead of mixing snapshots");
-        require(hosted.selectAllObjects(tracks, std::vector<std::string>{}, 1).size() == 8, "quiet store lists");
+        require(churned.size() >= 3, "the writer committed while listings ran");
+        // Expected state as of a sequence, from the complete recorded history.
+        auto everyTrack = tracks; everyTrack.includeRetired = true;
+        const auto all = hosted.selectAllObjects(everyTrack, std::vector<std::string>{"retired"});
+        std::map<std::string, std::vector<ObjectRevision>> histories;
+        for (const auto& record : all) histories[record.uuid] = hosted.objectHistory(record.uuid);
+        int moved = 0;
+        for (const auto& [asOf, listed] : listings) {
+            std::map<std::string, int64_t> expected;
+            for (const auto& [uuid, history] : histories) {
+                const ObjectRevision* at = nullptr;
+                for (const auto& revision : history)
+                    if (revision.commitSequence && *revision.commitSequence <= asOf.commitSequence) at = &revision;
+                if (at && !at->deleted && !at->record.retired) expected[uuid] = at->version;
+            }
+            std::map<std::string, int64_t> got;
+            for (const auto& record : listed) got[record.uuid] = record.version.value_or(-1);
+            require(got == expected, "a caught-up listing is exact as of its feed position");
+            moved += listed.size() != listings.front().second.size();
+        }
+        std::cout << "catch-up listings during churn: " << listings.size() << " listings, " << churned.size()
+                  << " tracks created, membership differed in " << moved << "\n";
+        // Quiet store: the 8 tracks from before, plus created tracks not retired.
+        const auto active = std::count_if(all.begin(), all.end(), [](const ObjectRecord& r) { return !r.retired; });
+        require(all.size() == 8 + churned.size() &&
+                int64_t(hosted.selectAllObjects(tracks, std::vector<std::string>{}, 1).size()) == active, "quiet store lists");
     }
 
     // Expired staging: a new request cannot run without its bytes, but the
