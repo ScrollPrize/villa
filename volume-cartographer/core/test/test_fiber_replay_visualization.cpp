@@ -99,12 +99,12 @@ TEST_CASE("coordinate textures sample the upsampled vertex grid trilinearly")
     REQUIRE(texture.rows == 6);
     REQUIRE(texture.cols == 8);
     // Pixel (i, j) sits at grid column 0.5 i - 0.25, row 0.5 j - 0.25; the volume is
-    // linear, so trilinear samples are exact before truncation.
+    // linear, so samples are 13.25 + 0.5 i + j before rounding to nearest.
     for (int j = 0; j < 6; ++j)
         for (int i = 0; i < 8; ++i) {
             const double column = 0.5 * i - 0.25, row = 0.5 * j - 0.25;
             const bool inside = column >= 0 && column <= 3 && row >= 0 && row <= 2 && !(column > 2 && row > 1);
-            const auto expected = inside ? std::uint8_t((1 + column) + 2 * (2 + row) + 9) : std::uint8_t(0);
+            const auto expected = inside ? std::uint8_t(13 + j + (i + 1) / 2) : std::uint8_t(0);
             CHECK_MESSAGE(texture(j, i) == expected, "pixel " << i << "," << j);
         }
     std::filesystem::remove_all(directory);

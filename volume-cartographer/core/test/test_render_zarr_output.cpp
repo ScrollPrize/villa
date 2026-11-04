@@ -14,6 +14,7 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
@@ -97,11 +98,11 @@ TEST_CASE("vc_render_tifxyz writes, resumes and partitions a Zarr pyramid")
             const auto surface = root / "surface";
             fs::create_directories(surface);
             writeSurfaceAxis(surface / "x.tif", height, width, [](int, int x) { return float(x + 4); });
-            writeSurfaceAxis(surface / "y.tif", height, width, [](int y, int) { return float(y + 4); });
+            writeSurfaceAxis(surface / "y.tif", height, width, [](int y, int) { return float(y) + 4.5f; });
             writeSurfaceAxis(surface / "z.tif", height, width, [](int, int) { return 8.0f; });
             std::ofstream(surface / "meta.json") << nlohmann::json{
                 {"format", "tifxyz"}, {"type", "seg"}, {"uuid", "surface"}, {"scale", {1, 1}},
-                {"bbox", {{4, 4, 8}, {width + 3, height + 3, 8}}}}.dump();
+                {"bbox", {{4, 4.5, 8}, {width + 3, height + 3.5, 8}}}}.dump();
 
             const auto render = [&](const fs::path& out, const std::string& extra = "", bool pyramid = true) {
                 const std::string command = std::string("OMP_NUM_THREADS=2 \"") + renderer + "\" -v \"" + volume.string() +
@@ -123,6 +124,18 @@ TEST_CASE("vc_render_tifxyz writes, resumes and partitions a Zarr pyramid")
             CHECK(vcr::zarr::openArray((out / "0").string(), {}).meta.dtype == dtype);
             CHECK(reference[0].shape == vcr::Index{3, height, width});
             CHECK(std::ranges::any_of(reference[0].bytes, [](std::uint8_t b) { return b != 0; }));
+            // Raster pixels start halfway between surface vertices, so the first
+            // samples are 19.5/20.5 (1009.5/1010.5 for uint16).
+            // Test the actual renderer's conversion policy, including both tie directions.
+            if (wide) {
+                std::array<std::uint16_t, 2> first{};
+                std::memcpy(first.data(), reference[0].bytes.data(), sizeof(first));
+                CHECK(first[0] == 1010);
+                CHECK(first[1] == 1010);
+            } else {
+                CHECK(reference[0].bytes[0] == 20);
+                CHECK(reference[0].bytes[1] == 20);
+            }
 
             // Resume reads stored level 0 chunks to reconstruct the inline pyramid.
             for (int level = 1; level < 6; ++level) removeChunks(out / std::to_string(level));
