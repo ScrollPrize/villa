@@ -370,6 +370,12 @@ def bind_object_store(path, author=None, hub=None):
             "its build's python directory on PYTHONPATH") from exc
     remote = hub is not None and "://" in str(hub)
     if hub is not None and not resolved.exists():
+        # A clone copies the whole hub and reports nothing while it runs (a
+        # large one over sftp takes minutes): say so before it starts, as
+        # the only line a client sees until it ends.
+        print(f"Cloning the object-store hub {hub} into this service's replica "
+              f"{resolved} (first launch; later launches reuse it)…", flush=True)
+        started = time.monotonic()
         try:
             resolved.parent.mkdir(parents=True, exist_ok=True)
             vos.hub_clone(_canonical_hub(vos, hub), str(resolved), author)
@@ -377,6 +383,8 @@ def bind_object_store(path, author=None, hub=None):
             raise ObjectStoreBindingError(
                 f"cannot clone the hub {hub} to {resolved}: {exc}"
                 + (f"; {_REMOTE_HUB_HINT}" if remote else "")) from exc
+        print(f"Cloned the object-store hub ({resolved.stat().st_size / 2**20:.0f} MiB "
+              f"in {time.monotonic() - started:.0f} s)", flush=True)
     if not resolved.is_file():
         raise ObjectStoreBindingError(f"no object store at {resolved}")
     try:
