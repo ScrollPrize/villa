@@ -480,6 +480,30 @@ Flat inference has a narrower preprocessing contract than training. It accepts
 with `divisor: 255`. Other normalization modes are rejected rather than being
 silently replaced with robust normalization.
 
+### CPU inference
+
+On Linux, a command-line run on the CPU keeps freed buffers in glibc's heap
+(`mallopt(M_MMAP_MAX=0)` and a 2 GiB trim threshold). Otherwise glibc returns
+large freed blocks to the kernel and every batch page-faults its activation
+buffers in again, so on CPU `--batch-size 4` ran slower than the default
+batch of 1. At a given batch size the output is byte-identical. With the
+setting, on a 2-core / 4-thread Zen 3 VM,
+`--device cpu --no-compile --loader-threads 4 --batch-size 8` ran 1.20x faster
+for one model over both directions of a 1.3 cm² window (median of three
+runs) than the fastest run we measured without it (`--batch-size 1`, where
+the setting changes nothing; batch 4 was slower and batch 8 was not run
+without it; batch 1 and batch 8 maps differ by at most one uint8 level on
+0.001% of pixels). The cost is memory: freed blocks stay resident, and
+reused ones are zeroed in place. At
+the same batch size, peak RSS rose by about 0.3 GB on that window, and by
+1.0 GB over a two-segment `--folder` run whose in-RAM accumulators were
+1.5 GiB (`--max-ram-accumulation-gb` caps them); batch 8 itself peaked at
+2.6–2.7 GB. GPU runs, and callers that pass `argv` to `main()`, are
+unaffected. Preloading tcmalloc
+(`LD_PRELOAD=libtcmalloc_minimal.so.4`), which the
+[PyTorch tuning guide](https://docs.pytorch.org/tutorials/recipes/recipes/tuning_guide.html#switch-memory-allocator)
+recommends, was as fast at batch 4.
+
 ## Native 3D inference
 
 A tifxyz directory must contain `x.tif`, `y.tif`, `z.tif`, and
