@@ -6,14 +6,14 @@ namespace vcr::display {
 enum class Rounding { Truncate, NearestEven, HalfUp };
 struct Conversion {
     double scale = 1;
-    Rounding rounding = Rounding::Truncate;
+    Rounding rounding = Rounding::NearestEven;
     bool saturateInfinity = false;
 };
-// Conversion clamps to the output range. By default bytes truncate and map
-// nonfinite pixels to zero; uint16 rounds half up and saturates infinities.
+// Conversion clamps to the output range and rounds to nearest, ties to even.
+// By default bytes map nonfinite pixels to zero; uint16 saturates infinities.
 // Coverage describes finite input values regardless of conversion policy.
 void toUint8(const float* input, std::size_t n, std::uint8_t* output, std::uint8_t* coverage = nullptr, Conversion conversion = {});
-void toUint16(const float* input, std::size_t n, std::uint16_t* output, Conversion conversion = {1, Rounding::HalfUp, true});
+void toUint16(const float* input, std::size_t n, std::uint16_t* output, Conversion conversion = {1, Rounding::NearestEven, true});
 void windowLevelLut(std::array<std::uint32_t,256>& out, float low, float high) noexcept;
 void paletteLut(std::array<std::uint32_t,256>& out, const std::array<std::uint32_t,256>& palette,
                 float low, float high, bool blackZero = true) noexcept;
@@ -27,7 +27,7 @@ void blend(const std::uint32_t* base, const std::uint32_t* overlay, std::size_t 
 namespace cuda {
 // Pixel buffers and palette are device pointers; completes on the caller's stream.
 void toUint8(const float* input, std::size_t n, std::uint8_t* output, std::uint8_t* coverage = nullptr, Conversion conversion = {});
-void toUint16(const float* input, std::size_t n, std::uint16_t* output, Conversion conversion = {1, Rounding::HalfUp, true});
+void toUint16(const float* input, std::size_t n, std::uint16_t* output, Conversion conversion = {1, Rounding::NearestEven, true});
 void applyLut(const std::uint8_t* input, std::size_t rows, std::size_t cols, std::size_t inputStride,
               const std::uint32_t* lut, std::uint32_t* output, std::size_t outputStride);
 void blend(const std::uint32_t* base, const std::uint32_t* overlay, std::size_t n, float opacity, std::uint32_t* output);

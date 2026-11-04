@@ -138,24 +138,23 @@ void makeColors(const cv::Mat_<uint8_t>& values, const OverlayColormapSpec& spec
         return;
     }
 
-    {
-        // Tint colormap: value * tint[channel]
-        // tint is R, G, B in [0,1]
-        const float tR = spec.tint[0] * 255.0f;
-        const float tG = spec.tint[1] * 255.0f;
-        const float tB = spec.tint[2] * 255.0f;
+    const auto lut = tintPalette(spec.tint);
+    vcr::display::applyLut(values.ptr(), values.rows, values.cols, values.step1(), lut.data(), outBuf, outStride);
+}
 
-        // Build 256-entry LUT for each channel
-        std::array<uint32_t, 256> lut{};
-        for (int i = 0; i < 256; ++i) {
-            float f = static_cast<float>(i) / 255.0f;
-            auto r = static_cast<uint32_t>(std::min(f * tR, 255.0f));
-            auto g = static_cast<uint32_t>(std::min(f * tG, 255.0f));
-            auto b = static_cast<uint32_t>(std::min(f * tB, 255.0f));
-            lut[i] = 0xFF000000u | (r << 16) | (g << 8) | b;
-        }
-        vcr::display::applyLut(values.ptr(), values.rows, values.cols, values.step1(), lut.data(), outBuf, outStride);
-    }
+std::array<uint32_t, 256> tintPalette(const cv::Vec3f& tint)
+{
+    std::array<float, 256 * 3> values;
+    for (int i = 0; i < 256; ++i)
+        for (int channel = 0; channel < 3; ++channel)
+            values[3 * i + channel] = float(i) * tint[channel];
+    std::array<uint8_t, 256 * 3> bytes;
+    vcr::display::toUint8(values.data(), values.size(), bytes.data());
+    std::array<uint32_t, 256> lut;
+    for (int i = 0; i < 256; ++i)
+        lut[i] = 0xFF000000u | (uint32_t(bytes[3 * i]) << 16)
+                 | (uint32_t(bytes[3 * i + 1]) << 8) | uint32_t(bytes[3 * i + 2]);
+    return lut;
 }
 
 const std::vector<OverlayColormapEntry>& entries(const EntryScope scope) noexcept

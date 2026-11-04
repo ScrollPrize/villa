@@ -203,6 +203,13 @@ int main(void)
     vcr_window_level_lut(lut, 0.0f, 255.0f);
     vcr_apply_lut(bytes, 4, 8, 8, lut, pixels, 8);
     CHECK(pixels[0] == lut[bytes[0]]);
+    {
+        const float fractional[] = {20.6f, 60.6f, .5f, 1.5f, 2.5f, 255.5f};
+        uint8_t rounded[6];
+        vcr_to_uint8(fractional, 6, rounded, NULL);
+        CHECK(rounded[0] == 21 && rounded[1] == 61);
+        CHECK(rounded[2] == 0 && rounded[3] == 2 && rounded[4] == 2 && rounded[5] == 255);
+    }
 
     /* A flat surface: vertices every 2 voxels in x and 3 in y at z = 10. */
     for (r = 0; r < 4; ++r)

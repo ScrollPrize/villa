@@ -20,7 +20,8 @@ VCR_PIXEL inline T converted(float v, Conversion options) {
     if (options.rounding == Rounding::NearestEven) {
         value = round_half_even(value);
     } else if (options.rounding == Rounding::HalfUp) {
-        value = floor(value + .5);
+        const double low = floor(value);
+        value = low + nearest_rounds_up(value - low);
     }
     return T(value > maximum ? maximum : value);
 }
@@ -56,7 +57,7 @@ VCR_PIXEL inline uint32_t mix(uint32_t base,uint32_t over,float opacity) {
     uint32_t out=0xff000000u;
     for(int shift=0;shift<24;shift+=8) {
         const float v=keep*float((base>>shift)&255)+a*float((over>>shift)&255);
-        out|=uint32_t(clamp(floorf(v+0.5f),0,255))<<shift;
+        out|=uint32_t(byte(v))<<shift;
     }
     return out;
 }

@@ -2,6 +2,7 @@
 
 
 #include <vc_reader/grid.hpp>
+#include <vc_reader/display.hpp>
 #include <vc_reader/zarr.hpp>
 #include <vc_reader/array.hpp>
 
@@ -139,7 +140,7 @@ struct DSReader {
 };
 
 // Trilinear samples at volume XYZ points (mapped through the levels' placements),
-// truncated to 8 bits.
+// rounded to 8 bits only for output.
 static cv::Mat_<uint8_t> sample(DSReader& reader, const cv::Mat_<cv::Vec3f>& xyz)
 {
     const auto map = reader.level.placement.indexMapFrom(reader.base);
@@ -153,14 +154,14 @@ static cv::Mat_<uint8_t> sample(DSReader& reader, const cv::Mat_<cv::Vec3f>& xyz
     std::vector<float> values(n);
     vc::cuda::sampleLinear(*reader.level.array, reader.level.meta.type, vc::cuda::toolReader(reader.level), zyx.data(), n, values.data());
     cv::Mat_<uint8_t> out(xyz.size());
-    for (std::size_t i = 0; i < n; ++i)
-        out(int(i)) = std::isnan(values[i]) ? uint8_t(0) : uint8_t(std::clamp(values[i], 0.0f, 255.0f));
+    vcr::display::toUint8(values.data(), n, out.ptr(), nullptr,
+                         {1, vcr::display::Rounding::NearestEven, true});
     return out;
 }
 
 // The opacity-weighted offset along `normal` of the volume around `point`: the layers
 // of a d x d plane patch (pixel (0, 0) at the point, steps of the plane's basis / scale)
-// sampled linearly at start, start + step, ... stop, truncated to 8 bits, blurred and
+// sampled linearly at start, start + step, ... stop, kept in float, blurred and
 // composited front to back at the patch's centre pixel.
 float alphacomp_offset(DSReader &reader, cv::Vec3f point, cv::Vec3f normal, float start, float stop, float step, float low, float high, int r)
 {
@@ -190,7 +191,7 @@ float alphacomp_offset(DSReader &reader, cv::Vec3f point, cv::Vec3f normal, floa
     for (std::size_t k = 0; k < offsets.size(); ++k) {
         for (int i = 0; i < d * d; ++i) {
             const float v = layers.values[k * std::size_t(d * d) + std::size_t(i)];
-            floatslice(i) = float(std::isnan(v) ? uint8_t(0) : uint8_t(std::clamp(v, 0.0f, 255.0f))) / 255.0f;
+            floatslice(i) = (std::isnan(v) ? 0.0f : std::clamp(v, 0.0f, 255.0f)) / 255.0f;
         }
 
         cv::GaussianBlur(floatslice, blur, {d,d}, 0);
