@@ -1,0 +1,34 @@
+#pragma once
+// Offline conversion of schema-17 stores (standalone, hub, or settled hub
+// replica) to the numbered-history schema. The only place that knows the
+// previous format; the runtime opens schema 18 only.
+//
+// The source is never modified: it is read through one consistent SQLite
+// snapshot into a new destination. Identities, recorded history, geometry,
+// relationships and timestamps are copied unchanged; numbered versions and the
+// commit sequence are added deterministically from recorded publication order;
+// hub coordination tables are removed. A replica with unpublished, in-flight
+// or conflicting state is refused: settle it with the old tooling first.
+//
+// Gaps (untimed baselines, relationship states without a recorded
+// publication, geometry revisions that do not identify one object version,
+// metadata holding old revision UUIDs, missing artifact files) are reported,
+// never guessed; they do not by themselves block conversion.
+
+#include <cstdint>
+#include <filesystem>
+#include <string>
+
+namespace vc::objects::migration {
+
+struct ConversionResult {
+    // Report: counts, removed tables, explicit gaps, validation.
+    std::string reportJson;
+    // Old object/relationship revision UUID -> generation-qualified numbered
+    // reference, for converting pins in external exports and job configs.
+    std::string mappingJson;
+};
+
+ConversionResult convertStore(const std::filesystem::path& source, const std::filesystem::path& destination);
+
+} // namespace vc::objects::migration

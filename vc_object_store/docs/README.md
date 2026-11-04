@@ -204,6 +204,22 @@ that every client then resolves from the store.
 Writable opens hold a host-local ownership lock on `<canonical path>-owner`:
 shared between standalone writers, exclusive for `OpenOptions::serviceOwner`.
 
+### Converting schema-17 stores
+
+The runtime opens schema 18 only. Stop every client, settle hub replicas with
+the old tooling, then convert into a new file (the source is never changed):
+
+```sh
+vc_object_convert old.vcobj new.vcobj   # writes new.vcobj.mapping.json and new.vcobj.report.json
+```
+
+The mapping gives each old object/relationship revision UUID its numbered
+reference, for converting pins in exports and job configurations. The report
+lists gaps rather than guessing: untimed baselines, relationship states without
+a recorded publication, geometry revisions that do not select one object
+version, metadata still holding old revision UUIDs, and an unversioned inventory
+of external artifact files. Converted commits have author `unrecorded`.
+
 ## Relationships and graphs
 
 Relationships are shared by both endpoints. Addition, removal or rebinding

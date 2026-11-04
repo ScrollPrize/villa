@@ -96,6 +96,11 @@ endif()
 target_link_libraries(vc_objects PUBLIC vc_geometry vc_reader::sftp vc_reader::catalog nlohmann_json::nlohmann_json PRIVATE OpenSSL::Crypto zstd::libzstd)
 target_compile_features(vc_objects PUBLIC cxx_std_20)
 add_library(vc_object_store::vc_objects ALIAS vc_objects)
+# Offline schema conversion; the runtime library knows only the current schema.
+add_library(vc_object_migration STATIC migration/ConvertStore.cpp)
+target_include_directories(vc_object_migration PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+target_link_libraries(vc_object_migration PUBLIC vc_objects PRIVATE nlohmann_json::nlohmann_json)
+target_compile_features(vc_object_migration PUBLIC cxx_std_20)
 add_library(vc_object_store::vc_geometry ALIAS vc_geometry)
 
 if(NOT VC_OBJECT_STORE_BUILD_ADAPTERS)
