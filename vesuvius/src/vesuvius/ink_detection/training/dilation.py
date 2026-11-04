@@ -1,4 +1,4 @@
-"""Lazy CUDA label dilation and full-3D batch morphology."""
+"""Label dilation and full-3D batch morphology."""
 
 from __future__ import annotations
 
@@ -6,8 +6,12 @@ from collections.abc import Mapping
 
 import torch
 
+import vc_reader.transforms as A
+
 from vesuvius.ink_detection.config import TrainingConfig
 from vesuvius.ink_detection.data.geometry import native_volume_downsample_factor
+
+_OUTSIDE_DISTANCE = A.DistanceTransform(mode="outside", implicit_background=True)
 
 
 def resolve_dilation_distances(
@@ -35,59 +39,35 @@ def resolve_dilation_distances(
     return label_distance / factor, supervision_distance / factor
 
 
-def dilate_label_batch_with_cucim(
+def dilate_label_batch(
     labels_BCZYX: torch.Tensor,
     valid_B1ZYX: torch.Tensor,
     distance: float | None,
 ) -> torch.Tensor:
-    """Dilate CUDA binary labels within a validity mask via cuCIM EDT."""
+    """Set background voxels within ``distance`` of label 1 to 1, inside a validity mask.
+
+    Distances are exact Euclidean (vc_reader DistanceTransform) on the tensor's
+    device. A channel with no valid label 1 voxels is returned unchanged.
+    """
 
     if distance in (None, 0):
         return labels_BCZYX
-    if labels_BCZYX.device.type != "cuda":
-        raise RuntimeError(
-            "positive full_3d dilation requires CUDA with CuPy and cuCIM"
-        )
-    try:
-        import cupy as cp
-        from cucim.core.operations.morphology import distance_transform_edt
-    except ImportError as exc:
-        raise RuntimeError(
-            "positive full_3d dilation requires CUDA with CuPy and cuCIM"
-        ) from exc
-
-    cp.cuda.Device(labels_BCZYX.device.index).use()
-    output_BCZYX = labels_BCZYX.clone()
     if valid_B1ZYX.ndim == labels_BCZYX.ndim - 1:
         valid_B1ZYX = valid_B1ZYX.unsqueeze(1)
-    streams = [
-        cp.cuda.Stream(non_blocking=True)
-        for _ in range(output_BCZYX.shape[0])
-    ]
-    for batch_index in range(output_BCZYX.shape[0]):
-        with streams[batch_index]:
-            for channel_index in range(output_BCZYX.shape[1]):
-                label_ZYX = cp.from_dlpack(
-                    output_BCZYX[batch_index, channel_index].contiguous()
-                )
-                valid_ZYX = cp.from_dlpack(
-                    valid_B1ZYX[batch_index, 0].contiguous()
-                )
-                source_ZYX = (label_ZYX == 1) & (valid_ZYX > 0)
-                distances_ZYX = distance_transform_edt(
-                    ~source_ZYX,
-                    return_indices=False,
-                    float64_distances=False,
-                )
-                fill_ZYX = (
-                    (label_ZYX == 0)
-                    & (valid_ZYX > 0)
-                    & (distances_ZYX <= float(distance))
-                )
-                label_ZYX[fill_ZYX] = label_ZYX.dtype.type(1)
-    for stream in streams:
-        stream.synchronize()
-    return output_BCZYX
+    batch, channels, *spatial = labels_BCZYX.shape
+    valid_B1ZYX = valid_B1ZYX > 0
+    source_BCZYX = (labels_BCZYX == 1) & valid_B1ZYX
+    distances_BCZYX = _OUTSIDE_DISTANCE.batch(
+        source_BCZYX.reshape(batch * channels, 1, *spatial).to(torch.uint8)
+    ).reshape(labels_BCZYX.shape)
+    has_source_BC111 = source_BCZYX.flatten(2).any(-1).reshape(batch, channels, 1, 1, 1)
+    fill_BCZYX = (
+        (labels_BCZYX == 0)
+        & valid_B1ZYX
+        & (distances_BCZYX <= float(distance))
+        & has_source_BC111
+    )
+    return labels_BCZYX.masked_fill(fill_BCZYX, 1)
 
 
 def apply_label_dilation(
@@ -110,14 +90,14 @@ def apply_label_dilation(
         dtype=inklabels_BCZYX.dtype,
     )
     if label_distance > 0.0:
-        inklabels_BCZYX = dilate_label_batch_with_cucim(
+        inklabels_BCZYX = dilate_label_batch(
             inklabels_BCZYX, valid_B1ZYX, label_distance
         )
     if supervision_distance > 0.0:
         background_BCZYX = (
             (supervision_BCZYX > 0) & (inklabels_BCZYX <= 0)
         ).to(dtype=inklabels_BCZYX.dtype)
-        background_BCZYX = dilate_label_batch_with_cucim(
+        background_BCZYX = dilate_label_batch(
             background_BCZYX, valid_B1ZYX, supervision_distance
         )
         background_BCZYX = background_BCZYX * (

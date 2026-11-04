@@ -109,6 +109,22 @@ class DeviceArray:
         return f"DeviceArray(shape={self.shape}, dtype={self.dtype}, device={self.device})"
 
 
+def set_pool_release_threshold(nbytes, *, device=0):
+    """Keep at most ``nbytes`` of freed vc_reader CUDA memory on ``device`` for reuse.
+
+    vc_reader allocates from the device's default stream-ordered pool, shared with
+    anything else in the process that uses it. By default freed memory is kept
+    (no limit), so repeated calls do not allocate again; ``0`` returns it to the
+    driver at each synchronization, CUDA's own default.
+    """
+    _reader._set_pool_release_threshold(int(device), int(nbytes))
+
+
+def pool_release_threshold(*, device=0):
+    """The freed bytes the device's pool keeps; 2**64 - 1 means no limit."""
+    return _reader._pool_release_threshold(int(device))
+
+
 def is_device_array(value):
     """True for DeviceArray or any CUDA DLPack producer (e.g. a CUDA torch tensor)."""
     if isinstance(value, DeviceArray):
@@ -139,7 +155,7 @@ def wrap(value):
         return value
     # DLPack uses 1 for CUDA's default stream. An omitted stream would make
     # Torch fence its default stream even when all work uses a separate stream.
-    value = _StreamInput(value, _reader._get_stream() or 1)
+    value = _StreamInput(value, _reader._dlpack_stream())
     shape, dtype, device = _reader._cuda_describe(value)
     return DeviceArray(_reader._cuda_view(value, shape, 0), shape, np.dtype(dtype), device)
 

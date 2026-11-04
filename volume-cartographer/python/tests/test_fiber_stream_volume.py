@@ -1,8 +1,11 @@
 """Native continuous observer and seed API contracts."""
 from concurrent.futures import ThreadPoolExecutor
 import numpy as np
+import pytest
 from test_fiber_chunk_trace import inputs, handles, chunk_config, trace_config
 from vc import fiber_trace as ft
+pytest.importorskip("msgpack")
+pytest.importorskip("vesuvius")
 from vc.fiber_stream_volume import NativeCT, uniform_path, save_page, read_page
 
 def test_cooperative_scheduler_cold_ct_and_resume(inputs):
@@ -54,10 +57,10 @@ def test_cooperative_scheduler_cold_ct_and_resume(inputs):
     import pytest
     # Incompatible historical pages must never be treated as completed work.
     import msgpack
-    from numcodecs import Zstd
+    from vc_reader.reader import compress_bytes
     original=pages[0].read_bytes()
     old=read_page(pages[0]);old['version']=1
-    pages[0].write_bytes(Zstd().encode(msgpack.packb(old,use_bin_type=True)))
+    pages[0].write_bytes(compress_bytes(msgpack.packb(old,use_bin_type=True),dict(id='zstd',level=1)))
     with pytest.raises(ValueError,match='old outputs cannot be reused'):
         ft.run_stream_volume(field,normals,trace,chunk_config(),json.dumps(options),keys,str(output))
     pages[0].write_bytes(original)
@@ -138,13 +141,13 @@ def test_seeds_are_core_owned_and_have_width(inputs):
     assert np.all(seeds['points_base']<cfg.core_base)
     np.testing.assert_allclose(seeds['widths_base'],20)
 
-def test_ct_sampling_does_not_double_scale():
+def test_ct_sampling_scales_to_its_level_and_orders_zyx():
     class Fake:
-        def sample_coords(self,p,mask,**kwargs):
-            np.testing.assert_array_equal(p,[[[100,200,300]]])
-            assert kwargs['level']==2 and kwargs['sampling']=='nearest'
-            return np.array([[17]],np.uint8),None,None
-    ct=NativeCT.__new__(NativeCT);ct.volume=Fake();ct.level=2;ct.scale=1.
+        def sample(self,p,order):
+            np.testing.assert_array_equal(p,[[75,50,25]])
+            assert order==0
+            return np.array([17],np.uint8)
+    ct=NativeCT.__new__(NativeCT);ct.reader=Fake();ct.scale=4.
     np.testing.assert_array_equal(ct.outside([[100,200,300]]),[False])
 
 def test_storage_and_policy_sampling(tmp_path):

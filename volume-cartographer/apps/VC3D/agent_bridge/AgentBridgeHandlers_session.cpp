@@ -1,8 +1,8 @@
 #include "agent_bridge/AgentBridgeServer.hpp"
+#include <vc_reader/zarr.hpp>
 #include "agent_bridge/AgentBridgeInternal.hpp"
 #include <vc_object_store/objects/Project.hpp>
 #include <vc_object_store/Uuid.hpp>
-#include "vc/core/util/AtomicFile.hpp"
 #include <QJsonDocument>
 
 #include <QBuffer>
@@ -11,6 +11,8 @@
 #include <QImage>
 #include <QJsonArray>
 #include <QPixmap>
+#include <QOpenGLWidget>
+#include <QPainter>
 #include <QPointF>
 #include <QRegularExpression>
 #include <QWidget>
@@ -27,7 +29,7 @@
 #include "CWindow.hpp"
 #include "AxisAlignedSliceController.hpp"
 #include "CState.hpp"
-#include "OpenDataManifest.hpp"
+#include "OpenDataResourceSelection.hpp"
 #include "SegmentationCommandHandler.hpp"
 #include "SurfaceCatalog.hpp"
 #include "SurfacePanelController.hpp"
@@ -70,6 +72,7 @@ QJsonObject AgentBridgeServer::handleStateGet(const QJsonValue&)
         result["segmentationGrowthVolumeId"] = QString();
         result["segmentationEditingEnabled"] = false;
         result["manualAddMode"] = false;
+        result["segmentationGrowthMethod"] = QJsonValue::Null;
         result["manualAddLineMode"] = QJsonValue::Null;
         result["manualAddInterpolation"] = QJsonValue::Null;
         result["correctionsPointMode"] = false;
@@ -151,6 +154,7 @@ QJsonObject AgentBridgeServer::handleStateGet(const QJsonValue&)
     // Line and interpolation modes persist when manual-add is inactive.
     if (SegmentationModule* mod = _window->_segmentationModule.get()) {
         result["manualAddMode"] = mod->manualAddMode();
+        result["manualAddFollowingSheet"] = mod->manualAddSheetWalkRunning();
         result["correctionsPointMode"] = mod->correctionPointMode();
         // Explicit save/flush bookkeeping.
         const SegmentationModule::AutosaveStatus save = mod->autosaveStatus();
@@ -161,6 +165,7 @@ QJsonObject AgentBridgeServer::handleStateGet(const QJsonValue&)
         result["autosave"] = autosave;
     } else {
         result["manualAddMode"] = false;
+        result["manualAddFollowingSheet"] = false;
         result["correctionsPointMode"] = false;
         result["autosave"] = QJsonValue::Null;
     }
@@ -178,10 +183,12 @@ QJsonObject AgentBridgeServer::handleStateGet(const QJsonValue&)
         result["axisAlignedSlices"] = QJsonValue::Null;
     }
     if (SegmentationWidget* widget = _window->_segmentationWidget) {
+        result["segmentationGrowthMethod"] = segmentationGrowthMethodToString(widget->growthMethod());
         const ManualAddTool::Config cfg = widget->manualAddConfig();
         result["manualAddLineMode"] = linePreviewModeToString(cfg.linePreviewMode);
         result["manualAddInterpolation"] = interpolationModeToString(cfg.interpolationMode);
     } else {
+        result["segmentationGrowthMethod"] = QJsonValue::Null;
         result["manualAddLineMode"] = QJsonValue::Null;
         result["manualAddInterpolation"] = QJsonValue::Null;
     }
@@ -381,6 +388,22 @@ QJsonObject AgentBridgeServer::handleScreenshotCapture(const QJsonValue& params)
     }
 
     QPixmap pixmap = widget->grab();
+    // QWidget's raster grab does not support QOpenGLWidget contents. Composite
+    // each visible GL child's framebuffer in logical coordinates so 3D colours
+    // and legends survive full-window captures, including on Retina displays.
+    {
+        QPainter painter(&pixmap);
+        for (auto* gl : widget->findChildren<QOpenGLWidget*>()) {
+            if (!gl->isVisibleTo(widget) || gl->window() != widget->window()) continue;
+            const QImage frame = gl->grabFramebuffer();
+            if (frame.isNull()) continue;
+            const QPoint position = gl->mapTo(widget, QPoint{});
+            painter.save();
+            painter.setClipRegion(gl->visibleRegion().translated(position));
+            painter.drawImage(QRect(position, gl->size()), frame);
+            painter.restore();
+        }
+    }
 
     static constexpr int kMinCaptureDim = 8;
     if (pixmap.width() < kMinCaptureDim || pixmap.height() < kMinCaptureDim) {
@@ -513,7 +536,7 @@ QJsonObject AgentBridgeServer::handleProjectCreate(const QJsonValue& params)
     }
 
     const std::string volumeLocation = volume.toStdString();
-    if (!vc::project::isLocationRemote(volumeLocation) &&
+    if (!vcr::zarr::isRemote(volumeLocation) &&
         !vc::project::resolveLocalPath(volumeLocation).is_absolute()) {
         QJsonObject data{{"param", "volume"}};
         throw AgentBridgeError{-32602, "local volume path must be absolute", data};
@@ -589,7 +612,7 @@ QJsonObject AgentBridgeServer::handleProjectCreate(const QJsonValue& params)
         auto package = VolumePkg::open(staging, loadOptions);
         package->addVolumeEntry(volumeLocation, std::move(tags));
         recordedLocation = package->volumeEntries().front().location;
-        vc::core::util::atomicWriteString(outputPath, package->document().data().dump(2) + "\n");
+        vcr::zarr::atomicWrite(outputPath, package->document().data().dump(2) + "\n", vcr::zarr::Durability::Fsync);
         fs::remove(staging);
     } catch (const std::exception& error) {
         std::error_code ignored;
@@ -626,7 +649,7 @@ QJsonObject AgentBridgeServer::handleVolumeAttach(const QJsonValue& params)
     }
 
     const std::string input = location.toStdString();
-    if (!vc::project::isLocationRemote(input) &&
+    if (!vcr::zarr::isRemote(input) &&
         !vc::project::resolveLocalPath(input).is_absolute()) {
         throw AgentBridgeError{
             -32602,

@@ -54,6 +54,17 @@ import numpy as np
 
 # Output zarr chunk edge; prob-volume spill buckets are full z/y/x chunks.
 _OUTPUT_CHUNK = 128
+# Every array this script creates: v3 layout, empty chunks stay unstored.
+_OUTPUT_ARRAY = {"separator": "/", "skip_empty": True}
+
+
+def _open_output_array(group_path, name):
+    """One array of an output group, opened for writing."""
+    from vc_reader.reader import ZarrWriter
+
+    return ZarrWriter.open(f"{group_path}/{name}", skip_empty=True)
+
+
 # Raw prob-volume record used only by the portable CPU fallback.
 _PROB_RECORD = np.dtype([("key", "<u8"), ("val", "u1")])
 # Spill records are partial reductions, not individual slab observations.
@@ -93,131 +104,41 @@ _PROB_KEY_MASK = (1 << 21) - 1
 _PROB_GPU_FLUSH_RECORDS = 1 << 26
 
 
-def _append_prob_aggregates(path, records):
-    """Append one independently compressed aggregate block."""
-    from numcodecs import Blosc
+# Byte shuffle is both faster and smaller than bitshuffle for these structured
+# records (e.g. u64/u64/u32/u8).  On representative full-resolution spills it
+# reduced encode time by ~28% and bytes by ~22%.
+_SPILL_CODEC = {"id": "blosc", "cname": "zstd", "clevel": 1, "shuffle": 1}
 
-    # Byte shuffle is both faster and smaller than bitshuffle for this
-    # structured record (u64/u64/u32/u8).  On representative full-resolution
-    # spills it reduced encode time by ~28% and bytes by ~22%.
-    codec = Blosc(cname="zstd", clevel=1, shuffle=Blosc.SHUFFLE)
-    encoded = codec.encode(np.ascontiguousarray(records))
+
+def _append_aggregates(path, records):
+    """Append one independently compressed block of aggregate records."""
+    from vc_reader.reader import compress_bytes
+
+    records = np.ascontiguousarray(records)
+    encoded = compress_bytes(
+        records, _SPILL_CODEC, itemsize=records.dtype.itemsize)
     with open(path, "ab") as handle:
-        handle.write(struct.pack("<Q", len(encoded)))
+        handle.write(struct.pack("<QQ", len(encoded), records.nbytes))
         handle.write(encoded)
 
 
-def _iter_prob_aggregates(path):
-    """Yield aggregate arrays from concatenated compressed blocks."""
-    from numcodecs import Blosc
+def _iter_aggregates(path, dtype):
+    """Yield record arrays from concatenated compressed blocks."""
+    from vc_reader.reader import decompress_bytes
 
-    codec = Blosc(cname="zstd", clevel=1, shuffle=Blosc.SHUFFLE)
     with open(path, "rb") as handle:
         while True:
-            header = handle.read(8)
+            header = handle.read(16)
             if not header:
                 return
-            if len(header) != 8:
-                raise RuntimeError(f"truncated probability spill header: {path}")
-            size = struct.unpack("<Q", header)[0]
+            if len(header) != 16:
+                raise RuntimeError(f"truncated spill header: {path}")
+            size, decoded = struct.unpack("<QQ", header)
             encoded = handle.read(size)
             if len(encoded) != size:
-                raise RuntimeError(f"truncated probability spill block: {path}")
-            yield np.frombuffer(codec.decode(encoded), dtype=_PROB_AGG_RECORD)
-
-
-def _append_phase_aggregates(path, records):
-    """Append one independently compressed phase-consensus block."""
-    from numcodecs import Blosc
-
-    codec = Blosc(cname="zstd", clevel=1, shuffle=Blosc.SHUFFLE)
-    encoded = codec.encode(np.ascontiguousarray(records))
-    with open(path, "ab") as handle:
-        handle.write(struct.pack("<Q", len(encoded)))
-        handle.write(encoded)
-
-
-def _iter_phase_aggregates(path):
-    """Yield phase-consensus arrays from concatenated compressed blocks."""
-    from numcodecs import Blosc
-
-    codec = Blosc(cname="zstd", clevel=1, shuffle=Blosc.SHUFFLE)
-    with open(path, "rb") as handle:
-        while True:
-            header = handle.read(8)
-            if not header:
-                return
-            if len(header) != 8:
-                raise RuntimeError(f"truncated phase spill header: {path}")
-            size = struct.unpack("<Q", header)[0]
-            encoded = handle.read(size)
-            if len(encoded) != size:
-                raise RuntimeError(f"truncated phase spill block: {path}")
-            yield np.frombuffer(codec.decode(encoded), dtype=_PHASE_AGG_RECORD)
-
-
-def _append_phase_label_aggregates(path, records):
-    """Append one independently compressed labeled-phase block."""
-    from numcodecs import Blosc
-
-    codec = Blosc(cname="zstd", clevel=1, shuffle=Blosc.SHUFFLE)
-    encoded = codec.encode(np.ascontiguousarray(records))
-    with open(path, "ab") as handle:
-        handle.write(struct.pack("<Q", len(encoded)))
-        handle.write(encoded)
-
-
-def _iter_phase_label_aggregates(path):
-    """Yield labeled-phase arrays from concatenated compressed blocks."""
-    from numcodecs import Blosc
-
-    codec = Blosc(cname="zstd", clevel=1, shuffle=Blosc.SHUFFLE)
-    with open(path, "rb") as handle:
-        while True:
-            header = handle.read(8)
-            if not header:
-                return
-            if len(header) != 8:
-                raise RuntimeError(
-                    f"truncated labeled-phase spill header: {path}")
-            size = struct.unpack("<Q", header)[0]
-            encoded = handle.read(size)
-            if len(encoded) != size:
-                raise RuntimeError(
-                    f"truncated labeled-phase spill block: {path}")
+                raise RuntimeError(f"truncated spill block: {path}")
             yield np.frombuffer(
-                codec.decode(encoded), dtype=_PHASE_LABEL_AGG_RECORD)
-
-
-def _append_winding_aggregates(path, records):
-    """Append one compressed source-vote aggregate block."""
-    from numcodecs import Blosc
-
-    codec = Blosc(cname="zstd", clevel=1, shuffle=Blosc.SHUFFLE)
-    encoded = codec.encode(np.ascontiguousarray(records))
-    with open(path, "ab") as handle:
-        handle.write(struct.pack("<Q", len(encoded)))
-        handle.write(encoded)
-
-
-def _iter_winding_aggregates(path):
-    """Yield source-vote aggregates from concatenated compressed blocks."""
-    from numcodecs import Blosc
-
-    codec = Blosc(cname="zstd", clevel=1, shuffle=Blosc.SHUFFLE)
-    with open(path, "rb") as handle:
-        while True:
-            header = handle.read(8)
-            if not header:
-                return
-            if len(header) != 8:
-                raise RuntimeError(f"truncated winding aggregate header: {path}")
-            size = struct.unpack("<Q", header)[0]
-            encoded = handle.read(size)
-            if len(encoded) != size:
-                raise RuntimeError(f"truncated winding aggregate block: {path}")
-            yield np.frombuffer(
-                codec.decode(encoded), dtype=_WINDING_AGG_RECORD)
+                decompress_bytes(encoded, _SPILL_CODEC, decoded), dtype=dtype)
 
 
 def _spiral_scripts_dir():
@@ -266,6 +187,47 @@ def _native_phase_cache_model_cfg(path):
 ANCHOR_TOLERANCE = 6.0  # max |t_peak - midpoint| for the seed anchor, samples
 EDGE_MARGIN = 8  # ignore peaks this close to the ray ends, samples
 TRANSFORM_CHUNK = 200_000  # points per SpiralAndTransform.inv call
+# Slabs per restartable --spiral-supervision-only part (fixed ranges of the
+# global ray order, independent of the GPU count).
+SUPERVISION_PART_RAYS = 256
+
+# Decode, raster, and probability options that only apply when derived
+# outputs are materialized; --native-phase-only and --spiral-supervision-only
+# reject them.
+_RECONSTRUCTION_OPTIONS = frozenset({
+    "--column-step", "--column-upsample", "--threshold",
+    "--min-distance", "--min-prob-keep", "--max-level",
+    "--prob-volume", "--archive-workers", "--prob-volume-floor",
+    "--prob-combine", "--prob-ray-margin", "--prob-column-margin",
+    "--merge-workers", "--prob-column-step",
+    "--prob-phase-level-half-life", "--prob-phase-max-level",
+    "--prob-phase-edge-taper", "--prob-phase-agreement-power",
+    "--prob-phase-min-observations",
+    "--prob-phase-min-effective-observations",
+    "--prob-phase-min-weight", "--prob-phase-band-sigma",
+    "--output-downsample", "--slab-center-width",
+    "--phase-cache-winding-stride",
+    "--phase-cache-allow-relocated-inputs",
+    "--phase-registration", "--phase-sync-radius",
+    "--phase-sync-neighbors", "--phase-sync-workers",
+    "--phase-sync-block-size", "--phase-sync-transverse-margin",
+    "--phase-sync-ray-margin", "--phase-sync-taper",
+    "--phase-sync-min-density", "--phase-sync-iterations",
+    "--phase-sync-huber", "--phase-sync-prior-weight",
+    "--phase-sync-prior-huber", "--phase-sync-max-correction",
+    "--phase-sync-recompute",
+    "--decode-workers",
+})
+
+
+def _supplied_options(options):
+    """The given options that appear on the command line."""
+    return sorted({
+        option
+        for token in sys.argv[1:]
+        for option in options
+        if token == option or token.startswith(option + "=")
+    })
 
 
 def parse_args():
@@ -506,6 +468,12 @@ def parse_args():
         "--phase-cache", default=None,
         help="reconstruct the normal output from a --native-phase-only Zarr, "
              "skipping volume extraction and neural-model inference")
+    modes.add_argument(
+        "--spiral-supervision-only", action="store_true",
+        help="write the compact Spiral supervision store to OUTPUT directly: "
+             "each slab's centre ray is decoded in memory exactly as "
+             "export_spiral_supervision.py decodes it from a native phase "
+             "cache, so no cache is written. Restartable from OUTPUT.partial")
     parser.add_argument(
         "--phase-cache-allow-relocated-inputs", action="store_true",
         help="allow --model-ckpt and --reference-zarr paths to differ from "
@@ -520,40 +488,18 @@ def parse_args():
              "the wider retained-anchor gap")
     args = parser.parse_args()
     if args.native_phase_only:
-        derived_options = {
-            "--column-step", "--column-upsample", "--threshold",
-            "--min-distance", "--min-prob-keep", "--max-level",
-            "--prob-volume", "--archive-workers", "--prob-volume-floor",
-            "--prob-combine", "--prob-ray-margin", "--prob-column-margin",
-            "--merge-workers", "--prob-column-step",
-            "--prob-phase-level-half-life", "--prob-phase-max-level",
-            "--prob-phase-edge-taper", "--prob-phase-agreement-power",
-            "--prob-phase-min-observations",
-            "--prob-phase-min-effective-observations",
-            "--prob-phase-min-weight", "--prob-phase-band-sigma",
-            "--output-downsample", "--slab-center-width",
-            "--phase-cache-winding-stride",
-            "--phase-cache-allow-relocated-inputs",
-            "--phase-registration", "--phase-sync-radius",
-            "--phase-sync-neighbors", "--phase-sync-workers",
-            "--phase-sync-block-size", "--phase-sync-transverse-margin",
-            "--phase-sync-ray-margin", "--phase-sync-taper",
-            "--phase-sync-min-density", "--phase-sync-iterations",
-            "--phase-sync-huber", "--phase-sync-prior-weight",
-            "--phase-sync-prior-huber", "--phase-sync-max-correction",
-            "--phase-sync-recompute",
-            "--decode-workers",
-        }
-        supplied = sorted({
-            option
-            for token in sys.argv[1:]
-            for option in derived_options
-            if token == option or token.startswith(option + "=")
-        })
+        supplied = _supplied_options(_RECONSTRUCTION_OPTIONS)
         if supplied:
             parser.error(
                 "--native-phase-only does not materialize derived outputs; "
                 "remove these reconstruction-only options: "
+                + ", ".join(supplied))
+    if args.spiral_supervision_only:
+        supplied = _supplied_options(_RECONSTRUCTION_OPTIONS)
+        if supplied:
+            parser.error(
+                "--spiral-supervision-only decodes only each slab's centre "
+                "ray; remove these reconstruction-only options: "
                 + ", ".join(supplied))
     return args
 
@@ -586,7 +532,7 @@ def build_seed_rays_from_meshes(args):
     away from the sheet (its splice tolerance alone is ~0.5 windings).
     """
     import re
-    import vesuvius.tifxyz as tifxyz
+    from vc_reader import tifxyz
 
     checkpoint = _load_checkpoint_cfg(args.fit_checkpoint)
     cfg = dict(checkpoint["cfg"])
@@ -633,12 +579,10 @@ def build_seed_rays_from_meshes(args):
     umbilicus_path = _find_umbilicus(args)
 
     def load_grid(path):
-        surface = tifxyz.read_tifxyz(path)
-        grid = np.stack([surface._x, surface._y, surface._z],
-                        axis=-1).astype(np.float64)
-        valid = surface.valid_vertex_mask & np.isfinite(grid).all(-1)
-        grid[~valid] = np.nan
-        return grid, valid
+        surface = tifxyz.read(path)
+        grid = surface.xyz.astype(np.float64)
+        grid[~surface.valid] = np.nan
+        return grid, surface.valid
 
     def neighbor_vertices(winding):
         """Vertices of an adjacent winding's mesh and the sign of its offset."""
@@ -737,7 +681,9 @@ def build_seed_rays(args, device="cuda:0"):
                 "gap_expander_logit_resolution", "gap_expander_num_windings",
                 "gap_expander_lr_scale", "linear_z_resolution",
                 "initial_dr_per_winding"):
-        cfg.setdefault(f"model_{key}", cfg[key])
+        # Recent spiral-fitting checkpoints store only the model_ keys.
+        if key in cfg:
+            cfg.setdefault(f"model_{key}", cfg[key])
 
     z_begin, z_end = int(checkpoint["z_begin"]), int(checkpoint["z_end"])
     z_lo, z_hi = args.z_range if args.z_range else (z_begin, z_end)
@@ -1157,14 +1103,11 @@ class _NativePhaseCacheWriter:
     """Write one GPU's native phase, validity, and geometric frames."""
 
     def __init__(self, group_path, gpu):
-        import zarr
-
-        group = zarr.open_group(str(group_path), mode="r+")
         name = f"shard_{gpu}"
-        self.phase = group["phase"][name]
-        self.valid = group["valid"][name]
-        self.frame = group["frame"][name]
-        self.available = group["available"][name]
+        self.phase = _open_output_array(group_path, f"phase/{name}")
+        self.valid = _open_output_array(group_path, f"valid/{name}")
+        self.frame = _open_output_array(group_path, f"frame/{name}")
+        self.available = _open_output_array(group_path, f"available/{name}")
 
     @staticmethod
     def _runs(indices):
@@ -1196,9 +1139,9 @@ class _NativePhaseCacheReader:
     """Random-access view of globally ordered, physically sharded phase data."""
 
     def __init__(self, group_path):
-        import zarr
+        from vc_reader.reader import open_group
 
-        self.group = zarr.open_group(str(group_path), mode="r")
+        self.group = open_group(str(group_path))
         shards = list(self.group.attrs["phase_shards"])
         self.bounds = np.asarray(
             [int(shards[0]["lo"])] + [int(item["hi"]) for item in shards],
@@ -1227,6 +1170,86 @@ class _NativePhaseCacheReader:
         return phase, valid, frame
 
 
+class _SpiralSupervisionWriter:
+    """Decode one GPU's slabs straight into compact Spiral supervision parts.
+
+    Takes the native phase/validity batches that --native-phase-only would
+    store and keeps only what export_spiral_supervision.py would read back
+    from them: each slab's decoded centre ray. Parts are fixed ranges of the
+    global ray order; main() hands each worker whole parts, so a part is
+    complete once a later part's slab (or the end of the shard) arrives.
+    """
+
+    def __init__(self, args, shard):
+        from vesuvius.neural_tracing.winding_models.export_spiral_supervision \
+            import CenterRayPart, center_ray_layout
+
+        self.part_type = CenterRayPart
+        config = args.spiral_supervision
+        self.signature = config["signature"]
+        self.attributes = config["attributes"]
+        self.part_rays = int(config["part_rays"])
+        self.parts_root = (
+            Path(config["partial"]) / "parts" / self.signature["name"])
+        self.parts_root.mkdir(parents=True, exist_ok=True)
+        self.global_index = np.asarray(shard["global_index"], dtype=np.int64)
+        self.seed_winding = np.asarray(shard["seed_winding"], dtype=np.int16)
+        self.pending = list(np.unique(self.global_index // self.part_rays))
+        (self.center, self.valid_center, self.transverse_center,
+         self.anchor) = center_ray_layout(
+            self.attributes["native_columns"],
+            self.attributes["column_stride"],
+            self.attributes["transverse_size"], self.attributes["ray_length"])
+        self.part = None
+        self.part_id = None
+
+    def _open(self, part_id):
+        start = int(part_id) * self.part_rays
+        end = min(start + self.part_rays, int(self.signature["hi"]))
+        self.part_id = int(part_id)
+        self.part = self.part_type(
+            end - start, anchor=self.anchor,
+            transverse_center=self.transverse_center,
+            spacing=self.attributes["spacing"],
+            edge_margin=self.signature["edge_margin"],
+            edge_trim=self.signature["edge_trim"])
+
+    def _write_through(self, part_id):
+        """Write every pending part before ``part_id`` (all slabs resolved)."""
+        while self.pending and self.pending[0] < part_id:
+            if self.part_id != self.pending[0]:
+                self._open(self.pending[0])  # every slab was unavailable
+            start = self.part_id * self.part_rays
+            end = start + self.part.num_source_rays
+            self.part.write(
+                self.parts_root / f"{start:08d}_{end:08d}", {
+                    "name": self.signature["name"],
+                    "part_start": start,
+                    "part_end": end,
+                    "source_signature": dict(
+                        self.signature, part_start=start, part_end=end),
+                })
+            self.pending.pop(0)
+            self.part = self.part_id = None
+
+    def add(self, indices, phase, valid, frames):
+        for sample, index in enumerate(indices):
+            part_id = int(self.global_index[index]) // self.part_rays
+            self._write_through(part_id)
+            if self.part_id != part_id:
+                self._open(part_id)
+            frame = frames[sample]
+            self.part.add(
+                phase[sample, self.center, self.center],
+                valid[sample][self.valid_center, self.valid_center],
+                np.stack([frame.origin, frame.axis_a, frame.axis_b,
+                          frame.direction]).astype(np.float64),
+                self.seed_winding[index])
+
+    def close(self):
+        self._write_through(np.inf)
+
+
 def gpu_worker(gpu, args, shard_path, result_path, progress_queue=None):
     """One inference process per GPU: extract slabs, run the model, decode."""
     import torch
@@ -1248,9 +1271,9 @@ def gpu_worker(gpu, args, shard_path, result_path, progress_queue=None):
     device = torch.device(f"cuda:{gpu}")
     phase_reader = None
     if getattr(args, "phase_cache", None):
-        import zarr
+        from vc_reader.reader import open_group
 
-        cache_attrs = zarr.open_group(args.phase_cache, mode="r").attrs
+        cache_attrs = open_group(args.phase_cache).attrs
         model_cfg = {
             "ray_length": int(cache_attrs["ray_length"]),
             "transverse_size": int(cache_attrs["transverse_size"]),
@@ -1295,7 +1318,6 @@ def gpu_worker(gpu, args, shard_path, result_path, progress_queue=None):
             ray_length=ray_length,
             spacing=spacing,
             sampling=str(model_cfg.get("sampling", "trilinear")),
-            tile_size=int(model_cfg.get("tile_size", 64)),
             cache_bytes=int(
                 args.volume_cache_bytes
                 if args.volume_cache_bytes is not None
@@ -1311,10 +1333,6 @@ def gpu_worker(gpu, args, shard_path, result_path, progress_queue=None):
 
     midpoint_t = (ray_length - 1) / 2.0
 
-    # A few locally stored chunks of these volumes are truncated; the
-    # training dataloader skips samples that touch them and so do we.
-    malformed_chunk = "decoded chunk byte size does not match full chunk shape"
-
     def extract(index):
         if phase_reader is not None:
             cached = phase_reader.read(int(shard["global_index"][index]))
@@ -1324,16 +1342,18 @@ def gpu_worker(gpu, args, shard_path, result_path, progress_queue=None):
             return index, phase, valid, frame
         origin = seeds[index].astype(np.float64) \
             - midpoint_t * spacing * directions[index].astype(np.float64)
-        try:
-            return index, *extractor.extract(0, directions[index], origin)
-        except RuntimeError as exc:
-            if malformed_chunk not in str(exc):
-                raise
-            return index, None, None, None
+        return index, *extractor.extract(0, directions[index], origin)
 
-    phase_only = bool(getattr(args, "native_phase_only", False))
-    phase_writer = (
-        _NativePhaseCacheWriter(args.output, gpu) if phase_only else None)
+    # Direct Spiral supervision runs the --native-phase-only path up to the
+    # writer, which decodes the centre rays instead of storing the phase.
+    supervision_only = bool(getattr(args, "spiral_supervision_only", False))
+    phase_only = supervision_only or bool(
+        getattr(args, "native_phase_only", False))
+    if supervision_only:
+        phase_writer = _SpiralSupervisionWriter(args, shard)
+    else:
+        phase_writer = (
+            _NativePhaseCacheWriter(args.output, gpu) if phase_only else None)
     decoded_writer = None if phase_only else _DecodedShardWriter(result_path)
     # Prob-volume partials spill straight to compressed per-output-chunk files:
     # neither this worker nor the merge stage holds the full record set.
@@ -1484,7 +1504,7 @@ def gpu_worker(gpu, args, shard_path, result_path, progress_queue=None):
         while extract_window:
             item = extract_window.popleft().result()
             refill()
-            if item[1] is None:  # slab touched a truncated volume chunk
+            if item[1] is None:  # slab not available in the phase cache
                 skipped += 1
                 decoded_slabs += 1
                 # Extraction is consumed in index order, so any earlier
@@ -1510,12 +1530,14 @@ def gpu_worker(gpu, args, shard_path, result_path, progress_queue=None):
         if spill is not None:
             spill.flush()
         if skipped:
-            print(f"[gpu{gpu}] skipped {skipped} slabs on truncated volume "
-                  "chunks", flush=True)
+            print(f"[gpu{gpu}] skipped {skipped} slabs not available in the "
+                  "phase cache", flush=True)
 
     compute_elapsed = time.time() - started
     if decoded_writer is not None:
         decoded_writer.close()
+    if supervision_only:
+        phase_writer.close()
     # Large arrays are already in bounded append-only streams.  The NPZ is
     # metadata only, so the parent never reloads a multi-hundred-GB shard.
     np.savez(
@@ -1539,10 +1561,9 @@ def _output_shape(reference, output_downsample):
 
 def _initialize_native_phase_cache(args, rays, bounds, gpus, model_cfg):
     """Create the lossless, independently writable native-phase artifact."""
-    import zarr
-    from zarr.codecs import BloscCodec, BloscShuffle, PackBits
+    from vc_reader.reader import create_group
 
-    group = zarr.open_group(args.output, mode="w")
+    group = create_group(args.output, version=3, overwrite=True)
     phase_group = group.create_group("phase")
     valid_group = group.create_group("valid")
     frame_group = group.create_group("frame")
@@ -1552,14 +1573,16 @@ def _initialize_native_phase_cache(args, rays, bounds, gpus, model_cfg):
         value = np.asarray(rays[key])
         first_chunk = max(1, min(len(value), 1 << 16))
         rays_group.create_array(
-            key, data=value, chunks=(first_chunk, *value.shape[1:]))
+            key, shape=value.shape, dtype=value.dtype,
+            chunks=(first_chunk, *value.shape[1:]),
+            **_OUTPUT_ARRAY)[:] = value
 
-    ray_length = int(model_cfg.get("ray_length", 384))
-    transverse = int(model_cfg.get("transverse_size", 128))
-    column_stride = int(model_cfg.get("column_stride", 4))
-    native_columns = transverse // column_stride
-    compressor = BloscCodec(
-        cname="zstd", clevel=1, shuffle=BloscShuffle.shuffle)
+    attrs = _native_phase_attrs(args, rays, model_cfg)
+    ray_length = attrs["ray_length"]
+    transverse = attrs["transverse_size"]
+    native_columns = attrs["native_columns"]
+    compressor = dict(
+        _OUTPUT_ARRAY, compressor="blosc", cname="zstd", level=1, shuffle=1)
     shards = []
     for slot, gpu in enumerate(gpus):
         lo, hi = int(bounds[slot]), int(bounds[slot + 1])
@@ -1573,51 +1596,184 @@ def _initialize_native_phase_cache(args, rays, bounds, gpus, model_cfg):
             chunks=(1, native_columns, native_columns, ray_length),
             shards=(min(32, max(1, count)), native_columns, native_columns,
                     ray_length),
-            dtype="float32", compressors=[compressor])
+            dtype="float32", **compressor)
         valid_group.create_array(
             name, shape=(count, transverse, transverse, ray_length),
             chunks=(1, transverse, transverse, ray_length),
             shards=(min(32, max(1, count)), transverse, transverse, ray_length),
-            dtype="bool", filters=[PackBits()], compressors=[compressor])
+            dtype="bool", packbits=True, fill_value=False, **compressor)
         compact_chunk = max(1, min(count, 1 << 12))
         frame_group.create_array(
             name, shape=(count, 4, 3), chunks=(compact_chunk, 4, 3),
-            dtype="float64", compressors=[compressor])
+            dtype="float64", **compressor)
         available_group.create_array(
             name, shape=(count,), chunks=(compact_chunk,), dtype="bool",
-            filters=[PackBits()], compressors=[compressor], fill_value=False)
+            packbits=True, fill_value=False, **compressor)
         shards.append({"name": name, "gpu": int(gpu), "lo": lo, "hi": hi})
 
     group.attrs.update({
         "artifact_type": "winding_native_phase_cache",
         "format_version": 1,
-        "phase_dtype": "float32",
-        "fit_checkpoint": str(Path(args.fit_checkpoint).resolve()),
-        "model_ckpt": str(Path(args.model_ckpt).resolve()),
-        "reference_zarr": str(Path(args.reference_zarr).resolve()),
-        "volume_scale": int(args.volume_scale),
-        "ray_length": ray_length,
-        "transverse_size": transverse,
-        "column_stride": column_stride,
-        "native_columns": native_columns,
-        "spacing": float(model_cfg.get("spacing", 1.0)),
-        "sampling": str(model_cfg.get("sampling", "trilinear")),
-        "crossing_sigma_wv": float(model_cfg.get("crossing_sigma_wv", 1.0)),
+        **attrs,
         "phase_shards": shards,
-        "z_range": [int(value) for value in rays["z_range"]],
-        "seed_windings": [int(value) for value in rays["seed_windings"]],
-        "dr_per_winding": float(rays["dr_per_winding"]),
-        "umbilicus": str(rays["umbilicus_path"]),
         "complete": False,
         "created": time.strftime("%Y-%m-%dT%H:%M:%S"),
     })
 
 
+def _native_phase_attrs(args, rays, model_cfg):
+    """Model geometry and seed provenance of a native-phase run."""
+    transverse = int(model_cfg.get("transverse_size", 128))
+    column_stride = int(model_cfg.get("column_stride", 4))
+    return {
+        "phase_dtype": "float32",
+        "fit_checkpoint": str(Path(args.fit_checkpoint).resolve()),
+        "model_ckpt": str(Path(args.model_ckpt).resolve()),
+        "reference_zarr": str(Path(args.reference_zarr).resolve()),
+        "volume_scale": int(args.volume_scale),
+        "ray_length": int(model_cfg.get("ray_length", 384)),
+        "transverse_size": transverse,
+        "column_stride": column_stride,
+        "native_columns": transverse // column_stride,
+        "spacing": float(model_cfg.get("spacing", 1.0)),
+        "sampling": str(model_cfg.get("sampling", "trilinear")),
+        "crossing_sigma_wv": float(model_cfg.get("crossing_sigma_wv", 1.0)),
+        "z_range": [int(value) for value in rays["z_range"]],
+        "seed_windings": [int(value) for value in rays["seed_windings"]],
+        "dr_per_winding": float(rays["dr_per_winding"]),
+        "umbilicus": str(rays["umbilicus_path"]),
+    }
+
+
+def _prepare_spiral_supervision(args, rays, model_cfg):
+    """Set up --spiral-supervision-only and return the slabs still to run.
+
+    The store is assembled under OUTPUT.partial. Parts left there by an
+    interrupted run of the same model, geometry, and seed rays are kept;
+    the returned mask selects every slab of the remaining parts.
+    """
+    import hashlib
+
+    from vesuvius.neural_tracing.winding_models.export_spiral_supervision \
+        import (
+            DEFAULT_EDGE_MARGIN, DEFAULT_EDGE_TRIM, _canonical_digest,
+            completed_part,
+        )
+
+    total = len(rays["seed_xyz"])
+    seed_digest = hashlib.sha256()
+    for key, dtype in (("seed_xyz", np.float32), ("direction_xyz", np.float32),
+                       ("seed_winding", np.int16)):
+        seed_digest.update(np.ascontiguousarray(rays[key], dtype=dtype).tobytes())
+    attributes = {
+        **_native_phase_attrs(args, rays, model_cfg),
+        "num_slabs": int(total),
+        "seed_rays_sha256": seed_digest.hexdigest(),
+    }
+    identity = _canonical_digest(attributes)
+    name = "shard_0"
+    signature = {
+        "root_identity": identity,
+        "name": name,
+        "lo": 0,
+        "hi": int(total),
+        "edge_margin": DEFAULT_EDGE_MARGIN,
+        "edge_trim": DEFAULT_EDGE_TRIM,
+    }
+    partial = Path(str(Path(args.output).resolve()) + ".partial")
+    part_rays = SUPERVISION_PART_RAYS
+    pending = np.ones(total, dtype=bool)
+    for start in range(0, total, part_rays):
+        end = min(total, start + part_rays)
+        if completed_part(
+                partial / "parts" / name / f"{start:08d}_{end:08d}",
+                dict(signature, part_start=start, part_end=end)) is not None:
+            pending[start:end] = False
+    args.spiral_supervision = {
+        "partial": str(partial),
+        "part_rays": part_rays,
+        "signature": signature,
+        "attributes": attributes,
+    }
+    if not pending.all():
+        print(f"[main] resuming {args.output}: "
+              f"{total - int(pending.sum()):,}/{total:,} slabs already "
+              f"exported", flush=True)
+    return pending
+
+
+def _part_aligned_bounds(global_index, bounds, part_rays):
+    """Move worker boundaries back to part starts so no part is split."""
+    parts = np.asarray(global_index, dtype=np.int64) // int(part_rays)
+    aligned = np.asarray(bounds).copy()
+    for slot in range(1, len(aligned) - 1):
+        if 0 < aligned[slot] < len(parts):
+            aligned[slot] = np.searchsorted(
+                parts, parts[aligned[slot]], side="left")
+    return np.maximum.accumulate(aligned)
+
+
+def _finish_spiral_supervision(args, workers, elapsed):
+    """Merge the finished parts and publish the compact store at OUTPUT."""
+    from vesuvius.neural_tracing.winding_models.export_spiral_supervision \
+        import (
+            FORMAT_NAME, FORMAT_VERSION, center_ray_layout, completed_part,
+            finish_store, merge_parts,
+        )
+
+    config = args.spiral_supervision
+    partial = Path(config["partial"])
+    signature = config["signature"]
+    attributes = config["attributes"]
+    name = signature["name"]
+    total = int(signature["hi"])
+    parts = []
+    for start in range(0, total, int(config["part_rays"])):
+        end = min(total, start + int(config["part_rays"]))
+        part = completed_part(
+            partial / "parts" / name / f"{start:08d}_{end:08d}",
+            dict(signature, part_start=start, part_end=end))
+        if part is None:
+            raise RuntimeError(
+                f"spiral supervision part {start}-{end} is missing; rerun the "
+                f"same command to resume")
+        parts.append(part)
+    shard = merge_parts(partial, name, parts, signature)
+    center, _, transverse_center, anchor = center_ray_layout(
+        attributes["native_columns"], attributes["column_stride"],
+        attributes["transverse_size"], attributes["ray_length"])
+    manifest = {
+        "artifact_type": FORMAT_NAME,
+        "format_version": FORMAT_VERSION,
+        "coordinate_order": "zyx",
+        "coordinate_space": "reference zarr scale-0 voxels",
+        "export_mode": "direct",
+        "source_cache": None,
+        "source_identity": signature["root_identity"],
+        "source_attributes": {
+            **attributes,
+            "num_available_slabs": int(shard["num_available_rays"]),
+        },
+        "center_native_column": center,
+        "center_transverse_sample": transverse_center,
+        "anchor_sample": anchor,
+        "edge_margin": int(signature["edge_margin"]),
+        "edge_trim": int(signature["edge_trim"]),
+        "export_workers": int(workers),
+        "rays_per_task": int(config["part_rays"]),
+        "num_rays": int(shard["num_retained_rays"]),
+        "num_crossings": int(shard["num_crossings"]),
+        "shards": [shard],
+        "elapsed_seconds": float(elapsed),
+    }
+    return finish_store(partial, Path(args.output).resolve(), manifest)
+
+
 def _load_native_phase_cache(args):
     """Load cached rays and validate immutable model geometry."""
-    import zarr
+    from vc_reader.reader import open_group
 
-    group = zarr.open_group(str(args.phase_cache), mode="r")
+    group = open_group(str(args.phase_cache))
     if group.attrs.get("artifact_type") != "winding_native_phase_cache":
         raise ValueError(f"not a native winding phase cache: {args.phase_cache}")
     if not bool(group.attrs.get("complete", False)):
@@ -1760,7 +1916,7 @@ class _ProbSpillWriter:
             bucket = int(bucket_value)
             zy, bx = divmod(bucket, self.nx_chunks)
             bz, by = divmod(zy, self.ny_chunks)
-            _append_prob_aggregates(
+            _append_aggregates(
                 self.directory / f"{bz:05d}_{by:05d}_{bx:05d}.rec",
                 records,
             )
@@ -1780,7 +1936,7 @@ class _ProbSpillWriter:
             aggregate["maximum"] = np.maximum.reduceat(values, starts)
             zy, bx = divmod(bucket, self.nx_chunks)
             bz, by = divmod(zy, self.ny_chunks)
-            _append_prob_aggregates(
+            _append_aggregates(
                 self.directory / f"{bz:05d}_{by:05d}_{bx:05d}.rec",
                 aggregate)
         self.buffers.clear()
@@ -1823,7 +1979,7 @@ class _PhaseSpillWriter:
             bucket = int(bucket_value)
             zy, bx = divmod(bucket, self.nx_chunks)
             bz, by = divmod(zy, self.ny_chunks)
-            _append_phase_aggregates(
+            _append_aggregates(
                 self.directory / f"{bz:05d}_{by:05d}_{bx:05d}.rec",
                 records,
             )
@@ -1864,7 +2020,7 @@ class _PhaseLabelSpillWriter:
             bucket = int(bucket_value)
             zy, bx = divmod(bucket, self.nx_chunks)
             bz, by = divmod(zy, self.ny_chunks)
-            _append_phase_label_aggregates(
+            _append_aggregates(
                 self.directory / f"{bz:05d}_{by:05d}_{bx:05d}.rec",
                 records,
             )
@@ -2581,7 +2737,7 @@ class _WindingAggregateSpillWriter:
                 if not mask.any():
                     continue
                 target = own + delta
-                _append_winding_aggregates(
+                _append_aggregates(
                     self.directory / (
                         f"{target[0]:05d}_{target[1]:05d}_"
                         f"{target[2]:05d}.rec"),
@@ -3016,13 +3172,11 @@ def _render_winding_aggregates_cuda(
 
 def _write_winding_aggregate_bucket(task, gpu):
     """Merge one source-vote chunk and render it on ``gpu``."""
-    import zarr
-
     group_path, out_shape, chunk, bz, by, bx, paths = task
     pieces = [
         records
         for path in paths
-        for records in _iter_winding_aggregates(path)
+        for records in _iter_aggregates(path, _WINDING_AGG_RECORD)
     ]
     if not pieces:
         return 0
@@ -3052,10 +3206,9 @@ def _write_winding_aggregate_bucket(task, gpu):
     if rendered is None:
         return 0
     dense_winding, dense_confidence = rendered
-    group = zarr.open_group(group_path, mode="r+")
-    group["winding"][lo[0]:hi[0], lo[1]:hi[1], lo[2]:hi[2]] = dense_winding
-    group["confidence"][lo[0]:hi[0], lo[1]:hi[1], lo[2]:hi[2]] = \
-        dense_confidence
+    region = (slice(lo[0], hi[0]), slice(lo[1], hi[1]), slice(lo[2], hi[2]))
+    _open_output_array(group_path, "winding")[region] = dense_winding
+    _open_output_array(group_path, "confidence")[region] = dense_confidence
     return int((dense_winding >= 0).sum())
 
 
@@ -3146,8 +3299,6 @@ def _write_prob_bucket(task):
     applies to the combined value. Buckets partition the chunk grid, so no
     two workers touch one chunk.
     """
-    import zarr
-
     group_path, name, out_shape, chunk, bz, by, bx, paths, combine, floor = task
     lo = (bz * chunk, by * chunk, bx * chunk)
     shape = tuple(
@@ -3160,7 +3311,7 @@ def _write_prob_bucket(task):
         total = np.zeros(size, dtype=np.float64)
         count = np.zeros(size, dtype=np.int64)
     for path in paths:
-        for records in _iter_prob_aggregates(path):
+        for records in _iter_aggregates(path, _PROB_AGG_RECORD):
             key = records["key"]
             z = (key >> 42).astype(np.int64) - lo[0]
             y = ((key >> 21) & _PROB_KEY_MASK).astype(np.int64) - lo[1]
@@ -3184,7 +3335,7 @@ def _write_prob_bucket(task):
         ).astype(np.uint8).reshape(shape)
     if floor > 0:
         dense[dense < floor] = 0
-    array = zarr.open_group(group_path, mode="r+")[name]
+    array = _open_output_array(group_path, name)
     if dense.any():
         array[
             lo[0]:lo[0] + shape[0],
@@ -3254,8 +3405,6 @@ def _render_phase_label_consensus(
 
 def _write_phase_bucket(task):
     """Fold one registered-phase bucket and render crossing evidence."""
-    import zarr
-
     (group_path, name, out_shape, chunk, bz, by, bx, paths, floor,
      sigma_voxels, agreement_power, min_observations) = task
     lo = (bz * chunk, by * chunk, bx * chunk)
@@ -3268,7 +3417,7 @@ def _write_phase_bucket(task):
     weight = np.zeros(size, dtype=np.float64)
     count = np.zeros(size, dtype=np.uint64)
     for path in paths:
-        for records in _iter_phase_aggregates(path):
+        for records in _iter_aggregates(path, _PHASE_AGG_RECORD):
             key = records["key"]
             z = (key >> 42).astype(np.int64) - lo[0]
             y = ((key >> 21) & _PROB_KEY_MASK).astype(np.int64) - lo[1]
@@ -3288,7 +3437,7 @@ def _write_phase_bucket(task):
         min_observations=min_observations).reshape(shape)
     if floor > 0:
         dense[dense < floor] = 0
-    array = zarr.open_group(group_path, mode="r+")[name]
+    array = _open_output_array(group_path, name)
     if dense.any():
         array[
             lo[0]:lo[0] + shape[0],
@@ -3300,8 +3449,6 @@ def _write_phase_bucket(task):
 
 def _write_phase_label_bucket(task):
     """Fold labeled-phase records and choose the best winding per voxel."""
-    import zarr
-
     (group_path, name, out_shape, chunk, bz, by, bx, paths, floor,
      sigma_voxels, agreement_power, min_observations,
      min_effective_observations, min_weight) = task
@@ -3311,7 +3458,7 @@ def _write_phase_label_bucket(task):
     pieces = [
         records
         for path in paths
-        for records in _iter_phase_label_aggregates(path)
+        for records in _iter_aggregates(path, _PHASE_LABEL_AGG_RECORD)
     ]
     if not pieces:
         return 0
@@ -3345,7 +3492,7 @@ def _write_phase_label_bucket(task):
     dense = dense.reshape(shape)
     if floor > 0:
         dense[dense < floor] = 0
-    array = zarr.open_group(group_path, mode="r+")[name]
+    array = _open_output_array(group_path, name)
     if dense.any():
         array[
             lo[0]:lo[0] + shape[0],
@@ -3471,7 +3618,7 @@ def _merge_phase_label_spill(
 
 
 _ARCHIVE_WORKER_CONTEXT = None
-_ARCHIVE_WORKER_GROUP = None
+_ARCHIVE_WORKER_ARRAYS = None
 
 
 def _read_sharded_stream(context, name, dtype, start, end, tail_shape=()):
@@ -3503,25 +3650,26 @@ def _read_sharded_stream(context, name, dtype, start, end, tail_shape=()):
 
 def _init_archive_worker(context):
     """Open output metadata once per archive materialization process."""
-    global _ARCHIVE_WORKER_CONTEXT, _ARCHIVE_WORKER_GROUP
-    import zarr
-
+    global _ARCHIVE_WORKER_CONTEXT, _ARCHIVE_WORKER_ARRAYS
     _ARCHIVE_WORKER_CONTEXT = context
-    _ARCHIVE_WORKER_GROUP = zarr.open_group(context["group_path"], mode="r+")
+    _ARCHIVE_WORKER_ARRAYS = {
+        name: _open_output_array(context["group_path"], name)
+        for name in ("points/xyz", "points/winding", "points/prob",
+                     "strips/offsets", "strips/slab")
+    }
 
 
 def _write_archive_chunk(task):
     """Write one disjoint point or strip chunk into the final archive."""
     context = _ARCHIVE_WORKER_CONTEXT
-    group = _ARCHIVE_WORKER_GROUP
+    arrays = _ARCHIVE_WORKER_ARRAYS
     kind, start, end, point_start = task
     if kind == "point":
-        points = group["points"]
-        points["xyz"][start:end] = _read_sharded_stream(
+        arrays["points/xyz"][start:end] = _read_sharded_stream(
             context, "xyz", np.float32, start, end, (3,))
-        points["winding"][start:end] = _read_sharded_stream(
+        arrays["points/winding"][start:end] = _read_sharded_stream(
             context, "winding", np.int16, start, end)
-        points["prob"][start:end] = _read_sharded_stream(
+        arrays["points/prob"][start:end] = _read_sharded_stream(
             context, "prob", np.uint8, start, end)
         return end - start
 
@@ -3546,8 +3694,8 @@ def _write_archive_chunk(task):
         if len(offsets) > 1:
             offsets[1:] = int(point_start) + np.cumsum(
                 lengths[:-1], dtype=np.int64)
-    group["strips"]["offsets"][start:end] = offsets
-    group["strips"]["slab"][start:end] = slabs
+    arrays["strips/offsets"][start:end] = offsets
+    arrays["strips/slab"][start:end] = slabs
     return end - start
 
 
@@ -3616,7 +3764,7 @@ def _materialize_archive(group_path, result_paths, shard_results, ray_bounds,
 
 
 def write_output(args, rays, shard_results, result_paths, elapsed_total):
-    import zarr
+    from vc_reader.reader import create_group
 
     reference = Path(args.reference_zarr)
     out_shape = _output_shape(reference, int(args.output_downsample))
@@ -3627,32 +3775,34 @@ def write_output(args, rays, shard_results, result_paths, elapsed_total):
     ray_bounds = np.linspace(
         0, len(rays["seed_xyz"]), len(shard_results) + 1).astype(int)
 
-    group = zarr.open_group(args.output, mode="w")
+    group = create_group(args.output, version=3, overwrite=True)
     chunk = _OUTPUT_CHUNK
     group.create_array(
         "winding", shape=out_shape, chunks=(chunk, chunk, chunk),
-        dtype="int16", fill_value=-1)
+        dtype="int16", fill_value=-1, **_OUTPUT_ARRAY)
     group.create_array(
         "confidence", shape=out_shape, chunks=(chunk, chunk, chunk),
-        dtype="uint8", fill_value=0)
+        dtype="uint8", fill_value=0, **_OUTPUT_ARRAY)
 
     point_chunk = max(1, min(num_points, 1 << 20))
     strip_chunk = max(1, min(num_strips + 1, 1 << 20))
     points = group.create_group("points")
     points.create_array(
         "xyz", shape=(num_points, 3), dtype="float32",
-        chunks=(point_chunk, 3))
+        chunks=(point_chunk, 3), **_OUTPUT_ARRAY)
     points.create_array(
-        "winding", shape=(num_points,), dtype="int16", chunks=(point_chunk,))
+        "winding", shape=(num_points,), dtype="int16", chunks=(point_chunk,),
+        **_OUTPUT_ARRAY)
     points.create_array(
-        "prob", shape=(num_points,), dtype="uint8", chunks=(point_chunk,))
+        "prob", shape=(num_points,), dtype="uint8", chunks=(point_chunk,),
+        **_OUTPUT_ARRAY)
     strips = group.create_group("strips")
     strip_offsets_arr = strips.create_array(
         "offsets", shape=(num_strips + 1,), dtype="int64",
-        chunks=(strip_chunk,))
+        chunks=(strip_chunk,), **_OUTPUT_ARRAY)
     strips.create_array(
         "slab", shape=(num_strips,), dtype="int64",
-        chunks=(max(1, min(num_strips, 1 << 20)),))
+        chunks=(max(1, min(num_strips, 1 << 20)),), **_OUTPUT_ARRAY)
     strip_offsets_arr[0] = 0
 
     materialize_started = time.time()
@@ -3677,7 +3827,7 @@ def write_output(args, rays, shard_results, result_paths, elapsed_total):
     if getattr(args, "prob_volume", False):
         group.create_array(
             "crossing_prob", shape=out_shape, chunks=(chunk, chunk, chunk),
-            dtype="uint8", fill_value=0)
+            dtype="uint8", fill_value=0, **_OUTPUT_ARRAY)
         prob_merge_started = time.time()
         if getattr(args, "prob_combine", "mean") == "phase-label":
             spill_dirs = sorted(
@@ -3729,8 +3879,10 @@ def write_output(args, rays, shard_results, result_paths, elapsed_total):
         if key not in rays:
             continue
         value = rays[key]
-        rays_group.create_array(key, shape=value.shape, dtype=value.dtype,
-                                chunks=value.shape)[:] = value
+        rays_group.create_array(
+            key, shape=value.shape, dtype=value.dtype,
+            chunks=tuple(max(1, n) for n in value.shape),
+            **_OUTPUT_ARRAY)[:] = value
 
     group.attrs.update({
         "fit_checkpoint": str(Path(args.fit_checkpoint).resolve()),
@@ -3842,8 +3994,9 @@ def write_output(args, rays, shard_results, result_paths, elapsed_total):
 
 
 def _reference_shape(reference: Path):
-    import zarr
-    node = zarr.open(str(reference), mode="r")
+    from vc_reader.reader import open_node
+
+    node = open_node(str(reference))
     if hasattr(node, "shape"):
         return node.shape
     return node["0"].shape
@@ -3864,11 +4017,14 @@ def main():
         else _load_checkpoint_cfg(args.model_ckpt).get("config", {}))
     args.phase_decode = not bool(
         (winding_model_cfg.get("model") or {}).get("use_crossing_head", True))
-    if (args.native_phase_only or args.phase_cache) and not args.phase_decode:
+    if ((args.native_phase_only or args.phase_cache
+         or args.spiral_supervision_only) and not args.phase_decode):
         raise ValueError(
-            "native phase caching currently requires a headless phase model; "
-            "this checkpoint has a separate crossing head that would also "
-            "need to be cached")
+            "native phase caching and direct Spiral supervision currently "
+            "require a headless phase model; this checkpoint has a separate "
+            "crossing head that would also need to be cached")
+    if args.spiral_supervision_only and Path(args.output).exists():
+        raise FileExistsError(f"output already exists: {args.output}")
     if args.prob_combine in ("phase", "phase-label") and not args.phase_decode:
         raise ValueError(
             "phase probability combine modes require a headless phase model")
@@ -4041,6 +4197,12 @@ def main():
         rays["phase_offset"] = phase_offset
     else:
         rays["phase_offset"] = np.zeros(total, dtype=np.float32)
+    if args.spiral_supervision_only:
+        pending = _prepare_spiral_supervision(args, rays, winding_model_cfg)
+        for key in ("seed_xyz", "direction_xyz", "seed_winding",
+                    "global_index", "phase_offset"):
+            rays[key] = rays[key][pending]
+        total = int(pending.sum())
     print(f"[main] {total:,} rays on {len(gpus)} GPU(s)", flush=True)
 
     # Shard contiguously: nearby rays share volume chunks, which keeps each
@@ -4052,6 +4214,9 @@ def main():
     progress_queue = context.Queue()
     shard_paths, result_paths, processes = [], [], []
     bounds = np.linspace(0, total, len(gpus) + 1).astype(int)
+    if args.spiral_supervision_only:
+        bounds = _part_aligned_bounds(
+            rays["global_index"], bounds, SUPERVISION_PART_RAYS)
     if args.native_phase_only:
         _initialize_native_phase_cache(
             args, rays, bounds, gpus, winding_model_cfg)
@@ -4096,12 +4261,25 @@ def main():
         for p in tqdm(result_paths, desc="loading shards", unit="shard")
     ]
     inference_elapsed = time.time() - started
+    if args.spiral_supervision_only:
+        manifest = _finish_spiral_supervision(
+            args, len(gpus), inference_elapsed)
+        print(
+            f"[main] wrote {manifest['num_crossings']:,} crossings on "
+            f"{manifest['num_rays']:,} rays from "
+            f"{manifest['source_attributes']['num_available_slabs']:,}/"
+            f"{manifest['source_attributes']['num_slabs']:,} slabs to "
+            f"{args.output} in {inference_elapsed:.0f}s", flush=True)
+        # The store is complete; the scratch only held shard inputs.
+        shutil.rmtree(scratch, ignore_errors=True)
+        return
     if args.native_phase_only:
-        import zarr
+        from vc_reader.reader import create_group
 
-        cache = zarr.open_group(args.output, mode="r+")
+        cache = create_group(args.output, version=3)
         available = sum(
-            int(np.count_nonzero(cache["available"][item["name"]][:]))
+            int(np.count_nonzero(
+                cache["available"][item["name"]][:]))
             for item in cache.attrs["phase_shards"])
         cache.attrs.update({
             "complete": True,
@@ -4116,10 +4294,12 @@ def main():
     num_points = write_output(
         args, rays, shard_results, result_paths, inference_elapsed)
     elapsed = time.time() - started
-    import zarr
-    output_group = zarr.open_group(args.output, mode="r+")
-    output_group.attrs["inference_elapsed_seconds"] = inference_elapsed
-    output_group.attrs["elapsed_seconds"] = elapsed
+    from vc_reader.reader import create_group
+
+    create_group(args.output, version=3).attrs.update({
+        "inference_elapsed_seconds": inference_elapsed,
+        "elapsed_seconds": elapsed,
+    })
     slabs = sum(int(r["slabs"]) for r in shard_results)
     print(f"[main] wrote {num_points:,} crossings from {slabs:,} slabs to "
           f"{args.output} in {elapsed:.0f}s total "

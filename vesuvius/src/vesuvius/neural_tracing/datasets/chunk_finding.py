@@ -11,7 +11,7 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 import numpy as np
 from tqdm import tqdm
 
-from vesuvius.tifxyz import Tifxyz
+from vc_reader import tifxyz
 
 
 PATCH_FINDER_VERSION = 3
@@ -20,7 +20,7 @@ PATCH_FINDER_VERSION = 3
 @dataclass(frozen=True)
 class SegmentRecord:
     segment_idx: int
-    segment: Tifxyz
+    segment: tifxyz.Surface
     path: str
     uuid: str
     wrap_label: int
@@ -74,11 +74,8 @@ def _build_chunk_grid(
     return starts, strides
 
 
-def _stored_step_voxels(seg: Tifxyz) -> float:
-    scale = getattr(seg, "_scale", None)
-    if scale is None:
-        return 20.0
-    values = np.asarray(scale, dtype=np.float64).reshape(-1)
+def _stored_step_voxels(seg: tifxyz.Surface) -> float:
+    values = np.asarray(seg.scale, dtype=np.float64).reshape(-1)
     values = values[np.isfinite(values) & (values > 0.0)]
     if values.size == 0:
         return 20.0
@@ -120,14 +117,14 @@ def _merge_exclusion_side(prev: Optional[str], side: str) -> str:
 def _compute_terminal_exclusions(
     *,
     segment_idx: int,
-    seg: Tifxyz,
+    seg: tifxyz.Surface,
     chunk_starts: Tuple[np.ndarray, np.ndarray, np.ndarray],
     crop_size: Tuple[int, int, int],
     guard_voxels: float,
 ) -> Dict[Tuple[int, int, int], str]:
-    valid = np.asarray(seg._valid_mask, dtype=bool)
+    valid = seg.valid
     if not bool(valid.any()):
-        raise ValueError(f"Segment has no valid stored cells: {getattr(seg, 'path', '') or seg.uuid}")
+        raise ValueError(f"Segment has no valid stored cells: {seg.location or seg.uuid}")
 
     rows, cols = np.nonzero(valid)
     row_extent = int(rows.max() - rows.min())
@@ -146,15 +143,13 @@ def _compute_terminal_exclusions(
         rr, cc = np.nonzero(mask)
         if rr.size == 0:
             raise ValueError(
-                f"Could not compute {side} terminal cells for segment: {getattr(seg, 'path', '') or seg.uuid}"
+                f"Could not compute {side} terminal cells for segment: {seg.location or seg.uuid}"
             )
-        z = np.asarray(seg._z[rr, cc], dtype=np.float64)
-        y = np.asarray(seg._y[rr, cc], dtype=np.float64)
-        x = np.asarray(seg._x[rr, cc], dtype=np.float64)
+        x, y, z = np.moveaxis(seg.xyz[rr, cc].astype(np.float64), -1, 0)
         finite = np.isfinite(z) & np.isfinite(y) & np.isfinite(x)
         if not bool(finite.any()):
             raise ValueError(
-                f"{side} terminal has no finite world points for segment: {getattr(seg, 'path', '') or seg.uuid}"
+                f"{side} terminal has no finite world points for segment: {seg.location or seg.uuid}"
             )
         ranges_by_axis = [
             _chunk_id_ranges_for_guarded_points(
@@ -185,7 +180,7 @@ def _compute_terminal_exclusions(
 def _assign_segment_to_chunks(
     *,
     segment_idx: int,
-    seg: Tifxyz,
+    seg: tifxyz.Surface,
     chunk_starts: Tuple[np.ndarray, np.ndarray, np.ndarray],
     crop_size: Tuple[int, int, int],
     min_points_per_wrap: int,
@@ -193,7 +188,7 @@ def _assign_segment_to_chunks(
     terminal_exclusions: Dict[Tuple[int, int, int], str],
     chunk_pad: float,
 ) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
-    valid = np.asarray(seg._valid_mask, dtype=bool)
+    valid = seg.valid
     rows, cols = np.nonzero(valid)
     if rows.size == 0:
         return [], {
@@ -205,9 +200,7 @@ def _assign_segment_to_chunks(
             "terminal_chunk_ids": set(),
         }
 
-    z = np.asarray(seg._z[rows, cols], dtype=np.float64)
-    y = np.asarray(seg._y[rows, cols], dtype=np.float64)
-    x = np.asarray(seg._x[rows, cols], dtype=np.float64)
+    x, y, z = np.moveaxis(seg.xyz[rows, cols].astype(np.float64), -1, 0)
     finite = np.isfinite(z) & np.isfinite(y) & np.isfinite(x)
     rows, cols, z, y, x = rows[finite], cols[finite], z[finite], y[finite], x[finite]
     if rows.size == 0:
@@ -323,7 +316,7 @@ def _has_lower_and_upper_neighbors(wraps: List[Dict[str, Any]], source_idx: int,
 
 def find_training_chunks(
     *,
-    segments: List[Tifxyz],
+    segments: List[tifxyz.Surface],
     volume: Any,
     scale: int,
     target_size: Tuple[int, int, int],

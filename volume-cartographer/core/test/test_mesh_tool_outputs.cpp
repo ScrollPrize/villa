@@ -209,7 +209,7 @@ TEST_CASE("vc_obj2tifxyz and vc_obj2tifxyz_legacy rasterize an OBJ")
 namespace {
 constexpr int kPlaneN = 200;
 constexpr double kPlaneStep = 4.0; // voxels per lattice cell
-constexpr double kPlaneUv = 20.0;  // vt units per lattice cell, as vc_merge_tifxyz writes them
+constexpr double kPlaneUv = 20.0;  // vt units per lattice cell
 
 // A kPlaneN^2 lattice plane; `stretched` lifts every 100th vertex off it.
 void writePlaneObj(const fs::path& path, bool stretched)

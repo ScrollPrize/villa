@@ -288,6 +288,8 @@ public:
     // Opens a fiber imported from an Automated Fiber Volume, fitting the whole
     // line in both strips. A Lasagna dataset is optional. Errors are returned
     // through error instead of dialogs.
+    // Immutable, worker-safe reference used by the Line Annotation strips.
+    std::function<cv::Vec3f(const cv::Vec3f&)> displayCenterReference();
     LineAnnotationDialog* openCollectionFiber(uint64_t fiberId, QString* error = nullptr);
     // Opens a fiber annotation (with line_points) read-only, without adding it
     // to the package: nothing is written, optimized or edited, and the fiber
@@ -1546,13 +1548,13 @@ private:
     // error names what refused.
     std::optional<QString> linkStoredControlPoints(StoredFiber& local,
                                                    int localControlIndex,
-                                                   StoredFiber& far,
+                                                   StoredFiber& farFiber,
                                                    int farControlIndex,
                                                    bool autoLink);
     // The pair-level part of linkStoredControlPoints' checks (same fiber,
     // read-only), so an operation can refuse BEFORE it mutates anything.
     [[nodiscard]] std::optional<QString> linkPairEligibilityError(const StoredFiber& local,
-                                                                  const StoredFiber& far) const;
+                                                                  const StoredFiber& farFiber) const;
     mutable QString _lastSuppressedError;
 
     // Transient (in-memory only) staging state for a designated control

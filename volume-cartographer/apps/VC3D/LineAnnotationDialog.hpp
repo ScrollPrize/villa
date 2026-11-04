@@ -24,6 +24,11 @@
 #include <opencv2/core/mat.hpp>
 
 class CState;
+class LineAnnotationController;
+class FiberCollectionController;
+class QDockWidget;
+class QToolButton;
+namespace vc3d::fibers3d { class Fiber3DPanel; }
 class QAction;
 class QComboBox;
 class QGraphicsPathItem;
@@ -55,6 +60,7 @@ class LineAnnotationDialog : public QMainWindow
     Q_OBJECT
 
 public:
+    void enableFibers3D(CState*, LineAnnotationController*, FiberCollectionController*);
     void setFiberWidth(double baseVoxels, double gapFraction);
     enum class ReoptimizationMode {
         AutoReoptimize,
@@ -385,6 +391,11 @@ private:
     void requestCurrentLinePosition(double position);
     // forceApply bypasses the sub-1e-3 no-op shortcut so a keyboard-pan landing
     // moves the cut planes onto the exact control-point position.
+    void syncFibers3D();
+    QPointer<vc3d::fibers3d::Fiber3DPanel> _fibers3D;
+    QPointer<QDockWidget> _fibers3DDock;
+    QToolButton* _fibers3DButton = nullptr;
+    bool _fibers3DDirty = true;
     void setCurrentLinePosition(double position,
                                 bool updateCurrentCutOverlay = true,
                                 bool forceApply = false);

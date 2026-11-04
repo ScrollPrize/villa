@@ -12,12 +12,12 @@ import time
 
 import numpy as np
 import torch
-import zarr
+from vc_reader.reader import create_group, open_zarr
 
-from lasagna.compact_zarr import _open_group, _create_array, atomic_chunk, chunk_file
+from lasagna.compact_zarr import _chunk_index, _create_array, _writer, atomic_chunk
 from lasagna.cooperative_inference import cooperative_signals
 from lasagna.tiled_predict3d import (
-    OutputProductSpec, _omezarr_compressor, resolve_inference_devices,
+    OutputProductSpec, omezarr_compressor_config, resolve_inference_devices,
     run_tiled_inference_3d,
 )
 
@@ -114,21 +114,25 @@ class ProbabilityZarrOutputAdapter:
             attrs = root / ".zattrs"
             if not attrs.exists() or json.loads(attrs.read_text()) != metadata:
                 raise ValueError("output provenance differs; use a new output directory")
-        group = _open_group(root)
-        codec = _omezarr_compressor("blosc-zstd")
+        group = create_group(root)
+        codec = omezarr_compressor_config("blosc-zstd")
         for name, factor in (("semantic", 1), ("tracing", 2)):
             shape = tuple(n // factor for n in self.shape)
             chunk = self.product.chunk_size // factor
             _create_array(group, name, (2, *shape), (2, chunk, chunk, chunk),
-                          np.uint8, codec, array_path=root / name)
+                          np.uint8, codec)
         group.attrs.update(metadata)
+
+    def _stored(self, name, origin):
+        path = str(Path(self.root) / name)
+        return _writer(path).chunk_exists(_chunk_index(path, origin))
 
     def product_chunk_complete(self, product, *, chunk_origin_zyx):
         origin = tuple(chunk_origin_zyx)
-        native = chunk_file(Path(self.root) / "semantic", origin).is_file()
+        native = self._stored("semantic", origin)
         if any(o // 2 >= n // 2 for o, n in zip(origin, self.shape)):
             return native  # Last unpaired plane has no tracing output.
-        return native and chunk_file(Path(self.root) / "tracing", tuple(o//2 for o in origin)).is_file()
+        return native and self._stored("tracing", tuple(o//2 for o in origin))
 
     def write_product_chunk(self, product, *, chunk_origin_zyx, data):
         values = np.stack([data[name] for name in product.channel_names]).astype(np.float32)
@@ -157,8 +161,8 @@ def run_inference(*, model_dir, input_path, output, voxel_size_um, devices,
     model_dir, input_path = Path(model_dir).resolve(), Path(input_path).resolve()
     hashes = {name: _sha256(model_dir / name)
               for name in ("model.py", "plans.json", "checkpoint_final.pth")}
-    source = zarr.open_array(str(input_path), mode="r")
-    if source.ndim != 3 or np.dtype(source.dtype) != np.uint8:
+    source = open_zarr(input_path)
+    if len(source.shape) != 3 or np.dtype(source.dtype) != np.uint8:
         raise ValueError("AFV inference expects a 3D uint8 CT Zarr array")
     shape = tuple(int(n) for n in source.shape)
     adapter = QualzzModelAdapter(model_dir, chunk_size, model_hashes=hashes)
@@ -184,7 +188,7 @@ def run_inference(*, model_dir, input_path, output, voxel_size_um, devices,
         tmp_dir=str(output.parent), temp_prefix=output.stem + "_", devices=devices,
         progress=dict(t0=time.time(), finalized_base_z=0, finalized_base_z_total=nz),
         flush_workers=flush_workers, accumulator_workers=accumulator_workers,
-        product_accumulator_dtype="float32", input_reader="tensorstore")
+        product_accumulator_dtype="float32")
     return output
 
 

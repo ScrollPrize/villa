@@ -215,7 +215,7 @@ TEST_CASE("save recomputes bbox after post-load point mutation (#1272)")
     {
         QuadSurface loaded(pkg.segDir);
         REQUIRE(loaded.meta.contains("bbox"));
-        CHECK(loaded.meta["bbox"][1][2].get_float() == doctest::Approx(100.f));
+        CHECK(loaded.meta["bbox"][1][2].get<float>() == doctest::Approx(100.f));
 
         // Mutate a vertex far outside the old bbox through rawPointsPtr(),
         // the uncontrolled mutation path used by growth/editing code (no
@@ -230,13 +230,13 @@ TEST_CASE("save recomputes bbox after post-load point mutation (#1272)")
         QuadSurface reloaded(pkg.segDir);
         REQUIRE(reloaded.meta.contains("bbox"));
         const auto& bb = reloaded.meta["bbox"];
-        CHECK(bb[1][0].get_float() == doctest::Approx(500.f));
-        CHECK(bb[1][1].get_float() == doctest::Approx(600.f));
-        CHECK(bb[1][2].get_float() == doctest::Approx(700.f));
+        CHECK(bb[1][0].get<float>() == doctest::Approx(500.f));
+        CHECK(bb[1][1].get<float>() == doctest::Approx(600.f));
+        CHECK(bb[1][2].get<float>() == doctest::Approx(700.f));
         // Untouched vertices still bound the low corner.
-        CHECK(bb[0][0].get_float() == doctest::Approx(0.f));
-        CHECK(bb[0][1].get_float() == doctest::Approx(0.f));
-        CHECK(bb[0][2].get_float() == doctest::Approx(100.f));
+        CHECK(bb[0][0].get<float>() == doctest::Approx(0.f));
+        CHECK(bb[0][1].get<float>() == doctest::Approx(0.f));
+        CHECK(bb[0][2].get<float>() == doctest::Approx(100.f));
     }
 }
 

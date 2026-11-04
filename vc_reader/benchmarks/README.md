@@ -10,6 +10,7 @@ local artifacts ignored by Git. Input fixtures remain versioned.
 | [`bench_pipeline.py`](bench_pipeline.py) | CPU/CUDA reading, sampling, normalization and transforms |
 | [`bench_transforms.py`](bench_transforms.py) | Individual transform recipes, including transfers and resident CUDA arrays |
 | [`bench_torch.py`](bench_torch.py) | Per-sample processing, CUDA batches and loader prefetch |
+| [`bench_reference_libraries.py`](bench_reference_libraries.py) | Image-processing operations against SciPy, scikit-image and OpenCV |
 | [`fiber_training/bench_fiber_trainer.py`](fiber_training/bench_fiber_trainer.py) | Full model and optimizer updates with the fiber trainer |
 
 ## Fiber trainer comparison
@@ -332,6 +333,34 @@ when using a short repetition count. CPU/CUDA interpolation can differ slightly
 at nearest-neighbor label boundaries; numerical differences are reported rather
 than treated as model-quality results.
 
+## Reference library comparison
+
+[`bench_reference_libraries.py`](bench_reference_libraries.py) times traditional image
+processing (filters, morphology, histogram equalization, distances, structure tensors,
+ridges, components, hole filling, skeletons) on vc_reader CPU, CUDA resident and CUDA
+uploaded, against SciPy, scikit-image and OpenCV. Each case runs on ten dense level-2
+128³ PHercParis4 chunks near z = 13000 (mask CT > 127 covering 0.5% to 36%), as 3D
+volumes and as 128 independent YX images (OpenCV is 2D only); `--start` selects others.
+Rows record max/mean differences from each reference, and from CPU for CUDA.
+
+All CPU code is single-threaded: vc_reader transforms are, components get `threads=1`,
+OpenCV `setNumThreads(1)`, and BLAS/OpenMP pools are pinned before import (recorded with
+`threadpoolctl`). Each timing also records process CPU time per wall second to expose
+hidden threads. Pin the process to one performance core; on hybrid CPUs unpinned
+single-threaded timings move between core types.
+
+```bash
+taskset -c 2 ../vesuvius/.venv/bin/python benchmarks/bench_reference_libraries.py \
+  --build-dir build-native-cuda \
+  --array /mnt/raid_nvme/volume_cache/s3/vesuvius-challenge-open-data/PHercParis4/volumes/20260411134726-2.400um-0.2m-78keV-masked.zarr \
+  --output benchmarks/results/reference_libraries.json
+```
+
+`--dims 3D|2D`, `--only <case names>` and `--reps/--warmup` shorten runs. OpenCV's
+equalization and CLAHE take uint8 images, vc_reader float32; several references
+(CLAHE clip limits, affine axes, Frangi vs Hessian ridges, skeleton algorithms) are
+timing comparisons rather than equivalent outputs, as each row's note says.
+
 ## PyTorch CUDA batches
 
 [`bench_torch.py`](bench_torch.py) compares per-sample processing,
@@ -355,3 +384,41 @@ Use `--help` for workload and profiling options. Correctness coverage is in `tes
 Use `--help` for each harness. Keep validation/profiling separate from throughput
 runs, retain JSON reports with commands and build hashes, and report the input
 shape, dtype, batch size, worker/thread counts and cache policy with timings.
+
+## Thinning
+
+Build the optional native harness without Python or volume-reader dependencies:
+
+```bash
+cmake -S . -B build-thinning -G Ninja -DCMAKE_BUILD_TYPE=Release \
+  -DVC_READER_BUILD_READER=OFF -DVC_READER_BUILD_PYTHON=OFF \
+  -DVC_READER_ENABLE_CUDA=ON -DVC_READER_BUILD_THINNING_BENCHMARK=ON \
+  -DVC_READER_THINNING_REFERENCE_DIR=/path/to/unmodified/volume-cartographer
+cmake --build build-thinning --target bench_thinning -j 4
+python benchmarks/bench_thinning.py \
+  --array /path/to/cached/surface-predictions.zarr/0 \
+  --start 3840 1920 1920 --shape 4 2048 2048 \
+  --executable build-thinning/bench_thinning --cuda --repetitions 7 \
+  --output benchmarks/results/thinning.json
+```
+
+The Python command uses an existing `vc_reader` environment to read the crop;
+it does not install dependencies. The reference directory is optional and adds
+OpenCV only to the benchmark. With it, the harness checks every image pixel and
+ordered polyline against `customThinning`, compares all three skeleton methods
+with OpenCV, and tests pruning, random masks, borders, and plateaus. The production
+library does not link the reference implementation or OpenCV.
+
+Two warmups precede each set of repetitions. Reports include mean, median, p95,
+min/max, input coordinates, foreground count, and hardware. CUDA host timings
+include allocation and transfers; resident timings exclude upload/download and
+include completion. File reads and first-use CUDA initialization are excluded.
+CPU execution uses one thread. Compare Release builds while other builds and GPU
+jobs are idle. Cold CLI startup can be slower than these warmed measurements.
+
+Run native API checks with `VC_READER_BUILD_NATIVE_TESTS=ON`, then
+`ctest --test-dir build-thinning -R test_native_thinning --output-on-failure`.
+With Python enabled, build `_thinning` and `_transforms` and run
+`VC_READER_BUILD_DIR=$PWD/build-thinning python -m pytest tests/test_thinning.py`.
+The tests cover CPU/CUDA values, device buffers, 2D/3D component connectivity,
+Manhattan distance, pruning, and chained resident/batched transforms.

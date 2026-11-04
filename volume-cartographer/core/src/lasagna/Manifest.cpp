@@ -1,5 +1,7 @@
 #include "vc/lasagna/Manifest.hpp"
 
+#include <vc_reader/zarr_write.hpp>
+
 #include <algorithm>
 #include <cmath>
 #include <fstream>
@@ -153,7 +155,7 @@ int LasagnaChannelGroup::scaleFactor() const noexcept
 
 bool LasagnaChannelGroup::isRemote() const noexcept
 {
-    return !remoteZarrBaseUrl.empty();
+    return zarrPath.empty() && !sourceLocation.empty();
 }
 
 bool LasagnaChannelGroup::hasChannel(std::string_view channel) const noexcept
@@ -218,14 +220,18 @@ std::vector<std::string> LasagnaDatasetManifest::fiberPredictionPrefixes() const
 
 LasagnaDatasetManifest LasagnaDatasetManifest::parseFile(const std::filesystem::path& manifestPath)
 {
+    // A compact manifest is the "lasagna" attribute of a Zarr group.
     const bool compact = std::filesystem::is_directory(manifestPath);
-    std::ifstream input(compact ? manifestPath / ".zattrs" : manifestPath);
-    if (!input) {
-        throw std::runtime_error("Failed to open Lasagna manifest: " + manifestPath.string());
-    }
-
     nlohmann::json root;
-    input >> root;
+    if (compact) {
+        root = vcr::zarr::readAttributes(manifestPath);
+    } else {
+        std::ifstream input(manifestPath);
+        if (!input) {
+            throw std::runtime_error("Failed to open Lasagna manifest: " + manifestPath.string());
+        }
+        input >> root;
+    }
     if (compact) {
         root = root.at("lasagna");
         if (root.at("version") != 3)
@@ -298,24 +304,7 @@ LasagnaDatasetManifest LasagnaDatasetManifest::parseText(
     }
     manifest.groups = parseGroups(root, manifest.baseDirectory);
 
-    if (manifest.hasNormalSource()) {
-        manifest.normalPath = manifest.manifestPath;
-        manifest.normalSourceKind = NormalSourceKind::DenseZarr;
-        manifest.normalSourceKey = "groups.grad_mag_nx_ny";
-    }
-
     return manifest;
-}
-
-std::string toString(NormalSourceKind kind)
-{
-    switch (kind) {
-    case NormalSourceKind::None:
-        return "none";
-    case NormalSourceKind::DenseZarr:
-        return "dense_zarr";
-    }
-    return "unknown";
 }
 
 bool lasagnaChannelShapeCompatible(

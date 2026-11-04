@@ -9,7 +9,7 @@ from torch import nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader, Subset
 from torch.utils.tensorboard import SummaryWriter
-import tifffile
+from vc_reader import images as image_files
 import numpy as np
 import kornia.augmentation as K
 from gen_post_data import compute_label_supervision
@@ -49,9 +49,8 @@ class TiffLayerDataset(Dataset):
             if not label_path.is_file():
                 raise ValueError(f"Missing label TIFF for {img_path.name} (expected {label_name}) in {self.labels_dir}")
 
-            with tifffile.TiffFile(img_path) as tif:
-                series = tif.series[0]
-                shape = series.shape
+            with image_files.open(img_path) as reader:
+                shape = reader.shape
             if len(shape) == 2:
                 num_layers = 1
             elif len(shape) == 3:
@@ -69,19 +68,8 @@ class TiffLayerDataset(Dataset):
         img_path, label_path, layer_idx = self.samples[index]
  
         # Load only the required layer from each TIFF instead of the full stack.
-        with tifffile.TiffFile(img_path) as tif:
-            series = tif.series[0]
-            if len(series.shape) == 2:
-                image = series.asarray()
-            else:
-                image = series.asarray(key=layer_idx)
- 
-        with tifffile.TiffFile(label_path) as tif:
-            series = tif.series[0]
-            if len(series.shape) == 2:
-                label = series.asarray()
-            else:
-                label = series.asarray(key=layer_idx)
+        image = image_files.read(img_path, page=layer_idx)
+        label = image_files.read(label_path, page=layer_idx)
  
         # Convert image to 8-bit if it is 16-bit (some stacks are uint8, some uint16).
         # 16-bit [0,65535] -> 8-bit [0,255] via integer division by 257.

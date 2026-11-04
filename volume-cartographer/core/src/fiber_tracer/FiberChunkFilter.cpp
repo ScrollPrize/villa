@@ -59,7 +59,7 @@ nlohmann::json inspectFiberChunkConflicts(const FiberChunkPaths& chunk,const Fib
         if(!field || !nf)throw std::runtime_error("conflict readiness requires native predicted normal field");
         std::vector<cv::Vec3f> batch;
         auto flush=[&]{if(batch.empty())return;vc::lasagna::LasagnaCornerBatch corners;
-            if(!field->sampleCornerBatchWithNormals(*nf,batch,1,&corners,nullptr))throw std::runtime_error("conflict normal preflight failed");batch.clear();};
+            if(!field->sampleCornerBatchWithNormals(*nf,batch,&corners,nullptr))throw std::runtime_error("conflict normal preflight failed");batch.clear();};
         for(const auto&l:lines)for(const auto&[p,t]:samples(l)) {
             // Cover both sides of float rounding without changing double sampling.
             cv::Vec3f lower(p/scale),upper(lower);

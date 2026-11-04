@@ -1,9 +1,13 @@
+import json
 from types import SimpleNamespace
+
+import pytest
 
 from vesuvius.utils.models import load_nnunet_model
 from vesuvius.utils.models.load_nnunet_model import (
     _build_network_from_trainer,
     initialize_network,
+    load_model,
 )
 
 
@@ -125,3 +129,25 @@ def test_initialize_network_uses_nnunet_factory(monkeypatch):
         ),
         {'allow_init': True, 'deep_supervision': False},
     )]
+
+
+@pytest.mark.parametrize('relative', ['fold_0/checkpoint_final.pth', 'checkpoint_final.pth', 'checkpoint_best.pth'])
+def test_load_model_finds_fold_and_flat_checkpoints(tmp_path, monkeypatch, relative):
+    (tmp_path / 'plans.json').write_text(json.dumps({'configurations': {}}))
+    (tmp_path / 'dataset.json').write_text(json.dumps({'labels': {'background': 0}}))
+    checkpoint = tmp_path / relative
+    checkpoint.parent.mkdir(exist_ok=True)
+    checkpoint.touch()
+    loaded = []
+
+    class Loaded(Exception):
+        pass
+
+    def fake_load(path, **kwargs):
+        loaded.append(path)
+        raise Loaded
+
+    monkeypatch.setattr(load_nnunet_model.torch, 'load', fake_load)
+    with pytest.raises(Loaded):
+        load_model(str(tmp_path), device='cpu')
+    assert loaded == [str(checkpoint)]

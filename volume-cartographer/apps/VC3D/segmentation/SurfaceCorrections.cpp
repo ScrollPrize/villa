@@ -16,7 +16,7 @@ namespace {
 constexpr const char* kRole = "corrections";
 
 // A VC collection as an attached collection, remembering its VC id.
-AttachedCollection toStore(uint64_t id, const utils::Json& collection)
+AttachedCollection toStore(uint64_t id, const nlohmann::json& collection)
 {
     auto stored = vc::storedCollection(collection);
     stored.source["source_collection_id"] = std::to_string(id);
@@ -24,10 +24,10 @@ AttachedCollection toStore(uint64_t id, const utils::Json& collection)
 }
 }
 
-std::map<uint64_t, utils::Json> vc3d::corrections::read(ObjectStoreSession& session, const AttachmentIdentity& attachment,
+std::map<uint64_t, nlohmann::json> vc3d::corrections::read(ObjectStoreSession& session, const AttachmentIdentity& attachment,
                                                         const std::string& surfaceUuid, const std::optional<vc::objects::ViewFrame>& view)
 {
-    std::map<uint64_t, utils::Json> result;
+    std::map<uint64_t, nlohmann::json> result;
     for (auto stored : attachedCollections(session, attachment, surfaceUuid, kRole, view)) {
         const auto id = std::stoull(stored.source.value("source_collection_id", std::string("0")));
         stored.source.erase("source_collection_id");
@@ -37,7 +37,7 @@ std::map<uint64_t, utils::Json> vc3d::corrections::read(ObjectStoreSession& sess
 }
 
 void vc3d::corrections::write(ObjectStoreSession& session, const AttachmentIdentity& attachment, const std::string& surfaceUuid,
-                              const std::map<uint64_t, utils::Json>& collections, const vc::objects::VolumeVoxels& volume,
+                              const std::map<uint64_t, nlohmann::json>& collections, const vc::objects::VolumeVoxels& volume,
                               const std::optional<vc::objects::ViewFrame>& view)
 {
     std::vector<AttachedCollection> stored;
