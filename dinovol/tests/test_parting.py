@@ -91,6 +91,18 @@ class ResampleTests(unittest.TestCase):
         with self.assertRaises(SystemExit):
             CT.parse_resample("7.91:3.24")
 
+    def test_a_blosc_chunk_decodes_and_a_missing_one_reads_as_zeros(self):
+        from vc_reader.reader import compress_bytes
+
+        chunk = np.arange(CT.CHUNK ** 3, dtype=np.uint64).astype(np.uint8).reshape((CT.CHUNK,) * 3)
+        codec = {"id": "blosc", "cname": "lz4", "clevel": 5, "shuffle": 1, "blocksize": 0}
+        w = CT.Window.__new__(CT.Window)
+        w.codec = codec
+        np.testing.assert_array_equal(w._decode(compress_bytes(chunk.tobytes(), codec)), chunk)
+        self.assertTrue((w._decode(None) == 0).all())
+        w.codec = None
+        np.testing.assert_array_equal(w._decode(chunk.tobytes()), chunk)
+
 
 class GateTests(unittest.TestCase):
     def scored(self, sites=120, pairs=5, gain=True, seed=1):
@@ -189,6 +201,23 @@ class SitesTests(unittest.TestCase):
         self.assertEqual(len(cross), 0)
         with self.assertRaises(ValueError):
             G.stack_layers({"L0": g["L1"], "L1": g["L0"]}, min_matched=10)
+
+    def test_a_tifxyz_folder_reads_as_a_grid_with_holes_at_minus_one(self):
+        from vc_reader import images
+
+        from dinovol_2.eval.parting.cli import read_grid
+
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp) / "seg.tifxyz"
+            d.mkdir()
+            xyz = np.random.default_rng(0).uniform(0, 100, (3, 4, 5)).astype(np.float32)
+            xyz[:, 1, 2] = -1
+            for c, a in zip("xyz", xyz):
+                images.write_tiff(str(d / f"{c}.tif"), a)
+            g = read_grid(d)
+        self.assertEqual(g.shape, (4, 5, 3))
+        self.assertTrue((g[1, 2] == -1).all())
+        np.testing.assert_allclose(g[0, 0], xyz[:, 0, 0])
 
     def test_the_sites_command_reads_npy_grids(self):
         g = flat_layers(5.0)

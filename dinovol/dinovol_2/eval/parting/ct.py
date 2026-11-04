@@ -3,8 +3,8 @@
 `Window` reads a level whose voxels already match the model (7.5 to 10 um). `ResampledWindow` reads a finer level
 and box-averages it: each output voxel is the overlap-weighted mean of the source voxels its cell covers, one axis at
 a time, with voxel centers at index times voxel size on both grids, so a point at source voxel x lies at
-x * src_um / dst_um in the resampled frame. The array must be uint8 with 128^3 chunks (raw or with a numcodecs
-compressor such as blosc); chunks outside the array, or missing (HTTP 403 or 404), read as zeros.
+x * src_um / dst_um in the resampled frame. The array must be uint8 with 128^3 chunks (raw or with a compressor
+vc_reader decodes, such as blosc); chunks outside the array, or missing (HTTP 403 or 404), read as zeros.
 """
 import concurrent.futures as cf
 import json
@@ -13,6 +13,7 @@ import urllib.error
 import urllib.request
 
 import numpy as np
+from vc_reader.reader import decompress_bytes
 
 CHUNK = 128
 
@@ -28,10 +29,7 @@ class Window:
         if meta.get("dtype") not in ("|u1", "uint8") or list(meta.get("chunks", [])) != [CHUNK] * 3:
             raise SystemExit(f"{self.url}: need uint8 128^3 chunks, got {meta.get('dtype')} {meta.get('chunks')}")
         self.sep = meta.get("dimension_separator", ".")
-        self.codec = None
-        if meta.get("compressor"):
-            from numcodecs import get_codec
-            self.codec = get_codec(meta["compressor"])
+        self.codec = meta.get("compressor") or None
         self.cache, self.keep = {}, keep
         self.fetched = 0
 
@@ -54,7 +52,7 @@ class Window:
         if raw is None:
             return np.zeros((CHUNK,) * 3, np.uint8)
         if self.codec is not None:
-            raw = self.codec.decode(raw)
+            raw = decompress_bytes(raw, self.codec, CHUNK ** 3)
         return np.frombuffer(raw, np.uint8).reshape((CHUNK,) * 3)
 
     def _inside(self, c):

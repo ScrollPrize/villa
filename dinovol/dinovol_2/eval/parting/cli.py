@@ -32,8 +32,8 @@ def read_grid(path):
     """An (H, W, 3) xyz grid from a .vcps pointset, an .npy array or a tifxyz folder (x.tif, y.tif, z.tif)."""
     p = Path(path)
     if p.is_dir():
-        import tifffile
-        g = np.stack([tifffile.imread(p / f"{c}.tif") for c in "xyz"], -1).astype(np.float64)
+        from vc_reader import images
+        g = np.stack([images.read(p / f"{c}.tif") for c in "xyz"], -1).astype(np.float64)
         g[(g < 0).any(-1)] = -1
         return g
     if p.suffix == ".vcps":
