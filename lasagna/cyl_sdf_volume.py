@@ -248,7 +248,10 @@ def build_previous_shell_violation_depth_volume(
 	)
 	depth_max = float(depth_max)
 	if device is not None:
-		volume = volume_cpu.to(device=device, non_blocking=True)
+		# Only CUDA gets a non_blocking copy: on MPS (torch 2.11/2.12) the queued copy
+		# can read volume_cpu after it is freed on return (pytorch/pytorch#189690).
+		dev = torch.device(device)
+		volume = volume_cpu.to(device=dev, non_blocking=dev.type == "cuda")
 	else:
 		volume = volume_cpu
 	return CylOutsideVolume(

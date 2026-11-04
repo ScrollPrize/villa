@@ -75,13 +75,16 @@ struct Session {
 inline std::shared_ptr<Buffer<float>> field_buffer(const std::vector<float>& field, const std::shared_ptr<void>& device) {
     return device ? std::static_pointer_cast<Buffer<float>>(device) : std::make_shared<Buffer<float>>(field);
 }
-struct Statistics { double mean, low, high, deviation; };
-Buffer<Statistics> statistics(View<float>, bool deviation = false, const float* weights = nullptr);
+// Shared with Normalize: empty masks select the whole channel.
+std::unique_ptr<Buffer<std::uint8_t>> valid_voxels(const Sample&, const ChannelPlan&, Session&,
+                                                unsigned long long* selected = nullptr);
+struct Statistics { double mean, low, high, deviation; double count = 0; };
+Buffer<Statistics> statistics(View<float>, bool deviation = false, const float* weights = nullptr, const std::uint8_t* valid = nullptr);
 Buffer<Statistics> bounds(View<float>);
 Buffer<Statistics> bounds(View<double>);
 // Sets `bit` when any input magnitude exceeds limit, without computing statistics.
 void flag_magnitude(View<float>, double limit, int* flags, int bit);
-Buffer<Statistics> statistics(View<double>, bool deviation = false, const float* weights = nullptr);
+Buffer<Statistics> statistics(View<double>, bool deviation = false, const float* weights = nullptr, const std::uint8_t* valid = nullptr);
 Buffer<Statistics> local_statistics(View<float>, LocalFieldView);
 Buffer<Statistics> local_statistics(View<double>, LocalFieldView);
 } // namespace vcr::transforms::cuda

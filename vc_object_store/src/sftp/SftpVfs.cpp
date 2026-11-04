@@ -1,5 +1,5 @@
 #include "sftp/SftpVfs.hpp"
-#include "vc_object_store/sftp/Sftp.hpp"
+#include "vc_reader/sftp.hpp"
 
 #include <sqlite3.h>
 #include <cstring>
@@ -10,11 +10,13 @@
 #include <charconv>
 #include <cstdlib>
 #include <exception>
+#include <algorithm>
+#include <list>
 
 namespace vc::objects::detail {
 namespace {
-using vc::sftp::Session;
-using vc::sftp::StatusError;
+using vcr::sftp::Session;
+using vcr::sftp::StatusError;
 constexpr const char* kVfsName = "vc-sftp";
 
 thread_local std::string lastError;
@@ -23,9 +25,10 @@ thread_local std::string lastError;
 // inspection helpers retain their ordinary SFTP connection per destination.
 struct Connection {
     std::mutex mutex;
-    vc::sftp::Url destination;
+    vcr::sftp::Url destination;
     std::unique_ptr<Session> session;
     uint64_t generation = 0;
+    uint64_t writes = 0;  // invalidates read-ahead on every handle, including rollback writes
     std::string hubPath;
     bool failed = false;
     bool active = false;
@@ -41,7 +44,7 @@ struct Connection {
         if (hubPath.empty() && session && !session->writesPending() && session->transportClosed())
             session.reset();
         if (!session) {
-            vc::sftp::Options options;
+            vcr::sftp::Options options;
             options.shareConnection = true;
             if (!hubPath.empty()) {
                 options.processLock = hubPath + ".lock/" + kProcessLockName;
@@ -66,13 +69,13 @@ struct Connection {
 
 thread_local std::shared_ptr<Connection> activeHub;
 
-bool belongsToHub(const vc::sftp::Url& url, const Connection& hub)
+bool belongsToHub(const vcr::sftp::Url& url, const Connection& hub)
 {
     return url.authority() == hub.destination.authority() &&
         (url.path == hub.hubPath || url.path == hub.hubPath + "-journal");
 }
 
-std::shared_ptr<Connection> standaloneConnection(const vc::sftp::Url& url)
+std::shared_ptr<Connection> standaloneConnection(const vcr::sftp::Url& url)
 {
     static std::mutex mutex;
     static std::map<std::string, std::shared_ptr<Connection>> connections;
@@ -85,7 +88,7 @@ std::shared_ptr<Connection> standaloneConnection(const vc::sftp::Url& url)
     return found;
 }
 
-std::shared_ptr<Connection> connection(const vc::sftp::Url& url)
+std::shared_ptr<Connection> connection(const vcr::sftp::Url& url)
 {
     if (activeHub && belongsToHub(url, *activeHub)) return activeHub;
     return standaloneConnection(url);
@@ -123,14 +126,59 @@ struct State {
     uint64_t generation = 0;
     int lock = SQLITE_LOCK_NONE;
     bool deleteOnClose = false;
+    bool mainDatabase = false;
+    // SQLite asks for individual pages. Read nearby pages together so the
+    // SFTP client's pipelining can amortize latency. Several blocks retain
+    // index pages while SQLite follows a blob's overflow pages. Bounded to
+    // 512 KiB per handle; never reused across a new process-lock session.
+    static constexpr size_t kReadBlock = 64 * 1024, kReadBlocks = 8;
+    struct Block { uint64_t offset; std::vector<std::byte> bytes; };
+    std::list<Block> blocks;
+    uint64_t writes = 0;
     // A handle from an earlier connection is invalid on the current one.
     Session::Handle& open(Session& session)
     {
         if (generation != connection->generation) {
+            blocks.clear();
             handle = session.open(path, flags);
             generation = connection->generation;
         }
         return handle;
+    }
+
+    size_t read(Session& session, uint64_t offset, std::span<std::byte> out)
+    {
+        auto& remote = open(session); // also validates the handle on cache hits
+        if (writes != connection->writes) {
+            blocks.clear();
+            writes = connection->writes;
+        }
+        // Header/change-counter probes must stay cheap on idle polls. Journals
+        // are short-lived and written frequently; leave their I/O unbuffered.
+        if (!mainDatabase || out.size() < 512) return session.read(remote, offset, out);
+        size_t copied = 0;
+        while (copied < out.size()) {
+            const auto position = offset + copied;
+            const auto base = position - position % kReadBlock;
+            auto block = std::find_if(blocks.begin(), blocks.end(),
+                [&](const auto& b) { return b.offset == base; });
+            if (block == blocks.end()) {
+                // Publish only successful reads, including a short final block.
+                std::vector<std::byte> bytes(kReadBlock);
+                bytes.resize(session.read(remote, base, bytes));
+                if (blocks.size() == kReadBlocks) blocks.pop_back();
+                blocks.push_front({base, std::move(bytes)});
+            } else {
+                blocks.splice(blocks.begin(), blocks, block);
+            }
+            const auto& bytes = blocks.front().bytes;
+            const auto within = size_t(position - base);
+            if (within >= bytes.size()) break;
+            const auto count = std::min(out.size() - copied, bytes.size() - within);
+            std::memcpy(out.data() + copied, bytes.data() + within, count);
+            copied += count;
+        }
+        return copied;
     }
 };
 struct File {
@@ -168,7 +216,7 @@ int fileRead(sqlite3_file* file, void* buffer, int amount, sqlite3_int64 offset)
     auto& s = state(file);
     try {
         const auto got = withSession(*s.connection, [&](Session& session) {
-            return session.read(s.open(session), uint64_t(offset), std::span(static_cast<std::byte*>(buffer), size_t(amount)));
+            return s.read(session, uint64_t(offset), std::span(static_cast<std::byte*>(buffer), size_t(amount)));
         });
         if (got < size_t(amount)) {
             std::memset(static_cast<char*>(buffer) + got, 0, size_t(amount) - got);
@@ -186,6 +234,7 @@ int fileWrite(sqlite3_file* file, const void* buffer, int amount, sqlite3_int64 
     auto& s = state(file);
     try {
         withSession(*s.connection, [&](Session& session) {
+            ++s.connection->writes; // invalidate even if the write fails partway
             session.write(s.open(session), uint64_t(offset), std::span(static_cast<const std::byte*>(buffer), size_t(amount)));
         });
         return SQLITE_OK;
@@ -199,7 +248,10 @@ int fileTruncate(sqlite3_file* file, sqlite3_int64 size)
 {
     auto& s = state(file);
     try {
-        withSession(*s.connection, [&](Session& session) { session.truncate(s.open(session), uint64_t(size)); });
+        withSession(*s.connection, [&](Session& session) {
+            ++s.connection->writes;
+            session.truncate(s.open(session), uint64_t(size));
+        });
         return SQLITE_OK;
     } catch (const std::exception& error) {
         lastError = error.what();
@@ -293,16 +345,17 @@ int vfsOpen(sqlite3_vfs*, const char* name, sqlite3_file* file, int flags, int* 
         return SQLITE_CANTOPEN;
     }
     try {
-        const auto url = vc::sftp::parseUrl(name);
+        const auto url = vcr::sftp::parseUrl(name);
         if (!activeHub || !belongsToHub(url, *activeHub))
             throw std::runtime_error("hub: remote databases must be accessed through the hub operations");
         auto s = std::make_unique<State>();
         s->connection = connection(url);
         s->path = url.path;
         s->deleteOnClose = flags & SQLITE_OPEN_DELETEONCLOSE;
-        s->flags = vc::sftp::Read | (flags & SQLITE_OPEN_READWRITE ? vc::sftp::Write : 0);
-        auto create = s->flags | (flags & SQLITE_OPEN_CREATE ? vc::sftp::Create : 0) |
-                      (flags & SQLITE_OPEN_EXCLUSIVE ? vc::sftp::Exclusive : 0);
+        s->mainDatabase = flags & SQLITE_OPEN_MAIN_DB;
+        s->flags = vcr::sftp::Read | (flags & SQLITE_OPEN_READWRITE ? vcr::sftp::Write : 0);
+        auto create = s->flags | (flags & SQLITE_OPEN_CREATE ? vcr::sftp::Create : 0) |
+                      (flags & SQLITE_OPEN_EXCLUSIVE ? vcr::sftp::Exclusive : 0);
         withSession(*s->connection, [&](Session& session) {
             if ((flags & SQLITE_OPEN_READWRITE) && !session.supports("fsync@openssh.com"))
                 throw std::runtime_error("the SFTP server lacks fsync@openssh.com, so writes cannot be made durable");
@@ -332,13 +385,13 @@ int vfsOpen(sqlite3_vfs*, const char* name, sqlite3_file* file, int flags, int* 
 int vfsDelete(sqlite3_vfs*, const char* name, int)
 {
     try {
-        const auto url = vc::sftp::parseUrl(name);
+        const auto url = vcr::sftp::parseUrl(name);
         if (!activeHub || !belongsToHub(url, *activeHub))
             throw std::runtime_error("hub: journal removal requires the operation's locked SSH session");
         withSession(*connection(url), [&](Session& session) { session.remove(url.path); });
         return SQLITE_OK;
     } catch (const StatusError& error) {
-        if (error.status == vc::sftp::NoSuchFile) return SQLITE_IOERR_DELETE_NOENT;
+        if (error.status == vcr::sftp::NoSuchFile) return SQLITE_IOERR_DELETE_NOENT;
         lastError = error.what();
         return SQLITE_IOERR_DELETE;
     } catch (const std::exception& error) {
@@ -362,7 +415,7 @@ int vfsAccess(sqlite3_vfs*, const char* name, int, int* result)
 int vfsFullPathname(sqlite3_vfs*, const char* name, int size, char* out)
 {
     try {
-        const auto canonical = vc::sftp::parseUrl(name).str();
+        const auto canonical = vcr::sftp::parseUrl(name).str();
         if (canonical.size() + 1 > size_t(size)) return SQLITE_CANTOPEN;
         std::memcpy(out, canonical.c_str(), canonical.size() + 1);
         return SQLITE_OK;
@@ -411,7 +464,7 @@ RemoteHubScope::RemoteHubScope(const std::filesystem::path& hub)
     if (!isRemotePath(hub)) return;
     if (activeHub) throw std::logic_error("hub: nested remote hub operation");
     auto state = std::make_unique<Impl>();
-    const auto url = vc::sftp::parseUrl(canonicalRemotePath(hub));
+    const auto url = vcr::sftp::parseUrl(canonicalRemotePath(hub));
 #ifndef _WIN32
     // This ordinary SFTP session owns the shared transport, never a hub lock.
     // Its completed handshake makes multiplexing available before the locked
@@ -470,13 +523,13 @@ std::string pathText(const std::filesystem::path& path)
     const auto text = path.u8string();
     return std::string(text.begin(), text.end());
 }
-bool isRemotePath(const std::filesystem::path& path) { return vc::sftp::isSftpUrl(pathText(path)); }
-std::string canonicalRemotePath(const std::filesystem::path& path) { return vc::sftp::parseUrl(pathText(path)).str(); }
+bool isRemotePath(const std::filesystem::path& path) { return vcr::sftp::isSftpUrl(pathText(path)); }
+std::string canonicalRemotePath(const std::filesystem::path& path) { return vcr::sftp::parseUrl(pathText(path)).str(); }
 std::string sftpLastError() { return lastError; }
 
 RemoteStat remoteStat(const std::string& text)
 {
-    const auto url = vc::sftp::parseUrl(text);
+    const auto url = vcr::sftp::parseUrl(text);
     return withSession(*connection(url), [&](Session& session) {
         RemoteStat result;
         try {
@@ -486,7 +539,7 @@ RemoteStat remoteStat(const std::string& text)
             result.size = attributes.size.value_or(0);
             result.modified = attributes.modified;
         } catch (const StatusError& error) {
-            if (error.status != vc::sftp::NoSuchFile) throw;
+            if (error.status != vcr::sftp::NoSuchFile) throw;
         }
         return result;
     });
@@ -494,9 +547,9 @@ RemoteStat remoteStat(const std::string& text)
 
 void remoteRead(const std::string& text, uint64_t offset, std::span<std::byte> out)
 {
-    const auto url = vc::sftp::parseUrl(text);
+    const auto url = vcr::sftp::parseUrl(text);
     withSession(*connection(url), [&](Session& session) {
-        const auto handle = session.open(url.path, vc::sftp::Read);
+        const auto handle = session.open(url.path, vcr::sftp::Read);
         size_t got = 0;
         try { got = session.read(handle, offset, out); } catch (...) { session.close(handle); throw; }
         session.close(handle);
@@ -506,13 +559,13 @@ void remoteRead(const std::string& text, uint64_t offset, std::span<std::byte> o
 
 uint64_t remoteCopy(const std::string& text, const std::function<void(std::span<const std::byte>)>& sink)
 {
-    const auto url = vc::sftp::parseUrl(text);
+    const auto url = vcr::sftp::parseUrl(text);
     // Not retried: a partial copy has already reached the sink.
     auto c = connection(url);
     std::lock_guard lock(c->mutex);
     auto& session = c->get();
     try {
-        const auto handle = session.open(url.path, vc::sftp::Read);
+        const auto handle = session.open(url.path, vcr::sftp::Read);
         const auto copied = session.read(handle, 0, std::numeric_limits<uint64_t>::max(), sink);
         session.close(handle);
         return copied;
@@ -527,7 +580,7 @@ uint64_t remoteCopy(const std::string& text, const std::function<void(std::span<
 
 void remoteEnableProcessLock(const std::string& text)
 {
-    const auto url = vc::sftp::parseUrl(text);
+    const auto url = vcr::sftp::parseUrl(text);
     // Migration is deliberately not passed through the reconnect/retry helper.
     // An uncertain mkdir is left for the operator, never guessed to be ours.
     Session session(url);
@@ -543,7 +596,7 @@ void remoteEnableProcessLock(const std::string& text)
             throw std::runtime_error("hub: invalid process lock file");
         return;
     } catch (const StatusError& error) {
-        if (error.status != vc::sftp::NoSuchFile) throw;
+        if (error.status != vcr::sftp::NoSuchFile) throw;
     }
     try { session.mkdir(directory); }
     catch (const StatusError& error) {
@@ -554,7 +607,7 @@ void remoteEnableProcessLock(const std::string& text)
         const auto mode = *database.permissions & 0666;
         session.setPathPermissions(directory, mode | ((mode & 0444) >> 2) | ((mode & 0222) >> 1));
     }
-    const auto handle = session.open(marker, vc::sftp::Write | vc::sftp::Create | vc::sftp::Exclusive);
+    const auto handle = session.open(marker, vcr::sftp::Write | vcr::sftp::Create | vcr::sftp::Exclusive);
     // The lock file needs the same sharing permissions as the hub.
     if (database.permissions) session.setPermissions(handle, *database.permissions & 0666);
     session.fsync(handle);
@@ -563,7 +616,7 @@ void remoteEnableProcessLock(const std::string& text)
 
 void remoteRmdir(const std::string& text)
 {
-    const auto url = vc::sftp::parseUrl(text);
+    const auto url = vcr::sftp::parseUrl(text);
     withSession(*connection(url), [&](Session& session) { session.rmdir(url.path); });
 }
 

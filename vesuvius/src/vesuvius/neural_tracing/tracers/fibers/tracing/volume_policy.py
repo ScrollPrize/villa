@@ -66,10 +66,10 @@ def runs(mask):
     return list(zip(np.flatnonzero(m == 1), np.flatnonzero(m == -1)))
 
 
-def outside_scan(vol, xyz):
+def outside_scan(ct, spec, xyz):
     """Grid xyz points where the CT is 0 (beyond the scanned/masked region, or beyond the array)."""
     xyz = np.asarray(xyz, np.float64).reshape(-1, 3)
-    return vol.sample_image_nearest(xyz[:, ::-1]) == 0 if len(xyz) else np.zeros(0, bool)
+    return ct.sample(xyz[:, ::-1]*spec.input_scale, order=0) == 0 if len(xyz) else np.zeros(0, bool)
 
 
 def outside_ct_cut(outside, gap):

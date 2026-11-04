@@ -6,19 +6,20 @@
 
 #include "vc/core/types/VolumePkg.hpp"
 #include "vc/core/types/Volume.hpp"
-#include "support/TestZarrVolume.hpp"
+#include <nlohmann/json.hpp>
+#include <vc_reader/zarr.hpp>
+#include <vc_reader/zarr_write.hpp>
+#include <filesystem>
+#include <fstream>
 #include "support/TestProject.hpp"
 
 #include <algorithm>
-#include <filesystem>
-#include <fstream>
 #include <memory>
 #include <random>
 #include <string>
 
 namespace fs = std::filesystem;
 using vc::project::Category;
-using vc::project::isLocationRemote;
 using vc::project::resolveLocalPath;
 using vc::project::validateLocation;
 using vc::project::validateSingleVolumeLocation;
@@ -37,18 +38,6 @@ fs::path tmpDir(const std::string& tag)
 } // namespace
 
 // --- Free helpers ---
-
-TEST_CASE("isLocationRemote: schemes")
-{
-    CHECK(isLocationRemote("s3://bucket/key"));
-    CHECK(isLocationRemote("s3+eu-west-1://bucket"));
-    CHECK(isLocationRemote("http://example.com"));
-    CHECK(isLocationRemote("https://example.com"));
-    CHECK_FALSE(isLocationRemote("/local/path"));
-    CHECK_FALSE(isLocationRemote("relative/path"));
-    CHECK_FALSE(isLocationRemote("file:///tmp/x"));
-    CHECK_FALSE(isLocationRemote(""));
-}
 
 TEST_CASE("resolveLocalPath: absolute, relative+base, file:// prefix")
 {
@@ -86,9 +75,8 @@ TEST_CASE("validateSingleVolumeLocation requires exactly one zarr")
 {
     auto root = tmpDir("single_volume");
     auto volume = root / "volume";
-    fs::create_directories(volume / "0");
+    vcr::zarr::Writer::create(volume / "0", {.shape = {1, 1, 1}, .chunks = {1, 1, 1}, .compressor = ""});
     { std::ofstream(volume / "meta.json") << "{}"; }
-    { std::ofstream(volume / "0" / ".zarray") << "{}"; }
 
     CHECK(validateSingleVolumeLocation(volume.string()).empty());
     CHECK_FALSE(validateSingleVolumeLocation(root.string()).empty());
@@ -292,13 +280,11 @@ TEST_CASE("VolumePkg stores regular and fiber Lasagna entries in one resource ki
 TEST_CASE("VolumePkg attaches Lasagna manifest volumes as regular volume entries")
 {
     auto d = tmpDir("lasagna_batch_attach");
-    vc::test::ZarrVolumeSpec create;
-    create.shapeZYX = {2, 2, 2};
-    create.chunkShapeZYX = {2, 2, 2};
-    create.numLevels = 1;
-    create.uuid = "lasagna-view";
-    create.name = "presence";
-    auto volume = vc::test::createZarrVolume(d / "backing.zarr", create);
+    const std::filesystem::path volumeRoot1 = d / "backing.zarr";
+    const vcr::zarr::CreateOptions levelZero1{.shape = {2, 2, 2}, .chunks = {2, 2, 2}, .compressor = "", .overwrite = true};
+    vcr::zarr::Writer::create(volumeRoot1 / "0", levelZero1);
+    std::ofstream(volumeRoot1 / "meta.json") << nlohmann::json{{"type", "vol"}, {"uuid", "lasagna-view"}, {"name", "presence"}, {"format", "zarr"}, {"width", 2}, {"height", 2}, {"slices", 2}, {"voxelsize", 1.0}}.dump();
+    auto volume = Volume::New(volumeRoot1);
 
     VolumePkg::PreparedVolumeAttachment derived{
         (d / "backing.zarr").string(),
@@ -349,16 +335,16 @@ TEST_CASE("VolumePkg Lasagna attach fills but does not replace selected datasets
 TEST_CASE("VolumePkg Lasagna reattachment updates manifest role without owning volumes")
 {
     auto d = tmpDir("lasagna_batch_reconcile");
-    vc::test::ZarrVolumeSpec create;
-    create.shapeZYX = {2, 2, 2};
-    create.chunkShapeZYX = {2, 2, 2};
-    create.numLevels = 1;
-    create.uuid = "old-channel";
-    create.name = "old";
-    auto oldVolume = vc::test::createZarrVolume(d / "old.zarr", create);
-    create.uuid = "new-channel";
-    create.name = "new";
-    auto newVolume = vc::test::createZarrVolume(d / "new.zarr", create);
+    const std::filesystem::path volumeRoot2 = d / "old.zarr";
+    const vcr::zarr::CreateOptions levelZero2{.shape = {2, 2, 2}, .chunks = {2, 2, 2}, .compressor = "", .overwrite = true};
+    vcr::zarr::Writer::create(volumeRoot2 / "0", levelZero2);
+    std::ofstream(volumeRoot2 / "meta.json") << nlohmann::json{{"type", "vol"}, {"uuid", "old-channel"}, {"name", "old"}, {"format", "zarr"}, {"width", 2}, {"height", 2}, {"slices", 2}, {"voxelsize", 1.0}}.dump();
+    auto oldVolume = Volume::New(volumeRoot2);
+    const std::filesystem::path volumeRoot3 = d / "new.zarr";
+    const vcr::zarr::CreateOptions levelZero3{.shape = {2, 2, 2}, .chunks = {2, 2, 2}, .compressor = "", .overwrite = true};
+    vcr::zarr::Writer::create(volumeRoot3 / "0", levelZero3);
+    std::ofstream(volumeRoot3 / "meta.json") << nlohmann::json{{"type", "vol"}, {"uuid", "new-channel"}, {"name", "new"}, {"format", "zarr"}, {"width", 2}, {"height", 2}, {"slices", 2}, {"voxelsize", 1.0}}.dump();
+    auto newVolume = Volume::New(volumeRoot3);
 
     const std::vector<VolumePkg::PreparedVolumeAttachment> oldAttachments{{
         (d / "old.zarr").string(),
@@ -392,13 +378,11 @@ TEST_CASE("VolumePkg Lasagna reattachment updates manifest role without owning v
 TEST_CASE("VolumePkg merges Lasagna manifest breadcrumbs onto shared regular volumes")
 {
     auto d = tmpDir("lasagna_shared_ownership");
-    vc::test::ZarrVolumeSpec create;
-    create.shapeZYX = {2, 2, 2};
-    create.chunkShapeZYX = {2, 2, 2};
-    create.numLevels = 1;
-    create.uuid = "shared-lasagna-view";
-    create.name = "shared";
-    auto volume = vc::test::createZarrVolume(d / "shared.zarr", create);
+    const std::filesystem::path volumeRoot4 = d / "shared.zarr";
+    const vcr::zarr::CreateOptions levelZero4{.shape = {2, 2, 2}, .chunks = {2, 2, 2}, .compressor = "", .overwrite = true};
+    vcr::zarr::Writer::create(volumeRoot4 / "0", levelZero4);
+    std::ofstream(volumeRoot4 / "meta.json") << nlohmann::json{{"type", "vol"}, {"uuid", "shared-lasagna-view"}, {"name", "shared"}, {"format", "zarr"}, {"width", 2}, {"height", 2}, {"slices", 2}, {"voxelsize", 1.0}}.dump();
+    auto volume = Volume::New(volumeRoot4);
 
     const VolumePkg::PreparedVolumeAttachment first{
         (d / "shared.zarr").string(),
@@ -427,14 +411,18 @@ TEST_CASE("VolumePkg merges Lasagna manifest breadcrumbs onto shared regular vol
 TEST_CASE("VolumePkg Lasagna attach can tag an independently attached source volume")
 {
     auto d = tmpDir("lasagna_independent_ownership");
-    vc::test::ZarrVolumeSpec create;
-    create.shapeZYX = {2, 2, 2};
-    create.chunkShapeZYX = {2, 2, 2};
-    create.numLevels = 1;
-    create.uuid = "independent-lasagna-source";
-    create.name = "source";
+
+
+
+
+
+
     const auto location = (d / "source.zarr").string();
-    auto volume = vc::test::createZarrVolume(location, create);
+    const std::filesystem::path volumeRoot5 = location;
+    const vcr::zarr::CreateOptions levelZero5{.shape = {2, 2, 2}, .chunks = {2, 2, 2}, .compressor = "", .overwrite = true};
+    vcr::zarr::Writer::create(volumeRoot5 / "0", levelZero5);
+    std::ofstream(volumeRoot5 / "meta.json") << nlohmann::json{{"type", "vol"}, {"uuid", "independent-lasagna-source"}, {"name", "source"}, {"format", "zarr"}, {"width", 2}, {"height", 2}, {"slices", 2}, {"voxelsize", 1.0}}.dump();
+    auto volume = Volume::New(volumeRoot5);
 
     auto pkg = vc::test::emptyProject();
     REQUIRE(pkg->attachPreparedVolume(location, {}, volume) ==
@@ -463,14 +451,18 @@ TEST_CASE("VolumePkg Lasagna attach can tag an independently attached source vol
 TEST_CASE("VolumePkg rejects Lasagna prepared volumes with mismatched locations")
 {
     auto d = tmpDir("lasagna_mismatched_location");
-    vc::test::ZarrVolumeSpec create;
-    create.shapeZYX = {2, 2, 2};
-    create.chunkShapeZYX = {2, 2, 2};
-    create.numLevels = 1;
-    create.uuid = "source";
-    create.name = "source";
+
+
+
+
+
+
     const auto location = (d / "source.zarr").string();
-    auto prepared = vc::test::createZarrVolume(d / "other.zarr", create);
+    const std::filesystem::path volumeRoot6 = d / "other.zarr";
+    const vcr::zarr::CreateOptions levelZero6{.shape = {2, 2, 2}, .chunks = {2, 2, 2}, .compressor = "", .overwrite = true};
+    vcr::zarr::Writer::create(volumeRoot6 / "0", levelZero6);
+    std::ofstream(volumeRoot6 / "meta.json") << nlohmann::json{{"type", "vol"}, {"uuid", "source"}, {"name", "source"}, {"format", "zarr"}, {"width", 2}, {"height", 2}, {"slices", 2}, {"voxelsize", 1.0}}.dump();
+    auto prepared = Volume::New(volumeRoot6);
 
     auto pkg = vc::test::emptyProject();
     const VolumePkg::PreparedVolumeAttachment derived{

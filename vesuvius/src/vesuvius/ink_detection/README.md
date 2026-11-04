@@ -211,5 +211,5 @@ uv run --no-sync pytest tests/ink_detection -q
 
 The supported modes are `flat`, `full_3d`, and `full_3d_single_wrap`.
 ResNet3D/container inference, `normal_pooled_3d`, mean-teacher, and Betti
-matching are outside this package. Positive native dilation requires the
-CUDA/cuCIM capability.
+matching are outside this package. Positive native dilation uses vc_reader's
+exact distance transform on the batch's device (CPU or CUDA).

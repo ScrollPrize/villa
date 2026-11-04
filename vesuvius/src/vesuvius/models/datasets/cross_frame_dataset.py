@@ -6,7 +6,7 @@ relates the two (``p_fixed = M @ p_moving`` in XYZ order). We enumerate
 foreground patches natively in label-voxel coords, then resample the
 matching image region through ``M^{-1}`` with trilinear interpolation.
 
-All S3/HTTPS/local zarr I/O goes through :func:`vesuvius.data.utils.open_zarr`.
+All S3/HTTPS/local zarr I/O goes through ``vc_reader``.
 The patch index is built once per unique (labels URL, patch size, thresholds,
 transform checksum) tuple and cached on disk.
 """
@@ -23,15 +23,14 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
-import zarr
 from torch.utils.data import Dataset
+from vc_reader.reader import ZarrReader, open_node
 
 from vesuvius.data import affine
-from vesuvius.data.utils import open_zarr
 from vesuvius.utils.utils import pad_or_crop_3d
 
-from ..augmentation.pipelines import create_training_transforms
-from ..training.normalization import get_normalization
+from ..augmentation.pipelines import create_training_transforms, sample_seed
+import vc_reader.transforms as A
 from .zarr_dataset import PatchInfo
 
 
@@ -48,19 +47,17 @@ def _stage(msg: str) -> None:
 
 
 def _open_zarr_any(url: str, storage_options: Optional[dict]):
-    """Open a zarr at ``url``. Uses ``open_zarr`` for http(s)/s3 URLs and
-    ``zarr.open`` for local paths, because zarr rejects ``storage_options``
-    on non-fsspec paths even when the mapping is empty.
+    """Group or array at ``url``, read in DataLoader workers. ``storage_options``
+    may say ``anon``: true to send no credentials.
     """
-    if url.startswith(("http://", "https://", "s3://")):
-        return open_zarr(url, mode="r", storage_options=storage_options or {})
-    return zarr.open(url, mode="r")
+    auth = None if (storage_options or {}).get("anon") else "auto"
+    return open_node(url, auth=auth, threads=1)
 
 
-def _resolve_zarr_array(obj) -> zarr.Array:
-    """Return the underlying ``zarr.Array`` for a group-or-array object.
+def _resolve_zarr_array(obj) -> ZarrReader:
+    """Return the array for a group-or-array object.
 
-    ``open_zarr`` may return a Group when the URL points at an OME-Zarr
+    ``open_node`` returns a group when the URL points at an OME-Zarr
     container. Prefer the ``"0"`` subpath, then a handful of common fallbacks.
     """
     if hasattr(obj, "shape") and hasattr(obj, "dtype") and not hasattr(obj, "keys"):
@@ -144,12 +141,10 @@ class CrossFrameZarrDataset(Dataset):
         )
 
         # Zarr handles are opened lazily per-process (see
-        # ``_ensure_process_local_handles``). An fsspec/s3fs session pickled
-        # into a DataLoader worker does not survive fork/spawn cleanly, which
-        # is why dinovol uses the same per-PID reopen pattern.
-        self._image_array: Optional[zarr.Array] = None
-        self._labels_array: Optional[zarr.Array] = None
-        self._scan_array: Optional[zarr.Array] = None
+        # ``_ensure_process_local_handles``).
+        self._image_array: Optional[ZarrReader] = None
+        self._labels_array: Optional[ZarrReader] = None
+        self._scan_array: Optional[ZarrReader] = None
         self._handle_pid: Optional[int] = None
         self._atexit_pid: Optional[int] = None
         self._debug_calls_remaining: int = self._DEBUG_CALLS_PER_PID
@@ -195,7 +190,23 @@ class CrossFrameZarrDataset(Dataset):
 
         self.normalization_scheme = getattr(mgr, "normalization_scheme", "zscore")
         self.intensity_properties = getattr(mgr, "intensity_properties", None) or {}
-        self.normalizer = get_normalization(self.normalization_scheme, self.intensity_properties)
+        scheme = self.normalization_scheme
+        if scheme == "ct":
+            props = self.intensity_properties
+            required = ("mean", "std", "percentile_00_5", "percentile_99_5")
+            if not props or any(key not in props for key in required):
+                raise ValueError("CT normalization requires mean, std and percentile bounds")
+            op = A.Normalize("fixed", center=float(props["mean"]), scale=max(float(props["std"]), 1e-8),
+                             bounds=(float(props["percentile_00_5"]), float(props["percentile_99_5"])))
+        elif scheme == "zscore":
+            op = A.Normalize("zscore", nonzero=False, eps=1e-8)
+        elif scheme in ("minmax", "rescale_to_01", "robust"):
+            op = A.Normalize("minmax" if scheme == "rescale_to_01" else scheme)
+        elif scheme == "none":
+            op = None
+        else:
+            raise ValueError(f"Unknown normalization scheme: {scheme}")
+        self.normalizer = A.Pipeline([op], backend="cpu") if op is not None else None
 
         self.cache_dir = self._resolve_cache_dir(ds_cfg)
         # data_path is read by BaseTrainer._configure_dataloaders to decide
@@ -217,6 +228,8 @@ class CrossFrameZarrDataset(Dataset):
         if self.is_training:
             self.transforms = create_training_transforms(
                 patch_size=self.patch_size,
+                label_names=[self.target_name],
+                backend="cuda" if getattr(mgr, "augment_on_device", False) else "cpu",
                 no_spatial=bool(getattr(mgr, "no_spatial_augmentation", False)),
                 no_scaling=bool(getattr(mgr, "no_scaling_augmentation", False)),
                 skeleton_targets=skeleton_targets or None,
@@ -225,6 +238,7 @@ class CrossFrameZarrDataset(Dataset):
         elif skeleton_targets:
             from ..augmentation.pipelines.training_transforms import create_validation_transforms
             self.transforms = create_validation_transforms(
+                label_names=[self.target_name],
                 skeleton_targets=skeleton_targets,
                 skeleton_ignore_values=skeleton_ignore_values or None,
             )
@@ -644,8 +658,11 @@ class CrossFrameZarrDataset(Dataset):
                 f"min={image_patch.min():.1f} max={image_patch.max():.1f})"
             )
 
-        if self.normalizer is not None:
-            image_patch = self.normalizer.run(image_patch)
+        if self.normalizer is not None and image_patch.size:
+            normalized = self.normalizer(
+                {"image": np.asarray(image_patch, dtype=np.float32).reshape(1, 1, -1)}, seed=0
+            )["image"]
+            image_patch = normalized.reshape(image_patch.shape)
         image_patch = image_patch.astype(np.float32, copy=False)
 
         # Resample labels through the forward affine into the image grid.
@@ -662,11 +679,11 @@ class CrossFrameZarrDataset(Dataset):
             )
             t_lbl_s = time.perf_counter()
 
-        label_patch = affine.resample_label_to_image_grid(
-            self._labels_array,
-            self._matrix_zyx_image_to_label,
-            pos,
+        linear = self._matrix_zyx_image_to_label[:3, :3]
+        label_patch = self._labels_array.read_affine(
             ps,
+            linear @ np.asarray(pos, dtype=np.float64) + self._matrix_zyx_image_to_label[:3, 3],
+            linear,
             order=0,  # nearest neighbor preserves integer labels
         )
         if self.binarize_labels:
@@ -693,10 +710,10 @@ class CrossFrameZarrDataset(Dataset):
             },
         }
 
-        if self.transforms is not None:
+        if self.transforms is not None and not getattr(self.mgr, "augment_on_device", False):
             if debug:
                 t_aug_s = time.perf_counter()
-            result = self.transforms(**result)
+            result = self.transforms(result, seed=sample_seed(index))
             if debug:
                 t_aug_e = time.perf_counter()
                 _stage(f"__getitem__ {tag}: transforms {1e3*(t_aug_e-t_aug_s):.1f} ms")

@@ -38,7 +38,7 @@ def test_real_pipeline_balances_aligned_chunks_and_matches_serial(tmp_path, monk
             output_regions_zyx={'identity': (0, 0, 0, 128, 128, 128)},
             full_output_shapes_zyx={'identity': (128, 128, 128)},
             tile_size=96, overlap=32, border=0, tmp_dir=str(root),
-            input_reader='python-zarr', accumulator_workers=workers, flush_workers=0,
+            accumulator_workers=workers, flush_workers=0,
             product_accumulator_dtype='float16',
         )
         outputs.append(output.chunks)

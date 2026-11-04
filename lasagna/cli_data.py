@@ -22,7 +22,6 @@ class DataConfig:
 	winding_volume: str | None                           # path to winding volume zarr
 	cuda_gridsample: bool                                # use custom CUDA uint8 grid_sample kernel
 	erode_valid_mask: int                                # erode grad_mag validity mask by N voxels
-	sparse_prefetch_backend: str                         # "tensorstore" or "python-zarr" streaming prefetcher
 	corr_point_roi: bool                                 # derive shell-dir-crop ROI from corr_points
 	corr_point_roi_init_margin: int                      # crop margin in mesh grid points
 	corr_point_roi_output_radius: int                    # export/output dilation radius in mesh grid points
@@ -53,8 +52,6 @@ def add_args(p: argparse.ArgumentParser) -> None:
 		help="Use custom CUDA uint8 grid_sample kernel (1=yes, 0=fallback to PyTorch F.grid_sample)")
 	g.add_argument("--erode-valid-mask", type=int, default=0,
 		help="Erode grad_mag validity mask inward by N voxels (excludes noisy borders from all losses)")
-	g.add_argument("--sparse-prefetch-backend", choices=("tensorstore", "python-zarr"), default="tensorstore",
-		help="Sparse streaming prefetch backend: tensorstore uses TensorStore Python, python-zarr uses the zarr fallback")
 	g.add_argument("--corr-point-roi", action=argparse.BooleanOptionalAction, default=False,
 		help="For shell-dir-crop seed init, ignore seed/size args and derive a single-depth ROI from corr_points")
 	g.add_argument("--corr-point-roi-init-margin", type=int, default=80,
@@ -99,7 +96,6 @@ def from_args(args: argparse.Namespace) -> DataConfig:
 		winding_volume=winding_volume,
 		cuda_gridsample=bool(int(getattr(args, "cuda_gridsample", 1))),
 		erode_valid_mask=int(getattr(args, "erode_valid_mask", 0)),
-		sparse_prefetch_backend=str(getattr(args, "sparse_prefetch_backend", "tensorstore")),
 		corr_point_roi=bool(getattr(args, "corr_point_roi", False)),
 		corr_point_roi_init_margin=int(getattr(args, "corr_point_roi_init_margin", 80)),
 		corr_point_roi_output_radius=int(getattr(args, "corr_point_roi_output_radius", 20)),
@@ -110,5 +106,4 @@ def load_fit_data(cfg: DataConfig) -> fit_data.FitData3D:
 	return fit_data.load_3d_streaming(
 		path=cfg.input,
 		device=torch.device(cfg.device),
-		sparse_prefetch_backend=cfg.sparse_prefetch_backend,
 	)

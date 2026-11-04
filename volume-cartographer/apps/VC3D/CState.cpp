@@ -2,8 +2,9 @@
 #include <vc_object_store/Uuid.hpp>
 #include "PointCollectionSync.hpp"
 
-#include "OpenDataManifest.hpp"
+#include "OpenDataResourceSelection.hpp"
 #include "VCSettings.hpp"
+#include "OpenedVolumes.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -28,7 +29,7 @@ namespace {
 
 std::shared_ptr<const vcr::catalog::RegistrationGraph> catalogTransformSnapshot()
 {
-    const auto catalog=vc3d::opendata::cachedCatalog();
+    const auto catalog=vcr::catalog::cachedManifest(vcr::catalog::catalogCacheFile(std::string(vcr::catalog::kDefaultManifestUrl)));
     if(!catalog)return {};
     auto graph=std::make_shared<vcr::catalog::RegistrationGraph>();
     graph->addCatalog(*catalog);
@@ -85,7 +86,8 @@ std::optional<SurfaceFocusPoint> focusPointAtGrid(QuadSurface& surface, int row,
     if (!surface.isQuadValid(row, col)) {
         return std::nullopt;
     }
-    const cv::Vec3f normal = surface.gridNormal(row, col);
+    cv::Vec3f normal;
+    surface.pointAt(float(col), float(row), nullptr, normal.val);
     if (!std::isfinite(normal[0]) || !std::isfinite(normal[1]) || !std::isfinite(normal[2])) {
         return std::nullopt;
     }
@@ -221,13 +223,24 @@ std::unique_ptr<POI> createSegmentationFocusPoi(CState* state, QuadSurface& surf
 
 } // namespace
 
-CState::CState(QObject* parent, bool debugDownloadQueue, CState* objectStoreOwner)
+CState::CState(QObject* parent, CState* objectStoreOwner, std::size_t cacheBytes)
     : QObject(parent)
-    , _debugDownloadQueue(debugDownloadQueue)
 {
     _objectStoreOwner = objectStoreOwner;
     _objectStoreSession = objectStoreOwner ? objectStoreOwner->objectStoreSession()
                                           : std::make_shared<vc::objects::ObjectStoreSession>();
+    if (objectStoreOwner) {
+        _openedVolumes = objectStoreOwner->_openedVolumes;
+    } else {
+        using namespace vc3d::settings;
+        const QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+        const auto gib = settings.value(perf::RAM_CACHE_SIZE_GB, perf::RAM_CACHE_SIZE_GB_DEFAULT).toULongLong();
+        const auto gpuGib = settings.value(perf::RENDER_CUDA, perf::RENDER_CUDA_DEFAULT).toBool()
+            ? settings.value(perf::RENDER_GPU_CACHE_GB, perf::RENDER_GPU_CACHE_GB_DEFAULT).toULongLong()
+            : 0;
+        _openedVolumes = std::make_shared<OpenedVolumes>(cacheBytes ? cacheBytes : std::size_t(gib) << 30,
+                                                         std::size_t(gpuGib) << 30);
+    }
     // Open Data surfaces are fetched from the catalog on the first read reaching them.
     if (!objectStoreOwner)
         _objectStoreSession->setGeometryFetcher(vc::objects::kCatalogMetaKey, vc::objects::fetchCatalogSurface);

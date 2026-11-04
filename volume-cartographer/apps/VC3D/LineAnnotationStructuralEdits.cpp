@@ -54,14 +54,14 @@ int MergePlan::farRemap(int index) const
 
 std::optional<MergePlan> planFiberMerge(const StoredFiber& clicked,
                                         int clickedIndex,
-                                        const StoredFiber& far,
+                                        const StoredFiber& farFiber,
                                         int candidateIndex,
                                         FiberOptimizationMode mode,
                                         const NewFiberIdentity& identity,
                                         std::string* error)
 {
     const std::size_t clickedCount = clicked.controlPoints.size();
-    const std::size_t farCount = far.controlPoints.size();
+    const std::size_t farCount = farFiber.controlPoints.size();
     if (clickedIndex < 0 || static_cast<std::size_t>(clickedIndex) >= clickedCount ||
         candidateIndex < 0 || static_cast<std::size_t>(candidateIndex) >= farCount) {
         fail(error, "Could not resolve the merge control points.");
@@ -86,10 +86,10 @@ std::optional<MergePlan> planFiberMerge(const StoredFiber& clicked,
                branch.branchControlPointIndex == otherIdx;
     };
     for (const auto& branch : clicked.branches) {
-        if (!branchReferencesFiber(branch, far.id)) {
+        if (!branchReferencesFiber(branch, farFiber.id)) {
             continue;
         }
-        if (!isPairLink(branch, far.id, clickedIndex, candidateIndex)) {
+        if (!isPairLink(branch, farFiber.id, clickedIndex, candidateIndex)) {
             fail(error, "These fibers are linked elsewhere; unlink first.");
             return std::nullopt;
         }
@@ -99,7 +99,7 @@ std::optional<MergePlan> planFiberMerge(const StoredFiber& clicked,
             return std::nullopt;
         }
     }
-    for (const auto& branch : far.branches) {
+    for (const auto& branch : farFiber.branches) {
         if (!branchReferencesFiber(branch, clicked.id)) {
             continue;
         }
@@ -116,14 +116,14 @@ std::optional<MergePlan> planFiberMerge(const StoredFiber& clicked,
     try {
         using namespace vc::objects;
         const auto a = geometryCoordinates(clicked.coordinateIdentity.value("coordinates", nlohmann::json::object()));
-        const auto b = geometryCoordinates(far.coordinateIdentity.value("coordinates", nlohmann::json::object()));
+        const auto b = geometryCoordinates(farFiber.coordinateIdentity.value("coordinates", nlohmann::json::object()));
         // Advisory bindings (volume labels, dimensions) do not define a frame.
         if (a != b) throw std::invalid_argument("different coordinate frames");
         // Both must be in the same voxels too: the merged fiber's positions are
         // mapped back to the stored frame through the clicked fiber's frame.
-        const bool sameView = clicked.frame.has_value() == far.frame.has_value() &&
-            (!clicked.frame || (clicked.frame->volume == far.frame->volume &&
-                                clicked.frame->storedToVolume == far.frame->storedToVolume));
+        const bool sameView = clicked.frame.has_value() == farFiber.frame.has_value() &&
+            (!clicked.frame || (clicked.frame->volume == farFiber.frame->volume &&
+                                clicked.frame->storedToVolume == farFiber.frame->storedToVolume));
         if (!sameView) throw std::invalid_argument("different coordinate frames");
         (void)mergeGeometryCoordinates(a, b); // Also check exact mixed integer/float scales.
     } catch (const std::exception&) {
@@ -146,9 +146,9 @@ std::optional<MergePlan> planFiberMerge(const StoredFiber& clicked,
         std::reverse(clickedLine.begin(), clickedLine.end());
     }
     std::vector<StoredControlPoint> farControls =
-        plan.reverseCandidate ? reversedStoredControlPoints(far.controlPoints)
-                              : far.controlPoints;
-    std::vector<cv::Vec3d> farLine = far.linePoints;
+        plan.reverseCandidate ? reversedStoredControlPoints(farFiber.controlPoints)
+                              : farFiber.controlPoints;
+    std::vector<cv::Vec3d> farLine = farFiber.linePoints;
     if (plan.reverseCandidate) {
         std::reverse(farLine.begin(), farLine.end());
     }
@@ -172,8 +172,8 @@ std::optional<MergePlan> planFiberMerge(const StoredFiber& clicked,
     StoredFiber& merged = plan.merged;
     applyIdentity(merged, identity);
     // A merged fiber has one width: prefer the clicked fiber's annotation.
-    merged.width = clicked.width > 0 ? clicked.width : far.width;
-    merged.widthGapFraction = clicked.width > 0 ? clicked.widthGapFraction : far.widthGapFraction;
+    merged.width = clicked.width > 0 ? clicked.width : farFiber.width;
+    merged.widthGapFraction = clicked.width > 0 ? clicked.widthGapFraction : farFiber.widthGapFraction;
     merged.controlPoints = std::move(geometry->controlPoints);
     merged.linePoints = std::move(geometry->linePoints);
     plan.joinControlIndex = geometry->joinControlIndex;
@@ -181,14 +181,14 @@ std::optional<MergePlan> planFiberMerge(const StoredFiber& clicked,
     // carries the gap tag and its cubic-spline goal like any other
     // structural edit.
     applyGapSpanPolicy(merged.controlPoints);
-    merged.modelOnly = clicked.modelOnly || far.modelOnly;
+    merged.modelOnly = clicked.modelOnly || farFiber.modelOnly;
     merged.optimizationMode = merged.modelOnly ? FiberOptimizationMode::NativeFiberTrace3d : mode;
     merged.manualHvTag =
-        clicked.manualHvTag == far.manualHvTag ? clicked.manualHvTag : std::string{};
+        clicked.manualHvTag == farFiber.manualHvTag ? clicked.manualHvTag : std::string{};
     for (const auto& tag : clicked.tags) {
         addUniqueSorted(merged.tags, tag);
     }
-    for (const auto& tag : far.tags) {
+    for (const auto& tag : farFiber.tags) {
         addUniqueSorted(merged.tags, tag);
     }
     // The join span has no real geometry until the merged line is re-fit.
@@ -202,14 +202,14 @@ std::optional<MergePlan> planFiberMerge(const StoredFiber& clicked,
     // left as stored; the batch canonicalization recomputes them from the
     // merged line (the incident: a copied direction on a reversed line).
     for (const auto& branch : clicked.branches) {
-        if (branchReferencesFiber(branch, far.id) || branch.controlPointIndex < 0) {
+        if (branchReferencesFiber(branch, farFiber.id) || branch.controlPointIndex < 0) {
             continue;
         }
         FiberBranchRef moved = branch;
         moved.controlPointIndex = plan.clickedRemap(branch.controlPointIndex);
         merged.branches.push_back(std::move(moved));
     }
-    for (const auto& branch : far.branches) {
+    for (const auto& branch : farFiber.branches) {
         if (branchReferencesFiber(branch, clicked.id) ||
             branch.controlPointIndex < 0) {
             continue;

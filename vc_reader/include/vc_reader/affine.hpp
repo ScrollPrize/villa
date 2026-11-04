@@ -7,6 +7,7 @@
 #include <optional>
 #include <span>
 #include <stdexcept>
+#include <string>
 #include <nlohmann/json.hpp>
 
 namespace vcr::catalog {
@@ -20,6 +21,13 @@ struct Affine {
     static Affine scale(double factor) {
         if (!std::isfinite(factor) || factor <= 0) throw std::invalid_argument("scale must be finite and positive");
         Affine a; a(0,0)=a(1,1)=a(2,2)=factor; return a;
+    }
+    // Voxels of a pyramid level `factor` times coarser than a reference, block-reduced from
+    // it (as Open Data 2x2x2-mean pyramids are): voxel i is centred at factor * i + (factor - 1) / 2.
+    static Affine blockReduced(double factor) {
+        Affine a=scale(factor);
+        for(int r=0;r<3;++r)a(r,3)=(factor-1)/2;
+        return a;
     }
     std::array<double,3> apply(const std::array<double,3>& p, bool vector=false) const {
         std::array<double,3> q{};
@@ -50,7 +58,7 @@ struct Affine {
         for(double v:out.values)if(!std::isfinite(v))throw std::invalid_argument("affine inverse is not representable");
         return out;
     }
-    static Affine fromJson(const nlohmann::json& rows) {
+    static Affine fromJson(const nlohmann::json& rows, bool allowSingular=false) {
         if(!rows.is_array() || (rows.size()!=3 && rows.size()!=4)) throw std::invalid_argument("expected 3x4 or 4x4 affine");
         Affine a;
         for(size_t r=0;r<rows.size();++r) {
@@ -60,18 +68,23 @@ struct Affine {
                 a(r,c)=rows[r][c].get<double>();
             }
         }
-        (void)a.inverse();return a;
+        if (allowSingular) {
+            for(double v:a.values)if(!std::isfinite(v))throw std::invalid_argument("nonfinite affine");
+            if(a.values[12]!=0 || a.values[13]!=0 || a.values[14]!=0 || a.values[15]!=1)
+                throw std::invalid_argument("expected affine homogeneous row");
+        } else (void)a.inverse();
+        return a;
     }
     // A transform.json: {"transformation_matrix": 3x4 or 4x4 rows}.
-    static Affine fromTransformJson(const nlohmann::json& json) {
+    static Affine fromTransformJson(const nlohmann::json& json, bool allowSingular=false) {
         if(!json.is_object() || !json.contains("transformation_matrix"))
             throw std::invalid_argument("transform.json is missing transformation_matrix");
-        return fromJson(json.at("transformation_matrix"));
+        return fromJson(json.at("transformation_matrix"),allowSingular);
     }
-    static Affine loadTransformJson(const std::filesystem::path& path) {
+    static Affine loadTransformJson(const std::filesystem::path& path, bool allowSingular=false) {
         std::ifstream in(path);
         if(!in) throw std::invalid_argument("cannot open transform file: " + path.string());
-        try { return fromTransformJson(nlohmann::json::parse(in)); }
+        try { return fromTransformJson(nlohmann::json::parse(in),allowSingular); }
         catch(const std::exception& e) { throw std::invalid_argument(path.string() + ": " + e.what()); }
     }
     // Of the linear part.
@@ -137,5 +150,11 @@ private:
         const double s=1./n;
         return {v[0]*s,v[1]*s,v[2]*s};
     }
+};
+// An affine with the derivation path a catalog publishes for it (empty when it has none).
+struct VolumeTransform {
+    Affine forward;
+    std::string derivationPath;
+    bool operator==(const VolumeTransform&) const = default;
 };
 }

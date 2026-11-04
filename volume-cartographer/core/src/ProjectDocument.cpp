@@ -1,5 +1,5 @@
 #include "vc/core/types/ProjectDocument.hpp"
-#include "vc/core/util/AtomicFile.hpp"
+#include <vc_reader/zarr.hpp>
 #include <vc_object_store/Uuid.hpp>
 #include <algorithm>
 #include <cctype>
@@ -18,7 +18,13 @@ void checkExtension(const std::filesystem::path& path) {
 }
 bool hasWritePermission(const std::filesystem::path& path) {
     std::error_code error;
-    const auto permissions = std::filesystem::status(path, error).permissions();
+    const auto status = std::filesystem::status(path, error);
+#if defined(_WIN32)
+    // Windows ignores the read-only attribute on folders but sets it on
+    // customized ones such as Downloads, so it does not mean unwritable.
+    if (!error && std::filesystem::is_directory(status)) return true;
+#endif
+    const auto permissions = status.permissions();
     using P = std::filesystem::perms;
     return !error && (permissions & (P::owner_write | P::group_write | P::others_write)) != P::none;
 }
@@ -96,7 +102,7 @@ void ProjectDocument::replace(nlohmann::json data) {
     validate(data);
     if (data == data_) return;
     if (!writable()) throw std::runtime_error("Project is read-only: " + path_.string());
-    vc::core::util::atomicWriteString(path_, data.dump(2) + "\n");
+    vcr::zarr::atomicWrite(path_, data.dump(2) + "\n", vcr::zarr::Durability::Fsync);
     data_ = std::move(data);
 }
 std::filesystem::path ProjectDocument::resolve(const std::string& location) const {

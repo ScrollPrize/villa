@@ -8,10 +8,14 @@ import multiprocessing
 from pathlib import Path
 import pickle
 import unittest
+import zlib
 
 import numpy as np
 
 from test_source_storage import FixtureCase, RemoteFixtureCase, process_read
+from build_support import load_build
+load_build()
+
 from vc_reader import Affine, Encoding, Selection, Source, Storage, VolumeRegistration, CacheMissError
 from vc_reader.reader import ZarrReader, ZarrGroup
 from vc_reader.reader.zarr_meta import ArrayMeta
@@ -209,6 +213,32 @@ class V3RemoteTests(RemoteFixtureCase):
             (path/'zarr.json').write_text(json.dumps(dict(metadata, **change)))
             with self.assertRaisesRegex(ValueError, 'holds a different array'):
                 ZarrReader.open(url, cache_dir=self.cache)
+
+    def test_cache_from_another_tool_serves_any_readable_codec(self):
+        data = np.arange(8, dtype='u1').reshape(2, 2, 2)
+        path = self.root/'foreign'
+        path.mkdir()
+        zarray = dict(zarr_format=2, shape=[2, 2, 4], chunks=[2, 2, 2], dtype='|u1', fill_value=0,
+            compressor=None, filters=None, order='C', dimension_separator='/')
+        (path/'.zarray').write_text(json.dumps(zarray))
+        for key, chunk in (('0/0/0', data), ('0/0/1', data+100)):
+            (path/key).parent.mkdir(parents=True, exist_ok=True)
+            (path/key).write_bytes(chunk.tobytes())
+        from vc_reader.reader.disk_cache import decoded_cache_path
+        url = self.url+'/foreign'
+        cache = Path(decoded_cache_path(self.cache, url))
+        (cache/'0/0').mkdir(parents=True)
+        (cache/'.zarray').write_text(json.dumps(dict(zarray, compressor=dict(id='zlib', level=1))))
+        (cache/'.zattrs').write_text(json.dumps(dict(remote_url=url, level=0)))
+        (cache/'0/0/0').write_bytes(zlib.compress((data+50).tobytes()))
+        with ZarrReader.open(url, cache_dir=self.cache) as reader:
+            np.testing.assert_array_equal(reader[:, :, :2], data+50)  # the cache served it
+            np.testing.assert_array_equal(reader[:, :, 2:], data+100)  # fetched, not cached as raw bytes
+        self.assertFalse((cache/'0/0/1').exists())
+        # A codec vc_reader cannot read is still refused.
+        (cache/'.zarray').write_text(json.dumps(dict(zarray, compressor=dict(id='no-such-codec'))))
+        with self.assertRaisesRegex(ValueError, 'holds a different array'):
+            ZarrReader.open(url, cache_dir=self.cache)
 
     def test_rejected_ranges_and_changed_shards(self):
         write_v3(self.root/'v3')

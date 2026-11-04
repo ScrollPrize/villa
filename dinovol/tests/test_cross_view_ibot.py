@@ -6,27 +6,24 @@ import unittest
 
 import numpy as np
 import torch
+from vc_reader import transforms as A
+from dinovol_2.dataset.training_transforms import ViewAugmentation
+SPATIAL = [A.Rotate90(), A.Flip(axes="zyx"), A.Transpose()]
+def spatial_only():
+    image = A.Image(valid=None)
+    return ViewAugmentation(
+        full=A.Pipeline(SPATIAL, targets={"image": image, "keypoints": A.Points(order="zyx", outside="keep")}),
+        geometry=A.Pipeline(SPATIAL, targets={"image": image}),
+    )
+def names_of(pipeline):
+    return [repr(t).split("(")[0] for t in pipeline.transforms]
 from scipy import ndimage as ndi
 
-from dinovol_2.augmentation.pipelines.training_transforms import create_training_transforms
-from dinovol_2.augmentation.transforms.spatial.mirroring import MirrorTransform
-from dinovol_2.augmentation.transforms.spatial.rot90 import Rot90Transform
-from dinovol_2.augmentation.transforms.spatial.transpose import TransposeAxesTransform
-from dinovol_2.augmentation.transforms.utils.compose import ComposeTransforms
+from dinovol_2.dataset.training_transforms import create_training_transforms
 from dinovol_2.dataset.ssl_zarr_dataset import SampledCropRegion, SSLZarrDataset
 from dinovol_2.model.model import DinoVitStudentTeacher
 from dinovol_2.pretrain import DinoIBOTPretrainer
 import tests.test_object_points as object_point_tests
-
-
-def _flatten(transform):
-    inner = getattr(transform, "transform", None)
-    if inner is not None:
-        return _flatten(inner)
-    children = getattr(transform, "list_of_transforms", None) or getattr(transform, "transforms", None)
-    if children:
-        return [leaf for child in children for leaf in _flatten(child)]
-    return [transform]
 
 
 class CrossViewTokenTargetTests(unittest.TestCase):
@@ -67,11 +64,7 @@ class CrossViewTokenTargetTests(unittest.TestCase):
         self.assertGreater(matched, 0)
 
     def test_targets_follow_crops_rotations_flips_and_transposes(self):
-        spatial = ComposeTransforms([
-            Rot90Transform(allowed_axes={0, 1, 2}),
-            MirrorTransform(allowed_axes=(0, 1, 2)),
-            TransposeAxesTransform(allowed_axes={0, 1, 2}),
-        ])
+        spatial = spatial_only()
         for overrides in ({}, {"object_points": {
             "enabled": True, "points_per_sample": 96, "max_labeled_points": 48,
             "points_per_object": 6, "max_objects": 12, "slab_thickness": 8,
@@ -119,22 +112,19 @@ class AugmentationTests(unittest.TestCase):
         self.tempdir.cleanup()
 
     def test_full_preset_has_every_family_and_artifacts_before_reorientation(self):
-        leaves = _flatten(create_training_transforms((32, 32, 32), gaussian_blur=True))
-        names = [type(leaf).__name__ for leaf in leaves]
+        augmentation = create_training_transforms((32, 32, 32), gaussian_blur=True)
+        names = names_of(augmentation.full)
         for expected in (
-            "GaussianBlurTransform", "GaussianNoiseTransform", "SharpeningTransform", "ContrastTransform",
-            "MultiplicativeBrightnessTransform", "BrightnessAdditiveTransform", "SimulateLowResolutionTransform",
-            "GammaTransform", "InvertImageTransform", "SmearTransform", "InhomogeneousSliceIlluminationTransform",
-            "BrightnessGradientAdditiveTransform", "LocalGammaTransform",
-            "Rot90Transform", "MirrorTransform", "TransposeAxesTransform",
+            "GaussianBlur", "GaussianNoise", "Sharpen", "OneOf", "BrightnessAdd", "LowResolution",
+            "Smear", "SliceIllumination", "BrightnessGradient", "LocalGamma", "Rotate90", "Flip", "Transpose",
         ):
             self.assertIn(expected, names)
-        first_reorientation = min(names.index(n) for n in ("Rot90Transform", "MirrorTransform", "TransposeAxesTransform"))
-        self.assertLess(names.index("SmearTransform"), first_reorientation)
-        self.assertLess(names.index("InhomogeneousSliceIlluminationTransform"), first_reorientation)
-        for leaf in leaves:
-            if isinstance(leaf, (Rot90Transform, TransposeAxesTransform)):
-                self.assertEqual(set(leaf.allowed_axes), {0, 1, 2})
+        text = repr(augmentation.full.transforms)
+        for expected in ("Contrast", "BrightnessMultiply", "Gamma", "Invert"):
+            self.assertIn(expected, text)
+        first_reorientation = min(names.index(n) for n in ("Rotate90", "Flip", "Transpose"))
+        self.assertLess(names.index("Smear"), first_reorientation)
+        self.assertLess(names.index("SliceIllumination"), first_reorientation)
 
     def test_each_global_crop_gets_its_own_augmentation(self):
         config = {

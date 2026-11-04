@@ -14,10 +14,10 @@ template<class T, class Function, class Field> __device__ void pointwise_kernel(
 struct pointwise_kernel_launch {
     template<class... Args> __device__ void operator()(KernelIndex index, Args... args) const { pointwise_kernel(index,args...); }
 };
-template<class T, class Function> void pointwise(View<T> data, const Grid& grid, const ChannelPlan& c, Function fn, bool needs_stats = false, bool weighted = false) {
+template<class T, class Function> void pointwise(View<T> data, const Grid& grid, const ChannelPlan& c, Function fn, bool needs_stats = false, bool weighted = false, const std::uint8_t* valid = nullptr) {
     auto field = field_buffer(c.field,c.device_field);
     if (needs_stats) {
-        auto stats = statistics(data,false,weighted ? field->ptr : nullptr);
+        auto stats = statistics(data,false,weighted ? field->ptr : nullptr,valid);
         launch(blocks(data.size),256,0,vcr::device::stream(), pointwise_kernel_launch{}, data,Layout(grid),field->ptr,stats.ptr,fn);
     } else launch(blocks(data.size),256,0,vcr::device::stream(), pointwise_kernel_launch{}, data,Layout(grid),field->ptr,nullptr,fn);
     check(cudaGetLastError());

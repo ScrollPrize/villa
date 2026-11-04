@@ -5,7 +5,7 @@
 // with the same role (data on the surface, never graph links).
 #include <vc_object_store/objects/GeometryCoordinates.hpp>
 #include <vc_object_store/store/GeometryViews.hpp>
-#include "utils/Json.hpp"
+#include <nlohmann/json.hpp>
 #include <vc_object_store/objects/ObjectStoreSession.hpp>
 #include <cstdint>
 #include <array>
@@ -19,7 +19,7 @@ namespace vc3d::corrections {
 // The surface's corrections, as collection JSON by VC collection id, with
 // points read through `view` (the surface's) when given. Throws when a
 // collection has no mapping to the view's volume.
-std::map<uint64_t, utils::Json> read(vc::objects::ObjectStoreSession& session,
+std::map<uint64_t, nlohmann::json> read(vc::objects::ObjectStoreSession& session,
                                      const vc::objects::AttachmentIdentity& attachment,
                                      const std::string& surfaceUuid,
                                      const std::optional<vc::objects::ViewFrame>& view = std::nullopt);
@@ -29,7 +29,7 @@ std::map<uint64_t, utils::Json> read(vc::objects::ObjectStoreSession& session,
 // back through `view` to each collection's stored frame), and dropped ones are
 // retired. One checked action.
 void write(vc::objects::ObjectStoreSession& session, const vc::objects::AttachmentIdentity& attachment,
-           const std::string& surfaceUuid, const std::map<uint64_t, utils::Json>& collections,
+           const std::string& surfaceUuid, const std::map<uint64_t, nlohmann::json>& collections,
            const vc::objects::VolumeVoxels& volume,
            const std::optional<vc::objects::ViewFrame>& view = std::nullopt);
 

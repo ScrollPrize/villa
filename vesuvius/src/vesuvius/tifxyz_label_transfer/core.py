@@ -30,7 +30,9 @@ import numpy as np
 from numpy.typing import NDArray
 from scipy.spatial import cKDTree
 
-from vesuvius.tifxyz_canvas import full_resolution_extent
+from vc_reader.tifxyz import full_extent
+from vc_reader.resident import sample_field_tile as bilinear_field_tile
+import vc_reader.transforms as A
 
 
 FloatArray = NDArray[np.floating]
@@ -106,6 +108,35 @@ def _run_ordered(process, items, worker_count, on_result=None):
                 on_result(result)
 
 
+def close_memmap(array: object) -> None:
+    """Release the file mapping behind ``array``, if it has one.
+
+    POSIX lets a mapped file be unlinked or replaced while the mapping is live;
+    Windows refuses with a sharing violation (``WinError 32``), so a mapping
+    that is still open when its backing file, or an enclosing temporary
+    directory, is removed makes the removal fail. Dropping the last reference
+    is not enough: the mapping closes at an unspecified garbage collection, not
+    deterministically, so the file stays locked in the meantime.
+
+    ``array`` may be a ``numpy.memmap`` or a plain array that views one:
+    ``numpy.asarray`` on a memmap strips the subclass but keeps the mapping
+    reachable through ``base``. The underlying mapping is found along the
+    ``base`` chain and closed. Closing it is shared state, so pass an array
+    whose mapping nothing else still needs; an owned array has no mapping and
+    is ignored.
+    """
+    seen: set[int] = set()
+    obj = array
+    while obj is not None and id(obj) not in seen:
+        seen.add(id(obj))
+        mapping = getattr(obj, "_mmap", None)
+        if mapping is not None:
+            if not mapping.closed:
+                mapping.close()
+            return
+        obj = getattr(obj, "base", None)
+
+
 @dataclass
 class Surface:
     """A stored-resolution TIFXYZ coordinate grid."""
@@ -116,6 +147,23 @@ class Surface:
     scale_yx: Tuple[float, float] = (1.0, 1.0)
     valid: Optional[BoolArray] = None
     name: str = ""
+
+    def close(self) -> None:
+        """Release any file mappings behind the coordinate grids.
+
+        ``load_surface`` may hand back ``x``/``y``/``z`` as live memory maps of
+        the stored ``x/y/z.tif`` grids. On Windows those mappings block removal
+        of the surface directory until they are closed, so a caller that is done
+        with the surface closes it. Harmless when the grids are owned arrays.
+        """
+        for grid in (self.x, self.y, self.z):
+            close_memmap(grid)
+
+    def __enter__(self) -> "Surface":
+        return self
+
+    def __exit__(self, exc_type, exc, traceback) -> None:
+        self.close()
 
     def __post_init__(self) -> None:
         if self.x.ndim != 2 or self.y.ndim != 2 or self.z.ndim != 2:
@@ -161,12 +209,7 @@ class Surface:
     def full_resolution_shape(self) -> Tuple[int, int]:
         height, width = self.shape
         scale_y, scale_x = self.scale_yx
-        # Same definition as vesuvius.tifxyz.Tifxyz.full_resolution_shape:
-        # the canvas vc_render_tifxyz renders (float32 scale, lround).
-        return (
-            full_resolution_extent(height, scale_y),
-            full_resolution_extent(width, scale_x),
-        )
+        return full_extent(height, scale_y), full_extent(width, scale_x)
 
 
 @dataclass(frozen=True)
@@ -463,8 +506,8 @@ def infer_output_shape(
     # a small scale change that forces downstream resampling.
     native_candidates = (
         (
-            full_resolution_extent(target_height, target_scale_y),
-            full_resolution_extent(target_width, target_scale_x),
+            full_extent(target_height, target_scale_y),
+            full_extent(target_width, target_scale_x),
         ),
         (target_height, target_width),
     )
@@ -1170,111 +1213,6 @@ def iter_tiles(
             yield row_start, row_end, col_start, col_end
 
 
-def bilinear_field_tile(
-    field: FloatArray,
-    valid: BoolArray,
-    output_shape: Tuple[int, int],
-    row_start: int,
-    row_end: int,
-    col_start: int,
-    col_end: int,
-) -> Tuple[NDArray[np.float64], BoolArray]:
-    """Interpolate one stored-grid field at output pixel centres."""
-
-    source_height, source_width = field.shape
-    output_height, output_width = output_shape
-    grid_y = (
-        (np.arange(row_start, row_end, dtype=np.float64) + 0.5)
-        * source_height
-        / output_height
-    )
-    grid_x = (
-        (np.arange(col_start, col_end, dtype=np.float64) + 0.5)
-        * source_width
-        / output_width
-    )
-    y0 = np.clip(np.floor(grid_y).astype(np.int64), 0, source_height - 1)
-    x0 = np.clip(np.floor(grid_x).astype(np.int64), 0, source_width - 1)
-    y1 = np.minimum(y0 + 1, source_height - 1)
-    x1 = np.minimum(x0 + 1, source_width - 1)
-    wy = (grid_y - y0)[:, None]
-    wx = (grid_x - x0)[None, :]
-
-    v00 = valid[y0[:, None], x0[None, :]]
-    v01 = valid[y0[:, None], x1[None, :]]
-    v10 = valid[y1[:, None], x0[None, :]]
-    v11 = valid[y1[:, None], x1[None, :]]
-    interpolated_valid = v00 & v01 & v10 & v11
-    f00 = np.where(v00, field[y0[:, None], x0[None, :]], 0.0)
-    f01 = np.where(v01, field[y0[:, None], x1[None, :]], 0.0)
-    f10 = np.where(v10, field[y1[:, None], x0[None, :]], 0.0)
-    f11 = np.where(v11, field[y1[:, None], x1[None, :]], 0.0)
-    top = f00 * (1.0 - wx) + f01 * wx
-    bottom = f10 * (1.0 - wx) + f11 * wx
-    result = top * (1.0 - wy) + bottom * wy
-    interpolated_valid &= np.isfinite(result)
-    return result, interpolated_valid
-
-
-def _sample_mapper_surface_xyz(
-    mapper: SurfaceMapper,
-    rows: NDArray[np.float64],
-    cols: NDArray[np.float64],
-    valid: BoolArray,
-) -> Tuple[NDArray[np.float64], BoolArray]:
-    """Sample transformed source XYZ using the mapper's triangle split."""
-
-    source_height, source_width = mapper.source.shape
-    finite = valid & np.isfinite(rows) & np.isfinite(cols)
-    in_bounds = (
-        finite
-        & (rows >= 0.0)
-        & (rows <= source_height - 1)
-        & (cols >= 0.0)
-        & (cols <= source_width - 1)
-    )
-    safe_rows = np.clip(np.where(in_bounds, rows, 0.0), 0, source_height - 1)
-    safe_cols = np.clip(np.where(in_bounds, cols, 0.0), 0, source_width - 1)
-    row0 = np.minimum(
-        np.floor(safe_rows).astype(np.int64), source_height - 2
-    )
-    col0 = np.minimum(
-        np.floor(safe_cols).astype(np.int64), source_width - 2
-    )
-    row_fraction = safe_rows - row0
-    col_fraction = safe_cols - col0
-
-    assert mapper.source.valid is not None
-    quad_valid = (
-        in_bounds
-        & mapper.source.valid[row0, col0]
-        & mapper.source.valid[row0, col0 + 1]
-        & mapper.source.valid[row0 + 1, col0]
-        & mapper.source.valid[row0 + 1, col0 + 1]
-    )
-    xyz = np.full((*rows.shape, 3), np.nan, dtype=np.float64)
-    for coordinate, field in enumerate((mapper.tx, mapper.ty, mapper.tz)):
-        p00 = field[row0, col0]
-        p10 = field[row0, col0 + 1]
-        p01 = field[row0 + 1, col0]
-        p11 = field[row0 + 1, col0 + 1]
-        first_triangle = row_fraction + col_fraction <= 1.0
-        first_value = (
-            p00
-            + col_fraction * (p10 - p00)
-            + row_fraction * (p01 - p00)
-        )
-        second_value = (
-            (1.0 - row_fraction) * p10
-            + (row_fraction + col_fraction - 1.0) * p11
-            + (1.0 - col_fraction) * p01
-        )
-        xyz[..., coordinate] = np.where(
-            first_triangle, first_value, second_value
-        )
-    sampled_valid = quad_valid & np.all(np.isfinite(xyz), axis=-1)
-    return xyz, sampled_valid
-
 
 def _fill_uv_field(
     rows: NDArray[np.float32],
@@ -1295,8 +1233,6 @@ def _fill_uv_field(
     measured vertices in grid cells. Callers use distances to limit filling.
     """
 
-    import scipy.ndimage
-
     valid = np.asarray(valid, dtype=bool)
     if not valid.any():
         raise ValueError("cannot fill a UV field with no valid vertices")
@@ -1310,10 +1246,10 @@ def _fill_uv_field(
             fill_mask,
             np.zeros(valid.shape, dtype=np.float64),
         )
-    anchor_distance, nearest = scipy.ndimage.distance_transform_edt(
-        fill_mask, return_distances=True, return_indices=True
-    )
-    anchor_distance = np.asarray(anchor_distance, dtype=np.float64)
+    # Nearest valid vertex of every grid cell, and its distance.
+    nearest_valid = A.DistanceTransform(mode="outside", indices="_nearest", implicit_background=True)({"mask": valid[None]})
+    anchor_distance = np.asarray(nearest_valid["mask_sdt"][0], dtype=np.float64)
+    nearest = nearest_valid["mask_nearest"]
     filled_rows = filled_rows[tuple(nearest)]
     filled_cols = filled_cols[tuple(nearest)]
     for _ in range(max(0, smoothing_iterations)):
@@ -1347,8 +1283,6 @@ def _content_anchor_distance(
     so this distance cannot distinguish seam gaps from mesh mismatch.
     """
 
-    import scipy.ndimage
-
     valid = np.asarray(valid, dtype=bool)
     source_height, source_width = source_shape
     label_height, label_width = label_shape
@@ -1381,7 +1315,8 @@ def _content_anchor_distance(
     if not anchor.any():
         return np.full(valid.shape, np.inf, dtype=np.float64)
     return np.asarray(
-        scipy.ndimage.distance_transform_edt(~anchor), dtype=np.float64
+        A.DistanceTransform(mode="outside", implicit_background=True)(anchor[None])[0],
+        dtype=np.float64,
     )
 
 
@@ -1448,7 +1383,7 @@ def transfer_array(
 
     With ``materialize_output=False``, ``tile_callback`` receives
     ``(bounds, labels, validity)`` in row-major order without full output arrays.
-    ``rasterizer="auto"`` uses a compatible native kernel or falls back to NumPy.
+    ``rasterizer="auto"`` uses vc_reader with prepared surface geometry.
     """
 
     label = np.asarray(source_label)
@@ -1628,7 +1563,6 @@ def transfer_array(
 
     filled_uv_rows: Optional[NDArray[np.float64]] = None
     filled_uv_cols: Optional[NDArray[np.float64]] = None
-    filled_uv_valid: Optional[BoolArray] = None
     filled_uv_anchor_distance: Optional[NDArray[np.float64]] = None
     seam_limit = float(max_seam_distance)
     if not seam_limit > 0.0:
@@ -1673,7 +1607,6 @@ def transfer_array(
                 (label_height, label_width),
                 label_offset_yx,
             )
-        filled_uv_valid = np.ones_like(uv_valid)
         if math.isfinite(seam_limit):
             filled_uv_anchor_distance = anchor_distance
         if seam_anchor_distance_output is not None:
@@ -1681,34 +1614,26 @@ def transfer_array(
 
     from .native import NativeRasterizer, resolve_rasterizer
 
-    selected_rasterizer = resolve_rasterizer(rasterizer)
-    native_rasterizer = (
-        None
-        if selected_rasterizer == "python"
-        else NativeRasterizer(
-            target_fields=(target.x, target.y, target.z),
-            target_valid=target.valid,
-            uv_rows=uv_rows,
-            uv_cols=uv_cols,
-            uv_valid=uv_valid,
-            source_fields=(mapper.tx, mapper.ty, mapper.tz),
-            source_valid=mapper.source.valid,
-            label_shape=label.shape,
-            output_shape=resolved_shape,
-            label_offset_yx=label_offset_yx,
-            max_distance=max_distance,
-            filled_uv_rows=filled_uv_rows,
-            filled_uv_cols=filled_uv_cols,
-            filled_uv_anchor_distance=filled_uv_anchor_distance,
-            max_seam_distance=seam_limit,
-            source_validity=source_validity_values,
-        )
+    resolve_rasterizer(rasterizer)
+    native_rasterizer = NativeRasterizer(
+        target_fields=(target.x, target.y, target.z),
+        target_valid=target.valid,
+        uv_rows=uv_rows,
+        uv_cols=uv_cols,
+        uv_valid=uv_valid,
+        source_fields=(mapper.tx, mapper.ty, mapper.tz),
+        source_valid=mapper.source.valid,
+        label_shape=label.shape,
+        output_shape=resolved_shape,
+        label_offset_yx=label_offset_yx,
+        max_distance=max_distance,
+        filled_uv_rows=filled_uv_rows,
+        filled_uv_cols=filled_uv_cols,
+        filled_uv_anchor_distance=filled_uv_anchor_distance,
+        max_seam_distance=seam_limit,
+        source_validity=source_validity_values,
     )
-    native_flat_labels = (
-        None
-        if native_rasterizer is None
-        else [current_label.ravel() for current_label in all_labels]
-    )
+    native_flat_labels = [current_label.ravel() for current_label in all_labels]
 
     def process_tile(
         tile: Tuple[int, int, int, int],
@@ -1724,125 +1649,7 @@ def transfer_array(
         Optional[NDArray[np.uint8]],
     ]:
         row_start, row_end, col_start, col_end = tile
-        if native_rasterizer is not None:
-            native = native_rasterizer.rasterize(tile)
-            tile_shape = row_end - row_start, col_end - col_start
-            if materialize_output:
-                assert output is not None
-                assert valid_output is not None
-                tile_label = output[row_start:row_end, col_start:col_end]
-                tile_labels = [tile_label] + [
-                    item[row_start:row_end, col_start:col_end]
-                    for item in extra_outputs
-                ]
-                tile_valid = valid_output[
-                    row_start:row_end, col_start:col_end
-                ]
-            else:
-                tile_labels = [
-                    np.full(
-                        tile_shape,
-                        np.asarray(
-                            fill_value, dtype=current_label.dtype
-                        ).item(),
-                        dtype=current_label.dtype,
-                    )
-                    for current_label in all_labels
-                ]
-                tile_valid = np.zeros(tile_shape, dtype=np.uint8)
-            tile_valid[...] = native.validity
-            sampled_rows, sampled_cols = np.nonzero(
-                native.source_indices >= 0
-            )
-            sampled_indices = native.source_indices[
-                sampled_rows, sampled_cols
-            ]
-            assert native_flat_labels is not None
-            for flat_label, current_output in zip(
-                native_flat_labels, tile_labels
-            ):
-                current_output[sampled_rows, sampled_cols] = (
-                    flat_label[sampled_indices]
-                )
-            measured = np.isfinite(native.distances)
-            if distance_output is not None:
-                tile_distance = distance_output[
-                    row_start:row_end, col_start:col_end
-                ]
-                tile_distance[measured] = native.distances[measured]
-            return (
-                native.validity.size,
-                native.target_surface_valid,
-                native.distances[measured],
-                native.seam_filled_pixels,
-                native.seam_blocked_pixels,
-                native.inherited_filled_pixels,
-                tile,
-                tile_labels if not materialize_output else None,
-                tile_valid if not materialize_output else None,
-            )
-
-        target_x, target_pixel_valid = bilinear_field_tile(
-            target.x,
-            target.valid,
-            resolved_shape,
-            row_start,
-            row_end,
-            col_start,
-            col_end,
-        )
-        target_y, target_y_valid = bilinear_field_tile(
-            target.y,
-            target.valid,
-            resolved_shape,
-            row_start,
-            row_end,
-            col_start,
-            col_end,
-        )
-        target_z, target_z_valid = bilinear_field_tile(
-            target.z,
-            target.valid,
-            resolved_shape,
-            row_start,
-            row_end,
-            col_start,
-            col_end,
-        )
-        target_pixel_valid &= target_y_valid & target_z_valid
-        mapped_rows, rows_valid = bilinear_field_tile(
-            uv_rows,
-            uv_valid,
-            resolved_shape,
-            row_start,
-            row_end,
-            col_start,
-            col_end,
-        )
-        mapped_cols, cols_valid = bilinear_field_tile(
-            uv_cols,
-            uv_valid,
-            resolved_shape,
-            row_start,
-            row_end,
-            col_start,
-            col_end,
-        )
-        source_xyz, source_xyz_valid = _sample_mapper_surface_xyz(
-            mapper,
-            mapped_rows,
-            mapped_cols,
-            rows_valid & cols_valid,
-        )
-        target_xyz = np.stack((target_x, target_y, target_z), axis=-1)
-        distances = np.linalg.norm(source_xyz - target_xyz, axis=-1)
-        distance_valid = (
-            source_xyz_valid
-            & np.isfinite(distances)
-            & (distances <= max_distance)
-        )
-        accepted = target_pixel_valid & distance_valid
-
+        native = native_rasterizer.rasterize(tile)
         tile_shape = row_end - row_start, col_end - col_start
         if materialize_output:
             assert output is not None
@@ -1852,163 +1659,47 @@ def transfer_array(
                 item[row_start:row_end, col_start:col_end]
                 for item in extra_outputs
             ]
-            tile_valid = valid_output[row_start:row_end, col_start:col_end]
+            tile_valid = valid_output[
+                row_start:row_end, col_start:col_end
+            ]
         else:
             tile_labels = [
                 np.full(
                     tile_shape,
-                    np.asarray(fill_value, dtype=current_label.dtype).item(),
+                    np.asarray(
+                        fill_value, dtype=current_label.dtype
+                    ).item(),
                     dtype=current_label.dtype,
                 )
                 for current_label in all_labels
             ]
             tile_valid = np.zeros(tile_shape, dtype=np.uint8)
-        tile_distance = (
-            None
-            if distance_output is None
-            else distance_output[row_start:row_end, col_start:col_end]
+        tile_valid[...] = native.validity
+        sampled_rows, sampled_cols = np.nonzero(
+            native.source_indices >= 0
         )
-        accepted_rows, accepted_cols = np.nonzero(accepted)
-        inherited_count = 0
-        if accepted_rows.size:
-            label_rows = np.floor(
-                mapped_rows[accepted_rows, accepted_cols]
-                * label_height
-                / source_height
-                - label_offset_yx[0]
-            ).astype(np.int64)
-            label_cols = np.floor(
-                mapped_cols[accepted_rows, accepted_cols]
-                * label_width
-                / source_width
-                - label_offset_yx[1]
-            ).astype(np.int64)
-            in_range = (
-                (label_rows >= 0)
-                & (label_rows < label_height)
-                & (label_cols >= 0)
-                & (label_cols < label_width)
+        sampled_indices = native.source_indices[
+            sampled_rows, sampled_cols
+        ]
+        for flat_label, current_output in zip(
+            native_flat_labels, tile_labels
+        ):
+            current_output[sampled_rows, sampled_cols] = (
+                flat_label[sampled_indices]
             )
-            accepted_rows = accepted_rows[in_range]
-            accepted_cols = accepted_cols[in_range]
-            label_rows = label_rows[in_range]
-            label_cols = label_cols[in_range]
-            if propagated_validity is not None:
-                source_is_valid = propagated_validity[
-                    label_rows, label_cols
-                ]
-                accepted_rows = accepted_rows[source_is_valid]
-                accepted_cols = accepted_cols[source_is_valid]
-                label_rows = label_rows[source_is_valid]
-                label_cols = label_cols[source_is_valid]
-            for current_label, current_output in zip(
-                all_labels, tile_labels
-            ):
-                current_output[accepted_rows, accepted_cols] = current_label[
-                    label_rows, label_cols
-                ]
-            if source_validity_values is not None:
-                sampled_validity = source_validity_values[
-                    label_rows, label_cols
-                ]
-                inherited = sampled_validity == 128
-                tile_valid[accepted_rows, accepted_cols] = np.where(
-                    inherited, np.uint8(128), np.uint8(255)
-                )
-                inherited_count = int(inherited.sum())
-            else:
-                tile_valid[accepted_rows, accepted_cols] = 255
-            if tile_distance is not None:
-                tile_distance[accepted_rows, accepted_cols] = distances[
-                    accepted_rows, accepted_cols
-                ]
-
-        seam_filled_count = 0
-        seam_blocked_count = 0
-        if fill_seams:
-            assert filled_uv_rows is not None
-            assert filled_uv_cols is not None
-            assert filled_uv_valid is not None
-            seam_rows_grid, _ = bilinear_field_tile(
-                filled_uv_rows,
-                filled_uv_valid,
-                resolved_shape,
-                row_start,
-                row_end,
-                col_start,
-                col_end,
-            )
-            seam_cols_grid, _ = bilinear_field_tile(
-                filled_uv_cols,
-                filled_uv_valid,
-                resolved_shape,
-                row_start,
-                row_end,
-                col_start,
-                col_end,
-            )
-            seam_mask = target_pixel_valid & (tile_valid == 0)
-            if filled_uv_anchor_distance is not None:
-                seam_anchor_distance, _ = bilinear_field_tile(
-                    filled_uv_anchor_distance,
-                    filled_uv_valid,
-                    resolved_shape,
-                    row_start,
-                    row_end,
-                    col_start,
-                    col_end,
-                )
-                within_limit = seam_anchor_distance <= seam_limit
-                seam_blocked_count = int((seam_mask & ~within_limit).sum())
-                seam_mask &= within_limit
-            seam_pixel_rows, seam_pixel_cols = np.nonzero(seam_mask)
-            if seam_pixel_rows.size:
-                seam_label_rows = np.floor(
-                    seam_rows_grid[seam_pixel_rows, seam_pixel_cols]
-                    * label_height
-                    / source_height
-                    - label_offset_yx[0]
-                ).astype(np.int64)
-                seam_label_cols = np.floor(
-                    seam_cols_grid[seam_pixel_rows, seam_pixel_cols]
-                    * label_width
-                    / source_width
-                    - label_offset_yx[1]
-                ).astype(np.int64)
-                seam_in_range = (
-                    (seam_label_rows >= 0)
-                    & (seam_label_rows < label_height)
-                    & (seam_label_cols >= 0)
-                    & (seam_label_cols < label_width)
-                )
-                seam_pixel_rows = seam_pixel_rows[seam_in_range]
-                seam_pixel_cols = seam_pixel_cols[seam_in_range]
-                seam_label_rows = seam_label_rows[seam_in_range]
-                seam_label_cols = seam_label_cols[seam_in_range]
-                if propagated_validity is not None:
-                    seam_source_valid = propagated_validity[
-                        seam_label_rows, seam_label_cols
-                    ]
-                    seam_pixel_rows = seam_pixel_rows[seam_source_valid]
-                    seam_pixel_cols = seam_pixel_cols[seam_source_valid]
-                    seam_label_rows = seam_label_rows[seam_source_valid]
-                    seam_label_cols = seam_label_cols[seam_source_valid]
-                for current_label, current_output in zip(
-                    all_labels, tile_labels
-                ):
-                    current_output[
-                        seam_pixel_rows, seam_pixel_cols
-                    ] = current_label[seam_label_rows, seam_label_cols]
-                tile_valid[seam_pixel_rows, seam_pixel_cols] = 128
-                seam_filled_count = int(seam_pixel_rows.size)
-
+        measured = np.isfinite(native.distances)
+        if distance_output is not None:
+            tile_distance = distance_output[
+                row_start:row_end, col_start:col_end
+            ]
+            tile_distance[measured] = native.distances[measured]
         return (
-            target_pixel_valid.size,
-            int(target_pixel_valid.sum()),
-            distances[accepted_rows, accepted_cols],
-            seam_filled_count,
-            seam_blocked_count,
-            inherited_count,
+            native.validity.size,
+            native.target_surface_valid,
+            native.distances[measured],
+            native.seam_filled_pixels,
+            native.seam_blocked_pixels,
+            native.inherited_filled_pixels,
             tile,
             tile_labels if not materialize_output else None,
             tile_valid if not materialize_output else None,

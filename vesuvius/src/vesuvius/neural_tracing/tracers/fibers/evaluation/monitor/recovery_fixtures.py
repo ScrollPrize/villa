@@ -18,7 +18,7 @@ from vesuvius.neural_tracing.tracers.fibers.data.state_labels import SUPERVISION
 FIXTURE_STRATA = ((0., 1.5), (1.5, 3.), (3., 4.5), (4.5, 6.))
 
 
-def make_recovery_states(fibers, seeds, cfg, provenance, vol, seed=20260925, strata=FIXTURE_STRATA):
+def make_recovery_states(fibers, seeds, cfg, provenance, ct, spec, seed=20260925, strata=FIXTURE_STRATA):
     """Freeze one simulated trace state per seed and displacement stratum, preserving identity.
 
     States come from the shared fresh sampler (established history; displaced strata use its
@@ -39,8 +39,8 @@ def make_recovery_states(fibers, seeds, cfg, provenance, vol, seed=20260925, str
                     break
             else:
                 raise ValueError('Could not draw a fixture displacement stratum')
-            resolve_trace_seed(item, vol)
-            orient_item(item, vol)
+            resolve_trace_seed(item, ct, spec)
+            orient_item(item, ct, spec)
             facts = item['trace_facts']
             nan = np.nan
             row = dict(fiber_idx=fi, t=float(facts['t']), reverse=reverse, pos=item['pos'], frame=item['frame'],
@@ -64,7 +64,7 @@ def make_recovery_states(fibers, seeds, cfg, provenance, vol, seed=20260925, str
         track_pos=np.asarray(track, dtype=np.float64))
 
 
-def recovery_batches(vol, states, fibers, sample, batch_builder=None, limit=0, learned_frames=False):
+def recovery_batches(ct, spec, states, fibers, sample, batch_builder=None, limit=0, learned_frames=False):
     """Reconstruct frozen observations identically for images and recovery traces.
 
     Fixture frames are CT structure-tensor frames. With ``learned_frames`` the recorded frame
@@ -85,12 +85,12 @@ def recovery_batches(vol, states, fibers, sample, batch_builder=None, limit=0, l
             item['frame_policy'] = states.provenance.get('frame_policy', FRAME_POLICY)
         if batch_builder is None:
             raise ValueError('Recovery evaluation requires the common observation builder')
-        cpu = batch_builder([item], vol)
+        cpu = batch_builder([item], ct, spec)
         yield j, cpu
 
 
 @torch.no_grad()
-def evaluate_recovery_states(model, vol, states, fibers, sample, *, device='cpu',
+def evaluate_recovery_states(model, ct, spec, states, fibers, sample, *, device='cpu',
                              tracer_class=ModelTracer, batch_builder=None, thresholds=DIAGNOSTIC_THRESHOLDS,
                              recovery_length=32., n_commit=8, tolerance=1.5, sampling_seed=0,
                              limit=0, on_prediction=None, progress=None, learned_frames=None):
@@ -115,7 +115,7 @@ def evaluate_recovery_states(model, vol, states, fibers, sample, *, device='cpu'
         dtype = torch.float32 if float_inputs and value.is_floating_point() else value.dtype
         return value.to(device=device, dtype=dtype)
     rows, predictions = [], []
-    for j, cpu in recovery_batches(vol, states, fibers, sample, batch_builder, limit, learned_frames):
+    for j, cpu in recovery_batches(ct, spec, states, fibers, sample, batch_builder, limit, learned_frames):
         fi=int(states.fiber_idx[j]);f=fibers[fi]
         b = move(cpu)
         sampling={}
@@ -143,7 +143,7 @@ def evaluate_recovery_states(model, vol, states, fibers, sample, *, device='cpu'
                 chosen = output
                 confidence = chosen['confidence']
                 labels, masks, error = prefix_labels(chosen['points'], b, tolerance, model.cfg.max_recovery_distance)
-            tracer=tracer_class(model,vol,sample.crop,sample.n_history,
+            tracer=tracer_class(model,ct,spec,sample.crop,sample.n_history,
                 TraceParams(max_len=recovery_length,confidence=threshold,seed=sampling_seed,
                             n_commit=n_commit),device=device)
             state={k:getattr(states,k)[j] for k in ('hist','hmask','frame')}

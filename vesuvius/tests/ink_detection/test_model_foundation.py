@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
-import json
 import math
 
 import pytest
@@ -20,51 +18,7 @@ from vesuvius.ink_detection.models.hybrid_3d2d import (
 from vesuvius.ink_detection.models.input_padding import center_pad_input_depth
 from vesuvius.ink_detection.models.model import SliceChannel2DModel, make_model
 
-
-def _config_mapping(
-    model_type: str = "vesuvius_unet",
-    *,
-    depth: int = 4,
-    side: int = 16,
-    stem_channels: int = 2,
-) -> dict:
-    is_base = model_type in {"vesuvius_unet", "unet"}
-    dimensions = 3 if is_base else 2
-    kernel = [3] * dimensions
-    first_stride = [1] * dimensions
-    second_stride = [2] * dimensions
-    model_config = {
-        "autoconfigure": True,
-        "basic_encoder_block": "BasicBlockD",
-        "basic_decoder_block": "ConvBlock",
-        "features_per_stage": [2, 4],
-        "n_blocks_per_stage": [1, 1],
-        "n_conv_per_stage_decoder": [1],
-        "kernel_sizes": [kernel, kernel],
-        "strides": [first_stride, second_stride],
-        "pool_op_kernel_sizes": [first_stride, second_stride],
-        "spacing": [1, 1, 1],
-    }
-    if "3d_stem_2d" in model_type:
-        model_config["stem_channels"] = stem_channels
-    return {
-        "model_type": model_type,
-        "mode": "flat",
-        "patch_size": [depth, side, side],
-        "patch_overlap": 0.25,
-        "patch_min_labeled_coverage": 0.0,
-        "batch_size": 1,
-        "in_channels": depth if "2p5d" in model_type else 1,
-        "model_config": model_config,
-        "targets": {
-            "ink": {
-                "out_channels": 1,
-                "activation": "none",
-                "z_projection_mode": "none",
-            }
-        },
-        "datasets": [{"segments_path": "/tmp/ink", "volume_scale": 0}],
-    }
+from .helpers import config_mapping
 
 
 @pytest.mark.parametrize(
@@ -87,7 +41,7 @@ def test_real_model_families_build_and_forward_on_cpu(
     wrapper_type,
 ):
     torch.manual_seed(7)
-    model = make_model(InkConfig.from_mapping(_config_mapping(model_type, depth=depth)))
+    model = make_model(InkConfig.from_mapping(config_mapping(model_type, depth=depth)))
     if wrapper_type is not None:
         assert isinstance(model, wrapper_type)
 
@@ -103,7 +57,7 @@ def test_real_model_families_build_and_forward_on_cpu(
 )
 def test_unet_aliases_dispatch_to_the_same_model_families(model_type):
     depth = 4 if model_type == "unet" else 3
-    model = make_model(InkConfig.from_mapping(_config_mapping(model_type, depth=depth)))
+    model = make_model(InkConfig.from_mapping(config_mapping(model_type, depth=depth)))
 
     if model_type == "unet":
         assert model.op_dims == 3
@@ -116,7 +70,7 @@ def test_unet_aliases_dispatch_to_the_same_model_families(model_type):
 def test_dinov2_backbone_configuration_reaches_the_shared_model_builder(
     monkeypatch,
 ):
-    authored = _config_mapping("vesuvius_unet", depth=4)
+    authored = config_mapping("vesuvius_unet", depth=4)
     authored["model_config"].update(
         {
             "pretrained_backbone": "dinov2_ps8",
@@ -157,7 +111,7 @@ def test_typed_spacing_is_forwarded_in_model_axis_order(
     expected_spacing,
     monkeypatch,
 ):
-    authored = _config_mapping(model_type, depth=3)
+    authored = config_mapping(model_type, depth=3)
     authored["model_config"]["spacing"] = [2, 3, 4]
     observed = []
     original = network_builder.get_pool_and_conv_props
@@ -248,29 +202,25 @@ def test_hybrid_rejects_depth_channel_and_rank_errors(shape, message):
         model(torch.zeros(shape))
 
 
-def test_tiny_hybrid_state_manifest_is_ordered_and_stable():
-    mapping = _config_mapping(
-        "vesuvius_unet_3d_stem_2d",
-        depth=17,
-        side=32,
-        stem_channels=16,
-    )
-    mapping["batch_size"] = 2
-    mapping["model_config"]["features_per_stage"] = [4, 8]
-    model = make_model(InkConfig.from_mapping(mapping))
-    manifest = [
-        [key, list(tensor.shape), str(tensor.dtype)]
-        for key, tensor in model.state_dict().items()
-    ]
-    digest = hashlib.sha256(
-        json.dumps(manifest, separators=(",", ":")).encode()
-    ).hexdigest()
+def test_hybrid_checkpoint_restores_predictions(tmp_path):
+    from vesuvius.ink_detection.models.checkpoint import load_checkpoint, load_model_state
 
-    assert len(manifest) == 66
-    assert sum(parameter.numel() for parameter in model.parameters()) == 10_298
-    assert manifest[0][0].startswith("network.")
-    assert manifest[-1][0] == "depth_fusion.attention_logits.bias"
-    assert digest == "c3ef958b71090231c673d8022a352f5c622dbfa86427064aabebbadd4fbf27a9"
+    config = InkConfig.from_mapping(config_mapping("vesuvius_unet_3d_stem_2d", depth=3))
+    # Keep this test's initialization deterministic without changing other tests' RNG.
+    with torch.random.fork_rng(devices=[]):
+        torch.manual_seed(7)
+        original = make_model(config).eval()
+        restored = make_model(config).eval()
+    image = torch.linspace(-1, 1, 3 * 16 * 16).reshape(1, 1, 3, 16, 16)
+    checkpoint_path = tmp_path / "model.pth"
+    torch.save({"model": original.state_dict()}, checkpoint_path)
+
+    with torch.inference_mode():
+        expected = original(image)["ink"]
+        # Ensure a no-op restore would fail the output comparison.
+        assert not torch.allclose(restored(image)["ink"], expected)
+        load_model_state(restored, load_checkpoint(checkpoint_path)["model"])
+        torch.testing.assert_close(restored(image)["ink"], expected, rtol=0, atol=0)
 
 
 def test_depth_padding_places_even_and_odd_deficits_on_literal_sides():
@@ -297,7 +247,7 @@ def test_depth_padding_rejects_rank_and_implicit_crop():
 
 
 def test_config_rejects_nonpositive_padding_depth():
-    mapping = _config_mapping()
+    mapping = config_mapping()
     mapping["model_config"]["input_pad_depth_to"] = 0
 
     with pytest.raises(ValueError, match="input_pad_depth_to must be positive"):
@@ -306,7 +256,7 @@ def test_config_rejects_nonpositive_padding_depth():
 
 @pytest.mark.parametrize("spacing", [[1, 1], [1, 1, 1, 1], "1,1,1"])
 def test_config_rejects_spacing_without_three_axes(spacing):
-    mapping = _config_mapping()
+    mapping = config_mapping()
     mapping["model_config"]["spacing"] = spacing
 
     with pytest.raises(ValueError, match="spacing.*three axes"):

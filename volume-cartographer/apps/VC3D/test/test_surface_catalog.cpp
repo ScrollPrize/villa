@@ -1,3 +1,4 @@
+#include <utility>
 // The VC3D surface catalog over a real object store: rows of the current
 // volume's surfaces kept current from commit events, opening a surface in the
 // volume's voxels, and record edits (tags, name, retire).
@@ -9,19 +10,21 @@
 #include <vc_object_store/geometry/Geometry.hpp>
 #include <vc_object_store/store/GeometryViews.hpp>
 #include <vc_object_store/objects/GeometryCoordinates.hpp>
-#include <vc_object_store/store/GeometryViews.hpp>
 #include <vc_reader/catalog.hpp>
 #include <vc_reader/registrations.hpp>
 #include "VolumeRegistrations.hpp"
 #include "vc/core/types/Volume.hpp"
-#include "support/TestZarrVolume.hpp"
+#include <nlohmann/json.hpp>
+#include <vc_reader/zarr.hpp>
+#include <vc_reader/zarr_write.hpp>
+#include <filesystem>
+#include <fstream>
 #include "vc/core/util/QuadSurface.hpp"
 #include <vc_object_store/Uuid.hpp>
 #include <QCoreApplication>
 #include <QElapsedTimer>
 #include <QTemporaryDir>
 #include <QThread>
-#include <filesystem>
 #include <iostream>
 #include <set>
 
@@ -40,9 +43,11 @@ int main(int argc, char** argv)
     QCoreApplication app(argc, argv);
     try {
         QTemporaryDir dir;
-        vc::test::ZarrVolumeSpec create;
-        create.shapeZYX = {4, 4, 4}; create.chunkShapeZYX = {4, 4, 4}; create.uuid = "vol1";
-        const auto volume = vc::test::createZarrVolume(fs::path(dir.path().toStdString()) / "ct.zarr", create);
+        const std::filesystem::path volumeRoot1 = fs::path(dir.path().toStdString()) / "ct.zarr";
+        const vcr::zarr::CreateOptions levelZero1{.shape = {4, 4, 4}, .chunks = {4, 4, 4}, .compressor = "", .overwrite = true};
+        vcr::zarr::Writer::create(volumeRoot1 / "0", levelZero1);
+        std::ofstream(volumeRoot1 / "meta.json") << nlohmann::json{{"type", "vol"}, {"uuid", "vol1"}, {"name", "vol1"}, {"format", "zarr"}, {"width", 4}, {"height", 4}, {"slices", 4}, {"voxelsize", 1.0}}.dump();
+        const auto volume = Volume::New(volumeRoot1);
         const auto path = fs::path(dir.path().toStdString()) / "objects.vcobj";
         OpenOptions options; options.author = "surface-catalog-test";
         { auto created = ObjectStore::create(path, options); }
@@ -185,7 +190,7 @@ int main(int argc, char** argv)
                 vc3d::corrections::write(*session, attachment, half, points.anchoredCollections(), {volume->id()});
                 const auto stored = vc3d::corrections::read(*session, attachment, half).at(fix);
                 const auto& moved = stored.at("points").at(std::to_string(firstPoint.id)).at("p");
-                require(moved[0].get_double() == 7 && moved[2].get_double() == 9, "moved correction points keep their id");
+                require(moved[0].get<double>() == 7 && moved[2].get<double>() == 9, "moved correction points keep their id");
             }
             {
                 // Through a view at half scale: points read halved, unchanged ones
@@ -194,11 +199,11 @@ int main(int argc, char** argv)
                 auto shown = vc3d::corrections::read(*session, attachment, half, coarse);
                 const auto& ordered = points.getAllCollections().at(fix).points;
                 const auto firstId = std::to_string(ordered.begin()->first), secondId = std::to_string(std::next(ordered.begin())->first);
-                require(shown.at(fix).at("points").at(firstId).at("p")[0].get_double() == 3.5, "corrections read through the view");
-                shown.at(fix)["points"][secondId]["p"] = utils::Json::parse("[1.0, 1.0, 1.0]");
+                require(shown.at(fix).at("points").at(firstId).at("p")[0].get<double>() == 3.5, "corrections read through the view");
+                shown.at(fix)["points"][secondId]["p"] = nlohmann::json::parse("[1.0, 1.0, 1.0]");
                 vc3d::corrections::write(*session, attachment, half, shown, {volume->id()}, coarse);
                 const auto stored = vc3d::corrections::read(*session, attachment, half).at(fix).at("points");
-                require(stored.at(firstId).at("p")[0].get_double() == 7 && stored.at(secondId).at("p")[0].get_double() == 2,
+                require(stored.at(firstId).at("p")[0].get<double>() == 7 && stored.at(secondId).at("p")[0].get<double>() == 2,
                         "corrections save back to their stored frame");
             }
             vc3d::corrections::write(*session, attachment, half, {}, {volume->id()});
@@ -244,7 +249,9 @@ int main(int argc, char** argv)
             // open volume, where the shear doubles x, sees twice it.
             require(catalog.row(other)->record.surface&&catalog.row(other)->record.surface->area==4.0,
                     "the store keeps the area in stored units");
-            require(std::abs(vc::surface::computeSurfaceAreaVox2(*catalog.open(other).surface)-8.0)<1e-9,
+            require(std::abs(([&] { const auto opened = catalog.open(other); const auto& points = *std::as_const(*opened.surface).rawPointsPtr(); return vc::geometry::surfaceGridArea(points.rows, points.cols,
+            [&](int64_t r, int64_t c) -> const cv::Vec3f& { return points(int(r), int(c)); },
+            [&](int64_t r, int64_t c) { return vc::geometry::validSurfacePoint(points(int(r), int(c))); }); }())-8.0)<1e-9,
                     "the open volume sees the sheared area");
         }
         auto registered=catalog.open(other);
@@ -316,9 +323,11 @@ int main(int argc, char** argv)
         // The volume at working level 1 is the same volume in half its voxels:
         // surfaces are listed at that scale, and those made there are kept in
         // the volume's own voxels at it, seen at full scale in the full volume.
-        vc::test::ZarrVolumeSpec coarse = create;
-        coarse.shapeZYX = {2, 2, 2}; coarse.chunkShapeZYX = {2, 2, 2};
-        const auto level = vc::test::createZarrVolume(fs::path(dir.path().toStdString()) / "level.zarr", coarse);
+        const std::filesystem::path volumeRoot2 = fs::path(dir.path().toStdString()) / "level.zarr";
+        const vcr::zarr::CreateOptions levelZero2{.shape = {2, 2, 2}, .chunks = {2, 2, 2}, .compressor = "", .overwrite = true};
+        vcr::zarr::Writer::create(volumeRoot2 / "0", levelZero2);
+        std::ofstream(volumeRoot2 / "meta.json") << nlohmann::json{{"type", "vol"}, {"uuid", "vol1"}, {"name", "vol1"}, {"format", "zarr"}, {"width", 2}, {"height", 2}, {"slices", 2}, {"voxelsize", 1.0}}.dump();
+        const auto level = Volume::New(volumeRoot2);
         const VolumeVoxels atHalf{volume->id(), 0.5};
         const auto atLevel = util::newUuid();
         session->act(attachment, {{atLevel, std::nullopt}}, [&](auto& db, auto& txn) {

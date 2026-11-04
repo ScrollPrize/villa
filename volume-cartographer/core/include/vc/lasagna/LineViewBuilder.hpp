@@ -3,6 +3,7 @@
 #include "vc/lasagna/LineModel.hpp"
 
 #include <memory>
+#include <functional>
 #include <string>
 #include <cstdint>
 #include <vector>
@@ -108,6 +109,14 @@ struct LineViewFrameDiagnostics {
     double minDisplayUpContinuityDot = 1.0;
     std::vector<LineViewFrameIssue> issues;
 };
+
+// The same sampled line and central anchor used when opening a stored fiber
+// in Line Annotation. Batches Lasagna reads; never changes the source points.
+LineModel lineModelFromSampledPoints(const std::vector<cv::Vec3d>& points,
+                                    const NormalSampler* sampler);
+
+std::vector<cv::Vec3f> orientedLineNormals(
+    const LineModel&, const std::function<cv::Vec3f(const cv::Vec3f&)>& centerReference = {});
 
 LineViewSurfaces buildLineViewSurfaces(const LineModel& line,
                                        const LineViewConfig& config = {});
