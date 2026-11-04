@@ -49,7 +49,7 @@ Measured: features for 283 Frag3 sites took about 4 minutes on one RTX PRO 6000 
 
 ## Encoder
 
-`encoder.py` builds the backbone from the checkpoint's own model config with `DinoVitStudentTeacher._build_backbone`, loads the teacher backbone weights strictly, and normalizes each window with `dinovol_2.dataset.normalization.normalize_robust` (clip to the 1st and 99th percentiles, subtract the median, divide by 1.4826 times the MAD), the dataset default the checkpoint was pretrained with, since its config names no `normalization_scheme`. On CUDA it runs under bf16 autocast, as the published runs did; on CPU in float32.
+`encoder.py` builds the backbone from the checkpoint's own model config with `DinoVitStudentTeacher._build_backbone`, loads the teacher backbone weights strictly, and normalizes each window with the "robust" scheme of `dinovol_2.dataset.normalization.get_normalization` (clip to the 1st and 99th percentiles, subtract the median, divide by 1.4826 times the MAD), the dataset default the checkpoint was pretrained with, since its config names no `normalization_scheme`. On CUDA it runs under bf16 autocast, as the published runs did; on CPU in float32.
 
 The published runs built the same backbone from a vendored copy of this dinovol code ([jimmylomro/hercUNet](https://github.com/jimmylomro/hercUNet) at `de4acb7`). On CPU (torch 2.14.1) this port gives bit-identical tokens to that copy on three real Frag3 windows (two box-averaged to 7.91 um, one native at 6.48 um): max abs difference 0.0, normalized input max abs difference 0.0, and identical features and scores on two sites through `features` and `compare`.
 

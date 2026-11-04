@@ -3,7 +3,7 @@
 The checkpoint (`teacher_305k.pt`) is downloaded from Hugging Face at run time, pinned by revision and sha256, and
 loaded with `torch.load(weights_only=True)`, so no pickled code in it runs. The backbone is built from the
 checkpoint's own model config by this package's `DinoVitStudentTeacher._build_backbone`, and each window is
-normalized with `normalize_robust` (percentile clip 1 to 99, then median and 1.4826 MAD), the dataset default the
+normalized with the "robust" scheme of `get_normalization` (percentile clip 1 to 99, then median and 1.4826 MAD), the dataset default the
 checkpoint was pretrained with: its config names no `normalization_scheme`.
 """
 import hashlib
@@ -65,9 +65,10 @@ def code_commit():
 
 
 def normalize(ct):
-    """A CT window as the encoder saw its pretraining crops: float32, robust-normalized, the input left unchanged."""
-    from dinovol_2.dataset.normalization import normalize_robust
-    return normalize_robust(np.array(ct))
+    """A CT window as the encoder saw its pretraining crops: float32, robust-normalized (the dataset's "robust"
+    scheme), the input left unchanged."""
+    from dinovol_2.dataset.normalization import get_normalization
+    return get_normalization("robust").run(np.array(ct))
 
 
 class Encoder:
