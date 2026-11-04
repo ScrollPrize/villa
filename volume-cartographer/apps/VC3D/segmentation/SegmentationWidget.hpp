@@ -44,6 +44,10 @@ public:
     [[nodiscard]] float smoothingStrength() const;
     [[nodiscard]] int smoothingIterations() const;
     [[nodiscard]] SegmentationGrowthMethod growthMethod() const;
+    // The last method selected that is not Manual Fill or Manual Grow: the
+    // one growth uses once Manual Add ends. The agent bridge reports it so
+    // its settings can be passed back unchanged.
+    [[nodiscard]] SegmentationGrowthMethod lastNonManualGrowthMethod() const { return _lastNonManualGrowthMethod; }
     [[nodiscard]] int growthSteps() const;
     [[nodiscard]] QString customParamsText() const;
     [[nodiscard]] QString customParamsProfile() const;
@@ -209,6 +213,7 @@ private:
     void restoreSettings();
     void writeSetting(const QString& key, const QVariant& value);
     void updateEditingState(bool enabled, bool notifyListeners);
+    void noteGrowthMethod(SegmentationGrowthMethod method);
 
     bool _editingEnabled{false};
     bool _drawMaskEnabled{false};
@@ -227,6 +232,7 @@ private:
     SegmentationManualAddPanel* _manualAddPanel{nullptr};
     bool _manualAddActive{false};
     bool _manualAddBusy{false};
+    SegmentationGrowthMethod _lastNonManualGrowthMethod{SegmentationGrowthMethod::Tracer};
     QWidget* _manualAddProgress{nullptr};
 
 };

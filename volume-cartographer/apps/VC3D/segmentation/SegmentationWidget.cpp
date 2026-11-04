@@ -125,6 +125,9 @@ void SegmentationWidget::buildUi()
             this, &SegmentationWidget::growthMethodChanged);
     connect(_growthPanel, &SegmentationGrowthPanel::growthMethodChanged,
             this, &SegmentationWidget::syncUiState);
+    connect(_growthPanel, &SegmentationGrowthPanel::growthMethodChanged,
+            this, &SegmentationWidget::noteGrowthMethod);
+    noteGrowthMethod(_growthPanel->growthMethod());
     connect(_growthPanel, &SegmentationGrowthPanel::volumeSelectionChanged,
             this, &SegmentationWidget::volumeSelectionChanged);
     connect(_growthPanel, &SegmentationGrowthPanel::correctionsZRangeChanged,
@@ -342,6 +345,13 @@ void SegmentationWidget::setGrowthMethod(SegmentationGrowthMethod method)
 {
     if (_manualAddBusy) return;
     _growthPanel->setGrowthMethod(method);
+}
+
+void SegmentationWidget::noteGrowthMethod(SegmentationGrowthMethod method)
+{
+    if (!isManualGrowthMethod(method)) {
+        _lastNonManualGrowthMethod = method;
+    }
 }
 void SegmentationWidget::setManualAddBusy(bool busy)
 {

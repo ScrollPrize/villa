@@ -572,7 +572,7 @@ surface's store UUID. Methods on segments need an open project and volume (-3200
   A change that leaves `min` above `max` is refused (-32602, `zRange`), but
   bounds the panel already holds are taken back as they are, since its spin
   boxes do not keep them in order. `growthMethod` is the method growth uses, with `manualAddSelected` telling
-  whether the Manual Add method is selected, so the reply of `get_settings`
+  whether Manual Fill or Manual Grow is selected, so the reply of `get_settings`
   can be passed to `set_settings` unchanged (a null `growthVolumeId` leaves
   the volume as it is). Neural tracer executable and checkpoint paths are not
   exposed.

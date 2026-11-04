@@ -170,9 +170,12 @@ public:
 
     // Keeps the history valid after the grid grows by the given counts:
     // deltas move with their vertices and full snapshots get invalid borders.
+    // The grid size moves with them, so setGridSize with the grown size keeps
+    // the history. Grown snapshots count at their new size; the next edit,
+    // undo or redo holds the history to its limits again.
     void padGrid(int top, int bottom, int left, int right)
     {
-        for (auto& entry : _states) {
+        auto padEntry = [&](Entry& entry) {
             for (auto& delta : entry.deltas) {
                 delta.row += top;
                 delta.col += left;
@@ -183,6 +186,20 @@ public:
                                    cv::BORDER_CONSTANT, cv::Scalar(-1.0, -1.0, -1.0));
                 entry.points = cv::Mat_<cv::Vec3f>(padded);
             }
+        };
+        for (auto* stack : {&_undo, &_redo, &_evictedByCapture, &_redoDroppedByCapture}) {
+            for (auto& entry : *stack) {
+                padEntry(entry);
+            }
+        }
+        _bytes = 0;
+        for (const auto* stack : {&_undo, &_redo}) {
+            for (const auto& entry : *stack) {
+                _bytes += entry.bytes();
+            }
+        }
+        if (!_gridSize.empty()) {
+            _gridSize = cv::Size(_gridSize.width + left + right, _gridSize.height + top + bottom);
         }
     }
 

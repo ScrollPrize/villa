@@ -13,7 +13,7 @@
 #include "CWindow.hpp"
 #include "volume_viewers/VolumeViewerBase.hpp"
 #include "overlays/InkDetectionOverlayController.hpp"
-#include "vc/core/render/Colormaps.hpp"
+#include "Colormaps.hpp"
 
 // ===========================================================================
 // Viewer display state beyond the shared render settings: the ink detection
@@ -167,8 +167,8 @@ QJsonObject AgentBridgeServer::handleViewerReset(const QJsonValue& params)
     if (fit == QLatin1String("surface"))
         viewer->fitSurfaceInView();
     else if (fit == QLatin1String("content"))
-        viewer->resetViewForCurrentContent(true);
-    viewer->renderVisible(true);
+        viewer->resetViewForCurrentContent();
+    viewer->renderVisible("agent bridge viewer view");
 
     QJsonObject result;
     result["viewer"] = viewerIdFor(viewer);

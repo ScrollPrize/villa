@@ -37,6 +37,7 @@ QString growthMethodName(SegmentationGrowthMethod method)
     case SegmentationGrowthMethod::Tracer:      return QStringLiteral("tracer");
     case SegmentationGrowthMethod::Corrections: return QStringLiteral("corrections");
     case SegmentationGrowthMethod::ManualAdd:   return QStringLiteral("manual_add");
+    case SegmentationGrowthMethod::ManualGrow:  return QStringLiteral("manual_grow");
     }
     return QStringLiteral("tracer");
 }
@@ -139,10 +140,10 @@ QJsonObject AgentBridgeServer::segmentationSettingsJson() const
         // growth method reported is the one growth uses, so get_settings can
         // be passed back to set_settings.
         {"growthMethod", growthMethodName(
-                             widget->growthMethod() == SegmentationGrowthMethod::ManualAdd
+                             isManualGrowthMethod(widget->growthMethod())
                                  ? widget->lastNonManualGrowthMethod()
                                  : widget->growthMethod())},
-        {"manualAddSelected", widget->growthMethod() == SegmentationGrowthMethod::ManualAdd},
+        {"manualAddSelected", isManualGrowthMethod(widget->growthMethod())},
         {"growthSteps", widget->growthSteps()},
         {"growthScale", widget->growthScale()},
         {"growthDirections", directions},
