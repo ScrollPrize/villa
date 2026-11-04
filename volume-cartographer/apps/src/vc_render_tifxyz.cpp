@@ -237,8 +237,8 @@ static vcr::grid::Result sampleTile(const RenderSurface& surface, const vcr::gri
     return vcr::grid::sample(*surface.grid, raster, request);
 }
 
-// One image of a result: pixels without a value read 0; uint8 truncates and uint16
-// rounds, as the renders always have.
+// One image of a result: pixels without a value read 0; integer intensities
+// round to nearest, ties to even.
 template <typename T>
 static cv::Mat toImage(const vcr::grid::Result& result, int layer)
 {
@@ -248,7 +248,7 @@ static cv::Mat toImage(const vcr::grid::Result& result, int layer)
     if constexpr (std::is_same_v<T, uint16_t>)
         vcr::display::toUint16(v, n, out[0]);
     else if constexpr (std::is_same_v<T, uint8_t>)
-        vcr::display::toUint8(v, n, out[0], nullptr, {1, vcr::display::Rounding::Truncate, true});
+        vcr::display::toUint8(v, n, out[0], nullptr, {1, vcr::display::Rounding::NearestEven, true});
     else
         static_assert(std::is_same_v<T, uint8_t> || std::is_same_v<T, uint16_t>);
     return out;

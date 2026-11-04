@@ -453,8 +453,8 @@ NB_MODULE(_reader, m)
         }, "input"_a.noconvert(), "output"_a.noconvert(), "coverage"_a.none() = nb::none(),
            "scale"_a = 1., "rounding"_a = defaultRounding, "saturate_infinity"_a = defaultSaturate);
     };
-    bindConversion.template operator()<std::uint8_t>("display_to_uint8", "truncate", false);
-    bindConversion.template operator()<std::uint16_t>("display_to_uint16", "half_up", true);
+    bindConversion.template operator()<std::uint8_t>("display_to_uint8", "nearest_even", false);
+    bindConversion.template operator()<std::uint16_t>("display_to_uint16", "nearest_even", true);
     m.def("apply_lut", [](nb::ndarray<const std::uint8_t, nb::ndim<2>, nb::c_contig> input,
                             nb::ndarray<const std::uint32_t, nb::ndim<1>, nb::c_contig> lut,
                             nb::ndarray<std::uint32_t, nb::ndim<2>, nb::c_contig> output) {
