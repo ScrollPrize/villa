@@ -8,6 +8,7 @@
 #include "HubBindings.hpp"
 #include <nanobind/stl/map.h>
 #include "vc_object_store/objects/ObjectStore.hpp"
+#include "vc_object_store/objects/TransactionJson.hpp"
 #include "vc_object_store/objects/Hub.hpp"
 #include "vc_object_store/objects/Project.hpp"
 #include "vc_reader/sftp.hpp"
@@ -22,6 +23,8 @@ nb::dict objectRevisionToPy(const vo::ObjectRevision& revision)
     d["parent_uuid"] = revision.parentUuid; d["geometry_revision"] = revision.geometryRevision;
     d["sequence"] = revision.sequence; d["metadata_complete"] = revision.metadataComplete;
     d["published_at_us"] = revision.publishedAtUs; d["deleted"] = revision.deleted;
+    d["version"] = revision.version; d["generation"] = revision.generation;
+    d["commit_sequence"] = revision.commitSequence;
     d["record"] = objectToPy(revision.record);
     return d;
 }
@@ -32,6 +35,8 @@ nb::dict relationshipRevisionToPy(const vo::RelationshipRevision& revision)
     d["uuid"] = revision.uuid; d["record"] = edgeToPy(revision.record);
     d["a_revision"] = revision.aRevision; d["b_revision"] = revision.bRevision;
     d["a_geometry_revision"] = revision.aGeometryRevision; d["b_geometry_revision"] = revision.bGeometryRevision;
+    d["version"] = revision.version; d["generation"] = revision.generation;
+    d["a_version"] = revision.aVersion; d["b_version"] = revision.bVersion;
     return d;
 }
 
@@ -47,6 +52,7 @@ nb::bytes toPy(const std::vector<uint8_t>& value) {
 template<class T> T toPy(T value) { return value; }
 std::vector<std::string> toPy(std::vector<std::string> value) { return value; }
 std::optional<std::filesystem::path> toPy(std::optional<std::filesystem::path> value) { return value; }
+nb::object toPy(const std::optional<int64_t>& value) { return value ? nb::cast(*value) : nb::none(); }
 template<class T> nb::object toPy(const std::optional<T>& value) {
     return value ? toPy(*value) : nb::none();
 }
@@ -842,6 +848,54 @@ NB_MODULE(_native, m)
              nb::arg("revision_uuid"))
         .def("object_history", readMethod<&vo::ObjectStore::objectHistory>(),
              nb::arg("object_uuid"))
+        .def("status", [](PyObjectStore& self) {
+            return jsonLoads(vo::storeStatusToJson(self.withRead([](vo::ObjectStore& db, vo::ReadTxn& txn) { return db.status(txn); })));
+        }, "Store UUID, active history generation, commit sequence and feed start.")
+        .def("current_version", readMethod<&vo::ObjectStore::currentVersion>(), nb::arg("object_uuid"))
+        .def("current_relationship_version", readMethod<&vo::ObjectStore::currentRelationshipVersion>(),
+             nb::arg("relationship_uuid"))
+        .def("object_at_version", [](PyObjectStore& self, const std::string& store, const std::string& generation,
+                                     const std::string& object, int64_t version) {
+            return toPy(self.withRead([&](vo::ObjectStore& db, vo::ReadTxn& txn) {
+                return db.objectAtVersion(txn, {store, generation, object, version});
+            }));
+        }, nb::arg("store_uuid"), nb::arg("generation"), nb::arg("object_uuid"), nb::arg("version"),
+           "Exact numbered reference; None when not published in that generation.")
+        .def("changes_since", [](PyObjectStore& self, const nb::dict& cursor, int64_t maxChanges) {
+            const vo::FeedCursor c{nb::cast<std::string>(cursor["store"]), nb::cast<std::string>(cursor["generation"]),
+                                   nb::cast<int64_t>(cursor["sequence"]),
+                                   cursor.contains("offset") ? nb::cast<int64_t>(cursor["offset"]) : 0};
+            return jsonLoads(vo::changePageToJson(self.withRead([&](vo::ObjectStore& db, vo::ReadTxn& txn) {
+                return db.changesSince(txn, c, maxChanges);
+            })));
+        }, nb::arg("cursor"), nb::arg("max_changes") = 4096)
+        .def("receipt", [](PyObjectStore& self, const std::string& request) -> nb::object {
+            const auto receipt = self.withRead([&](vo::ObjectStore& db, vo::ReadTxn& txn) { return db.receipt(txn, request); });
+            return receipt ? jsonLoads(vo::transactionReceiptToJson(*receipt)) : nb::none();
+        }, nb::arg("request_uuid"))
+        .def("submit", [](PyObjectStore& self, const nb::object& request, const nb::dict& payloads) {
+            // The canonical JSON form (transaction_request_json); binary
+            // payloads keyed by SHA-256, as on the wire.
+            vo::TransactionPayloads bytes;
+            for (const auto& [hash, value] : payloads) {
+                const auto data = nb::cast<nb::bytes>(value);
+                const auto* begin = reinterpret_cast<const uint8_t*>(data.c_str());
+                bytes.emplace(nb::cast<std::string>(hash), std::vector<uint8_t>(begin, begin + data.size()));
+            }
+            const auto text = nb::isinstance<nb::str>(request) ? nb::cast<std::string>(request) : jsonDumps(request);
+            const auto parsed = vo::transactionRequestFromJson(text, bytes);
+            vo::TransactionReceipt receipt;
+            {
+                nb::gil_scoped_release release;
+                receipt = self.require().submit(parsed);
+            }
+            return jsonLoads(vo::transactionReceiptToJson(receipt));
+        }, nb::arg("request"), nb::arg("payloads") = nb::dict(),
+           "Atomic checked request; identical retries return the saved receipt. Conflicts raise RuntimeError.")
+        .def("start_history_generation", [](PyObjectStore& self, const std::string& reason) {
+            nb::gil_scoped_release release;
+            return self.require().startHistoryGeneration(reason);
+        }, nb::arg("reason"), "Restore tooling: a fresh generation for new writes.")
         .def("recorded_relationships", readMethod<&vo::ObjectStore::recordedRelationships>(),
              nb::arg("object_revision_uuid"))
         .def("relationships_at", [](PyObjectStore& self, const vo::RevisionSelection& selection) {
