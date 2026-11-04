@@ -4,6 +4,7 @@
 // expired staging; the service owns its store exclusively.
 #include "TestSupport.hpp"
 #include "vc_object_store/client/HostedStore.hpp"
+#include "vc_object_store/objects/Artifacts.hpp"
 #include "vc_object_store/geometry/Geometry.hpp"
 #include "vc_object_store/objects/ObjectStore.hpp"
 #include "vc_object_store/objects/TransactionJson.hpp"
@@ -11,6 +12,7 @@
 
 #include <atomic>
 #include <cstring>
+#include <fstream>
 #include <iostream>
 #include <thread>
 
@@ -297,6 +299,39 @@ try {
             hostedHits[0].distance == localHits[0].distance, "proximity parity (exact doubles)");
     }
 
+    // Artifacts: the same identities, manifests and bytes locally and hosted;
+    // the hosted client never touches the store's files.
+    {
+        std::string bytes(200000, '\0');
+        for (std::size_t i = 0; i < bytes.size(); ++i) bytes[i] = char(i * 7 % 253);
+        const auto file = directory.path / "artifact.bin";
+        std::ofstream(file, std::ios::binary) << bytes;
+        const auto hash = hosted.putArtifact(file);
+        require(local.putArtifact(file) == hash && hosted.putArtifact(file) == hash, "artifact identity parity");
+        require(hosted.artifactLength(hash) == bytes.size() && !hosted.artifactLength(std::string(64, '0')),
+                "hosted artifact lengths");
+        const auto art = util::newUuid();
+        both(request({{art, std::nullopt}}, {CreateObjectOp{objectRecordJson(trackRecord(art))}}), "artifact owner");
+        const auto manifest = artifactManifestJson({{"fit/model.bin", hash, bytes.size()}});
+        const auto published = both(request({{art, 1}}, {SetMetaOp{art, kArtifactsMetaKey, manifest}}), "manifest parity");
+        require(published.objects.at(art) == 2, "manifest versions the object");
+        const auto unheld = request({{art, 2}},
+            {SetMetaOp{art, kArtifactsMetaKey, artifactManifestJson({{"x.bin", std::string(64, 'e'), 1}})}});
+        mustFail([&] { local.submit(unheld.local); });
+        mustFail([&] { hosted.submit(unheld.hosted); });
+        const auto files = artifactManifest(hosted.currentObjectRevision(art)->record);
+        require(files.size() == 1, "hosted manifest");
+        const auto fetched = directory.path / "fetched" / files[0].name;
+        hosted.fetchArtifact(files[0], fetched);
+        std::ifstream in(fetched, std::ios::binary);
+        require(std::string(std::istreambuf_iterator<char>(in), {}) == bytes, "fetched artifact bytes");
+        const auto part = hosted.readArtifact(hash, 100, 1000);
+        require(std::string(part.begin(), part.end()) == bytes.substr(100, 1000), "hosted ranged artifact read");
+        auto wrong = files[0]; wrong.length -= 1;
+        mustFail([&] { hosted.fetchArtifact(wrong, directory.path / "fetched" / "wrong.bin"); });
+        require(!std::filesystem::exists(directory.path / "fetched" / "wrong.bin"), "failed fetch leaves no file");
+    }
+
     // A listing never combines pages from different snapshots: with commits
     // landing between its pages it restarts, then gives up.
     {
@@ -322,7 +357,7 @@ try {
         writer.join();
         if (!writerError.empty()) throw std::runtime_error("concurrent writer: " + writerError);
         require(busy, "a listing across commits gives up instead of mixing snapshots");
-        require(hosted.selectAllObjects(tracks, std::vector<std::string>{}, 1).size() == 7, "quiet store lists");
+        require(hosted.selectAllObjects(tracks, std::vector<std::string>{}, 1).size() == 8, "quiet store lists");
     }
 
     // Expired staging: a new request cannot run without its bytes, but the

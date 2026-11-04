@@ -3,6 +3,10 @@
 #include "vc_object_store/objects/TransactionJson.hpp"
 
 #include <nlohmann/json.hpp>
+#include <vc_reader/native/atomic_file.hpp>
+#include <vc_reader/native/platform_io.hpp>
+
+#include <fcntl.h>
 #include <vc_reader/http.hpp>
 
 #include <algorithm>
@@ -293,6 +297,99 @@ std::vector<SurfaceProximityHit> HostedStore::nearestSurfaces(const SurfaceProxi
     const auto response = impl_->http.request("POST", endpoint_ + "/v1/query/nearest_surfaces",
         proximityQueryRequestToJson(query), {{"Content-Type", "application/json"}});
     return proximityQueryResultFromJson(expectOk(response, "proximity query").body, asOf);
+}
+
+std::optional<uint64_t> HostedStore::artifactLength(const std::string& sha256)
+{
+    if (!isArtifactHash(sha256)) throw std::invalid_argument("hosted store: invalid artifact SHA-256 " + sha256);
+    const auto response = impl_->http.request("GET", endpoint_ + "/v1/artifacts/" + sha256 + "/info");
+    if (response.status == 404) return std::nullopt;
+    return Json::parse(expectOk(response, "artifact info").body).at("length").get<uint64_t>();
+}
+
+std::string HostedStore::putArtifact(const std::filesystem::path& file)
+{
+    // The upload reads a mapping of the file, not a copy in memory.
+    struct Mapping {
+        int fd = -1;
+        const uint8_t* data = nullptr;
+        std::size_t size = 0;
+        ~Mapping()
+        {
+            if (data) vcr::platform::unmap(data, size);
+            if (fd >= 0) ::close(fd);
+        }
+    } mapping;
+    mapping.fd = vcr::platform::open_file(file, O_RDONLY);
+    if (mapping.fd < 0) throw std::system_error(errno, std::generic_category(), "open " + file.string());
+    mapping.size = std::filesystem::file_size(file);
+    if (mapping.size && !(mapping.data = vcr::platform::map_read(mapping.fd, mapping.size)))
+        throw std::runtime_error("hosted store: cannot map " + file.string());
+    const std::string_view bytes(reinterpret_cast<const char*>(mapping.data), mapping.size);
+    PayloadHasher hasher;
+    hasher.update(bytes.data(), bytes.size());
+    const auto hash = hasher.finish();
+    if (artifactLength(hash) == uint64_t(bytes.size())) return hash;
+    expectOk(impl_->http.request("PUT", endpoint_ + "/v1/artifacts/" + hash, bytes,
+                                 {{"Content-Type", "application/octet-stream"}}), "put artifact " + hash);
+    return hash;
+}
+
+std::vector<uint8_t> HostedStore::readArtifact(const std::string& sha256, uint64_t offset,
+                                               const std::optional<uint64_t>& count)
+{
+    if (!isArtifactHash(sha256)) throw std::invalid_argument("hosted store: invalid artifact SHA-256 " + sha256);
+    auto get = [&](uint64_t from, const std::optional<uint64_t>& n) {
+        auto url = endpoint_ + "/v1/artifacts/" + sha256 + "?offset=" + std::to_string(from);
+        if (n) url += "&count=" + std::to_string(*n);
+        return impl_->http.request("GET", url);
+    };
+    auto total = count;
+    if (!total) {
+        const auto length = artifactLength(sha256);
+        if (!length) throw std::invalid_argument("hosted store: the server does not hold artifact " + sha256);
+        if (offset > *length) throw std::out_of_range("hosted store: invalid artifact offset");
+        total = *length - offset;
+    }
+    if (!*total) {  // still an answer about this artifact and offset
+        expectOk(get(offset, 0), "artifact");
+        return {};
+    }
+    auto range = uint64_t(rangeBytes_);
+    std::vector<uint8_t> result;
+    result.reserve(std::size_t(*total));
+    for (uint64_t done = 0; done < *total;) {
+        const auto want = std::min(range, *total - done);
+        const auto response = get(offset + done, want);
+        if (response.status == 413) {
+            // The server answers smaller ranges than ours: use its limit.
+            const auto serverMax = Json::parse(response.body).value("max_response_bytes", uint64_t(0));
+            if (!serverMax || serverMax >= range) expectOk(response, "artifact");
+            range = serverMax;
+            continue;
+        }
+        const auto& body = expectOk(response, "artifact").body;
+        result.insert(result.end(), body.begin(), body.end());
+        done += want;
+    }
+    return result;
+}
+
+void HostedStore::fetchArtifact(const ArtifactFile& file, const std::filesystem::path& destination)
+{
+    vcr::AtomicFile out(destination.string());
+    PayloadHasher hasher;
+    uint64_t written = 0;
+    const uint64_t range = uint64_t(rangeBytes_);
+    while (written < file.length) {
+        const auto bytes = readArtifact(file.sha256, written, std::min(range, file.length - written));
+        hasher.update(bytes.data(), bytes.size());
+        out.write(bytes.data(), bytes.size());
+        written += bytes.size();
+    }
+    if (written != file.length || hasher.finish() != file.sha256)
+        throw std::runtime_error("hosted store: artifact '" + file.name + "' does not match its manifest");
+    out.publish(false);
 }
 
 } // namespace vc::objects

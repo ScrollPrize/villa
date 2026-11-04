@@ -10,6 +10,7 @@
 // the outcome is unknown; recover it with receipt() or by submitting the
 // identical request again, never by minting a new request UUID.
 
+#include "vc_object_store/objects/Artifacts.hpp"
 #include "vc_object_store/objects/GeometryRegion.hpp"
 #include "vc_object_store/objects/ObjectStore.hpp"
 #include "vc_object_store/objects/Transactions.hpp"
@@ -96,6 +97,17 @@ public:
     // reports a budget stop (complete() is false).
     RegionResult geometryRegion(const RegionSlice&, const RegionOptions& = {}, StoreStatus* asOf = nullptr);
     std::vector<SurfaceProximityHit> nearestSurfaces(const SurfaceProximityQuery&, StoreStatus* asOf = nullptr);
+
+    // Artifact bytes (objects/Artifacts.hpp). putArtifact sends `file` unless
+    // the server already holds its content and returns its SHA-256; the
+    // server has made it durable when this returns, so a transaction may
+    // then name it in a manifest. fetchArtifact writes one manifest file to
+    // `destination` (atomically), verifying its length and hash.
+    std::string putArtifact(const std::filesystem::path& file);
+    std::optional<uint64_t> artifactLength(const std::string& sha256);
+    std::vector<uint8_t> readArtifact(const std::string& sha256, uint64_t offset = 0,
+                                      const std::optional<uint64_t>& count = std::nullopt);
+    void fetchArtifact(const ArtifactFile&, const std::filesystem::path& destination);
 
 private:
     struct Impl;

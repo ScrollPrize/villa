@@ -220,6 +220,33 @@ a recorded publication, geometry revisions that do not select one object
 version, metadata still holding old revision UUIDs, and an unversioned inventory
 of external artifact files. Converted commits have author `unrecorded`.
 
+### Artifacts
+
+Artifacts are files that belong to an object but are not geometry, such as
+fitted models, exports and logs (`objects/Artifacts.hpp`). Their bytes are
+immutable and content-addressed beside the database, at
+`<store>.artifacts/sha256/<2 hex>/<sha256>`, and read-only. An object version
+names them through a manifest in its metadata, under the `artifacts` key: a
+sorted array of `{name, sha256, length}`, with relative `/`-separated names.
+A manifest is therefore versioned, historical and in the change feed like any
+other metadata.
+
+```cpp
+const auto hash = store.putArtifact(file);  // copied (or moved) and synced to disk
+store.submit(request with SetMetaOp{object, kArtifactsMetaKey,
+                                    artifactManifestJson({{"fit/model.pt", hash, size}})});
+```
+
+`putArtifact` makes the bytes durable (file, rename and directory synced)
+before it returns, so a transaction can only reference bytes that survive a
+crash. The shared commit path refuses a changed manifest that is malformed or
+names bytes the store does not hold. This check runs whichever API wrote the
+manifest, typed request or direct `setMeta`. Bytes are never deleted while
+the store is in use, because historical versions keep naming them. A backup
+copies this directory with the database. The older mutable per-object
+directories (`ObjectStoreSession::artifactDirectory`) remain until their
+consumers move.
+
 ### Hosting a store (`vc_object_server`)
 
 `vc_object_server` serves one store over HTTP to clients that have no
@@ -237,7 +264,9 @@ ssh -N -L 8750:127.0.0.1:8750 storage-host                # on each client
 C++ clients use `vc::objects::HostedStore` (`client/HostedStore.hpp`) with the
 same request and result types as the local API: `status`, `submit`, `receipt`,
 `changesSince`, `currentObjectRevision`, `currentVersion`, `objectAtVersion`,
-`geometryRevision`, `readGeometryArray`, `selectObjects`/`selectEdges` (one
+`geometryRevision`, `readGeometryArray`, `putArtifact`, `artifactLength`,
+`readArtifact`, `fetchArtifact` (verified, atomic local file),
+`selectObjects`/`selectEdges` (one
 page), `selectAllObjects`/`selectAllEdges`, `objectHistory`, `relationshipsAt`
 (numbered object versions), `geometryRegion` and `nearestSurfaces`. Conflicts throw the same
 `TransactionConflict`. Transport failures, 429 and 5xx are retried with the same
@@ -259,6 +288,9 @@ Wire protocol (version 1, JSON unless noted):
 | `GET /v1/objects/{uuid}/versions/{n}?store&generation` | that numbered revision or 404 |
 | `GET /v1/geometry/{revision}` | geometry descriptor (immutable) |
 | `GET /v1/geometry/{revision}/arrays/{name}?offset&count` | array bytes; 413 with `max_response_bytes` above the response limit |
+| `PUT /v1/artifacts/{sha256}` (bytes, `Content-Length` required) | streamed like payloads, then kept durably by the store (`putArtifact`) |
+| `GET /v1/artifacts/{sha256}/info` | `{sha256, length}` or 404 |
+| `GET /v1/artifacts/{sha256}?offset&count` | artifact bytes; same response limit as arrays |
 | `GET /v1/objects/{uuid}/history` | every recorded revision, or 404 |
 | `POST /v1/query/objects` (`selection`, `fields`) | one page of records; `limit` required, at most `maxQueryResults` |
 | `POST /v1/query/edges` (`selection`, `fields`) | one page of edges; same limit rule |

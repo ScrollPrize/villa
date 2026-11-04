@@ -6,6 +6,7 @@
 #include "vc_object_store/server/Server.hpp"
 
 #include "vc_object_store/Uuid.hpp"
+#include "vc_object_store/objects/Artifacts.hpp"
 #include "vc_object_store/objects/ObjectStore.hpp"
 #include "vc_object_store/objects/TransactionJson.hpp"
 
@@ -159,8 +160,9 @@ public:
             if (!file_) throw std::runtime_error("cannot write staging file " + path_.string());
             written_ += size;
         }
-        // Transfer lane only: verify and publish the staged bytes.
-        Reply finish();
+        // Transfer lane only: verify the bytes, then hand the file to
+        // `deliver` (which may move it) or, without one, stage it as a payload.
+        Reply finish(const std::function<void(const std::filesystem::path&)>& deliver = {});
         const std::string& hash() const { return hash_; }
     private:
         Staging& staging_;
@@ -258,14 +260,15 @@ private:
     std::map<std::string, std::shared_ptr<Entry>> entries_;
 };
 
-Reply Staging::Upload::finish()
+Reply Staging::Upload::finish(const std::function<void(const std::filesystem::path&)>& deliver)
 {
     if (!file_.is_open()) write(nullptr, 0);  // an empty payload still gets a file
     file_.close();
     if (!file_) throw std::runtime_error("cannot write staging file " + path_.string());
     if (written_ != length_) return errorReply(http::status::bad_request, "payload shorter than its Content-Length");
     if (hasher_.finish() != hash_) return errorReply(http::status::bad_request, "payload does not match its SHA-256");
-    staging_.publish(hash_, path_, written_);
+    if (deliver) deliver(path_);  // a moved file is no longer there to remove
+    else staging_.publish(hash_, path_, written_);
     finished_ = true;
     return jsonReply(Json{{"sha256", hash_}, {"length", written_}}.dump());
 }
@@ -519,6 +522,33 @@ struct ServerState {
         return {http::status::ok, "application/octet-stream", std::string(bytes.begin(), bytes.end())};
     }
 
+    Reply artifactInfo(const std::string& hash)
+    {
+        if (!isArtifactHash(hash)) return errorReply(http::status::bad_request, "not a lowercase SHA-256: " + hash);
+        const auto length = store->artifactLength(hash);
+        if (!length) return errorReply(http::status::not_found, "this store does not hold artifact " + hash);
+        return jsonReply(Json{{"sha256", hash}, {"length", *length}}.dump());
+    }
+
+    Reply artifactBytes(const std::string& hash, const Target& target)
+    {
+        if (!isArtifactHash(hash)) return errorReply(http::status::bad_request, "not a lowercase SHA-256: " + hash);
+        const auto length = store->artifactLength(hash);
+        if (!length) return errorReply(http::status::not_found, "this store does not hold artifact " + hash);
+        const auto offset = target.integer("offset", 0);
+        std::optional<uint64_t> count;
+        if (target.query.contains("count")) count = uint64_t(std::max<int64_t>(target.integer("count"), 0));
+        if (offset < 0) return errorReply(http::status::bad_request, "negative offset");
+        const auto size = count ? *count : *length - std::min<uint64_t>(uint64_t(offset), *length);
+        if (size > options.maxResponseBytes)
+            return jsonReply(Json{{"error", "artifact read exceeds the response limit of " +
+                                            std::to_string(options.maxResponseBytes) + " bytes; read ranges"},
+                                  {"max_response_bytes", options.maxResponseBytes}}.dump(),
+                             http::status::payload_too_large);
+        const auto bytes = store->readArtifact(hash, uint64_t(offset), count);
+        return {http::status::ok, "application/octet-stream", std::string(bytes.begin(), bytes.end())};
+    }
+
     // Query pages are bounded: an absent or larger limit is refused, not cut.
     void requirePage(const std::optional<int64_t>& limit) const
     {
@@ -628,6 +658,12 @@ struct ServerState {
             return {readers.get(), [this, body] { return queryNearestSurfaces(*body); }};
         if (method == http::verb::get && is({"v1", "geometry", "*"}))
             return {readers.get(), [this, target] { return geometry(target->path[2]); }};
+        if (method == http::verb::get && is({"v1", "artifacts", "*", "info"}))
+            return {transfers.get(), [this, target] { return artifactInfo(target->path[2]); }};
+        if (method == http::verb::get && is({"v1", "artifacts", "*"})) {
+            if (responseBytes.load() > options.maxResponseBytesInFlight) return {nullptr, nullptr, true};
+            return {transfers.get(), [this, target] { return artifactBytes(target->path[2], *target); }};
+        }
         if (method == http::verb::get && is({"v1", "geometry", "*", "arrays", "*"})) {
             // Bounded download memory: unsent replies stay below the limit
             // (plus the replies being produced, each maxResponseBytes at most).
@@ -680,15 +716,25 @@ struct ServerState {
         if (!r.lane->tryPost(job)) done(errorReply(http::status::service_unavailable, "server busy; retry"));
     }
 
-    // The payload hash of a staging upload ("PUT /v1/payloads/<sha256>").
-    static std::optional<std::string> uploadHash(const http::request_header<>& header)
+    // Streamed uploads: "PUT /v1/payloads/<sha256>" (staged transaction
+    // payloads) and "PUT /v1/artifacts/<sha256>" (artifact bytes, kept).
+    struct UploadTarget {
+        std::string hash;
+        bool artifact = false;
+    };
+    static std::optional<UploadTarget> uploadTarget(const http::request_header<>& header)
     {
         if (header.method() != http::verb::put) return std::nullopt;
         const auto raw = header.target();
         const auto target = parseTarget(std::string_view(raw.data(), raw.size()));
-        if (target.path.size() != 3 || target.path[0] != "v1" || target.path[1] != "payloads") return std::nullopt;
-        return target.path[2];
+        if (target.path.size() != 3 || target.path[0] != "v1") return std::nullopt;
+        if (target.path[1] == "payloads") return UploadTarget{target.path[2], false};
+        if (target.path[1] == "artifacts") return UploadTarget{target.path[2], true};
+        return std::nullopt;
     }
+
+    // Transfer lane: a verified artifact upload becomes durable store bytes.
+    void keepArtifact(const std::filesystem::path& file) { (void)store->putArtifact(file, true); }
 
     void scheduleCheckpoints()
     {
@@ -732,7 +778,7 @@ private:
         if (ec) return close();
         keepAlive_ = header_->get().keep_alive();
         version_ = header_->get().version();
-        if (const auto hash = ServerState::uploadHash(header_->get())) return startUpload(*hash);
+        if (const auto upload = ServerState::uploadTarget(header_->get())) return startUpload(*upload);
         command_.emplace(std::move(*header_));
         command_->body_limit(server_.options.maxCommandBytes);
         http::async_read(stream_, buffer_, *command_,
@@ -753,8 +799,10 @@ private:
 
     // ---- Payload uploads: streamed to a staging file in bounded chunks. ----
 
-    void startUpload(const std::string& hash)
+    void startUpload(const ServerState::UploadTarget& target)
     {
+        const auto& hash = target.hash;
+        artifact_ = target.artifact;
         if (!Staging::isHash(hash)) return refuse(http::status::bad_request, "payload name is not a lowercase SHA-256");
         const auto length = header_->content_length();
         if (!length) return refuse(http::status::length_required, "payload uploads need a Content-Length");
@@ -798,7 +846,10 @@ private:
             std::optional<Reply> reply;
             try {
                 self->upload_->write(self->chunk_.data(), used);
-                if (done) reply = self->upload_->finish();
+                if (done && self->artifact_)
+                    reply = self->upload_->finish([&](const std::filesystem::path& file) { self->server_.keepArtifact(file); });
+                else if (done)
+                    reply = self->upload_->finish();
             } catch (const std::exception& e) {
                 std::cerr << "vc_object_server: staging failed: " << e.what() << "\n";
                 reply = errorReply(http::status::internal_server_error, e.what());
@@ -858,6 +909,7 @@ private:
     std::optional<http::request_parser<http::string_body>> command_;
     std::optional<http::request_parser<http::buffer_body>> body_;
     std::unique_ptr<Staging::Upload> upload_;
+    bool artifact_ = false;
     std::vector<char> chunk_;
     ServerState& server_;
     bool keepAlive_ = true;

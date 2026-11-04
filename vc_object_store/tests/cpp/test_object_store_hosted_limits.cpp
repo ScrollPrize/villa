@@ -6,6 +6,7 @@
 // receipt), and scheduled WAL checkpoints.
 #include "TestSupport.hpp"
 #include "vc_object_store/client/HostedStore.hpp"
+#include "vc_object_store/objects/Artifacts.hpp"
 #include "vc_object_store/geometry/Geometry.hpp"
 #include "vc_object_store/objects/ObjectStore.hpp"
 #include "vc_object_store/objects/TransactionJson.hpp"
@@ -170,6 +171,22 @@ try {
         auto txn = inspect.read();
         require(client.readGeometryArray(descriptor->uuid, array.name) ==
                     inspect.readGeometryArray(txn, descriptor->uuid, array.name), "client-side ranges");
+    }
+
+    // A 3 MiB artifact streams in and comes back through 1 MiB ranges.
+    {
+        std::string bytes(3u << 20, '\0');
+        for (std::size_t i = 0; i < bytes.size(); ++i) bytes[i] = char(i * 13 % 241);
+        const auto file = directory.path / "big.artifact";
+        std::ofstream(file, std::ios::binary) << bytes;
+        const auto hash = hosted.putArtifact(file);
+        require(inspect.artifactLength(hash) == bytes.size(), "streamed artifact kept by the store");
+        const auto back = hosted.readArtifact(hash);
+        require(std::string(back.begin(), back.end()) == bytes, "ranged artifact read");
+        hosted.fetchArtifact({"big.bin", hash, bytes.size()}, directory.path / "big.fetched");
+        std::ifstream in(directory.path / "big.fetched", std::ios::binary);
+        require(std::string(std::istreambuf_iterator<char>(in), {}) == bytes, "fetched artifact");
+        require(stagingFiles(stagingDir, ".part") == 0, "artifact upload left no staging file");
     }
 
     // Upload refusals: wrong hash, oversized, no length; none leave files.

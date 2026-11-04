@@ -3,7 +3,7 @@
 // filesystem access to it. Handlers only adapt the wire to the public
 // ObjectStore APIs (submit, receipt, status, changesSince, historical reads,
 // object/edge selections, object history, numbered relationship selections,
-// region and surface proximity queries); /v1/service reports the service's
+// region and surface proximity queries, artifact bytes); /v1/service reports the service's
 // own state (queues, staging, connections, WAL checkpoints);
 // storage semantics live in the shared library.
 //
