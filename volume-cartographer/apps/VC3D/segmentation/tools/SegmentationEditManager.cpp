@@ -6,7 +6,7 @@
 
 #include <QLoggingCategory>
 
-#include "utils/Json.hpp"
+#include <nlohmann/json.hpp>
 #include <algorithm>
 #include <cmath>
 #include <utility>
@@ -25,7 +25,7 @@ void ensureSurfaceMetaObject(QuadSurface* surface)
     if (!surface->meta.is_null() && surface->meta.is_object()) {
         return;
     }
-    surface->meta = utils::Json::object();
+    surface->meta = nlohmann::json::object();
 }
 }
 
@@ -489,11 +489,8 @@ bool SegmentationEditManager::applyExternalSurfaceUpdate(const cv::Rect& vertexR
 
 std::optional<std::pair<int, int>> SegmentationEditManager::worldToGridIndex(const cv::Vec3f& worldPos,
                                                                               float* outDistance,
-                                                                              GridSearchResolution detail,
                                                                               bool warnOnFailure) const
 {
-    (void)detail;
-
     if (!_baseSurface) {
         return std::nullopt;
     }
@@ -844,28 +841,6 @@ std::vector<SegmentationEditManager::VertexEdit> SegmentationEditManager::edited
         result.push_back(entry.second);
     }
     return result;
-}
-
-std::optional<cv::Rect> SegmentationEditManager::recentTouchedBounds() const
-{
-    if (_recentTouched.empty()) {
-        return std::nullopt;
-    }
-
-    int minRow = _recentTouched.front().row;
-    int maxRow = minRow;
-    int minCol = _recentTouched.front().col;
-    int maxCol = minCol;
-
-    for (const auto& key : _recentTouched) {
-        minRow = std::min(minRow, key.row);
-        maxRow = std::max(maxRow, key.row);
-        minCol = std::min(minCol, key.col);
-        maxCol = std::max(maxCol, key.col);
-    }
-
-    cv::Rect rect(minCol, minRow, maxCol - minCol + 1, maxRow - minRow + 1);
-    return rect;
 }
 
 void SegmentationEditManager::markNextEditsAsGrowth()

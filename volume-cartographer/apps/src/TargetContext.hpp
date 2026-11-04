@@ -1,6 +1,7 @@
+#include <fstream>
 #pragma once
 
-#include "utils/Json.hpp"
+#include <nlohmann/json.hpp>
 
 #include <filesystem>
 #include <string>
@@ -10,7 +11,7 @@
 // inside a volpkg's volumes/ directory, the scroll it belongs to
 // (`scroll_source`, from the volpkg's config.json name or its folder name).
 // Keys the meta already has are left alone.
-inline void add_target_context(utils::Json& meta, const std::filesystem::path& volume_path)
+inline void add_target_context(nlohmann::json& meta, const std::filesystem::path& volume_path)
 {
     std::filesystem::path normalized_volume_path = volume_path.lexically_normal();
     if (normalized_volume_path.filename().empty()) {
@@ -34,9 +35,9 @@ inline void add_target_context(utils::Json& meta, const std::filesystem::path& v
     std::error_code ec;
     if (std::filesystem::is_regular_file(config_path, ec)) {
         try {
-            auto cfg = utils::Json::parse_file(config_path);
+            auto cfg = nlohmann::json::parse(std::ifstream(config_path));
             if (cfg.contains("name") && cfg["name"].is_string()) {
-                scroll_name = cfg["name"].get_string();
+                scroll_name = cfg["name"].get<std::string>();
             }
         } catch (...) {
             // Keep folder-based fallback if config.json cannot be parsed.

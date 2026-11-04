@@ -5,9 +5,8 @@ from pathlib import Path
 
 import numpy as np
 import pytest
-import zarr
 
-from vesuvius.data.utils import open_zarr
+from vc_reader.reader import ZarrWriter, open_zarr
 from vesuvius.models.run import inference
 from vesuvius.models.run.blending import InMemoryBlender, merge_inference_outputs, part_z_range, patches_in_z_range
 from vesuvius.models.run.finalize_outputs import FinalizeConfig
@@ -30,18 +29,18 @@ def _patches(num_classes):
 
 def _write_parts(parent: Path, coords, logits):
     """The two stores vesuvius.predict writes for one part."""
-    store = open_zarr(str(parent / "logits_part_0.zarr"), mode="w", shape=logits.shape,
-                      chunks=(1, logits.shape[1], *PATCH), dtype=np.float16, write_empty_chunks=False)
+    store = ZarrWriter.create(parent / "logits_part_0.zarr", shape=logits.shape,
+                              chunks=(1, logits.shape[1], *PATCH), dtype=np.float16, skip_empty=True)
     store[:] = logits
     store.attrs["patch_size"] = list(PATCH)
     store.attrs["original_volume_shape"] = list(VOLUME)
-    coords_store = open_zarr(str(parent / "coordinates_part_0.zarr"), mode="w", shape=coords.shape,
-                             chunks=coords.shape, dtype=np.int32)
+    coords_store = ZarrWriter.create(parent / "coordinates_part_0.zarr", shape=coords.shape,
+                                     chunks=coords.shape, dtype=np.int32)
     coords_store[:] = coords
 
 
 def _read(path):
-    return np.asarray(zarr.open(str(path), mode="r")[:])
+    return np.asarray(open_zarr(str(path))[:])
 
 
 @pytest.mark.parametrize(

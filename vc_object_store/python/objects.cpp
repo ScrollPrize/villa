@@ -10,7 +10,7 @@
 #include "vc_object_store/objects/ObjectStore.hpp"
 #include "vc_object_store/objects/Hub.hpp"
 #include "vc_object_store/objects/Project.hpp"
-#include "vc_object_store/sftp/Sftp.hpp"
+#include "vc_reader/sftp.hpp"
 #include "vc_object_store/object_links/ObjectLinks.hpp"
 #include "vc_object_store/CtSheetNormal.hpp"
 using namespace vc::python;
@@ -345,12 +345,12 @@ NB_MODULE(_native, m)
 
     // ssh prompts arrive on a helper thread while hub calls run with the GIL released.
     m.def("set_sftp_authenticator", [](nb::object callback) {
-        if (callback.is_none()) return vc::sftp::setAuthenticator({});
+        if (callback.is_none()) return vcr::sftp::setAuthenticator({});
         auto held = std::shared_ptr<nb::object>(new nb::object(std::move(callback)), [](nb::object* object) {
             nb::gil_scoped_acquire acquire;
             delete object;
         });
-        vc::sftp::setAuthenticator([held](const vc::sftp::Prompt& prompt) -> std::optional<std::string> {
+        vcr::sftp::setAuthenticator([held](const vcr::sftp::Prompt& prompt) -> std::optional<std::string> {
             nb::gil_scoped_acquire acquire;
             const auto answer = (*held)(prompt.destination, prompt.text, prompt.confirmation);
             if (answer.is_none()) return std::nullopt;
@@ -360,13 +360,13 @@ NB_MODULE(_native, m)
        "Answer ssh prompts for sftp:// hubs: callback(destination, prompt, confirmation) returns the answer, "
        "or None to cancel. Without one, ssh runs in batch mode (keys and agent only).");
     m.def("use_terminal_sftp_prompts", [] {
-        auto authenticator = vc::sftp::terminalAuthenticator();
+        auto authenticator = vcr::sftp::terminalAuthenticator();
         const bool available = static_cast<bool>(authenticator);
-        vc::sftp::setAuthenticator(std::move(authenticator));
+        vcr::sftp::setAuthenticator(std::move(authenticator));
         return available;
     }, "Ask ssh prompts on the controlling terminal; returns False when there is none.");
     // A callback must not outlive the interpreter.
-    nb::module_::import_("atexit").attr("register")(nb::cpp_function([] { vc::sftp::setAuthenticator({}); }));
+    nb::module_::import_("atexit").attr("register")(nb::cpp_function([] { vcr::sftp::setAuthenticator({}); }));
 
     auto store = nb::class_<PyObjectStore>(m, "ObjectStore")
         .def_static("create", &PyObjectStore::create, nb::arg("path"), nb::arg("author"),

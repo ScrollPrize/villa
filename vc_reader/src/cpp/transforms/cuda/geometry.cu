@@ -145,7 +145,7 @@ __device__ void geometry_kernel(KernelIndex vcr_launch, const T* src, T* dst, La
         if (p.nearest) {
             bool valid = true; std::size_t at = 0;
             for (int a = 0; a < dim; ++a) {
-                auto x = lo[a] + (p.mode == 2 ? 0 : (fraction[a] > .5 || (fraction[a] == .5 && (p.mode == 1 || lo[a]%2 != 0))));
+                auto x = lo[a] + (p.mode == 2 ? 0 : nearest_rounds_up(fraction[a]));
                 if (x < 0 || x >= static_cast<long long>(in.shape[a])) valid = false; else at += x*in.stride[a];
             }
             if (valid) dst[i] = src[channel*in.size+at];
@@ -245,7 +245,7 @@ DeviceArray resize_cuda(const DeviceArray& src, const Shape& shape, bool nearest
         });
         check(cudaGetLastError());return out;
     }
-    auto p = geometry(shape); p.border = true; p.nearest_mode = legacy ? 2 : 1;
+    auto p = geometry(shape); p.border = true; p.nearest_mode = legacy ? 2 : 0;
     for (std::size_t a = 0; a < shape.size(); ++a) {
         const double ratio = double(src.shape[a+1])/shape[a];
         p.matrix[a*shape.size()+a] = ratio; p.offset[a] = legacy ? 0 : .5*ratio-.5;

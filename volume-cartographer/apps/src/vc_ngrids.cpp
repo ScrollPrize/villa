@@ -1,3 +1,4 @@
+#include <vc_reader/sampling.hpp>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -17,10 +18,12 @@
 #include <unordered_set>
 
 #include <boost/program_options.hpp>
-#include "utils/Json.hpp"
-#include <utils/zarr.hpp>
+#include <nlohmann/json.hpp>
+#include <vc_reader/zarr.hpp>
+#include <vc_reader/zarr_write.hpp>
+#include <vc_reader/array.hpp>
 #include <opencv2/core/types.hpp>
-#include <opencv2/imgcodecs.hpp>
+#include "vc/core/util/ImageMat.hpp"
 
 #include <ceres/tiny_solver.h>
 #include <ceres/tiny_solver_autodiff_function.h>
@@ -30,16 +33,13 @@
 #include "vc/core/util/NormalGridVolume.hpp"
 #include "vc/core/util/QuadSurface.hpp"
 #include "vc/core/util/SparseChunkSpool.hpp"
-#include "vc/core/util/Zarr.hpp"
-
-#include "vc/core/types/VcDataset.hpp"
 
 namespace fs = std::filesystem;
 namespace po = boost::program_options;
 
 namespace {
 
-using Json = utils::Json;
+using Json = nlohmann::json;
 
 template <typename Solver, typename = void>
 struct TinySolverParameterVector {
@@ -167,18 +167,18 @@ static FitOutputMaterializeStats materialize_fit_output_spool(
     std::vector<std::thread> threads;
     threads.reserve(numThreads);
 
+    auto dsx = vcr::zarr::Writer::open(out_zarr / "x" / "0");
+    auto dsy = vcr::zarr::Writer::open(out_zarr / "y" / "0");
+    auto dsz = vcr::zarr::Writer::open(out_zarr / "z" / "0");
+    auto ds_fit_rms = vcr::zarr::Writer::open(out_zarr / "fit_rms" / "0");
+    auto ds_fit_frac = vcr::zarr::Writer::open(out_zarr / "fit_frac_short_paths" / "0");
+    auto ds_fit_rad = vcr::zarr::Writer::open(out_zarr / "fit_used_radius" / "0");
+    auto ds_fit_sc = vcr::zarr::Writer::open(out_zarr / "fit_segment_count" / "0");
+
     for (size_t tid = 0; tid < numThreads; ++tid) {
         threads.emplace_back([&, tid]() {
             (void)tid;
             try {
-                vc::VcDataset dsx(out_zarr / "x" / "0");
-                vc::VcDataset dsy(out_zarr / "y" / "0");
-                vc::VcDataset dsz(out_zarr / "z" / "0");
-                vc::VcDataset ds_fit_rms(out_zarr / "fit_rms" / "0");
-                vc::VcDataset ds_fit_frac(out_zarr / "fit_frac_short_paths" / "0");
-                vc::VcDataset ds_fit_rad(out_zarr / "fit_used_radius" / "0");
-                vc::VcDataset ds_fit_sc(out_zarr / "fit_segment_count" / "0");
-
                 std::vector<uint8_t> buf_x(chunkElems, 128);
                 std::vector<uint8_t> buf_y(chunkElems, 128);
                 std::vector<uint8_t> buf_z(chunkElems, 128);
@@ -221,13 +221,14 @@ static FitOutputMaterializeStats materialize_fit_output_spool(
                         buf_fit_sc[lin] = record.values[6];
                     }
 
-                    dsx.writeChunk(chunk.z, chunk.y, chunk.x, buf_x.data(), buf_x.size());
-                    dsy.writeChunk(chunk.z, chunk.y, chunk.x, buf_y.data(), buf_y.size());
-                    dsz.writeChunk(chunk.z, chunk.y, chunk.x, buf_z.data(), buf_z.size());
-                    ds_fit_rms.writeChunk(chunk.z, chunk.y, chunk.x, buf_fit_rms.data(), buf_fit_rms.size());
-                    ds_fit_frac.writeChunk(chunk.z, chunk.y, chunk.x, buf_fit_frac.data(), buf_fit_frac.size());
-                    ds_fit_rad.writeChunk(chunk.z, chunk.y, chunk.x, buf_fit_rad.data(), buf_fit_rad.size());
-                    ds_fit_sc.writeChunk(chunk.z, chunk.y, chunk.x, buf_fit_sc.data(), buf_fit_sc.size());
+                    const vcr::Index index{int64_t(chunk.z), int64_t(chunk.y), int64_t(chunk.x)};
+                    dsx.writeChunk(index, buf_x.data(), buf_x.size());
+                    dsy.writeChunk(index, buf_y.data(), buf_y.size());
+                    dsz.writeChunk(index, buf_z.data(), buf_z.size());
+                    ds_fit_rms.writeChunk(index, buf_fit_rms.data(), buf_fit_rms.size());
+                    ds_fit_frac.writeChunk(index, buf_fit_frac.data(), buf_fit_frac.size());
+                    ds_fit_rad.writeChunk(index, buf_fit_rad.data(), buf_fit_rad.size());
+                    ds_fit_sc.writeChunk(index, buf_fit_sc.data(), buf_fit_sc.size());
                 }
             } catch (...) {
                 std::lock_guard<std::mutex> lock(errorMutex);
@@ -251,7 +252,7 @@ static FitOutputMaterializeStats materialize_fit_output_spool(
 }
 
 static inline uint8_t encode_dir_component(float v) {
-    // Match direction-field encoding used by Chunked3dVec3fFromUint8:
+    // Direction-field encoding:
     // decode: (u8 - 128) / 127 -> [-1, 1]
     if (!std::isfinite(v)) return 128;
     v = std::max(-1.0f, std::min(1.0f, v));
@@ -966,53 +967,43 @@ static void run_vis_ply(const fs::path& input_dir, const fs::path& out_ply, cons
 }
 
 static bool looks_like_normals_zarr_root(const fs::path& input_dir) {
-    // Minimal heuristic: groups x,y,z exist and each has a scale dataset directory ("0").
-    return fs::is_directory(input_dir / "x") && fs::is_directory(input_dir / "y") && fs::is_directory(input_dir / "z") &&
-           fs::is_directory(input_dir / "x" / "0") && fs::is_directory(input_dir / "y" / "0") && fs::is_directory(input_dir / "z" / "0");
+    // Groups x, y, z, each with a level-0 Zarr array.
+    for (const char* axis : {"x", "y", "z"})
+        if (!vcr::zarr::isLocalZarrArray(input_dir / axis / "0")) return false;
+    return true;
 }
 
 static void run_vis_normals_zarr_as_ply(const fs::path& zarr_root, const fs::path& out_ply, const std::optional<CropBox3i>& crop_opt) {
-    // Determine delimiter from x/0/.zarray (fallback "." to match other tools).
-    std::string delim = ".";
-    {
-        try {
-            auto meta = utils::ZarrArray::open(zarr_root / "x" / "0").metadata();
-            if (!meta.dimension_separator.empty()) delim = meta.dimension_separator;
-        } catch (...) {}
-    }
-
     // Optional metadata written by vc_ngrids --output-zarr.
     cv::Vec3i origin_xyz(0, 0, 0);
     int step = 1;
     {
         try {
-            utils::Json attrs = vc::readZarrAttributes(zarr_root);
+            const auto attrs = vcr::zarr::readAttributes(zarr_root);
             if (attrs.contains("grid_origin_xyz") && attrs["grid_origin_xyz"].is_array() && attrs["grid_origin_xyz"].size() == 3) {
-                origin_xyz = cv::Vec3i(attrs["grid_origin_xyz"][0].get_int(), attrs["grid_origin_xyz"][1].get_int(), attrs["grid_origin_xyz"][2].get_int());
+                origin_xyz = cv::Vec3i(attrs["grid_origin_xyz"][0].get<int>(), attrs["grid_origin_xyz"][1].get<int>(), attrs["grid_origin_xyz"][2].get<int>());
             }
             if (attrs.contains("sample_step")) {
-                step = std::max(1, attrs["sample_step"].get_int());
+                step = std::max(1, attrs["sample_step"].get<int>());
             }
         } catch (...) {
             // Attributes are optional; keep defaults.
         }
     }
 
-    auto open_u8_zyx = [&](const char* axis) -> std::unique_ptr<vc::VcDataset> {
-        return std::make_unique<vc::VcDataset>(zarr_root / axis / "0");
-    };
-
-    auto dsx = open_u8_zyx("x");
-    auto dsy = open_u8_zyx("y");
-    auto dsz = open_u8_zyx("z");
-    if (!dsx || !dsy || !dsz) {
-        throw std::runtime_error("Failed to open x/y/z datasets under zarr root: " + zarr_root.string());
+    auto dsx = vcr::zarr::openArray((zarr_root / "x" / "0").string(), {});
+    auto dsy = vcr::zarr::openArray((zarr_root / "y" / "0").string(), {});
+    auto dsz = vcr::zarr::openArray((zarr_root / "z" / "0").string(), {});
+    for (const auto* array : {&dsx, &dsy, &dsz}) {
+        if (array->meta.type.kind != 'u' || array->meta.itemsize() != 1) {
+            throw std::runtime_error("Expected uint8 direction-field data under: " + zarr_root.string());
+        }
     }
-    if (dsx->shape() != dsy->shape() || dsx->shape() != dsz->shape()) {
+    if (dsx.meta.shape != dsy.meta.shape || dsx.meta.shape != dsz.meta.shape) {
         throw std::runtime_error("x/y/z datasets have different shapes under: " + zarr_root.string());
     }
 
-    const auto& shape = dsx->shape();
+    const auto& shape = dsx.meta.shape;
     if (shape.size() != 3) {
         throw std::runtime_error("Expected 3D datasets (ZYX) for normals zarr under: " + zarr_root.string());
     }
@@ -1023,15 +1014,9 @@ static void run_vis_normals_zarr_as_ply(const fs::path& zarr_root, const fs::pat
     std::vector<uint8_t> ax(Z * Y * X, 0);
     std::vector<uint8_t> ay(Z * Y * X, 0);
     std::vector<uint8_t> az(Z * Y * X, 0);
-    {
-        std::vector<size_t> off = {0, 0, 0};
-        std::vector<size_t> regionShape = {Z, Y, X};
-        if (!dsx->readRegion(off, regionShape, ax.data()) ||
-            !dsy->readRegion(off, regionShape, ay.data()) ||
-            !dsz->readRegion(off, regionShape, az.data())) {
-            throw std::runtime_error("Failed to read x/y/z datasets under zarr root: " + zarr_root.string());
-        }
-    }
+    dsx.array->read_many({{0, 0, 0}}, {shape}, {ax.data()});
+    dsy.array->read_many({{0, 0, 0}}, {shape}, {ay.data()});
+    dsz.array->read_many({{0, 0, 0}}, {shape}, {az.data()});
 
     const CropBox3i crop = crop_opt.value_or(CropBox3i{
         cv::Vec3i(std::numeric_limits<int>::min() / 4,
@@ -1089,46 +1074,35 @@ static void run_vis_normals_zarr_on_surf_edges_as_ply(
     const fs::path& surf_tifxyz,
     const fs::path& out_ply,
     const std::optional<CropBox3i>& crop_opt) {
-    // Determine delimiter from x/0/.zarray (fallback ".").
-    std::string delim = ".";
-    {
-        try {
-            auto meta = utils::ZarrArray::open(zarr_root / "x" / "0").metadata();
-            if (!meta.dimension_separator.empty()) delim = meta.dimension_separator;
-        } catch (...) {}
-    }
-
     // Optional metadata written by vc_ngrids --output-zarr.
     cv::Vec3i origin_xyz(0, 0, 0);
     int step = 1;
     {
         try {
-            utils::Json attrs = vc::readZarrAttributes(zarr_root);
+            const auto attrs = vcr::zarr::readAttributes(zarr_root);
             if (attrs.contains("grid_origin_xyz") && attrs["grid_origin_xyz"].is_array() && attrs["grid_origin_xyz"].size() == 3) {
-                origin_xyz = cv::Vec3i(attrs["grid_origin_xyz"][0].get_int(), attrs["grid_origin_xyz"][1].get_int(), attrs["grid_origin_xyz"][2].get_int());
+                origin_xyz = cv::Vec3i(attrs["grid_origin_xyz"][0].get<int>(), attrs["grid_origin_xyz"][1].get<int>(), attrs["grid_origin_xyz"][2].get<int>());
             }
             if (attrs.contains("sample_step")) {
-                step = std::max(1, attrs["sample_step"].get_int());
+                step = std::max(1, attrs["sample_step"].get<int>());
             }
         } catch (...) {
             // optional
         }
     }
 
-    auto open_u8_zyx = [&](const char* axis) -> std::unique_ptr<vc::VcDataset> {
-        return std::make_unique<vc::VcDataset>(zarr_root / axis / "0");
-    };
-
-    auto dsx = open_u8_zyx("x");
-    auto dsy = open_u8_zyx("y");
-    auto dsz = open_u8_zyx("z");
-    if (!dsx || !dsy || !dsz) {
-        throw std::runtime_error("Failed to open x/y/z datasets under zarr root: " + zarr_root.string());
+    auto dsx = vcr::zarr::openArray((zarr_root / "x" / "0").string(), {});
+    auto dsy = vcr::zarr::openArray((zarr_root / "y" / "0").string(), {});
+    auto dsz = vcr::zarr::openArray((zarr_root / "z" / "0").string(), {});
+    for (const auto* array : {&dsx, &dsy, &dsz}) {
+        if (array->meta.type.kind != 'u' || array->meta.itemsize() != 1) {
+            throw std::runtime_error("Expected uint8 direction-field data under: " + zarr_root.string());
+        }
     }
-    if (dsx->shape() != dsy->shape() || dsx->shape() != dsz->shape()) {
+    if (dsx.meta.shape != dsy.meta.shape || dsx.meta.shape != dsz.meta.shape) {
         throw std::runtime_error("x/y/z datasets have different shapes under: " + zarr_root.string());
     }
-    const auto& shape = dsx->shape();
+    const auto& shape = dsx.meta.shape;
     if (shape.size() != 3) {
         throw std::runtime_error("Expected 3D datasets (ZYX) for normals zarr under: " + zarr_root.string());
     }
@@ -1139,15 +1113,9 @@ static void run_vis_normals_zarr_on_surf_edges_as_ply(
     std::vector<uint8_t> ax(Z * Y * X, 0);
     std::vector<uint8_t> ay(Z * Y * X, 0);
     std::vector<uint8_t> az(Z * Y * X, 0);
-    {
-        std::vector<size_t> off = {0, 0, 0};
-        std::vector<size_t> regionShape = {Z, Y, X};
-        if (!dsx->readRegion(off, regionShape, ax.data()) ||
-            !dsy->readRegion(off, regionShape, ay.data()) ||
-            !dsz->readRegion(off, regionShape, az.data())) {
-            throw std::runtime_error("Failed to read x/y/z datasets under zarr root: " + zarr_root.string());
-        }
-    }
+    dsx.array->read_many({{0, 0, 0}}, {shape}, {ax.data()});
+    dsy.array->read_many({{0, 0, 0}}, {shape}, {ay.data()});
+    dsz.array->read_many({{0, 0, 0}}, {shape}, {az.data()});
 
     const CropBox3i crop = crop_opt.value_or(CropBox3i{
         cv::Vec3i(std::numeric_limits<int>::min() / 4,
@@ -1169,59 +1137,16 @@ static void run_vis_normals_zarr_on_surf_edges_as_ply(
         const double gy = (static_cast<double>(p_xyz.y) - origin_xyz[1]) / static_cast<double>(step);
         const double gz = (static_cast<double>(p_xyz.z) - origin_xyz[2]) / static_cast<double>(step);
 
-        int x0 = static_cast<int>(std::floor(gx));
-        int y0 = static_cast<int>(std::floor(gy));
-        int z0 = static_cast<int>(std::floor(gz));
-        x0 = std::clamp(x0, 0, static_cast<int>(X) - 2);
-        y0 = std::clamp(y0, 0, static_cast<int>(Y) - 2);
-        z0 = std::clamp(z0, 0, static_cast<int>(Z) - 2);
-        const int x1 = x0 + 1;
-        const int y1 = y0 + 1;
-        const int z1 = z0 + 1;
-
-        if (is_fill(static_cast<size_t>(z0), static_cast<size_t>(y0), static_cast<size_t>(x0)) ||
-            is_fill(static_cast<size_t>(z1), static_cast<size_t>(y0), static_cast<size_t>(x0)) ||
-            is_fill(static_cast<size_t>(z0), static_cast<size_t>(y1), static_cast<size_t>(x0)) ||
-            is_fill(static_cast<size_t>(z1), static_cast<size_t>(y1), static_cast<size_t>(x0)) ||
-            is_fill(static_cast<size_t>(z0), static_cast<size_t>(y0), static_cast<size_t>(x1)) ||
-            is_fill(static_cast<size_t>(z1), static_cast<size_t>(y0), static_cast<size_t>(x1)) ||
-            is_fill(static_cast<size_t>(z0), static_cast<size_t>(y1), static_cast<size_t>(x1)) ||
-            is_fill(static_cast<size_t>(z1), static_cast<size_t>(y1), static_cast<size_t>(x1))) {
-            return false;
-        }
-
-        double tx = gx - x0;
-        double ty = gy - y0;
-        double tz = gz - z0;
-        tx = std::clamp(tx, 0.0, 1.0);
-        ty = std::clamp(ty, 0.0, 1.0);
-        tz = std::clamp(tz, 0.0, 1.0);
-
-        auto lerp = [](double a, double b, double t) { return (1.0 - t) * a + t * b; };
-        auto tri = [&](double c000, double c100, double c010, double c110,
-                       double c001, double c101, double c011, double c111) -> double {
-            const double c00 = lerp(c000, c001, tx);
-            const double c01 = lerp(c010, c011, tx);
-            const double c10 = lerp(c100, c101, tx);
-            const double c11 = lerp(c110, c111, tx);
-            const double c0 = lerp(c00, c01, ty);
-            const double c1 = lerp(c10, c11, ty);
-            return lerp(c0, c1, tz);
+        const int shapeZYX[3]{int(Z),int(Y),int(X)};
+        const double xyz[3]{gx,gy,gz};
+        const auto valid = [&](int z,int y,int x) { return !is_fill(z,y,x); };
+        const auto sample = [&](const std::vector<uint8_t>& field,double& out) {
+            return vcr::sampling::sampleCube([&](int z,int y,int x) {
+                return double(decode(field[(size_t(z)*Y+size_t(y))*X+size_t(x)]));
+            },valid,shapeZYX,xyz,out);
         };
-
-        auto c = [&](const std::vector<uint8_t>& a, int zz, int yy, int xx) -> double {
-            return static_cast<double>(decode(a[static_cast<size_t>(zz) * Y * X + static_cast<size_t>(yy) * X + static_cast<size_t>(xx)]));
-        };
-
-        const double nx = tri(
-            c(ax, z0, y0, x0), c(ax, z1, y0, x0), c(ax, z0, y1, x0), c(ax, z1, y1, x0),
-            c(ax, z0, y0, x1), c(ax, z1, y0, x1), c(ax, z0, y1, x1), c(ax, z1, y1, x1));
-        const double ny = tri(
-            c(ay, z0, y0, x0), c(ay, z1, y0, x0), c(ay, z0, y1, x0), c(ay, z1, y1, x0),
-            c(ay, z0, y0, x1), c(ay, z1, y0, x1), c(ay, z0, y1, x1), c(ay, z1, y1, x1));
-        const double nz = tri(
-            c(az, z0, y0, x0), c(az, z1, y0, x0), c(az, z0, y1, x0), c(az, z1, y1, x0),
-            c(az, z0, y0, x1), c(az, z1, y0, x1), c(az, z0, y1, x1), c(az, z1, y1, x1));
+        double nx,ny,nz;
+        if(!sample(ax,nx)||!sample(ay,ny)||!sample(az,nz))return false;
 
         const double nlen2 = nx * nx + ny * ny + nz * nz;
         if (!(nlen2 > 1e-24)) return false;
@@ -1323,24 +1248,29 @@ static void create_normals_output_zarr(
     const std::optional<CropIndexBox3z>& crop_zyx = std::nullopt)
 {
     std::filesystem::create_directories(out_zarr);
-    vc::createZarrDataset(out_zarr / "x", "0", layout.fullShapeZyx, layout.chunkShapeZyx, vc::VcDtype::uint8, "blosc", "/", 128);
-    vc::createZarrDataset(out_zarr / "y", "0", layout.fullShapeZyx, layout.chunkShapeZyx, vc::VcDtype::uint8, "blosc", "/", 128);
-    vc::createZarrDataset(out_zarr / "z", "0", layout.fullShapeZyx, layout.chunkShapeZyx, vc::VcDtype::uint8, "blosc", "/", 128);
+    vcr::zarr::CreateOptions options;
+    options.shape.assign(layout.fullShapeZyx.begin(), layout.fullShapeZyx.end());
+    options.chunks.assign(layout.chunkShapeZyx.begin(), layout.chunkShapeZyx.end());
+    options.separator = "/";
+    options.fillValue = 128;
+    for (const auto* axis : {"x", "y", "z"}) {
+        vcr::zarr::Writer::create(out_zarr / axis / "0", options);
+    }
 
     auto mk3i = [](auto a, auto b, auto c) {
-        utils::Json arr = utils::Json::array();
+        nlohmann::json arr = nlohmann::json::array();
         arr.push_back(static_cast<int64_t>(a));
         arr.push_back(static_cast<int64_t>(b));
         arr.push_back(static_cast<int64_t>(c));
         return arr;
     };
 
-    utils::Json encoding = utils::Json::object();
+    nlohmann::json encoding = nlohmann::json::object();
     encoding["type"] = "direction-field-u8";
     encoding["decode"] = "(u8-128)/127";
     encoding["fill_value"] = 128;
 
-    utils::Json attrs = utils::Json::object();
+    nlohmann::json attrs = nlohmann::json::object();
     attrs["source"] = "vc_ngrids";
     attrs["description"] = "Direction-field encoded normals: x/0,y/0,z/0 uint8 with decode (u8-128)/127";
     attrs["encoding"] = encoding;
@@ -1354,7 +1284,7 @@ static void create_normals_output_zarr(
         attrs["crop_shape_zyx"] = mk3i(
             crop_zyx->shape[0], crop_zyx->shape[1], crop_zyx->shape[2]);
     }
-    vc::writeZarrAttributes(out_zarr, attrs);
+    vcr::zarr::writeAttributes(out_zarr, attrs);
 }
 
 static std::vector<size_t> bounded_normals_output_chunks(
@@ -1626,7 +1556,7 @@ static void run_fit_normals(
     const int crop_off_z = sz0 / step;
     {
         auto mk3i = [](int a, int b, int c) {
-            utils::Json arr = utils::Json::array();
+            nlohmann::json arr = nlohmann::json::array();
             arr.push_back(a); arr.push_back(b); arr.push_back(c);
             return arr;
         };
@@ -2240,14 +2170,13 @@ static void run_fit_normals(
 
     if (dbg_tif) {
         // Write float TIFFs into the current working directory.
-        // NOTE: OpenCV will write 32-bit float TIFFs when passed CV_32F mats.
-        cv::imwrite((fs::path("dbg_fit_rms.tif")).string(), dbg_rms);
-        cv::imwrite((fs::path("dbg_fit_used_radius.tif")).string(), dbg_used_radius);
-        cv::imwrite((fs::path("dbg_fit_sample_count_sum.tif")).string(), dbg_nsamp_sum);
-        cv::imwrite((fs::path("dbg_fit_sample_count_xy.tif")).string(), dbg_nsamp_xy);
-        cv::imwrite((fs::path("dbg_fit_sample_count_xz.tif")).string(), dbg_nsamp_xz);
-        cv::imwrite((fs::path("dbg_fit_sample_count_yz.tif")).string(), dbg_nsamp_yz);
-        cv::imwrite((fs::path("dbg_fit_frac_used_short_paths.tif")).string(), dbg_frac_used_short_paths);
+        vcr::sources::writeTiff(fs::path("dbg_fit_rms.tif"), vc::core::util::imageBuffer(dbg_rms).view());
+        vcr::sources::writeTiff(fs::path("dbg_fit_used_radius.tif"), vc::core::util::imageBuffer(dbg_used_radius).view());
+        vcr::sources::writeTiff(fs::path("dbg_fit_sample_count_sum.tif"), vc::core::util::imageBuffer(dbg_nsamp_sum).view());
+        vcr::sources::writeTiff(fs::path("dbg_fit_sample_count_xy.tif"), vc::core::util::imageBuffer(dbg_nsamp_xy).view());
+        vcr::sources::writeTiff(fs::path("dbg_fit_sample_count_xz.tif"), vc::core::util::imageBuffer(dbg_nsamp_xz).view());
+        vcr::sources::writeTiff(fs::path("dbg_fit_sample_count_yz.tif"), vc::core::util::imageBuffer(dbg_nsamp_yz).view());
+        vcr::sources::writeTiff(fs::path("dbg_fit_frac_used_short_paths.tif"), vc::core::util::imageBuffer(dbg_frac_used_short_paths).view());
     }
 
     if (output_spool) {
@@ -2306,18 +2235,21 @@ static void run_fit_normals(
                 {static_cast<size_t>(crop_off_z), static_cast<size_t>(crop_off_y), static_cast<size_t>(crop_off_x)},
                 {static_cast<size_t>(crop_nz), static_cast<size_t>(crop_ny), static_cast<size_t>(crop_nx)},
             });
-        vc::createZarrDataset(out_zarr / "fit_rms", "0", output_shape_zyx, output_chunks_zyx, vc::VcDtype::uint8, "blosc", "/");
-        vc::createZarrDataset(out_zarr / "fit_frac_short_paths", "0", output_shape_zyx, output_chunks_zyx, vc::VcDtype::uint8, "blosc", "/");
-        vc::createZarrDataset(out_zarr / "fit_used_radius", "0", output_shape_zyx, output_chunks_zyx, vc::VcDtype::uint8, "blosc", "/");
-        vc::createZarrDataset(out_zarr / "fit_segment_count", "0", output_shape_zyx, output_chunks_zyx, vc::VcDtype::uint8, "blosc", "/");
+        vcr::zarr::CreateOptions options;
+        options.shape.assign(output_shape_zyx.begin(), output_shape_zyx.end());
+        options.chunks.assign(output_chunks_zyx.begin(), output_chunks_zyx.end());
+        options.separator = "/";
+        for (const auto* name : {"fit_rms", "fit_frac_short_paths", "fit_used_radius", "fit_segment_count"}) {
+            vcr::zarr::Writer::create(out_zarr / name / "0", options);
+        }
 
         materialize_stats = materialize_fit_output_spool(out_zarr, *output_spool, static_cast<size_t>(nthreads));
 
-        utils::Json attrs = vc::readZarrAttributes(out_zarr);
+        nlohmann::json attrs = vcr::zarr::readAttributes(out_zarr);
         attrs["radius"] = radius;
         {
             auto mk3 = [](auto a, auto b, auto c) {
-                utils::Json arr = utils::Json::array();
+                nlohmann::json arr = nlohmann::json::array();
                 arr.push_back(static_cast<int64_t>(a));
                 arr.push_back(static_cast<int64_t>(b));
                 arr.push_back(static_cast<int64_t>(c));
@@ -2336,7 +2268,7 @@ static void run_fit_normals(
         attrs["fit_frac_short_paths_decode"] = "v/255";
         attrs["fit_used_radius_decode"] = "2 + (v/255)*(512-2)";
         attrs["fit_segment_count_decode"] = "(v/255)*8192";
-        vc::writeZarrAttributes(out_zarr, attrs);
+        vcr::zarr::writeAttributes(out_zarr, attrs);
 
         std::error_code ec;
         fs::remove_all(spool_dir, ec);

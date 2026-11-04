@@ -20,8 +20,8 @@
 #include <nlohmann/json.hpp>
 #include <opencv2/core.hpp>
 
-#include "spatial/SurfaceGrid.hpp"
-#include "spatial/SurfaceIndex.hpp"
+#include <vc_object_store/geometry/SurfaceGrid.hpp>
+#include <vc_object_store/geometry/SurfaceIndex.hpp>
 #include "vc_object_store/Uuid.hpp"
 
 namespace vc::object_links {

@@ -10,7 +10,7 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 import torch
-import zarr
+from vc_reader.reader import open_group
 
 from vesuvius.ink_detection.inference import infer_full3d_tifxyz as native
 
@@ -331,24 +331,19 @@ def test_native_dataset_normalizes_only_valid_voxels_and_builds_surface_channel(
     assert torch.all(image[0, 1:, 1:, 1:] == 1)
 
     class FakeTifxyz:
-        full_resolution_shape = (2, 2)
+        full_shape = (2, 2)
+        scale = (1.0, 1.0)
 
         def __init__(self):
             yy, xx = np.mgrid[:2, :2]
-            self.x = xx.astype(np.float32)
-            self.y = yy.astype(np.float32)
-            self.z = np.zeros((2, 2), dtype=np.float32)
+            self.xyz = np.stack((xx, yy, np.zeros((2, 2))), axis=-1).astype(np.float32)
+            self.valid = np.ones((2, 2), dtype=bool)
 
-        def get_zyxs(self, stored_resolution=False):
-            return np.stack((self.z, self.y, self.x), axis=-1)
-
-        def __getitem__(self, slices):
-            return (
-                self.x[slices],
-                self.y[slices],
-                self.z[slices],
-                np.ones(self.x[slices].shape, dtype=bool),
-            )
+        def resample(self, origin, step, size, *, interpolation, normals=False):
+            rows = int(origin[0]) + int(step[0]) * np.arange(size[0])
+            columns = int(origin[1]) + int(step[1]) * np.arange(size[1])
+            xyz = self.xyz[rows[:, None], columns[None, :]]
+            return xyz, np.ones(xyz.shape[:2], dtype=bool)
 
     wrap_config = SimpleNamespace(
         data=SimpleNamespace(
@@ -427,20 +422,29 @@ def test_explicit_v2_sparse_ome_zarr_and_encoded_uint8_pyramid(tmp_path):
     native.build_downsample_levels(arrays, level0_written_chunks={target}, workers=2)
     expected = np.zeros((5, 4, 3), dtype=np.uint8)
     expected[:2, :2, :2] = values
-    multiscales = zarr.open_group(path, mode="r").attrs["multiscales"][0]
+    multiscales = open_group(path).attrs["multiscales"][0]
     assert multiscales["version"] == "0.4"
-    assert multiscales["axes"] == native.AXES
+    assert [axis["name"] for axis in multiscales["axes"]] == ["z", "y", "x"]
     assert [dataset["path"] for dataset in multiscales["datasets"]] == [
         str(level) for level in range(6)
     ]
     for level, array in enumerate(arrays):
         assert array.attrs["_ARRAY_DIMENSIONS"] == ["z", "y", "x"]
-        assert np.array_equal(np.asarray(array), expected)
-        assert multiscales["datasets"][level]["coordinateTransformations"] == [
-            {"type": "scale", "scale": [float(2**level)] * 3}
-        ]
+        assert np.array_equal(array[...], expected)
+        assert multiscales["datasets"][level]["coordinateTransformations"][0] == {
+            "type": "scale", "scale": [float(2**level)] * 3
+        }
         if level + 1 < len(arrays):
-            expected = native.downsample_mean_3d(expected)
+            expected = _downsample_mean_3d(expected)
+
+
+def _downsample_mean_3d(block):
+    """Rounded mean of each 2x2x2 block, clipped at the array's end."""
+    shape = tuple((value + 1) // 2 for value in block.shape)
+    output = np.zeros(shape, block.dtype)
+    for index in np.ndindex(shape):
+        output[index] = np.rint(block[tuple(slice(2 * i, 2 * i + 2) for i in index)].mean())
+    return output
 
 
 def test_output_reject_overwrite_and_coherent_rerun(tmp_path):
@@ -472,7 +476,7 @@ def test_output_reject_overwrite_and_coherent_rerun(tmp_path):
         overwrite=True,
     )
     assert not np.asarray(second[0]).any()
-    assert len(list(zarr.open_group(output, mode="r").array_keys())) == 6
+    assert len(list(open_group(output).array_keys())) == 6
 
 
 def test_plan_only_does_not_load_runtime_or_touch_existing_output(tmp_path, monkeypatch):
@@ -576,15 +580,15 @@ def test_injected_command_runtime_writes_then_builds_all_levels(tmp_path, monkey
         downsample_workers=1,
     )
     assert native.run_command(args) == 0
-    group = zarr.open_group(output, mode="r")
+    group = open_group(output)
     assert sorted(group.array_keys()) == [str(level) for level in range(6)]
     assert all(np.all(np.asarray(group[str(level)]) == 128) for level in range(6))
     with pytest.raises(FileExistsError):
         native.run_command(args)
-    assert np.all(np.asarray(zarr.open_group(output, mode="r")["0"]) == 128)
+    assert np.all(np.asarray(open_group(output)["0"]) == 128)
     args.overwrite = True
     assert native.run_command(args) == 0
     assert all(
-        np.all(np.asarray(zarr.open_group(output, mode="r")[str(level)]) == 128)
+        np.all(np.asarray(open_group(output)[str(level)]) == 128)
         for level in range(6)
     )

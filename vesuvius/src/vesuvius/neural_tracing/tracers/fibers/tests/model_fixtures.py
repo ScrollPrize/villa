@@ -3,7 +3,7 @@
 ``config`` is a small regression model (models/crop_transformer.py), the crop/horizon/label contract most tests use;
 ``coordinate_config`` adds recurrent refinement and ``flow_config`` is a small flow model. ``coordinate_batch``/``batch``
 hold every input the crop transformer reads (CT crop, seed, observed path and path-geometry tokens) with label targets;
-``ct_volume`` is a synthetic CT volume with its normalization record.
+``ct_volume`` is a synthetic CT volume (a local Zarr v2 array, read with vc_reader) with its normalization record.
 """
 import json
 from dataclasses import replace
@@ -113,11 +113,13 @@ def batch(cfg, b=2):
 
 
 def ct_volume(root):
-    """A 96^3 synthetic CT volume (x+2y+z) with its z-score normalization record under ``root``."""
+    """The reader and spec of a 96^3 synthetic CT volume (x+2y+z) with its z-score normalization record under
+    ``root``."""
+    from vc_reader.reader import open_zarr
     from vesuvius.neural_tracing.tracers.shared.crop_sampling import normalization as norm
-    from vesuvius.neural_tracing.tracers.shared.crop_sampling.volume import CTVolume, CTVolumeSpec
+    from vesuvius.neural_tracing.tracers.shared.crop_sampling.volume import CTVolumeSpec
     z, y, x = np.indices((96, 96, 96))
     array_at(root/'ct'/'0', (x+2*y+z).clip(0, 255))
     spec = CTVolumeSpec(str(root/'ct'), ct_level=0, ct_grid_scale=4.)
     norm.prepare_normalization(root/'run', [spec], known=dict(method=norm.ZSCORE_METHOD, volumes={}))
-    return CTVolume(spec, cache_bytes=1 << 20)
+    return open_zarr(spec.ct_zarr, level=spec.ct_level, memory_cache=1 << 20), spec

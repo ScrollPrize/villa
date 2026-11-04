@@ -4,14 +4,10 @@ from __future__ import annotations
 from functools import lru_cache, partial
 import json
 import multiprocessing
-import os
 from pathlib import Path
-import threading
-import uuid
 
-import numcodecs
 import numpy as np
-import zarr
+from vc_reader.reader import ZarrWriter, create_group, open_zarr
 
 from lasagna.lasagna_volume import ChannelGroup, LasagnaVolume
 
@@ -32,13 +28,6 @@ def resolve_output(path, output_format="compact"):
     return path, output_format
 
 
-def _open_group(path):
-    try:
-        return zarr.open_group(str(path), mode="a", zarr_format=2)
-    except TypeError:
-        return zarr.open_group(str(path), mode="a")
-
-
 def blank_fiber_channels(values):
     """Use stored/quantized presence, not unquantized model probabilities."""
     presences = {k: v for k, v in values.items() if k == "presence" or k.endswith("_presence")}
@@ -54,68 +43,47 @@ def blank_fiber_channels(values):
     return result
 
 
-def _create_array(group, name, shape, chunks, dtype, compressor, *, array_path):
+def _create_array(group, name, shape, chunks, dtype, codec):
+    """``codec``: the compressor metadata, or None."""
     if name in group:
-        array = group[name]
+        try:
+            array = open_zarr(Path(group.path) / name)
+        except ValueError as error:  # such as Fortran order
+            raise ValueError(f"existing packed array has incompatible encoding: {group.path}/{name}: {error}") from error
         if tuple(array.shape) != tuple(shape) or tuple(array.chunks) != tuple(chunks) or np.dtype(array.dtype) != np.dtype(dtype):
             raise ValueError(f"existing packed array has incompatible layout: {group.path}/{name}")
-        metadata = json.loads((Path(array_path) / ".zarray").read_text())
-        expected_codec = None if compressor is None else compressor.get_config()
-        if (metadata.get("order", "C") != "C" or metadata.get("filters")
-                or metadata.get("compressor") != expected_codec
-                or metadata.get("dimension_separator", ".") != "/"
-                or metadata.get("fill_value") != 0):
+        if (array.filters or array.compressor != codec
+                or array.meta.separator != "/" or array.fill_value != 0):
             raise ValueError(f"existing packed array has incompatible encoding: {group.path}/{name}")
         return
-    try:
-        group.create_array(name, shape=shape, chunks=chunks, dtype=dtype, fill_value=0,
-                           compressor=compressor, chunk_key_encoding={"name": "v2", "separator": "/"})
-    except (AttributeError, TypeError):
-        group.create_dataset(name, shape=shape, chunks=chunks, dtype=dtype, fill_value=0,
-                             compressor=compressor, dimension_separator="/")
+    from lasagna.tiled_predict3d import _writer_codec
+    group.create_array(name, shape=shape, chunks=chunks, dtype=dtype, separator="/", **_writer_codec(codec))
 
 
 @lru_cache(maxsize=512)
-def _array_metadata(array_path: str):
+def _writer(array_path: str) -> ZarrWriter:
     # Array metadata is immutable for a validated inference/resume layout.
-    return json.loads((Path(array_path) / ".zarray").read_text())
+    return ZarrWriter.open(array_path)
 
 
-def chunk_file(array_path, origin):
-    metadata = _array_metadata(str(array_path))
-    indices = (0, *(int(v) // int(c) for v, c in zip(origin, metadata["chunks"][1:])))
-    return Path(array_path) / metadata.get("dimension_separator", ".").join(map(str, indices))
+def _chunk_index(array_path, origin) -> tuple[int, ...]:
+    chunks = _writer(str(array_path)).chunks[1:]
+    return (0, *(int(v) // int(c) for v, c in zip(origin, chunks)))
 
 
 def atomic_chunk(array_path, origin, values):
     """Publish a whole CZYX chunk, including explicit all-fill completion."""
-    array_path = Path(array_path)
-    metadata = _array_metadata(str(array_path))
-    chunks, shape = tuple(metadata["chunks"]), tuple(metadata["shape"])
+    writer = _writer(str(array_path))
+    chunks, shape = writer.chunks, writer.shape
     expected = (shape[0], *(min(c, n-o) for c, n, o in zip(chunks[1:], shape[1:], origin)))
     if tuple(values.shape) != expected or any(o < 0 or o % c for o, c in zip(origin, chunks[1:])):
         raise ValueError("packed publication requires one complete aligned chunk")
-    if expected == chunks:
-        block = np.ascontiguousarray(values, dtype=np.dtype(metadata["dtype"]))
-    else:
-        block = np.zeros(chunks, dtype=np.dtype(metadata["dtype"]))
-        block[tuple(slice(0, n) for n in expected)] = values
-    codec = metadata.get("compressor")
-    payload = block.tobytes(order="C") if codec is None else numcodecs.get_codec(codec).encode(block)
-    destination = chunk_file(array_path, origin)
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    temporary = destination.with_name(f".tmp.{destination.name}.{os.getpid()}.{threading.get_ident()}.{uuid.uuid4().hex}")
-    try:
-        with temporary.open("xb") as file:
-            file.write(payload)
-        os.replace(temporary, destination)
-    finally:
-        temporary.unlink(missing_ok=True)
+    writer[(slice(None), *(slice(o, o+n) for o, n in zip(origin, expected[1:])))] = values
 
 
 @lru_cache(maxsize=8)
 def _pyramid_source(path):
-    return zarr.open_array(path, mode="r")
+    return open_zarr(path, threads=1)
 
 
 def _build_compact_pyramid_chunk(origin, *, source_path, dest_path, names,
@@ -123,12 +91,13 @@ def _build_compact_pyramid_chunk(origin, *, source_path, dest_path, names,
     """Spawn-safe packed chunk worker; reduction math matches the legacy path."""
     from lasagna.omezarr_pyramid import _mean_pool2x_u8, _mean_pool2x_f32, _moment_pool2x_normals
     from lasagna.tiled_predict3d import _product_channel_kind
-    if chunk_file(dest_path, origin).is_file():
+    dest = _writer(dest_path)
+    if dest.chunk_exists(_chunk_index(dest_path, origin)):
         return "skipped_existing"
     source = _pyramid_source(source_path)
-    chunks = _array_metadata(dest_path)["chunks"]
+    chunks = dest.chunks
     slices = tuple(slice(o*2, min((o+c)*2, n)) for o,c,n in zip(origin, chunks[1:], source.shape[1:]))
-    raw = np.asarray(source[(slice(None), *slices)])
+    raw = source[(slice(None), *slices)]
     output = [None] * len(names)
     for i, name in enumerate(names):
         if _product_channel_kind(name) == "nx":
@@ -200,10 +169,16 @@ class CompactOutputAdapter:
         return str(Path(self.root) / f"sd{product.level}")
 
     def chunk_paths(self, origin):
-        return tuple(chunk_file(self.array_path(products[0]), origin) for products in self.by_level.values())
+        # Packed arrays are always "/"-separated (see _create_array).
+        return tuple(self.array_path(products[0]).joinpath(*map(str, _chunk_index(self.array_path(products[0]), origin)))
+                     for products in self.by_level.values())
+
+    def _chunk_stored(self, product, level, origin):
+        path = self.array_path(product, level)
+        return _writer(str(path)).chunk_exists(_chunk_index(path, origin))
 
     def product_chunk_complete(self, product, *, chunk_origin_zyx):
-        return chunk_file(self.array_path(product), chunk_origin_zyx).is_file()
+        return self._chunk_stored(product, None, chunk_origin_zyx)
 
     def channel_chunk_exists(self, product, channel_name, *, chunk_origin_zyx):
         return self.product_chunk_complete(product, chunk_origin_zyx=chunk_origin_zyx)
@@ -213,7 +188,7 @@ class CompactOutputAdapter:
 
     def prepare(self, *, base_shape_zyx, ome_chunk, ome_compressor="blosc-zstd",
                 source_to_base=1., grad_mag_factor=1., crop=None, provenance="inference.json", extra_fields=None):
-        from lasagna.tiled_predict3d import _omezarr_compressor, _omezarr_level_shape
+        from lasagna.tiled_predict3d import _omezarr_level_shape, omezarr_compressor_config
         root = Path(self.root)
         if (root / ".zattrs").exists():
             attrs = json.loads((root / ".zattrs").read_text())
@@ -233,18 +208,18 @@ class CompactOutputAdapter:
                 raise ValueError("cannot change grad_mag_factor during resume")
         else:
             previous = None
-        _open_group(root)
+        create_group(root)
         manifest = previous or LasagnaVolume(path=root, version=3, source_to_base=source_to_base,
             base_shape_zyx=tuple(base_shape_zyx), validity_channel=self.validity_channel,
             grad_mag_factor=grad_mag_factor)
         manifest.provenance_json = provenance
         manifest.extra_fields.update(extra_fields or {})
         manifest.extra_fields["blank_invalid"] = self.blank_invalid
-        codec = _omezarr_compressor(ome_compressor)
+        codec = omezarr_compressor_config(ome_compressor)
         for n, products in self.by_level.items():
             channels = [c.name for p in products for c in p.channels]
             manifest.groups[f"sd{n}"] = ChannelGroup(f"sd{n}/{n}", n, channels)
-            group = _open_group(root / f"sd{n}")
+            group = create_group(root / f"sd{n}")
             dtype = np.result_type(*(p.dtype for p in products))
             datasets = []
             for level in range(n, self._level_stop(products[0])):
@@ -252,8 +227,7 @@ class CompactOutputAdapter:
                 # Match the coordinator's grid; source_to_base transforms
                 # coordinates in metadata, not the array dimensions.
                 _create_array(group, str(level), (len(channels), *shape),
-                              (len(channels), *(min(v, ome_chunk) for v in shape)), dtype, codec,
-                              array_path=root / f"sd{n}" / str(level))
+                              (len(channels), *(min(v, ome_chunk) for v in shape)), dtype, codec)
                 datasets.append({"path": str(level), "coordinateTransformations": [
                     {"type": "scale", "scale": [1, *([source_to_base * 2**level] * 3)]}]})
             group.attrs["multiscales"] = [{"version": "0.4", "name": f"sd{n}",
@@ -272,9 +246,9 @@ class CompactOutputAdapter:
             channels = [c.name for p in products for c in p.channels]
             for name in channels:
                 if name not in values and name in self.external_channels:
-                    source = zarr.open_array(self.external_channels[name], mode="r")
+                    source = open_zarr(self.external_channels[name])
                     first = next(iter(values.values()))
-                    values[name] = np.asarray(source[tuple(slice(o,o+n) for o,n in zip(chunk_origin_zyx, first.shape))])
+                    values[name] = source[tuple(slice(o,o+n) for o,n in zip(chunk_origin_zyx, first.shape))]
             if set(values) != set(channels):
                 raise ValueError(f"partial packed chunk publication: expected {channels}, got {list(values)}")
             if self.blank_invalid:
@@ -284,20 +258,21 @@ class CompactOutputAdapter:
             origin = tuple(chunk_origin_zyx)
             for coarse in range(level + 1, self._level_stop(products[0])):
                 coarse_origin = tuple((o // (2**(coarse-level)) // products[0].chunk_size) * products[0].chunk_size for o in origin)
-                chunk_file(self.array_path(products[0], coarse), coarse_origin).unlink(missing_ok=True)
+                coarse_path = self.array_path(products[0], coarse)
+                _writer(str(coarse_path)).remove_chunk(_chunk_index(coarse_path, coarse_origin))
             atomic_chunk(array_path, origin, np.stack([values[c] for c in channels]))
 
     def validate_chunk(self, origin, read_arrays=None):
         arrays = {} if read_arrays is None else read_arrays
         try:
             for products in self.by_level.values():
-                path = str(self.array_path(products[0]))
-                if not chunk_file(path, origin).is_file():
+                if not self._chunk_stored(products[0], None, origin):
                     return False
+                path = str(self.array_path(products[0]))
                 if path not in arrays:
-                    arrays[path] = zarr.open_array(path, mode="r")
+                    arrays[path] = open_zarr(path, read_mode="slab")
                 a = arrays[path]
-                values = np.asarray(a[(slice(None), *(slice(o, min(o+c, n)) for o,c,n in zip(origin, a.chunks[1:], a.shape[1:])))])
+                values = a[(slice(None), *(slice(o, min(o+c, n)) for o,c,n in zip(origin, a.chunks[1:], a.shape[1:])))]
                 if not np.isfinite(values).all():
                     return False
             return True
@@ -329,19 +304,16 @@ class CompactOutputAdapter:
                 methods[name] = method
             # Packed arrays use different reducers per channel, unlike legacy
             # single-channel groups whose attribute is a single method string.
-            _open_group(Path(self.root) / f"sd{native}").attrs["lasagna_pyramid_downsample"] = methods
+            create_group(Path(self.root) / f"sd{native}").attrs["lasagna_pyramid_downsample"] = methods
             for level in range(native+1, self._level_stop(products[0])):
-                source = zarr.open_array(str(self.array_path(products[0], level-1)), mode="r")
-                dest = zarr.open_array(str(self.array_path(products[0], level)), mode="r")
-                # Discover only chunks with source data; never scan the full volume grid.
-                origins = set()
                 parent = self.array_path(products[0], level-1)
-                for file in parent.glob("0/*/*/*"):
-                    if file.is_file() and all(part.isdigit() for part in file.relative_to(parent).parts):
-                        indices = tuple(map(int, file.relative_to(parent).parts[1:]))
-                        origins.add(tuple((i*c//2//d)*d for i,c,d in zip(indices, source.chunks[1:], dest.chunks[1:])))
+                source = open_zarr(parent, threads=1)
+                dest = _writer(str(self.array_path(products[0], level)))
+                # Discover only chunks with source data; never scan the full volume grid.
+                origins = {tuple((i*c//2//d)*d for i,c,d in zip(index[1:], source.chunks[1:], dest.chunks[1:]))
+                           for index in ZarrWriter.open(parent).stored_chunks()}
                 worker = partial(_build_compact_pyramid_chunk,
                     source_path=str(parent), dest_path=str(self.array_path(products[0], level)),
                     names=names, channel_dtypes=channel_dtypes, blank_invalid=self.blank_invalid)
                 _run_pool(sorted(origins), worker, workers=workers,
-                          tag=f"[pyramid sd{native} L{level}]")
+                          tag=f"[pyramid sd{native} L{level}]", processes=True)

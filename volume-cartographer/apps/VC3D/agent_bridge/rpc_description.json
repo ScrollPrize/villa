@@ -765,73 +765,6 @@
         "type": "object"
       }
     },
-    "flatten.straighten": {
-      "errors": [
-        -32602,
-        -32000,
-        -32001,
-        -32004,
-        -32005,
-        -32006,
-        -32007,
-        -32009
-      ],
-      "mcp": {
-        "extraParams": [
-          "wait"
-        ],
-        "paramRenames": {
-          "outputName": "output_name",
-          "overlapPasses": "overlap_passes",
-          "segmentId": "segment_id",
-          "trimMaxEdge": "trim_max_edge",
-          "unbendSmoothCols": "unbend_smooth_cols"
-        },
-        "tool": "vc3d_flatten_straighten"
-      },
-      "params": {
-        "properties": {
-          "orthogonalize": {
-            "default": true,
-            "type": "boolean"
-          },
-          "outputName": {
-            "type": "string"
-          },
-          "overlapPasses": {
-            "default": 2,
-            "maximum": 2147483647,
-            "minimum": 0,
-            "type": "integer"
-          },
-          "segmentId": {
-            "type": "string"
-          },
-          "trim": {
-            "default": true,
-            "type": "boolean"
-          },
-          "trimMaxEdge": {
-            "default": 100,
-            "minimum": 0,
-            "type": "number"
-          },
-          "unbend": {
-            "default": true,
-            "type": "boolean"
-          },
-          "unbendSmoothCols": {
-            "default": 300,
-            "minimum": 0,
-            "type": "number"
-          }
-        },
-        "required": [
-          "segmentId"
-        ],
-        "type": "object"
-      }
-    },
     "job.cancel": {
       "errors": [
         -32602,
@@ -2249,6 +2182,36 @@
         "type": "object"
       }
     },
+    "segmentation.manual_add.add_constraint": {
+      "errors": [
+        -32602,
+        -32000,
+        -32005,
+        -32007
+      ],
+      "mcp": {
+        "tool": "vc3d_manual_add_add_constraint"
+      },
+      "params": {
+        "properties": {
+          "radius": {
+            "default": 0,
+            "minimum": 0,
+            "type": "number"
+          },
+          "world": {
+            "items": {
+              "type": "number"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "world"
+        ],
+        "type": "object"
+      }
+    },
     "segmentation.manual_add.begin": {
       "errors": [
         -32000,
@@ -2262,6 +2225,55 @@
       },
       "params": {
         "properties": {},
+        "type": "object"
+      }
+    },
+    "segmentation.manual_add.extend": {
+      "errors": [
+        -32602,
+        -32000,
+        -32005,
+        -32007,
+        -32008
+      ],
+      "mcp": {
+        "tool": "vc3d_manual_add_extend"
+      },
+      "params": {
+        "properties": {
+          "applyPending": {
+            "default": false,
+            "type": "boolean"
+          },
+          "cells": {
+            "default": 16,
+            "maximum": 4096,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "first": {
+            "maximum": 2147483647,
+            "minimum": -2147483648,
+            "type": "integer"
+          },
+          "last": {
+            "maximum": 2147483647,
+            "minimum": -2147483648,
+            "type": "integer"
+          },
+          "side": {
+            "enum": [
+              "up",
+              "down",
+              "left",
+              "right"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "side"
+        ],
         "type": "object"
       }
     },
@@ -3003,6 +3015,35 @@
       },
       "params": {
         "properties": {
+          "composite": {
+            "properties": {
+              "enabled": {
+                "type": "boolean"
+              },
+              "layersBehind": {
+                "maximum": 2147483647,
+                "minimum": -2147483648,
+                "type": "integer"
+              },
+              "layersFront": {
+                "maximum": 2147483647,
+                "minimum": -2147483648,
+                "type": "integer"
+              },
+              "method": {
+                "enum": [
+                  "mean",
+                  "max",
+                  "min",
+                  "alpha",
+                  "beerLambert",
+                  "volumetric"
+                ],
+                "type": "string"
+              }
+            },
+            "type": "object"
+          },
           "highlightedSurfaceIds": {
             "items": {
               "type": "string"

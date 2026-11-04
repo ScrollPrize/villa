@@ -168,6 +168,8 @@ private:
     QJsonObject handleManualAddSetLineMode(const QJsonValue& params);
     QJsonObject handleManualAddSetInterpolation(const QJsonValue& params);
     QJsonObject handleManualAddUndoConstraint(const QJsonValue& params);
+    QJsonObject handleManualAddExtend(const QJsonValue& params);
+    QJsonObject handleManualAddAddConstraint(const QJsonValue& params);
     QJsonObject handleCorrectionsSetPointMode(const QJsonValue& params);
     // Same-winding wrap annotation (tutorial's shift+E). set_mode drives the
     // WrapAnnotationWidget checkbox; commit/undo mirror the shift+E / Ctrl+Z
@@ -253,11 +255,10 @@ private:
     QJsonObject handlePushPullStop(const QJsonValue& params);
     QJsonObject handleTracerRunTrace(const QJsonValue& params);
     QJsonObject handleRenderTifxyz(const QJsonValue& params);
-    // Flattening RPCs: SLIM/flatboi, straighten. Each drives a
+    // Flattening RPCs: SLIM/flatboi. Drives a
     // headless SegmentationCommandHandler::start* launcher (dialogs suppressed)
     // and tracks the result as a source:"flatten" job.
     QJsonObject handleFlattenSlim(const QJsonValue& params);
-    QJsonObject handleFlattenStraighten(const QJsonValue& params);
     // Shared body for the three flatten handlers.
     QJsonObject launchFlattenJob(
         const QString& kind, const QString& label, const QString& segmentId,

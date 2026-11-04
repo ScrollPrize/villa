@@ -5,6 +5,7 @@
 #include <vc_object_store/store/GeometryViews.hpp>
 #include <vc_object_store/objects/GeometryCoordinates.hpp>
 #include <vc_object_store/Uuid.hpp>
+#include <vc_reader/tifxyz.hpp>
 
 #include <nlohmann/json.hpp>
 #include <opencv2/core.hpp>
@@ -122,9 +123,12 @@ std::unique_ptr<QuadSurface> load_quad_from_store(const vc::objects::ObjectStore
             (*points)(i/cols,i%cols)=tile.validity[i] ? cv::Vec3f(float(p[0]),float(p[1]),float(p[2])) : kInvalid;
         }
     }
+    // A negative coordinate marks a vertex invalid, as in tifxyz files.
+    for (auto& p : *points)
+        if (!vcr::tifxyz::vertexValid(p.val)) p = kInvalid;
     auto surface = std::make_unique<QuadSurface>(points.release(), scale);
     surface->id = object->uuid;
-    surface->meta = utils::Json::parse(object->meta);
+    surface->meta = nlohmann::json::parse(object->meta);
     surface->setComponents(surface_components(surface->meta));
     surface->meta["uuid"] = object->uuid;
     surface->meta["name"] = object->name;
@@ -156,7 +160,7 @@ void create_quad_in_store(vc::objects::ObjectStore& db, vc::objects::WriteTxn& t
     const std::string& name, const std::vector<std::string>& tags, const nlohmann::json& coordinates,
     const vc::objects::SurfaceProvenance& provenance)
 {
-    vc::objects::createSurface(db, txn, uuid, name, tags, coordinates, provenance, nlohmann::json::parse(surface.meta.dump()),
+    vc::objects::createSurface(db, txn, uuid, name, tags, coordinates, provenance, surface.meta,
                                quad_surface_geometry(surface));
 }
 

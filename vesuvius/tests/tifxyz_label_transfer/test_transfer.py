@@ -206,7 +206,7 @@ class CoverageGuardTests(unittest.TestCase):
             args = self.args(root)
             args.tile_size = 16
             args.minimum_mapping_coverage = 0.0
-            args.rasterizer = "python"
+            args.rasterizer = "native"
             source = plane()
             label = np.asarray([[1, 2], [3, 4]], dtype=np.uint8)
             with (
@@ -232,7 +232,7 @@ class CoverageGuardTests(unittest.TestCase):
             self.assertEqual(
                 report["output_storage_mode"], "streamed-compressed-tiles"
             )
-            self.assertEqual(report["rasterizer"], "python")
+            self.assertEqual(report["rasterizer"], "native")
             self.assertEqual(report["temporary_full_raster_bytes"], 0)
             self.assertLess(
                 report["estimated_buffered_output_bytes"],
@@ -245,7 +245,7 @@ class CoverageGuardTests(unittest.TestCase):
             args = self.args(root)
             args.tile_size = 16
             args.minimum_mapping_coverage = 0.0
-            args.rasterizer = "python"
+            args.rasterizer = "native"
             args.fill_seams = True
             source = plane()
             label = np.asarray([[1, 2], [3, 4]], dtype=np.uint8)

@@ -1,6 +1,5 @@
 import torch
 import numpy as np
-import zarr
 import os
 import errno
 try:
@@ -12,9 +11,7 @@ import hashlib
 import multiprocessing
 import subprocess
 import threading
-import fsspec
 import psutil
-import numcodecs
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
 # fork causes issues on windows , force to spawn
 multiprocessing.set_start_method('spawn', force=True)
@@ -23,7 +20,7 @@ from torch.utils.data import DataLoader
 from vesuvius.utils.models.load_nnunet_model import load_model_for_inference
 from vesuvius.models.utilities.get_accelerator import get_accelerator
 from vesuvius.data.vc_dataset import VCDataset
-from vesuvius.data.utils import open_zarr
+from vc_reader.reader import ObjectStore, ZarrWriter, open_zarr
 from pathlib import Path
 from vesuvius.models.build.build_network_from_config import NetworkFromConfig
 from vesuvius.models.run.external_models.load_resnet import try_load_external_resnet34_model
@@ -326,7 +323,6 @@ class Inferer():
                  model_path: str = None,
                  input_dir: str = None,
                  output_dir: str = None,
-                 input_format: str = 'zarr',
                  tta_type: str = 'mirroring', # 'mirroring' or 'rotation'
                  # tta_combinations: int = 3,
                  # tta_rotation_weights: [list, tuple] = (1, 1, 1),
@@ -343,17 +339,11 @@ class Inferer():
                  writer_workers: int = None,
                  verbose: bool = False,
                  skip_empty_patches: bool = True,  # Skip empty/homogeneous patches
-                 # params to get passed to Volume 
-                 scroll_id: [str, int] = None,
-                 segment_id: [str, int] = None,
-                 energy: int = None,
-                 resolution: float = None,
                  compressor_name: str = 'zstd',
                  compression_level: int = 1,
                  hf_token: str = None,
                  model_type: str = 'auto',
                  input_anon: bool = False,
-                 read_retries: int = 4,
                  model_cache_dir: str = DEFAULT_MODEL_CACHE_DIR,
                  max_patches: int = None,
                  bbox: [list, tuple] = None,
@@ -380,22 +370,16 @@ class Inferer():
         self.save_softmax = save_softmax
         self.verbose = verbose
         self.normalization_scheme = normalization_scheme
-        self.input_format = input_format
         # cuda, then mps, then cpu unless a device is given.
         self.device = torch.device(device) if device else get_accelerator()
         self.num_dataloader_workers = num_dataloader_workers
         self.writer_workers = writer_workers
         self.skip_empty_patches = skip_empty_patches
-        self.scroll_id = scroll_id
-        self.segment_id = segment_id
-        self.energy = energy
-        self.resolution = resolution
         self.compressor_name = compressor_name
         self.compression_level = compression_level
         self.hf_token = hf_token
         self.model_type = model_type
         self.input_anon = input_anon
-        self.read_retries = read_retries
         self.model_cache_dir = model_cache_dir
         self.max_patches = max_patches
         self.bbox = tuple(bbox) if bbox is not None else None
@@ -445,13 +429,8 @@ class Inferer():
         if output_dir:
             self.output_dir = output_dir
             
-            # For S3 paths, use fsspec.filesystem.makedirs
-            if self.output_dir.startswith('s3://'):
-                fs = fsspec.filesystem('s3', anon=False)
-                fs.makedirs(self.output_dir, exist_ok=True)
-                print(f"Created S3 output directory: {self.output_dir}")
-            else:
-                # For local paths, use os.makedirs
+            # S3 has no directories to make
+            if not self.output_dir.startswith('s3://'):
                 os.makedirs(self.output_dir, exist_ok=True)
         else:
             raise ValueError("Output directory must be provided.")
@@ -879,19 +858,14 @@ class Inferer():
             global_mean=global_mean,
             global_std=global_std,
             intensity_props=self.model_intensity_properties,
-            input_format=self.input_format,
             verbose=self.verbose,
             mode='infer',
             skip_empty_patches=self.skip_empty_patches,
-            scroll_id=self.scroll_id,
-            segment_id=self.segment_id,
-            energy=self.energy,
-            resolution=self.resolution,
             anon=self.input_anon,
             bbox=self.bbox,
-            read_retries=self.read_retries,
             cache=self.chunk_cache_mb > 0,
             cache_size_mb=self.chunk_cache_mb,
+            io_threads=1 if self.num_dataloader_workers > 0 else None,
             # The float16 default suits the CUDA autocast path. Autocast only
             # runs on CUDA here, so on CPU and MPS half patches would meet
             # float32 weights and raise "Input type (c10::Half) and bias type
@@ -982,21 +956,13 @@ class Inferer():
         
         return concatenated
         
-    def _get_zarr_compressor(self):
-        # numcodecs.Blosc, not zarr.Blosc: zarr 3 dropped that re-export, and the rest
-        # of the package (blending, finalize_outputs) already builds compressors here.
-        shuffle = numcodecs.blosc.SHUFFLE
+    def _zarr_codec(self):
         name = self.compressor_name.lower()
-        if name == 'zstd':
-            return numcodecs.Blosc(cname='zstd', clevel=self.compression_level, shuffle=shuffle)
-        elif name == 'lz4':
-            return numcodecs.Blosc(cname='lz4', clevel=self.compression_level, shuffle=shuffle)
-        elif name == 'zlib':
-            return numcodecs.Blosc(cname='zlib', clevel=self.compression_level, shuffle=shuffle)
-        elif name == 'none':
-            return None
-        else:
-            return numcodecs.Blosc(cname='zstd', clevel=1, shuffle=shuffle)
+        if name == 'none':
+            return {'compressor': None}
+        if name in ('zstd', 'lz4', 'zlib'):
+            return {'cname': name, 'level': self.compression_level, 'shuffle': 1}
+        return {'cname': 'zstd', 'level': 1, 'shuffle': 1}
 
     def _original_volume_shape(self):
         """Spatial (Z, Y, X) shape of the input volume, or None if the dataset does not expose it."""
@@ -1035,24 +1001,23 @@ class Inferer():
         # An empty patch list is valid: we still write zarrs with shape[0]=0 so
         # blending can enumerate logits_part_*.zarr files uniformly across parts.
 
-        compressor = self._get_zarr_compressor()
+        codec = self._zarr_codec()
         output_shape = (self.num_total_patches, self.num_classes, *self.patch_size)
         output_chunks = (1, self.num_classes, *self.patch_size)  # we align chunks to patch size for better write performance
         main_store_path = os.path.join(self.output_dir, f"logits_part_{self.part_id}.zarr")
         
         print(f"Creating output store at: {main_store_path}")
         
-        self.output_store = open_zarr(
-            path=main_store_path, 
-            mode='w',  
-            storage_options={'anon': False} if main_store_path.startswith('s3://') else None,
-            verbose=self.verbose,
+        # We skip empty chunks here so we don't write all zero patches to the array but keep
+        # the proper indices for later re-zarring.
+        self.output_store = ZarrWriter.create(
+            main_store_path,
             shape=output_shape,
             chunks=output_chunks,
-            dtype=np.float16,  
-            compressor=compressor,
-            write_empty_chunks=False  # we skip empty chunks here so we don't write all zero patches to the array but keep
-                                      # the proper indices for later re-zarring 
+            dtype=np.float16,
+            overwrite=True,
+            skip_empty=True,
+            **codec,
         )
         
         print(f"Created zarr array at {main_store_path} with shape {self.output_store.shape}")
@@ -1064,16 +1029,14 @@ class Inferer():
         
         print(f"Creating coordinates store at: {self.coords_store_path}")
         
-        coords_store = open_zarr(
-            path=self.coords_store_path,
-            mode='w',
-            storage_options={'anon': False} if self.coords_store_path.startswith('s3://') else None,
-            verbose=self.verbose,
+        coords_store = ZarrWriter.create(
+            self.coords_store_path,
             shape=coord_shape,
             chunks=coord_chunks,
             dtype=np.int32,
-            compressor=compressor,
-            write_empty_chunks=False  
+            overwrite=True,
+            skip_empty=True,
+            **codec,
         )
         
         print(f"Created coordinates zarr array at {self.coords_store_path} with shape {coords_store.shape}")
@@ -1143,8 +1106,6 @@ class Inferer():
         return self.output_store
 
     def _process_batches(self):
-        numcodecs.blosc.use_threads = False
-
         self.current_patch_write_index = 0
         max_workers = self.writer_workers if self.writer_workers is not None else min(16, os.cpu_count() or 4)
 
@@ -1361,7 +1322,6 @@ def build_parser():
                            'Required when reading from a public bucket while AWS credentials '
                            'are configured for writes to a different bucket.')
     parser.add_argument('--output_dir', type=str, required=True, help='Path to store output predictions')
-    parser.add_argument('--input_format', type=str, default='zarr', help='Input format (zarr, volume)')
     parser.add_argument('--tta_type', type=str, default='mirroring', choices=['mirroring', 'rotation'],
                       help='TTA type (mirroring or rotation). Default: rotation')
     parser.add_argument('--disable_tta', action='store_true', help='Disable test time augmentation')
@@ -1395,12 +1355,6 @@ def build_parser():
     parser.add_argument('--zarr_compression_level', type=int, default=3,
                       help='Compression level (1-9, higher = better compression but slower)')
     
-    # Add arguments for the updated Volume class
-    parser.add_argument('--scroll_id', type=str, default=None, help='Scroll ID to use (if input_format is volume)')
-    parser.add_argument('--segment_id', type=str, default=None, help='Segment ID to use (if input_format is volume)')
-    parser.add_argument('--energy', type=int, default=None, help='Energy level to use (if input_format is volume)')
-    parser.add_argument('--resolution', type=float, default=None, help='Resolution to use (if input_format is volume)')
-
     # Add arguments for Hugging Face model loading
     parser.add_argument('--hf_token', type=str, default=None, help='Hugging Face token for accessing private repositories')
     parser.add_argument('--model_type', type=str, default='auto',
@@ -1410,11 +1364,6 @@ def build_parser():
                       help=f'Local directory used to cache models downloaded from S3. '
                            f'Only applies when --model_path is an s3:// URL. '
                            f'Default: {DEFAULT_MODEL_CACHE_DIR}')
-    parser.add_argument('--read_retries', type=int, default=4,
-                      help='Attempts per patch read (default 4). Transient remote failures '
-                           '(dropped connections, truncated payloads, 429/5xx) are retried '
-                           'with exponential backoff so one hiccup does not abort a long '
-                           'streaming run. Set to 1 to disable.')
     parser.add_argument('--chunk_cache_mb', type=int, default=0,
                       help='Keep up to this many MB of fetched input chunks in an in-memory LRU '
                            'cache, so overlapping patches reuse chunks instead of downloading '
@@ -1498,22 +1447,11 @@ def main():
             'finalize_config': FinalizeConfig(mode=args.mode, threshold=resolve_threshold(parser, args)),
         }
 
-    # Convert scroll_id and segment_id if needed
-    scroll_id = args.scroll_id
-    segment_id = args.segment_id
-    
-    if scroll_id is not None and scroll_id.isdigit():
-        scroll_id = int(scroll_id)
-    
-    if segment_id is not None and segment_id.isdigit():
-        segment_id = int(segment_id)
-    
     print("\n--- Initializing Inferer ---")
     inferer = Inferer(
         model_path=args.model_path,
         input_dir=args.input_dir,
         output_dir=args.output_dir,
-        input_format=args.input_format,
         tta_type=args.tta_type,
         do_tta=not args.disable_tta,
         num_parts=args.num_parts,
@@ -1529,10 +1467,6 @@ def main():
         verbose=args.verbose,
         skip_empty_patches=args.skip_empty_patches,  # Skip empty patches flag
         # Pass Volume-specific parameters to VCDataset
-        scroll_id=scroll_id,
-        segment_id=segment_id,
-        energy=args.energy,
-        resolution=args.resolution,
         # Pass Zarr compression settings
         compressor_name=args.zarr_compressor,
         compression_level=args.zarr_compression_level,
@@ -1540,7 +1474,6 @@ def main():
         hf_token=args.hf_token,
         model_type=args.model_type,
         input_anon=args.input_anon,
-        read_retries=args.read_retries,
         model_cache_dir=args.model_cache_dir,
         max_patches=args.max_patches,
         bbox=bbox,
@@ -1565,21 +1498,18 @@ def main():
             return 0
 
         if logits_path and coords_path:
-            # Check if paths exist, using fsspec for S3 paths
+            # Check if paths exist
             logits_exists = False
             coords_exists = False
             
             try:
                 if logits_path.startswith('s3://'):
-                    fs = fsspec.filesystem('s3', anon=False)
-                    # Check if .zarray file exists within the zarr directory
-                    logits_exists = fs.exists(os.path.join(logits_path, '.zarray'))
+                    logits_exists = ObjectStore(logits_path).exists('.zarray')
                 else:
                     logits_exists = os.path.exists(logits_path)
                     
                 if coords_path.startswith('s3://'):
-                    fs = fsspec.filesystem('s3', anon=False)
-                    coords_exists = fs.exists(os.path.join(coords_path, '.zarray'))
+                    coords_exists = ObjectStore(coords_path).exists('.zarray')
                 else:
                     coords_exists = os.path.exists(coords_path)
             except Exception as e:
@@ -1594,11 +1524,7 @@ def main():
 
                 print("\n--- Inspecting Output Store ---")
                 try:
-                    output_store = open_zarr(
-                        path=logits_path,
-                        mode='r',
-                        storage_options={'anon': False} if logits_path.startswith('s3://') else None
-                    )
+                    output_store = open_zarr(logits_path)
                     print(f"Output shape: {output_store.shape}")
                     print(f"Output dtype: {output_store.dtype}")
                     print(f"Output chunks: {output_store.chunks}")
@@ -1617,11 +1543,7 @@ def main():
 
                 print("\n--- Inspecting Coordinate Store ---")
                 try:
-                    coords_store = open_zarr(
-                        path=coords_path,
-                        mode='r',
-                        storage_options={'anon': False} if coords_path.startswith('s3://') else None
-                    )
+                    coords_store = open_zarr(coords_path)
                     print(f"Coords shape: {coords_store.shape}")
                     print(f"Coords dtype: {coords_store.dtype}")
                     first_few_coords = coords_store[0:5]

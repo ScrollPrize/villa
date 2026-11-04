@@ -46,6 +46,5 @@ private:
 
     bool _correctionsEnabled{false};
 
-    bool _restoringSettings{false};
     const QString _settingsGroup;
 };

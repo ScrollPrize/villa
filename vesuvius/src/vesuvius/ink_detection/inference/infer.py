@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from vesuvius.ink_detection.data.normalization import normalize_image
+
 import argparse
 import json
 import logging
@@ -19,12 +21,12 @@ from typing import Any, Iterator, Mapping, Sequence
 from urllib.parse import urlparse
 
 import numpy as np
-import tifffile
+from vc_reader import images
 import torch
 import torch.nn.functional as F
 from torch import nn
 from torch.utils.data import DataLoader, Dataset
-import zarr
+from vc_reader.reader import ZarrWriter
 
 from vesuvius.ink_detection.models.checkpoint import (
     load_checkpoint,
@@ -42,12 +44,12 @@ from vesuvius.ink_detection.inference.inference_runtime import (
 )
 from vesuvius.ink_detection.models.model import make_model
 from vesuvius.ink_detection.volume_io import (
-    ZARR_V3,
     open_volume,
     open_volume_root,
     select_volume_level,
 )
 from vesuvius.utils.cli import HyphenUnderscoreParser
+
 
 
 LOGGER = logging.getLogger(__name__)
@@ -116,9 +118,7 @@ def normalize_flat_patch(
     """Normalize one reader-processed ZYX patch by the legacy flat contract."""
 
     if preprocessing == "tifxyz_robust":
-        from vesuvius.image_proc.intensity.normalization import normalize_robust
-
-        return np.ascontiguousarray(normalize_robust(patch_ZYX))
+        return normalize_image(patch_ZYX, NormalizationConfig(mode="robust_mad"))
     if preprocessing == "divide_255":
         normalized = np.ascontiguousarray(patch_ZYX, dtype=np.float32)
         normalized *= 1.0 / 255.0
@@ -1048,17 +1048,12 @@ def write_output_tiff(
     """Write one tiled, LZW, BigTIFF-compatible flat probability image."""
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    tifffile.imwrite(
-        output_path,
-        iter_probability_tiles(prob_sum_store, weight_sum_store, tile_shape),
-        shape=tuple(int(value) for value in prob_sum_store.shape),
-        dtype=np.uint8,
-        compression="lzw",
-        tile=tuple(int(value) for value in tile_shape),
-        bigtiff=True,
-        metadata=None,
-        software="vesuvius.ink_detection.inference.infer",
-    )
+    height, width = (int(value) for value in prob_sum_store.shape)
+    tile_h, tile_w = (int(value) for value in tile_shape)
+    positions = ((y0, x0) for y0 in range(0, height, tile_h) for x0 in range(0, width, tile_w))
+    with images.TiffWriter(output_path, (height, width), np.uint8, compression="lzw", tile=(tile_h, tile_w)) as writer:
+        for (y0, x0), tile in zip(positions, iter_probability_tiles(prob_sum_store, weight_sum_store, tile_shape)):
+            writer.write_tile(y0, x0, tile)
 
 
 def open_temp_zarr_array(
@@ -1069,25 +1064,13 @@ def open_temp_zarr_array(
 ):
     """Create one explicit-v2 float32 accumulation array."""
 
-    format_keyword = (
-        {"zarr_format": 2}
-        if ZARR_V3
-        else {"zarr_version": 2}
-    )
-    return zarr.open(
-        str(path),
-        mode="w",
-        shape=shape,
-        chunks=chunks,
-        dtype=np.float32,
-        **format_keyword,
-    )
+    return ZarrWriter.create(path, shape=shape, chunks=chunks, dtype=np.float32, overwrite=True, auth=None)
 
 
 def load_grayscale_mask(path: Path, target_shape: tuple[int, int]) -> np.ndarray:
     """Read a nonzero foreground TIFF with top-left crop/pad alignment."""
 
-    image = np.squeeze(np.asarray(tifffile.imread(path)))
+    image = np.squeeze(np.asarray(images.read(path)))
     if image.ndim == 3:
         image = image[..., 0]
     if image.ndim != 2:

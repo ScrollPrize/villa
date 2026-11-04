@@ -207,6 +207,62 @@ class DimensionTests(unittest.TestCase):
                     {'image': image}, seed=97)
                 np.testing.assert_allclose(output['image'], expected['image'], atol=2e-6, rtol=2e-6)
 
+    def test_uint8_images_match_float32_values(self):
+        # uint8 images are intensities 0..255: every path returns float32, bit-identical to float32 input.
+        rng = np.random.default_rng(4)
+        u8 = rng.integers(20, 200, (2, 10, 12, 14), dtype=np.uint8)
+        f32 = u8.astype(np.float32)
+        valid = (u8[:1] > 60).astype(np.uint8)
+        reference = rng.random((1, 10, 12, 14)).astype(np.float32)
+        for chain in ([A.MedianFilter(size=3)], [A.MedianFilter(size=5)], [A.GaussianBlur(sigma=1)], [A.Equalize(bins=32)],
+                      [A.CLAHE(clip_limit=2, bins=32, tile_shape=(5, 6, 7))], [A.HistogramMatching(reference=reference, bins=32)],
+                      [A.UnsharpMask(strength=.5, sigma=1)], [A.Gamma(gamma=.8), A.MedianFilter(size=3), A.Contrast(factor=1.2)],
+                      [A.Flip(axes='x', p_axis=1)], []):
+            for compact in (True, False):
+                with self.subTest(chain=repr(chain), compact=compact):
+                    p = A.Pipeline(chain, compact=compact)
+                    for extra in ({}, {'padding_mask': valid}):
+                        out = p({'image': u8, **extra}, seed=2)['image']
+                        self.assertEqual(out.dtype, np.float32)
+                        np.testing.assert_array_equal(out.view(np.uint32), p({'image': f32, **extra}, seed=2)['image'].view(np.uint32))
+        for op in (A.MedianFilter(size=3), A.Equalize(bins=32), A.GaussianBlur(sigma=1), A.Normalize('minmax')):
+            with self.subTest(batch=repr(op)):
+                planes = u8[0][:, None]
+                out = op.batch(planes)
+                self.assertEqual(out.dtype, np.float32)
+                np.testing.assert_array_equal(out.view(np.uint32), op.batch(planes.astype(np.float32)).view(np.uint32))
+
+    def test_host_batches_match_single_calls(self):
+        # Direct CPU .batch runs natively over (B, ...) and must equal per-sample calls bitwise.
+        rng = np.random.default_rng(9)
+        image = (rng.integers(0, 256, (4, 1, 9, 13)) / 255).astype(np.float32)
+        image[1, 0, :, ::3] = 0
+        image[1, 0, ::2, ::3] = -0.0  # both signed zeros: the general median selector
+        mask = (image > .5).astype(np.uint8)
+        for op, x in ((A.MedianFilter(size=3), image), (A.MedianFilter(size=5), image), (A.GaussianBlur(sigma=1), image),
+                      (A.Equalize(bins=16), image), (A.CLAHE(bins=16, tile_shape=(3, 4)), image),
+                      (A.Morphology(operation='close', radius=1, footprint='cross'), mask),
+                      (A.Morphology(operation='dilate', radius=2, footprint='ball'), mask),
+                      (A.DistanceTransform(mode='outside'), mask), (A.CropPad((5, 6)), image)):
+            with self.subTest(transform=repr(op)):
+                batch = op.batch(x)
+                single = np.stack([op(v) for v in x])
+                self.assertEqual(batch.dtype, single.dtype)
+                np.testing.assert_array_equal(batch.view(np.uint8), single.view(np.uint8))
+        rotated = A.Rotate90(planes=['yx'], turns=[1], resize=True).batch(image)
+        self.assertEqual(rotated.shape, (4, 1, 13, 9))
+        bad = image.copy(); bad[2, 0, 1, 1] = np.nan
+        with self.assertRaisesRegex(ValueError, 'nonfinite input'):
+            A.GaussianBlur(sigma=1).batch(bad)
+        np.testing.assert_array_equal(image[1, 0, ::2, ::3].view(np.uint32), np.float32(-0.0).view(np.uint32))
+        try:
+            import torch
+        except ImportError:
+            return
+        result = A.MedianFilter(size=3).batch(torch.from_numpy(image))
+        self.assertIsInstance(result, torch.Tensor)
+        np.testing.assert_array_equal(result.numpy(), A.MedianFilter(size=3).batch(image))
+
 
 if __name__ == '__main__':
     unittest.main()

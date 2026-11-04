@@ -3,7 +3,7 @@
 #include <vc_object_store/geometry/ArrayBytes.hpp>
 #include "FiberConstraintDatabase.hpp"
 #include "vc/fiber_tracer/FiberAxialAlignment.hpp"
-#include "vc/core/util/AtomicFile.hpp"
+#include <vc_reader/zarr.hpp>
 #include "vc/core/util/Umbilicus.hpp"
 #include <vc_object_store/objects/UmbilicusFile.hpp>
 #include "vc/fiber_tracer/FiberTraceConstraints.hpp"
@@ -31,7 +31,7 @@ int runFiberConstraintExtraction(int argc, char** argv)
     using namespace vc::fiber_tracer;
     using Clock = std::chrono::steady_clock;
     using Json = nlohmann::json;
-    if (argc != 2) throw std::invalid_argument("usage: vc_fiber_constraints CONFIG.json");
+    if (argc != 2) throw std::invalid_argument("usage: vc_fiber_constraints CONFIG.json [--cuda] [--cuda-cache-gb N]");
     Json cfg; std::ifstream input(argv[1]); input >> cfg;
     const auto seconds = [](auto start) { return std::chrono::duration<double>(Clock::now()-start).count(); };
     const auto xyz = [](const Json& v) {
@@ -154,7 +154,8 @@ int runFiberConstraintExtraction(int argc, char** argv)
     }
     const double loadSeconds=seconds(loadStart);
     const vc::lasagna::LasagnaNormalSampler normals(dataset);
-    const double spacing=vc::lasagna::bindLasagnaChannel(dataset.manifest(),"nx").spacing;
+    vc::lasagna::LasagnaGroupArrays arrays(0);
+    const double spacing=vc::lasagna::bindLasagnaChannel(dataset.manifest(),"nx",arrays).spacing;
     std::cout<<"selected fibers="<<lines.size()<<" points="<<totalPoints<<" arc_base="<<totalArc
              <<" unsigned normals; no alignment"<<std::endl;
     FiberTraceConstraintConfig options;
@@ -229,11 +230,11 @@ int runFiberConstraintExtraction(int argc, char** argv)
             {"semantics","arc mean 2*(fiber tangent dot axis tangent)^2-1; V positive, H negative"},
             {"seconds",seconds(begin)},{"umbilicus_frame",result["umbilicus_frame"]}};
         std::filesystem::create_directories(target.parent_path());
-        vc::core::util::ephemeralWriteString(target,features.dump()+"\n");
+        vcr::zarr::atomicWrite(target,features.dump()+"\n");
         result["axial_seconds"]=seconds(begin);
         if(cfg.value("axial_prior_only",false)) {
             result["wall_seconds"]=seconds(started);
-            vc::core::util::ephemeralWriteString(output,result.dump(2)+"\n");
+            vcr::zarr::atomicWrite(output,result.dump(2)+"\n");
             std::cout<<"axial features complete fibers="<<lines.size()<<" seconds="<<seconds(started)<<std::endl;
             return 0;
         }
@@ -251,7 +252,7 @@ int runFiberConstraintExtraction(int argc, char** argv)
             cfg.value("normal_sample_spacing",spacing),result,umbilicus?&*umbilicus:nullptr,
             cfg.contains("normal_curves_output"));
         result["wall_seconds"]=seconds(started);
-        vc::core::util::ephemeralWriteString(output,result.dump(2)+"\n");
+        vcr::zarr::atomicWrite(output,result.dump(2)+"\n");
         std::cout<<"orientation complete "<<result["orientation"].dump()<<std::endl;
         return 0;
     }
@@ -294,7 +295,7 @@ int runFiberConstraintExtraction(int argc, char** argv)
             result["wall_seconds"]=seconds(started);
             std::cout<<"export complete "<<result["export"].dump()<<std::endl;
         }
-        vc::core::util::ephemeralWriteString(output,result.dump(2)+"\n");
+        vcr::zarr::atomicWrite(output,result.dump(2)+"\n");
         std::cout<<run.dump()<<std::endl;
     }
     return 0;

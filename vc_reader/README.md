@@ -15,6 +15,189 @@ training pipelines; its Zarr reader and transforms also work with your own data.
   transforms to 2D or 3D inputs while keeping images and labels aligned.
   `CudaLoader` adds GPU transforms and prefetching to a PyTorch DataLoader.
 
+
+### Volume metadata
+
+Opening a volume also gathers what is known about it, from the store's `meta.json` /
+`metadata.json` and the Open Data catalog, merged into one value per field (the store's
+own documents win). Remote stores do this on first open only; the result is kept with
+the volume in the disk cache. `ZarrReader.open(url, refresh=True)` reads both sources again
+and replaces it.
+
+```python
+volume = ZarrReader.open(url, level=2, cache_dir=cache)
+volume.voxel_size        # micrometers per voxel of the opened level
+volume.voxel_size_zyx    # per axis, for non-cubic pyramids
+volume.metadata          # level-0 voxel_size_um, energy_kev, detector_distance_mm, beamline,
+                         # scan_name, acquisition_date, value_window, z_crop, sample_id,
+                         # volume_id, scan_id, name, created_at, data_format, documents
+```
+
+## Capability map
+
+**Check this map before writing code that reads, samples, interpolates, parses,
+caches or writes Vesuvius data, in any project in this repository.** If a row fits,
+call it directly, with no local copy, wrapper or renamed equivalent. If a row nearly
+fits, extend it in C++ here, then bind it to Python. The map covers each area's main
+entry points, so also search `include/vc_reader/` before concluding something is absent.
+
+- **C++ API:** in namespace `vcr`, declared in `include/vc_reader/<header>`.
+  Each row's header is shown in its C++ column.
+- **Implementation:** relative to `src/cpp/`. Headers there are also included as
+  `vc_reader/native/...`. `.cu` files are the CUDA kernels.
+- **Python:** in `src/vc_reader/`, binding the same C++. `_reader` is the compiled
+  extension module, `vc_reader._reader`.
+- **Tests:** native tests are `tests/cpp/test_native_<area>.cpp`; Python tests are `tests/test_*.py`.
+- **Conventions:** arrays and grids are C order and ZYX. Geometry and surface
+  coordinates are XYZ. Surface vertices are valid or invalid; invalid vertices are never sampled.
+
+### Catalog and metadata
+
+| Need | C++ API | Implementation | Python |
+| --- | --- | --- | --- |
+| Load or cache the Open Data manifest; parse samples, scans, volumes, segments, artifacts, surfaces | `catalog.hpp`: `catalog::loadCatalog`, `OpenDataManifest`, `OpenDataSample`, `OpenDataSegment`, `OpenDataArtifact` | `catalog.cpp`, `catalog_io.cpp` | `load`, `Catalog` |
+| Sample name aliases, public URL rewriting, cache-safe ids | `catalog.hpp`: `catalog::sampleNameKey`, `communityAliases`, `resolveOpenDataUrl`, `openDataS3Url`, `safePathComponent` | `catalog.cpp` | `to_https`, `to_s3` |
+| Browse scrolls, volumes, segments and labels; query by resolution | `browsing.hpp`: `catalog::Catalog`, `ScrollSource`, `Collection`, `Volume`, `Segment`, `Asset`, `atResolution` | `browsing.cpp`, `sources/resolution.cpp` | `ScrollSource`, `Collection`, `Volume`, `Segment`, `Asset` |
+| Volume-to-volume registration routes | `registrations.hpp`: `catalog::RegistrationGraph`, `resolveVolumeTransform` | `registrations.cpp` | `ScrollSource`, `VolumeMapping` |
+| Affines: compose, invert, map normals, read `transform.json`, block-reduced level placement | `affine.hpp`: `catalog::Affine` | header only | `Affine` |
+| Immutable source, storage, encoding and registration descriptors | `sources.hpp`: `sources::Source`, `Storage`, `Encoding`, `Surface`, `SurfaceRegistration`, `VolumeRegistration` | `sources.cpp` | `sources.py` |
+| Volume facts from `meta.json`, `metadata.json` and the catalog: voxel size, energy, per-level spacing | `zarr_metadata.hpp`: `zarr::storeMetadata`, `volumeMetadata`, `voxelSizeUm`, `levelVoxelSizeZYX` | `zarr/store_metadata.cpp` | `ZarrReader.metadata`, `.voxel_size`, `.voxel_size_zyx` |
+
+### Zarr, storage and caches
+
+| Need | C++ API | Implementation | Python |
+| --- | --- | --- | --- |
+| Open a Zarr v2/v3 array, OME-Zarr group or pyramid level (local, HTTP, S3, SFTP; online or offline) | `zarr.hpp`: `zarr::openArray`, `openPyramidLevel`, `pyramidLevels`, `Group` | `zarr/open.cpp` | `reader/zarr_reader.py`, `reader/zarr_group.py`: `ZarrReader`, `open_zarr`, `ZarrGroup`, `open_group`, `open_node` |
+| Level placement in level-0 coordinates; a level ready for `grid::sample` | `zarr.hpp`: `zarr::LevelPlacement`, `levelPlacement`, `declaredPlacement`, `gridLevel` | `zarr/open.cpp` | `ZarrGroup.placement` |
+| Parse `.zarray` / `zarr.json` | `zarr_array_meta.hpp`: `zarr::parseArrayMeta`, `ArrayMeta` | `zarr/meta.cpp` | `reader/zarr_meta.py`: `ArrayMeta` |
+| Region reads, integer point reads, nearest and linear sampling, affine grids, cache-only sampling, single chunks | `array.hpp`: `Array::read_many`, `read_points`, `sample_nearest`, `sample_linear`, `read_affine`, `sample_nearest_cached`, `sample_linear_cached`, `chunk`, `cached_chunk` | `array.hpp`, `chunk_io.hpp`, `zarr_storage.hpp`, `shard_index.hpp` | `ZarrReader` |
+| The same reads on the GPU; one device brick cache shared by several readers (e.g. a pyramid's levels) | `cuda_reader.hpp`: `reader_cuda::Reader`, `reader_cuda::Pool` | `reader_cuda/reader.hpp`, `reader_cuda/kernels.cu` | `reader/cuda.py`: `CudaReader`, `CudaPool` |
+| Chunks computed on demand, read and sampled like a stored array, with a persistent cache | `computed.hpp`: `computed::open` | `computed.cpp` | `_reader.open_computed` |
+| Credentials and access: anonymous, basic, signed S3, AWS profiles, bucket region | `zarr.hpp`: `zarr::resolveAccess`, `s3Access`, `basicAccess`, `awsCredentials`, `bucketRegion`, `loadBasicAuth` | `zarr/access.cpp`, `http.hpp`, `sigv4.hpp` | `reader/auth.py` |
+| List S3 prefixes; URL helpers | `zarr.hpp`: `zarr::listChildren`, `listObjects`, `listPage`, `isRemote`, `httpUrl`, `s3Location`, `levelGroupLocation`; `s3_listing.hpp`: `s3::listUrl`, `parseListPage` | `zarr/access.cpp`, `s3_listing.cpp` | `ObjectStore`, `reader/auth.py` |
+| SFTP sessions, pooled fetches, directory listing | `sftp.hpp`: `sftp::Session`, `Fetcher`, `Url`, `setAuthenticator` | `sftp/` | through any `sftp://` location |
+| Prefill array chunks or download a remote prefix through the existing disk caches, with progress and cancellation | `cache.hpp`: `cache::prefill`, `cache::downloadPrefix` | `cache.cpp` | `_reader.prefill`, `_reader.download_prefix`, `_reader.CacheCancellation` |
+| Decoded chunk memory cache | `array.hpp`: `MemoryCache` | `memory_cache.hpp`, `lru.hpp` | `reader/memory_cache.py`: `MemoryCache` |
+| Disk caches: budgets, cache discovery, VC3D cache roots and leases, low-disk handling | `zarr.hpp`: `zarr::openLayers`, `diskBudget`, `decodedCachePath`, `vc3dConfigDirectory`, `vc3dCacheRoot`, `selectedVc3dCacheRoot`, `vc3dVolumeId`, `createVc3dVolumeDir`, `Vc3dLease`, `LowDiskSpace` | `zarr/layers.cpp`, `disk_cache.hpp`, `write_behind.hpp` | `reader/disk_cache.py` |
+| Write arrays (v2/v3, shards, local or S3), attributes, groups, inventories | `zarr_write.hpp`: `zarr::Writer`, `createGroup`, `removeNode`, `nodeChildren`, `readAttributes`, `writeAttributes`, `inventory`, `atomicWrite`, `compressBytes`, `decompressBytes`, `decompressZstdFrame` | `zarr/writer.cpp` | `reader/writer.py`: `ZarrWriter`, `create_group`, `zarr_inventory`, `atomic_write`, `compress_bytes`, `decompress_bytes`, `decompress_zstd_frame` |
+| Object store over a local directory or S3 prefix | `zarr_write.hpp`: `zarr::Store` | `zarr/store.cpp` | `ObjectStore` |
+| Build pyramids and OME multiscales metadata | `zarr_write.hpp`: `zarr::writePyramid`, `writePyramidLevel`, `createPyramidLevels`, `omeMultiscales` | `zarr/pyramid.cpp` | `write_pyramid`, `write_pyramid_level`, `create_pyramid_levels`, `ome_multiscales` |
+| Compress and decompress bytes | `zarr_write.hpp`: `zarr::compressBytes`, `decompressBytes` | `zarr/writer.cpp`, `codecs.hpp`, `lzw.hpp` | `compress_bytes`, `decompress_bytes` |
+| Atomic and durable file writes; directory publication with rollback; snapshots | `zarr.hpp`: `zarr::atomicWrite`, `Durability`; `publication.hpp`: `files::publishDirectory`, `replaceFile`, `recoverDirectory`, `snapshot` | `atomic_file.hpp`, `zarr/layers.cpp`, `publication.cpp` | `snapshot` |
+
+### Images and labelled sources
+
+| Need | C++ API | Implementation | Python |
+| --- | --- | --- | --- |
+| Read TIFF, PNG or JPEG, whole, by page or windowed; memory-map a TIFF | `source_reader.hpp`: `sources::imageSource`, `readImage`, `readImagePage`, `tiffMapping`, `ImageFile` | `sources/image_file.cpp`, `sources/source_reader.cpp` | `images.py`: `read`, `open`, `memmap` |
+| Write TIFF, PNG or JPEG atomically; encode to memory | `image_write.hpp`: `sources::writeTiff`, `TiffWriter`, `writeImage`, `encodePng`, `encodeJpeg` | `sources/image_write.cpp`, `sources/image_encode.cpp` | `images.py`: `write_tiff`, `TiffWriter`; `write_image`, `encode_png`, `encode_jpeg` |
+| Crops of any Zarr, image or stack source, with exact encodings and decode budgets | `source_reader.hpp`: `sources::SourceReader`, `DecodedCache`, `EncodedFiles` | `sources/source_reader.cpp`, `sources/caches.cpp` | `reader/source_reader.py`, `reader/decoded_cache.py` |
+| Aligned multi-target reads in a reference grid; flattened image and label pairs | `aligned_reader.hpp`: `sources::SampleReader`, `PairedReader` | `sources/aligned_reader.cpp` | `sampling.py`: `open_sample`; `paired.py`: `PairedReader` |
+
+### Surfaces and tifxyz
+
+| Need | C++ API | Implementation | Python |
+| --- | --- | --- | --- |
+| Read tifxyz: metadata, shape, mask, windows, whole surface; list a folder | `tifxyz.hpp`: `tifxyz::read`, `Reader`, `readMetadata`, `parseMetadata`, `storedShape`, `readMask`, `list`, `vertexValid`, `fullExtent` | `tifxyz/tifxyz.cpp` | `tifxyz.py`: `read`, `read_metadata`, `stored_shape`, `read_mask`, `list_surfaces`, `full_extent` |
+| Write tifxyz with channels and rollback | `tifxyz.hpp`: `tifxyz::write`, `WriteOptions`, `Channel` | `tifxyz/tifxyz.cpp` | `tifxyz.write` |
+| In-memory surface: bounds, retargeting to another level, positions, normals and tangents | `tifxyz.hpp`: `tifxyz::Surface` | `tifxyz/tifxyz.cpp` | `tifxyz.Surface` |
+| Bilinear or bicubic Hermite interpolation of a vertex grid, with normals and tangents | `grid.hpp`: `grid::Surface`, `resample`, `pointsAt`, `snapshot`, `Raster`, `Interpolation` | `grid/grid.cpp`, `grid/points.hpp` | `tifxyz.Surface.resample`, `.points_at` |
+| Sample a volume along a surface or plane: layers along the normal, pyramid fallback, cache-only reads, masks | `grid.hpp`: `grid::sample`, `Request`, `Level`, `Plane`, `Points`, `levelFromMap` | `grid/grid.cpp`, `grid/level_map.hpp`, `grid/kernels.cu` | `grid.sample_grid` (every request field); `SampleReader.render_surface`; prepared per-pixel XYZ/directions: `ZarrReader.render_points` |
+| Reduce layers to one value per pixel: mean, max, min, median, min-abs, alpha, Beer-Lambert | `composite.hpp`: `composite::reduce` | `composite/` | `_reader.composite_reduce` |
+| Render surface layers; project a label patch into CT | `aligned_reader.hpp`: `sources::SampleReader`, `SurfaceProjection` | `sources/surface_reader.cpp`, `projection/` | `SampleReader.render_surface`, `.project_surface`, `.iter_project_surface` |
+
+### Resident arrays and surface transfer
+
+| Need | C++ API | Implementation | Python |
+| --- | --- | --- | --- |
+| Nearest/linear samples of resident batched 2D/3D float32 arrays, with value and coordinate gradients; CPU/CUDA | `resident_sampling.hpp`: `sampling::Dense`, `sampleDense`, `backwardDense` | `sample_point.hpp`, `sampling_math.hpp`, `sampling/` | `resident.sample_array`, `torch.sample_array` |
+| Batched bicubic surface positions/tangents, linear or triangle fields, explicit validity; CPU/CUDA | `resident_sampling.hpp`: `sampling::prepareSurfaces`, `sampleSurfaces` | `grid/derivatives.hpp`, `grid/points.hpp`, `sampling/` | `resident.GridField`, `torch.surface_derivatives`, `torch.surface_points` |
+| Pixel-centre field tiles with border replication; CPU/CUDA | `resident_sampling.hpp`: `sampling::Tile`, `sampleFieldTile`, `sampleSurfaceTile` | `sampling_math.hpp`, `sampling/` | `resident.sample_field_tile` |
+| Label lookup through a surface correspondence, distance rejection and seam provenance; CPU/CUDA | `sampling.hpp`: `projection::RasterRequest`, `transfer` | `projection/transfer.cpp`, `projection/kernels.cu` | `resident.SurfaceTransfer` |
+| Binary support swept through a surface normal band; CPU/CUDA | `sampling.hpp`: `projection::MaskBand`, `projectMask` | `projection/common.hpp`, `grid/points.hpp`, `projection/mask.cpp`, `projection/kernels.cu` | `resident.project_mask` |
+
+Resident arrays are already loaded host or device buffers. Their forward samples
+use the same voxel-lookup sampler as stored arrays; the adapter supplies a contiguous
+block, batch/channel layout, and boundary policy. Queries use array indices (ZYX
+or YX), without normalized Torch coordinates. `zeros` interpolates with the fill value outside the array,
+`border` replicates its boundary, and `constant` rejects out-of-bounds queries.
+Nearest ties round up. Coordinate gradients use the shared corner weights,
+including all axes at integer queries. Field tiles and correspondence UV maps
+share the clamped array interpolation used by transforms. Surface queries use row/column indices and require valid
+corners; bicubic Hermite derivatives are shared with `tifxyz.Surface`.
+`GridField` copies its input into fixed storage; CUDA copies remain resident.
+Torch sampling supports first-order gradients; CUDA value gradients use atomic
+addition and may differ slightly between runs. MPS tensors stage through CPU.
+Surface supervision queries do not support autograd.
+
+Surface transfer uses bicubic target geometry, triangle source geometry matching
+the correspondence mesh, and linear UV maps to avoid overshooting seams.
+Categorical labels are selected by index. Surface-to-volume projection prefers
+nonzero labels over zero; between nonzero labels, the nearest surface sample wins,
+with sample ID breaking ties. A multichannel label is nonzero when any channel is
+nonzero, and all channels come from the same winning sample.
+Binary masks use the same surface interpolation, sampling-density policy,
+endpoint-inclusive normal layers (at most half a voxel apart), and nearest-voxel
+placement as label projection. Supplied normals allow isolated valid points and
+edges to contribute too. Binary occupancy accumulates by union using deterministic
+integer writes. All these operations use float32 on CPU and CUDA.
+
+### Geometry and analysis
+
+| Need | C++ API | Implementation | Python |
+| --- | --- | --- | --- |
+| Polyline queries (nearest, interpolate, plane and box hits) and voxel-set membership | `sampling.hpp`: `geometry::Curves`, `Voxels` | `geometry/` | `geometry.py`: `PolylineSet`, `VoxelSet`, `transform_points` |
+| Low-level aligned and projection sampling plans | `sampling.hpp`: `aligned::Plan`, `PointPlan`, `projection::Plan` | `aligned/`, `projection/` | through `SampleReader` |
+| Triangle slice labels, interpolated normals and surface frames (ordered DDA rasterization) | `sampling.hpp`: `geometry::MeshSlice`, `raster_slice` | `geometry/triangle_mesh.hpp`, `geometry/kernels.cu` | `geometry.rasterize_mesh_slice` |
+| Sheet normals from CT | `reader.hpp`: `sheetNormals`, `sheetNormalsCpu`; `cuda_reader.hpp`: `sheet_normal::sample_cuda` | `sheet_normal/`, `native_reader.cpp`, `symmetric_eigen.hpp` | `sheet_normal.py`: `sheet_normals`, `sample_sheet_normals` |
+| Shortest path over a 2D cost grid | `pathfinding.hpp`: `pathfinding::shortestPath` | `pathfinding/` | `shortest_path` |
+| Connected components of a 2D/3D mask (4/8, 6/18/26-connected), numbered as `scipy.ndimage.label`; CPU (threaded, run-based) or CUDA | `components.hpp`: `components::label`, `components::cuda::label` | `components/` | `geometry.label_components`; `transforms.ConnectedComponents` |
+| Fill holes of a 2D/3D mask (`scipy.ndimage.binary_fill_holes`), CPU or CUDA | `components.hpp`: `components::fillHoles`, `components::cuda::fillHoles` | `components/` | `geometry.fill_holes` |
+| Binary YX skeletons (Zhang–Suen, Guo–Hall, combined), independent slice batches, host/device buffers | `thinning.hpp`: `thinning::skeleton`, `cuda::skeleton`, `cuda::skeletonDevice` | `thinning/skeleton.cpp`, `thinning/kernels.cu` | `thinning.skeletonize`, `skeletonize_into`; `transforms.MedialSurface` |
+| Ordered distance-ridge traces, pruning, reusable CPU scratch; complete device-side tracing | `thinning.hpp`: `thinning::trace`, `prune`, `cuda::traceDevice` | `thinning/trace.cpp`, `thinning/trace_cuda.cu` | `thinning.trace_ridges`, `trace_ridges_into`, `TraceWorkspace`; `transforms.RidgeTrace` |
+| Exact uint8 Manhattan distance to background in 2D/3D, saturated at 255 | `distance_transform.hpp`: `distance::manhattan`, `cuda::manhattanDevice` | `distance/` | `thinning.manhattan_distance` |
+
+
+### Display
+
+| Need | C++ API | Implementation | Python |
+| --- | --- | --- | --- |
+| Float to uint8/uint16 conversion, window/level, palette and overlay LUTs, ARGB blending | `display.hpp`: `display::toUint8`, `toUint16`, `windowLevelLut`, `paletteLut`, `overlayLut`, `applyLut`, `blend`, `blendArgb` | `display/` | `display_to_uint8`, `display_to_uint16`, `window_level_lut`, `palette_lut`, `overlay_lut`, `apply_lut`, `blend`, `blend_argb` |
+| Volumetric slab compositing, including perspective | `slab.hpp`: `display::compositeSlab`, `opacityLut`, `Slab` | `display/slab.cpp`, `display/slab_pixel.hpp` | `composite_slab`, `opacity_lut`, `SlabProjection` |
+| Views: the level for a zoom, fallback levels, a surface raster's pixels per voxel; progressive frames drawn from the caches with the reads they lacked | `grid.hpp`: `grid::levelForView`, `fallbackLevels`, `voxelExtent`, `pixelsPerVoxel`, `Frame`, `Pending`, `sampleCached`, `load` | `grid/view.cpp` | `grid.py`: `level_for_view`, `fallback_levels`, `pixels_per_voxel`, `Pending`, `sample_grid`, `sample_grid_cached`, `load`; levels from `ZarrReader.grid_level` |
+| The render engine from C or any language with a C FFI: volumes, surfaces, frames, progressive reads, composites, display tables | `vc_reader_c.h` (`vc_reader::c`, `libvc_reader_c`) | `c_api/c_api.cpp` | — |
+
+### Transforms and training
+
+| Need | C++ API | Implementation | Python |
+| --- | --- | --- | --- |
+| Augmentation and processing pipelines with seeded replay, on CPU or CUDA ([catalog](#transforms)) | `transforms.hpp`: `transforms::Pipeline`, `Op`, `Sample`, `Plan`, `save_plan`, `load_plan` | `transforms/pipeline.hpp`, `transforms/ops/`, `transforms/cpu/`, `transforms/cuda/` | `vc_reader.transforms` |
+| Device buffers, streams, resident pipelines and batches; how much freed memory the default CUDA pool keeps (all, by default) | `cuda.hpp`: `transforms::cuda::begin_device`, `run_device`, `run_batch`; `cuda_available.hpp`: `cuda::available` | `cuda_buffer.hpp`, `cuda_stream.hpp`, `cuda_pool.hpp`, `transforms/cuda/device_run.hpp` | `cuda.py`: `DeviceArray`, `is_available`, `asarray`, `wrap`, `set_pool_release_threshold`, `pool_release_threshold` |
+| PyTorch GPU transforms and prefetching; masked normalization; differentiable structure tensors | `transforms.hpp`: `StructureTensor` (component cotangent via `gradient`) | `transforms/` | `torch.py`: `CudaLoader`, `structure_tensor`; direct calls `A.Normalize(...).batch` |
+| Pavel/Gaussian structure components, directions; Euclidean distances; Hessian ridge responses | `transforms.hpp`: `StructureTensor`, `DistanceTransform`, `Ridges` | `transforms/cpu/`, `transforms/cuda/` | `transforms.StructureTensor`, `DistanceTransform`, `Ridges` |
+| Coherence-enhancing diffusion of a single image or volume, on CPU or CUDA | `transforms.hpp`: `CoherenceEnhancingDiffusion` | `transforms/cpu/coherence_enhancing_diffusion.hpp`, `transforms/cuda/coherence_enhancing_diffusion.cu` | `transforms.CoherenceEnhancingDiffusion` |
+
+### Shared primitives
+
+Use these instead of writing another copy. They are header-only under `src/cpp/` and
+included as `vc_reader/native/<file>`. They have no stability guarantee beyond this repository.
+
+| Need | File |
+| --- | --- |
+| Tie rules for rounding coordinates and values | `rounding.hpp` |
+| Bilinear, trilinear and masked interpolation; corner weights | `sampling_math.hpp`, `sample_point.hpp` |
+| Numpy typestrs and element types; encoding element values | `element_type.hpp`, `element_value.hpp` |
+| Symmetric eigendecomposition | `symmetric_eigen.hpp` |
+| LRU storage, thread pool, reused output buffers | `lru.hpp`, `thread_pool.hpp`, `output_pool.hpp` |
+| Atomic file writes | `atomic_file.hpp` |
+| Portable file I/O (open, pread, fstat, mmap, file locks, rename-over, temp dirs) on POSIX and Windows; headers must not include `<windows.h>` | `platform_io.hpp` (Windows bodies in `platform_io.cpp`) |
+| OME storage transforms | `storage_transform.hpp` |
+| Percentile, median, histogram, Fourier, elastic field and resize helpers shared by CPU and CUDA transforms | `transforms/shared/` |
+
+Guides: [C++](docs/cpp.md), [discovery](docs/discovery.md),
+[source reading](docs/source-reading.md), [aligned sampling](docs/aligned-sampling.md),
+[surface sampling](docs/surface-sampling.md), [precision](docs/precision.md).
+
 ## Quick start
 
 See [installation and notebook setup](examples/README.md#run). This example
@@ -219,6 +402,23 @@ Use fixed parameters for processing, such as `A.GaussianBlur(sigma=1.0)`, or
 sample parameters with `A.Uniform`, `A.Normal` and `A.Choice` for augmentation.
 Several constructors have random defaults; pipeline calls take an explicit
 `seed` for reproducibility, and `Plan` records sampled operations for replay.
+
+Every transform can also be called on its own. A transform is random only in a
+`Pipeline`: called directly it always applies (`p` is ignored) and draws
+anything else from a fixed seed, so the same input gives the same output. Pass
+plain values for processing. An array (NumPy, Torch CPU/CUDA or `DeviceArray`)
+stands for the field the transform reads by default and the call returns the
+field it creates, else the transformed input; a sample dict works like a
+pipeline call. `.batch` does the same over `(B, C, ...)` batches, CUDA ones in
+one launch.
+
+```python
+sdt = A.DistanceTransform(mode="outside")(mask)        # (1, Z, Y, X) label
+st = A.StructureTensor(sigma=1, rho=1.5)(image)          # created field
+z = A.Normalize("zscore", nonzero=False).batch(crops)    # (B, 1, Z, Y, X) CUDA
+out = A.Normalize("minmax", masked=True).batch(
+    {"image": x, "valid": v}, targets={"image": A.Image(valid="valid", refill=False), "valid": A.ValidMask()})
+```
 
 | Operation family | Examples |
 | --- | --- |
@@ -868,7 +1068,7 @@ A.MedianFilter(size=3)
 <details>
 <summary><strong>Morphology</strong></summary>
 
-Apply a morphological operation to labels. This example closes small gaps using dilation followed by erosion.
+Apply a morphological operation to labels. This example closes small gaps using dilation followed by erosion. `footprint` is `ball` (Euclidean radius), `cross` (L1 radius: SciPy's default structure with `iterations=radius`), `cube` (Chebyshev radius: SciPy's full-connectivity structure with `iterations=radius`) or `repeated_cross`. Outside the array counts as background, as SciPy's `border_value=0`; `neutral_border=True` keeps erosion from eating in from the edges.
 
 ```python
 A.Morphology(operation='close', radius=1)
@@ -1420,6 +1620,90 @@ A.SurfacePerturb(blobs=3, amplitude=1, points_affected=100, p=1)
 
 </details>
 
+### Image analysis and training losses
+
+`transforms.StructureTensor(sigma=1, rho=1.5)` returns Pavel structure tensor
+components in `zz, zy, zx, yy, yx, xx` order (2D: `yy, yx, xx`). Set `rho=0`
+to omit component smoothing. `vc_reader.torch.structure_tensor` accepts
+`(B,1,Y,X)` or `(B,1,Z,Y,X)` tensors and supplies first-order autograd on CPU
+and CUDA using native forward and backward kernels; MPS tensors stage through
+the CPU kernels and retain autograd. Double backward is not
+supported. For the central-plane 2D Pavel convention, pass `scale=3/8`.
+
+`transforms.DistanceTransform(implicit_background=True)` matches SciPy's
+all-one EDT convention: when no background feature exists, measure from
+`(-1,0,...)`. The default instead assigns zero when the other class is absent.
+
+For label ridge filtering, compose `GaussianBlur(sigma=2, boundary="reflect",
+truncate=4, full_width=False)`, `Normalize("minmax")`, and `Ridges()`.
+`Ridges` uses second-order one-sided differences at boundaries and requires
+at least three samples on each spatial axis.
+
+`CoherenceEnhancingDiffusion` processes a single channel-first `(C,Y,X)` image
+or `(C,Z,Y,X)` volume. Channels are independent, labels are unchanged, and the
+usual `on`, `channels`, `p`, and `p_channel` options apply. Both backends preserve
+float32/float64 input dtype. Volume buffers and eigendecomposition use that dtype;
+filter coefficients and CPU convolution accumulation follow `StructureTensor`.
+
+```python
+from vc_reader import transforms as A
+
+diffuse = A.Pipeline([
+    A.CoherenceEnhancingDiffusion(sigma=1, rho=2, lambda_=0.01,
+                                 exponent=2, alpha=0.01,
+                                 step_size=0.1, num_steps=10),
+], backend="cuda")  # or "cpu"
+result = diffuse({"image": volume[None]}, seed=0)["image"][0]
+```
+
+`volume` is a contiguous floating-point `(Z,Y,X)` array. CUDA device inputs and
+`Pipeline.batch` also work; iterations keep their buffers on the device.
+The corresponding C++ operation is `vcr::transforms::CoherenceEnhancingDiffusion`
+in a `Pipeline`, with the threshold member named `lambda`.
+
+Each iteration recomputes a Pavel structure tensor with nearest-edge filtering.
+`sigma` controls presmoothing and `rho` controls tensor integration, both in voxels.
+The diffusion tensor follows the CED eigenvalue mapping in
+[Mirebeau et al., equation (11)](https://insight-journal.org/pdfs/953.pdf):
+`mu_i = alpha + (1-alpha)*exp(-(lambda_/(l_max-l_i))**exponent)`, with `mu_i=alpha`
+for zero eigengap. `lambda_` is in squared input-intensity units; inputs are not
+automatically normalized. Scaling intensities by `k` requires scaling `lambda_`
+by `k*k` to retain the same diffusion strengths.
+
+The explicit stencil uses forward differences and their negative adjoint, with
+zero outward flux. It conserves total intensity (up to roundoff) and is L2 stable
+for the enforced `0 < step_size <= 1/6`; `alpha` must be in `(0,1]`.
+`num_steps=0` is identity. This stencil does not guarantee a maximum principle,
+so small intensity overshoots are possible; results are not clipped.
+Voxel spacing is assumed isotropic and equal to one. The complete volume and
+scratch buffers must fit memory; this API does not tile or stream diffusion.
+
+Validate CED with the existing build and Python environment:
+
+```bash
+AGENTS_AGENT_MODE=1 CCACHE_DISABLE=1 cmake --build vc_reader/build-native-cuda --target _transforms test_native_transforms -j 2
+AGENTS_AGENT_MODE=1 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 VC_READER_BUILD_DIR="$PWD/vc_reader/build-native-cuda" vesuvius/.venv/bin/python -m pytest vc_reader/tests/test_coherence_enhancing_diffusion.py vc_reader/tests/test_image_processing.py
+ctest --test-dir vc_reader/build-native-cuda -R '^test_native_transforms$' --output-on-failure
+```
+
+`geometry.rasterize_mesh_slice` intersects XYZ triangles with a Z plane,
+rounds DDA samples to even, and returns labels plus optional normals and frames.
+Later triangles overwrite labels; normal/frame sums retain triangle order on
+both CPU and CUDA. `Affine.load_transform_json` reads registration matrices;
+`geometry.transform_points(..., vectors=True, normalize=True)` maps unit
+vectors using a supplied linear transform.
+
+To validate these APIs against an existing local build (no installation):
+
+```bash
+AGENTS_AGENT_MODE=1 CCACHE_DISABLE=1 cmake --build vc_reader/build-native-cuda --target _transforms _reader _catalog -j 2
+AGENTS_AGENT_MODE=1 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 VC_READER_BUILD_DIR="$PWD/vc_reader/build-native-cuda" vesuvius/.venv/bin/python -m pytest vc_reader/tests/test_image_processing.py
+```
+
+Run these commands from the monorepo root, substituting your existing CMake
+build and Python environment. Tests cover forward values, gradients, EDT edge
+cases, mesh labels/frames, and the bundled PHerc0139 CT crop when available.
+
 ## Native C++ API
 
 Readers, sampling, geometry, and the full transform catalog are available to
@@ -1431,6 +1715,29 @@ CUDA backends. Python and C++ use the same implementations. Configure with
 See the [C++ guide](docs/cpp.md) for installation, target and header coverage,
 array/cache configuration, transform pipelines and replay, device-buffer
 ownership, streams, and a complete CPU/CUDA CT-normal example.
+
+### C API
+
+`libvc_reader_c` (CMake target `vc_reader::c`, header `<vc_reader/vc_reader_c.h>`)
+exposes the render engine to C and to any language with a C FFI (Rust, C#, Swift,
+Go, Node, ctypes). It opens a volume's pyramid with its caches, chooses levels for a
+view, samples planes and vertex-grid or tifxyz surfaces with layers and composites,
+draws frames progressively (`vcr_sample_cached` now, `vcr_pending_load` on a worker,
+then draw again), and maps samples to display pixels. Handles are opaque, outputs go
+to caller buffers, every failure is a `vcr_status` with `vcr_last_error()`, and only
+`vcr_*` symbols are exported. A frontend's loop:
+
+```c
+vcr_request_init(&req); req.volume = volume;
+req.start_level = vcr_level_for_view(volume, zoom, 1.0f);
+req.fallback_levels = vcr_fallback_levels(volume, req.start_level, w, h, zoom, 5);
+vcr_sample_cached(&frame, &req, pending, &result);   /* draw result now */
+if (!vcr_pending_empty(pending))                      /* on a worker thread: */
+    vcr_pending_load(pending, redraw, ui);            /* then sample again */
+```
+
+`tests/c/test_c_api.c` builds as strict C99 and exercises each path, on the GPU too
+when one is available.
 
 ### Native catalog
 
@@ -1446,3 +1753,55 @@ Python, Qt, OpenCV, CUDA or the volume reader. Configure with
 Python requires the compiled `_catalog` extension but no NumPy or array backend
 for metadata browsing. Native regression tests are enabled by
 `VC_READER_BUILD_NATIVE_TESTS=ON`.
+
+### Skeletons, traces, and connected components
+
+```python
+from vc_reader import thinning, transforms as A
+from vc_reader.geometry import label_components
+
+# uint8 contiguous (Y,X), or any leading dimensions batching independent YX masks.
+skeleton = thinning.skeletonize(mask, method="guo_hall", backend="cuda")
+trace_image, xy_paths = thinning.trace_ridges(mask, backend="cuda", return_traces=True)
+labels, count = label_components(mask, connectivity=8)  # CUDA masks give CUDA labels
+
+# Keep intermediate arrays on CUDA. Device inputs also produce device outputs.
+pipeline = A.Pipeline([
+    A.Morphology(on="mask", operation="close", radius=1),
+    A.ConnectedComponents(on="mask"),
+    A.RidgeTrace(on="mask"),
+    A.MedialSurface(on="mask", method="guo_hall", tube=False, close=False),
+], backend="cuda")
+result = pipeline({"mask": mask[None]}, seed=0)
+# mask_components, mask_traces, and mask_skel are added to the result.
+```
+
+Skeleton methods are `zhang_suen`, `guo_hall`, and `zhang_suen_guo_hall`.
+All nonzero input pixels are foreground; standalone skeleton outputs are 0/255.
+The standalone default preserves outer pixels; `preserve_border=False` treats
+outside pixels as background. `MedialSurface` defaults to the latter and retains
+input label values at skeleton pixels, with its existing optional morphology.
+Skeletons and ridge traces operate in YX planes; a stack is **not** a 3D skeleton.
+Components and Manhattan distances operate across the complete 2D or 3D grid.
+Component labels are int32 1..count in scan order of each component's first
+voxel, as `scipy.ndimage.label` numbers them, with zero for background.
+`ConnectedComponents` labels each channel independently (`connectivity`, 0 for full).
+
+`RidgeTrace`/`trace_ridges` return visit-index pixels (seeds are 1, indices saturate
+at 255). `return_traces=True` also returns ordered XY polylines. `min_length` prunes
+polylines by pixel length and rasterizes survivors as 255. CPU `TraceWorkspace`
+buffers can be reused, with one workspace per thread. CUDA performs distance,
+seeds, components, and tracing on the device. Independent components run in
+parallel; within each component seed order is preserved. Short speculative path
+prefixes reduce serial work and are accepted only where the ordered visited mask
+allows them. Large single components can limit acceleration. Returning polylines
+copies the final paths to the host; optional pruning then runs on the host.
+
+For resident arrays, `skeletonize_into(input, output, backend="cuda")` and
+`trace_ridges_into(input, output)` use preallocated CUDA uint8 buffers. Calls
+complete on vc_reader's stream; finish external writes before calling.
+The transforms pipeline keeps intermediate images on device, including in
+`Pipeline.batch`; convergence/count checks can synchronize small scalars.
+CUDA initialization is a one-time cost, so repeated processing should keep a
+process/pipeline alive. See [the thinning benchmark](benchmarks/README.md#thinning)
+for reproducible latency and reference comparisons.

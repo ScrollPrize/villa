@@ -1,4 +1,5 @@
 #pragma once
+#include "../../sampling_math.hpp"
 #include "../ops/oriented_blur.hpp"
 #include "../core.hpp"
 
@@ -51,23 +52,7 @@ template<int D=3> VCR_HD inline void basis(const double* axis, double* out) {
 }
 // Multilinear sample at a yx/zyx position, coordinates clamped into the grid.
 template<class T,class Real,int D=3> VCR_HD T sample(const T* src, const std::size_t* shape, const Real* q) {
-    long long lo[3]; Real f[3];
-    for (int a = 0; a < D; ++a) {
-        const Real x = q[a] < 0 ? 0 : q[a] > Real(shape[a] - 1) ? Real(shape[a] - 1) : q[a];
-        lo[a] = (long long)std::floor(x); f[a] = x - Real(lo[a]);
-    }
-    T value = 0;
-    for (int corner = 0; corner < (1<<D); ++corner) {
-        T w = 1; std::size_t at = 0;
-        for (int a = 0; a < D; ++a) {
-            const int bit = (corner >> (D - 1 - a)) & 1;
-            w *= bit ? f[a] : 1 - f[a];
-            long long x = lo[a] + bit; if (x >= (long long)shape[a]) x = (long long)shape[a] - 1;
-            at = at * shape[a] + std::size_t(x);
-        }
-        if (w) value += w * T(src[at]);
-    }
-    return value;
+    return sampling::clamped<D,T,Real,T,true,true>(src, shape, q);
 }
 // One pass for voxel (z, y, x): sum of weighted samples along direction u.
 template<class T,class Real,int D=3> VCR_HD T pass(const T* src, const std::size_t* shape, std::size_t z, std::size_t y, std::size_t x,
