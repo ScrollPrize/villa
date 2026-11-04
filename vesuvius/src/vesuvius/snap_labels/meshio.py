@@ -4,7 +4,7 @@ import json
 from pathlib import Path
 
 import numpy as np
-import tifffile
+from vc_reader import images
 
 VC3D_POINTS_VERSION = "1"   # volume-cartographer core/src/PointCollections.cpp
 
@@ -19,7 +19,7 @@ def load_mesh(folder):
     d = Path(folder)
     if not (d / "x.tif").is_file():
         raise MeshIOError(f"{d}: no x.tif (not a tifxyz folder)")
-    xs, ys, zs = (np.asarray(tifffile.imread(str(d / f"{a}.tif"))).astype(np.float32) for a in "xyz")
+    xs, ys, zs = (np.asarray(images.read(d / f"{a}.tif")).astype(np.float32) for a in "xyz")
     if not (xs.ndim == 2 and xs.shape == ys.shape == zs.shape):
         raise MeshIOError(f"{d}: x, y and z tifs must be 2-D grids of one size")
     valid = (xs > -0.5) & (ys > -0.5) & (zs > -0.5) & np.isfinite(xs) & np.isfinite(ys) & np.isfinite(zs)
@@ -27,13 +27,12 @@ def load_mesh(folder):
 
 
 def write_grid_tif(path, arr):
-    """One 2-D grid as an uncompressed single-strip TIFF, dtype kept (VC3D memory-maps this layout)."""
-    a = np.ascontiguousarray(arr)
-    tifffile.imwrite(str(path), a, photometric="minisblack", compression=None, rowsperstrip=a.shape[0])
+    """One 2-D grid as an uncompressed min-is-black TIFF, dtype kept."""
+    images.write_tiff(str(path), np.ascontiguousarray(arr), compression="none")
 
 
 def read_grid_tif(path):
-    return np.asarray(tifffile.imread(str(path)))
+    return np.asarray(images.read(path))
 
 
 def write_mesh(src, out, xs, ys, zs, valid, record, note):

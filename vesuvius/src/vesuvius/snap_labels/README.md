@@ -55,5 +55,5 @@ a second registered scan of the same object; the defaults are unchanged.
 3 voxels and an empty volume do not also "recover". On a mesh where most vertices abstain the check fails, since
 abstaining vertices do not move back.
 
-A snapped label is geometry, not a reading. Dependencies: numpy and zarr from the core install, and tifffile,
-which `vesuvius.tifxyz` also needs (in the `render`, `models` and `all` extras). No scipy, no GPU.
+A snapped label is geometry, not a reading. Dependencies: numpy and vc_reader, which reads the volume and the
+tifxyz grids and writes the TIFFs (the `volume-only` extra has both). No scipy, no GPU.

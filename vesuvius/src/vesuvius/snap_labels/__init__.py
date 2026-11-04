@@ -1,6 +1,6 @@
 """Snap tifxyz surface labels onto the papyrus recto face of the CT, with a per-vertex abstain mask.
 
-Entry point: ``vesuvius.snap_labels`` (see ``cli.py`` and README.md). numpy, tifffile and zarr only.
+Entry point: ``vesuvius.snap_labels`` (see ``cli.py`` and README.md). numpy and vc_reader only.
 """
 
 from .face import FACE_REASONS, normals, self_check, snap_face

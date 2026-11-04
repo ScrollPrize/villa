@@ -6,7 +6,7 @@ import concurrent.futures
 import threading
 
 import numpy as np
-import zarr
+from vc_reader.reader import ZarrReader, open_node
 
 
 class VolumeError(ValueError):
@@ -28,11 +28,11 @@ class Volume:
     def __init__(self, location, workers=8, cache_chunks=192):
         self.location = str(location)
         try:
-            node = zarr.open(self.location, mode="r")
-        except Exception as exc:  # noqa: BLE001 - zarr raises several types for a missing or bad store
+            node = open_node(self.location)
+        except Exception as exc:  # noqa: BLE001 - a missing or bad store raises several types
             raise VolumeError(f"cannot open {location}: {exc}") from exc
         self.levels = []
-        if isinstance(node, zarr.Array):
+        if isinstance(node, ZarrReader):
             self.levels.append(self._level("", node, None))
         else:
             ms = _multiscales(node.attrs)
@@ -40,12 +40,12 @@ class Volume:
                 for d in ms.get("datasets", []):
                     scale = next((t.get("scale") for t in d.get("coordinateTransformations") or []
                                   if t.get("type") == "scale"), None)
-                    self.levels.append(self._level(str(d.get("path")), node[str(d.get("path"))], scale))
+                    self.levels.append(self._level(str(d.get("path")), node.array(str(d.get("path"))), scale))
             else:
                 for k in range(16):
                     if str(k) not in node:
                         break
-                    self.levels.append(self._level(str(k), node[str(k)], None))
+                    self.levels.append(self._level(str(k), node.array(str(k)), None))
         if not self.levels:
             raise VolumeError(f"{location}: a zarr group with no levels")
         base = self.levels[0]
