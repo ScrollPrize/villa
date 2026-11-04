@@ -13,7 +13,7 @@ std::string ObjectStore::addEdge(WriteTxn& txn, const EdgeRecord& record)
             detail::validateDependencies(anchor, detail::dependencyGeometry(*this, txn, *revision));
     auto* db = static_cast<sqlite3*>(connection(txn));
     Savepoint savepoint(db);
-    const auto uuid = addEdgeImpl(db, impl_->options.author, impl_->hostname, record, false);
+    const auto uuid = addEdgeImpl(db, author(), impl_->hostname, record, false);
     recordRelationshipValidation(db, *edgeByUuid(txn, uuid));
     savepoint.release();
     return uuid;
@@ -75,7 +75,7 @@ void ObjectStore::removeEdge(WriteTxn& txn, const std::string& uuid)
     if (!row.row()) throw std::runtime_error("object store: edge not found: " + uuid);
     const auto kind = row.text(1);
     execute(db, "DELETE FROM edges WHERE id=?", row.i64(0));
-    appendJournal(db, impl_->options.author, impl_->hostname, bytes, 0, "remove_edge", kind);
+    appendJournal(db, author(), impl_->hostname, bytes, 0, "remove_edge", kind);
     savepoint.release();
 }
 

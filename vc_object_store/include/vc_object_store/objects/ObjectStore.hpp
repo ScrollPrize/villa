@@ -6,6 +6,7 @@
 
 #include "vc_object_store/objects/Geometry.hpp"
 #include "vc_object_store/objects/GeometryRegion.hpp"
+#include "vc_object_store/objects/Transactions.hpp"
 #include <array>
 #include <atomic>
 #include <cstddef>
@@ -128,6 +129,13 @@ struct ObjectRevision {
     // increasing within this store. Missing only for those untimed baselines.
     std::optional<int64_t> publishedAtUs;
     bool deleted = false;
+    // Numbered history: (store, generation, objectUuid, version) is this
+    // revision's public reference. The generation is the lineage it was
+    // published in. commitSequence is absent for history converted without a
+    // recorded publication (e.g. untimed imported baselines).
+    int64_t version = 0;
+    std::string generation;
+    std::optional<int64_t> commitSequence;
     ObjectRecord record;
 };
 
@@ -146,6 +154,10 @@ struct RelationshipRevision {
     EdgeRecord record;
     std::string aRevision, bRevision;
     std::optional<std::string> aGeometryRevision, bGeometryRevision;
+    // Numbered history of the relationship and of its pinned endpoint states.
+    int64_t version = 0;
+    std::string generation;
+    int64_t aVersion = 0, bVersion = 0;
 };
 
 struct SelectedRelationship {
@@ -190,6 +202,10 @@ struct OpenOptions {
     // Only the hub functions in objects/Hub.hpp open stores this way; ordinary
     // opens of a hub are rejected so they cannot switch it back to WAL.
     bool sharedFile = false;
+    // Open as the store's hosting service: exclusive host-local ownership.
+    // Fails while any standalone writable handle is open, and standalone
+    // writable opens fail while the service holds it (see ObjectStore).
+    bool serviceOwner = false;
     // Called (on the reading thread, inside the read) with the surfaces a
     // geometryRegion or nearestSurfaces query reached whose geometry is not
     // local yet. Must only queue work; ObjectStoreSession sets it on writable attachments.
@@ -308,6 +324,8 @@ public:
     // Exact heads captured inside a successful checked commit, before releasing
     // the writer. A later external commit cannot change this receipt.
     const RevisionSelection& committedRevisions() const { return committedRevisions_; }
+    // Numbered receipt of a committed write: commit sequence and versions.
+    const std::optional<TransactionReceipt>& receipt() const { return receipt_; }
 
 protected:
     Txn(ObjectStore* db, void* handle, bool write) : db_(db), handle_(handle), write_(write) {}
@@ -320,6 +338,8 @@ private:
     void* handle_ = nullptr;  // sqlite3*
     bool write_ = false;
     RevisionSelection expectedRevisions_, committedRevisions_;
+    std::optional<TransactionReceipt> receipt_;
+    VersionSelection expectedObjectVersions_, expectedRelationshipVersions_;
 };
 
 class ReadTxn : public Txn {
@@ -383,11 +403,41 @@ public:
     // (as `uuid` when given).
     std::string chooseVolumeTransform(WriteTxn&, const std::string& source, const std::string& target,
         const std::vector<std::string>& path, const std::optional<std::string>& uuid = std::nullopt);
+    // Record external catalog registrations as versioned store records
+    // (catalogTransformUuid(id), exact coefficients, catalog id and revision
+    // evidence). Unchanged registrations are left untouched; others need
+    // their expected versions in a checked write. Once recorded, a
+    // registration resolves from the store for every client: a client's own
+    // catalog copy of that id is ignored by volumeTransforms(). Returns the
+    // records created or changed.
+    std::vector<std::string> recordCatalogTransforms(WriteTxn&, const std::vector<vcr::catalog::Registration>&);
     WriteTxn write();
     // Check supplied heads before editing; require every changed object/endpoint.
     // Commit publishes one revision per changed object. Missing expectations or
     // conflicts abort the whole transaction, even if caught.
     WriteTxn write(const RevisionSelection& expected);
+    // Numbered checked write (see TransactionContext). A request UUID already
+    // committed is rejected here; use receipt() or submit() to recover it.
+    WriteTxn write(const TransactionContext&);
+    // Execute typed operations atomically. An identical retry of a committed
+    // request returns its saved receipt without re-executing; the same request
+    // UUID with different contents fails. Conflicts throw TransactionConflict.
+    TransactionReceipt submit(const TransactionRequest&);
+    std::optional<TransactionReceipt> receipt(const Txn&, const std::string& requestUuid) const;
+    StoreStatus status(const Txn&) const;
+    // Changes after the cursor, whole commits in sequence order, at most
+    // maxChanges records unless one commit alone exceeds it (then continued).
+    ChangePage changesSince(const Txn&, const FeedCursor&, int64_t maxChanges = 4096) const;
+    std::optional<int64_t> currentVersion(const Txn&, const std::string& objectUuid) const;
+    std::optional<int64_t> currentRelationshipVersion(const Txn&, const std::string& relationshipUuid) const;
+    // Exact numbered reference; nullopt when this store never published it in
+    // that generation (never another generation's same-numbered version).
+    std::optional<ObjectRevision> objectAtVersion(const Txn&, const ObjectVersion&) const;
+    std::optional<RelationshipRevision> relationshipAtVersion(const Txn&, const RelationshipVersion&) const;
+    ObjectVersion versionReference(const Txn&, const ObjectRevision&) const;
+    // Restore tooling: start a fresh, never reused history generation for new
+    // writes. Recorded versions keep their publication generations.
+    std::string startHistoryGeneration(const std::string& reason);
     std::optional<ObjectRevision> currentObjectRevision(const Txn&, const std::string& objectUuid) const;
     std::optional<ObjectRevision> objectRevision(const Txn&, const std::string& revisionUuid) const;
     std::vector<ObjectRevision> objectHistory(const Txn&, const std::string& objectUuid) const;

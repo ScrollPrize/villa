@@ -4,6 +4,7 @@
 #include "internal/History.hpp"
 #include "internal/RecordSql.hpp"
 #include "hub/HubRules.hpp"
+#include "internal/Versions.hpp"
 
 namespace vc::objects {
 thread_local std::unordered_map<sqlite3*, StatementPool*> activeStatementPools;
@@ -16,9 +17,11 @@ ObjectStore& ObjectStore::operator=(ObjectStore&&) noexcept = default;
 std::unique_ptr<ObjectStore::Impl> ObjectStore::openImpl(const std::filesystem::path& path, const OpenOptions& options, bool create)
 {
     const int kApplicationId = 0x56434f42;
-    const int kSchemaVersion = 17;
+    const int kSchemaVersion = 18;
     if (create && options.readOnly) throw std::invalid_argument("create requires writable options");
     if (create && options.sharedFile) throw std::invalid_argument("object store: create a store locally, then initialize it as a hub");
+    if (options.serviceOwner && (options.readOnly || options.sharedFile))
+        throw std::invalid_argument("object store: a hosting service opens its local store writable");
     if (sqlite3_threadsafe() == 0)
         throw std::runtime_error("object store: SQLite build is not thread-safe");
     if (!create && !options.readOnly && options.author.empty())
@@ -36,8 +39,9 @@ std::unique_ptr<ObjectStore::Impl> ObjectStore::openImpl(const std::filesystem::
     auto validate = [&](sqlite3* db) {
         if (pragmaInt(db, "application_id") != kApplicationId)
             throw std::runtime_error("object store: unsupported database format: " + path.string());
-        if (pragmaInt(db, "user_version") != kSchemaVersion)
-            throw std::runtime_error("object store: unsupported database schema: " + path.string());
+        if (const int version = pragmaInt(db, "user_version"); version != kSchemaVersion)
+            throw std::runtime_error("object store: unsupported database schema: " + path.string() +
+                (version == 17 ? " (schema 17: convert it with vc_object_convert)" : ""));
         // A hub must keep its rollback journal: opening it with WAL from a
         // network mount would break locking for every other client.
         impl->hubRole = detectHubRole(db);
@@ -47,6 +51,11 @@ std::unique_ptr<ObjectStore::Impl> ObjectStore::openImpl(const std::filesystem::
             throw std::runtime_error("object store: " + path.string() + " is not a hosted hub");
     };
     const char* journalMode = options.sharedFile ? "PRAGMA journal_mode=DELETE;" : "PRAGMA journal_mode=WAL;";
+    // Writable access is guarded before any writer connection opens. A hub on
+    // a network mount (sharedFile) relies on its own SQLite locking instead.
+    if (!options.readOnly && !options.sharedFile)
+        impl->ownership = std::make_unique<OwnershipGuard>(path,
+            options.serviceOwner ? OwnershipGuard::Mode::Service : OwnershipGuard::Mode::Standalone);
 
     if (create) {
         std::error_code ec;
@@ -63,6 +72,7 @@ std::unique_ptr<ObjectStore::Impl> ObjectStore::openImpl(const std::filesystem::
             createLifecycleSchema(impl->writer);
             createDependencyIndex(impl->writer);
             createSourceIdentityIndex(impl->writer);
+            createVersionSchema(impl->writer, util::newUuid());
             exec(impl->writer, ("PRAGMA user_version=" + std::to_string(kSchemaVersion) + ";").c_str());
             exec(impl->writer, "COMMIT;");
         } catch (...) {
@@ -92,7 +102,6 @@ std::unique_ptr<ObjectStore::Impl> ObjectStore::openImpl(const std::filesystem::
 
 const std::filesystem::path& ObjectStore::path() const { return impl_->path; }
 std::string ObjectStore::hostname() const { return impl_->hostname; }
-std::string ObjectStore::author() const { return impl_->options.author; }
 
 ObjectStore ObjectStore::create(const std::filesystem::path& p, const OpenOptions& o) { return ObjectStore(openImpl(p,o,true)); }
 ObjectStore ObjectStore::open(const std::filesystem::path& p, const OpenOptions& o) { return ObjectStore(openImpl(p,o,false)); }

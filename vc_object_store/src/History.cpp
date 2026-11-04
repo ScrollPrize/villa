@@ -1,4 +1,5 @@
 #include "internal/History.hpp"
+#include "internal/Versions.hpp"
 #include "internal/RecordJson.hpp"
 #include "internal/RecordSql.hpp"
 #include "internal/EdgeSql.hpp"
@@ -70,6 +71,10 @@ RelationshipRevision relationship(sqlite3* db, const std::string& uuid)
     result.record = edgeFromJson(record);
     result.aRevision = s.text(1); result.bRevision = s.text(2);
     result.aGeometryRevision = s.optText(3); result.bGeometryRevision = s.optText(4);
+    Statement version(db, "SELECT version,generation FROM relationship_versions WHERE revision_uuid=?", uuid);
+    if (version.row()) { result.version = version.i64(0); result.generation = version.text(1); }
+    result.aVersion = revisionVersion(db, result.aRevision);
+    result.bVersion = revisionVersion(db, result.bRevision);
     return result;
 }
 
@@ -315,7 +320,7 @@ void detail::publishHistory(sqlite3* db, bool importedBindings)
         std::set<std::string> owners;
     };
     std::vector<ChangedEdge> edges;
-    Statement dirtyEdges(db, "SELECT uuid FROM history_dirty_edges");
+    Statement dirtyEdges(db, "SELECT uuid FROM history_dirty_edges ORDER BY uuid");
     while (dirtyEdges.row()) {
         ChangedEdge e;
         e.uuid = formatUuid(dirtyEdges.blob16(0));
@@ -382,6 +387,7 @@ void detail::publishHistory(sqlite3* db, bool importedBindings)
     if (lastTime.i64(0) == std::numeric_limits<int64_t>::max())
         throw std::overflow_error("object history: publication clock exhausted");
     publishedAtUs = std::max(publishedAtUs, lastTime.i64(0) + 1);
+    CommitPublisher commit(db, publishedAtUs);
     // Allocate all identities first: shared records may pin both revisions
     // published by this action, including cycles and self relationships.
     for (auto& [object, p] : objects) {
@@ -389,9 +395,11 @@ void detail::publishHistory(sqlite3* db, bool importedBindings)
             if (p.parent) {
                 // Record a physical deletion without changing existing deletion
                 // eligibility. This prevents time-based reads resurrecting it.
+                const auto tombstone = util::newUuid();
                 execute(db, "INSERT INTO object_revisions(uuid,object_uuid,parent_uuid,"
-                    "metadata_delta,published_at_us,deleted) VALUES(?,?,?,'[]',?,1)", util::newUuid(),
+                    "metadata_delta,published_at_us,deleted) VALUES(?,?,?,'[]',?,1)", tombstone,
                     object, *p.parent, publishedAtUs);
+                commit.object(object, tombstone, true);
             }
             for (const auto* table : {"object_heads", "object_head_records", "object_relationship_heads"}) {
                 execute(db, std::string("DELETE FROM ") + table + " WHERE object_uuid=?", object);
@@ -405,6 +413,7 @@ void detail::publishHistory(sqlite3* db, bool importedBindings)
         if (p.geometry) insert.bind(4, parseUuid(*p.geometry)); else insert.bindNull(4);
         insert.bind(5, p.delta.dump()); insert.bind(6, int64_t(1));
         insert.bind(7, publishedAtUs); insert.stepDone();
+        commit.object(object, p.uuid, false);
         execute(db, "INSERT INTO object_heads VALUES(?,?) ON CONFLICT(object_uuid) DO UPDATE SET revision_uuid=excluded.revision_uuid",
             object, p.uuid);
         execute(db, "INSERT INTO object_head_records VALUES(?,?,?) ON CONFLICT(object_uuid) "
@@ -430,6 +439,7 @@ void detail::publishHistory(sqlite3* db, bool importedBindings)
         auto record = currentRecord(db, object);
         if (epoch) { record["lifecycle_epoch"] = *epoch; record["retired"] = false; }
         baseline.bind(4, Json::diff(Json::object(), record).dump()); baseline.stepDone();
+        commit.baseline(object, uuid);
         return uuid;
     };
     for (const auto& edge : edges) {
@@ -444,6 +454,9 @@ void detail::publishHistory(sqlite3* db, bool importedBindings)
             const auto a = metadata(db, aPin);
             const auto b = metadata(db, bPin);
             bindLifecycle(db, *edge.record, a.value("lifecycle_epoch", ""), b.value("lifecycle_epoch", ""));
+            commit.relationship(edge.uuid, edge.version);
+        } else {
+            commit.relationship(edge.uuid, std::nullopt);
         }
         for (const auto& owner : edge.owners) {
             const auto& p = objects.at(owner);
@@ -457,6 +470,9 @@ void detail::publishHistory(sqlite3* db, bool importedBindings)
             }
         }
     }
+    if (commit.sequence())
+        if (const auto pool = activeStatementPools.find(db); pool != activeStatementPools.end())
+            pool->second->publishedSequence = commit.sequence();
     exec(db, "DELETE FROM history_dirty_objects; DELETE FROM history_dirty_edges;"
              "DELETE FROM history_expected; DELETE FROM history_checked; DELETE FROM history_validated_edges;"
              "DELETE FROM history_required;");
@@ -475,6 +491,11 @@ std::optional<ObjectRevision> ObjectStore::objectRevision(const Txn& txn, const 
     result.metadataComplete = s.i64(4) != 0;
     if (!s.isNull(5)) result.publishedAtUs = s.i64(5);
     result.deleted = s.i64(6) != 0;
+    Statement version(db, "SELECT version,generation,commit_seq FROM object_versions WHERE revision_uuid=?", canonical);
+    if (version.row()) {
+        result.version = version.i64(0); result.generation = version.text(1);
+        if (!version.isNull(2)) result.commitSequence = version.i64(2);
+    }
     const auto record = metadata(db, canonical);
     result.record = objectFromJson(record); commonFromJson(record, result.record);
     return result;
@@ -565,6 +586,16 @@ std::vector<SelectedRelationship> ObjectStore::relationshipsAt(const Txn& txn, c
         result.push_back({std::move(edge), applicable});
     }
     return result;
+}
+
+std::optional<RelationshipRevision> ObjectStore::relationshipAtVersion(const Txn& txn, const RelationshipVersion& ref) const
+{
+    auto* db = static_cast<sqlite3*>(connection(txn));
+    if (formatUuid(parseUuid(ref.storeUuid)) != storeUuidText(db)) return std::nullopt;
+    Statement s(db, "SELECT revision_uuid FROM relationship_versions WHERE edge_uuid=? AND version=? AND generation=? "
+                    "AND revision_uuid IS NOT NULL",
+        formatUuid(parseUuid(ref.relationshipUuid)), ref.version, formatUuid(parseUuid(ref.generation)));
+    return s.row() ? std::optional(relationship(db, s.text(0))) : std::nullopt;
 }
 
 void detail::requirePublishedGraphRead(const Txn& txn)

@@ -34,14 +34,14 @@ void ObjectStore::setApproval(WriteTxn& txn, const std::string& recordUuid, cons
     if (state == "pending") {
         s.bindNull(2); s.bindNull(3); s.bindNull(4); s.bindNull(5);
     } else {
-        s.bind(2, impl_->options.author);
+        s.bind(2, author());
         s.bind(3, nowIsoUtc());
         s.bind(4, impl_->hostname);
         s.bind(5, generation);
     }
     s.bind(6, id);
     s.stepDone();
-    appendJournal(db, impl_->options.author, impl_->hostname, bytes, generation, "approval");
+    appendJournal(db, author(), impl_->hostname, bytes, generation, "approval");
     savepoint.release();
 }
 
@@ -89,11 +89,11 @@ void ObjectStore::setMeta(WriteTxn& txn, const std::string& recordUuid, const st
         const auto object = objectByUuid(txn, recordUuid);
         if (object && hasGeometryCoordinates(object->kind)) {
             const auto value = geometryCoordinates(nlohmann::json::parse(jsonValue));
-            mutateMeta(static_cast<sqlite3*>(connection(txn)), impl_->options.author, impl_->hostname, recordUuid, key, value.dump());
+            mutateMeta(static_cast<sqlite3*>(connection(txn)), author(), impl_->hostname, recordUuid, key, value.dump());
             return;
         }
     }
-    mutateMeta(static_cast<sqlite3*>(connection(txn)), impl_->options.author, impl_->hostname, recordUuid, key, jsonValue);
+    mutateMeta(static_cast<sqlite3*>(connection(txn)), author(), impl_->hostname, recordUuid, key, jsonValue);
 }
 
 void ObjectStore::bindGeometryCoordinates(WriteTxn& txn, const std::string& objectUuid, const std::string& volume,
@@ -111,7 +111,7 @@ void ObjectStore::bindGeometryCoordinates(WriteTxn& txn, const std::string& obje
 
 void ObjectStore::removeMeta(WriteTxn& txn, const std::string& recordUuid, const std::string& key)
 {
-    mutateMeta(static_cast<sqlite3*>(connection(txn)), impl_->options.author, impl_->hostname, recordUuid, key, std::nullopt);
+    mutateMeta(static_cast<sqlite3*>(connection(txn)), author(), impl_->hostname, recordUuid, key, std::nullopt);
 }
 
 int64_t ObjectStore::journalPosition(const Txn& txn) const

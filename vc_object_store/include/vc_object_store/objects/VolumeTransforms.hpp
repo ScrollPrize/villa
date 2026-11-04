@@ -34,6 +34,8 @@ struct VolumeTransforms {
     // The volumes with a route into `target`, by id.
     std::vector<Related> related(const std::string& target) const;
 };
+// Stable object UUID of a recorded catalog registration (by catalog id).
+std::string catalogTransformUuid(const std::string& registrationId);
 // The stored route choice from `source` to `target`, when there is one.
 std::optional<ObjectRecord> volumeTransformChoice(const ObjectStore&,const Txn&,const std::string& source,const std::string& target);
 // Through a session's attachment: store `matrix` (source voxels to target

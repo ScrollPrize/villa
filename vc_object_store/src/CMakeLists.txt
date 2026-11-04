@@ -29,6 +29,9 @@ target_compile_features(vc_geometry PUBLIC cxx_std_20)
 add_library(vc_objects ${_vc_store_library_type}
     sftp/SftpVfs.cpp
     internal/Anchors.cpp
+    internal/Ownership.cpp
+    Versions.cpp
+    Commands.cpp
     internal/Sqlite.cpp
     internal/RecordSql.cpp
     internal/EdgeSql.cpp

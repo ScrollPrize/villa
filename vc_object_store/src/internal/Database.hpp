@@ -2,6 +2,7 @@
 #include "vc_object_store/objects/ObjectStore.hpp"
 
 #include "internal/Sqlite.hpp"
+#include "internal/Ownership.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -42,6 +43,12 @@ struct StatementPool {
     bool hubApply = false;
     std::optional<std::string> actingHolder;
     int64_t startJournal = 0, startGeometry = 0;
+    // Attribution and request identity of the active write (see
+    // TransactionContext). actingAuthor overrides the open author for
+    // mutation stamps; commit* attribute the store commit.
+    std::optional<std::string> actingAuthor, requestUuid, requestDigest;
+    std::string commitAuthor, commitHost;
+    std::optional<int64_t> publishedSequence; // set by publishHistory
     std::map<std::string, std::vector<int64_t>> components;
     size_t componentNodes = 0;
     std::shared_ptr<detail::GeometryReadCache> geometryCache;
@@ -60,6 +67,8 @@ void beginSpatialRead(StatementPool&, size_t budget, int version);
 // Hosting role, fixed at open by the presence of the hub_* tables.
 enum class HubRole { None, Hub, Replica };
 struct ObjectStore::Impl {
+    // Declared first: released only after every connection has closed.
+    std::unique_ptr<detail::OwnershipGuard> ownership;
     std::filesystem::path path;
     OpenOptions options;
     std::string hostname;

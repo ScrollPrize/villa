@@ -1,12 +1,15 @@
 #include "internal/Database.hpp"
 #include "internal/History.hpp"
+#include "internal/Versions.hpp"
 #include "imports/SourceIdentityIndex.hpp"
 #include "hub/HubRules.hpp"
 
 namespace vc::objects {
 using namespace detail;
 Txn::Txn(Txn&& other) noexcept : db_(other.db_), handle_(other.handle_), write_(other.write_),
-    expectedRevisions_(std::move(other.expectedRevisions_)), committedRevisions_(std::move(other.committedRevisions_))
+    expectedRevisions_(std::move(other.expectedRevisions_)), committedRevisions_(std::move(other.committedRevisions_)),
+    receipt_(std::move(other.receipt_)), expectedObjectVersions_(std::move(other.expectedObjectVersions_)),
+    expectedRelationshipVersions_(std::move(other.expectedRelationshipVersions_))
 {
     other.handle_ = nullptr;
 }
@@ -47,12 +50,15 @@ void Txn::release(bool commit)
                                formatUuid(parseUuid(uuid)));
                 committedRevisions_[uuid] = head.row() ? std::optional(head.text(0)) : std::nullopt;
             }
+            auto expectedObjects = expectedObjectVersions_;
+            for (const auto& [uuid, expected] : expectedRevisions_) expectedObjects.emplace(uuid, std::nullopt);
+            receipt_ = finishReceipt(conn, *activeStatementPools.at(conn), expectedObjects, expectedRelationshipVersions_);
         }
         exec(conn, commit ? "COMMIT;" : "ROLLBACK;");
     }
     catch (...) {
         sqlite3_exec(conn, "ROLLBACK;", nullptr, nullptr, nullptr);
-        committedRevisions_.clear();
+        committedRevisions_.clear(); receipt_.reset();
         releaseConnection(); throw;
     }
     releaseConnection();
@@ -96,6 +102,12 @@ WriteTxn ObjectStore::write()
     impl_->statementPools.at(impl_->writer)->readSnapshot = false;
     impl_->statementPools.at(impl_->writer)->checkedAction = false;
     impl_->statementPools.at(impl_->writer)->actionConflict = false;
+    {
+        auto& pool = *impl_->statementPools.at(impl_->writer);
+        pool.actingAuthor.reset(); pool.requestUuid.reset(); pool.requestDigest.reset();
+        pool.publishedSequence.reset();
+        pool.commitAuthor = impl_->options.author; pool.commitHost = impl_->hostname;
+    }
     try {
         exec(impl_->writer, "BEGIN IMMEDIATE;");
         if (impl_->hubRole != HubRole::None) beginHubWrite(impl_->writer, *impl_->statementPools.at(impl_->writer));
@@ -111,6 +123,39 @@ WriteTxn ObjectStore::write(const RevisionSelection& expected)
     expectHistory(static_cast<sqlite3*>(connection(txn)), expected);
     txn.expectedRevisions_ = expected;
     return txn;
+}
+
+WriteTxn ObjectStore::write(const TransactionContext& context)
+{
+    if (context.author && context.author->empty()) throw std::invalid_argument("object store: empty transaction author");
+    auto txn = write();
+    auto* db = static_cast<sqlite3*>(connection(txn));
+    auto& pool = *activeStatementPools.at(db);
+    if (context.requestUuid) {
+        const auto request = util::canonicalUuid(*context.requestUuid);
+        if (savedReceipt(db, request))
+            throw std::invalid_argument("object store: request " + request + " already committed; recover its receipt");
+        pool.requestUuid = request;
+        pool.requestDigest = context.requestDigest;
+    }
+    if (context.author) pool.actingAuthor = *context.author;
+    RevisionSelection expected;
+    checkTransactionContext(db, context, expected);
+    expectHistory(db, expected);
+    txn.expectedRevisions_ = expected;
+    txn.expectedObjectVersions_ = context.expectedObjects;
+    txn.expectedRelationshipVersions_ = context.expectedRelationships;
+    return txn;
+}
+
+std::string ObjectStore::author() const
+{
+    // A write's transaction context attributes every stamp it makes, without
+    // changing the handle's options for other threads/requests.
+    if (impl_->writer)
+        if (const auto pool = activeStatementPools.find(impl_->writer); pool != activeStatementPools.end() &&
+            pool->second->actingAuthor) return *pool->second->actingAuthor;
+    return impl_->options.author;
 }
 
 void ObjectStore::checkpoint()

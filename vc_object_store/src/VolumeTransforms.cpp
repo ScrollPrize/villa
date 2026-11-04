@@ -89,18 +89,35 @@ std::array<double,6> transformBounds(const std::array<double,6>& b,const VolumeA
     }
     return out;
 }
+std::string catalogTransformUuid(const std::string& registrationId) {
+    if(registrationId.empty())throw std::invalid_argument("catalog registration id is empty");
+    return util::nameUuid("vc_object_store/catalog-registration/"+registrationId);
+}
 VolumeTransforms ObjectStore::volumeTransforms(const Txn& txn) const {
     VolumeTransforms result;
-    if(impl_->options.catalogTransforms)result.graph=*impl_->options.catalogTransforms;
+    std::vector<vcr::catalog::Registration> recorded;
+    std::set<std::string> recordedIds;
     for(const auto& object:objectsByKind(txn,"volume_transform")) {
         const auto meta=nlohmann::json::parse(object.meta);
         const auto& value=meta.at("registration");
         const auto head=currentObjectRevision(txn,object.uuid);
         if(!head)throw std::runtime_error("commit new volume registrations before resolving views");
-        result.graph.add({object.uuid,head->uuid,
+        // A recorded catalog registration keeps its catalog id as its route key.
+        std::string id=object.uuid;
+        if(meta.contains("catalog_registration")) {
+            id=meta.at("catalog_registration").at("id").get<std::string>();
+            recordedIds.insert(id);
+        }
+        recorded.push_back({id,head->uuid,
             value.at("source_volume").get<std::string>(),value.at("target_volume").get<std::string>(),
             VolumeAffine::fromJson(value.at("matrix")),value.value("description",std::string{})});
     }
+    // Client catalog registrations not recorded in the store still apply
+    // locally; recorded ones always resolve from the store.
+    if(impl_->options.catalogTransforms)
+        for(const auto& registration:impl_->options.catalogTransforms->registrations())
+            if(!recordedIds.contains(registration.id))result.graph.add(registration);
+    for(auto& registration:recorded)result.graph.add(std::move(registration));
     for(const auto& object:objectsByKind(txn,"volume_transform_choice")) {
         const auto value=nlohmann::json::parse(object.meta).at("choice");
         const auto key=std::pair(value.at("source_volume").get<std::string>(),value.at("target_volume").get<std::string>());
@@ -138,6 +155,31 @@ std::string ObjectStore::registerVolumeTransform(WriteTxn& txn,const std::string
     auto meta=nlohmann::json::parse(record.meta);
     meta["registration"]={{"source_volume",source},{"target_volume",target},{"matrix",matrix.json()},{"description",name}};
     record.meta=meta.dump();return upsertObject(txn,record);
+}
+std::vector<std::string> ObjectStore::recordCatalogTransforms(WriteTxn& txn,const std::vector<vcr::catalog::Registration>& registrations) {
+    std::vector<std::string> changed;
+    std::set<std::string> seen;
+    for(const auto& registration:registrations) {
+        if(!seen.insert(registration.id).second)throw std::invalid_argument("duplicate catalog registration "+registration.id);
+        vcr::catalog::RegistrationGraph validate;validate.add(registration);
+        const auto uuid=catalogTransformUuid(registration.id);
+        ObjectRecord record;
+        if(auto existing=objectByUuid(txn,uuid)) {
+            record=*existing;
+            if(record.kind!="volume_transform")throw std::invalid_argument("not a volume registration: "+uuid);
+        } else record.uuid=uuid;
+        record.kind="volume_transform";
+        record.name=registration.provenance.empty()?registration.id:registration.provenance;
+        auto meta=nlohmann::json::parse(record.meta);
+        const nlohmann::json value={{"source_volume",registration.source},{"target_volume",registration.target},
+                                    {"matrix",registration.matrix.json()},{"description",registration.provenance}};
+        const nlohmann::json source={{"id",registration.id},{"revision",registration.revision}};
+        if(meta.value("registration",nlohmann::json())==value&&meta.value("catalog_registration",nlohmann::json())==source)continue;
+        meta["registration"]=value;meta["catalog_registration"]=source;
+        record.meta=meta.dump();
+        changed.push_back(upsertObject(txn,record));
+    }
+    return changed;
 }
 std::string ObjectStore::chooseVolumeTransform(WriteTxn& txn,const std::string& source,const std::string& target,const std::vector<std::string>& path,
     const std::optional<std::string>& uuid) {

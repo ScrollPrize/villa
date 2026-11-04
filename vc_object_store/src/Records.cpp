@@ -4,7 +4,7 @@ namespace vc::objects {
 using namespace detail;
 std::string ObjectStore::upsertObject(WriteTxn& txn, const ObjectRecord& record)
 {
-    return upsertObjectImpl(static_cast<sqlite3*>(connection(txn)), impl_->options.author, impl_->hostname, record, false);
+    return upsertObjectImpl(static_cast<sqlite3*>(connection(txn)), author(), impl_->hostname, record, false);
 }
 
 std::optional<ObjectRecord> ObjectStore::objectByUuid(const Txn& txn, const std::string& uuid) const
@@ -69,7 +69,7 @@ void ObjectStore::deleteObject(WriteTxn& txn, const std::string& uuid)
     if (!row.row()) throw std::runtime_error("object store: object not found: " + uuid);
     const auto kind = row.text(1);
     execute(db, "DELETE FROM objects WHERE id=?", row.i64(0));  // FK RESTRICT on edges refuses while referenced
-    appendJournal(db, impl_->options.author, impl_->hostname, bytes, 0, "delete", kind);
+    appendJournal(db, author(), impl_->hostname, bytes, 0, "delete", kind);
     savepoint.release();
 }
 

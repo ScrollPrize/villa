@@ -157,6 +157,53 @@ excluded. Retired objects are omitted unless `include_retired=True`.
 `None` resolves the latest head in that snapshot. Restore historical content by
 publishing a new checked action, not by moving old heads.
 
+## Numbered history and checked requests
+
+Schema 18 numbers history. Each object and relationship keeps its UUID; each
+published state also has a version, starting at 1 and advancing once per
+transaction that changes the record (deletions and relationship removals are
+numbered too, so a deleted identity never looks newly absent). A historical
+reference is `(store UUID, publication generation, record UUID, version)`;
+`objectAtVersion`/`relationshipAtVersion` resolve it only in the generation it
+was published in. `startHistoryGeneration` (restore tooling) starts a new
+generation for new writes without relabelling recorded versions.
+
+Every transaction that publishes something advances the store's commit
+sequence by one and appends its changes to an ordered feed:
+`status()` returns store UUID, active generation, commit sequence and feed
+start; `changesSince(cursor, maxChanges)` returns whole commits (continuing
+inside a commit only when it alone exceeds the page). A cursor from another
+generation, from the future or before the feed start comes back invalid:
+revalidate cached heads and rerun queries.
+
+Typed requests carry a client-minted request UUID, the expected store and
+generation, an author (attribution, not authentication), expected object
+versions (every changed object, `null` for creation), optional relationship
+versions, read dependencies (checked, never versioned) and an optional commit
+sequence guard for query membership/absence:
+
+```cpp
+vc::objects::TransactionRequest r;
+r.requestUuid = vc::objects::util::newUuid();
+r.storeUuid = status.storeUuid; r.generation = status.generation; r.author = "reviewer";
+r.expectedObjects = {{objectUuid, 3}};
+r.operations = {vc::objects::SetMetaOp{objectUuid, "review_note", R"("checked")"}};
+const auto receipt = store.submit(r); // receipt.objects[objectUuid] == 4
+```
+
+An identical retry returns the saved receipt (`replayed`) before any version
+check, so a lost reply never turns into a conflict with its own changes; the
+same request UUID with different contents fails. Stale preconditions throw
+`TransactionConflict` and write nothing. `objects/TransactionJson.hpp` gives the
+canonical JSON form (binary payloads named by SHA-256, sent separately) and
+the request digest. `write(TransactionContext)` offers the same checks around
+direct `ObjectStore` calls; every committed write has `Txn::receipt()`.
+`recordCatalogTransforms` publishes catalog registrations as versioned records
+that every client then resolves from the store.
+
+Writable opens hold a host-local ownership lock on `<canonical path>-owner`:
+shared between standalone writers, exclusive for `OpenOptions::serviceOwner`.
+
 ## Relationships and graphs
 
 Relationships are shared by both endpoints. Addition, removal or rebinding
