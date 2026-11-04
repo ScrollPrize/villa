@@ -165,7 +165,8 @@ transaction that changes the record (deletions and relationship removals are
 numbered too, so a deleted identity never looks newly absent). A historical
 reference is `(store UUID, publication generation, record UUID, version)`;
 `objectAtVersion`/`relationshipAtVersion` resolve it only in the generation it
-was published in. `startHistoryGeneration` (restore tooling) starts a new
+was published in; `objectsAtVersions` reads many references in order in one
+snapshot (versions that are still heads skip history replay). `startHistoryGeneration` (restore tooling) starts a new
 generation for new writes without relabelling recorded versions.
 
 Every transaction that publishes something advances the store's commit
@@ -264,6 +265,7 @@ ssh -N -L 8750:127.0.0.1:8750 storage-host                # on each client
 C++ clients use `vc::objects::HostedStore` (`client/HostedStore.hpp`) with the
 same request and result types as the local API: `status`, `submit`, `receipt`,
 `changesSince`, `currentObjectRevision`, `currentVersion`, `objectAtVersion`,
+`objectsAtVersions` (batches of up to the server's query limit),
 `geometryRevision`, `readGeometryArray`, `putArtifact`, `artifactLength`,
 `readArtifact`, `fetchArtifact` (verified, atomic local file),
 `selectObjects`/`selectEdges` (one
@@ -295,6 +297,7 @@ Wire protocol (version 1, JSON unless noted):
 | `POST /v1/query/objects` (`selection`, `fields`) | one page of records; `limit` required, at most `maxQueryResults` |
 | `POST /v1/query/edges` (`selection`, `fields`) | one page of edges; same limit rule |
 | `POST /v1/query/relationships` (`versions`: store, generation, object, version) | selected relationships with `applicable` |
+| `POST /v1/query/versions` (`versions`, at most `maxQueryResults`) | one revision per reference, in order, `null` where not recorded |
 | `POST /v1/query/region` (`slice`, `options`) | region runs, coverage stop reason and stats |
 | `POST /v1/query/nearest_surfaces` (proximity query) | surface hits |
 

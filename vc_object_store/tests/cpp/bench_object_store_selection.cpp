@@ -6,6 +6,9 @@
 //   bench_object_store_selection list STORE [ITERATIONS]
 //       Times full listings: local single snapshot, local UUID pages, and
 //       hosted pages through an in-process vc_object_server.
+//   bench_object_store_selection versions STORE [COUNT] [ITERATIONS]
+//       Times reads of COUNT fibers at their (head) versions: batched versus
+//       one reference at a time, local and hosted.
 #include "vc_object_store/Uuid.hpp"
 #include "vc_object_store/client/HostedStore.hpp"
 #include "vc_object_store/objects/TransactionJson.hpp"
@@ -235,6 +238,54 @@ int list(const std::string& path, int iterations)
     std::cout << "max RSS (client and server in one process) " << maxRssMiB() << " MiB\n";
     return 0;
 }
+int versions(const std::string& path, int64_t count, int iterations)
+{
+    std::vector<ObjectVersion> references;
+    {
+        OpenOptions readOnly;
+        readOnly.readOnly = true;
+        auto store = ObjectStore::open(path, readOnly);
+        auto txn = store.read();
+        const auto status = store.status(txn);
+        ObjectSelection fibers;
+        fibers.kind = "fiber";
+        fibers.limit = count;
+        for (const auto& record : store.selectObjects(txn, fibers, std::vector<std::string>{}))
+            references.push_back({status.storeUuid, record.versionGeneration, record.uuid, *record.version});
+        std::vector<double> batched, single;
+        for (int i = 0; i < iterations; ++i) {
+            auto start = Clock::now();
+            const auto all = store.objectsAtVersions(txn, references);
+            batched.push_back(seconds(start));
+            start = Clock::now();
+            std::size_t found = 0;
+            for (const auto& reference : references) found += store.objectAtVersion(txn, reference).has_value();
+            single.push_back(seconds(start));
+            if (found != all.size() || std::count(all.begin(), all.end(), std::nullopt))
+                throw std::runtime_error("versions missing");
+        }
+        report("local objectsAtVersions", batched, references.size());
+        report("local objectAtVersion one at a time", single, references.size());
+    }
+    server::Server service(path, server::ServerOptions{});
+    service.start();
+    HostedStore hosted("http://127.0.0.1:" + std::to_string(service.port()));
+    const std::vector<ObjectVersion> few(references.begin(), references.begin() + std::min<std::size_t>(references.size(), 1000));
+    std::vector<double> batched, single;
+    for (int i = 0; i < iterations; ++i) {
+        auto start = Clock::now();
+        if (hosted.objectsAtVersions(references, 1000).size() != references.size())
+            throw std::runtime_error("hosted versions missing");
+        batched.push_back(seconds(start));
+        start = Clock::now();
+        for (const auto& reference : few)
+            if (!hosted.objectAtVersion(reference)) throw std::runtime_error("hosted version missing");
+        single.push_back(seconds(start));
+    }
+    report("hosted objectsAtVersions 1000 per request", batched, references.size());
+    report("hosted objectAtVersion one request each", single, few.size());
+    return 0;
+}
 } // namespace
 
 int main(int argc, char** argv)
@@ -242,7 +293,10 @@ try {
     const std::string mode = argc > 1 ? argv[1] : "";
     if (mode == "create" && argc == 4) return create(argv[2], std::stoll(argv[3]));
     if (mode == "list" && (argc == 3 || argc == 4)) return list(argv[2], argc == 4 ? std::stoi(argv[3]) : 3);
-    std::cerr << "usage: bench_object_store_selection create STORE COUNT | list STORE [ITERATIONS]\n";
+    if (mode == "versions" && argc >= 3 && argc <= 5)
+        return versions(argv[2], argc >= 4 ? std::stoll(argv[3]) : 10000, argc == 5 ? std::stoi(argv[4]) : 5);
+    std::cerr << "usage: bench_object_store_selection create STORE COUNT | list STORE [ITERATIONS] |"
+                 " versions STORE [COUNT] [ITERATIONS]\n";
     return 2;
 } catch (const std::exception& error) {
     std::cerr << "bench_object_store_selection: " << error.what() << "\n";

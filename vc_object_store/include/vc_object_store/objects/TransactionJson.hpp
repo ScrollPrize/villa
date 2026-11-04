@@ -87,8 +87,13 @@ std::vector<EdgeRecord> edgeQueryResultFromJson(const std::string&, StoreStatus*
 std::string objectHistoryToJson(const StoreStatus&, const std::vector<ObjectRevision>&);
 std::vector<ObjectRevision> objectHistoryFromJson(const std::string&, StoreStatus* asOf);
 
-std::string relationshipQueryRequestToJson(const std::vector<ObjectVersion>&);
-std::vector<ObjectVersion> relationshipQueryRequestFromJson(const std::string&);
+// Lists of numbered object references: relationship queries and batched
+// reads at versions send them in this form.
+std::string objectVersionsRequestToJson(const std::vector<ObjectVersion>&);
+std::vector<ObjectVersion> objectVersionsRequestFromJson(const std::string&);
+// Batched reads at versions: one entry per reference, null where not recorded.
+std::string objectsAtVersionsResultToJson(const StoreStatus&, const std::vector<std::optional<ObjectRevision>>&);
+std::vector<std::optional<ObjectRevision>> objectsAtVersionsResultFromJson(const std::string&, StoreStatus* asOf);
 std::string relationshipQueryResultToJson(const StoreStatus&, const std::vector<SelectedRelationship>&);
 std::vector<SelectedRelationship> relationshipQueryResultFromJson(const std::string&, StoreStatus* asOf);
 

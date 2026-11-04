@@ -448,6 +448,10 @@ public:
     // that generation (never another generation's same-numbered version).
     std::optional<ObjectRevision> objectAtVersion(const Txn&, const ObjectVersion&) const;
     std::optional<RelationshipRevision> relationshipAtVersion(const Txn&, const RelationshipVersion&) const;
+    // objectAtVersion for many references in one snapshot, in order (nullopt
+    // where a reference is not recorded). Versions that are still the head
+    // read the materialized head record without replaying history.
+    std::vector<std::optional<ObjectRevision>> objectsAtVersions(const Txn&, const std::vector<ObjectVersion>&) const;
     ObjectVersion versionReference(const Txn&, const ObjectRevision&) const;
     // Restore tooling: start a fresh, never reused history generation for new
     // writes. Recorded versions keep their publication generations.

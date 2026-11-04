@@ -188,6 +188,38 @@ try {
         require(!hosted.objectAtVersion({hostedInitial.storeUuid, util::newUuid(), a, 1}), "other generation never resolves");
         require(!hosted.objectAtVersion({hostedInitial.storeUuid, hostedInitial.generation, a, 99}), "unknown version");
 
+        // Batched reads at versions: same answers as one-at-a-time reads, in
+        // order, heads and historical versions alike, split into batches of 2.
+        {
+            auto references = [&](const StoreStatus& s) {
+                std::vector<ObjectVersion> refs;
+                for (int64_t version : {5, 1, 3, 99}) refs.push_back({s.storeUuid, s.generation, a, version});
+                refs.push_back({s.storeUuid, s.generation, b, 2});
+                refs.push_back({s.storeUuid, util::newUuid(), b, 1});
+                refs.push_back({util::newUuid(), s.generation, b, 1});
+                refs.push_back({s.storeUuid, s.generation, b, 1});
+                return refs;
+            };
+            const auto localRefs = references(localInitial), hostedRefs = references(hostedInitial);
+            const auto l = local.objectsAtVersions(txn, localRefs);
+            const auto h = hosted.objectsAtVersions(hostedRefs, 2);
+            require(l.size() == localRefs.size() && h.size() == hostedRefs.size(), "batched read lengths");
+            for (std::size_t i = 0; i < l.size(); ++i) {
+                const auto one = local.objectAtVersion(txn, localRefs[i]);
+                require(l[i].has_value() == one.has_value() && h[i].has_value() == one.has_value(), "batched presence");
+                if (!one) continue;
+                require(l[i]->uuid == one->uuid && l[i]->version == one->version && l[i]->generation == one->generation &&
+                    l[i]->commitSequence == one->commitSequence && objectRecordJson(l[i]->record) == objectRecordJson(one->record),
+                    "batched local equals single read");
+                require(h[i]->objectUuid == one->objectUuid && h[i]->version == one->version &&
+                    h[i]->record.meta == one->record.meta && h[i]->commitSequence == one->commitSequence,
+                    "batched hosted parity");
+            }
+            require(!l[3] && !l[5] && !l[6] && l[7] && l[7]->version == 1, "batched misses");
+            require(l[0]->version == 5 && l[1]->version == 1 && l[1]->record.meta != l[0]->record.meta, "batched order");
+            require(hosted.objectsAtVersions({}).empty(), "empty batch");
+        }
+
         StoreStatus asOf;
         const auto head = hosted.currentObjectRevision(a, &asOf);
         require(head && head->version == 5 && asOf.commitSequence == hosted.status().commitSequence, "current head snapshot");

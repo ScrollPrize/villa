@@ -14,6 +14,7 @@
 #include <set>
 #include <map>
 #include <functional>
+#include <iterator>
 
 namespace vc::objects {
 using Json = nlohmann::json;
@@ -439,10 +440,28 @@ std::vector<ObjectRevision> HostedStore::objectHistory(const std::string& object
     return objectHistoryFromJson(expectOk(response, "object history").body, asOf);
 }
 
+std::vector<std::optional<ObjectRevision>> HostedStore::objectsAtVersions(const std::vector<ObjectVersion>& references,
+                                                                       int64_t batch)
+{
+    if (batch <= 0) throw std::invalid_argument("hosted store: batch size must be positive");
+    std::vector<std::optional<ObjectRevision>> result;
+    result.reserve(references.size());
+    for (std::size_t i = 0; i < references.size(); i += std::size_t(batch)) {
+        const std::vector<ObjectVersion> part(references.begin() + i,
+            references.begin() + std::min(references.size(), i + std::size_t(batch)));
+        const auto response = impl_->http.request("POST", endpoint_ + "/v1/query/versions",
+            objectVersionsRequestToJson(part), {{"Content-Type", "application/json"}});
+        auto revisions = objectsAtVersionsResultFromJson(expectOk(response, "versions query").body, nullptr);
+        if (revisions.size() != part.size()) throw std::runtime_error("hosted store: versions answer has the wrong length");
+        std::move(revisions.begin(), revisions.end(), std::back_inserter(result));
+    }
+    return result;
+}
+
 std::vector<SelectedRelationship> HostedStore::relationshipsAt(const std::vector<ObjectVersion>& versions, StoreStatus* asOf)
 {
     const auto response = impl_->http.request("POST", endpoint_ + "/v1/query/relationships",
-        relationshipQueryRequestToJson(versions), {{"Content-Type", "application/json"}});
+        objectVersionsRequestToJson(versions), {{"Content-Type", "application/json"}});
     return relationshipQueryResultFromJson(expectOk(response, "relationship query").body, asOf);
 }
 

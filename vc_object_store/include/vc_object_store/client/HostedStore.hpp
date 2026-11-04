@@ -64,6 +64,11 @@ public:
     std::optional<ObjectRevision> currentObjectRevision(const std::string& objectUuid, StoreStatus* asOf = nullptr);
     std::optional<int64_t> currentVersion(const std::string& objectUuid);
     std::optional<ObjectRevision> objectAtVersion(const ObjectVersion&);
+    // Many references in order (nullopt where not recorded), `batch` per
+    // request (at most the server's query limit). Each batch is one server
+    // snapshot; historical versions are immutable, so batches agree.
+    std::vector<std::optional<ObjectRevision>> objectsAtVersions(const std::vector<ObjectVersion>&,
+                                                                 int64_t batch = 1000);
     // Geometry payloads by their immutable revision identity (from
     // ObjectRevision::geometryRevision): safe to cache by that key. Reads
     // above rangeBytes, and reads the server refuses as too large for one

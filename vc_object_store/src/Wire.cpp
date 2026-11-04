@@ -430,7 +430,7 @@ std::vector<ObjectRevision> objectHistoryFromJson(const std::string& text, Store
     return result;
 }
 
-std::string relationshipQueryRequestToJson(const std::vector<ObjectVersion>& versions)
+std::string objectVersionsRequestToJson(const std::vector<ObjectVersion>& versions)
 {
     auto array = Json::array();
     for (const auto& v : versions)
@@ -438,16 +438,31 @@ std::string relationshipQueryRequestToJson(const std::vector<ObjectVersion>& ver
     return Json{{"versions", std::move(array)}}.dump();
 }
 
-std::vector<ObjectVersion> relationshipQueryRequestFromJson(const std::string& text)
+std::vector<ObjectVersion> objectVersionsRequestFromJson(const std::string& text)
 {
     const auto j = Json::parse(text);
-    requireKeys(j, {"versions"}, "relationship query");
+    requireKeys(j, {"versions"}, "object versions request");
     std::vector<ObjectVersion> result;
     for (const auto& v : j.at("versions")) {
         requireKeys(v, {"store", "generation", "object", "version"}, "object version");
         result.push_back({v.at("store").get<std::string>(), v.at("generation").get<std::string>(),
                           v.at("object").get<std::string>(), v.at("version").get<int64_t>()});
     }
+    return result;
+}
+
+std::string objectsAtVersionsResultToJson(const StoreStatus& status, const std::vector<std::optional<ObjectRevision>>& revisions)
+{
+    auto array = Json::array();
+    for (const auto& revision : revisions) array.push_back(revision ? revisionJson(*revision) : Json(nullptr));
+    return envelope(status, "revisions", std::move(array)).dump();
+}
+
+std::vector<std::optional<ObjectRevision>> objectsAtVersionsResultFromJson(const std::string& text, StoreStatus* asOf)
+{
+    std::vector<std::optional<ObjectRevision>> result;
+    for (const auto& j : unwrap(text, asOf, "revisions"))
+        result.push_back(j.is_null() ? std::nullopt : std::optional(revisionFrom(j)));
     return result;
 }
 

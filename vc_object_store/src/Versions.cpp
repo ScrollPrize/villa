@@ -363,11 +363,7 @@ std::optional<int64_t> ObjectStore::currentRelationshipVersion(const Txn& txn, c
 
 std::optional<ObjectRevision> ObjectStore::objectAtVersion(const Txn& txn, const ObjectVersion& ref) const
 {
-    auto* db = static_cast<sqlite3*>(connection(txn));
-    if (canonical(ref.storeUuid) != storeUuidText(db)) return std::nullopt;
-    Statement s(db, "SELECT revision_uuid FROM object_versions WHERE object_uuid=? AND version=? AND generation=?",
-        canonical(ref.objectUuid), ref.version, canonical(ref.generation));
-    return s.row() ? objectRevision(txn, s.text(0)) : std::nullopt;
+    return std::move(objectsAtVersions(txn, {ref}).front());
 }
 
 ObjectVersion ObjectStore::versionReference(const Txn& txn, const ObjectRevision& revision) const

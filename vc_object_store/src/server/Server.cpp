@@ -585,9 +585,19 @@ struct ServerState {
 
     Reply queryRelationships(const std::string& body)
     {
-        const auto versions = relationshipQueryRequestFromJson(body);
+        const auto versions = objectVersionsRequestFromJson(body);
         auto txn = store->read();
         return jsonReply(relationshipQueryResultToJson(store->status(txn), store->relationshipsAt(txn, versions)));
+    }
+
+    Reply queryVersions(const std::string& body)
+    {
+        const auto versions = objectVersionsRequestFromJson(body);
+        if (int64_t(versions.size()) > options.maxQueryResults)
+            throw std::invalid_argument("at most " + std::to_string(options.maxQueryResults) +
+                                        " versions per request; send larger batches in parts");
+        auto txn = store->read();
+        return jsonReply(objectsAtVersionsResultToJson(store->status(txn), store->objectsAtVersions(txn, versions)));
     }
 
     Reply queryRegion(const std::string& body)
@@ -652,6 +662,8 @@ struct ServerState {
             return {readers.get(), [this, body] { return queryEdges(*body); }};
         if (method == http::verb::post && is({"v1", "query", "relationships"}))
             return {readers.get(), [this, body] { return queryRelationships(*body); }};
+        if (method == http::verb::post && is({"v1", "query", "versions"}))
+            return {readers.get(), [this, body] { return queryVersions(*body); }};
         if (method == http::verb::post && is({"v1", "query", "region"}))
             return {readers.get(), [this, body] { return queryRegion(*body); }};
         if (method == http::verb::post && is({"v1", "query", "nearest_surfaces"}))

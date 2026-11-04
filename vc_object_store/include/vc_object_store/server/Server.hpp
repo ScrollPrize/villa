@@ -2,7 +2,8 @@
 // vc_object_server: hosts one object store over HTTP for clients that have no
 // filesystem access to it. Handlers only adapt the wire to the public
 // ObjectStore APIs (submit, receipt, status, changesSince, historical reads,
-// object/edge selections, object history, numbered relationship selections,
+// object/edge selections, object history, batched reads at versions,
+// numbered relationship selections,
 // region and surface proximity queries, artifact bytes); /v1/service reports the service's
 // own state (queues, staging, connections, WAL checkpoints);
 // storage semantics live in the shared library.
@@ -56,8 +57,9 @@ struct ServerOptions {
     uint64_t walTruncateBytes = 256u << 20;
     std::chrono::milliseconds truncateWait{200};
     int64_t maxFeedChanges = 4096;
-    // Object/edge query pages must name a limit no larger than this; larger
-    // listings are paged by the client (see HostedStore::selectAllObjects).
+    // Object/edge query pages must name a limit no larger than this, and a
+    // batched read at versions may name at most this many references; larger
+    // listings and batches are split by the client (see HostedStore).
     int64_t maxQueryResults = 10000;
     // Region queries are clamped to these budgets; a clamped query reports
     // the budget it stopped at (RegionResult::stop), never a silent cut.

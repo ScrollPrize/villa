@@ -498,6 +498,27 @@ void detail::publishHistory(sqlite3* db, bool importedBindings)
              "DELETE FROM history_required;");
 }
 
+namespace {
+// Revision columns shared by the single and batched reads, starting at `c`:
+// object_uuid, parent_uuid, geometry_uuid, seq, metadata_complete,
+// published_at_us, deleted.
+ObjectRevision revisionColumns(Statement& s, int c, std::string uuid)
+{
+    ObjectRevision result;
+    result.uuid = std::move(uuid); result.objectUuid = s.text(c); result.parentUuid = s.optText(c + 1);
+    result.geometryRevision = optionalUuid(s, c + 2); result.sequence = s.i64(c + 3);
+    result.metadataComplete = s.i64(c + 4) != 0;
+    if (!s.isNull(c + 5)) result.publishedAtUs = s.i64(c + 5);
+    result.deleted = s.i64(c + 6) != 0;
+    return result;
+}
+
+void setRecord(ObjectRevision& revision, const Json& record)
+{
+    revision.record = objectFromJson(record); commonFromJson(record, revision.record);
+}
+} // namespace
+
 std::optional<ObjectRevision> ObjectStore::objectRevision(const Txn& txn, const std::string& uuid) const
 {
     auto* db = static_cast<sqlite3*>(connection(txn));
@@ -505,19 +526,50 @@ std::optional<ObjectRevision> ObjectStore::objectRevision(const Txn& txn, const 
     Statement s(db, "SELECT object_uuid,parent_uuid,geometry_uuid,seq,metadata_complete,published_at_us,deleted "
         "FROM object_revisions WHERE uuid=?", canonical);
     if (!s.row()) return std::nullopt;
-    ObjectRevision result;
-    result.uuid = canonical; result.objectUuid = s.text(0); result.parentUuid = s.optText(1);
-    result.geometryRevision = optionalUuid(s, 2); result.sequence = s.i64(3);
-    result.metadataComplete = s.i64(4) != 0;
-    if (!s.isNull(5)) result.publishedAtUs = s.i64(5);
-    result.deleted = s.i64(6) != 0;
+    auto result = revisionColumns(s, 0, canonical);
     Statement version(db, "SELECT version,generation,commit_seq FROM object_versions WHERE revision_uuid=?", canonical);
     if (version.row()) {
         result.version = version.i64(0); result.generation = version.text(1);
         if (!version.isNull(2)) result.commitSequence = version.i64(2);
     }
-    const auto record = metadata(db, canonical);
-    result.record = objectFromJson(record); commonFromJson(record, result.record);
+    setRecord(result, metadata(db, canonical));
+    return result;
+}
+
+std::vector<std::optional<ObjectRevision>> ObjectStore::objectsAtVersions(const Txn& txn,
+    const std::vector<ObjectVersion>& references) const
+{
+    auto* db = static_cast<sqlite3*>(connection(txn));
+    const auto store = storeUuidText(db);
+    // One prepared lookup per reference. A version that is still the head
+    // takes its record from the materialized head in the same row; older
+    // versions replay their metadata history.
+    Statement s(db, "SELECT v.revision_uuid,r.object_uuid,r.parent_uuid,r.geometry_uuid,r.seq,r.metadata_complete,"
+        "r.published_at_us,r.deleted,v.commit_seq,h.record FROM object_versions v "
+        "JOIN object_revisions r ON r.uuid=v.revision_uuid "
+        "LEFT JOIN object_head_records h ON h.revision_uuid=v.revision_uuid "
+        "WHERE v.object_uuid=? AND v.version=? AND v.generation=?");
+    std::vector<std::optional<ObjectRevision>> result;
+    result.reserve(references.size());
+    for (const auto& reference : references) {
+        if (formatUuid(parseUuid(reference.storeUuid)) != store) {
+            result.emplace_back();
+            continue;
+        }
+        const auto generation = formatUuid(parseUuid(reference.generation));
+        s.reset();
+        s.bindAll(formatUuid(parseUuid(reference.objectUuid)), reference.version, generation);
+        if (!s.row()) {
+            result.emplace_back();
+            continue;
+        }
+        auto revision = revisionColumns(s, 1, s.text(0));
+        revision.version = reference.version;
+        revision.generation = generation;
+        if (!s.isNull(8)) revision.commitSequence = s.i64(8);
+        setRecord(revision, s.isNull(9) ? metadata(db, revision.uuid) : Json::parse(s.text(9)));
+        result.push_back(std::move(revision));
+    }
     return result;
 }
 
