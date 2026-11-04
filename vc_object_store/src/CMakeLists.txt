@@ -33,6 +33,7 @@ add_library(vc_objects ${_vc_store_library_type}
     Versions.cpp
     Commands.cpp
     Wire.cpp
+    client/HostedStore.cpp
     internal/Sqlite.cpp
     internal/RecordSql.cpp
     internal/EdgeSql.cpp
@@ -103,6 +104,14 @@ target_include_directories(vc_object_migration PRIVATE "${CMAKE_CURRENT_SOURCE_D
 target_link_libraries(vc_object_migration PUBLIC vc_objects PRIVATE nlohmann_json::nlohmann_json)
 target_compile_features(vc_object_migration PUBLIC cxx_std_20)
 add_library(vc_object_store::vc_geometry ALIAS vc_geometry)
+
+# Hosting service: Boost.Beast/Asio stays private to this target.
+if(VC_OBJECT_STORE_BUILD_SERVER)
+    add_library(vc_object_server STATIC server/Server.cpp)
+    target_link_libraries(vc_object_server PUBLIC vc_objects PRIVATE Boost::headers Threads::Threads nlohmann_json::nlohmann_json)
+    target_compile_features(vc_object_server PUBLIC cxx_std_20)
+    add_library(vc_object_store::vc_object_server ALIAS vc_object_server)
+endif()
 
 if(NOT VC_OBJECT_STORE_BUILD_ADAPTERS)
     return()

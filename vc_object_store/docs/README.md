@@ -220,6 +220,53 @@ a recorded publication, geometry revisions that do not select one object
 version, metadata still holding old revision UUIDs, and an unversioned inventory
 of external artifact files. Converted commits have author `unrecorded`.
 
+### Hosting a store (`vc_object_server`)
+
+`vc_object_server` serves one store over HTTP to clients that have no
+filesystem access to it. It opens the store as its service owner, so it will
+not start while a standalone writer has the store open, and standalone
+writable opens fail while it runs (read-only inspection still works). It has no
+authentication: keep the default loopback address and reach it through an SSH
+tunnel, or listen on a trusted private network.
+
+```sh
+vc_object_server /data/project.vcobj --port 8750          # on the storage host
+ssh -N -L 8750:127.0.0.1:8750 storage-host                # on each client
+```
+
+C++ clients use `vc::objects::HostedStore` (`client/HostedStore.hpp`) with the
+same request and result types as the local API: `status`, `submit`, `receipt`,
+`changesSince`, `currentObjectRevision`, `currentVersion`, `objectAtVersion`,
+`geometryRevision` and `readGeometryArray`. Conflicts throw the same
+`TransactionConflict`. Transport failures, 429 and 5xx are retried with the same
+request UUID, so a lost reply is answered by the saved receipt. When retries run
+out the outcome is unknown: recover it with `receipt()` or by resubmitting the
+identical request, never under a new request UUID.
+
+Wire protocol (version 1, JSON unless noted):
+
+| Request | Answer |
+| --- | --- |
+| `GET /v1/status` | store, generation, commit sequence, feed start |
+| `PUT /v1/payloads/{sha256}` (bytes) | stages one payload until it expires |
+| `POST /v1/transactions` (canonical request JSON) | receipt; 409 conflict; 422 `missing` payload hashes; 400 invalid |
+| `GET /v1/receipts/{request}` | saved receipt or 404 |
+| `GET /v1/changes?store&generation&sequence&offset&max` | feed page |
+| `GET /v1/objects/{uuid}` | current revision and the status of the same snapshot |
+| `GET /v1/objects/{uuid}/versions/{n}?store&generation` | that numbered revision or 404 |
+| `GET /v1/geometry/{revision}` | geometry descriptor (immutable) |
+| `GET /v1/geometry/{revision}/arrays/{name}?offset&count` | array bytes |
+
+The server answers a request whose payloads have expired from its saved
+receipt when there is one. Otherwise it names the missing payloads, and the
+client uploads them again and resubmits the identical request. The in-process
+form is `ObjectStore::submit(requestJson, payloadLookup)`. Storage work never
+runs on network threads. Checked transactions go to one writer queue. Reads,
+feed pages and staging go to bounded read workers. Status and receipt checks
+have their own lane. A full queue answers 503, which clients retry.
+`ServerOptions` sets the queues, body, payload and staging limits, the staging
+lifetime and per-request deadlines.
+
 ## Relationships and graphs
 
 Relationships are shared by both endpoints. Addition, removal or rebinding
@@ -735,7 +782,9 @@ AGENTS_AGENT_MODE=1 ctest --test-dir build-core --output-on-failure
 ```
 
 The C++ tests cover shared-session lifecycle, direct fiber API transactions,
-and bounded UUID-filtered spatial reads. To run the Python tests with an existing
+bounded UUID-filtered spatial reads, numbered history (`object_store_versions`),
+schema conversion (`object_store_convert`) and local/hosted parity through
+`vc_object_server` (`object_store_hosted`, built with `VC_OBJECT_STORE_BUILD_SERVER`). To run the Python tests with an existing
 Python-enabled build, use its Python interpreter and point to its module directory:
 
 ```sh
