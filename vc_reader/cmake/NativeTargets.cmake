@@ -1,13 +1,24 @@
 include(GNUInstallDirs)
 find_package(Threads REQUIRED)
 
-# Publish the existing Python-independent headers without maintaining copies.
-# configure_file tracks edits and keeps build-tree and installed include paths identical.
+# Publish the Python-independent headers without maintaining copies. In the build
+# tree vc_reader/native is a link to src/cpp, so a source file may include a
+# header by either path and #pragma once still sees one file; installs copy them.
 file(GLOB_RECURSE _vc_native_headers CONFIGURE_DEPENDS RELATIVE "${CMAKE_CURRENT_SOURCE_DIR}/src/cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/cpp/*.hpp" "${CMAKE_CURRENT_SOURCE_DIR}/src/cpp/*.cuh")
 list(FILTER _vc_native_headers EXCLUDE REGEX "(^|/)([^/]*_)?bindings\\.hpp$")
+set(_vc_native_link "${CMAKE_CURRENT_BINARY_DIR}/include/vc_reader/native")
+if(EXISTS "${_vc_native_link}" AND NOT IS_SYMLINK "${_vc_native_link}")
+    file(REMOVE_RECURSE "${_vc_native_link}")
+endif()
+file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/include/vc_reader")
+if(NOT EXISTS "${_vc_native_link}")
+    file(CREATE_LINK "${CMAKE_CURRENT_SOURCE_DIR}/src/cpp" "${_vc_native_link}" RESULT _vc_native_linked SYMBOLIC)
+endif()
 foreach(header IN LISTS _vc_native_headers)
-    configure_file("src/cpp/${header}" "include/vc_reader/native/${header}" COPYONLY)
+    if(NOT IS_SYMLINK "${_vc_native_link}")  # no symbolic links (e.g. Windows without developer mode)
+        configure_file("src/cpp/${header}" "include/vc_reader/native/${header}" COPYONLY)
+    endif()
     get_filename_component(directory "${header}" DIRECTORY)
     install(FILES "src/cpp/${header}" DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/vc_reader/native/${directory}")
 endforeach()
@@ -21,10 +32,26 @@ target_include_directories(vc_reader_headers INTERFACE
     $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
 target_link_libraries(vc_reader_headers INTERFACE Threads::Threads)
 
+add_library(vc_reader_thinning STATIC
+    src/cpp/thinning/trace.cpp src/cpp/thinning/history.cpp src/cpp/thinning/distance.cpp src/cpp/thinning/skeleton.cpp
+    src/cpp/distance/manhattan.cpp src/cpp/components/label.cpp)
+add_library(vc_reader::thinning ALIAS vc_reader_thinning)
+set_target_properties(vc_reader_thinning PROPERTIES EXPORT_NAME thinning POSITION_INDEPENDENT_CODE ON)
+target_link_libraries(vc_reader_thinning PUBLIC vc_reader::headers)
+# Keep the history score's float32 operation order fixed across toolchains.
+target_compile_options(vc_reader_thinning PRIVATE $<$<COMPILE_LANG_AND_ID:CXX,GNU,Clang,AppleClang>:-ffp-contract=off>)
+if(VC_READER_ENABLE_CUDA)
+    target_sources(vc_reader_thinning PRIVATE src/cpp/thinning/kernels.cu src/cpp/thinning/trace_cuda.cu src/cpp/distance/kernels.cu src/cpp/components/kernels.cu)
+    set_source_files_properties(src/cpp/thinning/trace_cuda.cu PROPERTIES COMPILE_OPTIONS "--fmad=false;--expt-relaxed-constexpr")
+    set_target_properties(vc_reader_thinning PROPERTIES CUDA_STANDARD 20 CUDA_STANDARD_REQUIRED ON)
+    target_compile_definitions(vc_reader_thinning PUBLIC VC_READER_CUDA=1)
+    target_link_libraries(vc_reader_thinning PUBLIC CUDA::cudart)
+endif()
+
 add_library(vc_reader_transforms INTERFACE)
 add_library(vc_reader::transforms ALIAS vc_reader_transforms)
 set_target_properties(vc_reader_transforms PROPERTIES EXPORT_NAME transforms)
-target_link_libraries(vc_reader_transforms INTERFACE vc_reader::headers)
+target_link_libraries(vc_reader_transforms INTERFACE vc_reader::headers vc_reader::thinning)
 
 if(VC_READER_ENABLE_CUDA)
     add_library(vc_reader_transform_cuda STATIC
@@ -93,6 +120,7 @@ if(VC_READER_ENABLE_CUDA)
         src/cpp/transforms/cuda/low_resolution.cu
         src/cpp/transforms/cuda/median_filter.cu
         src/cpp/transforms/cuda/medial_surface.cu
+        src/cpp/transforms/cuda/label_analysis.cu
         src/cpp/transforms/cuda/normalization.cu
         src/cpp/transforms/cuda/oriented_blur.cu
         src/cpp/transforms/cuda/random_binary_operator.cu
@@ -104,6 +132,8 @@ if(VC_READER_ENABLE_CUDA)
         src/cpp/transforms/cuda/smear.cu
         src/cpp/transforms/cuda/distance_transform.cu
         src/cpp/transforms/cuda/structure_tensor.cu
+        src/cpp/transforms/cuda/ridges.cu
+        src/cpp/transforms/cuda/coherence_enhancing_diffusion.cu
         src/cpp/transforms/cuda/statistics.cu
         src/cpp/transforms/cuda/thick_slice.cu
         src/cpp/transforms/cuda/transpose.cu
@@ -113,6 +143,6 @@ if(VC_READER_ENABLE_CUDA)
         POSITION_INDEPENDENT_CODE ON CUDA_STANDARD 20 CUDA_STANDARD_REQUIRED ON)
     target_compile_definitions(vc_reader_transform_cuda PUBLIC VC_READER_CUDA=1)
     target_compile_options(vc_reader_transform_cuda PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>)
-    target_link_libraries(vc_reader_transform_cuda PUBLIC vc_reader::headers CUDA::cudart CUDA::cufft)
+    target_link_libraries(vc_reader_transform_cuda PUBLIC vc_reader::thinning vc_reader::headers CUDA::cudart CUDA::cufft)
     target_link_libraries(vc_reader_transforms INTERFACE vc_reader::transforms_cuda)
 endif()

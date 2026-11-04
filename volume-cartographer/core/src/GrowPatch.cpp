@@ -1,30 +1,27 @@
+#include <utility>
 #include "vc/tracer/SheetGrowth.hpp"
 #include <opencv2/core.hpp>
 #include <opencv2/imgproc.hpp>
 
 
+#include "vc/core/util/CudaSampling.hpp"
 #include "vc/core/util/Geometry.hpp"
 #include "vc/core/util/OpenCvCompat.hpp"
 #include "vc/core/util/GrowthMask.hpp"
 #include "vc/core/util/Surface.hpp"
 #include "vc/core/util/QuadSurface.hpp"
-#include "vc/core/util/Tiff.hpp"
 #include "vc/tracer/SurfaceModeling.hpp"
 #include "vc/core/util/SurfaceArea.hpp"
 #include "vc/core/util/OMPThreadPointCollection.hpp"
 #include "vc/core/util/LifeTime.hpp"
-#include "vc/core/types/ChunkedTensor.hpp"
-#include "vc/core/types/Volume.hpp"
-#include "utils/Json.hpp"
+#include <nlohmann/json.hpp>
 
 #include "vc/core/util/NormalGridVolume.hpp"
 #include "vc/core/util/GridStore.hpp"
 #include "vc/tracer/CostFunctions.hpp"
 #include "vc/core/util/HashFunctions.hpp"
 
-#include "vc/core/types/VcDataset.hpp"
 
-#include "edt.hpp"
 
 #include <iostream>
 #include <fstream>
@@ -48,26 +45,12 @@
 #include "vc/tracer/SeedAnchor.hpp"
 #include "vc/core/PointCollections.hpp"
 #include "vc/tracer/NeuralTracerConnection.h"
-
-DirectionField::DirectionField(std::string dir,
-                               std::unique_ptr<Chunked3dVec3fFromUint8> field,
-                               std::unique_ptr<Chunked3dFloatFromUint8> weight_dataset,
-                               float weight)
-    : direction(std::move(dir))
-    , field_ptr(std::move(field))
-    , weight_ptr(std::move(weight_dataset))
-    , weight(weight)
-{
-}
-DirectionField::~DirectionField() = default;
-DirectionField::DirectionField(DirectionField&&) noexcept = default;
-DirectionField& DirectionField::operator=(DirectionField&&) noexcept = default;
+#include "vc_reader/array.hpp"
 
 #define LOSS_STRAIGHT 1
 #define LOSS_DIST 2
 #define LOSS_NORMALSNAP 4
 #define LOSS_SDIR 8
-#define LOSS_SPACELINE 16
 
 namespace { // Anonymous namespace for local helpers
 
@@ -129,7 +112,7 @@ static bool point_in_bounds(const cv::Mat_<T>& mat, const cv::Vec2i& p)
     return p[0] >= 0 && p[0] < mat.rows && p[1] >= 0 && p[1] < mat.cols;
 }
 
-static cv::Size growth_source_size_from_meta(const utils::Json& meta)
+static cv::Size growth_source_size_from_meta(const nlohmann::json& meta)
 {
     if (!meta.contains("_growth_source_width") ||
         !meta.contains("_growth_source_height") ||
@@ -138,8 +121,8 @@ static cv::Size growth_source_size_from_meta(const utils::Json& meta)
         return {};
     }
 
-    const int width = meta["_growth_source_width"].get_int();
-    const int height = meta["_growth_source_height"].get_int();
+    const int width = meta["_growth_source_width"].get<int>();
+    const int height = meta["_growth_source_height"].get<int>();
     if (width <= 0 || height <= 0) {
         return {};
     }
@@ -173,8 +156,8 @@ static cv::Size exact_growth_output_size(const QuadSurface* coarse,
         coarse->meta["grid_offset"].size() >= 2 &&
         coarse->meta["grid_offset"][0].is_number() &&
         coarse->meta["grid_offset"][1].is_number()) {
-        source_offset.x = coarse->meta["grid_offset"][0].get_int();
-        source_offset.y = coarse->meta["grid_offset"][1].get_int();
+        source_offset.x = coarse->meta["grid_offset"][0].get<int>();
+        source_offset.y = coarse->meta["grid_offset"][1].get<int>();
     }
 
     const cv::Size coarse_source_size = vc::core::util::scaledGridSize(source_size, factor);
@@ -199,41 +182,6 @@ static cv::Mat_<cv::Vec3f> downsample_surface_points_nearest(const cv::Mat_<cv::
         for (int c = 0; c < result.cols; ++c) {
             const int src_c = std::min(points.cols - 1, c * factor);
             result(r, c) = points(src_r, src_c);
-        }
-    }
-    return result;
-}
-
-static cv::Mat resize_surface_points_weighted(const cv::Mat_<cv::Vec3f>& points,
-                                              const cv::Size& dst_size,
-                                              int interpolation)
-{
-    cv::Mat value(points.size(), CV_32FC3, cv::Scalar(0, 0, 0));
-    cv::Mat weight(points.size(), CV_32FC1, cv::Scalar(0));
-    for (int r = 0; r < points.rows; ++r) {
-        for (int c = 0; c < points.cols; ++c) {
-            const cv::Vec3f& p = points(r, c);
-            if (p[0] == -1.0f) {
-                continue;
-            }
-            value.at<cv::Vec3f>(r, c) = p;
-            weight.at<float>(r, c) = 1.0f;
-        }
-    }
-
-    cv::Mat value_resized;
-    cv::Mat weight_resized;
-    cv::resize(value, value_resized, dst_size, 0.0, 0.0, interpolation);
-    cv::resize(weight, weight_resized, dst_size, 0.0, 0.0, interpolation);
-
-    cv::Mat_<cv::Vec3f> result(dst_size, cv::Vec3f(-1.0f, -1.0f, -1.0f));
-    for (int r = 0; r < result.rows; ++r) {
-        for (int c = 0; c < result.cols; ++c) {
-            const float w = weight_resized.at<float>(r, c);
-            if (w <= 1e-5f) {
-                continue;
-            }
-            result(r, c) = value_resized.at<cv::Vec3f>(r, c) * (1.0f / w);
         }
     }
     return result;
@@ -305,8 +253,19 @@ static QuadSurface* make_output_scale_surface(QuadSurface* coarse,
     if (exact_output_size.width > 0 && exact_output_size.height > 0) {
         output_size = exact_output_size;
     }
-    cv::Mat_<cv::Vec3f> output_points =
-        resize_surface_points_weighted(coarse_points, output_size, cv::INTER_LINEAR);
+    cv::Mat_<cv::Vec3f> output_points(output_size, cv::Vec3f(-1, -1, -1));
+    const auto surface = coarse->pointSurface();
+    std::vector<float> xy(std::size_t(output_size.width) * 2);
+    cv::Mat_<cv::Vec3f> row(1, output_size.width);
+    for (int r = 0; r < output_size.height; ++r) {
+        for (int c = 0; c < output_size.width; ++c) {
+            xy[2*c] = std::clamp(float((c+.5)*coarse_points.cols/output_size.width-.5), 0.f, float(coarse_points.cols-1));
+            xy[2*c+1] = std::clamp(float((r+.5)*coarse_points.rows/output_size.height-.5), 0.f, float(coarse_points.rows-1));
+        }
+        surface->pointsAt(xy.data(), output_size.width, row.ptr<float>(), nullptr);
+        for (int c = 0; c < output_size.width; ++c)
+            if (std::isfinite(row(0,c)[0])) output_points(r,c) = row(0,c);
+    }
 
     auto* output = new QuadSurface(output_points, output_scale);
     output->id = coarse->id;
@@ -317,8 +276,8 @@ static QuadSurface* make_output_scale_surface(QuadSurface* coarse,
 
     if (output->meta.contains("grid_offset") && output->meta["grid_offset"].is_array() &&
         output->meta["grid_offset"].size() >= 2) {
-        output->meta["grid_offset"][0] = output->meta["grid_offset"][0].get_int() * factor;
-        output->meta["grid_offset"][1] = output->meta["grid_offset"][1].get_int() * factor;
+        output->meta["grid_offset"][0] = output->meta["grid_offset"][0].get<int>() * factor;
+        output->meta["grid_offset"][1] = output->meta["grid_offset"][1].get<int>() * factor;
     }
 
     for (const std::string& name : coarse->channelNames()) {
@@ -332,72 +291,8 @@ static QuadSurface* make_output_scale_surface(QuadSurface* coarse,
     return output;
 }
 
-struct lineLossDistance
-{
-    enum {BORDER = 16};
-    enum {CHUNK_SIZE = 64};
-    enum {FILL_V = 0};
-
-    explicit lineLossDistance(float threshold_in = 170.0f, bool invert_in = false)
-        : threshold(threshold_in), invert(invert_in)
-    {
-        UNIQUE_ID_STRING = "spaceline_" + std::to_string(BORDER) + "_" + std::to_string(CHUNK_SIZE) + "_" +
-                           std::to_string(static_cast<int>(std::round(threshold))) + "_" +
-                           std::to_string(static_cast<int>(invert));
-    }
-
-    template <typename T, typename E>
-    void compute(const T &large, T &small, const cv::Vec3i &offset_large)
-    {
-        (void)offset_large;
-        const int s = CHUNK_SIZE + 2 * BORDER;
-        const size_t voxels = static_cast<size_t>(s) * s * s;
-
-        std::vector<uint8_t> binary(voxels, 1);
-        const uint8_t thr = static_cast<uint8_t>(std::clamp(threshold, 0.0f, 255.0f));
-
-#pragma omp parallel for
-        for (int z = 0; z < s; ++z) {
-            for (int y = 0; y < s; ++y) {
-                for (int x = 0; x < s; ++x) {
-                    const uint8_t v = large(z, y, x);
-                    bool fg = v >= thr;
-                    if (invert) {
-                        fg = !fg;
-                    }
-                    const size_t idx = static_cast<size_t>(z) + static_cast<size_t>(y) * s + static_cast<size_t>(x) * s * s;
-                    binary[idx] = fg ? 0 : 1; // distance to foreground (zeros)
-                }
-            }
-        }
-
-        float* edt = edt::binary_edt<uint8_t>(
-            binary.data(), s, s, s, 1.0f, 1.0f, 1.0f, false, 1);
-
-        const int low = BORDER;
-
-        for (int z = 0; z < CHUNK_SIZE; ++z) {
-            for (int y = 0; y < CHUNK_SIZE; ++y) {
-                for (int x = 0; x < CHUNK_SIZE; ++x) {
-                    const size_t idx = static_cast<size_t>(z + low) + static_cast<size_t>(y + low) * s +
-                                       static_cast<size_t>(x + low) * s * s;
-                    float d = edt[idx];
-                    if (!std::isfinite(d)) {
-                        d = 255.0f;
-                    }
-                    d = std::clamp(d, 0.0f, 255.0f);
-                    small(z, y, x) = static_cast<uint8_t>(std::lround(d));
-                }
-            }
-        }
-
-        delete[] edt;
-    }
-
-    float threshold = 170.0f;
-    bool invert = false;
-    std::string UNIQUE_ID_STRING;
-};
+// The tracing volume's elements as numbers; the tracer reads uint8 CT.
+const vcr::ElementType kVolumeType{'u', 1, false};
 
 class PointCorrection {
 public:
@@ -533,16 +428,12 @@ private:
 };
 
 struct TraceData {
-    TraceData(const std::vector<DirectionField> &direction_fields) : direction_fields(direction_fields) {};
     PointCorrection point_correction;
     vc::tracer::SeedAnchor seed_anchor;
     const vc::core::util::NormalGridVolume *ngv = nullptr;
-    const std::vector<DirectionField> &direction_fields;
     cv::Mat_<uchar> allowed_growth_mask;
 
-    Chunked3d<uint8_t, passTroughComputor>* raw_volume = nullptr;
-    std::unique_ptr<lineLossDistance> space_line_compute;
-    std::unique_ptr<Chunked3d<uint8_t, lineLossDistance>> space_line_volume;
+    vcr::Array* raw_volume = nullptr;
 };
 
 class ReferenceClearanceCost {
@@ -580,7 +471,7 @@ private:
 
 class ReferenceRayOcclusionCost {
 public:
-    ReferenceRayOcclusionCost(Chunked3d<uint8_t, passTroughComputor>* volume,
+    ReferenceRayOcclusionCost(vcr::Array* volume,
                               const cv::Vec3d& target,
                               double threshold,
                               double weight,
@@ -673,21 +564,18 @@ public:
 
 private:
     double sample(const cv::Vec3d& xyz) const {
-        if (!interp_) {
-            interp_ = std::make_unique<CachedChunked3dInterpolator<uint8_t, passTroughComputor>>(*volume_);
-        }
-        double value = 0.0;
-        interp_->Evaluate(xyz[2], xyz[1], xyz[0], &value);
+        const double zyx[3] = {xyz[2], xyz[1], xyz[0]};
+        float value = 0.0f;
+        vc::cuda::sampleLinear(*volume_, kVolumeType, vc::cuda::toolReaderOf(*volume_), zyx, 1, &value);
         return value;
     }
 
-    Chunked3d<uint8_t, passTroughComputor>* volume_;
+    vcr::Array* volume_;
     cv::Vec3d target_;
     double threshold_;
     double weight_;
     double step_;
     double max_distance_;
-    mutable std::unique_ptr<CachedChunked3dInterpolator<uint8_t, passTroughComputor>> interp_;
 };
 
 struct TraceParameters {
@@ -699,13 +587,11 @@ struct TraceParameters {
 enum LossType {
     DIST,
     STRAIGHT,
-    DIRECTION,
     SNAP,
     NORMAL,
     SDIR,
     CORRECTION,
     REFERENCE_RAY,
-    SPACELINE,
     COUNT
 };
 
@@ -718,11 +604,9 @@ struct LossSettings {
         w[LossType::NORMAL] = 10.0f;
         w[LossType::STRAIGHT] = 0.2;
         w[LossType::DIST] = 1.0f;
-        w[LossType::DIRECTION] = 1.0f;
         w[LossType::SDIR] = 1.0f;
         w[LossType::CORRECTION] = 1.0f;
         w[LossType::REFERENCE_RAY] = 0.0f;
-        w[LossType::SPACELINE] = 0.0f;
     }
 
     struct ReferenceRaycastSettings {
@@ -738,13 +622,13 @@ struct LossSettings {
         return reference_raycast.surface && w[LossType::REFERENCE_RAY] > 0.0f;
     }
 
-    void applyJsonWeights(const utils::Json& params) {
+    void applyJsonWeights(const nlohmann::json& params) {
         const auto set_weight = [&](const char* key, LossType type) {
             if (!params.contains(key) || params[key].is_null()) {
                 return;
             }
             if (params[key].is_number()) {
-                w[type] = static_cast<float>(params[key].get_double());
+                w[type] = static_cast<float>(params[key].get<double>());
             } else {
                 std::cerr << key << " must be numeric" << std::endl;
             }
@@ -754,11 +638,9 @@ struct LossSettings {
         set_weight("normal_weight", LossType::NORMAL);
         set_weight("straight_weight", LossType::STRAIGHT);
         set_weight("dist_weight", LossType::DIST);
-        set_weight("direction_weight", LossType::DIRECTION);
         set_weight("sdir_weight", LossType::SDIR);
         set_weight("correction_weight", LossType::CORRECTION);
         set_weight("reference_ray_weight", LossType::REFERENCE_RAY);
-        set_weight("space_line_weight", LossType::SPACELINE);
     }
 
     float operator()(LossType type, const cv::Vec2i& p) const {
@@ -779,12 +661,9 @@ struct LossSettings {
     int x_min = -1;
     int x_max = std::numeric_limits<int>::max();
 
-    int space_line_steps = 8;
-    float space_line_threshold = 170.0f;
-    bool space_line_invert = false;
 };
 
-static std::vector<cv::Vec2i> parse_growth_directions(const utils::Json& params)
+static std::vector<cv::Vec2i> parse_growth_directions(const nlohmann::json& params)
 {
     static const std::vector<cv::Vec2i> kDefaultDirections = {
         {1, 0},    // down / +row
@@ -801,7 +680,7 @@ static std::vector<cv::Vec2i> parse_growth_directions(const utils::Json& params)
         return kDefaultDirections;
     }
 
-    const utils::Json& directions = params["growth_directions"];
+    const nlohmann::json& directions = params["growth_directions"];
     if (!directions.is_array()) {
         std::cerr << "growth_directions parameter must be an array of strings" << std::endl;
         return kDefaultDirections;
@@ -826,7 +705,7 @@ static std::vector<cv::Vec2i> parse_growth_directions(const utils::Json& params)
             continue;
         }
 
-        const std::string value = entry.get_string();
+        const std::string value = entry.get<std::string>();
         std::string normalized;
         normalized.reserve(value.size());
         for (char ch : value) {
@@ -1014,21 +893,10 @@ static std::vector<cv::Vec2i> call_neural_tracer_for_points(
     return successful_points;
 }
 
-// global CUDA to allow use to set to false globally
-// in the case they have cuda avail, but do not want to use it
-static bool g_use_cuda = true;
-
-// Expose a simple toggle for CUDA usage so tools can honor JSON settings
-void set_space_tracing_use_cuda(bool enable) {
-    g_use_cuda = enable;
-}
-
 static int gen_straight_loss(ceres::Problem &problem, const cv::Vec2i &p, const cv::Vec2i &o1, const cv::Vec2i &o2, const cv::Vec2i &o3, TraceParameters &params, const LossSettings &settings);
 static int gen_normal_loss(ceres::Problem &problem, const cv::Vec2i &p, TraceParameters &params, const TraceData &trace_data, const LossSettings &settings);
 static int conditional_normal_loss(int bit, const cv::Vec2i &p, cv::Mat_<uint16_t> &loss_status, ceres::Problem &problem, TraceParameters &params, const TraceData &trace_data, const LossSettings &settings);
 static int gen_dist_loss(ceres::Problem &problem, const cv::Vec2i &p, const cv::Vec2i &off, TraceParameters &params, const LossSettings &settings);
-static int gen_space_line_loss(ceres::Problem &problem, const cv::Vec2i &p, const cv::Vec2i &off, TraceParameters &params, const TraceData &trace_data, const LossSettings &settings);
-static int conditional_space_line_loss(int bit, const cv::Vec2i &p, const cv::Vec2i &off, cv::Mat_<uint16_t> &loss_status, ceres::Problem &problem, TraceParameters &params, const TraceData &trace_data, const LossSettings &settings);
 static int gen_sdirichlet_loss(ceres::Problem &problem, const cv::Vec2i &p,
                                TraceParameters &params, const LossSettings &settings,
                                double sdir_eps_abs, double sdir_eps_rel);
@@ -1101,35 +969,6 @@ static int gen_dist_loss(ceres::Problem &problem, const cv::Vec2i &p, const cv::
         return 0;
 
     problem.AddResidualBlock(DistLoss::Create(params.unit*cv::norm(off),settings(LossType::DIST, p)), nullptr, &params.dpoints(p)[0], &params.dpoints(p+off)[0]);
-
-    return 1;
-}
-
-static int gen_space_line_loss(ceres::Problem &problem, const cv::Vec2i &p, const cv::Vec2i &off,
-    TraceParameters &params, const TraceData &trace_data, const LossSettings &settings)
-{
-    if (!trace_data.space_line_volume)
-        return 0;
-    if (!coord_valid(params.state(p)))
-        return 0;
-    if (!coord_valid(params.state(p+off)))
-        return 0;
-    if (!dpoint_valid(params.dpoints(p)) || !dpoint_valid(params.dpoints(p+off)))
-        return 0;
-
-    const float w = settings(LossType::SPACELINE, p);
-    if (w <= 0.0f)
-        return 0;
-    if (settings.space_line_steps < 2)
-        return 0;
-
-    problem.AddResidualBlock(
-        SpaceLineLossAcc<uint8_t, lineLossDistance>::Create(*trace_data.space_line_volume,
-                                                            settings.space_line_steps,
-                                                            w),
-        nullptr,
-        &params.dpoints(p)[0],
-        &params.dpoints(p+off)[0]);
 
     return 1;
 }
@@ -1323,22 +1162,6 @@ static int conditional_dist_loss(int bit, const cv::Vec2i &p, const cv::Vec2i &o
     return set;
 };
 
-static int conditional_space_line_loss(int bit,
-    const cv::Vec2i &p,
-    const cv::Vec2i &off,
-    cv::Mat_<uint16_t> &loss_status,
-    ceres::Problem &problem,
-    TraceParameters &params,
-    const TraceData &trace_data,
-    const LossSettings &settings)
-{
-    int set = 0;
-    if (!loss_mask(bit, p, off, loss_status)) {
-        set = set_loss_mask(bit, p, off, loss_status, gen_space_line_loss(problem, p, off, params, trace_data, settings));
-    }
-    return set;
-}
-
 static int conditional_straight_loss(int bit, const cv::Vec2i &p, const cv::Vec2i &o1, const cv::Vec2i &o2, const cv::Vec2i &o3,
     cv::Mat_<uint16_t> &loss_status, ceres::Problem &problem, TraceParameters &params, const LossSettings &settings)
 {
@@ -1440,59 +1263,8 @@ static int conditional_normal_loss(int bit, const cv::Vec2i &p, cv::Mat_<uint16_
 // }
 
 
-// struct DSReader
-// {
-//     z5::Dataset *ds;
-//     float scale;
-//     ChunkCache *cache;
-// };
 
 
-
-int gen_direction_loss(ceres::Problem &problem,
-    const cv::Vec2i &p,
-    const int off_dist,
-    cv::Mat_<uint8_t> &state,
-    cv::Mat_<cv::Vec3d> &loc,
-    std::vector<DirectionField> const &direction_fields,
-    const LossSettings& settings)
-{
-    // Add losses saying that the local basis vectors of the patch at loc(p) should match those of the given fields
-
-    if (!loc_valid(state(p)))
-        return 0;
-
-    cv::Vec2i const p_off_horz{p[0], p[1] + off_dist};
-    cv::Vec2i const p_off_vert{p[0] + off_dist, p[1]};
-
-    const float baseWeight = settings(LossType::DIRECTION, p);
-
-    int count = 0;
-    for (const auto &field: direction_fields) {
-        const float totalWeight = baseWeight * field.weight;
-        if (totalWeight <= 0.0f) {
-            continue;
-        }
-        if (field.direction == "horizontal") {
-            if (!loc_valid(state(p_off_horz)))
-                continue;
-            problem.AddResidualBlock(FiberDirectionLoss::Create(*field.field_ptr, field.weight_ptr.get(), totalWeight), nullptr, &loc(p)[0], &loc(p_off_horz)[0]);
-        } else if (field.direction == "vertical") {
-            if (!loc_valid(state(p_off_vert)))
-                continue;
-            problem.AddResidualBlock(FiberDirectionLoss::Create(*field.field_ptr, field.weight_ptr.get(), totalWeight), nullptr, &loc(p)[0], &loc(p_off_vert)[0]);
-        } else if (field.direction == "normal") {
-            if (!loc_valid(state(p_off_horz)) || !loc_valid(state(p_off_vert)))
-                continue;
-            problem.AddResidualBlock(NormalDirectionLoss::Create(*field.field_ptr, field.weight_ptr.get(), totalWeight), nullptr, &loc(p)[0], &loc(p_off_horz)[0], &loc(p_off_vert)[0]);
-        } else {
-            assert(false);
-        }
-        ++count;
-    }
-
-    return count;
-}
 
 //create all valid losses for this point
 // Forward declarations
@@ -1545,14 +1317,6 @@ static int add_losses(ceres::Problem &problem, const cv::Vec2i &p, TraceParamete
         count += gen_dist_loss(problem, p, {-1,-1}, params, settings);
     }
 
-    if (flags & LOSS_SPACELINE) {
-        // direct neighbors only (4-neighborhood)
-        count += gen_space_line_loss(problem, p, {0,-1}, params, trace_data, settings);
-        count += gen_space_line_loss(problem, p, {0,1}, params, trace_data, settings);
-        count += gen_space_line_loss(problem, p, {-1,0}, params, trace_data, settings);
-        count += gen_space_line_loss(problem, p, {1,0}, params, trace_data, settings);
-    }
-
     if (flags & LOSS_NORMALSNAP) {
         //gridstore normals
         count += gen_normal_loss(problem, p                   , params, trace_data, settings);
@@ -1572,26 +1336,6 @@ static int add_losses(ceres::Problem &problem, const cv::Vec2i &p, TraceParamete
 
     return count;
 }
-
-static int conditional_direction_loss(int bit,
-    const cv::Vec2i &p,
-    const int u_off,
-    cv::Mat_<uint16_t> &loss_status,
-    ceres::Problem &problem,
-    cv::Mat_<uint8_t> &state,
-    cv::Mat_<cv::Vec3d> &loc,
-    const LossSettings& settings,
-    std::vector<DirectionField> const &direction_fields)
-{
-    if (!direction_fields.size())
-        return 0;
-
-    int set = 0;
-    cv::Vec2i const off{0, u_off};
-    if (!loss_mask(bit, p, off, loss_status))
-        set = set_loss_mask(bit, p, off, loss_status, gen_direction_loss(problem, p, u_off, state, loc, direction_fields, settings));
-    return set;
-};
 
 //create only missing losses so we can optimize the whole problem
 static int gen_corr_loss(ceres::Problem &problem, const cv::Vec2i &p, cv::Mat_<uint8_t> &state, cv::Mat_<cv::Vec3d> &dpoints, TraceData& trace_data, const LossSettings &settings)
@@ -1788,20 +1532,10 @@ static int add_missing_losses(ceres::Problem &problem, cv::Mat_<uint16_t> &loss_
     count += conditional_dist_loss(5, p, {1,1}, loss_status, problem, params, settings);
     count += conditional_dist_loss(5, p, {-1,-1}, loss_status, problem, params, settings);
 
-    // space-line loss (4-neighborhood)
-    count += conditional_space_line_loss(7, p, {0,-1}, loss_status, problem, params, trace_data, settings);
-    count += conditional_space_line_loss(7, p, {0,1}, loss_status, problem, params, trace_data, settings);
-    count += conditional_space_line_loss(8, p, {-1,0}, loss_status, problem, params, trace_data, settings);
-    count += conditional_space_line_loss(8, p, {1,0}, loss_status, problem, params, trace_data, settings);
-
     //symmetric dirichlet
     count += conditional_sdirichlet_loss(6, p,                    loss_status, problem, params, settings, /*eps_abs=*/1e-8, /*eps_rel=*/1e-2);
     count += conditional_sdirichlet_loss(6, p + cv::Vec2i(-1, 0), loss_status, problem, params, settings, 1e-8, 1e-2);
     count += conditional_sdirichlet_loss(6, p + cv::Vec2i( 0,-1), loss_status, problem, params, settings, 1e-8, 1e-2);
-
-    //normal field
-    count += conditional_direction_loss(9, p, 1, loss_status, problem, params.state, params.dpoints, settings, trace_data.direction_fields);
-    count += conditional_direction_loss(9, p, -1, loss_status, problem, params.state, params.dpoints, settings, trace_data.direction_fields);
 
     //gridstore normals
     count += conditional_normal_loss(10, p                   , loss_status, problem, params, trace_data, settings);
@@ -1963,7 +1697,6 @@ static void local_optimization(const cv::Rect &roi, const cv::Mat_<uchar> &mask,
 
     // std::cout << "inpaint solve " << summary.BriefReport() << std::endl;
 
-    // cv::imwrite("opt_mask.tif", mask);
 }
 
 struct LocalOptimizationConfig {
@@ -2073,27 +1806,6 @@ static float local_optimization(int radius, const cv::Vec2i &p, TraceParameters 
     if (parallel)
         options.num_threads = omp_get_max_threads();
 
-//    if (problem.NumParameterBlocks() > 1) {
-//        options.use_inner_iterations = true;
-//    }
-// // NOTE currently CPU seems always faster (40x , AMD 5800H vs RTX 3080 mobile, even a 5090 would probably be slower?)
-// #ifdef VC_USE_CUDA_SPARSE
-//     // Check if Ceres was actually built with CUDA sparse support
-//     if (g_use_cuda) {
-//         if (ceres::IsSparseLinearAlgebraLibraryTypeAvailable(ceres::CUDA_SPARSE)) {
-//             options.linear_solver_type = ceres::SPARSE_SCHUR;
-//             // options.linear_solver_type = ceres::SPARSE_NORMAL_CHOLESKY;
-//             options.sparse_linear_algebra_library_type = ceres::CUDA_SPARSE;
-//
-//             // if (options.linear_solver_type == ceres::SPARSE_SCHUR) {
-//                 options.use_mixed_precision_solves = true;
-//             // }
-//         } else {
-//             std::cerr << "Warning: use_cuda=true but Ceres was not built with CUDA sparse support. Falling back to CPU sparse." << std::endl;
-//         }
-//     }
-// #endif
-
     ceres::Solver::Summary summary;
 
     trace_data.seed_anchor.apply(problem);
@@ -2110,116 +1822,18 @@ static float local_optimization(int radius, const cv::Vec2i &p, TraceParameters 
 
     return sqrt(summary.final_cost/summary.num_residual_blocks);
 }
-template <typename E>
-static E _max_d_ign(const E &a, const E &b)
+QuadSurface *tracer(vcr::Array& volume, float scale, cv::Vec3f origin, const nlohmann::json &params, float voxelsize, QuadSurface* resume_surf, const std::filesystem::path& tgt_path, const nlohmann::json& meta_params, const PointCollections &corrections, const cv::Mat* allowed_growth_mask)
 {
-    if (a == E(-1))
-        return b;
-    if (b == E(-1))
-        return a;
-    return std::max(a,b);
-}
-
-template <typename T, typename E>
-static void _dist_iteration(T &from, T &to, int s)
-{
-    E magic = -1;
-#pragma omp parallel for
-    for(int k=0;k<s;k++)
-        for(int j=0;j<s;j++)
-            for(int i=0;i<s;i++) {
-                E dist = from(k,j,i);
-                if (dist == magic) {
-                    if (k) dist = _max_d_ign(dist, from(k-1,j,i));
-                    if (k < s-1) dist = _max_d_ign(dist, from(k+1,j,i));
-                    if (j) dist = _max_d_ign(dist, from(k,j-1,i));
-                    if (j < s-1) dist = _max_d_ign(dist, from(k,j+1,i));
-                    if (i) dist = _max_d_ign(dist, from(k,j,i-1));
-                    if (i < s-1) dist = _max_d_ign(dist, from(k,j,i+1));
-                    if (dist != magic)
-                        to(k,j,i) = dist+1;
-                    else
-                        to(k,j,i) = dist;
-                }
-                else
-                    to(k,j,i) = dist;
-
-            }
-}
-
-template <typename T, typename E>
-static T distance_transform(const T &chunk, int steps, int size)
-{
-    T c1(chunk.shape());
-    T c2(chunk.shape());
-
-    c1 = chunk;
-
-    E magic = -1;
-
-    for(int n=0;n<steps/2;n++) {
-        _dist_iteration<T,E>(c1,c2,size);
-        _dist_iteration<T,E>(c2,c1,size);
-    }
-
-#pragma omp parallel for
-    for(int z=0;z<size;z++)
-        for(int y=0;y<size;y++)
-            for(int x=0;x<size;x++)
-                if (c1(z,y,x) == magic)
-                    c1(z,y,x) = steps;
-
-    return c1;
-}
-
-struct thresholdedDistance
-{
-    enum {BORDER = 16};
-    enum {CHUNK_SIZE = 64};
-    enum {FILL_V = 0};
-    enum {TH = 170};
-    const std::string UNIQUE_ID_STRING = "dqk247q6vz_"+std::to_string(BORDER)+"_"+std::to_string(CHUNK_SIZE)+"_"+std::to_string(FILL_V)+"_"+std::to_string(TH);
-    template <typename T, typename E> void compute(const T &large, T &small, const cv::Vec3i &offset_large)
-    {
-        T outer(large.shape());
-
-        int s = CHUNK_SIZE+2*BORDER;
-        E magic = -1;
-
-        int good_count = 0;
-
-#pragma omp parallel for
-        for(int z=0;z<s;z++)
-            for(int y=0;y<s;y++)
-                for(int x=0;x<s;x++)
-                    if (large(z,y,x) < TH)
-                        outer(z,y,x) = magic;
-                    else {
-                        good_count++;
-                        outer(z,y,x) = 0;
-                    }
-
-        outer = distance_transform<T,E>(outer, 15, s);
-
-        int low = int(BORDER);
-        int high = int(BORDER)+int(CHUNK_SIZE);
-
-        small = outer.subarray(low, high, low, high, low, high);
-    }
-
-};
-
-QuadSurface *tracer(Volume& volume, float scale, int level, cv::Vec3f origin, const utils::Json &params, const std::string &cache_root, float voxelsize, std::vector<DirectionField> const &direction_fields, QuadSurface* resume_surf, const std::filesystem::path& tgt_path, const utils::Json& meta_params, const PointCollections &corrections, const cv::Mat* allowed_growth_mask)
-{
+    if (volume.itemsize() != 1)
+        throw std::runtime_error("the tracer reads uint8 volumes");
     const auto growthMethod = params.value("growth_method", std::string("default"));
     if (growthMethod != "default") {
         if (growthMethod != "projection" && growthMethod != "streamline")
             throw std::invalid_argument("growth_method must be default, projection or streamline");
-        if (resume_surf || level != 0 || scale != 1.0f || allowed_growth_mask ||
+        if (resume_surf || scale != 1.0f || allowed_growth_mask ||
             params.value("growth_scale", 0) != 0 || params.contains("neural_socket") ||
             params.contains("seed_anchor_xyz") || params.value("cell_reopt_mode", false) ||
-            params.value("inpaint", false) || !direction_fields.empty() ||
-            !corrections.getAllCollections().empty())
+            params.value("inpaint", false) || !corrections.getAllCollections().empty())
             throw std::invalid_argument("Projection and streamline GrowPatch modes support new level-0 CT seeds only");
         return growSheetPatch(volume, origin, params, voxelsize, meta_params);
     }
@@ -2228,13 +1842,11 @@ QuadSurface *tracer(Volume& volume, float scale, int level, cv::Vec3f origin, co
     const bool anchor_requested = params.contains("seed_anchor_xyz");
     if (resume_surf && resume_surf->meta.contains("seed_anchor") && !anchor_requested)
         throw std::runtime_error("anchored resume requires seed_anchor_xyz");
-    if (anchor_requested && (level != 0 || scale != 1.0f ||
+    if (anchor_requested && (scale != 1.0f ||
             params.value("growth_scale", 0) != 0 || params.contains("neural_socket") ||
             params.value("cell_reopt_mode", false) || params.value("rewind_gen", -1) != -1 ||
             params.value("inpaint", false) || !corrections.getAllCollections().empty()))
         throw std::runtime_error("seed anchor supports level-0 explicit seed/resume without inpaint or corrections only");
-    const std::array<int, 3> volume_shape_zyx = volume.shape(level);
-    auto* cache = volume.chunkedCache();
 
     const int growth_scale_level = std::clamp(params.value("growth_scale", 0), 0, 5);
     const int growth_scale_factor = 1 << growth_scale_level;
@@ -2279,7 +1891,7 @@ QuadSurface *tracer(Volume& volume, float scale, int level, cv::Vec3f origin, co
     std::unique_ptr<NeuralTracerConnection> neural_tracer;
     int pre_neural_gens = 0, neural_batch_size = 1;
     if (params.contains("neural_socket")) {
-        std::string socket_path = params["neural_socket"].get_string();
+        std::string socket_path = params["neural_socket"].get<std::string>();
         if (!socket_path.empty()) {
             try {
                 neural_tracer = std::make_unique<NeuralTracerConnection>(socket_path);
@@ -2295,9 +1907,9 @@ QuadSurface *tracer(Volume& volume, float scale, int level, cv::Vec3f origin, co
             std::cout << "Neural tracer not active" << std::endl;
         }
     }
-    TraceData trace_data(direction_fields);
+    TraceData trace_data;
     if (anchor_requested) {
-        auto xyz = params["seed_anchor_xyz"].get_double_array();
+        const auto xyz = params.at("seed_anchor_xyz").get<std::vector<double>>();
         if (xyz.size() != 3) throw std::runtime_error("seed_anchor_xyz needs three coordinates");
         trace_data.seed_anchor.configure({xyz[0], xyz[1], xyz[2]});
         if (!resume_surf) {
@@ -2310,27 +1922,24 @@ QuadSurface *tracer(Volume& volume, float scale, int level, cv::Vec3f origin, co
             const auto& saved = resume_surf->meta["seed_anchor"];
             if (saved.value("version", 0) != 1 || saved.value("mode", std::string()) != "fixed-vertex")
                 throw std::runtime_error("unsupported seed anchor provenance");
-            auto old = saved["xyz"].get_double_array();
+            const auto old = saved.at("xyz").get<std::vector<double>>();
             if (old.size() != 3 || !trace_data.seed_anchor.matches(old.data()))
                 throw std::runtime_error("resume seed anchor identity changed");
         }
     }
     LossSettings loss_settings;
     loss_settings.applyJsonWeights(params);
-    loss_settings.space_line_steps = std::max(2, params.value("space_line_steps", loss_settings.space_line_steps));
-    loss_settings.space_line_threshold = std::clamp(static_cast<float>(params.value("space_line_threshold", loss_settings.space_line_threshold)), 0.0f, 255.0f);
-    loss_settings.space_line_invert = params.value("space_line_invert", loss_settings.space_line_invert);
 
     std::unique_ptr<QuadSurface> reference_surface;
     if (params.contains("reference_surface")) {
-        const utils::Json& ref_cfg = params["reference_surface"];
+        const nlohmann::json& ref_cfg = params["reference_surface"];
         std::string ref_path;
         if (ref_cfg.is_string()) {
-            ref_path = ref_cfg.get_string();
+            ref_path = ref_cfg.get<std::string>();
         } else if (ref_cfg.is_object()) {
             if (ref_cfg.contains("path")) {
                 if (ref_cfg["path"].is_string()) {
-                    ref_path = ref_cfg["path"].get_string();
+                    ref_path = ref_cfg["path"].get<std::string>();
                 } else if (!ref_cfg["path"].is_null()) {
                     std::cerr << "reference_surface.path must be a string" << std::endl;
                 }
@@ -2355,7 +1964,7 @@ QuadSurface *tracer(Volume& volume, float scale, int level, cv::Vec3f origin, co
                     return current;
                 }
                 if (ref_cfg[key].is_number()) {
-                    return ref_cfg[key].get_double();
+                    return ref_cfg[key].get<double>();
                 }
                 std::cerr << "reference_surface." << key << " must be numeric" << std::endl;
                 return current;
@@ -2404,7 +2013,7 @@ QuadSurface *tracer(Volume& volume, float scale, int level, cv::Vec3f origin, co
             0,
             5);
         ngv = std::make_unique<vc::core::util::NormalGridVolume>(
-            params["normal_grid_path"].get_string(),
+            params["normal_grid_path"].get<std::string>(),
             normal_grid_level);
         std::cout << "Loaded normal grid level " << ngv->level()
                   << " (coordinate_scale=" << ngv->coordinateScale()
@@ -2437,11 +2046,9 @@ QuadSurface *tracer(Volume& volume, float scale, int level, cv::Vec3f origin, co
     std::cout << "GrowPatch loss weights:\n"
               << "  DIST: " << loss_settings.w[LossType::DIST]
               << " STRAIGHT: " << loss_settings.w[LossType::STRAIGHT]
-              << " DIRECTION: " << loss_settings.w[LossType::DIRECTION]
               << " SNAP: " << loss_settings.w[LossType::SNAP]
               << " NORMAL: " << loss_settings.w[LossType::NORMAL]
               << " REFERENCE_RAY: " << loss_settings.w[LossType::REFERENCE_RAY]
-              << " SPACELINE: " << loss_settings.w[LossType::SPACELINE]
               << " SDIR: " << loss_settings.w[LossType::SDIR]
               << std::endl;
     int rewind_gen = params.value("rewind_gen", -1);
@@ -2507,31 +2114,15 @@ QuadSurface *tracer(Volume& volume, float scale, int level, cv::Vec3f origin, co
     int x0 = w/2;
     int y0 = h/2;
 
-    // Together these represent the cached distance-transform of the thresholded surface volume
-    thresholdedDistance compute;
-    Chunked3d<uint8_t,thresholdedDistance> proc_tensor(compute, volume_shape_zyx, cache, level, cache_root);
-
-    if (loss_settings.w[LossType::SPACELINE] > 0.0f && loss_settings.space_line_steps >= 2) {
-        trace_data.space_line_compute = std::make_unique<lineLossDistance>(loss_settings.space_line_threshold,
-                                                                           loss_settings.space_line_invert);
-        trace_data.space_line_volume = std::make_unique<Chunked3d<uint8_t, lineLossDistance>>(
-            *trace_data.space_line_compute, volume_shape_zyx, cache, level, cache_root);
-        std::cout << "Space-line loss EDT enabled (threshold=" << loss_settings.space_line_threshold
-                  << ", steps=" << loss_settings.space_line_steps
-                  << ", invert=" << loss_settings.space_line_invert << ")" << std::endl;
+    trace_data.raw_volume = &volume;
+    {
+        std::uint8_t seed_value = 0;
+        const std::int64_t seed_zyx[3] = {std::int64_t(origin[2]), std::int64_t(origin[1]), std::int64_t(origin[0])};
+        volume.read_points(seed_zyx, 1, &seed_value);
+        std::cout << "seed val " << origin << " " << int(seed_value) << std::endl;
     }
 
-    // Debug: test the chunk cache by reading one voxel
-    passTroughComputor pass;
-    Chunked3d<uint8_t,passTroughComputor> dbg_tensor(pass, volume_shape_zyx, cache, level);
-    trace_data.raw_volume = &dbg_tensor;
-    std::cout << "seed val " << origin << " " <<
-    (int)dbg_tensor(origin[2],origin[1],origin[0]) << std::endl;
-
     auto timer = new ALifeTime("search & optimization ...");
-
-    // This provides a cached interpolated version of the original surface volume
-    CachedChunked3dInterpolator<uint8_t,thresholdedDistance> interp_global(proc_tensor);
 
     // fringe contains all 2D points around the edge of the patch where we might expand it
     // cands will contain new points adjacent to the fringe that are candidates to expand into
@@ -2680,15 +2271,17 @@ QuadSurface *tracer(Volume& volume, float scale, int level, cv::Vec3f origin, co
                   << " holes, " << inpaint_skip << " skipped" << std::endl;
 
         auto surf = new QuadSurface(result_points_storage.release(), {1/T, 1/T});
-        surf->setDpi(voxelSizeToDpi(voxelsize));
+        surf->setDpi(voxelsize > 0 ? float(25400.0 / voxelsize) : 0.f);
         surf->setChannel("generations", resume_generations.clone());
 
         if (!mask.empty()) {
             surf->setChannel("mask", mask);
         }
 
-        const double area_est_vx2 = vc::surface::computeSurfaceAreaVox2(*surf);
-        surf->meta = utils::Json::parse(meta_params.dump());
+        const double area_est_vx2 = ([&] { const auto& points = *std::as_const(*surf).rawPointsPtr(); return vc::geometry::surfaceGridArea(points.rows, points.cols,
+            [&](int64_t r, int64_t c) -> const cv::Vec3f& { return points(int(r), int(c)); },
+            [&](int64_t r, int64_t c) { return vc::geometry::validSurfacePoint(points(int(r), int(c))); }); }());
+        surf->meta = meta_params;
         if (resume_surf && !resume_surf->id.empty()) {
             surf->meta["seed_surface_id"] = resume_surf->objectUuid().empty()
                 ? resume_surf->id : resume_surf->objectUuid();
@@ -2742,7 +2335,7 @@ QuadSurface *tracer(Volume& volume, float scale, int level, cv::Vec3f origin, co
         cv::Mat_<uint16_t> generations_crop = generations(used_area_safe);
 
         auto surf = new QuadSurface(points_crop, {1/T, 1/T});
-        surf->setDpi(voxelSizeToDpi(voxelsize));
+        surf->setDpi(voxelsize > 0 ? float(25400.0 / voxelsize) : 0.f);
         surf->setChannel("generations", generations_crop.clone());
 
         if (params.value("vis_losses", false)) {
@@ -2798,22 +2391,24 @@ QuadSurface *tracer(Volume& volume, float scale, int level, cv::Vec3f origin, co
             surf->setChannel("loss_sdir", loss_sdir);
         }
 
-        const double area_est_vx2 = vc::surface::computeSurfaceAreaVox2(*surf);
+        const double area_est_vx2 = ([&] { const auto& points = *std::as_const(*surf).rawPointsPtr(); return vc::geometry::surfaceGridArea(points.rows, points.cols,
+            [&](int64_t r, int64_t c) -> const cv::Vec3f& { return points(int(r), int(c)); },
+            [&](int64_t r, int64_t c) { return vc::geometry::validSurfacePoint(points(int(r), int(c))); }); }());
 
-        surf->meta = utils::Json::parse(meta_params.dump());
+        surf->meta = meta_params;
         vc::surface::storeAreaMeta(surf->meta, area_est_vx2,
                                    static_cast<double>(voxelsize));
         surf->meta["max_gen"] = generation;
         if (anchor_requested) {
-            auto a = utils::Json::object();
+            auto a = nlohmann::json::object();
             a["version"] = 1; a["mode"] = "fixed-vertex";
-            auto xyz = utils::Json::array();
+            auto xyz = nlohmann::json::array();
             for (double v : trace_data.seed_anchor.xyz()) xyz.push_back(v);
             a["xyz"] = xyz;
             surf->meta["seed_anchor"] = a;
         }
         {
-            auto seed_arr = utils::Json::array();
+            auto seed_arr = nlohmann::json::array();
             seed_arr.push_back(origin[0]); seed_arr.push_back(origin[1]); seed_arr.push_back(origin[2]);
             surf->meta["seed"] = std::move(seed_arr);
         }
@@ -2825,7 +2420,7 @@ QuadSurface *tracer(Volume& volume, float scale, int level, cv::Vec3f origin, co
             // new_coord = old_coord + offset
             const int offset_row = resume_pad_y - used_area_safe.y;
             const int offset_col = resume_pad_x - used_area_safe.x;
-            auto off_arr = utils::Json::array();
+            auto off_arr = nlohmann::json::array();
             off_arr.push_back(offset_col); off_arr.push_back(offset_row);
             surf->meta["grid_offset"] = std::move(off_arr);
         }
@@ -3479,7 +3074,6 @@ QuadSurface *tracer(Volume& volume, float scale, int level, cv::Vec3f origin, co
                     inpaint_skip++;
             }
 
-            // cv::imwrite("vis_inp_rect.tif", vis);
         }
     }
 
@@ -3654,7 +3248,6 @@ QuadSurface *tracer(Volume& volume, float scale, int level, cv::Vec3f origin, co
             // ...then start iterating over candidates in parallel using the above to yield points
             #pragma omp parallel
             {
-                CachedChunked3dInterpolator<uint8_t,thresholdedDistance> interp(proc_tensor);
                 //             int idx = rand() % cands.size();
                 while (true) {
                     int r = 1;
@@ -3716,8 +3309,6 @@ QuadSurface *tracer(Volume& volume, float scale, int level, cv::Vec3f origin, co
                     trace_params.state(p) = STATE_LOC_VALID | STATE_COORD_VALID;
 
                     int flags = LOSS_DIST | LOSS_STRAIGHT;
-                    if (trace_data.space_line_volume && loss_settings.w[LossType::SPACELINE] > 0.0f)
-                        flags |= LOSS_SPACELINE;
 
                     add_losses(problem, p, trace_params, trace_data, loss_settings, flags);
 
@@ -3787,7 +3378,6 @@ QuadSurface *tracer(Volume& volume, float scale, int level, cv::Vec3f origin, co
 #pragma omp parallel
                 while (true)
                 {
-                    CachedChunked3dInterpolator<uint8_t,thresholdedDistance> interp(proc_tensor);
                     cv::Vec2i p = opt_local_threadcol.next();
                     if (p[0] == -1)
                         break;
@@ -3838,7 +3428,6 @@ QuadSurface *tracer(Volume& volume, float scale, int level, cv::Vec3f origin, co
 
         timer_gen.unit = succ_gen * vx_per_quad;
         timer_gen.unit_string = "vx^2";
-        // print_accessor_stats();
 
         if (!tgt_path.empty() && snapshot_interval > 0 && generation % snapshot_interval == 0) {
             QuadSurface* surf = create_surface_from_state();
@@ -3852,7 +3441,9 @@ QuadSurface *tracer(Volume& volume, float scale, int level, cv::Vec3f origin, co
 
     QuadSurface* surf = create_surface_from_state();
 
-    const double area_est_vx2 = vc::surface::computeSurfaceAreaVox2(*surf);
+    const double area_est_vx2 = ([&] { const auto& points = *std::as_const(*surf).rawPointsPtr(); return vc::geometry::surfaceGridArea(points.rows, points.cols,
+            [&](int64_t r, int64_t c) -> const cv::Vec3f& { return points(int(r), int(c)); },
+            [&](int64_t r, int64_t c) { return vc::geometry::validSurfacePoint(points(int(r), int(c))); }); }());
     const auto area_est_cm2 = vc::surface::areaCm2FromVox2(
         area_est_vx2, static_cast<double>(voxelsize));
     if (area_est_cm2) {

@@ -62,7 +62,7 @@ void testCorrectionResults()
         require(false, "Correction point row missing");
         return {};
     };
-    const auto load = [&](const char* json) { widget.loadCorrPointsResults(utils::Json::parse(json)); };
+    const auto load = [&](const char* json) { widget.loadCorrPointsResults(nlohmann::json::parse(json)); };
     load(R"({"points_list":[
         {"collection_id":0,"point_id":0,"p":[1,2,3],"winding_obs":1,"winding_err":0.1},
         {"collection_id":7,"point_id":0,"p":[1,2,3],"winding_obs":2,"winding_err":0.2}

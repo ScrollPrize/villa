@@ -24,7 +24,11 @@ int main()
         for (const auto& center : centers) {
             float prepared[4], direct[4];
             patch.evaluate(center, prepared);
-            cpu(image.data(), center, direct, 1);
+            // cpu() only accepts centers in [48,51); a fresh patch covers the rest.
+            CpuWorkspace freshWorkspace;
+            CpuPatch fresh;
+            freshWorkspace.prepare(image.data(), fresh);
+            fresh.evaluate(center, direct);
             if (std::memcmp(prepared, direct, sizeof direct) != 0) {
                 std::cerr << "Prepared patch differs from direct evaluation\n";
                 return 1;

@@ -7,8 +7,9 @@ struct Function {
 };
 }
 void apply_cuda(const Contrast& t, Sample& s, const Parameters& p, Session& session) {
-    apply_channels(t,s,p,session,[](const auto& t, auto v, const Grid& g, const ChannelPlan& c) {
-        pointwise(v,g,c,Function{c.values[0],t.preserve_range},true,false);
+    apply_channels(t,s,p,session,[&](const auto& t, auto v, const Grid& g, const ChannelPlan& c) {
+        auto valid = t.masked ? valid_voxels(s, c, session) : nullptr;
+        pointwise(v,g,c,Function{c.values[0],t.preserve_range},true,false,valid ? valid->ptr : nullptr);
     });
 }
 } // namespace vcr::transforms::cuda

@@ -69,7 +69,7 @@ def collate_with_padding(batch):
         return result
 
     # Source masks are used by on-device EDT target generation. Keeping EDT
-    # out of dataloader workers avoids cupyx defaulting every worker to GPU 0.
+    # out of dataloader workers avoids every worker defaulting to GPU 0.
     return {
         'vol': torch.stack([b['vol'] for b in batch]),
         'cond': torch.stack([b['cond'] for b in batch]),

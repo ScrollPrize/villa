@@ -17,7 +17,7 @@ from vesuvius.ink_detection.models.checkpoint import (
     select_inference_weights,
 )
 
-from .test_model_foundation import _config_mapping
+from .helpers import config_mapping
 
 
 def _training_payload(model_state):
@@ -317,7 +317,7 @@ def test_checkpoint_file_loading_does_not_interpret_payload(tmp_path):
     state = nn.Linear(2, 1).state_dict()
     payload = {
         "state_dict": state,
-        "config": _config_mapping(),
+        "config": config_mapping(),
         "ema_model": None,
     }
     checkpoint_path = tmp_path / "checkpoint.pth"

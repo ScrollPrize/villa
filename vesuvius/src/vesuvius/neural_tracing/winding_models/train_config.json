@@ -55,7 +55,6 @@
   "spacing": 1.0,
   "column_stride": 4,
   "sampling": "trilinear",
-  "tile_size": 16,
   "datasets": [
     {
       "volume_path": "/mnt/raid_nvme/intersection_addtl_train_data/PHerc0139/volumes/20260102150214-2.399um-0.2m-78keV-masked.zarr",

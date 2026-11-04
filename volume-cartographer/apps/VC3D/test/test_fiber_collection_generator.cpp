@@ -36,7 +36,7 @@ private slots:
         request.blackDistance = 8;
         request.previewDirectory = "/tmp/previews";
         const QStringList expected{
-            "-m", "vesuvius.afv_spline_generator", "--volume", "https://example.org/scroll.zarr", "--level", "1",
+            "-m", "vesuvius.fiber_spline_generator", "--volume", "https://example.org/scroll.zarr", "--level", "1",
             "--origin", "10", "20", "30", "--size", "512", "256", "128", "--output", "/data/fibers.vcobj",
             "--volume-uuid", "20250821151723", "--native-scale", "2", "--voxel-size", "9.362",
             "--source-path", "s3://bucket/scroll.zarr/", "--model", "Qualzz20/afv_fiber_9um", "--threshold", "55",
@@ -140,8 +140,8 @@ private slots:
         QTemporaryDir root;
         QVERIFY(root.isValid());
         const QString source = root.filePath("villa/vesuvius/src");
-        QVERIFY(QDir().mkpath(source + "/vesuvius/afv_spline_generator"));
-        QFile module(source + "/vesuvius/afv_spline_generator/__main__.py");
+        QVERIFY(QDir().mkpath(source + "/vesuvius/fiber_spline_generator"));
+        QFile module(source + "/vesuvius/fiber_spline_generator/__main__.py");
         QVERIFY(module.open(QIODevice::WriteOnly));
         module.close();
         const QString app = root.filePath("villa/volume-cartographer/build/bin");

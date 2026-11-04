@@ -3,7 +3,9 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <cmath>
 #include <memory>
+#include <stdexcept>
 #include <vector>
 #ifdef __CUDACC__
 #define VCR_SHEET_HD __host__ __device__
@@ -19,8 +21,37 @@ namespace vcr::sheet_normal {
 device::Storage cuda(const void* image, bool floating, const float* centers,
                      std::size_t batch, int device, device::Storage output = {});
 #endif
+inline constexpr const char* recipe="ct-anisotropic-1-24-4-grid3-r48-v4";
 constexpr int width=109, sites=33, count=sites*sites*sites;
 constexpr int zcount=sites*width*width, ycount=sites*sites*width;
+// Where the patch of one XYZ query sits: its ZYX start, and the query's XYZ offset from the
+// 3-voxel lattice. Global coordinates stay float64 until the lattice origin is removed.
+// valid: the whole patch lies inside the volume (shape ZYX).
+inline void region(const double* xyz,const std::int64_t* shape,std::int64_t* start,float* offset,bool* valid) {
+    *valid=true;
+    for(int axis=0;axis<3;++axis) {
+        if(!std::isfinite(xyz[axis]) || std::abs(xyz[axis])>=0x1p52) throw std::invalid_argument("invalid sheet-normal point");
+        const double lattice=std::floor(xyz[axis]/3)*3;
+        start[2-axis]=std::int64_t(lattice)-54;
+        offset[axis]=float(xyz[axis]-lattice);
+        *valid&=start[2-axis]>=0 && start[2-axis]+width<=shape[2-axis];
+    }
+}
+// The patch-local XYZ center and validity the estimators take, for offsets in [0,3).
+inline void center(const float* offset,bool valid,float* out) {
+    for(int axis=0;axis<3;++axis) {
+        if(!std::isfinite(offset[axis]) || offset[axis]<0 || offset[axis]>=3) throw std::invalid_argument("offsets_xyz must be finite (B,3) values in [0,3)");
+        // Preserve the open upper bound after float32 addition near a lattice edge.
+        out[axis]=std::min(offset[axis]+48.f,std::nextafter(51.f,48.f));
+    }
+    out[3]=valid;
+}
+// Centers (B,4) are patch-local XYZ in [48,51) plus validity.
+inline void check_centers(const float* centers,std::size_t batch) {
+    for(std::size_t b=0;b<batch;++b) for(int j=0;j<3;++j)
+        if(!std::isfinite(centers[4*b+j]) || centers[4*b+j]<48 || centers[4*b+j]>=51)
+            throw std::invalid_argument("center must be in [48,51)");
+}
 struct Kernels {
     float taps[4][13]{}; // smooth/derivative sigma 2, then sigma 1, zero padded
     Kernels() {
@@ -121,6 +152,7 @@ struct CpuWorkspace {
 };
 
 template<class T> inline void cpu(const T* image,const float* centers,float* output,std::size_t batch) {
+    check_centers(centers,batch);
     CpuWorkspace workspace;
     CpuPatch patch;
     for(std::size_t b=0;b<batch;++b) {

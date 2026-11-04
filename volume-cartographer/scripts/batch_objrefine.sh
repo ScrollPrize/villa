@@ -24,7 +24,6 @@ if [ "$#" -lt 3 ]; then
     echo ""
     echo "Example:"
     echo "  $0 /data/volumes/vol.zarr /data/segments params.json /data/refined"
-    echo "  $0 /data/volumes/vol.zarr /data/meshes params.json --cache_gb 2"
     exit 1
 fi
 

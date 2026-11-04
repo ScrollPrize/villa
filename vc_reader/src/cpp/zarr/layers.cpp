@@ -1,0 +1,763 @@
+// Finding the on-disk chunk caches of a remote array, in the formats other tools
+// already write, and choosing the one fetched chunks are appended to.
+//
+// * decoded (vc_reader, vesuvius RemoteChunkedArray): <root>/<scheme>/<host or
+//   bucket>/<path>/ is a zarr v2 array of the decoded chunks, uncompressed or
+//   losslessly Delta3D-encoded. vc_reader marks missing chunks <key>.missing.
+// * vc3d-mirror (VC3D ZarrMirror): <root>/<name>-<fnv1a64(url)>/ mirrors the
+//   source group; chunks are the source's stored bytes, <key>.empty marks a
+//   missing chunk.
+// * vc3d-delta3d (VC3D Delta3d): the same directory with a .vc_delta3d_cache
+//   marker; chunks are decoded voxels re-encoded with lossless VC-Delta3D and
+//   missing chunks are marked under .vc_cache_empty/<level>/<key>.empty.
+//
+// VC3D caches are used under VC3D's shared lease (flock on
+// <root>/.<id>.vc_cache.lock): VC3D replaces a cache directory only when it can
+// take that lock exclusively.
+#include "vc_reader/catalog.hpp"
+#include "vc_reader/zarr.hpp"
+#include "vc_reader/array.hpp"
+#include "files.hpp"
+#include "../chunk_io.hpp"
+
+#include <cmath>
+#include <cstdlib>
+#include <fstream>
+#include <mutex>
+#include <sstream>
+#include <thread>
+
+#ifndef _WIN32
+#include <fcntl.h>
+#include <sys/file.h>
+#include <unistd.h>
+#endif
+
+namespace fs = std::filesystem;
+
+namespace vcr::zarr {
+namespace {
+constexpr const char* kDelta3d = "vc-delta3d";
+constexpr const char* kDelta3dMarker = ".vc_delta3d_cache";
+constexpr const char* kDelta3dMarkerContents = "D3D1\n";
+constexpr const char* kVc3d = "vc3d";
+
+std::optional<Json> readJson(const fs::path& path)
+{
+    std::ifstream in(path);
+    if (!in)
+        return std::nullopt;
+    try {
+        return Json::parse(in);
+    } catch (const Json::exception&) {
+        return std::nullopt;
+    }
+}
+
+std::optional<std::string> readText(const fs::path& path)
+{
+    std::ifstream in(path, std::ios::binary);
+    if (!in)
+        return std::nullopt;
+    std::ostringstream text;
+    text << in.rdbuf();
+    return text.str();
+}
+
+// JSON equality that treats NaN fill values as equal.
+bool metadataEqual(const Json& a, const Json& b)
+{
+    if (a.is_object() && b.is_object()) {
+        if (a.size() != b.size())
+            return false;
+        for (const auto& [key, value] : a.items())
+            if (!b.contains(key) || !metadataEqual(value, b.at(key)))
+                return false;
+        return true;
+    }
+    if (a.is_array() && b.is_array()) {
+        if (a.size() != b.size())
+            return false;
+        for (std::size_t i = 0; i < a.size(); ++i)
+            if (!metadataEqual(a[i], b[i]))
+                return false;
+        return true;
+    }
+    if (a.is_number_float() && b.is_number_float() && std::isnan(a.get<double>()) && std::isnan(b.get<double>()))
+        return true;
+    return a == b;
+}
+
+bool losslessCodec(const Json& config)
+{
+    if (!config.is_object() || config.value("id", std::string()) != kDelta3d)
+        return true;
+    const auto quant = config.value("quant", Json(1));
+    return !quant.is_number() || quant.get<double>() <= 1;
+}
+
+bool readableCache(const Json& stored)
+{
+    try {
+        parseArrayMeta(stored).codec();
+        return true;
+    } catch (const std::exception&) {
+        return false;
+    }
+}
+
+// Whether a cache's .zarray describes the same array as the source (and, unless
+// ignoreCodec, stores it with the same compressor, filters and order).
+bool sameArray(const Json& stored, const ArrayMeta& source, bool ignoreCodec)
+{
+    ArrayMeta s;
+    try {
+        s = parseArrayMeta(stored);
+    } catch (const std::exception&) {
+        return false;
+    }
+    const auto nativeFill = [](const ArrayMeta& m) {
+        auto f = m.fill;
+        if (m.type.swap)
+            std::reverse(f.begin(), f.end());
+        return f;
+    };
+    bool sameFill;
+    if (source.type.kind == 'f') {
+        const double a = s.type.load(s.fill.data()), b = source.type.load(source.fill.data());
+        sameFill = a == b || (std::isnan(a) && std::isnan(b));
+    } else {
+        sameFill = nativeFill(s) == nativeFill(source);
+    }
+    const bool same = s.type.kind == source.type.kind && s.type.itemsize == source.type.itemsize &&
+                      s.shape == source.shape && s.chunks == source.chunks && s.separator == source.separator && sameFill;
+    if (!same || ignoreCodec)
+        return same;
+    const auto noFilters = [](const Json& f) { return f.is_null() || f.empty(); };
+    return stored.value("compressor", Json()) == source.compressor &&
+           (noFilters(stored.value("filters", Json())) ? noFilters(source.filters)
+                                                       : stored.value("filters", Json()) == source.filters) &&
+           s.order == source.order;
+}
+
+std::uint64_t fnv1a64(const std::string& text)
+{
+    std::uint64_t h = 14695981039346656037ull;
+    for (const unsigned char b : text)
+        h = (h ^ b) * 1099511628211ull;
+    return h;
+}
+
+std::vector<std::string> urlSpellings(const std::string& url)
+{
+    std::vector<std::string> out;
+    auto add = [&](std::string u) {
+        while (!u.empty() && u.back() == '/')
+            u.pop_back();
+        if (!u.empty() && std::find(out.begin(), out.end(), u) == out.end())
+            out.push_back(u);
+    };
+    add(url);
+    if (url.starts_with("http") || url.starts_with("s3"))
+        add(catalog::resolveOpenDataUrl(url));
+    if (auto s3 = catalog::openDataS3Url(url))
+        add(*s3);
+    add(httpUrl(url));
+    return out;
+}
+
+std::optional<fs::path> vc3dDir(const fs::path& root, const std::string& groupUrl)
+{
+    for (const auto& spelling : urlSpellings(groupUrl)) {
+        const auto dir = root / vc3dVolumeId(spelling);
+        std::error_code ec;
+        if (fs::is_directory(dir, ec))
+            return dir;
+    }
+    return std::nullopt;
+}
+
+// The disk policy a cache's metadata writes obey (writeCacheMetadata).
+struct CachePolicy {
+    std::vector<std::string> cacheDirs;
+    std::optional<fs::path> vc3dVolumeDir;
+    std::optional<std::int64_t> maxBytes, minFreeBytes;
+    bool write(const fs::path& path, const std::string& data) const
+    {
+        return detail::writeCacheMetadata(path, data, cacheDirs, vc3dVolumeDir, maxBytes, minFreeBytes);
+    }
+};
+
+std::optional<CacheLayer> decodedLayer(const fs::path& root, const ArrayMeta& source, const std::string& url,
+                                       bool create, const CachePolicy& policy, bool compress = false, bool allowLossy = false)
+{
+    auto stored = readJson(root / ".zarray");
+    if (!stored) {
+        if (!create)
+            return std::nullopt;
+        if (compress && (source.shape.size() != 3 || source.type.kind != 'u' ||
+                         (source.type.itemsize != 1 && source.type.itemsize != 2)))
+            throw std::invalid_argument("compress_cache needs 3-D uint8 or uint16 chunks");
+        stored = compress ? source.delta3dZarray() : source.decodedZarray();
+        const Json record{{"vc_reader", {{"source_url", url}, {"source_zarray", source.raw}}}};
+        // No layer without its documents: under the free-space floor nothing is cached here.
+        if (!policy.write(root / ".zattrs", record.dump(1)) || !policy.write(root / ".zarray", stored->dump(1)))
+            return std::nullopt;
+        CacheLayer layer;
+        layer.kind = "decoded";
+        layer.root = root.string();
+        layer.stored = parseArrayMeta(*stored);
+        return layer;
+    }
+    // Any cache of this array that vc_reader can decode serves, whichever tool wrote it;
+    // our own record also says which source the chunks came from.
+    bool ok = sameArray(*stored, source, true) && readableCache(*stored);
+    if (const auto attrs = readJson(root / ".zattrs"); ok && attrs && attrs->contains("vc_reader"))
+        ok = metadataEqual(attrs->at("vc_reader").value("source_zarray", Json()), source.raw);
+    if (ok && !allowLossy && !losslessCodec(stored->value("compressor", Json())))
+        return std::nullopt;
+    if (!ok)
+        throw std::invalid_argument("disk cache " + root.string() + " holds a different array than " + url +
+                                 " (the remote .zarray changed?); delete that cache directory to refill it");
+    CacheLayer layer;
+    layer.kind = "decoded";
+    layer.root = root.string();
+    layer.stored = parseArrayMeta(*stored);
+    layer.allowLossy = allowLossy;
+    return layer;
+}
+
+std::optional<CacheLayer> vc3dLayer(const fs::path& volumeDir, const std::string& levelKey, const ArrayMeta& source,
+                                    bool allowLossy, bool writable, std::vector<std::string>& busy, const CachePolicy& policy)
+{
+    if (source.v3)
+        return std::nullopt;  // VC3D mirror layouts describe v2 source chunks
+    auto lease = std::make_shared<Vc3dLease>(volumeDir);
+    if (!lease->acquire()) {  // being replaced by another process
+        busy.push_back(volumeDir.string());
+        return std::nullopt;
+    }
+    const bool delta3d = readText(volumeDir / kDelta3dMarker) == std::string(kDelta3dMarkerContents);
+    const auto root = fs::weakly_canonical(volumeDir / levelKey);
+    auto stored = readJson(root / ".zarray");
+    if (!stored && writable) {
+        // VC3D publishes each level's metadata when it first touches the level; do the same.
+        stored = delta3d ? source.delta3dZarray() : source.raw;
+        if (!policy.write(root / ".zarray", stored->dump(2) + "\n"))
+            stored.reset();  // the policy refused: no layer here
+    }
+    if (!stored)
+        return std::nullopt;
+    CacheLayer layer;
+    layer.root = root.string();
+    layer.lease = lease;
+    if (delta3d) {
+        const auto comp = stored->value("compressor", Json());
+        if (comp.value("id", std::string()) != kDelta3d || !sameArray(*stored, source, true))
+            throw std::invalid_argument("VC3D Delta3D cache " + root.string() + " does not hold this array's chunks");
+        if (!allowLossy && !losslessCodec(comp))
+            return std::nullopt;
+        layer.kind = "vc3d-delta3d";
+        layer.stored = parseArrayMeta(*stored);
+        layer.emptyRoot = (volumeDir / ".vc_cache_empty" / levelKey).string();
+        layer.allowLossy = allowLossy;
+        return layer;
+    }
+    if (!sameArray(*stored, source, false))
+        throw std::invalid_argument("VC3D cache " + root.string() + " mirrors a different array (the remote .zarray changed?)");
+    layer.kind = "vc3d-mirror";
+    layer.stored = parseArrayMeta(*stored);
+    return layer;
+}
+}  // namespace
+
+std::string vc3dVolumeId(std::string url)
+{
+    while (!url.empty() && url.back() == '/')
+        url.pop_back();
+    auto name = url.substr(url.rfind('/') + 1);
+    if (name.empty())
+        name = "remote";
+    char hex[17];
+    std::snprintf(hex, sizeof hex, "%016llx", static_cast<unsigned long long>(fnv1a64(url)));
+    return name + "-" + hex;
+}
+
+void createVc3dVolumeDir(const fs::path& volumeDir, bool delta3d)
+{
+    std::error_code ec;
+    if (fs::is_directory(volumeDir, ec))
+        return;
+    fs::create_directories(volumeDir);
+    if (delta3d)
+        atomicWrite(volumeDir / kDelta3dMarker, kDelta3dMarkerContents);
+}
+
+namespace {
+
+fs::path utf8Path(const std::string& value)
+{
+    return fs::path(std::u8string(value.begin(), value.end()));
+}
+
+std::optional<fs::path> homeDirectory()
+{
+#ifdef _WIN32
+    if (const wchar_t* profile = _wgetenv(L"USERPROFILE"); profile && *profile)
+        return fs::path(profile);
+    const wchar_t* drive = _wgetenv(L"HOMEDRIVE");
+    const wchar_t* homePath = _wgetenv(L"HOMEPATH");
+    if (drive && *drive && homePath && *homePath)
+        return fs::path(std::wstring(drive) + homePath);
+#endif
+    if (const char* home = std::getenv("HOME"); home && *home)
+        return utf8Path(home);
+    return std::nullopt;
+}
+
+std::optional<fs::path> configDirectory()
+{
+#ifdef _WIN32
+    if (const wchar_t* configured = _wgetenv(L"VC3D_CONFIG_DIR"); configured && *configured)
+        return fs::path(configured);
+#else
+    if (const char* configured = std::getenv("VC3D_CONFIG_DIR"); configured && *configured)
+        return utf8Path(configured);
+#endif
+    const auto home = homeDirectory();
+    return home ? std::optional<fs::path>(*home / ".VC3D") : std::nullopt;
+}
+
+std::string trimmed(const std::string& value)
+{
+    const auto first = value.find_first_not_of(" \t\r\n");
+    return first == std::string::npos ? std::string() : value.substr(first, value.find_last_not_of(" \t\r\n") - first + 1);
+}
+
+// A value as QSettings writes it: optionally quoted, with backslash escapes.
+std::string decodedIniValue(std::string value)
+{
+    value = trimmed(value);
+    if (value.size() >= 2 && value.front() == '"' && value.back() == '"')
+        value = value.substr(1, value.size() - 2);
+    std::string decoded;
+    for (std::size_t i = 0; i < value.size(); ++i) {
+        if (value[i] != '\\' || i + 1 == value.size()) {
+            decoded.push_back(value[i]);
+            continue;
+        }
+        const char escaped = value[++i];
+        if (escaped == '\\' || escaped == '"')
+            decoded.push_back(escaped);
+        else if (escaped == 'n')
+            decoded.push_back('\n');
+        else if (escaped == 'r')
+            decoded.push_back('\r');
+        else if (escaped == 't')
+            decoded.push_back('\t');
+        else {
+            decoded.push_back('\\');
+            decoded.push_back(escaped);
+        }
+    }
+    return decoded;
+}
+
+std::optional<fs::path> iniCacheRoot(const fs::path& configDir, const std::optional<fs::path>& home)
+{
+    std::ifstream ini(configDir / "VC3D.ini");
+    std::string line;
+    bool viewer = false;
+    while (std::getline(ini, line)) {
+        line = trimmed(line);
+        if (line.empty() || line.front() == ';' || line.front() == '#')
+            continue;
+        if (line.front() == '[' && line.back() == ']') {
+            viewer = line == "[viewer]";
+            continue;
+        }
+        const auto eq = line.find('=');
+        if (!viewer || eq == std::string::npos || trimmed(line.substr(0, eq)) != "remote_cache_dir")
+            continue;
+        const auto value = decodedIniValue(line.substr(eq + 1));
+        if (value.empty())
+            return std::nullopt;
+        return value.starts_with("~/") && home ? *home / utf8Path(value.substr(2)) : utf8Path(value);
+    }
+    return std::nullopt;
+}
+
+// cache.json's root, which counts whether or not it exists yet; throws when malformed.
+std::optional<fs::path> configuredCacheRoot(const fs::path& configDir)
+{
+    const auto config = readJson(configDir / "cache.json");
+    if (!config)
+        return std::nullopt;
+    if (!config->is_object() || config->value("version", 0) != 1)
+        throw std::invalid_argument("unsupported VC3D cache configuration version in " + (configDir / "cache.json").string());
+    const auto root = utf8Path(config->at("root").get<std::string>());
+    if (root.empty() || !root.is_absolute())
+        throw std::invalid_argument("VC3D global cache root must be absolute: " + (configDir / "cache.json").string());
+    return root.lexically_normal();
+}
+
+// The roots after cache.json, in order.
+std::vector<fs::path> cacheRootCandidates(const std::optional<fs::path>& configDir)
+{
+    const auto home = homeDirectory();
+    std::vector<fs::path> candidates;
+    if (configDir)
+        if (auto root = iniCacheRoot(*configDir, home))
+            candidates.push_back(std::move(*root));
+    for (const char* base : {"/volpkgs", "/ephemeral"}) {
+        std::error_code ec;
+        if (fs::is_directory(base, ec)) {
+            candidates.push_back(fs::path(base) / "remote_cache");
+            break;
+        }
+    }
+    if (home)
+        candidates.push_back(*home / ".VC3D" / "remote_cache");
+    return candidates;
+}
+
+}  // namespace
+
+fs::path vc3dConfigDirectory()
+{
+    auto directory = configDirectory();
+    if (!directory)
+        throw std::runtime_error("cannot resolve the VC3D configuration directory: no home directory");
+    return std::move(*directory);
+}
+
+std::optional<fs::path> vc3dCacheRoot()
+{
+    const auto configDir = configDirectory();
+    if (configDir)
+        if (auto root = configuredCacheRoot(*configDir))
+            return root;
+    for (const auto& candidate : cacheRootCandidates(configDir)) {
+        std::error_code ec;
+        if (fs::is_directory(candidate, ec))
+            return candidate;
+    }
+    return std::nullopt;
+}
+
+fs::path selectedVc3dCacheRoot()
+{
+    const auto configDir = configDirectory();
+    if (configDir)
+        if (auto root = configuredCacheRoot(*configDir))
+            return std::move(*root);
+    const auto candidates = cacheRootCandidates(configDir);
+    if (candidates.empty())
+        throw std::runtime_error("cannot resolve the VC3D cache root: no home directory");
+    return candidates.front();
+}
+
+fs::path decodedCachePath(const fs::path& cacheDir, const std::string& input)
+{
+    auto url = catalog::openDataS3Url(input).value_or(input);
+    while (!url.empty() && url.back() == '/')
+        url.pop_back();
+    const auto scheme = url.find("://");
+    if (scheme == std::string::npos)
+        throw std::invalid_argument("not a URL: '" + url + "'");
+    auto rest = url.substr(scheme + 3);
+    const auto query = rest.find_first_of("?#");
+    if (query != std::string::npos)
+        rest.erase(query);
+    const auto slash = rest.find('/');
+    auto out = cacheDir / url.substr(0, scheme) / rest.substr(0, slash);
+    if (slash != std::string::npos)
+        out /= rest.substr(slash + 1);
+    return out;
+}
+
+std::shared_ptr<DiskCache> diskBudget(const std::string& root, std::optional<std::int64_t> maxBytes)
+{
+    static std::mutex mutex;
+    static std::map<std::string, std::shared_ptr<DiskCache>> budgets;
+    static pid_t owner = getpid();
+    std::lock_guard lock(mutex);
+    if (owner != getpid()) {  // a forked child: the parent's indexes are not ours to use
+        for (auto& [_, budget] : budgets)
+            new std::shared_ptr<DiskCache>(std::move(budget));  // leaked, never touched
+        budgets.clear();
+        owner = getpid();
+    }
+    auto& budget = budgets[root];
+    if (!budget)
+        budget = std::make_shared<DiskCache>(root, maxBytes.value_or(-1));
+    else if (maxBytes)
+        budget->set_max_bytes(*maxBytes);
+    return budget;
+}
+
+bool detail::writeCacheMetadata(const fs::path& path, const std::string& data, const std::vector<std::string>& cacheDirs,
+                                const std::optional<fs::path>& vc3dVolumeDir, std::optional<std::int64_t> maxBytes,
+                                std::optional<std::int64_t> minFreeBytes)
+{
+    const auto under = [](const fs::path& file, const fs::path& dir) {
+        std::error_code ec;
+        const auto rel = fs::weakly_canonical(file, ec).lexically_relative(fs::weakly_canonical(dir, ec));
+        return !rel.empty() && rel != "." && *rel.begin() != "..";
+    };
+    std::optional<fs::path> root;
+    for (const auto& candidate : cacheRoots(cacheDirs))
+        if (under(path, candidate)) {
+            root = candidate;
+            break;
+        }
+    if (!root && vc3dVolumeDir && under(path, *vc3dVolumeDir))
+        root = vc3dVolumeDir->parent_path();
+    if (!root) {
+        atomicWrite(path, data);
+        return true;
+    }
+    auto budget = diskBudget(root->string(), maxBytes);
+    if (minFreeBytes)
+        budget->set_min_free_bytes(*minFreeBytes);
+    return budget->write_metadata(fs::weakly_canonical(path).string(), reinterpret_cast<const std::uint8_t*>(data.data()), data.size());
+}
+
+void atomicWrite(const fs::path& path, const std::string& data, Durability durability)
+{
+    atomicWrite(path, data.data(), data.size(), durability);
+}
+
+void atomicWrite(const fs::path& path, const void* data, std::size_t size, Durability durability)
+{
+    AtomicFile file(path.string());  // its destructor removes the temporary of a failed write
+    file.write(static_cast<const std::uint8_t*>(data), size);
+    file.publish(durability == Durability::Fsync);
+}
+
+void detail::atomicWriteFile(const fs::path& path, const std::function<void(std::ostream&)>& write)
+{
+    std::ostringstream out;
+    write(out);
+    if (!out)
+        throw std::runtime_error("cannot write " + path.string());
+    const auto data = out.str();
+    atomicWrite(path, data.data(), data.size());
+}
+
+Vc3dLease::Vc3dLease(const fs::path& volumeDir)
+    : path_(volumeDir.parent_path() / ("." + volumeDir.filename().string() + ".vc_cache.lock"))
+{
+}
+
+Vc3dLease::~Vc3dLease() { release(); }
+
+bool Vc3dLease::acquire()
+{
+#ifdef _WIN32
+    return false;  // no flock: VC3D caches are not shared
+#else
+    const int fd = ::open(path_.c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0666);
+    if (fd < 0)
+        return false;
+    if (::flock(fd, LOCK_SH | LOCK_NB) != 0) {
+        ::close(fd);
+        return false;
+    }
+    fd_ = fd;
+    return true;
+#endif
+}
+
+void Vc3dLease::release()
+{
+#ifndef _WIN32
+    if (fd_ >= 0)
+        ::close(fd_);  // closing the descriptor drops the flock
+#endif
+    fd_ = -1;
+}
+
+LayerSpec CacheLayer::spec() const
+{
+    return LayerSpec{kind, root, stored.codec(), emptyRoot, allowLossy};
+}
+
+std::vector<fs::path> cacheRoots(const std::vector<std::string>& cacheDirs)
+{
+    std::vector<fs::path> roots;
+    for (const auto& d : cacheDirs) {
+        if (d == kVc3d) {
+            if (auto r = vc3dCacheRoot())
+                roots.push_back(*r);
+        } else {
+            const char* home = std::getenv("HOME");
+            roots.push_back(d.starts_with("~/") && home ? fs::path(home) / d.substr(2) : fs::path(d));
+        }
+    }
+    return roots;
+}
+
+std::optional<Json> cachedSourceZarray(const std::vector<std::string>& cacheDirs, const std::string& url,
+                                       const std::optional<std::string>& groupUrl,
+                                       const std::optional<std::string>& levelKey,
+                                       const std::optional<fs::path>& vc3dVolumeDir)
+{
+    std::optional<Json> fallback;
+    auto fromVc3d = [&](const fs::path& vdir) -> std::optional<Json> {
+        auto stored = readJson(vdir / *levelKey / ".zarray");
+        if (stored) {
+            std::error_code ec;
+            if (!fs::exists(vdir / kDelta3dMarker, ec))
+                return stored;
+            if (!fallback)
+                fallback = stored;
+        }
+        return std::nullopt;
+    };
+    if (vc3dVolumeDir && levelKey)
+        if (auto exact = fromVc3d(*vc3dVolumeDir))
+            return exact;
+    for (const auto& root : cacheRoots(cacheDirs)) {
+        if (groupUrl && levelKey && !vc3dVolumeDir)
+            if (const auto vdir = vc3dDir(root, *groupUrl))
+                if (auto exact = fromVc3d(*vdir))
+                    return exact;
+        const auto droot = decodedCachePath(root, url);
+        const auto attrs = readJson(droot / ".zattrs");
+        if (attrs && attrs->contains("vc_reader")) {
+            const auto source = attrs->at("vc_reader").value("source_zarray", Json());
+            if (!source.is_null() && !source.empty())
+                return std::optional<Json>{source};
+        }
+        if (auto stored = readJson(droot / ".zarray"); stored && !fallback)
+            fallback = stored;
+    }
+    return fallback;
+}
+
+std::vector<fs::path> cachedNodeDirs(const std::vector<std::string>& cacheDirs, const std::string& url)
+{
+    std::vector<fs::path> out;
+    for (const auto& root : cacheRoots(cacheDirs)) {
+        std::error_code ec;
+        if (const auto d = decodedCachePath(root, url); fs::is_directory(d, ec))
+            out.push_back(d);
+        std::string parent = url;
+        while (!parent.empty() && parent.back() == '/')
+            parent.pop_back();
+        std::vector<std::string> rel;
+        while (true) {
+            const auto scheme = parent.find("://");
+            const auto after = scheme == std::string::npos ? 0 : scheme + 3;
+            if (parent.find('/', after) == std::string::npos)
+                break;
+            if (const auto vdir = vc3dDir(root, parent)) {
+                fs::path d = *vdir;
+                for (auto it = rel.rbegin(); it != rel.rend(); ++it)
+                    d /= *it;
+                if (fs::is_directory(d, ec))
+                    out.push_back(d);
+                break;
+            }
+            const auto slash = parent.rfind('/');
+            rel.push_back(parent.substr(slash + 1));
+            parent.erase(slash);
+        }
+    }
+    return out;
+}
+
+Layers openLayers(const std::vector<std::string>& cacheDirs, const std::string& url, const ArrayMeta& source,
+                  const LayerOptions& options)
+{
+    std::vector<fs::path> roots;
+    for (const auto& r : cacheRoots(cacheDirs)) {
+        std::error_code ec;
+        const auto canonical = fs::weakly_canonical(r, ec);
+        roots.push_back(ec ? r : canonical);
+    }
+    Layers out;
+    const bool vc3dWritable = options.writable;
+    const CachePolicy policy{cacheDirs, options.vc3dVolumeDir, options.maxBytes, options.minFreeBytes};
+    if (options.vc3dVolumeDir && options.levelKey) {
+        std::error_code ec;
+        if (fs::is_directory(*options.vc3dVolumeDir, ec))
+            if (auto layer = vc3dLayer(*options.vc3dVolumeDir, *options.levelKey, source, options.allowLossy, vc3dWritable, out.busy, policy))
+                out.layers.push_back(std::move(*layer));
+    }
+    for (const auto& root : roots) {
+        if (options.groupUrl && options.levelKey && !options.vc3dVolumeDir)
+            if (const auto vdir = vc3dDir(root, *options.groupUrl))
+                if (auto layer = vc3dLayer(*vdir, *options.levelKey, source, options.allowLossy, vc3dWritable, out.busy, policy))
+                    out.layers.push_back(std::move(*layer));
+        if (auto layer = decodedLayer(decodedCachePath(root, url), source, url, false, policy, false, options.allowLossy))
+            out.layers.push_back(std::move(*layer));
+    }
+    if (!options.writable)
+        return out;
+    // Keep writing the selected VC3D format when a byte limit is configured.
+    // Its budget spans the volume directories under the same cache root.
+    if (!out.layers.empty() && out.layers.front().kind.starts_with("vc3d-")) {
+        const auto root=fs::path(out.layers.front().root).parent_path().parent_path();
+        std::error_code ec;
+        if (options.maxBytes || fs::is_regular_file(root / ".vc_reader_cache.sqlite3",ec))
+            out.layers.front().budgetRoot=root.string();
+        out.writer=0;
+        return out;
+    }
+    std::optional<fs::path> configured;
+    for (const auto& root : roots) {
+        std::error_code ec;
+        if (fs::is_regular_file(root / ".vc_reader_cache.sqlite3", ec)) {
+            configured = root;
+            break;
+        }
+    }
+    if (options.maxBytes || configured) {
+        std::optional<fs::path> root = configured;
+        if (options.maxBytes) {
+            root.reset();
+            for (const auto& d : cacheDirs)
+                if (d != kVc3d) {
+                    std::error_code ec;
+                    const auto r = cacheRoots({d}).front();
+                    const auto canonical = fs::weakly_canonical(r, ec);
+                    root = ec ? r : canonical;
+                    break;
+                }
+            if (!root)
+                throw std::invalid_argument("cache_max_bytes needs an explicit decoded cache directory (not only 'vc3d')");
+        }
+        const auto target = decodedCachePath(*root, url).string();
+        auto writer = std::find_if(out.layers.begin(), out.layers.end(),
+                                   [&](const CacheLayer& l) { return l.kind == "decoded" && l.root == target; });
+        if (writer == out.layers.end()) {
+            auto layer = decodedLayer(target, source, url, true, policy, options.compress, options.allowLossy);
+            if (!layer) {
+                std::error_code ec;
+                if (fs::is_regular_file(fs::path(target) / ".zarray", ec))
+                    throw std::invalid_argument("bounded cache " + target + " is lossy; use a different cache directory");
+                return out;  // the disk policy refused the layer's documents: nothing is cached here
+            }
+            out.layers.push_back(std::move(*layer));
+            writer = std::prev(out.layers.end());
+        }
+        writer->budgetRoot = root->string();
+        out.writer = int(writer - out.layers.begin());
+        return out;
+    }
+    if (!out.layers.empty()) {
+        out.writer = 0;
+        return out;
+    }
+    if (roots.empty())
+        return out;
+    if (auto layer = decodedLayer(decodedCachePath(roots.front(), url), source, url, true, policy, options.compress)) {
+        out.layers.push_back(std::move(*layer));
+        out.writer = 0;
+    }
+    return out;
+}
+
+}  // namespace vcr::zarr

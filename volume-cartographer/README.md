@@ -15,6 +15,15 @@ this repository (developed and maintained by the Vesuvius Challenge team).
 The original Volume Cartographer is a general purpose toolkit for virtual unwrapping, while this version is specialized for the frontier challenges of the Herculaneum papyri.
 
 ### Installation Instructions
+
+Debian/Ubuntu builds use `scripts/install_build_deps.sh minimal-build` for the
+required system packages. The Docker CI builder uses the `ci-tooling` profile,
+which additionally installs compiler/debugging tools and AWS CLI. The installer
+requires root or sudo; in agent mode (`AGENTS_AGENT_MODE=1`) installation also
+requires `AGENTS_ALLOW_INSTALL=1`. `build_from_src_debian.sh` invokes the minimal
+profile, then configures, builds and installs VC3D. Validate installer behavior
+without provisioning with `python3 scripts/test_install_build_deps.py`.
+
 Due to a complex set of dependencies, it is *highly* recommended to use a prebuilt package: the release downloads described below (Linux, Windows, macOS) or the docker image. We host an image on the [github container registry](https://github.com/ScrollPrize/villa/pkgs/container/villa%2Fvolume-cartographer) which can be pulled with a simple command :
 
 ```bash
@@ -104,7 +113,7 @@ cmake --preset windows-msvc
 cmake --build build\windows-msvc
 ```
 
-The first configure builds the dependency closure (Qt, OpenCV, Ceres, CGAL, ...)
+The first configure builds the dependency closure (Qt, OpenCV, Ceres, ...)
 from source via vcpkg — this takes a while, but later configures restore it from
 vcpkg's binary cache. The result is `build\windows-msvc\bin\VC3D.exe` with the Qt
 plugins and dependency DLLs deployed alongside it, runnable in place. To work in
@@ -319,9 +328,9 @@ the decoded chunk cache in bytes (default 1e9) and `thread_limit` the number
 of OpenMP threads. The tracer reads the voxel size from the volume's
 `metadata.json` (`voxelsize: 45.532` in the log) and writes the segment to
 `out/auto_grown_<timestamp>/` as `x.tif`, `y.tif`, `z.tif`, `generations.tif`
-and `meta.json`. It also keeps a copy of every chunk it fetches in VC3D's
-remote cache directory, `~/.VC3D/remote_cache/<volume>-<id>/` unless
-`remote_cache_dir` under `[viewer]` in `~/.VC3D/VC3D.ini` points elsewhere,
+and `meta.json`. It also keeps a copy of every chunk it fetches under VC3D's
+remote cache root (`~/.VC3D/remote_cache` unless `cache.json` or
+`remote_cache_dir` under `[viewer]` in `~/.VC3D/VC3D.ini` says otherwise),
 and later runs on the same volume read from there. On this volume the eight
 generations take ten to twenty seconds on a 14-core workstation and fetch
 about 2 MiB the first time.
@@ -347,13 +356,10 @@ This writes `render/00.tif` (360×360 pixels for the segment above, about
 17 MiB fetched). Things to know:
 
 - `-v` takes the URL itself, and nothing is written under a local directory.
-  `--remote-url` is a deprecated alias for the same locator: alone it fills
-  `-v`, next to an equal `-v` it warns, next to a different one it is an
-  error. Since #1657 the renderer opens the remote volume the same way the
-  tracer does, so the chunks it fetches persist in the shared remote cache
-  (`~/.VC3D/remote_cache/<volume>-<id>/`, or `remote_cache_dir` under
-  `[viewer]` in `VC3D.ini`); `--cache-gb` (default 16) sizes the process-wide
-  decoded-chunk cache and `--prefetch-remote` warms it before rendering starts.
+  Since #1657 the renderer opens the remote volume the same way the
+  tracer does, so the chunks it fetches persist in the shared remote cache root; `--cache-gb` (default 16) sizes the volume's
+  decoded-chunk memory cache. The renderer fetches only the chunks its samples
+  read, in parallel.
 - The renderer reads the voxel size from the remote volume's metadata, as the
   tracer does: without `--voxel-size` the log says
   `Voxel size (from volume metadata): 45.532` and the TIFF carries the
@@ -364,7 +370,7 @@ This writes `render/00.tif` (360×360 pixels for the segment above, about
 - `-g` selects the pyramid level: `-g 3` renders the same segment at 1/8
   scale (45×45 pixels, about 4 MiB fetched). A level the remote pyramid does
   not have fails immediately with
-  `Error: group index 6 not available in remote zarr (present levels: 0 1 2 3 4 5)`.
+  `Error opening remote zarr: group index 6: ...`.
 - The `#vc-base-scale=N` selector described above applies to the tracer as
   well: with `#vc-base-scale=2` it reports
   `zarr dataset size for scale group 0 [1017, 566, 566]` and
@@ -435,11 +441,6 @@ _Primary entry point for interacting with the segmentation, more info in [extend
   - `Radius` : the radius of the area to be affected by the action
   - `Sigma` : the _strength_ of the action on affected vertices other the original one (aka how quickly the influence tapers as we step away from the original point)
   - `Step` (`Push/Pull` only) : The step size (in world units) to take along the surface normal for each push/pull action
-- `Direction Fields`
-  - `Zarr folder` : the path containing the direction field you want to use for optimization (ex: `/path/to/fiber-directions.zarr/horizontal`) _these are optional_
-    - `Orientation` : the orientation/type of the direction field (normal, horizontal, or vertical)
-    - `Scale level` : the zarr resolution from which these were computed
-    - `Weight` : the weight to apply to the field when optimizing.
 - `Corrections` : group which controls / manages the "correction points" for the current growth session
   - `Active set` : chooses an existing correction set to apply
   - `New correction set` : creates a new point collection containing a single "correction"

@@ -52,7 +52,7 @@ private slots:
         }
         std::array<CompositeParams, 3> transfer;
         for (auto& p : transfer) {
-            p.alphaOpacity = .25;
+            p.options.alphaOpacity = .25;
             p.tfGamma = 1;
         }
         QMatrix4x4 matrix;

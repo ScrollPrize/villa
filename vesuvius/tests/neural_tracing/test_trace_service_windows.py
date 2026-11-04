@@ -1,5 +1,5 @@
-"""trace_service without the CUDA extras and on every platform: it imports without cupy/cuCIM (only heatmap blob
-detection needs them, and says so), serves one JSON line per connection over AF_UNIX (Windows: Winsock through ws2_32),
+"""trace_service without the CUDA extras and on every platform: it imports and detects heatmap blobs without
+cupy/cuCIM, serves one JSON line per connection over AF_UNIX (Windows: Winsock through ws2_32),
 and its --parent_pid watch follows the process VC3D passed. No checkpoint, no GPU."""
 import json
 import os
@@ -47,12 +47,15 @@ def test_service_imports_without_cupy(monkeypatch):
     assert service.COPY_REQUEST_TYPE == "displacement_copy_grow"
 
 
-def test_heatmap_blob_detection_names_cupy_when_missing(monkeypatch):
+def test_heatmap_blob_detection_without_cupy(monkeypatch):
     _import_service(monkeypatch)
     from vesuvius.neural_tracing.infer import Inference
 
-    with pytest.raises(ImportError, match="cupy"):
-        Inference.get_blob_coordinates(None, torch.zeros(4, 4, 4), torch.zeros(3))
+    assert Inference.get_blob_coordinates(None, torch.zeros(4, 4, 4), torch.zeros(3)).shape == (0, 3)
+    heatmap = torch.zeros(8, 8, 8)
+    heatmap[2:4, 3:5, 4:6] = 1  # one 8-voxel blob centred at (2.5, 3.5, 4.5)
+    centroid = Inference.get_blob_coordinates(None, heatmap, torch.tensor([10, 20, 30]), min_size=8)
+    torch.testing.assert_close(centroid, torch.tensor([[12.5, 23.5, 34.5]]))
 
 
 def test_one_json_line_per_connection(monkeypatch):

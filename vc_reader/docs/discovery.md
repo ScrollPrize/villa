@@ -1,8 +1,7 @@
 # Scroll-centered discovery and paired reading
 
-The catalog and public views use the standard library. `load()` reads catalog
-metadata; navigating an already loaded catalog does not request arrays or
-import NumPy, compiled extensions, Pillow, or PyTorch.
+The catalog and its views are `vcr::catalog` in C++, bound here. `load()` reads catalog
+metadata; navigating an already loaded catalog does not request arrays.
 
 ## Collections and relationships
 
@@ -148,7 +147,7 @@ out-of-bounds requests with fill values and separate geometric validity;
 
 Published storage transforms resolve pixel grids. Labels and companion masks
 select matching stored grids independently; a missing matching grid uses the
-known affine and exact categorical nearest-neighbor sampling (ties to even).
+known affine and exact categorical nearest-neighbor sampling (half-voxel ties round up).
 Level numbers across different pyramids are not assumed equivalent. Unknown
 transforms fail when required to relate grids. Layer depth is never interpreted
 as original-volume Z and 2D labels are never repeated through it.

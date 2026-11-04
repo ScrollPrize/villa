@@ -1,16 +1,13 @@
 #include "UnifiedBrowserDialog.hpp"
-#include "utils/sftp_fetch.hpp"
+#include "vc_reader/sftp.hpp"
+#include "vc_reader/zarr.hpp"
 #include <QCheckBox>
 #include <QKeyEvent>
 
-#include "vc/core/util/HttpFetch.hpp"
 #include "vc/core/util/RemoteUrl.hpp"
-#include "vc/core/types/VolumePkg.hpp"
 
 #include <vc_reader/catalog.hpp>
-#include <vc_reader/s3_listing.hpp>
 
-#include <QApplication>
 #include <QButtonGroup>
 #include <QDir>
 #include <QFileInfo>
@@ -23,38 +20,23 @@
 #include <QPushButton>
 #include <QRadioButton>
 #include <QRegularExpression>
-#include <QStandardPaths>
+#include <QSignalBlocker>
 #include <QtConcurrent>
 #include <QUrl>
 #include <QVBoxLayout>
 
 #include <algorithm>
 #include <exception>
-#include <optional>
 #include <vector>
 
 namespace {
 
-bool stringStartsWithAny(const QString& s, std::initializer_list<const char*> needles)
-{
-    for (const auto* n : needles) {
-        if (s.startsWith(QLatin1String(n), Qt::CaseInsensitive)) return true;
-    }
-    return false;
-}
-
+// A remote location vc_reader knows (s3://, s3+REGION://, http(s)://, sftp://, ssh://) naming a host.
 bool isValidRemoteUri(const QString& uri)
 {
+    if (!vcr::zarr::isRemote(uri.toStdString())) return false;
     const QUrl parsed(uri, QUrl::StrictMode);
-    if (!parsed.isValid() || parsed.host().isEmpty()) return false;
-
-    const QString scheme = parsed.scheme().toLower();
-    return scheme == QLatin1String("s3")
-        || scheme.startsWith(QLatin1String("s3+"))
-        || scheme == QLatin1String("http")
-        || scheme == QLatin1String("sftp")
-        || scheme == QLatin1String("ssh")
-        || scheme == QLatin1String("https");
+    return parsed.isValid() && !parsed.host().isEmpty();
 }
 
 bool remoteUriLooksLikeDirectory(const QString& uri)
@@ -107,14 +89,6 @@ QString fileUriToPath(QString uri)
     return QDir::fromNativeSeparators(uri);
 }
 
-// A browsable s3:// location: its bucket's URI ("s3://bucket/",
-// "s3+REGION://bucket/") and the listing of the key prefix below it, at the
-// endpoint the remote transport resolves (vc::resolveRemoteUrl).
-struct S3Location {
-    QString bucketUri;
-    vcr::s3::Prefix listing;  // key is empty at the bucket root, else ends with '/'
-};
-
 struct RemoteEntry {
     QString name;
     QString uri;
@@ -127,85 +101,53 @@ struct RemoteListResult {
     QString error;
 };
 
-std::optional<S3Location> parseS3Url(const QString& input)
-{
-    QString uri = input.trimmed();
-    const int schemeEnd = uri.indexOf(QStringLiteral("://"));
-    if (schemeEnd < 0) return std::nullopt;
-    const QString scheme = uri.left(schemeEnd).toLower();
-    if (scheme != QLatin1String("s3") && !scheme.startsWith(QLatin1String("s3+"))) {
-        return std::nullopt;
-    }
-    uri = scheme + uri.mid(schemeEnd);
-    if (const int queryStart = uri.indexOf('?'); queryStart >= 0) uri = uri.left(queryStart);
-
-    const int bucketEnd = uri.indexOf('/', schemeEnd + 3);
-    const QString bucketUri = bucketEnd >= 0 ? uri.left(bucketEnd) : uri;
-    if (bucketUri.size() == schemeEnd + 3) return std::nullopt;
-    const auto listing = vcr::s3::splitPrefixUrl(vc::resolveRemoteUrl(uri.toStdString()).httpsUrl);
-    if (!listing) return std::nullopt;
-    return S3Location{withTrailingSlash(bucketUri), *listing};
-}
-
-QString displayNameForPrefix(QString name, const QString& parent)
-{
-    if (!parent.isEmpty() && name.startsWith(parent)) name = name.mid(parent.size());
-    while (name.endsWith('/')) name.chop(1);
-    const int slash = name.lastIndexOf('/');
-    if (slash >= 0) name = name.mid(slash + 1);
-    return name + QStringLiteral("/");
-}
-
 // The Open Data catalog's root, whose site files (the manifest, index page,
 // licence and thumbnails) are not data to browse.
-bool shouldHideCatalogRootEntry(const S3Location& loc, const std::string& keyOrPrefix)
+bool isCatalogRoot(const QString& url)
 {
-    if (vcr::s3::objectUrl(loc.listing.origin, loc.listing.key + "metadata.json") !=
-        vcr::catalog::kDefaultManifestUrl) {
-        return false;
-    }
-    QString name = QString::fromStdString(keyOrPrefix).mid(int(loc.listing.key.size()));
-    if (name.endsWith('/')) name.chop(1);
+    const auto manifest = vcr::catalog::openDataS3Url(std::string(vcr::catalog::kDefaultManifestUrl));
+    return manifest &&
+           vcr::catalog::openDataS3Url(withTrailingSlash(url).toStdString() + "metadata.json") == manifest;
+}
+
+bool isCatalogSiteFile(const QString& name)
+{
     return name.compare(QStringLiteral("_thumbnails"), Qt::CaseInsensitive) == 0
         || name.compare(QStringLiteral("index.html"), Qt::CaseInsensitive) == 0
         || name.compare(QStringLiteral("license.txt"), Qt::CaseInsensitive) == 0
         || name.compare(QStringLiteral("metadata.json"), Qt::CaseInsensitive) == 0;
 }
 
-RemoteListResult listS3Prefix(const QString& urlPrefix,
-                              const vc::HttpAuth& auth,
-                              const QString& continuationToken = {})
+// One page of the remote directory at `url`, from vc_reader's listing of an s3:// (or
+// public Open Data) location: subdirectories first, then files; `continuationToken`
+// continues an earlier page.
+RemoteListResult listRemotePage(const QString& url, const QString& continuationToken = {})
 {
     RemoteListResult result;
-    const auto loc = parseS3Url(urlPrefix);
-    if (!loc) {
-        result.error = QObject::tr("Remote browsing supports s3:// bucket URLs.");
-        return result;
-    }
-
-    vcr::s3::ListPage page;
+    const std::string location = url.toStdString();
+    vcr::zarr::Listing page;
     try {
-        page = vcr::s3::parseListPage(vc::httpGetString(
-            vcr::s3::listUrl(loc->listing, "/", continuationToken.toStdString()), auth));
+        const auto access = vcr::zarr::resolveAccess(location);
+        page = vcr::zarr::listPage(access, location, {}, continuationToken.toStdString());
+    } catch (const std::invalid_argument&) {
+        result.error = QObject::tr("Browsing is available for s3:// buckets and sftp:// hosts. Paste a full URL and click Open to attach it directly.");
+        return result;
     } catch (const std::exception& e) {
         result.error = QObject::tr("Could not list bucket: %1").arg(QString::fromUtf8(e.what()));
         return result;
     }
 
-    const QString parent = QString::fromStdString(loc->listing.key);
-    for (const auto& listedPrefix : page.commonPrefixes) {
-        if (shouldHideCatalogRootEntry(*loc, listedPrefix)) continue;
-        const QString prefix = QString::fromStdString(listedPrefix);
-        result.entries.push_back({displayNameForPrefix(prefix, parent), loc->bucketUri + prefix, true});
+    const QString base = withTrailingSlash(url);
+    const bool catalogRoot = isCatalogRoot(url);
+    for (const auto& child : page.children) {
+        const QString name = QString::fromStdString(child);
+        if (catalogRoot && isCatalogSiteFile(name)) continue;
+        result.entries.push_back({name + QStringLiteral("/"), base + name + QStringLiteral("/"), true});
     }
     for (const auto& object : page.objects) {
-        if (shouldHideCatalogRootEntry(*loc, object.key)) continue;
-        const QString key = QString::fromStdString(object.key);
-        if (key == parent) continue;
-        QString name = key;
-        if (!parent.isEmpty() && name.startsWith(parent)) name = name.mid(parent.size());
-        if (name.contains('/')) continue;
-        result.entries.push_back({name, loc->bucketUri + key, false});
+        const QString name = QString::fromStdString(object.key);
+        if (catalogRoot && isCatalogSiteFile(name)) continue;
+        result.entries.push_back({name, base + name, false});
     }
     result.nextToken = QString::fromStdString(page.nextContinuationToken);
 
@@ -325,8 +267,16 @@ void UnifiedBrowserDialog::setStartUri(const QString& uri, bool isFile)
     if (uri.isEmpty()) return;
     const QString trimmed = uri.trimmed();
     const Mode m = detectModeFromUri(trimmed);
+    // Checking a radio fires onModeChanged, which lists the current location
+    // (the Open Data bucket at first) before the requested one is navigated.
+    {
+        const QSignalBlocker localSignals(_localRadio);
+        const QSignalBlocker remoteSignals(_remoteRadio);
+        (m == Mode::Remote ? _remoteRadio : _localRadio)->setChecked(true);
+    }
+    _mode = m;
+    _selectedUri.clear();
     if (m == Mode::Remote) {
-        _remoteRadio->setChecked(true);
         if (isFile && _acceptsFiles) {
             navigateRemote(trimmed.left(trimmed.lastIndexOf('/') + 1));
             _pathBar->setText(trimmed);
@@ -335,7 +285,6 @@ void UnifiedBrowserDialog::setStartUri(const QString& uri, bool isFile)
             navigateRemote(withTrailingSlash(trimmed));
         }
     } else {
-        _localRadio->setChecked(true);
         QString p = fileUriToPath(trimmed);
         QFileInfo fi(p);
         if (fi.isFile()) p = fi.absolutePath();
@@ -345,8 +294,7 @@ void UnifiedBrowserDialog::setStartUri(const QString& uri, bool isFile)
 
 UnifiedBrowserDialog::Mode UnifiedBrowserDialog::detectModeFromUri(const QString& uri)
 {
-    if (stringStartsWithAny(uri, {"s3://", "s3+", "http://", "https://", "sftp://", "ssh://"})) return Mode::Remote;
-    return Mode::Local;
+    return vcr::zarr::isRemote(uri.toStdString()) ? Mode::Remote : Mode::Local;
 }
 
 void UnifiedBrowserDialog::onModeChanged()
@@ -453,27 +401,6 @@ void UnifiedBrowserDialog::navigateLocal(const QString& absDir)
     _status->setText(tr("%1 items").arg(shown));
 }
 
-bool UnifiedBrowserDialog::ensureRemoteAuth(const QString& probeUrl)
-{
-    if (utils::is_sftp_url(probeUrl.toStdString())) return true;
-    if (_authResolved && probeUrl == _authProbeUrl) return true;
-    if (!_authResolver) {
-        // No resolver — proceed with empty auth (works for fully public buckets).
-        _auth = {};
-        _authResolved = true;
-        _authProbeUrl = probeUrl;
-        return true;
-    }
-    QString err;
-    if (!_authResolver(probeUrl, &_auth, &err)) {
-        _status->setText(tr("Auth failed: %1").arg(err));
-        return false;
-    }
-    _authResolved = true;
-    _authProbeUrl = probeUrl;
-    return true;
-}
-
 void UnifiedBrowserDialog::navigateRemote(const QString& urlPrefix)
 {
     ++_listSeq;
@@ -485,25 +412,11 @@ void UnifiedBrowserDialog::navigateRemote(const QString& urlPrefix)
     _list->clear();
     _status->setText(tr("Loading..."));
 
-    const bool hasScheme =
-        utils::is_sftp_url(_currentRemoteUrl.toStdString()) ||
-        _currentRemoteUrl.startsWith(QLatin1String("s3://"), Qt::CaseInsensitive)
-        || _currentRemoteUrl.startsWith(QLatin1String("s3+"), Qt::CaseInsensitive)
-        || _currentRemoteUrl.startsWith(QLatin1String("http://"), Qt::CaseInsensitive)
-        || _currentRemoteUrl.startsWith(QLatin1String("https://"), Qt::CaseInsensitive);
-    if (!hasScheme || _currentRemoteUrl == QLatin1String("s3://")) {
+    if (!vcr::zarr::isRemote(_currentRemoteUrl.toStdString()) || _currentRemoteUrl == QLatin1String("s3://")) {
         _status->setText(tr("Need a bucket name (e.g. s3://your-bucket/) or full URL"));
         return;
     }
 
-    if (!parseS3Url(_currentRemoteUrl) && !utils::is_sftp_url(_currentRemoteUrl.toStdString())) {
-        _status->setText(tr("Browsing is available for s3:// buckets and sftp:// hosts. Paste a full URL and click Open to attach it directly."));
-        return;
-    }
-
-    if (!ensureRemoteAuth(_currentRemoteUrl)) {
-        return;
-    }
 
     auto* watcher = new QFutureWatcher<RemoteListResult>(this);
     connect(watcher, &QFutureWatcher<RemoteListResult>::finished, this, [this, watcher, mySeq]() {
@@ -545,15 +458,16 @@ void UnifiedBrowserDialog::navigateRemote(const QString& urlPrefix)
             ? tr("%1 items").arg(shown)
             : tr("%1 items; more available").arg(shown));
     });
-    watcher->setFuture(QtConcurrent::run([url = _currentRemoteUrl, auth = _auth]() {
-        if (utils::is_sftp_url(url.toStdString())) {
+    watcher->setFuture(QtConcurrent::run([url = _currentRemoteUrl]() {
+        if (vcr::sftp::isSftpUrl(url.toStdString())) {
             RemoteListResult result;
-            for (const auto& entry : utils::list_sftp_directory(url.toStdString()))
+            static vcr::sftp::Fetcher fetcher;
+            for (const auto& entry : fetcher.list(url.toStdString()))
                 result.entries.push_back({QString::fromStdString(entry.name),
                     QString::fromStdString(entry.url), entry.directory});
             return result;
         }
-        return listS3Prefix(url, auth);
+        return listRemotePage(url);
     }));
 }
 
@@ -565,7 +479,6 @@ void UnifiedBrowserDialog::onItemDoubleClicked(QListWidgetItem* item)
     const QString continuationToken = item->data(Qt::UserRole + 2).toString();
     if (!continuationToken.isEmpty() && _mode == Mode::Remote) {
         _status->setText(tr("Loading more..."));
-        if (!ensureRemoteAuth(_currentRemoteUrl)) return;
         auto* loadMoreItem = item;
         auto* watcher = new QFutureWatcher<RemoteListResult>(this);
         const std::uint64_t mySeq = _listSeq;
@@ -602,8 +515,8 @@ void UnifiedBrowserDialog::onItemDoubleClicked(QListWidgetItem* item)
             }
             _status->setText(tr("%1 items").arg(_list->count() - (result.nextToken.isEmpty() ? 0 : 1)));
         });
-        watcher->setFuture(QtConcurrent::run([url = _currentRemoteUrl, auth = _auth, continuationToken]() {
-            return listS3Prefix(url, auth, continuationToken);
+        watcher->setFuture(QtConcurrent::run([url = _currentRemoteUrl, continuationToken]() {
+            return listRemotePage(url, continuationToken);
         }));
         return;
     }

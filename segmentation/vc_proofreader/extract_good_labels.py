@@ -39,10 +39,11 @@ from __future__ import annotations
 
 import argparse
 import os
+from functools import lru_cache
 from typing import Optional, Sequence, Tuple, Iterable
 
 import numpy as np
-import zarr
+from vc_reader.reader import ZarrReader, ZarrWriter, open_node
 
 try:
     import cc3d
@@ -70,22 +71,21 @@ def worker_task(args_tuple):
     """Top-level worker function to allow multiprocessing pickling.
 
     Args tuple contains:
-      (input_path, output_path, array_key,
+      (input_path, out_a, array_key,
        z, y, x, cz, cy, cx,
        min_cc, max_cc, min_percent, max_percent,
        require_nonzero, target_value, connectivity, reject_branches)
     Returns (counted_chunks, written_chunks, branch_rejected_count) for aggregation.
     """
     (
-        input_path, output_path, array_key,
+        input_path, out_a, array_key,
         z, y, x, cz, cy, cx,
         min_cc, max_cc, min_percent, max_percent,
         require_nonzero, target_value, connectivity, reject_branches,
     ) = args_tuple
 
-    # Re-open arrays in each process
+    # Opened once per process
     in_a = open_ome_zarr_array(input_path, array_key=array_key)
-    out_a = zarr.open(output_path, mode='r+')
 
     zs, ys, xs = slice(z, z + cz), slice(y, y + cy), slice(x, x + cx)
     chunk = in_a[zs, ys, xs]
@@ -165,25 +165,24 @@ def _as_zyx_size(size: int | Sequence[int]) -> Tuple[int, int, int]:
     return tuple(int(s) for s in size)  # type: ignore[return-value]
 
 
-def open_ome_zarr_array(path: str, array_key: Optional[str] = None) -> zarr.Array:
-    root = zarr.open(path, mode='r')
-    if isinstance(root, zarr.Array):
+@lru_cache(maxsize=None)
+def open_ome_zarr_array(path: str, array_key: Optional[str] = None) -> ZarrReader:
+    root = open_node(path)
+    if isinstance(root, ZarrReader):
         return root
-    if not isinstance(root, zarr.hierarchy.Group):
-        raise ValueError(f"Unsupported zarr object at {path!r}")
     if array_key is not None:
         arr = root.get(array_key)
-        if arr is None or not isinstance(arr, zarr.Array):
+        if not isinstance(arr, ZarrReader):
             raise ValueError(f"Array key {array_key!r} not found in group at {path!r}")
         return arr
     # Default to multiscale level '0' if present
-    if '0' in root and isinstance(root['0'], zarr.Array):
+    if isinstance(root.get('0'), ZarrReader):
         return root['0']
     # Fallback: pick the first array child
-    for k, v in root.items():
-        if isinstance(v, zarr.Array):
-            return v
-    raise ValueError(f"No array found in group at {path!r}; keys: {list(root.keys())}")
+    arrays = root.array_keys()
+    if arrays:
+        return root[arrays[0]]
+    raise ValueError(f"No array found in group at {path!r}; keys: {root.keys()}")
 
 
 def prepare_output_array(
@@ -192,22 +191,22 @@ def prepare_output_array(
     dtype: np.dtype,
     chunks: Optional[Tuple[int, int, int]] = None,
     write_empty_chunks: bool = False,
-) -> zarr.Array:
+) -> ZarrWriter:
     # Use provided chunks; else default to full-shape (not ideal). Caller should pass chunk_size.
     if chunks is None:
         chunks = tuple(min(128, s) for s in shape)
 
-    compressor = zarr.Blosc(cname='zstd', clevel=3, shuffle=zarr.Blosc.BITSHUFFLE)
-    arr = zarr.open(
+    return ZarrWriter.create(
         path,
-        mode='w',
         shape=shape,
         chunks=chunks,
         dtype=dtype,
-        compressor=compressor,
-        write_empty_chunks=write_empty_chunks,
+        cname='zstd',
+        level=3,
+        shuffle=2,
+        overwrite=True,
+        skip_empty=not write_empty_chunks,
     )
-    return arr
 
 
 def count_connected_components(mask: np.ndarray, connectivity: int = 26) -> int:
@@ -317,7 +316,7 @@ def process(
             # Pack all required args for worker
             arg_items = [
                 (
-                    input_path, output_path, array_key,
+                    input_path, out_arr, array_key,
                     z, y, x, cz, cy, cx,
                     min_cc, max_cc, min_percent, max_percent,
                     require_nonzero, target_value, connectivity,
@@ -348,7 +347,7 @@ def process(
             it = coord_list
         for (z, y, x) in it:
             d, w, b = worker_task((
-                input_path, output_path, array_key,
+                input_path, out_arr, array_key,
                 z, y, x, cz, cy, cx,
                 min_cc, max_cc, min_percent, max_percent,
                 require_nonzero, target_value, connectivity,

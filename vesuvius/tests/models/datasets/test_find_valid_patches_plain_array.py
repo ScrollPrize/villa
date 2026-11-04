@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import numpy as np
 import pytest
-import zarr
+from vc_reader.reader import ZarrWriter, create_group, open_group, open_zarr
 
 from vesuvius.models.datasets.find_valid_patches import find_valid_patches
 
@@ -19,19 +19,16 @@ def _labels() -> np.ndarray:
     return data
 
 
-def _plain_array(data: np.ndarray):
-    arr = zarr.open(mode="w", shape=data.shape, chunks=PATCH, dtype=data.dtype)
-    arr[...] = data
-    return arr
+def _plain_array(path, data: np.ndarray):
+    ZarrWriter.create(path / "plain.zarr", shape=data.shape, chunks=PATCH, dtype=data.dtype)[...] = data
+    return open_zarr(path / "plain.zarr")
 
 
-def _group(levels: dict):
-    group = zarr.open_group(mode="w")
+def _group(path, levels: dict):
+    group = create_group(path / "group.zarr")
     for key, data in levels.items():
-        create = getattr(group, "create_array", None) or group.create_dataset
-        arr = create(key, shape=data.shape, chunks=PATCH, dtype=data.dtype)
-        arr[...] = data
-    return group
+        group.create_array(key, shape=data.shape, chunks=PATCH, dtype=data.dtype)[...] = data
+    return open_group(path / "group.zarr")
 
 
 def _starts(label_obj, level: int):
@@ -43,18 +40,18 @@ def _starts(label_obj, level: int):
 
 
 @pytest.mark.parametrize("level", [1, 2])
-def test_plain_array_falls_back_to_full_resolution(level):
-    starts = _starts(_plain_array(_labels()), level)
+def test_plain_array_falls_back_to_full_resolution(tmp_path, level):
+    starts = _starts(_plain_array(tmp_path, _labels()), level)
     assert starts == [(0, 0, 0)]
     for start in starts:
         assert all(s + p <= n for s, p, n in zip(start, PATCH, SHAPE))
 
 
-def test_plain_array_at_level_zero_is_unchanged():
-    assert _starts(_plain_array(_labels()), 0) == [(0, 0, 0)]
+def test_plain_array_at_level_zero_is_unchanged(tmp_path):
+    assert _starts(_plain_array(tmp_path, _labels()), 0) == [(0, 0, 0)]
 
 
-def test_multiscale_group_still_uses_requested_level():
+def test_multiscale_group_still_uses_requested_level(tmp_path):
     data = _labels()
-    group = _group({"0": data, "1": data[::2, ::2, ::2]})
+    group = _group(tmp_path, {"0": data, "1": data[::2, ::2, ::2]})
     assert _starts(group, 1) == [(0, 0, 0)]

@@ -135,10 +135,10 @@ def require_running(proc: VC3DProcess, results: Results, context: str) -> None:
 
 
 def create_test_volume(volume: Path, volume_id: str) -> Path:
-    level = volume / "0"
-    level.mkdir(parents=True)
+    from vc_reader.reader import ZarrWriter
+
+    volume.mkdir(parents=True)
     (volume / ".zgroup").write_text(json.dumps({"zarr_format": 2}))
-    (volume / ".zattrs").write_text(json.dumps({}))
     (volume / "meta.json").write_text(json.dumps({
         "type": "vol",
         "uuid": volume_id,
@@ -151,17 +151,7 @@ def create_test_volume(volume: Path, volume_id: str) -> Path:
         "min": 0.0,
         "max": 255.0,
     }))
-    (level / ".zarray").write_text(json.dumps({
-        "zarr_format": 2,
-        "shape": [16, 16, 16],
-        "chunks": [16, 16, 16],
-        "dtype": "|u1",
-        "compressor": None,
-        "fill_value": 0,
-        "order": "C",
-        "filters": None,
-        "dimension_separator": ".",
-    }))
+    ZarrWriter.create(volume / "0", shape=(16, 16, 16), chunks=(16, 16, 16), dtype="|u1", compressor=None)
     return volume
 
 
@@ -287,10 +277,10 @@ def check_rpc_describe(
         coverage = description.get("coverage", {})
         complete = (
             description.get("undocumented") == []
-            and coverage.get("described") == 100
-            and coverage.get("registered") == 100
+            and coverage.get("described") == 99
+            and coverage.get("registered") == 99
             and coverage.get("complete") is True
-            and len(snapshot["methods"]) == 100
+            and len(snapshot["methods"]) == 99
         )
         rendered = json.dumps(snapshot, indent=2, sort_keys=True) + "\n"
         if update_snapshot:
