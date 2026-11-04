@@ -6,8 +6,13 @@ from dataclasses import dataclass
 from typing import Mapping
 
 import numpy as np
-from scipy import ndimage
 from scipy.spatial import cKDTree
+
+import vc_reader.transforms as A
+from vc_reader.geometry import fill_holes, label_components
+
+# Nearest voxel of a mask for every voxel (scipy distance_transform_edt indices).
+_NEAREST = A.DistanceTransform(mode="outside", indices="_nearest", implicit_background=True)
 
 from vesuvius.neural_tracing.datasets.common import voxelize_surface_grid_masked
 
@@ -40,19 +45,6 @@ def _config_float(config: Mapping[str, object], key: str, default: float) -> flo
 
 def _config_int(config: Mapping[str, object], key: str, default: int) -> int:
     return int(config.get(key, default))
-
-
-def _ball_structure(radius: float) -> np.ndarray:
-    radius = float(radius)
-    if radius <= 0.0:
-        return np.ones((1, 1, 1), dtype=bool)
-    ceil_radius = int(math.ceil(radius))
-    zz, yy, xx = np.mgrid[
-        -ceil_radius : ceil_radius + 1,
-        -ceil_radius : ceil_radius + 1,
-        -ceil_radius : ceil_radius + 1,
-    ]
-    return (zz * zz + yy * yy + xx * xx) <= radius * radius
 
 
 def _finite_in_crop(surface: np.ndarray, crop_size: tuple[int, int, int]) -> np.ndarray:
@@ -97,7 +89,7 @@ def _keep_components_touching_source_and_target(
     target_mask: np.ndarray,
     debug: dict,
 ) -> np.ndarray:
-    labels, num_labels = ndimage.label(domain)
+    labels, num_labels = label_components(domain, connectivity=6, threads=1)
     debug["connected_component_count"] = int(num_labels)
     if num_labels == 0:
         debug["source_to_target_connected_component_count"] = 0
@@ -143,14 +135,14 @@ def _connector_domain(
     debug["bridge_voxels_raw"] = int(bridge.sum())
 
     if dilation_radius > 0.0:
-        bridge = ndimage.binary_dilation(bridge, structure=_ball_structure(dilation_radius))
+        bridge = A.Morphology("dilate", radius=dilation_radius)(bridge[None])[0]
     if closing_radius > 0.0:
-        bridge = ndimage.binary_closing(bridge, structure=_ball_structure(closing_radius))
+        bridge = A.Morphology("close", radius=closing_radius)(bridge[None])[0]
     debug["bridge_voxels_after_morphology"] = int(bridge.sum())
 
     domain = bridge | source_mask | target_mask
     if bool(config.get("copy_neighbor_fill_domain_holes", True)):
-        domain = ndimage.binary_fill_holes(domain)
+        domain = fill_holes(domain)
 
     if bool(config.get("copy_neighbor_keep_touching_components", True)):
         domain = _keep_components_touching_source_and_target(domain, source_mask, target_mask, debug)
@@ -199,11 +191,7 @@ def _apply_side_hint(
         debug["rejected_by_side_count"] = 0
         return domain
 
-    _, nearest_source_idx = ndimage.distance_transform_edt(
-        ~source_mask,
-        return_distances=True,
-        return_indices=True,
-    )
+    nearest_source_idx = _NEAREST({"mask": source_mask[None]})["mask_nearest"]
     coords = np.indices(domain.shape, dtype=np.float32)
     nearest = nearest_source_idx.astype(np.float32, copy=False)
     offset = coords - nearest
@@ -380,8 +368,9 @@ def build_copy_neighbor_targets(
 
     source_points = source_surface[source_valid]
     target_points = target_surface[target_valid]
-    d_source = ndimage.distance_transform_edt(~source_mask).astype(np.float32, copy=False)
-    d_target = ndimage.distance_transform_edt(~target_mask).astype(np.float32, copy=False)
+    outside_distance = A.DistanceTransform(mode="outside", implicit_background=True)
+    d_source = outside_distance(source_mask[None])[0]
+    d_target = outside_distance(target_mask[None])[0]
     target_edt = d_target.astype(np.float32, copy=False)
 
     domain_builder = str(config.get("copy_neighbor_domain_builder", "connectors"))
@@ -445,11 +434,7 @@ def build_copy_neighbor_targets(
     velocity_weight = (domain & (np.linalg.norm(velocity_dir, axis=0) > 0.0))[None].astype(np.float32, copy=False)
     progress_weight = domain[None].astype(np.float32, copy=False)
 
-    _, nearest_target_idx = ndimage.distance_transform_edt(
-        ~target_mask,
-        return_distances=True,
-        return_indices=True,
-    )
+    nearest_target_idx = _NEAREST({"mask": target_mask[None]})["mask_nearest"]
     coords = np.indices(crop_size, dtype=np.float32)
     nearest_target = nearest_target_idx.astype(np.float32, copy=False)
     surface_attract = (nearest_target - coords).astype(np.float32, copy=False)

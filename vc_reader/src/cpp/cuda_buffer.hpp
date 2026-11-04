@@ -2,6 +2,7 @@
 // Shared ownership for reader outputs and external transform inputs. CUDA
 // operations complete before returning to Python; consumers may use any stream.
 #include "cuda_stream.hpp"
+#include "cuda_pool.hpp"
 #include <cuda_runtime.h>
 #include <cstddef>
 #include <cstdint>
@@ -36,7 +37,7 @@ struct Buffer {
 #if CUDART_VERSION >= 11020
         int supported = 0; check(cudaDeviceGetAttribute(&supported,cudaDevAttrMemoryPoolsSupported,device));
         pooled = supported;
-        if (pooled) { check(cudaMallocAsync(&ptr,n,stream)); return; }
+        if (pooled) { prepare_pool(device); check(cudaMallocAsync(&ptr,n,stream)); return; }
 #endif
         check(cudaMalloc(&ptr,n));
     }

@@ -163,6 +163,8 @@ ListPage parseListPage(std::string_view xml)
             else if (name == "Contents") page.objects.push_back(std::exchange(object, {}));
         } else if (depth == 3 && parent == "Contents") {
             if (name == "Key") object.key = text;
+            else if (name == "ETag") object.etag = text;
+            else if (name == "LastModified") object.lastModified = text;
             else if (name == "Size") {
                 const auto [ptr, ec] = std::from_chars(text.data(), text.data() + text.size(), object.size);
                 if (text.empty() || ec != std::errc{} || ptr != text.data() + text.size())

@@ -1,18 +1,8 @@
 import numpy as np
 import torch
 from typing import Dict, Optional, Tuple
-from skimage.morphology import skeletonize
 from scipy.ndimage import convolve
-
-# Optional acceleration via OpenCV thinning if available
-try:  # pragma: no cover - optional dependency
-    import cv2  # type: ignore
-    _HAS_CV2 = True
-    _HAS_XIMGPROC = hasattr(cv2, 'ximgproc')
-except Exception:  # pragma: no cover
-    cv2 = None  # type: ignore
-    _HAS_CV2 = False
-    _HAS_XIMGPROC = False
+from vc_reader import thinning
 
 from .base_metric import BaseMetric
 
@@ -196,7 +186,7 @@ class SkeletonBranchPointsMetric(BaseMetric):
 
     def _skeletonize_slice(self, mask2d: np.ndarray) -> np.ndarray:
         """Skeletonize a single 2D slice (boolean array) efficiently with ROI cropping.
-        Uses OpenCV ximgproc thinning if available; falls back to skimage.skeletonize.
+        Uses Zhang-Suen thinning (vc_reader), as OpenCV's ximgproc thinning did.
         Returns uint8 array with values {0,1}.
         """
         if not mask2d.any():
@@ -216,14 +206,9 @@ class SkeletonBranchPointsMetric(BaseMetric):
 
         roi = mask2d[y0:y1, x0:x1]
 
-        # Prefer OpenCV thinning for speed if available
-        if _HAS_CV2 and _HAS_XIMGPROC:
-            roi_u8 = (roi.astype(np.uint8)) * 255
-            skel_roi_u8 = cv2.ximgproc.thinning(roi_u8)
-            skel_roi = (skel_roi_u8 > 0).astype(np.uint8)
-        else:
-            # skimage expects boolean
-            skel_roi = skeletonize(roi).astype(np.uint8)
+        # Outside the ROI is background, as for OpenCV's thinning.
+        skel_roi = (thinning.skeletonize(np.ascontiguousarray(roi, dtype=np.uint8), method="zhang_suen",
+                                         preserve_border=False) > 0).astype(np.uint8)
 
         out = np.zeros((H, W), dtype=np.uint8)
         out[y0:y1, x0:x1] = skel_roi

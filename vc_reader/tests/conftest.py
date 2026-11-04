@@ -1,5 +1,8 @@
-"""Shared pytest fixtures."""
+"""Shared pytest fixtures. The build in VC_READER_BUILD_DIR is selected before any test module imports vc_reader."""
 import pytest
+
+from build_support import load_build
+load_build()
 
 
 @pytest.fixture

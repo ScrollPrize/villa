@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+# Stable approval entrypoint; named suites come from local/fiber_tests.json.
+set -euo pipefail
+if (( $# != 0 )); then
+    echo 'This runner takes no arguments. Edit local/fiber_tests.json.' >&2
+    exit 2
+fi
+script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+python_bin="${VILLA_TEST_PYTHON:-/home/hendrik/.venv_las/bin/python}"
+if [[ ! -x "$python_bin" ]]; then
+    echo 'Set VILLA_TEST_PYTHON to an existing Python environment with pytest.' >&2
+    exit 2
+fi
+exec "$python_bin" "${script_dir}/fiber_test_runner.py"

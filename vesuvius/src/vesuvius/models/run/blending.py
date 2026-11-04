@@ -6,16 +6,14 @@ import time
 import traceback
 import warnings
 from collections import defaultdict
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 
-import fsspec
-import numcodecs
 import numpy as np
 from scipy.ndimage import gaussian_filter
 from tqdm.auto import tqdm
 
-from vesuvius.data.utils import open_zarr
-from vesuvius.utils.io.zarr_utils import wait_for_zarr_creation
+from vc_reader.reader import ObjectStore, ZarrWriter, open_zarr
+from vesuvius.utils.io.zarr_utils import mark_zarr_ready, wait_for_zarr_creation
 from vesuvius.utils.k8s import get_tqdm_kwargs
 from vesuvius.utils.cli import HyphenUnderscoreParser
 
@@ -53,13 +51,7 @@ class SpatialPatchGrid:
 
         Raises ValueError if the format doesn't match expectations.
         """
-        zarray_path = os.path.join(logits_path, '.zarray')
-        if logits_path.startswith('s3://'):
-            with fsspec.open(zarray_path, 'r', anon=False) as f:
-                zarray = json.load(f)
-        else:
-            with open(zarray_path, 'r') as f:
-                zarray = json.load(f)
+        zarray = json.loads(ObjectStore(logits_path).read('.zarray'))
 
         zarr_format = zarray.get('zarr_format')
         if zarr_format != 2:
@@ -91,13 +83,7 @@ class SpatialPatchGrid:
                 except ValueError:
                     warnings.warn(f"Non-integer patch index in chunk filename '{filename}' in {logits_path}")
 
-        if logits_path.startswith('s3://'):
-            fs = fsspec.filesystem('s3', anon=False)
-            zarr_path = logits_path.replace('s3://', '')
-            files = fs.ls(zarr_path, detail=False)
-            _parse_chunk_files(f.split('/')[-1] for f in files)
-        else:
-            _parse_chunk_files(os.listdir(logits_path))
+        _parse_chunk_files(ObjectStore(logits_path).keys())
 
         non_empty_mask = np.zeros(total_patches, dtype=bool)
         if non_empty_indices:
@@ -107,30 +93,22 @@ class SpatialPatchGrid:
 
     def _load_or_compute_non_empty(self, logits_path):
         """Load or compute non-empty patch mask."""
-        cache_path = os.path.join(logits_path, '.non_empty_patch_idxs.json')
+        cache_name = '.non_empty_patch_idxs.json'
+        store = ObjectStore(logits_path)
 
         # Try to load from cache
         try:
-            if logits_path.startswith('s3://'):
-                with fsspec.open(cache_path, 'r', anon=False) as f:
-                    data = json.load(f)
-            else:
-                if os.path.exists(cache_path):
-                    with open(cache_path, 'r') as f:
-                        data = json.load(f)
-                else:
-                    data = None
-
+            data = store.read(cache_name)
             if data:
+                data = json.loads(data)
                 non_empty_mask = np.zeros(data['num_patches'], dtype=bool)
                 non_empty_mask[data['non_empty_indices']] = True
                 return non_empty_mask
         except Exception as e:
-            warnings.warn(f"Failed to load non-empty cache from {cache_path}: {e}")
+            warnings.warn(f"Failed to load non-empty cache from {logits_path}/{cache_name}: {e}")
 
         # Compute it
-        logits_store = open_zarr(logits_path, mode='r',
-                                storage_options={'anon': False} if logits_path.startswith('s3://') else None)
+        logits_store = open_zarr(logits_path)
         total_patches = logits_store.shape[0]
 
         non_empty_mask = self._compute_non_empty_from_chunks(logits_path, total_patches)
@@ -141,14 +119,9 @@ class SpatialPatchGrid:
                 'num_patches': int(total_patches),
                 'non_empty_indices': np.where(non_empty_mask)[0].tolist()
             }
-            if logits_path.startswith('s3://'):
-                with fsspec.open(cache_path, 'w', anon=False) as f:
-                    json.dump(data, f)
-            else:
-                with open(cache_path, 'w') as f:
-                    json.dump(data, f)
+            store.write(cache_name, json.dumps(data))
         except Exception as e:
-            warnings.warn(f"Failed to save non-empty cache to {cache_path}: {e}")
+            warnings.warn(f"Failed to save non-empty cache to {logits_path}/{cache_name}: {e}")
 
         return non_empty_mask
 
@@ -177,14 +150,10 @@ class SpatialPatchGrid:
         """Load aggregate bbox cache from parent directory."""
         cache_path = os.path.join(parent_dir, '.bbox_cache.json')
         try:
-            if parent_dir.startswith('s3://'):
-                with fsspec.open(cache_path, 'r', anon=False) as f:
-                    cache_data = json.load(f)
-            else:
-                if not os.path.exists(cache_path):
-                    return None
-                with open(cache_path, 'r') as f:
-                    cache_data = json.load(f)
+            cache_data = ObjectStore(parent_dir).read('.bbox_cache.json')
+            if cache_data is None:
+                return None
+            cache_data = json.loads(cache_data)
             return {int(k): v for k, v in cache_data.items()}
         except Exception as e:
             warnings.warn(f"Failed to load bbox cache from {cache_path}: {e}")
@@ -195,12 +164,7 @@ class SpatialPatchGrid:
         cache_path = os.path.join(parent_dir, '.bbox_cache.json')
         try:
             cache_data = {str(k): v for k, v in self.bbox_cache.items()}
-            if parent_dir.startswith('s3://'):
-                with fsspec.open(cache_path, 'w', anon=False) as f:
-                    json.dump(cache_data, f, indent=2)
-            else:
-                with open(cache_path, 'w') as f:
-                    json.dump(cache_data, f, indent=2)
+            ObjectStore(parent_dir).write('.bbox_cache.json', json.dumps(cache_data, indent=2))
         except Exception as e:
             warnings.warn(f"Failed to save bbox cache to {cache_path}: {e}")
 
@@ -231,10 +195,9 @@ class SpatialPatchGrid:
             print(f"  Loading/computing bounding boxes for {len(part_ids)} parts...")
             for part_id in tqdm(part_ids, desc="Loading bboxes", **tqdm_kwargs):
                 coords_path = part_files[part_id]['coordinates']
-                coords_store = open_zarr(coords_path, mode='r',
-                                        storage_options={'anon': False} if coords_path.startswith('s3://') else None)
+                coords_store = open_zarr(coords_path)
 
-                if hasattr(coords_store, 'attrs') and 'bbox' in coords_store.attrs:
+                if 'bbox' in coords_store.attrs:
                     self.bbox_cache[part_id] = dict(coords_store.attrs['bbox'])
                 else:
                     coords_np = coords_store[:]
@@ -263,8 +226,7 @@ class SpatialPatchGrid:
         for part_id in tqdm(relevant_parts, desc="Loading metadata", **tqdm_kwargs):
             if part_id not in self.coords_cache:
                 coords_path = part_files[part_id]['coordinates']
-                coords_store = open_zarr(coords_path, mode='r',
-                                        storage_options={'anon': False} if coords_path.startswith('s3://') else None)
+                coords_store = open_zarr(coords_path)
                 self.coords_cache[part_id] = coords_store[:]
 
             logits_path = part_files[part_id]['logits']
@@ -360,7 +322,7 @@ class SpatialPatchGrid:
         return dict(result)
 
 def generate_gaussian_map(patch_size: tuple, sigma_scale: float = 8.0, dtype=np.float32) -> np.ndarray:
-    pZ, pY, pX = patch_size
+    """Blend weights of shape (1, *patch_size); 2D and 3D patches."""
     tmp = np.zeros(patch_size, dtype=dtype)
     center_coords = [i // 2 for i in patch_size]
     sigmas = [i / sigma_scale for i in patch_size]
@@ -370,12 +332,47 @@ def generate_gaussian_map(patch_size: tuple, sigma_scale: float = 8.0, dtype=np.
     gaussian_map_np = gaussian_filter(tmp, sigmas, 0, mode='constant', cval=0)
 
     gaussian_map_np /= max(gaussian_map_np.max(), 1e-12)
-    gaussian_map_np = gaussian_map_np.reshape(1, pZ, pY, pX)
+    gaussian_map_np = gaussian_map_np.reshape(1, *patch_size)
     gaussian_map_np = np.clip(gaussian_map_np, a_min=0, a_max=None)
     
     print(
         f"Generated Gaussian map with shape {gaussian_map_np.shape}, min: {gaussian_map_np.min():.4f}, max: {gaussian_map_np.max():.4f}")
     return gaussian_map_np
+
+
+def _write_blended_chunk(output_store, chunk_info, chunk_logits, chunk_weights, num_classes,
+                         finalize_config=None, epsilon=1e-8):
+    """Normalise one chunk's weighted logit sum and write it to the output store.
+
+    `chunk_logits` (C, Z, Y, X) holds sum(w * logits) and `chunk_weights` (Z, Y, X) holds
+    sum(w); `chunk_logits` is divided in place. With `finalize_config` the chunk is
+    finalized (softmax + uint8) before writing, otherwise it is written as float16 logits.
+    """
+    z_start, z_end = chunk_info['z_start'], chunk_info['z_end']
+    y_start, y_end = chunk_info['y_start'], chunk_info['y_end']
+    x_start, x_end = chunk_info['x_start'], chunk_info['x_end']
+    output_slice = (
+        slice(None),
+        slice(z_start, z_end),
+        slice(y_start, y_end),
+        slice(x_start, x_end)
+    )
+
+    # Divide in place: voxels with weight==0 had no contributions so
+    # chunk_logits is already 0 there, and `where=...` leaves them untouched.
+    weights_b = chunk_weights[np.newaxis, :, :, :]
+    np.divide(chunk_logits, weights_b + epsilon,
+              out=chunk_logits, where=weights_b > 0)
+
+    if finalize_config is not None:
+        from vesuvius.models.run.finalize_outputs import apply_finalization
+        result, is_empty = apply_finalization(chunk_logits, num_classes, finalize_config)
+        if not is_empty:
+            # Finalized output may have different channel count than blended logits;
+            # the channel slice is open so it matches the finalized shape.
+            output_store[output_slice] = result
+    else:
+        output_store[output_slice] = chunk_logits.astype(np.float16)
 
 
 # --- Worker Process State ---
@@ -394,8 +391,6 @@ def _init_worker(part_files, output_path, gaussian_map, patch_size, num_classes,
         finalize_config: Optional FinalizeConfig. When set, chunks are finalized
             (softmax + uint8) inline instead of writing float16 blended logits.
     """
-    numcodecs.blosc.use_threads = False
-    storage_opts = {'anon': False} if is_s3 else None
     _worker_state.update({
         'part_files': part_files,
         'gaussian_map': gaussian_map,
@@ -403,7 +398,7 @@ def _init_worker(part_files, output_path, gaussian_map, patch_size, num_classes,
         'num_classes': num_classes,
         'is_s3': is_s3,
         'logits_stores': {},
-        'output_store': open_zarr(output_path, mode='r+', storage_options=storage_opts),
+        'output_store': ZarrWriter.open(output_path, skip_empty=True),
         'finalize_config': finalize_config,
     })
 
@@ -451,7 +446,8 @@ def process_chunk(chunk_info, chunk_patches, epsilon=1e-8):
         if part_id not in logits_stores:
             logits_path = part_files[part_id]['logits']
             storage_opts = {'anon': False} if is_s3 else None
-            logits_stores[part_id] = open_zarr(logits_path, mode='r', storage_options=storage_opts)
+            # The worker pool already reads patches in parallel.
+            logits_stores[part_id] = open_zarr(logits_path, threads=1)
         logits_store = logits_stores[part_id]
 
         for patch_idx, z, y, x in patches:
@@ -513,35 +509,8 @@ def process_chunk(chunk_info, chunk_patches, epsilon=1e-8):
             patches_processed += 1
 
     if patches_processed > 0:
-        output_slice = (
-            slice(None),
-            slice(z_start, z_end),
-            slice(y_start, y_end),
-            slice(x_start, x_end)
-        )
-
-        # Divide in place: voxels with weight==0 had no contributions so
-        # chunk_logits is already 0 there, and `where=...` leaves them untouched.
-        weights_b = chunk_weights[np.newaxis, :, :, :]
-        np.divide(chunk_logits, weights_b + epsilon,
-                  out=chunk_logits, where=weights_b > 0)
-
-        finalize_config = _worker_state.get('finalize_config')
-        if finalize_config is not None:
-            from vesuvius.models.run.finalize_outputs import apply_finalization
-            result, is_empty = apply_finalization(chunk_logits, num_classes, finalize_config)
-            if not is_empty:
-                # Finalized output may have different channel count than blended logits;
-                # write using slices that match the finalized shape.
-                finalized_slice = (
-                    slice(None),
-                    slice(z_start, z_end),
-                    slice(y_start, y_end),
-                    slice(x_start, x_end)
-                )
-                output_store[finalized_slice] = result
-        else:
-            output_store[output_slice] = chunk_logits.astype(np.float16)
+        _write_blended_chunk(output_store, chunk_info, chunk_logits, chunk_weights, num_classes,
+                             _worker_state.get('finalize_config'), epsilon)
 
     return {
         'chunk': chunk_info,
@@ -585,6 +554,235 @@ def calculate_chunks(volume_shape, output_chunks=None, z_range=None):
 
     return chunks
 
+
+def _blend_output_chunks(patch_size, chunk_size):
+    # we use the patch size as the default chunk size throughout the pipeline
+    # so that the chunk size is consistent , to avoid partial chunk read/writes
+    # given that we write the logits with aligned chunk/patch size, we continue that here
+    if chunk_size is None or any(c == 0 for c in (chunk_size if chunk_size else [0, 0, 0])):
+        return (1, patch_size[0], patch_size[1], patch_size[2])
+    return (1, *chunk_size)
+
+
+def create_blend_output(output_path, original_volume_shape, num_classes, patch_size, chunk_size=None,
+                        compression_level=1, finalize_config=None, verbose=True):
+    """Create the blended (or blended and finalized) output array and return its chunks.
+
+    Shared by `merge_inference_outputs` and `InMemoryBlender`, so both write the same layout.
+    """
+    if finalize_config is not None:
+        from vesuvius.models.run.finalize_outputs import compute_finalized_shape
+        output_shape = compute_finalized_shape(original_volume_shape, num_classes, finalize_config)
+        output_dtype = np.uint8
+        print(f"  Finalized output shape: {output_shape}")
+    else:
+        output_shape = (num_classes, *original_volume_shape)  # (C, D, H, W)
+        output_dtype = np.float16
+
+    output_chunks = _blend_output_chunks(patch_size, chunk_size)
+    if verbose:
+        print(f"  Using chunk_size {output_chunks[1:]}" + ("" if chunk_size else " based directly on patch_size"))
+
+    if compression_level > 0:
+        codec = {'cname': 'zstd', 'level': compression_level, 'shuffle': 1}
+    else:
+        codec = {'compressor': None}
+
+    print(f"Creating final output store: {output_path}")
+    print(f"  Shape: {output_shape}, Chunks: {output_chunks}")
+    ZarrWriter.create(
+        output_path,
+        shape=output_shape,
+        chunks=output_chunks,
+        dtype=output_dtype,
+        fill_value=0,
+        overwrite=True,
+        **codec,
+    )
+    return output_chunks
+
+
+def part_z_range(patch_coords, patch_size, volume_shape, z_chunk, num_parts, part_id):
+    """Chunk-aligned Z slab [z0, z1) that part `part_id` of `num_parts` blends in memory.
+
+    Like the split in `merge_inference_outputs`, the parts divide output chunk rows, not Z
+    coordinates, so a boundary never cuts a chunk. Only the chunk rows the patches cover are
+    divided, so a `--bbox` run does not leave most parts empty.
+    """
+    origin, shape = InMemoryBlender.extent(patch_coords, patch_size, volume_shape)
+    first = origin[0] // z_chunk
+    last = -(-(origin[0] + shape[0]) // z_chunk)  # exclusive
+    rows = max(last - first, 0)
+    start = first + (part_id * rows) // num_parts
+    end = first + ((part_id + 1) * rows) // num_parts
+    return start * z_chunk, min(end * z_chunk, int(volume_shape[0]))
+
+
+def patches_in_z_range(patch_coords, patch_size_z, z_range):
+    """Indices of the patches whose Z extent overlaps [z0, z1): the ones a part has to run."""
+    z = np.asarray(patch_coords, dtype=np.int64).reshape(-1, 3)[:, 0]
+    return np.flatnonzero((z < z_range[1]) & (z + int(patch_size_z) > z_range[0]))
+
+
+class InMemoryBlender:
+    """Gaussian-blend patch logits in RAM while inference produces them.
+
+    The staged pipeline writes every patch's logits to disk (`vesuvius.predict`), reads them
+    back to blend (`vesuvius.blend_logits` / `vesuvius.blend_and_finalize`) and only then
+    finalizes. When the region being predicted fits in memory, this class keeps the two running
+    sums that blending needs, sum(w * logits) and sum(w), over the extent the patches cover, and
+    `write()` produces the same output array that `merge_inference_outputs` would.
+
+    Patches are weighted exactly like `process_chunk` weights the float16 logits it reads back,
+    and all-zero (skipped) patches add no weight, as there. Where several patches overlap, the
+    float32 sums are accumulated in the order `add()` is called rather than in the order the
+    chunked blend visits them, which can move a value by one float32 rounding step.
+
+    With `z_range=(z0, z1)` only that Z slab is kept and written: patches reaching into it from
+    above or below add their overlapping part, so every output chunk inside the slab gets the
+    same sums as when the whole region is blended at once. A split run gives each part its own
+    chunk-aligned slab (see `part_z_range`), so the parts write disjoint chunks.
+    """
+
+    def __init__(self, patch_coords, patch_size, num_classes, volume_shape, sigma_scale=8.0, z_range=None):
+        self.patch_size = tuple(int(p) for p in patch_size)
+        self.num_classes = int(num_classes)
+        self.volume_shape = tuple(int(v) for v in volume_shape)
+        self.coords = np.asarray(patch_coords, dtype=np.int64).reshape(-1, 3)
+        self.z_range = None if z_range is None else (int(z_range[0]), int(z_range[1]))
+        self.origin, self.shape = self.extent(self.coords, self.patch_size, self.volume_shape, self.z_range)
+        self.gaussian = generate_gaussian_map(self.patch_size, sigma_scale=sigma_scale)[0]
+        self.logits = np.zeros((self.num_classes, *self.shape), dtype=np.float32)
+        self.weights = np.zeros(self.shape, dtype=np.float32)
+        self.patches_added = 0
+        self.patches_skipped_empty = 0
+        self._scratch = None
+
+    @staticmethod
+    def extent(patch_coords, patch_size, volume_shape, z_range=None):
+        """Origin and shape of the volume region the patches cover, clipped to the volume
+        (and to the Z slab `z_range`, if given)."""
+        coords = np.asarray(patch_coords, dtype=np.int64).reshape(-1, 3)
+        if len(coords) == 0:
+            return (0, 0, 0), (0, 0, 0)
+        lo = np.maximum(coords.min(axis=0), 0)
+        hi = np.minimum(coords.max(axis=0) + np.asarray(patch_size), np.asarray(volume_shape))
+        if z_range is not None:
+            lo[0], hi[0] = max(lo[0], z_range[0]), min(hi[0], z_range[1])
+        return tuple(int(v) for v in lo), tuple(int(v) for v in np.maximum(hi - lo, 0))
+
+    @classmethod
+    def required_bytes(cls, patch_coords, patch_size, num_classes, volume_shape, z_range=None):
+        """Memory the float32 sums take: one array per class plus the weights."""
+        _, shape = cls.extent(patch_coords, patch_size, volume_shape, z_range)
+        return (int(num_classes) + 1) * 4 * int(np.prod(shape, dtype=np.int64))
+
+    def add(self, patch_index, patch_logits):
+        """Accumulate one patch, (C, pZ, pY, pX), placed at `patch_coords[patch_index]`.
+
+        Not thread-safe: call it from one thread at a time, in a fixed order, so the sums are
+        reproducible (`vesuvius.predict` uses a single writer thread).
+        """
+        if not np.any(patch_logits != 0):
+            self.patches_skipped_empty += 1
+            return
+        start = self.coords[patch_index] - np.asarray(self.origin)
+        canvas, patch = [], []
+        for s, p, n in zip(start.tolist(), self.patch_size, self.shape):
+            lo, hi = max(s, 0), min(s + p, n)
+            if hi <= lo:
+                return
+            canvas.append(slice(lo, hi))
+            patch.append(slice(lo - s, hi - s))
+        weight = self.gaussian[tuple(patch)]
+        # Same float32 product as process_chunk computes, written into a reused buffer.
+        if self._scratch is None:
+            self._scratch = np.empty((self.num_classes, *self.patch_size), dtype=np.float32)
+        weighted = self._scratch[(slice(None), *(slice(0, s.stop - s.start) for s in patch))]
+        np.multiply(patch_logits[(slice(None), *patch)], weight[np.newaxis], out=weighted)
+        self.logits[(slice(None), *canvas)] += weighted
+        self.weights[tuple(canvas)] += weight
+        self.patches_added += 1
+
+    def __setitem__(self, patch_index, patch_logits):
+        """`blender[i] = logits` adds a patch, so the blender can stand in for the logits store."""
+        self.add(patch_index, patch_logits)
+
+    def _output_chunks(self, chunk_size):
+        output_chunks = _blend_output_chunks(self.patch_size, chunk_size)
+        if self.z_range is not None:
+            z_chunk = output_chunks[1]
+            z0, z1 = self.z_range
+            if z0 % z_chunk or (z1 % z_chunk and z1 != self.volume_shape[0]):
+                raise ValueError(f"z_range {self.z_range} is not aligned to the output chunk size {z_chunk}; "
+                                 "parts would overwrite each other's chunks.")
+        return output_chunks
+
+    def prepare_output(self, output_path, chunk_size=None, compression_level=1, finalize_config=None,
+                       verbose=True, create=True, part_id=0, run_id=None, wait_timeout=300):
+        """Create or wait for the shared output before any part starts inference.
+
+        Split jobs must share a fresh run_id, so an old output cannot release waiting parts.
+        Part 0 publishes readiness only after creation completes, including on an empty slab.
+        """
+        self._output_chunks(chunk_size)  # Validate the slab before replacing an existing output.
+        if self.z_range is not None and (not run_id or not run_id.strip()):
+            raise ValueError("Split in-memory blending requires a non-empty run_id shared by all parts.")
+        if create:
+            create_blend_output(output_path, self.volume_shape, self.num_classes, self.patch_size,
+                                chunk_size, compression_level, finalize_config, verbose)
+            if run_id is not None:
+                mark_zarr_ready(output_path, run_id)
+        else:
+            wait_for_zarr_creation(output_path, max_wait_time=wait_timeout, verbose=verbose,
+                                   part_id=part_id, run_id=run_id)
+
+    def write(self, output_path, chunk_size=None, finalize_config=None,
+              verbose=True, epsilon=1e-8, num_workers=None):
+        """Normalise, optionally finalize, and write to an already prepared output.
+
+        Chunks are disjoint, so they are finalized and written by `num_workers` threads
+        (default: the CPUs this process may use, at most 8; each thread holds one chunk's copy).
+        This never creates or clears the array: other parts may already have written their slabs.
+        """
+        output_chunks = self._output_chunks(chunk_size)
+        output_store = ZarrWriter.open(output_path, skip_empty=True)
+        steps = output_chunks[1:]
+        ranges = [range((o // c) * c, o + n, c) for o, n, c in zip(self.origin, self.shape, steps)]
+        starts = [(z0, y0, x0) for z0 in ranges[0] for y0 in ranges[1] for x0 in ranges[2]]
+
+        def write_chunk(start):
+            chunk = [(a, min(a + c, v)) for a, c, v in zip(start, steps, self.volume_shape)]
+            # Overlap of the chunk with the canvas, in chunk and in canvas coordinates.
+            in_chunk, in_canvas = [], []
+            for (a, b), o, n in zip(chunk, self.origin, self.shape):
+                lo, hi = max(a, o), min(b, o + n)
+                in_chunk.append(slice(lo - a, hi - a))
+                in_canvas.append(slice(lo - o, hi - o))
+            chunk_weights = np.zeros([b - a for a, b in chunk], dtype=np.float32)
+            chunk_weights[tuple(in_chunk)] = self.weights[tuple(in_canvas)]
+            if not np.any(chunk_weights > 0):
+                return False
+            chunk_logits = np.zeros((self.num_classes, *chunk_weights.shape), dtype=np.float32)
+            chunk_logits[(slice(None), *in_chunk)] = self.logits[(slice(None), *in_canvas)]
+            chunk_info = {'z_start': chunk[0][0], 'z_end': chunk[0][1],
+                          'y_start': chunk[1][0], 'y_end': chunk[1][1],
+                          'x_start': chunk[2][0], 'x_end': chunk[2][1]}
+            _write_blended_chunk(output_store, chunk_info, chunk_logits, chunk_weights,
+                                 self.num_classes, finalize_config, epsilon)
+            return True
+
+        if num_workers is None:
+            # process_cpu_count (Python 3.13+) honours CPU affinity, e.g. a Slurm allocation.
+            usable = getattr(os, 'process_cpu_count', os.cpu_count)() or 1
+            num_workers = min(8, usable)
+        with ThreadPoolExecutor(max_workers=num_workers) as executor:
+            written = sum(executor.map(write_chunk, starts))
+        if verbose:
+            print(f"Blended {self.patches_added} patches in memory ({self.patches_skipped_empty} empty) "
+                  f"and wrote {written} chunks to {output_path}")
+        return output_path
+
 # --- Main Merging Function ---
 def merge_inference_outputs(
         parent_dir: str,
@@ -619,7 +817,6 @@ def merge_inference_outputs(
         tqdm_kwargs['disable'] = True
 
     # blosc has an issuse with threading , so we disable it
-    numcodecs.blosc.use_threads = False
     if num_workers is None:
         # just use half the cpu count 
         num_workers = max(1, mp.cpu_count() // 2)
@@ -635,25 +832,8 @@ def merge_inference_outputs(
     part_pattern = re.compile(r"(logits|coordinates)_part_(\d+)\.zarr")
     print(f"Scanning for parts in: {parent_dir}")
     
-    # we need to use fsspec to work w/ s3 paths , as os.listdir doesn't work with s3
-    if parent_dir.startswith('s3://'):
-        fs = fsspec.filesystem('s3', anon=False)
-        # Remove 's3://' prefix for fs.ls()
-        parent_dir_no_prefix = parent_dir.replace('s3://', '')
-        # List directory to get all entries
-        full_paths = fs.ls(parent_dir_no_prefix)
-        
-        # For S3, strip the bucket name and path prefix to get just the directory name
-        # Each entry looks like: 'bucket/path/to/parent_dir/logits_part_0.zarr'
-        file_list = []
-        for path in full_paths:
-            path_parts = path.split('/')
-            filename = path_parts[-1]
-            file_list.append(filename)
-            
-    else:
-        file_list = os.listdir(parent_dir)
-        
+    file_list = ObjectStore(parent_dir).children()
+
     for filename in file_list:
         match = part_pattern.match(filename)
         if match:
@@ -677,26 +857,15 @@ def merge_inference_outputs(
     print(f"Reading metadata from part {first_part_id}...")
     part0_logits_path = part_files[first_part_id]['logits']
     try:
-        part0_logits_store = open_zarr(part0_logits_path, mode='r', storage_options={'anon': False} if part0_logits_path.startswith('s3://') else None)
+        part0_logits_store = open_zarr(part0_logits_path)
 
         input_chunks = part0_logits_store.chunks
         print(f"Input zarr chunk size: {input_chunks}")
 
-        try:
-            # Use the part0_logits_store's .attrs directly if available
-            meta_attrs = part0_logits_store.attrs
-            patch_size = tuple(meta_attrs['patch_size']) 
-            original_volume_shape = tuple(meta_attrs['original_volume_shape'])  # MUST exist
-            num_classes = part0_logits_store.shape[1]  # (N, C, pZ, pY, pX) -> C
-        except (KeyError, AttributeError):
-            # Fallback: try to read .zattrs file directly
-            zattrs_path = os.path.join(part0_logits_path, '.zattrs')
-            with fsspec.open(zattrs_path, 'r') as f:
-                meta_attrs = json.load(f)
-                
-            patch_size = tuple(meta_attrs['patch_size'])  
-            original_volume_shape = tuple(meta_attrs['original_volume_shape'])
-            num_classes = part0_logits_store.shape[1]
+        meta_attrs = part0_logits_store.attrs
+        patch_size = tuple(meta_attrs['patch_size'])
+        original_volume_shape = tuple(meta_attrs['original_volume_shape'])  # MUST exist
+        num_classes = part0_logits_store.shape[1]  # (N, C, pZ, pY, pX) -> C
 
     except Exception as e:
         traceback.print_exc()
@@ -714,62 +883,15 @@ def merge_inference_outputs(
             finalize_config.is_multi_task = part0_logits_store.attrs.get('is_multi_task', False)
             finalize_config.target_info = part0_logits_store.attrs.get('target_info', None)
 
-        from vesuvius.models.run.finalize_outputs import compute_finalized_shape
-        output_shape = compute_finalized_shape(original_volume_shape, num_classes, finalize_config)
-        output_dtype = np.uint8
         print(f"Fused blend+finalize mode: {finalize_config.mode}, threshold={finalize_config.threshold}")
-        print(f"  Finalized output shape: {output_shape}")
-    else:
-        output_shape = (num_classes, *original_volume_shape)  # (C, D, H, W)
-        output_dtype = np.float16
-
-    # we use the patch size as the default chunk size throughout the pipeline
-    # so that the chunk size is consistent , to avoid partial chunk read/writes
-    # given that we write the logits with aligned chunk/patch size, we continue that here
-    if chunk_size is None or any(c == 0 for c in (chunk_size if chunk_size else [0, 0, 0])):
-
-        output_chunks = (
-            1,
-            patch_size[0],  # z
-            patch_size[1],  # y
-            patch_size[2]   # x
-        )
-        if verbose:
-            print(f"  Using chunk_size {output_chunks[1:]} based directly on patch_size")
-    else:
-        output_chunks = (1, *chunk_size)
-        if verbose:
-            print(f"  Using specified chunk_size {chunk_size}")
-
-
-    if compression_level > 0:
-        compressor = numcodecs.Blosc(
-            cname='zstd',
-            clevel=compression_level,
-            shuffle=numcodecs.blosc.SHUFFLE
-        )
-    else:
-        compressor = None
 
     # --- 3. Create or Open Output Arrays ---
     if global_part_id == 0:
         # Part 0 creates the arrays
-        print(f"Creating final output store: {output_path}")
-        print(f"  Shape: {output_shape}, Chunks: {output_chunks}")
-
-        open_zarr(
-            path=output_path,
-            mode='w',
-            storage_options={'anon': False} if output_path.startswith('s3://') else None,
-            verbose=verbose,
-            shape=output_shape,
-            chunks=output_chunks,
-            compressor=compressor,
-            dtype=output_dtype,
-            fill_value=0,
-            write_empty_chunks=False
-        )
+        output_chunks = create_blend_output(output_path, original_volume_shape, num_classes, patch_size,
+                                            chunk_size, compression_level, finalize_config, verbose)
     else:
+        output_chunks = _blend_output_chunks(patch_size, chunk_size)
         # Other parts wait for part 0 to create the arrays, then open them in r+ mode
         print(f"Waiting for part 0 to create output arrays...")
 
@@ -928,27 +1050,18 @@ def merge_inference_outputs(
     print(f"{'='*60}")
 
     # --- 10. Save Metadata ---
-    output_zarr = open_zarr(
-        path=output_path,
-        mode='r+',
-        storage_options={'anon': False} if output_path.startswith('s3://') else None,
-        verbose=verbose
-    )
-    if hasattr(output_zarr, 'attrs'):
-        # Copy all attributes from the input part
-        if hasattr(part0_logits_store, 'attrs'):
-            for key, value in part0_logits_store.attrs.items():
-                output_zarr.attrs[key] = value
-        # Update/add specific attributes
-        output_zarr.attrs['patch_size'] = patch_size
-        output_zarr.attrs['original_volume_shape'] = original_volume_shape
-        output_zarr.attrs['sigma_scale'] = sigma_scale
+    output_zarr = ZarrWriter.open(output_path)
+    # Copy all attributes from the input part, then update/add specific ones
+    output_zarr.attrs.update(part0_logits_store.attrs)
+    output_zarr.attrs['patch_size'] = patch_size
+    output_zarr.attrs['original_volume_shape'] = original_volume_shape
+    output_zarr.attrs['sigma_scale'] = sigma_scale
 
-        # Add finalization metadata when in fused mode
-        if finalize_config is not None:
-            output_zarr.attrs['processing_mode'] = finalize_config.mode
-            output_zarr.attrs['threshold_applied'] = finalize_config.threshold
-            output_zarr.attrs['fused_blend_finalize'] = True
+    # Add finalization metadata when in fused mode
+    if finalize_config is not None:
+        output_zarr.attrs['processing_mode'] = finalize_config.mode
+        output_zarr.attrs['threshold_applied'] = finalize_config.threshold
+        output_zarr.attrs['fused_blend_finalize'] = True
 
     print(f"\n--- Merging Finished ---")
     print(f"Final merged output saved to: {output_path}")

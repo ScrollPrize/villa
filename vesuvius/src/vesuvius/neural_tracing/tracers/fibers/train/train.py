@@ -14,6 +14,7 @@ import time
 
 import numpy as np
 import torch
+from vc_reader.reader import open_zarr
 
 from vesuvius.neural_tracing.tracers.shared.annotations.traced import fiber_manifest
 from vesuvius.neural_tracing.tracers.fibers.data.follow_dataset import FollowDataset
@@ -27,7 +28,6 @@ from vesuvius.neural_tracing.tracers.shared.training import RunLog, lr_at, prepa
 from vesuvius.neural_tracing.tracers.shared.system import raise_open_file_limit
 from vesuvius.neural_tracing.tracers.models.checkpoint import (
     initialize_model_weights, read_checkpoint, write_checkpoint)
-from vesuvius.neural_tracing.tracers.shared.crop_sampling.volume import CTVolume
 from vesuvius.neural_tracing.tracers.models.model import config_from_checkpoint
 from vesuvius.neural_tracing.tracers.fibers.data.observations import IdentityObservationBuilder, IdentitySampling
 from vesuvius.neural_tracing.tracers.fibers.tracing.trace import FiberTracer
@@ -393,30 +393,16 @@ def main(argv=None):
         live_continuation_steps=args.live_continuation_steps,
         frame_policy=configured_frame_policy(cfg), sampling=asdict(identity_sampling)))
     tracer = None
-    recovery_vol = CTVolume(spec) if recovery_states is not None else None
+    ct = open_zarr(spec.ct_zarr, level=spec.ct_level, cache_dir=spec.cache_dir, memory_cache=3 << 30)  # diagnostics
     started = time.monotonic()
     interval_started, interval_step = started, done
     interval_data_seconds = interval_update_seconds = 0.
     interval_metrics = TrainingInterval()
     updates = None
-    remote_prefetch = None
     try:
-        if args.remote_prefetch_connections:
-            from vesuvius.neural_tracing.tracers.shared.crop_sampling.prefetch import attach_remote_prefetch
-            remote_prefetch, remote_sources = attach_remote_prefetch(dataset.datasets,
-                args.remote_prefetch_connections, args.remote_prefetch_queue_size, args.remote_prefetch_timeout,
-                args.remote_prefetch_lookahead, args.workers)
-            if remote_prefetch is not None:
-                progress(f'Remote CT prefetch: {args.remote_prefetch_connections} concurrent fetches, '
-                         f'{args.remote_prefetch_queue_size} requests per priority queue, '
-                         f'{args.remote_prefetch_lookahead} future batch plans per remote source/worker, separate async process')
-            log.record(dict(step=done,event='remote_prefetch_configuration',
-                enabled=remote_prefetch is not None,connections=args.remote_prefetch_connections,
-                queue_size=args.remote_prefetch_queue_size,lookahead=args.remote_prefetch_lookahead,
-                timeout=args.remote_prefetch_timeout,sources=len(remote_sources)))
         if args.diag_every and main_rank:
             from vesuvius.neural_tracing.tracers.fibers.tracing.trace import TraceParams
-            tracer = FiberTracer(ema, CTVolume(spec), cfg.fine, cfg.n_history,
+            tracer = FiberTracer(ema, ct, spec, cfg.fine, cfg.n_history,
                 TraceParams.from_policy(policy, max_len=args.diag_max_len), device=args.device)
         world = parallel.world_size if parallel is not None else 1
         progress(f'Starting data loader; batch {args.batch} × grad steps {args.grad_steps}'
@@ -469,7 +455,6 @@ def main(argv=None):
             if main_rank and (step % args.log_every == 0 or step == args.steps):
                 now = time.monotonic()
                 log.record(dict(step=step, lr=lr, **metrics, samples_seen=prior_samples+observed_states,
-                    **({'remote_prefetch':remote_prefetch.snapshot()} if remote_prefetch else {}),
                     train_seconds=now-started,
                     samples_per_second=observed_states/(now-started),
                     interval_samples_per_second=interval_states/(now-interval_started),
@@ -533,7 +518,7 @@ def main(argv=None):
                 periodic['diagnostics_seconds'] = time.monotonic()-began
             if recovery_states is not None and step % args.recovery_every == 0:
                 began = time.monotonic()
-                report = evaluate_monitor(ema, recovery_vol, recovery_states, val_f, sample, device=args.device,
+                report = evaluate_monitor(ema, ct, spec, recovery_states, val_f, sample, device=args.device,
                     n_commit=args.n_commit, tolerance=args.tolerance, recovery_length=args.recovery_length)
                 report.update(step=step, split='monitor', fixture_sha256=recovery_hash)
                 folder = out/'recovery'
@@ -545,9 +530,6 @@ def main(argv=None):
                 # Wall time spent outside optimizer updates, so throughput can be read from the log.
                 log.record(dict(step=step, **periodic))
     finally:
-        if remote_prefetch is not None:
-            remote_prefetch.close()
-            log.record(dict(event='remote_prefetch_shutdown',remote_prefetch=remote_prefetch.snapshot()))
         if updates is not None:
             updates.close()
         if live_continuation is not None:

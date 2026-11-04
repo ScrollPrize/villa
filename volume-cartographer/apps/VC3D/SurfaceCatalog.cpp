@@ -91,10 +91,14 @@ void SurfaceCatalog::setSource(const std::optional<AttachmentIdentity>& attachme
                                const VolumeVoxels& voxels)
 {
     if (attachment_ == attachment && volume_ == volume && voxels_ == voxels) return;
+    // Changing working levels does not remove any surfaces. Keep the rows and
+    // selection until their mappings in the new frame arrive.
+    const bool keepRows = attachment_ == attachment && volume_ && volume &&
+                          voxels_.volume == voxels.volume;
     attachment_ = attachment;
     volume_ = std::move(volume);
     voxels_ = voxels;
-    restart();
+    restart(keepRows);
 }
 
 void SurfaceCatalog::readNow(const std::vector<std::string>& uuids)
@@ -115,7 +119,7 @@ std::vector<AttachmentIdentity> SurfaceCatalog::sources() const
     return sources;
 }
 
-void SurfaceCatalog::restart()
+void SurfaceCatalog::restart(bool keepRows)
 {
     ++generation_;
     if (cancelled_) cancelled_->store(true);
@@ -123,7 +127,7 @@ void SurfaceCatalog::restart()
     busy_ = false;
     pendingFull_ = false;
     pending_.clear();
-    rows_.clear();
+    if (!keepRows) rows_.clear();
     loading_ = false;
     if (!error_.isEmpty()) { error_.clear(); emit errorChanged(error_); }
     emit rowsChanged();

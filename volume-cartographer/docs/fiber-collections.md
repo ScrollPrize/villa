@@ -177,3 +177,31 @@ fiber-refresh and selection-reset counts. These events must preserve selection
 and warm fiber snapshots without reloading geometry. Use a local replica when
 testing a hosted store. This measures notification handling, not rendering FPS;
 the regular smoke test separately checks that actual commits refresh the views.
+
+The PHerc1451 save/cache regression uses the fixed 589-control fiber
+`6af54546-cad8-4696-9f4a-763334378476` and its real relationship neighbourhood.
+It clones and detaches the supplied local seed into a temporary directory;
+the source is not edited. Run from the repository root with `VC_TESTING=ON`:
+
+```sh
+AGENTS_AGENT_MODE=1 cmake --build volume-cartographer/build --target VC3D -j 6
+mkdir -p /tmp/vc3d-fiber-cache-config
+QT_QPA_PLATFORM=offscreen VC3D_CONFIG_DIR=/tmp/vc3d-fiber-cache-config \
+XDG_CONFIG_HOME=/tmp/vc3d-fiber-cache-config \
+VC3D_FIBER_CACHE_TEST_STORE="$PWD/local/benchmarks/pherc1451/seed/baseline.vcobj" \
+  volume-cartographer/build/bin/VC3D --test-object-store
+```
+
+Fiber transport artifacts and JSON exports use the core named-temporary-file
+atomic writer (fsync and rename), so publishing them does not require Linux
+`O_TMPFILE` linking through `/proc/self/fd`. The regression checks exact transport
+bytes on the real linked component, path reuse, and bundle creation/replacement.
+
+The check also covers unchanged saves with reordered branches, exact coordinate and
+annotation preservation, one-ULP edits, metadata and approval edits, stale
+revision conflicts, peer edits before event delivery, link deletion/creation,
+retirement, and transform invalidation. It compares cached reads with independent
+fresh reads and checks that unrelated decoded fibers and side-strip snapshots
+retain their allocations after a local edit. No CT sampling or solver runs are
+needed. Save comparisons use the existing batch canonicalization and exact
+values; decoded caches track peer generations and relationship identities.

@@ -1,5 +1,6 @@
 #pragma once
 #include <vc_reader/catalog.hpp>
+#include <vc_reader/cache.hpp>
 
 #include <atomic>
 #include <cstdint>
@@ -60,22 +61,14 @@ struct NormalGridsCacheState {
     const std::string& sampleId,
     const vcr::catalog::OpenDataVolume& volume);
 
-struct NormalGridsDownloadProgress {
-    int totalFiles = 0;
-    int completedFiles = 0;
-    int failedFiles = 0;
-    std::uint64_t totalBytes = 0;
-    std::uint64_t completedBytes = 0;
-    std::string fileName;
-    std::string status;  // "listing" | "downloading"
-};
-using NormalGridsProgressCallback =
-    std::function<void(const NormalGridsDownloadProgress&)>;
+using NormalGridsDownloadProgress = vcr::cache::DownloadProgress;
+using NormalGridsProgressCallback = vcr::cache::DownloadCallback;
 
-// Enumerate the artifact's S3 prefix (anonymous ListObjectsV2) and download all
-// objects with `workers` threads into the volume's normal-grid cache. The download
-// lands in a temp dir and is published atomically. Returns the final cache dir,
-// or an empty path on failure/cancellation (errorOut explains why).
+// List the artifact's prefix and fetch every object with `workers` threads through
+// vc_reader's file cache into the volume's normal-grid cache directory, under the
+// root's byte limit and free-space floor. Files already there are kept, so a
+// cancelled or failed download resumes. Returns the cache dir, or an empty path on
+// failure/cancellation (errorOut explains why).
 [[nodiscard]] std::filesystem::path downloadOpenDataNormalGrids(
     const OpenDataNormalGridsInfo& info,
     const std::filesystem::path& remoteCacheRoot,

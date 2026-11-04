@@ -15,11 +15,17 @@ source .venv/bin/activate
 
 The bootstrap uses `nvidia-smi` to select a pinned official PyTorch build for
 CUDA 12.8, CUDA 13.0, or CPU, then installs Lasagna. Override detection with
-`--backend cpu`, `--backend cu128`, or `--backend cu130`, for example:
+`--backend cpu`, `--backend cu128`, `--backend cu130`, or `--backend rocm`, for example:
 
 ```bash
 python3 scripts/bootstrap_venv.py --venv .venv --backend cu128
 ```
+
+AMD GPUs use the ROCm 7.2 build, which detection never selects: pass
+`--backend rocm` (Linux x86_64 only). It needs read/write access to `/dev/kfd`
+and `/dev/dri` (usually membership of the `render` and `video` groups), and
+runs a smoke kernel on the default GPU, reporting GPU and wheel gfx targets
+if the kernel fails.
 
 Verify the selected PyTorch build and GPU access:
 
@@ -47,6 +53,10 @@ also exposes the sibling Vesuvius Fiber packages and canonical `lasagna.*`
 modules; direct and managed inference do not require `PYTHONPATH`.
 
 ### Inference manager
+
+For Qualzz AFV V2 models and plain V/H probability Zarr output, see
+[Qualzz AFV inference](docs/qualzz_afv_inference.md). This uses the same tiled
+engine and GPU manager without writing Lasagna-schema metadata.
 
 `las_manager` provides configuration, discovery, prefetch, and durable tmux
 execution for managed Fiber and Lasagna inference. Initialize its XDG configuration, fill
@@ -339,17 +349,15 @@ Existing arrays keep their compressor when inference resumes; a mismatch is
 reported. Use `--ome-compressor none` only when uncompressed compatibility
 output is required.
 
-Use a subset with `--devices cuda:0,cuda:2`. Input tiles default to asynchronous
-TensorStore bounding-box reads outside GPU workers. The tile Cartesian product
+Use a subset with `--devices cuda:0,cuda:2`. Input tiles are read in the
+background through `vc_reader` outside GPU workers. The tile Cartesian product
 is generated lazily and read-ahead is bounded independently from reusable GPU
 shared-memory slots. `--slots-per-gpu` (default 2) controls GPU input/result
 buffers; `--prefetch-tiles-per-gpu` (default 4) controls outstanding/ready input
-tiles. TensorStore defaults to a 4 GiB cache, 16 file-I/O threads, and 4
-decode/copy threads, configurable with `--input-cache-gib`,
-`--input-io-threads`, and `--input-copy-threads`. Use
-`--input-reader python-zarr` for the old backend; `--prefetch-workers` controls
-only its reader threads. Existing `--device` selects single-device inference,
-which also maintains bounded TensorStore read-ahead during GPU forwards.
+tiles. The reader defaults to a 4 GiB memory cache and 16 threads, configurable
+with `--input-cache-gib` and `--input-io-threads`. `--prefetch-workers` overrides
+how many tile reads run at once. Existing `--device` selects single-device
+inference, which also maintains bounded read-ahead during GPU forwards.
 
 Add `--profile-pipeline` to a multi-device run for bounded loader/worker
 diagnostics. It reports backend read service, active wall span, throughput and
@@ -405,13 +413,13 @@ python -m vesuvius.neural_tracing.fiber_trace_3d.infer ... \
 
 The local OME root must contain `_download` S3 metadata. The defaults are a
 10 TiB selected-scale target (`--live-cache-gib 10240`) and 10,000 lazy tile
-descriptors (`--live-fetch-ahead-tiles 10000`); this disk window is separate
-from TensorStore's much smaller `--prefetch-tiles-per-gpu` array window. Only
-whole input Z-chunk planes safely behind a fully committed model row are
-removed. Cache pressure may temporarily exceed the target when no obsolete
-plane is safe. Live mode is intentionally full-volume only, conflicts with
+descriptors (`--live-fetch-ahead-tiles 10000`); this read-ahead is separate
+from the much smaller `--prefetch-tiles-per-gpu` array window. Chunks are read
+through `vc_reader` into `<ome root>/.live_cache`, decoded; past the target its
+least recently used chunks are removed. Chunks a plain download left in the
+level are not used. Live mode is intentionally full-volume only, conflicts with
 `--no-download`, and currently rejects a separately remote Lasagna `--pred-dt`.
-Interrupted runs retain atomically completed chunks and can be rerun directly.
+Interrupted runs keep the cache and can be rerun directly.
 
 ### Multi-axis processing
 

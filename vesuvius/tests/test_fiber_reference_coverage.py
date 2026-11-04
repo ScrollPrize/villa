@@ -1,7 +1,7 @@
 import json
 import numpy as np
 import pytest
-import tifffile
+from vc_reader import tifxyz
 from vesuvius.neural_tracing.fiber_trace_3d import fiber_reference_comparison as ref
 
 
@@ -14,9 +14,9 @@ def test_gray_coverage_distinguishes_outside_z_and_restricted_projection(tmp_pat
     np.savez(projection,**identity,xyz=np.c_[np.zeros((4,2)),[0,100,200,300]],
         weight=np.ones(4),owner=np.arange(4),placed_valid=np.array([False,True,False,False]),
         nearest_distance=np.array([300,0,0,300]),chosen_winding=np.ones(4))
-    monkeypatch.setattr(tifffile,'imread',lambda p:np.array([[100.,200.]]))
+    tifxyz.write(tmp_path/'reference',tifxyz.Surface(np.array([[[0.,0.,100.],[1.,0.,200.]]],np.float32)))
     monkeypatch.setattr(ref.uv,'hard_geometry',lambda *a:(None,None,np.ones(4,dtype=bool)))
-    result=ref.projection_coverage_report(dict(run_root=str(tmp_path),reference=str(tmp_path),
+    result=ref.projection_coverage_report(dict(run_root=str(tmp_path),reference=str(tmp_path/'reference'),
         projection_cache=str(projection),output_root=str(tmp_path),xyz_scale=1))
     assert result['reference_physical_z']==[100,200]
     assert result['gray_length_percent']==75

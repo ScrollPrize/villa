@@ -21,13 +21,6 @@ class SegmentationEditManager : public QObject
     Q_OBJECT
 
 public:
-    enum class GridSearchResolution
-    {
-        Low,
-        Medium,
-        High
-    };
-
     struct GridKey
     {
         int row{0};
@@ -131,8 +124,6 @@ public:
 
     std::optional<std::pair<int, int>> worldToGridIndex(const cv::Vec3f& worldPos,
                                                         float* outDistance = nullptr,
-                                                        GridSearchResolution detail =
-                                                            GridSearchResolution::High,
                                                         bool warnOnFailure = true) const;
     std::optional<cv::Vec3f> vertexWorldPosition(int row, int col) const;
 
@@ -146,7 +137,6 @@ public:
 
     [[nodiscard]] const ActiveDrag& activeDrag() const { return _activeDrag; }
     [[nodiscard]] const std::vector<GridKey>& recentTouched() const { return _recentTouched; }
-    [[nodiscard]] std::optional<cv::Rect> recentTouchedBounds() const;
     [[nodiscard]] std::vector<VertexEdit> editedVertices() const;
 
     void markNextEditsAsGrowth();

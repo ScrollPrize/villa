@@ -1527,7 +1527,7 @@ def main(argv: list[str] | None = None, *, lifecycle_fn=None,
 	_t_fit_total = _stage_start("total")
 	_t = _stage_start("parse_config")
 	parser = _build_parser()
-	cfg_paths, argv_rest = cli_json.split_cfg_argv(argv)
+	cfg_paths, argv_rest = cli_json.split_cfg_argv(argv, parser)
 	cfg_paths = [str(x) for x in cfg_paths]
 	cfg = cli_json.merge_cfgs(cfg_paths)
 	fit_config = copy.deepcopy(cfg)
@@ -1745,7 +1745,6 @@ def main(argv: list[str] | None = None, *, lifecycle_fn=None,
 			corr_point_roi_normal_data = fit_data.load_3d_streaming(
 				path=str(data_cfg.input),
 				device=device,
-				sparse_prefetch_backend=data_cfg.sparse_prefetch_backend,
 				skip_channels={"cos", "pred_dt"},
 			)
 		else:
@@ -2282,7 +2281,6 @@ def main(argv: list[str] | None = None, *, lifecycle_fn=None,
 		d = fit_data.load_3d_streaming(
 			path=str(data_cfg.input),
 			device=device,
-			sparse_prefetch_backend=data_cfg.sparse_prefetch_backend,
 			skip_channels=_streaming_skip_channels(needed_channels),
 			require_umbilicus=require_umbilicus,
 		)

@@ -31,6 +31,16 @@ coordinate conventions, inference resolution, or pyramid reduction methods.
 The immediate scope is Lasagna volumes. The same layout can accommodate
 Fiber prediction channels without defining new Fiber channel encodings here.
 
+The fiber full-volume runner exports `presence`, `nx`, and `ny` (fiber
+direction), plus `width` when the checkpoint has a width head. Checkpoints
+with a normal head also export `sheet_nx`, `sheet_ny`, and `sheet_grad_mag`
+(fiber/sheet normal, distinct from fiber direction). H/V is not exported.
+These channels share the resolution group when stored at the same scale.
+`presence` remains the validity channel; by default, zero presence blanks
+all other channels, including the normal channels. The manifest's channel
+inventory describes actual exports; checkpoint annotation settings describe
+the model heads, not an independent export switch.
+
 ## Layout and naming
 
 `sd<N>` identifies a group whose finest stored level has `scaledown: N`.
@@ -339,9 +349,32 @@ contribute normal moments or width/embedding means; they are no-data, not
 zero-width measurements. Scalar presence is still reduced normally, and
 non-presence outputs are blanked again where reduced presence is zero.
 
+Each scale group's `.zattrs` records `lasagna_pyramid_downsample` as an
+object mapping channel names to reduction methods (legacy single-channel
+groups instead store one method string). Methods are `mean_pool2x`,
+`mean_pool2x_zero_overrides` (a zero input makes that output invalid),
+`normal_second_moment_mean_pool2x` (joint encoded normal-pair reduction),
+`mean_pool2x_valid_presence` (width/embedding mean over nonzero-presence inputs),
+or `none` (native level only). The embedded manifest's `blank_invalid` setting
+also determines whether normal moments exclude zero-presence inputs.
+
+Native-only products do not advertise or generate coarse levels. Because a
+packed group's channel list is constant across levels, the compact writer
+rejects mixing native-only and pyramid-enabled products at the same native
+scale; use legacy output for that combination. It does not silently override
+a product's native-only policy.
+
 ## Writer defaults and compatibility options
 
 Both full-volume inference entrypoints default to `--output-format compact`.
+Fiber inference defaults to the checkpoint's native output resolution: input
+spacing multiplied by the model's `output_stride`, with no extra pooling.
+For example, input at base/2 and model stride 2 produce native `sd2/2`
+(base/4), not `sd3/3`. `--inference-scaledown-power` explicitly overrides the
+total reduction relative to input, including the model stride; `1` means
+factor 2, not another factor 2 on top of the model's reduction. Coarser pyramid
+levels do not replace or reduce this native level. Provenance records both
+`native_output_stride` and `additional_downsample_factor` (1 by default).
 An explicitly requested `--output-format legacy` writes the old per-channel
 stores and `.lasagna.json`. Existing sidecar outputs retain legacy handling;
 new `.lasagna.json` output arguments are normalized to a `.zarr` store when
@@ -360,8 +393,10 @@ its cache identity so old predictions are not silently reused.
 On-demand accumulation already keeps all raw product channels and their
 shared blend weights in one chunk-local arena record. This remains the
 compound accumulation unit; no per-channel accumulators are introduced.
-Whole-volume mmap accumulator storage, addition order, and precision remain
-unchanged. Only publication combines finalized products into a packed chunk.
+Whole-volume accumulation retains separate raw-channel mmap files and unchanged
+addition order and precision; those scratch files use chunk-major circular-band
+storage for locality. Only publication combines finalized products into a packed
+chunk. Scratch layout is not part of the persisted volume schema.
 
 The accelerated local reader shares the complete decoded payload between
 channel views; it neither re-decodes the same packed chunk once per channel
