@@ -80,4 +80,7 @@ if(TARGET vc_object_server)
     add_executable(test_object_store_hosted_limits test_object_store_hosted_limits.cpp)
     target_link_libraries(test_object_store_hosted_limits PRIVATE vc_object_server nlohmann_json::nlohmann_json)
     add_test(NAME object_store_hosted_limits COMMAND test_object_store_hosted_limits)
+    # Large-store selection benchmark; run by hand, not by ctest.
+    add_executable(bench_object_store_selection bench_object_store_selection.cpp)
+    target_link_libraries(bench_object_store_selection PRIVATE vc_object_server)
 endif()
