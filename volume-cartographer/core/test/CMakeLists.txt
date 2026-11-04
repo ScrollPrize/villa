@@ -71,6 +71,10 @@ vc_add_test(NAME test_fiber_constraint_geometry LIBS doctest::doctest vc_object_
 
 vc_add_test(NAME test_omp_thread_point_collection)
 
+# Repeated pool construction/destruction; hung on Windows before the
+# destructor held the pool mutex around request_stop() (#1686).
+vc_add_test(NAME test_thread_pool_lifecycle)
+
 vc_add_test(NAME test_surface_area_units)
 
 
