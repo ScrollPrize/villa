@@ -321,7 +321,25 @@ touched: a recorded transform during a volume listing, a relationship during a
 an expired feed position. After a bounded number of restarts, or when the feed
 never goes quiet (sustained writes far above interactive rates), it throws
 `StoreBusy`. Length-ordered and unbound-volume listings page by offset and
-restart on any commit.
+restart on any commit. Deleted transform records count as transform changes.
+
+### Selection records
+
+A selection record (`objects/Selections.hpp`) keeps the exact result of an
+object selection as of one commit, so a long job, export or training set can
+read its inputs back later at the same versions while the store moves on. It
+holds the query, the store, generation and commit sequence, every match in
+listing order at its numbered version and, for volume and coordinate
+selections, the versions of the recorded transforms and route choices in force.
+Capture it locally with `recordSelection(store, readTxn, selection)` (one
+snapshot) or hosted with `HostedStore::recordSelection(selection)` (the
+catch-up listing, then the transforms, checked against the feed since the
+listing's commit). Neither accepts explicit transforms or a limit, and the
+local form refuses a volume selection that would use client catalog
+registrations the store has not recorded. `encodeSelectionRecord` gives the
+binary form (a JSON header, then 24 bytes per object: UUID, generation index,
+version), meant to be kept as an artifact; `decodeSelectionRecord` validates
+it. Read the objects back with `objectsAtVersions`.
 
 `bench_object_store_selection` builds a synthetic store and times listings, as
 in this run (1M objects, 6.6 GB, Release, P-cores, 3 iterations, medians):
@@ -332,6 +350,8 @@ in this run (1M objects, 6.6 GB, Release, P-cores, 3 iterations, medians):
 | Hosted, UUIDs only, 10k pages | 2.31 s |
 | Hosted, with name/fiber/track fields | 5.29 s |
 | Hosted, UUIDs only, 60 commits landing during the listing | 2.79 s |
+| Selection record, local (`record` mode) | 1.00 s, 12.0 MB encoded |
+| Selection record, hosted, 10k pages | 2.33 s |
 
 The server answers a request whose payloads have expired from its saved
 receipt when there is one. Otherwise it names the missing payloads, and the

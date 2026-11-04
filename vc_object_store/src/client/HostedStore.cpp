@@ -303,6 +303,27 @@ private:
     }
 };
 
+// Whether any of these objects is (or, deleted, was) a recorded transform or
+// route choice, retired ones included: those move volume matches.
+bool touchesTransforms(HostedStore& store, const std::vector<std::string>& uuids, const std::set<std::string>& deleted,
+                       int64_t pageSize)
+{
+    auto transformKind = [](const std::string& kind) { return kind.starts_with("volume_transform"); };
+    for (std::size_t i = 0; i < uuids.size(); i += std::size_t(pageSize)) {
+        ObjectSelection kinds;
+        kinds.uuids.assign(uuids.begin() + i, uuids.begin() + std::min(uuids.size(), i + std::size_t(pageSize)));
+        kinds.limit = int64_t(kinds.uuids.size());
+        kinds.includeRetired = true;
+        for (const auto& record : store.selectObjects(kinds, std::vector<std::string>{"kind"}))
+            if (transformKind(record.kind)) return true;
+    }
+    for (const auto& uuid : uuids)
+        if (deleted.contains(uuid))
+            for (const auto& revision : store.objectHistory(uuid))
+                if (transformKind(revision.record.kind)) return true;
+    return false;
+}
+
 std::vector<std::string> restrictTo(const std::vector<std::string>& chunk, const std::vector<std::string>& allowed)
 {
     if (allowed.empty()) return chunk;
@@ -366,22 +387,18 @@ std::vector<ObjectRecord> HostedStore::selectAllObjects(ObjectSelection selectio
         };
         // Membership through relationships (connectedTo) changes with them.
         const bool graph = start.connectedTo.has_value();
+        std::set<std::string> deleted;
         listing.effect = [&](const ChangeRecord& change) {
-            if (change.recordKind == "object") return ChangeEffect::Recheck;
+            if (change.recordKind == "object") {
+                if (change.deleted) deleted.insert(change.uuid);
+                return ChangeEffect::Recheck;
+            }
             return graph ? ChangeEffect::Restart : ChangeEffect::Ignore;
         };
         // A recorded transform or route choice can move every volume match.
-        if (start.volume || start.coordinates)
+        if (selectionUsesTransforms(start))
             listing.restartFor = [&](const std::vector<std::string>& uuids) {
-                for (std::size_t i = 0; i < uuids.size(); i += std::size_t(pageSize)) {
-                    ObjectSelection kinds;
-                    kinds.uuids.assign(uuids.begin() + i, uuids.begin() + std::min(uuids.size(), i + std::size_t(pageSize)));
-                    kinds.limit = int64_t(kinds.uuids.size());
-                    kinds.includeRetired = true;
-                    for (const auto& record : selectObjects(kinds, std::vector<std::string>{"kind"}))
-                        if (record.kind.starts_with("volume_transform")) return true;
-                }
-                return false;
+                return touchesTransforms(*this, uuids, deleted, pageSize);
             };
         return listing.run(asOf);
     }
@@ -428,6 +445,64 @@ std::vector<EdgeRecord> HostedStore::selectAllEdges(EdgeSelection selection,
         return endpoints ? ChangeEffect::Restart : ChangeEffect::Ignore;
     };
     return listing.run(asOf);
+}
+
+SelectionRecord HostedStore::recordSelection(const ObjectSelection& selection, int64_t pageSize, int maxRestarts)
+{
+    if (selection.transforms)
+        throw std::invalid_argument("hosted store: selections use the store's recorded transforms, not explicit ones");
+    const auto query = objectQueryRequestToJson(selection, std::nullopt);
+    auto versions = [](const StoreStatus& at, const std::vector<ObjectRecord>& records, std::vector<ObjectVersion>& out) {
+        for (const auto& r : records) {
+            if (!r.version) throw std::runtime_error("hosted store: selected record without a version");
+            out.push_back({at.storeUuid, r.versionGeneration, r.uuid, *r.version});
+        }
+    };
+    for (int attempt = 0; attempt <= maxRestarts; ++attempt) {
+        StoreStatus asOf;
+        const auto objects = selectAllObjects(selection, std::vector<std::string>{}, pageSize, maxRestarts, &asOf);
+        SelectionRecord record{asOf.storeUuid, asOf.generation, asOf.commitSequence, query, {}, {}};
+        versions(asOf, objects, record.objects);
+        if (!selectionUsesTransforms(selection)) return record;
+        // The transforms in force at asOf: read them, then make sure the feed
+        // since asOf touched none of them (the listing itself restarts on
+        // transform changes while it pages).
+        std::vector<ObjectRecord> transforms;
+        int64_t readAt = asOf.commitSequence;
+        bool sameLineage = true;
+        for (const auto* kind : {"volume_transform", "volume_transform_choice"}) {
+            ObjectSelection byKind;
+            byKind.kind = kind;
+            StoreStatus at;
+            auto part = selectAllObjects(byKind, std::vector<std::string>{}, pageSize, maxRestarts, &at);
+            sameLineage = sameLineage && at.storeUuid == asOf.storeUuid && at.generation == asOf.generation;
+            readAt = std::max(readAt, at.commitSequence);
+            transforms.insert(transforms.end(), std::make_move_iterator(part.begin()), std::make_move_iterator(part.end()));
+        }
+        if (!sameLineage) continue;
+        FeedCursor cursor{asOf.storeUuid, asOf.generation, asOf.commitSequence, 0};
+        std::vector<std::string> changed;
+        std::set<std::string> deleted;
+        bool valid = true;
+        while (cursor.sequence < readAt || cursor.offset > 0) {
+            const auto page = changesSince(cursor);
+            if (!page.cursorValid) { valid = false; break; }
+            for (const auto& commit : page.commits)
+                for (const auto& change : commit.changes)
+                    if (change.recordKind == "object") {
+                        changed.push_back(change.uuid);
+                        if (change.deleted) deleted.insert(change.uuid);
+                    }
+            cursor = page.next;
+            if (!page.more) break;
+        }
+        if (!valid || touchesTransforms(*this, changed, deleted, pageSize)) continue;
+        std::sort(transforms.begin(), transforms.end(),
+                  [](const ObjectRecord& a, const ObjectRecord& b) { return a.uuid < b.uuid; });
+        versions(asOf, transforms, record.transforms);
+        return record;
+    }
+    throw StoreBusy("hosted store: transforms kept changing while recording a selection; retry later");
 }
 
 std::vector<ObjectRevision> HostedStore::objectHistory(const std::string& objectUuid, StoreStatus* asOf)

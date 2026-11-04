@@ -13,6 +13,7 @@
 #include "vc_object_store/objects/Artifacts.hpp"
 #include "vc_object_store/objects/GeometryRegion.hpp"
 #include "vc_object_store/objects/ObjectStore.hpp"
+#include "vc_object_store/objects/Selections.hpp"
 #include "vc_object_store/objects/Transactions.hpp"
 
 #include <memory>
@@ -104,6 +105,12 @@ public:
     std::vector<EdgeRecord> selectAllEdges(EdgeSelection,
         const std::optional<std::vector<std::string>>& fields = std::nullopt, int64_t pageSize = 1000,
         int maxRestarts = 3, StoreStatus* asOf = nullptr);
+    // selectAllObjects as a durable SelectionRecord (objects/Selections.hpp):
+    // every match at its version, exact as of one commit, plus the recorded
+    // transforms and route choices in force at that commit for volume and
+    // coordinate selections. Restarts (then StoreBusy) like selectAllObjects,
+    // and when a transform changed while they were read.
+    SelectionRecord recordSelection(const ObjectSelection&, int64_t pageSize = 1000, int maxRestarts = 3);
     // Every recorded revision of an object (empty when it never existed).
     std::vector<ObjectRevision> objectHistory(const std::string& objectUuid, StoreStatus* asOf = nullptr);
     std::vector<SelectedRelationship> relationshipsAt(const std::vector<ObjectVersion>&, StoreStatus* asOf = nullptr);

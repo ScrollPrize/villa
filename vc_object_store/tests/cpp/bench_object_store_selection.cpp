@@ -9,11 +9,15 @@
 //   bench_object_store_selection versions STORE [COUNT] [ITERATIONS]
 //       Times reads of COUNT fibers at their (head) versions: batched versus
 //       one reference at a time, local and hosted.
+//   bench_object_store_selection record STORE [ITERATIONS]
+//       Times selection records of every fiber (local snapshot, hosted pages),
+//       their encoding and size.
 #include "vc_object_store/Uuid.hpp"
 #include "vc_object_store/client/HostedStore.hpp"
 #include "vc_object_store/objects/TransactionJson.hpp"
 #include "vc_object_store/geometry/Geometry.hpp"
 #include "vc_object_store/objects/ObjectStore.hpp"
+#include "vc_object_store/objects/Selections.hpp"
 #include "vc_object_store/server/Server.hpp"
 
 #include <algorithm>
@@ -286,6 +290,50 @@ int versions(const std::string& path, int64_t count, int iterations)
     report("hosted objectAtVersion one request each", single, few.size());
     return 0;
 }
+int record(const std::string& path, int iterations)
+{
+    ObjectSelection fibers;
+    fibers.kind = "fiber";
+    std::vector<double> local, hostedTimes, encode, decode;
+    SelectionRecord captured;
+    std::size_t bytes = 0;
+    {
+        OpenOptions readOnly;
+        readOnly.readOnly = true;
+        auto store = ObjectStore::open(path, readOnly);
+        for (int i = 0; i < iterations; ++i) {
+            auto start = Clock::now();
+            {
+                auto txn = store.read();
+                captured = recordSelection(store, txn, fibers);
+            }
+            local.push_back(seconds(start));
+            start = Clock::now();
+            const auto encoded = encodeSelectionRecord(captured);
+            encode.push_back(seconds(start));
+            bytes = encoded.size();
+            start = Clock::now();
+            if (!(decodeSelectionRecord(encoded) == captured)) throw std::runtime_error("round trip differs");
+            decode.push_back(seconds(start));
+        }
+    }
+    server::Server service(path, server::ServerOptions{});
+    service.start();
+    HostedStore hosted("http://127.0.0.1:" + std::to_string(service.port()));
+    for (int i = 0; i < iterations; ++i) {
+        const auto start = Clock::now();
+        const auto remote = hosted.recordSelection(fibers, 10000);
+        hostedTimes.push_back(seconds(start));
+        if (remote.objects != captured.objects) throw std::runtime_error("hosted record differs");
+    }
+    report("local recordSelection fibers", local, captured.objects.size());
+    report("hosted recordSelection fibers 10k pages", hostedTimes, captured.objects.size());
+    report("encodeSelectionRecord", encode, captured.objects.size());
+    report("decodeSelectionRecord", decode, captured.objects.size());
+    std::cout << "encoded size " << bytes << " bytes (" << double(bytes) / double(captured.objects.size())
+              << " per object)\n";
+    return 0;
+}
 } // namespace
 
 int main(int argc, char** argv)
@@ -293,10 +341,11 @@ try {
     const std::string mode = argc > 1 ? argv[1] : "";
     if (mode == "create" && argc == 4) return create(argv[2], std::stoll(argv[3]));
     if (mode == "list" && (argc == 3 || argc == 4)) return list(argv[2], argc == 4 ? std::stoi(argv[3]) : 3);
+    if (mode == "record" && (argc == 3 || argc == 4)) return record(argv[2], argc == 4 ? std::stoi(argv[3]) : 3);
     if (mode == "versions" && argc >= 3 && argc <= 5)
         return versions(argv[2], argc >= 4 ? std::stoll(argv[3]) : 10000, argc == 5 ? std::stoi(argv[4]) : 5);
     std::cerr << "usage: bench_object_store_selection create STORE COUNT | list STORE [ITERATIONS] |"
-                 " versions STORE [COUNT] [ITERATIONS]\n";
+                 " versions STORE [COUNT] [ITERATIONS] | record STORE [ITERATIONS]\n";
     return 2;
 } catch (const std::exception& error) {
     std::cerr << "bench_object_store_selection: " << error.what() << "\n";
