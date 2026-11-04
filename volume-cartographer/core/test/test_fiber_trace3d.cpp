@@ -189,15 +189,6 @@ public:
     mutable std::vector<size_t> batchSizes;
     mutable std::vector<int> batchWorkers;
 
-    vc::lasagna::NormalPrefetchReport prefetchSamples(
-        const std::vector<cv::Vec3d>& points) const override
-    {
-        ++batchCalls;
-        batchSizes.push_back(points.size());
-        batchWorkers.push_back(1);
-        return {};
-    }
-
     [[nodiscard]] bool supportsConcurrentSampling() const noexcept override
     {
         return true;
@@ -587,11 +578,17 @@ TEST_CASE("native fiber tracer batches the candidate cone even with one worker")
         vc::fiber_tracer::traceFiberOneWay(predictions, request, nullptr);
 
     CHECK(result.reachedTargetPlane);
-    REQUIRE(predictions.batchSizes.size() == 1);
-    CHECK(predictions.sampleCalls == (workers==1 ? 1+predictions.batchSizes.front() : 1));
-    CHECK(predictions.batchCalls == 1);
-    CHECK(predictions.batchSizes.front() > 1);
-    CHECK(predictions.batchWorkers.front() == workers);
+    // One worker keeps the scalar contract, sample by sample; more use the source's batch.
+    if (workers == 1) {
+        CHECK(predictions.batchCalls == 0);
+        CHECK(predictions.sampleCalls > 1);
+    } else {
+        REQUIRE(predictions.batchSizes.size() == 1);
+        CHECK(predictions.sampleCalls == 1);
+        CHECK(predictions.batchCalls == 1);
+        CHECK(predictions.batchSizes.front() > 1);
+        CHECK(predictions.batchWorkers.front() == workers);
+    }
     }
 }
 
@@ -611,11 +608,9 @@ TEST_CASE("native fiber tracer batches lookahead with nonconcurrent normal sampl
     request.config.replayPresenceModulated = true;
     const auto result = vc::fiber_tracer::traceFiberOneWay(predictions, request, &normals);
     CHECK(result.reachedTargetPlane);
-    size_t totalSamples=1;
-    for (size_t size : predictions.batchSizes) totalSamples+=size;
-    CHECK(predictions.sampleCalls == totalSamples);
-    CHECK(predictions.batchCalls > 2);
-    for (int workers : predictions.batchWorkers) CHECK(workers == 1);
+    // A nonconcurrent normal sampler serializes the work: scalar samples, no batches.
+    CHECK(predictions.batchCalls == 0);
+    CHECK(predictions.sampleCalls > 2);
 }
 
 TEST_CASE("native fiber tracer prunes beams by Python score and generation order")

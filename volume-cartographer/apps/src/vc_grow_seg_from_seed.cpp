@@ -2,22 +2,22 @@
 #include <random>
 
 #include "TargetContext.hpp"
-#include "vc/core/util/Slicing.hpp"
+#include "vc/core/util/CudaSampling.hpp"
 #include "vc/core/util/Surface.hpp"
 #include "vc/core/util/QuadSurface.hpp"
 #include "vc/core/util/Geometry.hpp"
 
 #include <opencv2/imgproc.hpp>
-#include "utils/Json.hpp"
-#include "vc/core/types/ChunkedTensor.hpp"
+#include <nlohmann/json.hpp>
 #include "vc/core/types/Volume.hpp"
-#include "vc/core/render/ChunkCache.hpp"
+#include "vc_reader/tifxyz.hpp"
+#include "vc_reader/zarr.hpp"
+#include "vc_reader/array.hpp"
 #include "vc/core/util/StreamOperators.hpp"
 #include "vc/core/util/RemoteCacheSettings.hpp"
 #include "vc/tracer/Tracer.hpp"
 #include "vc/core/util/StoreToolOptions.hpp"
 
-#include "vc/core/types/VcDataset.hpp"
 #include <boost/program_options.hpp>
 
 #include <omp.h>
@@ -39,7 +39,7 @@ namespace po = boost::program_options;
 using shape = std::vector<size_t>;
 
 
-using Json = utils::Json;
+using Json = nlohmann::json;
 
 // The tracer's Ceres solves go through CHOLMOD, whose BLAS calls land in the
 // process-wide OpenBLAS pool. The pthreads build of OpenBLAS sizes that pool
@@ -72,29 +72,21 @@ static void cap_blas_thread_pool()
 #endif
 }
 
-static bool is_remote_volume_path(const std::string& path)
+// Whether a uint8 chunk is stored and holds anything but the fill value.
+static bool chunk_has_source_data(vcr::Array& volume, std::int64_t iz, std::int64_t iy, std::int64_t ix)
 {
-    return path.rfind("http://", 0) == 0 ||
-           path.rfind("https://", 0) == 0 ||
-           path.rfind("s3://", 0) == 0;
+    const auto chunk = volume.chunk({iz, iy, ix});
+    const std::uint8_t fill = volume.spec().fill[0];
+    return chunk && std::any_of(chunk->begin(), chunk->end(), [fill](std::uint8_t v) { return v != fill; });
 }
 
-static bool chunk_has_source_data(vc::render::IChunkedArray& chunks,
-                                  int level,
-                                  size_t iz,
-                                  size_t iy,
-                                  size_t ix)
+// Trilinear volume value at an XYZ location.
+static double volume_value(vcr::Array& volume, const cv::Vec3d& xyz)
 {
-    const auto result = chunks.getChunkBlocking(level,
-                                                static_cast<int>(iz),
-                                                static_cast<int>(iy),
-                                                static_cast<int>(ix));
-    if (result.status == vc::render::ChunkStatus::Error) {
-        throw std::runtime_error(result.error.empty()
-            ? std::string("Failed to read zarr chunk")
-            : result.error);
-    }
-    return result.status == vc::render::ChunkStatus::Data;
+    const double zyx[3] = {xyz[2], xyz[1], xyz[0]};
+    float value = 0.0f;
+    vc::cuda::sampleLinear(volume, vcr::ElementType{'u', 1, false}, vc::cuda::toolReaderOf(volume), zyx, 1, &value);
+    return value;
 }
 
 std::string time_str()
@@ -112,92 +104,31 @@ std::string time_str()
     return oss.str();
 }
 
-template <typename T, typename I>
-float get_val(I &interp, cv::Vec3d l) {
-    T v;
-    interp.Evaluate(l[2], l[1], l[0], &v);
-    return v;
-}
-
+// The tifxyz surfaces in tgt_dir named with the prefix: vc_reader lists the directories
+// holding one (a directory missing a coordinate file is not listed; one whose metadata
+// cannot be read is skipped with a message). Only surfaces with a bbox can be compared.
 bool check_existing_segments(const std::filesystem::path& tgt_dir, const cv::Vec3d& origin,
                            const std::string& name_prefix, int search_effort) {
-    for (const auto& entry : std::filesystem::directory_iterator(tgt_dir)) {
-        if (!std::filesystem::is_directory(entry)) {
-            continue;
-        }
-
-        std::string name = entry.path().filename().string();
+    for (const auto& entry : vcr::tifxyz::list(tgt_dir.string(), false)) {
+        const std::string name = std::filesystem::path(entry.location).filename().string();
         if (name.compare(0, name_prefix.size(), name_prefix)) {
             continue;
         }
-
-        std::filesystem::path meta_fn = entry.path() / "meta.json";
-        if (!std::filesystem::exists(meta_fn)) {
+        if (!entry.error.empty()) {
+            std::cerr << "Skipping " << entry.location << ": " << entry.error << std::endl;
+            continue;
+        }
+        if (!entry.metadata.bbox) {
             continue;
         }
 
-        auto meta = utils::Json::parse_file(meta_fn);
-
-        if (!meta.count("bbox") || meta.value("format", std::string{"NONE"}) != "tifxyz") {
-            continue;
-        }
-
-        QuadSurface other(entry.path(), meta);
+        QuadSurface other(entry.location);
         if (contains(other, origin, search_effort)) {
-            std::cout << "Found overlapping segment at location: " << entry.path() << std::endl;
+            std::cout << "Found overlapping segment at location: " << entry.location << std::endl;
             return true;
         }
     }
     return false;
-}
-
-static auto load_direction_fields(Json const&params, std::filesystem::path const &cache_root)
-{
-    std::vector<DirectionField> direction_fields;
-    if (params.contains("direction_fields")) {
-        if (!params["direction_fields"].is_array()) {
-            std::cerr << "WARNING: direction_fields must be an array; ignoring" << std::endl;
-        }
-        for (auto const& direction_field : params["direction_fields"]) {
-            std::string const zarr_path = direction_field["zarr"].get_string();
-            std::string const direction = direction_field["dir"].get_string();
-            if (!std::ranges::contains(std::vector{"horizontal", "vertical", "normal"}, direction)) {
-                std::cerr << "WARNING: invalid direction in direction_field " << zarr_path << "; skipping" << std::endl;
-                continue;
-            }
-            int const ome_scale = direction_field["scale"].get_int();
-            float scale_factor = std::pow(2, -ome_scale);
-            std::filesystem::path dirs_group_path(zarr_path);
-            std::vector<std::unique_ptr<vc::VcDataset>> direction_dss;
-            for (auto dim : std::string("xyz")) {
-                std::filesystem::path dim_ds_path = dirs_group_path / std::string(&dim, 1) / std::to_string(ome_scale);
-                direction_dss.push_back(std::make_unique<vc::VcDataset>(dim_ds_path));
-            }
-            std::cout << "direction field dataset shape " << direction_dss.front()->shape() << std::endl;
-            std::unique_ptr<vc::VcDataset> maybe_weight_ds;
-            if (direction_field.contains("weight_zarr")) {
-                std::string const weight_zarr_path = direction_field["weight_zarr"].get_string();
-                std::filesystem::path weight_ds_path = std::filesystem::path(weight_zarr_path) / std::to_string(ome_scale);
-                maybe_weight_ds = std::make_unique<vc::VcDataset>(weight_ds_path);
-            }
-            std::string const unique_id = std::to_string(std::hash<std::string>{}(dirs_group_path.string() + std::to_string(ome_scale)));
-            float weight = 1.0f;
-            if (direction_field.contains("weight")) {
-                try {
-                    weight = std::clamp(direction_field["weight"].get_float(), 0.0f, 10.0f);
-                } catch (const std::exception& ex) {
-                    std::cerr << "WARNING: invalid weight for direction field " << zarr_path << ": " << ex.what() << std::endl;
-                }
-            }
-
-            direction_fields.emplace_back(
-                direction,
-                std::make_unique<Chunked3dVec3fFromUint8>(std::move(direction_dss), scale_factor, cache_root, unique_id),
-                maybe_weight_ds ? std::make_unique<Chunked3dFloatFromUint8>(std::move(maybe_weight_ds), scale_factor, cache_root, unique_id + "_conf") : std::unique_ptr<Chunked3dFloatFromUint8>(),
-                weight);
-        }
-    }
-    return direction_fields;
 }
 
 // A remote chunk fetch that fails after its retries ends in a std::runtime_error. run_main catches
@@ -210,6 +141,7 @@ int main(int argc, char *argv[])
 {
     // First, before anything can issue a BLAS call.
     cap_blas_thread_pool();
+    vc::cuda::applyToolOptions(argc, argv);
 
     try {
         return run_main(argc, argv);
@@ -232,6 +164,7 @@ static int run_main(int argc, char *argv[])
 {
     std::filesystem::path vol_path, tgt_dir, params_path, resume_path, correct_path;
     cv::Vec3d origin;
+    bool explicit_seed = false;
     Json params;
     PointCollections corrections;
     std::string segment_name;
@@ -323,6 +256,7 @@ static int run_main(int argc, char *argv[])
                 return EXIT_FAILURE;
             }
             origin = {seed_coords[0], seed_coords[1], seed_coords[2]};
+            explicit_seed = true;
         }
         if (vm.count("resume")) {
             resume_path = vm["resume"].as<std::string>();
@@ -341,7 +275,7 @@ static int run_main(int argc, char *argv[])
             }
         }
         
-        params = Json::parse_file(params_path);
+        params = nlohmann::json::parse(std::ifstream(params_path));
 
         if (vm.count("rewind-gen")) {
             params["rewind_gen"] = vm["rewind-gen"].as<int>();
@@ -377,47 +311,40 @@ static int run_main(int argc, char *argv[])
     }
 
     if (params.empty()) {
-        params = Json::parse_file(params_path);
+        params = nlohmann::json::parse(std::ifstream(params_path));
     }
 
-    // Honor optional CUDA toggle from params (default true)
-    if (params.contains("use_cuda")) {
-        set_space_tracing_use_cuda(params.value("use_cuda", true));
-    } else {
-        set_space_tracing_use_cuda(true);
-    }
 
     const std::string volume_arg = vol_path.string();
-    const bool remote_volume = is_remote_volume_path(volume_arg);
+    const bool remote_volume = vcr::zarr::isRemote(volume_arg);
     const double requested_voxelsize = params.value("voxelsize", 0.0);
-    utils::Json remote_metadata;
+    nlohmann::json remote_metadata;
     if (std::isfinite(requested_voxelsize) && requested_voxelsize > 0.0)
         remote_metadata["voxelsize"] = requested_voxelsize;
-    if (remote_volume) {
-        // Same VC3D.ini disk budget as the VC3D app, so long traces cannot fill the disk.
-        vc::settings::configureRemoteCacheBudget();
-    }
     auto volume = remote_volume
-        ? Volume::NewFromUrl(volume_arg, {}, remote_metadata)
+        ? Volume::NewFromUrl(volume_arg, remote_metadata)
         : Volume::New(vol_path);
-    if (!volume->hasScaleLevel(0)) {
-        // The tracer reads scale group 0 only; on a sparse pyramid those reads
-        // would silently come back as fill value instead of failing.
-        std::cerr << "ERROR: volume has no full-resolution level 0, which the tracer reads;"
-                  << " present levels:";
-        for (int level : volume->presentScaleLevels())
-            std::cerr << " " << level;
-        std::cerr << std::endl;
+    auto level0_options = volume->sourceOpenOptions();
+    level0_options.memoryCache = std::make_shared<vcr::MemoryCache>(size_t(params.value("cache_size", 1e9)));
+    // The tracer reads this level only: a sparse pyramid without it fails here.
+    std::shared_ptr<vcr::zarr::OpenedArray> level0;
+    try {
+        level0 = std::make_shared<vcr::zarr::OpenedArray>(vcr::zarr::openPyramidLevel(
+            volume->sourceLocation(), volume->baseScaleLevel(), level0_options));
+    } catch (const std::out_of_range& e) {
+        std::cerr << "ERROR: the tracer needs the volume's full-resolution level: " << e.what() << std::endl;
         return EXIT_FAILURE;
     }
-    vc::render::processChunkCacheService()->configureDecodedByteCapacity(
-        size_t(params.value("cache_size", 1e9)));
-    auto* chunk_cache = volume->chunkedCache();
+    if (level0->meta.type.kind != 'u' || level0->meta.itemsize() != 1) {
+        std::cerr << "ERROR: the tracer reads uint8 volumes, not " << level0->meta.dtype << std::endl;
+        return EXIT_FAILURE;
+    }
+    (void)vc::cuda::toolReader(*level0);
+    vcr::Array& tracing_volume = *level0->array;
     const std::array<int, 3> volume_shape_zyx{
-        volume->numSlices(),
-        volume->sliceHeight(),
-        volume->sliceWidth()};
-    const auto chunk_shape_zyx = chunk_cache->chunkShape(0);
+        int(level0->meta.shape[0]), int(level0->meta.shape[1]), int(level0->meta.shape[2])};
+    const std::array<int, 3> chunk_shape_zyx{
+        int(level0->meta.chunks[0]), int(level0->meta.chunks[1]), int(level0->meta.chunks[2])};
 
     std::cout << "zarr dataset size for scale group 0 "
               << "[" << volume_shape_zyx[0] << ", " << volume_shape_zyx[1] << ", " << volume_shape_zyx[2] << "]"
@@ -425,10 +352,6 @@ static int run_main(int argc, char *argv[])
     std::cout << "chunk shape shape "
               << "[" << chunk_shape_zyx[0] << ", " << chunk_shape_zyx[1] << ", " << chunk_shape_zyx[2] << "]"
               << std::endl;
-
-    passTroughComputor pass;
-    Chunked3d<uint8_t,passTroughComputor> tensor(pass, volume_shape_zyx, chunk_cache, 0);
-    CachedChunked3dInterpolator<uint8_t,passTroughComputor> interpolator(tensor);
 
     auto chunk_size = chunk_shape_zyx;
 
@@ -468,13 +391,6 @@ static int run_main(int argc, char *argv[])
         voxelsize = static_cast<float>(params_voxelsize);
     }
     
-    std::filesystem::path cache_root;
-    if (params.contains("cache_root") && params["cache_root"].is_string()) {
-        cache_root = params["cache_root"].get_string();
-    } else if (params.contains("cache_root") && !params["cache_root"].is_null()) {
-        std::cerr << "WARNING: cache_root must be a string; ignoring" << std::endl;
-    }
-
     std::string mode = params.value("mode", std::string("seed"));
     
     std::cout << "mode: " << mode << std::endl;
@@ -502,8 +418,6 @@ static int run_main(int argc, char *argv[])
         return EXIT_FAILURE;
     }
 
-    auto direction_fields = load_direction_fields(params, cache_root);
-
     std::unordered_map<std::string,QuadSurface*> surfs;
     std::vector<QuadSurface*> surfs_v;
     QuadSurface *src;
@@ -523,32 +437,29 @@ static int run_main(int argc, char *argv[])
             //after growing, check locations on the new seg agains all existing segs
 
         if (!store)
-        for (const auto& entry : std::filesystem::directory_iterator(tgt_dir))
-            if (std::filesystem::is_directory(entry)) {
-                std::string name = entry.path().filename().string();
-                if (name.compare(0, name_prefix.size(), name_prefix))
-                    continue;
-
-                std::cout << entry.path() << entry.path().filename() << std::endl;
-
-                std::filesystem::path meta_fn = entry.path() / "meta.json";
-                if (!std::filesystem::exists(meta_fn))
-                    continue;
-
-                auto meta = utils::Json::parse_file(meta_fn);
-
-                if (!meta.count("bbox"))
-                    continue;
-
-                if (meta.value("format", std::string{"NONE"}) != "tifxyz")
-                    continue;
-
-                QuadSurface *sm = new QuadSurface(entry.path(), meta);
-
-                surfs[name] = sm;
-                surfs_v.push_back(sm);
+        for (const auto& entry : vcr::tifxyz::list(tgt_dir.string(), false)) {
+            const std::filesystem::path location(entry.location);
+            std::string name = location.filename().string();
+            if (name.compare(0, name_prefix.size(), name_prefix))
+                continue;
+            if (!entry.error.empty()) {
+                std::cerr << "Skipping " << entry.location << ": " << entry.error << std::endl;
+                continue;
             }
-            
+
+            std::cout << location << location.filename() << std::endl;
+
+            if (!entry.metadata.bbox)
+                continue;
+            if (entry.metadata.extra.value("format", std::string{"NONE"}) != "tifxyz")
+                continue;
+
+            QuadSurface *sm = new QuadSurface(location, entry.metadata.document());
+
+            surfs[name] = sm;
+            surfs_v.push_back(sm);
+        }
+
         if (!store && !surfs.size()) {
             std::cerr << "ERROR: no seed surfaces found in expansion mode" << std::endl; 
             return EXIT_FAILURE;
@@ -568,7 +479,7 @@ static int run_main(int argc, char *argv[])
                 {
                     cv::Vec2i p = {rand() % h, rand() % w};
                     
-                    if (points(p)[0] != -1 && get_val<double,CachedChunked3dInterpolator<uint8_t,passTroughComputor>>(interpolator, points(p)) >= 128) {
+                    if (points(p)[0] != -1 && volume_value(tracing_volume, points(p)) >= 128) {
                         found = true;
                         origin = points(p);
                         break;
@@ -594,7 +505,7 @@ static int run_main(int argc, char *argv[])
                         cv::Vec2i p_eval = p;
                         for(int r=0;r<5;r++) {
                             cv::Vec2i p_eval = p+r*searchdir;
-                            if (points(p_eval)[0] == -1 || get_val<double,CachedChunked3dInterpolator<uint8_t,passTroughComputor>>(interpolator, points(p_eval)) < 128) {
+                            if (points(p_eval)[0] == -1 || volume_value(tracing_volume, points(p_eval)) < 128) {
                                 found = false;
                                 break;
                             }
@@ -669,13 +580,11 @@ static int run_main(int argc, char *argv[])
             mode = "resume";
         } else if (use_old_args && argc == 7) {
             mode = "explicit_seed";
-            double v;
-            interpolator.Evaluate(origin[2], origin[1], origin[0], &v);
+            const double v = volume_value(tracing_volume, origin);
             std::cout << "seed location " << origin << " value is " << v << std::endl;
-        } else if (!use_old_args && origin[0] != 0 && origin[1] != 0 && origin[2] != 0) {
+        } else if (!use_old_args && explicit_seed) {
             mode = "explicit_seed";
-            double v;
-            interpolator.Evaluate(origin[2], origin[1], origin[0], &v);
+            const double v = volume_value(tracing_volume, origin);
             std::cout << "seed location " << origin << " value is " << v << std::endl;
         }
         else {
@@ -695,7 +604,7 @@ static int run_main(int argc, char *argv[])
                 chunk_id[1] = origin[1]/chunk_id[1];
                 chunk_id[2] = origin[0]/chunk_id[2];
 
-                if (!chunk_has_source_data(*chunk_cache, 0, chunk_id[0], chunk_id[1], chunk_id[2]))
+                if (!chunk_has_source_data(tracing_volume, chunk_id[0], chunk_id[1], chunk_id[2]))
                     continue;
 
                 cv::Vec3d dir = {static_cast<double>((rand() % 1024) - 512),
@@ -704,9 +613,8 @@ static int run_main(int argc, char *argv[])
                 cv::normalize(dir, dir);
 
                 for(int i=0;i<128;i++) {
-                    double v;
                     cv::Vec3d p = origin + i*dir;
-                    interpolator.Evaluate(p[2], p[1], p[0], &v);
+                    const double v = volume_value(tracing_volume, p);
                     if (v >= 128) {
                         if (store ? !stored_surfaces_near(p, 2.0).empty()
                                   : check_existing_segments(tgt_dir, p, name_prefix, search_effort))
@@ -785,7 +693,7 @@ static int run_main(int argc, char *argv[])
 
     // Store mode output: a new surface object recording how it was made.
     auto publish = [&](QuadSurface& output, const std::string& name, const Json& meta, const std::vector<std::string>& sources) {
-        const auto uuid = store->create(output, name, nlohmann::json::parse(meta.dump()), sources, output_tags,
+        const auto uuid = store->create(output, name, meta, sources, output_tags,
                                         volume_voxels);
         store->objects().finish();
         std::cout << "surface_uuid: " << uuid << std::endl;
@@ -887,7 +795,9 @@ static int run_main(int argc, char *argv[])
                     continue;
                 }
 
-                cv::Vec3f n = src_surface->gridNormal(r, c);
+                cv::Vec3f n;
+                const float nGrid[]{float(c),float(r)};
+                src_surface->pointSurface()->pointsAt(nGrid,1,nullptr,n.val);
                 if (!std::isfinite(n[0]) || !std::isfinite(n[1]) || !std::isfinite(n[2])) {
                     continue;
                 }
@@ -938,7 +848,7 @@ static int run_main(int argc, char *argv[])
                     }
 
                     const cv::Vec3d pos = cv::Vec3d(start[0], start[1], start[2]) + cv::Vec3d(n[0], n[1], n[2]) * t;
-                    const float v = get_val<double, CachedChunked3dInterpolator<uint8_t,passTroughComputor>>(interpolator, pos);
+                    const float v = volume_value(tracing_volume, pos);
                     if (!std::isfinite(v)) {
                         continue;
                     }
@@ -1514,12 +1424,13 @@ static int run_main(int argc, char *argv[])
             std::cout << "  Resizing grid from " << cols << "x" << rows
                       << " to " << new_cols << "x" << new_rows << std::endl;
 
-            // Custom bilinear interpolation that properly handles invalid markers
+            // Resize with the reader's masked interpolation and half-pixel coordinates.
             // cv::resize doesn't work because it interpolates invalid (-1,-1,-1) markers
             // as if they were real coordinates, corrupting the result
             cv::Mat_<cv::Vec3f> resized_points(new_rows, new_cols);
             resized_points.setTo(invalid_marker);
 
+            const auto surface = QuadSurface(dst_points, {1, 1}).pointSurface();
             #pragma omp parallel for schedule(static)
             for (int new_r = 0; new_r < new_rows; ++new_r) {
                 for (int new_c = 0; new_c < new_cols; ++new_c) {
@@ -1528,34 +1439,10 @@ static int run_main(int argc, char *argv[])
                     float orig_r = (static_cast<float>(new_r) + 0.5f) / static_cast<float>(scale_factor) - 0.5f;
                     float orig_c = (static_cast<float>(new_c) + 0.5f) / static_cast<float>(scale_factor) - 0.5f;
 
-                    // Clamp to valid range
-                    orig_r = std::clamp(orig_r, 0.0f, static_cast<float>(rows - 1));
-                    orig_c = std::clamp(orig_c, 0.0f, static_cast<float>(cols - 1));
-
-                    // Bilinear interpolation indices
-                    int r0 = static_cast<int>(std::floor(orig_r));
-                    int c0 = static_cast<int>(std::floor(orig_c));
-                    int r1 = std::min(r0 + 1, rows - 1);
-                    int c1 = std::min(c0 + 1, cols - 1);
-
-                    // Check all 4 corners are valid - skip if any are invalid
-                    if (!vc::geometry::validSurfacePoint(dst_points(r0, c0)) || !vc::geometry::validSurfacePoint(dst_points(r0, c1)) ||
-                        !vc::geometry::validSurfacePoint(dst_points(r1, c0)) || !vc::geometry::validSurfacePoint(dst_points(r1, c1))) {
-                        continue;  // Leave as invalid marker
-                    }
-
-                    float t_r = orig_r - static_cast<float>(r0);
-                    float t_c = orig_c - static_cast<float>(c0);
-
-                    cv::Vec3f p00 = dst_points(r0, c0);
-                    cv::Vec3f p01 = dst_points(r0, c1);
-                    cv::Vec3f p10 = dst_points(r1, c0);
-                    cv::Vec3f p11 = dst_points(r1, c1);
-
-                    // Bilinear interpolation of world coordinates
-                    cv::Vec3f top = p00 * (1.0f - t_c) + p01 * t_c;
-                    cv::Vec3f bot = p10 * (1.0f - t_c) + p11 * t_c;
-                    resized_points(new_r, new_c) = top * (1.0f - t_r) + bot * t_r;
+                    const float xy[]{std::clamp(orig_c, 0.f, float(cols-1)), std::clamp(orig_r, 0.f, float(rows-1))};
+                    cv::Vec3f point;
+                    surface->pointsAt(xy, 1, point.val, nullptr);
+                    if (std::isfinite(point[0])) resized_points(new_r, new_c) = point;
                 }
             }
 
@@ -1611,8 +1498,8 @@ static int run_main(int argc, char *argv[])
         add_target_context(refine_meta, vol_path);
         std::unique_ptr<QuadSurface> refined;
         try {
-            refined.reset(tracer(*volume, 1.0, 0, {0, 0, 0}, refine, cache_root.string(), voxelsize,
-                                 load_direction_fields(refine, cache_root), out_surf.get(),
+            refined.reset(tracer(tracing_volume, 1.0, {0, 0, 0}, refine, voxelsize,
+                                 out_surf.get(),
                                  store ? std::filesystem::path() : out_dir, refine_meta, corrections, nullptr));
         } catch (const std::exception& e) {
             std::cerr << "ERROR: vc_grow_seg_from_seed: neighbor refinement failed: " << e.what() << std::endl;
@@ -1625,7 +1512,7 @@ static int run_main(int argc, char *argv[])
 
     QuadSurface *surf = nullptr;
     try {
-        surf = tracer(*volume, 1.0, 0, origin, params, cache_root.string(), voxelsize, direction_fields, resume_surf.get(), seg_dir, meta_params, corrections, nullptr);
+        surf = tracer(tracing_volume, 1.0, origin, params, voxelsize, resume_surf.get(), seg_dir, meta_params, corrections, nullptr);
     } catch (const std::exception& e) {
         // A growth failure (e.g. a remote normal-grid store whose metadata
         // could not be fetched) must exit as a normal tool failure, not crash
@@ -1639,7 +1526,7 @@ static int run_main(int argc, char *argv[])
     if (min_area_cm > 0.0f) {
         // area_cm2 is guaranteed present here: the startup check rejects an
         // unusable voxel size, and storeAreaMeta() omits the key only then.
-        const double area_cm2 = surf->meta["area_cm2"].get_double();
+        const double area_cm2 = surf->meta["area_cm2"].get<double>();
         if (area_cm2 < min_area_cm) {
             std::cout << "discarding generated surface because area_cm2 " << area_cm2
                       << " is below min_area_cm " << min_area_cm << std::endl;
@@ -1677,7 +1564,7 @@ static int run_main(int argc, char *argv[])
     }
 
 #if defined(_WIN32)
-    // Skip CRT shutdown: live worker threads (ChunkCache IO pool, OpenMP)
+    // Skip CRT shutdown: live worker threads (vc_reader pools, OpenMP)
     // deadlock Windows DLL-detach/static-destructor teardown, leaving the
     // process alive after main() returns — VC3D then never sees the tool
     // finish. Same approach as VC3D's own main().

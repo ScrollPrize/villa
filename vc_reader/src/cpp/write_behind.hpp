@@ -44,18 +44,24 @@ public:
     WriteBehind& operator=(const WriteBehind&) = delete;
 
     // Queues `write` for `key`; until it has run, pending(key) returns `visible`
-    // (nullptr: the chunk is known to be missing). Blocks while more than the
-    // byte budget is waiting to be written.
-    void submit(const std::string& key, ChunkPtr visible, std::size_t bytes, std::function<void()> write)
+    // (nullptr: the chunk is known to be missing). When the byte budget is full,
+    // `wait` blocks until there is room; otherwise the write is dropped and false
+    // returned, so reads never run at the disk write rate.
+    bool submit(const std::string& key, ChunkPtr visible, std::size_t bytes, std::function<void()> write, bool wait)
     {
         std::unique_lock lock(mutex_);
-        room_.wait(lock, [&] { return queued_bytes_ == 0 || queued_bytes_ + bytes <= max_bytes_; });
+        const auto room = [&] { return queued_bytes_ == 0 || queued_bytes_ + bytes <= max_bytes_; };
+        if (wait)
+            room_.wait(lock, room);
+        else if (!room())
+            return false;
         const std::uint64_t gen = ++generation_;
         visible_[key] = {std::move(visible), gen};
         queue_.push_back(Item{key, gen, bytes, std::move(write)});
         queued_bytes_ += bytes;
         ++outstanding_;
         cv_.notify_one();
+        return true;
     }
 
     // (true, chunk) if `key` has a write queued or running.

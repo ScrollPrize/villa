@@ -31,6 +31,7 @@ class QuadSurface;
 // are fetched one at a time in the background and drawn as each arrives.
 class StoreSurfaceOverlayController : public ViewerOverlayControllerBase
 {
+    friend int runViewerRegressionTests();
     Q_OBJECT
 public:
     StoreSurfaceOverlayController(CState* state, ViewerManager* manager, QObject* parent = nullptr);
@@ -133,7 +134,6 @@ private:
     void drawSurfaceViewer(VolumeViewerBase* viewer, View& v, OverlayBuilder& builder);
 
     CState* _state;
-    std::string _volume;
     std::vector<std::string> _surfaces;
     std::set<std::string> _highlighted;
     std::uint64_t _styleVersion{0};

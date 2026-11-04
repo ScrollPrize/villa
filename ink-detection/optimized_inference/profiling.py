@@ -335,16 +335,6 @@ class _ScopeTimer:
         self.sink.add_duration(self.metric_name, elapsed, flag=self.flag, semantics=self.semantics)
 
 
-class TransferTracker:
-    def __init__(self):
-        self.bytes_transferred = 0
-        self._lock = threading.Lock()
-
-    def __call__(self, bytes_amount: int) -> None:
-        with self._lock:
-            self.bytes_transferred += int(bytes_amount)
-
-
 class WorkerProfiler(MetricSink):
     def __init__(self, output_dir: str):
         self.output_dir = maybe_mkdir(output_dir)
@@ -1472,16 +1462,13 @@ def copy_bundle_to_prefix(prefix: str, files: Dict[str, str | Path]) -> None:
     if not prefix:
         return
     if prefix.startswith("s3://"):
-        import boto3
+        from vc_reader.reader import ObjectStore
 
-        bucket, key_prefix = parse_s3_uri(prefix)
-        s3_client = boto3.client("s3")
+        store = ObjectStore(prefix)
         for name, file_path in files.items():
             source = Path(file_path)
-            if not source.exists():
-                continue
-            key = f"{key_prefix.rstrip('/')}/{name}" if key_prefix else name
-            s3_client.upload_file(str(source), bucket, key)
+            if source.exists():
+                store.write(name, source.read_bytes())
         return
 
     destination = Path(prefix)

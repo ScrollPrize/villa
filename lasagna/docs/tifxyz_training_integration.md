@@ -697,53 +697,25 @@ inter-sheet space (splat along normals).
 
 ## 9. Shared GPU-Accelerated EDT Utility
 
-The per-surface distance transforms in §3.2 are the computational bottleneck of
-on-the-fly label derivation. A shared GPU-accelerated EDT utility is provided at
-`vesuvius.image_proc.edt` to make this fast.
-
-### Location
-
-`vesuvius/src/vesuvius/image_proc/edt.py`
-
-### Public API
+The shared distance-only API is `vc_reader.transforms.DistanceTransform`, with
+native CPU and CUDA backends. Arrays have a leading channel dimension.
 
 ```python
-from vesuvius.image_proc.edt import distance_transform_edt, signed_distance_field, edt_dilate
+import vc_reader.transforms as A
 
-# Drop-in replacement for scipy.ndimage.distance_transform_edt
-dt = distance_transform_edt(~surface_mask)
+pipeline = A.Pipeline([A.DistanceTransform(on="label", mode="outside")], targets={"label": A.Label()}, backend="cpu")
+dt = pipeline({"label": binary_mask[None]}, seed=0)["label_sdt"][0]
+dilated = dt <= 8
 
-# Signed distance field (positive inside, negative outside)
-sdf = signed_distance_field(binary_mask)
-
-# Fast binary dilation via EDT thresholding
-dilated = edt_dilate(binary_mask, radius_voxels=8)
+# Signed distance is positive outside and negative inside.
+signed = A.Pipeline([A.DistanceTransform(on="label", mode="signed")], targets={"label": A.Label()}, backend="cpu")
+sdf = signed({"label": binary_mask[None]}, seed=0)["label_sdt"][0]
 ```
 
-### Backend priority
-
-| Priority | Backend | Package | Notes |
-|----------|---------|---------|-------|
-| 1 | `cupyx.scipy.ndimage.distance_transform_edt` | `cupy-cuda12x` | GPU PBA 3D, 10-50x faster |
-| 2 | `edt.edt()` | `edt` | CPU Felzenszwalb, parallel, ~5-10x faster than scipy |
-| 3 | `scipy.ndimage.distance_transform_edt` | `scipy` | CPU baseline, always available |
-
-Backend is resolved once per process and cached. CuPy uses
-`float64_distances=False` and a non-blocking stream for async GPU→CPU transfer.
-
-### Installation
-
-GPU acceleration requires CuPy matching your CUDA version:
-```bash
-pip install cupy-cuda12x   # CUDA 12.x
-```
-
-The `edt` package is a good CPU-only fallback:
-```bash
-pip install edt
-```
-
-Neither is required — scipy is always available as the final fallback.
+Use `backend="cuda"` with a CUDA-enabled vc_reader build. A class absent from
+the crop contributes zero distance by default; `implicit_background=True`
+selects SciPy's implicit-background convention. Nearest-feature indices used
+below are a separate requirement and are not returned by this distance-only API.
 
 ### Usage in tifxyz training (§3.2–3.3)
 

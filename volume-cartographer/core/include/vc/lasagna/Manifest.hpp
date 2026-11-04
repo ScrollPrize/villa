@@ -1,6 +1,6 @@
 #pragma once
 
-#include "vc/core/util/RemoteAuth.hpp"
+#include <vc_reader/native/reader_types.hpp>
 
 #include <filesystem>
 #include <array>
@@ -14,11 +14,6 @@
 
 namespace vc::lasagna {
 
-enum class NormalSourceKind {
-    None,
-    DenseZarr,
-};
-
 struct LasagnaChannelGroup {
     std::string name;
     // Original manifest-relative Zarr key. This remains authoritative for
@@ -26,17 +21,12 @@ struct LasagnaChannelGroup {
     // ordinary datasets and diagnostics.
     std::string relativeZarrKey;
     std::filesystem::path zarrPath;
-    // Authoritative local path or remote locator serialized into VC projects.
-    // Runtime endpoint and cache details remain separate below.
+    // Authoritative local path or remote locator serialized into VC projects;
+    // a remote group's array is opened at this URL.
     std::string sourceLocation;
-    // Non-empty when this group is opened through a remote read-through store.
-    // remoteZarrBaseUrl is either the manifest artifact root with
-    // remoteZarrKey naming the relative Zarr group, or the Zarr root itself
-    // with an empty remoteZarrKey for absolute remote group paths.
-    std::string remoteZarrBaseUrl;
-    std::string remoteZarrKey;
+    // Remote groups: the vc_reader disk cache directory of their chunks and
+    // whether the environment's AWS credentials may sign requests (vcr::zarr::resolveAccess).
     std::filesystem::path remoteCacheRoot;
-    vc::HttpAuth remoteAuth;
     bool discoverAwsCredentials = true;
     int scaledown = 0;
     std::vector<std::string> channels;
@@ -63,22 +53,14 @@ struct LasagnaDatasetManifest {
     std::optional<std::filesystem::path> initShellDir;
     std::vector<LasagnaChannelGroup> groups;
 
-    // Set by LasagnaDataset::open when the manifest is accompanied by the
-    // VC read-through-cache marker, or by LasagnaDataset::openLocation for a
-    // direct remote manifest.
-    std::string remoteBaseUrl;
-    // Original marker or manifest origin used to form readable project paths.
+    // Where the manifest's relative groups live: the marker's artifact URL (LasagnaDataset::open
+    // with the VC read-through-cache marker) or the remote manifest's parent (openLocation), as
+    // requests use it, a signed query included. Empty for a plain local manifest.
     std::string remoteSourceBaseLocation;
     std::filesystem::path remoteCacheRoot;
     // A cached public catalog marker sets this false so later group opens do
     // not accidentally inherit invalid credentials from the host machine.
     bool discoverAwsCredentials = true;
-
-    // Backward-compatible summary for old callers: a Lasagna dataset's
-    // normal source is its manifest when nx/ny channels are present.
-    std::optional<std::filesystem::path> normalPath;
-    NormalSourceKind normalSourceKind = NormalSourceKind::None;
-    std::string normalSourceKey;
 
     nlohmann::json raw = nlohmann::json::object();
 
@@ -111,7 +93,6 @@ struct LasagnaDatasetManifest {
     const std::array<std::size_t, 3>& toShapeZYX,
     int maximumAbsoluteLevel = 30);
 
-[[nodiscard]] std::string toString(NormalSourceKind kind);
 
 // Alias predicted sheet_* heads as normals without changing packed channel indices.
 [[nodiscard]] LasagnaDatasetManifest fiberNormalManifest(const LasagnaDatasetManifest&);

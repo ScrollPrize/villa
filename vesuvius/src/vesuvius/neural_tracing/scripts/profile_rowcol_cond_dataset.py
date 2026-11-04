@@ -462,7 +462,7 @@ def main() -> None:
     training_mode = str(config.get("training_mode", "rowcol_hidden"))
     if args.include_prepare_batch and prepare_device.type != "cuda":
         raise RuntimeError(
-            "--include-prepare-batch requires a CUDA device because target preparation uses cupyx EDT."
+            "--include-prepare-batch requires a CUDA device because target preparation runs the EDT on CUDA."
         )
     if args.image_output is not None and prepare_device.type != "cuda":
         raise RuntimeError("--image-output requires a CUDA prepare device for copy-neighbor EDT target preparation.")

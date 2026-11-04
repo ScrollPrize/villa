@@ -102,9 +102,8 @@ class LiveContinuationSource:
         outcomes, self.outcomes = self.outcomes, dict.fromkeys(OUTCOMES, 0)
         return outcomes
 
-    def resolve(self, fallback, dataset, vol, rng):
-        # Resolve at image-build time, after geometry lookahead. Planned batches
-        # must not reserve stale chains many updates before they are consumed.
+    def resolve(self, fallback, dataset, ct, rng):
+        # Resolve at image-build time, so a batch never reserves a stale chain before it is consumed.
         for queue in (self.chains, self.seeds):
             for _ in range(16):
                 try:
@@ -115,7 +114,7 @@ class LiveContinuationSource:
                     self.outcomes['stale'] += 1
                     continue
                 try:
-                    item = self.advance(state, dataset, vol, rng)
+                    item = self.advance(state, dataset, ct, rng)
                 except SeedHeadingError:
                     # As with ordinary sampling, invalid CT orientation/context
                     # rejects this proposal. I/O failures still propagate.
@@ -129,10 +128,11 @@ class LiveContinuationSource:
         self.outcomes['empty'] += 1
         return fallback
 
-    def advance(self, state, dataset, vol, rng):
+    def advance(self, state, dataset, ct, rng):
+        spec = dataset.vol_spec
         advanced, _ = advance_trace_path(state['observed_path'], state['frame'], state['points'],
-            state['commit'], state['heading_start'], vol.shape, self.params,
-            state['travelled'], state['loop_start'])
+            state['commit'], state['heading_start'], np.ceil(np.asarray(ct.shape)/spec.input_scale).astype(int),
+            self.params, state['travelled'], state['loop_start'])
         if advanced is None:
             return None
         path = advanced['path']
@@ -167,8 +167,6 @@ class LiveContinuationSource:
             live_travelled=advanced['travelled'], live_loop_start=state['loop_start'],
             live_chain_start=state['start'], labeler_state=labeler.state_dict())
         item = dataset.prepare(item, rng)
-        # The unresolved-frame footprint covers all rolls and the CT tensor.
-        dataset.prefetch_items([item], vol, required=True)
         from vesuvius.neural_tracing.tracers.fibers.frames.learned import (
             apply_prediction_axis, frame_predictor, orient_items, prediction_window)
         item['fiber_family'] = fiber.tag
@@ -180,12 +178,12 @@ class LiveContinuationSource:
         item['prev_prediction'] = (head+np.asarray(state['points']) @ np.asarray(state['frame']).T)[int(state['commit']):]
         if predictor is None:
             diagnostics = {}
-            frame = ct_frame(vol, item['pos'], advanced['heading'], state['frame'], diagnostics=diagnostics)
+            frame = ct_frame(ct, spec, item['pos'], advanced['heading'], state['frame'], diagnostics=diagnostics)
             reframe_item(item, frame)
             item.update(frame_policy=FRAME_POLICY, ct_frame_diagnostics=diagnostics)
             apply_prediction_axis(item, window)
         else:
-            orient_items([item], vol, predictor, previous=[state['frame']], window=window)
+            orient_items([item], ct, spec, predictor, previous=[state['frame']], window=window)
         if hasattr(dataset.batch_builder, 'apply_roll'):
             dataset.batch_builder.apply_roll(item, any_heading_planned=predictor is not None)
         return item

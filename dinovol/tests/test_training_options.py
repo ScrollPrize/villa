@@ -7,16 +7,21 @@ import tempfile
 import unittest
 
 import torch
+from vc_reader import transforms as A
+from dinovol_2.dataset.training_transforms import ViewAugmentation
+SPATIAL = [A.Rotate90(), A.Flip(axes="zyx"), A.Transpose()]
+def spatial_only():
+    image = A.Image(valid=None)
+    return ViewAugmentation(
+        full=A.Pipeline(SPATIAL, targets={"image": image, "keypoints": A.Points(order="zyx", outside="keep")}),
+        geometry=A.Pipeline(SPATIAL, targets={"image": image}),
+    )
+def names_of(pipeline):
+    return [repr(t).split("(")[0] for t in pipeline.transforms]
 import torch.distributed as dist
 import torch.multiprocessing as mp
 import torch.nn.functional as F
 
-from dinovol_2.augmentation.transforms.base.basic_transform import ImageOnlyTransform
-from dinovol_2.augmentation.transforms.spatial.mirroring import MirrorTransform
-from dinovol_2.augmentation.transforms.spatial.rot90 import Rot90Transform
-from dinovol_2.augmentation.transforms.spatial.transpose import TransposeAxesTransform
-from dinovol_2.augmentation.transforms.utils.compose import ComposeTransforms
-from dinovol_2.augmentation.transforms.utils.random import RandomTransform
 from dinovol_2.dataset.ssl_zarr_dataset import SSLZarrDataset
 from dinovol_2.loss import KoLeoLoss
 from dinovol_2.model.model import DinoVitStudentTeacher
@@ -34,14 +39,6 @@ def tiny_model_config(**overrides):
         "ibot_head_hidden_dim": 24, "ibot_head_bottleneck_dim": 12,
         **overrides,
     }
-
-
-class _AddIntensity(ImageOnlyTransform):
-    def _apply_to_image(self, img, **params):
-        # Consume a shape-dependent number of random values between geometry
-        # transforms: replaying a full pipeline at a different resolution fails.
-        torch.rand_like(img)
-        return img + 100
 
 
 def _koleo_worker(rank, init_path, result_path):
@@ -308,12 +305,13 @@ class GramAlignmentTests(unittest.TestCase):
         dataset = object.__new__(SSLZarrDataset)
         dataset.gram_teacher_no_augmentations = True
         dataset.global_crop_size = (3, 3, 3)
-        pipeline = ComposeTransforms([
-            RandomTransform(Rot90Transform(allowed_axes={0, 1, 2}), 1),
-            _AddIntensity(),
-            RandomTransform(MirrorTransform((0, 1, 2)), 1),
-            RandomTransform(TransposeAxesTransform({0, 1, 2}), 1),
-        ])
+        image = A.Image(valid=None)
+        geometry = [A.Rotate90(), A.Flip(axes="zyx"), A.Transpose()]
+        pipeline = ViewAugmentation(
+            full=A.Pipeline([geometry[0], A.BrightnessAdd(shift=100), *geometry[1:]],
+                            targets={"image": image, "keypoints": A.Points(order="zyx", outside="keep")}),
+            geometry=A.Pipeline([geometry[0], A.Invert(p=0), *geometry[1:]], targets={"image": image}),
+        )
         student = torch.arange(27.).reshape(1, 3, 3, 3)
         teacher = F.interpolate(student[None], scale_factor=2, mode="nearest")[0]
         for seed in range(5):

@@ -19,6 +19,7 @@ import warnings
 
 import numpy as np
 import torch
+from vc_reader.reader import open_zarr
 
 from vesuvius.neural_tracing.tracers.fibers.data.fibers import ZBand, split_fibers, training_state_allowed
 from vesuvius.neural_tracing.tracers.shared.annotations.traced import fiber_manifest
@@ -37,7 +38,6 @@ from vesuvius.neural_tracing.tracers.fibers.data.state_labels import (
     replay_class)
 from vesuvius.neural_tracing.tracers.fibers.tracing.trace import FiberTracer, TraceParams
 from vesuvius.neural_tracing.tracers.models.checkpoint import load_checkpoint
-from vesuvius.neural_tracing.tracers.shared.crop_sampling.volume import CTVolume
 
 
 class DecisionCollector:
@@ -257,7 +257,7 @@ class CoverageCursor:
         os.replace(temporary, path)
 
 
-def select_seeds(fibers, vol, cursor, count, rng, band=None):
+def select_seeds(fibers, ct, spec, cursor, count, rng, band=None):
     """One directed seed per distinct fiber; skipped fibers keep explicit reasons."""
     seeds, skipped, tried = [], [], set()
     while len(seeds) < count and len(tried) < len(fibers):
@@ -267,7 +267,7 @@ def select_seeds(fibers, vol, cursor, count, rng, band=None):
         fi, sign = taken
         tried.add(fi)
         try:
-            seed = directed_seed(fibers[fi], vol, rng, sign)
+            seed = directed_seed(fibers[fi], ct, spec, rng, sign)
         except SeedHeadingError as error:
             skipped.append(dict(fiber=fi, reason='ct_heading', detail=str(error)))
             continue
@@ -381,14 +381,14 @@ def main(argv=None):
         fibers = load_fibers(args.fibers, grid_scale=spec.grid_scale)
         band = ZBand(args.val_z[0]/spec.grid_scale, args.val_z[1]/spec.grid_scale)
         train_f, _ = split_fibers(fibers, band)
-    vol = CTVolume(spec, cache_bytes=2 << 30)
+    ct = open_zarr(spec.ct_zarr, level=spec.ct_level, cache_dir=spec.cache_dir, memory_cache=2 << 30)
     bank_detector = switch_detector(args, ck, train_f, band, spec)
     rng = np.random.default_rng(args.seed)
     cursor = CoverageCursor.load(train_f, args.coverage_state, args.seed, args.length_power)
     with warnings.catch_warnings():
         warnings.simplefilter('ignore')
-        seeds, skipped = select_seeds(train_f, vol, cursor, args.fibers_per_collection, rng, band)
-    tracer = FiberTracer(model, vol, crop, n_hist,
+        seeds, skipped = select_seeds(train_f, ct, spec, cursor, args.fibers_per_collection, rng, band)
+    tracer = FiberTracer(model, ct, spec, crop, n_hist,
                           TraceParams.from_policy(policy, max_len=args.trace_len, seed=args.seed,
                                                   forward_chunk=args.forward_chunk), device=args.device)
     rows, track, reasons, traced = [], [], [], 0.

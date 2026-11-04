@@ -17,13 +17,19 @@ ctest --test-dir build-native --output-on-failure
 cmake --install build-native --prefix /path/to/prefix
 ```
 
+The native suite includes `test_native_shared_algorithms`, covering cache
+eviction, filter boundaries and accumulation precision, interpolation,
+percentiles, storage transforms, dtype encoding, and atomic publication. Run
+just these checks with `ctest --test-dir build-native -R shared_algorithms
+--output-on-failure`.
+
 For CUDA, set `VC_READER_ENABLE_CUDA=ON` and choose
 `CMAKE_CUDA_ARCHITECTURES` for the deployment GPU. CUDA discovery defaults to
 auto-detection when the option is omitted. The toolkit supplies CUDA Runtime
 and cuFFT. No Python development files are needed when Python is disabled.
 
-Reader dependencies are libcurl, c-blosc, zstd, SQLite, nlohmann-json, and
-VC-Delta3D. CMake uses an installed VC-Delta3D package or fetches its pinned
+Reader dependencies are libcurl, c-blosc, zstd, zlib, LZ4, SQLite, libtiff, libpng,
+libjpeg, nlohmann-json, and VC-Delta3D. The volcomp codec is vendored under `third_party/volcomp`. CMake uses an installed VC-Delta3D package or fetches its pinned
 revision. A transforms-only build uses `VC_READER_BUILD_READER=OFF` and needs
 none of these reader dependencies.
 
@@ -49,11 +55,15 @@ already link them. The Python extensions link those same CUDA libraries.
 
 | Header | API | CPU and CUDA coverage |
 | --- | --- | --- |
-| `vc_reader/reader.hpp` | `vcr::CtReader`: open a CT array or pyramid level, read regions, sample sheet normals; Zarr metadata normalization | Convenience methods use CPU; `array()` exposes the same array to general and CUDA sampling |
+| `vc_reader/reader.hpp` | `vcr::sheetNormals`: sheet normals of an opened uint8 or float32 array; Zarr metadata normalization | CPU; `sheet_normal::sample_cuda` on the device |
+| `vc_reader/zarr.hpp` | `vcr::zarr`: parse array metadata, resolve access (anonymous, basic, signed S3), open arrays and OME-Zarr groups with decoded/VC3D disk caches online or offline, write local v2/v3 arrays (`Writer`) and attributes | CPU readers; connect an opened array to `reader_cuda::Reader` for CUDA |
+| `vc_reader/composite.hpp` | `vcr::composite::reduce`: one value per pixel from a stack of sampled layers (mean, max, min, median, minabs, alpha, Beer-Lambert), with an iso cutoff | CPU and `composite::cuda` (device inputs and outputs) |
+| `vc_reader/computed.hpp` | `vcr::computed::open`: an `Array` whose chunks a callback computes from other data, persisted in a decoded disk cache named by the computation's identity | Register with the service and sample like any array, on CPU and CUDA |
+| `vc_reader/sftp.hpp` | `vcr::sftp`: SFTP sessions, the pooled `Fetcher` behind `sftp://` reads, directory listing | Transport only |
 | `vc_reader/array.hpp` | `vcr::Array`, `ArraySpec`, `MemoryCache`, `DiskCache`, HTTP/auth options, region reads, point reads, nearest/linear sampling, affine reads | Full existing CPU reader; connect the same array to `reader_cuda::Reader` for CUDA |
-| `vc_reader/sampling.hpp` | `aligned::Plan` and `PointPlan`, `surface::Plan`, `geometry::Curves` and `Voxels`, sheet-normal kernels | Existing CPU algorithms and CUDA launch APIs, including surfaces, curves and voxel membership |
+| `vc_reader/sampling.hpp` | `aligned::Plan` and `PointPlan`, `projection::Plan`, `geometry::Curves` and `Voxels`, sheet-normal kernels | Existing CPU algorithms and CUDA launch APIs, including surface projection, curves and voxel membership |
 | `vc_reader/transforms.hpp` | All `transforms::Op` alternatives, parameter types, `Pipeline`, `Sample`, `Plan`, `save_plan`, `load_plan` | Full transform catalog; `cpu`, `cuda` and `auto` pipeline backends |
-| `vc_reader/cuda.hpp` | Device storage, borrowed storage, stream scope, completion, resident transform input/output sessions | CUDA only |
+| `vc_reader/cuda.hpp` | Device storage, borrowed storage, stream scope, completion, resident transform input/output sessions, device sample and batch runs | CUDA only |
 | `vc_reader/cuda_reader.hpp` | `reader_cuda::Reader`, region/affine grids, point plans, resident sampling, cache statistics; CUDA sampling declarations | CUDA only |
 
 The `vc_reader/native/` include tree contains the underlying typed APIs,
@@ -70,10 +80,75 @@ CUDA dispatch checks every operator at compile/link time.
 
 The general array API accepts an `ArraySpec`. This exposes the existing cache,
 authentication, storage-layer and sampling controls directly. Catalog lookup,
-Python DLPack wrappers and Python object orchestration are not C++ types.
-`CtReader` is a convenient opener for three-dimensional uint8 local/anonymous
-HTTP/S3 arrays; other dtypes and authenticated sources use `ArraySpec`.
-The set of supported codecs is unchanged.
+Python DLPack wrappers are not C++ types. `vcr::zarr::openPyramidLevel` opens a
+level of local, HTTP/S3 and `sftp://` arrays of any dtype, with the access in its options.
+
+`sftp://[user@]host[:port]/path` (and the `ssh://` alias) work wherever an
+HTTP URL does, including `ArraySpec::remote_url` and `source_root`. Requests
+go through the system OpenSSH `ssh` program (`ssh -s host sftp`), so
+`~/.ssh/config`, keys, the agent, ProxyJump and `known_hosts` apply; nothing is
+mounted. `vc_reader/sftp.hpp` exposes the session, the pooled `Fetcher` the
+reader uses (at most 8 sessions per host, transport failures retried, a missing
+file reads as not stored) and directory listing. Without an
+`sftp::setAuthenticator` callback, ssh runs in batch mode and never prompts.
+
+## Opening and writing Zarr arrays
+
+```cpp
+#include <vc_reader/zarr.hpp>
+
+namespace zarr = vcr::zarr;
+zarr::OpenOptions options;
+options.access = zarr::resolveAccess("s3://bucket/scan.zarr");  // anonymous for public channels
+options.cacheDirs = {"/data/cache", "vc3d"};                    // reuse decoded and VC3D caches
+auto group = zarr::Group::open("s3://bucket/scan.zarr", options);
+auto level2 = group.array(group.levels().at(2));
+std::vector<std::uint8_t> crop(64 * 64 * 64 * level2.meta.itemsize());
+level2.array->read_many({{0, 0, 0}}, {{64, 64, 64}}, {crop.data()});
+// Level-0 voxel coordinate of level-2 voxel z = 10: 4 * 10 + 1.5 for a scale-only
+// (block-reduced) level; use fromLevel0 to sample level 2 at level-0 coordinates.
+const double z0 = level2.placement.toLevel0(0, 10);
+
+zarr::CreateOptions create;
+create.shape = {1024, 1024, 1024};
+create.chunks = {128, 128, 128};
+create.compressor = "zstd";
+auto out = zarr::Writer::create("/data/out.zarr/0", create);
+out.writeRegion({0, 0, 0}, {64, 64, 64}, crop.data());
+```
+
+The opener and the Python reader share one implementation, including cache
+discovery, VC3D leases and offline metadata. `OpenOptions::metadata` replaces
+metadata requests (for example with a caller's metadata cache), and
+`vc3dVolumeDir` names a VC3D cache directory directly. Writers encode every
+supported codec except LZW and replace chunk files atomically.
+
+`CreateOptions::version` defaults to 2; set it to 3 for `zarr.json` metadata
+and default `c/…` or `c.…` chunk keys, selected by `separator`. `Writer::open`
+also edits v3 arrays with v2 chunk key encoding. `readAttributes` and
+`writeAttributes` handle both formats; v3 attributes are stored inside
+`zarr.json`, preserving its other fields. A writer cannot change a node's
+Zarr format in place. Chunk data uses the byte order declared by `dtype`.
+`setFillValue` updates absent-chunk fill without rewriting stored chunks;
+independently opened arrays must be reopened after metadata changes.
+
+For indexed shards, set `version = 3` and `shardShape` to the outer shape in
+elements, for example `{256, 256, 256}` with `{64, 64, 64}` chunks. Each shard
+dimension must be a positive multiple of its chunk dimension. `chunks` and
+chunk coordinates still describe the inner chunks. Indexes default to CRC32C
+at the end; `shardIndexCrc` and `shardIndexEnd` select the other supported layouts.
+`chunkPath` returns the containing shard file, while `chunkExists` checks the
+individual index entry. Removing its last stored chunk removes the shard.
+
+Shard updates copy unchanged encoded payloads and stream an atomic replacement;
+they do not decode or allocate the entire shard. Each chunk update rewrites its
+containing shard. Distinct chunk updates sharing a shard are serialized within
+the process, including updates through separately opened writers. Separate
+processes writing the same shard, or partial writes to the same chunk, must
+coordinate externally. Local reads keep one file snapshot for the index and
+payload. Remote arrays are treated as immutable. Writer-owned readers see local
+changes; callers using a separate memory cache must invalidate
+their cached chunks after writes.
 
 ## Transform pipelines and replay
 
@@ -105,16 +180,20 @@ Host-input CUDA pipelines handle upload/download. Resident pipelines accept
 `cuda::DeviceInput` maps through `cuda::begin_device`, then pass the returned
 session to `Pipeline::run` or `replay`. Retain that session while accessing
 `cuda::device_outputs` and `device_pyramids`. Caller-owned device buffers must
-remain alive until the work completes.
+remain alive until the work completes. `cuda::run_device` validates device inputs and does
+this for one sample; `cuda::run_batch` runs one invocation per leading-axis sample in shared
+launches, with outputs in storage from the caller's allocator.
 
 ## CT reads and normals
 
 ```cpp
 #include <vc_reader/reader.hpp>
+#include <vc_reader/zarr.hpp>
 
-vcr::CtReader volume("/data/scroll.zarr", 0);
+auto volume = vcr::zarr::openPyramidLevel("/data/scroll.zarr", 0, {});
 std::array<double, 3> point{3000.25, 4000.5, 5000.75}; // XYZ in selected level
-const auto normal = volume.sheetNormals(std::span(&point, 1)).front();
+std::array<float, 4> normal{};
+vcr::sheetNormals(volume, point.data(), 1, normal.data());
 // normal = XYZ unit vector, then relative eigengap. Invalid support is zero.
 ```
 
@@ -131,9 +210,9 @@ kernels, and compares their output. Build it with `VC_READER_BUILD_EXAMPLES=ON`:
 build-native/vc_reader_ct_normals /data/scroll.zarr 0 3000.25 4000.5 5000.75
 ```
 
-`CtReader::array()` returns a borrowed `Array&`. Both a `reader_cuda::Reader`
-constructed from it and any work in progress must finish before the `CtReader`
-is destroyed. CUDA reader results own their device storage independently.
+A `reader_cuda::Reader` borrows the opened `Array`: it and any work in progress
+must finish before the `OpenedArray` is destroyed. CUDA reader results own their
+device storage independently.
 
 Low-level sampling APIs take explicit pointer/shape/dtype descriptors; callers
 must supply buffers of the declared sizes and the correct host/device placement.
@@ -142,3 +221,41 @@ CUDA operations use the calling thread's `device::StreamScope`. Use
 `device::complete()` before reading asynchronous outputs on the host or passing
 them to work on another stream without an event dependency. CUDA objects must
 be created after a process fork.
+
+## Binary image analysis
+
+Link `vc_reader::thinning` (also linked by `vc_reader::reader` and
+`vc_reader::transforms`). It has no OpenCV or Python dependency. The public headers
+are `thinning.hpp`, `distance_transform.hpp`, and `components.hpp`.
+
+```cpp
+#include <vc_reader/thinning.hpp>
+#include <vc_reader/components.hpp>
+
+std::vector<std::uint8_t> output(rows * cols);
+vcr::thinning::skeleton(mask.data(), output.data(), rows, cols, 1,
+                       vcr::thinning::Algorithm::GuoHall);
+vcr::thinning::Scratch scratch;
+vcr::thinning::Traces paths;
+vcr::thinning::trace(mask.data(), rows, cols, output.data(), &paths, scratch);
+std::vector<std::int32_t> labels(rows * cols);
+const std::size_t shape[]{rows, cols};
+std::size_t count = vcr::components::label(mask.data(), shape, 8, labels.data());
+```
+
+`trace` accepts a padded input row stride and a `Backend::Cuda` option.
+`cuda::traceDevice`, `cuda::skeletonDevice`, `components::cuda::label`, and
+`distance::cuda::manhattanDevice` accept device pointers and complete on the
+calling thread's vc_reader stream. Host entry points include transfers. Skeleton
+calls accept a count of independent YX slices; components and distances take a
+2D/3D shape. Dimensions and pointer contracts are documented in the headers.
+CUDA trace grids require at most `UINT32_MAX` pixels (half that when returning
+polylines). Component labels are int32, numbered 1..count as `scipy.ndimage.label`
+numbers them; CUDA labelling requires at most `INT32_MAX` voxels. All buffers
+must fit memory. CUDA tracing uses several image-sized work arrays and up to
+256 MiB of path proposals, plus final path storage when requested.
+
+`transforms::ConnectedComponents` produces int32 label fields (`connectivity`, 0 for full);
+`transforms::RidgeTrace` produces uint8 visit-index fields. `MedialSurface.method`
+selects the shared skeleton algorithm. These transforms accept explicit `on`
+fields or default to label targets and keep intermediate CUDA arrays resident.

@@ -5,7 +5,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-import zarr
+from vc_reader.reader import create_group
 import numpy as np
 from torch.utils.data import DataLoader
 
@@ -14,22 +14,15 @@ from vesuvius.models.run.inference import Inferer
 from vesuvius.models.training.train import BaseTrainer
 
 
-def _create_array(group, name, **kwargs):
-    create_array = getattr(group, "create_array", None)
-    if create_array is not None:
-        return create_array(name, **kwargs)
-    return group.create_dataset(name, **kwargs)
-
-
 def _make_synthetic_dataset(root: Path) -> Path:
     data_root = root / "data"
     image_root = data_root / "images" / "volume1.zarr"
     label_root = data_root / "labels" / "volume1_surface.zarr"
 
-    image_group = zarr.open_group(str(image_root), mode="w")
-    label_group = zarr.open_group(str(label_root), mode="w")
-    image_array = _create_array(image_group, "0", shape=(32, 32, 32), chunks=(32, 32, 32), dtype="float32")
-    label_array = _create_array(label_group, "0", shape=(32, 32, 32), chunks=(32, 32, 32), dtype="uint8")
+    image_group = create_group(image_root)
+    label_group = create_group(label_root)
+    image_array = image_group.create_array("0", shape=(32, 32, 32), chunks=(32, 32, 32), dtype="float32")
+    label_array = label_group.create_array("0", shape=(32, 32, 32), chunks=(32, 32, 32), dtype="uint8")
 
     coords = np.linspace(-1.0, 1.0, 32, dtype=np.float32)
     z = coords[:, None, None]
@@ -153,7 +146,6 @@ def test_mednext_v1_checkpoint_roundtrip_preserves_plain_inference_forward(tmp_p
         model_path=str(checkpoint_path),
         input_dir=str(data_root / "images" / "volume1.zarr"),
         output_dir=str(output_dir),
-        input_format="zarr",
         do_tta=False,
         device="cpu",
         num_dataloader_workers=0,
@@ -219,7 +211,6 @@ def test_mednext_v2_checkpoint_roundtrip_preserves_plain_inference_forward(tmp_p
         model_path=str(checkpoint_path),
         input_dir=str(data_root / "images" / "volume1.zarr"),
         output_dir=str(output_dir),
-        input_format="zarr",
         do_tta=False,
         device="cpu",
         num_dataloader_workers=0,
@@ -251,7 +242,6 @@ def test_mednext_v1_deep_supervision_checkpoint_roundtrip_loads_plain_inference_
         model_path=str(checkpoint_path),
         input_dir=str(data_root / "images" / "volume1.zarr"),
         output_dir=str(output_dir),
-        input_format="zarr",
         do_tta=False,
         device="cpu",
         num_dataloader_workers=0,
@@ -310,7 +300,6 @@ def test_mednext_mixed_decoder_checkpoint_roundtrip_preserves_layout(tmp_path: P
         model_path=str(checkpoint_path),
         input_dir=str(data_root / "images" / "volume1.zarr"),
         output_dir=str(output_dir),
-        input_format="zarr",
         do_tta=False,
         device="cpu",
         num_dataloader_workers=0,

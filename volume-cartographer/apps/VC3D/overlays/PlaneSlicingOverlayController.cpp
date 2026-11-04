@@ -314,7 +314,7 @@ void PlaneSlicingOverlayController::collectPrimitives(VolumeViewerBase* viewer,
             const float step = cs.planeReverseDirection ? -1.0f : 1.0f;
             const float slabFront = float(std::max(0, cs.planeLayersFront)) * step;
             const float slabBehind = -float(std::max(0, cs.planeLayersBehind)) * step;
-            const bool volumetric = cs.params.method == "volumetric";
+            const bool volumetric = cs.params.volumetric;
 
             OverlayStyle slabStyle = lineStyle;
             slabStyle.penWidth = 1.0;

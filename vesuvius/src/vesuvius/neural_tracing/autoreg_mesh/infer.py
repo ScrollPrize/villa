@@ -14,7 +14,7 @@ from vesuvius.neural_tracing.autoreg_mesh.serialization import (
     deserialize_continuation_grid,
     deserialize_full_grid,
 )
-from vesuvius.tifxyz import Tifxyz, write_tifxyz
+from vc_reader import tifxyz
 
 
 def _to_single_batch(sample_or_batch: dict) -> dict:
@@ -61,30 +61,9 @@ def _pad_predicted_xyz(pred_xyz: np.ndarray, *, total_vertices: int) -> np.ndarr
     return padded
 
 
-def _build_tifxyz_from_grid(full_grid_world: np.ndarray, *, uuid: str) -> Tifxyz:
-    valid = np.isfinite(full_grid_world).all(axis=-1)
-    safe = np.where(valid[..., None], full_grid_world, -1.0).astype(np.float32)
-    bbox = None
-    if valid.any():
-        valid_xyz = safe[valid]
-        bbox = (
-            float(valid_xyz[:, 2].min()),
-            float(valid_xyz[:, 1].min()),
-            float(valid_xyz[:, 0].min()),
-            float(valid_xyz[:, 2].max()),
-            float(valid_xyz[:, 1].max()),
-            float(valid_xyz[:, 0].max()),
-        )
-    return Tifxyz(
-        _x=safe[..., 2],
-        _y=safe[..., 1],
-        _z=safe[..., 0],
-        uuid=uuid,
-        _scale=(1.0, 1.0),
-        bbox=bbox,
-        _mask=valid,
-        resolution="stored",
-    )
+def _build_tifxyz_from_grid(full_grid_world: np.ndarray, *, uuid: str) -> tifxyz.Surface:
+    surface = tifxyz.Surface(np.asarray(full_grid_world[..., ::-1], dtype=np.float32), uuid=uuid)
+    return tifxyz.Surface(surface.xyz, uuid=uuid, bbox=surface.bounds())
 
 
 @torch.no_grad()
@@ -239,7 +218,8 @@ def infer_autoreg_mesh(
             # surface_uuid only names the output directory; the prediction is a
             # new surface, so meta.json gets a fresh identity (not the source's).
             surface = _build_tifxyz_from_grid(full_grid_world, uuid=str(uuid4()))
-            tifxyz_path = write_tifxyz(Path(save_path) / surface_uuid, surface, overwrite=True)
+            tifxyz_path = Path(save_path) / surface_uuid
+            tifxyz.write(tifxyz_path, surface, overwrite=True)
 
         result = {
             "predicted_coarse_ids": np.asarray(generated_coarse, dtype=np.int64),

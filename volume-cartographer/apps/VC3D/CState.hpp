@@ -25,6 +25,7 @@ Q_DECLARE_METATYPE(vc::objects::StoreSessionEvent)
 
 class VolumePkg;
 class Volume;
+class OpenedVolumes;
 class QuadSurface;
 class Surface;
 class VCCollection;
@@ -44,12 +45,14 @@ class CState : public QObject
     Q_OBJECT
 
 public:
-    explicit CState(QObject* parent = nullptr,
-                    bool debugDownloadQueue = false, CState* objectStoreOwner = nullptr);
+    // cacheBytes sizes the opened volumes' memory cache (0: the RAM cache setting).
+    explicit CState(QObject* parent = nullptr, CState* objectStoreOwner = nullptr, std::size_t cacheBytes = 0);
     ~CState();
 
     // One session for all object kinds; controllers share this handle.
     std::shared_ptr<vc::objects::ObjectStoreSession> objectStoreSession() const { return _objectStoreSession; }
+    // The opened volume levels the tools sample, shared with the object-store owner's windows.
+    std::shared_ptr<OpenedVolumes> openedVolumes() const { return _openedVolumes; }
     // Decoded surface geometry kept for every store VC3D opens (all workspaces),
     // up to the surface geometry cache setting; re-read after Settings change.
     static std::shared_ptr<vc::objects::SurfaceTileCache> surfaceGeometryCache();
@@ -122,8 +125,6 @@ public:
     // and (through pointCollectionsSaveRequested) the open surface's corrections.
     void savePointCollections();
 
-    bool debugDownloadQueueEnabled() const { return _debugDownloadQueue; }
-
     // --- Teardown ---
     void closeAll();
 
@@ -183,6 +184,7 @@ private:
     std::optional<vc::objects::AttachmentIdentity> attachedAt(const std::filesystem::path& path) const;
     CState* _objectStoreOwner = nullptr;
     std::shared_ptr<vc::objects::ObjectStoreSession> _objectStoreSession;
+    std::shared_ptr<OpenedVolumes> _openedVolumes;
     std::vector<vc::objects::AttachmentIdentity> _attachedStores;
     std::map<std::string, vc::objects::AttachmentIdentity> _storeReferences;
     QString _objectStoreObservationError;
@@ -200,8 +202,6 @@ private:
     VCCollection* _pointCollection;
     // Keeps the volume's point collections in the store (the main state only).
     vc3d::PointCollectionSync* _pointCollectionSync = nullptr;
-
-    bool _debugDownloadQueue = false;
 
     // Surface/POI data (formerly in CSurfaceCollection)
     std::unordered_map<std::string, std::shared_ptr<Surface>> _surfs;

@@ -3,9 +3,11 @@
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
 #include <doctest/doctest.h>
 
+#include "vc/core/util/ImageMat.hpp"
 #include "vc/core/util/QuadSurface.hpp"
 
 #include <opencv2/core.hpp>
+#include <opencv2/imgcodecs.hpp>
 
 #include <filesystem>
 #include <fstream>
@@ -102,4 +104,48 @@ TEST_CASE("saveSnapshot: copies prior on-disk state into backups/<id>/0")
 
     auto backupsRoot = t.segDir.parent_path() / "backups" / t.segId;
     CHECK(fs::exists(backupsRoot / "0"));
+}
+
+TEST_CASE("channel files round trip at their stored depth and colour order")
+{
+    TmpSegDir t;
+    auto pts = grid();
+    QuadSurface writer(pts, cv::Vec2f(1.f, 1.f));
+    cv::Mat uv(16, 16, CV_32FC2, cv::Scalar(1.5f, -2.5f));
+    cv::Mat colour(32, 48, CV_8UC3, cv::Scalar(10, 20, 30));
+    cv::Mat generations(16, 16, CV_16UC1, cv::Scalar(4000));
+    writer.setChannel("uv", uv);
+    writer.setChannel("colour", colour);
+    writer.setChannel("generations", generations);
+    writer.save(t.segDir.string());
+
+    // Other tools see colour.tif as OpenCV wrote it.
+    const cv::Mat external = cv::imread((t.segDir / "colour.tif").string(), cv::IMREAD_UNCHANGED);
+    REQUIRE(external.type() == CV_8UC3);
+    CHECK(external.at<cv::Vec3b>(0, 0) == cv::Vec3b(10, 20, 30));
+
+    QuadSurface reader(t.segDir);
+    const cv::Mat readUv = reader.channel("uv", SURF_CHANNEL_NORESIZE);
+    REQUIRE(readUv.type() == CV_32FC2);
+    CHECK(readUv.at<cv::Vec2f>(3, 3) == cv::Vec2f(1.5f, -2.5f));
+    const cv::Mat readColour = reader.channel("colour", SURF_CHANNEL_NORESIZE);
+    REQUIRE(readColour.type() == CV_8UC3);
+    CHECK(readColour.size() == colour.size());
+    CHECK(readColour.at<cv::Vec3b>(3, 3) == cv::Vec3b(10, 20, 30));
+    const cv::Mat readGenerations = reader.channel("generations", SURF_CHANNEL_NORESIZE);
+    REQUIRE(readGenerations.type() == CV_16UC1);
+    CHECK(readGenerations.at<uint16_t>(3, 3) == 4000);
+}
+
+TEST_CASE("saving keeps non-finite placeholders as stored and negative valid coordinates")
+{
+    TmpSegDir t;
+    cv::Mat_<cv::Vec3f> points(8, 8, cv::Vec3f(1.f, 2.f, 3.f));
+    points(2, 2) = cv::Vec3f(NAN, NAN, NAN);
+    points(3, 3) = cv::Vec3f(-5.f, 2.f, 3.f);
+    QuadSurface writer(points, {1.f, 1.f});
+    writer.save(t.segDir.string());
+    const cv::Mat_<float> x = vc::core::util::imageMat(vcr::sources::readImagePage((t.segDir / "x.tif").string(), 0, {}));
+    CHECK(std::isnan(x(2, 2)));
+    CHECK(x(3, 3) == -5.f);
 }

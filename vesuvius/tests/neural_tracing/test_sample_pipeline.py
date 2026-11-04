@@ -5,18 +5,17 @@ from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 import json
 import os
 from pathlib import Path
-import subprocess
-import sys
 import threading
 import time
 
 import numpy as np
 import pytest
+from vc_reader.reader import ZarrReader
+
+from tests.zarr_utils import zarr_volume
 import torch
 
-from tests.neural_tracing.oriented_blur_reference import _anisotropic_blur_3d
 from tests.neural_tracing.test_fiber_trace_3d import _loader, _loader_with_mapping, _straight_fiber
-from vesuvius.neural_tracing.fiber_trace_2d.sampling import Vc3dCoordinateSampler
 from vesuvius.neural_tracing.fiber_trace_3d.loader import (
     FiberTrace3DConfig, FiberTrace3DLoader, FiberTrace3DSharedTensorSlots, config_from_mapping, load_config,
     _gaussian_kernel1d, _normalize_image,
@@ -140,7 +139,6 @@ def _real_paris4_loader(tmp_path):
         "batch_size": 2, "patch_shape_zyx": [32, 32, 32], "cp_margin_voxels": 3,
         "geometry_backend": "native", "value_augmentation_backend": "native",
         "volume_cache_memory_mib": 64, "volume_io_threads": 1,
-        "volume_decode_threads": 1, "volume_sample_threads": 1,
         "volume_cache_offline": True, "augment_enabled": True,
         "augment_rotation_degrees": 10., "augment_scale_min": .95, "augment_scale_max": 1.05,
         "augment_contrast_min": .8, "augment_contrast_max": 1.2,
@@ -161,7 +159,6 @@ def test_real_paris4_loader_queue_matches_serial_native_path(tmp_path):
     raw = loader.load_raw_sample(0, sample_mode="flat", profile=True)
     assert torch.count_nonzero(raw.sample.volume), "real annotated crop is absent from local CT"
     assert raw.sample.profile_timings_ms["geometry_native_used"] == 1
-    assert raw.sample.profile_timings_ms["vc_sample_workers"] == 1
     expected = loader.load_batch(0, sample_mode="flat", profile=True)
     assert expected.profile_timings_ms["value_native_transform_used"] == 2
     owner = FiberTrace3DSampleQueue(sources={
@@ -204,7 +201,7 @@ def test_real_paris4_default_preprocessing_ignores_native_availability(tmp_path,
     config = replace(native_loader.config, geometry_backend="eager", value_augmentation_backend="torch")
     loader = FiberTrace3DLoader(config)
     expected = loader.load_batch(0, sample_mode="flat", profile=True)
-    for name in ("generate_fiber3d_coords", "fiber3d_value_transform", "anisotropic_blur_3d"):
+    for name in ("generate_fiber3d_coords", "fiber3d_value_transform"):
         monkeypatch.delattr(vc.volume, name, raising=False)
     actual = FiberTrace3DLoader(config).load_batch(0, sample_mode="flat", profile=True)
     _assert_same_batch(actual, expected)
@@ -212,38 +209,11 @@ def test_real_paris4_default_preprocessing_ignores_native_availability(tmp_path,
     assert actual.profile_timings_ms["value_native_transform_used"] == 0
 
 
-@pytest.mark.parametrize("url,expected", (
-    ("http://example.invalid/ct.zarr", "http://example.invalid/ct.zarr"),
-    ("https://example.invalid/ct.zarr", "https://example.invalid/ct.zarr"),
-    ("s3://example-bucket/ct.zarr", "https://example-bucket.s3.amazonaws.com/ct.zarr"),
-))
-@pytest.mark.parametrize("cache_root", (None, "legacy-cache-suggestion"))
-def test_remote_sampler_uses_one_argument_open_url(monkeypatch, url, expected, cache_root):
-    import vc.volume
-
-    calls = []
-    sentinel = object()
-
-    class Volume:
-        @staticmethod
-        def open_url(url):
-            calls.append(url)
-            return sentinel
-
-    monkeypatch.setattr(vc.volume, "Volume", Volume)
-    sampler = Vc3dCoordinateSampler(url, level=0, cache_root=cache_root)
-    assert sampler.volume is sentinel
-    assert calls == [expected]
-
-
 def test_real_paris4_http_sampler_matches_local_binding(tmp_path):
     # Serve actual cached CT; no public network or AWS authentication required.
     loader = _real_paris4_loader(tmp_path)
     root = Path(loader.config.datasets[0]["base_volume_path"])
-    cache_config = tmp_path / "vc-settings"
-    cache_config.mkdir()
     cache = tmp_path / "remote-cache"
-    (cache_config / "cache.json").write_text(json.dumps({"version": 1, "root": str(cache)}))
 
     class QuietHandler(SimpleHTTPRequestHandler):
         def log_message(self, *args):
@@ -253,32 +223,17 @@ def test_real_paris4_http_sampler_matches_local_binding(tmp_path):
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     try:
-        # Isolate the process-wide cache before the native runtime opens it.
-        result = subprocess.run([sys.executable, "-c", """
-import json, sys
-import numpy as np
-from pathlib import Path
-from vesuvius.neural_tracing.fiber_trace_2d.sampling import Vc3dCoordinateSampler
-root, url, fiber, cache = sys.argv[1:]
-point = np.asarray(json.loads(Path(fiber).read_text())["control_points"][0]["position"], np.float32)
-coords = (point[::-1] * .5).reshape(1, 1, 3)
-valid = np.ones((1, 1), dtype=bool)
-options = dict(level=0, cache_root="legacy-unused", sample_threads=1,
-               io_threads=1, decode_threads=1, cache_budget_bytes=64 * 1024**2)
-local = Vc3dCoordinateSampler(root, **options).sample_coords(coords, valid)
-remote = Vc3dCoordinateSampler(url, **options)
-actual = remote.sample_coords(coords, valid)
-assert Path(remote.volume.remote_cache_root) == Path(cache)
-assert local.valid_mask.all() and np.count_nonzero(local.image)
-np.testing.assert_array_equal(actual.valid_mask, local.valid_mask)
-np.testing.assert_array_equal(actual.image, local.image)
-print("actual Paris4 HTTP/local samples identical; cache isolated")
-""", str(root), f"http://127.0.0.1:{server.server_port}/{root.name}",
-            os.environ["VC_QUEUE_TEST_FIBER"], str(cache)],
-            env={**os.environ, "VC3D_CONFIG_DIR": str(cache_config), "AWS_EC2_METADATA_DISABLED": "true"},
-            capture_output=True, text=True, timeout=45)
-        assert result.returncode == 0, result.stdout + result.stderr
-        print(result.stdout.strip())
+        point = np.asarray(json.loads(Path(os.environ["VC_QUEUE_TEST_FIBER"]).read_text())
+                           ["control_points"][0]["position"], np.float32)
+        points = (point[::-1] * .5).reshape(1, 3)
+        local = ZarrReader.open(root, level=0)
+        remote = ZarrReader.open(f"http://127.0.0.1:{server.server_port}/{root.name}", level=0,
+                                 cache_dir=cache, threads=1)
+        expected = local.sample(points, order=1)
+        assert np.count_nonzero(expected)
+        np.testing.assert_array_equal(remote.sample(points, order=1), expected)
+        assert remote.stats()["remote_fetches"] > 0
+        print("actual Paris4 HTTP/local samples identical")
     finally:
         server.shutdown()
         server.server_close()
@@ -426,21 +381,16 @@ def test_3d_config_preserves_volume_io_decode_and_sample_threads() -> None:
             "batch_size": 1,
             "patch_shape_zyx": [16, 16, 16],
             "volume_io_threads": 2,
-            "volume_decode_threads": 3,
-            "volume_sample_threads": 1,
             "_array_records": [
                 {
-                    "volume": np.zeros((16, 16, 16), dtype=np.float32),
+                    "volume_path": zarr_volume(np.zeros((16, 16, 16), dtype=np.float32)),
                     "fiber": _straight_fiber(),
-                    "volume_path": "synthetic",
                 }
             ],
         }
     )
 
     assert config.volume_io_threads == 2
-    assert config.volume_decode_threads == 3
-    assert config.volume_sample_threads == 1
 
 
 @pytest.mark.parametrize("mode", ("none", "1d", "2d", "3d"))
@@ -623,7 +573,6 @@ def test_native_geometry_preserves_sampled_patch() -> None:
         "augment_smooth_displacement_amplitude_zyx": [1.0, 0.75, 0.5],
         "augment_smooth_displacement_control_spacing_zyx": [8.0, 8.0, 8.0],
         "augment_smooth_displacement_probability": 1.0,
-        "volume_sample_threads": 1,
     }
     eager = _loader_with_mapping({**common, "geometry_backend": "eager"})
     native = _loader_with_mapping({**common, "geometry_backend": "native"})
@@ -637,96 +586,6 @@ def test_native_geometry_preserves_sampled_patch() -> None:
     mismatch = float(torch.count_nonzero(difference)) / float(difference.numel())
     assert mismatch <= 1.0e-4
     assert int(difference.max()) <= 1
-
-
-@pytest.mark.parametrize(
-    ("shape", "axis"),
-    (
-        ((17, 19, 23), np.asarray([0.31, 0.83, -0.46], dtype=np.float32)),
-        ((1, 13, 11), np.asarray([1.0, 0.0, 0.0], dtype=np.float32)),
-        ((11, 13, 17), np.asarray([0.8999, 0.436096, 0.0], dtype=np.float32)),
-        ((11, 13, 17), np.asarray([0.9001, 0.435683, 0.0], dtype=np.float32)),
-    ),
-)
-def test_native_anisotropic_blur_matches_torch_reference(
-    shape: tuple[int, int, int], axis: np.ndarray
-) -> None:
-    native_module = pytest.importorskip("vc.volume")
-    blur = getattr(native_module, "anisotropic_blur_3d", None)
-    if blur is None:
-        pytest.skip("volume-cartographer binding lacks native anisotropic blur")
-    source = torch.randn(shape, generator=torch.Generator().manual_seed(23))
-    source_before = source.clone()
-    expected = _anisotropic_blur_3d(
-        source,
-        axis_zyx=axis,
-        sigma_along=1.5,
-        sigma_across=0.25,
-    )
-    actual_array = blur(source.numpy(), axis, 1.5, 0.25)
-    actual = torch.from_numpy(actual_array)
-    scale = max(1.0, float(torch.max(torch.abs(source))))
-    error = torch.abs(actual - expected)
-    assert float(error.max()) <= 1.0e-4 * scale
-    assert float(error.mean()) <= 3.0e-6 * scale
-    assert actual.shape == source.shape
-    assert actual.dtype == torch.float32
-    assert actual_array.flags.c_contiguous
-    assert torch.equal(source, source_before)
-
-
-def test_native_anisotropic_blur_matches_full_training_cube() -> None:
-    native_module = pytest.importorskip("vc.volume")
-    blur = getattr(native_module, "anisotropic_blur_3d", None)
-    if blur is None:
-        pytest.skip("volume-cartographer binding lacks native anisotropic blur")
-    source = torch.randn((128, 128, 128), generator=torch.Generator().manual_seed(41))
-    axis = np.asarray([0.31, 0.83, -0.46], dtype=np.float32)
-    expected = _anisotropic_blur_3d(
-        source,
-        axis_zyx=axis,
-        sigma_along=1.5,
-        sigma_across=0.25,
-    )
-    actual = torch.from_numpy(blur(source.numpy(), axis, 1.5, 0.25))
-    scale = max(1.0, float(torch.max(torch.abs(source))))
-    error = torch.abs(actual - expected)
-    assert float(error.max()) <= 1.0e-4 * scale
-    assert float(error.mean()) <= 3.0e-6 * scale
-
-
-def test_native_axis_aligned_blur_matches_torch_isotropic_reference() -> None:
-    native_module = pytest.importorskip("vc.volume")
-    blur = getattr(native_module, "anisotropic_blur_3d", None)
-    if blur is None:
-        pytest.skip("volume-cartographer binding lacks native anisotropic blur")
-    source = torch.randn((33, 35, 37), generator=torch.Generator().manual_seed(43))
-    sigma = 0.5
-    kernel = _gaussian_kernel1d(sigma, device=source.device)
-    radius = int((kernel.numel() - 1) // 2)
-    data = source.view(1, 1, *source.shape)
-    for axis in range(3):
-        shape = [1, 1, 1, 1, 1]
-        shape[2 + axis] = int(kernel.numel())
-        padding = [0, 0, 0, 0, 0, 0]
-        padding[(2 - axis) * 2] = radius
-        padding[(2 - axis) * 2 + 1] = radius
-        data = torch.nn.functional.conv3d(
-            torch.nn.functional.pad(data, padding, mode="replicate"),
-            kernel.view(*shape),
-        )
-    expected = data[0, 0]
-    actual = torch.from_numpy(
-        blur(
-            source.numpy(),
-            np.asarray([1.0, 0.0, 0.0], dtype=np.float32),
-            sigma,
-            sigma,
-        )
-    )
-    error = torch.abs(actual - expected)
-    assert float(error.max()) <= 2.0e-6
-    assert float(error.mean()) <= 2.0e-7
 
 
 @pytest.mark.parametrize("mask_kind", ("all", "partial", "none", "constant"))
@@ -779,56 +638,6 @@ def test_native_value_transform_validates_contract() -> None:
         transform(source, valid, "other", 1.0, 0.0, 1.0)
     with pytest.raises(ValueError, match="must be positive"):
         transform(source, valid, "zscore", 0.0, 0.0, 1.0)
-
-
-@pytest.mark.parametrize("kind", ("ramp", "impulse", "high_contrast"))
-def test_native_anisotropic_blur_structured_inputs(kind: str) -> None:
-    native_module = pytest.importorskip("vc.volume")
-    blur = getattr(native_module, "anisotropic_blur_3d", None)
-    if blur is None:
-        pytest.skip("volume-cartographer binding lacks native anisotropic blur")
-    shape = (17, 19, 23)
-    if kind == "ramp":
-        z, y, x = torch.meshgrid(
-            *(torch.linspace(-2.0, 2.0, length) for length in shape),
-            indexing="ij",
-        )
-        source = (z + 0.3 * y - 0.7 * x).contiguous()
-    elif kind == "impulse":
-        source = torch.zeros(shape, dtype=torch.float32)
-        source[8, 9, 11] = 10.0
-    else:
-        source = 100.0 * torch.randn(
-            shape, generator=torch.Generator().manual_seed(47)
-        )
-    axis = np.asarray([-0.52, 0.17, 0.84], dtype=np.float32)
-    expected = _anisotropic_blur_3d(
-        source,
-        axis_zyx=axis,
-        sigma_along=1.5,
-        sigma_across=0.25,
-    )
-    actual = torch.from_numpy(blur(source.numpy(), axis, 1.5, 0.25))
-    scale = max(1.0, float(torch.max(torch.abs(source))))
-    error = torch.abs(actual - expected)
-    assert float(error.max()) <= 1.0e-4 * scale
-    assert float(error.mean()) <= 3.0e-6 * scale
-
-
-def test_native_anisotropic_blur_validates_input_and_zero_sigma() -> None:
-    native_module = pytest.importorskip("vc.volume")
-    blur = getattr(native_module, "anisotropic_blur_3d", None)
-    if blur is None:
-        pytest.skip("volume-cartographer binding lacks native anisotropic blur")
-    source = np.arange(60, dtype=np.float32).reshape(3, 4, 5)
-    axis = np.asarray([0.0, 0.0, 1.0], dtype=np.float32)
-    assert np.array_equal(blur(source, axis, 0.0, 0.0), source)
-    with pytest.raises(ValueError, match="positive finite norm"):
-        blur(source, np.zeros((3,), dtype=np.float32), 1.0, 0.0)
-    with pytest.raises(ValueError, match="nonnegative"):
-        blur(source, axis, -1.0, 0.0)
-    reversed_source = source[:, :, ::-1]
-    assert np.array_equal(blur(reversed_source, axis, 0.0, 0.0), reversed_source)
 
 
 def test_value_augmentation_backend_selection(monkeypatch: pytest.MonkeyPatch) -> None:
