@@ -399,7 +399,7 @@ CChunkedVolumeViewer::CChunkedVolumeViewer(CState* state, ViewerManager* manager
     // No per-viewer timers: render requests submit immediately. ViewerManager's
     // global clock still drains intersection requests and status refreshes.
 
-    reloadPerfSettings();
+    CChunkedVolumeViewer::reloadPerfSettings();
 
     auto* layout = new QVBoxLayout;
     layout->setContentsMargins(0, 0, 0, 0);
@@ -3509,8 +3509,8 @@ bool CChunkedVolumeViewer::framePointAt(const QuadSurface& quad, float column, f
 {
     const int pad = QuadSurface::kGridWindowPad + 1;
     if (_gridSurface && _gridSurfaceFor == &quad && std::isfinite(column) && std::isfinite(row) &&
-        _gridWindow.contains({int(std::floor(column)) - pad, int(std::floor(row)) - pad}) &&
-        _gridWindow.contains({int(std::floor(column)) + pad, int(std::floor(row)) + pad})) {
+        _gridWindow.contains(cv::Point(int(std::floor(column)) - pad, int(std::floor(row)) - pad)) &&
+        _gridWindow.contains(cv::Point(int(std::floor(column)) + pad, int(std::floor(row)) + pad))) {
         const float xy[]{column - float(_gridWindow.x), row - float(_gridWindow.y)};
         _gridSurface->pointsAt(xy, 1, xyz, normal);
     } else {
