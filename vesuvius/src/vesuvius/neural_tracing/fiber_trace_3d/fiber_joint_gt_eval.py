@@ -8,23 +8,22 @@ from .fiber_selected_dataset_eval import remap_events
 from . import fiber_soft_winding as soft, fiber_uv_layout as uv
 
 
-def combine(d, gd, events, config, gt_source_ids=None):
-    """Reuse measured internal/cross constraints; do not import fitted GT UV."""
+def combine(d, gd, events, config):
+    """Reuse measured internal/cross constraints; do not import fitted GT UV. GT fibers keep their own UUIDs."""
     if len(d['links']) or len(gd['links']):raise ValueError('Expected intact unsplit fibers')
     n=len(d['family']);g=len(gd['family'])
     if len(np.unique(gd['source_id']))!=g:raise ValueError('GT fibers are split')
-    mapped=(np.arange(int(d['source_id'].max())+1,int(d['source_id'].max())+1+g,dtype=np.int64)
-            if gt_source_ids is None else np.asarray(gt_source_ids,dtype=np.int64))
-    if mapped.shape!=(g,) or len(np.unique(mapped))!=g or np.isin(mapped,d['source_id']).any():
-        raise ValueError('GT source IDs must be unique and disjoint from ordinary fibers')
+    mapped=gd['source_id'].copy()
+    if np.isin(mapped,d['source_id']).any():
+        raise ValueError('GT source IDs must be disjoint from ordinary fibers')
     piece_keys=('source_id','family','initial_k','start','end','phase','z','radius','lengths','node_ds','node_phase','node_z')
-    out={k:np.concatenate((d[k],mapped if k=='source_id' else gd[k])) for k in piece_keys}
+    out={k:np.concatenate((d[k],gd[k])) for k in piece_keys}
     out['source_index']=np.arange(n+g);out['ids']=out['source_id'].copy()
     out['earlier_labels']=np.r_[d['earlier_labels'],gd['earlier_labels']]
     out['width_initial']=d['width_initial'].copy()
     a=np.array([e['test_piece'] for e in events],dtype=np.int64)
     b=np.array([e['gt_piece'] for e in events],dtype=np.int64)
-    if any(int(gd['source_id'][e['gt_piece']])!=e['gt_source'] for e in events):raise ValueError('GT cross-event identity mismatch')
+    if any(str(gd['source_id'][e['gt_piece']])!=e['gt_source'] for e in events):raise ValueError('GT cross-event identity mismatch')
     signed=np.array([e['signed_distance'] for e in events])
     cross=dict(i=a,j=b+n,
         ds_a=(np.array([e['test_arc'] for e in events])-d['start'][a])*np.sign(d['node_ds'][a,-1]),
@@ -60,7 +59,7 @@ def configure_gt_enablement(cfg,state,source_ids,gt_ids,forced=True):
 def run(settings):
     if settings.get('report_only'):return report(settings)
     from .fiber_workflows import run as dispatch
-    from vesuvius.neural_tracing.tracers.shared.annotations.afv import read_afv_polylines,write_afv
+    from vesuvius.neural_tracing.tracers.shared.annotations.fiber_store import fiber_volume,fibers_digest,read_polylines,write_fibers
     root=Path(settings['output_root']);root.mkdir(parents=True,exist_ok=True)
     baseline=Path(settings['baseline_root']);gt=Path(settings['gt_root'])
     cfg=json.loads(Path(settings['base_config']).read_text())['fiber_implicit_winding']
@@ -71,18 +70,18 @@ def run(settings):
     d=arrays(baseline/'tensors.npz');gd=arrays(gc['tensor_cache'])
     events=remap_events(json.loads((baseline/'gt_events.json').read_text()),d)
     merged,ids,filtered=combine(d,gd,events,cfg)
-    paths=[Path(settings['base_config']),baseline/'tensors.npz',baseline/'gt_events.json',Path(gc['tensor_cache']),Path(gc['afv'])]
-    signature=dict(settings=settings,inputs={str(p):sha256_file(p) for p in paths})
+    paths=[Path(settings['base_config']),baseline/'tensors.npz',baseline/'gt_events.json',Path(gc['tensor_cache'])]
+    signature=dict(settings=settings,inputs={str(p):sha256_file(p) for p in paths},gt_fibers=fibers_digest(gc['fibers']))
     if (root/'inputs.json').exists() and json.loads((root/'inputs.json').read_text())!=signature:raise ValueError('Changed joint GT inputs')
     atomic_write(root/'inputs.json',signature,durable=False)
     if (root/'results.json').exists():return json.loads((root/'results.json').read_text())
-    mapping=dict(zip(map(int,gd['source_id']),map(int,ids)))
-    curves=list(read_afv_polylines(cfg['afv'],d['source_id']))
-    curves.extend((dict(row,id=mapping[row['id']]),xyz) for row,xyz in read_afv_polylines(gc['afv']))
-    afv=root/'fibers.afv'
-    if not afv.exists():write_afv(cfg['afv'],afv,curves,dict(source='joint_GT_forced_enabled' if forced else 'joint_GT_selectable',gt_source_id_map=mapping))
+    volume=fiber_volume(cfg['fibers'])
+    store=root/'fibers.vcobj'
+    if not store.exists():
+        curves=read_polylines(cfg['fibers'],d['source_id'],volume=volume)+read_polylines(gc['fibers'],volume=volume)
+        write_fibers(store,curves,volume=volume)
     from .fiber_piece_split import split_graph
-    cfg['afv']=str(afv)
+    cfg['fibers']=str(store)
     merged=split_graph(merged,cfg,ids if forced else ())
     tensor=root/'tensors.npz';np.savez(tensor,**merged)
     init=root/'init';init.mkdir(exist_ok=True)
@@ -91,14 +90,14 @@ def run(settings):
     state=initial_state(merged,centers,widths)
     configure_gt_enablement(cfg,state,merged['source_id'],ids,forced)
     np.savez(init/'solution.npz',state=state,widths=widths,**{k:merged[k] for k in ('source_id','start','end','family')})
-    cfg.update(afv=str(afv),tensor_cache=str(tensor),initial_solution=str(init/'solution.npz'),
+    cfg.update(fibers=str(store),tensor_cache=str(tensor),initial_solution=str(init/'solution.npz'),
         output_root=str(root/'solve'),devices=settings.get('devices','0'))
     cfg['gpu_manager']=dict(cfg['gpu_manager'],exclusive=False,label='joint-GT-forced-enabled' if forced else 'joint-GT-selectable',
                             vram_bytes_per_gpu=settings.get('vram_bytes_per_gpu',32*1024**3))
     np.savez(init/'samples.npz',**soft.prepare_samples(cfg,merged))
     atomic_write(init/'config.json',dict(tensor_sha256=sha256_file(tensor),soft_samples=str(init/'samples.npz')),durable=False)
     atomic_write(root/'solve_config.json',{'fiber_implicit_winding':cfg},durable=False)
-    audit=dict(test_fibers=len(d['family']),gt_fibers=len(gd['family']),gt_source_id_map=mapping,
+    audit=dict(test_fibers=len(d['family']),gt_fibers=len(gd['family']),gt_source_ids=ids.tolist(),
         cross_constraints=len(events),total_constraints=len(merged['i']),filter=filtered,
         initialization='fresh radial, no fitted GT coordinates',force_gt_enabled=forced,
         policy=('GT enabled fixed' if forced else 'GT rejection optimized like ordinary fibers')+'; all winding/geometry variables optimized; GT-assisted, not held-out')
@@ -108,10 +107,8 @@ def run(settings):
     logits=result['state'][np.isin(merged['source_id'],ids),3]
     if forced and not np.all(logits==100):raise ValueError('GT enabled state changed')
     from scipy.special import expit
-    inverse={int(v):int(k) for k,v in mapping.items()}
     gt_rows=np.flatnonzero(np.isin(merged['source_id'],ids))
-    gt_status=[dict(original_source_id=inverse[int(merged['source_id'][row])],
-                    solve_source_id=int(merged['source_id'][row]),start=float(merged['start'][row]),
+    gt_status=[dict(source_id=str(merged['source_id'][row]),start=float(merged['start'][row]),
                     end=float(merged['end'][row]),length_vx=float(merged['lengths'][row]),
                     enabled_probability=float(expit(logit)),enabled=bool(logit>=0))
                for row,logit in zip(gt_rows,logits)]

@@ -38,6 +38,29 @@ constant field. That exceptional scan allocates no dense field. Axis means use
 double for accumulation and cancellation; stored coefficients and evaluated
 weights remain float32. LocalContrast also retains double weighted accumulation.
 
+Composite reductions (`vc_reader/composite.hpp`) of sampled layer stacks are float32,
+with one reducer shared by CPU and CUDA (`composite/reducer.hpp`), evaluated unfused
+(`-ffp-contract=off` and `--fmad=false`). Mean, max, min, median, minabs and alpha
+agree exactly; Beer-Lambert's `expf` can differ between the host and CUDA in its
+last bits.
+
+## Tie rules
+
+`src/cpp/rounding.hpp` holds the only two tie rules, shared by CPU and CUDA, and
+`tests/test_rounding_rules.py` rejects other rounding primitives in native sources.
+
+- **Spatial ties** (the voxel nearest a coordinate) round up: `nearest_index` /
+  `nearest_rounds_up`. Every nearest-neighbour path uses it: `Array` and
+  `ZarrReader.sample` points, the CUDA reader, surface and aligned label sampling and
+  spatial transforms. Integer shifts and crop origins then cannot change which voxel
+  wins, and zoomed nearest planes give every voxel equal width. This is SciPy's
+  `map_coordinates(order=0)` rule; NumPy `rint` and Torch `grid_sample` nearest round
+  half-voxel ties to even and so differ from vc_reader exactly at those ties.
+- **Value ties** (rounding numbers: sizes from scale factors, counts, quantized
+  intensities) round to even, as `np.rint`/`np.round` and `torch.round` do:
+  `round_half_even`. The SciPy Gaussian radius `int(truncate * sigma + .5)` is kept
+  as SciPy defines it.
+
 ## Where wider arithmetic remains
 
 | Location / operation | Numerical reason |
@@ -93,12 +116,12 @@ to use direct chunks. Neither route changes interpolation or fill semantics.
 
 ## Replay and numerical changes
 
-New replay records use `VCA2`. Local intensity fields serialize their compact
+Replay records use `VCA2`. Local intensity fields serialize their compact
 axis coefficients and normalization scalars. Dense fields are serialized as float32; component
 indices are integers. Matrices and shared scalar parameters retain the reasons
-listed above. `VCA1` records are rejected: regenerate old plans. A new plan
-reproduces its recorded execution exactly on the tested backend; CPU/CUDA and
-older-version outputs need not be bitwise equal.
+listed above. Records in another format are rejected. A plan reproduces its
+recorded execution exactly on the tested backend; CPU and CUDA outputs need not
+be bitwise equal.
 
 For three 128³ random images (seeds 0, 123, 456), the geometry precision change
 produced maximum image error of about 7.5e-6 against the preceding double-geometry

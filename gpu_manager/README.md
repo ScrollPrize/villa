@@ -217,6 +217,17 @@ grants without starting workers and retries registration until the requested
 allocation is available. This is opt-in; it can wait indefinitely and each new
 registration joins the FIFO queue anew.
 
+For commands that can size their workers at startup, `accept_partial=True`
+instead accepts any nonempty granted GPU subset and positive CPU count within
+the request. Each admitted GPU must still have its requested VRAM budget.
+This conflicts with `wait_for_exact`. The child receives only admitted GPUs in
+`CUDA_VISIBLE_DEVICES` (in requested order), and the actual allocation as JSON
+in `VILLA_GPU_MANAGER_GRANT` (`cpu_cores`, `gpus` mapping UUIDs to bytes).
+The child must size CPU/GPU workers to this allocation. It remains fixed for
+the cohort lifetime; this is admission flexibility, not live worker resizing.
+Ownership checks and join-before-release cleanup remain unchanged. The default
+continues to require the complete requested allocation.
+
 `ProcessOwner` provides a separate ownership root for sibling cohorts managed
 by one coordinator. Pass its identity as `Client(registration_root=...)`,
 track each worker session before authorizing it, and retire it only after joining

@@ -5,8 +5,8 @@ from .fiber_min_flow import integer_targets
 
 def reference_offsets(reference):
     """Reject conflicting exclusions and fractional labels instead of truncating."""
-    offsets = {int(k): v for k, v in reference['fiber_offsets'].items()}
-    if set(offsets).intersection(map(int, reference.get('excluded_source_ids', []))):
+    offsets = {str(k): v for k, v in reference['fiber_offsets'].items()}
+    if set(offsets).intersection(map(str, reference.get('excluded_source_ids', []))):
         raise ValueError('Excluded reference IDs must be omitted from fiber_offsets')
     if any(not np.isfinite(v) or v != int(v) for v in offsets.values()):
         raise ValueError('Reference offsets must be finite integers')
@@ -25,7 +25,7 @@ def summarize_errors(error, parallel):
 
 def small_reference(d, solution, reference, transport):
     offsets = reference_offsets(reference)
-    use = np.array([int(d['source_id'][a]) in offsets and int(d['source_id'][b]) in offsets
+    use = np.array([str(d['source_id'][a]) in offsets and str(d['source_id'][b]) in offsets
                     for a, b in zip(d['i'], d['j'])], dtype=bool)
     covered = use.copy()
     same_component = solution['component'][d['i']] == solution['component'][d['j']]
@@ -33,8 +33,8 @@ def small_reference(d, solution, reference, transport):
     # Reference = fiber offset + original UNWRAPPED angle. Convert that to
     # the same seam chart as our endpoint labels; fractional phase is absent.
     anchor = np.floor(d['node_phase'][:, 0]+.25).astype(int)
-    refa = np.array([offsets.get(int(d['source_id'][p]), 0) for p in d['i']])+anchor[d['i']]+transport['fiber_a']
-    refb = np.array([offsets.get(int(d['source_id'][p]), 0) for p in d['j']])+anchor[d['j']]+transport['fiber_b']
+    refa = np.array([offsets.get(str(d['source_id'][p]), 0) for p in d['i']])+anchor[d['i']]+transport['fiber_a']
+    refb = np.array([offsets.get(str(d['source_id'][p]), 0) for p in d['j']])+anchor[d['j']]+transport['fiber_b']
     local = solution['winding'][d['j']]-solution['winding'][d['i']]+transport['fiber_b']-transport['fiber_a']
     result = summarize_errors((local-(refb-refa))[use], d['parallel'][use])
     result.update(excluded_reference_source_ids=reference.get('excluded_source_ids', []),
@@ -56,7 +56,7 @@ def large_reference(d, solution, paths, reference, events, gt_data, gt_paths, de
     events = cross_events(events)
     gd, gp = gt_data, gt_paths
     offsets = reference_offsets(reference)
-    picks = {int(s): i for i, s in enumerate(d['source_id'])}
+    picks = {str(s): i for i, s in enumerate(d['source_id'])}
     required, par, components, orders, signs, margins = [], [], [], [], [], []
     skipped = 0
     scored = []
@@ -65,7 +65,7 @@ def large_reference(d, solution, paths, reference, events, gt_data, gt_paths, de
         if (isinstance(piece, bool) or not isinstance(piece, (int, np.integer))
                 or not 0 <= piece < len(gd['source_id'])):
             raise ValueError(f'Invalid GT piece index: {piece!r}')
-        if int(gd['source_id'][piece]) != e['gt_source']:
+        if str(gd['source_id'][piece]) != e['gt_source']:
             raise ValueError(f'GT piece/source mismatch: row {piece} is '
                              f"{gd['source_id'][piece]}, event declares {e['gt_source']}")
         if e['gt_source'] not in offsets or e['test_source'] not in picks:

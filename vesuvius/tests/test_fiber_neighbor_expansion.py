@@ -4,6 +4,10 @@ from vesuvius.neural_tracing.fiber_trace_3d.fiber_neighbor_expansion import z_sp
 from vesuvius.neural_tracing.fiber_trace_3d.fiber_scaled_lbfgs import scaled_joint
 
 
+def U(n):
+    return f'00000000-0000-4000-8000-{n:012d}'
+
+
 def test_z_spans_preserve_multiple_passes_and_boundary_interpolation():
     xyz=np.array([[0.,0.,0.],[0.,0.,20.],[0.,0.,0.]])
     assert z_spans(xyz,[5.,10.])==[[5.,10.],[30.,35.]]
@@ -18,11 +22,11 @@ def test_winding_overlap_is_not_rounded_or_padded():
 
 def test_new_neighbor_initialization_uses_fractional_width_map(monkeypatch):
     from vesuvius.neural_tracing.fiber_trace_3d import fiber_neighbor_expansion as m
-    d=dict(source_id=np.array([10,20]),family=np.array([0,1]),phase=np.array([.2,.2]),
+    d=dict(source_id=np.array([U(10),U(20)]),family=np.array([0,1]),phase=np.array([.2,.2]),
            z=np.zeros(2),start=np.zeros(2),node_ds=np.ones((2,2)),
            i=np.array([0]),j=np.array([1]),ds_a=np.array([100.]),ds_b=np.array([50.]),
            sign=np.ones(1),distance=np.array([.5]),parallel=np.array([False]))
-    old_d=dict(source_id=np.array([10]))
+    old_d=dict(source_id=np.array([U(10)]))
     sol=dict(state=np.array([[2.,.2,300.,100.]]),widths=np.full(8,1000.),
              straight_anchor_u=np.array([.2]),straight_anchor_v=np.array([300.]))
     monkeypatch.setattr(m,'map_geometry',lambda *args:(None,lambda owner,arc:(np.full(len(owner),2.3),np.full(len(owner),300.))))
@@ -33,13 +37,13 @@ def test_new_neighbor_initialization_uses_fractional_width_map(monkeypatch):
 
 def test_gt_retained_even_below_confidence_or_outside_range(monkeypatch):
     from vesuvius.neural_tracing.fiber_trace_3d import fiber_neighbor_expansion as m
-    d=dict(source_id=np.array([10,20,30]),family=np.array([0,1,1]),
+    d=dict(source_id=np.array([U(10),U(20),U(30)]),family=np.array([0,1,1]),
            start=np.zeros(3),end=np.full(3,10.),i=np.array([0,0]),j=np.array([1,2]),links=np.empty((0,4)))
     curves={s:({},np.array([[0.,0.,0.],[10.,0.,0.]])) for s in d['source_id']}
     def query(owner,arc):return np.array([2.,5.,2.])[owner],np.zeros(len(owner))
     monkeypatch.setattr(m,'map_geometry',lambda *args:(np.array([0.,0.,.9]),query))
-    selected,audit=m.select(d,{}, {},[10,20],curves,[-1,1],.5)
-    assert selected=={30}
+    selected,audit=m.select(d,{}, {},[U(10),U(20)],curves,[-1,1],.5)
+    assert selected=={U(30)}
     assert all(row['selected'] for row in audit['records'])
 
 

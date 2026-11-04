@@ -2012,6 +2012,7 @@ dependencies = [
     { name = "trimesh" },
     { name = "triton-windows", marker = "sys_platform == 'win32'" },
     { name = "vc-delta3d" },
+    { name = "vc-object-store" },
     { name = "wandb" },
     { name = "zarr" },
 ]
@@ -2065,6 +2066,7 @@ requires-dist = [
     { name = "trimesh", specifier = ">=4.12.2" },
     { name = "triton-windows", marker = "sys_platform == 'win32'", specifier = ">=3.6,<3.7" },
     { name = "vc-delta3d", specifier = ">=0.2.0,<0.3" },
+    { name = "vc-object-store", editable = "../vc_object_store" },
     { name = "wandb", specifier = ">=0.28.0" },
     { name = "zarr", specifier = ">=3.2.1" },
 ]
@@ -2288,6 +2290,17 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/00/2c/c86aac08a7d4eaaed727e36f834d6e2b75d9ed643d9174f9d7d59265d4f6/vc_delta3d-0.2.0-cp314-cp314-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:10014635b4ae0a8cabe2fc2f6aedea98f5dc1ba2652824d716f1c3f733308f17", size = 97803, upload-time = "2026-10-22T10:12:14.277Z" },
     { url = "https://files.pythonhosted.org/packages/f5/60/a758d3c654f23bbe5cd289b6bb9fadd52a690bc9b0f16699e7a1e68e6210/vc_delta3d-0.2.0-cp314-cp314-win_amd64.whl", hash = "sha256:072880e96db7e5dc02b9ce645ffa902bf9f7c07ed1668fd97587e8d5faf6bb38", size = 307719, upload-time = "2026-10-22T10:12:15.369Z" },
 ]
+
+[[package]]
+name = "vc-object-store"
+version = "0.1.0"
+source = { editable = "../vc_object_store" }
+dependencies = [
+    { name = "numpy" },
+]
+
+[package.metadata]
+requires-dist = [{ name = "numpy" }]
 
 [[package]]
 name = "vtk"

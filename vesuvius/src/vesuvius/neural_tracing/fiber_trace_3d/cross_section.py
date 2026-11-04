@@ -457,7 +457,7 @@ def write_cross_section_artifacts(
     *,
     metadata: dict | None = None,
 ) -> dict[str, str]:
-    import tifffile
+    from vc_reader import images
 
     directory = Path(directory)
     directory.mkdir(parents=True, exist_ok=True)
@@ -469,7 +469,7 @@ def write_cross_section_artifacts(
     paths: dict[str, str] = {}
     for name, array in arrays.items():
         path = directory / f"cross_section_{name}.tif"
-        tifffile.imwrite(path, array, dtype=np.float32, photometric="minisblack")
+        images.write_tiff(path, array)
         paths[name] = str(path)
     description = {
         "format": "fiber_presence_cross_section_v2",

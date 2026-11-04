@@ -374,7 +374,6 @@ void JsonProfileEditor::onSaveAs()
     }
 
     setProfile(profileId, false);
-    emit userProfilesChanged();
 }
 
 void JsonProfileEditor::onRename()
@@ -415,7 +414,6 @@ void JsonProfileEditor::onRename()
     }
 
     setProfile(selectedId, false);
-    emit userProfilesChanged();
 }
 
 void JsonProfileEditor::onDelete()
@@ -455,7 +453,6 @@ void JsonProfileEditor::onDelete()
     }
 
     setProfile(QStringLiteral("custom"), false);
-    emit userProfilesChanged();
 }
 
 void JsonProfileEditor::updateUserProfileButtons()

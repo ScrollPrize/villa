@@ -15,7 +15,6 @@
 #include <vector>
 #include <algorithm>
 #include <QColorDialog>
-#include <QFileDialog>
 #include <QKeyEvent>
 #include <QMessageBox>
 #include <QLabel>
@@ -28,7 +27,7 @@
 
 #include <filesystem>
 #include <optional>
-#include "utils/Json.hpp"
+#include <nlohmann/json.hpp>
 
 #include "vc/ui/VCCollection.hpp"
 
@@ -235,10 +234,6 @@ void CPointCollectionWidget::setupUi()
     layout->addStretch();
  
     QHBoxLayout *file_layout = new QHBoxLayout();
-    _load_button = new QPushButton("Load");
-    file_layout->addWidget(_load_button);
-    _save_button = new QPushButton("Save");
-    file_layout->addWidget(_save_button);
     _reset_button = new QPushButton("Clear All Points");
     _reset_button->setObjectName(QStringLiteral("pointCollectionClearAllButton"));
     file_layout->addWidget(_reset_button);
@@ -249,8 +244,6 @@ void CPointCollectionWidget::setupUi()
                                       "collection and uncheck Absolute Winding Number");
     layout->addWidget(_reset_winding_button);
 
-    connect(_load_button, &QPushButton::clicked, this, &CPointCollectionWidget::onLoadClicked);
-    connect(_save_button, &QPushButton::clicked, this, &CPointCollectionWidget::onSaveClicked);
     connect(_reset_button, &QPushButton::clicked, this, &CPointCollectionWidget::onResetClicked);
     connect(_reset_winding_button, &QPushButton::clicked, this, &CPointCollectionWidget::onResetWindingClicked);
  
@@ -841,36 +834,6 @@ void CPointCollectionWidget::onFillWindingEqualsClicked()
     }
 }
  
-void CPointCollectionWidget::onSaveClicked()
-{
-    QString fileName = QFileDialog::getSaveFileName(this, tr("Save Point Collection"), "", tr("JSON Files (*.json)"));
-    if (fileName.isEmpty()) {
-        return;
-    }
- 
-    if (_point_collection) {
-        _point_collection->saveToJSON(fileName.toStdString());
-    }
-}
- 
-void CPointCollectionWidget::onLoadClicked()
-{
-    QString fileName = QFileDialog::getOpenFileName(this, tr("Load Point Collection"), "", tr("JSON Files (*.json)"));
-    if (fileName.isEmpty()) {
-        return;
-    }
- 
-    if (_point_collection) {
-       try {
-           if (_point_collection->loadFromJSON(fileName.toStdString())) {
-               refreshTree();
-           }
-       } catch (const std::exception& e) {
-           QMessageBox::critical(this, "Error Loading File", e.what());
-       }
-    }
-}
- 
 void CPointCollectionWidget::selectCollection(uint64_t collectionId)
 {
     QStandardItem* item = findCollectionItem(collectionId);
@@ -957,45 +920,34 @@ void CPointCollectionWidget::showContextMenu(const QPoint& pos)
     }
 }
 
-void CPointCollectionWidget::loadCorrPointsResults(const std::filesystem::path& jsonPath)
+void CPointCollectionWidget::loadCorrPointsResults(const nlohmann::json& results)
 {
     _corr_point_results.clear();
     _corr_collection_avgs.clear();
 
-    if (jsonPath.empty() || !std::filesystem::exists(jsonPath)) {
-        refreshTree();
-        return;
-    }
-
     try {
-        if (!std::filesystem::exists(jsonPath)) {
-            refreshTree();
-            return;
-        }
-        utils::Json j = utils::Json::parse_file(jsonPath);
+        nlohmann::json j = results;
 
-        const auto readId = [](const utils::Json& value) -> std::optional<uint64_t> {
-            if (!value.is_number_integer() || value.get_double() < 0) return std::nullopt;
-            return value.get_uint64();
+        const auto readId = [](const nlohmann::json& value) -> std::optional<uint64_t> {
+            if (!value.is_number_integer() || value.get<double>() < 0) return std::nullopt;
+            return value.get<uint64_t>();
         };
-        const auto storeResult = [this](vc::PointRef ref, const utils::Json& val) {
+        const auto storeResult = [this](vc::PointRef ref, const nlohmann::json& val) {
             CorrPointResult r;
             if (val.contains("winding_obs") && val["winding_obs"].is_number()) {
-                r.winding_obs = val["winding_obs"].get_float();
+                r.winding_obs = val["winding_obs"].get<float>();
             }
             if (val.contains("winding_err") && val["winding_err"].is_number()) {
-                r.winding_err = val["winding_err"].get_float();
+                r.winding_err = val["winding_err"].get<float>();
             }
             if (val.contains("p") && val["p"].is_array() && val["p"].size() >= 3) {
-                r.p[0] = val["p"][0].get_float();
-                r.p[1] = val["p"][1].get_float();
-                r.p[2] = val["p"][2].get_float();
+                r.p[0] = val["p"][0].get<float>();
+                r.p[1] = val["p"][1].get<float>();
+                r.p[2] = val["p"][2].get<float>();
             }
             _corr_point_results[ref] = r;
         };
 
-        // The legacy ID-keyed object loses results when collections share IDs.
-        // Prefer the qualified list, even when it is empty.
         if (j.contains("points_list") && j["points_list"].is_array()) {
             auto points = j["points_list"];
             for (const auto& val : points) {
@@ -1004,23 +956,6 @@ void CPointCollectionWidget::loadCorrPointsResults(const std::filesystem::path& 
                 const auto cid = readId(val["collection_id"]);
                 const auto pid = readId(val["point_id"]);
                 if (cid && pid) storeResult({*cid, *pid}, val);
-            }
-        } else if (j.contains("points") && j["points"].is_object()) {
-            auto points = j["points"];  // copy before nested Json access
-            for (auto it = points.begin(); it != points.end(); ++it) {
-                const std::string key = it.key();
-                const auto& val = *it;
-                if (!val.is_object() || key.empty() ||
-                    key.find_first_not_of("0123456789") != std::string::npos) continue;
-                uint64_t pid = 0;
-                try { pid = std::stoull(key); } catch (...) { continue; }
-                if (val.contains("collection_id")) {
-                    const auto cid = readId(val["collection_id"]);
-                    if (cid) storeResult({*cid, pid}, val);
-                } else {
-                    const auto refs = _point_collection->findPointRefs(pid);
-                    if (refs.size() == 1) storeResult(refs.front(), val);
-                }
             }
         }
 
@@ -1032,7 +967,7 @@ void CPointCollectionWidget::loadCorrPointsResults(const std::filesystem::path& 
                 uint64_t cid = 0;
                 try { cid = std::stoull(key); } catch (...) { continue; }
                 if (val.is_number()) {
-                    _corr_collection_avgs[cid] = val.get_float();
+                    _corr_collection_avgs[cid] = val.get<float>();
                 }
             }
         }

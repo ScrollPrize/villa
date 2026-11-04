@@ -135,15 +135,6 @@ std::optional<std::string> sourceCollection(sqlite3* db, const std::string& orig
     if(s.row()) throw std::runtime_error("duplicate source collection ID");
     return result;
 }
-bool indexedSourceRevision(sqlite3* db, const std::string& object, const std::string& revision) {
-    Statement s(db,"SELECT 1 FROM source_collections WHERE object_uuid=? AND revision_uuid=?", parseUuid(object),
-        parseUuid(revision)); return s.row();
-}
-std::optional<int64_t> indexedSourcePointOffset(sqlite3* db, const std::string& object, int64_t id) {
-    Statement s(db,"SELECT point_offset FROM source_points WHERE object_uuid=? AND point_id=?", parseUuid(object), id);
-    if(geometryWork) ++geometryWork->identityRows;
-    return s.row()?std::optional(s.i64(0)):std::nullopt;
-}
 void validateSourceIdentities(sqlite3* db, const std::string& object) {
     Statement s(db,"SELECT origin,collection_id FROM source_collections WHERE object_uuid=?", parseUuid(object));
     if(!s.row()) return;

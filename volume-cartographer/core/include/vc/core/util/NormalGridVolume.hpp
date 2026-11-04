@@ -4,18 +4,30 @@
 #include <string>
 #include <memory>
 #include <optional>
+#include <filesystem>
 
 #include <opencv2/core/types.hpp>
-#include "utils/Json.hpp"
+#include <nlohmann/json.hpp>
 
 #include "vc/core/util/GridStore.hpp"
 
 namespace vc::core::util {
 
     // Marker file inside a normal-grid directory that turns it into a streaming
-    // cache: {"url": "<https prefix>"}. Grid files missing locally are fetched
-    // from the URL on demand and stored alongside the marker.
+    // cache: {"url": "<https prefix>"}. The directory must be the URL's place under
+    // a cache root, <root>/<scheme>/<host>/<path> (vcr::zarr::decodedCachePath, as
+    // VC3D lays it out); grid files missing locally are downloaded there by
+    // vc_reader's file cache under that root's disk budget and free-space floor.
     inline constexpr const char* kNormalGridsRemoteMarker = "normal-grids-remote.json";
+
+    // The URL a normal-grid directory's marker records (trailing slashes
+    // trimmed); nullopt without a readable marker.
+    [[nodiscard]] std::optional<std::string> normalGridsRemoteUrl(const std::filesystem::path& dir);
+    // Make dir (created if needed) a streaming cache of `url`; a marker already
+    // naming it is kept. False when the marker cannot be written.
+    bool writeNormalGridsRemoteMarker(const std::filesystem::path& dir, const std::string& url);
+    // dir holds a whole normal-grid store: metadata.json and the xy, xz and yz grids.
+    [[nodiscard]] bool hasNormalGridFiles(const std::filesystem::path& dir);
 
     class NormalGridVolume {
     public:
@@ -30,6 +42,10 @@ namespace vc::core::util {
             size_t decodedPathBytes = 0;
             size_t bucketIndexEntries = 0;
             size_t bucketIndexBytes = 0;
+            // Streaming stores: fetches that failed for a reason other than the
+            // file not existing (network, low disk space), and the last such message.
+            uint64_t fetchFailures = 0;
+            std::string lastFetchError;
         };
 
         explicit NormalGridVolume(const std::string& path);
@@ -54,7 +70,7 @@ namespace vc::core::util {
         int level() const;
 
     public:
-        const utils::Json& metadata() const;
+        const nlohmann::json& metadata() const;
 
     private:
         struct pimpl;

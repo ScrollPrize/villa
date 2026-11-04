@@ -188,7 +188,7 @@ Column confidences are the point confidences, interpolated the same way.
 | column frame in the front frame, flattened | 9 |
 
 **Fiber features** (`fiber_ft`, 17 per fiber point, `Tracer._fiber_tokens`). Fibers come from a pool
-(`scripts/build_fiber_pool.py`) of AFV fibers and VC3D fiber JSONs, sampled along each fiber. Each step takes the 48
+(`scripts/build_fiber_pool.py`) of fiber-store fibers and VC3D fiber JSONs, sampled along each fiber. Each step takes the 48
 pool points nearest any front point:
 
 | features | count |
@@ -317,8 +317,7 @@ threshold.
 
 * Scroll 1 (PHercParis4): two directories, on `s1_ds2`;
 * `fiber_ft` also uses `cut_windings`, resampled to square grids (`scripts/resample_isotropic.py`);
-* the registered segments of PHerc0139 and PHerc1667, on their own volumes at 9.6 um (`scripts/prepare_scroll.py`,
-  `data.patch_volumes`), masked where they leave the scan. The middle 20% of each scroll's z extent is held out.
+* the registered segments of PHerc0139 and PHerc1667, on their own volumes at 9.6 um (`data.patch_volumes`), masked where they leave the scan. The middle 20% of each scroll's z extent is held out.
 
 `data.dir_weights` sets each directory's share of the sampling weight. Within a directory, patches are sampled with
 weight `valid_nodes^0.5`. The patch index measures each patch's node spacing and uses it instead of `meta.json`'s
@@ -347,8 +346,8 @@ Split cells are 1024 vx cubes hashed with a seed; 10% are held out for validatio
 ### Fiber episodes (`fiber_ft`)
 
 Horizontal fibers of PHercParis4 are matched to the patches they lie on (`scripts/match_fibers_to_patches.py`,
-`data.fiber_runs`). The fibers are the AFV fiber volume plus VC3D fiber JSONs, matched within +-2 vx along the patch
-normal.
+`data.fiber_runs`). The fibers are a fiber store's (a VC object store; keyed `fiber:<UUID>`) plus VC3D fiber JSONs
+(`json:<file stem>`), matched within +-2 vx along the patch normal.
 
 * **Fiber-seeded episodes (25%, `data.fiber_fraction`).** The seed row is a random stretch of a matched fiber,
   sampled at the 60 vx point spacing. The GT window is rotated so its front axis follows the fiber's course on the

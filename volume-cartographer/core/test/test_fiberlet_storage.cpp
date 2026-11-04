@@ -1,7 +1,8 @@
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
 #include <doctest/doctest.h>
 
-#include "vc/core/util/AtomicFile.hpp"
+#include "vc/core/util/OutputDirectory.hpp"
+#include <vc_reader/zarr.hpp>
 #include "vc/fiber_tracer/FiberletStorage.hpp"
 #include "vc/fiber_tracer/FiberletDataset.hpp"
 #include "vc/fiber_tracer/FiberletQuantization.hpp"
@@ -58,187 +59,6 @@ static void checkMaterializedGraph(
     }
 }
 
-TEST_CASE("Metadata construction rejects nonpositive storage sides")
-{
-    for (const int side : {0, -12}) {
-        CHECK_THROWS_AS(makeFiberletDatasetMetadata(
-            FiberletDatasetKind::Anchors, {{12, 12, 12}, 1.0},
-            FiberAnchorConfig{}, FiberletPathConfig{}, side, nlohmann::json::object()),
-            std::invalid_argument);
-    }
-}
-
-TEST_CASE("Published payload preserves real stored fiberlet geometry")
-{
-    const auto* prefixPath = std::getenv("VC_TEST_FIBERLET_PREFIX");
-    if (!prefixPath)
-        return;
-    const std::filesystem::path input(prefixPath);
-    const auto root = input.parent_path().parent_path();
-    const auto read = [](const std::filesystem::path& path) {
-        std::ifstream stream(path, std::ios::binary);
-        if (!stream)
-            throw std::runtime_error("cannot read real fiberlet input: " + path.string());
-        std::vector<char> chars{std::istreambuf_iterator<char>(stream), {}};
-        std::vector<std::byte> bytes(chars.size());
-        std::memcpy(bytes.data(), chars.data(), chars.size());
-        return bytes;
-    };
-    const auto prefixBytes = read(input);
-    const auto routeBytes = read(root / "routes" / input.filename());
-    const auto ownedBytes = read(root / "anchors" / input.filename());
-    const auto prefixes = deserializeFiberletPrefixes(prefixBytes);
-    const auto owned = deserializeFiberletAnchors(ownedBytes);
-    REQUIRE_FALSE(prefixes.prefixes.empty());
-    nlohmann::json metadata;
-    std::ifstream(root / ".zattrs") >> metadata;
-    const auto units = metadata.at("coordinate_units_per_chunk_zyx")
-        .get<std::array<std::int64_t, 3>>();
-    const auto origin = metadata.at("coordinate_origin_zyx")
-        .get<std::array<std::int64_t, 3>>();
-    std::map<FiberletStorageKey, FiberletStoredAnchor> all;
-    for (const auto& anchor : owned.anchors)
-        all.emplace(anchor.key, anchor);
-    std::map<FiberletStorageKey, FiberletStoredAnchor> referenced;
-    for (const auto& prefix : prefixes.prefixes) {
-        for (const auto& endpoint : {prefix.id.first, prefix.id.second}) {
-            if (all.contains(endpoint))
-                continue;
-            std::array<std::int64_t, 3> coordinate;
-            for (int axis = 0; axis < 3; ++axis)
-                coordinate[axis] = (endpoint.coordinateZYX[axis] - origin[axis]) / units[axis];
-            const auto name = std::to_string(coordinate[0]) + "." +
-                std::to_string(coordinate[1]) + "." + std::to_string(coordinate[2]);
-            const auto anchors = deserializeFiberletAnchors(read(root / "anchors" / name));
-            const auto it = std::find_if(anchors.anchors.begin(), anchors.anchors.end(),
-                [&](const auto& anchor) { return anchor.key == endpoint; });
-            REQUIRE(it != anchors.anchors.end());
-            all.emplace(endpoint, *it);
-            referenced.emplace(endpoint, *it);
-        }
-    }
-    std::vector<FiberletStoredAnchor> references;
-    for (const auto& [key, anchor] : referenced)
-        references.push_back(anchor);
-    auto config = prefixes.config;
-    auto referencedConfig = config;
-    for (const auto& anchor : references)
-        for (int axis = 0; axis < 3; ++axis)
-            referencedConfig.coordinateOriginZYX[axis] = std::min(
-                referencedConfig.coordinateOriginZYX[axis], anchor.key.coordinateZYX[axis]);
-    const auto referenceBytes = serializeFiberletAnchors(referencedConfig, references);
-    const auto published = serializePublishedFiberletChunk(
-        config, ownedBytes, referenceBytes, prefixBytes, routeBytes);
-    const auto decoded = deserializePublishedFiberletChunk(published);
-    CHECK(decoded.ownedAnchorPayload == ownedBytes);
-    CHECK(decoded.prefixPayload == prefixBytes);
-    CHECK(decoded.routePayload == routeBytes);
-    CHECK(decoded.referencedAnchors.anchors.size() == references.size());
-    MESSAGE("real fiberlet prefixes=" << prefixes.prefixes.size()
-        << " owned anchors=" << owned.anchors.size() << " referenced anchors=" << references.size());
-}
-
-TEST_CASE("Real cached fiberlets support graph route reconstruction without generation")
-{
-    const char* directory = std::getenv("VC_TEST_STORED_GRAPH");
-    if (!directory) return;
-    const std::filesystem::path root(directory);
-    const auto anchors = FiberletChunkDataset::openExisting(root / "anchors.zarr");
-    const auto paths = FiberletChunkDataset::openExisting(root / "fiberlets.zarr");
-    auto anchorCache = createStoredFiberletAnchorChunkCache(anchors);
-    auto pathCache = createStoredFiberletPathChunkCache(paths);
-    const auto config = fiberletPathConfigFromDatasetMetadata(paths->metadata());
-    const FiberletAnchorView view = [](const auto&, auto payload) {
-        auto values = std::make_shared<std::vector<FiberletStoredAnchor>>(payload->anchors);
-        for (auto& anchor : *values)
-            anchor.fittedAxisXYZ = quantizeFiberletDirectionForEvaluation(anchor.fittedAxisXYZ);
-        return values;
-    };
-    FiberletChunkGraphSource graph(anchors, anchorCache, paths, pathCache, config, view);
-    const auto chunk = graph.prefixesInChunk({0, 12, 44, 20}, true);
-    REQUIRE(chunk.status == FiberletGraphQueryStatus::Ready);
-    REQUIRE_FALSE(chunk.value.payloadLease->prefixes.empty());
-    const auto id = chunk.value.payloadLease->prefixes.front().id;
-    const auto route = graph.route(id, true);
-    REQUIRE(route.status == FiberletGraphQueryStatus::Ready);
-    REQUIRE(route.value.pointsPredictionXYZ.size() >= 2);
-    FiberletStoredReplayGraphSource stored(anchors, anchorCache, paths, pathCache, config, 45, view);
-    const auto forward = stored.routePoints({id, false});
-    auto reverse = stored.routePoints({id, true});
-    std::reverse(reverse.begin(), reverse.end());
-    CHECK(forward == reverse);
-    REQUIRE(forward.size() == route.value.pointsPredictionXYZ.size());
-    for (size_t i = 0; i < forward.size(); ++i)
-        CHECK(cv::norm(forward[i] - cv::Vec3d(route.value.pointsPredictionXYZ[i]) *
-                       paths->metadata().predictionToBaseScale) == 0);
-    CHECK(stored.costProfile({id, false}).segmentCostDensities.size() == forward.size() - 1);
-    const auto center = forward.front();
-    const auto lo = center - cv::Vec3d::all(16);
-    const auto hi = center + cv::Vec3d::all(16);
-    const auto materialized = stored.materializeBaseBox(lo, hi, 4);
-    REQUIRE_FALSE(materialized.insideAnchors.empty());
-    checkMaterializedGraph(stored, materialized);
-    const char* normalPath = std::getenv("VC_TEST_GRAPH_NORMALS");
-    REQUIRE(normalPath);
-    vc::lasagna::LasagnaDatasetOpenOptions normalOptions;
-    normalOptions.workingToBaseScale = paths->metadata().predictionToBaseScale;
-    const auto normalData = vc::lasagna::LasagnaDataset::open(normalPath, normalOptions);
-    const vc::lasagna::LasagnaNormalSampler normals(normalData);
-    FiberletCropTraceConfig crop;
-    crop.minimumBaseXYZ = lo;
-    crop.maximumBaseXYZ = hi;
-    crop.lookaheadDistanceBaseVoxels = 16;
-    crop.maximumAttempts = 4;
-    crop.parallelThreads = 1;
-    const auto serial = traceFiberletCrop(*materialized.graph,
-        materialized.insideAnchors, normals, normalOptions.workingToBaseScale, crop);
-    crop.parallelThreads = 4;
-    const auto parallel = traceFiberletCrop(*materialized.graph,
-        materialized.insideAnchors, normals, normalOptions.workingToBaseScale, crop);
-    REQUIRE_FALSE(serial.lines.empty());
-    REQUIRE(serial.lines.size() == parallel.lines.size());
-    CHECK(serial.coveredAnchors == parallel.coveredAnchors);
-    CHECK(serial.attemptedAnchors == parallel.attemptedAnchors);
-    for (std::size_t i = 0; i < serial.lines.size(); ++i) {
-        CHECK(serial.lines[i].pointsBaseXYZ == parallel.lines[i].pointsBaseXYZ);
-        CHECK(serial.lines[i].totalMetricCost == parallel.lines[i].totalMetricCost);
-        CHECK(serial.lines[i].seed == parallel.lines[i].seed);
-    }
-    std::cout << "Real crop: " << materialized.insideAnchors.size() << " seeds, "
-              << serial.lines.size() << " lines; serial/4-worker geometry and costs exact\n";
-    const char* predictionPath = std::getenv("VC_TEST_GRAPH_PREDICTIONS");
-    REQUIRE(predictionPath);
-    const auto predictionData = vc::lasagna::LasagnaDataset::open(predictionPath, normalOptions);
-    const FiberPredictionField predictions(predictionData);
-    FiberTraceConfig dense;
-    dense.traceToBaseScale = paths->metadata().predictionToBaseScale;
-    dense.coneGridSize = 5;
-    crop.reverseConsistency = true;
-    crop.reverseBackoffBaseVoxels = 8;
-    crop.parallelThreads = 1;
-    const auto denseSerial = traceDenseBeamCrop(predictions, materialized.insideAnchors,
-        paths->metadata().predictionToBaseScale, normals, dense, crop);
-    crop.parallelThreads = 4;
-    const auto denseParallel = traceDenseBeamCrop(predictions, materialized.insideAnchors,
-        paths->metadata().predictionToBaseScale, normals, dense, crop);
-    REQUIRE_FALSE(denseSerial.lines.empty());
-    REQUIRE(denseSerial.lines.size() == denseParallel.lines.size());
-    CHECK(denseSerial.reverseAttempts > 0);
-    CHECK(denseSerial.reverseFailures == denseParallel.reverseFailures);
-    CHECK(denseSerial.reverseSkippedLengthBaseVoxels == denseParallel.reverseSkippedLengthBaseVoxels);
-    for (std::size_t i = 0; i < denseSerial.lines.size(); ++i) {
-        CHECK(denseSerial.lines[i].pointsBaseXYZ == denseParallel.lines[i].pointsBaseXYZ);
-        CHECK(denseSerial.lines[i].totalMetricCost == denseParallel.lines[i].totalMetricCost);
-    }
-    std::cout << "Real dense crop: " << denseSerial.lines.size() << " lines; "
-              << denseSerial.reverseAttempts << " reverse checks, "
-              << denseSerial.reverseFailures << " failures; serial/4-worker exact\n";
-    std::cout << "Real stored graph: " << chunk.value.payloadLease->prefixes.size()
-              << " prefixes; " << forward.size() << " route points, reverse exact\n";
-    pathCache->cancelPendingAndWait();
-    anchorCache->cancelPendingAndWait();
-}
-
 TEST_CASE("Canonical on-demand preprocessing generates and reopens without sampling")
 {
     class Normals final : public vc::lasagna::NormalSampler {
@@ -271,9 +91,8 @@ TEST_CASE("Canonical on-demand preprocessing generates and reopens without sampl
             }
         }, std::make_shared<Normals>(), {});
     auto producer = FiberletOnDemandPreprocessor::create(config);
-    const auto result = producer->fiberletCache()->getChunkBlocking(0, 0, 0, 0);
-    REQUIRE(result.status == vc::render::ChunkStatus::Data);
-    const auto prefixes = std::dynamic_pointer_cast<const FiberletPrefixChunkPayload>(result.payload);
+    const auto result = producer->fiberletRead()({0, 0, 0, 0});
+    const auto prefixes = std::dynamic_pointer_cast<const FiberletPrefixChunkPayload>(result);
     REQUIRE(prefixes);
     CHECK(!prefixes->prefixes.empty());
     CHECK(sampled.load() > 0);
@@ -281,8 +100,8 @@ TEST_CASE("Canonical on-demand preprocessing generates and reopens without sampl
     CHECK(recovered.cellRadius == paths.cellRadius);
     {
         FiberletStoredReplayGraphSource source(
-            producer->anchorDataset(), producer->anchorCache(),
-            producer->fiberletDataset(), producer->fiberletCache(), recovered, 45,
+            producer->anchorDataset(), producer->anchorRead(),
+            producer->fiberletDataset(), producer->fiberletRead(), recovered, 45,
             [producer](const auto& chunk, auto payload) {
                 return producer->evaluationAnchorChunk(chunk, std::move(payload));
             });
@@ -310,15 +129,12 @@ TEST_CASE("Canonical on-demand preprocessing generates and reopens without sampl
         CHECK_THROWS_AS(source.materializeBaseBoxForSeeds({}, {12, 12, 12},
             {-1, 0, 0}, {12, 12, 12}), std::invalid_argument);
     }
-    producer->shutdown();
     producer.reset();
     const auto calls = sampled.load();
     config.cachedOnly = true;
     auto reopened = FiberletOnDemandPreprocessor::create(config);
-    const auto cached = reopened->fiberletCache()->getChunkBlocking(0, 0, 0, 0);
-    REQUIRE(cached.status == vc::render::ChunkStatus::Data);
+    REQUIRE(reopened->fiberletRead()({0, 0, 0, 0}));
     CHECK(sampled.load() == calls);
-    reopened->shutdown();
     reopened.reset();
     std::filesystem::remove_all(root);
 }
@@ -433,51 +249,6 @@ TEST_CASE("Fiber trace payload round-trips float64 geometry and global costs exa
     invalid.totalMetricCost = std::numeric_limits<double>::quiet_NaN();
     CHECK_THROWS_AS(
         serializeFiberletTraces(config, std::span{&invalid, 1}),
-        std::invalid_argument);
-}
-
-TEST_CASE("Fiberlet scheduled resolution errors preserve key status and cause")
-{
-    const vc::render::ChunkKey key{0, 427, 139, 187};
-    vc::render::ChunkResult resolved;
-    resolved.status = vc::render::ChunkStatus::Error;
-    resolved.error = "synthetic generation failure";
-    CHECK(
-        fiberletScheduledResolutionError(key, resolved) ==
-        "scheduled fiberlet chunk 0/427/139/187 resolved as error: "
-        "synthetic generation failure");
-
-    resolved.status = vc::render::ChunkStatus::Missing;
-    resolved.error.clear();
-    CHECK(
-        fiberletScheduledResolutionError(key, resolved) ==
-        "scheduled fiberlet chunk 0/427/139/187 resolved as missing");
-}
-
-TEST_CASE("Reference prefetch deduplicates physical chunks and orders remaining work")
-{
-    const auto scheduled = [](int z, int y, int x, double arc, double distance) {
-        return FiberletScheduledChunk{{0, z, y, x}, arc, distance};
-    };
-    const std::vector<FiberletReferencePrefetchCandidate> candidates{
-        {scheduled(1, 2, 3, 2.0, 2.0), 10.0, 1},
-        {scheduled(1, 2, 3, 3.0, 5.0), 12.0, 2},
-        {scheduled(4, 5, 6, 1.0, 1.0), 12.0, 5},
-        {scheduled(4, 5, 6, 4.0, 1.0), 12.0, 3},
-        {scheduled(7, 8, 9, 0.0, 0.0), 5.0, 0},
-    };
-    const auto ordered = orderFiberletReferencePrefetch(candidates);
-    REQUIRE(ordered.size() == 3);
-    CHECK(ordered[0].key == (vc::render::ChunkKey{0, 4, 5, 6}));
-    CHECK(ordered[0].nearestReferenceArcBase == 4.0);
-    CHECK(ordered[1].key == (vc::render::ChunkKey{0, 1, 2, 3}));
-    CHECK(ordered[1].nearestReferenceArcBase == 3.0);
-    CHECK(ordered[2].key == (vc::render::ChunkKey{0, 7, 8, 9}));
-
-    auto invalid = candidates;
-    invalid.front().remainingReferenceBase = -1.0;
-    CHECK_THROWS_AS(
-        orderFiberletReferencePrefetch(invalid),
         std::invalid_argument);
 }
 
@@ -907,62 +678,41 @@ TEST_CASE("Fiberlet sparse dataset generates, publishes, and reuses opaque chunk
     finalizeFiberletDatasetIdentity(metadata);
     auto dataset = FiberletChunkDataset::createOrOpen(root, metadata);
     std::atomic<int> generated{0};
-    std::atomic<int> generatedResolutions{0};
-    auto cache = createGeneratedFiberletChunkCache(
+    auto memory = std::make_shared<vcr::MemoryCache>(1U << 20);
+    auto read = fiberletGeneratedChunkRead(
         dataset,
-        [&](FiberletStorageChunkKind kind, const vc::render::ChunkKey&, const FiberletStorageCodecConfig& config) {
+        [&](FiberletStorageChunkKind kind, const FiberletChunkKey&, const FiberletStorageCodecConfig& config) {
             ++generated;
             CHECK(kind == FiberletStorageChunkKind::Anchors);
             const auto origin = config.coordinateOriginZYX;
             const std::vector<FiberletStoredAnchor> anchors{{key(origin[0], origin[1], origin[2]), {1, 2, 3}, {1, 0, 0}}};
             return materialized(kind, serializeFiberletAnchors(config, anchors));
         },
-        {},
-        [&](FiberletStorageChunkKind kind, const vc::render::ChunkKey& key, vc::render::ChunkFetchStatus status) {
-            CHECK(kind == FiberletStorageChunkKind::Anchors);
-            CHECK(key.level == 0);
-            CHECK(key.iz == 1);
-            CHECK(key.iy == 0);
-            CHECK(key.ix == 1);
-            CHECK(status == vc::render::ChunkFetchStatus::Found);
-            ++generatedResolutions;
-            throw std::runtime_error("observer failure must be isolated");
-        });
-    auto first = cache->getChunkBlocking(0, 1, 0, 1);
-    REQUIRE(first.status == vc::render::ChunkStatus::Data);
-    REQUIRE(first.payload);
-    CHECK(cache->stats().decodedChunkBytes == first.payload->residentBytes());
+        memory);
+    auto first = read({0, 1, 0, 1});
+    REQUIRE(first);
     CHECK(generated.load() == 1);
-    CHECK(generatedResolutions.load() == 1);
-    cache.reset();
+    CHECK(memory->size() == 1);
+    CHECK(memory->nbytes() > 0);
+    // Repeat reads decode the bytes the memory cache keeps, without generating.
+    const auto repeated = std::dynamic_pointer_cast<const FiberletAnchorChunkPayload>(read({0, 1, 0, 1}));
+    REQUIRE(repeated);
+    CHECK(repeated->anchors.size() == 1);
+    CHECK(generated.load() == 1);
+    CHECK(memory->hits() == 1);
 
     auto reopened = FiberletChunkDataset::createOrOpen(root, metadata);
-    std::atomic<int> persistedResolutions{0};
-    auto secondCache = createGeneratedFiberletChunkCache(
+    auto secondRead = fiberletGeneratedChunkRead(
         reopened,
-        [&](FiberletStorageChunkKind, const vc::render::ChunkKey&, const FiberletStorageCodecConfig&) -> FiberletChunkDataset::MaterializedChunk {
+        [&](FiberletStorageChunkKind, const FiberletChunkKey&, const FiberletStorageCodecConfig&) -> FiberletChunkDataset::MaterializedChunk {
             ++generated;
             throw std::runtime_error("existing chunk should have been reused");
-        },
-        {},
-        [&](FiberletStorageChunkKind kind, const vc::render::ChunkKey& key, vc::render::ChunkFetchStatus status) {
-            CHECK(kind == FiberletStorageChunkKind::Anchors);
-            CHECK(key.level == 0);
-            CHECK(key.iz == 1);
-            CHECK(key.iy == 0);
-            CHECK(key.ix == 1);
-            CHECK(status == vc::render::ChunkFetchStatus::Found);
-            ++persistedResolutions;
         });
-    auto second = secondCache->getChunkBlocking(0, 1, 0, 1);
-    REQUIRE(second.status == vc::render::ChunkStatus::Data);
-    REQUIRE(second.payload);
-    CHECK(secondCache->stats().decodedChunkBytes ==
-          second.payload->residentBytes());
+    auto second = secondRead({0, 1, 0, 1});
+    REQUIRE(second);
     CHECK(generated.load() == 1);
-    CHECK(persistedResolutions.load() == 1);
-    const auto firstPayload = std::dynamic_pointer_cast<const FiberletAnchorChunkPayload>(first.payload);
-    const auto secondPayload = std::dynamic_pointer_cast<const FiberletAnchorChunkPayload>(second.payload);
+    const auto firstPayload = std::dynamic_pointer_cast<const FiberletAnchorChunkPayload>(first);
+    const auto secondPayload = std::dynamic_pointer_cast<const FiberletAnchorChunkPayload>(second);
     REQUIRE(firstPayload);
     REQUIRE(secondPayload);
     REQUIRE(secondPayload->anchors.size() == firstPayload->anchors.size());
@@ -1004,10 +754,10 @@ TEST_CASE("Generated sparse empty chunks remain absent on disk")
     metadata.costBits = 32;
     finalizeFiberletDatasetIdentity(metadata);
     auto dataset = FiberletChunkDataset::createOrOpen(root, metadata);
-    const vc::render::ChunkKey key{0, 1, 0, 1};
-    auto cache = createGeneratedFiberletChunkCache(
+    const FiberletChunkKey key{0, 1, 0, 1};
+    auto read = fiberletGeneratedChunkRead(
         dataset,
-        [](FiberletStorageChunkKind kind, const vc::render::ChunkKey&,
+        [](FiberletStorageChunkKind kind, const FiberletChunkKey&,
            const FiberletStorageCodecConfig& config) {
             auto chunk = materialized(
                 kind, serializeFiberletAnchors(config, {}));
@@ -1015,17 +765,13 @@ TEST_CASE("Generated sparse empty chunks remain absent on disk")
             return chunk;
         });
 
-    const auto fetched = cache->getChunkBlocking(
-        key.level, key.iz, key.iy, key.ix);
-    REQUIRE(fetched.status == vc::render::ChunkStatus::Data);
     const auto payload = std::dynamic_pointer_cast<
-        const FiberletAnchorChunkPayload>(fetched.payload);
+        const FiberletAnchorChunkPayload>(read(key));
     REQUIRE(payload);
     CHECK(payload->anchors.empty());
     CHECK_FALSE(std::filesystem::exists(
         dataset->chunkPath(FiberletStorageChunkKind::Anchors, key)));
 
-    cache->cancelPendingAndWait();
     std::filesystem::remove_all(root);
 }
 
@@ -1205,8 +951,8 @@ TEST_CASE("Fiberlet prefix and routes become visible only as a complete payload 
     metadata.costBits = 32;
     finalizeFiberletDatasetIdentity(metadata);
     auto dataset = FiberletChunkDataset::createOrOpen(root, metadata);
-    const vc::render::ChunkKey prefixKey{0, 0, 0, 0};
-    const vc::render::ChunkKey routeKey{1, 0, 0, 0};
+    const FiberletChunkKey prefixKey{0, 0, 0, 0};
+    const FiberletChunkKey routeKey{1, 0, 0, 0};
     const auto prefix = serializeFiberletPrefixes(dataset->codecConfig(FiberletStorageChunkKind::FiberletPrefix, prefixKey), {});
     const auto routes = serializeFiberletRoutes(dataset->codecConfig(FiberletStorageChunkKind::FiberletRoutes, routeKey), {});
     dataset->publishChunk(FiberletStorageChunkKind::FiberletPrefix, prefixKey, prefix);
@@ -1237,12 +983,12 @@ TEST_CASE("Fiberlet sparse output selection conservatively covers nonempty prese
 
 TEST_CASE("Whole-volume scheduler prioritizes ready fiberlets within a Z frontier")
 {
-    const vc::render::ChunkKey outputA{0, 3, 0, 0};
-    const vc::render::ChunkKey outputB{0, 3, 0, 1};
-    const vc::render::ChunkKey outputC{0, 4, 0, 0};
-    const vc::render::ChunkKey anchorA{0, 2, 0, 0};
-    const vc::render::ChunkKey anchorB{0, 3, 0, 0};
-    const vc::render::ChunkKey anchorC{0, 4, 0, 0};
+    const FiberletChunkKey outputA{0, 3, 0, 0};
+    const FiberletChunkKey outputB{0, 3, 0, 1};
+    const FiberletChunkKey outputC{0, 4, 0, 0};
+    const FiberletChunkKey anchorA{0, 2, 0, 0};
+    const FiberletChunkKey anchorB{0, 3, 0, 0};
+    const FiberletChunkKey anchorC{0, 4, 0, 0};
     FiberletPreprocessSchedule schedule(
         {outputA, outputB, outputC},
         {{anchorA, anchorB}, {anchorB, anchorB}, {anchorC}},
@@ -1283,8 +1029,8 @@ TEST_CASE("Whole-volume scheduler prioritizes ready fiberlets within a Z frontie
 
 TEST_CASE("Whole-volume scheduler retains missing anchor-cache work for resumed outputs")
 {
-    const vc::render::ChunkKey output{0, 8, 2, 1};
-    const vc::render::ChunkKey anchor{0, 8, 2, 1};
+    const FiberletChunkKey output{0, 8, 2, 1};
+    const FiberletChunkKey anchor{0, 8, 2, 1};
     FiberletPreprocessSchedule schedule({output}, {{anchor}}, std::array{output}, {});
     CHECK(schedule.outputsCompleted() == 1);
     CHECK_FALSE(schedule.currentOutputZ().has_value());
@@ -1298,10 +1044,10 @@ TEST_CASE("Whole-volume scheduler retains missing anchor-cache work for resumed 
 
 TEST_CASE("Whole-volume scheduler prioritizes anchors that unblock incomplete outputs")
 {
-    const vc::render::ChunkKey completedOutput{0, 7, 0, 0};
-    const vc::render::ChunkKey pendingOutput{0, 8, 0, 0};
-    const vc::render::ChunkKey cacheRepairAnchor{0, 7, 0, 0};
-    const vc::render::ChunkKey blockingAnchor{0, 8, 0, 0};
+    const FiberletChunkKey completedOutput{0, 7, 0, 0};
+    const FiberletChunkKey pendingOutput{0, 8, 0, 0};
+    const FiberletChunkKey cacheRepairAnchor{0, 7, 0, 0};
+    const FiberletChunkKey blockingAnchor{0, 8, 0, 0};
     FiberletPreprocessSchedule schedule(
         {completedOutput, pendingOutput},
         {{cacheRepairAnchor}, {blockingAnchor}},
@@ -1357,12 +1103,10 @@ TEST_CASE("Combined fiberlet dataset publishes and validates complete sparse tup
     };
     finalizeFiberletDatasetIdentity(metadata);
     auto dataset = FiberletChunkDataset::createOrOpen(root, metadata);
-    const vc::render::ChunkKey owner{0, 0, 0, 0};
-    dataset->configureExpectedChunks(std::span<const vc::render::ChunkKey>(&owner, 1));
-    auto incompleteAnchorCache = createStoredFiberletAnchorChunkCache(dataset);
-    auto incompletePathCache = createStoredFiberletPathChunkCache(dataset);
-    incompletePathCache->cancelPendingAndWait();
-    incompleteAnchorCache->cancelPendingAndWait();
+    const FiberletChunkKey owner{0, 0, 0, 0};
+    dataset->configureExpectedChunks(std::span<const FiberletChunkKey>(&owner, 1));
+    (void)fiberletStoredAnchorRead(dataset);
+    (void)fiberletStoredPathRead(dataset);
 
     const auto first = key(6, 7, 7);
     const auto second = key(7, 7, 7);
@@ -1394,7 +1138,7 @@ TEST_CASE("Combined fiberlet dataset publishes and validates complete sparse tup
     const std::vector<FiberletStoredRoute> routes{
         {.middleUV = {}, .segmentCostDensities = {1.0F}},
         {.middleUV = {}, .segmentCostDensities = {1.0F}}};
-    const vc::render::ChunkKey routeKey{1, 0, 0, 0};
+    const FiberletChunkKey routeKey{1, 0, 0, 0};
     const auto prefixBytes = serializeFiberletPrefixes(dataset->codecConfig(FiberletStorageChunkKind::FiberletPrefix, owner), prefixes);
     dataset->publishChunk(FiberletStorageChunkKind::FiberletPrefix, owner, prefixBytes);
     CHECK_FALSE(dataset->datasetComplete());
@@ -1420,10 +1164,10 @@ TEST_CASE("Combined fiberlet dataset publishes and validates complete sparse tup
     CHECK_FALSE(std::filesystem::exists(root / "dataset.complete"));
     CHECK_FALSE(std::filesystem::exists(root / "complete"));
     CHECK_THROWS_AS(reopened->datasetComplete(), std::invalid_argument);
-    reopened->configureExpectedChunks(std::span<const vc::render::ChunkKey>(&owner, 1));
+    reopened->configureExpectedChunks(std::span<const FiberletChunkKey>(&owner, 1));
     CHECK(reopened->datasetComplete());
-    const vc::render::ChunkKey inactive{0, 1, 1, 1};
-    const vc::render::ChunkKey inactiveRoute{1, 1, 1, 1};
+    const FiberletChunkKey inactive{0, 1, 1, 1};
+    const FiberletChunkKey inactiveRoute{1, 1, 1, 1};
     const auto emptyAnchorsBytes = serializeFiberletAnchors(reopened->codecConfig(FiberletStorageChunkKind::Anchors, inactive), {});
     const auto emptyPrefixesBytes = serializeFiberletPrefixes(reopened->codecConfig(FiberletStorageChunkKind::FiberletPrefix, inactive), {});
     const auto emptyRoutesBytes = serializeFiberletRoutes(reopened->codecConfig(FiberletStorageChunkKind::FiberletRoutes, inactiveRoute), {});
@@ -1460,12 +1204,10 @@ TEST_CASE("Combined fiberlet dataset with no expected chunks is complete from fo
     metadata.costBits = 16;
     finalizeFiberletDatasetIdentity(metadata);
     auto dataset = FiberletChunkDataset::createOrOpen(root, metadata);
-    dataset->configureExpectedChunks(std::span<const vc::render::ChunkKey>{});
+    dataset->configureExpectedChunks(std::span<const FiberletChunkKey>{});
     CHECK(dataset->datasetComplete());
-    auto anchorCache = createStoredFiberletAnchorChunkCache(dataset);
-    auto pathCache = createStoredFiberletPathChunkCache(dataset);
-    pathCache->cancelPendingAndWait();
-    anchorCache->cancelPendingAndWait();
+    (void)fiberletStoredAnchorRead(dataset);
+    (void)fiberletStoredPathRead(dataset);
     std::filesystem::remove_all(root);
 }
 
@@ -1488,20 +1230,14 @@ TEST_CASE("Stored combined fiberlet caches interpret absent sparse chunks as emp
     finalizeFiberletDatasetIdentity(metadata);
     auto dataset = FiberletChunkDataset::createOrOpen(root, metadata);
 
-    auto anchorCache = createStoredFiberletAnchorChunkCache(dataset);
-    auto pathCache = createStoredFiberletPathChunkCache(dataset);
-    const auto anchors = anchorCache->getChunkBlocking(0, 1, 0, 1);
-    const auto prefixes = pathCache->getChunkBlocking(0, 1, 0, 1);
-    const auto routes = pathCache->getChunkBlocking(1, 1, 0, 1);
-    REQUIRE(anchors.status == vc::render::ChunkStatus::Data);
-    REQUIRE(prefixes.status == vc::render::ChunkStatus::Data);
-    REQUIRE(routes.status == vc::render::ChunkStatus::Data);
+    auto anchorRead = fiberletStoredAnchorRead(dataset);
+    auto pathRead = fiberletStoredPathRead(dataset);
     const auto anchorPayload = std::dynamic_pointer_cast<
-        const FiberletAnchorChunkPayload>(anchors.payload);
+        const FiberletAnchorChunkPayload>(anchorRead({0, 1, 0, 1}));
     const auto prefixPayload = std::dynamic_pointer_cast<
-        const FiberletPrefixChunkPayload>(prefixes.payload);
+        const FiberletPrefixChunkPayload>(pathRead({0, 1, 0, 1}));
     const auto routePayload = std::dynamic_pointer_cast<
-        const FiberletRouteChunkPayload>(routes.payload);
+        const FiberletRouteChunkPayload>(pathRead({1, 1, 0, 1}));
     REQUIRE(anchorPayload);
     REQUIRE(prefixPayload);
     REQUIRE(routePayload);
@@ -1509,8 +1245,6 @@ TEST_CASE("Stored combined fiberlet caches interpret absent sparse chunks as emp
     CHECK(prefixPayload->prefixes.empty());
     CHECK(routePayload->routes.empty());
 
-    pathCache->cancelPendingAndWait();
-    anchorCache->cancelPendingAndWait();
     std::filesystem::remove_all(root);
 }
 
@@ -1540,8 +1274,8 @@ TEST_CASE("Fiberlet chunk graph loads complete cross-chunk adjacency and routes"
     auto anchorsDataset = FiberletChunkDataset::createOrOpen(root / "anchors", anchorsMetadata);
     auto fiberletsDataset = FiberletChunkDataset::createOrOpen(root / "fiberlets", fiberletsMetadata);
 
-    auto anchorCache =
-        createGeneratedFiberletChunkCache(anchorsDataset, [=](FiberletStorageChunkKind kind, const vc::render::ChunkKey&, const FiberletStorageCodecConfig& config) {
+    auto anchorRead =
+        fiberletGeneratedChunkRead(anchorsDataset, [=](FiberletStorageChunkKind kind, const FiberletChunkKey&, const FiberletStorageCodecConfig& config) {
             std::vector<FiberletStoredAnchor> anchors;
             const auto appendIfOwned = [&](const FiberletStorageKey& candidate, const cv::Vec3f& position) {
                 bool owned = true;
@@ -1556,12 +1290,11 @@ TEST_CASE("Fiberlet chunk graph loads complete cross-chunk adjacency and routes"
             std::sort(anchors.begin(), anchors.end(), [](const auto& left, const auto& right) { return left.key < right.key; });
             return materialized(kind, serializeFiberletAnchors(config, anchors));
         });
-    FiberletChunkCacheOptions fiberletCacheOptions;
-    fiberletCacheOptions.service.decodedByteCapacity = 1024;
+    auto fiberletMemory = std::make_shared<vcr::MemoryCache>(1024);
     std::atomic<int> routeRequests{0};
-    auto fiberletCache = createGeneratedFiberletChunkCache(
+    auto fiberletRead = fiberletGeneratedChunkRead(
         fiberletsDataset,
-        [=, &routeRequests](FiberletStorageChunkKind kind, const vc::render::ChunkKey& chunk, const FiberletStorageCodecConfig& config) {
+        [=, &routeRequests](FiberletStorageChunkKind kind, const FiberletChunkKey& chunk, const FiberletStorageCodecConfig& config) {
             const bool owner = chunk.iz == 0 && chunk.iy == 1 && chunk.ix == 1;
             if (kind == FiberletStorageChunkKind::FiberletPrefix) {
                 const std::vector<FiberletStoredPrefix> prefixes =
@@ -1578,73 +1311,65 @@ TEST_CASE("Fiberlet chunk graph loads complete cross-chunk adjacency and routes"
                       : std::vector<FiberletStoredRoute>{};
             return materialized(kind, serializeFiberletRoutes(config, routes));
         },
-        fiberletCacheOptions);
-    FiberletChunkGraphSource graph(anchorsDataset, anchorCache, fiberletsDataset, fiberletCache);
+        fiberletMemory);
+    FiberletChunkGraphSource graph(anchorsDataset, anchorRead, fiberletsDataset, fiberletRead);
 
-    auto incident = graph.incidentEdges(second, true);
+    auto incident = graph.incidentEdges(second);
     REQUIRE(incident.status == FiberletGraphQueryStatus::Ready);
     REQUIRE(incident.value.edges.size() == 1);
     CHECK(incident.value.edges.front().id.fiberlet == edgeId);
     CHECK(incident.value.edges.front().id.reverse);
     CHECK_FALSE(incident.value.payloadLeases.empty());
-    // External pins are not charged as cache-owned decoded bytes.
     REQUIRE(incident.value.payloadLeases.front());
 
-    const auto loadedAnchor = graph.anchor(second, true);
+    const auto loadedAnchor = graph.anchor(second);
     REQUIRE(loadedAnchor.status == FiberletGraphQueryStatus::Ready);
     CHECK((loadedAnchor.value.anchor.positionPredictionXYZ == cv::Vec3f{2, 2, 3}));
 
-    const auto edge = graph.edge(edgeId, true);
+    const auto edge = graph.edge(edgeId);
     REQUIRE(edge.status == FiberletGraphQueryStatus::Ready);
     CHECK(edge.value.prefix.cost.total() == 9.25F);
     CHECK((edge.value.prefix.firstStepBaseXYZ == cv::Vec3f{1, 0, 0}));
     CHECK(routeRequests.load() == 0);
 
-    auto route = graph.route(edgeId, true);
+    auto route = graph.route(edgeId);
     REQUIRE(route.status == FiberletGraphQueryStatus::Ready);
     CHECK(route.value.prefix.cost.total() == 9.25F);
     CHECK(route.value.route.middleUV.empty());
     CHECK(route.value.pointsPredictionXYZ.size() == 2);
     CHECK(routeRequests.load() == 1);
 
-    FiberletChunkGraphSource transformedGraph(anchorsDataset, anchorCache, fiberletsDataset, fiberletCache, {}, [](const vc::render::ChunkKey&, std::shared_ptr<const FiberletAnchorChunkPayload> canonical) {
+    FiberletChunkGraphSource transformedGraph(anchorsDataset, anchorRead, fiberletsDataset, fiberletRead, {}, [](const FiberletChunkKey&, std::shared_ptr<const FiberletAnchorChunkPayload> canonical) {
         auto transformed = std::make_shared<std::vector<FiberletStoredAnchor>>(canonical->anchors);
         for (auto& anchor : *transformed)
             anchor.positionPredictionXYZ[0] += 10.0F;
         return std::shared_ptr<const std::vector<FiberletStoredAnchor>>(std::move(transformed));
     });
-    const auto transformedAnchor = transformedGraph.anchor(second, true);
+    const auto transformedAnchor = transformedGraph.anchor(second);
     REQUIRE(transformedAnchor.status == FiberletGraphQueryStatus::Ready);
     CHECK((transformedAnchor.value.anchor.positionPredictionXYZ == cv::Vec3f{12, 2, 3}));
-    const auto transformedChunk = transformedGraph.anchorsInChunk({0, 1, 0, 0}, true);
+    const auto transformedChunk = transformedGraph.anchorsInChunk({0, 1, 0, 0});
     REQUIRE(transformedChunk.status == FiberletGraphQueryStatus::Ready);
     REQUIRE(transformedChunk.value.anchors->size() == 1);
     CHECK((transformedChunk.value.anchors->front().positionPredictionXYZ == cv::Vec3f{12, 2, 3}));
-    const auto transformedEdge = transformedGraph.edge(edgeId, true);
+    const auto transformedEdge = transformedGraph.edge(edgeId);
     REQUIRE(transformedEdge.status == FiberletGraphQueryStatus::Ready);
     CHECK((transformedEdge.value.firstAnchor.positionPredictionXYZ == cv::Vec3f{11, 2, 3}));
     CHECK((transformedEdge.value.secondAnchor.positionPredictionXYZ == cv::Vec3f{12, 2, 3}));
-    const auto transformedRoute = transformedGraph.route(edgeId, true);
+    const auto transformedRoute = transformedGraph.route(edgeId);
     REQUIRE(transformedRoute.status == FiberletGraphQueryStatus::Ready);
     REQUIRE(transformedRoute.value.pointsPredictionXYZ.size() == 2);
     CHECK((transformedRoute.value.pointsPredictionXYZ.front() == cv::Vec3f{11, 2, 3}));
     CHECK((transformedRoute.value.pointsPredictionXYZ.back() == cv::Vec3f{12, 2, 3}));
 
-    const vc::render::ChunkKey owner{0, 0, 1, 1};
-    const vc::render::ChunkKey distant{0, 3, 3, 3};
-    auto ownerBeforeRelease = fiberletCache->getChunkIfCached(owner.level, owner.iz, owner.iy, owner.ix);
-    CHECK(ownerBeforeRelease.status == vc::render::ChunkStatus::Data);
-    // Release every graph lease, then force LRU enforcement with another
-    // chunk. Connectivity must be reconstructible from stable IDs after the
-    // original owner payload is evicted.
+    // Release every graph lease, then evict with another chunk. Connectivity
+    // must be reconstructible from stable IDs after the owner payload is evicted.
+    const FiberletChunkKey distant{0, 3, 3, 3};
     incident.value = {};
     route.value = {};
-    ownerBeforeRelease.payload.reset();
-    const auto distantChunk = fiberletCache->getChunkBlocking(distant.level, distant.iz, distant.iy, distant.ix);
-    REQUIRE(distantChunk.status == vc::render::ChunkStatus::Data);
-    CHECK(fiberletCache->stats().decodedBytes <=
-          fiberletCacheOptions.service.decodedByteCapacity);
-    const auto reloadedIncident = graph.incidentEdges(second, true);
+    REQUIRE(fiberletRead(distant));
+    CHECK(fiberletMemory->nbytes() <= fiberletMemory->max_bytes());
+    const auto reloadedIncident = graph.incidentEdges(second);
     REQUIRE(reloadedIncident.status == FiberletGraphQueryStatus::Ready);
     REQUIRE(reloadedIncident.value.edges.size() == 1);
     CHECK(reloadedIncident.value.edges.front().id.fiberlet == edgeId);
@@ -1718,10 +1443,10 @@ TEST_CASE("Fiberlet crop materialization ignores partial tuples reached only by 
         return prefix;
     };
     const auto publishComplete = [&dataset](
-                                     const vc::render::ChunkKey& owner,
+                                     const FiberletChunkKey& owner,
                                      const std::vector<FiberletStoredAnchor>& anchors,
                                      const std::vector<FiberletStoredPrefix>& prefixes) {
-        const vc::render::ChunkKey routeOwner{
+        const FiberletChunkKey routeOwner{
             1, owner.iz, owner.iy, owner.ix};
         dataset->publishChunk(
             FiberletStorageChunkKind::Anchors, owner,
@@ -1749,9 +1474,9 @@ TEST_CASE("Fiberlet crop materialization ignores partial tuples reached only by 
                     routes)));
     };
 
-    const vc::render::ChunkKey insideOwner{0, 0, 0, 1};
-    const vc::render::ChunkKey haloOwner{0, 0, 0, 2};
-    const vc::render::ChunkKey partialOwner{0, 0, 0, 3};
+    const FiberletChunkKey insideOwner{0, 0, 0, 1};
+    const FiberletChunkKey haloOwner{0, 0, 0, 2};
+    const FiberletChunkKey partialOwner{0, 0, 0, 3};
     publishComplete(
         insideOwner, {makeAnchor(isolated, 9.0F), makeAnchor(inside, 15.0F)},
         {makePrefix(inside, relevantOutside)});
@@ -1826,9 +1551,9 @@ TEST_CASE("Published Fiberlet dataset stores self-contained slash-separated chun
     metadata.costBits = 16;
     finalizeFiberletDatasetIdentity(metadata);
     auto dataset = FiberletChunkDataset::createOrOpen(root, metadata);
-    const std::array<vc::render::ChunkKey, 2> expected{
-        vc::render::ChunkKey{0, 0, 0, 0},
-        vc::render::ChunkKey{0, 1, 0, 0}};
+    const std::array<FiberletChunkKey, 2> expected{
+        FiberletChunkKey{0, 0, 0, 0},
+        FiberletChunkKey{0, 1, 0, 0}};
     dataset->configureExpectedChunks(expected);
 
     const auto first = key(7, 2, 2);
@@ -1894,7 +1619,7 @@ TEST_CASE("Published Fiberlet dataset stores self-contained slash-separated chun
             secondEmptyPrefixes, secondEmptyRoutes));
     CHECK_FALSE(dataset->datasetComplete());
     CHECK_THROWS_AS(
-        createStoredFiberletAnchorChunkCache(dataset), std::invalid_argument);
+        (void)fiberletStoredAnchorRead(dataset), std::invalid_argument);
     dataset->markComplete();
     CHECK(dataset->datasetComplete());
     {
@@ -1925,41 +1650,31 @@ TEST_CASE("Published Fiberlet dataset stores self-contained slash-separated chun
     REQUIRE(ownedFacetPayload->anchors.size() == 1);
     CHECK(ownedFacetPayload->anchors.front().key == first);
 
-    auto anchorCache = createStoredFiberletAnchorChunkCache(dataset);
-    auto pathCache = createStoredFiberletPathChunkCache(dataset);
-    const auto loaded = anchorCache->getChunkBlocking(0, 1, 0, 0);
-    REQUIRE(loaded.status == vc::render::ChunkStatus::Data);
-    const auto route = pathCache->getChunkBlocking(1, 0, 0, 0);
-    REQUIRE(route.status == vc::render::ChunkStatus::Data);
-    REQUIRE(std::dynamic_pointer_cast<const FiberletRouteChunkPayload>(route.payload));
-    pathCache->cancelPendingAndWait();
-    anchorCache->cancelPendingAndWait();
+    auto anchorRead = fiberletStoredAnchorRead(dataset);
+    auto pathRead = fiberletStoredPathRead(dataset);
+    REQUIRE(anchorRead({0, 1, 0, 0}));
+    REQUIRE(std::dynamic_pointer_cast<const FiberletRouteChunkPayload>(pathRead({1, 0, 0, 0})));
 
     // Open while complete, then remove the neighboring owner's chunk. An
     // already-open route remains self-contained; new opens must still reject
     // the now-incomplete dataset.
-    auto graphAnchors = createStoredFiberletAnchorChunkCache(dataset);
-    auto graphPaths = createStoredFiberletPathChunkCache(dataset);
+    auto graphAnchors = fiberletStoredAnchorRead(dataset);
+    auto graphPaths = fiberletStoredPathRead(dataset);
     FiberletChunkGraphSource graph(dataset, graphAnchors, dataset, graphPaths);
     std::filesystem::remove(root / "fiberlets" / "1" / "0" / "0");
-    const auto edge = graph.edge(prefixes.front().id, true);
+    const auto edge = graph.edge(prefixes.front().id);
     REQUIRE(edge.status == FiberletGraphQueryStatus::Ready);
     CHECK(edge.value.firstAnchor.key == first);
     CHECK(edge.value.secondAnchor.key == second);
     REQUIRE(edge.value.prefixPayloadLease->endpoints);
-    CHECK(edge.value.prefixPayloadLease->residentBytes() >=
-          edge.value.prefixPayloadLease->endpoints->residentBytes());
-    const auto graphRoute = graph.route(prefixes.front().id, true);
+    const auto graphRoute = graph.route(prefixes.front().id);
     REQUIRE(graphRoute.status == FiberletGraphQueryStatus::Ready);
     REQUIRE(graphRoute.value.pointsPredictionXYZ.size() == 2);
     CHECK(graphRoute.value.pointsPredictionXYZ.front() == firstOwned.front().positionPredictionXYZ);
     CHECK(graphRoute.value.pointsPredictionXYZ.back() == firstReferenced.front().positionPredictionXYZ);
-    CHECK(graphAnchors->stats().decodedBytes == 0);
-    graphPaths->cancelPendingAndWait();
-    graphAnchors->cancelPendingAndWait();
     CHECK_FALSE(dataset->datasetComplete());
     CHECK_THROWS_AS(
-        createStoredFiberletPathChunkCache(dataset), std::invalid_argument);
+        (void)fiberletStoredPathRead(dataset), std::invalid_argument);
     dataset->configureExpectedChunks(expected);
     CHECK(dataset->metadata().buildState == FiberletDatasetBuildState::Partial);
     dataset->publishPublishedChunk(
@@ -1999,514 +1714,7 @@ TEST_CASE("Fiberlet atomic temporary cleanup removes only exact abandoned write 
         CHECK(std::filesystem::exists(root / "keep.tmp.1.invalid"));
     }
     std::filesystem::create_directories(root / "occupied-target");
-    CHECK_THROWS(vc::core::util::atomicWriteString(root / "occupied-target", "cannot replace a directory"));
+    CHECK_THROWS(vcr::zarr::atomicWrite(root / "occupied-target", "cannot replace a directory", vcr::zarr::Durability::Fsync));
     CHECK(vc::core::util::cleanupAtomicWriteTemporaryFiles(root) == 0);
-    std::filesystem::remove_all(root);
-}
-
-
-
-
-TEST_CASE("Fiberlet sparse overlays fall through and enforce monotone records")
-{
-    std::mt19937_64 random(std::random_device{}());
-    const auto root = std::filesystem::temp_directory_path() /
-        ("vc_fiberlet_overlays_" + std::to_string(random()));
-    FiberletDatasetMetadata anchorMetadata;
-    anchorMetadata.kind = FiberletDatasetKind::Anchors;
-    anchorMetadata.profile = FiberletStorageProfile::Float32Cache;
-    anchorMetadata.chunkGridShapeZYX = {1, 1, 2};
-    anchorMetadata.coordinateUnitsPerChunkZYX = {16, 16, 16};
-    anchorMetadata.maximumEndpointReachCoordinateUnitsZYX = {8, 8, 8};
-    anchorMetadata.spatialChunkSideBaseVoxels = 16;
-    anchorMetadata.predictionToBaseScale = 1.0;
-    finalizeFiberletDatasetIdentity(anchorMetadata);
-    auto pathMetadata = anchorMetadata;
-    pathMetadata.kind = FiberletDatasetKind::Fiberlets;
-    finalizeFiberletDatasetIdentity(pathMetadata);
-    const vc::render::ChunkKey owner{0, 0, 0, 0};
-    const vc::render::ChunkKey routeOwner{1, 0, 0, 0};
-    const FiberletStoredAnchor first{
-        key(1, 1, 1), {1, 1, 1}, {1, 0, 0}, {1, 0, 0}, 1.0F,
-        {0, 1, 0}, true, true, true};
-    const FiberletStoredAnchor second{
-        key(1, 1, 2), {2, 1, 1}, {1, 0, 0}, {1, 0, 0}, 1.0F,
-        {0, 1, 0}, true, true, true};
-    FiberletStoredPrefix prefix;
-    prefix.id = {first.key, second.key};
-    prefix.pathLengthPredictionVoxels = 1.0F;
-    prefix.firstStepBaseXYZ = {1, 0, 0};
-    prefix.lastStepBaseXYZ = {1, 0, 0};
-    FiberletStoredRoute route;
-    route.segmentCostDensities = {1.0F};
-
-    auto baseAnchors = FiberletChunkDataset::createOrOpen(
-        root / "base-anchors", anchorMetadata);
-    auto basePaths = FiberletChunkDataset::createOrOpen(
-        root / "base-paths", pathMetadata);
-    baseAnchors->publishChunk(
-        FiberletStorageChunkKind::Anchors, owner,
-        serializeFiberletAnchors(
-            baseAnchors->codecConfig(
-                FiberletStorageChunkKind::Anchors, owner),
-            std::array{first, second}));
-    FiberletChunkDataset::MaterializedChunk basePrefix = materialized(
-        FiberletStorageChunkKind::FiberletPrefix,
-        serializeFiberletPrefixes(
-            basePaths->codecConfig(
-                FiberletStorageChunkKind::FiberletPrefix, owner),
-            std::array{prefix}));
-    FiberletChunkDataset::MaterializedChunk baseRoute = materialized(
-        FiberletStorageChunkKind::FiberletRoutes,
-        serializeFiberletRoutes(
-            basePaths->codecConfig(
-                FiberletStorageChunkKind::FiberletRoutes, routeOwner),
-            std::array{route}));
-    basePaths->publishFiberletChunkPair(
-        owner, basePrefix, routeOwner, baseRoute);
-    auto baseAnchorCache = createStoredFiberletAnchorChunkCache(baseAnchors);
-    auto basePathCache = createStoredFiberletPathChunkCache(basePaths);
-
-    auto layerAnchorMetadata = anchorMetadata;
-    layerAnchorMetadata.processing["reduction"] = "layer1";
-    finalizeFiberletDatasetIdentity(layerAnchorMetadata);
-    auto layerPathMetadata = pathMetadata;
-    layerPathMetadata.processing["reduction"] = "layer1";
-    finalizeFiberletDatasetIdentity(layerPathMetadata);
-    auto layerAnchors = FiberletChunkDataset::createOrOpen(
-        root / "layer1-anchors", layerAnchorMetadata);
-    auto layerPaths = FiberletChunkDataset::createOrOpen(
-        root / "layer1-paths", layerPathMetadata);
-    auto layerAnchorCache = createOverlayFiberletAnchorChunkCache(
-        layerAnchors, baseAnchors, baseAnchorCache);
-    auto layerPathCache = createOverlayFiberletPathChunkCache(
-        layerPaths, basePaths, basePathCache);
-    auto inheritedAnchors = layerAnchorCache->getChunkBlocking(0, 0, 0, 0);
-    auto inheritedPaths = layerPathCache->getChunkBlocking(0, 0, 0, 0);
-    REQUIRE(inheritedAnchors.status == vc::render::ChunkStatus::Data);
-    REQUIRE(inheritedPaths.status == vc::render::ChunkStatus::Data);
-    REQUIRE(std::dynamic_pointer_cast<const FiberletAnchorChunkPayload>(
-                inheritedAnchors.payload)->anchors.size() == 2);
-    REQUIRE(std::dynamic_pointer_cast<const FiberletPrefixChunkPayload>(
-                inheritedPaths.payload)->prefixes.size() == 1);
-    layerAnchorCache->cancelPendingAndWait();
-    layerPathCache->cancelPendingAndWait();
-
-    auto combinedMetadata = anchorMetadata;
-    combinedMetadata.kind = FiberletDatasetKind::Combined;
-    combinedMetadata.profile =
-        FiberletStorageProfile::CompactDirectionsFixedCost;
-    combinedMetadata.costBits = 16;
-    finalizeFiberletDatasetIdentity(combinedMetadata);
-    auto combined = FiberletChunkDataset::createOrOpen(
-        root / "combined", combinedMetadata);
-    combined->publishChunk(
-        FiberletStorageChunkKind::Anchors, owner,
-        serializeFiberletAnchors(
-            combined->codecConfig(FiberletStorageChunkKind::Anchors, owner),
-            std::array{first, second}));
-    combined->publishFiberletChunkPair(
-        owner,
-        materialized(
-            FiberletStorageChunkKind::FiberletPrefix,
-            serializeFiberletPrefixes(
-                combined->codecConfig(
-                    FiberletStorageChunkKind::FiberletPrefix, owner),
-                std::array{prefix})),
-        routeOwner,
-        materialized(
-            FiberletStorageChunkKind::FiberletRoutes,
-            serializeFiberletRoutes(
-                combined->codecConfig(
-                    FiberletStorageChunkKind::FiberletRoutes, routeOwner),
-                std::array{route})));
-    auto combinedAnchorCache = createStoredFiberletAnchorChunkCache(combined);
-    auto combinedPathCache = createStoredFiberletPathChunkCache(combined);
-    auto combinedOverlayAnchors = createOverlayFiberletAnchorChunkCache(
-        layerAnchors, combined, combinedAnchorCache);
-    auto combinedOverlayPaths = createOverlayFiberletPathChunkCache(
-        layerPaths, combined, combinedPathCache);
-    CHECK(combinedOverlayAnchors->getChunkBlocking(0, 0, 0, 0).status ==
-          vc::render::ChunkStatus::Data);
-    CHECK(combinedOverlayPaths->getChunkBlocking(0, 0, 0, 0).status ==
-          vc::render::ChunkStatus::Data);
-    combinedOverlayAnchors->cancelPendingAndWait();
-    combinedOverlayPaths->cancelPendingAndWait();
-    combinedAnchorCache->cancelPendingAndWait();
-    combinedPathCache->cancelPendingAndWait();
-
-    const auto currentAnchors = materialized(
-        FiberletStorageChunkKind::Anchors,
-        serializeFiberletAnchors(
-            layerAnchors->codecConfig(
-                FiberletStorageChunkKind::Anchors, owner),
-            std::array{first, second}));
-    const auto emptyAnchors = materialized(
-        FiberletStorageChunkKind::Anchors,
-        serializeFiberletAnchors(
-            layerAnchors->codecConfig(
-                FiberletStorageChunkKind::Anchors, owner), {}));
-    replaceFiberletOverlayChunk(
-        layerAnchors, FiberletStorageChunkKind::Anchors, owner,
-        currentAnchors, emptyAnchors);
-    const auto currentPrefix = materialized(
-        FiberletStorageChunkKind::FiberletPrefix,
-        serializeFiberletPrefixes(
-            layerPaths->codecConfig(
-                FiberletStorageChunkKind::FiberletPrefix, owner),
-            std::array{prefix}));
-    const auto currentRoute = materialized(
-        FiberletStorageChunkKind::FiberletRoutes,
-        serializeFiberletRoutes(
-            layerPaths->codecConfig(
-                FiberletStorageChunkKind::FiberletRoutes, routeOwner),
-            std::array{route}));
-    const auto emptyPrefix = materialized(
-        FiberletStorageChunkKind::FiberletPrefix,
-        serializeFiberletPrefixes(
-            layerPaths->codecConfig(
-                FiberletStorageChunkKind::FiberletPrefix, owner), {}));
-    const auto emptyRoute = materialized(
-        FiberletStorageChunkKind::FiberletRoutes,
-        serializeFiberletRoutes(
-            layerPaths->codecConfig(
-                FiberletStorageChunkKind::FiberletRoutes, routeOwner), {}));
-    replaceFiberletOverlayChunkPair(
-        layerPaths, owner, currentPrefix, emptyPrefix, routeOwner,
-        currentRoute, emptyRoute);
-
-    auto layer2AnchorMetadata = layerAnchorMetadata;
-    layer2AnchorMetadata.processing["reduction"] = "layer2";
-    finalizeFiberletDatasetIdentity(layer2AnchorMetadata);
-    auto layer2PathMetadata = layerPathMetadata;
-    layer2PathMetadata.processing["reduction"] = "layer2";
-    finalizeFiberletDatasetIdentity(layer2PathMetadata);
-    auto layer2Anchors = FiberletChunkDataset::createOrOpen(
-        root / "layer2-anchors", layer2AnchorMetadata);
-    auto layer2Paths = FiberletChunkDataset::createOrOpen(
-        root / "layer2-paths", layer2PathMetadata);
-    auto emptyAnchorCache = createOverlayFiberletAnchorChunkCache(
-        layerAnchors, baseAnchors, baseAnchorCache);
-    auto emptyPathCache = createOverlayFiberletPathChunkCache(
-        layerPaths, basePaths, basePathCache);
-    auto layer2AnchorCache = createOverlayFiberletAnchorChunkCache(
-        layer2Anchors, layerAnchors, emptyAnchorCache);
-    auto layer2PathCache = createOverlayFiberletPathChunkCache(
-        layer2Paths, layerPaths, emptyPathCache);
-    const auto shadowedAnchors = layer2AnchorCache->getChunkBlocking(0, 0, 0, 0);
-    const auto shadowedPaths = layer2PathCache->getChunkBlocking(0, 0, 0, 0);
-    REQUIRE(shadowedAnchors.status == vc::render::ChunkStatus::Data);
-    REQUIRE(shadowedPaths.status == vc::render::ChunkStatus::Data);
-    CHECK(std::dynamic_pointer_cast<const FiberletAnchorChunkPayload>(
-              shadowedAnchors.payload)->anchors.empty());
-    CHECK(std::dynamic_pointer_cast<const FiberletPrefixChunkPayload>(
-              shadowedPaths.payload)->prefixes.empty());
-
-    FiberletStoredAnchor mutated = first;
-    mutated.predictionPresence = 0.5F;
-    const auto mutatedAnchors = materialized(
-        FiberletStorageChunkKind::Anchors,
-        serializeFiberletAnchors(
-            layerAnchors->codecConfig(
-                FiberletStorageChunkKind::Anchors, owner),
-            std::array{mutated}));
-    CHECK_THROWS_AS(
-        replaceFiberletOverlayChunk(
-            layerAnchors, FiberletStorageChunkKind::Anchors, owner,
-            currentAnchors, mutatedAnchors),
-        std::invalid_argument);
-    CHECK_THROWS_AS(
-        replaceFiberletOverlayChunk(
-            layerAnchors, FiberletStorageChunkKind::Anchors, owner,
-            emptyAnchors, currentAnchors),
-        std::invalid_argument);
-    auto mutatedRouteValue = route;
-    mutatedRouteValue.segmentCostDensities[0] = 0.5F;
-    const auto mutatedRoute = materialized(
-        FiberletStorageChunkKind::FiberletRoutes,
-        serializeFiberletRoutes(
-            layerPaths->codecConfig(
-                FiberletStorageChunkKind::FiberletRoutes, routeOwner),
-            std::array{mutatedRouteValue}));
-    CHECK_THROWS_AS(
-        replaceFiberletOverlayChunkPair(
-            layerPaths, owner, currentPrefix, currentPrefix, routeOwner,
-            currentRoute, mutatedRoute),
-        std::invalid_argument);
-
-    auto incompatibleMetadata = anchorMetadata;
-    incompatibleMetadata.sources = {{"identity", "different"}};
-    finalizeFiberletDatasetIdentity(incompatibleMetadata);
-    auto incompatible = FiberletChunkDataset::createOrOpen(
-        root / "incompatible", incompatibleMetadata);
-    CHECK_THROWS_AS(
-        createOverlayFiberletAnchorChunkCache(
-            incompatible, baseAnchors, baseAnchorCache),
-        std::invalid_argument);
-
-    auto partialMetadata = pathMetadata;
-    partialMetadata.processing["reduction"] = "partial";
-    finalizeFiberletDatasetIdentity(partialMetadata);
-    auto partial = FiberletChunkDataset::createOrOpen(
-        root / "partial", partialMetadata);
-    partial->publishChunk(
-        FiberletStorageChunkKind::FiberletPrefix, owner,
-        serializeFiberletPrefixes(
-            partial->codecConfig(
-                FiberletStorageChunkKind::FiberletPrefix, owner), {}));
-    auto partialCache = createOverlayFiberletPathChunkCache(
-        partial, basePaths, basePathCache);
-    const auto partialResult = partialCache->getChunkBlocking(0, 0, 0, 0);
-    CHECK(partialResult.status != vc::render::ChunkStatus::Data);
-
-    partialCache->cancelPendingAndWait();
-    layer2AnchorCache->cancelPendingAndWait();
-    layer2PathCache->cancelPendingAndWait();
-    emptyAnchorCache->cancelPendingAndWait();
-    emptyPathCache->cancelPendingAndWait();
-    baseAnchorCache->cancelPendingAndWait();
-    basePathCache->cancelPendingAndWait();
-    std::filesystem::remove_all(root);
-}
-
-TEST_CASE("Fiberlet overlay write-back cache retains and spills serialized chunks")
-{
-    std::mt19937_64 random(std::random_device{}());
-    const auto root = std::filesystem::temp_directory_path() /
-        ("vc_fiberlet_write_back_" + std::to_string(random()));
-
-    FiberletDatasetMetadata anchorMetadata;
-    anchorMetadata.kind = FiberletDatasetKind::Anchors;
-    anchorMetadata.profile = FiberletStorageProfile::Float32Cache;
-    anchorMetadata.chunkGridShapeZYX = {1, 1, 1};
-    anchorMetadata.coordinateUnitsPerChunkZYX = {16, 16, 16};
-    anchorMetadata.maximumEndpointReachCoordinateUnitsZYX = {8, 8, 8};
-    anchorMetadata.spatialChunkSideBaseVoxels = 16;
-    anchorMetadata.predictionToBaseScale = 1.0;
-    finalizeFiberletDatasetIdentity(anchorMetadata);
-    auto pathMetadata = anchorMetadata;
-    pathMetadata.kind = FiberletDatasetKind::Fiberlets;
-    finalizeFiberletDatasetIdentity(pathMetadata);
-
-    const vc::render::ChunkKey owner{0, 0, 0, 0};
-    const vc::render::ChunkKey routeOwner{1, 0, 0, 0};
-    const auto budget =
-        std::make_shared<vc::render::DecodedChunkCacheBudget>(1U << 20);
-    const auto retained = FiberletChunkWriteBackCache::create({
-        1U << 20, 2, budget, {}});
-    auto anchors = FiberletChunkDataset::createOrOpen(
-        root / "retained-anchors", anchorMetadata, retained);
-    auto paths = FiberletChunkDataset::createOrOpen(
-        root / "retained-paths", pathMetadata, retained);
-    const auto anchor = materialized(
-        FiberletStorageChunkKind::Anchors,
-        serializeFiberletAnchors(
-            anchors->codecConfig(FiberletStorageChunkKind::Anchors, owner),
-            {}));
-    const auto prefix = materialized(
-        FiberletStorageChunkKind::FiberletPrefix,
-        serializeFiberletPrefixes(
-            paths->codecConfig(
-                FiberletStorageChunkKind::FiberletPrefix, owner),
-            {}));
-    const auto routes = materialized(
-        FiberletStorageChunkKind::FiberletRoutes,
-        serializeFiberletRoutes(
-            paths->codecConfig(
-                FiberletStorageChunkKind::FiberletRoutes, routeOwner),
-            {}));
-
-    anchors->replaceOverlayChunk(
-        FiberletStorageChunkKind::Anchors, owner, anchor);
-    paths->replaceOverlayChunkPair(owner, prefix, routeOwner, routes);
-    CHECK_FALSE(std::filesystem::exists(anchors->chunkPath(
-        FiberletStorageChunkKind::Anchors, owner)));
-    CHECK_FALSE(std::filesystem::exists(paths->chunkPath(
-        FiberletStorageChunkKind::FiberletPrefix, owner)));
-    CHECK_FALSE(std::filesystem::exists(paths->chunkPath(
-        FiberletStorageChunkKind::FiberletRoutes, routeOwner)));
-    REQUIRE(anchors->readMaterializedChunk(
-        FiberletStorageChunkKind::Anchors, owner));
-    REQUIRE(paths->readMaterializedChunk(
-        FiberletStorageChunkKind::FiberletPrefix, owner));
-    REQUIRE(paths->readMaterializedChunk(
-        FiberletStorageChunkKind::FiberletRoutes, routeOwner));
-    CHECK(paths->pairPresence(owner) ==
-          FiberletChunkDataset::PairPresence::Complete);
-    const auto retainedStats = retained->stats();
-    CHECK(retainedStats.residentEntries == 2);
-    CHECK(retainedStats.spills == 0);
-    CHECK(retainedStats.memoryHits == 3);
-    CHECK(retained->logicalFiles(root).size() == 3);
-    CHECK(budget->maximumBytes() < (1U << 20));
-    retained->finish();
-    CHECK(budget->maximumBytes() == (1U << 20));
-
-    const auto spilled = FiberletChunkWriteBackCache::create({1, 2, {}, {}});
-    auto spilledAnchors = FiberletChunkDataset::createOrOpen(
-        root / "spilled-anchors", anchorMetadata, spilled);
-    auto spilledPaths = FiberletChunkDataset::createOrOpen(
-        root / "spilled-paths", pathMetadata, spilled);
-    spilledAnchors->replaceOverlayChunk(
-        FiberletStorageChunkKind::Anchors, owner, anchor);
-    spilledPaths->replaceOverlayChunkPair(owner, prefix, routeOwner, routes);
-    spilled->waitForSpills();
-    CHECK(std::filesystem::exists(spilledAnchors->chunkPath(
-        FiberletStorageChunkKind::Anchors, owner)));
-    CHECK(std::filesystem::exists(spilledPaths->chunkPath(
-        FiberletStorageChunkKind::FiberletPrefix, owner)));
-    CHECK(std::filesystem::exists(spilledPaths->chunkPath(
-        FiberletStorageChunkKind::FiberletRoutes, routeOwner)));
-    CHECK(spilledPaths->pairPresence(owner) ==
-          FiberletChunkDataset::PairPresence::Complete);
-    CHECK(spilled->stats().spills == 2);
-    REQUIRE(spilledAnchors->readMaterializedChunk(
-        FiberletStorageChunkKind::Anchors, owner));
-    REQUIRE(spilledPaths->readMaterializedChunk(
-        FiberletStorageChunkKind::FiberletPrefix, owner));
-    REQUIRE(spilledPaths->readMaterializedChunk(
-        FiberletStorageChunkKind::FiberletRoutes, routeOwner));
-    spilled->finish();
-
-    std::filesystem::remove_all(root);
-}
-
-TEST_CASE("Fiberlet overlay write-back cache never exposes a partial pair")
-{
-    std::mt19937_64 random(std::random_device{}());
-    const auto root = std::filesystem::temp_directory_path() /
-        ("vc_fiberlet_write_back_failure_" + std::to_string(random()));
-    FiberletDatasetMetadata metadata;
-    metadata.kind = FiberletDatasetKind::Fiberlets;
-    metadata.profile = FiberletStorageProfile::Float32Cache;
-    metadata.chunkGridShapeZYX = {1, 1, 1};
-    metadata.coordinateUnitsPerChunkZYX = {16, 16, 16};
-    metadata.maximumEndpointReachCoordinateUnitsZYX = {8, 8, 8};
-    metadata.spatialChunkSideBaseVoxels = 16;
-    metadata.predictionToBaseScale = 1.0;
-    finalizeFiberletDatasetIdentity(metadata);
-
-    const vc::render::ChunkKey owner{0, 0, 0, 0};
-    const vc::render::ChunkKey routeOwner{1, 0, 0, 0};
-    auto write = [](const std::filesystem::path& path,
-                    std::span<const std::byte> bytes) {
-        if (path.parent_path().filename() == "routes")
-            throw std::runtime_error("injected route write failure");
-        vc::core::util::atomicWriteBytes(path, bytes);
-    };
-    const auto store = FiberletChunkWriteBackCache::create({1, 1, {}, write});
-    auto paths = FiberletChunkDataset::createOrOpen(root, metadata, store);
-    const auto prefix = materialized(
-        FiberletStorageChunkKind::FiberletPrefix,
-        serializeFiberletPrefixes(
-            paths->codecConfig(
-                FiberletStorageChunkKind::FiberletPrefix, owner),
-            {}));
-    const auto routes = materialized(
-        FiberletStorageChunkKind::FiberletRoutes,
-        serializeFiberletRoutes(
-            paths->codecConfig(
-                FiberletStorageChunkKind::FiberletRoutes, routeOwner),
-            {}));
-    CHECK_THROWS_WITH_AS(
-        paths->replaceOverlayChunkPair(owner, prefix, routeOwner, routes),
-        doctest::Contains("injected route write failure"),
-        std::runtime_error);
-    CHECK_FALSE(std::filesystem::exists(paths->chunkPath(
-        FiberletStorageChunkKind::FiberletPrefix, owner)));
-    CHECK_FALSE(std::filesystem::exists(paths->chunkPath(
-        FiberletStorageChunkKind::FiberletRoutes, routeOwner)));
-    CHECK_THROWS_WITH_AS(
-        store->finish(), doctest::Contains("injected route write failure"),
-        std::runtime_error);
-    std::filesystem::remove_all(root);
-}
-
-TEST_CASE("Fiberlet overlay write-back LRU remains readable during async spill")
-{
-    std::mt19937_64 random(std::random_device{}());
-    const auto root = std::filesystem::temp_directory_path() /
-        ("vc_fiberlet_write_back_lru_" + std::to_string(random()));
-    FiberletDatasetMetadata metadata;
-    metadata.kind = FiberletDatasetKind::Anchors;
-    metadata.profile = FiberletStorageProfile::Float32Cache;
-    metadata.chunkGridShapeZYX = {1, 1, 3};
-    metadata.coordinateUnitsPerChunkZYX = {16, 16, 16};
-    metadata.maximumEndpointReachCoordinateUnitsZYX = {8, 8, 8};
-    metadata.spatialChunkSideBaseVoxels = 16;
-    metadata.predictionToBaseScale = 1.0;
-    finalizeFiberletDatasetIdentity(metadata);
-    const auto probe = FiberletChunkDataset::createOrOpen(
-        root / "probe", metadata);
-    const std::array<vc::render::ChunkKey, 3> keys{
-        vc::render::ChunkKey{0, 0, 0, 0},
-        vc::render::ChunkKey{0, 0, 0, 1},
-        vc::render::ChunkKey{0, 0, 0, 2}};
-    std::array<FiberletChunkDataset::MaterializedChunk, 3> chunks;
-    for (std::size_t index = 0; index < keys.size(); ++index) {
-        chunks[index] = materialized(
-            FiberletStorageChunkKind::Anchors,
-            serializeFiberletAnchors(
-                probe->codecConfig(
-                    FiberletStorageChunkKind::Anchors, keys[index]),
-                {}));
-    }
-
-    std::promise<void> writerEntered;
-    std::promise<void> releaseWriter;
-    const auto release = releaseWriter.get_future().share();
-    std::atomic_bool firstWrite{true};
-    std::mutex writesMutex;
-    std::vector<std::filesystem::path> writes;
-    auto write = [&](const std::filesystem::path& path,
-                     std::span<const std::byte> bytes) {
-        {
-            std::lock_guard lock(writesMutex);
-            writes.push_back(path);
-        }
-        if (firstWrite.exchange(false)) {
-            writerEntered.set_value();
-            release.wait();
-        }
-        vc::core::util::atomicWriteBytes(path, bytes);
-    };
-    constexpr std::size_t entryOverhead = 256;
-    const std::size_t entryBytes = chunks[0].bytes.size() + entryOverhead;
-    const auto store = FiberletChunkWriteBackCache::create(
-        {entryBytes * 2, 1, {}, write});
-    auto dataset = FiberletChunkDataset::createOrOpen(
-        root / "cached", metadata, store);
-    dataset->replaceOverlayChunk(
-        FiberletStorageChunkKind::Anchors, keys[0], chunks[0]);
-    dataset->replaceOverlayChunk(
-        FiberletStorageChunkKind::Anchors, keys[1], chunks[1]);
-    REQUIRE(dataset->readMaterializedChunk(
-        FiberletStorageChunkKind::Anchors, keys[0]));
-
-    auto pressure = std::async(std::launch::async, [&] {
-        dataset->replaceOverlayChunk(
-            FiberletStorageChunkKind::Anchors, keys[2], chunks[2]);
-    });
-    writerEntered.get_future().wait();
-    REQUIRE(dataset->readMaterializedChunk(
-        FiberletStorageChunkKind::Anchors, keys[1]));
-    releaseWriter.set_value();
-    pressure.get();
-    store->waitForSpills();
-
-    {
-        std::lock_guard lock(writesMutex);
-        REQUIRE(writes.size() == 2);
-        CHECK(writes[0].filename() == "0.0.1");
-        CHECK(writes[1].filename() == "0.0.0");
-    }
-    CHECK(store->stats().spills == 2);
-    CHECK(std::filesystem::exists(dataset->chunkPath(
-        FiberletStorageChunkKind::Anchors, keys[0])));
-    CHECK(std::filesystem::exists(dataset->chunkPath(
-        FiberletStorageChunkKind::Anchors, keys[1])));
-    CHECK_FALSE(std::filesystem::exists(dataset->chunkPath(
-        FiberletStorageChunkKind::Anchors, keys[2])));
-    store->finish();
     std::filesystem::remove_all(root);
 }

@@ -1,25 +1,25 @@
 import json
-import sqlite3
 import numpy as np
 import pytest
 from functools import partial
 from vesuvius.neural_tracing.fiber_trace_3d.fiber_json_solve import convert as convert_verified
 
-convert=partial(convert_verified,expected_manifest_tokens=['test-volume','test-scan'])
+VOLUME='20231117143551'
+convert=partial(convert_verified,volume=VOLUME,shape_zyx=[20,20,20],expected_manifest_tokens=['test-volume','test-scan'])
 
 
 def test_stage_requests_preserve_arbitrary_settings_and_order(tmp_path):
     from vesuvius.neural_tracing.fiber_trace_3d.fiber_json_solve import stage_requests
-    request={'fiber_normal_sign':{'afv':'{afv}','output_root':'{output_root}/oriented',
+    request={'fiber_normal_sign':{'fibers':'{fibers}','output_root':'{output_root}/oriented',
         'steps':17,'lr':.013,'gpu_manager':{'vram_bytes_per_gpu':123456},'force_keep_fibers':False}}
     path=tmp_path/'stage.json';path.write_text(json.dumps(request))
     stages=stage_requests([{'name':'user-label','config_file':str(path)},
-        {'name':'native','request':{'commands':[{'binary':'custom','args':['{afv}']}]}}],tmp_path,'input.afv')
+        {'name':'native','request':{'commands':[{'binary':'custom','args':['{fibers}']}]}}],tmp_path,'input.vcobj')
     assert [s['name'] for s in stages]==['user-label','native']
-    expected=dict(request['fiber_normal_sign'],afv='input.afv',output_root=str(tmp_path/'oriented'))
+    expected=dict(request['fiber_normal_sign'],fibers='input.vcobj',output_root=str(tmp_path/'oriented'))
     assert stages[0]['request']=={'fiber_normal_sign':expected}
-    assert stages[1]['request']['commands'][0]['args']==['input.afv']
-    assert stage_requests([],tmp_path,'input.afv')==[]
+    assert stages[1]['request']['commands'][0]['args']==['input.vcobj']
+    assert stage_requests([],tmp_path,'input.vcobj')==[]
 
 
 @pytest.mark.parametrize('stages',[
@@ -31,7 +31,7 @@ def test_stage_requests_preserve_arbitrary_settings_and_order(tmp_path):
 ])
 def test_stage_requests_reject_ambiguous_or_unsafe_input(tmp_path,stages):
     from vesuvius.neural_tracing.fiber_trace_3d.fiber_json_solve import stage_requests
-    with pytest.raises(ValueError):stage_requests(stages,tmp_path,'input.afv')
+    with pytest.raises(ValueError):stage_requests(stages,tmp_path,'input.vcobj')
 
 
 def test_transfer_151_radial_prior():
@@ -59,36 +59,38 @@ def test_trusted_gt_has_no_broken_mass_or_gradient():
 
 
 def test_conversion_roundtrip_and_source_guard(tmp_path):
-    template=tmp_path/'template.afv'
-    with sqlite3.connect(template) as db:
-        db.executescript('''
-        CREATE TABLE metadata(key TEXT PRIMARY KEY,value TEXT);
-        CREATE TABLE fibers(id INTEGER PRIMARY KEY,name TEXT,family TEXT,point_count INTEGER,length REAL,
-        min_x REAL,max_x REAL,min_y REAL,max_y REAL,min_z REAL,max_z REAL,annotation TEXT);
-        CREATE TABLE blocks(id INTEGER PRIMARY KEY,fiber_id INTEGER,first_segment INTEGER,points BLOB);
-        CREATE VIRTUAL TABLE block_bounds USING rtree(id,min_x,max_x,min_y,max_y,min_z,max_z);
-        ''')
-        db.execute('INSERT INTO metadata VALUES (?,?)',('root',json.dumps({'coordinate_base_shape_zyx':[20,20,20]})))
+    from vesuvius.neural_tracing.tracers.shared.annotations.fiber_store import read_polylines
     source=tmp_path/'source';source.mkdir()
-    doc=dict(coordinate_base_shape_zyx=[20,20,20],line_points=[[1,2,3],[4,5,6]],
+    uuid='12345678-1234-1234-1234-123456789abc'
+    doc=dict(uuid=uuid,coordinate_base_shape_zyx=[20,20,20],line_points=[[1,2,3],[4,5,6]],
              control_points=[dict(segment_to_next=dict(normal_manifest='test-volume/test-scan',interp_mode='trace')),{}],
              hv_classification={'automatic_tag':'H'},branches=[],adjacent_branches=[])
     path=source/'a.json';path.write_text(json.dumps(doc))
-    output=tmp_path/'out.afv'
-    records=convert(source,template,output)
-    assert len(records)==1
-    assert convert(source,template,output)==records
+    output=tmp_path/'out.vcobj'
+    records=convert(source,output)
+    assert len(records)==1 and records[0]['id']==uuid
+    assert convert(source,output)==records
+    [(row,xyz)]=read_polylines(output)
+    assert row['id']==uuid and row['name']=='a.json' and row['meta']['annotation']==doc
+    np.testing.assert_array_equal(xyz,doc['line_points'])
     doc['line_points'][0][0]=2;path.write_text(json.dumps(doc))
     with pytest.raises(ValueError,match='Changed source'):
-        convert(source,template,output)
+        convert(source,output)
     doc['adjacent_branches']=[{}];path.write_text(json.dumps(doc))
     with pytest.raises(ValueError,match='explicit links'):
-        convert(source,template,tmp_path/'other.afv')
+        convert(source,tmp_path/'other.vcobj')
     doc['adjacent_branches']=[]
     del doc['coordinate_base_shape_zyx']
     path.write_text(json.dumps(doc))
-    assert len(convert(source,template,tmp_path/'missing_shape.afv'))==1
+    assert len(convert(source,tmp_path/'missing_shape.vcobj'))==1
+    doc['coordinates']=dict(volume_uuid=VOLUME,scale_factor=.5);path.write_text(json.dumps(doc))
+    convert(source,tmp_path/'scaled.vcobj')
+    np.testing.assert_array_equal(read_polylines(tmp_path/'scaled.vcobj')[0][1],np.array(doc['line_points'])*2)
+    doc['coordinates']=dict(volume_uuid='other',scale_factor=1);path.write_text(json.dumps(doc))
+    with pytest.raises(ValueError,match='another volume'):
+        convert(source,tmp_path/'other_volume.vcobj')
+    del doc['coordinates']
     doc['line_points'][0][0]=20
     path.write_text(json.dumps(doc))
     with pytest.raises(ValueError,match='outside verified'):
-        convert(source,template,tmp_path/'outside.afv')
+        convert(source,tmp_path/'outside.vcobj')

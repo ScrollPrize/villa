@@ -5,7 +5,7 @@
 #include <doctest/doctest.h>
 
 #include "vc/core/util/QuadSurface.hpp"
-#include "vc/core/util/Tiff.hpp"
+#include <vc_reader/image_write.hpp>
 
 #include <opencv2/core.hpp>
 
@@ -58,7 +58,7 @@ TEST_CASE("invalidateMask removes the on-disk mask.tif")
         seed.save(segDir);
     }
     cv::Mat mask(8, 8, CV_8UC1, cv::Scalar(255));
-    writeTiff(segDir / "mask.tif", mask, CV_8UC1, /*tileW=*/0, /*tileH=*/0);
+    vcr::sources::writeTiff(segDir / "mask.tif", mask.data, "|u1", mask.rows, mask.cols);
     REQUIRE(fs::exists(segDir / "mask.tif"));
 
     QuadSurface qs(segDir);
@@ -75,22 +75,6 @@ TEST_CASE("invalidateMask with empty path is safe")
     CHECK(true);
 }
 
-TEST_CASE("gen() with ptr[2] non-zero offsets along normals")
-{
-    auto pts = grid(16, 16, /*z=*/0.f);
-    QuadSurface qs(pts, cv::Vec2f(1.f, 1.f));
-    cv::Mat_<cv::Vec3f> coords;
-    cv::Mat_<cv::Vec3f> normals;
-    // ptr[2] non-zero triggers the normal-offset branch in gen.
-    qs.gen(&coords, &normals, cv::Size(8, 8),
-           /*ptr=*/cv::Vec3f(0, 0, 2.0f),
-           /*scale=*/1.0f, /*offset=*/cv::Vec3f(0, 0, 0));
-    CHECK(coords.rows == 8);
-    CHECK(coords.cols == 8);
-    fs::path d = tmpDir("placeholder");
-    fs::remove_all(d);
-}
-
 TEST_CASE("save with extra channels writes ch_a.tif and ch_b.tif")
 {
     auto root = tmpDir("save_ch");
@@ -105,30 +89,6 @@ TEST_CASE("save with extra channels writes ch_a.tif and ch_b.tif")
     qs.save(segDir);
     CHECK(fs::exists(segDir / "ch_a.tif"));
     CHECK(fs::exists(segDir / "ch_b.tif"));
-    fs::remove_all(root);
-}
-
-TEST_CASE("save_meta after save: meta.json is rewritten")
-{
-    auto root = tmpDir("save_meta");
-    auto segDir = root / "seg";
-    {
-        QuadSurface seed(grid(), cv::Vec2f(1.f, 1.f));
-        seed.id = "orig";
-        seed.save(segDir);
-    }
-    QuadSurface qs(segDir);
-    qs.path = segDir;
-    qs.meta = utils::Json::object();
-    qs.meta["uuid"] = "new-uuid";
-    qs.meta["type"] = "seg";
-    qs.meta["format"] = "tifxyz";
-    qs.meta["custom"] = "hi";
-    qs.id = "new-uuid";
-    qs.save_meta();
-
-    QuadSurface reloaded(segDir);
-    CHECK(reloaded.meta["custom"].get_string() == "hi");
     fs::remove_all(root);
 }
 

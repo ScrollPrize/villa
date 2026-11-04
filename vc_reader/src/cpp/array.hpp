@@ -15,8 +15,6 @@
 #include "write_behind.hpp"
 #include "zarr_storage.hpp"
 
-#include <sys/mman.h>
-
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -29,6 +27,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <numeric>
 #include <optional>
 #include <span>
@@ -86,19 +85,119 @@ struct RebasedCoordinates : Coordinates {
     std::array<std::int64_t, 3> offset{};
     std::int64_t base(std::size_t axis) const { return offset[axis]; }
 };
-using FloatPoints = RebasedCoordinates<PointCoordinates<float>>;
 using FloatAffine = RebasedCoordinates<BasicAffineCoordinates<float>>;
 
-// A chunk an offline read needs is in none of the disk layers.
-struct CacheMiss : std::runtime_error {
-    using std::runtime_error::runtime_error;
-};
+// An integer origin for (n, 3) points to be sampled in local float32 coordinates: the
+// floor of their low corner. nullopt when they span too far for that to keep local
+// rounding below 1/4096 voxel, independent of point order. Non-finite points do not count.
+template <class T>
+std::optional<std::array<std::int64_t, 3>> pointOrigin(const T* points, std::size_t n)
+{
+    T low[3] = {INFINITY, INFINITY, INFINITY}, high[3] = {-INFINITY, -INFINITY, -INFINITY};
+    for (std::size_t i = 0; i < n; ++i, points += 3) {
+        if (!std::isfinite(points[0]) || !std::isfinite(points[1]) || !std::isfinite(points[2]))
+            continue;
+        for (int a = 0; a < 3; ++a) {
+            low[a] = std::min(low[a], points[a]);
+            high[a] = std::max(high[a], points[a]);
+        }
+    }
+    std::array<std::int64_t, 3> base{0, 0, 0};
+    if (std::isfinite(low[0]))
+        for (int a = 0; a < 3; ++a) {
+            base[a] = static_cast<std::int64_t>(std::clamp(std::floor(double(low[a])), 0., double(1LL << 30)));
+            if (double(low[a]) - base[a] < -4096 || double(high[a]) - base[a] > 4096)
+                return std::nullopt;
+        }
+    return base;
+}
 
-// An owning reference for the optional Python prefetch scheduler. No crop
-// output is allocated; nullptr represents a chunk absent from the source.
-struct ChunkHandle {
-    ChunkPtr value;
+// Points as float32 relative to an integer origin, the form the float32 CT paths take.
+// `dispersed`: they span too far to share one (see pointOrigin), and `local` is empty:
+// sample their own coordinates in float64. A given origin is used as it is.
+struct LocalPoints {
+    std::vector<float> local;
+    std::array<std::int64_t, 3> base{0, 0, 0};
+    bool dispersed = false;
 };
+inline std::array<std::int64_t, 3> checkedCoordinateOrigin(const Index& origin)
+{
+    if (origin.size() != 3)
+        throw std::invalid_argument("coordinate_origin must have three integers in [0, 2**30]");
+    for (const auto v : origin)
+        if (v < 0 || v > (1LL << 30))
+            throw std::invalid_argument("coordinate_origin must have three integers in [0, 2**30]");
+    return {origin[0], origin[1], origin[2]};
+}
+template <class T>
+LocalPoints localPoints(const T* points, std::size_t n, const std::optional<Index>& origin = std::nullopt)
+{
+    LocalPoints out;
+    if (origin) {
+        out.base = checkedCoordinateOrigin(*origin);
+        out.local.resize(3 * n);
+        for (std::size_t i = 0; i < 3 * n; ++i)
+            out.local[i] = static_cast<float>(points[i]);
+        return out;
+    }
+    const auto base = pointOrigin(points, n);
+    if (!base) {
+        out.dispersed = true;
+        return out;
+    }
+    out.base = *base;
+    out.local.resize(3 * n);
+    for (std::size_t i = 0; i < 3 * n; ++i)
+        out.local[i] = static_cast<float>(points[i] - static_cast<T>(out.base[i % 3]));
+    return out;
+}
+
+// A crop shape the float32 CT paths accept.
+inline std::array<std::int64_t, 3> checkedCropShape(const Index& shape)
+{
+    std::int64_t count = 1;
+    bool ok = shape.size() == 3;
+    if (ok)
+        for (const auto n : shape) {
+            ok &= n >= 0 && n <= (1LL << 24);
+            if (ok && n && count > std::numeric_limits<std::int64_t>::max() / 4 / n)
+                ok = false;
+            else if (ok)
+                count *= n;
+        }
+    if (!ok)
+        throw std::invalid_argument("shape must have three nonnegative dimensions <= 2**24");
+    return {shape[0], shape[1], shape[2]};
+}
+
+// An oriented crop's first sample as float32 relative to an integer origin: the floor of
+// the sample (clamped to the volume's range), or the given origin.
+struct LocalOrigin {
+    std::array<std::int64_t, 3> base{0, 0, 0};
+    std::array<float, 3> origin{0, 0, 0};
+};
+template <class T>
+LocalOrigin localOrigin(const T* origin, const std::optional<Index>& coordinateOrigin = std::nullopt)
+{
+    LocalOrigin out;
+    for (int a = 0; a < 3; ++a)
+        if (!std::isfinite(origin[a]))
+            throw std::invalid_argument("origin and axes must be finite with shapes (3,) and (3, 3)");
+    if (coordinateOrigin) {
+        out.base = checkedCoordinateOrigin(*coordinateOrigin);
+        for (int a = 0; a < 3; ++a)
+            out.origin[a] = static_cast<float>(origin[a]);
+    } else {
+        for (int a = 0; a < 3; ++a) {
+            out.base[a] = static_cast<std::int64_t>(std::clamp(std::floor(double(origin[a])), 0., double(1LL << 30)));
+            out.origin[a] = static_cast<float>(origin[a] - static_cast<T>(out.base[a]));
+        }
+    }
+    for (const float v : out.origin)
+        if (!std::isfinite(v))
+            throw std::invalid_argument("origin overflows float32");
+    return out;
+}
 
 // Linear chunk index -> dense id, for grouping point reads by chunk (open addressing).
 class ChunkIds {
@@ -168,6 +267,11 @@ struct LayerSpec {
     bool allow_lossy = false;
 };
 
+// Fills `out` (one decoded chunk, C order, padding included at the array edge)
+// with the chunk at a chunk-grid index; returns false when the whole chunk is the
+// fill value. Called concurrently for distinct chunks, at most once per chunk at a time.
+using ChunkCompute = std::function<bool(const Index& chunk, std::uint8_t* out)>;
+
 struct ArraySpec {
     Index shape, chunks;
     std::size_t itemsize = 1;
@@ -182,24 +286,36 @@ struct ArraySpec {
     Index shard_chunks;
     bool shard_index_end = true, shard_index_crc = false;
     bool offline = false;            // never fetch: a chunk in no layer raises CacheMiss
+    // Offline: a chunk in no layer reads as fill instead, is remembered as absent in the
+    // memory cache, and is recorded (Array::offline_misses), so a caller can complete a
+    // read and learn every chunk the caches lacked.
+    bool offline_fill = false;
     std::string read_mode = "slab";  // raw local chunks: "slab" (pread rows) or "mmap"
     bool hint = false;               // queue readahead for every piece before reading
     std::size_t threads = 16;
     std::size_t writer_threads = 4;                    // background disk-cache writes
-    std::size_t max_pending_write_bytes = 1ull << 30;  // reads wait beyond this much unwritten data
+    std::size_t max_pending_write_bytes = 1ull << 30;  // beyond this much unwritten data, writes are dropped
     std::shared_ptr<DiskCache> disk_cache;
     HttpOptions http;
+    ChunkCompute compute;            // the chunk source of a computed array (no remote or store)
+    // Every read runs on its calling thread alone (threads must be 0) and fetches or
+    // computes a missing chunk itself, never waiting for another read of the same
+    // chunk: for sources bound to the reader's thread.
+    bool caller_thread_only = false;
 };
 
 struct Stats {
     std::atomic<std::uint64_t> memory_hits{0}, pending_hits{0}, disk_hits{0}, remote_fetches{0},
-        remote_missing{0}, remote_bytes{0}, write_errors{0};
+        remote_missing{0}, remote_bytes{0}, write_errors{0}, computed{0},
+        corrupt{0},          // chunks that did not decode (skipped; see Array::last_corrupt_chunk)
+        offline_misses{0},   // distinct chunks an offline_fill array read as fill (in no layer)
+        dropped_writes{0};   // cache writes skipped because the write queue was over budget
 };
 
 class Array {
 public:
     Array(ArraySpec spec, std::shared_ptr<MemoryCache> cache)
-        : spec_(std::move(spec)), cache_(std::move(cache)), pool_(spec_.threads), maps_(8192)
+        : spec_(std::move(spec)), cache_(std::move(cache)), pool_(sharedPool(spec_.threads)), maps_(8192)
     {
         const std::size_t nd = spec_.shape.size();
         if (nd == 0 || spec_.chunks.size() != nd)
@@ -217,14 +333,18 @@ public:
                 chunk_shift_[i] = std::countr_zero(c);
         }
         for (auto& l : spec_.layers)
-            codecs_.push_back(parse_codec(l.codec));
-        remote_codec_ = parse_codec(spec_.remote_codec);
+            codecs_.push_back(parse_chunk_codec(l.codec));
+        remote_codec_ = parse_chunk_codec(spec_.remote_codec);
         if (!spec_.remote_url.empty() && !spec_.offline)
             http_ = std::make_unique<HttpClient>(spec_.http);
         if (!spec_.source_root.empty() && !spec_.offline)
             source_ = std::make_unique<ZarrStorage>(spec_.source_root, spec_.source_prefix, spec_.separator,
                 spec_.shard_chunks, spec_.shard_index_end, spec_.shard_index_crc, chunk_bytes_, http_.get(),
                 stats_.remote_fetches, stats_.remote_bytes);
+        if (spec_.compute && (!spec_.remote_url.empty() || !spec_.source_root.empty()))
+            throw std::invalid_argument("a computed array has no remote or stored source");
+        if (spec_.caller_thread_only && spec_.threads != 0)
+            throw std::invalid_argument("a caller-thread-only array has no workers");
         if (spec_.write_layer >= 0 && codecs_.at(spec_.write_layer) == Codec::Delta3d && nd != 3)
             throw std::invalid_argument("Delta3D caches hold 3-D chunks only");
         if (spec_.write_layer >= 0)
@@ -232,6 +352,8 @@ public:
     }
 
     // Waits for every queued disk-cache write.
+    std::size_t threads() const { return spec_.threads; }
+
     void flush()
     {
         if (writes_)
@@ -239,60 +361,24 @@ public:
     }
 
     std::size_t pending_writes() { return writes_ ? writes_->outstanding() : 0; }
+
+    // While one is alive, a full write queue makes reads wait instead of dropping
+    // the cache write: for callers (prefill) whose point is the chunks on disk.
+    class KeepWrites {
+    public:
+        explicit KeepWrites(Array& array) : array_(array) { ++array_.keep_writes_; }
+        ~KeepWrites() { --array_.keep_writes_; }
+        KeepWrites(const KeepWrites&) = delete;
+        KeepWrites& operator=(const KeepWrites&) = delete;
+
+    private:
+        Array& array_;
+    };
     std::size_t ndim() const noexcept { return spec_.shape.size(); }
     const ArraySpec& spec() const noexcept { return spec_; }
-    void parallel_for(std::size_t n, const std::function<void(std::size_t)>& fn) { pool_.parallel_for(n,fn); }
+    const std::shared_ptr<MemoryCache>& memory_cache() const noexcept { return cache_; }
+    void parallel_for(std::size_t n, const std::function<void(std::size_t)>& fn) { pool_->parallel_for(n,fn); }
     std::size_t itemsize() const noexcept { return spec_.itemsize; }
-
-    void set_fetcher(std::function<ChunkHandle(const Index&)> fetcher)
-    {
-        fetcher_.store(std::make_shared<const Fetcher>(std::move(fetcher)));
-    }
-
-    // The scheduler calls this directly, bypassing its own demand callback.
-    // It shares the normal decoder, memory cache, fetch deduplication and writes.
-    ChunkHandle load_chunk(const Index& idx)
-    {
-        validate_chunk(idx);
-        const auto k = key(idx), ck = spec_.identity + "|" + k;
-        if (cache_) {
-            auto [found, chunk] = cache_->get(ck);
-            if (found) return {chunk};
-        }
-        if (writes_) {
-            auto [found, chunk] = writes_->pending(k);
-            if (found) return {chunk};
-        }
-        ChunkPtr chunk;
-        bool found = false;
-        for (std::size_t li = 0; li < spec_.layers.size(); ++li) {
-            if (auto value = read_layer_chunk(li, k)) {
-                chunk = *value;
-                found = true;
-                break;
-            }
-        }
-        if (!found) {
-            if (spec_.offline)
-                throw CacheMiss("chunk " + k + " of " + spec_.identity + " is not in the disk cache (offline)");
-            if (http_ || source_) chunk = fetch(k);
-        }
-        if (cache_) cache_->put(ck, chunk);
-        return {chunk};
-    }
-
-    // Cross-process completion requires publication, including missing markers.
-    // A refused/failed cache write returns false; demand still owns its chunk.
-    bool publish_chunk(const Index& idx)
-    {
-        validate_chunk(idx);
-        const auto k = key(idx);
-        if (writes_) writes_->wait(k);
-        for (const auto& layer : spec_.layers)
-            if (layer.kind == "array" || exists(layer.root + "/" + k) || exists(marker_path(layer, k)))
-                return true;
-        return false;
-    }
 
     // Credentials for later fetches (e.g. refreshed temporary keys).
     void set_auth(Auth auth)
@@ -301,22 +387,58 @@ public:
             http_->set_auth(std::move(auth));
     }
 
+    enum class Bounds { Fill, Strict };
+
     // Reads every region [start, start+size) into its C-order output buffer.
-    // Parts outside the array, and chunks that are not stored, read as fill.
+    // Parts outside the array, and chunks that are not stored, read as fill. A null
+    // output only brings the region's chunks into the caches (nothing is copied).
     // `stream`: raw local chunks missing from the memory cache are copied straight
     // into the outputs without being read whole and inserted (callers with their
     // own cache, e.g. the CUDA reader). Memory-cache hits are still used.
+    // `cancel`: once set, no further chunk is started and the read throws Cancelled
+    // (chunks already started finish; outputs are then partly written). `complete`,
+    // when given, is set per region before returning or throwing: 1 when the region's
+    // output was written in full (always 1 for regions with a null output).
     void read_many(const std::vector<Index>& starts, const std::vector<Index>& sizes,
                    const std::vector<std::uint8_t*>& outs, const BoxOutput* output = nullptr,
-                   bool stream = false)
+                   bool stream = false, const std::atomic<bool>* cancel = nullptr,
+                   std::vector<std::uint8_t>* complete = nullptr)
+    {
+        read_many(starts, sizes, outs, Bounds::Fill, output, stream, cancel, complete);
+    }
+
+    // Strict reads reject nonempty regions outside the array before touching
+    // any output. Missing chunks still read as fill. Empty regions are no-ops.
+    void read_many(const std::vector<Index>& starts, const std::vector<Index>& sizes,
+                   const std::vector<std::uint8_t*>& outs, Bounds bounds,
+                   const BoxOutput* output = nullptr, bool stream = false,
+                   const std::atomic<bool>* cancel = nullptr, std::vector<std::uint8_t>* complete = nullptr)
     {
         const std::size_t nd = spec_.shape.size();
+        if (starts.size() != sizes.size() || starts.size() != outs.size())
+            throw std::invalid_argument("region starts, sizes and outputs must have equal counts");
+        if (bounds == Bounds::Strict) {
+            for (std::size_t r = 0; r < starts.size(); ++r) {
+                const auto& start = starts[r];
+                const auto& size = sizes[r];
+                if (std::find(size.begin(), size.end(), 0) != size.end())
+                    continue;
+                if (start.size() != nd || size.size() != nd)
+                    throw std::invalid_argument("region rank does not match the array");
+                for (std::size_t i = 0; i < nd; ++i)
+                    if (start[i] < 0 || size[i] < 0 || start[i] > spec_.shape[i] ||
+                        size[i] > spec_.shape[i] - start[i])
+                        throw std::out_of_range("region outside the array: " + spec_.identity);
+            }
+        }
         std::vector<Index> out_strides(starts.size());
         std::map<std::int64_t, std::size_t> slot;  // linear chunk index -> work item (ordered: locality)
         std::vector<Work> work;
         for (std::size_t r = 0; r < starts.size(); ++r) {
             const Index& start = starts[r];
             const Index& size = sizes[r];
+            if (bounds == Bounds::Strict && std::find(size.begin(), size.end(), 0) != size.end())
+                continue;
             if (start.size() != nd || size.size() != nd)
                 throw std::invalid_argument("region rank does not match the array");
             out_strides[r] = c_strides(size, output ? output->itemsize : spec_.itemsize);
@@ -330,7 +452,7 @@ public:
                 empty |= hi[i] <= lo[i];
                 clipped |= lo[i] != start[i] || hi[i] != start[i] + size[i];
             }
-            if (empty || clipped)  // outside the array reads as fill; the inside is overwritten below
+            if ((empty || clipped) && outs[r])  // outside the array reads as fill; the inside is overwritten below
                 fill_box(outs[r], out_strides[r], size, output ? output->fill : spec_.fill);
             if (empty)
                 continue;
@@ -355,18 +477,31 @@ public:
                     p.extent[i] = b - a;
                     dst_lo[i] = a - start[i];
                 }
-                p.dst = outs[r] + offset_of(dst_lo, out_strides[r]);
                 auto [it, fresh] = slot.emplace(linear, work.size());
                 if (fresh)
                     work.push_back(Work{idx, {}, {}});
-                work[it->second].pieces.push_back(std::move(p));
+                if (outs[r]) {
+                    p.dst = outs[r] + offset_of(dst_lo, out_strides[r]);
+                    work[it->second].pieces.push_back(std::move(p));
+                }
             } while (next_index(idx, c0, c1));
         }
         std::vector<Work> ordered;  // chunk order: locality
         ordered.reserve(work.size());
         for (auto& [linear, i] : slot)
             ordered.push_back(std::move(work[i]));
-        run(ordered, out_strides, nullptr, output, stream);
+        if (complete)
+            complete->assign(starts.size(), 1);
+        std::vector<std::uint8_t> resolved;
+        try {
+            run(ordered, out_strides, nullptr, output, stream, cancel, complete ? &resolved : nullptr);
+        } catch (const Cancelled&) {
+            for (std::size_t w = 0; complete && w < ordered.size(); ++w)
+                if (!resolved[w])
+                    for (const auto& piece : ordered[w].pieces)
+                        (*complete)[piece.region] = 0;
+            throw;
+        }
     }
 
     void read_many_float(const std::vector<Index>& starts, const std::vector<Index>& sizes,
@@ -386,7 +521,7 @@ public:
             read_points_as<0>(PointCoordinates{coords, ndim()}, n, out);
     }
 
-    // Element nearest to each real-valued point (voxel i at coordinate i, ties to even),
+    // Element nearest to each real-valued point (voxel i at coordinate i, ties up),
     // written as stored. Points outside the array, and non-finite ones, read as fill.
     void sample_nearest(const double* coords, std::size_t n, std::uint8_t* out)
     {
@@ -403,6 +538,39 @@ public:
     void sample_linear(const double* coords, std::size_t n, const ElementType& type, bool out64, void* out)
     {
         sample_linear_coordinates(PointCoordinates{coords, ndim()}, n, type, out64, out);
+    }
+
+    // sample_nearest and sample_linear from the caches alone: the memory cache, queued
+    // cache writes and the disk caches (decoded, VC3D mirror and Delta3D layers), never
+    // the array's source (a remote fetch, a read of its own local store, a computation),
+    // so they never wait on the network or on the store's filesystem. A point that needs
+    // a chunk only the source can supply gets missing[p] = 1 and its output is left as it
+    // was; every other point is sampled as by the blocking call, with missing[p] = 0
+    // (points outside the array read as fill without any chunk).
+    void sample_nearest_cached(const double* coords, std::size_t n, std::uint8_t* out, std::uint8_t* missing)
+    {
+        if (ndim() == 3)
+            read_points_as<3>(PointCoordinates{coords, ndim()}, n, out, missing);
+        else
+            read_points_as<0>(PointCoordinates{coords, ndim()}, n, out, missing);
+    }
+
+    void sample_linear_cached(const double* coords, std::size_t n, const ElementType& type, bool out64, void* out,
+                              std::uint8_t* missing)
+    {
+        sample_linear_coordinates(PointCoordinates{coords, ndim()}, n, type, out64, out, missing);
+    }
+
+    // sample_nearest for any coordinate provider (see PointCoordinates); with `missing`,
+    // from the caches alone like sample_nearest_cached.
+    template <class Coordinates>
+    void sample_nearest_coordinates(const Coordinates& coords, std::size_t n, std::uint8_t* out,
+                                    std::uint8_t* missing = nullptr)
+    {
+        if (ndim() == 3)
+            read_points_as<3>(coords, n, out, missing);
+        else
+            read_points_as<0>(coords, n, out, missing);
     }
 
     void read_affine(const AffineCoordinates& grid, std::size_t n, int order,
@@ -429,16 +597,16 @@ public:
 
     template <class Coordinates>
     void sample_linear_coordinates(const Coordinates& coords, std::size_t n, const ElementType& type,
-                                   bool out64, void* out)
+                                   bool out64, void* out, std::uint8_t* missing = nullptr)
     {
         if (spec_.shape.size() > kMaxSampleDims)
             throw std::invalid_argument("sample() supports at most 16 dimensions");
         // The element loads, chosen once: native-order numbers inline, the rest through `type`.
         const auto dispatch = [&](auto load) {
             if (ndim() == 3)
-                sample_linear_as<3>(coords, n, type, out64, out, load);
+                sample_linear_as<3>(coords, n, type, out64, out, load, missing);
             else
-                sample_linear_as<0>(coords, n, type, out64, out, load);
+                sample_linear_as<0>(coords, n, type, out64, out, load, missing);
         };
         type.visit_load([&](auto load) {
             dispatch([load](const std::uint8_t* p) { return static_cast<double>(load(p)); });
@@ -469,8 +637,8 @@ public:
                     if (resident) {
                         block.sample(coords,raw.data(),static_cast<float*>(out),
                             [&](std::size_t count,const auto& fn) {
-                                if (pool_.size()==1) for (std::size_t z=0;z<count;++z) fn(z);
-                                else pool_.parallel_for(count,fn);
+                                if (pool_->size()==1) for (std::size_t z=0;z<count;++z) fn(z);
+                                else pool_->parallel_for(count,fn);
                             });
                         return;
                     }
@@ -482,11 +650,132 @@ public:
         else throw std::invalid_argument("order must be 0 or 1");
     }
 
+    // The chunk at a chunk-grid index, decoded: nullptr when it is not stored (it
+    // reads as fill). Consults the memory cache, queued cache writes, the disk layers
+    // and the remote like region reads, and caches what it fetches. Offline arrays
+    // raise CacheMiss for a chunk in no layer.
+    ChunkPtr chunk(const Index& idx)
+    {
+        check_chunk_index(idx);
+        const std::string k = key(idx);
+        const std::string ck = spec_.identity + "|" + k;
+        if (cache_) {
+            auto [found, chunk] = cache_->get(ck);
+            if (found) {
+                ++stats_.memory_hits;
+                return chunk;
+            }
+        }
+        if (writes_) {
+            auto [found, chunk] = writes_->pending(k);
+            if (found) {
+                ++stats_.pending_hits;
+                return chunk;
+            }
+        }
+        for (std::size_t li = 0; li < spec_.layers.size(); ++li) {
+            if (auto chunk = read_layer_chunk(li, k)) {
+                ++stats_.disk_hits;
+                if (cache_)
+                    cache_->put(ck, *chunk);
+                return *chunk;
+            }
+        }
+        if (spec_.offline) {
+            if (spec_.offline_fill) {
+                offline_miss(idx, ck);
+                return nullptr;
+            }
+            throw CacheMiss("chunk " + k + " of " + spec_.identity + " is not in the disk cache (offline)");
+        }
+        if (!http_ && !source_ && !spec_.compute)
+            return nullptr;
+        return fetch(idx, k, ck);
+    }
+
+    // Copy a full decoded chunk, including stored padding at the array edge, or
+    // materialize fill when absent. The destination must hold exactly one chunk.
+    // Returns whether the chunk was stored. Like chunk(), uses configured caches.
+    bool read_chunk(const Index& idx, std::uint8_t* out, std::size_t size)
+    {
+        if (size != chunk_bytes_)
+            throw std::invalid_argument("destination size does not match the chunk");
+        const auto data = chunk(idx);
+        if (data)
+            std::memcpy(out, data->data(), size);
+        else
+            fill_elements(out, size / spec_.itemsize, spec_.fill);
+        return bool(data);
+    }
+
+    // The chunk at a chunk-grid index from the caches alone: the memory cache, queued
+    // cache writes and the disk caches, never the array's source (its remote, its own
+    // local store, a computation), so it never waits on the network or the store's
+    // filesystem. (true, chunk or nullptr when it is not stored) when a cache holds it,
+    // (false, nullptr) when only the source can supply it. A chunk read from a disk
+    // cache enters the memory cache.
+    std::pair<bool, ChunkPtr> cached_chunk(const Index& idx)
+    {
+        check_chunk_index(idx);
+        const std::string k = key(idx);
+        const std::string ck = spec_.identity + "|" + k;
+        if (cache_) {
+            auto found = cache_->get(ck);
+            if (found.first) {
+                ++stats_.memory_hits;
+                return found;
+            }
+        }
+        if (writes_) {
+            auto found = writes_->pending(k);
+            if (found.first) {
+                ++stats_.pending_hits;
+                return found;
+            }
+        }
+        bool store = false;  // the array's own store, its source
+        for (std::size_t li = 0; li < spec_.layers.size(); ++li) {
+            if (spec_.layers[li].kind == "array") {
+                store = true;
+                continue;
+            }
+            if (auto chunk = read_layer_chunk(li, k)) {
+                ++stats_.disk_hits;
+                if (cache_)
+                    cache_->put(ck, *chunk);
+                return {true, *chunk};
+            }
+        }
+        if (!store && !http_ && !source_ && !spec_.compute && !spec_.offline)
+            return {true, nullptr};  // no source: nothing is stored
+        return {false, nullptr};
+    }
+
+    // Whether fetching chunks may touch the network (a remote source that is not offline).
+    bool remote() const noexcept { return http_ != nullptr; }
+    const Index& chunk_grid() const noexcept { return grid_; }
+    std::size_t chunk_bytes() const noexcept { return chunk_bytes_; }
+
     const Stats& stats() const noexcept { return stats_; }
+    // offline_fill: the chunk-grid indices read as fill because no layer held them,
+    // sorted, each once.
+    std::vector<Index> offline_misses() const
+    {
+        std::lock_guard lock(miss_mutex_);
+        return {misses_.begin(), misses_.end()};
+    }
     std::string last_write_error()
     {
         std::lock_guard lock(error_mutex_);
         return last_write_error_;
+    }
+    // A corrupt chunk (wrong size, undecodable) is skipped: a disk cache's copy is
+    // ignored and the next layer or the source is read; the source's own reads as not
+    // stored (fill). Each is counted in Stats::corrupt; this is the latest one's error.
+    std::string last_corrupt_chunk()
+    {
+        std::lock_guard lock(error_mutex_);
+        return last_corrupt_;
     }
 
 private:
@@ -530,14 +819,6 @@ private:
     // Points per run: shorter runs are planned as single points (recomputing a point costs
     // more than reading its planned offset); longer ones are cut, so runs can be shared out.
     static constexpr std::uint64_t kRunMin = 8, kRunMax = std::uint64_t{1} << 12;
-    void validate_chunk(const Index& idx) const
-    {
-        if (idx.size() != grid_.size())
-            throw std::invalid_argument("chunk index rank does not match the array");
-        for (std::size_t i = 0; i < idx.size(); ++i)
-            if (idx[i] < 0 || idx[i] >= grid_[i])
-                throw std::out_of_range("chunk index outside the array");
-    }
 
     // Everything one chunk supplies: boxes (read_many) or single elements (point reads).
     struct Work {
@@ -554,20 +835,43 @@ private:
         // `data` holds the chunk's bytes from byte offset `origin` on.
         std::function<void(const std::uint8_t* data, std::int64_t origin, const Work&)> read;
         std::function<void(const Work&)> fill;  // the chunk is not stored
+        // Set for reads from the caches alone: only the source could supply the chunk.
+        std::function<void(const Work&)> miss;
     };
 
-    // Resolves every chunk in parallel, in the order given.
+    // Resolves every chunk in parallel, in the order given. Once `cancel` is set, no
+    // further chunk is started and Cancelled is thrown; `resolved` (when given) then
+    // marks the chunks resolved before it.
     void run(std::vector<Work>& work, const std::vector<Index>& out_strides, const PointOp* op,
-             const BoxOutput* output = nullptr, bool stream = false)
+             const BoxOutput* output = nullptr, bool stream = false, const std::atomic<bool>* cancel = nullptr,
+             std::vector<std::uint8_t>* resolved = nullptr)
     {
+        const auto cancelled = [cancel] { return cancel && cancel->load(std::memory_order_acquire); };
         if (spec_.hint && (!cache_ || stream))
-            pool_.parallel_for(work.size(), [&](std::size_t i) { hint(work[i]); });
-        pool_.parallel_for(work.size(), [&](std::size_t i) { resolve(work[i], out_strides, op, output, stream); });
+            pool_->parallel_for(work.size(), [&](std::size_t i) {
+                if (!cancelled())
+                    hint(work[i]);
+            });
+        if (!cancel) {
+            pool_->parallel_for(work.size(), [&](std::size_t i) { resolve(work[i], out_strides, op, output, stream); });
+            return;
+        }
+        std::vector<std::uint8_t> local;
+        auto& done = resolved ? *resolved : local;
+        done.assign(work.size(), 0);
+        pool_->parallel_for(work.size(), [&](std::size_t i) {
+            if (cancelled())
+                return;
+            resolve(work[i], out_strides, op, output, stream);
+            done[i] = 1;
+        });
+        if (std::find(done.begin(), done.end(), 0) != done.end())
+            throw Cancelled("read cancelled");
     }
 
     std::size_t plan_segments(std::size_t n) const
     {
-        return std::clamp<std::size_t>(n / kPlanGrain, 1, 4 * (pool_.size() + 1));
+        return std::clamp<std::size_t>(n / kPlanGrain, 1, 4 * (pool_->size() + 1));
     }
 
     // Point planning only divides nonnegative voxel indices. Common power-of-two
@@ -578,11 +882,11 @@ private:
     }
 
     // Groups point reads by chunk. The n points are split into plan_segments(n) contiguous
-    // ranges, each planned in order on one thread: locate(segment, p, scratch, emit) reports
+    // ranges, each planned in order on one thread: locate(segment, p, scratch, emitter) reports
     // what point p reads (scratch: room for nd indices; index: nd indices inside the array):
-    //  - emit.point(index, tag): the point is answered from the chunk holding `index` alone,
+    //  - emitter.point(index, tag): the point is answered from the chunk holding `index` alone,
     //    and the PointOp can recompute everything it needs from the point's number, `tag`;
-    //  - emit(index, tag): one element the point needs.
+    //  - emitter(index, tag): one element the point needs.
     // Consecutive points answered from one chunk become a Run, which stores no per-point data;
     // the other elements become Points (byte offset and tag). Returns one Work per chunk, in
     // chunk order, whose points and runs (in emission order) are stored in `points` and `runs`.
@@ -693,16 +997,16 @@ private:
             }
         };
         std::vector<Segment> seg(segs);
-        pool_.parallel_for(segs, [&](std::size_t s) {
+        pool_->parallel_for(segs, [&](std::size_t s) {
             Segment& g = seg[s];
             const std::size_t p0 = n * s / segs, p1 = n * (s + 1) / segs;
             g.entries.reserve(p1 - p0);
             Index scratch(nd);
-            Emit emit{*this, g};
-            emit.run_base.resize(nd);
+            Emit emitter{*this, g};
+            emitter.run_base.resize(nd);
             for (std::size_t p = p0; p < p1; ++p)
-                locate(s, p, scratch.data(), emit);
-            emit.close();
+                locate(s, p, scratch.data(), emitter);
+            emitter.close();
         });
         // Chunks in order; within a chunk, each segment's elements after the earlier segments'.
         // Every segment's chunks get a dense id (in order of appearance), then their rank.
@@ -755,7 +1059,7 @@ private:
         }
         points.resize(start.back());
         runs.resize(run_start.back());
-        pool_.parallel_for(segs, [&](std::size_t s) {
+        pool_->parallel_for(segs, [&](std::size_t s) {
             Segment& g = seg[s];
             for (const Entry& e : g.entries) {
                 Point& pt = points[g.next[e.id]++];
@@ -790,7 +1094,7 @@ private:
             fn(pts);
             return;
         }
-        pool_.parallel_for(parts, [&](std::size_t i) {
+        pool_->parallel_for(parts, [&](std::size_t i) {
             const std::size_t a = pts.size() * i / parts, b = pts.size() * (i + 1) / parts;
             fn(pts.subspan(a, b - a));
         });
@@ -816,7 +1120,7 @@ private:
                 cut.push_back(i + 1);
         }
         cut.push_back(runs.size());
-        pool_.parallel_for(cut.size() - 1, [&](std::size_t i) { fn(runs.subspan(cut[i], cut[i + 1] - cut[i])); });
+        pool_->parallel_for(cut.size() - 1, [&](std::size_t i) { fn(runs.subspan(cut[i], cut[i + 1] - cut[i])); });
     }
 
     // Byte offset of the element at `idx` in the chunk whose first element is `base`.
@@ -848,7 +1152,7 @@ private:
     // Reads one element per located point into out[tag] (see plan_points for `locate`, which
     // only emits elements here: planning a point costs less than recomputing it).
     template <std::size_t N, class Locate>
-    void gather_points(std::size_t n, std::uint8_t* out, Locate&& locate)
+    void gather_points(std::size_t n, std::uint8_t* out, std::uint8_t* missing, Locate&& locate)
     {
         std::vector<Point> points;
         std::vector<Run> runs;
@@ -873,19 +1177,28 @@ private:
             for (const Point& pt : w.points)
                 std::memcpy(out + pt.tag * isz, spec_.fill.data(), isz);
         };
+        if (missing)
+            op.miss = [&](const Work& w) {
+                for (const Point& pt : w.points)
+                    missing[pt.tag] = 1;
+                for (const Run& r : w.runs)
+                    std::fill_n(missing + r.first, r.count, std::uint8_t{1});
+            };
         run(work, {}, &op);
     }
 
     // Keep the common 3-D loop bounds visible to the compiler, sharing the same
     // planner and bounds/rounding rules with the arbitrary-rank path.
     template <std::size_t N, class Coordinates>
-    void read_points_as(const Coordinates& coords, std::size_t n, std::uint8_t* out)
+    void read_points_as(const Coordinates& coords, std::size_t n, std::uint8_t* out, std::uint8_t* missing = nullptr)
     {
         using Coord = typename Coordinates::value_type;
         const std::size_t nd = N ? N : ndim();
+        if (missing)
+            std::fill_n(missing, n, std::uint8_t{0});
         for (std::size_t b0 = 0; b0 < n; b0 += kPointBatch) {
             const std::size_t m = std::min(kPointBatch, n - b0);
-            gather_points<N>(m, out, [&](std::size_t, std::size_t p, std::int64_t* idx, auto& emit) {
+            gather_points<N>(m, out, missing, [&](std::size_t, std::size_t p, std::int64_t* idx, auto& emitter) {
                 Coord scratch[N ? N : kMaxSampleDims];
                 const Coord* c = coords(b0 + p, scratch);
                 const std::int64_t* at;
@@ -897,8 +1210,8 @@ private:
                         } else if constexpr (std::is_same_v<Coord,float>) {
                             const float low = std::floor(c[i]), f = c[i]-low;
                             const auto integer = base+static_cast<std::int64_t>(low);
-                            idx[i] = integer+(f > .5f || (f == .5f && (integer & 1)));
-                        } else idx[i] = base+static_cast<std::int64_t>(std::nearbyint(c[i]));
+                            idx[i] = integer+nearest_rounds_up(f);
+                        } else idx[i] = base+nearest_index(c[i]);
                     }
                     at = idx;
                 } else {
@@ -908,7 +1221,7 @@ private:
                 for (std::size_t i = 0; i < nd; ++i)
                     inside &= at[i] >= 0 && at[i] < spec_.shape[i];
                 if (inside)
-                    emit(at, b0 + p);
+                    emitter(at, b0 + p);
                 else
                     std::memcpy(out + (b0 + p) * spec_.itemsize, spec_.fill.data(), spec_.itemsize);
             });
@@ -918,25 +1231,12 @@ private:
     // A point's grid cell: the corner below it, its fractional offsets, and the axes on
     // which it is off the grid.
     template <std::size_t N, class Real = double>
-    struct Cell {
-        using value_type = Real;
-        std::int64_t lo[N ? N : kMaxSampleDims];
-        Real frac[N ? N : kMaxSampleDims];
-        std::size_t axes[N ? N : kMaxSampleDims];
-        std::size_t k = 0;
-    };
+    using Cell = sampling::Cell<N ? N : kMaxSampleDims, Real>;
 
     template <std::size_t N, class Real, class Coordinates, class Coord>
     static void cell_of(const Coord* c, std::size_t nd, Cell<N,Real>& cell, const Coordinates& coords)
     {
-        cell.k = 0;
-        for (std::size_t i = 0; i < (N ? N : nd); ++i) {
-            const Coord f = std::floor(c[i]);
-            cell.lo[i] = coords.base(i) + static_cast<std::int64_t>(f);
-            cell.frac[i] = c[i] - f;
-            if (cell.frac[i] != 0.0)
-                cell.axes[cell.k++] = i;
-        }
+        sampling::cellOf(c, N ? N : nd, cell, [&](std::size_t a) { return coords.base(a); });
     }
 
     // sample_linear with element loads `load`. A point whose neighbours all lie in one chunk
@@ -945,7 +1245,7 @@ private:
     // planning segment) and are interpolated after.
     template <std::size_t N, class Load, class Coordinates>
     void sample_linear_as(const Coordinates& coords, std::size_t n, const ElementType& type, bool out64, void* out,
-                          Load load)
+                          Load load, std::uint8_t* missing = nullptr)
     {
         using Coord = typename Coordinates::value_type;
         using Real = decltype(load(static_cast<const std::uint8_t*>(nullptr)));
@@ -964,7 +1264,7 @@ private:
         };
         struct Splits {
             std::vector<Split> points;
-            std::uint64_t slots = 0;
+            std::uint64_t slotCount = 0;
         };
         std::int64_t reach = static_cast<std::int64_t>(isz);  // the far corner of a cell, from its near one
         for (std::size_t i = 0; i < nd; ++i)
@@ -972,8 +1272,11 @@ private:
         std::vector<Splits> split;
         std::vector<std::uint64_t> base;  // segment -> its first slot in raw
         std::vector<std::uint8_t> raw;
+        std::vector<std::uint8_t> raw_missing;  // cache-only reads: split neighbours only the source has
         std::vector<Point> points;
         std::vector<Run> runs;
+        if (missing)
+            std::fill_n(missing, n, std::uint8_t{0});
         // A point whose neighbours all lie in the chunk at `at`'s; `at` is the near corner.
         const auto value = [&](const Cell<N,Real>& cell, const std::uint8_t* at) {
             if (nd == 3 && cell.k == 3)
@@ -989,7 +1292,7 @@ private:
         for (std::size_t b0 = 0; b0 < n; b0 += kPointBatch) {
             const std::size_t m = std::min(kPointBatch, n - b0);
             split.assign(plan_segments(m), Splits{});
-            auto work = plan_points<N>(m, points, runs, [&](std::size_t s, std::size_t p, std::int64_t* idx, auto& emit) {
+            auto work = plan_points<N>(m, points, runs, [&](std::size_t s, std::size_t p, std::int64_t* idx, auto& emitter) {
                 Coord scratch[N ? N : kMaxSampleDims];
                 const Coord* c = coords(b0 + p, scratch);
                 bool finite = true, outside = false;
@@ -1014,14 +1317,14 @@ private:
                     whole &= cell.lo[i] + 1 < spec_.shape[i] && rem + 1 < spec_.chunks[i];
                 }
                 if (whole) {
-                    emit.point(cell.lo, b0 + p);
+                    emitter.point(cell.lo, b0 + p);
                     return;
                 }
                 Splits& sp = split[s];
-                const std::uint64_t first = sp.slots;
+                const std::uint64_t first = sp.slotCount;
                 const std::size_t count = std::size_t{1} << cell.k;
                 sp.points.push_back(Split{b0 + p, first});
-                sp.slots += count;
+                sp.slotCount += count;
                 for (std::size_t corner = 0; corner < count; ++corner) {
                     bool inside = true;
                     for (std::size_t i = 0; i < nd; ++i)
@@ -1031,17 +1334,17 @@ private:
                     for (std::size_t i = 0; i < nd; ++i)
                         inside &= idx[i] >= 0 && idx[i] < spec_.shape[i];
                     if (inside)  // outside neighbours keep raw's fill
-                        emit(idx, kSplit | std::uint64_t{s} << kSegmentShift | (first + corner));
+                        emitter(idx, kSplit | std::uint64_t{s} << kSegmentShift | (first + corner));
                 }
             });
             base.assign(split.size(), 0);
-            std::uint64_t slots = 0;
+            std::uint64_t slotCount = 0;
             for (std::size_t s = 0; s < split.size(); ++s) {
-                base[s] = slots;
-                slots += split[s].slots;
+                base[s] = slotCount;
+                slotCount += split[s].slotCount;
             }
-            raw.resize(slots * isz);
-            fill_elements(raw.data(), slots, spec_.fill);
+            raw.resize(slotCount * isz);
+            fill_elements(raw.data(), slotCount, spec_.fill);
             PointOp op;
             op.reach = reach;
             op.read = [&](const std::uint8_t* data, std::int64_t origin, const Work& w) {
@@ -1107,11 +1410,32 @@ private:
                         store(p, sampling::interpolate(cell, [&](std::size_t) { return fill; }));
                     }
             };
+            if (missing) {
+                raw_missing.assign(slotCount, 0);
+                op.miss = [&](const Work& w) {
+                    for (const Point& pt : w.points) {
+                        if (pt.tag & kSplit)
+                            raw_missing[base[(pt.tag & ~kSplit) >> kSegmentShift] + (pt.tag & kSlotMask)] = 1;
+                        else
+                            missing[pt.tag] = 1;
+                    }
+                    for (const Run& r : w.runs)
+                        std::fill_n(missing + r.first, r.count, std::uint8_t{1});
+                };
+            }
             run(work, {}, &op);
-            pool_.parallel_for(split.size(), [&](std::size_t s) {
+            pool_->parallel_for(split.size(), [&](std::size_t s) {
                 Cell<N,Real> cell;
                 Coord coordinate[N ? N : kMaxSampleDims];
                 for (const Split& sp : split[s].points) {
+                    if (missing) {
+                        cell_of<N>(coords(sp.p, coordinate), nd, cell, coords);
+                        const auto* flags = raw_missing.data() + base[s] + sp.first;
+                        if (std::any_of(flags, flags + (std::size_t{1} << cell.k), [](std::uint8_t f) { return f; })) {
+                            missing[sp.p] = 1;
+                            continue;
+                        }
+                    }
                     const std::uint8_t* at = raw.data() + (base[s] + sp.first) * isz;
                     cell_of<N>(coords(sp.p, coordinate), nd, cell, coords);
                     store(sp.p, sampling::interpolate(cell, [&](std::size_t corner) { return load(at + corner * isz); }));
@@ -1122,16 +1446,16 @@ private:
 
     enum class Found { Copied, Missing, NotCached };
 
-    std::string key(const Index& idx) const
+    void check_chunk_index(const Index& idx) const
     {
-        std::string k;
-        for (std::size_t i = 0; i < idx.size(); ++i) {
-            if (i)
-                k += spec_.separator;
-            k += std::to_string(idx[i]);
-        }
-        return k;
+        if (idx.size() != grid_.size())
+            throw std::invalid_argument("chunk index rank does not match the array");
+        for (std::size_t i = 0; i < idx.size(); ++i)
+            if (idx[i] < 0 || idx[i] >= grid_[i])
+                throw std::out_of_range("chunk index outside the array");
     }
+
+    std::string key(const Index& idx) const { return chunkKey(idx, spec_.separator); }
 
     std::string marker_path(const LayerSpec& l, const std::string& k) const
     {
@@ -1227,10 +1551,7 @@ private:
             if (m->size != chunk_bytes_)
                 throw std::runtime_error(path + ": chunk file has the wrong size");
             const auto advise = [&](std::int64_t first, std::int64_t len) {
-                const std::int64_t page = ::sysconf(_SC_PAGESIZE);
-                const std::int64_t a = first / page * page;
-                ::madvise(const_cast<std::uint8_t*>(m->data) + a, static_cast<std::size_t>(first + len - a),
-                          MADV_WILLNEED);
+                platform::advise_willneed(m->data, first, len);
             };
             // Many pieces of one chunk (sub-chunk blocks) share one hint over their
             // span unless it would advise much more than the pieces themselves.
@@ -1300,15 +1621,33 @@ private:
             return std::nullopt;
         }
         auto data = read_whole(f.fd(), l.root + "/" + k);
-        if (codecs_[li] == Codec::Delta3d && !l.allow_lossy && !delta3d_lossless(data.data(), data.size()))
-            return std::nullopt;  // quantized: not the source's values
-        if (codecs_[li] == Codec::Raw) {
-            check_raw_size(data.size(), chunk_bytes_);
-            return std::make_shared<const Chunk>(std::move(data));
+        try {
+            if (codecs_[li] == Codec::Delta3d && !l.allow_lossy && !delta3d_lossless(data.data(), data.size()))
+                return std::nullopt;  // quantized: not the source's values
+            if (codecs_[li] == Codec::Raw) {
+                check_raw_size(data.size(), chunk_bytes_);
+                return std::make_shared<const Chunk>(std::move(data));
+            }
+            auto chunk = std::make_shared<Chunk>(chunk_bytes_);
+            decode(codecs_[li], data.data(), data.size(), chunk->data(), chunk_bytes_);
+            return ChunkPtr(std::move(chunk));
+        } catch (const std::exception& error) {
+            corrupt(l.root + "/" + k, error);
+            return skip_corrupt(l);
         }
-        auto chunk = std::make_shared<Chunk>(chunk_bytes_);
-        decode(codecs_[li], data.data(), data.size(), chunk->data(), chunk_bytes_);
-        return ChunkPtr(std::move(chunk));
+    }
+
+    // A corrupt chunk of a layer: the store's own reads as not stored; a cache's is ignored.
+    static std::optional<ChunkPtr> skip_corrupt(const LayerSpec& l)
+    {
+        return l.kind == "array" ? std::optional<ChunkPtr>(ChunkPtr{}) : std::nullopt;
+    }
+
+    void corrupt(const std::string& where, const std::exception& error)
+    {
+        ++stats_.corrupt;
+        std::lock_guard lock(error_mutex_);
+        last_corrupt_ = where + ": " + error.what();
     }
 
     void resolve(const Work& w, const std::vector<Index>& out_strides, const PointOp* op, const BoxOutput* output,
@@ -1332,10 +1671,27 @@ private:
                 return;
             }
         }
+        const bool cached_only = op && op->miss;
+        bool skipped_store = false;  // a cache-only read skipped the array's own store
         for (std::size_t li = 0; li < spec_.layers.size(); ++li) {
             const LayerSpec& l = spec_.layers[li];
+            if (cached_only && l.kind == "array") {
+                skipped_store = true;  // the array's own store is its source
+                continue;
+            }
             if ((!cache_ || stream) && codecs_[li] == Codec::Raw) {
-                if (read_raw_pieces(l.root + "/" + k, w, out_strides, op, output) == Found::Copied) {
+                Found found;
+                try {
+                    found = read_raw_pieces(l.root + "/" + k, w, out_strides, op, output);
+                } catch (const std::runtime_error& error) {  // the wrong size: corrupt
+                    corrupt(l.root + "/" + k, error);
+                    if (l.kind == "array") {
+                        fill_pieces(w, out_strides, op, output);
+                        return;
+                    }
+                    continue;
+                }
+                if (found == Found::Copied) {
                     ++stats_.disk_hits;
                     return;
                 }
@@ -1353,29 +1709,47 @@ private:
                 return;
             }
         }
-        if (auto fetcher = fetcher_.load()) {
-            ChunkPtr chunk = (*fetcher)(w.idx).value;
-            if (chunk && chunk->size() != chunk_bytes_)
-                throw std::runtime_error("prefetch coordinator returned an invalid chunk size");
-            if (cache_) cache_->put(ck, chunk);
-            apply(chunk, w, out_strides, op, output);
+        if (cached_only && (skipped_store || http_ || source_ || spec_.compute || spec_.offline)) {
+            op->miss(w);
             return;
         }
-        if (spec_.offline)
-            throw CacheMiss("chunk " + k + " of " + spec_.identity + " is not in the disk cache (offline)");
-        if (!http_ && !source_) {
+        if (!http_ && !source_ && !spec_.compute && !spec_.offline) {
             fill_pieces(w, out_strides, op, output);
             return;
         }
-        ChunkPtr chunk = fetch(k);
-        if (cache_)
-            cache_->put(ck, chunk);
-        apply(chunk, w, out_strides, op, output);
+        if (spec_.offline) {
+            if (spec_.offline_fill) {
+                offline_miss(w.idx, ck);
+                fill_pieces(w, out_strides, op, output);
+                return;
+            }
+            throw CacheMiss("chunk " + k + " of " + spec_.identity + " is not in the disk cache (offline)");
+        }
+        apply(fetch(w.idx, k, ck), w, out_strides, op, output);
     }
 
-    // Fetches a chunk from the remote once, however many reads want it at the same time.
-    ChunkPtr fetch(const std::string& k)
+    // offline_fill: records a chunk no layer holds, and remembers it as absent in the
+    // memory cache so later reads (and cache-only samples) take it as fill at once.
+    void offline_miss(const Index& idx, const std::string& ck)
     {
+        if (cache_)
+            cache_->put(ck, nullptr);
+        std::lock_guard lock(miss_mutex_);
+        if (misses_.insert(idx).second)
+            ++stats_.offline_misses;
+    }
+
+    // Fetches (or computes) a chunk once, however many reads want it at the same time,
+    // and puts it in the memory cache (key `ck`) before it stops being in flight, so a
+    // read that missed the memory cache meanwhile finds it there instead of fetching again.
+    ChunkPtr fetch(const Index& idx, const std::string& k, const std::string& ck)
+    {
+        if (spec_.caller_thread_only) {
+            ChunkPtr chunk = spec_.compute ? compute_now(idx, k) : fetch_now(k);
+            if (cache_)
+                cache_->put(ck, chunk);
+            return chunk;
+        }
         std::shared_future<ChunkPtr> future;
         std::promise<ChunkPtr> promise;
         bool owner = false;
@@ -1385,6 +1759,12 @@ private:
             if (it != inflight_.end()) {
                 future = it->second;
             } else {
+                if (cache_) {
+                    if (auto [found, chunk] = cache_->get(ck); found) {
+                        ++stats_.memory_hits;
+                        return chunk;
+                    }
+                }
                 future = promise.get_future().share();
                 inflight_.emplace(k, future);
                 owner = true;
@@ -1393,7 +1773,9 @@ private:
         if (!owner)
             return future.get();
         try {
-            ChunkPtr chunk = fetch_now(k);
+            ChunkPtr chunk = spec_.compute ? compute_now(idx, k) : fetch_now(k);
+            if (cache_)
+                cache_->put(ck, chunk);
             promise.set_value(chunk);
             std::lock_guard lock(inflight_mutex_);
             inflight_.erase(k);
@@ -1415,37 +1797,53 @@ private:
             if (!http_ && found) ++stats_.disk_hits;
         } else {
             ++stats_.remote_fetches;
-            found = http_->get(spec_.remote_url + "/" + k, body, chunk_bytes_);
+            found = http_->get(joinLocation(spec_.remote_url, k), body, chunk_bytes_);
             stats_.remote_bytes += body.size();
         }
         if (!found) {
             ++stats_.remote_missing;
-            if (writes_ && !write_disabled_.load())
-                writes_->submit(k, nullptr, 64, [this, k] { store_missing(k); });
+            queue_write(k, nullptr, 64, [this, k] { store_missing(k); });
             return nullptr;
         }
         ChunkPtr chunk;
         std::shared_ptr<const std::vector<std::uint8_t>> payload;
-        if (remote_codec_ == Codec::Raw) {
-            if (body.size() != chunk_bytes_)
-                throw std::runtime_error(spec_.remote_url + "/" + k + ": body is not one chunk");
-            chunk = std::make_shared<const Chunk>(std::move(body));
-            payload = chunk;  // the stored bytes are the decoded chunk
-        } else {
-            auto decoded = std::make_shared<Chunk>(chunk_bytes_);
-            decode(remote_codec_, body.data(), body.size(), decoded->data(), chunk_bytes_);
-            chunk = std::move(decoded);
-            payload = std::make_shared<const std::vector<std::uint8_t>>(std::move(body));
+        try {
+            if (remote_codec_ == Codec::Raw) {
+                if (body.size() != chunk_bytes_)
+                    throw std::runtime_error("body is not one chunk");
+                chunk = std::make_shared<const Chunk>(std::move(body));
+                payload = chunk;  // the stored bytes are the decoded chunk
+            } else {
+                auto decoded = std::make_shared<Chunk>(chunk_bytes_);
+                decode(remote_codec_, body.data(), body.size(), decoded->data(), chunk_bytes_);
+                chunk = std::move(decoded);
+                payload = std::make_shared<const std::vector<std::uint8_t>>(std::move(body));
+            }
+        } catch (const std::exception& error) {  // reads as not stored; nothing is cached on disk
+            corrupt((source_ ? spec_.source_root : spec_.remote_url) + "/" + k, error);
+            return nullptr;
         }
         // The read returns now; the cache file is written (and encoded) in the background.
-        if (writes_ && !write_disabled_.load()) {
-            const std::size_t bytes = chunk->size() + (payload == chunk ? 0 : payload->size());
-            writes_->submit(k, chunk, bytes, [this, k, chunk, payload] { store(k, *chunk, *payload); });
-        }
+        const std::size_t bytes = chunk->size() + (payload == chunk ? 0 : payload->size());
+        queue_write(k, chunk, bytes, [this, k, chunk, payload] { store(k, *chunk, *payload); });
         return chunk;
     }
 
-    // Writes a fetched chunk to the write layer in that layer's format.
+    ChunkPtr compute_now(const Index& idx, const std::string& k)
+    {
+        auto chunk = std::make_shared<Chunk>(chunk_bytes_);
+        ++stats_.computed;
+        if (!spec_.compute(idx, chunk->data())) {
+            queue_write(k, nullptr, 64, [this, k] { store_missing(k); });
+            return nullptr;
+        }
+        ChunkPtr out = std::move(chunk);
+        queue_write(k, out, out->size(), [this, k, out] { store(k, *out, *out); });
+        return out;
+    }
+
+    // Writes a fetched chunk to the write layer in that layer's format. A cache another
+    // tool compressed some other way only gets read: raw bytes would corrupt it.
     void store(const std::string& k, const Chunk& decoded, const std::vector<std::uint8_t>& payload)
     {
         if (write_disabled_.load())
@@ -1454,13 +1852,13 @@ private:
         try {
             const std::string path = l.root + "/" + k;
             if (l.kind == "vc3d-mirror") {
-                atomic_write(path, payload.data(), payload.size());  // the source's bytes, verbatim
+                store_bytes(path, payload.data(), payload.size());  // the source's bytes, verbatim
             } else if (codecs_[spec_.write_layer] == Codec::Delta3d) {  // compressed decoded / VC3D Delta3D
                 const std::array<int, 3> shape{static_cast<int>(spec_.chunks[0]), static_cast<int>(spec_.chunks[1]),
                                                static_cast<int>(spec_.chunks[2])};
                 auto enc = encode_delta3d(decoded.data(), decoded.size(), shape, spec_.itemsize);
                 store_bytes(path, enc.data(), enc.size());
-            } else {
+            } else if (codecs_[spec_.write_layer] == Codec::Raw) {
                 store_bytes(path, decoded.data(), decoded.size());
             }
         } catch (const std::exception& e) {
@@ -1490,6 +1888,16 @@ private:
         }
     }
 
+    // Queues a background cache write; over the byte budget it is dropped (the
+    // chunk stays memory-only) unless a KeepWrites is alive.
+    void queue_write(const std::string& k, ChunkPtr visible, std::size_t bytes, std::function<void()> write)
+    {
+        if (!writes_ || write_disabled_.load())
+            return;
+        if (!writes_->submit(k, std::move(visible), bytes, std::move(write), keep_writes_.load() > 0))
+            ++stats_.dropped_writes;
+    }
+
     void write_failed(const char* what)
     {
         ++stats_.write_errors;
@@ -1500,23 +1908,24 @@ private:
 
     ArraySpec spec_;
     std::shared_ptr<MemoryCache> cache_;
-    ThreadPool pool_;
+    std::shared_ptr<ThreadPool> pool_;  // shared with arrays asking for as many workers
     MapCache maps_;
     std::unique_ptr<HttpClient> http_;
-    std::vector<Codec> codecs_;
-    Codec remote_codec_ = Codec::Raw;
+    std::vector<ChunkCodec> codecs_;
+    ChunkCodec remote_codec_;
     Index chunk_strides_, grid_;
     std::vector<int> chunk_shift_;
     std::size_t chunk_bytes_ = 0;
     Stats stats_;
     std::unique_ptr<ZarrStorage> source_;
     std::mutex inflight_mutex_;
-    using Fetcher = std::function<ChunkHandle(const Index&)>;
-    std::atomic<std::shared_ptr<const Fetcher>> fetcher_;
     std::unordered_map<std::string, std::shared_future<ChunkPtr>> inflight_;
     std::atomic<bool> write_disabled_{false};
+    std::atomic<int> keep_writes_{0};
     std::mutex error_mutex_;
-    std::string last_write_error_;
+    std::string last_write_error_, last_corrupt_;
+    mutable std::mutex miss_mutex_;
+    std::set<Index> misses_;  // offline_fill
     // Last member: destroyed first, so queued writes finish while everything they use still exists.
     std::unique_ptr<WriteBehind> writes_;
 };

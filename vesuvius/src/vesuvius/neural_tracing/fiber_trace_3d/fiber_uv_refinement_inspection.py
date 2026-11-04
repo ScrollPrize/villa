@@ -67,7 +67,7 @@ def run(config):
         cb=refine.evaluate_points(after,owner,arcs,signed)
         curves.append((ca,cb))
         motion=np.linalg.norm(cb-ca,axis=1)
-        rows.append(dict(piece=int(original),source=int(after['source_id'][k]),family='H' if after['family'][k]==0 else 'V',
+        rows.append(dict(piece=int(original),source=str(after['source_id'][k]),family='H' if after['family'][k]==0 else 'V',
                          maximum_movement=float(motion.max()),median_node_movement=float(np.median(motion))))
     with (root/'piece_movements.csv').open('w') as f:
         w=csv.DictWriter(f,fieldnames=list(rows[0]));w.writeheader();w.writerows(sorted(rows,key=lambda r:-r['maximum_movement']))

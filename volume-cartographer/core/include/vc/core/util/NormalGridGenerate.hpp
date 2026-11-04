@@ -6,14 +6,16 @@
 #include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <exception>
+#include <mutex>
 #include <span>
 #include <stdexcept>
 #include <vector>
 
 #include <omp.h>
 #include <opencv2/core/mat.hpp>
-#include <vc/core/types/Array3D.hpp>
-#include <vc/core/types/Volume.hpp>
+#include <vc_reader/zarr.hpp>
+#include <vc_reader/array.hpp>
 
 namespace vc::core::util {
 
@@ -180,7 +182,8 @@ inline void distributeChunk(
     int rowOffset, int colOffset,
     std::span<const int> sliceForLocal,             // size = sourceSliceAxisLen, -1 for none
     std::span<BinarySliceTarget> targets,
-    std::span<std::atomic<uint8_t>> anyFlags)
+    std::span<std::atomic<uint8_t>> anyFlags,
+    uint8_t threshold)
 {
     const int H = chunkShape[1];
     const int W = chunkShape[2];
@@ -202,10 +205,10 @@ inline void distributeChunk(
                 }
                 const int slot = sliceForLocal[local];
                 if (slot < 0) continue;
-                const uint8_t v = row[lx];
+                const bool on = row[lx] >= threshold;
                 targets[slot].binarySlice->ptr<uint8_t>(dr)[dc] =
-                    v ? static_cast<uint8_t>(255) : static_cast<uint8_t>(0);
-                if (v) {
+                    on ? static_cast<uint8_t>(255) : static_cast<uint8_t>(0);
+                if (on) {
                     anyFlags[slot].store(1, std::memory_order_relaxed);
                 }
             }
@@ -216,11 +219,12 @@ inline void distributeChunk(
 }  // namespace detail
 
 // Walk the chunk grid of one chunk-aligned slab along the slice axis,
-// decode each chunk via volume.readChunk (uncached; nullopt = missing or
-// AllFill), and distribute voxels into the caller-provided binary slice
+// decode each chunk through the native reader (absent chunks are background), and distribute voxels into the caller-provided binary slice
 // batch. Each target's cv::Mat is pre-allocated zero CV_8U at the slice
 // extent given by normalGridSliceSize(volumeShape, direction); the helper
-// writes 255 where voxel != 0, 0 otherwise, and toggles anyNonZero.
+// writes 255 where voxel >= threshold, 0 otherwise, and toggles anyNonZero.
+// The default threshold 1 keeps "any non-zero voxel is surface"; pass a
+// higher value to binarize an 8-bit probability map (e.g. 51 for p >= 0.2).
 //
 // `ioThreads` overrides the OMP team size for the chunk-read loop. Pass 0
 // to keep the OMP default (omp_get_max_threads()). Useful as an IO-bound
@@ -228,28 +232,32 @@ inline void distributeChunk(
 // keep more concurrent reads in flight without starving compute on the
 // critical path.
 //
-// Sequential implementation; no global slab buffer.
-inline void fillBinarySliceBatchFromVolume(
-    Volume& volume,
-    int level,
+// Parallel chunk assembly; no global slab buffer.
+inline void fillBinarySliceBatchFromArray(
+    vcr::zarr::OpenedArray& source,
     NormalGridSliceDirection direction,
     int sliceAxisChunkIndex,
     const std::array<int, 3>& volumeShape,
     const std::array<int, 3>& sourceChunkShape,
     std::span<BinarySliceTarget> targets,
-    int ioThreads = 0)
+    int ioThreads = 0,
+    uint8_t threshold = 1)
 {
     if (targets.empty()) {
         return;
     }
-    if (volume.dtype() != vc::render::ChunkDtype::UInt8) {
+    if (threshold == 0) {
         throw std::runtime_error(
-            "fillBinarySliceBatchFromVolume currently supports uint8 volumes only");
+            "fillBinarySliceBatchFromVolume: threshold must be >= 1");
     }
-    if (volume.fillValue() != 0.0) {
+    if (source.meta.dtype != "|u1") {
+        throw std::runtime_error(
+            "fillBinarySliceBatchFromArray currently supports uint8 volumes only");
+    }
+    if (source.meta.fill != std::vector<std::uint8_t>{0}) {
         throw std::runtime_error(
             "input volume has non-zero zarr fill_value (" +
-            std::to_string(volume.fillValue()) +
+            source.meta.raw.value("fill_value", vcr::zarr::Json{}).dump() +
             "); vc_gen_normalgrids requires fill_value=0 so that missing or "
             "all-fill chunks can be treated as background. Re-export the "
             "volume with fill_value=0 and retry.");
@@ -281,7 +289,7 @@ inline void fillBinarySliceBatchFromVolume(
         const int local = targets[i].localSliceIndex;
         if (local < 0 || local >= sourceSliceAxisLen) {
             throw std::runtime_error(
-                "fillBinarySliceBatchFromVolume: localSliceIndex out of range");
+                "fillBinarySliceBatchFromArray: localSliceIndex out of range");
         }
         sliceForLocal[static_cast<size_t>(local)] = static_cast<int>(i);
     }
@@ -301,12 +309,11 @@ inline void fillBinarySliceBatchFromVolume(
         f.store(0, std::memory_order_relaxed);
     }
 
-    const size_t chunkBytes = volume.chunkByteSize(level);
+    const size_t chunkBytes = source.meta.chunkBytes();
 
-    // Per-thread reusable decode scratch: each thread owns one chunk-sized
-    // buffer for the lifetime of the parallel region, so blosc decompress
-    // writes into a hot, already-resident allocation instead of mmap/munmap-ing
-    // a fresh page-aligned vector for every chunk.
+    // Each worker owns its output scratch; the native reader owns decoding.
+    std::exception_ptr failure;
+    std::mutex failureMutex;
     const int teamSize = ioThreads > 0 ? ioThreads : omp_get_max_threads();
     #pragma omp parallel num_threads(teamSize)
     {
@@ -320,8 +327,16 @@ inline void fillBinarySliceBatchFromVolume(
                 chunkKey[static_cast<size_t>(axisA)] = static_cast<size_t>(ca);
                 chunkKey[static_cast<size_t>(axisB)] = static_cast<size_t>(cb);
 
-                if (!volume.readChunkInto(level, chunkKey, scratch)) {
-                    continue;  // missing or AllFill
+                try {
+                    if (!source.array->read_chunk(
+                            vcr::Index(chunkKey.begin(), chunkKey.end()),
+                            reinterpret_cast<std::uint8_t*>(scratch.data()), scratch.size())) {
+                        continue;
+                    }
+                } catch (...) {
+                    std::lock_guard lock(failureMutex);
+                    if (!failure) failure = std::current_exception();
+                    continue;
                 }
 
                 const int rowOffset = ca * chunkSizeA;
@@ -340,7 +355,7 @@ inline void fillBinarySliceBatchFromVolume(
                         scratch.data(), sourceChunkShape, validD, validH, validW,
                         rowOffset, colOffset,
                         std::span<const int>(sliceForLocal), targets,
-                        std::span<std::atomic<uint8_t>>(anyFlags));
+                        std::span<std::atomic<uint8_t>>(anyFlags), threshold);
                     break;
                 case NormalGridSliceDirection::XZ:
                     validD = std::min(D, std::max(0, volZ - rowOffset));
@@ -350,7 +365,7 @@ inline void fillBinarySliceBatchFromVolume(
                         scratch.data(), sourceChunkShape, validD, validH, validW,
                         rowOffset, colOffset,
                         std::span<const int>(sliceForLocal), targets,
-                        std::span<std::atomic<uint8_t>>(anyFlags));
+                        std::span<std::atomic<uint8_t>>(anyFlags), threshold);
                     break;
                 case NormalGridSliceDirection::YZ:
                     validD = std::min(D, std::max(0, volZ - rowOffset));
@@ -360,12 +375,14 @@ inline void fillBinarySliceBatchFromVolume(
                         scratch.data(), sourceChunkShape, validD, validH, validW,
                         rowOffset, colOffset,
                         std::span<const int>(sliceForLocal), targets,
-                        std::span<std::atomic<uint8_t>>(anyFlags));
+                        std::span<std::atomic<uint8_t>>(anyFlags), threshold);
                     break;
                 }
             }
         }
     }
+
+    if (failure) std::rethrow_exception(failure);
 
     for (size_t i = 0; i < targets.size(); ++i) {
         if (anyFlags[i].load(std::memory_order_relaxed) != 0) {

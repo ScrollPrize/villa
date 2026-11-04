@@ -1,14 +1,14 @@
-"""Predict the sheet an AFV fiber lies on along the fiber and write it as a tifxyz strip.
+"""Predict the sheet a fiber-store fiber lies on along the fiber and write it as a tifxyz strip.
 
-    python -m vesuvius.neural_tracing.tracers.fibers.sheet_strip.infer --afv FIBERS.afv --fiber 469373 --out OUT \\
+    python -m vesuvius.neural_tracing.tracers.fibers.sheet_strip.infer --fibers FIBERS.vcobj --fiber UUID --out OUT \\
         [--checkpoint scrollprize/fiber_strip_small_v1] [--index INDEX_DIR] [--arc START END] [--step 8] [--blend 16] \\
         [--trim 75]
 
 ``--checkpoint``: a sheet-strip checkpoint file, or a Hugging Face model repo ``ORG/NAME[@REVISION]`` holding it
 (``fibers/tracing/runtime.py``: downloaded into the Hugging Face cache, with the frame model next to it); default
 ``DEFAULT_CHECKPOINT``. A checkpoint records its CT (read again here; ``--ct``, ``--cache-dir`` and the other volume
-options of runtime.py override it), its frame model, and its run's AFV fibers, umbilicus and sheet-strip index; a
-recorded file that is not on this machine must be given (``--afv``), is looked for next to the checkpoint (the
+options of runtime.py override it), its frame model, and its run's fiber store, umbilicus and sheet-strip index; a
+recorded file that is not on this machine must be given (``--fibers``), is looked for next to the checkpoint (the
 umbilicus, ``umbilicus.json``) or is skipped (the index: no scoring).
 
 Decisions are made every ``--step`` trace voxels along the fiber, each built as in training (data/samples.
@@ -37,7 +37,6 @@ intact: summary.json records coverage counts and omits unavailable error statist
 from __future__ import annotations
 
 import argparse
-from concurrent.futures import ThreadPoolExecutor
 import json
 import math
 from pathlib import Path
@@ -45,9 +44,9 @@ import time
 
 import numpy as np
 import torch
+from vc_reader.reader import open_zarr
 
-from vesuvius.neural_tracing.tracers.fibers.data.observations import (
-    IdentityObservationBuilder, IdentitySampling, image_crop)
+from vesuvius.neural_tracing.tracers.fibers.data.observations import IdentityObservationBuilder, IdentitySampling
 from vesuvius.neural_tracing.tracers.fibers.data.samples import STARTUP_CATEGORIES, SampleConfig, decision_on_path
 from vesuvius.neural_tracing.tracers.fibers.frames.ct import oriented_seed_heading
 from vesuvius.neural_tracing.tracers.fibers.frames.learned import prediction_window
@@ -58,8 +57,8 @@ from vesuvius.neural_tracing.tracers.fibers.sheet_strip.targets import strip_tar
 from vesuvius.neural_tracing.tracers.fibers.sheet_strip.train import load_strip_model, with_tube
 from vesuvius.neural_tracing.tracers.fibers.tracing.runtime import (
     add_volume_arguments, configure_volume, resolve_checkpoint)
-from vesuvius.neural_tracing.tracers.shared.annotations.afv import AFVFibers
-from vesuvius.neural_tracing.tracers.shared.crop_sampling.volume import CTVolume, CTVolumeSpec
+from vesuvius.neural_tracing.tracers.shared.annotations.fiber_store import FiberStore, fiber_volume
+from vesuvius.neural_tracing.tracers.shared.crop_sampling.volume import CTVolumeSpec
 from vesuvius.neural_tracing.tracers.shared.geometry import interp_at
 from vesuvius.neural_tracing.tracers.shared.hub import checkpoint_source, hf_repo, hub_folder
 from vesuvius.neural_tracing.tracers.shared.paths import recorded_path
@@ -139,7 +138,7 @@ def skip_remote_seed_heading(item, reach):
 
 
 
-def reuse_seed_heading(item, vol, cache):
+def reuse_seed_heading(item, ct, spec, cache):
     """Resolve a decision's CT seed heading as data/targets.resolve_trace_seed does, computing it once per seed:
     every decision of a fiber has the same seed, family and seed tangent, so ``cache`` (one per fiber) holds it.
     Decisions starting at the seed (a pending crop heading) are left to resolve_trace_seed."""
@@ -150,7 +149,7 @@ def reuse_seed_heading(item, vol, cache):
     seed, tangent = (np.asarray(item[k], np.float64) for k in ('seed_pos', 'seed_tangent'))
     key = (family, seed.tobytes(), tangent.tobytes())
     if key not in cache:
-        cache[key] = oriented_seed_heading(vol, item['seed_pos'], family, item['seed_tangent'])
+        cache[key] = oriented_seed_heading(ct, spec, item['seed_pos'], family, item['seed_tangent'])
     item['fiber_family'] = family
     item['seed_tangent'] = cache[key].copy()
 
@@ -158,8 +157,7 @@ class StripPredictor:
     """A sheet-strip checkpoint and what its decisions need (frame model and crop builder, CT volume, umbilicus),
     loaded once; ``predict`` runs one fiber's decisions."""
 
-    def __init__(self, checkpoint=DEFAULT_CHECKPOINT, device='cuda', umbilicus=None, batch=16, crop_threads=1,
-                 volume=None):
+    def __init__(self, checkpoint=DEFAULT_CHECKPOINT, device='cuda', umbilicus=None, batch=16, volume=None):
         """``checkpoint``: a file or a Hugging Face repo (module notes); ``volume``: parsed CT and frame-model options
         (runtime.add_volume_arguments; None: the checkpoint's). ``source`` is what outputs record as the checkpoint."""
         path = resolve_checkpoint(checkpoint)
@@ -174,15 +172,11 @@ class StripPredictor:
         self.sample_cfg = SampleConfig(**dict(self.ck['sample_cfg'], crop=self.cfg.fine,
                                               prediction_window=prediction_window(self.cfg)))
         self.builder = IdentityObservationBuilder(self.cfg, None, IdentitySampling(), augment=False)
-        if crop_threads > 1:
-            # A batch's crops are read and sampled on a thread pool (shared/crop_sampling/crops.scalar_crops: the same
-            # values; the sampler releases the GIL).
-            pool = ThreadPoolExecutor(crop_threads)
-            self.builder.crop_images = lambda items, vol, crop, _=None: image_crop(items, vol, crop, pool)
         self.umbilicus = None
         if self.cfg.strip_orientation:
             self.umbilicus = load_umbilicus(umbilicus or find_umbilicus(checkpoint, path, self.data.get('umbilicus')))
-        self.vol = CTVolume(self.spec)
+        self.ct = open_zarr(self.spec.ct_zarr, level=self.spec.ct_level, cache_dir=self.spec.cache_dir,
+                            memory_cache=3 << 30)
         self.rng = np.random.default_rng(0)
         c = self.cfg.fine  # the crop's farthest point from its head, plus a sample
         self.crop_reach = math.sqrt((max(c.behind, c.depth-c.behind)*c.spacing)**2+2*((c.width-1)/2*c.spacing)**2)+c.spacing
@@ -200,8 +194,8 @@ class StripPredictor:
                      for t in arcs[start:start+self.batch]]
             for item in items:
                 skip_remote_seed_heading(item, self.crop_reach)
-                reuse_seed_heading(item, self.vol, seed_headings)
-            batch = self.builder(items, self.vol)  # orients each crop with the frame model, then crops the CT
+                reuse_seed_heading(item, self.ct, self.spec, seed_headings)
+            batch = self.builder(items, self.ct, self.spec)  # orients each crop with the frame model, then crops the CT
             tube = np.zeros((len(items), 2048, 3), np.float32)
             valid = np.zeros((len(items), 2048), bool)
             for row, item in enumerate(items):
@@ -264,7 +258,7 @@ def stitch_values(values, arcs, f, blend, weights=None):
 class Scorer:
     """Patch-sheet targets of decisions on a fiber of a sheet-strip index (StripBuilder.windows, strip_targets)."""
 
-    def __init__(self, index_dir, afv, catalog_index, cfg, spec, data):
+    def __init__(self, index_dir, fibers, catalog_index, cfg, spec, data):
         self.unit = None
         for split in ('validation', 'train', 'unused'):
             index = StripIndex(index_dir, split)
@@ -275,7 +269,7 @@ class Scorer:
         if self.unit is None:
             return
         trace_per_patch = spec.ct_grid_scale/spec.grid_scale
-        self.builder = StripBuilder(cfg, RunFibers(afv, index, spec.grid_scale), IdentitySampling(), augment=False,
+        self.builder = StripBuilder(cfg, RunFibers(fibers, index, spec.grid_scale), IdentitySampling(), augment=False,
                                     trace_per_patch=trace_per_patch, max_patches=data.get('max_patches', 4))
         self.options = dict(fold_tolerance=data.get('fold_tolerance', 2.), max_slope_deg=data.get('max_slope_deg', 70.),
                             max_height=(cfg.fine.width-1)*cfg.fine.spacing/2)
@@ -307,17 +301,16 @@ def stitch(heights, frames, positions, arcs, f, v, blend, weights=None):
     return mean, total, spread
 
 
-def render_strip(vol, rows, keep, row_step, column_step):
-    """CT (nearest) on a strip of patch-voxel rows (R, C, 3), its grid bilinearly refined to one voxel; NaN off it."""
-    from scipy.ndimage import map_coordinates
-    r = np.arange(0, len(rows)-1+1e-9, 1./row_step)
-    c = np.arange(0, rows.shape[1]-1+1e-9, 1./column_step)
-    grid = np.meshgrid(r, c, indexing='ij')
-    points = np.stack([map_coordinates(rows[..., i], grid, order=1) for i in range(3)], -1)
-    inside = map_coordinates(keep.astype(np.float32), grid, order=1) > .999
+def render_strip(ct, spec, rows, keep, row_step, column_step):
+    """CT (nearest) on a strip of patch-voxel rows (R, C, 3), its grid bicubically refined to one voxel; NaN off it."""
+    from vc_reader import tifxyz
+    r = np.arange(0, len(rows)-1+1e-9, 1./row_step, dtype=np.float32)
+    c = np.arange(0, rows.shape[1]-1+1e-9, 1./column_step, dtype=np.float32)
+    rr, cc = np.meshgrid(r, c, indexing='ij')
+    points, inside = tifxyz.Surface(np.asarray(rows, np.float32), mask=keep).points_at(rr, cc)
     image = np.full(points.shape[:2], np.nan, np.float32)
-    zyx = points[inside][:, ::-1]*(vol.spec.ct_grid_scale/vol.spec.grid_scale)*vol.input_scale  # -> trace -> CT
-    image[inside] = vol.ct.sample_nearest(zyx)
+    zyx = points[inside][:, ::-1]*(spec.ct_grid_scale/spec.grid_scale)*spec.input_scale  # -> trace -> CT
+    image[inside] = ct.sample(zyx, order=0)
     return image
 
 
@@ -367,15 +360,15 @@ def save_render(path, image, origin, title, error=None, length=1200):
     plt.close(fig)
 
 
-def render_saved(out, vol):
+def render_saved(out, ct, spec):
     """``render.png`` of an inference output folder: CT on its strip and the decisions' errors along it."""
-    import tifffile
+    from vc_reader import tifxyz
     out = Path(out)
     summary = json.loads((out/'summary.json').read_text())
     saved = np.load(out/'strip.npz')
-    rows = np.stack([tifffile.imread(out/'strip'/f'{axis}.tif') for axis in 'xyz'], -1).astype(np.float64)
+    rows = tifxyz.read(out/'strip').xyz.astype(np.float64)
     keep = np.all(rows != -1, -1)
-    image = render_strip(vol, rows, keep, summary['row_step_voxels'], summary['column_step_voxels'])
+    image = render_strip(ct, spec, rows, keep, summary['row_step_voxels'], summary['column_step_voxels'])
     filled = np.flatnonzero(np.isfinite(image).any(1))
     image = image[filled[0]:filled[-1]+1]
     origin = summary['first_row_arc_patch_voxels']+filled[0]
@@ -397,9 +390,9 @@ def render_saved(out, vol):
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     add_checkpoint_arguments(ap)
-    ap.add_argument('--fiber', type=int, required=True, help='AFV fiber id')
+    ap.add_argument('--fiber', required=True, help='fiber UUID')
     ap.add_argument('--out', required=True, type=Path)
-    ap.add_argument('--afv', help="AFV fibers (default: the checkpoint run's, when on this machine)")
+    ap.add_argument('--fibers', help="fiber store (default: the checkpoint run's, when on this machine)")
     ap.add_argument('--index', help="sheet-strip index for scoring (default: the checkpoint run's, when on this "
                                     "machine; 'none': skip)")
     ap.add_argument('--arc', type=float, nargs=2, help='fiber arclength range, patch voxels (default: all of it)')
@@ -417,7 +410,7 @@ def main(argv=None):
         path = resolve_checkpoint(args.checkpoint)
         spec = CTVolumeSpec.from_dict(torch.load(path, map_location='cpu', weights_only=False)['vol_spec'])
         configure_volume(args, spec, argparse.Namespace(), path)  # the CT options; no frame model needed
-        render_saved(args.out, CTVolume(spec))
+        render_saved(args.out, open_zarr(spec.ct_zarr, level=spec.ct_level, cache_dir=spec.cache_dir), spec)
         return
     try:
         predictor = StripPredictor(args.checkpoint, args.device, args.umbilicus, args.batch, volume=args)
@@ -425,14 +418,14 @@ def main(argv=None):
         raise SystemExit(str(error))
     cfg, ck, data, spec = predictor.cfg, predictor.ck, predictor.data, predictor.spec
     trace_per_patch, f, v = predictor.trace_per_patch, predictor.f, predictor.v
-    afv_path = args.afv or recorded_file(data.get('afv'))
-    if not afv_path:
-        raise SystemExit(f"Pass --afv: the checkpoint's AFV fibers {data.get('afv')} are not on this machine")
-    afv = AFVFibers(afv_path, spec.grid_scale, split='all')
-    if args.fiber not in afv.id_to_index:
-        raise SystemExit(f'Fiber {args.fiber} is not in {afv_path}')
-    catalog_index = afv.id_to_index[args.fiber]
-    fiber = afv[catalog_index]
+    fibers_path = args.fibers or recorded_file(data.get('fibers'))
+    if not fibers_path:
+        raise SystemExit(f"Pass --fibers: the checkpoint's fiber store {data.get('fibers')} is not on this machine")
+    fibers = FiberStore(fibers_path, fiber_volume(fibers_path), spec.grid_scale, split='all')
+    if args.fiber not in fibers.id_to_index:
+        raise SystemExit(f'Fiber {args.fiber} is not in {fibers_path}')
+    catalog_index = fibers.id_to_index[args.fiber]
+    fiber = fibers[catalog_index]
     df = f[1]-f[0]
     if abs(args.step/df-round(args.step/df)) > 1e-6 or args.step <= 0:
         raise SystemExit(f'--step must be a positive multiple of the strip row spacing {df:g}')
@@ -442,9 +435,8 @@ def main(argv=None):
         raise SystemExit('The arclength range holds no decision')
     arcs = np.arange(lo, hi+1e-9, args.step)
     index_dir = None if args.index == 'none' else (args.index or recorded_file(data.get('index')))
-    scorer = Scorer(index_dir, afv_path, catalog_index, cfg, spec, data) if index_dir else None
+    scorer = Scorer(index_dir, fibers_path, catalog_index, cfg, spec, data) if index_dir else None
     scorer = scorer if scorer is not None and scorer.unit is not None else None
-    vol = predictor.vol
     targets, masks = [], []
 
     def score(items):
@@ -463,7 +455,7 @@ def main(argv=None):
         raise SystemExit('No strip nodes remain after trimming; reduce --trim or choose a different --arc or fiber')
     row_step, column_step = df/trace_per_patch, (v[1]-v[0])/trace_per_patch
     args.out.mkdir(parents=True, exist_ok=True)
-    provenance = dict(checkpoint=predictor.source, step=ck.get('step'), afv=str(afv_path),
+    provenance = dict(checkpoint=predictor.source, step=ck.get('step'), fibers=str(fibers_path),
                       fiber=args.fiber, arc_trace=[float(arcs[0]), float(arcs[-1])], decision_step=args.step,
                       blend=args.blend, trim_patch_voxels=args.trim, units='patch voxels',
                       trace_per_patch=trace_per_patch,
@@ -519,7 +511,7 @@ def main(argv=None):
     (args.out/'summary.json').write_text(json.dumps(summary, indent=1))
     print(json.dumps(summary, indent=1), flush=True)
     if not args.no_render:
-        render_saved(args.out, vol)
+        render_saved(args.out, predictor.ct, spec)
 
 
 if __name__ == '__main__':

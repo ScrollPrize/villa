@@ -21,12 +21,12 @@ def test_rebuild_real_gt_events_and_reuse(tmp_path, monkeypatch):
     output.mkdir()
     # Keep expensive native evidence frozen; exercise the actual Python event
     # construction and its three native dispatches using those recorded outputs.
-    (output / 'combined.afv').symlink_to(cache / 'combined.afv')
+    (output / 'combined.vcobj').symlink_to(cache / 'combined.vcobj')
     calls = []
     def recorded_native(path, settings):
         cfg = json.loads(Path(path).read_text())
         calls.append(cfg)
-        assert cfg['afv'] == str(output / 'combined.afv') or cfg.get('normal_curves_output')
+        assert cfg['fibers'] == str(output / 'combined.vcobj') or cfg.get('normal_curves_output')
         if cfg.get('normal_curves_output'):
             assert cfg['orient_database'] == json.loads((gt / 'uv_whole/config.json').read_text())['database']
             Path(cfg['normal_curves_output']).symlink_to(cache / 'frozen_gt_normals', target_is_directory=True)
@@ -82,7 +82,7 @@ def test_build_real_gt_cache_from_scratch_and_score(tmp_path):
     if not gt_path or not binary:
         pytest.skip('set FIBER_GT_ROOT and VC_CONSTRAINT_TEST_BINARY for fresh native extraction')
     gt = Path(gt_path)
-    # Copy configuration only. All source AFVs, solves and databases stay read-only.
+    # Copy configuration only. All source fiber stores, solves and databases stay read-only.
     local_gt = tmp_path / 'gt-π-纤维'
     (local_gt / 'uv_whole').mkdir(parents=True)
     config = json.loads((gt / 'uv_whole/config.json').read_text())
@@ -127,7 +127,7 @@ def test_build_real_gt_cache_from_scratch_and_score(tmp_path):
                     native_binary=binary, events_only=True, threads=2)
     result = score.run(settings)
     assert result['events']
-    assert (root / 'combined.afv').exists() and (root / 'orient.sqlite').exists()
+    assert (root / 'combined.vcobj').exists() and (root / 'orient.sqlite').exists()
     assert (root / 'frozen_gt_normals/index.json').exists()
     spec = dict(root=str(root), gt_root=str(local_gt), events='cross_events.json')
     rebuilt = score.FrozenGTScorer(spec, config)

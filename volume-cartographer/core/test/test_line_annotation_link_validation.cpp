@@ -1,6 +1,6 @@
 // Load-time fiber link validation (LineAnnotationFiberLinkValidation.hpp):
 // the issue collector VC3D's "Broken branch links" prompt lists, and the
-// fixed-point neutralizer that replaces the strict loader's fiber removal.
+// strict validator. Validation never repairs or drops persisted entries.
 // The regression pinned here is the 2026-09-30 PHerc0139 cascade: one stale
 // direction on one entry must cost exactly one link pair, never a fiber.
 
@@ -13,7 +13,6 @@
 
 #include <opencv2/core/types.hpp>
 
-#include "LineAnnotationAdjacentLinks.hpp"
 #include "LineAnnotationFiberLinkValidation.hpp"
 #include "LineAnnotationFiberLinks.hpp"
 #include "LineAnnotationGeneratedViews.hpp"
@@ -26,7 +25,6 @@ using vc3d::line_annotation::StoredFiber;
 
 namespace {
 
-const std::filesystem::path kSource{"/proj/fibers"};
 
 // A fiber whose line is a polyline with a visible kink at every control
 // point (so a stale direction is detectable), control points every 4 line
@@ -34,8 +32,9 @@ const std::filesystem::path kSource{"/proj/fibers"};
 StoredFiber makeFiber(const std::string& name, double xOffset, double yOffset)
 {
     StoredFiber fiber;
+    static uint64_t nextId = 1;
+    fiber.id = nextId++;
     fiber.fileName = name;
-    fiber.sourceRoot = kSource;
     for (int i = 0; i < 17; ++i) {
         const double t = static_cast<double>(i);
         // Alternating slope every 4 points: a kink at every control point.
@@ -57,6 +56,7 @@ void link(StoredFiber& a, int ia, StoredFiber& b, int ib, bool adjacent = false)
     ab.controlPointIndex = ia;
     ab.branchControlPointIndex = ib;
     ab.branchFileName = b.fileName;
+    ab.branchFiberId = b.id;
     ab.controlPointPosition = a.controlPoints[static_cast<std::size_t>(ia)];
     ab.branchControlPointPosition = b.controlPoints[static_cast<std::size_t>(ib)];
     ab.controlPointDirection = endpointTangentFromLinePoints(a.linePoints, ab.controlPointPosition);
@@ -67,6 +67,7 @@ void link(StoredFiber& a, int ia, StoredFiber& b, int ib, bool adjacent = false)
     ba.controlPointIndex = ib;
     ba.branchControlPointIndex = ia;
     ba.branchFileName = a.fileName;
+    ba.branchFiberId = a.id;
     ba.controlPointPosition = ab.branchControlPointPosition;
     ba.branchControlPointPosition = ab.controlPointPosition;
     ba.controlPointDirection = ab.branchControlPointDirection;
@@ -74,11 +75,6 @@ void link(StoredFiber& a, int ia, StoredFiber& b, int ib, bool adjacent = false)
     ba.adjacent = adjacent;
     a.branches.push_back(ab);
     b.branches.push_back(ba);
-}
-
-std::string sourceKey(const StoredFiber& fiber, const std::string& fileName)
-{
-    return (fiber.sourceRoot / fileName).lexically_normal().string();
 }
 
 bool reciprocal(const StoredFiber& fiber, const FiberBranchRef& branch,
@@ -97,9 +93,7 @@ bool reciprocal(const StoredFiber& fiber, const FiberBranchRef& branch,
 std::vector<BranchLinkValidationIssue> collect(const std::vector<StoredFiber>& fibers)
 {
     return vc3d::line_annotation::collectFiberBranchIssues(
-        fibers, sourceKey,
-        [](const StoredFiber& fiber, const std::string& name) { return sourceKey(fiber, name); },
-        reciprocal);
+        fibers, reciprocal);
 }
 
 std::size_t totalEntries(const std::vector<StoredFiber>& fibers)
@@ -135,7 +129,7 @@ TEST_CASE("link validation: a consistent network reports nothing")
     CHECK(totalEntries(fibers) == 14);
 }
 
-TEST_CASE("link validation: one stale direction costs one link pair, never a fiber")
+TEST_CASE("link validation: one stale direction reports both inconsistent entries")
 {
     auto fibers = makeNetwork();
     // The incident shape: b's entry to c carries a direction from a
@@ -155,32 +149,20 @@ TEST_CASE("link validation: one stale direction costs one link pair, never a fib
     CHECK(issues[1].branchIndex == 0);
     CHECK(issues[1].reason == "missing reciprocal branch");
 
-    const auto result = vc3d::line_annotation::neutralizeFiberBranchIssues(fibers, issues, collect);
-    CHECK(fibers.size() == 7);
-    CHECK(result.removedEntries == 2);
-    CHECK(result.changedFibers == std::vector<std::size_t>{1, 2});
-    CHECK(totalEntries(fibers) == 12);
-    CHECK(collect(fibers).empty());
-    // Every other pair survived, the adjacent one included.
-    CHECK(fibers[3].branches.size() == 3);
-    CHECK(fibers[6].branches.size() == 1);
-    CHECK(fibers[6].branches[0].adjacent);
+
 }
 
-TEST_CASE("link validation: a missing target drops only the dangling entry")
+TEST_CASE("link validation: a missing target is reported")
 {
     auto fibers = makeNetwork();
     fibers.erase(fibers.begin() + 4);  // e.json is gone from disk
     const auto issues = collect(fibers);
     REQUIRE(issues.size() == 1);
     CHECK(issues[0].reason == "missing linked fiber");
-    const auto result = vc3d::line_annotation::neutralizeFiberBranchIssues(fibers, issues, collect);
-    CHECK(fibers.size() == 6);
-    CHECK(result.removedEntries == 1);
-    CHECK(collect(fibers).empty());
+
 }
 
-TEST_CASE("link validation: a one-way link is dropped on the surviving side too")
+TEST_CASE("link validation: a one-way link is reported")
 {
     auto fibers = makeNetwork();
     // d lost its entry back to c (what a one-sided repair on another machine
@@ -188,11 +170,7 @@ TEST_CASE("link validation: a one-way link is dropped on the surviving side too"
     auto& d = fibers[3];
     d.branches.erase(d.branches.begin());
     REQUIRE(collect(fibers).size() == 1);
-    const auto result = vc3d::line_annotation::neutralizeFiberBranchIssues(fibers, collect(fibers), collect);
-    CHECK(result.removedEntries == 1);
-    CHECK(fibers.size() == 7);
-    CHECK(collect(fibers).empty());
-    CHECK(totalEntries(fibers) == 12);
+
 }
 
 TEST_CASE("link validation: reversed line orientation is what breaks a copied direction")
@@ -208,6 +186,15 @@ TEST_CASE("link validation: reversed line orientation is what breaks a copied di
     CHECK_FALSE(vc3d::line_annotation::branchDirectionsCompatible(forward, onReversed));
 }
 
+TEST_CASE("link validation: labels are independent of object identity")
+{
+    auto fibers = makeNetwork();
+    for (auto& fiber : fibers) {
+        fiber.fileName = "duplicate.json";
+        for (auto& branch : fiber.branches) branch.branchFileName.clear();
+    }
+    CHECK(collect(fibers).empty());
+}
 
 // --- the automatic-link mark (FiberBranchRef::autoLink, JSON "auto") ---
 
@@ -302,44 +289,6 @@ TEST_CASE("auto link: ref builders assemble a reciprocal pair under the invarian
     // The invariant: no mark on an adjacent or on an approved link.
     CHECK_FALSE(makeBranchRef(3, pa, da, 7, "b.json", 5, pb, db, true, true, true).autoLink);
     CHECK_FALSE(makeBranchRef(3, pa, da, 7, "b.json", 5, pb, db, false, false, true).autoLink);
-}
-
-TEST_CASE("auto link: the JSON review-state keys round trip under the invariant")
-{
-    using vc3d::line_annotation::readBranchReviewStateJson;
-    using vc3d::line_annotation::writeBranchReviewStateJson;
-    FiberBranchRef ref;
-    ref.pending = true;
-    ref.autoLink = true;
-    nlohmann::json entry;
-    writeBranchReviewStateJson(entry, ref);
-    CHECK(entry.value("pending", false));
-    CHECK(entry.value("auto", false));
-    const auto state = readBranchReviewStateJson(entry, /*adjacent=*/false);
-    CHECK(state.pending);
-    CHECK(state.autoLink);
-    // Read on the adjacent array: the mark is dropped.
-    CHECK_FALSE(readBranchReviewStateJson(entry, /*adjacent=*/true).autoLink);
-    // "auto" without "pending" is dropped.
-    nlohmann::json stale = {{"auto", true}};
-    const auto staleState = readBranchReviewStateJson(stale, false);
-    CHECK_FALSE(staleState.pending);
-    CHECK_FALSE(staleState.autoLink);
-    // Approved: neither key is written.
-    FiberBranchRef approved;
-    nlohmann::json none;
-    writeBranchReviewStateJson(none, approved);
-    CHECK_FALSE(none.contains("pending"));
-    CHECK_FALSE(none.contains("auto"));
-    // Adjacent pending: pending only.
-    FiberBranchRef adjacent;
-    adjacent.pending = true;
-    adjacent.adjacent = true;
-    adjacent.autoLink = true;
-    nlohmann::json adjacentJson;
-    writeBranchReviewStateJson(adjacentJson, adjacent);
-    CHECK(adjacentJson.value("pending", false));
-    CHECK_FALSE(adjacentJson.contains("auto"));
 }
 
 TEST_CASE("auto link: the marker rule is 'every pending link on the point is automatic'")

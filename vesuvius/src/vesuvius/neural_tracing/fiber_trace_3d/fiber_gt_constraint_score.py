@@ -170,9 +170,9 @@ class FrozenGTScorer:
         _,_,keep,self.gpick=uv.hard_assignment(self.gs['state'],len(self.gs['widths']),self.gcfg,best_nonbroken=True)
         if not keep.all():raise ValueError('Trusted GT must remain enabled')
         for e in self.events:
-            if int(self.d['source_id'][e['test_piece']])!=e['test_source']:
+            if str(self.d['source_id'][e['test_piece']])!=e['test_source']:
                 raise ValueError('Cached event piece identity mismatch')
-            if int(self.gd['source_id'][e['gt_piece']])!=e['gt_source']:
+            if str(self.gd['source_id'][e['gt_piece']])!=e['gt_source']:
                 raise ValueError('Cached GT event piece identity mismatch')
         self.hashes={str(p):sha256_file(p) for p in self.paths}
 
@@ -242,7 +242,7 @@ def run(settings):
     from .constraint_extraction import run_native_constraints
     from .fiber_normal_convention import inward_solution
     from .fiber_normal_sign_visualization import load_umbilicus_frame
-    from vesuvius.neural_tracing.tracers.shared.annotations.afv import read_afv_polylines,write_afv
+    from vesuvius.neural_tracing.tracers.shared.annotations.fiber_store import fiber_volume,fibers_digest,read_polylines,write_fibers
     root=Path(settings['output_root']);root.mkdir(parents=True,exist_ok=True)
     configs=[json.loads(Path(p).read_text())['fiber_uv_layout'] for p in settings['configs']]
     cfg=configs[0];gtroot=Path(settings['gt_root'])
@@ -262,26 +262,27 @@ def run(settings):
     signature=dict(version=1,configs={p:sha256_file(p) for p in settings['configs']},
                    tensors=sha256_file(cfg['tensor_cache']),gt_tensors=sha256_file(gcfg['tensor_cache']),
                    gt_solution=sha256_file(gtroot/'uv_whole/solution.npz'),
-                   gt_normal=sha256_file(gcfg['stage1']),afv=sha256_file(cfg['afv']),
-                   gt_afv=sha256_file(gcfg['afv']),umbilicus=sha256_file(cfg['umbilicus']),
+                   gt_normal=sha256_file(gcfg['stage1']),fibers=fibers_digest(cfg['fibers']),
+                   gt_fibers=fibers_digest(gcfg['fibers']),umbilicus=sha256_file(cfg['umbilicus']),
                    extract_template=sha256_file(settings['extract_template']),
                    orient_template=sha256_file(settings['orient_template']))
     manifest=root/'inputs.json'
     if manifest.exists() and json.loads(manifest.read_text())!=signature:raise ValueError('Changed scoring inputs')
     atomic_write(manifest,signature,durable=False)
-    test_curves=read_afv_polylines(cfg['afv'],np.unique(d['source_id']))
-    gt_curves=read_afv_polylines(gcfg['afv'],np.unique(gd['source_id']))
-    records=[];mapping={};curves={}
-    for kind,items in [('test',test_curves),('gt',gt_curves)]:
-        for row,xyz in items:
-            cid=len(records)+1;mapping[cid]=(kind,int(row['id']));curves[cid]=xyz
-            records.append((dict(row,id=cid),xyz))
-    combined=root/'combined.afv'
-    if not combined.exists():write_afv(cfg['afv'],combined,records,dict(source='gt_cross_constraint_score'))
-    atomic_write(root/'fiber_ids.json',{str(k):v for k,v in mapping.items()},durable=False)
+    volume=fiber_volume(cfg['fibers'])
+    if fiber_volume(gcfg['fibers'])!=volume:raise ValueError('Test and GT fibers are bound to different volumes')
+    test_curves=read_polylines(cfg['fibers'],np.unique(d['source_id']),volume=volume)
+    gt_curves=read_polylines(gcfg['fibers'],np.unique(gd['source_id']),volume=volume)
+    # Fibers keep their own UUIDs in the combined store; the kind of each is its membership.
+    kinds={row['id']:'test' for row,_ in test_curves}
+    if any(row['id'] in kinds for row,_ in gt_curves):raise ValueError('Test and GT fibers share UUIDs')
+    kinds.update((row['id'],'gt') for row,_ in gt_curves)
+    curves={row['id']:xyz for row,xyz in test_curves+gt_curves}
+    combined=root/'combined.vcobj'
+    if not combined.exists():write_fibers(combined,test_curves+gt_curves,volume=volume)
     for name,template in [('extract',settings['extract_template']),('orient',settings['orient_template'])]:
         native=json.loads(Path(template).read_text())
-        native.update(afv=str(combined),full_volume=True,threads=settings.get('threads',128),
+        native.update(fibers=str(combined),full_volume=True,threads=settings.get('threads',128),
                       output=str(root/(name+'.json')),database=str(root/(name+'.sqlite')))
         if name=='orient':native['orient_database']=str(root/'extract.sqlite')
         path=root/(name+'_config.json');atomic_write(path,native,durable=False)
@@ -297,15 +298,14 @@ def run(settings):
                       database=str(root/'unused_curve_export.sqlite'),output=str(root/'frozen_gt_normals.json'))
         path=root/'frozen_gt_normals_config.json';atomic_write(path,native,durable=False)
         run_native_constraints(path, settings)
-    with uv._ro(cfg['afv']) as db:metadata={k:json.loads(v) for k,v in db.execute('SELECT key,value FROM metadata')}
-    axis=load_umbilicus_frame(cfg['umbilicus'],metadata['root'])
+    axis=load_umbilicus_frame(cfg['umbilicus'],volume)
     angles={}
     for cid,xyz in curves.items():
         arc,_,angle,_=uv.fiber_geometry(xyz,0,axis)
         angles[cid]=(arc,angle*(1 if cfg['h_convention']=='ccw' else -1))
     gn=inward_solution(arrays(gcfg['stage1']));normal_sign=dict(zip(gn['ids'],gn['normal_sign']))
     from .fiber_curve_bank import CurveBank
-    bank=CurveBank(gcfg['afv'],gd['source_id'],normal_root,gn)
+    bank=CurveBank(gcfg['fibers'],gd['source_id'],normal_root,gn)
     _,_,gkeep,gpick=uv.hard_assignment(gs['state'],len(gs['widths']),gcfg,best_nonbroken=True)
     if not gkeep.all():raise ValueError('GT must retain every fiber')
     events=[];excluded=dict(non_cross=0,outside_test_piece=0,invalid_gt_normal=0,tangent_connector=0)
@@ -313,7 +313,7 @@ def run(settings):
     with sqlite3.connect(root/'orient.sqlite') as db:
         rows=db.execute('SELECT id,fiber_a,fiber_b,arc_a,arc_b,ax,ay,az,bx,by,bz,parallel_score,perpendicular_score,winding_distance,parallel_winding_distance,normal_a,normal_b FROM constraints ORDER BY id')
         for r in rows:
-            ida,idb=int(r[1]),int(r[2]);ka,sa=mapping[ida];kb,sb=mapping[idb]
+            ida,idb=r[1],r[2];ka,sa=kinds[ida],ida;kb,sb=kinds[idb],idb
             if ka==kb:excluded['non_cross']+=1;continue
             if ka=='test':ti,gi,ts,gid,ta,ga,tx,gx,normal=ida,idb,sa,sb,r[3],r[4],r[5:8],r[8:11],r[16]
             else:ti,gi,ts,gid,ta,ga,tx,gx,normal=idb,ida,sb,sa,r[4],r[3],r[8:11],r[5:8],r[15]
@@ -349,7 +349,7 @@ def run(settings):
     for c in configs:
         solution=Path(c['output_root'])/'solution.npz';s=arrays(solution);k=len(s['widths'])
         saved=json.loads((solution.parent/'summary.json').read_text())['config']
-        for key in ('tensor_cache','afv','h_convention','winding_count','bucket_shared_phase',
+        for key in ('tensor_cache','fibers','h_convention','winding_count','bucket_shared_phase',
                     'reference_initialization','reference_width_initialization'):
             if saved.get(key)!=c.get(key):raise ValueError('Saved solve config mismatch: '+key)
         if not np.isfinite(s['state']).all() or not np.isfinite(s['widths']).all():
@@ -369,7 +369,7 @@ def run(settings):
                     additive_global_offset=offset,**stats(np.ones(len(events),bool)),
                     mean_absolute_residual=float(np.abs(required-offset).mean()),
                     enabled=stats(enabled),disabled=stats(~enabled),parallel=stats(parallel),perpendicular=stats(~parallel),
-                    by_gt={str(int(g)):stats(np.asarray([e['gt_source']==g for e in events])) for g in gd['source_id']},
+                    by_gt={str(g):stats(np.asarray([e['gt_source']==g for e in events])) for g in gd['source_id']},
                     excluded=excluded,class_disagreements=sum(not e['class_matches_families'] for e in events),
                     combined_sweep_gauge_corrections=gauge_flips,
                     gt_config_sha256=sha256_file(gtroot/'uv_whole/config.json'),

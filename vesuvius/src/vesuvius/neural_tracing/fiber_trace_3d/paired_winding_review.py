@@ -14,7 +14,7 @@ from .fiber_uv_visualization import render_layout
 
 
 def identity(d):
-    keys=[(int(s),float(a),float(b),int(f)) for s,a,b,f in zip(d['source_id'],d['start'],d['end'],d['family'])]
+    keys=[(str(s),float(a),float(b),int(f)) for s,a,b,f in zip(d['source_id'],d['start'],d['end'],d['family'])]
     if len(set(keys))!=len(keys):raise ValueError('Duplicate fiber-piece identity')
     return {key:i for i,key in enumerate(keys)}
 
@@ -151,7 +151,7 @@ def run(settings):
         atomic_write(out/name/'sign_underlays.json',dict(
             definition='Direct endpoints of internal parallel or perpendicular sign violations; both endpoints >=50% joint confidence; same MAP continuous-order audit as the report.',
             violated_constraints=int(bad.sum()),highlighted_fibers=len(underlays),
-            pieces=sorted(incident),source_ids=[int(d['source_id'][i]) for i in sorted(incident)]),durable=False)
+            pieces=sorted(incident),source_ids=[str(d['source_id'][i]) for i in sorted(incident)]),durable=False)
         context=[[xy[int(ext.v_offset_a[e])].tolist(),xy[int(ext.v_offset_b[e])].tolist()] for e in candidates
                  if e not in active and p[d['i'][e]]>=.5 and p[d['j'][e]]>=.5]
         render_layout(out/name/'predicted.svg',name+' — winding changes',d,saved[n]['state'],saved[n]['widths'],

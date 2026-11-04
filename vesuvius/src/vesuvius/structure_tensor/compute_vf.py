@@ -1,8 +1,6 @@
 #compute_vf.py
 import argparse
 import torch
-import zarr
-from numcodecs import Blosc
 try:
     # When executed as a module: python -m structure_tensor.compute_vf
     from .create_vf import VectorFieldComputer
@@ -73,11 +71,7 @@ def main():
     # parse chunk size
     cz, cy, cx = map(int, args.chunk_size.split(','))
 
-    compressor = Blosc(
-        cname=args.cname,
-        clevel=args.clevel,
-        shuffle=Blosc.SHUFFLE
-    )
+    codec = {"cname": args.cname, "level": args.clevel, "shuffle": 1}
 
     # set up device
     device = torch.device(args.device)
@@ -92,7 +86,7 @@ def main():
     computer.compute_fields_zarr(
         output_zarr=args.output_zarr,
         chunk_size=(cz, cy, cx),
-        compressor=compressor,
+        codec=codec,
         ome_u8=args.ome_u8 or args.ome_only,
         group_name=args.group_name,
         output_downsample=args.downsample,

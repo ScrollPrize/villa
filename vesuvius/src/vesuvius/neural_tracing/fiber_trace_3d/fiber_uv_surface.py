@@ -1,4 +1,4 @@
-"""H-anchored tifxyz surfaces from fixed UV assignments and original AFV curves."""
+"""H-anchored tifxyz surfaces from fixed UV assignments and original fiber curves."""
 import json
 import time
 from pathlib import Path
@@ -7,9 +7,8 @@ import numpy as np
 
 from . import fiber_uv_layout as uv
 from .fiber_normal_convention import inward_solution
-from vesuvius.neural_tracing.tracers.shared.annotations.afv import read_afv_polylines
-from vesuvius.tifxyz.types import Tifxyz
-from vesuvius.tifxyz.writer import write_tifxyz
+from vesuvius.neural_tracing.tracers.shared.annotations.fiber_store import fibers_digest
+from vc_reader import tifxyz
 
 
 def unit(v):
@@ -153,11 +152,11 @@ def construct(d,state,widths,cfg,bank,settings):
 
 def validate_sources(cfg,normal_doc):
     signature=json.loads(Path(cfg['tensor_cache']).with_suffix('.json').read_text())['signature']
-    hashes={key:uv.sha256_file(cfg[key]) for key in ('database','afv','stage1')}
+    hashes={key:(fibers_digest if key=='fibers' else uv.sha256_file)(cfg[key]) for key in ('database','fibers','stage1')}
     for key,value in hashes.items():
         if value!=signature[key]:raise ValueError('Surface source hash mismatch: '+key)
     native=normal_doc['provenance']['config']
-    if Path(native['orient_database']).resolve()!=Path(cfg['database']).resolve() or Path(native['afv']).resolve()!=Path(cfg['afv']).resolve():
+    if Path(native['orient_database']).resolve()!=Path(cfg['database']).resolve() or Path(native['fibers']).resolve()!=Path(cfg['fibers']).resolve():
         raise ValueError('Native normal source mismatch')
     return hashes
 
@@ -182,20 +181,20 @@ def run(settings):
         accepted=p[np.arange(len(p)),pick]>settings.get('joint_threshold',.5)
         del p
         print(f'{item["label"]}: loading {accepted.sum():,} selected piece curves',flush=True)
-        bank=CurveBank(cfg['afv'],d['source_id'][accepted],settings['normal_curves'],normal)
+        bank=CurveBank(cfg['fibers'],d['source_id'][accepted],settings['normal_curves'],normal)
         xyz,valid,stats=construct(d,state,widths,cfg,bank,settings)
         if not valid.any():raise ValueError('No supported surface vertices')
         coordinate_space=settings.get('coordinate_space') or cfg.get('coordinate_space')
         if not coordinate_space:raise ValueError('Supply the source coordinate_space for surface metadata')
         meta=dict(uv_origin=stats['uv_origin'],coordinate_space=coordinate_space,
             provenance=dict(solution=str(run_root/'solution.npz'),solution_sha256=uv.sha256_file(run_root/'solution.npz'),
-                afv_sha256=uv.sha256_file(cfg['afv']),tensor_sha256=uv.sha256_file(cfg['tensor_cache']),
+                fibers_digest=fibers_digest(cfg['fibers']),tensor_sha256=uv.sha256_file(cfg['tensor_cache']),
                 normal_sign_sha256=uv.sha256_file(cfg['stage1']),normal_curves=str(Path(settings['normal_curves']).resolve()),
                 normal_index_sha256=uv.sha256_file(Path(settings['normal_curves'])/'index.json'),settings=settings),
             method='H ruled surface plus scalar normal V chord residual; joint>0.5; bounded brackets; holes')
-        surface=Tifxyz(xyz[:,:,0],xyz[:,:,1],xyz[:,:,2],uuid=settings.get('surface_uuid_prefix','fiber-uv-')+item['label'].lower(),
-            _scale=(1/stats['grid_step'],)*2,_mask=valid,extra=meta)
-        write_tifxyz(out,surface,compression='lzw')
+        surface=tifxyz.Surface(xyz,uuid=settings.get('surface_uuid_prefix','fiber-uv-')+item['label'].lower(),
+            scale=(1/stats['grid_step'],)*2,mask=valid,extra=meta)
+        tifxyz.write(out,surface,compression='lzw')
         uv.atomic_write(out/'source_validation.json',hashes,durable=False)
         stats.update(label=item['label'],output=str(out),seconds=time.monotonic()-started)
         uv.atomic_write(out/'surface_statistics.json',stats,durable=False);reports.append(stats)
@@ -207,7 +206,7 @@ def run(settings):
 
 def audit(settings):
     """Audit completed artifact bands and provenance; never render a surface."""
-    import tifffile
+    from vc_reader import images
     results=[]
     for item in settings['solutions']:
         cfg=json.loads((Path(item['run_root'])/'summary.json').read_text())['config']
@@ -218,8 +217,8 @@ def audit(settings):
         step=float(settings.get('grid_step',100.))
         assert stats['grid_step']==step
         assert meta['scale']==[1/step]*2
-        bands=[tifffile.imread(path/(a+'.tif')) for a in ('x','y','z')]
-        mask=tifffile.imread(path/'mask.tif')
+        bands=[images.read(path/(a+'.tif')) for a in ('x','y','z')]
+        mask=images.read(path/'mask.tif')
         assert all(b.dtype==np.float32 and b.shape==mask.shape for b in bands)
         valid=mask==255
         assert np.array_equal(valid,bands[2]>0)

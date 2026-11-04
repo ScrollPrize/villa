@@ -12,8 +12,11 @@ def test_spanning_brackets_skip_shorter_candidate_and_limit():
     np.testing.assert_array_equal(brackets(*args[:3],15.,*args[4:])[:,0],[-1,-1])
 
 
+IDS=np.array([f'00000000-0000-4000-8000-00000000000{k}' for k in range(4)])
+
+
 class SyntheticCurves:
-    ids=np.arange(4)
+    ids=IDS
     def sample(self,source,arc):
         xyz=np.zeros((len(source),3));normal=np.tile([0.,0.,1.],(len(source),1))
         h=source<2
@@ -25,14 +28,13 @@ class SyntheticCurves:
 
 def fixture():
     d=dict(phase=np.array([0.,0.,0.,.1]),z=np.array([0.,100.,0.,0.]),family=np.array([0,0,1,1]),
-        node_ds=np.tile([0.,50.,100.],(4,1)),source_id=np.arange(4),start=np.zeros(4),end=np.full(4,100.))
+        node_ds=np.tile([0.,50.,100.],(4,1)),source_id=IDS,start=np.zeros(4),end=np.full(4,100.))
     state=np.zeros((4,6));state[:,:2]=np.log([.9,.1])
     return d,state,np.array([1000.]),dict(layout_mode='shared_anchor',broken_threshold=.5)
 
 
 def test_curvature_transfer_exact_h_and_tifxyz(tmp_path):
-    from vesuvius.tifxyz.types import Tifxyz
-    from vesuvius.tifxyz.writer import write_tifxyz
+    from vc_reader import tifxyz
     import tifffile
     xyz,valid,stats=construct(*fixture(),SyntheticCurves(),dict(grid_step=25,max_search=150))
     assert valid.all();assert stats['valid_quads']==16
@@ -41,7 +43,7 @@ def test_curvature_transfer_exact_h_and_tifxyz(tmp_path):
     np.testing.assert_allclose(xyz[1,:,2],10+10*np.sin(np.pi/4),atol=1e-5)
     assert stats['twisted_or_degenerate_quads']==0
     valid[2,2]=False;xyz[2,2]=-1
-    path=tmp_path/'surface';write_tifxyz(path,Tifxyz(*[xyz[:,:,a] for a in range(3)],_scale=(.04,.04),_mask=valid))
+    path=tmp_path/'surface';tifxyz.write(path,tifxyz.Surface(xyz,scale=(.04,.04),mask=valid))
     assert json.loads((path/'meta.json').read_text())['scale']==[.04,.04]
     assert tifffile.imread(path/'mask.tif')[2,2]==0
     assert tifffile.imread(path/'z.tif')[2,2]==-1
@@ -77,30 +79,34 @@ def test_reversed_source_arc_maps_same_surface():
 def test_curve_bank_actual_polyline_and_normal_invalidity(tmp_path,monkeypatch):
     from vesuvius.neural_tracing.fiber_trace_3d import fiber_curve_bank as m
     xyz=np.array([[0.,0.,10.],[10.,0.,10.],[10.,10.,10.]])
-    monkeypatch.setattr(m,'read_afv_polylines',lambda *_:[({'id':7},xyz)])
+    fid='00000000-0000-4000-8000-000000000007'
+    monkeypatch.setattr(m,'read_polylines',lambda _,ids:[({'id':str(i)},xyz) for i in ids])
     normals=np.array([[0,0,0,1,1],[16,0,0,1,1],[20,0,0,1,1]],dtype='<f8')
     normals.tofile(tmp_path/'normals.bin')
     (tmp_path/'index.json').write_text(json.dumps(dict(format='fiber-normal-curves',columns=['arc','nx','ny','nz','valid'],
-        index=[[7,0,3]],statistics=dict(samples=3,sample_spacing_base=16))))
-    sign=dict(ids=np.array([7]),broken=np.array([False]),normal_sign=np.array([-1]))
-    bank=m.CurveBank('unused',[7],tmp_path,sign)
+        index=[[fid,0,3]],statistics=dict(samples=3,sample_spacing_base=16))))
+    sign=dict(ids=np.array([fid]),broken=np.array([False]),normal_sign=np.array([-1]))
+    bank=m.CurveBank('unused',[fid],tmp_path,sign)
     point,n,ok=bank.sample(np.array([0,0,0]),np.array([5.,15.,20.]))
     np.testing.assert_allclose(point,[[5,0,10],[10,5,10],[10,10,10]])
     np.testing.assert_allclose(n,np.tile([0,0,-1],(3,1)));assert ok.all()
     with pytest.raises(ValueError,match='outside'):bank.sample(np.array([0]),np.array([21.]))
     del bank
     normals[1,4]=0;normals.tofile(tmp_path/'normals.bin')
-    bank=m.CurveBank('unused',[7],tmp_path,sign)
+    bank=m.CurveBank('unused',[fid],tmp_path,sign)
     assert not bank.sample(np.array([0]),np.array([5.]))[2][0]
 
 
 def test_source_hash_validation(tmp_path):
     from vesuvius.neural_tracing.fiber_trace_3d import fiber_uv_surface as m
-    cfg={key:str(tmp_path/key) for key in ('database','afv','stage1','tensor_cache')}
-    for key in ('database','afv','stage1'): (tmp_path/key).write_text(key)
-    expected={key:m.uv.sha256_file(cfg[key]) for key in ('database','afv','stage1')}
+    from vesuvius.neural_tracing.tracers.shared.annotations.fiber_store import fibers_digest, write_fibers
+    cfg={key:str(tmp_path/key) for key in ('database','fibers','stage1','tensor_cache')}
+    for key in ('database','stage1'): (tmp_path/key).write_text(key)
+    write_fibers(cfg['fibers'],[(dict(),np.array([[0.,0,0],[1.,0,0]]))],volume='123')
+    expected={key:m.uv.sha256_file(cfg[key]) for key in ('database','stage1')}
+    expected['fibers']=fibers_digest(cfg['fibers'])
     (tmp_path/'tensor_cache.json').write_text(json.dumps(dict(signature=expected)))
-    doc=dict(provenance=dict(config=dict(orient_database=cfg['database'],afv=cfg['afv'])))
+    doc=dict(provenance=dict(config=dict(orient_database=cfg['database'],fibers=cfg['fibers'])))
     assert m.validate_sources(cfg,doc)==expected
     (tmp_path/'database').write_text('replaced same pathname')
     with pytest.raises(ValueError,match='hash mismatch'):m.validate_sources(cfg,doc)
@@ -109,15 +115,13 @@ def test_source_hash_validation(tmp_path):
 @pytest.mark.parametrize('step', [None, 25])
 def test_audit_uses_export_grid_default(tmp_path,monkeypatch,step):
     from vesuvius.neural_tracing.fiber_trace_3d import fiber_uv_surface as m
-    from vesuvius.tifxyz.types import Tifxyz
-    from vesuvius.tifxyz.writer import write_tifxyz
+    from vc_reader import tifxyz
     options={} if step is None else dict(grid_step=step)
     xyz,valid,stats=construct(*fixture(),SyntheticCurves(),dict(max_search=150,**options))
     solve=tmp_path/'solve';solve.mkdir();(solve/'summary.json').write_text(json.dumps(dict(config={})))
     normals=tmp_path/'normals';normals.mkdir();(normals/'index.json').write_text('{}')
     out=tmp_path/'surface'
-    write_tifxyz(out,Tifxyz(*[xyz[:,:,a] for a in range(3)],
-        _scale=(1/stats['grid_step'],)*2,_mask=valid))
+    tifxyz.write(out,tifxyz.Surface(xyz,scale=(1/stats['grid_step'],)*2,mask=valid))
     (out/'surface_statistics.json').write_text(json.dumps(stats))
     monkeypatch.setattr(m,'validate_sources',lambda *_: {})
     result=m.audit(dict(output_root=str(tmp_path),normal_curves=str(normals),

@@ -4,6 +4,14 @@ namespace vcr::transforms::cuda {
 Session::Session(const Sample& s) {
     for (const auto& [key,f] : s) {
         if (sparse(f.target.role)) continue;
+        if (narrow_continuous(f)) {
+            // A quarter of the float32 transfer; widened exactly on the device.
+            DeviceArray bytes(f.array.shape,'u',1);
+            bytes.buffer->upload(static_cast<const std::byte*>(f.array.data()));
+            auto& device = arrays.emplace(key,DeviceArray(f.array.shape,'f',4)).first->second;
+            convert(device.view<float>(),bytes.view<std::uint8_t>());
+            continue;
+        }
         auto& device = arrays.emplace(key,DeviceArray(f.array.shape,f.array.kind,f.array.bytes)).first->second;
         device.buffer->upload(static_cast<const std::byte*>(f.array.data()));
     }
@@ -125,7 +133,7 @@ struct restore_kernel_launch {
 };
 void Session::restore_valid(const Sample& s) {
     for (const auto& [key,f] : s) {
-        if (f.target.role != Role::Image || !s.count(f.target.valid)) continue;
+        if (f.target.role != Role::Image || !f.target.refill || !s.count(f.target.valid)) continue;
         auto& image = arrays.at(key); const auto& mask = arrays.at(f.target.valid);
         require(image.spatial() == mask.spatial() && (mask.shape[0] == 1 || mask.shape[0] == image.shape[0]),"validity mask no longer matches image channels");
         mask.typed([&](auto valid) {
@@ -135,18 +143,23 @@ void Session::restore_valid(const Sample& s) {
         check(cudaGetLastError());
     }
 }
-std::shared_ptr<void> begin(const Sample& s) { return std::make_shared<Session>(s); }
+std::shared_ptr<void> begin(Sample& s) {
+    auto session = std::make_shared<Session>(s);
+    // Host fields of widened images describe the device float32 arrays (finish() replaces them).
+    for (auto& [key,f] : s) if (narrow_continuous(f) && !sparse(f.target.role)) { Array metadata; metadata.shape=f.array.shape; f.array=std::move(metadata); }
+    return session;
+}
 void finish(Sample& s, void* context) { static_cast<Session*>(context)->finish(s); }
-void synchronize() { check(cudaStreamSynchronize(vcr::device::stream())); }
 } // namespace vcr::transforms::cuda
 
 #include "device_io.hpp"
 namespace vcr::transforms::cuda {
-template<class T> __device__ void validate_device_values(KernelIndex vcr_launch, View<T> data, T* output, bool mask, int* invalid) {
+template<class T, class U> __device__ void validate_device_values(KernelIndex vcr_launch, View<T> data, U* output, bool mask, int* invalid) {
     EACH_INDEX(data.size) {
         if constexpr (std::is_floating_point_v<T>) if (!isfinite(data.ptr[i])) atomicOr(invalid,1);
         if (mask && data.ptr[i]!=0 && data.ptr[i]!=1) atomicOr(invalid,2);
-        if (output != data.ptr) output[i]=data.ptr[i];
+        if constexpr (std::is_same_v<T,U>) { if (output != data.ptr) output[i]=data.ptr[i]; }
+        else output[i]=U(data.ptr[i]);
     }
 }
 struct validate_device_values_launch {
@@ -161,17 +174,26 @@ std::shared_ptr<void> begin_device(const std::map<std::string,DeviceInput>& inpu
     for (const auto& [key,in]:inputs) {
         auto& f=sample.at(key);
         DeviceArray array(in.shape,in.kind,in.bytes,in.data);
+        // uint8 continuous targets are widened to float32 in this pass (never in place: the dtype changes).
+        const bool widen=narrow_continuous(f);
+        const char kind=widen ? 'f' : in.kind; const std::size_t bytes=widen ? 4 : in.bytes;
         // Validate while copying into the working output, avoiding a second
         // read of the entire batch. In-place callers only validate.
-        DeviceArray output = inplace ? array : destinations.count(key)
-            ? DeviceArray(in.shape,in.kind,in.bytes,destinations.at(key).data)
-            : DeviceArray(in.shape,in.kind,in.bytes);
+        DeviceArray output = inplace && !widen ? array : destinations.count(key)
+            ? DeviceArray(in.shape,kind,bytes,destinations.at(key).data)
+            : DeviceArray(in.shape,kind,bytes);
         array.typed([&](auto view) {
             using T=std::remove_pointer_t<decltype(view.ptr)>;
-            if (view.size) launch(blocks(view.size),256,0,vcr::device::stream(),validate_device_values_launch{},
-                                  view,reinterpret_cast<T*>(output.buffer->ptr),f.target.role==Role::Valid,status);
+            if (!view.size) return;
+            if (widen) {
+                if constexpr (std::is_same_v<T,std::uint8_t>)
+                    launch(blocks(view.size),256,0,vcr::device::stream(),validate_device_values_launch{},
+                           view,reinterpret_cast<float*>(output.buffer->ptr),false,status);
+            } else launch(blocks(view.size),256,0,vcr::device::stream(),validate_device_values_launch{},
+                          view,reinterpret_cast<T*>(output.buffer->ptr),f.target.role==Role::Valid,status);
         });
         check(cudaGetLastError());
+        if (widen) { f.array.kind='f'; f.array.bytes=4; }
         session->arrays.emplace(key,std::move(output));
     }
     if (async) return session;
@@ -207,7 +229,6 @@ void export_outputs(void* context) {
     for (auto& [key,a]:static_cast<Session*>(context)->arrays) a.buffer->exported=true;
     for (auto& [key,levels]:static_cast<Session*>(context)->pyramids) for (auto& a:levels) a.buffer->exported=true;
 }
-void check_device(void* context) { static_cast<Session*>(context)->check_status(); }
 void release_outputs(void* context, const std::vector<std::string>& keys) {
     for (const auto& key:keys) static_cast<Session*>(context)->arrays.erase(key);
 }

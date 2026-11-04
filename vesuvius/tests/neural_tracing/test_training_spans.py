@@ -8,6 +8,8 @@ import json
 import numpy as np
 import pytest
 
+from tests.zarr_utils import create_v2_group_array
+
 from vc3d_fiber_format import legacy_lasagna_segments
 from vesuvius.neural_tracing.fiber_trace.fiber_json import Vc3dFiber
 from vesuvius.neural_tracing.fiber_trace_2d.fiber_json import load_fiber_file
@@ -74,14 +76,15 @@ def test_repeated_line_vertices_are_allowed_without_sampling_mass():
     assert abs(counts[0] / sum(counts) - 2/3) < .025
 
 
-def test_file_backed_train_and_test_use_identical_filtered_geometry(monkeypatch):
+def test_file_backed_train_and_test_use_identical_filtered_geometry(monkeypatch, tmp_path):
     volume = np.zeros((64, 64, 64), np.uint8)
+    create_v2_group_array(tmp_path / "ct.zarr", "0", shape=volume.shape, chunks=(16, 16, 16), dtype=np.uint8)
     monkeypatch.setattr(module, "_open_dataset_volume", lambda *a, **k: volume)
     monkeypatch.setattr(module, "_validate_dataset_manifest", lambda *a, **k: volume.shape)
     monkeypatch.setattr(module, "_resolve_fiber_paths", lambda *a, **k: [Path("fiber.json")])
     monkeypatch.setattr(module, "load_fiber_file", lambda *a, **k: [example()])
-    monkeypatch.setattr(module, "make_coordinate_sampler", lambda **k: module.NumpyZarrCoordinateSampler(volume, level_spacing_base=1))
-    dataset = {"base_volume_path": "unused", "fiber_glob": "unused", "scroll_id": "A", "dense_supervision": True}
+    dataset = {"base_volume_path": str(tmp_path / "ct.zarr"), "fiber_glob": "unused", "scroll_id": "A",
+               "dense_supervision": True}
     raw = {"datasets": [dataset], "test_datasets": [dataset], "sampling_strategy": "scroll_balanced_arclength",
            "patch_shape_zyx": [16]*3, "cp_margin_voxels": 3, "augment_enabled": False}
     configs = [raw, _make_test_loader_raw_config(raw, {})]

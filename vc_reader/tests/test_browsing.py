@@ -1,5 +1,4 @@
 """Relationship and resolution contracts, independent of optional readers."""
-from dataclasses import replace
 import json
 import pickle
 import unittest
@@ -80,7 +79,7 @@ class BrowsingTests(unittest.TestCase):
     def test_custom_surface_volume_requires_explicit_artifact_kind(self):
         scroll = catalog().samples['s']
         image = Source('image', Storage('/tmp/image.zarr', 'zarr'), role='image', axes=('z', 'y', 'x'))
-        render = replace(image, id='user:surface', artifact_kind='layers-zarr')
+        render = image.replace(id='user:surface', artifact_kind='layers-zarr')
         label = Source('label', Storage('/tmp/label.png', 'png'), role='label', axes=('y', 'x'))
         scroll = scroll.with_source(image, kind='image', volume='b')
         scroll = scroll.with_source(render, kind='image', volume='b')
@@ -94,7 +93,7 @@ class BrowsingTests(unittest.TestCase):
         scroll = ScrollSource('s', 'a', catalog=c)
         label = scroll.segments['seg'].labels.ink(label_set='2021')
         self.assertEqual(label.id, scroll.labels.ink().id)
-        self.assertIs(label.source, c.samples['s'].labels[label.id].source)
+        self.assertEqual(label.source, c.samples["s"].labels[label.id].source)
         self.assertEqual(label.volume.id, 'a')
         self.assertEqual(label.segment.id, 'seg')
         self.assertEqual([s.id for s in scroll.segments], ['seg'])  # no mesh required
@@ -156,7 +155,7 @@ class BrowsingTests(unittest.TestCase):
         label = Source('label', Storage('/tmp/label.png', 'png'), role='label', axes=('y', 'x'), artifact_kind='ink-labels')
         s = s.with_source(render, kind='image', volume='a', segment='user:seg')
         s = s.with_source(label, kind='label', volume='a', segment='user:seg', image=render.id, same_grid=True)
-        self.assertIs(s.labels[source.id].source, source)
+        self.assertEqual(s.labels[source.id].source.id, source.id)
         self.assertEqual(s.labels[label.id].images.get().id, render.id)
         self.assertEqual(s.images[render.id].labels.get().id, label.id)
         self.assertEqual(s.labels[label.id].segment.id, 'user:seg')
@@ -181,7 +180,7 @@ class BrowsingTests(unittest.TestCase):
         s = s.with_source(rep, kind='representation', volume='a')
         self.assertEqual(s.on_volume('a').representations[rep.id].source.registration, rep.registration)
         with self.assertRaisesRegex(ValueError, 'contradicts'):
-            s.with_source(replace(rep, id='bad'), kind='representation', volume='b')
+            s.with_source(rep.replace(id='bad'), kind='representation', volume='b')
 
     def test_unpublished_source_target_and_historical_mapped_destination(self):
         from test_sources import catalog as source_catalog
@@ -190,7 +189,7 @@ class BrowsingTests(unittest.TestCase):
         self.assertEqual(label.volume.id, 'unpublished')
         self.assertIsNone(label.volume.record)
         self.assertEqual(label.mappable_volumes['a'].transform, Affine.scale(2))
-        self.assertEqual([m.id for m in label.mappable_volumes.filter(include_superseded=True)], ['a'])
+        self.assertEqual([m.id for m in label.mappable_volumes.filter(include_superseded=True)], ['a', 'b'])
 
     def test_cycles_and_malformed_overlay_relationships(self):
         c = catalog()
@@ -229,7 +228,7 @@ class PublishedLabelMappingTests(unittest.TestCase):
         from pathlib import Path
         fixture = Path(__file__).resolve().parent / 'fixtures/training/catalog.json'
         with patch('urllib.request.urlopen', side_effect=AssertionError('metadata browsing requested I/O')):
-            c = Catalog.from_file(fixture)
+            c = Catalog.load(fixture, use_cache=False)
             label = c.samples['PHerc0009B'].segments['20250919125754'].labels.ink(label_set='20260918')
             surface_volume = label.surface_volumes.zarr()
             self.assertEqual(surface_volume.artifact_kind, 'layers-zarr')
@@ -254,3 +253,11 @@ class PublishedLabelMappingTests(unittest.TestCase):
             self.assertEqual(label.volume.id, summary['source_volume'])
             # Source ownership never moves the label into B's direct-label list.
             self.assertFalse(mapping.volume.labels)
+
+
+def test_native_artifact_parameter_parity():
+    from vc_reader.artifacts import Artifact
+    from vc_reader import _catalog
+    for level in [None, -1, 2.5, "2", 2, 5, 6, 10**40]:
+        raw = {"type": "surface-prediction-zarr", "parameters": {"level": level}}
+        assert Artifact.from_json(raw).level == _catalog.parse_artifacts([raw])[0].level

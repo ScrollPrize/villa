@@ -259,7 +259,7 @@ def run(settings):
         result['seconds']=time.monotonic()-started;result['final']=report()
         from .fiber_shared_curve import saved_segment_metrics
         result['final']['segments']=saved_segment_metrics(d,dict(saved,**ext.arrays(),
-            state=state.detach().cpu().numpy(),widths=soft.decode_widths(raw,cfg).detach().cpu().numpy()),excluded_sources=(7,))
+            state=state.detach().cpu().numpy(),widths=soft.decode_widths(raw,cfg).detach().cpu().numpy()),excluded_sources=tuple(reference['excluded_source_ids']))
         dest=root/trial['name'];dest.mkdir(exist_ok=True)
         np.savez(dest/'solution.npz',**dict(saved,**ext.arrays(),state=state.detach().cpu().numpy(),widths=soft.decode_widths(raw,cfg).detach().cpu().numpy()))
         atomic_write(dest/'config.json',cfg,durable=False)

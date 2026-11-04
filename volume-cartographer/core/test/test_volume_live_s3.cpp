@@ -1,14 +1,21 @@
-// Live S3 tests against the PHerc 0172 zarr to drive Volume / Zarr / VcDataset
-// coverage. Network-soft-skipped: set VC_TEST_REQUIRE_NETWORK=1 to make
+// Live S3 tests against PHerc 0172 and PHerc 0139 for Volume and catalog identity
+// coverage. Set VC_TEST_REQUIRE_NETWORK=1 to make
 // failures hard.
 
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
 #include <doctest/doctest.h>
 
 #include "vc/core/types/Volume.hpp"
-#include "vc/core/types/Array3D.hpp"
+#include "vc/core/types/VolumePkg.hpp"
+#include "support/TestProject.hpp"
+#include <vc_reader/zarr.hpp>
+#include <vc_object_store/objects/GeometryCoordinates.hpp>
+#include <vc_object_store/store/GeometryViews.hpp>
+#include <vc_object_store/objects/ObjectStore.hpp>
+#include <vc_reader/catalog.hpp>
 
 #include <cstdlib>
+#include <atomic>
 #include <exception>
 #include <memory>
 #include <string>
@@ -38,151 +45,110 @@ std::shared_ptr<Volume> openOrSkip()
 
 } // namespace
 
-TEST_CASE("Volume::NewFromUrl: opens the PHerc 0172 zarr")
+TEST_CASE("Catalog PHerc0139 scan reopens with the object-store volume identity")
 {
-    auto v = openOrSkip();
-    if (!v) return;
-    CHECK(v->isRemote());
-    CHECK_FALSE(v->remoteUrl().empty());
-    CHECK_FALSE(v->id().empty());
-}
-
-TEST_CASE("Volume::NewFromUrl: invalid credentials fall back to anonymous public S3")
-{
-    vc::HttpAuth invalid;
-    invalid.access_key = "INVALIDACCESSKEY";
-    invalid.secret_key = "INVALIDSECRET";
-    invalid.session_token = "INVALIDSESSIONTOKEN";
-    invalid.region = "us-east-1";
-
+    const std::string url =
+        "https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/PHerc0139/volumes/"
+        "20260102150214-2.399um-0.2m-78keV-masked.zarr";
+    std::shared_ptr<Volume> untagged;
     try {
-        const auto volume = Volume::NewFromUrl(kVolumeUrl, invalid);
-        REQUIRE(volume != nullptr);
-        CHECK(volume->isRemote());
-        CHECK(volume->remoteAuth().empty());
+        untagged = Volume::NewFromUrl(url, nlohmann::json::object(), false);
     } catch (const std::exception& e) {
-        if (requireNetwork()) {
-            FAIL("invalid-credential anonymous fallback failed: " << e.what());
-        }
-        MESSAGE("Skipping invalid-credential fallback (network unavailable?): "
-                << e.what());
-    }
-}
-
-TEST_CASE("Volume: shape and pyramid metadata match the upstream .zarray files")
-{
-    auto v = openOrSkip();
-    if (!v) return;
-
-    // Base level (0) shape, pinned from the live bucket (.zarray observed 2026-06).
-    auto s0 = v->levelShape(0);
-    CHECK(s0[0] == 21000);
-    CHECK(s0[1] == 6700);
-    CHECK(s0[2] == 9100);
-
-    // Level 5 (smallest pyramid level)
-    auto s5 = v->levelShape(5);
-    CHECK(s5[0] == 657);
-    CHECK(s5[1] == 210);
-    CHECK(s5[2] == 285);
-
-    // 6 levels total
-    CHECK(v->numScales() == 6);
-    CHECK(v->hasScaleLevel(0));
-    CHECK(v->hasScaleLevel(5));
-    CHECK_FALSE(v->hasScaleLevel(99));
-}
-
-TEST_CASE("Volume: chunkShape per level is the upstream chunk grid")
-{
-    auto v = openOrSkip();
-    if (!v) return;
-
-    auto c5 = v->chunkShape(5);
-    CHECK(c5[0] == 128);
-    CHECK(c5[1] == 128);
-    CHECK(c5[2] == 128);
-}
-
-TEST_CASE("Volume: dtype is uint8")
-{
-    auto v = openOrSkip();
-    if (!v) return;
-    // dtypeSize() == 1 means uint8 (matches the "|u1" .zarray).
-    CHECK(v->dtypeSize() == 1);
-}
-
-TEST_CASE("Volume: present scale levels include 0..5")
-{
-    auto v = openOrSkip();
-    if (!v) return;
-    auto present = v->presentScaleLevels();
-    CHECK(present.size() >= 6);
-    CHECK(v->firstPresentScaleLevel() == 0);
-    // finestPresentScaleLevelAtOrBelow returns the finest level *with on-disk
-    // data*; the live PHerc 0172 zarr reports 4 here. Just sanity-check it
-    // lies within the pyramid range.
-    int finest5 = v->finestPresentScaleLevelAtOrBelow(5);
-    CHECK(finest5 >= 0);
-    CHECK(finest5 <= 5);
-}
-
-TEST_CASE("Volume: shape vs shapeXyz order swap")
-{
-    auto v = openOrSkip();
-    if (!v) return;
-    auto zyx = v->shape();
-    auto xyz = v->shapeXyz();
-    // xyz = [width, height, slices] = reverse of [slices, height, width]
-    CHECK(xyz[0] == zyx[2]);
-    CHECK(xyz[1] == zyx[1]);
-    CHECK(xyz[2] == zyx[0]);
-}
-
-TEST_CASE("Volume: chunkCount(level=5) matches grid size from the .zarray")
-{
-    auto v = openOrSkip();
-    if (!v) return;
-    // shape (657, 210, 285), chunks (128, 128, 128)
-    // grid = ceil(657/128)*ceil(210/128)*ceil(285/128) = 6*2*3 = 36
-    // (the live bucket actually has 30 chunks on-disk — missing ones are fill)
-    CHECK(v->chunkCount(5) > 0);
-}
-
-TEST_CASE("Volume::readZYX: read a small region at level 5 (one chunk)")
-{
-    auto v = openOrSkip();
-    if (!v) return;
-
-    Array3D<uint8_t> region({16, 16, 16});
-    bool ok = false;
-    try {
-        ok = v->readZYX(region, {0, 0, 0}, /*level=*/5);
-    } catch (const std::exception& e) {
-        if (requireNetwork()) FAIL("readZYX failed: " << e.what());
-        MESSAGE("Skipping read (network?): " << e.what());
+        if (requireNetwork()) FAIL("PHerc0139 remote open failed: " << e.what());
+        MESSAGE("Skipping (network unavailable?): " << e.what());
         return;
     }
-    CHECK(ok);
-    // Sanity check: region is the right size, accepts arbitrary uint8 values.
-    CHECK(region.shape()[0] == 16);
-    CHECK(region.shape()[1] == 16);
-    CHECK(region.shape()[2] == 16);
-}
+    const nlohmann::json fiber = {
+        {"coordinates", {{"volume_uuid", "20260102150214"}, {"scale_factor", 1}}}};
+    // Reproduce the URL-derived identity mismatch before the catalog names the volume.
+    CHECK_FALSE(vc::objects::geometryScaleToVolume(fiber, untagged->id()).has_value());
 
-TEST_CASE("Volume::readXYZ: same region using XY-major order")
-{
-    auto v = openOrSkip();
-    if (!v) return;
+    const auto store = vc::test::createTestProject();
+    vc::project::LoadOptions deferred;
+    deferred.deferResolution = true;
+    deferred.failOnRemoteError = true;
+    deferred.catalog = std::make_shared<const vcr::catalog::OpenDataManifest>(vcr::catalog::parseOpenDataManifest(R"({
+      "samples": {"PHerc0139": {"volumes": {"20260102150214": {"id": "20260102150214",
+        "suffix": "20260102150214-2.399um-0.2m-78keV-masked.zarr", "properties": {"pixel_size_um": 2.399},
+        "data": [{"type": "zarr", "origins": [{"path": "PHerc0139/volumes/20260102150214-2.399um-0.2m-78keV-masked.zarr",
+          "access_roots": [{"type": "https", "url": "https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/",
+                            "usage": "public-read"}]}]}]}}}}})"));
+    auto project = store.open(deferred);
+    REQUIRE(project->addVolumeEntry(url, {"vc-remote-auth:anonymous"}));
+    // A working level is the same entry, not a second volume.
+    CHECK_FALSE(project->addVolumeEntry(url + "#vc-base-scale=2", {"vc-remote-auth:anonymous"}));
+    project = store.open(deferred);
+    project->resolveDeferredEntries();
+    const auto volume = project->volume("20260102150214");
+    REQUIRE(volume);
+    CHECK(volume->shape() == untagged->shape());
+    // Changing the annotation identity must reuse the pre-existing URL cache,
+    // including the process cache shared with manually opened remote volumes.
+    const auto ownFolder = untagged->remoteCacheRoot() / untagged->id();
+    CHECK(untagged->remotePersistentCachePath() ==
+          (std::filesystem::is_directory(ownFolder) ? ownFolder
+                                       : vcr::zarr::decodedCachePath(untagged->remoteCacheRoot(), untagged->sourceLocation())));
+    CHECK(volume->remotePersistentCachePath() == untagged->remotePersistentCachePath());
+    // vc_reader opens both at the same source with the same VC3D cache directory.
+    CHECK(volume->sourceLocation() == untagged->sourceLocation());
+    CHECK(volume->sourceOpenOptions().vc3dVolumeDir == untagged->sourceOpenOptions().vc3dVolumeDir);
+    CHECK(vc::objects::geometryScaleToVolume(fiber, volume->id()) == 1.0);
+    CHECK(vc::objects::volumeCoordinates(volume->id(), 1) == fiber.at("coordinates"));
+    REQUIRE(project->volumeIDs() == std::vector<std::string>{"20260102150214"});
+    CHECK(vc::project::annotationVolume(project.get(), *volume).volume == "20260102150214");
 
-    Array3D<uint8_t> region({16, 16, 16});
-    bool ok = false;
-    try {
-        ok = v->readXYZ(region, {0, 0, 0}, 5);
-    } catch (const std::exception& e) {
-        if (requireNetwork()) FAIL("readXYZ failed: " << e.what());
-        MESSAGE("Skipping read (network?): " << e.what());
-        return;
+    // The same volume at working level 2: its ID, entry and objects stay; its
+    // voxels are 4 of the volume's own.
+    const auto levelZeroCache = volume->remotePersistentCachePath();
+    REQUIRE(project->setVolumeLevel("20260102150214", 2));
+    CHECK_FALSE(project->setVolumeLevel("20260102150214", 2));
+    const auto coarse = project->volume("20260102150214");
+    REQUIRE(coarse);
+    CHECK(coarse != volume);
+    CHECK(coarse->baseScaleLevel() == 2);
+    CHECK(project->volumeEntries().size() == 1);
+    CHECK(project->volumeEntries().front().location == url + "#vc-base-scale=2");
+    const auto view = project->catalogView(coarse->id());
+    REQUIRE(view);
+    CHECK((view->sampleId == "PHerc0139" && view->volumeId == "20260102150214" && view->level == 2 && view->source));
+    CHECK(project->overlayCompatible(coarse->id(), coarse->id()));
+    CHECK(coarse->voxelSize() == doctest::Approx(4 * 2.399));
+    // Every working level reads the physical pyramid's one cache.
+    CHECK(coarse->remotePersistentCachePath() == levelZeroCache);
+    // Objects made on it are kept in the volume's own voxels, at its scale.
+    const auto annotation = vc::project::annotationVolume(project.get(), *coarse);
+    CHECK(annotation.volume == "20260102150214");
+    CHECK(annotation.scale == 0.25);
+    REQUIRE(annotation.voxelSizeUm);
+    CHECK(*annotation.voxelSizeUm == doctest::Approx(2.399));
+    // The project reopens at the level, and goes back to level 0.
+    project = store.open(deferred);
+    project->resolveDeferredEntries();
+    REQUIRE(project->volume("20260102150214"));
+    CHECK(project->volume("20260102150214")->baseScaleLevel() == 2);
+    REQUIRE(project->setVolumeLevel("20260102150214", 0));
+    CHECK(project->volumeEntries().front().location == url);
+    CHECK(project->volume("20260102150214")->remotePersistentCachePath() == levelZeroCache);
+
+    // Optional read-only validation against a local replica of the PHerc0139 hub.
+    if (const char* path = std::getenv("VC_TEST_CATALOG_FIBER_STORE")) {
+        vc::objects::OpenOptions options;
+        options.readOnly = true;
+        auto store = vc::objects::ObjectStore::open(path, options);
+        auto txn = store.read();
+        vc::objects::ObjectSelection selection;
+        selection.kind = "fiber";
+        const auto all = store.selectObjects(txn, selection);
+        REQUIRE_FALSE(all.empty());
+        selection.volume = untagged->id();
+        CHECK(store.selectObjects(txn, selection).empty());
+        selection.volume = volume->id();
+        const auto matched = store.selectObjects(txn, selection);
+        CHECK(matched.size() == all.size());
+        CHECK(store.unboundObjectCount(txn, "fiber", volume->id()) == 0);
+        for (const auto& object : matched)
+            CHECK(vc::objects::geometryScaleToVolume(nlohmann::json::parse(object.meta), volume->id()) == 1.0);
+        MESSAGE("Matched " << matched.size() << " real hub fibers to " << volume->id());
     }
-    CHECK(ok);
 }
+

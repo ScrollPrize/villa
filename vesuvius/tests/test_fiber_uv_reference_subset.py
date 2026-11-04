@@ -33,7 +33,7 @@ def test_continuation_roundoff_cannot_drop_exact_shared_cut():
 
 
 def test_audit_identity_degrees_and_clipped_samples():
-    d=dict(source_id=np.array([3]),source_index=np.array([0]),family=np.array([0]),parent_piece=np.array([0]),
+    d=dict(source_id=np.array(['00000000-0000-4000-8000-000000000003']),source_index=np.array([0]),family=np.array([0]),parent_piece=np.array([0]),
            start=np.array([2.]),end=np.array([8.]),lengths=np.array([6.]),node_ds=np.array([[0.,3.,6.]]),
            i=np.array([0]),j=np.array([0]),ds_a=np.array([1.]),ds_b=np.array([5.]),degree=np.array([2.]),links=np.empty((0,4)))
     parent=dict(d,start=np.array([0.]),end=np.array([10.]))

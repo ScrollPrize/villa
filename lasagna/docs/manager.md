@@ -187,9 +187,9 @@ las_manager inference run fiber3d/my-run/best.pt \
 
 This initializes only the remote source descriptor, then launches inference
 immediately. Defaults are `--live-cache-gib 10240` and
-`--live-fetch-ahead-tiles 10000`. Completed selected-scale chunks count toward
-the target; only complete old Z-chunk planes behind the committed inference
-frontier may be removed. The settings and final cache counters are copied from
+`--live-fetch-ahead-tiles 10000`. Chunks are cached decoded in `<ome
+root>/.live_cache`; past the target the least recently used are removed. The
+settings and final cache counters are copied from
 portable inference provenance into manager run metadata. `--live-fetch` is
 full-volume only and rejects backend/configured `--no-download`.
 This includes output-format overrides such as `--ome-compressor none`; newly

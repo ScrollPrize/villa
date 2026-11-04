@@ -41,7 +41,7 @@ def test_visualization_offset_override_preserves_default():
 
 def test_source_aggregation_uses_curves_and_excludes_rejection(monkeypatch):
     from vesuvius.neural_tracing.fiber_trace_3d import fiber_reference_comparison as ref
-    d=dict(source_id=np.array([1,1,2,3]),start=np.zeros(4),lengths=np.ones(4),
+    d=dict(source_id=np.array([f'00000000-0000-4000-8000-00000000000{k}' for k in (1,1,2,3)]),start=np.zeros(4),lengths=np.ones(4),
            node_ds=np.tile([0,.5,1],(4,1)),family=np.zeros(4,dtype=int))
     monkeypatch.setattr(ref.uv,'hard_geometry',lambda *args:
         (None,None,np.array([True,True,True,False]),None,np.array([0,0,10,20]),None,None))

@@ -24,13 +24,10 @@ gha-creds-*.json
 
 **/checkpoints/
 
-# WandB (allow general wandb but ignore this one)
+# WandB (allow general wandb)
 !**/wandb/**
-/segmentation/models/arch/nnunet/wandb/
 
 *.pth
-segmentation/models/arch/nnunet/build/
-segmentation/models/batchgeneratorsv2/build/
 segmentation/napari_trainer/cline_rules.md
 segmentation/napari_trainer/test_1638_debug.png
 /wandb
@@ -54,10 +51,6 @@ volume-cartographer/AGENTS.md
 *.gcno
 /volume-cartographer/coverage/
 /coverage/
-
-# Dead-code analysis outputs
-/volume-cartographer/dead-code/
-/dead-code/
 
 # ccache (mounted into builder docker)
 /volume-cartographer/.ccache/
@@ -91,3 +84,10 @@ dinovol/cufile.log
 *.csv
 /vc_object_store/build-core
 /vc_object_store/docs/benchmarks
+/volume-cartographer/planning
+/dinovol/dinovol_2/perf
+/dinovol/evals/kaggle_surfaces/data
+/dinovol/evals/kaggle_surfaces/runs
+/dinovol/outputs
+/dinovol/perf_results
+/volume-cartographer/benchmarks/saved

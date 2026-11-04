@@ -8,9 +8,9 @@ geometric outcomes, by source and split. Comparisons pair identical seeds and re
 fibers. The final group never enters operating-point selection.
 
 Sources come from the checkpoint's dataset configuration (``--dataset-config`` overrides it).
-Paris 4 uses its frozen monitor/calibration/final seeds; each AFV source uses its own
+Paris 4 uses its frozen monitor/calibration/final seeds; each fiber-store source uses its own
 seeded validation manifest (the same seeds the trainer writes as ``validation_<name>.json``).
-AFV holdouts carry a neighbor detector over their own catalog; Paris 4 has no neighbor paths,
+Fiber-store holdouts carry a neighbor detector over their own catalog; Paris 4 has no neighbor paths,
 so its held-out identity coverage is reported as absent.
 
   python -m vesuvius.neural_tracing.tracers.fibers.evaluation.protocol calibrate --checkpoint CK --out DIR
@@ -27,13 +27,13 @@ from pathlib import Path
 import time
 
 import numpy as np
+from vc_reader.reader import open_zarr
 
 from vesuvius.neural_tracing.tracers.fibers.evaluation.scoring import EvaluationAudit, evaluate, monitor_coverage, summarize_outcomes
 from vesuvius.neural_tracing.tracers.shared.io import jsonable, write_json as write
 from vesuvius.neural_tracing.tracers.shared.policy import checkpoint_policy
 from vesuvius.neural_tracing.tracers.fibers.tracing.trace import FiberTracer, TraceParams
 from vesuvius.neural_tracing.tracers.models.checkpoint import load_checkpoint
-from vesuvius.neural_tracing.tracers.shared.crop_sampling.volume import CTVolume
 
 SPLITS = ('monitor', 'calibration', 'final')
 THRESHOLDS = (.5, .6, .7, .8, .85, .9, .95)
@@ -61,7 +61,7 @@ def run_policy(checkpoint, sources, splits, policy, *, device, max_len, batch, f
     tolerance = float(ck.get('tolerance', 1.5))
     rows = []
     for source in sources:
-        tracer = FiberTracer(model, source['volume'], crop, n_history,
+        tracer = FiberTracer(model, source['ct'], source['spec'], crop, n_history,
                              TraceParams.from_policy(policy, max_len=max_len, forward_chunk=forward_chunk), device=device)
         try:
             for split in splits:
@@ -233,9 +233,9 @@ DATASET_CONFIG = Path(__file__).parents[1]/'configs'/'datasets'/'paris50.json'
 def dataset_sources(args, config=None):
     """The held-out sources of the checkpoint's own dataset configuration, or of ``config`` /
     ``args.dataset_config`` when given."""
-    from vesuvius.neural_tracing.tracers.fibers.data.afv_neighbors import AFVBank
+    from vesuvius.neural_tracing.tracers.fibers.data.fiber_bank import FiberBank
     from vesuvius.neural_tracing.tracers.fibers.data.datasets import (
-        load_primary_dataset, open_afv_source, parse_dataset_config, read_dataset_config, validation_manifest)
+        load_primary_dataset, open_fiber_source, parse_dataset_config, read_dataset_config, validation_manifest)
     from vesuvius.neural_tracing.tracers.fibers.data.bank_geometry import BankSwitchDetector
     _, _, _, paris_spec, checkpoint = load_checkpoint(args.checkpoint, 'cpu')
     config = config or getattr(args, 'dataset_config', None)
@@ -255,14 +255,15 @@ def dataset_sources(args, config=None):
             _, _, validation, manifest = load_primary_dataset(document, spec)
             detector = None
         else:
-            _, validation, spec, _ = open_afv_source(source, document['cache_dir'], normalization)
+            _, validation, spec = open_fiber_source(source, document['cache_dir'], normalization)
             manifest = validation_manifest(validation, spec, source['validation']['seed'])
-            detector = BankSwitchDetector([AFVBank(validation)])
+            detector = BankSwitchDetector([FiberBank(validation)])
         # Every annotation source on the same CT and trace grid (neighbour fibers for tube_scoring switch labels).
         same_volume = [s for s in document['sources'] if str(s['ct']).rstrip('/') == str(source['ct']).rstrip('/')
                        and float(s.get('grid_scale', 8.)) == float(source.get('grid_scale', 8.))]
+        ct = open_zarr(spec.ct_zarr, level=spec.ct_level, cache_dir=spec.cache_dir, memory_cache=3 << 30)
         sources.append(dict(name=source['name'], fibers=validation, manifest=manifest, detector=detector,
-                            volume=CTVolume(spec), config=source, volume_configs=same_volume))
+                            ct=ct, spec=spec, config=source, volume_configs=same_volume))
     return sources
 
 
