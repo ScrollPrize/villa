@@ -281,6 +281,12 @@ def check_commit(generation, context):
             f"fit volume's shape {tuple(context.base_shape_zyx)}")
 
 
+# The steps of a commit, as status ``commit.stage_name`` names them.
+STAGE_PULL = "Pulling from the hub"
+STAGE_WRITE = "Writing the surface to the object store"
+STAGE_PUSH = "Pushing the surface to the hub"
+
+
 def write_commit(store_path, generation, context):
     """Create the committed surface in the store at ``store_path``; return
     its UUID. ``create_surface`` opens and closes its own handle, so it never
@@ -298,9 +304,14 @@ def write_commit(store_path, generation, context):
         tags=(SPIRAL_FIT_TAG,), author=context.author)
 
 
-def commit_in_place(store_path, generation, context):
+def _no_stage(_name):
+    pass
+
+
+def commit_in_place(store_path, generation, context, stage=_no_stage):
     """Commit to a store shared in place (no hub). The caller serializes
-    store writes, so a concurrent request for the same key finds this one."""
+    store writes, so a concurrent request for the same key finds this one.
+    ``stage`` is called with the name of each step as it starts."""
     from vc_object_store import ObjectStore
     check_commit(generation, context)
     with ObjectStore.open(str(store_path), author=context.author) as store:
@@ -308,13 +319,14 @@ def commit_in_place(store_path, generation, context):
     if existing is not None:
         surface_uuid, reused = existing["uuid"], True
     else:
+        stage(STAGE_WRITE)
         surface_uuid, reused = write_commit(store_path, generation, context), False
     with ObjectStore.open(str(store_path), read_only=True) as store:
         revision = store.current_geometry(surface_uuid)["uuid"]
     return CommitResult(surface_uuid, revision, reused)
 
 
-def commit_to_replica(store_path, generation, context):
+def commit_to_replica(store_path, generation, context, stage=_no_stage):
     """Commit to the service's hub replica, then publish with a plain push.
 
     The caller serializes store writes (no link refresh runs meanwhile).
@@ -324,10 +336,13 @@ def commit_to_replica(store_path, generation, context):
     visible to the reuse lookup; an unreachable hub still commits locally.
     The push is a plain one, not tied to a refresh's head: a new object
     cannot conflict and needs no lease. When it fails the commit stays
-    pending (``pushed`` False) and a later push carries it.
+    pending (``pushed`` False) and a later push carries it. ``stage`` is
+    called with the name of each step as it starts: the push of a large
+    surface takes far longer than writing it to the replica.
     """
     from vc_object_store import ObjectStore
     check_commit(generation, context)
+    stage(STAGE_PULL)
     with ObjectStore.open(str(store_path), author=context.author) as store:
         store.hub_revert()
         try:
@@ -338,11 +353,13 @@ def commit_to_replica(store_path, generation, context):
     if existing is not None:
         surface_uuid, reused = existing["uuid"], True
     else:
+        stage(STAGE_WRITE)
         surface_uuid, reused = write_commit(store_path, generation, context), False
     with ObjectStore.open(str(store_path), author=context.author) as store:
         revision = store.current_geometry(surface_uuid)["uuid"]
         if surface_uuid not in store.hub_status()["pending"]:
             return CommitResult(surface_uuid, revision, reused, pushed=True)
+        stage(STAGE_PUSH)
         error = push_pending(store)
         pushed = surface_uuid not in store.hub_status()["pending"]
     return CommitResult(surface_uuid, revision, reused, pushed=pushed,

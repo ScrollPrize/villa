@@ -424,6 +424,22 @@ def test_a_commit_reaches_the_hub(hosted):
     assert _on_hub(hosted.hub) == [result['surface_uuid']]
 
 
+def test_a_commit_names_its_push_apart_from_its_write(hosted):
+    # Pushing a large surface takes far longer than writing it, so status
+    # must not show "Writing the surface" while the hub transfer runs.
+    stages = []
+    record = hosted.state._commit_stage
+    hosted.state._commit_stage = lambda name: (stages.append(name), record(name))
+    assert commit(hosted, hosted.generation())['pushed'] is True
+    assert stages == ['Waiting for the object store', 'Pulling from the hub',
+                      'Writing the surface to the object store',
+                      'Pushing the surface to the hub']
+    # Committed again, the surface is reused and nothing is written or pushed.
+    stages.clear()
+    assert commit(hosted, hosted.generation())['reused'] is True
+    assert stages == ['Waiting for the object store', 'Pulling from the hub']
+
+
 def test_unpublished_links_are_reverted_before_the_push(hosted):
     names = _names(hosted.store)
     # Links a refresh left behind when its revert failed.

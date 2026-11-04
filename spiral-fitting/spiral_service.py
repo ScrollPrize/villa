@@ -3523,10 +3523,10 @@ class ServiceState:
                                            generation.key.model_state_sha256)
             self._commit_stage("Waiting for the object store")
             with self._store_write_lock:
-                self._commit_stage("Writing the surface to the object store")
                 write = (commit_to_replica if self.object_store.hosted
                          else commit_in_place)
-                result = write(self.object_store.path, generation, context)
+                result = write(self.object_store.path, generation, context,
+                               stage=self._commit_stage)
                 self._note_pending_commits()
             outcome = {"state": "done", "surface_uuid": result.surface_uuid,
                        "geometry_revision": result.geometry_revision,
