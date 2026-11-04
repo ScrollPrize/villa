@@ -178,6 +178,14 @@ std::vector<vc::lasagna::LasagnaChannelGroup> lasagnaGroupsToCache(
     return result;
 }
 
+std::string remoteManifestUrl(const vc::lasagna::LasagnaDatasetManifest& manifest)
+{
+    if (manifest.manifestIsRemote || manifest.remoteBaseUrl.empty()) return {};
+    auto base = manifest.remoteBaseUrl;
+    while (!base.empty() && base.back() == '/') base.pop_back();
+    return base + "/" + manifest.manifestPath.filename().string();
+}
+
 std::optional<ProjectDataset> projectFiberInference(const VolumePkg& pkg,
                                                     const std::filesystem::path& remoteCacheRoot)
 {
@@ -189,6 +197,7 @@ std::optional<ProjectDataset> projectFiberInference(const VolumePkg& pkg,
         const auto dataset = openDataset(result.location, remoteCacheRoot);
         result.identity = dataset.identity;
         result.baseShapeZYX = dataset.manifest.baseShapeZYX;
+        result.remoteManifest = remoteManifestUrl(dataset.manifest);
     } catch (const std::exception& error) {
         result.error = "cannot read " + result.location + ": " + error.what();
     }
@@ -300,8 +309,12 @@ QJsonObject projectBlock(const std::string& name,
         QJsonObject value{{QStringLiteral("location"), QString::fromStdString(fiberInference->location)}};
         if (!fibers)
             value[QStringLiteral("error")] = QString::fromStdString(fiberInference->error);
-        else if (!fiberInference->identity.empty())
-            value[QStringLiteral("identity")] = QString::fromStdString(fiberInference->identity);
+        else {
+            if (!fiberInference->identity.empty())
+                value[QStringLiteral("identity")] = QString::fromStdString(fiberInference->identity);
+            if (!fiberInference->remoteManifest.empty())
+                value[QStringLiteral("remote_manifest")] = QString::fromStdString(fiberInference->remoteManifest);
+        }
         block[QStringLiteral("fiber_inference")] = value;
     }
     return block;

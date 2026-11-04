@@ -311,6 +311,41 @@ def fiber_strip(cid, pcl, link_ids, *, z_begin, z_end, z_margin,
     }
 
 
+def fiber_winding_offsets(link_components):
+    """Each linked fiber's winding relative to its link component.
+
+    A component's first member is winding 0; the others follow its links
+    breadth first, a link's far end at its near end's winding plus the
+    link's ``winding_offset`` (W_b - W_a; 0 when absent). A link whose ends
+    were both reached first along other links and disagree with them closes
+    an inconsistent loop.
+
+    Returns ``(offsets, contradicting)``: winding offsets keyed by collection
+    id, and the inconsistent links in the order they were met.
+    """
+    offsets, contradicting, flagged = {}, [], set()
+    for member_cids, member_links in link_components:
+        links_of = {}
+        for link in member_links:
+            links_of.setdefault(link['a_coll'], []).append(link)
+            links_of.setdefault(link['b_coll'], []).append(link)
+        offsets[member_cids[0]] = 0
+        queue = [member_cids[0]]
+        while queue:
+            cid = queue.pop(0)
+            for link in links_of.get(cid, ()):
+                step = int(link.get('winding_offset', 0))
+                other, step = ((link['b_coll'], step) if link['a_coll'] == cid
+                               else (link['a_coll'], -step))
+                if other not in offsets:
+                    offsets[other] = offsets[cid] + step
+                    queue.append(other)
+                elif offsets[other] != offsets[cid] + step and id(link) not in flagged:
+                    flagged.add(id(link))
+                    contradicting.append(link)
+    return offsets, contradicting
+
+
 def fiber_training_views(point_collections, resolved_links, verified_patches,
                          *, z_begin, z_end, z_margin, min_point_spacing,
                          vertical_min_z_fraction=0.8,
@@ -319,10 +354,14 @@ def fiber_training_views(point_collections, resolved_links, verified_patches,
     """Derive the fiber training views from prepared fibers and resolved links.
 
     ``point_collections`` are the prepared catalog fibers (prepare_fiber_catalog)
-    in catalog order; ``resolved_links`` are same-winding links
-    ``{'a_coll', 'a_point', 'b_coll', 'b_point', 'pending'}`` between them.
-    A fiber with two or more patch attachments is a cross-patch view (linked
-    fibers merge into one component). Every fiber with two points in the z
+    in catalog order; ``resolved_links`` are branch links
+    ``{'a_coll', 'a_point', 'b_coll', 'b_point', 'pending', 'winding_offset'}``
+    between them. A fiber with two or more patch attachments is a cross-patch
+    view (linked fibers merge into one component). Every point of a linked
+    fiber carries its fiber's winding offset in its component
+    (fiber_winding_offsets) as its winding annotation, so an adjacent-winding
+    link ties its fibers one winding apart along their whole length; links
+    that close an inconsistent loop are left out of the components. Every fiber with two points in the z
     window also keeps its strip, attached or not: a representative patch
     contact says nothing about how much of the fiber the patches cover.
 
@@ -351,6 +390,15 @@ def fiber_training_views(point_collections, resolved_links, verified_patches,
     link_components.sort(
         key=lambda component: min(
             catalog_position[cid] for cid in component[0]))
+    winding_offsets, contradicting = fiber_winding_offsets(link_components)
+    if contradicting:
+        dropped = {id(link) for link in contradicting}
+        print(f'WARNING: dropping {len(contradicting)} fiber link(s) whose winding '
+              'offsets contradict their component: '
+              f'{[link.get("edge_uuid") for link in contradicting]}')
+        link_components = [
+            (member_cids, [link for link in member_links if id(link) not in dropped])
+            for member_cids, member_links in link_components]
     cross_patch = {}
     for cid, pcl in point_collections.items():
         num_attached = sum(
@@ -362,14 +410,15 @@ def fiber_training_views(point_collections, resolved_links, verified_patches,
         cross_patch, _ = merge_linked_point_collections(
             point_collections, link_components, cross_patch)
 
-    # Fibers carry no winding annotations. Their point dictionaries are
-    # shared by the catalog and derived PCLs, so normalize them directly after
-    # link resolution; subsequent materializations explicitly resolve catalog
-    # fibers as unannotated.
-    for pcl in point_collections.values():
+    # Fibers carry no winding annotations of their own: a fiber's points
+    # take its winding offset in its link component (0 when unlinked). Their
+    # point dictionaries are shared by the catalog and derived PCLs, so set
+    # them directly after link resolution.
+    for cid, pcl in point_collections.items():
         pcl['has_winding_annotations'] = False
+        winding = float(winding_offsets.get(cid, 0))
         for point in pcl['points'].values():
-            point['winding_annotation'] = 0.0
+            point['winding_annotation'] = winding
 
     for pcl in cross_patch.values():
         group_points_by_patch(pcl, verified_patches)

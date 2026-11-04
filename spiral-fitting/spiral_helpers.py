@@ -493,7 +493,8 @@ def merge_linked_point_collections(point_collections, link_components,
     """Fold link-connected collections into merged cross-patch component pcls.
 
     link_components is the shared decomposition from build_link_components
-    over fiber branch links (fibers carry no winding annotations).
+    over fiber branch links; member points carry their fiber's winding
+    offset in the component (pcl_views.fiber_winding_offsets).
     For each link component, removes the member collections from the cross-patch
     pool and (when the union holds >= 2 attached points) adds one merged pcl
     whose points are the union of all member points, renumbered member-major.

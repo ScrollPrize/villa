@@ -89,14 +89,20 @@ def _settled_update(state, timeout=60):
 # The binding
 # ---------------------------------------------------------------------------
 
-def test_the_binding_clones_and_checks_its_hub(hub, tmp_path):
+def test_the_binding_clones_and_checks_its_hub(hub, tmp_path, capsys):
     binding = spiral_service.bind_object_store(hub['service'], 'svc', hub['hub'])
     assert binding.hosted and Path(hub['service']).is_file()
+    # The clone is announced before it starts and when it ends (the only
+    # startup lines a client sees while a large hub copies); a reused
+    # replica is not.
+    printed = capsys.readouterr().out
+    assert 'Cloning the object-store hub' in printed and 'Cloned the object-store hub' in printed
     assert binding.hub == str(Path(hub['hub']).resolve())
     with ObjectStore.open(hub['editor'], read_only=True) as db:
         assert binding.hub_identity == db.hub_status()['hub_replica']
     # An existing replica binds its own hub, with or without the flag.
     assert spiral_service.bind_object_store(hub['service'], 'svc') == binding
+    assert 'Cloning' not in capsys.readouterr().out
     advertised = binding.advertisement()['hub']
     assert advertised['identity'] == binding.hub_identity and advertised['position'] > 0
     # A replica that cannot be read says why rather than reporting nothing.

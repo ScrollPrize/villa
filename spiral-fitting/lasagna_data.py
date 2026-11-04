@@ -1,3 +1,4 @@
+import contextlib
 import json
 import os
 
@@ -14,8 +15,11 @@ from lasagna_source import array_shape_matches
 from pack_resident_pools import pack_arrays
 
 
-def _ensure_sidecar(array_dirs, sidecar, *, identity, label, stage_name, progress=None):
-    """Build one missing resident-pool sidecar, safely across fit processes."""
+def _ensure_sidecar(array_dirs, sidecar, *, identity, label, stage_name, progress=None,
+                   local_arrays=None):
+    """Build one missing resident-pool sidecar, safely across fit processes.
+    ``local_arrays(array_dirs, sidecar, progress)``, when given, is a context
+    manager making the arrays local while the pack is built from them."""
     meta_path = os.path.join(sidecar, 'meta.json')
     if os.path.exists(meta_path):
         return sidecar
@@ -49,17 +53,22 @@ def _ensure_sidecar(array_dirs, sidecar, *, identity, label, stage_name, progres
                     progress.finish(detail='built by another process')
                 return sidecar
 
-            pack_arrays(
-                array_dirs,
-                sidecar,
-                label=label,
-                lasagna_identity=identity,
-                progress_callback=(
-                    (lambda current, total, detail: progress.update(
-                        current, total_steps=total, detail=detail))
-                    if progress is not None else None
-                ),
-            )
+            with (local_arrays(array_dirs, sidecar, progress) if local_arrays
+                  else contextlib.nullcontext(array_dirs)) as local:
+                if local_arrays and progress is not None:
+                    progress.begin('building', stage_name, step=0, total_steps=0,
+                                   unit='chunks', detail=sidecar)
+                pack_arrays(
+                    local,
+                    sidecar,
+                    label=label,
+                    lasagna_identity=identity,
+                    progress_callback=(
+                        (lambda current, total, detail: progress.update(
+                            current, total_steps=total, detail=detail))
+                        if progress is not None else None
+                    ),
+                )
         finally:
             if fcntl is None:  # pragma: no cover - Windows fallback
                 lock_file.seek(0)
@@ -89,15 +98,17 @@ def ensure_fit_sparse_stores(
     use_normals,
     use_spacing,
     progress=None,
+    local_arrays=None,
 ):
     """Build the resident pools one fit needs from the dataset's arrays when
-    they are absent (the command-line fit or an opted-in local service)."""
+    they are absent (the command-line fit, or a service that builds them).
+    ``local_arrays``: see _ensure_sidecar."""
     for kind in _fit_packs(use_normals, use_spacing):
         label, stage_name = _PACKS[kind]
         _ensure_sidecar(
             source.arrays(kind), source.pack_directory(cache_directory, kind),
             identity=source.identity, label=label, stage_name=stage_name,
-            progress=progress)
+            progress=progress, local_arrays=local_arrays)
 
 
 def _require_sidecar(source, cache_directory, kind):

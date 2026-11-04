@@ -431,6 +431,9 @@ private:
     QProcess* _process = nullptr;       // owned local service process, if any
     QStringList _ownedLaunchBinding;    // --output/--cache/--object-store/--winding-inference of _process
     bool _waitingForLocalStore = false;
+    // Set while stopService() stops _process: its exit is then the one asked
+    // for (a disconnect, restart or profile switch), not a failure.
+    bool _stoppingProcess = false;
     std::weak_ptr<vc::objects::ObjectStoreSession> _storeSession;
     std::unique_ptr<vc::objects::AttachmentIdentity> _storeAttachment;
     QString _localStorePath;

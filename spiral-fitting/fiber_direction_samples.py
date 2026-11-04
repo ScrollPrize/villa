@@ -20,18 +20,14 @@ from concurrent.futures import ThreadPoolExecutor
 import json
 from pathlib import Path
 import threading
-import time
-from urllib.parse import unquote, urljoin, urlparse
-import xml.etree.ElementTree as ET
+from urllib.parse import urljoin
 
 import numpy as np
 
+from remote_zarr import chunk_url, fetch, get_json, is_http, list_s3_chunk_indices
+
 
 FORMAT_VERSION = 2
-
-
-def _is_http(location):
-    return urlparse(str(location)).scheme in ("http", "https")
 
 
 def _manifest_location(location):
@@ -43,7 +39,7 @@ def _manifest_location(location):
 
     location = str(location)
     if is_remote_location(location):
-        if not _is_http(location):
+        if not is_http(location):
             raise ValueError(f"fiber directions are read over HTTP(S), not {location}")
         return location
     path = Path(location)
@@ -56,49 +52,10 @@ def _manifest_location(location):
     return str(path)
 
 
-def _get_json(session, location):
-    if not _is_http(location):
-        return json.loads(Path(location).read_text())
-    response = session.get(location, timeout=60)
-    response.raise_for_status()
-    return response.json()
-
-
-def _chunk_url(array_url, index, metadata):
-    separator = metadata.get("dimension_separator", ".")
-    return f"{array_url.rstrip('/')}/{separator.join(map(str, index))}"
-
-
-def _fetch(session, location):
-    """The bytes of the object at a URL or local path; None when absent."""
-    import requests
-
-    if not _is_http(location):
-        try:
-            return Path(location).read_bytes()
-        except FileNotFoundError:
-            return None
-    for attempt in range(6):
-        try:
-            response = session.get(location, timeout=60)
-            if response.status_code < 500:
-                break
-        except (requests.ConnectionError, requests.Timeout):
-            if attempt == 5:
-                raise
-        if attempt == 5:
-            response.raise_for_status()
-        time.sleep(min(2 ** attempt, 8))
-    if response.status_code == 404:
-        return None
-    response.raise_for_status()
-    return response.content
-
-
 def _read_chunk(session, array_url, metadata, index):
     import numcodecs
 
-    content = _fetch(session, _chunk_url(array_url, index, metadata))
+    content = fetch(session, chunk_url(array_url, index, metadata))
     shape = np.asarray(metadata["shape"], dtype=np.int64)
     chunks = np.asarray(metadata["chunks"], dtype=np.int64)
     begin = np.asarray(index, dtype=np.int64) * chunks
@@ -124,51 +81,6 @@ def _read_chunk(session, array_url, metadata, index):
     raise ValueError(
         f"decoded chunk {index} has {values.size} values; expected "
         f"{edge_size} (logical edge) or {full_size} (full stored chunk)")
-
-
-def _list_s3_chunk_indices(session, array_url, metadata, first_chunk, last_chunk):
-    """Return existing chunk indices for an anonymous virtual-hosted S3 URL."""
-    parsed = urlparse(array_url)
-    if not parsed.hostname or ".s3." not in parsed.hostname:
-        return None
-    separator = metadata.get("dimension_separator", ".")
-    array_key = unquote(parsed.path.lstrip("/").rstrip("/"))
-    result = set()
-    for cz in range(int(first_chunk[0]), int(last_chunk[0]) + 1):
-        prefix = f"{array_key}/{cz}{separator}"
-        continuation = None
-        while True:
-            params = {"list-type": "2", "prefix": prefix}
-            if continuation:
-                params["continuation-token"] = continuation
-            response = session.get(
-                f"{parsed.scheme}://{parsed.netloc}/", params=params, timeout=60)
-            if response.status_code in (401, 403):
-                return None
-            response.raise_for_status()
-            root = ET.fromstring(response.content)
-            keys = [node.text for node in root.iter()
-                    if node.tag.rsplit("}", 1)[-1] == "Key"]
-            for key in keys:
-                suffix = key[len(array_key) + 1:]
-                try:
-                    index = tuple(int(value) for value in suffix.split(separator))
-                except (TypeError, ValueError):
-                    continue
-                if (len(index) == 3
-                        and all(first_chunk[axis] <= index[axis] <= last_chunk[axis]
-                                for axis in range(3))):
-                    result.add(index)
-            truncated = next((node.text == "true" for node in root.iter()
-                              if node.tag.rsplit("}", 1)[-1] == "IsTruncated"), False)
-            if not truncated:
-                break
-            continuation = next((node.text for node in root.iter()
-                                 if node.tag.rsplit("}", 1)[-1]
-                                 == "NextContinuationToken"), None)
-            if not continuation:
-                raise ValueError("truncated S3 listing omitted continuation token")
-    return result
 
 
 def _parse_z_roi(value):
@@ -223,7 +135,7 @@ def extract(location, z_roi, output=None, *, cache=None, identity=None,
                     else local_manifest_identity(location))
     manifest_location = _manifest_location(location)
     with requests.Session() as session:
-        manifest = _get_json(session, manifest_location)
+        manifest = get_json(session, manifest_location)
         output = Path(fiber_directions_path(cache, identity, output_scale)
                       if cache is not None else output)
         output.parent.mkdir(parents=True, exist_ok=True)
@@ -231,10 +143,10 @@ def extract(location, z_roi, output=None, *, cache=None, identity=None,
             raise FileExistsError(f"output already exists: {output} (use --overwrite)")
         groups = manifest["groups"]
         urls = {name: (urljoin(manifest_location, groups[name]["zarr"])
-                       if _is_http(manifest_location) else
+                       if is_http(manifest_location) else
                        str(Path(manifest_location).parent / groups[name]["zarr"]))
                 for name in ("presence", "nx", "ny")}
-        metadata = {name: _get_json(session, f"{url.rstrip('/')}/.zarray")
+        metadata = {name: get_json(session, f"{url.rstrip('/')}/.zarray")
                     for name, url in urls.items()}
         reference = metadata["presence"]
         for name in ("nx", "ny"):
@@ -284,7 +196,7 @@ def extract(location, z_roi, output=None, *, cache=None, identity=None,
         }
         first_chunk = begin // chunks
         last_chunk = (end - 1) // chunks
-        available = _list_s3_chunk_indices(
+        available = list_s3_chunk_indices(
             session, urls["presence"], reference, first_chunk, last_chunk)
         if available is not None:
             log(f"S3 listing found {len(available):,} stored presence chunks "

@@ -161,6 +161,20 @@ QImage maskOverlayToSurface(
     return image;
 }
 
+// Why saved drawings could not reach the service's fit, or empty when the
+// attached store is the one it fits (or no service has named its store).
+QString fitStoreMismatch(const SpiralServiceManager::StoreBinding& binding)
+{
+    if (!binding.advertised() || binding.matches()) return {};
+    if (binding.serviceUuid == binding.localUuid)
+        return QObject::tr("The attached store is not a replica of the Spiral service's hub (%1): "
+                           "clone that hub to save drawings the fit can use")
+            .arg(binding.serviceHubIdentity);
+    return QObject::tr("The Spiral service fits store %1, not the attached store %2: "
+                       "drawings saved here would never reach the fit")
+        .arg(binding.serviceUuid, binding.localUuid);
+}
+
 } // namespace
 
 SpiralWorkspace::SpiralWorkspace(CState* mainState, QWidget* parent)
@@ -1074,6 +1088,8 @@ void SpiralWorkspace::submitReadyDrafts(bool updateAfter)
     std::optional<double> scale;
     if (!attachment || !session->writable(*attachment))
         problem = tr("Route surfaces, fibers and point collections to one writable store to save Spiral drawings");
+    else if (const QString mismatch = fitStoreMismatch(_service->storeBinding()); !mismatch.isEmpty())
+        problem = mismatch;
     else if (!_fitInputs || _fitInputs->volumeUuid.empty())
         problem = tr("Spiral drawings are saved in the fit's volume: wait until the fit's inputs are shown");
     else

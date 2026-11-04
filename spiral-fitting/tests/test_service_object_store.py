@@ -643,9 +643,65 @@ def test_local_service_packs_before_linking_and_reuses_cache(host, store_path, t
     assert meta.stat().st_mtime_ns == before
 
 
-@pytest.mark.parametrize('location', ['https://example.invalid/array', '/missing/array'])
+@pytest.mark.parametrize('flags, builds', [([], True), (['--build-missing-lasagna-packs'], True),
+                                            (['--require-prepared-lasagna-packs'], False)])
+def test_a_launched_service_builds_missing_packs_unless_told_not_to(
+        tmp_path, store_path, monkeypatch, flags, builds):
+    class Constructed(Exception):
+        pass
+
+    def construct(**kwargs):
+        raise Constructed(kwargs['build_missing_lasagna_packs'])
+    monkeypatch.setattr(spiral_service, 'ServiceState', construct)
+    import sys
+    monkeypatch.setattr(sys, 'stdout', sys.stdout)
+    monkeypatch.setattr(sys, 'stderr', sys.stderr)
+    with pytest.raises(Constructed) as constructed:
+        spiral_service.main(['--object-store', str(store_path), '--output', str(tmp_path / 'out'),
+                             '--cache', str(tmp_path / 'cache'),
+                             '--api-key-file', str(tmp_path / 'key'), *flags])
+    assert constructed.value.args == (builds,)
+
+
+def test_a_service_packs_remote_arrays_as_it_packs_local_ones(host, store_path, tmp_path,
+                                                             monkeypatch):
+    import numpy as np
+    import requests
+    from fake_s3 import BUCKET, FakeS3Session
+    from test_sparse_cuda_cache import write_raw_pack_source
+
+    channels = ('normal_x', 'normal_y', 'gradient_magnitude')
+    for value, channel in enumerate(channels):
+        write_raw_pack_source(tmp_path / 'bucket' / channel / '0',
+                              np.full((16, 16, 16), 100 + value, dtype=np.uint8))
+
+    def lasagna(identity, root):
+        return {'location': '/client/remote_cache/s.lasagna.json', 'identity': identity,
+                'group': '0', **{channel: f'{root}/{channel}' for channel in channels}}
+    local = lasagna('local-copy', tmp_path / 'bucket')
+    remote = lasagna('remote-copy', BUCKET)
+    gets = []
+    monkeypatch.setattr(requests, 'Session', lambda: FakeS3Session(tmp_path / 'bucket', gets))
+
+    def built(dataset):
+        _built(service(host, store_path, build_missing_lasagna_packs=True),
+               initialize_body(loss_weight_dense_spacing=1) | {
+                   'project': project(lasagna=dataset, lasagna_scale=2)})
+        return host.cache / 'lasagna' / dataset['identity']
+    from_local, from_remote = built(local), built(remote)
+    assert gets
+    for kind in ('normals_g0', 'grad_mag_g0'):
+        for name in ('table.npy', 'channel_0.u8'):
+            assert (from_remote / kind / name).read_bytes() == (from_local / kind / name).read_bytes()
+        # The fetched arrays are removed once packed.
+        assert not (from_remote / f'{kind}.arrays').exists()
+
+
+@pytest.mark.parametrize('location, refused', [
+    ('s3://bucket/array', 'neither local nor HTTP(S)'),
+    ('/missing/array', 'not an accessible local array')])
 def test_pack_failure_preserves_resident_before_link_refresh(host, store_path,
-                                                            monkeypatch, location):
+                                                            monkeypatch, location, refused):
     import object_store_inputs as osi
     state = service(host, store_path, build_missing_lasagna_packs=True)
     resident = SimpleNamespace(status=lambda: {"state": SessionState.Idle})
@@ -655,7 +711,7 @@ def test_pack_failure_preserves_resident_before_link_refresh(host, store_path,
                'group': '0', 'normal_x': location, 'normal_y': location}
     failure = _built(state, initialize_body() | {
         'project': project(lasagna=lasagna, lasagna_scale=2)})
-    assert 'not an accessible local array' in failure['message']
+    assert refused in failure['message']
     assert state.session is resident
 
 
@@ -709,6 +765,30 @@ def test_fiber_directions_are_the_project_datasets_cached_samples(host, store_pa
                       body({**local, 'identity': 'fibers-unused'},
                            input_use_fiber_directions=True))
     assert paths.fiber_directions == ''
+
+
+def test_fiber_directions_extract_from_the_copys_remote_manifest(host, store_path, monkeypatch):
+    import fiber_direction_samples
+    from lasagna_source import fiber_directions_path
+    calls = []
+
+    def extract(location, output, path, *, identity, **kwargs):
+        calls.append((location, identity))
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        Path(path).write_bytes(b'')
+    monkeypatch.setattr(fiber_direction_samples, 'extract', extract)
+    # VC3D's copy is not on this host; the manifest it was copied from is read,
+    # under the identity VC3D sent.
+    fibers = {'location': '/client/remote_cache/f/f.lasagna.json', 'identity': 'fibers-copy',
+              'remote_manifest': 'https://data.example/f/f.lasagna.json'}
+    body = initialize_body(input_use_fiber_directions=True, loss_weight_fiber_directions=1.0) | {
+        'project': project(fiber_inference=fibers, fiber_scale=4)}
+    paths, _ = _built(service(host, store_path, build_missing_lasagna_packs=True), body)
+    assert calls == [('https://data.example/f/f.lasagna.json', 'fibers-copy')]
+    assert paths.fiber_directions == fiber_directions_path(host.cache, 'fibers-copy', 4)
+    with pytest.raises(ApiError, match=r'remote_manifest must be an HTTP\(S\) URL'):
+        service(host, store_path).initialize(initialize_body() | {'project': project(
+            fiber_inference={**fibers, 'remote_manifest': 's3://data/f.lasagna.json'})})
 
 
 def test_a_changed_project_volume_rebuilds_everything(host, store_path):

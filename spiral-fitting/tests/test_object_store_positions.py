@@ -68,7 +68,12 @@ def test_prepare_links_publishes_and_pins_a_position(store):
             assert len(db.edges_by_kind('point-surface')) == 3
     # Later commits do not change N: every replica reads the same inputs at it.
     request = pinned(store.path, prepared.position)
-    before = read(store.path, request)
+    # The service's store is at N once it has pinned it (a replica pulls its
+    # own publication back), so the inputs at N are its current state: the
+    # read never rebuilds N from the history, which for a replica is the
+    # hub's (opened over the network for an sftp:// hub).
+    with ObjectStore.open(store.path, read_only=True) as db:
+        before = osi.read_snapshot(NoHistory(db), request)
     assert len(before.relationships) == 3
     assert before.manifest()['position'] == prepared.position.provenance()
     store.edit(walk, lambda db: db.set_meta(walk, 'sampling_group', 'later'))
@@ -80,7 +85,10 @@ def test_prepare_links_publishes_and_pins_a_position(store):
             assert db.object(walk)['meta']['sampling_group'] == 'later'
         after = read(path, request)
         assert after.digest() == before.digest()
-        assert after.manifest()['objects'] == before.manifest()['objects']
+        # Object revision UUIDs are each replica's own (the current state's
+        # or the hub's history's): every shared identity agrees.
+        assert osi._compared(after.manifest())['objects'] == \
+            osi._compared(before.manifest())['objects']
     [entry] = [e for e in before.manifest()['objects'] if e['uuid'] == walk]
     assert entry['metadata']['sampling_group'] == 'reviewed'
     # Nothing new to link: the conditional push validates the head, N = H.
@@ -202,6 +210,20 @@ def test_a_conflicting_approval_keeps_the_hub_side(replicas, monkeypatch):
         [record] = [r['record'] for r in view['relationships'] if r['record']['uuid'] == edge]
         assert record['approval_state'] == 'approved'
         assert db.hub_status()['conflicts'] == []
+
+
+class NoHistory:
+    """A store whose history reads fail: a read through it must use the
+    current state."""
+
+    def __init__(self, store):
+        self.store = store
+
+    def hub_read_view_at(self, *args, **kwargs):
+        raise AssertionError('read the history instead of the current state')
+
+    def __getattr__(self, name):
+        return getattr(self.store, name)
 
 
 class LostResponse:

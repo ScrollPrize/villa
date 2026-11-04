@@ -64,15 +64,6 @@ std::vector<int64_t> readIds(const ObjectStore& db, const Txn& txn,
     return ids;
 }
 
-bool truthy(const Json& value)
-{
-    if (value.is_null()) return false;
-    if (value.is_boolean()) return value.get<bool>();
-    if (value.is_number()) return value.get<double>() != 0;
-    if (value.is_string() || value.is_array() || value.is_object()) return !value.empty();
-    return true;
-}
-
 // object_store_inputs.KINDS and FAMILIES: the relationship families the
 // fitter consumes, by edge kind and endpoint kinds in KINDS order.
 int kindIndex(const std::string& kind)
@@ -117,8 +108,6 @@ std::optional<Json> consumedIdentity(const vc::objects::SelectedRelationship& se
         std::swap(ends[0], ends[1]);
     const auto family = relationshipFamily(record.kind, ends[0].kind, ends[1].kind);
     if (family.empty()) return std::nullopt;
-    const Json meta = record.meta.empty() ? Json::object() : Json::parse(record.meta);
-    if (family == "fiber_branch" && truthy(valueOrNull(meta, "adjacent"))) return std::nullopt;
     if (record.approvalState == "rejected") return std::nullopt;
     if (approvedLinksOnly && record.approvalState != "approved") return std::nullopt;
     const auto geometry = [](const auto& revision) { return revision ? Json(*revision) : Json(nullptr); };

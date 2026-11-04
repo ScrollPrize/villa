@@ -466,10 +466,17 @@ def object_frame(meta, volume_uuid, fit_scale=1):
 def _relationship_family(record, kinds):
     endpoint_kinds = tuple(sorted((kinds[record['a']], kinds[record['b']]),
                                   key=KINDS.index))
-    family = FAMILIES.get((record['kind'], endpoint_kinds))
-    if family == 'fiber_branch' and (record['meta'] or {}).get('adjacent'):
-        return 'adjacent_branch'
-    return family
+    return FAMILIES.get((record['kind'], endpoint_kinds))
+
+
+def adjacent_winding_offset(fiber_a, fiber_b):
+    """W_b - W_a an adjacent-winding branch between two fiber objects
+    asserts: the vertical fiber lies one winding inside the horizontal one.
+    None unless one is H and the other V by stored family (the effective
+    manual-else-automatic tag VC3D signed the branch with; VC3D's
+    adjacentWindingOffset)."""
+    families = tuple((fiber.fiber or {}).get('family') for fiber in (fiber_a, fiber_b))
+    return {('H', 'V'): -1, ('V', 'H'): 1}.get(families)
 
 
 def _ordered_endpoints(entry, kinds):
@@ -488,7 +495,8 @@ def filter_relationships(view_relationships, objects, approved_links_only):
     A relationship is consumed when both endpoints are selected, it applies
     to their selected revisions, it belongs to a family the fitter uses and
     its approval state is allowed (never 'rejected'; only 'approved' in
-    approved-only mode). Adjacent fiber branches are excluded explicitly.
+    approved-only mode). Adjacent-winding fiber branches are consumed like
+    ordinary ones; materialize_fibers signs them.
     """
     kinds = {uuid: obj.kind for uuid, obj in objects.items()}
     consumed, exclusions = [], Counter()
@@ -503,9 +511,6 @@ def filter_relationships(view_relationships, objects, approved_links_only):
         family = _relationship_family(record, kinds)
         if family is None:
             exclusions[f'unused kind {record["kind"]}'] += 1
-            continue
-        if family == 'adjacent_branch':
-            exclusions['adjacent fiber branch'] += 1
             continue
         state = record['approval_state']
         if state == 'rejected':
@@ -552,9 +557,18 @@ def check_position(store, position):
 
 
 def _at_head(store, position):
-    """Whether ``position`` is the head of the plain store whose positions
-    it names: nothing was written after it, so the store's current state is
-    the state at it."""
+    """Whether the store's current state is the state at ``position``: the
+    head of the plain store whose positions it names (nothing was written
+    after it), or the hub state a replica of that hub last pulled, with no
+    change of its own unpushed or in conflict (a replica holds the hub's
+    records as of its last pull, so its current state is that position's).
+    Both are local reads: the history read this avoids opens the hub, over
+    the network for an sftp:// one."""
+    status = store.hub_status()
+    if status is not None:
+        return (status['hub_replica'] == position.hub
+                and status['position'] == position.sequence
+                and not status['pending'] and not status['conflicts'])
     positions = store.store_positions()
     return (positions is not None and positions['store'] == position.hub
             and positions['position'] == position.sequence)
@@ -767,7 +781,8 @@ class FitInputs:
     order. ``point_collections`` maps resident collection ids to regular PCLs
     whose attached points carry ``on_patch`` ({'id', 'ij', 'edge_uuid'}).
     ``fibers`` maps fiber UUIDs to fiber collections (materialize_fibers) and
-    ``fiber_links`` holds their resolved same-winding branch links.
+    ``fiber_links`` holds their resolved branch links, each with the
+    ``winding_offset`` it asserts (0 same-winding, +-1 adjacent).
     ``patch_overlaps`` maps resident ids to the two-point same-surface
     collections of materialize_patch_overlaps. ``tracks`` holds the track
     collection and its crossings (materialize_tracks), or None when no track
@@ -1054,7 +1069,11 @@ def materialize_fibers(store, snapshot, patches, *, min_point_spacing,
     attach to several patches. A contact on a quad the losses do not sample
     is not attached, and is appended to ``dropped`` as ``(edge UUID, reason)``.
     ``links`` are resolved branch links keyed by resident collection id and
-    raw line index.
+    raw line index; each carries the winding gap it asserts between its
+    ends, ``winding_offset`` = W_b - W_a: 0 for a same-winding branch, -1 or
+    +1 for an adjacent-winding one (adjacent_winding_offset). An adjacent
+    branch whose fibers are not one H and one V asserts no direction and is
+    left out.
     """
     from vc_object_store import fiber_branch_control_index, fiber_hv_classification
     from spiral_helpers import (_decimate_ordered_points_min_spacing,
@@ -1172,10 +1191,18 @@ def materialize_fibers(store, snapshot, patches, *, min_point_spacing,
 
     links = []
     for rel in snapshot.relationships_of('fiber_branch'):
+        winding_offset = 0
+        if rel.meta.get('adjacent'):
+            winding_offset = adjacent_winding_offset(
+                snapshot.objects[rel.a], snapshot.objects[rel.b])
+            if winding_offset is None:
+                counts['adjacent fiber branches not one H and one V'] += 1
+                continue
         links.append({
             'a_coll': resident_id[rel.a], 'a_point': branch_points[rel.a][rel.uuid],
             'b_coll': resident_id[rel.b], 'b_point': branch_points[rel.b][rel.uuid],
             'pending': rel.approval_state != 'approved', 'edge_uuid': rel.uuid,
+            'winding_offset': winding_offset,
         })
     counts['fiber branches'] = len(links)
     return catalog, links, counts
@@ -2381,6 +2408,25 @@ def _conditional_push(store, head):
         return {**store.hub_sync(pull=False, push=True, expected_head=head), 'retried': True}
 
 
+def _pull_to_published(store, position):
+    """Pull after this replica's links were published at ``position`` N, so
+    it records N (a push leaves it at the head H it pulled): reads of the
+    inputs at N then use its current state (_at_head) instead of rebuilding
+    N from the hub's history, which scans every revision on the hub. The
+    pull brings back only this replica's own links, unless the hub moved
+    past N, when the reads fall back to the history. A failed pull costs
+    only that fallback, so it is reported, not raised."""
+    try:
+        pulled = store.hub_sync(pull=True, push=False)
+    except Exception as exc:  # noqa: BLE001 - reads stay correct, only slower
+        return [f'could not pull the published position {position} ({type(exc).__name__}: '
+                f'{exc}); the inputs are read from the hub\'s history']
+    if pulled['conflicts'] or pulled['pulled_position'] != position:
+        return [f'the hub moved past the published position {position} (to '
+                f'{pulled["pulled_position"]}); the inputs are read from its history']
+    return []
+
+
 def prepare_position(store, config, request, *, lasagna=None, minimum=None,
                      cache_directory=None, log=print, attempts=4, incremental=False,
                      progress=None):
@@ -2468,6 +2514,7 @@ def prepare_position(store, config, request, *, lasagna=None, minimum=None,
             continue
         position = pushed['published_position']
         lines = lines + [f'links published at hub position {position} (linked at {head})']
+        lines.extend(_pull_to_published(store, position))
         _record_marker(store, result, position, lines)
         break
     else:

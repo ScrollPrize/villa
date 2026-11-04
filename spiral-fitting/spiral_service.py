@@ -57,6 +57,7 @@ from session_lease import SessionLease
 from workspace_storage import reclaim_workspaces
 from collections import OrderedDict, deque
 from collections.abc import Mapping
+import contextlib
 import copy
 import dataclasses
 import hashlib
@@ -126,6 +127,8 @@ PREVIEW_ARTIFACTS_KEPT = 3
 CHECKPOINT_ARTIFACTS_KEPT = 2
 # Parallel chunk reads when extracting missing fiber directions.
 FIBER_DIRECTION_WORKERS = 64
+# Parallel object fetches when copying remote Lasagna arrays to pack them.
+FETCH_WORKERS = 64
 # Upper bound on the checkpoint listing /bindings advertises. A client offers
 # this as a choice, so it is a menu, not an inventory.
 SESSION_CHECKPOINTS_LISTED = 200
@@ -377,6 +380,12 @@ def bind_object_store(path, author=None, hub=None):
             "its build's python directory on PYTHONPATH") from exc
     remote = hub is not None and "://" in str(hub)
     if hub is not None and not resolved.exists():
+        # A clone copies the whole hub and reports nothing while it runs (a
+        # large one over sftp takes minutes): say so before it starts, as
+        # the only line a client sees until it ends.
+        print(f"Cloning the object-store hub {hub} into this service's replica "
+              f"{resolved} (first launch; later launches reuse it)…", flush=True)
+        started = time.monotonic()
         try:
             resolved.parent.mkdir(parents=True, exist_ok=True)
             vos.hub_clone(_canonical_hub(vos, hub), str(resolved), author)
@@ -384,6 +393,8 @@ def bind_object_store(path, author=None, hub=None):
             raise ObjectStoreBindingError(
                 f"cannot clone the hub {hub} to {resolved}: {exc}"
                 + (f"; {_REMOTE_HUB_HINT}" if remote else "")) from exc
+        print(f"Cloned the object-store hub ({resolved.stat().st_size / 2**20:.0f} MiB "
+              f"in {time.monotonic() - started:.0f} s)", flush=True)
     if not resolved.is_file():
         raise ObjectStoreBindingError(f"no object store at {resolved}")
     try:
@@ -2129,10 +2140,10 @@ class ServiceState:
                 self._note_pending_commits()
 
     def _prepare_fiber_directions(self, scroll, volume, paths, config):
-        """Opted-in hosts extract the fiber directions a fit with the
-        fiber-direction loss reads, when the cache lacks them, from the
-        project's fiber-inference dataset (whose own problems the scroll's
-        resolution reports)."""
+        """Unless it requires prepared inputs, a host extracts the fiber
+        directions a fit with the fiber-direction loss reads, when the cache
+        lacks them, from the project's fiber-inference dataset (whose own
+        problems the scroll's resolution reports)."""
         if not self.build_missing_lasagna_packs or not fiber_directions_required(config):
             return
         try:
@@ -2148,8 +2159,9 @@ class ServiceState:
             self.events.append("log", f"Fiber directions: {line}", source="service",
                                operation="preparing_inputs")
         dataset = scroll.project.fiber_inference
-        log(f"extracting from {dataset.location} into {path}")
-        extract(dataset.location, None, path, identity=dataset.identity,
+        location = dataset.extraction_location()
+        log(f"extracting from {location} into {path}")
+        extract(location, None, path, identity=dataset.identity,
                 output_scale=scroll.fiber_scale(volume, level),
                 workers=FIBER_DIRECTION_WORKERS, log=log)
 
@@ -2167,10 +2179,14 @@ class ServiceState:
             self._effective_config(paths, run), load_lasagna_source(paths.lasagna)))}
 
     def _prepare_lasagna_packs(self, paths, config):
-        """Opted-in hosts build missing pools from local arrays before linking."""
+        """Unless it requires prepared packs, a host builds missing pools
+        before linking: from local arrays, or from HTTP(S) ones it first
+        fetches whole into the cache (beside the pack, removed once it is
+        built; an interrupted fetch resumes)."""
         if not self.build_missing_lasagna_packs or not paths.lasagna:
             return
         from lasagna_source import is_remote_location
+        from remote_zarr import is_http
         source = load_lasagna_source(paths.lasagna)
         kinds = _lasagna_pack_kinds(config, source)
         if not kinds:
@@ -2180,7 +2196,12 @@ class ServiceState:
                     source.pack_directory(paths.cache_directory, kind), "meta.json")):
                 continue
             for array in source.arrays(kind):
-                if is_remote_location(array) or not os.path.isdir(array):
+                if is_remote_location(array) and not is_http(array):
+                    raise ValueError(
+                        f"Cannot build missing Lasagna {kind} pack: {array} is "
+                        "neither local nor HTTP(S). Prepare the pack where the "
+                        "arrays are and copy it into the service cache.")
+                if not is_remote_location(array) and not os.path.isdir(array):
                     raise ValueError(
                         f"Cannot build missing Lasagna {kind} pack: {array} is not "
                         "an accessible local array. Prepare the pack where the "
@@ -2192,7 +2213,7 @@ class ServiceState:
             ensure_fit_sparse_stores(
                 source=source, cache_directory=paths.cache_directory,
                 use_normals="normals" in kinds, use_spacing="grad_mag" in kinds,
-                progress=progress)
+                progress=progress, local_arrays=_fetched_lasagna_arrays)
             for kind in sorted(kinds):
                 _require_sidecar(source, paths.cache_directory, kind)
         finally:
@@ -3898,6 +3919,32 @@ def _route_upload_file(ctx):
         ctx.args[0], ctx.args[1], handler.rfile, length, offset=offset)
 
 
+@contextlib.contextmanager
+def _fetched_lasagna_arrays(arrays, sidecar, progress):
+    """``arrays`` made local for building ``sidecar``: each HTTP(S) one
+    fetched whole into ``<sidecar>.arrays/<i>``, removed once the pack is
+    built and kept, to resume, when building fails."""
+    from lasagna_source import is_remote_location
+    from remote_zarr import mirror_array
+
+    root = Path(f"{sidecar}.arrays")
+    local = []
+    for index, array in enumerate(arrays):
+        if not is_remote_location(array):
+            local.append(array)
+            continue
+        if progress is not None:
+            progress.begin("fetching", "Fetching remote Lasagna arrays", step=0,
+                           total_steps=0, unit="chunks", detail=array)
+        local.append(mirror_array(
+            array, root / str(index), workers=FETCH_WORKERS,
+            progress=(None if progress is None else
+                      lambda done, total: progress.update(done, total_steps=total))))
+    yield local
+    if root.exists():
+        shutil.rmtree(root, ignore_errors=True)
+
+
 def _lasagna_pack_kinds(config, source):
     """The Lasagna pack kinds a build of ``config`` reads from ``source``:
     the fit's (lasagna_packs_required), and normals for the link refresh
@@ -4308,11 +4355,16 @@ def main(argv=None):
     parser.add_argument("--object-store-author", default=None, metavar="NAME",
                         help="Author of the links this service's refresh "
                              "writes (default: spiral-service@<host>)")
+    parser.add_argument("--require-prepared-lasagna-packs", action="store_true",
+                        help="Require Lasagna packs and fiber directions prepared in "
+                             "--cache (for a shared host whose cache is curated). By "
+                             "default missing packs are built from accessible local "
+                             "arrays, and missing fiber directions extracted from the "
+                             "project's fiber-inference dataset, during input "
+                             "preparation")
+    # The former opt-in, now the default; older VC3D builds still pass it.
     parser.add_argument("--build-missing-lasagna-packs", action="store_true",
-                        help="Build missing Lasagna packs from accessible local arrays, "
-                             "and extract missing fiber directions from the project's "
-                             "fiber-inference dataset, during input preparation "
-                             "(default: require both prepared in --cache)")
+                        help=argparse.SUPPRESS)
     parser.add_argument("--cache", default=None,
                         help="Directory for derived host caches: prepared "
                              "Lasagna packs and fiber directions (default: "
@@ -4436,7 +4488,7 @@ def main(argv=None):
                          events=events,
                          gpu_ids=args.gpus,
                          object_store=object_store,
-                         build_missing_lasagna_packs=args.build_missing_lasagna_packs,
+                         build_missing_lasagna_packs=not args.require_prepared_lasagna_packs,
                          startup_run={"z_begin": args.z_begin,
                                       "z_end": args.z_end,
                                       "config": startup_config})

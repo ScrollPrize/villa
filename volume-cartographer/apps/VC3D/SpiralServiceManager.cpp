@@ -398,7 +398,7 @@ void SpiralServiceManager::startLocalProcess()
             emit errorOccurred(_process->errorString());
         });
         connect(_process, qOverload<int, QProcess::ExitStatus>(&QProcess::finished), this,
-                [this](int code, QProcess::ExitStatus) {
+                [this](int code, QProcess::ExitStatus status) {
                     _poll->stop();
                     _eventPoll->stop();
                     // A dead service can no longer serve /events; surface any
@@ -409,11 +409,21 @@ void SpiralServiceManager::startLocalProcess()
                         + QString::fromUtf8(_process->readAllStandardError());
                     for (const QString& line : tail.split('\n', Qt::SkipEmptyParts))
                         emit logMessage(line);
+                    // A stop this manager asked for (SIGTERM, then SIGKILL)
+                    // is not a failure, however the process ended.
+                    if (_stoppingProcess) {
+                        emit logMessage(tr("Stopped the local Spiral service"));
+                        return;
+                    }
                     if (_profile.autoLaunch
                         && _connectionState != ConnectionState::Disconnected) {
                         setConnectionState(ConnectionState::Failed, tr("The local Spiral service stopped"));
                     }
-                    if (code != 0) emit errorOccurred(tr("Spiral service exited with code %1").arg(code));
+                    // A crash exit's code is the signal that ended the process.
+                    if (status == QProcess::CrashExit)
+                        emit errorOccurred(tr("Spiral service was killed by signal %1").arg(code));
+                    else if (code != 0)
+                        emit errorOccurred(tr("Spiral service exited with code %1").arg(code));
                 });
     }
     _credential = QString::number(QRandomGenerator::global()->generate64(), 16)
@@ -734,11 +744,13 @@ void SpiralServiceManager::stopService()
 {
     _poll->stop();
     if (!_process || _process->state() == QProcess::NotRunning) return;
+    _stoppingProcess = true;
     _process->terminate();
     if (!_process->waitForFinished(2000)) {
         _process->kill();
         _process->waitForFinished(1000);
     }
+    _stoppingProcess = false;
 }
 
 QString SpiralServiceManager::commandId()
