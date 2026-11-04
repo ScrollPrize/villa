@@ -404,8 +404,8 @@ def test_surface_label_values_halo_and_level_scale(tmp_path):
     assert (np.nonzero(full == 1)[0] == 10).all()
     with pytest.raises(L.LabelSnapError):
         write("c.zarr", np.zeros((6, 6), np.uint8))
-    import zarr
-    z = zarr.open(str(tmp_path / "a.zarr" / "0"), mode="r")      # the label reads back through zarr itself
+    from vc_reader.reader import open_zarr
+    z = open_zarr(str(tmp_path / "a.zarr" / "0"))                # the label reads back through a zarr reader
     assert int(z[20, 10, 10]) == 1 and int(z[25, 10, 10]) == 0
 
 
