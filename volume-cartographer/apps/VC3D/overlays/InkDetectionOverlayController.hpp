@@ -74,8 +74,6 @@ private:
         QImage image;
         cv::Mat_<uint8_t> scalar;
         bool singleChannel{false};
-        std::filesystem::path path;
-        std::string colormapId;
     };
 
     void loadSelectedImage();

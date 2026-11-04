@@ -95,24 +95,33 @@ def test_download_rejects_non_positive_worker_count():
         dl.download("s3://bucket/volume.zarr", "volume.zarr", workers=0)
 
 
-def test_s3_client_uses_bounded_standard_retries(monkeypatch):
-    captured = {}
+def test_stores_are_per_thread_and_name_the_anonymous_region(monkeypatch):
+    opened = []
 
-    class FakeSession:
-        def client(self, service, *, config, region_name):
-            captured.update(service=service, config=config, region=region_name)
-            return object()
+    class FakeStore:
+        def __init__(self, location, *, auth, connections):
+            opened.append((location, auth, connections))
 
-    monkeypatch.setattr(dl.boto3, "Session", FakeSession)
-    dl._thread_local.s3_client_cache = None
-    dl._get_s3_client(True, "us-east-1")
+    monkeypatch.setattr(dl, "ObjectStore", FakeStore)
+    dl._thread_local.stores = None
+    first = dl._get_store("bucket", True, "us-east-2")
+    assert dl._get_store("bucket", True, "us-east-2") is first
+    dl._get_store("bucket", False, "us-east-2")
+    assert opened == [("s3+us-east-2://bucket", None, 4), ("s3://bucket", "aws", 4)]
 
-    assert captured["service"] == "s3"
-    assert captured["region"] == "us-east-1"
-    assert captured["config"].retries == {
-        "mode": "standard",
-        "total_max_attempts": 5,
-    }
+
+def test_download_treats_absent_object_as_missing_remote(tmp_path, monkeypatch):
+    class Store:
+        def read(self, _key):
+            return None
+
+    monkeypatch.setattr(dl, "_get_store", lambda *_args: Store())
+    stats = dl.Stats()
+    assert dl._download_one("bucket", "root/0/0.0.0", str(tmp_path / "0.0.0"), True, stats, 0, "0.0.0")
+    snapshot = stats.snapshot()
+    assert snapshot["download_missing"] == 1
+    assert snapshot["missing_remote"] == 1
+    assert not (tmp_path / "0.0.0").exists()
 
 
 def test_stats_snapshots_noremote_sets_by_value():
@@ -255,7 +264,7 @@ def test_scanner_uses_cached_missing_only_without_remote_inventory(tmp_path):
 
 def test_scanner_transport_failure_is_reported_to_coordinator(tmp_path, monkeypatch):
     def fail_iter(_bucket, _prefix, _anon):
-        raise dl.botocore.exceptions.ReadTimeoutError(endpoint_url="https://example.invalid")
+        raise OSError("Read timeout on endpoint URL: https://example.invalid")
 
     monkeypatch.setattr(dl, "_s3_iter_objects", fail_iter)
     stats = dl.Stats()

@@ -1,8 +1,8 @@
 #include "linking/StoredGeometry.hpp"
 #include "vc_object_store/geometry/Geometry.hpp"
 #include "vc_object_store/object_links/ObjectLinks.hpp"
-#include "spatial/SurfaceGrid.hpp"
-#include "spatial/SurfaceIndex.hpp"
+#include <vc_object_store/geometry/SurfaceGrid.hpp>
+#include <vc_object_store/geometry/SurfaceIndex.hpp>
 
 #include <algorithm>
 #include <cmath>

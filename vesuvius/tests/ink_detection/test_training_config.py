@@ -18,11 +18,11 @@ from vesuvius.ink_detection.training.train import (
     training_dataset_config,
 )
 
-from .test_model_foundation import _config_mapping
+from .helpers import config_mapping
 
 
 def _training_mapping(*, mode: str = "flat") -> dict:
-    authored = _config_mapping(depth=3, side=8)
+    authored = config_mapping(depth=3, side=8)
     authored.update(
         {
             "mode": mode,

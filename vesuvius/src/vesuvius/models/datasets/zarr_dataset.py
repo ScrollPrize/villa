@@ -19,14 +19,13 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
-import zarr
 from torch.utils.data import Dataset
+from vc_reader.reader import ZarrGroup, ZarrReader, open_node
 
 from vesuvius.utils.utils import pad_or_crop_3d, pad_or_crop_2d
 from .intensity_properties import initialize_intensity_properties
-from ..training.normalization import get_normalization
-from ..augmentation.pipelines import create_training_transforms
-from ..augmentation.transforms.utils.perf import collect_augmentation_names
+import vc_reader.transforms as A
+from ..augmentation.pipelines import create_training_transforms, sample_seed
 
 
 logger = logging.getLogger(__name__)
@@ -37,9 +36,9 @@ class VolumeInfo:
     """Metadata for a loaded OME-Zarr volume."""
     volume_id: str
     image_path: Path
-    image_array: zarr.Array
+    image_array: ZarrReader
     label_paths: Dict[str, Optional[Path]]
-    label_arrays: Dict[str, Optional[zarr.Array]]
+    label_arrays: Dict[str, Optional[ZarrReader]]
     spatial_shape: Tuple[int, ...]
     has_labels: bool = True
 
@@ -92,8 +91,6 @@ class ZarrDataset(Dataset):
         super().__init__()
         self.mgr = mgr
         self.is_training = is_training
-        self._profile_augmentations = bool(getattr(mgr, 'profile_augmentations', False))
-        self._augmentation_names: List[str] = []
 
         # Configuration from manager
         self.data_path = Path(mgr.data_path)
@@ -191,7 +188,7 @@ class ZarrDataset(Dataset):
         # Build volume list
         for volume_id, image_path in sorted(image_zarrs.items()):
             label_paths: Dict[str, Optional[Path]] = {}
-            label_arrays: Dict[str, Optional[zarr.Array]] = {}
+            label_arrays: Dict[str, Optional[ZarrReader]] = {}
             has_any_label = False
 
             for target in self.target_names:
@@ -255,7 +252,7 @@ class ZarrDataset(Dataset):
 
             label_mapping = self._resolve_explicit_label_mapping(spec)
             label_paths: Dict[str, Optional[Path]] = {}
-            label_arrays: Dict[str, Optional[zarr.Array]] = {}
+            label_arrays: Dict[str, Optional[ZarrReader]] = {}
             has_any_label = False
             for target in self.target_names:
                 label_path = self._resolve_explicit_volume_path(label_mapping.get(target))
@@ -349,12 +346,13 @@ class ZarrDataset(Dataset):
             return base_id
         return f"{base_id}_{duplicate_idx}"
 
-    def _open_zarr(self, path: Path) -> zarr.Array:
+    def _open_zarr(self, path: Path) -> ZarrReader:
         """Open a zarr array at the configured resolution level."""
-        store = zarr.open(path, mode="r")
+        # Read in DataLoader workers, which are the parallelism.
+        store = open_node(path, threads=1)
 
         # Handle zarr Group (OME-Zarr format)
-        if isinstance(store, zarr.Group):
+        if isinstance(store, ZarrGroup):
             # Try to get the requested resolution level
             level_key = str(self.ome_zarr_resolution)
             if level_key in store:
@@ -367,7 +365,7 @@ class ZarrDataset(Dataset):
 
         return store
 
-    def _get_spatial_shape(self, arr: zarr.Array) -> Tuple[int, ...]:
+    def _get_spatial_shape(self, arr: ZarrReader) -> Tuple[int, ...]:
         """Extract spatial shape (Z, Y, X) or (Y, X) from array."""
         shape = arr.shape
         if self.is_2d:
@@ -402,7 +400,23 @@ class ZarrDataset(Dataset):
                 mgr=self.mgr,
             )
 
-        self.normalizer = get_normalization(self.normalization_scheme, self.intensity_properties)
+        scheme = self.normalization_scheme
+        if scheme == "ct":
+            props = self.intensity_properties
+            required = ("mean", "std", "percentile_00_5", "percentile_99_5")
+            if not props or any(key not in props for key in required):
+                raise ValueError("CT normalization requires mean, std and percentile bounds")
+            op = A.Normalize("fixed", center=float(props["mean"]), scale=max(float(props["std"]), 1e-8),
+                             bounds=(float(props["percentile_00_5"]), float(props["percentile_99_5"])))
+        elif scheme == "zscore":
+            op = A.Normalize("zscore", nonzero=False, eps=1e-8)
+        elif scheme in ("minmax", "rescale_to_01", "robust"):
+            op = A.Normalize("minmax" if scheme == "rescale_to_01" else scheme)
+        elif scheme == "none":
+            op = None
+        else:
+            raise ValueError(f"Unknown normalization scheme: {scheme}")
+        self.normalizer = A.Pipeline([op], backend="cpu") if op is not None else None
 
     def _build_target_volumes_for_intensity(self) -> Dict:
         """Build legacy target_volumes format for intensity_properties module."""
@@ -800,22 +814,21 @@ class ZarrDataset(Dataset):
 
             self.transforms = create_training_transforms(
                 patch_size=self.patch_size,
+                label_names=self.target_names,
+                backend="cuda" if getattr(self.mgr, 'augment_on_device', False) else "cpu",
                 no_spatial=no_spatial,
                 no_scaling=no_scaling,
                 skeleton_targets=skeleton_targets if skeleton_targets else None,
                 skeleton_ignore_values=skeleton_ignore_values if skeleton_ignore_values else None,
             )
-            if self._profile_augmentations:
-                self._augmentation_names = collect_augmentation_names(self.transforms)
         elif skeleton_targets:
             # Validation: only apply skeleton generation (no augmentation)
             from vesuvius.models.augmentation.pipelines.training_transforms import create_validation_transforms
             self.transforms = create_validation_transforms(
+                label_names=self.target_names,
                 skeleton_targets=skeleton_targets,
                 skeleton_ignore_values=skeleton_ignore_values if skeleton_ignore_values else None,
             )
-            if self._profile_augmentations:
-                self._augmentation_names = collect_augmentation_names(self.transforms)
 
     # -------------------------------------------------------------------------
     # Dataset Interface
@@ -851,7 +864,7 @@ class ZarrDataset(Dataset):
             return data
 
         def load_array(
-            arr: Optional[zarr.Array], *, normalize: bool = False, return_original_shape: bool = False
+            arr: Optional[ZarrReader], *, normalize: bool = False, return_original_shape: bool = False
         ) -> np.ndarray | Tuple[np.ndarray, Tuple[int, ...]]:
             if arr is None:
                 data = np.zeros(size, dtype=np.float32)
@@ -859,8 +872,11 @@ class ZarrDataset(Dataset):
             else:
                 data = np.asarray(arr[slices])
                 original_shape = data.shape
-                if normalize and self.normalizer is not None:
-                    data = self.normalizer.run(data)
+                if normalize and self.normalizer is not None and data.size:
+                    normalized = self.normalizer(
+                        {"image": np.asarray(data, dtype=np.float32).reshape(1, 1, -1)}, seed=0
+                    )["image"]
+                    data = normalized.reshape(data.shape)
                 data = pad_or_crop(data.astype(np.float32), size)
             data = mask_neighbor_intrusion(data)
             if return_original_shape:
@@ -894,10 +910,8 @@ class ZarrDataset(Dataset):
 
         result['is_unlabeled'] = is_unlabeled or patch.is_unlabeled_fg
 
-        if self.transforms is not None:
-            if self._profile_augmentations and self._augmentation_names:
-                result['_aug_perf'] = {name: 0.0 for name in self._augmentation_names}
-            result = self.transforms(**result)
+        if self.transforms is not None and not getattr(self.mgr, 'augment_on_device', False):
+            result = self.transforms(result, seed=sample_seed(index))
 
         return result
 

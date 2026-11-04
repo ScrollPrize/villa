@@ -11,12 +11,11 @@ square within ``--tolerance`` are copied unchanged.
 from __future__ import annotations
 
 import argparse
-import json
 import shutil
 from pathlib import Path
 
 import numpy as np
-import tifffile
+from vc_reader import tifxyz
 
 
 def steps(xyz: np.ndarray, ok: np.ndarray) -> tuple[float, float]:
@@ -45,9 +44,8 @@ def main(argv=None):
     args = ap.parse_args(argv)
     src, out = Path(args.src), Path(args.out)
     for patch in sorted(p for p in src.iterdir() if (p/'x.tif').is_file()):
-        meta = json.loads((patch/'meta.json').read_text())
-        xyz = np.stack([np.asarray(tifffile.imread(patch/f'{c}.tif'), np.float32) for c in 'xyz'], -1)
-        ok = np.all(xyz != -1, -1) & np.all(np.isfinite(xyz), -1)
+        surface = tifxyz.read(patch, mask=False)
+        xyz, ok = surface.xyz, surface.valid
         row, col = steps(xyz, ok)
         dst = out/patch.name
         if abs(col/row-1) <= args.tolerance:
@@ -60,11 +58,8 @@ def main(argv=None):
             xyz, ok = resample_columns(xyz.transpose(1, 0, 2), ok.T, col/row)
             xyz, ok = xyz.transpose(1, 0, 2), ok.T
         cell = max(row, col)
-        dst.mkdir(parents=True, exist_ok=True)
-        for i, c in enumerate('xyz'):
-            tifffile.imwrite(dst/f'{c}.tif', np.ascontiguousarray(xyz[..., i]))
-        meta['scale'] = [1./cell, 1./cell]
-        (dst/'meta.json').write_text(json.dumps(meta))
+        tifxyz.write(dst, tifxyz.Surface(xyz, scale=(1./cell, 1./cell), uuid=surface.uuid, area=surface.area, extra=surface.extra),
+                     compression='none', tile=None, mask=False, overwrite=True)
         r2, c2 = steps(xyz, ok)
         print(f'{patch.name}: {row:.1f} x {col:.1f} vx -> {r2:.1f} x {c2:.1f} vx, {xyz.shape[0]} x {xyz.shape[1]} '
               f'nodes, {int(ok.sum())} valid', flush=True)

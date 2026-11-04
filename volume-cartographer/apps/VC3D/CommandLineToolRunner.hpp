@@ -33,8 +33,6 @@ public:
         tifxyz2obj,
         AlphaCompRefine,
         NeighborCopy,
-        MergeTifxyz,
-        MergePatch,
         CustomCommand
     };
 
@@ -69,11 +67,6 @@ public:
     };
 
     void setVolumePath(const QString& path);
-    void setRemoteVolumeUrl(const QString& url);
-    void setRemoteVolumeAuth(const QString& accessKey,
-                             const QString& secretKey,
-                             const QString& sessionToken,
-                             const QString& region);
     // Tools read and write surfaces in this object store (the attached store's
     // file; a hosted replica's local file, which tools sync themselves), in the
     // voxels of their volume at `voxelScale` of its own (--voxel-scale).
@@ -126,36 +119,6 @@ public:
                                const QString& volumeUuid,
                                const QString& outputTag,
                                const QString& resumeOpt);
-    // vc_merge_tifxyz: --merge lists the input surfaces by UUID; the merge is a
-    // new surface tagged `outputTag` and bound to `volumeUuid`. The remaining
-    // args are RANSAC + blend tunables that all have working defaults.
-    void setMergeParams(const QString& mergeJsonPath,
-                        const QString& volumeUuid,
-                        const QString& outputTag,
-                        const QString& refSurface,
-                        int ransacIters,
-                        double ransacMinThresh,
-                        double ransacMaxThresh,
-                        double ransacMadK,
-                        int ransacSeed,
-                        int anchorCap,
-                        int stripCols);
-    // vc_merge_patch: two stored surfaces; the binary auto-detects parent vs
-    // child by valid-cell count unless explicitRoles is set, in which case
-    // we pass --parent / --child explicitly. The parent is edited in place
-    // (its revision history keeps the pre-patch state).
-    void setMergePatchParams(const QString& parentSurface,
-                             const QString& childSurface,
-                             bool explicitRoles,
-                             int borderCells,
-                             int blendCells,
-                             int idwK,
-                             int ransacIters,
-                             double ransacMinThresh,
-                             double ransacMaxThresh,
-                             double ransacMadK,
-                             int ransacSeed,
-                             int anchorCap);
     bool execute(Tool tool, ExecutionOptions options = {});
     void cancel();
     bool isRunning() const;
@@ -203,11 +166,6 @@ private:
     QDialog* _consoleDialog;
     
     QString _volumePath;
-    QString _remoteVolumeUrl;
-    QString _remoteAccessKey;
-    QString _remoteSecretKey;
-    QString _remoteSessionToken;
-    QString _remoteRegion;
     QString _storePath;
     double _voxelScale = 1;
     QString _surfaceUuid;
@@ -261,28 +219,4 @@ private:
     QStringList _createdSurfaces;
     QString _exportedObj;
 
-    // vc_merge_tifxyz parameters
-    QString _mergeJsonPath;
-    QString _mergeRefSurface;
-    int     _mergeRansacIters{3000};
-    double  _mergeRansacMinThresh{5.0};
-    double  _mergeRansacMaxThresh{10.0};
-    double  _mergeRansacMadK{3.0};
-    int     _mergeRansacSeed{0};
-    int     _mergeAnchorCap{0};
-    int     _mergeStripCols{0};
-
-    // vc_merge_patch parameters
-    QString _patchParentSurface;
-    QString _patchChildSurface;
-    bool    _patchExplicitRoles{false};
-    int     _patchBorderCells{16};
-    int     _patchBlendCells{6};
-    int     _patchIdwK{4};
-    int     _patchRansacIters{3000};
-    double  _patchRansacMinThresh{5.0};
-    double  _patchRansacMaxThresh{10.0};
-    double  _patchRansacMadK{3.0};
-    int     _patchRansacSeed{0};
-    int     _patchAnchorCap{0};
 };

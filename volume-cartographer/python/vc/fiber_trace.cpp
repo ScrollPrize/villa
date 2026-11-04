@@ -80,16 +80,12 @@ nb::dict profileDict(const TraceProfileHandle& handle) {
     VC_PROFILE_FIELD(combinedChannelSampleSeconds);
     VC_PROFILE_FIELD(samplingWindowLoads); VC_PROFILE_FIELD(samplingWindowFallbacks);
     VC_PROFILE_FIELD(samplingWindowPeakBytes); VC_PROFILE_FIELD(samplingWindowLoadSeconds);
-    VC_PROFILE_FIELD(samplingWindowPeakTableBytes); VC_PROFILE_FIELD(samplingWindowCopiedBytes);
+    VC_PROFILE_FIELD(samplingWindowCopiedBytes);
     VC_PROFILE_FIELD(taskBuildSeconds); VC_PROFILE_FIELD(predictionBatchSeconds);
-    VC_PROFILE_FIELD(readinessPlanSeconds); VC_PROFILE_FIELD(readinessPlanPoints); VC_PROFILE_FIELD(readinessPlanDependencies);
-    VC_PROFILE_FIELD(predictionPrepareSeconds); VC_PROFILE_FIELD(predictionPrefetchSeconds);
-    VC_PROFILE_FIELD(predictionAssignSeconds); VC_PROFILE_FIELD(predictionMaterializeSeconds);
-    VC_PROFILE_FIELD(predictionCornerSeconds); VC_PROFILE_FIELD(predictionCornerPrepareSeconds);
-    VC_PROFILE_FIELD(predictionCornerLayoutSeconds); VC_PROFILE_FIELD(predictionCornerPinSeconds);
-    VC_PROFILE_FIELD(predictionCornerGatherSeconds); VC_PROFILE_FIELD(predictionDecodeSeconds);
+    VC_PROFILE_FIELD(predictionMaterializeSeconds);
+    VC_PROFILE_FIELD(predictionCornerSeconds); VC_PROFILE_FIELD(predictionDecodeSeconds);
     VC_PROFILE_FIELD(normalDecodeSeconds); VC_PROFILE_FIELD(normalBatchSeconds);
-    VC_PROFILE_FIELD(normalPrefetchSeconds); VC_PROFILE_FIELD(normalMaterializeSeconds);
+    VC_PROFILE_FIELD(normalMaterializeSeconds);
     VC_PROFILE_FIELD(candidateScoreSeconds); VC_PROFILE_FIELD(frontierSeconds); VC_PROFILE_FIELD(pruneSeconds);
     VC_PROFILE_FIELD(lookaheadDecisionSeconds); VC_PROFILE_FIELD(lookaheadParentOrderSeconds);
     VC_PROFILE_FIELD(lookaheadFrontierStorageSeconds);
@@ -517,7 +513,7 @@ nb::dict chunkSeeds(const PredictionFieldHandle& field,const NormalSamplerHandle
         auto* normalField=dynamic_cast<const vc::lasagna::LasagnaNormalSampler*>(normals.sampler.get());
         if(!normalField)throw std::invalid_argument("native seed extraction requires channel normals");
         ft::detail::FiberChunkTensor tensor(*field.field,*normalField,
-            bounds.lo/scale,bounds.hi/scale,true,c.channelHints,c.workerCacheBytes);
+            bounds.lo/scale,bounds.hi/scale,true);
         seeds=ft::findFiberChunkSeeds(tensor,tensor,*field.field,bounds,c,scale,true);
     }
     std::vector<cv::Vec3d> points,dirs;std::vector<double> widths,scores;
@@ -621,24 +617,6 @@ NB_MODULE(fiber_trace, m)
         .def(nb::init<>())
         .def("to_dict",&profileDict,
              "Snapshot completed-call counters. Read/reuse while active is rejected.");
-    m.def("configure_chunk_loader",[](size_t cores,size_t bytes,const std::string& backend,size_t window){
-        nb::gil_scoped_release release;
-        auto options=vc::render::ChunkCacheService::batchOptions(cores,bytes);
-        if(backend=="queued")options.loaderBackend=vc::render::ChunkCacheService::Options::LoaderBackend::Queued;
-        else if(backend!="direct")throw std::invalid_argument("loader backend must be direct or queued");
-        options.queuedChunkWindow=window;
-        const auto service=vc::render::configureProcessChunkCacheService(options);
-        return nlohmann::json{{"local_read_workers",service->localReadWorkers()},
-            {"decode_workers",service->decodeWorkerCapacity()},{"cache_bytes",bytes},
-            {"backend",backend},{"queued_chunk_window",service->queuedChunkWindow()}}.dump();
-    },"cores"_a,"cache_bytes"_a,"backend"_a="direct","queued_chunk_window"_a=0);
-    m.def("chunk_loader_stats",[]{
-        const auto s=vc::render::processChunkCacheService()->loaderStats();
-        return nlohmann::json{{"requests",s.requests},{"keys",s.keys},{"coalesced",s.coalesced},
-            {"completed",s.completed},{"polls",s.polls},{"wakes",s.wakes},{"in_flight",s.inFlight},
-            {"peak_in_flight",s.peakInFlight},{"pending",s.pending},{"peak_pending",s.peakPending},
-            {"reply_bytes",s.replyBytes},{"peak_reply_bytes",s.peakReplyBytes}}.dump();
-    });
     m.def("reference_plan_json", [](const std::string& text) {
         return ft::vc3dEvaluationReferencePlan(
             ft::parseVc3dFiberJson(nlohmann::json::parse(text), "reference"), "reference").dump();
@@ -703,9 +681,6 @@ NB_MODULE(fiber_trace, m)
         .def_rw("join_angle_degrees",&ft::FiberChunkTraceConfig::joinAngleDegrees)
         .def_rw("join_minimum_base",&ft::FiberChunkTraceConfig::joinMinimumBase)
         .def_rw("join_width_weight",&ft::FiberChunkTraceConfig::joinWidthWeight)
-        .def_rw("pin_sampling_region",&ft::FiberChunkTraceConfig::pinSamplingRegion)
-        .def_rw("channel_hints",&ft::FiberChunkTraceConfig::channelHints)
-        .def_rw("worker_cache_bytes",&ft::FiberChunkTraceConfig::workerCacheBytes)
         .def_rw("max_grid_samples",&ft::FiberChunkTraceConfig::maxGridSamples)
         .def_rw("initial_alignment_power",&ft::FiberChunkTraceConfig::initialAlignmentPower)
         .def_rw("initial_normal_radius_base",&ft::FiberChunkTraceConfig::initialNormalRadiusBase)

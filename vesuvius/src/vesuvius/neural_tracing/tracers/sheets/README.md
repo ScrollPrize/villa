@@ -61,7 +61,7 @@ and code names therefore means masked output, not halted motion.
 
 | option | effect |
 | --- | --- |
-| `data.patches_dir`, `data.patch_volumes`, `data.dir_weights` | One patch directory or a list of them, each with the CT volume its patches' coordinates are in (empty: `data.volume`; e.g. other scrolls prepared with `scripts/prepare_scroll.py`) and its share of the sampling weight. |
+| `data.patches_dir`, `data.patch_volumes`, `data.dir_weights` | One patch directory or a list of them, each with the CT volume its patches' coordinates are in (empty: `data.volume`) and its share of the sampling weight. |
 | `data.front_points_range`, `train.points_per_batch` | Training only: every batch draws its front size N uniformly from `[min, max]`, holding about `points_per_batch` points (`batch = points_per_batch / N`). `data.front_points` still sets validation. |
 | `data.unpadded_blocks` | Keep each training episode's block unpadded on the GPU (a list), instead of padding them to the batch's largest extent, which long fronts at mixed orientations blow up. |
 | `data.fiber_runs`, `fiber_fraction`, `fiber_min_valid` | Fiber-seeded episodes: this fraction of episodes starts from a fiber matched to its patch (`scripts/match_fibers_to_patches.py`). The fiber is the seed row, and the GT window is rotated to follow it. |
@@ -72,7 +72,7 @@ and code names therefore means masked output, not halted motion.
 | `train.ema` | Exponential moving average of the weights (e.g. 0.999). Validation, `best.pt`, evaluation and `--init` use the averaged weights. Checkpoints keep both (`model` raw, `ema` averaged); `evaluation/benchmark.py --raw NAME` benchmarks the raw ones. |
 | `train.max_minutes` | The cosine learning rate anneals to zero at the time budget. Resumed time counts. |
 | `train.keep_every` | Also keep `ckpt_ITER.pt` periodically, for benchmarking intermediate checkpoints. |
-| `train.compile_geometry` | `torch.compile` the GT projection: about 1.4x faster, but not bit-identical (foot points differ by about 1e-3 vx). |
+| `train.compile_geometry` | `torch.compile` the tensor operations around native bicubic GT queries; floating-point fusion can change foot points. |
 | `train.compile_model` | `torch.compile` the model: about 1.7x faster at level 0, not bit-identical. Checkpoints are unchanged. |
 | `train.live_chains` (+ `chain_steps`, `chain_on_sheet`, `chain_min_valid`, `chain_max_age`) | Live chains (`train/live.py`): a training front is not restarted from GT after its rollout, but continues in a later iteration from exactly where the model left it, on the next window of its patch. Needs `memory_rows <= data.steps`, and cannot be combined with `train.history_rows`. Use with `train.free_fraction=1`. |
 | `train.history_rows` | Before each training rollout, trace 0..N GT rows up to the seed without loss (the front is put back on GT after each step), so the grid memory starts out filled. |
@@ -87,10 +87,8 @@ and code names therefore means masked output, not halted motion.
 
 - **Training patches:** `data.patches_dir`. These are verified tifxyz patches with level-0 `x, y, z`; `-1` marks
   invalid nodes.
-- **Volume:** `data.volume` and `data.volume_level`. This is an OME-Zarr v2 pyramid read through tracers/shared/crop_sampling's
-  `ChunkedArray`; the models read level 0. Levels can be decoded in place with
-  `python -m vesuvius.neural_tracing.tracers.shared.crop_sampling.decode_store --workers 8 --verify 256 .../s1_ds2.zarr/0`.
-  Uncompressed chunks are memory-mapped and shared through the page cache.
+- **Volume:** `data.volume` and `data.volume_level`. This is an OME-Zarr pyramid read with vc_reader
+  (`vc_reader.reader.open_zarr`); the models read level 0.
 - **Episodes:** an episode resamples one patch window onto a canonical `(u, v)` grid at `data.gt_resolution`. `u`
   is the advance direction and `v` runs along the front, both in voxels. There are eight orientations: advance along
   rows or columns, either sign, front either sign. Fiber episodes use a window rotated to the fiber instead.

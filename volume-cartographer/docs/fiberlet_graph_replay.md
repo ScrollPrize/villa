@@ -179,21 +179,9 @@ ctest --test-dir build --output-on-failure -R '^test_fiberlet_paths$'
 Tests cover lookahead, exact stored cost integration, persistent-prefix
 accounting, deterministic parallel expansion, bounded search, diagnostics,
 elliptical acceptance, restarts, partial edges and failure-window validation.
-For the optional real-data regression, set `VC_TEST_GRAPH_ANCHORS` to an
-existing `anchors.json`, `VC_TEST_GRAPH_PREDICTIONS` to its prediction manifest,
-and `VC_TEST_GRAPH_NORMALS` to the corresponding normal manifest. It generates
-routes from the real predictions and compares serialized serial/four-worker
-replay results. Its reference is a generated edge: this checks pipeline and
-parallel equivalence, not tracing accuracy against annotated ground truth.
 
 Also build/run `test_fiberlet_storage` for cross-chunk leases, on-demand reuse,
-published endpoint independence and metadata recovery. Its optional
-`VC_TEST_STORED_GRAPH` fixture is a read-only cache directory containing
-`anchors.zarr` and `fiberlets.zarr` with Paris4 chunk `12/44/20`; the test
-checks reconstructed geometry and exact reversal without generation. With
-`VC_TEST_GRAPH_NORMALS` and `VC_TEST_GRAPH_PREDICTIONS`, it also compares
-serial/four-worker graph crop and dense consistency-filtered crop results.
-These are mechanical equivalence checks, not annotated accuracy benchmarks.
+published endpoint independence and metadata recovery.
 
 Build `test_fiberlet_crop_trace` as well, then run the three suites:
 

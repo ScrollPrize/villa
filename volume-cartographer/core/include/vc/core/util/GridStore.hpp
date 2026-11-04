@@ -5,7 +5,7 @@
 #include <opencv2/core/types.hpp>
 #include <vector>
 #include <memory>
-#include "utils/Json.hpp"
+#include <nlohmann/json.hpp>
 
 namespace vc::core::util {
 
@@ -57,7 +57,7 @@ public:
     CacheStats cacheStats() const;
     void resetCacheStats() const;
 
-    utils::Json meta;
+    nlohmann::json meta;
 
     void save(const std::string& path, const SaveOptions& options) const;
     void save(const std::string& path) const;

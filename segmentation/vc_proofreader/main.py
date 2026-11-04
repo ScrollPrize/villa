@@ -5,8 +5,8 @@ import argparse
 import runpy
 import numpy as np
 import napari
-import zarr
-import tifffile
+from vc_reader import images
+from vc_reader.reader import ZarrGroup, ZarrWriter, open_node
 from magicgui import magicgui
 from datetime import datetime
 import cc3d
@@ -219,22 +219,7 @@ def extract_patch(volume, coord, patch_size):
     if volume.ndim > len(coord):
         slices = slices + (slice(None),) * (volume.ndim - len(coord))
     
-    try:
-        return volume[slices]
-    except ValueError as e:
-        if "cannot reshape array of size 0" in str(e):
-            # Handle empty/all-zero chunks
-            # Calculate the shape of the patch
-            shape = []
-            for i, s in enumerate(slices):
-                if s.start is not None and s.stop is not None:
-                    shape.append(s.stop - s.start)
-                else:
-                    # For full slices, use the volume dimension
-                    shape.append(volume.shape[i])
-            return np.zeros(shape, dtype=volume.dtype)
-        else:
-            raise
+    return volume[slices]
 
 
 def update_progress():
@@ -461,8 +446,8 @@ def save_current_patch():
     label_path = os.path.join(state['labels_out_dir'], label_filename)
 
     # Save tif files
-    tifffile.imwrite(image_path, image_patch)
-    tifffile.imwrite(label_path, label_patch)
+    images.write_tiff(image_path, image_patch, pages=len(coord) == 3)
+    images.write_tiff(label_path, label_patch, pages=len(coord) == 3)
     print(f"Saved image patch to {image_path} and label patch to {label_path}")
     
     # Save to output zarr if configured
@@ -574,14 +559,13 @@ def init_volume(
     print(f"  Energy: {energy} keV")
     print(f"  Resolution: {resolution} μm")
 
-    # Try to open as array first (for zarrs with array at root)
-    image_volume = zarr.open(image_zarr, mode='r')
-    image_volume = image_volume['0'] if isinstance(image_volume, zarr.hierarchy.Group) else image_volume
+    # A group means level 0 of a pyramid.
+    image_volume = open_node(image_zarr)
+    image_volume = image_volume['0'] if isinstance(image_volume, ZarrGroup) else image_volume
     print("Loaded image zarr as array.")
 
-    # Try to open as array first (for zarrs with array at root)
-    label_volume = zarr.open(label_zarr, mode='r')
-    label_volume = label_volume['0'] if isinstance(label_volume, zarr.hierarchy.Group) else label_volume
+    label_volume = open_node(label_zarr)
+    label_volume = label_volume['0'] if isinstance(label_volume, ZarrGroup) else label_volume
     print("Loaded label zarr as array.")
         
 
@@ -637,7 +621,7 @@ def init_volume(
             # Check if zarr already exists
             if os.path.exists(output_label_zarr):
                 # Open existing zarr
-                state['output_zarr_array'] = zarr.open(output_label_zarr, mode='r+', write_empty_chunks=False)
+                state['output_zarr_array'] = ZarrWriter.open(output_label_zarr, skip_empty=True)
                 print(f"Opened existing output zarr at {output_label_zarr}")
                 print(f"  Shape: {state['output_zarr_array'].shape}")
                 print(f"  Chunks: {state['output_zarr_array'].chunks}")
@@ -647,14 +631,16 @@ def init_volume(
                 else:
                     chunks = (128,128,128)
                 
-                state['output_zarr_array'] = zarr.open(
+                state['output_zarr_array'] = ZarrWriter.create(
                     output_label_zarr,
-                    mode='w',
                     shape=vol_shape,
                     chunks=chunks,
                     dtype='uint8',
-                    compressor=zarr.Blosc(cname='zstd', clevel=3, shuffle=zarr.Blosc.BITSHUFFLE),
-                    write_empty_chunks=False
+                    cname='zstd',
+                    level=3,
+                    shuffle=2,
+                    overwrite=True,
+                    skip_empty=True,
                 )
                 print(f"Created new output zarr at {output_label_zarr}")
                 print(f"  Shape: {vol_shape}")

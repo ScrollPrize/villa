@@ -9,13 +9,13 @@
 #include <optional>
 #include <vector>
 
-// Runs of `python -m vesuvius.afv_spline_generator`, which predicts fibers in a
+// Runs of `python -m vesuvius.fiber_spline_generator`, which predicts fibers in a
 // zone of CT block by block, stitches them into long fibers and writes them as
 // a fiber object store.
 namespace vc3d::fibergen
 {
 
-inline constexpr auto kModule = "vesuvius.afv_spline_generator";
+inline constexpr auto kModule = "vesuvius.fiber_spline_generator";
 inline constexpr auto kDefaultModel = "Qualzz20/afv_fiber_9um";
 inline constexpr double kDefaultThresholdPercent = 60.0;
 inline constexpr int kDefaultBlockSize = 512;

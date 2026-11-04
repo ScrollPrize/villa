@@ -1,6 +1,6 @@
 #include "vc/tracer/SheetGrowth.hpp"
 
-#include "vc/core/types/Volume.hpp"
+#include <vc_reader/array.hpp>
 #include "vc/core/util/QuadSurface.hpp"
 #include "vc/core/util/SheetNormalField.hpp"
 #include "vc/core/util/SheetSeed.hpp"
@@ -93,9 +93,9 @@ private:
 };
 } // namespace
 
-QuadSurface* growSheetPatch(Volume& volume, const cv::Vec3f& seed,
-                            const utils::Json& params, float voxelSize,
-                            const utils::Json& metadata)
+QuadSurface* growSheetPatch(vcr::Array& volume, const cv::Vec3f& seed,
+                            const nlohmann::json& params, float voxelSize,
+                            const nlohmann::json& metadata)
 {
     const auto started = std::chrono::steady_clock::now();
     vc::sheet::SeedOptions options;
@@ -124,9 +124,9 @@ QuadSurface* growSheetPatch(Volume& volume, const cv::Vec3f& seed,
               << " voxels, " << workers << " workers" << std::endl;
     SheetGrowthProgress progress(started);
 
-    // The field cannot outlive this call; Volume remains owned by the caller.
-    SheetNormalField field(std::shared_ptr<Volume>(&volume, [](Volume*) {}));
-    const auto shape = volume.shape(0);
+    // The field cannot outlive this call; the array remains owned by the caller.
+    SheetNormalField field(std::shared_ptr<vcr::Array>(&volume, [](vcr::Array*) {}));
+    const auto& shape = volume.spec().shape;  // ZYX
     const auto checkBounds = [&](const cv::Vec3f& point) {
         for (int axis = 0; axis < 3; ++axis)
             if (!std::isfinite(point[axis]) || point[axis] < 0 || point[axis] > shape[2 - axis] - 1)
@@ -156,16 +156,19 @@ QuadSurface* growSheetPatch(Volume& volume, const cv::Vec3f& seed,
             generations(row, col) = static_cast<uint16_t>(std::max(1,
                 std::max(std::abs(row - center), std::abs(col - center))));
     surface->setChannel("generations", generations);
-    surface->meta = utils::Json::parse(metadata.dump());
+    surface->meta = metadata;
     surface->meta["growth_method"] = method;
     surface->meta["max_gen"] = options.generations;
-    auto seedJson = utils::Json::array();
+    auto seedJson = nlohmann::json::array();
     for (int axis = 0; axis < 3; ++axis) seedJson.push_back(seed[axis]);
     surface->meta["seed"] = seedJson;
     surface->meta["elapsed_time_s"] = std::chrono::duration<double>(
         std::chrono::steady_clock::now() - started).count();
     vc::surface::storeAreaMeta(surface->meta,
-        vc::surface::computeSurfaceAreaVox2(*surface), static_cast<double>(voxelSize));
+        vc::geometry::surfaceGridArea(points.rows, points.cols,
+            [&](int64_t r, int64_t c) -> const cv::Vec3f& { return points(int(r), int(c)); },
+            [&](int64_t r, int64_t c) { return vc::geometry::validSurfacePoint(points(int(r), int(c))); }),
+        static_cast<double>(voxelSize));
     progress.status("Surface ready; saving output");
     return surface.release();
 }

@@ -2,17 +2,17 @@
 // - QuadSurface(path, json) ctor with components/bbox
 // - setChannel with 3- and 4-channel masks (normalizeMaskChannel branches)
 // - channel(name) on-demand loading via file
-// - pointTo with a SurfacePatchIndex hint
+// - pointTo with a SurfaceQuerySet hint
 // - load_quad_from_tifxyz with a mask.tif present
 
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
 #include <doctest/doctest.h>
 
 #include "vc/core/util/QuadSurface.hpp"
-#include "vc/core/util/SurfacePatchIndex.hpp"
-#include "vc/core/util/Tiff.hpp"
+#include "vc/core/util/SurfaceQuerySet.hpp"
+#include <vc_reader/image_write.hpp>
 
-#include "utils/Json.hpp"
+#include <nlohmann/json.hpp>
 #include <opencv2/core.hpp>
 #include <opencv2/imgproc.hpp>
 
@@ -67,19 +67,19 @@ TEST_CASE("QuadSurface(path, json) ctor with bbox + components fields")
         seed.save(d);
     }
     // Build a custom meta JSON for the second ctor.
-    auto j = utils::Json::object();
+    auto j = nlohmann::json::object();
     j["format"] = "tifxyz";
     j["type"] = "seg";
     j["uuid"] = "test-uuid";
-    j["bbox"] = utils::Json::array();
-    auto lo = utils::Json::array();
+    j["bbox"] = nlohmann::json::array();
+    auto lo = nlohmann::json::array();
     lo.push_back(0.0); lo.push_back(0.0); lo.push_back(0.0);
-    auto hi = utils::Json::array();
+    auto hi = nlohmann::json::array();
     hi.push_back(16.0); hi.push_back(16.0); hi.push_back(0.0);
     j["bbox"].push_back(lo);
     j["bbox"].push_back(hi);
-    auto comps = utils::Json::array();
-    auto c1 = utils::Json::array(); c1.push_back(1); c1.push_back(2);
+    auto comps = nlohmann::json::array();
+    auto c1 = nlohmann::json::array(); c1.push_back(1); c1.push_back(2);
     comps.push_back(c1);
     j["components"] = comps;
 
@@ -90,7 +90,7 @@ TEST_CASE("QuadSurface(path, json) ctor with bbox + components fields")
     CHECK_FALSE(qs.isLoaded());
     qs.ensureLoaded();
     CHECK(qs.rawPointsPtr() != nullptr);
-    CHECK(qs.meta["uuid"].get_string() == "test-uuid");
+    CHECK(qs.meta["uuid"].get<std::string>() == "test-uuid");
     fs::remove_all(root);
 }
 
@@ -156,7 +156,7 @@ TEST_CASE("channel: on-disk file load (no in-memory mat)")
     seed.save(d);
     // 32x32 image with untiled (single strip) write.
     cv::Mat sideCh(32, 32, CV_8UC1, cv::Scalar(123));
-    writeTiff(d / "side.tif", sideCh, CV_8UC1, /*tileW=*/0, /*tileH=*/0);
+    vcr::sources::writeTiff(d / "side.tif", sideCh.data, "|u1", sideCh.rows, sideCh.cols);
 
     QuadSurface reloaded(d);
     reloaded.setChannel("side", cv::Mat());
@@ -168,11 +168,11 @@ TEST_CASE("channel: on-disk file load (no in-memory mat)")
     fs::remove_all(root);
 }
 
-TEST_CASE("pointTo with a SurfacePatchIndex hint")
+TEST_CASE("pointTo with a SurfaceQuerySet hint")
 {
     auto pts = makePlanarGrid(32, 32, 0.f);
     auto surf = std::make_shared<QuadSurface>(pts, cv::Vec2f(1.f, 1.f));
-    SurfacePatchIndex idx;
+    SurfaceQuerySet idx;
     idx.rebuild({surf});
 
     cv::Vec3f ptr(0, 0, 0);
@@ -185,10 +185,7 @@ TEST_CASE("pointTo with a SurfacePatchIndex hint")
 TEST_CASE("load_quad_from_tifxyz with an associated mask.tif trims invalid points")
 {
     auto seg = fixtureSeg("20241113070770");
-    if (!fs::exists(seg / "meta.json")) {
-        MESSAGE("Skipping: fixture missing");
-        return;
-    }
+    REQUIRE(fs::exists(seg / "meta.json"));
     // Stage the segment + an extra mask.tif into a tmp dir so we don't
     // pollute the committed fixtures.
     auto d = tmpDir("mask_load");
@@ -198,15 +195,23 @@ TEST_CASE("load_quad_from_tifxyz with an associated mask.tif trims invalid point
         fs::copy(f.path(), dst / f.path().filename(),
                  fs::copy_options::recursive);
     }
-    // Write a 129x129 mask of all 255 (no trimming) just to exercise the
-    // mask-application code path.
-    cv::Mat mask(129, 129, CV_8UC1, cv::Scalar(255));
-    writeTiff(dst / "mask.tif", mask, CV_8UC1, /*tileW=*/128, /*tileH=*/128);
+    // A mask at the surface's size that clears one block of vertices.
+    QuadSurface unmasked(seg);
+    unmasked.ensureLoaded();
+    const cv::Mat_<cv::Vec3f> before = *unmasked.rawPointsPtr();
+    const int row = before.rows / 2, col = before.cols / 2;
+    REQUIRE(before(row, col)[0] != -1.0f);
+    cv::Mat mask(before.rows, before.cols, CV_8UC1, cv::Scalar(255));
+    mask(cv::Rect(col, row, 1, 1)).setTo(0);
+    vcr::sources::TiffOptions tiled;
+    tiled.tile = std::array<int, 2>{128, 128};
+    vcr::sources::writeTiff(dst / "mask.tif", mask.data, "|u1", mask.rows, mask.cols, 1, tiled);
 
     auto qs = load_quad_from_tifxyz(dst.string(), 0);
     REQUIRE(qs);
     qs->ensureLoaded();
-    CHECK(qs->rawPointsPtr() != nullptr);
+    REQUIRE(qs->rawPointsPtr() != nullptr);
+    CHECK((*qs->rawPointsPtr())(row, col)[0] == -1.0f);
     fs::remove_all(d);
 }
 
@@ -242,7 +247,7 @@ TEST_CASE("countValid* on path-only (unloaded) construction lazily loads")
     fs::remove_all(root);
 }
 
-TEST_CASE("mapped SurfacePatchIndex rebuild keeps disk-backed surfaces lazy")
+TEST_CASE("resident SurfaceQuerySet loads disk-backed geometry once")
 {
     auto root = tmpDir("mapped_lazy_index");
     auto d = root / "seg";
@@ -257,23 +262,20 @@ TEST_CASE("mapped SurfacePatchIndex rebuild keeps disk-backed surfaces lazy")
     CHECK(lazy->scale() == cv::Vec2f(2.f, 4.f));
     CHECK(lazy->center() == cv::Vec3f(4.f, 2.f, 0.f));
 
-    SurfacePatchIndex index;
-    index.setSamplingStride(4);
-    index.rebuild({lazy}, 0.0f, /*useMappedSurfaces=*/true);
+    SurfaceQuerySet index;
+    index.rebuild({lazy});
 
     CHECK_FALSE(index.empty());
-    CHECK(index.containsSurface(lazy));
-    CHECK_FALSE(lazy->isLoaded());
+    CHECK(lazy->isLoaded());
 
-    std::unordered_set<QuadSurface*> targets{lazy.get()};
-    SurfacePatchIndex::PointQuery query;
+    SurfaceQuerySet::PointQuery query;
     query.worldPoint = cv::Vec3f(4.f, 4.f, 5.f);
     query.tolerance = 1.f;
-    query.surfaces.includeRaw = &targets;
-    const auto hit = index.locateAny(query);
+    query.surfaces.only = lazy;
+    const auto hit = index.locate(query);
     REQUIRE(hit);
     CHECK(hit->surface == lazy);
-    CHECK_FALSE(lazy->isLoaded());
+    CHECK(lazy->isLoaded());
 
     fs::remove_all(root);
 }

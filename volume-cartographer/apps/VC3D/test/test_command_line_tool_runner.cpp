@@ -348,14 +348,6 @@ private slots:
         args = runner.argumentsForTesting(CommandLineToolRunner::Tool::AlphaCompRefine);
         QVERIFY2(!args.contains("--name"), "no name refines in place");
 
-        runner.setMergePatchParams("parent-uuid", "child-uuid", true, 16, 6, 4, 3000, 5, 10, 3, 0, 0);
-        args = runner.argumentsForTesting(CommandLineToolRunner::Tool::MergePatch);
-        QCOMPARE(args.count("--surface"), 2);
-        QCOMPARE(args.at(args.indexOf("--surface") + 1), QString("parent-uuid"));
-        QCOMPARE(args.at(args.lastIndexOf("--surface") + 1), QString("child-uuid"));
-        QVERIFY(args.contains("--explicit-roles"));
-        QVERIFY(!args.contains("--parent") && !args.contains("--child"));
-
         // At a working level the tools work in that level's voxels of the volume.
         runner.setStore("objects.vcobj", 0.25);
         runner.setTraceParams("volume.zarr", "vol", "source", "trace", "params.json", "src-uuid");
