@@ -1,7 +1,9 @@
 #pragma once
 // vc_object_server: hosts one object store over HTTP for clients that have no
 // filesystem access to it. Handlers only adapt the wire to the public
-// ObjectStore APIs (submit, receipt, status, changesSince, historical reads);
+// ObjectStore APIs (submit, receipt, status, changesSince, historical reads,
+// object/edge selections, object history, numbered relationship selections,
+// region and surface proximity queries);
 // storage semantics live in the shared library.
 //
 // The store is opened as its service owner: startup fails while a standalone
@@ -33,6 +35,15 @@ struct ServerOptions {
     std::chrono::seconds stagingLifetime{3600};
     std::chrono::seconds requestDeadline{300}; // per request read/write on a connection
     int64_t maxFeedChanges = 4096;
+    // Object/edge query pages must name a limit no larger than this; larger
+    // listings are paged by the client (see HostedStore::selectAllObjects).
+    int64_t maxQueryResults = 10000;
+    // Region queries are clamped to these budgets; a clamped query reports
+    // the budget it stopped at (RegionResult::stop), never a silent cut.
+    uint64_t maxRegionOutputBytes = 32u << 20;
+    uint64_t maxRegionProcessingBytes = 512u << 20;
+    uint64_t maxRegionCandidateWork = 10000000;
+    uint64_t maxRegionSqlSteps = 100000000;
     std::string author = "vc_object_server";  // open author; requests carry their own
 };
 

@@ -10,15 +10,24 @@
 // the outcome is unknown; recover it with receipt() or by submitting the
 // identical request again, never by minting a new request UUID.
 
+#include "vc_object_store/objects/GeometryRegion.hpp"
 #include "vc_object_store/objects/ObjectStore.hpp"
 #include "vc_object_store/objects/Transactions.hpp"
 
 #include <memory>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
 namespace vc::objects {
+
+// A paged listing kept seeing new commits between its pages and gave up
+// rather than combine snapshots. Retry later or page a pinned selection.
+class StoreBusy : public std::runtime_error {
+public:
+    using std::runtime_error::runtime_error;
+};
 
 struct HostedStoreOptions {
     int connections = 4;
@@ -53,6 +62,32 @@ public:
     std::optional<GeometryRevision> geometryRevision(const std::string& revisionUuid);
     std::vector<uint8_t> readGeometryArray(const std::string& revisionUuid, const std::string& arrayName,
                                            int64_t byteOffset = 0, const std::optional<int64_t>& byteCount = std::nullopt);
+
+    // Queries run in one server read snapshot; `asOf` receives its status.
+    // Selections carry no transforms: volume targets resolve through the
+    // store's recorded transforms. One page: selection.limit is required and
+    // bounded by the server.
+    std::vector<ObjectRecord> selectObjects(const ObjectSelection&,
+        const std::optional<std::vector<std::string>>& fields = std::nullopt, StoreStatus* asOf = nullptr);
+    std::vector<EdgeRecord> selectEdges(const EdgeSelection&,
+        const std::optional<std::vector<std::string>>& fields = std::nullopt, StoreStatus* asOf = nullptr);
+    // Every match, read in pages of `pageSize`. Pages read at different commit
+    // sequences are never combined: the listing restarts, and after
+    // `maxRestarts` restarts throws StoreBusy. The selection must not carry a
+    // limit; its starting cursor/offset is kept. `asOf` is the common snapshot.
+    std::vector<ObjectRecord> selectAllObjects(ObjectSelection,
+        const std::optional<std::vector<std::string>>& fields = std::nullopt, int64_t pageSize = 1000,
+        int maxRestarts = 3, StoreStatus* asOf = nullptr);
+    std::vector<EdgeRecord> selectAllEdges(EdgeSelection,
+        const std::optional<std::vector<std::string>>& fields = std::nullopt, int64_t pageSize = 1000,
+        int maxRestarts = 3, StoreStatus* asOf = nullptr);
+    // Every recorded revision of an object (empty when it never existed).
+    std::vector<ObjectRevision> objectHistory(const std::string& objectUuid, StoreStatus* asOf = nullptr);
+    std::vector<SelectedRelationship> relationshipsAt(const std::vector<ObjectVersion>&, StoreStatus* asOf = nullptr);
+    // Budgets above the server's limits are clamped; the result's stop reason
+    // reports a budget stop (complete() is false).
+    RegionResult geometryRegion(const RegionSlice&, const RegionOptions& = {}, StoreStatus* asOf = nullptr);
+    std::vector<SurfaceProximityHit> nearestSurfaces(const SurfaceProximityQuery&, StoreStatus* asOf = nullptr);
 
 private:
     struct Impl;

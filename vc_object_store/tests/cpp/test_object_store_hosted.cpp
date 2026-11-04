@@ -1,7 +1,7 @@
 // Hosted access: the same requests through the public local API and through
 // vc_object_server give the same versions, receipts, conflicts, feed and
-// historical reads; receipts recover lost replies and expired staging; the
-// service owns its store exclusively.
+// historical reads, queries and listings; receipts recover lost replies and
+// expired staging; the service owns its store exclusively.
 #include "TestSupport.hpp"
 #include "vc_object_store/client/HostedStore.hpp"
 #include "vc_object_store/geometry/Geometry.hpp"
@@ -9,8 +9,10 @@
 #include "vc_object_store/objects/TransactionJson.hpp"
 #include "vc_object_store/server/Server.hpp"
 
+#include <atomic>
 #include <cstring>
 #include <iostream>
+#include <thread>
 
 using namespace vc::objects;
 
@@ -199,6 +201,128 @@ try {
                     hosted.readGeometryArray(hg->uuid, array.name), "geometry bytes parity");
         }
         require(!hosted.geometryRevision(util::newUuid()), "unknown geometry");
+    }
+
+    // Queries answer from one server snapshot and match the local store.
+    std::vector<std::string> extra;
+    {
+        const auto sheetUuid = util::newUuid();
+        vc::geometry::Surface sheet{70, 40, {1, 1}, {}};
+        for (int r = 0; r < 70; ++r)
+            for (int c = 0; c < 40; ++c) sheet.points.push_back({float(c), float(r), float(c + 1)});
+        ObjectRecord surfaceRecord; surfaceRecord.uuid = sheetUuid; surfaceRecord.kind = "surface";
+        both(request({{sheetUuid, std::nullopt}},
+            {CreateObjectOp{objectRecordJson(surfaceRecord)}, PutGeometryOp{sheetUuid, vc::geometry::encode(sheet), {}}}),
+            "surface parity");
+        VersionSelection absent;
+        std::vector<TransactionOperation> creations;
+        for (int i = 0; i < 5; ++i) {
+            extra.push_back(util::newUuid());
+            absent[extra.back()] = std::nullopt;
+            creations.push_back(CreateObjectOp{objectRecordJson(trackRecord(extra.back()))});
+        }
+        both(request(absent, creations), "bulk creation parity");
+
+        auto ids = [](const auto& records) {
+            std::vector<std::string> result;
+            for (const auto& r : records) result.push_back(r.uuid);
+            return result;
+        };
+        auto txn = local.read();
+        ObjectSelection tracks; tracks.kind = "track";
+        const auto localTracks = local.selectObjects(txn, tracks);
+        mustFail([&] { (void)hosted.selectObjects(tracks); }); // one page needs a limit
+        StoreStatus asOf;
+        const auto all = hosted.selectAllObjects(tracks, std::nullopt, 2, 3, &asOf);
+        require(all.size() == 7 && ids(all) == ids(localTracks), "paged selection parity");
+        require(asOf.commitSequence == hosted.status().commitSequence, "listing snapshot");
+        for (std::size_t i = 0; i < all.size(); ++i) {
+            require(all[i].meta == localTracks[i].meta && all[i].generation == localTracks[i].generation &&
+                all[i].changedBy == localTracks[i].changedBy && all[i].track->externalKey == localTracks[i].track->externalKey,
+                "record parity");
+        }
+        auto byLength = tracks; byLength.orderBy = "length_desc";
+        require(ids(hosted.selectAllObjects(byLength, std::nullopt, 3)) == ids(local.selectObjects(txn, byLength)),
+            "offset-paged selection parity");
+        auto page = tracks; page.limit = 3;
+        const std::vector<std::string> metaOnly{"meta"};
+        const auto projected = hosted.selectObjects(page, metaOnly);
+        const auto localProjected = local.selectObjects(txn, page, metaOnly);
+        require(ids(projected) == ids(localProjected) && projected[0].meta == localProjected[0].meta &&
+            !projected[0].track && projected[0].createdBy.empty(), "projected selection parity");
+        {
+            auto withTransforms = tracks; withTransforms.limit = 1;
+            withTransforms.transforms = std::make_shared<VolumeTransforms>(local.volumeTransforms(txn));
+            mustFail([&] { (void)hosted.selectObjects(withTransforms); }); // the store's recorded transforms apply
+        }
+
+        EdgeSelection links; links.kind = "test_link";
+        require(ids(hosted.selectAllEdges(links, std::nullopt, 1)) == ids(local.selectEdges(txn, links)) &&
+            ids(local.selectEdges(txn, links)) == std::vector<std::string>{edge}, "edge listing parity");
+
+        std::vector<int64_t> localVersions, hostedVersions;
+        for (const auto& r : local.objectHistory(txn, a)) localVersions.push_back(r.version);
+        for (const auto& r : hosted.objectHistory(a)) hostedVersions.push_back(r.version);
+        require(localVersions == hostedVersions && hostedVersions.back() == 5, "history parity");
+        require(hosted.objectHistory(util::newUuid()).empty(), "unknown history");
+
+        for (auto [va, vb] : {std::pair<int64_t, int64_t>{4, 2}, {5, 3}}) {
+            const auto l = local.relationshipsAt(txn, std::vector<ObjectVersion>{
+                {localInitial.storeUuid, localInitial.generation, a, va}, {localInitial.storeUuid, localInitial.generation, b, vb}});
+            const auto h = hosted.relationshipsAt(
+                {{hostedInitial.storeUuid, hostedInitial.generation, a, va}, {hostedInitial.storeUuid, hostedInitial.generation, b, vb}});
+            require(l.size() == 1 && h.size() == 1 && h[0].relationship.record.uuid == edge &&
+                h[0].relationship.version == l[0].relationship.version && h[0].applicable == l[0].applicable &&
+                h[0].relationship.aVersion == va && h[0].relationship.bVersion == vb, "numbered relationship parity");
+        }
+        mustFail([&] { (void)hosted.relationshipsAt({{hostedInitial.storeUuid, hostedInitial.generation, a, 99}}); });
+        mustFail([&] { (void)hosted.relationshipsAt({{hostedInitial.storeUuid, util::newUuid(), a, 1}}); });
+
+        RegionSlice plane; plane.origin = {0, 0, 31.25}; plane.localBounds = {-1000, -1000, -0.5, 1000, 1000, 0.5};
+        RegionOptions surfaces; surfaces.kind = "surface";
+        const auto localRegion = local.geometryRegion(txn, plane, surfaces);
+        const auto hostedRegion = hosted.geometryRegion(plane, surfaces);
+        require(localRegion.complete() && hostedRegion.complete() && localRegion.runs.size() == 1 &&
+            hostedRegion.runs.size() == 1 && hostedRegion.runs[0].objectUuid == sheetUuid &&
+            hostedRegion.runs[0].points == localRegion.runs[0].points && hostedRegion.runs[0].grid == localRegion.runs[0].grid &&
+            hostedRegion.intersectingObjects == localRegion.intersectingObjects, "region parity (exact doubles)");
+        surfaces.processingByteBudget = 0;
+        require(hosted.geometryRegion(plane, surfaces).stop == RegionStop::ProcessingBudget, "region budget stop");
+
+        SurfaceProximityQuery near; near.point = {10.2, 20, 11.5}; near.tolerance = 2;
+        const auto localHits = local.nearestSurfaces(txn, near);
+        const auto hostedHits = hosted.nearestSurfaces(near);
+        require(localHits.size() == 1 && hostedHits.size() == 1 && hostedHits[0].objectUuid == sheetUuid &&
+            hostedHits[0].point == localHits[0].point && hostedHits[0].grid == localHits[0].grid &&
+            hostedHits[0].distance == localHits[0].distance, "proximity parity (exact doubles)");
+    }
+
+    // A listing never combines pages from different snapshots: with commits
+    // landing between its pages it restarts, then gives up.
+    {
+        std::atomic<bool> done{false};
+        std::string writerError;
+        std::thread writer([&] {
+            try {
+                HostedStore client(endpoint);
+                for (int64_t version = 1; !done; ++version) {
+                    auto r = request({{extra[0], version}}, {SetMetaOp{extra[0], "tick", std::to_string(version)}}).hosted;
+                    client.submit(r);
+                }
+            } catch (const std::exception& e) {
+                writerError = e.what();
+            }
+        });
+        ObjectSelection tracks; tracks.kind = "track";
+        bool busy = false;
+        for (int attempt = 0; attempt < 50 && !busy; ++attempt) {
+            try { (void)hosted.selectAllObjects(tracks, std::vector<std::string>{}, 1, 0); } catch (const StoreBusy&) { busy = true; }
+        }
+        done = true;
+        writer.join();
+        if (!writerError.empty()) throw std::runtime_error("concurrent writer: " + writerError);
+        require(busy, "a listing across commits gives up instead of mixing snapshots");
+        require(hosted.selectAllObjects(tracks, std::vector<std::string>{}, 1).size() == 7, "quiet store lists");
     }
 
     // Expired staging: a new request cannot run without its bytes, but the

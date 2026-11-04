@@ -138,4 +138,128 @@ std::vector<uint8_t> HostedStore::readGeometryArray(const std::string& revisionU
     return {body.begin(), body.end()};
 }
 
+namespace {
+// Pages a listing until a short page, restarting whenever a page comes from
+// another snapshot than the first. `page(cursorFrom)` reads one page after
+// the cursor state captured from the previous page's last record.
+template<class Record, class Fetch, class Advance>
+std::vector<Record> pageAll(int64_t pageSize, int maxRestarts, StoreStatus* asOf, Fetch fetch, Advance advance)
+{
+    if (pageSize <= 0) throw std::invalid_argument("hosted store: page size must be positive");
+    for (int attempt = 0; attempt <= maxRestarts; ++attempt) {
+        std::vector<Record> all;
+        StoreStatus first, current;
+        bool restart = false;
+        for (bool start = true;; start = false) {
+            auto page = fetch(start, all, start ? &first : &current);
+            if (!start && (current.storeUuid != first.storeUuid || current.generation != first.generation ||
+                           current.commitSequence != first.commitSequence)) {
+                restart = true;
+                break;
+            }
+            const bool last = int64_t(page.size()) < pageSize;
+            advance(page);
+            all.insert(all.end(), std::make_move_iterator(page.begin()), std::make_move_iterator(page.end()));
+            if (last) break;
+        }
+        if (restart) continue;
+        if (asOf) *asOf = first;
+        return all;
+    }
+    throw StoreBusy("hosted store: the store kept changing while paging a listing; retry later");
+}
+} // namespace
+
+std::vector<ObjectRecord> HostedStore::selectObjects(const ObjectSelection& selection,
+    const std::optional<std::vector<std::string>>& fields, StoreStatus* asOf)
+{
+    const auto response = impl_->http.request("POST", endpoint_ + "/v1/query/objects",
+        objectQueryRequestToJson(selection, fields), {{"Content-Type", "application/json"}});
+    return objectQueryResultFromJson(expectOk(response, "object query").body, asOf);
+}
+
+std::vector<EdgeRecord> HostedStore::selectEdges(const EdgeSelection& selection,
+    const std::optional<std::vector<std::string>>& fields, StoreStatus* asOf)
+{
+    const auto response = impl_->http.request("POST", endpoint_ + "/v1/query/edges",
+        edgeQueryRequestToJson(selection, fields), {{"Content-Type", "application/json"}});
+    return edgeQueryResultFromJson(expectOk(response, "edge query").body, asOf);
+}
+
+std::vector<ObjectRecord> HostedStore::selectAllObjects(ObjectSelection selection,
+    const std::optional<std::vector<std::string>>& fields, int64_t pageSize, int maxRestarts, StoreStatus* asOf)
+{
+    if (selection.limit) throw std::invalid_argument("hosted store: selectAllObjects pages itself; remove the limit");
+    // UUID order pages by cursor. Length order and volume listings with
+    // unbound objects page by offset, which is exact within one snapshot.
+    const bool byCursor = selection.orderBy == "uuid" && !selection.includeUnbound;
+    if (!byCursor && (selection.afterUuid || selection.afterLength))
+        throw std::invalid_argument("hosted store: selectAllObjects starts length/unbound listings at an offset, not a cursor");
+    const auto start = selection;
+    selection.limit = pageSize;
+    return pageAll<ObjectRecord>(pageSize, maxRestarts, asOf,
+        [&](bool first, const std::vector<ObjectRecord>& all, StoreStatus* status) {
+            if (first) {
+                selection.afterUuid = start.afterUuid;
+                selection.offset = start.offset;
+            } else if (!byCursor) {
+                selection.offset = start.offset + int64_t(all.size());
+            }
+            return selectObjects(selection, fields, status);
+        },
+        [&](const std::vector<ObjectRecord>& page) {
+            if (byCursor && !page.empty()) {
+                selection.afterUuid = page.back().uuid;
+                selection.offset = 0;
+            }
+        });
+}
+
+std::vector<EdgeRecord> HostedStore::selectAllEdges(EdgeSelection selection,
+    const std::optional<std::vector<std::string>>& fields, int64_t pageSize, int maxRestarts, StoreStatus* asOf)
+{
+    if (selection.limit) throw std::invalid_argument("hosted store: selectAllEdges pages itself; remove the limit");
+    const auto start = selection.afterUuid;
+    selection.limit = pageSize;
+    return pageAll<EdgeRecord>(pageSize, maxRestarts, asOf,
+        [&](bool first, const std::vector<EdgeRecord>&, StoreStatus* status) {
+            if (first) selection.afterUuid = start;
+            return selectEdges(selection, fields, status);
+        },
+        [&](const std::vector<EdgeRecord>& page) {
+            if (!page.empty()) selection.afterUuid = page.back().uuid;
+        });
+}
+
+std::vector<ObjectRevision> HostedStore::objectHistory(const std::string& objectUuid, StoreStatus* asOf)
+{
+    const auto response = impl_->http.request("GET", endpoint_ + "/v1/objects/" + objectUuid + "/history");
+    if (response.status == 404) {
+        if (asOf) *asOf = status();
+        return {};
+    }
+    return objectHistoryFromJson(expectOk(response, "object history").body, asOf);
+}
+
+std::vector<SelectedRelationship> HostedStore::relationshipsAt(const std::vector<ObjectVersion>& versions, StoreStatus* asOf)
+{
+    const auto response = impl_->http.request("POST", endpoint_ + "/v1/query/relationships",
+        relationshipQueryRequestToJson(versions), {{"Content-Type", "application/json"}});
+    return relationshipQueryResultFromJson(expectOk(response, "relationship query").body, asOf);
+}
+
+RegionResult HostedStore::geometryRegion(const RegionSlice& slice, const RegionOptions& options, StoreStatus* asOf)
+{
+    const auto response = impl_->http.request("POST", endpoint_ + "/v1/query/region",
+        regionQueryRequestToJson(slice, options), {{"Content-Type", "application/json"}});
+    return regionQueryResultFromJson(expectOk(response, "region query").body, asOf);
+}
+
+std::vector<SurfaceProximityHit> HostedStore::nearestSurfaces(const SurfaceProximityQuery& query, StoreStatus* asOf)
+{
+    const auto response = impl_->http.request("POST", endpoint_ + "/v1/query/nearest_surfaces",
+        proximityQueryRequestToJson(query), {{"Content-Type", "application/json"}});
+    return proximityQueryResultFromJson(expectOk(response, "proximity query").body, asOf);
+}
+
 } // namespace vc::objects

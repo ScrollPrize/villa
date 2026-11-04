@@ -237,7 +237,9 @@ ssh -N -L 8750:127.0.0.1:8750 storage-host                # on each client
 C++ clients use `vc::objects::HostedStore` (`client/HostedStore.hpp`) with the
 same request and result types as the local API: `status`, `submit`, `receipt`,
 `changesSince`, `currentObjectRevision`, `currentVersion`, `objectAtVersion`,
-`geometryRevision` and `readGeometryArray`. Conflicts throw the same
+`geometryRevision`, `readGeometryArray`, `selectObjects`/`selectEdges` (one
+page), `selectAllObjects`/`selectAllEdges`, `objectHistory`, `relationshipsAt`
+(numbered object versions), `geometryRegion` and `nearestSurfaces`. Conflicts throw the same
 `TransactionConflict`. Transport failures, 429 and 5xx are retried with the same
 request UUID, so a lost reply is answered by the saved receipt. When retries run
 out the outcome is unknown: recover it with `receipt()` or by resubmitting the
@@ -256,6 +258,22 @@ Wire protocol (version 1, JSON unless noted):
 | `GET /v1/objects/{uuid}/versions/{n}?store&generation` | that numbered revision or 404 |
 | `GET /v1/geometry/{revision}` | geometry descriptor (immutable) |
 | `GET /v1/geometry/{revision}/arrays/{name}?offset&count` | array bytes |
+| `GET /v1/objects/{uuid}/history` | every recorded revision, or 404 |
+| `POST /v1/query/objects` (`selection`, `fields`) | one page of records; `limit` required, at most `maxQueryResults` |
+| `POST /v1/query/edges` (`selection`, `fields`) | one page of edges; same limit rule |
+| `POST /v1/query/relationships` (`versions`: store, generation, object, version) | selected relationships with `applicable` |
+| `POST /v1/query/region` (`slice`, `options`) | region runs, coverage stop reason and stats |
+| `POST /v1/query/nearest_surfaces` (proximity query) | surface hits |
+
+Every query answer carries the `status` of the single read snapshot it came
+from. Selections never carry transforms: volume targets resolve through the
+transforms recorded in the store (a client catalog cache cannot change a shared
+query), and a request that sets them is refused. Region budgets above the
+server's limits are clamped, so the answer reports the budget it stopped at
+instead of claiming completeness. `selectAllObjects`/`selectAllEdges` page
+with UUID cursors (offsets for length order and unbound volume listings) and
+restart when a page comes from a later commit than the first; after a bounded
+number of restarts they throw `StoreBusy` rather than combine snapshots.
 
 The server answers a request whose payloads have expired from its saved
 receipt when there is one. Otherwise it names the missing payloads, and the
@@ -265,7 +283,7 @@ runs on network threads. Checked transactions go to one writer queue. Reads,
 feed pages and staging go to bounded read workers. Status and receipt checks
 have their own lane. A full queue answers 503, which clients retry.
 `ServerOptions` sets the queues, body, payload and staging limits, the staging
-lifetime and per-request deadlines.
+lifetime, per-request deadlines, query page size and region budgets.
 
 ## Relationships and graphs
 

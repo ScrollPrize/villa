@@ -310,6 +310,65 @@ struct ServerState {
         return {http::status::ok, "application/octet-stream", std::string(bytes.begin(), bytes.end())};
     }
 
+    // Query pages are bounded: an absent or larger limit is refused, not cut.
+    void requirePage(const std::optional<int64_t>& limit) const
+    {
+        if (!limit || *limit > options.maxQueryResults)
+            throw std::invalid_argument("query limit is required and at most " + std::to_string(options.maxQueryResults) +
+                                        "; page larger selections");
+    }
+
+    Reply queryObjects(const std::string& body)
+    {
+        std::optional<std::vector<std::string>> fields;
+        const auto selection = objectQueryRequestFromJson(body, &fields);
+        requirePage(selection.limit);
+        auto txn = store->read();
+        return jsonReply(objectQueryResultToJson(store->status(txn), store->selectObjects(txn, selection, fields), fields));
+    }
+
+    Reply queryEdges(const std::string& body)
+    {
+        std::optional<std::vector<std::string>> fields;
+        const auto selection = edgeQueryRequestFromJson(body, &fields);
+        requirePage(selection.limit);
+        auto txn = store->read();
+        return jsonReply(edgeQueryResultToJson(store->status(txn), store->selectEdges(txn, selection, fields), fields));
+    }
+
+    Reply objectHistory(const std::string& uuid)
+    {
+        auto txn = store->read();
+        const auto history = store->objectHistory(txn, uuidSegment(uuid));
+        if (history.empty()) return errorReply(http::status::not_found, "no object " + uuid);
+        return jsonReply(objectHistoryToJson(store->status(txn), history));
+    }
+
+    Reply queryRelationships(const std::string& body)
+    {
+        const auto versions = relationshipQueryRequestFromJson(body);
+        auto txn = store->read();
+        return jsonReply(relationshipQueryResultToJson(store->status(txn), store->relationshipsAt(txn, versions)));
+    }
+
+    Reply queryRegion(const std::string& body)
+    {
+        auto [slice, region] = regionQueryRequestFromJson(body);
+        region.outputByteBudget = std::min(region.outputByteBudget, options.maxRegionOutputBytes);
+        region.processingByteBudget = std::min(region.processingByteBudget, options.maxRegionProcessingBytes);
+        region.candidateWorkBudget = std::min(region.candidateWorkBudget, options.maxRegionCandidateWork);
+        region.sqlStepBudget = std::min(region.sqlStepBudget, options.maxRegionSqlSteps);
+        auto txn = store->read();
+        return jsonReply(regionQueryResultToJson(store->status(txn), store->geometryRegion(txn, slice, region)));
+    }
+
+    Reply queryNearestSurfaces(const std::string& body)
+    {
+        const auto query = proximityQueryRequestFromJson(body);
+        auto txn = store->read();
+        return jsonReply(proximityQueryResultToJson(store->status(txn), store->nearestSurfaces(txn, query)));
+    }
+
     // ---- Routing ------------------------------------------------------------
 
     struct Route {
@@ -346,6 +405,18 @@ struct ServerState {
             return {readers.get(), [this, target] { return currentObject(target->path[2]); }};
         if (method == http::verb::get && is({"v1", "objects", "*", "versions", "*"}))
             return {readers.get(), [this, target] { return objectVersion(target->path[2], target->path[4], *target); }};
+        if (method == http::verb::get && is({"v1", "objects", "*", "history"}))
+            return {readers.get(), [this, target] { return objectHistory(target->path[2]); }};
+        if (method == http::verb::post && is({"v1", "query", "objects"}))
+            return {readers.get(), [this, body] { return queryObjects(*body); }};
+        if (method == http::verb::post && is({"v1", "query", "edges"}))
+            return {readers.get(), [this, body] { return queryEdges(*body); }};
+        if (method == http::verb::post && is({"v1", "query", "relationships"}))
+            return {readers.get(), [this, body] { return queryRelationships(*body); }};
+        if (method == http::verb::post && is({"v1", "query", "region"}))
+            return {readers.get(), [this, body] { return queryRegion(*body); }};
+        if (method == http::verb::post && is({"v1", "query", "nearest_surfaces"}))
+            return {readers.get(), [this, body] { return queryNearestSurfaces(*body); }};
         if (method == http::verb::get && is({"v1", "geometry", "*"}))
             return {readers.get(), [this, target] { return geometry(target->path[2]); }};
         if (method == http::verb::get && is({"v1", "geometry", "*", "arrays", "*"}))
