@@ -15,11 +15,52 @@ set(srcs
     Keybinds.cpp
     Keybinds.hpp
     CWindow.cpp
+    FiberCollectionGenerator.cpp
+    FiberCollectionGeneratorDialog.cpp
     FiberCollectionController.cpp
     SurfaceCatalog.cpp
     SurfaceCatalog.hpp
     FiberCollectionController.hpp
     FiberDisplayOptions.hpp
+    FiberOverlayColors.hpp
+    fibers3d/Fiber3DScene.hpp
+    fibers3d/Fiber3DData.cpp
+    fibers3d/Fiber3DData.hpp
+    fibers3d/Fiber3DCanvas.cpp
+    scene3d/Scene3DCanvas.cpp
+    scene3d/Scene3DPanel.cpp
+    scene3d/Scene3DPanel.hpp
+    scene3d/MemoryBudgetInput.hpp
+    scene3d/VolumePreview.cpp
+    scene3d/VolumePreview.hpp
+    fibers3d/Fiber3DCanvas.hpp
+    fibers3d/Fiber3DRenderGeometry.hpp
+    fibers3d/Fiber3DColor.hpp
+    fibers3d/Fiber3DGeometry.hpp
+    fibers3d/Fiber3DPanel.cpp
+    fibers3d/Fiber3DPanel.hpp
+    fibers3d/Fiber3DRibbon.hpp
+    fibers3d/Fiber3DRibbon.cpp
+    fibers3d/Fiber3DRibbonControls.hpp
+    fibers3d/Fiber3DRibbonControls.cpp
+    fibers3d/Fiber3DCT.hpp
+    fibers3d/Fiber3DCT.cpp
+    fibers3d/Fiber3DSlices.hpp
+    fibers3d/Fiber3DSlices.cpp
+    fibers3d/Fiber3DVolumeRenderer.hpp
+    fibers3d/Fiber3DVolumeRenderer.cpp
+    fibers3d/Fiber3DSliceControls.hpp
+    fibers3d/Fiber3DSliceControls.cpp
+    fibers3d/Fiber3DSurfaceMesh.hpp
+    fibers3d/Fiber3DSurfaceTexture.cpp
+    fibers3d/Fiber3DSurfaceMesh.cpp
+    fibers3d/Fiber3DSurfaceProximity.hpp
+    fibers3d/Fiber3DSurfaceProximity.cpp
+    fibers3d/Fiber3DSurfaceRenderer.hpp
+    fibers3d/Fiber3DSurfaceRenderer.cpp
+    fibers3d/Fiber3DSurfaceControls.hpp
+    fibers3d/Fiber3DSurfaceControls.cpp
+    LineAnnotationPolylineIndices.hpp
     CWindowContextMenu.cpp
     StatusDockPanelHost.cpp
     StatusDockPanelHost.hpp
@@ -76,6 +117,7 @@ set(srcs
     VolumeRegistrations.hpp
     CommandLaunchError.hpp
     FiberSaveBatchTracker.hpp
+    GrowPatchSeedDialog.cpp
     SegmentationCommandHandler.cpp
     SegmentationCommandHandler.hpp
     volume_viewers/annotation_tools/SameWrapAnnotationTool.cpp
@@ -143,11 +185,14 @@ set(srcs
     segmentation/tools/SurfaceMaskBrushTool.hpp
     segmentation/tools/ManualAddTool.cpp
     segmentation/tools/ManualAddTool.hpp
+    segmentation/tools/SheetNormalField.hpp
     segmentation/tools/ThinPlateSpline3d.cpp
     segmentation/tools/ThinPlateSpline3d.hpp
     segmentation/tools/SegmentationPushPullTool.cpp
     segmentation/tools/SegmentationPushPullTool.hpp
     segmentation/tools/SegmentationTool.hpp
+    segmentation/SurfaceGridEdit.cpp
+    segmentation/SurfaceGridEdit.hpp
     segmentation/SegmentationModule_Falloff.cpp
     segmentation/SegmentationModule_Input.cpp
     segmentation/SegmentationModule_Session.cpp
@@ -335,6 +380,8 @@ target_include_directories(VC3D
         ${CMAKE_CURRENT_SOURCE_DIR}
         ${CMAKE_SOURCE_DIR}/core/src
         ${CMAKE_SOURCE_DIR}/libs/djikstra3d
+        # Header-only CT sheet-normal estimator shared with vc_reader.
+        ${CMAKE_SOURCE_DIR}/../vc_reader/src/cpp
 )
 
 # Avahi for mDNS service discovery (Linux only)
@@ -376,6 +423,19 @@ target_link_libraries(VC3D
     $<$<BOOL:${AVAHI_FOUND}>:PkgConfig::AVAHI>
     Blosc::blosc
 )
+
+# Headless Manual Add edge extension along the sheet (no GUI). Qt Core only
+# because ManualAddTool's headers use it.
+add_executable(vc_extend_edge
+    cli/vc_extend_edge.cpp
+    segmentation/SurfaceGridEdit.cpp
+    segmentation/tools/AutoExtend.cpp
+    segmentation/tools/ManualAddTool.cpp
+    segmentation/tools/ThinPlateSpline3d.cpp)
+target_include_directories(vc_extend_edge PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_SOURCE_DIR}/../vc_reader/src/cpp)
+target_link_libraries(vc_extend_edge PRIVATE vc_core Qt6::Core Boost::program_options)
 
 # Build-tree Qt plugin deployment (MSVC/vcpkg). vcpkg copies the Qt DLLs next to
 # the executable but not the plugin tree, so a freshly built VC3D.exe cannot find
@@ -457,7 +517,7 @@ if(EXISTS "${_vc3d_fiber_format_src}/__init__.py")
 endif()
 
 if(VC_TESTING)
-    set_source_files_properties(LineAnnotationController.cpp SurfacePanelController.cpp VCAppMain.cpp PROPERTIES COMPILE_DEFINITIONS VC_TESTING)
+    set_source_files_properties(LineAnnotationController.cpp SurfacePanelController.cpp VCAppMain.cpp scene3d/Scene3DPanel.cpp PROPERTIES COMPILE_DEFINITIONS VC_TESTING)
     # The in-binary store tests build their fixture volumes with core/test/support.
     target_include_directories(VC3D PRIVATE ${PROJECT_SOURCE_DIR}/core/test)
 endif()

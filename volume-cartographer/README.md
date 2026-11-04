@@ -25,7 +25,7 @@ The `edge` and `main` image tags currently carry the build of 2026-05-13 (see [#
 
 #### Linux
 
-A self-contained `VC3D-<version>-linux-x86_64.AppImage` (VC3D plus the `vc_*` command-line tools, with all dependencies bundled) is attached to each [GitHub release](https://github.com/ScrollPrize/villa/releases). Make it executable and pass the program to run as the first argument:
+A `VC3D-<version>-linux-x86_64.AppImage` containing VC3D and the `vc_*` command-line tools is attached to each [GitHub release](https://github.com/ScrollPrize/villa/releases). The host must provide graphics and font libraries, including for headless CLI use; see the [runtime prerequisites](scripts/appimage/README.md#prerequisites-what-the-host-must-provide). Make it executable and pass the program to run as the first argument:
 
 ```bash
 chmod +x VC3D-*-linux-x86_64.AppImage
@@ -132,10 +132,66 @@ After dependencies are installed, rebuilds can use:
 scripts/build_macos.sh
 ```
 
+The macOS PR and release workflows use this same helper with
+`--install-deps --sccache`, installing missing dependencies directly from
+Homebrew on the runner. They do not restore a `vc3d-deps` Homebrew snapshot.
+Compiler outputs are still cached; dependency versions follow the runner's
+Homebrew formulae.
+
 [installation instructions for docker](https://docs.docker.com/engine/install/)
 
 [running docker as a non-root user](https://docs.docker.com/engine/install/linux-postinstall/)
 
+
+### Sheet-following edge extension
+
+In Manual Add, enable **Extensions follow the sheet**, choose **Sheet walk**
+(`Projection` or `Streamline`), and set **Normal substep** to the maximum internal
+step length in volume voxels. Zero means one step per output vertex. A positive
+value subdivides each mesh interval into equal steps no longer than that value;
+it does not add mesh vertices. Settings persist and apply to the next extension.
+While a sheet-following extension computes, its unfinished strip stays hidden,
+editing and surface selection are locked, and an animated progress indicator
+is shown. The completed strip appears when calculation finishes; failures
+discard the unfinished extension and release the lock.
+Streamline offers **Midpoint (RK2)**, **Heun (RK2)**, and **RK4**.
+Applying or canceling an extension ends the editing session but keeps **Manual
+Add** selected as the growth method until you choose another method.
+
+The CLI exposes the same options:
+
+```bash
+build/bin/vc_extend_edge -i INPUT.tifxyz -o OUTPUT.tifxyz -n VOLUME.zarr \
+    --sides right --cells 10 --rounds 1 \
+    --normal-step 2 --walk-mode streamline --integrator rk4 --report report.json
+```
+
+Defaults (`--normal-step 0 --walk-mode projection`) preserve the original walk
+and its cached normals. Positive substeps or streamline mode evaluate the tensor
+weights at the actual query position, without rounding the query. The estimator
+still samples gradients on its existing 3-voxel grid within a 109³ patch; patch
+support changes at cache-cell boundaries, so the field is not perfectly smooth.
+Exact-position queries share a bounded cache of 32 filtered gradient patches
+(about 27 MiB per volume). Each query still evaluates its own tensor and normal;
+reuse does not round positions or change the estimator arithmetic.
+
+Streamline integrates minimum-turn tangent transport, `x' = v` and
+`v' = -n (v · Dn v)`, using unit normals and central directional differences
+at ±0.25 voxels. Normal signs are aligned before differencing. Each completed
+step reprojects and normalizes the tangent. The finite-difference scale and
+normal-field smoothness limit accuracy even with RK4. If an integration stage
+has no usable normal, that substep uses the projection walk; if its midpoint
+normal is also missing, it continues straight. There is no positional snapping
+or automatic stop rule. Smaller steps do not guarantee the correct winding.
+The report's legacy `steps_without_normal` field counts failed normal queries,
+including intermediate integration and derivative queries.
+
+Build and run the extension tests with existing dependencies:
+
+```bash
+ninja -C build test_manual_add_extend vc_extend_edge
+QT_QPA_PLATFORM=offscreen build/bin/test_manual_add_extend
+```
 
 ### Basic introduction to VC3D 
 The document below is a basic introduction to the ui and keybindings available in VC3D, more detailed documentation is available in the [segmentation tutorial](https://scrollprize.org/segmentation) on the scrollprize website.
@@ -394,6 +450,10 @@ _Keybinds:_
 > - `T` : toggle correction annotation mode (click adds a correction point, right-click removes one)
 
 **Seeding** 
+
+Ctrl+right-click in a volume viewer and choose **Create Segment (GrowPatch)**
+to select default GrowPatch, projection, or streamline seed growth. See
+[seed growth modes and parameters](docs/grow_patch_sheet_seeds.md).
 
 _Widget for creating initial segmentations which can be used for traces or later growth actions_
 

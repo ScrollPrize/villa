@@ -127,6 +127,7 @@ public:
 
 signals:
     void fiberDetailsRequested(uint64_t fiberId);
+    void fiberSelectionChanged(uint64_t fiberId);
     void fiberOpenRequested(uint64_t fiberId);
     void deleteFibersRequested(std::vector<uint64_t> fiberIds);
     void manualHvTagChanged(uint64_t fiberId, QString tag);
@@ -136,6 +137,7 @@ signals:
     void addFibersToPointCollectionsRequested(std::vector<uint64_t> fiberIds);
     void addFibersToSpiralFitRequested(std::vector<uint64_t> fiberIds);
     void renameFiberFileRequested(uint64_t fiberId);
+    void generateFibersRequested();
     void importFibersRequested();
     void exportFibersRequested();
     void metricsCalculationRequested(std::vector<uint64_t> orderedFiberIds);

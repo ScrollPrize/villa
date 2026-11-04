@@ -8,6 +8,7 @@
 #include <QFormLayout>
 #include <QGroupBox>
 #include <QHBoxLayout>
+#include <QLabel>
 #include <QPushButton>
 #include <QSettings>
 #include <QSignalBlocker>
@@ -24,9 +25,11 @@ SegmentationManualAddPanel::SegmentationManualAddPanel(const QString& settingsGr
     auto* outer = new QVBoxLayout(this);
     outer->setContentsMargins(0, 0, 0, 0);
 
-    auto* group = new QGroupBox(tr("Manual Add"), this);
+    auto* group = new QGroupBox(tr("Manual Fill"), this);
+    _group = group;
     auto* layout = new QVBoxLayout(group);
     auto* form = new QFormLayout();
+    _form = form;
 
     _spinMaxPreviewSpan = new QSpinBox(group);
     _spinMaxPreviewSpan->setRange(4, 4096);
@@ -96,6 +99,78 @@ SegmentationManualAddPanel::SegmentationManualAddPanel(const QString& settingsGr
     _chkAllowBoundarySmoothing->setChecked(false);
     layout->addWidget(_chkAllowBoundarySmoothing);
 
+    _growControls = new QWidget(group);
+    auto* growLayout = new QVBoxLayout(_growControls);
+    growLayout->setContentsMargins(0, 0, 0, 0);
+    layout->addWidget(_growControls);
+
+    _chkFollowSheet = new QCheckBox(tr("Extensions follow the sheet (CT)"), group);
+    _chkFollowSheet->setChecked(true);
+    _chkFollowSheet->setToolTip(tr("Walk each new extension along the papyrus using the CT structure tensor "
+                                   "(vc_reader sheet normals) instead of continuing it straight. "
+                                   "Your Shift+clicks still correct it."));
+    growLayout->addWidget(_chkFollowSheet);
+    auto* walkForm = new QFormLayout();
+    _spinGrowWorkers = new QSpinBox(group);
+    _spinGrowWorkers->setObjectName(QStringLiteral("manualGrowWorkers"));
+    _spinGrowWorkers->setRange(1, 256);
+    _spinGrowWorkers->setValue(8);
+    _spinGrowWorkers->setToolTip(tr("Maximum parallel growth workers, limited by available hardware threads "
+                                    "and growth lines. Changes apply to the next extension."));
+    walkForm->addRow(tr("Workers"), _spinGrowWorkers);
+    _spinNormalStep = new QDoubleSpinBox(group);
+    _spinNormalStep->setRange(0, 10000);
+    _spinNormalStep->setDecimals(2);
+    _spinNormalStep->setSingleStep(0.25);
+    _spinNormalStep->setSpecialValueText(tr("One step per vertex"));
+    _spinNormalStep->setSuffix(tr(" voxels"));
+    _spinNormalStep->setToolTip(tr("Maximum internal step length; mesh vertex spacing stays unchanged. "
+                                   "Smaller steps take longer. Changes apply to the next extension."));
+    walkForm->addRow(tr("Normal substep"), _spinNormalStep);
+    _comboWalkMode = new QComboBox(group);
+    _comboWalkMode->addItem(tr("Projection"));
+    _comboWalkMode->addItem(tr("Streamline"));
+    _comboWalkMode->setToolTip(tr("Streamline transports the tangent along the normal field. "
+                                  "Changes apply to the next extension."));
+    walkForm->addRow(tr("Sheet walk"), _comboWalkMode);
+    _comboIntegrator = new QComboBox(group);
+    _comboIntegrator->addItem(tr("Midpoint (RK2)"));
+    _comboIntegrator->addItem(tr("Heun (RK2)"));
+    _comboIntegrator->addItem(tr("RK4"));
+    _comboIntegrator->setEnabled(false);
+    walkForm->addRow(tr("Streamline method"), _comboIntegrator);
+    connect(_comboWalkMode, &QComboBox::currentIndexChanged, this, [this](int mode) {
+        _comboIntegrator->setEnabled(mode == 1);
+    });
+    growLayout->addLayout(walkForm);
+
+    auto* extendRow = new QHBoxLayout();
+    extendRow->addWidget(new QLabel(tr("Extend edge"), group));
+    _spinExtendCells = new QSpinBox(group);
+    _spinExtendCells->setRange(1, 4096);
+    _spinExtendCells->setValue(16);
+    _spinExtendCells->setSuffix(tr(" vertices"));
+    _spinExtendCells->setToolTip(tr("How far an edge extension reaches past the last valid vertex of each line."));
+    extendRow->addWidget(_spinExtendCells);
+    auto makeExtendButton = [&](const QString& label, const QString& tip) {
+        auto* button = new QPushButton(label, group);
+        button->setToolTip(tip);
+        extendRow->addWidget(button);
+        return button;
+    };
+    const QString extendTip = tr("Continue the surface past its %1 edge along each line's own direction. "
+                                 "Shift+click the sheet in a slice view to bend the preview onto it, "
+                                 "Shift+right-click to remove a click, then Apply or Cancel. "
+                                 "Pressing it again applies the pending strip and extends on from the new edge. "
+                                 "Keys 1 to 4 do the same in Manual Grow, and Shift+drag along an edge "
+                                 "in the segment view extends only that stretch.");
+    _btnExtendUp = makeExtendButton(tr("Up"), extendTip.arg(tr("top")));
+    _btnExtendDown = makeExtendButton(tr("Down"), extendTip.arg(tr("bottom")));
+    _btnExtendLeft = makeExtendButton(tr("Left"), extendTip.arg(tr("left")));
+    _btnExtendRight = makeExtendButton(tr("Right"), extendTip.arg(tr("right")));
+    extendRow->addStretch(1);
+    growLayout->addLayout(extendRow);
+
     auto* buttons = new QHBoxLayout();
     _btnClearPending = new QPushButton(tr("Clear Pending"), group);
     _btnRecompute = new QPushButton(tr("Recompute"), group);
@@ -124,10 +199,50 @@ SegmentationManualAddPanel::SegmentationManualAddPanel(const QString& settingsGr
     connect(_comboInterpolationMode, QOverload<int>::of(&QComboBox::currentIndexChanged), this, persist);
     connect(_chkIncludeTouchedValidBorder, &QCheckBox::toggled, this, persist);
     connect(_chkAllowBoundarySmoothing, &QCheckBox::toggled, this, persist);
+    connect(_chkFollowSheet, &QCheckBox::toggled, this, persist);
+    connect(_spinNormalStep, &QDoubleSpinBox::valueChanged, this, persist);
+    connect(_comboWalkMode, &QComboBox::currentIndexChanged, this, persist);
+    connect(_comboIntegrator, &QComboBox::currentIndexChanged, this, persist);
     connect(_btnClearPending, &QPushButton::clicked, this, &SegmentationManualAddPanel::clearPendingRequested);
     connect(_btnRecompute, &QPushButton::clicked, this, &SegmentationManualAddPanel::recomputeRequested);
     connect(_btnApplyExit, &QPushButton::clicked, this, &SegmentationManualAddPanel::applyExitRequested);
     connect(_btnCancel, &QPushButton::clicked, this, &SegmentationManualAddPanel::cancelRequested);
+    connect(_spinExtendCells, QOverload<int>::of(&QSpinBox::valueChanged), this, [this]() { persistFromUi(); });
+    // Worker count affects the next job; it must not recompute pending geometry.
+    connect(_spinGrowWorkers, QOverload<int>::of(&QSpinBox::valueChanged), this, [this]() { persistFromUi(); });
+    const std::pair<QPushButton*, ManualAddTool::ExtendSide> extendButtons[] = {
+        {_btnExtendUp, ManualAddTool::ExtendSide::Up},
+        {_btnExtendDown, ManualAddTool::ExtendSide::Down},
+        {_btnExtendLeft, ManualAddTool::ExtendSide::Left},
+        {_btnExtendRight, ManualAddTool::ExtendSide::Right},
+    };
+    for (const auto& [button, side] : extendButtons) {
+        connect(button, &QPushButton::clicked, this, [this, side = side]() {
+            emit extendRequested(static_cast<int>(side), _spinExtendCells->value());
+        });
+    }
+}
+
+void SegmentationManualAddPanel::setGrowMode(bool grow)
+{
+    _group->setTitle(grow ? tr("Manual Grow") : tr("Manual Fill"));
+    _growControls->setVisible(grow);
+    for (QWidget* field : {static_cast<QWidget*>(_spinMaxPreviewSpan),
+                           static_cast<QWidget*>(_spinPreviewThrottle),
+                           static_cast<QWidget*>(_comboLinePreviewMode),
+                           static_cast<QWidget*>(_comboInterpolationMode)}) {
+        _form->setRowVisible(field, !grow);
+    }
+}
+
+int SegmentationManualAddPanel::growWorkers() const
+{
+    return _spinGrowWorkers->value();
+}
+
+int SegmentationManualAddPanel::extendCells() const
+{
+    return _spinExtendCells->value();
 }
 
 ManualAddTool::Config SegmentationManualAddPanel::config() const
@@ -145,6 +260,10 @@ ManualAddTool::Config SegmentationManualAddPanel::config() const
     cfg.interpolationMode = static_cast<ManualAddTool::InterpolationMode>(_comboInterpolationMode->currentData().toInt());
     cfg.includeTouchedValidBorder = _chkIncludeTouchedValidBorder->isChecked();
     cfg.allowBoundarySmoothing = _chkAllowBoundarySmoothing->isChecked();
+    cfg.followSheet = _chkFollowSheet->isChecked();
+    cfg.sheetWalk.maxStep = _spinNormalStep->value();
+    cfg.sheetWalk.mode = static_cast<ManualAddTool::SheetWalkMode>(_comboWalkMode->currentIndex());
+    cfg.sheetWalk.integrator = static_cast<ManualAddTool::SheetIntegrator>(_comboIntegrator->currentIndex());
     return cfg;
 }
 
@@ -198,6 +317,8 @@ void SegmentationManualAddPanel::restoreSettings(QSettings& settings)
     setSpin(_spinRegularization, settings.value(QStringLiteral("manual_add_regularization"), 0.0001).toDouble());
     setSpin(_spinSampleCap, settings.value(QStringLiteral("manual_add_sample_cap"), 512).toInt());
     setSpin(_spinPreviewThrottle, settings.value(QStringLiteral("manual_add_preview_throttle_ms"), 50).toInt());
+    setSpin(_spinGrowWorkers, settings.value(QStringLiteral("manual_grow_workers"), 8).toInt());
+    setSpin(_spinExtendCells, settings.value(QStringLiteral("manual_add_extend_cells"), 16).toInt());
     setSpin(_spinTintOpacity, settings.value(QStringLiteral("manual_add_tint_opacity_percent"), 45).toInt());
     setSpin(_spinPlaneConstraintRadius, settings.value(QStringLiteral("manual_add_plane_constraint_radius"), 30.0).toDouble());
     setSpin(_spinPlaneConstraintReplacementRadius, settings.value(QStringLiteral("manual_add_plane_constraint_replacement_radius"), 16.0).toDouble());
@@ -223,6 +344,17 @@ void SegmentationManualAddPanel::restoreSettings(QSettings& settings)
         const QSignalBlocker blocker(_chkAllowBoundarySmoothing);
         _chkAllowBoundarySmoothing->setChecked(settings.value(QStringLiteral("manual_add_allow_boundary_smoothing"), false).toBool());
     }
+    {
+        const QSignalBlocker blocker(_chkFollowSheet);
+        _chkFollowSheet->setChecked(settings.value(QStringLiteral("manual_add_follow_sheet"), true).toBool());
+    }
+    setSpin(_spinNormalStep, settings.value(QStringLiteral("manual_add_normal_step"), 0.0).toDouble());
+    {
+        const QSignalBlocker modeBlocker(_comboWalkMode), methodBlocker(_comboIntegrator);
+        _comboWalkMode->setCurrentIndex(std::clamp(settings.value(QStringLiteral("manual_add_walk_mode"), 0).toInt(), 0, 1));
+        _comboIntegrator->setCurrentIndex(std::clamp(settings.value(QStringLiteral("manual_add_integrator"), 0).toInt(), 0, 2));
+        _comboIntegrator->setEnabled(_comboWalkMode->currentIndex() == 1);
+    }
     _restoringSettings = false;
 }
 
@@ -240,6 +372,12 @@ void SegmentationManualAddPanel::syncUiState(bool editingEnabled, bool manualAdd
     }
     if (_btnClearPending) {
         _btnClearPending->setEnabled(editingEnabled && manualAddActive);
+    }
+    // Extending enters Manual Add on its own, so it only needs editing.
+    for (auto* button : {_btnExtendUp, _btnExtendDown, _btnExtendLeft, _btnExtendRight}) {
+        if (button) {
+            button->setEnabled(editingEnabled);
+        }
     }
 }
 
@@ -261,6 +399,8 @@ void SegmentationManualAddPanel::persistFromUi()
     writeSetting(QStringLiteral("manual_add_regularization"), _spinRegularization->value());
     writeSetting(QStringLiteral("manual_add_sample_cap"), _spinSampleCap->value());
     writeSetting(QStringLiteral("manual_add_preview_throttle_ms"), _spinPreviewThrottle->value());
+    writeSetting(QStringLiteral("manual_grow_workers"), _spinGrowWorkers->value());
+    writeSetting(QStringLiteral("manual_add_extend_cells"), _spinExtendCells->value());
     writeSetting(QStringLiteral("manual_add_tint_opacity_percent"), _spinTintOpacity->value());
     writeSetting(QStringLiteral("manual_add_plane_constraint_radius"), _spinPlaneConstraintRadius->value());
     writeSetting(QStringLiteral("manual_add_plane_constraint_replacement_radius"), _spinPlaneConstraintReplacementRadius->value());
@@ -268,4 +408,8 @@ void SegmentationManualAddPanel::persistFromUi()
     writeSetting(QStringLiteral("manual_add_interpolation_mode"), _comboInterpolationMode->currentData().toInt());
     writeSetting(QStringLiteral("manual_add_include_touched_valid_border"), _chkIncludeTouchedValidBorder->isChecked());
     writeSetting(QStringLiteral("manual_add_allow_boundary_smoothing"), _chkAllowBoundarySmoothing->isChecked());
+    writeSetting(QStringLiteral("manual_add_follow_sheet"), _chkFollowSheet->isChecked());
+    writeSetting(QStringLiteral("manual_add_normal_step"), _spinNormalStep->value());
+    writeSetting(QStringLiteral("manual_add_walk_mode"), _comboWalkMode->currentIndex());
+    writeSetting(QStringLiteral("manual_add_integrator"), _comboIntegrator->currentIndex());
 }

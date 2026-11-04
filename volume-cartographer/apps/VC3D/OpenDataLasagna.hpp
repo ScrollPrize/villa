@@ -73,6 +73,18 @@ struct ResolvedOpenDataLasagna {
     bool manifestBacked = false;
 };
 
+// Immutable resolver inputs for background rendering; no live project access.
+struct LasagnaResolutionSnapshot {
+    std::filesystem::path projectPath;
+    std::vector<vc::project::Entry> entries;
+    std::string manualLocation;
+    std::shared_ptr<const vcr::catalog::OpenDataManifest> catalog;
+    std::optional<vcr::catalog::OpenDataVolumeView> view;
+    std::optional<std::array<int, 3>> workingShape;
+};
+[[nodiscard]] LasagnaResolutionSnapshot snapshotLasagnaForVolume(const VolumePkg&, const std::string& volumeId);
+[[nodiscard]] std::optional<ResolvedOpenDataLasagna> resolveLasagnaSnapshot(const LasagnaResolutionSnapshot&);
+
 [[nodiscard]] std::optional<ResolvedOpenDataLasagna> resolveLasagnaForVolume(
     const VolumePkg& pkg,
     const std::string& loadedVolumeId);

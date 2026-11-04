@@ -10,6 +10,8 @@
 #include <charconv>
 #include <cstdlib>
 #include <exception>
+#include <algorithm>
+#include <list>
 
 namespace vc::objects::detail {
 namespace {
@@ -26,6 +28,7 @@ struct Connection {
     vc::sftp::Url destination;
     std::unique_ptr<Session> session;
     uint64_t generation = 0;
+    uint64_t writes = 0;  // invalidates read-ahead on every handle, including rollback writes
     std::string hubPath;
     bool failed = false;
     bool active = false;
@@ -123,14 +126,59 @@ struct State {
     uint64_t generation = 0;
     int lock = SQLITE_LOCK_NONE;
     bool deleteOnClose = false;
+    bool mainDatabase = false;
+    // SQLite asks for individual pages. Read nearby pages together so the
+    // SFTP client's pipelining can amortize latency. Several blocks retain
+    // index pages while SQLite follows a blob's overflow pages. Bounded to
+    // 512 KiB per handle; never reused across a new process-lock session.
+    static constexpr size_t kReadBlock = 64 * 1024, kReadBlocks = 8;
+    struct Block { uint64_t offset; std::vector<std::byte> bytes; };
+    std::list<Block> blocks;
+    uint64_t writes = 0;
     // A handle from an earlier connection is invalid on the current one.
     Session::Handle& open(Session& session)
     {
         if (generation != connection->generation) {
+            blocks.clear();
             handle = session.open(path, flags);
             generation = connection->generation;
         }
         return handle;
+    }
+
+    size_t read(Session& session, uint64_t offset, std::span<std::byte> out)
+    {
+        auto& remote = open(session); // also validates the handle on cache hits
+        if (writes != connection->writes) {
+            blocks.clear();
+            writes = connection->writes;
+        }
+        // Header/change-counter probes must stay cheap on idle polls. Journals
+        // are short-lived and written frequently; leave their I/O unbuffered.
+        if (!mainDatabase || out.size() < 512) return session.read(remote, offset, out);
+        size_t copied = 0;
+        while (copied < out.size()) {
+            const auto position = offset + copied;
+            const auto base = position - position % kReadBlock;
+            auto block = std::find_if(blocks.begin(), blocks.end(),
+                [&](const auto& b) { return b.offset == base; });
+            if (block == blocks.end()) {
+                // Publish only successful reads, including a short final block.
+                std::vector<std::byte> bytes(kReadBlock);
+                bytes.resize(session.read(remote, base, bytes));
+                if (blocks.size() == kReadBlocks) blocks.pop_back();
+                blocks.push_front({base, std::move(bytes)});
+            } else {
+                blocks.splice(blocks.begin(), blocks, block);
+            }
+            const auto& bytes = blocks.front().bytes;
+            const auto within = size_t(position - base);
+            if (within >= bytes.size()) break;
+            const auto count = std::min(out.size() - copied, bytes.size() - within);
+            std::memcpy(out.data() + copied, bytes.data() + within, count);
+            copied += count;
+        }
+        return copied;
     }
 };
 struct File {
@@ -168,7 +216,7 @@ int fileRead(sqlite3_file* file, void* buffer, int amount, sqlite3_int64 offset)
     auto& s = state(file);
     try {
         const auto got = withSession(*s.connection, [&](Session& session) {
-            return session.read(s.open(session), uint64_t(offset), std::span(static_cast<std::byte*>(buffer), size_t(amount)));
+            return s.read(session, uint64_t(offset), std::span(static_cast<std::byte*>(buffer), size_t(amount)));
         });
         if (got < size_t(amount)) {
             std::memset(static_cast<char*>(buffer) + got, 0, size_t(amount) - got);
@@ -186,6 +234,7 @@ int fileWrite(sqlite3_file* file, const void* buffer, int amount, sqlite3_int64 
     auto& s = state(file);
     try {
         withSession(*s.connection, [&](Session& session) {
+            ++s.connection->writes; // invalidate even if the write fails partway
             session.write(s.open(session), uint64_t(offset), std::span(static_cast<const std::byte*>(buffer), size_t(amount)));
         });
         return SQLITE_OK;
@@ -199,7 +248,10 @@ int fileTruncate(sqlite3_file* file, sqlite3_int64 size)
 {
     auto& s = state(file);
     try {
-        withSession(*s.connection, [&](Session& session) { session.truncate(s.open(session), uint64_t(size)); });
+        withSession(*s.connection, [&](Session& session) {
+            ++s.connection->writes;
+            session.truncate(s.open(session), uint64_t(size));
+        });
         return SQLITE_OK;
     } catch (const std::exception& error) {
         lastError = error.what();
@@ -300,6 +352,7 @@ int vfsOpen(sqlite3_vfs*, const char* name, sqlite3_file* file, int flags, int* 
         s->connection = connection(url);
         s->path = url.path;
         s->deleteOnClose = flags & SQLITE_OPEN_DELETEONCLOSE;
+        s->mainDatabase = flags & SQLITE_OPEN_MAIN_DB;
         s->flags = vc::sftp::Read | (flags & SQLITE_OPEN_READWRITE ? vc::sftp::Write : 0);
         auto create = s->flags | (flags & SQLITE_OPEN_CREATE ? vc::sftp::Create : 0) |
                       (flags & SQLITE_OPEN_EXCLUSIVE ? vc::sftp::Exclusive : 0);
