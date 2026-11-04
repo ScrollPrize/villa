@@ -310,6 +310,9 @@ jobs:
         env:
           AGENTS_ALLOW_INSTALL: '1'
         run: bash volume-cartographer/scripts/install_build_deps.sh minimal-build
+      # The smoke builds the vc_reader Python module from source.
+      - name: Install Python headers
+        run: apt-get install -y --no-install-recommends python3-dev
       - uses: mozilla-actions/sccache-action@v0.0.10
         with:
           version: v0.15.0

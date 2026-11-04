@@ -122,7 +122,7 @@ void Store::writeFile(const std::string& name, const fs::path& file) const
     constexpr std::uint64_t kPartBytes = 64ULL << 20;
     std::ifstream in(file, std::ios::binary);
     if (!in) throw std::runtime_error("cannot read " + file.string());
-    std::vector<char> buffer(std::size_t(std::min<std::uint64_t>(std::max(kPartBytes, bytes / 9000 + 1), std::max<std::uint64_t>(bytes, 1))));
+    std::vector<char> buffer(std::size_t(std::min<std::uint64_t>(std::max<std::uint64_t>(kPartBytes, bytes / 9000 + 1), std::max<std::uint64_t>(bytes, 1))));
     if (bytes <= kPartBytes) {
         in.read(buffer.data(), std::streamsize(bytes));
         impl_->signedRequest([&] { impl_->http->put(impl_->url(name), buffer.data(), std::size_t(bytes)); });
