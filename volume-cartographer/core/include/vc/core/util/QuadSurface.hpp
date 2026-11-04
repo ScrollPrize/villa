@@ -2,6 +2,7 @@
 
 namespace vc::objects { class TransformedGeometryView; }
 
+#include <array>
 #include <atomic>
 #include <filesystem>
 #include <functional>
@@ -21,6 +22,7 @@ namespace vc::objects { class TransformedGeometryView; }
 #include "vc_object_store/geometry/Geometry.hpp"
 #include "vc_object_store/objects/SurfaceCreate.hpp"
 #include "Rect3D.hpp"
+#include <vc_reader/grid.hpp>
 
 // Surface loading and channel flags
 #define SURF_LOAD_IGNORE_MASK 1
@@ -31,11 +33,7 @@ namespace vc::objects { class TransformedGeometryView; }
 
 // Forward declarations
 class QuadSurface;
-class SurfacePatchIndex;
-
-// Interpolation used by QuadSurface::gen() when resampling the point grid.
-// See QuadSurface::setGenInterpolation() for what each mode does.
-enum class GenInterpolation { Linear, Smooth };
+class SurfaceQuerySet;
 
 // Reference to a valid point in the grid (for iteration)
 template<typename PointType>
@@ -277,29 +275,6 @@ private:
 class QuadSurface : public Surface
 {
 public:
-    struct SurfaceSample {
-        enum class Status {
-            Valid,
-            NonFinite,
-            InvalidScale,
-            MissingPoints,
-            OutsideGrid,
-            InvalidQuad,
-        };
-
-        Status status = Status::MissingPoints;
-        cv::Vec2d grid{
-            std::numeric_limits<double>::quiet_NaN(),
-            std::numeric_limits<double>::quiet_NaN()};
-        cv::Vec3f volume{
-            std::numeric_limits<float>::quiet_NaN(),
-            std::numeric_limits<float>::quiet_NaN(),
-            std::numeric_limits<float>::quiet_NaN()};
-
-        [[nodiscard]] bool valid() const { return status == Status::Valid; }
-        explicit operator bool() const { return valid(); }
-    };
-
     QuadSurface() = default;
     // points will be cloned in constructor
     QuadSurface(const cv::Mat_<cv::Vec3f> &points, const cv::Vec2f &scale);
@@ -308,7 +283,7 @@ public:
     // Load from path with meta.json - lazy loading (only loads meta, loads points on first access)
     explicit QuadSurface(const std::filesystem::path &path_);
     // Load from path with provided meta json - lazy loading
-    QuadSurface(const std::filesystem::path &path_, const utils::Json &json);
+    QuadSurface(const std::filesystem::path &path_, const nlohmann::json &json);
     ~QuadSurface() override;
 
     // Ensure points are loaded (for lazy loading constructors)
@@ -320,10 +295,8 @@ public:
     cv::Vec3f coord(const cv::Vec3f &ptr, const cv::Vec3f &offset = {0,0,0}) const override;
     cv::Vec3f normal(const cv::Vec3f &ptr, const cv::Vec3f &offset = {0,0,0}) override;
     // Get normal directly from grid coordinates (avoids expensive pointTo lookup)
-    cv::Vec3f gridNormal(int row, int col) const;
-    void gen(cv::Mat_<cv::Vec3f> *coords, cv::Mat_<cv::Vec3f> *normals, cv::Size size, const cv::Vec3f &ptr, float scale, const cv::Vec3f &offset) const override;
     float pointTo(cv::Vec3f &ptr, const cv::Vec3f &tgt, float th, int max_iters = 1000,
-                  class SurfacePatchIndex* surfaceIndex = nullptr) override;
+                  class SurfaceQuerySet* surfaceIndex = nullptr) override;
     cv::Size size();
     // Raw grid dimensions without forcing a lazy surface to load its XYZ data.
     [[nodiscard]] cv::Size gridSize() const;
@@ -343,41 +316,14 @@ public:
     // invalidation recomputes _center, so use it only on in-memory derived
     // surfaces, never on disk-backed ones.
     void shiftSurfaceOrigin(const cv::Vec2d& delta);
-    [[nodiscard]] SurfaceSample sampleAtSurface(const cv::Vec2d& surface) const;
-
-    // How gen() resamples the point grid into the output raster.
-    //
-    // Linear  — bilinear positions, nearest-neighbour normals resampled from
-    //           the per-vertex normal cache. The source grid is typically much
-    //           coarser than the render (scale 0.05 => one cell spans ~20x20
-    //           output pixels), so the normal is piecewise-constant over those
-    //           blocks and any surface offset along it steps at cell edges.
-    // Smooth  — bicubic Hermite positions with the normal differentiated from
-    //           the same basis. Centered derivatives reproduce Catmull-Rom in
-    //           the interior; shared one-sided derivatives keep the surface C1
-    //           next to holes, grid borders and component boundaries.
-    //
-    // Set this before any concurrent gen(); like setStrictQuadRenderValidity it
-    // is not synchronized against in-flight renders.
-    void setGenInterpolation(GenInterpolation m) { _genInterpolation = m; }
-    [[nodiscard]] GenInterpolation genInterpolation() const { return _genInterpolation; }
-
-    // The legacy renderer treats native vertex validity as pixel coverage.
-    // Spiral's drawn-input view opts into the stricter contract that a rendered
-    // location must be backed by a complete bilinear quad. The default remains
-    // false so existing QuadSurface consumers retain their current behavior.
-    //
-    // Under the legacy contract a pixel whose bilinear cell touches an invalid
-    // (-1, -1, -1) vertex is still covered, and gen() blends its coordinate
-    // toward that sentinel: along ragged mask edges those points streak across
-    // the volume toward the origin.
-    void setStrictQuadRenderValidity(bool enabled) { _strictQuadRenderValidity = enabled; }
-    [[nodiscard]] bool strictQuadRenderValidity() const { return _strictQuadRenderValidity; }
-    // Process-wide initial value of strictQuadRenderValidity() for surfaces
-    // constructed afterwards. Applications set it once at startup, before
-    // loading surfaces (VC3D enables it); libraries and tools keep false.
-    static void setStrictQuadRenderValidityDefault(bool enabled);
-    [[nodiscard]] static bool strictQuadRenderValidityDefault();
+    // The vertex grid as vcr::grid sees it: the options of a vcr::grid::Surface over
+    // rawPointsPtr() (its pieces; linear patches), and the raster of `size` pixels whose
+    // top-left pixel sits at surface coordinate (u0, v0), `scale` pixels per unit.
+    [[nodiscard]] vcr::grid::SurfaceOptions gridOptions() const;
+    [[nodiscard]] vcr::grid::Raster gridRaster(double u0, double v0, double scale, cv::Size size) const;
+    // vcr::grid::Vertices over `points` (rawPointsPtr() by default), with `valid`
+    // filled in: VC marks an invalid vertex (-1, -1, -1); a non-finite vertex is invalid too.
+    [[nodiscard]] vcr::grid::Vertices gridVertices(std::vector<std::uint8_t>& valid, const cv::Mat_<cv::Vec3f>* points = nullptr) const;
 
     // Convert ptr-space coordinates to absolute grid row/col.
     // ptr-space stores (col - center.x*scale.x, row - center.y*scale.y, 0).
@@ -413,7 +359,7 @@ public:
     // Drop derived caches (validity mask, etc.) without unloading _points.
     // Called when this surface is no longer the active editing target so
     // RAM is reserved for the segment the user is currently working on.
-    // In-flight gen()/validMask() calls retain their derived-cache snapshots.
+    // In-flight validMask() calls keep the mask they returned.
     // Concurrent channel access, point unloading and geometry edits still
     // require external synchronization.
     void unloadCaches();
@@ -421,18 +367,28 @@ public:
     // The surface's tags: its store record's, or a tifxyz meta.json's "tags" keys.
     std::vector<std::string> tags;
 
+    // Column ranges [first, last) of disconnected components; empty: one component.
+    const std::vector<std::pair<int, int>>& components() const { return _components; }
     // Override disconnected component column ranges for an in-memory view.
     void setComponents(std::vector<std::pair<int, int>> components)
     {
         _components = std::move(components);
-        std::lock_guard<std::mutex> cacheLock(_cacheMutex);
-        _smoothDuCache.release();
-        _smoothDvCache.release();
-        _smoothDuvCache.release();
+        dropPointSurface();
+    }
+    // How positions between vertices are interpolated (gridOptions(); vcr::grid's
+    // default unless set). Surfaces built from polylines set linear to pass through them.
+    vcr::grid::Interpolation interpolation() const { return _interpolation; }
+    void setInterpolation(vcr::grid::Interpolation interpolation)
+    {
+        _interpolation = interpolation;
+        dropPointSurface();
     }
 
-    virtual cv::Mat_<cv::Vec3f> rawPoints() { ensureLoaded(); return *_points; }
-    virtual cv::Mat_<cv::Vec3f> *rawPointsPtr() { ensureLoaded(); return _points.get(); }
+    // The non-const accessors hand out the points to be edited, so they drop the
+    // vcr::grid::Surface that coord() and normal() use; it is rebuilt on the next call.
+    // Fetch the pointer again for each edit rather than keeping it across calls to them.
+    virtual cv::Mat_<cv::Vec3f> rawPoints() { ensureLoaded(); dropPointSurface(); return *_points; }
+    virtual cv::Mat_<cv::Vec3f> *rawPointsPtr() { ensureLoaded(); dropPointSurface(); return _points.get(); }
     virtual const cv::Mat_<cv::Vec3f> *rawPointsPtr() const { const_cast<QuadSurface*>(this)->ensureLoaded(); return _points.get(); }
 
     // Grid iteration helpers
@@ -472,32 +428,28 @@ public:
     cv::Mat_<uint8_t> validMask() const;
 
     // Write validity mask to path/mask.tif. If img is provided, writes multi-layer TIFF.
-    void writeValidMask(const cv::Mat& img = cv::Mat());
+    void writeValidMask();
 
     mutable cv::Mat_<uint8_t> _validMaskCache;
-    // Set when _validMaskCache contains no 0s — gen() can skip the
-    // validity warp + per-pixel invalidation pass entirely. Atomic
-    // because gen() can be called from concurrent OMP threads.
-    mutable std::atomic<bool> _validMaskAllValid{false};
-    mutable cv::Mat_<cv::Vec3f> _normalCache;
-    // Per-vertex derivatives for the Smooth Hermite surface. Adjacent patches
-    // share these values, which makes both position and first derivatives agree
-    // at their common edge. Built lazily and only in Smooth mode.
-    mutable cv::Mat_<cv::Vec3f> _smoothDuCache;
-    mutable cv::Mat_<cv::Vec3f> _smoothDvCache;
-    mutable cv::Mat_<cv::Vec3f> _smoothDuvCache;
-    // Guards derived-cache construction, invalidation and snapshot acquisition.
-    // Readers retain immutable, reference-counted Mat snapshots after unlocking,
-    // so unloadCaches() can evict the cache without freeing in-flight data.
+    // Immutable geometry retained by sampling consumers; built on first use.
+    mutable std::shared_ptr<const vcr::grid::Surface> _pointSurface;
+    mutable std::atomic<std::size_t> _windowQueries{0};  // answered by windows since the drop
+    [[nodiscard]] std::shared_ptr<const vcr::grid::Surface> pointSurface() const;
+    // A snapshot of the vertices in `vertices` (clipped to the grid; its grid position
+    // (0, 0) is the clipped rectangle's top-left), at a cost proportional to their number.
+    // Positions and normals match the whole grid's where a patch's vertices lie at least
+    // kGridWindowPad vertices inside the rectangle or the grid's edge.
+    static constexpr int kGridWindowPad = 3;
+    [[nodiscard]] std::shared_ptr<const vcr::grid::Surface> gridWindow(const cv::Rect& vertices,
+                                                                       const std::array<float, 3>& spacing = {1, 1, 1}) const;
+    // pointsAt at one grid position (column, row), which an edit does not make expensive:
+    // while the whole-grid surface is dropped, a window around the position answers. Once
+    // those queries have cost about one rebuild of the whole grid, it is rebuilt.
+    void pointAt(float column, float row, float* xyz, float* normal, float* columnTangent = nullptr,
+                 float* rowTangent = nullptr, const std::array<float, 3>& spacing = {1, 1, 1}) const;
+    void dropPointSurface() const;
+    // Guards the validity mask's lazy construction and invalidation.
     mutable std::mutex _cacheMutex;
-    // NOTE: gen()'s per-call coords/normals/valid scratch buffers used to live
-    // here as members and were reused across render ticks to avoid per-frame
-    // reallocation (at 1920×1080 each coords/normals Mat is ~170 MiB of
-    // cv::Vec3f). But gen() is called concurrently per-tile from the renderer's
-    // OMP loop, and sharing those buffers (plus returning views into them)
-    // raced -> SIGSEGV. They are now thread_local inside gen(): each thread
-    // keeps its own buffers, so the per-frame reuse is preserved per-thread
-    // while staying race-free.
     cv::Vec2f _scale;
 
     void setChannel(const std::string& name, const cv::Mat& channel);
@@ -539,24 +491,13 @@ protected:
     // Column ranges of disconnected surface components (meta "components").
     // Each pair is [col_start, col_end). Empty = single contiguous surface.
     std::vector<std::pair<int,int>> _components;
-    bool _strictQuadRenderValidity = strictQuadRenderValidityDefault();
-    GenInterpolation _genInterpolation = GenInterpolation::Linear;
+    vcr::grid::Interpolation _interpolation = vcr::grid::SurfaceOptions{}.interpolation;
     float dpi_ = 0.f;
 
 private:
-    cv::Mat_<uint8_t> validMaskSnapshot(bool* allValid) const;
-    // Lazily build and acquire ref-counted snapshots of the Smooth derivative
-    // caches. All three outputs have the same shape as _points.
-    void smoothDerivativeSnapshots(cv::Mat_<cv::Vec3f>& du,
-                                   cv::Mat_<cv::Vec3f>& dv,
-                                   cv::Mat_<cv::Vec3f>& duv) const;
 
-    // Write surface data to directory without modifying state. skipChannel can be used to exclude a channel.
-    void writeDataToDirectory(const std::filesystem::path& dir, const std::string& skipChannel = "");
     void saveWithUuid(const std::filesystem::path& path, const std::string& uuid, bool force_overwrite);
     std::string objectUuidOrNew() const;
-    // Write a single ancillary channel as dir/<name>.tif.
-    void writeChannelFile(const std::filesystem::path& dir, const std::string& name, const cv::Mat& mat);
     // Flag for lazy loading - true if points need to be loaded from path
     bool _needsLoad = false;
     // Mutex to protect lazy loading from concurrent access
@@ -567,7 +508,6 @@ private:
     // at the same dir. Recursive so a public entry point (saveOverwrite) can hold
     // it across nested saveSnapshot()/save() calls on the same thread without
     // self-deadlock.
-    static std::recursive_mutex& dirWriteMutex(const std::filesystem::path& dir);
 };
 
 // --- vc_object_store surfaces ------------------------------------------------
@@ -579,9 +519,9 @@ private:
 
 // Column ranges [c0, c1) of disconnected components recorded as meta
 // "components" (Lasagna multi-component fits); empty for one component.
-std::vector<std::pair<int, int>> surface_components(const utils::Json& meta);
+std::vector<std::pair<int, int>> surface_components(const nlohmann::json& meta);
 // The tags a tifxyz meta.json records: the keys of its "tags" object.
-std::vector<std::string> tifxyz_tags(const utils::Json& meta);
+std::vector<std::string> tifxyz_tags(const nlohmann::json& meta);
 
 // A surface object's geometry revision (default: its current one). Other
 // channels are registered empty; set a loader (store_channel_loader) to read them.
@@ -620,7 +560,7 @@ std::string write_quad_channels_to_store(vc::objects::ObjectStore&, vc::objects:
 
 // Serialize a bbox as [[minX,minY,minZ],[maxX,maxY,maxZ]], the layout
 // QuadSurface::save() writes for its own bbox key.
-utils::Json bbox_to_json(const Rect3D& bbox);
+nlohmann::json bbox_to_json(const Rect3D& bbox);
 
 std::unique_ptr<QuadSurface> load_quad_from_tifxyz(const std::filesystem::path &path, int flags = 0);
 std::unique_ptr<QuadSurface> load_quad_from_tifxyz_region(
@@ -634,7 +574,6 @@ float pointTo(cv::Vec2f &loc, const cv::Mat_<cv::Vec3f> &points, const cv::Vec3f
 float lookupDepthIndex(QuadSurface* surface, int row, int col);
 
 // Control CUDA usage in GrowPatch (space_tracing_quad_phys). Default is true.
-void set_space_tracing_use_cuda(bool enable);
 
 // Surface containment tests
 bool contains(QuadSurface& a, const cv::Vec3f& loc, int max_iters = 1000);

@@ -1071,50 +1071,16 @@ class NativeTraceFieldCache:
         return origin.contiguous()
 
     def _sample_block_volume(self, origin_zyx: np.ndarray) -> tuple[torch.Tensor, torch.Tensor]:
-        sampler = getattr(self.record, "sampler", None)
-        if sampler is None:
-            raise ValueError("native 3D Trace2CP record must provide a coordinate sampler")
-        if hasattr(sampler, "blocking") and not bool(getattr(sampler, "blocking")):
-            raise ValueError("native 3D Trace2CP requires blocking coordinate sampling")
-        if not hasattr(sampler, "sample_block_zyx"):
-            raise ValueError(
-                "native 3D Trace2CP requires a sampler with sample_block_zyx support"
-            )
+        reader = self.record.reader
         origin = np.asarray(origin_zyx, dtype=np.int64)
+        shape = np.asarray(self.patch_shape_zyx, dtype=np.int64)
         with self._measure("src_read_block"):
-            result = sampler.sample_block_zyx(origin, self.patch_shape_zyx)
+            sampled_np = reader.read_region(origin, self.patch_shape_zyx, dtype=np.float32)
         with self._measure("src_validate"):
-            stats = dict(getattr(result, "stats", {}) or {})
-            error_chunks = int(stats.get("error_chunks", 0) or 0)
-            if error_chunks > 0:
-                raise ValueError(
-                    "native 3D Trace2CP block sampling encountered chunk errors; "
-                    f"stats={stats}"
-                )
-            if "requested_level_only" in stats and not bool(stats.get("requested_level_only")):
-                raise ValueError(
-                    "native 3D Trace2CP block sampling did not use requested-level-only mode; "
-                    f"stats={stats}"
-                )
-            fallback_levels = int(stats.get("fallback_levels", 0) or 0)
-            if fallback_levels != 0:
-                raise ValueError(
-                    "native 3D Trace2CP block sampling used scale fallback; "
-                    f"stats={stats}"
-                )
-            sampled_np = np.asarray(result.image, dtype=np.float32)
-            sampled_valid_np = np.asarray(result.valid_mask, dtype=bool)
-            expected_shape = self.patch_shape_zyx
-            if sampled_np.shape != expected_shape:
-                raise ValueError(
-                    "native 3D Trace2CP sampler returned incompatible image shape: "
-                    f"shape={sampled_np.shape} expected={expected_shape}"
-                )
-            if sampled_valid_np.shape != expected_shape:
-                raise ValueError(
-                    "native 3D Trace2CP sampler returned incompatible valid-mask shape: "
-                    f"shape={sampled_valid_np.shape} expected={expected_shape}"
-                )
+            lo = np.clip(-origin, 0, shape)
+            hi = np.clip(np.asarray(reader.shape, dtype=np.int64) - origin, lo, shape)
+            sampled_valid_np = np.zeros(self.patch_shape_zyx, dtype=bool)
+            sampled_valid_np[tuple(slice(int(a), int(b)) for a, b in zip(lo, hi))] = True
         with self._measure("src_tensor"):
             sampled = torch.as_tensor(sampled_np, dtype=torch.float32, device=self.device)
             sampled_valid = torch.as_tensor(sampled_valid_np, dtype=torch.bool, device=self.device)
@@ -2107,7 +2073,6 @@ def _make_sparse_corner_normal_sampler(
         path=str(manifest_path),
         device=torch.device(device),
         skip_channels=skip_channels,
-        sparse_prefetch_backend="tensorstore",
     )
     if not getattr(data, "sparse_caches", None):
         raise ValueError(
@@ -5613,23 +5578,14 @@ def _control_point_reference_arc_voxels(record: Any) -> np.ndarray:
     return np.asarray(arcs, dtype=np.float64)
 
 
-def _vc3d_voxel_size_m(record: Any) -> float | None:
-    sampler = getattr(record, "sampler", None)
-    volume = getattr(sampler, "volume", None)
-    metadata = getattr(volume, "metadata", None)
-    if metadata is None:
+def _record_voxel_size_m(record: Any) -> float | None:
+    voxel_size_um = getattr(record, "voxel_size_um", None)
+    if voxel_size_um is None:
         return None
-    try:
-        voxelsize_um = metadata["voxelsize"]
-    except (KeyError, TypeError, AttributeError):
+    voxel_size_um = float(voxel_size_um)
+    if not math.isfinite(voxel_size_um) or voxel_size_um <= 0.0:
         return None
-    try:
-        voxelsize_um = float(voxelsize_um)
-    except (TypeError, ValueError):
-        return None
-    if not math.isfinite(voxelsize_um) or voxelsize_um <= 0.0:
-        return None
-    return voxelsize_um * 1.0e-6
+    return voxel_size_um * 1.0e-6
 
 
 def _reference_line_length_meters_between_cps(
@@ -5638,7 +5594,7 @@ def _reference_line_length_meters_between_cps(
     start_cp_index: int,
     end_cp_index: int,
 ) -> float | None:
-    voxel_size_m = _vc3d_voxel_size_m(record)
+    voxel_size_m = _record_voxel_size_m(record)
     if voxel_size_m is None:
         return None
     line_xyz = np.asarray(record.fiber.line_points_xyz, dtype=np.float64)
@@ -6065,7 +6021,7 @@ def _image_to_u8(
     if not bool(mask.any()):
         return out
     norm_t = _normalize_image(
-        torch.as_tensor(arr, dtype=torch.float32),
+        torch.as_tensor(np.where(mask, arr, 0.0), dtype=torch.float32),
         torch.as_tensor(mask, dtype=torch.bool),
         normalization,
     )
@@ -7955,9 +7911,7 @@ def run_native_trace2cp(
         f"normal_sampler={effective_normal_sampler} "
         f"normal_principal_axis_method={normal_principal_axis_method} "
         f"debug_compare_normal_sampler={debug_compare_normal_sampler or 'off'} "
-        f"debug_normal_angle_threshold_degrees={float(debug_normal_angle_threshold_degrees):.6g} "
-        f"sampler={type(getattr(record, 'sampler', None)).__name__} "
-        f"blocking={getattr(getattr(record, 'sampler', None), 'blocking', 'n/a')}",
+        f"debug_normal_angle_threshold_degrees={float(debug_normal_angle_threshold_degrees):.6g}",
         flush=True,
     )
     if whole_mode:

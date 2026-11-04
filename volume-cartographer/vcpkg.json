@@ -33,6 +33,9 @@
     "blosc",
     "zstd",
     "lz4",
-    "cgal"
+    "libpng",
+    "libjpeg-turbo",
+    "openssl",
+    "pkgconf"
   ]
 }

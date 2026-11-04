@@ -1,3 +1,28 @@
+# Load the full reader before the object store, whose standalone build only needs
+# the catalog when relationship detection is disabled. Leave CUDA discovery and
+# an explicit VC_READER_ENABLE_CUDA choice to vc_reader.
+function(vc_find_reader)
+    if(TARGET vc_reader::reader)
+        return()
+    endif()
+    find_package(vc_reader CONFIG QUIET)
+    if(TARGET vc_reader::reader)
+        return()
+    endif()
+    if(TARGET vc_reader::catalog)
+        message(FATAL_ERROR "The installed vc_reader lacks the reader API; rebuild it with VC_READER_BUILD_READER=ON")
+    endif()
+    set(VC_READER_SOURCE "${CMAKE_SOURCE_DIR}/../vc_reader" CACHE PATH
+        "vc_reader source checkout")
+    if(NOT EXISTS "${VC_READER_SOURCE}/CMakeLists.txt")
+        message(FATAL_ERROR "Install vc_reader or set VC_READER_SOURCE to its checkout")
+    endif()
+    set(VC_READER_BUILD_PYTHON OFF)
+    set(VC_READER_BUILD_READER ON)
+    add_subdirectory("${VC_READER_SOURCE}" "${CMAKE_BINARY_DIR}/reader")
+endfunction()
+vc_find_reader()
+
 # Prefer an installed package, otherwise build the sibling store and native formats.
 # No installation, FetchContent, or dependency download is performed here.
 function(vc_find_object_store)

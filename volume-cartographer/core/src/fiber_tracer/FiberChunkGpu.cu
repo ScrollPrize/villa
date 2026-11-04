@@ -1,3 +1,4 @@
+#include <vc_reader/sampling.hpp>
 // Optional resident CUDA chunk backend and standalone fixture benchmark.
 // One block owns each seed half; fields, search state and paths stay on device.
 #include <cuda_runtime.h>
@@ -86,11 +87,11 @@ VC_TRACE_HD Sample sample(Fields f,const Params& p,V q,V hint,SampleJacobian* ja
     for(int k=0;k<8;++k) {
         size_t i=(size_t((k&4)?upper[2]:b[2])*p.shape[1]+((k&2)?upper[1]:b[1]))*p.shape[0]+((k&1)?upper[0]:b[0]);
         auto bytes=f.bytes+6*i;
-        float w=((k&4)?frac[2]:1-frac[2])*((k&2)?frac[1]:1-frac[1])*((k&1)?frac[0]:1-frac[0]);
+        float w=vcr::sampling::cornerWeightZYX(k, frac);
         presence=std::fma(w,float(bytes[0]),presence);
         validNormal=std::fma(w,float(bytes[3]),validNormal);
         ws[k]=f.widths[i];all&=bytes[0]>0;
-        double dw=((k&1)?df[0]:1-df[0])*((k&2)?df[1]:1-df[1])*((k&4)?df[2]:1-df[2]);
+        double dw=vcr::sampling::cornerWeight(k, df);
         if(bytes[0]&&dw>0){weighted+=dw*ws[k];denom+=dw;}
         V derivative;
         if constexpr(Differentiate) {
@@ -119,9 +120,7 @@ VC_TRACE_HD Sample sample(Fields f,const Params& p,V q,V hint,SampleJacobian* ja
             s.normal=vc::core::portable::principalFloatTensorAxis(tensor[1][0],tensor[1][1],tensor[1][2],tensor[1][3],tensor[1][4],tensor[1][5],V{});
     }
     if(all) {
-        double a=ws[0]*(1-df[0])+ws[1]*df[0],b0=ws[2]*(1-df[0])+ws[3]*df[0];
-        double c=ws[4]*(1-df[0])+ws[5]*df[0],d=ws[6]*(1-df[0])+ws[7]*df[0];
-        s.width=float((a*(1-df[1])+b0*df[1])*(1-df[2])+(c*(1-df[1])+d*df[1])*df[2]);
+        s.width=float(vcr::sampling::trilinear(ws, df));
     } else s.width=denom>0?float(weighted/denom):0;
     if constexpr(Differentiate) {
         jac->presence=presence>0&&presence<255?dp:V{};

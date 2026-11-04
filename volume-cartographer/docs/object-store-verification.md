@@ -81,16 +81,7 @@ ninja -C build VC3D vc_fiber_constraints test_fiber_constraint_geometry \
   test_object_store_session test_object_store_fiber_json test_object_store_fiber_session
 ctest --test-dir build --output-on-failure \
   -R '^(object_store_(session|fiber_json|fiber_session|vc3d_controller)|test_fiber_constraint_geometry)$'
-VC_FIBER_CONSTRAINT_FIXTURE=/path/to/native-fiber-collection \
-  ctest --test-dir build -V -R '^test_fiber_constraint_geometry$'
 ```
-
-The optional collection check imports into a disposable store and trims an
-unlinked fiber through the two-point threshold. It verifies that extraction
-selects the current geometry despite the unchanged ingest summary. Input files
-are only read. The standard tests also check narrow import pins, conflicts on
-linked endpoints, journal kinds after deletion, old-schema rejection, and cache
-preservation on unrelated, foreign-store, and hub-status events.
 
 ## Limits
 

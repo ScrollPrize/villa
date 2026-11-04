@@ -6,6 +6,7 @@
 #include "vc/lasagna/Manifest.hpp"
 
 #include <vc_object_store/objects/VolumeUmbilicus.hpp>
+#include <vc_reader/zarr.hpp>
 
 #include <QCryptographicHash>
 #include <QJsonArray>
@@ -98,7 +99,7 @@ namespace {
 // resolved against the project.
 std::string datasetLocation(const VolumePkg& pkg, const std::string& selected)
 {
-    return vc::project::isLocationRemote(selected)
+    return vcr::zarr::isRemote(selected)
         ? selected
         : vc::project::resolveLocalPath(selected, pkg.directory()).string();
 }
@@ -180,10 +181,8 @@ std::vector<vc::lasagna::LasagnaChannelGroup> lasagnaGroupsToCache(
 
 std::string remoteManifestUrl(const vc::lasagna::LasagnaDatasetManifest& manifest)
 {
-    if (manifest.manifestIsRemote || manifest.remoteBaseUrl.empty()) return {};
-    auto base = manifest.remoteBaseUrl;
-    while (!base.empty() && base.back() == '/') base.pop_back();
-    return base + "/" + manifest.manifestPath.filename().string();
+    if (manifest.manifestIsRemote || manifest.remoteSourceBaseLocation.empty()) return {};
+    return vcr::joinLocation(manifest.remoteSourceBaseLocation, manifest.manifestPath.filename().string());
 }
 
 std::optional<ProjectDataset> projectFiberInference(const VolumePkg& pkg,

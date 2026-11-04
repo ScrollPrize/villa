@@ -3,14 +3,12 @@
 
 #include "vc/core/util/Geometry.hpp"
 #include "vc/core/util/InpaintSurface.hpp"
-#include "vc/core/util/Slicing.hpp"
 #include "vc/core/util/Surface.hpp"
 #include "vc/core/util/QuadSurface.hpp"
 #include "vc/core/util/StoreToolOptions.hpp"
 #include "vc/core/util/SurfaceMeshing.hpp"
 
-#include "vc/core/types/VcDataset.hpp"
-#include "utils/Json.hpp"
+#include <nlohmann/json.hpp>
 
 #include <filesystem>
 #include <fstream>
@@ -21,7 +19,7 @@
 #include <limits>
 
 
-using Json = utils::Json;
+using Json = nlohmann::json;
 
 // ---- small helpers ---------------------------------------------------------
 static inline bool finite3(const cv::Vec3f& v) {
@@ -73,10 +71,7 @@ static void write_vertex(std::ofstream& out,
     if (ok) n = unit_or_default(n);
 
     if (!ok || (n[0] == 0.f && n[1] == 0.f && n[2] == 0.f)) {
-        // fall back to grid_normal (expects x,y), then to finite-diff
-        cv::Vec3f ng = grid_normal(points, cv::Vec3f(float(loc[1]), float(loc[0]), 0.f));
-        if (finite3(ng)) n = unit_or_default(ng);
-        else             n = fd_fallback_normal(points, loc[0], loc[1]);
+        n = fd_fallback_normal(points, loc[0], loc[1]);
     }
     out << "vn " << n[0] << " " << n[1] << " " << n[2] << '\n';
 }

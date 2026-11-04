@@ -300,10 +300,10 @@ void Scene3DCanvas::drawCTSlices()
             const auto& bounds = v->ctVolume->bounds;
             double thickness = std::numeric_limits<double>::infinity();
             for (int k=0; k<3; ++k) thickness=std::min(thickness,std::max(1.,bounds.upper[k]-bounds.lower[k]));
-            p.alphaOpacity = float(v->volumeDensity / thickness);
-            p.alphaMin = std::clamp(v->windowLow/255.f,0.f,1.f);
-            p.alphaMax = std::clamp(v->windowHigh/255.f,0.f,1.f);
-            p.isoCutoff = 1;
+            p.options.alphaOpacity = float(v->volumeDensity / thickness);
+            p.options.alphaMin = std::clamp(v->windowLow/255.f,0.f,1.f);
+            p.options.alphaMax = std::clamp(v->windowHigh/255.f,0.f,1.f);
+            p.options.alphaCutoff = 1;
         }
         v->volumeUploading = v->volumeRenderer
                 ->draw(v->ctVolume ? v->ctVolume->images : (volumetric ? v->slices : slices::Images{}), transfer, v->matrix(width(), height()), v->origin, defaultFramebufferObject(), int(width() * ratio), int(height() * ratio), v->windowLow, v->windowHigh, v->ctVolume ? (v->surfaceVisible ? v->surfaceOpacity : 0.f) : v->sliceOpacity, v->interactive, raySamples);

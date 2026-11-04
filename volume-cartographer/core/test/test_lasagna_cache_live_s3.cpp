@@ -1,12 +1,13 @@
-// Live S3: a remote Lasagna array cached whole through its read-through
-// store reads as a local directory Zarr. Set VC_TEST_REQUIRE_NETWORK=1 to
+// Live S3: a remote Lasagna array cached whole, byte for byte, reads as a
+// local directory Zarr. Set VC_TEST_REQUIRE_NETWORK=1 to
 // make failures hard.
 
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
 #include <doctest/doctest.h>
 
-#include "vc/core/render/PersistentZarrCacheBudget.hpp"
 #include "vc/lasagna/Dataset.hpp"
+
+#include <vc_reader/zarr.hpp>
 
 #include <nlohmann/json.hpp>
 
@@ -52,8 +53,7 @@ vc::lasagna::LasagnaChannelGroup remoteGroup(const fs::path& cacheRoot)
     vc::lasagna::LasagnaChannelGroup group;
     group.name = "nx";
     group.relativeZarrKey = kArrayKey;
-    group.remoteZarrBaseUrl = kArtifactUrl;
-    group.remoteZarrKey = kArrayKey;
+    group.sourceLocation = std::string(kArtifactUrl) + "/" + kArrayKey;
     group.remoteCacheRoot = cacheRoot;
     group.discoverAwsCredentials = false;
     return group;
@@ -61,33 +61,26 @@ vc::lasagna::LasagnaChannelGroup remoteGroup(const fs::path& cacheRoot)
 
 } // namespace
 
-// The array is downloaded once: the cache budget below has no room at all,
-// so anything it accounted would be evicted.
-TEST_CASE("a remote Lasagna array is cached whole as a directory Zarr, outside the cache budget")
+TEST_CASE("a remote Lasagna array is cached whole as a directory Zarr")
 {
-    using Budget = vc::render::PersistentZarrCacheBudget;
     TempDir cache;
-    auto budget = Budget::configure(cache.path, {0, 0});
-    budget->waitForIdle();
-    const auto reset = [] { Budget::resetRegistryForTesting(); };
     const auto group = remoteGroup(cache.path);
 
     const auto directory = vc::lasagna::lasagnaChannelArrayCacheDirectory(group);
     REQUIRE(directory);
-    CHECK(*directory == (cache.path / kArrayKey).lexically_normal());
+    // Beside, not inside, vc_reader's cache of the same array.
+    CHECK(*directory == vcr::zarr::decodedCachePath(cache.path / "lasagna_arrays", group.sourceLocation));
 
     std::size_t reported = 0;
     const auto report = [&](const vc::lasagna::LasagnaArrayCacheProgress& progress) { reported = progress.total; };
     try {
         REQUIRE(vc::lasagna::cacheLasagnaChannelArray(group, report));
     } catch (const std::exception& error) {
-        reset();
         if (requireNetwork()) FAIL(error.what());
         MESSAGE("skipping, S3 unreachable: " << error.what());
         return;
     }
     CHECK(reported > 0);
-    budget->waitForIdle();
 
     // The metadata sits beside the chunks, and the marker lists every object.
     REQUIRE(fs::is_regular_file(*directory / ".zarray"));
@@ -99,7 +92,7 @@ TEST_CASE("a remote Lasagna array is cached whole as a directory Zarr, outside t
     for (const auto& object : objects)
         REQUIRE(fs::file_size(*directory / object.at(0).get<std::string>()) == object.at(1).get<std::uint64_t>());
 
-    // A complete cache, untouched by the budget, fetches nothing; an evicted
+    // A complete cache fetches nothing; an evicted
     // chunk is fetched again.
     reported = 0;
     REQUIRE(vc::lasagna::cacheLasagnaChannelArray(group, report));
@@ -117,12 +110,12 @@ TEST_CASE("a remote Lasagna array is cached whole as a directory Zarr, outside t
     REQUIRE(vc::lasagna::cacheLasagnaChannelArray(group, report));
     CHECK(reported == 1);
     CHECK(fs::is_regular_file(*directory / chunk));
-    reset();
 }
 
 TEST_CASE("caching stops when cancelled")
 {
     TempDir cache;
-    CHECK_FALSE(vc::lasagna::cacheLasagnaChannelArray(remoteGroup(cache.path), {}, []() { return true; }));
-    CHECK_FALSE(fs::exists(cache.path / kArrayKey / ".vc-cached-array.json"));
+    const auto group = remoteGroup(cache.path);
+    CHECK_FALSE(vc::lasagna::cacheLasagnaChannelArray(group, {}, []() { return true; }));
+    CHECK_FALSE(fs::exists(*vc::lasagna::lasagnaChannelArrayCacheDirectory(group) / ".vc-cached-array.json"));
 }

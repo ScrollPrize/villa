@@ -1,6 +1,9 @@
 #include "SpiralWorkspace.hpp"
 #include "SpiralPreviewWindings.hpp"
 
+#include <vc_reader/tifxyz.hpp>
+#include <vc_reader/zarr.hpp>
+
 #include "AxisAlignedSliceController.hpp"
 #include "CState.hpp"
 #include "ConsoleOutputWidget.hpp"
@@ -15,6 +18,7 @@
 #include "SpiralMinimap.hpp"
 #include "SurfaceOverlayColors.hpp"
 #include "VCSettings.hpp"
+#include "vc/core/util/RemoteCacheSettings.hpp"
 #include "ViewerManager.hpp"
 #include "elements/GrowOnlyLabel.hpp"
 #include "elements/ViewerSplitGrid.hpp"
@@ -35,7 +39,7 @@
 #include "vc/lasagna/Dataset.hpp"
 #include "vc/lasagna/Manifest.hpp"
 
-#include <opencv2/imgcodecs.hpp>
+#include "vc/core/util/ImageMat.hpp"
 
 #include <QDialog>
 #include <QDockWidget>
@@ -182,10 +186,8 @@ SpiralWorkspace::SpiralWorkspace(CState* mainState, QWidget* parent)
 {
     setObjectName(QStringLiteral("spiralWorkspaceWindow"));
     setDockOptions(QMainWindow::AnimatedDocks | QMainWindow::AllowNestedDocks | QMainWindow::AllowTabbedDocks);
-    // Regular volume chunks use the process service. Derived surface tiles
-    // remain local to each ViewerManager.
-    _state = new CState(
-        this, _mainState && _mainState->debugDownloadQueueEnabled(), _mainState);
+    // Volumes are opened through the main state's OpenedVolumes.
+    _state = new CState(this, _mainState);
     connect(_state,&CState::objectStoreChanged,this,[this](const vc::objects::StoreSessionEvent& event) {
         if(event.kind==vc::objects::StoreSessionEvent::Kind::Attached || event.kind == vc::objects::StoreSessionEvent::Kind::Detached) {
             cancelLineAnnotationDraft();
@@ -210,11 +212,6 @@ SpiralWorkspace::SpiralWorkspace(CState* mainState, QWidget* parent)
         syncSurfaceDrafts();
     });
     _viewerManager = std::make_unique<ViewerManager>(_state, _state->pointCollection(), this);
-    // The flattened preview is this workspace's primary pane: stop publishing
-    // raw-path chunk demand for frames the SurfaceCache fully serves, so its
-    // tile fills are not starved behind interactive fetches the frame never
-    // reads.
-    _viewerManager->setPreferSurfaceTileFills(true);
     _slices = std::make_unique<AxisAlignedSliceController>(_state, this);
     _slices->setViewerManager(_viewerManager.get());
     // Spiral always uses axis-aligned slices; don't write the user's global
@@ -883,8 +880,10 @@ void SpiralWorkspace::appendLineAnnotationDraftPoint(
         modifiers != Qt::NoModifier || !_flattenedViewer ||
         _lineAnnotationDraft->surface.get() != _flattenedViewer->currentSurface()) return;
     const cv::Vec2f surface = _flattenedViewer->sceneToSurfaceCoords(scenePoint);
-    if (!std::isfinite(surface[0]) || !std::isfinite(surface[1]) ||
-        !_lineAnnotationDraft->surface->sampleAtSurface({surface[0], surface[1]})) {
+    const cv::Vec2f grid(_lineAnnotationDraft->surface->surfaceToGrid({surface[0], surface[1]}));
+    cv::Vec3f position;
+    _lineAnnotationDraft->surface->pointSurface()->pointsAt(grid.val, 1, position.val, nullptr);
+    if (!std::isfinite(cv::norm(position))) {
         statusBar()->showMessage(tr("Point must lie on valid Spiral surface data"), 5000);
         return;
     }
@@ -916,7 +915,7 @@ SpiralWorkspace::resolveFiberBaseShape(QString* errorMessage) const
     for (const QString& candidate : candidates) {
         try {
             const std::string location = candidate.toStdString();
-            const std::string resolved = vc::project::isLocationRemote(location)
+            const std::string resolved = vcr::zarr::isRemote(location)
                 ? location
                 : vc::project::resolveLocalPath(
                       location, vpkg->path().parent_path()).string();
@@ -1008,15 +1007,17 @@ void SpiralWorkspace::finalizeLineAnnotationDraft()
     std::vector<cv::Vec3d> controls;
     controls.reserve(_lineAnnotationDraft->surfacePoints.size());
     for (const QPointF& point : _lineAnnotationDraft->surfacePoints) {
-        const auto sample = _lineAnnotationDraft->surface->sampleAtSurface({point.x(), point.y()});
-        if (!sample) {
+        const cv::Vec2f grid(_lineAnnotationDraft->surface->surfaceToGrid({point.x(), point.y()}));
+        cv::Vec3f position;
+        _lineAnnotationDraft->surface->pointSurface()->pointsAt(grid.val, 1, position.val, nullptr);
+        if (!std::isfinite(cv::norm(position))) {
             statusBar()->showMessage(tr(
                 "A saved control no longer samples valid preview geometry"), 10000);
             return;
         }
-        controls.emplace_back(sample.volume[0] * previewToFiberBase,
-                              sample.volume[1] * previewToFiberBase,
-                              sample.volume[2] * previewToFiberBase);
+        controls.emplace_back(position[0] * previewToFiberBase,
+                              position[1] * previewToFiberBase,
+                              position[2] * previewToFiberBase);
     }
     for (size_t i = 0; i < controls.size(); ++i) {
         for (size_t j = 0; j < i; ++j) {
@@ -1508,17 +1509,25 @@ void SpiralWorkspace::loadPreview(const QString& manifestPath, qint64 generation
             || windingMapName.startsWith(QStringLiteral("../")))
             return failure(QObject::tr("Invalid Spiral winding-ID map path"));
         const QString windingMapPath = QDir(artifactRoot).filePath(windingMapName);
-        auto windings = vc3d::spiral::windingIdsFromImage(
-            cv::imread(windingMapPath.toStdString(), cv::IMREAD_UNCHANGED), &windingError);
+        cv::Mat windingImage;
+        try {
+            windingImage = vc::core::util::imageMat(vcr::sources::readImagePage(windingMapPath.toStdString(), 0));
+        } catch (const std::exception&) {
+        }
+        auto windings = vc3d::spiral::windingIdsFromImage(windingImage, &windingError);
         if (!windings) return failure(windingError);
         cv::Mat_<int32_t> mappedWindings = std::move(*windings);
         if (!vc3d::spiral::windingMapMatchesBounds(mappedWindings, previewComponents, &windingError))
             return failure(windingError);
 
-        QFile metadata(QDir(surfacePath).filePath(QStringLiteral("meta.json")));
-        if (!metadata.open(QIODevice::ReadOnly))
+        QJsonObject meta;
+        try {
+            // The surface's metadata as vc_reader reads it; the compared fields are its extras.
+            const auto extra = vcr::tifxyz::readMetadata(surfacePath.toStdString()).extra.dump();
+            meta = QJsonDocument::fromJson(QByteArray::fromStdString(extra)).object();
+        } catch (const std::exception&) {
             return failure(QObject::tr("Spiral preview surface metadata is missing"));
-        const QJsonObject meta = QJsonDocument::fromJson(metadata.readAll()).object();
+        }
         if (meta.value(QStringLiteral("winding_id_map"))
                 != manifest.value(QStringLiteral("winding_id_map"))
             || meta.value(QStringLiteral("winding_bounds"))
@@ -1539,7 +1548,6 @@ void SpiralWorkspace::loadPreview(const QString& manifestPath, qint64 generation
             // compact display surface.
             auto surface = std::make_shared<QuadSurface>(surfacePath.toStdString());
             surface->id = surfaceId.toStdString();
-            surface->setStrictQuadRenderValidity(true);
             const cv::Size gridSize = surface->gridSize();
             const QJsonArray gridShape =
                 manifest.value(QStringLiteral("grid_shape")).toArray();
@@ -1647,7 +1655,6 @@ void SpiralWorkspace::openStoredFit(const QString& requested)
             PreviewLoadResult result;
             try {
                 auto fit = vc3d::spiral::readStoredFit(session, attachment, uuid);
-                fit.surface->setStrictQuadRenderValidity(true);
                 result.surface = fit.surface;
                 result.surfaceId = QString::fromStdString(fit.uuid);
                 result.components = std::move(fit.components);
@@ -2440,8 +2447,7 @@ void SpiralWorkspace::panFlattenedViewerToColumn(float column)
     const cv::Vec2f viewCenter = _flattenedViewer->sceneToSurfaceCoords(
         view->mapToScene(view->viewport()->rect().center()));
     const float surfaceX = column / scale[0] - center[0];
-    _flattenedViewer->centerOnSurfacePoint(cv::Vec2f(surfaceX, viewCenter[1]),
-                                           true);
+    _flattenedViewer->centerOnSurfacePoint(cv::Vec2f(surfaceX, viewCenter[1]));
 }
 
 void SpiralWorkspace::updateWindingTransitionOverlay()
@@ -2581,7 +2587,6 @@ void SpiralWorkspace::applyPreviewWindingRange(bool preserveFocus)
                 cv::Mat windingDepth;
                 windingRegion.convertTo(windingDepth, CV_32F);
                 loaded->setChannel("d", windingDepth);
-                loaded->setStrictQuadRenderValidity(true);
                 return std::shared_ptr<QuadSurface>(std::move(loaded));
             } catch (const std::exception&) {
                 return std::shared_ptr<QuadSurface>{};

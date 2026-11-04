@@ -158,7 +158,7 @@ private:
     void read(std::optional<std::vector<std::string>> uuids);
     void schedule();
     // The sources changed: drop the rows and pending reads, list again.
-    void restart();
+    void restart(bool keepRows = false);
 
     std::shared_ptr<vc::objects::ObjectStoreSession> session_;
     std::optional<vc::objects::AttachmentIdentity> attachment_;

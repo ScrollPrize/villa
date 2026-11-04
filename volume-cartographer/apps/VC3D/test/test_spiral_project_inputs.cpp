@@ -157,7 +157,7 @@ void describesTheFiberInferenceDataset()
     auto manifest = vc::lasagna::LasagnaDatasetManifest::parseText(kManifest);
     manifest.manifestPath = "/cache/f/f.lasagna.json";
     require(vc3d::spiral::remoteManifestUrl(manifest).empty(), "a local dataset has no remote manifest");
-    manifest.remoteBaseUrl = "https://data.example/f/";
+    manifest.remoteSourceBaseLocation = "https://data.example/f";
     fibers.remoteManifest = vc3d::spiral::remoteManifestUrl(manifest);
     require(fibers.remoteManifest == "https://data.example/f/f.lasagna.json",
             "the copy's manifest at its remote base: " + fibers.remoteManifest);
@@ -182,8 +182,7 @@ void givesALocalServiceTheCachedArrays(const fs::path& directory)
     const fs::path cacheRoot = directory / "remote_cache" / "s";
     for (auto& group : manifest.groups) {
         group.sourceLocation = "https://data.example/s/" + group.relativeZarrKey;
-        group.remoteZarrBaseUrl = "https://data.example/s";
-        group.remoteZarrKey = group.relativeZarrKey;
+        group.zarrPath.clear();
         group.remoteCacheRoot = cacheRoot;
     }
     const auto lasagna = vc3d::spiral::projectLasagna(manifest, "/project/s.lasagna.json", "run-4");
@@ -192,8 +191,10 @@ void givesALocalServiceTheCachedArrays(const fs::path& directory)
     require(lasagna.remoteGroups.size() == 3, "the remote groups are kept by input");
     const auto cached = vc3d::spiral::withCachedStores(lasagna);
     require(cached.error.empty(), "the cached stores are readable: " + cached.error);
-    require(cached.stores.at("normal_x") == (cacheRoot / "s_nx.ome.zarr").string()
-                && cached.stores.at("gradient_magnitude") == (cacheRoot / "s_gm.ome.zarr").string()
+    // Beside vc_reader's cache of the arrays, at their URL's place.
+    const fs::path copies = cacheRoot / "lasagna_arrays" / "https" / "data.example" / "s";
+    require(cached.stores.at("normal_x") == (copies / "s_nx.ome.zarr").string()
+                && cached.stores.at("gradient_magnitude") == (copies / "s_gm.ome.zarr").string()
                 && cached.group == "4",
             "each store is its cache directory's");
 

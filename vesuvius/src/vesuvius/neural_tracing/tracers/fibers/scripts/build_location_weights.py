@@ -27,7 +27,7 @@ def bend_profile(points, s, stride=STRIDE):
 
 def _compression_task(task):
     name, point = task
-    m = compression(volume(name), np.asarray(point))
+    m = compression(*volume(name), np.asarray(point))
     return m['sheetness'], m['sheet_modulation']
 
 

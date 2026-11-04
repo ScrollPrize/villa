@@ -87,7 +87,7 @@ Run each module as `python -m vesuvius.tifxyz_label_transfer.MODULE --help`.
 
 | Module | Purpose |
 | --- | --- |
-| `prepare_canvas_offset_evidence` | Prepare CT comparisons; remote reads require configured `rclone` access. |
+| `prepare_canvas_offset_evidence` | Prepare CT comparisons; remote reads go through vc_reader, credentials from the environment or `~/.aws`. |
 | `estimate_canvas_offset_evidence` | Estimate a canvas offset from the prepared comparisons. |
 | `estimate_canvas_offset` | Diagnose a single render pair. |
 | `self_render_tifxyz` | Check alignment against raw CT. |
@@ -99,14 +99,13 @@ These tools do not estimate volume registration transforms.
 
 ## Native acceleration and tests
 
-An optional C++17 rasterizer accelerates transfer:
+The rasterizer is part of `vc_reader`; no separate build is needed.
 
 ```bash
-uv run --no-sync python -m vesuvius.tifxyz_label_transfer.build_native
 uv run --no-sync pytest tests/tifxyz_label_transfer
 ```
 
-`--rasterizer auto` uses a compatible native build when available and
-otherwise falls back to Python. Use `native` to require it or `python`
-to select the reference implementation. Native differential tests skip
-when the library is unavailable.
+`--rasterizer auto` and `native` use the prepared vc_reader kernel.
+`python` composes vc_reader sampling operations in the application's orchestration
+path. Differential tests compare labels, validity, provenance and distances,
+allowing float32 rounding differences.

@@ -1,6 +1,7 @@
 #pragma once
 #include "fibers3d/Fiber3DSlices.hpp"
 
+class OpenedVolumes;
 class Volume;
 namespace vc3d::scene3d
 {
@@ -16,6 +17,6 @@ struct VolumeData {
 // coarsest is too large, resample it into <=maxEdge voxels per axis. CPU + GPU
 // texture storage and sampling scratch fit maxBytes. Callers clamp maxEdge to
 // their GPU's 3D texture limit; 256 keeps the default preview small and portable.
-std::shared_ptr<VolumeData> sampleVolume(Volume&, int requestedLevel, size_t maxBytes,
+std::shared_ptr<VolumeData> sampleVolume(OpenedVolumes&, const Volume&, int requestedLevel, size_t maxBytes,
                                        const std::atomic_bool& cancelled, int maxEdge = 256);
 }

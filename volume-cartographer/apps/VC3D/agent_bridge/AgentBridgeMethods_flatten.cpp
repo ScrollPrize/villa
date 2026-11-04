@@ -70,34 +70,4 @@ void AgentBridgeServer::registerFlattenHandlers()
         },
         [this](const QJsonValue& p) { return handleFlattenSlim(p); });
 
-    registerMethod(
-        {
-            .name = QStringLiteral("flatten.straighten"),
-            .params = {
-                Params::requiredString(QStringLiteral("segmentId")),
-                Params::optionalBoolean(QStringLiteral("unbend"), true),
-                numberAtLeast(
-                    QStringLiteral("unbendSmoothCols"),
-                    300.0,
-                    0.0),
-                integerAtLeast(QStringLiteral("overlapPasses"), 2, 0),
-                Params::optionalBoolean(
-                    QStringLiteral("orthogonalize"),
-                    true),
-                Params::optionalBoolean(QStringLiteral("trim"), true),
-                numberAtLeast(
-                    QStringLiteral("trimMaxEdge"),
-                    100.0,
-                    0.0),
-                Params::optionalString(QStringLiteral("outputName")),
-            },
-            .errors = {
-                -32602, -32000, -32001, -32004, -32005, -32006, -32007,
-                -32009,
-            },
-            .mcp = Mcp::snakeCase(
-                QStringLiteral("vc3d_flatten_straighten"),
-                {QStringLiteral("wait")}),
-        },
-        [this](const QJsonValue& p) { return handleFlattenStraighten(p); });
 }

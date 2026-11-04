@@ -1,4 +1,5 @@
 #include "Fiber3DSliceControls.hpp"
+#include "OpenedVolumes.hpp"
 #include "Fiber3DSlices.hpp"
 #include "scene3d/Scene3DCanvas.hpp"
 #include "CState.hpp"
@@ -418,7 +419,7 @@ struct Fiber3DSliceControls::Impl {
         for (int i = 0; i < 3; ++i)
             if (linked[i]) {
                 transfer[i] = linked[i]->compositeRenderSettings().params;
-                volumeMode = volumeMode || transfer[i].method == "volumetric";
+                volumeMode = volumeMode || transfer[i].volumetric;
             }
         {
             const QSignalBlocker blocker(volumetric);
@@ -452,6 +453,7 @@ struct Fiber3DSliceControls::Impl {
         cancelled = std::make_shared<std::atomic_bool>(false);
         const auto token = cancelled;
         const auto source = volume;
+        const auto opened = state->openedVolumes();
         const auto planes = requested;
         const auto ready = matching();
         const bool previewPass = ready.size() != planes.size();
@@ -465,7 +467,7 @@ struct Fiber3DSliceControls::Impl {
                     if (found != ready.end() && (previewPass || !(*found)->preview))
                         result.images.push_back(*found);
                     else
-                        result.images.push_back(slices::sample(plane, *source, token.get(), previewPass ? 256 : 1024));
+                        result.images.push_back(slices::sample(plane, *opened, *source, token.get(), previewPass ? 256 : 1024));
                 }
             } catch (const std::exception& e) {
                 result.error = QString::fromUtf8(e.what());

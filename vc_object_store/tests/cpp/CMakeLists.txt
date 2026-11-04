@@ -62,3 +62,9 @@ add_executable(test_object_store_hub_positions test_object_store_hub_positions.c
 target_link_libraries(test_object_store_hub_positions PRIVATE vc_objects nlohmann_json::nlohmann_json Threads::Threads)
 add_test(NAME object_store_hub_positions COMMAND test_object_store_hub_positions)
 set_tests_properties(object_store_hub_positions PROPERTIES TIMEOUT 60)
+
+if(TARGET vc_resident_geometry)
+    add_executable(test_resident_geometry test_resident_geometry.cpp)
+    target_link_libraries(test_resident_geometry PRIVATE vc_resident_geometry)
+    add_test(NAME object_store_resident_geometry COMMAND test_resident_geometry)
+endif()

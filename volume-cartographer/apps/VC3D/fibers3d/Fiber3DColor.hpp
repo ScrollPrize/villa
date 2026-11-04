@@ -1,7 +1,7 @@
 #pragma once
 
 #include "Fiber3DScene.hpp"
-#include "vc/core/render/Colormaps.hpp"
+#include "Colormaps.hpp"
 #include <opencv2/imgproc.hpp>
 #include <algorithm>
 #include <array>

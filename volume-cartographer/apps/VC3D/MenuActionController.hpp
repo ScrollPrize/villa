@@ -10,8 +10,8 @@
 #include <string>
 #include <vector>
 
-#include "OpenDataVolumePrefill.hpp"
-#include "OpenDataManifest.hpp"
+#include <vc_reader/cache.hpp>
+#include "OpenDataResourceSelection.hpp"
 #include "OpenDataSampleProject.hpp"
 
 #include <functional>
@@ -125,14 +125,6 @@ private slots:
     void exitApplication();
 
 signals:
-    // Emitted when the user picks Actions -> Merge Surfaces... CWindow
-    // wires this to SegmentationCommandHandler::onMergeSurfaces with an
-    // empty seed list so the dialog opens with an empty grid.
-    void mergeSurfacesFromMenuRequested();
-    // Emitted when the user picks Actions -> Patch Surface... CWindow
-    // wires this to SegmentationCommandHandler::onMergePatch with an
-    // empty seed list so the dialog opens with empty combo boxes.
-    void mergePatchFromMenuRequested();
     void growTrackPatchesFromMenuRequested();
     void openDataCatalogVisibilityChanged(bool visible);
 
@@ -218,13 +210,16 @@ private:
     QAction* _surfaceFromSelectionAct{nullptr};
     QAction* _selectionClearAct{nullptr};
     QAction* _rotateSurfaceAct{nullptr};
-    QAction* _mergeSurfacesAct{nullptr};
-    QAction* _mergePatchAct{nullptr};
     QAction* _growTrackPatchesAct{nullptr};
 
     QPointer<QDialog> _keybindsDialog;
     QPointer<vc3d::opendata::OpenDataCatalogWindow> _openDataCatalogDialog;
-    std::vector<QFutureWatcher<vc3d::opendata::OpenDataVolumePrefillResult>*> _openDataPrefillWatchers;
+    struct VolumePrefillResult : vcr::cache::PrefillResult {
+        std::string volumeId;
+        int level = 0;
+        int physicalLevel = 5;
+    };
+    std::vector<QFutureWatcher<VolumePrefillResult>*> _openDataPrefillWatchers;
     std::vector<std::shared_ptr<std::atomic<bool>>> _openDataPrefillCancelFlags;
     std::shared_ptr<std::atomic<bool>> _openDataPrefillCancelFlag;
     // True from launch until the finished slot runs; prevents overlapping opens.

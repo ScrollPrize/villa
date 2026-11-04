@@ -43,8 +43,8 @@ META_KEYS = ('strip_target', 'strip_mask', 'strip_patches', 'tube_full', 'patch_
 class EvalBuilder(StripBuilder):
     """StripBuilder plus the tube curves of both modes, every patch's own height field and the fiber reference."""
 
-    def __call__(self, items, vol):
-        batch = super().__call__(items, vol)
+    def __call__(self, items, ct, spec):
+        batch = super().__call__(items, ct, spec)
         n, nf, nv = len(items), len(self.f), len(self.v)
         height = (self.cfg.fine.width-1)*self.cfg.fine.spacing/2
         for mode in MODES:

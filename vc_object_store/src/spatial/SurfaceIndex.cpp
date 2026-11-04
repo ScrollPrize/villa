@@ -1,5 +1,5 @@
-#include "spatial/SurfaceIndex.hpp"
-#include "spatial/TriangleDistance.hpp"
+#include <vc_object_store/geometry/SurfaceIndex.hpp>
+#include <vc_object_store/geometry/TriangleDistance.hpp>
 #include "vc_object_store/geometry/Geometry.hpp"
 #include <limits>
 #include <map>
@@ -18,7 +18,7 @@ void SurfaceIndex::rebuild(const std::vector<SurfacePtr>& surfaces)
                 for (int r = row; r < std::min(row + 9, points.rows); ++r) {
                     for (int c = col; c < std::min(col + 9, points.cols); ++c) {
                         const auto point = points(r, c);
-                        if (!vc::geometry::validSurfacePoint(point)) continue;
+                        if (!surfaces[i]->valid(r,c)) continue;
                         for (int axis = 0; axis < 3; ++axis) {
                             box[axis] = std::min(box[axis], double(point[axis]));
                             box[axis + 3] = std::max(box[axis + 3], double(point[axis]));
@@ -36,7 +36,7 @@ void SurfaceIndex::rebuild(const std::vector<SurfacePtr>& surfaces)
 
 std::vector<SurfaceIndex::LookupResult> SurfaceIndex::locateAll(const PointQuery& query) const
 {
-    if (!(query.tolerance > 0) || !std::isfinite(query.tolerance)) return {};
+    if (!(query.tolerance >= 0) || !std::isfinite(query.tolerance)) return {};
     objects::detail::BoundsIndex::Box box;
     cv::Vec3f low, high;
     for (int axis = 0; axis < 3; ++axis) {
@@ -60,6 +60,8 @@ std::vector<SurfaceIndex::LookupResult> SurfaceIndex::locateAll(const PointQuery
     for (size_t index : candidates) {
         const auto& tile = tiles_[index];
         const auto& surface = surfaces_[tile.surface];
+        if (query.surfaces.only && query.surfaces.only!=surface.get()) continue;
+        if (query.surfaces.excludeRaw && query.surfaces.excludeRaw->contains(surface.get())) continue;
         if (query.surfaces.includeRaw && !query.surfaces.includeRaw->contains(surface.get())) continue;
         const auto& points = surface->rawPoints();
         for (int r = tile.row; r < std::min(tile.row + 8, points.rows - 1); ++r) {
@@ -73,7 +75,7 @@ std::vector<SurfaceIndex::LookupResult> SurfaceIndex::locateAll(const PointQuery
                                (a[axis] > high[axis] && b[axis] > high[axis] &&
                                 d[axis] > high[axis] && e[axis] > high[axis]);
                 }
-                if (outside || !vc::geometry::validSurfacePoint(a) || !vc::geometry::validSurfacePoint(b) || !vc::geometry::validSurfacePoint(d) || !vc::geometry::validSurfacePoint(e)) continue;
+                if (outside || !surface->valid(r,c) || !surface->valid(r,c+1) || !surface->valid(r+1,c) || !surface->valid(r+1,c+1)) continue;
                 for (int t = 0; t < 2; ++t) {
                     const auto hit = t ? objects::detail::closestPointOnTriangle(query.worldPoint, b, e, d)
                                        : objects::detail::closestPointOnTriangle(query.worldPoint, a, b, d);

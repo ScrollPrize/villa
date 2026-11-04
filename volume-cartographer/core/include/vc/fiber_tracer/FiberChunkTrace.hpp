@@ -38,9 +38,6 @@ struct FiberChunkTraceConfig {
     int gpuBatchMemoryMiB=2048; // workspace cap, excludes resident fields
     double onlineRefineEpsilonBase=.25, onlineRefineStepBase=1, onlineRefineCapBase=8;
     std::filesystem::path benchmarkExport; // explicit fixture export, empty disables
-    bool pinSamplingRegion=true;
-    bool channelHints=true; // generic cache hint; no change to construction identity
-    std::size_t workerCacheBytes=0; // 0: shared; otherwise experimental per-worker decoded LRU
     // Reject accidentally enormous dense seed grids before allocating them.
     size_t maxGridSamples=64ULL*1024*1024;
 };

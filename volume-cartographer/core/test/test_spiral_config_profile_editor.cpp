@@ -1,3 +1,4 @@
+#include <nlohmann/json.hpp>
 #include <QApplication>
 #include <QCheckBox>
 #include <QComboBox>
