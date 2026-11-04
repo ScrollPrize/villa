@@ -28,7 +28,7 @@ from pathlib import Path
 import time
 
 import numpy as np
-import tifffile
+from vc_reader import images
 import torch
 
 from vesuvius.neural_tracing.tracers.fibers.sheet_strip.infer import (
@@ -97,13 +97,12 @@ def main(argv=None):
     ap.add_argument('--limit', type=int, help='at most this many fibers of the shard (benchmarks)')
     ap.add_argument('--batch', type=int, default=32)
     ap.add_argument('--threads', type=int, default=2)
-    ap.add_argument('--crop-threads', type=int, default=1, help="threads sampling a batch's CT crops")
     ap.add_argument('--voxel-size-um', type=float, default=9.6, help='patch voxel size, for area_cm2 in meta.json')
     args = ap.parse_args(argv)
     torch.set_num_threads(args.threads)
     k, n = args.shard
     try:
-        predictor = StripPredictor(args.checkpoint, args.device, args.umbilicus, args.batch, args.crop_threads, args)
+        predictor = StripPredictor(args.checkpoint, args.device, args.umbilicus, args.batch, args)
     except ValueError as error:
         raise SystemExit(str(error))
     f, v, tpp = predictor.f, predictor.v, predictor.trace_per_patch
@@ -158,7 +157,7 @@ def main(argv=None):
                           length_mm=float(length)*args.base_voxel_um/1000., decisions=len(arcs),
                           nodes=nodes, path=str(out.relative_to(args.out)), checkpoint=checkpoint)
             if expected is not None:
-                tifffile.imwrite(out/'expected_error.tif', np.where(keep, expected, np.nan).astype(np.float32))
+                images.write_tiff(out/'expected_error.tif', np.where(keep, expected, np.nan).astype(np.float32))
                 record['expected_error_vox'] = float(np.nanmean(np.where(keep, expected, np.nan)))
             record['seconds'] = round(time.time()-tick, 2)
             log.write(json.dumps(record)+'\n')

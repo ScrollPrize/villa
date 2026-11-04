@@ -1,5 +1,6 @@
 #pragma once
 #include "../core.hpp"
+#include "../../sampling_math.hpp"
 
 namespace vcr::transforms::volume_detail {
 constexpr double pi = 3.14159265358979323846;
@@ -26,11 +27,7 @@ inline Shape spatial_sizes(const Shape& sizes,std::size_t dim,std::size_t fallba
     return sizes.empty() ? Shape(dim,fallback) : sizes;
 }
 template<class T,int D> VCR_HD T interpolate(const T* v,const GridND<D>& g,const double* q) {
-    std::size_t lo[D],hi[D];double f[D];
-    for(int a=0;a<D;++a) { double x=clamp(q[a],0,double(g.n[a]-1));lo[a]=std::size_t(floor(x));hi[a]=lo[a]+1<g.n[a]?lo[a]+1:lo[a];f[a]=x-lo[a]; }
-    T result=0;
-    for(int c=0;c<(1<<D);++c) { std::size_t j=0;double w=1;for(int a=0;a<D;++a){int b=(c>>a)&1;j+=(b?hi[a]:lo[a])*g.stride[a];w*=b?f[a]:1-f[a];} result+=T(w)*v[j]; }
-    return result;
+    return sampling::clamped<D,T,double>(v, g.n, q);
 }
 
 } // namespace vcr::transforms::volume_detail

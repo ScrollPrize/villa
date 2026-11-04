@@ -172,7 +172,7 @@ filtering are described below.
 ## Python
 
 The same implementation is available in `vc.fiber_trace`. Dataset handles are
-retained by `ChunkCache`; it copies both configurations at construction. Native
+retained by the chunk store; it copies both configurations at construction. Native
 construction, routing and replay release the GIL. Multiple Python threads may
 request chunks from the same cache, sharing in-flight builds. Returned NumPy
 arrays own their data and remain valid after the cache or result is destroyed.
@@ -555,7 +555,6 @@ must be chosen explicitly for the intended baseline, not inferred from a model):
   "scaledown_power": 0,
   "enable_width": true,
   "cache_bytes": 1073741824,
-  "loader": {"resource_scaled": true},
   "trace": {
     "parallel_threads": 1,
     "step_voxels": 16,
@@ -563,8 +562,6 @@ must be chosen explicitly for the intended baseline, not inferred from a model):
     "beam_lookahead_steps": 2
   },
   "chunks": {
-    "channel_hints": true,
-    "worker_cache_bytes": 0,
     "core_base": 512,
     "halo_base": 64,
     "grid_base": 4,
@@ -921,41 +918,13 @@ Reusable native profiling target: `bench_fiber_seed_grid CONFIG INPUTS OUTPUT
 independent per-point reference. This is a preparation microbenchmark, not a
 replacement for the manager-controlled end-to-end tracing benchmark.
 
-### Channel hints and cache scheduling
+### Reading channels
 
-`channel_hints=true` supplies the generic core read hint for the channels used
-by this construction. Reading presence schedules the other requested channels
-into their **ordinary decoded caches**, so subsequent ordinary reads reuse them.
-This is not a tracer-specific retention cache; see
-[generic channel-hint and partition APIs](chunk_channel_hints.md).
-
-The batch runner defaults to `loader.resource_scaled=true`: after manager
-admission it sizes local reads to `max(16, 2*granted cores)` and decoding to the
-granted core count. Metadata preflight exits before those execution pools exist.
-`resource_scaled=false` explicitly retains legacy host/benchmark pool settings.
-
-`loader.backend="queued"` selects the experimental generic batch admission
-backend; `"direct"` remains the default. `loader.queued_chunk_window=0` sizes the
-in-flight unique-key window from the granted read/decode capacities; a positive
-value overrides it. It coalesces concurrent ROI/hint requests and refills the
-pipeline on completion. Use shared `cache_bytes` (e.g. 10 GiB), with
-`chunks.worker_cache_bytes=0`; queued/local partitions cannot be combined.
-Window and decoded-cache budget do not cap caller-owned ROI/tensor memory.
-See [the queue API and limitations](chunk_channel_hints.md#optional-queued-batch-loader).
-
-`worker_cache_bytes=0` retains the large shared decoded cache. A positive value
-selects that many bytes per native preparation worker, using generic decoded
-partitions which still share the central I/O/decode pools. On the locked
-512-core Paris4 workload, 64 MiB per worker was faster than the equal-aggregate
-shared cache; this remains an opt-in experiment, not a global viewer default.
-Hints and partitions do not alter construction identity or numerical settings.
-Separate companion caches may load even if presence later rejects all seeds;
-packed storage already loads those companion bytes together.
-
-Measurements, exact output parity, commands and limitations:
-`/ephemeral/hendrik/fiber3d_train2/evaluations/channel_loader_20261025_v1/REPORT.md`.
-This extends the earlier sparse-grid timings above; it does not retroactively
-claim that sparse seed preparation alone improved sustained throughput.
+Chunk tensors read their channels through the opened `vcr::Array`s of the prediction
+and normal bindings, which share the field's memory cache (`cache_bytes`). There is no
+loader to configure: vc_reader fetches and decodes in parallel. The numbers reported in
+`channel_loader_20261025_v1` measured the removed VC chunk cache and queued loader; they
+do not describe this path.
 
 If new CUDA construction is needed, the command bootstraps/uses the existing GPU
 manager and requests a nonexclusive partial grant. By default all GPUs in the
@@ -1344,7 +1313,8 @@ and exception cleanup.
 
 ### Sampling overhead: retained chunks and owned ROIs
 
-The follow-up native benchmark `core/test/bench_fiber_sampling_overhead.cpp`
+Historical measurements of the removed VC chunk cache; the retained-chunk backend and
+this benchmark no longer exist. The follow-up native benchmark `core/test/bench_fiber_sampling_overhead.cpp`
 compares the current cached-request path with existing
 `detail::FiberChunkTensor` scalar sampling. This is measurement only, not a switch
 of the production direct tracer. Tensor normal/direction reconstruction and
@@ -1395,53 +1365,27 @@ mean/median/min/max statistics:
 `/ephemeral/hendrik/fiber3d_train2/evaluations/paris4_direct_separate_gates_20261027_v1/sampling_overhead_v1/REPORT.md`
 and `results.json`/`summary.json` alongside it.
 
-### Direct CPU tracing with retained decoded chunks
+### Direct CPU tracing with a sampling window
 
-Set `TraceConfig.sampling_window_voxels = 64` to use the retained-cache backend
-for direct CPU candidate-frontier sampling. `0` remains the default; valid nonzero
-sizes are 8–256 stored voxels. This does **not** build copied ROI channel arrays.
+Set `TraceConfig.sampling_window_voxels = 64` to sample direct CPU candidate frontiers
+from an owned window. `0` remains the default; valid nonzero sizes are 8–256 stored
+voxels. Each trace reads one `FiberChunkTensor` box and replaces it only when the next
+frontier leaves its coverage; the old window is released first. Interpolation performs
+no cache lookups, locks or I/O, and read errors propagate.
 
-The ownership/access flow is:
+Implementation: `core/src/fiber_tracer/FiberChunkTensor.cpp` holds the channels;
+`FiberTrace.cpp::scoreCandidateTasks` manages per-trace window reuse.
 
-1. `FiberPredictionField::chunkRegionChannels` checks publication readiness.
-2. `PinnedChunkRegion::pin` obtains ordinary decoded-cache `ChunkResult` references
-   and retains their buffers. This is shared ownership, not OS memory locking.
-3. `PinnedChunkGrid` builds an immutable table of raw pointers and strides for
-   each channel. Construction resolves packed-channel byte offsets and checks
-   payload extents. Missing/all-fill chunks use the source fill value; unpinned
-   in-volume dependencies throw, rather than silently becoming fill.
-4. `FiberChunkTensor` uses those tables for corner reads and the same interpolation,
-   direction reconstruction, validity masking and width math as its owned backend.
-   Interpolation performs no cache/map lookups, refcount updates, locks or I/O.
+Current scope: explicit one-worker scalar tracing, single-option byte prediction and
+normal channels on exactly matching lattices, byte/float width, no embeddings.
+Unsupported sources and oversized frontiers keep the existing sampler.
 
-Each trace retains one guarded window and replaces it only when the next candidate
-frontier leaves coverage. Old ownership is released before acquiring replacements.
-Forward and reverse traces may each retain a window. Cache eviction can remove its
-own reference without invalidating these views; buffers are freed when their last
-owner releases them. Full decoded storage chunks remain alive, so retained bytes
-can exceed the logical window size. This is not a second persistent cache.
+`TraceProfile` reports window loads, fallbacks, time, the largest window and the voxel
+bytes read into windows; these are not total process memory or a global memory cap.
 
-Implementation: `core/include/vc/core/render/PinnedChunkRegion.hpp` and
-`core/src/render/PinnedChunkRegion.cpp` provide the generic ownership/grid API;
-`core/src/fiber_tracer/FiberChunkTensor.cpp` provides shared interpolation/storage
-backends; `FiberTrace.cpp::scoreCandidateTasks` manages per-trace window reuse.
-
-Current scope: explicit one-worker scalar tracing, single-option byte prediction
-and normal channels on exactly matching lattices, byte/float width, no embeddings
-or caller-supplied pinned region. Unsupported sources and oversized frontiers keep
-the existing sampler. Read/readiness errors propagate. Initialization and committed
-step sampling still use their existing APIs. Dense/GPU construction is unchanged;
-`seedGrid` and `packGpu` deliberately require the owned backend.
-
-`TraceProfile` reports window loads/fallbacks/time, maximum retained physical bytes
-(deduplicated by payload within one window), pointer-table bytes, and ROI voxel
-bytes allocated/copied (zero). Pointer-table bytes exclude region map nodes;
-these counters are not total process memory or a global memory cap.
-
-Validation includes exact values across seams, packed channel offsets, missing
-chunks, masked normals, byte/float widths, independently chunked widths, cache
-eviction and owner lifetime, and concurrent read-only sampling. The approved
-runner suites `direct-sampling-window` and `direct-sampling-window-full` measure
+Validation includes packed channel offsets, missing chunks, masked normals, byte/float
+widths and independently chunked widths. The approved runner suites
+`direct-sampling-window` and `direct-sampling-window-full` measure
 cached Paris4 replay with unchanged tracing settings. Retained results are under
 `paris4_direct_separate_gates_20261027_v1/sampling_retained_v1`; the earlier
 `sampling_window_v1` measured the superseded **copied** ROI backend.

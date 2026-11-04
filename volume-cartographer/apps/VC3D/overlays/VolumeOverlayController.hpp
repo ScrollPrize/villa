@@ -10,7 +10,6 @@
 #include <string>
 #include <vector>
 
-#include "vc/core/types/Sampling.hpp"
 #include "vc/core/util/Compositing.hpp"
 
 class ViewerManager;
@@ -53,7 +52,7 @@ public:
         bool intensityAsAlpha{false};
         int maxDisplayedResolution{0};
         OverlayCompositeSettings composite;
-        vc::Sampling samplingMethod{vc::Sampling::Nearest};
+        int samplingMethod{0};  // 0 nearest, 1 trilinear
     };
 
     struct Update {
@@ -65,8 +64,8 @@ public:
         std::optional<bool> intensityAsAlpha;
         std::optional<int> maxDisplayedResolution;
         std::optional<OverlayCompositeSettings> composite;
-        // Nearest or Trilinear; other methods fall back to Nearest.
-        std::optional<vc::Sampling> samplingMethod;
+        // 0 nearest, 1 trilinear; other values fall back to nearest.
+        std::optional<int> samplingMethod;
     };
 
     enum class ApplyResult {
@@ -104,7 +103,7 @@ private:
     void saveState() const;
     void setVolumeId(const std::string& id);
     void setColormap(const std::string& id);
-    void setSamplingMethod(vc::Sampling method);
+    void setSamplingMethod(int method);
     void setOpacity(float value);
     void setWindowBounds(float low, float high);
     void setIntensityAsAlpha(bool enabled);
@@ -135,7 +134,7 @@ private:
     std::string _overlayVolumeId;
     std::string _overlayVolumeIdBeforeToggle;
     std::string _overlayColormapName;
-    vc::Sampling _overlaySamplingMethod{vc::Sampling::Nearest};
+    int _overlaySamplingMethod{0};
     float _overlayOpacity{0.5f};
     float _overlayOpacityBeforeToggle{0.5f};
     float _overlayWindowLow{0.0f};

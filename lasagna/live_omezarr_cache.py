@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from collections import defaultdict
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 import json
@@ -10,7 +9,9 @@ from pathlib import Path
 import sys
 import threading
 import time
-from typing import Any, Iterator
+from typing import Any
+
+from vc_reader.reader import ZarrReader
 
 # flock() is POSIX. Windows has no fcntl, so take the same non-blocking
 # shared/exclusive advisory lock through LockFileEx, which is the Win32 call
@@ -321,110 +322,12 @@ def prepare_selected_level_source(
     )
 
 
-def _chunk_key(separator: str, iz: int, iy: int, ix: int) -> str:
-    return separator.join(str(value) for value in (iz, iy, ix))
-
-
-def _chunk_path(source: SelectedLevelSource, iz: int, iy: int, ix: int) -> Path:
-    key = _chunk_key(source.dimension_separator, iz, iy, ix)
-    return source.level_path / Path(key.replace("/", os.sep))
-
-
-def _valid_regular_file(path: Path) -> bool:
-    try:
-        stat = path.lstat()
-    except OSError:
-        return False
-    return not path.is_symlink() and path.is_file() and stat.st_size > 0
-
-
-def _iter_plane_files(source: SelectedLevelSource, iz: int) -> Iterator[Path]:
-    if source.dimension_separator == ".":
-        prefix = f"{int(iz)}."
-        try:
-            entries = os.scandir(source.level_path)
-        except OSError:
-            return
-        with entries:
-            for entry in entries:
-                if not entry.name.startswith(prefix) or entry.is_symlink():
-                    continue
-                parts = entry.name.split(".")
-                if len(parts) == 3 and all(part.isdigit() for part in parts):
-                    path = Path(entry.path)
-                    if _valid_regular_file(path):
-                        yield path
-        return
-
-    z_path = source.level_path / str(int(iz))
-    if z_path.is_symlink() or not z_path.is_dir():
-        return
-    try:
-        y_entries = os.scandir(z_path)
-    except OSError:
-        return
-    with y_entries:
-        for y_entry in y_entries:
-            if y_entry.is_symlink() or not y_entry.name.isdigit() or not y_entry.is_dir(follow_symlinks=False):
-                continue
-            try:
-                x_entries = os.scandir(y_entry.path)
-            except OSError:
-                continue
-            with x_entries:
-                for x_entry in x_entries:
-                    if x_entry.is_symlink() or not x_entry.name.isdigit():
-                        continue
-                    path = Path(x_entry.path)
-                    if _valid_regular_file(path):
-                        yield path
-
-
-def inventory_selected_level(source: SelectedLevelSource) -> tuple[dict[int, int], dict[int, int]]:
-    plane_bytes: dict[int, int] = defaultdict(int)
-    plane_counts: dict[int, int] = defaultdict(int)
-    nz = math.ceil(source.shape[0] / source.chunks[0])
-    if source.dimension_separator == "/":
-        try:
-            entries = os.scandir(source.level_path)
-        except OSError:
-            return {}, {}
-        with entries:
-            z_values = sorted(
-                int(entry.name)
-                for entry in entries
-                if entry.name.isdigit() and not entry.is_symlink()
-                and entry.is_dir(follow_symlinks=False) and int(entry.name) < nz
-            )
-    else:
-        z_values_set: set[int] = set()
-        try:
-            entries = os.scandir(source.level_path)
-        except OSError:
-            return {}, {}
-        with entries:
-            for entry in entries:
-                if entry.is_symlink() or not entry.is_file(follow_symlinks=False):
-                    continue
-                parts = entry.name.split(".")
-                if len(parts) == 3 and all(part.isdigit() for part in parts):
-                    iz = int(parts[0])
-                    if iz < nz:
-                        z_values_set.add(iz)
-        z_values = sorted(z_values_set)
-    for iz in z_values:
-        for path in _iter_plane_files(source, iz):
-            try:
-                size = path.stat().st_size
-            except OSError:
-                continue
-            plane_bytes[iz] += int(size)
-            plane_counts[iz] += 1
-    return dict(plane_bytes), dict(plane_counts)
-
-
 class LiveOmeZarrCache:
-    """Bounded, Z-forward selected-level materialization cache."""
+    """One selected level read from its remote source through a bounded disk cache, with read-ahead.
+
+    The reader's cache drops its least recently used chunks past ``max_bytes``. Chunks a plain
+    download left in the level are not used.
+    """
 
     def __init__(
         self,
@@ -440,62 +343,30 @@ class LiveOmeZarrCache:
             raise ValueError("live fetch lookahead_tiles must be > 0")
         if int(workers) <= 0:
             raise ValueError("live fetch workers must be > 0")
-        raw_path = Path(str(input_path).rstrip("/")).expanduser()
-        if not raw_path.name.isdigit():
-            raise ValueError(
-                f"live fetch requires an input path ending in a numeric OME-Zarr level: {input_path}"
-            )
-        self._level_lock = SelectedLevelLock(
-            raw_path.parent.resolve(), int(raw_path.name), exclusive=True,
-        )
-        self._level_lock.__enter__()
-        try:
-            self.source = prepare_selected_level_source(input_path)
-        except BaseException:
-            self._level_lock.__exit__(None, None, None)
-            raise
+        self.source = prepare_selected_level_source(input_path)
         self.max_bytes = int(max_bytes)
         self.lookahead_tiles = int(lookahead_tiles)
         self.workers = int(workers)
-        try:
-            self._plane_bytes, self._plane_counts = inventory_selected_level(self.source)
-        except BaseException:
-            self._level_lock.__exit__(None, None, None)
-            raise
-        self._resident_bytes = sum(self._plane_bytes.values())
-        self._resident_chunks = sum(self._plane_counts.values())
-        self._peak_resident_bytes = self._resident_bytes
-        self._safe_plane_exclusive = 0
+        self._reader: ZarrReader | None = None
+        self._final_reader_stats: dict[str, Any] | None = None
         self._inventory_futures: dict[int, Future[set[tuple[int, int]]]] = {}
-        self._chunk_futures: dict[tuple[int, int, int], Future[int]] = {}
-        self._active_planes: dict[int, int] = defaultdict(int)
         self._lock = threading.RLock()
         self._closed = False
-        self._inventory_pool = None
-        self._download_pool = None
-        self._planner_pool = None
-        try:
-            self._inventory_pool = ThreadPoolExecutor(
-                max_workers=min(16, self.workers), thread_name_prefix="live-zarr-list",
-            )
-            self._download_pool = ThreadPoolExecutor(
-                max_workers=self.workers, thread_name_prefix="live-zarr-get",
-            )
-            self._planner_pool = ThreadPoolExecutor(
-                max_workers=min(32, self.workers), thread_name_prefix="live-zarr-plan",
-            )
-        except BaseException:
-            for pool in (self._planner_pool, self._download_pool, self._inventory_pool):
-                if pool is not None:
-                    pool.shutdown(wait=True, cancel_futures=True)
-            self._level_lock.__exit__(None, None, None)
-            raise
-        self._stats = defaultdict(int)
+        self._inventory_pool = ThreadPoolExecutor(
+            max_workers=min(16, self.workers), thread_name_prefix="live-zarr-list",
+        )
+        # 64 concurrent tile reads keep up with the old 256-worker pipeline on Open Data (planning, C).
+        self._read_pool = ThreadPoolExecutor(
+            max_workers=min(64, self.workers), thread_name_prefix="live-zarr-read",
+        )
+        self._stats = {
+            "requested_regions": 0, "materialized_regions": 0,
+            "listed_planes": 0, "listed_chunks": 0, "missing_chunks": 0,
+        }
         self._started_at = time.monotonic()
         print(
             f"[live-fetch] level={self.source.level} shape={self.source.shape} "
-            f"chunks={self.source.chunks} resident={self._resident_bytes / (1 << 40):.2f}TiB "
-            f"target={self.max_bytes / (1 << 40):.2f}TiB "
+            f"chunks={self.source.chunks} target={self.max_bytes / (1 << 40):.2f}TiB "
             f"lookahead_tiles={self.lookahead_tiles} workers={self.workers}",
             flush=True,
         )
@@ -505,6 +376,20 @@ class LiveOmeZarrCache:
 
     def __exit__(self, _exc_type, _exc, _tb) -> None:
         self.close()
+
+    def open_reader(self, *, memory_cache: int | None = None, threads: int | None = None) -> ZarrReader:
+        """The reader inference reads tiles from; read-ahead goes through the same one."""
+        source = self.source
+        self._reader = ZarrReader.open(
+            _downloader()._s3_location(f"{source.source_uri}/{source.level}", source.anon, source.region),
+            cache_dir=str(source.group_root / ".live_cache"),
+            cache_max_bytes=self.max_bytes,
+            memory_cache=memory_cache,
+            threads=threads,
+            connections=self.workers,
+            auth=None if source.anon else "aws",
+        )
+        return self._reader
 
     def _list_plane(self, iz: int) -> set[tuple[int, int]]:
         dl = _downloader()
@@ -542,64 +427,9 @@ class LiveOmeZarrCache:
         with self._lock:
             future = self._inventory_futures.get(int(iz))
             if future is None:
-                assert self._inventory_pool is not None
                 future = self._inventory_pool.submit(self._list_plane, int(iz))
                 self._inventory_futures[int(iz)] = future
             return future
-
-    def _download_chunk(self, iz: int, iy: int, ix: int) -> int:
-        dl = _downloader()
-        local_path = _chunk_path(self.source, iz, iy, ix)
-        remote_key = (
-            f"{self.source.prefix}/{self.source.level}/"
-            f"{_chunk_key(self.source.dimension_separator, iz, iy, ix)}"
-        )
-        for attempt in range(3):
-            try:
-                size = dl._download_chunk_atomic(
-                    self.source.bucket,
-                    remote_key,
-                    str(local_path),
-                    self.source.anon,
-                    region=self.source.region,
-                )
-                break
-            except Exception:
-                if attempt == 2:
-                    raise
-                time.sleep(0.5 * (attempt + 1))
-        with self._lock:
-            self._plane_bytes[iz] = self._plane_bytes.get(iz, 0) + int(size)
-            self._plane_counts[iz] = self._plane_counts.get(iz, 0) + 1
-            self._resident_bytes += int(size)
-            self._resident_chunks += 1
-            self._peak_resident_bytes = max(self._peak_resident_bytes, self._resident_bytes)
-            self._stats["downloaded_chunks"] += 1
-            self._stats["downloaded_bytes"] += int(size)
-        return int(size)
-
-    def _ensure_chunk(self, iz: int, iy: int, ix: int) -> Future[int] | None:
-        path = _chunk_path(self.source, iz, iy, ix)
-        if _valid_regular_file(path):
-            with self._lock:
-                self._stats["reused_chunks"] += 1
-            return None
-        key = (int(iz), int(iy), int(ix))
-        with self._lock:
-            existing = self._chunk_futures.get(key)
-            if existing is not None:
-                return existing
-            assert self._download_pool is not None
-            future = self._download_pool.submit(self._download_chunk, *key)
-            self._chunk_futures[key] = future
-
-        def forget(done: Future[int], *, chunk_key=key) -> None:
-            with self._lock:
-                if self._chunk_futures.get(chunk_key) is done:
-                    self._chunk_futures.pop(chunk_key, None)
-
-        future.add_done_callback(forget)
-        return future
 
     def _chunk_ranges(
         self, bounds_zyx: tuple[int, int, int, int, int, int],
@@ -612,40 +442,16 @@ class LiveOmeZarrCache:
             range(max(0, x0 // cx), min(math.ceil(self.source.shape[2] / cx), math.ceil(x1 / cx))),
         )
 
-    def _materialize_region(
-        self, bounds_zyx: tuple[int, int, int, int, int, int],
-    ) -> bool:
-        z_values, y_values, x_values = self._chunk_ranges(bounds_zyx)
-        planes = tuple(z_values)
+    def _read_ahead(self, bounds_zyx: tuple[int, int, int, int, int, int]) -> bool:
+        """Reads the region into the caches; False when nothing is stored there."""
+        present = self.region_has_remote_chunks(bounds_zyx)
+        if present:
+            assert self._reader is not None
+            z0, z1, y0, y1, x0, x1 = bounds_zyx
+            self._reader[max(0, z0):z1, max(0, y0):y1, max(0, x0):x1]
         with self._lock:
-            for iz in planes:
-                self._active_planes[iz] += 1
-        try:
-            inventory_tasks = {iz: self._plane_inventory(iz) for iz in planes}
-            inventories = {iz: task.result() for iz, task in inventory_tasks.items()}
-            futures: list[Future[int]] = []
-            has_present = False
-            for iz in planes:
-                present = inventories[iz]
-                for iy in y_values:
-                    for ix in x_values:
-                        if (iy, ix) not in present:
-                            continue
-                        has_present = True
-                        future = self._ensure_chunk(iz, iy, ix)
-                        if future is not None:
-                            futures.append(future)
-            for future in futures:
-                future.result()
-            with self._lock:
-                self._stats["materialized_regions"] += 1
-            return has_present
-        finally:
-            with self._lock:
-                for iz in planes:
-                    self._active_planes[iz] -= 1
-                    if self._active_planes[iz] <= 0:
-                        self._active_planes.pop(iz, None)
+            self._stats["materialized_regions"] += 1
+        return present
 
     def request_region(
         self, bounds_zyx: tuple[int, int, int, int, int, int],
@@ -654,8 +460,7 @@ class LiveOmeZarrCache:
             if self._closed:
                 raise RuntimeError("live cache is closed")
             self._stats["requested_regions"] += 1
-        assert self._planner_pool is not None
-        return self._planner_pool.submit(self._materialize_region, bounds_zyx)
+        return self._read_pool.submit(self._read_ahead, bounds_zyx)
 
     def region_has_remote_chunks(
         self, bounds_zyx: tuple[int, int, int, int, int, int],
@@ -669,110 +474,26 @@ class LiveOmeZarrCache:
                 return True
         return False
 
-    def _evict_plane(self, iz: int) -> tuple[int, int]:
-        removed_bytes = 0
-        removed_chunks = 0
-        for path in tuple(_iter_plane_files(self.source, iz)):
-            try:
-                size = path.stat().st_size
-                path.unlink()
-            except OSError:
-                continue
-            removed_bytes += int(size)
-            removed_chunks += 1
-        if self.source.dimension_separator == "/":
-            z_path = self.source.level_path / str(int(iz))
-            if not z_path.is_symlink() and z_path.is_dir():
-                try:
-                    y_paths = tuple(z_path.iterdir())
-                except OSError:
-                    y_paths = ()
-                for y_path in y_paths:
-                    if y_path.is_symlink() or not y_path.is_dir():
-                        continue
-                    try:
-                        y_path.rmdir()
-                    except OSError:
-                        pass
-                try:
-                    z_path.rmdir()
-                except OSError:
-                    pass
-        with self._lock:
-            remaining_bytes = max(0, self._plane_bytes.get(iz, 0) - removed_bytes)
-            remaining_chunks = max(0, self._plane_counts.get(iz, 0) - removed_chunks)
-            if remaining_bytes:
-                self._plane_bytes[iz] = remaining_bytes
-            else:
-                self._plane_bytes.pop(iz, None)
-            if remaining_chunks:
-                self._plane_counts[iz] = remaining_chunks
-            else:
-                self._plane_counts.pop(iz, None)
-            self._resident_bytes = max(0, self._resident_bytes - removed_bytes)
-            self._resident_chunks = max(0, self._resident_chunks - removed_chunks)
-            self._stats["evicted_planes"] += 1
-            self._stats["evicted_chunks"] += removed_chunks
-            self._stats["evicted_bytes"] += removed_bytes
-            self._inventory_futures.pop(iz, None)
-        return removed_bytes, removed_chunks
-
-    def advance_safe_boundary(self, input_voxel_z: int) -> None:
-        safe_exclusive = max(0, int(input_voxel_z) // self.source.chunks[0])
-        with self._lock:
-            self._safe_plane_exclusive = max(self._safe_plane_exclusive, safe_exclusive)
-        while True:
-            with self._lock:
-                if self._resident_bytes <= self.max_bytes:
-                    break
-                eligible = [
-                    iz
-                    for iz, byte_count in self._plane_bytes.items()
-                    if byte_count > 0 and iz < self._safe_plane_exclusive
-                    and self._active_planes.get(iz, 0) == 0
-                    and not any(key[0] == iz for key in self._chunk_futures)
-                ]
-                if not eligible:
-                    self._stats["over_target_events"] += 1
-                    break
-                iz = min(eligible)
-            removed_bytes, removed_chunks = self._evict_plane(iz)
-            print(
-                f"[live-fetch] evict zchunk={iz} chunks={removed_chunks} "
-                f"bytes={removed_bytes / (1 << 30):.2f}GiB "
-                f"resident={self.snapshot()['resident_bytes'] / (1 << 40):.2f}TiB",
-                flush=True,
-            )
-            if removed_chunks == 0:
-                break
-        with self._lock:
-            for iz in tuple(self._inventory_futures):
-                if (
-                    iz < self._safe_plane_exclusive
-                    and self._active_planes.get(iz, 0) == 0
-                    and not any(key[0] == iz for key in self._chunk_futures)
-                    and self._inventory_futures[iz].done()
-                ):
-                    self._inventory_futures.pop(iz, None)
-
     def snapshot(self) -> dict[str, Any]:
+        reader_stats = self._final_reader_stats
+        if reader_stats is None:
+            reader_stats = self._reader.stats() if self._reader is not None else {}
         with self._lock:
             elapsed = max(1.0e-6, time.monotonic() - self._started_at)
+            downloaded_bytes = int(reader_stats.get("remote_bytes", 0))
             return {
                 "enabled": 1,
                 "level": self.source.level,
                 "target_bytes": self.max_bytes,
                 "lookahead_tiles": self.lookahead_tiles,
-                "resident_bytes": self._resident_bytes,
-                "resident_chunks": self._resident_chunks,
-                "peak_resident_bytes": self._peak_resident_bytes,
-                "safe_plane_exclusive": self._safe_plane_exclusive,
-                "active_inventory_planes": len(self._inventory_futures),
-                "inflight_downloads": len(self._chunk_futures),
+                "active_inventory_planes": sum(not task.done() for task in self._inventory_futures.values()),
+                "inflight_regions": self._stats["requested_regions"] - self._stats["materialized_regions"],
                 "elapsed_seconds": elapsed,
-                "download_rate_bytes_s": self._stats["downloaded_bytes"] / elapsed,
-                "over_target": int(self._resident_bytes > self.max_bytes),
-                **{str(key): int(value) for key, value in self._stats.items()},
+                "downloaded_chunks": int(reader_stats.get("remote_fetches", 0)),
+                "downloaded_bytes": downloaded_bytes,
+                "disk_hits": int(reader_stats.get("disk_hits", 0)),
+                "download_rate_bytes_s": downloaded_bytes / elapsed,
+                **self._stats,
             }
 
     def close(self) -> None:
@@ -780,20 +501,15 @@ class LiveOmeZarrCache:
             if self._closed:
                 return
             self._closed = True
-        assert self._planner_pool is not None
-        assert self._download_pool is not None
-        assert self._inventory_pool is not None
-        try:
-            self._planner_pool.shutdown(wait=True, cancel_futures=True)
-            self._download_pool.shutdown(wait=True, cancel_futures=True)
-            self._inventory_pool.shutdown(wait=True, cancel_futures=True)
-            snapshot = self.snapshot()
-            print(
-                f"[live-fetch] done resident={snapshot['resident_bytes'] / (1 << 40):.2f}TiB "
-                f"peak={snapshot['peak_resident_bytes'] / (1 << 40):.2f}TiB "
-                f"downloaded={snapshot.get('downloaded_bytes', 0) / (1 << 40):.2f}TiB "
-                f"evicted={snapshot.get('evicted_bytes', 0) / (1 << 40):.2f}TiB",
-                flush=True,
-            )
-        finally:
-            self._level_lock.__exit__(None, None, None)
+        self._read_pool.shutdown(wait=True, cancel_futures=True)
+        self._inventory_pool.shutdown(wait=True, cancel_futures=True)
+        if self._reader is not None:
+            self._reader.flush()
+            self._final_reader_stats = self._reader.stats()
+            self._reader.close()
+        snapshot = self.snapshot()
+        print(
+            f"[live-fetch] done downloaded={snapshot['downloaded_bytes'] / (1 << 40):.2f}TiB "
+            f"in {snapshot['downloaded_chunks']} chunks, {snapshot['disk_hits']} from disk",
+            flush=True,
+        )

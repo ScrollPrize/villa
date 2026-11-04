@@ -1,4 +1,5 @@
 #include "viewer_controls/panels/ViewerCompositePanel.hpp"
+#include "ReparentLayoutItem.hpp"
 
 #include "ViewerManager.hpp"
 #include "volume_viewers/VolumeViewerBase.hpp"
@@ -46,22 +47,6 @@ int compositeModeIndexForMethod(const std::string& method)
 bool isPlaneViewer(const std::string& name)
 {
     return name == "seg xz" || name == "seg yz" || name == "xy plane";
-}
-
-void reparentItemWidgets(QLayoutItem* item, QWidget* newParent)
-{
-    if (!item || !newParent) {
-        return;
-    }
-    if (auto* widget = item->widget()) {
-        widget->setParent(newParent);
-        return;
-    }
-    if (auto* layout = item->layout()) {
-        for (int i = 0; i < layout->count(); ++i) {
-            reparentItemWidgets(layout->itemAt(i), newParent);
-        }
-    }
 }
 
 void moveLayoutItems(QLayout* from, QLayout* to, QWidget* newParent)
@@ -380,7 +365,7 @@ void ViewerCompositePanel::setupControls()
         connect(_uiRefs.alphaMin, QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int value) {
             applyToAllViewers([value](VolumeViewerBase* viewer) {
                 auto s = viewer->compositeRenderSettings();
-                s.params.alphaMin = value / 255.0f;
+                s.params.options.alphaMin = value / 255.0f;
                 viewer->setCompositeRenderSettings(s);
             });
         });
@@ -389,7 +374,7 @@ void ViewerCompositePanel::setupControls()
         connect(_uiRefs.alphaMax, QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int value) {
             applyToAllViewers([value](VolumeViewerBase* viewer) {
                 auto s = viewer->compositeRenderSettings();
-                s.params.alphaMax = value / 255.0f;
+                s.params.options.alphaMax = value / 255.0f;
                 viewer->setCompositeRenderSettings(s);
             });
         });
@@ -398,7 +383,7 @@ void ViewerCompositePanel::setupControls()
         connect(_uiRefs.alphaThreshold, QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int value) {
             applyToAllViewers([value](VolumeViewerBase* viewer) {
                 auto s = viewer->compositeRenderSettings();
-                s.params.alphaCutoff = value / 10000.0f;
+                s.params.options.alphaCutoff = value / 10000.0f;
                 viewer->setCompositeRenderSettings(s);
             });
         });
@@ -407,7 +392,7 @@ void ViewerCompositePanel::setupControls()
         connect(_uiRefs.material, QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int value) {
             applyToAllViewers([value](VolumeViewerBase* viewer) {
                 auto s = viewer->compositeRenderSettings();
-                s.params.alphaOpacity = value / 255.0f;
+                s.params.options.alphaOpacity = value / 255.0f;
                 viewer->setCompositeRenderSettings(s);
             });
         });
@@ -522,16 +507,16 @@ void ViewerCompositePanel::applyInitialSettingsToViewer(VolumeViewerBase* viewer
             s.layersBehind = _uiRefs.layersBehind->value();
         }
         if (_uiRefs.alphaMin) {
-            s.params.alphaMin = _uiRefs.alphaMin->value() / 255.0f;
+            s.params.options.alphaMin = _uiRefs.alphaMin->value() / 255.0f;
         }
         if (_uiRefs.alphaMax) {
-            s.params.alphaMax = _uiRefs.alphaMax->value() / 255.0f;
+            s.params.options.alphaMax = _uiRefs.alphaMax->value() / 255.0f;
         }
         if (_uiRefs.alphaThreshold) {
-            s.params.alphaCutoff = _uiRefs.alphaThreshold->value() / 10000.0f;
+            s.params.options.alphaCutoff = _uiRefs.alphaThreshold->value() / 10000.0f;
         }
         if (_uiRefs.material) {
-            s.params.alphaOpacity = _uiRefs.material->value() / 255.0f;
+            s.params.options.alphaOpacity = _uiRefs.material->value() / 255.0f;
         }
         if (_uiRefs.reverseDirection) {
             s.reverseDirection = _uiRefs.reverseDirection->isChecked();
@@ -557,8 +542,8 @@ void ViewerCompositePanel::applyInitialSettingsToViewer(VolumeViewerBase* viewer
         // The camera is per-view and stays at the viewer's own state
         // (default straight-down), edited only via its on-view gizmo.
     }
-    s.params.method = compositeMethodForModeIndex(
-        _uiRefs.compositeMode ? _uiRefs.compositeMode->currentIndex() : 0);
+    setCompositeMethod(s.params, compositeMethodForModeIndex(
+        _uiRefs.compositeMode ? _uiRefs.compositeMode->currentIndex() : 0));
     viewer->setCompositeRenderSettings(s);
     if (viewer->surfName() == "segmentation") {
         setSegmentationCompositeChecked(s.enabled);
@@ -601,7 +586,7 @@ void ViewerCompositePanel::syncUiFromManager()
         }
         if (_uiRefs.compositeMode) {
             const QSignalBlocker blocker(_uiRefs.compositeMode);
-            _uiRefs.compositeMode->setCurrentIndex(compositeModeIndexForMethod(settings.params.method));
+            _uiRefs.compositeMode->setCurrentIndex(compositeModeIndexForMethod(compositeMethodName(settings.params)));
         }
         if (_uiRefs.layersInFront) {
             const QSignalBlocker blocker(_uiRefs.layersInFront);
@@ -613,19 +598,19 @@ void ViewerCompositePanel::syncUiFromManager()
         }
         if (_uiRefs.alphaMin) {
             const QSignalBlocker blocker(_uiRefs.alphaMin);
-            _uiRefs.alphaMin->setValue(static_cast<int>(std::lround(settings.params.alphaMin * 255.0f)));
+            _uiRefs.alphaMin->setValue(static_cast<int>(std::lround(settings.params.options.alphaMin * 255.0f)));
         }
         if (_uiRefs.alphaMax) {
             const QSignalBlocker blocker(_uiRefs.alphaMax);
-            _uiRefs.alphaMax->setValue(static_cast<int>(std::lround(settings.params.alphaMax * 255.0f)));
+            _uiRefs.alphaMax->setValue(static_cast<int>(std::lround(settings.params.options.alphaMax * 255.0f)));
         }
         if (_uiRefs.alphaThreshold) {
             const QSignalBlocker blocker(_uiRefs.alphaThreshold);
-            _uiRefs.alphaThreshold->setValue(static_cast<int>(std::lround(settings.params.alphaCutoff * 10000.0f)));
+            _uiRefs.alphaThreshold->setValue(static_cast<int>(std::lround(settings.params.options.alphaCutoff * 10000.0f)));
         }
         if (_uiRefs.material) {
             const QSignalBlocker blocker(_uiRefs.material);
-            _uiRefs.material->setValue(static_cast<int>(std::lround(settings.params.alphaOpacity * 255.0f)));
+            _uiRefs.material->setValue(static_cast<int>(std::lround(settings.params.options.alphaOpacity * 255.0f)));
         }
         if (_uiRefs.reverseDirection) {
             const QSignalBlocker blocker(_uiRefs.reverseDirection);

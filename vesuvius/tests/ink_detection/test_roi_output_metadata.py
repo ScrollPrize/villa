@@ -6,7 +6,7 @@ import pytest
 import tifffile
 import torch
 from torch import nn
-import zarr
+from vc_reader.reader import ZarrWriter
 import vesuvius.ink_detection.inference.infer as infer
 
 class SavedFixtureModel(nn.Module):
@@ -25,8 +25,7 @@ def test_reused_output_never_retains_old_roi_frame(tmp_path, next_roi, max_ram_g
     with np.load(fixture) as saved:
         ct, probability = saved['ct'], saved['probability']
     input_path = tmp_path / 'real_fixture.zarr'
-    volume = zarr.open_array(str(input_path), mode='w', shape=ct.shape,
-                             chunks=ct.shape, dtype=ct.dtype, zarr_format=2)
+    volume = ZarrWriter.create(input_path, shape=ct.shape, chunks=ct.shape, dtype=ct.dtype)
     volume[:] = ct
     tile = np.zeros((128, 128), np.float32)
     tile[:80, :80] = probability

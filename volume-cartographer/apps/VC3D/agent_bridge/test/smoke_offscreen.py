@@ -136,10 +136,10 @@ def require_running(proc: VC3DProcess, results: Results, context: str) -> None:
 
 
 def create_test_volume(volume: Path, volume_id: str) -> Path:
-    level = volume / "0"
-    level.mkdir(parents=True)
+    from vc_reader.reader import ZarrWriter
+
+    volume.mkdir(parents=True)
     (volume / ".zgroup").write_text(json.dumps({"zarr_format": 2}))
-    (volume / ".zattrs").write_text(json.dumps({}))
     (volume / "meta.json").write_text(json.dumps({
         "type": "vol",
         "uuid": volume_id,
@@ -152,17 +152,7 @@ def create_test_volume(volume: Path, volume_id: str) -> Path:
         "min": 0.0,
         "max": 255.0,
     }))
-    (level / ".zarray").write_text(json.dumps({
-        "zarr_format": 2,
-        "shape": [16, 16, 16],
-        "chunks": [16, 16, 16],
-        "dtype": "|u1",
-        "compressor": None,
-        "fill_value": 0,
-        "order": "C",
-        "filters": None,
-        "dimension_separator": ".",
-    }))
+    ZarrWriter.create(volume / "0", shape=(16, 16, 16), chunks=(16, 16, 16), dtype="|u1", compressor=None)
     return volume
 
 
@@ -291,10 +281,10 @@ def check_rpc_describe(
         coverage = description.get("coverage", {})
         complete = (
             description.get("undocumented") == []
-            and coverage.get("described") == 114
-            and coverage.get("registered") == 114
+            and coverage.get("described") == 110
+            and coverage.get("registered") == 110
             and coverage.get("complete") is True
-            and len(snapshot["methods"]) == 114
+            and len(snapshot["methods"]) == 110
         )
         rendered = json.dumps(snapshot, indent=2, sort_keys=True) + "\n"
         if update_snapshot:
@@ -1585,7 +1575,7 @@ def check_segmentation_settings(client: BridgeClient, results: Results) -> None:
         settings, _ = client.call("segmentation.get_settings", {}, timeout=RPC_TIMEOUT)
         z_range = settings.get("zRange", {})
         ok = (
-            {"drag", "pushPull", "growthMethod", "directionFields"} <= set(settings)
+            {"drag", "pushPull", "growthMethod"} <= set(settings)
             and not {"line", "patchTracer", "approvalMask"} & set(settings)
             and {"enabled", "min", "max"} <= set(z_range)
             and settings.get("growthMethod") in ("tracer", "corrections")
@@ -1662,23 +1652,11 @@ def check_segment_operations(client: BridgeClient, results: Results) -> None:
          "segment_transform_unknown_segment"),
         ("segment.export_obj", {"segmentId": missing},
          "segment_export_obj_unknown_segment"),
-        ("segment.rasterize", {"segmentIds": [missing]},
-         "segment_rasterize_unknown_segment"),
         ("segment.neighbor_copy", {"segmentId": missing, "direction": "out"},
          "segment_neighbor_copy_unknown_segment"),
     ):
         ok, detail = expect_bridge_error(client, method, params, -32007)
         results.record(name, ok, detail)
-    ok, detail = expect_param_error(
-        client, "segments.merge", {"segmentIds": [missing]}, "segmentIds")
-    results.record("segments_merge_needs_two_segments", ok, detail)
-    ok, detail = expect_param_error(
-        client, "segments.patch",
-        {"segmentIds": [missing, missing], "confirm": True}, "segmentIds")
-    results.record("segments_patch_needs_two_distinct_segments", ok, detail)
-    ok, detail = expect_param_error(
-        client, "segments.patch", {"segmentIds": [missing, "other-segment"]}, "confirm")
-    results.record("segments_patch_requires_confirm", ok, detail)
 
 
 def check_c4(client: BridgeClient, results: Results, project: str) -> None:

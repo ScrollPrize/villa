@@ -50,10 +50,7 @@ bool haveFixture(const std::string& name)
 
 TEST_CASE("Fixture: segment 770 loads with the meta.json pins we converted")
 {
-    if (!haveFixture(kSeg770)) {
-        MESSAGE("Skipping: fixture not present at " << segPath(kSeg770));
-        return;
-    }
+    REQUIRE(haveFixture(kSeg770));
     QuadSurface qs(segPath(kSeg770));
     qs.ensureLoaded();
     auto* pts = qs.rawPointsPtr();
@@ -62,9 +59,9 @@ TEST_CASE("Fixture: segment 770 loads with the meta.json pins we converted")
     CHECK(pts->cols == 129);
 
     CHECK(qs.meta.is_object());
-    CHECK(qs.meta["uuid"].get_string() == std::string(kSeg770));
-    CHECK(qs.meta["type"].get_string() == "seg");
-    CHECK(qs.meta["format"].get_string() == "tifxyz");
+    CHECK(qs.meta["uuid"].get<std::string>() == std::string(kSeg770));
+    CHECK(qs.meta["type"].get<std::string>() == "seg");
+    CHECK(qs.meta["format"].get<std::string>() == "tifxyz");
     // stretch_factor=128 -> scale = 1/128 = 0.0078125
     CHECK(qs.scale()[0] == doctest::Approx(0.0078125f).epsilon(1e-5));
     CHECK(qs.scale()[1] == doctest::Approx(0.0078125f).epsilon(1e-5));
@@ -72,7 +69,7 @@ TEST_CASE("Fixture: segment 770 loads with the meta.json pins we converted")
 
 TEST_CASE("Fixture: validMask, countValid*, and bbox on segment 770")
 {
-    if (!haveFixture(kSeg770)) return;
+    REQUIRE(haveFixture(kSeg770));
     QuadSurface qs(segPath(kSeg770));
     qs.ensureLoaded();
 
@@ -98,19 +95,19 @@ TEST_CASE("Fixture: validMask, countValid*, and bbox on segment 770")
 TEST_CASE("Fixture: segment 880 and 990 also load")
 {
     for (const char* name : {kSeg880, kSeg990}) {
-        if (!haveFixture(name)) continue;
+        REQUIRE(haveFixture(name));
         CAPTURE(name);
         QuadSurface qs(segPath(name));
         qs.ensureLoaded();
         CHECK(qs.rawPointsPtr() != nullptr);
-        CHECK(qs.meta["uuid"].get_string() == std::string(name));
-        CHECK(qs.meta["format"].get_string() == "tifxyz");
+        CHECK(qs.meta["uuid"].get<std::string>() == std::string(name));
+        CHECK(qs.meta["format"].get<std::string>() == "tifxyz");
     }
 }
 
 TEST_CASE("Fixture: rotate(0) is a no-op; rotate(90) keeps surface loaded")
 {
-    if (!haveFixture(kSeg770)) return;
+    REQUIRE(haveFixture(kSeg770));
     QuadSurface qs(segPath(kSeg770));
     qs.ensureLoaded();
     auto* p = qs.rawPointsPtr();
@@ -123,7 +120,7 @@ TEST_CASE("Fixture: rotate(0) is a no-op; rotate(90) keeps surface loaded")
 
 TEST_CASE("Fixture: flipU and flipV are involutions")
 {
-    if (!haveFixture(kSeg770)) return;
+    REQUIRE(haveFixture(kSeg770));
     QuadSurface qs(segPath(kSeg770));
     qs.ensureLoaded();
     int validBefore = qs.countValidPoints();
@@ -137,7 +134,7 @@ TEST_CASE("Fixture: flipU and flipV are involutions")
 
 TEST_CASE("Fixture: gridNormal yields a unit-length normal somewhere on the surface")
 {
-    if (!haveFixture(kSeg770)) return;
+    REQUIRE(haveFixture(kSeg770));
     QuadSurface qs(segPath(kSeg770));
     qs.ensureLoaded();
     auto* p = qs.rawPointsPtr();
@@ -148,7 +145,9 @@ TEST_CASE("Fixture: gridNormal yields a unit-length normal somewhere on the surf
             if ((*p)(r + 1, c)[0] == -1.f) continue;
             if ((*p)(r, c - 1)[0] == -1.f) continue;
             if ((*p)(r, c + 1)[0] == -1.f) continue;
-            auto n = qs.gridNormal(r, c);
+            cv::Vec3f n;
+            const float nGrid[]{float(c),float(r)};
+            qs.pointSurface()->pointsAt(nGrid,1,nullptr,n.val);
             if (std::isfinite(n[0]) && std::isfinite(n[1]) && std::isfinite(n[2])) {
                 float len = std::sqrt(n[0]*n[0] + n[1]*n[1] + n[2]*n[2]);
                 CHECK(len == doctest::Approx(1.0f).epsilon(1e-3));
@@ -166,7 +165,5 @@ TEST_CASE("Fixture: three segments share the same uuid pattern (date_id)")
     for (const char* name : {kSeg770, kSeg880, kSeg990}) {
         if (haveFixture(name)) ++found;
     }
-    // Three live in the repo by default; running from a different cwd may
-    // miss the path — accept >=1 for the soft-skip case.
-    CHECK(found >= 1);
+    CHECK(found == 3);
 }

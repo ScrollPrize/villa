@@ -5,14 +5,15 @@
 
 #include <opencv2/core/types.hpp>
 
-class Volume;
+namespace vcr::zarr {
+struct OpenedArray;
+}
 
 namespace vc::fiber_tracer
 {
 
 void writeFiberletCropBoxVisualization(
-    ::Volume& volume,
-    const std::string& sourceLocator,
+    const vcr::zarr::OpenedArray& ct,
     const cv::Vec3d& minimumBaseXYZ,
     const cv::Vec3d& maximumBaseXYZ,
     const std::filesystem::path& outputStem,

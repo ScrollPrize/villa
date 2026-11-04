@@ -8,13 +8,13 @@ from typing import Any
 import numpy as np
 import torch
 import torch.nn.functional as F
-import zarr
 from skimage.filters import threshold_otsu
 from skimage.morphology import ball
 from skimage.morphology.binary import binary_dilation
+from vc_reader.reader import open_group
 
 from dinovol_2.dataset.normalization import NORMALIZATION_SCHEMES, get_normalization
-from dinovol_2.dataset.ssl_zarr_dataset import open_zarr_handle
+from dinovol_2.dataset.ssl_zarr_dataset import open_volume_level
 from dinovol_2.model.model import DinoVitStudentTeacher, PointDenseHead, _upgrade_weight_norm_state_dict_keys
 from dinovol_2.ops.point_embeddings import sample_grid_points
 
@@ -179,7 +179,7 @@ def _combine_coordinate_transforms(
 
 def load_ome_zarr_spec(path: str | Path) -> OmeZarrSpec:
     path_str = _normalize_path_string(path)
-    root = zarr.open_group(path_str, mode="r")
+    root = open_group(path_str)
     multiscales = root.attrs.get("multiscales")
     if not isinstance(multiscales, list) or not multiscales:
         raise ValueError("OME-Zarr root is missing multiscales metadata")
@@ -254,11 +254,7 @@ def _reorder_ome_zarr_array(array: np.ndarray, *, axes: tuple[str, ...]) -> np.n
 
 
 def load_ome_zarr_array(path: str | Path, scale: OmeZarrScale) -> np.ndarray:
-    handle = open_zarr_handle(_normalize_path_string(path), scale.path)
-    try:
-        array = np.asarray(handle.array)
-    finally:
-        handle.close()
+    array = open_volume_level(_normalize_path_string(path), scale.path)[...]
     return _reorder_ome_zarr_array(array, axes=scale.axes)
 
 
@@ -1523,13 +1519,13 @@ if _QT_AVAILABLE:
             )
 
             path_str = _normalize_path_string(self.ome_zarr_spec.path)
-            root = zarr.open_group(path_str, mode="r")
+            root = open_group(path_str)
             self._zarr_root = root
 
             multiscale_data = []
             for scale in self.ome_zarr_spec.scales:
                 zarr_array = root[scale.path]
-                dask_array = da.from_zarr(zarr_array)
+                dask_array = da.from_array(zarr_array, chunks=zarr_array.chunks, asarray=False, fancy=False, lock=False)
                 channel_axis = scale.channel_axis
                 target_axes = ("c", "z", "y", "x") if channel_axis is not None else ("z", "y", "x")
                 permutation = tuple(scale.axes.index(name) for name in target_axes)

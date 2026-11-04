@@ -70,15 +70,6 @@ SegmentationGrowthDirection directionFromName(const QString& name)
     return SegmentationGrowthDirection::Right;
 }
 
-SegmentationDirectionFieldOrientation orientationFromName(const QString& name)
-{
-    if (name == QLatin1String("horizontal"))
-        return SegmentationDirectionFieldOrientation::Horizontal;
-    if (name == QLatin1String("vertical"))
-        return SegmentationDirectionFieldOrientation::Vertical;
-    return SegmentationDirectionFieldOrientation::Normal;
-}
-
 SegmentationWidget* requireWidget(SegmentationWidget* widget)
 {
     if (!widget) {
@@ -134,16 +125,6 @@ QJsonObject AgentBridgeServer::segmentationSettingsJson() const
         {"max", zMax},
     };
 
-    QJsonArray directionFields;
-    for (const auto& field : widget->directionFieldConfigs()) {
-        directionFields.append(QJsonObject{
-            {"path", field.path},
-            {"orientation", segmentationDirectionFieldOrientationKey(field.orientation)},
-            {"scale", field.scale},
-            {"weight", field.weight},
-        });
-    }
-
     const std::string growthVolume = state ? state->segmentationGrowthVolumeId() : std::string{};
 
     return {
@@ -168,7 +149,6 @@ QJsonObject AgentBridgeServer::segmentationSettingsJson() const
         {"zRange", zRange},
         {"growthVolumeId", growthVolume.empty() ? QJsonValue(QJsonValue::Null)
                                                 : QJsonValue(QString::fromStdString(growthVolume))},
-        {"directionFields", directionFields},
     };
 }
 
@@ -198,18 +178,6 @@ QJsonObject AgentBridgeServer::handleSegmentationSetSettings(const QJsonValue& p
                 -32007, QStringLiteral("Unknown volume id: %1").arg(volumeId),
                 QJsonObject{{"kind", "volume"}, {"id", volumeId}}};
         }
-    }
-    std::vector<SegmentationDirectionFieldConfig> directionFields;
-    for (const QJsonValue& value : p.value("directionFields").toArray()) {
-        const QJsonObject field = value.toObject();
-        SegmentationDirectionFieldConfig config;
-        config.path = field.value("path").toString();
-        if (config.path.trimmed().isEmpty())
-            throwParam(QStringLiteral("directionFields"), QStringLiteral("direction field path must not be blank"));
-        config.orientation = orientationFromName(field.value("orientation").toString());
-        config.scale = field.value("scale").toInt(0);
-        config.weight = field.value("weight").toDouble(1.0);
-        directionFields.push_back(config);
     }
     // A Z range given with one bound keeps the other field's value; the
     // panel's own bounds are taken back even when its spin boxes hold them
@@ -268,8 +236,6 @@ QJsonObject AgentBridgeServer::handleSegmentationSetSettings(const QJsonValue& p
     }
     if (p.contains("zRange"))
         widget->setCorrectionsZRange(zRange.value("enabled").toBool(), zMin, zMax);
-    if (p.contains("directionFields"))
-        widget->setDirectionFieldConfigs(directionFields);
 
 
     return segmentationSettingsJson();

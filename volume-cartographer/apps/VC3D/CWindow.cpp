@@ -1,7 +1,9 @@
 #include "CWindow.hpp"
+
+#include <vc_reader/array.hpp>
+#include <vc_reader/zarr.hpp>
 #include "VolumeComboTooltip.hpp"
 
-#include <QDateTime>
 #include "FiberLengthDisplay.hpp"
 #include "elements/StatusMessageHistory.hpp"
 #include "VolumeDisplayNames.hpp"
@@ -14,14 +16,9 @@
 #include "SessionRecoveryDialog.hpp"
 
 #include "vc/core/types/Volume.hpp"
-#include "vc/core/render/ChunkCache.hpp"
 #include "vc/core/types/VolumePkg.hpp"
 #include "vc/core/util/Surface.hpp"
 #include "vc/core/util/QuadSurface.hpp"
-#include "vc/core/render/PersistentZarrCacheBudget.hpp"
-#include "vc/core/util/LoadJson.hpp"
-#include "vc/lasagna/Dataset.hpp"
-#include "vc/lasagna/LasagnaNormalSampler.hpp"
 
 #include <iostream>
 
@@ -34,10 +31,9 @@
 #include "OpenDataNormalGrids.hpp"
 #include "viewer_controls/panels/ViewerCompositePanel.hpp"
 #include "viewer_controls/panels/ViewerInkDetectionPanel.hpp"
-#include <QGridLayout>
+#include <QLoggingCategory>
 #include <QAction>
 #include <QVBoxLayout>
-#include <QCursor>
 #include <QEvent>
 #include <QKeyEvent>
 #include <QResizeEvent>
@@ -46,22 +42,16 @@
 #include <QMdiSubWindow>
 #include <QApplication>
 #include <QGuiApplication>
-#include <QBrush>
-#include <QDialog>
-#include <QDialogButtonBox>
 #include <QStyleHints>
 #include <QWindow>
 #include <QScreen>
-#include <QDesktopServices>
 #include <QUrl>
 #include <QClipboard>
 #include <QFileDialog>
 #include <QFileInfo>
 #include <QPointF>
 #include <QMessageBox>
-#include <QtConcurrent/QtConcurrent>
 #include <QComboBox>
-#include <QFutureWatcher>
 #include <QRegularExpression>
 #include <QRegularExpressionValidator>
 #include <QDockWidget>
@@ -75,54 +65,28 @@
 #include <QSize>
 #include <QVector>
 #include <QVector3D>
-#include <QLoggingCategory>
-#include <QDebug>
 #include <QFrame>
-#include <QMouseEvent>
 #include <QScrollArea>
 #include <QSignalBlocker>
-#include <QStandardPaths>
 #include <QMenu>
 #include <QMainWindow>
 #include <QTabBar>
 #include <QTabWidget>
 #include <QTreeWidget>
-#include <QHeaderView>
-#include <QFormLayout>
-#include <QProgressBar>
-#include <QColorDialog>
-#include <QListView>
-#include <QTreeView>
-#include <QPainter>
-#include <QStandardItem>
 #include <QStandardItemModel>
-#include <QStyledItemDelegate>
-#include <QStyleOptionButton>
-#include <QPersistentModelIndex>
-#include <QSet>
 #include <QPushButton>
-#include <QItemSelectionModel>
-#include <QItemSelection>
-#include "utils/Json.hpp"
+#include <nlohmann/json.hpp>
 #include <QPointer>
-#include <QListView>
 #include <algorithm>
 #include <set>
 #include <chrono>
 #include <cmath>
 #include <cstdlib>
-#include <limits>
 #include <optional>
-#include <sstream>
-#include <cctype>
-#include <string_view>
 #include <utility>
 #include <filesystem>
 #include <system_error>
-#include <unordered_map>
 #include <vector>
-#include <opencv2/imgproc.hpp>
-#include <opencv2/imgcodecs.hpp>
 #include <QStringList>
 #include <array>
 
@@ -130,7 +94,6 @@
 #include "viewer_controls/ViewerControlsPanel.hpp"
 #include "viewer_controls/panels/VolumeRegistrationsPanel.hpp"
 #include "volume_viewers/CChunkedVolumeViewer.hpp"
-#include "SettingsDialog.hpp"
 #include "elements/VolumeSelector.hpp"
 #include "elements/ViewerSplitGrid.hpp"
 #include "CPointCollectionWidget.hpp"
@@ -150,12 +113,10 @@
 #include "SurfaceCatalog.hpp"
 #include "overlays/StoreSurfaceOverlayController.hpp"
 #include "SurfacePanelController.hpp"
-#include "elements/DropdownChecklistButton.hpp"
 #include "elements/GrowOnlyLabel.hpp"
 #include "MenuActionController.hpp"
 #include "plugins/PluginController.hpp"
 #include "VolumeAttachmentController.hpp"
-#include "FileWatcherService.hpp"
 #include "AxisAlignedSliceController.hpp"
 #include "SegmentationCommandHandler.hpp"
 #include "LasagnaServiceManager.hpp"
@@ -168,15 +129,9 @@
 #include "vc/core/util/Logging.hpp"
 #include "vc/core/types/Volume.hpp"
 #include "vc/core/types/VolumePkg.hpp"
-#include "vc/core/util/DateTime.hpp"
 #include "vc/core/util/Surface.hpp"
 #include "vc/core/util/QuadSurface.hpp"
 #include "vc/core/util/PlaneSurface.hpp"
-#include "vc/core/util/Slicing.hpp"
-#include "vc/core/util/Tiff.hpp"
-#include "vc/lasagna/Dataset.hpp"
-#include "vc/lasagna/LasagnaNormalSampler.hpp"
-#include <utils/zarr.hpp>
 
 
 
@@ -444,7 +399,8 @@ std::optional<SurfaceFocusPoint> focusPointAtGrid(QuadSurface& surface, int row,
     if (!surface.isQuadValid(row, col)) {
         return std::nullopt;
     }
-    const cv::Vec3f normal = surface.gridNormal(row, col);
+    cv::Vec3f normal;
+    surface.pointAt(float(col), float(row), nullptr, normal.val);
     if (!std::isfinite(normal[0]) || !std::isfinite(normal[1]) || !std::isfinite(normal[2])) {
         return std::nullopt;
     }
@@ -743,9 +699,8 @@ static bool windowStateMetaMatches(const QSettings& settings,
 }
 
 // Constructor
-CWindow::CWindow(size_t cacheSizeGB, bool debugDownloadQueue) :
+CWindow::CWindow(size_t cacheSizeGB) :
     _cmdRunner(nullptr),
-    _debugDownloadQueue(debugDownloadQueue),
     _seedingWidget(nullptr),
     _point_collection_widget(nullptr)
 {
@@ -868,31 +823,18 @@ CWindow::CWindow(size_t cacheSizeGB, bool debugDownloadQueue) :
     }
     // setAttribute(Qt::WA_DeleteOnClose);
 
-    _cacheSizeBytes = cacheSizeGB * 1024ULL * 1024ULL * 1024ULL;
-    std::cout << "chunk cache budget is " << cacheSizeGB << " gigabytes" << std::endl;
+    std::cout << "memory cache budget is " << cacheSizeGB << " gigabytes" << std::endl;
 
-    vc::render::processChunkCacheService()->configureDecodedByteCapacity(
-        _cacheSizeBytes);
-    _state = new CState(this, _debugDownloadQueue);
+    _state = new CState(this, nullptr, cacheSizeGB * 1024ULL * 1024ULL * 1024ULL);
     connect(_state, &CState::vpkgChanged, this, &CWindow::updateProjectNameLabel);
     updateProjectNameLabel();
     connect(_state, &CState::poiChanged, this, &CWindow::onFocusPOIChanged);
     connect(_state, &CState::surfaceWillBeDeleted, this, &CWindow::onSurfaceWillBeDeleted);
 
-    _fileWatcher = std::make_unique<FileWatcherService>(_state, this);
-    connect(_fileWatcher.get(), &FileWatcherService::volumeCatalogChanged,
-            this, [this](const QString& preferredVolumeId) {
-                refreshCurrentVolumePackageUi(preferredVolumeId);
-            });
-
     _axisAlignedSliceController = std::make_unique<AxisAlignedSliceController>(_state, this);
 
     _viewerManager = std::make_unique<ViewerManager>(_state, _state->pointCollection(), this);
     _viewerManager->setSegmentationCursorMirroring(_mirrorCursorToSegmentation);
-    // Let SurfaceCache tile fills serve the flattened view instead of queueing
-    // behind raw-path chunk demand for frames that never sample it, as Spiral
-    // does.
-    _viewerManager->setPreferSurfaceTileFills(true);
     if (_workspaceTabs && _spiralWorkspaceWindow) {
         const int spiralIndex = _workspaceTabs->indexOf(_spiralWorkspaceWindow);
         auto* shell = _spiralWorkspaceWindow;
@@ -1019,7 +961,8 @@ CWindow::CWindow(size_t cacheSizeGB, bool debugDownloadQueue) :
     _sharedCacheStatsLabel = new GrowOnlyLabel(this);
     _sharedCacheStatsLabel->setContentsMargins(8, 0, 8, 0);
     _sharedCacheStatsLabel->setToolTip(
-        tr("Z-scroll sensitivity: use Shift+G / Shift+H to adjust"));
+        tr("Shared RAM cache, downloaded bytes/chunks for this session, and viewers loading volume levels.\n"
+           "Z-scroll sensitivity: use Shift+G / Shift+H to adjust"));
     statusBar()->addPermanentWidget(_sharedCacheStatsLabel);
     updateSharedStatusLabel();
 
@@ -1042,17 +985,27 @@ CWindow::CWindow(size_t cacheSizeGB, bool debugDownloadQueue) :
 
     _persistentCacheSpaceTimer = new QTimer(this);
     _persistentCacheSpaceTimer->setInterval(5000);
+    // The free space of the cache root against VC's floor, every 5 s; whether vc_reader has
+    // actually refused a write is its budget's low_space(), which it decides on each write.
     auto updatePersistentCacheSpace = [this]() {
-        auto budget = vc::render::PersistentZarrCacheBudget::findForPath(
-            vc3d::remoteCachePathFs());
-        if (!budget)
+        std::error_code spaceError;
+        const auto root = vc3d::remoteCachePathFs();
+        const auto space = std::filesystem::space(root, spaceError);
+        if (spaceError)
             return;
-        const auto stats = budget->stats();
-        if (stats.lowSpace) {
-            const double freeGiB = static_cast<double>(stats.freeBytes) /
+        if (space.available < static_cast<std::uintmax_t>(vc::settings::remoteCacheMinFreeBytes())) {
+            const double freeGiB = static_cast<double>(space.available) /
                                    (1024.0 * 1024.0 * 1024.0);
-            const QString text = tr("Low disk space: %1 GiB free. Cache cleanup runs asynchronously; downloads continue and cache writes may fail if the disk fills.")
-                                     .arg(freeGiB, 0, 'f', 1);
+            bool refused = false;
+            try {
+                refused = vcr::zarr::diskBudget(root.string(), std::nullopt)->low_space();
+            } catch (const std::exception&) {
+                // No budget on this root yet: nothing has been refused.
+            }
+            const QString text = tr("Low disk space: %1 GiB free. %2 Nothing already cached was removed.")
+                                     .arg(freeGiB, 0, 'f', 1)
+                                     .arg(refused ? tr("Chunks are no longer being cached; downloads continue without caching.")
+                                                  : tr("Chunks will not be cached while the disk stays below the configured floor."));
             _persistentCacheLowSpaceLabel->setText(QStringLiteral("⚠ ") + text);
             _persistentCacheLowSpaceLabel->show();
             if (!_persistentCacheBannerShownThisSession) {
@@ -1175,17 +1128,6 @@ CWindow::CWindow(size_t cacheSizeGB, bool debugDownloadQueue) :
             [this](const QString& text, int timeout) { showStatusBarMessage(text, timeout); }},
         this);
     _pluginController->installMenu(menuBar());
-    // Wire the Actions -> Merge Surfaces... menu entry to the handler.
-    // Has to happen here (not inside CreateWidgets) because
-    // _menuController is created after CreateWidgets() returns.
-    connect(_menuController.get(), &MenuActionController::mergeSurfacesFromMenuRequested,
-            this, [this]() {
-                _segmentationCommandHandler->onMergeSurfaces(QStringList{});
-            });
-    connect(_menuController.get(), &MenuActionController::mergePatchFromMenuRequested,
-            this, [this]() {
-                _segmentationCommandHandler->onMergePatch(QStringList{});
-            });
     connect(_menuController.get(), &MenuActionController::growTrackPatchesFromMenuRequested,
             this, [this]() {
                 _segmentationCommandHandler->onGrowTrackPatches();
@@ -1577,7 +1519,7 @@ CWindow::CWindow(size_t cacheSizeGB, bool debugDownloadQueue) :
         if (auto* viewer = activeBaseViewer()) {
             viewer->resetSurfaceOffsets();
             viewer->fitSurfaceInView();
-            viewer->renderVisible(true);
+            viewer->renderVisible();
         }
     });
 
@@ -1588,7 +1530,7 @@ CWindow::CWindow(size_t cacheSizeGB, bool debugDownloadQueue) :
     connect(fZoomToFitShortcut, &QShortcut::activated, [this]() {
         VolumeViewerBase* viewer = _viewerManager ? _viewerManager->segmentationViewer() : nullptr;
         if (viewer) {
-            viewer->resetViewForCurrentContent(true);
+            viewer->resetViewForCurrentContent();
         }
     });
 
@@ -1748,9 +1690,6 @@ CWindow::~CWindow()
         qApp->removeEventFilter(this);
     }
 
-    if (_fileWatcher) {
-        _fileWatcher->stopWatching();
-    }
     setStatusBar(nullptr);
 
     if (_lineAnnotationController) {
@@ -2192,8 +2131,6 @@ void CWindow::configureChunkedViewerConnections(CChunkedVolumeViewer* viewer)
                 _seedingWidget, &SeedingWidget::onMouseMove, Qt::UniqueConnection);
         connect(viewer, &CChunkedVolumeViewer::sendMouseReleaseVolume,
                 _seedingWidget, &SeedingWidget::onMouseRelease, Qt::UniqueConnection);
-        connect(viewer, &CChunkedVolumeViewer::sendZSliceChanged,
-                _seedingWidget, &SeedingWidget::updateCurrentZSlice, Qt::UniqueConnection);
         viewer->setProperty("vc_seeding_bound", true);
     }
 
@@ -2739,7 +2676,7 @@ void CWindow::loadLasagnaResults(Surface* surface)
     }
     if (_point_collection_widget) {
         if (corr) {
-            _point_collection_widget->loadCorrPointsResults(utils::Json::parse(corr->dump()));
+            _point_collection_widget->loadCorrPointsResults(*corr);
         } else {
             _point_collection_widget->clearCorrPointsResults();
         }
@@ -2954,17 +2891,6 @@ void CWindow::CreateWidgets(void)
             this, [this](const QString& segmentId) {
                 _segmentationCommandHandler->onConvertToObj(segmentId.toStdString());
             });
-    connect(_surfacePanel.get(), &SurfacePanelController::mergeSurfacesRequested,
-            this, [this](const QStringList& segmentIds) {
-                _segmentationCommandHandler->onMergeSurfaces(segmentIds);
-            });
-    connect(_surfacePanel.get(), &SurfacePanelController::mergePatchRequested,
-            this, [this](const QStringList& segmentIds) {
-                _segmentationCommandHandler->onMergePatch(segmentIds);
-            });
-    // Note: the Actions -> Merge Surfaces... menu wiring lives in the
-    // constructor after _menuController is initialized -- _menuController
-    // is null inside CreateWidgets().
     connect(_surfacePanel.get(), &SurfacePanelController::visLasagnaObjRequested,
             this, [this](const QString& segmentId) {
                 onVisLasagnaObj(segmentId.toStdString());
@@ -3031,18 +2957,6 @@ void CWindow::CreateWidgets(void)
             this, [this](const QString& segmentId) {
                 _segmentationCommandHandler->onSlimFlatten(segmentId.toStdString());
             });
-    connect(_surfacePanel.get(), &SurfacePanelController::straightenRequested,
-            this, [this](const QString& segmentId) {
-                _segmentationCommandHandler->onStraighten(segmentId.toStdString());
-            });
-    connect(_surfacePanel.get(), &SurfacePanelController::rasterizeSegmentsRequested,
-        this, [this](const QStringList& segmentIds) {
-            _segmentationCommandHandler->onRasterizeSegments(segmentIds);
-        });
-    connect(_surfacePanel.get(), &SurfacePanelController::addIgnoreLabelRequested,
-        this, [this]() {
-            _segmentationCommandHandler->onAddIgnoreLabel();
-        });
     connect(_surfacePanel.get(), &SurfacePanelController::statusMessageRequested,
             this, [this](const QString& message, int timeoutMs) {
                 showStatusBarMessage(message, timeoutMs);
@@ -3110,7 +3024,6 @@ void CWindow::CreateWidgets(void)
     _segmentationEdit = std::make_unique<SegmentationEditManager>(this);
     _segmentationEdit->setViewerManager(_viewerManager.get());
     _segmentationOverlay = std::make_unique<SegmentationOverlayController>(_state, this);
-    _segmentationOverlay->setEditManager(_segmentationEdit.get());
     _segmentationOverlay->setViewerManager(_viewerManager.get());
     _surfaceRotationOverlay = std::make_unique<SurfaceRotationOverlayController>(_state, this);
     _surfaceRotationOverlay->setSaver([this](QuadSurface* surface) {
@@ -3699,8 +3612,6 @@ void CWindow::CreateWidgets(void)
         .contents = ui.dockWidgetViewerControlsContents,
         .viewScrollArea = ui.scrollAreaView,
         .viewContents = ui.dockWidgetViewContents,
-        .overlayScrollArea = ui.scrollAreaOverlay,
-        .overlayContents = ui.dockWidgetOverlayContents,
         .normalVisualizationContents = ui.dockWidgetNormalVisContents,
         .showSurfaceNormals = ui.chkShowSurfaceNormals,
         .normalArrowLengthLabel = ui.labelNormalArrowLength,
@@ -4411,7 +4322,7 @@ bool CWindow::OpenVolume(const QString& path,
     QString loadError;
     try {
         vc::project::LoadOptions options;
-        options.catalog = vc3d::opendata::cachedCatalog();
+        options.catalog = vcr::catalog::cachedManifest(vcr::catalog::catalogCacheFile(std::string(vcr::catalog::kDefaultManifestUrl)));
         package = VolumePkg::open(aVpkgPath.toStdString(), options);
     } catch (const std::exception& e) {
         Logger()->error("Failed to open project: {}", e.what());
@@ -4488,9 +4399,6 @@ bool CWindow::OpenVolume(const QString& path,
         _menuController->updateRecentVolpkgList(aVpkgPath);
     }
 
-    if (_fileWatcher) {
-        _fileWatcher->startWatching();
-    }
     return true;
 }
 
@@ -4623,7 +4531,7 @@ std::optional<vcr::catalog::Affine> CWindow::volumeTransformForSwitch(const vc::
         _state->objectStoreSession()->read(*attachment, [&](const auto& db, const auto& txn, const auto&) {
             transforms = db.volumeTransforms(txn);
         });
-    } else if (const auto catalog = vc3d::opendata::cachedCatalog()) {
+    } else if (const auto catalog = vcr::catalog::cachedManifest(vcr::catalog::catalogCacheFile(std::string(vcr::catalog::kDefaultManifestUrl)))) {
         transforms.graph.addCatalog(*catalog);
     }
     return transforms.toVolume(nlohmann::json{{"coordinates", vc::objects::volumeCoordinates(from)}}, to.volume, to.scale);
@@ -4638,7 +4546,36 @@ void CWindow::setVolumeLevel(int level)
         syncVolumeLevelControl();
         return;
     }
+    if (_segmentationModule) {
+        const auto save = _segmentationModule->autosaveStatus();
+        if (save.saveInProgress || save.pending || save.dirtyAfterSave) {
+            if (!save.saveInProgress) _segmentationModule->flushAutosave();
+            statusBar()->showMessage(tr("Finishing the surface save before changing the working level…"), 2000);
+            QTimer::singleShot(100, this, [this, volume, level] {
+                if (_state->currentVolume() == volume && _volumeLevelSpin && _volumeLevelSpin->value() == level)
+                    setVolumeLevel(level);
+            });
+            return;
+        }
+        if (_segmentationModule->hasActiveSession()) _segmentationModule->endEditingSession();
+    }
+    const auto navigation = _viewerManager ? _viewerManager->captureNavigation() : nullptr;
+    const auto oldVoxels = _state->annotationVolume().value_or(
+        vc::project::annotationVolume(_state->vpkg().get(), *volume));
+    std::optional<SurfaceCatalog::Opened> reopened;
+    std::optional<vcr::catalog::Affine> transform;
     try {
+        // Prepare geometry before persisting the new level: a failed surface
+        // read must leave both the project and the current view untouched.
+        auto nextVoxels = vc::objects::VolumeVoxels(oldVoxels);
+        nextVoxels.scale *= std::ldexp(1.0, volume->baseScaleLevel() - level);
+        transform = volumeTransformForSwitch(oldVoxels, nextVoxels);
+        if (_surfacePanel && _surfacePanel->opened() && _state->surface("segmentation")) {
+            const auto& opened = *_surfacePanel->opened();
+            reopened = SurfaceCatalog::open(_state->objectStoreSession(), opened.pin.attachment,
+                                            nextVoxels, opened.surface->id,
+                                            opened.current ? std::nullopt : std::optional(opened.pin.objectRevision));
+        }
         _state->vpkg()->setVolumeLevel(volume->id(), level);
     } catch (const std::exception& error) {
         QMessageBox::warning(this, tr("Working Level"),
@@ -4647,7 +4584,18 @@ void CWindow::setVolumeLevel(int level)
         syncVolumeLevelControl();
         return;
     }
+    // Drop the old-frame draft before changing the frame it is declared in.
+    if (reopened) _state->setSurface("segmentation", nullptr);
     setVolume(_state->vpkg()->volume(volume->id()));
+    if (reopened) {
+        const auto surface = reopened->surface;
+        _surfacePanel->replaceOpenedSurface(std::move(*reopened));
+        _state->setActiveSurface(surface->id, surface);
+        _state->setSurface("segmentation", surface, false, true);
+        if (_segmentationModule) _segmentationModule->onActiveSegmentChanged(surface.get());
+        _axisAlignedSliceController->applyOrientation(surface.get());
+    }
+    if (navigation && transform) _viewerManager->restoreNavigation(navigation, *transform);
     refreshVolumeSelectionUi(QString::fromStdString(volume->id()));
 }
 
@@ -4891,9 +4839,6 @@ void CWindow::refreshVolumeSelectionUi(const QString& preferredVolumeId)
 
 void CWindow::CloseVolume(void)
 {
-    if (_fileWatcher) {
-        _fileWatcher->stopWatching();
-    }
 
 
     // Tear down active segmentation editing before surfaces disappear to avoid

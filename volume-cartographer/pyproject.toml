@@ -13,13 +13,14 @@ readme = "README.md"
 requires-python = ">=3.14"
 dependencies = [
     "numpy",
-    "numcodecs>=0.15.1,<0.17",
-    "vc-delta3d @ git+https://github.com/ScrollPrize/vc-delta3d.git@45339743b450ff707d21fb742dc1b3b2bf99306d",
 ]
 license = { file = "LICENSE" }
 
-[project.entry-points."numcodecs.codecs"]
-vcz1 = "vc.compression.vcz1_numcodecs:Vcz1"
+[dependency-groups]
+test = ["msgpack", "pytest", "vc-reader"]
+
+[tool.uv.sources]
+vc-reader = { path = "../vc_reader", editable = true }
 
 [project.scripts]
 vc_fiberlets = "vc.fiberlets_cli:main"
@@ -44,7 +45,6 @@ cache-keys = [
     { file = "CMakeLists.txt" },
     { file = "cmake/**" },
     { file = "core/**/*.{c,cpp,h,hpp,cu,cuh,in,txt}" },
-    { file = "utils/**/*.{c,cpp,h,hpp,cu,cuh,in,txt}" },
     { file = "libs/**/*.{c,cpp,h,hpp,cu,cuh,in,txt}" },
     { file = "apps/CMakeLists.txt" },
     { file = "apps/src/**" },
@@ -53,4 +53,8 @@ cache-keys = [
     { file = "../vc_object_store/cmake/**" },
     { file = "../vc_object_store/include/**" },
     { file = "../vc_object_store/src/**" },
+    { file = "../vc_reader/CMakeLists.txt" },
+    { file = "../vc_reader/cmake/**" },
+    { file = "../vc_reader/include/**" },
+    { file = "../vc_reader/src/cpp/**" },
 ]

@@ -1,6 +1,6 @@
 #include "agent_bridge/AgentBridgeServer.hpp"
 
-#include "vc/core/render/Colormaps.hpp"
+#include "Colormaps.hpp"
 
 namespace {
 

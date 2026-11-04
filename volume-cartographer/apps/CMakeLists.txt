@@ -54,7 +54,7 @@ add_subdirectory(VC3D)
 #################
 
 add_executable(vc_render_tifxyz src/vc_render_tifxyz.cpp)
-target_link_libraries(vc_render_tifxyz vc_core Boost::program_options TIFF::TIFF)
+target_link_libraries(vc_render_tifxyz vc_core Boost::program_options)
 
 add_executable(vc_objrefine src/ObjAlphaCompRefinement.cpp)
 target_link_libraries(vc_objrefine vc_core)
@@ -68,36 +68,15 @@ target_link_libraries(vc_grow_seg_from_segments vc_core vc_tracer Boost::program
 add_executable(vc_tifxyz2obj src/vc_tifxyz2obj.cpp)
 target_link_libraries(vc_tifxyz2obj vc_core vc_inpaint)
 
-add_executable(vc_tifxyz2zarr_sparse src/vc_tifxyz2zarr_sparse.cpp)
-target_link_libraries(vc_tifxyz2zarr_sparse vc_core Boost::program_options)
-
-add_executable(vc_add_ignore_label src/vc_add_ignore_label.cpp src/alpha_wrap.cpp)
-target_link_libraries(vc_add_ignore_label
-    vc_core
-    Boost::program_options
-    CGAL::CGAL
-    opencv_core
-    opencv_imgproc
-    opencv_imgcodecs
-)
-
 add_executable(vc_obj2tifxyz src/vc_obj2tifxyz.cpp)
 target_link_libraries(vc_obj2tifxyz vc_core)
 
 add_executable(vc_obj2tifxyz_legacy src/vc_obj2tifxyz_legacy.cpp)
 target_link_libraries(vc_obj2tifxyz_legacy vc_core)
 
-add_executable(vc_straighten src/vc_straighten.cpp)
-target_link_libraries(vc_straighten vc_core Boost::program_options opencv_core opencv_imgproc opencv_imgcodecs opencv_flann)
 
-add_executable(vc_tifxyz_gengt src/vc_tifxyz_gengt.cpp)
-target_link_libraries(vc_tifxyz_gengt vc_core Boost::program_options)
 
-add_executable(vc_merge_tifxyz src/vc_merge_tifxyz.cpp src/vc_merge_tifxyz_grid.cpp)
-target_link_libraries(vc_merge_tifxyz vc_core Boost::program_options opencv_imgcodecs opencv_imgproc opencv_flann Eigen3::Eigen)
 
-add_executable(vc_merge_patch src/vc_merge_patch.cpp)
-target_link_libraries(vc_merge_patch vc_core Boost::program_options opencv_imgcodecs opencv_imgproc opencv_flann Eigen3::Eigen)
 
 add_executable(vc_gen_normalgrids src/vc_gen_normalgrids.cpp)
 target_link_libraries(vc_gen_normalgrids vc_core Boost::program_options opencv_core opencv_imgproc OpenMP::OpenMP_CXX)
@@ -111,17 +90,16 @@ add_executable(vc_ngrids src/vc_ngrids.cpp)
 target_link_libraries(vc_ngrids vc_core Boost::program_options opencv_core Ceres::ceres OpenMP::OpenMP_CXX)
 
 add_executable(vc_thinning src/vc_thinning.cpp)
-target_link_libraries(vc_thinning vc_core opencv_ximgproc)
+target_link_libraries(vc_thinning vc_core vc_reader::thinning)
 
 # Stable compile-coverage entry point for CI. Keep every command-line
 # executable here so the CLI shard cannot silently omit a newly added tool.
 set(VC_CLI_TARGETS
     vc_render_tifxyz vc_objrefine vc_grow_seg_from_seed
-    vc_grow_seg_from_segments vc_tifxyz2obj
-    vc_tifxyz2zarr_sparse vc_add_ignore_label vc_obj2tifxyz
-    vc_obj2tifxyz_legacy vc_straighten
+    vc_grow_seg_from_segments vc_tifxyz2obj vc_obj2tifxyz
+    vc_obj2tifxyz_legacy
     vc_fiber_trace_metric vc_cache_root vc_fiber_bake_annotations vc_fiber_constraints
-    vc_tifxyz_gengt vc_merge_tifxyz vc_merge_patch
+
     vc_gen_normalgrids vc_gen_umbilicus vc_ngrids
     vc_thinning)
 if(VC_BUILD_FIBERLETS)
@@ -144,14 +122,13 @@ add_custom_target(vc_cli_all DEPENDS ${VC_CLI_TARGETS})
 if(VC_USE_PCH)
     foreach(_app
         vc_render_tifxyz vc_objrefine vc_grow_seg_from_seed
-        vc_grow_seg_from_segments vc_tifxyz2obj
-        vc_tifxyz2zarr_sparse vc_add_ignore_label vc_obj2tifxyz
+        vc_grow_seg_from_segments vc_tifxyz2obj vc_obj2tifxyz
         vc_obj2tifxyz_legacy
-        vc_fiber_trace_metric vc_tifxyz_gengt
-        vc_merge_tifxyz vc_merge_patch
+        vc_fiber_trace_metric
+
         vc_gen_normalgrids vc_gen_umbilicus vc_ngrids
         vc_thinning
-        vc_straighten
+
     )
         target_precompile_headers(${_app} REUSE_FROM vc_common_pch)
     endforeach()

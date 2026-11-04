@@ -19,7 +19,6 @@
 
 #include "elements/VolumeSelector.hpp"
 #include "AlphaCompRefineRequest.hpp"
-#include "StraightenRequest.hpp"
 #include "CommandLaunchError.hpp"
 // Full definition needed: RenderSegmentParams stores a
 // CommandLineToolRunner::RenderOutputFormat (nested enum) by value.
@@ -115,8 +114,6 @@ public:
                                      // <name>_flatboi (matching the dialog default)
     };
 
-    // Arguments accepted by startStraighten.
-    using StraightenParams = StraightenRequest;
 
     // Inputs shared by the interactive dialog and dialog-free caller. Base
     // tracer params are fixed; paramOverrides merge over them last.
@@ -157,53 +154,6 @@ public:
         int     ompThreads{-1};   // -1 => runner default
     };
 
-    // Arguments accepted by startMergeTifxyz; RANSAC defaults match the dialog.
-    struct MergeTifxyzParams {
-        QVector<QStringList> grid;            // row-major surface UUIDs; "" is a hole
-        QString refSurface;                   // empty => largest valid-cell count
-        QString outputTag{QStringLiteral("paths")};  // tag of the merged surface
-        int     ransacIters{3000};
-        double  ransacMinThresh{5.0};
-        double  ransacMaxThresh{10.0};
-        double  ransacMadK{3.0};
-        int     ransacSeed{0};
-        int     anchorCap{0};
-        int     stripCols{0};
-        int     ompThreads{-1};               // -1 => runner default
-    };
-
-    // Arguments accepted by startMergePatch; defaults match the dialog.
-    struct MergePatchParams {
-        QString parentId;                     // overwritten in place (a new revision)
-        QString childId;
-        bool    explicitRoles{false};         // false => vc_merge_patch picks the
-                                              // parent by valid-cell count
-        int     borderCells{16};
-        int     blendCells{6};
-        int     idwK{4};
-        int     ransacIters{3000};
-        double  ransacMinThresh{5.0};
-        double  ransacMaxThresh{10.0};
-        double  ransacMadK{3.0};
-        int     ransacSeed{0};
-        int     anchorCap{0};
-        int     ompThreads{-1};               // -1 => runner default
-    };
-
-    // Arguments accepted by startRasterizeSegments.
-    struct RasterizeParams {
-        int chunkSize{128};       // isotropic chunk size, 1..4096
-        int zMin{0};              // level-0 Z min, >= 0
-        int zMax{-1};             // level-0 Z max (exclusive); -1 => volume end
-    };
-
-    // Surfaces accepted for rasterization by startRasterizeSegments.
-    struct RasterizeLaunch {
-        QString     outputPath;   // the labels_<timestamp>.zarr the tool publishes
-        QStringList segmentIds;   // surfaces passed to the tool
-        QStringList skippedIds;   // requested surfaces that cannot be rasterized
-    };
-
     /// Grid transforms offered by the surface context menu's Flip and Rotate
     /// entries. The "Normals (H Flip)" entry is FlipV.
     enum class SurfaceTransform { FlipU, FlipV, Rotate90 };
@@ -242,9 +192,9 @@ signals:
     void statusMessage(QString text, int timeout);
 
     /**
-     * Emitted when a flattening job (SLIM or straighten) begins.
+     * Emitted when a flattening job (SLIM) begins.
      * Emitted from both interactive slots and direct start* methods. `kind` is
-     * "flatten.slim" / "flatten.straighten"; `label` is a short
+     * "flatten.slim"; `label` is a short
      * human string.
      */
     void flattenJobStarted(QString kind, QString label);
@@ -260,7 +210,7 @@ signals:
     /**
      * Emitted once when a segment operation whose result the tool runner does
      * not report reaches its terminal state. Emitted for interactive and
-     * dialog-free launches. `kind` names the operation ("rasterize");
+     * dialog-free launches. `kind` names the operation;
      * `outputPath` is the produced artifact on success.
      */
     void segmentOperationFinished(QString kind, bool success, QString message,
@@ -275,17 +225,7 @@ public slots:
     void onRotateSurface(const std::string& segmentId);
     void onAlphaCompRefine(const std::string& segmentId);
     void onSlimFlatten(const std::string& segmentId);
-    void onStraighten(const std::string& segmentId);
-    void onRasterizeSegments(const QStringList& segmentIds);
-    // Open the MergeSurfacesDialog seeded with `segmentIds` (empty = open
-    // dialog with empty grid for the user to populate via "Add segments").
-    void onMergeSurfaces(const QStringList& segmentIds);
-    // Open the MergePatchDialog. When invoked from the surface context
-    // menu we receive exactly two segment IDs; from the top menu the list
-    // is empty and the user picks both via the dialog combos.
-    void onMergePatch(const QStringList& segmentIds);
     void onGrowTrackPatches();
-    void onAddIgnoreLabel();
     void onNeighborCopyRequested(const QString& segmentId, bool copyOut);
     void onResumeLocalGrowPatchRequested(const QString& segmentId);
     void onCreateSegmentGrowPatchFromSeed(const QVector3D& seedPoint);
@@ -325,19 +265,6 @@ public:
                           const SlimFlattenParams& params,
                           CommandLaunchError* error = nullptr,
                           QString* resolvedOutputName = nullptr);
-
-    /// Starts vc_straighten asynchronously with dialogs suppressed. The tool is
-    /// validated before launch; completion uses flattenJobFinished.
-    bool startStraighten(const std::string& segmentId,
-                         const StraightenParams& params,
-                         CommandLaunchError* error = nullptr,
-                         QString* resolvedOutputName = nullptr);
-    // The one straighten launch, from the dialog (interactive) or the bridge.
-    bool startStraightenImpl(const std::string& segmentId,
-                             const StraightenParams& params,
-                             bool interactive,
-                             CommandLaunchError* error,
-                             QString* resolvedOutputName);
 
     /// Dialog-free Resume-opt Local (GrowPatch) launch. The interactive slot
     /// gathers the same ResumeLocalGrowParams and uses the same launch core.
@@ -381,15 +308,6 @@ public:
                            const ConvertToObjParams& params,
                            CommandLaunchError* error = nullptr);
 
-    /// Dialog-free rasterize launch (vc_tifxyz2zarr_sparse). Requested
-    /// surfaces that cannot be rasterized are skipped as in the interactive
-    /// slot; at least one must remain. Completion is reported by
-    /// segmentOperationFinished("rasterize") with the published volume.
-    bool startRasterizeSegments(const QStringList& segmentIds,
-                                const RasterizeParams& params,
-                                CommandLaunchError* error = nullptr,
-                                RasterizeLaunch* launch = nullptr);
-
     /// Dialog-free neighbor copy (one vc_grow_seg_from_seed run that projects
     /// and refines). The interactive slot gathers the same params from its
     /// dialog. Completion is observable via CommandLineToolRunner::toolFinished
@@ -399,20 +317,7 @@ public:
                            const NeighborCopyParams& params,
                            CommandLaunchError* error = nullptr);
 
-    /// Dialog-free vc_merge_tifxyz launch: validates the grid like the dialog
-    /// and starts the tool on a temporary merge.json. Completion is observable
-    /// via CommandLineToolRunner::toolFinished (the merged surface's UUID).
-    bool startMergeTifxyz(const MergeTifxyzParams& params,
-                          CommandLaunchError* error = nullptr);
 
-    /// Dialog-free vc_merge_patch launch. The parent is rewritten in place as
-    /// a new revision. Completion is observable via
-    /// CommandLineToolRunner::toolFinished.
-    bool startMergePatch(const MergePatchParams& params,
-                         CommandLaunchError* error = nullptr);
-
-
-    // Marks a rasterized label volume and records its source surfaces (UUIDs).
 
 private:
     /** Helper: get current volume path from state */
@@ -464,7 +369,6 @@ private:
     QVector<VolumeSelector::VolumeOption> buildVolumeOptionList(
         QString* defaultOut = nullptr);
     // The tool reads volume `volumeId`: a remote one with its locator and auth.
-    void configureCommandRunnerForVolume(const std::string& volumeId);
 
     /**
      * Fixed resume-local tracer params before caller overrides.
@@ -508,22 +412,6 @@ private:
                                const NeighborCopyParams& params,
                                bool interactive,
                                CommandLaunchError* error);
-    bool launchMergeTifxyz(const QString& mergeJsonText,
-                           const StoredSurface& store,
-                           const MergeTifxyzParams& params,
-                           bool interactive,
-                           CommandLaunchError* error);
-    bool launchMergePatch(const StoredSurface& store,
-                          const MergePatchParams& params,
-                          bool interactive,
-                          CommandLaunchError* error);
-    // Interactive launches ask for the parameters when `params` is empty and
-    // present refusals as the menu always has.
-    bool startRasterizeSegmentsImpl(const QStringList& segmentIds,
-                                    const std::optional<RasterizeParams>& params,
-                                    bool interactive,
-                                    CommandLaunchError* error,
-                                    RasterizeLaunch* launch);
 
 
     QWidget* _parentWidget{nullptr};

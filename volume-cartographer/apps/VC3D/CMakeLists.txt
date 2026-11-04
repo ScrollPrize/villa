@@ -1,16 +1,15 @@
 set(CMAKE_AUTORCC ON)
 
-set(CHUNK_CACHE_SIZE_GB "10" CACHE STRING "size of the chunk cache in gigabytes")
-add_definitions(-DCHUNK_CACHE_SIZE_GB=${CHUNK_CACHE_SIZE_GB})
-
 # Qt shim + Qt image helpers formerly in vc_ui; wrap the shim header for MOC.
 qt6_wrap_cpp(vccollection_moc ${CMAKE_SOURCE_DIR}/core/include/vc/ui/VCCollection.hpp)
 
 set(srcs
+    DisplayPalette.cpp
+    Colormaps.cpp
     ${CMAKE_SOURCE_DIR}/core/src/VCCollection.cpp
     ${vccollection_moc}
-    VCAppMain.cpp
     CState.cpp
+    OpenedVolumes.cpp
     CState.hpp
     Keybinds.cpp
     Keybinds.hpp
@@ -68,8 +67,6 @@ set(srcs
     SessionRecovery.hpp
     SessionRecoveryDialog.cpp
     SessionRecoveryDialog.hpp
-    FileWatcherService.cpp
-    FileWatcherService.hpp
     AxisAlignedSliceController.cpp
     AxisAlignedSliceController.hpp
     LineAnnotationFiberDeletion.hpp
@@ -105,14 +102,12 @@ set(srcs
     LineAnnotationGeneratedViews.hpp
     OpenDataCatalogWindow.cpp
     OpenDataCatalogWindow.hpp
-    OpenDataManifest.cpp
+    OpenDataResourceSelection.cpp
     OpenDataLasagna.cpp
     OpenDataLasagna.hpp
-    OpenDataManifest.hpp
+    OpenDataResourceSelection.hpp
     OpenDataSampleProject.cpp
     OpenDataSampleProject.hpp
-    OpenDataVolumePrefill.cpp
-    OpenDataVolumePrefill.hpp
     OpenDataVolumeOrientation.cpp
     OpenDataVolumeOrientation.hpp
     OpenDataNormalGrids.cpp
@@ -149,11 +144,7 @@ set(srcs
     elements/ViewerStatsBar.hpp
     elements/StatusMessageHistory.cpp
     elements/StatusMessageHistory.hpp
-    elements/DownloadQueueStats.cpp
-    elements/DownloadQueueStats.hpp
     elements/GrowOnlyLabel.hpp
-    elements/DownloadQueueDebugOverlay.cpp
-    elements/DownloadQueueDebugOverlay.hpp
     elements/ViewerSplitGrid.cpp
     elements/ViewerSplitGrid.hpp
     SettingsDialog.cpp
@@ -178,8 +169,6 @@ set(srcs
     segmentation/panels/SegmentationCustomParamsPanel.hpp
     segmentation/panels/SegmentationNeuralTracerPanel.cpp
     segmentation/panels/SegmentationNeuralTracerPanel.hpp
-    segmentation/panels/SegmentationDirectionFieldPanel.cpp
-    segmentation/panels/SegmentationDirectionFieldPanel.hpp
     segmentation/panels/SegmentationManualAddPanel.cpp
     segmentation/panels/SegmentationManualAddPanel.hpp
     segmentation/growth/SegmentationGrowth.cpp
@@ -325,8 +314,6 @@ set(srcs
     PointCollectionSync.hpp
     ToolDialogs.cpp
     ToolDialogs.hpp
-    MergeTifxyzInputs.cpp
-    MergeTifxyzInputs.hpp
     ConsoleOutputWidget.cpp
     ConsoleOutputWidget.hpp
     CPointCollectionWidget.cpp
@@ -336,6 +323,8 @@ set(srcs
     elements/COutlinedTextItem.cpp
     volume_viewers/CChunkedVolumeViewer.cpp
     volume_viewers/CChunkedVolumeViewer.hpp
+    volume_viewers/ViewerSampling.cpp
+    volume_viewers/ViewerSampling.hpp
     volume_viewers/CameraGizmoWidget.cpp
     volume_viewers/CameraGizmoWidget.hpp
     volume_viewers/VolumetricCompositor.cpp
@@ -396,7 +385,13 @@ if(VC_ENABLE_TSAN OR VC_ENABLE_LSAN OR VC_ENABLE_UBSAN OR VC_ENABLE_ASAN)
 endif()
 
 
-add_executable(VC3D ${srcs} resources.qrc)
+# Everything but main() is one object library, so the app and the benchmarks
+# (VC_BUILD_BENCHMARKS) link the same compiled viewer and controller code.
+add_library(vc3d_app OBJECT ${srcs} resources.qrc)
+add_executable(VC3D VCAppMain.cpp)
+target_link_libraries(VC3D PRIVATE vc3d_app)
+# Its uic headers (ui_*.h) are included by VCAppMain.cpp and the benchmarks too.
+target_include_directories(vc3d_app PUBLIC ${CMAKE_CURRENT_BINARY_DIR}/vc3d_app_autogen/include)
 
 if(WIN32)
     # GUI subsystem so double-click launch doesn't open a console window.
@@ -405,13 +400,10 @@ if(WIN32)
     target_sources(VC3D PRIVATE VC3D.rc)
 endif()
 
-target_include_directories(VC3D
-    PRIVATE
+target_include_directories(vc3d_app
+    PUBLIC
         ${CMAKE_CURRENT_SOURCE_DIR}
         ${CMAKE_SOURCE_DIR}/core/src
-        ${CMAKE_SOURCE_DIR}/libs/djikstra3d
-        # Header-only CT sheet-normal estimator shared with vc_reader.
-        ${CMAKE_SOURCE_DIR}/../vc_reader/src/cpp
 )
 
 # Avahi for mDNS service discovery (Linux only)
@@ -423,17 +415,17 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
 endif()
 
 if(AVAHI_FOUND)
-    target_compile_definitions(VC3D PRIVATE VC_HAVE_AVAHI=1)
+    target_compile_definitions(vc3d_app PUBLIC VC_HAVE_AVAHI=1)
 else()
-    target_compile_definitions(VC3D PRIVATE VC_HAVE_AVAHI=0)
+    target_compile_definitions(vc3d_app PUBLIC VC_HAVE_AVAHI=0)
 endif()
 
 find_package(mimalloc QUIET)
 if(mimalloc_FOUND)
-    target_compile_definitions(VC3D PRIVATE VC_HAVE_MIMALLOC=1)
+    target_compile_definitions(vc3d_app PUBLIC VC_HAVE_MIMALLOC=1)
 endif()
 
-target_link_libraries(VC3D
+target_link_libraries(vc3d_app PUBLIC
     # mimalloc first so its symbols win malloc/free resolution.
     $<$<BOOL:${mimalloc_FOUND}>:mimalloc>
     vc_core
@@ -451,7 +443,6 @@ target_link_libraries(VC3D
     Qt6::OpenGLWidgets
     opencv_ximgproc
     $<$<BOOL:${AVAHI_FOUND}>:PkgConfig::AVAHI>
-    Blosc::blosc
 )
 
 # Headless Manual Add edge extension along the sheet (no GUI). Qt Core only
@@ -462,9 +453,7 @@ add_executable(vc_extend_edge
     segmentation/tools/AutoExtend.cpp
     segmentation/tools/ManualAddTool.cpp
     segmentation/tools/ThinPlateSpline3d.cpp)
-target_include_directories(vc_extend_edge PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}
-    ${CMAKE_SOURCE_DIR}/../vc_reader/src/cpp)
+target_include_directories(vc_extend_edge PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(vc_extend_edge PRIVATE vc_core Qt6::Core Boost::program_options)
 
 # Build-tree Qt plugin deployment (MSVC/vcpkg). vcpkg copies the Qt DLLs next to
@@ -511,7 +500,7 @@ if(VC_USE_PCH)
     # headers. Qt stays out of vc_core's shared PCH so the Qt-free CLI apps that
     # REUSE_FROM it don't pay to parse Qt. (Can't REUSE_FROM vc_core and add Qt
     # — a target has one PCH — so build VC3D's directly from the same list.)
-    target_precompile_headers(VC3D PRIVATE
+    target_precompile_headers(vc3d_app PRIVATE
         ${VC_PCH_HEADERS}
         "$<$<COMPILE_LANGUAGE:CXX>:<QtCore/QtCore>>"
         "$<$<COMPILE_LANGUAGE:CXX>:<QtWidgets/QtWidgets>>"
@@ -549,5 +538,5 @@ endif()
 if(VC_TESTING)
     set_source_files_properties(LineAnnotationController.cpp SurfacePanelController.cpp VCAppMain.cpp scene3d/Scene3DPanel.cpp PROPERTIES COMPILE_DEFINITIONS VC_TESTING)
     # The in-binary store tests build their fixture volumes with core/test/support.
-    target_include_directories(VC3D PRIVATE ${PROJECT_SOURCE_DIR}/core/test)
+    target_include_directories(vc3d_app PUBLIC ${PROJECT_SOURCE_DIR}/core/test)
 endif()

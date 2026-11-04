@@ -1,11 +1,12 @@
 #include "SegmentationModule.hpp"
 #include "SurfaceStoreEdit.hpp"
 
-#include "../OpenDataManifest.hpp"
+#include "../OpenDataResourceSelection.hpp"
 
 #include "volume_viewers/CChunkedVolumeViewer.hpp"
 #include "volume_viewers/CVolumeViewerView.hpp"
 #include "CState.hpp"
+#include "OpenedVolumes.hpp"
 #include "tools/SegmentationEditManager.hpp"
 #include "SegmentationWidget.hpp"
 #include "SurfaceGridEdit.hpp"
@@ -44,7 +45,7 @@
 #include <utility>
 #include <vector>
 
-#include "utils/Json.hpp"
+#include <nlohmann/json.hpp>
 
 #include "vc/core/util/QuadSurface.hpp"
 #include "vc/core/util/PlaneSurface.hpp"
@@ -192,11 +193,10 @@ SegmentationModule::SegmentationModule(SegmentationWidget* widget,
     }
 
     if (_overlay) {
-        _overlay->setEditManager(_editManager);
         _overlay->setEditingEnabled(_editingEnabled);
     }
 
-    _pushPullTool = std::make_unique<SegmentationPushPullTool>(*this, _editManager, _widget, _state);
+    _pushPullTool = std::make_unique<SegmentationPushPullTool>(*this, _editManager, _state);
     _pushPullTool->setStepMultiplier(initialPushPullStep);
     _pushPullTool->setAlphaConfig(initialAlphaConfig);
 
@@ -1316,8 +1316,8 @@ bool SegmentationModule::applyManualAddTracerPreview(QuadSurface* surface)
     if (!surface->meta.is_null() && surface->meta.is_object() && surface->meta.contains("grid_offset")) {
         const auto& offset = surface->meta["grid_offset"];
         if (offset.is_array() && offset.size() >= 2 && offset[0].is_number() && offset[1].is_number()) {
-            offsetCol = offset[0].get_int();
-            offsetRow = offset[1].get_int();
+            offsetCol = offset[0].get<int>();
+            offsetRow = offset[1].get<int>();
         }
     }
 
@@ -1789,7 +1789,10 @@ bool SegmentationModule::followSheetForManualAdd()
         return false;
     }
     if (!_sheetNormals || _sheetNormalsVolume != volume) {
-        _sheetNormals = std::make_shared<SheetNormalField>(volume);
+        // Working level 0, whose indices are the surface's world coordinates; the
+        // array stays open while the field holds it.
+        auto opened = _state->openedVolumes()->level(*volume, 0).array;
+        _sheetNormals = std::make_shared<SheetNormalField>(std::shared_ptr<vcr::Array>(opened, opened->array.get()));
         _sheetNormalsVolume = volume;
     }
     setSheetWalkRunning(true);
@@ -2330,16 +2333,8 @@ void SegmentationModule::refreshEditedRegion(VolumeViewerBase* editViewer)
 {
     if (!_editManager)
         return;
-    std::optional<cv::Rect> changedCells;
-    if (const auto touched = _editManager->recentTouchedBounds()) {
-        changedCells = cv::Rect(touched->x - 1, touched->y - 1,
-                                touched->width + 2, touched->height + 2);
-    }
     const auto refresh = [&](VolumeViewerBase* viewer) {
-        if (changedCells)
-            viewer->invalidateVisRegion("segmentation", *changedCells);
-        else
-            viewer->invalidateVis();
+        viewer->invalidateVis();
         viewer->requestRender("segmentation edit refresh");
     };
     if (editViewer)
@@ -2546,7 +2541,6 @@ void SegmentationModule::updateHover(VolumeViewerBase* viewer,
             float surfaceDistance = 0.0f;
             if (auto gridIndex = _editManager->worldToGridIndex(targetWorld,
                                                                 &surfaceDistance,
-                                                                SegmentationEditManager::GridSearchResolution::High,
                                                                 false)) {
                 const float maxHoverDistance = std::max(gridStepWorld(), 1.0f) * 100.0f;
                 if (surfaceDistance <= maxHoverDistance) {
@@ -2874,7 +2868,13 @@ std::shared_ptr<SurfaceStoreEdit> SegmentationModule::storeEditFor(QuadSurface* 
     }
     const auto origin = _storePinResolver ? _storePinResolver(surface) : std::nullopt;
     // Saves continue from the edit's own revisions until the surface is reopened.
-    if (_storeEdit && _storeEdit->uuid() == surface->id && (!origin || origin->pin == _storeEdit->origin())) {
+    const auto sameView = [&] {
+        const auto& view = _storeEdit->view();
+        return view && view->volume == origin->view.volume && view->scale == origin->view.scale &&
+               view->mapping == origin->view.mapping;
+    };
+    if (_storeEdit && _storeEdit->uuid() == surface->id &&
+        (!origin || (origin->pin == _storeEdit->origin() && sameView()))) {
         return _storeEdit;
     }
     if (!origin || !_state) {

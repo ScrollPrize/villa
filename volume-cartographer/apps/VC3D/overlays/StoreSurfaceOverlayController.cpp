@@ -73,9 +73,9 @@ StoreSurfaceOverlayController::StoreSurfaceOverlayController(CState* state, View
             refreshCommittedSurfaces();
         }
     });
-    // volumeChanged also repeats for the same volume; only a new one changes the data.
-    connect(_state, &CState::volumeChanged, this, [this](std::shared_ptr<Volume>, const std::string& volume) {
-        if (std::exchange(_volume, volume) != volume) invalidate();
+    // A working-level change keeps the ID but changes every coordinate.
+    connect(_state, &CState::volumeChanged, this, [this](std::shared_ptr<Volume>, const std::string&) {
+        invalidate();
     });
     // Edits update their drafts before announcing the surface; intersect
     // targets and planes are named surfaces.
@@ -155,6 +155,11 @@ void StoreSurfaceOverlayController::invalidate()
         view->targets.clear();
         view->cuts.clear();
         view->planeRuns.clear();
+        view->draftSlab.reset();
+        view->draftRuns.clear();
+        view->draftRevisions.clear();
+        view->drawn.reset();
+        ++view->runsVersion;
         view->dirty = true;
         view->refreshPending = false;
     }
@@ -242,13 +247,9 @@ std::vector<Run> StoreSurfaceOverlayController::draftRuns(const std::vector<std:
     const auto session = _state->objectStoreSession();
     if (uuids.empty() || !session || !_state->currentVolume()) return {};
     auto options = surfaceOptions(uuids);
-    options.kind = "surface";
-    options.volume = _state->currentVolumeId();
-    std::vector<vc::objects::VisibleRun> visible;
     // No attachments: only drafts are read, all in memory.
-    for (auto& region : session->geometryRegion({}, vc3d::store::regionSlice(slab), options))
-        for (auto& run : region.result.runs) visible.push_back(std::move(run));
-    return runsOf(std::move(visible));
+    const vc::objects::VolumeVoxels volume(_state->annotationVolume().value_or(vc::project::AnnotationVolume{}));
+    return runsOf(SurfaceCatalog::region(*session, {}, volume, vc3d::store::regionSlice(slab), options).runs);
 }
 
 bool StoreSurfaceOverlayController::isOverlayEnabledFor(VolumeViewerBase* viewer) const
@@ -451,7 +452,7 @@ StoreSurfaceOverlayController::LineStyle StoreSurfaceOverlayController::lineStyl
         if (segViewer->isCompositeEnabled()) {
             const auto& cs = segViewer->compositeRenderSettings();
             const float step = cs.reverseDirection ? -1.0f : 1.0f;
-            style.volumetric = cs.params.method == "volumetric";
+            style.volumetric = cs.params.volumetric;
             style.offsets = {offset + float(std::max(0, cs.layersFront)) * step,
                              offset - float(std::max(0, cs.layersBehind)) * step};
         } else if (std::abs(offset) > 1e-3f) {

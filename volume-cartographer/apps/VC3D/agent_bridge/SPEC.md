@@ -228,7 +228,7 @@ per source is tracked:
 | `growth` | segmentation growth lifecycle |
 | `lasagna` | Lasagna optimization lifecycle |
 | `catalog` | Open Data sample open lifecycle |
-| `flatten` | SLIM and straighten lifecycle |
+| `flatten` | SLIM lifecycle |
 | `seeding` | bridge-started run or expand batch |
 | `autosave` | explicit dirty-segment save |
 
@@ -565,7 +565,7 @@ surface's store UUID. Methods on segments need an open project and volume (-3200
   through `SegmentationModule`'s setters, which the mouse-wheel shortcuts use
   and which update and save the panel; the other values go through
   `SegmentationWidget`'s panels, which clamp, save and signal the module.
-  Updates check the growth volume, direction fields and Z range before
+  Updates check the growth volume and Z range before
   changing anything, and apply the growth volume
   first, since the panel may not offer a volume the project has (-32007).
   `zRange` is always `{enabled, min, max}`; a bound left out keeps its value.
@@ -601,7 +601,7 @@ and never open file pickers.
   are synchronous requests over the existing widget state.
 - `render.tifxyz`, trace, reoptimize, and alpha-composition refinement use the
   shared `tool` source.
-- SLIM and straighten share the `flatten` source and application
+- SLIM uses the `flatten` source and application
   lifecycle.
 - Crop and area recalculation are synchronous.
 - Result paths are returned only after successful launch or completion.
@@ -624,24 +624,9 @@ state first.
   job that writes into the surface's artifact folder. `objName` is a file name
   ending in `.obj`, without folders. The job's terminal `outputPath` is the
   OBJ file.
-- `segment.rasterize` runs `vc_tifxyz2zarr_sparse` over one or more segments
-  as a `tool` job. Ids without tifxyz meshes are skipped and reported as
-  `skippedIds`; at least one must remain. The tool publishes the labels zarr
-  as a volume of the project's store, and the job ends after the surface and
-  volume lists are refreshed. Defaults are the dialog's code defaults, not the
-  person's last dialog values.
 - `segment.neighbor_copy` runs one `vc_grow_seg_from_seed` neighbor run, with
   its local refinement, as a `tool` job. The new surface is tagged with
   `outputTag` (default `paths`). `job.cancel` stops it.
-- `segments.merge` lays segments out in a `grid` (null for a hole), or takes at
-  least two `segmentIds` as one row, and runs `vc_merge_tifxyz` on their ids
-  as a `tool` job. Grid rules (two distinct ids, no whitespace, a reference
-  inside the grid, RANSAC min below max) are -32602; unknown ids are -32007.
-  The merged surface is a new surface tagged with `outputTag` (default
-  `paths`).
-- `segments.patch` runs `vc_merge_patch` on exactly two segments as a `tool`
-  job and requires `confirm: true`. The patched grid is saved as a new
-  revision of the parent.
 
 ## MCP behavior
 
@@ -730,12 +715,11 @@ is the sole bridge method without an MCP tool; `vc3d_wait_job` and
 | `vc3d_fiber_set_follow` | `fiber.set_follow` |
 | `vc3d_fiber_set_tag` | `fiber.set_tag` |
 | `vc3d_flatten_slim` | `flatten.slim` |
-| `vc3d_flatten_straighten` | `flatten.straighten` |
 | `vc3d_get_cursor_point` | `canvas.get_cursor_volume_point` | Resolve a viewer scene position (or the current cursor) to a 3D volume point + surface normal. |
 | `vc3d_get_ink_overlay` | `viewer.get_ink_overlay` | Read the ink detection overlay: available detections for the active segment, selection, opacity, colormap, flips. |
 | `vc3d_get_overlay` | `viewer.get_overlay` | Read the active workspace's overlay-volume settings, shared with the GUI controls. |
 | `vc3d_get_render_settings` | `viewer.get_render_settings` | Read the shared viewer render/overlay settings (intersection lines, overlay opacity, surface normals, highlighted surfaces). |
-| `vc3d_get_segmentation_settings` | `segmentation.get_settings` | Read the Segmentation panel settings: brushes, smoothing, growth options, direction fields. |
+| `vc3d_get_segmentation_settings` | `segmentation.get_settings` | Read the Segmentation panel settings: brushes, smoothing, growth options. |
 | `vc3d_get_state` | `state.get` | Snapshot of VC3D: open project and its stores, current volume, active segment, viewers (ids/names, workspace, visibility), workspaces, editing mode, running job, revision. Call this first. |
 | `vc3d_grow_surface_from_seed` | `segmentation.grow_surface_from_seed` | Create a new surface by growing it from a 3D seed point (headless GrowPatch). Async: returns a jobId; the new surface's UUID is the finished job's output. |
 | `vc3d_grow_segment` | `segmentation.grow` | Grow the active segmentation surface (method: tracer/corrections; direction; steps). Async: returns a jobId. |
@@ -762,16 +746,13 @@ is the sole bridge method without an MCP tool; `vc3d_wait_job` and
 | `vc3d_manual_add_set_interpolation` | `segmentation.manual_add.set_interpolation` |
 | `vc3d_manual_add_set_line_mode` | `segmentation.manual_add.set_line_mode` |
 | `vc3d_manual_add_undo_constraint` | `segmentation.manual_add.undo_constraint` |
-| `vc3d_merge_segments` | `segments.merge` | Merge segments laid out in a grid into a new segment (`tool` job ending with the merged folder). |
 | `vc3d_neighbor_copy_segment` | `segment.neighbor_copy` | Grow the neighboring sheet from a segment as a new surface (one `tool` job; cancellable). |
 | `vc3d_open_catalog_sample` | `catalog.open_sample` | Open a sample returned by `vc3d_list_catalog_samples`, using its manifest sample id. |
 | `vc3d_open_volume` | `volume.open` | Open a project (.vcproj) and optionally select a volume id. |
-| `vc3d_patch_segment` | `segments.patch` | Patch one segment into another, saving the result as a new revision of the parent (`confirm` required; `tool` job). |
 | `vc3d_ping` | `ping` | Check the VC3D bridge is alive; returns pid, app version, and protocol version. |
 | `vc3d_push_pull_set_config` | `segmentation.push_pull.set_config` |
 | `vc3d_push_pull_start` | `segmentation.push_pull.start` |
 | `vc3d_push_pull_stop` | `segmentation.push_pull.stop` |
-| `vc3d_rasterize_segments` | `segment.rasterize` | Rasterize segments into a labels zarr that the tool publishes as a volume of the project's store (`tool` job). |
 | `vc3d_refine_segment_alpha_comp` | `segment.refine_alpha_comp` | Alpha-composite refinement of a segment. Asynchronous (`source:"tool"`); rejects remote volumes; supports `wait: bool = false` (30-minute cap). |
 | `vc3d_remove_point_collection_tag` | `points.remove_collection_tag` |
 | `vc3d_remove_point` | `points.remove_point` |

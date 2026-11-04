@@ -1,4 +1,6 @@
 #include "agent_bridge/AgentBridgeServer.hpp"
+
+#include "viewer_controls/panels/ViewerCompositePanel.hpp"
 #include "agent_bridge/AgentBridgeInternal.hpp"
 
 #include <QCheckBox>
@@ -81,7 +83,7 @@ QJsonObject overlaySettingsJson(
     composite["layersFront"] = state.composite.layersFront;
     composite["layersBehind"] = state.composite.layersBehind;
     o["composite"] = composite;
-    o["interpolation"] = state.samplingMethod == vc::Sampling::Trilinear
+    o["interpolation"] = state.samplingMethod == 1
         ? QStringLiteral("trilinear") : QStringLiteral("nearest");
     return o;
 }
@@ -159,9 +161,8 @@ QJsonObject AgentBridgeServer::handleViewerSetOverlay(const QJsonValue& params)
     }
 
     const bool hasInterpolation = p.contains("interpolation");
-    const vc::Sampling interpolation =
-        p.value("interpolation").toString() == QLatin1String("trilinear")
-            ? vc::Sampling::Trilinear : vc::Sampling::Nearest;
+    const int interpolation =
+        p.value("interpolation").toString() == QLatin1String("trilinear") ? 1 : 0;
 
     VolumeOverlayController::Update update;
     if (clearVolume)

@@ -361,11 +361,10 @@ private:
     QJsonObject handlePushPullStop(const QJsonValue& params);
     QJsonObject handleTracerRunTrace(const QJsonValue& params);
     QJsonObject handleRenderTifxyz(const QJsonValue& params);
-    // Flattening RPCs: SLIM/flatboi, straighten. Each drives a
+    // Flattening RPCs: SLIM/flatboi. Drives a
     // headless SegmentationCommandHandler::start* launcher (dialogs suppressed)
     // and tracks the result as a source:"flatten" job.
     QJsonObject handleFlattenSlim(const QJsonValue& params);
-    QJsonObject handleFlattenStraighten(const QJsonValue& params);
     // Shared body for the three flatten handlers.
     QJsonObject launchFlattenJob(
         const QString& kind, const QString& label, const QString& segmentId,
@@ -386,10 +385,7 @@ private:
     // empty) or a "tool" job runs.
     void requireSegmentFilesIdle(const QString& segmentId, const QString& operation) const;
     QJsonObject handleSegmentExportObj(const QJsonValue& params);
-    QJsonObject handleSegmentRasterize(const QJsonValue& params);
     QJsonObject handleSegmentNeighborCopy(const QJsonValue& params);
-    QJsonObject handleSegmentsMerge(const QJsonValue& params);
-    QJsonObject handleSegmentsPatch(const QJsonValue& params);
 
     // Registers a "tool" job for a launch that `launch` performs (reporting
     // the job's output path) and, when `closingOperation` is non-empty, keeps

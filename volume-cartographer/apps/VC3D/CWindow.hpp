@@ -31,7 +31,7 @@
 #include "CFiberWidget.hpp"
 #include "CState.hpp"
 
-#include "OpenDataManifest.hpp"
+#include "OpenDataResourceSelection.hpp"
 #include "segmentation/tools/SegmentationEditManager.hpp"
 #include "overlays/SegmentationOverlayController.hpp"
 #include "overlays/PointsOverlayController.hpp"
@@ -81,7 +81,6 @@ class QSpinBox;
 class QStandardItemModel;
 class QTabWidget;
 class QFrame;
-class FileWatcherService;
 class AxisAlignedSliceController;
 class SegmentationCommandHandler;
 class LineAnnotationController;
@@ -131,8 +130,7 @@ public:
         VolumeNotFound,
     };
 
-    explicit CWindow(size_t cacheSizeGB = CHUNK_CACHE_SIZE_GB,
-                     bool debugDownloadQueue = false);
+    explicit CWindow(size_t cacheSizeGB);
     ~CWindow(void);
 
     bool openVolumePackage(const QString& path,
@@ -343,7 +341,6 @@ private:
 
     bool can_change_volume_();
 
-    size_t _cacheSizeBytes = 0;
 
     std::unique_ptr<VolumeOverlayController> _volumeOverlay;
     std::unique_ptr<ViewerManager> _viewerManager;
@@ -374,11 +371,9 @@ private:
     PluginController* _pluginController{nullptr};
     // runner for command line tools
     CommandLineToolRunner* _cmdRunner;
-    bool _debugDownloadQueue{false};
     bool _normalGridAvailable{false};
     QString _normalGridPath;
 
-    std::unique_ptr<FileWatcherService> _fileWatcher;
     std::unique_ptr<AxisAlignedSliceController> _axisAlignedSliceController;
     std::unique_ptr<SegmentationCommandHandler> _segmentationCommandHandler;
     std::unique_ptr<LineAnnotationController> _lineAnnotationController;

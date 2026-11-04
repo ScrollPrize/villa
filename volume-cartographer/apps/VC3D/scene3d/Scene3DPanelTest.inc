@@ -3,7 +3,8 @@
 #include "volume_viewers/VolumeViewerBase.hpp"
 #include "vc/core/util/PlaneSurface.hpp"
 #include "vc/core/util/QuadSurface.hpp"
-#include "support/TestZarrVolume.hpp"
+#include "OpenedVolumes.hpp"
+#include "test/support/TestVolume.hpp"
 #include <QApplication>
 #include <QElapsedTimer>
 #include <QTemporaryDir>
@@ -37,21 +38,21 @@ int runScene3DPanelTests()
         const auto surfacePath = qEnvironmentVariable("VC3D_SCENE3D_SURFACE");
         const bool render = !qEnvironmentVariableIsEmpty("VC3D_SCENE3D_SCREENSHOT");
         if (volumePath.isEmpty()) testVolumePreview(temporary.path().toStdString());
-        vc::test::ZarrVolumeSpec spec;
+        vc3d::test::VolumeSpec spec;
         spec.shapeZYX = {32,32,32}; spec.chunkShapeZYX = {32,32,32};
         spec.numLevels = 4;
         auto volume = volumePath.isEmpty()
-            ? vc::test::createZarrVolume(std::filesystem::path(temporary.path().toStdString()) / "ct.zarr", spec)
+            ? vc3d::test::createVolume(std::filesystem::path(temporary.path().toStdString()) / "ct.zarr", spec)
             : Volume::New(volumePath.toStdString());
         if (qEnvironmentVariableIsSet("VC3D_SCENE3D_BENCHMARK")) {
             require(!volumePath.isEmpty(), "benchmark requires VC3D_SCENE3D_VOLUME");
             const int mib = qEnvironmentVariableIntValue("VC3D_SCENE3D_BENCHMARK_MIB");
             const size_t budget = size_t(mib > 0 ? mib : 512)*1024*1024;
             for (int iteration=0; iteration<3; ++iteration) {
-                volume->invalidateCache();
+                OpenedVolumes opened(budget);
                 std::atomic_bool stop{false};
                 QElapsedTimer elapsed; elapsed.start();
-                auto data=sampleVolume(*volume,3,budget,stop);
+                auto data=sampleVolume(opened,*volume,3,budget,stop);
                 require(data && !data->images.empty(), "benchmark volume is empty");
                 const auto& slab=*data->images.front()->slab;
                 std::cout << "iteration=" << iteration+1 << " elapsed_ms=" << elapsed.elapsed()
@@ -61,18 +62,21 @@ int runScene3DPanelTests()
             return 0;
         }
         if (volumePath.isEmpty()) {
-            Array3D<uint8_t> ramp({32,32,32});
+            vc3d::test::Grid<uint8_t> ramp({32,32,32});
             for (int z=0; z<32; ++z)
                 for (int y=0; y<32; ++y)
                     for (int x=0; x<32; ++x) ramp(z,y,x) = uint8_t(3*x + 3*y + z);
-            vc::test::writeZYX(*volume, ramp, {0,0,0});
+            vc3d::test::writeZYX(*volume, ramp, {0,0,0});
             // Distinguish the selected source level from a fine-level sample
             // at the same coordinates, rather than just inspecting metadata.
-            Array3D<uint8_t> coarse({4,4,4}, uint8_t(190));
-            vc::test::writeZYX(*volume, coarse, {0,0,0}, 3);
+            vc3d::test::Grid<uint8_t> coarse({4,4,4}, uint8_t(190));
+            vc3d::test::writeZYX(*volume, coarse, {0,0,0}, 3);
+            // Chunks a level has not stored read as its fill value, so every level holds data.
+            vc3d::test::writeZYX(*volume, vc3d::test::Grid<uint8_t>({16,16,16}, uint8_t(170)), {0,0,0}, 1);
+            vc3d::test::writeZYX(*volume, vc3d::test::Grid<uint8_t>({8,8,8}, uint8_t(180)), {0,0,0}, 2);
             auto oneLevelSpec = spec;
             oneLevelSpec.numLevels = 1;
-            auto singleLevel = vc::test::createZarrVolume(std::filesystem::path(temporary.path().toStdString()) / "single.zarr", oneLevelSpec);
+            auto singleLevel = vc3d::test::createVolume(std::filesystem::path(temporary.path().toStdString()) / "single.zarr", oneLevelSpec);
             CState fallbackState;
             fallbackState.setCurrentVolume(singleLevel);
             ViewerManager fallbackViews(&fallbackState, fallbackState.pointCollection());
@@ -112,7 +116,7 @@ int runScene3DPanelTests()
             state.setSurface(names[i], std::make_shared<PlaneSurface>(center, normals[i]));
             auto* view = viewers.createViewerInWidget(names[i], &ctHost);
             auto settings = view->compositeRenderSettings();
-            settings.params.method = "max";
+            setCompositeMethod(settings.params, "max");
             settings.planeLayersFront = 3;
             settings.planeLayersBehind = 2;
             view->setCompositeRenderSettings(settings);
@@ -164,10 +168,10 @@ int runScene3DPanelTests()
             auto masked = points.clone();
             masked(0,0) = {-1,-1,-1};
             std::atomic_bool stop{false};
-            const auto maskedTexture = surface::sampleTexture(masked, {1,1}, *volume, stop, 0);
+            const auto maskedTexture = surface::sampleTexture(masked, {1,1}, *state.openedVolumes(), *volume, stop, 0);
             require(maskedTexture->pixels[1] == 0 && maskedTexture->pixels.back() == 255, "texture respects invalid surface cells");
             stop.store(true);
-            require(!surface::sampleTexture(points, {1,1}, *volume, stop, 0), "texture sampling can be cancelled");
+            require(!surface::sampleTexture(points, {1,1}, *state.openedVolumes(), *volume, stop, 0), "texture sampling can be cancelled");
         }
         auto* texture = panel.findChild<QCheckBox*>("scene3DSurfaceTexture");
         require(texture && texture->isChecked(), "CT texture is enabled by default");

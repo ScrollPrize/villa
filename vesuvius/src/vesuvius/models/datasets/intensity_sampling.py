@@ -42,7 +42,7 @@ def sample_from_zarr_with_progress(zarr_array, num_samples, vol_idx):
     
     Parameters
     ----------
-    zarr_array : zarr.Array
+    zarr_array : ZarrReader
         The zarr array to sample from
     num_samples : int
         Number of samples to collect

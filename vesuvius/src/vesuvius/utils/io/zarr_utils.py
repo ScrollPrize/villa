@@ -1,78 +1,17 @@
-from pathlib import Path
-import zarr
-import json
+import math
 import os
-import fsspec
 import time
 
-def _is_ome_zarr(zarr_path):
-    """
-    Check if a zarr directory has multi-resolution pyramid structure.
+from vc_reader.reader import ObjectStore
 
-    Detects:
-    - Standard OME-Zarr with .zattrs multiscales metadata
-    - Pyramid zarrs with numbered subdirectories (0, 1, 2, etc.) even without .zattrs
-    """
-    zarr_path = Path(zarr_path)
 
-    # Check for numbered subdirectories (0, 1, etc.)
-    has_level_0 = (zarr_path / '0').exists()
-    if not has_level_0:
-        return False
+_ZARR_RUN_MARKER = ".vesuvius-run-id"
 
-    # If level 0 exists, check if it contains array data (not just another group)
-    level_0_path = zarr_path / '0'
-    has_zarray = (level_0_path / '.zarray').exists()
-    if not has_zarray:
-        return False
 
-    # At this point we have numbered directories with array data - treat as multi-resolution
-    # Optionally verify .zattrs contains multiscales metadata (but not required)
-    zattrs_path = zarr_path / '.zattrs'
-    if zattrs_path.exists():
-        try:
-            with open(zattrs_path, 'r') as f:
-                attrs = json.load(f)
-                if 'multiscales' in attrs:
-                    return True
-        except Exception:
-            pass
+def mark_zarr_ready(zarr_path, run_id):
+    """Publish this run only after array creation completes; object replacement is atomic."""
+    ObjectStore(zarr_path).write(_ZARR_RUN_MARKER, run_id)
 
-    # Even without .zattrs, if we have level 0 with array data, treat as multi-resolution
-    return True
-
-def _get_zarr_path(zarr_dir, resolution_level=None):
-    """
-    Get the appropriate path for opening a zarr array.
-    
-    For OME-Zarr files, appends the resolution level to the path.
-    For regular zarr files, returns the path as-is.
-    
-    Args:
-        zarr_dir: Path to the zarr directory
-        resolution_level: Resolution level to use (default: 0 for OME-Zarr, None for regular zarr)
-    
-    Returns:
-        str: Path to use for zarr.open()
-    """
-    zarr_dir = Path(zarr_dir)
-    
-    if _is_ome_zarr(zarr_dir):
-        # Use resolution level 0 by default for OME-Zarr
-        if resolution_level is None:
-            resolution_level = 0
-        
-        zarr_path = zarr_dir / str(resolution_level)
-        
-        # Verify the resolution level exists
-        if not zarr_path.exists():
-            available_levels = [d.name for d in zarr_dir.iterdir() if d.is_dir() and d.name.isdigit()]
-            raise ValueError(f"Resolution level {resolution_level} not found in {zarr_dir}. Available levels: {sorted(available_levels)}")
-        
-        return str(zarr_path)
-    else:
-        # Regular zarr file
-        return str(zarr_dir)
 
 def zarr_array_exists(zarr_path):
     """
@@ -104,9 +43,9 @@ def zarr_array_exists(zarr_path):
     # credentials must still be able to answer this. Try the configured
     # credentials first, then fall back to anonymous access.
     last_error = None
-    for anon in (False, True):
+    for auth in ("aws", None):
         try:
-            return fsspec.filesystem('s3', anon=anon).exists(marker)
+            return ObjectStore(zarr_path, auth=auth).exists('.zarray')
         except Exception as exc:
             last_error = exc
 
@@ -120,7 +59,8 @@ def zarr_array_exists(zarr_path):
     ) from last_error
 
 
-def wait_for_zarr_creation(zarr_path, max_wait_time=300, sleep_interval=5, verbose=True, part_id=None):
+def wait_for_zarr_creation(zarr_path, max_wait_time=300, sleep_interval=5, verbose=True, part_id=None,
+                           run_id=None):
     """
     Wait for a zarr array to be created by another process.
 
@@ -130,21 +70,32 @@ def wait_for_zarr_creation(zarr_path, max_wait_time=300, sleep_interval=5, verbo
         sleep_interval: Time to sleep between checks in seconds (default: 5)
         verbose: Whether to print progress messages
         part_id: Optional part ID for logging purposes
+        run_id: When set, wait for mark_zarr_ready() to publish this exact run, not an old array.
 
     Raises:
         RuntimeError: If timeout is reached without array being created
     """
-    wait_time = 0
+    if not math.isfinite(max_wait_time) or max_wait_time <= 0:
+        raise ValueError("max_wait_time must be finite and positive.")
+    if not math.isfinite(sleep_interval) or sleep_interval <= 0:
+        raise ValueError("sleep_interval must be finite and positive.")
+    start = time.monotonic()
     part_str = f"Part {part_id} " if part_id is not None else ""
+    store = ObjectStore(zarr_path) if run_id is not None else None
+    expected_run = run_id.encode() if run_id is not None else None
+    description = f"run {run_id!r} at {zarr_path}" if run_id is not None else f"array at {zarr_path}"
 
-    while not zarr_array_exists(zarr_path):
-        if wait_time >= max_wait_time:
-            raise RuntimeError(f"Timeout waiting for zarr array to be created. Waited {max_wait_time} seconds.")
-
+    while True:
+        ready = (store.read(_ZARR_RUN_MARKER) == expected_run if store is not None
+                 else zarr_array_exists(zarr_path))
+        if ready:
+            break
+        elapsed = time.monotonic() - start
+        if elapsed >= max_wait_time:
+            raise RuntimeError(f"Timeout waiting for {description}. Waited {max_wait_time} seconds.")
         if verbose:
-            print(f"  {part_str}waiting for array to be created... ({wait_time}s elapsed)")
-        time.sleep(sleep_interval)
-        wait_time += sleep_interval
+            print(f"  {part_str}waiting for {description}... ({elapsed:.0f}s elapsed)")
+        time.sleep(min(sleep_interval, max_wait_time - elapsed))
 
     if verbose:
-        print(f"Array found! {part_str}can now proceed.")
+        print(f"Ready: {description}. {part_str}can now proceed.")

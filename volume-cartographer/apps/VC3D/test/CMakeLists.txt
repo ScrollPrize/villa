@@ -30,20 +30,10 @@ set_tests_properties(volume_path_labels PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=
 vc_register_test_target(test_volume_path_labels)
 vc_register_ctest(volume_path_labels test_volume_path_labels)
 
-add_executable(test_surface_render_policy test_surface_render_policy.cpp)
-set_target_properties(test_surface_render_policy PROPERTIES
-    AUTOMOC ON AUTOUIC OFF AUTORCC OFF)
-target_include_directories(test_surface_render_policy PRIVATE
-    ${PROJECT_SOURCE_DIR}/apps/VC3D)
-target_link_libraries(test_surface_render_policy PRIVATE Qt6::Core Qt6::Test)
-add_test(NAME surface_render_policy COMMAND test_surface_render_policy)
-vc_register_test_target(test_surface_render_policy)
-vc_register_ctest(surface_render_policy test_surface_render_policy)
-
 add_executable(test_catalog_project_dialog
     test_catalog_project_dialog.cpp
     ../OpenDataCatalogWindow.cpp
-    ../OpenDataManifest.cpp
+    ../OpenDataResourceSelection.cpp
     ../OpenDataSampleProject.cpp
     ../OpenDataLasagna.cpp
     ../OpenDataNormalGrids.cpp)
@@ -154,7 +144,7 @@ set_target_properties(test_unified_browser_dialog PROPERTIES
     AUTOMOC ON AUTOUIC OFF AUTORCC OFF)
 
 target_include_directories(test_unified_browser_dialog PRIVATE
-    ${PROJECT_SOURCE_DIR}/apps/VC3D)
+    ${PROJECT_SOURCE_DIR}/apps/VC3D ${PROJECT_SOURCE_DIR}/core/test)
 
 target_link_libraries(test_unified_browser_dialog PRIVATE
     vc_core
@@ -349,47 +339,6 @@ add_test(NAME spiral_preview_provenance COMMAND test_spiral_preview_provenance)
 vc_register_test_target(test_spiral_preview_provenance)
 vc_register_ctest(spiral_preview_provenance test_spiral_preview_provenance)
 
-add_executable(test_download_queue_stats
-    test_download_queue_stats.cpp
-    ${PROJECT_SOURCE_DIR}/apps/VC3D/elements/DownloadQueueStats.cpp)
-
-set_target_properties(test_download_queue_stats PROPERTIES
-    AUTOMOC ON AUTOUIC OFF AUTORCC OFF)
-
-target_include_directories(test_download_queue_stats PRIVATE
-    ${PROJECT_SOURCE_DIR}/apps/VC3D)
-
-target_link_libraries(test_download_queue_stats PRIVATE
-    vc_core
-    Qt6::Core
-    Qt6::Test)
-
-add_test(NAME download_queue_stats COMMAND test_download_queue_stats)
-vc_register_test_target(test_download_queue_stats)
-vc_register_ctest(download_queue_stats test_download_queue_stats)
-
-add_executable(test_download_queue_debug
-    test_download_queue_debug.cpp
-    ${PROJECT_SOURCE_DIR}/apps/VC3D/elements/DownloadQueueDebugOverlay.cpp)
-
-set_target_properties(test_download_queue_debug PROPERTIES
-    AUTOMOC ON AUTOUIC OFF AUTORCC OFF)
-
-target_include_directories(test_download_queue_debug PRIVATE
-    ${PROJECT_SOURCE_DIR}/apps/VC3D)
-
-target_link_libraries(test_download_queue_debug PRIVATE
-    vc_core
-    Qt6::Core
-    Qt6::Gui
-    Qt6::Test)
-
-add_test(NAME download_queue_debug COMMAND test_download_queue_debug)
-vc_register_test_target(test_download_queue_debug)
-vc_register_ctest(download_queue_debug test_download_queue_debug)
-set_tests_properties(download_queue_debug PROPERTIES
-    ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
-
 add_executable(test_seeding_batch_tracker
     test_seeding_batch_tracker.cpp
     ${PROJECT_SOURCE_DIR}/apps/VC3D/SeedingBatchTracker.cpp)
@@ -502,8 +451,8 @@ add_executable(test_open_data_volume_orientation
     test_open_data_volume_orientation.cpp
     ${PROJECT_SOURCE_DIR}/apps/VC3D/OpenDataVolumeOrientation.cpp
     ${PROJECT_SOURCE_DIR}/apps/VC3D/OpenDataVolumeOrientation.hpp
-    ${PROJECT_SOURCE_DIR}/apps/VC3D/OpenDataManifest.cpp
-    ${PROJECT_SOURCE_DIR}/apps/VC3D/OpenDataManifest.hpp)
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/OpenDataResourceSelection.cpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/OpenDataResourceSelection.hpp)
 
 set_target_properties(test_open_data_volume_orientation PROPERTIES
     AUTOMOC ON AUTOUIC OFF AUTORCC OFF)
@@ -766,16 +715,6 @@ vc_register_test_target(test_spiral_brush_patch)
 vc_register_ctest(spiral_brush_patch test_spiral_brush_patch)
 set_tests_properties(spiral_brush_patch PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
 
-add_executable(test_merge_tifxyz_inputs
-    test_merge_tifxyz_inputs.cpp
-    ../MergeTifxyzInputs.cpp ../MergeTifxyzInputs.hpp)
-set_target_properties(test_merge_tifxyz_inputs PROPERTIES AUTOMOC ON AUTOUIC OFF AUTORCC OFF)
-target_include_directories(test_merge_tifxyz_inputs PRIVATE ${PROJECT_SOURCE_DIR}/apps/VC3D)
-target_link_libraries(test_merge_tifxyz_inputs PRIVATE Qt6::Core Qt6::Test)
-add_test(NAME merge_tifxyz_inputs COMMAND test_merge_tifxyz_inputs)
-vc_register_test_target(test_merge_tifxyz_inputs)
-vc_register_ctest(merge_tifxyz_inputs test_merge_tifxyz_inputs)
-
 # Exercise the production controller publication paths after Qt/state cleanup.
 # The VC3D app target only exists with VC_BUILD_APPS; CI runs these tests from
 # the VC3D compile-and-smoke job.
@@ -792,12 +731,17 @@ if(TARGET VC3D)
     set_tests_properties(surface_panel_store PROPERTIES
         ENVIRONMENT "QT_QPA_PLATFORM=offscreen" TIMEOUT 90)
     vc_register_ctest(surface_panel_store VC3D)
+    add_test(NAME viewer_regressions COMMAND VC3D --test-viewer-regressions)
+    set_tests_properties(viewer_regressions PROPERTIES
+        ENVIRONMENT "QT_QPA_PLATFORM=offscreen;VC3D_CONFIG_DIR=${CMAKE_CURRENT_BINARY_DIR}/viewer-regression-config"
+        TIMEOUT 90)
+    vc_register_ctest(viewer_regressions VC3D)
 endif()
 
 add_executable(test_surface_catalog test_surface_catalog.cpp ../SurfaceCatalog.cpp ../SurfaceCatalog.hpp
     ../segmentation/SurfaceStoreEdit.cpp ../segmentation/SurfaceStoreEdit.hpp
     ../segmentation/SurfaceCorrections.cpp ../segmentation/SurfaceCorrections.hpp
-    ../OpenDataManifest.cpp ../VolumeRegistrations.cpp)
+    ../OpenDataResourceSelection.cpp ../VolumeRegistrations.cpp)
 set_target_properties(test_surface_catalog PROPERTIES AUTOMOC ON AUTOUIC OFF AUTORCC OFF)
 target_include_directories(test_surface_catalog PRIVATE ${PROJECT_SOURCE_DIR}/apps/VC3D ${PROJECT_SOURCE_DIR}/core/test)
 target_link_libraries(test_surface_catalog PRIVATE vc_core Qt6::Core Qt6::Concurrent)
@@ -824,7 +768,7 @@ add_test(NAME fiber_3d_geometry COMMAND test_fiber_3d_geometry)
 vc_register_test_target(test_fiber_3d_geometry)
 vc_register_ctest(fiber_3d_geometry test_fiber_3d_geometry)
 
-add_executable(test_fiber_3d_ribbon test_fiber_3d_ribbon.cpp ../fibers3d/Fiber3DRibbon.cpp ../fibers3d/Fiber3DCT.cpp)
+add_executable(test_fiber_3d_ribbon test_fiber_3d_ribbon.cpp ../OpenedVolumes.cpp ../fibers3d/Fiber3DRibbon.cpp ../fibers3d/Fiber3DCT.cpp)
 set_target_properties(test_fiber_3d_ribbon PROPERTIES AUTOMOC ON AUTOUIC OFF AUTORCC OFF)
 target_include_directories(test_fiber_3d_ribbon PRIVATE ${PROJECT_SOURCE_DIR}/apps/VC3D)
 target_link_libraries(test_fiber_3d_ribbon PRIVATE Qt6::Core Qt6::Gui Qt6::Test vc_core vc_fiber_view vc_lasagna)
@@ -832,7 +776,7 @@ add_test(NAME fiber_3d_ribbon COMMAND test_fiber_3d_ribbon)
 vc_register_test_target(test_fiber_3d_ribbon)
 vc_register_ctest(fiber_3d_ribbon test_fiber_3d_ribbon)
 
-add_executable(test_fiber_3d_slices test_fiber_3d_slices.cpp ../fibers3d/Fiber3DSlices.cpp ../fibers3d/Fiber3DCT.cpp)
+add_executable(test_fiber_3d_slices test_fiber_3d_slices.cpp ../OpenedVolumes.cpp ../fibers3d/Fiber3DSlices.cpp ../fibers3d/Fiber3DCT.cpp)
 set_target_properties(test_fiber_3d_slices PROPERTIES AUTOMOC ON AUTOUIC OFF AUTORCC OFF)
 target_include_directories(test_fiber_3d_slices PRIVATE ${PROJECT_SOURCE_DIR}/apps/VC3D)
 target_link_libraries(test_fiber_3d_slices PRIVATE Qt6::Core Qt6::Gui Qt6::Test vc_core vc_fiber_view)
@@ -861,7 +805,8 @@ add_executable(test_fiber_3d_canvas test_fiber_3d_canvas.cpp
     ../scene3d/Scene3DCanvas.cpp
     ../fibers3d/Fiber3DSlices.cpp ../fibers3d/Fiber3DCT.cpp
     ../fibers3d/Fiber3DVolumeRenderer.cpp ../volume_viewers/VolumetricCompositor.cpp
-    ../fibers3d/Fiber3DSurfaceRenderer.cpp ../fibers3d/Fiber3DSurfaceProximity.cpp)
+    ../fibers3d/Fiber3DSurfaceRenderer.cpp ../fibers3d/Fiber3DSurfaceProximity.cpp
+    ../Colormaps.cpp ../OpenedVolumes.cpp)
 set_target_properties(test_fiber_3d_canvas PROPERTIES AUTOMOC ON AUTOUIC OFF AUTORCC OFF)
 target_include_directories(test_fiber_3d_canvas PRIVATE ${PROJECT_SOURCE_DIR}/apps/VC3D)
 target_link_libraries(test_fiber_3d_canvas PRIVATE Qt6::Core Qt6::Gui Qt6::Widgets

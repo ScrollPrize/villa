@@ -26,17 +26,10 @@ class _ZRange(TypedDict):
     max: NotRequired[int]
 
 
-class _DirectionField(TypedDict):
-    path: str
-    orientation: NotRequired[Literal["normal", "horizontal", "vertical"]]
-    scale: NotRequired[int]
-    weight: NotRequired[float]
-
-
 @mcp.tool()
 async def vc3d_get_segmentation_settings() -> dict[str, Any]:
     """Read the segmentation editing settings shown in the Segmentation panel:
-    brushes, smoothing, growth options and direction fields.
+    brushes, smoothing and growth options.
 
     Returns {"editingEnabled", "drag" ({"radius", "sigma"}),
     "pushPull" ({"radius", "sigma", "step"}), "editScale",
@@ -45,8 +38,7 @@ async def vc3d_get_segmentation_settings() -> dict[str, Any]:
     "manualAddSelected" (the Manual Add method is selected; use
     vc3d_manual_add_begin / finish for it), "growthSteps", "growthScale",
     "growthDirections" (subset of up/down/left/right), "zRange"
-    ({"enabled", "min", "max"}), "growthVolumeId" (or null),
-    "directionFields" ([{"path", "orientation", "scale", "weight"}])}.
+    ({"enabled", "min", "max"}), "growthVolumeId" (or null)}.
     Brush radii and sigmas are in grid steps, as in the panel. The reply can
     be passed back to vc3d_set_segmentation_settings unchanged.
     """
@@ -67,7 +59,6 @@ async def vc3d_set_segmentation_settings(
     growth_directions: Optional[list[Literal["up", "down", "left", "right"]]] = None,
     z_range: Optional[_ZRange] = None,
     growth_volume_id: Optional[str] = None,
-    direction_fields: Optional[list[_DirectionField]] = None,
 ) -> dict[str, Any]:
     """Change segmentation editing settings, the headless twin of the
     Segmentation panel's controls. Any subset; omitted fields stay as they
@@ -86,8 +77,6 @@ async def vc3d_set_segmentation_settings(
     left out keeps its current value, and min above max fails with -32602.
     growth_volume_id: the volume growth runs on; an id the project or the
     panel does not offer fails with -32007 before anything changes.
-    direction_fields: replaces the direction field list
-    ([{"path", "orientation", "scale", "weight"}]).
 
     Settings are saved as preferences, like the panel's own edits. Everything
     that can fail is checked before any value changes.
@@ -110,7 +99,6 @@ async def vc3d_set_segmentation_settings(
                 "growthDirections": growth_directions,
                 "zRange": z_range,
                 "growthVolumeId": growth_volume_id,
-                "directionFields": direction_fields,
             }
         ),
     )

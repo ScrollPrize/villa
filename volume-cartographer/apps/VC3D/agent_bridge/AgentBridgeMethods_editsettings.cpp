@@ -68,22 +68,6 @@ void AgentBridgeServer::registerEditSettingsHandlers()
                 // null, as get_settings reports when none is chosen, leaves
                 // the growth volume unchanged.
                 Params::nullable(Params::optionalString(QStringLiteral("growthVolumeId"))),
-                Params::optionalArray(
-                    QStringLiteral("directionFields"),
-                    Params::optionalObject(
-                        QString(),
-                        {
-                            Params::requiredString(QStringLiteral("path")),
-                            Params::optionalStringEnum(
-                                QStringLiteral("orientation"),
-                                {
-                                    QStringLiteral("normal"),
-                                    QStringLiteral("horizontal"),
-                                    QStringLiteral("vertical"),
-                                }),
-                            Params::optionalInteger(QStringLiteral("scale")),
-                            Params::optionalNumber(QStringLiteral("weight")),
-                        })),
             },
             .errors = {-32602, -32007, -32009},
             .mcp = Mcp::snakeCase(QStringLiteral("vc3d_set_segmentation_settings")),

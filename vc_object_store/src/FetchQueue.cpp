@@ -57,11 +57,14 @@ void FetchQueue::refetch(const std::vector<std::string>& uuids)
     wake_.notify_one();
 }
 
-bool FetchQueue::fetchNow(const std::string& uuid, const std::function<bool()>& cancel, std::string* error)
+bool FetchQueue::fetchNow(const std::string& uuid, const std::function<bool()>& cancel, std::string* error,
+                          const std::function<bool()>& isLocal)
 {
     std::unique_lock lock(mutex_);
     auto& entry = entries_[uuid];
     entry.requested = std::chrono::steady_clock::now();
+    // A fetch may have finished since the caller last looked: fetching again would conflict.
+    if (entry.state == GeometryState::Local && isLocal && isLocal()) return true;
     if (entry.state == GeometryState::Failed || entry.state == GeometryState::Local) entry.state = GeometryState::Remote;
     if (entry.state != GeometryState::Fetching) {
         std::erase(queue_, uuid);

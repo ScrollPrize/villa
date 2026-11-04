@@ -135,10 +135,10 @@ def reconstruct_frames(direction_xyz):
 
 class InferenceArchive:
     def __init__(self, path):
-        import zarr
+        from vc_reader.reader import open_group
 
         self.path = Path(path)
-        self.group = zarr.open_group(str(path), mode="r")
+        self.group = open_group(path)
         self.attrs = dict(self.group.attrs)
         self.points_xyz = self.group["points/xyz"]
         self.points_winding = self.group["points/winding"]
@@ -374,31 +374,22 @@ def load_patch_metas(patches_dir, band, scratch):
 
 def _patch_samples(patch_dir, erode, subdiv):
     """World-space surface samples of one eroded tifxyz patch."""
-    import tifffile
-    from scipy.ndimage import binary_erosion
+    import vc_reader.transforms as A
+    from vc_reader import tifxyz
 
-    grids = [tifffile.imread(patch_dir / f"{axis}.tif") for axis in "xyz"]
-    xyz = np.stack(grids, axis=-1).astype(np.float32)
-    valid = np.all(xyz != -1, axis=-1)
+    surface = tifxyz.read(patch_dir, mask=False)
+    xyz, valid = surface.xyz, surface.valid
     if erode > 0:
-        valid = binary_erosion(
-            valid, structure=np.ones((3, 3), dtype=bool), iterations=erode)
+        valid = A.Morphology("erode", radius=erode, footprint="cube")(valid[None])[0]
     quad = valid[:-1, :-1] & valid[:-1, 1:] & valid[1:, :-1] & valid[1:, 1:]
     rows, cols = np.nonzero(quad)
     if not len(rows):
         return None, None
-    c00 = xyz[rows, cols]
-    c01 = xyz[rows, cols + 1]
-    c10 = xyz[rows + 1, cols]
-    c11 = xyz[rows + 1, cols + 1]
     steps = (np.arange(subdiv, dtype=np.float32) + 0.5) / subdiv
     u, v = np.meshgrid(steps, steps, indexing="ij")
-    u = u.reshape(-1)[None, :, None]
-    v = v.reshape(-1)[None, :, None]
-    samples = (
-        c00[:, None] * (1 - u) * (1 - v) + c01[:, None] * (1 - u) * v
-        + c10[:, None] * u * (1 - v) + c11[:, None] * u * v
-    ).reshape(-1, 3)
+    samples, supported = surface.points_at(
+        rows[:, None] + u.ravel(), cols[:, None] + v.ravel())
+    samples = samples[supported]
     vertices = xyz[valid]
     return samples, vertices
 
@@ -1160,15 +1151,11 @@ class OmeZarrPyramidWriter:
     """
 
     def __init__(self, path, band, source, parameters, zstd_level):
-        from numcodecs import Zstd
+        from vc_reader.reader import create_group, ome_multiscales
 
         self.path = Path(path)
         self.band = band
-        self.compressor = Zstd(level=int(zstd_level))
         self.level_shapes = [band.level_shape(level) for level in range(LEVELS)]
-        self.path.mkdir(parents=True, exist_ok=True)
-        _write_json_atomic(self.path / ".zgroup", {"zarr_format": 2})
-        axes = [{"name": axis, "type": "space"} for axis in "zyx"]
         self.attributes = {
             "kind": "winding_field_merge",
             "created": datetime.now(timezone.utc).isoformat(),
@@ -1183,53 +1170,29 @@ class OmeZarrPyramidWriter:
             },
             "complete": False,
             "parameters": parameters,
-            "multiscales": [{
-                "version": "0.4",
-                "name": "winding_field",
-                "axes": axes,
-                "datasets": [{
-                    "path": str(level),
-                    "coordinateTransformations": [{
-                        "type": "scale",
-                        "scale": [float(1 << level)] * 3,
-                    }],
-                } for level in range(LEVELS)],
-            }],
+            "multiscales": [ome_multiscales(name="winding_field", levels=LEVELS - 1)],
         }
-        _write_json_atomic(self.path / ".zattrs", self.attributes)
+        self.group = create_group(self.path, attrs=self.attributes, auth=None)
+        self.levels = []
         for level, shape in enumerate(self.level_shapes):
-            level_path = self.path / str(level)
-            level_path.mkdir(exist_ok=True)
-            _write_json_atomic(level_path / ".zarray", {
-                "zarr_format": 2,
-                "shape": list(shape),
-                "chunks": [CHUNK, CHUNK, CHUNK],
-                "dtype": "<u2",
-                "compressor": {"id": "zstd", "level": int(zstd_level)},
-                "fill_value": 0,
-                "order": "C",
-                "filters": None,
-                "dimension_separator": "/",
-            })
-            _write_json_atomic(
-                level_path / ".zattrs",
-                {"_ARRAY_DIMENSIONS": ["z", "y", "x"],
-                 **({"downsampling_method": "mean"} if level else {})})
+            array = self.group.create_array(
+                str(level),
+                shape=shape,
+                chunks=(CHUNK, CHUNK, CHUNK),
+                dtype="<u2",
+                compressor="zstd",
+                level=int(zstd_level),
+                separator="/",
+                fill_value=0,
+            )
+            array.attrs.put({"_ARRAY_DIMENSIONS": ["z", "y", "x"],
+                             **({"downsampling_method": "mean"} if level else {})})
+            self.levels.append(array)
         self._pool = ThreadPoolExecutor(max_workers=16)
         self._futures = []
 
     def _write_chunk(self, level, chunk_index, values):
-        destination = (
-            self.path / str(level)
-            / str(chunk_index[0]) / str(chunk_index[1]) / str(chunk_index[2]))
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        payload = bytes(self.compressor.encode(
-            np.ascontiguousarray(values).tobytes()))
-        temporary = destination.with_name(
-            f".{destination.name}.tmp-{os.getpid()}")
-        with open(temporary, "wb") as stream:
-            stream.write(payload)
-        os.replace(temporary, destination)
+        self.levels[level].write_chunk(chunk_index, values)
 
     def write_block(self, level, origin, values):
         """Write a uint16 block at ``origin`` (level voxels), splitting into
@@ -1274,7 +1237,7 @@ class OmeZarrPyramidWriter:
         self._pool.shutdown()
         self.attributes.update(extra_attributes)
         self.attributes["complete"] = True
-        _write_json_atomic(self.path / ".zattrs", self.attributes)
+        self.group.attrs.put(self.attributes)
 
 
 def encode_u16(field_np, mask_np):

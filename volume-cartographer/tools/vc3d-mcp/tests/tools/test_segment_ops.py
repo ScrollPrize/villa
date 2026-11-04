@@ -21,10 +21,7 @@ from vc3d_mcp import core
 from vc3d_mcp.tools import segment_ops
 from vc3d_mcp.tools.segment_ops import (
     vc3d_export_segment_obj,
-    vc3d_merge_segments,
     vc3d_neighbor_copy_segment,
-    vc3d_patch_segment,
-    vc3d_rasterize_segments,
     vc3d_transform_segment,
 )
 
@@ -96,14 +93,6 @@ class SegmentOpsTest(unittest.IsolatedAsyncioTestCase):
             {"segmentId": "seg-1", "normalizeUv": False, "alignGrid": False},
         )
 
-    async def test_rasterize_maps_options_and_omits_unset(self) -> None:
-        result = await vc3d_rasterize_segments(["seg-1", "seg-2"], z_max=20)
-        self.assertEqual(result["jobId"], "job-7")
-        self.assertEqual(
-            self.bridge.params_for("segment.rasterize"),
-            {"segmentIds": ["seg-1", "seg-2"], "zMax": 20},
-        )
-
     async def test_neighbor_copy_maps_refinement(self) -> None:
         result = await vc3d_neighbor_copy_segment(
             "seg-1", "out", output_tag="neighbors", neighbor_max_distance=150,
@@ -114,26 +103,6 @@ class SegmentOpsTest(unittest.IsolatedAsyncioTestCase):
             {"segmentId": "seg-1", "direction": "out", "outputTag": "neighbors",
              "neighborMaxDistance": 150, "refineOmpThreads": 8,
              "refineParamOverrides": {"step": 10}},
-        )
-
-    async def test_merge_grid_keeps_holes(self) -> None:
-        await vc3d_merge_segments(
-            grid=[["a", None], ["b", "c"]], ref_segment_id="b", output_tag="merged",
-            ransac_iters=500)
-        self.assertEqual(
-            self.bridge.params_for("segments.merge"),
-            {"grid": [["a", None], ["b", "c"]], "refSegmentId": "b",
-             "outputTag": "merged", "ransacIters": 500},
-        )
-
-    async def test_patch_waits_and_forwards_confirm(self) -> None:
-        result = await vc3d_patch_segment(
-            ["a", "b"], parent_id="a", confirm=True, border_cells=8, wait=True)
-        self.assertEqual(result["state"], "succeeded")
-        self.assertEqual(
-            self.bridge.params_for("segments.patch"),
-            {"segmentIds": ["a", "b"], "parentId": "a", "confirm": True,
-             "borderCells": 8},
         )
 
     def test_synchronous_file_operations_outlast_default_timeout(self) -> None:

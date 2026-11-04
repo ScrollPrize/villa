@@ -11,7 +11,7 @@
 #include "SegmentationCommon.hpp"
 #include "SegmentationPushPullConfig.hpp"
 
-#include "utils/Json.hpp"
+#include <nlohmann/json.hpp>
 
 #include "growth/SegmentationGrowth.hpp"
 #include "tools/ManualAddTool.hpp"
@@ -22,7 +22,6 @@ class SegmentationGrowthPanel;
 class SegmentationCorrectionsPanel;
 class SegmentationCustomParamsPanel;
 class SegmentationNeuralTracerPanel;
-class SegmentationDirectionFieldPanel;
 class SegmentationLasagnaPanel;
 class SegmentationManualAddPanel;
 
@@ -50,7 +49,7 @@ public:
     [[nodiscard]] QString customParamsProfile() const;
     [[nodiscard]] bool customParamsValid() const;
     [[nodiscard]] QString customParamsError() const;
-    [[nodiscard]] utils::Json customParamsJson() const;
+    [[nodiscard]] nlohmann::json customParamsJson() const;
     [[nodiscard]] bool showHoverMarker() const;
     [[nodiscard]] bool growthKeybindsEnabled() const;
     [[nodiscard]] int growthScale() const;
@@ -111,12 +110,10 @@ public:
     void setCorrectionsZRange(bool enabled, int zMin, int zMax);
     void setAllowedGrowthDirections(const std::vector<SegmentationGrowthDirection>& directions);
     bool selectGrowthVolume(const QString& volumeId);
-    void setDirectionFieldConfigs(const std::vector<SegmentationDirectionFieldConfig>& configs);
     [[nodiscard]] std::optional<std::pair<int, int>> correctionsZRange() const;
     [[nodiscard]] std::pair<int, int> correctionsZBounds() const;
 
     [[nodiscard]] std::vector<SegmentationGrowthDirection> allowedGrowthDirections() const;
-    [[nodiscard]] std::vector<SegmentationDirectionFieldConfig> directionFieldConfigs() const;
 
     // "Draw mask" brush radius in voxels.
     [[nodiscard]] float maskBrushRadius() const { return _maskBrushRadius; }
@@ -226,7 +223,6 @@ private:
     SegmentationCorrectionsPanel* _correctionsPanel{nullptr};
     SegmentationCustomParamsPanel* _customParamsPanel{nullptr};
     SegmentationNeuralTracerPanel* _neuralTracerPanel{nullptr};
-    SegmentationDirectionFieldPanel* _directionFieldPanel{nullptr};
     SegmentationLasagnaPanel* _lasagnaPanel{nullptr};
     SegmentationManualAddPanel* _manualAddPanel{nullptr};
     bool _manualAddActive{false};

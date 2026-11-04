@@ -39,7 +39,6 @@ class EditingSettingsToolsTest(unittest.IsolatedAsyncioTestCase):
             growth_method="corrections",
             growth_directions=["up", "left"],
             z_range={"enabled": True, "min": 100, "max": 200},
-            direction_fields=[{"path": "/fields/a.zarr", "orientation": "vertical"}],
         )
         self.assertEqual(result["echoedMethod"], "segmentation.set_settings")
         self.assertEqual(
@@ -50,8 +49,6 @@ class EditingSettingsToolsTest(unittest.IsolatedAsyncioTestCase):
                 "growthMethod": "corrections",
                 "growthDirections": ["up", "left"],
                 "zRange": {"enabled": True, "min": 100, "max": 200},
-                "directionFields": [
-                    {"path": "/fields/a.zarr", "orientation": "vertical"}],
             },
         )
 

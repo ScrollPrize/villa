@@ -45,7 +45,7 @@ ViewerViewExtrasPanel::ViewerViewExtrasPanel(ViewerManager* viewerManager, QWidg
                     return;
                 }
                 viewer->reloadPerfSettings();
-                viewer->renderVisible(true);
+                viewer->renderVisible();
             });
         }
     });
