@@ -1,3 +1,4 @@
+#include <vc_reader/slab.hpp>
 #include "Fiber3DVolumeRenderer.hpp"
 #include "volume_viewers/VolumetricCompositor.hpp"
 #include <QVector2D>
@@ -247,7 +248,7 @@ bool Fiber3DVolumeRenderer::draw(
         std::array<float, 256 * 3> values{};
         for (int i = 0; i < 3; ++i) {
             const auto& p = params[i];
-            const auto lut = vc3d::volumetric::buildOpacityLut(p.alphaMin, p.alphaMax, p.alphaOpacity, p.tfGamma, p.isoCutoff, 1.f);
+            const auto lut = vcr::display::opacityLut(p.options.alphaMin, p.options.alphaMax, p.options.alphaOpacity, p.tfGamma, p.options.alphaCutoff, 1.f);
             std::copy(lut.begin(), lut.end(), values.begin() + 256 * i);
         }
         glBindTexture(GL_TEXTURE_2D, transfer_);

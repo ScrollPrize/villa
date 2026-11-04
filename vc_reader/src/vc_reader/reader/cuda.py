@@ -40,6 +40,27 @@ def _device_points(points, device, dtype):
     return array.reshape(-1, 3), array.shape[:-1]
 
 
+class CudaPool:
+    """A device cache that several :class:`CudaReader` share: one byte budget and one
+    least-recently-used order over all their bricks (e.g. every level of a pyramid)."""
+
+    def __init__(self, cache_bytes=512 << 20, *, device=0):
+        cache_bytes, device = operator.index(cache_bytes), operator.index(device)
+        if cache_bytes < 0 or device < 0:
+            raise ValueError("cache_bytes and device must be nonnegative")
+        if not is_available():
+            raise RuntimeError("CUDA reader unavailable: build with VC_READER_ENABLE_CUDA=ON and use a CUDA device")
+        self.device, self._engine = device, _reader.CudaPool(cache_bytes, device)
+
+    @property
+    def cache_bytes(self) -> int:
+        return self._engine.budget
+
+    @property
+    def resident_bytes(self) -> int:
+        return self._engine.resident_bytes
+
+
 class CudaReader:
     """Create with reader.cuda(). Outputs stay on device.
 
@@ -47,10 +68,11 @@ class CudaReader:
     and falls back to CPU sampling/upload if the request exceeds cache_bytes.
     source='chunks' requires device sampling and a sufficient chunk budget.
     source='cpu' explicitly samples/crops on CPU and uploads the result.
-    The cache is private to this reader adapter and device; clear_cache() drops
+    The cache is private to this reader adapter and device, unless ``pool`` (a
+    :class:`CudaPool`) shares one with other readers; clear_cache() drops this reader's
     resident source chunks. Arrays retain independent ownership after close().
     """
-    def __init__(self, reader, *, cache_bytes=512 << 20, device=0):
+    def __init__(self, reader, *, cache_bytes=512 << 20, device=0, pool=None):
         reader._ready()
         if reader.ndim != 3 or reader.dtype != np.uint8:
             raise TypeError("CUDA sampling supports 3-D uint8 CT")
@@ -59,8 +81,11 @@ class CudaReader:
             raise ValueError("cache_bytes and device must be nonnegative")
         if not is_available():
             raise RuntimeError("CUDA reader unavailable: build with VC_READER_ENABLE_CUDA=ON and use a CUDA device")
-        self.reader, self.device, self._pid = reader, device, os.getpid()
-        self._engine = _reader.CudaReader(reader._array, cache_bytes, device)
+        if pool is not None:
+            device = pool.device
+        self.reader, self.device, self._pid, self.pool = reader, device, os.getpid(), pool
+        self._engine = (_reader.CudaReader(reader._array, cache_bytes, device) if pool is None
+                        else _reader.CudaReader(reader._array, pool._engine))
 
     def _ready(self):
         if self._pid != os.getpid():

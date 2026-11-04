@@ -1,4 +1,4 @@
-#include "spatial/SurfaceGrid.hpp"
+#include <vc_object_store/geometry/SurfaceGrid.hpp>
 #include "vc_object_store/Tiff.hpp"
 #include "vc_object_store/geometry/Geometry.hpp"
 #include <nlohmann/json.hpp>

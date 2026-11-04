@@ -1,13 +1,13 @@
 #include "ProjectWorkspace.hpp"
+#include <vc_reader/zarr.hpp>
 
 #include "CState.hpp"
 #include "MenuActionController.hpp"
 #include "OpenDataSampleProject.hpp"
 #include "VCSettings.hpp"
 
-#include "vc/core/render/ChunkCache.hpp"
-#include "vc/core/render/DecodedChunkCacheBudget.hpp"
-#include "vc/core/render/PersistentZarrCacheBudget.hpp"
+#include "vc/core/util/RemoteCacheSettings.hpp"
+#include "OpenedVolumes.hpp"
 #include "vc/core/types/Volume.hpp"
 #include "vc/core/types/VolumePkg.hpp"
 #include "vc_object_store/objects/SurfaceTileCache.hpp"
@@ -43,6 +43,8 @@
 #include <algorithm>
 #include <filesystem>
 #include <map>
+#include "vc_reader/array.hpp"
+#include <vc_reader/source_reader.hpp>
 
 namespace {
 
@@ -81,17 +83,6 @@ QString trimmedLocation(QString location)
 QString volumeLocation(const Volume& volume)
 {
     return trimmedLocation(QString::fromStdString(volume.isRemote() ? volume.remoteUrl() : volume.path().string()));
-}
-
-QString dtypeName(vc::render::ChunkDtype dtype)
-{
-    switch (dtype) {
-    case vc::render::ChunkDtype::UInt8: return QStringLiteral("uint8");
-    case vc::render::ChunkDtype::UInt16: return QStringLiteral("uint16");
-    case vc::render::ChunkDtype::Float32: return QStringLiteral("float32");
-    case vc::render::ChunkDtype::Opaque: return QStringLiteral("opaque");
-    }
-    return {};
 }
 
 void setBar(QProgressBar* bar, QLabel* text, quint64 used, std::optional<quint64> maximum, const QString& extra = {})
@@ -163,7 +154,7 @@ void hideEmptyColumns(QTreeWidget* tree, int first)
 void reveal(const QString& location)
 {
     if (location.isEmpty()) return;
-    if (vc::project::isLocationRemote(location.toStdString())) {
+    if (vcr::zarr::isRemote(location.toStdString())) {
         QApplication::clipboard()->setText(location);
         return;
     }
@@ -433,8 +424,8 @@ ProjectWorkspace::ProjectWorkspace(CState* state, MenuActionController* menu, QW
     addBar(0, tr("Volume chunks in memory"), tr("Decoded volume chunks held in memory, shared by every viewer."),
            _ramBar, _ramText);
     _diskCell = addBar(1, tr("Volume chunks on disk"),
-                       tr("Chunks of remote volumes downloaded to disk. Older chunks are removed past the limit, "
-                          "or when the disk runs low."),
+                       tr("Chunks of remote volumes downloaded to disk. Older chunks are removed past the limit; "
+                          "when the disk runs low, caching stops and nothing is removed."),
                        _diskBar, _diskText);
     addBar(2, tr("Surface geometry in memory"), tr("Decoded surface tiles kept for every open store."),
            _surfaceBar, _surfaceText);
@@ -636,7 +627,7 @@ void ProjectWorkspace::rebuildResources()
     _resources->clear();
 
     const auto resolved = [&](const std::string& location) {
-        return trimmedLocation(vc::project::isLocationRemote(location)
+        return trimmedLocation(vcr::zarr::isRemote(location)
             ? QString::fromStdString(location)
             : QString::fromStdString(vc::project::resolveLocalPath(location, pkg->directory()).string()));
     };
@@ -662,8 +653,13 @@ void ProjectWorkspace::rebuildResources()
         const auto shape = volume.shapeXyz();
         item->setText(ResShape, QStringLiteral("%1 × %2 × %3").arg(shape[0]).arg(shape[1]).arg(shape[2]));
         if (volume.voxelSize() > 0) item->setText(ResVoxel, tr("%1 µm").arg(volume.voxelSize()));
-        item->setText(ResLevels, QString::number(volume.numScales()));
-        item->setText(ResType, dtypeName(volume.dtype()));
+        try {
+            const auto& pyramid = _state->openedVolumes()->pyramid(volume);
+            item->setText(ResLevels, QString::number(pyramid.levels.size()));
+            item->setText(ResType, QString::fromStdString(vcr::sources::dtypeName(pyramid.dtype)));
+        } catch (const std::exception& error) {
+            item->setToolTip(ResLevels, QString::fromUtf8(error.what()));
+        }
         if (volume.isRemote()) {
             const auto cache = QString::fromStdString(volume.remotePersistentCachePath().string());
             const auto measured = _cacheBytes.find(cache);
@@ -769,31 +765,35 @@ void ProjectWorkspace::rebuildResources()
 void ProjectWorkspace::updateCaches()
 {
     if (!isVisible()) return;
-    if (const auto budget = vc::render::processChunkCacheService()->decodedByteBudget()) {
-        const auto stats = budget->stats();
-        setBar(_ramBar, _ramText, stats.decodedBytes, stats.maximumBytes);
-    }
+    const auto ram = _state->openedVolumes()->cacheStats();
+    setBar(_ramBar, _ramText, ram.bytes, ram.capacity);
     const auto root = vc3d::remoteCachePathFs();
     const auto rootText = QString::fromStdString(root.string());
     _revealCache->setToolTip(rootText);
-    _diskCell->setToolTip(tr("Chunks of remote volumes downloaded to %1. Older chunks are removed past the limit, "
-                             "or when the disk runs low.").arg(rootText));
-    if (const auto budget = vc::render::PersistentZarrCacheBudget::findForPath(root)) {
-        const auto stats = budget->stats();
-        // Free space is measured with the first trim; until then it reads 0.
-        QStringList extra;
-        if (stats.freeBytes || stats.lowSpace) extra << tr("%1 free").arg(bytes(stats.freeBytes));
-        if (stats.minimumFreeBytes) extra << tr("keeps %1 free").arg(bytes(stats.minimumFreeBytes));
-        if (stats.scanInFlight) extra << tr("counting...");
-        setBar(_diskBar, _diskText, stats.managedBytes,
-               stats.maximumBytes ? std::optional<quint64>(*stats.maximumBytes) : std::nullopt,
-               extra.join(QStringLiteral(" · ")));
-        // Overrides the dimmed palette while space is low.
-        _diskText->setStyleSheet(stats.lowSpace ? QStringLiteral("color: #d28b00; font-weight: 600;") : QString());
+    _diskCell->setToolTip(tr("Chunks of remote volumes downloaded to %1. Older chunks are removed past the limit; "
+                             "when the disk runs low, caching stops and nothing is removed.").arg(rootText));
+    const auto limit = vc::settings::remoteCacheMaxBytes();
+    const auto minimumFree = static_cast<std::uint64_t>(vc::settings::remoteCacheMinFreeBytes());
+    std::error_code rootError;
+    const auto space = std::filesystem::space(root, rootError);
+    const std::uint64_t freeBytes = rootError ? 0 : space.available;
+    QStringList extra;
+    if (!rootError) extra << tr("%1 free").arg(bytes(freeBytes));
+    if (minimumFree) extra << tr("stops caching under %1 free").arg(bytes(minimumFree));
+    if (limit) {
+        // A limit keeps the budget's index, built when the volumes opened.
+        setBar(_diskBar, _diskText, static_cast<quint64>(vcr::zarr::diskBudget(root.string(), std::nullopt)->total_bytes()),
+               static_cast<quint64>(*limit), extra.join(QStringLiteral(" · ")));
     } else {
+        // Without one there is no index: a total would walk every chunk of the root.
+        // Measure caches sizes the project's volumes on request.
         _diskBar->setEnabled(false);
-        _diskText->setText(tr("not in use"));
+        extra.prepend(tr("no limit"));
+        _diskText->setText(extra.join(QStringLiteral(" · ")));
     }
+    // Overrides the dimmed palette while space is low.
+    _diskText->setStyleSheet(!rootError && freeBytes < minimumFree ? QStringLiteral("color: #d28b00; font-weight: 600;")
+                                                                   : QString());
     const auto surfaces = CState::surfaceGeometryCache();
     setBar(_surfaceBar, _surfaceText, surfaces->size(), surfaces->capacity());
 }
@@ -825,7 +825,7 @@ void ProjectWorkspace::updateResourceButtons()
                                 _state->vpkg() && _state->vpkg()->writable());
     const auto location = item ? item->data(0, kRevealRole).toString() : QString();
     _revealResource->setEnabled(!location.isEmpty());
-    _revealResource->setText(vc::project::isLocationRemote(location.toStdString()) ? tr("Copy URL") : tr("Open Folder"));
+    _revealResource->setText(vcr::zarr::isRemote(location.toStdString()) ? tr("Copy URL") : tr("Open Folder"));
 }
 
 void ProjectWorkspace::measureVolumeCaches()

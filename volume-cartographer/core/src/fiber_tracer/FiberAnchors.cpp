@@ -1,5 +1,5 @@
 #include "vc/fiber_tracer/FiberAnchors.hpp"
-#include "vc/core/util/AtomicFile.hpp"
+#include <vc_reader/zarr.hpp>
 #include "vc/fiber_tracer/FiberAxisTensor.hpp"
 #include "vc/fiber_tracer/PolylineGeometry.hpp"
 #include "vc/fiber_tracer/detail/FiberAnchorPeakGrid.hpp"
@@ -5941,28 +5941,28 @@ void writeFiberAnchorArtifacts(
     if (outputDirectory.empty())
         throw std::invalid_argument("fiber anchor output directory must not be empty");
     std::filesystem::create_directories(outputDirectory);
-    vc::core::util::atomicWriteString(
+    vcr::zarr::atomicWrite(
         outputDirectory / "anchors.json",
-        fiberAnchorReportJson(report, artifact).dump(2) + "\n");
-    vc::core::util::atomicWriteString(
+        fiberAnchorReportJson(report, artifact).dump(2) + "\n", vcr::zarr::Durability::Fsync);
+    vcr::zarr::atomicWrite(
         outputDirectory / "anchors.obj",
-        fiberAnchorReportObj(report, artifact));
-    vc::core::util::atomicWriteString(
+        fiberAnchorReportObj(report, artifact), vcr::zarr::Durability::Fsync);
+    vcr::zarr::atomicWrite(
         outputDirectory / "anchors_0.obj",
-        fiberAnchorReportObjForComponent(report, artifact, 0));
-    vc::core::util::atomicWriteString(
+        fiberAnchorReportObjForComponent(report, artifact, 0), vcr::zarr::Durability::Fsync);
+    vcr::zarr::atomicWrite(
         outputDirectory / "anchors_1.obj",
-        fiberAnchorReportObjForComponent(report, artifact, 1));
-    vc::core::util::atomicWriteString(
+        fiberAnchorReportObjForComponent(report, artifact, 1), vcr::zarr::Durability::Fsync);
+    vcr::zarr::atomicWrite(
         outputDirectory / "anchor_cells.obj",
-        fiberAnchorCellReportObj(report));
+        fiberAnchorCellReportObj(report), vcr::zarr::Durability::Fsync);
     std::filesystem::create_directories(outputDirectory / "stages");
     for (size_t index = 0; index < kFiberAnchorDiagnosticStageCount; ++index) {
         const auto stage = static_cast<FiberAnchorDiagnosticStage>(index);
-        vc::core::util::atomicWriteString(
+        vcr::zarr::atomicWrite(
             outputDirectory / "stages" /
                 (std::string(fiberAnchorDiagnosticStageName(stage)) + ".json"),
-            fiberAnchorDiagnosticStageJson(report, artifact, stage).dump(2) + "\n");
+            fiberAnchorDiagnosticStageJson(report, artifact, stage).dump(2) + "\n", vcr::zarr::Durability::Fsync);
     }
 }
 

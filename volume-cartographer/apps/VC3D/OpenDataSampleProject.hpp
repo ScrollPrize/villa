@@ -1,7 +1,7 @@
 #pragma once
 #include <vc_reader/catalog.hpp>
 
-#include "OpenDataManifest.hpp"
+#include "OpenDataResourceSelection.hpp"
 
 #include <vc_object_store/objects/ObjectStoreSession.hpp>
 
@@ -67,6 +67,7 @@ void createSampleProjectFiles(const std::filesystem::path& path, const vcr::cata
 OpenDataSampleProjectResult attachOpenDataSampleVolumes(
     VolumePkg& pkg,
     const vcr::catalog::OpenDataSample& sample,
-    const OpenDataResourceSelection* selection = nullptr);
+    const OpenDataResourceSelection* selection = nullptr,
+    const std::filesystem::path& remoteCacheRoot = {});
 
 } // namespace vc3d::opendata

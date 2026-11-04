@@ -1,6 +1,7 @@
 #include "fibers3d/Fiber3DSlices.hpp"
 #include "vc/core/types/Volume.hpp"
-#include "../../../core/test/support/TestZarrVolume.hpp"
+#include "OpenedVolumes.hpp"
+#include "support/TestVolume.hpp"
 #include <QTemporaryDir>
 #include <QTest>
 #include <cmath>
@@ -20,20 +21,21 @@ private slots:
     void ctSamplesFollowWorldPlanesAndMaskVolumeEdges()
     {
         QTemporaryDir directory;
-        vc::test::ZarrVolumeSpec options;
+        vc3d::test::VolumeSpec options;
         options.shapeZYX = {32, 32, 32};
         options.chunkShapeZYX = {16, 16, 16};
         options.numLevels = 2;
-        auto volume = vc::test::createZarrVolume(directory.path().toStdString(), options);
-        Array3D<uint8_t> data({32, 32, 32});
+        auto volume = vc3d::test::createVolume(directory.path().toStdString(), options);
+        vc3d::test::Grid<uint8_t> data({32, 32, 32});
         for (int z = 0; z < 32; ++z)
             for (int y = 0; y < 32; ++y)
                 for (int x = 0; x < 32; ++x)
                     data(z, y, x) = uint8_t(x + 2 * y + 3 * z);
-        vc::test::writeZYX(*volume, data, {0, 0, 0});
+        vc3d::test::writeZYX(*volume, data, {0, 0, 0});
+        OpenedVolumes opened(std::size_t(1) << 26);
         for (const auto& p : std::vector<
                  slices::Plane>{{0, {8, 8, 8}, {8, 0, 0}, {0, 8, 0}, 9, 9}, {1, {8, 8, 8}, {8, 0, 0}, {0, 0, 8}, 9, 9}, {2, {8, 8, 8}, {0, 8, 0}, {0, 0, 8}, 9, 9}, {0, {8, 8, 8}, {8, 0, 4}, {0, 8, 0}, 9, 9}}) {
-            auto image = slices::sample(p, *volume);
+            auto image = slices::sample(p, opened, *volume);
             QCOMPARE(image->level, 0);
             QCOMPARE(image->tile.left.front(), p.origin);
             for (int r = 0; r < 9; ++r)
@@ -45,39 +47,40 @@ private slots:
                 }
         }
         slices::Plane edge{0, {-2, 8, 8}, {8, 0, 0}, {0, 8, 0}, 9, 9};
-        auto image = slices::sample(edge, *volume);
+        auto image = slices::sample(edge, opened, *volume);
         QCOMPARE(image->tile.pixels[1], uint8_t(0));
         QCOMPARE(image->tile.pixels[5], uint8_t(255));
         const slices::Plane overview{0, {4, 4, 8}, {24, 0, 0}, {0, 24, 0}, 25, 25};
-        auto preview = slices::sample(overview, *volume, nullptr, 7);
+        auto preview = slices::sample(overview, opened, *volume, nullptr, 7);
         QVERIFY(preview->preview);
         QCOMPARE(preview->level, 1);  // choose the available finer level when L2 is absent
         QCOMPARE(preview->tile.width, 7);
-        auto detail = slices::sample(overview, *volume);
+        auto detail = slices::sample(overview, opened, *volume);
         QVERIFY(!detail->preview);
         QCOMPARE(detail->level, 0);
         QCOMPARE(preview->tile.left.front(), detail->tile.left.front());
         QCOMPARE(preview->tile.right.back(), detail->tile.right.back());
         std::atomic_bool cancelled{true};
-        QVERIFY_THROWS_EXCEPTION(std::runtime_error, slices::sample(edge, *volume, &cancelled));
+        QVERIFY_THROWS_EXCEPTION(std::runtime_error, slices::sample(edge, opened, *volume, &cancelled));
         edge.down = edge.right;
-        QVERIFY_THROWS_EXCEPTION(std::invalid_argument, slices::sample(edge, *volume));
+        QVERIFY_THROWS_EXCEPTION(std::invalid_argument, slices::sample(edge, opened, *volume));
     }
     void volumetricSamplesKeepThicknessAndReverseDirection()
     {
         QTemporaryDir directory;
-        vc::test::ZarrVolumeSpec options;
+        vc3d::test::VolumeSpec options;
         options.shapeZYX = {32, 32, 32};
         options.chunkShapeZYX = {16, 16, 16};
-        auto volume = vc::test::createZarrVolume(directory.path().toStdString(), options);
-        Array3D<uint8_t> data({32, 32, 32});
+        auto volume = vc3d::test::createVolume(directory.path().toStdString(), options);
+        vc3d::test::Grid<uint8_t> data({32, 32, 32});
         for (int z = 0; z < 32; ++z)
             for (int y = 0; y < 32; ++y)
                 for (int x = 0; x < 32; ++x)
                     data(z, y, x) = uint8_t(x + 2 * y + 3 * z);
-        vc::test::writeZYX(*volume, data, {0, 0, 0});
+        vc3d::test::writeZYX(*volume, data, {0, 0, 0});
+        OpenedVolumes opened(std::size_t(1) << 26);
         slices::Plane p{0, {8, 8, 12}, {8, 0, 0}, {0, 8, 0}, 9, 9, true, {0, 0, 1}, 3, 2};
-        auto image = slices::sample(p, *volume);
+        auto image = slices::sample(p, opened, *volume);
         QVERIFY(image->slab.has_value());
         QVERIFY(!image->preview);
         const auto& slab = *image->slab;
@@ -92,23 +95,23 @@ private slots:
                     QCOMPARE(slab.pixels[i + 1], uint8_t(255));
                 }
         p.normal = {0, 0, -1};
-        auto reverse = slices::sample(p, *volume);
+        auto reverse = slices::sample(p, opened, *volume);
         QCOMPARE(reverse->slab->origin, (Point{7.5, 7.5, 14.5}));
         QCOMPARE(reverse->slab->pixels[0], uint8_t(8 + 16 + 42));
         p.front = p.behind = 0;
-        auto single = slices::sample(p, *volume);
+        auto single = slices::sample(p, opened, *volume);
         QCOMPARE(single->slab->depth, 1);
         QCOMPARE(single->slab->through, (Point{0, 0, -1}));
         p.front = 3;
         p.behind = 2;
-        auto preview = slices::sample(p, *volume, nullptr, 5);
+        auto preview = slices::sample(p, opened, *volume, nullptr, 5);
         QVERIFY(preview->preview);
         QCOMPARE(preview->slab->through, reverse->slab->through);
         QCOMPARE(preview->slab->origin[2], reverse->slab->origin[2]);
         std::atomic_bool cancelled{true};
-        QVERIFY_THROWS_EXCEPTION(std::runtime_error, slices::sample(p, *volume, &cancelled));
+        QVERIFY_THROWS_EXCEPTION(std::runtime_error, slices::sample(p, opened, *volume, &cancelled));
         p.normal = {0, 0, 0};
-        QVERIFY_THROWS_EXCEPTION(std::invalid_argument, slices::sample(p, *volume));
+        QVERIFY_THROWS_EXCEPTION(std::invalid_argument, slices::sample(p, opened, *volume));
     }
     void intersectingPlanesKeepAreaUvsAndCorrectAlphaOrder()
     {

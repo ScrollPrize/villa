@@ -1,0 +1,141 @@
+#include "../sampling_math.hpp"
+// Points on a surface stored as a grid of vertices, at real-valued grid positions:
+// the position and the unit normal, shared by the CPU and CUDA samplers.
+#pragma once
+#include "../geometry/math.hpp"
+
+#include <cmath>
+#include <cstddef>
+#include <cstdint>
+
+#ifdef __CUDACC__
+#define VCR_POINTS_HD __host__ __device__
+#else
+#define VCR_POINTS_HD
+#endif
+// point() is large (the Hermite patch): left to itself the host compiler calls its
+// small geometry helpers out of line, several calls per pixel.
+#if !defined(__CUDA_ARCH__) && (defined(__GNUC__) || defined(__clang__))
+#define VCR_POINTS_FLATTEN __attribute__((flatten))
+#else
+#define VCR_POINTS_FLATTEN
+#endif
+
+namespace vcr::grid {
+
+// How grid positions become points: `physical` maps vertex coordinates to physical
+// space (where normals are taken), `destination` maps physical points to the output
+// space; both row-major 3x4. `orientation` (+-1) flips the patch normal.
+struct PointMap {
+    int height = 0, width = 0;
+    float physical[12]{1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0};
+    float destination[12]{1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0};
+    float orientation = 1;
+};
+
+// A grid's vertices (height x width x 3 floats, rows contiguous) and what
+// interpolating them needs. A cell is a surface patch only when its four vertices are
+// valid (`valid`) and in one piece (`piece`, per column; null: one piece). With
+// `normals`, normals are those vertex normals interpolated; otherwise they are the
+// patch's. With the Hermite derivatives (du, dv, duv per vertex), patches are bicubic
+// Hermite; otherwise bilinear.
+struct GridView {
+    const float* xyz = nullptr;
+    const bool* valid = nullptr;
+    const int* piece = nullptr;
+    const float* normals = nullptr;
+    const float* du = nullptr;
+    const float* dv = nullptr;
+    const float* duv = nullptr;
+    bool triangles = false;
+};
+
+namespace detail {
+struct Hermite {
+    float p0, m0, p1, m1, dp0, dm0, dp1, dm1;
+};
+VCR_POINTS_HD inline Hermite hermite(float t)
+{
+    const float t2 = t * t, t3 = t2 * t;
+    return {2.f * t3 - 3.f * t2 + 1.f, t3 - 2.f * t2 + t, -2.f * t3 + 3.f * t2, t3 - t2,
+            6.f * t2 - 6.f * t,       3.f * t2 - 4.f * t + 1.f, -6.f * t2 + 6.f * t, 3.f * t2 - 2.f * t};
+}
+}  // namespace detail
+
+// The point at grid position (x = column, y = row): false when no patch covers it.
+// The patch's tangents are taken in physical space, so its normal accounts for
+// anisotropic spacing. `point` gets the position in vertex coordinates and `step`
+// (optional) the move in output coordinates per unit of physical offset along the unit
+// physical normal (destination's linear part applied to the normal).
+VCR_POINTS_HD VCR_POINTS_FLATTEN inline bool point(const PointMap& g, const GridView& v, float x, float y, float* point,
+                                                   float* step = nullptr, float* columnTangent = nullptr, float* rowTangent = nullptr)
+{
+    using geometry::V;
+    using geometry::vector;
+    if (!std::isfinite(x) || !std::isfinite(y) || x < 0 || y < 0 || x > float(g.width - 1) || y > float(g.height - 1) ||
+        g.width < 2 || g.height < 2)
+        return false;
+    const float lastCol = float(g.width - 2), lastRow = float(g.height - 2);  // x, y finite here
+    const int col = int(floorf(x) < lastCol ? floorf(x) : lastCol), row = int(floorf(y) < lastRow ? floorf(y) : lastRow);
+    const float u = x - float(col), w = y - float(row);
+    const int at[4]{row * g.width + col, row * g.width + col + 1, (row + 1) * g.width + col, (row + 1) * g.width + col + 1};
+    for (int k = 0; k < 4; ++k)
+        if (!v.valid[at[k]])
+            return false;
+    if (v.piece && v.piece[col] != v.piece[col + 1])
+        return false;
+    V p[4];
+    for (int k = 0; k < 4; ++k)
+        p[k] = vector(v.xyz + 3 * at[k]);
+    V position, du, dv;
+    if (v.triangles) {
+        if(u+w<=1.f){position=p[0]+(p[1]-p[0])*u+(p[2]-p[0])*w;du=p[1]-p[0];dv=p[2]-p[0];}
+        else {position=p[1]*(1-w)+p[3]*(u+w-1)+p[2]*(1-u);du=p[3]-p[2];dv=p[3]-p[1];}
+    } else if (v.du) {
+        const detail::Hermite bx = detail::hermite(u), by = detail::hermite(w);
+        const auto D = [&](const float* d, int k) { return vector(d + 3 * at[k]); };
+        const V q0 = p[0] * bx.p0 + D(v.du, 0) * bx.m0 + p[1] * bx.p1 + D(v.du, 1) * bx.m1;
+        const V q1 = p[2] * bx.p0 + D(v.du, 2) * bx.m0 + p[3] * bx.p1 + D(v.du, 3) * bx.m1;
+        const V r0 = D(v.dv, 0) * bx.p0 + D(v.duv, 0) * bx.m0 + D(v.dv, 1) * bx.p1 + D(v.duv, 1) * bx.m1;
+        const V r1 = D(v.dv, 2) * bx.p0 + D(v.duv, 2) * bx.m0 + D(v.dv, 3) * bx.p1 + D(v.duv, 3) * bx.m1;
+        const V q0u = p[0] * bx.dp0 + D(v.du, 0) * bx.dm0 + p[1] * bx.dp1 + D(v.du, 1) * bx.dm1;
+        const V q1u = p[2] * bx.dp0 + D(v.du, 2) * bx.dm0 + p[3] * bx.dp1 + D(v.du, 3) * bx.dm1;
+        const V r0u = D(v.dv, 0) * bx.dp0 + D(v.duv, 0) * bx.dm0 + D(v.dv, 1) * bx.dp1 + D(v.duv, 1) * bx.dm1;
+        const V r1u = D(v.dv, 2) * bx.dp0 + D(v.duv, 2) * bx.dm0 + D(v.dv, 3) * bx.dp1 + D(v.duv, 3) * bx.dm1;
+        position = q0 * by.p0 + r0 * by.m0 + q1 * by.p1 + r1 * by.m1;
+        du = q0u * by.p0 + r0u * by.m0 + q1u * by.p1 + r1u * by.m1;
+        dv = q0 * by.dp0 + r0 * by.dm0 + q1 * by.dp1 + r1 * by.dm1;
+    } else {
+        position = sampling::bilinear(p[0], p[1], p[2], p[3], u, w);
+        du = (p[1] - p[0]) * (1 - w) + (p[3] - p[2]) * w;
+        dv = (p[2] - p[0]) * (1 - u) + (p[3] - p[1]) * u;
+    }
+    if (!geometry::finite(position)) return false;
+    geometry::store(point, position);
+    if (columnTangent) geometry::store(columnTangent, du);
+    if (rowTangent) geometry::store(rowTangent, dv);
+    if (!step) return true;
+    V n = geometry::cross(geometry::linear(g.physical, du), geometry::linear(g.physical, dv)) * g.orientation;
+    if (v.normals) {
+        V m[4];
+        for (int k = 0; k < 4; ++k)
+            m[k] = vector(v.normals + 3 * at[k]);
+        n = (m[0] * (1 - u) + m[1] * u) * (1 - w) + (m[2] * (1 - u) + m[3] * u) * w;
+    }
+    if (!geometry::finite(n))
+        return false;
+    const float ax = fabsf(n.x), ay = fabsf(n.y), az = fabsf(n.z);
+    const float scale = ax > ay ? (ax > az ? ax : az) : (ay > az ? ay : az);
+    if (!(scale > 0))
+        return false;
+    n = n * (1 / scale);
+    n = n * (1 / sqrtf(geometry::dot(n, n)));
+    if (step)
+        geometry::store(step, geometry::linear(g.destination, n));
+    return true;
+}
+
+}  // namespace vcr::grid
+
+#undef VCR_POINTS_HD
+#undef VCR_POINTS_FLATTEN

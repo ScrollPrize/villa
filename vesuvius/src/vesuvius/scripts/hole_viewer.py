@@ -17,15 +17,15 @@ from pathlib import Path
 from typing import List, Optional
 
 import numpy as np
-import tifffile as tiff
+from vc_reader import images
 
 import napari
 from magicgui import magicgui
 from magicgui.widgets import Container, PushButton, Label
 
-import cc3d
+from vc_reader.geometry import label_components
 
-from detect_holes import compute_component_topology, localize_holes
+from detect_holes import localize_holes
 from fix_holes import _fix_2d_hole_fill, _fix_morph_close, _fix_alpha_wrap
 
 
@@ -74,7 +74,7 @@ def load_folder(viewer: napari.Viewer, index: int) -> None:
     # --- suffix1: Labels layer (editable) ---
     path1 = _find_file_by_suffix(folder, args.suffix1)
     if path1 is not None:
-        data1 = tiff.imread(str(path1))
+        data1 = images.read(str(path1))
         viewer.add_labels(data1, name=args.suffix1, metadata={"source_path": str(path1)})
     else:
         print(f"[WARN] No file matching suffix1 '{args.suffix1}' in {folder}")
@@ -82,7 +82,7 @@ def load_folder(viewer: napari.Viewer, index: int) -> None:
     # --- suffix2: Labels layer ---
     path2 = _find_file_by_suffix(folder, args.suffix2)
     if path2 is not None:
-        data2 = tiff.imread(str(path2))
+        data2 = images.read(str(path2))
         viewer.add_labels(data2, name=args.suffix2, metadata={"source_path": str(path2)})
     else:
         print(f"[WARN] No file matching suffix2 '{args.suffix2}' in {folder}")
@@ -180,7 +180,7 @@ def make_save_widget(viewer: napari.Viewer) -> Container:
             stem = layer.name
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         out_path = folder / f"{stem}_{ts}.tif"
-        tiff.imwrite(str(out_path), data)
+        images.write_tiff(str(out_path), data)
         print(f"[OK] Saved {out_path}")
 
     btn_save.changed.connect(_on_save)
@@ -250,35 +250,8 @@ def make_detect_holes_widget(viewer: napari.Viewer) -> Container:
         if args.ignore_value is not None:
             mask &= (label_data != args.ignore_value)
 
-        if backend == "betti_matching":
-            b1 = None
-            print(f"[INFO] Localizing holes (backend={backend}) …")
-            hole_mask, coords = localize_holes(
-                mask,
-                dilation_radius=dilation_radius,
-                expected_b1=None,
-                backend=backend,
-            )
-        else:
-            print("[INFO] Computing topology …")
-            b1, _b2, _chi = compute_component_topology(
-                mask,
-                fg_connectivity=args.fg_connectivity,
-                bg_connectivity=args.bg_connectivity,
-                use_cpu=True,
-            )
-            print(f"[INFO] Euler-based b1={b1}")
-            if b1 > 0:
-                print(f"[INFO] Localizing holes (backend={backend}) …")
-                hole_mask, coords = localize_holes(
-                    mask,
-                    dilation_radius=dilation_radius,
-                    expected_b1=b1,
-                    backend=backend,
-                )
-            else:
-                hole_mask = np.zeros(mask.shape, dtype=bool)
-                coords = []
+        print(f"[INFO] Localizing holes (backend={backend}) …")
+        hole_mask, coords = localize_holes(mask, dilation_radius=dilation_radius, backend=backend)
 
         print(f"[INFO] Found {len(coords)} hole location(s)")
 
@@ -463,7 +436,7 @@ def make_components_widget(viewer: napari.Viewer) -> Container:
 
         data = np.asarray(layer.data)
         binary = (data > 0).astype(np.uint8)
-        labels, n = cc3d.connected_components(binary, connectivity=26, return_N=True)
+        labels, n = label_components(binary, connectivity=26)
         print(f"[INFO] {n} connected component(s) (26-conn) in '{layer_name}'")
 
         out_name = f"{layer_name}_cc26"
@@ -557,10 +530,6 @@ def parse_args() -> argparse.Namespace:
                     help="Foreground label value (default: 1).")
     ap.add_argument("--ignore-value", type=int, default=2,
                     help="Ignore label value (default: 2).")
-    ap.add_argument("--fg-connectivity", type=int, default=6, choices=[6, 18, 26],
-                    help="FG connectivity for hole detection (default: 6).")
-    ap.add_argument("--bg-connectivity", type=int, default=6, choices=[6, 18, 26],
-                    help="BG connectivity for hole detection (default: 6).")
     return ap.parse_args()
 
 

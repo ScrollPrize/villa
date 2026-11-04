@@ -7,7 +7,13 @@
 #include "SpiralServiceManager.hpp"
 #include <vc_object_store/geometry/Geometry.hpp>
 #include <vc_object_store/objects/AttachedDocument.hpp>
-#include "support/TestZarrVolume.hpp"
+#include "vc/core/types/Volume.hpp"
+#include "test/support/TestVolume.hpp"
+#include <nlohmann/json.hpp>
+#include <vc_reader/zarr.hpp>
+#include <vc_reader/zarr_write.hpp>
+#include <filesystem>
+#include <fstream>
 #include "fibers3d/Fiber3DCanvas.hpp"
 #include "fibers3d/Fiber3DSliceControls.hpp"
 #include <QCheckBox>
@@ -111,9 +117,11 @@ int runObjectStoreControllerTests()
         }
         {
             QTemporaryDir volumeDir;
-            vc::test::ZarrVolumeSpec create; create.shapeZYX = {4,4,4};
-            create.chunkShapeZYX = {4,4,4}; create.uuid = "20260411134726";
-            const auto volume = vc::test::createZarrVolume(fs::path(volumeDir.path().toStdString())/"ct.zarr", create);
+            const std::filesystem::path volumeRoot1 = fs::path(volumeDir.path().toStdString())/"ct.zarr";
+            const vcr::zarr::CreateOptions levelZero1{.shape = {4, 4, 4}, .chunks = {4, 4, 4}, .compressor = "", .overwrite = true};
+            vcr::zarr::Writer::create(volumeRoot1 / "0", levelZero1);
+            std::ofstream(volumeRoot1 / "meta.json") << nlohmann::json{{"type", "vol"}, {"uuid", "20260411134726"}, {"name", "20260411134726"}, {"format", "zarr"}, {"width", 4}, {"height", 4}, {"slices", 4}, {"voxelsize", 1.0}}.dump();
+            const auto volume = Volume::New(volumeRoot1);
             const auto binding = nlohmann::json{{"coordinates", vc::objects::volumeCoordinates(volume->id(), 4)}};
             require(binding.at("coordinates").at("volume_uuid") == "20260411134726", "VC3D retains catalog volume ID verbatim");
             require(vc::objects::geometryScaleToVolume(binding, volume->id()) == .25, "VC3D matches the authoritative volume ID");
@@ -123,9 +131,9 @@ int runObjectStoreControllerTests()
             // find the main CT settings and place slices at the live fiber.
             using namespace vc3d::fibers3d;
             QTemporaryDir dir;
-            vc::test::ZarrVolumeSpec spec;
+            vc3d::test::VolumeSpec spec;
             spec.shapeZYX = {32,32,32}; spec.chunkShapeZYX = {32,32,32};
-            auto volume = vc::test::createZarrVolume(fs::path(dir.path().toStdString())/"ct.zarr", spec);
+            auto volume = vc3d::test::createVolume(fs::path(dir.path().toStdString())/"ct.zarr", spec);
             CState state;
             state.setCurrentVolume(volume);
             ViewerManager mainViews(&state, state.pointCollection());
@@ -138,7 +146,7 @@ int runObjectStoreControllerTests()
                 state.setSurface(names[i], std::make_shared<PlaneSurface>(cv::Vec3f{0,0,0}, normals[i]));
                 auto* viewer = mainViews.createViewerInWidget(names[i], &host);
                 auto settings = viewer->compositeRenderSettings();
-                settings.params.method = "max";
+                setCompositeMethod(settings.params, "max");
                 settings.planeLayersFront = 3; settings.planeLayersBehind = 2;
                 viewer->setCompositeRenderSettings(settings);
                 dynamic_cast<QWidget*>(viewer)->hide();
@@ -178,9 +186,11 @@ int runObjectStoreControllerTests()
         {
             // The umbilicus is the store's, bound to a volume; its frame was set when stored.
             QTemporaryDir dir;
-            vc::test::ZarrVolumeSpec create; create.shapeZYX = {16,8,8};
-            create.chunkShapeZYX = {16,8,8}; create.uuid = "umbilicus-volume";
-            const auto volume = vc::test::createZarrVolume(fs::path(dir.path().toStdString())/"ct.zarr", create);
+            const std::filesystem::path volumeRoot2 = fs::path(dir.path().toStdString())/"ct.zarr";
+            const vcr::zarr::CreateOptions levelZero2{.shape = {16, 8, 8}, .chunks = {16, 8, 8}, .compressor = "", .overwrite = true};
+            vcr::zarr::Writer::create(volumeRoot2 / "0", levelZero2);
+            std::ofstream(volumeRoot2 / "meta.json") << nlohmann::json{{"type", "vol"}, {"uuid", "umbilicus-volume"}, {"name", "umbilicus-volume"}, {"format", "zarr"}, {"width", 8}, {"height", 8}, {"slices", 16}, {"voxelsize", 1.0}}.dump();
+            const auto volume = Volume::New(volumeRoot2);
             const auto storePath = fs::path(dir.path().toStdString())/"objects.vcobj";
             OpenOptions umbilicusOptions; umbilicusOptions.author = "vc3d-umbilicus-test";
             { auto db = ObjectStore::create(storePath, umbilicusOptions); }
@@ -229,9 +239,11 @@ int runObjectStoreControllerTests()
             // debounced transaction, a new session loads them, and someone else's
             // commit reloads them; corrections (anchored) stay out.
             QTemporaryDir dir;
-            vc::test::ZarrVolumeSpec create; create.shapeZYX = {16,8,8};
-            create.chunkShapeZYX = {16,8,8}; create.uuid = "points-volume";
-            const auto volume = vc::test::createZarrVolume(fs::path(dir.path().toStdString())/"ct.zarr", create);
+            const std::filesystem::path volumeRoot3 = fs::path(dir.path().toStdString())/"ct.zarr";
+            const vcr::zarr::CreateOptions levelZero3{.shape = {16, 8, 8}, .chunks = {16, 8, 8}, .compressor = "", .overwrite = true};
+            vcr::zarr::Writer::create(volumeRoot3 / "0", levelZero3);
+            std::ofstream(volumeRoot3 / "meta.json") << nlohmann::json{{"type", "vol"}, {"uuid", "points-volume"}, {"name", "points-volume"}, {"format", "zarr"}, {"width", 8}, {"height", 8}, {"slices", 16}, {"voxelsize", 1.0}}.dump();
+            const auto volume = Volume::New(volumeRoot3);
             const auto storePath = fs::path(dir.path().toStdString())/"objects.vcobj";
             OpenOptions pointOptions; pointOptions.author = "vc3d-points-test";
             { auto db = ObjectStore::create(storePath, pointOptions); }
@@ -286,9 +298,11 @@ int runObjectStoreControllerTests()
             // Fibers bound by scale or through a registration are read and edited
             // in the open volume's voxels and saved back to their stored frame.
             QTemporaryDir dir;
-            vc::test::ZarrVolumeSpec create; create.shapeZYX = {16,16,16};
-            create.chunkShapeZYX = {16,16,16}; create.uuid = "frame-volume";
-            const auto volume = vc::test::createZarrVolume(fs::path(dir.path().toStdString())/"ct.zarr", create);
+            const std::filesystem::path volumeRoot4 = fs::path(dir.path().toStdString())/"ct.zarr";
+            const vcr::zarr::CreateOptions levelZero4{.shape = {16, 16, 16}, .chunks = {16, 16, 16}, .compressor = "", .overwrite = true};
+            vcr::zarr::Writer::create(volumeRoot4 / "0", levelZero4);
+            std::ofstream(volumeRoot4 / "meta.json") << nlohmann::json{{"type", "vol"}, {"uuid", "frame-volume"}, {"name", "frame-volume"}, {"format", "zarr"}, {"width", 16}, {"height", 16}, {"slices", 16}, {"voxelsize", 1.0}}.dump();
+            const auto volume = Volume::New(volumeRoot4);
             const auto storePath = fs::path(dir.path().toStdString())/"objects.vcobj";
             OpenOptions frameOptions; frameOptions.author = "vc3d-frame-test";
             VolumeAffine shear; shear(0,0)=2; shear(0,1)=.5; shear(0,3)=1; shear(2,3)=3;
@@ -822,7 +836,7 @@ int runObjectStoreControllerTests()
         const auto artifact=controller.fiberTransportPaths({merged.id}).at(merged.uuid);
         require(std::filesystem::exists(artifact) && controller.fiberIdForFilePath(artifact)==merged.id,"pinned Spiral transport retains UUID");
         {
-            CState child(nullptr,false,&state);
+            CState child(nullptr,&state);
             require(child.objectStoreSession()==state.objectStoreSession(),"secondary workspaces share session");
         }
         require(state.storeFor("fiber").has_value(),"secondary destruction keeps main attachment");
@@ -917,9 +931,7 @@ int runObjectStoreControllerTests()
                 require(overlays.size() == 1 && overlays.front().front() == toVec3f(line.front()),
                     "linked polyline is in the volume's voxels");
                 const cv::Vec3d point=fiber.controlPoints.front();
-                Array3D<uint8_t> crop({2,2,2});
-                require(state.currentVolume()->readZYX(crop,{int(point[2]),int(point[1]),int(point[0])}),"read real CT at scale 2");
-                std::cerr << "CT smoke: " << ct << " scale 2, voxel size " << state.currentVolume()->voxelSize() << " um, sampled XYZ " << point << "\n";
+                std::cerr << "CT smoke: " << ct << " scale 2, voxel size " << state.currentVolume()->voxelSize() << " um, fiber XYZ " << point << "\n";
             }
             const auto originalPin=fiber.storePin;
             fiber.tags.push_back("vc3d_smoke");

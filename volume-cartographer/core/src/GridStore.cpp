@@ -596,10 +596,10 @@ public:
                 throw std::runtime_error("Invalid GridStore file: metadata out of bounds.");
             }
             std::string meta_str(meta_start, json_meta_size);
-            meta_ = utils::Json::parse(meta_str);
+            meta_ = nlohmann::json::parse(meta_str);
         }
     }
-    utils::Json meta_;
+    nlohmann::json meta_;
 
 private:
     char* write_seglist(char* current, const LineSegList& seglist) const {

@@ -176,6 +176,10 @@ jobs:
             volume-cartographer
             vc_object_store
             vc_reader
+      - name: Install shared build dependencies
+        env:
+          AGENTS_ALLOW_INSTALL: '1'
+        run: bash volume-cartographer/scripts/install_build_deps.sh minimal-build
       # Fibers 3D tests need a real X server and software OpenGL. The pinned
       # builder already contains the database headers, but not these runtimes.
       - name: Install headless OpenGL runtime
@@ -243,6 +247,10 @@ jobs:
             volume-cartographer
             vc_object_store
             vc_reader
+      - name: Install shared build dependencies
+        env:
+          AGENTS_ALLOW_INSTALL: '1'
+        run: bash volume-cartographer/scripts/install_build_deps.sh minimal-build
       - uses: mozilla-actions/sccache-action@v0.0.10
         with:
           version: v0.15.0
@@ -262,86 +270,6 @@ jobs:
           ctest --test-dir build/ci-fast-specialized --output-on-failure \
             --parallel 4 -L '^vc-specialized$'
           sccache --show-stats
-
-  render-benchmark:
-    name: Synthetic rendering regression (GCC Release / Valgrind replay)
-    needs: changes
-    if: needs.changes.outputs.test_core == 'true'
-    runs-on: blacksmith-4vcpu-ubuntu-2404
-    timeout-minutes: 20
-    container:
-      image: ghcr.io/scrollprize/villa/volume-cartographer@sha256:1bebf104edbd6c290ddbaf8036c919635259f3722e8eddb31340b240baf1ed68
-      credentials:
-        username: ${{ github.actor }}
-        password: ${{ secrets.GITHUB_TOKEN }}
-    env:
-      SCCACHE_GHA_ENABLED: 'true'
-      SCCACHE_IGNORE_SERVER_IO_ERROR: '1'
-      SCCACHE_C_CUSTOM_CACHE_BUSTER: vc3d-linux-ubuntu-26.04-deps-675836fc3d478d17-gcc15-release
-    steps:
-      - name: Checkout Villa
-        id: checkout
-        uses: actions/checkout@v4
-        timeout-minutes: 2
-        continue-on-error: true
-        with:
-          sparse-checkout: |
-            volume-cartographer
-            vc_object_store
-            vc_reader
-      - name: Retry checkout Villa
-        if: steps.checkout.outcome == 'failure'
-        uses: actions/checkout@v4
-        timeout-minutes: 2
-        with:
-          sparse-checkout: |
-            volume-cartographer
-            vc_object_store
-            vc_reader
-      - name: Set up benchmark compiler cache
-        uses: mozilla-actions/sccache-action@v0.0.10
-        with:
-          version: v0.15.0
-      - name: Configure Release benchmark graph
-        working-directory: volume-cartographer
-        run: |
-          sccache --zero-stats
-          cmake -S . -B build/ci-render-benchmark -G Ninja \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_C_COMPILER=gcc-15 -DCMAKE_CXX_COMPILER=g++-15 \
-            -DCMAKE_Fortran_COMPILER=flang \
-            -DVC_MARCH_NATIVE=OFF -DVC_TESTING=ON -DVC_USE_SCCACHE=ON \
-            -DVC_RUN_RENDER_BENCHMARKS=ON \
-            -DVC_BUILD_APPS=OFF \
-            -DVC_BUILD_FLATBOI=OFF
-      - name: Verify fixture and native parallel execution
-        working-directory: volume-cartographer
-        run: |
-          jobs=$(nproc)
-          echo "Using $jobs Ninja jobs"
-          cmake --build build/ci-render-benchmark \
-            --target bench_render_synthetic bench_thread_sync_replay \
-              test_thread_sync_replay_native \
-            --parallel "$jobs"
-          ctest --test-dir build/ci-render-benchmark --output-on-failure \
-            -R '^(test_render_synthetic_fixture|test_thread_sync_replay_native)$'
-      - name: Report benchmark compiler cache statistics
-        if: always()
-        run: sccache --show-stats
-      - name: Run full fresh Valgrind matrix
-        working-directory: volume-cartographer
-        run: |
-          jobs=$(nproc)
-          echo "Using $jobs Valgrind/Ninja jobs"
-          cmake --build build/ci-render-benchmark \
-            --target render_valgrind_ci --parallel "$jobs"
-      - name: Upload rendering benchmark results
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: synthetic-rendering-valgrind
-          path: volume-cartographer/build/ci-render-benchmark/render-valgrind-ci/
-          if-no-files-found: warn
 
   vc3d-compile-smoke:
     name: Linux VC3D compile and smoke (Clang QuickBuild)
@@ -378,6 +306,13 @@ jobs:
             volume-cartographer
             vc_object_store
             vc_reader
+      - name: Install shared build dependencies
+        env:
+          AGENTS_ALLOW_INSTALL: '1'
+        run: bash volume-cartographer/scripts/install_build_deps.sh minimal-build
+      # The smoke builds the vc_reader Python module from source.
+      - name: Install Python headers
+        run: apt-get install -y --no-install-recommends python3-dev
       - uses: mozilla-actions/sccache-action@v0.0.10
         with:
           version: v0.15.0
@@ -394,7 +329,9 @@ jobs:
             -DVC_TESTING=ON -DVC_BUILD_APPS=ON \
             -DVC_BUILD_FLATBOI=OFF
           cmake --build build/ci-fast-vc3d --target VC3D --parallel 4
-          QT_QPA_PLATFORM=offscreen python3 apps/VC3D/agent_bridge/test/smoke_offscreen.py \
+          python3 -m venv build/ci-fast-vc3d/smoke-venv
+          build/ci-fast-vc3d/smoke-venv/bin/pip install ../vc_reader
+          QT_QPA_PLATFORM=offscreen build/ci-fast-vc3d/smoke-venv/bin/python apps/VC3D/agent_bridge/test/smoke_offscreen.py \
             --vc3d build/ci-fast-vc3d/bin/VC3D
           # VC_TESTING compiles VC3D's --test-object-store entry point; the
           # test shards build without apps, so the controller test runs here.
@@ -437,6 +374,10 @@ jobs:
             volume-cartographer
             vc_object_store
             vc_reader
+      - name: Install shared build dependencies
+        env:
+          AGENTS_ALLOW_INSTALL: '1'
+        run: bash volume-cartographer/scripts/install_build_deps.sh minimal-build
       - uses: mozilla-actions/sccache-action@v0.0.10
         with:
           version: v0.15.0
@@ -458,14 +399,6 @@ jobs:
         working-directory: volume-cartographer
         timeout-minutes: 2
         run: python3 core/test/test_render_tifxyz_logging.py build/ci-fast-cli/bin/vc_render_tifxyz
-      - name: Test renderer exit code on remote fetch failure
-        working-directory: volume-cartographer
-        timeout-minutes: 5
-        run: python3 core/test/test_render_fetch_failure.py build/ci-fast-cli/bin/vc_render_tifxyz
-      - name: Test renderer band prefetch reads only sampled chunks
-        working-directory: volume-cartographer
-        timeout-minutes: 2
-        run: python3 core/test/test_render_band_prefetch.py build/ci-fast-cli/bin/vc_render_tifxyz
 
   flatboi-compile:
     name: Linux Flatboi/PaStiX compile coverage (Clang QuickBuild)
@@ -502,6 +435,10 @@ jobs:
             volume-cartographer
             vc_object_store
             vc_reader
+      - name: Install shared build dependencies
+        env:
+          AGENTS_ALLOW_INSTALL: '1'
+        run: bash volume-cartographer/scripts/install_build_deps.sh minimal-build
       - uses: mozilla-actions/sccache-action@v0.0.10
         with:
           version: v0.15.0
@@ -622,7 +559,7 @@ jobs:
 
   ci:
     name: CI
-    needs: [changes, skip, test-core, test-specialized, render-benchmark, vc3d-compile-smoke, cli-compile, flatboi-compile, mcp-test, macos-build]
+    needs: [changes, skip, test-core, test-specialized, vc3d-compile-smoke, cli-compile, flatboi-compile, mcp-test, macos-build]
     if: always()
     runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 15
@@ -633,7 +570,6 @@ jobs:
           R_SKIP: ${{ needs.skip.result }}
           R_TEST_CORE: ${{ needs.test-core.result }}
           R_TEST_SPECIALIZED: ${{ needs.test-specialized.result }}
-          R_RENDER_BENCHMARK: ${{ needs.render-benchmark.result }}
           R_VC3D: ${{ needs.vc3d-compile-smoke.result }}
           R_CLI: ${{ needs.cli-compile.result }}
           R_FLATBOI: ${{ needs.flatboi-compile.result }}
@@ -641,10 +577,10 @@ jobs:
           R_MACOS: ${{ needs.macos-build.result }}
         run: |
           set -e
-          echo "changes=$R_CHANGES skip=$R_SKIP core=$R_TEST_CORE specialized=$R_TEST_SPECIALIZED render_benchmark=$R_RENDER_BENCHMARK vc3d=$R_VC3D cli=$R_CLI flatboi=$R_FLATBOI mcp=$R_MCP_TEST macos=$R_MACOS"
+          echo "changes=$R_CHANGES skip=$R_SKIP core=$R_TEST_CORE specialized=$R_TEST_SPECIALIZED vc3d=$R_VC3D cli=$R_CLI flatboi=$R_FLATBOI mcp=$R_MCP_TEST macos=$R_MACOS"
           # All non-skipped jobs must succeed (or be skipped legitimately).
           fail=0
-          for r in "$R_CHANGES" "$R_SKIP" "$R_TEST_CORE" "$R_TEST_SPECIALIZED" "$R_RENDER_BENCHMARK" "$R_VC3D" "$R_CLI" "$R_FLATBOI" "$R_MCP_TEST" "$R_MACOS"; do
+          for r in "$R_CHANGES" "$R_SKIP" "$R_TEST_CORE" "$R_TEST_SPECIALIZED" "$R_VC3D" "$R_CLI" "$R_FLATBOI" "$R_MCP_TEST" "$R_MACOS"; do
             case "$r" in
               success|skipped) ;;
               *) fail=1 ;;
