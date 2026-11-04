@@ -1,3 +1,4 @@
+#include "internal/Versions.hpp"
 #include "internal/EdgeSql.hpp"
 #include "geometry/Dependencies.hpp"
 #include "internal/History.hpp"
@@ -170,7 +171,9 @@ std::vector<EdgeRecord> ObjectStore::selectEdges(const Txn& txn, const EdgeSelec
         return selectEdges(txn, selected, projection);
     }
     auto rows = edgeSelectionQuery(db, selection, columns);
-    return readEdgeRows(db, *rows, fields);
+    auto records = readEdgeRows(db, *rows, fields);
+    if (!txn.write_) attachRelationshipVersions(db, records);
+    return records;
 }
 
 std::string ObjectStore::attach(WriteTxn& txn, const std::string& dataUuid, const std::string& ownerUuid, const std::string& role)

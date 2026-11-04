@@ -68,6 +68,13 @@ struct RecordCommon {
     std::optional<int64_t> approvedGeneration;
     std::vector<std::string> tags;
     std::string meta = "{}";  // JSON object text
+    // Set by selectObjects/selectEdges in read transactions: the numbered
+    // version of the published head this record was read from, and the
+    // history generation it was published in, so a listing pins exactly what
+    // it returned. Absent in write transactions, whose rows may not be
+    // published yet. Ignored by writes.
+    std::optional<int64_t> version;
+    std::string versionGeneration;
 };
 
 struct ObjectRecord : RecordCommon {

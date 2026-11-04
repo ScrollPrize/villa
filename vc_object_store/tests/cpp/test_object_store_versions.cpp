@@ -218,6 +218,26 @@ try {
             "pre-restore cursor revalidates");
     }
 
+    // Selections pin what they return: after deletion, recreation and a
+    // generation change, every selected record carries its head's version
+    // and generation. Rows read inside a write carry none (maybe unpublished).
+    {
+        auto txn = db.read();
+        const auto selected = db.selectObjects(txn, ObjectSelection{});
+        require(!selected.empty(), "selected objects");
+        for (const auto& record : selected) {
+            const auto head = db.currentObjectRevision(txn, record.uuid);
+            require(record.version == head->version && record.versionGeneration == head->generation,
+                    "selected version is the head version");
+        }
+    }
+    {
+        auto txn = db.write();
+        db.setMeta(txn, a, "unpublished", "1");
+        for (const auto& record : db.selectObjects(txn, ObjectSelection{}))
+            require(!record.version, "no version inside a write");
+    }
+
     // Catalog registrations become versioned records; once recorded they
     // resolve from the store, never from a client's newer catalog copy.
     {

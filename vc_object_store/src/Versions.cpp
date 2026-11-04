@@ -105,6 +105,35 @@ std::optional<int64_t> detail::headVersion(sqlite3* db, const std::string& objec
     return s.row() ? std::optional(s.i64(0)) : std::nullopt;
 }
 
+void detail::attachObjectVersions(sqlite3* db, std::vector<ObjectRecord>& records)
+{
+    // A selected (live, published) object's head is its newest version: one
+    // backward seek in the (object_uuid, version) key instead of a head join.
+    Statement s(db, "SELECT version,generation FROM object_versions WHERE object_uuid=? ORDER BY version DESC LIMIT 1");
+    for (auto& record : records) {
+        s.reset();
+        s.bind(1, record.uuid);
+        if (s.row()) {
+            record.version = s.i64(0);
+            record.versionGeneration = s.text(1);
+        }
+    }
+}
+
+void detail::attachRelationshipVersions(sqlite3* db, std::vector<EdgeRecord>& records)
+{
+    Statement s(db, "SELECT version,generation,deleted FROM relationship_versions WHERE edge_uuid=? "
+                    "ORDER BY version DESC LIMIT 1");
+    for (auto& record : records) {
+        s.reset();
+        s.bind(1, record.uuid);
+        if (s.row() && !s.i64(2)) {
+            record.version = s.i64(0);
+            record.versionGeneration = s.text(1);
+        }
+    }
+}
+
 std::optional<int64_t> detail::relationshipHeadVersion(sqlite3* db, const std::string& edgeUuid)
 {
     Statement s(db, "SELECT version,deleted FROM relationship_versions WHERE edge_uuid=? ORDER BY version DESC LIMIT 1",

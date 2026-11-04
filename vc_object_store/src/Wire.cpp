@@ -337,6 +337,21 @@ ObjectSelection objectQueryRequestFromJson(const std::string& text, std::optiona
     return selectionFrom(j.at("selection"));
 }
 
+// The pinned head version a selection read (RecordCommon::version).
+static void versionToJson(const RecordCommon& record, Json& j)
+{
+    if (!record.version) return;
+    j["version"] = *record.version;
+    j["version_generation"] = record.versionGeneration;
+}
+
+static void versionFromJson(const Json& j, RecordCommon& record)
+{
+    if (!j.contains("version")) return;
+    record.version = j.at("version").get<int64_t>();
+    record.versionGeneration = j.at("version_generation").get<std::string>();
+}
+
 std::string objectQueryResultToJson(const StoreStatus& status, const std::vector<ObjectRecord>& objects,
                                     const std::optional<std::vector<std::string>>& fields)
 {
@@ -345,6 +360,7 @@ std::string objectQueryResultToJson(const StoreStatus& status, const std::vector
     for (const auto& object : objects) {
         auto j = withExactMeta(objectToJson(object, selected ? &*selected : nullptr), object);
         if (object.volumeLength) j["volume_length"] = *object.volumeLength;
+        versionToJson(object, j);
         array.push_back(std::move(j));
     }
     return envelope(status, "objects", std::move(array)).dump();
@@ -357,6 +373,7 @@ std::vector<ObjectRecord> objectQueryResultFromJson(const std::string& text, Sto
         auto record = exactMetaFrom(j, objectFromJson(j));
         presentCommonFromJson(j, record);
         read(j, "volume_length", record.volumeLength);
+        versionFromJson(j, record);
         result.push_back(std::move(record));
     }
     return result;
@@ -380,14 +397,22 @@ std::string edgeQueryResultToJson(const StoreStatus& status, const std::vector<E
 {
     const auto selected = fieldSet(fields);
     auto array = Json::array();
-    for (const auto& edge : edges) array.push_back(withExactMeta(edgeToJson(edge, selected ? &*selected : nullptr, false), edge));
+    for (const auto& edge : edges) {
+        auto j = withExactMeta(edgeToJson(edge, selected ? &*selected : nullptr, false), edge);
+        versionToJson(edge, j);
+        array.push_back(std::move(j));
+    }
     return envelope(status, "edges", std::move(array)).dump();
 }
 
 std::vector<EdgeRecord> edgeQueryResultFromJson(const std::string& text, StoreStatus* asOf)
 {
     std::vector<EdgeRecord> result;
-    for (const auto& j : unwrap(text, asOf, "edges")) result.push_back(exactMetaFrom(j, edgeFromJson(j, true)));
+    for (const auto& j : unwrap(text, asOf, "edges")) {
+        auto edge = exactMetaFrom(j, edgeFromJson(j, true));
+        versionFromJson(j, edge);
+        result.push_back(std::move(edge));
+    }
     return result;
 }
 

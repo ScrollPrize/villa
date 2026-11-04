@@ -3,6 +3,10 @@
 #include "internal/Database.hpp"
 
 namespace vc::objects::detail {
+// Fills RecordCommon::version/versionGeneration of records selected in a read
+// transaction from their published heads (one prepared lookup per record).
+void attachObjectVersions(sqlite3*, std::vector<ObjectRecord>&);
+void attachRelationshipVersions(sqlite3*, std::vector<EdgeRecord>&);
 // Tables shared by new stores and the offline converter. `generation` is the
 // initial active history generation.
 void createVersionSchema(sqlite3*, const std::string& generation, const std::string& reason = "created");
