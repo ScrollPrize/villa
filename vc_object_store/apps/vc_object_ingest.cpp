@@ -64,9 +64,11 @@ try {
     auto db = std::filesystem::exists(path) ? vc::objects::ObjectStore::open(path, options) : vc::objects::ObjectStore::create(path, options);
     bool failed = false;
     auto print = [&](const vc::objects::GeometryIngestReport& report) {
-        std::cout << report.ingested << " ingested, " << report.problems.size() << " problems\n";
+        std::cout << report.ingested << " ingested, " << report.existing.size() << " already in the store, "
+                  << report.problems.size() << " problems\n";
         for (const auto& problem : report.problems) std::cerr << problem << '\n';
-        failed |= !report.problems.empty();
+        if (report.fatalError) std::cerr << "stopped: " << *report.fatalError << '\n';
+        failed |= !report.problems.empty() || report.fatalError.has_value();
     };
     for (const auto& [kind, source] : sources) {
         vc::objects::util::TerminalProgress progress("Ingest " + kind, showProgress);

@@ -43,14 +43,15 @@ def test_legacy_fibers_without_uuids(tmp_path, version):
             path.write_text(json.dumps(document))
     with ObjectStore.create(str(tmp_path / "plain.vcobj"), author="test") as store:
         report = store.ingest_geometry_source("fiber", tmp_path / "fibers")
-        assert report == dict(ingested=2, edges_imported=1, problems=[])
+        assert {k: report[k] for k in ("ingested", "edges_imported", "problems")} == dict(ingested=2, edges_imported=1, problems=[])
         default_namespace = uuid.UUID("e14f6968-9145-494d-8b06-ab2f2fac7f3b")
         for name in names:
             assert store.object(str(uuid.uuid5(default_namespace, "vc3d_fiber/" + name + ".json")))
     with ObjectStore.create(str(tmp_path / "derived.vcobj"), author="test") as store:
         report = store.ingest_geometry_source("fiber", tmp_path / "fibers", uuid_namespace=NAMESPACE)
-        assert report == dict(ingested=2, edges_imported=1, problems=[])
         ids = [derived("fiber:" + name) for name in names]
+        assert report == dict(ingested=2, edges_imported=1, problems=[], uuids=ids, existing=[],
+                              cancelled=False, fatal_error=None)
         edge = store.edges_by_kind("fiber_branch")[0]
         assert {edge["a"], edge["b"]} == set(ids)
         source = store.object(ids[0])["meta"]["source"]
@@ -59,6 +60,8 @@ def test_legacy_fibers_without_uuids(tmp_path, version):
         # The same namespace maps the same files to the same identities, so a repeat is refused.
         again = store.ingest_geometry_source("fiber", tmp_path / "fibers", uuid_namespace=NAMESPACE)
         assert again["ingested"] == 0 and "already exists" in " ".join(again["problems"])
+        # One clash rejects the whole batch, and every clash is reported.
+        assert again["uuids"] == [] and sorted(again["existing"]) == sorted(ids)
 
 
 def test_canonical_fiber_uuids_are_kept_and_branches_resolve_to_them(tmp_path):
@@ -66,7 +69,7 @@ def test_canonical_fiber_uuids_are_kept_and_branches_resolve_to_them(tmp_path):
     write_v3_fibers(tmp_path / "fibers", kept_uuid=kept)
     with ObjectStore.create(str(tmp_path / "mixed.vcobj"), author="test") as store:
         report = store.ingest_geometry_source("fiber", tmp_path / "fibers", uuid_namespace=NAMESPACE)
-        assert report == dict(ingested=2, edges_imported=1, problems=[])
+        assert {k: report[k] for k in ("ingested", "edges_imported", "problems")} == dict(ingested=2, edges_imported=1, problems=[])
         edge = store.edges_by_kind("fiber_branch")[0]
         assert {edge["a"], edge["b"]} == {derived("fiber:anon_0"), kept}
         assert "uuid_derivation" not in store.object(kept)["meta"]["source"]
