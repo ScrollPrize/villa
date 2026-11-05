@@ -45,3 +45,6 @@ def test_older_revisions_read_in_the_frame_they_were_stored_in(db_path):
     assert (older.version, current.version) == (1, 3) and older.record["meta"]["coordinates"]["volume_uuid"] == "a"
     with pytest.raises(ValueError, match="version 9"):
         read_surface(db_path, uid, volume="a", version=9)
+    assert read_surface(db_path, uid, volume="a", version=1, generation=older.generation).geometry_revision == first
+    with pytest.raises(ValueError, match="version 1"):
+        read_surface(db_path, uid, volume="a", version=1, generation="00000000-0000-4000-8000-000000000000")

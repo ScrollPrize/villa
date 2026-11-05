@@ -22,20 +22,21 @@ class SurfaceGrid(NamedTuple):
     valid: np.ndarray  # (rows, columns) bool
     scale: tuple  # grid scale in the read volume's voxels
     record: dict
-    version: int  # the numbered object version read (in ``generation``, the store's active one)
+    version: int  # the numbered object version read, in ``generation``
     generation: str
     geometry_revision: str  # payload identity of its geometry (reads its channels)
     channels: frozenset  # names of the per-vertex channels (not points or valid)
 
 
-def read_surface(store, surface_uuid, *, volume, version=None, target_scale=1.0) -> SurfaceGrid:
-    """The surface (its current version, or numbered ``version`` in the store's active generation) in voxels of
-    ``volume`` at ``target_scale``, through the store's mapping to it (its binding, or a registration). Raises
+def read_surface(store, surface_uuid, *, volume, version=None, generation=None, target_scale=1.0) -> SurfaceGrid:
+    """The surface (its current version, or numbered ``version`` in ``generation``, default the store's active
+    one) in voxels of ``volume`` at ``target_scale``, through the store's mapping to it (its binding, or a registration). Raises
     ValueError when the surface (version) does not exist or does not map to ``volume``."""
     with ObjectStore.open(str(store), read_only=True, reader_pool_size=1) as db:
         # Every read through db comes before the snapshot, which holds the one pooled reader.
         status = db.status()
-        generation = status["generation"]
+        if version is None or generation is None:
+            generation = status["generation"]
         if version is None:
             record = db.object(surface_uuid)
             if record is None or record["kind"] != "surface":
