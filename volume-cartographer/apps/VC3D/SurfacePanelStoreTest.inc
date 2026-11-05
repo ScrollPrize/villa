@@ -169,8 +169,8 @@ int runSurfacePanelStoreTests()
         state.objectStoreSession()->setGeometryFetcher(vc::objects::kCatalogMetaKey,
             [&](ObjectStore& store, const std::string& uuid, const ObjectStoreSession::FetchWrite& write) {
                 { std::lock_guard lock(fetchedMutex); fetched.push_back(uuid); }
-                const auto revision = store.currentObjectRevision(store.read(), uuid)->uuid;
-                write({{uuid, revision}}, [&](ObjectStore& db, WriteTxn& txn) {
+                const auto version = store.currentVersion(store.read(), uuid);
+                write({{uuid, version}}, [&](ObjectStore& db, WriteTxn& txn) {
                     const auto geometry = db.putGeometry(txn, uuid, quad_surface_geometry(grid));
                     db.setMeta(txn, uuid, "catalog_geometry_revision", nlohmann::json(geometry).dump());
                     db.setMeta(txn, uuid, "catalog_write", "\"fetched\"");
