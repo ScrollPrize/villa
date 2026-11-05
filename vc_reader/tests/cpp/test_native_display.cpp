@@ -13,11 +13,27 @@ int main() {
     std::array<float,8> values{-1,0,1.9f,254.9f,256,NAN,INFINITY,-INFINITY};
     std::array<uint8_t,8> bytes{},coverage{};
     toUint8(values.data(),8,bytes.data(),coverage.data());
-    CHECK((bytes==std::array<uint8_t,8>{0,0,1,254,255,0,0,0}));
+    CHECK((bytes==std::array<uint8_t,8>{0,0,2,255,255,0,0,0}));
     CHECK((coverage==std::array<uint8_t,8>{1,1,1,1,1,0,0,0}));
+    // Halfway values round to even, without changing saturation or explicit policies.
+    const std::array<float,10> ties{-1,.5f,1.5f,2.5f,20.6f,254.5f,255.5f,65535,NAN,INFINITY};
+    std::array<uint8_t,10> rounded{};
+    std::array<uint16_t,10> wide{};
+    toUint8(ties.data(), ties.size(), rounded.data());
+    CHECK((rounded==std::array<uint8_t,10>{0,0,2,2,21,254,255,255,0,0}));
+    toUint16(ties.data(), ties.size(), wide.data());
+    CHECK((wide==std::array<uint16_t,10>{0,0,2,2,21,254,256,65535,0,65535}));
+    toUint8(ties.data(), ties.size(), rounded.data(), nullptr, {1,Rounding::Truncate,true});
+    CHECK((rounded==std::array<uint8_t,10>{0,0,1,2,20,254,255,255,0,255}));
+    toUint8(ties.data(), ties.size(), rounded.data(), nullptr, {1,Rounding::HalfUp,true});
+    CHECK((rounded==std::array<uint8_t,10>{0,1,2,3,21,255,255,255,0,255}));
+    const std::array<float,3> nearTie{std::nextafter(.5f,0.f), .5f, std::nextafter(.5f,1.f)};
+    std::array<uint8_t,3> nearBytes{};
+    toUint8(nearTie.data(), nearTie.size(), nearBytes.data());
+    CHECK((nearBytes==std::array<uint8_t,3>{0,0,1}));
     std::array<uint32_t,256> ramp{},palette{},result{};
     windowLevelLut(ramp,10,110);
-    CHECK(ramp[10]==0xff000000u && ramp[110]==0xffffffffu && ramp[60]==0xff7f7f7fu);
+    CHECK(ramp[10]==0xff000000u && ramp[110]==0xffffffffu && ramp[60]==0xff808080u);
     static_assert(noexcept(windowLevelLut(ramp,0,0)));
     // Window edge cases: endpoints clamp into [0,255]; an empty or inverted
     // window becomes a step at low+1.
@@ -29,11 +45,12 @@ int main() {
     CHECK(ramp[200]==0xff000000u && ramp[201]==0xffffffffu);
     for(int i=0;i<256;++i)palette[i]=0xff000000u|uint32_t(i);
     paletteLut(result,palette,10,110);
-    CHECK(result[60]==palette[127] && result[0]==0xff000000u);
+    CHECK(result[60]==palette[128] && result[0]==0xff000000u);
     CHECK(blendArgb(0xff204060u,0x80402010u,1)==0xff504040u);
     // An opaque overlay mixes by opacity per channel, rounded; a transparent one keeps the base.
     CHECK(blendArgb(0xff204060u,0xffc08010u,0.3f)==0xff505348u);
     CHECK(blendArgb(0xff204060u,0u,0.3f)==0xff204060u);
+    CHECK(blendArgb(0xff000000u,0xff010305u,0.5f)==0xff000202u);
     // Strided input; output padding past cols is left untouched.
     const std::array<uint8_t,6> pixels{1,2,99,3,4,99};
     std::array<uint32_t,8> mapped; mapped.fill(0xdeadbeefu);

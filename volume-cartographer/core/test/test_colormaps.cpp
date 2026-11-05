@@ -94,3 +94,18 @@ TEST_CASE("makeColors: DiscreteLut (glasbey) maps label 0 to black, alpha=0xFF")
     // Label 0 → black (0xFF000000)
     CHECK(out[0] == 0xFF000000u);
 }
+
+TEST_CASE("fractional tints round intensities to nearest even")
+{
+    auto spec = resolve("red");
+    spec.tint = {0.5f, 0.25f, 0.75f};
+    cv::Mat_<uint8_t> values(1, 3);
+    values(0, 0) = 1;
+    values(0, 1) = 3;
+    values(0, 2) = 5;
+    std::array<uint32_t, 3> colors{};
+    makeColors(values, spec, colors.data(), 3);
+    CHECK(colors[0] == 0xFF000001u);
+    CHECK(colors[1] == 0xFF020102u);
+    CHECK(colors[2] == 0xFF020104u);
+}
