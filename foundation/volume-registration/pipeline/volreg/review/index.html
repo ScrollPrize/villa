@@ -39,6 +39,9 @@ table.steps td { vertical-align: top; padding: 5px 6px; }
 .err { color: var(--bad); }
 .settings { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; margin-top: 3px; }
 .settings input { width: 5.5em; }
+.settings input.unapplied { outline: 2px solid var(--select); background: color-mix(in srgb, var(--select) 25%, transparent); }
+.settings .unapplied-note { color: var(--bad); font-size: 12px; }
+.settings button.unapplied { border-color: var(--select); font-weight: 600; }
 .revisit { border: 1px solid var(--select); border-radius: 6px; padding: 5px 8px; margin-bottom: 8px; }
 </style>
 </head>
@@ -93,11 +96,24 @@ function detail(p, s) {
   return s.finished && s.state !== "running" ? `<span class="muted">last run ${ago(s.finished)}</span>` : "";
 }
 
-function settings(s) {
+// Values typed but not applied yet, by pair/stage/key; kept across the page's refreshes.
+const pending = {};
+const pendingKey = (pair, stage, key) => `${pair}/${stage}/${key}`;
+
+function settings(p, s) {
   if (!s.settings.length) return "";
-  return `<div class="settings">${s.settings.map(x =>
-    `<label>${x.label} <input type="number" min="1" data-stage="${s.name}" data-key="${x.key}" value="${x.value}"></label>`).join("")}
-    <button data-apply="${s.name}">Apply</button></div>`;
+  let dirty = false;
+  const fields = s.settings.map(x => {
+    const typed = pending[pendingKey(p.name, s.name, x.key)];
+    const changed = typed !== undefined && Number(typed) !== x.value;
+    dirty ||= changed;
+    return `<label>${x.label} <input type="number" min="${x.min}" data-stage="${s.name}" data-key="${x.key}"
+      data-applied="${x.value}" value="${changed ? typed : x.value}" class="${changed ? "unapplied" : ""}"
+      title="${x.min > 1 ? `can only grow: ${x.min} now` : ""}"></label>`;
+  }).join("");
+  return `<div class="settings">${fields}
+    <button data-apply="${s.name}" class="${dirty ? "unapplied" : ""}">Apply</button>
+    <span class="unapplied-note" ${dirty ? "" : "hidden"}>not applied</span></div>`;
 }
 
 async function load() {
@@ -129,7 +145,7 @@ async function load() {
       <table class="steps"><tbody>${p.stages.map(s => `<tr>
         <td><span class="badge ${s.state}">${STATE_TEXT[s.state]}</span></td>
         <td><b>${s.title}</b><div class="who">${s.human ? "you" : "automatic"} · ${s.name}</div></td>
-        <td>${detail(p, s)}${s.error ? `<div class="err">${escapeHtml(s.error)}</div>` : ""}${settings(s)}</td>
+        <td>${detail(p, s)}${s.error ? `<div class="err">${escapeHtml(s.error)}</div>` : ""}${settings(p, s)}</td>
         <td>${s.human ? "" : `<button data-redo="${s.name}" ${["blocked", "running"].includes(s.state) ? "disabled" : ""}
              title="Mark this step and the ones after it to run again">Redo</button>`}</td>
       </tr>`).join("")}</tbody></table>
@@ -151,8 +167,21 @@ async function load() {
     for (const b of box.querySelectorAll("[data-apply]")) b.onclick = () => {
       const values = {};
       for (const input of box.querySelectorAll(`input[data-stage="${b.dataset.apply}"]`)) values[input.dataset.key] = Number(input.value);
+      for (const key of Object.keys(values)) delete pending[pendingKey(box.dataset.name, b.dataset.apply, key)];
       act("params", {stage: b.dataset.apply, values});
     };
+    for (const input of box.querySelectorAll(".settings input")) {
+      input.oninput = () => {
+        const key = pendingKey(box.dataset.name, input.dataset.stage, input.dataset.key);
+        const changed = input.value !== "" && Number(input.value) !== Number(input.dataset.applied);
+        if (changed) pending[key] = input.value; else delete pending[key];
+        input.classList.toggle("unapplied", changed);
+        const row = input.closest(".settings");
+        const dirty = [...row.querySelectorAll("input")].some(i => i.classList.contains("unapplied"));
+        row.querySelector("button").classList.toggle("unapplied", dirty);
+        row.querySelector(".unapplied-note").hidden = !dirty;
+      };
+    }
     for (const input of box.querySelectorAll("input")) {
       input.onfocus = () => { editing = true; };
       input.onblur = () => { setTimeout(() => { if (!box.contains(document.activeElement) || document.activeElement.tagName !== "INPUT") editing = false; }, 200); };

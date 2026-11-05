@@ -152,3 +152,13 @@ def test_the_fits_page_lists_every_record_with_its_scores_and_tally(pairs, tmp_p
     assert a["scores"]["bend"]["passes"] and not a["scores"]["affine"]["passes"]
     assert a["blind"]["tally"]["f002"] == 1 and a["blind"]["tally"]["unsure"] == 1
     assert rows["pair-b"]["source"] == "first runs" and rows["pair-b"]["state"] == "needs a hold-out set"
+
+
+def test_a_count_can_only_grow(pairs):
+    reviews, record = pairs
+    reviews.set_params("pair-a", "blind", {"count": 30})
+    with pytest.raises(ValueError, match="can only grow"):
+        reviews.set_params("pair-a", "blind", {"count": 25})
+    reviews.set_params("pair-a", "fit", {"passes": 1})      # passes may go down
+    entry = next(s for s in reviews.pairs()["pairs"][0]["stages"] if s["name"] == "blind")
+    assert entry["settings"][0] == {"key": "count", "label": "patches in a round", "value": 30, "min": 30}

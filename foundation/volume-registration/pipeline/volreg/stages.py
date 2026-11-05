@@ -313,9 +313,11 @@ def run_score(pipeline, params):
 def run_blind(pipeline, params):
     """A blind round for the fit: the hold-out patches answered "lines up" or "partly" where
     its bend and its affine part place the patch furthest apart, the two options shuffled.
-    A round for this fit that someone has picked in, or that is as long as asked, is kept;
-    one nobody has picked in and shorter than asked -- drawn from too few answers, or before
-    the count was raised -- is drawn again under a new id. A new fit gets a new round."""
+
+    A round for this fit as long as asked is kept. One shorter than asked -- drawn from too
+    few answers, or before the count was raised -- grows: if someone has picked in it, the
+    next patches by spread are added after its items, which keep their places and picks;
+    if nobody has, it is drawn again under a new id. A new fit gets a new round."""
     fit = json.loads(pipeline.work("fit", "fit.json").read_text())
     candidates = [fit["fit"], fit["fit"] + fs.AFFINE]
     final = pipeline.record.read(rec.FINAL_REVIEW) if pipeline.record.exists(rec.FINAL_REVIEW) else {}
@@ -323,41 +325,50 @@ def run_blind(pipeline, params):
     events = pipeline.record.events()
     picked = {event["round"] for event in events if event["kind"] == "blind-pick"}
     this_fit = [round_ for round_ in rounds if round_["candidates"] == candidates]
-    if any(round_["id"] in picked or len(round_["items"]) >= params["count"] for round_ in this_fit):
+    if any(len(round_["items"]) >= params["count"] for round_ in this_fit):
         return [rec.FINAL_REVIEW]
-    rounds = [round_ for round_ in rounds if round_ not in this_fit]
-    taken = {round_["id"] for round_ in final.get("rounds") or []} | {
-        event["round"] for event in events if event["kind"] == "blind-round"}
+    grown = next((round_ for round_ in this_fit if round_["id"] in picked), None)
+    if grown is None:
+        rounds = [round_ for round_ in rounds if round_ not in this_fit]
+        taken = {round_["id"] for round_ in final.get("rounds") or []} | {
+            event["round"] for event in events if event["kind"] == "blind-round"}
+        round_id = next(f"c{number:03d}" for number in range(len(taken) + 1, 1000)
+                        if f"c{number:03d}" not in taken)
+        grown = {"id": round_id, "at": rec.now(), "candidates": candidates, "test_only": True,
+                 "items": []}
+        rounds.append(grown)
     held = {patch["id"]: patch for patch in pipeline.record.read(rec.HOLDOUT)["patches"]}
+    shown = {item["patch"] for item in grown["items"]}
     eligible = {patch_id for patch_id, patch in held.items()
                 if (patch.get("answer") or {}).get("answer") in params["answers"]}
     with session_lock(pipeline):
         session = open_session(pipeline)
-        rng = np.random.default_rng(params["seed"] + len(rounds))
         to_coarse = session.fine_um / session.coarse_um
         ranked = []
-        for patch_id in sorted(eligible):
+        for patch_id in sorted(eligible - shown):
             patch = session.patch(patch_id)
             placed = [session.placement(candidate, patch) for candidate in candidates]
             spread = float(np.linalg.norm(placed[0] - placed[1]) * to_coarse)
             if spread >= fs.SAME_PLACE_VOXELS:
                 ranked.append((spread, patch_id))
         ranked.sort(key=lambda item: (-item[0], item[1]))
-        round_id = next(f"c{number:03d}" for number in range(len(taken) + 1, 1000)
-                        if f"c{number:03d}" not in taken)
-        items = []
-        for index, (spread, patch_id) in enumerate(ranked[:params["count"]]):
+        before = len(grown["items"])
+        for spread, patch_id in ranked[:params["count"] - before]:
+            index = len(grown["items"])
+            # Each item's order from the seed, the round and its place, so an item added
+            # later is shuffled as it would have been in the first draw.
+            rng = np.random.default_rng([params["seed"], int(grown["id"][1:]), index])
             options = [[candidates[i]] for i in rng.permutation(len(candidates))]
-            digests = render.blind_item(session, pipeline.work("images", "blind", round_id, str(index)),
+            digests = render.blind_item(session, pipeline.work("images", "blind", grown["id"], str(index)),
                                         session.patch(patch_id), options,
                                         display_anchors(pipeline, session))
-            items.append({"patch": patch_id, "spread": round(spread, 4), "options": options,
-                          "choice": None, "image_sha256": digests})
-    rounds.append({"id": round_id, "at": rec.now(), "candidates": candidates, "test_only": True,
-                   "items": items})
+            grown["items"].append({"patch": patch_id, "spread": round(spread, 4), "options": options,
+                                   "choice": None, "image_sha256": digests})
     pipeline.record.refresh_final(rounds)
-    pipeline.record.log("blind-round", round=round_id, candidates=candidates, items=len(items),
-                        eligible=len(eligible), replaces=[round_["id"] for round_ in this_fit])
+    pipeline.record.log("blind-round", round=grown["id"], candidates=candidates,
+                        items=len(grown["items"]), added=len(grown["items"]) - before,
+                        eligible=len(eligible),
+                        replaces=[round_["id"] for round_ in this_fit if round_ is not grown])
     return [rec.FINAL_REVIEW]
 
 

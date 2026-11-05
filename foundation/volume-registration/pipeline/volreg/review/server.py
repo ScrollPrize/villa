@@ -52,6 +52,9 @@ TEST_STRETCHES = 5
 EDITABLE = {"holdout": {"patches": "hold-out patches"},
             "fit": {"patches": "fit patches", "passes": "passes"},
             "blind": {"count": "patches in a round"}}
+# Settings that only extend what is there: a hold-out set, fit patches or a blind round
+# already drawn stays, so a smaller number would change nothing.
+GROW_ONLY = {("holdout", "patches"), ("fit", "patches"), ("blind", "count")}
 
 
 class Reviews:
@@ -106,7 +109,8 @@ class Reviews:
         return {"name": name, "title": stage.title, "human": stage.human, "state": state,
                 "error": stamp.get("error") if state == engine.FAILED else None,
                 "finished": stamp.get("finished"),
-                "settings": [{"key": key, "label": label, "value": params.get(key)}
+                "settings": [{"key": key, "label": label, "value": params.get(key),
+                              "min": params.get(key) if (name, key) in GROW_ONLY else 1}
                              for key, label in EDITABLE.get(name, {}).items()]}
 
     def set_params(self, name, stage, values):
@@ -114,11 +118,14 @@ class Reviews:
         allowed = EDITABLE.get(stage, {})
         if not values or set(values) - set(allowed):
             raise ValueError(f"{stage} has no setting {sorted(set(values) - set(allowed))}")
+        current = self.pipeline(name).stage_params(stage)
         clean = {}
         for key, value in values.items():
             value = int(value)
             if value < 1:
                 raise ValueError(f"{allowed[key]} must be at least 1")
+            if (stage, key) in GROW_ONLY and value < current[key]:
+                raise ValueError(f"{allowed[key]} can only grow: there are {current[key]} already")
             clean[key] = value
         record = self.record(name)
         params = record.read(pipeline_stages.PARAMS) if record.exists(pipeline_stages.PARAMS) else {}
