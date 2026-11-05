@@ -82,7 +82,7 @@ def test_copy_store_mode_reads_the_pinned_version_and_creates_sourced_outputs(tm
         edited = np.zeros((6, 8, 3), '<f4')
         db.put_geometry(source, dict(kind='surface', attributes=dict(scale=[0.5, 0.5]),
                                      arrays=[dict(name='points', dtype='<f4', shape=[6, 8, 3], data=edited.tobytes())]),
-                        expected_revision=revision)
+                        expected_version=pinned)
     surfaces = copy._StoredSurfaces(str(store), 'vol', source, pinned)
     _, grid, valid = surfaces.load(source, 1)
     assert grid[1, 1, 2] == pytest.approx(12.0)  # zyx of the pinned version (x = 1*2 + 10)
