@@ -73,14 +73,19 @@ try {
     TemporaryDirectory directory;
     OpenOptions options; options.author = "session-test";
     const auto hostedPath = directory.path / "hosted.vcobj", localPath = directory.path / "local.vcobj";
-    std::string surface, track;
+    std::string surface, track, fiber;
     {
         auto store = ObjectStore::create(hostedPath, options);
         auto write = store.write();
-        ObjectRecord record; record.kind = "surface";
+        ObjectRecord record; record.kind = "surface"; record.tags = {"probe"};
         record.meta = R"({"coordinates":{"volume_uuid":"20260411134726","scale_factor":1}})";
         surface = store.upsertObject(write, record);
         store.putGeometry(write, surface, vc::geometry::encode(tilted(0)));
+        ObjectRecord strand; strand.kind = "fiber";
+        strand.meta = R"({"coordinates":{"volume_uuid":"20260411134726","scale_factor":1}})";
+        fiber = store.upsertObject(write, strand);
+        vc::geometry::Fiber f; f.controlPoints = {{0, 0, 0}, {3, 4, 0}, {3, 4, 12}};
+        store.putGeometry(write, fiber, vc::geometry::encode(f));
         ObjectRecord line; line.kind = "track"; line.track.emplace(); line.track->datasetRef = "s"; line.track->externalKey = "k";
         track = store.upsertObject(write, line);
         write.commit();
@@ -161,6 +166,24 @@ try {
             mustFail([&] { (void)reader.readGeometryArray(revision, "points", 0, 1 << 20); });
             ObjectSelection all; all.kind = "surface";
             require(reader.selectObjects(all).size() == 1 && reader.selectEdges({}).empty(), "reader listings");
+            const auto projected = reader.selectObjects(all, std::vector<std::string>{});
+            require(projected.size() == 1 && projected[0].uuid == surface && projected[0].meta == "{}" &&
+                    projected[0].version == expected.selectObjects(all).front().version, "reader projection");
+            require(reader.objectCount("surface") == expected.objectCount("surface") && reader.objectCount("track") == 1 &&
+                    reader.objectCount("fiber") == 1, "reader counts");
+            const auto strand = reader.currentGeometry(fiber)->uuid;
+            const auto packed = reader.readGeometryArrays({strand, strand}, "control_points");
+            const auto expectedPacked = expected.readGeometryArrays({strand, strand}, "control_points");
+            require(packed.data == expectedPacked.data && packed.offsets == expectedPacked.offsets &&
+                    packed.shape == expectedPacked.shape && packed.dtype == expectedPacked.dtype &&
+                    packed.offsets == std::vector<uint64_t>{0, 3, 6}, "reader packed arrays");
+            mustFail([&] { (void)reader.readGeometryArrays({strand, revision}, "control_points"); });
+            require(reader.geometryPointAnnotations(strand, "control_points") ==
+                    expected.geometryPointAnnotations(strand, "control_points"), "reader point annotations");
+            require(reader.geometryLengthInVolume(fiber, volume, 2) == expected.geometryLengthInVolume(fiber, volume, 2) &&
+                    expected.geometryLengthInVolume(fiber, volume, 2) == 34, "reader fiber length");
+            require(reader.objectTags() == std::vector<std::string>{"probe"} && reader.objectTags() == expected.objectTags() && reader.objectTags("track") == expected.objectTags("track"),
+                    "reader tags");
             const GeometrySnapshot views(reader);
             const auto tile = views.surface(surface).readTile(3, 2, 10, 7);
             const auto expectedTile = expectedViews.surface(surface).readTile(3, 2, 10, 7);

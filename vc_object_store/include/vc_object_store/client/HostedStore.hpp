@@ -14,6 +14,7 @@
 #include "vc_object_store/objects/GeometryRegion.hpp"
 #include "vc_object_store/objects/ObjectStore.hpp"
 #include "vc_object_store/objects/Selections.hpp"
+#include "vc_object_store/objects/TransactionJson.hpp"
 #include "vc_object_store/objects/Transactions.hpp"
 
 #include <memory>
@@ -111,6 +112,12 @@ public:
     // coordinate selections. Restarts (then StoreBusy) like selectAllObjects,
     // and when a transform changed while they were read.
     SelectionRecord recordSelection(const ObjectSelection&, int64_t pageSize = 1000, int maxRestarts = 3);
+    // ObjectStore::geometryPointAnnotations: exact JSON text.
+    std::string geometryPointAnnotations(const std::string& revisionUuid, const std::string& arrayName);
+    // ObjectStore::componentOf / neighbours on the host (GraphQuery).
+    std::vector<std::string> traverse(const GraphQuery&, StoreStatus* asOf = nullptr);
+    int64_t objectCount(const std::string& kind, bool includeRetired = false, StoreStatus* asOf = nullptr);
+    std::vector<std::string> objectTags(const std::optional<std::string>& kind = std::nullopt, StoreStatus* asOf = nullptr);
     // Every recorded revision of an object (empty when it never existed).
     std::vector<ObjectRevision> objectHistory(const std::string& objectUuid, StoreStatus* asOf = nullptr);
     std::vector<SelectedRelationship> relationshipsAt(const std::vector<ObjectVersion>&, StoreStatus* asOf = nullptr);

@@ -1,6 +1,7 @@
 #include "TestSupport.hpp"
 #include "vc_object_store/objects/GeometryCoordinates.hpp"
 #include "vc_object_store/objects/ObjectStore.hpp"
+#include "vc_object_store/objects/StoreReader.hpp"
 #include "vc_object_store/store/GeometryViews.hpp"
 #include "vc_object_store/objects/VolumeUmbilicus.hpp"
 #include "vc_object_store/objects/UmbilicusFile.hpp"
@@ -41,6 +42,11 @@ int main() try {
         const auto ordered=db.selectObjects(txn,select);
         require(ordered.size()==1&&ordered.front().volumeLength==db.geometryLengthInVolume(txn,fiber,"b"),
                 "registered rows carry the target length they were ordered by");
+        // A reader measures the same lengths from the array bytes it reads.
+        const LocalStoreReader reader(db,txn);
+        require(reader.geometryLengthInVolume(fiber,"b")==db.geometryLengthInVolume(txn,fiber,"b")&&
+                reader.geometryLengthInVolume(track,"b",.5)==db.geometryLengthInVolume(txn,track,"b",.5),"reader lengths");
+        mustFail([&]{(void)reader.geometryLengthInVolume(surface,"b");});
         SurfaceProximityQuery query;query.volume="b";query.point={12.5,1,21.5};query.tolerance=.51;
         const auto hits=db.nearestSurfaces(txn,query);require(hits.size()==1,"registered nearest surface");
         require(std::abs(hits.front().distance-.5)<1e-10,"target-space Euclidean distance");

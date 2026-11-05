@@ -53,11 +53,14 @@ public:
     std::vector<std::optional<ObjectRevision>> objectsAtVersions(const std::vector<ObjectVersion>&);
     std::optional<GeometryRevision> geometryRevision(const std::string& revisionUuid);
     std::shared_ptr<const std::vector<uint8_t>> geometryArray(const std::string& revisionUuid, const std::string& array);
+    std::string geometryPointAnnotations(const std::string& revisionUuid, const std::string& array);
     VolumeTransforms volumeTransforms();
     // The UUIDs among `uuids` that the store holds (retired included).
     std::set<std::string> holds(const std::set<std::string>& uuids);
-    std::vector<ObjectRecord> selectObjects(const ObjectSelection&);
-    std::vector<EdgeRecord> selectEdges(const EdgeSelection&);
+    std::vector<ObjectRecord> selectObjects(const ObjectSelection&,
+                                            const std::optional<std::vector<std::string>>& fields = std::nullopt);
+    std::vector<EdgeRecord> selectEdges(const EdgeSelection&,
+                                        const std::optional<std::vector<std::string>>& fields = std::nullopt);
 
 private:
     void poll();
@@ -119,13 +122,42 @@ public:
                                                int64_t row, int64_t column, int64_t rows,
                                                int64_t columns) const override;
     VolumeTransforms volumeTransforms() const override { return attachment_->volumeTransforms(); }
-    std::vector<ObjectRecord> selectObjects(const ObjectSelection& selection) const override
+    std::vector<ObjectRecord> selectObjects(
+        const ObjectSelection& selection,
+        const std::optional<std::vector<std::string>>& fields = std::nullopt) const override
     {
-        return attachment_->selectObjects(selection);
+        return attachment_->selectObjects(selection, fields);
     }
-    std::vector<EdgeRecord> selectEdges(const EdgeSelection& selection) const override
+    std::vector<EdgeRecord> selectEdges(
+        const EdgeSelection& selection,
+        const std::optional<std::vector<std::string>>& fields = std::nullopt) const override
     {
-        return attachment_->selectEdges(selection);
+        return attachment_->selectEdges(selection, fields);
+    }
+    std::string geometryPointAnnotations(const std::string& revisionUuid, const std::string& arrayName) const override
+    {
+        return attachment_->geometryPointAnnotations(revisionUuid, arrayName);
+    }
+    std::vector<std::string> componentOf(const std::string& objectUuid, const std::vector<std::string>& edgeKinds = {},
+                                         const std::atomic_bool* = nullptr) const override
+    {
+        return attachment_->client().traverse({GraphQuery::Kind::Component, objectUuid, edgeKinds, std::nullopt, false});
+    }
+    std::vector<std::string> neighbours(const std::string& objectUuid,
+                                        const std::optional<std::string>& edgeKind = std::nullopt,
+                                        const std::optional<std::string>& neighbourKind = std::nullopt) const override
+    {
+        std::vector<std::string> kinds;
+        if (edgeKind) kinds.push_back(*edgeKind);
+        return attachment_->client().traverse({GraphQuery::Kind::Neighbours, objectUuid, kinds, neighbourKind, false});
+    }
+    int64_t objectCount(const std::string& kind, bool includeRetired = false) const override
+    {
+        return attachment_->client().objectCount(kind, includeRetired);
+    }
+    std::vector<std::string> objectTags(const std::optional<std::string>& kind = std::nullopt) const override
+    {
+        return attachment_->client().objectTags(kind);
     }
 
 private:

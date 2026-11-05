@@ -30,19 +30,44 @@ public:
     virtual std::vector<uint8_t> readGeometryArray(const std::string& revisionUuid, const std::string& arrayName,
                                                    int64_t byteOffset = 0,
                                                    const std::optional<int64_t>& byteCount = std::nullopt) const = 0;
+    // One packed buffer in caller revision order, as
+    // ObjectStore::readGeometryArrays. By default each array is read whole
+    // through readGeometryArray (a hosted reader's cached arrays).
+    virtual PackedGeometryArray readGeometryArrays(const std::vector<std::string>& revisionUuids,
+                                                   const std::string& arrayName) const;
     // Dense row-major rectangle of a surface-aligned array, as
     // ObjectStore::readGeometryRectangle.
     virtual std::vector<uint8_t> readGeometryRectangle(const std::string& revisionUuid, const std::string& arrayName,
                                                        int64_t row, int64_t column, int64_t rows,
                                                        int64_t columns) const = 0;
+    // Per-point annotations of a sequence array (ObjectStore::geometryPointAnnotations).
+    virtual std::string geometryPointAnnotations(const std::string& revisionUuid, const std::string& arrayName) const = 0;
     virtual VolumeTransforms volumeTransforms() const = 0;
-    // Complete listings (every page when the selection has no limit).
-    virtual std::vector<ObjectRecord> selectObjects(const ObjectSelection&) const = 0;
-    virtual std::vector<EdgeRecord> selectEdges(const EdgeSelection&) const = 0;
+    // Complete listings (every page when the selection has no limit), with
+    // the projections of ObjectStore::selectObjects/selectEdges.
+    virtual std::vector<ObjectRecord> selectObjects(
+        const ObjectSelection&, const std::optional<std::vector<std::string>>& fields = std::nullopt) const = 0;
+    virtual std::vector<EdgeRecord> selectEdges(
+        const EdgeSelection&, const std::optional<std::vector<std::string>>& fields = std::nullopt) const = 0;
+    // As ObjectStore::componentOf (retired objects excluded; `cancel` stops a
+    // local traversal) and ObjectStore::neighbours.
+    virtual std::vector<std::string> componentOf(const std::string& objectUuid,
+                                                 const std::vector<std::string>& edgeKinds = {},
+                                                 const std::atomic_bool* cancel = nullptr) const = 0;
+    virtual std::vector<std::string> neighbours(const std::string& objectUuid,
+                                                const std::optional<std::string>& edgeKind = std::nullopt,
+                                                const std::optional<std::string>& neighbourKind = std::nullopt) const = 0;
+    // As ObjectStore::objectCount and ObjectStore::objectTags.
+    virtual int64_t objectCount(const std::string& kind, bool includeRetired = false) const = 0;
+    virtual std::vector<std::string> objectTags(const std::optional<std::string>& kind = std::nullopt) const = 0;
 
     // The transforms from the object's recorded volume to every reachable
     // volume (ObjectStore::availableTransforms).
     std::vector<vcr::catalog::TransformResolution> availableTransforms(const std::string& objectUuid) const;
+    // The length of a fiber or track's current geometry in `target` voxels at
+    // `targetScale` (ObjectStore::geometryLengthInVolume).
+    double geometryLengthInVolume(const std::string& objectUuid, const std::string& target,
+                                  double targetScale = 1) const;
 };
 
 // Request expectations read through a reader (objects/Transactions.hpp).
@@ -73,12 +98,24 @@ public:
     std::vector<uint8_t> readGeometryArray(const std::string& revisionUuid, const std::string& arrayName,
                                            int64_t byteOffset = 0,
                                            const std::optional<int64_t>& byteCount = std::nullopt) const override;
+    PackedGeometryArray readGeometryArrays(const std::vector<std::string>& revisionUuids,
+                                           const std::string& arrayName) const override;
     std::vector<uint8_t> readGeometryRectangle(const std::string& revisionUuid, const std::string& arrayName,
                                                int64_t row, int64_t column, int64_t rows,
                                                int64_t columns) const override;
+    std::string geometryPointAnnotations(const std::string& revisionUuid, const std::string& arrayName) const override;
     VolumeTransforms volumeTransforms() const override;
-    std::vector<ObjectRecord> selectObjects(const ObjectSelection&) const override;
-    std::vector<EdgeRecord> selectEdges(const EdgeSelection&) const override;
+    std::vector<ObjectRecord> selectObjects(
+        const ObjectSelection&, const std::optional<std::vector<std::string>>& fields = std::nullopt) const override;
+    std::vector<EdgeRecord> selectEdges(
+        const EdgeSelection&, const std::optional<std::vector<std::string>>& fields = std::nullopt) const override;
+    std::vector<std::string> componentOf(const std::string& objectUuid, const std::vector<std::string>& edgeKinds = {},
+                                         const std::atomic_bool* cancel = nullptr) const override;
+    std::vector<std::string> neighbours(const std::string& objectUuid,
+                                        const std::optional<std::string>& edgeKind = std::nullopt,
+                                        const std::optional<std::string>& neighbourKind = std::nullopt) const override;
+    int64_t objectCount(const std::string& kind, bool includeRetired = false) const override;
+    std::vector<std::string> objectTags(const std::optional<std::string>& kind = std::nullopt) const override;
 
 private:
     const ObjectStore* store_;

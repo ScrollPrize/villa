@@ -416,6 +416,81 @@ std::vector<EdgeRecord> edgeQueryResultFromJson(const std::string& text, StoreSt
     return result;
 }
 
+std::string kindQueryRequestToJson(const KindQuery& query)
+{
+    Json j = Json::object();
+    if (query.kind) j["kind"] = *query.kind;
+    if (query.includeRetired) j["include_retired"] = true;
+    return j.dump();
+}
+
+KindQuery kindQueryRequestFromJson(const std::string& text)
+{
+    const auto j = Json::parse(text);
+    requireKeys(j, {"kind", "include_retired"}, "kind query");
+    KindQuery query;
+    if (j.contains("kind")) query.kind = j.at("kind").get<std::string>();
+    query.includeRetired = j.value("include_retired", false);
+    return query;
+}
+
+std::string objectCountResultToJson(const StoreStatus& status, int64_t count)
+{
+    return envelope(status, "count", count).dump();
+}
+
+int64_t objectCountResultFromJson(const std::string& text, StoreStatus* asOf)
+{
+    return unwrap(text, asOf, "count").get<int64_t>();
+}
+
+std::string objectTagsResultToJson(const StoreStatus& status, const std::vector<std::string>& tags)
+{
+    return envelope(status, "tags", tags).dump();
+}
+
+std::vector<std::string> objectTagsResultFromJson(const std::string& text, StoreStatus* asOf)
+{
+    return unwrap(text, asOf, "tags").get<std::vector<std::string>>();
+}
+
+std::string graphQueryRequestToJson(const GraphQuery& query)
+{
+    Json j{{"traversal", query.kind == GraphQuery::Kind::Component ? "component" : "neighbours"},
+           {"object", query.objectUuid}};
+    if (!query.edgeKinds.empty()) j["edge_kinds"] = query.edgeKinds;
+    if (query.neighbourKind) j["neighbour_kind"] = *query.neighbourKind;
+    if (query.includeRetired) j["include_retired"] = true;
+    return j.dump();
+}
+
+GraphQuery graphQueryRequestFromJson(const std::string& text)
+{
+    const auto j = Json::parse(text);
+    requireKeys(j, {"traversal", "object", "edge_kinds", "neighbour_kind", "include_retired"}, "graph query");
+    GraphQuery query;
+    const auto traversal = j.at("traversal").get<std::string>();
+    if (traversal == "neighbours") query.kind = GraphQuery::Kind::Neighbours;
+    else if (traversal != "component") throw std::invalid_argument("graph query: unknown traversal " + traversal);
+    query.objectUuid = j.at("object").get<std::string>();
+    query.edgeKinds = j.value("edge_kinds", std::vector<std::string>{});
+    if (j.contains("neighbour_kind")) query.neighbourKind = j.at("neighbour_kind").get<std::string>();
+    query.includeRetired = j.value("include_retired", false);
+    if (query.kind == GraphQuery::Kind::Neighbours ? query.edgeKinds.size() > 1 : bool(query.neighbourKind))
+        throw std::invalid_argument("graph query: neighbours take at most one edge kind; components no neighbour kind");
+    return query;
+}
+
+std::string uuidListResultToJson(const StoreStatus& status, const std::vector<std::string>& uuids)
+{
+    return envelope(status, "uuids", uuids).dump();
+}
+
+std::vector<std::string> uuidListResultFromJson(const std::string& text, StoreStatus* asOf)
+{
+    return unwrap(text, asOf, "uuids").get<std::vector<std::string>>();
+}
+
 std::string objectHistoryToJson(const StoreStatus& status, const std::vector<ObjectRevision>& revisions)
 {
     auto array = Json::array();

@@ -534,6 +534,34 @@ std::vector<std::optional<ObjectRevision>> HostedStore::objectsAtVersions(const 
     return result;
 }
 
+std::string HostedStore::geometryPointAnnotations(const std::string& revisionUuid, const std::string& arrayName)
+{
+    const auto response = impl_->http.request("GET", endpoint_ + "/v1/geometry/" + revisionUuid + "/annotations/" + arrayName);
+    if (response.status == 404) throw std::invalid_argument("geometry revision not found: " + revisionUuid);
+    return expectOk(response, "point annotations").body;
+}
+
+std::vector<std::string> HostedStore::traverse(const GraphQuery& query, StoreStatus* asOf)
+{
+    const auto response = impl_->http.request("POST", endpoint_ + "/v1/query/graph",
+        graphQueryRequestToJson(query), {{"Content-Type", "application/json"}});
+    return uuidListResultFromJson(expectOk(response, "graph query").body, asOf);
+}
+
+int64_t HostedStore::objectCount(const std::string& kind, bool includeRetired, StoreStatus* asOf)
+{
+    const auto response = impl_->http.request("POST", endpoint_ + "/v1/query/count",
+        kindQueryRequestToJson({kind, includeRetired}), {{"Content-Type", "application/json"}});
+    return objectCountResultFromJson(expectOk(response, "object count").body, asOf);
+}
+
+std::vector<std::string> HostedStore::objectTags(const std::optional<std::string>& kind, StoreStatus* asOf)
+{
+    const auto response = impl_->http.request("POST", endpoint_ + "/v1/query/tags",
+        kindQueryRequestToJson({kind, false}), {{"Content-Type", "application/json"}});
+    return objectTagsResultFromJson(expectOk(response, "object tags").body, asOf);
+}
+
 std::vector<SelectedRelationship> HostedStore::relationshipsAt(const std::vector<ObjectVersion>& versions, StoreStatus* asOf)
 {
     const auto response = impl_->http.request("POST", endpoint_ + "/v1/query/relationships",

@@ -10,6 +10,7 @@
 #include "vc_object_store/objects/TransactionJson.hpp"
 #include "vc_object_store/server/Server.hpp"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstring>
@@ -309,6 +310,22 @@ try {
             require(hostedEdges[0].version && hostedEdges[0].version == local.selectEdges(txn, links)[0].version &&
                 hostedEdges[0].version == local.currentRelationshipVersion(txn, edge), "selected relationship versions");
         }
+
+        // Graph traversal, counts and tags run on the host.
+        auto sorted = [](std::vector<std::string> v) { std::sort(v.begin(), v.end()); return v; };
+        for (const std::vector<std::string>& kinds : {std::vector<std::string>{}, {"test_link"}, {"other"}})
+            require(sorted(hosted.traverse({GraphQuery::Kind::Component, a, kinds})) ==
+                    sorted(local.componentOf(txn, a, kinds)), "component parity");
+        require(sorted(hosted.traverse({GraphQuery::Kind::Component, a, {"test_link"}})).size() == 2, "component reaches b");
+        require(hosted.traverse({GraphQuery::Kind::Neighbours, b, {"test_link"}, std::string("track")}) ==
+                local.neighbours(txn, b, std::string("test_link"), std::string("track")) &&
+                hosted.traverse({GraphQuery::Kind::Neighbours, b, {"test_link"}, std::string("track")}) ==
+                std::vector<std::string>{a}, "neighbour parity");
+        mustFail([&] { (void)hosted.traverse({GraphQuery::Kind::Neighbours, b, {"x", "y"}}); });
+        require(hosted.objectCount("track") == local.objectCount(txn, "track") &&
+                hosted.objectCount("track", true) == local.objectCount(txn, "track", true) &&
+                hosted.objectTags() == local.objectTags(txn) && hosted.objectTags("surface") == local.objectTags(txn, "surface"),
+                "count and tag parity");
 
         std::vector<int64_t> localVersions, hostedVersions;
         for (const auto& r : local.objectHistory(txn, a)) localVersions.push_back(r.version);

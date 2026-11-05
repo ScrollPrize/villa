@@ -173,9 +173,12 @@ explicit transforms are refused.
 
 `readStore(attachment, [](const StoreReader& reader, const auto& cancelled) {...})`
 gives code one read interface for both backends (`objects/StoreReader.hpp`):
-status, current and historical records, geometry descriptors, array ranges and
-surface rectangles, volume transforms, and complete object and edge listings.
-`GeometrySnapshot(reader)` builds the usual geometry views over it, transformed
+status, current and historical records, geometry descriptors, array ranges,
+packed arrays and surface rectangles, point annotations, volume transforms,
+complete object and edge listings (with projections), object counts and tags,
+graph components and neighbours, and fiber/track lengths in a volume. Region
+and proximity queries stay session operations (they combine attachments and
+drafts). `GeometrySnapshot(reader)` builds the usual geometry views over it, transformed
 views included. A local reader answers from one read transaction. A hosted one
 answers each call from the attachment's cache or the host: answers about
 numbered versions and geometry revisions are exact, while current heads may come
@@ -391,6 +394,7 @@ Wire protocol (version 1, JSON unless noted):
 | `GET /v1/objects/{uuid}/versions/{n}?store&generation` | that numbered revision or 404 |
 | `GET /v1/geometry/{revision}` | geometry descriptor (immutable) |
 | `GET /v1/geometry/{revision}/arrays/{name}?offset&count` | array bytes; 413 with `max_response_bytes` above the response limit |
+| `GET /v1/geometry/{revision}/annotations/{name}` | per-point annotations of a sequence array (exact JSON text, immutable) |
 | `PUT /v1/artifacts/{sha256}` (bytes, `Content-Length` required) | streamed like payloads, then kept durably by the store (`putArtifact`) |
 | `GET /v1/artifacts/{sha256}/info` | `{sha256, length}` or 404 |
 | `GET /v1/artifacts/{sha256}?offset&count` | artifact bytes; same response limit as arrays |
@@ -401,6 +405,9 @@ Wire protocol (version 1, JSON unless noted):
 | `POST /v1/query/versions` (`versions`, at most `maxQueryResults`) | one revision per reference, in order, `null` where not recorded |
 | `POST /v1/query/region` (`slice`, `options`) | region runs, coverage stop reason and stats |
 | `POST /v1/query/nearest_surfaces` (proximity query) | surface hits |
+| `POST /v1/query/count` (`kind`, `include_retired`) | object count of a kind |
+| `POST /v1/query/tags` (`kind` optional) | distinct tags of live objects, sorted |
+| `POST /v1/query/graph` (`traversal`: `component` or `neighbours`, `object`, `edge_kinds`, `neighbour_kind`, `include_retired`) | object UUIDs reached from `object` |
 
 Every query answer carries the `status` of the single read snapshot it came
 from. Selections never carry transforms: volume targets resolve through the

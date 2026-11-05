@@ -502,6 +502,17 @@ struct ServerState {
         return jsonReply(geometryRevisionToJson(*revision));
     }
 
+    Reply geometryAnnotations(const std::string& revisionUuid, const std::string& array)
+    {
+        auto txn = store->read();
+        const auto revision = uuidSegment(revisionUuid);
+        if (!store->geometryRevision(txn, revision)) return errorReply(http::status::not_found, "no geometry revision " + revisionUuid);
+        auto text = store->geometryPointAnnotations(txn, revision, array);
+        if (int64_t(text.size()) > options.maxResponseBytes)
+            return errorReply(http::status::payload_too_large, "point annotations exceed the response limit");
+        return jsonReply(std::move(text));
+    }
+
     Reply geometryArray(const std::string& revisionUuid, const std::string& array, const Target& target)
     {
         const auto offset = target.integer("offset", 0);
@@ -573,6 +584,33 @@ struct ServerState {
         requirePage(selection.limit);
         auto txn = store->read();
         return jsonReply(edgeQueryResultToJson(store->status(txn), store->selectEdges(txn, selection, fields), fields));
+    }
+
+    Reply queryCount(const std::string& body)
+    {
+        const auto query = kindQueryRequestFromJson(body);
+        if (!query.kind) throw std::invalid_argument("an object count needs a kind");
+        auto txn = store->read();
+        return jsonReply(objectCountResultToJson(store->status(txn), store->objectCount(txn, *query.kind, query.includeRetired)));
+    }
+
+    Reply queryTags(const std::string& body)
+    {
+        const auto query = kindQueryRequestFromJson(body);
+        auto txn = store->read();
+        return jsonReply(objectTagsResultToJson(store->status(txn), store->objectTags(txn, query.kind)));
+    }
+
+    Reply queryGraph(const std::string& body)
+    {
+        const auto query = graphQueryRequestFromJson(body);
+        auto txn = store->read();
+        const auto uuids = query.kind == GraphQuery::Kind::Component
+            ? store->componentOf(txn, query.objectUuid, query.edgeKinds, nullptr, query.includeRetired)
+            : store->neighbours(txn, query.objectUuid,
+                                query.edgeKinds.empty() ? std::nullopt : std::optional(query.edgeKinds.front()),
+                                query.neighbourKind, query.includeRetired);
+        return jsonReply(uuidListResultToJson(store->status(txn), uuids));
     }
 
     Reply objectHistory(const std::string& uuid)
@@ -662,6 +700,12 @@ struct ServerState {
             return {readers.get(), [this, body] { return queryEdges(*body); }};
         if (method == http::verb::post && is({"v1", "query", "relationships"}))
             return {readers.get(), [this, body] { return queryRelationships(*body); }};
+        if (method == http::verb::post && is({"v1", "query", "count"}))
+            return {readers.get(), [this, body] { return queryCount(*body); }};
+        if (method == http::verb::post && is({"v1", "query", "graph"}))
+            return {readers.get(), [this, body] { return queryGraph(*body); }};
+        if (method == http::verb::post && is({"v1", "query", "tags"}))
+            return {readers.get(), [this, body] { return queryTags(*body); }};
         if (method == http::verb::post && is({"v1", "query", "versions"}))
             return {readers.get(), [this, body] { return queryVersions(*body); }};
         if (method == http::verb::post && is({"v1", "query", "region"}))
@@ -676,6 +720,8 @@ struct ServerState {
             if (responseBytes.load() > options.maxResponseBytesInFlight) return {nullptr, nullptr, true};
             return {transfers.get(), [this, target] { return artifactBytes(target->path[2], *target); }};
         }
+        if (method == http::verb::get && is({"v1", "geometry", "*", "annotations", "*"}))
+            return {readers.get(), [this, target] { return geometryAnnotations(target->path[2], target->path[4]); }};
         if (method == http::verb::get && is({"v1", "geometry", "*", "arrays", "*"})) {
             // Bounded download memory: unsent replies stay below the limit
             // (plus the replies being produced, each maxResponseBytes at most).

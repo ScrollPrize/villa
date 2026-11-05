@@ -84,6 +84,33 @@ std::string edgeQueryResultToJson(const StoreStatus&, const std::vector<EdgeReco
                                   const std::optional<std::vector<std::string>>& fields);
 std::vector<EdgeRecord> edgeQueryResultFromJson(const std::string&, StoreStatus* asOf);
 
+// Object counts and tags (ObjectStore::objectCount, objectTags): counts need
+// a kind; tags take an optional one and ignore `includeRetired`.
+struct KindQuery {
+    std::optional<std::string> kind;
+    bool includeRetired = false;
+};
+std::string kindQueryRequestToJson(const KindQuery&);
+KindQuery kindQueryRequestFromJson(const std::string&);
+std::string objectCountResultToJson(const StoreStatus&, int64_t count);
+int64_t objectCountResultFromJson(const std::string&, StoreStatus* asOf);
+std::string objectTagsResultToJson(const StoreStatus&, const std::vector<std::string>& tags);
+std::vector<std::string> objectTagsResultFromJson(const std::string&, StoreStatus* asOf);
+
+// Graph traversal from one object: its component (ObjectStore::componentOf)
+// or its neighbours (ObjectStore::neighbours), as object UUIDs.
+struct GraphQuery {
+    enum class Kind { Component, Neighbours } kind = Kind::Component;
+    std::string objectUuid;
+    std::vector<std::string> edgeKinds;          // component: empty means all kinds
+    std::optional<std::string> neighbourKind;    // neighbours only (with at most one edge kind)
+    bool includeRetired = false;
+};
+std::string graphQueryRequestToJson(const GraphQuery&);
+GraphQuery graphQueryRequestFromJson(const std::string&);
+std::string uuidListResultToJson(const StoreStatus&, const std::vector<std::string>& uuids);
+std::vector<std::string> uuidListResultFromJson(const std::string&, StoreStatus* asOf);
+
 std::string objectHistoryToJson(const StoreStatus&, const std::vector<ObjectRevision>&);
 std::vector<ObjectRevision> objectHistoryFromJson(const std::string&, StoreStatus* asOf);
 

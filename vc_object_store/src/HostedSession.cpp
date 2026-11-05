@@ -268,6 +268,22 @@ std::shared_ptr<const std::vector<uint8_t>> HostedAttachment::geometryArray(cons
     return bytes;
 }
 
+std::string HostedAttachment::geometryPointAnnotations(const std::string& revisionUuid, const std::string& array)
+{
+    // Immutable per geometry revision, cached as the JSON text's bytes.
+    const auto key = "annotations/" + revisionUuid + "/" + array;
+    {
+        std::lock_guard lock(cacheMutex_);
+        if (const auto* entry = cache_.get(key); entry && entry->bytes)
+            return std::string(entry->bytes->begin(), entry->bytes->end());
+    }
+    auto text = client_.geometryPointAnnotations(revisionUuid, array);
+    auto bytes = std::make_shared<const std::vector<uint8_t>>(text.begin(), text.end());
+    std::lock_guard lock(cacheMutex_);
+    cache_.put(key, Entry{std::nullopt, std::nullopt, bytes}, bytes->size() + 128);
+    return text;
+}
+
 VolumeTransforms HostedAttachment::volumeTransforms()
 {
     {
@@ -303,14 +319,16 @@ std::set<std::string> HostedAttachment::holds(const std::set<std::string>& uuids
     return held;
 }
 
-std::vector<ObjectRecord> HostedAttachment::selectObjects(const ObjectSelection& selection)
+std::vector<ObjectRecord> HostedAttachment::selectObjects(const ObjectSelection& selection,
+                                                          const std::optional<std::vector<std::string>>& fields)
 {
-    return selection.limit ? client_.selectObjects(selection) : client_.selectAllObjects(selection);
+    return selection.limit ? client_.selectObjects(selection, fields) : client_.selectAllObjects(selection, fields);
 }
 
-std::vector<EdgeRecord> HostedAttachment::selectEdges(const EdgeSelection& selection)
+std::vector<EdgeRecord> HostedAttachment::selectEdges(const EdgeSelection& selection,
+                                                      const std::optional<std::vector<std::string>>& fields)
 {
-    return selection.limit ? client_.selectEdges(selection) : client_.selectAllEdges(selection);
+    return selection.limit ? client_.selectEdges(selection, fields) : client_.selectAllEdges(selection, fields);
 }
 
 std::optional<ObjectRevision> HostedStoreReader::currentObject(const std::string& objectUuid) const
