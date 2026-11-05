@@ -179,6 +179,39 @@ uv sync --extra models
 uv run --extra models python -c "import torch; print(torch.__version__, '| cuda:', torch.cuda.is_available())"
 ```
 
+#### Native Windows (no WSL)
+
+The pipeline also runs natively on Windows 10/11 with an NVIDIA GPU. Measured on Windows 10 Pro 19045, RTX 4060 Ti 16 GB (driver 595.79), Python 3.14.6, uv 0.13.5:
+
+1. Install an NVIDIA driver ≥ 580 (the Windows PyTorch wheels are built for CUDA 13.0); no CUDA toolkit is needed.
+2. Run the setup from a regular PowerShell, skipping the C++ `volume-cartographer` build that ink detection doesn't use (see the note above):
+   ```powershell
+   git clone https://github.com/ScrollPrize/villa.git
+   cd villa\vesuvius
+   uv sync --extra models --no-install-package volume-cartographer
+   uv run --no-sync --extra models python -c "import torch; print(torch.__version__, '| cuda:', torch.cuda.is_available())"
+   ```
+   This should print `2.12.1+cu130 | cuda: True`. If it prints `+cpu | cuda: False`, your checkout predates the Windows CUDA index in `pyproject.toml`; pull `main` and run `uv sync` again.
+3. Pass `--no-sync` to every `uv run` in this tutorial. Use `^` (cmd) or `` ` `` (PowerShell) instead of `\` for line continuations, or put each command on one line.
+
+What to expect on 16 GB (flat inference, `ink_9um` `hybrid_3d2d-seed42/step-020000.pth`, a 1536×1536 crop of w035 = 529 patches of 128×128, `--overlap 0.5 --blend-mode hann --num-workers 2`):
+
+| Device | Batch | Patches/s | Peak VRAM (torch reserved / nvidia-smi delta) |
+|---|---|---|---|
+| RTX 4060 Ti 16 GB | 1 | 13.8 | 192 / 192 MiB |
+| RTX 4060 Ti 16 GB | 4 | 17.2 | 364 / 214 MiB |
+| RTX 4060 Ti 16 GB | 8 | 17.9 | 450 / 586 MiB |
+| RTX 4060 Ti 16 GB | 16 | 16.4 | 740 / 663 MiB |
+| RTX 4060 Ti 16 GB | 32 | 12.8 | 1840 / 1989 MiB |
+| CPU only (what `main` installs on Windows today: `torch 2.12.1+cpu`), 6 threads | 4–8 | 2.8 (529 patches in 186–193 s) | – |
+
+* `torch.compile` needs Triton, which PyTorch doesn't ship for Windows; inference logs a warning and falls back to eager mode, so the first batch takes a few seconds longer. Pass `--no-compile` to skip the attempt.
+* DataLoader workers use `spawn` on Windows; `--num-workers 2` kept the GPU busy here, more workers only added start-up time.
+* Batch size barely changes throughput beyond batch 4, so on smaller cards a batch size of 1–4 loses little.
+* A whole w035-sized segment (5820×5240, at most 7,462 patches; empty tiles are skipped) takes about 7 minutes at that rate.
+
+To check that your Windows setup reproduces the published models, run `python verify_windows_ink.py --work-dir <folder>` (in `vesuvius/scripts/`): it downloads the two step-020000 checkpoints and a 64 MB crop of w035 (all SHA-256-pinned), runs the inference above on the GPU and once on the CPU, and compares against the figure below. It prints `RESULT PASS` when the GPU matches the CPU (r ≥ 0.999) and each seed matches its own published figure better than the other seed's.
+
 ### Training
 
 Training runs are configured with a single JSON file. Create `configs/ink_tutorial.json` (the `configs` folder doesn't exist yet; create it too), pointing `segments_path` at the folder containing your downloaded segments:
