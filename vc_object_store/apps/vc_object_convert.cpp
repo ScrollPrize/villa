@@ -1,4 +1,4 @@
-// Offline conversion of a schema-17 or schema-18 object store to the current schema.
+// Offline conversion of a schema-16 to schema-19 object store to the current schema.
 #include "vc_object_store/migration/ConvertStore.hpp"
 
 #include <fstream>

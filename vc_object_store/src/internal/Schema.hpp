@@ -164,10 +164,7 @@ CREATE TABLE geometry_current_chunks(
   hash TEXT NOT NULL, data BLOB NOT NULL,
   PRIMARY KEY(object_uuid,array_name,chunk_index)
 );
-
-CREATE TABLE sync_replica(singleton INTEGER PRIMARY KEY CHECK(singleton=1), uuid TEXT NOT NULL);
 )SQL");
-    execute(db, "INSERT INTO sync_replica VALUES(1,?)", util::newUuid());
     detail::createSpatialSchema(db);
     exec(db, "CREATE TABLE store_identity(singleton INTEGER PRIMARY KEY CHECK(singleton=1), uuid BLOB NOT NULL UNIQUE CHECK(length(uuid)=16));");
     execute(db, "INSERT INTO store_identity VALUES(1,?)", parseUuid(util::newUuid()));

@@ -1,10 +1,11 @@
 #pragma once
-// Offline conversion of schema-16, schema-17 and schema-18 stores (standalone, hub, or
-// settled hub replica) to the current schema (19). The only place that knows
+// Offline conversion of schema-16 to schema-19 stores (standalone, hub, or
+// settled hub replica) to the current schema (20). The only place that knows
 // the previous formats; the runtime opens the current schema only. Schema 16
 // (without surface data) is first brought to schema 17; schema 17
 // is numbered first (schema 18), then every format is copied into a store
-// built by the runtime's own schema definition.
+// built by the runtime's own schema definition. Schema 20 is schema 19
+// without the hub's replica identity table.
 //
 // The source is never modified: it is read through one consistent SQLite
 // snapshot into a new destination. Identities, recorded history, geometry,

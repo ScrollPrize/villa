@@ -1,6 +1,7 @@
-// Offline conversion of schema-17 and schema-18 stores to the current schema.
+// Offline conversion of schema-17, 18 and 19 stores to the current schema.
 // The fixtures (data/convert_schema17.sql, data/convert_schema18.sql) were
-// written by the schema-18 runtime from one history: tracks with geometry,
+// written by the schema-18 runtime from one history (data/convert_schema19.sql
+// is the schema-18 fixture converted by the last schema-19 converter): tracks with geometry,
 // metadata edits, relationships retained and kept recorded through a geometry
 // edit, a removal, retirement and deletion, copy provenance naming an old
 // revision UUID, and a tiled surface with a sparse (delta) edit.
@@ -126,7 +127,7 @@ try {
     TemporaryDirectory directory;
     const auto expected = Json::parse(bytesOf(kData / "convert_expected.json"));
     OpenOptions options; options.author = "convert-test";
-    for (const int schema : {17, 18}) {
+    for (const int schema : {17, 18, 19}) {
         const auto source = directory.path / ("old" + std::to_string(schema) + ".vcobj");
         sql(source, bytesOf(kData / ("convert_schema" + std::to_string(schema) + ".sql")));
         const auto before = bytesOf(source);
@@ -139,7 +140,7 @@ try {
         const auto report = Json::parse(result.reportJson);
         const auto mapping = Json::parse(result.mappingJson);
         require(report.at("validation") == "ok" && report.at("source_role") == "standalone", "report");
-        require(report.at("source_schema") == schema && report.at("target_schema") == 19, "schemas reported");
+        require(report.at("source_schema") == schema && report.at("target_schema") == 20, "schemas reported");
         mustFail([&] { (void)migration::convertStore(source, destination); }); // never overwrites
         // Storage form: whole records for revisions without a parent, no
         // materialized head record duplicating one, 16-byte keys.
@@ -149,6 +150,9 @@ try {
                                     "WHERE r.parent_uuid IS NULL") == 0, "no duplicate head records");
         require(scalar(destination, "SELECT count(*) FROM object_versions WHERE length(object_uuid)<>16 OR length(revision_uuid)<>16") == 0,
                 "blob keys");
+        require(scalar(destination, "SELECT count(*) FROM sqlite_master WHERE name='sync_replica'") == 0 &&
+                std::find(report.at("removed_tables").begin(), report.at("removed_tables").end(), "sync_replica") !=
+                    report.at("removed_tables").end(), "replica identity dropped");
 
         requireSameHistory(destination, expected,
                            schema == 17 ? std::optional(mapping.at("generation").get<std::string>()) : std::nullopt);
@@ -174,7 +178,8 @@ try {
         require(!std::filesystem::exists(refused) && !std::filesystem::exists(refused.string() + ".converting"), "no partial destination");
         sql(source, "DELETE FROM hub_pending;");
         const auto settled = Json::parse(migration::convertStore(source, directory.path / "settled.vcobj").reportJson);
-        require(settled.at("source_role") == "replica" && settled.at("removed_tables").size() == 2, "coordination removed");
+        require(settled.at("source_role") == "replica" &&
+                settled.at("removed_tables") == Json::array({"hub_pending", "hub_upstream", "sync_replica"}), "coordination removed");
     }
     // Schema 16 (the patches detail table, hub sync baselines): its form of
     // the schema-17 fixture. Surface data is refused; without it the history

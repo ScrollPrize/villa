@@ -257,7 +257,7 @@ success: the editor that kept them is gone.
 
 ## Numbered history and checked requests
 
-Schema 18 introduced numbered history; schema 19 (current) stores it compactly. Each object and relationship keeps its UUID; each
+Schema 18 introduced numbered history; schema 19 stores it compactly, and schema 20 (current) drops the hub's replica identity table. Each object and relationship keeps its UUID; each
 published state also has a version, starting at 1 and advancing once per
 transaction that changes the record (deletions and relationship removals are
 numbered too, so a deleted identity never looks newly absent). A historical
@@ -330,9 +330,9 @@ which requests expect.
 Writable opens hold a host-local ownership lock on `<canonical path>-owner`:
 shared between standalone writers, exclusive for `OpenOptions::serviceOwner`.
 
-### Converting schema-16, schema-17 and schema-18 stores
+### Converting schema-16 to schema-19 stores
 
-The runtime opens schema 19 only. Stop every client, settle hub replicas with
+The runtime opens schema 20 only. Stop every client, settle hub replicas with
 the old tooling, then convert into a new file (the source is never changed):
 
 ```sh
@@ -356,7 +356,10 @@ and head keys are 16-byte blobs, a revision without a parent stores its whole
 record rather than a patch from `{}` (later revisions stay RFC 6902 patches),
 only heads with a parent keep a materialized record, and geometry payload and
 manifest hashes are 32-byte blobs (still hex text in every API). A schema-18 source
-is copied directly; its mapping is read from its recorded versions. The report
+is copied directly; its mapping is read from its recorded versions. Schema 20 is
+schema 19 without the one-row `sync_replica` table (the hub's replica
+identity); a schema-19 source is copied as it is, with that table dropped and
+its mapping read back like schema 18's. The report
 gives `source_bytes`, `destination_bytes` and the rows copied per table.
 
 ### Artifacts

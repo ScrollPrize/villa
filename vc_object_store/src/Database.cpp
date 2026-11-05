@@ -47,7 +47,7 @@ std::unique_ptr<ObjectStore::Impl> ObjectStore::openImpl(const std::filesystem::
             throw std::runtime_error("object store: unsupported database format: " + path.string());
         if (const int version = pragmaInt(db, "user_version"); version != kSchemaVersion)
             throw std::runtime_error("object store: unsupported database schema: " + path.string() +
-                (version == 17 || version == 18 ? " (schema " + std::to_string(version) +
+                (version >= 16 && version < kSchemaVersion ? " (schema " + std::to_string(version) +
                  ": convert it with vc_object_convert)" : std::string()));
     };
     // Writable access is guarded before any writer connection opens.

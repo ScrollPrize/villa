@@ -15,6 +15,7 @@ using Json = nlohmann::json;
 namespace {
 constexpr int kApplicationId = 0x56434f42;
 constexpr int kNumberedSchema = 18; // schema 17 plus numbered history, text keys
+constexpr int kCompactSchema = 19;  // schema 18 with blob keys and root records; still has sync_replica
 constexpr size_t kSampleLimit = 50;
 
 struct Connection {
@@ -202,11 +203,12 @@ int64_t copyTable(sqlite3* db, const std::string& table, const TableCopy& copy)
     return rows;
 }
 
-// Schema 18 -> current, from `stage` (schema 18) into a new `destination`
-// built by the runtime's own schema definition. Unchanged tables are copied
-// as they are; history and version keys become 16-byte blobs, a revision
-// without a parent stores its whole record, materialized head records are
-// kept only for heads with a parent, and geometry hashes become 32-byte blobs.
+// Schema 18 or 19 -> current, from `stage` into a new `destination` built by
+// the runtime's own schema definition. Unchanged tables are copied as they
+// are; text history and version keys become 16-byte blobs, a revision without
+// a parent stores its whole record, materialized head records are kept only
+// for heads with a parent, and hex geometry hashes become 32-byte blobs
+// (schema-19 sources already have these forms and pass through).
 void copyToCurrentSchema(const std::filesystem::path& stage, const std::filesystem::path& destination, Json& report)
 {
     Connection out;
@@ -569,27 +571,32 @@ Json numberSchema17(sqlite3* db, Json& report, const std::filesystem::path& sour
                 {"relationships", mappingRelationships}};
 }
 
-// A schema-18 source already has numbered history: the mapping is read back.
-Json mappingOfSchema18(sqlite3* db, Json& report)
+// A schema-18 or schema-19 source already has numbered history: the mapping
+// is read back (text keys in schema 18, 16-byte keys in schema 19).
+Json mappingOfNumbered(sqlite3* db, Json& report)
 {
+    const auto key = [](const Statement& s, int c) {
+        return sqlite3_column_type(s.value, c) == SQLITE_BLOB ? s.uuid(c) : s.text(c);
+    };
     const auto store = storeUuidText(db);
     Statement active(db, "SELECT active_generation FROM store_history");
     if (!active.row()) throw std::runtime_error("convert: missing history state");
     report["store_uuid"] = store;
-    report["generation"] = active.text(0);
+    const auto generation = key(active, 0);
+    report["generation"] = generation;
     Json objects = Json::object(), relationships = Json::object();
     Statement o(db, "SELECT revision_uuid,object_uuid,version,generation FROM object_versions ORDER BY object_uuid,version");
-    while (o.row()) objects[o.text(0)] = {{"object", o.text(1)}, {"version", o.i64(2)}, {"generation", o.text(3)}};
+    while (o.row()) objects[key(o, 0)] = {{"object", key(o, 1)}, {"version", o.i64(2)}, {"generation", key(o, 3)}};
     Statement r(db, "SELECT revision_uuid,edge_uuid,version,generation FROM relationship_versions "
                     "WHERE revision_uuid IS NOT NULL ORDER BY edge_uuid,version");
-    while (r.row()) relationships[r.text(0)] = {{"relationship", r.text(1)}, {"version", r.i64(2)}, {"generation", r.text(3)}};
+    while (r.row()) relationships[key(r, 0)] = {{"relationship", key(r, 1)}, {"version", r.i64(2)}, {"generation", key(r, 3)}};
     report["counts"] = {{"objects", scalar(db, "SELECT count(*) FROM objects")},
                         {"relationships", scalar(db, "SELECT count(*) FROM edges")},
                         {"object_versions", scalar(db, "SELECT count(*) FROM object_versions")},
                         {"relationship_versions", scalar(db, "SELECT count(*) FROM relationship_versions")},
                         {"commits", scalar(db, "SELECT commit_sequence FROM store_history")},
                         {"geometry_revisions", scalar(db, "SELECT count(*) FROM geometry_revisions")}};
-    return Json{{"store", store}, {"generation", active.text(0)}, {"objects", objects}, {"relationships", relationships}};
+    return Json{{"store", store}, {"generation", generation}, {"objects", objects}, {"relationships", relationships}};
 }
 
 } // namespace
@@ -610,8 +617,8 @@ ConversionResult convertStore(const std::filesystem::path& source, const std::fi
     if (pragmaInt(in.db, "application_id") != kApplicationId)
         throw std::runtime_error("convert: not an object store: " + source.string());
     const int sourceSchema = pragmaInt(in.db, "user_version");
-    if (sourceSchema != 16 && sourceSchema != 17 && sourceSchema != kNumberedSchema)
-        throw std::runtime_error("convert: expected schema 16, 17 or 18, found " + std::to_string(sourceSchema));
+    if (sourceSchema < 16 || sourceSchema > kCompactSchema)
+        throw std::runtime_error("convert: expected schema 16, 17, 18 or 19, found " + std::to_string(sourceSchema));
 
     Json report{{"source", source.string()}, {"destination", destination.string()},
                 {"source_schema", sourceSchema}, {"target_schema", kSchemaVersion}};
@@ -641,7 +648,12 @@ ConversionResult convertStore(const std::filesystem::path& source, const std::fi
         exec(db, "BEGIN IMMEDIATE;");
         report["removed_tables"] = settle(db, report);
         if (sourceSchema == 16) upgradeSchema16(db, report);
-        const auto mapping = sourceSchema < kNumberedSchema ? numberSchema17(db, report, source) : mappingOfSchema18(db, report);
+        const auto mapping = sourceSchema < kNumberedSchema ? numberSchema17(db, report, source) : mappingOfNumbered(db, report);
+        // The replica identity (the generation seed above) has no successor.
+        if (tableExists(db, "sync_replica")) {
+            exec(db, "DROP TABLE sync_replica;");
+            report["removed_tables"].push_back("sync_replica");
+        }
         exec(db, "COMMIT;");
         staged = {};
 

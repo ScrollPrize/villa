@@ -19,8 +19,9 @@ int main() try
 {
     TemporaryDirectory directory;
     OpenOptions options; options.author = "session-test";
-    // Both pre-backport formats are rejected before the new journal is queried.
-    for (const int version : {14, 15, 16}) {
+    // Older formats are rejected before the new journal is queried; the ones
+    // vc_object_convert reads (16 to 19) name it.
+    for (const int version : {14, 15, 16, 19}) {
         const auto oldPath = directory.path / ("schema-" + std::to_string(version) + ".vcobj");
         { auto db = ObjectStore::create(oldPath, options); }
         sqlite3* raw = nullptr;
@@ -34,7 +35,9 @@ int main() try
             bool rejected = false;
             try { auto db = ObjectStore::open(oldPath, oldOptions); }
             catch (const std::runtime_error& error) {
-                rejected = std::string(error.what()).find("unsupported database schema") != std::string::npos;
+                const std::string message = error.what();
+                rejected = message.find("unsupported database schema") != std::string::npos &&
+                           (version < 16) == (message.find("vc_object_convert") == std::string::npos);
             }
             require(rejected, "old formats are explicitly rejected in read-only and writable mode");
         }
