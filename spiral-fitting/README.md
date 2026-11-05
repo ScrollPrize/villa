@@ -4,6 +4,24 @@ Code and helpers to fit a canonical Archimedean spiral to deformed scrolls.
 `spiral_service.py` hosts one persistent interactive fit session over HTTP for
 the VC3D Spiral workspace; `fit_spiral.py` is the underlying fitter.
 
+## CPU surface-track extraction
+
+`extract_surface_tracks.py --backend cpu` labels 6-connected components with
+`vc_reader.geometry.label_components`, then max-pools and filters labels before
+Kimimaro skeletonization. The local `vc-reader` dependency requires its native
+build prerequisites (see [vc_reader](../vc_reader/README.md)).
+
+Use `--slab-workers N --kimimaro-parallel 1` to process multiple slabs concurrently
+on Linux with local predictions. Each worker holds a slab in RAM; the default is
+one worker and eight Kimimaro processes per slab.
+
+```sh
+python extract_surface_tracks.py --backend cpu --predictions /data/predictions.zarr \
+  --out /data/tracks.dbm --z-min 9048 --z-max 9548 \
+  --slab-workers 4 --kimimaro-parallel 1
+python -m pytest -q tests/test_cc_labels.py tests/test_extract_surface_tracks.py
+```
+
 ## CUDA startup check
 
 VC3D fit sessions and command-line fits allocate one CUDA element and synchronize
