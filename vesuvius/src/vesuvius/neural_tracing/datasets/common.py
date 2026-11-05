@@ -592,7 +592,7 @@ def _upsample_world_surface(x_s, y_s, z_s, scale_y: float, scale_x: float):
     query_row, query_col = np.meshgrid(dense_rows, dense_cols, indexing="ij")
 
     surface = tifxyz.Surface(np.stack([x_s, y_s, z_s], axis=-1).astype(np.float32))
-    xyz, valid = surface.points_at(query_row, query_col, interpolation="smooth")
+    xyz, valid = surface.points_at(query_row, query_col, interpolation="bicubic")
 
     if not np.all(valid):
         invalid_count = int((~valid).sum())
