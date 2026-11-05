@@ -2,7 +2,6 @@
 
 #include <atomic>
 #include <cstring>
-#include <filesystem>
 #include <map>
 #include <mutex>
 #include <set>
@@ -35,47 +34,11 @@ constexpr size_t kDiagnosticBytes = 8192;
 // their timeout checks; only the last kDiagnosticBytes are kept anyway.
 constexpr size_t kDrainBytes = 4 * kDiagnosticBytes;
 
-#ifndef _WIN32
-std::string controlPath()
-{
-    // Keep the socket path short enough for macOS too. mkdtemp creates mode
-    // 0700, so only this user can connect to the authenticated transport.
-    struct Directory {
-        std::string path = "/tmp/vc-ssh-XXXXXX";
-        Directory() {
-            if (!mkdtemp(path.data())) throw std::runtime_error("SFTP: cannot create SSH control directory");
-        }
-        ~Directory() { std::error_code ignored; std::filesystem::remove_all(path, ignored); }
-    };
-    static Directory directory;
-    return directory.path + "/%C";
-}
-#endif
-
 std::string shellQuote(const std::string& text)
 {
     std::string quoted = "'";
     for (const char c : text) quoted += c == '\'' ? std::string("'\\''") : std::string(1, c);
     return quoted + "'";
-}
-
-std::string lockedServerCommand(const Options& options)
-{
-    if (options.processLifetime.count() <= 0)
-        throw std::invalid_argument("SFTP process lifetime must be positive");
-    // No user-supplied text is interpreted as shell syntax. All descriptors
-    // for the database and its journal belong to this one locked process.
-    return "lock=" + shellQuote(options.processLock) + "; "
-        "test -f \"$lock\" && test ! -L \"$lock\" || { "
-        "echo 'hub: enable SSH process locking with vc_object_hub enable-ssh-locking HUB first' >&2; exit 1; }; "
-        "command -v flock >/dev/null && command -v timeout >/dev/null || { "
-        "echo 'hub: server needs flock and timeout (Linux util-linux/coreutils)' >&2; exit 1; }; "
-        "server=; for p in /usr/lib/openssh/sftp-server /usr/lib/ssh/sftp-server "
-        "/usr/libexec/openssh/sftp-server /usr/libexec/sftp-server; do "
-        "if test -x \"$p\"; then server=$p; break; fi; done; "
-        "test -n \"$server\" || { echo 'hub: external OpenSSH sftp-server not found' >&2; exit 1; }; "
-        "exec timeout --kill-after=5s " + std::to_string(options.processLifetime.count()) +
-        "s flock --exclusive --timeout 60 --no-fork \"$lock\" \"$server\"";
 }
 
 std::vector<std::string> sshArguments(const Url& url, const Options& options, bool interactive)
@@ -85,12 +48,7 @@ std::vector<std::string> sshArguments(const Url& url, const Options& options, bo
         "-oConnectTimeout=" + std::to_string(options.connectTimeout.count())};
     if (!url.user.empty()) args.insert(args.end(), {"-l", url.user});
     if (url.port) args.insert(args.end(), {"-p", std::to_string(*url.port)});
-#ifndef _WIN32
-    if (options.shareConnection)
-        args.insert(args.end(), {"-oControlMaster=auto", "-oControlPersist=no", "-oControlPath=" + controlPath()});
-#endif
-    if (options.processLock.empty()) args.insert(args.end(), {"-s", "--", url.host, "sftp"});
-    else args.insert(args.end(), {"--", url.host, lockedServerCommand(options)});
+    args.insert(args.end(), {"-s", "--", url.host, "sftp"});
     return args;
 }
 

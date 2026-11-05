@@ -2,8 +2,7 @@
 
 // SFTP v3 client over the system OpenSSH `ssh` program (`ssh -s HOST sftp`).
 // OpenSSH alone handles configuration, keys, the agent, ProxyJump and host
-// verification; no SSH library is linked. Ordinary access uses the subsystem;
-// process-locked hubs run a quoted remote command around sftp-server. Without an
+// verification; no SSH library is linked. Without an
 // authenticator ssh runs in batch mode and never prompts. With one, every ssh
 // prompt (password, key passphrase, one-time code, new host key) is answered by
 // the application through SSH_ASKPASS (Linux and macOS).
@@ -64,16 +63,6 @@ struct Options {
     // waiting for the user to answer a prompt does not count.
     std::chrono::milliseconds idleTimeout{30000};
     std::function<bool()> cancelled;  // polled while waiting
-    // Hub-only: run the existing remote sftp-server under a process-owned
-    // flock on this file. Requires SSH command execution, flock and timeout.
-    // Empty keeps ordinary SFTP subsystem access (e.g. remote volumes).
-    std::string processLock;
-    // Server-side hard deadline, including lock acquisition. Killing the
-    // writer releases its lock even if the connection silently disappears.
-    std::chrono::seconds processLifetime{1800};
-    // Share an application-private SSH transport on POSIX clients. Sessions
-    // and their server locks remain independent. Ignored on Windows.
-    bool shareConnection = false;
 };
 
 enum Status : uint32_t {
