@@ -30,7 +30,7 @@ import numpy as np
 import torch
 
 from point_collection import load_point_collection
-from tifxyz import load_tifxyz
+from tifxyz import Patch, load_tifxyz
 
 SEED = 343
 N_BOOT = 2000
@@ -47,10 +47,48 @@ def load_truth_meshes(directory):
     return sorted(meshes, key=lambda m: m[0])
 
 
-def link_points(points, meshes, tolerance, chunk_size=8):
-    """Winding index of the nearest mesh within tolerance for each (N, 3) xyz point, else None."""
+def max_face_edge(mesh):
+    """Longest edge over the valid triangles of a patch (both quad diagonals included)."""
+    v, q = mesh.zyxs.to(torch.float32), mesh.valid_quad_mask
+    tl, tr, bl, br = v[:-1, :-1][q], v[:-1, 1:][q], v[1:, :-1][q], v[1:, 1:][q]
+    edges = [tl - bl, tr - tl, tr - bl, br - tr, br - bl]
+    return float(max(torch.linalg.norm(e, dim=-1).max() for e in edges))
+
+
+def project_near(mesh, zyx, reach, chunk_size=8):
+    """Distance from each point to the patch, exact wherever it is <= reach - longest face edge, else
+    >= that bound (inf when no vertex lies within reach). A face within distance t of a point has every
+    vertex within t + longest edge of it, so projecting onto the grid window spanned by the vertices
+    inside that ball (plus one cell) finds every such face; points with no vertex in the ball are skipped."""
+    from scipy.spatial import cKDTree
+    ij = mesh.valid_vertex_indices.numpy()
+    tree = cKDTree(mesh.zyxs[mesh.valid_vertex_mask].to(torch.float64).numpy())
+    h, w = mesh.zyxs.shape[:2]
+    out = torch.full((len(zyx),), float('inf'))
+    for n, near in enumerate(tree.query_ball_point(zyx.to(torch.float64).numpy(), reach)):
+        if not near:
+            continue
+        (i0, j0), (i1, j1) = ij[near].min(0), ij[near].max(0)
+        win = mesh.zyxs[max(i0 - 1, 0):min(i1 + 2, h), max(j0 - 1, 0):min(j1 + 2, w)]
+        valid = torch.any(win != -1, dim=-1)
+        if not bool((valid[:-1, :-1] & valid[1:, :-1] & valid[:-1, 1:] & valid[1:, 1:]).any()):
+            continue
+        sub = Patch(win.clone(), mesh.scale, None, None)
+        out[n] = sub.project(zyx[n:n + 1], chunk_size=chunk_size)[1][0]
+    return out
+
+
+def link_points(points, meshes, tolerance, chunk_size=8, prefilter=True):
+    """Winding index of the nearest mesh within tolerance for each (N, 3) xyz point, else None.
+
+    prefilter: project each point only onto the grid window of its nearby vertices (KD-tree), see
+    project_near. Same links as the brute-force projection over every face (prefilter=False)."""
     zyx = torch.as_tensor(np.asarray(points, dtype=np.float32).reshape(-1, 3)[:, ::-1].copy())
-    dists = torch.stack([m.project(zyx, chunk_size=chunk_size)[1] for _, m in meshes])  # (M, N)
+    if prefilter:
+        dists = torch.stack([project_near(m, zyx, tolerance + max_face_edge(m), chunk_size)
+                             for _, m in meshes])  # (M, N), exact where <= tolerance
+    else:
+        dists = torch.stack([m.project(zyx, chunk_size=chunk_size)[1] for _, m in meshes])  # (M, N)
     best_d, best_i = dists.min(dim=0)
     return [meshes[int(i)][0] if float(d) <= tolerance else None
             for d, i in zip(best_d, best_i)]
@@ -113,12 +151,14 @@ def pooled_with_interval(rows, seed=SEED, n_boot=N_BOOT):
             'n_collections': len(rows), 'seed': seed, 'n_boot': n_boot}
 
 
-def evaluate(collections, meshes, tolerance=10.0, umbilicus=None, exclude=None):
+def evaluate(collections, meshes, tolerance=10.0, umbilicus=None, exclude=None, prefilter=True):
     """collections: dict from load_point_collection. Returns the result dict."""
     rows = []
-    for cid, col in collections.items():
-        pts = [dict(p) for p in col['points'].values()]  # dict order = file order
-        truth = link_points([p['p'] for p in pts], meshes, tolerance) if pts else []
+    all_pts = {cid: [dict(p) for p in col['points'].values()] for cid, col in collections.items()}  # file order
+    flat = [p['p'] for pts in all_pts.values() for p in pts]
+    linked = iter(link_points(flat, meshes, tolerance, prefilter=prefilter) if flat else [])  # one pass: one KD-tree per mesh
+    for cid, pts in all_pts.items():
+        truth = [next(linked) for _ in pts]
         for p, t in zip(pts, truth):
             p['truth'] = t
             p['excluded'] = bool(t is not None and any(
@@ -173,6 +213,8 @@ def main():
     ap.add_argument('--exclude')
     ap.add_argument('--tolerance', type=float, default=10.0)
     ap.add_argument('--out', required=True)
+    ap.add_argument('--no-prefilter', action='store_true',
+                    help='brute-force projection over every face (slow; same links)')
     args = ap.parse_args()
 
     meshes = load_truth_meshes(args.meshes)
@@ -186,7 +228,7 @@ def main():
     collections = load_point_collection(args.collection)
     if collections is None:
         raise SystemExit('could not load point collection')
-    result = evaluate(collections, meshes, args.tolerance, umbilicus, exclude)
+    result = evaluate(collections, meshes, args.tolerance, umbilicus, exclude, prefilter=not args.no_prefilter)
     result['mesh_windings'] = [w for w, _ in meshes]
     with open(args.out, 'w') as f:
         json.dump(result, f, indent=1)
