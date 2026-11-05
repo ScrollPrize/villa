@@ -543,6 +543,11 @@ public:
                              const std::vector<GeometryArrayEdit>&,
                              const std::string& expectedRevision) const;
     std::optional<GeometryRevision> currentGeometry(const Txn& txn, const std::string& objectUuid) const;
+    // The current geometry revision (payload identity; nullopt without
+    // geometry) of an object checked to be at `expectedVersion`: the
+    // expectation the geometry mutations take. Any other version is a history
+    // conflict, which aborts a checked write.
+    std::optional<std::string> geometryAtVersion(const Txn&, const std::string& objectUuid, int64_t expectedVersion) const;
     std::optional<GeometryRevision> geometryRevision(const Txn& txn, const std::string& revisionUuid) const;
     std::vector<GeometryRevision> geometryHistory(const Txn& txn, const std::string& objectUuid) const;
     // Byte ranges allow bounded loading without materializing a whole array.

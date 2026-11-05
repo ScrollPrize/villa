@@ -137,11 +137,11 @@ with store.geometry_snapshot() as snapshot:
     with store.write(expected_versions={collection_uuid: collection.version}) as tx:
         new_revision = tx.edit_geometry(collection_uuid, [dict(
             array="points", element_offset=0, data=struct.pack("<3d", 10, 20, 30)
-        )], collection.revision["uuid"])
+        )], collection.version)
     # collection still reads the original revision.
 ```
 
-The transaction checks the pinned object and geometry revisions, including for
+The transaction checks the object version the view read, including for
 no-ops. Affected relationships require explicit retain, update, remove or keep
 recorded decisions through `edit_geometry(edge_edits=...)`; include the affected
 endpoints in the transaction's expected versions. No relationship meaning is

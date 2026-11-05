@@ -36,7 +36,8 @@ def test_older_revisions_read_in_the_frame_they_were_stored_in(db_path):
     uid = create_surface(db_path, xyz, name="s", scale=1, volume="a", tool="pytest")
     with ObjectStore.open(db_path, author="pytest") as db:
         first = db.current_geometry(uid)["uuid"]
-        db.put_geometry(uid, Surface.from_arrays(np.ascontiguousarray(xyz * 2), [1.0, 1.0]), expected_revision=first)
+        db.put_geometry(uid, Surface.from_arrays(np.ascontiguousarray(xyz * 2), [1.0, 1.0]),
+                        expected_version=db.current_version(uid))
         db.set_meta(uid, "coordinates", {"volume_uuid": "c", "scale_factor": 2})
     current = read_surface(db_path, uid, volume="c")
     older = read_surface(db_path, uid, volume="a", version=1)

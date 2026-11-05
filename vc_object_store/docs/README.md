@@ -946,7 +946,7 @@ single-page `mask.tif` (255/0).
 Surface overlaps are relationships made by the linking tools (`surface-overlap`
 detector).
 
-`update_surface_channels(uuid, channels, remove, expected_revision, edge_edits=[])`
+`update_surface_channels(uuid, channels, remove, expected_version, edge_edits=[])`
 adds/replaces/removes channels atomically. Supply only changed arrays and exact
 little-endian bytes. Removing absent channels, duplicate names or spatial
 dimensions that are not a whole multiple of the grid fails; dtype/components may change. Use
@@ -956,17 +956,22 @@ changes. Typed owned surfaces carry `validity` and `channels`.
 ```python
 import struct
 
-current = store.current_geometry(uid)
+version = store.current_version(uid)
 edits = [{"array": "points", "element_offset": 15,
           "data": struct.pack("<3f", 12, 24, 36)}]
-affected = store.affected_geometry_edit_edges(uid, edits, current["uuid"])
+affected = store.affected_geometry_edit_edges(uid, edits, version)
 assert not affected  # otherwise supply explicit edge_edits
-revision = store.edit_geometry(uid, edits, current["uuid"])
+revision = store.edit_geometry(uid, edits, version)
 raw = store.read_geometry_rectangle(revision, "points", 0, 0, 1, 1)
 ```
 
 Sparse offsets count **scalars**, not bytes or points. Edits preserve shape,
 dtype, names and attributes; overlaps apply in input order, last write wins.
+Geometry mutations (`put_geometry(expected_version=)`, `edit_geometry`,
+`edit_geometry_rectangle`, `update_surface_channels`, and the structural edits)
+expect the object's numbered version; another version is a conflict
+(`RuntimeError`). They return the new geometry revision, the payload identity
+the geometry reads take. C++ `geometryAtVersion` resolves that expectation.
 Net no-ops create no revision/journal entry, but stale expectations still fail.
 Rectangle edits preserve all components and require exact byte lengths.
 Geometry, bounds, approvals and relationship decisions publish atomically.

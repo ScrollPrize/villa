@@ -73,7 +73,7 @@ namespace {
 void requireCheckedLifecycle(sqlite3* db)
 {
     Statement checked(db, "SELECT 1 FROM history_checked");
-    if (!checked.row()) throw std::runtime_error("object lifecycle requires write(expected_revisions)");
+    if (!checked.row()) throw std::runtime_error("object lifecycle requires a checked write (expected versions)");
 }
 }
 

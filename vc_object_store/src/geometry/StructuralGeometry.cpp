@@ -9,7 +9,7 @@ using namespace detail;
 namespace {
 using Json=nlohmann::json;
 void checked(sqlite3* db) {
-    if (!activeStatementPools.at(db)->checkedAction) throw std::runtime_error("structural editing requires write(expected revisions)");
+    if (!activeStatementPools.at(db)->checkedAction) throw std::runtime_error("structural editing requires a checked write (expected versions)");
 }
 void requireSource(sqlite3* db,const std::string& uuid) {
     execute(db,"INSERT OR IGNORE INTO history_required VALUES(?)", uuid);

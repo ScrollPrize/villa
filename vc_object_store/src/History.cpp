@@ -228,6 +228,18 @@ void detail::historyConflict(sqlite3* db, const std::string& message)
     throw std::runtime_error(message);
 }
 
+std::optional<std::string> ObjectStore::geometryAtVersion(const Txn& txn, const std::string& objectUuid,
+                                                         int64_t expectedVersion) const
+{
+    const auto uuid = formatUuid(parseUuid(objectUuid));
+    if (const auto version = currentVersion(txn, uuid); version != expectedVersion)
+        detail::historyConflict(static_cast<sqlite3*>(connection(txn)),
+            "geometry: object " + uuid + " is at version " + (version ? std::to_string(*version) : std::string("none")) +
+            ", not " + std::to_string(expectedVersion) + "; reload before committing");
+    const auto geometry = currentGeometry(txn, uuid);
+    return geometry ? std::optional(geometry->uuid) : std::nullopt;
+}
+
 void detail::recordRelationshipValidation(sqlite3* db, const EdgeRecord& edge, bool recordedOnly)
 {
     execute(db, "INSERT INTO history_validated_edges VALUES(?,?,?,?) ON CONFLICT(uuid) "

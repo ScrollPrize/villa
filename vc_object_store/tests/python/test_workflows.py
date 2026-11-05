@@ -95,36 +95,40 @@ def test_surface_channels_sparse_reads_history_and_resize(db, tile):
         packed = db.read_geometry_arrays([first, first], name)
         assert packed.values.tobytes() == original.tobytes() * 2
         assert packed.offsets.tolist() == [0, 35, 70]
-    second = db.edit_geometry_rectangle(uid, 'review', 31, 31, 2, 3, b'\xff\xff' * 6, first)
+    first_version = db.current_version(uid)
+    second = db.edit_geometry_rectangle(uid, 'review', 31, 31, 2, 3, b'\xff\xff' * 6, first_version)
     channel[31:33, 31:34] = 65535
     assert db.read_geometry_array(second, 'review') == channel.tobytes()
     assert db.read_geometry_array(first, 'review') != channel.tobytes()
-    assert db.edit_geometry(uid, [], second) == second
-    with pytest.raises(RuntimeError, match='revision'):
-        db.edit_geometry(uid, [], first)
+    assert db.edit_geometry(uid, [], db.current_version(uid)) == second
+    with pytest.raises(RuntimeError, match='version'):
+        db.edit_geometry(uid, [], first_version)
     # An ink channel rendered finer than the grid: 2x rows, 3x columns.
     ink = np.arange(70 * 111, dtype='<f4').reshape(70, 111)
     with pytest.raises(ValueError, match='whole multiple'):
-        db.update_surface_channels(uid, [array('ink', ink[:69])], [], second)
-    third = db.update_surface_channels(uid, [array('extra', np.zeros((35, 37), 'u1')), array('ink', ink)], ['review'], second)
+        db.update_surface_channels(uid, [array('ink', ink[:69])], [], db.current_version(uid))
+    third = db.update_surface_channels(uid, [array('extra', np.zeros((35, 37), 'u1')), array('ink', ink)], ['review'],
+                                       db.current_version(uid))
     assert db.read_geometry_rectangle(third, 'ink', 61, 100, 4, 5) == ink[61:65, 100:105].tobytes()
     fills = [array('points', np.full((1, 1, 3), -1, '<f4')), array('extra', np.ones((1, 1), 'u1')),
              array('ink', np.zeros((1, 1), '<f4'))]
-    with db.write(expected_versions=versions(db, uid)) as tx:
-        grown = tx.resize_surface(uid, dict(row=-1, column=-1, rows=37, columns=39, fill=fills), third)
+    expected = versions(db, uid)
+    with db.write(expected_versions=expected) as tx:
+        grown = tx.resize_surface(uid, dict(row=-1, column=-1, rows=37, columns=39, fill=fills), expected[uid])
     assert db.read_geometry_rectangle(grown, 'points', 1, 1, 35, 37) == values.tobytes()
     assert db.read_geometry_rectangle(grown, 'extra', 0, 0, 1, 1) == b'\x01'
     assert db.read_geometry_rectangle(grown, 'ink', 2, 3, 70, 111) == ink.tobytes()
     assert db.read_geometry_rectangle(grown, 'ink', 0, 0, 2, 117) == bytes(2 * 117 * 4)
     with pytest.raises(RuntimeError, match='finer channels'):
-        with db.write(expected_versions=versions(db, uid)) as tx:
-            tx.resize_surface(uid, dict(row=0, column=0, rows=0, columns=39, fill=fills), grown)
-    grown = db.update_surface_channels(uid, [], ['ink'], grown)
+        expected = versions(db, uid)
+        with db.write(expected_versions=expected) as tx:
+            tx.resize_surface(uid, dict(row=0, column=0, rows=0, columns=39, fill=fills), expected[uid])
+    grown = db.update_surface_channels(uid, [], ['ink'], db.current_version(uid))
     assert db.geometry_revision(grown)['grid_origin'] == [-1, -1]
     extra = np.arange(37 * 39, dtype='<u2').reshape(37, 39)
-    updated = db.update_surface_channels(uid, [array('extra', extra)], [], grown)
+    updated = db.update_surface_channels(uid, [array('extra', extra)], [], db.current_version(uid))
     assert db.read_geometry_array(updated, 'extra') == extra.tobytes()
-    changed = db.edit_geometry_rectangle(uid, 'extra', 31, 31, 2, 3, b'\xff\xff' * 6, updated)
+    changed = db.edit_geometry_rectangle(uid, 'extra', 31, 31, 2, 3, b'\xff\xff' * 6, db.current_version(uid))
     extra[31:33, 31:34] = 65535
     assert db.read_geometry_array(changed, 'extra') == extra.tobytes()
     assert db.read_geometry_rectangle(grown, 'extra', 0, 0, 1, 1) == b'\x01'
@@ -155,7 +159,7 @@ def test_nearest_surfaces_pick_restrict_and_volume_target(db):
     # Vertices marked invalid are holes.
     valid = np.ones((40, 40), 'u1')
     valid[19:23, 11:15] = 0
-    db.update_surface_channels(near, [array('valid', valid)], [], db.current_geometry(near)['uuid'])
+    db.update_surface_channels(near, [array('valid', valid)], [], db.current_version(near))
     hits = db.nearest_surfaces([12.25, 20.5, 11], 5)
     assert hits[0]['object_uuid'] == near and hits[0]['distance'] > 2
 
@@ -208,10 +212,13 @@ def test_checked_relationships_lifecycle_and_graph(db):
     assert db.journal_since() == before and db.edge(edge)
     with db.graph_read(versions=selected, approval_states=[]) as graph:
         edits = [dict(array='points', element_offset=0, data=struct.pack('<i', 9))]
-        assert db.affected_geometry_edit_edges(a, edits, first)[0]['uuid'] == edge
+        read = selected[0]['version']
+        assert db.affected_geometry_edit_edges(a, edits, read)[0]['uuid'] == edge
         with pytest.raises(RuntimeError):
-            db.edit_geometry(a, edits, first)
-        second = db.edit_geometry(a, edits, first, edge_edits=[edge_choice(db, edge, 'keep_recorded')])
+            db.edit_geometry(a, edits, read)
+        second = db.edit_geometry(a, edits, read, edge_edits=[edge_choice(db, edge, 'keep_recorded')])
+        with pytest.raises(RuntimeError, match='version'):
+            db.edit_geometry(a, edits, read, edge_edits=[edge_choice(db, edge, 'keep_recorded')])
         assert graph.read_geometry_arrays('points').values.tolist() in (
             [[1, 2, 3], [4, 5, 6], [1, 2, 3]], [[1, 2, 3], [1, 2, 3], [4, 5, 6]])
         assert graph.component(a) == [a, b]
@@ -247,10 +254,11 @@ def test_stable_ids_annotations_splice_and_coordinates(db):
     label = {'label': 'A', 'note': 'x' * 70000}
     uid = db.upsert_object(dict(kind='point_collection', meta={'source': {
         'point_attributes': [label, {'label': 'B'}]}}))
-    first = db.put_geometry(uid, PointCollection([10, 20], [[1, 2, 3], [4, 5, 6]]))
-    with db.write(expected_versions=versions(db, uid)) as tx:
+    db.put_geometry(uid, PointCollection([10, 20], [[1, 2, 3], [4, 5, 6]]))
+    expected = versions(db, uid)
+    with db.write(expected_versions=expected) as tx:
         second = tx.edit_geometry_sequence(uid, dict(array='points', start=1, erase_count=0,
-            parts=[dict(count=1, ids=[30], data=struct.pack('<3d', 7, 8, 9), annotations=[{'label': 'C'}])]), first)
+            parts=[dict(count=1, ids=[30], data=struct.pack('<3d', 7, 8, 9), annotations=[{'label': 'C'}])]), expected[uid])
         tx.set_meta(uid, 'coordinates', {'scale_factor': 4})
     assert db.geometry_point_annotations(second, 'points') == [label, {'label': 'C'}, {'label': 'B'}]
     assert db.read_geometry_array(second, 'point_ids') == struct.pack('<3q', 10, 30, 20)
@@ -260,7 +268,7 @@ def test_stable_ids_annotations_splice_and_coordinates(db):
         assert view.point(30) == [7, 8, 9]
         with db.write(expected_versions={uid: view.version}) as tx:
             third = tx.edit_geometry(uid, [dict(array="points", element_offset=3,
-                data=struct.pack("<3d", 10, 11, 12))], view.revision["uuid"])
+                data=struct.pack("<3d", 10, 11, 12))], view.version)
         assert view.point(30) == [7, 8, 9]
     assert db.read_geometry_array(third, 'points')[24:48] == struct.pack('<3d', 10, 11, 12)
 
@@ -593,8 +601,8 @@ def test_service_edits_a_hosted_surface_through_a_session(tmp_path):
     assert model == hub.parent / 'hub.vcobj.artifacts' / surface and model.is_dir()
     with session.hold_leases(attachment, [surface]):
         with ObjectStore.open(str(tmp_path / 'service.vcobj'), author='service') as db:
-            revision = db.current_geometry(surface)['uuid']
-            db.edit_geometry_rectangle(surface, 'points', 1, 1, 1, 1, np.array([7, 7, 7], '<f4').tobytes(), revision)
+            db.edit_geometry_rectangle(surface, 'points', 1, 1, 1, 1, np.array([7, 7, 7], '<f4').tobytes(),
+                                       db.current_version(surface))
         status = session.sync_hub_and_wait(attachment, timeout_s=20)
         assert not status['pending'] and not status['error'] and not status['conflicts']
     kinds = [event['kind'] for event in session.take_events()]

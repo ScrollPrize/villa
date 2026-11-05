@@ -1,14 +1,15 @@
 # Structural geometry editing
 
 Structural edits publish ordinary immutable geometry and object revisions.
-Use a checked writer with **object** revision UUIDs, and pass the expected
-**geometry** revision UUID to each mutation. The Python API exposes structural
+Use a checked writer expecting the objects' numbered versions, and pass the
+object's expected version to each mutation. The Python API exposes structural
 mutations on the checked writer; C++ uses `ObjectStore::editGeometrySequence()`
-and `ObjectStore::resizeSurface()`.
+and `ObjectStore::resizeSurface()`, which take the expected geometry revision
+(`ObjectStore::geometryAtVersion` resolves it from a version).
 
 ## Sequences
 
-`edit_geometry_sequence(object_uuid, edit, expected_revision, edge_edits=[])`
+`edit_geometry_sequence(object_uuid, edit, expected_version, edge_edits=[])`
 splices rows of `points` (point collections/tracks), `control_points`, or
 `line_points` (fibers). `start` and `erase_count` select the removed span.
 `parts` supplies the replacement, in order:
@@ -24,14 +25,14 @@ splices rows of `points` (point collections/tracks), `control_points`, or
 ```python
 import struct
 
-geometry_head = db.current_geometry(uid)['uuid']
-with db.write(expected_versions={uid: db.current_version(uid)}) as tx:
+version = db.current_version(uid)
+with db.write(expected_versions={uid: version}) as tx:
     result = tx.edit_geometry_sequence(uid, {
         'array': 'points', 'start': 2, 'erase_count': 0,
         'parts': [{'count': 1, 'ids': [42],
                    'data': struct.pack('<3d', 10, 20, 30),
                    'annotations': [{'label': 'new point'}]}],
-    }, geometry_head)
+    }, version)
 ```
 
 Append uses `start=count, erase_count=0`; insertion uses `erase_count=0`;
@@ -79,7 +80,7 @@ the application catches the immediate exception.
 
 ## Surface growth and cropping
 
-`resize_surface(object_uuid, resize, expected_revision, edge_edits=[])` accepts:
+`resize_surface(object_uuid, resize, expected_version, edge_edits=[])` accepts:
 
 - `row`, `column`: the old logical coordinate of the new top-left corner.
 - `rows`, `columns`: the resulting shape, including zero-sized grids.
