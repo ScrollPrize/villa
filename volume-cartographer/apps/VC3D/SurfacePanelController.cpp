@@ -1,4 +1,5 @@
 #include "SurfacePanelController.hpp"
+#include <vc_object_store/objects/StoreReader.hpp>
 #include "BindCoordinatesPrompt.hpp"
 
 #include "SurfaceTreeWidget.hpp"
@@ -652,9 +653,11 @@ void SurfacePanelController::showHistory(const std::string& id)
     auto* view = buttons->addButton(tr("View"), QDialogButtonBox::ActionRole);
     auto* restore = buttons->addButton(tr("Restore"), QDialogButtonBox::ActionRole);
     restore->setEnabled(_catalog->session()->writable(attachment));
-    auto selected = [list]() {
+    auto selected = [list, &attachment, &id]() -> std::optional<vc::objects::ObjectVersion> {
         const auto* item = list->currentItem();
-        return item ? item->data(0, Qt::UserRole).toString().toStdString() : std::string();
+        if (!item) return std::nullopt;
+        return vc::objects::ObjectVersion{attachment.storeUuid, item->data(2, Qt::UserRole).toString().toStdString(), id,
+                                          item->data(1, Qt::UserRole).toLongLong()};
     };
     connect(view, &QPushButton::clicked, &dialog, [&]() {
         const auto* item = list->currentItem();
@@ -670,12 +673,12 @@ void SurfacePanelController::showHistory(const std::string& id)
         }
     });
     connect(restore, &QPushButton::clicked, &dialog, [&]() {
-        const auto revision = selected();
-        if (revision.empty()) {
+        const auto version = selected();
+        if (!version) {
             return;
         }
         QString error;
-        if (restoreRevision(id, revision, &error)) {
+        if (restoreRevision(id, *version, &error)) {
             dialog.accept();
         } else {
             QMessageBox::critical(&dialog, tr("Restore Failed"), error);
@@ -687,7 +690,8 @@ void SurfacePanelController::showHistory(const std::string& id)
     dialog.exec();
 }
 
-bool SurfacePanelController::restoreRevision(const std::string& id, const std::string& revision, QString* errorMessage)
+bool SurfacePanelController::restoreRevision(const std::string& id, const vc::objects::ObjectVersion& version,
+                                             QString* errorMessage)
 {
     try {
         const auto* row = _catalog->row(id);
@@ -695,14 +699,14 @@ bool SurfacePanelController::restoreRevision(const std::string& id, const std::s
             throw std::runtime_error("The surface requires a writable object store to restore a revision");
         }
         const auto attachment = row->source;
-        std::optional<std::string> head;
+        std::optional<vc::objects::ObjectRevision> head;
         _catalog->session()->readStore(attachment, [&](const vc::objects::StoreReader& reader, const auto&) {
-            if (const auto current = reader.currentObject(id)) head = current->uuid;
+            head = reader.currentObject(id);
         });
         if (!head) throw std::runtime_error("The surface is no longer in the object store");
-        if (*head == revision) return true;
-        _catalog->session()->editCurrent(attachment, {id}, [&](auto& db, auto& txn, const auto& uuid) {
-            db.restoreObject(txn, uuid, revision);
+        if (head->version == version.version && head->generation == version.generation) return true;
+        (void)_catalog->session()->editCurrent(attachment, {id}, [&](const vc::objects::StoreReader&, const std::string& uuid) {
+            return std::vector<vc::objects::TransactionOperation>{vc::objects::RestoreObjectOp{uuid, version}};
         });
     } catch (const std::exception& error) {
         if (errorMessage) *errorMessage = QString::fromUtf8(error.what());
@@ -758,9 +762,11 @@ void SurfacePanelController::bindSurface(const std::string& id)
         // Units per voxel of the open volume, so per voxel of its store volume
         // at the open volume's scale of it.
         const auto& voxels = _catalog->voxels();
-        _catalog->session()->editCurrent(*_catalog->attachment(), {id}, [&](auto& db, auto& txn, const auto& uuid) {
-            db.bindGeometryCoordinates(txn, uuid, voxels.volume, *scale * voxels.scale);
-        });
+        (void)_catalog->session()->editCurrent(*_catalog->attachment(), {id},
+            [&](const vc::objects::StoreReader& reader, const std::string& uuid) {
+                return std::vector<vc::objects::TransactionOperation>{vc::objects::bindCoordinatesOperation(
+                    reader.currentObject(uuid)->record, voxels.volume, *scale * voxels.scale)};
+            });
     } catch (const std::exception& error) {
         QMessageBox::critical(_ui.treeWidget, tr("Bind Failed"), QString::fromUtf8(error.what()));
     }
@@ -805,8 +811,10 @@ bool SurfacePanelController::retireSurfaces(const QStringList& surfaceIds, QStri
         return false;
     }
     try {
-        _catalog->session()->editCurrent(*_catalog->attachment(), uuids,
-                                         [](auto& db, auto& txn, const auto& uuid) { db.retireObject(txn, uuid); });
+        (void)_catalog->session()->editCurrent(*_catalog->attachment(), uuids,
+            [](const vc::objects::StoreReader&, const std::string& uuid) {
+                return std::vector<vc::objects::TransactionOperation>{vc::objects::RetireObjectOp{uuid}};
+            });
         return true;
     } catch (const std::exception& error) {
         if (err) *err = QString::fromUtf8(error.what());
@@ -1992,5 +2000,4 @@ bool SurfacePanelController::cycleVisibleSegment(int direction)
 
 #ifdef VC_TESTING
 #include "SurfacePanelStoreTest.inc"
-#include <vc_object_store/objects/StoreReader.hpp>
 #endif

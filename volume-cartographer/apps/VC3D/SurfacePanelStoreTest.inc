@@ -199,8 +199,7 @@ int runSurfacePanelStoreTests()
         // Segmentation editing saves to the sample's project and preserves the view's scale.
         require(panel.activateSurfaceById(shown, &error), "the catalog surface reopens");
         const auto onScreen = panel.opened()->surface;
-        const auto publishedRevision = state.objectStoreSession()->objectsAtVersions(
-            panel.opened()->pin.attachment, {panel.opened()->pin.reference()}).front()->uuid;
+        const auto publishedVersion = panel.opened()->pin.reference();
         require(panel.prepareSurfaceEditing(shown, &error) && panel.opened()->editable &&
                     panel.opened()->pin.attachment == catalogAttachment && panel.opened()->surface == onScreen,
                 "editing keeps the sample's store and the surface on screen");
@@ -226,7 +225,7 @@ int runSurfacePanelStoreTests()
         }
         require((*catalog.open(shown).surface->rawPointsPtr())(1, 2) == cv::Vec3f(3, 4, 5),
                 "reopening the sample surface retains the edit in volume coordinates");
-        require(panel.restoreRevision(shown, publishedRevision, &error), "sample surfaces can restore their history");
+        require(panel.restoreRevision(shown, publishedVersion, &error), "sample surfaces can restore their history");
         require((*catalog.open(shown).surface->rawPointsPtr())(1, 2) == cv::Vec3f(1, 0.5f, 1),
                 "restoring history recovers the published geometry");
         state.objectStoreSession()->editRecords(catalogAttachment, {shown}, [](ObjectRecord& record) { record.name = "edited"; });

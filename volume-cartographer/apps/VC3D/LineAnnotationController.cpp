@@ -15315,10 +15315,11 @@ bool LineAnnotationController::ensureFiberInVolume(uint64_t id, bool prompt)
     const auto scale=vc3d::promptStoredUnitsPerVoxel(_parentWidget.data(),tr("Bind Fiber Coordinates"),tr("fiber"),*volume,known,
         tr("Fiber bounds XYZ: (%1, %2, %3) – (%4, %5, %6)").arg(lower[0]).arg(lower[1]).arg(lower[2]).arg(upper[0]).arg(upper[1]).arg(upper[2]));
     if (!scale) return false;
-    connection->editCurrent(pin.attachment,{fiber.uuid},[&](auto& db,auto& txn,const auto& uuid){
+    (void)connection->editCurrent(pin.attachment,{fiber.uuid},[&](const vc::objects::StoreReader& reader,const std::string& uuid){
         // Units per voxel of the open volume: per voxel of its store volume at its scale.
         const auto& target=*_state->annotationVolume();
-        db.bindGeometryCoordinates(txn,uuid,target.volume,*scale*target.scale);
+        return std::vector<vc::objects::TransactionOperation>{
+            vc::objects::bindCoordinatesOperation(reader.currentObject(uuid)->record,target.volume,*scale*target.scale)};
     });
     return true;
 }

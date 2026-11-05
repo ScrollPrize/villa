@@ -235,7 +235,9 @@ int main(int argc, char** argv)
             return row && row->record.name == "renamed" && row->record.tags == std::vector<std::string>{"reviewed"};
         }, "record edits reach the rows through commit events");
         require(std::count(committed.begin(), committed.end(), native) >= 1, "commits name the edited surface");
-        session->editCurrent(attachment, {half}, [](auto& db, auto& txn, const auto& uuid) { db.retireObject(txn, uuid); });
+        (void)session->editCurrent(attachment, {half}, [](const vc::objects::StoreReader&, const std::string& uuid) {
+            return std::vector<vc::objects::TransactionOperation>{vc::objects::RetireObjectOp{uuid}};
+        });
         pump([&] { return !catalog.row(half) && catalog.rows().size() == 3; }, "retired surfaces leave the listing");
 
         // The store supplies registered views; the application only adapts their tiles.

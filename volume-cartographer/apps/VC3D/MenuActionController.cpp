@@ -1,4 +1,5 @@
 #include "MenuActionController.hpp"
+#include <vc_object_store/objects/StoreReader.hpp>
 #include <vc_reader/zarr.hpp>
 #include "OpenedVolumes.hpp"
 #include <vc_object_store/Uuid.hpp>
@@ -1759,9 +1760,9 @@ void MenuActionController::importUmbilicus()
     // The umbilicus belongs to the open volume's store volume: units per voxel
     // of the open volume are units per voxel of that one at its scale.
     const auto target = state.annotationVolume().value_or(vc::project::AnnotationVolume{});
-    vc::objects::RevisionSelection replaced;
-    state.objectStoreSession()->read(*attachment, [&](const auto& db, const auto& txn, const auto&) {
-        replaced = vc::objects::volumeUmbilicusRevisions(db, txn, target.volume);
+    std::vector<vc::objects::ObjectRecord> replaced;
+    state.objectStoreSession()->readStore(*attachment, [&](const vc::objects::StoreReader& reader, const auto&) {
+        replaced = vc::objects::volumeUmbilici(reader, target.volume);
     });
     if (!replaced.empty() &&
         QMessageBox::question(_window, QObject::tr("Import Umbilicus"),
@@ -1794,18 +1795,19 @@ void MenuActionController::removeUmbilicus()
             QObject::tr("Open a project and a volume first."));
         return;
     }
-    vc::objects::RevisionSelection pins;
-    state.objectStoreSession()->read(*attachment, [&](const auto& db, const auto& txn, const auto&) {
-        pins = vc::objects::volumeUmbilicusRevisions(db, txn, volumeId);
+    std::vector<std::string> umbilici;
+    state.objectStoreSession()->readStore(*attachment, [&](const vc::objects::StoreReader& reader, const auto&) {
+        for (const auto& record : vc::objects::volumeUmbilici(reader, volumeId)) umbilici.push_back(record.uuid);
     });
-    if (pins.empty()) {
+    if (umbilici.empty()) {
         QMessageBox::information(_window, QObject::tr("Remove Umbilicus"),
             QObject::tr("Volume %1 has no umbilicus.").arg(QString::fromStdString(volumeId)));
         return;
     }
-    state.objectStoreSession()->act(*attachment, pins, [&](auto& db, auto& txn) {
-        for (const auto& [id, revision] : pins) db.retireObject(txn, id);
-    });
+    (void)state.objectStoreSession()->editCurrent(*attachment, umbilici,
+        [](const vc::objects::StoreReader&, const std::string& uuid) {
+            return std::vector<vc::objects::TransactionOperation>{vc::objects::RetireObjectOp{uuid}};
+        });
     _window->showStatusBarMessage(
         QObject::tr("Removed the umbilicus of volume %1").arg(QString::fromStdString(volumeId)), 5000);
 }
