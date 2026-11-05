@@ -177,6 +177,12 @@ class ConfigManager:
         # Enable nnUNet-style deep supervision (disabled by default)
         self.enable_deep_supervision = bool(self.tr_configs.get("enable_deep_supervision", True))
         self.gradient_accumulation = int(self.tr_configs.get("gradient_accumulation", 1))
+        # Restore AMP policy persisted by CLI/config serialization. Missing
+        # keys retain existing defaults or attributes from trainer-specific config.
+        if "no_amp" in self.tr_configs:
+            self.no_amp = bool(self.tr_configs["no_amp"])
+        if "amp_dtype" in self.tr_configs:
+            self.amp_dtype = self.tr_configs["amp_dtype"]
         self.max_steps_per_epoch = int(self.tr_configs.get("max_steps_per_epoch", 250))
         self.max_val_steps_per_epoch = int(self.tr_configs.get("max_val_steps_per_epoch", 50))
         self.train_num_dataloader_workers = int(self.tr_configs.get("num_dataloader_workers", 8))
