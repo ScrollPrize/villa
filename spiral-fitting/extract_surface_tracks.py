@@ -22,7 +22,7 @@ Two backends write the same keys in the same format:
   gpu  Brook (brook-cu12) and cuCIM on NVIDIA GPUs of compute capability 8.0 or
        newer, Linux x86-64 only, one process per GPU (``surface_tracks_gpu.py``).
   cpu  Kimimaro on the CPU, one slab at a time, or several with
-       --slab-workers; --cc-device gpu labels components on a GPU.
+       --slab-workers; vc_reader labels connected components on the CPU.
 
 Brook implements Kimimaro's algorithm on the GPU; its skeletons are close to
 Kimimaro's but not guaranteed to be identical. ``--backend auto`` uses the GPU
@@ -47,7 +47,6 @@ import importlib.util
 import os
 import pickle
 import re
-import subprocess
 import sys
 
 import numpy as np
@@ -68,7 +67,6 @@ yx_stride_v = 64  # stride between successive vertical slabs
 dust_threshold = 400  # remove components smaller than this many voxels
 max_area_threshold = 640_000  # drop components larger than this many voxels
 path_mode = 'interjoint'  # 'interjoint' = every chain between branch/terminal nodes; 'maximal_chain' = greedy longest-path peel
-cc_device = 'cpu'  # CPU backend: 'gpu' = connected components in PyTorch (gpu_cc.py), same labels as cc3d
 slab_workers = 1  # CPU backend: slabs processed at once by forked workers
 kimimaro_parallel = 8  # CPU backend: Kimimaro processes per slab
 
@@ -201,85 +199,14 @@ def get_skeleton_tracks(cc_labels, offset_zyx, verbose=False, skeletonize=None):
     return tracks
 
 
-def _cc_size_range():
-    # (lower, upper) component sizes kept after downsampling, as in the cc3d path below.
-    scale = downsample_factor ** 3
-    return max(1, dust_threshold // scale), max(1, max_area_threshold // scale)
-
-
-def _gpu_cc_owner(requests, responses, ds, lower, upper):
-    # Labels every slab worker's slabs on the GPU, so the card holds one CUDA context.
-    # Ignores Ctrl-C and stops once every request pipe is closed, after the workers.
-    import signal
-    import traceback
-    from multiprocessing.connection import wait
-    import gpu_cc
-    signal.signal(signal.SIGINT, signal.SIG_IGN)
-    open_requests = list(requests)
-    while open_requests:
-        for conn in wait(open_requests):
-            try:
-                predictions_binary = conn.recv()
-            except EOFError:
-                open_requests.remove(conn)
-                continue
-            try:
-                labels = gpu_cc.prepare_cc_labels(predictions_binary, ds, lower, upper)
-            except gpu_cc.torch.cuda.OutOfMemoryError:
-                labels = None
-            except Exception:
-                labels = traceback.format_exc()
-            finally:
-                gpu_cc.torch.cuda.empty_cache()
-            responses[requests.index(conn)].send(labels)
-
-
-_gpu_owner = None  # (free slots, request pipes, response pipes, exit sentinel) of the GPU owner, inherited by forked workers
-
-
-def _owner_cc_labels(predictions_binary):
-    # Labels from the GPU owner; None if it ran out of GPU memory.
-    from multiprocessing.connection import wait
-    slots, requests, responses, sentinel = _gpu_owner
-    slot = slots.get()
-    pending = False
-    try:
-        requests[slot].send(predictions_binary)
-        pending = True
-        if responses[slot] not in wait([responses[slot], sentinel]):
-            raise EOFError
-        labels = responses[slot].recv()
-        pending = False
-    except (BrokenPipeError, EOFError):
-        pending = False
-        raise RuntimeError('gpu_cc: the GPU owner process exited') from None
-    finally:
-        if pending:
-            # Interrupted while waiting (Ctrl-C): drain this slab's labels so the slot's next user gets its own.
-            if responses[slot] in wait([responses[slot], sentinel]):
-                responses[slot].recv()
-        slots.put(slot)
-    if isinstance(labels, str):
-        raise RuntimeError(f'gpu_cc failed in the GPU owner process:\n{labels}')
-    return labels
-
-
 def prepare_cc_labels(predictions_binary):
-    if _gpu_owner is not None:
-        cc_labels = _owner_cc_labels(predictions_binary)
-        if cc_labels is not None:
-            return cc_labels
-        print('gpu_cc: out of GPU memory, using cc3d for this slab', flush=True)
-    elif cc_device == 'gpu':
-        import gpu_cc
-        try:
-            return gpu_cc.prepare_cc_labels(predictions_binary, downsample_factor, *_cc_size_range())
-        except gpu_cc.torch.cuda.OutOfMemoryError:
-            print('gpu_cc: out of GPU memory, using cc3d for this slab', flush=True)
     # CC at native resolution, then max-pool down, then dust by combined min/max area.
     # Area thresholds are specified in full-res voxels; convert to downsampled by ds**3.
     import cc3d
-    cc_labels, _ = cc3d.connected_components(predictions_binary, connectivity=6, return_N=True)
+    from vc_reader.geometry import label_components
+    cc_labels, _ = label_components(predictions_binary, connectivity=6)
+    # cc3d.dust and Kimimaro expect unsigned label arrays.
+    cc_labels = cc_labels.astype(np.uint32, copy=False)
     cc_labels = downsample_maxpool(cc_labels, downsample_factor)
     scale = downsample_factor ** 3
     cc3d.dust(
@@ -322,23 +249,7 @@ def _run_slabs(predictions_zarr_array, tracks_db, jobs, desc):
         return
     import multiprocessing
     from concurrent.futures import ProcessPoolExecutor
-    global _worker_array, _gpu_owner
-    owner = None
-    if cc_device == 'gpu':
-        # A spawned process owns the GPU; forked workers send it their slabs.
-        # One request and one response pipe per slot; each worker holds a slot while it waits.
-        spawn = multiprocessing.get_context('spawn')
-        slots = spawn.SimpleQueue()
-        for slot in range(slab_workers):
-            slots.put(slot)
-        request_in, request_out = zip(*(spawn.Pipe(duplex=False) for _ in range(slab_workers)))
-        response_in, response_out = zip(*(spawn.Pipe(duplex=False) for _ in range(slab_workers)))
-        owner = spawn.Process(target=_gpu_cc_owner, daemon=True,
-                              args=(request_in, response_out, downsample_factor, *_cc_size_range()))
-        owner.start()
-        for conn in request_in + response_out:
-            conn.close()  # the owner's ends
-        _gpu_owner = slots, request_out, response_in, owner.sentinel
+    global _worker_array
     _worker_array = predictions_zarr_array
     pool = ProcessPoolExecutor(slab_workers, mp_context=multiprocessing.get_context('fork'))
     try:
@@ -348,14 +259,6 @@ def _run_slabs(predictions_zarr_array, tracks_db, jobs, desc):
         # On an error or Ctrl-C, drop the slabs not started yet; running slabs finish first.
         pool.shutdown(cancel_futures=True)
         _worker_array = None
-        if owner is not None:
-            for conn in _gpu_owner[1]:
-                conn.close()  # with the workers gone, this ends the owner
-            owner.join()
-            for conn in _gpu_owner[2]:
-                conn.close()
-            slots.close()
-            _gpu_owner = None
 
 
 def extract_horizontal(predictions_zarr_array, tracks_db):
@@ -555,12 +458,6 @@ def parse_args(argv=None):
              '(default: all visible GPUs)',
     )
     parser.add_argument(
-        '--cc-device', choices=('cpu', 'gpu'), default=cc_device,
-        help='CPU backend: connected components with cc3d, or in PyTorch on the first visible '
-             'CUDA or ROCm GPU with the same labels; a slab that runs out of GPU memory falls '
-             'back to cc3d (default: %(default)s)',
-    )
-    parser.add_argument(
         '--slab-workers', metavar='N', type=int, default=slab_workers,
         help='CPU backend: slabs processed at once in forked workers, each holding its own '
              'slab in memory; Linux and local predictions only (default: %(default)s)',
@@ -588,29 +485,24 @@ def parse_args(argv=None):
         parser.error('--z-min must be non-negative and less than --z-max')
     if args.backend == 'cpu' and args.gpus is not None:
         parser.error('--gpus applies to the GPU backend only, not to --backend cpu')
-    cpu_opts = ('cc_device', 'slab_workers', 'kimimaro_parallel')
+    cpu_opts = ('slab_workers', 'kimimaro_parallel')
     if args.backend != 'cpu' and any(getattr(args, k) != parser.get_default(k) for k in cpu_opts):
-        parser.error('--cc-device, --slab-workers and --kimimaro-parallel apply to --backend cpu only')
+        parser.error('--slab-workers and --kimimaro-parallel apply to --backend cpu only')
     if args.slab_workers < 1 or args.kimimaro_parallel < 1:
         parser.error('--slab-workers and --kimimaro-parallel must be at least 1')
     if args.slab_workers > 1 and not sys.platform.startswith('linux'):
         parser.error('--slab-workers > 1 needs Linux (forked workers)')
     if args.slab_workers > 1 and '://' in args.predictions:
         parser.error('--slab-workers > 1 needs local predictions; forked workers cannot share a remote store')
-    if args.cc_device == 'gpu':
-        # Checked in a child process, so this process never initializes CUDA.
-        probe = 'import sys, torch; sys.exit(not torch.cuda.is_available())'
-        if subprocess.run([sys.executable, '-c', probe], capture_output=True).returncode:
-            parser.error('--cc-device gpu needs PyTorch with a visible CUDA or ROCm GPU')
     return args
 
 
 def main(argv=None):
     # The slab functions above read the z range from the module configuration.
-    global z_min, z_max, cc_device, slab_workers, kimimaro_parallel
+    global z_min, z_max, slab_workers, kimimaro_parallel
     args = parse_args(argv)
     z_min, z_max = args.z_min, args.z_max
-    cc_device, slab_workers, kimimaro_parallel = args.cc_device, args.slab_workers, args.kimimaro_parallel
+    slab_workers, kimimaro_parallel = args.slab_workers, args.kimimaro_parallel
 
     assert z_chunk_depth_h >= downsample_factor
     assert yx_chunk_thickness_v >= downsample_factor

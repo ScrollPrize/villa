@@ -1,11 +1,4 @@
-"""Tests for the CPU-backend speed options of extract_surface_tracks.py.
-
-``--cc-device gpu`` must give the same connected-component labels as cc3d, and
-``--cc-device gpu``, ``--slab-workers`` and ``--kimimaro-parallel`` must write
-the same DBM as the defaults. The GPU tests run only when PyTorch sees a CUDA
-or ROCm GPU.
-"""
-
+"""Parity tests for vc_reader components and CPU slab workers."""
 from __future__ import annotations
 
 import dbm
@@ -22,14 +15,6 @@ cc3d = pytest.importorskip('cc3d')
 
 import extract_surface_tracks as est  # noqa: E402
 
-try:
-    import torch
-except ImportError:
-    torch = None
-
-needs_gpu = pytest.mark.skipif(
-    torch is None or not torch.cuda.is_available(), reason='needs a CUDA or ROCm GPU')
-
 
 def _blobs(shape, density, seed):
     # Random foreground grown into sheets and blobs of many sizes, so dust removes components.
@@ -40,7 +25,6 @@ def _blobs(shape, density, seed):
     return x.astype(np.uint8)
 
 
-@needs_gpu
 @pytest.mark.parametrize('shape,density,seed', [
     ((4, 256, 256), 0.08, 0),     # horizontal ribbon
     ((96, 4, 300), 0.10, 1),      # vertical zx slab
@@ -48,43 +32,30 @@ def _blobs(shape, density, seed):
     ((33, 47, 61), 0.05, 3),      # shape not divisible by the downsample factor
     ((8, 64, 64), 0.0, 4),        # empty
 ])
-def test_gpu_labels_equal_cc3d(shape, density, seed, monkeypatch):
+def test_vc_reader_labels_equal_cc3d(shape, density, seed):
     pred = _blobs(shape, density, seed)
-    monkeypatch.setattr(est, 'cc_device', 'cpu')
-    want = est.prepare_cc_labels(pred.copy())
-    monkeypatch.setattr(est, 'cc_device', 'gpu')
+    want = _reference_labels(pred.copy())
     got = est.prepare_cc_labels(pred.copy())
-    # cc3d picks uint16 or uint32 from the volume size; the GPU path always returns uint32.
-    np.testing.assert_array_equal(got.astype(np.uint32), want.astype(np.uint32))
+    np.testing.assert_array_equal(got, want)
 
 
-@needs_gpu
-def test_gpu_max_area_equal_cc3d(monkeypatch):
-    # Low enough that the max-area filter removes components of this volume.
+def _reference_labels(pred):
+    labels = cc3d.connected_components(pred, connectivity=6)
+    labels = est.downsample_maxpool(labels, est.downsample_factor)
+    scale = est.downsample_factor ** 3
+    cc3d.dust(labels, threshold=[max(1, est.dust_threshold // scale),
+                               max(1, est.max_area_threshold // scale)],
+              in_place=True, precomputed_ccl=True)
+    return labels
+
+
+def test_max_area_equal_cc3d(monkeypatch):
     monkeypatch.setattr(est, 'max_area_threshold', 20_000)
     pred = _blobs((4, 256, 256), 0.08, 0)
-    monkeypatch.setattr(est, 'cc_device', 'cpu')
-    want = est.prepare_cc_labels(pred.copy())
-    monkeypatch.setattr(est, 'cc_device', 'gpu')
-    got = est.prepare_cc_labels(pred.copy())
+    want = _reference_labels(pred.copy())
+    np.testing.assert_array_equal(est.prepare_cc_labels(pred.copy()), want)
     monkeypatch.setattr(est, 'max_area_threshold', 640_000)
     assert np.count_nonzero(want) < np.count_nonzero(est.prepare_cc_labels(pred.copy()))
-    np.testing.assert_array_equal(got.astype(np.uint32), want.astype(np.uint32))
-
-
-@pytest.mark.skipif(torch is None, reason='needs PyTorch')
-def test_gpu_oom_falls_back_to_cc3d(monkeypatch):
-    import gpu_cc
-
-    def oom(*args):
-        raise torch.cuda.OutOfMemoryError('test')
-
-    pred = _blobs((8, 64, 64), 0.05, 5)
-    monkeypatch.setattr(est, 'cc_device', 'cpu')
-    want = est.prepare_cc_labels(pred.copy())
-    monkeypatch.setattr(est, 'cc_device', 'gpu')
-    monkeypatch.setattr(gpu_cc, 'prepare_cc_labels', oom)
-    np.testing.assert_array_equal(est.prepare_cc_labels(pred.copy()), want)
 
 
 def _run(out_dir, name, volume, **opts):
@@ -115,15 +86,12 @@ def _canonical(tracks):
 @pytest.mark.parametrize('opts', [
     dict(kimimaro_parallel=1),
     dict(slab_workers=3, kimimaro_parallel=1),
-    pytest.param(dict(cc_device='gpu'), marks=needs_gpu),
-    pytest.param(dict(cc_device='gpu', slab_workers=3, kimimaro_parallel=1), marks=needs_gpu),
-    # A pass with a single slab (one horizontal ribbon here).
-    pytest.param(dict(cc_device='gpu', slab_workers=3, kimimaro_parallel=1, z_chunk_stride_h=64), marks=needs_gpu),
 ])
-def test_dbm_equal_to_default(tmp_path, opts):
+def test_dbm_equal_to_default(tmp_path, opts, monkeypatch):
     volume = _blobs((64, 128, 128), 0.03, 7)
-    layout = {k: v for k, v in opts.items() if k == 'z_chunk_stride_h'}
-    want = _run(tmp_path, 'ref', volume, **layout)
+    with monkeypatch.context() as reference:
+        reference.setattr(est, 'prepare_cc_labels', _reference_labels)
+        want = _run(tmp_path, 'ref', volume)
     got = _run(tmp_path, 'new', volume, **opts)
     assert want.keys() == got.keys()
     assert _canonical(got) == _canonical(want)
@@ -139,3 +107,19 @@ def test_slab_workers_on_zarr(tmp_path):
     got = _run(tmp_path, 'new', zarr.open_array(str(tmp_path / 'pred.zarr'), mode='r'),
                slab_workers=3, kimimaro_parallel=1)
     assert _canonical(got) == _canonical(want)
+
+
+@pytest.mark.parametrize('axis', [0, 1, 2])
+def test_real_scroll_labels_equal_cc3d(axis):
+    fixture = Path(__file__).resolve().parents[2] / 'vesuvius/tests/ink_detection/fixtures/ink_roi_case.npz'
+    if not fixture.exists():
+        pytest.skip('monorepo real-scroll fixture required')
+    with np.load(fixture) as data:
+        # Exercise slab labeling on foreground derived from the real CT crop.
+        volume = (data['ct'] > 128).astype(np.uint8)
+    index = [slice(None)] * 3
+    index[axis] = slice(4, 8)
+    slab = np.ascontiguousarray(volume[tuple(index)])
+    want = _reference_labels(slab)
+    assert np.count_nonzero(want)
+    np.testing.assert_array_equal(est.prepare_cc_labels(slab), want)
