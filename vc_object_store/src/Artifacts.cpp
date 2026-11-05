@@ -15,6 +15,24 @@
 #include <set>
 
 namespace vc::objects {
+void detail::writeArtifactFile(const ArtifactFileRef& file, const std::filesystem::path& destination, uint64_t range,
+                               const std::function<std::vector<uint8_t>(uint64_t, uint64_t)>& read)
+{
+    vcr::AtomicFile out(destination.string());
+    PayloadHasher hasher;
+    uint64_t written = 0;
+    while (written < file.length) {
+        const auto bytes = read(written, std::min(range, file.length - written));
+        if (bytes.empty()) break;
+        hasher.update(bytes.data(), bytes.size());
+        out.write(bytes.data(), bytes.size());
+        written += bytes.size();
+    }
+    if (written != file.length || hasher.finish() != file.sha256)
+        throw std::runtime_error("artifact '" + file.name + "' does not match its manifest");
+    out.publish(false);
+}
+
 using Json = nlohmann::json;
 namespace platform = vcr::platform;
 

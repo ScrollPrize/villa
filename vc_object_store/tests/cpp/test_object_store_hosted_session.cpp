@@ -11,7 +11,9 @@
 #include "vc_object_store/objects/ObjectStoreSession.hpp"
 #include "vc_object_store/server/Server.hpp"
 
+#include <fstream>
 #include <iostream>
+#include <iterator>
 #include <thread>
 
 using namespace vc::objects;
@@ -86,7 +88,11 @@ try {
         auto store = ObjectStore::create(localPath, options);
         auto write = store.write();
         ObjectRecord record; record.kind = "track"; record.track.emplace(); record.track->datasetRef = "s"; record.track->externalKey = "l";
+        record.uuid = "ffffffff-ffff-4fff-bfff-ffffffffffff"; // sorts after the copy below
         localOnly = store.upsertObject(write, record);
+        // A local copy of the hosted track (same UUID): the hosted one hides it.
+        ObjectRecord copy = record; copy.uuid = track; copy.track->externalKey = "copy";
+        store.upsertObject(write, copy);
         write.commit();
     }
     server::ServerOptions serverOptions; serverOptions.readWorkers = 2;
@@ -180,6 +186,30 @@ try {
     const auto listed = session.selectObjects(order, tracks);
     require(listed.size() == 2 && listed[0].attachment == hosted && listed[0].record.uuid == track &&
             listed[1].attachment == local && listed[1].record.uuid == localOnly, "selection across backends");
+    // A limited page that loses its first record to the hosted copy reads on.
+    tracks.limit = 1;
+    const auto page = session.selectObjects(order, tracks);
+    require(page.size() == 2 && page[1].attachment == local && page[1].record.uuid == localOnly, "hidden records refilled");
+    tracks.limit.reset();
+
+    // Artifacts through the session, hosted and local alike.
+    for (const auto& attachment : order) {
+        const auto object = attachment == hosted ? track : localOnly;
+        const auto file = directory.path / "weights.bin";
+        { std::ofstream(file, std::ios::binary) << "weights for " << object; }
+        const auto version = session.currentObject(attachment, object)->version;
+        const auto published = session.publishArtifacts(attachment, object, version, {{"model/weights.bin", file}}, "session-test");
+        require(published.objects.at(object) == version + 1, "artifacts published");
+        if (attachment == hosted) session.refresh(hosted);
+        const auto files = session.artifacts(attachment, object);
+        require(files.size() == 1 && files[0].name == "model/weights.bin" && session.artifacts(attachment, object, version).empty(),
+                "manifest per version");
+        const auto out = directory.path / ("materialized-" + object);
+        session.materializeArtifacts(attachment, object, out);
+        std::ifstream in(out / "model" / "weights.bin", std::ios::binary);
+        require(std::string(std::istreambuf_iterator<char>(in), {}) == "weights for " + object, "materialized bytes");
+    }
+    (void)session.takeEvents();
     const auto committed = session.geometryRegion(order, plane(10.25), surfaces());
     require(!committed.empty() && committed[0].attachment == hosted && !committed[0].result.runs.empty() &&
             committed[0].result.runs[0].objectUuid == surface, "hosted region");

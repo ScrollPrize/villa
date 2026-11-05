@@ -1,6 +1,7 @@
 #include "FetchQueue.hpp"
 #include "HostedSession.hpp"
 #include "DraftCheckpoints.hpp"
+#include "internal/Artifacts.hpp"
 #include <set>
 #include "vc_object_store/objects/ObjectStoreSession.hpp"
 #include "hub/HubWorker.hpp"
@@ -308,6 +309,69 @@ VolumeTransforms ObjectStoreSession::volumeTransforms(const AttachmentIdentity& 
     });
 }
 
+std::vector<ArtifactFile> ObjectStoreSession::artifacts(const AttachmentIdentity& identity, const std::string& objectUuid,
+                                                       const std::optional<int64_t>& version)
+{
+    const auto uuid = util::canonicalUuid(objectUuid);
+    std::optional<ObjectRevision> revision;
+    if (version) {
+        const auto status = this->status(identity);
+        revision = objectsAtVersions(identity, {{status.storeUuid, status.generation, uuid, *version}}).front();
+    } else {
+        revision = currentObject(identity, uuid);
+    }
+    if (!revision || revision->deleted) throw std::invalid_argument("object version not found: " + uuid);
+    return artifactManifest(revision->record);
+}
+
+std::vector<ArtifactFile> ObjectStoreSession::materializeArtifacts(const AttachmentIdentity& identity, const std::string& objectUuid,
+                                                                  const std::filesystem::path& destination,
+                                                                  const std::optional<int64_t>& version)
+{
+    const auto files = artifacts(identity, objectUuid, version);
+    withAttachment(identity, false, [&](Attachment& attachment) {
+        for (const auto& file : files) {
+            const auto target = destination / std::filesystem::path(file.name);
+            std::filesystem::create_directories(target.parent_path());
+            if (attachment.remote) { attachment.remote->client().fetchArtifact(file, target); continue; }
+            auto& store = attachment.store();
+            detail::writeArtifactFile({file.name, file.sha256, file.length}, target, uint64_t(32) << 20,
+                                      [&](uint64_t offset, uint64_t count) { return store.readArtifact(file.sha256, offset, count); });
+        }
+        return 0;
+    });
+    return files;
+}
+
+TransactionReceipt ObjectStoreSession::publishArtifacts(const AttachmentIdentity& identity, const std::string& objectUuid,
+                                                        int64_t expectedVersion,
+                                                        const std::vector<std::pair<std::string, std::filesystem::path>>& files,
+                                                        const std::string& author)
+{
+    const auto uuid = util::canonicalUuid(objectUuid);
+    std::map<std::string, ArtifactFile> manifest;
+    for (auto& file : artifacts(identity, uuid, expectedVersion)) manifest[file.name] = std::move(file);
+    // Bytes first: the request may only name what the store holds.
+    withAttachment(identity, true, [&](Attachment& attachment) {
+        for (const auto& [name, path] : files) {
+            const auto hash = attachment.remote ? attachment.remote->client().putArtifact(path) : attachment.store().putArtifact(path);
+            manifest[name] = ArtifactFile{name, hash, uint64_t(std::filesystem::file_size(path))};
+        }
+        return 0;
+    });
+    std::vector<ArtifactFile> listed;
+    for (auto& [name, file] : manifest) listed.push_back(std::move(file));
+    const auto status = this->status(identity);
+    TransactionRequest request;
+    request.requestUuid = util::newUuid();
+    request.storeUuid = status.storeUuid;
+    request.generation = status.generation;
+    request.author = author;
+    request.expectedObjects = {{uuid, expectedVersion}};
+    request.operations = {SetMetaOp{uuid, kArtifactsMetaKey, artifactManifestJson(std::move(listed))}};
+    return submit(identity, request);
+}
+
 std::set<std::string> ObjectStoreSession::holds(const AttachmentIdentity& identity, const std::set<std::string>& uuids)
 {
     if (uuids.empty()) return {};
@@ -586,16 +650,26 @@ std::vector<AttachedRecord> ObjectStoreSession::selectObjects(const std::vector<
     std::vector<AttachedRecord> result;
     std::vector<AttachmentIdentity> earlier;
     for (const auto& attachment : order) {
-        const auto records = withAttachment(attachment, false, [&](Attachment& held) {
-            if (held.remote) return held.remote->selectObjects(selection);
-            auto txn = held.store().read();
-            return held.store().selectObjects(txn, selection);
-        });
-        std::set<std::string> uuids;
-        for (const auto& record : records) uuids.insert(record.uuid);
-        const auto hidden = heldBy(earlier, uuids);
-        for (const auto& record : records)
-            if (!hidden.contains(record.uuid)) result.push_back({attachment, record});
+        auto page = selection;
+        int64_t kept = 0;
+        for (;;) {
+            const auto records = withAttachment(attachment, false, [&](Attachment& held) {
+                if (held.remote) return held.remote->selectObjects(page);
+                auto txn = held.store().read();
+                return held.store().selectObjects(txn, page);
+            });
+            std::set<std::string> uuids;
+            for (const auto& record : records) uuids.insert(record.uuid);
+            const auto hidden = heldBy(earlier, uuids);
+            for (const auto& record : records) {
+                if (hidden.contains(record.uuid) || (selection.limit && kept == *selection.limit)) continue;
+                result.push_back({attachment, record});
+                ++kept;
+            }
+            // A full page that lost records to earlier attachments: read on.
+            if (!selection.limit || kept == *selection.limit || int64_t(records.size()) < *selection.limit) break;
+            page.offset += int64_t(records.size());
+        }
         earlier.push_back(attachment);
     }
     return result;

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "vc_object_store/objects/ObjectStore.hpp"
+#include "vc_object_store/objects/Artifacts.hpp"
 #include "vc_object_store/client/HostedStore.hpp"
 #include "vc_object_store/objects/GeometryRegion.hpp"
 #include "vc_object_store/objects/Hub.hpp"
@@ -221,6 +222,21 @@ public:
     // The attachment's volume transforms: recorded registrations and choices
     // (and, locally, the client catalog's unrecorded registrations).
     VolumeTransforms volumeTransforms(const AttachmentIdentity&);
+    // Artifacts (objects/Artifacts.hpp) on any attachment: the manifest of an
+    // object's current version (or `version`, in the active generation).
+    std::vector<ArtifactFile> artifacts(const AttachmentIdentity&, const std::string& objectUuid,
+                                        const std::optional<int64_t>& version = std::nullopt);
+    // Writes those files under `destination` (local to this process; names
+    // are relative paths), each atomically and verified against the manifest.
+    std::vector<ArtifactFile> materializeArtifacts(const AttachmentIdentity&, const std::string& objectUuid,
+                                                   const std::filesystem::path& destination,
+                                                   const std::optional<int64_t>& version = std::nullopt);
+    // Stores each (name, local file) durably, then names them in the object's
+    // manifest (replacing entries of the same names) in one checked request
+    // that expects `expectedVersion` of the object; returns its receipt.
+    TransactionReceipt publishArtifacts(const AttachmentIdentity&, const std::string& objectUuid, int64_t expectedVersion,
+                                        const std::vector<std::pair<std::string, std::filesystem::path>>& files,
+                                        const std::string& author);
     // Writes by a geometry fetcher (setGeometryFetcher) on a writable attachment.
     using FetchWrite = std::function<RevisionSelection(const RevisionSelection& expected, const Action&)>;
     // Fetches one object's geometry and writes it with `write`; throws when it
@@ -291,6 +307,9 @@ public:
     void writeJob(const AttachmentIdentity&, const Job&);
     // Queries across attachments in `order`: an object (by UUID) comes from the
     // first attachment holding it, so an imported copy hides the catalog one.
+    // With a selection limit, each attachment contributes up to `limit`
+    // records that are not hidden: it is read in further pages when earlier
+    // attachments hide some, so a short result means there are no more.
     std::vector<AttachedRecord> selectObjects(const std::vector<AttachmentIdentity>& order, const ObjectSelection&);
     std::vector<AttachedRegion> geometryRegion(const std::vector<AttachmentIdentity>& order, const RegionSlice&,
                                                const RegionOptions&, const RegionCancel& = {});

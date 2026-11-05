@@ -187,6 +187,18 @@ check. The session's own submissions invalidate theirs at once. Cached data
 stays readable while the host is unreachable; anything else fails, and listings
 and spatial queries always need the host.
 
+With a selection limit, `selectObjects` gives each attachment up to `limit`
+records that earlier attachments do not hide. It reads further pages when some
+are hidden, so a short result means there are no more.
+
+Artifacts work the same way on every attachment. `artifacts(attachment, object,
+version)` lists an object version's manifest. `materializeArtifacts` writes those
+files under a local directory, each one atomic and verified.
+`publishArtifacts(attachment, object, expectedVersion, files, author)` stores the
+bytes durably, then names them in the manifest in one checked request.
+`artifactDirectory` (a shared directory) remains for local attachments until its
+callers move.
+
 ### Durable drafts
 
 Drafts live in the session's memory. `useDraftDirectory(directory)` makes them

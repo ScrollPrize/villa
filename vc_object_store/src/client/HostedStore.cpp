@@ -1,6 +1,7 @@
 #include "vc_object_store/client/HostedStore.hpp"
 
 #include "vc_object_store/objects/TransactionJson.hpp"
+#include "internal/Artifacts.hpp"
 
 #include <nlohmann/json.hpp>
 #include <vc_reader/native/atomic_file.hpp>
@@ -632,19 +633,8 @@ std::vector<uint8_t> HostedStore::readArtifact(const std::string& sha256, uint64
 
 void HostedStore::fetchArtifact(const ArtifactFile& file, const std::filesystem::path& destination)
 {
-    vcr::AtomicFile out(destination.string());
-    PayloadHasher hasher;
-    uint64_t written = 0;
-    const uint64_t range = uint64_t(rangeBytes_);
-    while (written < file.length) {
-        const auto bytes = readArtifact(file.sha256, written, std::min(range, file.length - written));
-        hasher.update(bytes.data(), bytes.size());
-        out.write(bytes.data(), bytes.size());
-        written += bytes.size();
-    }
-    if (written != file.length || hasher.finish() != file.sha256)
-        throw std::runtime_error("hosted store: artifact '" + file.name + "' does not match its manifest");
-    out.publish(false);
+    detail::writeArtifactFile({file.name, file.sha256, file.length}, destination, uint64_t(rangeBytes_),
+                              [&](uint64_t offset, uint64_t count) { return readArtifact(file.sha256, offset, count); });
 }
 
 } // namespace vc::objects
