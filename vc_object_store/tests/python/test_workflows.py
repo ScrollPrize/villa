@@ -194,7 +194,7 @@ def test_checked_relationships_lifecycle_and_graph(db):
     assert db.component(a, adjacent=True) == [a]
     assert db.neighbours(a) == [b] and db.edges_by_kind('fiber_branch')[0]['uuid'] == edge
     before = db.journal_since()
-    with pytest.raises(RuntimeError):
+    with pytest.raises(ValueError):
         with db.write(expected_revisions={a: selected[a]}) as tx:
             tx.set_meta(a, 'rollback', True)
             tx.remove_edge(edge)  # b is also modified, but has no expectation
@@ -322,7 +322,9 @@ def test_record_fields_and_transaction_bindings(db, kind, detail):
     assert record[kind] == detail and record['tags'] == ['review']
     assert record['approved_by'] == 'pytest' and record['approved_generation'] == record['generation']
     fields = ['name', 'format_version', 'storage_kind', 'storage_ref', 'data_generation', 'data_checksum', kind]
-    assert db.select_objects(fields=fields) == [{key: record[key] for key in ['uuid', 'kind', *fields]}]
+    rows = db.select_objects(fields=fields)
+    assert rows[0].pop('version') >= 1 and rows[0].pop('version_generation') == db.status()['generation']
+    assert rows == [{key: record[key] for key in ['uuid', 'kind', *fields]}]
     with ObjectStore.create(db.path + '.copy', author='copy') as other:
         other.import_json(db.export_json())
         assert other.object(uid) == record

@@ -397,6 +397,24 @@ checks these bounds. It also measures status latency while four clients upload
 at once and submit latency for 2 and 4 concurrent writers, and it recovers a
 transaction whose client hung up before the reply.
 
+### Python access to numbered history and hosted stores
+
+`ObjectStore` (local) and `HostedStore(endpoint)` (a `vc_object_server`) take
+the same forms: requests are the canonical JSON as a dict or text with binary
+payloads keyed by SHA-256 (`submit(request, payloads)`, `receipt`), queries
+are the wire query form (`{"selection": {...}, "fields": [...]}`) and
+numbered references are `{store, generation, object, version}` dicts
+(`objects_at_versions`, `relationships_at_versions`). Selected rows carry
+`version` and `version_generation`. `record_selection(query)` returns a
+selection record dict; `encode_selection_record`/`decode_selection_record`
+give the binary form. Artifacts: `put_artifact`, `artifact_length`,
+`read_artifact`, `artifact_manifest_json(files)` for the `ARTIFACTS_META_KEY`
+metadata value, and on `HostedStore` also `fetch_artifact(file, destination)`.
+`HostedStore` queries take `with_status=True` to also return the status of the
+server snapshot they read; `select_all_objects`/`select_all_edges` raise
+`StoreBusy` as in C++. Conflicts raise `RuntimeError`, malformed requests
+`ValueError`.
+
 ## Relationships and graphs
 
 Relationships are shared by both endpoints. Addition, removal or rebinding
@@ -921,6 +939,11 @@ Python-enabled build, use its Python interpreter and point to its module directo
 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 VC_OBJECT_STORE_BUILD_PYTHON_PATH=build/python \
   /path/to/python -m pytest tests/python -q
 ```
+
+`tests/python/test_hosted_client.py` runs only when `VC_OBJECT_SERVER` names a
+`vc_object_server` binary. In a VC build tree, configure with
+`-DVC_OBJECT_STORE_PYTHON=ON` and build the `vc_object_bindings` target; the
+module directory is then `<build>/object_store/python`.
 
 VC3D and CLI imports share `prepareGeometrySource` and the checked batch ingest.
 Fibers accept current version-4 documents, VC3D version-1 and version-3 fiber

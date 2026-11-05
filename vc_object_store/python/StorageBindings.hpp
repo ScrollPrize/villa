@@ -122,6 +122,8 @@ void commonToPy(nb::dict& d, const vo::RecordCommon& r, const std::set<std::stri
         if (include(key)) d[key] = value;
     });
     if (include("meta")) d["meta"] = jsonLoads(r.meta);
+    // Selected in a read snapshot: the numbered head version it was read from.
+    if (r.version) { d["version"] = *r.version; d["version_generation"] = r.versionGeneration; }
 }
 
 nb::dict objectToPy(const vo::ObjectRecord& r, const std::set<std::string>* fields = nullptr)
