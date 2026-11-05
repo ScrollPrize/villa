@@ -91,7 +91,8 @@ TransactionReceipt HostedStore::submit(const TransactionRequest& request)
         if (response.status != 422 || attempt == 3) {
             return transactionReceiptFromJson(expectOk(response, "submit " + request.requestUuid).body);
         }
-        for (const auto& hash : Json::parse(response.body).at("missing")) {
+        const auto answer = Json::parse(response.body);  // the loop reads into it
+        for (const auto& hash : answer.at("missing")) {
             const auto name = hash.get<std::string>();
             if (!payloads.contains(name)) throw std::runtime_error("hosted store: server asked for an unknown payload " + name);
             upload(name);

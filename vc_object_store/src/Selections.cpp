@@ -149,7 +149,8 @@ SelectionRecord recordSelection(const ObjectStore& store, const Txn& txn, const 
             recorded.insert(meta.contains("catalog_registration")
                 ? meta.at("catalog_registration").at("id").get<std::string>() : transform.uuid);
         }
-        for (const auto& registration : store.volumeTransforms(txn).graph.registrations())
+        const auto available = store.volumeTransforms(txn);  // the loop reads its registrations by reference
+        for (const auto& registration : available.graph.registrations())
             if (!recorded.contains(registration.id))
                 throw std::invalid_argument("selection record: catalog registration " + registration.id +
                                             " is not recorded in the store; record it first (recordCatalogTransforms)");
