@@ -2043,6 +2043,20 @@ QuadSurface *tracer(vcr::Array& volume, float scale, cv::Vec3f origin, const nlo
     }
     trace_data.ngv = ngv.get();
 
+    // Without normal grids the NORMAL and SNAP losses add nothing
+    // (gen_normal_loss), and the reference ray loss, the only other one that
+    // reads data, is off by default, so the surface is shaped by spacing and
+    // smoothness alone and does not follow the surface prediction. Say so
+    // instead of tracing silently.
+    if (!ngv && loss_settings[LossType::REFERENCE_RAY] <= 0.0f) {
+        std::cerr << "WARNING: no normal_grid_path given, and no other loss that reads the "
+                     "volume is enabled. The surface will be shaped by spacing and smoothness "
+                     "only and will not follow the surface prediction. Pass normal_grid_path "
+                     "(a published prediction's .normal-grids folder, or a folder holding "
+                     "normal-grids-remote.json; see docs/extending_and_modifying_segmentations.md)."
+                  << std::endl;
+    }
+
     std::cout << "GrowPatch loss weights:\n"
               << "  DIST: " << loss_settings.w[LossType::DIST]
               << " STRAIGHT: " << loss_settings.w[LossType::STRAIGHT]
