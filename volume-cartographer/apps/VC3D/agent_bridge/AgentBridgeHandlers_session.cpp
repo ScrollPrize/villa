@@ -270,7 +270,7 @@ QJsonObject AgentBridgeServer::handleSegmentsList(const QJsonValue& /*params*/)
     const std::string activeId = _window->_state ? _window->_state->activeSurfaceId() : std::string{};
     QJsonArray segments;
     for (const auto& [uuid, row] : catalog.rows())
-        segments.push_back(surfaceRowJson(row, activeId));
+        segments.push_back(surfaceRowJson(row, activeId, *_window->_state));
     QJsonObject result;
     result["segments"] = segments;
     // A listing is still being read: what is here may be partial.
@@ -344,7 +344,7 @@ QJsonObject AgentBridgeServer::handleSegmentsActivate(const QJsonValue& params)
         }
     }
 
-    const QJsonObject segment = surfaceRowJson(*_window->_surfaceCatalog->row(segmentId), segmentId);
+    const QJsonObject segment = surfaceRowJson(*_window->_surfaceCatalog->row(segmentId), segmentId, *state);
 
     QJsonObject result;
     result["activated"] = true;

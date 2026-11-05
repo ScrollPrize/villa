@@ -470,29 +470,6 @@
         "type": "object"
       }
     },
-    "fiber.import": {
-      "errors": [
-        -32602,
-        -32000,
-        -32010,
-        -32007,
-        -32005
-      ],
-      "mcp": {
-        "tool": "vc3d_fiber_import"
-      },
-      "params": {
-        "properties": {
-          "path": {
-            "type": "string"
-          }
-        },
-        "required": [
-          "path"
-        ],
-        "type": "object"
-      }
-    },
     "fiber.launch": {
       "errors": [
         -32602,
@@ -991,6 +968,113 @@
         },
         "required": [
           "mode"
+        ],
+        "type": "object"
+      }
+    },
+    "objects.export": {
+      "errors": [
+        -32602,
+        -32000,
+        -32007,
+        -32004,
+        -32005
+      ],
+      "mcp": {
+        "extraParams": [
+          "wait"
+        ],
+        "paramRenames": {
+          "validOnly": "valid_only"
+        },
+        "tool": "vc3d_export_object"
+      },
+      "params": {
+        "properties": {
+          "overwrite": {
+            "default": false,
+            "type": "boolean"
+          },
+          "path": {
+            "type": "string"
+          },
+          "store": {
+            "type": "string"
+          },
+          "uuid": {
+            "type": "string"
+          },
+          "validOnly": {
+            "default": false,
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "uuid",
+          "path"
+        ],
+        "type": "object"
+      }
+    },
+    "objects.import": {
+      "errors": [
+        -32602,
+        -32000,
+        -32007,
+        -32009,
+        -32004,
+        -32005
+      ],
+      "mcp": {
+        "extraParams": [
+          "wait"
+        ],
+        "paramRenames": {
+          "uuidNamespace": "uuid_namespace"
+        },
+        "tool": "vc3d_import_objects"
+      },
+      "params": {
+        "properties": {
+          "bind": {
+            "properties": {
+              "scale": {
+                "exclusiveMinimum": 0,
+                "type": "number"
+              }
+            },
+            "required": [
+              "scale"
+            ],
+            "type": "object"
+          },
+          "kind": {
+            "enum": [
+              "surface",
+              "fiber",
+              "point_collection"
+            ],
+            "type": "string"
+          },
+          "path": {
+            "type": "string"
+          },
+          "store": {
+            "type": "string"
+          },
+          "tags": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "uuidNamespace": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "kind",
+          "path"
         ],
         "type": "object"
       }

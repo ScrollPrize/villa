@@ -192,6 +192,8 @@ per source is tracked:
 | `flatten` | SLIM lifecycle |
 | `seeding` | bridge-started run or expand batch |
 | `autosave` | explicit dirty-segment save |
+| `import` | `StoreImportController` (bridge and Stores menu imports) |
+| `export` | bridge-started object export |
 
 Application work started outside the bridge is represented when its lifecycle
 is observable, but only bridge-started seeding operations are registered as
@@ -202,13 +204,15 @@ most recently started job across all sources. Its record contains:
 
 ```text
 jobId, kind, source, label, state, message, outputPath, externalId,
-consoleTail, progressHistory, startedAtMs, finishedAtMs, result
+consoleTail, progressHistory, startedAtMs, finishedAtMs, result, progress
 ```
 
 `state` is `running`, `succeeded`, or `failed`. `consoleTail` and
 `progressHistory` are bounded. `outputPath`, `externalId`, and `finishedAtMs`
 are null when unavailable. `result` is an operation-specific object when a
-terminal job has structured output, otherwise null.
+terminal job has structured output, otherwise null; a failed job keeps any
+partial report there. `progress` is `{completed, total, detail}` for a job
+that counts its work (imports), otherwise null.
 
 ### Progress
 
@@ -302,8 +306,11 @@ own whose catalog surfaces are ordinary surfaces of it. A segment id is the
 surface's store UUID. Methods on segments need an open project and volume (-32000).
 
 - `segments.list` reports the listed surfaces: `id`, `name`, record `tags`,
-  `catalog` (an Open Data catalog surface), `bound` (bound to the open volume)
-  and `active`; `loading` is true while a listing is still being read.
+  `catalog` (an Open Data catalog surface), `bound` (bound to the open volume),
+  `active`, `store` (the project store reference it is in, null for a store
+  the project does not reference) and `writable`; `loading` is true while a
+  listing is still being read. `segments.activate` and `segments.review`
+  report the same fields.
 - `segments.activate` validates before changing selection. Activating the
   current segment is a no-op success. A catalog surface whose geometry is still
   remote is fetched first (the call blocks while it downloads).
@@ -348,7 +355,11 @@ surface's store UUID. Methods on segments need an open project and volume (-3200
 ### Points
 
 Point collection mutations resolve every selector and validate all points
-before changing the collection. Bulk operations are all-or-nothing. Winding
+before changing the collection. `points.list` and the responses naming a
+`collectionId` also carry the collection's object `uuid` and the `store`
+reference it is kept in (null for a surface's corrections, which are not
+objects of their own). The UUID is stable across reopen and is what
+`objects.export` takes. Bulk operations are all-or-nothing. Winding
 values may be finite floats or null where the method declares clearing.
 Metadata and tags are idempotent setters. Save/load methods use explicit paths
 and never open file pickers.
@@ -358,10 +369,61 @@ and never open file pickers.
 - Lasagna service and job queries use deferred responses from the service
   manager. Optimization is tracked as a `lasagna` job.
 - Fiber ids are strings on the wire. Bulk deletion validates every id before
-  removing any fiber. Import/export paths are explicit. Save waits for the
+  removing any fiber. Export paths are explicit. Save waits for the
   controller's persistence completion signal.
+- `fiber.list` and `fiber.open` also report each fiber's object `uuid` and
+  the `store` reference of the fiber store, connecting numeric editing ids to
+  store identities (`objects.import` results, `objects.export`).
+- Fibers are imported with `objects.import kind=fiber`; `fiber.export` writes
+  every fiber of the fiber store as one collection file.
 - Fiber launch suppresses dataset pickers; missing prerequisites become
   ordinary errors.
+
+### Stores and imports
+
+Objects live in the project's `.vcobj` stores; `state.get` lists the
+references (`stores`) and each kind's selected store (`routes`).
+
+- `objects.import` copies source files into a store as new objects: tifxyz
+  surfaces (one directory or a folder of them), fiber JSON (file, collection
+  or folder), or a `vc_pointcollections` JSON. It writes to the store routed
+  for the kind, or the attached writable `store` named, and never changes
+  routing. It is an `import` job (`StoreImportController`, shared with the
+  Stores menu's Import from Folder), one at a time; a fiber import is refused
+  (-32004) during a fiber merge, split or link.
+  - `tags` absent tags each object with the last path component; `[]` adds
+    none.
+  - `bind.scale` is stored units per current-volume voxel; objects are bound
+    to the annotation volume at `scale * annotationVolume.scale`. There is no
+    default scale; without `bind` sources keep the coordinates they declare
+    (or stay unbound). An explicit binding conflicting with a source's own
+    declaration is a problem of that source.
+  - `uuidNamespace` (a UUID per dataset) derives identities for sources
+    without canonical UUIDs. Bridge imports require source UUIDs otherwise:
+    a UUID-less fiber is a problem rather than named after its file, as the
+    fiber widget and Spiral still do.
+  - The result is `{store, ingested, edgesImported, problems, uuids,
+    existing, cancelled, fatalError}`. A completed traversal succeeds even
+    with problems or existing identities. A store failure stops the import:
+    the job fails with `fatalError: {message}` and the committed part of the
+    report. `job.cancel` stops it before the next object; the job fails with
+    `cancelled: true` and the partial report. Fiber and point-collection
+    sources commit as one batch: one existing identity rejects the batch and
+    `existing` lists every clash.
+  - Closing the project or detaching the store stops the import between
+    objects; what was committed stays.
+- `objects.export` writes one surface (tifxyz directory), fiber (fiber JSON)
+  or point collection (`vc_pointcollections` JSON with that collection) of an
+  attached project store, read-only stores included. Without `store` the UUID
+  is looked up across the project's attached stores; several matches fail
+  -32602 with the candidates. Catalog-only objects are not candidates. Pending
+  edits of the object are saved first (-32004 when an edit operation prevents
+  it, -32005 when saving fails, without export). It is an `export` job, not
+  cancellable; its result is `{path, uuid, kind, store, objectRevision,
+  geometryRevision}` from one read snapshot. The files carry the stored frame:
+  `uuid`, `coordinates: {volume_uuid, scale_factor}` (stored units per voxel
+  of that volume, null when unknown) and `coordinate_binding` when recorded.
+  Re-importing them keeps UUID and coordinates.
 
 ### Seeding, rendering, flattening, and mesh operations
 
@@ -417,7 +479,7 @@ is the sole bridge method without an MCP tool.
 | `vc3d_apply_anchor_offset` | `points.apply_anchor_offset` |
 | `vc3d_attach_volume` | `volume.attach` | Attach one local zarr volume or remote `.zarr` URL to the open project without changing the current primary volume. Returns a `volume` job; compose with `vc3d_list_overlay_volumes` and `vc3d_set_overlay` to display it. |
 | `vc3d_auto_fill_windings` | `points.auto_fill_windings` |
-| `vc3d_cancel_job` | `job.cancel` | Request cancellation of a running job by `jobId` (or by `source`). Only `tool`/`seeding`/`lasagna` jobs are cancellable; `growth`/`flatten`/`catalog`/`volume`/`autosave` return an error. Request-only — poll `vc3d_job_status` for the terminal state. |
+| `vc3d_cancel_job` | `job.cancel` | Request cancellation of a running job by `jobId` (or by `source`). Only `tool`/`seeding`/`lasagna`/`import` jobs are cancellable; `growth`/`flatten`/`catalog`/`volume`/`autosave`/`export` return an error. Request-only — poll `vc3d_job_status` for the terminal state. |
 | `vc3d_center_viewer` | `viewer.center_on_point` | Center a viewer pane on a 3D volume point. |
 | `vc3d_clear_all_points` | `points.clear_all` |
 | `vc3d_clear_point_collection` | `points.clear_collection` |
@@ -431,9 +493,9 @@ is the sole bridge method without an MCP tool.
 | `vc3d_describe_catalog_sample` | `catalog.describe_sample` |
 | `vc3d_drag` | `canvas.drag` |
 | `vc3d_enable_editing` | `segmentation.enable_editing` | Turn segmentation editing mode on/off for the active segment. |
+| `vc3d_export_object` | `objects.export` | Export one surface, fiber or point collection of an attached store as native files, in its stored frame. An `export` job. |
 | `vc3d_fiber_delete` | `fiber.delete` |
 | `vc3d_fiber_export` | `fiber.export` |
-| `vc3d_fiber_import` | `fiber.import` |
 | `vc3d_fiber_launch` | `fiber.launch` |
 | `vc3d_fiber_list` | `fiber.list` | Per fiber includes `traceState` (`legacy`/`predictions`/`mixed`) and per-span `interpMode` (`C`/`L`/`T`) plus `fiberManifest` (predictions provenance, trace spans only). Human review state is just the ordinary `reviewed` tag in `tags`. |
 | `vc3d_fiber_open` | `fiber.open` |
@@ -447,6 +509,7 @@ is the sole bridge method without an MCP tool.
 | `vc3d_get_state` | `state.get` | Snapshot of VC3D: open project and its stores, current volume, active segment, viewers (ids/names), editing mode, running job. Call this first. |
 | `vc3d_grow_surface_from_seed` | `segmentation.grow_surface_from_seed` | Create a new surface by growing it from a 3D seed point (headless GrowPatch). Async: returns a jobId; the new surface's UUID is the finished job's output. |
 | `vc3d_grow_segment` | `segmentation.grow` | Grow the active segmentation surface (method: tracer/corrections; direction; steps). Async: returns a jobId. |
+| `vc3d_import_objects` | `objects.import` | Import tifxyz surfaces, fiber JSON or point collections into a project store as new objects. An `import` job reporting new UUIDs, existing identities and problems. |
 | `vc3d_job_status` | `job.status` | Poll a job by id (or the latest job): state, message, console tail. |
 | `vc3d_lasagna_cancel` | `lasagna.cancel` |
 | `vc3d_lasagna_ensure_service` | `lasagna.ensure_service` |

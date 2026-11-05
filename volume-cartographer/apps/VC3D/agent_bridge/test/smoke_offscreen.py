@@ -277,10 +277,10 @@ def check_rpc_describe(
         coverage = description.get("coverage", {})
         complete = (
             description.get("undocumented") == []
-            and coverage.get("described") == 99
-            and coverage.get("registered") == 99
+            and coverage.get("described") == 100
+            and coverage.get("registered") == 100
             and coverage.get("complete") is True
-            and len(snapshot["methods"]) == 99
+            and len(snapshot["methods"]) == 100
         )
         rendered = json.dumps(snapshot, indent=2, sort_keys=True) + "\n"
         if update_snapshot:

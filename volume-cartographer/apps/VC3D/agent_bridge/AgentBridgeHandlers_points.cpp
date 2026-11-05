@@ -41,6 +41,17 @@ VCCollection* requirePointStore(CState* state)
     return pc;
 }
 
+// A collection's object identity: its store UUID and the project store reference it
+// is kept in (null for a surface's corrections, which are not store objects of their own).
+void addCollectionIdentity(QJsonObject& o, const CState& state, const VCCollection& pc, uint64_t collectionId)
+{
+    const auto& all = pc.getAllCollections();
+    const auto found = all.find(collectionId);
+    o["uuid"] = found == all.end() ? QJsonValue(QJsonValue::Null) : QJsonValue(QString::fromStdString(found->second.uuid));
+    const auto store = state.pointCollectionStore(collectionId);
+    o["store"] = store ? storeReferenceJson(state, *store) : QJsonValue(QJsonValue::Null);
+}
+
 [[noreturn]] void throwUnknownCollection(const QString& id)
 {
     QJsonObject data;
@@ -219,6 +230,7 @@ QJsonObject AgentBridgeServer::handlePointsCommit(const QJsonValue& params)
 
     QJsonObject result;
     result["collectionId"] = static_cast<double>(pc->getCollectionId(col).value());
+    addCollectionIdentity(result, *state, *pc, pc->getCollectionId(col).value());
     result["pointIds"] = pointIds;
     return result;
 }
@@ -248,6 +260,7 @@ QJsonObject AgentBridgeServer::handlePointsList(const QJsonValue& params)
             QJsonObject c;
             c["id"] = static_cast<double>(id);
             c["name"] = QString::fromStdString(coll.name);
+            addCollectionIdentity(c, *state, *pc, id);
             QJsonArray color;
             color.append(coll.color[0]);
             color.append(coll.color[1]);
@@ -298,6 +311,7 @@ QJsonObject AgentBridgeServer::handlePointsAddCollection(const QJsonValue& param
 
     QJsonObject result;
     result["collectionId"] = static_cast<double>(id);
+    addCollectionIdentity(result, *state, *pc, id);
     result["name"] = name;
     return result;
 }
@@ -319,6 +333,7 @@ QJsonObject AgentBridgeServer::handlePointsRenameCollection(const QJsonValue& pa
 
     QJsonObject result;
     result["collectionId"] = static_cast<double>(id);
+    addCollectionIdentity(result, *state, *pc, id);
     result["name"] = newName;
     return result;
 }
@@ -380,6 +395,7 @@ QJsonObject AgentBridgeServer::handlePointsUpdatePoint(const QJsonValue& params)
 
     QJsonObject result;
     result["collectionId"] = static_cast<double>(cp->collectionId);
+    addCollectionIdentity(result, *state, *pc, cp->collectionId);
     result["id"] = static_cast<double>(cp->id);
     result["position"] = vec3ToJson(cp->p);
     result["winding"] = windingToJson(cp->winding_annotation);
@@ -399,6 +415,7 @@ QJsonObject AgentBridgeServer::handlePointsRemovePoint(const QJsonValue& params)
     QJsonObject result;
     result["removed"] = true;
     result["collectionId"] = static_cast<double>(point.collectionId);
+    addCollectionIdentity(result, *state, *pc, point.collectionId);
     result["pointId"] = static_cast<double>(point.pointId);
     return result;
 }
@@ -420,6 +437,7 @@ QJsonObject AgentBridgeServer::handlePointsSetCollectionColor(const QJsonValue& 
 
     QJsonObject result;
     result["collectionId"] = static_cast<double>(id);
+    addCollectionIdentity(result, *state, *pc, id);
     result["color"] = colorToJson(color);
     return result;
 }
@@ -439,6 +457,7 @@ QJsonObject AgentBridgeServer::handlePointsSetCollectionMetadata(const QJsonValu
 
     QJsonObject result;
     result["collectionId"] = static_cast<double>(id);
+    addCollectionIdentity(result, *state, *pc, id);
     result["absoluteWindingNumber"] = meta.absolute_winding_number;
     return result;
 }
@@ -493,6 +512,7 @@ QJsonObject AgentBridgeServer::handlePointsSetWindingsLinked(const QJsonValue& p
         echo.append(static_cast<double>(l));
     QJsonObject result;
     result["collectionId"] = static_cast<double>(id);
+    addCollectionIdentity(result, *state, *pc, id);
     result["linkedCollectionIds"] = echo;
     return result;
 }

@@ -222,6 +222,8 @@ Tool names use a `vc3d_` prefix and snake_case. The surface includes:
 - segment loading, growth, editing, refinement, and review;
 - points, tags, winding annotations, seeding, and push/pull;
 - fiber annotation and Lasagna workflows;
+- importing tifxyz surfaces, fibers and point collections into the project's
+  object stores, and exporting objects as native files;
 - tracing, flattening, rendering, jobs, progress, and cancellation.
 
 The MCP client displays each installed tool with its current description and
@@ -233,6 +235,80 @@ reference.
 RPC errors surface as MCP tool errors containing the bridge's JSON
 `{"code", "message", "data"}` object. Coordinates are volume-space voxels
 unless a tool takes an explicit `space`.
+
+### Importing and exporting objects
+
+Surfaces, fibers and point collections live in the project's `.vcobj` stores.
+`vc3d_get_state` lists the store references (`stores`) and the store each
+kind is shown from and edited in (`routes`).
+
+Load a folder of tifxyz segments onto the open volume:
+
+```text
+vc3d_import_objects(kind="surface", path="/data/paths", bind={"scale": 1}, wait=True)
+vc3d_list_segments()                    # rows carry id (UUID), store, writable
+vc3d_activate_segment(segment_id=<uuid>)
+vc3d_screenshot()
+```
+
+- Import copies the geometry into the store; the source files are not
+  referenced afterwards, so a large folder needs room for its copy.
+- `bind.scale` is stored units per *current-volume* voxel. There is no default
+  scale: without `bind`, sources keep the coordinates they declare, and a
+  source that declares none stays unbound and is not shown on a volume.
+- Import writes to the store routed for the kind unless `store` names another
+  attached, writable store, and never changes routing. The job result's
+  `store` says where the objects went; route that store for the kind before
+  listing, activating or editing them through the kind's tools. Edits of an
+  existing object always go to the store that holds it.
+- The job result lists the new `uuids`, identities that were `existing`
+  already, and `problems`. A finished import succeeds even when some sources
+  were problems; check the lists. `vc3d_cancel_job` stops an import between
+  objects, keeping what was committed.
+
+Sources without canonical UUIDs (VC3D-era tifxyz directories named like
+`auto_grown_...`, older fibers and point collections) need `uuid_namespace`:
+one fresh UUID per dataset, recorded and reused for every later import of the
+same files, so a retry reports the objects as `existing` instead of
+duplicating them. There is no default namespace, because the names identities
+are derived from repeat across datasets. A legacy `.volpkg`:
+
+```text
+vc3d_create_project(path="/work/p.vcproj", volume="<volpkg>/volumes/<volume>")
+vc3d_open_volume(path="/work/p.vcproj")
+vc3d_import_objects(kind="surface", path="<volpkg>/paths",
+                    uuid_namespace="<one fresh UUID for this volpkg>",
+                    bind={"scale": 1}, wait=True)
+```
+
+Export one object by UUID: a segment id from `vc3d_list_segments`, or the
+`uuid` that `vc3d_fiber_list` and `vc3d_list_points` report next to the
+numeric fiber and collection ids. Create or edit, list to learn the UUID and
+store, then export:
+
+```text
+vc3d_fiber_list()                       # {fiberId, uuid, store, ...}
+vc3d_export_object(uuid=<uuid>, path="/data/out/fiber.json", wait=True)
+```
+
+Export searches only stores attached to the project (read-only ones
+included); when the UUID is in more than one, pass `store`. A surface becomes
+a tifxyz directory, a fiber one fiber JSON, a point collection a
+`vc_pointcollections` JSON holding it; the parent directory must exist.
+Pending edits of the object are saved first. Files are written in the stored
+frame with the object's `uuid` and `coordinates: {volume_uuid,
+scale_factor}`: stored XYZ divided by `scale_factor` is voxels of that volume,
+and unknown values stay null. Importing the files again (without `bind` or
+`uuid_namespace`) keeps UUID and coordinates; an explicit `bind` that
+conflicts with them is reported as a problem and imports nothing for that
+source.
+
+`vc3d_fiber_import` was removed. Use
+`vc3d_import_objects(kind="fiber", path=...)`: fibers without a UUID need
+`uuid_namespace` (the bridge no longer names them after their file), and a
+fiber file that declares no coordinates stays unbound unless `bind` is given.
+`vc3d_fiber_export` still writes every fiber of the fiber store as one
+collection file; `vc3d_export_object` writes one fiber.
 
 ### Waiting for jobs
 
