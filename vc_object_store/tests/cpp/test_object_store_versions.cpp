@@ -326,10 +326,57 @@ try {
         payloads.clear();
         require(transactionRequestDigest(transactionRequestFromJson(transactionRequestToJson(channels, &payloads), payloads)) ==
                 transactionRequestDigest(channels), "channel operation round trip");
+        require(transactionJsonPayloadHashes(transactionRequestToJson(channels)).size() == 1, "channel payloads listed");
         edits.submit(channels);
-        auto txn = edits.read();
-        const auto head = edits.currentObjectRevision(txn, surface);
-        require(head->version == 4 && edits.readGeometryArray(txn, *head->geometryRevision, "ink") == ink.bytes, "channel written");
+        {
+            auto txn = edits.read();
+            const auto head = edits.currentObjectRevision(txn, surface);
+            require(head->version == 4 && edits.readGeometryArray(txn, *head->geometryRevision, "ink") == ink.bytes, "channel written");
+        }
+
+        // Whole-array updates: sparse, identity-keeping, annotations replaced,
+        // affected relationships retained or kept as recorded.
+        const auto collection = util::newUuid(), marker = util::newUuid(), anchored = util::newUuid();
+        ObjectRecord pc; pc.uuid = collection; pc.kind = "point_collection";
+        pc.meta = R"({"source":{"point_attributes":[{"n":0},{"n":1}]}})";
+        vc::geometry::PointCollection points{{0, 1}, {{1, 1, 1}, {2, 2, 2}}};
+        edits.submit(make({{collection, std::nullopt}, {marker, std::nullopt}},
+            {CreateObjectOp{objectRecordJson(pc)}, PutGeometryOp{collection, vc::geometry::encode(points), {}, false},
+             CreateObjectOp{objectRecordJson(trackRecord(marker))}}));
+        EdgeRecord pointLink; pointLink.uuid = anchored; pointLink.kind = "test_link"; pointLink.aUuid = collection;
+        pointLink.bUuid = marker; pointLink.aAnchor.points = {{"point_ids", {0}}}; pointLink.bAnchor.wholeGeometry = true;
+        edits.submit(make({{collection, 1}, {marker, 1}}, {AddEdgeOp{edgeRecordJson(pointLink)}}));
+        points.points[0] = {1, 1, 3};
+        auto update = make({{collection, 2}, {marker, 2}}, {UpdateGeometryArraysOp{collection, vc::geometry::encode(points),
+            {{"points", R"([{"n":5},{"n":6}])"}}, "retain"}});
+        payloads.clear();
+        const auto updateText = transactionRequestToJson(update, &payloads);
+        require(!payloads.empty() && transactionJsonPayloadHashes(updateText).size() == payloads.size(), "update payloads listed");
+        require(transactionRequestDigest(transactionRequestFromJson(updateText, payloads)) == transactionRequestDigest(update),
+                "update round trip");
+        mustFail([&] { edits.submit(make({{collection, 2}, {marker, 2}}, {UpdateGeometryArraysOp{collection,
+            vc::geometry::encode(points), {}, "update"}})); });
+        const auto retained = edits.submit(update);
+        int64_t relationshipVersion = 0;
+        {
+            auto txn = edits.read();
+            const auto head = edits.currentGeometry(txn, collection);
+            const auto stored = std::get<vc::geometry::PointCollection>(vc::geometry::decode(edits.readGeometryData(txn, head->uuid)));
+            require(stored.ids == points.ids && stored.points == points.points &&
+                    nlohmann::json::parse(edits.geometryPointAnnotations(txn, head->uuid, "points")) ==
+                        nlohmann::json::parse(R"([{"n":5},{"n":6}])"), "arrays and annotations updated");
+            require(retained.objects.at(collection) == 3 && !edits.edgeGeometryState(txn, anchored).stale, "relationship retained");
+            relationshipVersion = *edits.currentRelationshipVersion(txn, anchored);
+        }
+        points.points[0] = {1, 1, 4};
+        edits.submit(make({{collection, 3}, {marker, retained.objects.at(marker).value()}},
+            {UpdateGeometryArraysOp{collection, vc::geometry::encode(points), {}, "keep_recorded"}}));
+        {
+            auto txn = edits.read();
+            require(edits.currentRelationshipVersion(txn, anchored) == relationshipVersion, "relationship kept as recorded");
+            require(nlohmann::json::parse(edits.geometryPointAnnotations(txn, edits.currentGeometry(txn, collection)->uuid, "points")) ==
+                        nlohmann::json::parse(R"([{"n":5},{"n":6}])"), "annotations follow stable IDs");
+        }
     }
 
     // Ownership: standalone writers share; the service is exclusive; aliases

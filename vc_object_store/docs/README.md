@@ -286,7 +286,11 @@ Geometry operations name each relationship decision explicitly, or set
 `keepAffectedRecorded`: every relationship the change affects without its own
 decision is then kept as recorded (its historical pins stay; the server decides
 which relationships are affected from the checked state). `SetSurfaceChannelsOp`
-replaces or removes surface channels. Through a session,
+replaces or removes surface channels. `UpdateGeometryArraysOp` makes the
+current arrays equal whole desired arrays (`updateGeometryArrays`: sparse
+deltas, sequences keep their stable point identities, optional replacement
+per-point annotations) and decides every affected relationship one way,
+`retain` or `keep_recorded`. Through a session,
 `newRequest(attachment)` starts a request for the attachment's store, active
 generation and author. Helpers over a `StoreReader` fill in what an edit
 depends on: `expectRelationshipEndpoints` expects the far ends of an edited

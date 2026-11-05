@@ -224,6 +224,21 @@ struct SetSurfaceChannelsOp {
     bool keepAffectedRecorded = false;
 };
 
+// Make the object's current geometry arrays equal `data`
+// (objects/GeometryEdits.hpp updateGeometryArrays): sparse deltas, sequences
+// keeping their stable point identities, unchanged schema and grid shape.
+// `annotations` (array name -> JSON array, one entry per row) replaces a
+// sequence's per-point annotations; omitted ones follow stable IDs. Every
+// relationship the change affects is decided by `affected`: "retain" (it
+// still applies to the new geometry) or "keep_recorded". The request must
+// expect both endpoints of each.
+struct UpdateGeometryArraysOp {
+    std::string objectUuid;
+    GeometryData data;
+    std::map<std::string, std::string> annotations;
+    std::string affected = "keep_recorded";
+};
+
 // Publish catalog registrations used by shared queries (see
 // ObjectStore::recordCatalogTransforms); expected versions name
 // catalogTransformUuid(id) of each.
@@ -233,7 +248,8 @@ using TransactionOperation = std::variant<
     CreateObjectOp, UpdateObjectOp, SetMetaOp, RemoveMetaOp, SetApprovalOp,
     RetireObjectOp, RestoreObjectOp, DeleteObjectOp,
     AddEdgeOp, UpdateEdgeOp, RemoveEdgeOp, RetainRelationshipOp, KeepRecordedRelationshipOp,
-    PutGeometryOp, EditGeometryOp, EditGeometryRectangleOp, RecordCatalogTransformsOp, SetSurfaceChannelsOp>;
+    PutGeometryOp, EditGeometryOp, EditGeometryRectangleOp, RecordCatalogTransformsOp, SetSurfaceChannelsOp,
+    UpdateGeometryArraysOp>;
 
 // Wire/command format version, part of every request digest.
 inline constexpr int kTransactionCommandVersion = 1;

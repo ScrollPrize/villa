@@ -6,6 +6,7 @@
 #include "internal/RecordJson.hpp"
 #include "internal/RecordSql.hpp"
 #include "internal/Versions.hpp"
+#include "vc_object_store/objects/GeometryEdits.hpp"
 
 #include <openssl/evp.h>
 
@@ -98,14 +99,7 @@ public:
     }
     Json operator()(const PutGeometryOp& op)
     {
-        auto arrays = Json::array();
-        for (const auto& array : op.data.arrays)
-            arrays.push_back({{"name", array.name}, {"dtype", array.dtype}, {"shape", array.shape},
-                              {"bytes", payload(array.bytes)}});
-        return keep(op, {{"op", "put_geometry"}, {"object", canonical(op.objectUuid)},
-                {"data", {{"kind", op.data.kind}, {"format_version", op.data.formatVersion},
-                          {"coordinate_system", op.data.coordinateSystem},
-                          {"attributes", Json::parse(op.data.attributes)}, {"arrays", arrays}}},
+        return keep(op, {{"op", "put_geometry"}, {"object", canonical(op.objectUuid)}, {"data", data(op.data)},
                 {"relationships", relationships(op.relationships)}});
     }
     Json operator()(const EditGeometryOp& op)
@@ -131,6 +125,13 @@ public:
         return keep(op, {{"op", "set_surface_channels"}, {"object", canonical(op.objectUuid)}, {"channels", channels},
                          {"remove", op.remove}, {"relationships", relationships(op.relationships)}});
     }
+    Json operator()(const UpdateGeometryArraysOp& op)
+    {
+        auto annotations = Json::object();
+        for (const auto& [name, value] : op.annotations) annotations[name] = Json::parse(value);
+        return {{"op", "update_geometry_arrays"}, {"object", canonical(op.objectUuid)}, {"data", data(op.data)},
+                {"annotations", annotations}, {"affected", op.affected}};
+    }
     Json operator()(const RecordCatalogTransformsOp& op)
     {
         auto registrations = Json::array();
@@ -140,6 +141,15 @@ public:
         return {{"op", "record_catalog_transforms"}, {"registrations", registrations}};
     }
 private:
+    Json data(const GeometryData& data)
+    {
+        auto arrays = Json::array();
+        for (const auto& array : data.arrays)
+            arrays.push_back({{"name", array.name}, {"dtype", array.dtype}, {"shape", array.shape},
+                              {"bytes", payload(array.bytes)}});
+        return {{"kind", data.kind}, {"format_version", data.formatVersion}, {"coordinate_system", data.coordinateSystem},
+                {"attributes", Json::parse(data.attributes)}, {"arrays", arrays}};
+    }
     // Present only when set, so requests without it keep their digests.
     template <class Op> static Json keep(const Op& op, Json j)
     {
@@ -193,6 +203,19 @@ std::vector<GeometryRelationshipEdit> relationshipsFrom(const Json& j)
     return result;
 }
 
+GeometryData dataFrom(const Json& data, const TransactionPayloads& payloads)
+{
+    GeometryData result;
+    result.kind = data.at("kind").get<std::string>();
+    result.formatVersion = data.at("format_version").get<int64_t>();
+    result.coordinateSystem = data.at("coordinate_system").get<std::string>();
+    result.attributes = data.at("attributes").dump();
+    for (const auto& array : data.at("arrays"))
+        result.arrays.push_back({array.at("name").get<std::string>(), array.at("dtype").get<std::string>(),
+                                 array.at("shape").get<std::vector<int64_t>>(), payloadFrom(array.at("bytes"), payloads)});
+    return result;
+}
+
 TransactionOperation operationFrom(const Json& j, const TransactionPayloads& payloads)
 {
     const auto op = j.at("op").get<std::string>();
@@ -219,14 +242,7 @@ TransactionOperation operationFrom(const Json& j, const TransactionPayloads& pay
     if (op == "put_geometry") {
         PutGeometryOp result;
         result.objectUuid = canonical(j.at("object").get<std::string>());
-        const auto& data = j.at("data");
-        result.data.kind = data.at("kind").get<std::string>();
-        result.data.formatVersion = data.at("format_version").get<int64_t>();
-        result.data.coordinateSystem = data.at("coordinate_system").get<std::string>();
-        result.data.attributes = data.at("attributes").dump();
-        for (const auto& array : data.at("arrays"))
-            result.data.arrays.push_back({array.at("name").get<std::string>(), array.at("dtype").get<std::string>(),
-                                          array.at("shape").get<std::vector<int64_t>>(), payloadFrom(array.at("bytes"), payloads)});
+        result.data = dataFrom(j.at("data"), payloads);
         result.relationships = relationshipsFrom(j.at("relationships"));
         result.keepAffectedRecorded = keepFrom(j);
         return result;
@@ -261,6 +277,14 @@ TransactionOperation operationFrom(const Json& j, const TransactionPayloads& pay
         result.remove = j.at("remove").get<std::vector<std::string>>();
         result.relationships = relationshipsFrom(j.at("relationships"));
         result.keepAffectedRecorded = keepFrom(j);
+        return result;
+    }
+    if (op == "update_geometry_arrays") {
+        UpdateGeometryArraysOp result;
+        result.objectUuid = canonical(j.at("object").get<std::string>());
+        result.data = dataFrom(j.at("data"), payloads);
+        for (const auto& [name, value] : j.at("annotations").items()) result.annotations.emplace(name, value.dump());
+        result.affected = j.at("affected").get<std::string>();
         return result;
     }
     if (op == "record_catalog_transforms") {
@@ -537,6 +561,18 @@ struct Executor {
     {
         store.updateSurfaceChannels(txn, op.objectUuid, op.channels, op.remove, geometryHead(op.objectUuid), edgeEdits(op));
     }
+    void operator()(const UpdateGeometryArraysOp& op)
+    {
+        if (op.affected != "retain" && op.affected != "keep_recorded")
+            throw std::invalid_argument("transaction: update_geometry_arrays decides affected relationships by retain or keep_recorded");
+        // Each step of the update decides the relationships it affects.
+        updateGeometryArrays(store, txn, op.objectUuid, op.data, geometryHead(op.objectUuid), op.annotations,
+            [&](const std::vector<EdgeRecord>& affected) {
+                std::vector<GeometryRelationshipEdit> edits;
+                for (const auto& edge : affected) edits.push_back({edge.uuid, op.affected});
+                return edgeEdits(edits);
+            });
+    }
 };
 }
 
@@ -585,8 +621,10 @@ void collectPayloads(const Json& op, std::vector<std::string>& hashes)
 {
     const auto name = op.at("op").get<std::string>();
     auto add = [&](const Json& ref) { hashes.push_back(ref.at("sha256").get<std::string>()); };
-    if (name == "put_geometry")
+    if (name == "put_geometry" || name == "update_geometry_arrays")
         for (const auto& array : op.at("data").at("arrays")) add(array.at("bytes"));
+    else if (name == "set_surface_channels")
+        for (const auto& array : op.at("channels")) add(array.at("bytes"));
     else if (name == "edit_geometry")
         for (const auto& edit : op.at("edits")) add(edit.at("bytes"));
     else if (name == "edit_geometry_rectangle")
