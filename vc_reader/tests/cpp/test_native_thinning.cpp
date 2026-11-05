@@ -71,7 +71,7 @@ void verify(bool gpu) {
         }
 #endif
     }
-    rejects([]{std::uint8_t m=1;std::int32_t l;vcr::components::label(&m,std::vector<std::size_t>{1,1},6,&l);});
+    rejects([]{std::uint8_t m=1;std::int32_t l;vcr::components::label(&m,std::vector<std::size_t>{1,1},5,&l);});
     std::vector<std::uint8_t> longLine(600,255),longOut(600);longLine[0]=0;
     vcr::distance::manhattan(longLine.data(),longOut.data(),{1,600});CHECK(longOut[254]==254 && longOut[255]==255 && longOut.back()==255);
     for(int trial=0;trial<45;++trial) {
