@@ -4,8 +4,8 @@ import os
 from pathlib import Path
 import napari
 import numpy as np
-from skimage import io
 from skimage.segmentation import expand_labels
+from vc_reader import images
 import cc3d
 from magicgui import magicgui
 from napari.utils.notifications import show_info
@@ -498,7 +498,7 @@ class ImageLabelViewer:
 
         label_data = label_data.astype(np.uint8)
 
-        io.imsave(str(output_path), label_data)
+        images.write_tiff(output_path, label_data, pages=label_data.ndim == 3)
         show_info(f"Saved label to: {output_path.name}")
 
     def output_exists(self, image_path):
@@ -528,7 +528,7 @@ class ImageLabelViewer:
 
         # Load image
         image_path = self.image_files[self.current_index]
-        image = io.imread(str(image_path))
+        image = images.read(image_path)
 
         # Add image layer
         self.viewer.add_image(image, name=f"Image: {image_path.name}")
@@ -536,7 +536,7 @@ class ImageLabelViewer:
         # Load and add label if exists
         label_path = self.get_label_path(image_path)
         if label_path and label_path.exists():
-            label = io.imread(str(label_path))
+            label = images.read(label_path)
             # Set ignore label (2) to background before computing components
             if self.zero_ignore_label:
                 label[label == 2] = 0
@@ -596,9 +596,9 @@ class ImageLabelViewer:
         output_path = self.output_dir / f"{image_path.stem}.tif"
 
         # Read and write the original label (preserving original data)
-        label_data = io.imread(str(label_path))
+        label_data = images.read(label_path)
         label_data = label_data.astype(np.uint8)
-        io.imsave(str(output_path), label_data)
+        images.write_tiff(output_path, label_data, pages=label_data.ndim == 3)
         show_info(f"Copied original label to: {output_path.name}")
 
     def skip_image(self):

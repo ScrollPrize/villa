@@ -17,7 +17,7 @@ from service_http import ApiError
 from spiral_service import ServiceState
 from test_service_editing import Resident, upload
 from test_spiral_service_v2 import _attach_fake_session
-from workspace_storage import MARKER, reclaim_workspaces
+from workspace_storage import MARKER, owner_lock_path, reclaim_workspaces
 
 
 @pytest.fixture
@@ -56,6 +56,7 @@ def test_release_removes_uploads_and_revisions_only(state, commit):
     assert workspace.root.exists()
     assert state.release_editing('owner', 'release') == {'released': True}
     assert not workspace.root.exists()
+    assert not owner_lock_path(workspace.root).exists()
     assert not workspace.catalog.entries()
     assert saved.read_bytes() == b'saved fit output'
     assert not workspace.uploads.uploads
@@ -182,9 +183,11 @@ def test_failed_deletion_keeps_marker_for_reclamation(state, monkeypatch):
     with pytest.raises(PermissionError):
         state.release_editing('owner', 'release')
     assert (workspace.root / MARKER).exists()
+    assert owner_lock_path(workspace.root).exists()
     monkeypatch.setattr(workspace_storage.shutil, 'rmtree', original)
     state.release_editing('owner', 'release')
     assert not workspace.root.exists()
+    assert not owner_lock_path(workspace.root).exists()
 
 
 def test_subprocess_crash_live_owner_concurrent_reclamation_and_legacy(tmp_path):
@@ -222,6 +225,7 @@ sys.stdin.read()
         processes = [subprocess.Popen(command) for _ in range(3)]
         assert all(p.wait(timeout=10) == 0 for p in processes)
         assert not root.exists()
+        assert not owner_lock_path(root).exists()
         assert (legacy / 'data').read_text() == 'keep'
         assert link.is_symlink()
         assert unknown.exists()

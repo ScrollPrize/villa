@@ -62,7 +62,7 @@ class RenderLoggingTests(unittest.TestCase):
     def test_valid_surface_interpolation_values_are_accepted(self):
         # These get past flag parsing and fail later, on the absent volume.
         seg = ["-s", str(self.root / "absent.tifxyz")]
-        for value in ("linear", "smooth", "bicubic", "SMOOTH"):
+        for value in ("linear", "bicubic", "BICUBIC"):
             with self.subTest(value=value):
                 result = self.run_renderer(
                     seg + ["--surface-interpolation", value], logged=False
@@ -71,7 +71,7 @@ class RenderLoggingTests(unittest.TestCase):
                 self.assertIn("Error opening local zarr:", result.stderr)
 
     def test_missing_segmentation_preserves_error(self):
-        self.assert_logged_error([], "--segmentation required")
+        self.assert_logged_error([], "give --segmentation, or --store with one --surface")
 
     def test_caught_volume_error_preserves_diagnostic(self):
         self.assert_logged_error(

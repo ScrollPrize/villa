@@ -14,7 +14,8 @@ import sys
 import tempfile
 from typing import Any, Iterable, Iterator, Sequence
 from urllib.parse import urlparse
-from urllib.request import Request, urlopen
+
+from vc_reader.reader import ObjectStore
 
 from .catalog import (
     CatalogCache, LasagnaPredictionRecord, index_lasagna_predictions,
@@ -280,8 +281,11 @@ def _atomic_bytes(path: Path, value: bytes) -> None:
 
 
 def _remote_bytes(url: str) -> bytes:
-    with urlopen(Request(url, headers={"User-Agent": "las_manager/0.1"}), timeout=30.0) as response:
-        return response.read()
+    parent, _, name = url.rpartition("/")
+    raw = ObjectStore(parent, auth=None).read(name)
+    if raw is None:
+        raise FileNotFoundError(url)
+    return raw
 
 
 def _discover_published_manifest(

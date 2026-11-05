@@ -49,7 +49,6 @@ class ViewerBridge(FakeBridgeServer):
             "normalArrowLengthScale": 1.0,
             "normalMaxArrows": 32,
             "segmentationCursorMirroring": False,
-            "samplingStride": 1,
             "zScrollSensitivity": 1.0,
             "highlightedSurfaceIds": [],
         }
@@ -57,9 +56,9 @@ class ViewerBridge(FakeBridgeServer):
             "volumeId": "",
             "colormap": "",
             "opacity": 0.5,
-            "threshold": 0.0,
             "windowLow": 0.0,
             "windowHigh": 255.0,
+            "intensityAsAlpha": False,
             "maxDisplayedResolution": 0,
             "composite": {"enabled": False, "method": "max", "layersFront": 8, "layersBehind": 0},
         }
@@ -94,7 +93,7 @@ class ViewerBridge(FakeBridgeServer):
                 self._overlay["volumeId"] = ""
             elif "volumeId" in params:
                 self._overlay["volumeId"] = params["volumeId"]
-            for key in ("colormap", "opacity", "threshold", "maxDisplayedResolution"):
+            for key in ("colormap", "opacity", "intensityAsAlpha", "maxDisplayedResolution"):
                 if key in params:
                     self._overlay[key] = params[key]
             if "window" in params:
@@ -148,7 +147,6 @@ class ViewerToolTest(unittest.IsolatedAsyncioTestCase):
             normal_arrow_length_scale=1.5,
             normal_max_arrows=50,
             segmentation_cursor_mirroring=True,
-            sampling_stride=2,
             z_scroll_sensitivity=5.0,
         )
         self.assertEqual(
@@ -158,11 +156,9 @@ class ViewerToolTest(unittest.IsolatedAsyncioTestCase):
                 "normalArrowLengthScale": 1.5,
                 "normalMaxArrows": 50,
                 "segmentationCursorMirroring": True,
-                "samplingStride": 2,
                 "zScrollSensitivity": 5.0,
             },
         )
-        self.assertEqual(result["samplingStride"], 2)
         self.assertTrue(result["segmentationCursorMirroring"])
 
     async def test_set_render_settings_clamps_normal_arrow_fields(self) -> None:
@@ -186,8 +182,8 @@ class ViewerToolTest(unittest.IsolatedAsyncioTestCase):
             volume_id="1",
             colormap="viridis",
             opacity=0.8,
-            threshold=10.0,
             window={"low": 5.0, "high": 250.0},
+            intensity_as_alpha=True,
             max_displayed_resolution=2,
             composite={"enabled": True, "method": "mean"},
         )
@@ -197,8 +193,8 @@ class ViewerToolTest(unittest.IsolatedAsyncioTestCase):
                 "volumeId": "1",
                 "colormap": "viridis",
                 "opacity": 0.8,
-                "threshold": 10.0,
                 "window": {"low": 5.0, "high": 250.0},
+                "intensityAsAlpha": True,
                 "maxDisplayedResolution": 2,
                 "composite": {"enabled": True, "method": "mean"},
             },

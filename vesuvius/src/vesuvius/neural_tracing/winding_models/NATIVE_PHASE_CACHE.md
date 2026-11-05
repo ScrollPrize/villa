@@ -33,7 +33,10 @@ python infer_winding_volume.py \
 Do not pass output-resolution, interpolation, decode, raster, archive, or
 probability options to this command. They have no meaning until reconstruction,
 and the CLI rejects them in `--native-phase-only` mode. The stored phase is
-always the model's native `32 x 32 x 384` float32 output.
+always the model's native float32 output, `transverse_size / column_stride`
+columns square by `ray_length` samples per slab: `128 x 128 x 384` for the
+published `winding_model_9um` checkpoint (`column_stride` 1 with a
+full-resolution head).
 
 Cache creation uses only:
 
@@ -58,7 +61,13 @@ Do not reconstruct from a cache whose root `complete` attribute is false.
 
 For the 139,205-slab PHercParis4 workload, the phase payload is approximately
 219 GB uncompressed and 144-150 GB losslessly compressed. Validity and frame
-metadata are small by comparison.
+metadata are small by comparison. Those figures are for an older stride-4
+checkpoint whose native phase is `32 x 32 x 384` (1.57 MB per slab). The
+published `winding_model_9um` checkpoint stores `128 x 128 x 384` float32 per
+slab, 25.2 MB before compression and 16 times as much, so the 1,557,627-slab
+cache behind the published PHercParis4 `winding_inference` store holds about
+39 TB of raw phase. If the compact Spiral supervision store is the only
+product you need, use `--spiral-supervision-only` (below) instead.
 
 ## Export compact Spiral supervision
 
@@ -90,6 +99,44 @@ GPU/source shards. Its aggregate `tqdm` bar reports source rays, retained rays,
 decoded crossings, throughput, and ETA. Each completed task is atomic and
 restartable under `OUTPUT.partial/parts`; use `--rays-per-task` to trade finer
 progress/restart granularity for scheduling overhead.
+
+## Write compact Spiral supervision directly
+
+The exporter reads back one ray from each cached slab. When that store is all
+you need, run inference with `--spiral-supervision-only` instead of
+`--native-phase-only`; `OUTPUT` is then the compact store itself:
+
+```bash
+python infer_winding_volume.py \
+  /path/to/run/checkpoint_fitted.ckpt \
+  /path/to/dataset/winding_inference \
+  --model-ckpt /path/to/winding_model_9um/ckpt_final.pth \
+  --reference-zarr /path/to/volume.zarr \
+  --volume-scale 0 \
+  --winding-step 3 \
+  --seed-spacing 60 \
+  --gpus 0 \
+  --spiral-supervision-only
+```
+
+Each slab's centre ray is decoded in memory, right after the forward pass, by
+the same code the exporter uses (`CenterRayPart` with the default
+`--edge-margin 8` and `--edge-trim 2`), so for the same model output the
+arrays equal those of `--native-phase-only` followed by
+`export_spiral_supervision.py`. The same reconstruction-only options are
+rejected. Differences from an exported store:
+
+- the store has a single shard, `shard_0`, whatever the GPU count (an export
+  has one shard per cache shard; the concatenated arrays are the same);
+- the manifest has `"export_mode": "direct"`, `"source_cache": null`, and the
+  would-be cache attributes plus a seed-ray digest under `source_attributes`.
+
+Work is restartable in fixed 256-slab parts of the global ray order under
+`OUTPUT.partial/parts`. Repeating the same command after an interruption skips
+finished parts, even with a different `--gpus` list; changing the model,
+geometry, or seed rays invalidates them. `OUTPUT` appears only when every part
+is complete, and the command refuses an existing `OUTPUT`. Keep the cache
+workflow when you also need `--phase-cache` reconstructions.
 
 ## Reconstruct the normal full-resolution output
 

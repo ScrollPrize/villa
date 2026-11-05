@@ -2,7 +2,7 @@
 
 #include "vc/ui/VCCollection.hpp"
 
-#include "dijkstra3d.hpp"
+#include <vc_reader/pathfinding.hpp>
 
 #include <QBrush>
 #include <QColor>
@@ -556,13 +556,6 @@ void SameWrapAnnotationTool::setPathType(PathType pathType)
     _state.hasShortestPathSource = false;
 }
 
-void SameWrapAnnotationTool::setImageFilter(ImageFilterType filterType, int kernelSize)
-{
-    _state.imageFilterType = filterType;
-    _state.imageFilterKernelSize = std::max(3, kernelSize | 1);
-    _state.hasShortestPathSource = false;
-}
-
 void SameWrapAnnotationTool::setImageFilterType(ImageFilterType filterType)
 {
     _state.imageFilterType = filterType;
@@ -752,7 +745,6 @@ bool SameWrapAnnotationTool::generatePreview(const QImage& framebuffer,
                                              const QPointF& scenePos,
                                              bool appendToPreview,
                                              float viewScale,
-                                             const VCCollection* pointCollection,
                                              const SceneToVolumeFn& sceneToVolume,
                                              const VolumeToSceneFn& volumeToScene,
                                              const SetOverlayGroupFn& setOverlayGroup,
@@ -845,17 +837,15 @@ bool SameWrapAnnotationTool::generatePreview(const QImage& framebuffer,
             }
         }
 
-        std::vector<uint32_t> path = dijkstra::dijkstra2d<float, uint32_t>(
+        std::vector<uint32_t> path = vcr::pathfinding::shortestPath(
             weights.data(),
-            static_cast<size_t>(w),
             static_cast<size_t>(h),
+            static_cast<size_t>(w),
             static_cast<size_t>(sourceKey),
-            static_cast<size_t>(targetKey),
-            8);
+            static_cast<uint32_t>(targetKey));
         if (path.size() < 2) {
             return false;
         }
-        std::reverse(path.begin(), path.end());
 
         std::vector<QPointF> scenePath;
         scenePath.reserve(path.size());
@@ -1172,7 +1162,6 @@ bool SameWrapAnnotationTool::beginManualPreview(const QPointF& scenePos,
 
 bool SameWrapAnnotationTool::appendManualPreview(const QPointF& scenePos,
                                                  float viewScale,
-                                                 const VCCollection* pointCollection,
                                                  const SceneToVolumeFn& sceneToVolume,
                                                  const VolumeToSceneFn& volumeToScene,
                                                  const SetOverlayGroupFn& setOverlayGroup,

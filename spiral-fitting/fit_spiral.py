@@ -5385,6 +5385,9 @@ class FitContext:
                 conditioning_lines, conditioning_payload = self._flow_conditioning_report()
                 for line in conditioning_lines:
                     print(line)
+                # A headless fit usually writes stdout to a file, where Python block-buffers it: without this
+                # flush the per-200-step loss report only appears when the buffer fills or the fit ends.
+                sys.stdout.flush()
                 payload = {
                     'total_loss': loss.item(),
                     **conditioning_payload,
@@ -5440,6 +5443,13 @@ class FitContext:
             progress.update(iteration - self.start_iteration + 1)
             self.log_step_metrics(iteration, loss, losses, log_metrics, shell_metrics)
             self._maybe_save_headless_checkpoint(iteration + 1)
+            if self.device.type == 'mps':
+                # Return the step's freed blocks to Metal: otherwise the MPS
+                # caching allocator keeps a ~15 GB pool for the whole fit.
+                # Blocks still used by queued kernels are only released once
+                # the queue has drained.
+                torch.mps.synchronize()
+                torch.mps.empty_cache()
 
         # ==========================================================================
         # Final outputs

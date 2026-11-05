@@ -1,14 +1,83 @@
 #pragma once
 #include "vc_object_store/objects/ObjectStore.hpp"
 #include "vc_object_store/Progress.hpp"
+#include <nlohmann/json.hpp>
+#include <atomic>
+#include <optional>
+#include <stdexcept>
 
 namespace vc::objects {
+class ObjectStoreSession;
+struct AttachmentIdentity;
+// A decoded current-format object. Geometry, metadata and native relationships
+// are inserted together; relationship endpoints use explicit UUIDs.
+struct GeometrySource {
+    ObjectRecord object;
+    GeometryData geometry;
+    nlohmann::json source;
+};
+// How source files that predate the store's contracts are admitted. Defaults
+// reject invalid surfaces/PCLs; UUID-less fibers use the fixed file-name namespace.
+// Each option is an explicit, recorded repair.
+struct SourceIngestOptions {
+    // A UUID namespace admitting sources without canonical UUIDs: a tifxyz surface keyed
+    // by its meta.json "uuid" or directory name, a PCL collection by "<document stem>:<id>",
+    // a fiber file by its stem (as version-3 branches name targets). Each gets
+    // uuid5(namespace, "<kind>:<key>"), so reingesting the same files yields the same
+    // identities; surfaces keep the pre-rename kind "patch" here. Canonical source
+    // UUIDs are kept.
+    std::optional<std::string> uuidNamespace;
+    // Without a namespace, a fiber file without a UUID (including a branch's peer
+    // file) is a problem rather than named from its file name.
+    bool requireSourceUuids = false;
+    // Stop at the first failure that is not the source's (store access, a failed
+    // commit, an unexpected exception) and report it as fatalError, instead of
+    // listing it among the problems and continuing.
+    bool stopOnInfrastructureError = false;
+};
+
+// A source the store cannot admit as given: invalid source data, a coordinate
+// conflict, identities the store already has, or the store changing while the
+// source was read. Ingestion reports these as problems of that source.
+struct GeometrySourceRejected : std::runtime_error {
+    using std::runtime_error::runtime_error;
+};
+// The identities of a batch the store already has, including retired objects.
+struct GeometryIdentitiesExist : GeometrySourceRejected {
+    explicit GeometryIdentitiesExist(std::vector<std::string> existing);
+    std::vector<std::string> uuids;
+};
+
+// Decode a native surface, point-collection file, or fiber file/collection/directory
+// before opening a write transaction. Linked documents are loaded recursively;
+// available UUIDs are existing endpoints whose stored contents remain authoritative.
+// Explicit roots and duplicate identities are never silently skipped.
+std::vector<GeometrySource> prepareGeometrySource(const std::string& kind,
+    const std::filesystem::path&, const std::vector<std::string>& availableUuids = {},
+    const SourceIngestOptions& options = {});
+
+// Create new identities atomically in the caller's transaction. Re-import and
+// retired identities are rejected. Checked callers must pin every relationship
+// endpoint. Returns the number of relationships imported; XYZ is unchanged.
+int64_t ingestGeometryBatch(ObjectStore&, WriteTxn&, std::vector<GeometrySource>,
+    const std::string& coordinateContext = "{}");
+
 struct GeometryIngestReport {
     int64_t ingested = 0, edgesImported = 0;
     std::vector<std::string> problems;
+    // The objects created, in commit order.
+    std::vector<std::string> uuids;
+    // Identities rejected because the store already has them (including retired
+    // objects). A rejected fiber or collection batch lists every clash.
+    std::vector<std::string> existing;
+    // Ingestion stopped early on cancellation; what was committed stays.
+    bool cancelled = false;
+    // Set only with stopOnInfrastructureError: the failure that stopped
+    // ingestion. The counts and identities cover the objects committed before it.
+    std::optional<std::string> fatalError;
 };
 
-// Read/validate files outside write transactions, then publish the selected batch
+// Read/validate files outside write transactions, then insert the selected batch
 // atomically, including native topology. Only registered placeholders that have
 // never had geometry are eligible. Existing/retired imports are errors, even if
 // unchanged. Source data must be stable during ingestion; edit imported objects
@@ -17,17 +86,37 @@ GeometryIngestReport ingestRegisteredGeometry(ObjectStore& db,
     const std::optional<std::filesystem::path>& datasetRoot = std::nullopt,
     const std::vector<std::string>& objectUuids = {}, const util::ProgressCallback& progress = {});
 
-// Create new objects and ingest one source: a tifxyz patch directory,
-// vc3d_fiber JSON or directory, vc_pointcollections JSON (all collections), or packed tracks
-// (.vctracks directory or DBM path with an existing packed mirror). Track
-// identity is (dataset_ref, external_key), within the object store. Fiber/collection
-// sources publish atomically; packed tracks publish individually with partial reports.
+// Create new objects and ingest one source: a tifxyz surface directory or a
+// folder of them, vc3d_fiber JSON, collection or directory, vc_pointcollections
+// JSON (all collections), or packed tracks (.vctracks directory or DBM path with
+// an existing packed mirror). Track identity is (dataset_ref, external_key),
+// within the object store. Fiber/collection sources are inserted atomically;
+// surfaces and packed tracks are inserted individually with partial reports.
 // Existing identities (including retired objects) and duplicate UUIDs within a
 // batch are errors. Use ingestRegisteredGeometry for an initial placeholder load.
-// coordinateContext supplies {volume_uuid, scale_factor} for any geometry kind.
+// coordinateContext supplies {volume_uuid, scale_factor} for any geometry kind,
+// and `tags` are added to each new object's own (e.g. the folder it came from).
 // It fills unknown declarations and rejects source conflicts; XYZ is unchanged.
+// options are as for prepareGeometrySource; tracks keep (dataset_ref, external_key)
+// and ignore them.
 GeometryIngestReport ingestGeometrySource(ObjectStore& db, const std::string& kind,
     const std::filesystem::path& source, const util::ProgressCallback& progress = {},
-    const std::string& coordinateContext = "{}");
+    const std::string& coordinateContext = "{}", const std::vector<std::string>& tags = {},
+    const SourceIngestOptions& options = {});
+// The same into a writable session attachment (ObjectStoreSession::writeJob),
+// on the caller's thread. Detaching, or setting `cancel`, stops it before the
+// next surface or track, and before a fiber or collection batch commits.
+// A failure to enter or leave the job is thrown, or with stopOnInfrastructureError
+// reported as fatalError alongside whatever was committed.
+GeometryIngestReport ingestGeometrySource(ObjectStoreSession&, const AttachmentIdentity&, const std::string& kind,
+    const std::filesystem::path& source, const util::ProgressCallback& progress = {},
+    const std::string& coordinateContext = "{}", const std::vector<std::string>& tags = {},
+    const SourceIngestOptions& options = {}, const std::atomic_bool* cancel = nullptr);
+
+// Add or replace one channel of a stored surface from a TIFF with its exact
+// samples (rows and columns a whole multiple of the grid), as an edit of the
+// current geometry in the caller's transaction. Returns the new geometry revision.
+std::string importSurfaceChannel(ObjectStore&, WriteTxn&, const std::string& objectUuid,
+    const std::string& name, const std::filesystem::path& tiff);
 
 } // namespace vc::objects

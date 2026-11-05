@@ -1,5 +1,4 @@
 import argparse
-import multiprocessing
 import os
 import socket
 import subprocess
@@ -13,15 +12,28 @@ from vesuvius.models.datasets.intensity_properties import load_intensity_props_f
 from vesuvius.models.utilities.cli_utils import update_config_from_args
 
 
-def _maybe_set_spawn_start_method(argv):
-    # s3fs/fsspec can misbehave with fork; force spawn if s3/config is present.
-    if not argv:
-        return
-    if any('s3://' in str(arg) for arg in argv) or '--config-path' in argv or '--config' in argv:
-        try:
-            multiprocessing.set_start_method('spawn', force=True)
-        except RuntimeError:
-            pass
+def _configured_auxiliary_target_names(mgr) -> list[str]:
+    return [
+        name
+        for name, config in getattr(mgr, "targets", {}).items()
+        if config.get("auxiliary_task", False)
+    ]
+
+
+def _build_base_trainer(mgr, *, verbose: bool):
+    if _configured_auxiliary_target_names(mgr):
+        if getattr(mgr, "augment_on_device", False):
+            raise ValueError(
+                "Auxiliary target generation does not yet support "
+                "tr_config.augment_on_device=true; generate targets after the "
+                "dataset-side augmentation pipeline instead."
+            )
+        from vesuvius.models.training.trainers.auxiliary import AuxiliaryTrainer
+
+        return AuxiliaryTrainer(mgr=mgr, verbose=verbose)
+    from vesuvius.models.training.train import BaseTrainer
+
+    return BaseTrainer(mgr=mgr, verbose=verbose)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -178,8 +190,6 @@ def build_parser() -> argparse.ArgumentParser:
                              help="Optional custom name for the Weights & Biases run")
     grp_logging.add_argument("--wandb-resume", nargs='?', const='allow', default=None,
                              help="Weights & Biases resume mode or run id. Provide a resume policy ('allow', 'auto', 'must', 'never') or a run id (defaults to 'allow' if flag used without value).")
-    grp_logging.add_argument("--profile-augmentations", action="store_true",
-                             help="Collect per-augmentation timing and report per-epoch totals")
     grp_logging.add_argument("--verbose", action="store_true",
                              help="Enable verbose debug output")
 
@@ -190,8 +200,6 @@ def main(argv=None):
     """Main entry point for the training script."""
     if argv is None:
         argv = sys.argv[1:]
-
-    _maybe_set_spawn_start_method(argv)
 
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -335,6 +343,13 @@ def main(argv=None):
     trainer_name = args.trainer.lower()
     mgr.trainer_class = trainer_name
 
+    auxiliary_target_names = _configured_auxiliary_target_names(mgr)
+    if auxiliary_target_names and trainer_name != "base":
+        raise ValueError(
+            f"Trainer '{trainer_name}' does not generate configured auxiliary targets "
+            f"{auxiliary_target_names}; use --trainer base."
+        )
+
     # Enforce usage of --pretrained_checkpoint only for the MAE finetune trainer, and require it there
     if getattr(args, 'pretrained_checkpoint', None):
         if trainer_name != "finetune_mae_unet":
@@ -380,9 +395,14 @@ def main(argv=None):
         trainer = MutexAffinityTrainer(mgr=mgr, verbose=args.verbose)
         print("Using Mutex Affinity Trainer")
     elif trainer_name == "base":
-        from vesuvius.models.training.train import BaseTrainer
-        trainer = BaseTrainer(mgr=mgr, verbose=args.verbose)
-        print("Using Base Trainer for supervised training")
+        trainer = _build_base_trainer(mgr, verbose=args.verbose)
+        if auxiliary_target_names:
+            print(
+                "Using Auxiliary Trainer for supervised training targets: "
+                + ", ".join(auxiliary_target_names)
+            )
+        else:
+            print("Using Base Trainer for supervised training")
     elif trainer_name == "surface_frame":
         from vesuvius.models.training.trainers.surface_frame_trainer import SurfaceFrameTrainer
         trainer = SurfaceFrameTrainer(mgr=mgr, verbose=args.verbose)

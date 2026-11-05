@@ -3,7 +3,8 @@
 This is an extraction of the direct Gaussian and batched image-value chain from
 the existing Fiber3D development implementation (`29a7289c5`), not a new blur
 algorithm. The common deferred dispatcher and shared-source collation come from
-`2192cc5ac`. It is opt-in and leaves the current training CLI unchanged.
+`2192cc5ac`. It is opt-in; the production trainer connects it through the
+[shared queue and asynchronous preparation options](queued_training.md).
 
 ## Preparation flow
 
@@ -85,8 +86,9 @@ parameter descriptors without replacing the current loader's fixed blur-sigma
 sampling or changing its RNG draw order. The later trainer/config integration
 must carry any updated parameter-selection recipe explicitly.
 
-This PR does not yet enable GPU augmentation in the production training CLI or
-change model, loss, effective batch, annotation or refinement behavior.
+The production CLI can opt into this recipe without changing model, loss,
+effective batch, annotation or refinement behavior. Defaults retain the original
+mask-aware CPU recipe. Dense evaluation still uses its configured CPU recipe.
 
 ## Validation
 

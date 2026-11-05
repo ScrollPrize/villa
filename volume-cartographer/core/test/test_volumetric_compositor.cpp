@@ -243,7 +243,7 @@ TEST_CASE("compositeVolumetric perspective at zero tilt keeps the w=0 layer pixe
 
 TEST_CASE("buildOpacityLut windows, gamma and cutoff")
 {
-    const auto lut = buildOpacityLut(0.25f, 0.75f, 1.0f, 1.0f, 32, 1.0f);
+    const auto lut = vcr::display::opacityLut(0.25f, 0.75f, 1.0f, 1.0f, 32, 1.0f);
     // Below iso cutoff: fully transparent.
     CHECK(lut[0] == 0.0f);
     CHECK(lut[31] == 0.0f);
@@ -259,9 +259,9 @@ TEST_CASE("buildOpacityLut windows, gamma and cutoff")
     }
 
     // Gamma bends the ramp down; segment length scales alpha up (clamped).
-    const auto gammaLut = buildOpacityLut(0.0f, 1.0f, 1.0f, 2.0f, 0, 1.0f);
+    const auto gammaLut = vcr::display::opacityLut(0.0f, 1.0f, 1.0f, 2.0f, 0, 1.0f);
     CHECK(gammaLut[128] == doctest::Approx(0.25f).epsilon(0.05));
-    const auto segLut = buildOpacityLut(0.0f, 1.0f, 0.5f, 1.0f, 0, 2.0f);
+    const auto segLut = vcr::display::opacityLut(0.0f, 1.0f, 0.5f, 1.0f, 0, 2.0f);
     CHECK(segLut[255] == doctest::Approx(1.0f));
     CHECK(segLut[128] == doctest::Approx(0.5f).epsilon(0.05));
 }

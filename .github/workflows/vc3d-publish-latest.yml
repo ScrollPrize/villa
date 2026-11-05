@@ -23,7 +23,7 @@ jobs:
     if: >-
       github.event.workflow_run.event == 'push' &&
       github.event.workflow_run.conclusion == 'success'
-    runs-on: ubuntu-24.04
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 15
     env:
       GH_TOKEN: ${{ github.token }}
@@ -158,19 +158,24 @@ jobs:
         run: |
           set -euo pipefail
 
+          # Retag the old release before moving latest; its assets stay in place.
+          # An interrupted publication may require manual recovery.
+          release_id="$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/latest" --jq '.id')"
+          git fetch --no-tags origin refs/tags/latest
+          old_oid="$(git rev-parse FETCH_HEAD)"
+          archive_tag="vc3d-archive-latest-$release_id"
+          # A non-forced push accepts an identical alias but never overwrites one.
+          git push origin "$old_oid:refs/tags/$archive_tag"
+          gh api --method PATCH "repos/$GITHUB_REPOSITORY/releases/$release_id" \
+            -f "tag_name=$archive_tag" >/dev/null
+
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git tag --force --annotate latest "$PACKAGE_SHA" \
             --message "VC3D latest release at $PACKAGE_SHA"
-          git push --force origin refs/tags/latest
+          git push --force-with-lease="refs/tags/latest:$old_oid" origin refs/tags/latest
 
-          # Replace the old rolling release after its tag advances. Mark this
-          # main-branch snapshot as a pre-release so the manually promoted
-          # stable channel remains GitHub's designated latest release.
-          if gh release view latest >/dev/null 2>&1; then
-            gh release delete latest --yes
-          fi
-
+          # Keep stable as GitHub's designated latest release.
           gh release create latest release-assets/* \
             --verify-tag \
             --title "VC3D Latest" \

@@ -27,12 +27,12 @@
 #include <functional>
 #include <cstdint>
 #include <optional>
+#include "SpiralPatchProjection.hpp"
 #include <unordered_map>
 #include <utility>
 #include <vector>
 
 class QuadSurface;
-class SurfacePatchIndex;
 class VolumeViewerBase;
 class SpiralBrushCursorWidget;
 class PointsOverlayController;
@@ -80,8 +80,6 @@ public:
     void setPclSourceVisible(PclRole role, bool visible);
     void setPclHitOverlay(PclRole role, PointsOverlayController* overlay);
     void setPointViewTolerance(double tolerance);
-    void replacementConflict(const QString& id, bool discardDraft);
-    void resetSession();
     bool hasUnfinalizedPaint() const;
     bool hasUnfinalizedPolylines() const;
     bool hasReadyDrafts() const;
@@ -90,7 +88,6 @@ public:
                                const QString& alias, const QJsonDocument& document,
                                const QString& sourceIdentity = {});
     void markDraftsReady();
-    int brushDiameter() const { return _diameterPx; }
 
     std::vector<PreparedPatch> preparePatches(QStringList& warnings);
     std::vector<PreparedPointCollections> preparePointCollections(QStringList& warnings);
@@ -99,7 +96,8 @@ public:
     QJsonArray patchDrafts() const;
     bool removePatchDraft(const QString& id);
     std::shared_ptr<QuadSurface> setPatchRemoved(const QString& id, bool removed);
-    void setPatchIndexProvider(std::function<SurfacePatchIndex*()> provider) { _patchIndexProvider = std::move(provider); }
+    // Where volume points lie on patches (the store: patches are drafts).
+    void setPatchLocator(vc3d::spiral::PatchLocator locator) { _patchLocator = std::move(locator); }
     bool usesPaintSurface(const std::shared_ptr<QuadSurface>& surface) const;
     bool dragging() const { return _dragMode != DragMode::None; }
 
@@ -191,7 +189,7 @@ private:
         const std::shared_ptr<QuadSurface>& from, const std::shared_ptr<QuadSurface>& to) const;
     std::optional<QPainterPath> mapPatchShape(const QPainterPath& path,
         const std::shared_ptr<QuadSurface>& from, const std::shared_ptr<QuadSurface>& to) const;
-    std::function<SurfacePatchIndex*()> _patchIndexProvider;
+    vc3d::spiral::PatchLocator _patchLocator;
     QColor nextColor();
     QPainterPath deviceDisk(const QPointF& center) const;
     QPainterPath deviceSweep(const QPointF& from, const QPointF& to) const;
@@ -263,9 +261,6 @@ private:
     // Aliases of `_flattened` kept for the paint/polyline code paths.
     VolumeViewerBase* _viewer = nullptr;
     std::shared_ptr<QuadSurface> _paintSurface;
-    QObject* _viewport = nullptr;
-    QObject* _viewObject = nullptr;
-    SpiralBrushCursorWidget* _cursorWidget = nullptr;
     std::vector<Gesture> _gestures;
     std::vector<PolylineGesture> _polylines;
     QSet<QString> _visiblePointCollectionIds;

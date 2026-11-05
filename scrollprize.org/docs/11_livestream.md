@@ -69,7 +69,7 @@ On [X](https://twitter.com/i/spaces/1eaJbgEkEnrxX?s=20) and [our recording](http
 
 <iframe className="w-[100%] mb-4 aspect-video" src="https://www.youtube.com/embed/w0EsoAbRk1M"  title="YouTube video player" frameBorder="0" allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share" allowFullScreen></iframe>
 
-More videos from the symposium can be found [here](https://www.herculaneum.ox.ac.uk/node/262).
+More videos from the symposium can be found [here](https://web.archive.org/web/20241207094227/https://www.herculaneum.ox.ac.uk/node/262).
 
 ### May 25, 2023 - Papyrology team Q&A
 

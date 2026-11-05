@@ -79,6 +79,10 @@ class FiberTrace3DCudaBatchPipeline:
         self._closed = False
         self._terminal_result: object | None = None
         self.max_pinned_bytes = 0
+        # Geometry prepasses submit CUDA work too and must obey pause/drain.
+        from .sample_pipeline import MacroBatchTargetSource
+        if isinstance(source, MacroBatchTargetSource):
+            source.prepare_geometry = self._prepare_geometry
         self._thread = threading.Thread(
             target=self._run,
             name="fiber3d-cuda-batch-preparation",
@@ -175,6 +179,18 @@ class FiberTrace3DCudaBatchPipeline:
                 self._results.put(prepared)
         except BaseException as error:
             self._results.put(_PreparationFailure(error))
+
+    def _prepare_geometry(self, operation):
+        # Queue reads remain outside this lock: evaluation may need the same
+        # queue's credits while the producer waits at its admission boundary.
+        while self._wait_until_running():
+            with self._submit_lock:
+                with self._pause_condition:
+                    if self._paused:
+                        continue
+                with torch.cuda.device(self.device), torch.cuda.stream(self.stream):
+                    return operation()
+        raise StopIteration
 
     def __next__(self) -> FiberTrace3DBatch:
         if self._closed:

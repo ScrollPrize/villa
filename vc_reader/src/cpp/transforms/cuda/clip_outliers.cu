@@ -1,13 +1,12 @@
 #include "voxel_transform.cuh"
 #include "sort_keys.cuh"
+#include "../shared/percentile.hpp"
 namespace vcr::transforms::cuda {
 namespace {
 template<class T> __device__ void clip_bounds(KernelIndex vcr_launch, const T* sorted, std::size_t n, double lower, double upper, double* bounds) {
-    const auto percentile = [&](double q) {
-        const double pos = q / 100 * (n - 1); const auto lo = std::size_t(pos), hi = lo + 1 < n ? lo + 1 : lo;
-        return sorted[lo] + (sorted[hi] - sorted[lo]) * (pos - lo);
-    };
-    bounds[0] = percentile(lower); bounds[1] = percentile(upper);
+    const auto at = [&](std::size_t i) { return sorted[i]; };
+    bounds[0] = percentile_detail::sorted_percentile<percentile_detail::Rule::Linear>(at, n, lower);
+    bounds[1] = percentile_detail::sorted_percentile<percentile_detail::Rule::Linear>(at, n, upper);
 }
 struct clip_bounds_launch {
     template<class... Args> __device__ void operator()(KernelIndex index, Args... args) const { clip_bounds(index,args...); }

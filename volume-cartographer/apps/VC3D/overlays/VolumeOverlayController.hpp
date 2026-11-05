@@ -10,7 +10,6 @@
 #include <string>
 #include <vector>
 
-#include "vc/core/types/Sampling.hpp"
 #include "vc/core/util/Compositing.hpp"
 
 class ViewerManager;
@@ -31,7 +30,7 @@ public:
         QPointer<QComboBox> colormapSelect;
         QPointer<QComboBox> samplingMethodSelect;
         QPointer<QSpinBox> opacitySpin;
-        QPointer<QSpinBox> thresholdSpin;
+        QPointer<QCheckBox> intensityAsAlphaCheck;
         QPointer<QSpinBox> maxDisplayedResolutionSpin;
         QPointer<QCheckBox> compositeEnabledCheck;
         QPointer<QComboBox> compositeMethodSelect;
@@ -50,6 +49,7 @@ public:
         std::string colormap;
         float opacity{0.5f};
         Window window;
+        bool intensityAsAlpha{false};
         int maxDisplayedResolution{0};
         OverlayCompositeSettings composite;
     };
@@ -59,8 +59,8 @@ public:
         std::optional<std::string> volumeId;
         std::optional<std::string> colormap;
         std::optional<float> opacity;
-        std::optional<float> threshold;
         std::optional<Window> window;
+        std::optional<bool> intensityAsAlpha;
         std::optional<int> maxDisplayedResolution;
         std::optional<OverlayCompositeSettings> composite;
     };
@@ -100,10 +100,10 @@ private:
     void saveState() const;
     void setVolumeId(const std::string& id);
     void setColormap(const std::string& id);
-    void setSamplingMethod(vc::Sampling method);
+    void setSamplingMethod(int method);
     void setOpacity(float value);
-    void setThreshold(float value);
     void setWindowBounds(float low, float high);
+    void setIntensityAsAlpha(bool enabled);
     void setMaxDisplayedResolution(int value);
     void setComposite(const OverlayCompositeSettings& settings);
     OverlayCompositeSettings currentCompositeSettings() const;
@@ -114,7 +114,7 @@ private:
     void handleColormapChanged(int index);
     void handleSamplingMethodChanged(int index);
     void handleOpacityChanged(int value);
-    void handleThresholdChanged(int value);
+    void handleIntensityAsAlphaChanged(bool enabled);
     void handleMaxDisplayedResolutionChanged(int value);
     void handleCompositeEnabledChanged(bool enabled);
     void handleCompositeMethodChanged(int index);
@@ -131,11 +131,12 @@ private:
     std::string _overlayVolumeId;
     std::string _overlayVolumeIdBeforeToggle;
     std::string _overlayColormapName;
-    vc::Sampling _overlaySamplingMethod{vc::Sampling::Nearest};
+    int _overlaySamplingMethod{0};
     float _overlayOpacity{0.5f};
     float _overlayOpacityBeforeToggle{0.5f};
     float _overlayWindowLow{0.0f};
     float _overlayWindowHigh{255.0f};
+    bool _overlayIntensityAsAlpha{false};
     int _overlayMaxDisplayedResolution{0};
     bool _compositeEnabled{false};
     std::string _compositeMethod{"max"};

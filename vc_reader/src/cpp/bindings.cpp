@@ -1,6 +1,18 @@
+#ifdef VC_READER_CUDA
+#include "cuda_buffer.hpp"
+#endif
+#include "vc_reader/display.hpp"
+#include "vc_reader/pathfinding.hpp"
 // Python bindings for the C++ read path (module vc_reader._reader).
 #include "array.hpp"
+#include "cuda_available.hpp"
+#include "vc_reader/composite.hpp"
+#include "vc_reader/grid.hpp"
+#include "vc_reader/computed.hpp"
 #include "vc_reader/reader.hpp"
+#include "vc_reader/zarr.hpp"
+#include "vc_reader/zarr_metadata.hpp"
+#include "vc_reader/zarr_write.hpp"
 #include "output_pool.hpp"
 
 #include <nanobind/nanobind.h>
@@ -11,44 +23,21 @@
 #include <nanobind/stl/pair.h>
 #include <nanobind/stl/vector.h>
 #include <nanobind/stl/function.h>
+#include <nanobind/stl/optional.h>
+#include <nanobind/stl/array.h>
 
+#include <cstring>
+#include <climits>
 #include <functional>
+#include <map>
 #include <numeric>
 
 namespace nb = nanobind;
 using namespace nb::literals;
 
 using Bytes = nb::ndarray<std::uint8_t, nb::ndim<1>, nb::c_contig, nb::device::cpu>;
-using LayerTuple = std::tuple<std::string, std::string, std::string, std::string, bool>;
-// (kind, user or access key id, password or secret key, session token, region); see vcr::Auth.
-using AuthTuple = std::tuple<std::string, std::string, std::string, std::string, std::string>;
+using Json = vcr::zarr::Json;
 using HostPoints = nb::ndarray<nb::ro, nb::ndim<2>, nb::c_contig, nb::device::cpu>;
-
-template<class T> static nb::object point_origin(const HostPoints& points)
-{
-    const auto* p = static_cast<const T*>(points.data());
-    T low[3] = {INFINITY, INFINITY, INFINITY}, high[3] = {-INFINITY, -INFINITY, -INFINITY};
-    {
-        nb::gil_scoped_release release;
-        for (std::size_t i = 0; i < points.shape(0); ++i, p += 3) {
-            if (!std::isfinite(p[0]) || !std::isfinite(p[1]) || !std::isfinite(p[2])) continue;
-            for (int a = 0; a < 3; ++a) {
-                low[a] = std::min(low[a], p[a]);
-                high[a] = std::max(high[a], p[a]);
-            }
-        }
-    }
-    vcr::Index base(3, 0);
-    if (std::isfinite(low[0])) {
-        for (int a = 0; a < 3; ++a) {
-            base[a] = static_cast<std::int64_t>(std::clamp(std::floor(double(low[a])), 0., double(1LL << 30)));
-            // Keep local rounding below 1/4096 voxel, independent of point order.
-            if (double(low[a]) - base[a] < -4096 || double(high[a]) - base[a] > 4096)
-                return nb::none();
-        }
-    }
-    return nb::cast(base);
-}
 
 template<class T> static void sample_u8_points(vcr::Array& a, const HostPoints& points,
                                               const vcr::Index& offset, Bytes out, int order)
@@ -63,11 +52,25 @@ template<class T> static void sample_u8_points(vcr::Array& a, const HostPoints& 
 #ifdef VC_READER_CUDA
 #include "reader_cuda/bindings.hpp"
 #endif
+#include "sources/bindings.hpp"
+#include "cache_bindings.hpp"
+#include "tifxyz/bindings.hpp"
+#include "grid/bindings.hpp"
 
-static vcr::Auth to_auth(const AuthTuple& t)
+static nb::object py_json(const Json& value)
 {
-    auto& [kind, user, secret, token, region] = t;
-    return vcr::Auth{kind, user, secret, token, region};
+    return nb::module_::import_("json").attr("loads")(value.dump());
+}
+
+static Json to_json(const nb::object& value)
+{
+    return Json::parse(nb::cast<std::string>(nb::module_::import_("json").attr("dumps")(value)));
+}
+
+static std::string access_kind(const vcr::zarr::Access& access)
+{
+    using Kind = vcr::zarr::Access::Kind;
+    return access.kind == Kind::S3 ? "s3" : access.kind == Kind::Basic ? "basic" : "anonymous";
 }
 
 static vcr::ElementType sample_type(const std::string& name, std::size_t itemsize, bool swap)
@@ -102,30 +105,60 @@ static std::vector<std::size_t> output_counts(const std::vector<vcr::Index>& sha
     return counts;
 }
 
-#include "aligned/bindings.hpp"
-#include "surface/bindings.hpp"
 #include "sheet_normal/bindings.hpp"
 #include "geometry/bindings.hpp"
+#include "sampling/bindings.hpp"
+#include "projection/transfer_bindings.hpp"
+
+#include "display/bindings.hpp"
 
 NB_MODULE(_reader, m)
 {
-    m.def("normalize_zarr_metadata", &vcr::normalizeZarrMetadata);
+    vcr::display::python::bind(m);
     m.doc() = "Zarr reader: local and HTTP chunks, disk cache layers, memory cache.";
-    m.def("_point_origin", [](HostPoints points) -> nb::object {
+    m.def("_local_points", [](HostPoints points, std::optional<vcr::Index> origin) -> nb::object {
         if (points.shape(1) != 3) throw nb::value_error("expected points of shape (N, 3)");
-        if (points.dtype() == nb::dtype<float>()) return point_origin<float>(points);
-        if (points.dtype() == nb::dtype<double>()) return point_origin<double>(points);
+        const auto local = [&](const auto* p) -> nb::object {
+            auto owned = std::make_unique<vcr::LocalPoints>();
+            {
+                nb::gil_scoped_release release;
+                *owned = vcr::localPoints(p, points.shape(0), origin);
+            }
+            if (owned->dispersed)
+                return nb::none();
+            const auto base = owned->base;
+            float* data = owned->local.data();
+            nb::capsule holder(owned.release(), [](void* q) noexcept { delete static_cast<vcr::LocalPoints*>(q); });
+            return nb::make_tuple(nb::ndarray<nb::numpy, float, nb::ndim<2>>(data, {points.shape(0), std::size_t(3)}, holder),
+                                  vcr::Index(base.begin(), base.end()));
+        };
+        if (points.dtype() == nb::dtype<float>()) return local(static_cast<const float*>(points.data()));
+        if (points.dtype() == nb::dtype<double>()) return local(static_cast<const double*>(points.data()));
         throw nb::type_error("expected float32 or float64 points");
-    });
+    }, "points"_a, "origin"_a.none() = nb::none());
+    m.def("_check_crop_shape", [](const vcr::Index& shape) { return vcr::checkedCropShape(shape); }, "shape"_a);
+    m.def("_check_coordinate_origin", [](const vcr::Index& origin) { return vcr::checkedCoordinateOrigin(origin); }, "origin"_a);
+    m.def("_local_origin", [](nb::ndarray<nb::ro, nb::ndim<1>, nb::c_contig, nb::device::cpu> origin, std::optional<vcr::Index> coordinate_origin) {
+        if (origin.size() != 3) throw nb::value_error("origin and axes must be finite with shapes (3,) and (3, 3)");
+        const auto local = origin.dtype() == nb::dtype<float>()
+            ? vcr::localOrigin(static_cast<const float*>(origin.data()), coordinate_origin)
+            : origin.dtype() == nb::dtype<double>() ? vcr::localOrigin(static_cast<const double*>(origin.data()), coordinate_origin)
+                                                     : throw nb::type_error("expected a float32 or float64 origin");
+        return std::make_pair(local.base, local.origin);
+    }, "origin"_a, "coordinate_origin"_a.none() = nb::none());
 #ifdef VC_READER_CUDA
     vcr::reader_cuda::bind(m);
 #else
-    m.def("reader_cuda_available", [] { return false; });
+    m.def("reader_cuda_available", &vcr::cuda::available);
 #endif
-    vcr::aligned::bind(m);
-    vcr::surface::bind(m);
     vcr::sheet_normal::bind(m);
     vcr::geometry::bind(m);
+    vcr::sampling::python::bind(m);
+    vcr::projection::python::bind(m);
+    vcr::sources::python::bind(m);
+    vcr::cache::python::bind(m);
+    vcr::tifxyz::python::bind(m);
+    vcr::grid::python::bind(m);
     // Engines inherited by a forked process are deliberately kept alive and never
     // destroyed there (their threads do not exist in the child), so they are
     // still referenced at exit; that is not a leak worth reporting.
@@ -140,6 +173,14 @@ NB_MODULE(_reader, m)
             PyErr_SetString(cls.ptr(), e.what());
         } catch (const vcr::HttpDenied& e) {
             PyErr_SetString(PyExc_PermissionError, e.what());
+        } catch (const vcr::zarr::NotFound& e) {
+            PyErr_SetString(PyExc_FileNotFoundError, e.what());
+        } catch (const vcr::zarr::LowDiskSpace& e) {
+            nb::object cls = nb::module_::import_("vc_reader.errors").attr("LowDiskSpaceError");
+            PyErr_SetString(cls.ptr(), e.what());
+        } catch (const std::filesystem::filesystem_error& e) {
+            errno = e.code().value();
+            PyErr_SetFromErrnoWithFilename(PyExc_OSError, e.path1().c_str());
         }
     });
 
@@ -166,39 +207,6 @@ NB_MODULE(_reader, m)
         return d;
     });
 
-    m.def(
-        "http_get",
-        [](const std::string& url, const AuthTuple& auth, long stall_timeout_s, int retries) -> nb::object {
-            std::vector<std::uint8_t> body;
-            bool found;
-            {
-                nb::gil_scoped_release release;
-                vcr::HttpOptions options;
-                options.connections = 1;
-                options.stall_timeout_s = stall_timeout_s;
-                options.retries = retries;
-                options.auth = to_auth(auth);
-                vcr::HttpClient client(options);
-                found = client.get(url, body);
-            }
-            if (!found)
-                return nb::none();
-            return nb::bytes(reinterpret_cast<const char*>(body.data()), body.size());
-        },
-        "url"_a, "auth"_a = AuthTuple{}, "stall_timeout_s"_a = 10, "retries"_a = 5,
-        "GET a small object (e.g. .zarray); None if it does not exist (404). PermissionError on 401/403.");
-
-    m.def(
-        "sigv4_headers",
-        [](const std::string& url, const std::string& access_key, const std::string& secret_key,
-           const std::string& session_token, const std::string& region, const std::string& amz_date,
-           const std::vector<std::pair<std::string, std::string>>& extra) {
-            return vcr::sigv4_get_headers(url, {access_key, secret_key, session_token, region}, amz_date, extra);
-        },
-        "url"_a, "access_key"_a, "secret_key"_a, "session_token"_a, "region"_a, "amz_date"_a,
-        "extra"_a = std::vector<std::pair<std::string, std::string>>{},
-        "The headers that sign a GET of url for S3 at amz_date (YYYYMMDDTHHMMSSZ); for tests.");
-
     nb::class_<vcr::MemoryCache>(m, "MemoryCache", "Byte-bounded LRU of decoded chunks, shareable between arrays.")
         .def(nb::init<std::size_t>(), "max_bytes"_a)
         .def_prop_ro("max_bytes", &vcr::MemoryCache::max_bytes)
@@ -208,79 +216,711 @@ NB_MODULE(_reader, m)
         .def("__len__", &vcr::MemoryCache::size)
         .def("clear", &vcr::MemoryCache::clear);
 
+    // Finding remote arrays and their disk caches (vc_reader/zarr.hpp).
+    m.def("is_remote", &vcr::zarr::isRemote, "location"_a);
+    m.def("http_url", &vcr::zarr::httpUrl, "location"_a);
+    m.def("is_public_location", &vcr::zarr::isPublicLocation, "location"_a);
+    m.def("load_basic_auth", [](const std::string& path) { return vcr::zarr::loadBasicAuth(path); }, "path"_a);
+    m.def("cache_roots", [](const std::vector<std::string>& cache_dirs) {
+        std::vector<std::string> out;
+        for (const auto& d : vcr::zarr::cacheRoots(cache_dirs))
+            out.push_back(d.string());
+        return out;
+    }, "cache_dirs"_a);
+    m.def("decoded_cache_path", [](const std::string& cache_dir, const std::string& url) {
+        return vcr::zarr::decodedCachePath(cache_dir, url).string();
+    }, "cache_dir"_a, "url"_a);
+    m.def("vc3d_volume_id", &vcr::zarr::vc3dVolumeId, "url"_a);
+    m.def("vc3d_cache_root", []() -> std::optional<std::string> {
+        const auto root = vcr::zarr::vc3dCacheRoot();
+        return root ? std::optional<std::string>(root->string()) : std::nullopt;
+    });
+    m.def("declared_placement", [](const nb::object& attributes, const std::string& path) {
+        const auto placement = vcr::zarr::declaredPlacement(to_json(attributes), path);
+        return nb::make_tuple(placement.scale, placement.offset);
+    }, "attributes"_a, "path"_a);
+    m.def("selected_vc3d_cache_root", []() { return vcr::zarr::selectedVc3dCacheRoot().string(); });
+    m.def("vc3d_config_directory", []() { return vcr::zarr::vc3dConfigDirectory().string(); });
+    m.def("disk_budget", &vcr::zarr::diskBudget, "root"_a, "max_bytes"_a.none(),
+          nb::call_guard<nb::gil_scoped_release>());
+
+    using vcr::zarr::Access;
+    nb::class_<Access>(m, "Access", "How requests under one root are made. Picklable; keys from the environment are read again in the new process.")
+        .def_prop_ro("kind", &access_kind)
+        .def_prop_ro("region", [](const Access& a) { return a.auth.region; })
+        .def_prop_ro("endpoint", [](const Access& a) { return a.endpoint; })
+        .def("url", &Access::url, "location"_a)
+        .def("cache_url", &Access::cacheUrl, "location"_a)
+        .def("__repr__", [](const Access& a) {
+            if (a.kind != Access::Kind::S3)
+                return "Access(" + access_kind(a) + ")";
+            return std::string("Access(s3, ") + (a.fromEnvironment ? "AWS environment" : "fixed keys") + ", region='" + a.auth.region + "')";
+        })
+        .def("__getstate__", [](const Access& a) {
+            const bool keep = !a.fromEnvironment;
+            return nb::make_tuple(access_kind(a), keep ? a.auth.user : "", keep ? a.auth.secret : "", keep ? a.auth.token : "",
+                                  a.auth.region, a.auth.kind, a.endpoint, a.fromEnvironment);
+        })
+        .def("__setstate__", [](Access& a, const std::tuple<std::string, std::string, std::string, std::string, std::string,
+                                                            std::string, std::string, bool>& state) {
+            const auto& [kind, user, secret, token, region, authKind, endpoint, environment] = state;
+            new (&a) Access();
+            a.kind = kind == "s3" ? Access::Kind::S3 : kind == "basic" ? Access::Kind::Basic : Access::Kind::Anonymous;
+            a.auth = vcr::Auth{authKind, user, secret, token, region};
+            a.endpoint = endpoint;
+            a.fromEnvironment = environment;
+            vcr::zarr::reloadEnvironmentKeys(a);
+        });
+    m.def("anonymous_access", [] { return Access{}; });
+    m.def("resolve_access", [](const std::string& location, const std::string& mode, bool offline) {
+        if (mode != "auto" && mode != "aws")
+            throw nb::value_error("auth mode must be 'auto' or 'aws'");
+        nb::gil_scoped_release release;
+        return vcr::zarr::resolveAccess(location, mode == "aws" ? vcr::zarr::AuthMode::Aws : vcr::zarr::AuthMode::Auto, offline);
+    }, "location"_a, "mode"_a, "offline"_a = false);
+    m.def("s3_access", [](const std::string& location, const std::string& key, const std::string& secret,
+                          const std::string& token, const std::string& region, const std::string& endpoint, bool offline) {
+        nb::gil_scoped_release release;
+        return vcr::zarr::s3Access(location, vcr::Auth{"s3", key, secret, token, region}, endpoint, offline);
+    }, "location"_a, "access_key_id"_a, "secret_access_key"_a, "session_token"_a, "region"_a, "endpoint"_a, "offline"_a = false);
+    m.def("basic_access", &vcr::zarr::basicAccess, "user"_a, "password"_a);
+
+    using vcr::zarr::ArrayMeta;
+    nb::class_<ArrayMeta>(m, "ArrayMeta", "Zarr array metadata as parsed by vcr::zarr::parseArrayMeta.")
+        .def_prop_ro("shape", [](const ArrayMeta& a) { return a.shape; })
+        .def_prop_ro("chunks", [](const ArrayMeta& a) { return a.chunks; })
+        .def_prop_ro("dtype", [](const ArrayMeta& a) { return a.dtype; })
+        .def_prop_ro("fill", [](const ArrayMeta& a) { return nb::bytes(reinterpret_cast<const char*>(a.fill.data()), a.fill.size()); })
+        .def_prop_ro("order", [](const ArrayMeta& a) { return a.order; })
+        .def_prop_ro("separator", [](const ArrayMeta& a) { return a.separator; })
+        .def_prop_ro("compressor", [](const ArrayMeta& a) { return py_json(a.compressor); })
+        .def_prop_ro("filters", [](const ArrayMeta& a) { return py_json(a.filters); })
+        .def_prop_ro("raw", [](const ArrayMeta& a) { return py_json(a.raw); })
+        .def_prop_ro("chunk_nbytes", &ArrayMeta::chunkBytes)
+        .def("codec", &ArrayMeta::codec)
+        .def("decoded_zarray", [](const ArrayMeta& a) { return py_json(a.decodedZarray()); });
+    m.def("zarr_inventory", [](const std::string& path, bool strict) {
+        vcr::zarr::ArrayInventory result;
+        { nb::gil_scoped_release release; result=vcr::zarr::inventory(path,{},strict); }
+        return nb::make_tuple(py_json(result.metadata),result.chunks);
+    }, "path"_a, "strict"_a=false);
+    m.def("create_object_array", [](const std::string& path,const vcr::Index& shape,const vcr::Index& chunks,
+                                    const nb::object& filters,const std::string& separator) {
+        const auto config=to_json(filters);
+        nb::gil_scoped_release release;
+        vcr::zarr::createObjectArray(path,shape,chunks,config,separator);
+    }, "path"_a,"shape"_a,"chunks"_a,"filters"_a,"separator"_a="");
+    m.def("parse_array_meta", [](const nb::object& metadata) { return vcr::zarr::parseArrayMeta(to_json(metadata)); }, "metadata"_a);
+
+    using vcr::zarr::CacheLayer;
+    nb::class_<CacheLayer>(m, "CacheLayer", "One cache directory holding chunks of one array, in one format.")
+        .def_ro("kind", &CacheLayer::kind)
+        .def_ro("root", &CacheLayer::root)
+        .def_ro("stored", &CacheLayer::stored)
+        .def_ro("empty_root", &CacheLayer::emptyRoot)
+        .def_ro("allow_lossy", &CacheLayer::allowLossy)
+        .def_ro("budget_root", &CacheLayer::budgetRoot)
+        .def("__repr__", [](const CacheLayer& l) { return "CacheLayer('" + l.kind + "', '" + l.root + "')"; });
+
+    using vcr::zarr::OpenOptions;
+    nb::class_<OpenOptions>(m, "OpenOptions")
+        .def("__init__", [](OpenOptions* self, Access access, std::vector<std::string> cache_dirs, bool cache_writes,
+                            std::optional<std::int64_t> cache_max_bytes, bool compress_cache, bool allow_lossy_cache,
+                            std::shared_ptr<vcr::MemoryCache> memory_cache, std::size_t threads, int connections,
+                            std::string read_mode, bool offline, bool offline_fill) {
+            new (self) OpenOptions();
+            self->access = std::move(access);
+            self->cacheDirs = std::move(cache_dirs);
+            self->cacheWrites = cache_writes;
+            self->cacheMaxBytes = cache_max_bytes;
+            self->compressCache = compress_cache;
+            self->allowLossyCache = allow_lossy_cache;
+            self->memoryCache = std::move(memory_cache);
+            self->threads = threads;
+            self->connections = connections;
+            self->readMode = std::move(read_mode);
+            self->offline = offline;
+            self->offlineFill = offline_fill;
+        }, "access"_a, "cache_dirs"_a, "cache_writes"_a, "cache_max_bytes"_a.none(), "compress_cache"_a, "allow_lossy_cache"_a,
+           "memory_cache"_a.none(), "threads"_a, "connections"_a, "read_mode"_a, "offline"_a, "offline_fill"_a = false);
+
+    using vcr::zarr::OpenedArray;
+    nb::class_<OpenedArray>(m, "OpenedArray")
+        .def_ro("location", &OpenedArray::location)
+        .def_ro("meta", &OpenedArray::meta)
+        .def_ro("store", &OpenedArray::store)
+        .def_ro("level_key", &OpenedArray::levelKey)
+        .def_ro("writer", &OpenedArray::writer)
+        .def_ro("busy", &OpenedArray::busy)
+        .def_prop_ro("array", [](OpenedArray& o) -> vcr::Array& { return *o.array; }, nb::rv_policy::reference_internal)
+        .def_prop_ro("layers", [](const OpenedArray& o) {
+            auto layers = o.layers;  // a view: the leases stay with the opened array
+            for (auto& layer : layers)
+                layer.lease.reset();
+            return layers;
+        })
+        .def_prop_ro("placement_scale", [](const OpenedArray& o) { return o.placement.scale; })
+        .def("attributes", [](OpenedArray& o, const OpenOptions& options) {
+            {
+                nb::gil_scoped_release release;
+                vcr::zarr::arrayAttributes(o, options);
+            }
+            return py_json(o.attributes);
+        }, "options"_a)
+        .def_prop_ro("known_attributes", [](const OpenedArray& o) -> nb::object {
+            return o.attributesRead ? py_json(o.attributes) : nb::none();
+        })
+        .def("close", &OpenedArray::close, nb::call_guard<nb::gil_scoped_release>());
+    m.def("open_array", [](const std::string& location, const OpenOptions& options, std::optional<std::string> group,
+                           std::optional<std::string> level_key, nb::object metadata, nb::object attributes) {
+        vcr::zarr::ArrayHints hints;
+        hints.group = std::move(group);
+        hints.levelKey = std::move(level_key);
+        if (!metadata.is_none())
+            hints.metadata = to_json(metadata);
+        if (!attributes.is_none())
+            hints.attributes = to_json(attributes);
+        nb::gil_scoped_release release;
+        return vcr::zarr::openArray(location, options, std::move(hints));
+    }, "location"_a, "options"_a, "group"_a.none() = nb::none(), "level_key"_a.none() = nb::none(),
+       "metadata"_a.none() = nb::none(), "attributes"_a.none() = nb::none());
+
+    using vcr::zarr::Group;
+    m.def("window_level_lut", [](float low, float high, bool cuda) {
+        std::array<std::uint32_t,256> out;
+        nb::gil_scoped_release release;
+        if (cuda) {
+#ifdef VC_READER_CUDA
+            vcr::display::cuda::windowLevelLut(out, low, high);
+#else
+            throw std::runtime_error("CUDA support is not built");
+#endif
+        } else vcr::display::windowLevelLut(out, low, high);
+        return out;
+    }, "low"_a, "high"_a, "cuda"_a = false);
+    m.def("palette_lut", [](const std::array<std::uint32_t,256>& palette, float low, float high, bool black_zero, bool cuda) {
+        std::array<std::uint32_t,256> out;
+        nb::gil_scoped_release release;
+        if (cuda) {
+#ifdef VC_READER_CUDA
+            vcr::display::cuda::paletteLut(out, palette, low, high, black_zero);
+#else
+            throw std::runtime_error("CUDA support is not built");
+#endif
+        } else vcr::display::paletteLut(out, palette, low, high, black_zero);
+        return out;
+    }, "palette"_a, "low"_a, "high"_a, "black_zero"_a = true, "cuda"_a = false);
+    m.def("overlay_lut", [](const std::array<std::uint32_t,256>& color, float low, float high, bool intensity, bool premultiplied, bool cuda) {
+        std::array<std::uint32_t,256> out;
+        nb::gil_scoped_release release;
+        if (cuda) {
+#ifdef VC_READER_CUDA
+            vcr::display::cuda::overlayLut(out, color, low, high, intensity, premultiplied);
+#else
+            throw std::runtime_error("CUDA support is not built");
+#endif
+        } else vcr::display::overlayLut(out, color, low, high, intensity, premultiplied);
+        return out;
+    }, "color"_a, "low"_a, "high"_a, "intensity_as_alpha"_a, "premultiplied"_a, "cuda"_a = false);
+    const auto bindConversion = [&]<class T>(const char* name, const char* defaultRounding, bool defaultSaturate) {
+        m.def(name, [](nb::ndarray<const float, nb::ndim<1>, nb::c_contig> input,
+                       nb::ndarray<T, nb::ndim<1>, nb::c_contig> output,
+                       std::optional<nb::ndarray<std::uint8_t, nb::ndim<1>, nb::c_contig>> coverage,
+                       double scale, const std::string& rounding, bool saturateInfinity) {
+            if (input.size()!=output.size() || input.device_type()!=output.device_type() || input.device_id()!=output.device_id() ||
+                (coverage && (coverage->size()!=input.size() || coverage->device_type()!=input.device_type() || coverage->device_id()!=input.device_id())))
+                throw nb::value_error("display buffers must have matching size and device");
+            if (!std::isfinite(scale)) throw nb::value_error("display scale must be finite");
+            using namespace vcr::display;
+            Conversion conversion{scale, Rounding::Truncate, saturateInfinity};
+            if (rounding == "nearest_even") conversion.rounding = Rounding::NearestEven;
+            else if (rounding == "half_up") conversion.rounding = Rounding::HalfUp;
+            else if (rounding != "truncate") throw nb::value_error("unknown display rounding");
+            if constexpr (sizeof(T) == 2) if (coverage) throw nb::value_error("uint16 conversion does not produce coverage");
+            nb::gil_scoped_release release;
+            if (input.device_type()==nb::device::cpu::value) {
+                if constexpr (sizeof(T) == 1) toUint8(input.data(),input.size(),output.data(),coverage ? coverage->data() : nullptr,conversion);
+                else toUint16(input.data(),input.size(),output.data(),conversion);
+            }
+#ifdef VC_READER_CUDA
+            else if (input.device_type()==nb::device::cuda::value) {
+                vcr::device::Guard guard(input.device_id());
+                if constexpr (sizeof(T) == 1) vcr::display::cuda::toUint8(input.data(),input.size(),output.data(),coverage ? coverage->data() : nullptr,conversion);
+                else vcr::display::cuda::toUint16(input.data(),input.size(),output.data(),conversion);
+            }
+#endif
+            else throw nb::value_error("unsupported display device");
+        }, "input"_a.noconvert(), "output"_a.noconvert(), "coverage"_a.none() = nb::none(),
+           "scale"_a = 1., "rounding"_a = defaultRounding, "saturate_infinity"_a = defaultSaturate);
+    };
+    bindConversion.template operator()<std::uint8_t>("display_to_uint8", "nearest_even", false);
+    bindConversion.template operator()<std::uint16_t>("display_to_uint16", "nearest_even", true);
+    m.def("apply_lut", [](nb::ndarray<const std::uint8_t, nb::ndim<2>, nb::c_contig> input,
+                            nb::ndarray<const std::uint32_t, nb::ndim<1>, nb::c_contig> lut,
+                            nb::ndarray<std::uint32_t, nb::ndim<2>, nb::c_contig> output) {
+        if (lut.size()!=256 || input.shape(0)!=output.shape(0) || input.shape(1)!=output.shape(1) ||
+            input.device_type()!=output.device_type() || input.device_type()!=lut.device_type() ||
+            input.device_id()!=output.device_id() || input.device_id()!=lut.device_id())
+            throw nb::value_error("palette requires 256 entries; buffers must have matching shape and device");
+        nb::gil_scoped_release release;
+        if (input.device_type()==nb::device::cpu::value)
+            vcr::display::applyLut(input.data(),input.shape(0),input.shape(1),input.shape(1),lut.data(),output.data(),output.shape(1));
+#ifdef VC_READER_CUDA
+        else if (input.device_type()==nb::device::cuda::value) {
+            vcr::device::Guard guard(input.device_id());
+            vcr::display::cuda::applyLut(input.data(),input.shape(0),input.shape(1),input.shape(1),lut.data(),output.data(),output.shape(1));
+        }
+#endif
+        else throw nb::value_error("unsupported display device");
+    }, "input"_a.noconvert(), "lut"_a.noconvert(), "output"_a.noconvert());
+    m.def("blend", [](nb::ndarray<const std::uint32_t, nb::ndim<1>, nb::c_contig> base,
+                        nb::ndarray<const std::uint32_t, nb::ndim<1>, nb::c_contig> overlay, float opacity,
+                        nb::ndarray<std::uint32_t, nb::ndim<1>, nb::c_contig> output) {
+        if (base.size()!=overlay.size() || base.size()!=output.size() ||
+            base.device_type()!=output.device_type() || base.device_type()!=overlay.device_type() ||
+            base.device_id()!=output.device_id() || base.device_id()!=overlay.device_id())
+            throw nb::value_error("blend buffers must have matching size and device");
+        nb::gil_scoped_release release;
+        if (base.device_type()==nb::device::cpu::value)
+            vcr::display::blend(base.data(),overlay.data(),base.size(),opacity,output.data());
+#ifdef VC_READER_CUDA
+        else if (base.device_type()==nb::device::cuda::value) {
+            vcr::device::Guard guard(base.device_id());
+            vcr::display::cuda::blend(base.data(),overlay.data(),base.size(),opacity,output.data());
+        }
+#endif
+        else throw nb::value_error("unsupported display device");
+    }, "base"_a.noconvert(), "overlay"_a.noconvert(), "opacity"_a, "output"_a.noconvert());
+    m.def("blend_argb", &vcr::display::blendArgb, "base"_a, "overlay"_a, "opacity"_a);
+
+    m.def("shortest_path", [](nb::ndarray<const float, nb::ndim<2>, nb::c_contig, nb::device::cpu> costs,
+                              std::uint32_t source, std::uint32_t target, bool cuda) {
+        nb::gil_scoped_release release;
+        if (cuda) {
+#ifdef VC_READER_CUDA
+            return vcr::pathfinding::cuda::shortestPath(costs.data(), costs.shape(0), costs.shape(1), source, target);
+#else
+            throw std::runtime_error("CUDA support is not built");
+#endif
+        }
+        return vcr::pathfinding::shortestPath(costs.data(), costs.shape(0), costs.shape(1), source, target);
+    }, "costs"_a.noconvert(), "source"_a, "target"_a, "cuda"_a = false);
+
+    m.def("render_points", [](vcr::Array& array, const std::string& kind, std::size_t itemsize, bool swap,
+                             nb::ndarray<const float, nb::ndim<3>, nb::c_contig, nb::device::cpu> xyz,
+                             nb::ndarray<const float, nb::ndim<3>, nb::c_contig, nb::device::cpu> normals,
+                             nb::ndarray<const std::uint8_t, nb::ndim<2>, nb::c_contig, nb::device::cpu> valid,
+                             std::array<double, 3> scale, std::vector<float> offsets) {
+        const auto h = xyz.shape(0), w = xyz.shape(1);
+        if (xyz.shape(2) != 3 || normals.shape(0) != h || normals.shape(1) != w || normals.shape(2) != 3 ||
+            valid.shape(0) != h || valid.shape(1) != w || h > INT_MAX || w > INT_MAX)
+            throw nb::value_error("expected H,W,3 positions/directions and H,W validity");
+        vcr::grid::Request request;
+        request.levels.push_back({&array, sample_type(kind, itemsize, swap), scale});
+        request.offsets = std::move(offsets);
+        request.pixels = valid.data();
+        request.composite = vcr::composite::Options{};
+        request.composite->method = vcr::composite::Method::Max;
+        auto result = std::make_unique<vcr::grid::Result>();
+        {
+            nb::gil_scoped_release release;
+            *result = vcr::grid::sample(vcr::grid::Points{xyz.data(), normals.data(), int(w), int(h)}, request);
+        }
+        auto* data = result->values.data();
+        nb::capsule owner(result.release(), [](void* p) noexcept { delete static_cast<vcr::grid::Result*>(p); });
+        return nb::ndarray<nb::numpy, float, nb::ndim<2>>(data, {h, w}, owner);
+    }, "array"_a, "kind"_a, "itemsize"_a, "swap"_a, "xyz"_a, "normals"_a, "valid"_a, "scale"_a, "offsets"_a);
+
+    m.def("composite_reduce", [](nb::ndarray<const float, nb::ndim<2>, nb::c_contig, nb::device::cpu> values, const std::string& method,
+                                 float iso_cutoff, float alpha_min, float alpha_max, float alpha_opacity, float alpha_cutoff,
+                                 float extinction, float emission, float ambient, nb::ndarray<float, nb::ndim<1>, nb::c_contig, nb::device::cpu> out) {
+        namespace composite = vcr::composite;
+        static const std::map<std::string, composite::Method> methods{
+            {"mean", composite::Method::Mean}, {"max", composite::Method::Max}, {"min", composite::Method::Min},
+            {"median", composite::Method::Median}, {"min_abs", composite::Method::MinAbs},
+            {"alpha", composite::Method::Alpha}, {"beer_lambert", composite::Method::BeerLambert}};
+        const auto found = methods.find(method);
+        if (found == methods.end())
+            throw nb::value_error(("unknown composite method '" + method + "'").c_str());
+        if (out.shape(0) != values.shape(1))
+            throw nb::value_error("composite output does not match the values");
+        composite::Options options;
+        options.method = found->second;
+        options.isoCutoff = iso_cutoff;
+        options.alphaMin = alpha_min;
+        options.alphaMax = alpha_max;
+        options.alphaOpacity = alpha_opacity;
+        options.alphaCutoff = alpha_cutoff;
+        options.extinction = extinction;
+        options.emission = emission;
+        options.ambient = ambient;
+        nb::gil_scoped_release release;
+        composite::reduce(values.data(), values.shape(0), values.shape(1), options, out.data());
+    }, "values"_a, "method"_a, "iso_cutoff"_a, "alpha_min"_a, "alpha_max"_a, "alpha_opacity"_a, "alpha_cutoff"_a,
+       "extinction"_a, "emission"_a, "ambient"_a, "out"_a);
+    m.def("open_computed", [](const std::vector<std::int64_t>& shape, const std::vector<std::int64_t>& chunks, const std::string& dtype,
+                              nb::object fill_value, const std::string& identity, nb::callable compute,
+                              std::optional<std::string> cache_dir, std::optional<std::int64_t> cache_max_bytes, bool compress_cache,
+                              std::shared_ptr<vcr::MemoryCache> memory_cache, std::size_t threads) {
+        vcr::computed::Options options;
+        options.shape = shape;
+        options.chunks = chunks;
+        options.dtype = dtype;
+        options.fillValue = to_json(fill_value);
+        options.identity = identity;
+        if (cache_dir)
+            options.cacheDir = *cache_dir;
+        options.cacheMaxBytes = cache_max_bytes;
+        options.compressCache = compress_cache;
+        options.memoryCache = std::move(memory_cache);
+        options.threads = threads;
+        OpenedArray opened;
+        opened.location = "computed:" + identity;
+        opened.meta = vcr::zarr::parseArrayMeta({{"zarr_format", 2}, {"shape", shape}, {"chunks", chunks}, {"dtype", dtype},
+            {"compressor", nullptr}, {"filters", nullptr}, {"order", "C"}, {"fill_value", options.fillValue}, {"dimension_separator", "/"}});
+        const std::size_t bytes = opened.meta.chunkBytes();
+        // The callback outlives this call inside the array; the GIL guards its reference count.
+        auto held = std::shared_ptr<nb::callable>(new nb::callable(std::move(compute)), [](nb::callable* c) {
+            nb::gil_scoped_acquire acquire;
+            delete c;
+        });
+        opened.array = vcr::computed::open(options, [held, bytes](const vcr::Index& chunk, std::uint8_t* out) {
+            nb::gil_scoped_acquire acquire;
+            nb::tuple index = nb::steal<nb::tuple>(PyTuple_New(Py_ssize_t(chunk.size())));
+            for (std::size_t i = 0; i < chunk.size(); ++i)
+                PyTuple_SET_ITEM(index.ptr(), Py_ssize_t(i), PyLong_FromLongLong(chunk[i]));
+            nb::object result = (*held)(index);
+            if (result.is_none())
+                return false;
+            const auto data = nb::cast<nb::bytes>(result);
+            if (data.size() != bytes)
+                throw std::invalid_argument("a computed chunk has the wrong size");
+            std::memcpy(out, data.c_str(), bytes);
+            return true;
+        });
+        return opened;
+    }, "shape"_a, "chunks"_a, "dtype"_a, "fill_value"_a, "identity"_a, "compute"_a, "cache_dir"_a.none(), "cache_max_bytes"_a.none(),
+       "compress_cache"_a, "memory_cache"_a.none(), "threads"_a);
+    nb::class_<Group>(m, "Group")
+        .def_static("open", [](const std::string& location, const OpenOptions& options) {
+            nb::gil_scoped_release release;
+            return Group::open(location, options);
+        }, "location"_a, "options"_a)
+        .def_static("from_state", [](const std::string& state, const OpenOptions& options) {
+            return Group::fromState(Json::parse(state), options);
+        }, "state"_a, "options"_a)
+        .def("state", [](const Group& g, bool inherited) { return g.state(inherited).dump(); }, "inherited"_a = false)
+        .def_prop_ro("location", [](const Group& g) { return g.location(); })
+        .def_prop_ro("version", &Group::version)
+        .def_prop_ro("attributes", [](const Group& g) { return py_json(g.attributes()); })
+        .def_prop_ro("multiscales", [](const Group& g) { return py_json(g.multiscales()); })
+        .def("levels", &Group::levels, "probe_levels"_a = 0, nb::call_guard<nb::gil_scoped_release>())
+        .def("placement", [](const Group& g, const std::string& path) {
+            const auto placement = g.placement(path);
+            return nb::make_tuple(placement.scale, placement.offset);
+        }, "path"_a)
+        .def("keys", &Group::keys, nb::call_guard<nb::gil_scoped_release>())
+        .def("array_keys", &Group::arrayKeys, nb::call_guard<nb::gil_scoped_release>())
+        .def("node", [](Group& g, const std::string& key) -> nb::object {
+            std::optional<std::pair<Group::NodeKind, Json>> node;
+            {
+                nb::gil_scoped_release release;
+                node = g.node(key);
+            }
+            if (!node)
+                return nb::none();
+            return nb::cast(std::string(node->first == Group::NodeKind::Array ? "array" : "group"));
+        }, "key"_a, "'array' or 'group' for a child path; None when there is none.")
+        .def("array", &Group::array, "key"_a, nb::call_guard<nb::gil_scoped_release>())
+        .def("group", &Group::group, "key"_a, nb::call_guard<nb::gil_scoped_release>())
+        .def("metadata_json", [](Group& g, bool refresh) {
+            std::string text;
+            {
+                nb::gil_scoped_release release;
+                text = vcr::zarr::storeMetadataJson(g.metadata(refresh)).dump();
+            }
+            return text;
+        }, "refresh"_a = false);
+    m.def("volume_metadata_json", [](const std::string& location, const OpenOptions& options, bool refresh) {
+        nb::gil_scoped_release release;
+        return vcr::zarr::storeMetadataJson(vcr::zarr::volumeMetadata(location, options, refresh)).dump();
+    }, "location"_a, "options"_a, "refresh"_a = false,
+       "What is known about the volume at a location, as JSON (see vcr::zarr::volumeMetadata).");
+    m.def("forget_volume_metadata", &vcr::zarr::forgetVolumeMetadata);
+    m.def("is_array_node", &vcr::zarr::isArrayNode, "location"_a, "options"_a, nb::call_guard<nb::gil_scoped_release>());
+    m.def("forget_kept_metadata", &vcr::zarr::forgetKeptMetadata, "location"_a, "options"_a);
+    m.def("level_voxel_size_zyx", [](std::optional<double> voxel_size, const nb::object& documents, const std::string& level_key) {
+        vcr::zarr::StoreMetadata metadata;
+        metadata.voxelSizeUm = voxel_size;
+        metadata.documents = to_json(documents);
+        return vcr::zarr::levelVoxelSizeZYX(metadata, level_key);
+    }, "voxel_size"_a.none(), "documents"_a, "level_key"_a);
+
+    using vcr::zarr::Writer;
+    using ConstBytes = nb::ndarray<nb::ro, nb::c_contig, nb::device::cpu>;
+    m.def("compress_bytes", [](ConstBytes data, const nb::object& compressor, std::size_t itemsize, const vcr::Index& shape) {
+        const auto config = to_json(compressor);
+        std::vector<std::uint8_t> encoded;
+        {
+            nb::gil_scoped_release release;
+            encoded = vcr::zarr::compressBytes(config, {static_cast<const std::uint8_t*>(data.data()), data.nbytes()}, itemsize, shape);
+        }
+        return nb::bytes(reinterpret_cast<const char*>(encoded.data()), encoded.size());
+    }, "data"_a, "compressor"_a.none(), "itemsize"_a, "shape"_a);
+    m.def("decompress_bytes", [](ConstBytes data, const nb::object& compressor, std::size_t size) {
+        const auto config = to_json(compressor);
+        auto decoded = nb::steal<nb::bytes>(PyBytes_FromStringAndSize(nullptr, Py_ssize_t(size)));
+        if (!decoded.is_valid())
+            throw nb::python_error();
+        auto* out = reinterpret_cast<std::uint8_t*>(PyBytes_AS_STRING(decoded.ptr()));
+        {
+            nb::gil_scoped_release release;
+            vcr::zarr::decompressBytes(config, {static_cast<const std::uint8_t*>(data.data()), data.nbytes()}, {out, size});
+        }
+        return decoded;
+    }, "data"_a, "compressor"_a.none(), "size"_a);
+    m.def("decompress_zstd_frame", [](ConstBytes data, std::size_t maxBytes) {
+        std::vector<std::uint8_t> decoded;
+        {
+            nb::gil_scoped_release release;
+            decoded = vcr::zarr::decompressZstdFrame({static_cast<const std::uint8_t*>(data.data()), data.nbytes()}, maxBytes);
+        }
+        return nb::bytes(reinterpret_cast<const char*>(decoded.data()), decoded.size());
+    }, "data"_a, "max_bytes"_a);
+    m.def("atomic_write", [](const std::string& path, ConstBytes data, bool fsync) {
+        nb::gil_scoped_release release;
+        vcr::zarr::atomicWrite(path, data.data(), data.nbytes(), fsync ? vcr::zarr::Durability::Fsync : vcr::zarr::Durability::Fast);
+    }, "path"_a, "data"_a, "fsync"_a);
+    nb::class_<Writer>(m, "Writer", "A Zarr array, local or on S3, opened for writing.")
+        .def_static("create", [](const std::string& path, const vcr::Index& shape, const vcr::Index& chunks,
+                                 const std::string& dtype, const std::string& compressor, int level, const std::string& cname,
+                                 int shuffle, bool overwrite, const std::string& separator, const nb::object& fill, int version,
+                                 const vcr::Index& shards, bool packbits, const vcr::zarr::Access& access) {
+            vcr::zarr::CreateOptions options;
+            options.shape = shape;
+            options.chunks = chunks;
+            options.dtype = dtype;
+            options.compressor = compressor;
+            options.level = level;
+            options.cname = cname;
+            options.shuffle = shuffle;
+            options.overwrite = overwrite;
+            options.separator = separator;
+            options.fillValue = to_json(fill);
+            options.version = version;
+            options.shardShape = shards;
+            options.packbits = packbits;
+            nb::gil_scoped_release release;
+            return Writer::create(path, options, access);
+        }, "path"_a, "shape"_a, "chunks"_a, "dtype"_a, "compressor"_a, "level"_a, "cname"_a, "shuffle"_a, "overwrite"_a,
+           "separator"_a, "fill_value"_a.none(), "version"_a, "shards"_a, "packbits"_a, "access"_a)
+        .def_static("create_like", [](const std::string& path, const ArrayMeta& like, const std::optional<vcr::Index>& shape,
+                                      const std::optional<vcr::Index>& chunks, const std::optional<std::string>& dtype,
+                                      const nb::object& fill, const std::optional<std::string>& separator, bool overwrite,
+                                      const vcr::zarr::Access& access) {
+            auto options = vcr::zarr::createOptionsLike(like);
+            if (shape) options.shape = *shape;
+            if (chunks) options.chunks = *chunks;
+            if (dtype) {
+                options.dtype = *dtype;
+                options.packbits = options.packbits && *dtype == "|b1";
+            }
+            if (!fill.is_none()) options.fillValue = to_json(fill);
+            if (separator) options.separator = *separator;
+            options.overwrite = overwrite;
+            nb::gil_scoped_release release;
+            return Writer::create(path, options, access);
+        }, "path"_a, "like"_a, "shape"_a.none(), "chunks"_a.none(), "dtype"_a.none(), "fill_value"_a.none(), "separator"_a.none(),
+           "overwrite"_a, "access"_a)
+        .def_static("open", [](const std::string& path, const vcr::zarr::Access& access) {
+            nb::gil_scoped_release release;
+            return Writer::open(path, access);
+        }, "path"_a, "access"_a)
+        .def_prop_ro("meta", &Writer::meta, nb::rv_policy::reference_internal)
+        .def_prop_ro("path", [](const Writer& w) { return w.path().string(); })
+        .def("write_region", [](Writer& w, const vcr::Index& start, const vcr::Index& shape, ConstBytes data, bool skip_empty) {
+            std::int64_t n = static_cast<std::int64_t>(w.meta().itemsize());
+            for (const auto extent : shape) n *= extent;
+            if (static_cast<std::int64_t>(data.nbytes()) != n)
+                throw nb::value_error("the data does not match its region");
+            nb::gil_scoped_release release;
+            w.writeRegion(start, shape, static_cast<const std::uint8_t*>(data.data()), skip_empty);
+        }, "start"_a, "shape"_a, "data"_a, "skip_empty"_a = false)
+        .def("write_chunk", [](Writer& w, const vcr::Index& chunk, ConstBytes data, bool skip_empty) {
+            nb::gil_scoped_release release;
+            const auto* bytes = static_cast<const std::uint8_t*>(data.data());
+            if (skip_empty)
+                w.writeChunkSkipEmpty(chunk, bytes, data.nbytes());
+            else
+                w.writeChunk(chunk, bytes, data.nbytes());
+        }, "chunk"_a, "data"_a, "skip_empty"_a = false)
+        .def("chunk_exists", &Writer::chunkExists, "chunk"_a, nb::call_guard<nb::gil_scoped_release>())
+        .def("stored_chunks", &Writer::storedChunks, "strict"_a = false, nb::call_guard<nb::gil_scoped_release>())
+        .def("remove_chunk", &Writer::removeChunk, "chunk"_a, nb::call_guard<nb::gil_scoped_release>())
+        .def("set_fill_value", [](Writer& w, const nb::object& value) {
+            const auto fill = to_json(value);
+            nb::gil_scoped_release release;
+            w.setFillValue(fill);
+        }, "value"_a.none());
+    using vcr::zarr::Store;
+    nb::class_<Store>(m, "Store", "The objects below a local directory or an s3:// prefix.")
+        .def("__init__", [](Store* store, const std::string& location, const vcr::zarr::Access& access, int connections) {
+            new (store) Store(location, access, connections);
+        }, "location"_a, "access"_a, "connections"_a = 16)
+        .def_prop_ro("location", &Store::location)
+        .def_prop_ro("access", [](const Store& s) { return s.access(); })
+        .def_prop_ro("remote", &Store::remote)
+        .def("read", [](const Store& s, const std::string& name) -> nb::object {
+            std::optional<std::string> data;
+            {
+                nb::gil_scoped_release release;
+                data = s.read(name);
+            }
+            if (!data) return nb::none();
+            return nb::bytes(data->data(), data->size());
+        }, "name"_a)
+        .def("write", [](const Store& s, const std::string& name, const nb::bytes& data) {
+            const std::string_view view(data.c_str(), data.size());
+            nb::gil_scoped_release release;
+            s.write(name, view);
+        }, "name"_a, "data"_a)
+        .def("write_file", &Store::writeFile, "name"_a, "file"_a, nb::call_guard<nb::gil_scoped_release>())
+        .def("read_file", &Store::readFile, "name"_a, "file"_a, nb::call_guard<nb::gil_scoped_release>())
+        .def("exists", &Store::exists, "name"_a, nb::call_guard<nb::gil_scoped_release>())
+        .def("remove", &Store::remove, "name"_a, nb::call_guard<nb::gil_scoped_release>())
+        .def("remove_all", &Store::removeAll, nb::call_guard<nb::gil_scoped_release>())
+        .def("objects", [](const Store& s, const std::string& prefix) {
+            std::vector<vcr::s3::Object> objects;
+            {
+                nb::gil_scoped_release release;
+                objects = s.list(prefix);
+            }
+            nb::list out;
+            for (const auto& object : objects) {
+                nb::dict entry;
+                entry["key"] = object.key;
+                entry["size"] = object.size;
+                entry["etag"] = object.etag;
+                entry["last_modified"] = object.lastModified;
+                out.append(entry);
+            }
+            return out;
+        }, "prefix"_a = "")
+        .def("list", [](const Store& s) {
+            std::vector<std::pair<std::string, std::uint64_t>> out;
+            {
+                nb::gil_scoped_release release;
+                for (auto& object : s.list())
+                    out.emplace_back(std::move(object.key), object.size);
+            }
+            return out;
+        })
+        .def("children", &Store::children, nb::call_guard<nb::gil_scoped_release>())
+        .def("list_page", [](const Store& s, const std::string& prefix, const std::string& continuation_token, int max_keys) {
+            vcr::zarr::Listing listing;
+            {
+                nb::gil_scoped_release release;
+                listing = s.listPage(prefix, continuation_token, max_keys);
+            }
+            nb::list objects;
+            for (const auto& object : listing.objects) {
+                nb::dict entry;
+                entry["key"] = object.key;
+                entry["size"] = object.size;
+                entry["etag"] = object.etag;
+                entry["last_modified"] = object.lastModified;
+                objects.append(entry);
+            }
+            nb::dict out;
+            out["objects"] = objects;
+            out["children"] = listing.children;
+            out["next_continuation_token"] = listing.nextContinuationToken;
+            return out;
+        }, "prefix"_a = "", "continuation_token"_a = "", "max_keys"_a = 1000)
+        .def("is_node", &Store::isNode, nb::call_guard<nb::gil_scoped_release>())
+        .def("is_array", &Store::isArray, nb::call_guard<nb::gil_scoped_release>());
+    using vcr::zarr::Access;
+    m.def("read_attributes", [](const std::string& path, const Access& access) {
+        Json attributes;
+        {
+            nb::gil_scoped_release release;
+            attributes = vcr::zarr::readAttributes(path, access);
+        }
+        return py_json(attributes);
+    }, "path"_a, "access"_a);
+    m.def("write_attributes", [](const std::string& path, const nb::object& attributes, const Access& access) {
+        const auto json = to_json(attributes);
+        nb::gil_scoped_release release;
+        vcr::zarr::writeAttributes(path, json, access);
+    }, "path"_a, "attributes"_a, "access"_a);
+    m.def("create_group", [](const std::string& path, const nb::object& attributes, int version, const Access& access) {
+        const auto json = attributes.is_none() ? std::nullopt : std::optional<Json>(to_json(attributes));
+        nb::gil_scoped_release release;
+        vcr::zarr::createGroup(path, json, version, access);
+    }, "path"_a, "attributes"_a.none(), "version"_a, "access"_a);
+    m.def("remove_node", [](const std::string& path, const Access& access) {
+        nb::gil_scoped_release release;
+        return vcr::zarr::removeNode(path, access);
+    }, "path"_a, "access"_a);
+    m.def("node_children", [](const std::string& path, const Access& access) { return vcr::zarr::nodeChildren(path, access); },
+          "path"_a, "access"_a, nb::call_guard<nb::gil_scoped_release>());
+
+    const auto pyramidOptions = [](int levels, const std::array<int, 3>& factors, const std::string& reduction, std::size_t threads) {
+        vcr::zarr::PyramidOptions options;
+        options.levels = levels;
+        options.factors = factors;
+        options.reduction = vcr::zarr::parseReduction(reduction);
+        options.threads = threads;
+        return options;
+    };
+    m.def("create_pyramid_levels", [pyramidOptions](const std::string& root, int levels, const std::array<int, 3>& factors, bool overwrite) {
+        const auto options = pyramidOptions(levels, factors, "mean", 0);
+        nb::gil_scoped_release release;
+        vcr::zarr::createPyramidLevels(root, options, overwrite);
+    }, "root"_a, "levels"_a, "factors"_a, "overwrite"_a);
+    m.def("write_pyramid_level", [pyramidOptions](const std::string& root, int level, const std::array<int, 3>& factors,
+                                                  const std::string& reduction, std::size_t threads,
+                                                  const std::optional<vcr::Index>& begin, const std::optional<vcr::Index>& end) {
+        const auto options = pyramidOptions(level, factors, reduction, threads);
+        std::optional<vcr::zarr::ChunkRange> range;
+        if (begin && end)
+            range = vcr::zarr::ChunkRange{*begin, *end};
+        nb::gil_scoped_release release;
+        vcr::zarr::writePyramidLevel(root, level, options, range);
+    }, "root"_a, "level"_a, "factors"_a, "reduction"_a, "threads"_a, "begin"_a.none(), "end"_a.none());
+    m.def("write_pyramid", [pyramidOptions](const std::string& root, int levels, const std::array<int, 3>& factors,
+                                            const std::string& reduction, std::size_t threads, bool overwrite) {
+        const auto options = pyramidOptions(levels, factors, reduction, threads);
+        nb::gil_scoped_release release;
+        vcr::zarr::writePyramid(root, options, overwrite);
+    }, "root"_a, "levels"_a, "factors"_a, "reduction"_a, "threads"_a, "overwrite"_a);
+    m.def("ome_multiscales", [](const std::string& name, int levels, const std::array<int, 3>& factors, const std::array<double, 3>& scale,
+                                const std::string& unit, const std::string& reduction, const std::array<std::string, 3>& axes) {
+        vcr::zarr::MultiscalesOptions options;
+        options.name = name;
+        options.levels = levels;
+        options.factors = factors;
+        options.scale = scale;
+        options.unit = unit;
+        options.reduction = vcr::zarr::parseReduction(reduction);
+        options.axes = axes;
+        return py_json(vcr::zarr::omeMultiscales(options));
+    }, "name"_a, "levels"_a, "factors"_a, "scale"_a, "unit"_a, "reduction"_a, "axes"_a);
+
     nb::class_<vcr::DiskCache>(m, "DiskCache")
         .def(nb::init<const std::string&, std::int64_t>(), "root"_a, "max_bytes"_a,
              nb::call_guard<nb::gil_scoped_release>())
         .def("set_max_bytes", &vcr::DiskCache::set_max_bytes, nb::call_guard<nb::gil_scoped_release>())
         .def_prop_ro("max_bytes", &vcr::DiskCache::max_bytes, nb::call_guard<nb::gil_scoped_release>())
-        .def("open_file", [](vcr::DiskCache& cache, const std::string& path, const std::string& url,
-                              const AuthTuple& auth, bool offline, bool refresh) {
+        .def("set_min_free_bytes", &vcr::DiskCache::set_min_free_bytes, "bytes"_a)
+        .def_prop_ro("low_space", &vcr::DiskCache::low_space)
+        .def("open_file", [](vcr::DiskCache& cache, const std::string& path, const std::string& location,
+                              const vcr::zarr::Access& access) {
             nb::gil_scoped_release release;
-            return cache.open_file(path, url, to_auth(auth), offline, refresh);
-        }, "path"_a, "url"_a, "auth"_a, "offline"_a, "refresh"_a);
-
-    nb::class_<vcr::ChunkHandle>(m, "ChunkHandle")
-        .def("to_bytes", [](const vcr::ChunkHandle& h) -> nb::object {
-            if (!h.value) return nb::none();
-            return nb::bytes(reinterpret_cast<const char*>(h.value->data()), h.value->size());
-        })
-        .def_static("from_bytes", [](nb::object data) {
-            if (data.is_none()) return vcr::ChunkHandle{};
-            auto b = nb::cast<nb::bytes>(data);
-            const auto* p = static_cast<const std::uint8_t*>(b.data());
-            return vcr::ChunkHandle{std::make_shared<const vcr::Chunk>(p, p + b.size())};
-        }, "data"_a.none());
+            return cache.open_file(path, access.url(location), access.auth);
+        }, "path"_a, "location"_a, "access"_a);
 
     nb::class_<vcr::Array>(m, "Array")
-        .def(
-            "__init__",
-            [](vcr::Array* self, vcr::Index shape, vcr::Index chunks, std::size_t itemsize, nb::bytes fill,
-               std::string separator, std::string identity, std::vector<LayerTuple> layers, int write_layer,
-               std::string remote_url, std::string remote_codec, AuthTuple auth, bool offline,
-               std::string read_mode, bool hint, std::size_t threads, int connections, long stall_timeout_s, int retries,
-               std::shared_ptr<vcr::MemoryCache> cache, std::size_t writer_threads,
-               std::size_t max_pending_write_bytes, std::shared_ptr<vcr::DiskCache> disk_cache,
-               std::string source_root, std::string source_prefix, vcr::Index shard_chunks,
-               bool shard_index_end, bool shard_index_crc) {
-                vcr::ArraySpec spec;
-                spec.shape = std::move(shape);
-                spec.chunks = std::move(chunks);
-                spec.itemsize = itemsize;
-                spec.fill.assign(static_cast<const std::uint8_t*>(fill.data()),
-                                 static_cast<const std::uint8_t*>(fill.data()) + fill.size());
-                spec.separator = std::move(separator);
-                spec.identity = std::move(identity);
-                for (auto& [kind, root, codec, empty_root, allow_lossy] : layers)
-                    spec.layers.push_back({kind, root, codec, empty_root, allow_lossy});
-                spec.write_layer = write_layer;
-                spec.remote_url = std::move(remote_url);
-                spec.remote_codec = std::move(remote_codec);
-                spec.source_root = std::move(source_root);
-                spec.source_prefix = std::move(source_prefix);
-                spec.shard_chunks = std::move(shard_chunks);
-                spec.shard_index_end = shard_index_end;
-                spec.shard_index_crc = shard_index_crc;
-                spec.offline = offline;
-                spec.http.auth = to_auth(auth);
-                spec.read_mode = std::move(read_mode);
-                spec.hint = hint;
-                spec.threads = threads;
-                spec.writer_threads = writer_threads;
-                spec.max_pending_write_bytes = max_pending_write_bytes;
-                spec.disk_cache = std::move(disk_cache);
-                spec.http.connections = connections;
-                spec.http.stall_timeout_s = stall_timeout_s;
-                spec.http.retries = retries;
-                new (self) vcr::Array(std::move(spec), std::move(cache));
-            },
-            "shape"_a, "chunks"_a, "itemsize"_a, "fill"_a, "separator"_a, "identity"_a, "layers"_a,
-            "write_layer"_a = -1, "remote_url"_a = "", "remote_codec"_a = "", "auth"_a = AuthTuple{},
-            "offline"_a = false, "read_mode"_a = "slab",
-            "hint"_a = false, "threads"_a = 16, "connections"_a = 16, "stall_timeout_s"_a = 10,
-            "retries"_a = 5, "cache"_a.none() = nb::none(), "writer_threads"_a = 4,
-            "max_pending_write_bytes"_a = std::size_t{1} << 30, "disk_cache"_a.none() = nb::none(),
-            "source_root"_a = "", "source_prefix"_a = "", "shard_chunks"_a = vcr::Index{},
-            "shard_index_end"_a = true, "shard_index_crc"_a = false)
         .def(
             "read_many",
             [](vcr::Array& a, const std::vector<vcr::Index>& starts, const std::vector<vcr::Index>& sizes,
@@ -440,11 +1080,7 @@ NB_MODULE(_reader, m)
             nb::gil_scoped_release release;
             a.sample_u8_float32(grid,counts[0],order,out.data());
         })
-        .def("load_chunk", &vcr::Array::load_chunk, nb::call_guard<nb::gil_scoped_release>())
-        .def("publish_chunk", &vcr::Array::publish_chunk, nb::call_guard<nb::gil_scoped_release>())
-        .def("set_fetcher", &vcr::Array::set_fetcher)
-        .def("set_auth", [](vcr::Array& a, const AuthTuple& auth) { a.set_auth(to_auth(auth)); }, "auth"_a,
-             "Credentials for later fetches.")
+        .def_prop_ro("threads", &vcr::Array::threads)
         .def("flush", &vcr::Array::flush, nb::call_guard<nb::gil_scoped_release>(),
              "Wait for every queued disk-cache write.")
         .def("stats", [](vcr::Array& a) {
@@ -459,6 +1095,12 @@ NB_MODULE(_reader, m)
             d["remote_bytes"] = s.remote_bytes.load();
             d["write_errors"] = s.write_errors.load();
             d["last_write_error"] = a.last_write_error();
+            d["corrupt"] = s.corrupt.load();
+            d["last_corrupt_chunk"] = a.last_corrupt_chunk();
+            d["offline_misses"] = s.offline_misses.load();
+            d["dropped_writes"] = s.dropped_writes.load();
             return d;
-        });
+        })
+        .def("offline_misses", &vcr::Array::offline_misses,
+             "offline_fill arrays: the chunk-grid indices read as fill because no cache held them.");
 }

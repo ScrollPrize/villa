@@ -3,10 +3,6 @@ from __future__ import annotations
 import math
 
 import numpy as np
-try:
-    from lasagna.omezarr_pyramid import _decode_normals as _lasagna_decode_normals
-except ImportError:  # pragma: no cover - supports PYTHONPATH=lasagna style runs.
-    from omezarr_pyramid import _decode_normals as _lasagna_decode_normals
 
 from vesuvius.neural_tracing.fiber_trace.labels import (
     IGNORE_INDEX,
@@ -15,6 +11,7 @@ from vesuvius.neural_tracing.fiber_trace.labels import (
     NEGATIVE_ONLY_ID,
     POSITIVE_LABEL,
 )
+from vesuvius.neural_tracing.normals import decode_normals
 
 
 def normalize_vector(vec: np.ndarray, *, eps: float = 1e-6) -> np.ndarray:
@@ -128,7 +125,7 @@ def decode_lasagna_normals_xyz(
         raise ValueError(
             f"nx/ny normal shapes must match, got {nx_raw.shape!r} vs {ny_raw.shape!r}"
         )
-    nx, ny, nz = _lasagna_decode_normals(nx_raw, ny_raw)
+    nx, ny, nz = decode_normals(nx_raw, ny_raw)
     normals = np.stack([nx, ny, nz], axis=-1).astype(np.float32, copy=False)
     norms = np.linalg.norm(normals, axis=-1, keepdims=True)
     valid = np.isfinite(normals).all(axis=-1)

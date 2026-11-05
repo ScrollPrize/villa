@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 from pathlib import Path
+import json
 import os
 import pickle
 import random
@@ -11,13 +12,13 @@ import warnings
 import numpy as np
 import pytest
 import torch
-import zarr
+from vc_reader.reader import create_group
 
+from vesuvius.ink_detection import label_zarr
 from vesuvius.ink_detection.config import InkDataConfig
 from vesuvius.ink_detection.data.dataset import InkDataset, flat_z_window_bbox
 from vesuvius.ink_detection.data.geometry import (
     StoredResolutionIndex,
-    catmull_rom_vertex_mask,
     filter_support_bands,
     filter_support_components,
     maybe_select_flat_pixels,
@@ -26,6 +27,7 @@ from vesuvius.ink_detection.data.geometry import (
     project_labels_and_supervision,
     read_tifxyz_on_flat_grid,
     select_flat_pixel_bands_via_stored_resolution,
+    read_normals_on_flat_grid,
     select_flat_pixels_via_stored_resolution,
 )
 from vesuvius.ink_detection.data.patch_cache import (
@@ -47,7 +49,7 @@ from vesuvius.ink_detection.data.segment import (
     parse_label_asset_path,
 )
 from vesuvius.ink_detection.types import Patch, Segment
-from vesuvius.tifxyz import Tifxyz
+from vc_reader import tifxyz as vcr_tifxyz
 from vesuvius.ink_detection.volume_io import (
     open_volume,
     read_bbox_with_padding,
@@ -92,11 +94,8 @@ def _segment(
 
 
 def _write_pyramid(path: Path, array: np.ndarray) -> None:
-    root = zarr.open_group(path, mode="w")
-    if int(zarr.__version__.split(".", 1)[0]) >= 3:
-        root.create_array("0", data=array, chunks=array.shape)
-    else:
-        root.create_dataset("0", data=array, chunks=array.shape)
+    root = create_group(path, overwrite=True)
+    root.create_array("0", shape=array.shape, chunks=array.shape, dtype=array.dtype)[...] = array
 
 
 def test_config_rejects_undefined_subtiling_branch(tmp_path):
@@ -203,6 +202,58 @@ def test_explicit_label_version_requires_matching_required_assets(tmp_path):
     config = _config(tmp_path, label_version="v2")
     with pytest.raises(ValueError, match="matching .zarr labels for version v2"):
         discover_segment_labels(_segment(config, tmp_path))
+
+
+def test_unused_validation_mask_warns_without_changing_selection(tmp_path):
+    segment_dir = tmp_path / "segment-a"
+    segment_dir.mkdir()
+    selected = [
+        segment_dir / "segment-a_inklabels.zarr",
+        segment_dir / "segment-a_supervision_mask.zarr",
+    ]
+    for path in selected:
+        path.mkdir()
+    (segment_dir / "segment_validation_mask_v2.zarr").mkdir()
+    with pytest.warns(UserWarning, match="no validation mask selected"):
+        discovered = discover_segment_labels(_segment(_config(tmp_path), tmp_path))
+    assert discovered.inklabels == selected[0]
+    assert discovered.supervision_mask == selected[1]
+    assert discovered.validation_mask is None
+
+    (segment_dir / "segment-a_validation_mask.zarr").mkdir()
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        discovered = discover_segment_labels(_segment(_config(tmp_path), tmp_path))
+    assert discovered.validation_mask == segment_dir / "segment-a_validation_mask.zarr"
+
+
+def test_validation_mask_with_other_extension_warns_and_names_extension(tmp_path):
+    segment_dir = tmp_path / "segment-a"
+    segment_dir.mkdir()
+    (segment_dir / "segment-a_inklabels.zarr").mkdir()
+    (segment_dir / "segment-a_supervision_mask.zarr").mkdir()
+    (segment_dir / "segment-a_validation_mask.tif").touch()
+    with pytest.warns(UserWarning, match=r"segment-a_<kind>\[_vN\]\.zarr"):
+        discovered = discover_segment_labels(_segment(_config(tmp_path), tmp_path))
+    assert discovered.validation_mask is None
+
+
+def test_explicit_label_version_warns_when_only_other_version_has_validation(tmp_path):
+    segment_dir = tmp_path / "segment-a"
+    segment_dir.mkdir()
+    selected = [
+        segment_dir / "segment-a_inklabels_v1.zarr",
+        segment_dir / "segment-a_supervision_mask_v1.zarr",
+    ]
+    for path in selected:
+        path.mkdir()
+    (segment_dir / "segment-a_validation_mask_v2.zarr").mkdir()
+    config = _config(tmp_path, label_version="v1")
+    with pytest.warns(UserWarning, match="no validation mask selected"):
+        discovered = discover_segment_labels(_segment(config, tmp_path))
+    assert discovered.inklabels == selected[0]
+    assert discovered.supervision_mask == selected[1]
+    assert discovered.validation_mask is None
 
 
 def test_segment_gathering_preserves_remote_and_explicit_volume_paths(tmp_path):
@@ -365,7 +416,32 @@ def test_default_labeled_and_unlabeled_patch_origins(tmp_path):
     assert held_out == []
 
 
-def test_v6_patch_cache_round_trip_and_stale_rejection(tmp_path):
+def _patch_search_counting_mask_reads(tmp_path):
+    config = _config(tmp_path, patch_size=[3, 8, 8], patch_overlap=0.25)
+    segment = replace(
+        _segment(config, tmp_path, image_volume="image"), inklabels=Path("labels"), supervision_mask=Path("supervision")
+    )
+    mask = (np.random.default_rng(0).random((3, 61, 47)) < 0.02).astype(np.uint8)
+    reads = []
+    class Counted(np.ndarray):
+        def __getitem__(self, key):
+            reads.append(key)
+            return np.asarray(self)[key]
+    training, _ = find_segment_patches(segment, lambda path, _: mask.view(Counted))
+    expected = np.unique(np.stack(np.nonzero(mask[1]), axis=1) // 2 * 2, axis=0).tolist()
+    return [list(p.bbox[1:3]) for p in training], expected, reads
+
+
+def test_default_patch_origins_are_every_supported_stride_cell(tmp_path):
+    origins, expected, _ = _patch_search_counting_mask_reads(tmp_path)
+    assert origins == expected
+
+
+def test_default_patch_finding_reads_each_mask_surface_once(tmp_path):
+    assert len(_patch_search_counting_mask_reads(tmp_path)[2]) == 2
+
+
+def test_patch_cache_round_trip_and_stale_rejection(tmp_path):
     config = _config(tmp_path)
     segment = replace(
         _segment(config, tmp_path),
@@ -388,10 +464,54 @@ def test_v6_patch_cache_round_trip_and_stale_rejection(tmp_path):
     assert loaded[0].is_validation
     assert loaded[0].supervision_mask == str(segment.validation_mask)
     assert replace(patch, supervision_mask_override="").supervision_mask == ""
-    assert "v6" in patch_finding_cache_token(config)
+    assert "labeled-default-v7" in patch_finding_cache_token(config)
 
     changed = _config(tmp_path, patch_overlap=0.25)
     assert load_patch_cache(path, config=changed, segments=[segment]) is None
+
+
+def test_default_cache_rejects_old_mixed_depth_coverage(tmp_path):
+    config = _config(tmp_path, patch_overlap=1.0, patch_min_labeled_coverage=0.1)
+    image = np.ones((7, 2, 4), dtype=np.uint8)
+    labels = np.zeros((65, 2, 4), dtype=np.uint8)
+    labels[32] = 255
+    supervision = np.zeros_like(image)
+    supervision[3] = 255
+    validation = np.zeros_like(image)
+    validation[3, :, :2] = 255
+    paths = {}
+    for name, value in (
+        ("image", image),
+        ("labels", labels),
+        ("supervision", supervision),
+        ("validation", validation),
+    ):
+        paths[name] = tmp_path / f"{name}.zarr"
+        _write_pyramid(paths[name], value)
+    segment = replace(
+        _segment(config, tmp_path, image_volume=paths["image"]),
+        inklabels=paths["labels"],
+        supervision_mask=paths["supervision"],
+        validation_mask=paths["validation"],
+    )
+    training, held_out = find_segment_patches(
+        segment, lambda path, scale: open_volume(path, resolution=scale)
+    )
+    assert len(training) == len(held_out) == 1
+
+    # v6 read ink at the supervision midpoint (Z=3), so only validation survived.
+    path = tmp_path / "patches.json"
+    save_patch_cache(path, held_out)
+    records = json.loads(path.read_text())
+    for record in records:
+        record["patch_finding_key"] = "labeled-default-v6-po-1.0-mlc-0.1-pfs-"
+    path.write_text(json.dumps(records))
+    assert load_patch_cache(path, config=config, segments=[segment]) is None
+
+    save_patch_cache(path, training + held_out)
+    loaded = load_patch_cache(path, config=config, segments=[segment])
+    assert loaded is not None
+    assert [patch.is_validation for patch in loaded] == [False, True]
 
 
 def _write_mask(path: Path, chunks: dict[str, bytes]) -> None:
@@ -504,13 +624,6 @@ def test_volume_resolution_padding_and_disk_cache_boundary(tmp_path):
     assert valid == (slice(1, 3), slice(0, 3), slice(0, 2))
     np.testing.assert_array_equal(crop[1:3, :3, :2], array[:2, 1:4, 3:5])
 
-    if int(zarr.__version__.split(".", 1)[0]) < 3:
-        with pytest.raises(
-            NotImplementedError, match="volume disk cache requires zarr 3"
-        ):
-            open_volume(volume_path, 0, cache_dir=tmp_path / "cache")
-        return
-
     cached = open_volume(
         volume_path,
         0,
@@ -518,7 +631,6 @@ def test_volume_resolution_padding_and_disk_cache_boundary(tmp_path):
         cache_max_gb=0.001,
     )
     np.testing.assert_array_equal(cached[:], array)
-    assert any(path.is_file() for path in (tmp_path / "cache").rglob("*"))
 
 
 def test_flat_jitter_and_dataset_sample_are_self_contained(tmp_path, monkeypatch):
@@ -571,39 +683,74 @@ def test_flat_jitter_and_dataset_sample_are_self_contained(tmp_path, monkeypatch
     assert torch.count_nonzero(sample["supervision_mask"][:, :, 0, 0]) == 0
 
 
+def _sampled(origin, step, size):
+    rows = np.round(origin[0] + step[0] * np.arange(size[0])).astype(int)
+    columns = np.round(origin[1] + step[1] * np.arange(size[1])).astype(int)
+    return rows[:, None], columns[None, :]
+
+
+def test_flat_sample_reads_converted_labels_at_their_own_mid_plane(tmp_path):
+    # create_label_zarrs writes 65 label planes; the 9 um surface volumes are 21 or 28 deep.
+    config = _config(tmp_path, patch_size=[3, 2, 2], patch_overlap=1.0)
+    image = np.arange(7 * 2 * 2, dtype=np.uint8).reshape(7, 2, 2)
+    labels = np.zeros((label_zarr.VOLUME_DEPTH, 2, 2), dtype=np.uint8)
+    labels[label_zarr.LABEL_SLICE, 0, :] = 255
+    supervision = np.zeros_like(labels)
+    supervision[label_zarr.LABEL_SLICE] = 255
+    paths = {}
+    for name, value in (("image", image), ("labels", labels), ("supervision", supervision)):
+        paths[name] = tmp_path / f"{name}.zarr"
+        _write_pyramid(paths[name], value)
+    segment = replace(
+        _segment(config, tmp_path, image_volume=paths["image"]),
+        inklabels=paths["labels"],
+        supervision_mask=paths["supervision"],
+    )
+
+    training, _ = find_segment_patches(segment, lambda path, scale: open_volume(path, resolution=scale))
+    assert [patch.bbox for patch in training] == [(2, 0, 0, 5, 2, 2)]  # the image's window
+
+    sample = InkDataset(config, do_augmentations=False, patches=training)[0]
+    np.testing.assert_array_equal(sample["image"][0].numpy(), image[2:5])
+    assert bool(sample["supervision_mask"].amax(dim=1).all())
+    np.testing.assert_array_equal(
+        sample["inklabels"].amax(dim=1)[0].numpy() > 0, [[True, True], [False, False]]
+    )
+
+
 class _FakeTifxyz:
+    scale = (1.0, 1.0)
+
     def __init__(self, positions_zyx: np.ndarray):
         self.positions_zyx = positions_zyx
-        self.full_resolution_shape = positions_zyx.shape[:2]
+        self.xyz = positions_zyx[..., ::-1]
+        self.valid = np.ones(positions_zyx.shape[:2], dtype=bool)
+        self.full_shape = positions_zyx.shape[:2]
 
-    def get_zyxs(self, *, stored_resolution: bool):
-        assert stored_resolution
-        return self.positions_zyx
-
-    def __getitem__(self, index):
-        positions = self.positions_zyx[index]
-        valid = np.ones(positions.shape[:2], dtype=bool)
-        return positions[..., 2], positions[..., 1], positions[..., 0], valid
-
-    def get_normals(self, row_start, row_end, column_start, column_end):
-        shape = row_end - row_start, column_end - column_start
-        return (
-            np.zeros(shape, dtype=np.float32),
-            np.zeros(shape, dtype=np.float32),
-            np.ones(shape, dtype=np.float32),
-        )
+    def resample(self, origin, step, size, *, interpolation, normals=False):
+        rows, columns = _sampled(origin, step, size)
+        xyz = self.xyz[rows, columns]
+        valid = np.ones(xyz.shape[:2], dtype=bool)
+        if normals:
+            # The surface's column x row normal is opposite the ZYX (1, 0, 0) wanted here.
+            out = np.zeros(xyz.shape, dtype=np.float32)
+            out[..., 2] = -1.0
+            return xyz, valid, out
+        return xyz, valid
 
 
 class _PyramidFakeTifxyz:
+    scale = (1.0, 1.0)
+
     def __init__(self, full_positions_zyx: np.ndarray, *, stride: int):
         self.full_positions_zyx = full_positions_zyx
         self.stored_positions_zyx = full_positions_zyx[::stride, ::stride]
-        self.full_resolution_shape = full_positions_zyx.shape[:2]
+        self.full_shape = full_positions_zyx.shape[:2]
 
-    def __getitem__(self, index):
-        positions = self.full_positions_zyx[index]
-        valid = np.ones(positions.shape[:2], dtype=bool)
-        return positions[..., 2], positions[..., 1], positions[..., 0], valid
+    def resample(self, origin, step, size, *, interpolation, normals=False):
+        rows, columns = _sampled(origin, step, size)
+        xyz = self.full_positions_zyx[rows, columns][..., ::-1]
+        return xyz, np.ones(xyz.shape[:2], dtype=bool)
 
 
 def test_ragged_tifxyz_pyramid_refines_to_exact_flat_grid():
@@ -728,9 +875,9 @@ def test_patch_bbox_seeds_only_its_connected_support_component():
 
 def _spiral_tifxyz(
     rng, scale: float, *, shift: float = 0.0, non_finite: bool = True
-) -> Tifxyz:
+) -> vcr_tifxyz.Surface:
     # A sheet wound several times around an axis, with invalid and non-finite
-    # stored points, as a real Tifxyz (Catmull-Rom full resolution).
+    # stored points, as a real surface (smooth patches at full resolution).
     step = 1.0 / scale
     height, width = round(120 * scale), round(1800 * scale)
     rows, columns = np.meshgrid(np.arange(height), np.arange(width), indexing="ij")
@@ -747,10 +894,10 @@ def _spiral_tifxyz(
         x[hole] = y[hole] = z[hole] = -1.0
     if non_finite:
         x[rng.integers(0, height), rng.integers(0, width)] = np.nan
-    return Tifxyz(_x=x, _y=y, _z=z, _scale=(scale, scale)).use_full_resolution()
+    return vcr_tifxyz.Surface(np.stack([x, y, z], axis=-1), scale=(scale, scale))
 
 
-def _rippled_tifxyz(rng, scale: float) -> Tifxyz:
+def _rippled_tifxyz(rng, scale: float) -> vcr_tifxyz.Surface:
     # A sheet with diagonal ripples: a thin crop meets it in slanted stripes
     # whose bounding boxes overlap.
     step = 1.0 / scale
@@ -760,13 +907,13 @@ def _rippled_tifxyz(rng, scale: float) -> Tifxyz:
     y = 20 + rows * step + rng.normal(0, 0.2, rows.shape)
     z = 80 + 40 * np.sin((rows + columns) * step / 26.0)
     x, y, z = (values.astype(np.float32) for values in (x, y, z))
-    return Tifxyz(_x=x, _y=y, _z=z, _scale=(scale, scale)).use_full_resolution()
+    return vcr_tifxyz.Surface(np.stack([x, y, z], axis=-1), scale=(scale, scale))
 
 
 def _spiral_selection(tifxyz, resolution: int) -> dict:
     stride, coordinate_scale, coarse_pad = native_tifxyz_pyramid_params(resolution)
-    coarse = np.asarray(tifxyz.get_zyxs(stored_resolution=True), dtype=np.float32)
-    coarse_valid = np.isfinite(coarse).all(axis=-1) & (coarse >= 0).all(axis=-1)
+    coarse = tifxyz.xyz[..., ::-1]
+    coarse_valid = tifxyz.valid
     return dict(
         coarse_native_pad=coarse_pad,
         coarse_positions_zyx=coarse,
@@ -813,7 +960,7 @@ def test_support_bands_hold_exactly_the_points_of_the_whole_window(
     rng = np.random.default_rng(11)
     tifxyz = surface(rng, scale)
     selection = _spiral_selection(tifxyz, resolution)
-    vertex_mask = catmull_rom_vertex_mask(tifxyz)
+    vertex_mask = tifxyz.valid
     several = 0
     for _ in range(50):
         crop = _random_spiral_crop(
@@ -873,8 +1020,8 @@ def test_support_filter_drops_native_components_without_supervision():
 
 
 def _flat_normals(tifxyz, bbox):
-    nx, ny, nz = tifxyz.get_normals(*bbox)
-    return np.stack([nz, ny, nx], axis=-1).astype(np.float32)
+    y0, y1, x0, x1 = bbox
+    return read_normals_on_flat_grid(tifxyz, y0=y0, y1=y1, x0=x0, x1=x1)
 
 
 @pytest.mark.parametrize("max_distance", [None, 0.0, 3.0, 64.0])
@@ -882,7 +1029,7 @@ def test_support_filter_and_projection_per_band_match_the_whole_window(max_dista
     rng = np.random.default_rng(5)
     tifxyz = _spiral_tifxyz(rng, 0.1)
     selection = _spiral_selection(tifxyz, 0)
-    vertex_mask = catmull_rom_vertex_mask(tifxyz)
+    vertex_mask = tifxyz.valid
     several = dropped = 0
     for _ in range(40):
         crop = _random_spiral_crop(rng)
@@ -1058,7 +1205,7 @@ def test_native_samples_are_the_same_with_and_without_bands(
     segments, surfaces = [], {}
     for name, shift in (("base", 0.0), ("other", 9.0)):
         tifxyz = _spiral_tifxyz(rng, 0.1, shift=shift, non_finite=False)
-        flat_shape = tuple(-(-size // stride) for size in tifxyz.full_resolution_shape)
+        flat_shape = tuple(-(-size // stride) for size in tifxyz.full_shape)
         arrays[f"{name}-ink"] = (rng.random((1, *flat_shape)) < 0.3).astype(np.uint8)
         arrays[f"{name}-supervision"] = (rng.random((1, *flat_shape)) < 0.6).astype(
             np.uint8

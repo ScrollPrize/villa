@@ -477,13 +477,25 @@ The output directory uses the numeric identifier padded to four digits and conta
 └── scroll_summary.csv
 ```
 
-The case label combines the configured collection prefix with the padded scroll identifier. The CSV records the padded identifier, lining-interior height and lining-outer diameter in millimetres.
+The case label combines the configured collection prefix with the padded scroll identifier. The CSV records the padded identifier, lining-interior height and lining-outer diameter in millimetres, and the split rotation in degrees.
+
+A flat fragment (footprint along the case axis at least 1.5 times as long as its least width) has its lining, divider and split turned relative to the square caps so that it is narrowest along y (its long side along x); the split rotation is that turn, anticlockwise about z, and 0 for a scroll. Pass `--narrow-y off` to keep the split where the rotation search leaves it, or `--narrow-y on` to turn any sample; `--narrow-y-min-aspect` sets the threshold. The caps' bolt protrusions move to the pair of sides nearest the turned split.
 
 The generator expands and smooths the mesh, creates the scroll proxy and combines a fitted lining with the two case halves. Provide all three STLs per sample to the 3D-printing company only after verifying them.
 
 Confirm that every input produced three readable, non-empty STLs and one CSV row. Record bounds, connected components, boundary/non-manifold topology, winding consistency, watertightness and visual renders.
 
 The generator uses multiple workers and may finish its parent process even if a worker failed. A zero exit status is therefore insufficient. Require the padded identifier's three expected STLs, a populated `scroll_summary.csv` row, readable finite geometry and sensible assembly renders before accepting the kit. [`photogrammetry-tools/scrollcase_qa.py`](../photogrammetry-tools/) checks these, measures the clearance between the scroll and each half, and writes section and assembly renders.
+
+#### Scan footprint
+
+`scripts/xy_outline.py` projects each scroll along the case axis (z) and outlines the union of the x,y coordinates of its interior:
+
+```bash
+.venv/bin/python scripts/xy_outline.py "$SCROLLCASE_OUTPUT" --output /path/to/xy-outlines
+```
+
+Inputs may be the generator's output directory (searched for `*_scroll.stl`) or individual scroll STLs. The coordinates are those of the case frame: z along the case axis, origin on the axis at the base of the scroll, and the origin at the centre of the smallest circle enclosing the scroll's projection (so a lopsided fragment can look off-centre). +y is marked by the alignment arrow engraved on the bottom cap; the `_right` half lies on the +y side of the split, turned with it by the split rotation in `scroll_summary.csv`. For each scroll it writes `<padded-scroll-number>_xy_outline.csv`, the points of a closed counter-clockwise polyline in order, at most 1 mm apart (`x_mm,y_mm`; the script stops if a projection falls into several pieces), and `<padded-scroll-number>_xy_outline.png` showing the outline over the mesh footprint coloured by height, with the lining's outer circle (the diameter in `scroll_summary.csv`) dashed; `xy_outlines_overview.png` shows all of them. The projection is rasterised on a 0.5 mm grid, so the outline is within about 0.5 mm of the true footprint; use `--margin` to grow it outwards, and `--cell` and `--step` to change the grid and point spacing.
 
 #### Printing
 

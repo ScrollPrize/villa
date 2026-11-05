@@ -1,21 +1,26 @@
 #include "SpiralWorkspace.hpp"
 
+#include <vc_reader/tifxyz.hpp>
+#include <vc_reader/zarr.hpp>
+
 #include "AxisAlignedSliceController.hpp"
 #include "CState.hpp"
 #include "ConsoleOutputWidget.hpp"
 #include "Keybinds.hpp"
 #include "SpiralPanel.hpp"
 #include "SpiralBrushController.hpp"
-#include "SpiralFiberRevisionUpload.hpp"
 #include "SpiralServiceManager.hpp"
 #include "SpiralMinimap.hpp"
 #include "SurfaceOverlayColors.hpp"
 #include "VCSettings.hpp"
+#include "vc/core/util/RemoteCacheSettings.hpp"
 #include "ViewerManager.hpp"
+#include "elements/GrowOnlyLabel.hpp"
 #include "elements/ViewerSplitGrid.hpp"
 #include "overlays/SegmentationOverlayController.hpp"
 #include "overlays/PointsOverlayController.hpp"
 #include "overlays/SpiralOverlayController.hpp"
+#include "overlays/StoreSurfaceOverlayController.hpp"
 #include "overlays/ViewerOverlayControllerBase.hpp"
 #include "volume_viewers/CChunkedVolumeViewer.hpp"
 #include "volume_viewers/CVolumeViewerView.hpp"
@@ -24,10 +29,11 @@
 #include "vc/ui/VCCollection.hpp"
 #include "vc/core/types/VolumePkg.hpp"
 #include "vc/core/util/QuadSurface.hpp"
+#include <vc_object_store/Uuid.hpp>
 #include "vc/lasagna/Dataset.hpp"
 #include "vc/lasagna/Manifest.hpp"
 
-#include <opencv2/imgcodecs.hpp>
+#include "vc/core/util/ImageMat.hpp"
 
 #include <QDialog>
 #include <QDockWidget>
@@ -139,115 +145,49 @@ std::optional<std::array<std::size_t, 3>> parseBaseShapeZYX(
 std::optional<int> omeScaledownForGroup(
     const QString& rootPath, const QString& group, QString* errorMessage)
 {
-    QFile attributesFile(QDir(rootPath).filePath(QStringLiteral(".zattrs")));
-    if (!attributesFile.open(QIODevice::ReadOnly)) {
-        if (errorMessage) *errorMessage = QObject::tr("Cannot read OME metadata at %1")
-            .arg(attributesFile.fileName());
-        return std::nullopt;
-    }
-    QJsonParseError parseError;
-    const QJsonDocument document = QJsonDocument::fromJson(
-        attributesFile.readAll(), &parseError);
-    if (parseError.error != QJsonParseError::NoError || !document.isObject()) {
-        if (errorMessage) *errorMessage = QObject::tr("Malformed OME metadata at %1: %2")
-            .arg(attributesFile.fileName(), parseError.errorString());
-        return std::nullopt;
-    }
-    const QJsonArray multiscales = document.object()
-        .value(QStringLiteral("multiscales")).toArray();
-    if (multiscales.isEmpty()) {
-        if (errorMessage) *errorMessage = QObject::tr("OME multiscales metadata is missing");
-        return std::nullopt;
-    }
-    const QJsonArray datasets = multiscales.at(0).toObject()
-        .value(QStringLiteral("datasets")).toArray();
-    auto datasetScale = [&](const QString& wanted) -> std::optional<double> {
-        for (const QJsonValue& value : datasets) {
-            const QJsonObject dataset = value.toObject();
-            if (dataset.value(QStringLiteral("path")).toString() != wanted) continue;
-            std::optional<double> scale;
-            for (const QJsonValue& transformValue : dataset.value(
-                     QStringLiteral("coordinateTransformations")).toArray()) {
-                const QJsonObject transform = transformValue.toObject();
-                const QString type = transform.value(QStringLiteral("type")).toString();
-                const QJsonArray values = transform.value(type).toArray();
-                if (values.size() != 3) return std::nullopt;
-                if (type == QStringLiteral("translation")) {
-                    for (const QJsonValue& component : values)
-                        if (!component.isDouble() || !std::isfinite(component.toDouble()) ||
-                            std::abs(component.toDouble()) > 1.0e-9) return std::nullopt;
-                } else if (type == QStringLiteral("scale")) {
-                    const double first = values.at(0).toDouble(
-                        std::numeric_limits<double>::quiet_NaN());
-                    if (!std::isfinite(first) || first <= 0.0) return std::nullopt;
-                    for (const QJsonValue& component : values) {
-                        const double current = component.toDouble(
-                            std::numeric_limits<double>::quiet_NaN());
-                        if (!std::isfinite(current) || current <= 0.0 ||
-                            std::abs(current - first) >
-                                1.0e-9 * std::max({1.0, current, first})) return std::nullopt;
-                    }
-                    scale = first;
-                } else return std::nullopt;
-            }
-            return scale;
+    try {
+        const auto scale = vcr::zarr::Group::open(rootPath.toStdString(), vc::settings::remoteOpenOptions(vc3d::remoteCachePathFs()))
+                               .placement(group.toStdString()).scale;
+        const double levelValue = std::log2(scale[0]);
+        const int level = static_cast<int>(std::llround(levelValue));
+        if (scale[1] != scale[0] || scale[2] != scale[0] || level < 0 || level > 30 ||
+            std::abs(levelValue - static_cast<double>(level)) > 1.0e-9) {
+            if (errorMessage) *errorMessage = QObject::tr(
+                "OME scale for group %1 is not a dyadic L0 scale").arg(group);
+            return std::nullopt;
         }
-        return std::nullopt;
-    };
-    const auto baseScale = datasetScale(QStringLiteral("0"));
-    const auto groupScale = datasetScale(group);
-    if (!baseScale || !groupScale) {
-        if (errorMessage) *errorMessage = QObject::tr(
-            "OME scale metadata for groups 0 and %1 is required").arg(group);
+        return level;
+    } catch (const std::exception& error) {
+        if (errorMessage) *errorMessage = QObject::tr("Cannot read OME metadata at %1: %2")
+            .arg(rootPath, QString::fromUtf8(error.what()));
         return std::nullopt;
     }
-    const double levelValue = std::log2(*groupScale / *baseScale);
-    const int level = static_cast<int>(std::llround(levelValue));
-    if (level < 0 || level > 30 || !std::isfinite(levelValue) ||
-        std::abs(levelValue - static_cast<double>(level)) > 1.0e-9) {
-        if (errorMessage) *errorMessage = QObject::tr(
-            "OME scale for group %1 is not a dyadic L0 scale").arg(group);
-        return std::nullopt;
-    }
-    return level;
 }
 
 // Shape of an OME store's level-zero array, the grid its group scaledowns
-// are relative to. Reads the array metadata directly (Zarr v2 ``.zarray`` or
-// v3 ``zarr.json``) so it needs no chunk access.
+// are relative to, from its metadata alone.
 std::optional<std::array<std::size_t, 3>> omeLevelZeroShapeZYX(
     const QString& rootPath, QString* errorMessage)
 {
-    const QDir level(QDir(rootPath).filePath(QStringLiteral("0")));
-    for (const QString& name : {QStringLiteral(".zarray"), QStringLiteral("zarr.json")}) {
-        QFile metadataFile(level.filePath(name));
-        if (!metadataFile.open(QIODevice::ReadOnly)) continue;
-        QJsonParseError parseError;
-        const QJsonDocument document = QJsonDocument::fromJson(
-            metadataFile.readAll(), &parseError);
-        if (parseError.error != QJsonParseError::NoError || !document.isObject()) {
-            if (errorMessage) *errorMessage = QObject::tr("Malformed Zarr metadata at %1: %2")
-                .arg(metadataFile.fileName(), parseError.errorString());
+    try {
+        // Through the caches, under VC's cache settings (a remote store's levels are kept there).
+        const auto options = vc::settings::remoteOpenOptions(vc3d::remoteCachePathFs());
+        for (const auto& level : vcr::zarr::pyramidLevels(rootPath.toStdString(), options)) {
+            if (level.level != 0) continue;
+            if (level.meta.shape.size() == 3 &&
+                std::all_of(level.meta.shape.begin(), level.meta.shape.end(), [](auto size) { return size > 0; }))
+                return std::array<std::size_t, 3>{std::size_t(level.meta.shape[0]), std::size_t(level.meta.shape[1]),
+                                                  std::size_t(level.meta.shape[2])};
+            if (errorMessage) *errorMessage = QObject::tr(
+                "Zarr level zero below %1 must declare a three-axis positive shape").arg(rootPath);
             return std::nullopt;
         }
-        const QJsonArray shape = document.object().value(QStringLiteral("shape")).toArray();
-        std::array<std::size_t, 3> result{};
-        if (shape.size() == 3) {
-            bool valid = true;
-            for (int axis = 0; axis < 3; ++axis) {
-                const double value = shape.at(axis).toDouble(-1.0);
-                if (!(value > 0.0) || value != std::floor(value)) { valid = false; break; }
-                result[axis] = static_cast<std::size_t>(value);
-            }
-            if (valid) return result;
-        }
         if (errorMessage) *errorMessage = QObject::tr(
-            "Zarr metadata at %1 must declare a three-axis positive shape")
-            .arg(metadataFile.fileName());
-        return std::nullopt;
+            "Cannot read level-zero Zarr array metadata below %1").arg(rootPath);
+    } catch (const std::exception& error) {
+        if (errorMessage) *errorMessage = QObject::tr(
+            "Malformed Zarr metadata below %1: %2").arg(rootPath, QString::fromUtf8(error.what()));
     }
-    if (errorMessage) *errorMessage = QObject::tr(
-        "Cannot read level-zero Zarr array metadata below %1").arg(rootPath);
     return std::nullopt;
 }
 
@@ -276,19 +216,28 @@ SpiralWorkspace::SpiralWorkspace(CState* mainState, QWidget* parent)
 {
     setObjectName(QStringLiteral("spiralWorkspaceWindow"));
     setDockOptions(QMainWindow::AnimatedDocks | QMainWindow::AllowNestedDocks | QMainWindow::AllowTabbedDocks);
-    // Regular volume chunks use the process service. Derived surface tiles
-    // remain local to each ViewerManager.
-    _state = new CState(
-        this, _mainState && _mainState->debugDownloadQueueEnabled());
+    // Volumes are opened through the main state's OpenedVolumes.
+    _state = new CState(this, _mainState);
+    connect(_state,&CState::objectStoreChanged,this,[this](const vc::objects::StoreSessionEvent& event) {
+        if(event.kind==vc::objects::StoreSessionEvent::Kind::Attached || event.kind == vc::objects::StoreSessionEvent::Kind::Detached) {
+            cancelLineAnnotationDraft();
+            _trackedFiberPaths.clear();
+        }
+    });
+    connect(_state,&CState::storeRoutesChanged,this,[this]() {
+        cancelLineAnnotationDraft();
+        _trackedFiberPaths.clear();
+    });
+    // Drafts are synced before anything else hears of a surface change.
+    connect(_state, &CState::surfaceChanged, this,
+            [this](std::string, std::shared_ptr<Surface> surface, bool edit) {
+                syncSurfaceDrafts(edit ? std::dynamic_pointer_cast<QuadSurface>(surface) : nullptr);
+            });
+    connect(_state, &CState::volumeChanged, this, [this](std::shared_ptr<Volume>, const std::string&) {
+        clearSurfaceDrafts();
+        syncSurfaceDrafts();
+    });
     _viewerManager = std::make_unique<ViewerManager>(_state, _state->pointCollection(), this);
-    // Spiral can trade some intersection detail for substantially cheaper
-    // input-patch indexing without changing the main workspace preference.
-    _viewerManager->setSurfacePatchSamplingStride(4, false);
-    // The flattened preview is this workspace's primary pane: stop publishing
-    // raw-path chunk demand for frames the SurfaceCache fully serves, so its
-    // tile fills are not starved behind interactive fetches the frame never
-    // reads.
-    _viewerManager->setPreferSurfaceTileFills(true);
     _slices = std::make_unique<AxisAlignedSliceController>(_state, this);
     _slices->setViewerManager(_viewerManager.get());
     // Spiral always uses axis-aligned slices; don't write the user's global
@@ -302,8 +251,12 @@ SpiralWorkspace::SpiralWorkspace(CState* mainState, QWidget* parent)
             });
     _overlay = std::make_unique<SpiralOverlayController>(this);
     _overlay->bindToViewerManager(_viewerManager.get());
+    _storeSurfaceOverlay = std::make_unique<StoreSurfaceOverlayController>(_state, _viewerManager.get(), this);
     _brush = std::make_unique<SpiralBrushController>(this);
-    _brush->setPatchIndexProvider([this]() { return _viewerManager->surfacePatchIndexIfReady(); });
+    _brush->setPatchLocator([this](const QuadSurface& surface, const cv::Vec3f& point, float tolerance) {
+        const auto hit = _viewerManager->locate(surface, point, tolerance);
+        return hit ? std::optional<cv::Vec3f>(hit->ptr) : std::nullopt;
+    });
     _brush->bindToViewerManager(_viewerManager.get());
     _lineDraftOverlay = std::make_unique<SpiralLineDraftOverlay>(this);
     _lineDraftOverlay->bindToViewerManager(_viewerManager.get());
@@ -376,7 +329,7 @@ SpiralWorkspace::SpiralWorkspace(CState* mainState, QWidget* parent)
         settings.setValue(QStringLiteral("spiral/split_y"), _grid->splitY());
     };
 
-    auto* cacheStatsLabel = new QLabel(this);
+    auto* cacheStatsLabel = new GrowOnlyLabel(this);
     cacheStatsLabel->setContentsMargins(8, 0, 8, 0);
     cacheStatsLabel->setText(tr("RAM --  disk --  net --"));
     statusBar()->addPermanentWidget(cacheStatsLabel);
@@ -429,13 +382,8 @@ SpiralWorkspace::SpiralWorkspace(CState* mainState, QWidget* parent)
             });
     connect(_service, &SpiralServiceManager::inputWorkspaceReleased, this, [this]() {
         cancelLineAnnotationDraft();
-        if (_lineAnnotationController)
-            for (const auto& directory : _managedFiberDirectories)
-                _lineAnnotationController->unregisterExternalFiberSource(directory.toStdString());
-        _managedFiberDirectories.clear();
+        _trackedFiberPaths.clear();
         _managedPatchCopies.clear();
-        _inputFiberDirectories.clear();
-        _externalFiberSource.clear();
     });
     connect(_service, &SpiralServiceManager::inputEditorRequested, this,
             [this](const QJsonObject& input, const QString& path) {
@@ -449,20 +397,20 @@ SpiralWorkspace::SpiralWorkspace(CState* mainState, QWidget* parent)
                     _managedPatchCopies[path] = id;
                     emit patchEditorRequested(id, path);
                 } else if (kind == QStringLiteral("fiber") && _lineAnnotationController) {
-                    const auto directory = QFileInfo(path).absolutePath();
-                    const auto previous = _inputFiberDirectories.value(id);
-                    if (!previous.isEmpty() && previous != directory) {
-                        _lineAnnotationController->unregisterExternalFiberSource(previous.toStdString());
-                        _managedFiberDirectories.remove(previous);
+                    auto fiber = _lineAnnotationController->fiberIdForFilePath(path.toStdString());
+                    if (!fiber) {
+                        QString error;
+                        if (!_lineAnnotationController->importFibersFromPath(path.toStdString(), &error)) {
+                            statusBar()->showMessage(tr("Cannot import service fiber: %1").arg(error), 15000);
+                            return;
+                        }
+                        fiber = _lineAnnotationController->fiberIdForFilePath(path.toStdString());
                     }
-                    QString error;
-                    if (_lineAnnotationController->registerExternalFiberSource(directory.toStdString(), &error, true)) {
-                        const auto fiber = _lineAnnotationController->fiberIdForFilePath(path.toStdString());
-                        _inputFiberDirectories[id] = directory;
-                        _externalFiberSource = directory;
-                        _managedFiberDirectories.insert(QDir(directory).absolutePath());
-                        if (fiber) _lineAnnotationController->openFiber(fiber);
-                    } else statusBar()->showMessage(error, 15000);
+                    if (fiber) {
+                        stageFiberInputs({fiber});
+                        _lineAnnotationController->openFiber(fiber);
+                    }
+                    else statusBar()->showMessage(tr("The imported fiber could not be opened."), 15000);
                 } else if (kind == QStringLiteral("pcl")) {
                     const auto role = vc3d::spiral::pclRoleFromName(input.value(QStringLiteral("role")).toString());
                     QFile file(path);
@@ -484,6 +432,7 @@ SpiralWorkspace::SpiralWorkspace(CState* mainState, QWidget* parent)
                 }
             });
     connect(_service, &SpiralServiceManager::inputDraftDiscarded, this, [this](const QString& alias) {
+        _trackedFiberPaths.remove(alias);
         _brush->discardDraft(alias);
         _pendingBrushPatches.remove(alias);
         _pendingPointCollectionPaths.remove(alias);
@@ -680,10 +629,6 @@ SpiralWorkspace::SpiralWorkspace(CState* mainState, QWidget* parent)
         _showSurfaceIntersections = shown;
         updateSurfaceIntersections();
     });
-    connect(_panel, &SpiralPanel::surfaceIntersectionStrideChanged,
-            this, [this](int stride) {
-                _viewerManager->setSurfacePatchSamplingStride(stride, false);
-            });
     connect(_panel, &SpiralPanel::surfaceOverlapChanged, this, [this](bool shown) {
         _showSurfaceOverlap = shown;
         updateSurfaceIntersections();
@@ -782,10 +727,6 @@ SpiralWorkspace::SpiralWorkspace(CState* mainState, QWidget* parent)
                 emit spiralSessionActiveChanged(active);
                 if (active || !_service->inputWorkspaceId().isEmpty()) return;
                 cancelLineAnnotationDraft();
-                if (_lineAnnotationController && !_externalFiberSource.isEmpty())
-                    _lineAnnotationController->unregisterExternalFiberSource(
-                        _externalFiberSource.toStdString());
-                _externalFiberSource.clear();
                 for (auto& state : _pclOverlays) {
                     state.manifestPath.clear();
                     state.baseShapeZYX.reset();
@@ -805,52 +746,11 @@ SpiralWorkspace::SpiralWorkspace(CState* mainState, QWidget* parent)
                 _sessionPaths = paths;
                 _sessionRunConfig = request.value(QStringLiteral("run")).toObject()
                     .value(QStringLiteral("config")).toObject();
-                if (_externalFiberSource.isEmpty()) {
-                const QString fibersServicePath = paths.value(
-                    QStringLiteral("fibers")).toString();
-                const QString sourceFibersPath = fibersServicePath.isEmpty()
-                    ? QString() : mapServicePath(fibersServicePath);
-                QString workingCopyError;
-                const bool savesDrained = !_lineAnnotationController
-                    || _lineAnnotationController->flushFiberSavesForDestinationChange(&workingCopyError);
-                if (!workingCopyError.isEmpty()) statusBar()->showMessage(workingCopyError, 15000);
-                if (!sourceFibersPath.isEmpty() && savesDrained) {
-                    const QPointer<SpiralWorkspace> workspace(this);
-                    const auto fiberGeneration = _lineAnnotationController
-                        ? _lineAnnotationController->fiberDataGeneration() : 0;
-                    _service->workingCopyAsync(sourceFibersPath,
-                        [workspace, sourceFibersPath, fiberGeneration](const QString& localPath, const QString& copyError) {
-                            if (!workspace) return;
-                            if (!copyError.isEmpty()) {
-                                workspace->statusBar()->showMessage(copyError, 15000);
-                                return;
-                            }
-                            auto* controller = workspace->_lineAnnotationController;
-                            if (!controller || !workspace->_externalFiberSource.isEmpty()) return;
-                            QString error;
-                            if (!controller->flushFiberSavesForDestinationChange(&error)
-                                || controller->fiberDataGeneration() != fiberGeneration) {
-                                workspace->_service->invalidateWorkingCopy(sourceFibersPath);
-                                workspace->statusBar()->showMessage(error.isEmpty()
-                                    ? tr("Fibers changed while copying. Reconnect to prepare a fresh working copy.")
-                                    : error, 15000);
-                                return;
-                            }
-                            if (controller->redirectFiberSource(sourceFibersPath.toStdString(),
-                                                               localPath.toStdString(), &error)) {
-                                workspace->_externalFiberSource = localPath;
-                                workspace->_managedFiberDirectories.insert(QDir(localPath).absolutePath());
-                            } else workspace->statusBar()->showMessage(error, 15000);
-                        });
-                }
-                }
                 _previewSource.reset();
                 _previewBaseShapeZYX.reset();
                 _fiberBaseShapeZYX.reset();
                 _previewToFiberBaseScale.reset();
-                _fiberBaseToPreviewFactor.reset();
                 _previewCoordinateError.clear();
-                emit fiberBaseToPreviewFactorChanged(1.0, false);
                 _previewComponents.clear();
                 _previewWindingIds.release();
                 _previewRunDiffImagePath.clear();
@@ -933,16 +833,35 @@ void SpiralWorkspace::loadInputSurfaces(const QJsonObject& servicePaths, quint64
             const QString category = QString::fromLatin1(categoryText);
             const QString rootPath = paths.value(QString::fromLatin1(pathKey)).toString();
             if (rootPath.isEmpty()) continue;
+            // The root is one surface, or holds surfaces: tifxyz directories with their metadata,
+            // which vc_reader lists (a directory missing a coordinate file is not one; malformed
+            // metadata is an entry with an error, skipped with a warning).
             QStringList candidates;
             const QFileInfo root(rootPath);
+            std::vector<vcr::tifxyz::Entry> entries;
             if (root.isDir() && QFileInfo(QDir(rootPath).filePath(QStringLiteral("meta.json"))).isFile()) {
-                candidates.push_back(root.absoluteFilePath());
+                vcr::tifxyz::Entry entry;
+                entry.location = root.absoluteFilePath().toStdString();
+                try {
+                    entry.metadata = vcr::tifxyz::readMetadata(entry.location);
+                } catch (const std::exception& error) {
+                    entry.error = error.what();
+                }
+                entries.push_back(std::move(entry));
             } else if (root.isDir()) {
-                const QFileInfoList children = QDir(rootPath).entryInfoList(
-                    QDir::Dirs | QDir::NoDotAndDotDot, QDir::Name);
-                for (const QFileInfo& child : children)
-                    if (QFileInfo(QDir(child.absoluteFilePath()).filePath(QStringLiteral("meta.json"))).isFile())
-                        candidates.push_back(child.absoluteFilePath());
+                try {
+                    entries = vcr::tifxyz::list(rootPath.toStdString(), false);
+                } catch (const std::exception& error) {
+                    result.warnings.push_back(QObject::tr("Cannot list %1: %2").arg(rootPath, QString::fromUtf8(error.what())));
+                }
+            }
+            for (const auto& entry : entries) {
+                if (!entry.error.empty()) {
+                    result.warnings.push_back(QObject::tr("Skipping %1: %2")
+                                                  .arg(QString::fromStdString(entry.location), QString::fromUtf8(entry.error.c_str())));
+                    continue;
+                }
+                candidates.push_back(QString::fromStdString(entry.location));
             }
             if (candidates.isEmpty()) {
                 result.warnings.push_back(QObject::tr("No TIFXYZ surfaces found for %1 at %2")
@@ -1151,17 +1070,10 @@ void SpiralWorkspace::updateSurfaceIntersections()
 
 void SpiralWorkspace::setLineAnnotationController(LineAnnotationController* controller)
 {
-    if (_lineAnnotationController == controller) return;
-    if (_lineAnnotationController && !_externalFiberSource.isEmpty())
-        _lineAnnotationController->unregisterExternalFiberSource(
-            _externalFiberSource.toStdString());
+    if (_lineAnnotationController) disconnect(_lineAnnotationController, nullptr, this, nullptr);
     _lineAnnotationController = controller;
-    if (_lineAnnotationController && !_externalFiberSource.isEmpty()) {
-        QString error;
-        if (!_lineAnnotationController->registerExternalFiberSource(
-                _externalFiberSource.toStdString(), &error))
-            statusBar()->showMessage(error, 15000);
-    }
+    if (controller) connect(controller, &LineAnnotationController::fibersChanged,
+                            this, &SpiralWorkspace::refreshTrackedFibers);
 }
 
 bool SpiralWorkspace::isFlattenedViewer(const VolumeViewerBase* viewer) const
@@ -1180,21 +1092,14 @@ QString SpiralWorkspace::lineAnnotationDraftUnavailableReason() const
         return _previewCoordinateError.isEmpty()
             ? tr("Spiral preview and fiber coordinates have not been paired")
             : _previewCoordinateError;
-    const QString servicePath = _sessionPaths.value(QStringLiteral("fibers")).toString();
-    const QString localPath = _externalFiberSource;
-    if (localPath.isEmpty())
-        return tr("paths.fibers is unavailable through the current service-path mapping");
-    const QFileInfo info(localPath);
-    const QFileInfo parent(info.absolutePath());
-    if ((info.exists() && (!info.isDir() || !info.isWritable())) ||
-        (!info.exists() && !parent.isWritable()))
-        return tr("The mapped paths.fibers directory is not writable");
     return {};
 }
 
 void SpiralWorkspace::startLineAnnotationDraft()
 {
-    const QString reason = lineAnnotationDraftUnavailableReason();
+    QString reason = lineAnnotationDraftUnavailableReason();
+    if (reason.isEmpty() && !_state->storeFor("fiber"))
+        reason = tr("Open a project before creating fibers");
     if (!reason.isEmpty()) {
         statusBar()->showMessage(reason, 10000);
         return;
@@ -1237,8 +1142,10 @@ void SpiralWorkspace::appendLineAnnotationDraftPoint(
         modifiers != Qt::NoModifier || !_flattenedViewer ||
         _lineAnnotationDraft->surface.get() != _flattenedViewer->currentSurface()) return;
     const cv::Vec2f surface = _flattenedViewer->sceneToSurfaceCoords(scenePoint);
-    if (!std::isfinite(surface[0]) || !std::isfinite(surface[1]) ||
-        !_lineAnnotationDraft->surface->sampleAtSurface({surface[0], surface[1]})) {
+    const cv::Vec2f grid(_lineAnnotationDraft->surface->surfaceToGrid({surface[0], surface[1]}));
+    cv::Vec3f position;
+    _lineAnnotationDraft->surface->pointSurface()->pointsAt(grid.val, 1, position.val, nullptr);
+    if (!std::isfinite(cv::norm(position))) {
         statusBar()->showMessage(tr("Point must lie on valid Spiral surface data"), 5000);
         return;
     }
@@ -1286,7 +1193,7 @@ SpiralWorkspace::resolveFiberBaseShape(QString* errorMessage) const
     for (const QString& candidate : candidates) {
         try {
             const std::string location = candidate.toStdString();
-            const std::string resolved = vc::project::isLocationRemote(location)
+            const std::string resolved = vcr::zarr::isRemote(location)
                 ? location
                 : vc::project::resolveLocalPath(
                       location, vpkg->path().parent_path()).string();
@@ -1317,19 +1224,16 @@ void SpiralWorkspace::updatePreviewCoordinateScale()
 {
     _fiberBaseShapeZYX.reset();
     _previewToFiberBaseScale.reset();
-    _fiberBaseToPreviewFactor.reset();
     _previewCoordinateError.clear();
     if (!_previewBaseShapeZYX) {
         _previewCoordinateError = tr(
             "Spiral preview metadata has no base_shape_zyx; publish a new preview");
-        emit fiberBaseToPreviewFactorChanged(1.0, false);
         return;
     }
     QString error;
     const auto fiberShape = resolveFiberBaseShape(&error);
     if (!fiberShape) {
         _previewCoordinateError = error;
-        emit fiberBaseToPreviewFactorChanged(1.0, false);
         return;
     }
     try {
@@ -1337,13 +1241,10 @@ void SpiralWorkspace::updatePreviewCoordinateScale()
             *_previewBaseShapeZYX, *fiberShape, 5);
         _fiberBaseShapeZYX = fiberShape;
         _previewToFiberBaseScale = previewToFiber;
-        _fiberBaseToPreviewFactor = 1.0 / previewToFiber;
-        emit fiberBaseToPreviewFactorChanged(*_fiberBaseToPreviewFactor, true);
     } catch (const std::exception& ex) {
         _previewCoordinateError = tr(
             "Spiral preview and fiber base shapes are incompatible: %1")
                                       .arg(QString::fromUtf8(ex.what()));
-        emit fiberBaseToPreviewFactorChanged(1.0, false);
     }
 }
 
@@ -1481,15 +1382,17 @@ void SpiralWorkspace::finalizeLineAnnotationDraft()
     std::vector<cv::Vec3d> controls;
     controls.reserve(_lineAnnotationDraft->surfacePoints.size());
     for (const QPointF& point : _lineAnnotationDraft->surfacePoints) {
-        const auto sample = _lineAnnotationDraft->surface->sampleAtSurface({point.x(), point.y()});
-        if (!sample) {
+        const cv::Vec2f grid(_lineAnnotationDraft->surface->surfaceToGrid({point.x(), point.y()}));
+        cv::Vec3f position;
+        _lineAnnotationDraft->surface->pointSurface()->pointsAt(grid.val, 1, position.val, nullptr);
+        if (!std::isfinite(cv::norm(position))) {
             statusBar()->showMessage(tr(
                 "A saved control no longer samples valid preview geometry"), 10000);
             return;
         }
-        controls.emplace_back(sample.volume[0] * previewToFiberBase,
-                              sample.volume[1] * previewToFiberBase,
-                              sample.volume[2] * previewToFiberBase);
+        controls.emplace_back(position[0] * previewToFiberBase,
+                              position[1] * previewToFiberBase,
+                              position[2] * previewToFiberBase);
     }
     for (size_t i = 0; i < controls.size(); ++i) {
         for (size_t j = 0; j < i; ++j) {
@@ -1500,19 +1403,11 @@ void SpiralWorkspace::finalizeLineAnnotationDraft()
             }
         }
     }
-    const QString destinationService = _sessionPaths.value(QStringLiteral("fibers")).toString();
-    const QString destination = _externalFiberSource;
-    if (destination.isEmpty()) {
-        statusBar()->showMessage(tr(
-            "paths.fibers is unavailable through the current path mapping"), 15000);
-        return;
-    }
     _lineAnnotationDraft->optimizing = true;
     statusBar()->showMessage(tr("Optimizing 2D line annotation…"));
     LineAnnotationController::HeadlessFiberOptimizationRequest request;
     request.controlPointsL0 = std::move(controls);
     request.inputs = std::move(*inputs);
-    request.destinationFiberSource = destination.toStdString();
     const auto saveAllowed = _lineAnnotationDraft->saveAllowed;
     request.shouldSave = [saveAllowed]() { return saveAllowed && saveAllowed->load(); };
     QPointer<SpiralWorkspace> self(this);
@@ -1527,16 +1422,12 @@ void SpiralWorkspace::finalizeLineAnnotationDraft()
                 return;
             }
             self->cancelLineAnnotationDraft();
+            self->stageFiberInputs({fiberId});
             if (self->_lineAnnotationController)
                 self->_lineAnnotationController->openFiber(fiberId);
             self->statusBar()->showMessage(
                 self->tr("Saved 2D line annotation as a local draft"), 10000);
         });
-}
-
-bool SpiralWorkspace::hasActiveSpiralSession() const
-{
-    return _service && _service->hasActiveSession();
 }
 
 void SpiralWorkspace::addPatchToCurrentFit(
@@ -1550,57 +1441,47 @@ void SpiralWorkspace::addPatchToCurrentFit(
     _service->applyInputDrafts();
 }
 
-void SpiralWorkspace::addFiberToCurrentFit(const QString& fiberJsonPath)
+void SpiralWorkspace::addFibersToCurrentFit(const std::vector<uint64_t>& fiberIds)
+{
+    if (stageFiberInputs(fiberIds)) _service->applyInputDrafts();
+}
+
+bool SpiralWorkspace::stageFiberInputs(const std::vector<uint64_t>& fiberIds)
+{
+    if (!_service || !_lineAnnotationController || fiberIds.empty()) return false;
+    try {
+        const auto paths = _lineAnnotationController->fiberTransportPaths(fiberIds);
+        for (const auto& [uuid, path] : paths) {
+            const auto id = QString::fromStdString(uuid);
+            const auto source = QString::fromStdString(path.string());
+            if (_trackedFiberPaths.value(id) == source) continue;
+            _trackedFiberPaths[id] = source;
+            _service->stageJsonInput(QStringLiteral("fiber"), source, id);
+        }
+        return true;
+    } catch (const std::exception& error) {
+        statusBar()->showMessage(QString::fromUtf8(error.what()), 15000);
+        return false;
+    }
+}
+
+void SpiralWorkspace::refreshTrackedFibers()
+{
+    if (!_service || !_lineAnnotationController || _trackedFiberPaths.isEmpty()) return;
+    std::vector<uint64_t> ids;
+    for (const auto& uuid : _trackedFiberPaths.keys()) {
+        const auto id = _lineAnnotationController->fiberIdForUuid(uuid.toStdString());
+        if (id && _lineAnnotationController->fiberPin(id)) ids.push_back(id);
+        else noteFiberRetired(uuid);
+    }
+    stageFiberInputs(ids);
+}
+
+void SpiralWorkspace::noteFiberRetired(const QString& objectUuid)
 {
     if (!_service) return;
-    const auto inputId = vc3d::spiralFiberInputId(fiberJsonPath);
-    if (inputId.isEmpty()) return;
-    _service->stageJsonInput(QStringLiteral("fiber"), fiberJsonPath, inputId);
-    _service->applyInputDrafts();
-}
-
-void SpiralWorkspace::noteTrackedFiberSaved(uint64_t, const QString& fiberJsonPath)
-{
-    if (!_service || !hasActiveSpiralSession()) return;
-    if (!_managedFiberDirectories.contains(QFileInfo(fiberJsonPath).absolutePath())) return;
-    const QString inputId = vc3d::spiralFiberInputId(fiberJsonPath);
-    if (!inputId.isEmpty())
-        _service->stageJsonInput(QStringLiteral("fiber"), fiberJsonPath, inputId);
-}
-
-void SpiralWorkspace::noteFiberRemoved(const QString& path)
-{
-    if (!_service || !_managedFiberDirectories.contains(QFileInfo(path).absolutePath())) return;
-    const auto alias = QFileInfo(path).completeBaseName();
-    for (const auto& value : _service->inputDraftStatus()) {
-        const auto input = value.toObject();
-        if (input.value(QStringLiteral("kind")).toString() == QStringLiteral("fiber")
-            && (QFileInfo(input.value(QStringLiteral("source")).toString()).completeBaseName() == alias
-                || input.value(QStringLiteral("name")).toString() == alias))
-            _service->removeInputDraft(input.value(QStringLiteral("id")).toString());
-    }
-}
-
-bool SpiralWorkspace::stageManagedPatchRemoval(const std::shared_ptr<QuadSurface>& surface)
-{
-    if (!_service || !surface || surface->path.empty()) return false;
-    const auto path = QString::fromStdString(surface->path.string());
-    QString id = _managedPatchCopies.value(path);
-    if (id.isEmpty()) {
-        for (const auto& value : _service->inputDraftStatus()) {
-            const auto input = value.toObject();
-            if (input.value(QStringLiteral("kind")).toString() == QStringLiteral("patch")
-                && QFileInfo(mapServicePath(input.value(QStringLiteral("source")).toString())).canonicalFilePath()
-                    == QFileInfo(path).canonicalFilePath()) {
-                id = input.value(QStringLiteral("id")).toString();
-                break;
-            }
-        }
-    }
-    if (id.isEmpty()) return false;
-    _service->removeInputDraft(id);
-    statusBar()->showMessage(tr("Patch removal staged. Apply removes supervision; Commit deletes dataset files."), 15000);
-    return true;
+    _trackedFiberPaths.remove(objectUuid);
+    _service->removeInputDraft(objectUuid);
 }
 
 bool SpiralWorkspace::prepareManagedPatch(const std::shared_ptr<QuadSurface>& surface)
@@ -1621,12 +1502,6 @@ bool SpiralWorkspace::prepareManagedPatch(const std::shared_ptr<QuadSurface>& su
         return true;
     }
     return true;
-}
-
-void SpiralWorkspace::noteManagedPatchSaved(const QString& path)
-{
-    if (!_managedPatchCopies.contains(path)) return;
-    _service->stagePatch(path, _managedPatchCopies.value(path));
 }
 
 QString SpiralWorkspace::provisionalBrushRoot() const
@@ -1804,11 +1679,7 @@ void SpiralWorkspace::discardBrushWork()
 
 void SpiralWorkspace::requestSessionExit(std::function<void()> continuation)
 {
-    QString saveError;
-    if (_lineAnnotationController && !_lineAnnotationController->flushFiberSavesForDestinationChange(&saveError)) {
-        statusBar()->showMessage(saveError, 15000);
-        return;
-    }
+    _state->objectStoreSession()->finalize();
     auto exit = [this, continuation]() { _service->releaseInputWorkspace(continuation); };
     if (!hasPendingBrushWork()) {
         exit();
@@ -1866,10 +1737,6 @@ SpiralWorkspace::~SpiralWorkspace()
 {
     _shuttingDown = true;
     cancelLineAnnotationDraft();
-    if (_lineAnnotationController && !_externalFiberSource.isEmpty())
-        _lineAnnotationController->unregisterExternalFiberSource(
-            _externalFiberSource.toStdString());
-    if (_viewerManager) _viewerManager->beginShutdown();
     // Disconnecting never terminates a service VC3D did not launch; only an
     // owned local process is stopped.
     if (_service) _service->disconnectFromService();
@@ -1922,7 +1789,6 @@ void SpiralWorkspace::mirrorFocusToMainWorkspace(const cv::Vec3f& position)
     focus->p = position;
     focus->surfacePtr.reset();
     focus->suppressViewerRecenter = false;
-    focus->suppressTransientPlaneIntersections = true;
     _mainState->setPOI("focus", focus);
 }
 
@@ -1958,7 +1824,7 @@ QComboBox* SpiralWorkspace::volumeSelectionControl() const
 
 void SpiralWorkspace::synchronizeVolume(
     const std::shared_ptr<Volume>& volume,
-    const std::optional<cv::Matx44d>& navigationTransform)
+    const std::optional<vcr::catalog::Affine>& navigationTransform)
 {
     const auto package = _mainState ? _mainState->vpkg() : nullptr;
     if (_state->vpkg() != package) {
@@ -2005,7 +1871,6 @@ SpiralWorkspace::parseLossMaps(const QJsonObject& manifest,
         map.p50 = entry.value(QStringLiteral("p50")).toDouble();
         map.p95 = entry.value(QStringLiteral("p95")).toDouble();
         map.maximum = entry.value(QStringLiteral("maximum")).toDouble();
-        map.displayMaximum = entry.value(QStringLiteral("display_maximum")).toDouble();
         map.sampleCount = entry.value(QStringLiteral("sample_count")).toInteger();
         map.eligibleSampleCount = entry.contains(QStringLiteral("eligible_sample_count"))
             ? entry.value(QStringLiteral("eligible_sample_count")).toInteger()
@@ -2099,8 +1964,11 @@ void SpiralWorkspace::loadPreview(const QString& manifestPath, qint64 generation
             || windingMapName.startsWith(QStringLiteral("../")))
             return failure(QObject::tr("Invalid Spiral winding-ID map path"));
         const QString windingMapPath = QDir(artifactRoot).filePath(windingMapName);
-        cv::Mat windingImage = cv::imread(
-            windingMapPath.toStdString(), cv::IMREAD_UNCHANGED);
+        cv::Mat windingImage;
+        try {
+            windingImage = vc::core::util::imageMat(vcr::sources::readImagePage(std::filesystem::path(windingMapPath.toStdString()).string(), 0));
+        } catch (const std::exception&) {
+        }
         if (windingImage.empty() || windingImage.channels() != 1)
             return failure(QObject::tr("Cannot read Spiral winding-ID map"));
         cv::Mat windingValues;
@@ -2155,10 +2023,14 @@ void SpiralWorkspace::loadPreview(const QString& manifestPath, qint64 generation
                     "Spiral winding bounds do not match the winding-ID map"));
         }
 
-        QFile metadata(QDir(surfacePath).filePath(QStringLiteral("meta.json")));
-        if (!metadata.open(QIODevice::ReadOnly))
+        QJsonObject meta;
+        try {
+            // The surface's metadata as vc_reader reads it; the compared fields are its extras.
+            const auto extra = vcr::tifxyz::readMetadata(surfacePath.toStdString()).extra.dump();
+            meta = QJsonDocument::fromJson(QByteArray::fromStdString(extra)).object();
+        } catch (const std::exception&) {
             return failure(QObject::tr("Spiral preview surface metadata is missing"));
-        const QJsonObject meta = QJsonDocument::fromJson(metadata.readAll()).object();
+        }
         if (meta.value(QStringLiteral("winding_id_map"))
                 != manifest.value(QStringLiteral("winding_id_map"))
             || meta.value(QStringLiteral("winding_bounds"))
@@ -2179,7 +2051,6 @@ void SpiralWorkspace::loadPreview(const QString& manifestPath, qint64 generation
             // compact display surface.
             auto surface = std::make_shared<QuadSurface>(surfacePath.toStdString());
             surface->id = surfaceId.toStdString();
-            surface->setStrictQuadRenderValidity(true);
             const cv::Size gridSize = surface->gridSize();
             const QJsonArray gridShape =
                 manifest.value(QStringLiteral("grid_shape")).toArray();
@@ -2675,8 +2546,7 @@ void SpiralWorkspace::panFlattenedViewerToColumn(float column)
     const cv::Vec2f viewCenter = _flattenedViewer->sceneToSurfaceCoords(
         view->mapToScene(view->viewport()->rect().center()));
     const float surfaceX = column / scale[0] - center[0];
-    _flattenedViewer->centerOnSurfacePoint(cv::Vec2f(surfaceX, viewCenter[1]),
-                                           true);
+    _flattenedViewer->centerOnSurfacePoint(cv::Vec2f(surfaceX, viewCenter[1]));
 }
 
 void SpiralWorkspace::updateWindingTransitionOverlay()
@@ -2789,9 +2659,7 @@ void SpiralWorkspace::applyPreviewWindingRange(bool preserveFocus)
                 }
                 _state->setSurface(selection.registrationId.toStdString(),
                                    preview);
-                installPreviewAliasWhenIndexed(
-                    preview, selection.registrationId, generation, revision,
-                    preserveFocus, 0);
+                installPreviewAlias(preview, selection.registrationId, generation, revision, preserveFocus);
             });
     watcher->setFuture(QtConcurrent::run(
         [source, selection = *selection, region, windingRegion]() {
@@ -2814,7 +2682,6 @@ void SpiralWorkspace::applyPreviewWindingRange(bool preserveFocus)
                 cv::Mat windingDepth;
                 windingRegion.convertTo(windingDepth, CV_32F);
                 loaded->setChannel("d", windingDepth);
-                loaded->setStrictQuadRenderValidity(true);
                 return std::shared_ptr<QuadSurface>(std::move(loaded));
             } catch (const std::exception&) {
                 return std::shared_ptr<QuadSurface>{};
@@ -2822,9 +2689,9 @@ void SpiralWorkspace::applyPreviewWindingRange(bool preserveFocus)
         }));
 }
 
-void SpiralWorkspace::installPreviewAliasWhenIndexed(
+void SpiralWorkspace::installPreviewAlias(
     const std::shared_ptr<QuadSurface>& preview, const QString& registrationId,
-    qint64 generation, quint64 revision, bool preserveFocus, int attempt)
+    qint64 generation, quint64 revision, bool preserveFocus)
 {
     const bool stale = _shuttingDown || generation != _requestedPreviewGeneration
                        || revision != _previewDisplayRevision;
@@ -2835,25 +2702,8 @@ void SpiralWorkspace::installPreviewAliasWhenIndexed(
         return;
     }
     if (_brush->dragging()) {
-        QTimer::singleShot(50, this, [this, preview, registrationId, generation,
-                                     revision, preserveFocus, attempt]() {
-            installPreviewAliasWhenIndexed(preview, registrationId, generation, revision,
-                                           preserveFocus, attempt);
-        });
-        return;
-    }
-    auto* index = _viewerManager->surfacePatchIndexIfReady();
-    if (!index || !index->containsSurface(preview)) {
-        if (attempt >= 600) {
-            if (_state->surface(registrationId.toStdString()) == preview)
-                _state->setSurface(registrationId.toStdString(), nullptr);
-            statusBar()->showMessage(tr("Timed out indexing the new Spiral preview; keeping the previous preview"), 15000);
-            return;
-        }
-        QTimer::singleShot(50, this, [this, preview, registrationId, generation,
-                                     revision, preserveFocus, attempt]() {
-            installPreviewAliasWhenIndexed(preview, registrationId, generation, revision,
-                                           preserveFocus, attempt + 1);
+        QTimer::singleShot(50, this, [this, preview, registrationId, generation, revision, preserveFocus]() {
+            installPreviewAlias(preview, registrationId, generation, revision, preserveFocus);
         });
         return;
     }
@@ -2873,8 +2723,6 @@ void SpiralWorkspace::installPreviewAliasWhenIndexed(
     initializePreviewFocus();
     updateSurfaceIntersections();
     for (auto* viewer : _viewerManager->baseViewers()) if (viewer) {
-        viewer->invalidateIntersect("segmentation");
-        viewer->renderIntersections("Spiral preview installed");
         viewer->requestRender("Spiral preview installed");
     }
     if (!previousRegistration.isEmpty() && previousRegistration != registrationId) {
@@ -2884,6 +2732,51 @@ void SpiralWorkspace::installPreviewAliasWhenIndexed(
         else
             _state->setSurface(previousRegistration.toStdString(), nullptr);
     }
+}
+
+void SpiralWorkspace::syncSurfaceDrafts(const std::shared_ptr<QuadSurface>& edited)
+{
+    const auto session = _state ? _state->objectStoreSession() : nullptr;
+    if (!session) {
+        return;
+    }
+    const auto& volume = _state->annotationVolume();
+    std::set<std::string> shown;
+    if (volume) {
+        for (const auto& surface : _state->surfaces()) {
+            const auto quad = std::dynamic_pointer_cast<QuadSurface>(surface);
+            if (!quad) {
+                continue;
+            }
+            if (!vc::objects::util::isUuid(quad->id)) {
+                quad->id = vc::objects::util::newUuid();
+            }
+            if (!shown.insert(quad->id).second) {
+                continue;
+            }
+            auto& drafted = _surfaceDrafts[quad->id];
+            if (drafted.lock() == quad && quad != edited) {
+                continue;
+            }
+            session->setDraft(quad->id, quad_surface_grid(*quad), vc::objects::volumeCoordinates(*volume));
+            drafted = quad;
+        }
+    }
+    for (auto it = _surfaceDrafts.begin(); it != _surfaceDrafts.end();) {
+        if (shown.contains(it->first)) {
+            ++it;
+            continue;
+        }
+        session->clearDraft(it->first);
+        it = _surfaceDrafts.erase(it);
+    }
+}
+
+void SpiralWorkspace::clearSurfaceDrafts()
+{
+    if (const auto session = _state ? _state->objectStoreSession() : nullptr)
+        for (const auto& [uuid, surface] : _surfaceDrafts) session->clearDraft(uuid);
+    _surfaceDrafts.clear();
 }
 
 void SpiralWorkspace::pruneBrushPreviewSurfaces()

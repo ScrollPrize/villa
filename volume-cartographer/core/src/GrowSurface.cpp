@@ -1,21 +1,21 @@
+#include <vc_reader/sampling.hpp>
+#include <shared_mutex>
 #include <omp.h>
 
 
-#include <opencv2/imgcodecs.hpp>
+#include "vc/core/util/ImageMat.hpp"
 #include <opencv2/core.hpp>
 #include <opencv2/imgproc.hpp>
 
-#include "vc/core/util/Slicing.hpp"
 #include "vc/core/util/Geometry.hpp"
-#include "vc/core/util/PointIndex.hpp"
+#include <vc_object_store/geometry/VertexIndex.hpp>
 #include "vc/core/util/QuadSurface.hpp"
 #include "vc/core/util/SurfaceArea.hpp"
-#include "vc/core/util/SurfacePatchIndex.hpp"
+#include "vc/core/util/SurfaceQuerySet.hpp"
 #include "vc/tracer/SurfaceModeling.hpp"
 #include "vc/core/util/OMPThreadPointCollection.hpp"
 #include "vc/core/util/DateTime.hpp"
 #include "vc/core/util/HashFunctions.hpp"
-#include "vc/core/types/ChunkedTensor.hpp"
 
 #include "growth_strategies/CandidateOrdering.hpp"
 #include "growth_strategies/GrowthConfig.hpp"
@@ -23,7 +23,7 @@
 
 #include "vc/core/util/LifeTime.hpp"
 #include "vc/tracer/Tracer.hpp"
-#include "utils/Json.hpp"
+#include <nlohmann/json.hpp>
 
 #include <nlohmann/json.hpp>
 
@@ -49,15 +49,7 @@ using vec2i_hash = std::vec2i_hash;
 
 namespace {
 
-static nlohmann::json json_from_utils(const utils::Json& json)
-{
-    return nlohmann::json::parse(json.dump());
-}
 
-static utils::Json json_to_utils(const nlohmann::json& json)
-{
-    return utils::Json::parse(json.dump());
-}
 
 static cv::Rect scaled_rect_trunc(const cv::Rect& rect, float scale)
 {
@@ -67,23 +59,6 @@ static cv::Rect scaled_rect_trunc(const cv::Rect& rect, float scale)
         static_cast<int>(rect.width * scale),
         static_cast<int>(rect.height * scale)
     };
-}
-
-static cv::Rect valid_points_bounds(const cv::Mat_<cv::Vec3d>& points)
-{
-    cv::Rect bounds;
-    bool have_valid = false;
-    for (int y = 0; y < points.rows; ++y) {
-        for (int x = 0; x < points.cols; ++x) {
-            if (points(y, x)[0] == -1) {
-                continue;
-            }
-            const cv::Rect cell(x, y, 1, 1);
-            bounds = have_valid ? (bounds | cell) : cell;
-            have_valid = true;
-        }
-    }
-    return bounds;
 }
 
 static std::string surface_name(const QuadSurface* surf)
@@ -104,7 +79,7 @@ static bool looks_like_resume_surface(const QuadSurface* surf, const nlohmann::j
         return false;
     }
 
-    const nlohmann::json meta = json_from_utils(surf->meta);
+    const nlohmann::json meta = (surf->meta);
     if (meta.contains("vc_grow_seg_from_segments_params")) {
         return true;
     }
@@ -371,42 +346,16 @@ static int remove_components_disconnected_from_seed(SurfTrackerData& data,
     return removed;
 }
 
-static std::set<QuadSurface*> surface_patch_candidates(SurfacePatchIndex* surface_patch_index,
-                                                       const cv::Vec3d& coord,
-                                                       QuadSurface* exclude = nullptr)
-{
-    std::set<QuadSurface*> candidates;
-    if (!surface_patch_index || surface_patch_index->empty() || coord[0] == -1) {
-        return candidates;
-    }
-
-    SurfacePatchIndex::PointQuery query;
-    query.worldPoint = {
-        static_cast<float>(coord[0]),
-        static_cast<float>(coord[1]),
-        static_cast<float>(coord[2])
-    };
-    query.tolerance = same_surface_th;
-
-    for (const auto& surface : surface_patch_index->locateSurfaces(query)) {
-        QuadSurface* raw = surface.get();
-        if (raw && raw != exclude) {
-            candidates.insert(raw);
-        }
-    }
-    return candidates;
-}
-
-static std::vector<SurfacePatchIndex::LookupResult> surface_patch_hits(SurfacePatchIndex* surface_patch_index,
+static std::vector<SurfaceQuerySet::LookupResult> surface_patch_hits(SurfaceQuerySet* surface_patch_index,
                                                                        const cv::Vec3d& coord,
                                                                        QuadSurface* exclude = nullptr)
 {
-    std::vector<SurfacePatchIndex::LookupResult> hits;
+    std::vector<SurfaceQuerySet::LookupResult> hits;
     if (!surface_patch_index || surface_patch_index->empty() || coord[0] == -1) {
         return hits;
     }
 
-    SurfacePatchIndex::PointQuery query;
+    SurfaceQuerySet::PointQuery query;
     query.worldPoint = {
         static_cast<float>(coord[0]),
         static_cast<float>(coord[1]),
@@ -426,14 +375,14 @@ static std::vector<SurfacePatchIndex::LookupResult> surface_patch_hits(SurfacePa
 static int add_surface_patch_candidates(const cv::Vec2i& p,
                                         const cv::Vec3d& coord,
                                         SurfTrackerData& data,
-                                        SurfacePatchIndex* surface_patch_index,
+                                        SurfaceQuerySet* surface_patch_index,
                                         QuadSurface* exclude = nullptr)
 {
     if (!surface_patch_index || surface_patch_index->empty() || coord[0] == -1) {
         return 0;
     }
 
-    SurfacePatchIndex::PointQuery query;
+    SurfaceQuerySet::PointQuery query;
     query.worldPoint = {
         static_cast<float>(coord[0]),
         static_cast<float>(coord[1]),
@@ -609,7 +558,7 @@ static int add_surftrack_surfloss(QuadSurface *sm, const cv::Vec2i& p, SurfTrack
     if ((state(p) & STATE_LOC_VALID) == 0 || !data.valid_int(sm, p))
         return 0;
 
-    ceres::ResidualBlockId tmp = problem.AddResidualBlock(SurfaceLossD::Create(sm->rawPoints(), w), nullptr,
+    ceres::ResidualBlockId tmp = problem.AddResidualBlock(SurfaceLossD::Create(sm->pointSurface(), w), nullptr,
                                                           &points(p)[0], &data.loc(sm, p)[0]);
 
     if (res)
@@ -691,8 +640,8 @@ static int surftrack_add_local(QuadSurface *sm, const cv::Vec2i& p, SurfTrackerD
     }
 
     if (flags & LOSS_ZLOC)
-        problem.AddResidualBlock(ZLocationLoss<cv::Vec3f>::Create(
-            sm->rawPoints(),
+        problem.AddResidualBlock(ZLocationLoss::Create(
+            sm->pointSurface(),
             data.seed_coord[2] - (p[0]-data.seed_loc[0])*step*src_step, z_loc_loss_w),
             new ceres::HuberLoss(1.0), &data.loc(sm, p)[0]);
 
@@ -867,6 +816,7 @@ static cv::Mat_<cv::Vec3d> surftrack_genpoints_hr(SurfTrackerData &data, cv::Mat
     cv::Mat_<cv::Vec3f> points_hr(hr_rows, hr_cols, {0,0,0});
     cv::Mat_<int> counts_hr(hr_rows, hr_cols, 0);
     cv::Mat_<uint8_t> rejected_hr(hr_rows, hr_cols, static_cast<uint8_t>(0));
+    const auto inputSurface = QuadSurface(points, {1, 1}).pointSurface();
     const double sample_outlier_dist = std::max<double>(step_src * 3.0, step * step_src);
     const double sample_outlier_dist_sq = sample_outlier_dist * sample_outlier_dist;
     for(int j=used_area.y;j<used_area.br().y-1;j++)
@@ -876,10 +826,12 @@ static cv::Mat_<cv::Vec3d> surftrack_genpoints_hr(SurfTrackerData &data, cv::Mat
                 && state(j+1,i) & (STATE_LOC_VALID|STATE_COORD_VALID)
                 && state(j+1,i+1) & (STATE_LOC_VALID|STATE_COORD_VALID))
             {
-            const cv::Vec3d& c00 = points(j,i);
-            const cv::Vec3d& c01 = points(j,i+1);
-            const cv::Vec3d& c10 = points(j+1,i);
-            const cv::Vec3d& c11 = points(j+1,i+1);
+            const auto position = [&](float fx, float fy) {
+                const float xy[]{float(i) + fx, float(j) + fy};
+                cv::Vec3f out;
+                inputSurface->pointsAt(xy, 1, out.val, nullptr);
+                return cv::Vec3d(out);
+            };
             for(auto &sm : data.surfsC({j,i})) {
                 if (data.valid_int(sm,{j,i})
                     && data.valid_int(sm,{j,i+1})
@@ -895,13 +847,10 @@ static cv::Mat_<cv::Vec3d> surftrack_genpoints_hr(SurfTrackerData &data, cv::Mat
                         for(int sx=0;sx<=step;sx++) {
                             float fx = sx/step;
                             float fy = sy/step;
-                            cv::Vec2f l0 = (1-fx)*l00 + fx*l01;
-                            cv::Vec2f l1 = (1-fx)*l10 + fx*l11;
-                            cv::Vec2f l = (1-fy)*l0 + fy*l1;
+                            // Interpolate the correspondence parameters, then evaluate the bicubic XYZ surface.
+                            const cv::Vec2f l = vcr::sampling::bilinear(l00, l01, l10, l11, fx, fy);
                             if (loc_valid(sm->rawPoints(), l)) {
-                                cv::Vec3d c0 = (1-fx)*c00 + fx*c01;
-                                cv::Vec3d c1 = (1-fx)*c10 + fx*c11;
-                                cv::Vec3d expected = (1-fy)*c0 + fy*c1;
+                                const cv::Vec3d expected = position(fx, fy);
                                 cv::Vec3d sample = SurfTrackerData::lookup_int_loc(sm,l);
                                 const cv::Vec3d delta = sample - expected;
                                 const int y = j*step+sy;
@@ -924,9 +873,7 @@ static cv::Mat_<cv::Vec3d> surftrack_genpoints_hr(SurfTrackerData &data, cv::Mat
                     if (!counts_hr(y,x) && rejected_hr(y,x)) {
                         float fx = sx/step;
                         float fy = sy/step;
-                        cv::Vec3d c0 = (1-fx)*c00 + fx*c01;
-                        cv::Vec3d c1 = (1-fx)*c10 + fx*c11;
-                        cv::Vec3d c = (1-fy)*c0 + fy*c1;
+                        const cv::Vec3d c = position(fx, fy);
                         points_hr(y,x) = c;
                         counts_hr(y,x) = 1;
                     }
@@ -937,9 +884,7 @@ static cv::Mat_<cv::Vec3d> surftrack_genpoints_hr(SurfTrackerData &data, cv::Mat
                         if (!counts_hr(j*step+sy,i*step+sx)) {
                             float fx = sx/step;
                             float fy = sy/step;
-                            cv::Vec3d c0 = (1-fx)*c00 + fx*c01;
-                            cv::Vec3d c1 = (1-fx)*c10 + fx*c11;
-                            cv::Vec3d c = (1-fy)*c0 + fy*c1;
+                            const cv::Vec3d c = position(fx, fy);
                             points_hr(j*step+sy,i*step+sx) = c;
                             counts_hr(j*step+sy,i*step+sx) = 1;
                         }
@@ -995,7 +940,7 @@ static cv::Mat_<uint16_t> surftrack_generations_hr(const cv::Mat_<uint8_t>& stat
 static void optimize_surface_mapping(SurfTrackerData &data, cv::Mat_<uint8_t> &state, cv::Mat_<cv::Vec3d> &points, cv::Rect used_area,
     cv::Rect static_bounds, float step, float src_step, const cv::Vec2i &seed, int closing_r, bool keep_inpainted = false,
     const std::filesystem::path& tgt_dir = std::filesystem::path(),
-    SurfacePatchIndex* surface_patch_index = nullptr,
+    SurfaceQuerySet* surface_patch_index = nullptr,
     bool debug_images = false,
     int reopt_support_radius = 0,
     bool reopt_robust_affine_support = false,
@@ -1067,7 +1012,6 @@ static void optimize_surface_mapping(SurfTrackerData &data, cv::Mat_<uint8_t> &s
         bitwise_and(state, STATE_VALID, masked);
         cv::dilate(masked, masked, m, {-1,-1}, r);
         cv::erode(masked, masked, m, {-1,-1}, std::min(r,closing_r));
-        // cv::imwrite("masked.tif", masked);
 
         for(int j=used_area.y;j<used_area.br().y;j++)
             for(int i=used_area.x;i<used_area.br().x;i++)
@@ -1133,7 +1077,7 @@ static void optimize_surface_mapping(SurfTrackerData &data, cv::Mat_<uint8_t> &s
         for(int i=used_area.x;i<used_area.br().x;i++) {
             fix_points_z++;
             if (problem.HasParameterBlock(&data_inp.loc(sm_inp, {j,i})[0]))
-                problem.AddResidualBlock(ZLocationLoss<cv::Vec3d>::Create(points_new, data_inp.seed_coord[2] - (j-data.seed_loc[0])*step*src_step, z_loc_loss_w), new ceres::HuberLoss(1.0), &data_inp.loc(sm_inp, {j,i})[0]);
+                problem.AddResidualBlock(ZLocationLoss::Create(sm_inp->pointSurface(), data_inp.seed_coord[2] - (j-data.seed_loc[0])*step*src_step, z_loc_loss_w), new ceres::HuberLoss(1.0), &data_inp.loc(sm_inp, {j,i})[0]);
         }
 
     std::cout << "optimizer: optimizing " << res_count << " residuals, seed " << seed << std::endl;
@@ -1152,7 +1096,7 @@ static void optimize_surface_mapping(SurfTrackerData &data, cv::Mat_<uint8_t> &s
     std::cout << summary.FullReport() << std::endl;
     std::cout << "optimizer: rms " << sqrt(summary.final_cost/summary.num_residual_blocks) << " count " << summary.num_residual_blocks << std::endl;
 
-    if (debug_images) {
+    if (debug_images && !tgt_dir.empty()) {
         cv::Mat_<cv::Vec3d> points_hr_inp = surftrack_genpoints_hr(data, new_state, points_inpainted, used_area, step, src_step, true);
         try {
             auto dbg_surf = new QuadSurface(points_hr_inp(used_area_hr), {1/src_step,1/src_step});
@@ -1166,6 +1110,7 @@ static void optimize_surface_mapping(SurfTrackerData &data, cv::Mat_<uint8_t> &s
     }
 
     cv::Mat_<cv::Vec3d> points_hr = surftrack_genpoints_hr(data, new_state, points_inpainted, used_area, step, src_step);
+    const auto highResolutionSurface = QuadSurface(points_hr, {1, 1}).pointSurface();
     SurfTrackerData data_out;
     cv::Mat_<cv::Vec3d> points_out(points.size(), {-1,-1,-1});
     cv::Mat_<uint8_t> state_out(state.size(), 0);
@@ -1202,7 +1147,11 @@ static void optimize_surface_mapping(SurfTrackerData &data, cv::Mat_<uint8_t> &s
 
                     support_count(j,i) = src_loc_valid_count;
 
-                    points_out(j, i) = interp_lin_2d(points_hr, l);
+                    const float xy[]{float(l[1]), float(l[0])};
+                    cv::Vec3f position;
+                    highResolutionSurface->pointsAt(xy, 1, position.val, nullptr);
+                    if (!std::isfinite(position[0])) continue;
+                    points_out(j, i) = position;
                     state_out(j, i) = STATE_LOC_VALID | STATE_COORD_VALID;
 
                     std::set<QuadSurface *> surfs;
@@ -1366,7 +1315,7 @@ static void optimize_surface_mapping(SurfTrackerData &data, cv::Mat_<uint8_t> &s
     data.seed_loc = seed;
     data.seed_coord = points(seed);
 
-    if (debug_images) {
+    if (debug_images && !tgt_dir.empty()) {
         cv::Mat_<cv::Vec3d> points_hr_inp = surftrack_genpoints_hr(data, state, points, used_area, step, src_step, true);
         try {
             auto dbg_surf = new QuadSurface(points_hr_inp(used_area_hr), {1/src_step,1/src_step});
@@ -1385,8 +1334,7 @@ static void optimize_surface_mapping(SurfTrackerData &data, cv::Mat_<uint8_t> &s
 static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
                                               const std::vector<QuadSurface *> &surfs_v,
                                               const nlohmann::json &params,
-                                              float voxelsize,
-                                              SurfacePatchIndex* external_surface_patch_index = nullptr)
+                                              float voxelsize)
 {
     bool flip_x = params.value("flip_x", 0);
     bool bidirectional = params.value("bidirectional", false);
@@ -1396,7 +1344,9 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
     std::cout << "global_steps_per_window: " << global_steps_per_window << std::endl;
     std::cout << "flip_x: " << flip_x << std::endl;
     std::cout << "bidirectional: " << bidirectional << std::endl;
-    std::filesystem::path tgt_dir = params["tgt_dir"].get<std::string>();
+    // Debug output (generation snapshots, inliers_sum.tif, debug_images) goes
+    // here; there is none without it.
+    const std::filesystem::path tgt_dir = params.value("tgt_dir", std::string{});
 
     std::unordered_map<std::string,QuadSurface *> surfs;
     float src_step = params.value("src_step", 20);
@@ -1493,9 +1443,6 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
                   << " min_generations=" << sweep_prune_min_generations << std::endl;
     }
     std::cout << "  reopt_interval: " << reopt_interval << std::endl;
-    if (external_surface_patch_index) {
-        std::cout << "  external_surface_patch_index: true" << std::endl;
-    }
     if (enforce_z_range)
         std::cout << "  z_range: [" << z_min << ", " << z_max << "]" << std::endl;
 
@@ -1509,10 +1456,10 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
     std::ofstream approved_log(log_filename);
 
     for(auto &sm : surfs_v) {
-        const nlohmann::json meta = json_from_utils(sm->meta);
-        if (meta.contains("tags") && meta.at("tags").contains("approved"))
+        const auto tagged = [&](const char* tag) { return std::find(sm->tags.begin(), sm->tags.end(), tag) != sm->tags.end(); };
+        if (tagged("approved"))
             approved_sm.insert(sm);
-        if (!meta.contains("tags") || !meta.at("tags").contains("defective")) {
+        if (!tagged("defective")) {
             surfs[surface_name(sm)] = sm;
         }
     }
@@ -1523,10 +1470,9 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
     std::cout << "total surface count (after defective filter): " << surfs.size() << std::endl;
     std::cout << "seed " << seed << " name " << surface_name(seed) << std::endl;
 
-    SurfacePatchIndex surface_patch_index;
-    SurfacePatchIndex* surface_patch_index_ptr = external_surface_patch_index;
-    if (!surface_patch_index_ptr) {
-        std::vector<SurfacePatchIndex::SurfacePtr> patch_surfaces;
+    SurfaceQuerySet surface_patch_index;
+    {
+        std::vector<SurfaceQuerySet::SurfacePtr> patch_surfaces;
         std::set<QuadSurface*> indexed_surfaces;
         patch_surfaces.reserve(surfs.size() + 1);
         auto append_index_surface = [&](QuadSurface * sm) {
@@ -1535,23 +1481,22 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
             QuadSurface* surf = sm ;
             if (!surf || !indexed_surfaces.insert(surf).second)
                 return;
-            patch_surfaces.emplace_back(SurfacePatchIndex::SurfacePtr(surf, [](QuadSurface*) {}));
+            patch_surfaces.emplace_back(SurfaceQuerySet::SurfacePtr(surf, [](QuadSurface*) {}));
         };
         for (const auto& [_, sm] : surfs) {
             append_index_surface(sm);
         }
         append_index_surface(seed);
-        surface_patch_index.setReadOnly(true);
         const auto rebuild_start = std::chrono::steady_clock::now();
-        surface_patch_index.rebuild(patch_surfaces, 0.0f);
+        surface_patch_index.rebuild(patch_surfaces);
         const double rebuild_elapsed = std::chrono::duration<double>(
             std::chrono::steady_clock::now() - rebuild_start).count();
-        std::cout << "SurfacePatchIndex rebuild time=" << rebuild_elapsed << "s" << std::endl;
-        surface_patch_index_ptr = &surface_patch_index;
-        std::cout << "SurfacePatchIndex built for " << patch_surfaces.size()
-                  << " surfaces patches=" << surface_patch_index.patchCount()
+        std::cout << "SurfaceQuerySet rebuild time=" << rebuild_elapsed << "s" << std::endl;
+        std::cout << "SurfaceQuerySet built for " << patch_surfaces.size()
+                  << " surfaces patches=" << surface_patch_index.tileCount()
                   << std::endl;
     }
+    SurfaceQuerySet* surface_patch_index_ptr = &surface_patch_index;
 
     cv::Mat_<cv::Vec3f> seed_points = seed->rawPoints();
     const bool resume_growth = looks_like_resume_surface(seed, params);
@@ -1667,7 +1612,7 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
 
     bool sweep_prune_distance_active = false;
     std::shared_ptr<QuadSurface> sweep_prune_target_surface;
-    SurfacePatchIndex sweep_prune_target_index;
+    SurfaceQuerySet sweep_prune_target_index;
     if (sweep_prune_distance_enabled &&
         !sweep_prune_target_path.empty() &&
         std::isfinite(sweep_prune_best_coverage_adjusted_distance_vx) &&
@@ -1675,13 +1620,12 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
         try {
             sweep_prune_target_surface = std::make_shared<QuadSurface>(std::filesystem::path(sweep_prune_target_path));
             sweep_prune_target_surface->ensureLoaded();
-            sweep_prune_target_index.setReadOnly(true);
-            sweep_prune_target_index.rebuild({sweep_prune_target_surface}, 0.0f);
+            sweep_prune_target_index.rebuild({sweep_prune_target_surface});
             sweep_prune_distance_active = !sweep_prune_target_index.empty();
             if (sweep_prune_distance_active) {
                 std::cout << "sweep distance prune target indexed: "
                           << sweep_prune_target_path
-                          << " patches=" << sweep_prune_target_index.patchCount() << std::endl;
+                          << " patches=" << sweep_prune_target_index.tileCount() << std::endl;
             }
         } catch (const std::exception& e) {
             std::cout << "sweep distance prune disabled: failed to index target "
@@ -2322,7 +2266,7 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
             ceres::Problem problem;
             surftrack_add_local(probe.surf, probe.p, data, problem, state, points, step, src_step, SURF_LOSS | LOSS_ZLOC);
 
-            std::vector<SurfacePatchIndex::LookupResult> more_local_hits;
+            std::vector<SurfaceQuerySet::LookupResult> more_local_hits;
             for(auto test_surf : local_surfs) {
                 if (test_surf == probe.surf)
                     continue;
@@ -2949,7 +2893,7 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
                 ceres::Problem problem;
                 surftrack_add_local(best_surf, p, data_th, problem, state, points, step, src_step, SURF_LOSS | LOSS_ZLOC);
 
-                std::vector<SurfacePatchIndex::LookupResult> more_local_hits;
+                std::vector<SurfaceQuerySet::LookupResult> more_local_hits;
 
                 for(auto test_surf : local_surfs) {
                     if (test_surf == best_surf)
@@ -3102,30 +3046,25 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
         if (!global_steps_per_window && reopt_interval == 0)
             update_mapping = false;
 
-        if (generation % 50 == 0 || update_mapping /*|| generation < 10*/) {
+        if (!tgt_dir.empty() && (generation % 50 == 0 || update_mapping)) {
             {
                 cv::Mat_<cv::Vec3d> points_hr = surftrack_genpoints_hr(data, state, points, used_area, step, src_step);
                 cv::Mat_<uint16_t> generations_hr = surftrack_generations_hr(state, generations, used_area, step);
                 auto dbg_surf = new QuadSurface(points_hr(used_area_hr), {1/src_step,1/src_step});
                 dbg_surf->setChannel("generations", generations_hr(used_area_hr));
-                dbg_surf->meta = utils::Json::object();
-                dbg_surf->meta["vc_grow_seg_from_segments_params"] = json_to_utils(params);
+                dbg_surf->meta = nlohmann::json::object();
+                dbg_surf->meta["vc_grow_seg_from_segments_params"] = (params);
 
                 float const area_est_vx2 = loc_valid_count*src_step*src_step*step*step;
                 vc::surface::storeAreaMeta(dbg_surf->meta,
                                            static_cast<double>(area_est_vx2),
                                            static_cast<double>(voxelsize));
-                dbg_surf->meta["used_approved_segments"] = json_to_utils(nlohmann::json(std::vector<std::string>(used_approved_names.begin(), used_approved_names.end())));
-                const std::filesystem::path legacy_current_path = tgt_dir / (std::string(Z_DBG_GEN_PREFIX)+"current");
+                dbg_surf->meta["used_approved_segments"] = (nlohmann::json(std::vector<std::string>(used_approved_names.begin(), used_approved_names.end())));
                 std::string uuid = std::string(Z_DBG_GEN_PREFIX) + get_surface_time_str();
                 const std::filesystem::path snapshot_path = tgt_dir / uuid;
                 dbg_surf->saveAsNew(snapshot_path, true);
 
                 std::error_code cleanup_ec;
-                if (legacy_current_path != snapshot_path) {
-                    std::filesystem::remove_all(legacy_current_path, cleanup_ec);
-                }
-                cleanup_ec.clear();
                 if (current_snapshot_path && *current_snapshot_path != snapshot_path) {
                     std::filesystem::remove_all(*current_snapshot_path, cleanup_ec);
                 }
@@ -3189,20 +3128,20 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
                 reseed_fringe_from_valid(active);
             }
 
-            if (debug_images) {
+            if (debug_images && !tgt_dir.empty()) {
                 cv::Mat_<cv::Vec3d> points_hr = surftrack_genpoints_hr(data, state, points, used_area, step, src_step);
                 cv::Mat_<uint16_t> generations_hr = surftrack_generations_hr(state, generations, used_area, step);
                 auto dbg_surf = new QuadSurface(points_hr(used_area_hr), {1/src_step,1/src_step});
                 dbg_surf->setChannel("generations", generations_hr(used_area_hr));
-                dbg_surf->meta = utils::Json::object();
-                dbg_surf->meta["vc_grow_seg_from_segments_params"] = json_to_utils(params);
+                dbg_surf->meta = nlohmann::json::object();
+                dbg_surf->meta["vc_grow_seg_from_segments_params"] = (params);
 
                 std::string uuid = std::string(Z_DBG_GEN_PREFIX)+"opt";
                 float const area_est_vx2 = loc_valid_count*src_step*src_step*step*step;
                 vc::surface::storeAreaMeta(dbg_surf->meta,
                                            static_cast<double>(area_est_vx2),
                                            static_cast<double>(voxelsize));
-                dbg_surf->meta["used_approved_segments"] = json_to_utils(nlohmann::json(std::vector<std::string>(used_approved_names.begin(), used_approved_names.end())));
+                dbg_surf->meta["used_approved_segments"] = (nlohmann::json(std::vector<std::string>(used_approved_names.begin(), used_approved_names.end())));
                 dbg_surf->saveAsNew(tgt_dir / uuid, true);
                 delete dbg_surf;
             }
@@ -3246,7 +3185,7 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
                         continue;
                     }
 
-                    SurfacePatchIndex::PointQuery query;
+                    SurfaceQuerySet::PointQuery query;
                     query.worldPoint = cv::Vec3f(
                         static_cast<float>(p[0]),
                         static_cast<float>(p[1]),
@@ -3486,7 +3425,8 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
             }
         }
 
-        cv::imwrite((tgt_dir / "inliers_sum.tif").string(), inliers_sum_dbg(used_area));
+        if (!tgt_dir.empty())
+            vcr::sources::writeTiff(tgt_dir / "inliers_sum.tif", vc::core::util::imageBuffer(inliers_sum_dbg(used_area)).view());
 
         const int current_remaining_left = remaining_extra(max_extra_left, expanded_left);
         const int current_remaining_right = remaining_extra(max_extra_right, expanded_right);
@@ -3554,15 +3494,15 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
     auto surf = new QuadSurface(points_hr(used_area_hr), {1/src_step,1/src_step});
     surf->setChannel("generations", generations_hr(used_area_hr));
 
-    surf->meta = utils::Json::object();
+    surf->meta = nlohmann::json::object();
     vc::surface::storeAreaMeta(surf->meta,
                                static_cast<double>(area_est_vx2),
                                static_cast<double>(voxelsize));
-    surf->meta["used_approved_segments"] = json_to_utils(nlohmann::json(std::vector<std::string>(used_approved_names.begin(), used_approved_names.end())));
+    surf->meta["used_approved_segments"] = (nlohmann::json(std::vector<std::string>(used_approved_names.begin(), used_approved_names.end())));
     if (resume_growth) {
         const int offset_col = grid_margin + expanded_left - used_area.x;
         const int offset_row = grid_margin + expanded_up - used_area.y;
-        auto off_arr = utils::Json::array();
+        auto off_arr = nlohmann::json::array();
         off_arr.push_back(offset_col);
         off_arr.push_back(offset_row);
         surf->meta["grid_offset"] = std::move(off_arr);
@@ -3571,16 +3511,7 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
     return surf;
 }
 
-QuadSurface *grow_surf_from_surfs(QuadSurface *seed, const std::vector<QuadSurface*> &surfs_v, const utils::Json &params, float voxelsize)
-{
-    return grow_surf_from_surfs(seed, surfs_v, params, voxelsize, nullptr);
-}
-
-QuadSurface *grow_surf_from_surfs(QuadSurface *seed,
-                                  const std::vector<QuadSurface*> &surfs_v,
-                                  const utils::Json &params,
-                                  float voxelsize,
-                                  SurfacePatchIndex* surface_patch_index)
+QuadSurface *grow_surf_from_surfs(QuadSurface *seed, const std::vector<QuadSurface*> &surfs_v, const nlohmann::json &params, float voxelsize)
 {
     if (!seed)
         return nullptr;
@@ -3601,6 +3532,6 @@ QuadSurface *grow_surf_from_surfs(QuadSurface *seed,
         seed_surf = seed;
     }
 
-    nlohmann::json grow_params = json_from_utils(params);
-    return grow_surf_from_surfs_impl(seed_surf, grow_surfs, grow_params, voxelsize, surface_patch_index);
+    nlohmann::json grow_params = (params);
+    return grow_surf_from_surfs_impl(seed_surf, grow_surfs, grow_params, voxelsize);
 }

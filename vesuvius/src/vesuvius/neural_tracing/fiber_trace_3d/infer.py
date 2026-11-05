@@ -12,7 +12,8 @@ import time
 from typing import Any
 
 import torch
-import zarr
+import vc_reader
+from vc_reader.reader import open_node
 
 try:
     from lasagna.live_omezarr_cache import (
@@ -31,9 +32,7 @@ try:
     from lasagna.tiled_predict3d import (
         DEFAULT_FLUSH_WORKERS, DEFAULT_ACCUMULATOR_WORKERS,
         DEFAULT_INPUT_CACHE_BYTES,
-        DEFAULT_INPUT_COPY_THREADS,
         DEFAULT_INPUT_IO_THREADS,
-        DEFAULT_INPUT_READER,
         DEFAULT_OME_COMPRESSOR,
         OME_COMPRESSOR_CHOICES,
         DEFAULT_PREFETCH_TILES_PER_GPU,
@@ -52,9 +51,7 @@ except ImportError:  # pragma: no cover - supports PYTHONPATH=lasagna style runs
     from tiled_predict3d import (
         DEFAULT_FLUSH_WORKERS, DEFAULT_ACCUMULATOR_WORKERS,
         DEFAULT_INPUT_CACHE_BYTES,
-        DEFAULT_INPUT_COPY_THREADS,
         DEFAULT_INPUT_IO_THREADS,
-        DEFAULT_INPUT_READER,
         DEFAULT_OME_COMPRESSOR,
         OME_COMPRESSOR_CHOICES,
         DEFAULT_PREFETCH_TILES_PER_GPU,
@@ -138,9 +135,12 @@ def _checkpoint_provenance(path: str | Path | None, config: dict[str, Any]) -> d
         "metric_value": scalar(top.get("metric")),
         "architecture": model.get("architecture") if isinstance(model, dict) else None,
         "output_schema": {
-            key: model[key] for key in (
+            **({"annotations": config["annotations"]}
+               if config.get("annotations") else {}),
+            **{key: model[key] for key in (
                 "output_channels", "direction_branch_count", "conditioned_decoder_enabled",
-            ) if isinstance(model, dict) and key in model
+                "output_stride",
+            ) if isinstance(model, dict) and key in model},
         },
     }
 
@@ -268,6 +268,7 @@ def _resolve_inference_precision(
     *,
     checkpoint: str | Path | None,
     devices: tuple[torch.device, ...],
+    validate_devices: bool = True,
 ) -> tuple[str, str]:
     from vesuvius.neural_tracing.fiber_trace_3d.train import (
         _mixed_precision_config_from_training,
@@ -299,6 +300,11 @@ def _resolve_inference_precision(
 
     if mode == "auto":
         mode = "off"
+    if not validate_devices:
+        # Live demand inference establishes numerical/cache identity before it
+        # has (or needs) a GPU grant. The gated worker validates this resolved
+        # policy against its authorized device before constructing the model.
+        return mode, source
     try:
         for selected in devices:
             if selected.type == "cuda":
@@ -418,7 +424,7 @@ def run_fiber_trace_3d_inference(
     tile_size: int | None = None,
     overlap: int = 16,
     border: int = 16,
-    inference_scaledown_power: int = 2,
+    inference_scaledown_power: int | None = None,
     base_ref: str | None = None,
     base_scale: int | None = None,
     no_download: bool = False,
@@ -431,11 +437,9 @@ def run_fiber_trace_3d_inference(
     slots_per_gpu: int = 2,
     flush_workers: int = DEFAULT_FLUSH_WORKERS,
     accumulator_workers: int = DEFAULT_ACCUMULATOR_WORKERS,
-    input_reader: str = DEFAULT_INPUT_READER,
     prefetch_tiles_per_gpu: int = DEFAULT_PREFETCH_TILES_PER_GPU,
     input_cache_gib: float = DEFAULT_INPUT_CACHE_BYTES / float(1 << 30),
     input_io_threads: int = DEFAULT_INPUT_IO_THREADS,
-    input_copy_threads: int = DEFAULT_INPUT_COPY_THREADS,
     download_workers: int = 64,
     live_fetch: bool = False,
     live_cache_gib: float = DEFAULT_LIVE_CACHE_GIB,
@@ -443,6 +447,9 @@ def run_fiber_trace_3d_inference(
     profile_pipeline: bool = False,
     inference_precision: str = "auto",
     product_accumulator_dtype: str = "float16",
+    output_format: str = "compact",
+    blank_invalid: bool = True,
+    width_uint8_base: bool = True,
     provenance_context_path: str | Path | None = None,
     _live_cache: LiveOmeZarrCache | None = None,
 ) -> None:
@@ -454,23 +461,27 @@ def run_fiber_trace_3d_inference(
         raise ValueError("accumulator_workers must be >= 0")
     if not math.isfinite(float(input_cache_gib)) or float(input_cache_gib) < 0:
         raise ValueError("input_cache_gib must be finite and >= 0")
-    if int(prefetch_tiles_per_gpu) <= 0 or int(input_io_threads) <= 0 or int(input_copy_threads) <= 0:
-        raise ValueError("prefetch_tiles_per_gpu and TensorStore thread counts must be > 0")
+    if int(prefetch_tiles_per_gpu) <= 0 or int(input_io_threads) <= 0:
+        raise ValueError("prefetch_tiles_per_gpu and input_io_threads must be > 0")
     config, config_source = _checkpoint_config_for_inference(checkpoint, config_path)
     tile_size_i = _tile_size_from_config(config, tile_size)
     output_manifest = Path(output_path)
-    if not output_manifest.name.endswith(".lasagna.json"):
-        raise ValueError(f"output must be .lasagna.json, got: {output_path}")
+    from lasagna.compact_zarr import CompactOutputAdapter, resolve_output
+    output_manifest, output_format = resolve_output(output_manifest, output_format)
     output_dir = output_manifest.parent
     provenance_path = output_dir / "inference.json"
-    json_stem = output_manifest.name.removesuffix(".lasagna.json")
+    json_stem = output_manifest.name.removesuffix(".lasagna.json").removesuffix(".zarr")
     if not json_stem:
         raise ValueError("output .lasagna.json path must have a non-empty stem")
 
     if not no_download and not live_fetch:
         _auto_download(input_path, crop_xyzwhd, download_workers=int(download_workers))
 
-    a_in = zarr.open(str(input_path), mode="r")
+    input_memory = int(float(input_cache_gib) * (1 << 30))
+    if _live_cache is not None:
+        a_in = _live_cache.open_reader(memory_cache=input_memory, threads=int(input_io_threads))
+    else:
+        a_in = open_node(str(input_path), memory_cache=input_memory, threads=int(input_io_threads))
     if not hasattr(a_in, "shape"):
         raise ValueError(f"input must point to a zarr array, got: {input_path}")
     input_shape = tuple(int(v) for v in a_in.shape)
@@ -484,10 +495,15 @@ def run_fiber_trace_3d_inference(
             "inside an OME-Zarr group with level 0 metadata."
         )
     input_sd = _input_scaledown_from_base(base_shape_zyx, input_shape)
-    power = int(inference_scaledown_power)
+    from .inference_adapter import _model_cfg_from_raw
+    native_stride = int(_model_cfg_from_raw(config).get("output_stride", 1))
+    native_power = _level_from_scaledown(native_stride)
+    power = native_power if inference_scaledown_power is None else int(inference_scaledown_power)
     if power < 0 or power > 30:
         raise ValueError(f"inference_scaledown_power must be in [0, 30], got {power}")
     output_sd_input = 1 << power
+    if output_sd_input < native_stride:
+        raise ValueError("requested output resolution is finer than the model's native output stride")
     effective_output_sd = input_sd * output_sd_input
     output_level = _level_from_scaledown(effective_output_sd)
     n_levels = max(int(levels), output_level + 2)
@@ -505,8 +521,10 @@ def run_fiber_trace_3d_inference(
     resolved_devices = resolve_inference_devices(device=device, devices=devices)
     torch_device = resolved_devices[0]
 
+    from lasagna.cooperative_inference import enabled as cooperative_enabled
     precision_mode, precision_source = _resolve_inference_precision(
         inference_precision, checkpoint=checkpoint, devices=resolved_devices,
+        validate_devices=not cooperative_enabled(resolved_devices),
     )
     config = dict(config)
     effective_training = dict(config.get("training", {}))
@@ -526,6 +544,8 @@ def run_fiber_trace_3d_inference(
             flush=True,
         )
 
+    from .annotations import AnnotationConfig
+    annotation_heads = AnnotationConfig.from_mapping(config).names
     predict_adapter = FiberTrace3DPredictAdapter(
         config,
         checkpoint=checkpoint,
@@ -536,25 +556,44 @@ def run_fiber_trace_3d_inference(
         product_prefix=json_stem,
         zarr_path_prefix=output_dir / json_stem,
         recurrent_steps=recurrent_steps,
+        width_uint8_base=width_uint8_base,
+        input_to_base=input_sd,
+        emit_width="width" in annotation_heads,
+        emit_normals="normal" in annotation_heads,
     )
-    output_adapter = OmeZarrOutputAdapter(
-        products=predict_adapter.output_products,
-        n_levels=n_levels,
-    )
-    create_product_omezarr_groups(
-        products=predict_adapter.output_products,
-        base_shape_zyx=base_shape_zyx,
-        n_levels=n_levels,
-        ome_chunk=int(ome_chunk),
-        ome_compressor=ome_compressor,
-    )
-    write_lasagna_product_manifest(
-        output_path=output_manifest,
-        products=predict_adapter.output_products,
-        base_shape_zyx=base_shape_zyx,
-        crop_xyzwhd_base=crop_xyzwhd,
-		provenance_json="inference.json",
-    )
+    if output_format == "compact":
+        products = predict_adapter.output_products
+        validity = next(c.name for p in products for c in p.channels if c.name == "presence" or c.name.endswith("_presence"))
+        output_adapter = CompactOutputAdapter(root=output_manifest, products=products, n_levels=n_levels,
+            validity_channel=validity, blank_invalid=blank_invalid)
+        output_adapter.prepare(base_shape_zyx=base_shape_zyx, ome_chunk=int(ome_chunk),
+            ome_compressor=ome_compressor, crop=crop_xyzwhd,
+            provenance="../inference.json", extra_fields={"width_encoding": "uint8-base-voxels" if width_uint8_base else "float32-input-voxels"})
+    else:
+        output_adapter = OmeZarrOutputAdapter(
+            products=predict_adapter.output_products,
+            n_levels=n_levels,
+        )
+        output_adapter.blank_invalid = blank_invalid
+        create_product_omezarr_groups(
+            products=predict_adapter.output_products,
+            base_shape_zyx=base_shape_zyx,
+            n_levels=n_levels,
+            ome_chunk=int(ome_chunk),
+            ome_compressor=ome_compressor,
+        )
+        write_lasagna_product_manifest(
+            output_path=output_manifest,
+            products=predict_adapter.output_products,
+            base_shape_zyx=base_shape_zyx,
+            crop_xyzwhd_base=crop_xyzwhd,
+            provenance_json="inference.json",
+        )
+        from lasagna.lasagna_volume import LasagnaVolume
+        manifest = LasagnaVolume.load(output_manifest)
+        manifest.extra_fields.update(width_encoding="uint8-base-voxels" if width_uint8_base else "float32-input-voxels",
+                                     blank_invalid=blank_invalid)
+        manifest.save()
 
     try:
         from inference_provenance import (
@@ -609,6 +648,8 @@ def run_fiber_trace_3d_inference(
             "code_commit": code_commit(Path(__file__)),
             "scaledown_power": power,
             "scaledown_factor_from_input": output_sd_input,
+            "native_output_stride": native_stride,
+            "additional_downsample_factor": output_sd_input // native_stride,
             "effective_base_factor": effective_output_sd,
             "produced_levels": list(range(output_level, n_levels)),
             "crop_xyzwhd_base": list(crop_xyzwhd) if crop_xyzwhd is not None else None,
@@ -636,10 +677,13 @@ def run_fiber_trace_3d_inference(
         "runtime": {
             "python": platform.python_version(),
             "torch": torch.__version__,
-            "zarr": getattr(zarr, "__version__", None),
+            "vc_reader": vc_reader.__version__,
             "cuda": torch.version.cuda,
         },
         "manifest": output_manifest.name,
+        "output_format": output_format,
+        "blank_invalid": bool(blank_invalid),
+        "width_encoding": "uint8-base-voxels" if width_uint8_base else "float32-input-voxels",
     })
     write_provenance(provenance_path, provenance)
 
@@ -661,7 +705,7 @@ def run_fiber_trace_3d_inference(
     t0 = time.time()
     model = None
     try:
-        if len(resolved_devices) == 1:
+        if len(resolved_devices) == 1 and not cooperative_enabled(resolved_devices):
             print(
                 f"[fiber_trace_3d:infer] loading checkpoint={checkpoint} device={torch_device}",
                 flush=True,
@@ -697,11 +741,7 @@ def run_fiber_trace_3d_inference(
             prefetch_workers=int(prefetch_workers),
             slots_per_gpu=int(slots_per_gpu),
             flush_workers=int(flush_workers),
-            input_reader=str(input_reader),
             prefetch_tiles_per_gpu=int(prefetch_tiles_per_gpu),
-            input_cache_bytes=int(float(input_cache_gib) * (1 << 30)),
-            input_io_threads=int(input_io_threads),
-            input_copy_threads=int(input_copy_threads),
             profile_pipeline=bool(profile_pipeline),
             product_accumulator_dtype=str(product_accumulator_dtype),
             accumulator_workers=int(accumulator_workers),
@@ -715,13 +755,16 @@ def run_fiber_trace_3d_inference(
         if torch_device.type == "cuda":
             torch.cuda.empty_cache()
 
-        build_product_omezarr_pyramids(
-            products=predict_adapter.output_products,
-            n_levels=n_levels,
-            ome_chunk=int(ome_chunk),
-            crop_zyx=output_region,
-            workers=int(pyramid_workers),
-        )
+        if output_format == "compact":
+            output_adapter.build_pyramids(workers=int(pyramid_workers))
+        else:
+            build_product_omezarr_pyramids(
+                products=predict_adapter.output_products,
+                n_levels=n_levels,
+                ome_chunk=int(ome_chunk),
+                crop_zyx=output_region,
+                workers=int(pyramid_workers),
+            )
         removed_finish = _cleanup_predict3d_temp_files(
             output_dir,
             f"{json_stem}_",
@@ -764,14 +807,20 @@ def main(argv: list[str] | None = None) -> int:
         help="Legacy Fiber config JSON; omitted when the checkpoint embeds config.",
     )
     parser.add_argument("--input", required=True, help="Input zarr array (3D ZYX).")
-    parser.add_argument("--output", required=True, help="Output .lasagna.json manifest path.")
+    parser.add_argument("--output", required=True, help="Output compact .zarr store (legacy sidecars remain resumable).")
+    parser.add_argument("--output-format", choices=("compact", "legacy"), default="compact")
+    parser.add_argument("--blank-invalid", action=argparse.BooleanOptionalAction, default=True,
+                        help="Zero other Fiber channels wherever quantized presence is zero.")
+    parser.add_argument("--width-uint8-base", action=argparse.BooleanOptionalAction, default=True,
+                        help="Export width rounded/clamped to uint8 base-volume voxels.")
     parser.add_argument("--checkpoint", required=True, help="Fiber trace 3D model checkpoint (.pt).")
     parser.add_argument("--tile-size", type=int, default=None, help="Inference tile cube size.")
     parser.add_argument("--overlap", type=int, default=16, help="Tile overlap in input voxels.")
     parser.add_argument("--border", type=int, default=16, help="Hard discard border at tile edges.")
     parser.add_argument(
-        "--inference-scaledown-power", type=int, default=2,
-        help="Power-of-two output reduction relative to input (2 means factor 4).",
+        "--inference-scaledown-power", type=int, default=None,
+        help="Total power-of-two output reduction relative to input, including model stride. "
+             "Default: native model output, without additional downsampling.",
     )
     parser.add_argument(
         "--crop",
@@ -806,24 +855,16 @@ def main(argv: list[str] | None = None) -> int:
         help="Spawned OME-Zarr flush processes (default: min(CPU count, 64)); 0 uses the synchronous baseline.",
     )
     parser.add_argument(
-        "--input-reader", choices=("tensorstore", "python-zarr"), default=DEFAULT_INPUT_READER,
-        help="Inference tile reader backend (default: tensorstore).",
-    )
-    parser.add_argument(
         "--prefetch-tiles-per-gpu", type=int, default=DEFAULT_PREFETCH_TILES_PER_GPU,
         help="Bounded input read-ahead tiles per selected GPU (default: 4).",
     )
     parser.add_argument(
         "--input-cache-gib", type=float, default=DEFAULT_INPUT_CACHE_BYTES / float(1 << 30),
-        help="TensorStore cache budget in GiB (default: 4).",
+        help="Input reader memory cache budget in GiB (default: 4).",
     )
     parser.add_argument(
         "--input-io-threads", type=int, default=DEFAULT_INPUT_IO_THREADS,
-        help="TensorStore file I/O concurrency (default: 16).",
-    )
-    parser.add_argument(
-        "--input-copy-threads", type=int, default=DEFAULT_INPUT_COPY_THREADS,
-        help="TensorStore decode/data-copy concurrency (default: 4).",
+        help="Input reader threads (default: 16).",
     )
     parser.add_argument(
         "--profile-pipeline", action="store_true",
@@ -909,8 +950,6 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--input-cache-gib must be finite and >= 0")
     if int(args.input_io_threads) <= 0:
         parser.error("--input-io-threads must be > 0")
-    if int(args.input_copy_threads) <= 0:
-        parser.error("--input-copy-threads must be > 0")
     if not args.live_fetch and (args.live_cache_gib is not None or args.live_fetch_ahead_tiles is not None):
         parser.error("--live-cache-gib/--live-fetch-ahead-tiles require --live-fetch")
     if args.live_fetch and args.no_download:
@@ -923,13 +962,16 @@ def main(argv: list[str] | None = None) -> int:
         input_path=str(args.input),
         output_path=args.output,
         checkpoint=args.checkpoint,
+        output_format=args.output_format,
+        blank_invalid=args.blank_invalid,
+        width_uint8_base=args.width_uint8_base,
         device=args.device,
         devices=args.devices,
         crop_xyzwhd=tuple(int(v) for v in args.crop_xyzwhd) if args.crop_xyzwhd else None,
         tile_size=args.tile_size,
         overlap=int(args.overlap),
         border=int(args.border),
-        inference_scaledown_power=int(args.inference_scaledown_power),
+        inference_scaledown_power=args.inference_scaledown_power,
         base_ref=args.base_ref,
         base_scale=args.base_scale,
         no_download=bool(args.no_download),
@@ -942,11 +984,9 @@ def main(argv: list[str] | None = None) -> int:
         slots_per_gpu=int(args.slots_per_gpu),
         flush_workers=int(args.flush_workers),
         accumulator_workers=int(args.accumulator_workers),
-        input_reader=str(args.input_reader),
         prefetch_tiles_per_gpu=int(args.prefetch_tiles_per_gpu),
         input_cache_gib=float(args.input_cache_gib),
         input_io_threads=int(args.input_io_threads),
-        input_copy_threads=int(args.input_copy_threads),
         profile_pipeline=bool(args.profile_pipeline),
         inference_precision=str(args.inference_precision),
         product_accumulator_dtype=str(args.product_accumulator_dtype),

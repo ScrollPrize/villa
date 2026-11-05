@@ -246,7 +246,7 @@ If you know geometry processing, optimization algorithms, or C++, this is one of
 
 </Admonition>
 ### Surface mesh representations
-The unwrapping software used by our team, [VC3D](https://github.com/ScrollPrize/villa/tree/main/volume-cartographer), uses a custom format called 'tifxyz' (see [Data Formats](/data)), an alternative to widely-used 3D formats such as .obj or .stl. Its key benefit is that it enforces grid topology on the surface mesh — meaning, again, a single flat sheet. The flat coordinate system on the surface is carried explicitly exploiting a 2D grid structure. Indeed, the surface mesh (QuadSurface in the C++ code; Tifxyz in Python, via vesuvius.tifxyz.Tifxyz/read\_tifxyz()) is represented by a 2D array of 3D vertex coordinates: the array's shape determines the mesh's grid structure, and the vertices define its actual shape in space. That grid of coordinates is saved as three separate TIFF images, one each for x, y, and z coordinates (as float32). The format can also mark a given cell as missing, either by setting each coordinate to \-1 or via an optional sidecar mask image. Converter scripts move between tifxyz and .obj in both directions ([vc\_tifxyz2obj](https://github.com/ScrollPrize/villa/blob/main/volume-cartographer/apps/src/vc_tifxyz2obj.cpp), [vc\_obj2tifxyz](https://github.com/ScrollPrize/villa/blob/main/volume-cartographer/apps/src/vc_obj2tifxyz.cpp)); going from .obj to tifxyz requires an accompanying .griduv sidecar file specifying the intended grid structure (a [legacy converter](https://github.com/ScrollPrize/villa/blob/main/volume-cartographer/apps/src/vc_obj2tifxyz_legacy.cpp) without this requirement also exists, but is not recommended for new work). The core representation itself lives in [QuadSurface.cpp](https://github.com/ScrollPrize/villa/blob/main/volume-cartographer/core/src/QuadSurface.cpp).
+The unwrapping software used by our team, [VC3D](https://github.com/ScrollPrize/villa/tree/main/volume-cartographer), uses a custom format called 'tifxyz' (see [Data Formats](/data)), an alternative to widely-used 3D formats such as .obj or .stl. Its key benefit is that it enforces grid topology on the surface mesh — meaning, again, a single flat sheet. The flat coordinate system on the surface is carried explicitly exploiting a 2D grid structure. Indeed, the surface mesh (QuadSurface in the C++ code; Tifxyz in Python, via vesuvius.tifxyz.Tifxyz/read\_tifxyz()) is represented by a 2D array of 3D vertex coordinates: the array's shape determines the mesh's grid structure, and the vertices define its actual shape in space. That grid of coordinates is saved as three separate TIFF images, one each for x, y, and z coordinates (as float32). The format can also mark a given cell as missing, either by setting each coordinate to \-1 or via an optional sidecar mask image. Converter scripts move between tifxyz and .obj in both directions ([vc\_tifxyz2obj](https://github.com/ScrollPrize/villa/blob/main/volume-cartographer/apps/src/vc_tifxyz2obj.cpp), [vc\_obj2tifxyz](https://github.com/ScrollPrize/villa/blob/main/volume-cartographer/apps/src/vc_obj2tifxyz.cpp)); going from .obj to tifxyz rasterizes the mesh's UVs onto a grid (a [legacy converter](https://github.com/ScrollPrize/villa/blob/main/volume-cartographer/apps/src/vc_obj2tifxyz_legacy.cpp) also exists, but is not recommended for new work). The core representation itself lives in [QuadSurface.cpp](https://github.com/ScrollPrize/villa/blob/main/volume-cartographer/core/src/QuadSurface.cpp).
 
 ### Visualizing a mesh
 [VC3D](https://github.com/ScrollPrize/villa/tree/main/volume-cartographer) makes it possible to visualize the CT scans, meshes, and annotations all in one tool. The CT data for the large scrolls, which can reach dozens of terabytes, is streamed remotely and synchronized from the S3 Open Data bucket, generously provided to the project by AWS. A hands-on [VC3D tutorial](tutorial_VC3D) walks through installing the software, loading scroll data, and annotating fibers and windings.
@@ -518,16 +518,13 @@ We have evidence that working on 1.1 µm data yields cleaner results than 2.4 µ
 
 The square brackets follow classics and papyrology's standard "Leiden Convention" for transcribing damaged text: they mark text that is missing or illegible at that point in the original, not a typo or a transcriber giving up. An open bracket with nothing closing it, as in "πρ\[", means the word is simply cut off there by damage.
 
-What happens if the models don’t generalize? The right conclusion here is neither "the scan failed" nor "the model failed." At the moment, several explanations remain possible:
+Why do ink models not generalize well to some scrolls/segments? This varies from case to case (and sometimes we have no explanation!), but for example:
 
 * the scan may not capture the relevant signal strongly enough;    
 * the surface may be slightly misplaced (suboptimally localized);    
 * the ink labels may not match the true location of the ink signal;    
-* the model architecture may not be exploiting the right features;    
-* the ink morphology or chemistry may differ across scrolls;    
-* the signal may be present but below the current pipeline's ability to use it.
-
-**This is why better diagnostics matter just as much as better models — without them, it's hard to know which of these failure modes you're even fighting.**
+* the model may not be exploiting the right features;    
+* the ink morphology or chemistry may differ across scrolls.
 
 ## 4\. Data scale: the infrastructure bottleneck
 A full-resolution scroll volume is huge — too huge to just download to a laptop and work with as a local folder. So the project increasingly depends on chunked, cloud-friendly formats instead.

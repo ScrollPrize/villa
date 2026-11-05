@@ -15,11 +15,17 @@ source .venv/bin/activate
 
 The bootstrap uses `nvidia-smi` to select a pinned official PyTorch build for
 CUDA 12.8, CUDA 13.0, or CPU, then installs Lasagna. Override detection with
-`--backend cpu`, `--backend cu128`, or `--backend cu130`, for example:
+`--backend cpu`, `--backend cu128`, `--backend cu130`, or `--backend rocm`, for example:
 
 ```bash
 python3 scripts/bootstrap_venv.py --venv .venv --backend cu128
 ```
+
+AMD GPUs use the ROCm 7.2 build, which detection never selects: pass
+`--backend rocm` (Linux x86_64 only). It needs read/write access to `/dev/kfd`
+and `/dev/dri` (usually membership of the `render` and `video` groups), and
+runs a smoke kernel on the default GPU, reporting GPU and wheel gfx targets
+if the kernel fails.
 
 Verify the selected PyTorch build and GPU access:
 
@@ -47,6 +53,10 @@ also exposes the sibling Vesuvius Fiber packages and canonical `lasagna.*`
 modules; direct and managed inference do not require `PYTHONPATH`.
 
 ### Inference manager
+
+For Qualzz AFV V2 models and plain V/H probability Zarr output, see
+[Qualzz AFV inference](docs/qualzz_afv_inference.md). This uses the same tiled
+engine and GPU manager without writing Lasagna-schema metadata.
 
 `las_manager` provides configuration, discovery, prefetch, and durable tmux
 execution for managed Fiber and Lasagna inference. Initialize its XDG configuration, fill
@@ -82,13 +92,46 @@ printed run directory's `run.log`. Passing `--no-prefetch` writes only the
 source descriptor and lets the inference backend download missing chunks on
 demand for its crop; this download belongs to the inference lifecycle.
 
+### Cooperative full-volume GPUs
+
+`las_manager` inference jobs automatically use the local cooperative GPU manager
+(`incremental_release` capability required). Prefetch does not reserve GPUs.
+The GPU phase uses one tile per forward pass and varies the **number of GPUs**,
+not batch size or tile geometry. `--devices` limits the eligible devices; it is
+not itself a reservation. CUDA ordinals are resolved to UUIDs before requesting
+resources. An older manager fails capability negotiation; it is never bypassed
+or restarted behind existing clients' backs.
+
+CPU readers, caches, bounded queues, accumulators and output state persist when
+the allocation changes. Removed GPU workers finish submitted tiles, return their
+results and exit before release is acknowledged. Retained workers stay loaded;
+only newly granted GPUs load a model. Full pause unloads all GPU workers; work
+continues automatically after a new grant. Pyramid generation runs after GPU
+workers have exited and release has been reported. A manager restart still
+requires a GPU-only drain; the CPU pipeline remains intact. Communication errors
+are logged and stop new tile admission, drain GPU workers and retry every five
+seconds. No full-volume rescan is needed for these transitions.
+
+Until a one-tile peak is measured, the conservative default requests a full
+selected GPU's memory (the largest selected capacity on heterogeneous hosts).
+To share GPUs, pass a **measured budget including CUDA overhead and reserve**
+through `LASAGNA_GPU_MEMORY_GIB`, for example `46` only if that budget has been
+verified for the chosen model/tile size. `LASAGNA_GPU_PRIORITY` defaults to `0`;
+`VILLA_GPU_MANAGER_SOCKET` optionally selects a socket. These variables are
+inherited by the inference runner. The worker limits Torch's allocator to the
+grant minus 1 GiB reserved for non-allocator CUDA use; this is not a memory
+calibration and an undersized user budget may still fail with OOM. Normalization
+calibration must be performed separately, not inside cooperative inference.
+Direct API/CLI callers can opt into the same behavior with `LASAGNA_COOPERATIVE=1`;
+the manager launcher always sets it for volume inference, not Fiberlet jobs.
+
 Current Fiber checkpoints carry their authoritative inference config, so no
 separate config argument is needed. Direct inference uses the same rule:
 
 ```bash
 python -m vesuvius.neural_tracing.fiber_trace_3d.infer \
   --input /path/to/volume.ome.zarr/1 \
-  --output /path/to/artifacts/fiber.lasagna.json \
+  --output /path/to/artifacts/fiber.zarr \
   --checkpoint /path/to/snapshots/best.pt
 ```
 
@@ -105,8 +148,19 @@ las_manager inference run lasagna/<run>/<checkpoint.pt> <volume> 1 -- --devices 
 ```
 
 The manager dispatches these to `preprocess_cos_omezarr predict3d`; both direct
-and managed Lasagna inference write portable provenance and remain compatible
-with the existing Atlas `lasagna` artifact type.
+and managed Lasagna inference write portable provenance.
+
+New Fiber and Lasagna outputs default to the [compact schema v3](docs/volume_schema_v3.md):
+one Zarr store, an embedded manifest, and resolution-based full-channel chunks.
+Existing sidecar outputs remain resumable. Fiber additionally defaults to
+blanking auxiliary channels at zero presence and rounding/clamping width to
+uint8 base-volume voxels; `--no-blank-invalid` and `--no-width-uint8-base`
+disable those changes independently.
+
+Atlas/catalogue publication and manager Fiberlet discovery still require
+legacy output until their v3 integration is available. For those workflows,
+append `-- --output-format legacy` to the manager command. Direct inference
+uses `--output-format legacy --output /path/to/fiber.lasagna.json`.
 
 Commands and subcommands accept unique prefixes, so `las_manager sn l` is the
 same as `las_manager snapshot ls`. Install path-aware Bash completion once with
@@ -126,7 +180,8 @@ Atlas/local normal overrides and compatibility rules.
 This installation currently expects the `villa` monorepo layout: Lasagna
 packages the sibling `vesuvius/src` implementation, installs its declared
 model dependencies, and installs the sibling Volume Cartographer Python
-distribution with its `vc_fiberlets` command. Copying only the `lasagna/`
+distribution with its `vc_fiberlets` command and the sibling `vc_object_store`
+Python package, through which surfaces are exchanged. Copying only the `lasagna/`
 directory is therefore not yet a supported standalone installation. On Linux,
 the bootstrap selects an available GCC 13 or newer for that C++23 build unless
 `CC` or `CXX` is already set.
@@ -294,17 +349,15 @@ Existing arrays keep their compressor when inference resumes; a mismatch is
 reported. Use `--ome-compressor none` only when uncompressed compatibility
 output is required.
 
-Use a subset with `--devices cuda:0,cuda:2`. Input tiles default to asynchronous
-TensorStore bounding-box reads outside GPU workers. The tile Cartesian product
+Use a subset with `--devices cuda:0,cuda:2`. Input tiles are read in the
+background through `vc_reader` outside GPU workers. The tile Cartesian product
 is generated lazily and read-ahead is bounded independently from reusable GPU
 shared-memory slots. `--slots-per-gpu` (default 2) controls GPU input/result
 buffers; `--prefetch-tiles-per-gpu` (default 4) controls outstanding/ready input
-tiles. TensorStore defaults to a 4 GiB cache, 16 file-I/O threads, and 4
-decode/copy threads, configurable with `--input-cache-gib`,
-`--input-io-threads`, and `--input-copy-threads`. Use
-`--input-reader python-zarr` for the old backend; `--prefetch-workers` controls
-only its reader threads. Existing `--device` selects single-device inference,
-which also maintains bounded TensorStore read-ahead during GPU forwards.
+tiles. The reader defaults to a 4 GiB memory cache and 16 threads, configurable
+with `--input-cache-gib` and `--input-io-threads`. `--prefetch-workers` overrides
+how many tile reads run at once. Existing `--device` selects single-device
+inference, which also maintains bounded read-ahead during GPU forwards.
 
 Add `--profile-pipeline` to a multi-device run for bounded loader/worker
 diagnostics. It reports backend read service, active wall span, throughput and
@@ -360,13 +413,13 @@ python -m vesuvius.neural_tracing.fiber_trace_3d.infer ... \
 
 The local OME root must contain `_download` S3 metadata. The defaults are a
 10 TiB selected-scale target (`--live-cache-gib 10240`) and 10,000 lazy tile
-descriptors (`--live-fetch-ahead-tiles 10000`); this disk window is separate
-from TensorStore's much smaller `--prefetch-tiles-per-gpu` array window. Only
-whole input Z-chunk planes safely behind a fully committed model row are
-removed. Cache pressure may temporarily exceed the target when no obsolete
-plane is safe. Live mode is intentionally full-volume only, conflicts with
+descriptors (`--live-fetch-ahead-tiles 10000`); this read-ahead is separate
+from the much smaller `--prefetch-tiles-per-gpu` array window. Chunks are read
+through `vc_reader` into `<ome root>/.live_cache`, decoded; past the target its
+least recently used chunks are removed. Chunks a plain download left in the
+level are not used. Live mode is intentionally full-volume only, conflicts with
 `--no-download`, and currently rejects a separately remote Lasagna `--pred-dt`.
-Interrupted runs retain atomically completed chunks and can be rerun directly.
+Interrupted runs keep the cache and can be rerun directly.
 
 ### Multi-axis processing
 

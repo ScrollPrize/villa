@@ -1,4 +1,5 @@
 #pragma once
+#include "../shared/percentile.hpp"
 #include "../ops/intensity.hpp"
 #include "../core.hpp"
 #include "normalization.hpp"
@@ -74,14 +75,14 @@ inline ChannelPlan channel_parameters(const BlankRectangle& t, const Array& a, R
 inline ChannelPlan channel_parameters(const SliceIllumination& t, const Array& a, Random& r) {
     auto dim = a.shape.size() - 1, d = std::size_t(axis(t.axis, dim)), n = a.shape[d + 1];
     ChannelPlan p; p.values = {double(d)}; p.field.assign(n, 1);
-    for (int count = int(std::round(draw(t.defects, r))); count > 0; --count) {
+    for (int count = int(round_half_even(draw(t.defects, r))); count > 0; --count) {
         double width = draw(t.width, r), reduction = draw(t.reduction, r), pos = double(r.index(n));
         require(width > 0, "illumination defect width must be positive");
         for (std::size_t i = 0; i < n; ++i) p.field[i] *= 1 - std::exp(-.5 * std::pow((i - pos) / width, 2)) * (1 - reduction);
     }
     for (auto& v : p.field) v = std::clamp(v, .1f, 1.f);
     double bp = draw(t.base_p, r); probability(bp);
-    auto count = std::size_t(std::round(bp * n));
+    auto count = std::size_t(round_half_even(bp * n));
     std::vector<double> weights(n); for (std::size_t i = 0; i < n; ++i) weights[i] = 2 - p.field[i];
     for (std::size_t j = 0; j < count; ++j) {
         double threshold = r.uniform() * std::accumulate(weights.begin(), weights.end(), 0.);
@@ -96,30 +97,24 @@ inline ChannelPlan channel_parameters(const Smear& t, const Array& a, Random&) {
     return {"", 0, {double(axis(t.axis, a.shape.size() - 1))}};
 }
 
-// Normalized intensity powers need only image precision. Preserve the wider
-// calculation when conversion would underflow, or a large exponent would
-// amplify rounding a normalized base close to one.
-template<class T> inline double intensity_power(double base, double exponent) {
-    if constexpr (std::is_same_v<T, float>) {
-        if ((base == 0 || base >= std::numeric_limits<float>::min()) &&
-            exponent >= std::numeric_limits<float>::min() && exponent <= 16)
-            return std::pow(float(base), float(exponent));
-    }
-    return std::pow(base, exponent);
-}
-
 // Share the transform with compact palette consumers. Their statistics and
 // bounds must be weighted by the actual number of voxels at each palette entry.
 template<class T, class Statistics, class Bounds>
-inline void gamma_values(std::vector<T>& v, const ChannelPlan& p, Statistics&& statistics, Bounds&& bounds) {
+inline void gamma_values(std::vector<T>& v, const ChannelPlan& p, Statistics&& statistics, Bounds&& bounds, const Gamma& t = {}) {
     bool invert = p.values[1], retain = p.values[2];
     if (invert) for (auto& x : v) x = -x;
     const auto before = retain ? statistics(v) : std::pair{0., 0.};
     const auto [low, high] = bounds(v); double range = high - low;
     for (auto& x : v) {
-        T value=std::pow((x-T(low))/std::max(T(range),T(1e-7)),T(p.values[0]))*T(range)+T(low);
+        auto unit = (x-T(low))/std::max(T(range),T(t.eps));
+        if (t.clip) unit = std::clamp(unit, T(0), T(1));
+        T value=std::pow(unit,T(p.values[0]))*T(range)+T(low);
         if constexpr(std::is_same_v<T,float>) if(!std::isfinite(value) || !std::isfinite(T(range)))
-            value=T(std::pow((double(x)-low)/std::max(range,1e-7),p.values[0])*range+low);
+            {
+                double wide = (double(x)-low)/std::max(range,t.eps);
+                if (t.clip) wide = std::clamp(wide, 0., 1.);
+                value=T(std::pow(wide,p.values[0])*range+low);
+            }
         x=value;
     }
     if (retain) {
@@ -129,13 +124,26 @@ inline void gamma_values(std::vector<T>& v, const ChannelPlan& p, Statistics&& s
     if (invert) for (auto& x : v) x = -x;
 }
 template<class T>
-inline void channel_apply(const Gamma&, std::vector<T>& v, const Grid&, const ChannelPlan& p) {
+inline void channel_apply(const Gamma& t, std::vector<T>& v, const Grid&, const ChannelPlan& p,
+                          const std::vector<std::uint8_t>& valid = {}) {
+    const auto selected = [&](const auto& values) {
+        std::vector<T> out;
+        for (std::size_t i = 0; i < values.size(); ++i) if (valid[i]) out.push_back(values[i]);
+        return out;
+    };
     gamma_values(v, p,
-        [](const auto& values) { double m = mean(values); return std::pair{m, deviation(values, m)}; },
-        [](const auto& values) {
-            const auto [lo, hi] = std::minmax_element(values.begin(), values.end());
-            return std::pair<double, double>{*lo, *hi};
-        });
+        [&](const auto& values) {
+            if (valid.empty()) { double m = mean(values); return std::pair{m, deviation(values, m)}; }
+            const auto chosen = selected(values); double m = mean(chosen); return std::pair{m, deviation(chosen, m)};
+        },
+        [&](const auto& values) {
+            // Bounds need no temporary selection buffer.
+            double low = INFINITY, high = -INFINITY;
+            for (std::size_t i = 0; i < values.size(); ++i) if (valid.empty() || valid[i]) {
+                low = std::min(low, double(values[i])); high = std::max(high, double(values[i]));
+            }
+            return std::pair{low, high};
+        }, t);
 }
 
 template<class T,class Real>
@@ -177,18 +185,18 @@ template<class Values> void channel_apply(const RicianNoise&, Values& v, const G
 }
 template<class T> inline void channel_apply(const ClipOutliers&, std::vector<T>& v, const Grid&, const ChannelPlan& p) {
     double std = p.values[2] ? deviation(v, mean(v)) : 0; auto sorted = v;
-    auto percentile = [&](double q) {
-        double pos = q / 100 * (v.size() - 1); auto lo = std::size_t(pos), hi = std::min(lo + 1, v.size() - 1);
-        std::nth_element(sorted.begin(), sorted.begin() + lo, sorted.end());
-        double low = sorted[lo], high = hi == lo ? low : *std::min_element(sorted.begin() + hi, sorted.end());
-        return low + (high - low) * (pos - lo);
-    };
-    double low = percentile(p.values[0]), high = percentile(p.values[1]);
+    double low = percentile_detail::percentile<percentile_detail::Rule::Linear>(sorted, p.values[0]);
+    double high = percentile_detail::percentile<percentile_detail::Rule::Linear>(sorted, p.values[1]);
     for (auto& x : v) x = std::clamp(double(x), low, high);
     if (p.values[2]) { double m = mean(v), after = deviation(v, m); if (after > 1e-8) for (auto& x : v) x = (x - m) / after * std + m; }
 }
 template<class T>
 inline void channel_apply(const GaussianBlur& t, std::vector<T>& v, const Grid& g, const ChannelPlan& p) { gaussian_blur(v, g, p.values, t.truncate, t.boundary, t.full_width); }
+// The std::array bounds below are namespace-scope constants, not function-local ones: CUDA
+// 13.0's cudafe++ prints a std::array type first named with a function-local bound as invalid
+// C++ (`unsigned long((256))`) wherever the same type is named again (voxel_transform.hpp).
+inline constexpr std::size_t palette_limit = 256;   // distinct values a uint8 code names
+inline constexpr std::size_t palette_slots = 1024;  // float_palette's open-addressing table
 // Exact palette compression, not quantization. This benefits CT patches and
 // pointwise intensity transforms of them; continuous-valued inputs use the
 // small-window network or nth_element. The bounded palette stays in L1 cache.
@@ -198,9 +206,9 @@ inline void channel_apply(const GaussianBlur& t, std::vector<T>& v, const Grid& 
 template<class Values>
 inline bool float_palette(const Values& v, std::vector<std::uint8_t>& codes,
                           std::vector<float>& values, bool sorted = true) {
-    constexpr std::size_t slots = 1024;
-    std::array<std::uint32_t, slots> keys{};
-    std::array<std::uint16_t, slots> indices;
+    constexpr std::size_t slots = palette_slots;
+    std::array<std::uint32_t, palette_slots> keys{};
+    std::array<std::uint16_t, palette_slots> indices;
     indices.fill(256);
     values.clear();
     bool positive_zero = false, negative_zero = false;
@@ -239,7 +247,7 @@ template<class Values, class T>
 inline bool median_palette(const Values& v, std::vector<std::uint8_t>& codes,
                            std::vector<T>& values) {
     if constexpr (std::is_same_v<T, float>) return float_palette(v, codes, values);
-    constexpr std::size_t limit = 256;
+    constexpr std::size_t limit = palette_limit;
     std::unordered_map<T, std::uint16_t> palette;
     palette.reserve(limit + 1);
     bool positive_zero = false, negative_zero = false;
@@ -261,7 +269,7 @@ inline bool median_palette(const Values& v, std::vector<std::uint8_t>& codes,
     }
     for (const auto& [value, code] : palette) values.push_back(value);
     std::sort(values.begin(), values.end());
-    std::array<std::uint8_t, limit> ranks{};
+    std::array<std::uint8_t, palette_limit> ranks{};
     for (std::size_t rank = 0; rank < values.size(); ++rank) ranks[palette.at(values[rank])] = static_cast<std::uint8_t>(rank);
     for (auto& code : codes) code = ranks[code];
     return true;
@@ -270,7 +278,7 @@ inline bool median_palette(const Values& v, std::vector<std::uint8_t>& codes,
 template<class Values, class T>
 inline bool encode_median_palette(const Values& v, std::vector<std::uint8_t>& codes,
                                   std::vector<T>& values, bool quantize) {
-    constexpr std::size_t limit = 256;
+    constexpr std::size_t limit = palette_limit;
     if (!median_palette(v, codes, values)) {
         if (!quantize || !std::all_of(v.begin(), v.end(), [](T x) { return std::isfinite(x); })) return false;
         const auto bounds = std::minmax_element(v.begin(), v.end());
@@ -282,7 +290,7 @@ inline bool encode_median_palette(const Values& v, std::vector<std::uint8_t>& co
             values[code] = T(std::lerp(low, high, double(code) / (limit - 1)));
         codes.resize(v.size());
         for (std::size_t i = 0; i < v.size(); ++i)
-            codes[i] = std::uint8_t(std::clamp(std::floor((double(v[i]) - low) / range * (limit - 1) + .5), 0., double(limit - 1)));
+            codes[i] = std::uint8_t(std::clamp(round_half_even((double(v[i]) - low) / range * (limit - 1)), 0., double(limit - 1)));
         // Monotone quantization commutes with rank selection: the result is
         // the quantized exact median, within range/510 plus output rounding.
     }
@@ -291,22 +299,22 @@ inline bool encode_median_palette(const Values& v, std::vector<std::uint8_t>& co
 
 // Exact rank selection shared by ordinary and compact images.
 template<class Output, class Values>
-inline void median_rank_filter(const std::vector<std::uint8_t>& codes, Output& v, const Values& values,
+inline void median_rank_filter(const std::uint8_t* codes, Output& v, const Values& values,
                                const Grid& g, std::size_t k, const std::vector<std::size_t>& iz,
                                const std::vector<std::size_t>& iy, const std::vector<std::size_t>& ix) {
-    if (g.shape.size() == 3 && k == 3) {
+    if (k == 3) {
         median_detail::median3_filter<64>(codes, v, g, iz, iy, ix,
                                         [&](std::uint8_t code) { return values[code]; });
         return;
     }
-    constexpr std::size_t limit = 256;
+    constexpr std::size_t limit = palette_limit;
     const auto dim = g.shape.size(), nz = dim == 3 ? g.shape[0] : 1;
     const auto ny = g.shape[dim - 2], nx = g.shape.back(), kz = dim == 3 ? k : 1;
     const auto middle = kz * k * k / 2;
     for (std::size_t z = 0; z < nz; ++z) for (std::size_t y = 0; y < ny; ++y) {
-        std::array<std::uint32_t, limit> counts{};
+        std::array<std::uint32_t, palette_limit> counts{};
         for (std::size_t dz = 0; dz < kz; ++dz) for (std::size_t dy = 0; dy < k; ++dy) {
-            const auto* row = codes.data() + iz[z * kz + dz] + iy[y * k + dy];
+            const auto* row = codes + iz[z * kz + dz] + iy[y * k + dy];
             for (std::size_t dx = 0; dx < k; ++dx) ++counts[row[ix[dx]]];
         }
         // Adjacent windows tend to have nearby medians. Maintain the count
@@ -319,7 +327,7 @@ inline void median_rank_filter(const std::vector<std::uint8_t>& codes, Output& v
             if (x + 1 == nx) break;
             const auto leave = ix[x * k], enter = ix[(x + 1) * k + k - 1];
             for (std::size_t dz = 0; dz < kz; ++dz) for (std::size_t dy = 0; dy < k; ++dy) {
-                const auto* row = codes.data() + iz[z * kz + dz] + iy[y * k + dy];
+                const auto* row = codes + iz[z * kz + dz] + iy[y * k + dy];
                 auto from = row[leave], to = row[enter];
                 if (from == to) continue;
                 --counts[from]; ++counts[to];
@@ -363,7 +371,7 @@ inline bool median_histogram(std::vector<T>& v, const Grid& g, std::size_t k,
     std::vector<std::uint8_t> codes;
     std::vector<T> values;
     if (!encode_median_palette(v, codes, values, quantize)) return false;
-    if (values.size() > 1) median_rank_filter(codes, v, values, g, k, iz, iy, ix);
+    if (values.size() > 1) median_rank_filter(codes.data(), v, values, g, k, iz, iy, ix);
     return true;
 }
 
@@ -377,8 +385,13 @@ inline void channel_apply(const MedianFilter& t, std::vector<T>& v, const Grid& 
     const auto nz = dim == 3 ? g.shape[0] : 1, ny = g.shape[dim - 2], nx = g.shape.back();
     const auto kz = dim == 3 ? k : 1;
     auto iz = median_indices(nz, kz, ny * nx), iy = median_indices(ny, k, nx), ix = median_indices(nx, k, 1);
+    // 2D size 3 selects directly on the values: the palette's per-voxel encoding costs more than
+    // the 9-input selector (in 3D the byte network over 27 inputs wins). Both give the exact
+    // median, and non-finite values already took this path.
+    // Quantization changes values, so it keeps the palette.
+    if (dim == 2 && k == 3 && !t.quantize && median_detail::median3(v, g, iz, iy, ix)) return;
     if (median_histogram(v, g, k, iz, iy, ix, t.quantize)) return;
-    if (dim == 3 && k == 3 && median_detail::median3(v, g, iz, iy, ix)) return;
+    if (k == 3 && median_detail::median3(v, g, iz, iy, ix)) return;
     auto src = v;
     std::vector<T> values(kz * k * k);
     for (std::size_t z = 0; z < nz; ++z) for (std::size_t y = 0; y < ny; ++y)
@@ -542,12 +555,84 @@ Parameters sample(const T& t, const Sample& s, Random& r) {
     }
     return result;
 }
+// 2D float32 size-3 median read straight from the (possibly borrowed) input and written once:
+// the same selection as channel_apply's median3 path, without its copies. False when that
+// path does not apply (mixed signed zeros keep the general selector).
+inline bool median3_plane_direct(const MedianFilter& t, Array& a, const Grid& g, const ChannelPlan& c) {
+    if (a.kind != 'f' || a.bytes != 4 || g.shape.size() != 2 || c.values[0] != 3 || t.quantize) return false;
+    const auto ny = g.shape[0], nx = g.shape[1];
+    const auto iy = median_indices(ny, 3, nx), ix = median_indices(nx, 3, 1);
+    const auto identity = [](float value) { return value; };
+    if (a.shape[0] == 1 && a.borrowed && !a.writable) {
+        // Read the view, write fresh storage (a batch slot when the view has one): no copy. The
+        // signed-zero check rides along; with both zeros the input is restored for the general path.
+        const auto* input = static_cast<const float*>(std::as_const(a).data());
+        auto* output = static_cast<float*>(a.fresh());
+        std::span<float> values(output, g.size);
+        if (median_detail::median9_plane<float, std::span<float>, decltype(identity), true>(input, values, ny, nx, iy, ix, identity)) {
+            std::copy_n(input, g.size, output);
+            return false;
+        }
+        return true;
+    }
+    auto* data = static_cast<float*>(a.data()) + c.channel * g.size;
+    if (median_detail::mixed_zeros(data, g.size)) return false;
+    median_detail::median9_plane_inplace(data, ny, nx, iy, ix);
+    return true;
+}
+// A uint8 channel's median or blur, written as float32: the float path's selection and
+// arithmetic on the same values (median ranks are value ranks; every sample converts exactly).
+inline void narrow_apply(const MedianFilter&, const ChannelPlan& c, const Grid& g, const std::uint8_t* input, float* output) {
+    const auto k = std::size_t(c.values[0]);
+    if (k == 1) { widen_values(input, output, g.size); return; }
+    const auto dim = g.shape.size();
+    const auto nz = dim == 3 ? g.shape[0] : 1, ny = g.shape[dim - 2], nx = g.shape.back();
+    const auto iz = median_indices(nz, dim == 3 ? k : 1, ny * nx), iy = median_indices(ny, k, nx), ix = median_indices(nx, k, 1);
+    if (dim == 2 && k == 3) {
+        // Select among bytes (vectorized, in place), then widen once.
+        std::vector<std::uint8_t> bytes(input, input + g.size);
+        median_detail::median9_plane_inplace(bytes.data(), ny, nx, iy, ix);
+        widen_values(bytes.data(), output, g.size);
+        return;
+    }
+    std::array<float, 256> levels; std::iota(levels.begin(), levels.end(), 0.f);
+    std::span<float> values(output, g.size);
+    // Quantization only applies beyond 256 distinct values, so it never changes uint8 medians.
+    median_rank_filter(input, values, levels, g, k, iz, iy, ix);
+}
+inline void narrow_apply(const GaussianBlur& t, const ChannelPlan& c, const Grid& g, const std::uint8_t* input, float* output) {
+    gaussian_blur_buffer(input, output, g, c.values, t.truncate, t.boundary, t.full_width);
+}
 template<class T> requires requires(T t) { t.options; }
-void apply(const T& t, Sample& s, const Parameters& p) {
+void apply(const T& t, Sample& s, const Parameters& planned) {
     if constexpr (std::is_same_v<T, Gamma> || std::is_same_v<T, GaussianBlur> || std::is_same_v<T, MedianFilter> ||
                   std::is_same_v<T, Sharpen> || std::is_same_v<T, LocalSmoothing>) {
+        Parameters narrowed;
+        if constexpr (std::is_same_v<T, GaussianBlur> || std::is_same_v<T, MedianFilter>)
+            narrowed = narrow_channels(s, planned, [&](const ChannelPlan& c, const Grid& g, const std::uint8_t* input, float* output) {
+                narrow_apply(t, c, g, input, output);
+            });
+        const auto& p = std::is_same_v<T, GaussianBlur> || std::is_same_v<T, MedianFilter> ? narrowed : planned;
         for (const auto& c : p.channels) {
             auto& a = s.at(c.key).array; Grid g(a.spatial());
+            if constexpr (std::is_same_v<T, MedianFilter>)
+                if (median3_plane_direct(t, a, g, c)) continue;
+            const auto run_channel = [&](auto& values) {
+                if constexpr (std::is_same_v<T, Gamma>) {
+                    const auto valid = t.masked ? normalization_detail::valid_voxels(s, c.key, c.channel) : std::vector<std::uint8_t>{};
+                    channel_apply(t, values, g, c, valid);
+                } else channel_apply(t, values, g, c);
+            };
+            if constexpr (std::is_same_v<T, GaussianBlur>) {
+                // A single-channel view: blur from it straight into fresh storage (its batch slot).
+                if (a.bytes == 4 && a.shape[0] == 1 && a.borrowed && !a.writable) {
+                    const auto* input = static_cast<const float*>(std::as_const(a).data());
+                    if (!magnitude_exceeds(input, g.size, std::numeric_limits<float>::max() / 64.)) {
+                        gaussian_blur_buffer(input, static_cast<float*>(a.fresh()), g, c.values, t.truncate, t.boundary, t.full_width);
+                        continue;
+                    }
+                }
+            }
             if (a.bytes == 4) {
                 auto* data = static_cast<float*>(a.data()) + c.channel * g.size;
                 // Float arithmetic is sufficient for ordinary images. Retain
@@ -556,24 +641,26 @@ void apply(const T& t, Sample& s, const Parameters& p) {
                 if constexpr (!std::is_same_v<T, MedianFilter> && !std::is_same_v<T, Gamma>) {
                     double limit = std::numeric_limits<float>::max() / 64.;
                     if constexpr (std::is_same_v<T, Sharpen>) limit /= std::max(1., std::abs(c.values[0]));
-                    if (std::any_of(data, data + g.size, [&](float x) { return std::abs(double(x)) > limit; }) ||
+                    if (magnitude_exceeds(data, g.size, limit) ||
                         (std::is_same_v<T, Sharpen> && std::abs(c.values[0]) > std::numeric_limits<float>::max())) {
-                        auto values = a.channel(c.channel); channel_apply(t, values, g, c); a.channel(c.channel, values);
+                        auto values = a.channel(c.channel); run_channel(values); a.channel(c.channel, values);
                         continue;
                     }
                 }
-                if constexpr (std::is_same_v<T, LocalSmoothing>) {
+                if constexpr (std::is_same_v<T, GaussianBlur>) {
+                    gaussian_blur_buffer(data, data, g, c.values, t.truncate, t.boundary, t.full_width);
+                } else if constexpr (std::is_same_v<T, LocalSmoothing>) {
                     // The blur already owns a separate buffer. Blend directly
                     // into the writable image instead of copying out and back.
                     std::span<float> values(data, g.size);
-                    channel_apply(t, values, g, c);
+                    run_channel(values);
                 } else {
                     std::vector<float> values(data, data + g.size);
-                    channel_apply(t, values, g, c);
+                    run_channel(values);
                     std::copy(values.begin(), values.end(), data);
                 }
             } else {
-                auto values = a.channel(c.channel); channel_apply(t, values, g, c); a.channel(c.channel, values);
+                auto values = a.channel(c.channel); run_channel(values); a.channel(c.channel, values);
             }
         }
         restore_valid(s);
@@ -582,7 +669,7 @@ void apply(const T& t, Sample& s, const Parameters& p) {
                   std::is_same_v<T, BlankRectangle> || std::is_same_v<T, SliceIllumination> ||
                   std::is_same_v<T, GaussianNoise> || std::is_same_v<T, RicianNoise> ||
                   std::is_same_v<T, BrightnessGradient> || std::is_same_v<T, LocalContrast> || std::is_same_v<T, LocalGamma>) {
-        for (const auto& c : p.channels) {
+        for (const auto& c : planned.channels) {
             auto& a = s.at(c.key).array; Grid g(a.spatial());
             if constexpr (std::is_same_v<T, BlankRectangle>) {
                 if (!t.statistic.empty()) { auto v = a.channel(c.channel); channel_apply(t, v, g, c); a.channel(c.channel, v); continue; }
@@ -595,13 +682,17 @@ void apply(const T& t, Sample& s, const Parameters& p) {
                               std::is_same_v<T, BrightnessGradient> || std::is_same_v<T, LocalContrast> || std::is_same_v<T, LocalGamma>)
                     channel_apply(t, v, g, c);
                 else {
-                    double m = 0, low = 0, high = 0;
+                    double m = 0, low = INFINITY, high = -INFINITY;
                     if constexpr (std::is_same_v<T, Contrast> || std::is_same_v<T, Invert>) {
-                        for (auto x : v) m += double(x);
-                        m /= v.size();
-                    }
-                    if constexpr (std::is_same_v<T, Contrast>) {
-                        auto bounds = std::minmax_element(v.begin(), v.end()); low = *bounds.first; high = *bounds.second;
+                        std::vector<std::uint8_t> valid;
+                        if constexpr (std::is_same_v<T, Contrast>)
+                            if (t.masked) valid = normalization_detail::valid_voxels(s, c.key, c.channel);
+                        std::size_t count = 0;
+                        for (std::size_t i = 0; i < v.size(); ++i) if (valid.empty() || valid[i]) {
+                            m += double(v[i]); ++count;
+                            low = std::min(low, double(v[i])); high = std::max(high, double(v[i]));
+                        }
+                        m /= count;
                     }
                     for (auto& x : v) {
                         V y = pointwise_intensity(t, x, c, V(m), V(low), V(high));
@@ -615,6 +706,6 @@ void apply(const T& t, Sample& s, const Parameters& p) {
             else run(static_cast<double*>(a.data()));
         }
         restore_valid(s);
-    } else apply_channels(s, p, [&](auto& v, const Grid& g, const ChannelPlan& c) { channel_apply(t, v, g, c); });
+    } else apply_channels(s, planned, [&](auto& v, const Grid& g, const ChannelPlan& c) { channel_apply(t, v, g, c); });
 }
 } // namespace vcr::transforms

@@ -1,10 +1,14 @@
-#include "vc/fiber_tracer/FiberReplayVisualization.hpp"
-#include "vc/core/types/Volume.hpp"
+#include "vc/core/util/CudaSampling.hpp"
 #include "vc/core/util/QuadSurface.hpp"
-#include "vc/core/util/SurfaceTexture.hpp"
+#include "vc/fiber_tracer/FiberReplayVisualization.hpp"
+#include <iomanip>
+#include <sstream>
+#include "vc/core/util/QuadSurface.hpp"
+#include <vc_reader/grid.hpp>
+#include <vc_reader/display.hpp>
+#include <vc_reader/zarr.hpp>
 #include <algorithm>
 #include <cmath>
-#include <fstream>
 #include <limits>
 #include <opencv2/imgproc.hpp>
 namespace vc::fiber_tracer {
@@ -42,177 +46,6 @@ nlohmann::json failureJson(
     });
     return result;
 }
-struct OmeZarrGroupTransform {
-    std::array<double, 3> scaleFromBaseXYZ{};
-    std::array<double, 3> offsetFromBaseXYZ{};
-};
-
-struct OmeCoordinateTransform {
-    std::array<double, 3> scaleZYX{1.0, 1.0, 1.0};
-    std::array<double, 3> translationZYX{0.0, 0.0, 0.0};
-};
-
-OmeCoordinateTransform omeCoordinateTransform(
-    const nlohmann::json& dataset,
-    const std::filesystem::path& attrsPath)
-{
-    OmeCoordinateTransform result;
-    if (!dataset.contains("coordinateTransformations")) {
-        throw std::invalid_argument(
-            "OME-Zarr dataset is missing coordinateTransformations: " +
-            attrsPath.string());
-    }
-    const auto& transforms = dataset.at("coordinateTransformations");
-    if (!transforms.is_array()) {
-        throw std::invalid_argument(
-            "OME-Zarr dataset coordinateTransformations must be an array: " +
-            attrsPath.string());
-    }
-    bool sawScale = false;
-    bool sawTranslation = false;
-    for (const auto& transform : transforms) {
-        if (!transform.is_object() || !transform.contains("type") ||
-            !transform.at("type").is_string()) {
-            throw std::invalid_argument(
-                "OME-Zarr dataset has an invalid coordinate transformation: " +
-                attrsPath.string());
-        }
-        const std::string type = transform.at("type").get<std::string>();
-        if (type != "scale" && type != "translation")
-            continue;
-        if (!transform.contains(type) || !transform.at(type).is_array() ||
-            transform.at(type).size() != 3 ||
-            (type == "scale" && sawScale) ||
-            (type == "translation" && sawTranslation)) {
-            throw std::invalid_argument(
-                "OME-Zarr dataset has an invalid " + type +
-                " transformation: " + attrsPath.string());
-        }
-        auto& target = type == "scale" ? result.scaleZYX : result.translationZYX;
-        for (size_t axis = 0; axis < 3; ++axis) {
-            if (!transform.at(type).at(axis).is_number()) {
-                throw std::invalid_argument(
-                    "OME-Zarr dataset transformation values must be numeric: " +
-                    attrsPath.string());
-            }
-            target[axis] = transform.at(type).at(axis).get<double>();
-            if (!std::isfinite(target[axis]) ||
-                (type == "scale" && !(target[axis] > 0.0))) {
-                throw std::invalid_argument(
-                    "OME-Zarr dataset transformation values are invalid: " +
-                    attrsPath.string());
-            }
-        }
-        sawScale = sawScale || type == "scale";
-        sawTranslation = sawTranslation || type == "translation";
-    }
-    if (!sawScale) {
-        throw std::invalid_argument(
-            "OME-Zarr dataset is missing a scale transformation: " +
-            attrsPath.string());
-    }
-    return result;
-}
-
-OmeZarrGroupTransform omeZarrGroupTransform(
-    const std::filesystem::path& groupPath)
-{
-    const auto normalizeDirectory = [](const std::filesystem::path& path) {
-        auto normalized = std::filesystem::absolute(path).lexically_normal();
-        while (normalized != normalized.root_path() &&
-               normalized.filename().empty()) {
-            normalized = normalized.parent_path();
-        }
-        return normalized;
-    };
-    const auto selected = normalizeDirectory(groupPath);
-    if (!std::filesystem::exists(selected / ".zarray") &&
-        !std::filesystem::exists(selected / "zarr.json")) {
-        throw std::invalid_argument(
-            "replay strip CT --volume must name a concrete Zarr array/group");
-    }
-
-    for (auto root = selected.parent_path(); !root.empty();
-         root = root.parent_path()) {
-        const auto attrsPath = root / ".zattrs";
-        if (!std::filesystem::exists(attrsPath)) {
-            if (root == root.root_path())
-                break;
-            continue;
-        }
-        std::ifstream input(attrsPath);
-        if (!input)
-            throw std::runtime_error("cannot read OME-Zarr attributes: " + attrsPath.string());
-        nlohmann::json attrs;
-        input >> attrs;
-        if (!attrs.contains("multiscales") || !attrs.at("multiscales").is_array())
-            continue;
-        for (const auto& multiscale : attrs.at("multiscales")) {
-            if (!multiscale.is_object() || !multiscale.contains("datasets") ||
-                !multiscale.at("datasets").is_array() ||
-                multiscale.at("datasets").empty()) {
-                continue;
-            }
-            if (multiscale.contains("axes")) {
-                const auto& axes = multiscale.at("axes");
-                if (!axes.is_array() || axes.size() != 3) {
-                    throw std::invalid_argument(
-                        "replay strip CT OME-Zarr must have three Z,Y,X axes");
-                }
-                constexpr std::array<const char*, 3> expected{"z", "y", "x"};
-                for (size_t axis = 0; axis < 3; ++axis) {
-                    if (!axes.at(axis).is_object() ||
-                        axes.at(axis).value("name", std::string{}) != expected[axis]) {
-                        throw std::invalid_argument(
-                            "replay strip CT OME-Zarr axes must be ordered Z,Y,X");
-                    }
-                }
-            }
-
-            const auto& datasets = multiscale.at("datasets");
-            const nlohmann::json* selectedDataset = nullptr;
-            for (const auto& dataset : datasets) {
-                if (!dataset.is_object() || !dataset.contains("path") ||
-                    !dataset.at("path").is_string()) {
-                    continue;
-                }
-                const auto candidate = normalizeDirectory(
-                    root / dataset.at("path").get<std::string>());
-                if (candidate == selected) {
-                    selectedDataset = &dataset;
-                    break;
-                }
-            }
-            if (selectedDataset == nullptr)
-                continue;
-            const auto& baseDataset = datasets.front();
-            if (!baseDataset.is_object() || !baseDataset.contains("path") ||
-                !baseDataset.at("path").is_string()) {
-                throw std::invalid_argument(
-                    "OME-Zarr base dataset descriptor is invalid: " +
-                    attrsPath.string());
-            }
-            const auto base = omeCoordinateTransform(baseDataset, attrsPath);
-            const auto group = omeCoordinateTransform(*selectedDataset, attrsPath);
-            OmeZarrGroupTransform result;
-            for (size_t xyzAxis = 0; xyzAxis < 3; ++xyzAxis) {
-                const size_t zyxAxis = 2 - xyzAxis;
-                result.scaleFromBaseXYZ[xyzAxis] =
-                    base.scaleZYX[zyxAxis] / group.scaleZYX[zyxAxis];
-                result.offsetFromBaseXYZ[xyzAxis] =
-                    (base.translationZYX[zyxAxis] -
-                     group.translationZYX[zyxAxis]) /
-                    group.scaleZYX[zyxAxis];
-            }
-            return result;
-        }
-        if (root == root.root_path())
-            break;
-    }
-    throw std::invalid_argument(
-        "replay strip CT --volume group is not advertised by parent OME-Zarr multiscales metadata");
-}
-
 cv::Mat_<cv::Vec3f> nativeGroupTextureCoordinates(
     const cv::Mat_<cv::Vec3f>& basePoints,
     const FiberReplayStripTextureSource& source, double baseSamplesPerPixel = 0,
@@ -220,11 +53,8 @@ cv::Mat_<cv::Vec3f> nativeGroupTextureCoordinates(
 {
     cv::Mat_<cv::Vec3f> groupPoints = basePoints.clone();
     for (auto& point : groupPoints) {
-        for (size_t axis = 0; axis < 3; ++axis) {
-            point[axis] = static_cast<float>(
-                static_cast<double>(point[axis]) *
-                    source.scaleFromBaseXYZ[axis] +
-                source.offsetFromBaseXYZ[axis]);
+        for (int axis = 0; axis < 3; ++axis) {
+            point[axis] = static_cast<float>(source.fromBase(axis, static_cast<double>(point[axis])));
         }
     }
 
@@ -875,10 +705,10 @@ void validateTextureSource(const FiberReplayStripTextureSource& source)
             source.shapeZYX.begin(), source.shapeZYX.end(),
             [](int value) { return value <= 0; }) ||
         std::any_of(
-            source.scaleFromBaseXYZ.begin(), source.scaleFromBaseXYZ.end(),
+            source.placement.scale.begin(), source.placement.scale.end(),
             [](double value) { return !std::isfinite(value) || value <= 0.0; }) ||
         std::any_of(
-            source.offsetFromBaseXYZ.begin(), source.offsetFromBaseXYZ.end(),
+            source.placement.offset.begin(), source.placement.offset.end(),
             [](double value) { return !std::isfinite(value); })) {
         throw std::invalid_argument(
             "replay strip CT source metadata is invalid");
@@ -954,31 +784,269 @@ std::vector<BuiltLineViewComponent> buildLineViewComponents(
     return output;
 }
 
+nlohmann::json pointsJson(const std::vector<cv::Vec3d>& points)
+{
+    nlohmann::json result = nlohmann::json::array();
+    for (const auto& point : points)
+        result.push_back(pointJson(point));
+    return result;
+}
+
+bool sameThresholdMeasurement(
+    const FiberReplayThresholdMeasurement& left,
+    const FiberReplayThresholdMeasurement& right)
+{
+    const auto sameOptional = [](const auto& first, const auto& second) {
+        return first.has_value() == second.has_value() &&
+            (!first.has_value() || nearlyEqual(*first, *second));
+    };
+    return nearlyEqual(
+               left.euclideanErrorBaseVoxels,
+               right.euclideanErrorBaseVoxels) &&
+        sameOptional(
+            left.normalErrorBaseVoxels,
+            right.normalErrorBaseVoxels) &&
+        sameOptional(
+            left.tangentialErrorBaseVoxels,
+            right.tangentialErrorBaseVoxels) &&
+        nearlyEqual(
+            left.thresholdErrorBaseVoxels,
+            right.thresholdErrorBaseVoxels) &&
+        nearlyEqual(left.thresholdErrorRatio, right.thresholdErrorRatio) &&
+        left.localNormalValid == right.localNormalValid;
+}
+
+void validateGreedyThresholdData(
+    const FiberReplayTraceResult& replay,
+    double normalThresholdBaseVoxels)
+{
+    for (const auto& segment : replay.segments) {
+        for (const auto& match : segment.matches) {
+            if (match.tracePointIndex >= segment.tracePointsBase.size()) {
+                throw std::invalid_argument(
+                    "greedy replay threshold match index is invalid");
+            }
+            validateFiberReplayThresholdMeasurement(
+                match.thresholdMeasurement,
+                normalThresholdBaseVoxels);
+            if (!nearlyEqual(
+                    cv::norm(
+                        segment.tracePointsBase[match.tracePointIndex] -
+                        match.matchedReferencePointBase),
+                    match.thresholdMeasurement.euclideanErrorBaseVoxels)) {
+                throw std::invalid_argument(
+                    "greedy replay threshold Euclidean error differs from geometry");
+            }
+        }
+    }
+    for (const auto& failure : replay.failures) {
+        if (failure.thresholdMeasurement.has_value()) {
+            validateFiberReplayThresholdMeasurement(
+                *failure.thresholdMeasurement,
+                normalThresholdBaseVoxels);
+        }
+        if (failure.reason != "distance_above_threshold")
+            continue;
+        if (!failure.thresholdMeasurement.has_value() ||
+            !failure.segmentPointIndex.has_value() ||
+            failure.segmentIndex >= replay.segments.size()) {
+            throw std::invalid_argument(
+                "greedy replay distance failure lacks threshold diagnostics");
+        }
+        const auto& matches = replay.segments[failure.segmentIndex].matches;
+        const auto found = std::find_if(
+            matches.begin(), matches.end(), [&](const auto& match) {
+                return match.tracePointIndex == *failure.segmentPointIndex;
+            });
+        if (found == matches.end() ||
+            !sameThresholdMeasurement(
+                found->thresholdMeasurement,
+                *failure.thresholdMeasurement)) {
+            throw std::invalid_argument(
+                "greedy replay distance failure differs from its terminal match");
+        }
+    }
+}
+
+void validateNativeReplayStructure(const FiberReplayTraceResult& replay)
+{
+    const double begin = replay.referenceBeginArcBase;
+    const double end = replay.referenceEndArcBase;
+    const auto inInterval = [](double v, double lo, double hi) {
+        return std::isfinite(v) && v >= lo - kEpsilon && v <= hi + kEpsilon;
+    };
+    if (!std::isfinite(begin) || begin < 0 || !std::isfinite(end) || end <= begin ||
+        !inInterval(replay.completedReferenceArcBase, begin, end))
+        throw std::invalid_argument("invalid native replay interval/progress");
+    double previousEnd = begin;
+    double previousFilteredEnd = begin;
+    for (const auto& stop : replay.filteredStops) {
+        if (!inInterval(stop[0], previousFilteredEnd, end) ||
+            !inInterval(stop[1], stop[0], end) || !inInterval(stop[2], stop[1], end))
+            throw std::invalid_argument("invalid filtered replay interval");
+        previousFilteredEnd = stop[2];
+    }
+    for (const auto& segment : replay.segments) {
+        if (!inInterval(segment.startReferenceArcBase, previousEnd, end) ||
+            !inInterval(segment.endReferenceArcBase, segment.startReferenceArcBase, end) ||
+            segment.endReferenceArcBase > replay.completedReferenceArcBase + kEpsilon ||
+            (replay.graphGeometry && segment.tracePointsBase.empty() ? !segment.matches.empty() :
+                segment.tracePointsBase.size() != segment.matches.size() + 1) ||
+            (!(replay.graphGeometry && segment.cumulativeLosses.empty()) && segment.cumulativeLosses.size() != segment.tracePointsBase.size()))
+            throw std::invalid_argument("invalid native replay segment interval/geometry");
+        for (const auto& p : segment.tracePointsBase)
+            for (double value : p.val)
+                if (!std::isfinite(value)) throw std::invalid_argument("nonfinite replay point");
+        for (double loss : segment.cumulativeLosses)
+            if (!std::isfinite(loss)) throw std::invalid_argument("nonfinite replay loss");
+        double previousArc = segment.startReferenceArcBase;
+        for (size_t i = 0; i < segment.matches.size(); ++i) {
+            const auto& match = segment.matches[i];
+            if (match.tracePointIndex != i + 1 ||
+                !inInterval(match.searchBeginArcBase, previousArc, previousArc) ||
+                !inInterval(match.searchEndArcBase, match.searchBeginArcBase, end) ||
+                !inInterval(match.predictedReferenceArcBase, match.searchBeginArcBase, match.searchEndArcBase) ||
+                !inInterval(match.matchedReferenceArcBase, match.searchBeginArcBase, match.searchEndArcBase))
+                throw std::invalid_argument("invalid native replay match interval/index");
+            for (double value : match.matchedReferencePointBase.val)
+                if (!std::isfinite(value)) throw std::invalid_argument("nonfinite matched point");
+            previousArc = match.matchedReferenceArcBase;
+        }
+        if (!inInterval(previousArc, segment.startReferenceArcBase, segment.endReferenceArcBase))
+            throw std::invalid_argument("native replay match exceeds segment end");
+        previousEnd = segment.endReferenceArcBase;
+    }
+    for (const auto& failure : replay.failures) {
+        if (failure.segmentIndex >= replay.segments.size())
+            throw std::invalid_argument("invalid native replay failure segment index");
+        const auto& segment = replay.segments[failure.segmentIndex];
+        if (!inInterval(failure.referenceArcBase, segment.startReferenceArcBase, segment.endReferenceArcBase) ||
+            failure.reason != segment.terminationReason ||
+            (failure.segmentPointIndex && *failure.segmentPointIndex >= segment.tracePointsBase.size()))
+            throw std::invalid_argument("invalid native replay failure segment association");
+    }
+}
+
+std::vector<std::vector<cv::Vec3d>> greedySegments(const FiberReplayTraceResult& replay)
+{
+    std::vector<std::vector<cv::Vec3d>> result;
+    result.reserve(replay.segments.size());
+    for (const auto& segment : replay.segments)
+        result.push_back(segment.tracePointsBase);
+    return result;
+}
+
+nlohmann::json greedyReplayJson(
+    const FiberReplayTraceResult& replay,
+    double normalThresholdBaseVoxels)
+{
+    nlohmann::json root = {
+        {"format", "vc_greedy_fiber_replay"},
+        {"filtered_stops", replay.filteredStops},
+        {"reverse_checks", replay.reverseChecks},
+        {"version", 2},
+        {"reference_begin_arc_base", replay.referenceBeginArcBase},
+        {"reference_end_arc_base", replay.referenceEndArcBase},
+        {"completed_reference_arc_base", replay.completedReferenceArcBase},
+        {"threshold", fiberReplayThresholdDescriptorJson(
+             normalThresholdBaseVoxels, replay.tangentialThresholdFactor)},
+        {"segments", nlohmann::json::array()},
+        {"failures", nlohmann::json::array()},
+    };
+    for (const auto& segment : replay.segments) {
+        nlohmann::json matches = nlohmann::json::array();
+        for (const auto& match : segment.matches) {
+            validateFiberReplayThresholdMeasurement(
+                match.thresholdMeasurement,
+                normalThresholdBaseVoxels);
+            auto matchJson = fiberReplayThresholdMeasurementJson(
+                match.thresholdMeasurement);
+            matchJson.update({
+                {"trace_point_index", match.tracePointIndex},
+                {"predicted_reference_arc_base", match.predictedReferenceArcBase},
+                {"matched_reference_arc_base", match.matchedReferenceArcBase},
+                {"matched_reference_point_base_xyz", pointJson(match.matchedReferencePointBase)},
+                {"search_begin_arc_base", match.searchBeginArcBase},
+                {"search_end_arc_base", match.searchEndArcBase},
+            });
+            matches.push_back(std::move(matchJson));
+        }
+        root["segments"].push_back({
+            {"start_reference_arc_base", segment.startReferenceArcBase},
+            {"end_reference_arc_base", segment.endReferenceArcBase},
+            {"termination_reason", segment.terminationReason},
+            {"trace_points_base_xyz", pointsJson(segment.tracePointsBase)},
+            {"trace_cumulative_losses", segment.cumulativeLosses},
+            {"matches", std::move(matches)},
+        });
+        if (segment.filteredDistanceFailure)
+            root["segments"].back()["filtered_distance_failure_xyz_arc"] = *segment.filteredDistanceFailure;
+    }
+    for (const auto& failure : replay.failures)
+        root["failures"].push_back(failureJson(
+            failure, normalThresholdBaseVoxels));
+    return root;
+}
+
+std::string lineObj(const char* header, const std::vector<cv::Vec3d>& points, bool pointRecord = false)
+{
+    std::ostringstream output;
+    output << header << '\n' << std::setprecision(17);
+    for (const auto& point : points)
+        output << "v " << point[0] << ' ' << point[1] << ' ' << point[2] << '\n';
+    if (pointRecord) {
+        if (points.size() != 1)
+            throw std::invalid_argument("replay point OBJ requires exactly one point");
+        output << "p 1\n";
+    } else if (!points.empty()) {
+        output << "l";
+        if (points.size() == 1) {
+            output << " 1 1";
+        } else {
+            for (size_t index = 0; index < points.size(); ++index)
+                output << ' ' << index + 1;
+        }
+        output << '\n';
+    }
+    return output.str();
+}
+
+std::string segmentedLineObj(const char* header, const std::vector<std::vector<cv::Vec3d>>& segments)
+{
+    std::ostringstream output;
+    output << header << '\n' << std::setprecision(17);
+    size_t offset = 0;
+    for (size_t segmentIndex = 0; segmentIndex < segments.size(); ++segmentIndex) {
+        const auto& points = segments[segmentIndex];
+        if (points.empty())
+            continue;
+        output << "g segment_" << segmentIndex << '\n';
+        for (const auto& point : points)
+            output << "v " << point[0] << ' ' << point[1] << ' ' << point[2] << '\n';
+        output << "l";
+        if (points.size() == 1) {
+            output << ' ' << offset + 1 << ' ' << offset + 1;
+        } else {
+            for (size_t index = 0; index < points.size(); ++index)
+                output << ' ' << offset + index + 1;
+        }
+        output << '\n';
+        offset += points.size();
+    }
+    return output.str();
+}
+
 }  // namespace
 FiberReplayStripTextureSource validateFiberReplayStripCtVolume(
-    ::Volume& volume,
-    const std::string& sourceLocator)
+    const vcr::zarr::OpenedArray& ct)
 {
-    if (sourceLocator.empty())
-        throw std::invalid_argument("replay strip CT source locator is empty");
-    auto* cache = volume.chunkedCache();
-    if (cache == nullptr)
-        throw std::runtime_error("replay strip CT volume has no chunk cache");
-    if (cache->numLevels() != 1 || !volume.hasScaleLevel(0)) {
-        throw std::invalid_argument(
-            "replay strip CT --volume must name one concrete Zarr array/group");
-    }
-    if (volume.dtype() != vc::render::ChunkDtype::UInt8) {
-        throw std::invalid_argument(
-            "replay strip CT volume must use uint8 voxels");
-    }
-    const auto transform = omeZarrGroupTransform(sourceLocator);
-    FiberReplayStripTextureSource source{
-        sourceLocator,
-        volume.shape(0),
-        transform.scaleFromBaseXYZ,
-        transform.offsetFromBaseXYZ,
-    };
+    if (ct.meta.shape.size() != 3)
+        throw std::invalid_argument("replay strip CT volume must be a 3-D array");
+    if (ct.meta.type.kind != 'u' || ct.meta.type.itemsize != 1)
+        throw std::invalid_argument("replay strip CT volume must use uint8 voxels");
+    FiberReplayStripTextureSource source{ct.location, {}, ct.placement};
+    for (size_t axis = 0; axis < 3; ++axis)
+        source.shapeZYX[axis] = static_cast<int>(ct.meta.shape[axis]);
     validateTextureSource(source);
     return source;
 }
@@ -1213,7 +1281,7 @@ FiberReplayOverview renderFiberReplayOverview(
     const FiberletGraphReplayResult& fiberletReplay,
     const vc::lasagna::NormalSampler& normalSampler,
     double normalWorkingToBaseScale, int parallelThreads,
-    ::Volume& volume, const std::string& sourceLocator)
+    const vcr::zarr::OpenedArray& ct)
 {
     if (referenceGeometryBase.size() < 2 || !(normalWorkingToBaseScale > 0.0) ||
         !std::isfinite(normalWorkingToBaseScale) || parallelThreads < 1)
@@ -1230,10 +1298,28 @@ FiberReplayOverview renderFiberReplayOverview(
         matchedGreedySegments(greedyReplay, reference), matchedFiberletSegments(fiberletReplay, reference),
         greedyReplay.failures, fiberletReplay.failures, normalSampler,
         normalWorkingToBaseScale, parallelThreads,
-        validateFiberReplayStripCtVolume(volume, sourceLocator),
-        [&](const auto& coords, int scale) -> cv::Mat_<uint8_t> {
-            return vc::core::util::renderCoordsTextureFineToCoarse(
-                coords, volume, 0, scale, "Replay overview CT sampling");
+        validateFiberReplayStripCtVolume(ct),
+        [&](const auto& coords, int scale) {
+            return [&]() {
+                const auto& vertices = coords;
+                const int factor = std::max(1, scale);
+                std::vector<uint8_t> valid(vertices.total(), 1);
+                for (int r = 0; r < vertices.rows; ++r)
+                    for (int c = 0; c < vertices.cols; ++c)
+                        valid[std::size_t(r) * vertices.cols + c] = vertices(r,c) != cv::Vec3f(-1,-1,-1);
+                const vcr::grid::Surface surface({reinterpret_cast<const float*>(vertices.data),
+                    vertices.rows, vertices.cols, vertices.step1(), nullptr, valid.data()});
+                const double step = 1.0 / factor;
+                const vcr::grid::Raster raster{0.5*step-0.5, 0.5*step-0.5, step, step,
+                    vertices.cols*factor, vertices.rows*factor};
+                vcr::grid::Request request;
+                request.levels = {{ct.array.get(), ct.meta.type}};
+                request.levels.front().cuda = vc::cuda::toolReader(ct);
+                const auto sampled = vcr::grid::sample(surface, raster, request);
+                cv::Mat_<uint8_t> texture(raster.height, raster.width);
+                vcr::display::toUint8(sampled.values.data(), texture.total(), texture.ptr());
+                return texture;
+            }();
         });
 }
 
@@ -1242,14 +1328,32 @@ FiberReplayOverview renderFiberReplayTraceOverview(
     const FiberReplayTraceResult& replay,
     const vc::lasagna::NormalSampler& normalSampler,
     double normalWorkingToBaseScale, int parallelThreads,
-    ::Volume& volume, const std::string& sourceLocator)
+    const vcr::zarr::OpenedArray& ct)
 {
     return renderFiberReplayTraceOverview(referenceGeometryBase, replay, normalSampler,
         normalWorkingToBaseScale, parallelThreads,
-        validateFiberReplayStripCtVolume(volume, sourceLocator),
-        [&](const auto& coords, int scale) -> cv::Mat_<uint8_t> {
-            return vc::core::util::renderCoordsTextureFineToCoarse(
-                coords, volume, 0, scale, "Replay overview CT sampling");
+        validateFiberReplayStripCtVolume(ct),
+        [&](const auto& coords, int scale) {
+            return [&]() {
+                const auto& vertices = coords;
+                const int factor = std::max(1, scale);
+                std::vector<uint8_t> valid(vertices.total(), 1);
+                for (int r = 0; r < vertices.rows; ++r)
+                    for (int c = 0; c < vertices.cols; ++c)
+                        valid[std::size_t(r) * vertices.cols + c] = vertices(r,c) != cv::Vec3f(-1,-1,-1);
+                const vcr::grid::Surface surface({reinterpret_cast<const float*>(vertices.data),
+                    vertices.rows, vertices.cols, vertices.step1(), nullptr, valid.data()});
+                const double step = 1.0 / factor;
+                const vcr::grid::Raster raster{0.5*step-0.5, 0.5*step-0.5, step, step,
+                    vertices.cols*factor, vertices.rows*factor};
+                vcr::grid::Request request;
+                request.levels = {{ct.array.get(), ct.meta.type}};
+                request.levels.front().cuda = vc::cuda::toolReader(ct);
+                const auto sampled = vcr::grid::sample(surface, raster, request);
+                cv::Mat_<uint8_t> texture(raster.height, raster.width);
+                vcr::display::toUint8(sampled.values.data(), texture.total(), texture.ptr());
+                return texture;
+            }();
         });
 }
 
@@ -1290,10 +1394,19 @@ cv::Mat_<uint8_t> renderFiberReplayPresenceTexture(
     if (sourceCoordinates.empty() || renderScale < 1 ||
         !std::isfinite(workingToBaseScale) || workingToBaseScale <= 0)
         throw std::invalid_argument("invalid presence texture coordinates/scale");
-    cv::Mat_<cv::Vec3f> coords;
-    cv::resize(sourceCoordinates, coords,
-        cv::Size(sourceCoordinates.cols * renderScale, sourceCoordinates.rows * renderScale),
-        0, 0, cv::INTER_LINEAR);
+    cv::Mat_<cv::Vec3f> coords = sourceCoordinates;
+    if (renderScale > 1) {
+        coords.create(sourceCoordinates.rows * renderScale, sourceCoordinates.cols * renderScale);
+        const auto surface = QuadSurface(sourceCoordinates, {1, 1}).pointSurface();
+        std::vector<float> xy(std::size_t(coords.cols) * 2);
+        for (int r = 0; r < coords.rows; ++r) {
+            for (int c = 0; c < coords.cols; ++c) {
+                xy[2*c] = std::clamp(float((c+.5)/renderScale-.5), 0.f, float(sourceCoordinates.cols-1));
+                xy[2*c+1] = std::clamp(float((r+.5)/renderScale-.5), 0.f, float(sourceCoordinates.rows-1));
+            }
+            surface->pointsAt(xy.data(), coords.cols, coords.ptr<float>(r), nullptr);
+        }
+    }
     cv::Mat_<uint8_t> image(coords.rows, coords.cols, uint8_t(0));
     // Bounded requests avoid materializing a full strip's interpolation data.
     constexpr size_t batchSize = 4096;
@@ -1302,8 +1415,7 @@ cv::Mat_<uint8_t> renderFiberReplayPresenceTexture(
         std::vector<cv::Vec3d> points(count), directions(count, cv::Vec3d{1, 0, 0});
         for (size_t i = 0; i < count; ++i)
             for (int axis = 0; axis < 3; ++axis)
-                points[i][axis] = (coords.ptr<cv::Vec3f>()[begin + i][axis] -
-                    source.offsetFromBaseXYZ[axis]) / source.scaleFromBaseXYZ[axis] / workingToBaseScale;
+                points[i][axis] = source.toBase(axis, coords.ptr<cv::Vec3f>()[begin + i][axis]) / workingToBaseScale;
         std::vector<FiberPredictionSample> samples;
         predictions.sampleBatch(points, directions, 1, samples);
         if (samples.size() != count) throw std::runtime_error("invalid presence sample count");
@@ -1615,7 +1727,7 @@ FiberReplayInspection renderFiberReplayInspection(
                         const auto base = sample.pointBase + frame.horizontal * (frame.horizontalRadius * (2.0 * x / (w - 1) - 1))
                             + frame.vertical * (frame.verticalRadius * (2.0 * y / (h - 1) - 1));
                         for (int a = 0; a < 3; ++a)
-                            coords(y, x)[a] = float(base[a] * source.scaleFromBaseXYZ[a] + source.offsetFromBaseXYZ[a]);
+                            coords(y, x)[a] = float(source.fromBase(a, base[a]));
                     }
                     const auto label = station.failure
                         ? "R" + std::to_string(station.failure->index) + (station.role == "breakoff" ? "-" : "+")
@@ -1678,5 +1790,143 @@ FiberReplayOverview composeFiberReplayOverviewForTesting(
 }
 }  // namespace testing
 #endif
+
+nlohmann::json fiberReplayTraceJson(const FiberReplayTraceResult& replay, double normalThresholdBaseVoxels)
+{
+    validateNativeReplayStructure(replay);
+    validateReplayFailures(replay, "native");
+    validateGreedyThresholdData(replay, normalThresholdBaseVoxels);
+    auto result = greedyReplayJson(replay, normalThresholdBaseVoxels);
+    result["format"] = "vc_native_fiber_replay";
+    result["version"] = 1;
+    if (replay.graphGeometry)
+        result["geometry_backend"] = "fiberlet";
+    else if (!replay.geometryBackend.empty())
+        result["geometry_backend"] = replay.geometryBackend;
+    return result;
+}
+
+FiberReplayTraceResult fiberReplayTraceFromJson(const nlohmann::json& document)
+{
+    if (document.at("format") != "vc_native_fiber_replay" || document.at("version") != 1)
+        throw std::invalid_argument("unsupported native replay format/version");
+    const double threshold = document.at("threshold").at("normal_radius_base_voxels");
+    const double factor = document.at("threshold").value("tangential_factor", 4.0);
+    if (document.at("threshold") != fiberReplayThresholdDescriptorJson(threshold, factor))
+        throw std::invalid_argument("unsupported native replay threshold descriptor");
+    const auto point = [](const nlohmann::json& value) {
+        if (!value.is_array() || value.size() != 3)
+            throw std::invalid_argument("replay point must contain three coordinates");
+        cv::Vec3d result{value.at(0).get<double>(), value.at(1).get<double>(), value.at(2).get<double>()};
+        for (double v : result.val)
+            if (!std::isfinite(v)) throw std::invalid_argument("nonfinite replay point");
+        return result;
+    };
+    const auto optionalDouble = [](const nlohmann::json& value) -> std::optional<double> {
+        return value.is_null() ? std::nullopt : std::optional<double>(value.get<double>());
+    };
+    const auto optionalIndex = [](const nlohmann::json& value) -> std::optional<size_t> {
+        if (value.is_null()) return std::nullopt;
+        if (!value.is_number_integer() || value.get<int64_t>() < 0)
+            throw std::invalid_argument("invalid replay index");
+        return value.get<size_t>();
+    };
+    const auto measurement = [&](const nlohmann::json& value) {
+        FiberReplayThresholdMeasurement m;
+        m.euclideanErrorBaseVoxels = value.at("euclidean_error_base_voxels");
+        m.normalErrorBaseVoxels = optionalDouble(value.at("normal_error_base_voxels"));
+        m.tangentialErrorBaseVoxels = optionalDouble(value.at("tangential_error_base_voxels"));
+        m.thresholdErrorBaseVoxels = value.at("threshold_error_base_voxels");
+        m.thresholdErrorRatio = value.at("threshold_error_ratio");
+        m.localNormalValid = value.at("local_normal_valid");
+        m.tangentialFactor = value.value("tangential_factor", factor);
+        if (m.tangentialFactor != factor)
+            throw std::invalid_argument("measurement tangential factor differs from descriptor");
+        validateFiberReplayThresholdMeasurement(m, threshold);
+        return m;
+    };
+    FiberReplayTraceResult replay;
+    replay.filteredStops = document.value("filtered_stops", std::vector<std::array<double, 3>>{});
+    replay.reverseChecks = document.value("reverse_checks", size_t(0));
+    replay.geometryBackend = document.value("geometry_backend", std::string{});
+    replay.graphGeometry = replay.geometryBackend == "fiberlet";
+    replay.tangentialThresholdFactor = factor;
+    replay.referenceBeginArcBase = document.at("reference_begin_arc_base");
+    replay.referenceEndArcBase = document.at("reference_end_arc_base");
+    replay.completedReferenceArcBase = document.at("completed_reference_arc_base");
+    for (const auto& value : document.at("segments")) {
+        FiberReplayTraceSegment segment;
+        segment.startReferenceArcBase = value.at("start_reference_arc_base");
+        segment.endReferenceArcBase = value.at("end_reference_arc_base");
+        segment.terminationReason = value.at("termination_reason").get<std::string>();
+        if (value.contains("filtered_distance_failure_xyz_arc"))
+            segment.filteredDistanceFailure = value.at("filtered_distance_failure_xyz_arc").get<std::array<double, 4>>();
+        for (const auto& p : value.at("trace_points_base_xyz")) segment.tracePointsBase.push_back(point(p));
+        segment.cumulativeLosses = value.at("trace_cumulative_losses").get<std::vector<double>>();
+        for (const auto& m : value.at("matches")) {
+            segment.matches.push_back({
+                m.at("trace_point_index").get<size_t>(),
+                m.at("predicted_reference_arc_base").get<double>(),
+                m.at("matched_reference_arc_base").get<double>(),
+                point(m.at("matched_reference_point_base_xyz")),
+                m.at("search_begin_arc_base").get<double>(),
+                m.at("search_end_arc_base").get<double>(), measurement(m)});
+        }
+        if ((replay.graphGeometry && segment.tracePointsBase.empty() ? !segment.matches.empty() :
+                segment.tracePointsBase.size() != segment.matches.size() + 1) ||
+            (!(replay.graphGeometry && segment.cumulativeLosses.empty()) && segment.cumulativeLosses.size() != segment.tracePointsBase.size()))
+            throw std::invalid_argument("replay segment geometry/loss/match lengths disagree");
+        for (size_t i = 0; i < segment.matches.size(); ++i)
+            if (segment.matches[i].tracePointIndex != i + 1)
+                throw std::invalid_argument("noncontiguous replay match indices");
+        for (double loss : segment.cumulativeLosses)
+            if (!std::isfinite(loss)) throw std::invalid_argument("nonfinite replay loss");
+        replay.segments.push_back(std::move(segment));
+    }
+    for (const auto& value : document.at("failures")) {
+        FiberReplayFailure f;
+        f.index = value.at("index");
+        f.segmentIndex = value.at("segment_index");
+        f.reason = value.at("reason").get<std::string>();
+        f.referenceArcBase = value.at("reference_arc_base");
+        f.referenceArcFraction = value.at("reference_arc_fraction");
+        f.referencePointBase = point(value.at("reference_point_base_xyz"));
+        if (!value.at("evaluator_point_base_xyz").is_null())
+            f.evaluatorPointBase = point(value.at("evaluator_point_base_xyz"));
+        f.segmentPointIndex = optionalIndex(value.at("segment_point_index"));
+        f.candidateIndex = optionalIndex(value.at("candidate_index"));
+        f.arcIndex = optionalIndex(value.at("arc_index"));
+        f.candidatePathPointIndex = optionalIndex(value.at("candidate_path_point_index"));
+        if (!value.at("threshold_error_base_voxels").is_null()) f.thresholdMeasurement = measurement(value);
+        replay.failures.push_back(std::move(f));
+    }
+    validateNativeReplayStructure(replay);
+    validateReplayFailures(replay, "native");
+    validateGreedyThresholdData(replay, threshold);
+    return replay;
+}
+
+void writeFiberReplayTraceArtifacts(
+    const std::filesystem::path& outputDirectory,
+    const std::vector<cv::Vec3d>& referenceGeometryBase,
+    const FiberReplayTraceResult& replay, double threshold,
+    const nlohmann::json& provenance)
+{
+    const auto reference = makePolylineArcGeometry(referenceGeometryBase);
+    if (!nearlyEqual(reference.length(), replay.referenceEndArcBase - replay.referenceBeginArcBase))
+        throw std::invalid_argument("native replay artifact reference extent mismatch");
+    const auto serialized = fiberReplayTraceJson(replay, threshold);
+    (void)matchedGreedySegments(replay, reference);
+    if (!std::filesystem::create_directory(outputDirectory))
+        throw std::invalid_argument("native replay artifact directory already exists");
+    vcr::zarr::atomicWrite(outputDirectory / "reference.obj",
+        lineObj("# vc_native_replay_reference", referenceGeometryBase));
+    vcr::zarr::atomicWrite(outputDirectory / "trace.obj",
+        segmentedLineObj("# vc_native_replay_segments; resets are disconnected", greedySegments(replay)));
+    vcr::zarr::atomicWrite(outputDirectory / "trace.json", nlohmann::json{
+        {"format", "vc_native_replay_artifact"}, {"version", 1},
+        {"reference_points_base_xyz", pointsJson(referenceGeometryBase)},
+        {"provenance", provenance}, {"replay", serialized}}.dump(2) + "\n");
+}
 
 }  // namespace vc::fiber_tracer

@@ -29,6 +29,7 @@ from typing import Iterable
 
 import numpy as np
 import torch
+from vc_reader.reader import decompress_bytes, open_zarr
 
 from lasagna import tiled_predict3d as tiled
 from lasagna.inference_provenance import atomic_write
@@ -314,33 +315,36 @@ class DemandStore:
         return _MmapHandle(tuple(str(member) for member in paths), tuple(int(v) for v in sizes), str(dtype))
 
     def _chunk_files(self, origin):
+        if hasattr(self.output_adapter, "chunk_paths"):
+            yield from self.output_adapter.chunk_paths(origin)
+            return
         for channel, product, sep in self._channel_metadata:
             index = tuple(v // product.chunk_size for v in origin)
             yield Path(tiled._zarr_chunk_path(str(Path(channel.relative_path) / str(product.level)), sep, *index))
 
     def _cached_chunk_complete(self, origin, *, read_arrays=None):
+        if hasattr(self.output_adapter, "validate_chunk"):
+            return self.output_adapter.validate_chunk(origin, read_arrays=read_arrays)
         # Existing shared completeness checks require actual files, including
         # explicit zero chunks. A missing sibling must never become Zarr fill.
         if not all(self.output_adapter.product_chunk_complete(product, chunk_origin_zyx=origin)
                    for product in self.products):
             return False
-        import zarr
         read_arrays = self._read_arrays if read_arrays is None else read_arrays
-        region = tuple(slice(o, min(o + self.geometry.chunk, n)) for o, n in zip(origin, self.geometry.output_shape))
+        index = tuple(v // self.geometry.chunk for v in origin)
         try:
-            for channel, product, _ in self._channel_metadata:
+            for channel, product, sep in self._channel_metadata:
                 path = str(Path(channel.relative_path) / str(product.level))
                 if path not in read_arrays:
-                    read_arrays[path] = zarr.open_array(path, mode="r")
+                    read_arrays[path] = open_zarr(path)
                 array = read_arrays[path]
                 if (tuple(array.shape) != self.geometry.output_shape or array.dtype != np.dtype(product.dtype)
                         or tuple(array.chunks) != (self.geometry.chunk,) * 3):
                     return False
-                # Decodes only the requested chunk (including its padded edge
-                # storage). No array scan or persistent checksum database.
-                values = np.asarray(array[region])
-                if values.shape != tuple(s.stop - s.start for s in region):
-                    return False
+                # Decodes only this chunk's stored bytes: a read would return a
+                # corrupt chunk as fill. No array scan or persistent checksum database.
+                payload = Path(tiled._zarr_chunk_path(path, sep, *index)).read_bytes()
+                decompress_bytes(payload, array.compressor, array.meta.chunk_nbytes)
         except MemoryError:
             raise
         except Exception:
@@ -588,6 +592,7 @@ class DemandStore:
                                dtype=np.float32).copy()
             if np.any(denom > 0.0):
                 np.maximum(denom, 1.0e-7, out=denom)
+                finalized = []
                 for product in self.products:
                     raw = np.stack([np.asarray(tiled._record_array(
                         record, layouts[f"product:{product.name}:{channel}"])[region],
@@ -599,9 +604,12 @@ class DemandStore:
                                      for i, channel in enumerate(product.channels)}
                     else:
                         persisted = finalizer(product, raw)
-                    self.output_adapter.write_product_chunk(
-                        product, chunk_origin_zyx=origin,
-                        data={channel.name: persisted[channel.name] for channel in product.channels})
+                    finalized.append((product, {channel.name: persisted[channel.name] for channel in product.channels}))
+                if hasattr(self.output_adapter, "write_products_chunk"):
+                    self.output_adapter.write_products_chunk(finalized, chunk_origin_zyx=origin)
+                else:
+                    for product, persisted in finalized:
+                        self.output_adapter.write_product_chunk(product, chunk_origin_zyx=origin, data=persisted)
             return self._sync_published(origin)
         finally:
             shm.close()

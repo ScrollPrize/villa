@@ -20,8 +20,7 @@ from vesuvius.neural_tracing.fiber_trace_3d.targets import materialize_targets, 
 from vesuvius.neural_tracing.fiber_trace_3d.train import compute_losses, _slice_batch
 
 
-@pytest.mark.parametrize("raw", [{"embedding": {"enabled": True}},
-    {"model_3d": {"direction_branch_count": 2}}, {"model": {"output_channels": 21}}])
+@pytest.mark.parametrize("raw", [{"model_3d": {"direction_branch_count": 2}}, {"model": {"output_channels": 21}}])
 def test_unsupported_losses_fail_early(raw):
     with pytest.raises(ValueError, match="TODO.*prediction-dependent"):
         validate_target_only_loss_config(raw)

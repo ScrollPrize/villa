@@ -1,8 +1,11 @@
 #pragma once
+#include "../cuda_available.hpp"
 #include "cpu/tracing.hpp"
 #include "cpu/palette.hpp"
 #include "cpu/distance_transform.hpp"
 #include "cpu/structure_tensor.hpp"
+#include "cpu/ridges.hpp"
+#include "cpu/coherence_enhancing_diffusion.hpp"
 #include "cpu/bias_field.hpp"
 #include "cpu/plasma_brightness_contrast.hpp"
 #include "cpu/plasma_shadow.hpp"
@@ -30,8 +33,8 @@
 #include "cpu/stripe_masking.hpp"
 #include "cpu/foreground_dropout.hpp"
 #include "cpu/object_dropout.hpp"
+#include "validate.hpp"
 #include <bit>
-#include <chrono>
 
 namespace vcr::transforms {
 struct OneOf;
@@ -41,24 +44,30 @@ using Op = std::variant<
     BrightnessGradient, LocalContrast, LocalGamma, LocalSmoothing, BlankRectangle,
     SliceIllumination, Smear, Flip, Rotate90, Transpose, CropPad, Affine, Elastic,
     SheetCompression, LowResolution, ThickSlice, Morphology, RandomBinaryOperator,
-    RemoveComponents, ReplaceLabel, Regions, OneHot, MaskImage, DeepSupervision,
-    ToPseudo2D, FromPseudo2D, MedialSurface, StripGeometry, SurfacePerturb, std::shared_ptr<OneOf>, Normalize, OrientedBlur, DistanceTransform, StructureTensor, BiasField, PlasmaBrightnessContrast, PlasmaShadow, Illumination, Vignetting, RandomToneCurve, MultiplicativeNoise, ShotNoise, AdditiveNoise, SaltAndPepper, MotionBlur, Defocus, ZoomBlur, Equalize, CLAHE, HistogramMatching, PixelDistributionAdaptation, FDA, UnsharpMask, GibbsRinging, RingingOvershoot, ForegroundCrop, ChannelMisalignment, GridDropout, StripeMasking, ForegroundDropout, ObjectDropout>;
+    RemoveComponents, ConnectedComponents, RidgeTrace, ReplaceLabel, Regions, OneHot, MaskImage, DeepSupervision,
+    ToPseudo2D, FromPseudo2D, MedialSurface, StripGeometry, SurfacePerturb, std::shared_ptr<OneOf>, Normalize, OrientedBlur, DistanceTransform, StructureTensor, Ridges, CoherenceEnhancingDiffusion, BiasField, PlasmaBrightnessContrast, PlasmaShadow, Illumination, Vignetting, RandomToneCurve, MultiplicativeNoise, ShotNoise, AdditiveNoise, SaltAndPepper, MotionBlur, Defocus, ZoomBlur, Equalize, CLAHE, HistogramMatching, PixelDistributionAdaptation, FDA, UnsharpMask, GibbsRinging, RingingOvershoot, ForegroundCrop, ChannelMisalignment, GridDropout, StripeMasking, ForegroundDropout, ObjectDropout>;
 using Executor = void (*)(const Op&, Sample&, const Parameters&, void*);
 #ifdef VC_READER_CUDA
 namespace cuda {
-bool available();
+using vcr::cuda::available;
 void execute(const Op&, Sample&, const Parameters&, void*);
-std::shared_ptr<void> begin(const Sample&);
+// Uploads the sample; uint8 images become float32 on the device (their host fields then describe it).
+std::shared_ptr<void> begin(Sample&);
 void finish(Sample&, void*);
 void finish_device(void*);
-void synchronize();
 Parameters sample_parameters(const Op&, const Sample&, Random&, bool, void*);
 void validate_program(const std::vector<Op>&);
 }
 #else
-namespace cuda { inline bool available() { return false; } }
+namespace cuda { using vcr::cuda::available; }
 #endif
 struct OneOf { std::vector<Op> transforms; std::vector<double> weights; double p = 1; };
+inline void validate_transform(const Op& op) {
+    std::visit([](const auto& t) {
+        if constexpr (std::is_same_v<std::decay_t<decltype(t)>, std::shared_ptr<OneOf>>) { probability(t->p); for (const auto& child : t->transforms) validate_transform(child); }
+        else validate_transform(t);
+    }, op);
+}
 struct Program { std::vector<Op> transforms; std::map<std::string, Target> targets; };
 #ifdef VC_READER_CUDA
 namespace cuda {
@@ -66,6 +75,10 @@ void run_batch_steps(const Program&, std::vector<Sample>&, const std::vector<std
                      const std::map<std::string,std::vector<double>>&, const std::vector<std::shared_ptr<void>>&);
 }
 #endif
+// uint8 continuous targets other than images become float32 as a run starts (images: see narrow).
+inline void widen_entries(Sample& s) {
+    for (auto& [name, f] : s) if (narrow_continuous(f) && f.target.role != Role::Image) widen(f.array);
+}
 struct InputSpec {
     Shape shape; char kind; std::size_t bytes;
     bool operator==(const InputSpec&) const = default;
@@ -76,10 +89,11 @@ struct Plan {
     std::map<std::string, InputSpec> inputs;
     std::vector<Step> steps;
 };
-struct RunResult { Sample sample; Plan plan; std::map<std::string, double> timings; };
+struct RunResult { Sample sample; Plan plan; };
 inline std::map<std::string, InputSpec> input_specs(const Sample& s) {
     std::map<std::string, InputSpec> result;
-    for (const auto& [name, f] : s) result[name] = {f.array.shape, f.array.kind, f.array.bytes};
+    // uint8 continuous inputs run as float32: either may replay the other's plan.
+    for (const auto& [name, f] : s) result[name] = narrow_continuous(f) ? InputSpec{f.array.shape, 'f', 4} : InputSpec{f.array.shape, f.array.kind, f.array.bytes};
     return result;
 }
 inline double chance(const Op& op) {
@@ -133,7 +147,7 @@ inline void prepare(const Op& op, Sample& s, Random& r, Shape path, std::vector<
     }, op);
     if (record) {
         parameters.device_field.reset();
-        for (auto& c : parameters.channels) { c.device_field.reset(); c.device_indices.reset(); }
+        for (auto& c : parameters.channels) c.device_field.reset();
         record->push_back({std::move(path), std::move(parameters)});
     }
 }
@@ -154,38 +168,29 @@ public:
 #endif
         }
         require(!program_->targets.empty(), "target schema must not be empty");
-        for (const auto& op : program_->transforms) probability(chance(op));
+        for (const auto& op : program_->transforms) validate_transform(op);
     }
     const auto& backend() const { return backend_; }
     const auto& targets() const { return program_->targets; }
     const auto& program() const { return program_; }
-    RunResult run(Sample s, std::uint64_t seed, bool record, bool profile, std::shared_ptr<void> context = {}) const {
+    RunResult run(Sample s, std::uint64_t seed, bool record, std::shared_ptr<void> context = {}) const {
         const bool resident = bool(context);
         require(!resident || executor_, "device inputs require a CUDA pipeline");
         validate(s, !resident); RunResult result; result.plan.program = program_; result.plan.inputs = input_specs(s);
-        CompactState compact(compact_);
-        const auto upload_start = std::chrono::steady_clock::now();
+        if (!resident) widen_entries(s);
+        CompactState compact(compact_, program_->transforms.size() == 1);
 #ifdef VC_READER_CUDA
         if (executor_ && !resident) context = cuda::begin(s);
 #endif
-        const double upload_time = std::chrono::duration<double>(std::chrono::steady_clock::now()-upload_start).count();
         for (std::size_t i = 0; i < program_->transforms.size(); ++i) {
             for (const auto& [name, f] : s) require(f.pyramid.empty(), "DeepSupervision must be the last transform");
-            auto start = std::chrono::steady_clock::now(); Random r{split_seed(seed, std::to_string(i))};
+            Random r{split_seed(seed, std::to_string(i))};
             prepare(program_->transforms[i], s, r, {i}, record ? &result.plan.steps : nullptr, compact, executor_, context.get());
-#ifdef VC_READER_CUDA
-            if (executor_ && profile) cuda::synchronize();
-#endif
-            if (profile) result.timings[std::to_string(i)] = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count()
-                + (executor_ && i == 0 ? upload_time : 0);
         }
-        auto start = std::chrono::steady_clock::now();
 #ifdef VC_READER_CUDA
         if (executor_) { if (resident) cuda::finish_device(context.get()); else cuda::finish(s,context.get()); }
 #endif
-        compact.flush(s);
-        if (profile && !program_->transforms.empty()) result.timings[std::to_string(program_->transforms.size() - 1)] +=
-            std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+        compact.flush(s); widen_images(s);
         result.sample = std::move(s); return result;
     }
     RunResult replay(Sample s, const Plan& plan, std::shared_ptr<void> context = {}) const {
@@ -193,7 +198,8 @@ public:
         const bool resident = bool(context);
         require(!resident || executor_, "device inputs require a CUDA pipeline");
         validate(s, !resident); require(input_specs(s) == plan.inputs, "replay requires identical target names, shapes and dtypes");
-        CompactState compact(compact_);
+        if (!resident) widen_entries(s);
+        CompactState compact(compact_, program_->transforms.size() == 1);
 #ifdef VC_READER_CUDA
         if (executor_ && !resident) context = cuda::begin(s);
 #endif
@@ -208,8 +214,72 @@ public:
 #ifdef VC_READER_CUDA
         if (executor_) { if (resident) cuda::finish_device(context.get()); else cuda::finish(s,context.get()); }
 #endif
-        compact.flush(s);
+        compact.flush(s); widen_images(s);
         RunResult result; result.sample = std::move(s); return result;
     }
+    static Pipeline direct(const Op& op, std::map<std::string, Target> targets, bool compact = true, std::string backend = "cpu");
 };
+
+// Direct calls. A transform is random only inside a Pipeline. Called on its own
+// it always applies (p ignored) and draws everything else from direct_seed,
+// so the same input gives the same output.
+inline constexpr std::uint64_t direct_seed = 0;
+inline Op always(Op op) {
+    std::visit([](auto& t) {
+        using T = std::decay_t<decltype(t)>;
+        if constexpr (std::is_same_v<T, std::shared_ptr<OneOf>>) { auto copy = std::make_shared<OneOf>(*t); copy->p = 1; t = std::move(copy); }
+        else if constexpr (requires { t.options; }) t.options.p = 1;
+        else t.p = 1;
+    }, op);
+    return op;
+}
+inline Pipeline Pipeline::direct(const Op& op, std::map<std::string, Target> targets, bool compact, std::string backend) {
+    return Pipeline({always(op)}, std::move(targets), compact, std::move(backend));
+}
+// The field a bare array stands for: the op's own `on` default. A named field
+// (StructureTensor "image", OneHot "mask"), the first label of a label list
+// (DistanceTransform, Morphology, MedialSurface: "mask"), else "image".
+inline std::pair<std::string, Target> direct_input(const Op& op) {
+    return std::visit([](const auto& t) -> std::pair<std::string, Target> {
+        using T = std::decay_t<decltype(t)>;
+        Target target; target.valid = "";
+        if constexpr (std::is_same_v<T, std::shared_ptr<OneOf>>) {
+            require(!t->transforms.empty(), "OneOf needs transforms");
+            return direct_input(t->transforms.front());
+        } else if constexpr (requires { { t.on } -> std::convertible_to<std::string>; }) {
+            if (t.on == "mask") target.role = Role::Label;
+            if (t.on == "surface") target.role = Role::Points;
+            return {t.on, target};
+        } else if constexpr (requires { t.on.front(); }) {
+            target.role = Role::Label;
+            return {t.on.empty() ? "mask" : t.on.front(), target};
+        } else if constexpr (requires { t.options.on; }) {
+            return {t.options.on.empty() ? "image" : t.options.on.front(), target};
+        } else return {"image", target};
+    }, op);
+}
+// The result of a bare-array call: the one field the op created, else the
+// transformed input. Several created fields need a dict call.
+inline std::string direct_output(const std::string& input, const std::vector<std::string>& fields) {
+    std::string created;
+    for (const auto& name : fields) if (name != input) {
+        require(created.empty(), "transform creates several fields (" + created + ", " + name + "); call it with a dict");
+        created = name;
+    }
+    return created.empty() ? input : created;
+}
+// One transform on a sample whose fields carry their targets.
+inline Sample apply(const Op& op, Sample s, bool compact = true, std::string backend = "cpu") {
+    std::map<std::string, Target> targets;
+    for (const auto& [name, f] : s) targets[name] = f.target;
+    return Pipeline::direct(op, std::move(targets), compact, std::move(backend)).run(std::move(s), direct_seed, false).sample;
+}
+// One transform on a channel-first (C, Y, X) / (C, Z, Y, X) array.
+inline Array apply(const Op& op, Array a, bool compact = true, std::string backend = "cpu") {
+    auto [key, target] = direct_input(op);
+    Sample s; s.emplace(key, Field{std::move(a), target, key});
+    auto result = apply(op, std::move(s), compact, std::move(backend));
+    std::vector<std::string> fields; for (const auto& [name, f] : result) fields.push_back(name);
+    return std::move(result.at(direct_output(key, fields)).array);
+}
 } // namespace vcr::transforms

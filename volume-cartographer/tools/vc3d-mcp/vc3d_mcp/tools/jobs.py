@@ -16,8 +16,9 @@ async def vc3d_job_status(
 ) -> dict[str, Any]:
     """Poll a job by id (or the latest job): state, message, console tail.
 
-    source: optionally filter the latest job to tool, growth, lasagna, atlas,
-    catalog, volume, flatten, seeding, or autosave when job_id is omitted.
+    source: optionally filter the latest job to tool, growth, lasagna, catalog,
+    volume, flatten, seeding, autosave, import, or export when job_id is
+    omitted. An import job also reports progress {completed, total, detail}.
     """
     return await _call(
         "job.status",
@@ -60,16 +61,18 @@ async def vc3d_cancel_job(
     vc3d_job_status afterward to confirm the job reaches a terminal state.
 
     Cancellable sources: "tool" (tracer.run_trace / render.tifxyz child
-    processes), "atlas" (fiber-intersection search), "seeding" (seeding batch),
-    "lasagna" (optimization). NOT cancellable -- these return -32010 and must
-    be waited out: "growth" (segmentation.grow runs as a QtConcurrent future
-    with no cancel API) and flatten jobs (self-owned, no cancel handle).
+    processes), "seeding" (seeding batch), "lasagna" (optimization), "import"
+    (objects.import stops before its next object; the job then fails with
+    result.cancelled=true and the partial report). NOT cancellable -- these
+    return -32010 and must be waited out: "growth" (segmentation.grow runs as
+    a QtConcurrent future with no cancel API), flatten jobs (self-owned, no
+    cancel handle) and "export".
 
     Identify the job by either argument (at least one is required):
     job_id: the job's id (preferred; from vc3d_job_status / a launch result).
-    source: the job's source ("growth" | "tool" | "atlas" | "seeding" |
-    "lasagna" | ...); used to resolve the active job for that source when
-    job_id is omitted.
+    source: the job's source ("growth" | "tool" | "seeding" | "lasagna" |
+    ...); used to resolve the active job for that source when job_id is
+    omitted.
 
     Returns {"cancelRequested": true, "jobId", "source", "kind"}. Errors:
     -32602 (neither job_id nor source given), -32007 (no such / not-running

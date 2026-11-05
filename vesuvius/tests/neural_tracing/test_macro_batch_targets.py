@@ -57,11 +57,13 @@ def _raw_pair(tmp_path):
 
 
 @pytest.mark.parametrize("stride", [1, 2, 4])
-@pytest.mark.parametrize("mask", ["all", "partial", "empty"])
+@pytest.mark.parametrize("mask", [None, "all", "partial", "empty"])
 @pytest.mark.parametrize("conditioned", [False, True])
-def test_prepass_matches_masked_target_counts_without_image_transfer(tmp_path, monkeypatch, stride, mask, conditioned):
+def test_prepass_counts_ignore_legacy_masks_without_image_transfer(tmp_path, monkeypatch, stride, mask, conditioned):
     config, raw, _ = _raw_pair(tmp_path)
-    valid = raw.valid_mask.clone()
+    # The canonical queue is mask-free; old masks must not alter its counts.
+    assert raw.valid_mask is None
+    valid = None if mask is None else torch.ones_like(raw.volume, dtype=torch.bool)
     if mask == "partial":
         valid[0, :, :16] = False
     elif mask == "empty":
@@ -77,7 +79,7 @@ def test_prepass_matches_masked_target_counts_without_image_transfer(tmp_path, m
 
     def transfer(batch, *args, **kwargs):
         calls.append(batch.volume.numel())
-        assert batch.valid_mask is not None
+        assert batch.valid_mask is None
         return original(batch, *args, **kwargs)
 
     monkeypatch.setattr(FiberTrace3DBatch, "to", transfer)
@@ -191,12 +193,14 @@ def test_actual_queue_prepass_wraps_slots_and_reuses_workers(tmp_path):
 
 
 @pytest.mark.parametrize("conditioned", [False, True])
-@pytest.mark.parametrize("mask", ["all", "no-positive", "empty"])
+@pytest.mark.parametrize("mask", [None, "all", "no-positive", "empty"])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
-def test_statistics_counts_are_target_only_for_real_masked_patches(tmp_path, conditioned, mask, dtype):
+def test_statistics_counts_are_target_only_and_ignore_legacy_masks(tmp_path, conditioned, mask, dtype):
     config, raw, _ = _raw_pair(tmp_path)
     batch = materialize_targets(raw, replace(config, presence_radius_voxels=3.0))
-    presence_mask = batch.presence_mask.clone()
+    assert batch.presence_mask is None
+    expected = target_normalization_counts(batch, conditioned=conditioned)
+    presence_mask = None if mask is None else torch.ones_like(batch.presence_target, dtype=torch.bool)
     if mask == "no-positive":
         presence_mask &= batch.presence_target <= .5
     elif mask == "empty":
@@ -216,7 +220,7 @@ def test_statistics_counts_are_target_only_for_real_masked_patches(tmp_path, con
             point = None if idx is None else output[idx[:, 0], :, idx[:, 1], idx[:, 2], idx[:, 3]]
             return {"zero_output": output, "random_output": output, "point_output": point}
 
-    expected = target_normalization_counts(batch, conditioned=conditioned)
+    assert torch.equal(target_normalization_counts(batch, conditioned=conditioned), expected)
     for value in (.1, .9):
         if conditioned:
             stats = compute_conditioned_losses(ConditionedHead(value), batch,
@@ -233,13 +237,13 @@ def test_statistics_counts_are_target_only_for_real_masked_patches(tmp_path, con
         assert all(torch.isfinite(v) for v in metrics.values())
 
 
-def test_statistics_reject_multibranch_but_legacy_loss_still_works(tmp_path):
+@pytest.mark.parametrize("statistics", [False, True])
+def test_multibranch_rejected_until_target_only_normalization_supported(tmp_path, statistics):
     config, raw, _ = _raw_pair(tmp_path)
     batch = materialize_targets(raw, config)
     output = torch.full((len(batch.volume), 14, *batch.volume.shape[-3:]), .6)
-    assert torch.isfinite(compute_losses(output, batch, direction_weight=1, presence_weight=1)["total"])
-    with pytest.raises(ValueError, match="prediction-dependent counts"):
-        compute_losses(output, batch, direction_weight=1, presence_weight=1, _return_statistics=True)
+    with pytest.raises(ValueError, match="fix target-only normalization"):
+        compute_losses(output, batch, direction_weight=1, presence_weight=1, _return_statistics=statistics)
 
 
 def _distributed_finalizer(rank, init_file, batch):
@@ -286,11 +290,10 @@ def _reference_single_loss(output, batch):
     positive_losses, negative_losses = [], []
     for b in range(len(output)):
         selected = idx[idx[:, 0] == b]
-        mask = batch.presence_mask[b, 0, selected[:, 1], selected[:, 2], selected[:, 3]]
-        values = presence[b, 0, selected[:, 1], selected[:, 2], selected[:, 3]][mask]
+        values = presence[b, 0, selected[:, 1], selected[:, 2], selected[:, 3]]
         if values.numel():
             positive_losses.append(F.binary_cross_entropy(values.float(), torch.ones_like(values).float()))
-        negative = presence[b][batch.presence_mask[b] & (batch.presence_target[b] <= .5)]
+        negative = presence[b][batch.presence_target[b] <= .5]
         if negative.numel():
             negative_losses.append(F.binary_cross_entropy(negative.float(), torch.zeros_like(negative).float()))
     zero = output.sum() * 0
@@ -324,10 +327,7 @@ class _ConditionedPointwiseHead(torch.nn.Module):
 
 def _production_update(tmp_path, device, stride, conditioned):
     config, raw, parts = _raw_pair(tmp_path)
-    # Sparse positives masked out in one sample; direction remains supervised.
-    raw = replace(raw, valid_mask=raw.valid_mask.clone())
-    raw.valid_mask[0, :, :16] = False
-    parts = [_slice_batch(raw, i, i + 1) for i in range(2)]
+    assert raw.valid_mask is None
     full = materialize_targets(raw.to(device), config, output_stride=stride)
     torch.manual_seed(31)
     model = _ConditionedPointwiseHead().to(device) if conditioned else _pointwise_fiber_model(device)
@@ -414,7 +414,7 @@ def test_cuda_real_macro_batch_and_async_suffix_preserve_counts(tmp_path, mode):
         for reference in expected:
             actual = next(pipeline)
             assert torch.equal(actual.volume, reference.volume)
-            assert torch.equal(actual.presence_mask, reference.presence_mask)
+            assert actual.presence_mask is reference.presence_mask is None
             assert torch.equal(actual.normalization_counts, counts)
             assert actual.normalization_counts.is_cuda
     finally:

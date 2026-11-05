@@ -40,6 +40,22 @@ import AwardedTotal from '@site/src/components/AwardedTotal';
 
 Vesuvius Challenge has awarded **<AwardedTotal />** in prizes since the competition started in 2023! This page lists all the prizes awarded so far.
 
+### \$50,000 First Letters: PHerc. 306B (October, 2026)
+
+**Goal:** Find 10 letters within a 4 cm² area of a scroll where nothing has been read yet.
+
+<div className="flex flex-row flex-wrap">
+  <PrizeCard
+    href="https://scrollprize.substack.com/p/writing-seen-in-pherc-306b-for-the"
+    prizeAmount="$50,000"
+    title="Winners"
+    description="Liam Warner (@Prodigle) and Nicola Bodill (@polytrope) found writing in PHerc. 306B, likely reading “τὸ δι᾽ αὑτὸ αἱρ̣ε̣τ̣όν̣”, “that which is in itself desirable”"
+    mediaSrc="/img/firstletters/pherc0306b-warner-bodill.webp"
+    mediaAlt="Ink detected in PHerc. 306B by Liam Warner and Nicola Bodill, with the reading τὸ δι᾽ αὑτὸ αἱρετόν"
+    wide
+  />
+</div>
+
 ### \$50,000 First Letters: PHerc. 343 (October, 2026)
 
 **Goal:** Find 10 letters within a 4 cm² area of a scroll where nothing has been read yet.
@@ -1091,7 +1107,7 @@ Vesuvius Challenge has awarded **<AwardedTotal />** in prizes since the competit
 **Announcement:** <a href="firstletters">Announcement page</a>
 
 <div className="flex flex-row flex-wrap">
-  <a className="vc-card max-w-[200px] mr-4 mb-4 flex flex-col justify-between hover:no-underline" href="https://github.com/lukeboi/scroll-first-letters">
+  <a className="vc-card max-w-[200px] mr-4 mb-4 flex flex-col justify-between hover:no-underline" href="https://web.archive.org/web/20241225210819/https://github.com/lukeboi/scroll-first-letters">
     <div className="mb-4"><div className="text-sm font-semibold text-accent vc-nums">\$40,000</div><span className="font-semibold">First Letters</span>: Luke Farritor / @lukeboi</div>
     <img alt="First Letters by Luke Farritor" src="/img/firstletters/luke-submission.webp"/>
   </a>
@@ -1208,7 +1224,7 @@ Vesuvius Challenge has awarded **<AwardedTotal />** in prizes since the competit
     <div className="mb-4"><div className="text-sm font-semibold text-accent vc-nums">\$5,000</div><span className="font-semibold"> VolumeAnnotate</span> by Moshe / @moshelevy</div>
     <img alt="VolumeAnnotate by Moshe Levy" src="https://substackcdn.com/image/fetch/w_1456,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F2db002b5-80bf-4bda-95b1-340bc8bc2f8a_915x440.gif"/>
   </a>
-  <a className="vc-card max-w-[200px] mr-4 mb-4 flex flex-col justify-between hover:no-underline" href="https://github.com/lukeboi/scroll-viewer">
+  <a className="vc-card max-w-[200px] mr-4 mb-4 flex flex-col justify-between hover:no-underline" href="https://web.archive.org/web/20241230173950/https://github.com/lukeboi/scroll-viewer">
     <div className="mb-4"><div className="text-sm font-semibold text-accent vc-nums">\$5,000</div><span className="font-semibold"> Scroll Viewer</span> by Luke Farritor / @lukeboi</div>
     <img alt="Scroll Viewer by Luke Farritor" src="https://substackcdn.com/image/fetch/w_1456,c_limit,f_webp,q_auto:good,fl_lossy/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F16b4d5fa-e782-472e-bea8-f333d3e78cfe_669x442.gif"/>
   </a>
@@ -1272,7 +1288,7 @@ Vesuvius Challenge has awarded **<AwardedTotal />** in prizes since the competit
 **Announcement:** <a href="https://scrollprize.substack.com/p/first-prizes-awarded-open-source">Blog post</a> / <a href="https://www.youtube.com/watch?v=_LBI0DtTl80">Live stream</a>
 
 <div className="flex flex-row flex-wrap">
-  <a className="vc-card max-w-[200px] mr-4 mb-4 flex flex-col justify-between hover:no-underline" href="https://github.com/lukeboi/scroll-viewer">
+  <a className="vc-card max-w-[200px] mr-4 mb-4 flex flex-col justify-between hover:no-underline" href="https://web.archive.org/web/20241230173950/https://github.com/lukeboi/scroll-viewer">
     <div className="mb-4"><div className="text-sm font-semibold text-accent vc-nums">\$2,500</div><span className="font-semibold"> Scroll Viewer</span> by Luke Farritor / @lukeboi</div>
     <img alt="Scroll Viewer by Luke Farritor" src="https://substackcdn.com/image/fetch/w_1456,c_limit,f_webp,q_auto:good,fl_lossy/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F16b4d5fa-e782-472e-bea8-f333d3e78cfe_669x442.gif"/>
   </a>

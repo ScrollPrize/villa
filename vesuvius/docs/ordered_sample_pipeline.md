@@ -3,7 +3,8 @@
 `vesuvius.neural_tracing.ordered_sample_pipeline` provides the CPU scheduling
 foundation for shared training and evaluation loading. It is independent of
 fiber annotations, augmentation recipes, model outputs and GPU allocations.
-This extraction does **not** switch the existing trainer to this queue yet.
+The Fiber3D trainer uses one source-tagged queue per rank for training and dense
+evaluation; see [the training integration](queued_training.md).
 
 ## Fiber3D preparation integration
 
@@ -16,9 +17,9 @@ Serial and queued batches both use `collate_fiber_trace_3d_samples`.
 This layer is extracted from the CPU preparation stage before CUDA augmentation
 and the later annotation/refinement/embedding features. Its masks, fixed-sigma
 augmentation, targets and sampling remain that stage's existing behavior.
-The normal training CLI's replacement by the latest unified owner is deferred
-until its GPU preparation and effective-batch dependencies are extracted;
-the old trainer has not been rewritten as an alternative integration.
+The production loop now consumes these shared queues instead of separate
+whole-batch train/test worker pools. Cooperative GPU worker ownership and
+bounded effective-batch accumulation remain separate integration stages.
 
 `geometry_backend` defaults to `eager`; `value_augmentation_backend` defaults to
 `torch`, preserving unchanged-config preprocessing independently of which
@@ -39,16 +40,14 @@ with the source implementation's existing rounding bounds; same-backend serial
 and queued results are exact. This does not import the later randomized-sigma
 GPU augmentation recipe or remove validity masks.
 
-`volume_io_threads`, `volume_decode_threads` and `volume_sample_threads` expose
-the shared sampler's native thread controls. Queue load workers initialize the
-native cache before opening volumes and force one I/O, decode and sampling
-worker. Native CPU compute and Torch workers are single-threaded. Separate
-loader processes retain their own caches; this API does not imply a cross-process
-decoded cache.
+Each loader record opens its CT level with vc_reader (`ZarrReader.open`), with
+a memory cache of `volume_cache_memory_mib` and `volume_io_threads` read
+threads. Queue load workers force one read thread. Native CPU compute and Torch
+workers are single-threaded. Separate loader processes retain their own memory
+caches; there is no cross-process decoded cache.
 
-Remote VC3D volumes use the process-wide cache root configured by VC3D, just
-as before this extraction. The sampler's legacy `cache_root` argument is not a
-per-volume override for this backend; `Volume.open_url` accepts only the URL.
+Remote volumes are disk-cached under VC3D's configured cache root (`"vc3d"`),
+then searched in `volume_cache_dir` if set.
 
 The shared tensor bank keeps large volumes **and validity masks** out of queue
 payloads; only metadata and generation-checked descriptors cross the queues.
@@ -207,12 +206,10 @@ exceptions and hard/clean worker exits, saturated shutdown, retained storage
 leases, one-worker operation, zero-worker parking/resume, explicit admission,
 and train/test/train phase transitions.
 
-To include real CT transport, set `VC_QUEUE_TEST_VOLUME` to a local array
-readable by `vc.volume.Volume.open` and `VC_QUEUE_TEST_ORIGIN_ZYX` to an occupied
-crop origin in that array's coordinates. Four overlapping 32³ patches and a
-deterministic axis flip must match direct serial reads byte-for-byte in fixed
-and shared modes, using both `spawn` and `forkserver` where supported. These
-tests skip without an explicit fixture; no downloads or source writes occur.
+CT transport is covered with a small random local Zarr written by the test and
+read through vc_reader in the worker processes: four overlapping 32³ patches and
+a deterministic axis flip must match the array byte-for-byte in fixed and shared
+modes, using both `spawn` and `forkserver` where supported. No downloads occur.
 They validate transport and scheduling, not a throughput or model-quality gain.
 
 `tests/neural_tracing/test_sample_pipeline.py` carries the original CPU-stage

@@ -1,0 +1,58 @@
+#pragma once
+
+#include <opencv2/core/mat.hpp>
+
+#include <array>
+#include <cstdint>
+#include <string>
+#include <vector>
+
+// __has_builtin isn't provided by every preprocessor (e.g. pre-16.1 MSVC); fall
+// back so the nt_store_u32 __builtin_nontemporal_store check below degrades to
+// the plain store rather than failing to preprocess.
+#ifndef __has_builtin
+#define __has_builtin(x) 0
+#endif
+
+namespace vc {
+
+enum class OverlayColormapKind { OpenCv, Tint, DiscreteLut };
+enum class ColormapAudience { Shared, OverlayOnly };
+enum class EntryScope { SharedOnly, OverlayCompatible };
+
+struct OverlayColormapSpec {
+    std::string id;
+    std::string label;
+    OverlayColormapKind kind;
+    ColormapAudience audience;
+    int opencvCode;
+    cv::Vec3f tint; // R, G, B in [0,1]
+    const uint32_t* discreteLut;
+    // Black at the low end, so the colours read as already scaled by
+    // intensity (fire, tints). Intensity-as-alpha then blends them as
+    // premultiplied colour with alpha = brightest channel; other maps
+    // (viridis) are blended as straight colour with alpha = intensity.
+    // Ignored for DiscreteLut, whose values are labels.
+    bool premultiplied;
+};
+
+struct OverlayColormapEntry {
+    std::string label;
+    std::string id;
+};
+
+const std::vector<OverlayColormapSpec>& specs() noexcept;
+const OverlayColormapSpec& resolve(const std::string& id);
+
+// Scale a grayscale ramp by an RGB tint, rounding through the display converter.
+std::array<uint32_t, 256> tintPalette(const cv::Vec3f& tint);
+
+// Apply colormap and write directly into a caller-provided ARGB32 buffer.
+// outBuf must point to rows*outStride uint32_t elements.
+// outStride is in uint32_t units (pixels per row including padding).
+void makeColors(const cv::Mat_<uint8_t>& values, const OverlayColormapSpec& spec,
+                uint32_t* outBuf, int outStride);
+
+const std::vector<OverlayColormapEntry>& entries(EntryScope scope = EntryScope::OverlayCompatible) noexcept;
+
+} // namespace vc

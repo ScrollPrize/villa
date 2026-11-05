@@ -2,138 +2,97 @@
 
 #include "vc/lasagna/Dataset.hpp"
 #include "vc/lasagna/LineModel.hpp"
-#include "vc/core/render/ChunkCache.hpp"
-#include "vc/core/render/LocalChunkCache.hpp"
-#include "vc/core/render/PinnedChunkRegion.hpp"
+
+#include <vc_reader/array.hpp>
+#include <vc_reader/zarr_array_meta.hpp>
 
 #include <array>
 #include <cstddef>
 #include <cstdint>
-#include <filesystem>
-#include <list>
+#include <map>
 #include <memory>
-#include <mutex>
 #include <optional>
-#include <shared_mutex>
 #include <span>
 #include <string>
 #include <string_view>
-#include <unordered_map>
-#include <unordered_set>
 #include <vector>
 
 #include <opencv2/core/types.hpp>
 
-namespace utils { class ZarrArray; }
-namespace vc::render { class DecodedChunkCacheBudget; }
+namespace vcr { class Array; }
+
+namespace vcr::reader_cuda { class Reader; }
 
 namespace vc::lasagna {
 
-struct LasagnaChannelChunkKey {
-    uint32_t arrayId = 0;
-    uint32_t channelIndex = 0;
-    uint32_t z = 0;
-    uint32_t y = 0;
-    uint32_t x = 0;
-
-    [[nodiscard]] bool operator==(const LasagnaChannelChunkKey& other) const noexcept;
+// The channel-group arrays of one dataset, each opened once through vc_reader
+// (openLasagnaGroupArray) and sharing one memory cache. Channels of one packed
+// group share its array.
+struct LasagnaGroupArrays {
+    explicit LasagnaGroupArrays(std::size_t memoryCacheBytes)
+        : cache(std::make_shared<vcr::MemoryCache>(memoryCacheBytes)) {}
+    explicit LasagnaGroupArrays(std::shared_ptr<vcr::MemoryCache> sharedCache)
+        : cache(std::move(sharedCache)) {}
+    std::shared_ptr<vcr::MemoryCache> cache;
+    // The opened level of each group, whole: its cache layers (and a VC3D layer's lease)
+    // live as long as any binding shares its array.
+    std::map<const LasagnaChannelGroup*, std::shared_ptr<vcr::zarr::OpenedArray>> arrays;
 };
 
-struct LasagnaChannelChunkKeyHash {
-    [[nodiscard]] size_t operator()(const LasagnaChannelChunkKey& key) const noexcept;
-};
-
+// One channel of a dataset in working coordinates: working point p (xyz) lies
+// at channel voxel p / spacing.
 struct LasagnaChannelBinding {
-    const LasagnaChannelGroup* group = nullptr;
-    uint32_t arrayId = 0;
+    const LasagnaChannelGroup* group = nullptr;  // in the manifest it was bound from
     size_t channelIndex = 0;
-    std::filesystem::path path;
-    std::shared_ptr<utils::ZarrArray> array;
-    std::shared_ptr<vc::render::ChunkCache> chunkSource;
+    // The group array: (Z,Y,X), or (C,Z,Y,X) holding every channel of the group.
+    std::shared_ptr<vcr::Array> array;
+    // With a tool's --cuda: the 3-D uint8 group's GPU reader, kept for the process.
+    vcr::reader_cuda::Reader* cuda = nullptr;
+    bool packed = false;
+    bool float32 = false;  // stored as float32; otherwise uint8
     std::array<size_t, 3> shapeZYX{0, 0, 0};
     std::array<size_t, 3> chunksZYX{0, 0, 0};
     double spacing = 1.0;
 };
 
-// Storage dependencies for an inclusive world-space box, including interpolation
-// corners and a one-voxel guard for float coordinate rounding at boundaries.
-std::vector<vc::render::ChunkKey> lasagnaRegionChunkKeys(
-    const LasagnaChannelBinding&, const cv::Vec3d& lo, const cv::Vec3d& hi);
-void pinLasagnaRegion(vc::render::PinnedChunkRegion&, const LasagnaChannelBinding&,
-    const cv::Vec3d& lo, const cv::Vec3d& hi);
+[[nodiscard]] LasagnaChannelBinding bindLasagnaChannel(
+    const LasagnaDatasetManifest& manifest,
+    std::string_view channel,
+    LasagnaGroupArrays& arrays,
+    bool allowFloat32 = false);
 
 [[nodiscard]] std::vector<LasagnaChannelBinding> bindLasagnaEmbeddingChannels(
-    const LasagnaDatasetManifest& manifest, const LasagnaChannelBinding& lattice);
+    const LasagnaDatasetManifest& manifest, const LasagnaChannelBinding& lattice,
+    LasagnaGroupArrays& arrays);
 
-struct LasagnaCubeValues {
-    double c000 = 0.0;
-    double c001 = 0.0;
-    double c010 = 0.0;
-    double c011 = 0.0;
-    double c100 = 0.0;
-    double c101 = 0.0;
-    double c110 = 0.0;
-    double c111 = 0.0;
-};
+[[nodiscard]] bool sameLasagnaSamplingGrid(
+    const LasagnaChannelBinding& a,
+    const LasagnaChannelBinding& b);
 
-struct LasagnaCubeRequest {
-    bool valid = false;
-    bool singleChunk = false;
-    size_t z0 = 0;
-    size_t y0 = 0;
-    size_t x0 = 0;
-    double fx = 0.0;
-    double fy = 0.0;
-    double fz = 0.0;
-    std::array<LasagnaChannelChunkKey, 8> keys{};
-    std::array<vc::render::ChunkResult, 8> chunks{};
-    std::array<const vc::render::ChunkResult*,8> borrowed{};
-    const vc::render::ChunkResult& chunk(size_t index) const {
-        return borrowed[index]?*borrowed[index]:chunks[index];
-    }
-};
+// Trilinear cubes. A point's cube is the voxel below it (floor of p / spacing)
+// and the seven above; corner k adds (k & 1, k >> 1 & 1, k >> 2) to (x, y, z),
+// clamped to the last voxel. Points that are not finite or lie outside
+// [0, n - 1] on an axis have none. Each binding's corners are one
+// Array::read_points call; chunks that are not stored read as the fill value.
 
-using LasagnaResolvedChunks = std::unordered_map<
-    LasagnaChannelChunkKey, vc::render::ChunkResult, LasagnaChannelChunkKeyHash>;
-using LasagnaPrefetchRequest = std::pair<const LasagnaChannelBinding*, LasagnaChannelChunkKey>;
-
-// Scheduling, payload ownership, coalescing and budgets belong to ChunkCacheService.
-[[nodiscard]] NormalPrefetchReport resolveLasagnaChunks(
-    const LasagnaChannelBinding& binding,
-    const std::vector<LasagnaChannelChunkKey>& keys, LasagnaResolvedChunks& resolved);
-[[nodiscard]] NormalPrefetchReport prefetchLasagnaChunks(
-    const std::vector<LasagnaPrefetchRequest>& requests);
-
-class LasagnaLocalChunkResolver {
-public:
-    explicit LasagnaLocalChunkResolver(const LasagnaChannelBinding& binding,
-        const vc::render::PinnedChunkRegion* pinnedRegion = nullptr);
-    void resolve(LasagnaCubeRequest& request);
-
-private:
-    [[nodiscard]] vc::render::ChunkResult resolveKey(const LasagnaChannelChunkKey& key);
-    vc::render::BlockingLocalChunkCache local_;
-    std::optional<vc::render::PinnedChunkLookup> pinned_;
-    int requested_ = 0;
-    int errors_ = 0;
-};
-
-struct LasagnaPreparedCompactPoint {
-    LasagnaCubeRequest nx;
-    LasagnaCubeRequest ny;
-};
-
-struct LasagnaCornerSample {
-    std::array<uint8_t, 8> values{};
-    cv::Vec3f fractionXYZ{0.0f, 0.0f, 0.0f};
-    bool valid = false;
-};
-
+// Byte channels (uint8, or float32 holding integers in [0, 255]) in float
+// geometry (p / float(spacing)), for the tracer's hot paths. All bindings must
+// share one sampling grid.
 struct LasagnaCornerBatch {
-    std::vector<std::vector<std::array<uint8_t, 8>>> values;
+    std::vector<std::vector<std::array<uint8_t, 8>>> values;  // [binding][point]
     std::vector<cv::Vec3f> fractionsXYZ;
     std::vector<uint8_t> valid;
 };
+
+// The values of `bindings` (which share one sampling grid) at every voxel of the box
+// [originXYZ, originXYZ + shapeXYZ) of that grid, interleaved as [z][y][x][binding]
+// bytes (a float32 channel as its byte values): one region read per binding. Throws when
+// the box leaves the grid.
+void readLasagnaChannelBox(
+    const std::vector<const LasagnaChannelBinding*>& bindings,
+    const std::array<int64_t, 3>& originXYZ,
+    const std::array<int64_t, 3>& shapeXYZ,
+    std::vector<uint8_t>& interleaved);
 
 using LasagnaCornerPointVisitor = void (*)(
     void* context,
@@ -142,73 +101,74 @@ using LasagnaCornerPointVisitor = void (*)(
     bool valid,
     std::span<const std::array<uint8_t, 8>> volumeCorners);
 
-// Fetches the ordered eight nearest-neighbor voxel corners through VC3D's
-// blocking requested-level reader for caller-side interpolation.
-class LasagnaChannelCornerSampler {
-public:
-    explicit LasagnaChannelCornerSampler(
-        const LasagnaChannelBinding& binding);
-    ~LasagnaChannelCornerSampler();
-
-    LasagnaChannelCornerSampler(const LasagnaChannelCornerSampler&) = delete;
-    LasagnaChannelCornerSampler& operator=(const LasagnaChannelCornerSampler&) = delete;
-    LasagnaChannelCornerSampler(LasagnaChannelCornerSampler&&) noexcept;
-    LasagnaChannelCornerSampler& operator=(LasagnaChannelCornerSampler&&) noexcept;
-
-    [[nodiscard]] bool sharesSamplingGrid(const LasagnaChannelCornerSampler& other) const noexcept;
-
-    [[nodiscard]] NormalPrefetchReport sampleBatch(
-        const std::vector<cv::Vec3f>& volumePoints,
-        std::vector<LasagnaCornerSample>& samples) const;
-
-private:
-    friend NormalPrefetchReport sampleLasagnaChannelCornerBatch(
-        const std::vector<const LasagnaChannelCornerSampler*>& samplers,
-        const std::vector<cv::Vec3f>& volumePoints,
-        std::vector<std::vector<LasagnaCornerSample>>& samples,
-        int parallelThreads);
-    friend NormalPrefetchReport sampleLasagnaChannelCornerBatch(
-        const std::vector<const LasagnaChannelCornerSampler*>& samplers,
-        const std::vector<cv::Vec3f>& volumePoints,
-        LasagnaCornerBatch& samples,
-        int parallelThreads);
-    friend NormalPrefetchReport visitLasagnaChannelCorners(
-        const std::vector<const LasagnaChannelCornerSampler*>& samplers,
-        const std::vector<cv::Vec3f>& volumePoints,
-        void* visitorContext,
-        LasagnaCornerPointVisitor visitor,
-        int parallelThreads,
-        bool collectLocalityStats,
-        const vc::render::PinnedChunkRegion* pinnedRegion);
-
-    class Impl;
-    std::unique_ptr<Impl> impl_;
-};
-
-[[nodiscard]] NormalPrefetchReport sampleLasagnaChannelCornerBatch(
-    const std::vector<const LasagnaChannelCornerSampler*>& samplers,
+void sampleLasagnaChannelCornerBatch(
+    const std::vector<const LasagnaChannelBinding*>& bindings,
     const std::vector<cv::Vec3f>& volumePoints,
-    std::vector<std::vector<LasagnaCornerSample>>& samples,
-    int parallelThreads = 0);
+    LasagnaCornerBatch& samples);
 
-[[nodiscard]] NormalPrefetchReport sampleLasagnaChannelCornerBatch(
-    const std::vector<const LasagnaChannelCornerSampler*>& samplers,
-    const std::vector<cv::Vec3f>& volumePoints,
-    LasagnaCornerBatch& samples,
-    int parallelThreads = 0);
-
-[[nodiscard]] NormalPrefetchReport visitLasagnaChannelCorners(
-    const std::vector<const LasagnaChannelCornerSampler*>& samplers,
+// Calls `visitor` for every point (concurrently on up to parallelThreads threads).
+void visitLasagnaChannelCorners(
+    const std::vector<const LasagnaChannelBinding*>& bindings,
     const std::vector<cv::Vec3f>& volumePoints,
     void* visitorContext,
     LasagnaCornerPointVisitor visitor,
-    int parallelThreads = 0,
-    bool collectLocalityStats = false,
-    const vc::render::PinnedChunkRegion* pinnedRegion = nullptr);
+    int parallelThreads,
+    LasagnaCornerBatch& scratch);
 
-[[nodiscard]] size_t lasagnaReadWorkersPerChannel();
+// Any channel in double geometry (p / spacing).
+struct LasagnaCubes {
+    std::vector<std::array<double, 8>> values;
+    std::vector<cv::Vec3d> fractionsXYZ;
+    std::vector<uint8_t> valid;
+};
+
+void readLasagnaCubes(
+    const LasagnaChannelBinding& binding,
+    std::span<const cv::Vec3d> volumePoints,
+    LasagnaCubes& cubes);
+
+
+// Compact-normal (nx, ny byte) cubes to their weighted principal axis; corners
+// whose `validity` value is zero are left out. nullopt when no corner counts.
+[[nodiscard]] std::optional<cv::Vec3d> lasagnaCompactAxisCube(
+    const std::array<double, 8>& nx,
+    const std::array<double, 8>& ny,
+    const cv::Vec3d& fractionXYZ,
+    const std::array<double, 8>* validity = nullptr);
+
+[[nodiscard]] std::optional<double> sampleLasagnaChannel(
+    const LasagnaChannelBinding& binding,
+    const cv::Vec3d& volumePoint);
+
+[[nodiscard]] std::optional<cv::Vec3d> sampleLasagnaCompactAxisTensor(
+    const LasagnaChannelBinding& nxBinding,
+    const LasagnaChannelBinding& nyBinding,
+    const cv::Vec3d& volumePoint, const LasagnaChannelBinding* validity = nullptr);
+
+// Interpolate each component before optional L2 normalization; empty denotes
+// invalid (or normalized zero). With normalize=false retain physical
+// scalar/vector units, including valid zero. With `validity`, corners whose
+// validity value is zero are left out of each component's interpolation.
+void sampleLasagnaVectorBatch(const std::vector<LasagnaChannelBinding>& channels,
+    const std::vector<cv::Vec3f>& points, std::vector<std::vector<float>>& vectors,
+    bool normalize = true, const LasagnaChannelBinding* validity = nullptr);
 
 [[nodiscard]] double decodeCompactNormalComponent(double raw);
+// Storage-independent interpolation, also used by owned dense ROIs.
+[[nodiscard]] std::optional<cv::Vec3d> interpolateLasagnaCompactTensorCorners(
+    const std::array<uint8_t,8>& nx, const std::array<uint8_t,8>& ny,
+    const cv::Vec3d& fraction, const std::array<uint8_t,8>& mask);
+// Shared scalar stages; separate entrypoints also allow profiling actual tensor
+// accumulation versus principal-axis solving, without timers in the hot loop.
+struct LasagnaCompactTensor {
+    double t00=0,t01=0,t02=0,t11=0,t12=0,t22=0;
+    cv::Vec3d hint{0,0,0};
+    double totalWeight=0;
+};
+[[nodiscard]] LasagnaCompactTensor accumulateLasagnaCompactTensorCorners(
+    const std::array<uint8_t,8>& nx,const std::array<uint8_t,8>& ny,
+    const cv::Vec3d& fraction,const std::array<uint8_t,8>& mask);
+[[nodiscard]] std::optional<cv::Vec3d> finalizeLasagnaCompactTensor(const LasagnaCompactTensor&);
 [[nodiscard]] cv::Vec3d decodeCompactNormalFromRaw(double rawNx, double rawNy);
 [[nodiscard]] std::optional<std::array<uint8_t, 2>>
 encodeCompactNormalToRaw(const cv::Vec3d& normal);
@@ -216,85 +176,13 @@ encodeCompactNormalToRaw(const cv::Vec3d& normal);
     const cv::Matx33d& tensor,
     const cv::Vec3d& hint);
 
-[[nodiscard]] float interpolateLasagnaCorners(
-    const LasagnaCornerSample& sample);
-[[nodiscard]] std::array<float, 8> lasagnaCornerWeights(
-    const cv::Vec3f& fractionXYZ);
 [[nodiscard]] std::array<float, 8> validLasagnaCornerWeights(
     const std::array<float, 8>& weights, const std::array<uint8_t, 8>& validity);
-[[nodiscard]] float interpolateLasagnaCorners(
-    const std::array<uint8_t, 8>& values,
-    const std::array<float, 8>& weights);
 
-[[nodiscard]] cv::Vec3f interpolateLasagnaCompactAxisCorners(
-    const LasagnaCornerSample& nx,
-    const LasagnaCornerSample& ny,
-    const cv::Vec3f& hint = {0.0f, 0.0f, 0.0f});
 [[nodiscard]] cv::Vec3f interpolateLasagnaCompactAxisCorners(
     const std::array<uint8_t, 8>& nx,
     const std::array<uint8_t, 8>& ny,
     const std::array<float, 8>& weights,
     const cv::Vec3f& hint = {0.0f, 0.0f, 0.0f}, bool vectorized = false);
-
-[[nodiscard]] LasagnaChannelBinding bindLasagnaChannel(
-    const LasagnaDatasetManifest& manifest,
-    std::string_view channel,
-    bool allowFloat32 = false);
-
-// Typed scalar reads through the same process cache. Interpolate each component
-// before optional L2 normalization; empty denotes invalid (or normalized zero).
-// With normalize=false retain physical scalar/vector units, including valid zero.
-void sampleLasagnaVectorBatch(const std::vector<LasagnaChannelBinding>& channels,
-    const std::vector<cv::Vec3f>& points, std::vector<std::vector<float>>& vectors,
-    bool normalize = true, const LasagnaChannelBinding* validity = nullptr,
-    const vc::render::PinnedChunkRegion* pinnedRegion = nullptr);
-
-[[nodiscard]] LasagnaCubeRequest prepareLasagnaCubeRequest(
-    const LasagnaChannelBinding& binding,
-    const cv::Vec3d& volumePoint);
-
-[[nodiscard]] bool sameLasagnaSamplingGrid(
-    const LasagnaChannelBinding& a,
-    const LasagnaChannelBinding& b);
-
-[[nodiscard]] LasagnaCubeRequest cloneLasagnaCubeRequestForBinding(
-    const LasagnaCubeRequest& source,
-    const LasagnaChannelBinding& binding);
-
-void assignResolvedLasagnaCubeRequestChunks(
-    LasagnaCubeRequest& request,
-    const LasagnaResolvedChunks& resolved);
-
-void appendUniqueLasagnaCubeRequestChunkKeys(
-    const LasagnaCubeRequest& request,
-    std::vector<LasagnaChannelChunkKey>& keys);
-
-void deduplicateLasagnaChunkKeysInPlace(
-    std::vector<LasagnaChannelChunkKey>& keys);
-
-void appendLasagnaInterpolationChunkKeys(
-    const LasagnaChannelBinding& binding,
-    const cv::Vec3d& volumePoint,
-    std::vector<LasagnaChannelChunkKey>& keys);
-
-[[nodiscard]] std::optional<double> sampleLasagnaChannel(
-    const LasagnaChannelBinding& binding,
-    const cv::Vec3d& volumePoint);
-
-[[nodiscard]] std::optional<double> sampleLasagnaChannel(
-    const LasagnaChannelBinding& binding,
-    const LasagnaCubeRequest& request);
-
-[[nodiscard]] std::optional<cv::Vec3d> sampleLasagnaCompactAxisTensor(
-    const LasagnaChannelBinding& nxBinding,
-    const LasagnaChannelBinding& nyBinding,
-    const cv::Vec3d& volumePoint, const LasagnaChannelBinding* validity = nullptr);
-
-[[nodiscard]] std::optional<cv::Vec3d> sampleLasagnaCompactAxisTensor(
-    const LasagnaChannelBinding& nxBinding,
-    const LasagnaChannelBinding& nyBinding,
-    const LasagnaCubeRequest& nxRequest,
-    const LasagnaCubeRequest& nyRequest, const LasagnaChannelBinding* validity = nullptr,
-    const LasagnaCubeRequest* validityRequest = nullptr);
 
 } // namespace vc::lasagna

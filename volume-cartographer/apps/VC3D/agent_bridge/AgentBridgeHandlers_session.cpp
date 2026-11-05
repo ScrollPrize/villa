@@ -1,12 +1,19 @@
 #include "agent_bridge/AgentBridgeServer.hpp"
+#include <vc_reader/zarr.hpp>
 #include "agent_bridge/AgentBridgeInternal.hpp"
+#include <vc_object_store/objects/Project.hpp>
+#include <vc_object_store/Uuid.hpp>
+#include <QJsonDocument>
 
 #include <QBuffer>
+#include <QFileInfo>
 #include <QByteArray>
 #include <QCoreApplication>
 #include <QImage>
 #include <QJsonArray>
 #include <QPixmap>
+#include <QOpenGLWidget>
+#include <QPainter>
 #include <QPointF>
 #include <QRegularExpression>
 #include <QWidget>
@@ -23,9 +30,10 @@
 #include "CWindow.hpp"
 #include "AxisAlignedSliceController.hpp"
 #include "CState.hpp"
-#include "OpenDataCoordinateIdentity.hpp"
-#include "OpenDataSegmentCache.hpp"
+#include "OpenDataResourceSelection.hpp"
+#include "ProjectResources.hpp"
 #include "SegmentationCommandHandler.hpp"
+#include "SurfaceCatalog.hpp"
 #include "SurfacePanelController.hpp"
 #include "ViewerManager.hpp"
 #include "WrapAnnotationWidget.hpp"
@@ -34,8 +42,8 @@
 #include "volume_viewers/CChunkedVolumeViewer.hpp"
 #include "volume_viewers/VolumeViewerBase.hpp"
 
-#include "vc/core/types/Segmentation.hpp"
 #include "vc/core/types/Volume.hpp"
+#include "vc/core/types/ProjectCreation.hpp"
 #include "vc/core/types/VolumePkg.hpp"
 #include "vc/core/util/Logging.hpp"
 #include "vc/core/util/QuadSurface.hpp"
@@ -59,12 +67,18 @@ QJsonObject AgentBridgeServer::handleStateGet(const QJsonValue&)
 
     if (!state) {
         // Degenerate case: report an empty snapshot rather than erroring.
-        result["vpkg"] = QJsonValue::Null;
+        result["project"] = QJsonValue::Null;
+        result["stores"] = QJsonArray();
+        result["routes"] = QJsonObject();
+        result["author"] = CState::storeAuthor();
+        result["authorConfigured"] = CState::storeAuthorConfigured();
+        result["umbilicus"] = QJsonValue::Null;
         result["volume"] = QJsonValue::Null;
         result["activeSurface"] = QJsonValue::Null;
         result["segmentationGrowthVolumeId"] = QString();
         result["segmentationEditingEnabled"] = false;
         result["manualAddMode"] = false;
+        result["segmentationGrowthMethod"] = QJsonValue::Null;
         result["manualAddLineMode"] = QJsonValue::Null;
         result["manualAddInterpolation"] = QJsonValue::Null;
         result["correctionsPointMode"] = false;
@@ -77,14 +91,70 @@ QJsonObject AgentBridgeServer::handleStateGet(const QJsonValue&)
         return result;
     }
 
-    // vpkg
-    if (state->hasVpkg()) {
-        QJsonObject vpkg;
-        vpkg["path"] = state->vpkgPath();
-        result["vpkg"] = vpkg;
+    // The project file, its store references and each object kind's selected store.
+    const auto session = state->objectStoreSession();
+    const auto describeStore = [&](const vc::objects::AttachmentIdentity& attachment) {
+        QJsonObject store;
+        store["path"] = QString::fromStdString(session->path(attachment).string());
+        store["storeUuid"] = QString::fromStdString(attachment.storeUuid);
+        store["writable"] = session->writable(attachment);
+        store["hosted"] = session->hubStatus(attachment).has_value();
+        return store;
+    };
+    // Edits are recorded under this author; never empty.
+    result["author"] = CState::storeAuthor();
+    result["authorConfigured"] = CState::storeAuthorConfigured();
+    if (const auto project = state->vpkg()) {
+        // The entries project.detach_entry removes, as the File menu's Detach lists them.
+        QJsonArray entries;
+        const auto addEntries = [&](const std::vector<vc::project::Entry>& list, const auto& kindOf) {
+            for (const auto& entry : list) {
+                entries.append(QJsonObject{
+                    {"kind", kindOf(entry)},
+                    {"location", QString::fromStdString(entry.location)},
+                    {"scope", project->entryOwner(entry.location).empty() ? "everyone" : "only you"},
+                });
+            }
+        };
+        addEntries(project->volumeEntries(), [](const auto&) { return QStringLiteral("volume"); });
+        addEntries(project->normalGridEntries(), [](const auto&) { return QStringLiteral("normal_grid"); });
+        addEntries(project->allLasagnaDatasetEntries(), [](const auto& entry) {
+            return vc::project::isFiberLasagnaEntry(entry) ? QStringLiteral("fiber_lasagna") : QStringLiteral("lasagna");
+        });
+        result["project"] = QJsonObject{{"path", QString::fromStdString(project->path().string())},
+            {"name", QString::fromStdString(project->name())}, {"writable", project->writable()},
+            {"entries", entries}};
+        QJsonArray stores;
+        for (const auto& reference : project->document().data().at("stores")) {
+            const auto id = reference.at("id").get<std::string>();
+            const auto attachment = state->storeReference(id);
+            auto store = attachment ? describeStore(*attachment) : QJsonObject{
+                {"path", QString::fromStdString(project->document().resolve(reference.at("location")).string())}};
+            store["id"] = QString::fromStdString(id);
+            store["available"] = attachment.has_value();
+            stores.append(store);
+        }
+        result["stores"] = stores;
+        result["routes"] = QJsonDocument::fromJson(QByteArray::fromStdString(project->document().data().at("selections").dump())).object();
     } else {
-        result["vpkg"] = QJsonValue::Null;
+        result["project"] = QJsonValue::Null;
+        result["stores"] = QJsonArray();
+        result["routes"] = QJsonObject();
     }
+
+    // The annotation volume's umbilicus objects in the store routed for umbilici.
+    QJsonValue umbilicus = QJsonValue::Null;
+    try {
+        if (const auto umbilici = vc3d::annotationUmbilici(*state)) {
+            QJsonArray uuids;
+            for (const auto& [uuid, revision] : umbilici->pins) uuids.append(QString::fromStdString(uuid));
+            umbilicus = QJsonObject{{"volume", QString::fromStdString(umbilici->volume)},
+                                    {"store", storeReferenceJson(*state, umbilici->store)}, {"uuids", uuids}};
+        }
+    } catch (const std::exception&) {
+        // An unreadable store has no umbilicus to report; stores[] shows its availability.
+    }
+    result["umbilicus"] = umbilicus;
 
     // volume
     if (auto vol = state->currentVolume()) {
@@ -124,6 +194,7 @@ QJsonObject AgentBridgeServer::handleStateGet(const QJsonValue&)
     // Line and interpolation modes persist when manual-add is inactive.
     if (SegmentationModule* mod = _window->_segmentationModule.get()) {
         result["manualAddMode"] = mod->manualAddMode();
+        result["manualAddFollowingSheet"] = mod->manualAddSheetWalkRunning();
         result["correctionsPointMode"] = mod->correctionPointMode();
         // Explicit save/flush bookkeeping.
         const SegmentationModule::AutosaveStatus save = mod->autosaveStatus();
@@ -134,6 +205,7 @@ QJsonObject AgentBridgeServer::handleStateGet(const QJsonValue&)
         result["autosave"] = autosave;
     } else {
         result["manualAddMode"] = false;
+        result["manualAddFollowingSheet"] = false;
         result["correctionsPointMode"] = false;
         result["autosave"] = QJsonValue::Null;
     }
@@ -151,10 +223,12 @@ QJsonObject AgentBridgeServer::handleStateGet(const QJsonValue&)
         result["axisAlignedSlices"] = QJsonValue::Null;
     }
     if (SegmentationWidget* widget = _window->_segmentationWidget) {
+        result["segmentationGrowthMethod"] = segmentationGrowthMethodToString(widget->growthMethod());
         const ManualAddTool::Config cfg = widget->manualAddConfig();
         result["manualAddLineMode"] = linePreviewModeToString(cfg.linePreviewMode);
         result["manualAddInterpolation"] = interpolationModeToString(cfg.interpolationMode);
     } else {
+        result["segmentationGrowthMethod"] = QJsonValue::Null;
         result["manualAddLineMode"] = QJsonValue::Null;
         result["manualAddInterpolation"] = QJsonValue::Null;
     }
@@ -230,200 +304,17 @@ QJsonObject AgentBridgeServer::handleStateGet(const QJsonValue&)
 }
 
 
-QJsonObject AgentBridgeServer::handleSegmentsAttach(const QJsonValue& params)
+QJsonObject AgentBridgeServer::handleSegmentsList(const QJsonValue& /*params*/)
 {
-    namespace fs = std::filesystem;
-
-    CState* state = _window ? _window->_state : nullptr;
-    std::shared_ptr<VolumePkg> vpkg = state ? state->vpkg() : nullptr;
-    if (!state || !state->hasVpkg() || !vpkg)
-        throw AgentBridgeError{-32000, "No volume package loaded", {}};
-
-    const QJsonObject p = params.toObject();
-    const QString location = p.value("location").toString();
-    if (location.trimmed().isEmpty()) {
-        throw AgentBridgeError{
-            -32602,
-            "location must not be blank",
-            QJsonObject{{"param", "location"}},
-        };
-    }
-
-    const std::string input = location.toStdString();
-    if (vc::project::isLocationRemote(input)) {
-        throw AgentBridgeError{
-            -32007,
-            "Invalid segments location",
-            QJsonObject{
-                {"kind", "segment"},
-                {"detail", "remote segment locations are not supported"},
-            },
-        };
-    }
-
-    fs::path localPath =
-        vc::project::resolveLocalPath(input).lexically_normal();
-    while (localPath.has_relative_path() && localPath.filename().empty())
-        localPath = localPath.parent_path();
-    if (!localPath.is_absolute()) {
-        throw AgentBridgeError{
-            -32602,
-            "segment path must be absolute",
-            QJsonObject{{"param", "location"}},
-        };
-    }
-    const std::string normalizedLocation = localPath.string();
-
-    const std::string validationError = vc::project::validateLocation(
-        vc::project::Category::Segments, normalizedLocation);
-    if (!validationError.empty()) {
-        throw AgentBridgeError{
-            -32007,
-            "Invalid segments location",
-            QJsonObject{
-                {"kind", "segment"},
-                {"detail", QString::fromStdString(validationError)},
-            },
-        };
-    }
-
-    const bool select = p.value("select").toBool(true);
-    auto sourceIsSelected = [&](const std::string& persistedLocation) {
-        const fs::path selected =
-            vpkg->outputSegmentsPath().lexically_normal();
-        const fs::path source = vc::project::resolveLocalPath(
-            persistedLocation, vpkg->path().parent_path()).lexically_normal();
-        if (selected.empty())
-            return false;
-        std::error_code ec;
-        if (fs::equivalent(selected, source, ec))
-            return true;
-        return selected == source;
-    };
-    auto resultFor = [&](bool attached, const std::string& persistedLocation) {
-        return QJsonObject{
-            {"attached", attached},
-            {"alreadyAttached", !attached},
-            {"location", QString::fromStdString(persistedLocation)},
-            {"projectPath", QString::fromStdString(vpkg->path().string())},
-            {"selected", sourceIsSelected(persistedLocation)},
-        };
-    };
-
-    const auto existing =
-        vpkg->matchingSegmentsEntry(normalizedLocation);
-    const std::string persistedLocation =
-        existing ? existing->location : normalizedLocation;
-    const std::string sourceName = localPath.filename().string();
-    if (!existing) {
-        if (const auto conflict =
-                vpkg->matchingSegmentsEntryByDirectoryName(sourceName)) {
-            throw AgentBridgeError{
-                -32010,
-                "A segment source with the same directory name is already attached",
-                QJsonObject{
-                    {"sourceName", QString::fromStdString(sourceName)},
-                    {"existingLocation",
-                     QString::fromStdString(conflict->location)},
-                },
-            };
-        }
-    }
-
-    const bool selectionChanged =
-        select && !sourceIsSelected(persistedLocation);
-    const bool reloadSurfaces = !existing || selectionChanged;
-    if (reloadSurfaces && _window->_segmentationWidget &&
-        _window->_segmentationWidget->isEditingEnabled()) {
-        throw AgentBridgeError{
-            -32004,
-            "Cannot attach segments while editing",
-            QJsonObject{
-                {"detail",
-                 "disable segmentation editing before changing segment sources"},
-            },
-        };
-    }
-
-    std::vector<std::string> tags;
-    const QJsonArray tagValues = p.value("tags").toArray();
-    tags.reserve(tagValues.size());
-    for (const QJsonValue& tag : tagValues)
-        tags.push_back(tag.toString().toStdString());
-
-    VolumePkg::AttachSegmentsResult attachResult;
-    try {
-        attachResult = vpkg->attachSegmentsEntry(
-            normalizedLocation, std::move(tags), select);
-    } catch (const std::exception& error) {
-        throw AgentBridgeError{
-            -32005,
-            "Could not attach segments",
-            QJsonObject{{"detail", QString::fromUtf8(error.what())}},
-        };
-    }
-    if (reloadSurfaces) {
-        try {
-            _window->refreshCurrentVolumePackageUi(QString(), true);
-        } catch (const std::exception& error) {
-            Logger()->warn(
-                "Segment attachment committed, but the VC3D UI could not "
-                "refresh: {}",
-                error.what());
-        } catch (...) {
-            Logger()->warn(
-                "Segment attachment committed, but the VC3D UI could not "
-                "refresh");
-        }
-    }
-
-    const bool attached =
-        attachResult == VolumePkg::AttachSegmentsResult::Attached;
-    return resultFor(attached, persistedLocation);
-}
-
-
-QJsonObject AgentBridgeServer::handleSegmentsList(const QJsonValue& params)
-{
-    CState* state = _window ? _window->_state : nullptr;
-    std::shared_ptr<VolumePkg> vpkg = state ? state->vpkg() : nullptr;
-    if (!state || !state->hasVpkg() || !vpkg)
-        throw AgentBridgeError{-32000, "No volume package loaded", {}};
-
-    const QJsonObject p = params.toObject();
-    const bool onlyLoaded = p.value("onlyLoaded").toBool(false);
-
-    // Loaded surface names live in CState; the on-disk segment ids come from the
-    // package. A segment is "loaded" when its id appears among CState surfaces.
-    const std::vector<std::string> loadedNames = state->surfaceNames();
-    const std::unordered_set<std::string> loadedSet(loadedNames.begin(), loadedNames.end());
-    const std::string activeId = state->activeSurfaceId();
-
+    auto& catalog = requireSurfaceCatalog(_window->_surfaceCatalog.get());
+    const std::string activeId = _window->_state ? _window->_state->activeSurfaceId() : std::string{};
     QJsonArray segments;
-    for (const std::string& id : vpkg->segmentationIDs()) {
-        const bool loaded = loadedSet.count(id) > 0;
-        if (onlyLoaded && !loaded)
-            continue;
-
-        QJsonObject seg;
-        seg["id"] = QString::fromStdString(id);
-
-        QString path;
-        try {
-            if (auto s = vpkg->segmentation(id))
-                path = QString::fromStdString(s->path().string());
-        } catch (...) {
-            // Metadata resolution may fail for a partially written segment; the
-            // id is still reportable without a path.
-        }
-        seg["path"] = path;
-        seg["loaded"] = loaded;
-        seg["active"] = (id == activeId);
-        segments.push_back(seg);
-    }
-
+    for (const auto& [uuid, row] : catalog.rows())
+        segments.push_back(surfaceRowJson(row, activeId, *_window->_state));
     QJsonObject result;
     result["segments"] = segments;
+    // A listing is still being read: what is here may be partial.
+    result["loading"] = catalog.loading();
     return result;
 }
 
@@ -431,9 +322,9 @@ QJsonObject AgentBridgeServer::handleSegmentsList(const QJsonValue& params)
 QJsonObject AgentBridgeServer::handleSegmentsActivate(const QJsonValue& params)
 {
     CState* state = _window ? _window->_state : nullptr;
-    std::shared_ptr<VolumePkg> vpkg = state ? state->vpkg() : nullptr;
-    if (!state || !state->hasVpkg() || !vpkg)
-        throw AgentBridgeError{-32000, "No volume package loaded", {}};
+    if (!state)
+        throw AgentBridgeError{-32000, "No state", {}};
+    (void)requireSurfaceCatalog(_window->_surfaceCatalog.get());
 
     const QJsonObject p = params.toObject();
     const QString segmentIdQ = p.value("segmentId").toString();
@@ -450,19 +341,6 @@ QJsonObject AgentBridgeServer::handleSegmentsActivate(const QJsonValue& params)
         data["detail"] = "surface panel is not available";
         throw AgentBridgeError{-32010, "Surface panel unavailable", data};
     }
-
-    // Resolve the path for the result's segment entry. Prefer the
-    // loaded CState surface (covers multi-folder display ids), fall back to the vpkg.
-    auto resolveSegPath = [&]() -> QString {
-        if (auto surf = state->surface(segmentId))
-            return QString::fromStdString(surf->path.string());
-        try {
-            if (auto s = vpkg->segmentation(segmentId))
-                return QString::fromStdString(s->path().string());
-        } catch (...) {
-        }
-        return QString();
-    };
 
     const std::string prevActive = state->activeSurfaceId();
     const QJsonValue previousSegmentId = prevActive.empty()
@@ -483,7 +361,7 @@ QJsonObject AgentBridgeServer::handleSegmentsActivate(const QJsonValue& params)
                 data["detail"] = err;
                 throw AgentBridgeError{-32004, "Surface selection is locked", data};
             }
-            if (err.startsWith(QLatin1String("unknown segment"))) {
+            if (err.startsWith(QLatin1String("unknown surface"))) {
                 QJsonObject data;
                 data["kind"] = "segment";
                 data["id"] = segmentIdQ;
@@ -506,369 +384,13 @@ QJsonObject AgentBridgeServer::handleSegmentsActivate(const QJsonValue& params)
         }
     }
 
-    QJsonObject segment;
-    segment["id"] = segmentIdQ;
-    segment["path"] = resolveSegPath();
-    segment["loaded"] = true;
-    segment["active"] = true;
+    const QJsonObject segment = surfaceRowJson(*_window->_surfaceCatalog->row(segmentId), segmentId, *state);
 
     QJsonObject result;
     result["activated"] = true;
     result["segment"] = segment;
     result["previousSegmentId"] = previousSegmentId;
     result["alreadyActive"] = alreadyActive;
-    return result;
-}
-
-
-QJsonObject AgentBridgeServer::handleSegmentsCreateEditableCopy(const QJsonValue& params)
-{
-    CState* state = _window ? _window->_state : nullptr;
-    std::shared_ptr<VolumePkg> vpkg = state ? state->vpkg() : nullptr;
-    if (!state || !state->hasVpkg() || !vpkg)
-        throw AgentBridgeError{-32000, "No volume package loaded", {}};
-
-    if (_window->_segmentationWidget &&
-        _window->_segmentationWidget->isEditingEnabled()) {
-        throw AgentBridgeError{
-            -32004,
-            "Cannot create an editable copy while editing",
-            QJsonObject{{"detail", "disable segmentation editing first"}},
-        };
-    }
-
-    const QJsonObject p = params.toObject();
-    const QString segmentIdQ = p.value("segmentId").toString();
-    if (segmentIdQ.isEmpty()) {
-        throw AgentBridgeError{
-            -32602,
-            "segmentId is required",
-            QJsonObject{{"param", "segmentId"}},
-        };
-    }
-    const std::string segmentId = segmentIdQ.toStdString();
-
-    std::shared_ptr<Segmentation> source;
-    try {
-        source = vpkg->segmentation(segmentId);
-    } catch (...) {
-    }
-    if (!source) {
-        throw AgentBridgeError{
-            -32007,
-            QStringLiteral("Unknown segment id: %1").arg(segmentIdQ),
-            QJsonObject{{"kind", "segment"}, {"id", segmentIdQ}},
-        };
-    }
-
-    const std::filesystem::path selectedPath = source->path();
-    std::filesystem::path sourcePath = selectedPath;
-    std::filesystem::path editablePath;
-
-    if (!vc3d::opendata::isOpenDataCatalogSegmentDirectory(sourcePath)) {
-        // A successful first call selects the editable source, so an immediate
-        // retry resolves segmentId there instead of in the catalog source.
-        // A default copy root is named after the selected catalog root with an
-        // `_editable` suffix. Recover that root and search it because aggregate
-        // catalog entries can keep the actual segment in a nested representation.
-        constexpr std::string_view suffix = "_editable";
-        const auto selectedRoot = selectedPath.parent_path();
-        const auto selectedRootName = selectedRoot.filename().string();
-        if (selectedRootName.ends_with(suffix)) {
-            const auto catalogRoot = selectedRoot.parent_path() /
-                selectedRootName.substr(0, selectedRootName.size() - suffix.size());
-            std::filesystem::path candidate =
-                catalogRoot / selectedPath.filename();
-            if (!vc3d::opendata::isOpenDataCatalogSegmentDirectory(candidate)) {
-                candidate.clear();
-                std::error_code scanError;
-                std::filesystem::recursive_directory_iterator it(
-                    catalogRoot,
-                    std::filesystem::directory_options::skip_permission_denied,
-                    scanError);
-                const std::filesystem::recursive_directory_iterator end;
-                for (; it != end && !scanError; it.increment(scanError)) {
-                    std::error_code entryError;
-                    if (!it->is_directory(entryError) || entryError ||
-                        it->path().filename() != selectedPath.filename()) {
-                        continue;
-                    }
-                    if (vc3d::opendata::isOpenDataCatalogSegmentDirectory(
-                            it->path())) {
-                        candidate = it->path();
-                        break;
-                    }
-                }
-            }
-            const auto candidateEditablePath = candidate.empty()
-                ? std::filesystem::path{}
-                : vc3d::opendata::defaultEditableCopyPathForCatalogSegment(
-                      candidate, catalogRoot);
-            std::error_code equivalentError;
-            if (!candidate.empty() &&
-                std::filesystem::equivalent(
-                    selectedPath, candidateEditablePath, equivalentError) &&
-                !equivalentError) {
-                sourcePath = candidate;
-                editablePath = candidateEditablePath;
-            }
-        }
-    }
-
-    if (!vc3d::opendata::isOpenDataCatalogSegmentDirectory(sourcePath)) {
-        throw AgentBridgeError{
-            -32009,
-            "Segment is not an immutable Open Data catalog segment",
-            QJsonObject{
-                {"kind", "segment"},
-                {"id", segmentIdQ},
-                {"path", QString::fromStdString(sourcePath.string())},
-            },
-        };
-    }
-    if (vc3d::opendata::isOpenDataSegmentPlaceholder(sourcePath)) {
-        throw AgentBridgeError{
-            -32009,
-            "Catalog segment must be fetched before it can be copied",
-            QJsonObject{
-                {"kind", "segment"},
-                {"id", segmentIdQ},
-                {"action", "segments.fetch"},
-            },
-        };
-    }
-
-    if (editablePath.empty()) {
-        const auto registeredCatalogRoot =
-            vc3d::opendata::registeredOpenDataCatalogRootForSegment(
-                *vpkg, sourcePath);
-        const auto copySourceRoot = registeredCatalogRoot.empty()
-            ? vpkg->outputSegmentsPath()
-            : registeredCatalogRoot;
-        editablePath =
-            vc3d::opendata::defaultEditableCopyPathForCatalogSegment(
-                sourcePath, copySourceRoot);
-    }
-    const std::filesystem::path editableRoot = editablePath.parent_path();
-    const std::string editableId = editablePath.filename().string();
-    std::error_code existsError;
-    const bool alreadyExisted = std::filesystem::exists(editablePath, existsError);
-    if (existsError) {
-        throw AgentBridgeError{
-            -32005,
-            "Could not inspect editable segment destination",
-            QJsonObject{{"detail", QString::fromStdString(existsError.message())}},
-        };
-    }
-
-    try {
-        vc3d::opendata::copyCatalogSegmentToEditableDirectory(
-            *vpkg, sourcePath, editablePath);
-        vc3d::opendata::attachEditableOpenDataSegmentRoot(
-            *vpkg, sourcePath, editableRoot, true);
-
-        auto editableSurface = vpkg->loadSurface(editableId);
-        if (!editableSurface) {
-            editableSurface = std::make_shared<QuadSurface>(editablePath);
-        }
-        vc3d::opendata::copyVolumeCoordinateIdentityToSurface(
-            *editableSurface, *vpkg, state->currentVolumeId());
-        editableSurface->save_meta();
-    } catch (const std::exception& error) {
-        throw AgentBridgeError{
-            -32005,
-            "Could not create editable segment copy",
-            QJsonObject{{"detail", QString::fromUtf8(error.what())}},
-        };
-    }
-
-    try {
-        _window->refreshCurrentVolumePackageUi(QString(), true);
-    } catch (const std::exception& error) {
-        Logger()->warn(
-            "Editable segment copy was committed, but the VC3D UI could not "
-            "refresh: {}",
-            error.what());
-    } catch (...) {
-        Logger()->warn(
-            "Editable segment copy was committed, but the VC3D UI could not "
-            "refresh");
-    }
-
-    SurfacePanelController* panel =
-        _window ? _window->_surfacePanel.get() : nullptr;
-    if (!panel) {
-        throw AgentBridgeError{
-            -32010,
-            "Surface panel unavailable",
-            QJsonObject{
-                {"detail", "editable copy was created but could not be activated"},
-                {"path", QString::fromStdString(editablePath.string())},
-            },
-        };
-    }
-    QString activationError;
-    if (!panel->activateSurfaceById(editableId, &activationError)) {
-        throw AgentBridgeError{
-            -32005,
-            "Editable segment copy was created but could not be activated",
-            QJsonObject{
-                {"detail", activationError},
-                {"path", QString::fromStdString(editablePath.string())},
-            },
-        };
-    }
-
-    auto equivalentPath = [](const std::filesystem::path& lhs,
-                             const std::filesystem::path& rhs) {
-        std::error_code error;
-        return std::filesystem::equivalent(lhs, rhs, error) && !error;
-    };
-    std::filesystem::path resolvedPath;
-    try {
-        if (auto resolved = vpkg->segmentation(editableId)) {
-            resolvedPath = resolved->path();
-        }
-    } catch (...) {
-    }
-    const auto activeSurface =
-        std::dynamic_pointer_cast<QuadSurface>(state->surface("segmentation"));
-    const auto activeWeakSurface =
-        std::dynamic_pointer_cast<QuadSurface>(state->activeSurface().lock());
-    const std::filesystem::path activePath =
-        activeSurface ? activeSurface->path : std::filesystem::path{};
-    const std::filesystem::path activeWeakPath =
-        activeWeakSurface ? activeWeakSurface->path : std::filesystem::path{};
-    if (state->activeSurfaceId() != editableId ||
-        !equivalentPath(vpkg->outputSegmentsPath(), editableRoot) ||
-        !equivalentPath(resolvedPath, editablePath) ||
-        !equivalentPath(activePath, editablePath) ||
-        !equivalentPath(activeWeakPath, editablePath)) {
-        throw AgentBridgeError{
-            -32005,
-            "Editable segment copy was created but did not remain active",
-            QJsonObject{
-                {"path", QString::fromStdString(editablePath.string())},
-                {"selectedRoot", QString::fromStdString(
-                                     vpkg->outputSegmentsPath().string())},
-                {"resolvedPath", QString::fromStdString(resolvedPath.string())},
-                {"activePath", QString::fromStdString(activePath.string())},
-                {"activeSurfacePath", QString::fromStdString(
-                                          activeWeakPath.string())},
-            },
-        };
-    }
-
-    return QJsonObject{
-        {"created", !alreadyExisted},
-        {"alreadyExisted", alreadyExisted},
-        {"segmentId", QString::fromStdString(editableId)},
-        {"sourcePath", QString::fromStdString(sourcePath.string())},
-        {"path", QString::fromStdString(editablePath.string())},
-        {"activated", true},
-    };
-}
-
-
-QJsonObject AgentBridgeServer::handleSegmentsFetch(const QJsonValue& params)
-{
-    CState* state = _window ? _window->_state : nullptr;
-    std::shared_ptr<VolumePkg> vpkg = state ? state->vpkg() : nullptr;
-    if (!state || !state->hasVpkg() || !vpkg)
-        throw AgentBridgeError{-32000, "No volume package loaded", {}};
-
-    const QJsonObject p = params.toObject();
-    const QString segmentIdQ = p.value("segmentId").toString();
-    if (segmentIdQ.isEmpty()) {
-        QJsonObject data;
-        data["param"] = "segmentId";
-        throw AgentBridgeError{-32602, "segmentId is required", data};
-    }
-    const std::string segmentId = segmentIdQ.toStdString();
-
-    SurfacePanelController* panel = _window ? _window->_surfacePanel.get() : nullptr;
-    if (!panel) {
-        QJsonObject data;
-        data["detail"] = "surface panel is not available";
-        throw AgentBridgeError{-32010, "Surface panel unavailable", data};
-    }
-
-    // Resolve the segment path (prefer the loaded CState surface for multi-folder
-    // display ids, fall back to the vpkg) so the result carries a stable path.
-    auto resolveSegPath = [&]() -> QString {
-        if (auto surf = state->surface(segmentId))
-            return QString::fromStdString(surf->path.string());
-        try {
-            if (auto s = vpkg->segmentation(segmentId))
-                return QString::fromStdString(s->path().string());
-        } catch (...) {
-        }
-        return QString();
-    };
-    const QString segPath = resolveSegPath();
-
-    auto segmentEntry = [&](bool placeholder) {
-        QJsonObject seg;
-        seg["id"] = segmentIdQ;
-        seg["path"] = segPath;
-        seg["placeholder"] = placeholder;
-        return seg;
-    };
-
-    // A concurrent Open Data operation (catalog open or another segment fetch)
-    // shares the same download subsystem, so reject it up front.
-    requireSourceIdle(QStringLiteral("catalog"));
-
-    // Kick off (or short-circuit) the materialize. fetchOpenDataSegmentAsync
-    // only calls onDone for the `Started` outcome; the others are terminal here.
-    // beginJob runs synchronously below before we return to the event loop, so
-    // the "catalog" job is registered before onDone (which finishes it) can fire.
-    const auto outcome = panel->fetchOpenDataSegmentAsync(
-        segmentId,
-        [this, segmentId](bool success, const QString& message) {
-            finishJob(QStringLiteral("catalog"), success,
-                      success
-                          ? QStringLiteral("segment %1 fetched")
-                                .arg(QString::fromStdString(segmentId))
-                          : message,
-                      QString());
-        });
-
-    switch (outcome) {
-    case SurfacePanelController::OpenDataFetchOutcome::NotFound: {
-        QJsonObject data;
-        data["kind"] = "segment";
-        data["id"] = segmentIdQ;
-        throw AgentBridgeError{-32007, "Segment not found", data};
-    }
-    case SurfacePanelController::OpenDataFetchOutcome::Busy: {
-        QJsonObject data;
-        data["source"] = "catalog";
-        data["detail"] = "another open-data segment fetch is already in progress";
-        throw AgentBridgeError{-32004, "A segment fetch is already in progress", data};
-    }
-    case SurfacePanelController::OpenDataFetchOutcome::AlreadyMaterialized: {
-        QJsonObject result;
-        result["fetched"] = true;
-        result["alreadyMaterialized"] = true;
-        result["segment"] = segmentEntry(false);
-        return result;
-    }
-    case SurfacePanelController::OpenDataFetchOutcome::Started:
-        break;
-    }
-
-    const QString jobId = beginJob(QStringLiteral("catalog"),
-                                   QStringLiteral("segments.fetch"),
-                                   QStringLiteral("Fetching segment %1").arg(segmentIdQ),
-                                   /*broadcastStart=*/true);
-
-    QJsonObject result;
-    result["jobId"] = jobId;
-    result["source"] = "catalog";
-    result["fetched"] = false;
-    result["alreadyMaterialized"] = false;
-    result["segment"] = segmentEntry(true);
     return result;
 }
 
@@ -906,6 +428,22 @@ QJsonObject AgentBridgeServer::handleScreenshotCapture(const QJsonValue& params)
     }
 
     QPixmap pixmap = widget->grab();
+    // QWidget's raster grab does not support QOpenGLWidget contents. Composite
+    // each visible GL child's framebuffer in logical coordinates so 3D colours
+    // and legends survive full-window captures, including on Retina displays.
+    {
+        QPainter painter(&pixmap);
+        for (auto* gl : widget->findChildren<QOpenGLWidget*>()) {
+            if (!gl->isVisibleTo(widget) || gl->window() != widget->window()) continue;
+            const QImage frame = gl->grabFramebuffer();
+            if (frame.isNull()) continue;
+            const QPoint position = gl->mapTo(widget, QPoint{});
+            painter.save();
+            painter.setClipRegion(gl->visibleRegion().translated(position));
+            painter.drawImage(QRect(position, gl->size()), frame);
+            painter.restore();
+        }
+    }
 
     static constexpr int kMinCaptureDim = 8;
     if (pixmap.width() < kMinCaptureDim || pixmap.height() < kMinCaptureDim) {
@@ -1024,12 +562,12 @@ QJsonObject AgentBridgeServer::handleProjectCreate(const QJsonValue& params)
         QJsonObject data{{"param", "path"}};
         throw AgentBridgeError{-32602, "path must not be blank", data};
     }
-    if (volume.trimmed().isEmpty()) {
+    if (p.contains("volume") && volume.trimmed().isEmpty()) {
         QJsonObject data{{"param", "volume"}};
         throw AgentBridgeError{-32602, "volume must not be blank", data};
     }
-    if (!output.endsWith(QStringLiteral(".volpkg.json"), Qt::CaseInsensitive))
-        output += QStringLiteral(".volpkg.json");
+    if (!output.endsWith(QStringLiteral(".vcproj"), Qt::CaseInsensitive))
+        output += QStringLiteral(".vcproj");
 
     fs::path outputPath = fs::path(output.toStdString()).lexically_normal();
     if (!outputPath.is_absolute()) {
@@ -1037,9 +575,10 @@ QJsonObject AgentBridgeServer::handleProjectCreate(const QJsonValue& params)
         throw AgentBridgeError{-32602, "path must be absolute", data};
     }
 
-    const std::string volumeLocation = volume.toStdString();
-    if (!vc::project::isLocationRemote(volumeLocation) &&
-        !vc::project::resolveLocalPath(volumeLocation).is_absolute()) {
+    const std::optional<std::string> volumeLocation =
+        p.contains("volume") ? std::optional(volume.toStdString()) : std::nullopt;
+    if (volumeLocation && !vcr::zarr::isRemote(*volumeLocation) &&
+        !vc::project::resolveLocalPath(*volumeLocation).is_absolute()) {
         QJsonObject data{{"param", "volume"}};
         throw AgentBridgeError{-32602, "local volume path must be absolute", data};
     }
@@ -1060,7 +599,7 @@ QJsonObject AgentBridgeServer::handleProjectCreate(const QJsonValue& params)
     }
 
     const std::string validationError =
-        vc::project::validateSingleVolumeLocation(volumeLocation);
+        volumeLocation ? vc::project::validateSingleVolumeLocation(*volumeLocation) : std::string{};
     if (!validationError.empty()) {
         QJsonObject data{
             {"detail", QString::fromStdString(validationError)},
@@ -1073,8 +612,7 @@ QJsonObject AgentBridgeServer::handleProjectCreate(const QJsonValue& params)
     if (p.contains("name")) {
         projectName = p.value("name").toString();
     } else {
-        projectName = QString::fromStdString(outputPath.filename().string());
-        projectName.chop(QStringLiteral(".volpkg.json").size());
+        projectName = QString::fromStdString(outputPath.stem().string());
         if (projectName.isEmpty())
             projectName = QStringLiteral("Untitled");
     }
@@ -1085,25 +623,40 @@ QJsonObject AgentBridgeServer::handleProjectCreate(const QJsonValue& params)
     for (const QJsonValue& tag : tagValues)
         tags.push_back(tag.toString().toStdString());
 
-    vc::project::LoadOptions options;
-    options.deferResolution = true;
-    auto package = VolumePkg::newDetached(options);
-    package->setName(projectName.toStdString());
-    if (!package->addVolumeEntry(volumeLocation, std::move(tags)))
-        throw AgentBridgeError{-32010, "Could not add volume to project", {}};
-
+    fs::path storePath = p.value("store").toString().toStdString();
+    const auto requestedNewStore = p.value("newStore").toString();
+    if (!storePath.empty() && !requestedNewStore.isEmpty())
+        throw AgentBridgeError{-32602, "Choose store or newStore, not both", {}};
+    const bool makeStore = storePath.empty();
+    if (makeStore) {
+        storePath = requestedNewStore.isEmpty() ? outputPath.parent_path() / (outputPath.stem().string() + ".vcobj")
+                                               : fs::path(requestedNewStore.toStdString());
+    }
+    if (!storePath.is_absolute()) throw AgentBridgeError{-32602, "Store path must be absolute", {}};
+    std::error_code sameError;
+    if (storePath.lexically_normal() == outputPath || fs::equivalent(storePath, outputPath, sameError))
+        throw AgentBridgeError{-32602, "The project and object store must be separate files", {}};
+    vc::project::CreatedProject created;
     try {
-        package->save(outputPath);
+        if (_window && _window->_state && _window->_state->vpkg() &&
+            (_window->_state->vpkg()->path() == outputPath || fs::equivalent(_window->_state->vpkg()->path(), outputPath, sameError)))
+            throw std::runtime_error("the output is the open project");
+        // An existing store's reference is read-only when this user cannot write it, as in New Project.
+        created = vc::project::createProject(outputPath, projectName.toStdString(),
+            {makeStore ? vc::project::StoreChoice::Mode::New : vc::project::StoreChoice::Mode::Existing, storePath,
+             !makeStore && !QFileInfo(QString::fromStdString(storePath.string())).isWritable()},
+            CState::storeOpenOptions(CState::storeAuthor(), false), volumeLocation, std::move(tags),
+            p.value("overwrite").toBool(false));
     } catch (const std::exception& error) {
-        QJsonObject data{{"detail", QString::fromUtf8(error.what())}};
-        throw AgentBridgeError{-32005, "Project write failed", data};
+        throw AgentBridgeError{-32005, "Project write failed", {{"detail", QString::fromUtf8(error.what())}}};
     }
 
     QJsonObject result;
     result["path"] = QString::fromStdString(outputPath.string());
     result["name"] = projectName;
-    result["volume"] =
-        QString::fromStdString(package->volumeEntries().front().location);
+    result["store"] = QString::fromStdString(created.storePath.string());
+    result["volume"] = created.recordedVolume ? QJsonValue(QString::fromStdString(*created.recordedVolume))
+                                              : QJsonValue(QJsonValue::Null);
     return result;
 }
 
@@ -1127,7 +680,7 @@ QJsonObject AgentBridgeServer::handleVolumeAttach(const QJsonValue& params)
     }
 
     const std::string input = location.toStdString();
-    if (!vc::project::isLocationRemote(input) &&
+    if (!vcr::zarr::isRemote(input) &&
         !vc::project::resolveLocalPath(input).is_absolute()) {
         throw AgentBridgeError{
             -32602,
@@ -1266,7 +819,7 @@ QJsonObject AgentBridgeServer::handleVolumeOpen(const QJsonValue& params)
     const auto ids = state->vpkg()->volumeIDs();
     QJsonObject result;
     result["opened"] = true;
-    result["vpkgPath"] = state->vpkgPath();
+    result["vpkgPath"] = state->projectDirectory();
     result["volumeId"] = QString::fromStdString(state->currentVolumeId());
     QJsonArray idArr;
     for (const auto& id : ids)
@@ -1300,50 +853,28 @@ QJsonObject AgentBridgeServer::handleVolumeList(const QJsonValue&)
 
 QJsonObject AgentBridgeServer::handleSegmentsDelete(const QJsonValue& params)
 {
-    CState* state = _window ? _window->_state : nullptr;
-    std::shared_ptr<VolumePkg> vpkg = state ? state->vpkg() : nullptr;
-    if (!state || !state->hasVpkg() || !vpkg)
-        throw AgentBridgeError{-32000, "No volume package loaded", {}};
-
     const QJsonObject p = params.toObject();
     const QString segmentIdQ = p.value("segmentId").toString();
     const bool confirm = p.value("confirm").toBool(false);
     if (!confirm) {
         QJsonObject data;
         data["param"] = "confirm";
-        data["reason"] = "destructive; pass confirm=true";
-        throw AgentBridgeError{-32602,
-            "confirm must be true (on-disk deletion is irreversible)", data};
+        data["reason"] = "retires the surface; pass confirm=true";
+        throw AgentBridgeError{-32602, "confirm must be true", data};
     }
 
-    // Refuse while a segmentation edit is in progress (would race the delete
+    // Refuse while a segmentation edit is in progress (would race the retire
     // against unsaved edits / active-surface teardown).
     if (_window->_segmentationWidget && _window->_segmentationWidget->isEditingEnabled()) {
         QJsonObject data;
         data["detail"] = "cannot delete while editing";
         throw AgentBridgeError{-32004, "cannot delete while editing", data};
     }
+    (void)writableCatalogRow(_window->_surfaceCatalog.get(), segmentIdQ);
 
-    // Unknown id -> -32007. Match against the package's known segment ids.
-    const std::string segmentId = segmentIdQ.toStdString();
-    const std::vector<std::string> ids = vpkg->segmentationIDs();
-    if (std::find(ids.begin(), ids.end(), segmentId) == ids.end()) {
-        QJsonObject data;
-        data["kind"] = "segment";
-        data["id"] = segmentIdQ;
-        throw AgentBridgeError{-32007, QStringLiteral("Unknown segment id: %1").arg(segmentIdQ), data};
-    }
-
-    SurfacePanelController* panel = _window ? _window->_surfacePanel.get() : nullptr;
-    if (!panel) {
-        QJsonObject data;
-        data["detail"] = "surface panel is not available";
-        throw AgentBridgeError{-32010, "Surface panel unavailable", data};
-    }
-
-    // Dialog-free core clears the active slot first, deletes on disk, and refreshes.
+    SurfacePanelController* panel = _window->_surfacePanel.get();
     QString err;
-    if (!panel->deleteSegmentsHeadless(QStringList{segmentIdQ}, &err)) {
+    if (!panel || !panel->retireSurfaces(QStringList{segmentIdQ}, &err)) {
         QJsonObject data;
         data["detail"] = err.isEmpty() ? QStringLiteral("delete failed") : err;
         throw AgentBridgeError{-32010, QStringLiteral("Failed to delete segment: %1").arg(err), data};
@@ -1359,97 +890,34 @@ QJsonObject AgentBridgeServer::handleSegmentsDelete(const QJsonValue& params)
 
 QJsonObject AgentBridgeServer::handleSegmentsRename(const QJsonValue& params)
 {
-    CState* state = _window ? _window->_state : nullptr;
-    std::shared_ptr<VolumePkg> vpkg = state ? state->vpkg() : nullptr;
-    if (!state || !state->hasVpkg() || !vpkg)
-        throw AgentBridgeError{-32000, "No volume package loaded", {}};
-
     const QJsonObject p = params.toObject();
     const QString segmentIdQ = p.value("segmentId").toString();
-    const QString newName = p.value("newName").toString();
-
-    // Validate the new name up front so a bad name is -32602 (not -32010).
-    static const QRegularExpression validNameRegex(QStringLiteral("^[a-zA-Z0-9_-]+$"));
-    if (!validNameRegex.match(newName).hasMatch()) {
+    const QString newName = p.value("newName").toString().trimmed();
+    if (newName.isEmpty()) {
         QJsonObject data;
         data["param"] = "newName";
-        throw AgentBridgeError{-32602,
-            "newName must match ^[a-zA-Z0-9_-]+$", data};
+        throw AgentBridgeError{-32602, "newName is required", data};
     }
-
-    // Refuse while editing (mirrors segments.delete and the interactive guard).
-    if (_window->_segmentationWidget && _window->_segmentationWidget->isEditingEnabled()) {
+    const auto& row = writableCatalogRow(_window->_surfaceCatalog.get(), segmentIdQ);
+    if (row.record.name == newName.toStdString()) {
         QJsonObject data;
-        data["detail"] = "cannot rename while editing";
-        throw AgentBridgeError{-32004, "cannot rename while editing", data};
+        data["param"] = "newName";
+        throw AgentBridgeError{-32602, "newName is unchanged", data};
     }
-
-    // Unknown id -> -32007.
-    const std::string segmentId = segmentIdQ.toStdString();
-    const std::vector<std::string> ids = vpkg->segmentationIDs();
-    if (std::find(ids.begin(), ids.end(), segmentId) == ids.end()) {
+    try {
+        _window->_surfaceCatalog->session()->editRecords(
+            *_window->_surfaceCatalog->attachment(), {row.record.uuid},
+            [&](vc::objects::ObjectRecord& record) { record.name = newName.toStdString(); });
+    } catch (const std::exception& error) {
         QJsonObject data;
-        data["kind"] = "segment";
-        data["id"] = segmentIdQ;
-        throw AgentBridgeError{-32007, QStringLiteral("Unknown segment id: %1").arg(segmentIdQ), data};
+        data["detail"] = QString::fromUtf8(error.what());
+        throw AgentBridgeError{-32010, QStringLiteral("Failed to rename segment: %1").arg(error.what()), data};
     }
 
-    SegmentationCommandHandler* sch = _window ? _window->_segmentationCommandHandler.get() : nullptr;
-    if (!sch) {
-        QJsonObject data;
-        data["detail"] = "segmentation command handler is not available";
-        throw AgentBridgeError{-32010, "Segmentation command handler unavailable", data};
-    }
-
-    QString err;
-    if (!sch->renameSurfaceHeadless(segmentIdQ, newName, &err)) {
-        // Map the core's classifiable sentences to JSON-RPC codes.
-        if (err == QLatin1String("name exists")) {
-            QJsonObject data;
-            data["kind"] = "segment";
-            data["id"] = newName;
-            data["reason"] = "target name already exists";
-            throw AgentBridgeError{-32010, QStringLiteral("A segment named %1 already exists").arg(newName), data};
-        }
-        if (err == QLatin1String("invalid name")) {
-            QJsonObject data;
-            data["param"] = "newName";
-            throw AgentBridgeError{-32602, "newName must match ^[a-zA-Z0-9_-]+$", data};
-        }
-        if (err == QLatin1String("name unchanged")) {
-            QJsonObject data;
-            data["param"] = "newName";
-            throw AgentBridgeError{-32602, "newName is unchanged", data};
-        }
-        if (err == QLatin1String("immutable catalog segment")) {
-            QJsonObject data;
-            data["kind"] = "segment";
-            data["id"] = segmentIdQ;
-            data["action"] = "segments.create_editable_copy";
-            throw AgentBridgeError{
-                -32009,
-                "Cannot rename an immutable Open Data catalog segment",
-                data};
-        }
-        if (err == QLatin1String("editing in progress")) {
-            QJsonObject data;
-            data["detail"] = "cannot rename while editing";
-            throw AgentBridgeError{-32004, "cannot rename while editing", data};
-        }
-        if (err == QLatin1String("segment not found")) {
-            QJsonObject data;
-            data["kind"] = "segment";
-            data["id"] = segmentIdQ;
-            throw AgentBridgeError{-32007, QStringLiteral("Unknown segment id: %1").arg(segmentIdQ), data};
-        }
-        QJsonObject data;
-        data["detail"] = err.isEmpty() ? QStringLiteral("rename failed") : err;
-        throw AgentBridgeError{-32010, QStringLiteral("Failed to rename segment: %1").arg(err), data};
-    }
-
+    // The UUID is the identity; renaming changes only the name.
     QJsonObject result;
-    result["oldId"] = segmentIdQ;
-    result["newId"] = newName;
+    result["id"] = segmentIdQ;
+    result["name"] = newName;
     return result;
 }
 

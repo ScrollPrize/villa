@@ -12,78 +12,16 @@
 namespace vc::fiber_tracer::detail
 {
 
-inline constexpr float kFiberLocalEpsilon = 1.0e-6f;
+using portable::kFiberLocalEpsilon;
+using portable::clampFiberLocalUnit;
+using portable::clampFiberLocalPositiveUnit;
+using portable::clampFiberLocalFinitePositiveUnit;
+using portable::finiteFiberLocalOrZero;
+using portable::normalizeFiberLocalOrZero;
+using portable::fiberLocalAngleBetweenUnit;
+using portable::fiberLocalExcessAngleSquared;
 
-static inline float clampFiberLocalUnit(float value)
-{
-    if (!std::isfinite(value))
-        return 0.0f;
-    return std::clamp(value, -1.0f, 1.0f);
-}
-
-static inline float clampFiberLocalPositiveUnit(float value)
-{
-    if (!std::isfinite(value))
-        return 0.0f;
-    return std::clamp(value, 0.0f, 1.0f);
-}
-
-static inline float clampFiberLocalFinitePositiveUnit(float value)
-{
-    return std::min(std::max(value, 0.0f), 1.0f);
-}
-
-static inline cv::Vec3f finiteFiberLocalOrZero(const cv::Vec3f& value)
-{
-    if (!std::isfinite(value[0]) || !std::isfinite(value[1]) ||
-        !std::isfinite(value[2])) {
-        return {0.0f, 0.0f, 0.0f};
-    }
-    return value;
-}
-
-static inline cv::Vec3f normalizeFiberLocalOrZero(const cv::Vec3f& value)
-{
-    const float length = std::sqrt(value.dot(value));
-    if (!(length > kFiberLocalEpsilon) || !std::isfinite(length))
-        return {0.0f, 0.0f, 0.0f};
-    return value / length;
-}
-
-static inline float fiberLocalAngleBetweenUnit(
-    const cv::Vec3f& left, const cv::Vec3f& right)
-{
-    return std::acos(clampFiberLocalUnit(left.dot(right)));
-}
-
-static inline float fiberLocalExcessAngleSquared(float angle, float freeAngle)
-{
-    const float excess = std::max(0.0f, angle - freeAngle);
-    return excess * excess;
-}
-
-static inline float fiberLocalAlignmentLossInline(
-    float presence,
-    const cv::Vec3f& previousStepDirection,
-    const cv::Vec3f& candidateStepDirection,
-    const cv::Vec3f& currentPredictionDirection,
-    const cv::Vec3f& candidatePredictionDirection)
-{
-    float score = clampFiberLocalPositiveUnit(presence);
-    score *= clampFiberLocalPositiveUnit(
-        previousStepDirection.dot(candidateStepDirection));
-    score *= clampFiberLocalPositiveUnit(
-        previousStepDirection.dot(currentPredictionDirection));
-    score *= clampFiberLocalPositiveUnit(
-        previousStepDirection.dot(candidatePredictionDirection));
-    score *= clampFiberLocalPositiveUnit(
-        currentPredictionDirection.dot(candidateStepDirection));
-    score *= clampFiberLocalPositiveUnit(
-        currentPredictionDirection.dot(candidatePredictionDirection));
-    score *= clampFiberLocalPositiveUnit(
-        candidateStepDirection.dot(candidatePredictionDirection));
-    return 1.0f - score;
-}
+using portable::fiberLocalAlignmentLossInline;
 
 struct FiberLocalPreparedIncomingAlignment {
     cv::Vec3f previousDirection{0.0f, 0.0f, 0.0f};
@@ -112,20 +50,8 @@ prepareFiberLocalIncomingAlignmentInline(
     return prepared;
 }
 
-enum class FiberLocalPreparedCandidateSmoothnessMode : std::uint8_t {
-    InvalidDirection,
-    IsotropicFallback,
-    NormalAwareDegenerateTangent,
-    NormalAware,
-};
-
-struct FiberLocalPreparedCandidateSmoothness {
-    cv::Vec3f normal{0.0f, 0.0f, 0.0f};
-    cv::Vec3f tangent{0.0f, 0.0f, 0.0f};
-    float normalAngle = 0.0f;
-    FiberLocalPreparedCandidateSmoothnessMode mode =
-        FiberLocalPreparedCandidateSmoothnessMode::InvalidDirection;
-};
+using portable::FiberLocalPreparedCandidateSmoothnessMode;
+using FiberLocalPreparedCandidateSmoothness = portable::FiberLocalPreparedCandidateSmoothness<cv::Vec3f>;
 
 struct FiberLocalPreparedCandidateMetric {
     cv::Vec3f direction{0.0f, 0.0f, 0.0f};
@@ -216,33 +142,7 @@ static inline void fiberLocalAlignmentLossPreparedBatchInline(
     }
 }
 
-static inline FiberLocalPreparedCandidateSmoothness
-prepareFiberLocalCandidateSmoothnessInline(
-    const cv::Vec3f& candidateStepDirection,
-    const cv::Vec3f& normal,
-    bool normalValid)
-{
-    FiberLocalPreparedCandidateSmoothness prepared;
-    prepared.normal = normal;
-    constexpr float epsilon2 = kFiberLocalEpsilon * kFiberLocalEpsilon;
-    if (candidateStepDirection.dot(candidateStepDirection) <= epsilon2)
-        return prepared;
-    if (!normalValid || normal.dot(normal) <= epsilon2) {
-        prepared.mode =
-            FiberLocalPreparedCandidateSmoothnessMode::IsotropicFallback;
-        return prepared;
-    }
-
-    const float candidateNormal = clampFiberLocalUnit(
-        candidateStepDirection.dot(normal));
-    prepared.tangent = normalizeFiberLocalOrZero(
-        candidateStepDirection - normal * candidateNormal);
-    prepared.normalAngle = std::asin(candidateNormal);
-    prepared.mode = prepared.tangent.dot(prepared.tangent) > epsilon2
-        ? FiberLocalPreparedCandidateSmoothnessMode::NormalAware
-        : FiberLocalPreparedCandidateSmoothnessMode::NormalAwareDegenerateTangent;
-    return prepared;
-}
+using portable::prepareFiberLocalCandidateSmoothnessInline;
 
 static inline FiberLocalPreparedCandidateMetric
 prepareFiberLocalCandidateMetricInline(
@@ -295,73 +195,8 @@ static inline float fiberLocalAlignmentLossPreparedInline(
     return 1.0f - score;
 }
 
-static inline FiberLocalSmoothnessCost
-fiberLocalSmoothnessCostCandidatePreparedInline(
-    const cv::Vec3f& previousStepDirection,
-    const cv::Vec3f& candidateStepDirection,
-    const FiberLocalPreparedCandidateSmoothness& candidatePrepared,
-    const FiberLocalSmoothnessConfig& config)
-{
-    FiberLocalSmoothnessCost cost;
-    constexpr float epsilon2 = kFiberLocalEpsilon * kFiberLocalEpsilon;
-    if (previousStepDirection.dot(previousStepDirection) <= epsilon2 ||
-        candidatePrepared.mode ==
-            FiberLocalPreparedCandidateSmoothnessMode::InvalidDirection) {
-        return cost;
-    }
-
-    if (candidatePrepared.mode ==
-        FiberLocalPreparedCandidateSmoothnessMode::IsotropicFallback) {
-        const float isotropicAngle = fiberLocalAngleBetweenUnit(
-            previousStepDirection, candidateStepDirection);
-        cost.isotropic = config.isotropicWeight *
-                         fiberLocalExcessAngleSquared(
-                             isotropicAngle, config.freeAngleRadians);
-        cost.mode = FiberLocalSmoothnessMode::IsotropicFallback;
-        return cost;
-    }
-
-    const float previousNormal = clampFiberLocalUnit(
-        previousStepDirection.dot(candidatePrepared.normal));
-    const cv::Vec3f previousTangent = normalizeFiberLocalOrZero(
-        previousStepDirection - candidatePrepared.normal * previousNormal);
-    const bool tangentValid =
-        previousTangent.dot(previousTangent) > epsilon2 &&
-        candidatePrepared.mode ==
-            FiberLocalPreparedCandidateSmoothnessMode::NormalAware;
-    const float tangentAngle = tangentValid
-        ? fiberLocalAngleBetweenUnit(
-              previousTangent, candidatePrepared.tangent)
-        : fiberLocalAngleBetweenUnit(
-              previousStepDirection, candidateStepDirection);
-    const float normalAngle = std::abs(
-        candidatePrepared.normalAngle - std::asin(previousNormal));
-    cost.tangent = config.tangentWeight * fiberLocalExcessAngleSquared(
-        tangentAngle, config.freeAngleRadians);
-    cost.normal = config.normalWeight * fiberLocalExcessAngleSquared(
-        normalAngle, config.freeAngleRadians);
-    cost.mode = FiberLocalSmoothnessMode::NormalAware;
-    return cost;
-}
-
-static inline FiberLocalSmoothnessCost fiberLocalSmoothnessCostInline(
-    const cv::Vec3f& previousStepDirection,
-    const cv::Vec3f& candidateStepDirection,
-    const cv::Vec3f& normal,
-    bool normalValid,
-    const FiberLocalSmoothnessConfig& config)
-{
-    constexpr float epsilon2 = kFiberLocalEpsilon * kFiberLocalEpsilon;
-    if (previousStepDirection.dot(previousStepDirection) <= epsilon2 ||
-        candidateStepDirection.dot(candidateStepDirection) <= epsilon2) {
-        return {};
-    }
-    return fiberLocalSmoothnessCostCandidatePreparedInline(
-        previousStepDirection, candidateStepDirection,
-        prepareFiberLocalCandidateSmoothnessInline(
-            candidateStepDirection, normal, normalValid),
-        config);
-}
+using portable::fiberLocalSmoothnessCostCandidatePreparedInline;
+using portable::fiberLocalSmoothnessCostInline;
 
 static inline FiberLocalMetricCost
 fiberLocalMetricCostFromPreparedAlignmentInline(

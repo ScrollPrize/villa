@@ -15,11 +15,6 @@ public:
     {
     }
 
-    void addJob()
-    {
-        ++_pendingJobs;
-    }
-
     void addError(const QString& error)
     {
         if (!error.isEmpty()) {
@@ -27,27 +22,9 @@ public:
         }
     }
 
-    void finishJob(const QString& error = {})
+    void finish()
     {
-        addError(error);
-        if (_pendingJobs > 0) {
-            --_pendingJobs;
-        }
-        completeIfReady();
-    }
-
-    void finishScheduling()
-    {
-        _scheduling = false;
-        completeIfReady();
-    }
-
-private:
-    void completeIfReady()
-    {
-        if (_scheduling || _pendingJobs != 0 || !_completion) {
-            return;
-        }
+        if (!_completion) return;
         auto completion = std::move(_completion);
         // A moved-from std::function is valid but unspecified, not
         // necessarily empty; libc++ leaves small targets callable. Re-arm the
@@ -56,8 +33,7 @@ private:
         completion(_errors.isEmpty(), _errors.join('\n'));
     }
 
-    int _pendingJobs = 0;
-    bool _scheduling = true;
+private:
     QStringList _errors;
     Completion _completion;
 };

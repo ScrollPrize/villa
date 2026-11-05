@@ -1,5 +1,10 @@
 # 2026-10-21
 
+- Extracted existing annotated Fiber3D heads, Gaussian/coarse supervision,
+  refinement, embeddings, EMA and training-compatible native trace evaluation.
+  Added shared annotation baking, AFV constraints, winding/U/V layout and
+  minimum-flow solving; experiments, data and surface reconstruction excluded.
+
 - Extracted existing native Fiber3D CPU loading, split augmentation, shared
   volume/mask transport and source-tagged train/test queue APIs with their
   regression coverage. Training entrypoint integration remains a later stage.
@@ -414,3 +419,7 @@
   and 10 TiB / 10,000-tile defaults without changing the normal prefetch path.
 - Made live progress cadence independent of TTY detection and report unique
   remote-missing chunks per listed Z plane.
+
+## 2026-11-02
+
+Use vc_reader sampling for coordinate and augmentation maps with its default numeric and boundary policies. Centralize selected winding sampling, CT rendering, and label transfer, and remove obsolete I/O tools.

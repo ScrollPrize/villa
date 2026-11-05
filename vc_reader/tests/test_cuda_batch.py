@@ -1,17 +1,13 @@
 """Batch independence and CUDA stage coverage."""
-import os
 from pathlib import Path
-import sys
 import unittest
 
 import numpy as np
 import torch
 
 ROOT = Path(__file__).resolve().parents[1]
-if os.environ.get('VC_READER_BUILD_DIR'):
-    sys.path.insert(0, str(ROOT / 'benchmarks'))
-    from extension_build import load_extensions
-    load_extensions(Path(os.environ['VC_READER_BUILD_DIR']))
+from build_support import load_build
+load_build()
 
 from vc_reader import transforms as A, cuda
 
@@ -193,6 +189,30 @@ class CudaBatchTests(unittest.TestCase):
                           A.ClipOutliers(), A.BlankRectangle(size=129, value='median')):
             with self.subTest(transform=repr(transform)):
                 self.compare(transform, {'image': image})
+
+    def test_device_array_batches_match_torch(self):
+        # DeviceArray batches run natively (no Torch), through Pipeline.batch and direct .batch.
+        rng = np.random.default_rng(5)
+        image = rng.random((3, 1, 9, 11), dtype=np.float32)
+        mask = (image > .5).astype(np.int16)
+        pipeline = A.Pipeline([A.GaussianBlur(A.Param('sigma')), A.GaussianNoise(.03)], backend='cuda')
+        sample = {'image': cuda.asarray(image), 'meta': 'kept'}
+        result = pipeline.batch(sample, seeds=[3, 19, 107], params={'sigma': [.5, 1., 2.]})
+        expected = pipeline.batch({'image': torch.from_numpy(image).cuda()}, seeds=[3, 19, 107],
+                                  params={'sigma': [.5, 1., 2.]})
+        self.assertIsInstance(result['image'], cuda.DeviceArray)
+        self.assertEqual(result['meta'], 'kept')
+        np.testing.assert_array_equal(result['image'].numpy(), expected['image'].cpu().numpy())
+        np.testing.assert_array_equal(sample['image'].numpy(), image)
+        uint8 = pipeline.batch({'image': cuda.asarray((image*255).astype(np.uint8))}, seeds=[1, 2, 3],
+                               params={'sigma': [1., 1., 1.]})
+        self.assertEqual(uint8['image'].dtype, np.float32)
+        morphology = A.Morphology(operation='dilate')
+        direct = morphology.batch(cuda.asarray(mask))
+        self.assertIsInstance(direct, cuda.DeviceArray)
+        np.testing.assert_array_equal(direct.numpy(), morphology.batch(mask))
+        with self.assertRaises(ValueError):
+            pipeline.batch({'image': cuda.asarray(image)}, seeds=[1, 2], params={'sigma': [1., 1.]})
 
     def test_failed_parameter_sampling_releases_pending_work(self):
         pipeline = A.Pipeline([A.GaussianBlur(A.Param('sigma'))], backend='cuda')

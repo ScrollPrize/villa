@@ -40,39 +40,22 @@ struct FiberTraceProfile {
     size_t candidateDepth2Points = 0;
     std::vector<size_t> candidateDepth1BatchSizes;
     std::vector<size_t> candidateDepth2BatchSizes;
-    uint64_t cornerPointCount = 0;
-    uint64_t cornerUniqueVoxelCubes = 0;
-    uint64_t cornerWorkerTasks = 0;
-    uint64_t cornerMaxCandidatesPerCube = 0;
-    std::array<uint64_t, 65> cornerCubeOccupancyHistogram{};
-    uint64_t depthDependencyShared = 0;
-    uint64_t depthDependencyUnion = 0;
-    uint64_t stepDependencyShared = 0;
-    uint64_t stepDependencyUnion = 0;
-    std::vector<uint64_t> localityCurrentDepth1Dependencies;
-    std::vector<uint64_t> localityPreviousStepDependencies;
     double startSampleSeconds = 0.0;
+    double widthSampleSeconds = 0.0;
+    size_t widthSamplePoints = 0;
+    size_t samplingWindowLoads = 0;
+    size_t samplingWindowFallbacks = 0;
+    size_t samplingWindowPeakBytes = 0;
+    size_t samplingWindowCopiedBytes = 0;
+    double samplingWindowLoadSeconds = 0;
+    double combinedChannelSampleSeconds = 0;
     double taskBuildSeconds = 0.0;
     double predictionBatchSeconds = 0.0;
-    double readinessPlanSeconds = 0.0;
-    size_t readinessPlanPoints = 0;
-    size_t readinessPlanDependencies = 0;
-    double predictionPrepareSeconds = 0.0;
-    double predictionPrefetchSeconds = 0.0;
-    double predictionAssignSeconds = 0.0;
     double predictionMaterializeSeconds = 0.0;
     double predictionCornerSeconds = 0.0;
-    double predictionCornerPrepareSeconds = 0.0;
-    double predictionCornerLayoutSeconds = 0.0;
-    double predictionCornerPinSeconds = 0.0;
-    double predictionCornerGatherSeconds = 0.0;
-    uint64_t predictionCornerLayoutChunkRuns = 0;
-    uint64_t predictionCornerBoundaryPoints = 0;
-    uint64_t predictionCornerDependencies = 0;
     double predictionDecodeSeconds = 0.0;
     double normalDecodeSeconds = 0.0;
     double normalBatchSeconds = 0.0;
-    double normalPrefetchSeconds = 0.0;
     double normalMaterializeSeconds = 0.0;
     double candidateScoreSeconds = 0.0;
     double frontierSeconds = 0.0;
@@ -96,6 +79,9 @@ struct FiberTraceConfig {
     size_t lookaheadParentCap = 32;
     size_t lookaheadRetryParentCap = 0;
     int parallelThreads = 0;
+    // Opt-in retained decoded-chunk window, side in stored voxels. Zero disables.
+    // Only scalar one-worker compatible fields; all other paths are unchanged.
+    int samplingWindowVoxels = 0;
     double smoothnessWeight = 2.0;
     double smoothnessNormalWeight = 0.1;
     double smoothnessTangentWeight = 10.0;
@@ -124,11 +110,24 @@ struct FiberTraceConfig {
     // selected option's direction/width-modulated presence, before smoothness.
     double replayPresenceCutoff = 0.0;
     bool replayPresenceModulated = false;
+    // Opt-in direct CPU eligibility, independent of the width-weighted objective.
+    bool replayPresenceIgnoreWidth = false;
+    double widthHardRelativeTolerance = 0.0; // zero disabled; inclusive relative deviation
+    // Existing reference-replay consistency controls; zero interval disables them.
+    double replayReverseIntervalBase = 0.0;
+    double replayReverseNormalRadiusBase = 20.0;
+    double replayReverseTangentialRadiusBase = 40.0;
+    bool replayReverseToStart = false;
+    bool replayReverseAllEndpoints = false;
+    int replayReverseHistorySteps = 0;
+    int replayReverseDelaySteps = 0; // incoming reverse history from later forward edges
+    double replayReverseConvergenceMinBase = 0; // zero disables early success
+    double replayReverseConvergenceDistanceBase = 4;
+    double replayReverseConvergenceAngleDegrees = 5;
+    int replayReverseConvergenceSteps = 4;
     bool preserveInitialDirection = false; // history prior, not a forced step
     // Stop the entire frontier after any surviving branch exits this box.
     std::optional<std::array<cv::Vec3d, 2>> committedBounds;
-    // Optional explicitly owned payloads; must outlive this trace.
-    const vc::render::PinnedChunkRegion* pinnedRegion = nullptr;
     FiberTraceProfile* profile = nullptr;
 };
 
@@ -323,11 +322,6 @@ public:
     {
         return false;
     }
-    [[nodiscard]] virtual vc::lasagna::NormalPrefetchReport prefetchSamples(
-        const std::vector<cv::Vec3d>& /*volumePoints*/) const
-    {
-        return {};
-    }
     virtual void sampleBatch(
         const std::vector<cv::Vec3d>& volumePoints,
         const std::vector<cv::Vec3d>& referenceDirections,
@@ -339,7 +333,6 @@ public:
             throw std::invalid_argument(
                 "fiber prediction batch points and reference directions size mismatch");
         }
-        (void)prefetchSamples(volumePoints);
         samples.clear();
         samples.reserve(volumePoints.size());
         for (size_t index = 0; index < volumePoints.size(); ++index) {
@@ -364,28 +357,30 @@ using FiberPredictionReadinessGate =
 
 struct FiberPredictionFieldOptions {
     FiberPredictionFieldBindingMode bindingMode = FiberPredictionFieldBindingMode::TraceOptions;
+    // The memory cache of the field's channel arrays: `memoryCache` when set
+    // (one cache shared with other readers), else a new cache of maxCachedBytes.
     size_t maxCachedBytes = 512ULL * 1024ULL * 1024ULL;
+    std::shared_ptr<vcr::MemoryCache> memoryCache;
     bool enableEmbeddings = false;
     bool enableWidth = false;
 };
 
+// A Lasagna fiber-prediction dataset read through vc_reader: its channel-group
+// arrays share one memory cache of maxCachedBytes.
 class FiberPredictionField final : public FiberPredictionSource {
 public:
-    // Configure before concurrent sampling; empty keeps offline behavior.
-    // The gate may be called concurrently and must not sample this field itself.
+    // One option, width and no embeddings: presence/nx/ny/width bindings for a dense
+    // tensor, and the multiplier from stored width units to sampleWidths() units. The
+    // field stays alive while the bindings are used.
+    [[nodiscard]] std::pair<std::array<vc::lasagna::LasagnaChannelBinding,4>,double>
+        chunkRegionChannels() const;
+    // Metadata-only capability check. Does not wait for inference or read chunks.
+    [[nodiscard]] bool supportsDenseSampling(const vc::lasagna::LasagnaNormalSampler&) const;
+    // Live inference: configure before concurrent sampling; empty keeps offline
+    // behavior. Each chunk is read only after the gate has returned for it; the
+    // gate runs on the sampling thread, once per chunk while the chunk stays in
+    // the field's memory cache, and must not sample this field itself.
     void setReadinessGate(FiberPredictionReadinessGate gate);
-    // Await publication, then retain all prediction/auxiliary payloads in this
-    // inclusive working-coordinate box. Add other channels, seal, then share.
-    // Keep this field alive for the lifetime of the region.
-    [[nodiscard]] std::shared_ptr<vc::render::PinnedChunkRegion> pinRegion(
-        const cv::Vec3d& lo, const cv::Vec3d& hi) const;
-    [[nodiscard]] FiberPredictionSample sample(const cv::Vec3d& point,
-        const cv::Vec3d& referenceDirection, const vc::render::PinnedChunkRegion& region) const;
-    void sampleWidths(const std::vector<cv::Vec3f>& points, std::vector<float>& widths,
-                      const vc::render::PinnedChunkRegion& region) const;
-    void sampleEmbeddings(const std::vector<cv::Vec3f>& points,
-                          std::vector<std::vector<float>>& embeddings,
-                          const vc::render::PinnedChunkRegion& region) const;
     FiberPredictionField(const vc::lasagna::LasagnaDataset& dataset,
                          const FiberPredictionFieldOptions& options);
     void sampleWidths(const std::vector<cv::Vec3f>& points, std::vector<float>& widths) const override;
@@ -399,15 +394,14 @@ public:
         FiberPredictionFieldBindingMode mode,
         size_t maxCachedBytes = 512ULL * 1024ULL * 1024ULL);
     [[nodiscard]] FiberPredictionGridInfo storedGridInfo() const;
-    [[nodiscard]] FiberPresenceChunkScanReport scanStoredPresenceChunks(int parallelThreads) const;
+    // Every stored presence chunk probed on the array's thread pool.
+    [[nodiscard]] FiberPresenceChunkScanReport scanStoredPresenceChunks() const;
     void sampleStoredGridBatch(const std::vector<std::array<size_t, 3>>& indicesZYX,
         int parallelThreads, std::vector<FiberStoredPredictionSample>& samples) const;
     void sampleStoredPresenceBatch(const std::vector<std::array<size_t, 3>>& indicesZYX,
         int parallelThreads, std::vector<FiberStoredPresenceSample>& samples) const;
 
     [[nodiscard]] bool supportsConcurrentSampling() const noexcept override { return true; }
-    [[nodiscard]] vc::lasagna::NormalPrefetchReport prefetchSamples(
-        const std::vector<cv::Vec3d>& volumePoints) const override;
     void sampleBatch(
         const std::vector<cv::Vec3d>& volumePoints,
         const std::vector<cv::Vec3d>& referenceDirections,
@@ -419,16 +413,24 @@ public:
         int parallelThreads,
         std::vector<FiberPredictionSample>& samples,
         FiberTraceProfile* profile) const;
+    // Batch chunk access without changing the scalar interpolation arithmetic.
+    void sampleBatchScalarEquivalent(
+        const std::vector<cv::Vec3d>& volumePoints,
+        const std::vector<cv::Vec3d>& referenceDirections,
+        int parallelThreads,
+        std::vector<FiberPredictionSample>& samples,
+        FiberTraceProfile* profile) const;
     void sampleBatch(
         const std::vector<cv::Vec3f>& volumePoints,
         const std::vector<cv::Vec3f>& referenceDirections,
         int parallelThreads,
         std::vector<FiberPredictionSample>& samples,
         FiberTraceProfile* profile) const;
+    // Corners of every option's presence/nx/ny, then the normal sampler's
+    // grad_mag/nx/ny; false when they do not share one sampling grid.
     [[nodiscard]] bool sampleCornerBatchWithNormals(
         const vc::lasagna::LasagnaNormalSampler& normalSampler,
         const std::vector<cv::Vec3f>& volumePoints,
-        int parallelThreads,
         vc::lasagna::LasagnaCornerBatch* cornerScratch,
         FiberTraceProfile* profile) const;
     [[nodiscard]] bool visitCornerBatchWithNormals(
@@ -437,9 +439,17 @@ public:
         int parallelThreads,
         void* visitorContext,
         vc::lasagna::LasagnaCornerPointVisitor visitor,
-        int lookaheadDepth,
-        FiberTraceProfile* profile,
-        const vc::render::PinnedChunkRegion* pinnedRegion = nullptr) const;
+        FiberTraceProfile* profile) const;
+    // The same channels at every voxel of a box of the shared sampling grid, interleaved
+    // as [z][y][x][channel] bytes, in one region read per channel; `latticeSpacing` is the
+    // working-unit spacing the caller laid its lattice at and must be the grid's. False
+    // when the channels do not share one grid.
+    [[nodiscard]] bool readCornerBoxWithNormals(
+        const vc::lasagna::LasagnaNormalSampler& normalSampler,
+        const std::array<int64_t, 3>& originXYZ,
+        const std::array<int64_t, 3>& shapeXYZ,
+        double latticeSpacing,
+        std::vector<uint8_t>& interleaved) const;
     [[nodiscard]] FiberPredictionSample sample(
         const cv::Vec3d& volumePoint,
         const cv::Vec3d& referenceDirection) const override;
@@ -449,6 +459,9 @@ private:
     class Impl;
     std::unique_ptr<Impl> impl_;
 };
+
+[[nodiscard]] FiberPredictionSampleOption materializeFiberScalarPrediction(
+    double rawPresence,const cv::Vec3d& direction,const cv::Vec3d& reference);
 
 struct FiberTraceSegmentRequest {
     std::vector<cv::Vec3d> referenceLine;
@@ -501,6 +514,35 @@ struct FiberTraceOneWayResult {
         std::numeric_limits<double>::infinity();
     double widthMean = 0.0;
     uint64_t widthSamples = 0;
+};
+
+struct FiberTraceCommit {
+    cv::Vec3d point;
+    double loss=0, widthMean=0;
+    int step=0;
+    // Observations from the chosen beam node, not a later re-evaluation.
+    double sampledWidth=0, modulatedPresence=0, stepCost=0;
+    cv::Vec3d normal{};
+    bool normalValid=false;
+};
+
+// Cooperative frontier advancement. Only one worker may advance a cursor at a
+// time, but ownership may move between workers. No thread is retained on yield.
+// Sources must outlive the cursor. Uses the synchronous tracer's same beam loop.
+class FiberTraceCursor {
+public:
+    FiberTraceCursor(const FiberPredictionSource&,const cv::Vec3d& start,
+        const cv::Vec3d& direction,double distance,const FiberTraceConfig&,
+        const vc::lasagna::NormalSampler* = nullptr);
+    ~FiberTraceCursor();
+    FiberTraceCursor(FiberTraceCursor&&) noexcept;
+    FiberTraceCursor& operator=(FiberTraceCursor&&) noexcept;
+    bool advance(); // true when complete; at most one frontier quantum
+    std::vector<FiberTraceCommit> takeCommitted();
+    const FiberTraceOneWayResult& result() const; // only after completion
+private:
+    struct Impl;
+    std::unique_ptr<Impl> impl_;
 };
 
 struct FiberTraceSegmentResult {
@@ -673,7 +715,8 @@ struct CandidateScoreDebug {
     // false stops after this point. Only irrevocable points are reported,
     // excluding the seed, before optional final length clipping.
     const std::function<bool(const cv::Vec3d&, double, int)>& committedStep = {},
-    const std::vector<cv::Vec3d>& initialStepDirections = {});
+    const std::vector<cv::Vec3d>& initialStepDirections = {},
+    double* observedWidthMean = nullptr);
 
 // Evaluation adapter: length-bounded beam tracing towards the reference end,
 // with committed-point observation (no target-plane snapping). widthMean is
@@ -682,7 +725,7 @@ struct CandidateScoreDebug {
     const FiberPredictionSource&, const FiberTraceOneWayRequest&, int maximumSteps,
     const vc::lasagna::NormalSampler&, const FiberTraceProgressCallback&,
     const std::function<bool(const cv::Vec3d&, double, int)>& committedStep,
-    double& widthMean);
+    double& widthMean, float* committedModulatedPresence = nullptr);
 
 // Fraction of a segment's start-to-target distance that bounds the endpoint
 // acceptance threshold for that segment. The fixed threshold

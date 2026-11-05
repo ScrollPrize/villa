@@ -3471,7 +3471,8 @@ def optimize(
 		# Initial evaluation
 		def _eval_terms(res_, eff_, *, profile_label: str | None = None,
 						timing: _OptTimingWindow | None = None,
-						atlas_debug_step: int | None = None):
+						atlas_debug_step: int | None = None,
+						report_flatten: bool = True):
 			"""Evaluate all loss terms, handling both single and multi-loss returns."""
 			total = torch.zeros((), device=next(model.parameters()).device, dtype=torch.float32)
 			tv: dict[str, float] = {}
@@ -3509,10 +3510,20 @@ def optimize(
 				if _t_loss is not None:
 					_stage_done(loss_label, _t_loss)
 				total = total + combined_loss
-				for i, name in enumerate(_flatten_combined_names):
-					lv = combined_parts[i + 1]
-					tv[name] = float(lv.detach().cpu())
-					tv[f"{name}_contrib"] = float((lv * _flatten_combined_weights[i]).detach().cpu())
+				if combined_loss.device.type == "cpu":
+					# CPU scalar reads do not require device-to-host synchronization.
+					for i, name in enumerate(_flatten_combined_names):
+						lv = combined_parts[i + 1]
+						tv[name] = float(lv.detach().cpu())
+						tv[f"{name}_contrib"] = float((lv * _flatten_combined_weights[i]).detach().cpu())
+				elif report_flatten:
+					component_tensor = torch.stack([part.detach() for part in combined_parts[1:]])
+					values, contributions = torch.stack((
+						component_tensor, component_tensor * _flatten_combined_weights,
+					)).cpu().tolist()
+					for name, value, contribution in zip(_flatten_combined_names, values, contributions, strict=True):
+						tv[name] = value
+						tv[f"{name}_contrib"] = contribution
 			for name, t in terms.items():
 				if _flatten_combined_weights is not None and name in _flatten_combined_names:
 					continue
@@ -4425,6 +4436,10 @@ def optimize(
 		for step in range(max_steps):
 			_t_iter = time.perf_counter()
 			auto_stop = False
+			status_due = (
+				step == 0 or step + 1 == max_steps
+				or (status_interval > 0 and (step + 1) % status_interval == 0)
+			)
 			_log_cuda_memory(f"{label}.{step + 1}.iter.begin")
 			# Sync: wait for chunks loaded by last prefetch
 			_t_io = time.perf_counter()
@@ -4469,8 +4484,10 @@ def optimize(
 			_t_loss_eval = time.perf_counter()
 			opt_loss_snap_surf.set_debug_step(step + 1, label=label)
 			_log_cuda_memory(f"{label}.{step + 1}.loss_eval.before")
+			# Automatic stopping can request a final report on any iteration.
 			loss, term_vals, display_loss = _eval_terms(
-				res, stage_eff, timing=_opt_timing, atlas_debug_step=step + 1)
+				res, stage_eff, timing=_opt_timing, atlas_debug_step=step + 1,
+				report_flatten=status_due or opt_cfg.steps_auto)
 			_log_cuda_memory(f"{label}.{step + 1}.loss_eval.after")
 			if _flow_timing is not None:
 				_timing_cuda_sync()
@@ -4615,7 +4632,7 @@ def optimize(
 					auto_stop = True
 
 			_t_part = time.perf_counter()
-			if step == 0 or step1 == max_steps or auto_stop or (status_interval > 0 and (step1 % status_interval) == 0):
+			if status_due or auto_stop:
 				if bool(getattr(model, "flatten_enabled", False)):
 					_renorm_grid_step = term_vals.get("flatten_grid_step_avg")
 					term_vals = {

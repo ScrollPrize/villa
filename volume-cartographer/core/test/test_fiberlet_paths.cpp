@@ -2632,58 +2632,6 @@ TEST_CASE("fiberlet replay benchmark can continue after multiple route failures"
     CHECK(replay.completedReferenceArcBase == doctest::Approx(replay.referenceEndArcBase));
 }
 
-TEST_CASE("real cached anchors produce deterministic graph replay across worker counts")
-{
-    const char* anchorPath = std::getenv("VC_TEST_GRAPH_ANCHORS");
-    const char* predictionPath = std::getenv("VC_TEST_GRAPH_PREDICTIONS");
-    const char* normalPath = std::getenv("VC_TEST_GRAPH_NORMALS");
-    if (!anchorPath || !predictionPath || !normalPath) return;
-    using namespace vc::fiber_tracer;
-    const auto anchors = loadFiberAnchorArtifact(anchorPath);
-    const auto predictions = vc::lasagna::LasagnaDataset::open(predictionPath);
-    FiberPredictionField field(predictions);
-    const auto grid = field.storedGridInfo();
-    REQUIRE(grid.shapeZYX == anchors.report.grid.shapeZYX);
-    REQUIRE(grid.predictionToBaseScale == anchors.report.grid.predictionToBaseScale);
-    vc::lasagna::LasagnaDatasetOpenOptions options;
-    options.workingToBaseScale = grid.predictionToBaseScale;
-    const auto normalData = vc::lasagna::LasagnaDataset::open(normalPath, options);
-    const vc::lasagna::LasagnaNormalSampler normals(normalData);
-    FiberletPathConfig paths;
-    paths.cellRadius = 1;
-    paths.parallelThreads = 4;
-    const auto report = traceFiberletPaths(anchors, grid, paths,
-        [&](const auto& indices, int threads, auto& samples) {
-            field.sampleStoredGridBatch(indices, threads, samples);
-        }, normals);
-    const auto graph = buildFiberletGraph(report);
-    REQUIRE_FALSE(graph.edges.empty());
-    // A real generated edge is a short mechanical replay reference, not a GT
-    // quality benchmark. Exercise the real cached predictions/normals without
-    // making this regression depend on an experiment's selected fiber cohort.
-    std::vector<cv::Vec3d> reference;
-    for (const auto& point : graph.edges.front().pointsBaseXYZ)
-        reference.emplace_back(point);
-    FiberletGraphReplayConfig config;
-    config.lookaheadDistanceBaseVoxels = 16;
-    config.beamStepDistanceBaseVoxels = 8;
-    config.recordDecisionDiagnostics = true;
-    const auto serial = traceFiberletGraphReplay(
-        graph, reference, normals, grid.predictionToBaseScale, config);
-    REQUIRE_FALSE(serial.segments.empty());
-    const auto serialJson = fiberletGraphReplayJson(serial, config);
-    config.expansionThreads = 4;
-    const auto parallel = traceFiberletGraphReplay(
-        graph, reference, normals, grid.predictionToBaseScale, config);
-    // Serialize with identical config: thread count is metadata, not a result.
-    config.expansionThreads = 1;
-    CHECK(fiberletGraphReplayJson(parallel, config) == serialJson);
-    CHECK_FALSE(fiberletGraphReplayObj(serial).empty());
-    std::cout << "Real graph replay: " << graph.nodes.size() << " nodes, "
-              << graph.edges.size() << " edges, " << serial.segments.size()
-              << " segments, " << serial.failures.size() << " failures\n";
-}
-
 TEST_CASE("fiberlet DP preloads each scoring voxel once")
 {
     const auto anchors = twoAnchorArtifact();

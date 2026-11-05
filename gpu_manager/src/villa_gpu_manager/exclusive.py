@@ -201,7 +201,7 @@ class ExclusiveTask:
     """
     def __init__(self, path, grant, *, label, priority=0, poll_seconds=.1,
                  client_factory=Client, stop_event=None, cleanup_timeout=30.0, exclusive=True,
-                 wait_for_exact=False, exact_retry_seconds=5.0):
+                 wait_for_exact=False, exact_retry_seconds=5.0, accept_partial=False):
         if type(exclusive) is not bool:
             raise ValueError("exclusive must be boolean")
         if type(priority) is not int or poll_seconds <= 0 or cleanup_timeout <= 0:
@@ -211,6 +211,7 @@ class ExclusiveTask:
             raise ValueError("exclusive task requires positive GPU budgets and CPUs")
         sizes = list(grant["gpus"].values())
         self.grant = deepcopy(grant)
+        self.requested_grant = deepcopy(grant)
         # The locked scheduler scales CPU promises with the sum of GPU bytes.
         # Compensate for heterogeneous full-device capacities so the resulting
         # CPU grant is exact too (ceil in cores_for cancels this floor).
@@ -225,6 +226,9 @@ class ExclusiveTask:
         if type(wait_for_exact) is not bool or not math.isfinite(exact_retry_seconds) or exact_retry_seconds <= 0:
             raise ValueError("boolean exact waiting and positive retry interval required")
         self.wait_for_exact, self.exact_retry_seconds = wait_for_exact, exact_retry_seconds
+        if type(accept_partial) is not bool or (accept_partial and wait_for_exact):
+            raise ValueError("accept_partial must be boolean and conflicts with wait_for_exact")
+        self.accept_partial = accept_partial
         self.cohort = None
         self.epoch = self.generation = None
         self.closed = False
@@ -273,7 +277,17 @@ class ExclusiveTask:
                     last = status
                 time.sleep(self.poll_seconds)
                 task = self.client.poll()
-            if task["granted"] != self.grant:
+            if self.accept_partial:
+                actual = task["granted"]
+                requested = self.requested_grant
+                if (type(actual["cpu_cores"]) is not int or
+                    not 0 < actual["cpu_cores"] <= requested["cpu_cores"] or
+                    not actual["gpus"] or
+                    any(gpu not in requested["gpus"] or size != requested["gpus"][gpu]
+                        for gpu, size in actual["gpus"].items())):
+                    raise RuntimeError("invalid partial grant: requires positive bounded CPUs and requested GPU memory")
+                self.grant = deepcopy(actual)
+            elif task["granted"] != self.grant:
                 raise RuntimeError("manager granted only part of the requested CPU/devices/VRAM; not launching")
             self.epoch, self.generation = self.client.epoch, task["generation"]
             print(f"gpu-manager task={self.client.task_id} exclusive={self.request['exclusive']} grant={self.grant}", flush=True)
@@ -358,7 +372,7 @@ def run_exclusive(command, *, socket, gpu_uuids, priority=100, label="fiber-eval
                   environment=None, poll_interval=1.0, stop_event=None,
                   client_factory=Client, cleanup_timeout=30.0, before_authorize=None,
                   exclusive=True, cpu_cores=None, vram_bytes_per_gpu=None,
-                  wait_for_exact=False, exact_retry_seconds=5.0):
+                  wait_for_exact=False, exact_retry_seconds=5.0, accept_partial=False):
     """Gated command adapter around ExclusiveTask; no unmanaged fallback.
 
     The caller may bootstrap the shared manager before calling. An independent
@@ -380,14 +394,16 @@ def run_exclusive(command, *, socket, gpu_uuids, priority=100, label="fiber-eval
     lease = ExclusiveTask(socket, grant, label=label, priority=priority,
         poll_seconds=poll_interval, stop_event=stop_event, client_factory=client_factory,
         cleanup_timeout=cleanup_timeout, exclusive=exclusive,
-        wait_for_exact=wait_for_exact, exact_retry_seconds=exact_retry_seconds)
+        wait_for_exact=wait_for_exact, exact_retry_seconds=exact_retry_seconds,
+        accept_partial=accept_partial)
     outcome = "failed"
     try:
         lease.__enter__()
         if before_authorize is not None:
             before_authorize()
         env = dict(os.environ if environment is None else environment)
-        env["CUDA_VISIBLE_DEVICES"] = ",".join(gpu_uuids)
+        env["CUDA_VISIBLE_DEVICES"] = ",".join(gpu for gpu in gpu_uuids if gpu in lease.grant["gpus"])
+        env["VILLA_GPU_MANAGER_GRANT"] = json.dumps(lease.grant, sort_keys=True)
         lease.cohort = child = GatedCommand(command, env)
         lease.authorize()
         while child.process.poll() is None:

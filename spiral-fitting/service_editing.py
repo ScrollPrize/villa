@@ -655,8 +655,10 @@ class EditingWorkspace:
         def cleanup():
             with storage_lock(self.root.parent):
                 remove_workspace(self.root)
-                owner_lock_path(self.root).unlink(missing_ok=True)
+                # Release before unlink: an open lock handle holds its
+                # file on Windows, and storage_lock fences reclaimers.
                 self._owner_lock.release()
+                owner_lock_path(self.root).unlink(missing_ok=True)
             self.lease.close()
             self.catalog = Catalog()
             self.uploads.uploads.clear()

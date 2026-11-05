@@ -1,0 +1,87 @@
+{
+  "description": "Workflow benchmark data and cases. Relative paths are relative to this file. See README.md.",
+  "cache": "cache",
+  "csv": "results.csv",
+
+  "baseline": "main-fd97a4b60",
+  "results": [
+    {"label": "main-fd97a4b60", "path": "saved/main-fd97a4b60-params-20261103.jsonl"},
+    {"label": "branch-20f3a2ee3", "path": "saved/branch-20f3a2ee3-params-20261103.jsonl"}
+  ],
+
+  "volumes": {
+    "paris4-2.4um": {
+      "url": "s3://vesuvius-challenge-open-data/PHercParis4/volumes/20260411134726-2.400um-0.2m-78keV-masked.zarr"
+    }
+  },
+  "segments": {
+    "w028-037": {
+      "description": "Segment w028-037 in paris4-2.4um's level-0 voxels.",
+      "url": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20260623142658-w028-037/mesh/20260623142658-on-20260411134726-2.4um.tifxyz",
+      "volume": "paris4-2.4um",
+      "scale": 1
+    }
+  },
+  "fibers": {
+    "spiral": {
+      "description": "VC3D fiber JSON, line_points in level-0 voxels of paris4-2.4um.",
+      "path": "/mnt/raid_nvme/spiral_dataset_working/fibers",
+      "volume": "paris4-2.4um",
+      "scale": 1
+    }
+  },
+
+  "defaults": {
+    "cache_gb": 16,
+    "gpu_cache_gb": 8,
+    "passes": 2,
+    "timeout_ms": 120000,
+    "max_resolution": 0,
+    "prefetch_margin": 1.5,
+    "fetch_max_gb": 100,
+    "cache_state": "cached"
+  },
+
+  "benchmarks": {
+    "viewer_navigation": [
+      {
+        "name": "w028-037",
+        "segment": "w028-037",
+        "description": "Each of VC3D's 2x2 main viewers on a 2448x1332 screen: half the width and height.",
+        "width": 1224,
+        "height": 666,
+        "view_scale": 1.0,
+        "pan_steps": 60,
+        "zoom_steps": 20,
+        "slice_steps": 120,
+        "jumps": 60,
+        "burst": 120
+      }
+    ],
+    "line_annotation": [
+      {
+        "name": "spiral-longest-4",
+        "fibers": "spiral",
+        "count": 4,
+        "steps": 48,
+        "strip_width": 1600,
+        "strip_height": 80,
+        "cut_size": 640
+      }
+    ],
+    "render_tifxyz": [
+      {
+        "name": "w028-037-center-quarter",
+        "description": "The central quarter of the segment: half its width and height of the 44200x11600 group-2 canvas. partial_levels leaves out level 2, the level it renders, so cache state partial fetches it.",
+        "crop": [11050, 2900, 22100, 5800],
+        "partial_levels": [3, 4, 5],
+        "segment": "w028-037",
+        "group": 2,
+        "scale": 1,
+        "slices": 21,
+        "surface_interpolation": "linear",
+        "iterations": 3
+      }
+    ]
+  }
+}

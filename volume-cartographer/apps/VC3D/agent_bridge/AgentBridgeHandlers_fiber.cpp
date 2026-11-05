@@ -36,9 +36,8 @@
 #include "LineAnnotationController.hpp"
 #include "LineAnnotationDialog.hpp"
 #include "MenuActionController.hpp"
-#include "OpenDataManifest.hpp"
+#include "OpenDataResourceSelection.hpp"
 #include "OpenDataSampleProject.hpp"
-#include "OpenDataSegmentCache.hpp"
 #include "SeedingWidget.hpp"
 #include "SegmentationCommandHandler.hpp"
 #include "SurfacePanelController.hpp"
@@ -54,7 +53,6 @@
 #include "volume_viewers/CChunkedVolumeViewer.hpp"
 #include "volume_viewers/VolumeViewerBase.hpp"
 
-#include "vc/core/types/Segmentation.hpp"
 #include "vc/core/types/Volume.hpp"
 #include "vc/core/types/VolumePkg.hpp"
 #include "vc/ui/VCCollection.hpp"
@@ -65,6 +63,16 @@
 // ---------------------------------------------------------------------------
 
 namespace {
+
+// A fiber's object identity beside its numeric editing id: its store UUID and
+// the project store reference of the fiber store it is read from.
+void addFiberIdentity(QJsonObject& o, const CState& state, const LineAnnotationController& ctrl, uint64_t fiberId)
+{
+    const auto uuid = ctrl.fiberUuidForId(fiberId);
+    o["uuid"] = uuid.empty() ? QJsonValue(QJsonValue::Null) : QJsonValue(QString::fromStdString(uuid));
+    const auto store = state.storeFor("fiber");
+    o["store"] = store ? storeReferenceJson(state, *store) : QJsonValue(QJsonValue::Null);
+}
 
 template <typename Operation>
 QString captureFiberError(LineAnnotationController* controller, Operation&& operation)
@@ -121,8 +129,8 @@ uint64_t jsonToFiberId(const QJsonValue& value, const char* paramName)
 LineAnnotationController* AgentBridgeServer::fiberController() const
 {
     CState* state = _window ? _window->_state : nullptr;
-    if (!state || !state->hasVpkg())
-        throw AgentBridgeError{-32000, "No volume package loaded", {}};
+    if (!state || !state->storeFor("fiber"))
+        throw AgentBridgeError{-32000, "Attach an object store before using fibers", {}};
     LineAnnotationController* ctrl =
         _window->_lineAnnotationController ? _window->_lineAnnotationController.get() : nullptr;
     if (!ctrl)
@@ -131,13 +139,11 @@ LineAnnotationController* AgentBridgeServer::fiberController() const
 }
 
 
-// Throws -32007 kind:"fiber" unless `fiberId` is a currently-loaded fiber.
+// Throws -32007 kind:"fiber" unless `fiberId` is an active fiber of the attached store.
 void AgentBridgeServer::requireKnownFiber(LineAnnotationController* ctrl, quint64 fiberId) const
 {
-    for (const auto& summary : ctrl->fiberSummaries()) {
-        if (summary.id == fiberId)
-            return;
-    }
+    if (ctrl->fiberPin(fiberId))
+        return;
     QJsonObject data;
     data["kind"] = "fiber";
     data["id"] = QString::number(fiberId);
@@ -216,9 +222,10 @@ QJsonObject AgentBridgeServer::handleFiberList(const QJsonValue&)
     LineAnnotationController* ctrl = fiberController();
 
     QJsonArray fibers;
-    for (const auto& s : ctrl->fiberSummaries()) {
+    for (const auto& s : ctrl->fiberSummaries(std::nullopt)) {
         QJsonObject f;
         f["fiberId"] = QString::number(s.id);
+        addFiberIdentity(f, *_window->_state, *ctrl, s.id);
         f["name"] = QString::fromStdString(s.name);
         f["controlPointCount"] = s.controlPointCount;
         f["linePointCount"] = s.linePointCount;
@@ -312,6 +319,9 @@ QJsonObject AgentBridgeServer::handleFiberOpen(const QJsonValue& params)
         } else {
             ctrl->openFiber(fiberId);
         }
+        // Stored fibers open read-only; editing is an explicit request.
+        if (p.value("editable").toBool(false))
+            ctrl->enableFiberEditing(fiberId);
     });
     if (!err.isEmpty()) {
         QJsonObject data;
@@ -322,6 +332,7 @@ QJsonObject AgentBridgeServer::handleFiberOpen(const QJsonValue& params)
     QJsonObject result;
     result["opened"] = true;
     result["fiberId"] = QString::number(fiberId);
+    addFiberIdentity(result, *_window->_state, *ctrl, fiberId);
     return result;
 }
 
@@ -395,10 +406,7 @@ QJsonObject AgentBridgeServer::handleFiberDelete(const QJsonValue& params)
     vc3d::line_annotation::FiberDeleteOutcome outcome;
     const QString err = captureFiberError(ctrl, [&] { outcome = ctrl->deleteFibers(ids); });
 
-    // What was removed (or found already absent), in terms of the file names
-    // captured before the controller's save drain: the package can change during that drain,
-    // so "is the requested id still listed" is not the question. deleteFibers
-    // continues past per-file failures.
+    // Report the UUIDs retired by the checked action using the requested handles.
     QJsonArray deleted;
     bool allDeleted = !outcome.aborted;
     for (uint64_t id : ids) {
@@ -460,36 +468,6 @@ QJsonObject AgentBridgeServer::handleFiberSetTag(const QJsonValue& params)
 }
 
 
-QJsonObject AgentBridgeServer::handleFiberCreateAtlas(const QJsonValue& params)
-{
-    LineAnnotationController* ctrl = fiberController();
-    const QJsonObject p = params.toObject();
-
-    const uint64_t fiberId = jsonToFiberId(p.value("fiberId"), "fiberId");
-    requireKnownFiber(ctrl, fiberId);
-
-    // createAtlasFromFiber is synchronous, but its error and rebuild dialogs are
-    // unsafe for remote calls. Run the dialog-free split and display the result
-    // through displayAtlasFromDirectoryHeadless.
-    QString err;
-    std::filesystem::path atlasDir;
-    if (!ctrl->createAtlasFromFiberHeadless(fiberId, &err, &atlasDir)) {
-        QJsonObject data;
-        data["detail"] = err;
-        throw AgentBridgeError{-32005, "Atlas creation failed", data};
-    }
-
-    QString displayErr;
-    const bool displayed = _window->displayAtlasFromDirectoryHeadless(atlasDir, &displayErr);
-
-    QJsonObject result;
-    result["atlasDir"] = QString::fromStdString(atlasDir.string());
-    result["displayed"] = displayed;
-    if (!displayed && !displayErr.isEmpty())
-        result["displayDetail"] = displayErr;
-    return result;
-}
-
 
 QJsonObject AgentBridgeServer::handleFiberExport(const QJsonValue& params)
 {
@@ -502,9 +480,6 @@ QJsonObject AgentBridgeServer::handleFiberExport(const QJsonValue& params)
         data["param"] = "path";
         throw AgentBridgeError{-32602, "path is required", data};
     }
-    if (p.contains("scale"))
-        throw AgentBridgeError{-32602,
-            "Fiber import/export preserves coordinates; scale is not supported", {}};
 
     QString err;
     int exported = 0;
@@ -518,46 +493,5 @@ QJsonObject AgentBridgeServer::handleFiberExport(const QJsonValue& params)
     QJsonObject result;
     result["exported"] = exported;
     result["path"] = pathStr;
-    return result;
-}
-
-
-QJsonObject AgentBridgeServer::handleFiberImport(const QJsonValue& params)
-{
-    LineAnnotationController* ctrl = fiberController();
-    const QJsonObject p = params.toObject();
-
-    const QString pathStr = p.value("path").toString();
-    if (pathStr.isEmpty()) {
-        QJsonObject data;
-        data["param"] = "path";
-        throw AgentBridgeError{-32602, "path is required", data};
-    }
-    if (p.contains("scale"))
-        throw AgentBridgeError{-32602,
-            "Fiber import/export preserves coordinates; scale is not supported", {}};
-
-    const std::filesystem::path importPath(pathStr.toStdString());
-    std::error_code ec;
-    if (!std::filesystem::exists(importPath, ec)) {
-        QJsonObject data;
-        data["kind"] = "path";
-        data["path"] = pathStr;
-        throw AgentBridgeError{-32007, "Import path does not exist", data};
-    }
-
-    QString err;
-    int imported = 0;
-    int skipped = 0;
-    if (!ctrl->importFibersFromPath(importPath, &err, &imported, &skipped)) {
-        QJsonObject data;
-        data["detail"] = err;
-        data["skipped"] = skipped;
-        throw AgentBridgeError{-32005, "fiber.import failed", data};
-    }
-
-    QJsonObject result;
-    result["imported"] = imported;
-    result["skipped"] = skipped;
     return result;
 }

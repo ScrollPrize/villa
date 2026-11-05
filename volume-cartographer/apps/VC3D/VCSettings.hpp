@@ -35,7 +35,7 @@ inline QString settingsFilePath()
 // Priority — first match wins:
 //   1. viewer/remote_cache_dir from the process-wide VC3D settings
 //   2. /volpkgs/remote_cache    (typical EBS mount on EC2 dev hosts)
-//   3. /ephemeral/remote_cache  (NVMe instance store, scripts/ec2_setup.sh)
+//   3. /ephemeral/remote_cache  (NVMe instance store)
 //   4. ~/.VC3D/remote_cache
 //
 // Resolution and directory creation are implemented in shared core code so
@@ -74,51 +74,42 @@ namespace project {
 }
 
 // -----------------------------------------------------------------------------
+// Object Store Settings
+// -----------------------------------------------------------------------------
+namespace object_store {
+    // Settings array, most recent first; entries hold path, read_only, remote.
+    constexpr auto RECENT = "object_store/recent";
+    // Followed by the percent-encoded canonical source folder: the UUID namespace
+    // last used to import it, offered again so a repeat import keeps its identities.
+    constexpr auto IMPORT_UUID_NAMESPACE_PREFIX = "object_store/import_uuid_namespace/";
+}
+
+// -----------------------------------------------------------------------------
 // Viewer Settings
 // -----------------------------------------------------------------------------
 namespace viewer {
     // Navigation & Interaction
-    constexpr auto FWD_BACK_STEP_MS = "viewer/fwd_back_step_ms";
-    constexpr auto CENTER_ON_ZOOM = "viewer/center_on_zoom";
-    constexpr auto SCROLL_SPEED = "viewer/scroll_speed";
     constexpr auto PAN_SENSITIVITY = "viewer/pan_sensitivity";
     constexpr auto ZOOM_SENSITIVITY = "viewer/zoom_sensitivity";
     constexpr auto ZSCROLL_SENSITIVITY = "viewer/zscroll_sensitivity";
-    constexpr auto IMPACT_RANGE_STEPS = "viewer/impact_range_steps";
-    constexpr auto SCAN_RANGE_STEPS = "viewer/scan_range_steps";
 
-    constexpr int FWD_BACK_STEP_MS_DEFAULT = 25;
-    constexpr bool CENTER_ON_ZOOM_DEFAULT = false;
-    constexpr int SCROLL_SPEED_DEFAULT = -1;
     constexpr float PAN_SENSITIVITY_DEFAULT = 1.0f;
     constexpr float ZOOM_SENSITIVITY_DEFAULT = 1.0f;
     constexpr float ZSCROLL_SENSITIVITY_DEFAULT = 1.0f;
-    constexpr auto IMPACT_RANGE_STEPS_DEFAULT = "1-3, 5, 8, 11, 15, 20, 28, 40, 60, 100, 200";
-    constexpr auto SCAN_RANGE_STEPS_DEFAULT = "1, 2, 5, 10, 20, 50, 100, 200, 500, 1000";
 
     // Display & Appearance
-    constexpr auto DISPLAY_SEGMENT_OPACITY = "viewer/display_segment_opacity";
-    constexpr auto SHOW_DIRECTION_HINTS = "viewer/show_direction_hints";
     constexpr auto SHOW_SURFACE_NORMALS = "viewer/show_surface_normals";
     constexpr auto NORMAL_ARROW_LENGTH_SCALE = "viewer/normal_arrow_length_scale";
     constexpr auto NORMAL_MAX_ARROWS = "viewer/normal_max_arrows";
-    constexpr auto DIRECTION_STEP = "viewer/direction_step";
-    constexpr auto USE_SEG_STEP_FOR_HINTS = "viewer/use_seg_step_for_hints";
-    constexpr auto DIRECTION_STEP_POINTS = "viewer/direction_step_points";
     constexpr auto RESET_VIEW_ON_SURFACE_CHANGE = "viewer/reset_view_on_surface_change";
     constexpr auto SHOW_PLANE_INTERSECTION_LINES = "viewer/show_plane_intersection_lines";
     constexpr auto MIRROR_CURSOR_TO_SEGMENTATION = "viewer/mirror_cursor_to_segmentation";
     constexpr auto MAX_DISPLAYED_RESOLUTION = "viewer/max_displayed_resolution";
     constexpr auto POINT_COLLECTION_VIEW_TOLERANCE = "viewer/point_collection_view_tolerance";
 
-    constexpr int DISPLAY_SEGMENT_OPACITY_DEFAULT = 70;
-    constexpr bool SHOW_DIRECTION_HINTS_DEFAULT = true;
     constexpr bool SHOW_SURFACE_NORMALS_DEFAULT = false;
     constexpr int NORMAL_ARROW_LENGTH_SCALE_DEFAULT = 100;  // Percentage (100 = 1.0x)
     constexpr int NORMAL_MAX_ARROWS_DEFAULT = 32;  // Max arrows per axis for sampling
-    constexpr double DIRECTION_STEP_DEFAULT = 10.0;
-    constexpr bool USE_SEG_STEP_FOR_HINTS_DEFAULT = true;
-    constexpr int DIRECTION_STEP_POINTS_DEFAULT = 5;
     constexpr bool RESET_VIEW_ON_SURFACE_CHANGE_DEFAULT = false;
     constexpr bool SHOW_PLANE_INTERSECTION_LINES_DEFAULT = true;
     constexpr bool MIRROR_CURSOR_TO_SEGMENTATION_DEFAULT = false;
@@ -135,15 +126,9 @@ namespace viewer {
     // Intersection Rendering
     constexpr auto INTERSECTION_OPACITY = "viewer/intersection_opacity";
     constexpr auto INTERSECTION_THICKNESS = "viewer/intersection_thickness";
-    constexpr auto INTERSECTION_SAMPLING_STRIDE = "viewer/intersection_sampling_stride";
-    constexpr auto INTERSECTION_SAMPLING_STRIDE_USER_SET = "viewer/intersection_sampling_stride_user_set";
-
-    constexpr auto INTERSECTION_MAX_SURFACES = "viewer/intersection_max_surfaces";
 
     constexpr int INTERSECTION_OPACITY_DEFAULT = 70;
     constexpr float INTERSECTION_THICKNESS_DEFAULT = 0.0f;
-    constexpr int INTERSECTION_SAMPLING_STRIDE_DEFAULT = 1;
-    constexpr int INTERSECTION_MAX_SURFACES_DEFAULT = 0;  // 0 = unlimited
 
     // Axis Overlays
     constexpr auto SHOW_AXIS_OVERLAYS = "viewer/show_axis_overlays";
@@ -162,54 +147,36 @@ namespace viewer {
     constexpr auto REMOTE_RECENT_URLS = "viewer/remote_recent_urls";
 
     // Audio/UX
-    constexpr auto PLAY_SOUND_AFTER_SEG_RUN = "viewer/play_sound_after_seg_run";
     constexpr auto USERNAME = "viewer/username";
 
-    constexpr bool PLAY_SOUND_AFTER_SEG_RUN_DEFAULT = true;
     constexpr auto USERNAME_DEFAULT = "";
 
     // Viewer control group expansion states
     constexpr auto GROUP_NORMAL_VIS_EXPANDED = "viewer/group_normal_vis_expanded";
     constexpr auto GROUP_VIEW_EXPANDED = "viewer/group_view_expanded";
-    constexpr auto GROUP_OVERLAY_EXPANDED = "viewer/group_overlay_expanded";
-    constexpr auto GROUP_RENDER_SETTINGS_EXPANDED = "viewer/group_render_settings_expanded";
-    constexpr auto GROUP_COMPOSITE_EXPANDED = "viewer/group_composite_expanded";
-    constexpr auto GROUP_TRANSFORMS_EXPANDED = "viewer/group_transforms_expanded";
 
     constexpr bool GROUP_NORMAL_VIS_EXPANDED_DEFAULT = true;
     constexpr bool GROUP_VIEW_EXPANDED_DEFAULT = true;
-    constexpr bool GROUP_OVERLAY_EXPANDED_DEFAULT = true;
-    constexpr bool GROUP_RENDER_SETTINGS_EXPANDED_DEFAULT = true;
-    constexpr bool GROUP_COMPOSITE_EXPANDED_DEFAULT = true;
-    constexpr bool GROUP_TRANSFORMS_EXPANDED_DEFAULT = true;
-}
-
-// -----------------------------------------------------------------------------
-// Atlas Workspace Settings
-// -----------------------------------------------------------------------------
-namespace atlas {
-    constexpr auto SEARCH_MAX_DISTANCE = "atlas/search_max_distance";
 }
 
 // -----------------------------------------------------------------------------
 // Performance Settings
 // -----------------------------------------------------------------------------
 namespace perf {
-    constexpr auto PRELOADED_SLICES = "perf/preloaded_slices";
-    constexpr auto PARALLEL_PROCESSES = "perf/parallel_processes";
-    constexpr auto ITERATION_COUNT = "perf/iteration_count";
-    constexpr auto DOWNSCALE_OVERRIDE = "perf/downscale_override";
     constexpr auto INTERPOLATION_METHOD = "viewer/interpolation_method";
     constexpr auto ENABLE_FILE_WATCHING = "perf/enable_file_watching";
     constexpr auto RAM_CACHE_SIZE_GB = "perf/ram_cache_size_gb";
 
-    constexpr int PRELOADED_SLICES_DEFAULT = 200;
-    constexpr int PARALLEL_PROCESSES_DEFAULT = 8;
-    constexpr int ITERATION_COUNT_DEFAULT = 1000;
-    constexpr int DOWNSCALE_OVERRIDE_DEFAULT = 0;
     constexpr int INTERPOLATION_METHOD_DEFAULT = 1;  // 0 = Nearest, 1 = Trilinear
     constexpr bool ENABLE_FILE_WATCHING_DEFAULT = true;
     constexpr int RAM_CACHE_SIZE_GB_DEFAULT = 10;
+
+    // Sample volumes on the GPU in every viewer (builds with CUDA, uint8 volumes). The cache is per
+    // pyramid level. Startup-only.
+    constexpr auto RENDER_CUDA = "perf/render_cuda";
+    constexpr bool RENDER_CUDA_DEFAULT = false;
+    constexpr auto RENDER_GPU_CACHE_GB = "perf/render_gpu_cache_gb";
+    constexpr int RENDER_GPU_CACHE_GB_DEFAULT = 4;
 
     // Startup-only persistent representation for remote-volume chunks.
     constexpr auto REMOTE_CACHE_DELTA3D = vc::settings::kRemoteCacheDelta3d;
@@ -218,67 +185,32 @@ namespace perf {
 
     // Shared budget for every managed remote Zarr chunk beneath the resolved
     // vc3d cache root. Zero maximum means unlimited.
-    constexpr auto REMOTE_CACHE_MAX_GIB = "perf/remote_cache_max_gib";
-    constexpr qulonglong REMOTE_CACHE_MAX_GIB_DEFAULT = 0;
-    constexpr auto REMOTE_CACHE_MIN_FREE_GIB = "perf/remote_cache_min_free_gib";
-    constexpr qulonglong REMOTE_CACHE_MIN_FREE_GIB_DEFAULT = 20;
+    constexpr auto REMOTE_CACHE_MAX_GIB = vc::settings::kRemoteCacheMaxGib;
+    constexpr qulonglong REMOTE_CACHE_MAX_GIB_DEFAULT = vc::settings::kRemoteCacheMaxGibDefault;
+    constexpr auto REMOTE_CACHE_MIN_FREE_GIB = vc::settings::kRemoteCacheMinFreeGib;
+    constexpr qulonglong REMOTE_CACHE_MIN_FREE_GIB_DEFAULT = vc::settings::kRemoteCacheMinFreeGibDefault;
 
-    // LOD synthesis method.  Selects how c3d chunks are decoded when a
-    // downscaled view is requested.  Value is one of:
-    //   "codec_synthesis"   — call c3d_chunk_decode_lod; codec-native filter.
-    //   "full_decode_box"   — full decode + box-average pool.
-    //   "full_decode_min"   — full decode + min pool.
-    //   "full_decode_max"   — full decode + max pool.
-    // Has no effect until the sampler calls into the LOD-synthesis path
-    // (no-op on the current multi-level zarr pyramid).
-    constexpr auto LOD_METHOD = "perf/lod_method";
-    constexpr auto LOD_METHOD_DEFAULT = "codec_synthesis";
-
-    // Process-wide remote source-download admission. Automatic mode adapts
-    // between 2 and the fixed worker capacity. Manual mode admits exactly the
-    // configured number of simultaneous downloads. Decode workers are managed
-    // separately.
-    constexpr auto REMOTE_DOWNLOAD_AUTOMATIC =
-        "perf/remote_download_automatic";
-    constexpr bool REMOTE_DOWNLOAD_AUTOMATIC_DEFAULT = true;
-    constexpr auto REMOTE_DOWNLOAD_PARALLELISM =
-        "perf/remote_download_parallelism";
-    constexpr int REMOTE_DOWNLOAD_PARALLELISM_DEFAULT = 16;
+    // Simultaneous remote downloads per opened array. Automatic mode leaves the
+    // choice to vc_reader.
+    constexpr auto REMOTE_DOWNLOAD_AUTOMATIC = vc::settings::kRemoteDownloadAutomatic;
+    constexpr bool REMOTE_DOWNLOAD_AUTOMATIC_DEFAULT = vc::settings::kRemoteDownloadAutomaticDefault;
+    constexpr auto REMOTE_DOWNLOAD_PARALLELISM = vc::settings::kRemoteDownloadParallelism;
+    constexpr int REMOTE_DOWNLOAD_PARALLELISM_DEFAULT = vc::settings::kRemoteDownloadParallelismDefault;
     constexpr int REMOTE_DOWNLOAD_WORKER_CAPACITY = 64;
-
-    // Reusable adaptive-download capacity model. Runtime probe phase and
-    // stability timing are reset on every launch.
-    constexpr auto REMOTE_DOWNLOAD_STATE_VERSION =
-        "perf/remote_download_state/version";
-    constexpr int REMOTE_DOWNLOAD_STATE_VERSION_CURRENT = 1;
-    constexpr auto REMOTE_DOWNLOAD_SETTLED_ADMISSION =
-        "perf/remote_download_state/settled_admission";
-    constexpr auto REMOTE_DOWNLOAD_LONG_TERM_BYTES_PER_SECOND =
-        "perf/remote_download_state/long_term_bytes_per_second";
-    constexpr auto REMOTE_DOWNLOAD_MAX_SATURATED_PARALLELISM =
-        "perf/remote_download_state/max_saturated_parallelism";
-    constexpr auto REMOTE_DOWNLOAD_SATURATED_BYTES_PER_SECOND_PER_WORKER =
-        "perf/remote_download_state/saturated_bytes_per_second_per_worker";
 
 }
 
 // -----------------------------------------------------------------------------
 // Viewer Cache Settings
 //
-// Each ViewerManager owns independent derived surface-tile caches. Raw decoded
-// volume chunks use the application-wide cache. These settings apply without a
-// restart.
+// These settings apply without a restart.
 // -----------------------------------------------------------------------------
 namespace viewer_cache {
-    // Per-workspace budget for the flattened segmentation view's cache of
-    // resampled surface space. 0 selects the legacy direct-sampling path.
-    constexpr auto SURFACE_CACHE_GB = "viewer_cache/surface_cache_gb";
-    constexpr int SURFACE_CACHE_GB_DEFAULT = 4;
-
-    // Per-workspace budget for the overlay volume's surface-space cache. 0
-    // leaves the overlay channel on its legacy resident-only sampling path.
-    constexpr auto OVERLAY_SURFACE_CACHE_GB = "viewer_cache/overlay_surface_cache_gb";
-    constexpr int OVERLAY_SURFACE_CACHE_GB_DEFAULT = 2;
+    // App-wide budget for decoded object-store surface geometry (every
+    // surface's tiles read for intersections and lookups), shared by all
+    // workspaces and stores.
+    constexpr auto SURFACE_GEOMETRY_CACHE_GB = "viewer_cache/surface_geometry_cache_gb";
+    constexpr int SURFACE_GEOMETRY_CACHE_GB_DEFAULT = 8;
 
 }
 
@@ -342,6 +274,10 @@ namespace line_annotation {
     // app-global "Sync cursor across views" toggle.
     constexpr auto MIRROR_CURSOR_ACROSS_PANES = "lineAnnotation/mirror_cursor_across_panes";
     constexpr bool MIRROR_CURSOR_ACROSS_PANES_DEFAULT = true;
+    // Stored fibers the user opens start with editing enabled instead of
+    // read-only. Agent-driven opens and collection inspections ignore it.
+    constexpr auto OPEN_FIBERS_EDITABLE = "lineAnnotation/open_fibers_editable";
+    constexpr bool OPEN_FIBERS_EDITABLE_DEFAULT = false;
     constexpr auto CURRENT_CUT_ZOOM = "lineAnnotation/current_cut_zoom";
     constexpr auto SIDE_CUT_ZOOM = "lineAnnotation/side_cut_zoom";
     constexpr auto STRIP_ZOOMS = "lineAnnotation/strip_zooms";
@@ -359,21 +295,6 @@ namespace line_annotation {
 }
 
 // -----------------------------------------------------------------------------
-// Export Settings
-// -----------------------------------------------------------------------------
-namespace export_ {  // underscore because 'export' is reserved keyword
-    constexpr auto CHUNK_WIDTH_PX = "export/chunk_width_px";
-    constexpr auto CHUNK_OVERLAP_PX = "export/chunk_overlap_px";
-    constexpr auto OVERWRITE = "export/overwrite";
-    constexpr auto DIR = "export/dir";
-
-    constexpr int CHUNK_WIDTH_PX_DEFAULT = 40000;
-    constexpr int CHUNK_OVERLAP_PX_DEFAULT = 0;
-    constexpr bool OVERWRITE_DEFAULT = true;
-    constexpr auto DIR_DEFAULT = "";
-}
-
-// -----------------------------------------------------------------------------
 // Neighbor Copy Settings
 // -----------------------------------------------------------------------------
 namespace neighbor_copy {
@@ -386,34 +307,11 @@ namespace neighbor_copy {
 }
 
 // -----------------------------------------------------------------------------
-// AWS Settings
-// -----------------------------------------------------------------------------
-namespace aws {
-    constexpr auto DEFAULT_PROFILE = "aws/default_profile";
-    constexpr auto ACCESS_KEY = "aws/access_key";
-    constexpr auto SECRET_KEY = "aws/secret_key";
-    constexpr auto SESSION_TOKEN = "aws/session_token";
-
-    constexpr auto DEFAULT_PROFILE_DEFAULT = "";
-}
-
-// -----------------------------------------------------------------------------
 // Tools Settings
 // -----------------------------------------------------------------------------
 namespace tools {
-    constexpr auto FLATBOI_PATH = "tools/flatboi_path";
-    constexpr auto FLATBOI = "tools/flatboi";  // Legacy key
     constexpr auto GROW_TRACK_VENV = "tools/grow_track_venv";
     constexpr auto GROW_TRACK_VENV_DEFAULT = "";
-}
-
-// -----------------------------------------------------------------------------
-// Backup Settings
-// -----------------------------------------------------------------------------
-namespace backup {
-    // How many rotating snapshots to keep per segment under <volpkg_dir>/backups/.
-    constexpr auto SEGMENT_COUNT = "backup/segment_count";
-    constexpr int  SEGMENT_COUNT_DEFAULT = 10;
 }
 
 // -----------------------------------------------------------------------------
@@ -423,18 +321,12 @@ namespace segmentation {
     // Tool group expansion states
     constexpr auto GROUP_EDITING_EXPANDED = "group_editing_expanded";
     constexpr auto GROUP_DRAG_EXPANDED = "group_drag_expanded";
-    constexpr auto GROUP_LINE_EXPANDED = "group_line_expanded";
     constexpr auto GROUP_PUSH_PULL_EXPANDED = "group_push_pull_expanded";
-    constexpr auto GROUP_DIRECTION_FIELD_EXPANDED = "group_direction_field_expanded";
-    constexpr auto GROUP_APPROVAL_MASK_EXPANDED = "group_approval_mask_expanded";
     constexpr auto GROUP_NEURAL_TRACER_EXPANDED = "group_neural_tracer_expanded";
 
     constexpr bool GROUP_EDITING_EXPANDED_DEFAULT = true;
     constexpr bool GROUP_DRAG_EXPANDED_DEFAULT = true;
-    constexpr bool GROUP_LINE_EXPANDED_DEFAULT = true;
     constexpr bool GROUP_PUSH_PULL_EXPANDED_DEFAULT = true;
-    constexpr bool GROUP_DIRECTION_FIELD_EXPANDED_DEFAULT = true;
-    constexpr bool GROUP_APPROVAL_MASK_EXPANDED_DEFAULT = true;
     constexpr bool GROUP_NEURAL_TRACER_EXPANDED_DEFAULT = true;
 
     // Drag tool (note: these are stored in a QSettings group)
@@ -442,10 +334,6 @@ namespace segmentation {
     constexpr auto DRAG_SIGMA_STEPS = "drag_sigma_steps";
     constexpr auto RADIUS_STEPS = "radius_steps";  // Legacy key
     constexpr auto SIGMA_STEPS = "sigma_steps";    // Legacy key
-
-    // Line tool
-    constexpr auto LINE_RADIUS_STEPS = "line_radius_steps";
-    constexpr auto LINE_SIGMA_STEPS = "line_sigma_steps";
 
     // Push/Pull tool
     constexpr auto PUSH_PULL_RADIUS_STEPS = "push_pull_radius_steps";
@@ -472,7 +360,6 @@ namespace segmentation {
     constexpr auto GROWTH_METHOD = "growth_method";
     constexpr auto GROWTH_STEPS = "growth_steps";
     constexpr auto GROWTH_DIRECTION_MASK = "growth_direction_mask";
-    constexpr auto DIRECTION_FIELDS = "direction_fields";
     constexpr auto GROWTH_KEYBINDS_ENABLED = "growth_keybinds_enabled";
 
     constexpr bool GROWTH_KEYBINDS_ENABLED_DEFAULT = true;
@@ -489,20 +376,9 @@ namespace segmentation {
     // Hover marker
     constexpr auto SHOW_HOVER_MARKER = "show_hover_marker";
 
-    // Approval brush
-    constexpr auto APPROVAL_BRUSH_RADIUS = "approval_brush_radius";
-    constexpr auto APPROVAL_BRUSH_DEPTH = "approval_brush_depth";
-    constexpr auto APPROVAL_MASK_OPACITY = "approval_mask_opacity";
-    constexpr auto APPROVAL_BRUSH_COLOR = "approval_brush_color";
-    constexpr auto SHOW_APPROVAL_MASK = "show_approval_mask";
-    constexpr auto APPROVAL_AUTO_APPROVE_EDITS = "approval_auto_approve_edits";
-
-    // Auto-approval settings
-    constexpr auto AUTO_APPROVAL_ENABLED = "auto_approval_enabled";
-    constexpr auto AUTO_APPROVAL_RADIUS = "auto_approval_radius";
-    constexpr auto AUTO_APPROVAL_THRESHOLD = "auto_approval_threshold";
-    constexpr auto AUTO_APPROVAL_MAX_DISTANCE = "auto_approval_max_distance";
-
+    // Draw mask brush radius (voxels)
+    constexpr auto MASK_BRUSH_RADIUS = "mask_brush_radius";
+    constexpr float MASK_BRUSH_RADIUS_DEFAULT = 50.0f;
 
     constexpr bool CORRECTIONS_ENABLED_DEFAULT = false;
     constexpr bool CORRECTIONS_Z_RANGE_ENABLED_DEFAULT = false;
@@ -513,13 +389,12 @@ namespace segmentation {
 // Volume Overlay Settings (stored in a QSettings group per overlay)
 // -----------------------------------------------------------------------------
 namespace volume_overlay {
-    constexpr auto PATH = "path";
     constexpr auto VOLUME_ID = "volume_id";
     constexpr auto OPACITY = "opacity";
     constexpr auto WINDOW_LOW = "window_low";
     constexpr auto WINDOW_HIGH = "window_high";
-    constexpr auto THRESHOLD = "threshold";  // Legacy key
     constexpr auto COLORMAP = "colormap";
+    constexpr auto INTENSITY_AS_ALPHA = "intensity_as_alpha";
     constexpr auto SAMPLING_METHOD = "sampling_method";
     constexpr auto MAX_DISPLAYED_RESOLUTION = "max_displayed_resolution";
     constexpr auto COMPOSITE_ENABLED = "composite_enabled";

@@ -51,7 +51,6 @@ public:
     void setSpacing(double spacingVx);
     void setMergeExistingAnnotations(bool enabled);
     void setPathType(PathType pathType);
-    void setImageFilter(ImageFilterType filterType, int kernelSize);
     void setImageFilterType(ImageFilterType filterType);
     void setImageFilterKernelSize(int kernelSize);
     void noteShiftReleased();
@@ -75,7 +74,6 @@ public:
                          const QPointF& scenePos,
                          bool appendToPreview,
                          float viewScale,
-                         const VCCollection* pointCollection,
                          const SceneToVolumeFn& sceneToVolume,
                          const VolumeToSceneFn& volumeToScene,
                          const SetOverlayGroupFn& setOverlayGroup,
@@ -89,7 +87,6 @@ public:
                             const ClearOverlayGroupFn& clearOverlayGroup);
     bool appendManualPreview(const QPointF& scenePos,
                              float viewScale,
-                             const VCCollection* pointCollection,
                              const SceneToVolumeFn& sceneToVolume,
                              const VolumeToSceneFn& volumeToScene,
                              const SetOverlayGroupFn& setOverlayGroup,
