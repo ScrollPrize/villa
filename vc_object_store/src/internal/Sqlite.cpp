@@ -42,6 +42,27 @@ std::array<unsigned char, 16> parseUuid(const std::string& uuid)
     return out;
 }
 
+HashKey parseHash(const std::string& hex)
+{
+    auto digit = [&](char ch) {
+        if (ch >= '0' && ch <= '9') return ch - '0';
+        if (ch >= 'a' && ch <= 'f') return ch - 'a' + 10;
+        throw std::runtime_error("object store: not a lowercase SHA-256 hex digest: " + hex);
+    };
+    if (hex.size() != 64) throw std::runtime_error("object store: not a lowercase SHA-256 hex digest: " + hex);
+    HashKey out{};
+    for (size_t i = 0; i < out.size(); ++i) out[i] = static_cast<unsigned char>(digit(hex[2 * i]) << 4 | digit(hex[2 * i + 1]));
+    return out;
+}
+
+std::string formatHash(const unsigned char* bytes)
+{
+    constexpr char digits[] = "0123456789abcdef";
+    std::string out(64, '0');
+    for (size_t i = 0; i < 32; ++i) { out[2 * i] = digits[bytes[i] >> 4]; out[2 * i + 1] = digits[bytes[i] & 15]; }
+    return out;
+}
+
 std::string formatUuid(const std::array<unsigned char, 16>& bytes)
 {
     constexpr char hex[] = "0123456789abcdef";
@@ -174,6 +195,18 @@ void Statement::bindNull(int i)
 void Statement::bind(int i, const std::array<unsigned char, 16>& v)
 {
     check(sqlite3_bind_blob(value, i, v.data(), 16, SQLITE_TRANSIENT), db_, "bind");
+}
+
+void Statement::bind(int i, const HashKey& v)
+{
+    check(sqlite3_bind_blob(value, i, v.data(), int(v.size()), SQLITE_TRANSIENT), db_, "bind");
+}
+
+std::string Statement::hash(int c) const
+{
+    if (sqlite3_column_bytes(value, c) != 32)
+        throw std::runtime_error("object store: hash column is not 32 bytes");
+    return formatHash(static_cast<const unsigned char*>(sqlite3_column_blob(value, c)));
 }
 
 bool Statement::row()

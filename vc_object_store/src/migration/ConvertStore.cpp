@@ -2,6 +2,7 @@
 #include "internal/Database.hpp"
 #include "internal/Sqlite.hpp"
 #include "internal/Versions.hpp"
+#include "geometry/GeometryDelta.hpp"
 
 #include <functional>
 #include <map>
@@ -152,6 +153,8 @@ struct TableCopy {
     // SELECT of the source rows when not every row is copied.
     std::string sourceFilter;
     Adjust adjust;
+    // Columns holding SHA-256 hex text that become 32-byte blobs.
+    std::set<std::string> hashColumns = {};
 };
 
 std::vector<std::string> copiedColumns(sqlite3* db, const std::string& schema, const std::string& table)
@@ -187,6 +190,8 @@ int64_t copyTable(sqlite3* db, const std::string& table, const TableCopy& copy)
         for (int c = 0; c < int(columns.size()); ++c) {
             if (copy.uuidColumns.contains(columns[c]) && sqlite3_column_type(in.value, c) == SQLITE_TEXT)
                 out.bind(c + 1, parseUuid(in.text(c)));
+            else if (copy.hashColumns.contains(columns[c]) && sqlite3_column_type(in.value, c) == SQLITE_TEXT)
+                out.bind(c + 1, parseHash(in.text(c)));
             else
                 check(sqlite3_bind_value(out.value, c + 1, sqlite3_column_value(in.value, c)), db, "convert: bind");
         }
@@ -200,8 +205,8 @@ int64_t copyTable(sqlite3* db, const std::string& table, const TableCopy& copy)
 // Schema 18 -> current, from `stage` (schema 18) into a new `destination`
 // built by the runtime's own schema definition. Unchanged tables are copied
 // as they are; history and version keys become 16-byte blobs, a revision
-// without a parent stores its whole record, and materialized head records
-// are kept only for heads with a parent.
+// without a parent stores its whole record, materialized head records are
+// kept only for heads with a parent, and geometry hashes become 32-byte blobs.
 void copyToCurrentSchema(const std::filesystem::path& stage, const std::filesystem::path& destination, Json& report)
 {
     Connection out;
@@ -259,6 +264,10 @@ void copyToCurrentSchema(const std::filesystem::path& stage, const std::filesyst
         {"object_versions", {{"object_uuid", "generation", "revision_uuid"}}},
         {"relationship_versions", {{"edge_uuid", "generation", "revision_uuid"}}},
         {"transaction_receipts", {{"request_uuid", "generation"}}},
+        // Columns: uuid, object_uuid, parent_uuid, content_hash, manifest, ...
+        {"geometry_revisions", {.hashColumns = {"content_hash"}}},
+        {"geometry_chunks", {.hashColumns = {"hash"}}},
+        {"geometry_revision_chunks", {.hashColumns = {"hash"}}},
     };
     Json counts = Json::object();
     for (const auto& table : target) {
@@ -279,6 +288,12 @@ void copyToCurrentSchema(const std::filesystem::path& stage, const std::filesyst
         exec(db, "INSERT INTO main.sqlite_sequence SELECT * FROM src.sqlite_sequence;");
     }
     for (const auto& [name, sql] : triggers) exec(db, (sql + ";").c_str());
+    // Every geometry manifest still matches its recorded content hash, now a
+    // blob (the runtime's own loader verifies it).
+    {
+        Statement revisions(db, "SELECT uuid,manifest,content_hash FROM main.geometry_revisions");
+        while (revisions.row()) loadGeometryManifest(db, revisions.uuid(0), revisions.text(1), revisions.hash(2));
+    }
     exec(db, ("PRAGMA user_version=" + std::to_string(kSchemaVersion) + ";").c_str());
     exec(db, "COMMIT;");
     exec(db, "DETACH DATABASE src;");

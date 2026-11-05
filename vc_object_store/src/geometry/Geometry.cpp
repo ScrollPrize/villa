@@ -17,7 +17,7 @@ GeometryRevision readGeometryRevision(const Statement& s)
     GeometryRevision r;
     r.uuid = formatUuid(s.blob16(0)); r.objectUuid = formatUuid(s.blob16(1));
     if (!s.isNull(2)) r.parentUuid = formatUuid(s.blob16(2));
-    r.contentHash = s.text(3);
+    r.contentHash = s.hash(3);
     const auto text = s.text(4);
     const auto manifest = loadGeometryManifest(sqlite3_db_handle(s.value), r.uuid, text, r.contentHash);
     r.gridOrigin = manifest.value("grid_origin", std::array<int64_t,2>{0,0});
@@ -146,7 +146,7 @@ void writeRevision(sqlite3* db, const ObjectStore& store, const ObjectRecord& ob
     Statement revision(db, "INSERT INTO geometry_revisions VALUES(?,?,?,?,?,?,?,?,?)", parseUuid(uuid),
         parseUuid(object.uuid));
     if (parent) revision.bind(3, parseUuid(parent->uuid)); else revision.bindNull(3);
-    revision.bind(4, hash); revision.bind(5, text); revision.bind(6, object.generation + 1);
+    revision.bind(4, parseHash(hash)); revision.bind(5, text); revision.bind(6, object.generation + 1);
     revision.bind(7, store.author()); revision.bind(8, nowIsoUtc()); revision.bind(9, store.hostname());
     revision.stepDone();
 }
@@ -168,7 +168,7 @@ void writeArrays(sqlite3* db, const std::string& revisionUuid,
     for (const auto& array : arrays) {
         const auto layout = detail::geometryLayout(manifest.at("arrays").at(array.name));
         detail::forEachGeometryChunk(array, layout.tile, [&](int64_t index, std::span<const uint8_t> bytes) {
-            const std::string hash = manifest.at("arrays").at(array.name).at("chunks").at(index);
+            const auto hash = parseHash(manifest.at("arrays").at(array.name).at("chunks").at(index).get<std::string>());
             insert.reset(); insert.bind(1, hash);
             check(sqlite3_bind_blob64(insert.value, 2, bytes.data(), bytes.size(), SQLITE_STATIC), db, "bind geometry chunk");
             insert.stepDone();
@@ -486,7 +486,7 @@ std::string ObjectStore::editGeometry(WriteTxn& txn, const std::string& objectId
         for (const auto& name : changed) {
             const auto& array = manifest.at("arrays").at(name);
             for (int64_t index = 0; index < geometryLayout(array).chunkCount(); ++index) {
-                const std::string chunk = array.at("chunks").at(index);
+                const auto chunk = parseHash(array.at("chunks").at(index).get<std::string>());
                 stored.reset(); stored.bind(1, chunk);
                 if (!stored.row()) {
                     const auto found = plan->modified->find({name, index});

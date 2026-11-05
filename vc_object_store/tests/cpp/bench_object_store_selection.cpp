@@ -12,6 +12,9 @@
 //   bench_object_store_selection record STORE [ITERATIONS]
 //       Times selection records of every fiber (local snapshot, hosted pages),
 //       their encoding and size.
+//   bench_object_store_selection geometry STORE [COUNT] [ITERATIONS]
+//       Times local geometry reads of COUNT fibers: descriptors and control
+//       points one revision at a time, and one packed batch.
 #include "vc_object_store/Uuid.hpp"
 #include "vc_object_store/client/HostedStore.hpp"
 #include "vc_object_store/objects/TransactionJson.hpp"
@@ -334,6 +337,42 @@ int record(const std::string& path, int iterations)
               << " per object)\n";
     return 0;
 }
+int geometry(const std::string& path, std::int64_t count, int iterations)
+{
+    OpenOptions readOnly;
+    readOnly.readOnly = true;
+    auto store = ObjectStore::open(path, readOnly);
+    std::vector<std::string> revisions;
+    {
+        auto txn = store.read();
+        ObjectSelection fibers;
+        fibers.kind = "fiber";
+        fibers.limit = count;
+        for (const auto& record : store.selectObjects(txn, fibers, std::vector<std::string>{}))
+            revisions.push_back(store.currentGeometry(txn, record.uuid)->uuid);
+    }
+    std::vector<double> descriptors, arrays, packed;
+    std::size_t bytes = 0;
+    for (int i = 0; i < iterations; ++i) {
+        auto txn = store.read();
+        auto start = Clock::now();
+        for (const auto& revision : revisions)
+            if (!store.geometryRevision(txn, revision)) throw std::runtime_error("missing geometry");
+        descriptors.push_back(seconds(start));
+        start = Clock::now();
+        bytes = 0;
+        for (const auto& revision : revisions) bytes += store.readGeometryArray(txn, revision, "control_points").size();
+        arrays.push_back(seconds(start));
+        start = Clock::now();
+        if (store.readGeometryArrays(txn, revisions, "control_points").data.size() != bytes)
+            throw std::runtime_error("packed size differs");
+        packed.push_back(seconds(start));
+    }
+    report("geometryRevision one at a time", descriptors, revisions.size());
+    report("readGeometryArray control_points one at a time", arrays, revisions.size());
+    report("readGeometryArrays control_points packed", packed, revisions.size());
+    return 0;
+}
 } // namespace
 
 int main(int argc, char** argv)
@@ -344,8 +383,10 @@ try {
     if (mode == "record" && (argc == 3 || argc == 4)) return record(argv[2], argc == 4 ? std::stoi(argv[3]) : 3);
     if (mode == "versions" && argc >= 3 && argc <= 5)
         return versions(argv[2], argc >= 4 ? std::stoll(argv[3]) : 10000, argc == 5 ? std::stoi(argv[4]) : 5);
+    if (mode == "geometry" && argc >= 3 && argc <= 5)
+        return geometry(argv[2], argc >= 4 ? std::stoll(argv[3]) : 10000, argc == 5 ? std::stoi(argv[4]) : 5);
     std::cerr << "usage: bench_object_store_selection create STORE COUNT | list STORE [ITERATIONS] |"
-                 " versions STORE [COUNT] [ITERATIONS] | record STORE [ITERATIONS]\n";
+                 " versions STORE [COUNT] [ITERATIONS] | record STORE [ITERATIONS] | geometry STORE [COUNT] [ITERATIONS]\n";
     return 2;
 } catch (const std::exception& error) {
     std::cerr << "bench_object_store_selection: " << error.what() << "\n";

@@ -109,7 +109,7 @@ GeometryReader::GeometryReader(sqlite3* db, const std::string& revision, bool ca
     // Charge JSON nodes/strings, layouts and cache bookkeeping conservatively,
     // in addition to the separately accounted retained payload bytes.
     metadataCharge_ = text.size() * 32 + 4096;
-    manifest_ = loadGeometryManifest(db_, revision, text, row.text(0));
+    manifest_ = loadGeometryManifest(db_, revision, text, row.hash(0));
     if (manifest_.contains("delta")) {
         const auto target = manifest_;
         const auto object = row.blob16(2);
@@ -136,10 +136,10 @@ GeometryReader::GeometryReader(sqlite3* db, const std::string& revision, bool ca
                 Statement previous(db_, "SELECT content_hash,manifest,parent_uuid,object_uuid FROM geometry_revisions WHERE uuid=?",
                     parseUuid(parent));
                 if (!previous.row() || previous.blob16(3) != object ||
-                    previous.text(0) != descriptor.at("delta").at("parent_hash").get<std::string>())
+                    previous.hash(0) != descriptor.at("delta").at("parent_hash").get<std::string>())
                     throw std::runtime_error("geometry delta: invalid parent");
                 id = parent;
-                descriptor = loadGeometryManifest(db_, id, previous.text(1), previous.text(0));
+                descriptor = loadGeometryManifest(db_, id, previous.text(1), previous.hash(0));
                 parent = previous.isNull(2) ? std::string() : formatUuid(previous.blob16(2));
             }
             if (id != baseRevision_) throw std::runtime_error("geometry delta: invalid base");
@@ -173,7 +173,7 @@ GeometryReader::GeometryReader(sqlite3* db, const std::string& revision, bool ca
                     Statement step(db_, "SELECT manifest,content_hash,parent_uuid,object_uuid FROM geometry_revisions WHERE uuid=?",
                         parseUuid(cursor));
                     if (!step.row() || step.isNull(2) || step.blob16(3) != object) break;
-                    auto m = loadGeometryManifest(db_, cursor, step.text(0), step.text(1));
+                    auto m = loadGeometryManifest(db_, cursor, step.text(0), step.hash(1));
                     if (!m.contains("delta") || m.at("delta").at("base") != baseRevision_) break;
                     reverse.emplace_back(cursor, std::move(m));
                     cursor = formatUuid(step.blob16(2));
@@ -261,7 +261,7 @@ void GeometryReader::visitChunk(const std::string& name, int64_t index,
             if (!chunk.row()) throw std::runtime_error("geometry: missing payload chunk");
             const auto* p = static_cast<const uint8_t*>(sqlite3_column_blob(chunk.value, 0));
             if (geometryWork) geometryWork->readBytes[name] += sqlite3_column_bytes(chunk.value, 0);
-            owned.assign(p, p + sqlite3_column_bytes(chunk.value, 0)); storedHash = chunk.text(1);
+            owned.assign(p, p + sqlite3_column_bytes(chunk.value, 0)); storedHash = chunk.hash(1);
             if (!deltas_.empty()) verifyGeometryChunk(owned, storedHash, storedHash, expectedSize, name);
         }
     }
@@ -485,7 +485,7 @@ PackedGeometryArray ObjectStore::readGeometryArrays(const Txn& txn,
         bind(manifests, begin, count);
         while (manifests.row()) {
             if (manifests.isNull(1)) throw std::invalid_argument("geometry: revision not found");
-            auto manifest = loadGeometryManifest(db, revisions[begin + size_t(manifests.i64(0))], manifests.text(2), manifests.text(1));
+            auto manifest = loadGeometryManifest(db, revisions[begin + size_t(manifests.i64(0))], manifests.text(2), manifests.hash(1));
             if (manifest.contains("delta") || (manifest.at("arrays").contains(name) && manifest.at("arrays").at(name).contains("source_revision"))) {
                 // Snapshot-only batches keep the SQL fast path below. Mixed
                 // batches use the same verified reader as all other APIs.
@@ -557,7 +557,7 @@ PackedGeometryArray ObjectStore::readGeometryArrays(const Txn& txn,
             const auto& array = plan.at(begin + row);
             const auto expectedSize = array.layout.chunkBytes(index);
             if (geometryWork) geometryWork->readBytes[name] += bytes.size();
-            verifyGeometryChunk(bytes, chunks.text(2), array.hashes.at(index), expectedSize, name);
+            verifyGeometryChunk(bytes, chunks.hash(2), array.hashes.at(index), expectedSize, name);
             copyGeometryChunk(array.layout, index, bytes, result.data.data() + array.offset);
         }
         for (size_t i = 0; i < count; ++i)

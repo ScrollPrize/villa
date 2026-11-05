@@ -226,7 +226,8 @@ destination), then copied into a store built by the current schema
 definition. Schema 19 keeps the same content in less space: history, version
 and head keys are 16-byte blobs, a revision without a parent stores its whole
 record rather than a patch from `{}` (later revisions stay RFC 6902 patches),
-and only heads with a parent keep a materialized record. A schema-18 source
+only heads with a parent keep a materialized record, and geometry payload and
+manifest hashes are 32-byte blobs (still hex text in every API). A schema-18 source
 is copied directly; its mapping is read from its recorded versions. The report
 gives `source_bytes`, `destination_bytes` and the rows copied per table.
 
