@@ -1,11 +1,15 @@
-// Included inside runObjectStoreControllerTests(). Always clone the supplied
+// Included inside runObjectStoreControllerTests(). Always copy the supplied
 // real store; neither the source nor a user's working project is edited.
 if (const char* source = std::getenv("VC3D_FIBER_CACHE_TEST_STORE")) {
     QTemporaryDir directory;
     const auto copy = fs::path(directory.path().toStdString()) / "fibers.vcobj";
     OpenOptions options; options.author = "fiber-cache-regression";
-    cloneHub(source, copy, options);
-    detachHub(copy, options.author);
+    {
+        OpenOptions readOnly; readOnly.readOnly = true;
+        ObjectStoreSession original;
+        const auto attached = original.attach(source, readOnly);
+        vc::objects::copyProject(original, attached, copy, "fiber cache regression", options);
+    }
     CState state;
     Controller controller(&state, nullptr, nullptr, nullptr);
     controller._errorDialogsSuppressed = true;

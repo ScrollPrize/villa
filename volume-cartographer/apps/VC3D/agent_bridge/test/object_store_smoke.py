@@ -7,13 +7,16 @@ Without --database, create a current-format fixture and check lazy span details.
 The database is the project VC3D opens: it references one volume and holds a
 surface bound to it and an Open Data catalog surface, so the bridge's surface
 workflow (list, activate, rename, tags, review, editing a catalog surface in
-place) runs against a real store. Hosted replicas of it open as projects too.
+place) runs against a real store. Two VC3D clients then share a copy of it
+through vc_object_server (--object-server, default: beside --vc3d).
 """
 import argparse
 import json
 import os
 from pathlib import Path
+import re
 import sqlite3
+import subprocess
 import tempfile
 import time
 
@@ -42,7 +45,9 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--vc3d', required=True)
     parser.add_argument('--database', type=Path)
+    parser.add_argument('--object-server', type=Path)
     args = parser.parse_args()
+    server_binary = args.object_server or Path(args.vc3d).with_name('vc_object_server')
     with tempfile.TemporaryDirectory(prefix='vc3d-store-bridge-') as temporary:
         root = Path(temporary)
         database = root / 'smoke.vcobj'
@@ -82,12 +87,14 @@ def main():
             '\n[project]\nshow_open_data_catalog_on_startup=false\n')
         tag = 'bridge_smoke_' + str(os.getpid())
 
-        def launch(index, store=database):
-            project = store.with_suffix('.vcproj')
+        def launch(index, store=database, endpoint=None):
+            project = root / f'hosted-{index}.vcproj' if endpoint else store.with_suffix('.vcproj')
+            entry = dict(id='main', location=endpoint, hosted=True) if endpoint else \
+                dict(id='main', location=str(store), read_only=False)
             if not project.exists():
                 project.write_text(json.dumps(dict(
                     format='vcproj', version=1, name='Store smoke',
-                    stores=[dict(id='main', location=str(store), read_only=False)],
+                    stores=[entry],
                     selections={kind: 'main' for kind in ('surface', 'fiber', 'point_collection', 'umbilicus', 'volume_transform')},
                     volumes=[dict(location=str(root / 'volumes'), tags=[])],
                     normal_grids=[], lasagna_datasets=[], view={})))
@@ -155,7 +162,7 @@ def main():
         finally:
             client.close()
             process.terminate()
-        hosted(root, database, launch, tag, user_surface)
+        hosted(root, database, launch, tag, user_surface, server_binary)
 
 
 def listed_surfaces(client, wanted):
@@ -250,16 +257,21 @@ def render(client, root, *surface_ids):
     print('Render: a bound surface and a registered one render through the store', flush=True)
 
 
-def hosted(root, database, launch, tag, surface):
-    """Two VC3D replicas of one hub exchange edits; a lease held elsewhere blocks editing."""
-    import vc_object_store as vos
-    hub = root / 'share' / 'hub.vcobj'
-    hub.parent.mkdir()
-    with sqlite3.connect(database) as source, sqlite3.connect(hub) as target:
+def hosted(root, database, launch, tag, surface, server_binary):
+    """Two VC3D clients of one vc_object_server exchange fiber and surface edits."""
+    if not server_binary.exists():
+        print(f'Hosted: skipped, no vc_object_server at {server_binary}', flush=True)
+        return
+    shared = root / 'shared.vcobj'
+    with sqlite3.connect(database) as source, sqlite3.connect(shared) as target:
         source.backup(target)
-    vos.hub_init(str(hub), 'curator')
-    for name in ('first', 'second', 'script'):
-        vos.hub_clone(str(hub), str(root / f'{name}.vcobj'), name)
+    server = subprocess.Popen([str(server_binary), str(shared), '--port', '0'], stderr=subprocess.PIPE, text=True)
+    line = server.stderr.readline()
+    port = re.search(r':(\d+)\s*$', line)
+    if not port:
+        server.terminate()
+        raise RuntimeError(f'vc_object_server did not start: {line}')
+    endpoint = f'http://127.0.0.1:{port.group(1)}'
 
     def wait_for_tag(client, wanted):
         """Fiber IDs are per process: find the fiber by tag in this one."""
@@ -270,50 +282,33 @@ def hosted(root, database, launch, tag, surface):
                 if wanted in fiber['tags']:
                     return fiber['fiberId']
             time.sleep(.5)
-        raise RuntimeError(f'{wanted} did not arrive through the hub')
+        raise RuntimeError(f'{wanted} did not arrive through the hosted store')
 
-    first, first_client, fibers = launch(3, root / 'first.vcobj')
-    second = second_client = None
+    first = first_client = second = second_client = None
     try:
-        second, second_client, _ = launch(4, root / 'second.vcobj')
+        first, first_client, fibers = launch(3, endpoint=endpoint)
+        second, second_client, _ = launch(4, endpoint=endpoint)
         first_id = fibers[0]['fiberId']
         first_client.call('fiber.set_tag', {'fiberId': first_id, 'tag': tag + '_first', 'enabled': True})
         second_id = wait_for_tag(second_client, tag + '_first')
         second_client.call('fiber.set_tag', {'fiberId': second_id, 'tag': tag + '_second', 'enabled': True})
         wait_for_tag(first_client, tag + '_second')
-        with ObjectStore.open(str(root / 'script.vcobj'), author='script') as script:
-            script.hub_sync()
-            [uuid] = [fiber['uuid'] for fiber in script.objects_by_kind('fiber') if tag + '_second' in fiber['tags']]
-            deadline = time.monotonic() + 60
-            while True:  # the second replica releases its lease after pushing
-                try:
-                    script.acquire_leases([uuid])
-                    break
-                except RuntimeError:
-                    if time.monotonic() > deadline:
-                        raise
-                    time.sleep(1)
-                    script.hub_sync()
-            try:
-                first_client.call('fiber.set_tag', {'fiberId': first_id, 'tag': tag + '_blocked', 'enabled': True})
-                raise AssertionError('Editing a fiber leased by another replica must fail')
-            except BridgeError as error:
-                assert 'leased to script' in str(error), error
-        # Surfaces travel the same way: a tag set in one replica reaches the other.
+        # Surfaces travel the same way: a tag set in one client reaches the other.
         listed_surfaces(first_client, {surface})
         first_client.call('tags.set', {'segmentId': surface, 'tag': 'reviewed', 'enabled': True}, timeout=120)
         deadline = time.monotonic() + 90
         while 'reviewed' not in listed_surfaces(second_client, {surface})[surface]['tags']:
-            assert time.monotonic() < deadline, 'surface tag did not arrive through the hub'
+            assert time.monotonic() < deadline, 'surface tag did not arrive through the hosted store'
             time.sleep(.5)
-        print('Hosted replicas exchanged fiber and surface edits through the hub; a held lease blocked editing',
-              flush=True)
+        print('Two clients of one hosted store exchanged fiber and surface edits', flush=True)
     finally:
         for client, process in ((first_client, first), (second_client, second)):
             if client:
                 client.close()
             if process:
                 process.terminate()
+        server.terminate()
+        server.wait(timeout=30)
 
 
 if __name__ == '__main__':

@@ -74,7 +74,6 @@ VolumeRegistrationsPanel::VolumeRegistrationsPanel(CState* state, QWidget* paren
     if (_state) {
         connect(_state, &CState::volumeChanged, this, [this]() { refresh(); });
         connect(_state, &CState::objectStoreChanged, this, [this](const vc::objects::StoreSessionEvent& event) {
-            if (event.kind == vc::objects::StoreSessionEvent::Kind::Hub) return;
             if (event.touches({"volume_transform", "volume_transform_choice"})) refresh();
         });
     }

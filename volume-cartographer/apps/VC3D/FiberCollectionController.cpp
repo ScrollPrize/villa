@@ -375,9 +375,6 @@ FiberCollectionController::FiberCollectionController(CState* state, ViewerManage
     options_.showLinked = settings.value("fiberCollections/showLinked", false).toBool();
     options_.sliceDistance = settings.value("fiberCollections/sliceDistance", 3.0).toDouble();
     connect(state_, &CState::objectStoreChanged, this, [this](const vc::objects::StoreSessionEvent& event) {
-        // Sync/lease status is not a data change. Pulled edits arrive through
-        // Committed events; status-only events must preserve warm views/selection.
-        if (event.kind == vc::objects::StoreSessionEvent::Kind::Hub) return;
         if (event.kind == vc::objects::StoreSessionEvent::Kind::Committed &&
             event.attachment != displayedStore()) return;
         if (!event.touches({"fiber", "fiber_branch", "volume_transform", "volume_transform_choice"})) return;

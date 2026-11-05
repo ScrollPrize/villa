@@ -26,8 +26,8 @@ double parseVoxelScale(const std::string& value);
 
 // Surface objects for command-line tools as QuadSurfaces: `--store PATH` with
 // `--surface UUID` inputs and new surface outputs that record their
-// provenance. The store's ToolObjects keeps what was read, decides frames and
-// pins, and waits for the hub (objects().finish()).
+// provenance. The store's ToolObjects keeps what was read and decides frames
+// and pins; objects().finish() drains its writes.
 class StoreSurfaces {
 public:
     StoreSurfaces(const std::filesystem::path& store, const std::string& tool);

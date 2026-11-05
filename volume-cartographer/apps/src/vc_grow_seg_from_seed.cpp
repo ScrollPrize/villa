@@ -201,7 +201,7 @@ static int run_main(int argc, char *argv[])
             ("segment-name", po::value<std::string>(), "Output segment name (uses target-dir directly instead of creating subfolder)")
             ("rng-seed", po::value<unsigned int>(), "Seed every random choice of the run (seed search, expansion order and the offsets GrowPatch "
                                                     "adds to new points), so the same inputs give the same surface. Without it the clock is used.");
-        StoreToolOptions::add(desc, "Object store (local or hosted replica) holding input and output surfaces; "
+        StoreToolOptions::add(desc, "Object store holding input and output surfaces; "
                                     "--surface is the stored surface to resume from or to project",
                               {.surfaces = true, .creates = true});
 

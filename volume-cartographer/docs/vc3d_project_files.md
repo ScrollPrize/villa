@@ -35,7 +35,7 @@ The version 1 document contains:
 
 - `format: "vcproj"`, `version: 1`, and `name`.
 - `stores`: entries with a stable project-local `id`, local `location`, and
-  `read_only` preference. Hosted replicas remain local store references. An
+  `read_only` preference. An
   entry with `"hosted": true` names a `vc_object_server` instead: its
   `location` is the service endpoint (`http://` or `https://`, e.g.
   `http://127.0.0.1:8750` through an SSH tunnel). Stores > Attach Hosted

@@ -165,20 +165,6 @@ void reveal(const QString& location)
 
 } // namespace
 
-QString hubStatusSummary(const vc::objects::HubSessionStatus& status)
-{
-    if (!status.conflicts.empty())
-        return QObject::tr("%n conflict(s)", nullptr, int(status.conflicts.size()));
-    if (!status.error.empty())
-        return QObject::tr("offline (%1)").arg(QString::fromStdString(status.error));
-    if (!status.pending.empty())
-        return QObject::tr("%n pending", nullptr, int(status.pending.size()));
-    if (status.syncedAtUs)
-        return QObject::tr("synced %1").arg(
-            QDateTime::fromMSecsSinceEpoch(*status.syncedAtUs / 1000).toString(QStringLiteral("HH:mm:ss")));
-    return QObject::tr("connecting");
-}
-
 ProjectWorkspace::ProjectWorkspace(CState* state, MenuActionController* menu, QWidget* parent)
     : QWidget(parent), _state(state), _menu(menu)
 {
@@ -315,18 +301,8 @@ ProjectWorkspace::ProjectWorkspace(CState* state, MenuActionController* menu, QW
     addStore->addAction(tr("Attach Store..."), this, [this]() { _menu->attachStore(false); });
     addStore->addAction(tr("Attach Read-only..."), this, [this]() { _menu->attachStore(true); });
     addStore->addAction(tr("Attach Hosted..."), this, [this]() { _menu->attachHostedStore(); });
-    addStore->addAction(tr("Clone Hosted Store..."), this, [this]() { _menu->cloneHostedStore(false); });
     connect(button(tr("Import from Folder..."), page, storeHeader), &QPushButton::clicked, _menu,
             &MenuActionController::importIntoObjectStore);
-    _syncStores = button(tr("Sync Now"), page, storeHeader);
-    _syncStores->setToolTip(tr("Sync every hosted store now."));
-    connect(_syncStores, &QPushButton::clicked, this, [this]() {
-        const auto session = _state->objectStoreSession();
-        std::vector<vc::objects::AttachmentIdentity> stores = _state->attachedStores();
-        for (const auto& store : stores)
-            if (session->hubStatus(store)) session->syncHub(store);
-        emit hubSyncRequested();
-    });
     addGap(storeHeader);
     _revealStore = button(tr("Open Folder"), page, storeHeader);
     connect(_revealStore, &QPushButton::clicked, this, [this]() {
@@ -577,7 +553,6 @@ void ProjectWorkspace::rebuildStores()
         item->setToolTip(StoreName, tr("Store UUID %1").arg(QString::fromStdString(store.storeUuid)));
         QString access = session->writable(store) ? tr("Read-write") : tr("Read-only");
         if (hosted) access += tr(" · hosted");
-        if (const auto hub = session->hubStatus(store)) access += tr(" · hosted, %1").arg(hubStatusSummary(*hub));
         item->setText(StoreAccess, access);
         std::map<std::string, int64_t> counts;
         try {
@@ -839,10 +814,6 @@ void ProjectWorkspace::updateStoreButtons()
     // A hosted store has no folder here and no file to locate.
     _revealStore->setEnabled(store.has_value() && !hostedEntry);
     _replaceStore->setEnabled(_stores->currentItem() && _state->vpkg() && _state->vpkg()->writable() && !hostedEntry);
-    const auto session = _state->objectStoreSession();
-    bool hosted = false;
-    for (const auto& attached : _state->attachedStores()) hosted = hosted || session->hubStatus(attached);
-    _syncStores->setVisible(hosted);
 }
 
 void ProjectWorkspace::updateResourceButtons()

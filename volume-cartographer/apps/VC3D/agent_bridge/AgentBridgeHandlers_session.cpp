@@ -93,7 +93,7 @@ QJsonObject AgentBridgeServer::handleStateGet(const QJsonValue&)
         store[hosted ? "endpoint" : "path"] = QString::fromStdString(session->location(attachment));
         store["storeUuid"] = QString::fromStdString(attachment.storeUuid);
         store["writable"] = session->writable(attachment);
-        store["hosted"] = hosted || session->hubStatus(attachment).has_value();
+        store["hosted"] = hosted;
         return store;
     };
     if (const auto project = state->vpkg()) {

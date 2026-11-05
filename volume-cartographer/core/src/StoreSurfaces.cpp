@@ -49,7 +49,6 @@ std::string StoreSurfaces::create(QuadSurface& surface, const std::string& name,
     request.expectedObjects = {{uuid, std::nullopt}};
     request.operations = create_quad_operations(uuid, surface, name, tags, coordinates, {objects_.tool(), parameters, sources});
     session->submit(objects_.attachment(), request);
-    objects_.wrote();
     surface.id = uuid;
     return uuid;
 }
@@ -71,7 +70,6 @@ int64_t StoreSurfaces::update(const std::string& uuid, QuadSurface& surface)
     });
     if (request.operations.empty()) return pin.version;
     const auto receipt = session->submit(objects_.attachment(), request);
-    objects_.wrote();
     return *receipt.objects.at(canonical);
 }
 

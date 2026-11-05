@@ -54,7 +54,7 @@ bool SegmentationModule::beginEditingSession(std::shared_ptr<QuadSurface> surfac
     try {
         if (!_state->objectStoreSession()->writable(storeEdit->pin().attachment))
             throw std::runtime_error("The object store is attached read-only");
-        _editLease = _state->objectStoreSession()->holdForEditing(storeEdit->pin());
+        _state->objectStoreSession()->requireCurrent(storeEdit->pin());
     } catch (const std::exception& error) {
         emit statusMessageRequested(tr("This surface cannot be edited now: %1").arg(QString::fromUtf8(error.what())),
                                     kStatusLong);
@@ -146,7 +146,6 @@ void SegmentationModule::endEditingSession()
     _saveSnapshot.reset();
     _pendingAutosaveVertexUpdates.clear();
     _pendingAutosaveVertexUpdateIndex.clear();
-    _editLease = {};
     updateAutosaveState();
 }
 

@@ -141,7 +141,7 @@ int main(int argc, char** argv)
         {
             auto edited = catalog.open(native);
             SurfaceStoreEdit edit(session, edited.pin);
-            auto lease = session->holdForEditing(edited.pin);
+            session->requireCurrent(edited.pin);
             auto& grid = *edited.surface->rawPointsPtr();
             grid(1, 1) = {5.f, 5.f, 5.f};
             edit.save(*edited.surface, cv::Rect(1, 1, 1, 1));
@@ -166,9 +166,8 @@ int main(int argc, char** argv)
             QuadSurface larger(grown, {1.f, 1.f});
             edit.save(larger, cv::Rect(0, 0, 3, 4));
             require(catalog.open(native).surface->rawPointsPtr()->size() == cv::Size(3, 4), "growth replaces the stored grid");
-            lease = {};
             bool stale = false;
-            try { session->holdForEditing(edited.pin); } catch (const std::exception&) { stale = true; }
+            try { session->requireCurrent(edited.pin); } catch (const std::exception&) { stale = true; }
             require(stale, "an edit from a superseded pin is refused");
         }
 

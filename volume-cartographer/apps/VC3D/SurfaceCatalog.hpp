@@ -128,7 +128,7 @@ public:
         const std::vector<std::array<double, 3>>& points, double tolerance);
 
     // Where tools launched for the open volume read and write: the user's store
-    // file (a hosted replica's local file) and the open volume's voxels
+    // file and the open volume's voxels
     // (--volume-uuid, --voxel-scale). Throws without a writable attachment and
     // an open volume.
     struct ToolStore {

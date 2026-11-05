@@ -78,8 +78,8 @@ Unless noted otherwise, paths are relative to `apps/VC3D`.
 1. **Begin** – `SegmentationModule::beginEditingSession` primes the edit manager
    with the base surface, updates overlay parameters, and republishes that same
    surface through the shared collection so viewers refresh immediately. The
-   surface's `SurfaceStoreEdit` holds the object for editing (a lease in a
-   hosted store); a read-only store or a stale pin refuses the session.
+   surface's `SurfaceStoreEdit` pins the version being edited
+   (`requireCurrent`); a read-only store or a stale pin refuses the session.
 2. **Edit** – All vertex mutations occur directly on the base surface while the
    module keeps `_originalPoints` as the reset snapshot. The module
    continuously mirrors dirty state back to the widget so the UI can flag

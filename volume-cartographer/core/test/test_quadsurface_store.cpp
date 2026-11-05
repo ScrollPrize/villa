@@ -7,7 +7,6 @@
 
 #include "vc/core/util/QuadSurface.hpp"
 #include "vc/core/util/StoreSurfaces.hpp"
-#include <vc_object_store/objects/Hub.hpp>
 #include <vc_object_store/store/GeometryViews.hpp>
 #include <vc_object_store/objects/StoreReader.hpp>
 #include <vc_object_store/objects/TransactionJson.hpp>
@@ -299,11 +298,11 @@ TEST_CASE("Tools read surfaces in a bound volume's voxels and write back only st
     fs::remove_all(dir, ignored);
 }
 
-TEST_CASE("Tools create surfaces with provenance and push them to a hub")
+TEST_CASE("Tools create surfaces with provenance that other clients read")
 {
     const fs::path dir = fs::temp_directory_path() / ("vc-store-surfaces-" + util::newUuid());
-    fs::create_directories(dir / "share");
-    const auto hub = dir / "share" / "hub.vcobj";
+    fs::create_directories(dir);
+    const auto path = dir / "objects.vcobj";
     OpenOptions options; options.author = "curator";
     cv::Mat_<cv::Vec3f> points(3, 3);
     for (int r = 0; r < 3; ++r)
@@ -311,7 +310,7 @@ TEST_CASE("Tools create surfaces with provenance and push them to a hub")
     QuadSurface seed(points, {1.f, 1.f});
     const auto source = util::newUuid();
     {
-        auto store = ObjectStore::create(hub, options);
+        auto store = ObjectStore::create(path, options);
         auto txn = store.write();
         ObjectRecord record; record.uuid = source; record.kind = "surface";
         record.meta = R"({"coordinates":{"volume_uuid":"vol","scale_factor":1}})";
@@ -319,23 +318,19 @@ TEST_CASE("Tools create surfaces with provenance and push them to a hub")
         store.putGeometry(txn, source, quad_surface_geometry(seed));
         txn.commit();
     }
-    initHub(hub, "curator");
-    cloneHub(hub, dir / "tool.vcobj", options);
-    cloneHub(hub, dir / "viewer.vcobj", options);
 
     std::string created;
     {
-        StoreSurfaces surfaces(dir / "tool.vcobj", "vc_test_tool");
+        StoreSurfaces surfaces(path, "vc_test_tool");
         auto input = surfaces.load(source);
         CHECK(input->id == source);
         (*input->rawPointsPtr())(1, 1)[2] = 5.f;
         created = surfaces.create(*input, "grown", nlohmann::json{{"steps", 3}}, {source}, {"paths"});
         CHECK(input->id == created);
-        CHECK(fs::is_directory(surfaces.objects().session()->artifactDirectory(surfaces.objects().attachment(), created)));
         surfaces.objects().finish();
     }
-    auto viewer = ObjectStore::open(dir / "viewer.vcobj", options);
-    hubPull(viewer);
+    OpenOptions readOnly; readOnly.readOnly = true;
+    auto viewer = ObjectStore::open(path, readOnly);
     auto txn = viewer.read();
     const auto object = viewer.objectByUuid(txn, created);
     REQUIRE(object.has_value());

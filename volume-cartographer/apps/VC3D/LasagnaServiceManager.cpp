@@ -813,9 +813,9 @@ void LasagnaServiceManager::startOptimization(const QJsonObject& config)
         requestConfig[QStringLiteral("source")] = source;
     }
 
-    // The job reads the surfaces' current revisions from the store: an
-    // external service sees them once this replica has pushed its edits.
-    afterStoreSync([this, requestConfig]() { postOptimizationRequest(requestConfig); });
+    // The job reads the surfaces' current versions from the store, where
+    // every save is committed before it returns.
+    postOptimizationRequest(requestConfig);
 }
 
 QString LasagnaServiceManager::storeError() const
@@ -825,42 +825,12 @@ QString LasagnaServiceManager::storeError() const
     }
     if (_isExternal && _serviceStoreUuid != QString::fromStdString(_storeAttachment->storeUuid)) {
         return _serviceStoreUuid.isEmpty()
-            ? tr("The Lasagna service at %1:%2 has no object store; start it with --store on a replica of "
-                 "this hub.").arg(_host).arg(_port)
+            ? tr("The Lasagna service at %1:%2 has no object store; start it with --store on the attached "
+                 "store.").arg(_host).arg(_port)
             : tr("The Lasagna service at %1:%2 works on store %3, not the attached store; attach the same "
-                 "hosted store.").arg(_host).arg(_port).arg(_serviceStoreUuid);
+                 "store.").arg(_host).arg(_port).arg(_serviceStoreUuid);
     }
     return {};
-}
-
-void LasagnaServiceManager::afterStoreSync(std::function<void()> then)
-{
-    const auto session = _storeSession.lock();
-    if (!_isExternal || !session || !session->hubStatus(*_storeAttachment)) {
-        then();
-        return;
-    }
-    // The remote service reads the hub: wait off the GUI thread for a sync started now.
-    const quint64 generation = _requestGeneration;
-    vc3d::store::background<std::optional<vc::objects::HubSessionStatus>>(this,
-        [session, attachment = *_storeAttachment] { return session->syncHubAndWait(attachment, std::chrono::seconds(60)); },
-        [this, generation, then](vc3d::store::Outcome<std::optional<vc::objects::HubSessionStatus>> result) {
-            if (generation != _requestGeneration || !_storeAttachment) return;
-            const auto& status = result.value;
-            QString error;
-            if (!result.error.isEmpty())
-                error = tr("The object store did not sync with its hub: %1").arg(result.error);
-            else if (!status)
-                error = tr("The object store was detached.");
-            else if (!status->conflicts.empty())
-                error = tr("Resolve the object store's hub conflicts before running Lasagna.");
-            else if (!status->error.empty())
-                error = tr("The object store did not sync with its hub: %1").arg(QString::fromStdString(status->error));
-            if (error.isEmpty())
-                then();
-            else
-                emit optimizationError(error);
-        });
 }
 
 void LasagnaServiceManager::setObjectStore(std::shared_ptr<vc::objects::ObjectStoreSession> session,
@@ -1237,10 +1207,6 @@ void LasagnaServiceManager::handleJobsReply(QNetworkReply* reply)
             QStringList surfaces;
             for (const QJsonValue& surface : obj[QStringLiteral("output_surfaces")].toArray()) {
                 surfaces.append(surface.toString());
-            }
-            // An external service pushed them to the hub: pull them now.
-            if (const auto session = _storeSession.lock(); _isExternal && session && _storeAttachment) {
-                session->syncHub(*_storeAttachment);
             }
             emit jobFinished(jobId, surfaces);
             emit optimizationFinished(surfaces);

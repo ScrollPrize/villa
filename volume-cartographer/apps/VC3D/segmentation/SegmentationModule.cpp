@@ -606,7 +606,6 @@ void SegmentationModule::onActiveSegmentChanged(QuadSurface* newSurface)
     // The previous surface's pending saves are done: its store edit ends here.
     if (_storeEdit && (!newSurface || newSurface->id != _storeEdit->uuid())) {
         _storeEdit.reset();
-        _editLease = {};
     }
     if (_pointCollection) {
         loadCorrections(newSurface);

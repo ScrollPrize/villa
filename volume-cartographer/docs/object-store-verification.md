@@ -53,9 +53,9 @@ store, edits persist before Save, external journal updates are observed, and
 edits survive a fresh VC3D process. For surfaces it lists a project surface
 beside an Open Data catalog surface; activation, tags, rename and review commit
 to the store; cropping commits a child geometry revision; the catalog surface is
-edited, renamed and tagged in place. Two hosted replicas, each opened as the
-project, exchange fiber and surface edits through a hub, and a lease held
-elsewhere blocks editing. Supplying `--database PATH` instead runs against a
+edited, renamed and tagged in place. Two VC3D clients of one `vc_object_server`
+(found beside `--vc3d`, or `--object-server PATH`), each opening it as the
+project, exchange fiber and surface edits. Supplying `--database PATH` instead runs against a
 disposable backup of a current database.
 
 Regression tests also cover advisory-coordinate differences during merge, the

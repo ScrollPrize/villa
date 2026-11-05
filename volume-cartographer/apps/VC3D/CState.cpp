@@ -275,9 +275,7 @@ CState::CState(QObject* parent, CState* objectStoreOwner, std::size_t cacheBytes
     connect(this, &CState::objectStoreChanged, this, [this](const vc::objects::StoreSessionEvent& event) {
         // The umbilicus is read through the store's volume mapping, so a
         // registration change moves it too.
-        if (event.kind == vc::objects::StoreSessionEvent::Kind::Hub ||
-            !event.touches({"umbilicus", "volume_transform", "volume_transform_choice"}))
-            return;
+        if (!event.touches({"umbilicus", "volume_transform", "volume_transform_choice"})) return;
         emit umbilicusChanged();
     });
 }

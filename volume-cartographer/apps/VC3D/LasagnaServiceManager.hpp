@@ -24,14 +24,13 @@ class QNetworkReply;
  *
  * Supports two modes:
  *   - Internal: launches fit_service.py as a subprocess on the attached
- *     object store's file (--store --shared-store; this process's session
- *     syncs it)
+ *     object store's file (--store --shared-store)
  *   - External: connects to a pre-started service on a known host:port; it
- *     must work on the same store (a replica of the same hub)
+ *     must work on the same store
  *
  * Jobs read stored surfaces by UUID and create their results as new surfaces
- * in the store (results attached to them, the model checkpoint in their
- * artifact directory); nothing travels as files.
+ * in the store (results attached to them, the model checkpoint among their
+ * artifacts); nothing travels as files.
  *
  * The service is kept alive so repeated optimizations avoid
  * Python/torch startup overhead.
@@ -164,9 +163,6 @@ private:
     void handleOptimizeReply(QNetworkReply* reply);
     bool validateApiVersion(QNetworkReply* reply, const QString& context);
     void postOptimizationRequest(const QJsonObject& requestConfig);
-    /** Run `then` once the store's hub has this replica's edits (an external
-     *  service reads the hub); right away for the internal service. */
-    void afterStoreSync(std::function<void()> then);
     QString storeError() const;
     void updateCachedJobFromStatus(const QJsonObject& status);
 

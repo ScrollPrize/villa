@@ -354,7 +354,13 @@ TEST_CASE("flatboi flattens a stored surface and a tifxyz directory alike")
     CHECK(meta.at("provenance").at("tool") == "flatboi");
     CHECK(meta.at("provenance").at("sources") == nlohmann::json::array({f.uuid}));
     CHECK(meta.at("coordinates").at("volume_uuid") == "vol");
-    CHECK(fs::is_regular_file(fs::path(f.store.string() + ".artifacts") / uuid / "slim_energies_flatboi.txt"));
+    // Its reports are published as the new surface's artifacts.
+    {
+        ObjectStoreSession session;
+        OpenOptions readOnly; readOnly.readOnly = true;
+        const auto files = session.artifacts(session.attach(f.store, readOnly), uuid);
+        CHECK(std::any_of(files.begin(), files.end(), [](const auto& file) { return file.name == "flatboi/slim_energies_flatboi.txt"; }));
+    }
 
     // Decimated: SLIM on every other row and column, UVs lifted to the full grid.
     CHECK(load_quad_from_store(vc::objects::LocalStoreReader(db, txn), coarse)->countValidPoints() > 0);

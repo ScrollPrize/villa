@@ -972,17 +972,6 @@ CWindow::CWindow(size_t cacheSizeGB) :
     _persistentCacheLowSpaceLabel->hide();
     statusBar()->addPermanentWidget(_persistentCacheLowSpaceLabel);
 
-    _hubStatusLabel = new QLabel(this);
-    _hubStatusLabel->setContentsMargins(8, 0, 8, 0);
-    _hubStatusLabel->setToolTip(tr("Sync state of the attached hosted object store replica"));
-    _hubStatusLabel->hide();
-    statusBar()->addPermanentWidget(_hubStatusLabel);
-    connect(_state, &CState::storeRoutesChanged, this, &CWindow::updateHubStatus);
-    connect(_state, &CState::objectStoreChanged, this, [this](const vc::objects::StoreSessionEvent& event) {
-        using Kind = vc::objects::StoreSessionEvent::Kind;
-        if (event.kind != Kind::Committed && event.kind != Kind::Draft) updateHubStatus();
-    });
-
     // Hosted stores: what this client knows of each, from its last status check.
     _hostedStatusLabel = new QLabel(this);
     _hostedStatusLabel->setObjectName(QStringLiteral("hostedStoreStatusLabel"));
@@ -1154,7 +1143,6 @@ CWindow::CWindow(size_t cacheSizeGB) :
     const int projectIndex = _workspaceTabs->addTab(_projectWorkspace, tr("Project"));
     if (auto* tabBar = _workspaceTabs->tabBar()) tabBar->setTabButton(projectIndex, QTabBar::RightSide, nullptr);
     connect(_projectWorkspace, &ProjectWorkspace::projectRenamed, this, &CWindow::updateProjectNameLabel);
-    connect(_projectWorkspace, &ProjectWorkspace::hubSyncRequested, this, &CWindow::promptHubConflicts);
     connect(_projectWorkspace, &ProjectWorkspace::volumeActivationRequested, this, [this](const QString& volumeId) {
         const auto vpkg = _state->vpkg();
         std::shared_ptr<Volume> volume;
@@ -2735,7 +2723,7 @@ void CWindow::CreateWidgets(void)
             _storeSurfaceOverlay.get(), &StoreSurfaceOverlayController::setSurfaces);
     connect(_surfacePanel.get(), &SurfacePanelController::highlightedSurfacesChanged,
             _storeSurfaceOverlay.get(), &StoreSurfaceOverlayController::setHighlighted);
-    // Another replica, tool or service changed the open surface: reopen it, unless
+    // Another client, tool or service changed the open surface: reopen it, unless
     // it is being edited (its edits continue from their own revisions).
     connect(_surfaceCatalog.get(), &SurfaceCatalog::surfacesCommitted, this, [this](const std::vector<std::string>& uuids) {
         const auto active = _state->activeSurface().lock();
@@ -5645,31 +5633,6 @@ std::vector<vc::objects::AttachmentIdentity> openStores(const CState& state)
 }
 }
 
-void CWindow::updateHubStatus()
-{
-    const auto session = _state->objectStoreSession();
-    QStringList texts;
-    std::vector<std::string> conflicts;
-    for (const auto& attachment : openStores(*_state)) {
-        const auto status = session->hubStatus(attachment);
-        if (!status) continue;
-        texts << tr("%1 Hub: %2").arg(QString::fromStdString(session->path(attachment).stem().string()),
-                                       hubStatusSummary(*status));
-        for (const auto& conflict : status->conflicts) conflicts.push_back(conflict.uuid);
-    }
-    if (texts.isEmpty()) {
-        _hubStatusLabel->hide();
-        _hubPromptedConflicts.clear();
-        return;
-    }
-    _hubStatusLabel->setText(texts.join(QStringLiteral("  ")));
-    _hubStatusLabel->show();
-    // Ask about a set of conflicts once; Sync Now asks again.
-    if (conflicts.empty() || conflicts == _hubPromptedConflicts) return;
-    _hubPromptedConflicts = conflicts;
-    promptHubConflicts();
-}
-
 void CWindow::updateHostedStatus()
 {
     const auto session = _state->objectStoreSession();
@@ -5715,26 +5678,3 @@ void CWindow::updateHostedStatus()
     _hostedStatusLabel->show();
 }
 
-void CWindow::promptHubConflicts()
-{
-    const auto session = _state->objectStoreSession();
-    for (const auto& attachment : openStores(*_state)) {
-        const auto status = session->hubStatus(attachment);
-        if (!status || status->conflicts.empty()) continue;
-        QStringList uuids;
-        for (const auto& conflict : status->conflicts) uuids << QString::fromStdString(conflict.uuid);
-        QMessageBox box(QMessageBox::Warning, tr("Hosted object store conflict"),
-            tr("%n record(s) of %1 changed both here and on the hub:", nullptr, int(uuids.size()))
-                .arg(QString::fromStdString(session->path(attachment).filename().string())) +
-                QStringLiteral("\n") + uuids.mid(0, 10).join(QStringLiteral("\n")) +
-                (uuids.size() > 10 ? QStringLiteral("\n...") : QString()) +
-                tr("\n\nUse the hub's versions (discarding your changes to them), or keep yours and publish them?"),
-            QMessageBox::NoButton, this);
-        auto* useHub = box.addButton(tr("Use Hub Versions"), QMessageBox::DestructiveRole);
-        auto* keepMine = box.addButton(tr("Keep Mine"), QMessageBox::AcceptRole);
-        box.addButton(tr("Later"), QMessageBox::RejectRole);
-        box.exec();
-        if (box.clickedButton() == useHub) session->resolveHubConflicts(attachment, "hub");
-        else if (box.clickedButton() == keepMine) session->resolveHubConflicts(attachment, "local");
-    }
-}

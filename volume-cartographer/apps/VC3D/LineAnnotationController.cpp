@@ -247,8 +247,6 @@ struct LineAnnotationController::LineAnnotationSession {
     std::string fiberUuid = vc::objects::util::newUuid();
     std::optional<vc::objects::PinnedObject> storePin;
     std::optional<vc::objects::PinnedObject> runningStorePin;
-    // A hosted replica keeps the fiber leased while it is open for editing.
-    vc::objects::LeaseHold editingLeases;
     std::string fiberUsername;
     std::string fiberStartedAt;
     uint64_t fiberSequence = 0;
@@ -1605,9 +1603,6 @@ LineAnnotationController::LineAnnotationController(CState* state,
     _lineSolvePool.setThreadPriority(QThread::LowPriority);
     if (_state) {
         connect(_state, &CState::objectStoreChanged, this, [this](const vc::objects::StoreSessionEvent& event) {
-            // Hub status alone changes no fiber revisions or geometry. Actual
-            // pulled edits are observed separately as Committed events.
-            if (event.kind == vc::objects::StoreSessionEvent::Kind::Hub) return;
             if (event.kind == vc::objects::StoreSessionEvent::Kind::Attached || event.kind == vc::objects::StoreSessionEvent::Kind::Detached) {
                 onVolumePackageChanged({});
                 return;
@@ -2155,17 +2150,6 @@ bool LineAnnotationController::enableSessionEditing(const std::string& surfaceNa
         showError(tr("This fiber cannot be edited: the object store is attached read-only or the fiber does not decode."),
                   session->suppressErrorDialogs);
         return false;
-    }
-    // A hosted replica edits only fibers it leases.
-    const auto connection = _state ? _state->objectStoreSession() : nullptr;
-    if (connection && session->storePin && session->storePin->stored()) {
-        try {
-            session->editingLeases = connection->holdForEditing(*session->storePin);
-        } catch (const std::exception& error) {
-            showError(tr("This fiber cannot be edited now: %1").arg(QString::fromUtf8(error.what())),
-                      session->suppressErrorDialogs);
-            return false;
-        }
     }
     // Editing starts from the revision on screen; a newer one reopens the view.
     const auto stored = readStoredFiber(session->fiberId);
