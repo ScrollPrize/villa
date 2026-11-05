@@ -430,8 +430,6 @@ def run_store(pipeline, params):
     transform["fixed_volume"] = transform["fixed_volume"].rstrip("/").rsplit("/", 1)[-1]
     pipeline.record.write(rec.TRANSFORM, transform)
     pipeline.record.write(rec.FIT, fit | scores | {"code": stamp.get("code")})
-    if pipeline.work("fit", "points.json").exists():
-        shutil.copy(pipeline.work("fit", "points.json"), pipeline.record.path("fit/points.json"))
     return [rec.TRANSFORM, rec.FIT]
 
 
