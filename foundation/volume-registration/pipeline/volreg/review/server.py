@@ -19,6 +19,7 @@ migrated records, say, which have no pipeline to drive.
     GET  /api/pairs                           the pairs, their stages and what waits
     GET  /api/pairs/<pair>/holdout[?unit=octants&reveal=1]
     GET  /api/pairs/<pair>/blind
+    GET  /api/pairs/<pair>/viewer?id=<unit>   a Neuroglancer link to a hold-out unit
     GET  /img/<pair>/<path>                   a stored picture, under work/images
     POST /api/pairs/<pair>/run                start every stage that can run
     POST /api/pairs/<pair>/redo               {"stage": ...}
@@ -41,6 +42,7 @@ from .. import cli
 from .. import engine
 from .. import record as rec
 from .. import stages as pipeline_stages
+from . import viewer
 
 HERE = Path(__file__).resolve().parent
 PAGES = {"": "index.html", "holdout": "holdout.html", "blind": "blind.html"}
@@ -216,6 +218,12 @@ class Reviews:
                 "scores": json.loads(scores.read_text()) if scores.exists() and (done or reveal)
                 else None,
                 "score_stale": pipeline.states()["score"] != engine.DONE}
+
+    def viewer(self, name, unit):
+        """Both volumes overlaid in Neuroglancer where a hold-out unit sits."""
+        pipeline = self.pipeline(name)
+        session = pipeline_stages.fs.Session.load(pipeline.work(pipeline_stages.SESSION))
+        return {"url": viewer.unit_link(session, pipeline.record.read(rec.HOLDOUT), unit)}
 
     def answer(self, name, unit, answer):
         """Record an answer, then start what it made ready: scoring, once enough line up."""
@@ -412,6 +420,8 @@ def handler_for(reviews):
                 elif parts[:2] == ["api", "pairs"] and len(parts) == 4 and parts[3] == "holdout":
                     self.send_json(reviews.holdout(parts[2], octants,
                                                    query.get("reveal", ["0"])[0] == "1"))
+                elif parts[:2] == ["api", "pairs"] and len(parts) == 4 and parts[3] == "viewer":
+                    self.send_json(reviews.viewer(parts[2], query["id"][0]))
                 elif parts[:2] == ["api", "pairs"] and len(parts) == 4 and parts[3] == "blind":
                     self.send_json(reviews.blind(parts[2]))
                 elif parts[0] == "img" and len(parts) >= 3:

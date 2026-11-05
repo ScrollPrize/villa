@@ -31,6 +31,7 @@ tr { cursor: pointer; } tr.sel td { background: color-mix(in srgb, var(--select)
   <h1 id="title">Hold-out set</h1>
   <span id="count" class="muted"></span>
   <button id="undo" disabled title="Take back your last answer and go back to that patch">Undo <kbd>u</kbd></button>
+  <button id="viewer" title="Both whole volumes overlaid where this patch sits, in Neuroglancer">Neuroglancer <kbd>g</kbd></button>
   <button id="reveal" title="Show how the fit scores on the answers so far">Show result</button>
   <a id="other-unit"></a>
   <span id="error"></span>
@@ -46,7 +47,7 @@ tr { cursor: pointer; } tr.sel td { background: color-mix(in srgb, var(--select)
     <textarea id="note" rows="2"
       placeholder="note: what you see in this patch (n to write, Esc or leaving the field saves)"></textarea>
     <p class="muted"><kbd>1</kbd>–<kbd>5</kbd> answer and next · <kbd>space</kbd> flip ·
-      <kbd>m</kbd> mode · <kbd>n</kbd> note · <kbd>u</kbd> undo. No fit is shown here: the patch is drawn
+      <kbd>m</kbd> mode · <kbd>n</kbd> note · <kbd>u</kbd> undo · <kbd>g</kbd> Neuroglancer. No fit is shown here: the patch is drawn
       through the transform it was measured under, moved to its own measurement.</p>
   </section>
   <section>
@@ -181,7 +182,17 @@ document.addEventListener("keydown", e => {
   else if (e.key === " ") { e.preventDefault(); if (mode !== "flip") mode = "flip"; flipped = !flipped; render(); }
   else if (e.key === "m") { mode = MODES[(MODES.indexOf(mode) + 1) % MODES.length]; render(); }
   else if (e.key === "u") undo();
+  else if (e.key === "g") openViewer();
 });
+
+// The tab is opened before the link is asked for, so a popup blocker lets it through.
+async function openViewer() {
+  if (!current) return;
+  const tab = window.open("", "_blank");
+  try { tab.location = (await call(`${API}/viewer?id=${encodeURIComponent(current)}`)).url; }
+  catch (e) { tab.close(); $("error").textContent = e.message; }
+}
+$("viewer").onclick = openViewer;
 $("undo").onclick = undo;
 $("note").onblur = saveNote;
 $("reveal").onclick = async () => { reveal = true; await load(); };
