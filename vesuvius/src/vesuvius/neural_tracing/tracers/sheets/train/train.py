@@ -352,14 +352,27 @@ def main(argv=None):
         train_cfg = copy.deepcopy(cfg)
         train_cfg.data.history += tc.history_rows
     train_sampler = EpisodeSampler(train_cfg.data, index, 'train', d.steps, d.roi, pad)
-    val_sampler = EpisodeSampler(d, index, 'val', d.steps, d.roi, pad)
-    train_spec, spec = train_sampler.spec, val_sampler.spec
+    validating = tc.val_episodes > 0  # train.val_episodes=0: no in-run validation, no best.pt, no final eval
+    train_spec, spec = train_sampler.spec, None
     print(f'{len(train_sampler.index)} usable patches; GT grid {train_spec.Gu}x{train_spec.Gv}; '
           f'blocks within {d.roi} vx at level {d.volume_level}', flush=True)
+    no_val_hint = ('A small patch set may have no episode block wholly inside val cells: raise data.val_fraction or '
+                   'lower data.split_block, or set train.val_episodes=0 to train without validation (last.pt only).')
+    if validating:
+        try:
+            val_sampler = EpisodeSampler(d, index, 'val', d.steps, d.roi, pad)
+        except ValueError as e:
+            raise ValueError(f'{e}. {no_val_hint}') from e
+        spec = val_sampler.spec
+    else:
+        print('train.val_episodes=0: no validation, best.pt or final eval; last.pt is the result', flush=True)
     val_set = None  # only rank 0 validates
-    if main_rank:
+    if main_rank and validating:
         t0 = time.time()
-        val_set = fixed_episodes(val_sampler, tc.val_episodes, tc.seed)
+        try:
+            val_set = fixed_episodes(val_sampler, tc.val_episodes, tc.seed)
+        except RuntimeError as e:
+            raise RuntimeError(f'{e} (split_block {d.split_block}, val_fraction {d.val_fraction}). {no_val_hint}') from e
         print(f'{len(val_set)} validation episodes in {time.time()-t0:.1f} s', flush=True)
     jobs = None
     if tc.live_chains:  # the workers serve live-chain continuations as whole batches
@@ -517,7 +530,7 @@ def main(argv=None):
                                 f"conf {row['confident']:.2f} prec {row['conf_precision']:.2f} "
                                 f"caught {row['off_caught']:.2f} "
                                 f"{row['episodes_per_s']:.0f} ep/s data {row['data_fraction']:.0%}")
-        if main_rank and (done % tc.val_every == 0 or done == tc.iterations):
+        if main_rank and validating and (done % tc.val_every == 0 or done == tc.iterations):
             summary = validate(done)
             tqdm.write(f"[{done}] val score {summary['score_mean']:.3f} coverage {summary['coverage_mean']:.3f} "
                        f"kept_off {summary['kept_off_mean']:.3f} caught {summary['caught_mean']:.3f} "
@@ -534,7 +547,7 @@ def main(argv=None):
         if tc.max_minutes and minutes() > tc.max_minutes:  # the same decision on every process (rank 0's clock)
             if main_rank:
                 tqdm.write(f'time budget reached at iteration {done}')
-            if main_rank and done % tc.val_every:
+            if main_rank and validating and done % tc.val_every:
                 summary = validate(done)
                 if summary['score_mean'] > best:
                     best = summary['score_mean']
@@ -547,7 +560,7 @@ def main(argv=None):
         return
     save(run/'last.pt', model, opt, cfg, it+1, best, elapsed_minutes(), ema)
     training_figure(log_rows, run/'training.png')
-    if cfg.eval.after_training:
+    if cfg.eval.after_training and validating:
         final_eval(cfg, run, device)
 
 
