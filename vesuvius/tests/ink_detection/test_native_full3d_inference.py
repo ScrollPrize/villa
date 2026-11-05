@@ -373,7 +373,11 @@ def test_native_dataset_normalizes_only_valid_voxels_and_builds_surface_channel(
     assert restored._coarse_positions is None
 
 
-def test_native_dataset_batch_reads_match_single_reads(monkeypatch):
+@pytest.mark.parametrize("mode", ["full_3d", "full_3d_single_wrap"])
+@pytest.mark.parametrize(
+    "normalization", ["none", "minmax", "robust_mad", {"mode": "divide", "divisor": 7}]
+)
+def test_native_dataset_batch_reads_match_single_reads(monkeypatch, normalization, mode):
     from vesuvius.ink_detection.config import NormalizationConfig
 
     class CountingVolume:
@@ -387,17 +391,26 @@ def test_native_dataset_batch_reads_match_single_reads(monkeypatch):
             self.reads += 1
             return self.values[key]
 
+        def read_regions(self, regions, out):
+            self.reads += 1
+            for (start, size), destination in zip(regions, out):
+                selection = tuple(slice(a, a + n) for a, n in zip(start, size))
+                destination[...] = self.values[selection]
+            return out
+
     rng = np.random.default_rng(0)
     volume = CountingVolume(rng.integers(0, 256, (20, 24, 28), dtype=np.uint8))
     monkeypatch.setattr(
         native, "_open_shared_volume", lambda *args, **kwargs: volume
     )
+    monkeypatch.setattr(
+        native.NativePatchDataset, "_surface_mask",
+        lambda self, bbox: np.full(self.patch_size_zyx, bbox[0], dtype=np.float32),
+    )
     config = SimpleNamespace(
         data=SimpleNamespace(
-            mode="full_3d",
-            normalization=NormalizationConfig.from_value(
-                {"mode": "divide", "divisor": 7}
-            ),
+            mode=mode,
+            normalization=NormalizationConfig.from_value(normalization),
         )
     )
     patches = native.build_patch_plan_for_chunks(
@@ -420,11 +433,16 @@ def test_native_dataset_batch_reads_match_single_reads(monkeypatch):
     single = [dataset[index] for index in indices]
     volume.reads = 0
     batched = dataset.__getitems__(indices)
-    assert 0 < volume.reads < len(patches)
+    assert volume.reads == 1
     assert len(batched) == len(single)
     for (image, metadata), (expected, expected_metadata) in zip(batched, single):
         assert torch.equal(metadata, expected_metadata)
         assert torch.equal(image, expected)
+    assert dataset.__getitems__([]) == []
+    reordered = [len(patches) - 1, 2, 0, 2]
+    for actual, index in zip(dataset.__getitems__(reordered), reordered):
+        assert torch.equal(actual[0], single[index][0])
+        assert torch.equal(actual[1], single[index][1])
     loader = torch.utils.data.DataLoader(dataset, batch_size=5)
     images = torch.cat([batch[0] for batch in loader])
     assert torch.equal(images, torch.stack([image for image, _ in single]))
@@ -602,7 +620,11 @@ def test_injected_command_runtime_writes_then_builds_all_levels(tmp_path, monkey
             volume_cache_max_gb=120.0,
         )
     )
-    volume = np.zeros((2, 2, 2), dtype=np.uint8)
+    from vc_reader.reader import ZarrReader, ZarrWriter
+
+    volume_path = tmp_path / "input.zarr"
+    ZarrWriter.create(volume_path, shape=(2, 2, 2), chunks=(2, 2, 2), dtype="uint8")
+    volume = ZarrReader.open(volume_path)
     monkeypatch.setattr(
         native,
         "_plan_from_args",
