@@ -208,7 +208,8 @@ def run_fit(pipeline, params):
     Two settings a pair may carry in `params.json`, off unless set: `at_most`, a seeded
     random choice of that many fit patches when there are more (a session imported from
     the first runs can hold 500, and the bend's cost grows with the cube of its points);
-    `octants` 0, one point per patch and never its octants."""
+    `octants` 0, one point per patch and never its octants; `unit` "octants", every octant
+    that measured well as a point (the fit otherwise keeps its last fit's unit)."""
     with session_lock(pipeline):
         session = open_session(pipeline)
         fit_patches = sorted(patch["id"] for patch in session.state["patches"]
@@ -225,8 +226,8 @@ def run_fit(pipeline, params):
         octants = bool(params.get("octants", 1))
         for _ in range(params["passes"]):
             session.correlate(skip_test=True, among=among)
-            session.fit("patches", "gate", unit=None if octants else "patches", among=among,
-                        octants=octants)
+            session.fit("patches", "gate", unit=params.get("unit") if octants else "patches",
+                        among=among, octants=octants)
         record = session.fit_record()
         transform = json.loads((session.directory / record["transform"]).read_text())
     out = pipeline.work("fit")
