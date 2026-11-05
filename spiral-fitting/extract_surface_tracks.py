@@ -222,6 +222,11 @@ def extract_horizontal(predictions_zarr_array, tracks_db):
         z_chunk_max = min(z_chunk_min + z_chunk_depth_h, z_max, z_limit)
         if z_chunk_max <= z_chunk_min:
             continue
+        if z_chunk_max - z_chunk_min < downsample_factor:
+            # The last ribbon, clipped at z_max or the volume end, is thinner than one max-pool
+            # cell: downsample_maxpool would crop it to nothing, so it has no tracks.
+            tracks_db[db_key] = pickle.dumps([])
+            continue
         predictions = predictions_zarr_array[z_chunk_min : z_chunk_max]
         predictions = (predictions > 0).astype(np.uint8)
         if predictions.max() == 0:
@@ -279,7 +284,7 @@ def extract_vertical(predictions_zarr_array, tracks_db, axis, min_yx, max_yx):
         if db_key in tracks_db:
             continue
         w_max = min(w + yx_chunk_thickness_v, shape_along)
-        if w_max - w < downsample_factor:
+        if w_max - w < downsample_factor or z_range_max - z_range_min < downsample_factor:
             tracks_db[db_key] = pickle.dumps([])
             continue
         if axis == 'y':
