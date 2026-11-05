@@ -8,14 +8,16 @@ from vc_object_store import surfaces
 from vc_reader import tifxyz
 
 
-def read_surface(path, surface_uuid, *, volume, geometry_revision=None):
-    """The surface (its current geometry, or ``geometry_revision``) in voxels of ``volume``.
+def read_surface(path, surface_uuid, *, volume, version=None, generation=None):
+    """The surface (its current version, or numbered ``version`` in ``generation``, default the store's active one)
+    in voxels of ``volume``. ``extra['store_version']`` is the {generation, version} read.
 
     Missing vertices, by the store's rule (coordinates and the ``valid`` array), are -1. Raises when the surface
-    does not map to ``volume``."""
-    grid = surfaces.read_surface(path, surface_uuid, volume=volume, geometry_revision=geometry_revision)
-    return tifxyz.Surface(grid.points, mask=grid.valid, scale=tuple(grid.scale), uuid=surface_uuid,
-                          extra=dict(grid.record['meta']))
+    (version) does not exist or does not map to ``volume``."""
+    grid = surfaces.read_surface(path, surface_uuid, volume=volume, version=version, generation=generation)
+    extra = dict(grid.record['meta'])
+    extra['store_version'] = dict(generation=grid.generation, version=grid.version)
+    return tifxyz.Surface(grid.points, mask=grid.valid, scale=tuple(grid.scale), uuid=surface_uuid, extra=extra)
 
 
 def create_surface(path, zyxs, *, name, scale, volume, tool, parameters=None, sources=(), meta=None, tags=(),
