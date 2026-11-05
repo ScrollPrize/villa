@@ -146,6 +146,39 @@ The native tifxyz directory must contain `x.tif`, `y.tif`, `z.tif`, and
 `volume_source.txt`. Use `--plan-only` to inspect occupied-chunk and patch
 counts without creating output.
 
+## Resolution gap check
+
+`eval/resolution_gap.py` compares 9 µm training inputs with a real coarse scan
+of the same segment. It needs a fine surface volume (2.2 to 2.45 µm, levels 0
+and 2) with its ink labels and supervision mask, and a real coarse surface
+volume (7 to 9.45 µm) of the same papyrus. It builds every input on the same
+windows and tiles (the fine volume, its 4x box average,
+`prepare_9um_isotropic_input`, the box average with a blur fitted from the CT
+alone to the real scan's sharpness, and the real scan registered onto the fine
+surface), trains one small model per input and seed with held-out windows, and
+scores ink AUC with a reversed-depth control, a null that puts another
+segment's labels on the same CT, and intervals over seeds and tiles.
+
+```bash
+M=vesuvius.ink_detection.eval.resolution_gap
+uv run --extra models python -m $M windows --labels INK.zarr --mask SUP.zarr --out RUN --name seg
+uv run --extra models python -m $M stages --fine FINE.zarr --coarse COARSE.zarr \
+  --windows RUN/seg-windows.json --tiles RUN/seg-tiles.json --out RUN --name seg
+uv run --extra models python -m $M train --input box_average --seed 1 2 3 4 5 6 \
+  --fine FINE.zarr --coarse COARSE.zarr --labels INK.zarr --mask SUP.zarr \
+  --windows RUN/seg-windows.json --tiles RUN/seg-tiles.json \
+  --stages RUN/seg-stages.json --out RUN/maps --name seg
+uv run --extra models python -m $M score RUN/maps/seg-*.npz \
+  --stages RUN/seg-stages.json --donor OTHER/maps/other-fine-s1.npz --out RUN/score.json
+```
+
+`stages` reads the CT only, on CPU, and lists the inputs to train in its plan;
+run `train` once per planned input. `train` refuses an input whose arrays
+differ from the stage record's and needs a GPU in practice (3000 steps per
+model). The donor is a map file of another segment from `train`. `--smoke`
+runs `stages` and `train` on three tiles and one 504 px window. Probability
+maps are model output.
+
 ## Checkpoints and metrics
 
 Training embeds the resolved JSON config in each checkpoint. Inference
