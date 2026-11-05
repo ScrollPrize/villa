@@ -157,6 +157,36 @@ excluded. Retired objects are omitted unless `include_retired=True`.
 `None` resolves the latest head in that snapshot. Restore historical content by
 publishing a new checked action, not by moving old heads.
 
+### Hosted attachments
+
+`attachHosted(endpoint, HostedSessionOptions)` attaches a store served by
+`vc_object_server` beside local attachments. The session never opens its
+database, so `read()`, `act()` and the other callbacks that hand out an
+`ObjectStore` throw for it. The typed operations work on every attachment:
+`status`, `submit` (checked requests; conflicts throw `TransactionConflict`),
+`receipt`, `currentObject`, `objectsAtVersions`, `geometryRevision`,
+`readGeometryArray` and `volumeTransforms`. `selectObjects`, `geometryRegion` and
+`nearestSurfaces` combine hosted results with local attachments and drafts in
+attachment order. A hosted store answers them on the host: it resolves volume
+targets through its recorded transforms, a region query is not cancellable, and
+explicit transforms are refused.
+
+A background check every `pollInterval` asks for the store's status and, when
+the commit sequence moved, reads the change feed. It delivers the commits through
+`takeEvents()` as `Committed` events: `journalPosition` is the commit sequence,
+and each change carries its record kind, or an empty kind when it cannot be
+learned (`touches()` counts such a change). When the feed position is lost
+(another history generation, a restored store), the event has `revalidate` set:
+reread whatever is shown. `refresh()` checks now. `freshness()` reports the last
+successful check and the last failure for the UI.
+
+The attachment caches what it read, within `cacheBytes`: geometry descriptors
+and arrays by revision, records at numbered versions, and current heads until
+the feed reports them changed. Cached heads are therefore current as of the last
+check. The session's own submissions invalidate theirs at once. Cached data
+stays readable while the host is unreachable; anything else fails, and listings
+and spatial queries always need the host.
+
 ## Numbered history and checked requests
 
 Schema 18 introduced numbered history; schema 19 (current) stores it compactly. Each object and relationship keeps its UUID; each

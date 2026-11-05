@@ -93,38 +93,49 @@ std::string catalogTransformUuid(const std::string& registrationId) {
     if(registrationId.empty())throw std::invalid_argument("catalog registration id is empty");
     return util::nameUuid("vc_object_store/catalog-registration/"+registrationId);
 }
-VolumeTransforms ObjectStore::volumeTransforms(const Txn& txn) const {
+VolumeTransforms volumeTransformsFrom(const std::vector<std::pair<ObjectRecord,std::string>>& registrations,
+                                      const std::vector<ObjectRecord>& choices,
+                                      const vcr::catalog::RegistrationGraph* catalog) {
     VolumeTransforms result;
     std::vector<vcr::catalog::Registration> recorded;
     std::set<std::string> recordedIds;
-    for(const auto& object:objectsByKind(txn,"volume_transform")) {
+    for(const auto& [object,headRevision]:registrations) {
         const auto meta=nlohmann::json::parse(object.meta);
         const auto& value=meta.at("registration");
-        const auto head=currentObjectRevision(txn,object.uuid);
-        if(!head)throw std::runtime_error("commit new volume registrations before resolving views");
         // A recorded catalog registration keeps its catalog id as its route key.
         std::string id=object.uuid;
         if(meta.contains("catalog_registration")) {
             id=meta.at("catalog_registration").at("id").get<std::string>();
             recordedIds.insert(id);
         }
-        recorded.push_back({id,head->uuid,
+        recorded.push_back({id,headRevision,
             value.at("source_volume").get<std::string>(),value.at("target_volume").get<std::string>(),
             VolumeAffine::fromJson(value.at("matrix")),value.value("description",std::string{})});
     }
     // Client catalog registrations not recorded in the store still apply
     // locally; recorded ones always resolve from the store.
-    if(impl_->options.catalogTransforms)
-        for(const auto& registration:impl_->options.catalogTransforms->registrations())
+    if(catalog)
+        for(const auto& registration:catalog->registrations())
             if(!recordedIds.contains(registration.id))result.graph.add(registration);
     for(auto& registration:recorded)result.graph.add(std::move(registration));
-    for(const auto& object:objectsByKind(txn,"volume_transform_choice")) {
+    for(const auto& object:choices) {
         const auto value=nlohmann::json::parse(object.meta).at("choice");
         const auto key=std::pair(value.at("source_volume").get<std::string>(),value.at("target_volume").get<std::string>());
         if(!result.choices.emplace(key,value.at("path").get<std::vector<std::string>>()).second)
             throw std::runtime_error("multiple active volume transform choices for "+key.first+" -> "+key.second);
     }
     return result;
+}
+
+VolumeTransforms ObjectStore::volumeTransforms(const Txn& txn) const {
+    std::vector<std::pair<ObjectRecord,std::string>> registrations;
+    for(auto& object:objectsByKind(txn,"volume_transform")) {
+        const auto head=currentObjectRevision(txn,object.uuid);
+        if(!head)throw std::runtime_error("commit new volume registrations before resolving views");
+        registrations.emplace_back(std::move(object),head->uuid);
+    }
+    return volumeTransformsFrom(registrations,objectsByKind(txn,"volume_transform_choice"),
+                                impl_->options.catalogTransforms.get());
 }
 std::vector<vcr::catalog::TransformResolution> ObjectStore::availableTransforms(const Txn& txn,const std::string& uuid) const {
     const auto object=objectByUuid(txn,uuid);

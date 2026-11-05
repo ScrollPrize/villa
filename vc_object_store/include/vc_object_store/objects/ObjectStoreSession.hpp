@@ -1,6 +1,7 @@
 #pragma once
 
 #include "vc_object_store/objects/ObjectStore.hpp"
+#include "vc_object_store/client/HostedStore.hpp"
 #include "vc_object_store/objects/GeometryRegion.hpp"
 #include "vc_object_store/objects/Hub.hpp"
 #include "vc_object_store/geometry/Geometry.hpp"
@@ -12,6 +13,7 @@
 #include <mutex>
 #include <condition_variable>
 #include <map>
+#include <set>
 #include <span>
 
 namespace vc::objects {
@@ -56,9 +58,16 @@ struct StoreSessionEvent {
     int64_t journalPosition = 0;
     // Generic record UUIDs: objects AND relationships, including deleted records.
     // Consumers invalidate by identity, never by names or storage paths.
+    // Hosted attachments: journalPosition is the store's commit sequence, and
+    // a change whose kind could not be learned has an empty kind.
     std::vector<JournalEntry> changes;
+    // Committed, hosted: the attachment lost its place in the store's change
+    // feed (another history generation, a restored store), so any record may
+    // have changed; reread what is shown.
+    bool revalidate = false;
     // Whether it may have changed records of these kinds: a commit or draft
-    // touching one, or any attachment or hub event.
+    // touching one (or a change of unknown kind), a revalidation, or any
+    // attachment or hub event.
     bool touches(std::initializer_list<std::string_view> kinds) const;
 };
 
@@ -90,7 +99,27 @@ struct HubSessionStatus {
     std::vector<HubLease> leases;       // as of the last hub contact
 };
 
-namespace detail { struct HubLeaseCounts; class HubWorker; struct SurfaceDraft; }
+// A store served by vc_object_server, attached through its endpoint.
+struct HostedSessionOptions {
+    HostedStoreOptions client;
+    // How often the attachment checks the store for commits (one status
+    // request; the change feed only when the commit sequence moved).
+    std::chrono::milliseconds pollInterval{2000};
+    // Bound of the attachment's memory cache: geometry descriptors and arrays
+    // by revision, records at numbered versions, and current heads until the
+    // feed reports them changed.
+    std::size_t cacheBytes = std::size_t(256) << 20;
+};
+
+// What a hosted attachment knows about its store, for the UI: current as of
+// the last successful check, and the last failure since.
+struct HostedFreshness {
+    std::optional<StoreStatus> status;
+    std::optional<int64_t> checkedAtUs; // UTC Unix microseconds of that check
+    std::string error;                  // empty when the last check succeeded
+};
+
+namespace detail { struct HubLeaseCounts; class HubWorker; struct SurfaceDraft; class HostedAttachment; }
 
 // Keeps objects leased while it lives. Leases are renewed in the background;
 // once no hold remains and the object's changes are pushed, the lease is released.
@@ -137,6 +166,34 @@ public:
     AttachmentIdentity replace(const AttachmentIdentity&, const std::filesystem::path&, const OpenOptions&,
                                const HubSessionOptions& = {});
     void detach(const AttachmentIdentity&);
+    // A store hosted by vc_object_server (client/HostedStore.hpp). The session
+    // never opens its database: read() and act() and the other callbacks that
+    // take an ObjectStore throw for it; use the typed operations below. Its
+    // commits arrive through takeEvents() after each check (pollInterval).
+    // Throws when the endpoint does not answer or its store is already attached.
+    AttachmentIdentity attachHosted(const std::string& endpoint, const HostedSessionOptions& = {});
+    bool hosted(const AttachmentIdentity&) const;
+    // nullopt for local attachments.
+    std::optional<HostedFreshness> freshness(const AttachmentIdentity&) const;
+    // Check a hosted attachment now (blocking); its commits then arrive
+    // through takeEvents(). A failed check is reported by freshness().
+    void refresh(const AttachmentIdentity&);
+
+    // Typed operations, the same for local and hosted attachments.
+    StoreStatus status(const AttachmentIdentity&);
+    // Checked atomic request (objects/Transactions.hpp); conflicts throw
+    // TransactionConflict. Hosted: transport failures leave the outcome
+    // unknown; recover it with receipt() or submit the identical request again.
+    TransactionReceipt submit(const AttachmentIdentity&, const TransactionRequest&);
+    std::optional<TransactionReceipt> receipt(const AttachmentIdentity&, const std::string& requestUuid);
+    // Hosted: current as of the last check (or a newer read).
+    std::optional<ObjectRevision> currentObject(const AttachmentIdentity&, const std::string& objectUuid);
+    std::vector<std::optional<ObjectRevision>> objectsAtVersions(const AttachmentIdentity&, const std::vector<ObjectVersion>&);
+    std::optional<GeometryRevision> geometryRevision(const AttachmentIdentity&, const std::string& revisionUuid);
+    std::vector<uint8_t> readGeometryArray(const AttachmentIdentity&, const std::string& revisionUuid, const std::string& arrayName);
+    // The attachment's volume transforms: recorded registrations and choices
+    // (and, locally, the client catalog's unrecorded registrations).
+    VolumeTransforms volumeTransforms(const AttachmentIdentity&);
     // Writes by a geometry fetcher (setGeometryFetcher) on a writable attachment.
     using FetchWrite = std::function<RevisionSelection(const RevisionSelection& expected, const Action&)>;
     // Fetches one object's geometry and writes it with `write`; throws when it
@@ -284,6 +341,11 @@ private:
     void observe(Attachment&);
     void hubChanged(const Attachment*);
     void startFetching(Attachment&);
+    // Runs `f(attachment)` while the attachment is admitted.
+    template <class F> auto withAttachment(const AttachmentIdentity&, bool write, F&& f);
+    // The UUIDs among `uuids` that the attachment (or one of them) holds.
+    std::set<std::string> holds(const AttachmentIdentity&, const std::set<std::string>& uuids);
+    std::set<std::string> heldBy(const std::vector<AttachmentIdentity>&, const std::set<std::string>& uuids);
 
     // transition_ serializes lifecycle operations and is never held by read
     // callbacks. mutex_ protects the attachment list, admission and events.

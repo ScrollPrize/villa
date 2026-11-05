@@ -34,6 +34,14 @@ struct VolumeTransforms {
     // The volumes with a route into `target`, by id.
     std::vector<Related> related(const std::string& target) const;
 };
+// The transform context of recorded registrations (each `volume_transform`
+// record with its head revision UUID, the registration's revision evidence)
+// and route choices (`volume_transform_choice` records), plus `catalog`
+// registrations the store has not recorded. Local and hosted stores build it
+// the same way.
+VolumeTransforms volumeTransformsFrom(const std::vector<std::pair<ObjectRecord,std::string>>& registrations,
+                                      const std::vector<ObjectRecord>& choices,
+                                      const vcr::catalog::RegistrationGraph* catalog);
 // Stable object UUID of a recorded catalog registration (by catalog id).
 std::string catalogTransformUuid(const std::string& registrationId);
 // The stored route choice from `source` to `target`, when there is one.
