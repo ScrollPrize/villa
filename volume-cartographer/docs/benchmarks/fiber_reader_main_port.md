@@ -8,7 +8,8 @@ main. It is not a new model or tracing-parameter sweep.
 
 - Before: `c2305418e`, based on `8ff06f762`, using the old decoded-chunk cache.
 - Main base: `9c343a164`.
-- After: `0750edcad`, including the FW/BW cherry-pick `a178d9c3a` and a CUDA
+- After: code at `0750edcad` (GPU runs at documentation-only descendant
+  `3d8f60cf7`), including the FW/BW cherry-pick `a178d9c3a` and a CUDA
   build fix. The CUDA targets now consume `vc_reader::headers` and C++20; the
   device source includes the narrow shared sampling-math header. Arithmetic
   flags, including `--fmad=false`, were not changed.
@@ -47,7 +48,10 @@ convergence after 1,024 base voxels within 8 base voxels / 10 degrees, one
 converged point. Width modulation is cosine 30%, with a hard width cutoff of
 20% and joint modulated-presence cutoff 0.25.
 
-GPU construction uses 16 CPU workers and eight contexts per worker. It keeps
+GPU construction requests 16 CPU workers and eight contexts per worker; the
+manager grants seven GPUs (physical indices 1-7), 4 GiB VRAM each and 14 CPU
+workers for every measured run. Physical GPU 0 is excluded by the local-node
+allowlist. No other task is stopped and no manager journal is reset. It keeps
 the same chunk geometry and cosine modulation but disables reverse replay and
 the hard width cutoff, which that backend does not implement. This is a matched
 GPU-before/GPU-after comparison, not a CPU/GPU algorithm equivalence claim.
@@ -76,7 +80,8 @@ Three unprofiled repeats per cell, native wall time in seconds:
 | --- | --- | --- | --- |
 | Continuous tracer / 64 GiB | 56.123 (54.822 / 55.637 / 57.910) | 61.950 (57.396 / 62.082 / 66.372) | +11.6% |
 | Continuous tracer / 1 GiB | 62.674 (61.370 / 62.067 / 64.585) | 72.798 (70.130 / 70.366 / 77.898) | +13.4% |
-| GPU chunk construction | Pending | Pending | Not measured |
+| GPU chunk construction / 64 GiB | 9.299 (9.146 / 9.232 / 9.517) | 5.448 (5.181 / 5.512 / 5.650) | -40.3% |
+| GPU chunk construction / 1 GiB | 9.521 (9.449 / 9.466 / 9.647) | 6.764 (6.412 / 6.854 / 7.026) | -27.6% |
 
 This port works for streaming but does not preserve the old throughput. Mean
 CPU time rises from 4,051 to 4,841 CPU-seconds with ample cache, and from 4,935
@@ -93,9 +98,30 @@ All runs see the same 14,780 seed candidates. Retained-length means differ by
 less than 0.4%; collision scheduling makes inventories non-identical. These
 figures do not establish equal GT accuracy.
 
-Do not interpret this document as completed GPU validation. The GPU manager
-currently rejects the migrated old-server GPU allowlist; no bypass or journal
-reset is used.
+All GPU runs construct 21,261 paths and flag the same 942 as conflicting. Saved
+coordinates, endpoint reasons, seeds, maxima and conflict flags match exactly
+between before and after for each of the six paired runs (192 chunk pairs).
+This checks parsed values rather than compressed-file bytes: timing metadata
+and backend configuration necessarily differ. The preserved startup-failure
+directories contain no benchmark results and are excluded.
+
+The GPU times include CPU preparation, GPU tracing, conflict filtering and
+writing all 32 fresh output chunks; they are not pure CUDA kernel times. Mean
+sums of per-chunk elapsed timers in the 64-GiB runs:
+
+| Timer | Before summed seconds | After summed seconds |
+| --- | --- | --- |
+| Seed construction | 5.452 | 4.407 |
+| GPU packing | 14.357 | 6.384 |
+| GPU kernel events | 0.762 | 0.816 |
+| Conflict filtering, including normal reads | 82.102 | 41.327 |
+
+These timers overlap across workers and are not an additive wall-time
+decomposition. The kernel timer is essentially unchanged; the complete chunk
+workflow is faster in preparation/filtering, not because its tracing math was
+reduced. Conversely, the streaming CPU workflow remains slower. This comparison
+spans the reader migration; it is not a measurement of stock current main
+versus only the FW/BW patch.
 
 ## Cache behavior under test
 
