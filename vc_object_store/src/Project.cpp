@@ -1,6 +1,7 @@
 #include "vc_object_store/objects/Project.hpp"
 #include "vc_object_store/Uuid.hpp"
 #include "vc_object_store/objects/TransactionJson.hpp"
+#include "vc_object_store/objects/Artifacts.hpp"
 #include "internal/Sqlite.hpp"
 #include <algorithm>
 #include <map>
@@ -101,14 +102,10 @@ void copyProject(ObjectStoreSession& session, const AttachmentIdentity& attachme
                              "BEGIN SELECT RAISE(ABORT,'store identity is immutable'); END;"
                              "CREATE TRIGGER store_identity_immutable_delete BEFORE DELETE ON store_identity "
                              "BEGIN SELECT RAISE(ABORT,'store identity is retained'); END;");
-            detail::execute(db, "UPDATE sync_replica SET uuid=?", util::newUuid());
-            for (const auto* table : {"hub_upstream", "hub_versions", "hub_pending", "hub_inflight", "hub_conflicts", "hub_leases"})
-                detail::exec(db, (std::string("DROP TABLE IF EXISTS ") + table + ";").c_str());
             detail::exec(db, "COMMIT;");
         } catch (...) { sqlite3_exec(db, "ROLLBACK;", nullptr, nullptr, nullptr); sqlite3_close(db); throw; }
         sqlite3_close(db);
-        // The artifacts of a hosted replica are beside its hub.
-        const auto artifacts = session.artifactDirectory(attachment, util::newUuid(), false).parent_path();
+        const auto artifacts = artifactBlobDirectory(source).parent_path();
         if (fs::is_directory(artifacts))
             fs::copy(artifacts, fs::path(destination.string() + ".artifacts"), fs::copy_options::recursive);
         ObjectStoreSession copy;
@@ -164,7 +161,7 @@ std::vector<ProjectResource> projectResources(const StoreReader& reader, const s
     selection.kind = kind;
     auto records = reader.selectObjects(selection);
     // Added order: when the first revision was published (microseconds), or
-    // created (seconds) for a hub baseline without its publication time.
+    // created (seconds) for an imported baseline without its publication time.
     std::map<std::string, std::pair<std::string, int64_t>> added;
     for (const auto& record : records) {
         const auto history = reader.objectHistory(record.uuid);

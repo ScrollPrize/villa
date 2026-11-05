@@ -1,6 +1,5 @@
 #include "internal/Database.hpp"
 #include "internal/ReadRequest.hpp"
-#include "sftp/SftpVfs.hpp"
 
 namespace vc::objects::detail {
 [[noreturn]] void fail(sqlite3* db, const std::string& what)
@@ -117,23 +116,12 @@ void applyPragmas(sqlite3* db, const OpenOptions& options, bool queryOnly)
 sqlite3* openConnection(const std::filesystem::path& path, int flags, const OpenOptions& options, bool queryOnly)
 {
     sqlite3* db = nullptr;
-    const bool remote = isRemotePath(path);
-    if (remote && !options.sharedFile)
-        throw std::invalid_argument("object store: only hosted hubs open from sftp:// or ssh:// locations; clone one to a local replica");
-    const auto name = remote ? canonicalRemotePath(path) : path.string();
-    if (!remote && options.sharedFile && std::filesystem::exists(path.string() + ".lock/" + kProcessLockName))
-        throw std::runtime_error("hub: this hub uses SSH process locking; access it through its sftp:// address");
-    // Network filesystems lack the shared memory and byte-range locks WAL needs.
-    const char* vfs = remote ? sftpVfs() : options.sharedFile ? "unix-dotfile" : nullptr;
-    if (vfs && !sqlite3_vfs_find(vfs))
-        throw std::runtime_error("object store: this SQLite build lacks the unix-dotfile VFS needed for shared files");
-    const int rc = sqlite3_open_v2(remote ? name.c_str() : reinterpret_cast<const char*>(path.u8string().c_str()), &db,
-                                   flags | SQLITE_OPEN_FULLMUTEX, vfs);
+    const int rc = sqlite3_open_v2(reinterpret_cast<const char*>(path.u8string().c_str()), &db,
+                                   flags | SQLITE_OPEN_FULLMUTEX, nullptr);
     if (rc != SQLITE_OK) {
         std::string msg = db ? sqlite3_errmsg(db) : "open failed";
-        if (remote && !sftpLastError().empty()) msg += " (" + sftpLastError() + ")";
         if (db) sqlite3_close(db);
-        throw std::runtime_error("object store: cannot open " + name + ": " + msg);
+        throw std::runtime_error("object store: cannot open " + path.string() + ": " + msg);
     }
     try {
         applyPragmas(db, options, queryOnly);

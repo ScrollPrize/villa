@@ -3,7 +3,6 @@
 #include "imports/SourceIdentityIndex.hpp"
 #include "internal/History.hpp"
 #include "internal/RecordSql.hpp"
-#include "hub/HubRules.hpp"
 #include "internal/Versions.hpp"
 
 namespace vc::objects {
@@ -28,8 +27,7 @@ std::unique_ptr<ObjectStore::Impl> ObjectStore::openImpl(const std::filesystem::
 {
     const int kApplicationId = 0x56434f42;
     if (create && options.readOnly) throw std::invalid_argument("create requires writable options");
-    if (create && options.sharedFile) throw std::invalid_argument("object store: create a store locally, then initialize it as a hub");
-    if (options.serviceOwner && (options.readOnly || options.sharedFile))
+    if (options.serviceOwner && options.readOnly)
         throw std::invalid_argument("object store: a hosting service opens its local store writable");
     if (sqlite3_threadsafe() == 0)
         throw std::runtime_error("object store: SQLite build is not thread-safe");
@@ -41,8 +39,7 @@ std::unique_ptr<ObjectStore::Impl> ObjectStore::openImpl(const std::filesystem::
     auto impl = std::make_unique<ObjectStore::Impl>();
     impl->path = path;
     impl->options = options;
-    impl->options.readerPoolSize = options.sharedFile ? 1 : std::max(1, options.readerPoolSize);
-    if (options.sharedFile) impl->options.geometryCacheBytes = impl->options.spatialCacheBytes = 0;
+    impl->options.readerPoolSize = std::max(1, options.readerPoolSize);
     impl->hostname = options.hostnameOverride.value_or(detectHostname());
 
     auto validate = [&](sqlite3* db) {
@@ -52,18 +49,9 @@ std::unique_ptr<ObjectStore::Impl> ObjectStore::openImpl(const std::filesystem::
             throw std::runtime_error("object store: unsupported database schema: " + path.string() +
                 (version == 17 || version == 18 ? " (schema " + std::to_string(version) +
                  ": convert it with vc_object_convert)" : std::string()));
-        // A hub must keep its rollback journal: opening it with WAL from a
-        // network mount would break locking for every other client.
-        impl->hubRole = detectHubRole(db);
-        if (impl->hubRole == HubRole::Hub && !options.sharedFile)
-            throw std::runtime_error("object store: " + path.string() + " is a hosted hub; clone it to a local replica");
-        if (impl->hubRole != HubRole::Hub && options.sharedFile)
-            throw std::runtime_error("object store: " + path.string() + " is not a hosted hub");
     };
-    const char* journalMode = options.sharedFile ? "PRAGMA journal_mode=DELETE;" : "PRAGMA journal_mode=WAL;";
-    // Writable access is guarded before any writer connection opens. A hub on
-    // a network mount (sharedFile) relies on its own SQLite locking instead.
-    if (!options.readOnly && !options.sharedFile)
+    // Writable access is guarded before any writer connection opens.
+    if (!options.readOnly)
         impl->ownership = std::make_unique<OwnershipGuard>(path,
             options.serviceOwner ? OwnershipGuard::Mode::Service : OwnershipGuard::Mode::Standalone);
 
@@ -87,7 +75,7 @@ std::unique_ptr<ObjectStore::Impl> ObjectStore::openImpl(const std::filesystem::
     } else if (!options.readOnly) {
         impl->writer = openConnection(path, SQLITE_OPEN_READWRITE, options, false);
         validate(impl->writer);
-        exec(impl->writer, journalMode);
+        exec(impl->writer, "PRAGMA journal_mode=WAL;");
         exec(impl->writer, "PRAGMA synchronous=FULL;");
     }
 

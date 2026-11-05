@@ -38,11 +38,6 @@ struct StatementPool {
     std::map<std::string,double> transformedLengths;
     bool readSnapshot = false;
     bool checkedAction = false, actionConflict = false;
-    // Hosted-store bookkeeping for the active write (see hub/HubRules.hpp):
-    // cursors at BEGIN, and whether this write applies hub state verbatim.
-    bool hubApply = false;
-    std::optional<std::string> actingHolder;
-    int64_t startJournal = 0, startGeometry = 0;
     // Attribution and request identity of the active write (see
     // TransactionContext). actingAuthor overrides the open author for
     // mutation stamps; commit* attribute the store commit.
@@ -69,15 +64,12 @@ void beginSpatialRead(StatementPool&, size_t budget, int version);
 inline constexpr int kSchemaVersion = 19;
 void createStoreSchema(sqlite3*, const std::string& generation);
 }
-// Hosting role, fixed at open by the presence of the hub_* tables.
-enum class HubRole { None, Hub, Replica };
 struct ObjectStore::Impl {
     // Declared first: released only after every connection has closed.
     std::unique_ptr<detail::OwnershipGuard> ownership;
     std::filesystem::path path;
     OpenOptions options;
     std::string hostname;
-    HubRole hubRole = HubRole::None;
     sqlite3* writer = nullptr;
     std::mutex writerMutex;
     std::vector<sqlite3*> readerPool;

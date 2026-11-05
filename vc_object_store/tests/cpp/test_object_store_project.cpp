@@ -1,24 +1,19 @@
 #include "TestSupport.hpp"
-#include "HubTestSupport.hpp"
-#include "vc_object_store/objects/Hub.hpp"
+#include "vc_object_store/objects/Artifacts.hpp"
 #include "vc_object_store/objects/Project.hpp"
 #include <nlohmann/json.hpp>
-#include <chrono>
+#include <fstream>
 #include <iostream>
-#include <thread>
 
 using namespace vc::objects;
 using Json = nlohmann::json;
 
 namespace {
-template <class Condition>
-void eventually(const Condition& condition, const char* message)
+OpenOptions as(const std::string& author)
 {
-    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(20);
-    while (!condition()) {
-        require(std::chrono::steady_clock::now() < deadline, message);
-        std::this_thread::sleep_for(std::chrono::milliseconds(20));
-    }
+    OpenOptions options;
+    options.author = author;
+    return options;
 }
 
 std::vector<ProjectResource> resources(ObjectStoreSession& session, const AttachmentIdentity& attachment,
@@ -126,44 +121,43 @@ int main() try
     session.detach(plain);
     session.detach(project);
 
-    // A hosted project shares its resources; each replica keeps its author's view.
-    initHub(path, "curator");
-    const auto alicePath = directory.path / "alice.vcobj", bobPath = directory.path / "bob.vcobj";
-    cloneHub(path, alicePath, as("alice"));
-    cloneHub(path, bobPath, as("bob"));
-    HubSessionOptions fast;
-    fast.syncInterval = std::chrono::milliseconds(100);
-    fast.pushDelay = std::chrono::milliseconds(20);
-    ObjectStoreSession aliceSession, bobSession;
-    const auto alice = aliceSession.attach(alicePath, as("alice"), fast);
-    const auto bob = bobSession.attach(bobPath, as("bob"), fast);
-    const std::string shared = "https://example.org/shared.zarr/";
-    require(addProjectResource(aliceSession, alice, kVolumeResource, shared), "alice adds a volume");
-    setProjectView(aliceSession, alice, "alice", {{"current_volume", "shared"}});
-    require(addProjectResource(aliceSession, alice, kVolumeResource, "/home/alice/scan.zarr", {}, Json::object(), "alice"),
-            "alice adds a volume on her disk");
-    aliceSession.syncHubAndWait(alice, std::chrono::seconds(20));
-    bobSession.syncHubAndWait(bob, std::chrono::seconds(20));
-    require(resources(bobSession, bob, kVolumeResource, "bob").size() == 3, "bob sees alice's shared volume, not her disk's");
-    // Editing a pushed resource leases it.
-    updateProjectResourceMeta(bobSession, bob, projectResourceUuid(kVolumeResource, shared), {{"volume_id", "shared"}});
-    setProjectView(bobSession, bob, "bob", {{"current_volume", "shared"}});
-    const auto pushed = bobSession.syncHubAndWait(bob, std::chrono::seconds(20));
-    require(pushed && pushed->conflicts.empty() && pushed->error.empty(), "bob pushed");
-    eventually([&] {
-        aliceSession.syncHubAndWait(alice, std::chrono::seconds(20));
-        const auto listed = resources(aliceSession, alice, kVolumeResource);
-        return std::any_of(listed.begin(), listed.end(), [](const auto& r) { return r.meta.contains("volume_id") && r.meta.at("volume_id") == "shared"; });
-    }, "alice sees bob's resource edit");
-    require(view(aliceSession, alice, "alice").at("current_volume") == "shared" &&
-            view(aliceSession, alice, "bob").at("current_volume") == "shared", "views synced without contention");
-    // A copy of a hosted replica is standalone.
-    copyProject(aliceSession, alice, directory.path / "standalone.vcobj", "standalone", as("alice"));
+    // Several local writers share one project; each keeps their own view.
     {
-        ObjectStoreSession standalone;
-        const auto copied = standalone.attach(directory.path / "standalone.vcobj", as("alice"));
-        require(!standalone.hubStatus(copied), "not a replica");
-        require(resources(standalone, copied, kVolumeResource, "alice").size() == 5, "replica records copied");
+        ObjectStoreSession aliceSession, bobSession;
+        const auto alice = aliceSession.attach(path, as("alice"));
+        const auto bob = bobSession.attach(path, as("bob"));
+        const std::string shared = "https://example.org/shared.zarr/";
+        require(addProjectResource(aliceSession, alice, kVolumeResource, shared), "alice adds a volume");
+        setProjectView(aliceSession, alice, "alice", {{"current_volume", "shared"}});
+        require(addProjectResource(aliceSession, alice, kVolumeResource, "/home/alice/scan.zarr", {}, Json::object(), "alice"),
+                "alice adds a volume on her disk");
+        require(resources(bobSession, bob, kVolumeResource, "bob").size() == 3, "bob sees alice's shared volume, not her disk's");
+        updateProjectResourceMeta(bobSession, bob, projectResourceUuid(kVolumeResource, shared), {{"volume_id", "shared"}});
+        setProjectView(bobSession, bob, "bob", {{"current_volume", "shared"}});
+        const auto listed = resources(aliceSession, alice, kVolumeResource);
+        require(std::any_of(listed.begin(), listed.end(), [](const auto& r) {
+                    return r.meta.contains("volume_id") && r.meta.at("volume_id") == "shared"; }),
+                "alice sees bob's resource edit");
+        require(view(aliceSession, alice, "alice").at("current_volume") == "shared" &&
+                view(aliceSession, alice, "bob").at("current_volume") == "shared", "views kept per author");
+        // A copy carries the project's artifacts.
+        const auto file = directory.path / "notes.txt";
+        std::ofstream(file) << "project notes";
+        std::string recordUuid;
+        int64_t version = 0;
+        aliceSession.readStore(alice, [&](const vc::objects::StoreReader& reader, const auto&) {
+            recordUuid = projectRecord(reader)->uuid;
+            version = reader.currentObject(recordUuid)->version;
+        });
+        aliceSession.publishArtifacts(alice, recordUuid, version, {{"notes.txt", file}});
+        const auto copyPath = directory.path / "with-artifacts.vcobj";
+        copyProject(aliceSession, alice, copyPath, "with artifacts", as("alice"));
+        ObjectStoreSession copied;
+        const auto copy = copied.attach(copyPath, as("alice"));
+        require(resources(copied, copy, kVolumeResource, "alice").size() == 5, "records copied");
+        const auto artifacts = copied.artifacts(copy, recordUuid);
+        require(artifacts.size() == 1 && std::filesystem::is_regular_file(artifactBlobPath(copyPath, artifacts.front().sha256)),
+                "artifact bytes copied");
     }
     std::cout << "ok\n";
     return 0;

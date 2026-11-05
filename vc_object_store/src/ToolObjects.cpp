@@ -28,9 +28,7 @@ TransactionReceipt ToolObjects::publishArtifacts(const std::string& uuid,
         if (!current) throw std::runtime_error("no object " + uuid + " to publish artifacts of");
         version = current->version;
     }
-    auto receipt = session_->publishArtifacts(attachment_, uuid, *version, files);
-    wrote_ = true;
-    return receipt;
+    return session_->publishArtifacts(attachment_, uuid, *version, files);
 }
 
 void ToolObjects::noteRead(const PinnedObject& pin, const std::optional<VolumeVoxels>& volume, bool identity)
@@ -71,13 +69,8 @@ PinnedObject ToolObjects::writable(const std::string& uuid)
     return found->second.pin;
 }
 
-void ToolObjects::finish(std::chrono::seconds timeout)
+void ToolObjects::finish()
 {
     session_->finalize();
-    if (!wrote_) return;
-    const auto status = session_->syncHubAndWait(attachment_, timeout);
-    if (status && (!status->error.empty() || !status->conflicts.empty()))
-        throw std::runtime_error("writes did not reach the hub: " +
-                                 (status->error.empty() ? std::string("unresolved hub conflicts") : status->error));
 }
 }

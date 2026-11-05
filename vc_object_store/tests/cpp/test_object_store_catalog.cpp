@@ -250,7 +250,7 @@ int main() try
     });
     const auto target = directory.path / "published" / "ink-detection.jpg";
     require(published && fetchPublishedFile(*published, target) == target && fs::is_regular_file(target) &&
-            !fs::exists(session.artifactDirectory(catalog, uuid, false)), "published image fetched");
+            !fs::exists(session.path(catalog).string() + ".artifacts"), "published image fetched");
     const auto written = fs::last_write_time(target);
     require(fetchPublishedFile(*published, target) == target && fs::last_write_time(target) == written, "fetched once");
 

@@ -553,107 +553,22 @@ def test_native_export_pins_object_metadata_and_geometry(db, tmp_path, kind, geo
         db.export_geometry(uid, tmp_path / 'wrong.json', version=before, generation=str(uuid.uuid4()))
 
 
-def test_scripts_edit_hosted_replicas_under_leases(tmp_path):
+def test_session_sees_commits_of_another_writer(tmp_path):
     import vc_object_store as vos
-    hub = tmp_path / 'share' / 'hub.vcobj'
-    hub.parent.mkdir()
-    with ObjectStore.create(str(hub), author='curator') as origin:
-        fiber, _ = put(origin, Fiber([[1, 2, 3], [4, 5, 6]], []), kind='fiber')
-        origin.checkpoint()
-    vos.hub_init(str(hub), 'curator')
-    with pytest.raises(RuntimeError, match='hosted hub'):
-        ObjectStore.open(str(hub), author='curator')
-    for name in ('script', 'viewer'):
-        vos.hub_clone(str(hub), str(tmp_path / f'{name}.vcobj'), name)
-    with ObjectStore.open(str(tmp_path / 'script.vcobj'), author='script') as script, \
-            ObjectStore.open(str(tmp_path / 'viewer.vcobj'), author='viewer') as viewer:
-        with pytest.raises(RuntimeError, match='not leased'):
-            script.set_meta(fiber, 'review', 'done')
-        [lease] = script.acquire_leases([fiber])
-        assert lease['author'] == 'script'
-        script.set_meta(fiber, 'review', 'done')
-        assert script.hub_status()['pending'] == [fiber]
-        assert script.hub_sync() == {'pulled': 0, 'pushed': 1, 'conflicts': []}
-        assert viewer.hub_sync()['pulled'] == 1
-        assert viewer.object(fiber)['meta']['review'] == 'done'
-        with pytest.raises(RuntimeError, match='leased to script'):
-            viewer.acquire_leases([fiber])
-        script.release_leases([fiber])
-        assert viewer.acquire_leases([fiber])[0]['author'] == 'viewer'
-
-
-def test_service_edits_a_hosted_surface_through_a_session(tmp_path):
-    import vc_object_store as vos
-    hub = tmp_path / 'share' / 'hub.vcobj'
-    hub.parent.mkdir()
+    path = tmp_path / 'store.vcobj'
     points = np.stack([*np.mgrid[:4, :5][::-1], np.full((4, 5), 9)], axis=-1).astype('<f4')
-    with ObjectStore.create(str(hub), author='curator') as origin:
+    with ObjectStore.create(str(path), author='curator') as origin:
         surface, _ = put(origin, dict(kind='surface', attributes={'scale': [1, 1]}, arrays=[array('points', points)]), 'surface')
-        origin.checkpoint()
-    vos.hub_init(str(hub), 'curator')
-    for name in ('service', 'viewer'):
-        vos.hub_clone(str(hub), str(tmp_path / f'{name}.vcobj'), name)
     session = vos.ObjectStoreSession()
-    attachment = session.attach(str(tmp_path / 'service.vcobj'), 'service', sync_interval_ms=100, push_delay_ms=20)
+    attachment = session.attach(str(path), 'service')
     assert session.attachments() == [attachment] and session.writable(attachment)
-    assert Path(session.path(attachment)) == tmp_path / 'service.vcobj'  # the replica, not the hub
-    model = session.artifact_directory(attachment, surface)
-    assert model == hub.parent / 'hub.vcobj.artifacts' / surface and model.is_dir()
-    with session.hold_leases(attachment, [surface]):
-        with ObjectStore.open(str(tmp_path / 'service.vcobj'), author='service') as db:
-            db.edit_geometry_rectangle(surface, 'points', 1, 1, 1, 1, np.array([7, 7, 7], '<f4').tobytes(),
-                                       db.current_version(surface))
-        status = session.sync_hub_and_wait(attachment, timeout_s=20)
-        assert not status['pending'] and not status['error'] and not status['conflicts']
+    assert Path(session.path(attachment)) == path
+    with ObjectStore.open(str(path), author='script') as db:
+        db.edit_geometry_rectangle(surface, 'points', 1, 1, 1, 1, np.array([7, 7, 7], '<f4').tobytes(),
+                                   db.current_version(surface))
     kinds = [event['kind'] for event in session.take_events()]
     assert kinds[0] == 'attached' and 'committed' in kinds
     session.detach(attachment)
-    with ObjectStore.open(str(tmp_path / 'viewer.vcobj'), author='viewer') as viewer:
-        assert viewer.hub_sync()['pulled'] == 1
-        edited = viewer.read_geometry_rectangle(viewer.current_geometry(surface)['uuid'], 'points', 1, 1, 1, 1)
-        assert edited == np.array([7, 7, 7], '<f4').tobytes()
-
-
-def test_scripts_sync_a_hub_addressed_over_sftp_with_a_password(tmp_path, monkeypatch):
-    """The C++ SFTP test executable acts as ssh and serves files with the installed sftp-server."""
-    import os
-    from urllib.parse import quote
-    import vc_object_store as vos
-    build = os.environ.get('VC_OBJECT_STORE_BUILD_PYTHON_PATH')
-    fixture = Path(build).resolve().parent / 'bin' / 'test_object_store_sftp' if build else None
-    server = next((p for p in ('/usr/lib/openssh/sftp-server', '/usr/lib/ssh/sftp-server', '/usr/libexec/sftp-server',
-                               '/usr/libexec/openssh/sftp-server') if Path(p).exists()), None)
-    if not fixture or not fixture.exists() or not server:
-        pytest.skip('needs the built test_object_store_sftp and an installed OpenSSH sftp-server')
-    bin_dir = tmp_path / 'bin'
-    bin_dir.mkdir()
-    (bin_dir / 'ssh').symlink_to(fixture)
-    monkeypatch.setenv('PATH', f'{bin_dir}:{os.environ["PATH"]}')
-    monkeypatch.setenv('VC_SFTP_TEST_SERVER', server)
-    monkeypatch.setenv('VC_SFTP_TEST_PASSWORD', 'hunter2')
-    hub = tmp_path / 'share' / 'hub.vcobj'
-    hub.parent.mkdir()
-    with ObjectStore.create(str(hub), author='curator') as origin:
-        fiber, _ = put(origin, Fiber([[1, 2, 3], [4, 5, 6]], []), kind='fiber')
-        origin.checkpoint()
-    vos.hub_init(str(hub), 'curator')
-    url = 'sftp://annotator@test-host' + quote(str(hub))
-    prompts = []
-    vos.set_sftp_authenticator(lambda destination, prompt, confirmation: prompts.append(destination) or 'hunter2')
-    try:
-        vos.hub_clone(url, str(tmp_path / 'replica.vcobj'), 'script')
-        vos.hub_clone(str(hub), str(tmp_path / 'local.vcobj'), 'viewer')
-        with ObjectStore.open(str(tmp_path / 'replica.vcobj'), author='script') as script, \
-                ObjectStore.open(str(tmp_path / 'local.vcobj'), author='viewer') as viewer:
-            assert script.hub_status()['hub'] == url
-            script.acquire_leases([fiber])
-            script.set_meta(fiber, 'review', 'remote')
-            assert script.hub_sync()['pushed'] == 1
-            assert viewer.hub_sync()['pulled'] == 1 and viewer.object(fiber)['meta']['review'] == 'remote'
-        assert prompts and set(prompts) == {'annotator@test-host'}
-        assert vos.hub_lock_age(url) is None
-    finally:
-        vos.set_sftp_authenticator(None)
 
 
 def test_surface_vertices_are_missing_by_the_store_rule(db, tmp_path):

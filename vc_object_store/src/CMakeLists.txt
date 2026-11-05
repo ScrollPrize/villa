@@ -27,7 +27,6 @@ target_compile_features(vc_geometry PUBLIC cxx_std_20)
 
 # Primary SQLite object database; no dependency on vc_core or Qt.
 add_library(vc_objects ${_vc_store_library_type}
-    sftp/SftpVfs.cpp
     internal/Anchors.cpp
     internal/Ownership.cpp
     Versions.cpp
@@ -71,12 +70,6 @@ add_library(vc_objects ${_vc_store_library_type}
     ToolObjects.cpp
     AttachedDocument.cpp
     SurfaceCreate.cpp
-    sync/Replica.cpp
-    sync/GeometryTransfer.cpp
-    sync/Apply.cpp
-    hub/HubRules.cpp
-    hub/Hub.cpp
-    hub/HubWorker.cpp
     geometry/GeometryViews.cpp
     imports/SourceRelationships.cpp
     geometry/GeometryIngestBatch.cpp
@@ -100,7 +93,7 @@ if(TARGET SQLite3::SQLite3)
 else()
     target_link_libraries(vc_objects PUBLIC SQLite::SQLite3)
 endif()
-target_link_libraries(vc_objects PUBLIC vc_geometry vc_reader::sftp vc_reader::catalog nlohmann_json::nlohmann_json PRIVATE OpenSSL::Crypto zstd::libzstd)
+target_link_libraries(vc_objects PUBLIC vc_geometry vc_reader::catalog nlohmann_json::nlohmann_json PRIVATE OpenSSL::Crypto zstd::libzstd)
 target_compile_features(vc_objects PUBLIC cxx_std_20)
 add_library(vc_object_store::vc_objects ALIAS vc_objects)
 # Offline schema conversion; the runtime library knows only the current schema.

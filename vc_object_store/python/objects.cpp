@@ -6,16 +6,14 @@
 #include "vc_object_store/objects/AttachedDocument.hpp"
 #include "vc_object_store/objects/SurfaceCreate.hpp"
 #include "GeometryRegionBindings.hpp"
-#include "HubBindings.hpp"
+#include "SessionBindings.hpp"
 #include <nanobind/stl/map.h>
 #include "vc_object_store/objects/ObjectStore.hpp"
 #include "vc_object_store/objects/TransactionJson.hpp"
 #include "vc_object_store/objects/Artifacts.hpp"
 #include "vc_object_store/objects/Selections.hpp"
 #include "vc_object_store/client/HostedStore.hpp"
-#include "vc_object_store/objects/Hub.hpp"
 #include "vc_object_store/objects/Project.hpp"
-#include "vc_reader/sftp.hpp"
 #include "vc_object_store/object_links/ObjectLinks.hpp"
 #include "vc_object_store/CtSheetNormal.hpp"
 using namespace vc::python;
@@ -737,48 +735,6 @@ NB_MODULE(_native, m)
     }, nb::arg("path"), nb::arg("name"), nb::arg("meta") = nb::none(), nb::arg("author"),
        "Create a store at path holding a project named name.");
     m.def("project_resource_uuid", &vo::projectResourceUuid, nb::arg("kind"), nb::arg("location"), nb::arg("owner") = "");
-    m.def("hub_init", &vo::initHub, nb::arg("path"), nb::arg("author"),
-          "Turn a local store with no other connections into a hub for a network share.");
-    m.def("hub_clone", [](const std::filesystem::path& hub, const std::filesystem::path& replica, const std::string& author) {
-        vo::OpenOptions options; options.author = author;
-        nb::gil_scoped_release release;
-        vo::cloneHub(hub, replica, options);
-    }, nb::arg("hub"), nb::arg("replica"), nb::arg("author"), "Copy a hub into a new local replica.");
-    m.def("hub_detach", &vo::detachHub, nb::arg("replica"), nb::arg("author"),
-          "Drop a replica's hub tables, leaving an ordinary store.");
-    m.def("hub_lock_age", [](const std::filesystem::path& hub) {
-        nb::gil_scoped_release release;
-        return vo::hubLockAge(hub);
-    }, nb::arg("hub"), "Seconds since the hub's lock was taken, or None when it is unlocked.");
-    m.def("hub_remove_lock", [](const std::filesystem::path& hub) {
-        nb::gil_scoped_release release;
-        vo::removeHubLock(hub);
-    }, nb::arg("hub"), "Remove a stale lock left by a crashed client, once no client is syncing.");
-
-    // ssh prompts arrive on a helper thread while hub calls run with the GIL released.
-    m.def("set_sftp_authenticator", [](nb::object callback) {
-        if (callback.is_none()) return vcr::sftp::setAuthenticator({});
-        auto held = std::shared_ptr<nb::object>(new nb::object(std::move(callback)), [](nb::object* object) {
-            nb::gil_scoped_acquire acquire;
-            delete object;
-        });
-        vcr::sftp::setAuthenticator([held](const vcr::sftp::Prompt& prompt) -> std::optional<std::string> {
-            nb::gil_scoped_acquire acquire;
-            const auto answer = (*held)(prompt.destination, prompt.text, prompt.confirmation);
-            if (answer.is_none()) return std::nullopt;
-            return nb::cast<std::string>(answer);
-        });
-    }, nb::arg("callback").none(),
-       "Answer ssh prompts for sftp:// hubs: callback(destination, prompt, confirmation) returns the answer, "
-       "or None to cancel. Without one, ssh runs in batch mode (keys and agent only).");
-    m.def("use_terminal_sftp_prompts", [] {
-        auto authenticator = vcr::sftp::terminalAuthenticator();
-        const bool available = static_cast<bool>(authenticator);
-        vcr::sftp::setAuthenticator(std::move(authenticator));
-        return available;
-    }, "Ask ssh prompts on the controlling terminal; returns False when there is none.");
-    // A callback must not outlive the interpreter.
-    nb::module_::import_("atexit").attr("register")(nb::cpp_function([] { vcr::sftp::setAuthenticator({}); }));
 
     auto store = nb::class_<PyObjectStore>(m, "ObjectStore")
         .def_static("create", &PyObjectStore::create, nb::arg("path"), nb::arg("author"),
@@ -1078,53 +1034,6 @@ NB_MODULE(_native, m)
         }, nb::arg("object_kind") = std::nullopt, nb::arg("tag") = std::nullopt,
            nb::arg("object_uuids") = std::vector<std::string>{}, nb::arg("connected_to") = std::nullopt,
            nb::arg("edge_kinds") = std::vector<std::string>{}, nb::arg("fields") = std::vector<std::string>{}, nb::arg("include_retired") = false)
-        .def_prop_ro("replica_uuid", readMethod<&vo::ObjectStore::replicaUuid>())
-        .def("fork_replica", [](PyObjectStore& self) {
-            self.require();
-            if (self.db.use_count() != 1) throw std::runtime_error("fork_replica requires an idle store");
-            return self.require().forkReplica();
-        })
-        .def("hub_sync", [](PyObjectStore& self, bool pull, bool push) {
-            auto& db = self.require();
-            if (self.db.use_count() != 1) throw std::runtime_error("hub_sync requires an idle store");
-            vo::HubSyncReport report;
-            { nb::gil_scoped_release release;
-              report = pull && push ? vo::hubSync(db) : pull ? vo::hubPull(db) : vo::hubPush(db); }
-            return hubReport(report);
-        }, nb::arg("pull") = true, nb::arg("push") = true,
-           "Pull hub changes and/or push local ones. Pushing changed hub objects requires their leases.")
-        .def("acquire_leases", [](PyObjectStore& self, const std::vector<std::string>& uuids, int64_t seconds) {
-            auto& db = self.require();
-            std::vector<vo::HubLease> leases;
-            { nb::gil_scoped_release release; leases = vo::acquireLeases(db, uuids, seconds); }
-            return hubLeases(leases);
-        }, nb::arg("uuids"), nb::arg("seconds") = vo::kDefaultLeaseSeconds)
-        .def("renew_leases", [](PyObjectStore& self, const std::vector<std::string>& uuids, int64_t seconds) {
-            auto& db = self.require();
-            std::vector<vo::HubLease> leases;
-            { nb::gil_scoped_release release; leases = vo::renewLeases(db, uuids, seconds); }
-            return hubLeases(leases);
-        }, nb::arg("uuids"), nb::arg("seconds") = vo::kDefaultLeaseSeconds)
-        .def("release_leases", [](PyObjectStore& self, const std::vector<std::string>& uuids) {
-            auto& db = self.require();
-            nb::gil_scoped_release release;
-            vo::releaseLeases(db, uuids);
-        }, nb::arg("uuids"))
-        .def("hub_status", [](PyObjectStore& self) -> nb::object {
-            const auto status = vo::hubStatus(self.require());
-            if (!status) return nb::none();
-            nb::dict result; result["hub"] = status->hub.string(); result["replica"] = status->replica;
-            result["pending"] = status->pending; result["conflicts"] = hubConflicts(status->conflicts);
-            result["leases"] = hubLeases(status->leases);
-            return result;
-        }, "Local hosting state of a replica, or None for an ordinary store.")
-        .def("resolve_hub_conflict", [](PyObjectStore& self, const std::string& uuid, const std::string& keep) {
-            auto& db = self.require();
-            if (self.db.use_count() != 1) throw std::runtime_error("resolve_hub_conflict requires an idle store");
-            vo::HubSyncReport report;
-            { nb::gil_scoped_release release; report = vo::resolveHubConflict(db, uuid, keep); }
-            return hubReport(report);
-        }, nb::arg("uuid"), nb::arg("keep"))
         .def("import_json", writeMethod<&vo::ObjectStore::importJson>(),
              nb::arg("json_text"))
         .def(

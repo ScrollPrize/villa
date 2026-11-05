@@ -85,33 +85,13 @@ build/bin/vc_object_links --db objects.vcobj --author "$USER" \
   --link-fiber-surfaces --ct /data/ct.zarr
 ```
 
-A team can share a store as a hub file on a network share or on any SSH server.
-Initialize the hub from a local store that nothing else has open, then copy it
-into place (to a server, use `scp`):
-
-```sh
-vc_object_hub init objects.vcobj
-cp objects.vcobj /mnt/share/hub.vcobj
-```
-
-Nobody opens the hub directly. Each client clones it into a local replica,
-works there, and syncs; editing an object that already exists on the hub needs
-that object's lease (`vc_object_hub lease acquire REPLICA UUID`):
-
-```sh
-vc_object_hub clone /mnt/share/hub.vcobj ~/replica.vcobj
-# SSH access: stop all clients for the one-time conversion (Linux server).
-vc_object_hub enable-ssh-locking sftp://user@host/path/hub.vcobj
-vc_object_hub clone sftp://user@host/path/hub.vcobj ~/replica.vcobj
-vc_object_hub sync ~/replica.vcobj
-```
-
-In VC3D, File → Object Store → Clone Hosted Object Store... clones and attaches
-a replica, and Sync Hosted Object Store Now syncs it; initializing a hub is
-command-line only. See [hosted hub and replicas](docs/README.md#hosted-hub-and-replicas).
+A team shares a store by running `vc_object_server` on the machine that holds
+it; clients attach its endpoint (through an SSH tunnel or a trusted private
+network) and never open the database themselves. In VC3D, Stores > Attach
+Hosted Store... adds one. See [hosting a store](docs/README.md#hosting-a-store-vc_object_server).
 
 See the [API guide](docs/README.md) for checked revisions, geometry reads and
-edits, graph snapshots, spatial queries, and hosted hubs. Detector distances
+edits, graph snapshots, spatial queries, and hosted stores. Detector distances
 and scale options use working voxels. CT normals use uint8 Zarr data with complete
 109³ support. Native CT opening supports local and anonymous HTTP/S3 arrays and
 pyramid levels; credentials and disk-cache configuration are not exposed by this
@@ -129,35 +109,12 @@ Tests are self-contained and do not require the volume-cartographer checkout or
 its fixture data. A standalone build and regression run (using installed dependencies):
 
 ```sh
-AGENTS_AGENT_MODE=1 cmake -S vc_object_store -B /tmp/vc-hub-lock-build -G Ninja \
+AGENTS_AGENT_MODE=1 cmake -S vc_object_store -B /tmp/vc-object-store-build -G Ninja \
   -DCMAKE_BUILD_TYPE=RelWithDebInfo -DVC_OBJECT_STORE_BUILD_ADAPTERS=ON \
   -DVC_OBJECT_STORE_BUILD_LINKING=OFF -DVC_OBJECT_STORE_BUILD_TESTS=ON
-cmake --build /tmp/vc-hub-lock-build -j 4
-ctest --test-dir /tmp/vc-hub-lock-build --output-on-failure
+cmake --build /tmp/vc-object-store-build -j 4
+ctest --test-dir /tmp/vc-object-store-build --output-on-failure
 ```
-
-`object_store_sftp` uses a local SSH fixture executing the production remote
-command with real OpenSSH `sftp-server`, `flock` and `timeout`; it needs no sshd
-or credentials. It covers concurrent sessions, legacy-client exclusion,
-client death during a spilled write, lost replies without reconnect, server
-deadlines, journal recovery, cache reuse across operations, cache invalidation
-after another writer, and sync/push/pull with 250 ms reply delays. The process-lock fixture
-requires Linux; client portability does not depend on those utilities locally.
-To repeat the recovery and two-replica sync checks on real fiber data, supply
-an ordinary store in the current schema. The fixture snapshots it without
-changing the input:
-
-```sh
-/tmp/vc-hub-lock-build/bin/test_object_store_sftp --real-store /path/to/fibers.vcobj
-```
-
-SFTP database reads use bounded read-ahead (eight 64 KiB blocks per handle)
-through the existing pipelined transport. Cached bytes are invalidated between
-hub-lock sessions and on writes/truncation; small header probes and journals
-remain unbuffered. The hub lock still protects one consistent SQLite snapshot.
-Incoming geometry is staged before taking the replica's write lock.
-See [read-ahead measurements and validation](docs/sftp-read-ahead.md) for the
-tradeoff between latency and extra bytes, and the optional real-fiber pull benchmark.
 
 ## Transformed geometry views
 

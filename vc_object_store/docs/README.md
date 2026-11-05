@@ -76,7 +76,7 @@ session.submit(attachment, request); // TransactionConflict when the object move
 Keep all work using a reader inside its callback and do not reenter the
 session from a callback. A session holds any number of attachments (for example a
 project store beside a hosted team store), each with its own access mode,
-writer, events and hub sync; a store is attached at most once. `attach()` adds one,
+writer and events; a store is attached at most once. `attach()` adds one,
 `replace(attachment, ...)` swaps one for another store, `detach(attachment)` removes
 one, and `attachments()` lists them in attach order. Replacement validates the new
 database first, drains the old attachment's accepted writes, cancels/waits for
@@ -99,16 +99,12 @@ at the versions they started from, add every endpoint of their relationships
 (`expectRelationshipEndpoints`), and let geometry operations keep affected
 relationships as recorded (`keepAffectedRecorded`, or `UpdateGeometryArraysOp`
 with `affected = "keep_recorded"`; "retain" when the relationships still apply,
-as for point collections whose points keep their identity). On a hub replica
-`submit` first leases the existing objects the request expects. `copyObject(from, to, uuid)` copies an
+as for point collections whose points keep their identity). `copyObject(from, to, uuid)` copies an
 object's current record and geometry from one attachment into another as a new
 object (new UUID, `meta.copied_from` naming the source store, object, numbered
 version and geometry revision; point annotations kept); relationships, history and approval stay
-behind. `artifactDirectory(attachment, uuid)` returns (and creates; pass
-`create = false` to look for a file without creating it)
-`<store>.artifacts/<object uuid>/` for an object's non-geometry files such as
-fitted models or mesh exports; a hosted replica uses the directory beside its hub
-so replicas and services share it (an `sftp://` hub has none). `finalize()` waits
+behind. An editor checks that the version on screen is still current with
+`requireCurrent(pin)` before it starts editing. `finalize()` waits
 for accepted writes on every attachment; requests are already committed when `submit()` returns.
 
 Fiber consumers use the same `selectObjects`, `geometryRegion`, geometry, and
@@ -221,9 +217,8 @@ cacheDirectory)` returns one artifact as a local file kept by content
 (`<cacheDirectory>/<sha256>/<file name>`, written unless it is there); Lasagna's
 service reads fitted models this way. Command-line tools publish through
 `ToolObjects::publishArtifacts`, expecting the version they read (or the
-current version of an object they created). `artifactDirectory` (a shared
-directory) remains only for hub replicas and project copies; it goes with the
-hub (phase 5).
+current version of an object they created). `copyProject` copies the
+artifact directory with the database.
 
 ### Durable drafts
 
@@ -388,9 +383,8 @@ names bytes the store does not hold. This check runs whichever API wrote the
 manifest, typed request or direct `setMeta`. Bytes are never deleted while
 the store is in use, because historical versions keep naming them. A backup
 copies this directory with the database. The older mutable per-object
-directories (`ObjectStoreSession::artifactDirectory`) are no longer read or
-written by VC3D, the command-line tools or Lasagna; files left in them by
-earlier versions are not migrated.
+directories (`<store>.artifacts/<object uuid>/`) are no longer read or
+written; files left in them by earlier versions are not migrated.
 
 ### Hosting a store (`vc_object_server`)
 
@@ -658,208 +652,6 @@ explicit dependencies. Endpoint order is canonical, so put directional roles in
 metadata. Arbitrary UUID strings in JSON are not tracked references.
 `delete_object` retains history and still rejects managed geometry/current edge
 references. There is no history/payload purge API.
-
-## Hosted hub and replicas
-
-A team shares one store by keeping a **hub** `.vcobj` on a network filesystem
-(an sshfs mount, NFS or SMB) or on any server reachable over SSH, addressed as
-`sftp://[user@]host[:port]/path/hub.vcobj` (`ssh://` works too). Nobody opens the hub to work. Each client clones
-it into a local **replica** and opens that replica like any other store, so reads
-and viewport queries stay on local disk. Hosting needs no object-store installation or persistent service on the server. Public
-signatures are in [Hub.hpp](../include/vc_object_store/objects/Hub.hpp).
-
-```sh
-vc_object_hub init objects.vcobj        # locally, with no other connections
-cp objects.vcobj /mnt/share/hub.vcobj   # then place it on the share
-vc_object_hub clone /mnt/share/hub.vcobj ~/objects-replica.vcobj
-vc_object_hub lease acquire ~/objects-replica.vcobj UUID
-#   ... edit UUID with any client of the replica ...
-vc_object_hub sync ~/objects-replica.vcobj
-# Or use SSH, with every client stopped during this one-time opt-in:
-vc_object_hub enable-ssh-locking sftp://alice@data.example.org/share/hub.vcobj
-vc_object_hub clone sftp://alice@data.example.org/share/hub.vcobj ~/objects-replica.vcobj
-```
-
-**SFTP addresses.** Hub files addressed as `sftp://` or `ssh://` use a dedicated
-SSH command session for each hub operation. The command runs the existing
-OpenSSH `sftp-server` under `flock --no-fork`, so the process doing all database
-and journal I/O also owns the kernel lock. On exit or crash its lock is released;
-the next operation checks for and recovers any hot journal. A lost
-connection fails the operation, including rollback attempts on that connection;
-individual reads/writes are never replayed on a newly acquired lock. Retry the
-whole hub operation. The existing push-outcome tracking handles a lost commit
-acknowledgment.
-
-The **server** needs Linux, SSH command execution permission, `flock` (util-linux),
-`timeout` (GNU coreutils), and an external OpenSSH `sftp-server` in one of
-`/usr/lib/openssh`, `/usr/lib/ssh`, `/usr/libexec/openssh`, or `/usr/libexec`.
-The hub and lock should live on the server's local filesystem. No root access,
-new listening port, or object-store software is required to run the command.
-Clients can run Linux, macOS or Windows with OpenSSH `ssh` on PATH; the Linux
-utilities run remotely. SSH config, keys, agent, ProxyJump and known_hosts still
-apply. SFTP-only accounts must be allowed to execute this command. Ordinary
-remote volumes continue to use the standard SFTP subsystem.
-
-On Linux/macOS clients, hub sessions share an application-private OpenSSH
-connection using a mode-0700 control directory under `/tmp`. An ordinary SFTP
-session keeps the transport connected; it holds no hub lock. Each operation
-still starts its own `flock`/`sftp-server` process and releases it on completion.
-This needs no SSH config changes or background daemon. Windows uses independent
-SSH connections and still benefits from SQLite cache reuse.
-
-**Migration:** stop every client and run `enable-ssh-locking HUB` once from an
-updated client. It creates `<hub>.lock/process-v1`, preserving the hub's access
-permissions. An existing legacy lock blocks migration: first establish that no
-client is using it, then use the legacy unlock command if necessary. Migration
-is idempotent and never replaces an existing lock inode. The permanent nonempty
-`.lock` directory blocks old SFTP and mounted `unix-dotfile` clients, including
-cached connections. Every client must upgrade and use the SSH address afterward;
-previously mounted replicas must be recloned through SSH after pushing their
-changes before migration. **Never delete this directory or its file**, including
-when it appears old: the kernel owns the live lock, not the file's existence.
-`unlock` refuses these hubs. Do not access the same database through alternate
-hard-linked paths with separate lock files.
-
-Lock acquisition waits at most 60 seconds. A server-side deadline terminates an
-operation after **30 minutes**, with a forced kill five seconds later if needed,
-so even a silently abandoned session eventually loses its lock. For long
-operations set `VC_HUB_SESSION_SECONDS` to a positive integer on the client
-before launching the application (for example `7200`). This bounds total
-session lifetime, not just idle time. Server-side SSH client-alive settings can
-shorten detection of unreachable clients. The SFTP inactivity timeout remains
-120 seconds. SQLite page reads still incur network round trips. Healthy SQLite
-connections retain their schema/page caches between operations and check the
-database change counter under the next lock. A failed operation or an unfinished
-transaction discards its cached connection before any retry.
-
-The protocol client is vc_reader's `vc_reader::sftp` library
-(`vc_reader/sftp.hpp`), which also serves remote volumes. The server must provide OpenSSH's
-`fsync@openssh.com` extension for durable writes; the VFS refuses writes without
-it.
-- Without a registered authenticator, `ssh` runs in batch mode: keys and the
-  agent only, and only hosts already in `known_hosts`.
-- With one (`vc::sftp::setAuthenticator`, Python `set_sftp_authenticator`), every
-  ssh prompt (password, key passphrase, one-time code, accepting a new host key)
-  goes to the application through `SSH_ASKPASS`, with ssh's own wording. The
-  helper relays prompts through FIFOs in a private 0700 directory, so secrets
-  never appear in arguments or the environment. An accepted answer is reused
-  when a later connection to the same destination asks the same question; a
-  question repeated within one connection means the answer was wrong, so the
-  user is asked again. VC3D shows dialogs, `vc_object_hub` asks on the terminal
-  (Python: `use_terminal_sftp_prompts()`). Prompts need Linux or macOS; on
-  Windows `ssh` always runs in batch mode.
-- Writes are pipelined and collected before any read, sync or unlock, so a
-  commit costs about one round trip plus the bytes. Each page read is still one
-  round trip, as over sshfs.
-
-Both hub access methods keep SQLite's rollback journal. Hubs still accessed
-through filesystem paths open through the `unix-dotfile` VFS (`OpenOptions::sharedFile`). That VFS locks by creating `<hub>.lock` with an
-atomic `mkdir`, which works on network filesystems where WAL's shared memory and
-byte-range locks do not. Only hub operations open the file, and each holds the
-lock briefly. An ordinary open of a hub is refused, so nothing can switch it back
-to WAL. Stores without the `hub_*` tables behave exactly as before.
-
-**Leases.** Changing the record or geometry of an object that exists on the hub
-requires this replica to hold that object's lease. The check runs at commit, in
-the library, so it covers every client of the replica. Objects created locally
-need no lease until they are pushed, and a push grants their creator a lease.
-`acquire_leases` is all-or-nothing. It refuses objects another replica holds,
-and objects changed on the hub since this replica last pulled them
-(`HubLeaseRefused::held` / `stale`); pull, then retry. Leases expire after their
-duration (default ten minutes), so clients need roughly synchronized clocks.
-Releasing a lease requires its changes to be pushed first. The hub enforces
-unexpired leases on direct edits too.
-
-Relationships are shared records, not leased. Linking to someone else's object,
-or saving an edit that revalidates its links, does not need the other object's
-lease. Two replicas changing the same relationship produce a conflict.
-
-**Sync.** A replica tracks the hub's journal cursor, the hub version (latest
-journal sequence) of each record it installed, and its own unpushed changes.
-- `hubPull` installs records changed on the hub since the cursor, with their
-  geometry history, in one replica transaction.
-- `hubPush` publishes local changes in one hub transaction. Each record must
-  still have the hub version it was edited from, and each changed hub object must
-  be leased to this replica. The push copies geometry history, validates
-  relationship dependencies, and verifies the result.
-- A retry after a push whose outcome was lost recognizes its own records.
-
-**Applications** do not drive sync themselves. When an `ObjectStoreSession`
-attaches a writable hosted replica, it starts a background worker. The worker
-pulls and pushes every `HubSessionOptions::syncInterval`, and pushes shortly
-after each `submit()`; pulled changes arrive through `takeEvents()` like any other
-external commit. Before editing, a caller takes
-`holdLeases(attachment, uuids)`. The returned `LeaseHold` keeps the leases
-renewed while it lives. Once no hold remains and the changes are pushed, the
-worker releases the lease. A hold pulls once first if the hub is ahead, and it
-is a no-op for ordinary stores, so callers need not check what they attached.
-`hubStatus(attachment)` reports pending records, conflicts, the last error and
-sync time for that replica, and a `StoreSessionEvent::Kind::Hub` event tagged with
-the attachment announces each change. `syncHub(attachment)` and
-`resolveHubConflicts(attachment, keep)` act asynchronously. Scripts that
-do not use a session call `hub_sync` and the lease functions directly.
-
-Python services use the same session: `ObjectStoreSession().attach(replica,
-author)` starts background sync, `hold_leases(attachment, uuids)` is a context
-manager whose leases renew until it exits, and `hub_status`, `sync_hub`,
-`artifact_directory`, `copy_object` and `take_events` mirror the C++ calls. Data
-is read and edited through `ObjectStore.open(replica)` connections to the same
-file; the session pushes their commits.
-
-```python
-import vc_object_store as vos
-vos.hub_clone(hub, replica, "lasagna")            # once per machine
-session = vos.ObjectStoreSession()
-attachment = session.attach(replica, "lasagna")
-with session.hold_leases(attachment, [surface_uuid]):
-    with vos.ObjectStore.open(replica, author="lasagna") as db:
-        ...  # edit the surface, add objects
-    model_dir = session.artifact_directory(attachment, surface_uuid)
-```
-
-Records changed both locally and on the hub become conflicts, and pushing stops
-until they are resolved. `resolveHubConflict(uuid, "hub")` installs the hub's
-record. `"local"` publishes this replica's record over it and requires the lease.
-Object revision UUIDs are per replica. Geometry revision
-UUIDs and the store UUID are shared.
-
-**Operations.**
-- SSH `clone` holds the process lock for the copy and uses large pipelined reads.
-  Mounted `clone` copies without the lock, then verifies the header change
-  counter and size under the lock. After three interrupted copies it falls back
-  to copying under the lock.
-- For **legacy mounted hubs only**, a dead client can leave `<hub>.lock` behind.
-  Once no client is syncing, `vc_object_hub unlock HUB --force` removes it; the
-  next open recovers any interrupted write. Process-lock hubs recover without
-  removing the guard directory.
-- Legacy mounts must apply `mkdir` atomically and avoid stale caches. Mount NFS
-  with `noac`; mount sshfs (3.x) with
-  `-o direct_io,dir_cache=no,entry_timeout=0,attr_timeout=0,negative_timeout=0`.
-- Mounted and SSH hubs retain healthy SQLite connections/page caches between
-  operations. SSH file handles reopen under each new process lock; failed
-  sessions cannot reconnect or carry a transaction into a later operation.
-- Contention can time out an operation; retry it. No fairness is guaranteed.
-- `detach` turns a replica back into an ordinary store.
-
-The historical measurements below use the mounted transport, not SSH process
-locking.
-
-Measured on 2026-10-23 with RelWithDebInfo on Ubuntu arm64, median of 10
-iterations. "Local disk" uses a synthetic 20,000-fiber hub (354 MB). "Network"
-uses 765 real fibers with 186 links (98 MB) on a remote host, mounted with the
-sshfs options above at about 18 ms round-trip time.
-
-| Operation | Local disk | Network |
-| --- | ---: | ---: |
-| Clone | 0.4 s | 3.8 s |
-| Lease acquire | 13 ms | 460 ms |
-| One-fiber push (metadata + geometry edit) | 19 ms | 520 ms |
-| Pull of that change on another replica | 10 ms | 1,080 ms |
-| Sync with nothing to do | 6 ms | 140 ms |
-
-The first operation of a process also opens the hub, which takes about 2 s over
-the network. A pull after any hub commit rereads the index pages it needs: in
-rollback-journal mode, SQLite drops its page cache whenever the file changes.
 
 ## Volume identity and coordinate scale
 

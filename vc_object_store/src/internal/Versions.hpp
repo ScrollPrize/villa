@@ -25,8 +25,6 @@ class CommitPublisher {
 public:
     CommitPublisher(sqlite3* db, int64_t publishedAtUs);
     int64_t object(const std::string& objectUuid, const std::string& revisionUuid, bool deleted);
-    // An imported baseline: numbered, but not a publication of this commit.
-    int64_t baseline(const std::string& objectUuid, const std::string& revisionUuid);
     // nullopt revision records the relationship's deletion.
     int64_t relationship(const std::string& edgeUuid, const std::optional<std::string>& revisionUuid);
     std::optional<int64_t> sequence() const { return sequence_; }

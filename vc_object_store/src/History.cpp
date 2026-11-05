@@ -259,7 +259,7 @@ void detail::recordRelationshipValidation(sqlite3* db, const EdgeRecord& edge, b
     }
 }
 
-void detail::publishHistory(sqlite3* db, bool importedBindings)
+void detail::publishHistory(sqlite3* db)
 {
     GeometryPhase phase("detail::publishHistory");
     if (const auto pool = activeStatementPools.find(db); pool != activeStatementPools.end() && pool->second->actionConflict)
@@ -310,22 +310,20 @@ void detail::publishHistory(sqlite3* db, bool importedBindings)
         objects.emplace(object, std::move(p));
     }
     // A changed artifact manifest may only name bytes the store holds, whichever
-    // API wrote it (hub imports bring manifests whose bytes live elsewhere).
-    if (!importedBindings) {
-        std::optional<std::filesystem::path> storePath;
-        for (const auto& [object, p] : objects) {
-            if (!p.exists || !p.changed) continue;
-            const auto& meta = p.record.at("meta");
-            if (!meta.is_object() || !meta.contains(kArtifactsMetaKey)) continue;
-            const auto& manifest = meta.at(kArtifactsMetaKey);
-            if (p.parent) {
-                const auto before = metadata(db, *p.parent).at("meta");
-                if (before.is_object() && before.contains(kArtifactsMetaKey) && before.at(kArtifactsMetaKey) == manifest)
-                    continue;
-            }
-            if (!storePath) storePath = std::filesystem::path(sqlite3_db_filename(db, "main"));
-            checkArtifactReferences(*storePath, object, manifest);
+    // API wrote it.
+    std::optional<std::filesystem::path> storePath;
+    for (const auto& [object, p] : objects) {
+        if (!p.exists || !p.changed) continue;
+        const auto& meta = p.record.at("meta");
+        if (!meta.is_object() || !meta.contains(kArtifactsMetaKey)) continue;
+        const auto& manifest = meta.at(kArtifactsMetaKey);
+        if (p.parent) {
+            const auto before = metadata(db, *p.parent).at("meta");
+            if (before.is_object() && before.contains(kArtifactsMetaKey) && before.at(kArtifactsMetaKey) == manifest)
+                continue;
         }
+        if (!storePath) storePath = std::filesystem::path(sqlite3_db_filename(db, "main"));
+        checkArtifactReferences(*storePath, object, manifest);
     }
     // Ordinary metadata is independent unless the relationship declares a
     // dependency. Check the final state, not the order of earlier API calls.
@@ -343,10 +341,6 @@ void detail::publishHistory(sqlite3* db, bool importedBindings)
             for (const auto& [endpoint, anchor] : {std::pair{edge.aUuid, edge.aAnchor}, std::pair{edge.bUuid, edge.bAnchor}})
                 affected |= endpoint == object && dependencyMetadata(before, anchor) != dependencyMetadata(p.record, anchor);
             if (!affected) continue;
-            // A hub pull imports a previously published lifecycle decision.
-            // Preserve recorded pins; imported edge bindings below carry any
-            // separate revalidation. It does not import the peer's timeline.
-            if (importedBindings && lifecycleChanged) recordRelationshipValidation(db, edge, true);
             Statement validated(db, "SELECT a_meta,b_meta,recorded_only FROM history_validated_edges WHERE uuid=?",
                 edge.uuid);
             if (!validated.row() ||
@@ -389,16 +383,11 @@ void detail::publishHistory(sqlite3* db, bool importedBindings)
             }
             Statement validated(db, "SELECT recorded_only FROM history_validated_edges WHERE uuid=?", e.uuid);
             const bool revalidated = validated.row() && !validated.i64(0);
-            const auto importedEpochs = lifecycleBinding(db, *e.record);
             if (previous && !revalidated) {
-                if (e.aGeometry == previous->aGeometryRevision && (!importedBindings ||
-                    metadata(db, previous->aRevision).value("lifecycle_epoch", "") == importedEpochs.first))
-                    e.aPin = previous->aRevision;
-                if (e.bGeometry == previous->bGeometryRevision && (!importedBindings ||
-                    metadata(db, previous->bRevision).value("lifecycle_epoch", "") == importedEpochs.second))
-                    e.bPin = previous->bRevision;
+                if (e.aGeometry == previous->aGeometryRevision) e.aPin = previous->aRevision;
+                if (e.bGeometry == previous->bGeometryRevision) e.bPin = previous->bRevision;
             }
-            if (previous && (!importedBindings || (e.aPin && e.bPin)) && edgeToJson(previous->record, nullptr, false) == edgeToJson(*e.record, nullptr, false) &&
+            if (previous && edgeToJson(previous->record, nullptr, false) == edgeToJson(*e.record, nullptr, false) &&
                 e.aGeometry == previous->aGeometryRevision && e.bGeometry == previous->bGeometryRevision &&
                 dependencyMetadata(metadata(db, previous->aRevision), e.record->aAnchor) ==
                     dependencyMetadata(currentRecord(db, e.record->aUuid), e.record->aAnchor) &&
@@ -473,35 +462,17 @@ void detail::publishHistory(sqlite3* db, bool importedBindings)
         else
             execute(db, "DELETE FROM object_head_records WHERE object_uuid=?", parseUuid(object));
     }
-    auto pin = [&](const std::string& object, const std::optional<std::string>& geometry,
-                   const std::optional<std::string>& epoch = std::nullopt) {
+    auto pin = [&](const std::string& object, const std::optional<std::string>& geometry) {
         Statement s(db, "SELECT uuid FROM object_revisions WHERE object_uuid=? AND geometry_uuid IS ? ORDER BY seq DESC",
             parseUuid(object));
         if (geometry) s.bind(2, parseUuid(*geometry)); else s.bindNull(2);
-        while (s.row())
-            if (!epoch || metadata(db, s.uuid(0)).value("lifecycle_epoch", "") == *epoch) return s.uuid(0);
-        if (!importedBindings)
-            throw std::runtime_error("object history: relationship binding has no object revision");
-        // Hub pulls can supply older geometry
-        // without its object history. Preserve that binding with an explicitly
-        // incomplete, untimed baseline, never fabricated historical metadata.
-        const auto uuid = util::newUuid();
-        Statement baseline(db, "INSERT INTO object_revisions(uuid,object_uuid,geometry_uuid,metadata_delta,metadata_complete) VALUES(?,?,?,?,0)",
-            parseUuid(uuid), parseUuid(object));
-        if (geometry) baseline.bind(3, parseUuid(*geometry)); else baseline.bindNull(3);
-        auto record = currentRecord(db, object);
-        if (epoch) { record["lifecycle_epoch"] = *epoch; record["retired"] = false; }
-        baseline.bind(4, record.dump()); baseline.stepDone();
-        commit.baseline(object, uuid);
-        return uuid;
+        if (!s.row()) throw std::runtime_error("object history: relationship binding has no object revision");
+        return s.uuid(0);
     };
     for (const auto& edge : edges) {
         if (edge.record) {
-            const auto epochs = lifecycleBinding(db, *edge.record);
-            const auto aPin = edge.aPin ? *edge.aPin : pin(edge.record->aUuid, edge.aGeometry,
-                importedBindings ? std::optional(epochs.first) : std::nullopt);
-            const auto bPin = edge.bPin ? *edge.bPin : pin(edge.record->bUuid, edge.bGeometry,
-                importedBindings ? std::optional(epochs.second) : std::nullopt);
+            const auto aPin = edge.aPin ? *edge.aPin : pin(edge.record->aUuid, edge.aGeometry);
+            const auto bPin = edge.bPin ? *edge.bPin : pin(edge.record->bUuid, edge.bGeometry);
             execute(db, "INSERT INTO relationship_revisions VALUES(?,?,?,?,?,?,?)", parseUuid(edge.version), parseUuid(edge.uuid),
                 edgeToJson(*edge.record, nullptr, false).dump(), parseUuid(aPin), parseUuid(bPin),
                 parseOptionalUuid(edge.aGeometry), parseOptionalUuid(edge.bGeometry));

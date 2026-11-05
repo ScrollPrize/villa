@@ -188,14 +188,6 @@ int64_t CommitPublisher::object(const std::string& objectUuid, const std::string
     return version;
 }
 
-int64_t CommitPublisher::baseline(const std::string& objectUuid, const std::string& revisionUuid)
-{
-    const auto version = nextObject(objectUuid);
-    execute(db_, "INSERT INTO object_versions(object_uuid,version,generation,revision_uuid) VALUES(?,?,?,?)",
-        parseUuid(objectUuid), version, parseUuid(generation_), parseUuid(revisionUuid));
-    return version;
-}
-
 int64_t CommitPublisher::relationship(const std::string& edgeUuid, const std::optional<std::string>& revisionUuid)
 {
     begin();

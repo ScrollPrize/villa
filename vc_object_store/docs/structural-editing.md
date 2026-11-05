@@ -129,5 +129,4 @@ persistent geometry or metadata tree.
 Historical reads reconstruct deltas within the selected snapshot's chain.
 Structural checkpoints start new chains without removing earlier history. There
 are no automatic periodic checkpoints or pruning. Spatial queries use ordinary
-chunk/region bounds, including crossing segments. Hub sync transfers and
-verifies snapshots, deltas and referenced metadata payloads.
+chunk/region bounds, including crossing segments.

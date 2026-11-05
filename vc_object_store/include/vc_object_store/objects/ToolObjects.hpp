@@ -2,7 +2,6 @@
 #include "vc_object_store/objects/GeometryCoordinates.hpp"
 #include "vc_object_store/objects/ObjectStoreSession.hpp"
 
-#include <chrono>
 #include <filesystem>
 #include <map>
 #include <memory>
@@ -13,10 +12,9 @@
 
 namespace vc::objects {
 // A command-line tool's objects in one store: the revisions it read (and the
-// frame it read them in), the coordinates of what it creates, the pins of
-// what it writes back, and the wait for its writes to reach a hosted store's
-// hub. Several tools may use the same replica at once; reads may be noted
-// from several threads.
+// frame it read them in), the coordinates of what it creates and the pins of
+// what it writes back. Several tools may use the same store at once; reads
+// may be noted from several threads.
 class ToolObjects {
 public:
     ToolObjects(const std::filesystem::path& store, const std::string& tool);
@@ -43,11 +41,8 @@ public:
     // read it at, else its current version (an object the tool created).
     TransactionReceipt publishArtifacts(const std::string& uuid,
                                         const std::vector<std::pair<std::string, std::filesystem::path>>& files);
-    // The tool wrote to the store (finish waits for the hub then).
-    void wrote() { wrote_ = true; }
-    // Drain writes and, after any, wait until they reached the hub (no-op for
-    // local stores); throws when they did not.
-    void finish(std::chrono::seconds timeout = std::chrono::seconds(120));
+    // Drain accepted writes.
+    void finish();
 
 private:
     struct Read {
@@ -58,7 +53,6 @@ private:
     std::string tool_;
     std::shared_ptr<ObjectStoreSession> session_;
     AttachmentIdentity attachment_;
-    bool wrote_ = false;
     std::mutex mutex_;
     std::map<std::string, Read> read_;
 };

@@ -281,23 +281,23 @@ int main() try
     const auto named = session.copyObject(catalog, replacement, surface, "renamed");
     require(session.currentObject(replacement, named)->record.name == "renamed", "a copy can be named");
     {
-        // Editing holds the object from the revision on screen.
+        // Editing starts from the version on screen.
         const auto pin = pinOf(replacement, *session.currentObject(replacement, named));
         require(pin.stored() && pin.reference() == ObjectVersion{replacement.storeUuid, pin.generation, named, pin.version},
                 "pin of the current revision");
-        { auto held = session.holdForEditing(pin); }
+        session.requireCurrent(pin);
         auto stale = pin;
         ++stale.version;
         bool refused = false;
-        try { auto held = session.holdForEditing(stale); } catch (const std::runtime_error&) { refused = true; }
+        try { session.requireCurrent(stale); } catch (const std::runtime_error&) { refused = true; }
         require(refused, "a stale pin cannot be edited");
         StoreSessionEvent committed;
         committed.kind = StoreSessionEvent::Kind::Committed;
         committed.changes.push_back(JournalEntry{});
         committed.changes.back().kind = "surface";
-        StoreSessionEvent hub;
-        hub.kind = StoreSessionEvent::Kind::Hub;
-        require(committed.touches({"fiber", "surface"}) && !committed.touches({"fiber"}) && hub.touches({"fiber"}),
+        StoreSessionEvent attached;
+        attached.kind = StoreSessionEvent::Kind::Attached;
+        require(committed.touches({"fiber", "surface"}) && !committed.touches({"fiber"}) && attached.touches({"fiber"}),
                 "events say which record kinds they may have changed");
     }
     // Importing keeps the object's identity: its source version is its first
@@ -339,12 +339,6 @@ int main() try
     try { session.importObject(catalog, replacement, surface); } catch (const std::exception&) { refused = true; }
     require(refused, "an object is imported once");
     session.takeEvents();
-    const auto looked = session.artifactDirectory(replacement, surface, false);
-    require(!std::filesystem::exists(looked), "looking for artifacts creates nothing");
-    const auto artifacts = session.artifactDirectory(replacement, surface);
-    require(artifacts == looked, "looking and creating name the same directory");
-    require(artifacts == std::filesystem::path(replacementPath.string() + ".artifacts") / surface &&
-            std::filesystem::is_directory(artifacts), "artifacts live beside the store, one directory per object");
     session.detach(catalog);
     require(session.current(replacement) && !session.current(catalog), "detaching one keeps the other");
     require(exists(replacement, added), "remaining attachment still reads");

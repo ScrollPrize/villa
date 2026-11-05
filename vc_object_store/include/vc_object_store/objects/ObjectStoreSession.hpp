@@ -6,7 +6,6 @@
 #include "vc_object_store/objects/Artifacts.hpp"
 #include "vc_object_store/client/HostedStore.hpp"
 #include "vc_object_store/objects/GeometryRegion.hpp"
-#include "vc_object_store/objects/Hub.hpp"
 #include "vc_object_store/geometry/Geometry.hpp"
 #include "vc_object_store/objects/GeometryCoordinates.hpp"
 #include <chrono>
@@ -56,9 +55,8 @@ struct GeometryUnavailable : std::runtime_error {
 struct StoreSessionEvent {
     // Attached/Detached: an attachment joined or left the session (replace()
     // reports the old one's Detached before the new one's Attached).
-    // Hub: that attachment's hubStatus() changed.
     // A fetched object's geometry arriving is a Committed event.
-    enum class Kind { Attached, Detached, Committed, Hub, Draft };
+    enum class Kind { Attached, Detached, Committed, Draft };
     Kind kind = Kind::Attached;
     // Draft: this session's drafts of the objects in `changes` (recordUuid,
     // kind) were set, edited or cleared; `attachment` is empty for drafts
@@ -78,7 +76,7 @@ struct StoreSessionEvent {
     bool revalidate = false;
     // Whether it may have changed records of these kinds: a commit or draft
     // touching one (or a change of unknown kind), a revalidation, or any
-    // attachment or hub event.
+    // attachment event.
     bool touches(std::initializer_list<std::string_view> kinds) const;
 };
 
@@ -94,20 +92,6 @@ struct AttachedRegion {
 struct AttachedHit {
     AttachmentIdentity attachment;
     SurfaceProximityHit hit;
-};
-
-// Hosted replicas (objects/Hub.hpp) attached to a session sync in the background.
-struct HubSessionOptions {
-    std::chrono::milliseconds syncInterval{15000};
-    std::chrono::milliseconds pushDelay{2000};  // after a local action, to batch edits
-};
-
-struct HubSessionStatus {
-    std::vector<std::string> pending;   // records changed here and not yet pushed
-    std::vector<HubConflict> conflicts; // block pushing; see resolveHubConflicts
-    std::string error;                  // last failed sync; empty once one succeeds
-    std::optional<int64_t> syncedAtUs;  // last successful sync, UTC Unix microseconds
-    std::vector<HubLease> leases;       // as of the last hub contact
 };
 
 // A store served by vc_object_server, attached through its endpoint.
@@ -187,29 +171,11 @@ struct DraftRecovery {
     std::vector<PendingSubmission> pending;
 };
 
-namespace detail { struct HubLeaseCounts; class HubWorker; struct SurfaceDraft; class HostedAttachment; struct DurableDrafts; }
-
-// Keeps objects leased while it lives. Leases are renewed in the background;
-// once no hold remains and the object's changes are pushed, the lease is released.
-class LeaseHold {
-public:
-    LeaseHold() = default;
-    LeaseHold(LeaseHold&&) noexcept;
-    LeaseHold& operator=(LeaseHold&&) noexcept;
-    LeaseHold(const LeaseHold&) = delete;
-    LeaseHold& operator=(const LeaseHold&) = delete;
-    ~LeaseHold() { reset(); }
-    void reset();
-
-private:
-    friend class detail::HubWorker;
-    std::weak_ptr<detail::HubLeaseCounts> counts_;
-    std::vector<std::string> objects_;
-};
+namespace detail { struct SurfaceDraft; class HostedAttachment; struct DurableDrafts; }
 
 // Application-owned connection and lifetime boundary for any number of stores,
 // independent of object kind and UI toolkit. Each attachment is independent:
-// its own identity, access mode, writer, journal events and hub sync. Reads go
+// its own identity, access mode, writer and journal events. Reads go
 // through readStore(), whose reader must not escape the callback; writes are
 // checked typed requests (submit). Callbacks must not reenter the session. Cancellation is
 // cooperative. Detaching or replacing an attachment waits for its accepted reads
@@ -227,13 +193,12 @@ public:
     ObjectStoreSession& operator=(const ObjectStoreSession&) = delete;
 
     // Existing database only; read-only attachments reject all actions. A store
-    // is attached at most once. A writable hosted replica also starts background hub sync.
-    AttachmentIdentity attach(const std::filesystem::path&, const OpenOptions&, const HubSessionOptions& = {});
+    // is attached at most once.
+    AttachmentIdentity attach(const std::filesystem::path&, const OpenOptions&);
     // Swap one attachment for another store. The new store is validated first
     // (failure preserves the old attachment); the old one drains and delivers its
     // last commits before the new one is announced.
-    AttachmentIdentity replace(const AttachmentIdentity&, const std::filesystem::path&, const OpenOptions&,
-                               const HubSessionOptions& = {});
+    AttachmentIdentity replace(const AttachmentIdentity&, const std::filesystem::path&, const OpenOptions&);
     void detach(const AttachmentIdentity&);
     // A store hosted by vc_object_server (client/HostedStore.hpp). The session
     // never opens its database; use the typed operations below. Its
@@ -258,7 +223,6 @@ public:
     // Checked atomic request (objects/Transactions.hpp); conflicts throw
     // TransactionConflict. Hosted: transport failures leave the outcome
     // unknown; recover it with receipt() or submit the identical request again.
-    // A hub replica first leases the existing objects the request expects.
     TransactionReceipt submit(const AttachmentIdentity&, const TransactionRequest&);
     std::optional<TransactionReceipt> receipt(const AttachmentIdentity&, const std::string& requestUuid);
     // Hosted: current as of the last check (or a newer read).
@@ -420,14 +384,8 @@ public:
     // A pending submission's outcome: its saved receipt when it committed,
     // else the identical request sent again (the same rules as submitDurably).
     TransactionReceipt resolvePending(const AttachmentIdentity&, const std::string& requestUuid);
-    // Files that belong to an object but are not geometry (fitted models, mesh
-    // exports): <store>.artifacts/<object uuid>/, created unless `create` is
-    // false (looking for a file there). A hosted replica uses the directory
-    // beside its hub so every replica and service shares it; a hub addressed
-    // by sftp:// URL has no shared directory.
-    std::filesystem::path artifactDirectory(const AttachmentIdentity&, const std::string& objectUuid, bool create = true);
-    // The store file of an attachment (a hosted store's local replica), e.g. to
-    // hand to a tool that opens the same file.
+    // The store file of a local attachment, e.g. to hand to a tool that opens
+    // the same file. Throws for hosted attachments.
     std::filesystem::path path(const AttachmentIdentity&);
     // Drain accepted writes on every attachment. No delayed persistence or new geometry publication.
     void finalize();
@@ -435,35 +393,19 @@ public:
     // every record kind, tagged by attachment, in order per attachment.
     std::vector<StoreSessionEvent> takeEvents();
 
-    // Hosted replicas: lease objects before editing them, pulling once if the
-    // hub is ahead. Blocks on the hub; throws HubLeaseRefused when another
-    // replica holds one. Returns an empty hold for other stores.
-    LeaseHold holdLeases(const AttachmentIdentity&, const std::vector<std::string>& objects);
-    // Editing an object from the revision on screen: lease it (leasing may first
-    // pull the hub's newer record), then check that the pin is still its current
-    // revision. Throws when it is not.
-    LeaseHold holdForEditing(const PinnedObject&);
-    // nullopt unless the attachment is a writable hosted replica.
-    std::optional<HubSessionStatus> hubStatus(const AttachmentIdentity&) const;
-    // Asynchronous: sync now, or settle every conflict ("hub" or "local") then sync.
-    void syncHub(const AttachmentIdentity&);
-    // Sync now and block until that sync has finished: everything committed
-    // before the call is pushed and the hub's changes are pulled, unless the
-    // returned status reports an error or conflicts. nullopt when the attachment
-    // is not a writable hosted replica. Throws when no sync finishes in time.
-    std::optional<HubSessionStatus> syncHubAndWait(const AttachmentIdentity&, std::chrono::milliseconds timeout);
-    void resolveHubConflicts(const AttachmentIdentity&, const std::string& keep);
+    // Editing an object from the version on screen: throws unless the pin is
+    // still its current version.
+    void requireCurrent(const PinnedObject&);
 
 private:
     void submitCopy(const AttachmentIdentity& to, const ObjectCopy&);
     struct Attachment;
-    std::shared_ptr<Attachment> open(const std::filesystem::path&, const OpenOptions&, const HubSessionOptions&);
+    std::shared_ptr<Attachment> open(const std::filesystem::path&, const OpenOptions&);
     std::shared_ptr<Attachment> find(const AttachmentIdentity&) const;
     std::shared_ptr<Attachment> acquire(const AttachmentIdentity&, bool write);
     void release(Attachment&, bool write);
     void retire(const std::shared_ptr<Attachment>&);
     void observe(Attachment&);
-    void hubChanged(const Attachment*);
     void startFetching(Attachment&);
     // Runs `f(attachment)` while the attachment is admitted.
     template <class F> auto withAttachment(const AttachmentIdentity&, bool write, F&& f);

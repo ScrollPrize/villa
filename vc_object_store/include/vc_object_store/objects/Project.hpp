@@ -10,7 +10,7 @@
 //   kDatasetStorage, storageRef the location (URL or local path), tags and meta
 //   for the application. A shared resource (no owner) is everyone's; an owned
 //   one (meta.owner, e.g. a path on its author's disk) is its owner's alone.
-//   Its UUID is named by kind, location and owner, so replicas adding the same
+//   Its UUID is named by kind, location and owner, so clients adding the same
 //   resource agree on it. Removing one retires it.
 // - kProjectViewKind: one per author (name), its meta the author's view state.
 #include "vc_object_store/objects/StoreReader.hpp"
@@ -44,10 +44,9 @@ struct ProjectResource {
 // `name` with meta `meta`.
 void createProject(const std::filesystem::path& path, const std::string& name, const nlohmann::json& meta,
                    const OpenOptions& options);
-// A standalone copy of an attached project at `destination` (which must not
-// exist), named `name`: every object, relationship and its history, under a
-// store identity of its own (a copy of a hosted replica is not one), with the
-// project's artifact directory.
+// A standalone copy of a locally attached project at `destination` (which
+// must not exist), named `name`: every object, relationship and its history,
+// under a store identity of its own, with the project's artifacts.
 void copyProject(ObjectStoreSession&, const AttachmentIdentity&, const std::filesystem::path& destination,
                  const std::string& name, const OpenOptions& options);
 // The store's project record; nullopt for a store without one.

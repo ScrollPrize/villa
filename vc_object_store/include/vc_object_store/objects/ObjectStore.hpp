@@ -131,7 +131,8 @@ struct ObjectRevision {
     std::string uuid, objectUuid;
     std::optional<std::string> parentUuid, geometryRevision;
     int64_t sequence = 0;
-    // False for baselines a hub pull installed without their original metadata history.
+    // False for baselines imported without their original metadata history
+    // (recorded by stores converted from hub replicas).
     bool metadataComplete = true;
     // UTC Unix microseconds assigned once per atomic publication, monotonically
     // increasing within this store. Missing only for those untimed baselines.
@@ -207,11 +208,6 @@ struct OpenOptions {
     // as a full revision instead (unchanged chunks are shared by hash). Capped
     // at 256 MiB, the largest delta read back.
     std::size_t maxGeometryDeltaBytes = 256 * 1024 * 1024;
-    // A hosted hub on a network filesystem (sshfs, NFS, SMB): rollback journal
-    // and SQLite's unix-dotfile locking instead of WAL, one reader, no caches.
-    // Only the hub functions in objects/Hub.hpp open stores this way; ordinary
-    // opens of a hub are rejected so they cannot switch it back to WAL.
-    bool sharedFile = false;
     // Open as the store's hosting service: exclusive host-local ownership.
     // Fails while any standalone writable handle is open, and standalone
     // writable opens fail while the service holds it (see ObjectStore).
@@ -486,10 +482,6 @@ public:
 
     // Stable store identity, independent of its filesystem location.
     std::string uuid(const Txn&) const;
-
-    std::string replicaUuid(const Txn&) const;
-    // Assign a copied database its own replica identity.
-    std::string forkReplica();
 
     // Create/update by UUID (mint one if empty). Updates bump generation, stamp
     // changed_*, reset approval and journal. Returns the UUID.

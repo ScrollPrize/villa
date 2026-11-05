@@ -2,7 +2,6 @@
 #include "internal/History.hpp"
 #include "internal/Versions.hpp"
 #include "imports/SourceIdentityIndex.hpp"
-#include "hub/HubRules.hpp"
 
 namespace vc::objects {
 using namespace detail;
@@ -44,7 +43,6 @@ void Txn::release(bool commit)
         if (commit && write_) {
             refreshSourceIdentityIndex(conn);
             publishHistory(conn);
-            enforceHubRules(conn, *activeStatementPools.at(conn), db_->impl_->hubRole);
             auto expectedObjects = expectedObjectVersions_;
             for (const auto& [uuid, expected] : expectedRevisions_) expectedObjects.emplace(uuid, std::nullopt);
             receipt_ = finishReceipt(conn, *activeStatementPools.at(conn), expectedObjects, expectedRelationshipVersions_);
@@ -103,10 +101,7 @@ WriteTxn ObjectStore::write()
         pool.publishedSequence.reset();
         pool.commitAuthor = impl_->options.author; pool.commitHost = impl_->hostname;
     }
-    try {
-        exec(impl_->writer, "BEGIN IMMEDIATE;");
-        if (impl_->hubRole != HubRole::None) beginHubWrite(impl_->writer, *impl_->statementPools.at(impl_->writer));
-    }
+    try { exec(impl_->writer, "BEGIN IMMEDIATE;"); }
     catch (...) { sqlite3_exec(impl_->writer, "ROLLBACK;", nullptr, nullptr, nullptr); activeStatementPools.erase(impl_->writer); throw; }
     lock.release(); // WriteTxn releases the mutex on commit or rollback.
     return WriteTxn(this, impl_->writer);

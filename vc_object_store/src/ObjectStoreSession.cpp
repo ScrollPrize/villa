@@ -4,12 +4,10 @@
 #include "internal/Artifacts.hpp"
 #include <set>
 #include "vc_object_store/objects/ObjectStoreSession.hpp"
-#include "hub/HubWorker.hpp"
 #include "internal/SurfaceDrafts.hpp"
 #include "vc_object_store/objects/ObjectCopy.hpp"
 #include "vc_object_store/objects/StoreReader.hpp"
 #include "vc_object_store/objects/TransactionJson.hpp"
-#include "vc_reader/sftp.hpp"
 #include "vc_object_store/Uuid.hpp"
 #include <algorithm>
 #include <nlohmann/json.hpp>
@@ -40,8 +38,6 @@ struct ObjectStoreSession::Attachment {
     // writer serializes accepted actions; journal guards journalPosition.
     std::mutex writer, journal;
     int64_t journalPosition = 0;
-    // Hosted replicas only; declared after store so it stops first.
-    std::unique_ptr<detail::HubWorker> hub;
     // Writable attachments: fetches the geometry of objects published elsewhere
     // (setGeometryFetcher).
     std::unique_ptr<detail::FetchQueue> fetches;
@@ -82,7 +78,7 @@ ObjectStoreSession::~ObjectStoreSession()
 }
 
 std::shared_ptr<ObjectStoreSession::Attachment> ObjectStoreSession::open(const std::filesystem::path& path,
-    const OpenOptions& options, const HubSessionOptions& hubOptions)
+    const OpenOptions& options)
 {
     // Reads that reach objects without local geometry queue their fetch.
     std::unique_ptr<detail::FetchQueue> fetches;
@@ -106,11 +102,10 @@ std::shared_ptr<ObjectStoreSession::Attachment> ObjectStoreSession::open(const s
     return next;
 }
 
-AttachmentIdentity ObjectStoreSession::attach(const std::filesystem::path& path, const OpenOptions& options,
-                                              const HubSessionOptions& hubOptions)
+AttachmentIdentity ObjectStoreSession::attach(const std::filesystem::path& path, const OpenOptions& options)
 {
     std::lock_guard transition(transition_);
-    auto next = open(path, options, hubOptions);
+    auto next = open(path, options);
     {
         std::lock_guard lock(mutex_);
         if (std::any_of(attached_.begin(), attached_.end(),
@@ -121,19 +116,16 @@ AttachmentIdentity ObjectStoreSession::attach(const std::filesystem::path& path,
         events_.push_back({StoreSessionEvent::Kind::Attached, next->identity, next->journalPosition, {}});
     }
     startFetching(*next);
-    if (next->writable && vc::objects::hubStatus(next->store()))
-        next->hub = std::make_unique<detail::HubWorker>(next->store(), hubOptions,
-            [this, owner = next.get()] { hubChanged(owner); });
     return next->identity;
 }
 
 AttachmentIdentity ObjectStoreSession::replace(const AttachmentIdentity& identity, const std::filesystem::path& path,
-    const OpenOptions& options, const HubSessionOptions& hubOptions)
+    const OpenOptions& options)
 {
     std::lock_guard transition(transition_);
     const auto previous = find(identity);
     if (!previous) throw std::runtime_error("object-store attachment is missing or superseded");
-    auto next = open(path, options, hubOptions);
+    auto next = open(path, options);
     {
         std::lock_guard lock(mutex_);
         if (std::any_of(attached_.begin(), attached_.end(), [&](const auto& a) {
@@ -148,9 +140,6 @@ AttachmentIdentity ObjectStoreSession::replace(const AttachmentIdentity& identit
         events_.push_back({StoreSessionEvent::Kind::Attached, next->identity, next->journalPosition, {}});
     }
     startFetching(*next);
-    if (next->writable && vc::objects::hubStatus(next->store()))
-        next->hub = std::make_unique<detail::HubWorker>(next->store(), hubOptions,
-            [this, owner = next.get()] { hubChanged(owner); });
     return next->identity;
 }
 
@@ -175,10 +164,8 @@ void ObjectStoreSession::retire(const std::shared_ptr<Attachment>& attachment)
     lock.lock();
     std::erase(attached_, attachment);
     events_.push_back({StoreSessionEvent::Kind::Detached, attachment->identity, attachment->journalPosition, {}});
-    // Stop the replica's sync and the catalog fetcher outside the lock their
-    // status reports take.
+    // Stop the catalog fetcher outside the lock.
     lock.unlock();
-    attachment->hub.reset();
     attachment->fetches.reset();
 }
 
@@ -267,18 +254,10 @@ TransactionRequest ObjectStoreSession::newRequest(const AttachmentIdentity& iden
 
 TransactionReceipt ObjectStoreSession::submit(const AttachmentIdentity& identity, const TransactionRequest& request)
 {
-    // A hub replica edits only leased objects: lease the existing ones the
-    // request expects (an empty hold elsewhere). Goes away with the hub.
-    std::vector<std::string> existing;
-    for (const auto& [uuid, version] : request.expectedObjects)
-        if (version) existing.push_back(uuid);
-    const auto leases = holdLeases(identity, existing);
     return withAttachment(identity, true, [&](Attachment& attachment) {
         if (attachment.remote) return attachment.remote->submit(request);
         std::lock_guard writer(attachment.writer);
-        auto receipt = attachment.store().submit(request);
-        if (attachment.hub) attachment.hub->requestSync(true);
-        return receipt;
+        return attachment.store().submit(request);
     });
 }
 
@@ -595,8 +574,6 @@ void ObjectStoreSession::startFetching(Attachment& attachment)
                     if (!fetch && meta.is_object() && meta.contains(key)) fetch = fetcher;
             }
             if (!fetch) throw std::runtime_error("no geometry fetcher for " + uuid);
-            // A placeholder another replica pushed is edited by fetching it.
-            const auto lease = holdLeases(identity, {uuid});
             fetch(held->store(), uuid, [&](const VersionSelection& expected, const Action& action) {
                 return fetchWrite(identity, expected, action);
             });
@@ -617,7 +594,6 @@ TransactionReceipt ObjectStoreSession::fetchWrite(const AttachmentIdentity& iden
         callback(attachment->store(), txn);
         txn.commit();
         committed = *txn.receipt();
-        if (attachment->hub) attachment->hub->requestSync(true);
     } catch (...) { release(*attachment, false); throw; }
     release(*attachment, false);
     return committed;
@@ -1227,24 +1203,6 @@ std::vector<std::vector<AttachedHit>> ObjectStoreSession::nearestSurfaces(const 
     return result;
 }
 
-std::filesystem::path ObjectStoreSession::artifactDirectory(const AttachmentIdentity& identity, const std::string& objectUuid,
-                                                           bool create)
-{
-    const auto object = util::canonicalUuid(objectUuid);
-    std::filesystem::path base;
-    auto attachment = acquire(identity, false);
-    try {
-        if (const auto hub = vc::objects::hubStatus(attachment->store())) base = hub->hub;
-        else base = attachment->store().path();
-    } catch (...) { release(*attachment, false); throw; }
-    release(*attachment, false);
-    if (vcr::sftp::isSftpUrl(base.string()))
-        throw std::runtime_error("an sftp:// hub has no shared artifact directory; mount the share instead");
-    auto directory = std::filesystem::path(base.string() + ".artifacts") / object;
-    if (create) std::filesystem::create_directories(directory);
-    return directory;
-}
-
 std::string ObjectStoreSession::location(const AttachmentIdentity& identity)
 {
     return withAttachment(identity, false, [](Attachment& attachment) {
@@ -1311,67 +1269,12 @@ bool StoreSessionEvent::touches(std::initializer_list<std::string_view> kinds) c
     });
 }
 
-LeaseHold ObjectStoreSession::holdForEditing(const PinnedObject& pin)
+void ObjectStoreSession::requireCurrent(const PinnedObject& pin)
 {
-    auto lease = holdLeases(pin.attachment, {pin.object.objectUuid});
     readStore(pin.attachment, [&](const StoreReader& reader, const auto&) {
         const auto head = reader.currentObject(pin.object.objectUuid);
         if (!head || head->version != pin.version || head->generation != pin.generation)
             throw std::runtime_error("It changed in the object store since it was opened; reopen it to edit");
     });
-    return lease;
-}
-
-LeaseHold ObjectStoreSession::holdLeases(const AttachmentIdentity& identity, const std::vector<std::string>& objects)
-{
-    auto attachment = acquire(identity, true);
-    LeaseHold hold;
-    try {
-        if (attachment->hub) hold = attachment->hub->hold(objects);
-    } catch (...) { release(*attachment, true); throw; }
-    release(*attachment, true);
-    return hold;
-}
-
-std::optional<HubSessionStatus> ObjectStoreSession::hubStatus(const AttachmentIdentity& identity) const
-{
-    std::lock_guard lock(mutex_);
-    for (const auto& attachment : attached_)
-        if (attachment->identity == identity && attachment->accepting && attachment->hub) return attachment->hub->status();
-    return std::nullopt;
-}
-
-void ObjectStoreSession::syncHub(const AttachmentIdentity& identity)
-{
-    std::lock_guard lock(mutex_);
-    for (const auto& attachment : attached_)
-        if (attachment->identity == identity && attachment->hub) attachment->hub->requestSync(false);
-}
-
-std::optional<HubSessionStatus> ObjectStoreSession::syncHubAndWait(const AttachmentIdentity& identity,
-                                                                   std::chrono::milliseconds timeout)
-{
-    // Admission keeps the worker alive: detaching waits for the sync.
-    auto attachment = acquire(identity, false);
-    std::optional<HubSessionStatus> status;
-    try {
-        if (attachment->hub) status = attachment->hub->syncAndWait(timeout);
-    } catch (...) { release(*attachment, false); throw; }
-    release(*attachment, false);
-    return status;
-}
-
-void ObjectStoreSession::resolveHubConflicts(const AttachmentIdentity& identity, const std::string& keep)
-{
-    std::lock_guard lock(mutex_);
-    for (const auto& attachment : attached_)
-        if (attachment->identity == identity && attachment->hub) attachment->hub->requestResolve(keep);
-}
-
-void ObjectStoreSession::hubChanged(const Attachment* owner)
-{
-    std::lock_guard lock(mutex_);
-    for (const auto& attachment : attached_)
-        if (attachment.get() == owner) events_.push_back({StoreSessionEvent::Kind::Hub, attachment->identity, 0, {}});
 }
 }
