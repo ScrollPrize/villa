@@ -21,10 +21,42 @@ PinnedObject SurfaceStoreEdit::pin() const
     return _pin;
 }
 
-void SurfaceStoreEdit::save(QuadSurface& surface, const cv::Rect& rect, const std::vector<std::string>& channels)
+void SurfaceStoreEdit::repin(const TransactionReceipt& receipt)
+{
+    const auto version = receipt.objects.find(_uuid);
+    if (version == receipt.objects.end() || !version->second) return;
+    const auto committed = _session->objectsAtVersions(
+        _pin.attachment, {{_pin.object.storeUuid, receipt.generation, _uuid, *version->second}});
+    if (!committed.front()) throw std::runtime_error("the saved surface version cannot be read back");
+    _pin = pinOf(_pin.attachment, *committed.front());
+}
+
+void SurfaceStoreEdit::settlePending()
+{
+    if (!_pending) return;
+    TransactionReceipt receipt;
+    try {
+        receipt = _session->resolvePending(_pin.attachment, *_pending);
+    } catch (const TransactionConflict&) {
+        _pending.reset();
+        throw;
+    } catch (const std::invalid_argument&) {
+        // Resolved meanwhile (on reattachment), or concluded: its receipt, if any.
+        const auto request = *std::exchange(_pending, std::nullopt);
+        if (const auto saved = _session->receipt(_pin.attachment, request)) repin(*saved);
+        return;
+    }
+    // Other failures (still unreachable) propagate and keep it pending.
+    _pending.reset();
+    repin(receipt);
+}
+
+void SurfaceStoreEdit::save(QuadSurface& surface, const cv::Rect& rect, const std::vector<std::string>& channels,
+                            std::optional<uint64_t> draftRevision)
 {
     // One save at a time: each starts from the version the previous one committed.
     std::lock_guard lock(_mutex);
+    settlePending();
     const auto& points = *surface.rawPointsPtr();
     auto request = _session->newRequest(_pin.attachment);
     request.generation = _pin.generation;
@@ -75,9 +107,20 @@ void SurfaceStoreEdit::save(QuadSurface& surface, const cv::Rect& rect, const st
         expectRelationshipEndpoints(reader, request.expectedObjects);
     });
     if (request.operations.empty()) return;
-    const auto receipt = _session->submit(_pin.attachment, request);
-    const auto committed = _session->objectsAtVersions(
-        _pin.attachment, {{_pin.object.storeUuid, receipt.generation, _uuid, *receipt.objects.at(_uuid)}});
-    if (!committed.front()) throw std::runtime_error("the saved surface version cannot be read back");
-    _pin = pinOf(_pin.attachment, *committed.front());
+    DurableSave durable;
+    durable.keepDrafts = true;
+    if (draftRevision && *draftRevision && *draftRevision <= _session->draftRevision(_uuid))
+        durable.drafts.push_back({_uuid, *draftRevision});
+    TransactionReceipt receipt;
+    try {
+        receipt = _session->submitDurably(_pin.attachment, request, durable);
+    } catch (const TransactionConflict&) {
+        throw;
+    } catch (...) {
+        const auto pending = _session->pendingSubmissions();
+        if (std::any_of(pending.begin(), pending.end(), [&](const auto& p) { return p.requestUuid == request.requestUuid; }))
+            _pending = request.requestUuid;
+        throw;
+    }
+    repin(receipt);
 }

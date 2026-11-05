@@ -100,8 +100,12 @@ void SegmentationEditManager::publishWholeDraft()
     if (!_draft || !_baseSurface) {
         return;
     }
+    // Only the first publication sets the base (saves move it on) and may
+    // hold the committed surface.
     _draft->session->setDraft(_baseSurface->id, quad_surface_grid(*_baseSurface), _draft->coordinates,
-                              _draft->attachment);
+                              _draft->attachment, std::exchange(_draft->base, std::nullopt));
+    if (std::exchange(_draft->saved, false))
+        _draft->session->markDraftSaved(_baseSurface->id, _draft->session->draftRevision(_baseSurface->id));
 }
 
 void SegmentationEditManager::publishDraft(const cv::Rect& vertices)

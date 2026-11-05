@@ -79,6 +79,12 @@ namespace project {
 namespace object_store {
     // Settings array, most recent first; entries hold path, read_only, remote.
     constexpr auto RECENT = "object_store/recent";
+    // Crash recovery: seconds between draft checkpoints (0: off). Checkpoints
+    // do not change when editors save to their stores.
+    constexpr auto DRAFT_CHECKPOINT_SECONDS = "object_store/draft_checkpoint_seconds";
+    constexpr int DRAFT_CHECKPOINT_SECONDS_DEFAULT = 30;
+    // Where checkpoints go (empty: "drafts" in the application data directory).
+    constexpr auto DRAFT_DIRECTORY = "object_store/draft_directory";
 }
 
 // -----------------------------------------------------------------------------

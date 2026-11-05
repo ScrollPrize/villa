@@ -173,6 +173,8 @@ private:
     void UpdateVolpkgLabel(int filterCounter);
     void updateVolumePackageEmptyState();
     void showStatusBarMessage(const QString& text, int timeout = 0);
+    // Crash recovery of drafts (settings: object_store/draft_*).
+    void startDraftRecovery();
     void clearStatusBarMessage();
 
 

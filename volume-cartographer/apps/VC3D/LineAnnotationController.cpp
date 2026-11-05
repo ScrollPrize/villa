@@ -15304,7 +15304,11 @@ void LineAnnotationController::commitFiberStoreAction(std::vector<FiberSaveSnaps
         for (const auto& fiber : retired) operations.push_back(RetireObjectOp{fiber.uuid});
         expectRelationshipEndpoints(reader, request.expectedObjects);
     });
-    const auto receipt = connection->submit(*attachment, request);
+    // Durable: written to the session's draft directory before it is sent. A
+    // hosted store that does not answer leaves it pending; it is resolved in
+    // the background (SessionDrafts), and a save made meanwhile from the same
+    // pins conflicts instead of overwriting it.
+    const auto receipt = connection->submitDurably(*attachment, request);
     // The saved fibers' versions: their generations and geometry heads.
     std::vector<ObjectVersion> savedVersions;
     for (const auto& snapshot : edits)

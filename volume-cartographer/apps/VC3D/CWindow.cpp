@@ -24,6 +24,7 @@
 #include <optional>
 
 #include "VCSettings.hpp"
+#include "SessionDrafts.hpp"
 #include "Keybinds.hpp"
 #include "OpenDataNormalGrids.hpp"
 #include "viewer_controls/panels/ViewerCompositePanel.hpp"
@@ -35,6 +36,7 @@
 #include <QKeyEvent>
 #include <QResizeEvent>
 #include <QSettings>
+#include <QStandardPaths>
 #include <QMdiArea>
 #include <QMdiSubWindow>
 #include <QApplication>
@@ -826,6 +828,7 @@ CWindow::CWindow(size_t cacheSizeGB) :
     updateProjectNameLabel();
     connect(_state, &CState::poiChanged, this, &CWindow::onFocusPOIChanged);
     connect(_state, &CState::surfaceWillBeDeleted, this, &CWindow::onSurfaceWillBeDeleted);
+    startDraftRecovery();
 
     _axisAlignedSliceController = std::make_unique<AxisAlignedSliceController>(_state, this);
 
@@ -4025,6 +4028,35 @@ void CWindow::UpdateVolpkgLabel(int filterCounter)
         QString label = tr("Remote: %1").arg(QString::fromStdString(_state->currentVolumeId()));
         ui.lblVpkgName->setText(label);
     }
+}
+
+void CWindow::startDraftRecovery()
+{
+    using namespace vc3d::settings;
+    const QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+    const int seconds = settings.value(object_store::DRAFT_CHECKPOINT_SECONDS,
+                                       object_store::DRAFT_CHECKPOINT_SECONDS_DEFAULT).toInt();
+    auto* drafts = _state->sessionDrafts();
+    if (seconds <= 0 || !drafts) return;
+    auto directory = settings.value(object_store::DRAFT_DIRECTORY).toString().trimmed();
+    if (directory.isEmpty())
+        directory = QStandardPaths::writableLocation(QStandardPaths::AppDataLocation) + QStringLiteral("/drafts");
+    QString message;
+    if (!drafts->start(directory.toStdString(), seconds * 1000)) {
+        message = tr("Crash recovery of unsaved edits is off: %1").arg(drafts->error());
+    } else if (const auto recovered = drafts->recoveredDrafts(); !recovered.empty()) {
+        message = tr("Unsaved edits of %n surface(s) were recovered from an earlier session; "
+                     "open a surface to restore or discard them.", nullptr, int(recovered.size()));
+    }
+    connect(drafts, &SessionDrafts::checkpointFailed, this, [this](const QString& error) {
+        showStatusBarMessage(tr("Unsaved edits are not crash-safe: the draft checkpoint failed: %1").arg(error), 0);
+    });
+    connect(drafts, &SessionDrafts::checkpointRestored, this, [this]() {
+        showStatusBarMessage(tr("Draft checkpoints work again."), 5000);
+    });
+    connect(drafts, &SessionDrafts::pendingResolved, this, [this](const QString& text) { showStatusBarMessage(text, 10000); });
+    if (!message.isEmpty())
+        QTimer::singleShot(0, this, [this, message]() { showStatusBarMessage(message, 15000); });
 }
 
 void CWindow::onShowStatusMessage(QString text, int timeout)

@@ -302,6 +302,8 @@ set(srcs
     ToolProcess.hpp
     PointCollectionSync.cpp
     PointCollectionSync.hpp
+    SessionDrafts.cpp
+    SessionDrafts.hpp
     ToolDialogs.cpp
     ToolDialogs.hpp
     ConsoleOutputWidget.cpp

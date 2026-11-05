@@ -7,6 +7,7 @@
 #include "vc/core/util/SurfaceArea.hpp"
 #include "segmentation/SurfaceCorrections.hpp"
 #include "segmentation/SurfaceStoreEdit.hpp"
+#include "SessionDrafts.hpp"
 #include "vc/core/PointCollections.hpp"
 #include <vc_object_store/geometry/Geometry.hpp>
 #include <vc_object_store/store/GeometryViews.hpp>
@@ -422,6 +423,64 @@ int main(int argc, char** argv)
                                                           [] { return true; });
             require(!cancelled.complete && cancelled.runs.empty() && fetchCount == 2,
                     "cancelled queries neither publish intersections nor fetch more surfaces");
+        }
+        // Durable saves keep the editor's draft (marked saved, not
+        // checkpointed); an unsaved later edit is checkpointed and recovered.
+        {
+            const auto draftDirectory = fs::path(dir.path().toStdString()) / "drafts";
+            cv::Mat_<cv::Vec3f> stored(3, 3);
+            session->readStore(attachment, [&](const StoreReader& reader, const auto&) {
+                const auto view = GeometrySnapshot(reader).surface(native);
+                for (int r = 0; r < 3; ++r)
+                    for (int c = 0; c < 3; ++c) {
+                        const auto p = view.vertex(r, c);
+                        stored(r, c) = {p[0], p[1], p[2]};
+                    }
+            });
+            ObjectVersion saved;
+            {
+                auto durable = std::make_shared<ObjectStoreSession>();
+                SessionDrafts drafts(durable);
+                require(drafts.start(draftDirectory, 0) && drafts.recoveredDrafts().empty(), "draft directory in use");
+                const auto store = durable->attach(path, options);
+                const auto pin = pinOf(store, *durable->currentObject(store, native));
+                QuadSurface surface(stored, {1.f, 1.f});
+                surface.id = native;
+                const auto coordinates = vc::objects::volumeCoordinates(volume->id(), 1);
+                durable->setDraft(native, quad_surface_grid(surface), coordinates, store, pin.reference());
+                durable->markDraftSaved(native, durable->draftRevision(native));
+                const auto drafted = [&](int row, int column, cv::Vec3f point) {
+                    (*surface.rawPointsPtr())(row, column) = point;
+                    const vc::geometry::SurfacePoint p{point[0], point[1], point[2]};
+                    durable->updateDraft(native, row, column, 1, 1, std::span(&p, 1));
+                };
+                drafted(0, 1, {7.f, 7.f, 7.f});
+                SurfaceStoreEdit edit(durable, pin);
+                edit.save(surface, cv::Rect(1, 0, 1, 1), {}, durable->draftRevision(native));
+                saved = edit.pin().reference();
+                const auto state = durable->draftState(native);
+                require(saved.version == pin.version + 1 && state && state->saved && state->base == saved &&
+                        drafts.checkpointNow(), "the save keeps the draft as saved");
+                const auto files = [&] {
+                    std::size_t n = 0;
+                    for (const auto& entry : fs::directory_iterator(draftDirectory))
+                        n += entry.path().filename().string().rfind("draft-", 0) == 0;
+                    return n;
+                };
+                require(files() == 0, "a saved draft is not checkpointed");
+                drafted(2, 2, {8.f, 8.f, 8.f});
+                require(drafts.checkpointNow() && files() == 1, "an unsaved edit is checkpointed");
+            }
+            auto restarted = std::make_shared<ObjectStoreSession>();
+            SessionDrafts drafts(restarted);
+            require(drafts.start(draftDirectory, 0) && drafts.recovered(native), "the unsaved edit is recovered");
+            const auto contents = restarted->draftContents(native);
+            require(contents && contents->surface.points[8] == vc::geometry::SurfacePoint{8, 8, 8} &&
+                    contents->surface.points[1] == vc::geometry::SurfacePoint{7, 7, 7} &&
+                    restarted->draftState(native)->base == saved, "recovered grid and base");
+            restarted->clearDraft(native);
+            drafts.forgetRecovered(native);
+            require(!drafts.recovered(native), "discarded");
         }
         session->detach(attachment);
         std::cout << "surface catalog tests passed\n";

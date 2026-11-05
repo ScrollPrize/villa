@@ -1,6 +1,7 @@
 #include "CState.hpp"
 #include <vc_object_store/Uuid.hpp>
 #include "PointCollectionSync.hpp"
+#include "SessionDrafts.hpp"
 
 #include "OpenDataResourceSelection.hpp"
 #include "VCSettings.hpp"
@@ -257,6 +258,13 @@ CState::CState(QObject* parent, CState* objectStoreOwner, std::size_t cacheBytes
     }
     _pointCollection = new VCCollection(this);
     if (!objectStoreOwner) _pointCollectionSync = new vc3d::PointCollectionSync(this);
+    if (!objectStoreOwner) {
+        _sessionDrafts = new SessionDrafts(_objectStoreSession, this);
+        // A store attached again may answer saves left pending.
+        connect(this, &CState::objectStoreChanged, this, [this](const vc::objects::StoreSessionEvent& event) {
+            if (event.kind == vc::objects::StoreSessionEvent::Kind::Attached) _sessionDrafts->resolvePending();
+        });
+    }
 
     setSurface("xy plane",
         std::make_shared<PlaneSurface>(cv::Vec3f{2000,2000,2000}, cv::Vec3f{0,0,1}));
@@ -725,7 +733,8 @@ void CState::setSurface(const std::string& name, std::shared_ptr<Surface> surf, 
 
     _surfs[name] = surf;
     if (name == "segmentation" && (!sameSurface || (isEditUpdate && !_activeSurfaceEditing))) {
-        draftActiveSurface(std::dynamic_pointer_cast<QuadSurface>(surf));
+        // A surface newly set without an edit is the one opened from its store.
+        draftActiveSurface(std::dynamic_pointer_cast<QuadSurface>(surf), !sameSurface && !isEditUpdate);
     }
     if (!sameSurface) {
         // Edit updates re-set the same pointer every frame; only a mapping
@@ -749,7 +758,7 @@ void CState::setSurface(const std::string& name, std::shared_ptr<Surface> surf, 
     }
 }
 
-void CState::draftActiveSurface(const std::shared_ptr<QuadSurface>& surface)
+void CState::draftActiveSurface(const std::shared_ptr<QuadSurface>& surface, bool saved)
 {
     // Workspaces sharing the main session draft their own surfaces.
     if (_objectStoreOwner || !_objectStoreSession) {
@@ -762,9 +771,32 @@ void CState::draftActiveSurface(const std::shared_ptr<QuadSurface>& surface)
     if (!surface || !_annotationVolume || !vc::objects::util::isUuid(surface->id)) {
         return;
     }
+    // Never replace unsaved edits recovered from an earlier session: the user decides.
+    if (_sessionDrafts && _sessionDrafts->recovered(surface->id)) {
+        _activeSurfaceDraft.clear();
+        const auto uuid = QString::fromStdString(surface->id);
+        QMetaObject::invokeMethod(this, [this, uuid] { emit recoveredDraftFound(uuid); }, Qt::QueuedConnection);
+        return;
+    }
     _objectStoreSession->setDraft(surface->id, quad_surface_grid(*surface),
                                   vc::objects::volumeCoordinates(*_annotationVolume));
+    if (saved) _objectStoreSession->markDraftSaved(surface->id, _objectStoreSession->draftRevision(surface->id));
     _activeSurfaceDraft = surface->id;
+}
+
+void CState::recoveredDraftResolved(const std::string& objectUuid, bool restored)
+{
+    if (_objectStoreOwner) { _objectStoreOwner->recoveredDraftResolved(objectUuid, restored); return; }
+    if (_sessionDrafts) _sessionDrafts->forgetRecovered(objectUuid);
+    const auto open = std::dynamic_pointer_cast<QuadSurface>(surface("segmentation"));
+    if (!open || open->id != objectUuid) return;
+    if (restored) _activeSurfaceDraft = objectUuid;
+    else draftActiveSurface(open, true);
+}
+
+SessionDrafts* CState::sessionDrafts() const
+{
+    return _objectStoreOwner ? _objectStoreOwner->sessionDrafts() : _sessionDrafts;
 }
 
 void CState::setSurfacesBatch(
