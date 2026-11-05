@@ -92,15 +92,18 @@ each author keeps a `project_view` record of their own. `takeEvents()` polls loc
 every attachment for all object kinds, tagged by attachment; call it from the
 application's event loop. Each change carries
 its record's object or edge `kind` (kept for deletions too), so a consumer
-filters by kind without looking the record up. `editKeepingRelationships(attachment, pins, edit)` is the checked edit for
-tools and editors that change existing objects without deciding about each
-relationship: it expects the pinned object revisions and every endpoint of
-their relationships, holds the objects' leases, and gives the callback
-`keep_recorded` decisions to pass to geometry edits (affected relationships keep
-their historical pins). `copyObject(from, to, uuid)` copies an
+filters by kind without looking the record up. Tools and editors that change existing objects
+without deciding about each relationship build one checked request
+(`newRequest`, then `submit`) read through `readStore`: they expect the objects
+at the versions they started from, add every endpoint of their relationships
+(`expectRelationshipEndpoints`), and let geometry operations keep affected
+relationships as recorded (`keepAffectedRecorded`, or `UpdateGeometryArraysOp`
+with `affected = "keep_recorded"`; "retain" when the relationships still apply,
+as for point collections whose points keep their identity). On a hub replica
+`submit` first leases the existing objects the request expects. `copyObject(from, to, uuid)` copies an
 object's current record and geometry from one attachment into another as a new
-object (new UUID, `meta.copied_from` naming the source store, object and
-revisions; point annotations kept); relationships, history and approval stay
+object (new UUID, `meta.copied_from` naming the source store, object, numbered
+version and geometry revision; point annotations kept); relationships, history and approval stay
 behind. `artifactDirectory(attachment, uuid)` returns (and creates; pass
 `create = false` to look for a file without creating it)
 `<store>.artifacts/<object uuid>/` for an object's non-geometry files such as

@@ -2,6 +2,7 @@
 #include "vc_object_store/objects/GeometryCoordinates.hpp"
 #include "vc_object_store/objects/GeometryEdits.hpp"
 #include "vc_object_store/objects/ObjectStoreSession.hpp"
+#include "vc_object_store/objects/TransactionJson.hpp"
 #include "vc_object_store/Uuid.hpp"
 #include "vc_object_store/geometry/Geometry.hpp"
 #include <cmath>
@@ -47,17 +48,21 @@ AttachedCollection readCollection(const StoreReader& reader, const ObjectRecord&
     return collection;
 }
 
-// Make collection `uuid` hold `wanted`: created (or restored) with record
-// meta `created` (coordinates, role) when new; otherwise a new geometry
-// revision whose remaining points keep their identity, keeping its
-// relationships. Points are in `frame` when given.
-void writeCollection(ObjectStore& store, WriteTxn& txn, const std::string& uuid, const AttachedCollection& wanted,
-                     const nlohmann::json& created, const std::optional<ViewFrame>& frame)
+// Operations making collection `uuid` hold `wanted`, read through `reader`:
+// created (or restored) with record meta `created` (coordinates, role) when
+// new; otherwise a new geometry revision whose remaining points keep their
+// identity and whose relationships still apply. Points are in `frame` when
+// given. Expectations of the collection and its relationships' endpoints are
+// added to `request`.
+void writeCollection(const StoreReader& reader, TransactionRequest& request, const std::string& uuid,
+                     const AttachedCollection& wanted, const nlohmann::json& created, const std::optional<ViewFrame>& frame)
 {
+    auto& operations = request.operations;
     auto points = wanted.points;
-    const auto current = store.objectByUuid(txn, uuid);
-    if (current && current->retired) store.restoreObject(txn, uuid);
-    auto record = current ? *store.objectByUuid(txn, uuid) : ObjectRecord{};
+    const auto current = reader.currentObject(uuid);
+    request.expectedObjects[uuid] = currentVersionOf(reader, uuid);
+    if (current && current->record.retired) operations.push_back(RestoreObjectOp{uuid, std::nullopt});
+    auto record = current ? current->record : ObjectRecord{};
     auto meta = nlohmann::json::parse(record.meta.empty() ? std::string("{}") : record.meta);
     if (!current) {
         record.uuid = uuid;
@@ -66,45 +71,36 @@ void writeCollection(ObjectStore& store, WriteTxn& txn, const std::string& uuid,
     }
     record.name = wanted.name;
     meta["source"] = wanted.source;
-    const auto head = current ? store.currentGeometry(txn, uuid) : std::nullopt;
+    const auto head = current && current->geometryRevision ? reader.geometryRevision(*current->geometryRevision) : std::nullopt;
     if (!head) {
         // A new geometry takes its points' annotations from meta.source.
         meta["source"]["point_attributes"] = wanted.annotations;
         record.meta = meta.dump();
-        store.upsertObject(txn, record);
-        store.putGeometry(txn, uuid, geometry::encode(points));
+        if (current) operations.push_back(UpdateObjectOp{objectRecordJson(record)});
+        else operations.push_back(CreateObjectOp{objectRecordJson(record)});
+        operations.push_back(PutGeometryOp{uuid, geometry::encode(points), {}, false});
         return;
     }
     record.meta = meta.dump();
-    store.upsertObject(txn, record);
+    operations.push_back(UpdateObjectOp{objectRecordJson(record)});
     if (frame) {
-        const auto shown = GeometrySnapshot(store, txn).viewTransformedAt(uuid, frame->volume, frame->scale);
+        const auto shown = GeometrySnapshot(reader).viewTransformedAt(uuid, frame->volume, frame->scale);
         points = shown.canonicalPointCollection(points);
+        for (auto& [transform, version] : transformDependencies(reader)) request.readDependencies.emplace(transform, version);
     }
-    const auto previous = std::get<geometry::PointCollection>(geometry::decode(store.readGeometryData(txn, head->uuid)));
-    const auto previousAnnotations = nlohmann::json::parse(store.geometryPointAnnotations(txn, head->uuid, "points"));
+    const auto previous = std::get<geometry::PointCollection>(geometry::decode(reader.readGeometryData(head->uuid)));
+    const auto previousAnnotations = nlohmann::json::parse(reader.geometryPointAnnotations(head->uuid, "points"));
     if (previous.ids == points.ids && previous.points == points.points && previousAnnotations == wanted.annotations) {
         // Only the record changed: its relationships still apply.
-        for (const auto& edge : store.edgesOf(txn, uuid)) store.retainRelationship(txn, edge.uuid);
+        EdgeSelection edges;
+        edges.endpointUuids = std::vector<std::string>{uuid};
+        for (const auto& edge : reader.selectEdges(edges, std::vector<std::string>{}))
+            operations.push_back(RetainRelationshipOp{edge.uuid});
         return;
     }
     // Points that stay keep their identity (stable ids); relationships apply
     // to the edited geometry as before.
-    auto retain = [&](const std::vector<EdgeRecord>& edges) {
-        std::vector<GeometryEdgeEdit> decisions;
-        for (const auto& edge : edges) {
-            GeometryEdgeEdit decision;
-            decision.edgeUuid = edge.uuid;
-            decision.expectedGeneration = edge.generation;
-            decision.action = "retain";
-            if (const auto r = store.currentGeometry(txn, edge.aUuid)) decision.aRevision = r->uuid;
-            if (const auto r = store.currentGeometry(txn, edge.bUuid)) decision.bRevision = r->uuid;
-            decisions.push_back(std::move(decision));
-        }
-        return decisions;
-    };
-    updateGeometryArrays(store, txn, uuid, geometry::encode(points), head->uuid, {{"points", wanted.annotations.dump()}},
-                         retain);
+    operations.push_back(UpdateGeometryArraysOp{uuid, geometry::encode(points), {{"points", wanted.annotations.dump()}}, "retain"});
 }
 }
 
@@ -184,28 +180,29 @@ void replaceAttachedCollections(ObjectStoreSession& session, const AttachmentIde
 {
     std::map<std::string, const AttachedCollection*> desired;
     for (const auto& collection : collections) desired[util::canonicalUuid(collection.uuid)] = &collection;
-    std::map<std::string, EdgeRecord> linked;
-    RevisionSelection pins, related;
+    auto request = session.newRequest(attachment);
     session.readStore(attachment, [&](const StoreReader& reader, const auto&) {
-        linked = attachedEdges(reader, objectUuid, role);
+        const auto linked = attachedEdges(reader, objectUuid, role);
         const auto object = reader.currentObject(objectUuid);
         if (!object) throw std::runtime_error("object not found: " + objectUuid);
-        related[objectUuid] = object->uuid;
-        auto pin = [&](const std::string& uuid) { pins[uuid] = currentRevisionPin(reader, uuid); };
-        for (const auto& [uuid, edge] : linked) pin(uuid);
-        for (const auto& [uuid, collection] : desired) pin(uuid);
-    });
-    session.editKeepingRelationships(attachment, pins, related, [&](auto& store, auto& txn, const auto&) {
+        request.expectedObjects[object->record.uuid] = object->version;
         for (const auto& [uuid, wanted] : desired) {
-            writeCollection(store, txn, uuid, *wanted, {{"coordinates", coordinates}, {"role", role}}, frame);
-            if (!linked.contains(uuid)) store.attach(txn, uuid, objectUuid, role);
+            writeCollection(reader, request, uuid, *wanted, {{"coordinates", coordinates}, {"role", role}}, frame);
+            if (!linked.contains(uuid)) {
+                auto edge = attachmentEdge(uuid, object->record.uuid, role);
+                edge.uuid = util::newUuid();
+                request.operations.push_back(AddEdgeOp{edgeRecordJson(edge)});
+            }
         }
         for (const auto& [uuid, edge] : linked) {
             if (desired.contains(uuid)) continue;
-            store.removeEdge(txn, edge.uuid);
-            store.retireObject(txn, uuid);
+            request.expectedObjects[uuid] = currentVersionOf(reader, uuid);
+            request.operations.push_back(RemoveEdgeOp{edge.uuid});
+            request.operations.push_back(RetireObjectOp{uuid});
         }
+        expectRelationshipEndpoints(reader, request.expectedObjects);
     });
+    session.submit(attachment, request);
 }
 
 std::vector<AttachedCollection> volumeCollections(const StoreReader& reader, const VolumeVoxels& volume)
@@ -248,21 +245,19 @@ std::vector<AttachedCollection> volumeCollections(ObjectStoreSession& session, c
 void writeVolumeCollections(ObjectStoreSession& session, const AttachmentIdentity& attachment, const VolumeVoxels& volume,
                             const std::vector<AttachedCollection>& changed, const std::vector<std::string>& removed)
 {
-    RevisionSelection pins;
+    auto request = session.newRequest(attachment);
     session.readStore(attachment, [&](const StoreReader& reader, const auto&) {
-        auto pin = [&](const std::string& uuid) {
-            pins[util::canonicalUuid(uuid)] = currentRevisionPin(reader, util::canonicalUuid(uuid));
-        };
-        for (const auto& collection : changed) pin(collection.uuid);
-        for (const auto& uuid : removed) pin(uuid);
-    });
-    session.editKeepingRelationships(attachment, pins, {}, [&](auto& store, auto& txn, const auto&) {
         for (const auto& collection : changed)
-            writeCollection(store, txn, util::canonicalUuid(collection.uuid), collection,
+            writeCollection(reader, request, util::canonicalUuid(collection.uuid), collection,
                             {{"coordinates", volumeCoordinates(volume)}}, ViewFrame{volume.volume, volume.scale});
-        for (const auto& uuid : removed)
-            if (const auto object = store.objectByUuid(txn, util::canonicalUuid(uuid)); object && !object->retired)
-                store.retireObject(txn, object->uuid);
+        for (const auto& removedUuid : removed) {
+            const auto uuid = util::canonicalUuid(removedUuid);
+            request.expectedObjects[uuid] = currentVersionOf(reader, uuid);
+            if (const auto object = reader.currentObject(uuid); object && !object->record.retired)
+                request.operations.push_back(RetireObjectOp{uuid});
+        }
+        expectRelationshipEndpoints(reader, request.expectedObjects);
     });
+    session.submit(attachment, request);
 }
 }

@@ -1,4 +1,5 @@
 #include "TestSupport.hpp"
+#include "vc_object_store/objects/TransactionJson.hpp"
 #include "vc_object_store/objects/ObjectStoreSession.hpp"
 #include "vc_object_store/geometry/Geometry.hpp"
 #include <nlohmann/json.hpp>
@@ -338,26 +339,34 @@ int main() try
             std::vector<uint8_t> moved(12); const float xyz[3] = {1, 1, 5}; std::memcpy(moved.data(), xyz, 12);
             store.editGeometry(txn, sheet, {{"points", 0, moved}}, head);
         }); });
-        session.editKeepingRelationships(replacement, pins, {}, [&](auto& store, auto& txn, const auto& keep) {
-            const auto head = store.currentGeometry(txn, sheet)->uuid;
+        {
+            // The typed form: the edit keeps affected relationships as recorded.
+            auto request = session.newRequest(replacement);
+            session.readStore(replacement, [&](const StoreReader& reader, const auto&) {
+                request.expectedObjects[sheet] = reader.currentObject(sheet)->version;
+                expectRelationshipEndpoints(reader, request.expectedObjects);
+            });
             std::vector<uint8_t> moved(12); const float xyz[3] = {1, 1, 5}; std::memcpy(moved.data(), xyz, 12);
-            const std::vector<GeometryArrayEdit> edits{{"points", 0, moved}};
-            store.editGeometry(txn, sheet, edits, head, [&](const std::vector<EdgeRecord>& affected) { return keep(affected); });
-        });
+            request.operations.push_back(EditGeometryOp{sheet, {{"points", 0, moved}}, {}, true});
+            session.submit(replacement, request);
+        }
         session.read(replacement, [&](const auto& store, const auto& txn, const auto&) {
             require(store.edgeByUuid(txn, link).has_value(), "relationships survive kept-as-recorded edits");
             const auto points = store.readGeometryArray(txn, store.currentGeometry(txn, sheet)->uuid, "points");
             float z; std::memcpy(&z, points.data() + 8, 4);
             require(z == 5, "the anchored vertex moved");
         });
-        // An object pinned without a revision is created by the same edit.
+        // An object expected absent is created by the request.
         const auto created = util::newUuid();
-        session.editKeepingRelationships(replacement, {{created, std::nullopt}}, {}, [&](auto& store, auto& txn, const auto&) {
+        {
             ObjectRecord record; record.uuid = created; record.kind = "surface";
-            store.upsertObject(txn, record);
-        });
+            auto request = session.newRequest(replacement);
+            request.expectedObjects[created] = std::nullopt;
+            request.operations.push_back(CreateObjectOp{objectRecordJson(record)});
+            session.submit(replacement, request);
+        }
         session.read(replacement, [&](const auto& store, const auto& txn, const auto&) {
-            require(store.objectByUuid(txn, created).has_value(), "edits create objects pinned without a revision");
+            require(store.objectByUuid(txn, created).has_value(), "requests create objects expected absent");
         });
         // Tags of current records, kept relationships, and selections by tag sets.
         session.tagObjects(replacement, {sheet, created}, {"approved", "reviewed"});

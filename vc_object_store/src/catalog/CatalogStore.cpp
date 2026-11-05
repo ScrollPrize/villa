@@ -1,4 +1,5 @@
 #include "vc_object_store/objects/StoreReader.hpp"
+#include "vc_object_store/objects/TransactionJson.hpp"
 #include "catalog/Catalog.hpp"
 #include "formats/GeometryInput.hpp"
 #include "formats/RemoteSource.hpp"
@@ -146,54 +147,52 @@ CatalogStoreReport updateCatalogRecords(ObjectStoreSession& session, const Attac
         for (const auto& surface : sample.surfaces(segment)) records.push_back(placeholder(sample, segment, surface));
     }
     report.surfaces = int(records.size());
-    RevisionSelection expected;
-    std::vector<ObjectRecord> changed;
-    session.read(attachment, [&](const auto& db, const auto& read, const auto&) {
+    auto request = session.newRequest(attachment);
+    session.readStore(attachment, [&](const StoreReader& reader, const auto&) {
         for (auto& record : records) {
-            const auto existing = db.objectByUuid(read, record.uuid);
-            if (!existing) {
-                expected[record.uuid] = std::nullopt;
+            const auto head = reader.currentObject(record.uuid);
+            if (!head) {
+                request.expectedObjects[record.uuid] = currentVersionOf(reader, record.uuid);
                 ++report.added;
-                changed.push_back(std::move(record));
+                auto meta = Json::parse(record.meta);
+                meta["catalog_write"] = util::newUuid();
+                record.meta = meta.dump();
+                request.operations.push_back(CreateObjectOp{objectRecordJson(record)});
                 continue;
             }
             if (!refresh) continue;
-            const auto geometry = db.currentGeometry(read, record.uuid);
-            if (geometry && locallyEdited(*existing, *geometry)) {
+            const auto& existing = head->record;
+            const auto geometry = head->geometryRevision ? reader.geometryRevision(*head->geometryRevision) : std::nullopt;
+            if (geometry && locallyEdited(existing, *geometry)) {
                 ++report.preserved;
                 continue;
             }
-            if (sameCatalogRecord(*existing, record)) continue;
+            if (sameCatalogRecord(existing, record)) continue;
             if (geometry) {
                 auto meta = Json::parse(record.meta);
                 meta["catalog_geometry_revision"] = geometry->uuid;
                 record.meta = meta.dump();
                 // The fetched grid stays; a changed published tifxyz is fetched again.
-                if (existing->surface) {
-                    record.surface->gridWidth = existing->surface->gridWidth;
-                    record.surface->gridHeight = existing->surface->gridHeight;
-                    record.surface->scale = existing->surface->scale;
+                if (existing.surface) {
+                    record.surface->gridWidth = existing.surface->gridWidth;
+                    record.surface->gridHeight = existing.surface->gridHeight;
+                    record.surface->scale = existing.surface->scale;
                 }
                 if (Json::parse(geometry->attributes).value("source_url", "") != catalogReference(record)->url) {
                     ++report.stale;
                     stale.push_back(record.uuid);
                 }
             }
-            record.tags = existing->tags;
-            expected[record.uuid] = db.currentObjectRevision(read, record.uuid)->uuid;
+            record.tags = existing.tags;
+            request.expectedObjects[record.uuid] = head->version;
             ++report.updated;
-            changed.push_back(std::move(record));
+            auto meta = Json::parse(record.meta);
+            meta["catalog_write"] = util::newUuid();
+            record.meta = meta.dump();
+            request.operations.push_back(UpdateObjectOp{objectRecordJson(record)});
         }
     });
-    if (!changed.empty())
-        session.fetchWrite(attachment, expected, [&](ObjectStore& db, WriteTxn& txn) {
-            for (auto record : changed) {
-                auto meta = Json::parse(record.meta);
-                meta["catalog_write"] = util::newUuid();
-                record.meta = meta.dump();
-                db.upsertObject(txn, record);
-            }
-        });
+    if (!request.operations.empty()) session.submit(attachment, request);
     return report;
 }
 

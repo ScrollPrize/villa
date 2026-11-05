@@ -267,6 +267,12 @@ TransactionRequest ObjectStoreSession::newRequest(const AttachmentIdentity& iden
 
 TransactionReceipt ObjectStoreSession::submit(const AttachmentIdentity& identity, const TransactionRequest& request)
 {
+    // A hub replica edits only leased objects: lease the existing ones the
+    // request expects (an empty hold elsewhere). Goes away with the hub.
+    std::vector<std::string> existing;
+    for (const auto& [uuid, version] : request.expectedObjects)
+        if (version) existing.push_back(uuid);
+    const auto leases = holdLeases(identity, existing);
     return withAttachment(identity, true, [&](Attachment& attachment) {
         if (attachment.remote) return attachment.remote->submit(request);
         std::lock_guard writer(attachment.writer);
@@ -509,9 +515,9 @@ std::string ObjectStoreSession::copyObject(const AttachmentIdentity& from, const
                                            const std::string& objectUuid, const std::string& name)
 {
     std::optional<ObjectCopy> copy;
-    read(from, [&](const auto& store, const auto& txn, const auto&) { copy = readObjectCopy(store, txn, objectUuid); });
+    readStore(from, [&](const StoreReader& reader, const auto&) { copy = readObjectCopy(reader, objectUuid); });
     if (!name.empty()) copy->record.name = name;
-    act(to, {{copy->record.uuid, std::nullopt}}, [&](auto& store, auto& txn) { writeObjectCopy(store, txn, *copy); });
+    submitCopy(to, *copy);
     return copy->record.uuid;
 }
 
@@ -520,10 +526,18 @@ void ObjectStoreSession::importObject(const AttachmentIdentity& from, const Atta
 {
     ensureGeometry(from, objectUuid);
     std::optional<ObjectCopy> copy;
-    read(from, [&](const auto& store, const auto& txn, const auto&) {
-        copy = readObjectCopy(store, txn, objectUuid, util::canonicalUuid(objectUuid));
+    readStore(from, [&](const StoreReader& reader, const auto&) {
+        copy = readObjectCopy(reader, objectUuid, util::canonicalUuid(objectUuid));
     });
-    act(to, {{copy->record.uuid, std::nullopt}}, [&](auto& store, auto& txn) { writeObjectCopy(store, txn, *copy); });
+    submitCopy(to, *copy);
+}
+
+void ObjectStoreSession::submitCopy(const AttachmentIdentity& to, const ObjectCopy& copy)
+{
+    auto request = newRequest(to);
+    request.expectedObjects[copy.record.uuid] = std::nullopt;
+    request.operations = objectCopyOperations(copy);
+    submit(to, request);
 }
 
 void ObjectStoreSession::writeJob(const AttachmentIdentity& identity, const Job& job)
@@ -1222,46 +1236,6 @@ std::filesystem::path ObjectStoreSession::artifactDirectory(const AttachmentIden
 std::filesystem::path ObjectStoreSession::path(const AttachmentIdentity& identity)
 {
     return withAttachment(identity, false, [](Attachment& attachment) { return attachment.store().path(); });
-}
-
-RevisionSelection ObjectStoreSession::editKeepingRelationships(const AttachmentIdentity& identity,
-    const RevisionSelection& pins, const RevisionSelection& related,
-    const std::function<void(ObjectStore&, WriteTxn&, const KeepRecorded&)>& edit, TransactionReceipt* receipt)
-{
-    // Objects pinned without a revision are created by the edit: none to lease.
-    std::vector<std::string> existing;
-    for (const auto& [uuid, revision] : pins)
-        if (revision) existing.push_back(uuid);
-    const auto leases = holdLeases(identity, existing);
-    auto expected = pins;
-    for (const auto& [uuid, revision] : related)
-        if (!expected.emplace(uuid, revision).second && expected.at(uuid) != revision)
-            throw std::invalid_argument("object store: conflicting revisions for " + uuid);
-    read(identity, [&](const auto& store, const auto& txn, const auto&) {
-        // Objects expected absent have no relationships yet.
-        const auto touched = expected;
-        for (const auto& [uuid, revision] : touched)
-            if (revision) for (const auto& edge : store.edgesOf(txn, uuid, true))
-                for (const auto& endpoint : {edge.aUuid, edge.bUuid})
-                    if (!expected.contains(endpoint))
-                        if (const auto head = store.currentObjectRevision(txn, endpoint)) expected[endpoint] = head->uuid;
-    });
-    return act(identity, expected, [&](auto& store, auto& txn) {
-        const KeepRecorded keep = [&](const std::vector<EdgeRecord>& affected) {
-            std::vector<GeometryEdgeEdit> result;
-            for (const auto& edge : affected) {
-                GeometryEdgeEdit decision;
-                decision.edgeUuid = edge.uuid;
-                decision.expectedGeneration = edge.generation;
-                decision.action = "keep_recorded";
-                if (const auto r = store.currentGeometry(txn, edge.aUuid)) decision.aRevision = r->uuid;
-                if (const auto r = store.currentGeometry(txn, edge.bUuid)) decision.bRevision = r->uuid;
-                result.push_back(std::move(decision));
-            }
-            return result;
-        };
-        edit(store, txn, keep);
-    }, receipt);
 }
 
 void ObjectStoreSession::finalize()

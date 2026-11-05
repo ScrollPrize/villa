@@ -822,7 +822,7 @@ void benchmarkPull(const std::filesystem::path& root, const std::filesystem::pat
         std::sort(records.begin(), records.end(), [](const auto& a, const auto& b) { return a.uuid < b.uuid; });
         for (const auto& record : records) {
             if (!source.currentGeometry(txn, record.uuid)) continue;
-            copies.push_back(readObjectCopy(source, txn, record.uuid, record.uuid));
+            copies.push_back(readObjectCopy(LocalStoreReader(source, txn), record.uuid, record.uuid));
             for (const auto& array : copies.back().geometry->arrays) payloadBytes += array.bytes.size();
             if (int(copies.size()) == count) break;
         }

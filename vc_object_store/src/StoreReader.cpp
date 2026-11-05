@@ -150,11 +150,11 @@ VersionSelection transformDependencies(const StoreReader& reader)
     return result;
 }
 
-std::optional<std::string> currentRevisionPin(const StoreReader& reader, const std::string& objectUuid)
+std::optional<int64_t> currentVersionOf(const StoreReader& reader, const std::string& objectUuid)
 {
-    if (const auto head = reader.currentObject(objectUuid)) return head->uuid;
+    if (const auto head = reader.currentObject(objectUuid)) return head->version;
     const auto history = reader.objectHistory(objectUuid);
-    return history.empty() ? std::nullopt : std::optional(history.back().uuid);
+    return history.empty() ? std::nullopt : std::optional(history.back().version);
 }
 
 std::vector<EdgeRecord> attachments(const StoreReader& reader, const std::string& ownerUuid,

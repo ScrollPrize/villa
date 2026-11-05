@@ -6,6 +6,8 @@
 // drafts like local ones; a lost feed position is a revalidation; an
 // unreachable host keeps cached data and reports the failure.
 #include "vc_object_store/objects/VolumeTransforms.hpp"
+#include "vc_object_store/objects/AttachedDocument.hpp"
+#include "vc_object_store/objects/Project.hpp"
 #include "TestSupport.hpp"
 #include "vc_object_store/client/HostedStore.hpp"
 #include "vc_object_store/geometry/Geometry.hpp"
@@ -344,6 +346,45 @@ try {
         require(chooseVolumeTransform(session, hosted, "hosted-a", "hosted-b", route) == choice &&
                 session.currentObject(hosted, choice)->version == 2, "a choice is replaced in place");
         mustFail([&] { (void)chooseVolumeTransform(session, hosted, "hosted-a", "hosted-b", {util::newUuid()}); });
+    }
+
+    // Point collections, attached collections, object copies and project
+    // records are checked requests too.
+    {
+        const VolumeVoxels voxels{"20260411134726", 1};
+        AttachedCollection marks;
+        marks.uuid = util::newUuid(); marks.name = "marks";
+        marks.points = {{0, 1}, {{1, 2, 3}, {4, 5, 6}}};
+        marks.annotations = nlohmann::json::array({{{"n", 0}}, {{"n", 1}}});
+        writeVolumeCollections(session, hosted, voxels, {marks}, {});
+        auto listed = volumeCollections(session, hosted, voxels);
+        require(listed.size() == 1 && listed[0].points.points == marks.points.points &&
+                listed[0].annotations == marks.annotations, "hosted volume collection created");
+        marks.points.points[1] = {4, 5, 7}; marks.name = "moved";
+        writeVolumeCollections(session, hosted, voxels, {marks}, {});
+        listed = volumeCollections(session, hosted, voxels);
+        require(listed.size() == 1 && listed[0].name == "moved" && listed[0].points.points == marks.points.points &&
+                listed[0].points.ids == marks.points.ids && listed[0].annotations == marks.annotations &&
+                session.currentObject(hosted, marks.uuid)->version == 2, "hosted volume collection revised");
+        writeVolumeCollections(session, hosted, voxels, {}, {marks.uuid});
+        require(volumeCollections(session, hosted, voxels).empty(), "hosted volume collection retired");
+        AttachedCollection fix;
+        fix.uuid = util::newUuid(); fix.name = "fix";
+        fix.points = {{0}, {{0, 0, 1}}};
+        fix.annotations = nlohmann::json::array({nlohmann::json::object()});
+        replaceAttachedCollections(session, hosted, surface, "corrections", {fix}, volumeCoordinates(voxels));
+        require(attachedCollections(session, hosted, surface, "corrections").size() == 1, "hosted attached collection");
+        replaceAttachedCollections(session, hosted, surface, "corrections", {}, volumeCoordinates(voxels));
+        require(attachedCollections(session, hosted, surface, "corrections").empty(), "hosted attached collection removed");
+        const auto copied = session.copyObject(hosted, hosted, fiber, "copied");
+        const auto copy = session.currentObject(hosted, copied);
+        const auto from = nlohmann::json::parse(copy->record.meta).at("copied_from");
+        require(copy->record.name == "copied" && copy->geometryRevision && from.at("object_uuid") == fiber &&
+                from.at("version") == session.currentObject(hosted, fiber)->version, "hosted copy");
+        mustFail([&] { session.importObject(hosted, hosted, fiber); }); // already there
+        require(addProjectResource(session, hosted, kVolumeResource, "https://example.org/v.zarr/") &&
+                removeProjectResource(session, hosted, projectResourceUuid(kVolumeResource, "https://example.org/v.zarr/")),
+                "hosted project resource");
     }
 
     // Detaching stops the poller: nothing arrives after Detached.

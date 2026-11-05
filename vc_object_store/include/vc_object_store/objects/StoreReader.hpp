@@ -86,10 +86,9 @@ public:
 std::vector<EdgeRecord> attachments(const StoreReader&, const std::string& ownerUuid,
                                     const std::optional<std::string>& role = std::nullopt);
 
-// The object revision a callback write (ObjectStoreSession::act and friends)
-// expects of `uuid`: its head, which for a deleted object is its deletion;
-// nullopt only when it never existed. Goes away with the callback writes.
-std::optional<std::string> currentRevisionPin(const StoreReader&, const std::string& objectUuid);
+// The version a checked request expects of `uuid` as it stands: its head,
+// which for a deleted object is its deletion; nullopt only when it never existed.
+std::optional<int64_t> currentVersionOf(const StoreReader&, const std::string& objectUuid);
 
 // Request expectations read through a reader (objects/Transactions.hpp).
 // Adds every endpoint of the relationships (retired included) of the objects

@@ -2,6 +2,7 @@
 
 #include "vc_object_store/objects/ObjectStore.hpp"
 #include "vc_object_store/objects/StoreReader.hpp"
+#include "vc_object_store/objects/ObjectCopy.hpp"
 #include "vc_object_store/objects/Artifacts.hpp"
 #include "vc_object_store/client/HostedStore.hpp"
 #include "vc_object_store/objects/GeometryRegion.hpp"
@@ -228,6 +229,7 @@ public:
     // Checked atomic request (objects/Transactions.hpp); conflicts throw
     // TransactionConflict. Hosted: transport failures leave the outcome
     // unknown; recover it with receipt() or submit the identical request again.
+    // A hub replica first leases the existing objects the request expects.
     TransactionReceipt submit(const AttachmentIdentity&, const TransactionRequest&);
     std::optional<TransactionReceipt> receipt(const AttachmentIdentity&, const std::string& requestUuid);
     // Hosted: current as of the last check (or a newer read).
@@ -289,19 +291,6 @@ public:
     // `receipt`, when given, receives the commit's receipt (numbered versions).
     RevisionSelection act(const AttachmentIdentity&, const RevisionSelection&, const Action&,
                           TransactionReceipt* receipt = nullptr);
-    // Decisions for relationships an edit affects: each is kept as recorded, with
-    // its historical pins and no claim that it applies to the new geometry.
-    using KeepRecorded = std::function<std::vector<GeometryEdgeEdit>(const std::vector<EdgeRecord>&)>;
-    // A checked edit of objects pinned at the object revisions in `pins` (null:
-    // the edit creates it) that keeps their relationships as recorded. `related`
-    // objects are expected but not edited (new relationship endpoints). It also
-    // expects every endpoint of their relationships, holds the existing pinned
-    // objects' leases on a hosted replica (relationships are guarded by the
-    // revision check alone), and hands the callback the decisions to pass to
-    // geometry edits. Returns the receipt.
-    RevisionSelection editKeepingRelationships(const AttachmentIdentity&, const RevisionSelection& pins,
-        const RevisionSelection& related, const std::function<void(ObjectStore&, WriteTxn&, const KeepRecorded&)>&,
-        TransactionReceipt* receipt = nullptr);
     // Edit these objects at their current versions in one checked request
     // that keeps their recorded relationships (editCurrentRequest), on any
     // attachment: `operations` gives each object's operations, read through
@@ -439,6 +428,7 @@ public:
     void resolveHubConflicts(const AttachmentIdentity&, const std::string& keep);
 
 private:
+    void submitCopy(const AttachmentIdentity& to, const ObjectCopy&);
     struct Attachment;
     std::shared_ptr<Attachment> open(const std::filesystem::path&, const OpenOptions&, const HubSessionOptions&);
     std::shared_ptr<Attachment> find(const AttachmentIdentity&) const;
