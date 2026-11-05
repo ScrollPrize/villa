@@ -216,9 +216,12 @@ int main() try {
             require(!volumeUmbilicus(LocalStoreReader(db,read),{"d"}),"a volume without one has none");
         }
         auto second=first;second.uuid=vc::objects::util::newUuid();second.name="second";
-        RevisionSelection pins;{auto read=db.read();pins=volumeUmbilicusRevisions(db,read,"c");}
-        require(pins.size()==1&&pins.contains(first.uuid),"the replacement pins the umbilicus it replaces");
-        pins[second.uuid]=std::nullopt;
+        TransactionContext pins;
+        {
+            auto read=db.read();const auto replaced=volumeUmbilici(LocalStoreReader(db,read),"c");
+            require(replaced.size()==1&&replaced[0].uuid==first.uuid,"the replacement expects the umbilicus it replaces");
+            pins.expectedObjects={{first.uuid,db.currentVersion(read,first.uuid)},{second.uuid,std::nullopt}};
+        }
         {auto txn=db.write(pins);setVolumeUmbilicus(db,txn,"c",second,u);txn.commit();}
         {
             auto read=db.read();

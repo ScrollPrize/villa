@@ -238,6 +238,21 @@ GraphReadView ObjectStore::graphReadView(const Txn& txn, const ObjectSelection& 
     return result;
 }
 
+GraphReadView ObjectStore::graphReadViewAt(const Txn& txn, const std::vector<ObjectVersion>& versions,
+                                         const EdgeSelection& edges) const
+{
+    RevisionSelection selection;
+    const auto revisions = objectsAtVersions(txn, versions);
+    for (size_t i = 0; i < versions.size(); ++i) {
+        if (!revisions[i])
+            throw std::invalid_argument("object history: version " + std::to_string(versions[i].version) + " of " +
+                                        versions[i].objectUuid + " is not recorded in this store and generation");
+        if (!selection.emplace(revisions[i]->objectUuid, revisions[i]->uuid).second)
+            throw std::invalid_argument("duplicate object in version selection");
+    }
+    return graphReadViewAt(txn, selection, edges);
+}
+
 GraphReadView ObjectStore::graphReadViewAt(const Txn& txn, const RevisionSelection& selection,
                                          const EdgeSelection& edges) const
 {
@@ -245,7 +260,7 @@ GraphReadView ObjectStore::graphReadViewAt(const Txn& txn, const RevisionSelecti
     requirePublishedGraphRead(txn);
     validateEdgeSelection(edges);
     if (edges.endpointUuids)
-        throw std::invalid_argument("graph endpoint scope is specified by its revision selection");
+        throw std::invalid_argument("graph endpoint scope is specified by its version selection");
     GraphReadView result;
     result.selectedObjects.emplace(); result.selectedRelationships.emplace();
     RevisionSelection resolved;

@@ -105,7 +105,7 @@ bool endpointApplies(const ObjectStore& store, const Txn& txn, const Anchor& anc
                      const ObjectRevision& selected)
 {
     if (selected.deleted || selected.record.retired) return false;
-    const auto original = store.objectRevision(txn, pinned);
+    const auto original = ObjectStoreImplAccess::objectRevision(store, txn, pinned);
     if (!original || (!anchor.metadataKeys.empty() && !original->metadataComplete)) return false;
     return dependencyMetadata(objectToJson(original->record), anchor) ==
                dependencyMetadata(objectToJson(selected.record), anchor) &&
@@ -628,24 +628,16 @@ RevisionSelection ObjectStore::revisionSelectionAt(const Txn& txn, int64_t publi
     return result;
 }
 
-RevisionSelection ObjectStore::currentRevisions(const Txn& txn, const ObjectSelection& selection) const
+std::vector<ObjectVersion> ObjectStore::versionsAt(const Txn& txn, int64_t publishedAtUs, bool includeRetired) const
 {
-    const auto heads = revisionSelectionAt(txn, std::numeric_limits<int64_t>::max(), true);
-    RevisionSelection result;
-    for (const auto& object : selectObjects(txn, selection, std::vector<std::string>{}))
-        if (const auto head = heads.find(object.uuid); head != heads.end()) result.emplace(head->first, head->second);
-    return result;
-}
-
-std::vector<RelationshipRevision> ObjectStore::recordedRelationships(const Txn& txn, const std::string& uuid) const
-{
-    const auto revision = objectRevision(txn, uuid);
-    if (!revision) throw std::invalid_argument("object history: unknown object revision");
-    auto* db = static_cast<sqlite3*>(connection(txn));
-    std::vector<RelationshipRevision> result;
-    if (revision->deleted) return result;
-    for (const auto& [edge, version] : members(db, revision->uuid))
-        result.push_back(relationship(db, version));
+    const auto store = status(txn).storeUuid;
+    std::vector<ObjectVersion> result;
+    for (const auto& [object, revision] : revisionSelectionAt(txn, publishedAtUs, includeRetired)) {
+        const auto value = objectRevision(txn, *revision);
+        if (!value->version)
+            throw std::runtime_error("object history: revision of " + object + " has no numbered version");
+        result.push_back({store, value->generation, object, value->version});
+    }
     return result;
 }
 

@@ -118,6 +118,21 @@ struct ObjectStoreImplAccess {
             throw std::runtime_error("object store: use of finished transaction");
         return static_cast<sqlite3*>(txn.handle_);
     }
+    // Internal revision-UUID lookups (storage keys; see ObjectStore's private section).
+    static std::optional<ObjectRevision> objectRevision(const ObjectStore& store, const Txn& txn, const std::string& revision)
+    {
+        return store.objectRevision(txn, revision);
+    }
+    static RevisionSelection revisionSelectionAt(const ObjectStore& store, const Txn& txn, int64_t publishedAtUs,
+                                                 bool includeRetired)
+    {
+        return store.revisionSelectionAt(txn, publishedAtUs, includeRetired);
+    }
+    static std::vector<SelectedRelationship> relationshipsAt(const ObjectStore& store, const Txn& txn,
+                                                             const RevisionSelection& selection)
+    {
+        return store.relationshipsAt(txn, selection);
+    }
 };
 
 } // namespace vc::objects

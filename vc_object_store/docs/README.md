@@ -156,13 +156,13 @@ publishes at most one revision per changed object, including shared endpoints.
 
 `published_at_us` is UTC Unix microseconds, shared by revisions in one action and
 strictly increasing between actions even if the clock goes backward.
-`revision_selection_at(time)` selects the latest revisions at that time;
-`revision_read_view_at(time)` returns their `objects`, `relationships`, and resolved
-`selection` together. Objects created later or physically deleted by then are
-excluded. Retired objects are omitted unless `include_retired=True`.
-`revision_read_view({uuid: revision_or_None})` uses an explicit closed selection;
-`None` resolves the latest head in that snapshot. Restore historical content by
-publishing a new checked action, not by moving old heads.
+`versions_at(time)` (C++ `versionsAt`) returns the numbered version
+`{store, generation, object, version}` of every object live at that time;
+read them with `objects_at_versions` and `relationships_at_versions`. Objects
+created later or physically deleted by then are excluded. Retired objects are
+omitted unless `include_retired=True`. Public history references are always
+numbered versions; revision UUIDs are internal storage keys. Restore historical
+content by publishing a new checked action, not by moving old heads.
 
 ### Hosted attachments
 
@@ -573,12 +573,13 @@ items carry `revalidate`.
 ## Relationships and graphs
 
 Relationships are shared by both endpoints. Addition, removal or rebinding
-revises both objects (once for a self-link). `recorded_relationships(object_revision)`
-returns immutable edge versions with `a_revision`/`b_revision` object pins and
-geometry pins. Resolve these pins rather than substituting current heads.
-`relationships_at(selection)` reports `applicable` only when both selected
-endpoints share the same version and its geometry, metadata and lifecycle
-dependencies match. Missing endpoints are inapplicable.
+revises both objects (once for a self-link). Relationship versions pin both
+endpoints' object versions (`a_version`/`b_version`) and geometry. Resolve these
+pins rather than substituting current heads.
+`relationships_at_versions(refs)` (C++ `relationshipsAt(txn, versions)`) reports
+`applicable` only when both selected endpoints share the same version and its
+geometry, metadata and lifecycle dependencies match. Missing endpoints are
+inapplicable.
 
 Anchors declare point IDs/indices, `channels`, `metadata_keys` (top-level keys),
 or `whole_geometry`. Editing a dependency requires an explicit decision:
@@ -616,7 +617,7 @@ applicability filtering. Fiber imports reject contradictory ordinary/adjacent
 classifications, including reciprocal declarations, atomically.
 
 ```python
-with store.graph_read(revisions=selection, adjacent=False, approval_states=[]) as graph:
+with store.graph_read(versions=refs, adjacent=False, approval_states=[]) as graph:
     component = graph.component(seed)
     records = graph.objects()
     links = graph.edges()
@@ -624,9 +625,9 @@ with store.graph_read(revisions=selection, adjacent=False, approval_states=[]) a
 ```
 
 `graph_read` defaults to approved edges; `approval_states=[]` includes all states.
-Explicit revision graphs always require applicability, retain isolated selected
-nodes, and cannot combine `revisions` with current object filters or
-`include_retired`. Nodes are in canonical UUID order; traversal is breadth-first
+Graphs of explicit numbered versions (`versions=`, C++ `graphReadViewAt(txn,
+versions)`) always require applicability, retain isolated selected nodes, and
+cannot combine `versions` with current object filters or `include_retired`. Nodes are in canonical UUID order; traversal is breadth-first
 in edge-UUID order. Current queries otherwise inspect current records.
 Applicability queries require a read transaction.
 Graph views are thread-confined and must close before checkpointing. NumPy arrays
@@ -635,11 +636,12 @@ are read-only and retain their buffers after closure, not the database transacti
 ## Retirement and restoration
 
 `retired` and `lifecycle_epoch` are library-managed revision fields. Use
-`tx.retire_object(uuid)` or `tx.restore_object(uuid, source_revision=None)` in a
+`tx.retire_object(uuid)` or `tx.restore_object(uuid, source_version=None)` in a
 checked write, with explicit decisions for every surviving incident edge after
 endpoint edits. Retirement retains geometry, metadata and history. Restoration
-uses the last published active content, or an explicit active revision of that
-object; it advances generation and resets approval while preserving creation
+uses the last published active content, or an explicit active version of that
+object (`source_version`, optionally `source_generation`; the typed
+`restore_object` operation takes a numbered `source`); it advances generation and resets approval while preserving creation
 stamps. Already-retired retirement and already-active default restoration are
 no-ops. Restoration does not recreate removed links or physically removed rows.
 
@@ -1112,9 +1114,9 @@ Fibers accept current version-4 documents, VC3D version-1 and version-3 fiber
 files and version-1 fiber collections. Version-4 branch endpoints require
 `target_uuid`, and `branch_file` only locates a missing peer's transport file;
 version-3 links resolve by `branch_file`. No older-format repair or database migration is performed.
-Native export's `--revision` / Python `object_revision_uuid` pins an object
-revision, including its metadata and relationship snapshot, and returns its
-geometry revision UUID.
+Native export's `--version N [--generation G]` / Python `version=` (and
+`generation=`) selects a recorded object version, including its metadata and
+relationship snapshot, and returns the exported numbered version.
 
 Native format clients link `vc_object_store::vc_object_geometry`. Set
 `VC_OBJECT_STORE_BUILD_ADAPTERS=ON` and `VC_OBJECT_STORE_BUILD_LINKING=OFF`

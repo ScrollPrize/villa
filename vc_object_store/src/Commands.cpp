@@ -524,16 +524,7 @@ struct Executor {
     void operator()(const RemoveMetaOp& op) { store.removeMeta(txn, op.uuid, op.key); }
     void operator()(const SetApprovalOp& op) { store.setApproval(txn, op.uuid, op.state); }
     void operator()(const RetireObjectOp& op) { store.retireObject(txn, op.uuid); }
-    void operator()(const RestoreObjectOp& op)
-    {
-        std::optional<std::string> source;
-        if (op.source) {
-            const auto revision = store.objectAtVersion(txn, *op.source);
-            if (!revision) throw std::invalid_argument("transaction: restore source version is not recorded in this store");
-            source = revision->uuid;
-        }
-        store.restoreObject(txn, op.uuid, source);
-    }
+    void operator()(const RestoreObjectOp& op) { store.restoreObject(txn, op.uuid, op.source); }
     void operator()(const DeleteObjectOp& op) { store.deleteObject(txn, op.uuid); }
     void operator()(const AddEdgeOp& op)
     {

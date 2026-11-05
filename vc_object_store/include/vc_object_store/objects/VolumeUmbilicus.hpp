@@ -14,9 +14,6 @@ struct VolumeUmbilicus {
     ObjectVersion version; // the version read
     std::vector<geometry::Point> points; // in the volume's voxels
 };
-// The current revisions of the umbilici that map to `volume`: the pins of an
-// edit that replaces or removes them.
-RevisionSelection volumeUmbilicusRevisions(const ObjectStore&, const Txn&, const std::string& volume);
 // The live umbilici that map to `volume` (one, unless the store is inconsistent).
 std::vector<ObjectRecord> volumeUmbilici(const StoreReader&, const std::string& volume);
 // The umbilicus of `volume`'s volume, its points in `volume`; nullopt when it

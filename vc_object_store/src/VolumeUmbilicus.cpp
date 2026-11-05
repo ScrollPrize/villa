@@ -24,11 +24,6 @@ void requireUmbilicusFor(const VolumeTransforms& transforms, const ObjectRecord&
 }
 }
 
-RevisionSelection volumeUmbilicusRevisions(const ObjectStore& store, const Txn& txn, const std::string& volume)
-{
-    return store.currentRevisions(txn, umbilici(volume));
-}
-
 std::vector<ObjectRecord> volumeUmbilici(const StoreReader& reader, const std::string& volume)
 {
     return reader.selectObjects(umbilici(volume));
@@ -65,7 +60,7 @@ std::string setVolumeUmbilicus(ObjectStore& store, WriteTxn& txn, const std::str
                                const geometry::Umbilicus& geometry)
 {
     requireUmbilicusFor(store.volumeTransforms(txn), record, volume);
-    for (const auto& [uuid, revision] : volumeUmbilicusRevisions(store, txn, volume)) store.retireObject(txn, uuid);
+    for (const auto& existing : store.selectObjects(txn, umbilici(volume))) store.retireObject(txn, existing.uuid);
     const auto uuid = store.upsertObject(txn, record);
     store.putGeometry(txn, uuid, geometry::encode(geometry));
     return uuid;

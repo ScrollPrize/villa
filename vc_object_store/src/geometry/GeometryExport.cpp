@@ -1,5 +1,6 @@
 #include "vc_object_store/objects/StoreReader.hpp"
 #include "geometry/GeometrySnapshot.hpp"
+#include "internal/Database.hpp"
 #include "geometry/SourceMetadata.hpp"
 #include "vc_object_store/objects/GeometryExport.hpp"
 #include "vc_object_store/objects/FiberJson.hpp"
@@ -54,8 +55,8 @@ void publish(const fs::path& source, const fs::path& destination, bool overwrite
 }
 } // namespace
 
-std::string exportGeometry(ObjectStore& db, const std::string& objectUuid, const fs::path& destination,
-    const std::optional<std::string>& revisionUuid, bool overwrite, bool validOnly)
+ObjectVersion exportGeometry(ObjectStore& db, const std::string& objectUuid, const fs::path& destination,
+    const std::optional<ObjectVersion>& version, bool overwrite, bool validOnly)
 {
     if (destination.empty()) throw std::invalid_argument("export destination is empty");
     const auto dest = fs::absolute(destination).lexically_normal();
@@ -72,20 +73,24 @@ std::string exportGeometry(ObjectStore& db, const std::string& objectUuid, const
         throw std::runtime_error("cannot export over the open object database or its sidecars");
     if (!fs::is_directory(dest.parent_path())) throw std::runtime_error("export parent directory must exist");
     Snapshot snapshot;
+    ObjectVersion exported;
     Json attributes;
     std::string fiberJson;
     {
         auto read = db.read();
-        const auto object = revisionUuid ? db.objectRevision(read, *revisionUuid) : db.currentObjectRevision(read, objectUuid);
+        if (version && util::canonicalUuid(version->objectUuid) != util::canonicalUuid(objectUuid))
+            throw std::invalid_argument("export version names another object");
+        const auto object = version ? db.objectAtVersion(read, *version) : db.currentObjectRevision(read, objectUuid);
         if (!object || object->objectUuid != util::canonicalUuid(objectUuid) || object->deleted || object->record.retired)
-            throw std::runtime_error("active object revision not found for this object");
+            throw std::runtime_error("active object version not found for this object");
+        exported = db.versionReference(read, *object);
         if (!object->geometryRevision) throw std::runtime_error("object revision has no geometry");
         const auto revision = db.geometryRevision(read, *object->geometryRevision);
         if (!revision) throw std::runtime_error("geometry revision not found");
         RevisionSelection selection;
-        if (revisionUuid) {
-            if (!object->publishedAtUs) throw std::runtime_error("object revision has no publication time");
-            selection = db.revisionSelectionAt(read, *object->publishedAtUs, true);
+        if (version) {
+            if (!object->publishedAtUs) throw std::runtime_error("object version has no publication time");
+            selection = ObjectStoreImplAccess::revisionSelectionAt(db, read, *object->publishedAtUs, true);
         } else {
             ObjectSelection all; all.includeRetired = true;
             for (const auto& record : db.selectObjects(read, all))
@@ -97,7 +102,7 @@ std::string exportGeometry(ObjectStore& db, const std::string& objectUuid, const
             std::vector<ObjectVersion> fibers;
             for (const auto& [uuid, pin] : selection)
                 if (pin)
-                    if (const auto pinned = db.objectRevision(read, *pin); pinned->record.kind == "fiber")
+                    if (const auto pinned = ObjectStoreImplAccess::objectRevision(db, read, *pin); pinned->record.kind == "fiber")
                         fibers.push_back({store, pinned->generation, uuid, pinned->version});
             fiberJson = fiberNetworkJson(LocalStoreReader(db, read), fibers, {object->objectUuid},
                                          std::numeric_limits<uint64_t>::max()).at(object->objectUuid);
@@ -132,6 +137,6 @@ std::string exportGeometry(ObjectStore& db, const std::string& objectUuid, const
     else if (kind == "umbilicus") formats::umbilicus(snapshot, attributes, output);
     else throw std::runtime_error("unsupported geometry kind for export");
     publish(output, dest, overwrite, directory);
-    return snapshot.revision.uuid;
+    return exported;
 }
 } // namespace vc::objects

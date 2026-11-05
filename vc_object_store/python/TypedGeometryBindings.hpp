@@ -146,7 +146,6 @@ inline void bindTypedGeometry(nb::module_& m)
         .def_prop_ro("available_transforms",[](const vo::GeometryView& v){return volumeTransformsToPy(v.availableTransforms());})
         .def("view_transformed_at",&vo::GeometryView::viewTransformedAt,nb::arg("volume"),nb::arg("target_scale")=1.)
         .def_prop_ro("revision", [](const vo::GeometryView& self) { return geometryToPy(self.revision()); })
-        .def_prop_ro("object_revision", &vo::GeometryView::objectRevision, nb::rv_policy::copy)
         .def_prop_ro("version", &vo::GeometryView::version,
                      "The object's numbered version this view read; None for a pinned geometry revision.");
     nb::class_<vo::PointCollectionView, vo::GeometryView>(m, "PointCollectionView")
@@ -197,7 +196,6 @@ inline void bindTypedGeometry(nb::module_& m)
         }, nb::arg("row") = 0, nb::arg("column") = 0, nb::arg("rows") = nb::none(), nb::arg("columns") = nb::none(),
            "(points, valid): a rectangle (default: all) as a (rows, columns, 3) float32 array and the store's per-vertex validity as a bool array.");
     nb::class_<vo::TransformedGeometryView>(m,"TransformedGeometryView")
-        .def_prop_ro("object_revision",&vo::TransformedGeometryView::objectRevision)
         .def_prop_ro("canonical",&vo::TransformedGeometryView::canonical)
         .def_prop_ro("target_volume",&vo::TransformedGeometryView::targetVolume)
         .def_prop_ro("matrix",[](const vo::TransformedGeometryView& v){return jsonLoads(v.mapping().json().dump());})

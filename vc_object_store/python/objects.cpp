@@ -138,25 +138,6 @@ auto writeMethod()
     }(Method);
 }
 
-nb::dict revisionViewToPy(vo::ObjectStore& db, const vo::Txn& txn, const vo::RevisionSelection& selection)
-{
-    const auto relationships = db.relationshipsAt(txn, selection);
-    nb::dict result, resolved;
-    nb::list objects, edges;
-    for (const auto& [uuid, selected] : selection) {
-        const auto revision = selected ? db.objectRevision(txn, *selected) : db.currentObjectRevision(txn, uuid);
-        objects.append(objectRevisionToPy(*revision)); // selection was validated above
-        resolved[pyStr(revision->objectUuid)] = revision->uuid;
-    }
-    for (const auto& relationship : relationships) {
-        auto edge = relationshipRevisionToPy(relationship.relationship);
-        edge["applicable"] = relationship.applicable; edges.append(edge);
-    }
-    result["objects"] = objects; result["relationships"] = edges; result["selection"] = resolved;
-    return result;
-}
-
-
 vo::EdgeGeometryRepair repairFromPy(const nb::dict& d)
 {
     vo::EdgeGeometryRepair repair;
@@ -918,13 +899,22 @@ NB_MODULE(_native, m)
         }, nb::arg("kind"), nb::arg("source"), nb::arg("coordinate_context") = nb::dict())
         .def("export_geometry", [](PyObjectStore& self, const std::string& object,
                                    const std::filesystem::path& destination,
-                                   const std::optional<std::string>& revision, bool overwrite, bool validOnly) {
-            return self.withStore<true>([&](auto& db) {
-                return vo::exportGeometry(db, object, destination, revision, overwrite, validOnly);
+                                   const std::optional<int64_t>& version, const std::optional<std::string>& generation,
+                                   bool overwrite, bool validOnly) {
+            if (generation && !version) throw std::invalid_argument("export_geometry: generation needs version");
+            const auto exported = self.withStore<true>([&](auto& db) {
+                std::optional<vo::ObjectVersion> selected;
+                if (version) {
+                    const auto status = db.status(db.read());
+                    selected = vo::ObjectVersion{status.storeUuid, generation.value_or(status.generation), object, *version};
+                }
+                return vo::exportGeometry(db, object, destination, selected, overwrite, validOnly);
             });
-        }, nb::arg("object_uuid"), nb::arg("destination"), nb::arg("object_revision_uuid") = std::nullopt,
-           nb::arg("overwrite") = false, nb::arg("valid_only") = false,
-           "Export an object revision to native files; return its geometry revision UUID. Does not modify the store.")
+            return nb::cast<nb::dict>(objectVersionsToPy({exported})[0]);
+        }, nb::arg("object_uuid"), nb::arg("destination"), nb::arg("version") = std::nullopt,
+           nb::arg("generation") = std::nullopt, nb::arg("overwrite") = false, nb::arg("valid_only") = false,
+           "Export an object version (default: current; generation defaults to the active one) to native files; "
+           "return the exported {store, generation, object, version}. Does not modify the store.")
         .def("edge_geometry_state", [](PyObjectStore& self, const std::string& uuid) {
             const auto state = self.withRead([&](vo::ObjectStore& db, vo::ReadTxn& txn) { return db.edgeGeometryState(txn, uuid); });
             nb::dict result; result["a_revision"] = state.aRevision; result["b_revision"] = state.bRevision; result["stale"] = state.stale; return result;
@@ -982,25 +972,27 @@ NB_MODULE(_native, m)
             const std::vector<std::string>& ids, const std::optional<std::string>& edgeKind,
             const std::vector<std::string>& states, const std::optional<std::array<double, 6>>& bbox,
             const std::optional<std::string>& tag, bool includeRetired, std::optional<bool> adjacent,
-            bool applicableOnly, const std::optional<vo::RevisionSelection>& revisions) {
+            bool applicableOnly, const std::optional<nb::list>& versionRefs) {
             self.require();
-            if (revisions && (kind || !ids.empty() || bbox || includeRetired))
-                throw std::invalid_argument("revisions specifies the complete graph object selection; cannot combine with object filters or include_retired");
+            if (versionRefs && (kind || !ids.empty() || bbox || includeRetired))
+                throw std::invalid_argument("versions specifies the complete graph object selection; cannot combine with object filters or include_retired");
+            const auto versions = versionRefs ? std::optional(objectVersionsFromPy(*versionRefs)) : std::nullopt;
             auto view = std::make_unique<PyGraphReadView>(); view->store = self.db;
             vo::ObjectSelection objects; objects.kind = kind; objects.uuids = ids; objects.bbox = bbox; objects.includeRetired = includeRetired;
             vo::EdgeSelection edges; edges.kind = edgeKind; edges.approvalStates = states; edges.tag = tag;
             edges.adjacent = adjacent; edges.applicableOnly = applicableOnly;
             { nb::gil_scoped_release release;
               view->txn = std::make_unique<vo::ReadTxn>(view->store->read());
-              view->graph = std::make_shared<vo::GraphReadView>(revisions ? view->store->graphReadViewAt(*view->txn, *revisions, edges)
+              view->graph = std::make_shared<vo::GraphReadView>(versions ? view->store->graphReadViewAt(*view->txn, *versions, edges)
                         : view->store->graphReadView(*view->txn, objects, edges)); }
             return view.release();
         }, nb::rv_policy::take_ownership, nb::arg("object_kind") = std::nullopt,
            nb::arg("object_uuids") = std::vector<std::string>{}, nb::arg("edge_kind") = std::nullopt,
            nb::arg("approval_states") = std::vector<std::string>{"approved"},
            nb::arg("bbox") = std::nullopt, nb::arg("edge_tag") = std::nullopt, nb::arg("include_retired") = false,
-           nb::arg("adjacent") = std::nullopt, nb::arg("applicable_only") = false, nb::arg("revisions") = std::nullopt,
-           "Pin a store graph read view; use as a context manager and close before checkpointing.")
+           nb::arg("adjacent") = std::nullopt, nb::arg("applicable_only") = false, nb::arg("versions") = std::nullopt,
+           "Pin a store graph read view; use as a context manager and close before checkpointing. versions: "
+           "numbered references {store, generation, object, version}, the complete closed object selection.")
         .def("select_objects", [](PyObjectStore& self, const std::optional<std::string>& kind,
             const std::optional<std::string>& tag, const std::vector<std::string>& ids,
             const std::optional<std::string>& connected, const std::vector<std::string>& edgeKinds,
@@ -1245,8 +1237,6 @@ NB_MODULE(_native, m)
         .def_prop_ro("uuid", readMethod<&vo::ObjectStore::uuid>())
         .def("current_object_revision", readMethod<&vo::ObjectStore::currentObjectRevision>(),
              nb::arg("object_uuid"))
-        .def("object_revision", readMethod<&vo::ObjectStore::objectRevision>(),
-             nb::arg("revision_uuid"))
         .def("object_history", readMethod<&vo::ObjectStore::objectHistory>(),
              nb::arg("object_uuid"))
         .def("status", [](PyObjectStore& self) {
@@ -1332,32 +1322,13 @@ NB_MODULE(_native, m)
                                  const std::optional<uint64_t>& count) {
             return bytesToPy(self.withStore<true>([&](vo::ObjectStore& db) { return db.readArtifact(sha256, offset, count); }));
         }, nb::arg("sha256"), nb::arg("offset") = 0, nb::arg("count") = std::nullopt)
-        .def("recorded_relationships", readMethod<&vo::ObjectStore::recordedRelationships>(),
-             nb::arg("object_revision_uuid"))
-        .def("relationships_at", [](PyObjectStore& self, const vo::RevisionSelection& selection) {
-            const auto revisions = self.withRead([&](vo::ObjectStore& db, vo::ReadTxn& txn) { return db.relationshipsAt(txn, selection); });
-            nb::list result;
-            for (const auto& revision : revisions) {
-                auto d = relationshipRevisionToPy(revision.relationship);
-                d["applicable"] = revision.applicable;
-                result.append(d);
-            }
-            return result;
-        }, nb::arg("selection"))
-        .def("revision_read_view", [](PyObjectStore& self, const vo::RevisionSelection& selection) {
-            return self.withRead([&](vo::ObjectStore& db, vo::ReadTxn& txn) {
-                return revisionViewToPy(db, txn, selection);
-            });
-        }, nb::arg("selection"),
-           "Resolve selected objects, metadata, geometry references and relationship applicability in one read snapshot.")
-        .def("revision_selection_at", readMethod<&vo::ObjectStore::revisionSelectionAt>(), nb::arg("published_at_us"),
-             nb::arg("include_retired") = false)
-        .def("revision_read_view_at", [](PyObjectStore& self, int64_t time, bool includeRetired) {
-            return self.withRead([&](vo::ObjectStore& db, vo::ReadTxn& txn) {
-                return revisionViewToPy(db, txn, db.revisionSelectionAt(txn, time, includeRetired));
-            });
+        .def("versions_at", [](PyObjectStore& self, int64_t time, bool includeRetired) {
+            return objectVersionsToPy(self.withRead([&](vo::ObjectStore& db, vo::ReadTxn& txn) {
+                return db.versionsAt(txn, time, includeRetired);
+            }));
         }, nb::arg("published_at_us"), nb::arg("include_retired") = false,
-           "Recover all objects, geometry references and recorded relationships at a publication time (UTC Unix microseconds).")
+           "The version {store, generation, object, version} of every object live at a publication time (UTC Unix "
+           "microseconds), by object UUID; read them with objects_at_versions and relationships_at_versions.")
         .def(
             "write",
             [](PyObjectStore& self, const std::optional<vo::VersionSelection>& objects,
@@ -1434,8 +1405,18 @@ NB_MODULE(_native, m)
             return self.receipt ? jsonLoads(vo::transactionReceiptToJson(*self.receipt)) : nb::none();
         }, "The committed write's numbered receipt (commit sequence, versions); None before it commits.")
         .def("retire_object", writeMethod<&vo::ObjectStore::retireObject, PyObjectWriteTxn>(), nb::arg("uuid"))
-        .def("restore_object", writeMethod<&vo::ObjectStore::restoreObject, PyObjectWriteTxn>(),
-             nb::arg("uuid"), nb::arg("source_revision") = std::nullopt)
+        .def("restore_object", [](PyObjectWriteTxn& self, const std::string& uuid, const std::optional<int64_t>& version,
+                                  const std::optional<std::string>& generation) {
+            if (generation && !version) throw std::invalid_argument("restore_object: source_generation needs source_version");
+            auto& db = self.owner->require(); auto& txn = self.require();
+            std::optional<vo::ObjectVersion> source;
+            if (version) {
+                const auto status = db.status(txn);
+                source = vo::ObjectVersion{status.storeUuid, generation.value_or(status.generation), uuid, *version};
+            }
+            db.restoreObject(txn, uuid, source);
+        }, nb::arg("uuid"), nb::arg("source_version") = std::nullopt, nb::arg("source_generation") = std::nullopt,
+           "Restore from a recorded version of the object (default: its last active one).")
         .def("retain_relationship", writeMethod<&vo::ObjectStore::retainRelationship, PyObjectWriteTxn>(), nb::arg("edge_uuid"))
         .def("keep_recorded_relationship", writeMethod<&vo::ObjectStore::keepRecordedRelationship, PyObjectWriteTxn>(), nb::arg("edge_uuid"))
         .def("keep_recorded_relationships_of", writeMethod<&vo::ObjectStore::keepRecordedRelationshipsOf, PyObjectWriteTxn>(), nb::arg("object_uuid"))

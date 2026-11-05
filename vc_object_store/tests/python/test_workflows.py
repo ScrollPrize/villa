@@ -1,6 +1,7 @@
 from pathlib import Path
 import sqlite3
 import struct
+import uuid
 import subprocess
 import sys
 
@@ -10,8 +11,10 @@ from vc_object_store import ObjectStore, PointCollection, Fiber, Track, Surface,
 from object_helpers import edge_choice
 
 
-def heads(db, *ids):
-    return {uid: db.current_object_revision(uid)['uuid'] for uid in ids}
+def refs(db, *ids):
+    status = db.status()
+    return [dict(store=status['store'], generation=status['generation'], object=uid, version=db.current_version(uid))
+            for uid in ids]
 
 
 def versions(db, *ids):
@@ -55,7 +58,7 @@ def test_owned_views_native_export_and_one_time_ingest(db, tmp_path, kind, geome
     db.set_meta(uid, 'coordinate_binding', binding)
     db.set_meta(uid, 'source', {'coordinates': {'scale_factor': 7}, 'volume_uuid': 'stale', 'coordinate_binding': {'active_volume_id': 'stale'}, 'retained_note': 'native'})
     output = tmp_path / 'native'
-    assert db.export_geometry(uid, output) == revision
+    assert db.export_geometry(uid, output) == refs(db, uid)[0]
     with pytest.raises((RuntimeError, ValueError)):
         db.export_geometry(uid, output)
     with ObjectStore.create(str(tmp_path / 'import.vcobj'), author='import') as other:
@@ -193,7 +196,7 @@ def test_checked_relationships_lifecycle_and_graph(db):
     anchor = dict(points=[dict(array='points', index=[0])], metadata_keys=['coordinates'])
     edge = db.add_edge(dict(a=a, b=b, kind='fiber_branch', a_anchor=anchor, b_anchor=anchor))
     db.set_approval(edge, 'approved')
-    selected = heads(db, a, b)
+    selected = refs(db, a, b)
     assert db.component(a, adjacent=False, applicable_only=True) == [a, b]
     assert db.component(a, adjacent=True) == [a]
     assert db.neighbours(a) == [b] and db.edges_by_kind('fiber_branch')[0]['uuid'] == edge
@@ -203,7 +206,7 @@ def test_checked_relationships_lifecycle_and_graph(db):
             tx.set_meta(a, 'rollback', True)
             tx.remove_edge(edge)  # b is also modified, but has no expectation
     assert db.journal_since() == before and db.edge(edge)
-    with db.graph_read(revisions=selected, approval_states=[]) as graph:
+    with db.graph_read(versions=selected, approval_states=[]) as graph:
         edits = [dict(array='points', element_offset=0, data=struct.pack('<i', 9))]
         assert db.affected_geometry_edit_edges(a, edits, first)[0]['uuid'] == edge
         with pytest.raises(RuntimeError):
@@ -213,8 +216,7 @@ def test_checked_relationships_lifecycle_and_graph(db):
             [[1, 2, 3], [4, 5, 6], [1, 2, 3]], [[1, 2, 3], [1, 2, 3], [4, 5, 6]])
         assert graph.component(a) == [a, b]
     assert db.component(a, applicable_only=True) == [a]
-    assert db.relationships_at(selected)[0]['applicable']
-    assert db.recorded_relationships(selected[a]) == db.recorded_relationships(selected[b])
+    assert db.relationships_at_versions(selected)[0]['applicable']
     with db.write(expected_versions=versions(db, a, b)) as tx:
         tx.retain_relationship(edge)
     assert db.component(a, applicable_only=True) == [a, b]
@@ -228,9 +230,17 @@ def test_checked_relationships_lifecycle_and_graph(db):
         assert db.current_geometry(a)['uuid'] == second
         assert db.component(b, applicable_only=True) == [b]
     assert not db.object(a)['retired']
-    assert db.object_revision(selected[a])['geometry_revision'] == first
-    at = db.object_revision(selected[a])['published_at_us']
-    assert db.revision_read_view_at(at)['selection'] == selected
+    pinned = db.objects_at_versions(selected)[0]
+    assert pinned['geometry_revision'] == first
+    assert db.versions_at(pinned['published_at_us']) == sorted(selected, key=lambda ref: ref['object'])
+    restored = db.current_version(a)
+    with db.write(expected_versions=versions(db, a, b)) as tx:
+        tx.restore_object(a, source_version=selected[0]['version'])
+        tx.keep_recorded_relationships_of(a)
+    assert db.current_geometry(a)['uuid'] == first and db.current_version(a) == restored + 1
+    with pytest.raises(ValueError):
+        with db.write(expected_versions=versions(db, a, b)) as tx:
+            tx.restore_object(a, source_version=99)
 
 
 def test_stable_ids_annotations_splice_and_coordinates(db):
@@ -408,11 +418,11 @@ def test_fiber_collection_and_linked_file_import_use_uuid_endpoints(db, tmp_path
         db.export_geometry(uid, output)
         documents.append(json.loads(output.read_text()))
     db.upsert_object(dict(kind="fiber", name="unrelated pending geometry"))
-    historical_pin = db.current_object_revision(a)['uuid']
+    historical_pin = db.current_version(a)
     with db.write(expected_versions=versions(db, a, b)) as tx:
         tx.remove_edge(documents[0]['branches'][0]['edge_uuid'])
     historical = tmp_path / 'historical-graph.json'
-    db.export_geometry(a, historical, object_revision_uuid=historical_pin)
+    assert db.export_geometry(a, historical, version=historical_pin)['version'] == historical_pin
     assert json.loads(historical.read_text()) == documents[0]
     current = tmp_path / 'current-graph.json'
     db.export_geometry(a, current)
@@ -520,16 +530,19 @@ def test_native_export_pins_object_metadata_and_geometry(db, tmp_path, kind, geo
     import json
     uid, first_geometry = put(db, geometry, kind)
     db.set_meta(uid, 'coordinates', {'scale_factor': 2})
-    before = db.current_object_revision(uid)['uuid']
+    before = db.current_version(uid)
     db.set_meta(uid, 'coordinates', {'scale_factor': 4})
     output = tmp_path / 'historical.json'
-    assert db.export_geometry(uid, output, object_revision_uuid=before) == first_geometry
+    assert db.export_geometry(uid, output, version=before)['version'] == before
+    assert db.objects_at_versions([db.export_geometry(uid, output, version=before, overwrite=True)])[0]['geometry_revision'] == first_geometry
     doc = json.loads(output.read_text())
     if kind == 'point_collection':
         doc = next(iter(doc['collections'].values()))
     assert doc['coordinates']['scale_factor'] == 2
-    with pytest.raises(RuntimeError, match='object revision'):
-        db.export_geometry(uid, tmp_path / 'wrong.json', object_revision_uuid=first_geometry)
+    with pytest.raises(RuntimeError, match='object version'):
+        db.export_geometry(uid, tmp_path / 'wrong.json', version=99)
+    with pytest.raises(RuntimeError, match='object version'):
+        db.export_geometry(uid, tmp_path / 'wrong.json', version=before, generation=str(uuid.uuid4()))
 
 
 def test_scripts_edit_hosted_replicas_under_leases(tmp_path):

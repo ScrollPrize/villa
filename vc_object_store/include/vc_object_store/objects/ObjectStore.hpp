@@ -158,7 +158,7 @@ inline constexpr const char* kAttachmentEdgeKind = "attachment";
 EdgeRecord attachmentEdge(const std::string& dataUuid, const std::string& ownerUuid, const std::string& role);
 
 // Edge changes revise both endpoints atomically; unchanged membership is inherited.
-// Pins are immutable objectRevision() UUIDs, never moving heads.
+// Endpoint pins are immutable object revisions (aVersion/bVersion), never moving heads.
 struct RelationshipRevision {
     std::string uuid;
     EdgeRecord record;
@@ -463,20 +463,14 @@ public:
     // writes. Recorded versions keep their publication generations.
     std::string startHistoryGeneration(const std::string& reason);
     std::optional<ObjectRevision> currentObjectRevision(const Txn&, const std::string& objectUuid) const;
-    std::optional<ObjectRevision> objectRevision(const Txn&, const std::string& revisionUuid) const;
     std::vector<ObjectRevision> objectHistory(const Txn&, const std::string& objectUuid) const;
-    // Latest live revisions at/before this time; actions are indivisible.
+    // The version of every object live at/before this publication time
+    // (UTC Unix microseconds), ordered by object UUID; actions are indivisible.
     // Empty before the first publication; excludes deletions.
-    RevisionSelection revisionSelectionAt(const Txn&, int64_t publishedAtUs, bool includeRetired = false) const;
-    // The current revisions of the selected objects (a pin for each), without a
-    // query per object.
-    RevisionSelection currentRevisions(const Txn&, const ObjectSelection&) const;
-    std::vector<RelationshipRevision> recordedRelationships(const Txn&, const std::string& objectRevisionUuid) const;
-    // Explicit, closed selection: omitted endpoints are not selected. null
-    // selects the latest head (unlike write(), where null expects absence).
-    std::vector<SelectedRelationship> relationshipsAt(const Txn&, const RevisionSelection&) const;
-    // Numbered form: each selected object at an exact recorded version of this
-    // store (one per object; deleted versions and unknown references fail).
+    std::vector<ObjectVersion> versionsAt(const Txn&, int64_t publishedAtUs, bool includeRetired = false) const;
+    // Relationships recorded between the selected objects, each at an exact
+    // recorded version of this store (one per object; omitted endpoints are
+    // not selected; deleted versions and unknown references fail).
     std::vector<SelectedRelationship> relationshipsAt(const Txn&, const std::vector<ObjectVersion>&) const;
     // After endpoint edits, validate anchors/metadataKeys and retain the relationship.
     // The caller decides domain meaning.
@@ -518,7 +512,7 @@ public:
     // omitted source selects the last active revision. Links need explicit validation.
     void retireObject(WriteTxn&, const std::string& uuid);
     void restoreObject(WriteTxn&, const std::string& uuid,
-                       const std::optional<std::string>& sourceRevision = std::nullopt);
+                       const std::optional<ObjectVersion>& source = std::nullopt);
     void deleteObject(WriteTxn& txn, const std::string& uuid);  // fails while edges or retained geometry reference it
 
     // Create geometry, or replace a surface; sequences use structural/sparse edits.
@@ -659,10 +653,11 @@ public:
     // generations and geometry heads from the caller's consistent snapshot.
     GraphReadView graphReadView(const Txn&, const ObjectSelection& = {},
                                const EdgeSelection& = {}) const;
-    // Requires a ReadTxn. Closed selection, null revisions resolve to latest in this snapshot.
+    // Requires a ReadTxn. Closed selection of exact recorded versions (one per
+    // object; deleted versions and unknown references fail).
     // Always includes only applicable relationships. Retains isolated objects,
     // including explicitly selected retired objects (which have no applicable edges).
-    GraphReadView graphReadViewAt(const Txn&, const RevisionSelection&,
+    GraphReadView graphReadViewAt(const Txn&, const std::vector<ObjectVersion>&,
                                  const EdgeSelection& = {}) const;
     // Neighbour object UUIDs, optionally filtered by edge kind and/or
     // neighbour object kind.
@@ -741,6 +736,14 @@ public:
     WalCheckpoint checkpointWal(WalCheckpointMode, std::chrono::milliseconds wait = std::chrono::milliseconds(0));
 
 private:
+    // Lookups by internal revision UUID (storage keys, not public history
+    // references); src/ reaches them through ObjectStoreImplAccess.
+    std::optional<ObjectRevision> objectRevision(const Txn&, const std::string& revisionUuid) const;
+    RevisionSelection revisionSelectionAt(const Txn&, int64_t publishedAtUs, bool includeRetired) const;
+    // Explicit, closed selection: omitted endpoints are not selected. null
+    // selects the latest head (unlike write(), where null expects absence).
+    std::vector<SelectedRelationship> relationshipsAt(const Txn&, const RevisionSelection&) const;
+    GraphReadView graphReadViewAt(const Txn&, const RevisionSelection&, const EdgeSelection&) const;
     struct Impl;
     static std::unique_ptr<Impl> openImpl(const std::filesystem::path&, const OpenOptions&, bool create);
     explicit ObjectStore(std::unique_ptr<Impl>);
@@ -750,6 +753,7 @@ private:
                              const EdgeDecider* decide);
     std::unique_ptr<Impl> impl_;
     friend class Txn;
+    friend struct ObjectStoreImplAccess;
 };
 
 } // namespace vc::objects
