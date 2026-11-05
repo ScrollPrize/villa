@@ -89,10 +89,11 @@ QJsonObject AgentBridgeServer::handleStateGet(const QJsonValue&)
     const auto session = state->objectStoreSession();
     const auto describeStore = [&](const vc::objects::AttachmentIdentity& attachment) {
         QJsonObject store;
-        store["path"] = QString::fromStdString(session->path(attachment).string());
+        const bool hosted = session->hosted(attachment);
+        store[hosted ? "endpoint" : "path"] = QString::fromStdString(session->location(attachment));
         store["storeUuid"] = QString::fromStdString(attachment.storeUuid);
         store["writable"] = session->writable(attachment);
-        store["hosted"] = session->hubStatus(attachment).has_value();
+        store["hosted"] = hosted || session->hubStatus(attachment).has_value();
         return store;
     };
     if (const auto project = state->vpkg()) {
@@ -102,8 +103,10 @@ QJsonObject AgentBridgeServer::handleStateGet(const QJsonValue&)
         for (const auto& reference : project->document().data().at("stores")) {
             const auto id = reference.at("id").get<std::string>();
             const auto attachment = state->storeReference(id);
-            auto store = attachment ? describeStore(*attachment) : QJsonObject{
-                {"path", QString::fromStdString(project->document().resolve(reference.at("location")).string())}};
+            auto store = attachment ? describeStore(*attachment)
+                : vc::project::ProjectDocument::hostedStore(reference)
+                    ? QJsonObject{{"endpoint", QString::fromStdString(reference.at("location").get<std::string>())}, {"hosted", true}}
+                    : QJsonObject{{"path", QString::fromStdString(project->document().resolve(reference.at("location")).string())}};
             store["id"] = QString::fromStdString(id);
             store["available"] = attachment.has_value();
             stores.append(store);

@@ -2099,6 +2099,26 @@ bool MenuActionController::attachStore(bool readOnly, const std::string& kind)
     return true;
 }
 
+bool MenuActionController::attachHostedStore()
+{
+    auto& state = *_window->_state;
+    if (!requireProject(QObject::tr("Attaching a store"))) return false;
+    bool ok = false;
+    const auto endpoint = QInputDialog::getText(_window, QObject::tr("Attach Hosted Store"),
+        QObject::tr("Endpoint of a vc_object_server (for example http://127.0.0.1:8750 through an SSH tunnel):"),
+        QLineEdit::Normal, QStringLiteral("http://127.0.0.1:8750"), &ok).trimmed();
+    if (!ok || endpoint.isEmpty()) return false;
+    const auto author = objectStoreAuthor();
+    if (author.isEmpty()) return false;
+    try {
+        state.attachHostedStore(endpoint.toStdString(), author);
+    } catch (const std::exception& error) {
+        QMessageBox::critical(_window, QObject::tr("Cannot attach hosted store"), QString::fromUtf8(error.what()));
+        return false;
+    }
+    return true;
+}
+
 bool MenuActionController::requireProject(const QString& purpose)
 {
     if (_window->_state->hasVpkg()) return true;
@@ -2124,13 +2144,16 @@ void MenuActionController::refreshStoresMenu()
     const bool project = state.hasVpkg();
     const auto attached = state.attachedStores();
     const auto storeName = [&](const vc::objects::AttachmentIdentity& attachment) {
-        auto name = QString::fromStdString(session->path(attachment).filename().string());
+        const bool hosted = session->hosted(attachment);
+        auto name = hosted ? QString::fromStdString(session->location(attachment))
+                           : QString::fromStdString(session->path(attachment).filename().string());
         if (!session->writable(attachment)) name += QObject::tr(" [read-only]");
-        if (session->hubStatus(attachment)) name += QObject::tr(" [hosted]");
+        if (hosted || session->hubStatus(attachment)) name += QObject::tr(" [hosted]");
         return name.replace("&", "&&");
     };
     _storesMenu->addAction(QObject::tr("Attach Store..."), this, [this]() { attachStore(false); })->setEnabled(project);
     _storesMenu->addAction(QObject::tr("Attach Read-only Store..."), this, [this]() { attachStore(true); })->setEnabled(project);
+    _storesMenu->addAction(QObject::tr("Attach Hosted Store..."), this, [this]() { attachHostedStore(); })->setEnabled(project);
     _storesMenu->addAction(QObject::tr("Clone Hosted Store..."), this, [this]() { cloneHostedStore(false); })->setEnabled(project);
     _storesMenu->addAction(tr("New Store..."), this, &MenuActionController::newStore)->setEnabled(project);
     _storesMenu->addSeparator();

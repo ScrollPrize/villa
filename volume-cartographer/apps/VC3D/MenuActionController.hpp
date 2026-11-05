@@ -51,6 +51,8 @@ public:
     // and attaches it beside the project; with `kind`, objects of that kind are
     // then kept in it. True once attached.
     bool attachStore(bool readOnly = false, const std::string& kind = {});
+    // Asks for a vc_object_server endpoint and attaches its store beside the project.
+    bool attachHostedStore();
     // With no project open, explains that `purpose` needs one and offers to
     // create or open one. True once a project is open.
     bool requireProject(const QString& purpose);

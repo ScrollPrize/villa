@@ -869,7 +869,9 @@ void LasagnaServiceManager::setObjectStore(std::shared_ptr<vc::objects::ObjectSt
     _storeSession = session;
     _storeAttachment = attachment;
     _storePath.clear();
-    if (session && _storeAttachment) _storePath = QString::fromStdString(session->path(*_storeAttachment).string());
+    // The service opens the store file; a hosted store has none here (no store path).
+    if (session && _storeAttachment && !session->hosted(*_storeAttachment))
+        _storePath = QString::fromStdString(session->path(*_storeAttachment).string());
     // The internal service works on one store file; restart it on the next job.
     if (_process && !_isExternal && _serviceStorePath != _storePath) {
         stopService();

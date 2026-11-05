@@ -120,6 +120,9 @@ public slots:
 public:
     // Status bar and conflict prompt for an attached hosted replica.
     void updateHubStatus();
+    // Each hosted store's freshness (current as of its last check, or
+    // disconnected) and pending saves, in the status bar.
+    void updateHostedStatus();
     void promptHubConflicts();
     enum class VolumeOpenError {
         None,
@@ -295,6 +298,7 @@ private:
     QLabel* _sharedCacheStatsLabel{nullptr};
     QLabel* _persistentCacheLowSpaceLabel{nullptr};
     QLabel* _hubStatusLabel{nullptr};
+    QLabel* _hostedStatusLabel{nullptr};
     std::vector<std::string> _hubPromptedConflicts;
     QLabel* _persistentCacheWarningText{nullptr};
     QFrame* _persistentCacheWarningBanner{nullptr};

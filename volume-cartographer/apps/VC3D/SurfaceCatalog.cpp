@@ -261,6 +261,8 @@ SurfaceCatalog::ToolStore SurfaceCatalog::toolStore() const
 {
     if (!attachment_ || !volume_) throw std::runtime_error("Attach an object store and open a volume first.");
     if (!session_->writable(*attachment_)) throw std::runtime_error("The object store is read-only.");
+    if (session_->hosted(*attachment_))
+        throw std::runtime_error("Command-line tools open a store file; they cannot use a hosted store yet.");
     return {session_->path(*attachment_), voxels_};
 }
 

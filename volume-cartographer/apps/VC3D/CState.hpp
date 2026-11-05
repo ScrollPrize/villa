@@ -63,6 +63,7 @@ public:
     static QString storeAuthor();
     // Open Options for attaching stores to the viewer's session.
     static vc::objects::OpenOptions storeOpenOptions(const QString& author, bool readOnly);
+    static vc::objects::HostedSessionOptions hostedOptions(const QString& author);
 
     // Project references are stable IDs; attachments exist only for available stores.
     std::optional<vc::objects::AttachmentIdentity> storeReference(const std::string& id) const;
@@ -72,6 +73,9 @@ public:
     void closeProject();
     std::vector<vc::objects::AttachmentIdentity> attachedStores() const;
     vc::objects::AttachmentIdentity attachStore(const std::filesystem::path&, const QString& author, bool readOnly = false);
+    // A store served by vc_object_server (e.g. http://127.0.0.1:8750 through
+    // an SSH tunnel), added to the project as a hosted entry.
+    vc::objects::AttachmentIdentity attachHostedStore(const std::string& endpoint, const QString& author);
     void detachStore(const vc::objects::AttachmentIdentity&);
     void detachStoreReference(const std::string& id);
     void replaceStoreReference(const std::string& id, const std::filesystem::path& path);

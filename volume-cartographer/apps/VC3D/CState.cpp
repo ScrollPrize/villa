@@ -299,6 +299,30 @@ QString CState::storeAuthor()
     return author;
 }
 
+vc::objects::HostedSessionOptions CState::hostedOptions(const QString& author)
+{
+    vc::objects::HostedSessionOptions options;
+    options.author = author.toStdString();
+    return options;
+}
+
+vc::objects::AttachmentIdentity CState::attachHostedStore(const std::string& endpoint, const QString& author)
+{
+    if (_objectStoreOwner) return _objectStoreOwner->attachHostedStore(endpoint, author);
+    if (!_vpkg) throw std::runtime_error("Open a project first");
+    const auto attachment = _objectStoreSession->attachHosted(endpoint, hostedOptions(author));
+    const auto id = vc::objects::util::newUuid();
+    auto data = _vpkg->document().data();
+    data["stores"].push_back({{"id", id}, {"location", endpoint}, {"hosted", true}, {"read_only", false}});
+    try { _vpkg->document().replace(std::move(data)); }
+    catch (...) { _objectStoreSession->detach(attachment); throw; }
+    _attachedStores.push_back(attachment);
+    _storeReferences.emplace(id, attachment);
+    pollObjectStoreChanges();
+    emit storeRoutesChanged();
+    return attachment;
+}
+
 vc::objects::OpenOptions CState::storeOpenOptions(const QString& author, bool readOnly)
 {
     auto options = viewerOpenOptions();
@@ -322,6 +346,7 @@ std::optional<vc::objects::AttachmentIdentity> CState::sampleStore() const
 std::optional<vc::objects::AttachmentIdentity> CState::attachedAt(const std::filesystem::path& path) const
 {
     for (const auto& attachment : _objectStoreSession->attachments()) {
+        if (_objectStoreSession->hosted(attachment)) continue;
         std::error_code error;
         if (std::filesystem::equivalent(_objectStoreSession->path(attachment), path, error)) return attachment;
     }
@@ -399,6 +424,8 @@ void CState::replaceStoreReference(const std::string& id, const std::filesystem:
     auto data = _vpkg->document().data();
     auto entry = std::find_if(data["stores"].begin(), data["stores"].end(), [&](const auto& e) { return e.at("id") == id; });
     if (entry == data["stores"].end()) throw std::invalid_argument("Unknown store reference");
+    if (vc::project::ProjectDocument::hostedStore(*entry))
+        throw std::invalid_argument("A hosted store has no file to locate; detach it and attach its endpoint again");
     if (prepareStoreSwitch && !prepareStoreSwitch()) throw std::runtime_error("Store switch cancelled");
     if (_pointCollectionSync && !_pointCollectionSync->flush())
         throw std::runtime_error("Pending point-collection edits could not be saved");
@@ -462,8 +489,9 @@ void CState::restoreStoreRoutes()
     QStringList failures;
     for (const auto& entry : _vpkg->document().data().at("stores")) {
         try {
-            const auto path = _vpkg->document().resolve(entry.at("location"));
-            const auto attachment = prepareStore(path, storeAuthor(), entry.value("read_only", false));
+            const auto attachment = vc::project::ProjectDocument::hostedStore(entry)
+                ? _objectStoreSession->attachHosted(entry.at("location").get<std::string>(), hostedOptions(storeAuthor()))
+                : prepareStore(_vpkg->document().resolve(entry.at("location")), storeAuthor(), entry.value("read_only", false));
             if (std::find(_attachedStores.begin(), _attachedStores.end(), attachment) != _attachedStores.end())
                 throw std::runtime_error("Store is referenced more than once");
             _attachedStores.push_back(attachment);

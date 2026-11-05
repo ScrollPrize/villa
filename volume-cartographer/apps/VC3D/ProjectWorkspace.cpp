@@ -314,6 +314,7 @@ ProjectWorkspace::ProjectWorkspace(CState* state, MenuActionController* menu, QW
     addStore->addAction(tr("New Store..."), _menu, &MenuActionController::newStore);
     addStore->addAction(tr("Attach Store..."), this, [this]() { _menu->attachStore(false); });
     addStore->addAction(tr("Attach Read-only..."), this, [this]() { _menu->attachStore(true); });
+    addStore->addAction(tr("Attach Hosted..."), this, [this]() { _menu->attachHostedStore(); });
     addStore->addAction(tr("Clone Hosted Store..."), this, [this]() { _menu->cloneHostedStore(false); });
     connect(button(tr("Import from Folder..."), page, storeHeader), &QPushButton::clicked, _menu,
             &MenuActionController::importIntoObjectStore);
@@ -505,7 +506,9 @@ void ProjectWorkspace::rebuild()
 
 QString ProjectWorkspace::storeDisplayName(const vc::objects::AttachmentIdentity& attachment) const
 {
-    return QString::fromStdString(_state->objectStoreSession()->path(attachment).filename().string());
+    const auto session = _state->objectStoreSession();
+    if (session->hosted(attachment)) return QString::fromStdString(session->location(attachment));
+    return QString::fromStdString(session->path(attachment).filename().string());
 }
 
 void ProjectWorkspace::rebuildProject()
@@ -546,6 +549,16 @@ void ProjectWorkspace::rebuildStores()
         if (selectedId == QString::fromStdString(id)) _stores->setCurrentItem(item);
         for (int c : {StoreSurfaces, StoreFibers, StorePointCollections, StoreSize})
             item->setTextAlignment(c, Qt::AlignRight | Qt::AlignVCenter);
+        if (!available && vc::project::ProjectDocument::hostedStore(reference)) {
+            const auto endpoint = QString::fromStdString(reference.at("location").get<std::string>());
+            item->setText(StoreName, endpoint);
+            item->setText(StoreAccess, tr("Unreachable"));
+            item->setToolTip(StoreAccess, tr("The service at %1 did not answer when the project opened. "
+                                             "Start it (or its SSH tunnel) and reopen the project.").arg(endpoint));
+            item->setForeground(StoreAccess, QColor(0xd2, 0x8b, 0x00));
+            item->setText(StoreFolder, tr("hosted"));
+            continue;
+        }
         if (!available) {
             const auto path = _state->vpkg()->document().resolve(reference.at("location"));
             item->setText(StoreName, QString::fromStdString(path.filename().string()));
@@ -558,10 +571,12 @@ void ProjectWorkspace::rebuildStores()
             continue;
         }
         const auto& store = *available;
-        const auto path = session->path(store);
-        item->setText(StoreName, QString::fromStdString(path.filename().string()));
+        const bool hosted = session->hosted(store);
+        const auto path = hosted ? std::filesystem::path() : session->path(store);
+        item->setText(StoreName, storeDisplayName(store));
         item->setToolTip(StoreName, tr("Store UUID %1").arg(QString::fromStdString(store.storeUuid)));
         QString access = session->writable(store) ? tr("Read-write") : tr("Read-only");
+        if (hosted) access += tr(" · hosted");
         if (const auto hub = session->hubStatus(store)) access += tr(" · hosted, %1").arg(hubStatusSummary(*hub));
         item->setText(StoreAccess, access);
         std::map<std::string, int64_t> counts;
@@ -579,6 +594,10 @@ void ProjectWorkspace::rebuildStores()
         item->setText(StoreSurfaces, count("surface"));
         item->setText(StoreFibers, count("fiber"));
         item->setText(StorePointCollections, count("point_collection"));
+        if (hosted) {
+            item->setText(StoreFolder, tr("hosted"));
+            continue;
+        }
         std::error_code ec;
         const auto size = std::filesystem::file_size(path, ec);
         item->setText(StoreSize, ec ? QString() : bytes(size));
@@ -809,8 +828,17 @@ void ProjectWorkspace::updateStoreButtons()
 {
     const auto store = selectedStore();
     _detachStore->setEnabled(_stores->currentItem() && _state->vpkg() && _state->vpkg()->writable() && _state->vpkg()->document().data().at("stores").size() > 1);
-    _revealStore->setEnabled(store.has_value());
-    _replaceStore->setEnabled(_stores->currentItem() && _state->vpkg() && _state->vpkg()->writable());
+    const bool hostedEntry = [&] {
+        const auto* item = _stores->currentItem();
+        if (!item || !_state->vpkg()) return false;
+        const auto id = item->data(0, kStoreIndexRole).toString().toStdString();
+        for (const auto& reference : _state->vpkg()->document().data().at("stores"))
+            if (reference.at("id") == id) return vc::project::ProjectDocument::hostedStore(reference);
+        return false;
+    }();
+    // A hosted store has no folder here and no file to locate.
+    _revealStore->setEnabled(store.has_value() && !hostedEntry);
+    _replaceStore->setEnabled(_stores->currentItem() && _state->vpkg() && _state->vpkg()->writable() && !hostedEntry);
     const auto session = _state->objectStoreSession();
     bool hosted = false;
     for (const auto& attached : _state->attachedStores()) hosted = hosted || session->hubStatus(attached);

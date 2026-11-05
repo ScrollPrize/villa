@@ -36,6 +36,7 @@
 #include <QKeyEvent>
 #include <QResizeEvent>
 #include <QSettings>
+#include <QDateTime>
 #include <QStandardPaths>
 #include <QMdiArea>
 #include <QMdiSubWindow>
@@ -981,6 +982,18 @@ CWindow::CWindow(size_t cacheSizeGB) :
         using Kind = vc::objects::StoreSessionEvent::Kind;
         if (event.kind != Kind::Committed && event.kind != Kind::Draft) updateHubStatus();
     });
+
+    // Hosted stores: what this client knows of each, from its last status check.
+    _hostedStatusLabel = new QLabel(this);
+    _hostedStatusLabel->setObjectName(QStringLiteral("hostedStoreStatusLabel"));
+    _hostedStatusLabel->setContentsMargins(8, 0, 8, 0);
+    _hostedStatusLabel->hide();
+    statusBar()->addPermanentWidget(_hostedStatusLabel);
+    auto* hostedStatusTimer = new QTimer(this);
+    hostedStatusTimer->setInterval(1000);
+    connect(hostedStatusTimer, &QTimer::timeout, this, &CWindow::updateHostedStatus);
+    connect(_state, &CState::storeRoutesChanged, this, &CWindow::updateHostedStatus);
+    hostedStatusTimer->start();
 
     _persistentCacheSpaceTimer = new QTimer(this);
     _persistentCacheSpaceTimer->setInterval(5000);
@@ -5655,6 +5668,51 @@ void CWindow::updateHubStatus()
     if (conflicts.empty() || conflicts == _hubPromptedConflicts) return;
     _hubPromptedConflicts = conflicts;
     promptHubConflicts();
+}
+
+void CWindow::updateHostedStatus()
+{
+    const auto session = _state->objectStoreSession();
+    const auto pending = session->pendingSubmissions();
+    QStringList texts, tips;
+    bool failing = false;
+    for (const auto& attachment : openStores(*_state)) {
+        std::optional<vc::objects::HostedFreshness> freshness;
+        try { freshness = session->freshness(attachment); } catch (const std::exception&) { continue; }
+        if (!freshness) continue;
+        const auto endpoint = QString::fromStdString(session->location(attachment));
+        const auto checked = freshness->checkedAtUs
+            ? QDateTime::fromMSecsSinceEpoch(*freshness->checkedAtUs / 1000).toLocalTime().toString(QStringLiteral("HH:mm:ss"))
+            : QString();
+        QString text;
+        if (!freshness->error.empty()) {
+            failing = true;
+            text = checked.isEmpty() ? tr("%1: disconnected").arg(endpoint)
+                                     : tr("%1: disconnected, last current %2").arg(endpoint, checked);
+            tips << tr("%1: %2").arg(endpoint, QString::fromStdString(freshness->error));
+        } else if (!checked.isEmpty()) {
+            text = tr("%1: current as of %2").arg(endpoint, checked);
+        } else {
+            text = tr("%1: unknown").arg(endpoint);
+        }
+        const auto waiting = std::count_if(pending.begin(), pending.end(),
+                                           [&](const auto& p) { return p.storeUuid == attachment.storeUuid; });
+        if (waiting) text += tr(" · %n save(s) pending", nullptr, int(waiting));
+        if (freshness->status)
+            tips << tr("%1: store %2, generation %3, commit %4")
+                        .arg(endpoint, QString::fromStdString(freshness->status->storeUuid))
+                        .arg(QString::fromStdString(freshness->status->generation))
+                        .arg(freshness->status->commitSequence);
+        texts << text;
+    }
+    if (texts.isEmpty()) {
+        _hostedStatusLabel->hide();
+        return;
+    }
+    _hostedStatusLabel->setText(texts.join(QStringLiteral("  ")));
+    _hostedStatusLabel->setToolTip(tips.join(QStringLiteral("\n")));
+    _hostedStatusLabel->setStyleSheet(failing ? QStringLiteral("color: #d28b00; font-weight: 600;") : QString());
+    _hostedStatusLabel->show();
 }
 
 void CWindow::promptHubConflicts()

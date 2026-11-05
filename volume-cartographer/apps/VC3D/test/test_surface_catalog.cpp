@@ -8,6 +8,9 @@
 #include "segmentation/SurfaceCorrections.hpp"
 #include "segmentation/SurfaceStoreEdit.hpp"
 #include "SessionDrafts.hpp"
+#ifdef VC3D_TEST_HOSTED
+#include <vc_object_store/server/Server.hpp>
+#endif
 #include "vc/core/PointCollections.hpp"
 #include <vc_object_store/geometry/Geometry.hpp>
 #include <vc_object_store/store/GeometryViews.hpp>
@@ -482,6 +485,81 @@ int main(int argc, char** argv)
             drafts.forgetRecovered(native);
             require(!drafts.recovered(native), "discarded");
         }
+#ifdef VC3D_TEST_HOSTED
+        // A hosted store: the catalog lists and opens its surfaces, edits save
+        // through the service, and an outage is reported and fails saves cleanly.
+        {
+            const auto hostedPath = fs::path(dir.path().toStdString()) / "hosted.vcobj";
+            std::string uuid;
+            {
+                auto store = ObjectStore::create(hostedPath, options);
+                auto write = store.write();
+                ObjectRecord record; record.kind = "surface"; record.name = "hosted";
+                record.meta = nlohmann::json{{"coordinates", vc::objects::volumeCoordinates(volume->id(), 1)}}.dump();
+                uuid = store.upsertObject(write, record);
+                store.putGeometry(write, uuid, quad_surface_geometry(grid));
+                write.commit();
+            }
+            server::ServerOptions serverOptions;
+            auto service = std::make_unique<server::Server>(hostedPath, serverOptions);
+            service->start();
+            serverOptions.port = service->port();
+            const auto endpoint = "http://127.0.0.1:" + std::to_string(serverOptions.port);
+            auto hostedSession = std::make_shared<ObjectStoreSession>();
+            HostedSessionOptions hostedOptions;
+            hostedOptions.author = "surface-catalog-test";
+            hostedOptions.pollInterval = std::chrono::hours(1);
+            hostedOptions.client.retries = 0;
+            hostedOptions.client.connectTimeoutMs = 500;
+            const auto hosted = hostedSession->attachHosted(endpoint, hostedOptions);
+            require(hostedSession->location(hosted) == endpoint && hostedSession->freshness(hosted)->error.empty(),
+                    "hosted attachment");
+            SurfaceCatalog hostedCatalog(hostedSession);
+            hostedCatalog.setSource(hosted, volume, {volume->id()});
+            QElapsedTimer timer; timer.start();
+            while ((hostedCatalog.loading() || hostedCatalog.rows().size() != 1) && timer.elapsed() < 10000) {
+                for (const auto& event : hostedSession->takeEvents()) hostedCatalog.handle(event);
+                QCoreApplication::processEvents();
+                QThread::msleep(1);
+            }
+            require(hostedCatalog.rows().size() == 1 && hostedCatalog.row(uuid), "hosted surfaces are listed");
+            auto opened = hostedCatalog.open(uuid);
+            require(opened.editable && opened.pin.version == 1, "hosted surfaces open editable");
+            SurfaceStoreEdit edit(hostedSession, opened.pin);
+            auto& points = *opened.surface->rawPointsPtr();
+            const auto vertexAt = [&](int row, int column) {
+                cv::Vec3f value;
+                hostedSession->readStore(hosted, [&](const StoreReader& reader, const auto&) {
+                    const auto p = GeometrySnapshot(reader).surface(uuid).vertex(row, column);
+                    value = {p[0], p[1], p[2]};
+                });
+                return value;
+            };
+            points(1, 1) = {4.f, 4.f, 4.f};
+            edit.save(*opened.surface, cv::Rect(1, 1, 1, 1));
+            require(edit.pin().version == 2 && vertexAt(1, 1) == cv::Vec3f(4, 4, 4), "hosted save");
+
+            // The service goes away: the check reports it, a save fails before
+            // sending anything (its reads need the service), and nothing is pending.
+            service.reset();
+            hostedSession->refresh(hosted);
+            require(!hostedSession->freshness(hosted)->error.empty(), "an unanswered check is reported");
+            points(0, 0) = {6.f, 6.f, 6.f};
+            bool failed = false;
+            try { edit.save(*opened.surface, cv::Rect(0, 0, 1, 1)); } catch (const std::exception&) { failed = true; }
+            require(failed && hostedSession->pendingSubmissions().empty() && edit.pin().version == 2,
+                    "a save without the service fails cleanly");
+            service = std::make_unique<server::Server>(hostedPath, serverOptions);
+            service->start();
+            hostedSession->refresh(hosted);
+            require(hostedSession->freshness(hosted)->error.empty(), "current again");
+            points(2, 2) = {9.f, 9.f, 9.f};
+            edit.save(*opened.surface, cv::Rect(0, 0, 3, 3));
+            require(edit.pin().version == 3 && vertexAt(0, 0) == cv::Vec3f(6, 6, 6) && vertexAt(2, 2) == cv::Vec3f(9, 9, 9),
+                    "the next save carries the edits");
+            hostedSession->detach(hosted);
+        }
+#endif
         session->detach(attachment);
         std::cout << "surface catalog tests passed\n";
         return 0;
