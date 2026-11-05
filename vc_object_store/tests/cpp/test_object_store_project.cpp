@@ -25,8 +25,8 @@ std::vector<ProjectResource> resources(ObjectStoreSession& session, const Attach
                                        const std::string& kind, const std::optional<std::string>& viewer = std::nullopt)
 {
     std::vector<ProjectResource> result;
-    session.read(attachment, [&](const auto& store, const auto& txn, const auto&) {
-        result = projectResources(store, txn, kind, viewer);
+    session.readStore(attachment, [&](const vc::objects::StoreReader& reader, const auto&) {
+        result = projectResources(reader, kind, viewer);
     });
     return result;
 }
@@ -34,7 +34,7 @@ std::vector<ProjectResource> resources(ObjectStoreSession& session, const Attach
 Json view(ObjectStoreSession& session, const AttachmentIdentity& attachment, const std::string& author)
 {
     Json result;
-    session.read(attachment, [&](const auto& store, const auto& txn, const auto&) { result = projectView(store, txn, author); });
+    session.readStore(attachment, [&](const vc::objects::StoreReader& reader, const auto&) { result = projectView(reader, author); });
     return result;
 }
 } // namespace
@@ -49,8 +49,8 @@ int main() try
     mustFail([&] { createProject(path, "again", Json::object(), as("alice")); });
     ObjectStoreSession session;
     const auto project = session.attach(path, as("alice"));
-    session.read(project, [&](const auto& store, const auto& txn, const auto&) {
-        const auto record = projectRecord(store, txn);
+    session.readStore(project, [&](const vc::objects::StoreReader& reader, const auto&) {
+        const auto record = projectRecord(reader);
         require(record && record->name == "PHerc" &&
                 Json::parse(record->meta).at("open_data").at("sample") == "PHerc0139", "project record");
     });
@@ -58,12 +58,12 @@ int main() try
     {
         auto plain = ObjectStore::create(directory.path / "plain.vcobj", as("alice"));
         auto txn = plain.read();
-        require(!projectRecord(plain, txn), "a plain store has no project record");
+        require(!projectRecord(LocalStoreReader(plain, txn)), "a plain store has no project record");
     }
     const auto plain = session.attach(directory.path / "plain.vcobj", as("alice"));
     setProjectName(session, plain, "named later");
-    session.read(plain, [&](const auto& store, const auto& txn, const auto&) {
-        require(projectRecord(store, txn)->name == "named later", "naming creates the record");
+    session.readStore(plain, [&](const vc::objects::StoreReader& reader, const auto&) {
+        require(projectRecord(reader)->name == "named later", "naming creates the record");
     });
 
     // Resources: one per (kind, location), in the order added; removal retires.
@@ -119,8 +119,8 @@ int main() try
     require(copy.storeUuid != project.storeUuid, "the copy has its own identity");
     require(resources(session, copy, kVolumeResource, "carol").size() == 2 && view(session, copy, "bob").at("current_volume") == "predictions",
             "the copy keeps the resources and views");
-    session.read(copy, [&](const auto& store, const auto& txn, const auto&) {
-        require(projectRecord(store, txn)->name == "copy", "the copy is renamed");
+    session.readStore(copy, [&](const vc::objects::StoreReader& reader, const auto&) {
+        require(projectRecord(reader)->name == "copy", "the copy is renamed");
     });
     session.detach(copy);
     session.detach(plain);

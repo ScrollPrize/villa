@@ -207,10 +207,12 @@ int main() try {
         vc::geometry::Umbilicus u;u.points={{2,4,6},{4,6,8}};
         {auto txn=db.write({{first.uuid,std::nullopt}});setVolumeUmbilicus(db,txn,"c",first,u);txn.commit();}
         {
-            auto read=db.read();const auto found=volumeUmbilicus(db,read,{"c"});
+            auto read=db.read();const auto found=volumeUmbilicus(LocalStoreReader(db,read),{"c"});
             require(found&&found->uuid==first.uuid&&found->points.front()==std::array<double,3>{1,2,3},
                     "the volume's umbilicus in its voxels");
-            require(!volumeUmbilicus(db,read,{"d"}),"a volume without one has none");
+            require(found->version.version==db.currentVersion(read,first.uuid)&&found->version.objectUuid==first.uuid&&
+                    found->version.generation==db.status(read).generation,"the umbilicus carries the version read");
+            require(!volumeUmbilicus(LocalStoreReader(db,read),{"d"}),"a volume without one has none");
         }
         auto second=first;second.uuid=vc::objects::util::newUuid();second.name="second";
         RevisionSelection pins;{auto read=db.read();pins=volumeUmbilicusRevisions(db,read,"c");}
@@ -219,7 +221,7 @@ int main() try {
         {auto txn=db.write(pins);setVolumeUmbilicus(db,txn,"c",second,u);txn.commit();}
         {
             auto read=db.read();
-            require(volumeUmbilicus(db,read,{"c"})->uuid==second.uuid&&db.objectByUuid(read,first.uuid)->retired,
+            require(volumeUmbilicus(LocalStoreReader(db,read),{"c"})->uuid==second.uuid&&db.objectByUuid(read,first.uuid)->retired,
                     "importing replaces the volume's umbilicus");
         }
         auto elsewhere=first;elsewhere.uuid=vc::objects::util::newUuid();
@@ -231,7 +233,7 @@ int main() try {
         auto extra=first;extra.uuid=vc::objects::util::newUuid();
         {auto txn=db.write();db.upsertObject(txn,extra);db.putGeometry(txn,extra.uuid,vc::geometry::encode(u));txn.commit();}
         bool several=false;
-        try{auto read=db.read();(void)volumeUmbilicus(db,read,{"c"});}catch(const std::runtime_error&){several=true;}
+        try{auto read=db.read();(void)volumeUmbilicus(LocalStoreReader(db,read),{"c"});}catch(const std::runtime_error&){several=true;}
         require(several,"several umbilici for one volume are refused");
     }
     {

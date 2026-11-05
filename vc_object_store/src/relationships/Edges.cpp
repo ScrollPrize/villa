@@ -1,3 +1,4 @@
+#include "vc_object_store/objects/StoreReader.hpp"
 #include "internal/Versions.hpp"
 #include "internal/EdgeSql.hpp"
 #include "geometry/Dependencies.hpp"
@@ -191,15 +192,7 @@ std::string ObjectStore::attach(WriteTxn& txn, const std::string& dataUuid, cons
 std::vector<EdgeRecord> ObjectStore::attachments(const Txn& txn, const std::string& ownerUuid,
                                                  const std::optional<std::string>& role) const
 {
-    EdgeSelection selection;
-    selection.kind = kAttachmentEdgeKind;
-    selection.endpointUuids = std::vector<std::string>{ownerUuid};
-    auto edges = selectEdges(txn, selection);
-    if (role)
-        std::erase_if(edges, [&](const EdgeRecord& edge) {
-            return nlohmann::json::parse(edge.meta).value("role", std::string{}) != *role;
-        });
-    return edges;
+    return vc::objects::attachments(LocalStoreReader(*this, txn), ownerUuid, role);
 }
 
 } // namespace vc::objects

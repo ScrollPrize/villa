@@ -12,6 +12,7 @@
 #include "vc_object_store/objects/ObjectStore.hpp"
 #include "vc_object_store/objects/Transactions.hpp"
 
+#include <limits>
 #include <set>
 
 namespace vc::objects {
@@ -72,11 +73,23 @@ public:
     // The transforms from the object's recorded volume to every reachable
     // volume (ObjectStore::availableTransforms).
     std::vector<vcr::catalog::TransformResolution> availableTransforms(const std::string& objectUuid) const;
+    // Every array of a geometry revision (ObjectStore::readGeometryData);
+    // throws when their bytes exceed `byteBudget`.
+    GeometryData readGeometryData(const std::string& revisionUuid, uint64_t byteBudget = 64 * 1024 * 1024) const;
     // The length of a fiber or track's current geometry in `target` voxels at
     // `targetScale` (ObjectStore::geometryLengthInVolume).
     double geometryLengthInVolume(const std::string& objectUuid, const std::string& target,
                                   double targetScale = 1) const;
 };
+
+// The attachment relationships of `owner` (ObjectStore::attachments).
+std::vector<EdgeRecord> attachments(const StoreReader&, const std::string& ownerUuid,
+                                    const std::optional<std::string>& role = std::nullopt);
+
+// The object revision a callback write (ObjectStoreSession::act and friends)
+// expects of `uuid`: its head, which for a deleted object is its deletion;
+// nullopt only when it never existed. Goes away with the callback writes.
+std::optional<std::string> currentRevisionPin(const StoreReader&, const std::string& objectUuid);
 
 // Request expectations read through a reader (objects/Transactions.hpp).
 // Adds every endpoint of the relationships (retired included) of the objects

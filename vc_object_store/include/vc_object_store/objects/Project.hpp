@@ -13,6 +13,7 @@
 //   Its UUID is named by kind, location and owner, so replicas adding the same
 //   resource agree on it. Removing one retires it.
 // - kProjectViewKind: one per author (name), its meta the author's view state.
+#include "vc_object_store/objects/StoreReader.hpp"
 #include "vc_object_store/objects/ObjectStoreSession.hpp"
 #include <nlohmann/json.hpp>
 #include <filesystem>
@@ -50,13 +51,13 @@ void createProject(const std::filesystem::path& path, const std::string& name, c
 void copyProject(ObjectStoreSession&, const AttachmentIdentity&, const std::filesystem::path& destination,
                  const std::string& name, const OpenOptions& options);
 // The store's project record; nullopt for a store without one.
-std::optional<ObjectRecord> projectRecord(const ObjectStore&, const Txn&);
+std::optional<ObjectRecord> projectRecord(const StoreReader&);
 // Name the project, creating its record when the store has none.
 void setProjectName(ObjectStoreSession&, const AttachmentIdentity&, const std::string& name);
 
 // The live resources of `kind` `viewer` sees (the shared ones and those it
 // owns; every one when nullopt), in the order they were added.
-std::vector<ProjectResource> projectResources(const ObjectStore&, const Txn&, const std::string& kind,
+std::vector<ProjectResource> projectResources(const StoreReader&, const std::string& kind,
                                               const std::optional<std::string>& viewer = std::nullopt);
 // The resource's UUID, the same in every store.
 std::string projectResourceUuid(const std::string& kind, const std::string& location, const std::string& owner = {});
@@ -77,7 +78,7 @@ void updateProjectResourceMeta(ObjectStoreSession&, const AttachmentIdentity&, c
 bool removeProjectResource(ObjectStoreSession&, const AttachmentIdentity&, const std::string& uuid);
 
 // `author`'s view of the project (an empty object without one).
-nlohmann::json projectView(const ObjectStore&, const Txn&, const std::string& author);
+nlohmann::json projectView(const StoreReader&, const std::string& author);
 // Replace `author`'s view; no change, no revision.
 void setProjectView(ObjectStoreSession&, const AttachmentIdentity&, const std::string& author,
                     const nlohmann::json& view);

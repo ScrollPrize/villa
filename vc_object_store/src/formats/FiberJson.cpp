@@ -158,23 +158,36 @@ std::string encodeFiberJson(const std::string& uuid, const GeometryData& data,
     }
     return attributes.dump();
 }
-std::string fiberRevisionJson(const ObjectStore& db,const Txn& txn,const std::string& objectRevision,uint64_t byteBudget)
+namespace {
+ObjectRevision fiberAt(const StoreReader& reader, const ObjectVersion& version)
 {
-    const auto revision=db.objectRevision(txn,objectRevision);
-    if(!revision || revision->record.kind!="fiber" || !revision->geometryRevision)
-        throw std::runtime_error("Fiber object revision has no geometry");
-    const auto geometry = db.geometryRevision(txn, *revision->geometryRevision);
+    const auto revision = reader.objectsAtVersions({version}).front();
+    if (!revision || revision->record.kind != "fiber" || revision->deleted)
+        throw std::invalid_argument("Invalid fiber export version for " + version.objectUuid);
+    return *revision;
+}
+
+std::string revisionJson(const StoreReader& reader, const ObjectRevision& revision, uint64_t byteBudget)
+{
+    if (!revision.geometryRevision) throw std::runtime_error("Fiber object revision has no geometry");
+    const auto geometry = reader.geometryRevision(*revision.geometryRevision);
     if (!geometry) throw std::runtime_error("Fiber geometry revision is missing");
-    return encodeFiberJson(revision->objectUuid, db.readGeometryData(txn, geometry->uuid, byteBudget),
-                          detail::fiberMetadata(db, txn, revision->record, *geometry).dump());
+    return encodeFiberJson(revision.objectUuid, reader.readGeometryData(geometry->uuid, byteBudget),
+                           detail::fiberMetadata(reader, revision.record, *geometry).dump());
+}
+} // namespace
+
+std::string fiberVersionJson(const StoreReader& reader, const ObjectVersion& version, uint64_t byteBudget)
+{
+    return revisionJson(reader, fiberAt(reader, version), byteBudget);
 }
 
 namespace detail {
-Json fiberMetadata(const ObjectStore& db, const Txn& txn, const ObjectRecord& record, const GeometryRevision& geometry)
+Json fiberMetadata(const StoreReader& reader, const ObjectRecord& record, const GeometryRevision& geometry)
 {
     auto source = geometryTransferMetadata(Json::parse(record.meta));
     for (const auto* name : {"control_points", "line_points"}) {
-        const auto attrs = Json::parse(db.geometryPointAnnotations(txn, geometry.uuid, name));
+        const auto attrs = Json::parse(reader.geometryPointAnnotations(geometry.uuid, name));
         const auto key = std::string(name) + "_attributes";
         if (std::any_of(attrs.begin(), attrs.end(), [](const auto& a) { return !a.is_null() && !a.empty(); })) source[key] = attrs;
         else source.erase(key);
@@ -195,7 +208,7 @@ Json fiberMetadata(const ObjectStore& db, const Txn& txn, const ObjectRecord& re
     return source;
 }
 
-Json fiberBranchJson(const ObjectStore& db, const Txn& txn, const EdgeRecord& edge,
+Json fiberBranchJson(const StoreReader& reader, const EdgeRecord& edge,
     const Anchor& own, const Anchor& other, const GeometryRevision& ownGeometry,
     const GeometryRevision& otherGeometry)
 {
@@ -204,12 +217,12 @@ Json fiberBranchJson(const ObjectStore& db, const Txn& txn, const EdgeRecord& ed
         std::vector<int64_t> ids;
         for (const auto& array : geometry.arrays) {
             if (array.name == "control_point_ids") {
-                snapshot.arrays[array.name] = db.readGeometryArray(txn, geometry.uuid, array.name);
+                snapshot.arrays[array.name] = reader.readGeometryArray(geometry.uuid, array.name);
                 ids = snapshot.values<int64_t>(array.name);
             }
         }
         const auto index = fiberBranchControlIndex(ids, anchor);
-        const auto bytes = pointValue(dependencyGeometry(db, txn, geometry), anchor.points.front());
+        const auto bytes = pointValue(dependencyGeometry(reader, geometry), anchor.points.front());
         if (!bytes) throw std::runtime_error("Fiber branch control point is missing");
         snapshot.arrays["point"] = *bytes;
         return std::pair{index, snapshot.values<double>("point")};
@@ -232,21 +245,23 @@ Json fiberBranchJson(const ObjectStore& db, const Txn& txn, const EdgeRecord& ed
 }
 
 std::map<std::string, std::string> fiberNetworkJson(
-    const ObjectStore& db, const Txn& txn, const RevisionSelection& selection,
+    const StoreReader& reader, const std::vector<ObjectVersion>& selection,
     const std::vector<std::string>& roots, uint64_t byteBudget)
 {
     std::map<std::string, ObjectRevision> revisions;
-    for (const auto& [uuid, pin] : selection) {
-        if (!pin) throw std::invalid_argument("Fiber export requires explicit object revision pins");
-        const auto revision = db.objectRevision(txn, *pin);
-        if (!revision || revision->objectUuid != uuid || revision->record.kind != "fiber" ||
-            revision->deleted)
-            throw std::invalid_argument("Invalid fiber export revision for " + uuid);
-        revisions.emplace(uuid, *revision);
+    if (!selection.empty()) {
+        const auto found = reader.objectsAtVersions(selection);
+        for (size_t i = 0; i < selection.size(); ++i) {
+            const auto& revision = found[i];
+            if (!revision || revision->record.kind != "fiber" || revision->deleted)
+                throw std::invalid_argument("Invalid fiber export version for " + selection[i].objectUuid);
+            if (!revisions.emplace(revision->objectUuid, *revision).second)
+                throw std::invalid_argument("Fiber export selects " + revision->objectUuid + " twice");
+        }
     }
     std::vector<EdgeRecord> edges;
     std::map<std::string, std::vector<std::string>> neighbours;
-    for (const auto& selected : db.relationshipsAt(txn, selection)) {
+    for (const auto& selected : selection.empty() ? std::vector<SelectedRelationship>{} : reader.relationshipsAt(selection)) {
         const auto& edge = selected.relationship.record;
         if (edge.kind != "fiber_branch") continue;
         // An omitted endpoint must never silently remove a branch constraint.
@@ -270,14 +285,14 @@ std::map<std::string, std::string> fiberNetworkJson(
     }
     std::map<std::string, Json> fibers;
     for (const auto& uuid : included)
-        fibers.emplace(uuid, Json::parse(fiberRevisionJson(db, txn, revisions.at(uuid).uuid, byteBudget)));
+        fibers.emplace(uuid, Json::parse(revisionJson(reader, revisions.at(uuid), byteBudget)));
     for (const auto& edge : edges) {
         if (!included.contains(edge.aUuid)) continue;
-        const auto aGeometry = db.geometryRevision(txn, *revisions.at(edge.aUuid).geometryRevision);
-        const auto bGeometry = db.geometryRevision(txn, *revisions.at(edge.bUuid).geometryRevision);
+        const auto aGeometry = reader.geometryRevision(*revisions.at(edge.aUuid).geometryRevision);
+        const auto bGeometry = reader.geometryRevision(*revisions.at(edge.bUuid).geometryRevision);
         const auto key = Json::parse(edge.meta).value("adjacent", false) ? "adjacent_branches" : "branches";
-        fibers.at(edge.aUuid)[key].push_back(detail::fiberBranchJson(db, txn, edge, edge.aAnchor, edge.bAnchor, *aGeometry, *bGeometry));
-        fibers.at(edge.bUuid)[key].push_back(detail::fiberBranchJson(db, txn, edge, edge.bAnchor, edge.aAnchor, *bGeometry, *aGeometry));
+        fibers.at(edge.aUuid)[key].push_back(detail::fiberBranchJson(reader, edge, edge.aAnchor, edge.bAnchor, *aGeometry, *bGeometry));
+        fibers.at(edge.bUuid)[key].push_back(detail::fiberBranchJson(reader, edge, edge.bAnchor, edge.aAnchor, *bGeometry, *aGeometry));
     }
     std::map<std::string, std::string> result;
     for (auto& [uuid, fiber] : fibers) result.emplace(uuid, fiber.dump());

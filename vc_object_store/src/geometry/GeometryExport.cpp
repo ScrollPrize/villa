@@ -1,3 +1,4 @@
+#include "vc_object_store/objects/StoreReader.hpp"
 #include "geometry/GeometrySnapshot.hpp"
 #include "geometry/SourceMetadata.hpp"
 #include "vc_object_store/objects/GeometryExport.hpp"
@@ -92,10 +93,14 @@ std::string exportGeometry(ObjectStore& db, const std::string& objectUuid, const
         }
         snapshot.revision = *revision;
         if (revision->kind == "fiber") {
-            RevisionSelection fibers;
+            const auto store = db.status(read).storeUuid;
+            std::vector<ObjectVersion> fibers;
             for (const auto& [uuid, pin] : selection)
-                if (pin && db.objectRevision(read, *pin)->record.kind == "fiber") fibers.emplace(uuid, pin);
-            fiberJson = fiberNetworkJson(db, read, fibers, {object->objectUuid}, std::numeric_limits<uint64_t>::max()).at(object->objectUuid);
+                if (pin)
+                    if (const auto pinned = db.objectRevision(read, *pin); pinned->record.kind == "fiber")
+                        fibers.push_back({store, pinned->generation, uuid, pinned->version});
+            fiberJson = fiberNetworkJson(LocalStoreReader(db, read), fibers, {object->objectUuid},
+                                         std::numeric_limits<uint64_t>::max()).at(object->objectUuid);
         } else attributes = detail::nativeMetadata(db, read, object->record, *revision, selection);
         if (revision->formatVersion != 1 || revision->coordinateSystem != "source_xyz")
             throw std::runtime_error("unsupported geometry format for native export");

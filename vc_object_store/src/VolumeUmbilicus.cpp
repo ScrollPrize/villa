@@ -20,9 +20,9 @@ RevisionSelection volumeUmbilicusRevisions(const ObjectStore& store, const Txn& 
     return store.currentRevisions(txn, umbilici(volume));
 }
 
-std::optional<VolumeUmbilicus> volumeUmbilicus(const ObjectStore& store, const Txn& txn, const VolumeVoxels& volume)
+std::optional<VolumeUmbilicus> volumeUmbilicus(const StoreReader& reader, const VolumeVoxels& volume)
 {
-    const auto records = store.selectObjects(txn, umbilici(volume.volume));
+    const auto records = reader.selectObjects(umbilici(volume.volume));
     if (records.empty()) return std::nullopt;
     if (records.size() > 1) {
         std::string names;
@@ -30,10 +30,11 @@ std::optional<VolumeUmbilicus> volumeUmbilicus(const ObjectStore& store, const T
         throw std::runtime_error("several umbilici map to volume " + volume.volume + ":" + names);
     }
     const auto& record = records.front();
-    if (!store.currentGeometry(txn, record.uuid))
-        throw std::runtime_error("umbilicus " + record.name + " has no geometry");
-    const auto canonical = GeometrySnapshot(store, txn).umbilicus(record.uuid);
-    VolumeUmbilicus result{record.uuid, record.name, store.currentObjectRevision(txn, record.uuid)->uuid,
+    const auto head = reader.currentObject(record.uuid);
+    if (!head || !head->geometryRevision) throw std::runtime_error("umbilicus " + record.name + " has no geometry");
+    // The geometry of the version read, so points and version agree.
+    const auto canonical = GeometrySnapshot(reader).umbilicus(record.uuid, *head->geometryRevision);
+    VolumeUmbilicus result{record.uuid, record.name, {reader.status().storeUuid, head->generation, record.uuid, head->version},
                            canonical.viewTransformedAt(volume.volume, volume.scale).points("points", 0, canonical.size())};
     return result;
 }
@@ -42,9 +43,7 @@ std::optional<VolumeUmbilicus> volumeUmbilicus(ObjectStoreSession& session, cons
                                                const VolumeVoxels& volume)
 {
     std::optional<VolumeUmbilicus> umbilicus;
-    session.read(attachment, [&](const auto& store, const auto& txn, const auto&) {
-        umbilicus = volumeUmbilicus(store, txn, volume);
-    });
+    session.readStore(attachment, [&](const StoreReader& reader, const auto&) { umbilicus = volumeUmbilicus(reader, volume); });
     return umbilicus;
 }
 

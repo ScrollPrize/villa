@@ -2,6 +2,7 @@
 #include "ObjectReadBindings.hpp"
 #include "TypedGeometryBindings.hpp"
 #include "vc_object_store/objects/GeometryCoordinates.hpp"
+#include "vc_object_store/objects/StoreReader.hpp"
 #include "vc_object_store/objects/AttachedDocument.hpp"
 #include "vc_object_store/objects/SurfaceCreate.hpp"
 #include "GeometryRegionBindings.hpp"
@@ -919,13 +920,13 @@ NB_MODULE(_native, m)
              "Find a surface/fiber by source UUID, verifying the saved path before searching the dataset root.")
         .def("checkpoint", [](PyObjectStore& self) { self.require().checkpoint(); })
         .def("attached_document", [](PyObjectStore& self, const std::string& owner, const std::string& role) -> nb::object {
-            const auto document = self.withRead<true>([&](auto& db, auto& txn) { return vo::attachedDocument(db, txn, owner, role); });
+            const auto document = self.withRead<true>([&](auto& db, auto& txn) { return vo::attachedDocument(vo::LocalStoreReader(db, txn), owner, role); });
             return document ? jsonLoads(document->dump()) : nb::none();
         }, nb::arg("owner_uuid"), nb::arg("role"), "The document attached to owner in role, or None.")
         .def("point_collections", [](PyObjectStore& self, const std::vector<std::string>& uuids, const std::string& volume,
                                      double targetScale) {
             const auto collections = self.withRead<true>([&](auto& db, auto& txn) {
-                return vo::pointCollections(db, txn, uuids, vo::VolumeVoxels{volume, targetScale});
+                return vo::pointCollections(vo::LocalStoreReader(db, txn), uuids, vo::VolumeVoxels{volume, targetScale});
             });
             nb::list out;
             for (const auto& collection : collections) {
@@ -1361,12 +1362,12 @@ NB_MODULE(_native, m)
         nb::arg("object_uuid"),nb::arg("target_volume"),nb::arg("target_scale")=1.0);
     // A store as a project (objects/Project.hpp).
     store.def("project_record",[](PyObjectStore& self)->nb::object{
-        const auto record=self.withRead([&](auto& db,auto& txn){return vo::projectRecord(db,txn);});
+        const auto record=self.withRead([&](auto& db,auto& txn){return vo::projectRecord(vo::LocalStoreReader(db,txn));});
         return record?nb::object(objectToPy(*record)):nb::none();
     },"The store's project record, or None.");
     store.def("project_resources",[](PyObjectStore& self,const std::string& kind,const std::optional<std::string>& viewer){
         nb::list resources;
-        for(const auto& resource:self.withRead([&](auto& db,auto& txn){return vo::projectResources(db,txn,kind,viewer);})){
+        for(const auto& resource:self.withRead([&](auto& db,auto& txn){return vo::projectResources(vo::LocalStoreReader(db,txn),kind,viewer);})){
             nb::dict d;
             d["uuid"]=resource.uuid;d["kind"]=resource.kind;d["location"]=resource.location;d["owner"]=resource.owner;
             d["tags"]=resource.tags;d["meta"]=jsonLoads(resource.meta.dump());

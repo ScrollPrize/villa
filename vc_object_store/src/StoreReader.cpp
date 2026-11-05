@@ -46,6 +46,31 @@ PackedGeometryArray StoreReader::readGeometryArrays(const std::vector<std::strin
     return packed;
 }
 
+GeometryData StoreReader::readGeometryData(const std::string& revisionUuid, uint64_t budget) const
+{
+    const auto revision = geometryRevision(revisionUuid);
+    if (!revision) throw std::invalid_argument("geometry revision not found");
+    uint64_t total = 0;
+    for (const auto& array : revision->arrays) {
+        if (array.byteLength < 0 || uint64_t(array.byteLength) > budget - total)
+            throw std::runtime_error("geometry read exceeds byte budget; use bounded ranges");
+        total += uint64_t(array.byteLength);
+    }
+    GeometryData data; data.kind = revision->kind; data.formatVersion = revision->formatVersion;
+    data.coordinateSystem = revision->coordinateSystem; data.attributes = revision->attributes;
+    for (const auto& info : revision->arrays) {
+        GeometryArray array{info.name, info.dtype, info.shape, {}};
+        array.bytes.reserve(size_t(info.byteLength));
+        for (int64_t offset = 0; offset < info.byteLength;) {
+            const auto count = std::min<int64_t>(1024 * 1024, info.byteLength - offset);
+            auto bytes = readGeometryArray(revisionUuid, info.name, offset, count);
+            array.bytes.insert(array.bytes.end(), bytes.begin(), bytes.end()); offset += count;
+        }
+        data.arrays.push_back(std::move(array));
+    }
+    return data;
+}
+
 double StoreReader::geometryLengthInVolume(const std::string& objectUuid, const std::string& target,
                                            double targetScale) const
 {
@@ -100,6 +125,27 @@ VersionSelection transformDependencies(const StoreReader& reader)
         }
     }
     return result;
+}
+
+std::optional<std::string> currentRevisionPin(const StoreReader& reader, const std::string& objectUuid)
+{
+    if (const auto head = reader.currentObject(objectUuid)) return head->uuid;
+    const auto history = reader.objectHistory(objectUuid);
+    return history.empty() ? std::nullopt : std::optional(history.back().uuid);
+}
+
+std::vector<EdgeRecord> attachments(const StoreReader& reader, const std::string& ownerUuid,
+                                    const std::optional<std::string>& role)
+{
+    EdgeSelection selection;
+    selection.kind = kAttachmentEdgeKind;
+    selection.endpointUuids = std::vector<std::string>{ownerUuid};
+    auto edges = reader.selectEdges(selection);
+    if (role)
+        std::erase_if(edges, [&](const EdgeRecord& edge) {
+            return nlohmann::json::parse(edge.meta).value("role", std::string{}) != *role;
+        });
+    return edges;
 }
 
 bool changesTouchKinds(const StoreReader& reader, const FeedCursor& since, const std::set<std::string>& kinds)

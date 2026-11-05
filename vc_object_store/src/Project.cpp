@@ -18,9 +18,12 @@ std::optional<std::string> currentRevision(ObjectStoreSession& session, const At
                                            const std::string& uuid, std::optional<ObjectRecord>* record = nullptr)
 {
     std::optional<std::string> revision;
-    session.read(attachment, [&](const auto& store, const auto& txn, const auto&) {
-        if (const auto head = store.currentObjectRevision(txn, uuid)) revision = head->uuid;
-        if (record) *record = store.objectByUuid(txn, uuid);
+    session.readStore(attachment, [&](const StoreReader& reader, const auto&) {
+        revision = currentRevisionPin(reader, uuid);
+        if (record) {
+            const auto head = reader.currentObject(uuid);
+            *record = head ? std::optional(head->record) : std::nullopt;
+        }
     });
     return revision;
 }
@@ -116,17 +119,28 @@ void copyProject(ObjectStoreSession& session, const AttachmentIdentity& attachme
     }
 }
 
-std::optional<ObjectRecord> projectRecord(const ObjectStore& store, const Txn& txn)
+std::optional<ObjectRecord> projectRecord(const StoreReader& reader)
 {
-    auto records = store.objectsByKind(txn, kProjectKind);
+    ObjectSelection selection;
+    selection.kind = kProjectKind;
+    auto records = reader.selectObjects(selection);
     if (records.empty()) return std::nullopt;
-    return std::move(records.front());
+    if (records.size() == 1) return std::move(records.front());
+    // A store holds one; with several, the first added.
+    const auto added = [&](const ObjectRecord& record) {
+        const auto history = reader.objectHistory(record.uuid);
+        return history.empty() ? std::nullopt : history.front().publishedAtUs;
+    };
+    auto first = std::min_element(records.begin(), records.end(), [&](const auto& a, const auto& b) {
+        return std::pair(added(a).value_or(0), a.uuid) < std::pair(added(b).value_or(0), b.uuid);
+    });
+    return std::move(*first);
 }
 
 void setProjectName(ObjectStoreSession& session, const AttachmentIdentity& attachment, const std::string& name)
 {
     std::optional<ObjectRecord> record;
-    session.read(attachment, [&](const auto& store, const auto& txn, const auto&) { record = projectRecord(store, txn); });
+    session.readStore(attachment, [&](const StoreReader& reader, const auto&) { record = projectRecord(reader); });
     if (record && record->name == name) return;
     if (!record) {
         record.emplace();
@@ -137,16 +151,18 @@ void setProjectName(ObjectStoreSession& session, const AttachmentIdentity& attac
     writeRecord(session, attachment, *record, currentRevision(session, attachment, record->uuid));
 }
 
-std::vector<ProjectResource> projectResources(const ObjectStore& store, const Txn& txn, const std::string& kind,
+std::vector<ProjectResource> projectResources(const StoreReader& reader, const std::string& kind,
                                               const std::optional<std::string>& viewer)
 {
     if (!isProjectResourceKind(kind)) throw std::invalid_argument("not a project resource kind: " + kind);
-    auto records = store.objectsByKind(txn, kind);
+    ObjectSelection selection;
+    selection.kind = kind;
+    auto records = reader.selectObjects(selection);
     // Added order: when the first revision was published (microseconds), or
     // created (seconds) for a hub baseline without its publication time.
     std::map<std::string, std::pair<std::string, int64_t>> added;
     for (const auto& record : records) {
-        const auto history = store.objectHistory(txn, record.uuid);
+        const auto history = reader.objectHistory(record.uuid);
         const auto published = history.empty() ? std::nullopt : history.front().publishedAtUs;
         added[record.uuid] = published ? std::pair(std::string{}, *published) : std::pair(record.createdAt, int64_t(0));
     }
@@ -229,11 +245,11 @@ bool removeProjectResource(ObjectStoreSession& session, const AttachmentIdentity
     return true;
 }
 
-Json projectView(const ObjectStore& store, const Txn& txn, const std::string& author)
+Json projectView(const StoreReader& reader, const std::string& author)
 {
-    const auto record = store.objectByUuid(txn, projectViewUuid(author));
-    if (!record || record->retired) return Json::object();
-    auto view = Json::parse(record->meta);
+    const auto head = reader.currentObject(projectViewUuid(author));
+    if (!head || head->record.retired) return Json::object();
+    auto view = Json::parse(head->record.meta);
     return view.is_object() ? view : Json::object();
 }
 
