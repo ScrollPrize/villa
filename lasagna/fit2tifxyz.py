@@ -1288,10 +1288,7 @@ def main(argv: list[str] | None = None, *, cancel_fn=None, state: dict | None = 
 			session.path, cfg.output_name.removesuffix(".tifxyz"), args.output_name_mode))
 	created = created_surfaces if created_surfaces is not None else []
 	try:
-		result = _export(cfg, cancel_fn=_check_cancel, state=state, store_session=session, created=created)
-		if own_session:
-			session.sync()
-		return result
+		return _export(cfg, cancel_fn=_check_cancel, state=state, store_session=session, created=created)
 	finally:
 		if own_session:
 			session.close()

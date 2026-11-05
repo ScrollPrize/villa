@@ -71,14 +71,14 @@ For VC3D integration, VC3D is transport only: it sends the selected tifxyz/model
 ### Stored surfaces (VC3D)
 
 VC3D works on surfaces in a VC object store, never on tifxyz directories. Start the service with `--store PATH`
-(a hub replica or local store; `/health` reports its `store_uuid`); VC3D starts its internal service on its own
-store file with `--shared-store`, leaving hub sync to VC3D's session. A VC3D request names that store
+(a local store file; `/health` reports its `store_uuid`); VC3D starts its internal service on its own
+store file with `--shared-store`. A VC3D request names that store
 (`store_uuid`) and the volume it works in (`volume_uuid`); its surface references are
-`{"type": "surface", "uuid": ..., "revision": optional geometry revision}` in `external_surfaces`, the atlas
+`{"type": "surface", "uuid": ..., "generation": ..., "version": ...}` (the version optional) in `external_surfaces`, the atlas
 `base.ref`, and `model` (the model checkpoint a fit published with that surface: its `model.pt` artifact, read as a
 local copy in the service's object cache, `<object store dir>/artifacts/<sha256>/model.pt`).
-The service syncs the store before a job, the fit reads the surfaces directly (`fit.py --store --volume-uuid`,
-references `vcobj:<uuid>[@<revision>]`), and the export creates new surfaces in the store
+The fit reads the surfaces directly (`fit.py --store --volume-uuid`,
+references `vcobj:<uuid>[@<generation>/<version>]`), and the export creates new surfaces in the store
 (`fit2tifxyz.py --store PATH --volume-uuid UUID [--tag TAG]`): the `d` and flow-gate channels are surface
 channels, `model.pt`/`model_params.json`/mask debug files are published as the surface's artifacts (written to a
 temporary directory, then stored with the surface's version in one checked request), and the

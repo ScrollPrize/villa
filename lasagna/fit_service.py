@@ -1882,8 +1882,7 @@ def _run_optimization(job: _JobState, body: dict[str, Any]) -> None:
         store_volume = _request_store_volume(body)
         store_voxel_scale = _request_voxel_scale(body)
         if store_volume is not None:
-            job.set_running("loading", 0, 0, 0.0, stage_name="Syncing the object store")
-            _require_store().sync()
+            _require_store()
         body = _body_with_resolved_job_spec(body)
     except Exception as exc:
         job.set_error(str(exc))
@@ -2138,7 +2137,6 @@ def _run_optimization(job: _JobState, body: dict[str, Any]) -> None:
                 "finalizing", 0, 0, 0.0,
                 stage_name="Finalizing Lasagna preview export")
             if store_volume is not None:
-                _require_store().sync()
                 print(f"[fit-service] results stored: surfaces {output_surfaces} "
                       f"in {time.perf_counter() - save_t0:.3f}s", flush=True)
             else:
@@ -2593,9 +2591,9 @@ def main() -> None:
     p.add_argument("--capture-dir", default=None,
                    help="Directory for captured queued jobs (default: ./job_captures)")
     p.add_argument("--store", default=None,
-                   help="VC object store (a hub replica or local store) VC3D jobs read surfaces from and write to")
+                   help="VC object store file VC3D jobs read surfaces from and write to")
     p.add_argument("--shared-store", action="store_true", default=False,
-                   help="--store is the store file of the VC3D that started this service; its session syncs it")
+                   help="--store is the store file of the VC3D that started this service")
     args = p.parse_args()
     if args.store:
         _store = stored_surfaces.StoreSession(args.store, shared=args.shared_store)

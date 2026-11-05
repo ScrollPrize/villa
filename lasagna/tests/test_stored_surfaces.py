@@ -276,7 +276,7 @@ class ServiceStoreRequestTest(unittest.TestCase):
 		self.assertEqual(model.read_bytes(), b"checkpoint")
 		self.assertNotEqual(model, checkpoint)  # a cached copy of the published bytes
 
-	def test_a_shared_store_is_written_but_synced_by_its_owner(self) -> None:
+	def test_a_shared_store_is_written_through_short_lived_connections(self) -> None:
 		shared = stored_surfaces.StoreSession(self.store_path, author="service", shared=True)
 		try:
 			self.assertEqual(shared.store_uuid, fit_service._store.store_uuid)
@@ -285,7 +285,6 @@ class ServiceStoreRequestTest(unittest.TestCase):
 			shared.publish_artifacts(self.source, {"model.pt": checkpoint})  # read-only session, written anyway
 			cached = fit_service._store.artifact_file(self.source, "model.pt", Path(self._td.name) / "cache")
 			self.assertEqual(cached.read_bytes(), b"shared")
-			shared.sync()  # the owning session syncs; nothing to wait for here
 			created = create_surface(
 				shared.path, np.zeros((2, 2, 3), np.float32), name="written", scale=1.0, volume=VOLUME, tool="test")
 		finally:

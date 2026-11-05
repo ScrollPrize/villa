@@ -71,13 +71,12 @@ def next_free_name(store: str | Path, root: str, mode: str) -> str:
 
 
 class StoreSession:
-	"""A store attached for this process: a hosted replica syncs with its hub in the background (pushing writes
-	made through any connection to the file). Files belonging to an object (a fit's model checkpoint) are its
+	"""A store attached for this process. Files belonging to an object (a fit's model checkpoint) are its
 	artifacts: published into the store with the object's version and read back as cached local copies. Reads and
-	writes go through ``open_store`` connections to ``path``.
+	writes go through ``open_store`` connections to ``path``; every write is committed when it returns.
 
-	``shared``: the file is another process's store (VC3D's, for a service on its host) and that process's
-	session syncs it; this one only reads and writes it, and ``sync`` has nothing to do."""
+	``shared``: the file is another process's store (VC3D's, for a service on its host); this session attaches it
+	read-only and writes through short-lived connections."""
 
 	def __init__(self, path: str | Path, *, author: str | None = None, shared: bool = False):
 		from vc_object_store import ObjectStoreSession
@@ -110,17 +109,6 @@ class StoreSession:
 											 {name: str(path) for name, path in files.items()}, self.author)
 		finally:
 			session.detach(attachment)
-
-	def sync(self, *, timeout_s: float = 120.0) -> None:
-		"""Pull the hub's changes and push this replica's; returns once a sync started now has finished. A store
-		without a hub, or a shared one, has nothing to sync."""
-		status = self._session.sync_hub_and_wait(self._attachment, timeout_s=timeout_s)
-		if status is None:
-			return
-		if status["conflicts"]:
-			raise RuntimeError(f"store {self.path} has hub conflicts to resolve")
-		if status["error"]:
-			raise RuntimeError(f"store {self.path} did not sync with its hub: {status['error']}")
 
 	def close(self) -> None:
 		self._session.detach(self._attachment)
