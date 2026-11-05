@@ -11,10 +11,11 @@ Surfaces follow the same rules: VC3D lists, opens and edits `surface` objects
 only (no tifxyz reads), Open Data segments are surfaces of read-only per-sample
 catalog stores, and tools run in `--store` mode.
 
-Native export accepts an **object revision** pin, so metadata, coordinates and
-applicable topology agree with the selected geometry. Python names this argument
-`object_revision_uuid`; the CLI retains `--revision`. The return value is the
-geometry revision UUID. Historical exports do not read current annotations.
+Native export accepts a recorded **object version**, so metadata, coordinates and
+applicable topology agree with the selected geometry. Python takes `version=`
+(and `generation=`, default the active one); the CLI takes `--version N`
+(and `--generation G`). The return value is the exported numbered version.
+Historical exports do not read current annotations.
 
 ## Build and checks
 
