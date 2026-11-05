@@ -85,10 +85,16 @@ pair to see every fit its session made.
 From this directory. The reviewer comes from `--handle` and `--email`, or from
 `VOLREG_HANDLE` and `VOLREG_EMAIL`:
 
+    uv run --python 3.12 --with-requirements requirements.txt python -m volreg.cli new PAIR \
+        --start START_TRANSFORM --manifest MANIFEST
     uv run --python 3.12 --with-requirements requirements.txt python -m volreg.cli run PAIR
     uv run --python 3.12 --with-requirements requirements.txt python -m volreg.cli answer PAIR p0007 lines-up
     uv run --python 3.12 --with-requirements requirements.txt python -m volreg.cli more PAIR --holdout 20
     uv run --python 3.12 --with-requirements requirements.txt python -m volreg.cli redo PAIR fit
+
+`new` starts a pair from a transform file (moving → fixed, the first runs' `dense/` or
+`discovered/` ones), its volumes from the manifest entry of the same name, and runs it. Only
+the start's affine part is kept.
 
 A first run's session goes into a new pair after its capture check, before the hold-out
 set is drawn: its patches with their measurements and blocks, its fits (as `prior-<id>`,

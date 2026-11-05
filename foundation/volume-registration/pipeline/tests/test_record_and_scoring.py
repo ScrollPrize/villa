@@ -1,6 +1,7 @@
 """The record's files, scoring against a hold-out set, and the bar."""
 
 import json
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -84,3 +85,19 @@ def test_bar():
     assert not bar_check(good | {"lines_up": 19})["checks"]["enough"]
     assert not bar_check(good | {"median_fine_voxels": 2.01})["passes"]
     assert bar_check(good)["bar"] == BAR["version"]
+
+
+def test_a_new_pair_takes_its_volumes_from_the_manifest_and_its_start_from_the_transform(tmp_path):
+    from volreg.cli import new_pair
+    start = Path(__file__).parent / "example_transform.json"
+    volumes = {"fixed": "https://proxy/a.zarr", "fixed_direct": "https://direct/a.zarr",
+               "fixed_voxel_size_um": 7.91, "moving": "https://proxy/b.zarr",
+               "moving_voxel_size_um": 45.532}
+    by = {"handle": "test", "email": "test@example.org"}
+    record = new_pair(tmp_path / "p", start, volumes, "B-to-A", by)
+    pair = record.read(rec.PAIR)
+    assert pair["fixed"]["url"] == "https://direct/a.zarr" and pair["moving"]["url"] == "https://proxy/b.zarr"
+    assert pair["coarse_side"] == "moving" and len(pair["start"]["matrix_xyz"]) == 3
+    assert record.events()[-1]["kind"] == "pair-created"
+    with pytest.raises(FileExistsError):
+        new_pair(tmp_path / "p", start, volumes, "B-to-A", by)

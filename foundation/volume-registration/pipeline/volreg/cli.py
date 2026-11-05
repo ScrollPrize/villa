@@ -1,5 +1,6 @@
 """volreg: drive and inspect registration records.
 
+    python -m volreg.cli new PAIR --start TRANSFORM --manifest MANIFEST [--name KEY]
     python -m volreg.cli run PAIR                  start every stage that can run; show where it stands
     python -m volreg.cli status RECORDS_DIR        every pair, one line each
     python -m volreg.cli answer PAIR UNIT ANSWER   a hold-out answer (or "clear")
@@ -15,6 +16,7 @@ The reviewer is taken from --handle and --email, or VOLREG_HANDLE and VOLREG_EMA
 """
 
 import argparse
+import json
 import os
 import sys
 from pathlib import Path
@@ -23,6 +25,7 @@ from . import engine
 from . import migrate as migration
 from . import record as rec
 from . import stages as pipeline_stages
+from .cores.transform_io import read_transform_json
 from .scoring import bar_check, score
 
 
@@ -86,6 +89,27 @@ def python():
     requirements = Path(__file__).resolve().parent.parent / "requirements.txt"
     return ["uv", "run", "-q", "--python", f"{sys.version_info.major}.{sys.version_info.minor}",
             "--with-requirements", str(requirements), "python"]
+
+
+def new_pair(directory, start, volumes, name, by):
+    """A pair that starts from a transform file (moving -> fixed, XYZ), its volumes taken
+    from a manifest entry: the `*_direct` URL where there is one. Only the start's affine
+    part is kept; the fit measures again whatever deformation it carried."""
+    record = rec.Record(directory)
+    if record.exists(rec.PAIR):
+        raise FileExistsError(f"{directory} already holds a pair")
+    side = {which: {"url": volumes.get(f"{which}_direct") or volumes[which],
+                    "voxel_um": float(volumes[f"{which}_voxel_size_um"])}
+            for which in ("fixed", "moving")}
+    matrix, _fixed_points, _moving_points = read_transform_json(start)
+    record.write(rec.PAIR, {
+        "pair": name, **side,
+        "coarse_side": "fixed" if side["fixed"]["voxel_um"] >= side["moving"]["voxel_um"] else "moving",
+        "start": {"source": str(Path(start).resolve()), "matrix_xyz": matrix[:3].tolist()},
+        "created": rec.now(),
+    })
+    record.log("pair-created", pair=name, start=str(Path(start).resolve()), by=by)
+    return record
 
 
 def advance(pair):
@@ -163,6 +187,11 @@ def main(argv=None):
                        ("check", "recompute published scores from the record alone")):
         commands.add_parser(name, help=text).add_argument("records", nargs="+")
     commands.add_parser("run", help="start what can run, show the stages").add_argument("pair")
+    new = commands.add_parser("new", help="a new pair from a start transform")
+    new.add_argument("pair")
+    new.add_argument("--start", required=True, help="transform JSON, moving -> fixed")
+    new.add_argument("--manifest", required=True, help="pairs' volumes, by pair name")
+    new.add_argument("--name", help="the pair's key in the manifest (default: the start's file name)")
     job = commands.add_parser("job", help="run one stage here (what `run` starts)")
     job.add_argument("pair")
     job.add_argument("stage")
@@ -193,7 +222,7 @@ def main(argv=None):
     imported.add_argument("pair")
     imported.add_argument("session")
     imported.add_argument("record")
-    for command in (answer, migrate, more, redo, revisit):
+    for command in (answer, migrate, more, new, redo, revisit):
         command.add_argument("--handle")
         command.add_argument("--email")
     args = parser.parse_args(argv)
@@ -202,6 +231,12 @@ def main(argv=None):
     elif args.command == "check":
         return check(args)
     elif args.command == "run":
+        run(args)
+    elif args.command == "new":
+        key = args.name or Path(args.start).name
+        with open(args.manifest) as handle:
+            volumes = json.load(handle)[key if key.endswith(".json") else key + ".json"]
+        new_pair(args.pair, args.start, volumes, key.removesuffix(".json"), reviewer(args))
         run(args)
     elif args.command == "job":
         # A job that finished starts what its result made ready, so a pair moves on by
