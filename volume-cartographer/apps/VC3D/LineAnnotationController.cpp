@@ -332,6 +332,24 @@ struct LineAnnotationController::FiberMetricsTaskResult {
 };
 
 namespace {
+// Every fiber (retired included, to resolve link lifecycles) at its current
+// numbered version: the selection a fiber network export is pinned at.
+std::vector<vc::objects::ObjectVersion> currentFiberVersions(const vc::objects::StoreReader& reader)
+{
+    vc::objects::ObjectSelection objects;
+    objects.kind = "fiber";
+    objects.includeRetired = true;
+    std::vector<vc::objects::ObjectVersion> versions;
+    const auto store = reader.status().storeUuid;
+    for (const auto& record : reader.selectObjects(objects, std::vector<std::string>{})) {
+        if (!record.version) throw std::runtime_error("Fiber listing without versions");
+        versions.push_back({store, record.versionGeneration, record.uuid, *record.version});
+    }
+    return versions;
+}
+} // namespace
+
+namespace {
 
 // Fiber control-point directions and display normals between frames.
 cv::Vec3d mapDirection(const vc::objects::VolumeAffine& m, const cv::Vec3d& d)
@@ -4323,9 +4341,8 @@ bool LineAnnotationController::exportFibersToPath(const fs::path& exportPath,
         if (!attachment) throw std::runtime_error("Attach an object store before exporting fibers");
         nlohmann::json root{{"type", "vc3d_fiber_collection"}, {"version", 1},
                             {"point_collections", nlohmann::json::array()}};
-        connection->read(*attachment, [&](const auto& db, const auto& txn, const auto&) {
-            vc::objects::ObjectSelection objects; objects.kind = "fiber"; objects.includeRetired = true;
-            for (const auto& [uuid, document] : vc::objects::fiberNetworkJson(db, txn, db.currentRevisions(txn, objects)))
+        connection->readStore(*attachment, [&](const vc::objects::StoreReader& reader, const auto&) {
+            for (const auto& [uuid, document] : vc::objects::fiberNetworkJson(reader, currentFiberVersions(reader)))
                 root["point_collections"].push_back(nlohmann::json::parse(document));
         });
 
@@ -5458,12 +5475,13 @@ LineAnnotationController::storedUmbilicus(const vc::objects::VolumeVoxels& voxel
 
 QString LineAnnotationController::umbilicusFingerprint() const
 {
-    // Changes whenever the answer does: uuid@revision, else why there is none.
+    // Changes whenever the answer does: uuid@generation/version, else why there is none.
     if (!_state || !_state->storeFor("umbilicus") || !_state->annotationVolume()) {
         return {};
     }
     const auto& stored = storedUmbilicus(*_state->annotationVolume());
-    return stored.umbilicus ? QString::fromStdString(stored.umbilicus->uuid + "@" + stored.umbilicus->objectRevision)
+    return stored.umbilicus ? QString::fromStdString(stored.umbilicus->uuid + "@" + stored.umbilicus->version.generation + "/" +
+                                                     std::to_string(stored.umbilicus->version.version))
                             : stored.problem;
 }
 
@@ -12069,9 +12087,8 @@ std::map<std::string, fs::path> LineAnnotationController::fiberTransportPaths(
         roots.push_back(pin->object.objectUuid);
     }
     std::map<std::string, std::string> documents;
-    connection->read(*attachment, [&](const auto& db, const auto& txn, const auto&) {
-        vc::objects::ObjectSelection objects; objects.kind = "fiber"; objects.includeRetired = true;
-        documents = vc::objects::fiberNetworkJson(db, txn, db.currentRevisions(txn, objects), roots);
+    connection->readStore(*attachment, [&](const vc::objects::StoreReader& reader, const auto&) {
+        documents = vc::objects::fiberNetworkJson(reader, currentFiberVersions(reader), roots);
     });
     return vc3d::materializeJsonDocuments(_fiberTransportDirectory, *attachment, documents);
 }

@@ -22,9 +22,8 @@ if (const char* source = std::getenv("VC3D_FIBER_CACHE_TEST_STORE")) {
         const auto paths = controller.fiberTransportPaths({original.id});
         std::map<std::string, std::string> documents;
         const auto attachment = *state.storeFor("fiber");
-        state.objectStoreSession()->read(attachment, [&](const auto& db, const auto& txn, const auto&) {
-            ObjectSelection selection; selection.kind = "fiber"; selection.includeRetired = true;
-            documents = fiberNetworkJson(db, txn, db.currentRevisions(txn, selection), {original.uuid});
+        state.objectStoreSession()->readStore(attachment, [&](const StoreReader& reader, const auto&) {
+            documents = fiberNetworkJson(reader, currentFiberVersions(reader), {original.uuid});
         });
         require(paths.size() == documents.size() && paths.size() > 1, "transport includes the real linked component");
         for (const auto& [uuid, path] : paths) {
@@ -73,7 +72,7 @@ if (const char* source = std::getenv("VC3D_FIBER_CACHE_TEST_STORE")) {
     const auto connection = state.objectStoreSession();
     const auto journal = [&] {
         int64_t position = 0;
-        connection->read(attachment, [&](const auto& db, const auto& txn, const auto&) { position = db.journalPosition(txn); });
+        connection->readStore(attachment, [&](const StoreReader& reader, const auto&) { position = reader.status().commitSequence; });
         return position;
     };
     const auto read = [&](const std::string& uuid) {
@@ -221,9 +220,7 @@ if (const char* source = std::getenv("VC3D_FIBER_CACHE_TEST_STORE")) {
                                           VolumeAffine{}, "cache regression");
         else {
             std::vector<std::string> route;
-            connection->read(attachment, [&](const auto& db, const auto& txn, const auto&) {
-                route = db.volumeTransforms(txn).resolve("cache-source", "cache-target").resolved().path;
-            });
+            route = connection->volumeTransforms(attachment).resolve("cache-source", "cache-target").resolved().path;
             (void)chooseVolumeTransform(*connection, attachment, "cache-source", "cache-target", route);
         }
         (void)controller.readStoredFibersCached({original.uuid}, true);

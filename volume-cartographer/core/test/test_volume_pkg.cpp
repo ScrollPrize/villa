@@ -262,8 +262,8 @@ TEST_CASE("VolumePkg stores regular and fiber Lasagna entries in one resource ki
     REQUIRE(pkg->addLasagnaDatasetEntry("fiber.lasagna.json", {"model:v1", std::string(vc::project::kFiberLasagnaTag)}));
     pkg->setSelectedLasagnaDataset("regular.lasagna.json");
     pkg->setSelectedFiberInferenceDataset("fiber.lasagna.json");
-    store.session->read(store.attachment, [](const auto& db, const auto& txn, const auto&) {
-        CHECK(vc::objects::projectResources(db, txn, vc::objects::kLasagnaDatasetResource).empty());
+    store.session->readStore(store.attachment, [](const vc::objects::StoreReader& reader, const auto&) {
+        CHECK(vc::objects::projectResources(reader, vc::objects::kLasagnaDatasetResource).empty());
     });
 
     vc::project::LoadOptions options;

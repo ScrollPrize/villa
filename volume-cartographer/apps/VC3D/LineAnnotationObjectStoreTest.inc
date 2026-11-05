@@ -341,8 +341,8 @@ int runObjectStoreControllerTests()
             };
             auto stored = [&](const std::string& uuid) {
                 vc::geometry::Fiber fiber;
-                state.objectStoreSession()->read(*state.storeFor("fiber"), [&](const auto& db, const auto& txn, const auto&) {
-                    fiber = GeometrySnapshot(db, txn).fiber(uuid).load();
+                state.objectStoreSession()->readStore(*state.storeFor("fiber"), [&](const StoreReader& reader, const auto&) {
+                    fiber = GeometrySnapshot(reader).fiber(uuid).load();
                 });
                 return fiber;
             };
@@ -447,8 +447,8 @@ int runObjectStoreControllerTests()
         openStoreAsProject(state, QString::fromStdString(path.string()),"vc3d-controller-test");
         auto transferJson = [&](const Controller::StoredFiber& fiber) {
             nlohmann::json result;
-            state.objectStoreSession()->read(fiber.storePin->attachment, [&](const auto& db, const auto& txn, const auto&) {
-                result = nlohmann::json::parse(fiberRevisionJson(db, txn, db.objectAtVersion(txn, fiber.storePin->reference())->uuid));
+            state.objectStoreSession()->readStore(fiber.storePin->attachment, [&](const StoreReader& reader, const auto&) {
+                result = nlohmann::json::parse(fiberVersionJson(reader, fiber.storePin->reference()));
             });
             return result;
         };
