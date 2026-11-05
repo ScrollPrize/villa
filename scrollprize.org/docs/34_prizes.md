@@ -312,14 +312,14 @@ The prizes above feel too ambitious? There are plenty of other ways to contribut
 <div className="vc-deadline">
 
 {/* progress-prizes:deadline:start */}
-Submissions are evaluated monthly, and multiple submissions/awards per month are permitted. The next deadline is 11:59pm Pacific, October 31st, 2026!
+Submissions are evaluated monthly, and multiple submissions/awards per month are permitted. The next deadline is 11:59pm Pacific, November 30th, 2026!
 {/* progress-prizes:deadline:end */}
 
 </div>
 <div className="vc-submit">
 
 {/* progress-prizes:form:start */}
-[Submission Form](https://docs.google.com/forms/d/e/1FAIpQLSc4flEfgK2nyjoczz2_U_XrIGMlgrnSknWatLqrFPnbtKfZwg/viewform)
+[Submission Form](https://docs.google.com/forms/d/e/1FAIpQLSeB6MC_--4UCCEGc3zalX57-uE4puRcE_vJoYJCrEt4uYaaaw/viewform)
 {/* progress-prizes:form:end */}
 
 </div>
