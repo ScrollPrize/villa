@@ -113,7 +113,11 @@ def manage_checkpoint_history(checkpoint_history, best_checkpoints, epoch,
     checkpoint_path = Path(checkpoint_path)
     checkpoint_dir = Path(checkpoint_dir)
     
-    checkpoint_history.append((epoch, str(checkpoint_path)))
+    # The trainer may already have registered this saved epoch.
+    if (not checkpoint_history
+            or checkpoint_history[-1][0] != epoch
+            or Path(checkpoint_history[-1][1]) != checkpoint_path):
+        checkpoint_history.append((epoch, str(checkpoint_path)))
     
     if epoch in [e for e, _ in checkpoint_history]:
         ckpt_path = next(p for e, p in checkpoint_history if e == epoch)
@@ -185,7 +189,11 @@ def manage_debug_gifs(debug_gif_history, best_debug_gifs, epoch,
     gif_path = Path(gif_path)
     checkpoint_dir = Path(checkpoint_dir)
     
-    debug_gif_history.append((epoch, str(gif_path)))
+    # The trainer may already have registered this saved epoch.
+    if (not debug_gif_history
+            or debug_gif_history[-1][0] != epoch
+            or Path(debug_gif_history[-1][1]) != gif_path):
+        debug_gif_history.append((epoch, str(gif_path)))
     
     if epoch in [e for e, _ in debug_gif_history]:
         gif_path_str = next(p for e, p in debug_gif_history if e == epoch)
