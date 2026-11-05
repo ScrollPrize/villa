@@ -166,9 +166,15 @@ class StoredExportTest(unittest.TestCase):
 			self.assertEqual(corr["points_list"][0]["winding_err"], 0.25)
 			self.assertEqual(atlas["records"][0]["target_xyz"], [1.0, 2.0, 3.0])
 
-			artifacts = Path(str(store) + ".artifacts") / surface_uuid
-			self.assertEqual((artifacts / "model.pt").read_bytes(), ckpt.read_bytes())
-			self.assertTrue((artifacts / "model_params.json").is_file())
+			# The model checkpoint and parameters are published as the surface's artifacts.
+			session = stored_surfaces.StoreSession(store, author="test", shared=True)
+			try:
+				cache = root / "artifact-cache"
+				self.assertEqual(session.artifact_file(surface_uuid, "model.pt", cache).read_bytes(), ckpt.read_bytes())
+				self.assertTrue(session.artifact_file(surface_uuid, "model_params.json", cache).is_file())
+			finally:
+				session.close()
+			self.assertFalse(Path(str(store) + ".artifacts", surface_uuid).exists())
 
 	def test_new_surfaces_take_the_next_free_name_of_their_root(self) -> None:
 		with tempfile.TemporaryDirectory() as td:
@@ -227,24 +233,31 @@ class ServiceStoreRequestTest(unittest.TestCase):
 		self.assertEqual(collection["points"]["7"], {"wind_a": 2.0, "p": [4.0, 5.0, 6.0]})
 
 	def test_surface_and_model_refs_resolve_through_the_store(self) -> None:
-		model = fit_service._store.artifact_directory(self.source) / "model.pt"
-		model.write_bytes(b"checkpoint")
+		with self.assertRaisesRegex(ValueError, "no Lasagna model"):
+			fit_service._body_with_resolved_job_spec({"job_spec": {
+				"model": {"type": "surface", "uuid": self.source}, "config": {}}})
+		checkpoint = Path(self._td.name) / "checkpoint.pt"
+		checkpoint.write_bytes(b"checkpoint")
+		receipt = fit_service._store.publish_artifacts(self.source, {"model.pt": checkpoint})
+		self.assertEqual(len(receipt["objects"]), 1)
 		resolved = fit_service._body_with_resolved_job_spec({"job_spec": {
 			"model": {"type": "surface", "uuid": self.source},
 			"config": {"external_surfaces": [{"type": "surface", "uuid": self.source, "revision": "r1"}]},
 		}})
 		self.assertEqual(resolved["config"]["external_surfaces"][0]["path"], f"vcobj:{self.source}@r1")
-		self.assertEqual(resolved["model_input"], str(model))
-		model.unlink()
-		with self.assertRaisesRegex(ValueError, "no Lasagna model"):
-			fit_service._body_with_resolved_job_spec({"job_spec": {
-				"model": {"type": "surface", "uuid": self.source}, "config": {}}})
+		model = Path(resolved["model_input"])
+		self.assertEqual(model.read_bytes(), b"checkpoint")
+		self.assertNotEqual(model, checkpoint)  # a cached copy of the published bytes
 
 	def test_a_shared_store_is_written_but_synced_by_its_owner(self) -> None:
 		shared = stored_surfaces.StoreSession(self.store_path, author="service", shared=True)
 		try:
 			self.assertEqual(shared.store_uuid, fit_service._store.store_uuid)
-			self.assertEqual(shared.artifact_directory(self.source), fit_service._store.artifact_directory(self.source))
+			checkpoint = Path(self._td.name) / "shared.pt"
+			checkpoint.write_bytes(b"shared")
+			shared.publish_artifacts(self.source, {"model.pt": checkpoint})  # read-only session, written anyway
+			cached = fit_service._store.artifact_file(self.source, "model.pt", Path(self._td.name) / "cache")
+			self.assertEqual(cached.read_bytes(), b"shared")
 			shared.sync()  # the owning session syncs; nothing to wait for here
 			created = create_surface(
 				shared.path, np.zeros((2, 2, 3), np.float32), name="written", scale=1.0, volume=VOLUME, tool="test")

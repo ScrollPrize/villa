@@ -59,8 +59,9 @@ def next_free_name(store: str | Path, root: str, mode: str) -> str:
 
 class StoreSession:
 	"""A store attached for this process: a hosted replica syncs with its hub in the background (pushing writes
-	made through any connection to the file); artifact directories hold files belonging to an object (a fit's
-	model checkpoint) next to the hub. Reads and writes go through ``open_store`` connections to ``path``.
+	made through any connection to the file). Files belonging to an object (a fit's model checkpoint) are its
+	artifacts: published into the store with the object's version and read back as cached local copies. Reads and
+	writes go through ``open_store`` connections to ``path``.
 
 	``shared``: the file is another process's store (VC3D's, for a service on its host) and that process's
 	session syncs it; this one only reads and writes it, and ``sync`` has nothing to do."""
@@ -76,8 +77,26 @@ class StoreSession:
 	def store_uuid(self) -> str:
 		return self._attachment.store_uuid
 
-	def artifact_directory(self, object_uuid: str, *, create: bool = True) -> Path:
-		return Path(self._session.artifact_directory(self._attachment, object_uuid, create=create))
+	def artifact_file(self, object_uuid: str, name: str, cache_directory: str | Path) -> Path | None:
+		"""The object's current artifact ``name`` as a local file under ``cache_directory`` (kept by content);
+		None when it has none."""
+		path = self._session.artifact_file(self._attachment, object_uuid, name, str(cache_directory))
+		return None if path is None else Path(path)
+
+	def publish_artifacts(self, object_uuid: str, files: dict[str, str | Path]) -> dict:
+		"""Publish local files ``{name: path}`` as artifacts of the object's current version (one checked
+		request; the bytes are copied into the store first)."""
+		from vc_object_store import ObjectStoreSession
+		session = ObjectStoreSession()
+		attachment = session.attach(self.path, self.author)
+		try:
+			current = session.current_object(attachment, object_uuid)
+			if current is None:
+				raise ValueError(f"no object {object_uuid} to publish artifacts of")
+			return session.publish_artifacts(attachment, object_uuid, current["version"],
+											 {name: str(path) for name, path in files.items()}, self.author)
+		finally:
+			session.detach(attachment)
 
 	def sync(self, *, timeout_s: float = 120.0) -> None:
 		"""Pull the hub's changes and push this replica's; returns once a sync started now has finished. A store

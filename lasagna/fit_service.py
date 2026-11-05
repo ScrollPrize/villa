@@ -677,9 +677,10 @@ def _stored_surface_path(ref: dict[str, Any]) -> str:
 
 
 def _stored_model_path(ref: dict[str, Any]) -> Path:
-    """The model checkpoint a fit left in a stored surface's artifact directory."""
-    path = _require_store().artifact_directory(str(ref.get("uuid") or ""), create=False) / "model.pt"
-    if not path.is_file():
+    """The model checkpoint a fit published with a stored surface (its ``model.pt`` artifact), as a local copy in
+    the service's object cache."""
+    path = _require_store().artifact_file(str(ref.get("uuid") or ""), "model.pt", _object_store_root() / "artifacts")
+    if path is None:
         raise ValueError(f"surface {ref.get('uuid')} has no Lasagna model")
     return path
 

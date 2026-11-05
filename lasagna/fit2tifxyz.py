@@ -6,6 +6,7 @@ import json
 import math
 import shutil
 import sys
+import tempfile
 import uuid
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -55,10 +56,24 @@ class _StoreTarget:
 
 @dataclass(frozen=True)
 class _Written:
-	"""An exported surface: the directory its side files go in (the tifxyz directory, or the stored surface's
-	artifact directory) and its UUID when stored."""
+	"""An exported surface: the directory its side files go in (the tifxyz directory, or, for a stored surface,
+	a temporary directory published as its artifacts by _publish_side_files) and its UUID when stored."""
 	files_dir: Path
 	surface_uuid: str | None = None
+
+
+def _publish_side_files(written: _Written, store: _StoreTarget | None) -> None:
+	"""A stored surface's side files (model checkpoint, model parameters, mask debug output) become its
+	artifacts (relative paths as names); the temporary directory is then removed."""
+	if store is None or written.surface_uuid is None:
+		return
+	try:
+		files = {path.relative_to(written.files_dir).as_posix(): path
+				 for path in sorted(written.files_dir.rglob("*")) if path.is_file()}
+		if files:
+			store.session.publish_artifacts(written.surface_uuid, files)
+	finally:
+		shutil.rmtree(written.files_dir, ignore_errors=True)
 
 
 def _valid_xyz_mask(x: np.ndarray, y: np.ndarray, z: np.ndarray) -> np.ndarray:
@@ -1087,7 +1102,8 @@ def _copy_model(model_source: Path, directory: Path) -> None:
 
 def _store_surface(store: _StoreTarget, name: str, xyz: np.ndarray, meta: dict, channels: dict[str, np.ndarray],
 				   model_source: Path | None) -> _Written:
-	"""Create the exported surface in the store; the model checkpoint goes to its artifact directory."""
+	"""Create the exported surface in the store; the model checkpoint and other side files are written to a
+	temporary directory and published as its artifacts (_publish_side_files)."""
 	meta = copy.deepcopy(meta)
 	scale = float(meta["scale"][0])
 	meta.pop("model_source", None)
@@ -1103,10 +1119,10 @@ def _store_surface(store: _StoreTarget, name: str, xyz: np.ndarray, meta: dict, 
 		meta=meta, channels=channels, tags=store.tags, author=store.session.author, voxel_scale=store.voxel_scale)
 	store.created.append(surface_uuid)
 	print(f"surface_uuid: {surface_uuid}", flush=True)
-	artifacts = store.session.artifact_directory(surface_uuid)
+	side_files = Path(tempfile.mkdtemp(prefix=f"lasagna-{surface_uuid}-"))
 	if model_source is not None:
-		_copy_model(model_source, artifacts)
-	return _Written(artifacts, surface_uuid)
+		_copy_model(model_source, side_files)
+	return _Written(side_files, surface_uuid)
 
 
 def _as_numpy_float32(value: object, *, name: str) -> np.ndarray:
@@ -1218,6 +1234,7 @@ def _export_flatten_checkpoint(
 	if model_params is not None:
 		(written.files_dir / "model_params.json").write_text(json.dumps(model_params, indent=2) + "\n", encoding="utf-8")
 	_write_atlas_control_results(written, atlas_control_export, store)
+	_publish_side_files(written, store)
 	_print_area(area)
 	print(f"[fit2tifxyz] exported {out_dir.name}", flush=True)
 	return 0
@@ -1480,6 +1497,7 @@ def _export(cfg: ExportConfig, *, cancel_fn, state: dict | None,
 			(written.files_dir / "model_params.json").write_text(json.dumps(model_params, indent=2) + "\n", encoding="utf-8")
 		_write_corr_points_results(written, corr_points_results, store)
 		_write_atlas_control_results(written, atlas_control_export, store)
+		_publish_side_files(written, store)
 	else:
 		# One tifxyz per depth layer (winding)
 		total_area = {"area_vx2": 0.0}
@@ -1552,6 +1570,7 @@ def _export(cfg: ExportConfig, *, cancel_fn, state: dict | None,
 				(written.files_dir / "model_params.json").write_text(json.dumps(model_params, indent=2) + "\n", encoding="utf-8")
 			_write_corr_points_results(written, corr_points_results, store)
 			_write_atlas_control_results(written, atlas_control_export, store)
+			_publish_side_files(written, store)
 		_print_area(total_area)
 
 	return 0
