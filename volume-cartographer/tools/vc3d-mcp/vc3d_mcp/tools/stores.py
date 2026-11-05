@@ -69,8 +69,10 @@ async def vc3d_import_objects(
     with fatalError set and the report of what was committed before it.
     vc3d_cancel_job stops an import before its next object; the job then fails
     with cancelled=true and the partial report. Fiber and point-collection
-    sources commit all at once or not at all. Fails with -32004 while another
-    import (or, for fibers, a fiber merge, split or link) runs.
+    sources commit all at once or not at all. If the project changes before
+    the import finishes, the job fails with projectReplaced=true and
+    store=null. Fails with -32004 while another import (or, for fibers, a
+    fiber merge, split or link) runs.
     """
     result = await _call(
         "objects.import",
@@ -117,7 +119,7 @@ async def vc3d_export_object(
     mask.tif.
 
     Pending edits of the object are saved first (-32004 while an edit
-    operation prevents it). The export is the stored frame: the files carry
+    operation prevents it, -32005 when saving fails). The export is the stored frame: the files carry
     the object's uuid and coordinates {volume_uuid, scale_factor} (stored units
     per voxel of that volume; divide stored XYZ by scale_factor for that
     volume's voxels; unknown values stay null). Re-importing the files keeps
@@ -207,7 +209,8 @@ async def vc3d_save_project_as(path: str) -> dict[str, Any]:
     current volume. Resource locations are rebased; stores are shared, not
     copied. Refuses an existing file (-32005). Pending edits are saved first
     (-32004 when they cannot be, or while growth or a line optimization runs).
-    Returns {path, previousPath}.
+    Also -32004 while an import or export job runs. Returns {path,
+    previousPath}.
     """
     return await _call("project.save_as", {"path": path})
 
@@ -278,7 +281,8 @@ async def vc3d_import_umbilicus(
     different value fails -32602). When the frame is only inferred from the
     points, or not stated at all, the call fails -32602 with the inference in
     error data {inferred, frame}: check it and call again with
-    units_per_voxel. A file that does not fit the volume fails -32005. When
+    units_per_voxel. An unreadable file fails -32602; a file that does not
+    fit the volume, or a failed read of the umbilicus store, fails -32005. When
     the volume already has an umbilicus the call fails -32005 unless
     replace=true. Returns {uuid, volume, store, unitsPerVoxel, frame,
     replaced}; vc3d_get_state's "umbilicus" lists the current one.

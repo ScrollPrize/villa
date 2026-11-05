@@ -41,7 +41,11 @@ UmbilicusImportPlan planUmbilicusImport(const CState& state, const std::filesyst
         throw std::runtime_error("Open a project and a volume first.");
     UmbilicusImportPlan plan;
     plan.file = file;
-    plan.umbilicus = vc::objects::readUmbilicusFile(file);
+    try {
+        plan.umbilicus = vc::objects::readUmbilicusFile(file);
+    } catch (const std::exception& error) {
+        throw UmbilicusFileUnreadable(error.what());
+    }
     // The store decides the frame: the file's stamp against the volume the
     // umbilicus is bound to, and against an attached volume the stamp names.
     std::optional<vc::objects::UmbilicusTargetGrid> named;

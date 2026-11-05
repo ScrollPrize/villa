@@ -216,6 +216,10 @@ def stores_and_resources(call, root: Path, volume: Path) -> None:
     assert grid.is_dir()
 
     # The umbilicus of the current volume: stated frames import as is, others are confirmed.
+    garbage = root / "not-umbilicus.json"
+    garbage.write_text("{")
+    error = expect_error(call, "umbilicus.import", {"path": str(garbage)}, -32602)
+    assert error.data["param"] == "path", error.data
     stamped = root / "umbilicus.json"
     stamped.write_text(json.dumps(dict(points=[[z, 8, 8] for z in range(16)], metadata=dict(
         voxelsize_um=1.0, volume_width=16, volume_height=16, volume_slices=16))))

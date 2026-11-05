@@ -184,9 +184,14 @@ void AgentBridgeServer::completeImportJob(const StoreImportOutcome& outcome)
         return;
     const auto& report = outcome.report;
     it->resultJson = importReportJson(report, outcome.storeReference);
-    const bool success = !report.fatalError && !report.cancelled;
+    // Store references belong to the project that started the import.
+    it->resultJson["projectReplaced"] = outcome.projectReplaced;
+    if (outcome.projectReplaced) it->resultJson["store"] = QJsonValue::Null;
+    const bool success = !report.fatalError && !report.cancelled && !outcome.projectReplaced;
     QString message;
-    if (report.fatalError)
+    if (outcome.projectReplaced)
+        message = QStringLiteral("Import stopped: the project changed after %1 object(s)").arg(report.ingested);
+    else if (report.fatalError)
         message = QStringLiteral("Import stopped: %1").arg(QString::fromStdString(*report.fatalError));
     else if (report.cancelled)
         message = QStringLiteral("Import cancelled after %1 object(s)").arg(report.ingested);
@@ -478,6 +483,9 @@ QJsonObject AgentBridgeServer::handleProjectSaveAs(const QJsonValue& params)
 {
     namespace fs = std::filesystem;
     CState& state = requireProject(_window ? _window->_state : nullptr);
+    // Reopening detaches every store, which would stop an import or export.
+    requireSourceIdle(QStringLiteral("import"));
+    requireSourceIdle(QStringLiteral("export"));
     auto path = absolutePathParam(params.toObject(), "path");
     if (!path.has_extension()) path += ".vcproj";
     std::error_code existsError;
@@ -619,8 +627,10 @@ QJsonObject AgentBridgeServer::handleUmbilicusImport(const QJsonValue& params)
     vc3d::UmbilicusImportPlan plan;
     try {
         plan = vc3d::planUmbilicusImport(state, path);
-    } catch (const std::exception& error) {
+    } catch (const vc3d::UmbilicusFileUnreadable& error) {
         throw AgentBridgeError{-32602, "Not a readable umbilicus file", {{"param", "path"}, {"detail", QString::fromUtf8(error.what())}}};
+    } catch (const std::exception& error) {
+        throw AgentBridgeError{-32005, "Could not read the umbilicus store", {{"detail", QString::fromUtf8(error.what())}}};
     }
     const auto& binding = plan.binding;
     if (binding.refusal)

@@ -2,6 +2,7 @@
 
 #include <filesystem>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -28,8 +29,14 @@ struct UmbilicusImportPlan {
     bool replaces{false};
 };
 
-// Throws when no project, volume or umbilicus store is selected, or `file` is
-// not an umbilicus file.
+// Thrown by planUmbilicusImport when `file` is not a readable umbilicus file.
+struct UmbilicusFileUnreadable : std::runtime_error {
+    using std::runtime_error::runtime_error;
+};
+
+// Throws UmbilicusFileUnreadable when `file` is not an umbilicus file, and
+// another exception when no project, volume or umbilicus store is selected or
+// the store cannot be read.
 UmbilicusImportPlan planUmbilicusImport(const CState&, const std::filesystem::path& file);
 // Imports at `storedUnitsPerVoxel` file units per current-volume voxel,
 // replacing the volume's umbilicus in one commit. Returns the new UUID.

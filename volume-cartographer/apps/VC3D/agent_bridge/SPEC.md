@@ -428,7 +428,9 @@ references (`stores`) and each kind's selected store (`routes`).
     sources commit as one batch: one existing identity rejects the batch and
     `existing` lists every clash.
   - Closing the project or detaching the store stops the import between
-    objects; what was committed stays.
+    objects; what was committed stays. When the project changed before the
+    import finished the job fails with `projectReplaced: true` and
+    `store: null` (store references belong to the old project).
 - `objects.export` writes one surface (tifxyz directory), fiber (fiber JSON)
   or point collection (`vc_pointcollections` JSON with that collection) of an
   attached project store, read-only stores included. Without `store` the UUID
@@ -469,7 +471,8 @@ All of these persist in the `.vcproj` and survive reopening it.
 
 - `project.save_as` saves to a new `.vcproj` (refusing an existing file,
   -32005) and reopens it, keeping the current volume. Resource locations are
-  rebased; stores are shared, not copied.
+  rebased; stores are shared, not copied. Refused (-32004) while an import or
+  export job runs, since reopening detaches the stores.
 - `project.attach_normal_grid` validates and adds a normal-grid entry;
   attaching the same location again succeeds with `alreadyAttached`.
 - `project.attach_lasagna_manifest` loads and validates a local or remote
@@ -485,8 +488,9 @@ All of these persist in the `.vcproj` and survive reopening it.
 - `umbilicus.import` reads an umbilicus file and binds it to the current
   volume: a stated frame is used as is; an inferred or missing one needs
   `unitsPerVoxel` (-32602 with `data.inferred` and `data.frame` otherwise).
-  A file that does not fit, or an existing umbilicus without `replace`, fails
-  -32005. It needs a selected volume (-32001) and a writable umbilicus store
+  An unreadable file fails -32602 (`param: path`); a file that does not fit,
+  an existing umbilicus without `replace`, or a failed read of the umbilicus
+  store fails -32005. It needs a selected volume (-32001) and a writable umbilicus store
   (-32009).
 - `umbilicus.remove` retires the annotation volume's umbilicus objects in the
   umbilicus store in one transaction, so other projects sharing the store see
