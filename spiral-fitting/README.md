@@ -53,6 +53,9 @@ Both are off by default and do not change the math.
 `FIT_SPIRAL_GRAPH_RK4=1` replays the eager RK4 slab integration as CUDA/HIP
 graphs when the fields are on a GPU and the Triton kernel is not used
 (`graph_rk4.py`); it helps on devices where kernel launch overhead dominates.
+Frozen fields use eager integration for point gradients, so repeated calls do
+not cache fresh full-resolution fields. Triton and sampler-only calls do not
+allocate the graph path's persistent LR buffer.
 `FIT_SPIRAL_GRAPH_RK4_MAX` caps the graphs kept for the forward and the backward
 pass each (default 256, oldest evicted first).
 

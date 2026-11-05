@@ -478,16 +478,6 @@ class CartesianFlowField(nn.Module):
         # full-resolution accumulator becomes the HR parameter gradient.
         low_field = lr_upsampled.detach()
         high_field = hr_flow.detach()
-        if _graph_rk4_enabled() and low_field.is_cuda:
-            # Graph replays bake in field pointers: keep the upsampled LR field
-            # in one persistent buffer, and drop graphs that point at an old one.
-            buf = getattr(self, '_graph_low_buf', None)
-            if buf is None or buf.shape != low_field.shape:
-                import graph_rk4
-                graph_rk4.clear()
-                buf = self._graph_low_buf = torch.empty_like(low_field)
-            buf.copy_(low_field)
-            low_field = buf
         if self._field_grad_acc is None or self._field_grad_acc.shape != high_field.shape:
             if self._field_grad_acc is not None and _graph_rk4_enabled():
                 import graph_rk4
@@ -564,6 +554,21 @@ class CartesianFlowField(nn.Module):
 
             return integrate
 
+        # Frozen fields have no persistent training state. Keep their point
+        # gradients on the eager path instead of caching a fresh LR field on
+        # every call. Triton and get_sampler never need graph-owned storage.
+        use_graph = _graph_rk4_enabled() and low_field.is_cuda and acc is not None
+        if use_graph:
+            # Graph replays bake in field pointers: keep the upsampled LR field
+            # in one persistent buffer, and drop graphs that point at an old one.
+            buf = getattr(self, '_graph_low_buf', None)
+            if buf is None or buf.shape != low_field.shape:
+                import graph_rk4
+                graph_rk4.clear()
+                buf = self._graph_low_buf = torch.empty_like(low_field)
+            buf.copy_(low_field)
+            low_field = buf
+
         num_stages = self.num_stages
 
         def integrate(y_flat, h, n_steps, reverse=False):
@@ -578,7 +583,7 @@ class CartesianFlowField(nn.Module):
                     y = _rk4_sampler_loop(
                         y, lambda p: sample_field(p, low) + sample_field(p, high),
                         h, n_steps)
-                elif _graph_rk4_enabled() and y.is_cuda:
+                elif use_graph and y.is_cuda:
                     import graph_rk4
                     y = graph_rk4.RK4GraphIntegrate.apply(
                         y, low, high,

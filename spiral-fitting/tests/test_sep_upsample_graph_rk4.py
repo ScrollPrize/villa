@@ -75,3 +75,86 @@ def test_graph_rk4_matches_eager(n_points):
         assert torch.equal(out_g, ref_g)
         rel = (out_acc - ref_acc).abs().max() / ref_acc.abs().max()
         assert rel.item() <= 1e-5
+
+
+@pytest.fixture
+def graph_cache():
+    import graph_rk4
+
+    graph_rk4.clear()
+    yield graph_rk4
+    graph_rk4.clear()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='needs CUDA/HIP')
+@pytest.mark.parametrize('path', ['triton', 'sampler'])
+def test_non_graph_paths_do_not_allocate_graph_buffer(monkeypatch, graph_cache, path):
+    monkeypatch.setenv('FIT_SPIRAL_GRAPH_RK4', '1')
+    monkeypatch.setenv('FIT_SPIRAL_DIRECT_LR', '0')
+    monkeypatch.setenv('FIT_SPIRAL_TRITON', '1')
+    field = flow_fields.CartesianFlowField((12, 14, 16), spatial_scale_factor=2).cuda()
+    if path == 'triton':
+        if not flow_fields.flow_triton.rk4_triton_available(*field.flows):
+            pytest.skip('needs Triton')
+        field.get_integrator()
+    else:
+        field.get_sampler()
+    assert not hasattr(field, '_graph_low_buf')
+    assert not graph_cache._FWD and not graph_cache._BWD
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='needs CUDA/HIP')
+def test_frozen_fields_do_not_cache_graphs(monkeypatch, graph_cache):
+    monkeypatch.setenv('FIT_SPIRAL_GRAPH_RK4', '1')
+    monkeypatch.setenv('FIT_SPIRAL_DIRECT_LR', '0')
+    monkeypatch.setenv('FIT_SPIRAL_TRITON', '0')
+    field = flow_fields.CartesianFlowField((12, 14, 16), spatial_scale_factor=2).cuda()
+    field.requires_grad_(False)
+    for _ in range(3):
+        points = torch.rand(17, 3, device='cuda', requires_grad=True)
+        out = field.get_integrator()(points, 0.25, 3)
+        out.sum().backward()
+        # A zero velocity field is the identity, including its point gradient.
+        assert torch.equal(out, points)
+        assert torch.equal(points.grad, torch.ones_like(points))
+        assert not hasattr(field, '_graph_low_buf')
+        assert not graph_cache._FWD and not graph_cache._BWD
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='needs CUDA/HIP')
+@pytest.mark.parametrize('reverse', [False, True])
+def test_training_graph_reuses_updated_fields(monkeypatch, graph_cache, reverse):
+    monkeypatch.setenv('FIT_SPIRAL_DIRECT_LR', '0')
+    monkeypatch.setenv('FIT_SPIRAL_TRITON', '0')
+    torch.manual_seed(1)
+    field = flow_fields.CartesianFlowField(
+        (12, 14, 16), spatial_scale_factor=2, num_stages=2).cuda()
+    reference = flow_fields.CartesianFlowField(
+        (12, 14, 16), spatial_scale_factor=2, num_stages=2).cuda()
+    points = 0.2 + 0.6 * torch.rand(17, 3, device='cuda')
+    weights = torch.randn_like(points)
+    h = -0.25 if reverse else 0.25
+    buffer_ptr = None
+    for _ in range(3):
+        with torch.no_grad():
+            for param, ref in zip(field.flows, reference.flows):
+                param.add_(0.01 * torch.randn_like(param))
+                ref.copy_(param)
+        results = []
+        for model, enabled in [(reference, '0'), (field, '1')]:
+            monkeypatch.setenv('FIT_SPIRAL_GRAPH_RK4', enabled)
+            model.zero_grad(set_to_none=True)
+            y = points.clone().requires_grad_(True)
+            out = model.get_integrator()(y, h, 3, reverse=reverse)
+            out.backward(weights)
+            model.apply_accumulated_field_grad()
+            results.append((out.detach(), y.grad))
+        assert torch.equal(results[0][0], results[1][0])
+        assert torch.equal(results[0][1], results[1][1])
+        for param, ref in zip(field.flows, reference.flows):
+            torch.testing.assert_close(param.grad, ref.grad, rtol=1e-5, atol=1e-6)
+        current_ptr = field._graph_low_buf.data_ptr()
+        if buffer_ptr is not None:
+            assert current_ptr == buffer_ptr
+        buffer_ptr = current_ptr
+        assert len(graph_cache._FWD) == len(graph_cache._BWD) == 2
