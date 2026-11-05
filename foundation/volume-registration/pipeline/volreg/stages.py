@@ -317,7 +317,7 @@ def run_blind(pipeline, params):
     A round for this fit as long as asked is kept. One shorter than asked -- drawn from too
     few answers, or before the count was raised -- grows: if someone has picked in it, the
     next patches by spread are added after its items, which keep their places and picks;
-    if nobody has, it is drawn again under a new id. A new fit gets a new round."""
+    if nobody has, it is drawn again under its id. A new fit gets a new round."""
     fit = json.loads(pipeline.work("fit", "fit.json").read_text())
     candidates = [fit["fit"], fit["fit"] + fs.AFFINE]
     final = pipeline.record.read(rec.FINAL_REVIEW) if pipeline.record.exists(rec.FINAL_REVIEW) else {}
@@ -332,8 +332,9 @@ def run_blind(pipeline, params):
         rounds = [round_ for round_ in rounds if round_ not in this_fit]
         taken = {round_["id"] for round_ in final.get("rounds") or []} | {
             event["round"] for event in events if event["kind"] == "blind-round"}
-        round_id = next(f"c{number:03d}" for number in range(len(taken) + 1, 1000)
-                        if f"c{number:03d}" not in taken)
+        # Nobody has picked in it, so no answer is tied to its id: it keeps the id.
+        round_id = this_fit[0]["id"] if this_fit else next(
+            f"c{number:03d}" for number in range(len(taken) + 1, 1000) if f"c{number:03d}" not in taken)
         grown = {"id": round_id, "at": rec.now(), "candidates": candidates, "test_only": True,
                  "items": []}
         rounds.append(grown)
