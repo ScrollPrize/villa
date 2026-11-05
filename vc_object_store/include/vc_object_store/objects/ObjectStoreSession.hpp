@@ -1,6 +1,7 @@
 #pragma once
 
 #include "vc_object_store/objects/ObjectStore.hpp"
+#include "vc_object_store/objects/StoreReader.hpp"
 #include "vc_object_store/objects/Artifacts.hpp"
 #include "vc_object_store/client/HostedStore.hpp"
 #include "vc_object_store/objects/GeometryRegion.hpp"
@@ -179,6 +180,7 @@ class ObjectStoreSession {
 public:
     using Read = std::function<void(const ObjectStore&, const ReadTxn&, const std::atomic_bool&)>;
     using Action = std::function<void(ObjectStore&, WriteTxn&)>;
+    using StoreRead = std::function<void(const StoreReader&, const std::atomic_bool& cancelled)>;
 
     ObjectStoreSession();
     ~ObjectStoreSession();
@@ -260,6 +262,13 @@ public:
     bool writable(const AttachmentIdentity&) const;
     bool current(const AttachmentIdentity&) const;
 
+    // Reads of any attachment, local or hosted (objects/StoreReader.hpp): a
+    // local one answers from one read transaction, a hosted one from its
+    // cache and the host. Geometry views over the reader
+    // (GeometrySnapshot(reader)) work on both. The reader and views must not
+    // escape the callback; `cancelled` is set when the attachment detaches.
+    void readStore(const AttachmentIdentity&, const StoreRead&);
+    // Local attachments only (throws for hosted ones).
     void read(const AttachmentIdentity&, const Read&);
     // All writes are immediate checked atomic actions. The library enforces
     // expectations for every affected object and relationship endpoint.

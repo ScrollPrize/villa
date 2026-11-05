@@ -445,6 +445,20 @@ void ObjectStoreSession::read(const AttachmentIdentity& identity, const Read& ca
     release(*attachment, false);
 }
 
+void ObjectStoreSession::readStore(const AttachmentIdentity& identity, const StoreRead& callback)
+{
+    withAttachment(identity, false, [&](Attachment& attachment) {
+        if (attachment.remote) {
+            const detail::HostedStoreReader reader(*attachment.remote);
+            callback(reader, attachment.cancelled);
+            return;
+        }
+        auto txn = attachment.store().read();
+        const LocalStoreReader reader(attachment.store(), txn);
+        callback(reader, attachment.cancelled);
+    });
+}
+
 RevisionSelection ObjectStoreSession::act(const AttachmentIdentity& identity,
     const RevisionSelection& expected, const Action& callback)
 {

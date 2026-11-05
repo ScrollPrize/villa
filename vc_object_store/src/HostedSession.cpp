@@ -1,4 +1,8 @@
 #include "HostedSession.hpp"
+#include "geometry/ArrayLayout.hpp"
+
+#include <algorithm>
+#include <cstring>
 
 #include <chrono>
 
@@ -302,6 +306,68 @@ std::set<std::string> HostedAttachment::holds(const std::set<std::string>& uuids
 std::vector<ObjectRecord> HostedAttachment::selectObjects(const ObjectSelection& selection)
 {
     return selection.limit ? client_.selectObjects(selection) : client_.selectAllObjects(selection);
+}
+
+std::vector<EdgeRecord> HostedAttachment::selectEdges(const EdgeSelection& selection)
+{
+    return selection.limit ? client_.selectEdges(selection) : client_.selectAllEdges(selection);
+}
+
+std::optional<ObjectRevision> HostedStoreReader::currentObject(const std::string& objectUuid) const
+{
+    auto revision = attachment_->currentObject(objectUuid);
+    if (revision && revision->deleted) return std::nullopt;
+    return revision;
+}
+
+std::vector<ObjectRevision> HostedStoreReader::objectHistory(const std::string& objectUuid) const
+{
+    return attachment_->client().objectHistory(objectUuid);
+}
+
+std::optional<GeometryRevision> HostedStoreReader::currentGeometry(const std::string& objectUuid) const
+{
+    const auto object = currentObject(objectUuid);
+    if (!object || !object->geometryRevision) return std::nullopt;
+    return geometryRevision(*object->geometryRevision);
+}
+
+std::vector<uint8_t> HostedStoreReader::readGeometryArray(const std::string& revisionUuid, const std::string& arrayName,
+                                                          int64_t byteOffset, const std::optional<int64_t>& byteCount) const
+{
+    // Whole arrays are cached by revision; ranges are cut from them.
+    const auto bytes = attachment_->geometryArray(revisionUuid, arrayName);
+    const auto size = int64_t(bytes->size());
+    const auto count = byteCount.value_or(size - byteOffset);
+    if (byteOffset < 0 || count < 0 || byteOffset > size || count > size - byteOffset)
+        throw std::out_of_range("geometry: byte range outside array " + arrayName);
+    return {bytes->begin() + byteOffset, bytes->begin() + byteOffset + count};
+}
+
+std::vector<uint8_t> HostedStoreReader::readGeometryRectangle(const std::string& revisionUuid, const std::string& arrayName,
+                                                              int64_t row, int64_t column, int64_t rows,
+                                                              int64_t columns) const
+{
+    const auto descriptor = geometryRevision(revisionUuid);
+    if (!descriptor) throw std::invalid_argument("geometry revision not found: " + revisionUuid);
+    const auto found = std::find_if(descriptor->arrays.begin(), descriptor->arrays.end(),
+                                    [&](const auto& a) { return a.name == arrayName; });
+    if (found == descriptor->arrays.end()) throw std::invalid_argument("geometry: array not found: " + arrayName);
+    const auto& shape = found->shape;
+    if (descriptor->kind != "surface" || (shape.size() != 2 && shape.size() != 3))
+        throw std::invalid_argument("geometry: rectangle requires an aligned surface array");
+    if (row < 0 || column < 0 || rows < 0 || columns < 0 || row > shape[0] || column > shape[1] ||
+        rows > shape[0] - row || columns > shape[1] - column)
+        throw std::out_of_range("geometry: invalid rectangle");
+    const auto pixel = surfacePixelBytes(found->dtype, shape);
+    const auto bytes = attachment_->geometryArray(revisionUuid, arrayName);
+    if (int64_t(bytes->size()) != shape[0] * shape[1] * pixel)
+        throw std::runtime_error("geometry: array bytes do not match its shape: " + arrayName);
+    std::vector<uint8_t> result(static_cast<std::size_t>(rows * columns * pixel));
+    for (int64_t r = 0; r < rows; ++r)
+        std::memcpy(result.data() + r * columns * pixel, bytes->data() + ((row + r) * shape[1] + column) * pixel,
+                    static_cast<std::size_t>(columns * pixel));
+    return result;
 }
 
 } // namespace vc::objects::detail

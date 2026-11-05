@@ -171,6 +171,17 @@ attachment order. A hosted store answers them on the host: it resolves volume
 targets through its recorded transforms, a region query is not cancellable, and
 explicit transforms are refused.
 
+`readStore(attachment, [](const StoreReader& reader, const auto& cancelled) {...})`
+gives code one read interface for both backends (`objects/StoreReader.hpp`):
+status, current and historical records, geometry descriptors, array ranges and
+surface rectangles, volume transforms, and complete object and edge listings.
+`GeometrySnapshot(reader)` builds the usual geometry views over it, transformed
+views included. A local reader answers from one read transaction. A hosted one
+answers each call from the attachment's cache or the host: answers about
+numbered versions and geometry revisions are exact, while current heads may come
+from different commits. `LocalStoreReader(store, txn)` wraps a transaction the
+caller already holds. The reader and its views must not outlive the callback.
+
 A background check every `pollInterval` asks for the store's status and, when
 the commit sequence moved, reads the change feed. It delivers the commits through
 `takeEvents()` as `Committed` events: `journalPosition` is the commit sequence,

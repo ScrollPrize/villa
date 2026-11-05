@@ -11,6 +11,7 @@
 
 #include "vc_object_store/client/HostedStore.hpp"
 #include "vc_object_store/objects/ObjectStoreSession.hpp"
+#include "vc_object_store/objects/StoreReader.hpp"
 
 #include <vc_reader/native/lru.hpp>
 
@@ -56,6 +57,7 @@ public:
     // The UUIDs among `uuids` that the store holds (retired included).
     std::set<std::string> holds(const std::set<std::string>& uuids);
     std::vector<ObjectRecord> selectObjects(const ObjectSelection&);
+    std::vector<EdgeRecord> selectEdges(const EdgeSelection&);
 
 private:
     void poll();
@@ -90,6 +92,44 @@ private:
     AttachmentIdentity identity_;
     Deliver deliver_;
     std::thread poller_;
+};
+
+// ObjectStoreSession::readStore for a hosted attachment: each answer comes
+// from the attachment's cache or the host.
+class HostedStoreReader final : public StoreReader {
+public:
+    explicit HostedStoreReader(HostedAttachment& attachment) : attachment_(&attachment) {}
+    bool active() const override { return true; }
+    StoreStatus status() const override { return attachment_->status(); }
+    std::optional<ObjectRevision> currentObject(const std::string& objectUuid) const override;
+    std::vector<ObjectRevision> objectHistory(const std::string& objectUuid) const override;
+    std::vector<std::optional<ObjectRevision>> objectsAtVersions(const std::vector<ObjectVersion>& references) const override
+    {
+        return attachment_->objectsAtVersions(references);
+    }
+    std::optional<GeometryRevision> currentGeometry(const std::string& objectUuid) const override;
+    std::optional<GeometryRevision> geometryRevision(const std::string& revisionUuid) const override
+    {
+        return attachment_->geometryRevision(revisionUuid);
+    }
+    std::vector<uint8_t> readGeometryArray(const std::string& revisionUuid, const std::string& arrayName,
+                                           int64_t byteOffset = 0,
+                                           const std::optional<int64_t>& byteCount = std::nullopt) const override;
+    std::vector<uint8_t> readGeometryRectangle(const std::string& revisionUuid, const std::string& arrayName,
+                                               int64_t row, int64_t column, int64_t rows,
+                                               int64_t columns) const override;
+    VolumeTransforms volumeTransforms() const override { return attachment_->volumeTransforms(); }
+    std::vector<ObjectRecord> selectObjects(const ObjectSelection& selection) const override
+    {
+        return attachment_->selectObjects(selection);
+    }
+    std::vector<EdgeRecord> selectEdges(const EdgeSelection& selection) const override
+    {
+        return attachment_->selectEdges(selection);
+    }
+
+private:
+    HostedAttachment* attachment_;
 };
 
 } // namespace vc::objects::detail

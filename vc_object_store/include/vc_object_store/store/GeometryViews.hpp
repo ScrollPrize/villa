@@ -4,6 +4,7 @@
 
 namespace vc::objects {
 class TransformedGeometryView;
+class StoreReader;
 namespace detail { struct GeometryReadState; struct GeometryViewState; }
 
 // Views share a read transaction and pin a geometry revision. Reads are bounded
@@ -155,6 +156,9 @@ public:
     // Views over the caller's transaction (e.g. inside ObjectStoreSession::read),
     // valid while it is.
     GeometrySnapshot(const ObjectStore&, const Txn&);
+    // Views over any attachment's reader (objects/StoreReader.hpp, e.g. inside
+    // ObjectStoreSession::readStore), valid while it is.
+    explicit GeometrySnapshot(const StoreReader&);
     void close();
     TransformedGeometryView viewTransformedAt(const std::string& objectUuid,const std::string& target,
         double targetScale=1, const VolumeTransforms* transforms=nullptr) const;
@@ -176,6 +180,9 @@ public:
     TypedGeometryView geometry(const std::string& objectUuid,
                                const std::optional<std::string>& geometryRevision = std::nullopt) const;
 private:
+    friend class GeometryView;
+    // Another snapshot over the same reads (and lifetime).
+    explicit GeometrySnapshot(std::shared_ptr<detail::GeometryReadState> state) : state_(std::move(state)) {}
     std::shared_ptr<detail::GeometryViewState> view(const std::string&, const std::string& kind,
                                                     const std::optional<std::string>& geometryRevision) const;
     std::shared_ptr<detail::GeometryReadState> state_;

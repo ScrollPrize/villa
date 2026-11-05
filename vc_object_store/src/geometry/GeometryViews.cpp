@@ -1,4 +1,5 @@
 #include "vc_object_store/store/GeometryViews.hpp"
+#include "vc_object_store/objects/StoreReader.hpp"
 #include "vc_object_store/geometry/ArrayBytes.hpp"
 #include "geometry/ArrayLayout.hpp"
 #include <map>
@@ -10,15 +11,19 @@ namespace vc::objects {
 namespace detail {
 struct GeometryReadState {
     std::shared_ptr<ObjectStore> lease;
-    const ObjectStore* db;
-    // The snapshot's own transaction, or none when it borrows the caller's.
+    // The snapshot's own transaction and reader, or none when it borrows the
+    // caller's transaction or reader.
     std::unique_ptr<ReadTxn> owned;
-    const Txn* txn;
+    std::unique_ptr<LocalStoreReader> local;
+    const StoreReader* reader = nullptr;
     explicit GeometryReadState(ObjectStore& store)
-        : db(&store), owned(std::make_unique<ReadTxn>(store.read())), txn(owned.get()) {}
-    GeometryReadState(const ObjectStore& store, const Txn& borrowed) : db(&store), txn(&borrowed) {}
+        : owned(std::make_unique<ReadTxn>(store.read())),
+          local(std::make_unique<LocalStoreReader>(store, *owned)), reader(local.get()) {}
+    GeometryReadState(const ObjectStore& store, const Txn& borrowed)
+        : local(std::make_unique<LocalStoreReader>(store, borrowed)), reader(local.get()) {}
+    explicit GeometryReadState(const StoreReader& borrowed) : reader(&borrowed) {}
     void require() const {
-        if (!txn || !txn->active()) throw std::runtime_error("geometry snapshot is closed");
+        if (!reader || !reader->active()) throw std::runtime_error("geometry snapshot is closed");
     }
 };
 struct GeometryViewState {
@@ -42,7 +47,7 @@ struct GeometryViewState {
         if (start < 0 || count < 0 || start > size || count > size - start)
             throw std::out_of_range("geometry point range out of bounds");
         const int64_t stride = (a.dtype == "<f8" || a.dtype == "<i8" ? 8 : 4) * (a.shape.size() > 1 ? 3 : 1);
-        return read->db->readGeometryArray(*read->txn, revision.uuid, name, start * stride, count * stride);
+        return read->reader->readGeometryArray(revision.uuid, name, start * stride, count * stride);
     }
     std::optional<int64_t> indexOf(int64_t id) {
         read->require();
@@ -83,14 +88,16 @@ GeometrySnapshot::GeometrySnapshot(std::shared_ptr<ObjectStore> db)
 }
 GeometrySnapshot::GeometrySnapshot(const ObjectStore& db, const Txn& txn)
     : state_(std::make_shared<detail::GeometryReadState>(db, txn)) {}
+GeometrySnapshot::GeometrySnapshot(const StoreReader& reader)
+    : state_(std::make_shared<detail::GeometryReadState>(reader)) {}
 TransformedGeometryView GeometrySnapshot::viewTransformedAt(const std::string& uuid,const std::string& target,
     double targetScale,const VolumeTransforms* context) const
 {
     state_->require();
-    const auto record=state_->db->objectByUuid(*state_->txn,uuid);
-    if(!record)throw std::invalid_argument("object not found");
-    const auto local=context?VolumeTransforms{}:state_->db->volumeTransforms(*state_->txn);
-    const auto mapping=(context?*context:local).toVolume(nlohmann::json::parse(record->meta),target,targetScale);
+    const auto object=state_->reader->currentObject(uuid);
+    if(!object)throw std::invalid_argument("object not found");
+    const auto local=context?VolumeTransforms{}:state_->reader->volumeTransforms();
+    const auto mapping=(context?*context:local).toVolume(nlohmann::json::parse(object->record.meta),target,targetScale);
     if(!mapping)throw std::runtime_error("object has no unambiguous transform to volume "+target);
     return TransformedGeometryView(geometry(uuid),*mapping,target,targetScale);
 }
@@ -103,37 +110,42 @@ TransformedGeometryView GeometrySnapshot::viewStored(const std::string& uuid,
 
 TransformedGeometryView GeometryView::viewTransformedAt(const std::string& target,double scale) const {
     state_->read->require();
-    const auto& db=*state_->read->db;
-    const auto& txn=*state_->read->txn;
+    const auto& reader=*state_->read->reader;
     const auto& id=state_->revision.objectUuid;
-    const GeometrySnapshot snapshot(db,txn);
-    const auto current=db.currentGeometry(txn,id);
+    const GeometrySnapshot snapshot(state_->read);
+    const auto current=reader.currentGeometry(id);
     if(current&&current->uuid==state_->revision.uuid)return snapshot.viewTransformedAt(id,target,scale);
     // Older geometry is in the frame of the latest object revision that held it.
     std::optional<ObjectRecord> record;
-    for(const auto& revision:db.objectHistory(txn,id))
+    for(const auto& revision:reader.objectHistory(id))
         if(revision.geometryRevision==state_->revision.uuid&&revision.metadataComplete)record=revision.record;
     if(!record)throw std::invalid_argument("geometry revision has no recorded coordinate metadata");
-    const auto mapping=db.volumeTransforms(txn).toVolume(nlohmann::json::parse(record->meta),target,scale);
+    const auto mapping=reader.volumeTransforms().toVolume(nlohmann::json::parse(record->meta),target,scale);
     if(!mapping)throw std::runtime_error("object has no unambiguous transform to volume "+target);
     return TransformedGeometryView(snapshot.geometry(id,state_->revision.uuid),*mapping,target,scale);
 }
 
 std::vector<vcr::catalog::TransformResolution> GeometryView::availableTransforms() const {
     state_->read->require();
-    return state_->read->db->availableTransforms(*state_->read->txn,state_->revision.objectUuid);
+    return state_->read->reader->availableTransforms(state_->revision.objectUuid);
 }
 
-void GeometrySnapshot::close() { state_->txn = nullptr; state_->owned.reset(); state_->lease.reset(); }
-bool GeometrySnapshot::active() const { return state_->txn && state_->txn->active(); }
+void GeometrySnapshot::close()
+{
+    state_->reader = nullptr;
+    state_->local.reset();
+    state_->owned.reset();
+    state_->lease.reset();
+}
+bool GeometrySnapshot::active() const { return state_->reader && state_->reader->active(); }
 std::shared_ptr<State> GeometrySnapshot::view(const std::string& id, const std::string& kind,
                                               const std::optional<std::string>& geometryRevision) const
 {
     state_->require();
-    const auto object = state_->db->currentObjectRevision(*state_->txn, id);
-    if (!object || object->deleted) throw std::invalid_argument("object not found");
-    const auto revision = geometryRevision ? state_->db->geometryRevision(*state_->txn, *geometryRevision)
-                                           : state_->db->currentGeometry(*state_->txn, id);
+    const auto object = state_->reader->currentObject(id);
+    if (!object) throw std::invalid_argument("object not found");
+    const auto revision = geometryRevision ? state_->reader->geometryRevision(*geometryRevision)
+                                           : state_->reader->currentGeometry(id);
     if (!revision) throw std::invalid_argument("object has no stored geometry");
     if (revision->objectUuid != object->objectUuid)
         throw std::invalid_argument("geometry revision belongs to another object");
@@ -185,7 +197,7 @@ geometry::Geometry GeometryView::loadGeometry() const
     data.attributes = state_->revision.attributes;
     for (const auto& a : state_->revision.arrays)
         data.arrays.push_back({a.name, a.dtype, a.shape,
-            state_->read->db->readGeometryArray(*state_->read->txn, state_->revision.uuid, a.name)});
+            state_->read->reader->readGeometryArray(state_->revision.uuid, a.name)});
     return geometry::decode(data);
 }
 int64_t PointCollectionView::size() const { return state_->array("points").shape[0]; }
@@ -232,7 +244,7 @@ bool SurfaceView::valid(int64_t row, int64_t column) const { return readTile(row
 geometry::Surface SurfaceView::readTile(int64_t row, int64_t column, int64_t rows, int64_t columns) const
 {
     state_->read->require();
-    const auto bytes = state_->read->db->readGeometryRectangle(*state_->read->txn,
+    const auto bytes = state_->read->reader->readGeometryRectangle(
         state_->revision.uuid, "points", row, column, rows, columns);
     geometry::Surface result{rows, columns, scale(), detail::xyzValues<float>(bytes)};
     // Vertices without coordinates read as the sentinel; exact stored bits stay
@@ -241,7 +253,7 @@ geometry::Surface SurfaceView::readTile(int64_t row, int64_t column, int64_t row
         if (!geometry::validSurfacePoint(p)) p = {-1, -1, -1};
     const auto& arrays = state_->revision.arrays;
     if (std::any_of(arrays.begin(), arrays.end(), [](const auto& a) { return a.name == detail::surfaceValidChannel; }))
-        result.validity = state_->read->db->readGeometryRectangle(*state_->read->txn,
+        result.validity = state_->read->reader->readGeometryRectangle(
             state_->revision.uuid, detail::surfaceValidChannel, row, column, rows, columns);
     result.validate();
     return result;

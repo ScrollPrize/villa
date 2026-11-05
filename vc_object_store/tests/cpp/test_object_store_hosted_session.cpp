@@ -1,6 +1,7 @@
 // Hosted attachments in an ObjectStoreSession: the typed operations answer
 // as the store does; read()/act() refuse a hosted attachment; commits arrive
-// as events after a check, with their kinds; cached heads are current as of
+// as events after a check, with their kinds; readStore readers and the
+// geometry views over them answer as a local reader does; cached heads are current as of
 // the last check; queries combine hosted results, local attachments and
 // drafts like local ones; a lost feed position is a revalidation; an
 // unreachable host keeps cached data and reports the failure.
@@ -10,6 +11,7 @@
 #include "vc_object_store/objects/GeometryCoordinates.hpp"
 #include "vc_object_store/objects/ObjectStoreSession.hpp"
 #include "vc_object_store/server/Server.hpp"
+#include "vc_object_store/store/GeometryViews.hpp"
 
 #include <fstream>
 #include <iostream>
@@ -134,6 +136,52 @@ try {
         const auto at = session.objectsAtVersions(hosted, {{status.storeUuid, status.generation, surface, 1},
                                                            {status.storeUuid, status.generation, surface, 2}});
         require(at.size() == 2 && at[0] && at[0]->uuid == head->uuid && !at[1], "objects at versions");
+    }
+
+    // readStore: the same reads and geometry views from both backends.
+    {
+        OpenOptions readOnly; readOnly.readOnly = true;
+        auto direct = ObjectStore::open(hostedPath, readOnly);
+        auto txn = direct.read();
+        const LocalStoreReader expected(direct, txn);
+        const GeometrySnapshot expectedViews(expected);
+        bool ran = false;
+        session.readStore(hosted, [&](const StoreReader& reader, const auto&) {
+            const auto head = reader.currentObject(surface);
+            require(head && head->uuid == expected.currentObject(surface)->uuid && !reader.currentObject(util::newUuid()),
+                    "reader current object");
+            require(reader.objectHistory(surface).size() == expected.objectHistory(surface).size(), "reader history");
+            require(reader.currentGeometry(surface)->uuid == *head->geometryRevision, "reader current geometry");
+            const auto& revision = *head->geometryRevision;
+            require(reader.readGeometryRectangle(revision, "points", 2, 3, 5, 4) ==
+                    expected.readGeometryRectangle(revision, "points", 2, 3, 5, 4), "reader rectangle");
+            require(reader.readGeometryArray(revision, "points", 12, 24) == expected.readGeometryArray(revision, "points", 12, 24),
+                    "reader byte range");
+            mustFail([&] { (void)reader.readGeometryRectangle(revision, "points", 25, 0, 6, 1); });
+            mustFail([&] { (void)reader.readGeometryArray(revision, "points", 0, 1 << 20); });
+            ObjectSelection all; all.kind = "surface";
+            require(reader.selectObjects(all).size() == 1 && reader.selectEdges({}).empty(), "reader listings");
+            const GeometrySnapshot views(reader);
+            const auto tile = views.surface(surface).readTile(3, 2, 10, 7);
+            const auto expectedTile = expectedViews.surface(surface).readTile(3, 2, 10, 7);
+            require(tile.points == expectedTile.points && tile.validity == expectedTile.validity &&
+                    tile.scale == expectedTile.scale, "surface view tile");
+            const auto shown = views.viewTransformedAt(surface, volume, 2).readTile(0, 0, 30, 20);
+            const auto expectedShown = expectedViews.viewTransformedAt(surface, volume, 2).readTile(0, 0, 30, 20);
+            require(shown.points == expectedShown.points && shown.validity == expectedShown.validity &&
+                    shown.scale == expectedShown.scale && shown.points[21][0] == 2, "transformed view");
+            require(views.surface(surface, revision).viewTransformedAt(volume, 2).readTile(0, 0, 1, 1).points ==
+                    expectedViews.surface(surface, revision).viewTransformedAt(volume, 2).readTile(0, 0, 1, 1).points,
+                    "pinned revision view");
+            require(views.surface(surface).availableTransforms().size() ==
+                    expectedViews.surface(surface).availableTransforms().size(), "available transforms");
+            ran = true;
+        });
+        session.readStore(local, [&](const StoreReader& reader, const auto&) {
+            require(reader.active() && reader.currentObject(localOnly) && reader.status().storeUuid == local.storeUuid,
+                    "local reader");
+        });
+        require(ran, "hosted readStore ran");
     }
 
     // A checked edit through the session; its own cache sees it at once, and

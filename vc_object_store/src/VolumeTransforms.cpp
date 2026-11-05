@@ -1,3 +1,4 @@
+#include "vc_object_store/objects/StoreReader.hpp"
 #include "vc_object_store/objects/VolumeTransforms.hpp"
 #include "vc_object_store/objects/GeometryCoordinates.hpp"
 #include "vc_object_store/objects/ObjectStore.hpp"
@@ -138,15 +139,7 @@ VolumeTransforms ObjectStore::volumeTransforms(const Txn& txn) const {
                                 impl_->options.catalogTransforms.get());
 }
 std::vector<vcr::catalog::TransformResolution> ObjectStore::availableTransforms(const Txn& txn,const std::string& uuid) const {
-    const auto object=objectByUuid(txn,uuid);
-    if(!object)throw std::invalid_argument("object not found");
-    const auto coordinates=geometryCoordinates(nlohmann::json::parse(object->meta).value("coordinates",nlohmann::json::object()));
-    if(coordinates["volume_uuid"].is_null()||coordinates["scale_factor"].is_null())return {};
-    const auto source=coordinates["volume_uuid"].get<std::string>();
-    const auto context=volumeTransforms(txn);
-    auto result=context.graph.available(source);
-    for(auto& resolution:result)resolution=context.resolve(source,resolution.target);
-    return result;
+    return LocalStoreReader(*this,txn).availableTransforms(uuid);
 }
 double ObjectStore::geometryLengthInVolume(const Txn& txn,const std::string& uuid,const std::string& target,double scale) const {
     const auto object=objectByUuid(txn,uuid);
