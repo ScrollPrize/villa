@@ -338,3 +338,26 @@ def test_reference_selection_splits_at_lasagna_spans():
     assert [r["line_indices"] for r in plan["runs"]] == [[1, 2], [3, 4]]
     assert plan["eligible_length_base_voxels"] == 20
     assert [e["reason"] for e in plan["excluded"]] == ["extrapolated", "extrapolated", "lasagna"]
+
+
+def test_stop_score_filters_beam_replay_and_is_beam_only(inputs):
+    field, normals = handles(inputs)
+    case = ft.EvaluationCase(np.array([[16., 16., 16.], [220., 16., 16.]]))
+    stock = evaluation.replay_dict(ft.beam_replay(
+        field, normals, normals, trace_config(), case, ft.ChunkReplayConfig(), 0))
+    trace = trace_config()
+    trace.stop_score_weights = [0.0, 0.0, 1.0]  # lateral rival: negative on the tube axis
+    trace.stop_score_bias = -10.0
+    assert evaluation.replay_dict(ft.beam_replay(
+        field, normals, normals, trace, case, ft.ChunkReplayConfig(), 0)) == stock
+    features = ft.stop_score_features(field, np.array([[16., 16., 16.], [32., 16., 16.]]))
+    assert features[1, 0] > .9 and features[1, 2] < -.5
+    trace.stop_score_bias = 10.0  # always positive
+    stopped = evaluation.replay_dict(ft.beam_replay(
+        field, normals, normals, trace, case, ft.ChunkReplayConfig(), 0))
+    assert "stop_score_filtered" in {s["termination_reason"] for s in stopped["segments"]}
+    assert stopped["failures"] == [] and stopped["filtered_stops"]
+    cfg = config(inputs)
+    cfg["trace"] = trace.to_dict()
+    with pytest.raises(ValueError, match="beam backend only"):
+        evaluation.evaluate(cfg, base_directory=inputs)

@@ -230,6 +230,34 @@ TEST_CASE("Presence filtering retains accepted prefix and shares safe reseeding"
     CHECK(r.filteredStops.size()==1); CHECK(r.completedReferenceArcBase==100);
 }
 
+TEST_CASE("Stop-score ends are filtered stops with their own segment reason") {
+    using namespace vc::fiber_tracer;
+    class Normals final : public vc::lasagna::NormalSampler {
+        vc::lasagna::NormalSample sampleNormal(const cv::Vec3d&) const override { return {{0,1,0},true,{}}; }
+    } normals;
+    const auto ref=makePolylineArcGeometry({{0,0,0},{100,0,0}});
+    int runs=0;
+    ReplaySegmentRunner runner=[&](const PolylineArcSample& seed,double,int,const ReplayPointObserver& observe,const FiberTraceProgressCallback&) {
+        if (runs++) {
+            for(double x=seed.arc+10;x<=100;x+=10) if(!observe({x,0,0},0,int(x))) break;
+            return std::string("stopped");
+        }
+        (void)observe({seed.arc+10,0,0},0,1);
+        return std::string("stop_score");
+    };
+    ReplayConsistencyPolicy policy;
+    const auto run=[&]{runs=0;return traceReferenceReplayCore(ref,0,100,10,3,40,0,2,1,normals,1,runner,{},{},policy);};
+    CHECK_THROWS(run()); // Like the presence cutoff, it needs a restart search.
+    policy.nextSeed=[&](double arc)->std::optional<PolylineArcSample>{return samplePolylineArc(ref,arc);};
+    const auto r=run();
+    REQUIRE(r.filteredStops.size()==1);
+    CHECK(r.filteredStops[0]==std::array<double,3>{10,10,20});
+    REQUIRE(r.segments.size()==2);
+    CHECK(r.segments[0].terminationReason=="stop_score_filtered");
+    CHECK(r.segments[0].tracePointsBase.size()==2);
+    CHECK(r.failures.empty()); CHECK(r.completedReferenceArcBase==100);
+}
+
 TEST_CASE("Unified prediction seeding covers initial error and filtered starts") {
     using namespace vc::fiber_tracer;
     class Normals final : public vc::lasagna::NormalSampler {
