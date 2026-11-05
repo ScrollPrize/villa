@@ -45,6 +45,7 @@
 #include <map>
 #include "vc_reader/array.hpp"
 #include <vc_reader/source_reader.hpp>
+#include <vc_object_store/objects/StoreReader.hpp>
 
 namespace {
 
@@ -565,9 +566,8 @@ void ProjectWorkspace::rebuildStores()
         item->setText(StoreAccess, access);
         std::map<std::string, int64_t> counts;
         try {
-            session->read(store, [&](const vc::objects::ObjectStore& s, const vc::objects::ReadTxn& txn,
-                                     const std::atomic_bool&) {
-                for (const auto& kind : CState::routableKinds()) counts[kind] = s.objectCount(txn, kind);
+            session->readStore(store, [&](const vc::objects::StoreReader& reader, const std::atomic_bool&) {
+                for (const auto& kind : CState::routableKinds()) counts[kind] = reader.objectCount(kind);
             });
         } catch (const std::exception& error) {
             item->setToolTip(StoreSurfaces, QString::fromUtf8(error.what()));

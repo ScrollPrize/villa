@@ -14,6 +14,7 @@
 
 #include "vc/core/util/QuadSurface.hpp"
 #include "vc/ui/VCCollection.hpp"
+#include <vc_object_store/objects/StoreReader.hpp>
 
 bool SegmentationModule::prepareEditingDestination(const std::shared_ptr<QuadSurface>& surface)
 {
@@ -60,9 +61,9 @@ bool SegmentationModule::beginEditingSession(std::shared_ptr<QuadSurface> surfac
     if (const auto& view = storeEdit->view()) {
         draft.coordinates = vc::objects::volumeCoordinates(view->volume, view->scale);
     } else {
-        draft.session->read(draft.attachment, [&](const auto& db, const auto& txn, const auto&) {
-            if (const auto record = db.objectByUuid(txn, storeEdit->uuid()))
-                draft.coordinates = nlohmann::json::parse(record->meta).value("coordinates", nlohmann::json::object());
+        draft.session->readStore(draft.attachment, [&](const vc::objects::StoreReader& reader, const auto&) {
+            if (const auto object = reader.currentObject(storeEdit->uuid()))
+                draft.coordinates = nlohmann::json::parse(object->record.meta).value("coordinates", nlohmann::json::object());
         });
     }
     if (!_editManager->beginSession(surface, std::move(draft))) {

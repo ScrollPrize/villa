@@ -4425,9 +4425,7 @@ std::optional<vcr::catalog::Affine> CWindow::volumeTransformForSwitch(const vc::
     // choices); without a store, the cached catalog's registrations.
     vc::objects::VolumeTransforms transforms;
     if (const auto attachment = _state->storeFor("volume_transform")) {
-        _state->objectStoreSession()->read(*attachment, [&](const auto& db, const auto& txn, const auto&) {
-            transforms = db.volumeTransforms(txn);
-        });
+        transforms = _state->objectStoreSession()->volumeTransforms(*attachment);
     } else if (const auto catalog = vcr::catalog::cachedManifest(vcr::catalog::catalogCacheFile(std::string(vcr::catalog::kDefaultManifestUrl)))) {
         transforms.graph.addCatalog(*catalog);
     }

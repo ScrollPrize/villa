@@ -41,6 +41,7 @@
 #include "vc/fiber_tracer/FiberSideStripIntersections.hpp"
 #include "vc/core/util/Umbilicus.hpp"
 #include <vc_object_store/Uuid.hpp>
+#include <vc_object_store/objects/Transactions.hpp>
 #include <vc_object_store/objects/VolumeUmbilicus.hpp>
 #include "vc/lasagna/LineOptimizer.hpp"
 #include "volume_viewers/CChunkedVolumeViewer.hpp"
@@ -1462,7 +1463,8 @@ private:
     // See readStoredFibersCached: decoded fibers keyed by uuid.
     mutable std::unordered_map<std::string, StoredFiber> _storedFiberDecodeCache;
     mutable FiberDependencies _storedFiberDependencies;
-    mutable std::optional<int64_t> _storedFiberCacheJournalPosition;
+    // The store's feed position when the decode cache was last checked.
+    mutable std::optional<vc::objects::FeedCursor> _storedFiberCachePosition;
     // The voxels _storedFiberDecodeCache was decoded in.
     mutable vc::objects::VolumeVoxels _storedFiberDecodeVolume;
     // See cachedControlSpansForFiber: keyed by fiber id, valid while the

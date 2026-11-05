@@ -61,6 +61,7 @@
 #include <memory>
 #include <utility>
 #include <vector>
+#include <vc_object_store/objects/StoreReader.hpp>
 
 namespace
 {
@@ -1626,8 +1627,9 @@ SegmentationLasagnaPanel::startOptimizationWithOverrides(
     if (activeRow) {
         // The job reads the revision on screen now; earlier links read their current one.
         std::optional<std::string> revision;
-        _surfaceCatalog->session()->read(*_surfaceCatalog->attachment(), [&](const auto& db, const auto& txn, const auto&) {
-            if (const auto head = db.currentGeometry(txn, activeUuid)) revision = head->uuid;
+        _surfaceCatalog->session()->readStore(*_surfaceCatalog->attachment(),
+                                              [&](const vc::objects::StoreReader& reader, const auto&) {
+            if (const auto head = reader.currentGeometry(activeUuid)) revision = head->uuid;
         });
         linkedSurfaces = linkedSurfacesOf(*activeRow, *_surfaceCatalog);
         for (qsizetype i = 0; i < linkedSurfaces.size(); ++i) {

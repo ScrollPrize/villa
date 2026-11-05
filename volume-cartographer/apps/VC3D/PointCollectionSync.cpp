@@ -7,6 +7,7 @@
 #include "vc/ui/VCCollection.hpp"
 
 #include <vc_object_store/objects/AttachedDocument.hpp>
+#include <vc_object_store/objects/StoreReader.hpp>
 
 #include <nlohmann/json.hpp>
 
@@ -118,9 +119,9 @@ bool PointCollectionSync::flush()
 void PointCollectionSync::noteRevisions(const std::vector<std::string>& uuids)
 {
     if (!attachment_ || uuids.empty()) return;
-    state_->objectStoreSession()->read(*attachment_, [&](const auto& db, const auto& txn, const auto&) {
+    state_->objectStoreSession()->readStore(*attachment_, [&](const vc::objects::StoreReader& reader, const auto&) {
         for (const auto& uuid : uuids)
-            if (const auto head = db.currentObjectRevision(txn, uuid)) revisions_[uuid] = head->uuid;
+            if (const auto head = reader.currentObject(uuid)) revisions_[uuid] = {head->generation, head->version};
             else revisions_.erase(uuid);
     });
 }
@@ -198,11 +199,12 @@ void PointCollectionSync::onStoreEvent(const vc::objects::StoreSessionEvent& eve
     for (const auto& change : event.changes)
         if (change.kind == kKind) touched.push_back(change.recordUuid);
     bool external = false;
-    state_->objectStoreSession()->read(*attachment_, [&](const auto& db, const auto& txn, const auto&) {
+    state_->objectStoreSession()->readStore(*attachment_, [&](const vc::objects::StoreReader& reader, const auto&) {
         for (const auto& uuid : touched) {
-            const auto head = db.currentObjectRevision(txn, uuid);
+            const auto head = reader.currentObject(uuid);
             const auto known = revisions_.find(uuid);
-            if ((head ? head->uuid : std::string{}) != (known == revisions_.end() ? std::string{} : known->second))
+            if (head.has_value() != (known != revisions_.end()) ||
+                (head && known->second != std::pair(head->generation, head->version)))
                 external = true;
         }
     });

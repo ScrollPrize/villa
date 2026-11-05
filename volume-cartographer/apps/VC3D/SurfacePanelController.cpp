@@ -614,8 +614,8 @@ void SurfacePanelController::showHistory(const std::string& id)
     const auto attachment = row->source;
     std::vector<vc::objects::ObjectRevision> history;
     try {
-        _catalog->session()->read(attachment, [&](const auto& db, const auto& txn, const auto&) {
-            history = db.objectHistory(txn, id);
+        _catalog->session()->readStore(attachment, [&](const vc::objects::StoreReader& reader, const auto&) {
+            history = reader.objectHistory(id);
         });
     } catch (const std::exception& error) {
         QMessageBox::critical(_ui.treeWidget, tr("Surface History"), QString::fromUtf8(error.what()));
@@ -696,8 +696,8 @@ bool SurfacePanelController::restoreRevision(const std::string& id, const std::s
         }
         const auto attachment = row->source;
         std::optional<std::string> head;
-        _catalog->session()->read(attachment, [&](const auto& db, const auto& txn, const auto&) {
-            if (const auto current = db.currentObjectRevision(txn, id)) head = current->uuid;
+        _catalog->session()->readStore(attachment, [&](const vc::objects::StoreReader& reader, const auto&) {
+            if (const auto current = reader.currentObject(id)) head = current->uuid;
         });
         if (!head) throw std::runtime_error("The surface is no longer in the object store");
         if (*head == revision) return true;
@@ -1518,8 +1518,8 @@ void SurfacePanelController::rebuildRecordTagFilterModel()
     std::set<std::string> tags;
     for (const auto& source : _catalog->sources()) {
         try {
-            _catalog->session()->read(source, [&](const auto& db, const auto& txn, const auto&) {
-                for (auto& tag : db.objectTags(txn, std::string("surface"))) tags.insert(std::move(tag));
+            _catalog->session()->readStore(source, [&](const vc::objects::StoreReader& reader, const auto&) {
+                for (auto& tag : reader.objectTags(std::string("surface"))) tags.insert(std::move(tag));
             });
         } catch (const std::exception&) {
             // A detached source lists no tags.
@@ -1992,4 +1992,5 @@ bool SurfacePanelController::cycleVisibleSegment(int direction)
 
 #ifdef VC_TESTING
 #include "SurfacePanelStoreTest.inc"
+#include <vc_object_store/objects/StoreReader.hpp>
 #endif

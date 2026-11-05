@@ -39,6 +39,7 @@
 #include "vc/core/util/DateTime.hpp"
 #include "vc/core/util/StreamOperators.hpp"
 #include "vc/tracer/Tracer.hpp"
+#include <vc_object_store/objects/StoreReader.hpp>
 
 
 using shape = std::vector<size_t>;
@@ -1142,7 +1143,8 @@ int main(int argc, char *argv[])
         store.emplace(store_path, "vc_grow_seg_from_segments");
         tgt_dir = std::filesystem::temp_directory_path() / ("vc-grow-segments-" + vc::objects::util::newUuid());
         std::vector<std::string> uuids;
-        store->objects().session()->read(store->objects().attachment(), [&](const auto& db, const auto& txn, const auto&) {
+        store->objects().session()->readStore(store->objects().attachment(),
+                                              [&](const vc::objects::StoreReader& reader, const auto&) {
             vc::objects::ObjectSelection selection;
             selection.kind = "surface";
             if (!source_tag.empty()) selection.tag = source_tag;
@@ -1150,7 +1152,7 @@ int main(int argc, char *argv[])
                 selection.volume = volume_voxels->volume;
                 selection.targetScale = volume_voxels->scale;
             }
-            for (const auto& object : db.selectObjects(txn, selection, std::vector<std::string>{})) uuids.push_back(object.uuid);
+            for (const auto& object : reader.selectObjects(selection, std::vector<std::string>{})) uuids.push_back(object.uuid);
         });
         if (!src_surface.empty() && std::find(uuids.begin(), uuids.end(), vc::objects::util::canonicalUuid(src_surface)) == uuids.end())
             uuids.push_back(src_surface);

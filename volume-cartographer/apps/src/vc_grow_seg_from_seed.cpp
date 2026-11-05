@@ -34,6 +34,7 @@
 #include <optional>
 #include <utility>
 #include <vector>
+#include <vc_object_store/objects/StoreReader.hpp>
  
 namespace po = boost::program_options;
 using shape = std::vector<size_t>;
@@ -373,9 +374,8 @@ static int run_main(int argc, char *argv[])
             query.targetScale = volume_voxels->scale;
         }
         std::vector<vc::objects::SurfaceProximityHit> hits;
-        store->objects().session()->read(store->objects().attachment(), [&](const auto& db, const auto& txn, const auto&) {
-            hits = db.nearestSurfaces(txn, query);
-        });
+        for (auto& hit : store->objects().session()->nearestSurfaces({store->objects().attachment()}, query))
+            hits.push_back(std::move(hit.hit));
         return hits;
     };
 
@@ -524,14 +524,15 @@ static int run_main(int argc, char *argv[])
         if (store) {
             // One candidate loaded at a time; overlaps are counted with the store's proximity query.
             std::vector<std::string> candidates;
-            store->objects().session()->read(store->objects().attachment(), [&](const auto& db, const auto& txn, const auto&) {
+            store->objects().session()->readStore(store->objects().attachment(),
+                                                  [&](const vc::objects::StoreReader& reader, const auto&) {
                 vc::objects::ObjectSelection selection;
                 selection.kind = "surface";
                 if (volume_voxels) {
                     selection.volume = volume_voxels->volume;
                     selection.targetScale = volume_voxels->scale;
                 }
-                for (const auto& object : db.selectObjects(txn, selection, std::vector<std::string>{}))
+                for (const auto& object : reader.selectObjects(selection, std::vector<std::string>{}))
                     candidates.push_back(object.uuid);
             });
             if (candidates.empty()) {

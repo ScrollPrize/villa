@@ -50,9 +50,9 @@ private:
     std::map<uint64_t, std::string> uuids_;
     std::set<uint64_t> changed_;
     std::set<std::string> removed_;
-    // The object revision of each collection as this sync last wrote or read
-    // it: a commit leaving another is someone else's.
-    std::map<std::string, std::string> revisions_;
+    // The numbered version (generation, version) of each collection as this
+    // sync last wrote or read it: a commit leaving another is someone else's.
+    std::map<std::string, std::pair<std::string, int64_t>> revisions_;
     // Installing from the store: the collection's change hooks are not edits.
     bool installing_ = false;
 };
