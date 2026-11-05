@@ -47,6 +47,7 @@ add_library(vc_objects ${_vc_store_library_type}
     VolumeTransforms.cpp
     ObjectStoreSession.cpp
     HostedSession.cpp
+    DraftCheckpoints.cpp
     Project.cpp
     FetchQueue.cpp
     Transactions.cpp

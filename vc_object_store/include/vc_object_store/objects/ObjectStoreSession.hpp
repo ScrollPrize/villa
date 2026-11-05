@@ -119,7 +119,34 @@ struct HostedFreshness {
     std::string error;                  // empty when the last check succeeded
 };
 
-namespace detail { struct HubLeaseCounts; class HubWorker; struct SurfaceDraft; class HostedAttachment; }
+// Durable drafts (useDraftDirectory): what the session knows of one draft.
+struct DraftState {
+    uint64_t revision = 0;
+    // The committed version the draft edits (none: a new object or not given).
+    std::optional<ObjectVersion> base;
+    // A durable submission of this revision is pending (its outcome unknown
+    // or not yet returned).
+    std::optional<uint64_t> submittedRevision;
+    std::optional<std::string> pendingRequest;
+    // The last save conflicted: reload, discard, or reapply by setting a new
+    // base. Never resent automatically.
+    std::string conflict;
+    // This revision is in the last completed checkpoint.
+    bool checkpointed = false;
+};
+
+struct PendingSubmission {
+    std::string requestUuid, storeUuid;
+    std::vector<std::string> drafts;
+};
+
+struct DraftRecovery {
+    uint64_t checkpoint = 0;           // its sequence; 0 when the directory had none
+    std::vector<std::string> drafts;   // drafts installed again
+    std::vector<PendingSubmission> pending;
+};
+
+namespace detail { struct HubLeaseCounts; class HubWorker; struct SurfaceDraft; class HostedAttachment; struct DurableDrafts; }
 
 // Keeps objects leased while it lives. Leases are renewed in the background;
 // once no hold remains and the object's changes are pushed, the lease is released.
@@ -152,7 +179,7 @@ public:
     using Read = std::function<void(const ObjectStore&, const ReadTxn&, const std::atomic_bool&)>;
     using Action = std::function<void(ObjectStore&, WriteTxn&)>;
 
-    ObjectStoreSession() = default;
+    ObjectStoreSession();
     ~ObjectStoreSession();
     ObjectStoreSession(const ObjectStoreSession&) = delete;
     ObjectStoreSession& operator=(const ObjectStoreSession&) = delete;
@@ -285,8 +312,12 @@ public:
     // attachment, else of the first attachment queried. Each change is a Draft event.
     // Set (or replace) the draft of `objectUuid`: its whole grid, the coordinates
     // it is declared in (geometryCoordinates) and the attachment it belongs to.
+    // `base`, when given, is the committed version the draft edits (and
+    // clears a recorded conflict: an explicit reapplication); otherwise the
+    // draft keeps the base it had.
     void setDraft(const std::string& objectUuid, const vc::geometry::Surface&, const CoordinateJson& coordinates,
-                  const std::optional<AttachmentIdentity>& attachment = std::nullopt);
+                  const std::optional<AttachmentIdentity>& attachment = std::nullopt,
+                  const std::optional<ObjectVersion>& base = std::nullopt);
     // Replace a rows x columns rectangle (row-major) of a draft's vertices at
     // row, column, and their valid channel unless `validity` is empty.
     void updateDraft(const std::string& objectUuid, int64_t row, int64_t column, int64_t rows, int64_t columns,
@@ -297,6 +328,34 @@ public:
     // Changes with every set or update of the object's draft (0 without one),
     // so a reader can keep what it cut from a draft until the draft changes.
     uint64_t draftRevision(const std::string& objectUuid) const;
+    std::optional<DraftState> draftState(const std::string& objectUuid) const;
+
+    // Durable drafts. Checkpoints of every draft and pending submission go to
+    // `directory` (one session at a time); a checkpoint rewrites only drafts
+    // changed since the last one and replaces the previous one atomically, so
+    // a crash or failed write keeps the previous checkpoint. Call it once,
+    // before making drafts: it installs the drafts of the directory's last
+    // checkpoint (in the attachments of their stores, when attached) and its
+    // pending submissions. Edits since that checkpoint are lost.
+    DraftRecovery useDraftDirectory(const std::filesystem::path& directory);
+    // Write a checkpoint now; returns its sequence. Throws when it cannot
+    // (disk full, ...); the error stays in draftCheckpointError() until a
+    // checkpoint succeeds. Scheduling is the application's.
+    uint64_t checkpointDrafts();
+    std::string draftCheckpointError() const;
+    // A checked save that survives a crash: with a draft directory, the exact
+    // request and its payloads are written, and a checkpoint completed, before
+    // it is sent. Success clears each of `drafts` that did not change after
+    // the call started; a changed one stays, based on its committed version.
+    // A conflict keeps the drafts and records it (draftState().conflict);
+    // nothing is resent automatically. When a hosted store cannot be reached
+    // the outcome is unknown and the submission stays pending.
+    TransactionReceipt submitDurably(const AttachmentIdentity&, const TransactionRequest&,
+                                     const std::vector<std::string>& drafts = {});
+    std::vector<PendingSubmission> pendingSubmissions() const;
+    // A pending submission's outcome: its saved receipt when it committed,
+    // else the identical request sent again (the same rules as submitDurably).
+    TransactionReceipt resolvePending(const AttachmentIdentity&, const std::string& requestUuid);
     // Files that belong to an object but are not geometry (fitted models, mesh
     // exports): <store>.artifacts/<object uuid>/, created unless `create` is
     // false (looking for a file there). A hosted replica uses the directory
@@ -363,5 +422,10 @@ private:
     std::map<std::string, GeometryFetcher> fetchers_;
     Drafts drafts() const;
     void draftChanged(const std::string& objectUuid, const std::optional<AttachmentIdentity>&);
+    std::unique_ptr<detail::DurableDrafts> durable_;
+    TransactionReceipt sendPending(const AttachmentIdentity&, const TransactionRequest&, const std::string& requestUuid);
+    // Applies a pending submission's outcome (receipt, or the reason nothing
+    // committed) to its drafts and forgets it.
+    void conclude(const std::string& requestUuid, const TransactionReceipt*, const std::string& conflict);
 };
 }

@@ -187,6 +187,29 @@ check. The session's own submissions invalidate theirs at once. Cached data
 stays readable while the host is unreachable; anything else fails, and listings
 and spatial queries always need the host.
 
+### Durable drafts
+
+Drafts live in the session's memory. `useDraftDirectory(directory)` makes them
+durable: `checkpointDrafts()` writes every draft (its grid, coordinates,
+attachment store and `base`, the committed version it edits) and every pending
+submission. Only drafts changed since the last checkpoint are rewritten, each to
+a new file, and then `checkpoint.json` is replaced atomically and synced. A crash
+or a failed write (`draftCheckpointError()`) therefore leaves the previous
+checkpoint complete. The application schedules checkpoints; they are separate
+from its saves. Call `useDraftDirectory` once, before making drafts: it installs
+the last checkpoint's drafts and pending submissions, so edits made after that
+checkpoint are lost. A directory serves one session at a time.
+
+`submitDurably(attachment, request, drafts)` is a checked save that survives a
+crash. The exact request and its payloads are written, and a checkpoint
+completed, before it is sent. Success clears each listed draft that did not
+change after the call; one that changed stays as a draft based on the committed
+version. A conflict keeps the drafts and records it (`draftState().conflict`);
+nothing is resent. Reapply by setting the draft again with a new `base`. When a
+hosted store cannot be reached, the outcome is unknown: the submission stays
+pending (`pendingSubmissions()`, also after a restart) until
+`resolvePending()` finds its receipt or sends the identical request again.
+
 ## Numbered history and checked requests
 
 Schema 18 introduced numbered history; schema 19 (current) stores it compactly. Each object and relationship keeps its UUID; each
