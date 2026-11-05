@@ -72,7 +72,7 @@ serialize pinned revisions into temporary transport artifacts while retaining
 their existing wire formats; the Lasagna service reads surfaces from the store
 itself (`{type: "surface", uuid, revision}` references). Fiber transport uses UUID filenames, with
 display names stored separately. The object-store `fiberNetworkJson` exporter
-reads pinned relationship edges and resolves stable control-point IDs into wire
+reads the relationship edges of fibers pinned at numbered versions and resolves stable control-point IDs into wire
 indices, preserving reciprocal ordinary, adjacent, and pending branches. Adding
 fibers to Spiral stages their complete linked components before applying inputs.
 Changes refresh the tracked drafts; retirement removes the corresponding UUID
