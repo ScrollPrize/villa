@@ -49,16 +49,9 @@ template <class T> Json nullable(const std::optional<T>& value) { return value ?
 std::vector<uint8_t> encodeDraft(const SurfaceDraft& draft)
 {
     const auto count = std::size_t(draft.rows * draft.columns);
-    std::vector<vc::geometry::SurfacePoint> points(count);
-    std::vector<uint8_t> validity(count, 1);
-    for (const auto& tile : draft.tiles)
-        for (int64_t r = 0; r < tile.rect.rows; ++r)
-            for (int64_t c = 0; c < tile.rect.columns; ++c) {
-                const auto source = std::size_t(r * tile.rect.columns + c);
-                const auto target = std::size_t((tile.rect.row + r) * draft.columns + tile.rect.column + c);
-                points[target] = tile.data->tile.points[source];
-                validity[target] = tile.data->channel[source];
-            }
+    const auto grid = draftGrid(draft);
+    const auto& points = grid.points;
+    const auto& validity = grid.validity;
     std::vector<uint8_t> bytes(sizeof kDraftMagic + 16 + count * sizeof(vc::geometry::SurfacePoint) + count);
     auto* out = bytes.data();
     std::memcpy(out, kDraftMagic, sizeof kDraftMagic); out += sizeof kDraftMagic;

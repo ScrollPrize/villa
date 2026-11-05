@@ -144,8 +144,36 @@ struct DraftState {
     // The last save conflicted: reload, discard, or reapply by setting a new
     // base. Never resent automatically.
     std::string conflict;
-    // This revision is in the last completed checkpoint.
+    // This revision is in the last completed checkpoint (or needs none: saved).
     bool checkpointed = false;
+    // This revision holds its base's committed geometry (markDraftSaved, or a
+    // durable save that kept the draft): nothing to recover, so checkpoints
+    // leave it out until it changes.
+    bool saved = false;
+};
+
+// A draft's grid, as setDraft and updateDraft left it.
+struct DraftContents {
+    vc::geometry::Surface surface;
+    CoordinateJson coordinates;
+    std::optional<AttachmentIdentity> attachment;
+    uint64_t revision = 0;
+};
+
+// A draft a durable save publishes: the draft revision whose grid the request
+// holds (0: the current one). Edits after that revision are not in the save.
+struct SavedDraft {
+    std::string objectUuid;
+    uint64_t revision = 0;
+};
+
+struct DurableSave {
+    std::vector<SavedDraft> drafts;
+    // An editor still has the drafts open: after success each stays, on the
+    // committed version, and is marked saved when it did not change after its
+    // saved revision (instead of being cleared). Not kept across a restart: a
+    // pending save recovered by useDraftDirectory clears its drafts.
+    bool keepDrafts = false;
 };
 
 struct PendingSubmission {
@@ -366,6 +394,11 @@ public:
     // so a reader can keep what it cut from a draft until the draft changes.
     uint64_t draftRevision(const std::string& objectUuid) const;
     std::optional<DraftState> draftState(const std::string& objectUuid) const;
+    std::optional<DraftContents> draftContents(const std::string& objectUuid) const;
+    // The draft at `revision` holds its base's committed geometry (e.g. a
+    // surface just opened from the store): checkpoints leave it out until it
+    // changes. No-op when the draft has moved past `revision` or is gone.
+    void markDraftSaved(const std::string& objectUuid, uint64_t revision);
 
     // Durable drafts. Checkpoints of every draft and pending submission go to
     // `directory` (one session at a time); a checkpoint rewrites only drafts
@@ -389,6 +422,7 @@ public:
     // the outcome is unknown and the submission stays pending.
     TransactionReceipt submitDurably(const AttachmentIdentity&, const TransactionRequest&,
                                      const std::vector<std::string>& drafts = {});
+    TransactionReceipt submitDurably(const AttachmentIdentity&, const TransactionRequest&, const DurableSave&);
     std::vector<PendingSubmission> pendingSubmissions() const;
     // A pending submission's outcome: its saved receipt when it committed,
     // else the identical request sent again (the same rules as submitDurably).

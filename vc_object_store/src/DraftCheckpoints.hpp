@@ -39,12 +39,17 @@ struct DraftMeta {
     std::optional<uint64_t> submittedRevision;
     std::optional<std::string> pendingRequest;
     std::string conflict;
+    // This draft revision holds the committed geometry of `base`; such a
+    // draft is left out of checkpoints. Not written: a checkpoint never holds one.
+    std::optional<uint64_t> savedRevision;
 };
 
 struct PendingRecord {
     std::string requestUuid, storeUuid;
     // Drafts the submission saves, with the draft revision it captured.
     std::map<std::string, uint64_t> drafts;
+    // DurableSave::keepDrafts; not written (a recovered save clears its drafts).
+    bool keepDrafts = false;
 };
 
 struct RecoveredDraft {

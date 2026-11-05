@@ -661,13 +661,18 @@ void bindSessionOperations(nb::class_<vo::ObjectStoreSession> session)
             return result;
         })
         .def("submit_durably", [=](Session& self, const vo::AttachmentIdentity& attachment, const nb::object& request,
-                                   const nb::dict& payloads, const std::vector<std::string>& drafts) {
+                                   const nb::dict& payloads, const std::vector<std::string>& drafts, bool keepDrafts) {
             const auto parsed = requestFromPy(request, payloads);
+            vo::DurableSave save;
+            for (const auto& uuid : drafts) save.drafts.push_back({uuid, 0});
+            save.keepDrafts = keepDrafts;
             vo::TransactionReceipt receipt;
-            { nb::gil_scoped_release release; receipt = self.submitDurably(attachment, parsed, drafts); }
+            { nb::gil_scoped_release release; receipt = self.submitDurably(attachment, parsed, save); }
             return receiptPy(receipt);
         }, nb::arg("attachment"), nb::arg("request"), nb::arg("payloads") = nb::dict(), nb::arg("drafts") = std::vector<std::string>{},
-           "A checked save that survives a crash (request written before it is sent).")
+           nb::arg("keep_drafts") = false,
+           "A checked save that survives a crash (request written before it is sent). keep_drafts: the saved "
+           "drafts stay (on the committed version, marked saved) for an editor still open on them.")
         .def("resolve_pending", [=](Session& self, const vo::AttachmentIdentity& attachment, const std::string& requestUuid) {
             vo::TransactionReceipt receipt;
             { nb::gil_scoped_release release; receipt = self.resolvePending(attachment, requestUuid); }

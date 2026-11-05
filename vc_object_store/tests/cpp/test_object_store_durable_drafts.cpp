@@ -2,7 +2,8 @@
 // (not later edits), a failed checkpoint keeps the previous one, a directory
 // serves one session, durable saves clear only what they saved, conflicts
 // keep drafts without resending, and a hosted save with an unknown outcome
-// stays pending across a restart until resolved.
+// stays pending across a restart until resolved. An editor's draft can be
+// kept through its saves: saved drafts are left out of checkpoints.
 #include "TestSupport.hpp"
 #include "vc_object_store/geometry/Geometry.hpp"
 #include "vc_object_store/objects/GeometryCoordinates.hpp"
@@ -126,6 +127,41 @@ try {
         const auto receipt = session.submitDurably(attachment, save(session, attachment, surface, 1, 5), {surface});
         require(receipt.objects.at(surface) == 2 && !session.hasDraft(surface), "saved draft cleared");
         require(filesIn(drafts, "draft-") == 0 && filesIn(drafts, "request-") == 0, "checkpoint holds nothing");
+    }
+    {
+        // An editor's draft: opened unchanged (saved), edited, saved from an
+        // earlier revision while edits continue, then saved again; it stays.
+        ObjectStoreSession session;
+        const auto attachment = session.attach(storePath, options);
+        require(session.useDraftDirectory(drafts).drafts.empty(), "nothing to recover");
+        const ObjectVersion v2{base.storeUuid, base.generation, surface, 2};
+        session.setDraft(surface, flat(5), coordinates, attachment, v2);
+        session.markDraftSaved(surface, session.draftRevision(surface));
+        require(session.draftState(surface)->saved && session.draftState(surface)->checkpointed, "opened saved");
+        session.checkpointDrafts();
+        require(filesIn(drafts, "draft-") == 0, "a saved draft is not written");
+        session.markDraftSaved(surface, session.draftRevision(surface) + 1); // no such revision: no-op
+        session.updateDraft(surface, 0, 0, 20, 20, std::vector<SurfacePoint>(400, SurfacePoint{1, 1, 6}));
+        const auto snapshot = session.draftRevision(surface);
+        require(!session.draftState(surface)->saved, "edited");
+        session.updateDraft(surface, 0, 0, 20, 20, std::vector<SurfacePoint>(400, SurfacePoint{1, 1, 8}));
+        DurableSave keep{{{surface, session.draftRevision(surface) + 1}}, true};
+        mustFail([&] { (void)session.submitDurably(attachment, save(session, attachment, surface, 2, 6), keep); });
+        keep.drafts = {{surface, snapshot}};
+        auto receipt = session.submitDurably(attachment, save(session, attachment, surface, 2, 6), keep);
+        auto state = session.draftState(surface);
+        require(receipt.objects.at(surface) == 3 && state && state->base->version == 3 && !state->saved &&
+                state->checkpointed && filesIn(drafts, "draft-") == 1, "the later edit stays unsaved");
+        keep.drafts = {{surface, 0}};
+        receipt = session.submitDurably(attachment, save(session, attachment, surface, 3, 8), keep);
+        state = session.draftState(surface);
+        require(receipt.objects.at(surface) == 4 && state->base->version == 4 && state->saved && filesIn(drafts, "draft-") == 0,
+                "kept and saved");
+        const auto contents = session.draftContents(surface);
+        require(contents && contents->revision == state->revision && contents->attachment == attachment &&
+                contents->surface.rows == 20 && contents->surface.points[0][2] == 8 && contents->surface.validity.size() == 400,
+                "draft contents");
+        session.clearDraft(surface);
     }
 
     // Hosted: an unreachable host leaves the outcome unknown; it stays pending

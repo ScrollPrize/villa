@@ -828,10 +828,32 @@ std::optional<DraftState> ObjectStoreSession::draftState(const std::string& obje
         state.submittedRevision = meta->second.submittedRevision;
         state.pendingRequest = meta->second.pendingRequest;
         state.conflict = meta->second.conflict;
+        state.saved = meta->second.savedRevision == state.revision;
     }
     const auto written = durable_->checkpointed.find(uuid);
-    state.checkpointed = written != durable_->checkpointed.end() && written->second == state.revision;
+    state.checkpointed = state.saved || (written != durable_->checkpointed.end() && written->second == state.revision);
     return state;
+}
+
+std::optional<DraftContents> ObjectStoreSession::draftContents(const std::string& objectUuid) const
+{
+    std::shared_ptr<const detail::SurfaceDraft> draft;
+    {
+        std::lock_guard lock(mutex_);
+        const auto found = drafts_.find(util::canonicalUuid(objectUuid));
+        if (found == drafts_.end()) return std::nullopt;
+        draft = found->second;
+    }
+    return DraftContents{detail::draftGrid(*draft), draft->coordinates, draft->attachment, draft->revision};
+}
+
+void ObjectStoreSession::markDraftSaved(const std::string& objectUuid, uint64_t revision)
+{
+    const auto uuid = util::canonicalUuid(objectUuid);
+    std::lock_guard lock(mutex_);
+    const auto found = drafts_.find(uuid);
+    if (found == drafts_.end() || found->second->revision != revision) return;
+    durable_->meta[uuid].savedRevision = revision;
 }
 
 DraftRecovery ObjectStoreSession::useDraftDirectory(const std::filesystem::path& path)
@@ -897,6 +919,10 @@ uint64_t ObjectStoreSession::checkpointDrafts()
         if (!durable_->directory) throw std::logic_error("the session has no draft directory");
         for (const auto& [uuid, draft] : drafts_) {
             const auto meta = durable_->meta.find(uuid);
+            // A saved draft has nothing to recover (unless a save of it is pending).
+            if (meta != durable_->meta.end() && meta->second.savedRevision == draft->revision &&
+                !meta->second.submittedRevision)
+                continue;
             captures.push_back({uuid, draft, meta == durable_->meta.end() ? detail::DraftMeta{} : meta->second});
         }
         for (const auto& [request, record] : durable_->pending) pending.push_back(record);
@@ -937,18 +963,28 @@ std::vector<PendingSubmission> ObjectStoreSession::pendingSubmissions() const
 TransactionReceipt ObjectStoreSession::submitDurably(const AttachmentIdentity& attachment, const TransactionRequest& request,
                                                      const std::vector<std::string>& drafts)
 {
+    DurableSave save;
+    for (const auto& uuid : drafts) save.drafts.push_back({uuid, 0});
+    return submitDurably(attachment, request, save);
+}
+
+TransactionReceipt ObjectStoreSession::submitDurably(const AttachmentIdentity& attachment, const TransactionRequest& request,
+                                                     const DurableSave& save)
+{
     if (request.requestUuid.empty()) throw std::invalid_argument("a durable submission needs a request UUID");
     const auto requestUuid = util::canonicalUuid(request.requestUuid);
     bool durable = false;
     {
         std::lock_guard lock(mutex_);
         if (durable_->pending.contains(requestUuid)) throw std::invalid_argument("request " + requestUuid + " is already pending");
-        detail::PendingRecord record{requestUuid, attachment.storeUuid, {}};
-        for (const auto& objectUuid : drafts) {
-            const auto uuid = util::canonicalUuid(objectUuid);
+        detail::PendingRecord record{requestUuid, attachment.storeUuid, {}, save.keepDrafts};
+        for (const auto& saved : save.drafts) {
+            const auto uuid = util::canonicalUuid(saved.objectUuid);
             const auto found = drafts_.find(uuid);
             if (found == drafts_.end()) throw std::invalid_argument("no draft of " + uuid);
-            record.drafts[uuid] = found->second->revision;
+            if (saved.revision > found->second->revision)
+                throw std::invalid_argument("draft " + uuid + " has no revision " + std::to_string(saved.revision));
+            record.drafts[uuid] = saved.revision ? saved.revision : found->second->revision;
         }
         for (const auto& [uuid, revision] : record.drafts) {
             auto& meta = durable_->meta[uuid];
@@ -1040,16 +1076,21 @@ void ObjectStoreSession::conclude(const std::string& requestUuid, const Transact
                 if (!conflict.empty()) meta->second.conflict = conflict;
                 continue;
             }
-            // Committed: clear what was saved; later edits stay on the new base.
-            if (draft->second->revision == submitted) {
+            // Committed: clear what was saved (or, kept for an open editor,
+            // mark it saved); later edits stay on the new base.
+            const bool unchanged = draft->second->revision == submitted;
+            if (unchanged && !record.keepDrafts) {
                 const auto attachment = draft->second->attachment;
                 drafts_.erase(draft);
                 durable_->meta.erase(meta);
                 draftChanged(uuid, attachment);
-            } else if (const auto version = receipt->objects.find(uuid); version != receipt->objects.end() && version->second) {
+                continue;
+            }
+            if (const auto version = receipt->objects.find(uuid); version != receipt->objects.end() && version->second) {
                 meta->second.base = ObjectVersion{receipt->storeUuid, receipt->generation, uuid, *version->second};
                 meta->second.conflict.clear();
             }
+            if (unchanged) meta->second.savedRevision = submitted;
         }
         durable = durable_->directory != nullptr;
     }

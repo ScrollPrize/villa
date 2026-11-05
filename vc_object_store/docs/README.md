@@ -240,6 +240,18 @@ hosted store cannot be reached, the outcome is unknown: the submission stays
 pending (`pendingSubmissions()`, also after a restart) until
 `resolvePending()` finds its receipt or sends the identical request again.
 
+Editors that keep a draft open while they save use the `DurableSave` form:
+`drafts` names each draft with the revision whose grid the request holds (a save
+copied on one thread while edits continue on another), and `keepDrafts` keeps
+the drafts after success. A kept draft moves to the committed version and, when
+it did not change after its saved revision, is marked saved. `markDraftSaved`
+does the same for a draft that holds its base's committed geometry (a surface
+just opened). Checkpoints leave saved drafts out, so opening large surfaces
+writes nothing; `draftState().saved` reports it. `draftContents()` returns a
+draft's grid, coordinates and attachment (for an application restoring a
+recovered draft). A pending save recovered after a restart clears its drafts on
+success: the editor that kept them is gone.
+
 ## Numbered history and checked requests
 
 Schema 18 introduced numbered history; schema 19 (current) stores it compactly. Each object and relationship keeps its UUID; each
