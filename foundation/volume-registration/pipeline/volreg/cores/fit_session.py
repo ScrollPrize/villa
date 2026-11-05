@@ -557,11 +557,13 @@ class Session:
     def calibrate(self):
         """Fix the sign convention against a planted shift, under the current fit."""
         _coarse_levels, fine_array, fine_scale = self.open()
+        patches = self._correlatable()
         blocks = [(np.asarray(patch["origin_zyx"]), self.coarse_block(patch["id"]))
-                  for patch in self._correlatable()]
+                  for patch in patches]
         if not blocks:
             raise ValueError("no textured patch to calibrate on; sample first")
-        sign = dense.calibrate_sign(blocks, fine_array, fine_scale, self.fine_to_coarse())
+        sign = dense.calibrate_sign(blocks, fine_array, fine_scale, self.fine_to_coarse(),
+                                    cache=self._fine, keys=[patch["id"] for patch in patches])
         self.state["sampling"]["sign"] = float(sign)
         self.save()
         return sign

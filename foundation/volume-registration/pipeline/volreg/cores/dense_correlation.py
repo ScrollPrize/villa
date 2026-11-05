@@ -726,23 +726,42 @@ def pairs_from(blocks, fine_array, fine_scale, fine_to_coarse, sign, cache):
             np.array(shifts), np.array(errors))
 
 
-def starting_residual(blocks, fine_array, fine_scale, fine_to_coarse, wanted=12):
+def first_found(measure, items, wanted):
+    """`measure` over `items` in order, keeping the first `wanted` results that are not
+    None -- the ones a loop that stops there would keep -- but read `THREADS` at a time in
+    rounds, so a stop does not wait on reads nobody uses (see SAMPLE_ROUND)."""
+    found = []
+    with ThreadPoolExecutor(max_workers=THREADS) as pool:
+        for start in range(0, len(items), max(wanted, THREADS)):
+            for result in pool.map(measure, items[start:start + max(wanted, THREADS)]):
+                if result is not None and len(found) < wanted:
+                    found.append(result)
+            if len(found) >= wanted:
+                break
+    return found
+
+
+def starting_residual(blocks, fine_array, fine_scale, fine_to_coarse, wanted=12, cache=None,
+                      keys=None):
     """How far the unperturbed transform already is from the images, in coarse voxels.
 
     The sign test plants a displacement and asks which sign undoes it. That only answers
     anything if the planted displacement is large against the error already there, so the
     error already there has to be measured rather than assumed.
+
+    With a `cache` (and a key per block), the fine patches read here are the ones the
+    first measurement pass reads -- same transform, same bounds -- and it reuses them.
     """
-    seen = []
-    for origin, coarse_block in blocks[:40]:
-        fine_block = resample_fine(fine_array, fine_scale, fine_to_coarse, origin, BLOCK)
+    def one(index):
+        origin, coarse_block = blocks[index]
+        fine_block = resample_fine(fine_array, fine_scale, fine_to_coarse, origin, BLOCK,
+                                   cache=cache, key=None if keys is None else keys[index])
         if fine_block is None:
-            continue
+            return None
         shift, _error = correlate(coarse_block, fine_block)
-        if np.isfinite(shift).all():
-            seen.append(float(np.linalg.norm(shift)))
-        if len(seen) >= wanted:
-            break
+        return float(np.linalg.norm(shift)) if np.isfinite(shift).all() else None
+
+    seen = first_found(one, list(range(min(len(blocks), 40))), wanted)
     return float(np.median(seen)) if seen else float("nan")
 
 
@@ -761,7 +780,7 @@ def calibration_plant(residual):
     return direction * max(np.linalg.norm(planted), CALIBRATION_MARGIN * float(residual))
 
 
-def calibrate_sign(blocks, fine_array, fine_scale, fine_to_coarse):
+def calibrate_sign(blocks, fine_array, fine_scale, fine_to_coarse, cache=None, keys=None):
     """Decide the sign by perturbing a transform that is already close to right.
 
     Offsetting the transform's translation by a known amount moves every resampled block
@@ -780,7 +799,8 @@ def calibrate_sign(blocks, fine_array, fine_scale, fine_to_coarse):
     costs one extra correlation pass over twelve blocks and makes the test mean the same
     thing on every pair.
     """
-    residual = starting_residual(blocks, fine_array, fine_scale, fine_to_coarse)
+    residual = starting_residual(blocks, fine_array, fine_scale, fine_to_coarse, cache=cache,
+                                 keys=keys)
     planted = calibration_plant(residual)
 
     perturbed = np.array(fine_to_coarse, dtype=float)
@@ -788,21 +808,21 @@ def calibrate_sign(blocks, fine_array, fine_scale, fine_to_coarse):
     inverse_perturbed = np.linalg.inv(perturbed)
     inverse_true = np.linalg.inv(fine_to_coarse)
 
-    errors = {1.0: [], -1.0: []}
-    for origin, coarse_block in blocks[:40]:
+    def one(block):
+        origin, coarse_block = block
         fine_block = resample_fine(fine_array, fine_scale, perturbed, origin, BLOCK)
         if fine_block is None:
-            continue
+            return None
         shift, _error = correlate(coarse_block, fine_block)
         if not np.isfinite(shift).all():
-            continue
+            return None
         centre = signal_centre(coarse_block, origin)
         want = apply(inverse_true, centre)
-        for sign in (1.0, -1.0):
-            got = apply(inverse_perturbed, centre + sign * shift)
-            errors[sign].append(float(np.linalg.norm(got - want)))
-        if len(errors[1.0]) >= 12:
-            break
+        return {sign: float(np.linalg.norm(apply(inverse_perturbed, centre + sign * shift) - want))
+                for sign in (1.0, -1.0)}
+
+    found = first_found(one, blocks[:40], 12)
+    errors = {sign: [result[sign] for result in found] for sign in (1.0, -1.0)}
 
     if not errors[1.0]:
         raise RuntimeError("no block could be resampled under the perturbed transform")
