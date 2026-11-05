@@ -1,5 +1,6 @@
 #include "vc_object_store/objects/StoreReader.hpp"
 #include "vc_object_store/objects/GeometryCoordinates.hpp"
+#include "vc_object_store/Uuid.hpp"
 #include "internal/TransformedLength.hpp"
 
 #include <nlohmann/json.hpp>
@@ -110,6 +111,28 @@ void expectRelationshipEndpoints(const StoreReader& reader, VersionSelection& ex
         const auto head = reader.currentObject(endpoint);
         expected.emplace(endpoint, head ? std::optional(head->version) : std::nullopt);
     }
+}
+
+void editCurrentRequest(const StoreReader& reader, TransactionRequest& request, const std::vector<std::string>& objectUuids,
+                        std::vector<TransactionOperation> operations)
+{
+    std::vector<std::string> uuids;
+    for (const auto& objectUuid : objectUuids) {
+        const auto uuid = util::canonicalUuid(objectUuid);
+        const auto current = reader.currentObject(uuid);
+        if (!current) throw std::runtime_error("object is not in the store: " + uuid);
+        request.expectedObjects[uuid] = current->version;
+        uuids.push_back(uuid);
+    }
+    expectRelationshipEndpoints(reader, request.expectedObjects);
+    for (auto& operation : operations) request.operations.push_back(std::move(operation));
+    if (uuids.empty()) return;
+    EdgeSelection edges;
+    edges.endpointUuids = uuids;
+    edges.includeRetired = true;
+    std::set<std::string> kept;
+    for (const auto& edge : reader.selectEdges(edges, std::vector<std::string>{}))
+        if (kept.insert(edge.uuid).second) request.operations.push_back(KeepRecordedRelationshipOp{edge.uuid});
 }
 
 VersionSelection transformDependencies(const StoreReader& reader)

@@ -97,6 +97,18 @@ std::optional<std::string> currentRevisionPin(const StoreReader&, const std::str
 // geometry change that keeps or edits those relationships is checked against
 // both ends. Existing entries are kept.
 void expectRelationshipEndpoints(const StoreReader&, VersionSelection& expected);
+// The typed form of an edit of existing objects that keeps their
+// relationships as recorded (ObjectStoreSession::editCurrent): expects each of
+// `objectUuids` at its current version (throws when one is absent) and every
+// endpoint of their relationships, appends `operations`, then keeps every
+// relationship of each object (retired ones included) as recorded.
+void editCurrentRequest(const StoreReader&, TransactionRequest&, const std::vector<std::string>& objectUuids,
+                        std::vector<TransactionOperation> operations);
+// The operation that declares `record`'s coordinate frame
+// (ObjectStore::bindGeometryCoordinates): stored at `storedUnitsPerVoxel`
+// units per voxel of `volume`, merged into its meta.coordinates; throws for a
+// kind without one or a conflict with what it declares.
+SetMetaOp bindCoordinatesOperation(const ObjectRecord&, const std::string& volume, double storedUnitsPerVoxel);
 // The current versions of the recorded volume transforms and route choices:
 // read dependencies of a write computed through a transformed view, so a
 // changed registration conflicts instead of mapping the edit wrongly.

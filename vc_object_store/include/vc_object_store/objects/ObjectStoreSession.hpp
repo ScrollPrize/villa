@@ -302,14 +302,17 @@ public:
     RevisionSelection editKeepingRelationships(const AttachmentIdentity&, const RevisionSelection& pins,
         const RevisionSelection& related, const std::function<void(ObjectStore&, WriteTxn&, const KeepRecorded&)>&,
         TransactionReceipt* receipt = nullptr);
-    // Edit the current revisions of these objects in one commit, keeping their
-    // recorded relationships: `edit` runs once per object. Throws when one is
-    // gone, or when one changed between the read and the commit.
-    void editCurrent(const AttachmentIdentity&, const std::vector<std::string>& objectUuids,
-                     const std::function<void(ObjectStore&, WriteTxn&, const std::string& objectUuid)>& edit);
+    // Edit these objects at their current versions in one checked request
+    // that keeps their recorded relationships (editCurrentRequest), on any
+    // attachment: `operations` gives each object's operations, read through
+    // the attachment. Throws when one is gone, and TransactionConflict when
+    // one changed between the read and the commit. nullopt for no objects.
+    using EditOperations = std::function<std::vector<TransactionOperation>(const StoreReader&, const std::string& objectUuid)>;
+    std::optional<TransactionReceipt> editCurrent(const AttachmentIdentity&, const std::vector<std::string>& objectUuids,
+                                                  const EditOperations& operations);
     // The same over each object's current record (name, tags, meta).
-    void editRecords(const AttachmentIdentity&, const std::vector<std::string>& objectUuids,
-                     const std::function<void(ObjectRecord&)>& change);
+    std::optional<TransactionReceipt> editRecords(const AttachmentIdentity&, const std::vector<std::string>& objectUuids,
+                                                  const std::function<void(ObjectRecord&)>& change);
     // Add, then remove, tags of these objects.
     void tagObjects(const AttachmentIdentity&, const std::vector<std::string>& objectUuids,
                     const std::vector<std::string>& add, const std::vector<std::string>& remove = {});

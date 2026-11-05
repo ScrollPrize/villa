@@ -1,6 +1,7 @@
 // Open Data samples as catalog stores: placeholders from the catalog, geometry
 // fetched by reads that reach it (once, through the session), failures not
 // cached, imports shadowing catalog surfaces, published files and refresh.
+#include "vc_object_store/objects/StoreReader.hpp"
 #include "TestSupport.hpp"
 #include "vc_object_store/Tiff.hpp"
 #include "vc_object_store/objects/CatalogStore.hpp"
@@ -286,10 +287,9 @@ int main() try
                 "other stores untouched by refresh");
     });
     // Local edits survive refresh and reopening.
-    session.editCurrent(catalog, {uuid}, [&](auto& db, auto& txn, const auto& id) {
-        auto geometry = db.currentGeometry(txn, id);
-        const auto view = GeometrySnapshot(db, txn).viewStored(id);
-        db.editGeometry(txn, id, view.surfaceEdits(0, 0, 1, 1, {{42, 43, 44}}), geometry->uuid);
+    (void)session.editCurrent(catalog, {uuid}, [&](const StoreReader& reader, const std::string& id) {
+        const auto view = GeometrySnapshot(reader).viewStored(id);
+        return std::vector<TransactionOperation>{EditGeometryOp{id, view.surfaceEdits(0, 0, 1, 1, {{42, 43, 44}}), {}}};
     });
     std::string editedGeometry;
     session.read(catalog, [&](const auto& db, const auto& txn, const auto&) {

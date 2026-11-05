@@ -4,6 +4,7 @@
 #include <memory>
 #include <optional>
 namespace vc::objects {
+class StoreReader;
 class ObjectStore;
 class ObjectStoreSession;
 struct AttachmentIdentity;
@@ -46,10 +47,19 @@ VolumeTransforms volumeTransformsFrom(const std::vector<std::pair<ObjectRecord,s
 std::string catalogTransformUuid(const std::string& registrationId);
 // The stored route choice from `source` to `target`, when there is one.
 std::optional<ObjectRecord> volumeTransformChoice(const ObjectStore&,const Txn&,const std::string& source,const std::string& target);
-// Through a session's attachment: store `matrix` (source voxels to target
-// voxels) as a new registration named `name`, returning its UUID; make `path`
-// (one of the pair's routes) the route from `source` to `target`, replacing a
-// stored choice, returning the choice's UUID.
+std::optional<ObjectRecord> volumeTransformChoice(const StoreReader&,const std::string& source,const std::string& target);
+// `base` (a new record with its UUID, or the existing one) as the
+// registration of `matrix` from `source` to `target` named `name`; validates it.
+ObjectRecord volumeTransformRecord(ObjectRecord base,const std::string& source,const std::string& target,
+                                   const VolumeAffine& matrix,const std::string& name);
+// `base` as the choice of route `path` from `source` to `target` (not validated).
+ObjectRecord volumeTransformChoiceRecord(ObjectRecord base,const std::string& source,const std::string& target,
+                                         const std::vector<std::string>& path);
+// Through a session's attachment (local or hosted), as checked requests: store
+// `matrix` (source voxels to target voxels) as a new registration named `name`,
+// returning its UUID; make `path` (one of the pair's routes, resolved against
+// the recorded transforms, which the request depends on) the route from
+// `source` to `target`, replacing a stored choice, returning the choice's UUID.
 std::string registerVolumeTransform(ObjectStoreSession&,const AttachmentIdentity&,const std::string& source,
                                     const std::string& target,const VolumeAffine& matrix,const std::string& name);
 std::string chooseVolumeTransform(ObjectStoreSession&,const AttachmentIdentity&,const std::string& source,

@@ -154,6 +154,8 @@ struct ObjectRevision {
 // and exports include them. Point collections attached this way carry a record
 // meta "role" and are never linked to surfaces by the point-collection linker.
 inline constexpr const char* kAttachmentEdgeKind = "attachment";
+// The relationship attaching object `data` to `owner` in `role` (ObjectStore::attach); no UUID.
+EdgeRecord attachmentEdge(const std::string& dataUuid, const std::string& ownerUuid, const std::string& role);
 
 // Edge changes revise both endpoints atomically; unchanged membership is inherited.
 // Pins are immutable objectRevision() UUIDs, never moving heads.

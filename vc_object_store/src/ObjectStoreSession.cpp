@@ -7,6 +7,8 @@
 #include "hub/HubWorker.hpp"
 #include "internal/SurfaceDrafts.hpp"
 #include "vc_object_store/objects/ObjectCopy.hpp"
+#include "vc_object_store/objects/StoreReader.hpp"
+#include "vc_object_store/objects/TransactionJson.hpp"
 #include "vc_reader/sftp.hpp"
 #include "vc_object_store/Uuid.hpp"
 #include <algorithm>
@@ -545,34 +547,31 @@ void ObjectStoreSession::writeJob(const AttachmentIdentity& identity, const Job&
     release(*attachment, true);
 }
 
-void ObjectStoreSession::editCurrent(const AttachmentIdentity& identity, const std::vector<std::string>& objectUuids,
-                                     const std::function<void(ObjectStore&, WriteTxn&, const std::string&)>& edit)
+std::optional<TransactionReceipt> ObjectStoreSession::editCurrent(const AttachmentIdentity& identity,
+                                                                  const std::vector<std::string>& objectUuids,
+                                                                  const EditOperations& operations)
 {
-    RevisionSelection pins;
-    read(identity, [&](const auto& store, const auto& txn, const auto&) {
-        for (const auto& objectUuid : objectUuids) {
-            const auto uuid = util::canonicalUuid(objectUuid);
-            const auto current = store.currentObjectRevision(txn, uuid);
-            if (!current) throw std::runtime_error("object is not in the store: " + uuid);
-            pins[uuid] = current->uuid;
-        }
+    if (objectUuids.empty()) return std::nullopt;
+    auto request = newRequest(identity);
+    readStore(identity, [&](const StoreReader& reader, const auto&) {
+        std::vector<TransactionOperation> edits;
+        for (const auto& objectUuid : objectUuids)
+            for (auto& operation : operations(reader, util::canonicalUuid(objectUuid))) edits.push_back(std::move(operation));
+        editCurrentRequest(reader, request, objectUuids, std::move(edits));
     });
-    if (pins.empty()) return;
-    editKeepingRelationships(identity, pins, {}, [&](auto& store, auto& txn, const auto&) {
-        for (const auto& [uuid, revision] : pins) {
-            edit(store, txn, uuid);
-            store.keepRecordedRelationshipsOf(txn, uuid);
-        }
-    });
+    return submit(identity, request);
 }
 
-void ObjectStoreSession::editRecords(const AttachmentIdentity& identity, const std::vector<std::string>& objectUuids,
-                                     const std::function<void(ObjectRecord&)>& change)
+std::optional<TransactionReceipt> ObjectStoreSession::editRecords(const AttachmentIdentity& identity,
+                                                                  const std::vector<std::string>& objectUuids,
+                                                                  const std::function<void(ObjectRecord&)>& change)
 {
-    editCurrent(identity, objectUuids, [&](auto& store, auto& txn, const auto& uuid) {
-        auto record = *store.objectByUuid(txn, uuid);
+    return editCurrent(identity, objectUuids, [&](const StoreReader& reader, const std::string& uuid) {
+        const auto current = reader.currentObject(uuid);
+        if (!current) throw std::runtime_error("object is not in the store: " + uuid);
+        auto record = current->record;
         change(record);
-        store.upsertObject(txn, record);
+        return std::vector<TransactionOperation>{UpdateObjectOp{objectRecordJson(record)}};
     });
 }
 

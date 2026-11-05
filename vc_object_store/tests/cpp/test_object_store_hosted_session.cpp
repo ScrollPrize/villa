@@ -5,6 +5,7 @@
 // the last check; queries combine hosted results, local attachments and
 // drafts like local ones; a lost feed position is a revalidation; an
 // unreachable host keeps cached data and reports the failure.
+#include "vc_object_store/objects/VolumeTransforms.hpp"
 #include "TestSupport.hpp"
 #include "vc_object_store/client/HostedStore.hpp"
 #include "vc_object_store/geometry/Geometry.hpp"
@@ -111,6 +112,7 @@ try {
     ObjectStoreSession session;
     HostedSessionOptions hostedOptions;
     hostedOptions.pollInterval = std::chrono::hours(1); // checks happen through refresh() here
+    hostedOptions.author = "session-test";
     hostedOptions.client.retries = 1;
     hostedOptions.client.connectTimeoutMs = 1000;
     const auto hosted = session.attachHosted(endpoint, hostedOptions);
@@ -323,6 +325,26 @@ try {
     events = committedOf(session, hosted);
     require(events.size() == 1 && events[0].revalidate && events[0].touches({"anything"}), "revalidation");
     require(session.freshness(hosted)->error.empty(), "reconnected");
+
+    // Typed session edits work on a hosted attachment: record edits keep
+    // relationships, a registration and a route choice are checked requests.
+    {
+        const auto renamed = session.editRecords(hosted, {track}, [](ObjectRecord& record) { record.name = "renamed"; });
+        require(renamed && session.currentObject(hosted, track)->record.name == "renamed" &&
+                session.currentObject(hosted, track)->version == renamed->objects.at(track), "hosted record edit");
+        require(!session.editRecords(hosted, {}, [](ObjectRecord&) {}), "no objects, no request");
+        mustFail([&] { (void)session.editRecords(hosted, {util::newUuid()}, [](ObjectRecord&) {}); });
+        const auto registration = registerVolumeTransform(session, hosted, "hosted-a", "hosted-b", VolumeAffine{}, "hosted");
+        session.refresh(hosted);
+        const auto route = session.volumeTransforms(hosted).resolve("hosted-a", "hosted-b").resolved().path;
+        const auto choice = chooseVolumeTransform(session, hosted, "hosted-a", "hosted-b", route);
+        require(session.currentObject(hosted, registration)->record.kind == "volume_transform" &&
+                session.currentObject(hosted, choice)->record.kind == "volume_transform_choice", "hosted transform writes");
+        session.refresh(hosted);
+        require(chooseVolumeTransform(session, hosted, "hosted-a", "hosted-b", route) == choice &&
+                session.currentObject(hosted, choice)->version == 2, "a choice is replaced in place");
+        mustFail([&] { (void)chooseVolumeTransform(session, hosted, "hosted-a", "hosted-b", {util::newUuid()}); });
+    }
 
     // Detaching stops the poller: nothing arrives after Detached.
     session.detach(hosted);

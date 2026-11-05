@@ -1,3 +1,4 @@
+#include "vc_object_store/objects/StoreReader.hpp"
 #include "catalog/Catalog.hpp"
 #include "formats/GeometryInput.hpp"
 #include "formats/RemoteSource.hpp"
@@ -272,22 +273,21 @@ void restoreCatalogVersion(ObjectStoreSession& session, const AttachmentIdentity
                            const std::string& objectUuid)
 {
     const auto uuid = util::canonicalUuid(objectUuid);
-    std::optional<std::string> revision;
-    session.read(attachment, [&](const auto& store, const auto& txn, const auto&) {
-        const auto record = store.objectByUuid(txn, uuid);
-        if (!record || !catalogReference(*record)) throw std::runtime_error("not a catalog surface: " + uuid);
-        const auto meta = Json::parse(record->meta);
+    (void)session.editCurrent(attachment, {uuid}, [&](const StoreReader& reader, const std::string&) {
+        const auto current = reader.currentObject(uuid);
+        if (!current || !catalogReference(current->record)) throw std::runtime_error("not a catalog surface: " + uuid);
+        const auto meta = Json::parse(current->record.meta);
         if (!meta.contains("catalog_geometry_revision"))
             throw std::runtime_error("the catalog version of " + uuid + " was never fetched");
         // The catalog's last write (a fetch or refresh) minted this token; the
         // user's later revisions carry it forward.
         const auto token = meta.value("catalog_write", std::string());
-        for (const auto& version : store.objectHistory(txn, uuid))
-            if (!revision && Json::parse(version.record.meta).value("catalog_write", std::string()) == token)
-                revision = version.uuid;
+        for (const auto& version : reader.objectHistory(uuid))
+            if (!version.deleted && Json::parse(version.record.meta).value("catalog_write", std::string()) == token)
+                return std::vector<TransactionOperation>{RestoreObjectOp{
+                    uuid, ObjectVersion{reader.status().storeUuid, version.generation, uuid, version.version}}};
+        throw std::runtime_error("the catalog version of " + uuid + " is not in its history");
     });
-    if (!revision) throw std::runtime_error("the catalog version of " + uuid + " is not in its history");
-    session.editCurrent(attachment, {uuid}, [&](auto& store, auto& txn, const auto&) { store.restoreObject(txn, uuid, *revision); });
 }
 
 CatalogStoreReport refreshCatalog(ObjectStoreSession& session, const AttachmentIdentity& attachment,

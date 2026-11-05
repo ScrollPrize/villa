@@ -17,6 +17,8 @@ struct VolumeUmbilicus {
 // The current revisions of the umbilici that map to `volume`: the pins of an
 // edit that replaces or removes them.
 RevisionSelection volumeUmbilicusRevisions(const ObjectStore&, const Txn&, const std::string& volume);
+// The live umbilici that map to `volume` (one, unless the store is inconsistent).
+std::vector<ObjectRecord> volumeUmbilici(const StoreReader&, const std::string& volume);
 // The umbilicus of `volume`'s volume, its points in `volume`; nullopt when it
 // has none. Throws when several map to it.
 std::optional<VolumeUmbilicus> volumeUmbilicus(const StoreReader&, const VolumeVoxels& volume);
@@ -28,4 +30,8 @@ std::optional<VolumeUmbilicus> volumeUmbilicus(ObjectStoreSession&, const Attach
 // record.uuid to be absent. Returns the UUID.
 std::string setVolumeUmbilicus(ObjectStore&, WriteTxn&, const std::string& volume, ObjectRecord record,
                                const geometry::Umbilicus& geometry);
+// The same as a checked request read through `reader`: expects the umbilici it
+// retires at their current versions and record.uuid (required) absent.
+void setVolumeUmbilicusRequest(const StoreReader&, TransactionRequest&, const std::string& volume,
+                               const ObjectRecord& record, const geometry::Umbilicus& geometry);
 }

@@ -292,8 +292,16 @@ generation and author. Helpers over a `StoreReader` fill in what an edit
 depends on: `expectRelationshipEndpoints` expects the far ends of an edited
 object's relationships, and `transformDependencies` makes an edit computed
 through a transformed view conflict when a recorded registration or route
-choice changes before it commits. `createSurfaceOperations` gives the
-operations that create a surface record and its geometry. Code holding an
+choice changes before it commits. `editCurrentRequest` builds an edit of
+existing objects at their current versions that keeps their relationships as
+recorded, and the session's `editCurrent(attachment, uuids, operations)` and
+`editRecords` read, build and submit one (on any attachment).
+`bindCoordinatesOperation`, `attachmentEdge`, `volumeTransformRecord`,
+`volumeTransformChoiceRecord` and `setVolumeUmbilicusRequest` give the
+operations of the corresponding store writes; `registerVolumeTransform`,
+`chooseVolumeTransform` and `importVolumeUmbilicus` submit them.
+`createSurfaceOperations` gives the operations that create a surface record
+and its geometry. Code holding an
 object keeps a `PinnedObject`: its version and history generation (`pinOf`),
 which requests expect.
 

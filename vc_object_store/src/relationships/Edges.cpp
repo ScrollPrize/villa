@@ -177,7 +177,7 @@ std::vector<EdgeRecord> ObjectStore::selectEdges(const Txn& txn, const EdgeSelec
     return records;
 }
 
-std::string ObjectStore::attach(WriteTxn& txn, const std::string& dataUuid, const std::string& ownerUuid, const std::string& role)
+EdgeRecord attachmentEdge(const std::string& dataUuid, const std::string& ownerUuid, const std::string& role)
 {
     EdgeRecord edge;
     edge.kind = kAttachmentEdgeKind;
@@ -186,7 +186,12 @@ std::string ObjectStore::attach(WriteTxn& txn, const std::string& dataUuid, cons
     edge.aAnchor.wholeGeometry = true;
     edge.bAnchor.wholeGeometry = true;
     edge.meta = nlohmann::json{{"role", role}}.dump();
-    return addEdge(txn, edge);
+    return edge;
+}
+
+std::string ObjectStore::attach(WriteTxn& txn, const std::string& dataUuid, const std::string& ownerUuid, const std::string& role)
+{
+    return addEdge(txn, attachmentEdge(dataUuid, ownerUuid, role));
 }
 
 std::vector<EdgeRecord> ObjectStore::attachments(const Txn& txn, const std::string& ownerUuid,
