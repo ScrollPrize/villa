@@ -137,10 +137,12 @@ def status(args):
             waiting = [name for name, state in states.items() if state in (engine.WAITING,)]
             busy = [name for name, state in states.items() if state in (engine.RUNNING,)]
             failed = [name for name, state in states.items() if state == engine.FAILED]
-            print(f"{record.directory.name:18s} " + "  ".join(
-                f"{label}: {', '.join(names)}" for label, names in
-                (("waiting for you", waiting), ("running", busy), ("failed", failed)) if names)
-                or f"{record.directory.name:18s} " + ", ".join(f"{n} {s}" for n, s in states.items()))
+            parts = "  ".join(f"{label}: {', '.join(names)}" for label, names in
+                              (("waiting for you", waiting), ("running", busy), ("failed", failed))
+                              if names)
+            print(f"{record.directory.name:18s} " + (parts or ", ".join(
+                f"{name} {state}" for name, state in states.items() if state != engine.DONE)
+                or "finished"))
             continue
         pair = record.read(rec.PAIR)
         line = f"{record.directory.name:18s} {pair['pair'][:52]:52s} {stage_of(record)}"
@@ -242,10 +244,10 @@ def main(argv=None):
         # A job that finished starts what its result made ready, so a pair moves on by
         # itself until a person is next. Two jobs finishing at once may both try to start
         # the same stage; its lock lets only one run.
-        status = engine.main_job(pipeline_stages.pipeline(args.pair), args.stage)
-        if status == 0:
+        code = engine.main_job(pipeline_stages.pipeline(args.pair), args.stage)
+        if code == 0:
             advance(args.pair)
-        return status
+        return code
     elif args.command == "import":
         pipeline = pipeline_stages.pipeline(args.pair)
         with pipeline_stages.session_lock(pipeline):
