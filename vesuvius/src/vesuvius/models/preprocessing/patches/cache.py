@@ -34,6 +34,8 @@ class PatchCacheParams:
     unlabeled_fg_enabled: bool = True
     unlabeled_fg_threshold: float = 0.05
     unlabeled_fg_bbox_threshold: float = 0.15
+    primary_target: Optional[str] = None
+    unlabeled_fg_volume_ids: Tuple[str, ...] = ()
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary for serialization."""
@@ -49,6 +51,11 @@ class PatchCacheParams:
             "unlabeled_fg_enabled": bool(self.unlabeled_fg_enabled),
             "unlabeled_fg_threshold": float(self.unlabeled_fg_threshold),
             "unlabeled_fg_bbox_threshold": float(self.unlabeled_fg_bbox_threshold),
+            **({"primary_target": self.primary_target}
+               if self.primary_target is not None else {}),
+            # Even an unrestricted enabled cache must identify its selection.
+            **({"unlabeled_fg_volume_ids": list(self.unlabeled_fg_volume_ids)}
+               if self.unlabeled_fg_enabled else {}),
         }
 
 
@@ -82,6 +89,8 @@ def build_cache_params(
     unlabeled_fg_enabled: bool = True,
     unlabeled_fg_threshold: float = 0.05,
     unlabeled_fg_bbox_threshold: float = 0.15,
+    primary_target: Optional[str] = None,
+    unlabeled_fg_volume_ids: Optional[Sequence[str]] = None,
 ) -> PatchCacheParams:
     """Build cache params from individual arguments."""
     return PatchCacheParams(
@@ -95,6 +104,9 @@ def build_cache_params(
         unlabeled_fg_enabled=bool(unlabeled_fg_enabled),
         unlabeled_fg_threshold=float(unlabeled_fg_threshold),
         unlabeled_fg_bbox_threshold=float(unlabeled_fg_bbox_threshold),
+        primary_target=None if primary_target is None else str(primary_target),
+        unlabeled_fg_volume_ids=(tuple(sorted(set(unlabeled_fg_volume_ids or ())))
+                                 if unlabeled_fg_enabled else ()),
     )
 
 
@@ -227,6 +239,8 @@ def try_load_patch_cache(
     unlabeled_fg_enabled: bool = True,
     unlabeled_fg_threshold: float = 0.05,
     unlabeled_fg_bbox_threshold: float = 0.15,
+    primary_target: Optional[str] = None,
+    unlabeled_fg_volume_ids: Optional[Sequence[str]] = None,
 ) -> Optional[PatchCacheData]:
     """
     Convenience function to build cache params and load cache if it exists.
@@ -256,6 +270,15 @@ def try_load_patch_cache(
     unlabeled_fg_bbox_threshold : float
         Min bbox coverage for image data.
 
+    primary_target : Optional[str]
+        Primary label target used for patch discovery. None retains
+        legacy unscoped keys for direct metadata API callers.
+
+    unlabeled_fg_volume_ids : Optional[Sequence[str]]
+        Image-volume selection for unlabeled foreground. None/empty
+        means unrestricted; order/duplicates do not change the key.
+        Enabled keys deliberately invalidate old untagged caches.
+
     Returns
     -------
     Optional[PatchCacheData]
@@ -272,5 +295,7 @@ def try_load_patch_cache(
         unlabeled_fg_enabled=unlabeled_fg_enabled,
         unlabeled_fg_threshold=unlabeled_fg_threshold,
         unlabeled_fg_bbox_threshold=unlabeled_fg_bbox_threshold,
+        primary_target=primary_target,
+        unlabeled_fg_volume_ids=unlabeled_fg_volume_ids,
     )
     return load_patch_cache(cache_dir, params)
