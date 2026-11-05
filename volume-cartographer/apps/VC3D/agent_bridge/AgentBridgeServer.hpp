@@ -241,6 +241,18 @@ private:
     QJsonObject handleObjectsImport(const QJsonValue& params);
     QJsonObject handleObjectsExport(const QJsonValue& params);
     void completeImportJob(const StoreImportOutcome& outcome);
+    // Store references and routing, Save As, and the project's resource
+    // entries (AgentBridgeHandlers_stores.cpp).
+    QJsonObject handleStoresAttach(const QJsonValue& params);
+    QJsonObject handleStoresCreate(const QJsonValue& params);
+    QJsonObject handleStoresDetach(const QJsonValue& params);
+    QJsonObject handleStoresRoute(const QJsonValue& params);
+    QJsonObject handleProjectSaveAs(const QJsonValue& params);
+    QJsonObject handleProjectAttachNormalGrid(const QJsonValue& params);
+    QJsonObject handleProjectAttachLasagnaManifest(const QJsonValue& params);
+    QJsonObject handleProjectDetachEntry(const QJsonValue& params);
+    QJsonObject handleUmbilicusImport(const QJsonValue& params);
+    QJsonObject handleUmbilicusRemove(const QJsonValue& params);
     // Tags, seeding, push/pull, and tracing.
     QJsonObject handleTagsSet(const QJsonValue& params);
     QJsonObject handleSeedingSetWindingAnnotationMode(const QJsonValue& params);

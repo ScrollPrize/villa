@@ -168,3 +168,12 @@ stores. `vc3d_get_state` lists the store references (`stores`, each with
 - **Export by UUID**: `vc3d_export_object(uuid, path)` takes a segment id or
   the `uuid` from `vc3d_fiber_list` / `vc3d_list_points` (next to the numeric
   ids). The parent directory must exist; pending edits are saved first.
+- **Detach is not delete.** `vc3d_detach_store` and
+  `vc3d_detach_project_entry` only drop the project's reference; files and
+  stored objects stay. `vc3d_remove_umbilicus` is the exception: it retires
+  the umbilicus *in the store*, for every project sharing it — use
+  `vc3d_route_store(kind="umbilicus", store_id=None)` to hide it for this
+  project only.
+- **Store switches save first.** Route, detach and Save As save pending
+  edits before switching and fail `-32004` (changing nothing) while growth
+  or a line optimization runs; finish or wait for those first.

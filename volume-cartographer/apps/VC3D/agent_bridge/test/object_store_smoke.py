@@ -151,6 +151,7 @@ def main():
             render(client, root, user_surface, registered_surface)
             surfaces(client, database, user_surface, catalog_surface)
             legacy = objects(client, root, database, side, user_surface, uuid)
+            routed(client, root, legacy)
         finally:
             client.close()
             process.terminate()
@@ -389,6 +390,21 @@ def objects(client, root, database, side, surface, fiber):
     print(f"Objects: export/re-import of each kind, namespace-stable legacy import, binding and "
           f"cancellation ({status['state']} with {report['ingested']} of 40)", flush=True)
     return derived['auto_grown_a']
+
+
+def routed(client, root, surface):
+    """Objects imported into another store show once that store is routed for their kind."""
+    assert surface not in listed_surfaces(client, set())
+    result, _ = client.call('stores.route', {'kind': 'surface', 'storeId': 'side'}, timeout=120)
+    assert result['routes']['surface'] == 'side', result
+    rows = listed_surfaces(client, {surface})
+    assert rows[surface]['store'] == 'side' and rows[surface]['bound'], rows[surface]
+    activated, _ = client.call('segments.activate', {'segmentId': surface}, timeout=120)
+    assert activated['segment']['store'] == 'side', activated
+    shot, _ = client.call('screenshot.capture', {'filePath': str(root / 'imported.png')}, timeout=120)
+    assert (root / 'imported.png').stat().st_size > 0, shot
+    client.call('stores.route', {'kind': 'surface', 'storeId': 'main'}, timeout=120)
+    print('Routing the import store lists and activates the imported surface', flush=True)
 
 
 def render(client, root, *surface_ids):

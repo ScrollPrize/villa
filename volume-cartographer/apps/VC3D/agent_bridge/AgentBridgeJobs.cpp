@@ -260,6 +260,9 @@ bool AgentBridgeServer::jobIsRunning(const QString& source) const
         if (source == QLatin1String("import") && _window->_storeImportController &&
             _window->_storeImportController->inFlight())
             return true;
+        if (source == QLatin1String("manifest") && _window->_menuController &&
+            _window->_menuController->lasagnaManifestAttachmentInFlight())
+            return true;
     }
     return false;
 }
@@ -760,7 +763,7 @@ QJsonObject AgentBridgeServer::handleJobCancel(const QJsonValue& params)
         _window->_cmdRunner->cancel();
     } else {
         // growth (QtConcurrent future, no cancel), flatten (self-owned job with no
-        // reachable cancel handle), catalog, volume, autosave, export:
+        // reachable cancel handle), catalog, volume, autosave, export, manifest:
         // no safe cancel authority.
         QJsonObject data;
         data["kind"] = "job";

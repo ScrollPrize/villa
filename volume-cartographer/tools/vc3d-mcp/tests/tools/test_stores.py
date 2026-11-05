@@ -11,7 +11,11 @@ from typing import Any
 
 from tests.support import FakeBridgeServer
 from vc3d_mcp import core
-from vc3d_mcp.tools.stores import vc3d_import_objects
+from vc3d_mcp.tools.stores import (
+    vc3d_import_objects,
+    vc3d_import_umbilicus,
+    vc3d_route_store,
+)
 
 PARTIAL_REPORT = {
     "store": "side",
@@ -79,6 +83,14 @@ class StoreToolsTest(unittest.IsolatedAsyncioTestCase):
         )
         await vc3d_import_objects("fiber", "/data/fibers")
         self.assertEqual(self.fake.params_for("objects.import"), {"kind": "fiber", "path": "/data/fibers"})
+
+    async def test_route_sends_null_store(self) -> None:
+        await vc3d_route_store("umbilicus", None)
+        self.assertEqual(self.fake.params_for("stores.route"), {"kind": "umbilicus", "storeId": None})
+
+    async def test_umbilicus_units_are_optional(self) -> None:
+        await vc3d_import_umbilicus("/data/umbilicus.json")
+        self.assertEqual(self.fake.params_for("umbilicus.import"), {"path": "/data/umbilicus.json", "replace": False})
 
     async def test_wait_returns_failed_partial_report_promptly(self) -> None:
         result = await asyncio.wait_for(

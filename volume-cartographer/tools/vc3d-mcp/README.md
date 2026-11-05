@@ -217,7 +217,9 @@ Inline screenshots cross the local bridge as base64. For large captures, pass
 
 Tool names use a `vc3d_` prefix and snake_case. The surface includes:
 
-- project creation, attached volumes, and the Open Data catalog;
+- project creation and Save As, attached volumes, normal grids, Lasagna
+  datasets and umbilici, store attachment and routing, and the Open Data
+  catalog;
 - viewer navigation, screenshots, render settings, and volume overlays;
 - segment loading, growth, editing, refinement, and review;
 - points, tags, winding annotations, seeding, and push/pull;
@@ -309,6 +311,53 @@ source.
 fiber file that declares no coordinates stays unbound unless `bind` is given.
 `vc3d_fiber_export` still writes every fiber of the fiber store as one
 collection file; `vc3d_export_object` writes one fiber.
+
+### Projects, stores and resources
+
+A project can start without a volume:
+`vc3d_create_project(path=...)` reports `"volume": null`, and segments are
+listed and rendered once a volume is attached (`vc3d_attach_volume`).
+`vc3d_get_state` reports the project's `stores`, `routes`, its detachable
+`project.entries`, the current volume's `umbilicus`, and the `author` edits
+are recorded under (`authorConfigured` says whether the username setting
+names one).
+
+Use another store for one kind of object:
+
+```text
+vc3d_attach_store(path="/data/team.vcobj")            # or vc3d_create_store(path=...)
+vc3d_route_store(kind="surface", store_id=<storeId>)  # one kind per call
+vc3d_route_store(kind="surface", store_id=None)       # stop showing surfaces
+vc3d_detach_store(store_id=<storeId>)                 # drop the reference
+```
+
+Attaching and creating never change routing, and each route call persists
+on its own. Routing chooses what is shown and where new objects go; edits of
+an existing object stay in the store holding it. Route, detach and Save As
+first save pending edits (point collections, the open segment, idle fiber
+sessions) and are refused with -32004 while growth or a line optimization
+runs or a save fails; nothing changes then.
+
+Attach and detach project resources:
+
+```text
+vc3d_attach_normal_grid(location="/data/normal_grids")
+vc3d_attach_lasagna_manifest(location="s3://.../x.lasagna.json", role="fiber", wait=True)
+vc3d_get_state()                                       # project.entries: {kind, location, scope}
+vc3d_detach_project_entry(location=<an entries location>)
+vc3d_save_project_as(path="/work/copy.vcproj")         # shares the stores
+```
+
+Detaching an entry or a store removes the project's reference only: the
+volume, grid, dataset or `.vcobj` and its objects stay where they are.
+Removing an umbilicus is different:
+
+```text
+vc3d_import_umbilicus(path="/data/umbilicus.json")    # -32602 with data.inferred when the frame must be confirmed
+vc3d_import_umbilicus(path="/data/umbilicus.json", units_per_voxel=1, replace=True)
+vc3d_remove_umbilicus()                                # retires it in the store, for every project using it
+vc3d_route_store(kind="umbilicus", store_id=None)      # hide umbilici in this project only
+```
 
 ### Waiting for jobs
 
