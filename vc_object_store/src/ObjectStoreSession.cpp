@@ -360,18 +360,37 @@ std::vector<ArtifactFile> ObjectStoreSession::materializeArtifacts(const Attachm
                                                                   const std::optional<int64_t>& version)
 {
     const auto files = artifacts(identity, objectUuid, version);
+    for (const auto& file : files) writeArtifact(identity, file, destination / std::filesystem::path(file.name));
+    return files;
+}
+
+void ObjectStoreSession::writeArtifact(const AttachmentIdentity& identity, const ArtifactFile& file,
+                                       const std::filesystem::path& target)
+{
     withAttachment(identity, false, [&](Attachment& attachment) {
-        for (const auto& file : files) {
-            const auto target = destination / std::filesystem::path(file.name);
-            std::filesystem::create_directories(target.parent_path());
-            if (attachment.remote) { attachment.remote->client().fetchArtifact(file, target); continue; }
-            auto& store = attachment.store();
-            detail::writeArtifactFile({file.name, file.sha256, file.length}, target, uint64_t(32) << 20,
-                                      [&](uint64_t offset, uint64_t count) { return store.readArtifact(file.sha256, offset, count); });
-        }
+        std::filesystem::create_directories(target.parent_path());
+        if (attachment.remote) { attachment.remote->client().fetchArtifact(file, target); return 0; }
+        auto& store = attachment.store();
+        detail::writeArtifactFile({file.name, file.sha256, file.length}, target, uint64_t(32) << 20,
+                                  [&](uint64_t offset, uint64_t count) { return store.readArtifact(file.sha256, offset, count); });
         return 0;
     });
-    return files;
+}
+
+std::optional<std::filesystem::path> ObjectStoreSession::artifactFile(const AttachmentIdentity& identity,
+                                                                      const std::string& objectUuid, const std::string& name,
+                                                                      const std::filesystem::path& cacheDirectory,
+                                                                      const std::optional<int64_t>& version)
+{
+    const auto files = artifacts(identity, objectUuid, version);
+    const auto file = std::find_if(files.begin(), files.end(), [&](const auto& f) { return f.name == name; });
+    if (file == files.end()) return std::nullopt;
+    // Content-addressed: a complete file at its path is that content (writes are atomic and verified).
+    const auto target = cacheDirectory / file->sha256 / std::filesystem::path(file->name).filename();
+    std::error_code error;
+    if (!std::filesystem::is_regular_file(target, error) || std::filesystem::file_size(target, error) != file->length || error)
+        writeArtifact(identity, *file, target);
+    return target;
 }
 
 TransactionReceipt ObjectStoreSession::publishArtifacts(const AttachmentIdentity& identity, const std::string& objectUuid,
@@ -392,12 +411,16 @@ TransactionReceipt ObjectStoreSession::publishArtifacts(const AttachmentIdentity
     });
     std::vector<ArtifactFile> listed;
     for (auto& [name, file] : manifest) listed.push_back(std::move(file));
-    const auto status = this->status(identity);
     TransactionRequest request;
-    request.requestUuid = util::newUuid();
-    request.storeUuid = status.storeUuid;
-    request.generation = status.generation;
-    request.author = author;
+    if (author.empty()) {
+        request = newRequest(identity);
+    } else {
+        const auto status = this->status(identity);
+        request.requestUuid = util::newUuid();
+        request.storeUuid = status.storeUuid;
+        request.generation = status.generation;
+        request.author = author;
+    }
     request.expectedObjects = {{uuid, expectedVersion}};
     request.operations = {SetMetaOp{uuid, kArtifactsMetaKey, artifactManifestJson(std::move(listed))}};
     return submit(identity, request);

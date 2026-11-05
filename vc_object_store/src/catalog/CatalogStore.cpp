@@ -299,19 +299,9 @@ CatalogStoreReport refreshCatalog(ObjectStoreSession& session, const AttachmentI
     return report;
 }
 
-fs::path publishedFile(ObjectStoreSession& session, const AttachmentIdentity& attachment, const std::string& objectUuid,
-                       const std::string& name)
+fs::path fetchPublishedFile(const CatalogFile& file, const fs::path& target)
 {
-    std::optional<CatalogReference> reference;
-    session.read(attachment, [&](const auto& store, const auto& txn, const auto&) {
-        if (const auto record = store.objectByUuid(txn, objectUuid)) reference = catalogReference(*record);
-    });
-    if (!reference) throw std::runtime_error("not a catalog surface: " + objectUuid);
-    const auto file = std::find_if(reference->files.begin(), reference->files.end(),
-                                   [&](const auto& f) { return f.name == name; });
-    if (file == reference->files.end()) throw std::runtime_error("no published file " + name + " for " + objectUuid);
-    const auto target = session.artifactDirectory(attachment, objectUuid) / file->name;
-    if (!fs::is_regular_file(target)) detail::downloadFile(file->url, target);
+    if (!fs::is_regular_file(target)) detail::downloadFile(file.url, target);
     return target;
 }
 

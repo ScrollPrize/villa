@@ -244,10 +244,17 @@ int main() try
     session.ensureGeometry(catalog, offline);
     require(local(offline), "retried on the next read");
 
-    // Published files land in the artifact directory.
-    const auto ink = publishedFile(session, catalog, uuid, "ink-detection.jpg");
-    require(fs::is_regular_file(ink) && ink.parent_path() == session.artifactDirectory(catalog, uuid, false),
-            "published image fetched");
+    // Published files are fetched to where the caller keeps them; the store is not written.
+    std::optional<CatalogFile> published;
+    session.readStore(catalog, [&](const StoreReader& reader, const auto&) {
+        for (const auto& file : catalogReference(reader.currentObject(uuid)->record)->files)
+            if (file.name == "ink-detection.jpg") published = file;
+    });
+    const auto target = directory.path / "published" / "ink-detection.jpg";
+    require(published && fetchPublishedFile(*published, target) == target && fs::is_regular_file(target) &&
+            !fs::exists(session.artifactDirectory(catalog, uuid, false)), "published image fetched");
+    const auto written = fs::last_write_time(target);
+    require(fetchPublishedFile(*published, target) == target && fs::last_write_time(target) == written, "fetched once");
 
     // Editing a fetched surface edits it in place; resetting restores the fetched version.
     std::string firstRevision;

@@ -38,6 +38,11 @@ public:
     // read in stored units (writing a mapped grid back would rewrite every
     // stored coordinate). Throws otherwise.
     PinnedObject writable(const std::string& uuid);
+    // Publish local files (name, path) as artifacts of `uuid`
+    // (ObjectStoreSession::publishArtifacts), expecting the version this tool
+    // read it at, else its current version (an object the tool created).
+    TransactionReceipt publishArtifacts(const std::string& uuid,
+                                        const std::vector<std::pair<std::string, std::filesystem::path>>& files);
     // The tool wrote to the store (finish waits for the hub then).
     void wrote() { wrote_ = true; }
     // Drain writes and, after any, wait until they reached the hub (no-op for

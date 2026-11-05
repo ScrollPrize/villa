@@ -213,9 +213,15 @@ Artifacts work the same way on every attachment. `artifacts(attachment, object,
 version)` lists an object version's manifest. `materializeArtifacts` writes those
 files under a local directory, each one atomic and verified.
 `publishArtifacts(attachment, object, expectedVersion, files, author)` stores the
-bytes durably, then names them in the manifest in one checked request.
-`artifactDirectory` (a shared directory) remains for local attachments until its
-callers move.
+bytes durably, then names them in the manifest in one checked request (an empty
+author is the attachment's). `artifactFile(attachment, object, name,
+cacheDirectory)` returns one artifact as a local file kept by content
+(`<cacheDirectory>/<sha256>/<file name>`, written unless it is there); Lasagna's
+service reads fitted models this way. Command-line tools publish through
+`ToolObjects::publishArtifacts`, expecting the version they read (or the
+current version of an object they created). `artifactDirectory` (a shared
+directory) remains only for hub replicas and project copies; it goes with the
+hub (phase 5).
 
 ### Durable drafts
 
@@ -380,8 +386,9 @@ names bytes the store does not hold. This check runs whichever API wrote the
 manifest, typed request or direct `setMeta`. Bytes are never deleted while
 the store is in use, because historical versions keep naming them. A backup
 copies this directory with the database. The older mutable per-object
-directories (`ObjectStoreSession::artifactDirectory`) remain until their
-consumers move.
+directories (`ObjectStoreSession::artifactDirectory`) are no longer read or
+written by VC3D, the command-line tools or Lasagna; files left in them by
+earlier versions are not migrated.
 
 ### Hosting a store (`vc_object_server`)
 

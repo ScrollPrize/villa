@@ -629,6 +629,15 @@ void bindSessionOperations(nb::class_<vo::ObjectStoreSession> session)
             { nb::gil_scoped_release release; files = self.materializeArtifacts(attachment, uuid, destination, version); }
             return filesPy(files);
         }, nb::arg("attachment"), nb::arg("object_uuid"), nb::arg("destination"), nb::arg("version") = std::nullopt)
+        .def("artifact_file", [=](Session& self, const vo::AttachmentIdentity& attachment, const std::string& uuid,
+                                  const std::string& name, const std::filesystem::path& cacheDirectory,
+                                  const std::optional<int64_t>& version) -> nb::object {
+            std::optional<std::filesystem::path> path;
+            { nb::gil_scoped_release release; path = self.artifactFile(attachment, uuid, name, cacheDirectory, version); }
+            return path ? nb::cast(*path) : nb::none();
+        }, nb::arg("attachment"), nb::arg("object_uuid"), nb::arg("name"), nb::arg("cache_directory"),
+           nb::arg("version") = std::nullopt,
+           "One artifact as a local file under cache_directory/<sha256>/ (written unless there); None without it.")
         .def("publish_artifacts", [=](Session& self, const vo::AttachmentIdentity& attachment, const std::string& uuid,
                                       int64_t expectedVersion, const std::map<std::string, std::filesystem::path>& files,
                                       const std::string& author) {
@@ -636,7 +645,7 @@ void bindSessionOperations(nb::class_<vo::ObjectStoreSession> session)
             vo::TransactionReceipt receipt;
             { nb::gil_scoped_release release; receipt = self.publishArtifacts(attachment, uuid, expectedVersion, list, author); }
             return receiptPy(receipt);
-        }, nb::arg("attachment"), nb::arg("object_uuid"), nb::arg("expected_version"), nb::arg("files"), nb::arg("author"),
+        }, nb::arg("attachment"), nb::arg("object_uuid"), nb::arg("expected_version"), nb::arg("files"), nb::arg("author") = "",
            "Store {name: local path} durably and name them in the object's manifest in one checked request.")
         .def("use_draft_directory", [](Session& self, const std::filesystem::path& directory) {
             vo::DraftRecovery recovery;

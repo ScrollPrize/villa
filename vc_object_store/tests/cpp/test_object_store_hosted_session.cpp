@@ -297,6 +297,15 @@ try {
         session.materializeArtifacts(attachment, object, out);
         std::ifstream in(out / "model" / "weights.bin", std::ios::binary);
         require(std::string(std::istreambuf_iterator<char>(in), {}) == "weights for " + object, "materialized bytes");
+        // One artifact as a cached local file, kept by content.
+        const auto cache = directory.path / ("artifact-cache-" + object);
+        const auto copy = session.artifactFile(attachment, object, "model/weights.bin", cache);
+        require(copy && *copy == cache / files[0].sha256 / "weights.bin" && std::filesystem::file_size(*copy) == files[0].length &&
+                !session.artifactFile(attachment, object, "missing.bin", cache) &&
+                !session.artifactFile(attachment, object, "model/weights.bin", cache, version), "artifact file");
+        const auto written = std::filesystem::last_write_time(*copy);
+        require(session.artifactFile(attachment, object, "model/weights.bin", cache) == copy &&
+                std::filesystem::last_write_time(*copy) == written, "cached artifact file kept");
     }
     (void)session.takeEvents();
     const auto committed = session.geometryRegion(order, plane(10.25), surfaces());

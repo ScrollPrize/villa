@@ -279,12 +279,19 @@ public:
     std::vector<ArtifactFile> materializeArtifacts(const AttachmentIdentity&, const std::string& objectUuid,
                                                    const std::filesystem::path& destination,
                                                    const std::optional<int64_t>& version = std::nullopt);
+    // One artifact as a local file, kept by content: <cacheDirectory>/<sha256>/
+    // <file name of `name`>, written (verified) unless it is there. nullopt
+    // when that version of the object has no artifact of that name.
+    std::optional<std::filesystem::path> artifactFile(const AttachmentIdentity&, const std::string& objectUuid,
+                                                      const std::string& name, const std::filesystem::path& cacheDirectory,
+                                                      const std::optional<int64_t>& version = std::nullopt);
     // Stores each (name, local file) durably, then names them in the object's
     // manifest (replacing entries of the same names) in one checked request
-    // that expects `expectedVersion` of the object; returns its receipt.
+    // that expects `expectedVersion` of the object; returns its receipt. An
+    // empty author is the attachment's (newRequest).
     TransactionReceipt publishArtifacts(const AttachmentIdentity&, const std::string& objectUuid, int64_t expectedVersion,
                                         const std::vector<std::pair<std::string, std::filesystem::path>>& files,
-                                        const std::string& author);
+                                        const std::string& author = {});
     // Writes by a geometry fetcher (setGeometryFetcher) on a writable attachment.
     using FetchWrite = std::function<RevisionSelection(const RevisionSelection& expected, const Action&)>;
     // Fetches one object's geometry and writes it with `write`; throws when it
@@ -497,6 +504,7 @@ private:
     Drafts drafts() const;
     void draftChanged(const std::string& objectUuid, const std::optional<AttachmentIdentity>&);
     std::unique_ptr<detail::DurableDrafts> durable_;
+    void writeArtifact(const AttachmentIdentity&, const ArtifactFile&, const std::filesystem::path& target);
     TransactionReceipt sendPending(const AttachmentIdentity&, const TransactionRequest&, const std::string& requestUuid);
     // Applies a pending submission's outcome (receipt, or the reason nothing
     // committed) to its drafts and forgets it.

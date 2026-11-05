@@ -1,4 +1,5 @@
 #include "vc_object_store/objects/ToolObjects.hpp"
+#include "vc_object_store/Uuid.hpp"
 
 #include <cstdlib>
 #include <set>
@@ -12,6 +13,24 @@ ToolObjects::ToolObjects(const std::filesystem::path& store, const std::string& 
     const char* user = std::getenv("USER");
     options.author = user && *user ? user : tool;
     attachment_ = session_->attach(store, options);
+}
+
+TransactionReceipt ToolObjects::publishArtifacts(const std::string& uuid,
+                                                const std::vector<std::pair<std::string, std::filesystem::path>>& files)
+{
+    std::optional<int64_t> version;
+    {
+        std::lock_guard lock(mutex_);
+        if (const auto read = read_.find(util::canonicalUuid(uuid)); read != read_.end()) version = read->second.pin.version;
+    }
+    if (!version) {
+        const auto current = session_->currentObject(attachment_, uuid);
+        if (!current) throw std::runtime_error("no object " + uuid + " to publish artifacts of");
+        version = current->version;
+    }
+    auto receipt = session_->publishArtifacts(attachment_, uuid, *version, files);
+    wrote_ = true;
+    return receipt;
 }
 
 void ToolObjects::noteRead(const PinnedObject& pin, const std::optional<VolumeVoxels>& volume, bool identity)
