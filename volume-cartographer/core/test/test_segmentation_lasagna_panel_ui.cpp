@@ -24,6 +24,7 @@
 
 #include "CState.hpp"
 #include "LasagnaServiceManager.hpp"
+#include <vc_object_store/objects/TransactionJson.hpp>
 #include <vc_object_store/objects/GeometryCoordinates.hpp>
 #include <vc_object_store/store/GeometryViews.hpp>
 #include "SurfaceCatalog.hpp"
@@ -206,15 +207,16 @@ int main(int argc, char** argv)
     auto addSurface = [&](const std::string& name, nlohmann::json meta) {
         const auto uuid = vo::util::newUuid();
         meta.update(nlohmann::json{{"coordinates", vc::objects::volumeCoordinates(volume->id(), 1)}});
-        session->act(attachment, {{uuid, std::nullopt}}, [&](auto& db, auto& txn) {
-            vo::ObjectRecord record;
-            record.uuid = uuid;
-            record.kind = "surface";
-            record.name = name;
-            record.meta = meta.dump();
-            db.upsertObject(txn, record);
-            db.putGeometry(txn, uuid, quad_surface_geometry(grid));
-        });
+        vo::ObjectRecord record;
+        record.uuid = uuid;
+        record.kind = "surface";
+        record.name = name;
+        record.meta = meta.dump();
+        auto request = session->newRequest(attachment);
+        request.expectedObjects = {{uuid, std::nullopt}};
+        request.operations.push_back(vo::CreateObjectOp{vo::objectRecordJson(record)});
+        request.operations.push_back(vo::PutGeometryOp{uuid, quad_surface_geometry(grid), {}});
+        session->submit(attachment, request);
         return uuid;
     };
     const auto referenceUuid = addSurface("reference_surface", nlohmann::json::object());

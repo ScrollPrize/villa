@@ -62,11 +62,12 @@ int runSurfacePanelStoreTests()
         QuadSurface grid(points, {1.f, 1.f});
         auto add = [&](const std::string& name, std::vector<std::string> tags, bool bound) {
             const auto uuid = util::newUuid();
-            state.objectStoreSession()->act(attachment, {{uuid, std::nullopt}}, [&](auto& db, auto& txn) {
-                vc::objects::createSurface(db, txn, uuid, name, tags,
-                                           bound ? vc::objects::volumeCoordinates(volume->id(), 1) : nlohmann::json::object(),
-                                           {"surface-panel-test"}, grid.meta, quad_surface_geometry(grid));
-            });
+            auto request = state.objectStoreSession()->newRequest(attachment);
+            request.expectedObjects = {{uuid, std::nullopt}};
+            request.operations = vc::objects::createSurfaceOperations(uuid, name, tags,
+                bound ? vc::objects::volumeCoordinates(volume->id(), 1) : nlohmann::json::object(),
+                {"surface-panel-test"}, grid.meta, quad_surface_geometry(grid));
+            state.objectStoreSession()->submit(attachment, request);
             return uuid;
         };
         const auto approved = add("approved", {"approved"}, true);
@@ -283,10 +284,13 @@ int runViewerRegressionTests()
             for (int c = 0; c < 3; ++c) points(r, c) = {float(c), float(r), 2};
         QuadSurface grid(points, {1, 1});
         const auto plain = util::newUuid();
-        state.objectStoreSession()->act(attachment, {{plain, std::nullopt}}, [&](auto& db, auto& txn) {
-            vc::objects::createSurface(db, txn, plain, "surface", {}, volumeCoordinates(volume->id(), 1), {"viewer-test"},
-                                       grid.meta, quad_surface_geometry(grid));
-        });
+        {
+            auto request = state.objectStoreSession()->newRequest(attachment);
+            request.expectedObjects = {{plain, std::nullopt}};
+            request.operations = vc::objects::createSurfaceOperations(plain, "surface", {}, volumeCoordinates(volume->id(), 1),
+                                                                      {"viewer-test"}, grid.meta, quad_surface_geometry(grid));
+            state.objectStoreSession()->submit(attachment, request);
+        }
         SurfaceCatalog catalog(state.objectStoreSession());
         catalog.setSource(attachment, volume, {volume->id()});
         SurfaceTreeWidget tree;

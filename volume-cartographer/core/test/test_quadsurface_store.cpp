@@ -10,6 +10,8 @@
 #include <vc_object_store/objects/Hub.hpp>
 #include <vc_object_store/store/GeometryViews.hpp>
 #include <vc_object_store/objects/StoreReader.hpp>
+#include <vc_object_store/objects/TransactionJson.hpp>
+#include <vc_object_store/objects/VolumeTransforms.hpp>
 #include <vc_object_store/Uuid.hpp>
 
 #include <opencv2/core.hpp>
@@ -35,8 +37,16 @@ struct Store {
     ~Store() { session.reset(); std::error_code ignored; fs::remove_all(dir, ignored); }
     std::string head(const std::string& uuid) {
         std::string result;
-        session->read(attachment, [&](const auto& db, const auto& txn, const auto&) { result = db.currentGeometry(txn, uuid)->uuid; });
+        session->readStore(attachment, [&](const StoreReader& reader, const auto&) { result = reader.currentGeometry(uuid)->uuid; });
         return result;
+    }
+    // A new object `record` (its uuid expected absent) holding `geometry`, in one checked request.
+    void create(const ObjectRecord& record, const vc::objects::GeometryData& geometry) {
+        auto request = session->newRequest(attachment);
+        request.expectedObjects = {{record.uuid, std::nullopt}};
+        request.operations.push_back(vc::objects::CreateObjectOp{vc::objects::objectRecordJson(record)});
+        request.operations.push_back(vc::objects::PutGeometryOp{record.uuid, geometry, {}});
+        session->submit(attachment, request);
     }
     // One checked request editing an existing surface at its current version:
     // `build` adds its operations, reading through the reader.
@@ -59,8 +69,8 @@ struct Store {
 cv::Vec3f stored(Store& store, const std::string& uuid, int row, int col)
 {
     cv::Vec3f result;
-    store.session->read(store.attachment, [&](const auto& db, const auto& txn, const auto&) {
-        const auto bytes = db.readGeometryRectangle(txn, db.currentGeometry(txn, uuid)->uuid, "points", row, col, 1, 1);
+    store.session->readStore(store.attachment, [&](const StoreReader& reader, const auto&) {
+        const auto bytes = reader.readGeometryRectangle(reader.currentGeometry(uuid)->uuid, "points", row, col, 1, 1);
         std::memcpy(result.val, bytes.data(), 12);
     });
     return result;
@@ -68,8 +78,8 @@ cv::Vec3f stored(Store& store, const std::string& uuid, int row, int col)
 uint8_t storedValid(Store& store, const std::string& uuid, int row, int col)
 {
     uint8_t result = 0;
-    store.session->read(store.attachment, [&](const auto& db, const auto& txn, const auto&) {
-        result = db.readGeometryRectangle(txn, db.currentGeometry(txn, uuid)->uuid, "valid", row, col, 1, 1).at(0);
+    store.session->readStore(store.attachment, [&](const StoreReader& reader, const auto&) {
+        result = reader.readGeometryRectangle(reader.currentGeometry(uuid)->uuid, "valid", row, col, 1, 1).at(0);
     });
     return result;
 }
@@ -90,11 +100,10 @@ TEST_CASE("QuadSurface round trip through the object store")
     source.setChannel("generations", generations);
 
     const auto uuid = util::newUuid();
-    store.session->act(store.attachment, {{uuid, std::nullopt}}, [&](auto& db, auto& txn) {
+    {
         ObjectRecord record; record.uuid = uuid; record.kind = "surface"; record.name = "sheet"; record.tags = {"approved"};
-        db.upsertObject(txn, record);
-        db.putGeometry(txn, uuid, quad_surface_geometry(source));
-    });
+        store.create(record, quad_surface_geometry(source));
+    }
 
     auto loaded = store.load(uuid);
     CHECK(loaded->id == uuid);
@@ -156,11 +165,8 @@ TEST_CASE("A stored multi-component surface does not interpolate across its seam
     Store store;
     const auto put = [&](const char* meta) {
         const auto uuid = util::newUuid();
-        store.session->act(store.attachment, {{uuid, std::nullopt}}, [&](auto& db, auto& txn) {
-            ObjectRecord record; record.uuid = uuid; record.kind = "surface"; record.meta = meta;
-            db.upsertObject(txn, record);
-            db.putGeometry(txn, uuid, quad_surface_geometry(source));
-        });
+        ObjectRecord record; record.uuid = uuid; record.kind = "surface"; record.meta = meta;
+        store.create(record, quad_surface_geometry(source));
         return uuid;
     };
     // Rendered depth along the middle row, across the seam between columns 7 and 8.
@@ -193,11 +199,10 @@ TEST_CASE("A stored vertex without coordinates loads as missing")
     GeometryArray points{"points", "<f4", {1, 3, 3}, std::vector<uint8_t>(xyz.size() * 4)};
     std::memcpy(points.bytes.data(), xyz.data(), points.bytes.size());
     data.arrays.push_back(points);
-    store.session->act(store.attachment, {{uuid, std::nullopt}}, [&](auto& db, auto& txn) {
+    {
         ObjectRecord record; record.uuid = uuid; record.kind = "surface";
-        db.upsertObject(txn, record);
-        db.putGeometry(txn, uuid, data);
-    });
+        store.create(record, data);
+    }
     const auto loaded = store.load(uuid);
     CHECK((*loaded->rawPointsPtr())(0, 0) == cv::Vec3f(1, 2, 3));
     CHECK((*loaded->rawPointsPtr())(0, 1) == cv::Vec3f(-1, -1, -1));
@@ -214,12 +219,11 @@ TEST_CASE("A view hides stored z <= 0 vertices and keeps them on save")
     // Written as stored bytes: a tracer extrapolation below z = 0, marked valid.
     auto data = quad_surface_geometry(surface);
     std::memcpy(data.arrays.front().bytes.data() + 3 * 12, cv::Vec3f(2, 2, -3).val, 12);
-    store.session->act(store.attachment, {{uuid, std::nullopt}}, [&](auto& db, auto& txn) {
+    {
         ObjectRecord record; record.uuid = uuid; record.kind = "surface";
         record.meta = R"({"coordinates":{"volume_uuid":"vol","scale_factor":0.5}})";
-        db.upsertObject(txn, record);
-        db.putGeometry(txn, uuid, data);
-    });
+        store.create(record, data);
+    }
     std::unique_ptr<QuadSurface> shown;
     store.session->readStore(store.attachment, [&](const StoreReader& reader, const auto&) {
         const auto view = GeometrySnapshot(reader).viewTransformedAt(uuid, "vol");
@@ -263,11 +267,11 @@ TEST_CASE("Tools read surfaces in a bound volume's voxels and write back only st
         CHECK_THROWS(surfaces.update(uuid, *inVolume));
         CHECK_THROWS(surfaces.load(uuid, true, VolumeVoxels{"other-volume"}));
         // A volume registered to "vol" (here shifted by 10 in x) reads through the store's mapping.
-        const auto registration = util::newUuid();
-        surfaces.objects().session()->act(surfaces.objects().attachment(), {{registration, std::nullopt}}, [&](auto& db, auto& txn) {
+        {
             VolumeAffine shift; shift(0, 3) = 10;
-            db.registerVolumeTransform(txn, "vol", "registered", shift, "test registration", registration);
-        });
+            vc::objects::registerVolumeTransform(*surfaces.objects().session(), surfaces.objects().attachment(), "vol",
+                                                 "registered", shift, "test registration");
+        }
         auto registered = surfaces.load(uuid, true, VolumeVoxels{"registered"});
         CHECK((*registered->rawPointsPtr())(1, 1) == cv::Vec3f(11, 1, 4));
         CHECK_THROWS(surfaces.update(uuid, *registered));
@@ -285,8 +289,8 @@ TEST_CASE("Tools read surfaces in a bound volume's voxels and write back only st
         auto coarse = surfaces.load(uuid, true, VolumeVoxels{"vol", 0.5});
         CHECK((*coarse->rawPointsPtr())(1, 1) == cv::Vec3f(0.5f, 0.5f, 2));
         const auto atLevel = surfaces.create(*coarse, "at-level", nlohmann::json::object(), {uuid});
-        surfaces.objects().session()->read(surfaces.objects().attachment(), [&](const auto& db, const auto& txn, const auto&) {
-            CHECK(nlohmann::json::parse(db.objectByUuid(txn, atLevel)->meta).at("coordinates") ==
+        surfaces.objects().session()->readStore(surfaces.objects().attachment(), [&](const StoreReader& reader, const auto&) {
+            CHECK(nlohmann::json::parse(reader.currentObject(atLevel)->record.meta).at("coordinates") ==
                   vc::objects::volumeCoordinates("vol", 0.5));
         });
         CHECK((*surfaces.load(atLevel, true, VolumeVoxels{"vol"})->rawPointsPtr())(1, 1) == cv::Vec3f(1, 1, 4));

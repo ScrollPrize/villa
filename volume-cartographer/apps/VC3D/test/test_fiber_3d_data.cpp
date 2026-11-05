@@ -1,5 +1,6 @@
 #include "fibers3d/Fiber3DData.hpp"
 #include "LineAnnotationGeneratedViews.hpp"
+#include <vc_object_store/objects/StoreReader.hpp>
 #include <vc_object_store/objects/FiberJson.hpp>
 #include <vc_object_store/Uuid.hpp>
 #include <QtTest/QtTest>
@@ -43,7 +44,11 @@ struct Fixture {
              {"hv_classification", {{"automatic_tag", family}}}};
         root.update(extras);
         const auto entry = vc::objects::decodeFiberJson(root.dump());
-        session->act(attachment, {{id, {}}}, [&](auto& db, auto& txn) { vc::objects::ingestGeometryBatch(db, txn, {entry}); });
+        auto request = session->newRequest(attachment);
+        session->readStore(attachment, [&](const vc::objects::StoreReader& reader, const auto&) {
+            vc::objects::addIngestOperation(request, reader, {entry});
+        });
+        session->submit(attachment, request);
         return id;
     }
 };

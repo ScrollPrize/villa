@@ -207,12 +207,14 @@ int runObjectStoreControllerTests()
                     "a volume without a stored umbilicus has none");
             auto add = [&](const std::string& name) {
                 const auto uuid = vc::objects::util::newUuid();
-                state.objectStoreSession()->act(attachment, {{uuid, std::nullopt}}, [&](auto& db, auto& txn) {
-                    ObjectRecord record; record.uuid = uuid; record.kind = "umbilicus"; record.name = name;
-                    record.meta = nlohmann::json{{"coordinates", vc::objects::volumeCoordinates(volume->id(), 2)}}.dump();
-                    db.upsertObject(txn, record);
-                    db.putGeometry(txn, uuid, vc::geometry::encode(vc::geometry::Umbilicus{{{8, 6, 0}, {8, 6, 30}}}));
-                });
+                ObjectRecord record; record.uuid = uuid; record.kind = "umbilicus"; record.name = name;
+                record.meta = nlohmann::json{{"coordinates", vc::objects::volumeCoordinates(volume->id(), 2)}}.dump();
+                auto request = state.objectStoreSession()->newRequest(attachment);
+                request.expectedObjects = {{uuid, std::nullopt}};
+                request.operations.push_back(vc::objects::CreateObjectOp{vc::objects::objectRecordJson(record)});
+                request.operations.push_back(vc::objects::PutGeometryOp{uuid,
+                    vc::geometry::encode(vc::geometry::Umbilicus{{{8, 6, 0}, {8, 6, 30}}}), {}});
+                state.objectStoreSession()->submit(attachment, request);
                 state.pollObjectStoreChanges();
                 return uuid;
             };
@@ -521,10 +523,13 @@ int runObjectStoreControllerTests()
             const auto connection = state.objectStoreSession();
             const auto attachment = *state.storeFor("fiber");
             const auto unrelated = vc::objects::util::newUuid();
-            connection->act(attachment, {{unrelated, std::nullopt}}, [&](auto& db, auto& txn) {
+            {
                 ObjectRecord record; record.uuid = unrelated; record.kind = "point_collection";
-                db.upsertObject(txn, record);
-            });
+                auto request = connection->newRequest(attachment);
+                request.expectedObjects = {{unrelated, std::nullopt}};
+                request.operations.push_back(vc::objects::CreateObjectOp{vc::objects::objectRecordJson(record)});
+                connection->submit(attachment, request);
+            }
             state.pollObjectStoreChanges();
             // Old/foreign attachments must not invalidate this store's fibers.
             StoreSessionEvent foreign{StoreSessionEvent::Kind::Committed,

@@ -1,4 +1,6 @@
 #include <vc_object_store/objects/StoreReader.hpp>
+#include <vc_object_store/objects/TransactionJson.hpp>
+#include <vc_object_store/objects/VolumeTransforms.hpp>
 #include <utility>
 // The VC3D surface catalog over a real object store: rows of the current
 // volume's surfaces kept current from commit events, opening a surface in the
@@ -41,6 +43,16 @@ void require(bool value, const char* message)
 {
     if (!value) throw std::runtime_error(message);
 }
+// A new surface `record` (its uuid expected absent) holding `geometry`, in one checked request.
+void storeSurface(ObjectStoreSession& session, const AttachmentIdentity& attachment, const ObjectRecord& record,
+                  const GeometryData& geometry)
+{
+    auto request = session.newRequest(attachment);
+    request.expectedObjects = {{record.uuid, std::nullopt}};
+    request.operations.push_back(CreateObjectOp{objectRecordJson(record)});
+    request.operations.push_back(PutGeometryOp{record.uuid, geometry, {}});
+    session.submit(attachment, request);
+}
 }
 
 int main(int argc, char** argv)
@@ -65,14 +77,11 @@ int main(int argc, char** argv)
         QuadSurface grid(points, {1.f, 1.f});
         auto add = [&](const std::string& name, const std::optional<nlohmann::json>& coordinates) {
             const auto uuid = util::newUuid();
-            session->act(attachment, {{uuid, std::nullopt}}, [&](auto& db, auto& txn) {
-                ObjectRecord record; record.uuid = uuid; record.kind = "surface"; record.name = name; record.tags = {"approved"};
-                auto meta = nlohmann::json::object();
-                if (coordinates) meta.update(*coordinates);
-                record.meta = meta.dump();
-                db.upsertObject(txn, record);
-                db.putGeometry(txn, uuid, quad_surface_geometry(grid));
-            });
+            ObjectRecord record; record.uuid = uuid; record.kind = "surface"; record.name = name; record.tags = {"approved"};
+            auto meta = nlohmann::json::object();
+            if (coordinates) meta.update(*coordinates);
+            record.meta = meta.dump();
+            storeSurface(*session, attachment, record, quad_surface_geometry(grid));
             return uuid;
         };
         const auto native = add("native", nlohmann::json{{"coordinates", vc::objects::volumeCoordinates(volume->id(), 1)}});
@@ -119,8 +128,8 @@ int main(int argc, char** argv)
             grown(3,1)={2,6,2};
             QuadSurface result(grown,{0.5f,0.5f});
             edit.save(result,cv::Rect(0,0,3,4));
-            session->read(attachment,[&](const auto& db,const auto& txn,const auto&) {
-                require(GeometrySnapshot(db,txn).surface(half).vertex(3,1)==vc::geometry::SurfacePoint{1,3,1},
+            session->readStore(attachment,[&](const vc::objects::StoreReader& reader,const auto&) {
+                require(GeometrySnapshot(reader).surface(half).vertex(3,1)==vc::geometry::SurfacePoint{1,3,1},
                         "growth keeps the opened view binding even when its output has no metadata");
             });
         }
@@ -146,8 +155,8 @@ int main(int argc, char** argv)
             edited.surface->setChannel("mask", mask);
             edit.save(*edited.surface, cv::Rect(0, 0, 3, 3), {"mask"});
             require((*catalog.open(native).surface->rawPointsPtr())(0, 0) == cv::Vec3f(-1, -1, -1), "masked vertices load masked");
-            session->read(attachment, [&](const auto& db, const auto& txn, const auto&) {
-                const auto unmasked = load_quad_from_store(vc::objects::LocalStoreReader(db, txn), native, std::nullopt, false);
+            session->readStore(attachment, [&](const vc::objects::StoreReader& reader, const auto&) {
+                const auto unmasked = load_quad_from_store(reader, native, std::nullopt, false);
                 require((*unmasked->rawPointsPtr())(0, 0) == cv::Vec3f(0, 0, 1), "masking keeps stored coordinates");
             });
             // Growth: another grid size replaces the geometry.
@@ -173,10 +182,10 @@ int main(int argc, char** argv)
             vc3d::corrections::write(*session, attachment, half, saved, {volume->id()});
             auto stored = vc3d::corrections::read(*session, attachment, half);
             require(stored.size() == 1 && stored.begin()->first == fix, "corrections round-trip by collection id");
-            session->read(attachment, [&](const auto& db, const auto& txn, const auto&) {
-                const auto uuid = db.neighbours(txn, half, std::string(vc::objects::kAttachmentEdgeKind)).at(0);
-                require(nlohmann::json::parse(db.objectByUuid(txn, uuid)->meta)["role"] == "corrections" &&
-                            db.neighbours(txn, half).empty(),
+            session->readStore(attachment, [&](const vc::objects::StoreReader& reader, const auto&) {
+                const auto uuid = reader.neighbours(half, std::string(vc::objects::kAttachmentEdgeKind)).at(0);
+                require(nlohmann::json::parse(reader.currentObject(uuid)->record.meta)["role"] == "corrections" &&
+                            reader.neighbours(half).empty(),
                         "corrections are attached data, not graph links");
             });
             PointCollections reloaded;
@@ -221,12 +230,12 @@ int main(int argc, char** argv)
             annotation.afterGeometry = "after";
             annotation.points = {{fix, 2, "fix", {1, 2, 3}, 20}, {fix, 1, "fix", {4, 5, 6}, 10}};
             const auto annotationUuid = vc3d::corrections::writeGrowthAnnotation(*session, attachment, annotation, {volume->id()});
-            session->read(attachment, [&](const auto& db, const auto& txn, const auto&) {
-                const auto object = db.objectByUuid(txn, annotationUuid);
-                require(object && nlohmann::json::parse(object->meta)["source"]["growth_annotation"]["after_geometry"] == "after",
+            session->readStore(attachment, [&](const vc::objects::StoreReader& reader, const auto&) {
+                const auto object = reader.currentObject(annotationUuid);
+                require(object && nlohmann::json::parse(object->record.meta)["source"]["growth_annotation"]["after_geometry"] == "after",
                         "growth annotations record the revisions");
                 const auto points = std::get<vc::geometry::PointCollection>(
-                    vc::geometry::decode(db.readGeometryData(txn, db.currentGeometry(txn, annotationUuid)->uuid)));
+                    vc::geometry::decode(reader.readGeometryData(reader.currentGeometry(annotationUuid)->uuid)));
                 require(points.ids == std::vector<int64_t>{1, 2}, "annotation points keep placement order");
             });
             require(vc3d::corrections::read(*session, attachment, half).empty(), "annotations are not corrections");
@@ -247,10 +256,7 @@ int main(int argc, char** argv)
         // The store supplies registered views; the application only adapts their tiles.
         VolumeAffine affine;
         affine(0,0)=2; affine(0,1)=0.5; affine(0,3)=10; affine(2,3)=20;
-        const auto registration=util::newUuid();
-        session->act(attachment,{{registration,std::nullopt}},[&](auto& db,auto& txn) {
-            db.registerVolumeTransform(txn,"vol2","vol1",affine,"registered scan",registration);
-        });
+        vc::objects::registerVolumeTransform(*session,attachment,"vol2","vol1",affine,"registered scan");
         pump([&]{return catalog.row(other)&&catalog.row(other)->mapping.has_value();},"registration commits refresh compatible surfaces");
         {
             // Area: the store's, in stored units (vol2: the 2x2 unit grid); the
@@ -267,16 +273,13 @@ int main(int argc, char** argv)
         SurfaceStoreEdit registeredEdit(session,registered.pin,registered.view);
         (*registered.surface->rawPointsPtr())(2,1)={15,2,21};
         registeredEdit.save(*registered.surface,cv::Rect(1,2,1,1));
-        session->read(attachment,[&](const auto& db,const auto& txn,const auto&) {
-            require(GeometrySnapshot(db,txn).surface(other).vertex(2,1)==vc::geometry::SurfacePoint{2,2,1},
+        session->readStore(attachment,[&](const vc::objects::StoreReader& reader,const auto&) {
+            require(GeometrySnapshot(reader).surface(other).vertex(2,1)==vc::geometry::SurfacePoint{2,2,1},
                     "registered view edits remain in canonical coordinates");
-            require(nlohmann::json::parse(db.objectByUuid(txn,other)->meta)["coordinates"]["volume_uuid"]=="vol2",
+            require(nlohmann::json::parse(reader.currentObject(other)->record.meta)["coordinates"]["volume_uuid"]=="vol2",
                     "view edits preserve the paired volume");
         });
-        const auto conflicting=util::newUuid();
-        session->act(attachment,{{conflicting,std::nullopt}},[&](auto& db,auto& txn) {
-            db.registerVolumeTransform(txn,"vol2","vol1",VolumeAffine::scale(3),"alternative",conflicting);
-        });
+        vc::objects::registerVolumeTransform(*session,attachment,"vol2","vol1",VolumeAffine::scale(3),"alternative");
         bool staleMapping=false;
         try {registeredEdit.save(*registered.surface,cv::Rect(1,2,1,1));}catch(const std::exception&){staleMapping=true;}
         require(staleMapping,"registration conflicts invalidate writable views");
@@ -287,9 +290,7 @@ int main(int argc, char** argv)
             namespace reg = vc3d::registrations;
             auto relatedTo = [&](const std::string& volumeId) {
                 std::vector<VolumeTransforms::Related> result;
-                session->read(attachment, [&](const auto& db, const auto& txn, const auto&) {
-                    result = db.volumeTransforms(txn).related(volumeId);
-                });
+                result = session->volumeTransforms(attachment).related(volumeId);
                 return result;
             };
             auto related = relatedTo("vol1");
@@ -322,10 +323,8 @@ int main(int argc, char** argv)
             const auto vol3 = std::find_if(withNew.begin(), withNew.end(), [](const auto& r) { return r.volume == "vol3"; });
             require(vol3 != withNew.end() && vol3->status == vcr::catalog::TransformStatus::Resolved &&
                     vol3->routes.front().forward == VolumeAffine::scale(4), "a registered affine relates its volume");
-            session->read(attachment, [&](const auto& db, const auto& txn, const auto&) {
-                require(db.volumeTransforms(txn).graph.describe(vol3->routes.front().path).find("test scan") != std::string::npos,
-                        "routes are described by registration name");
-            });
+            require(session->volumeTransforms(attachment).graph.describe(vol3->routes.front().path).find("test scan") != std::string::npos,
+                    "routes are described by registration name");
         }
 
         // The volume at working level 1 is the same volume in half its voxels:
@@ -338,12 +337,11 @@ int main(int argc, char** argv)
         const auto level = Volume::New(volumeRoot2);
         const VolumeVoxels atHalf{volume->id(), 0.5};
         const auto atLevel = util::newUuid();
-        session->act(attachment, {{atLevel, std::nullopt}}, [&](auto& db, auto& txn) {
+        {
             ObjectRecord record; record.uuid = atLevel; record.kind = "surface"; record.name = "at-level";
             record.meta = nlohmann::json{{"coordinates", vc::objects::volumeCoordinates(atHalf)}}.dump();
-            db.upsertObject(txn, record);
-            db.putGeometry(txn, atLevel, quad_surface_geometry(grid));
-        });
+            storeSurface(*session, attachment, record, quad_surface_geometry(grid));
+        }
         catalog.setSource(attachment, level, atHalf);
         pump([&] { const auto* row = catalog.row(native); return !catalog.loading() && row && row->mapping; },
              "the level lists the surfaces of its volume");
