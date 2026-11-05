@@ -28,6 +28,8 @@ struct ObjectStoreSession::Attachment {
         return *local;
     }
     AttachmentIdentity identity;
+    // Attribution of newRequest() requests.
+    std::string author;
     bool writable = true;
     std::atomic_bool cancelled{false};
     // Admission, guarded by the session mutex.
@@ -95,6 +97,7 @@ std::shared_ptr<ObjectStoreSession::Attachment> ObjectStoreSession::open(const s
     // successfully is not sufficient validation for an editing session.
     next->writable = !options.readOnly;
     if (next->writable) { auto writable = next->store().write(RevisionSelection{}); writable.commit(); }
+    next->author = next->store().author();
     auto txn = next->store().read();
     next->identity.storeUuid = next->store().uuid(txn);
     next->journalPosition = next->store().journalPosition(txn);
@@ -188,6 +191,7 @@ AttachmentIdentity ObjectStoreSession::attachHosted(const std::string& endpoint,
     std::lock_guard transition(transition_);
     auto next = std::make_shared<Attachment>(std::make_unique<detail::HostedAttachment>(endpoint, options));
     next->identity.storeUuid = next->remote->storeUuid();
+    next->author = options.author;
     {
         std::lock_guard lock(mutex_);
         if (std::any_of(attached_.begin(), attached_.end(),
@@ -238,6 +242,25 @@ StoreStatus ObjectStoreSession::status(const AttachmentIdentity& identity)
         auto txn = attachment.store().read();
         return attachment.store().status(txn);
     });
+}
+
+PinnedObject pinOf(const AttachmentIdentity& attachment, const ObjectRevision& revision)
+{
+    return {attachment, {attachment.storeUuid, revision.objectUuid}, revision.generation, revision.version,
+            revision.geometryRevision};
+}
+
+TransactionRequest ObjectStoreSession::newRequest(const AttachmentIdentity& identity)
+{
+    const auto author = withAttachment(identity, false, [](Attachment& attachment) { return attachment.author; });
+    if (author.empty()) throw std::invalid_argument("object store attachment has no author for its requests");
+    const auto current = status(identity);
+    TransactionRequest request;
+    request.requestUuid = util::newUuid();
+    request.storeUuid = current.storeUuid;
+    request.generation = current.generation;
+    request.author = author;
+    return request;
 }
 
 TransactionReceipt ObjectStoreSession::submit(const AttachmentIdentity& identity, const TransactionRequest& request)
@@ -460,7 +483,7 @@ void ObjectStoreSession::readStore(const AttachmentIdentity& identity, const Sto
 }
 
 RevisionSelection ObjectStoreSession::act(const AttachmentIdentity& identity,
-    const RevisionSelection& expected, const Action& callback)
+    const RevisionSelection& expected, const Action& callback, TransactionReceipt* receipt)
 {
     RevisionSelection committed;
     auto attachment = acquire(identity, true);
@@ -470,6 +493,10 @@ RevisionSelection ObjectStoreSession::act(const AttachmentIdentity& identity,
         callback(attachment->store(), txn);
         txn.commit();
         committed = txn.committedRevisions();
+        if (receipt) {
+            if (!txn.receipt()) throw std::logic_error("object store: a committed action has no receipt");
+            *receipt = *txn.receipt();
+        }
         if (attachment->hub) attachment->hub->requestSync(true);
     } catch (...) { release(*attachment, true); throw; }
     release(*attachment, true);
@@ -1295,9 +1322,9 @@ bool StoreSessionEvent::touches(std::initializer_list<std::string_view> kinds) c
 LeaseHold ObjectStoreSession::holdForEditing(const PinnedObject& pin)
 {
     auto lease = holdLeases(pin.attachment, {pin.object.objectUuid});
-    read(pin.attachment, [&](const auto& store, const auto& txn, const auto&) {
-        const auto head = store.currentObjectRevision(txn, pin.object.objectUuid);
-        if (!head || head->uuid != pin.objectRevision)
+    readStore(pin.attachment, [&](const StoreReader& reader, const auto&) {
+        const auto head = reader.currentObject(pin.object.objectUuid);
+        if (!head || head->version != pin.version || head->generation != pin.generation)
             throw std::runtime_error("It changed in the object store since it was opened; reopen it to edit");
     });
     return lease;

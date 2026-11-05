@@ -45,6 +45,17 @@ public:
     std::vector<vcr::catalog::TransformResolution> availableTransforms(const std::string& objectUuid) const;
 };
 
+// Request expectations read through a reader (objects/Transactions.hpp).
+// Adds every endpoint of the relationships (retired included) of the objects
+// `expected` expects present, at its current version (absent: nullopt), so a
+// geometry change that keeps or edits those relationships is checked against
+// both ends. Existing entries are kept.
+void expectRelationshipEndpoints(const StoreReader&, VersionSelection& expected);
+// The current versions of the recorded volume transforms and route choices:
+// read dependencies of a write computed through a transformed view, so a
+// changed registration conflicts instead of mapping the edit wrongly.
+VersionSelection transformDependencies(const StoreReader&);
+
 // A reader over a caller's transaction, valid while it is.
 class LocalStoreReader final : public StoreReader {
 public:

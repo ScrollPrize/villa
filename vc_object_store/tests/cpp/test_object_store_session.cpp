@@ -253,13 +253,12 @@ int main() try
     });
     {
         // Editing holds the object from the revision on screen.
-        PinnedObject pin{replacement, {replacement.storeUuid, named}, {}, std::nullopt};
-        session.read(replacement, [&](const auto& store, const auto& txn, const auto&) {
-            pin.objectRevision = store.currentObjectRevision(txn, named)->uuid;
-        });
+        const auto pin = pinOf(replacement, *session.currentObject(replacement, named));
+        require(pin.stored() && pin.reference() == ObjectVersion{replacement.storeUuid, pin.generation, named, pin.version},
+                "pin of the current revision");
         { auto held = session.holdForEditing(pin); }
         auto stale = pin;
-        stale.objectRevision = vc::objects::util::newUuid();
+        ++stale.version;
         bool refused = false;
         try { auto held = session.holdForEditing(stale); } catch (const std::runtime_error&) { refused = true; }
         require(refused, "a stale pin cannot be edited");

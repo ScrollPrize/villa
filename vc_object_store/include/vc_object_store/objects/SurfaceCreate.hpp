@@ -2,6 +2,7 @@
 // Creating a surface object: one record shape for every writer (VC3D, the
 // store-mode tools, Python).
 #include "vc_object_store/objects/ObjectStore.hpp"
+#include "vc_object_store/objects/Transactions.hpp"
 #include <nlohmann/json.hpp>
 #include <string>
 #include <vector>
@@ -24,4 +25,12 @@ const std::vector<std::string>& tifxyzFileKeys();
 void createSurface(ObjectStore&, WriteTxn&, const std::string& uuid, const std::string& name,
                    const std::vector<std::string>& tags, const nlohmann::json& coordinates,
                    const SurfaceProvenance&, const nlohmann::json& meta, const GeometryData&);
+// That surface's record, and the operations of a checked request that create
+// it (the request expects `uuid` absent).
+ObjectRecord surfaceRecord(const std::string& uuid, const std::string& name, const std::vector<std::string>& tags,
+                           const nlohmann::json& coordinates, const SurfaceProvenance&, const nlohmann::json& meta);
+std::vector<TransactionOperation> createSurfaceOperations(const std::string& uuid, const std::string& name,
+                                                          const std::vector<std::string>& tags,
+                                                          const nlohmann::json& coordinates, const SurfaceProvenance&,
+                                                          const nlohmann::json& meta, GeometryData geometry);
 }

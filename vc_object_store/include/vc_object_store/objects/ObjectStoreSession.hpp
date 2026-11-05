@@ -31,13 +31,21 @@ struct AttachmentIdentity {
     bool operator==(const AttachmentIdentity&) const = default;
 };
 
+// An object as some code holds it: its numbered version (0: not stored yet)
+// in the store's history generation, and the geometry of that version.
+// Checked requests editing it expect that version in that generation.
 struct PinnedObject {
     AttachmentIdentity attachment;
     ObjectIdentity object;
-    std::string objectRevision;
+    std::string generation;
+    int64_t version = 0;
     std::optional<std::string> geometryRevision;
+    bool stored() const { return version > 0; }
+    ObjectVersion reference() const { return {object.storeUuid, generation, object.objectUuid, version}; }
     bool operator==(const PinnedObject&) const = default;
 };
+// The pin of a revision read from `attachment`.
+PinnedObject pinOf(const AttachmentIdentity& attachment, const ObjectRevision& revision);
 
 // An object's published geometry could not be fetched (offline, missing, invalid).
 struct GeometryUnavailable : std::runtime_error {
@@ -104,6 +112,8 @@ struct HubSessionStatus {
 // A store served by vc_object_server, attached through its endpoint.
 struct HostedSessionOptions {
     HostedStoreOptions client;
+    // Attribution of this session's requests (newRequest).
+    std::string author;
     // How often the attachment checks the store for commits (one status
     // request; the change feed only when the commit sequence moved).
     std::chrono::milliseconds pollInterval{2000};
@@ -211,6 +221,10 @@ public:
 
     // Typed operations, the same for local and hosted attachments.
     StoreStatus status(const AttachmentIdentity&);
+    // A new request (fresh UUID) for the attachment's store and active history
+    // generation, by the attachment's author (OpenOptions::author, or
+    // HostedSessionOptions::author).
+    TransactionRequest newRequest(const AttachmentIdentity&);
     // Checked atomic request (objects/Transactions.hpp); conflicts throw
     // TransactionConflict. Hosted: transport failures leave the outcome
     // unknown; recover it with receipt() or submit the identical request again.
@@ -272,7 +286,9 @@ public:
     void read(const AttachmentIdentity&, const Read&);
     // All writes are immediate checked atomic actions. The library enforces
     // expectations for every affected object and relationship endpoint.
-    RevisionSelection act(const AttachmentIdentity&, const RevisionSelection&, const Action&);
+    // `receipt`, when given, receives the commit's receipt (numbered versions).
+    RevisionSelection act(const AttachmentIdentity&, const RevisionSelection&, const Action&,
+                          TransactionReceipt* receipt = nullptr);
     // Decisions for relationships an edit affects: each is kept as recorded, with
     // its historical pins and no claim that it applies to the new geometry.
     using KeepRecorded = std::function<std::vector<GeometryEdgeEdit>(const std::vector<EdgeRecord>&)>;

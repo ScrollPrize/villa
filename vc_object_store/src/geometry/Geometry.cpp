@@ -83,15 +83,38 @@ std::vector<EdgeRecord> affectedEdges(const ObjectStore& store, const Txn& txn, 
     }
     return result;
 }
+// Decisions other than the keep-recorded default (which an unchanged
+// geometry simply does not use).
+bool explicitEdgeDecisions(const std::vector<GeometryEdgeEdit>& edits)
+{
+    return std::any_of(edits.begin(), edits.end(), [](const auto& e) { return e.edgeUuid != kKeepAffectedRecorded; });
+}
 std::map<std::string, GeometryEdgeEdit> validateEdgeEdits(const ObjectStore& store, const Txn& txn,
     sqlite3* db, const std::string& objectUuid, const detail::DependencyGeometry& after,
     const std::vector<EdgeRecord>& affected, const std::vector<GeometryEdgeEdit>& edgeEdits)
 {
     std::map<std::string, GeometryEdgeEdit> decisions;
+    bool keepRest = false;
     for (const auto& edit : edgeEdits) {
+        if (edit.edgeUuid == kKeepAffectedRecorded) {
+            if (edit.action != "keep_recorded" || keepRest)
+                throw std::invalid_argument("geometry: one keep-recorded default, with action keep_recorded");
+            keepRest = true;
+            continue;
+        }
         const auto uuid = formatUuid(parseUuid(edit.edgeUuid));
         if (!decisions.emplace(uuid, edit).second) throw std::invalid_argument("duplicate geometry edge decision");
     }
+    // The default decides the rest from this checked state: the request's
+    // endpoint expectations already pin the edges' endpoints.
+    if (keepRest)
+        for (const auto& edge : affected)
+            if (!decisions.contains(edge.uuid)) {
+                GeometryEdgeEdit kept;
+                kept.edgeUuid = edge.uuid; kept.expectedGeneration = edge.generation; kept.action = "keep_recorded";
+                kept.aRevision = geometryHead(db, edge.aUuid); kept.bRevision = geometryHead(db, edge.bUuid);
+                decisions.emplace(edge.uuid, std::move(kept));
+            }
     for (const auto& edge : affected) {
         const auto found = decisions.find(edge.uuid);
         if (found == decisions.end())
@@ -235,7 +258,7 @@ std::string ObjectStore::putGeometry(WriteTxn& txn, const std::string& objectUui
         }
     }
     if (unchanged) {
-        if (!edgeEdits.empty()) throw std::invalid_argument("geometry is unchanged; edit relationships directly");
+        if (explicitEdgeDecisions(edgeEdits)) throw std::invalid_argument("geometry is unchanged; edit relationships directly");
         savepoint.release();
         return current->uuid;
     }
@@ -457,7 +480,7 @@ std::string ObjectStore::editGeometry(WriteTxn& txn, const std::string& objectId
     const auto plan = prepareEdit(*this, txn, objectUuid, expected, edits);
     const auto current = *currentGeometry(txn, objectUuid);
     if (plan->changes.empty()) {
-        if (!edgeEdits.empty()) throw std::invalid_argument("geometry is unchanged; edit relationships directly");
+        if (explicitEdgeDecisions(edgeEdits)) throw std::invalid_argument("geometry is unchanged; edit relationships directly");
         return current.uuid;
     }
     const auto object = *objectByUuid(txn, objectUuid);
@@ -577,7 +600,7 @@ std::string ObjectStore::updateSurfaceChannels(WriteTxn& txn, const std::string&
         return value;
     };
     if (logical(manifest) == logical(original)) {
-        if (!edgeEdits.empty()) throw std::invalid_argument("geometry is unchanged; edit relationships directly");
+        if (explicitEdgeDecisions(edgeEdits)) throw std::invalid_argument("geometry is unchanged; edit relationships directly");
         return current->uuid;
     }
     auto after = dependencyGeometry(*this, txn, *current);

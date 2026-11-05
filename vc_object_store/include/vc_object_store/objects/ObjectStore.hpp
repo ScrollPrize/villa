@@ -373,6 +373,10 @@ struct EdgeGeometryRepair {
     Anchor aAnchor, bAnchor;
 };
 
+// A GeometryEdgeEdit with this edgeUuid and action "keep_recorded" decides
+// every affected relationship without its own decision: each is kept as
+// recorded (from the edit's checked state).
+inline constexpr const char* kKeepAffectedRecorded = "*";
 struct GeometryEdgeEdit {
     std::string edgeUuid;
     int64_t expectedGeneration = 0;

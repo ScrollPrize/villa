@@ -102,25 +102,34 @@ public:
         for (const auto& array : op.data.arrays)
             arrays.push_back({{"name", array.name}, {"dtype", array.dtype}, {"shape", array.shape},
                               {"bytes", payload(array.bytes)}});
-        return {{"op", "put_geometry"}, {"object", canonical(op.objectUuid)},
+        return keep(op, {{"op", "put_geometry"}, {"object", canonical(op.objectUuid)},
                 {"data", {{"kind", op.data.kind}, {"format_version", op.data.formatVersion},
                           {"coordinate_system", op.data.coordinateSystem},
                           {"attributes", Json::parse(op.data.attributes)}, {"arrays", arrays}}},
-                {"relationships", relationships(op.relationships)}};
+                {"relationships", relationships(op.relationships)}});
     }
     Json operator()(const EditGeometryOp& op)
     {
         auto edits = Json::array();
         for (const auto& edit : op.edits)
             edits.push_back({{"array", edit.array}, {"element_offset", edit.elementOffset}, {"bytes", payload(edit.bytes)}});
-        return {{"op", "edit_geometry"}, {"object", canonical(op.objectUuid)}, {"edits", edits},
-                {"relationships", relationships(op.relationships)}};
+        return keep(op, {{"op", "edit_geometry"}, {"object", canonical(op.objectUuid)}, {"edits", edits},
+                {"relationships", relationships(op.relationships)}});
     }
     Json operator()(const EditGeometryRectangleOp& op)
     {
-        return {{"op", "edit_geometry_rectangle"}, {"object", canonical(op.objectUuid)}, {"array", op.arrayName},
+        return keep(op, {{"op", "edit_geometry_rectangle"}, {"object", canonical(op.objectUuid)}, {"array", op.arrayName},
                 {"row", op.row}, {"column", op.column}, {"rows", op.rows}, {"columns", op.columns},
-                {"bytes", payload(op.bytes)}, {"relationships", relationships(op.relationships)}};
+                {"bytes", payload(op.bytes)}, {"relationships", relationships(op.relationships)}});
+    }
+    Json operator()(const SetSurfaceChannelsOp& op)
+    {
+        auto channels = Json::array();
+        for (const auto& array : op.channels)
+            channels.push_back({{"name", array.name}, {"dtype", array.dtype}, {"shape", array.shape},
+                                {"bytes", payload(array.bytes)}});
+        return keep(op, {{"op", "set_surface_channels"}, {"object", canonical(op.objectUuid)}, {"channels", channels},
+                         {"remove", op.remove}, {"relationships", relationships(op.relationships)}});
     }
     Json operator()(const RecordCatalogTransformsOp& op)
     {
@@ -131,8 +140,23 @@ public:
         return {{"op", "record_catalog_transforms"}, {"registrations", registrations}};
     }
 private:
+    // Present only when set, so requests without it keep their digests.
+    template <class Op> static Json keep(const Op& op, Json j)
+    {
+        if (op.keepAffectedRecorded) j["keep_affected_recorded"] = true;
+        return j;
+    }
     TransactionPayloads* payloads_;
 };
+
+bool keepFrom(const Json& j)
+{
+    const auto found = j.find("keep_affected_recorded");
+    if (found == j.end()) return false;
+    if (!found->is_boolean() || !found->get<bool>())
+        throw std::invalid_argument("transaction: keep_affected_recorded is true or absent");
+    return true;
+}
 
 Json requestJson(const TransactionRequest& request, TransactionPayloads* payloads, bool withRequestUuid)
 {
@@ -204,6 +228,7 @@ TransactionOperation operationFrom(const Json& j, const TransactionPayloads& pay
             result.data.arrays.push_back({array.at("name").get<std::string>(), array.at("dtype").get<std::string>(),
                                           array.at("shape").get<std::vector<int64_t>>(), payloadFrom(array.at("bytes"), payloads)});
         result.relationships = relationshipsFrom(j.at("relationships"));
+        result.keepAffectedRecorded = keepFrom(j);
         return result;
     }
     if (op == "edit_geometry") {
@@ -213,6 +238,7 @@ TransactionOperation operationFrom(const Json& j, const TransactionPayloads& pay
             result.edits.push_back({edit.at("array").get<std::string>(), edit.at("element_offset").get<int64_t>(),
                                     payloadFrom(edit.at("bytes"), payloads)});
         result.relationships = relationshipsFrom(j.at("relationships"));
+        result.keepAffectedRecorded = keepFrom(j);
         return result;
     }
     if (op == "edit_geometry_rectangle") {
@@ -223,6 +249,18 @@ TransactionOperation operationFrom(const Json& j, const TransactionPayloads& pay
         result.rows = j.at("rows").get<int64_t>(); result.columns = j.at("columns").get<int64_t>();
         result.bytes = payloadFrom(j.at("bytes"), payloads);
         result.relationships = relationshipsFrom(j.at("relationships"));
+        result.keepAffectedRecorded = keepFrom(j);
+        return result;
+    }
+    if (op == "set_surface_channels") {
+        SetSurfaceChannelsOp result;
+        result.objectUuid = canonical(j.at("object").get<std::string>());
+        for (const auto& array : j.at("channels"))
+            result.channels.push_back({array.at("name").get<std::string>(), array.at("dtype").get<std::string>(),
+                                       array.at("shape").get<std::vector<int64_t>>(), payloadFrom(array.at("bytes"), payloads)});
+        result.remove = j.at("remove").get<std::vector<std::string>>();
+        result.relationships = relationshipsFrom(j.at("relationships"));
+        result.keepAffectedRecorded = keepFrom(j);
         return result;
     }
     if (op == "record_catalog_transforms") {
@@ -383,6 +421,16 @@ struct Executor {
     ObjectStore& store;
     WriteTxn& txn;
 
+    template <class Op> std::vector<GeometryEdgeEdit> edgeEdits(const Op& op)
+    {
+        auto result = edgeEdits(op.relationships);
+        if (op.keepAffectedRecorded) {
+            GeometryEdgeEdit rest;
+            rest.edgeUuid = kKeepAffectedRecorded; rest.action = "keep_recorded";
+            result.push_back(std::move(rest));
+        }
+        return result;
+    }
     std::vector<GeometryEdgeEdit> edgeEdits(const std::vector<GeometryRelationshipEdit>& edits)
     {
         // Observed state comes from the checked snapshot: the transaction's
@@ -472,19 +520,22 @@ struct Executor {
     void operator()(const PutGeometryOp& op)
     {
         const auto head = store.currentGeometry(txn, op.objectUuid);
-        store.putGeometry(txn, op.objectUuid, op.data, head ? std::optional(head->uuid) : std::nullopt,
-            edgeEdits(op.relationships));
+        store.putGeometry(txn, op.objectUuid, op.data, head ? std::optional(head->uuid) : std::nullopt, edgeEdits(op));
     }
     void operator()(const EditGeometryOp& op)
     {
         const auto head = geometryHead(op.objectUuid);
-        store.editGeometry(txn, op.objectUuid, op.edits, head, edgeEdits(op.relationships));
+        store.editGeometry(txn, op.objectUuid, op.edits, head, edgeEdits(op));
     }
     void operator()(const EditGeometryRectangleOp& op)
     {
         const auto head = geometryHead(op.objectUuid);
         store.editGeometryRectangle(txn, op.objectUuid, op.arrayName, op.row, op.column, op.rows, op.columns, op.bytes, head,
-            edgeEdits(op.relationships));
+            edgeEdits(op));
+    }
+    void operator()(const SetSurfaceChannelsOp& op)
+    {
+        store.updateSurfaceChannels(txn, op.objectUuid, op.channels, op.remove, geometryHead(op.objectUuid), edgeEdits(op));
     }
 };
 }

@@ -3,6 +3,8 @@
 
 #include <nlohmann/json.hpp>
 
+#include <set>
+
 namespace vc::objects {
 
 std::vector<vcr::catalog::TransformResolution> StoreReader::availableTransforms(const std::string& objectUuid) const
@@ -16,6 +18,39 @@ std::vector<vcr::catalog::TransformResolution> StoreReader::availableTransforms(
     const auto context = volumeTransforms();
     auto result = context.graph.available(source);
     for (auto& resolution : result) resolution = context.resolve(source, resolution.target);
+    return result;
+}
+
+void expectRelationshipEndpoints(const StoreReader& reader, VersionSelection& expected)
+{
+    EdgeSelection edges;
+    edges.endpointUuids.emplace();
+    for (const auto& [uuid, version] : expected)
+        if (version) edges.endpointUuids->push_back(uuid);
+    if (edges.endpointUuids->empty()) return;
+    edges.includeRetired = true;
+    std::set<std::string> endpoints;
+    for (const auto& edge : reader.selectEdges(edges))
+        for (const auto& endpoint : {edge.aUuid, edge.bUuid})
+            if (!expected.contains(endpoint)) endpoints.insert(endpoint);
+    for (const auto& endpoint : endpoints) {
+        const auto head = reader.currentObject(endpoint);
+        expected.emplace(endpoint, head ? std::optional(head->version) : std::nullopt);
+    }
+}
+
+VersionSelection transformDependencies(const StoreReader& reader)
+{
+    VersionSelection result;
+    for (const auto* kind : {"volume_transform", "volume_transform_choice"}) {
+        ObjectSelection selection;
+        selection.kind = kind;
+        selection.includeRetired = true;
+        for (const auto& record : reader.selectObjects(selection)) {
+            if (!record.version) throw std::runtime_error("transform record without a numbered version: " + record.uuid);
+            result.emplace(record.uuid, record.version);
+        }
+    }
     return result;
 }
 

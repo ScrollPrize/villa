@@ -3,6 +3,8 @@
 #include "TestSupport.hpp"
 #include "vc_object_store/geometry/Geometry.hpp"
 #include "vc_object_store/objects/ObjectStore.hpp"
+#include "vc_object_store/objects/StoreReader.hpp"
+#include "vc_object_store/objects/SurfaceCreate.hpp"
 #include "vc_object_store/objects/TransactionJson.hpp"
 
 #include <cstring>
@@ -255,6 +257,79 @@ try {
         auto txn = client.read();
         const auto resolution = client.volumeTransforms(txn).resolve("volume-a", "volume-b");
         require(resolution.resolved().forward(0, 0) == 2, "recorded coefficients win over the client catalog");
+    }
+
+    // Geometry requests that keep affected relationships as recorded, surface
+    // channels, created surfaces, and expectations read through a reader.
+    {
+        auto txn = db.read();
+        const auto dependencies = transformDependencies(LocalStoreReader(db, txn));
+        require(!dependencies.empty() && std::all_of(dependencies.begin(), dependencies.end(),
+                [](const auto& d) { return d.second && *d.second > 0; }), "transform dependencies");
+    }
+    {
+        auto edits = ObjectStore::create(directory.path / "edits.vcobj", options);
+        const auto at = [&] { auto txn = edits.read(); return edits.status(txn); };
+        auto make = [&](VersionSelection expected, std::vector<TransactionOperation> operations) {
+            TransactionRequest r;
+            r.requestUuid = util::newUuid(); r.storeUuid = at().storeUuid; r.generation = at().generation;
+            r.author = "carol"; r.expectedObjects = std::move(expected); r.operations = std::move(operations);
+            return r;
+        };
+        const auto surface = util::newUuid(), other = util::newUuid(), relation = util::newUuid();
+        vc::geometry::Surface grid{2, 2, {1, 1}, {{0, 0, 1}, {1, 0, 1}, {0, 1, 1}, {1, 1, 1}}};
+        auto operations = createSurfaceOperations(surface, "made", {"t"}, {{"volume_uuid", "20260411134726"}, {"scale_factor", 1}},
+                                                  {"versions-test", {}, {}}, {{"format", "tifxyz"}, {"note", 1}},
+                                                  vc::geometry::encode(grid));
+        operations.push_back(CreateObjectOp{objectRecordJson(trackRecord(other))});
+        edits.submit(make({{surface, std::nullopt}, {other, std::nullopt}}, operations));
+        EdgeRecord link; link.uuid = relation; link.kind = "test_link"; link.aUuid = surface; link.bUuid = other;
+        link.aAnchor.wholeGeometry = link.bAnchor.wholeGeometry = true;
+        edits.submit(make({{surface, 1}, {other, 1}}, {AddEdgeOp{edgeRecordJson(link)}}));
+        {
+            auto txn = edits.read();
+            const auto record = edits.objectByUuid(txn, surface);
+            require(record->name == "made" && record->tags == std::vector<std::string>{"t"} &&
+                    nlohmann::json::parse(record->meta).value("note", 0) == 1 &&
+                    !nlohmann::json::parse(record->meta).contains("format"), "created surface record");
+        }
+        std::vector<uint8_t> moved(12);
+        const float xyz[3] = {5, 0, 1};
+        std::memcpy(moved.data(), xyz, 12);
+        // Without a decision the affected relationship refuses the edit.
+        mustFail([&] { edits.submit(make({{surface, 2}, {other, 2}}, {EditGeometryOp{surface, {{"points", 0, moved}}, {}}})); });
+        VersionSelection expected{{surface, 2}};
+        {
+            auto txn = edits.read();
+            expectRelationshipEndpoints(LocalStoreReader(edits, txn), expected);
+        }
+        require(expected == VersionSelection{{surface, 2}, {other, 2}}, "relationship endpoints expected");
+        auto keep = make(expected, {EditGeometryOp{surface, {{"points", 0, moved}}, {}, true}});
+        const auto plain = transactionRequestToJson(make(expected, {EditGeometryOp{surface, {{"points", 0, moved}}, {}}}));
+        TransactionPayloads payloads;
+        const auto encoded = transactionRequestToJson(keep, &payloads);
+        require(plain.find("keep_affected_recorded") == std::string::npos &&
+                encoded.find("\"keep_affected_recorded\":true") != std::string::npos, "keep flag encoded only when set");
+        require(transactionRequestDigest(transactionRequestFromJson(encoded, payloads)) == transactionRequestDigest(keep),
+                "keep flag survives the round trip");
+        const auto kept = edits.submit(keep);
+        // Kept as recorded: the relationship and its other end do not change.
+        require(kept.objects.at(surface) == 3 && kept.objects.at(other) == 2 && !kept.relationships.contains(relation),
+                "affected relationship kept as recorded");
+        {
+            auto txn = edits.read();
+            require(edits.currentRelationshipVersion(txn, relation) == 1, "relationship unchanged");
+        }
+        // Channels through a typed operation, deciding the relationship the same way.
+        const GeometryArray ink{"ink", "|u1", {2, 2}, {1, 2, 3, 4}};
+        auto channels = make({{surface, 3}, {other, 2}}, {SetSurfaceChannelsOp{surface, {ink}, {}, {}, true}});
+        payloads.clear();
+        require(transactionRequestDigest(transactionRequestFromJson(transactionRequestToJson(channels, &payloads), payloads)) ==
+                transactionRequestDigest(channels), "channel operation round trip");
+        edits.submit(channels);
+        auto txn = edits.read();
+        const auto head = edits.currentObjectRevision(txn, surface);
+        require(head->version == 4 && edits.readGeometryArray(txn, *head->geometryRevision, "ink") == ink.bytes, "channel written");
     }
 
     // Ownership: standalone writers share; the service is exclusive; aliases

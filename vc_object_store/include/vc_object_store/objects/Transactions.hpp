@@ -191,21 +191,37 @@ struct GeometryRelationshipEdit {
     std::string action; // retain | update | remove | keep_recorded
     std::string aAnchorJson = "{}", bAnchorJson = "{}"; // update only
 };
+// keepAffectedRecorded: every relationship the geometry change affects and
+// `relationships` does not decide is kept as recorded (its historical pins,
+// no claim that it applies to the new geometry). The request must still
+// expect both endpoints of each.
 struct PutGeometryOp {
     std::string objectUuid;
     GeometryData data;
     std::vector<GeometryRelationshipEdit> relationships;
+    bool keepAffectedRecorded = false;
 };
 struct EditGeometryOp {
     std::string objectUuid;
     std::vector<GeometryArrayEdit> edits;
     std::vector<GeometryRelationshipEdit> relationships;
+    bool keepAffectedRecorded = false;
 };
 struct EditGeometryRectangleOp {
     std::string objectUuid, arrayName;
     int64_t row = 0, column = 0, rows = 0, columns = 0;
     std::vector<uint8_t> bytes;
     std::vector<GeometryRelationshipEdit> relationships;
+    bool keepAffectedRecorded = false;
+};
+// Replace or add surface channels and remove others
+// (ObjectStore::updateSurfaceChannels); "points" is not a channel.
+struct SetSurfaceChannelsOp {
+    std::string objectUuid;
+    std::vector<GeometryArray> channels;
+    std::vector<std::string> remove;
+    std::vector<GeometryRelationshipEdit> relationships;
+    bool keepAffectedRecorded = false;
 };
 
 // Publish catalog registrations used by shared queries (see
@@ -217,7 +233,7 @@ using TransactionOperation = std::variant<
     CreateObjectOp, UpdateObjectOp, SetMetaOp, RemoveMetaOp, SetApprovalOp,
     RetireObjectOp, RestoreObjectOp, DeleteObjectOp,
     AddEdgeOp, UpdateEdgeOp, RemoveEdgeOp, RetainRelationshipOp, KeepRecordedRelationshipOp,
-    PutGeometryOp, EditGeometryOp, EditGeometryRectangleOp, RecordCatalogTransformsOp>;
+    PutGeometryOp, EditGeometryOp, EditGeometryRectangleOp, RecordCatalogTransformsOp, SetSurfaceChannelsOp>;
 
 // Wire/command format version, part of every request digest.
 inline constexpr int kTransactionCommandVersion = 1;

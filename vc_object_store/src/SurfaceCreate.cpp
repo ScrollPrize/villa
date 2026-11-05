@@ -1,5 +1,6 @@
 #include "vc_object_store/objects/SurfaceCreate.hpp"
 #include "vc_object_store/objects/GeometryCoordinates.hpp"
+#include "vc_object_store/objects/TransactionJson.hpp"
 
 namespace vc::objects {
 const std::vector<std::string>& tifxyzFileKeys()
@@ -10,11 +11,9 @@ const std::vector<std::string>& tifxyzFileKeys()
     return keys;
 }
 
-void createSurface(ObjectStore& store, WriteTxn& txn, const std::string& uuid, const std::string& name,
-                   const std::vector<std::string>& tags, const nlohmann::json& coordinates,
-                   const SurfaceProvenance& provenance, const nlohmann::json& meta, const GeometryData& geometry)
+ObjectRecord surfaceRecord(const std::string& uuid, const std::string& name, const std::vector<std::string>& tags,
+                           const nlohmann::json& coordinates, const SurfaceProvenance& provenance, const nlohmann::json& meta)
 {
-    if (geometry.kind != "surface") throw std::invalid_argument("createSurface needs surface geometry");
     auto recordMeta = meta.is_object() ? meta : nlohmann::json::object();
     for (const auto& key : tifxyzFileKeys()) recordMeta.erase(key);
     for (const auto* key : {"tags", "provenance"}) recordMeta.erase(key);
@@ -27,7 +26,25 @@ void createSurface(ObjectStore& store, WriteTxn& txn, const std::string& uuid, c
     record.name = name;
     record.tags = tags;
     record.meta = recordMeta.dump();
-    store.upsertObject(txn, record);
+    return record;
+}
+
+void createSurface(ObjectStore& store, WriteTxn& txn, const std::string& uuid, const std::string& name,
+                   const std::vector<std::string>& tags, const nlohmann::json& coordinates,
+                   const SurfaceProvenance& provenance, const nlohmann::json& meta, const GeometryData& geometry)
+{
+    if (geometry.kind != "surface") throw std::invalid_argument("createSurface needs surface geometry");
+    store.upsertObject(txn, surfaceRecord(uuid, name, tags, coordinates, provenance, meta));
     store.putGeometry(txn, uuid, geometry);
+}
+
+std::vector<TransactionOperation> createSurfaceOperations(const std::string& uuid, const std::string& name,
+                                                          const std::vector<std::string>& tags,
+                                                          const nlohmann::json& coordinates, const SurfaceProvenance& provenance,
+                                                          const nlohmann::json& meta, GeometryData geometry)
+{
+    if (geometry.kind != "surface") throw std::invalid_argument("createSurfaceOperations needs surface geometry");
+    return {CreateObjectOp{objectRecordJson(surfaceRecord(uuid, name, tags, coordinates, provenance, meta))},
+            PutGeometryOp{uuid, std::move(geometry), {}}};
 }
 }

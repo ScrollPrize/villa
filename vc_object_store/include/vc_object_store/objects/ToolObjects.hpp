@@ -25,23 +25,19 @@ public:
     const std::shared_ptr<ObjectStoreSession>& session() const { return session_; }
     const AttachmentIdentity& attachment() const { return attachment_; }
 
-    // The tool read `uuid` at these revisions: in stored coordinates
-    // (`volume` unset), or through the view of it in `volume`, where `identity`
-    // says whether that view maps stored coordinates unchanged.
-    void noteRead(const std::string& uuid, const std::string& objectRevision, const std::string& geometryRevision,
-                  const std::optional<VolumeVoxels>& volume, bool identity);
+    // The tool read `pin`: in stored coordinates (`volume` unset), or through
+    // the view of it in `volume`, where `identity` says whether that view maps
+    // stored coordinates unchanged.
+    void noteRead(const PinnedObject& pin, const std::optional<VolumeVoxels>& volume, bool identity);
     // The coordinates of a new object made from `sources`: bound to `volume`
     // when given, else to the frame the sources were read in (the voxels they
     // were read through, else the first source's binding). Sources read in
     // different frames throw.
     CoordinateJson coordinatesFor(const std::vector<std::string>& sources, const std::optional<VolumeVoxels>& volume);
-    // The pins (object and geometry revision) of writing back `uuid`: one this
-    // tool read in stored units (writing a mapped grid back would rewrite every
+    // The pin (version and geometry) of writing back `uuid`: one this tool
+    // read in stored units (writing a mapped grid back would rewrite every
     // stored coordinate). Throws otherwise.
-    struct Pins {
-        std::string objectRevision, geometryRevision;
-    };
-    Pins writable(const std::string& uuid);
+    PinnedObject writable(const std::string& uuid);
     // The tool wrote to the store (finish waits for the hub then).
     void wrote() { wrote_ = true; }
     // Drain writes and, after any, wait until they reached the hub (no-op for
@@ -50,7 +46,7 @@ public:
 
 private:
     struct Read {
-        std::string objectRevision, geometryRevision;
+        PinnedObject pin;
         std::optional<VolumeVoxels> volume;
         bool identity = true;
     };

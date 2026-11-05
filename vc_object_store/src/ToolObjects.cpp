@@ -14,11 +14,10 @@ ToolObjects::ToolObjects(const std::filesystem::path& store, const std::string& 
     attachment_ = session_->attach(store, options);
 }
 
-void ToolObjects::noteRead(const std::string& uuid, const std::string& objectRevision,
-                           const std::string& geometryRevision, const std::optional<VolumeVoxels>& volume, bool identity)
+void ToolObjects::noteRead(const PinnedObject& pin, const std::optional<VolumeVoxels>& volume, bool identity)
 {
     std::lock_guard lock(mutex_);
-    read_[uuid] = {objectRevision, geometryRevision, volume, !volume || identity};
+    read_[pin.object.objectUuid] = {pin, volume, !volume || identity};
 }
 
 CoordinateJson ToolObjects::coordinatesFor(const std::vector<std::string>& sources, const std::optional<VolumeVoxels>& volume)
@@ -34,23 +33,23 @@ CoordinateJson ToolObjects::coordinatesFor(const std::vector<std::string>& sourc
     if (!frames.empty() && *frames.begin()) return volumeCoordinates(**frames.begin());
     auto coordinates = CoordinateJson::object();
     if (!sources.empty())
-        session_->read(attachment_, [&](const auto& db, const auto& txn, const auto&) {
-            const auto source = db.objectByUuid(txn, sources.front());
+        session_->readStore(attachment_, [&](const StoreReader& reader, const auto&) {
+            const auto source = reader.currentObject(sources.front());
             if (!source) throw std::runtime_error("source object not found: " + sources.front());
-            const auto meta = nlohmann::json::parse(source->meta);
+            const auto meta = nlohmann::json::parse(source->record.meta);
             if (meta.contains("coordinates")) coordinates = meta.at("coordinates");
         });
     return coordinates;
 }
 
-ToolObjects::Pins ToolObjects::writable(const std::string& uuid)
+PinnedObject ToolObjects::writable(const std::string& uuid)
 {
     std::lock_guard lock(mutex_);
     const auto found = read_.find(uuid);
     if (found == read_.end()) throw std::runtime_error("update a surface this tool loaded: " + uuid);
     if (!found->second.identity)
         throw std::runtime_error("surface " + uuid + " was loaded through a volume mapping other than the identity");
-    return {found->second.objectRevision, found->second.geometryRevision};
+    return found->second.pin;
 }
 
 void ToolObjects::finish(std::chrono::seconds timeout)

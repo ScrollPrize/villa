@@ -128,8 +128,12 @@ public:
     // canonical coordinates. Points keep their exact canonical values while
     // their displayed position is unchanged, matched by stable ID.
     geometry::PointCollection canonicalPointCollection(const geometry::PointCollection& desired) const;
+    // `validity`, when given, is the whole grid's validity the edits apply to
+    // instead of the stored one (an earlier operation of the same request
+    // replaces the valid channel).
     std::vector<GeometryArrayEdit> surfaceEdits(int64_t row, int64_t column,
-        int64_t rows, int64_t columns, const std::vector<geometry::SurfacePoint>& desired) const;
+        int64_t rows, int64_t columns, const std::vector<geometry::SurfacePoint>& desired,
+        const std::vector<uint8_t>* validity = nullptr) const;
     std::vector<geometry::Point> points(const std::string& array,int64_t start,int64_t count) const;
     TransformedSurfaceTile readTile(int64_t row,int64_t column,int64_t rows,int64_t columns) const;
     // Encode only explicitly changed positions; unchanged values reuse their

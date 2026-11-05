@@ -434,10 +434,17 @@ geometry::Surface TransformedGeometryView::canonicalSurface(const geometry::Surf
     result.validate();return result;
 }
 std::vector<GeometryArrayEdit> TransformedGeometryView::surfaceEdits(int64_t row,int64_t column,int64_t rows,int64_t columns,
-    const std::vector<geometry::SurfacePoint>& desired) const {
+    const std::vector<geometry::SurfacePoint>& desired,const std::vector<uint8_t>* validity) const {
     const auto* surface=std::get_if<SurfaceView>(&source_);
     if(!surface)throw std::invalid_argument("not a surface");
-    const auto stored=surface->readTile(row,column,rows,columns);
+    auto stored=surface->readTile(row,column,rows,columns);
+    if(validity) {
+        const auto gridColumns=surface->columns();
+        if(int64_t(validity->size())!=surface->rows()*gridColumns)throw std::invalid_argument("surface validity shape mismatch");
+        stored.validity.resize(size_t(rows*columns));
+        for(int64_t r=0;r<rows;++r)for(int64_t c=0;c<columns;++c)
+            stored.validity[size_t(r*columns+c)]=(*validity)[size_t((row+r)*gridColumns+column+c)];
+    }
     if(desired.size()!=stored.points.size())throw std::invalid_argument("surface edit shape mismatch");
     const auto inverse=mapping_.inverse();
     std::vector<GeometryArrayEdit> edits;
