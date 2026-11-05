@@ -14,6 +14,10 @@ def heads(db, *ids):
     return {uid: db.current_object_revision(uid)['uuid'] for uid in ids}
 
 
+def versions(db, *ids):
+    return {uid: db.current_version(uid) for uid in ids}
+
+
 def put(db, geometry, kind='track', **options):
     record = dict(kind=kind)
     if kind == 'track':
@@ -103,14 +107,14 @@ def test_surface_channels_sparse_reads_history_and_resize(db, tile):
     assert db.read_geometry_rectangle(third, 'ink', 61, 100, 4, 5) == ink[61:65, 100:105].tobytes()
     fills = [array('points', np.full((1, 1, 3), -1, '<f4')), array('extra', np.ones((1, 1), 'u1')),
              array('ink', np.zeros((1, 1), '<f4'))]
-    with db.write(expected_revisions=heads(db, uid)) as tx:
+    with db.write(expected_versions=versions(db, uid)) as tx:
         grown = tx.resize_surface(uid, dict(row=-1, column=-1, rows=37, columns=39, fill=fills), third)
     assert db.read_geometry_rectangle(grown, 'points', 1, 1, 35, 37) == values.tobytes()
     assert db.read_geometry_rectangle(grown, 'extra', 0, 0, 1, 1) == b'\x01'
     assert db.read_geometry_rectangle(grown, 'ink', 2, 3, 70, 111) == ink.tobytes()
     assert db.read_geometry_rectangle(grown, 'ink', 0, 0, 2, 117) == bytes(2 * 117 * 4)
     with pytest.raises(RuntimeError, match='finer channels'):
-        with db.write(expected_revisions=heads(db, uid)) as tx:
+        with db.write(expected_versions=versions(db, uid)) as tx:
             tx.resize_surface(uid, dict(row=0, column=0, rows=0, columns=39, fill=fills), grown)
     grown = db.update_surface_channels(uid, [], ['ink'], grown)
     assert db.geometry_revision(grown)['grid_origin'] == [-1, -1]
@@ -195,7 +199,7 @@ def test_checked_relationships_lifecycle_and_graph(db):
     assert db.neighbours(a) == [b] and db.edges_by_kind('fiber_branch')[0]['uuid'] == edge
     before = db.journal_since()
     with pytest.raises(ValueError):
-        with db.write(expected_revisions={a: selected[a]}) as tx:
+        with db.write(expected_versions={a: db.current_version(a)}) as tx:
             tx.set_meta(a, 'rollback', True)
             tx.remove_edge(edge)  # b is also modified, but has no expectation
     assert db.journal_since() == before and db.edge(edge)
@@ -211,11 +215,11 @@ def test_checked_relationships_lifecycle_and_graph(db):
     assert db.component(a, applicable_only=True) == [a]
     assert db.relationships_at(selected)[0]['applicable']
     assert db.recorded_relationships(selected[a]) == db.recorded_relationships(selected[b])
-    with db.write(expected_revisions=heads(db, a, b)) as tx:
+    with db.write(expected_versions=versions(db, a, b)) as tx:
         tx.retain_relationship(edge)
     assert db.component(a, applicable_only=True) == [a, b]
     for action in ('retire_object', 'restore_object'):
-        with db.write(expected_revisions=heads(db, a, b)) as tx:
+        with db.write(expected_versions=versions(db, a, b)) as tx:
             getattr(tx, action)(a)
             if action == 'retire_object':
                 tx.keep_recorded_relationship(edge)
@@ -234,7 +238,7 @@ def test_stable_ids_annotations_splice_and_coordinates(db):
     uid = db.upsert_object(dict(kind='point_collection', meta={'source': {
         'point_attributes': [label, {'label': 'B'}]}}))
     first = db.put_geometry(uid, PointCollection([10, 20], [[1, 2, 3], [4, 5, 6]]))
-    with db.write(expected_revisions=heads(db, uid)) as tx:
+    with db.write(expected_versions=versions(db, uid)) as tx:
         second = tx.edit_geometry_sequence(uid, dict(array='points', start=1, erase_count=0,
             parts=[dict(count=1, ids=[30], data=struct.pack('<3d', 7, 8, 9), annotations=[{'label': 'C'}])]), first)
         tx.set_meta(uid, 'coordinates', {'scale_factor': 4})
@@ -244,7 +248,7 @@ def test_stable_ids_annotations_splice_and_coordinates(db):
     with db.geometry_snapshot() as snapshot:
         view = snapshot.point_collection(uid)
         assert view.point(30) == [7, 8, 9]
-        with db.write(expected_revisions={uid: view.object_revision}) as tx:
+        with db.write(expected_versions={uid: view.version}) as tx:
             third = tx.edit_geometry(uid, [dict(array="points", element_offset=3,
                 data=struct.pack("<3d", 10, 11, 12))], view.revision["uuid"])
         assert view.point(30) == [7, 8, 9]
@@ -405,7 +409,7 @@ def test_fiber_collection_and_linked_file_import_use_uuid_endpoints(db, tmp_path
         documents.append(json.loads(output.read_text()))
     db.upsert_object(dict(kind="fiber", name="unrelated pending geometry"))
     historical_pin = db.current_object_revision(a)['uuid']
-    with db.write(expected_revisions=heads(db, a, b)) as tx:
+    with db.write(expected_versions=versions(db, a, b)) as tx:
         tx.remove_edge(documents[0]['branches'][0]['edge_uuid'])
     historical = tmp_path / 'historical-graph.json'
     db.export_geometry(a, historical, object_revision_uuid=historical_pin)
@@ -649,7 +653,7 @@ def test_attachments_by_role(db):
     owner, _ = put(db, Surface(1, 1, [1, 1], [[1, 2, 3]]), 'surface')
     results, _ = put(db, PointCollection([1], [[1, 2, 3]]), 'point_collection')
     corrections, _ = put(db, PointCollection([1], [[4, 5, 6]]), 'point_collection')
-    with db.write(expected_revisions=heads(db, owner, results, corrections)) as tx:
+    with db.write(expected_versions=versions(db, owner, results, corrections)) as tx:
         tx.attach(results, owner, 'fit_results')
         tx.attach(corrections, owner, 'corrections')
     other = lambda edge: edge['b'] if edge['a'] == owner else edge['a']

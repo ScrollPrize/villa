@@ -19,14 +19,13 @@ splices rows of `points` (point collections/tracks), `control_points`, or
 - Existing rows: `revision`, `start` (default zero), `count`, and optional
   `reverse`. These copy coordinates, IDs, and annotations together. References
   can select another object of the same kind, including historical revisions.
-  Include every source object in `expected_revisions`.
+  Include every source object in `expected_versions`.
 
 ```python
 import struct
 
-object_head = db.current_object_revision(uid)['uuid']
 geometry_head = db.current_geometry(uid)['uuid']
-with db.write(expected_revisions={uid: object_head}) as tx:
+with db.write(expected_versions={uid: db.current_version(uid)}) as tx:
     result = tx.edit_geometry_sequence(uid, {
         'array': 'points', 'start': 2, 'erase_count': 0,
         'parts': [{'count': 1, 'ids': [42],

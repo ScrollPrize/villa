@@ -388,7 +388,8 @@ struct PyObjectWriteTxn {
     PyObjectStore* owner = nullptr;
     std::shared_ptr<vo::ObjectStore> lease;
     std::unique_ptr<vo::WriteTxn> txn;
-    std::optional<vo::RevisionSelection> expected;
+    std::optional<vo::TransactionContext> context;
+    std::optional<vo::TransactionReceipt> receipt;
 
     vo::WriteTxn& require()
     {
@@ -400,14 +401,15 @@ struct PyObjectWriteTxn {
         if (txn) throw std::runtime_error("transaction is already active");
         owner->require();
         lease = owner->db;
-        try { txn = std::make_unique<vo::WriteTxn>(expected ? lease->write(*expected) : lease->write()); }
+        receipt.reset();
+        try { txn = std::make_unique<vo::WriteTxn>(context ? lease->write(*context) : lease->write()); }
         catch (...) { lease.reset(); throw; }
         return *this;
     }
     void exit(bool failed)
     {
         if (txn) {
-            try { if (!failed) txn->commit(); }
+            try { if (!failed) { txn->commit(); receipt = txn->receipt(); } }
             catch (...) { txn.reset(); lease.reset(); throw; }
             txn.reset();  // RAII rolls back when not committed
             lease.reset();

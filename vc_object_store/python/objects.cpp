@@ -1360,14 +1360,31 @@ NB_MODULE(_native, m)
            "Recover all objects, geometry references and recorded relationships at a publication time (UTC Unix microseconds).")
         .def(
             "write",
-            [](PyObjectStore& self, const std::optional<vo::RevisionSelection>& expected) {
+            [](PyObjectStore& self, const std::optional<vo::VersionSelection>& objects,
+               const std::optional<vo::VersionSelection>& relationships, const std::optional<vo::VersionSelection>& reads,
+               const std::optional<int64_t>& commitSequence, const std::optional<std::string>& requestUuid,
+               const std::optional<std::string>& author) {
                 PyObjectWriteTxn w;
                 w.owner = &self;
-                w.expected = expected;
+                if (objects || relationships || reads || commitSequence || requestUuid || author) {
+                    vo::TransactionContext context;
+                    if (objects) context.expectedObjects = *objects;
+                    if (relationships) context.expectedRelationships = *relationships;
+                    if (reads) context.readDependencies = *reads;
+                    context.expectedCommitSequence = commitSequence;
+                    context.requestUuid = requestUuid;
+                    context.author = author;
+                    w.context = std::move(context);
+                }
                 return w;
             },
-            nb::arg("expected_revisions") = std::nullopt, nb::keep_alive<0, 1>(),
-            "Batch write transaction context manager: 'with db.write() as w: w.upsert_object(...)'");
+            nb::arg("expected_versions") = std::nullopt, nb::arg("expected_relationships") = std::nullopt,
+            nb::arg("read_dependencies") = std::nullopt, nb::arg("expected_commit_sequence") = std::nullopt,
+            nb::arg("request_uuid") = std::nullopt, nb::arg("author") = std::nullopt, nb::keep_alive<0, 1>(),
+            "Batch write transaction context manager: 'with db.write() as w: w.upsert_object(...)'. Checked when "
+            "given expectations: {uuid: version, or None for absent} of every object (and relationship) the write "
+            "changes, versions of records it only read, and/or the store commit sequence; a conflict raises "
+            "RuntimeError and commits nothing. After the block, w.receipt is the commit's numbered receipt.");
 
     store.def("available_transforms",[](PyObjectStore& self,const std::string& uuid){
         return volumeTransformsToPy(self.withRead([&](auto& db,auto& txn){return db.availableTransforms(txn,uuid);}));
@@ -1413,6 +1430,9 @@ NB_MODULE(_native, m)
             const bool failed = nb::len(args) > 0 && !args[0].is_none();
             self.exit(failed);
         })
+        .def_prop_ro("receipt", [](const PyObjectWriteTxn& self) -> nb::object {
+            return self.receipt ? jsonLoads(vo::transactionReceiptToJson(*self.receipt)) : nb::none();
+        }, "The committed write's numbered receipt (commit sequence, versions); None before it commits.")
         .def("retire_object", writeMethod<&vo::ObjectStore::retireObject, PyObjectWriteTxn>(), nb::arg("uuid"))
         .def("restore_object", writeMethod<&vo::ObjectStore::restoreObject, PyObjectWriteTxn>(),
              nb::arg("uuid"), nb::arg("source_revision") = std::nullopt)

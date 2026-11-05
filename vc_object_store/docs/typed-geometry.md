@@ -134,7 +134,7 @@ there is no separate typed editor or commit path.
 import struct
 with store.geometry_snapshot() as snapshot:
     collection = snapshot.point_collection(collection_uuid)
-    with store.write(expected_revisions={collection_uuid: collection.object_revision}) as tx:
+    with store.write(expected_versions={collection_uuid: collection.version}) as tx:
         new_revision = tx.edit_geometry(collection_uuid, [dict(
             array="points", element_offset=0, data=struct.pack("<3d", 10, 20, 30)
         )], collection.revision["uuid"])

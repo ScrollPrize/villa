@@ -30,6 +30,7 @@ struct GeometryViewState {
     std::shared_ptr<GeometryReadState> read;
     GeometryRevision revision;
     std::string objectRevision;
+    std::optional<int64_t> version;
     std::optional<std::map<int64_t, int64_t>> pointIndex;
     const GeometryArrayInfo& array(const std::string& name) const {
         read->require();
@@ -154,7 +155,7 @@ std::shared_ptr<State> GeometrySnapshot::view(const std::string& id, const std::
         throw std::invalid_argument("unsupported geometry version or coordinate system");
     auto result = std::make_shared<State>();
     result->read = state_; result->revision = *revision;
-    if (!geometryRevision) result->objectRevision = object->uuid;
+    if (!geometryRevision) { result->objectRevision = object->uuid; result->version = object->version; }
     if (revision->kind == "point_collection") {
         result->require("points", "<f8", 2);
         result->require("point_ids", "<i8", 1);
@@ -186,6 +187,7 @@ TypedGeometryView GeometrySnapshot::geometry(const std::string& id, const std::o
 
 GeometryView::GeometryView(std::shared_ptr<State> state) : state_(std::move(state)) {}
 const GeometryRevision& GeometryView::revision() const { state_->read->require(); return state_->revision; }
+std::optional<int64_t> GeometryView::version() const { state_->read->require(); return state_->version; }
 const std::string& GeometryView::objectRevision() const { state_->read->require(); return state_->objectRevision; }
 geometry::Geometry GeometryView::loadGeometry() const
 {

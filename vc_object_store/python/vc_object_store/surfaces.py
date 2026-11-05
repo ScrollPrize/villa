@@ -22,31 +22,49 @@ class SurfaceGrid(NamedTuple):
     valid: np.ndarray  # (rows, columns) bool
     scale: tuple  # grid scale in the read volume's voxels
     record: dict
-    geometry_revision: str
+    version: int  # the numbered object version read (in ``generation``, the store's active one)
+    generation: str
+    geometry_revision: str  # payload identity of its geometry (reads its channels)
     channels: frozenset  # names of the per-vertex channels (not points or valid)
 
 
-def read_surface(store, surface_uuid, *, volume, geometry_revision=None, target_scale=1.0) -> SurfaceGrid:
-    """The surface (its current geometry, or ``geometry_revision``) in voxels of ``volume`` at ``target_scale``,
-    through the store's mapping to it (its binding, or a registration). Raises ValueError when the surface does
-    not map to ``volume``."""
+def read_surface(store, surface_uuid, *, volume, version=None, target_scale=1.0) -> SurfaceGrid:
+    """The surface (its current version, or numbered ``version`` in the store's active generation) in voxels of
+    ``volume`` at ``target_scale``, through the store's mapping to it (its binding, or a registration). Raises
+    ValueError when the surface (version) does not exist or does not map to ``volume``."""
     with ObjectStore.open(str(store), read_only=True, reader_pool_size=1) as db:
-        record = db.object(surface_uuid)
-        if record is None or record["kind"] != "surface":
-            raise ValueError(f"no surface {surface_uuid} in {store}")
+        # Every read through db comes before the snapshot, which holds the one pooled reader.
+        status = db.status()
+        generation = status["generation"]
+        if version is None:
+            record = db.object(surface_uuid)
+            if record is None or record["kind"] != "surface":
+                raise ValueError(f"no surface {surface_uuid} in {store}")
+            geometry = None
+        else:
+            revision = db.object_at_version(status["store"], generation, surface_uuid, int(version))
+            if revision is None or revision["deleted"] or revision["record"]["kind"] != "surface":
+                raise ValueError(f"no surface {surface_uuid} version {version} in {store}")
+            if revision["geometry_revision"] is None:
+                raise ValueError(f"surface {surface_uuid} version {version} has no geometry")
+            record, geometry = revision["record"], revision["geometry_revision"]
         with db.geometry_snapshot() as snapshot:
-            canonical = snapshot.surface(surface_uuid, geometry_revision)
+            canonical = snapshot.surface(surface_uuid, geometry)
+            read_version = canonical.version if version is None else int(version)
             try:
                 view = canonical.view_transformed_at(volume, target_scale)
             except RuntimeError as error:
                 raise ValueError(f"surface {surface_uuid} does not map to volume {volume}: {error}") from error
             tile = view.read_tile(0, 0, canonical.rows, canonical.columns)
             revision = canonical.revision
+        if version is None:  # the record of the version the snapshot read
+            record = db.object_at_version(status["store"], generation, surface_uuid, read_version)["record"]
     points = np.array(tile["points"], dtype=np.float32)
     valid = np.asarray(tile["validity"]).astype(bool)
     points[~valid] = INVALID
     channels = frozenset(array["name"] for array in revision["arrays"]) - {"points", "valid"}
-    return SurfaceGrid(points, valid, tuple(float(s) for s in tile["scale"]), record, revision["uuid"], channels)
+    return SurfaceGrid(points, valid, tuple(float(s) for s in tile["scale"]), record, read_version, generation,
+                       revision["uuid"], channels)
 
 
 def create_surface(store, xyz, *, name, scale, volume, tool, parameters=None, sources=(), meta=None,
@@ -70,7 +88,7 @@ def create_surface(store, xyz, *, name, scale, volume, tool, parameters=None, so
     geometry.channels = arrays
     surface_uuid = str(uuidlib.uuid4())
     with ObjectStore.open(str(store), author=author or getpass.getuser()) as db:
-        with db.write(expected_revisions={surface_uuid: None}) as tx:
+        with db.write(expected_versions={surface_uuid: None}) as tx:
             tx.create_surface(surface_uuid, name, list(tags), dict(volume_uuid=str(volume), scale_factor=float(voxel_scale)), tool,
                               parameters or {}, list(sources), meta or {}, geometry)
     return surface_uuid

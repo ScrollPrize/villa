@@ -137,14 +137,17 @@ Pin all modified objects and participating relationship endpoints when preparing
 an edit outside the writer lock:
 
 ```python
-observed = {u: store.current_object_revision(u)["uuid"] for u in (a, b)}
-with store.write(expected_revisions=observed) as tx:
+observed = {u: store.current_version(u) for u in (a, b)}
+with store.write(expected_versions=observed) as tx:
     tx.set_meta(a, "review_note", "checked")
     tx.set_meta(edge, "confidence", 0.9)
+print(tx.receipt["commit_sequence"], tx.receipt["objects"])
 ```
 
-C++ uses `store.write(RevisionSelection{...})`. `None` means the object must not
-exist; preselect its UUID. Stale/missing expectations and caught geometry
+C++ uses `store.write(TransactionContext{...})` (`expectedObjects`). `None` means
+the object must not exist; preselect its UUID. `write()` also takes
+`expected_relationships`, `read_dependencies` (versions of records read but not
+changed) and `expected_commit_sequence`. Stale/missing expectations and caught geometry
 revision conflicts abort the entire checked action. Plain `write()` serializes
 read/modify/write under its lock but cannot protect an earlier external read.
 Standalone Python mutations commit their own transaction. Read transactions pin

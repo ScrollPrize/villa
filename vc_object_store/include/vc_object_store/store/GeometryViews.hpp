@@ -18,6 +18,9 @@ public:
     std::vector<vcr::catalog::TransformResolution> availableTransforms() const;
     const GeometryRevision& revision() const;
     const std::string& objectRevision() const;
+    // The numbered version of the object this view read (its current one);
+    // nullopt for a view of a pinned geometry revision.
+    std::optional<int64_t> version() const;
 protected:
     explicit GeometryView(std::shared_ptr<detail::GeometryViewState>);
     geometry::Geometry loadGeometry() const;

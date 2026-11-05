@@ -146,7 +146,9 @@ inline void bindTypedGeometry(nb::module_& m)
         .def_prop_ro("available_transforms",[](const vo::GeometryView& v){return volumeTransformsToPy(v.availableTransforms());})
         .def("view_transformed_at",&vo::GeometryView::viewTransformedAt,nb::arg("volume"),nb::arg("target_scale")=1.)
         .def_prop_ro("revision", [](const vo::GeometryView& self) { return geometryToPy(self.revision()); })
-        .def_prop_ro("object_revision", &vo::GeometryView::objectRevision, nb::rv_policy::copy);
+        .def_prop_ro("object_revision", &vo::GeometryView::objectRevision, nb::rv_policy::copy)
+        .def_prop_ro("version", &vo::GeometryView::version,
+                     "The object's numbered version this view read; None for a pinned geometry revision.");
     nb::class_<vo::PointCollectionView, vo::GeometryView>(m, "PointCollectionView")
         .def("__len__", &vo::PointCollectionView::size)
         .def("ids", &vo::PointCollectionView::ids, nb::arg("start"), nb::arg("count"), nb::call_guard<nb::gil_scoped_release>())

@@ -17,9 +17,8 @@ def attach_document(store, object_uuid, document, *, role, list_key, position_ke
     collection_uuid = str(uuidlib.uuid4())
     coordinates = dict(volume_uuid=str(volume), scale_factor=float(voxel_scale))
     with ObjectStore.open(str(store), author=author or getpass.getuser()) as db:
-        head = db.current_object_revision(object_uuid)
-        expected = {collection_uuid: None, object_uuid: head["uuid"] if head else None}
-        with db.write(expected_revisions=expected) as tx:
+        expected = {collection_uuid: None, object_uuid: db.current_version(object_uuid)}
+        with db.write(expected_versions=expected) as tx:
             tx.attach_document(object_uuid, collection_uuid, document, role, list_key, position_key, name, coordinates)
     return collection_uuid
 
