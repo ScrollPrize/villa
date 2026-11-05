@@ -151,3 +151,14 @@ def test_a_start_that_does_not_capture_fails_before_anyone_judges(tmp_path, stor
     stamp = pipeline.run_stage("capture")
     assert stamp["status"] == "failed" and "does not capture" in stamp["error"]
     assert pipeline.states()["capture"] == FAILED
+
+
+def test_a_session_marks_its_caches_for_backups_to_skip(tmp_path):
+    for name in ("blocks", "overview"):
+        (tmp_path / name).mkdir()
+    (tmp_path / "overview" / "CACHEDIR.TAG").write_text("kept")
+    pipeline_stages.tag_caches(tmp_path)
+    assert (tmp_path / "blocks" / "CACHEDIR.TAG").read_text().startswith(
+        "Signature: 8a477f597d28d172789f06886806bc55")
+    assert (tmp_path / "overview" / "CACHEDIR.TAG").read_text() == "kept"
+    assert not (tmp_path / "CACHEDIR.TAG").exists()      # the session itself holds no cache only

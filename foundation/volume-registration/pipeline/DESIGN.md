@@ -21,7 +21,8 @@ Decided with the reviewer on 2026-11-03.
   tmpfs scratchpad and were lost (rebuilt from the transcript). Every step is a command of
   the tool.
 - **Reads are chunk-aligned and the cache is disposable** (the first sessions hold 33 GB of
-  cached blocks, all re-derivable).
+  cached blocks, all re-derivable). A session's `blocks/` and `overview/` carry a
+  `CACHEDIR.TAG`, so a backup run with `--exclude-caches` leaves them out.
 - **Scan artifacts belong in the data**: DLS slab seams, for example, are a patch flag.
 
 ## Stages

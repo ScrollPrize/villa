@@ -40,15 +40,33 @@ def session_lock(pipeline):
             fcntl.flock(handle, fcntl.LOCK_UN)
 
 
+# The cache directory tag (bford.ca/cachedir): backups run with --exclude-caches skip a
+# directory holding it.
+CACHE_TAG = ("Signature: 8a477f597d28d172789f06886806bc55\n"
+             "# A cache of volume reads by the volume-registration pipeline; it can be read again"
+             " from the volumes.\n")
+
+
+def tag_caches(directory):
+    """Mark a session's block cache and overview as caches, so backups leave them out."""
+    for name in ("blocks", "overview"):
+        tag = directory / name / "CACHEDIR.TAG"
+        if tag.parent.is_dir() and not tag.exists():
+            tag.write_text(CACHE_TAG)
+
+
 def open_session(pipeline):
     """The pair's session, created from `pair.json` the first time."""
     directory = pipeline.work(SESSION)
     if (directory / "session.json").exists():
-        return fs.Session.load(directory)
-    pair = pipeline.record.read(rec.PAIR)
-    return fs.Session.create(directory, pair["fixed"]["url"], pair["moving"]["url"],
-                             pair["fixed"]["voxel_um"], pair["moving"]["voxel_um"],
-                             pair["start"]["matrix_xyz"], pair["start"]["source"])
+        session = fs.Session.load(directory)
+    else:
+        pair = pipeline.record.read(rec.PAIR)
+        session = fs.Session.create(directory, pair["fixed"]["url"], pair["moving"]["url"],
+                                    pair["fixed"]["voxel_um"], pair["moving"]["voxel_um"],
+                                    pair["start"]["matrix_xyz"], pair["start"]["source"])
+    tag_caches(directory)
+    return session
 
 
 def run_capture(pipeline, params):
