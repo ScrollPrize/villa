@@ -2,6 +2,7 @@
 #include <vc_reader/zarr.hpp>
 #include <vc_object_store/objects/FiberJson.hpp>
 #include <vc_object_store/objects/StoreReader.hpp>
+#include <vc_object_store/objects/TransactionJson.hpp>
 #include <vc_object_store/store/GeometryViews.hpp>
 #include <vc_object_store/objects/GeometryEdits.hpp>
 #include <vc_object_store/objects/GeometryIngest.hpp>
@@ -15060,19 +15061,20 @@ void LineAnnotationController::commitFiberStoreAction(std::vector<FiberSaveSnaps
     auto edits = snapshots;
     vc3d::line_annotation::canonicalizeFiberSaveSnapshots(edits);
     vc3d::line_annotation::validateFiberSaveSnapshots(edits);
-    RevisionSelection expected;
+    auto request = connection->newRequest(*attachment);
+    VersionSelection expected;
     auto expect = [&](const StoredFiber& fiber) {
         if (fiber.storePin && fiber.storePin->attachment != *attachment)
             throw std::runtime_error("The fiber belongs to a previous object store attachment");
-        // The action expects the revision of each pinned version.
-        std::optional<std::string> revision;
+        // The request expects each fiber at its pinned version.
+        std::optional<int64_t> version;
         if (fiber.storePin && fiber.storePin->stored()) {
-            const auto pinned = connection->objectsAtVersions(*attachment, {fiber.storePin->reference()}).front();
-            if (!pinned) throw std::runtime_error("The fiber's pinned version is not in its object store");
-            revision = pinned->uuid;
+            if (fiber.storePin->generation != request.generation)
+                throw std::runtime_error("The fiber's pinned version is not in its object store's current history; reopen it");
+            version = fiber.storePin->version;
         }
-        const auto [it, inserted] = expected.emplace(fiber.uuid, revision);
-        if (!inserted && it->second != revision) throw std::runtime_error("Conflicting fiber revision expectations");
+        const auto [it, inserted] = expected.emplace(fiber.uuid, version);
+        if (!inserted && it->second != version) throw std::runtime_error("Conflicting fiber version expectations");
     };
     // Branch endpoints outside the edit are read from the store's current heads.
     std::vector<std::string> targetUuids;
@@ -15092,21 +15094,15 @@ void LineAnnotationController::commitFiberStoreAction(std::vector<FiberSaveSnaps
         for (const auto& branch : edit.fiber.branches) expect(findFiber(branch.branchFiberId));
     }
     for (const auto& fiber : retired) expect(fiber);
-    // The action changes the edited and retired fibers; branch targets only gain links.
-    RevisionSelection pins, related;
-    for (const auto& [uuid, revision] : expected) {
-        const bool changed = std::any_of(edits.begin(), edits.end(), [&](const auto& edit) { return edit.fiber.uuid == uuid; }) ||
-            std::any_of(retired.begin(), retired.end(), [&](const auto& fiber) { return fiber.uuid == uuid; });
-        (changed ? pins : related).emplace(uuid, revision);
-    }
-    std::map<std::string, std::string> geometryHeads;
-    TransactionReceipt receipt;
-    connection->editKeepingRelationships(*attachment, pins, related, [&](auto& db, auto& txn, const auto& decisions) {
+    request.expectedObjects = expected;
+    auto& operations = request.operations;
+    connection->readStore(*attachment, [&](const StoreReader& reader, const auto&) {
         // A fiber read in an open volume, back in its stored frame: positions
         // through the store's view (unchanged points keep their exact values),
         // vectors and width through the inverse; classification in that frame.
         // A new object derived from one (split halves, a merge) has no stored
         // view yet; its positions go through the inverse of the frame it carries.
+        bool viewed = false;
         std::map<std::string, StoredFiber> storedFrames;
         auto inStoredFrame = [&](const StoredFiber& fiber) -> const StoredFiber& {
             if (const auto found = storedFrames.find(fiber.uuid); found != storedFrames.end()) return found->second;
@@ -15120,12 +15116,13 @@ void LineAnnotationController::commitFiberStoreAction(std::vector<FiberSaveSnaps
                 for (const auto& point : fiber.linePoints) edited.linePoints.push_back({point[0], point[1], point[2]});
                 const auto inverse = fiber.frame->storedToVolume.inverse();
                 auto canonical = edited;
-                if (db.objectByUuid(txn, fiber.uuid)) {
-                    const auto shown = GeometrySnapshot(db, txn).viewTransformedAt(fiber.uuid, fiber.frame->volume.volume,
+                if (reader.currentObject(fiber.uuid)) {
+                    const auto shown = GeometrySnapshot(reader).viewTransformedAt(fiber.uuid, fiber.frame->volume.volume,
                                                                                 fiber.frame->volume.scale);
                     if (shown.mapping() != fiber.frame->storedToVolume)
                         throw std::runtime_error("The fiber's volume registration changed; reopen it");
                     canonical = shown.canonicalFiber(edited);
+                    viewed = true;
                 } else {
                     for (auto& point : canonical.controlPoints) point = inverse.apply(point);
                     for (auto& point : canonical.linePoints) point = inverse.apply(point);
@@ -15146,19 +15143,46 @@ void LineAnnotationController::commitFiberStoreAction(std::vector<FiberSaveSnaps
             }
             return storedFrames.emplace(fiber.uuid, std::move(stored)).first->second;
         };
-        std::map<std::string, EdgeRecord> incident;
-        for (const auto& [uuid, revision] : expected)
-            if (db.objectByUuid(txn, uuid))
-                for (const auto& edge : db.edgesOf(txn, uuid, true)) incident[edge.uuid] = edge;
+        // Relationships of the fibers this request touches (retired ones
+        // included), and every relationship a branch names: the state the
+        // branch updates below start from.
+        std::vector<std::string> present;
+        for (const auto& [uuid, version] : expected)
+            if (reader.currentObject(uuid)) present.push_back(uuid);
+        std::map<std::string, EdgeRecord> incident, known;
+        if (!present.empty()) {
+            EdgeSelection selection;
+            selection.endpointUuids = present;
+            selection.includeRetired = true;
+            for (auto& edge : reader.selectEdges(selection)) incident.emplace(edge.uuid, std::move(edge));
+        }
+        known = incident;
+        {
+            EdgeSelection selection;
+            selection.uuids.emplace();
+            for (const auto& edit : edits)
+                for (const auto& branch : edit.fiber.branches)
+                    if (!branch.edgeUuid.empty()) selection.uuids->push_back(vc::objects::util::canonicalUuid(branch.edgeUuid));
+            selection.includeRetired = true;
+            if (!selection.uuids->empty())
+                for (auto& edge : reader.selectEdges(selection)) known.emplace(edge.uuid, std::move(edge));
+        }
+        // The lifecycle-active ones: a branch may reuse only these.
+        std::set<std::string> live;
+        if (!present.empty()) {
+            EdgeSelection selection;
+            selection.endpointUuids = present;
+            for (const auto& edge : reader.selectEdges(selection, std::vector<std::string>{})) live.insert(edge.uuid);
+        }
         for (auto& snapshot : edits) {
             auto& fiber = snapshot.fiber;
-            const auto current = db.objectByUuid(txn, fiber.uuid);
-            auto record = current.value_or(ObjectRecord{});
+            const auto head = reader.currentObject(fiber.uuid);
+            auto record = head ? head->record : ObjectRecord{};
             record.uuid = fiber.uuid; record.kind = "fiber";
             record.name = fs::path(fiber.fileName).stem().string(); record.tags = fiber.tags;
             record.formatVersion = vc3d::line_annotation::kFiberFormatVersion;
-            auto meta = Json::parse(record.meta);
-            if (!current && snapshot.fiber.coordinateIdentity.contains("coordinates"))
+            auto meta = Json::parse(record.meta.empty() ? std::string("{}") : record.meta);
+            if (!head && snapshot.fiber.coordinateIdentity.contains("coordinates"))
                 meta["coordinates"] = snapshot.fiber.coordinateIdentity.at("coordinates");
             fiber.coordinateIdentity = Json::object();
             if (meta.contains("coordinates")) fiber.coordinateIdentity["coordinates"] = meta.at("coordinates");
@@ -15186,21 +15210,23 @@ void LineAnnotationController::commitFiberStoreAction(std::vector<FiberSaveSnaps
             detail.manualFamily = !fiber.manualHvTag.empty();
             detail.family = detail.manualFamily ? fiber.manualHvTag : vc::fiber_tracer::fiberHvTagToString(stored.hvClassification.automaticTag);
             record.fiber = detail;
-            const auto dataToSave = vc::geometry::encode(geometry);
-            auto head = current ? db.currentGeometry(txn, fiber.uuid) : std::nullopt;
-            if (!head) {
+            auto dataToSave = vc::geometry::encode(geometry);
+            if (!head || !head->geometryRevision) {
                 meta["source"] = source; record.meta = meta.dump();
-                db.upsertObject(txn, record);
-                geometryHeads[fiber.uuid] = db.putGeometry(txn, fiber.uuid, dataToSave);
+                if (head) operations.push_back(UpdateObjectOp{objectRecordJson(record)});
+                else operations.push_back(CreateObjectOp{objectRecordJson(record)});
+                operations.push_back(PutGeometryOp{fiber.uuid, std::move(dataToSave), {}, false});
             } else {
-                const auto revision = updateGeometryArrays(db, txn, fiber.uuid, dataToSave, head->uuid,
-                    {{"control_points", source.at("control_points_attributes").dump()}}, decisions);
-                geometryHeads[fiber.uuid] = revision;
+                operations.push_back(UpdateGeometryArraysOp{fiber.uuid, std::move(dataToSave),
+                    {{"control_points", source.at("control_points_attributes").dump()}}, "keep_recorded"});
                 // Sequence annotations are immutable and live with geometry.
                 source.erase("control_points_attributes");
-                meta["source"] = source; record.meta = meta.dump(); db.upsertObject(txn, record);
+                meta["source"] = source; record.meta = meta.dump();
+                operations.push_back(UpdateObjectOp{objectRecordJson(record)});
             }
         }
+        if (viewed)
+            for (const auto& [uuid, version] : transformDependencies(reader)) request.readDependencies.emplace(uuid, version);
         std::set<std::string> retiredUuids;
         for (const auto& fiber : retired) retiredUuids.insert(fiber.uuid);
         std::set<std::string> retainedBranches;
@@ -15219,7 +15245,8 @@ void LineAnnotationController::commitFiberStoreAction(std::vector<FiberSaveSnaps
                     a.position = {cp[0],cp[1],cp[2]}; a.direction = {direction[0],direction[1],direction[2]};
                     a.points = {{"control_point_ids", {fiber.controlPoints.at(index).storeId}}}; return a;
                 };
-                EdgeRecord edge; edge.uuid = branch.edgeUuid; edge.kind = "fiber_branch";
+                EdgeRecord edge; edge.uuid = branch.edgeUuid.empty() ? std::string() : vc::objects::util::canonicalUuid(branch.edgeUuid);
+                edge.kind = "fiber_branch";
                 edge.aUuid = local.uuid; edge.bUuid = target.uuid;
                 edge.aAnchor = anchor(local,branch.controlPointIndex,branch.controlPointDirection);
                 edge.bAnchor = anchor(target,branch.branchControlPointIndex,branch.branchControlPointDirection);
@@ -15232,7 +15259,9 @@ void LineAnnotationController::commitFiberStoreAction(std::vector<FiberSaveSnaps
                 };
                 edge.meta = reviewMeta(Json::object());
                 // Reciprocal UI references describe one shared edge.
-                for (const auto& existing : db.edgesOf(txn,local.uuid)) {
+                for (const auto& uuid : live) {
+                    const auto& existing = known.at(uuid);
+                    if (existing.aUuid != local.uuid && existing.bUuid != local.uuid) continue;
                     const bool forward = existing.aUuid == edge.aUuid && existing.bUuid == edge.bUuid;
                     const bool reverse = existing.bUuid == edge.aUuid && existing.aUuid == edge.bUuid;
                     if (existing.kind != "fiber_branch" || (!forward && !reverse)) continue;
@@ -15243,32 +15272,50 @@ void LineAnnotationController::commitFiberStoreAction(std::vector<FiberSaveSnaps
                         edge.meta = reviewMeta(Json::parse(existing.meta)); break;
                     }
                 }
-                if (!edge.uuid.empty()) {
-                    const auto old = db.edgeByUuid(txn, edge.uuid);
-                    if (old && !((old->aUuid == edge.aUuid && old->bUuid == edge.bUuid) ||
-                                 (old->bUuid == edge.aUuid && old->aUuid == edge.bUuid))) edge.uuid.clear();
+                const auto old = edge.uuid.empty() ? known.end() : known.find(edge.uuid);
+                if (old != known.end() && !((old->second.aUuid == edge.aUuid && old->second.bUuid == edge.bUuid) ||
+                                            (old->second.bUuid == edge.aUuid && old->second.aUuid == edge.bUuid))) edge.uuid.clear();
+                if (!edge.uuid.empty() && old != known.end()) {
+                    edge.approvalState = old->second.approvalState;
+                    operations.push_back(UpdateEdgeOp{edgeRecordJson(edge)});
+                } else {
+                    if (edge.uuid.empty()) edge.uuid = vc::objects::util::newUuid();
+                    edge.approvalState = "pending";
+                    operations.push_back(AddEdgeOp{edgeRecordJson(edge)});
                 }
-                if (!edge.uuid.empty() && db.edgeByUuid(txn,edge.uuid)) db.updateEdge(txn,edge);
-                else edge.uuid = db.addEdge(txn,edge);
-                db.retainRelationship(txn,edge.uuid);
+                operations.push_back(RetainRelationshipOp{edge.uuid});
                 const auto approval = branch.pending ? "pending" : "approved";
-                if (db.edgeByUuid(txn,edge.uuid)->approvalState != approval) db.setApproval(txn,edge.uuid,approval);
+                if (edge.approvalState != approval) {
+                    operations.push_back(SetApprovalOp{edge.uuid, approval});
+                    edge.approvalState = approval;
+                }
+                live.insert(edge.uuid);
+                known.insert_or_assign(edge.uuid, edge);
                 retainedBranches.insert(edge.uuid); branch.edgeUuid = edge.uuid;
             }
         }
         std::set<std::string> edited;
         for (const auto& snapshot : edits) edited.insert(snapshot.fiber.uuid);
         for (const auto& [uuid,edge] : incident) {
-            if (edge.kind != "fiber_branch") { db.keepRecordedRelationship(txn,uuid); continue; }
-            if ((edited.contains(edge.aUuid) || edited.contains(edge.bUuid) || retiredUuids.contains(edge.aUuid) || retiredUuids.contains(edge.bUuid)) && !retainedBranches.contains(uuid)) db.removeEdge(txn,uuid);
+            if (edge.kind != "fiber_branch") { operations.push_back(KeepRecordedRelationshipOp{uuid}); continue; }
+            if ((edited.contains(edge.aUuid) || edited.contains(edge.bUuid) || retiredUuids.contains(edge.aUuid) || retiredUuids.contains(edge.bUuid)) && !retainedBranches.contains(uuid))
+                operations.push_back(RemoveEdgeOp{uuid});
         }
-        for (const auto& fiber : retired) db.retireObject(txn,fiber.uuid);
-        for (auto& snapshot : edits) snapshot.fiber.generation = db.objectByUuid(txn, snapshot.fiber.uuid)->generation;
-    }, &receipt);
-    for (auto& snapshot : edits) {
-        auto& fiber = snapshot.fiber;
-        fiber.storePin = PinnedObject{*attachment, {attachment->storeUuid, fiber.uuid}, receipt.generation,
-                                     receipt.objects.at(fiber.uuid).value(), geometryHeads.at(fiber.uuid)};
+        for (const auto& fiber : retired) operations.push_back(RetireObjectOp{fiber.uuid});
+        expectRelationshipEndpoints(reader, request.expectedObjects);
+    });
+    const auto receipt = connection->submit(*attachment, request);
+    // The saved fibers' versions: their generations and geometry heads.
+    std::vector<ObjectVersion> savedVersions;
+    for (const auto& snapshot : edits)
+        savedVersions.push_back({attachment->storeUuid, receipt.generation, snapshot.fiber.uuid,
+                                 receipt.objects.at(snapshot.fiber.uuid).value()});
+    const auto saved = connection->objectsAtVersions(*attachment, savedVersions);
+    for (size_t i = 0; i < edits.size(); ++i) {
+        auto& fiber = edits[i].fiber;
+        if (!saved[i]) throw std::logic_error("A saved fiber version is not in its object store");
+        fiber.generation = saved[i]->record.generation;
+        fiber.storePin = pinOf(*attachment, *saved[i]);
         registerFiberId(fiber.uuid, fiber.id);
     }
     // Shared links also revise the other endpoint: keep its open sessions
