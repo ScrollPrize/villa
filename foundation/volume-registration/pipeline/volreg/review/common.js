@@ -70,3 +70,28 @@ function modeButtons(holder, mode, flipped, show, onPick) {
     `<span class="muted">${show === "overlay" ? "red = coarse volume, cyan = fine volume; grey where they agree" : ""}</span>`;
   for (const b of holder.querySelectorAll("button")) b.onclick = () => onPick(b.dataset.m);
 }
+
+// The bend and the affine against the bar, one row each: every check as a gauge whose tick
+// is the limit (half way along), with how far the value is over it or how much is to spare.
+function barTable(s) {
+  const b = s.bar;
+  const gauge = (value, limit, lowerIsBetter, digits, unit = "") => {
+    const ok = lowerIsBetter ? value <= limit : value >= limit;
+    const margin = Math.abs(value - limit);
+    const said = margin < 0.5 * 10 ** -digits ? "at the limit" :
+      `${fmt(margin, digits)}${unit} ${ok ? "to spare" : lowerIsBetter ? "over" : "short"}`;
+    return `<div class="gauge ${ok ? "ok" : "miss"}" title="limit ${lowerIsBetter ? "≤" : "≥"} ${fmt(limit, digits)}${unit}">
+      <b>${fmt(value, digits)}${unit}</b><span class="track"><span class="fill" style="width:${Math.min(100, 50 * value / limit)}%"></span><span class="tick"></span></span>
+      <small>${said}</small></div>`;
+  };
+  const row = (name, v) => !v.lines_up ? `<tr><th>${name}</th><td colspan="5" class="muted">nothing lines up yet</td></tr>` :
+    `<tr><th>${name}</th><td><b class="${v.bar.passes ? "pass" : "fail"}">${v.bar.passes ? "passes" : "misses"}</b></td>
+      <td>${gauge(v.lines_up, b.min_lines_up, false, 0)}</td>
+      <td>${gauge(v.median_fine_voxels, b.median_max, true, 2)}<small class="muted">${fmt(v.median_um, 1)} µm</small></td>
+      <td>${gauge(v.p90_fine_voxels, b.p90_max, true, 2)}<small class="muted">${fmt(v.p90_um, 1)} µm</small></td>
+      <td>${gauge(100 * v.far / v.lines_up, 100 * b.far_share_max, true, 0, " %")}<small class="muted">${v.far} of ${v.lines_up}</small></td></tr>`;
+  return `<table class="bar-table"><thead><tr><th></th><th></th><th>lining up ≥ ${b.min_lines_up}</th>
+    <th>median ≤ ${b.median_max}</th><th>p90 ≤ ${b.p90_max}</th><th>over ${b.far_voxels} ≤ ${100 * b.far_share_max} %</th></tr></thead>
+    <tbody>${row("bend", s.scores.bend)}${row("affine", s.scores.affine)}</tbody></table>
+    <div class="muted">fine voxels against the hold-out set · bar ${b.version} · the tick marks the limit</div>`;
+}

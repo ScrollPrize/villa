@@ -103,13 +103,8 @@ function showResult() {
   const box = $("result"), s = state.scores;
   box.hidden = !s;
   if (!s) return;
-  const line = (name, v) => !v.lines_up ? `<div>${name}: nothing lines up yet</div>` :
-    `<div><b class="${v.bar.passes ? "pass" : "fail"}">${name} ${v.bar.passes ? "passes" : "misses"}</b> ·
-      median ${fmt(v.median_fine_voxels)} / p90 ${fmt(v.p90_fine_voxels)} fine voxels
-      (${fmt(v.median_um, 1)} / ${fmt(v.p90_um, 1)} µm) · over ${s.bar.far_voxels}: ${v.far} of ${v.lines_up}</div>`;
-  box.innerHTML = line("bend", s.scores.bend) + line("affine", s.scores.affine) +
-    `<div class="muted">bar ${s.bar.version}: median ≤ ${s.bar.median_max}, p90 ≤ ${s.bar.p90_max}, at least ${s.bar.min_lines_up} lining up` +
-    (state.score_stale ? " · scored before your latest answers: run the pair to score again" : "") + `</div>` +
+  box.innerHTML = barTable(s) + `<div class="muted">` +
+    (state.score_stale ? "scored before your latest answers: run the pair to score again" : "") + `</div>` +
     (s.drift ? `<div class="${s.drift.judge_again.length ? "fail" : "muted"}">measured again under the fit, the hold-out
       positions move ${fmt(s.drift.median)} median, ${fmt(s.drift.max)} at most (fine voxels)${s.drift.judge_again.length ?
       ` · worth judging again: ${s.drift.judge_again.map(id => `<a href="#" data-again="${id}">${id}</a>`).join(", ")}` : ""}</div>` : "");

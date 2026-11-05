@@ -69,10 +69,21 @@ function paramsCell(r) {
   return `hold-out ${p.holdout.patches} · fit ${p.fit.patches} × ${p.fit.passes}<div class="sub">blind round of ${p.blind.count}</div>${scale}`;
 }
 
-function scoreCell(v) {
+// How far each missed check is from the bar, e.g. "median 0.02 over".
+function misses(v, bar) {
+  if (!bar || v.passes) return "";
+  const over = [];
+  if (v.lines_up < bar.min_lines_up) over.push(`${bar.min_lines_up - v.lines_up} too few lining up`);
+  if (v.median_fine_voxels > bar.median_max) over.push(`median ${fmt(v.median_fine_voxels - bar.median_max)} over`);
+  if (v.p90_fine_voxels > bar.p90_max) over.push(`p90 ${fmt(v.p90_fine_voxels - bar.p90_max)} over`);
+  if (v.far > bar.far_share_max * v.lines_up) over.push(`${v.far} over ${bar.far_voxels} (${Math.round(100 * v.far / v.lines_up)} %, ≤ ${100 * bar.far_share_max} %)`);
+  return over.length ? `<div class="sub miss">${over.join(" · ")}</div>` : "";
+}
+
+function scoreCell(v, bar) {
   if (!v || v.median_fine_voxels == null) return `<span class="muted">–</span>`;
   const mark = v.passes ? `<span class="ok">✓</span>` : `<span class="miss">✗</span>`;
-  return `${mark} ${fmt(v.median_fine_voxels)} / ${fmt(v.p90_fine_voxels)}` +
+  return `${mark} ${fmt(v.median_fine_voxels)} / ${fmt(v.p90_fine_voxels)}` + misses(v, bar) +
     `<div class="sub">${fmt(v.median_um, 1)} / ${fmt(v.p90_um, 1)} µm · worst ${fmt(v.worst_fine_voxels, 1)} · ${v.far} over 5</div>`;
 }
 
@@ -116,7 +127,7 @@ function draw() {
       <td>${escapeHtml(r.source)}<div class="sub">${escapeHtml(r.folder)}</div></td>
       <td class="wrap">${standing(r)}</td><td>${fitCell(r)}</td><td>${paramsCell(r)}</td>
       <td class="num">${r.scores ? r.scores.bend?.lines_up ?? "–" : "–"}</td>
-      <td>${scoreCell(r.scores?.bend)}</td><td>${scoreCell(r.scores?.affine)}</td>
+      <td>${scoreCell(r.scores?.bend, r.bar)}</td><td>${scoreCell(r.scores?.affine, r.bar)}</td>
       <td>${blindCell(r)}</td><td class="wrap">${decisionCell(r)}</td></tr>`;
     return main + (open.has(key) && r.history ? history(r) : "");
   }).join("");

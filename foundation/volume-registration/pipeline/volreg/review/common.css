@@ -40,3 +40,15 @@ table { border-collapse: collapse; width: 100%; font-variant-numeric: tabular-nu
 td, th { padding: 2px 6px; border-bottom: 1px solid var(--line); text-align: left; }
 th { color: var(--muted); font-weight: 500; }
 td.num, th.num { text-align: right; }
+
+/* The bar: one gauge per check, its tick the limit. */
+.bar-table { border-collapse: collapse; margin: 4px 0; }
+.bar-table th, .bar-table td { padding: 3px 10px 3px 0; text-align: left; vertical-align: top; font-size: 12px; }
+.bar-table thead th { font-weight: normal; color: var(--muted); }
+.gauge { display: grid; grid-template-columns: auto 70px; gap: 0 6px; align-items: center; }
+.gauge small { grid-column: 1 / -1; }
+.gauge.ok small { color: var(--good); } .gauge.miss small { color: var(--bad); }
+.gauge .track { position: relative; height: 6px; background: var(--line); border-radius: 3px; }
+.gauge .fill { position: absolute; left: 0; top: 0; bottom: 0; border-radius: 3px; }
+.gauge.ok .fill { background: var(--good); } .gauge.miss .fill { background: var(--bad); }
+.gauge .tick { position: absolute; left: 50%; top: -3px; bottom: -3px; width: 2px; background: var(--ink); }

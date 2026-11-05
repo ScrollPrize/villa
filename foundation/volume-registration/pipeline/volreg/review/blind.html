@@ -73,13 +73,11 @@ async function load() {
 }
 
 function showScores() {
-  const s = state.scores, line = (name, v) => !v.lines_up ? "" :
-    `<div><b class="${v.bar.passes ? "pass" : "fail"}">${name} ${v.bar.passes ? "passes" : "misses"}</b> ·
-      ${fmt(v.median_fine_voxels)} / ${fmt(v.p90_fine_voxels)} fine voxels · over ${s.bar.far_voxels}: ${v.far} of ${v.lines_up}</div>`;
-  $("scores").innerHTML = line("bend", s.scores.bend) + line("affine", s.scores.affine) +
+  const s = state.scores;
+  $("scores").innerHTML = barTable(s) +
     (s.drift ? `<div class="${s.drift.judge_again.length ? "fail" : "muted"}">hold-out positions measured again under the fit move
       ${fmt(s.drift.median)} median, ${fmt(s.drift.max)} at most${s.drift.judge_again.length ? ` · ${s.drift.judge_again.length} lining-up patches worth judging again` : ""}</div>` : "") +
-    `<p class="muted">bar ${s.bar.version}. A bend is kept only if it wins its blind round; you may still keep a barely visible bend out.</p>`;
+    `<p class="muted">A bend is kept only if it wins its blind round; you may still keep a barely visible bend out.</p>`;
 }
 
 async function showItem() {
