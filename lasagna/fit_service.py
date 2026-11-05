@@ -660,7 +660,7 @@ def _store_uploaded_object(body: dict[str, Any]) -> dict[str, str]:
 
 
 def _is_surface_ref(ref: Any) -> bool:
-    """A stored surface: {"type": "surface", "uuid": ..., "revision": optional geometry revision}."""
+    """A stored surface: {"type": "surface", "uuid": ...}, at a numbered version with "generation" and "version"."""
     return isinstance(ref, dict) and ref.get("type") == "surface"
 
 
@@ -673,7 +673,12 @@ def _require_store() -> stored_surfaces.StoreSession:
 def _stored_surface_path(ref: dict[str, Any]) -> str:
     """The fit's reference to a stored surface (read from the service store)."""
     _require_store()
-    return stored_surfaces.surface_ref(str(ref.get("uuid") or ""), ref.get("revision") or None)
+    if "revision" in ref:
+        raise ValueError("stored surface references select a numbered version (generation and version), not a revision")
+    version = ref.get("version")
+    if version is None:
+        return stored_surfaces.surface_ref(str(ref.get("uuid") or ""))
+    return stored_surfaces.surface_ref(str(ref.get("uuid") or ""), (str(ref.get("generation") or ""), int(version)))
 
 
 def _stored_model_path(ref: dict[str, Any]) -> Path:

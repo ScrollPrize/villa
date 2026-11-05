@@ -15,7 +15,7 @@ if ROOT not in sys.path:
 	sys.path.insert(0, ROOT)
 
 try:
-	from vc_object_store import ObjectStore
+	from vc_object_store import ObjectStore, Surface
 	from vc_object_store.documents import attached_document
 	from vc_object_store.surfaces import create_surface
 except ImportError:  # pragma: no cover - the store bindings are an optional dependency
@@ -92,6 +92,29 @@ class StoredSurfaceReadTest(unittest.TestCase):
 			surface = stored_surfaces.read_surface(store, stored_surfaces.surface_ref(uid), volume=VOLUME)
 			self.assertEqual(surface.xyz[0, 0].tolist(), [-1.0, -1.0, -1.0])
 			self.assertEqual(surface.xyz[0, 1].tolist(), [-1.0, -1.0, -1.0])
+
+	def test_numbered_version_refs_read_that_version(self) -> None:
+		with tempfile.TemporaryDirectory() as td:
+			store = Path(td) / "objects.vcobj"
+			ObjectStore.create(str(store), author="test").close()
+			xyz = np.full((2, 2, 3), 30.0, "<f4")
+			uid = create_surface(store, xyz, name="s", scale=1.0, volume=VOLUME, tool="test")
+			first = stored_surfaces.read_surface(store, stored_surfaces.surface_ref(uid), volume=VOLUME)
+			with ObjectStore.open(str(store), author="test") as db:
+				with db.write(expected_versions={uid: 1}) as tx:
+					tx.put_geometry(uid, Surface.from_arrays(np.ascontiguousarray(xyz + 1), [1.0, 1.0]),
+									db.current_geometry(uid)["uuid"])
+			ref = stored_surfaces.surface_ref(uid, first.version)
+			self.assertEqual(stored_surfaces.parse_surface_ref(ref), (uid, first.version))
+			self.assertEqual(first.version[1], 1)
+			older = stored_surfaces.read_surface(store, ref, volume=VOLUME)
+			current = stored_surfaces.read_surface(store, stored_surfaces.surface_ref(uid), volume=VOLUME)
+			self.assertEqual((older.version, current.version[1]), (first.version, 2))
+			np.testing.assert_array_equal(older.xyz, xyz)
+			np.testing.assert_array_equal(current.xyz, xyz + 1)
+			for bad in (f"vcobj:{uid}@r1", f"vcobj:{uid}@g/0", f"vcobj:{uid}@/3"):
+				with self.assertRaisesRegex(ValueError, "generation"):
+					stored_surfaces.parse_surface_ref(bad)
 
 	def test_approval_surface_scales_in_memory(self) -> None:
 		with tempfile.TemporaryDirectory() as td:
@@ -242,9 +265,13 @@ class ServiceStoreRequestTest(unittest.TestCase):
 		self.assertEqual(len(receipt["objects"]), 1)
 		resolved = fit_service._body_with_resolved_job_spec({"job_spec": {
 			"model": {"type": "surface", "uuid": self.source},
-			"config": {"external_surfaces": [{"type": "surface", "uuid": self.source, "revision": "r1"}]},
+			"config": {"external_surfaces": [{"type": "surface", "uuid": self.source, "generation": "g1", "version": 2}]},
 		}})
-		self.assertEqual(resolved["config"]["external_surfaces"][0]["path"], f"vcobj:{self.source}@r1")
+		self.assertEqual(resolved["config"]["external_surfaces"][0]["path"], f"vcobj:{self.source}@g1/2")
+		with self.assertRaisesRegex(ValueError, "numbered version"):
+			fit_service._body_with_resolved_job_spec({"job_spec": {
+				"model": {"type": "surface", "uuid": self.source},
+				"config": {"external_surfaces": [{"type": "surface", "uuid": self.source, "revision": "r1"}]}}})
 		model = Path(resolved["model_input"])
 		self.assertEqual(model.read_bytes(), b"checkpoint")
 		self.assertNotEqual(model, checkpoint)  # a cached copy of the published bytes

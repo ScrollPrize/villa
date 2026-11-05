@@ -1,6 +1,7 @@
 """Surfaces in a VC object store (``vc_object_store``) for the fit service and its tools.
 
-A stored surface is named by a reference string ``vcobj:<uuid>`` or ``vcobj:<uuid>@<geometry revision>`` in the
+A stored surface is named by a reference string ``vcobj:<uuid>`` (its current version) or
+``vcobj:<uuid>@<generation>/<version>`` (that numbered version of the store's history) in the
 places a tifxyz directory path is accepted; the store file and the volume whose voxels coordinates are in travel
 separately (``--store`` / ``--volume-uuid``). Geometry is a ``points`` array (rows x columns x 3, xyz, -1 for a
 missing vertex), an optional ``valid`` array and per-vertex channels (``d``, ``approval``, ...), as VC3D stores
@@ -20,16 +21,28 @@ import numpy as np
 REF_PREFIX = "vcobj:"
 
 
-def surface_ref(surface_uuid: str, geometry_revision: str | None = None) -> str:
-	return REF_PREFIX + str(surface_uuid) + (f"@{geometry_revision}" if geometry_revision else "")
+def surface_ref(surface_uuid: str, version: tuple[str, int] | None = None) -> str:
+	"""The reference to a surface's current version, or to ``version`` = (generation, number)."""
+	if version is None:
+		return REF_PREFIX + str(surface_uuid)
+	generation, number = version
+	if not generation or int(number) < 1:
+		raise ValueError(f"not a numbered version: {version!r}")
+	return f"{REF_PREFIX}{surface_uuid}@{generation}/{int(number)}"
 
 
-def parse_surface_ref(value: object) -> tuple[str, str | None] | None:
-	"""(uuid, geometry revision or None) of a stored-surface reference; None for anything else (a path)."""
+def parse_surface_ref(value: object) -> tuple[str, tuple[str, int] | None] | None:
+	"""(uuid, (generation, version) or None for the current version) of a stored-surface reference; None for
+	anything else (a path)."""
 	if not isinstance(value, str) or not value.startswith(REF_PREFIX):
 		return None
-	uuid_text, _, revision = value[len(REF_PREFIX):].partition("@")
-	return str(uuidlib.UUID(uuid_text)), (revision or None)
+	uuid_text, at, version = value[len(REF_PREFIX):].partition("@")
+	if not at:
+		return str(uuidlib.UUID(uuid_text)), None
+	generation, slash, number = version.partition("/")
+	if not generation or not slash or not number.isdigit() or int(number) < 1:
+		raise ValueError(f"stored surface reference {value!r} does not name <generation>/<version>")
+	return str(uuidlib.UUID(uuid_text)), (generation, int(number))
 
 
 def open_store(store: str | Path, *, read_only: bool = True, author: str | None = None):
@@ -114,7 +127,7 @@ class StoreSession:
 
 
 class StoredSurface:
-	"""One revision of a stored surface in voxels of a volume.
+	"""One version of a stored surface in voxels of a volume.
 
 	xyz: (H, W, 3) float32, -1 at missing vertices; meta: the record meta plus ``uuid``, ``name`` and the grid
 	``scale``; channel(name) reads a per-vertex channel (None when absent)."""
@@ -122,7 +135,8 @@ class StoredSurface:
 	def __init__(self, store, surface_uuid, grid):
 		self._store = store
 		self.uuid = surface_uuid
-		self.revision = grid.geometry_revision
+		self.version = (grid.generation, grid.version)
+		self._geometry = grid.geometry_revision
 		self.xyz = grid.points
 		self._channels = grid.channels
 		record = grid.record
@@ -133,7 +147,7 @@ class StoredSurface:
 		if name not in self._channels:
 			return None
 		with open_store(self._store) as store:
-			return np.array(store.read_geometry_arrays([self.revision], name).values)
+			return np.array(store.read_geometry_arrays([self._geometry], name).values)
 
 
 def read_surface(store: str | Path, ref: str, *, volume: str | None, target_scale: float = 1.0) -> StoredSurface:
@@ -143,8 +157,9 @@ def read_surface(store: str | Path, ref: str, *, volume: str | None, target_scal
 	parsed = parse_surface_ref(ref)
 	if parsed is None:
 		raise ValueError(f"not a stored surface reference: {ref!r}")
-	surface_uuid, revision = parsed
+	surface_uuid, version = parsed
 	if volume is None:
 		raise ValueError(f"reading stored surface {surface_uuid} needs the volume its coordinates are in")
-	grid = read_grid(store, surface_uuid, volume=volume, geometry_revision=revision, target_scale=target_scale)
+	generation, number = version or (None, None)
+	grid = read_grid(store, surface_uuid, volume=volume, version=number, generation=generation, target_scale=target_scale)
 	return StoredSurface(store, surface_uuid, grid)
