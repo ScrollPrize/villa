@@ -132,3 +132,23 @@ def test_settings_change_a_stage_and_are_logged(pairs):
     for stage, values in (("fit", {"seed": 1}), ("capture", {"probes": 5}), ("fit", {"patches": 0})):
         with pytest.raises(ValueError):
             reviews.set_params("pair-a", stage, values)
+
+
+def test_the_fits_page_lists_every_record_with_its_scores_and_tally(pairs, tmp_path):
+    reviews, record = pairs
+    elsewhere = tmp_path.parent / (tmp_path.name + "-records")
+    other = rec.Record(elsewhere / "pair-b")
+    other.write(rec.PAIR, {"pair": "C-to-D", "coarse_side": "fixed",
+                           "fixed": {"voxel_um": 8.0}, "moving": {"voxel_um": 2.0}})
+    record.write(rec.PAIR, record.read(rec.PAIR) | {"fixed": {"voxel_um": 9.4}, "moving": {"voxel_um": 2.4}})
+    (record.directory / "work" / "fit" / "fit.json").write_text(json.dumps(
+        {"fit": "f002", "model": "affine12", "points": {"ids": ["p0009"] * 3}, "bend": None}))
+    reviews.pick("pair-a", "c001", 0, 1)
+    reviews.pick("pair-a", "c001", 1, "unsure")
+    reviews.records = [elsewhere]
+    rows = {row["name"]: row for row in reviews.fits()["fits"]}
+    a = rows["pair-a"]
+    assert a["source"] == "pipeline" and a["fit"]["points"] == 3
+    assert a["scores"]["bend"]["passes"] and not a["scores"]["affine"]["passes"]
+    assert a["blind"]["tally"]["f002"] == 1 and a["blind"]["tally"]["unsure"] == 1
+    assert rows["pair-b"]["source"] == "first runs" and rows["pair-b"]["state"] == "needs a hold-out set"

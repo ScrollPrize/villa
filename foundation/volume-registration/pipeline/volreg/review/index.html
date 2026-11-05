@@ -43,7 +43,7 @@ table.steps td { vertical-align: top; padding: 5px 6px; }
 </style>
 </head>
 <body>
-<header><h1>Registration pairs</h1><span id="who" class="muted"></span>
+<header><h1>Registration pairs</h1><a href="/fits">all fits →</a><span id="who" class="muted"></span>
   <label class="filter"><input type="checkbox" id="hide-done"> hide finished pairs <span id="hidden" class="muted"></span></label>
   <span id="error"></span></header>
 <main class="single"><div id="pairs"></div></main>
@@ -109,7 +109,7 @@ async function load() {
     const yours = p.stages.filter(s => s.state === "waiting");
     const failed = p.stages.filter(s => s.state === "failed");
     const open = remembered(`open:${p.name}`, !finished(p));
-    return `<details class="pair section" data-name="${escapeHtml(p.name)}" ${open ? "open" : ""}>
+    return `<details class="pair section" id="${escapeHtml(p.name)}" data-name="${escapeHtml(p.name)}" ${open ? "open" : ""}>
       <summary class="pair-head"><h3>${escapeHtml(p.name)}</h3>
         <div class="overview">${p.stages.map(s => `<div class="chip ${s.state}" title="${s.name}: ${STATE_TEXT[s.state]}"></div>`).join("")}</div>
         <span>${summary(p)}</span><span class="muted">${escapeHtml(p.pair)}</span></summary>

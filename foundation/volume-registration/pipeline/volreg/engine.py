@@ -239,6 +239,30 @@ class Pipeline:
             launch(name)
         return states, started
 
+    def adopt_needs(self, name, reason):
+        """After a change to what a stage needs (not to what it does), take its finished
+        result as resting on the new needs, instead of running it again. Only the needs
+        change: its parameters must match, and a stage whose new needs are not all done is
+        left alone. The old stamp is kept beside, and the change is logged with `reason`."""
+        stamp = self.stamp(name)
+        if not stamp or stamp.get("status") != "ok":
+            raise ValueError(f"{name} has no finished result to keep")
+        inputs = self.inputs(name)
+        if stamp["inputs"]["params"] != inputs["params"]:
+            raise ValueError(f"{name} ran with other parameters; run it again instead")
+        if not all(self.state(need) == DONE for need in self.stages[name].needs):
+            raise ValueError(f"what {name} needs is not done yet")
+        if stamp["inputs"] == inputs:
+            return False
+        history = self.work("stages", "history")
+        history.mkdir(parents=True, exist_ok=True)
+        (history / f"{name}.{rec.now().replace(':', '')}.json").write_text(json.dumps(stamp, indent=1) + "\n")
+        self._write_stamp(name, stamp | {"inputs": inputs, "adopted": {"at": rec.now(), "reason": reason,
+                                                                        "needs_were": stamp["inputs"]["needs"]}})
+        self.record.log("needs-adopted", stage=name, reason=reason, were=stamp["inputs"]["needs"],
+                        now=inputs["needs"])
+        return True
+
     def redo(self, name):
         """Make a stage and everything after it that depends on it run again. Its stamp is
         kept beside, so what it was is not lost."""

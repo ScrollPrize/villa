@@ -5,9 +5,11 @@
     python -m volreg.cli answer PAIR UNIT ANSWER   a hold-out answer (or "clear")
     python -m volreg.cli more PAIR --holdout N | --fit N
     python -m volreg.cli redo PAIR STAGE
+    python -m volreg.cli adopt PAIR STAGE REASON   keep a result after a change to what its stage needs
     python -m volreg.cli revisit PAIR TEXT         an open question for a later round (--done N closes it)
     python -m volreg.cli check RECORD [RECORD ...]
     python -m volreg.cli migrate SESSION OUT [--staged DIR]
+    python -m volreg.cli import PAIR SESSION RECORD          a first run's patches, fits and answers
 
 The reviewer is taken from --handle and --email, or VOLREG_HANDLE and VOLREG_EMAIL.
 """
@@ -75,10 +77,21 @@ def show(pipeline):
         print(line)
 
 
+def python():
+    """How a background job starts Python. `uv run --with-requirements` runs in an
+    environment it deletes when it exits, so a job started from a `volreg run` that has
+    since finished would find no interpreter; such a job goes through `uv run` again."""
+    if "/uv/builds-v" not in sys.executable:
+        return [sys.executable]
+    requirements = Path(__file__).resolve().parent.parent / "requirements.txt"
+    return ["uv", "run", "-q", "--python", f"{sys.version_info.major}.{sys.version_info.minor}",
+            "--with-requirements", str(requirements), "python"]
+
+
 def advance(pair):
     """Start every stage of a pair that can run, each as a background `volreg job`."""
     pipeline = pipeline_stages.pipeline(pair)
-    command = [sys.executable, "-m", "volreg.cli", "job", str(pair)]
+    command = python() + ["-m", "volreg.cli", "job", str(pair)]
     _states, started = pipeline.advance(lambda name: pipeline.start(name, command + [name]))
     return pipeline, started
 
@@ -156,6 +169,10 @@ def main(argv=None):
     redo = commands.add_parser("redo", help="run a stage and what depends on it again")
     redo.add_argument("pair")
     redo.add_argument("stage")
+    adopt = commands.add_parser("adopt", help="keep a result after a change to what its stage needs")
+    adopt.add_argument("pair")
+    adopt.add_argument("stage")
+    adopt.add_argument("reason")
     more = commands.add_parser("more", help="ask for more hold-out or fit patches")
     more.add_argument("pair")
     more.add_argument("--holdout", type=int, default=0)
@@ -172,6 +189,10 @@ def main(argv=None):
     migrate.add_argument("session")
     migrate.add_argument("out")
     migrate.add_argument("--staged")
+    imported = commands.add_parser("import", help="take a first run's patches, fits and answers")
+    imported.add_argument("pair")
+    imported.add_argument("session")
+    imported.add_argument("record")
     for command in (answer, migrate, more, redo, revisit):
         command.add_argument("--handle")
         command.add_argument("--email")
@@ -190,6 +211,14 @@ def main(argv=None):
         if status == 0:
             advance(args.pair)
         return status
+    elif args.command == "import":
+        pipeline = pipeline_stages.pipeline(args.pair)
+        with pipeline_stages.session_lock(pipeline):
+            print(migration.import_session(args.session, args.record, args.pair))
+        advance(args.pair)
+    elif args.command == "adopt":
+        changed = pipeline_stages.pipeline(args.pair).adopt_needs(args.stage, args.reason)
+        print(f"{args.stage}: {'now rests on its new needs' if changed else 'already up to date'}")
     elif args.command == "redo":
         affected = pipeline_stages.pipeline(args.pair).redo(args.stage)
         print(f"will run again: {', '.join(affected)}")

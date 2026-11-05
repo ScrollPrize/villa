@@ -1,0 +1,149 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Registration Fits</title>
+<link rel="stylesheet" href="/common.css">
+<style>
+.filters { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; margin-bottom: 8px; }
+.scroll { overflow-x: auto; }
+table.fits td, table.fits th { vertical-align: top; white-space: nowrap; padding: 4px 8px; }
+table.fits td.wrap { white-space: normal; min-width: 14em; max-width: 26em; }
+table.fits tbody tr.main { cursor: pointer; }
+table.fits tbody tr.main:hover { background: color-mix(in srgb, var(--accent) 6%, transparent); }
+.sub { font-size: 11px; color: var(--muted); }
+.ok { color: var(--good); } .miss { color: var(--bad); }
+.tag { display: inline-block; border: 1px solid var(--line); border-radius: 10px; padding: 0 7px; font-size: 11px; }
+.tag.finished { border-color: var(--good); color: var(--good); }
+.tag.yours { border-color: var(--select); background: color-mix(in srgb, var(--select) 30%, transparent); }
+.tag.running { border-color: var(--accent); color: var(--accent); }
+.tag.failed, .tag.override { border-color: var(--bad); color: var(--bad); }
+tr.history td { background: var(--bg); }
+tr.history table td, tr.history table th { border: none; padding: 1px 8px; font-size: 12px; }
+</style>
+</head>
+<body>
+<header><h1>Registration fits</h1><a href="/">← pairs</a>
+  <span id="count" class="muted"></span><span id="error"></span></header>
+<main class="single"><section>
+  <div class="filters">
+    <label>show <select id="source">
+      <option value="">every source</option><option value="pipeline">pipeline</option>
+      <option value="first runs">first runs</option></select></label>
+    <label><input type="checkbox" id="decided"> decided only</label>
+    <input id="search" placeholder="filter by pair" size="18">
+    <span class="muted">Distances are in fine voxels against the hold-out set; the bar: median ≤ <span id="median-max"></span>,
+      p90 ≤ <span id="p90-max"></span>, at least <span id="min-lines"></span> lining up. Click a pipeline pair for every fit its session made.</span>
+  </div>
+  <div class="scroll"><table class="fits">
+    <thead><tr><th>pair</th><th>source</th><th>where it stands</th><th>fit</th><th>parameters</th>
+      <th class="num">lining up</th><th>bend median / p90</th><th>affine median / p90</th>
+      <th>blind: bend · affine · unsure</th><th>decision</th></tr></thead>
+    <tbody id="rows"></tbody></table></div>
+</section></main>
+<script src="/common.js"></script>
+<script>
+const remembered = (key, fallback) => { try { const v = localStorage.getItem(key); return v === null ? fallback : JSON.parse(v); } catch { return fallback; } };
+const remember = (key, value) => { try { localStorage.setItem(key, JSON.stringify(value)); } catch {} };
+let rows = [], open = new Set();
+
+function standing(r) {
+  if (r.decision) return `<span class="tag finished">decided</span>${r.revisit.length ? ` <span class="sub">revisit open</span>` : ""}`;
+  const s = r.state || "";
+  const kind = /failed/.test(s) ? "failed" : /waiting/.test(s) ? "yours" : /running/.test(s) ? "running" : "";
+  return `<span class="tag ${kind}">${escapeHtml(s)}</span>`;
+}
+
+function fitCell(r) {
+  if (!r.fit) return `<span class="muted">none yet</span>`;
+  const f = r.fit, bend = f.bend ? `bend λ ${f.bend.regularisation}, ${Math.round(f.bend.effective_parameters)} eff. params` : "no bend";
+  const current = r.current && r.current !== f.id ? ` <span class="sub">(session at ${escapeHtml(r.current)})</span>` : "";
+  return `<b>${escapeHtml(f.id)}</b> ${escapeHtml(f.model)}${current}<div class="sub">${f.points} points · ${f.robust} · hold-out by ${f.hold_out}</div><div class="sub">${bend}</div>`;
+}
+
+function paramsCell(r) {
+  const scale = `<div class="sub">${r.coarse_um} → ${r.fine_um} µm</div>`;
+  if (!r.params) return `<span class="muted">first runs</span>${scale}`;
+  const p = r.params;
+  return `hold-out ${p.holdout.patches} · fit ${p.fit.patches} × ${p.fit.passes}<div class="sub">blind round of ${p.blind.count}</div>${scale}`;
+}
+
+function scoreCell(v) {
+  if (!v || v.median_fine_voxels == null) return `<span class="muted">–</span>`;
+  const mark = v.passes ? `<span class="ok">✓</span>` : `<span class="miss">✗</span>`;
+  return `${mark} ${fmt(v.median_fine_voxels)} / ${fmt(v.p90_fine_voxels)}` +
+    `<div class="sub">${fmt(v.median_um, 1)} / ${fmt(v.p90_um, 1)} µm · worst ${fmt(v.worst_fine_voxels, 1)} · ${v.far} over 5</div>`;
+}
+
+function blindCell(r) {
+  const b = r.blind;
+  if (!b) return `<span class="muted">–</span>`;
+  if (!b.done) return `<span class="sub">round ${escapeHtml(b.round)} under way</span>`;
+  const t = b.tally, keys = Object.keys(t).filter(k => k !== "unsure" && k !== "none");
+  const affine = keys.find(k => k.endsWith("/affine")), bend = keys.find(k => k !== affine);
+  return `${t[bend] ?? 0} · ${t[affine] ?? 0} · ${t.unsure}${t.none ? ` <span class="sub">(${t.none} neither)</span>` : ""}<div class="sub">${b.items} patches</div>`;
+}
+
+function decisionCell(r) {
+  const d = r.decision;
+  if (!d) return r.status ? `<span class="sub">${escapeHtml(r.status)}</span>` : `<span class="muted">–</span>`;
+  const override = d.override ? ` <span class="tag override">override: misses ${escapeHtml((d.override.bar_missed || []).join(", "))}</span>` : "";
+  return `publish <b>${escapeHtml(d.publish)}</b> of ${escapeHtml(d.fit)}${override}` +
+    (d.reason ? `<div class="sub">${escapeHtml(d.reason)}</div>` : "") +
+    (d.by ? `<div class="sub">${escapeHtml(d.by.handle)}${d.at ? ", " + escapeHtml(d.at.slice(0, 10)) : ""}</div>` : "");
+}
+
+function history(r) {
+  return `<tr class="history"><td colspan="10"><table><thead><tr><th>fit</th><th>from</th><th>made</th><th>model</th>
+    <th class="num">points</th><th class="num">held-out RMS</th><th>bend</th><th></th></tr></thead><tbody>${
+    r.history.map(h => `<tr><td><b>${escapeHtml(h.id)}</b>${h.id === r.current ? " (current)" : ""}</td>
+      <td>${escapeHtml(h.parent || "")}</td><td>${escapeHtml((h.at || "").replace("T", " ").slice(0, 16))}</td>
+      <td>${escapeHtml(h.model || "")}</td><td class="num">${h.points}</td><td class="num">${fmt(h.held_out_rms)}</td>
+      <td>${h.bend ? "yes" : "no"}</td><td class="sub">${h.imported ? "imported from the first runs" : ""}</td></tr>`).join("")
+    }</tbody></table></td></tr>`;
+}
+
+function draw() {
+  const source = $("source").value, decided = $("decided").checked, search = $("search").value.trim().toLowerCase();
+  const shown = rows.filter(r => (!source || r.source.startsWith(source)) && (!decided || r.decision) &&
+    (!search || (r.name + " " + r.pair).toLowerCase().includes(search)));
+  $("count").textContent = `${shown.length} of ${rows.length}`;
+  $("rows").innerHTML = shown.map(r => {
+    const key = `${r.folder}/${r.name}`;
+    const main = `<tr class="main" data-key="${escapeHtml(key)}">
+      <td>${r.driven ? `<a href="/#${encodeURIComponent(r.name)}">${escapeHtml(r.name)}</a>` : escapeHtml(r.name)}<div class="sub">${escapeHtml(r.pair)}</div></td>
+      <td>${escapeHtml(r.source)}<div class="sub">${escapeHtml(r.folder)}</div></td>
+      <td class="wrap">${standing(r)}</td><td>${fitCell(r)}</td><td>${paramsCell(r)}</td>
+      <td class="num">${r.scores ? r.scores.bend?.lines_up ?? "–" : "–"}</td>
+      <td>${scoreCell(r.scores?.bend)}</td><td>${scoreCell(r.scores?.affine)}</td>
+      <td>${blindCell(r)}</td><td class="wrap">${decisionCell(r)}</td></tr>`;
+    return main + (open.has(key) && r.history ? history(r) : "");
+  }).join("");
+  for (const tr of document.querySelectorAll("tr.main")) tr.onclick = event => {
+    if (event.target.closest("a")) return;
+    const key = tr.dataset.key;
+    open.has(key) ? open.delete(key) : open.add(key);
+    remember("fits-open", [...open]); draw();
+  };
+}
+
+async function load() {
+  const state = await call("/api/fits");
+  rows = state.fits;
+  const bar = rows.find(r => r.bar)?.bar;
+  if (bar) { $("median-max").textContent = bar.median_max; $("p90-max").textContent = bar.p90_max; $("min-lines").textContent = bar.min_lines_up; }
+  draw();
+}
+
+open = new Set(remembered("fits-open", []));
+$("source").value = remembered("fits-source", "");
+$("decided").checked = remembered("fits-decided", false);
+$("source").onchange = () => { remember("fits-source", $("source").value); draw(); };
+$("decided").onchange = () => { remember("fits-decided", $("decided").checked); draw(); };
+$("search").oninput = draw;
+load().catch(e => { $("error").textContent = e.message; });
+setInterval(() => load().catch(() => {}), 15000);
+</script>
+</body>
+</html>

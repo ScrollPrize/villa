@@ -81,3 +81,29 @@ def test_revisit_is_kept_until_done(tmp_path):
     main(["revisit", str(tmp_path / "out"), "--done", "1", *who])
     assert "revisit" not in stage_of(record)
     assert [event["kind"] for event in record.events()][-2:] == ["revisit", "revisit-done"]
+
+
+def test_import_carries_patches_fits_and_answers_into_a_pair(tmp_path):
+    import pytest
+    old = session(tmp_path)
+    migrated = migrate.migrate(old, tmp_path / "out", REVIEWER)
+    target = tmp_path / "pair" / "work" / "session"
+    (target / "blocks").mkdir(parents=True)
+    (target / "fits").mkdir()
+    probes = [{"id": f"p{index:04d}", "origin_zyx": [0, 0, 0], "round": 0, "auto": "ok",
+               "measurement": None} for index in (1, 2)]
+    (target / "session.json").write_text(json.dumps({
+        "schema": migrate.SESSION_SCHEMA, "fixed": {"url": "coarse"}, "moving": {"url": "fine"},
+        "sampling": {"block": 128, "sign": 1.0, "rounds": [{"along": None}]},
+        "patches": probes, "fits": [], "current": "start"}))
+    result = migrate.import_session(old, migrated.directory, tmp_path / "pair")
+    assert result == {"patches": 30, "events": 22, "current": "prior-f001"}
+    state = json.loads((target / "session.json").read_text())
+    imported = state["patches"][2:]
+    assert [patch["id"] for patch in imported] == [f"p{index:04d}" for index in range(3, 33)]
+    assert {patch["measurement"]["under"] for patch in imported} == {"start"}
+    assert state["fits"][0]["used"][0] == "p0003" and (target / "fits" / "prior-f001.json").exists()
+    answers = rec.Record(tmp_path / "pair").answers()
+    assert set(answers) == {f"p{index:04d}" for index in range(3, 25)}
+    with pytest.raises(ValueError, match="already has a hold-out set"):
+        migrate.import_session(old, migrated.directory, tmp_path / "pair")

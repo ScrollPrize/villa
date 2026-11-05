@@ -371,10 +371,13 @@ def stages():
         Stage("judge-holdout", "judge the hold-out set", needs=("holdout",),
               complete=holdout_judged, identity=holdout_identity,
               params={"min_lines_up": BAR["min_lines_up"]}),
-        # Starts right after the hold-out set is drawn, while a person judges it.
-        Stage("fit", "sample, measure and fit", needs=("holdout",),
+        # Starts right after the capture check, beside the hold-out set: neither draws on the
+        # other's patches (the sampler skips taken origins, a fit never uses a hold-out
+        # patch), so more hold-out patches do not fit again, and more fit patches do not
+        # touch what a person judged.
+        Stage("fit", "sample, measure and fit", needs=("capture",),
               run=run_fit, params={"patches": 200, "passes": 2, "seed": 2000}),
-        Stage("recheck", "measure the hold-out set again under the fit", needs=("fit",),
+        Stage("recheck", "measure the hold-out set again under the fit", needs=("fit", "holdout"),
               run=run_recheck, params={"drift_fine_voxels": 0.5}),
         Stage("score", "score against the hold-out set", needs=("recheck", "judge-holdout"),
               run=run_score),

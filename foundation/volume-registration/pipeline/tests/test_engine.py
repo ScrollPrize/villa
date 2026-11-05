@@ -1,6 +1,7 @@
 """The engine's state, read off the files: done, stale, waiting, failed, redo."""
 
 import json
+from dataclasses import replace
 
 import pytest
 
@@ -110,3 +111,18 @@ def test_stamp_names_the_code_and_inputs(tmp_path):
 def test_needs_must_come_first(tmp_path):
     with pytest.raises(ValueError):
         Pipeline(tmp_path, [Stage("b", "b", needs=("a",), run=print), Stage("a", "a", run=print)])
+
+
+def test_a_result_can_be_kept_when_only_what_its_stage_needs_changes(tmp_path):
+    pipeline = make(tmp_path)
+    for name in ("draw", "fit"):
+        pipeline.run_stage(name)
+    moved = Pipeline(tmp_path, [replace(stage, needs=()) if stage.name == "fit" else stage
+                                for stage in pipeline.stages.values()])
+    assert moved.states()["fit"] == STALE
+    assert moved.adopt_needs("fit", "fit never read the draw")
+    assert moved.states()["fit"] == DONE
+    assert moved.record.events()[-1]["kind"] == "needs-adopted"
+    assert len(list((tmp_path / "work/stages/history").iterdir())) == 1
+    with pytest.raises(ValueError, match="other parameters"):
+        make(tmp_path, params={"draw": {"count": 20}}).adopt_needs("draw", "no")

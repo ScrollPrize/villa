@@ -5,10 +5,15 @@ It never reads a volume. What it shows comes from the record and the pictures th
 stored; what a person does is appended to the record's event log, under the reviewer the
 server was started for. Jobs it starts run as `volreg job`, as `volreg run` starts them.
 
-    python -m volreg.review.server PAIRS_DIR [--port 8790] [--host 127.0.0.1]
+    python -m volreg.review.server PAIRS_DIR [--records DIR ...] [--port 8790] [--host 127.0.0.1]
         [--handle H --email E]       (or VOLREG_HANDLE, VOLREG_EMAIL)
 
+`--records` adds folders of records to the fits page only, read-only: the first runs'
+migrated records, say, which have no pipeline to drive.
+
     GET  /                                    every pair and its stages
+    GET  /fits                                every pair's fit: parameters, state, outcome
+    GET  /api/fits
     GET  /pairs/<pair>/holdout[?unit=octants] judge the hold-out set
     GET  /pairs/<pair>/blind                  the blind round, then the decision
     GET  /api/pairs                           the pairs, their stages and what waits
@@ -39,6 +44,8 @@ from .. import stages as pipeline_stages
 
 HERE = Path(__file__).resolve().parent
 PAGES = {"": "index.html", "holdout": "holdout.html", "blind": "blind.html"}
+# How a fit is shown on the fits page: the session's own record of it, these keys only.
+FIT_HISTORY_KEYS = ("id", "parent", "at", "model", "held_out_rms", "robust", "unit")
 TEST_STRETCHES = 5
 # The settings the pair page offers, per stage: what a person may want to change between
 # runs. Everything else stays as `stages.py` sets it, and `params.json` can still hold it.
@@ -50,8 +57,9 @@ EDITABLE = {"holdout": {"patches": "hold-out patches"},
 class Reviews:
     """The pairs under a folder, and what the pages ask of them."""
 
-    def __init__(self, root, reviewer, auto_advance=True):
+    def __init__(self, root, reviewer, auto_advance=True, records=()):
         self.root = Path(root).resolve()
+        self.records = [Path(folder).resolve() for folder in records]
         self.reviewer = reviewer
         # Whether answers and decisions start the jobs they make ready (off in tests).
         self.auto_advance = auto_advance
@@ -218,15 +226,7 @@ class Reviews:
         if not rounds:
             return {"round": None, "decision": final.get("decision")}
         round_ = rounds[-1]
-        done = all(item["choice"] is not None for item in round_["items"])
-        tally = {candidate: 0 for candidate in round_["candidates"]}
-        others = {"unsure": 0, "none": 0}
-        for item in round_["items"]:
-            if isinstance(item["choice"], int):
-                for candidate in item["options"][item["choice"]]:
-                    tally[candidate] += 1
-            elif item["choice"] in others:
-                others[item["choice"]] += 1
+        done, tally = tally_of(round_)
         scores = pipeline.work("scores.json")
         return {
             "pair": pipeline.record.read(rec.PAIR)["pair"], "done": done,
@@ -235,11 +235,26 @@ class Reviews:
                                  "choice": item["choice"]}
                                 | ({"revealed": item["options"]} if done else {})
                                 for item in round_["items"]]},
-            "tally": tally | others if done else None,
+            "tally": tally if done else None,
             "scores": json.loads(scores.read_text()) if done and scores.exists() else None,
             "decision": final.get("decision"),
             "revisit": [item for item in final.get("revisit") or [] if not item.get("done")],
         }
+
+    # ------------------------------------------------------------------- the fits page
+
+    def fits(self):
+        """One row per pair, the pipeline's and the read-only records alike: the fit it
+        decided on (or, before a decision, the one it is scoring), with its parameters,
+        where the pair stands, the scores against the hold-out set, the blind tally and the
+        decision; for a pipeline pair also every fit its session made on the way."""
+        rows = []
+        folders = [(self.root, True)] + [(folder, False) for folder in self.records]
+        for folder, driven in folders:
+            for path in sorted(folder.iterdir()):
+                if (path / rec.PAIR).exists() and (not driven or (path / "work").exists()):
+                    rows.append(fit_row(path, driven, folder.name))
+        return {"fits": rows}
 
     def pick(self, name, round_id, index, choice):
         self.record(name).blind_pick(round_id, int(index), choice, self.reviewer)
@@ -274,6 +289,79 @@ class Reviews:
         return target.read_bytes(), ("application/json" if target.suffix == ".json" else "image/png")
 
 
+def tally_of(round_):
+    """Whether every item of a blind round is answered, and how often each candidate (and
+    "unsure", "none") was picked."""
+    done = all(item["choice"] is not None for item in round_["items"])
+    tally = {candidate: 0 for candidate in round_["candidates"]} | {"unsure": 0, "none": 0}
+    for item in round_["items"]:
+        if isinstance(item["choice"], int):
+            for candidate in item["options"][item["choice"]]:
+                tally[candidate] += 1
+        elif item["choice"] in tally:
+            tally[item["choice"]] += 1
+    return done, tally
+
+
+def read_json(path):
+    return json.loads(path.read_text()) if path.exists() else None
+
+
+def fit_row(path, driven, folder):
+    record = rec.Record(path)
+    pair = record.read(rec.PAIR)
+    final = record.read(rec.FINAL_REVIEW) if record.exists(rec.FINAL_REVIEW) else {}
+    stored = read_json(record.path(rec.FIT))
+    row = {"name": path.name, "folder": folder, "pair": pair["pair"], "driven": driven,
+           "source": ("pipeline, imported" if any(event["kind"] == "session-imported"
+                                                  for event in record.events())
+                      else "pipeline") if driven else "first runs",
+           "fine_um": pair[("moving" if pair["coarse_side"] == "fixed" else "fixed")]["voxel_um"],
+           "coarse_um": pair[pair["coarse_side"]]["voxel_um"],
+           "decision": final.get("decision"), "params": None, "stages": None, "history": None}
+    fit, scores = stored, stored
+    if driven:
+        pipeline = pipeline_stages.pipeline(path)
+        states = pipeline.states()
+        row["stages"] = [{"name": name, "state": states[name]} for name in pipeline.order]
+        row["params"] = {name: pipeline.stage_params(name) for name in ("holdout", "fit", "blind")}
+        if not (final.get("decision") and stored):
+            # Not stored yet: the fit the pipeline made and is scoring, if any.
+            fit, scores = read_json(pipeline.work("fit", "fit.json")), read_json(pipeline.work("scores.json"))
+        session = read_json(pipeline.work("session", "session.json"))
+        if session:
+            row["history"] = [{key: entry.get(key) for key in FIT_HISTORY_KEYS}
+                              | {"points": len(entry.get("used") or []),
+                                 "imported": bool(entry.get("imported_from")),
+                                 "bend": bool(entry.get("bend"))}
+                              for entry in session["fits"]]
+            row["current"] = session.get("current")
+        row["state"] = next((f"{entry['name']}: {entry['state']}" for entry in row["stages"]
+                             if entry["state"] != engine.DONE), "finished")
+    else:
+        row["state"] = cli.stage_of(record)
+    if fit:
+        row["fit"] = {"id": fit["fit"], "model": fit["model"], "robust": fit.get("robust"),
+                      "hold_out": fit.get("hold_out"), "unit": fit.get("unit"),
+                      "points": len(fit["points"]["ids"]), "bend": fit.get("bend")}
+    if scores and scores.get("scores"):
+        row["scores"] = {variant: {key: value.get(key) for key in
+                                   ("lines_up", "median_fine_voxels", "p90_fine_voxels",
+                                    "worst_fine_voxels", "far", "median_um", "p90_um")}
+                         | {"passes": (value.get("bar") or {}).get("passes")}
+                         for variant, value in scores["scores"].items()}
+        row["bar"] = scores.get("bar")
+        row["drift"] = scores.get("drift")
+    rounds = final.get("rounds") or []
+    if rounds:
+        done, tally = tally_of(rounds[-1])
+        row["blind"] = {"round": rounds[-1]["id"], "done": done, "items": len(rounds[-1]["items"]),
+                        "tally": tally if done else None}
+    row["revisit"] = [item["text"] for item in final.get("revisit") or [] if not item.get("done")]
+    row["status"] = final.get("status")
+    return row
+
+
 def handler_for(reviews):
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, format, *args):  # noqa: A002 - the stdlib's own name
@@ -305,8 +393,12 @@ def handler_for(reviews):
                 elif parts[0] == "pairs" and len(parts) == 3 and parts[2] in PAGES:
                     reviews.pair_dir(parts[1])
                     self.send((HERE / PAGES[parts[2]]).read_bytes(), "text/html; charset=utf-8")
+                elif parts == ["fits"]:
+                    self.send((HERE / "fits.html").read_bytes(), "text/html; charset=utf-8")
                 elif parts == ["api", "pairs"]:
                     self.send_json(reviews.pairs())
+                elif parts == ["api", "fits"]:
+                    self.send_json(reviews.fits())
                 elif parts[:2] == ["api", "pairs"] and len(parts) == 4 and parts[3] == "holdout":
                     self.send_json(reviews.holdout(parts[2], octants,
                                                    query.get("reveal", ["0"])[0] == "1"))
@@ -365,12 +457,14 @@ def handler_for(reviews):
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     parser.add_argument("pairs")
+    parser.add_argument("--records", nargs="*", default=[])
     parser.add_argument("--port", type=int, default=8790)
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--handle", default=os.environ.get("VOLREG_HANDLE"))
     parser.add_argument("--email", default=os.environ.get("VOLREG_EMAIL"))
     args = parser.parse_args(argv)
-    reviews = Reviews(args.pairs, rec.Reviewer(args.handle, args.email).as_json())
+    reviews = Reviews(args.pairs, rec.Reviewer(args.handle, args.email).as_json(),
+                      records=args.records)
     server = ThreadingHTTPServer((args.host, args.port), handler_for(reviews))
     print(f"reviewing {args.pairs} as {args.handle} at http://{args.host}:{args.port}/", flush=True)
     server.serve_forever()

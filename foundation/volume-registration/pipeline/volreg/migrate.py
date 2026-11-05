@@ -267,6 +267,86 @@ def human_events(held, reviews, state):
                        "time_is_the_rounds": True}
 
 
+def import_session(session_dir, record_dir, pair_dir):
+    """Take a first run's session into a pipeline pair, so nothing it measured or a person
+    answered has to be done again: every patch with its measurement and cached blocks
+    (the hold-out ones frozen as they were judged), every fit (as `prior-<id>`, the last
+    one current, so the next fit goes on from it), and the answers, notes and verdicts
+    from the migrated record's log, under the patches' new ids. Blind rounds and the
+    decision stay behind: they judged a fit the pipeline has not made. Only into a pair of
+    the same two volumes and sign convention that has no hold-out set yet."""
+    import shutil
+    old = Session(session_dir)
+    pair = Path(pair_dir)
+    target = pair / "work" / "session"
+    with open(target / "session.json") as handle:
+        state = json.load(handle)
+    for side in ("fixed", "moving"):
+        if state[side]["url"] != old.state[side]["url"]:
+            raise ValueError(f"the {side} volume differs: {state[side]['url']} vs {old.state[side]['url']}")
+    if state["sampling"]["sign"] != old.state["sampling"]["sign"]:
+        raise ValueError("the two sessions disagree on the sign convention")
+    if any(patch.get("test") for patch in state["patches"]):
+        raise ValueError("the pair already has a hold-out set")
+    source = {"session": str(old.directory)}
+
+    rounds, ids = {}, {}
+    for patch in old.state["patches"]:
+        if patch["round"] not in rounds:
+            rounds[patch["round"]] = len(state["sampling"]["rounds"])
+            state["sampling"]["rounds"].append(old.state["sampling"]["rounds"][patch["round"]]
+                                               | {"imported_from": source | {"round": patch["round"]}})
+        ids[patch["id"]] = f"p{len(state['patches']) + len(ids) + 1:04d}"
+    fit_ids = {"start": "start"} | {fit["id"]: f"prior-{fit['id']}" for fit in old.state["fits"]}
+
+    def unit(name):
+        patch_id, dot, octant = name.partition(".")
+        return ids.get(patch_id, patch_id) + dot + octant
+
+    for patch in old.state["patches"]:
+        moved = json.loads(json.dumps(patch)) | {"id": ids[patch["id"]], "round": rounds[patch["round"]],
+                                                 "imported_from": patch["id"]}
+        if moved["measurement"]:
+            moved["measurement"]["under"] = fit_ids[moved["measurement"]["under"]]
+        state["patches"].append(moved)
+        block = old.directory / "blocks" / f"{patch['id']}.npz"
+        if block.exists():
+            shutil.copyfile(block, target / "blocks" / f"{ids[patch['id']]}.npz")
+    for fit in old.state["fits"]:
+        moved = json.loads(json.dumps(fit)) | {
+            "id": fit_ids[fit["id"]], "transform": f"fits/{fit_ids[fit['id']]}.json",
+            "parent": fit_ids.get(fit.get("parent"), fit.get("parent")),
+            "measured_under": [fit_ids.get(f, f) for f in fit.get("measured_under") or []],
+            "imported_from": source | {"fit": fit["id"]}}
+        for key in ("candidates", "ransac_dropped", "used", "guard_failures"):
+            if isinstance(moved.get(key), list):
+                moved[key] = [unit(name) if isinstance(name, str) else name for name in moved[key]]
+        shutil.copyfile(old.directory / fit["transform"], target / moved["transform"])
+        state["fits"].append(moved)
+    if old.state["fits"]:
+        state["current"] = fit_ids[old.state["current"]]
+    scratch = target / "session.json.tmp"
+    scratch.write_text(json.dumps(state, indent=1))
+    scratch.replace(target / "session.json")
+
+    record = rec.Record(pair)
+    carried = 0
+    for event in rec.Record(record_dir).events():
+        if event["kind"] not in ("holdout-answer", "note", "patch-verdict"):
+            continue
+        key = "unit" if event["kind"] == "holdout-answer" else "patch"
+        if event.get(key, "").partition(".")[0] not in ids:
+            continue
+        fields = {k: v for k, v in event.items() if k not in ("kind", key)}
+        fields |= {key: unit(event[key]),
+                   "imported_from": {"record": str(Path(record_dir)), key: event[key]}}
+        record.log(event["kind"], **fields)
+        carried += 1
+    record.log("session-imported", **source, record=str(Path(record_dir)), patches=ids,
+               fits=fit_ids, current=state["current"])
+    return {"patches": len(ids), "events": carried, "current": state["current"]}
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     parser.add_argument("session")

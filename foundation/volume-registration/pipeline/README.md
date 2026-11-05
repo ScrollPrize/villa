@@ -39,7 +39,7 @@ Two things behave differently from the first runs:
 | `volreg/migrate.py` | convert a session of the first runs (`fit_session.py`) into a record |
 | `volreg/engine.py` | state read off the files, as make does: done, stale, running, failed, ready, waiting, blocked; background jobs; redo |
 | `volreg/stages.py` | the stage table of `DESIGN.md`, and what each stage does |
-| `volreg/cli.py` | `run`, `status`, `answer`, `more`, `redo`, `job`, `check`, `migrate` |
+| `volreg/cli.py` | `run`, `status`, `answer`, `more`, `redo`, `adopt`, `job`, `check`, `migrate`, `import` |
 | `volreg/cores/` | algorithms merged in from the research modules, unchanged except for imports: `deformable.py`, `transform_fit.py`, `dense_correlation.py`, the transform file I/O, point fits and volume reading of `transform_utils.py`, and `read_patch` of `blob_snap.py`, `fit_session.py` and `session_overview.py` |
 
 ## Stages
@@ -49,8 +49,8 @@ Two things behave differently from the first runs:
 | `capture` | auto | draws probe patches under the start and fails, saying how well they matched, if too few match |
 | `holdout` | auto | draws the hold-out set (no more than asked for), measures it under the start, renders it |
 | `judge-holdout` | you | done when enough patches line up, or all are answered |
-| `fit` | auto | samples fit patches, then correlates and fits; starts while you judge |
-| `recheck` | auto | measures the hold-out set again under the fit, and flags drift |
+| `fit` | auto | samples fit patches, then correlates and fits; starts after the capture check, beside the hold-out set, so more hold-out patches do not fit again |
+| `recheck` | auto | measures the hold-out set again under the fit (needs both), and flags drift |
 | `score` | auto | the bend and the affine against your answers, and the bar |
 | `blind` | auto | draws and renders a blind round of bend against affine on the patches lining up or partly |
 | `final-review` | you | the blind picks, then the decision; publishing what misses the bar needs a reason, and is stored as an override |
@@ -62,7 +62,7 @@ decision on the review page. So a pair moves on by itself until you are next.
 ## Review UI
 
     VOLREG_HANDLE=... VOLREG_EMAIL=... uv run --python 3.12 --with-requirements requirements.txt \
-        python -m volreg.review.server PAIRS_DIR --port 8790
+        python -m volreg.review.server PAIRS_DIR [--records RECORDS_DIR ...] --port 8790
 
 The page at `/` shows each pair under `PAIRS_DIR` in three parts. At the top is a compact
 overview of its steps. Below it, **Continue** starts every step that can run, beside a link
@@ -73,6 +73,13 @@ answer, `space` to flip, `m` for mode, `n` for a note, `u` to undo, and `?unit=o
 judge octants. The blind page uses `1`/`2`, `Enter` to pick, `x` for can't tell, `n` for
 neither, and `j`/`k` to move. It ends in the decision. The server never reads a volume.
 
+Pairs can be collapsed, and finished ones are hidden unless you untick the filter. `/fits`
+lists every pair's fit in one table: the pipeline's pairs and, read-only, the records under
+`--records` (the first runs' migrated records). Each row shows the fit's model, points and
+bend; the pair's settings; where it stands; the bend's and the affine's median and p90
+against the hold-out set, with the bar; the blind tally; and the decision. Click a pipeline
+pair to see every fit its session made.
+
 ## Run
 
 From this directory. The reviewer comes from `--handle` and `--email`, or from
@@ -82,6 +89,20 @@ From this directory. The reviewer comes from `--handle` and `--email`, or from
     uv run --python 3.12 --with-requirements requirements.txt python -m volreg.cli answer PAIR p0007 lines-up
     uv run --python 3.12 --with-requirements requirements.txt python -m volreg.cli more PAIR --holdout 20
     uv run --python 3.12 --with-requirements requirements.txt python -m volreg.cli redo PAIR fit
+
+A first run's session goes into a new pair after its capture check, before the hold-out
+set is drawn: its patches with their measurements and blocks, its fits (as `prior-<id>`,
+the last current), and the answers, notes and verdicts of its migrated record. The old
+blind rounds and decision stay behind, since they judged a fit the pipeline has not made:
+
+    uv run --python 3.12 --with-requirements requirements.txt python -m volreg.cli import \
+        PAIR SESSION MIGRATED_RECORD
+
+When a change to the code changes only what a stage needs, not what it does, `adopt` keeps
+its finished result instead of running it again. The old stamp is kept, and the change is
+logged with the reason:
+
+    uv run --python 3.12 --with-requirements requirements.txt python -m volreg.cli adopt PAIR STAGE "why"
 
     uv run --python 3.12 --with-requirements requirements.txt python -m volreg.cli status RECORDS
     uv run --python 3.12 --with-requirements requirements.txt python -m volreg.cli check RECORDS
