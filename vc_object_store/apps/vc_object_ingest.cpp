@@ -1,5 +1,6 @@
 #include "vc_object_store/objects/GeometryIngest.hpp"
 #include "vc_object_store/TerminalProgress.hpp"
+#include "vc_object_store/Uuid.hpp"
 #include <iostream>
 
 int main(int argc, char** argv)
@@ -10,6 +11,7 @@ try {
     struct Channel { std::string uuid, name; std::filesystem::path image; };
     std::vector<Channel> channels;
     std::vector<std::string> tags;
+    vc::objects::SourceIngestOptions sourceOptions;
     bool showProgress = true;
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
@@ -29,6 +31,7 @@ try {
             channels.push_back(std::move(channel));
         }
         else if (arg == "--tag") tags.push_back(next());
+        else if (arg == "--derive-uuids") sourceOptions.uuidNamespace = next();
         else if (arg == "--no-progress") showProgress = false;
         else if (arg == "--help" || arg == "-h") {
             std::cout << "Usage: vc_object_ingest --db objects.vcobj --author NAME [options]\n"
@@ -40,15 +43,23 @@ try {
                 "  --surface-channel UUID NAME TIFF\n"
                 "                            add or replace a channel of a stored surface\n"
                 "  --tag NAME                tag every imported object (repeatable)\n"
+                "  --derive-uuids NAMESPACE  identities for sources without UUIDs (see below)\n"
                 "  --no-progress             suppress progress display\n"
                 "Fiber/collection sources commit atomically; tracks commit individually. Failures are reported and exit status is nonzero.\n"
                 "Source flags are repeatable. Existing object identities are errors, even when unchanged.\n"
+                "--derive-uuids NAMESPACE (a UUID, one per dataset) admits surfaces, fibers and PCL collections\n"
+                "that lack canonical UUIDs, as VC3D-era files do. Each gets uuid5(NAMESPACE, KIND:KEY): a surface\n"
+                "keyed (as patch:) by its meta.json uuid or directory name, a fiber by its file stem (version-3\n"
+                "branches resolve the same way), a PCL collection by DOCUMENT_STEM:ID. Rerunning yields the same\n"
+                "UUIDs, so a repeated import fails as an existing identity. Canonical UUIDs are kept; tracks are unaffected.\n"
                 "Edit imported geometry, annotations and relationships through the object API.\n";
             return 0;
         } else throw std::runtime_error("unknown argument: " + arg);
     }
     if (path.empty() || author.empty() || (sources.empty() && channels.empty()))
         throw std::runtime_error("specify --db, --author and source or channel flags; see --help");
+    if (sourceOptions.uuidNamespace && !vc::objects::util::isUuid(*sourceOptions.uuidNamespace))
+        throw std::runtime_error("--derive-uuids requires a UUID namespace");
     vc::objects::OpenOptions options; options.author = author;
     auto db = std::filesystem::exists(path) ? vc::objects::ObjectStore::open(path, options) : vc::objects::ObjectStore::create(path, options);
     bool failed = false;
@@ -59,7 +70,7 @@ try {
     };
     for (const auto& [kind, source] : sources) {
         vc::objects::util::TerminalProgress progress("Ingest " + kind, showProgress);
-        const auto report = vc::objects::ingestGeometrySource(db, kind, source, progress.callback(), "{}", tags);
+        const auto report = vc::objects::ingestGeometrySource(db, kind, source, progress.callback(), "{}", tags, sourceOptions);
         progress.finish(); print(report);
     }
     for (const auto& channel : channels) {

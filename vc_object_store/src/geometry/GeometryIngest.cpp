@@ -85,11 +85,12 @@ void problem(GeometryIngestReport& report, const std::string& label, const std::
 }
 
 std::vector<GeometrySource> prepareGeometrySource(const std::string& kind, const fs::path& source,
-    const std::vector<std::string>& availableUuids)
+    const std::vector<std::string>& availableUuids, const SourceIngestOptions& options)
 {
-    if (kind == "fiber") return formats::fibers(source, availableUuids);
-    if (kind == "surface") return {surface(source)};
-    if (kind == "point_collection") return collections(source);
+    if (options.uuidNamespace) util::canonicalUuid(*options.uuidNamespace);
+    if (kind == "fiber") return formats::fibers(source, availableUuids, options);
+    if (kind == "surface") return {surface(source, options.uuidNamespace)};
+    if (kind == "point_collection") return collections(source, options);
     if (kind == "umbilicus") return {formats::umbilicus(source)};
     throw std::invalid_argument("unsupported batch geometry kind: " + kind);
 }
@@ -180,11 +181,12 @@ namespace {
 // Stops before the next surface or track once `cancelled` is set.
 GeometryIngestReport ingestSource(ObjectStore& db, const Commit& commit, const std::string& kind,
     const fs::path& source, const util::ProgressCallback& progress, const std::string& coordinateContext,
-    const std::vector<std::string>& tags, const std::atomic_bool& cancelled)
+    const std::vector<std::string>& tags, const SourceIngestOptions& options, const std::atomic_bool& cancelled)
 {
     GeometryIngestReport report;
     try {
         geometryCoordinates(Json::parse(coordinateContext));
+        if (options.uuidNamespace) util::canonicalUuid(*options.uuidNamespace);
         if (kind == "track") {
             const auto packed = resolvePackedTrackStore(source);
             PackedTrackStore store(packed);
@@ -232,7 +234,7 @@ GeometryIngestReport ingestSource(ObjectStore& db, const Commit& commit, const s
                 util::reportProgress(progress, "ingesting surfaces", i, directories.size(), directory.filename().string());
                 try {
                     Expected expected;
-                    auto prepared = surface(directory);
+                    auto prepared = surface(directory, options.uuidNamespace);
                     addTags(prepared, tags);
                     { auto read = db.read(); expected = expectedAt(db, read, prepared.object.uuid); }
                     ingestOne(commit, std::move(prepared), expected, report, coordinateContext);
@@ -248,7 +250,7 @@ GeometryIngestReport ingestSource(ObjectStore& db, const Commit& commit, const s
                 auto read = db.read();
                 std::vector<std::string> available;
                 for (const auto& object : db.objectsByKind(read, kind)) available.push_back(object.uuid);
-                batch = prepareGeometrySource(kind, source, available);
+                batch = prepareGeometrySource(kind, source, available, options);
                 for (auto& p : batch) { expectations[p.object.uuid] = expectedAt(db, read, p.object.uuid); addTags(p, tags); }
             }
             ingestBatch(commit, std::move(batch), expectations, report, coordinateContext);
@@ -259,19 +261,20 @@ GeometryIngestReport ingestSource(ObjectStore& db, const Commit& commit, const s
 }
 
 GeometryIngestReport ingestGeometrySource(ObjectStore& db, const std::string& kind, const fs::path& source,
-    const util::ProgressCallback& progress, const std::string& coordinateContext, const std::vector<std::string>& tags)
+    const util::ProgressCallback& progress, const std::string& coordinateContext, const std::vector<std::string>& tags,
+    const SourceIngestOptions& options)
 {
     static const std::atomic_bool never{false};
-    return ingestSource(db, directCommit(db), kind, source, progress, coordinateContext, tags, never);
+    return ingestSource(db, directCommit(db), kind, source, progress, coordinateContext, tags, options, never);
 }
 
 GeometryIngestReport ingestGeometrySource(ObjectStoreSession& session, const AttachmentIdentity& attachment,
     const std::string& kind, const fs::path& source, const util::ProgressCallback& progress,
-    const std::string& coordinateContext, const std::vector<std::string>& tags)
+    const std::string& coordinateContext, const std::vector<std::string>& tags, const SourceIngestOptions& options)
 {
     GeometryIngestReport report;
     session.writeJob(attachment, [&](ObjectStore& db, const Commit& commit, const std::atomic_bool& cancelled) {
-        report = ingestSource(db, commit, kind, source, progress, coordinateContext, tags, cancelled);
+        report = ingestSource(db, commit, kind, source, progress, coordinateContext, tags, options, cancelled);
     });
     return report;
 }

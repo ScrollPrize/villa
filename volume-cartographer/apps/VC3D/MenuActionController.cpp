@@ -2325,6 +2325,36 @@ void MenuActionController::importIntoObjectStore()
         if (!*tagsEdited) tags->setText(QFileInfo(QDir::cleanPath(text.trimmed())).fileName());
     });
     form->addRow(QObject::tr("Tags:"), tags);
+    // Sources without canonical UUIDs (VC3D tifxyz directories named like
+    // auto_grown_..., PCL collections, older fibers) each get uuid5(namespace, name).
+    // The namespace last used for the folder is offered until the user edits it.
+    const auto namespaceKey = [](const QString& path) {
+        const QFileInfo info(QDir::cleanPath(path.trimmed()));
+        const auto stable = info.canonicalFilePath().isEmpty() ? info.absoluteFilePath() : info.canonicalFilePath();
+        return QString::fromLatin1(vc3d::settings::object_store::IMPORT_UUID_NAMESPACE_PREFIX) +
+            QString::fromLatin1(QUrl::toPercentEncoding(stable));
+    };
+    auto* namespaceRow = new QHBoxLayout;
+    auto* uuidNamespace = new QLineEdit(&dialog);
+    uuidNamespace->setPlaceholderText(QObject::tr("optional; needed for sources without canonical UUIDs"));
+    uuidNamespace->setToolTip(QObject::tr("A UUID naming this dataset. Sources whose UUID is missing or not "
+                                          "canonical get one derived from it and their name, so importing the "
+                                          "same files with the same namespace always yields the same objects."));
+    auto namespaceEdited = std::make_shared<bool>(false);
+    QObject::connect(uuidNamespace, &QLineEdit::textEdited, &dialog, [namespaceEdited] { *namespaceEdited = true; });
+    auto* newNamespace = new QPushButton(QObject::tr("New"), &dialog);
+    QObject::connect(newNamespace, &QPushButton::clicked, &dialog, [uuidNamespace, namespaceEdited] {
+        *namespaceEdited = true;
+        uuidNamespace->setText(QString::fromStdString(vc::objects::util::newUuid()));
+    });
+    QObject::connect(folder, &QLineEdit::textChanged, &dialog, [uuidNamespace, namespaceEdited, namespaceKey](const QString& text) {
+        if (*namespaceEdited) return;
+        const QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+        uuidNamespace->setText(settings.value(namespaceKey(text)).toString());
+    });
+    namespaceRow->addWidget(uuidNamespace);
+    namespaceRow->addWidget(newNamespace);
+    form->addRow(QObject::tr("UUID namespace:"), namespaceRow);
     auto* bind = new QCheckBox(volume
         ? QObject::tr("Bind to the active volume (%1)").arg(QString::fromStdString(volume->id()))
         : QObject::tr("Bind to the active volume (none open: imports stay unbound)"), &dialog);
@@ -2349,6 +2379,10 @@ void MenuActionController::importIntoObjectStore()
         const double value = scale->text().toDouble(&valid);
         if (!QFileInfo(folder->text().trimmed()).isDir())
             QMessageBox::warning(&dialog, dialog.windowTitle(), QObject::tr("Choose an existing folder."));
+        else if (const auto text = uuidNamespace->text().trimmed();
+                 !text.isEmpty() && !vc::objects::util::isUuid(text.toStdString()))
+            QMessageBox::warning(&dialog, dialog.windowTitle(),
+                QObject::tr("The UUID namespace must be a UUID (xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx); use New for a fresh one."));
         else if (bind->isChecked() && (!valid || !(value > 0) || !std::isfinite(value)))
             QMessageBox::warning(&dialog, dialog.windowTitle(), QObject::tr("Enter a positive finite coordinate scale."));
         else dialog.accept();
@@ -2373,6 +2407,12 @@ void MenuActionController::importIntoObjectStore()
     std::vector<std::string> tagNames;
     for (const auto& tag : tags->text().split(QLatin1Char(','), Qt::SkipEmptyParts))
         if (const auto name = tag.trimmed(); !name.isEmpty()) tagNames.push_back(name.toStdString());
+    vc::objects::SourceIngestOptions sourceOptions;
+    if (const auto text = uuidNamespace->text().trimmed(); !text.isEmpty()) {
+        sourceOptions.uuidNamespace = vc::objects::util::canonicalUuid(text.toStdString());
+        QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+        settings.setValue(namespaceKey(folder->text()), QString::fromStdString(*sourceOptions.uuidNamespace));
+    }
 
     auto* progressDialog = new QProgressDialog(QObject::tr("Importing %1...").arg(folder->text().trimmed()), {}, 0, 0, _window);
     progressDialog->setWindowTitle(QObject::tr("Import from Folder"));
@@ -2393,7 +2433,8 @@ void MenuActionController::importIntoObjectStore()
     };
     using Report = vc::objects::GeometryIngestReport;
     auto* watcher = new QFutureWatcher<Report>(this);
-    connect(watcher, &QFutureWatcher<Report>::finished, this, [this, watcher, progressDialog, kindName] {
+    const bool derivingUuids = sourceOptions.uuidNamespace.has_value();
+    connect(watcher, &QFutureWatcher<Report>::finished, this, [this, watcher, progressDialog, kindName, derivingUuids] {
         const auto report = watcher->result();
         watcher->deleteLater();
         progressDialog->close();
@@ -2406,15 +2447,16 @@ void MenuActionController::importIntoObjectStore()
         }
         QStringList problems;
         for (const auto& problem : report.problems) problems << QString::fromStdString(problem);
-        QMessageBox box(QMessageBox::Warning, QObject::tr("Import from Folder"),
-            summary + QLatin1Char(' ') + QObject::tr("%n item(s) could not be imported.", nullptr, int(problems.size())),
-            QMessageBox::Ok, _window);
+        auto text = summary + QLatin1Char(' ') + QObject::tr("%n item(s) could not be imported.", nullptr, int(problems.size()));
+        if (!derivingUuids && problems.join(QLatin1Char('\n')).contains(QStringLiteral("invalid UUID")))
+            text += QLatin1Char(' ') + QObject::tr("Sources without canonical UUIDs import when a UUID namespace is given.");
+        QMessageBox box(QMessageBox::Warning, QObject::tr("Import from Folder"), text, QMessageBox::Ok, _window);
         box.setDetailedText(problems.join(QLatin1Char('\n')));
         box.exec();
     });
-    watcher->setFuture(QtConcurrent::run([session, attachment = *attachment, kindName, source, progress, coordinates, tagNames]() {
+    watcher->setFuture(QtConcurrent::run([session, attachment = *attachment, kindName, source, progress, coordinates, tagNames, sourceOptions]() {
         try {
-            return vc::objects::ingestGeometrySource(*session, attachment, kindName, source, progress, coordinates, tagNames);
+            return vc::objects::ingestGeometrySource(*session, attachment, kindName, source, progress, coordinates, tagNames, sourceOptions);
         } catch (const std::exception& error) {
             Report report;
             report.problems.push_back(error.what());

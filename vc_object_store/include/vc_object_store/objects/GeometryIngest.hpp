@@ -13,12 +13,26 @@ struct GeometrySource {
     GeometryData geometry;
     nlohmann::json source;
 };
+// How source files that predate the store's contracts are admitted. Defaults
+// reject invalid surfaces/PCLs; UUID-less fibers use the fixed file-name namespace.
+// Each option is an explicit, recorded repair.
+struct SourceIngestOptions {
+    // A UUID namespace admitting sources without canonical UUIDs: a tifxyz surface keyed
+    // by its meta.json "uuid" or directory name, a PCL collection by "<document stem>:<id>",
+    // a fiber file by its stem (as version-3 branches name targets). Each gets
+    // uuid5(namespace, "<kind>:<key>"), so reingesting the same files yields the same
+    // identities; surfaces keep the pre-rename kind "patch" here. Canonical source
+    // UUIDs are kept.
+    std::optional<std::string> uuidNamespace;
+};
+
 // Decode a native surface, point-collection file, or fiber file/collection/directory
 // before opening a write transaction. Linked documents are loaded recursively;
 // available UUIDs are existing endpoints whose stored contents remain authoritative.
 // Explicit roots and duplicate identities are never silently skipped.
 std::vector<GeometrySource> prepareGeometrySource(const std::string& kind,
-    const std::filesystem::path&, const std::vector<std::string>& availableUuids = {});
+    const std::filesystem::path&, const std::vector<std::string>& availableUuids = {},
+    const SourceIngestOptions& options = {});
 
 // Create new identities atomically in the caller's transaction. Re-import and
 // retired identities are rejected. Checked callers must pin every relationship
@@ -51,14 +65,18 @@ GeometryIngestReport ingestRegisteredGeometry(ObjectStore& db,
 // coordinateContext supplies {volume_uuid, scale_factor} for any geometry kind,
 // and `tags` are added to each new object's own (e.g. the folder it came from).
 // It fills unknown declarations and rejects source conflicts; XYZ is unchanged.
+// options are as for prepareGeometrySource; tracks keep (dataset_ref, external_key)
+// and ignore them.
 GeometryIngestReport ingestGeometrySource(ObjectStore& db, const std::string& kind,
     const std::filesystem::path& source, const util::ProgressCallback& progress = {},
-    const std::string& coordinateContext = "{}", const std::vector<std::string>& tags = {});
+    const std::string& coordinateContext = "{}", const std::vector<std::string>& tags = {},
+    const SourceIngestOptions& options = {});
 // The same into a writable session attachment (ObjectStoreSession::writeJob),
 // on the caller's thread. Detaching stops it before the next surface or track.
 GeometryIngestReport ingestGeometrySource(ObjectStoreSession&, const AttachmentIdentity&, const std::string& kind,
     const std::filesystem::path& source, const util::ProgressCallback& progress = {},
-    const std::string& coordinateContext = "{}", const std::vector<std::string>& tags = {});
+    const std::string& coordinateContext = "{}", const std::vector<std::string>& tags = {},
+    const SourceIngestOptions& options = {});
 
 // Add or replace one channel of a stored surface from a TIFF with its exact
 // samples (rows and columns a whole multiple of the grid), as an edit of the
