@@ -175,6 +175,16 @@ void ObjectStoreSession::detach(const AttachmentIdentity& identity)
     if (const auto attachment = find(identity)) retire(attachment);
 }
 
+AttachmentIdentity ObjectStoreSession::attachLocation(const std::string& location, const OpenOptions& options)
+{
+    if (location.starts_with("http://") || location.starts_with("https://")) {
+        HostedSessionOptions hosted;
+        hosted.author = options.author;
+        return attachHosted(location, hosted);
+    }
+    return attach(location, options);
+}
+
 AttachmentIdentity ObjectStoreSession::attachHosted(const std::string& endpoint, const HostedSessionOptions& options)
 {
     std::lock_guard transition(transition_);

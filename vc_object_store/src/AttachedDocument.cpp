@@ -104,33 +104,36 @@ void writeCollection(const StoreReader& reader, TransactionRequest& request, con
 }
 }
 
-void attachDocument(ObjectStore& store, WriteTxn& txn, const std::string& objectUuid, const std::string& collectionUuid,
-                    const nlohmann::json& document, const DocumentLayout& layout, const std::string& name,
-                    const nlohmann::json& coordinates)
+std::string attachDocument(ObjectStoreSession& session, const AttachmentIdentity& attachment, const std::string& objectUuid,
+                           const nlohmann::json& document, const DocumentLayout& layout, const std::string& name,
+                           const nlohmann::json& coordinates)
 {
-    auto records = nlohmann::json::array();
-    for (const auto& record : document.value(layout.listKey, nlohmann::json::array()))
-        if (record.is_object()) records.push_back(record);
-    geometry::PointCollection points;
-    for (const auto& record : records) {
-        points.ids.push_back(geometry::PointId(points.ids.size()));
-        points.points.push_back(position(record.value(layout.positionKey, nlohmann::json())));
+    AttachedCollection collection;
+    collection.uuid = util::newUuid();
+    collection.name = name;
+    for (const auto& record : document.value(layout.listKey, nlohmann::json::array())) {
+        if (!record.is_object()) continue;
+        collection.points.ids.push_back(geometry::PointId(collection.points.ids.size()));
+        collection.points.points.push_back(position(record.value(layout.positionKey, nlohmann::json())));
+        collection.annotations.push_back(record);
     }
     auto rest = document;
     rest.erase(layout.listKey);
-    ObjectRecord record;
-    record.uuid = collectionUuid;
-    record.kind = "point_collection";
-    record.name = name;
-    record.meta = nlohmann::json{{"role", layout.role},
-                                 {"coordinates", coordinates},
-                                 {"source", {{"document", rest},
-                                             {"list_key", layout.listKey},
-                                             {"position_key", layout.positionKey},
-                                             {"point_attributes", records}}}}.dump();
-    store.upsertObject(txn, record);
-    store.putGeometry(txn, collectionUuid, geometry::encode(points));
-    store.attach(txn, collectionUuid, objectUuid, layout.role);
+    collection.source = {{"document", rest}, {"list_key", layout.listKey}, {"position_key", layout.positionKey}};
+    auto request = session.newRequest(attachment);
+    session.readStore(attachment, [&](const StoreReader& reader, const auto&) {
+        const auto object = reader.currentObject(objectUuid);
+        if (!object || object->deleted) throw std::invalid_argument("object not found: " + objectUuid);
+        request.expectedObjects[object->record.uuid] = object->version;
+        writeCollection(reader, request, collection.uuid, collection, {{"coordinates", coordinates}, {"role", layout.role}},
+                        std::nullopt);
+        auto edge = attachmentEdge(collection.uuid, object->record.uuid, layout.role);
+        edge.uuid = util::newUuid();
+        request.operations.push_back(AddEdgeOp{edgeRecordJson(edge)});
+        expectRelationshipEndpoints(reader, request.expectedObjects);
+    });
+    session.submit(attachment, request);
+    return collection.uuid;
 }
 
 std::optional<nlohmann::json> attachedDocument(const StoreReader& reader, const std::string& objectUuid,

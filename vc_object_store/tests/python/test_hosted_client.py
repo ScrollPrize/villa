@@ -107,3 +107,39 @@ def test_session_typed_operations_on_hosted_and_local(hosted, tmp_path):
     session.submit_durably(remote, request(status, [dict(op="create_object", record=dict(uuid=obj, kind="note"))], {obj: None}))
     assert session.pending_submissions() == [] and session.draft_checkpoint_error() == ""
     assert session.checkpoint_drafts() >= 2
+
+
+def test_surface_and_document_helpers_take_an_endpoint(hosted):
+    """The location helpers give the same results through a served store as through its file."""
+    import numpy as np
+    from vc_object_store.documents import attach_document, attached_document, point_collections
+    from vc_object_store.surfaces import create_surface, read_surface
+    store, path = hosted
+    endpoint, status = store.endpoint, store.status()
+    xyz = np.stack([*np.mgrid[:3, :4][::-1], np.full((3, 4), 5)], axis=-1).astype(np.float32)
+    xyz[0, 0] = -1
+    surface = create_surface(endpoint, xyz, name="served", scale=2.0, volume="vol", tool="test",
+                             channels={"d": np.arange(12, dtype="<f4").reshape(3, 4)}, author="remote")
+    grid = read_surface(endpoint, surface, volume="vol")
+    local = read_surface(path, surface, volume="vol")  # read-only opens are allowed while hosted
+    assert np.array_equal(grid.points, local.points) and np.array_equal(grid.valid, local.valid)
+    assert grid.points[0, 0].tolist() == [-1, -1, -1] and not grid.valid[0, 0]
+    assert grid.scale == local.scale and grid.channels == frozenset({"d"}) and grid.version == 1
+    assert grid.record["meta"]["provenance"]["tool"] == "test" and grid.generation == status["generation"]
+    document = {"summary": 1, "points": [{"id": 1, "p": [1, 2, 3]}]}
+    collection = attach_document(endpoint, surface, document, role="results", list_key="points",
+                                 position_key="p", name="results", volume="vol", author="remote")
+    assert attached_document(endpoint, surface, "results") == document == attached_document(path, surface, "results")
+    [read] = point_collections(endpoint, [collection], "vol")
+    assert read["uuid"] == collection and [list(p) for p in read["points"]] == [[1, 2, 3]]
+    assert read_surface(endpoint, surface, volume="vol").version == 2  # the attachment versioned the surface
+    session = vos.ObjectStoreSession()
+    attachment = session.attach_location(endpoint, "remote")
+    try:
+        assert session.hosted(attachment)
+        names = session.select_objects(attachment, {"selection": {"kind": "surface"}, "fields": ["name"]})
+        assert [row["name"] for row in names] == ["served"]
+        channel = np.array(session.read_geometry_arrays(attachment, [grid.geometry_revision], "d").values)
+        assert channel.reshape(-1).tolist() == list(range(12))
+    finally:
+        session.detach(attachment)

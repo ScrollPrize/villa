@@ -21,12 +21,12 @@ struct AttachmentIdentity;
 struct DocumentLayout {
     std::string role, listKey, positionKey;
 };
-// Attach `document` to `objectUuid` as a new point collection `collectionUuid`
-// named `name` whose meta.coordinates are `coordinates`. The caller's checked
-// transaction expects `collectionUuid` absent and pins the object.
-void attachDocument(ObjectStore&, WriteTxn&, const std::string& objectUuid, const std::string& collectionUuid,
-                    const nlohmann::json& document, const DocumentLayout&, const std::string& name,
-                    const nlohmann::json& coordinates);
+// Attach `document` to `objectUuid` (at its current version) as a new point
+// collection named `name` whose meta.coordinates are `coordinates`, in one
+// checked request; returns the collection's UUID.
+std::string attachDocument(ObjectStoreSession&, const AttachmentIdentity&, const std::string& objectUuid,
+                           const nlohmann::json& document, const DocumentLayout&, const std::string& name,
+                           const nlohmann::json& coordinates);
 // The document attached to `objectUuid` in `role` (its first live collection
 // with geometry); nullopt when there is none.
 std::optional<nlohmann::json> attachedDocument(const StoreReader&, const std::string& objectUuid,

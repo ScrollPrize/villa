@@ -70,6 +70,7 @@ add_library(vc_objects ${_vc_store_library_type}
     ToolObjects.cpp
     AttachedDocument.cpp
     SurfaceCreate.cpp
+    SurfaceGrid.cpp
     geometry/GeometryViews.cpp
     imports/SourceRelationships.cpp
     geometry/GeometryIngestBatch.cpp

@@ -567,6 +567,19 @@ server snapshot they read; `select_all_objects`/`select_all_edges` raise
 `submit_durably`, `pending_submissions` and `resolve_pending`. `take_events()`
 items carry `revalidate`.
 
+A store *location* is a store file or a `vc_object_server` endpoint
+(`http://` or `https://`): `ObjectStoreSession.attach_location(location,
+author, read_only)` (C++ `attachLocation`) attaches either. The session reads
+and writes surfaces and attached documents on any attachment:
+`read_surface_grid` (a surface's current or numbered version as a whole grid
+in a volume's voxels, `objects/SurfaceGrid.hpp`), `read_geometry_arrays`,
+`select_objects` (wire query form, complete), `create_surface` and
+`attach_document` (one checked request each), `attached_document` and
+`point_collections`. The module helpers `surfaces.read_surface`/`create_surface`
+and `documents.attach_document`/`attached_document`/`point_collections` take a
+location (`locations.attached` gives a short-lived attachment), so a tool on
+another machine works on a served store by its endpoint exactly as on a file.
+
 ## Relationships and graphs
 
 Relationships are shared by both endpoints. Addition, removal or rebinding

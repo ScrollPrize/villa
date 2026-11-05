@@ -5,6 +5,7 @@
 #include "vc_object_store/objects/StoreReader.hpp"
 #include "vc_object_store/objects/AttachedDocument.hpp"
 #include "vc_object_store/objects/SurfaceCreate.hpp"
+#include "vc_object_store/objects/SurfaceGrid.hpp"
 #include "GeometryRegionBindings.hpp"
 #include "SessionBindings.hpp"
 #include <nanobind/stl/map.h>
@@ -18,6 +19,20 @@
 #include "vc_object_store/CtSheetNormal.hpp"
 using namespace vc::python;
 namespace {
+nb::list collectionsToPy(const std::vector<vo::AttachedCollection>& collections)
+{
+    nb::list out;
+    for (const auto& collection : collections) {
+        nb::dict item;
+        item["uuid"] = collection.uuid; item["name"] = collection.name;
+        item["ids"] = collection.points.ids; item["points"] = collection.points.points;
+        item["annotations"] = jsonLoads(collection.annotations.dump());
+        item["source"] = jsonLoads(collection.source.dump());
+        out.append(item);
+    }
+    return out;
+}
+
 nb::dict objectRevisionToPy(const vo::ObjectRevision& revision)
 {
     nb::dict d;
@@ -229,21 +244,6 @@ void bindMutations(nb::class_<T>& cls)
             },
             nb::arg("data_uuid"), nb::arg("owner_uuid"), nb::arg("role"),
             "Attach object data to owner in role (an attachment relationship); returns the edge uuid.")
-        .def(
-            "attach_document",
-            [](T& self, const std::string& owner, const std::string& collection, const nb::object& document,
-               const std::string& role, const std::string& listKey, const std::string& positionKey,
-               const std::string& name, const nb::object& coordinates) {
-                const auto parsed = nlohmann::json::parse(jsonDumps(document));
-                const auto frame = nlohmann::json::parse(jsonDumps(coordinates));
-                self.template withWrite<true>([&](vo::ObjectStore& g, vo::WriteTxn& t) {
-                    vo::attachDocument(g, t, owner, collection, parsed, {role, listKey, positionKey}, name, frame);
-                });
-            },
-            nb::arg("owner_uuid"), nb::arg("collection_uuid"), nb::arg("document"), nb::arg("role"),
-            nb::arg("list_key"), nb::arg("position_key"), nb::arg("name"), nb::arg("coordinates"),
-            "Attach a document to owner as point collection collection_uuid (objects/AttachedDocument.hpp): one point "
-            "per record of document[list_key], at record[position_key].")
         .def(
             "create_surface",
             [](T& self, const std::string& uuid, const std::string& name, const std::vector<std::string>& tags,
@@ -563,9 +563,16 @@ void bindSessionOperations(nb::class_<vo::ObjectStoreSession> session)
         return result;
     };
     session
+        .def("attach_location", [](Session& self, const std::string& location, const std::string& author, bool readOnly) {
+            vo::OpenOptions options; options.author = author; options.readOnly = readOnly;
+            nb::gil_scoped_release release;
+            return self.attachLocation(location, options);
+        }, nb::arg("location"), nb::arg("author") = std::string(), nb::arg("read_only") = false,
+           "Attach a store location: a vc_object_server endpoint (http:// or https://; always writable) or a store file.")
         .def("attach_hosted", [](Session& self, const std::string& endpoint, int64_t pollIntervalMs, size_t cacheBytes,
-                                 int retries, long connectTimeoutMs) {
+                                 int retries, long connectTimeoutMs, const std::string& author) {
             vo::HostedSessionOptions options;
+            options.author = author;
             options.pollInterval = std::chrono::milliseconds(pollIntervalMs);
             options.cacheBytes = cacheBytes;
             options.client.retries = retries;
@@ -573,8 +580,102 @@ void bindSessionOperations(nb::class_<vo::ObjectStoreSession> session)
             nb::gil_scoped_release release;
             return self.attachHosted(endpoint, options);
         }, nb::arg("endpoint"), nb::arg("poll_interval_ms") = 2000, nb::arg("cache_bytes") = vo::HostedSessionOptions{}.cacheBytes,
-           nb::arg("retries") = 5, nb::arg("connect_timeout_ms") = 10000,
+           nb::arg("retries") = 5, nb::arg("connect_timeout_ms") = 10000, nb::arg("author") = std::string(),
            "Attach a store served by vc_object_server; use the typed operations (no local callbacks).")
+        .def("read_surface_grid", [](Session& self, const vo::AttachmentIdentity& attachment, const std::string& uuid,
+                                     const std::string& volume, double targetScale, std::optional<int64_t> version,
+                                     const std::optional<std::string>& generation) {
+            vo::SurfaceGrid grid;
+            {
+                nb::gil_scoped_release release;
+                self.readStore(attachment, [&](const vo::StoreReader& reader, const auto&) {
+                    grid = vo::readSurfaceGrid(reader, uuid, volume, targetScale, version, generation);
+                });
+            }
+            nb::dict d;
+            const auto rows = size_t(grid.rows), columns = size_t(grid.columns);
+            d["points"] = ownedArray(std::move(grid.points), {rows, columns, 3});
+            d["valid"] = ownedArray(std::move(grid.valid), {rows, columns});
+            d["scale"] = nb::make_tuple(grid.scale[0], grid.scale[1]);
+            d["record"] = objectToPy(grid.record);
+            d["version"] = grid.version; d["generation"] = grid.generation;
+            d["geometry_revision"] = grid.geometryRevision; d["channels"] = grid.channels;
+            return d;
+        }, nb::arg("attachment"), nb::arg("surface_uuid"), nb::arg("volume"), nb::arg("target_scale") = 1.0,
+           nb::arg("version") = nb::none(), nb::arg("generation") = nb::none(),
+           "A surface (current, or numbered version) as a whole grid in volume's voxels (objects/SurfaceGrid.hpp): "
+           "points (rows, columns, 3) float32 with -1 at invalid vertices, valid (uint8), scale, record, version, "
+           "generation, geometry_revision, channels.")
+        .def("select_objects", [](Session& self, const vo::AttachmentIdentity& attachment, const nb::object& query) {
+            std::optional<std::vector<std::string>> fields;
+            const auto selection = vo::objectQueryRequestFromJson(
+                nb::isinstance<nb::str>(query) ? nb::cast<std::string>(query) : jsonDumps(query), &fields);
+            std::vector<vo::ObjectRecord> records;
+            {
+                nb::gil_scoped_release release;
+                self.readStore(attachment, [&](const vo::StoreReader& reader, const auto&) { records = reader.selectObjects(selection, fields); });
+            }
+            const std::set<std::string> selected = fields ? std::set<std::string>(fields->begin(), fields->end()) : std::set<std::string>{};
+            nb::list result;
+            for (const auto& record : records) result.append(objectToPy(record, fields ? &selected : nullptr));
+            return result;
+        }, nb::arg("attachment"), nb::arg("query"),
+           "Every record the query (wire form, as HostedStore.select_objects; complete without a limit) selects in one read.")
+        .def("read_geometry_arrays", [](Session& self, const vo::AttachmentIdentity& attachment,
+                                        const std::vector<std::string>& revisions, const std::string& name) {
+            std::shared_ptr<vo::PackedGeometryArray> packed;
+            {
+                nb::gil_scoped_release release;
+                self.readStore(attachment, [&](const vo::StoreReader& reader, const auto&) {
+                    packed = std::make_shared<vo::PackedGeometryArray>(reader.readGeometryArrays(revisions, name));
+                });
+            }
+            return PyPackedGeometryArray{std::move(packed)};
+        }, nb::arg("attachment"), nb::arg("revision_uuids"), nb::arg("array_name"),
+           "Read homogeneous arrays into one verified packed buffer with row offsets (as ObjectStore.read_geometry_arrays).")
+        .def("create_surface", [](Session& self, const vo::AttachmentIdentity& attachment, const std::string& name,
+                                  const std::vector<std::string>& tags, const nb::object& coordinates, const std::string& tool,
+                                  const nb::object& parameters, const std::vector<std::string>& sources, const nb::object& meta,
+                                  const nb::object& geometry) {
+            auto data = geometryInputFromPy(geometry);
+            const vo::SurfaceProvenance provenance{tool, nlohmann::json::parse(jsonDumps(parameters)), sources};
+            const auto frame = nlohmann::json::parse(jsonDumps(coordinates));
+            const auto rest = nlohmann::json::parse(jsonDumps(meta));
+            nb::gil_scoped_release release;
+            return vo::createSurface(self, attachment, name, tags, frame, provenance, rest, std::move(data));
+        }, nb::arg("attachment"), nb::arg("name"), nb::arg("tags"), nb::arg("coordinates"), nb::arg("tool"),
+           nb::arg("parameters"), nb::arg("sources"), nb::arg("meta"), nb::arg("geometry"),
+           "Create a surface under a new UUID in one checked request (objects/SurfaceCreate.hpp); returns the UUID.")
+        .def("attach_document", [](Session& self, const vo::AttachmentIdentity& attachment, const std::string& owner,
+                                   const nb::object& document, const std::string& role, const std::string& listKey,
+                                   const std::string& positionKey, const std::string& name, const nb::object& coordinates) {
+            const auto parsed = nlohmann::json::parse(jsonDumps(document));
+            const auto frame = nlohmann::json::parse(jsonDumps(coordinates));
+            nb::gil_scoped_release release;
+            return vo::attachDocument(self, attachment, owner, parsed, {role, listKey, positionKey}, name, frame);
+        }, nb::arg("attachment"), nb::arg("owner_uuid"), nb::arg("document"), nb::arg("role"), nb::arg("list_key"),
+           nb::arg("position_key"), nb::arg("name"), nb::arg("coordinates"),
+           "Attach a document to the owner's current version as a new point collection (objects/AttachedDocument.hpp): "
+           "one point per record of document[list_key], at record[position_key]; returns its UUID.")
+        .def("attached_document", [](Session& self, const vo::AttachmentIdentity& attachment, const std::string& owner,
+                                     const std::string& role) -> nb::object {
+            std::optional<nlohmann::json> document;
+            { nb::gil_scoped_release release; document = vo::attachedDocument(self, attachment, owner, role); }
+            return document ? jsonLoads(document->dump()) : nb::none();
+        }, nb::arg("attachment"), nb::arg("owner_uuid"), nb::arg("role"), "The document attached to owner in role, or None.")
+        .def("point_collections", [](Session& self, const vo::AttachmentIdentity& attachment, const std::vector<std::string>& uuids,
+                                     const std::string& volume, double targetScale) {
+            std::vector<vo::AttachedCollection> collections;
+            {
+                nb::gil_scoped_release release;
+                self.readStore(attachment, [&](const vo::StoreReader& reader, const auto&) {
+                    collections = vo::pointCollections(reader, uuids, vo::VolumeVoxels{volume, targetScale});
+                });
+            }
+            return collectionsToPy(collections);
+        }, nb::arg("attachment"), nb::arg("uuids"), nb::arg("volume"), nb::arg("target_scale") = 1.0,
+           "Point collections by UUID (any role), in the volume's voxels at target_scale: uuid, name, ids, points, "
+           "annotations, source.")
         .def("hosted", &Session::hosted, nb::arg("attachment"))
         .def("freshness", [statusPy](const Session& self, const vo::AttachmentIdentity& attachment) -> nb::object {
             const auto fresh = self.freshness(attachment);
@@ -905,16 +1006,7 @@ NB_MODULE(_native, m)
             const auto collections = self.withRead<true>([&](auto& db, auto& txn) {
                 return vo::pointCollections(vo::LocalStoreReader(db, txn), uuids, vo::VolumeVoxels{volume, targetScale});
             });
-            nb::list out;
-            for (const auto& collection : collections) {
-                nb::dict item;
-                item["uuid"] = collection.uuid; item["name"] = collection.name;
-                item["ids"] = collection.points.ids; item["points"] = collection.points.points;
-                item["annotations"] = jsonLoads(collection.annotations.dump());
-                item["source"] = jsonLoads(collection.source.dump());
-                out.append(item);
-            }
-            return out;
+            return collectionsToPy(collections);
         }, nb::arg("uuids"), nb::arg("volume"), nb::arg("target_scale") = 1.0,
            "Point collections by UUID (any role), in the volume's voxels at target_scale: uuid, name, ids, points, "
            "annotations, source.")

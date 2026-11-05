@@ -1,6 +1,8 @@
 #include "vc_object_store/objects/SurfaceCreate.hpp"
 #include "vc_object_store/objects/GeometryCoordinates.hpp"
 #include "vc_object_store/objects/TransactionJson.hpp"
+#include "vc_object_store/objects/ObjectStoreSession.hpp"
+#include "vc_object_store/Uuid.hpp"
 
 namespace vc::objects {
 const std::vector<std::string>& tifxyzFileKeys()
@@ -46,5 +48,17 @@ std::vector<TransactionOperation> createSurfaceOperations(const std::string& uui
     if (geometry.kind != "surface") throw std::invalid_argument("createSurfaceOperations needs surface geometry");
     return {CreateObjectOp{objectRecordJson(surfaceRecord(uuid, name, tags, coordinates, provenance, meta))},
             PutGeometryOp{uuid, std::move(geometry), {}}};
+}
+
+std::string createSurface(ObjectStoreSession& session, const AttachmentIdentity& attachment, const std::string& name,
+                          const std::vector<std::string>& tags, const nlohmann::json& coordinates,
+                          const SurfaceProvenance& provenance, const nlohmann::json& meta, GeometryData geometry)
+{
+    const auto uuid = util::newUuid();
+    auto request = session.newRequest(attachment);
+    request.expectedObjects[uuid] = std::nullopt;
+    request.operations = createSurfaceOperations(uuid, name, tags, coordinates, provenance, meta, std::move(geometry));
+    session.submit(attachment, request);
+    return uuid;
 }
 }

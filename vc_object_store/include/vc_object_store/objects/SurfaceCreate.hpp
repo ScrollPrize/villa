@@ -8,6 +8,8 @@
 #include <vector>
 
 namespace vc::objects {
+class ObjectStoreSession;
+struct AttachmentIdentity;
 // How a surface was made: the tool, its parameters and the surfaces it came from.
 struct SurfaceProvenance {
     std::string tool;
@@ -33,4 +35,9 @@ std::vector<TransactionOperation> createSurfaceOperations(const std::string& uui
                                                           const std::vector<std::string>& tags,
                                                           const nlohmann::json& coordinates, const SurfaceProvenance&,
                                                           const nlohmann::json& meta, GeometryData geometry);
+// Create that surface under a new UUID in one checked request on any
+// attachment (local file or hosted store); returns the UUID.
+std::string createSurface(ObjectStoreSession&, const AttachmentIdentity&, const std::string& name,
+                          const std::vector<std::string>& tags, const nlohmann::json& coordinates,
+                          const SurfaceProvenance&, const nlohmann::json& meta, GeometryData geometry);
 }

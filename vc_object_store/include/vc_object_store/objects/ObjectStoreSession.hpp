@@ -205,6 +205,10 @@ public:
     // commits arrive through takeEvents() after each check (pollInterval).
     // Throws when the endpoint does not answer or its store is already attached.
     AttachmentIdentity attachHosted(const std::string& endpoint, const HostedSessionOptions& = {});
+    // A store location: a vc_object_server endpoint (http:// or https://,
+    // attached with the options' author; hosted attachments are writable) or
+    // a store file (attach).
+    AttachmentIdentity attachLocation(const std::string& location, const OpenOptions&);
     bool hosted(const AttachmentIdentity&) const;
     // Where an attachment's store is: its file path, or a hosted store's endpoint.
     std::string location(const AttachmentIdentity&);
