@@ -24,6 +24,12 @@ from sample_spiral import (
 from spiral_helpers import _huber_abs
 
 
+def get_unattached_pcl_radius_margin(cfg):
+    """The unattached-PCL radius hinge margin: its own key, else the verified-patch margin."""
+    margin = cfg['unattached_pcl_radius_loss_margin']
+    return cfg['patch_radius_loss_margin'] if margin is None else margin
+
+
 def _masked_mean(values, mask):
     mask_f = mask.to(values.dtype)
     return (values * mask_f).sum() / mask_f.sum().clamp(min=1.)
@@ -1399,7 +1405,7 @@ def get_unattached_pcl_strip_losses(
     # offset (a positive offset sits the fiber outside its winding).
     normalised_radii = shifted_radii - winding_t * dr_per_winding - offset_t
 
-    radius_hinge_margin = dr_per_winding.detach() * cfg['patch_radius_loss_margin']
+    radius_hinge_margin = dr_per_winding.detach() * get_unattached_pcl_radius_margin(cfg)
     dt_hinge_margin = dr_per_winding.detach() * cfg['patch_dt_loss_margin']
 
     radius_counts = sample_mask.sum(dim=-1, keepdim=True).clamp(min=1)
