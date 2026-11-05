@@ -75,12 +75,30 @@ CtSheetNormal CtSheetNormalSampler::sampleNormal(const cv::Vec3d& xyz,
 }
 
 struct LasagnaSheetNormalSampler::Impl {
-    vcr::CtReader nx, ny;
+    vcr::zarr::OpenedArray nx, ny;
     double scale;
     std::mutex mutex;
 
     Impl(const std::filesystem::path& x, const std::filesystem::path& y, int level, double scale)
-        : nx(x.string(), level), ny(y.string(), level), scale(scale) {}
+        : nx(open(x, level)), ny(open(y, level)), scale(scale) {}
+
+    static vcr::zarr::OpenedArray open(const std::filesystem::path& path, int level)
+    {
+        vcr::zarr::OpenOptions options;
+        options.memoryCache = std::make_shared<vcr::MemoryCache>(std::size_t(64) << 20);
+        auto opened = vcr::zarr::openPyramidLevel(path.string(), level, options);
+        if (opened.meta.dtype != "|u1" || opened.meta.shape.size() != 3)
+            throw std::invalid_argument("lasagna normal volume " + path.string() + " must be a 3D uint8 array");
+        return opened;
+    }
+
+    // One voxel (ZYX) of a 3D uint8 array.
+    static uint8_t voxel(const vcr::zarr::OpenedArray& array, const std::array<int64_t, 3>& zyx)
+    {
+        uint8_t value = 0;
+        array.array->read_many({vcr::Index(zyx.begin(), zyx.end())}, {vcr::Index{1, 1, 1}}, {&value});
+        return value;
+    }
 };
 
 LasagnaSheetNormalSampler::LasagnaSheetNormalSampler(const std::filesystem::path& normalX,
@@ -89,7 +107,7 @@ LasagnaSheetNormalSampler::LasagnaSheetNormalSampler(const std::filesystem::path
     if (level < 0 || !(scale > 0) || !std::isfinite(scale))
         throw std::invalid_argument("invalid lasagna normal level or scale");
     impl_ = std::make_unique<Impl>(normalX, normalY, level, scale);
-    if (impl_->nx.shape() != impl_->ny.shape())
+    if (impl_->nx.meta.shape != impl_->ny.meta.shape)
         throw std::invalid_argument("lasagna nx and ny volumes differ in shape");
 }
 
@@ -126,13 +144,13 @@ CtSheetNormal LasagnaSheetNormalSampler::sampleNormal(const cv::Vec3d& xyz,
                                                       const std::atomic_bool* cancel) const
 {
     if (cancel && cancel->load()) throw std::runtime_error("lasagna normals cancelled");
-    const auto zyx = nearestLasagnaVoxel(xyz, impl_->scale, impl_->nx.shape());
+    const auto zyx = nearestLasagnaVoxel(xyz, impl_->scale, impl_->nx.meta.shape);
     if (!zyx) return kOutsideLasagna;
     uint8_t x = 0, y = 0;
     {
         std::lock_guard lock(impl_->mutex);
-        impl_->nx.readRegion(*zyx, {1, 1, 1}, std::span(&x, 1));
-        impl_->ny.readRegion(*zyx, {1, 1, 1}, std::span(&y, 1));
+        x = Impl::voxel(impl_->nx, *zyx);
+        y = Impl::voxel(impl_->ny, *zyx);
     }
     return decodeLasagnaNormal(x, y);
 }

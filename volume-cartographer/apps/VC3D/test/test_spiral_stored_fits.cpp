@@ -4,6 +4,7 @@
 // and the store's surface must keep the generation's points.
 #include "SpiralStoredFits.hpp"
 
+#include "vc/core/util/ImageMat.hpp"
 #include "vc/core/util/QuadSurface.hpp"
 
 #include <vc_object_store/Uuid.hpp>
@@ -122,14 +123,15 @@ struct Fixture {
 void aStoredFitReadsAsItsArtifact(const fs::path& directory)
 {
     const Generation generation;
-    // The artifact's winding map: float32, as lasagna_publish writes it.
+    // The artifact's winding map: float32, as lasagna_publish writes it (here
+    // OpenCV stands in for that writer), read as loadPreview reads it.
     const fs::path mapPath = directory / "winding-ids.tif";
     cv::Mat floats;
     generation.windings.convertTo(floats, CV_32F);
     require(cv::imwrite(mapPath.string(), floats), "the artifact winding map is written");
     QString error;
     const auto artifactWindings = vc3d::spiral::windingIdsFromImage(
-        cv::imread(mapPath.string(), cv::IMREAD_UNCHANGED), &error);
+        vc::core::util::imageMat(vcr::sources::readImagePage(mapPath.string(), 0)), &error);
     require(artifactWindings.has_value(), "the artifact map decodes: " + error.toStdString());
     const auto artifactComponents = vc3d::spiral::parseWindingBounds(
         qtArray(generation.bounds), qtArray(generation.windingIds), &error);
