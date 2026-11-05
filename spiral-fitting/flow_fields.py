@@ -300,6 +300,57 @@ class _SparseAccumTrilinearSample(torch.autograd.Function):
         return grad_pts, None, None, None, None
 
 
+def _rk4_forward_stages(y0, sampler, h, n_steps, stages=None):
+    # Graph capture writes into static stage storage; eager autograd saves a list.
+    stage_points = [] if stages is None else stages
+    y = y0
+    for i in range(n_steps):
+        k1 = sampler(y)
+        x2 = y + (h / 2) * k1
+        k2 = sampler(x2)
+        x3 = y + (h / 2) * k2
+        k3 = sampler(x3)
+        x4 = y + h * k3
+        k4 = sampler(x4)
+        if stages is None:
+            stage_points.extend([y, x2, x3, x4])
+        else:
+            for j, point in enumerate((y, x2, x3, x4)):
+                stages[4 * i + j].copy_(point)
+        y = y + (h / 6) * (k1 + 2 * k2 + 2 * k3 + k4)
+    return y, stage_points
+
+
+def _rk4_sparse_backward(grad_y, stage_points, low_field, high_field, scale, acc, h, n_steps):
+    consts = _field_consts(low_field, grad_y.dtype)
+    corners = _corner_bits(grad_y.device)
+    if consts['signs'].dtype == grad_y.dtype:
+        signs = consts['signs']
+    else:
+        signs = (2 * corners - 1).to(grad_y.dtype)
+    Y, X = low_field.shape[2], low_field.shape[3]
+
+    def stage_grad(g, pts):
+        return _sparse_backward_impl(
+            g, pts, low_field, high_field, scale, acc,
+            consts['shape_m1'], consts['zeros'], consts['shape_m2'],
+            consts['corner_offsets'], signs, corners, Y, X,
+        )
+
+    for step in range(n_steps - 1, -1, -1):
+        x1, x2, x3, x4 = stage_points[4 * step: 4 * step + 4]
+        g6 = grad_y * (h / 6)
+        xb4 = stage_grad(g6, x4)
+        xb3 = stage_grad(g6 * 2 + xb4 * h, x3)
+        xb2 = stage_grad(g6 * 2 + xb3 * (h / 2), x2)
+        xb1 = stage_grad(g6 + xb2 * (h / 2), x1)
+        grad_y = grad_y + xb4
+        grad_y = grad_y + xb3
+        grad_y = grad_y + xb2
+        grad_y = grad_y + xb1
+    return grad_y
+
+
 class _RK4SparseFlowIntegrate(torch.autograd.Function):
     # The whole time-invariant RK4 integration as a single autograd node.
     #
@@ -325,18 +376,9 @@ class _RK4SparseFlowIntegrate(torch.autograd.Function):
     @staticmethod
     def forward(ctx, y0, low_field, high_field, high_scale, acc, h, n_steps):
         ctx.set_materialize_grads(False)
-        stage_points = []
-        y = y0
-        for _ in range(n_steps):
-            k1 = sample_field(y, low_field) + sample_field(y, high_field) * high_scale
-            x2 = y + (h / 2) * k1
-            k2 = sample_field(x2, low_field) + sample_field(x2, high_field) * high_scale
-            x3 = y + (h / 2) * k2
-            k3 = sample_field(x3, low_field) + sample_field(x3, high_field) * high_scale
-            x4 = y + h * k3
-            k4 = sample_field(x4, low_field) + sample_field(x4, high_field) * high_scale
-            stage_points.extend([y, x2, x3, x4])
-            y = y + (h / 6) * (k1 + 2 * k2 + 2 * k3 + k4)
+        y, stage_points = _rk4_forward_stages(
+            y0, lambda p: sample_field(p, low_field) + sample_field(p, high_field) * high_scale,
+            h, n_steps)
         ctx.save_for_backward(low_field, high_field, *stage_points)
         ctx.high_scale = float(high_scale)
         ctx.acc = acc
@@ -354,32 +396,8 @@ class _RK4SparseFlowIntegrate(torch.autograd.Function):
         h = ctx.h
         scale = ctx.high_scale
         acc = ctx.acc
-        consts = _field_consts(low_field, grad_y.dtype)
-        corners = _corner_bits(grad_y.device)
-        if consts['signs'].dtype == grad_y.dtype:
-            signs = consts['signs']
-        else:
-            signs = (2 * corners - 1).to(grad_y.dtype)
-        Y, X = low_field.shape[2], low_field.shape[3]
-
-        def stage_grad(g, pts):
-            return _sparse_backward_impl(
-                g, pts, low_field, high_field, scale, acc,
-                consts['shape_m1'], consts['zeros'], consts['shape_m2'],
-                consts['corner_offsets'], signs, corners, Y, X,
-            )
-
-        for step in range(ctx.n_steps - 1, -1, -1):
-            x1, x2, x3, x4 = stage_points[4 * step: 4 * step + 4]
-            g6 = grad_y * (h / 6)
-            xb4 = stage_grad(g6, x4)
-            xb3 = stage_grad(g6 * 2 + xb4 * h, x3)
-            xb2 = stage_grad(g6 * 2 + xb3 * (h / 2), x2)
-            xb1 = stage_grad(g6 + xb2 * (h / 2), x1)
-            grad_y = grad_y + xb4
-            grad_y = grad_y + xb3
-            grad_y = grad_y + xb2
-            grad_y = grad_y + xb1
+        grad_y = _rk4_sparse_backward(
+            grad_y, stage_points, low_field, high_field, scale, acc, h, ctx.n_steps)
         return grad_y, None, None, None, None, None, None
 
 

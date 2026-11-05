@@ -65,54 +65,15 @@ def _capture(fn):
 
 
 def _forward_body(y_in, stages, y_out, low, high, h, n_steps):
-    # Same arithmetic as _RK4SparseFlowIntegrate.forward with high_scale=1.
-    y = y_in
-    for i in range(n_steps):
-        k1 = ff.sample_field(y, low) + ff.sample_field(y, high)
-        x2 = y + (h / 2) * k1
-        k2 = ff.sample_field(x2, low) + ff.sample_field(x2, high)
-        x3 = y + (h / 2) * k2
-        k3 = ff.sample_field(x3, low) + ff.sample_field(x3, high)
-        x4 = y + h * k3
-        k4 = ff.sample_field(x4, low) + ff.sample_field(x4, high)
-        stages[4 * i].copy_(y)
-        stages[4 * i + 1].copy_(x2)
-        stages[4 * i + 2].copy_(x3)
-        stages[4 * i + 3].copy_(x4)
-        y = y + (h / 6) * (k1 + 2 * k2 + 2 * k3 + k4)
+    y, _ = ff._rk4_forward_stages(
+        y_in, lambda p: ff.sample_field(p, low) + ff.sample_field(p, high),
+        h, n_steps, stages)
     y_out.copy_(y)
 
 
 def _backward_body(g_in, stages, g_out, low, high, acc, h, n_steps):
-    # Same adjoint sweep as _RK4SparseFlowIntegrate.backward.
-    consts = ff._field_consts(low, g_in.dtype)
-    corners = ff._corner_bits(g_in.device)
-    if consts['signs'].dtype == g_in.dtype:
-        signs = consts['signs']
-    else:
-        signs = (2 * corners - 1).to(g_in.dtype)
-    Y, X = low.shape[2], low.shape[3]
-
-    def stage_grad(g, pts):
-        return ff._sparse_backward_impl(
-            g, pts, low, high, 1.0, acc,
-            consts['shape_m1'], consts['zeros'], consts['shape_m2'],
-            consts['corner_offsets'], signs, corners, Y, X,
-        )
-
-    grad_y = g_in
-    for step in range(n_steps - 1, -1, -1):
-        x1, x2, x3, x4 = stages[4 * step: 4 * step + 4]
-        g6 = grad_y * (h / 6)
-        xb4 = stage_grad(g6, x4)
-        xb3 = stage_grad(g6 * 2 + xb4 * h, x3)
-        xb2 = stage_grad(g6 * 2 + xb3 * (h / 2), x2)
-        xb1 = stage_grad(g6 + xb2 * (h / 2), x1)
-        grad_y = grad_y + xb4
-        grad_y = grad_y + xb3
-        grad_y = grad_y + xb2
-        grad_y = grad_y + xb1
-    g_out.copy_(grad_y)
+    g_out.copy_(ff._rk4_sparse_backward(
+        g_in, stages, low, high, 1.0, acc, h, n_steps))
 
 
 def _evict(cache):
