@@ -365,10 +365,12 @@ def run_native(cfg,out):
     field,normals,trace,chunks=open_inputs(base)
     if chunks.gpu_library or trace.parallel_threads!=1:
         raise ValueError('native streaming uses one shared CPU pool')
+    trace=ft.stream_trace_config(trace,options.setdefault('reverse_consistency',True))
     _,_,_,shape=ft.prediction_presence_storage(field)
     options.setdefault('box_base_xyz',[[0,0,0],list(shape[::-1])])
     keys=job_keys(base,field,chunks)
-    identity=hashlib.sha256(json.dumps(cfg,sort_keys=True).encode()).hexdigest()
+    effective=dict(cfg,trace=trace.to_dict(),stream=options,reverse_policy_version=1)
+    identity=hashlib.sha256(json.dumps(effective,sort_keys=True).encode()).hexdigest()
     record=out/'run.json'
     if record.exists():
         saved=json.loads(record.read_text())
@@ -377,7 +379,7 @@ def run_native(cfg,out):
         if saved['identity']!=identity:
             raise ValueError('resume settings/source differ')
     else:
-        atomic_json(record,dict(identity=identity,config=cfg,policy='neural-volume+width-v1',
+        atomic_json(record,dict(identity=identity,config=effective,policy='neural-volume+width+reverse-v1',
             output_schema='fiber-stream-attributes-v2',
             coordinates='base voxels',decision_base=options.get('decision_base',64)))
     atomic_json(out/'scheduler.json',dict(backend='native-cooperative-v1',options=options))
@@ -393,6 +395,8 @@ def main(argv=None):
         if not args.python_reference:
             run_native(cfg,args.output)
             return 0
+        if cfg['stream'].get('reverse_consistency',True):
+            raise ValueError('FW/BW verification requires the native runner; Python reference is off-only')
         stream=Stream(cfg,args.output)
         if os.environ.get('VC_STREAM_PROFILE'):
             import cProfile
