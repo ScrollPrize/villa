@@ -203,16 +203,30 @@ def display_anchors(pipeline, session):
 def run_fit(pipeline, params):
     """Sample fit patches up to the number asked for, then correlate and fit, `passes` times,
     as the first runs did (patch hold-out, gate). Hold-out patches are never used or
-    re-measured."""
+    re-measured.
+
+    Two settings a pair may carry in `params.json`, off unless set: `at_most`, a seeded
+    random choice of that many fit patches when there are more (a session imported from
+    the first runs can hold 500, and the bend's cost grows with the cube of its points);
+    `octants` 0, one point per patch and never its octants."""
     with session_lock(pipeline):
         session = open_session(pipeline)
-        have = sum(1 for patch in session.state["patches"]
-                   if not patch.get("test") and patch["auto"] == fs.OK)
+        fit_patches = sorted(patch["id"] for patch in session.state["patches"]
+                             if not patch.get("test") and patch["auto"] == fs.OK)
+        have = len(fit_patches)
         if params["patches"] > have:
             session.sample(params["patches"] - have, seed=params["seed"] + have)
+            fit_patches = sorted(patch["id"] for patch in session.state["patches"]
+                                 if not patch.get("test") and patch["auto"] == fs.OK)
+        among = None
+        if params.get("at_most") and len(fit_patches) > params["at_most"]:
+            rng = np.random.default_rng(params["seed"])
+            among = set(rng.choice(fit_patches, params["at_most"], replace=False).tolist())
+        octants = bool(params.get("octants", 1))
         for _ in range(params["passes"]):
-            session.correlate(skip_test=True)
-            session.fit("patches", "gate")
+            session.correlate(skip_test=True, among=among)
+            session.fit("patches", "gate", unit=None if octants else "patches", among=among,
+                        octants=octants)
         record = session.fit_record()
         transform = json.loads((session.directory / record["transform"]).read_text())
     out = pipeline.work("fit")

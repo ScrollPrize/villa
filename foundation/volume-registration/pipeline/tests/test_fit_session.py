@@ -372,6 +372,12 @@ def test_a_gate_splits_a_patch_that_deformed_inside_into_octants(tmp_path):
     fit = session.fit_record(session.fit(robust="gate"))
     assert "p0005" not in fit["used"]
     assert sum(point.startswith("p0005.") for point in fit["used"]) == 8
+    # Without octants the patch is one point again, and `among` keeps the fit to a choice.
+    session.set_verdict("p0006", "use-octants")
+    among = {patch["id"] for patch in session.candidates()} - {"p0007"}
+    fit = session.fit_record(session.fit(robust="gate", unit="patches", among=among, octants=False))
+    assert "p0005" in fit["used"] and "p0006" in fit["used"]
+    assert not any("." in point for point in fit["used"]) and "p0007" not in fit["candidates"]
 
 
 def test_a_test_patch_is_never_fitted_and_scores_the_fit(tmp_path):

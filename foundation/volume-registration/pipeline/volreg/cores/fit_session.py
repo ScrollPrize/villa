@@ -568,11 +568,12 @@ class Session:
         self.save()
         return sign
 
-    def correlate(self, only_new=False, skip_test=False):
+    def correlate(self, only_new=False, skip_test=False, among=None):
         """Measure every textured patch under the current fit's affine part, or with
         `only_new` those not measured yet -- a test set drawn after the fits, say. With
         `skip_test`, test patches are left as they are: the pipeline keeps a hold-out
-        measurement exactly as the person who judged it saw it.
+        measurement exactly as the person who judged it saw it. With `among`, a set of
+        patch ids, only those.
 
         A patch is measured at the NCC optimum its peak check finds next to the phase
         correlation's answer: on PHerc0139 a blind review preferred the optimum eleven
@@ -592,7 +593,8 @@ class Session:
         under = self.state["current"]
         patches = [patch for patch in self._correlatable()
                    if (not only_new or patch["measurement"] is None)
-                   and not (skip_test and patch.get("test"))]
+                   and not (skip_test and patch.get("test"))
+                   and (among is None or patch["id"] in among)]
         for patch in patches:
             self.coarse_block(patch["id"])
         held = {patch["id"]: self._fine.get(patch["id"]) for patch in patches}
@@ -770,7 +772,7 @@ class Session:
             chosen.append(patch)
         return chosen
 
-    def points(self, patches, auto_octants=False, every_octant=False):
+    def points(self, patches, auto_octants=False, every_octant=False, octants=True):
         """The points a fit is made from: `(id, coarse_zyx, fine_zyx, trusted)`.
 
         One per patch, at its measurement, except for a patch marked "use-octants" -- or,
@@ -779,13 +781,14 @@ class Session:
         well, with ids `<patch>.<octant>`. An octant is
         placed at its NCC optimum rather than its phase-correlation shift, which on a
         half-size block is biased towards zero. A point is trusted -- kept whatever RANSAC
-        says -- when a person judged its patch.
+        says -- when a person judged its patch. Without `octants`, every patch gives one
+        point, whatever it is marked.
         """
         points = []
         for patch in patches:
             measurement, human = patch["measurement"], patch["human"]
-            by_octants = (human["verdict"] == OCTANTS if human is not None
-                          else every_octant or (auto_octants and wants_octants(measurement)))
+            by_octants = octants and (human["verdict"] == OCTANTS if human is not None
+                                      else every_octant or (auto_octants and wants_octants(measurement)))
             if not by_octants:
                 points.append((patch["id"], measurement["centre_zyx"],
                                measurement["fine_zyx"], human is not None))
@@ -794,13 +797,15 @@ class Session:
                 points.append((f"{patch['id']}.{index}", centre, fine, human is not None))
         return points
 
-    def fit(self, hold_out=None, robust=None, unit=None):
+    def fit(self, hold_out=None, robust=None, unit=None, among=None, octants=True):
         """Fit the current measurements and make the result the current transform.
 
         `hold_out` is one of `HOLD_OUTS`, `robust` one of `ROBUST`, `unit` one of `UNITS`;
         None keeps the current fit's, "regions", "ransac" and "patches" for a session's
         first. With "gate", a patch no person judged is also split into octants when
-        `wants_octants` says so; with "octants", always.
+        `wants_octants` says so; with "octants", always. With `among`, a set of patch ids,
+        only those patches are used; without `octants`, no patch is split, so `unit` must
+        be "patches".
 
         The robust step is the one the research used: RANSAC against an affine with the
         threshold in coarse voxels. A patch a person marked good is used even when RANSAC
@@ -820,9 +825,11 @@ class Session:
             unit = (self.fit_record() or {}).get("unit", "patches")
         if unit not in UNITS:
             raise ValueError(f"unknown unit {unit!r}; one of {', '.join(UNITS)}")
-        patches = self.candidates()
+        if not octants and unit == "octants":
+            raise ValueError("a fit without octants takes one point per patch: unit 'patches'")
+        patches = [patch for patch in self.candidates() if among is None or patch["id"] in among]
         points = self.points(patches, auto_octants=robust == "gate",
-                             every_octant=unit == "octants")
+                             every_octant=unit == "octants", octants=octants)
         if len(points) < 6:
             raise ValueError(f"only {len(points)} usable points; a fit needs at least 6")
         ids = [point[0] for point in points]
