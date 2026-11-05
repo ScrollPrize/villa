@@ -98,7 +98,7 @@ std::shared_ptr<ObjectStoreSession::Attachment> ObjectStoreSession::open(const s
     // Exercise write access without changing records. Opening a read connection
     // successfully is not sufficient validation for an editing session.
     next->writable = !options.readOnly;
-    if (next->writable) { auto writable = next->store().write(RevisionSelection{}); writable.commit(); }
+    if (next->writable) { auto writable = next->store().write(); writable.commit(); }
     next->author = next->store().author();
     auto txn = next->store().read();
     next->identity.storeUuid = next->store().uuid(txn);
@@ -597,7 +597,7 @@ void ObjectStoreSession::startFetching(Attachment& attachment)
             if (!fetch) throw std::runtime_error("no geometry fetcher for " + uuid);
             // A placeholder another replica pushed is edited by fetching it.
             const auto lease = holdLeases(identity, {uuid});
-            fetch(held->store(), uuid, [&](const RevisionSelection& expected, const Action& action) {
+            fetch(held->store(), uuid, [&](const VersionSelection& expected, const Action& action) {
                 return fetchWrite(identity, expected, action);
             });
         } catch (...) { release(*held, false); throw; }
@@ -605,10 +605,10 @@ void ObjectStoreSession::startFetching(Attachment& attachment)
     });
 }
 
-RevisionSelection ObjectStoreSession::fetchWrite(const AttachmentIdentity& identity, const RevisionSelection& expected,
-                                                 const Action& callback)
+TransactionReceipt ObjectStoreSession::fetchWrite(const AttachmentIdentity& identity, const VersionSelection& expected,
+                                                  const Action& callback)
 {
-    RevisionSelection committed;
+    TransactionReceipt committed;
     auto attachment = acquire(identity, false);
     try {
         if (!attachment->fetches) throw std::runtime_error("Object store is attached read-only");
@@ -616,7 +616,7 @@ RevisionSelection ObjectStoreSession::fetchWrite(const AttachmentIdentity& ident
         auto txn = attachment->store().write(expected);
         callback(attachment->store(), txn);
         txn.commit();
-        committed = txn.committedRevisions();
+        committed = *txn.receipt();
         if (attachment->hub) attachment->hub->requestSync(true);
     } catch (...) { release(*attachment, false); throw; }
     release(*attachment, false);

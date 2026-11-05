@@ -29,7 +29,6 @@ struct GeometryReadState {
 struct GeometryViewState {
     std::shared_ptr<GeometryReadState> read;
     GeometryRevision revision;
-    std::string objectRevision;
     std::optional<int64_t> version;
     std::optional<std::map<int64_t, int64_t>> pointIndex;
     const GeometryArrayInfo& array(const std::string& name) const {
@@ -155,7 +154,7 @@ std::shared_ptr<State> GeometrySnapshot::view(const std::string& id, const std::
         throw std::invalid_argument("unsupported geometry version or coordinate system");
     auto result = std::make_shared<State>();
     result->read = state_; result->revision = *revision;
-    if (!geometryRevision) { result->objectRevision = object->uuid; result->version = object->version; }
+    if (!geometryRevision) result->version = object->version;
     if (revision->kind == "point_collection") {
         result->require("points", "<f8", 2);
         result->require("point_ids", "<i8", 1);
@@ -188,7 +187,6 @@ TypedGeometryView GeometrySnapshot::geometry(const std::string& id, const std::o
 GeometryView::GeometryView(std::shared_ptr<State> state) : state_(std::move(state)) {}
 const GeometryRevision& GeometryView::revision() const { state_->read->require(); return state_->revision; }
 std::optional<int64_t> GeometryView::version() const { state_->read->require(); return state_->version; }
-const std::string& GeometryView::objectRevision() const { state_->read->require(); return state_->objectRevision; }
 geometry::Geometry GeometryView::loadGeometry() const
 {
     state_->read->require();
@@ -266,8 +264,8 @@ geometry::Surface SurfaceView::load() const { return std::get<geometry::Surface>
 const GeometryRevision& TransformedGeometryView::revision() const {
     return std::visit([](const auto& v)->const GeometryRevision&{return v.revision();},source_);
 }
-const std::string& TransformedGeometryView::objectRevision() const {
-    return std::visit([](const auto& v)->const std::string&{return v.objectRevision();},source_);
+std::optional<int64_t> TransformedGeometryView::version() const {
+    return std::visit([](const auto& v){return v.version();},source_);
 }
 std::vector<geometry::Point> TransformedGeometryView::points(const std::string& array,int64_t start,int64_t count) const {
     auto result=std::visit([&](const auto& v)->std::vector<geometry::Point>{
@@ -334,7 +332,8 @@ void TransformedGeometryView::validateForWrite(const ObjectStore& db,const Txn& 
     const auto& pinned=revision();
     const auto head=db.currentGeometry(txn,pinned.objectUuid);
     const auto object=db.currentObjectRevision(txn,pinned.objectUuid);
-    if(!head||head->uuid!=pinned.uuid||!object||object->uuid!=objectRevision())
+    const auto read=version();
+    if(!head||head->uuid!=pinned.uuid||!object||!read||object->version!=*read)
         throw std::runtime_error("object changed; reopen its transformed view");
     const auto mapping=db.volumeTransforms(txn).toVolume(nlohmann::json::parse(object->record.meta),target_,targetScale_);
     if(!mapping||*mapping!=mapping_)throw std::runtime_error("volume registration changed; reopen its transformed view");

@@ -291,10 +291,10 @@ int main() try
         releaseLeases(bob, uuids);
         acquireLeases(alice, uuids);
         {
-            RevisionSelection expected;
+            VersionSelection expected;
             {
                 auto read = alice.read();
-                for (const auto& uuid : uuids) expected[uuid] = alice.currentObjectRevision(read, uuid)->uuid;
+                for (const auto& uuid : uuids) expected[uuid] = alice.currentVersion(read, uuid);
             }
             auto txn = alice.write(expected);
             for (const auto& [kind, uuid] : objects) {

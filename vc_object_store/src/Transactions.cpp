@@ -7,7 +7,7 @@
 namespace vc::objects {
 using namespace detail;
 Txn::Txn(Txn&& other) noexcept : db_(other.db_), handle_(other.handle_), write_(other.write_),
-    expectedRevisions_(std::move(other.expectedRevisions_)), committedRevisions_(std::move(other.committedRevisions_)),
+    expectedRevisions_(std::move(other.expectedRevisions_)),
     receipt_(std::move(other.receipt_)), expectedObjectVersions_(std::move(other.expectedObjectVersions_)),
     expectedRelationshipVersions_(std::move(other.expectedRelationshipVersions_))
 {
@@ -45,10 +45,6 @@ void Txn::release(bool commit)
             refreshSourceIdentityIndex(conn);
             publishHistory(conn);
             enforceHubRules(conn, *activeStatementPools.at(conn), db_->impl_->hubRole);
-            for (const auto& [uuid, expected] : expectedRevisions_) {
-                Statement head(conn, "SELECT revision_uuid FROM object_heads WHERE object_uuid=?", parseUuid(uuid));
-                committedRevisions_[uuid] = head.row() ? std::optional(head.uuid(0)) : std::nullopt;
-            }
             auto expectedObjects = expectedObjectVersions_;
             for (const auto& [uuid, expected] : expectedRevisions_) expectedObjects.emplace(uuid, std::nullopt);
             receipt_ = finishReceipt(conn, *activeStatementPools.at(conn), expectedObjects, expectedRelationshipVersions_);
@@ -57,7 +53,7 @@ void Txn::release(bool commit)
     }
     catch (...) {
         sqlite3_exec(conn, "ROLLBACK;", nullptr, nullptr, nullptr);
-        committedRevisions_.clear(); receipt_.reset();
+        receipt_.reset();
         releaseConnection(); throw;
     }
     releaseConnection();
@@ -116,12 +112,11 @@ WriteTxn ObjectStore::write()
     return WriteTxn(this, impl_->writer);
 }
 
-WriteTxn ObjectStore::write(const RevisionSelection& expected)
+WriteTxn ObjectStore::write(const VersionSelection& expectedObjects)
 {
-    auto txn = write();
-    expectHistory(static_cast<sqlite3*>(connection(txn)), expected);
-    txn.expectedRevisions_ = expected;
-    return txn;
+    TransactionContext context;
+    context.expectedObjects = expectedObjects;
+    return write(context);
 }
 
 WriteTxn ObjectStore::write(const TransactionContext& context)

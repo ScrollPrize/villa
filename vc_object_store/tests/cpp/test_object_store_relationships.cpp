@@ -34,7 +34,7 @@ try {
     }
     const auto heads = [&] {
         auto txn = db.read();
-        return RevisionSelection{{a, db.currentObjectRevision(txn, a)->uuid}, {b, db.currentObjectRevision(txn, b)->uuid}};
+        return VersionSelection{{a, db.currentVersion(txn, a)}, {b, db.currentVersion(txn, b)}};
     };
     const auto component = [&](const std::string& uuid, std::optional<bool> adjacent, bool applicableOnly) {
         auto txn = db.read();

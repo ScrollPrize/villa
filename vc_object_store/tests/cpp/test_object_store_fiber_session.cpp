@@ -31,9 +31,9 @@ int main() try
         }
     });
     auto heads = [&] {
-        RevisionSelection result;
+        VersionSelection result;
         storeRead(db, [&](const auto& store, const auto& txn, const auto&) {
-            for (const auto& uuid : {a,b,c}) result[uuid] = store.currentObjectRevision(txn, uuid)->uuid;
+            for (const auto& uuid : {a,b,c}) result[uuid] = store.currentVersion(txn, uuid);
         });
         return result;
     };
@@ -104,9 +104,9 @@ int main() try
         store.putGeometry(txn, source, vc::geometry::encode(geometry));
     });
     std::string sourceGeometry;
-    RevisionSelection splitHeads{{left,{}}, {right,{}}};
+    VersionSelection splitHeads{{left,{}}, {right,{}}};
     storeRead(db, [&](const auto& store, const auto& txn, const auto&) {
-        splitHeads[source] = store.currentObjectRevision(txn, source)->uuid;
+        splitHeads[source] = store.currentVersion(txn, source);
         sourceGeometry = store.currentGeometry(txn, source)->uuid;
     });
     storeAct(db, splitHeads, [&](auto& store, auto& txn) {
@@ -124,11 +124,11 @@ int main() try
         }
         store.retireObject(txn, source);
     });
-    RevisionSelection mergeHeads;
+    VersionSelection mergeHeads;
     std::string leftGeometry, rightGeometry;
     storeRead(db, [&](const auto& store, const auto& txn, const auto&) {
         require(store.objectByUuid(txn, source)->retired, "atomic source retirement");
-        for (const auto& uuid : {left,right}) mergeHeads[uuid] = store.currentObjectRevision(txn, uuid)->uuid;
+        for (const auto& uuid : {left,right}) mergeHeads[uuid] = store.currentVersion(txn, uuid);
         leftGeometry = store.currentGeometry(txn, left)->uuid; rightGeometry = store.currentGeometry(txn, right)->uuid;
         require(Json::parse(store.geometryPointAnnotations(txn, rightGeometry, "control_points"))[0]["label"] == "c", "split annotations");
     });

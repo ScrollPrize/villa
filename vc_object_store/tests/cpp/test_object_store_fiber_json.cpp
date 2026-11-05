@@ -9,15 +9,15 @@
 using namespace vc::objects;
 using Json = nlohmann::json;
 namespace {
-// The numbered versions of object revisions (pins from a receipt).
-std::vector<ObjectVersion> versionsOf(const StoreReader& reader, const RevisionSelection& pins)
+// Numbered references of versions in the active generation (pins from a receipt).
+std::vector<ObjectVersion> versionsOf(const StoreReader& reader, const VersionSelection& pins)
 {
     std::vector<ObjectVersion> result;
-    const auto store = reader.status().storeUuid;
-    for (const auto& [uuid, pin] : pins)
-        for (const auto& revision : reader.objectHistory(uuid))
-            if (pin && revision.uuid == *pin) result.push_back({store, revision.generation, uuid, revision.version});
-    if (result.size() != pins.size()) throw std::runtime_error("pin without a recorded version");
+    const auto status = reader.status();
+    for (const auto& [uuid, pin] : pins) {
+        if (!pin) throw std::runtime_error("pin without a recorded version");
+        result.push_back({status.storeUuid, status.generation, uuid, *pin});
+    }
     return result;
 }
 } // namespace
@@ -74,7 +74,7 @@ int main() try {
     { auto txn = external.write(receipt); external.setMeta(txn,uuid,"external","true");
       auto changed = source; changed["control_points_attributes"][0]["tags"] = {"changed"};
       mustFail([&] { external.setMeta(txn, uuid, "source", changed.dump()); }); txn.commit();
-      require(txn.committedRevisions().at(uuid) != receipt.at(uuid), "external commit produces different pin"); }
+      require(txn.receipt()->objects.at(uuid) != receipt.at(uuid), "external commit produces different pin"); }
     storeReader(store,[&](const StoreReader& reader,const auto&) {
         const auto pinned = versionsOf(reader, receipt).front();
         require(reader.objectsAtVersions({pinned}).front()->record.meta.find("external") == std::string::npos, "receipt is immutable after external commit");
@@ -97,10 +97,10 @@ int main() try {
         linked["branches"] = Json::array({Json{{"target_uuid", uuid}, {"control_point_index", 0},
                                                {"branch_control_point_index", 0}}});
         auto batch = std::vector<GeometrySource>{decodeFiberJson(linked.dump())};
-        RevisionSelection pins{{imported, {}}};
+        VersionSelection pins{{imported, {}}};
         storeRead(store, [&](const auto& db, const auto& txn, const auto&) {
             for (const auto& target : fiberBatchEndpoints(batch))
-                pins[target] = db.currentObjectRevision(txn, target)->uuid;
+                pins[target] = db.currentVersion(txn, target);
         });
         { auto txn = external.write(); external.setMeta(txn, unrelated, "concurrent", "true"); txn.commit(); }
         storeAct(store, pins, [&](auto& db, auto& txn) { ingestGeometryBatch(db, txn, batch); });
@@ -110,7 +110,7 @@ int main() try {
         batch = {decodeFiberJson(linked.dump())}; pins = {{rejected, {}}};
         storeRead(store, [&](const auto& db, const auto& txn, const auto&) {
             for (const auto& target : fiberBatchEndpoints(batch))
-                pins[target] = db.currentObjectRevision(txn, target)->uuid;
+                pins[target] = db.currentVersion(txn, target);
         });
         { auto txn = external.write(); external.setMeta(txn, uuid, "concurrent", "true"); txn.commit(); }
         mustFail([&] { storeAct(store, pins, [&](auto& db, auto& txn) { ingestGeometryBatch(db, txn, batch); }); });
@@ -166,11 +166,11 @@ int main() try {
         mustFail([&] { fiberNetworkJson(reader,pinned,{a},1); });
     });
     storeAct(store, networkPins, [&](auto& db, auto& txn) { db.removeEdge(txn,ordinary); });
-    RevisionSelection currentNetworkPins;
+    VersionSelection currentNetworkPins;
     storeReader(store, [&](const StoreReader& reader, const auto&) {
         require(fiberNetworkJson(reader,versionsOf(reader,networkPins),{a}) == exported, "pinned topology survives later edge deletion");
         auto current = networkPins;
-        for (auto& [objectUuid, pin] : current) pin = reader.currentObject(objectUuid)->uuid;
+        for (auto& [objectUuid, pin] : current) pin = reader.currentObject(objectUuid)->version;
         currentNetworkPins = current;
         const auto now = fiberNetworkJson(reader,versionsOf(reader,current),{a});
         require(Json::parse(now.at(a))["branches"].empty(), "current export observes edge deletion");
@@ -181,7 +181,7 @@ int main() try {
         db.keepRecordedRelationship(txn, adjacent);
     });
     storeReader(store, [&](const StoreReader& reader, const auto&) {
-        for (auto& [objectUuid, pin] : currentNetworkPins) pin = reader.currentObject(objectUuid)->uuid;
+        for (auto& [objectUuid, pin] : currentNetworkPins) pin = reader.currentObject(objectUuid)->version;
         const auto now = fiberNetworkJson(reader,versionsOf(reader,currentNetworkPins),{a});
         require(now.size() == 1 && Json::parse(now.at(a))["adjacent_branches"].empty(), "retired endpoints and inactive edges are not transported");
         require(fiberNetworkJson(reader,versionsOf(reader,networkPins),{a}) == exported, "historical network remains independent of current lifecycle");

@@ -323,7 +323,7 @@ int main() try {
         std::string second;
         {
             auto read = store.read();
-            const auto head = store.currentObjectRevision(read, uid)->uuid;
+            const auto head = store.currentVersion(read, uid);
             auto txn = store.write({{uid, head}});
             GeometrySequencePart part; part.count = 1; part.ids = {30}; part.bytes = doubles({7, 8, 9});
             part.annotations = R"([{"label":"C"}])";
@@ -346,7 +346,7 @@ int main() try {
         require(view.point(30) == vc::geometry::Point{7, 8, 9}, "lookup by stable ID");
         std::string third;
         {
-            auto txn = store.write({{uid, view.objectRevision()}});
+            auto txn = store.write({{uid, view.version()}});
             third = store.editGeometry(txn, uid, {{"points", 3, doubles({10, 11, 12})}}, view.revision().uuid);
             txn.commit();
         }

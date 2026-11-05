@@ -17,7 +17,6 @@ public:
     TransformedGeometryView viewTransformedAt(const std::string& targetVolume, double targetScale=1) const;
     std::vector<vcr::catalog::TransformResolution> availableTransforms() const;
     const GeometryRevision& revision() const;
-    const std::string& objectRevision() const;
     // The numbered version of the object this view read (its current one);
     // nullopt for a view of a pinned geometry revision.
     std::optional<int64_t> version() const;
@@ -108,7 +107,8 @@ class TransformedGeometryView {
 public:
     ViewFrame frame() const {return {target_, targetScale_, mapping_};}
     const GeometryRevision& revision() const;
-    const std::string& objectRevision() const;
+    // The canonical view's version(): nullopt for a pinned geometry revision.
+    std::optional<int64_t> version() const;
     const VolumeAffine& mapping() const {return mapping_;}
     const TypedGeometryView& canonical() const {return source_;}
     const std::string& targetVolume() const {return target_;}
@@ -176,7 +176,7 @@ public:
                                        const std::optional<std::string>& geometryRevision = std::nullopt) const;
     bool active() const;
     // The object's current geometry, or its pinned `geometryRevision`. A view of
-    // a pinned revision has an empty objectRevision().
+    // a pinned revision has no version().
     PointCollectionView pointCollection(const std::string& objectUuid,
                                         const std::optional<std::string>& geometryRevision = std::nullopt) const;
     FiberView fiber(const std::string& objectUuid, const std::optional<std::string>& geometryRevision = std::nullopt) const;

@@ -123,8 +123,8 @@ struct EdgeRecord : RecordCommon {
     Anchor aAnchor, bAnchor;
 };
 
-// Object UUID -> immutable object revision UUID. null means expect no object.
-// These are object revisions, not geometry payload revisions.
+// Object UUID -> internal object revision UUID (storage keys; public history
+// references are numbered ObjectVersions). null means no object.
 using RevisionSelection = std::map<std::string, std::optional<std::string>>;
 
 struct ObjectRevision {
@@ -331,10 +331,8 @@ public:
     ~Txn();
     void commit();
     bool active() const { return handle_ != nullptr; }
-    // Exact heads captured inside a successful checked commit, before releasing
-    // the writer. A later external commit cannot change this receipt.
-    const RevisionSelection& committedRevisions() const { return committedRevisions_; }
-    // Numbered receipt of a committed write: commit sequence and versions.
+    // Numbered receipt of a committed write: commit sequence and versions,
+    // captured before releasing the writer (a later commit cannot change it).
     const std::optional<TransactionReceipt>& receipt() const { return receipt_; }
 
 protected:
@@ -347,7 +345,7 @@ private:
     ObjectStore* db_ = nullptr;
     void* handle_ = nullptr;  // sqlite3*
     bool write_ = false;
-    RevisionSelection expectedRevisions_, committedRevisions_;
+    RevisionSelection expectedRevisions_;
     std::optional<TransactionReceipt> receipt_;
     VersionSelection expectedObjectVersions_, expectedRelationshipVersions_;
 };
@@ -426,10 +424,11 @@ public:
     // records created or changed.
     std::vector<std::string> recordCatalogTransforms(WriteTxn&, const std::vector<vcr::catalog::Registration>&);
     WriteTxn write();
-    // Check supplied heads before editing; require every changed object/endpoint.
-    // Commit publishes one revision per changed object. Missing expectations or
-    // conflicts abort the whole transaction, even if caught.
-    WriteTxn write(const RevisionSelection& expected);
+    // Checked write expecting these object versions (null: absent); the same as
+    // write(TransactionContext) with only expectedObjects. Every changed
+    // object/endpoint must be expected. Commit publishes one revision per changed
+    // object. Missing expectations or conflicts abort the whole transaction, even if caught.
+    WriteTxn write(const VersionSelection& expectedObjects);
     // Numbered checked write (see TransactionContext). A request UUID already
     // committed is rejected here; use receipt() or submit() to recover it.
     WriteTxn write(const TransactionContext&);

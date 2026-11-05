@@ -78,7 +78,7 @@ int main() try {
         surfaces.targetScale=.5;cut.origin={6.5,.5,10.5};cut.localBounds={-.25,-.5,-.5,.25,.5,.5};
         clippedEnds(.5);
     }
-    std::string objectRevision,geometryRevision;
+    std::optional<int64_t> objectVersion;std::string geometryRevision;
     std::vector<GeometryArrayEdit> changes;
     {
         GeometrySnapshot snapshot(db);const auto view=snapshot.track(track).viewTransformedAt("b");
@@ -125,13 +125,13 @@ int main() try {
         require(surfaceChanges.size()==1,"surface inverse edits supplied by store");
         const auto changedPoint=vc::objects::xyzFromBytes<float>(surfaceChanges.front().bytes).front();
         require(changedPoint==std::array<float,3>{1,0,1},"surface inverse uses registration");
-        changes=surfaceChanges;objectRevision=surfaceView.objectRevision();geometryRevision=surfaceView.revision().uuid;
+        changes=surfaceChanges;objectVersion=surfaceView.version();geometryRevision=surfaceView.revision().uuid;
         snapshot.close();
         bool closed=false;try{view.points("points",0,1);}catch(const std::exception&){closed=true;}require(closed,"snapshot lifetime retained");
     }
     {
         GeometrySnapshot snapshot(db);const auto view=snapshot.surface(surface).viewTransformedAt("b");
-        auto txn=db.write({{surface,objectRevision}});view.validateForWrite(db,txn);
+        auto txn=db.write({{surface,objectVersion}});view.validateForWrite(db,txn);
         db.editGeometry(txn,surface,changes,geometryRevision);txn.commit();
     }
     GeometrySnapshot pinned(db);const auto stale=pinned.surface(surface).viewTransformedAt("b");
@@ -157,7 +157,7 @@ int main() try {
         const auto choice=vc::objects::util::newUuid();
         {auto txn=db.write({{choice,std::nullopt}});require(db.chooseVolumeTransform(txn,"a","b",paths[1],choice)==choice,"choice takes the given uuid");txn.commit();}
         {auto read=db.read();require(db.volumeTransforms(read).resolve("a","b").status==vcr::catalog::TransformStatus::Resolved,"a choice resolves the pair");}
-        {auto read=db.read();const auto head=db.currentObjectRevision(read,choice)->uuid;
+        {auto read=db.read();const auto head=db.currentVersion(read,choice);
          auto txn=db.write({{choice,head}});require(db.chooseVolumeTransform(txn,"a","b",paths[0])==choice,"choosing again updates the choice");txn.commit();}
         auto read=db.read();
         require(db.volumeTransforms(read).resolve("a","b").resolved().path==paths[0],"the latest choice wins");
@@ -187,7 +187,7 @@ int main() try {
         require(context.resolve("a","b").resolved().path!=other,"the forward choice is unchanged");
         const auto choice=volumeTransformChoice(db,read,"b","a");
         require(choice.has_value(),"the explicit reverse choice is stored");
-        {auto txn=db.write({{choice->uuid,db.currentObjectRevision(read,choice->uuid)->uuid}});db.retireObject(txn,choice->uuid);txn.commit();}
+        {auto txn=db.write({{choice->uuid,db.currentVersion(read,choice->uuid)}});db.retireObject(txn,choice->uuid);txn.commit();}
         {auto after=db.read();require(db.volumeTransforms(after).resolve("b","a").resolved().path==implied,"retiring it restores the implied choice");}
         // A b -> a registration equal to the chosen route's inverse folds the
         // implied route into it; the related listing names the listed route.

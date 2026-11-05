@@ -292,7 +292,7 @@ public:
                                         const std::vector<std::pair<std::string, std::filesystem::path>>& files,
                                         const std::string& author = {});
     // Writes by a geometry fetcher (setGeometryFetcher) on a writable attachment.
-    using FetchWrite = std::function<RevisionSelection(const RevisionSelection& expected, const Action&)>;
+    using FetchWrite = std::function<TransactionReceipt(const VersionSelection& expected, const Action&)>;
     // Fetches one object's geometry and writes it with `write`; throws when it
     // cannot. Runs on the attachment's fetch thread; must only read `store`.
     using GeometryFetcher = std::function<void(ObjectStore& store, const std::string& objectUuid, const FetchWrite& write)>;
@@ -303,7 +303,7 @@ public:
     // geometry queue its fetch (then the Committed write); refetch fetches it
     // again. An empty `fetch` removes the fetcher. Read-only attachments never fetch.
     void setGeometryFetcher(const std::string& metaKey, GeometryFetcher fetch);
-    RevisionSelection fetchWrite(const AttachmentIdentity&, const RevisionSelection& expected, const Action&);
+    TransactionReceipt fetchWrite(const AttachmentIdentity&, const VersionSelection& expected, const Action&);
     // Fetch these again (their published geometry changed), read or not.
     void refetch(const AttachmentIdentity&, const std::vector<std::string>& objectUuids);
     // Block until the object's geometry is local, fetching it now when it has

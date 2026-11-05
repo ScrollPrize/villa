@@ -144,7 +144,7 @@ with store.geometry_snapshot() as snapshot:
 The transaction checks the pinned object and geometry revisions, including for
 no-ops. Affected relationships require explicit retain, update, remove or keep
 recorded decisions through `edit_geometry(edge_edits=...)`; include the affected
-endpoints in the transaction's expected revisions. No relationship meaning is
+endpoints in the transaction's expected versions. No relationship meaning is
 inferred by the geometry layer.
 
 C++ clients applying full desired arrays can use `updateGeometryArrays`: it

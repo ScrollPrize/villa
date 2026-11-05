@@ -55,7 +55,7 @@ void createProject(const std::filesystem::path& path, const std::string& name, c
     auto store = ObjectStore::create(path, options);
     ObjectRecord record;
     record.uuid = util::newUuid();
-    auto txn = store.write({{record.uuid, std::nullopt}});
+    auto txn = store.write(VersionSelection{{record.uuid, std::nullopt}});
     record.kind = kProjectKind;
     record.name = name;
     record.meta = meta.is_object() ? meta.dump() : "{}";

@@ -6,15 +6,15 @@
 #include <atomic>
 #include <utility>
 
-// Commits fn(store, txn) in a write checked against `expected`; returns the
-// revisions it committed.
+// Commits fn(store, txn) in a write checked against the `expected` object
+// versions; returns the receipt's versions (every expected and changed object).
 template<class F>
-vc::objects::RevisionSelection storeAct(vc::objects::ObjectStore& store, const vc::objects::RevisionSelection& expected, F&& fn)
+vc::objects::VersionSelection storeAct(vc::objects::ObjectStore& store, const vc::objects::VersionSelection& expected, F&& fn)
 {
     auto txn = store.write(expected);
     fn(store, txn);
     txn.commit();
-    return txn.committedRevisions();
+    return txn.receipt()->objects;
 }
 
 // fn(store, txn, cancelled) over one read transaction (never cancelled).

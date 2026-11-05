@@ -216,7 +216,8 @@ void downloadFile(const std::string& url, const fs::path& path)
 void fetchCatalogSurface(ObjectStore& db, const std::string& uuid, const ObjectStoreSession::FetchWrite& write)
 {
     std::optional<ObjectRecord> record;
-    std::optional<std::string> geometry, revision;
+    std::optional<std::string> geometry;
+    std::optional<int64_t> version;
     {
         auto read = db.read();
         record = db.objectByUuid(read, uuid);
@@ -225,7 +226,7 @@ void fetchCatalogSurface(ObjectStore& db, const std::string& uuid, const ObjectS
             if (record && locallyEdited(*record, *current)) return;
             geometry = current->uuid;
         }
-        if (const auto current = db.currentObjectRevision(read, uuid)) revision = current->uuid;
+        version = db.currentVersion(read, uuid);
     }
     const auto reference = record ? catalogReference(*record) : std::nullopt;
     if (!reference || reference->url.empty()) throw std::runtime_error("not a catalog surface: " + uuid);
@@ -250,9 +251,9 @@ void fetchCatalogSurface(ObjectStore& db, const std::string& uuid, const ObjectS
     updated.surface->gridWidth = prepared.object.surface->gridWidth;
     updated.surface->gridHeight = prepared.object.surface->gridHeight;
     updated.surface->scale = prepared.object.surface->scale;
-    // Expected at the revision read: a concurrent change (another fetch, a
+    // Expected at the version read: a concurrent change (another fetch, a
     // refresh) fails this write, and the next read fetches again.
-    write({{uuid, revision}}, [&](ObjectStore& store, WriteTxn& txn) {
+    write({{uuid, version}}, [&](ObjectStore& store, WriteTxn& txn) {
         store.upsertObject(txn, updated);
         const auto fetched = store.putGeometry(txn, uuid, prepared.geometry, geometry);
         store.setMeta(txn, uuid, "catalog_geometry_revision", Json(fetched).dump());

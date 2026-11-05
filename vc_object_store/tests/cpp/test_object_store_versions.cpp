@@ -164,8 +164,8 @@ try {
 
     // Legacy checked writes produce the same numbered receipts.
     {
-        RevisionSelection expected;
-        { auto txn = db.read(); expected[a] = db.currentObjectRevision(txn, a)->uuid; }
+        VersionSelection expected;
+        { auto txn = db.read(); expected[a] = db.currentVersion(txn, a); }
         auto txn = db.write(expected);
         db.setMeta(txn, a, "legacy", "true");
         txn.commit();
