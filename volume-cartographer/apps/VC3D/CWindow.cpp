@@ -1760,7 +1760,7 @@ void CWindow::configureChunkedViewerConnections(CChunkedVolumeViewer* viewer)
 
                         const auto activeSurface = _state ? _state->surface("segmentation") : nullptr;
                         const bool activeSegmentHasLasagnaModel =
-                            activeSurface && LasagnaServiceManager::instance().surfaceModel(activeSurface->id);
+                            activeSurface && LasagnaServiceManager::instance().surfaceHasModel(activeSurface->id);
 
                         QMenu menu(this);
 

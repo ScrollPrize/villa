@@ -878,15 +878,18 @@ void LasagnaServiceManager::setObjectStore(std::shared_ptr<vc::objects::ObjectSt
     }
 }
 
-std::optional<std::filesystem::path> LasagnaServiceManager::surfaceModel(const std::string& surfaceUuid) const
+bool LasagnaServiceManager::surfaceHasModel(const std::string& surfaceUuid) const
 {
     const auto session = _storeSession.lock();
     if (!session || !_storeAttachment) {
-        return std::nullopt;
+        return false;
     }
-    const auto model = session->artifactDirectory(*_storeAttachment, surfaceUuid, false) / "model.pt";
-    std::error_code ec;
-    return std::filesystem::is_regular_file(model, ec) ? std::optional(model) : std::nullopt;
+    try {
+        const auto files = session->artifacts(*_storeAttachment, surfaceUuid);
+        return std::any_of(files.begin(), files.end(), [](const auto& file) { return file.name == "model.pt"; });
+    } catch (const std::exception&) {
+        return false; // not a stored object (or the store is unavailable)
+    }
 }
 
 void LasagnaServiceManager::stopOptimization()

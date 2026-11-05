@@ -222,8 +222,10 @@ int main(int argc, char** argv)
         {"sources", nlohmann::json::array({referenceUuid})}}}});
     addSurface("sheet_off1", nlohmann::json::object());
     const auto noModelUuid = addSurface("sheet_no_model", nlohmann::json::object());
-    writeFile(QString::fromStdString((session->artifactDirectory(attachment, fittedUuid) / "model.pt").string()),
-              QByteArrayLiteral("model"));
+    const auto modelFile = std::filesystem::path(storePath).parent_path() / "model.pt";
+    writeFile(QString::fromStdString(modelFile.string()), QByteArrayLiteral("model"));
+    session->publishArtifacts(attachment, fittedUuid, session->currentObject(attachment, fittedUuid)->version,
+                              {{"model.pt", modelFile}});
     LasagnaServiceManager::instance().setObjectStore(session, attachment);
     SurfaceCatalog catalog(session);
     catalog.setSource(attachment, volume, {volume->id()});

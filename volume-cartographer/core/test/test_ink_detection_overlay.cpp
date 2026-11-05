@@ -1,4 +1,5 @@
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
+#include <vc_object_store/objects/CatalogStore.hpp>
 #include <doctest/doctest.h>
 
 #include "CState.hpp"
@@ -116,7 +117,12 @@ struct CatalogFixture {
                 throw std::runtime_error("offline");
             });
         const auto attachment = state.objectStoreSession()->attach(storePath, storeOptions);
-        inkFile = state.objectStoreSession()->artifactDirectory(attachment, surfaceUuid) / inkName;
+        // Published files are cached under VC3D's remote cache root: this test's.
+        const auto config = root / "config";
+        fs::create_directories(config);
+        std::ofstream(config / "cache.json") << nlohmann::json{{"version", 1}, {"root", (root / "cache").string()}}.dump();
+        qputenv("VC3D_CONFIG_DIR", QByteArray::fromStdString(config.string()));
+        inkFile = vcr::zarr::decodedCachePath(vcr::zarr::selectedVc3dCacheRoot(), "https://example.test/" + inkName);
         catalog = std::make_unique<SurfaceCatalog>(state.objectStoreSession());
         catalog->setSource(attachment, volume, {volume->id()});
         QElapsedTimer timer;

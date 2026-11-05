@@ -76,8 +76,8 @@ public:
     /** The store jobs read and write (the surface catalog's attachment). */
     void setObjectStore(std::shared_ptr<vc::objects::ObjectStoreSession> session,
                         std::optional<vc::objects::AttachmentIdentity> attachment);
-    /** The model checkpoint a fit left with a stored surface, if any. */
-    std::optional<std::filesystem::path> surfaceModel(const std::string& surfaceUuid) const;
+    /** Whether a fit published a model checkpoint (the model.pt artifact) with a stored surface. */
+    bool surfaceHasModel(const std::string& surfaceUuid) const;
 
     [[nodiscard]] bool isRunning() const;
     [[nodiscard]] QString lastError() const { return _lastError; }

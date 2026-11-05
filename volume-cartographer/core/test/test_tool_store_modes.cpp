@@ -1,3 +1,4 @@
+#include <vc_object_store/objects/ObjectStoreSession.hpp>
 // Command-line tools in store mode produce what their tifxyz mode produces for
 // the same surface. Each tool's binary comes from VC_<TOOL>_BIN.
 
@@ -93,15 +94,26 @@ struct Fixture {
 };
 }
 
-TEST_CASE("vc_tifxyz2obj writes the OBJ into the surface's artifact directory")
+// An artifact of the surface's current version, read back as a local file.
+fs::path artifactCopy(const Fixture& f, const std::string& name)
+{
+    ObjectStoreSession session;
+    OpenOptions options; options.readOnly = true;
+    const auto attachment = session.attach(f.store, options);
+    const auto file = session.artifactFile(attachment, f.uuid, name, f.dir / "artifact-cache");
+    REQUIRE(file.has_value());
+    return *file;
+}
+
+TEST_CASE("vc_tifxyz2obj publishes the OBJ as an artifact of the surface version it read")
 {
     Fixture f;
     const auto bin = tool("VC_TIFXYZ2OBJ_BIN");
     run(bin + " \"" + f.tifxyz.string() + "\" \"" + (f.dir / "file.obj").string() + "\" --normalize-uv", f.dir / "file.log");
     const auto output = run(bin + " " + f.storeArgs() + " --name mesh.obj --normalize-uv", f.dir / "store.log");
-    const auto stored = fs::path(f.store.string() + ".artifacts") / f.uuid / "mesh.obj";
-    CHECK(output.find("obj: " + stored.string()) != std::string::npos);
-    CHECK(readFile(stored) == readFile(f.dir / "file.obj"));
+    CHECK(output.find("obj: mesh.obj") != std::string::npos);
+    CHECK(output.find("artifact_version: 2") != std::string::npos);
+    CHECK(readFile(artifactCopy(f, "mesh.obj")) == readFile(f.dir / "file.obj"));
 }
 
 TEST_CASE("vc_tifxyz2obj with --volume-uuid exports through the store's view of the surface")
@@ -118,7 +130,6 @@ TEST_CASE("vc_tifxyz2obj with --volume-uuid exports through the store's view of 
     const auto bin = tool("VC_TIFXYZ2OBJ_BIN");
     run(bin + " " + f.storeArgs() + " --name full.obj", f.dir / "full.log");
     run(bin + " " + f.storeArgs() + " --name half.obj --volume-uuid=half", f.dir / "half.log");
-    const auto artifacts = fs::path(f.store.string() + ".artifacts") / f.uuid;
     auto firstVertex = [](const fs::path& obj) {
         std::ifstream in(obj);
         for (std::string line; std::getline(in, line);)
@@ -130,7 +141,7 @@ TEST_CASE("vc_tifxyz2obj with --volume-uuid exports through the store's view of 
             }
         return cv::Vec3d(-1, -1, -1);
     };
-    const auto full = firstVertex(artifacts / "full.obj"), half = firstVertex(artifacts / "half.obj");
+    const auto full = firstVertex(artifactCopy(f, "full.obj")), half = firstVertex(artifactCopy(f, "half.obj"));
     for (int i = 0; i < 3; ++i) CHECK(half[i] == doctest::Approx(full[i] / 2));
 }
 
@@ -304,8 +315,12 @@ TEST_CASE("vc_grow_seg_from_segments grows a stored surface from stored sources"
     const auto object = db.objectByUuid(txn, uuid);
     CHECK(object->tags == std::vector<std::string>{"trace"});
     CHECK(nlohmann::json::parse(object->meta).at("provenance").at("sources") == nlohmann::json::array({uuidA}));
-    // The tracer's debug snapshots land in the output's artifacts, not a target directory.
-    CHECK(fs::is_directory(fs::path(f.store.string() + ".artifacts") / uuid / "grow_debug"));
+    // The tracer's debug snapshots are published as the output's artifacts, not left in a target directory.
+    ObjectStoreSession session;
+    OpenOptions readOnly; readOnly.readOnly = true;
+    const auto files = session.artifacts(session.attach(f.store, readOnly), uuid);
+    CHECK(!files.empty());
+    CHECK(std::all_of(files.begin(), files.end(), [](const auto& file) { return file.name.rfind("grow_debug/", 0) == 0; }));
 }
 
 TEST_CASE("flatboi flattens a stored surface and a tifxyz directory alike")

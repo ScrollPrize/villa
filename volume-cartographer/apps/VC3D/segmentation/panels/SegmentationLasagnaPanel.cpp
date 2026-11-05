@@ -1471,7 +1471,7 @@ SegmentationLasagnaPanel::startOptimizationWithOverrides(
     const SurfaceCatalog::Row* activeRow = activeSurfaceRow(state, _surfaceCatalog);
     const bool isOffsetMode = (launchMode == LasagnaMode::Offset);
     const std::string activeUuid = activeRow ? activeRow->record.uuid : std::string{};
-    const bool hasModel = activeRow && mgr.surfaceModel(activeUuid).has_value();
+    const bool hasModel = activeRow && mgr.surfaceHasModel(activeUuid);
 
     QString rootName = QStringLiteral("new_model");
     if (isNewModel) {

@@ -217,6 +217,7 @@ private:
 
     QString _refineName;  // the refined surface's name; empty: refined in place
     QStringList _createdSurfaces;
-    QString _exportedObj;
+    QString _exportedObj; // the OBJ artifact's name, reported by vc_tifxyz2obj
+    QString exportedObjCopy() const;
 
 };
