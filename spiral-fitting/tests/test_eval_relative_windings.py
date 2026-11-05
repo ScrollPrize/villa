@@ -80,3 +80,27 @@ def test_exclude_sector_drops_points_on_that_mesh_only():
     ex = [{'winding': 11, 'theta_deg': [350, 10]}]  # wraps through 0
     r = ev.evaluate({0: col}, MESHES, umbilicus=umb, exclude=ex)
     assert r['n_excluded'] == 1 and r['n_pairs'] == 0
+
+
+def test_prefilter_links_match_brute_force_projection():
+    """The KD-tree prefilter is a speed-up only: every audit number rests on it giving the same links as
+    projecting onto every face, including points at the edge of the tolerance and points on no mesh."""
+    rng = np.random.default_rng(0)
+    pts = []
+    for w in (10, 11, 12, 13):  # 13 is the holed mesh below; its points also fall over the hole
+        for t in rng.uniform(-0.45, 0.45, 25):
+            x, y, z = _xyz(t, w)
+            off = rng.uniform(-14.0, 14.0)  # radial offset spanning both sides of tolerance 10
+            r = math.hypot(x, y) + off
+            pts.append([math.cos(t) * r, math.sin(t) * r, rng.uniform(-2.0, 4.0)])
+    pts += rng.uniform(-900, 900, (40, 3)).tolist()  # mostly nowhere near the arcs
+    pts.append(_xyz(0.7, 11))  # past the arc ends
+    grid = _arc_patch(13).zyxs.clone()
+    grid[1, 15:25] = -1.0  # a strip of invalid vertices in the middle row (masks are set at construction)
+    holed = Patch(zyxs=grid, scale=torch.tensor([1.0, 1.0]), overlapping_ids=None, winding=None)
+    meshes = MESHES + [(13, holed)]
+    for tol in (3.0, 10.0, 25.0):
+        fast = ev.link_points(pts, meshes, tol, prefilter=True)
+        slow = ev.link_points(pts, meshes, tol, prefilter=False)
+        assert fast == slow, tol
+    assert any(l is None for l in slow) and {l for l in slow if l is not None} == {10, 11, 12, 13}
