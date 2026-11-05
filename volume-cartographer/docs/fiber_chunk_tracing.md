@@ -1949,7 +1949,15 @@ coordinate scaling, output roundtrip, and shared neural-policy parity. Local
 production inputs and pilot timings remain under the ephemeral experiment
 directory rather than becoming repository defaults.
 
-### Cache/sampling timing diagnostics
+### Cache/sampling timing diagnostics and reader migration
+
+The following `SamplingWaitProfile` instrumentation describes the historical
+pre-`vc_reader` implementation, preserved on `fiber-stream-fwbw-before-main`.
+Current main replaced `ChunkCache.cpp` and `ChunkedPlaneSampler.cpp`; setting
+this environment variable does not instrument the replacement reader.
+See the [matched reader-port benchmark](benchmarks/fiber_reader_main_port.md)
+for current-main integration status, cache-pressure measurements and sampled
+CPU profiles.
 
 `VC_SAMPLING_WAIT_PROFILE=1` enables the opt-in `SamplingWaitProfile` hooks in
 `ChunkCache.cpp` and `ChunkedPlaneSampler.cpp`. Per-thread counters attribute
@@ -1959,9 +1967,10 @@ ten seconds per sampling thread, outside cache locks. Some timings are nested;
 do not sum all fields as exclusive wall time. Disabled profiling does not
 construct the thread-local stats or read clocks for these cache timers.
 
-The helper and its enabled/disabled regression test are retained through the
-main/object-store integration. Existing cache-pressure counters and standalone
-contention/ROI benchmarks remain available as well: unit tests check behavior,
-whereas throughput regressions require matched performance runs. The profiling
-hooks do not change cache policy, precision, or trace scoring. See
+The helper and its enabled/disabled regression test survived the earlier
+main/object-store integration, but not the later reader replacement. Historical
+cache-pressure counters are not interchangeable with current reader metrics:
+unit tests check behavior, whereas throughput regressions require matched
+performance runs. The historical profiling hooks did not change cache policy,
+precision, or trace scoring. See
 `scripts/FIBER_TEST_RUNNER.md` for isolated integration validation.
