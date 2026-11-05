@@ -63,9 +63,9 @@ int runSurfacePanelStoreTests()
         auto add = [&](const std::string& name, std::vector<std::string> tags, bool bound) {
             const auto uuid = util::newUuid();
             state.objectStoreSession()->act(attachment, {{uuid, std::nullopt}}, [&](auto& db, auto& txn) {
-                create_quad_in_store(db, txn, uuid, grid, name, tags,
-                                     bound ? vc::objects::volumeCoordinates(volume->id(), 1) : nlohmann::json::object(),
-                                     {"surface-panel-test"});
+                vc::objects::createSurface(db, txn, uuid, name, tags,
+                                           bound ? vc::objects::volumeCoordinates(volume->id(), 1) : nlohmann::json::object(),
+                                           {"surface-panel-test"}, grid.meta, quad_surface_geometry(grid));
             });
             return uuid;
         };
@@ -153,8 +153,8 @@ int runSurfacePanelStoreTests()
             auto txn = db.write({{shown, std::nullopt}, {remote, std::nullopt}});
             QuadSurface published(points, {1.f, 1.f});
             published.meta = nlohmann::json{{"catalog", nlohmann::json::parse(binding).at("catalog")}};
-            create_quad_in_store(db, txn, shown, published, "shown", {}, nlohmann::json::parse(binding).at("coordinates"),
-                                 {"catalog-test"});
+            vc::objects::createSurface(db, txn, shown, "shown", {}, nlohmann::json::parse(binding).at("coordinates"),
+                                       {"catalog-test"}, published.meta, quad_surface_geometry(published));
             // As a catalog fetch records it.
             db.setMeta(txn, shown, "catalog_geometry_revision", nlohmann::json(db.currentGeometry(txn, shown)->uuid).dump());
             db.setMeta(txn, shown, "catalog_write", "\"fetched\"");
@@ -199,7 +199,8 @@ int runSurfacePanelStoreTests()
         // Segmentation editing saves to the sample's project and preserves the view's scale.
         require(panel.activateSurfaceById(shown, &error), "the catalog surface reopens");
         const auto onScreen = panel.opened()->surface;
-        const auto publishedRevision = panel.opened()->pin.objectRevision;
+        const auto publishedRevision = state.objectStoreSession()->objectsAtVersions(
+            panel.opened()->pin.attachment, {panel.opened()->pin.reference()}).front()->uuid;
         require(panel.prepareSurfaceEditing(shown, &error) && panel.opened()->editable &&
                     panel.opened()->pin.attachment == catalogAttachment && panel.opened()->surface == onScreen,
                 "editing keeps the sample's store and the surface on screen");
@@ -284,7 +285,8 @@ int runViewerRegressionTests()
         QuadSurface grid(points, {1, 1});
         const auto plain = util::newUuid();
         state.objectStoreSession()->act(attachment, {{plain, std::nullopt}}, [&](auto& db, auto& txn) {
-            create_quad_in_store(db, txn, plain, grid, "surface", {}, volumeCoordinates(volume->id(), 1), {"viewer-test"});
+            vc::objects::createSurface(db, txn, plain, "surface", {}, volumeCoordinates(volume->id(), 1), {"viewer-test"},
+                                       grid.meta, quad_surface_geometry(grid));
         });
         SurfaceCatalog catalog(state.objectStoreSession());
         catalog.setSource(attachment, volume, {volume->id()});

@@ -94,14 +94,14 @@ public:
     bool loading() const { return loading_; }
     const QString& error() const { return error_; }
 
-    // The surface's geometry in the volume's voxels: current, or at object
-    // revision `revision` of its history (read-only); channels read on demand
-    // from the same revision. Throws when it cannot be read.
-    Opened open(const std::string& uuid, const std::optional<std::string>& revision = std::nullopt) const;
+    // The surface's geometry in the volume's voxels: current, or at numbered
+    // version `at` of its history (read-only); channels read on demand from
+    // the same geometry. Throws when it cannot be read.
+    Opened open(const std::string& uuid, const std::optional<vc::objects::ObjectVersion>& at = std::nullopt) const;
     // The same from an explicit source, for worker threads.
     static Opened open(const std::shared_ptr<vc::objects::ObjectStoreSession>& session,
                        const vc::objects::AttachmentIdentity& attachment, const vc::objects::VolumeVoxels& volume,
-                       const std::string& uuid, const std::optional<std::string>& revision = std::nullopt);
+                       const std::string& uuid, const std::optional<vc::objects::ObjectVersion>& at = std::nullopt);
 
     // Where the surfaces of every source cross `slice` (in `volume`),
     // with `options` (uuids, budgets) per source; complete when every source's

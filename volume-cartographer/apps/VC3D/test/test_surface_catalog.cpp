@@ -1,3 +1,4 @@
+#include <vc_object_store/objects/StoreReader.hpp>
 #include <utility>
 // The VC3D surface catalog over a real object store: rows of the current
 // volume's surfaces kept current from commit events, opening a surface in the
@@ -131,7 +132,8 @@ int main(int argc, char** argv)
             auto& grid = *edited.surface->rawPointsPtr();
             grid(1, 1) = {5.f, 5.f, 5.f};
             edit.save(*edited.surface, cv::Rect(1, 1, 1, 1));
-            require(edit.pin().objectRevision != edited.pin.objectRevision, "saves re-pin from the receipt");
+            require(edit.pin().version == edited.pin.version + 1 && edit.pin().geometryRevision != edited.pin.geometryRevision,
+                    "saves re-pin from the receipt");
             require((*catalog.open(native).surface->rawPointsPtr())(1, 1) == cv::Vec3f(5, 5, 5), "vertex edits reach the store");
             // The mask brush: validity 0 and the sentinel in memory; stored coordinates survive.
             cv::Mat_<uint8_t> mask(3, 3, uint8_t(255));
@@ -141,7 +143,7 @@ int main(int argc, char** argv)
             edit.save(*edited.surface, cv::Rect(0, 0, 3, 3), {"mask"});
             require((*catalog.open(native).surface->rawPointsPtr())(0, 0) == cv::Vec3f(-1, -1, -1), "masked vertices load masked");
             session->read(attachment, [&](const auto& db, const auto& txn, const auto&) {
-                const auto unmasked = load_quad_from_store(db, txn, native, std::nullopt, false);
+                const auto unmasked = load_quad_from_store(vc::objects::LocalStoreReader(db, txn), native, std::nullopt, false);
                 require((*unmasked->rawPointsPtr())(0, 0) == cv::Vec3f(0, 0, 1), "masking keeps stored coordinates");
             });
             // Growth: another grid size replaces the geometry.

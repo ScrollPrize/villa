@@ -8,6 +8,7 @@
 #include <vc_object_store/objects/GeometryCoordinates.hpp>
 #include <vc_object_store/store/GeometryViews.hpp>
 #include <vc_object_store/Uuid.hpp>
+#include <vc_object_store/objects/StoreReader.hpp>
 #include <nlohmann/json.hpp>
 
 namespace {
@@ -56,10 +57,7 @@ Listing list(ObjectStoreSession& session, const std::vector<AttachmentIdentity>&
     for (auto& [attachment, record] : session.selectObjects(listed, selection)) {
         if (cancel.load()) break;
         auto& mapping = transforms[attachment];
-        if (!mapping)
-            session.read(attachment, [&](const auto& db, const auto& txn, const auto&) {
-                mapping = std::make_shared<const VolumeTransforms>(db.volumeTransforms(txn));
-            });
+        if (!mapping) mapping = std::make_shared<const VolumeTransforms>(session.volumeTransforms(attachment));
         const auto meta = nlohmann::json::parse(record.meta);
         if (otherScanCopy(*mapping, meta, volume.volume)) continue;
         SurfaceCatalog::Row row;
@@ -202,38 +200,39 @@ void SurfaceCatalog::schedule()
         });
 }
 
-SurfaceCatalog::Opened SurfaceCatalog::open(const std::string& uuid, const std::optional<std::string>& revision) const
+SurfaceCatalog::Opened SurfaceCatalog::open(const std::string& uuid, const std::optional<ObjectVersion>& at) const
 {
     if (!volume_) throw std::runtime_error("Open a volume first");
-    if (const auto* listed = row(uuid)) return open(session_, listed->source, voxels_, uuid, revision);
+    if (const auto* listed = row(uuid)) return open(session_, listed->source, voxels_, uuid, at);
     if (!attachment_) throw std::runtime_error("Attach an object store and open a volume first");
-    return open(session_, *attachment_, voxels_, uuid, revision);
+    return open(session_, *attachment_, voxels_, uuid, at);
 }
 
 SurfaceCatalog::Opened SurfaceCatalog::open(const std::shared_ptr<ObjectStoreSession>& session,
                                             const AttachmentIdentity& attachment, const VolumeVoxels& volume,
-                                            const std::string& uuid, const std::optional<std::string>& at)
+                                            const std::string& uuid, const std::optional<ObjectVersion>& at)
 {
     Opened opened;
     auto& current = opened.current;
-    session->read(attachment, [&](const auto& db, const auto& txn, const auto&) {
-        auto revision = db.currentObjectRevision(txn, uuid);
+    session->readStore(attachment, [&](const StoreReader& reader, const auto&) {
+        auto revision = reader.currentObject(uuid);
         if (!revision || revision->record.retired || revision->record.kind != "surface")
             throw std::runtime_error("The surface is no longer in the object store");
-        if (at && *at != revision->uuid) {
-            revision = db.objectRevision(txn, *at);
-            if (!revision || revision->objectUuid != uuid || revision->deleted)
+        if (at && (at->version != revision->version || at->generation != revision->generation)) {
+            auto found = reader.objectsAtVersions({*at}).front();
+            if (!found || found->objectUuid != revision->objectUuid || found->deleted)
                 throw std::runtime_error("The surface has no such revision");
+            revision = std::move(found);
             current = false;
         }
         if (!revision->geometryRevision) throw NoGeometry("The surface has no geometry");
-        const GeometrySnapshot snapshot(db, txn);
-        const auto view = current ? snapshot.viewTransformedAt(uuid, volume.volume, volume.scale)
-                                  : snapshot.surface(uuid, revision->geometryRevision)
+        const GeometrySnapshot snapshot(reader);
+        const auto view = current ? snapshot.viewTransformedAt(revision->objectUuid, volume.volume, volume.scale)
+                                  : snapshot.surface(revision->objectUuid, revision->geometryRevision)
                                         .viewTransformedAt(volume.volume, volume.scale);
-        opened.surface=load_quad_from_store(db,txn,uuid,*revision->geometryRevision,true,&view);
+        opened.surface = load_quad_from_store(reader, revision->objectUuid, *revision->geometryRevision, true, &view);
         opened.view = view.frame();
-        opened.pin = {attachment, {attachment.storeUuid, revision->objectUuid}, revision->uuid, revision->geometryRevision};
+        opened.pin = pinOf(attachment, *revision);
     });
     opened.surface->setChannelLoader(store_channel_loader(session, attachment, *opened.pin.geometryRevision));
     // Past revisions are viewed; edits continue from the current one.
@@ -270,9 +269,10 @@ std::string SurfaceCatalog::create(QuadSurface& surface, const std::string& name
 {
     if (!attachment_ || !volume_) throw std::runtime_error("Attach an object store and open a volume first");
     const auto uuid = util::newUuid();
-    session_->act(*attachment_, {{uuid, std::nullopt}}, [&](auto& db, auto& txn) {
-        create_quad_in_store(db, txn, uuid, surface, name, tags, volumeCoordinates(voxels_), provenance);
-    });
+    auto request = session_->newRequest(*attachment_);
+    request.expectedObjects = {{uuid, std::nullopt}};
+    request.operations = create_quad_operations(uuid, surface, name, tags, volumeCoordinates(voxels_), provenance);
+    session_->submit(*attachment_, request);
     surface.id = uuid;
     return uuid;
 }

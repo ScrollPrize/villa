@@ -2729,11 +2729,8 @@ void CWindow::CreateWidgets(void)
         }
         auto known = _segmentationModule ? _segmentationModule->storePin(active.get()) : std::nullopt;
         if (!known && _surfacePanel->opened()) known = _surfacePanel->opened()->pin;
-        std::optional<std::string> head;
-        _surfaceCatalog->session()->read(row->source, [&](const auto& db, const auto& txn, const auto&) {
-            if (const auto revision = db.currentObjectRevision(txn, active->id)) head = revision->uuid;
-        });
-        if (!head || (known && known->objectRevision == *head)) {
+        const auto head = _surfaceCatalog->session()->currentObject(row->source, active->id);
+        if (!head || (known && known->version == head->version && known->generation == head->generation)) {
             return;
         }
         if (_segmentationModule && _segmentationModule->editingEnabled()) {
@@ -4474,7 +4471,7 @@ void CWindow::setVolumeLevel(int level)
             const auto& opened = *_surfacePanel->opened();
             reopened = SurfaceCatalog::open(_state->objectStoreSession(), opened.pin.attachment,
                                             nextVoxels, opened.surface->id,
-                                            opened.current ? std::nullopt : std::optional(opened.pin.objectRevision));
+                                            opened.current ? std::nullopt : std::optional(opened.pin.reference()));
         }
         _state->vpkg()->setVolumeLevel(volume->id(), level);
     } catch (const std::exception& error) {

@@ -448,7 +448,7 @@ int runObjectStoreControllerTests()
         auto transferJson = [&](const Controller::StoredFiber& fiber) {
             nlohmann::json result;
             state.objectStoreSession()->read(fiber.storePin->attachment, [&](const auto& db, const auto& txn, const auto&) {
-                result = nlohmann::json::parse(fiberRevisionJson(db, txn, fiber.storePin->objectRevision));
+                result = nlohmann::json::parse(fiberRevisionJson(db, txn, db.objectAtVersion(txn, fiber.storePin->reference())->uuid));
             });
             return result;
         };
@@ -684,7 +684,7 @@ int runObjectStoreControllerTests()
             changedPane.surfaceName = "changed-test-pane"; changedPane.session = changedSession;
             keptPane.surfaceName = "kept-test-pane"; keptPane.session = untouched;
             controller._panes.push_back(changedPane); controller._panes.push_back(keptPane);
-            { auto db = ObjectStore::open(path, options); auto txn = db.write({{a.uuid, a.storePin->objectRevision}});
+            { auto db = ObjectStore::open(path, options); const auto pinned = [&] { auto read = db.read(); return db.objectAtVersion(read, a.storePin->reference())->uuid; }(); auto txn = db.write({{a.uuid, pinned}});
               db.setMeta(txn, a.uuid, "external_note", "true"); txn.commit(); }
             controller.refreshChangedStoreFibers();
             require(controller._panes.size() == 1 && controller._panes.front().session == untouched,
@@ -706,9 +706,9 @@ int runObjectStoreControllerTests()
             bool rejected = false;
             try { controller.commitFiberStoreAction(failed); } catch (...) { rejected = true; }
             require(rejected, "invalid relationship rejects after geometry edits start");
-            require(failed.front().fiber.storePin->objectRevision == invalid.storePin->objectRevision, "failed transaction leaves working pins unchanged");
+            require(failed.front().fiber.storePin->version == invalid.storePin->version, "failed transaction leaves working pins unchanged");
             auto db = ObjectStore::open(path, options); auto txn = db.read();
-            require(db.currentObjectRevision(txn, a.uuid)->uuid == a.storePin->objectRevision,
+            require(db.currentObjectRevision(txn, a.uuid)->version == a.storePin->version,
                     "failed relationship rolls back geometry and metadata");
         }
         const auto edge=a.branches.front().edgeUuid;
@@ -736,7 +736,7 @@ int runObjectStoreControllerTests()
         batch={controller.makeFiberSaveSnapshot(a)};
         const auto stale=batch;
         a=resolve(a.uuid);
-        { auto db=ObjectStore::open(path,options);auto txn=db.write({{a.uuid,a.storePin->objectRevision}});db.setMeta(txn,a.uuid,"external","true");txn.commit(); }
+        { auto db=ObjectStore::open(path,options);const auto pinned=[&]{auto read=db.read();return db.objectAtVersion(read,a.storePin->reference())->uuid;}();auto txn=db.write({{a.uuid,pinned}});db.setMeta(txn,a.uuid,"external","true");txn.commit(); }
         bool conflict=false;try { auto old=stale;controller.commitFiberStoreAction(old); } catch(...) { conflict=true; }
         require(conflict,"stale controller edits reject");
         a=resolve(a.uuid);
@@ -745,7 +745,7 @@ int runObjectStoreControllerTests()
         {
         auto db=ObjectStore::open(path,options);auto txn=db.read();
         require(db.objectByUuid(txn,a.uuid)->retired,"retirement persisted");
-        require(db.objectRevision(txn,first->objectRevision).has_value(),"historical revision retained");
+        require(db.objectAtVersion(txn,first->reference()).has_value(),"historical revision retained");
         require(db.edgesByKind(txn,"fiber_branch").empty(),"retirement and branch removal atomic");
         }
 
@@ -815,7 +815,7 @@ int runObjectStoreControllerTests()
             const auto failures=controller._fiberSaveFailureCount;
             controller.saveSessionAsFiber(*live,false);
             require(controller._fiberSaveFailureCount==failures,"completed manual interaction commits without solver");
-            require(live->storePin->objectRevision!=merged.storePin->objectRevision,"interaction advances pin immediately");
+            require(live->storePin->version!=merged.storePin->version,"interaction advances pin immediately");
             const auto savedPin=live->storePin;
             controller.saveOpenFibers();
             require(live->storePin==savedPin,"Save barrier does not create another revision");
@@ -940,7 +940,7 @@ int runObjectStoreControllerTests()
             require(controller.readStoredFibers(std::nullopt).size()==count,"real database reopens");
             const auto restored=resolve(fiber.uuid);
             require(std::find(restored.tags.begin(),restored.tags.end(),"vc3d_smoke")!=restored.tags.end(),"real database edit persists");
-            require(restored.storePin->objectRevision!=originalPin->objectRevision,"real database revision advances");
+            require(restored.storePin->version!=originalPin->version,"real database revision advances");
             auto realSplit=la::planFiberSplit(restored,restored.controlPoints.size()/2,
                 identity("real-prefix.json"),identity("real-suffix.json"),true,&error);
             if(!realSplit) throw std::runtime_error("real split plan: "+error);

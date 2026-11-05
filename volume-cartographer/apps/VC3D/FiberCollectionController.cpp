@@ -713,7 +713,7 @@ void FiberCollectionController::selectFiber(int64_t id, bool focusView, bool ope
                 if (!revision || revision->record.retired || !revision->record.fiber)
                     throw std::runtime_error("Fiber is no longer available");
                 auto& row=selected.row;
-                selected.pin={attachment,{attachment.storeUuid,uuid},revision->uuid,revision->geometryRevision};
+                selected.pin=vc::objects::pinOf(attachment,*revision);
                 row.record=revision->record;
                 if (!volume.volume.empty())
                     row.mapping = db.volumeTransforms(txn).toVolume(Json::parse(row.record.meta), volume.volume, volume.scale);

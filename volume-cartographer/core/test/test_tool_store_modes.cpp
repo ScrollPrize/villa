@@ -2,6 +2,7 @@
 // the same surface. Each tool's binary comes from VC_<TOOL>_BIN.
 
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
+#include <vc_object_store/objects/StoreReader.hpp>
 #include <doctest/doctest.h>
 
 #include <vc_reader/zarr.hpp>
@@ -212,7 +213,7 @@ void checkSameSurface(const Fixture& f, const std::string& uuid, const fs::path&
     OpenOptions options; options.author = "tool-store-test";
     auto db = ObjectStore::open(f.store, options);
     auto txn = db.read();
-    const auto stored = load_quad_from_store(db, txn, uuid);
+    const auto stored = load_quad_from_store(vc::objects::LocalStoreReader(db, txn), uuid);
     const auto files = load_quad_from_tifxyz(tifxyz);
     REQUIRE(stored->rawPointsPtr()->size() == files->rawPointsPtr()->size());
     CHECK(cv::norm(*stored->rawPointsPtr(), *files->rawPointsPtr(), cv::NORM_INF) == 0);
@@ -259,7 +260,7 @@ TEST_CASE("vc_objrefine refines a stored surface into a new object or in place")
     auto txn = db.read();
     const auto files = load_quad_from_tifxyz(f.dir / "refined");
     for (const auto& uuid : {created, f.uuid}) {
-        const auto stored = load_quad_from_store(db, txn, uuid);
+        const auto stored = load_quad_from_store(vc::objects::LocalStoreReader(db, txn), uuid);
         REQUIRE(stored->rawPointsPtr()->size() == files->rawPointsPtr()->size());
         CHECK(cv::norm(*stored->rawPointsPtr(), *files->rawPointsPtr(), cv::NORM_INF) == 0);
     }
@@ -326,7 +327,7 @@ TEST_CASE("flatboi flattens a stored surface and a tifxyz directory alike")
     OpenOptions options; options.author = "tool-store-test";
     auto db = ObjectStore::open(f.store, options);
     auto txn = db.read();
-    const auto stored = load_quad_from_store(db, txn, uuid);
+    const auto stored = load_quad_from_store(vc::objects::LocalStoreReader(db, txn), uuid);
     const auto direct = load_quad_from_tifxyz(f.dir / "direct");
     REQUIRE(stored->countValidPoints() > 0);
     CHECK(cv::norm(*stored->rawPointsPtr(), *direct->rawPointsPtr(), cv::NORM_INF) == 0);
@@ -341,6 +342,6 @@ TEST_CASE("flatboi flattens a stored surface and a tifxyz directory alike")
     CHECK(fs::is_regular_file(fs::path(f.store.string() + ".artifacts") / uuid / "slim_energies_flatboi.txt"));
 
     // Decimated: SLIM on every other row and column, UVs lifted to the full grid.
-    CHECK(load_quad_from_store(db, txn, coarse)->countValidPoints() > 0);
+    CHECK(load_quad_from_store(vc::objects::LocalStoreReader(db, txn), coarse)->countValidPoints() > 0);
     CHECK(db.objectByUuid(txn, coarse)->name == "coarse");
 }

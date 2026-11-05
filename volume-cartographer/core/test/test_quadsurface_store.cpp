@@ -9,6 +9,7 @@
 #include "vc/core/util/StoreSurfaces.hpp"
 #include <vc_object_store/objects/Hub.hpp>
 #include <vc_object_store/store/GeometryViews.hpp>
+#include <vc_object_store/objects/StoreReader.hpp>
 #include <vc_object_store/Uuid.hpp>
 
 #include <opencv2/core.hpp>
@@ -37,19 +38,19 @@ struct Store {
         session->read(attachment, [&](const auto& db, const auto& txn, const auto&) { result = db.currentGeometry(txn, uuid)->uuid; });
         return result;
     }
-    RevisionSelection pin(const std::string& uuid) {
-        RevisionSelection result;
-        session->read(attachment, [&](const auto& db, const auto& txn, const auto&) { result[uuid] = db.currentObjectRevision(txn, uuid)->uuid; });
-        return result;
-    }
-    // One checked edit of an existing surface against its current geometry.
-    template<class Edit> void edit(const std::string& uuid, Edit&& apply) {
-        const auto geometry = head(uuid);
-        session->act(attachment, pin(uuid), [&](auto& db, auto& txn) { apply(db, txn, geometry); });
+    // One checked request editing an existing surface at its current version:
+    // `build` adds its operations, reading through the reader.
+    template<class Build> void edit(const std::string& uuid, Build&& build) {
+        auto request = session->newRequest(attachment);
+        session->readStore(attachment, [&](const StoreReader& reader, const auto&) {
+            request.expectedObjects = {{uuid, reader.currentObject(uuid)->version}};
+            build(reader, request.operations);
+        });
+        session->submit(attachment, request);
     }
     std::unique_ptr<QuadSurface> load(const std::string& uuid) {
         std::unique_ptr<QuadSurface> surface;
-        session->read(attachment, [&](const auto& db, const auto& txn, const auto&) { surface = load_quad_from_store(db, txn, uuid); });
+        session->readStore(attachment, [&](const StoreReader& reader, const auto&) { surface = load_quad_from_store(reader, uuid); });
         surface->setChannelLoader(store_channel_loader(session, attachment, head(uuid)));
         return surface;
     }
@@ -111,8 +112,8 @@ TEST_CASE("QuadSurface round trip through the object store")
     // Edit one vertex, clear another, leave the masked one alone.
     (*loaded->rawPointsPtr())(1, 1) = {1.5f, 1.f, 11.f};
     (*loaded->rawPointsPtr())(3, 0) = {-1.f, -1.f, -1.f};
-    store.edit(uuid, [&](auto& db, auto& txn, const auto& head) {
-        write_quad_rect_to_store(db, txn, uuid, *loaded, cv::Rect(0, 0, 5, 4), head);
+    store.edit(uuid, [&](const StoreReader& reader, auto& operations) {
+        operations.push_back(*quad_rect_edit(GeometrySnapshot(reader).viewStored(uuid), *loaded, cv::Rect(0, 0, 5, 4)));
     });
     CHECK(stored(store, uuid, 1, 1) == cv::Vec3f(1.5f, 1.f, 11.f));
     CHECK(stored(store, uuid, 3, 0) == cv::Vec3f(-1, -1, -1));
@@ -121,8 +122,12 @@ TEST_CASE("QuadSurface round trip through the object store")
 
     // Giving the masked vertex new coordinates makes it valid.
     (*loaded->rawPointsPtr())(2, 3) = {3.f, 2.f, 12.f};
-    store.edit(uuid, [&](auto& db, auto& txn, const auto& head) {
-        write_quad_rect_to_store(db, txn, uuid, *loaded, cv::Rect(3, 2, 1, 1), head);
+    store.edit(uuid, [&](const StoreReader& reader, auto& operations) {
+        operations.push_back(*quad_rect_edit(GeometrySnapshot(reader).viewStored(uuid), *loaded, cv::Rect(3, 2, 1, 1)));
+    });
+    // Nothing changed: no edit.
+    store.session->readStore(store.attachment, [&](const StoreReader& reader, const auto&) {
+        CHECK_FALSE(quad_rect_edit(GeometrySnapshot(reader).viewStored(uuid), *loaded, cv::Rect(0, 0, 5, 4)));
     });
     CHECK(storedValid(store, uuid, 2, 3) == 255);
     CHECK(stored(store, uuid, 2, 3) == cv::Vec3f(3, 2, 12));
@@ -132,8 +137,8 @@ TEST_CASE("QuadSurface round trip through the object store")
     cv::Mat_<uint8_t> newMask(4, 5, uint8_t(255));
     newMask(0, 0) = 0;
     loaded->setChannel("mask", newMask);
-    store.edit(uuid, [&](auto& db, auto& txn, const auto& head) {
-        write_quad_channels_to_store(db, txn, uuid, *loaded, {"generations", "mask"}, {}, head);
+    store.edit(uuid, [&](const StoreReader&, auto& operations) {
+        operations.push_back(quad_channels_operation(uuid, *loaded, {"generations", "mask"}, {}, 4, 5));
     });
     auto reloaded = store.load(uuid);
     CHECK(cv::countNonZero(reloaded->channel("generations", SURF_CHANNEL_NORESIZE) != 9) == 0);
@@ -216,17 +221,16 @@ TEST_CASE("A view hides stored z <= 0 vertices and keeps them on save")
         db.putGeometry(txn, uuid, data);
     });
     std::unique_ptr<QuadSurface> shown;
-    store.session->read(store.attachment, [&](const auto& db, const auto& txn, const auto&) {
-        const auto view = GeometrySnapshot(db, txn).viewTransformedAt(uuid, "vol");
-        shown = load_quad_from_store(db, txn, uuid, std::nullopt, true, &view);
+    store.session->readStore(store.attachment, [&](const StoreReader& reader, const auto&) {
+        const auto view = GeometrySnapshot(reader).viewTransformedAt(uuid, "vol");
+        shown = load_quad_from_store(reader, uuid, std::nullopt, true, &view);
     });
     CHECK((*shown->rawPointsPtr())(0, 0) == cv::Vec3f(2, 2, 8));
     CHECK((*shown->rawPointsPtr())(1, 1) == cv::Vec3f(-1, -1, -1));
     (*shown->rawPointsPtr())(0, 0) = {4, 4, 8};
-    const auto geometry = store.head(uuid);
-    store.session->act(store.attachment, store.pin(uuid), [&](auto& db, auto& txn) {
-        const auto view = GeometrySnapshot(db, txn).viewTransformedAt(uuid, "vol");
-        write_quad_rect_to_store(db, txn, uuid, *shown, cv::Rect(0, 0, 2, 2), geometry, {}, &view);
+    store.edit(uuid, [&](const StoreReader& reader, auto& operations) {
+        const auto view = GeometrySnapshot(reader).viewTransformedAt(uuid, "vol");
+        operations.push_back(*quad_rect_edit(view, *shown, cv::Rect(0, 0, 2, 2)));
     });
     CHECK(stored(store, uuid, 0, 0) == cv::Vec3f(2, 2, 4));
     CHECK(stored(store, uuid, 1, 1) == cv::Vec3f(2, 2, -3));
@@ -337,7 +341,7 @@ TEST_CASE("Tools create surfaces with provenance and push them to a hub")
     CHECK(meta.at("provenance").at("parameters").at("steps") == 3);
     CHECK(meta.at("coordinates").at("volume_uuid") == "vol");
     CHECK(object->tags == std::vector<std::string>{"paths"});
-    const auto loaded = load_quad_from_store(viewer, txn, created);
+    const auto loaded = load_quad_from_store(LocalStoreReader(viewer, txn), created);
     CHECK((*loaded->rawPointsPtr())(1, 1) == cv::Vec3f(1, 1, 5));
     std::error_code ignored;
     fs::remove_all(dir, ignored);

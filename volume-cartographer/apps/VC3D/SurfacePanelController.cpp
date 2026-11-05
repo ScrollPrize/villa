@@ -640,6 +640,8 @@ void SurfacePanelController::showHistory(const std::string& id)
                                                 QString::fromStdString(revision.record.name),
                                                 revision.geometryRevision == previousGeometry ? QString() : tr("changed")});
         item->setData(0, Qt::UserRole, QString::fromStdString(revision.uuid));
+        item->setData(1, Qt::UserRole, QVariant::fromValue<qlonglong>(revision.version));
+        item->setData(2, Qt::UserRole, QString::fromStdString(revision.generation));
         previousGeometry = revision.geometryRevision;
     }
     if (list->topLevelItemCount() > 0) {
@@ -655,12 +657,14 @@ void SurfacePanelController::showHistory(const std::string& id)
         return item ? item->data(0, Qt::UserRole).toString().toStdString() : std::string();
     };
     connect(view, &QPushButton::clicked, &dialog, [&]() {
-        const auto revision = selected();
-        if (revision.empty() || !selectSurfaceById(id)) {
+        const auto* item = list->currentItem();
+        if (!item || !selectSurfaceById(id)) {
             return;
         }
+        const vc::objects::ObjectVersion version{attachment.storeUuid, item->data(2, Qt::UserRole).toString().toStdString(), id,
+                                                 item->data(1, Qt::UserRole).toLongLong()};
         try {
-            activate(id, false, _catalog->open(id, revision));
+            activate(id, false, _catalog->open(id, version));
         } catch (const std::exception& error) {
             QMessageBox::critical(&dialog, tr("Surface History"), QString::fromUtf8(error.what()));
         }

@@ -94,12 +94,6 @@ QuadSurface wrappedSurface()
     return QuadSurface(points, cv::Vec2f{1.0f, 1.0f});
 }
 
-nlohmann::json pinJson(const vc::objects::PinnedObject& pin)
-{
-    return {{"store_uuid", pin.object.storeUuid}, {"object_uuid", pin.object.objectUuid},
-            {"object_revision", pin.objectRevision}, {"geometry_revision", pin.geometryRevision.value_or("")}};
-}
-
 } // namespace
 
 int main(int argc, char** argv)
