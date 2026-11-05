@@ -117,3 +117,16 @@ def test_capacity_growth_appends_identity_latents_and_zero_moments():
                                    checkpoint["optimiser"]["state"][20][name])
         assert torch.count_nonzero(moment[..., old_width:]) == 0
     assert expanded["cfg"]["model_gap_expander_capacity_windings"] == 7
+
+
+def test_cached_gap_constants_built_in_inference_mode_still_train():
+    # The cached bias tensors must not be inference tensors, or a metrics pass
+    # that runs first would break the next training step's backward.
+    from gap_parameterization import _bias_and_softplus, lower_bounded_gap
+
+    _bias_and_softplus.cache_clear()
+    with torch.inference_mode():
+        lower_bounded_gap(torch.zeros(3), torch.tensor(16.0), 1.0, 4.0, 0.3)
+    latent = torch.zeros(3, requires_grad=True)
+    lower_bounded_gap(latent, torch.tensor(16.0), 1.0, 4.0, 0.3).sum().backward()
+    assert torch.isfinite(latent.grad).all()
