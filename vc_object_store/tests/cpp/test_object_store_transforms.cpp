@@ -1,4 +1,5 @@
 #include "TestSupport.hpp"
+#include "vc_object_store/objects/TransactionJson.hpp"
 #include "vc_object_store/objects/GeometryCoordinates.hpp"
 #include "vc_object_store/objects/ObjectStore.hpp"
 #include "vc_object_store/objects/StoreReader.hpp"
@@ -336,7 +337,8 @@ int main() try {
         // Attached data (a surface's corrections) is no volume collection.
         ObjectRecord surface;surface.kind="surface";surface.uuid=vc::objects::util::newUuid();
         surface.meta=R"({"coordinates":{"volume_uuid":"w","scale_factor":1}})";
-        session.act(attachment,{{surface.uuid,std::nullopt}},[&](auto& db,auto& txn){db.upsertObject(txn,surface);});
+        auto create=session.newRequest(attachment);create.expectedObjects[surface.uuid]=std::nullopt;
+        create.operations.push_back(CreateObjectOp{objectRecordJson(surface)});session.submit(attachment,create);
         AttachedCollection corrections=collection;corrections.uuid=vc::objects::util::newUuid();
         replaceAttachedCollections(session,attachment,surface.uuid,"corrections",{corrections},volumeCoordinates("w",1));
         require(volumeCollections(session,attachment,{"w"}).size()==1,"attached collections are not the volume's");

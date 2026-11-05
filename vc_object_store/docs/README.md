@@ -55,25 +55,25 @@ current geometry descriptors and spatial queries after edits.
 ## Revisions and transactions
 
 C++ applications can share an `ObjectStoreSession` to manage attachments of
-existing databases, checked writes, worker cancellation, and journal events.
-Consumers call the existing `ObjectStore` APIs directly inside its callbacks:
+existing databases (local files or hosted stores), checked writes, worker
+cancellation, and journal events. Reads go through a `StoreReader`
+(`readStore`); writes are checked typed requests (`objects/Transactions.hpp`):
 
 ```cpp
 vc::objects::ObjectStoreSession session;
 vc::objects::OpenOptions options;
 options.author = "reviewer";
 const auto attachment = session.attach("objects.vcobj", options);
-vc::objects::RevisionSelection observed;
-session.read(attachment, [&](const auto& store, const auto& txn, const auto& cancel) {
+auto request = session.newRequest(attachment);
+session.readStore(attachment, [&](const vc::objects::StoreReader& reader, const auto& cancel) {
     if (cancel.load()) return;
-    observed[objectUuid] = store.currentObjectRevision(txn, objectUuid)->uuid;
+    request.expectedObjects[objectUuid] = reader.currentObject(objectUuid)->version;
 });
-session.act(attachment, observed, [&](auto& store, auto& txn) {
-    store.setMeta(txn, objectUuid, "review_note", R"("checked")");
-});
+request.operations.push_back(vc::objects::SetMetaOp{objectUuid, "review_note", R"("checked")"});
+session.submit(attachment, request); // TransactionConflict when the object moved on
 ```
 
-Keep all work using a snapshot inside its callback and do not reenter the
+Keep all work using a reader inside its callback and do not reenter the
 session from a callback. A session holds any number of attachments (for example a
 project store beside a hosted team store), each with its own access mode,
 writer, events and hub sync; a store is attached at most once. `attach()` adds one,
@@ -109,7 +109,7 @@ behind. `artifactDirectory(attachment, uuid)` returns (and creates; pass
 `<store>.artifacts/<object uuid>/` for an object's non-geometry files such as
 fitted models or mesh exports; a hosted replica uses the directory beside its hub
 so replicas and services share it (an `sftp://` hub has none). `finalize()` waits
-for accepted writes on every attachment; edits are already committed by `act()`.
+for accepted writes on every attachment; requests are already committed when `submit()` returns.
 
 Fiber consumers use the same `selectObjects`, `geometryRegion`, geometry, and
 relationship APIs. Update any catalog summaries used by the application in the
@@ -168,8 +168,7 @@ publishing a new checked action, not by moving old heads.
 
 `attachHosted(endpoint, HostedSessionOptions)` attaches a store served by
 `vc_object_server` beside local attachments. The session never opens its
-database, so `read()`, `act()` and the other callbacks that hand out an
-`ObjectStore` throw for it. The typed operations work on every attachment:
+database; the session's operations work on every attachment:
 `status`, `submit` (checked requests; conflicts throw `TransactionConflict`),
 `receipt`, `currentObject`, `objectsAtVersions`, `geometryRevision`,
 `readGeometryArray` and `volumeTransforms`. `selectObjects`, `geometryRegion` and
@@ -786,7 +785,7 @@ journal sequence) of each record it installed, and its own unpushed changes.
 **Applications** do not drive sync themselves. When an `ObjectStoreSession`
 attaches a writable hosted replica, it starts a background worker. The worker
 pulls and pushes every `HubSessionOptions::syncInterval`, and pushes shortly
-after each `act()`; pulled changes arrive through `takeEvents()` like any other
+after each `submit()`; pulled changes arrive through `takeEvents()` like any other
 external commit. Before editing, a caller takes
 `holdLeases(attachment, uuids)`. The returned `LeaseHold` keeps the leases
 renewed while it lives. Once no hold remains and the changes are pushed, the
@@ -890,7 +889,14 @@ they are not silently treated as aliases of catalog IDs.
 
 `ingestGeometryBatch` takes decoded objects, geometry and source annotations and
 inserts them and their native relationships in the caller's transaction. Duplicate,
-existing and retired identities are errors; this is not a refresh operation.
+existing and retired identities are errors (`invalid_argument`, as are
+inconsistent source relationships); this is not a refresh operation. The checked
+form is `IngestGeometryOp`: `addIngestOperation(request, reader, batch,
+coordinates)` adds it with the request's expectations (every new object absent,
+every existing fiber a branch links to at its current version; point and winding
+links must resolve within the batch), so ingestion works on hosted attachments
+too. `ingestGeometrySource` (direct or through a session) submits one such
+request per surface or track, or one for a fiber or point-collection source.
 `updateGeometryArrays` accepts desired typed arrays, the expected geometry revision,
 optional transformed annotations, and a caller-supplied relationship decision
 callback. It uses sparse coordinate edits and stable-ID sequence operations for

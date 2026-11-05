@@ -209,15 +209,15 @@ private:
 
 // Application-owned connection and lifetime boundary for any number of stores,
 // independent of object kind and UI toolkit. Each attachment is independent:
-// its own identity, access mode, writer, journal events and hub sync. All worker
-// work belongs inside read(); its snapshot and store references must not escape
-// the callback. Callbacks must not reenter the session. Cancellation is
+// its own identity, access mode, writer, journal events and hub sync. Reads go
+// through readStore(), whose reader must not escape the callback; writes are
+// checked typed requests (submit). Callbacks must not reenter the session. Cancellation is
 // cooperative. Detaching or replacing an attachment waits for its accepted reads
 // and checked writes to finish; the caller must not hold a worker's completion
 // hostage to the thread performing that change.
 class ObjectStoreSession {
 public:
-    using Read = std::function<void(const ObjectStore&, const ReadTxn&, const std::atomic_bool&)>;
+    // The write a geometry fetcher makes (setGeometryFetcher).
     using Action = std::function<void(ObjectStore&, WriteTxn&)>;
     using StoreRead = std::function<void(const StoreReader&, const std::atomic_bool& cancelled)>;
 
@@ -236,8 +236,7 @@ public:
                                const HubSessionOptions& = {});
     void detach(const AttachmentIdentity&);
     // A store hosted by vc_object_server (client/HostedStore.hpp). The session
-    // never opens its database: read() and act() and the other callbacks that
-    // take an ObjectStore throw for it; use the typed operations below. Its
+    // never opens its database; use the typed operations below. Its
     // commits arrive through takeEvents() after each check (pollInterval).
     // Throws when the endpoint does not answer or its store is already attached.
     AttachmentIdentity attachHosted(const std::string& endpoint, const HostedSessionOptions& = {});
@@ -321,13 +320,6 @@ public:
     // (GeometrySnapshot(reader)) work on both. The reader and views must not
     // escape the callback; `cancelled` is set when the attachment detaches.
     void readStore(const AttachmentIdentity&, const StoreRead&);
-    // Local attachments only (throws for hosted ones).
-    void read(const AttachmentIdentity&, const Read&);
-    // All writes are immediate checked atomic actions. The library enforces
-    // expectations for every affected object and relationship endpoint.
-    // `receipt`, when given, receives the commit's receipt (numbered versions).
-    RevisionSelection act(const AttachmentIdentity&, const RevisionSelection&, const Action&,
-                          TransactionReceipt* receipt = nullptr);
     // Edit these objects at their current versions in one checked request
     // that keeps their recorded relationships (editCurrentRequest), on any
     // attachment: `operations` gives each object's operations, read through
@@ -352,14 +344,6 @@ public:
     // when the destination already has the object. An object without local
     // geometry is fetched first.
     void importObject(const AttachmentIdentity& from, const AttachmentIdentity& to, const std::string& objectUuid);
-    // A long job on a writable attachment, e.g. ingestion (objects/GeometryIngest.hpp),
-    // run on the caller's thread. It reads the store outside any transaction and
-    // writes only through `commit`: each call is one transaction, serialized with
-    // the attachment's actions and unchecked, so the job guards its own writes.
-    // `cancelled` is set when the attachment detaches, which waits for the job.
-    using Commit = std::function<void(const Action&)>;
-    using Job = std::function<void(ObjectStore&, const Commit& commit, const std::atomic_bool& cancelled)>;
-    void writeJob(const AttachmentIdentity&, const Job&);
     // Queries across attachments in `order`: an object (by UUID) comes from the
     // first attachment holding it, so an imported copy hides the catalog one.
     // With a selection limit, each attachment contributes up to `limit`

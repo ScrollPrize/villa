@@ -347,15 +347,18 @@ int main() try
         eventually([&] { return session.hubStatus(attachment) && session.hubStatus(attachment)->syncedAtUs; }, "session syncs on attach");
         require(session.artifactDirectory(attachment, b) == std::filesystem::path(hubPath.string() + ".artifacts") / b,
                 "replicas share the artifact directory beside the hub");
-        mustFail([&] { session.act(attachment, {}, [&](auto& store, auto& txn) { store.setMeta(txn, b, "note", "\"unleased\""); }); });
+        auto note = [&](const char* value) {
+            auto request = session.newRequest(attachment);
+            request.expectedObjects[b] = session.currentObject(attachment, b)->version;
+            request.operations.push_back(SetMetaOp{b, "note", value});
+            return request;
+        };
+        // Bob holds b's lease, so the session cannot lease it for the request.
+        mustFail([&] { session.submit(attachment, note("\"unleased\"")); });
         releaseLeases(bob, {b});
         {
             auto hold = session.holdLeases(attachment, {b});
-            RevisionSelection expected;
-            session.read(attachment, [&](const auto& store, const auto& txn, const auto&) {
-                expected[b] = store.currentObjectRevision(txn, b)->uuid;
-            });
-            session.act(attachment, expected, [&](auto& store, auto& txn) { store.setMeta(txn, b, "note", "\"session\""); });
+            session.submit(attachment, note("\"session\""));
             // A waited sync pushes everything committed before it.
             const auto synced = session.syncHubAndWait(attachment, std::chrono::seconds(20));
             require(synced && synced->pending.empty() && synced->error.empty(), "waited sync pushed the action");

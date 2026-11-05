@@ -9,6 +9,9 @@
 #include "vc_object_store/objects/AttachedDocument.hpp"
 #include "vc_object_store/objects/Project.hpp"
 #include "TestSupport.hpp"
+#include "vc_object_store/objects/FiberJson.hpp"
+#include "vc_object_store/objects/GeometryIngest.hpp"
+#include "vc_object_store/objects/TransactionJson.hpp"
 #include "vc_object_store/client/HostedStore.hpp"
 #include "vc_object_store/geometry/Geometry.hpp"
 #include "vc_object_store/objects/GeometryCoordinates.hpp"
@@ -125,9 +128,7 @@ try {
     require(session.freshness(hosted) && session.freshness(hosted)->error.empty() && !session.freshness(local), "freshness");
     (void)session.takeEvents();
 
-    // Local callbacks need a database the session does not have.
-    mustFail([&] { session.read(hosted, [](const auto&, const auto&, const auto&) {}); });
-    mustFail([&] { (void)session.act(hosted, {}, [](auto&, auto&) {}); });
+    // A hosted attachment has no local file.
     mustFail([&] { (void)session.path(hosted); }); // and the attachment can still be detached at the end
 
     // Typed reads answer as the store does (read-only beside the service).
@@ -397,7 +398,62 @@ try {
                 "hosted project resource");
     }
 
+    {
+        // Decoded sources ingest as one checked request, hosted as locally: the
+        // new objects expected absent, an existing fiber a branch links to at
+        // its current version.
+        auto fiberJson = [](const std::string& uuid, const std::optional<std::string>& target) {
+            nlohmann::json root{{"type", "vc3d_fiber"}, {"uuid", uuid}, {"version", 4}, {"name", "ingested"},
+                {"control_point_ids", {0, 1}},
+                {"control_points", nlohmann::json::array({nlohmann::json{{"position", {1, 2, 3}}},
+                                                          nlohmann::json{{"position", {4, 5, 6}}}})},
+                {"line_points", {{1, 2, 3}, {4, 5, 6}}}};
+            if (target)
+                root["branches"] = nlohmann::json::array({nlohmann::json{{"target_uuid", *target}, {"control_point_index", 0},
+                                                                         {"branch_control_point_index", 0}}});
+            return root;
+        };
+        auto source = [&](const std::string& uuid, const std::optional<std::string>& target) {
+            return decodeFiberJson(fiberJson(uuid, target).dump());
+        };
+        for (const auto& attachment : {hosted, local}) {
+            const auto existing = util::newUuid(), linked = util::newUuid();
+            auto ingest = [&](std::vector<GeometrySource> batch) {
+                auto request = session.newRequest(attachment);
+                session.readStore(attachment, [&](const StoreReader& reader, const auto&) {
+                    addIngestOperation(request, reader, std::move(batch), R"({"volume_uuid":"20260411134726"})");
+                });
+                return request;
+            };
+            // From a file, through the session's ingestion.
+            const auto file = directory.path / (existing + ".json");
+            { std::ofstream(file) << fiberJson(existing, std::nullopt).dump(); }
+            const auto report = ingestGeometrySource(session, attachment, "fiber", file);
+            require(report.ingested == 1 && report.problems.empty(), "file ingested through the session");
+            auto request = ingest({source(linked, existing)});
+            require(request.expectedObjects.at(linked) == std::nullopt && request.expectedObjects.at(existing) == 1,
+                    "ingestion expects new objects absent and linked fibers at their versions");
+            TransactionPayloads payloads;
+            const auto text = transactionRequestToJson(request, &payloads);
+            require(!payloads.empty() && transactionJsonPayloadHashes(text).size() == payloads.size() &&
+                        transactionRequestToJson(transactionRequestFromJson(text, payloads)) == text,
+                    "ingestion round trips with its geometry payloads");
+            const auto receipt = session.submit(attachment, request);
+            require(receipt.created.size() == 2 && receipt.objects.at(existing) == 2, "the new fiber and its branch");
+            session.readStore(attachment, [&](const StoreReader& reader, const auto&) {
+                require(reader.neighbours(linked) == std::vector<std::string>{existing}, "the branch is imported");
+                require(nlohmann::json::parse(reader.currentObject(linked)->record.meta).at("coordinates").at("volume_uuid") ==
+                            "20260411134726", "the coordinate context binds the new fiber");
+            });
+            mustFail([&] { session.submit(attachment, ingest({source(linked, std::nullopt)})); }); // imported once
+            auto stale = ingest({source(util::newUuid(), existing)});
+            (void)session.editRecords(attachment, {existing}, [](ObjectRecord& record) { record.name = "changed"; });
+            mustFail([&] { session.submit(attachment, stale); }); // the linked fiber changed
+        }
+    }
+
     // Detaching stops the poller: nothing arrives after Detached.
+    (void)session.takeEvents();
     session.detach(hosted);
     const auto last = session.takeEvents();
     require(!last.empty() && last.back().kind == StoreSessionEvent::Kind::Detached, "detached");

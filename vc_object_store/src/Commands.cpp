@@ -7,6 +7,7 @@
 #include "internal/RecordSql.hpp"
 #include "internal/Versions.hpp"
 #include "vc_object_store/objects/GeometryEdits.hpp"
+#include "geometry/GeometryIngestBatch.hpp"
 
 #include <openssl/evp.h>
 
@@ -131,6 +132,14 @@ public:
         for (const auto& [name, value] : op.annotations) annotations[name] = Json::parse(value);
         return {{"op", "update_geometry_arrays"}, {"object", canonical(op.objectUuid)}, {"data", data(op.data)},
                 {"annotations", annotations}, {"affected", op.affected}};
+    }
+    Json operator()(const IngestGeometryOp& op)
+    {
+        auto items = Json::array();
+        for (const auto& item : op.items)
+            items.push_back({{"record", Json::parse(item.recordJson)}, {"data", data(item.data)},
+                             {"source", Json::parse(item.sourceJson)}});
+        return {{"op", "ingest_geometry"}, {"items", items}, {"coordinates", Json::parse(op.coordinateContext)}};
     }
     Json operator()(const RecordCatalogTransformsOp& op)
     {
@@ -285,6 +294,13 @@ TransactionOperation operationFrom(const Json& j, const TransactionPayloads& pay
         result.data = dataFrom(j.at("data"), payloads);
         for (const auto& [name, value] : j.at("annotations").items()) result.annotations.emplace(name, value.dump());
         result.affected = j.at("affected").get<std::string>();
+        return result;
+    }
+    if (op == "ingest_geometry") {
+        IngestGeometryOp result;
+        for (const auto& item : j.at("items"))
+            result.items.push_back({item.at("record").dump(), dataFrom(item.at("data"), payloads), item.at("source").dump()});
+        result.coordinateContext = j.at("coordinates").dump();
         return result;
     }
     if (op == "record_catalog_transforms") {
@@ -541,6 +557,13 @@ struct Executor {
     void operator()(const RetainRelationshipOp& op) { store.retainRelationship(txn, op.uuid); }
     void operator()(const KeepRecordedRelationshipOp& op) { store.keepRecordedRelationship(txn, op.uuid); }
     void operator()(const RecordCatalogTransformsOp& op) { store.recordCatalogTransforms(txn, op.registrations); }
+    void operator()(const IngestGeometryOp& op)
+    {
+        std::vector<GeometrySource> batch;
+        for (const auto& item : op.items)
+            batch.push_back({objectFromJson(Json::parse(item.recordJson)), item.data, Json::parse(item.sourceJson)});
+        detail::ingestGeometryBatch(store, txn, std::move(batch), op.coordinateContext, false);
+    }
     void operator()(const PutGeometryOp& op)
     {
         const auto head = store.currentGeometry(txn, op.objectUuid);
@@ -625,6 +648,9 @@ void collectPayloads(const Json& op, std::vector<std::string>& hashes)
         for (const auto& array : op.at("data").at("arrays")) add(array.at("bytes"));
     else if (name == "set_surface_channels")
         for (const auto& array : op.at("channels")) add(array.at("bytes"));
+    else if (name == "ingest_geometry")
+        for (const auto& item : op.at("items"))
+            for (const auto& array : item.at("data").at("arrays")) add(array.at("bytes"));
     else if (name == "edit_geometry")
         for (const auto& edit : op.at("edits")) add(edit.at("bytes"));
     else if (name == "edit_geometry_rectangle")

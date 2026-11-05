@@ -244,12 +244,28 @@ struct UpdateGeometryArraysOp {
 // catalogTransformUuid(id) of each.
 struct RecordCatalogTransformsOp { std::vector<vcr::catalog::Registration> registrations; };
 
+// Create objects from decoded sources (objects/GeometryIngest.hpp,
+// prepareGeometrySource) with their geometry and the native relationships
+// their sources declare (fiber branches, point and winding links), in
+// `coordinateContext` ({volume_uuid, scale_factor}). Every object is new
+// (re-import is refused); the request expects each absent, and expects every
+// existing object a declared relationship links to (ingestRequest).
+struct IngestGeometryOp {
+    struct Item {
+        std::string recordJson; // objectToJson form
+        GeometryData data;
+        std::string sourceJson; // the decoded source document
+    };
+    std::vector<Item> items;
+    std::string coordinateContext = "{}";
+};
+
 using TransactionOperation = std::variant<
     CreateObjectOp, UpdateObjectOp, SetMetaOp, RemoveMetaOp, SetApprovalOp,
     RetireObjectOp, RestoreObjectOp, DeleteObjectOp,
     AddEdgeOp, UpdateEdgeOp, RemoveEdgeOp, RetainRelationshipOp, KeepRecordedRelationshipOp,
     PutGeometryOp, EditGeometryOp, EditGeometryRectangleOp, RecordCatalogTransformsOp, SetSurfaceChannelsOp,
-    UpdateGeometryArraysOp>;
+    UpdateGeometryArraysOp, IngestGeometryOp>;
 
 // Wire/command format version, part of every request digest.
 inline constexpr int kTransactionCommandVersion = 1;

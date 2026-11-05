@@ -1,4 +1,5 @@
 #include "TestSupport.hpp"
+#include "vc_object_store/objects/StoreReader.hpp"
 #include "vc_object_store/Tiff.hpp"
 #include "vc_object_store/geometry/Geometry.hpp"
 #include "vc_object_store/object_links/ObjectLinks.hpp"
@@ -189,8 +190,9 @@ int main() try
     for (const auto& event : session.takeEvents())
         surfacesCommitted |= event.kind == StoreSessionEvent::Kind::Committed && event.touches({"surface"});
     require(surfacesCommitted, "session observers see the ingested surfaces");
-    session.read(attachment, [&](const auto& store, const auto& txn, const auto&) {
-        const auto surfaces = store.objectsByKind(txn, "surface");
+    session.readStore(attachment, [&](const StoreReader& reader, const auto&) {
+        ObjectSelection kind; kind.kind = "surface";
+        const auto surfaces = reader.selectObjects(kind);
         require(surfaces.size() == 2, "the session store holds both surfaces");
         for (auto object : surfaces) {
             std::sort(object.tags.begin(), object.tags.end());

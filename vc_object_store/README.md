@@ -26,14 +26,14 @@ The object store can be used in place of tifxyz files, fiber jsons, track crossi
 
 The db has fast spatial queries through a persisted r-tree backed index with optional in-memory views for repeated queries. 
 
-The C++ `ObjectStoreSession` accepts writable or read-only attachments. Read-only
-sessions reject actions before invoking their callbacks. VC3D calls the database's
-object, geometry, relationship and retirement APIs directly inside `act`, with
-explicit revision expectations. A split creates two objects and retires the
-original in one transaction. `updateGeometryArrays` shares sparse array/sequence
-updates across geometry kinds; `ingestGeometryBatch` shares one-time ingestion
-of decoded geometry and native topology. Both run inside the caller’s transaction
-and retain the database’s existing revision and relationship checks.
+The C++ `ObjectStoreSession` accepts writable or read-only attachments, local or
+hosted. Reads go through `readStore` (a `StoreReader`); every write is a checked
+typed request (`newRequest`, `submit`) expecting the numbered versions it read.
+A split creates two objects and retires the original in one request.
+`UpdateGeometryArraysOp` (`updateGeometryArrays`) shares sparse array/sequence
+updates across geometry kinds; `IngestGeometryOp` (`addIngestOperation`, over
+`ingestGeometryBatch`) shares one-time ingestion of decoded geometry and native
+topology. Both keep the database's version and relationship checks.
 
 A session also holds surface drafts: uncommitted surface grids, in memory
 only, that stand in for their objects (or for objects not created yet) in that

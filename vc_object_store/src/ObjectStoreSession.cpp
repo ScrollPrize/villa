@@ -489,16 +489,6 @@ void ObjectStoreSession::release(Attachment& attachment, bool write)
     idle_.notify_all();
 }
 
-void ObjectStoreSession::read(const AttachmentIdentity& identity, const Read& callback)
-{
-    auto attachment = acquire(identity, false);
-    try {
-        auto txn = attachment->store().read();
-        callback(attachment->store(), txn, attachment->cancelled);
-    } catch (...) { release(*attachment, false); throw; }
-    release(*attachment, false);
-}
-
 void ObjectStoreSession::readStore(const AttachmentIdentity& identity, const StoreRead& callback)
 {
     withAttachment(identity, false, [&](Attachment& attachment) {
@@ -511,27 +501,6 @@ void ObjectStoreSession::readStore(const AttachmentIdentity& identity, const Sto
         const LocalStoreReader reader(attachment.store(), txn);
         callback(reader, attachment.cancelled);
     });
-}
-
-RevisionSelection ObjectStoreSession::act(const AttachmentIdentity& identity,
-    const RevisionSelection& expected, const Action& callback, TransactionReceipt* receipt)
-{
-    RevisionSelection committed;
-    auto attachment = acquire(identity, true);
-    try {
-        std::lock_guard writer(attachment->writer);
-        auto txn = attachment->store().write(expected);
-        callback(attachment->store(), txn);
-        txn.commit();
-        committed = txn.committedRevisions();
-        if (receipt) {
-            if (!txn.receipt()) throw std::logic_error("object store: a committed action has no receipt");
-            *receipt = *txn.receipt();
-        }
-        if (attachment->hub) attachment->hub->requestSync(true);
-    } catch (...) { release(*attachment, true); throw; }
-    release(*attachment, true);
-    return committed;
 }
 
 std::string ObjectStoreSession::copyObject(const AttachmentIdentity& from, const AttachmentIdentity& to,
@@ -561,27 +530,6 @@ void ObjectStoreSession::submitCopy(const AttachmentIdentity& to, const ObjectCo
     request.expectedObjects[copy.record.uuid] = std::nullopt;
     request.operations = objectCopyOperations(copy);
     submit(to, request);
-}
-
-void ObjectStoreSession::writeJob(const AttachmentIdentity& identity, const Job& job)
-{
-    auto attachment = acquire(identity, true);
-    bool committed = false;
-    try {
-        job(attachment->store(), [&](const Action& action) {
-            std::lock_guard writer(attachment->writer);
-            auto txn = attachment->store().write();
-            action(attachment->store(), txn);
-            txn.commit();
-            committed = true;
-        }, attachment->cancelled);
-    } catch (...) {
-        if (committed && attachment->hub) attachment->hub->requestSync(true);
-        release(*attachment, true);
-        throw;
-    }
-    if (committed && attachment->hub) attachment->hub->requestSync(true);
-    release(*attachment, true);
 }
 
 std::optional<TransactionReceipt> ObjectStoreSession::editCurrent(const AttachmentIdentity& identity,

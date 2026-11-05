@@ -1,5 +1,6 @@
 #include "vc_object_store/objects/StoreReader.hpp"
 #include "TestSupport.hpp"
+#include "StoreTestSupport.hpp"
 #include "vc_object_store/objects/FiberJson.hpp"
 #include "vc_object_store/objects/ObjectStoreSession.hpp"
 #include "vc_object_store/geometry/Geometry.hpp"
@@ -63,8 +64,8 @@ int main() try {
     const auto path = dir.path / "receipt.vcobj";
     OpenOptions options; options.author = "receipt-test";
     { auto db = ObjectStore::create(path, options); }
-    ObjectStoreSession session; const auto attachment = session.attach(path, options);
-    const auto receipt = session.act(attachment, {{uuid,{}}}, [&](auto& db, auto& txn) {
+    auto store = ObjectStore::open(path, options);
+    const auto receipt = storeAct(store, {{uuid,{}}}, [&](auto& db, auto& txn) {
         auto object = doc.object; object.meta = Json{{"source",source}}.dump();
         db.upsertObject(txn, object); db.putGeometry(txn, uuid, doc.geometry);
     });
@@ -74,7 +75,7 @@ int main() try {
       auto changed = source; changed["control_points_attributes"][0]["tags"] = {"changed"};
       mustFail([&] { external.setMeta(txn, uuid, "source", changed.dump()); }); txn.commit();
       require(txn.committedRevisions().at(uuid) != receipt.at(uuid), "external commit produces different pin"); }
-    session.readStore(attachment,[&](const StoreReader& reader,const auto&) {
+    storeReader(store,[&](const StoreReader& reader,const auto&) {
         const auto pinned = versionsOf(reader, receipt).front();
         require(reader.objectsAtVersions({pinned}).front()->record.meta.find("external") == std::string::npos, "receipt is immutable after external commit");
         const auto historical=Json::parse(fiberVersionJson(reader,pinned));
@@ -84,11 +85,11 @@ int main() try {
         auto later = pinned; ++later.version; ++later.version;
         mustFail([&] {fiberVersionJson(reader,later);});
     });
-    mustFail([&] { session.act(attachment,receipt,[](auto&,auto&) {}); });
+    mustFail([&] { storeAct(store,receipt,[](auto&,auto&) {}); });
     {
         // Only linked endpoints participate in checked import concurrency.
         const auto unrelated = util::newUuid();
-        session.act(attachment, {{unrelated, {}}}, [&](auto& db, auto& txn) {
+        storeAct(store, {{unrelated, {}}}, [&](auto& db, auto& txn) {
             auto record = doc.object; record.uuid = unrelated;
             db.upsertObject(txn, record); db.putGeometry(txn, unrelated, doc.geometry);
         });
@@ -97,29 +98,29 @@ int main() try {
                                                {"branch_control_point_index", 0}}});
         auto batch = std::vector<GeometrySource>{decodeFiberJson(linked.dump())};
         RevisionSelection pins{{imported, {}}};
-        session.read(attachment, [&](const auto& db, const auto& txn, const auto&) {
+        storeRead(store, [&](const auto& db, const auto& txn, const auto&) {
             for (const auto& target : fiberBatchEndpoints(batch))
                 pins[target] = db.currentObjectRevision(txn, target)->uuid;
         });
         { auto txn = external.write(); external.setMeta(txn, unrelated, "concurrent", "true"); txn.commit(); }
-        session.act(attachment, pins, [&](auto& db, auto& txn) { ingestGeometryBatch(db, txn, batch); });
+        storeAct(store, pins, [&](auto& db, auto& txn) { ingestGeometryBatch(db, txn, batch); });
         // Reusing the new identity still fails even though unrelated fibers are not pinned.
-        mustFail([&] { session.act(attachment, pins, [&](auto& db, auto& txn) { ingestGeometryBatch(db, txn, batch); }); });
+        mustFail([&] { storeAct(store, pins, [&](auto& db, auto& txn) { ingestGeometryBatch(db, txn, batch); }); });
         const auto rejected = util::newUuid(); linked["uuid"] = rejected;
         batch = {decodeFiberJson(linked.dump())}; pins = {{rejected, {}}};
-        session.read(attachment, [&](const auto& db, const auto& txn, const auto&) {
+        storeRead(store, [&](const auto& db, const auto& txn, const auto&) {
             for (const auto& target : fiberBatchEndpoints(batch))
                 pins[target] = db.currentObjectRevision(txn, target)->uuid;
         });
         { auto txn = external.write(); external.setMeta(txn, uuid, "concurrent", "true"); txn.commit(); }
-        mustFail([&] { session.act(attachment, pins, [&](auto& db, auto& txn) { ingestGeometryBatch(db, txn, batch); }); });
-        session.read(attachment, [&](const auto& db, const auto& txn, const auto&) {
+        mustFail([&] { storeAct(store, pins, [&](auto& db, auto& txn) { ingestGeometryBatch(db, txn, batch); }); });
+        storeRead(store, [&](const auto& db, const auto& txn, const auto&) {
             require(!db.objectByUuid(txn, rejected), "a changed linked endpoint rejects the entire import");
         });
     }
     const auto a = util::newUuid(), b = util::newUuid(), isolated = util::newUuid();
     std::string ordinary, adjacent;
-    const auto networkPins = session.act(attachment, {{a,{}},{b,{}},{isolated,{}}}, [&](auto& db, auto& txn) {
+    const auto networkPins = storeAct(store, {{a,{}},{b,{}},{isolated,{}}}, [&](auto& db, auto& txn) {
         vc::geometry::Fiber geometry{{{1,2,3},{5,2,3}}, {{1,2,3},{5,2,3}}, {90,10}};
         for (const auto& objectUuid : {a,b,isolated}) {
             ObjectRecord record; record.uuid = objectUuid; record.kind = "fiber";
@@ -142,7 +143,7 @@ int main() try {
         adjacent = db.addEdge(txn, edge); db.setApproval(txn, adjacent, "pending");
     });
     std::map<std::string,std::string> exported;
-    session.readStore(attachment, [&](const StoreReader& reader, const auto&) {
+    storeReader(store, [&](const StoreReader& reader, const auto&) {
         const auto pinned = versionsOf(reader, networkPins);
         exported = fiberNetworkJson(reader, pinned, {a});
         require(exported.size() == 2 && exported.contains(b), "export follows linked component only");
@@ -164,9 +165,9 @@ int main() try {
         mustFail([&] { fiberNetworkJson(reader,{*onlyA,*onlyA}); });
         mustFail([&] { fiberNetworkJson(reader,pinned,{a},1); });
     });
-    session.act(attachment, networkPins, [&](auto& db, auto& txn) { db.removeEdge(txn,ordinary); });
+    storeAct(store, networkPins, [&](auto& db, auto& txn) { db.removeEdge(txn,ordinary); });
     RevisionSelection currentNetworkPins;
-    session.readStore(attachment, [&](const StoreReader& reader, const auto&) {
+    storeReader(store, [&](const StoreReader& reader, const auto&) {
         require(fiberNetworkJson(reader,versionsOf(reader,networkPins),{a}) == exported, "pinned topology survives later edge deletion");
         auto current = networkPins;
         for (auto& [objectUuid, pin] : current) pin = reader.currentObject(objectUuid)->uuid;
@@ -175,11 +176,11 @@ int main() try {
         require(Json::parse(now.at(a))["branches"].empty(), "current export observes edge deletion");
         require(Json::parse(now.at(a))["adjacent_branches"].size() == 1, "parallel adjacent edge survives");
     });
-    session.act(attachment, currentNetworkPins, [&](auto& db, auto& txn) {
+    storeAct(store, currentNetworkPins, [&](auto& db, auto& txn) {
         db.retireObject(txn, b);
         db.keepRecordedRelationship(txn, adjacent);
     });
-    session.readStore(attachment, [&](const StoreReader& reader, const auto&) {
+    storeReader(store, [&](const StoreReader& reader, const auto&) {
         for (auto& [objectUuid, pin] : currentNetworkPins) pin = reader.currentObject(objectUuid)->uuid;
         const auto now = fiberNetworkJson(reader,versionsOf(reader,currentNetworkPins),{a});
         require(now.size() == 1 && Json::parse(now.at(a))["adjacent_branches"].empty(), "retired endpoints and inactive edges are not transported");
