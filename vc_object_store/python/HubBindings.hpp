@@ -48,7 +48,7 @@ namespace vc::python {
 // Lifecycle, leases, hub sync, artifacts and copies for the stores a process
 // works with. Data access goes through ObjectStore connections to the same
 // files; a session's hosted replica pushes their commits in the background.
-inline void bindObjectStoreSession(nb::module_& m)
+inline nb::class_<vo::ObjectStoreSession> bindObjectStoreSession(nb::module_& m)
 {
     nb::class_<vo::AttachmentIdentity>(m, "AttachmentIdentity")
         .def_ro("store_uuid", &vo::AttachmentIdentity::storeUuid)
@@ -61,7 +61,8 @@ inline void bindObjectStoreSession(nb::module_& m)
         .def("release", &vo::LeaseHold::reset, nb::call_guard<nb::gil_scoped_release>())
         .def("__enter__", [](nb::object self) { return self; })
         .def("__exit__", [](vo::LeaseHold& self, nb::args) { nb::gil_scoped_release release; self.reset(); });
-    nb::class_<vo::ObjectStoreSession>(m, "ObjectStoreSession")
+    auto session = nb::class_<vo::ObjectStoreSession>(m, "ObjectStoreSession");
+    session
         .def(nb::init<>())
         .def("attach", [](vo::ObjectStoreSession& self, const std::filesystem::path& path, const std::string& author,
                           bool readOnly, int64_t syncIntervalMs, int64_t pushDelayMs) {
@@ -109,9 +110,9 @@ inline void bindObjectStoreSession(nb::module_& m)
             { nb::gil_scoped_release release; events = self.takeEvents(); }
             nb::list result;
             for (const auto& event : events) {
-                static constexpr const char* kinds[] = {"attached", "detached", "committed", "hub"};
+                static constexpr const char* kinds[] = {"attached", "detached", "committed", "hub", "draft"};
                 nb::dict item; item["kind"] = kinds[int(event.kind)]; item["attachment"] = event.attachment;
-                item["journal_position"] = event.journalPosition;
+                item["journal_position"] = event.journalPosition; item["revalidate"] = event.revalidate;
                 nb::list changes;
                 for (const auto& change : event.changes) {
                     nb::dict row; row["seq"] = change.seq; row["record_uuid"] = change.recordUuid;
@@ -123,5 +124,6 @@ inline void bindObjectStoreSession(nb::module_& m)
             }
             return result;
         });
+    return session;
 }
 }

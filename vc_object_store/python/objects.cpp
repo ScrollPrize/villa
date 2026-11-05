@@ -544,6 +544,136 @@ void bindHostedStore(nb::module_& m)
     nb::exception<vo::StoreBusy>(m, "StoreBusy", PyExc_RuntimeError);
 }
 
+// ObjectStoreSession operations that take requests, numbered references and
+// artifacts in the same forms as ObjectStore and HostedStore.
+void bindSessionOperations(nb::class_<vo::ObjectStoreSession> session)
+{
+    using Session = vo::ObjectStoreSession;
+    auto statusPy = [](const vo::StoreStatus& status) { return jsonLoads(vo::storeStatusToJson(status)); };
+    auto requestFromPy = [](const nb::object& request, const nb::dict& payloads) {
+        vo::TransactionPayloads bytes;
+        for (const auto& [hash, value] : payloads) {
+            const auto data = nb::cast<nb::bytes>(value);
+            const auto* begin = reinterpret_cast<const uint8_t*>(data.c_str());
+            bytes.emplace(nb::cast<std::string>(hash), std::vector<uint8_t>(begin, begin + data.size()));
+        }
+        return vo::transactionRequestFromJson(nb::isinstance<nb::str>(request) ? nb::cast<std::string>(request) : jsonDumps(request), bytes);
+    };
+    auto receiptPy = [](const vo::TransactionReceipt& receipt) { return jsonLoads(vo::transactionReceiptToJson(receipt)); };
+    auto filesPy = [](const std::vector<vo::ArtifactFile>& files) {
+        nb::list result;
+        for (const auto& f : files) { nb::dict d; d["name"] = f.name; d["sha256"] = f.sha256; d["length"] = f.length; result.append(d); }
+        return result;
+    };
+    session
+        .def("attach_hosted", [](Session& self, const std::string& endpoint, int64_t pollIntervalMs, size_t cacheBytes,
+                                 int retries, long connectTimeoutMs) {
+            vo::HostedSessionOptions options;
+            options.pollInterval = std::chrono::milliseconds(pollIntervalMs);
+            options.cacheBytes = cacheBytes;
+            options.client.retries = retries;
+            options.client.connectTimeoutMs = connectTimeoutMs;
+            nb::gil_scoped_release release;
+            return self.attachHosted(endpoint, options);
+        }, nb::arg("endpoint"), nb::arg("poll_interval_ms") = 2000, nb::arg("cache_bytes") = vo::HostedSessionOptions{}.cacheBytes,
+           nb::arg("retries") = 5, nb::arg("connect_timeout_ms") = 10000,
+           "Attach a store served by vc_object_server; use the typed operations (no local callbacks).")
+        .def("hosted", &Session::hosted, nb::arg("attachment"))
+        .def("freshness", [statusPy](const Session& self, const vo::AttachmentIdentity& attachment) -> nb::object {
+            const auto fresh = self.freshness(attachment);
+            if (!fresh) return nb::none();
+            nb::dict d;
+            d["status"] = fresh->status ? statusPy(*fresh->status) : nb::none();
+            d["checked_at_us"] = fresh->checkedAtUs ? nb::cast(*fresh->checkedAtUs) : nb::none();
+            d["error"] = fresh->error;
+            return d;
+        }, nb::arg("attachment"))
+        .def("refresh", &Session::refresh, nb::arg("attachment"), nb::call_guard<nb::gil_scoped_release>())
+        .def("status", [statusPy](Session& self, const vo::AttachmentIdentity& attachment) {
+            vo::StoreStatus status;
+            { nb::gil_scoped_release release; status = self.status(attachment); }
+            return statusPy(status);
+        }, nb::arg("attachment"))
+        .def("submit", [=](Session& self, const vo::AttachmentIdentity& attachment, const nb::object& request, const nb::dict& payloads) {
+            const auto parsed = requestFromPy(request, payloads);
+            vo::TransactionReceipt receipt;
+            { nb::gil_scoped_release release; receipt = self.submit(attachment, parsed); }
+            return receiptPy(receipt);
+        }, nb::arg("attachment"), nb::arg("request"), nb::arg("payloads") = nb::dict())
+        .def("receipt", [=](Session& self, const vo::AttachmentIdentity& attachment, const std::string& requestUuid) -> nb::object {
+            std::optional<vo::TransactionReceipt> receipt;
+            { nb::gil_scoped_release release; receipt = self.receipt(attachment, requestUuid); }
+            return receipt ? receiptPy(*receipt) : nb::none();
+        }, nb::arg("attachment"), nb::arg("request_uuid"))
+        .def("current_object", [](Session& self, const vo::AttachmentIdentity& attachment, const std::string& uuid) {
+            std::optional<vo::ObjectRevision> revision;
+            { nb::gil_scoped_release release; revision = self.currentObject(attachment, uuid); }
+            return toPy(revision);
+        }, nb::arg("attachment"), nb::arg("object_uuid"))
+        .def("objects_at_versions", [](Session& self, const vo::AttachmentIdentity& attachment, const nb::list& refs) {
+            const auto versions = objectVersionsFromPy(refs);
+            std::vector<std::optional<vo::ObjectRevision>> revisions;
+            { nb::gil_scoped_release release; revisions = self.objectsAtVersions(attachment, versions); }
+            return toPy(revisions);
+        }, nb::arg("attachment"), nb::arg("refs"))
+        .def("artifacts", [=](Session& self, const vo::AttachmentIdentity& attachment, const std::string& uuid,
+                              const std::optional<int64_t>& version) {
+            std::vector<vo::ArtifactFile> files;
+            { nb::gil_scoped_release release; files = self.artifacts(attachment, uuid, version); }
+            return filesPy(files);
+        }, nb::arg("attachment"), nb::arg("object_uuid"), nb::arg("version") = std::nullopt)
+        .def("materialize_artifacts", [=](Session& self, const vo::AttachmentIdentity& attachment, const std::string& uuid,
+                                          const std::filesystem::path& destination, const std::optional<int64_t>& version) {
+            std::vector<vo::ArtifactFile> files;
+            { nb::gil_scoped_release release; files = self.materializeArtifacts(attachment, uuid, destination, version); }
+            return filesPy(files);
+        }, nb::arg("attachment"), nb::arg("object_uuid"), nb::arg("destination"), nb::arg("version") = std::nullopt)
+        .def("publish_artifacts", [=](Session& self, const vo::AttachmentIdentity& attachment, const std::string& uuid,
+                                      int64_t expectedVersion, const std::map<std::string, std::filesystem::path>& files,
+                                      const std::string& author) {
+            const std::vector<std::pair<std::string, std::filesystem::path>> list(files.begin(), files.end());
+            vo::TransactionReceipt receipt;
+            { nb::gil_scoped_release release; receipt = self.publishArtifacts(attachment, uuid, expectedVersion, list, author); }
+            return receiptPy(receipt);
+        }, nb::arg("attachment"), nb::arg("object_uuid"), nb::arg("expected_version"), nb::arg("files"), nb::arg("author"),
+           "Store {name: local path} durably and name them in the object's manifest in one checked request.")
+        .def("use_draft_directory", [](Session& self, const std::filesystem::path& directory) {
+            vo::DraftRecovery recovery;
+            { nb::gil_scoped_release release; recovery = self.useDraftDirectory(directory); }
+            nb::dict d; d["checkpoint"] = recovery.checkpoint; d["drafts"] = recovery.drafts;
+            nb::list pending;
+            for (const auto& p : recovery.pending) {
+                nb::dict item; item["request_uuid"] = p.requestUuid; item["store_uuid"] = p.storeUuid; item["drafts"] = p.drafts;
+                pending.append(item);
+            }
+            d["pending"] = pending;
+            return d;
+        }, nb::arg("directory"), "Durable drafts: install the directory's last checkpoint; call once, before making drafts.")
+        .def("checkpoint_drafts", &Session::checkpointDrafts, nb::call_guard<nb::gil_scoped_release>())
+        .def("draft_checkpoint_error", &Session::draftCheckpointError)
+        .def("pending_submissions", [](const Session& self) {
+            nb::list result;
+            for (const auto& p : self.pendingSubmissions()) {
+                nb::dict item; item["request_uuid"] = p.requestUuid; item["store_uuid"] = p.storeUuid; item["drafts"] = p.drafts;
+                result.append(item);
+            }
+            return result;
+        })
+        .def("submit_durably", [=](Session& self, const vo::AttachmentIdentity& attachment, const nb::object& request,
+                                   const nb::dict& payloads, const std::vector<std::string>& drafts) {
+            const auto parsed = requestFromPy(request, payloads);
+            vo::TransactionReceipt receipt;
+            { nb::gil_scoped_release release; receipt = self.submitDurably(attachment, parsed, drafts); }
+            return receiptPy(receipt);
+        }, nb::arg("attachment"), nb::arg("request"), nb::arg("payloads") = nb::dict(), nb::arg("drafts") = std::vector<std::string>{},
+           "A checked save that survives a crash (request written before it is sent).")
+        .def("resolve_pending", [=](Session& self, const vo::AttachmentIdentity& attachment, const std::string& requestUuid) {
+            vo::TransactionReceipt receipt;
+            { nb::gil_scoped_release release; receipt = self.resolvePending(attachment, requestUuid); }
+            return receiptPy(receipt);
+        }, nb::arg("attachment"), nb::arg("request_uuid"));
+}
+
 NB_MODULE(_native, m)
 {
     m.def("artifact_manifest_json", [](const nb::list& files) {
@@ -579,7 +709,7 @@ NB_MODULE(_native, m)
     bindGraphReadView(m);
     bindGeometryRegion(m);
     bindHostedStore(m);
-    bindObjectStoreSession(m);
+    bindSessionOperations(bindObjectStoreSession(m));
     bindTypedGeometry(m); // Shared C++ geometry and revision-pinned views.
 
     m.def("geometry_scale_to_volume", [](const nb::handle& meta, const std::string& volume) {

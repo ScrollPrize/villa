@@ -116,6 +116,7 @@ try {
     // Local callbacks need a database the session does not have.
     mustFail([&] { session.read(hosted, [](const auto&, const auto&, const auto&) {}); });
     mustFail([&] { (void)session.act(hosted, {}, [](auto&, auto&) {}); });
+    mustFail([&] { (void)session.path(hosted); }); // and the attachment can still be detached at the end
 
     // Typed reads answer as the store does (read-only beside the service).
     {

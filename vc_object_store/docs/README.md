@@ -489,6 +489,13 @@ metadata value, and on `HostedStore` also `fetch_artifact(file, destination)`.
 server snapshot they read; `select_all_objects`/`select_all_edges` raise
 `StoreBusy` as in C++. Conflicts raise `RuntimeError`, malformed requests
 `ValueError`.
+`ObjectStoreSession` has the same session operations as C++: `attach_hosted`,
+`hosted`, `freshness`, `refresh`, `status`, `submit`, `receipt`,
+`current_object`, `objects_at_versions`, `artifacts`, `materialize_artifacts`,
+`publish_artifacts(attachment, object, expected_version, {name: path}, author)`,
+`use_draft_directory`, `checkpoint_drafts`, `draft_checkpoint_error`,
+`submit_durably`, `pending_submissions` and `resolve_pending`. `take_events()`
+items carry `revalidate`.
 
 ## Relationships and graphs
 
