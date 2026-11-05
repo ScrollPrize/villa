@@ -332,12 +332,12 @@ bool LasagnaServiceManager::startService(const QString& pythonPath,
         return false;
     }
     _dataDirectory = dataDirectoryInfo.absoluteFilePath();
-    if (_storePath.isEmpty()) {
+    if (_storeLocation.isEmpty()) {
         _lastError = tr("Lasagna needs an attached object store.");
         emit serviceError(_lastError);
         return false;
     }
-    _serviceStorePath = _storePath;
+    _serviceStoreLocation = _storeLocation;
 
     _process = std::make_unique<QProcess>();
     _process->setProcessChannelMode(QProcess::SeparateChannels);
@@ -399,8 +399,9 @@ bool LasagnaServiceManager::startService(const QString& pythonPath,
     QStringList args = {
         scriptPath, QStringLiteral("--port"), QStringLiteral("0"),
         QStringLiteral("--data-dir"), _dataDirectory,
-        // The service writes into this process's store file; its session syncs it.
-        QStringLiteral("--store"), _serviceStorePath, QStringLiteral("--shared-store")
+        // The service works on the attached store: its file (shared with this
+        // process) or the endpoint of the vc_object_server that hosts it.
+        QStringLiteral("--store"), _serviceStoreLocation, QStringLiteral("--shared-store")
     };
 
     emit statusMessage(tr("Starting lasagna service..."));
@@ -838,12 +839,12 @@ void LasagnaServiceManager::setObjectStore(std::shared_ptr<vc::objects::ObjectSt
 {
     _storeSession = session;
     _storeAttachment = attachment;
-    _storePath.clear();
-    // The service opens the store file; a hosted store has none here (no store path).
-    if (session && _storeAttachment && !session->hosted(*_storeAttachment))
-        _storePath = QString::fromStdString(session->path(*_storeAttachment).string());
-    // The internal service works on one store file; restart it on the next job.
-    if (_process && !_isExternal && _serviceStorePath != _storePath) {
+    _storeLocation.clear();
+    // The service attaches the same store: a file path, or a hosted store's endpoint.
+    if (session && _storeAttachment)
+        _storeLocation = QString::fromStdString(session->location(*_storeAttachment));
+    // The internal service works on one store; restart it on the next job.
+    if (_process && !_isExternal && _serviceStoreLocation != _storeLocation) {
         stopService();
     }
 }

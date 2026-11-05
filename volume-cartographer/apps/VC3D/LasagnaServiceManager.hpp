@@ -24,9 +24,11 @@ class QNetworkReply;
  *
  * Supports two modes:
  *   - Internal: launches fit_service.py as a subprocess on the attached
- *     object store's file (--store --shared-store)
+ *     object store (--store with its file or, for a hosted store, its
+ *     vc_object_server endpoint; --shared-store)
  *   - External: connects to a pre-started service on a known host:port; it
- *     must work on the same store
+ *     must work on the same store (on another machine: started with
+ *     --store <endpoint> of the vc_object_server VC3D attached)
  *
  * Jobs read stored surfaces by UUID and create their results as new surfaces
  * in the store (results attached to them, the model checkpoint among their
@@ -185,8 +187,8 @@ private:
     // it (this manager is a process-lifetime singleton).
     std::weak_ptr<vc::objects::ObjectStoreSession> _storeSession;
     std::optional<vc::objects::AttachmentIdentity> _storeAttachment;
-    QString _storePath;         // the attached store's file
-    QString _serviceStorePath;  // the file the internal service was started on
+    QString _storeLocation;         // the attached store: its file or endpoint
+    QString _serviceStoreLocation;  // the store the internal service was started on
     QString _serviceStoreUuid;  // the store the connected service writes to
     bool _serviceReady{false};
     bool _optimizationRunning{false};
