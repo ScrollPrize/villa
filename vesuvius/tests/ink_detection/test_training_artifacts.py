@@ -205,12 +205,14 @@ def test_checkpoint_payload_uses_canonical_mapping_and_optional_ema_state():
         "lr_scheduler",
         "config",
         "step",
+        "optimizer_step",
         "wandb_run_id",
         "validation_metrics",
         "ema_model",
         "ema_optimizer_step",
     ]
     assert payload["step"] == 2
+    assert payload["optimizer_step"] == 3
     assert payload["wandb_run_id"] == "run-123"
     assert payload["ema_optimizer_step"] == 3
     assert payload["validation_metrics"] == {"val_loss": 0.25}

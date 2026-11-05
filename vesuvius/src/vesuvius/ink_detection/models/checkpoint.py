@@ -79,6 +79,13 @@ def load_model_state(
         raise direct_error
 
 
+def validate_optimizer_step(value: Any) -> int:
+    """Require an exact nonnegative update count; never infer it from iterations."""
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError("optimizer step must be a nonnegative integer")
+    return value
+
+
 def restore_training_state(
     model: nn.Module,
     optimizer: torch.optim.Optimizer,
@@ -89,12 +96,26 @@ def restore_training_state(
     load_weights_only: bool = False,
     ema_model: nn.Module | None = None,
 ) -> tuple[int, int]:
-    """Restore training state and return the next step and EMA optimizer step."""
+    """Restore training state and return the next iteration and update count."""
 
     model_state = checkpoint.get("model")
     if model_state is None:
         raise ValueError(f"Checkpoint {str(checkpoint_path)!r} is missing 'model'")
+    optimizer_step = 0
+    if not load_weights_only:
+        optimizer_step = validate_optimizer_step(
+            checkpoint.get("optimizer_step", checkpoint.get("ema_optimizer_step", 0))
+        )
+        if "optimizer_step" in checkpoint and "ema_optimizer_step" in checkpoint:
+            legacy_step = validate_optimizer_step(checkpoint["ema_optimizer_step"])
+            if legacy_step != optimizer_step:
+                raise ValueError("optimizer_step and ema_optimizer_step disagree")
     load_model_state(model, model_state)
+    # The caller may have copied EMA before the main weights were restored.
+    if ema_model is not None and (
+        load_weights_only or checkpoint.get("ema_model") is None
+    ):
+        ema_model.load_state_dict(model.state_dict())
     if load_weights_only:
         return 0, 0
 
@@ -107,12 +128,10 @@ def restore_training_state(
 
     optimizer.load_state_dict(checkpoint["optimizer"])
     lr_scheduler.load_state_dict(checkpoint["lr_scheduler"])
-    optimizer_step = 0
     if ema_model is not None:
         ema_model_state = checkpoint.get("ema_model")
         if ema_model_state is not None:
             ema_model.load_state_dict(ema_model_state)
-            optimizer_step = int(checkpoint.get("ema_optimizer_step", 0))
     return int(checkpoint["step"]) + 1, optimizer_step
 
 
