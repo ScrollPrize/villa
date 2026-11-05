@@ -68,7 +68,7 @@ The page at `/` shows each pair under `PAIRS_DIR` in three parts. At the top is 
 overview of its steps. Below it, **Continue** starts every step that can run, beside a link
 to whatever waits for you. Then every step is listed with its state, its settings (the
 hold-out set's size, the fit's patches and passes, the blind round's size) and a Redo
-button. A changed setting is logged under your id, and the step runs again on Continue. The judging page uses the first runs' keys: `1`–`5` to
+button. A changed setting is logged under your id; it and Redo start the step again right away. The judging page uses the first runs' keys: `1`–`5` to
 answer, `space` to flip, `m` for mode, `n` for a note, `u` to undo, and `?unit=octants` to
 judge octants. The blind page uses `1`/`2`, `Enter` to pick, `x` for can't tell, `n` for
 neither, and `j`/`k` to move. It ends in the decision. The server never reads a volume.

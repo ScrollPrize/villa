@@ -86,7 +86,9 @@ async function load() {
   $("count").textContent = `${state.units.filter(q => q.answer).length} of ${state.units.length} answered`;
   $("bar").style.width = `${Math.min(100, 100 * p.lines_up / state.target)}%`;
   const whole = a["lines-up"] + a.partly;
-  $("progress-text").innerHTML = `<b>${p.lines_up}</b> of ${state.target} line up · partly ${a.partly}` +
+  const answered = p.stretches.reduce((n, x) => n + x.answered, 0);
+  const needed = p.lines_up >= state.target ? `${state.target} needed ✓` : `${state.target} needed, ${state.target - p.lines_up} to go`;
+  $("progress-text").innerHTML = `<b>${p.lines_up}</b> of ${answered} answered line up (${needed}) · partly ${a.partly}` +
     (whole ? ` (${Math.round(100 * a.partly / whole)}%)` : "") + ` · no ${a.no} · can't tell ${a["cant-tell"]} · not scroll ${a["not-scroll"]}`;
   $("stretches").innerHTML = p.stretches.map((s, i) =>
     `<div title="stretch ${i + 1} along the scroll"><b>${s.lines_up}</b><small>${s.left} left</small></div>`).join("");

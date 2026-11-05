@@ -74,11 +74,15 @@ const summary = p => {
 $("hide-done").checked = remembered("hide-done", true);
 $("hide-done").onchange = () => { remember("hide-done", $("hide-done").checked); load(); };
 
+// The bar's minimum, beside the count rather than as its denominator.
+const needed = (have, target) => have >= target ? `${target} needed ✓` : `${target} needed, ${target - have} to go`;
+
 function detail(p, s) {
   const link = `/pairs/${encodeURIComponent(p.name)}/${PAGE[s.name] || ""}`;
   if (s.name === "judge-holdout" && p.holdout) {
     const left = p.holdout.stretches.reduce((a, x) => a + x.left, 0);
-    return `${p.holdout.lines_up} of ${p.target} line up · ${left} left to answer` +
+    const answered = p.holdout.stretches.reduce((a, x) => a + x.answered, 0);
+    return `${p.holdout.lines_up} of ${answered} answered line up · ${needed(p.holdout.lines_up, p.target)} · ${left} left to answer` +
       (s.state !== "blocked" ? ` · <a href="${link}">judge →</a>` : "");
   }
   if (s.name === "final-review") {
@@ -142,7 +146,7 @@ async function load() {
     };
     box.querySelector('[data-act="continue"]').onclick = () => act("run", {});
     for (const b of box.querySelectorAll("[data-redo]")) b.onclick = () => {
-      if (confirm(`Run "${b.dataset.redo}" and the steps after it again? Press Continue afterwards.`)) act("redo", {stage: b.dataset.redo});
+      if (confirm(`Run "${b.dataset.redo}" and the steps after it again?`)) act("redo", {stage: b.dataset.redo});
     };
     for (const b of box.querySelectorAll("[data-apply]")) b.onclick = () => {
       const values = {};

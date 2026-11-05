@@ -110,7 +110,7 @@ class Reviews:
                              for key, label in EDITABLE.get(name, {}).items()]}
 
     def set_params(self, name, stage, values):
-        """Change a stage's settings; the stage and what follows it run again on Continue."""
+        """Change a stage's settings; the stage and what follows it run again."""
         allowed = EDITABLE.get(stage, {})
         if not values or set(values) - set(allowed):
             raise ValueError(f"{stage} has no setting {sorted(set(values) - set(allowed))}")
@@ -126,6 +126,7 @@ class Reviews:
         params.setdefault(stage, {}).update(clean)
         record.write(pipeline_stages.PARAMS, params)
         record.log("params", stage=stage, values=clean, by=self.reviewer)
+        self.advance(name)
         return params
 
     def run(self, name):
@@ -137,7 +138,9 @@ class Reviews:
             cli.advance(self.pair_dir(name))
 
     def redo(self, name, stage):
-        return {"affected": self.pipeline(name).redo(stage)}
+        affected = self.pipeline(name).redo(stage)
+        self.advance(name)
+        return {"affected": affected}
 
     def more(self, name, holdout, fit):
         record = self.record(name)
