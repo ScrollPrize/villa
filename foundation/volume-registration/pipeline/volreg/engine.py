@@ -169,8 +169,10 @@ class Pipeline:
             if stamp and stamp.get("status") == "failed" and stamp.get("inputs") == self.inputs(name):
                 result = FAILED
             elif stamp and stamp.get("status") == "ok":
-                result = DONE if stamp.get("inputs") == self.inputs(name) else \
-                    (STALE if needs_done else BLOCKED)
+                # A result whose own inputs still match waits, too, while a stage before it
+                # runs again: what it rests on is about to change.
+                result = (BLOCKED if not needs_done else
+                          DONE if stamp.get("inputs") == self.inputs(name) else STALE)
             else:
                 result = READY if needs_done else BLOCKED
         memo[name] = result

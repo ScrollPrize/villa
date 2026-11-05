@@ -126,3 +126,15 @@ def test_a_result_can_be_kept_when_only_what_its_stage_needs_changes(tmp_path):
     assert len(list((tmp_path / "work/stages/history").iterdir())) == 1
     with pytest.raises(ValueError, match="other parameters"):
         make(tmp_path, params={"draw": {"count": 20}}).adopt_needs("draw", "no")
+
+
+def test_a_result_waits_while_a_stage_before_it_runs_again(tmp_path):
+    pipeline = make(tmp_path)
+    write(pipeline, "answers.json", ["a", "b"])
+    for name in ("draw", "fit", "score"):
+        pipeline.run_stage(name)
+    more = make(tmp_path, params={"draw": {"count": 20}, "score": {"anything": 1}})
+    states = more.states()
+    assert states["draw"] == STALE and states["judge"] == BLOCKED
+    assert states["fit"] == BLOCKED and states["score"] == BLOCKED   # not run on the old draw
+    assert more.advance(lambda name: None)[1] == ["draw"]

@@ -100,6 +100,12 @@ def test_a_pair_through_every_stage(tmp_path, stores):
     assert pipeline.states()["final-review"] == WAITING
     round_ = record.read(rec.FINAL_REVIEW)["rounds"][0]
     assert round_["candidates"] == [fit["fit"], fit["fit"] + "/affine"]
+    # Shorter than asked and nobody has picked in it: drawn again, under a new id.
+    assert len(round_["items"]) < pipeline.stage_params("blind")["count"]
+    pipeline.redo("blind"); pipeline.run_stage("blind")
+    rounds = record.read(rec.FINAL_REVIEW)["rounds"]
+    assert [r["id"] for r in rounds] == ["c002"] and record.events()[-2]["replaces"] == ["c001"]
+    round_ = rounds[0]
     for index, item in enumerate(round_["items"]):
         assert pipeline.work("images", "blind", round_["id"], str(index), "1.png").exists()
         record.blind_pick(round_["id"], index, "unsure", REVIEWER)

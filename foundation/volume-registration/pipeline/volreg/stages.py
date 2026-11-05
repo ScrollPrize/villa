@@ -22,6 +22,8 @@ from .engine import Pipeline, Stage
 from .scoring import BAR, bar_check, score
 
 PARAMS = "params.json"
+# Draws of the hold-out stage, at most, to make up for patches that cannot be measured.
+HOLDOUT_DRAWS = 4
 SESSION = "session"
 
 
@@ -84,14 +86,19 @@ def run_holdout(pipeline, params):
     the record. Only measured patches are listed: an unmeasured one has nothing to judge."""
     with session_lock(pipeline):
         session = open_session(pipeline)
-        have = sum(1 for patch in session.state["patches"] if patch.get("test"))
-        missing = params["patches"] - have
-        if missing > 0:
-            added = session.sample_test(missing, seed=params["seed"] + have)
+        for _ in range(HOLDOUT_DRAWS):
+            measure_new_holdout(session)
+            have = sum(1 for patch in session.state["patches"] if patch.get("test"))
+            missing = params["patches"] - have
+            if missing <= 0:
+                break
+            added = session.sample_test(missing, seed=params["seed"] + len(session.state["patches"]))
             if not added:
-                raise RuntimeError(f"no hold-out patch could be drawn ({missing} asked for)")
+                break
             keep_only_asked(session, added, missing)
-            session.correlate(only_new=True)
+        if not any(patch.get("test") for patch in session.state["patches"]):
+            raise RuntimeError(f"no hold-out patch could be drawn and measured "
+                               f"({params['patches']} asked for)")
         held = migrate.holdout(migrate.Session(session.directory), None, every_octant=True)
         patches = [patch for patch in held["patches"] if "centre_zyx" in patch]
         render_holdout(pipeline, session, patches)
@@ -103,6 +110,18 @@ def run_holdout(pipeline, params):
     listed = pipeline.work("holdout-patches.json")
     listed.write_text(json.dumps([[patch["id"], patch["origin_zyx"]] for patch in patches]) + "\n")
     return ["work/holdout-patches.json"]
+
+
+def measure_new_holdout(session):
+    """Measure the hold-out patches drawn but not measured yet. One that cannot be measured
+    -- where the fine scan does not reach, as for much of a 45 um scan against a DLS one --
+    has nothing to judge: it leaves the hold-out set, and another is drawn in its place."""
+    if any(patch.get("test") and patch["measurement"] is None for patch in session.state["patches"]):
+        session.correlate(only_new=True)
+    for patch in session.state["patches"]:
+        if patch.get("test") and patch["measurement"] is None:
+            patch["test"] = False
+    session.save()
 
 
 def render_holdout(pipeline, session, patches):
@@ -294,13 +313,21 @@ def run_score(pipeline, params):
 def run_blind(pipeline, params):
     """A blind round for the fit: the hold-out patches answered "lines up" or "partly" where
     its bend and its affine part place the patch furthest apart, the two options shuffled.
-    A round for this fit already in the record is kept; a new fit gets a new round."""
+    A round for this fit that someone has picked in, or that is as long as asked, is kept;
+    one nobody has picked in and shorter than asked -- drawn from too few answers, or before
+    the count was raised -- is drawn again under a new id. A new fit gets a new round."""
     fit = json.loads(pipeline.work("fit", "fit.json").read_text())
     candidates = [fit["fit"], fit["fit"] + fs.AFFINE]
     final = pipeline.record.read(rec.FINAL_REVIEW) if pipeline.record.exists(rec.FINAL_REVIEW) else {}
     rounds = final.get("rounds") or []
-    if any(round_["candidates"] == candidates for round_ in rounds):
+    events = pipeline.record.events()
+    picked = {event["round"] for event in events if event["kind"] == "blind-pick"}
+    this_fit = [round_ for round_ in rounds if round_["candidates"] == candidates]
+    if any(round_["id"] in picked or len(round_["items"]) >= params["count"] for round_ in this_fit):
         return [rec.FINAL_REVIEW]
+    rounds = [round_ for round_ in rounds if round_ not in this_fit]
+    taken = {round_["id"] for round_ in final.get("rounds") or []} | {
+        event["round"] for event in events if event["kind"] == "blind-round"}
     held = {patch["id"]: patch for patch in pipeline.record.read(rec.HOLDOUT)["patches"]}
     eligible = {patch_id for patch_id, patch in held.items()
                 if (patch.get("answer") or {}).get("answer") in params["answers"]}
@@ -316,7 +343,8 @@ def run_blind(pipeline, params):
             if spread >= fs.SAME_PLACE_VOXELS:
                 ranked.append((spread, patch_id))
         ranked.sort(key=lambda item: (-item[0], item[1]))
-        round_id = f"c{len(rounds) + 1:03d}"
+        round_id = next(f"c{number:03d}" for number in range(len(taken) + 1, 1000)
+                        if f"c{number:03d}" not in taken)
         items = []
         for index, (spread, patch_id) in enumerate(ranked[:params["count"]]):
             options = [[candidates[i]] for i in rng.permutation(len(candidates))]
@@ -328,7 +356,8 @@ def run_blind(pipeline, params):
     rounds.append({"id": round_id, "at": rec.now(), "candidates": candidates, "test_only": True,
                    "items": items})
     pipeline.record.refresh_final(rounds)
-    pipeline.record.log("blind-round", round=round_id, candidates=candidates, items=len(items))
+    pipeline.record.log("blind-round", round=round_id, candidates=candidates, items=len(items),
+                        eligible=len(eligible), replaces=[round_["id"] for round_ in this_fit])
     return [rec.FINAL_REVIEW]
 
 
