@@ -279,7 +279,7 @@ TEST_CASE("Tools read surfaces in a bound volume's voxels and write back only st
         CHECK_THROWS(surfaces.create(*derivedInStore, "mixed", nlohmann::json::object(), {uuid, derived}));
         auto inStore = surfaces.load(uuid);
         CHECK((*inStore->rawPointsPtr())(1, 1) == cv::Vec3f(2, 2, 8));
-        CHECK_NOTHROW(surfaces.update(uuid, *inStore));
+        CHECK(surfaces.update(uuid, *inStore) >= 1);  // unchanged: the version it loaded
         // At working level 1 (half the volume's voxels): read there, and what is
         // made from it is bound to the volume at that scale.
         auto coarse = surfaces.load(uuid, true, VolumeVoxels{"vol", 0.5});

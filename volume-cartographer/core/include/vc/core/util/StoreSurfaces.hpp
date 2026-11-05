@@ -52,9 +52,10 @@ public:
                        const std::vector<std::string>& sources = {}, const std::vector<std::string>& tags = {},
                        const std::optional<vc::objects::VolumeVoxels>& volume = std::nullopt);
     // Publish the edited vertices of a surface this tool loaded, checked against
-    // the revision it loaded; relationships are kept as recorded. The grid must
-    // keep its size. Returns the new geometry revision.
-    std::string update(const std::string& uuid, QuadSurface& surface);
+    // the version it loaded; relationships are kept as recorded. The grid must
+    // keep its size. Returns the object's numbered version afterwards (the
+    // loaded one when nothing changed).
+    int64_t update(const std::string& uuid, QuadSurface& surface);
 
     vc::objects::ToolObjects& objects() { return objects_; }
 

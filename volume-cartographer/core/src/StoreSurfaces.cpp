@@ -54,7 +54,7 @@ std::string StoreSurfaces::create(QuadSurface& surface, const std::string& name,
     return uuid;
 }
 
-std::string StoreSurfaces::update(const std::string& uuid, QuadSurface& surface)
+int64_t StoreSurfaces::update(const std::string& uuid, QuadSurface& surface)
 {
     const auto canonical = vc::objects::util::canonicalUuid(uuid);
     const auto pin = objects_.writable(canonical);
@@ -69,12 +69,10 @@ std::string StoreSurfaces::update(const std::string& uuid, QuadSurface& surface)
             request.operations.push_back(std::move(*edit));
         vc::objects::expectRelationshipEndpoints(reader, request.expectedObjects);
     });
-    if (request.operations.empty()) return *pin.geometryRevision;
+    if (request.operations.empty()) return pin.version;
     const auto receipt = session->submit(objects_.attachment(), request);
     objects_.wrote();
-    const auto version = receipt.objects.at(canonical);
-    const auto committed = session->objectsAtVersions(objects_.attachment(), {{pin.object.storeUuid, receipt.generation, canonical, *version}});
-    return *committed.front()->geometryRevision;
+    return *receipt.objects.at(canonical);
 }
 
 bool StoreOutputArgs::parse(const std::string& arg)
