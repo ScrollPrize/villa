@@ -62,7 +62,7 @@ class RenderLoggingTests(unittest.TestCase):
     def test_valid_surface_interpolation_values_are_accepted(self):
         # These get past flag parsing and fail later, on the absent volume.
         seg = ["-s", str(self.root / "absent.tifxyz")]
-        for value in ("linear", "smooth", "bicubic", "SMOOTH"):
+        for value in ("linear", "bicubic", "BICUBIC"):
             with self.subTest(value=value):
                 result = self.run_renderer(
                     seg + ["--surface-interpolation", value], logged=False

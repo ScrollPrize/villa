@@ -1,5 +1,5 @@
 // VolumePkg coverage with real attached resources: a local zarr volume
-// and an empty normal-grid dir. Exercises addSingleVolume/removeSingleVolume,
+// and an empty normal-grid dir. Exercises attachment,
 // reload variants, volume(), etc.
 
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
@@ -7,13 +7,15 @@
 
 #include "vc/core/types/VolumePkg.hpp"
 #include "vc/core/types/Volume.hpp"
-#include "support/TestZarrVolume.hpp"
+#include <nlohmann/json.hpp>
+#include <vc_reader/zarr.hpp>
+#include <vc_reader/zarr_write.hpp>
+#include <filesystem>
+#include <fstream>
 #include "support/TestProject.hpp"
 #include "vc/core/util/RemoteUrl.hpp"
 
 #include <atomic>
-#include <filesystem>
-#include <fstream>
 #include <random>
 #include <string>
 
@@ -44,13 +46,11 @@ fs::path makeLocalVolume(const fs::path& root,
                          const std::string& id = "vol1")
 {
     auto volDir = root / "volumes" / id;
-    vc::test::ZarrVolumeSpec o;
-    o.shapeZYX = {16, 16, 16};
-    o.chunkShapeZYX = {16, 16, 16};
-    o.numLevels = 1;
-    o.uuid = id;
-    o.name = id;
-    auto v = vc::test::createZarrVolume(volDir, o);
+    const std::filesystem::path volumeRoot = volDir;
+    const vcr::zarr::CreateOptions levelZero{.shape = {16, 16, 16}, .chunks = {16, 16, 16}, .compressor = "", .overwrite = true};
+    vcr::zarr::Writer::create(volumeRoot / "0", levelZero);
+    std::ofstream(volumeRoot / "meta.json") << nlohmann::json{{"type", "vol"}, {"uuid", id}, {"name", id}, {"format", "zarr"}, {"width", 16}, {"height", 16}, {"slices", 16}, {"voxelsize", 1.0}}.dump();
+    auto v = Volume::New(volumeRoot);
     REQUIRE(v);
     return volDir;
 }
@@ -63,27 +63,10 @@ TEST_CASE("VolumePkg::addVolumeEntry auto-loads vol1 from the volumes dir")
     makeLocalVolume(d);
     auto p = vc::test::emptyProject();
     p->addVolumeEntry((d / "volumes").string());
-    // resolveVolumeEntry already loaded vol1; addSingleVolume returns false
-    // for an already-present id. Either way, vol1 must be reachable.
-    (void)p->addSingleVolume("vol1");
     auto v = p->volume("vol1");
     CHECK(v != nullptr);
     auto vDefault = p->volume();
     CHECK(vDefault != nullptr);
-    fs::remove_all(d);
-}
-
-TEST_CASE("VolumePkg::removeSingleVolume drops a volume by id")
-{
-    auto d = tmpDir("rmvol");
-    makeLocalVolume(d);
-    auto p = vc::test::emptyProject();
-    p->addVolumeEntry((d / "volumes").string());
-    REQUIRE(p->volume("vol1") != nullptr);
-    CHECK(p->removeSingleVolume("vol1"));
-    CHECK(p->volume("vol1") == nullptr);
-    // Second remove is a no-op.
-    CHECK_FALSE(p->removeSingleVolume("vol1"));
     fs::remove_all(d);
 }
 
@@ -274,7 +257,7 @@ TEST_CASE("VolumePkg does not treat a direct Zarr as a collection entry")
     fs::remove_all(d);
 }
 
-TEST_CASE("VolumePkg matches legacy remote entries by resolved identity")
+TEST_CASE("VolumePkg matches older remote entries by resolved identity")
 {
     vc::project::LoadOptions deferred;
     deferred.deferResolution = true;
@@ -319,15 +302,14 @@ TEST_CASE("A catalog gives remote entries their catalog volume identity at every
           {"type": "surface-prediction-zarr", "parameters": {"level": 1}, "origins": [{"path": "s/pred.zarr",
             "access_roots": [{"type": "https", "url": "https://example.test/", "usage": "public-read"}]}]}]}}}}})");
     const auto source = vc::project::catalogVolumeMetadata(&catalog, "https://example.test/s/vol.zarr");
-    CHECK(source.at("uuid").get_string() == "vol");
-    CHECK(source.at("voxelsize").get_double() == doctest::Approx(2.5));
+    CHECK(source.at("uuid").get<std::string>() == "vol");
+    CHECK_FALSE(source.contains("voxelsize"));  // the store's metadata decides, the catalog only fills gaps
     const auto level = vc::project::catalogVolumeMetadata(&catalog, "https://example.test/s/vol.zarr#vc-base-scale=2");
-    CHECK(level.at("uuid").get_string() == "vol");
-    CHECK(level.at("voxelsize").get_double() == doctest::Approx(10.0));
-    CHECK(level.at("name").get_string() == "scan.zarr [L2]");
+    CHECK(level.at("uuid").get<std::string>() == "vol");
+    CHECK(level.at("name").get<std::string>() == "scan.zarr [L2]");
     const auto prediction = vc::project::catalogVolumeMetadata(&catalog, "https://example.test/s/pred.zarr");
     CHECK_FALSE(prediction.contains("uuid"));
-    CHECK(prediction.at("voxelsize").get_double() == doctest::Approx(5.0));
+    CHECK(prediction.at("name").get<std::string>() == "surface-prediction-zarr of scan.zarr [L1]");
     CHECK(vc::project::catalogVolumeMetadata(&catalog, "https://example.test/elsewhere.zarr").empty());
     CHECK(vc::project::catalogVolumeMetadata(nullptr, "https://example.test/s/vol.zarr").empty());
 }

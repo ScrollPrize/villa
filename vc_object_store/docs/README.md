@@ -36,6 +36,29 @@ A surface placeholder with `storage_kind="url"` and an `http(s)://` or `s3://`
 decodes them like a local directory and stores the geometry, so the remote is
 read once. The placeholder, not the remote `meta.json`, supplies the identity.
 
+Files written before objects carried UUIDs (VC3D tifxyz surfaces, whose `uuid` is
+their directory name; PCL collections; version-1/3 fibers) can receive dataset
+identities when a UUID namespace is supplied: `vc_object_ingest --derive-uuids NAMESPACE`,
+`ingest_geometry_source(..., uuid_namespace=NAMESPACE)`, or VC3D's Import from Folder
+dialog. Each such source then gets `uuid5(NAMESPACE, "<kind>:<key>")`, matching
+Python's `uuid.uuid5`:
+
+| Kind | Key |
+| --- | --- |
+| `patch` (surfaces) | `meta.json` `uuid` string, else the directory name |
+| `fiber` | file stem; version-3 `branch_file` targets resolve the same way |
+| `point_collection` | `<document stem>:<collection id>` |
+
+Without a namespace, UUID-less fibers retain the default fixed-namespace
+`vc3d_fiber/<filename>` identity; surfaces and PCLs still require canonical UUIDs.
+
+The object records `meta.source.uuid_derivation = {namespace, name}`. Canonical
+source UUIDs are kept, and tracks keep their `(dataset_ref, external_key)`
+identity. Use one namespace per dataset; the same files then always map to the
+same identities, so a repeated import fails as an existing identity rather than
+duplicating objects. Keys do not depend on absolute paths, but renaming a file or
+directory changes its identity.
+
 PCL source links use document-scoped collection/point identities. The namespace
 is `meta.source.origin`, the absolute lexically normalized import path; symlink
 aliases and moved files are different namespaces. Import only new collections
@@ -317,8 +340,8 @@ connections retain their schema/page caches between operations and check the
 database change counter under the next lock. A failed operation or an unfinished
 transaction discards its cached connection before any retry.
 
-The protocol client is `vc_object_store::vc_sftp`
-(`include/vc_object_store/sftp/Sftp.hpp`). The server must provide OpenSSH's
+The protocol client is vc_reader's `vc_reader::sftp` library
+(`vc_reader/sftp.hpp`), which also serves remote volumes. The server must provide OpenSSH's
 `fsync@openssh.com` extension for durable writes; the VFS refuses writes without
 it.
 - Without a registered authenticator, `ssh` runs in batch mode: keys and the

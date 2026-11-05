@@ -7,7 +7,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
-import tifffile
+from vc_reader import tifxyz
 
 
 def surface_step_stats(xyz: torch.Tensor, valid: torch.Tensor) -> tuple[float, float, float, float]:
@@ -81,16 +81,8 @@ def load_tifxyz(path: str | Path, *, device: torch.device | str = "cpu",
 		p = Path(path)
 		if not p.is_dir():
 			raise ValueError(f"tifxyz path is not a directory: {p}")
-		x = tifffile.imread(str(p / "x.tif")).astype(np.float32)
-		y = tifffile.imread(str(p / "y.tif")).astype(np.float32)
-		z = tifffile.imread(str(p / "z.tif")).astype(np.float32)
-		if x.shape != y.shape or x.shape != z.shape:
-			raise ValueError(f"tifxyz shape mismatch: x={x.shape} y={y.shape} z={z.shape}")
-		xyz = np.stack([x, y, z], axis=-1)  # (H, W, 3)
-		meta_path = p / "meta.json"
-		meta: dict = {}
-		if meta_path.exists():
-			meta = json.loads(meta_path.read_text(encoding="utf-8"))
+		xyz = tifxyz.read(p, mask=False).xyz.copy()  # (H, W, 3)
+		meta = json.loads((p / "meta.json").read_text(encoding="utf-8"))
 		label = p.name
 
 	xyz_t = torch.from_numpy(xyz)

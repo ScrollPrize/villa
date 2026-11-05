@@ -2,8 +2,9 @@
 #include <vc_object_store/Uuid.hpp>
 #include "PointCollectionSync.hpp"
 
-#include "OpenDataManifest.hpp"
+#include "OpenDataResourceSelection.hpp"
 #include "VCSettings.hpp"
+#include "OpenedVolumes.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -28,7 +29,7 @@ namespace {
 
 std::shared_ptr<const vcr::catalog::RegistrationGraph> catalogTransformSnapshot()
 {
-    const auto catalog=vc3d::opendata::cachedCatalog();
+    const auto catalog=vcr::catalog::cachedManifest(vcr::catalog::catalogCacheFile(std::string(vcr::catalog::kDefaultManifestUrl)));
     if(!catalog)return {};
     auto graph=std::make_shared<vcr::catalog::RegistrationGraph>();
     graph->addCatalog(*catalog);
@@ -85,7 +86,8 @@ std::optional<SurfaceFocusPoint> focusPointAtGrid(QuadSurface& surface, int row,
     if (!surface.isQuadValid(row, col)) {
         return std::nullopt;
     }
-    const cv::Vec3f normal = surface.gridNormal(row, col);
+    cv::Vec3f normal;
+    surface.pointAt(float(col), float(row), nullptr, normal.val);
     if (!std::isfinite(normal[0]) || !std::isfinite(normal[1]) || !std::isfinite(normal[2])) {
         return std::nullopt;
     }
@@ -221,13 +223,24 @@ std::unique_ptr<POI> createSegmentationFocusPoi(CState* state, QuadSurface& surf
 
 } // namespace
 
-CState::CState(QObject* parent, bool debugDownloadQueue, CState* objectStoreOwner)
+CState::CState(QObject* parent, CState* objectStoreOwner, std::size_t cacheBytes)
     : QObject(parent)
-    , _debugDownloadQueue(debugDownloadQueue)
 {
     _objectStoreOwner = objectStoreOwner;
     _objectStoreSession = objectStoreOwner ? objectStoreOwner->objectStoreSession()
                                           : std::make_shared<vc::objects::ObjectStoreSession>();
+    if (objectStoreOwner) {
+        _openedVolumes = objectStoreOwner->_openedVolumes;
+    } else {
+        using namespace vc3d::settings;
+        const QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+        const auto gib = settings.value(perf::RAM_CACHE_SIZE_GB, perf::RAM_CACHE_SIZE_GB_DEFAULT).toULongLong();
+        const auto gpuGib = settings.value(perf::RENDER_CUDA, perf::RENDER_CUDA_DEFAULT).toBool()
+            ? settings.value(perf::RENDER_GPU_CACHE_GB, perf::RENDER_GPU_CACHE_GB_DEFAULT).toULongLong()
+            : 0;
+        _openedVolumes = std::make_shared<OpenedVolumes>(cacheBytes ? cacheBytes : std::size_t(gib) << 30,
+                                                         std::size_t(gpuGib) << 30);
+    }
     // Open Data surfaces are fetched from the catalog on the first read reaching them.
     if (!objectStoreOwner)
         _objectStoreSession->setGeometryFetcher(vc::objects::kCatalogMetaKey, vc::objects::fetchCatalogSurface);
@@ -269,14 +282,24 @@ CState::~CState()
     }
 }
 
-QString CState::storeAuthor()
+namespace {
+QString configuredAuthor()
 {
     const QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
-    auto author = settings.value(vc3d::settings::viewer::USERNAME).toString().trimmed();
-    if (author.isEmpty() || author == QStringLiteral("anon"))
+    return settings.value(vc3d::settings::viewer::USERNAME).toString().trimmed();
+}
+bool namesAuthor(const QString& author) { return !author.isEmpty() && author != QStringLiteral("anon"); }
+}
+
+QString CState::storeAuthor()
+{
+    auto author = configuredAuthor();
+    if (!namesAuthor(author))
         author = qEnvironmentVariable("USER", qEnvironmentVariable("USERNAME", "vc3d"));
     return author;
 }
+
+bool CState::storeAuthorConfigured() { return namesAuthor(configuredAuthor()); }
 
 vc::objects::OpenOptions CState::storeOpenOptions(const QString& author, bool readOnly)
 {
@@ -291,6 +314,17 @@ std::optional<vc::objects::AttachmentIdentity> CState::storeReference(const std:
     if (_objectStoreOwner) return _objectStoreOwner->storeReference(id);
     const auto found = _storeReferences.find(id);
     return found == _storeReferences.end() ? std::nullopt : std::optional(found->second);
+}
+std::optional<vc::objects::AttachmentIdentity> CState::pointCollectionStore(uint64_t collectionId) const
+{
+    return _pointCollectionSync ? _pointCollectionSync->storeOf(collectionId) : std::nullopt;
+}
+std::optional<std::string> CState::storeReferenceId(const vc::objects::AttachmentIdentity& attachment) const
+{
+    if (_objectStoreOwner) return _objectStoreOwner->storeReferenceId(attachment);
+    for (const auto& [id, store] : _storeReferences)
+        if (store == attachment) return id;
+    return std::nullopt;
 }
 std::optional<vc::objects::AttachmentIdentity> CState::sampleStore() const
 {
@@ -345,8 +379,7 @@ vc::objects::AttachmentIdentity CState::attachStore(const std::filesystem::path&
 void CState::detachStore(const vc::objects::AttachmentIdentity& attachment)
 {
     if (_objectStoreOwner) { _objectStoreOwner->detachStore(attachment); return; }
-    for (const auto& [id, store] : _storeReferences)
-        if (store == attachment) { const auto copy = id; detachStoreReference(copy); return; }
+    if (const auto id = storeReferenceId(attachment)) detachStoreReference(*id);
 }
 void CState::detachStoreReference(const std::string& id)
 {
@@ -355,9 +388,9 @@ void CState::detachStoreReference(const std::string& id)
     auto data = _vpkg->document().data();
     auto& stores = data["stores"];
     if (stores.size() <= 1) throw std::runtime_error("A project must reference at least one store");
-    if (prepareStoreSwitch && !prepareStoreSwitch()) throw std::runtime_error("Store switch cancelled: pending edits could not be saved");
+    if (prepareStoreSwitch && !prepareStoreSwitch()) throw StoreSwitchRefused("Store switch cancelled: pending edits could not be saved");
     if (_pointCollectionSync && !_pointCollectionSync->flush())
-        throw std::runtime_error("Pending point-collection edits could not be saved");
+        throw StoreSwitchRefused("Pending point-collection edits could not be saved");
     stores.erase(std::remove_if(stores.begin(), stores.end(), [&](const auto& entry) { return entry.at("id") == id; }), stores.end());
     for (auto& selection : data["selections"]) if (selection == id) selection = nullptr;
     if (data.contains("open_data") && data["open_data"]["store"] == id) data.erase("open_data");
@@ -378,9 +411,9 @@ void CState::replaceStoreReference(const std::string& id, const std::filesystem:
     auto data = _vpkg->document().data();
     auto entry = std::find_if(data["stores"].begin(), data["stores"].end(), [&](const auto& e) { return e.at("id") == id; });
     if (entry == data["stores"].end()) throw std::invalid_argument("Unknown store reference");
-    if (prepareStoreSwitch && !prepareStoreSwitch()) throw std::runtime_error("Store switch cancelled");
+    if (prepareStoreSwitch && !prepareStoreSwitch()) throw StoreSwitchRefused("Store switch cancelled");
     if (_pointCollectionSync && !_pointCollectionSync->flush())
-        throw std::runtime_error("Pending point-collection edits could not be saved");
+        throw StoreSwitchRefused("Pending point-collection edits could not be saved");
     const auto existing = attachedAt(path);
     if (existing && existing != storeReference(id)) throw std::invalid_argument("Store is already attached");
     const auto replacement = prepareStore(path, storeAuthor(), entry->value("read_only", false));
@@ -415,8 +448,7 @@ void CState::setStoreFor(const std::string& kind, const std::optional<vc::object
 {
     if (_objectStoreOwner) { _objectStoreOwner->setStoreFor(kind, store); return; }
     if (!store) { setStoreSelection(kind, {}); return; }
-    for (const auto& [id, attachment] : _storeReferences)
-        if (attachment == store) { setStoreSelection(kind, id); return; }
+    if (const auto id = storeReferenceId(*store)) { setStoreSelection(kind, *id); return; }
     throw std::invalid_argument("Store is not attached to this project");
 }
 void CState::setStoreSelection(const std::string& kind, const std::string& id)
@@ -427,9 +459,9 @@ void CState::setStoreSelection(const std::string& kind, const std::string& id)
     if (!data["selections"].contains(kind)) throw std::invalid_argument("Unknown object kind");
     const nlohmann::json selected = id.empty() ? nlohmann::json(nullptr) : nlohmann::json(id);
     if (data["selections"][kind] == selected) return;
-    if (prepareStoreSwitch && !prepareStoreSwitch()) throw std::runtime_error("Store switch cancelled: pending edits could not be saved");
+    if (prepareStoreSwitch && !prepareStoreSwitch()) throw StoreSwitchRefused("Store switch cancelled: pending edits could not be saved");
     if (_pointCollectionSync && !_pointCollectionSync->flush())
-        throw std::runtime_error("Pending point-collection edits could not be saved");
+        throw StoreSwitchRefused("Pending point-collection edits could not be saved");
     data["selections"][kind] = selected;
     _vpkg->document().replace(std::move(data));
     emit storeRoutesChanged();

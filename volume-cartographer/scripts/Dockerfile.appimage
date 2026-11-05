@@ -20,7 +20,8 @@
 #     -f volume-cartographer/scripts/Dockerfile.appimage \
 #     --build-arg BUILDER_IMAGE=vc-builder:dev .
 
-ARG BUILDER_IMAGE=ghcr.io/scrollprize/villa/volume-cartographer:builder-ubuntu-26.04
+# Published builder with deps recipe hash 675836fc3d478d17 (also used by PR CI).
+ARG BUILDER_IMAGE=ghcr.io/scrollprize/villa/volume-cartographer@sha256:1bebf104edbd6c290ddbaf8036c919635259f3722e8eddb31340b240baf1ed68
 
 FROM ${BUILDER_IMAGE} AS build
 ARG DEBIAN_FRONTEND=noninteractive
@@ -50,9 +51,15 @@ COPY vc_reader/ /src/vc_reader/
 COPY vesuvius/src/vc3d_fiber_format/ /src/vesuvius/src/vc3d_fiber_format/
 WORKDIR /src/volume-cartographer
 
-RUN cmake --preset ci-release-gcc \
+# The workflow restores/saves this mount separately from Docker's layer cache,
+# so changed sources can still reuse unchanged translation units.
+ENV CCACHE_DIR=/var/cache/ccache CCACHE_MAXSIZE=3G CCACHE_COMPILERCHECK=content
+RUN --mount=type=cache,target=/var/cache/ccache \
+    ccache --zero-stats \
+ && cmake --preset ci-release-gcc -DVC_USE_CCACHE=ON \
       -DVC_GIT_SHA1="${VC_GIT_SHA1}" -DVC_GIT_COMMIT_DATE="${VC_GIT_COMMIT_DATE}" \
- && cmake --build --preset ci-release-gcc
+ && ninja -C build/ci-release-gcc \
+ && ccache --show-stats
 
 ENV QMAKE=/usr/bin/qmake6
 RUN GIT_SHA1="${VC_GIT_SHA1}" GIT_COMMIT_DATE="${VC_GIT_COMMIT_DATE}" \

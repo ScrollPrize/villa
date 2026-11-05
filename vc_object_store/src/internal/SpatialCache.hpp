@@ -1,7 +1,7 @@
 #pragma once
 #include "internal/Database.hpp"
 #include <numeric>
-#include "spatial/BoundsIndex.hpp"
+#include <vc_object_store/geometry/BoundsIndex.hpp>
 
 namespace vc::objects::detail {
 inline constexpr const char* regionColumns =

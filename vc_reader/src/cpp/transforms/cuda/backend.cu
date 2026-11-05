@@ -7,10 +7,6 @@ namespace vcr::transforms::cuda {
 // requires a CUDA overload (and its definition at link time).
 template<class T> concept Supported = requires(const T& t, Sample& s, const Parameters& p, Session& session) { apply_cuda(t,s,p,session); };
 
-bool available() {
-    int count = 0;
-    return cudaGetDeviceCount(&count) == cudaSuccess && count > 0;
-}
 void validate_program(const std::vector<Op>& ops) {
     for (const auto& op : ops) std::visit([](const auto& t) {
         using T = std::decay_t<decltype(t)>;

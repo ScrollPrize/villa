@@ -19,7 +19,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest]
+        os: [blacksmith-2vcpu-ubuntu-2404]
         python: ["3.11", "3.14"]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 10
@@ -34,7 +34,7 @@ jobs:
         run: python -m pytest -q gpu_manager/tests --durations=10 --basetemp=/tmp/vgm-tests
 
   torch-integration:
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 10
     env:
       CUDA_VISIBLE_DEVICES: ""

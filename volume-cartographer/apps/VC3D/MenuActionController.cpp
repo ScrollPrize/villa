@@ -1,6 +1,10 @@
 #include "MenuActionController.hpp"
+#include <vc_reader/zarr.hpp>
+#include "OpenedVolumes.hpp"
 #include <vc_object_store/Uuid.hpp>
 
+#include "ProjectResources.hpp"
+#include "StoreImportController.hpp"
 #include "VolumeAttachmentController.hpp"
 #include "VCSettings.hpp"
 #include "UnifiedBrowserDialog.hpp"
@@ -9,7 +13,6 @@
 #include "OpenDataNormalGrids.hpp"
 #include "OpenDataSampleProject.hpp"
 #include "ProjectCreationDefaults.hpp"
-#include "OpenDataVolumePrefill.hpp"
 #include "CWindow.hpp"
 #include "SurfaceCatalog.hpp"
 #include "SurfacePanelController.hpp"
@@ -22,17 +25,16 @@
 #include "segmentation/SegmentationModule.hpp"
 #include "ui_VCMain.h"
 #include "Keybinds.hpp"
-#include "FileWatcherService.hpp"
 #include "LineAnnotationController.hpp"
 #include "LineAnnotationFiberNaming.hpp"
 
 #include "vc/core/types/Volume.hpp"
+#include "vc/core/types/ProjectCreation.hpp"
 #include "vc/core/types/VolumePkg.hpp"
 #include "vc/core/Version.hpp"
 #include "vc/core/util/Logging.hpp"
 #include "vc_object_store/objects/Hub.hpp"
 #include "vc/core/util/LoadJson.hpp"
-#include "vc/core/util/RemoteMetadataCache.hpp"
 #include <vc_object_store/objects/UmbilicusFile.hpp>
 #include "BindCoordinatesPrompt.hpp"
 #include <vc_object_store/objects/GeometryCoordinates.hpp>
@@ -89,7 +91,7 @@
 #include <QHBoxLayout>
 #include <QPushButton>
 
-#include "utils/Json.hpp"
+#include <nlohmann/json.hpp>
 
 #include <algorithm>
 #include <fstream>
@@ -101,8 +103,6 @@
 namespace
 {
 constexpr int kMaxStoredRemoteUrls = 10;
-bool isAuthError(const QString& msg);
-
 } // namespace
 
 // Kept local so the QtConcurrent result type does not leak into the header.
@@ -217,13 +217,7 @@ void MenuActionController::populateMenus(QMenuBar* menuBar)
     _rotateSurfaceAct = new QAction(QObject::tr("Rotate"), this);
     connect(_rotateSurfaceAct, &QAction::triggered, this, &MenuActionController::beginRotateSurfaceTransform);
 
-    _mergeSurfacesAct = new QAction(QObject::tr("Merge Surfaces..."), this);
-    connect(_mergeSurfacesAct, &QAction::triggered,
-            this, &MenuActionController::mergeSurfacesFromMenuRequested);
 
-    _mergePatchAct = new QAction(QObject::tr("Patch Surface..."), this);
-    connect(_mergePatchAct, &QAction::triggered,
-            this, &MenuActionController::mergePatchFromMenuRequested);
 
     _growTrackPatchesAct = new QAction(QObject::tr("Grow Track Patches..."), this);
     connect(_growTrackPatchesAct, &QAction::triggered,
@@ -282,8 +276,6 @@ void MenuActionController::populateMenus(QMenuBar* menuBar)
     _actionsMenu->addAction(_drawBBoxAct);
     _actionsMenu->addSeparator();
     _actionsMenu->addSeparator();
-    _actionsMenu->addAction(_mergeSurfacesAct);
-    _actionsMenu->addAction(_mergePatchAct);
     _actionsMenu->addAction(_growTrackPatchesAct);
     _actionsMenu->addSeparator();
     _transformsMenu = new QMenu(QObject::tr("&Transforms"), _actionsMenu);
@@ -485,7 +477,7 @@ void MenuActionController::showAttachRemoteZarrDialog(const QString& initialUrl)
     if (url.trimmed().isEmpty()) {
         return;
     }
-    if (!vc::project::isLocationRemote(url.toStdString())) {
+    if (!vcr::zarr::isRemote(url.toStdString())) {
         QMessageBox::warning(_window, QObject::tr("Attach failed"),
             QObject::tr("Select a remote volume, or use Attach Volume for a local one."));
         return;
@@ -526,11 +518,13 @@ void MenuActionController::showOpenDataCatalog()
     dialog->setRefreshSampleHandler([this](const vcr::catalog::OpenDataSample& sample) -> QString {
         if (!_window || !_window->_state) return tr("No viewer state.");
         QApplication::setOverrideCursor(Qt::WaitCursor);
-        // Volume metadata is cached as immutable; a refresh is how a sample
+        // Volume metadata is kept as immutable; a refresh is how a sample
         // republished in place is picked up on its next open.
+        vcr::zarr::OpenOptions options;
+        options.cacheDirs = {vc::settings::remoteCachePath().string()};
         for (const auto& volume : sample.volumes)
             for (const auto& artifact : volume.artifacts)
-                vc::core::util::remoteMetadataCache().invalidate(artifact.url());
+                vcr::zarr::forgetKeptMetadata(artifact.url(), options);
         try {
             auto& state = *_window->_state;
             const auto project = state.sampleStore();
@@ -569,7 +563,7 @@ void MenuActionController::resetOpenDataProject()
     auto original = _window->_state->vpkg();
     if (!original || !original->writable() || _openDataSampleOpenInFlight) return;
     const auto sampleId = vc3d::opendata::openDataProjectSample(*original);
-    const auto catalog = vc3d::opendata::cachedCatalog();
+    const auto catalog = vcr::catalog::cachedManifest(vcr::catalog::catalogCacheFile(std::string(vcr::catalog::kDefaultManifestUrl)));
     const auto* sample = sampleId && catalog ? catalog->findSample(*sampleId) : nullptr;
     if (!sample) {
         QMessageBox::warning(_window, tr("Reset to Open Data"), tr("The catalog no longer lists this sample."));
@@ -603,7 +597,7 @@ void MenuActionController::resetOpenDataProject()
             auto data = result.package->document().data();
             for (const auto& store : original->document().data().at("stores")) data["stores"].push_back(store);
             original->document().replace(std::move(data));
-            auto package = VolumePkg::open(original->path(), {.catalog = vc3d::opendata::cachedCatalog()});
+            auto package = VolumePkg::open(original->path(), {.catalog = vcr::catalog::cachedManifest(vcr::catalog::catalogCacheFile(std::string(vcr::catalog::kDefaultManifestUrl)))});
             _window->CloseVolume();
             _window->_state->setVpkg(std::move(package));
             _window->refreshCurrentVolumePackageUi();
@@ -672,6 +666,8 @@ bool MenuActionController::openOpenDataSample(const vcr::catalog::OpenDataSample
     // Do not interleave CloseVolume/setVpkg from overlapping opens. Only this
     // interactive wrapper waits through a nested event loop.
     if (_openDataSampleOpenInFlight) {
+        QMessageBox::warning(_window, QObject::tr("Open Data Sample"),
+            QObject::tr("Another Open Data sample is still opening."));
         return false;
     }
 
@@ -737,6 +733,9 @@ void MenuActionController::beginOpenDataSampleOpenTask(
     // Prepare edits now and check again before switching. Keep the old project
     // open while the sample is prepared, including when preparation fails.
     if (_window && _window->_state->prepareStoreSwitch && !_window->_state->prepareStoreSwitch()) {
+        if (interactive)
+            QMessageBox::warning(_window, QObject::tr("Open Data Sample"),
+                QObject::tr("Pending edits prevented the project switch."));
         if (onFinished) QMetaObject::invokeMethod(this, [onFinished = std::move(onFinished)]() {
             OpenDataSampleOpenOutcome outcome;
             outcome.success = false;
@@ -768,6 +767,12 @@ void MenuActionController::beginOpenDataSampleOpenTask(
         }
     }
     if (!setupError.isEmpty()) {
+        // The worker's failures are reported by finishOpenDataSampleOpen; these
+        // happen before it starts, and the interactive caller only sees a bool.
+        if (interactive)
+            QMessageBox::warning(_window, QObject::tr("Open Data Sample"),
+                QObject::tr("Could not create the project for %1:\n\n%2")
+                    .arg(QString::fromStdString(sample.id), setupError));
         if (onFinished) {
             QMetaObject::invokeMethod(this, [onFinished = std::move(onFinished), setupError]() {
                 OpenDataSampleOpenOutcome outcome;
@@ -889,7 +894,7 @@ void MenuActionController::beginOpenDataSampleOpenTask(
                         session, projectPath, attachment, sampleCopy, cacheDir.toStdString(),
                         &taskResult.result, progressCallback, hasSelection ? &selectionCopy : nullptr);
                 } else {
-                    taskResult.pkg = VolumePkg::open(projectPath, {.catalog = vc3d::opendata::cachedCatalog()});
+                    taskResult.pkg = VolumePkg::open(projectPath, {.catalog = vcr::catalog::cachedManifest(vcr::catalog::catalogCacheFile(std::string(vcr::catalog::kDefaultManifestUrl)))});
                 }
             } catch (const std::exception& e) {
                 taskResult.error = QString::fromUtf8(e.what());
@@ -962,12 +967,6 @@ void MenuActionController::finishOpenDataSampleOpen(OpenDataOpenTaskResult task,
         cancelOpenDataVolumePrefills();
         _window->CloseVolume();
         _window->_state->setVpkg(pkg);
-        // CloseVolume() stopped all file watches; the ordinary open flow
-        // restarts them after its own setVpkg, and the sample flow gets the
-        // same treatment — previously it left the watcher stopped entirely.
-        if (_window->_fileWatcher) {
-            _window->_fileWatcher->startWatching();
-        }
     }
     if (!pkg->path().empty()) {
         updateRecentVolpkgList(QString::fromStdString(pkg->path().string()));
@@ -1013,64 +1012,50 @@ void MenuActionController::finishOpenDataSampleOpen(OpenDataOpenTaskResult task,
 
 void MenuActionController::startOpenDataVolumePrefill(const std::shared_ptr<Volume>& volume)
 {
+    constexpr int physicalPrefillLevel = 5;
     const int logicalPrefillLevel = volume
-        ? vc3d::opendata::kOpenDataVolumePrefillLevel - volume->baseScaleLevel()
+        ? physicalPrefillLevel - volume->baseScaleLevel()
         : -1;
-    if (!volume || !volume->isRemote() || logicalPrefillLevel < 0 ||
-        !volume->hasScaleLevel(logicalPrefillLevel)) {
+    if (!volume || !volume->isRemote() || logicalPrefillLevel < 0) {
         return;
     }
-    if (volume->remotePersistentCachePath().empty()) {
-        return;
+    try {
+        if (!_window->_state->openedVolumes()->pyramid(*volume).has(logicalPrefillLevel))
+            return;
+    } catch (const std::exception&) {
+        return;  // the volume's viewers report what cannot be opened
     }
-    if (vc3d::opendata::openDataVolumePrefillMarkerMatches(
-            volume->remotePersistentCachePath(),
-            *volume,
-            logicalPrefillLevel)) {
-        Logger()->info(
-            "Open-data volume {} physical level {} (logical {}) already prefetched",
-            volume->id(),
-            vc3d::opendata::kOpenDataVolumePrefillLevel,
-            logicalPrefillLevel);
+    if (volume->remoteCacheRoot().empty()) {
         return;
     }
 
     auto cancelFlag = std::make_shared<std::atomic<bool>>(false);
     _openDataPrefillCancelFlag = cancelFlag;
-    auto* watcher = new QFutureWatcher<vc3d::opendata::OpenDataVolumePrefillResult>(this);
+    auto* watcher = new QFutureWatcher<VolumePrefillResult>(this);
     _openDataPrefillWatchers.push_back(watcher);
     _openDataPrefillCancelFlags.push_back(cancelFlag);
 
     const QString volumeId = QString::fromStdString(volume->id());
-    if (_window) {
-        _window->showStatusBarMessage(
-            QObject::tr("Caching remote volume %1 physical /%2 (logical /%3) in background...")
-                .arg(volumeId)
-                .arg(vc3d::opendata::kOpenDataVolumePrefillLevel)
-                .arg(logicalPrefillLevel),
-            7000);
-    }
-
     connect(watcher,
-            &QFutureWatcher<vc3d::opendata::OpenDataVolumePrefillResult>::finished,
+            &QFutureWatcher<VolumePrefillResult>::finished,
             this,
             [this, watcher, cancelFlag, volumeId]() {
-                vc3d::opendata::OpenDataVolumePrefillResult result;
+                VolumePrefillResult result;
                 // A canceled QFuture has no stored result. Check cancellation
                 // before result() when a stale finished signal arrives.
                 if (watcher->isCanceled()) {
-                    result.status = vc3d::opendata::OpenDataVolumePrefillResult::Status::Cancelled;
+                    result.status = VolumePrefillResult::Status::Cancelled;
                     result.volumeId = volumeId.toStdString();
                     result.message = "cancelled before completion";
                 } else {
                     try {
                         result = watcher->result();
                     } catch (const std::exception& e) {
-                        result.status = vc3d::opendata::OpenDataVolumePrefillResult::Status::Failed;
+                        result.status = VolumePrefillResult::Status::Failed;
                         result.volumeId = volumeId.toStdString();
                         result.message = e.what();
                     } catch (...) {
-                        result.status = vc3d::opendata::OpenDataVolumePrefillResult::Status::Failed;
+                        result.status = VolumePrefillResult::Status::Failed;
                         result.volumeId = volumeId.toStdString();
                         result.message = "unknown error";
                     }
@@ -1095,23 +1080,26 @@ void MenuActionController::startOpenDataVolumePrefill(const std::shared_ptr<Volu
                     return;
                 }
 
-                using Status = vc3d::opendata::OpenDataVolumePrefillResult::Status;
+                using Status = VolumePrefillResult::Status;
                 switch (result.status) {
                 case Status::Completed:
-                    _window->showStatusBarMessage(
-                        QObject::tr("Cached remote volume %1 physical /%2 (logical /%3): %4 chunks.")
-                            .arg(QString::fromStdString(result.volumeId))
-                            .arg(result.physicalLevel)
-                            .arg(result.level)
-                            .arg(result.totalChunks),
-                        7000);
+                    if (result.fetchedChunks > 0) {
+                        _window->showStatusBarMessage(
+                            QObject::tr("Cached remote volume %1 physical /%2 (logical /%3): %4 chunks fetched.")
+                                .arg(QString::fromStdString(result.volumeId))
+                                .arg(result.physicalLevel)
+                                .arg(result.level)
+                                .arg(result.fetchedChunks),
+                            7000);
+                    }
                     Logger()->info(
-                        "Open-data volume prefill completed for {} level {}: {} chunks (data={}, empty={})",
+                        "Open-data volume prefill completed for {} level {}: {} chunks (data={}, empty={}, fetched={})",
                         result.volumeId,
                         result.level,
                         result.totalChunks,
                         result.dataChunks,
-                        result.emptyChunks);
+                        result.emptyChunks,
+                        result.fetchedChunks);
                     break;
                 case Status::Failed:
                     _window->showStatusBarMessage(
@@ -1134,21 +1122,26 @@ void MenuActionController::startOpenDataVolumePrefill(const std::shared_ptr<Volu
                         result.resolvedChunks,
                         result.totalChunks);
                     break;
-                case Status::Skipped:
-                    Logger()->info(
-                        "Open-data volume prefill skipped for {} level {}: {}",
-                        result.volumeId,
-                        result.level,
-                        result.message);
-                    break;
                 }
             });
 
     watcher->setFuture(QtConcurrent::run([volume, cancelFlag, logicalPrefillLevel]() {
-        return vc3d::opendata::prefillOpenDataVolumeLevel(
-            volume,
-            logicalPrefillLevel,
-            cancelFlag.get());
+        VolumePrefillResult result;
+        result.volumeId = volume->id();
+        result.level = logicalPrefillLevel;
+        result.physicalLevel = volume->baseScaleLevel() + logicalPrefillLevel;
+        try {
+            // Populate disk only; opening without a memory cache keeps the level
+            // from displacing chunks the viewers are using.
+            auto opened = vcr::zarr::openPyramidLevel(
+                volume->sourceLocation(), result.physicalLevel, volume->sourceOpenOptions());
+            static_cast<vcr::cache::PrefillResult&>(result) =
+                vcr::cache::prefill(*opened.array, cancelFlag.get());
+        } catch (const std::exception& e) {
+            result.status = VolumePrefillResult::Status::Failed;
+            result.message = e.what();
+        }
+        return result;
     }));
 }
 
@@ -1227,29 +1220,6 @@ void MenuActionController::attachRemoteZarrUrl(const QString& url)
                 return;
             }
 
-            if (isAuthError(outcome.error)) {
-                QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
-                settings.remove(vc3d::settings::aws::ACCESS_KEY);
-                settings.remove(vc3d::settings::aws::SECRET_KEY);
-                settings.remove(vc3d::settings::aws::SESSION_TOKEN);
-
-                const auto reply = QMessageBox::warning(
-                    self->_window,
-                    QObject::tr("Authentication Error"),
-                    QObject::tr("Failed to attach remote zarr:\n%1\n\n"
-                                "Would you like to enter new AWS credentials and retry?")
-                        .arg(outcome.error),
-                    QMessageBox::Yes | QMessageBox::No);
-                if (reply == QMessageBox::Yes) {
-                    QTimer::singleShot(
-                        0, self, [self, persistedLocator]() {
-                            if (self)
-                                self->attachRemoteZarrUrl(persistedLocator);
-                        });
-                    return;
-                }
-            }
-
             QMessageBox::critical(
                 self->_window,
                 QObject::tr("Attach Remote Zarr Error"),
@@ -1268,15 +1238,6 @@ void MenuActionController::attachRemoteZarrUrl(const QString& url)
 
 namespace
 {
-
-bool isAuthError(const QString& msg)
-{
-    return msg.contains("Access denied", Qt::CaseInsensitive) ||
-           msg.contains("403", Qt::CaseInsensitive) ||
-           msg.contains("401", Qt::CaseInsensitive) ||
-           msg.contains("credential", Qt::CaseInsensitive) ||
-           msg.contains("Forbidden", Qt::CaseInsensitive);
-}
 
 } // namespace
 
@@ -1302,7 +1263,7 @@ void MenuActionController::showSettingsDialog()
                 viewer->setPlaneIntersectionLinesVisible(showPlaneLines);
                 // Re-read viewer settings so changes made in the dialog take effect immediately.
                 viewer->reloadPerfSettings();
-                viewer->renderVisible(true);
+                viewer->renderVisible();
             }
         });
     }
@@ -1319,12 +1280,6 @@ void MenuActionController::showSettingsDialog()
         settings.value(vc3d::settings::viewer::AXIS_OVERLAY_OPACITY,
                        vc3d::settings::viewer::AXIS_OVERLAY_OPACITY_DEFAULT).toInt());
 
-    // Cache budgets are independent per workspace. Re-read them for every live
-    // manager so changes take effect without reopening either workspace.
-    for (auto* manager : ViewerManager::allManagers()) {
-        if (manager)
-            manager->applyViewerCacheSettings();
-    }
     CState::applySurfaceGeometryCacheSettings();
 
     dialog->deleteLater();
@@ -1577,13 +1532,12 @@ void MenuActionController::newProject()
     if (QFileInfo(store).suffix().isEmpty()) store += ".vcobj";
     const auto author = objectStoreAuthor();
     if (author.isEmpty()) return;
-    bool created = false;
     try {
-        if (makeStore) { auto db = vc::objects::ObjectStore::create(store.toStdString(), CState::storeOpenOptions(author, false)); created = true; }
-        else { auto db = vc::objects::ObjectStore::open(store.toStdString(), CState::storeOpenOptions(author, true)); }
-        vc::project::ProjectDocument::create(file.toStdString(), QFileInfo(file).completeBaseName().toStdString(), store.toStdString(), !QFileInfo(store).isWritable());
+        vc::project::createProject(file.toStdString(), QFileInfo(file).completeBaseName().toStdString(),
+            {makeStore ? vc::project::StoreChoice::Mode::New : vc::project::StoreChoice::Mode::Existing,
+             store.toStdString(), !QFileInfo(store).isWritable()},
+            CState::storeOpenOptions(author, false));
     } catch (const std::exception& error) {
-        if (created) { std::error_code ignored; std::filesystem::remove(store.toStdString(), ignored); }
         QMessageBox::warning(_window, tr("New Project failed"), QString::fromUtf8(error.what()));
         return;
     }
@@ -1638,12 +1592,6 @@ QString MenuActionController::promptLocation(const QString& title,
     dlg.setLocalNameFilters(localFilters);
     dlg.setAcceptsFiles(acceptFiles);
     dlg.setAcceptsDirs(acceptDirs);
-    dlg.setAuthResolver([this](const QString& url, vc::HttpAuth* out, QString* err) {
-        auto* attachment = _window
-            ? _window->_volumeAttachmentController.get()
-            : nullptr;
-        return attachment && attachment->resolveRemoteAuth(url, out, err);
-    });
     dlg.setStartUri(defaultDir, startAtFile);
     if (dlg.exec() != QDialog::Accepted) return {};
     QString uri = dlg.selectedUri();
@@ -1737,28 +1685,11 @@ void MenuActionController::attachNormalGrid()
     _window->refreshCurrentVolumePackageUi();
 }
 
-namespace {
-// The attached volume an umbilicus stamp names by store directory name, so the
-// stamp can be checked against it. Remote volumes are skipped: the check needs
-// local shape metadata.
-std::shared_ptr<Volume> attachedVolumeByStoreName(const VolumePkg& pkg, const std::string& storeName)
-{
-    const std::string wanted = std::filesystem::path(storeName).filename().string();
-    if (wanted.empty()) return nullptr;
-    for (const std::string& id : pkg.volumeIDs()) {
-        const std::shared_ptr<Volume> volume = pkg.volume(id);
-        if (volume && !volume->isRemote() && volume->path().filename().string() == wanted) return volume;
-    }
-    return nullptr;
-}
-}
-
 void MenuActionController::importUmbilicus()
 {
     auto& state = *_window->_state;
-    const auto attachment = state.storeFor("umbilicus");
     const auto volume = state.currentVolume();
-    if (!attachment || !volume || !state.vpkg()) {
+    if (!state.storeFor("umbilicus") || !volume || !state.vpkg()) {
         QMessageBox::information(_window, QObject::tr("Import Umbilicus"),
             QObject::tr("Open a project and a volume first."));
         return;
@@ -1769,27 +1700,15 @@ void MenuActionController::importUmbilicus()
         QObject::tr("Umbilicus (*.json *.txt *.csv)"));
     if (file.isEmpty()) return;
 
-    vc::objects::UmbilicusFile umbilicus;
+    vc3d::UmbilicusImportPlan plan;
     try {
-        umbilicus = vc::objects::readUmbilicusFile(std::filesystem::path(file.toStdString()));
+        plan = vc3d::planUmbilicusImport(state, std::filesystem::path(file.toStdString()));
     } catch (const std::exception& e) {
         QMessageBox::warning(_window, QObject::tr("Import failed"),
             QObject::tr("%1 is not a valid umbilicus file:\n\n%2").arg(file, QString::fromUtf8(e.what())));
         return;
     }
-
-    // The store decides the frame: the file's stamp against the volume the
-    // umbilicus is bound to, and against an attached volume the stamp names.
-    const auto grid = [](const Volume& v) {
-        const double voxelSize = v.voxelSize();
-        return vc::objects::UmbilicusTargetGrid{
-            {double(v.sliceWidth()), double(v.sliceHeight()), double(v.numSlices())},
-            std::isfinite(voxelSize) && voxelSize > 0 ? std::optional(voxelSize) : std::nullopt};
-    };
-    std::optional<vc::objects::UmbilicusTargetGrid> named;
-    if (umbilicus.volume)
-        if (const auto volumeNamed = attachedVolumeByStoreName(*state.vpkg(), *umbilicus.volume)) named = grid(*volumeNamed);
-    const auto binding = vc::objects::umbilicusBinding(umbilicus, grid(*volume), named);
+    const auto& binding = plan.binding;
     if (binding.refusal) {
         QMessageBox::warning(_window, QObject::tr("Import failed"),
             QObject::tr("%1 does not fit volume %2: %3")
@@ -1810,26 +1729,14 @@ void MenuActionController::importUmbilicus()
         storedUnitsPerVoxel = *entered;
     }
 
-    // The umbilicus belongs to the open volume's store volume: units per voxel
-    // of the open volume are units per voxel of that one at its scale.
-    const auto target = state.annotationVolume().value_or(vc::project::AnnotationVolume{});
-    vc::objects::RevisionSelection replaced;
-    state.objectStoreSession()->read(*attachment, [&](const auto& db, const auto& txn, const auto&) {
-        replaced = vc::objects::volumeUmbilicusRevisions(db, txn, target.volume);
-    });
-    if (!replaced.empty() &&
+    if (plan.replaces &&
         QMessageBox::question(_window, QObject::tr("Import Umbilicus"),
-            QObject::tr("Volume %1 already has an umbilicus. Replace it?").arg(QString::fromStdString(target.volume)))
+            QObject::tr("Volume %1 already has an umbilicus. Replace it?").arg(QString::fromStdString(plan.target.volume)))
             != QMessageBox::Yes)
         return;
 
     try {
-        vc::objects::importVolumeUmbilicus(*state.objectStoreSession(), *attachment, target.volume, umbilicus,
-            storedUnitsPerVoxel * target.scale, QFileInfo(file).completeBaseName().toStdString(),
-            {{"tool", "vc3d-import-umbilicus"},
-             {"parameters", {{"file", file.toStdString()}, {"units_per_voxel", storedUnitsPerVoxel},
-                             {"frame", binding.frame.empty() ? std::string("entered") : binding.frame}}},
-             {"sources", nlohmann::json::array()}});
+        vc3d::importUmbilicus(state, plan, storedUnitsPerVoxel);
     } catch (const std::exception& e) {
         QMessageBox::warning(_window, QObject::tr("Import failed"), QString::fromUtf8(e.what()));
         return;
@@ -1841,27 +1748,20 @@ void MenuActionController::importUmbilicus()
 void MenuActionController::removeUmbilicus()
 {
     auto& state = *_window->_state;
-    const auto attachment = state.storeFor("umbilicus");
-    const auto volumeId = state.annotationVolume() ? state.annotationVolume()->volume : std::string{};
-    if (!attachment || volumeId.empty()) {
+    const auto umbilici = vc3d::annotationUmbilici(state);
+    if (!umbilici) {
         QMessageBox::information(_window, QObject::tr("Remove Umbilicus"),
             QObject::tr("Open a project and a volume first."));
         return;
     }
-    vc::objects::RevisionSelection pins;
-    state.objectStoreSession()->read(*attachment, [&](const auto& db, const auto& txn, const auto&) {
-        pins = vc::objects::volumeUmbilicusRevisions(db, txn, volumeId);
-    });
-    if (pins.empty()) {
+    if (umbilici->pins.empty()) {
         QMessageBox::information(_window, QObject::tr("Remove Umbilicus"),
-            QObject::tr("Volume %1 has no umbilicus.").arg(QString::fromStdString(volumeId)));
+            QObject::tr("Volume %1 has no umbilicus.").arg(QString::fromStdString(umbilici->volume)));
         return;
     }
-    state.objectStoreSession()->act(*attachment, pins, [&](auto& db, auto& txn) {
-        for (const auto& [id, revision] : pins) db.retireObject(txn, id);
-    });
+    vc3d::retireUmbilici(state, *umbilici);
     _window->showStatusBarMessage(
-        QObject::tr("Removed the umbilicus of volume %1").arg(QString::fromStdString(volumeId)), 5000);
+        QObject::tr("Removed the umbilicus of volume %1").arg(QString::fromStdString(umbilici->volume)), 5000);
 }
 
 void MenuActionController::attachLasagnaManifest()
@@ -1925,7 +1825,7 @@ void MenuActionController::attachCatalogRepresentation(const vcr::catalog::OpenD
             _window->refreshCurrentVolumePackageUi();
             return;
         }
-        const auto result = vc3d::opendata::attachOpenDataSampleVolumes(*targetPackage, sample, &selection);
+        const auto result = vc3d::opendata::attachOpenDataSampleVolumes(*targetPackage, sample, &selection, vc3d::remoteCachePathFs());
         _window->refreshCurrentVolumePackageUi();
         if (result.failedVolumes)
             reportMessages(tr("Attach incomplete"), result.messages);
@@ -1952,7 +1852,7 @@ void MenuActionController::beginLasagnaManifestAttachment(bool remote)
             promptLocation(QObject::tr("Attach Remote Lasagna Manifest"), QObject::tr("Pick a remote .lasagna.json manifest."), QStringLiteral("s3://"), {QStringLiteral("*.lasagna.json")}, true, false, false);
         if (location.isEmpty())
             return;
-        if (!vc::lasagna::isRemoteLasagnaLocation(location.toStdString())) {
+        if (!vcr::zarr::isRemote(location.toStdString())) {
             QMessageBox::warning(_window, QObject::tr("Attach failed"), QObject::tr("The remote action requires an s3://, http://, https://, or sftp:// manifest."));
             return;
         }
@@ -1972,48 +1872,40 @@ void MenuActionController::beginLasagnaManifestAttachment(bool remote)
         return;
     const bool fiberInference = role == QObject::tr("Fiber inference");
 
+    QString error;
+    const bool started = startLasagnaManifestAttachment(location, fiberInference, [this](const LasagnaManifestOutcome& outcome) {
+        if (!outcome.success)
+            QMessageBox::warning(_window, QObject::tr("Attach Lasagna failed"), outcome.error);
+    }, &error);
+    if (!started)
+        QMessageBox::warning(_window, QObject::tr("Attach Lasagna failed"), error);
+}
+
+bool MenuActionController::startLasagnaManifestAttachment(const QString& location, bool fiberInference,
+                                                          std::function<void(const LasagnaManifestOutcome&)> onFinished,
+                                                          QString* errorMessage)
+{
+    if (!_window || !_window->_state || !_window->_state->vpkg()) {
+        if (errorMessage) *errorMessage = QObject::tr("Open or create a project first.");
+        return false;
+    }
+    if (_lasagnaAttachmentInFlight) {
+        if (errorMessage) *errorMessage = QObject::tr("A Lasagna manifest attachment is already in progress.");
+        return false;
+    }
+    const bool remote = vcr::zarr::isRemote(location.toStdString());
+    // Requests are signed with the environment's AWS credentials where a bucket needs
+    // them (vcr::zarr::resolveAccess); a remote manifest or group needs a cache root.
     vc::lasagna::LasagnaDatasetOpenOptions openOptions;
     bool needsRemoteCache = remote;
-    bool needsRemoteAuth = remote;
-    QString authLocation = location;
     if (!remote) {
         try {
-            const auto localManifest = std::filesystem::path(location.toStdString());
-            const auto parsed = vc::lasagna::LasagnaDatasetManifest::parseFile(localManifest);
-            const auto remoteGroup = std::find_if(parsed.groups.begin(), parsed.groups.end(), [](const auto& group) {
-                return vc::lasagna::isRemoteLasagnaLocation(group.relativeZarrKey);
+            const auto parsed = vc::lasagna::LasagnaDatasetManifest::parseFile(std::filesystem::path(location.toStdString()));
+            needsRemoteCache = std::any_of(parsed.groups.begin(), parsed.groups.end(), [](const auto& group) {
+                return vcr::zarr::isRemote(group.relativeZarrKey);
             });
-            if (remoteGroup != parsed.groups.end()) {
-                needsRemoteCache = true;
-                needsRemoteAuth = true;
-                authLocation = QString::fromStdString(remoteGroup->relativeZarrKey);
-            } else {
-                const auto markerPath = localManifest.parent_path() /
-                    vc::lasagna::kLasagnaRemoteMarker;
-                if (std::filesystem::is_regular_file(markerPath)) {
-                    const auto marker = utils::Json::parse_file(markerPath);
-                    const auto artifactUrl = marker.value(
-                        "artifact_url", std::string{});
-                    if (vc::lasagna::isRemoteLasagnaLocation(artifactUrl)) {
-                        needsRemoteAuth = true;
-                        authLocation = QString::fromStdString(artifactUrl);
-                    }
-                }
-            }
         } catch (...) {
             // The background loader reports manifest parse errors uniformly.
-        }
-    }
-    if (needsRemoteAuth || needsRemoteCache) {
-        auto* attachment = _window->_volumeAttachmentController.get();
-        if (!attachment) {
-            QMessageBox::warning(_window, QObject::tr("Attach failed"), QObject::tr("Remote attachment settings are unavailable."));
-            return;
-        }
-        QString authError;
-        if (!attachment->resolveRemoteAuth(authLocation, &openOptions.remoteAuth, &authError)) {
-            QMessageBox::warning(_window, QObject::tr("Attach failed"), authError);
-            return;
         }
     }
     if (needsRemoteCache) {
@@ -2023,7 +1915,8 @@ void MenuActionController::beginLasagnaManifestAttachment(bool remote)
     const auto targetPackage = _window->_state->vpkg();
     const std::string persistedLocation = location.toStdString();
     auto* watcher = new QFutureWatcher<LasagnaAttachTaskResult>(this);
-    connect(watcher, &QFutureWatcher<LasagnaAttachTaskResult>::finished, this, [this, watcher, targetPackage, persistedLocation, fiberInference]() {
+    connect(watcher, &QFutureWatcher<LasagnaAttachTaskResult>::finished, this,
+            [this, watcher, targetPackage, persistedLocation, fiberInference, onFinished = std::move(onFinished)]() {
         auto task = watcher->result();
         watcher->deleteLater();
         _lasagnaAttachmentInFlight = false;
@@ -2031,30 +1924,39 @@ void MenuActionController::beginLasagnaManifestAttachment(bool remote)
             _attachLasagnaManifestAct->setEnabled(true);
         if (_attachRemoteLasagnaManifestAct)
             _attachRemoteLasagnaManifestAct->setEnabled(true);
-        if (!task.error.isEmpty()) {
-            QMessageBox::warning(_window, QObject::tr("Attach Lasagna failed"), task.error);
-            return;
+        LasagnaManifestOutcome outcome;
+        outcome.location = QString::fromStdString(persistedLocation);
+        outcome.fiberInference = fiberInference;
+        outcome.error = task.error;
+        if (outcome.error.isEmpty() && (!_window || !_window->_state || _window->_state->vpkg() != targetPackage)) {
+            outcome.projectReplaced = true;
+            outcome.error = QObject::tr("The open project changed while the manifest was loading.");
         }
-        if (!_window || !_window->_state || _window->_state->vpkg() != targetPackage) {
-            QMessageBox::warning(_window, QObject::tr("Attach Lasagna failed"), QObject::tr("The open project changed while the manifest was loading."));
-            return;
-        }
-        try {
-            const auto result = targetPackage->attachPreparedLasagnaDataset(
-                persistedLocation, {}, fiberInference, task.volumes);
-            if (result == VolumePkg::AttachLasagnaResult::VolumeIdConflict) {
-                QMessageBox::warning(_window, QObject::tr("Attach Lasagna failed"), QObject::tr("A Lasagna volume conflicts with an existing volume id."));
-                return;
+        if (outcome.error.isEmpty()) {
+            try {
+                const auto result = targetPackage->attachPreparedLasagnaDataset(
+                    persistedLocation, {}, fiberInference, task.volumes);
+                if (result == VolumePkg::AttachLasagnaResult::VolumeIdConflict) {
+                    outcome.error = QObject::tr("A Lasagna volume conflicts with an existing volume id.");
+                } else {
+                    outcome.success = true;
+                    outcome.alreadyAttached = result == VolumePkg::AttachLasagnaResult::AlreadyAttached;
+                    for (const auto& volume : task.volumes)
+                        if (volume.volume) outcome.volumeIds.push_back(QString::fromStdString(volume.volume->id()));
+                    _window->refreshCurrentVolumePackageUi();
+                }
+            } catch (const std::exception& error) {
+                outcome.error = QString::fromUtf8(error.what());
             }
-            _window->refreshCurrentVolumePackageUi();
-        } catch (const std::exception& error) {
-            QMessageBox::warning(_window, QObject::tr("Attach Lasagna failed"), QString::fromUtf8(error.what()));
         }
+        if (onFinished) onFinished(outcome);
     });
 
     _lasagnaAttachmentInFlight = true;
-    _attachLasagnaManifestAct->setEnabled(false);
-    _attachRemoteLasagnaManifestAct->setEnabled(false);
+    if (_attachLasagnaManifestAct)
+        _attachLasagnaManifestAct->setEnabled(false);
+    if (_attachRemoteLasagnaManifestAct)
+        _attachRemoteLasagnaManifestAct->setEnabled(false);
     watcher->setFuture(QtConcurrent::run([persistedLocation, openOptions, fiberInference]() {
         LasagnaAttachTaskResult result;
         try {
@@ -2076,6 +1978,8 @@ void MenuActionController::beginLasagnaManifestAttachment(bool remote)
         }
         return result;
     }));
+    if (errorMessage) errorMessage->clear();
+    return true;
 }
 
 void MenuActionController::detachEntry()
@@ -2128,7 +2032,7 @@ void MenuActionController::detachEntryAt(const QString& loc)
         return;
     }
     bool changed = false;
-    try { changed = pkg->removeEntry(loc.toStdString()); }
+    try { changed = removeEntry(loc); }
     catch (const std::exception& error) {
         QMessageBox::warning(_window, tr("Project save failed"), QString::fromUtf8(error.what()));
         return;
@@ -2136,9 +2040,15 @@ void MenuActionController::detachEntryAt(const QString& loc)
     if (!changed) {
         QMessageBox::warning(_window, QObject::tr("Detach failed"),
             QObject::tr("Could not remove entry (not found)."));
-        return;
     }
+}
+
+bool MenuActionController::removeEntry(const QString& location)
+{
+    auto pkg = _window && _window->_state ? _window->_state->vpkg() : nullptr;
+    if (!pkg || !pkg->removeEntry(location.toStdString())) return false;
     _window->refreshCurrentVolumePackageUi();
+    return true;
 }
 
 QString MenuActionController::objectStoreAuthor()
@@ -2370,7 +2280,6 @@ void MenuActionController::importIntoObjectStore()
 {
     if (!requireProject(QObject::tr("Importing surfaces or fibers"))) return;
     auto& state = *_window->_state;
-    const auto session = state.objectStoreSession();
     const auto volume = state.currentVolume();
 
     QDialog dialog(_window);
@@ -2409,6 +2318,36 @@ void MenuActionController::importIntoObjectStore()
         if (!*tagsEdited) tags->setText(QFileInfo(QDir::cleanPath(text.trimmed())).fileName());
     });
     form->addRow(QObject::tr("Tags:"), tags);
+    // Sources without canonical UUIDs (VC3D tifxyz directories named like
+    // auto_grown_..., PCL collections, older fibers) each get uuid5(namespace, name).
+    // The namespace last used for the folder is offered until the user edits it.
+    const auto namespaceKey = [](const QString& path) {
+        const QFileInfo info(QDir::cleanPath(path.trimmed()));
+        const auto stable = info.canonicalFilePath().isEmpty() ? info.absoluteFilePath() : info.canonicalFilePath();
+        return QString::fromLatin1(vc3d::settings::object_store::IMPORT_UUID_NAMESPACE_PREFIX) +
+            QString::fromLatin1(QUrl::toPercentEncoding(stable));
+    };
+    auto* namespaceRow = new QHBoxLayout;
+    auto* uuidNamespace = new QLineEdit(&dialog);
+    uuidNamespace->setPlaceholderText(QObject::tr("optional; needed for sources without canonical UUIDs"));
+    uuidNamespace->setToolTip(QObject::tr("A UUID naming this dataset. Sources whose UUID is missing or not "
+                                          "canonical get one derived from it and their name, so importing the "
+                                          "same files with the same namespace always yields the same objects."));
+    auto namespaceEdited = std::make_shared<bool>(false);
+    QObject::connect(uuidNamespace, &QLineEdit::textEdited, &dialog, [namespaceEdited] { *namespaceEdited = true; });
+    auto* newNamespace = new QPushButton(QObject::tr("New"), &dialog);
+    QObject::connect(newNamespace, &QPushButton::clicked, &dialog, [uuidNamespace, namespaceEdited] {
+        *namespaceEdited = true;
+        uuidNamespace->setText(QString::fromStdString(vc::objects::util::newUuid()));
+    });
+    QObject::connect(folder, &QLineEdit::textChanged, &dialog, [uuidNamespace, namespaceEdited, namespaceKey](const QString& text) {
+        if (*namespaceEdited) return;
+        const QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+        uuidNamespace->setText(settings.value(namespaceKey(text)).toString());
+    });
+    namespaceRow->addWidget(uuidNamespace);
+    namespaceRow->addWidget(newNamespace);
+    form->addRow(QObject::tr("UUID namespace:"), namespaceRow);
     auto* bind = new QCheckBox(volume
         ? QObject::tr("Bind to the active volume (%1)").arg(QString::fromStdString(volume->id()))
         : QObject::tr("Bind to the active volume (none open: imports stay unbound)"), &dialog);
@@ -2433,6 +2372,10 @@ void MenuActionController::importIntoObjectStore()
         const double value = scale->text().toDouble(&valid);
         if (!QFileInfo(folder->text().trimmed()).isDir())
             QMessageBox::warning(&dialog, dialog.windowTitle(), QObject::tr("Choose an existing folder."));
+        else if (const auto text = uuidNamespace->text().trimmed();
+                 !text.isEmpty() && !vc::objects::util::isUuid(text.toStdString()))
+            QMessageBox::warning(&dialog, dialog.windowTitle(),
+                QObject::tr("The UUID namespace must be a UUID (xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx); use New for a fresh one."));
         else if (bind->isChecked() && (!valid || !(value > 0) || !std::isfinite(value)))
             QMessageBox::warning(&dialog, dialog.windowTitle(), QObject::tr("Enter a positive finite coordinate scale."));
         else dialog.accept();
@@ -2441,22 +2384,31 @@ void MenuActionController::importIntoObjectStore()
     if (dialog.exec() != QDialog::Accepted) return;
 
     const auto kindName = kind->currentData().toString().toStdString();
-    // Into the store objects of the kind are kept in.
-    const auto attachment = state.storeFor(kindName);
-    if (!attachment || !session->writable(*attachment)) {
-        QMessageBox::warning(_window, QObject::tr("Import from Folder"),
-            QObject::tr("The store %1 are kept in is read-only.")
-                .arg(kindName == "surface" ? QObject::tr("surfaces") : QObject::tr("fibers")));
-        return;
-    }
-    const std::filesystem::path source = folder->text().trimmed().toStdString();
-    const auto coordinates = bind->isChecked()
-        ? vc::objects::volumeCoordinates(state.annotationVolume()->volume,
-                                         scale->text().toDouble() * state.annotationVolume()->scale).dump()
-        : std::string("{}");
+    StoreImportParams params;
+    params.kind = kindName;
+    params.source = folder->text().trimmed().toStdString();
     std::vector<std::string> tagNames;
     for (const auto& tag : tags->text().split(QLatin1Char(','), Qt::SkipEmptyParts))
         if (const auto name = tag.trimmed(); !name.isEmpty()) tagNames.push_back(name.toStdString());
+    params.tags = std::move(tagNames);
+    if (bind->isChecked()) params.bindScale = scale->text().toDouble();
+    if (const auto text = uuidNamespace->text().trimmed(); !text.isEmpty()) params.uuidNamespace = text.toStdString();
+    // Into the store objects of the kind are kept in.
+    auto* importer = _window->_storeImportController.get();
+    StoreImportRequest request;
+    StoreImportFailure failure = StoreImportFailure::None;
+    QString error;
+    if (!importer->prepare(params, &request, &error, &failure)) {
+        if (failure == StoreImportFailure::NoStore || failure == StoreImportFailure::ReadOnlyStore)
+            error = QObject::tr("The store %1 are kept in is read-only.")
+                        .arg(kindName == "surface" ? QObject::tr("surfaces") : QObject::tr("fibers"));
+        QMessageBox::warning(_window, QObject::tr("Import from Folder"), error);
+        return;
+    }
+    if (request.options.uuidNamespace) {
+        QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+        settings.setValue(namespaceKey(folder->text()), QString::fromStdString(*request.options.uuidNamespace));
+    }
 
     auto* progressDialog = new QProgressDialog(QObject::tr("Importing %1...").arg(folder->text().trimmed()), {}, 0, 0, _window);
     progressDialog->setWindowTitle(QObject::tr("Import from Folder"));
@@ -2464,22 +2416,16 @@ void MenuActionController::importIntoObjectStore()
     progressDialog->setMinimumDuration(0);
     progressDialog->setValue(0);
     QPointer<QProgressDialog> guardedDialog(progressDialog);
-    auto progress = [guardedDialog](const vc::objects::util::ProgressUpdate& event) {
-        if (!event.total) return;
-        const int completed = int(event.completed), total = int(event.total);
-        const auto detail = QString::fromUtf8(event.detail.data(), qsizetype(event.detail.size()));
-        QMetaObject::invokeMethod(guardedDialog, [guardedDialog, completed, total, detail] {
-            if (!guardedDialog) return;
-            guardedDialog->setMaximum(total);
-            guardedDialog->setValue(completed);
-            if (!detail.isEmpty()) guardedDialog->setLabelText(QObject::tr("Importing %1 (%2 of %3)").arg(detail).arg(completed + 1).arg(total));
-        }, Qt::QueuedConnection);
+    auto progress = [guardedDialog](const StoreImportProgress& event) {
+        if (!event.total || !guardedDialog) return;
+        guardedDialog->setMaximum(int(event.total));
+        guardedDialog->setValue(int(event.completed));
+        if (!event.detail.isEmpty())
+            guardedDialog->setLabelText(QObject::tr("Importing %1 (%2 of %3)").arg(event.detail).arg(event.completed + 1).arg(event.total));
     };
-    using Report = vc::objects::GeometryIngestReport;
-    auto* watcher = new QFutureWatcher<Report>(this);
-    connect(watcher, &QFutureWatcher<Report>::finished, this, [this, watcher, progressDialog, kindName] {
-        const auto report = watcher->result();
-        watcher->deleteLater();
+    const bool derivingUuids = request.options.uuidNamespace.has_value();
+    auto finished = [this, progressDialog, kindName, derivingUuids](const StoreImportOutcome& outcome) {
+        const auto& report = outcome.report;
         progressDialog->close();
         progressDialog->deleteLater();
         const auto what = kindName == "surface" ? QObject::tr("surface(s)") : QObject::tr("fiber(s)");
@@ -2490,20 +2436,16 @@ void MenuActionController::importIntoObjectStore()
         }
         QStringList problems;
         for (const auto& problem : report.problems) problems << QString::fromStdString(problem);
-        QMessageBox box(QMessageBox::Warning, QObject::tr("Import from Folder"),
-            summary + QLatin1Char(' ') + QObject::tr("%n item(s) could not be imported.", nullptr, int(problems.size())),
-            QMessageBox::Ok, _window);
+        auto text = summary + QLatin1Char(' ') + QObject::tr("%n item(s) could not be imported.", nullptr, int(problems.size()));
+        if (!derivingUuids && problems.join(QLatin1Char('\n')).contains(QStringLiteral("invalid UUID")))
+            text += QLatin1Char(' ') + QObject::tr("Sources without canonical UUIDs import when a UUID namespace is given.");
+        QMessageBox box(QMessageBox::Warning, QObject::tr("Import from Folder"), text, QMessageBox::Ok, _window);
         box.setDetailedText(problems.join(QLatin1Char('\n')));
         box.exec();
-    });
-    watcher->setFuture(QtConcurrent::run([session, attachment = *attachment, kindName, source, progress, coordinates, tagNames]() {
-        try {
-            return vc::objects::ingestGeometrySource(*session, attachment, kindName, source, progress, coordinates, tagNames);
-        } catch (const std::exception& error) {
-            Report report;
-            report.problems.push_back(error.what());
-            return report;
-        }
-    }));
+    };
+    if (!importer->start(std::move(request), progress, finished, &error)) {
+        progressDialog->close();
+        progressDialog->deleteLater();
+        QMessageBox::warning(_window, QObject::tr("Import from Folder"), error);
+    }
 }
-

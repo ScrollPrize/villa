@@ -6,10 +6,10 @@
 #include <vc_object_store/objects/CatalogStore.hpp>
 #include "../SurfaceCatalog.hpp"
 
-#include "vc/core/render/Colormaps.hpp"
+#include "Colormaps.hpp"
 #include "vc/core/util/QuadSurface.hpp"
 
-#include <opencv2/imgcodecs.hpp>
+#include "vc/core/util/ImageMat.hpp"
 #include <opencv2/imgproc.hpp>
 
 #include <algorithm>
@@ -219,7 +219,6 @@ void InkDetectionOverlayController::setColormapId(const std::string& id)
     if (_selectedImage.singleChannel && !_selectedImage.scalar.empty()) {
         _selectedImage.baseImage = renderSingleChannelImage(_selectedImage.scalar, _colormapId);
         _selectedImage.image = applyImageFlips(_selectedImage.baseImage);
-        _selectedImage.colormapId = _colormapId;
     }
     refreshAll();
 }
@@ -403,18 +402,21 @@ void InkDetectionOverlayController::loadSelectedImage()
             });
         return;
     }
-    const cv::Mat src = cv::imread(_selectedPath.string(), cv::IMREAD_UNCHANGED);
+    // TIFF, PNG or JPEG by suffix, in OpenCV's colour order; a palette PNG stays indices.
+    cv::Mat src;
+    try {
+        src = vc::core::util::imageMat(vcr::sources::readImagePage(std::filesystem::path(_selectedPath).string(), 0));
+    } catch (const std::exception&) {
+    }
     if (src.empty()) {
         return;
     }
 
     LoadedImage loaded;
-    loaded.path = _selectedPath;
     loaded.singleChannel = imageLooksSingleChannel(src);
     if (loaded.singleChannel) {
         loaded.scalar = toU8Scalar(src);
         loaded.baseImage = renderSingleChannelImage(loaded.scalar, _colormapId);
-        loaded.colormapId = _colormapId;
     } else {
         loaded.baseImage = colorMatToImage(src);
     }

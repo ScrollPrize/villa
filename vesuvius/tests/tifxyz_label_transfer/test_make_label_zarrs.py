@@ -6,9 +6,9 @@ from pathlib import Path
 
 import numpy as np
 import tifffile
-import zarr
+from vc_reader.reader import open_group
 
-from vesuvius.label_zarr import CHUNK_SHAPE, LABEL_SLICE, VOLUME_DEPTH
+from vesuvius.ink_detection.label_zarr import CHUNK_SHAPE, LABEL_SLICE, VOLUME_DEPTH
 from vesuvius.tifxyz_label_transfer.make_label_zarrs import (  # noqa: E402
     convert_label_tiff,
     write_label_zarr,
@@ -32,7 +32,7 @@ class MakeLabelZarrsTests(unittest.TestCase):
         output = self.tmp_path / "label.zarr"
         write_label_zarr(label, output, levels=4)
 
-        group = zarr.open_group(str(output), mode="r")
+        group = open_group(str(output))
         multiscales = group.attrs["multiscales"]
         self.assertEqual(multiscales[0]["version"], "0.4")
         self.assertEqual(
@@ -61,13 +61,8 @@ class MakeLabelZarrsTests(unittest.TestCase):
             self.assertEqual(
                 dataset.attrs["_ARRAY_DIMENSIONS"], ["z", "y", "x"]
             )
-            compressor = (
-                dataset.compressors[0]
-                if int(zarr.__version__.split(".", 1)[0]) >= 3
-                else dataset.compressor
-            )
-            self.assertEqual(compressor.cname, "zstd")
-            self.assertEqual(compressor.clevel, 3)
+            self.assertEqual(dataset.compressor["cname"], "zstd")
+            self.assertEqual(dataset.compressor["clevel"], 3)
             data = np.asarray(dataset)
             np.testing.assert_array_equal(data[LABEL_SLICE], expected)
             other = np.delete(data, LABEL_SLICE, axis=0)
@@ -95,7 +90,7 @@ class MakeLabelZarrsTests(unittest.TestCase):
         output = convert_label_tiff(input_path, levels=2)
         self.assertEqual(output, self.tmp_path / "supervision-2.399um.zarr")
 
-        group = zarr.open_group(str(output), mode="r")
+        group = open_group(str(output))
         self.assertEqual(group.attrs["canvas_size"], [128, 96])
         self.assertEqual(group.attrs["source_image"], str(input_path))
         self.assertEqual(group.attrs["transfer_report"], str(report_path))
@@ -110,7 +105,7 @@ class MakeLabelZarrsTests(unittest.TestCase):
     def test_rejects_non_2d_input(self) -> None:
         input_path = self.tmp_path / "bad_inklabels.tif"
         tifffile.imwrite(input_path, np.zeros((2, 8, 8, 2), dtype=np.uint8))
-        with self.assertRaisesRegex(ValueError, "2D"):
+        with self.assertRaisesRegex(ValueError, "declare"):
             convert_label_tiff(input_path)
 
     def test_present_corrupt_transfer_report_fails_factually(self) -> None:

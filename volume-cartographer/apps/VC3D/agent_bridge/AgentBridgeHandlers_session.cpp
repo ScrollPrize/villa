@@ -1,16 +1,19 @@
 #include "agent_bridge/AgentBridgeServer.hpp"
+#include <vc_reader/zarr.hpp>
 #include "agent_bridge/AgentBridgeInternal.hpp"
 #include <vc_object_store/objects/Project.hpp>
 #include <vc_object_store/Uuid.hpp>
-#include "vc/core/util/AtomicFile.hpp"
 #include <QJsonDocument>
 
 #include <QBuffer>
+#include <QFileInfo>
 #include <QByteArray>
 #include <QCoreApplication>
 #include <QImage>
 #include <QJsonArray>
 #include <QPixmap>
+#include <QOpenGLWidget>
+#include <QPainter>
 #include <QPointF>
 #include <QRegularExpression>
 #include <QWidget>
@@ -27,7 +30,8 @@
 #include "CWindow.hpp"
 #include "AxisAlignedSliceController.hpp"
 #include "CState.hpp"
-#include "OpenDataManifest.hpp"
+#include "OpenDataResourceSelection.hpp"
+#include "ProjectResources.hpp"
 #include "SegmentationCommandHandler.hpp"
 #include "SurfaceCatalog.hpp"
 #include "SurfacePanelController.hpp"
@@ -39,6 +43,7 @@
 #include "volume_viewers/VolumeViewerBase.hpp"
 
 #include "vc/core/types/Volume.hpp"
+#include "vc/core/types/ProjectCreation.hpp"
 #include "vc/core/types/VolumePkg.hpp"
 #include "vc/core/util/Logging.hpp"
 #include "vc/core/util/QuadSurface.hpp"
@@ -65,11 +70,15 @@ QJsonObject AgentBridgeServer::handleStateGet(const QJsonValue&)
         result["project"] = QJsonValue::Null;
         result["stores"] = QJsonArray();
         result["routes"] = QJsonObject();
+        result["author"] = CState::storeAuthor();
+        result["authorConfigured"] = CState::storeAuthorConfigured();
+        result["umbilicus"] = QJsonValue::Null;
         result["volume"] = QJsonValue::Null;
         result["activeSurface"] = QJsonValue::Null;
         result["segmentationGrowthVolumeId"] = QString();
         result["segmentationEditingEnabled"] = false;
         result["manualAddMode"] = false;
+        result["segmentationGrowthMethod"] = QJsonValue::Null;
         result["manualAddLineMode"] = QJsonValue::Null;
         result["manualAddInterpolation"] = QJsonValue::Null;
         result["correctionsPointMode"] = false;
@@ -92,9 +101,29 @@ QJsonObject AgentBridgeServer::handleStateGet(const QJsonValue&)
         store["hosted"] = session->hubStatus(attachment).has_value();
         return store;
     };
+    // Edits are recorded under this author; never empty.
+    result["author"] = CState::storeAuthor();
+    result["authorConfigured"] = CState::storeAuthorConfigured();
     if (const auto project = state->vpkg()) {
+        // The entries project.detach_entry removes, as the File menu's Detach lists them.
+        QJsonArray entries;
+        const auto addEntries = [&](const std::vector<vc::project::Entry>& list, const auto& kindOf) {
+            for (const auto& entry : list) {
+                entries.append(QJsonObject{
+                    {"kind", kindOf(entry)},
+                    {"location", QString::fromStdString(entry.location)},
+                    {"scope", project->entryOwner(entry.location).empty() ? "everyone" : "only you"},
+                });
+            }
+        };
+        addEntries(project->volumeEntries(), [](const auto&) { return QStringLiteral("volume"); });
+        addEntries(project->normalGridEntries(), [](const auto&) { return QStringLiteral("normal_grid"); });
+        addEntries(project->allLasagnaDatasetEntries(), [](const auto& entry) {
+            return vc::project::isFiberLasagnaEntry(entry) ? QStringLiteral("fiber_lasagna") : QStringLiteral("lasagna");
+        });
         result["project"] = QJsonObject{{"path", QString::fromStdString(project->path().string())},
-            {"name", QString::fromStdString(project->name())}, {"writable", project->writable()}};
+            {"name", QString::fromStdString(project->name())}, {"writable", project->writable()},
+            {"entries", entries}};
         QJsonArray stores;
         for (const auto& reference : project->document().data().at("stores")) {
             const auto id = reference.at("id").get<std::string>();
@@ -112,6 +141,20 @@ QJsonObject AgentBridgeServer::handleStateGet(const QJsonValue&)
         result["stores"] = QJsonArray();
         result["routes"] = QJsonObject();
     }
+
+    // The annotation volume's umbilicus objects in the store routed for umbilici.
+    QJsonValue umbilicus = QJsonValue::Null;
+    try {
+        if (const auto umbilici = vc3d::annotationUmbilici(*state)) {
+            QJsonArray uuids;
+            for (const auto& [uuid, revision] : umbilici->pins) uuids.append(QString::fromStdString(uuid));
+            umbilicus = QJsonObject{{"volume", QString::fromStdString(umbilici->volume)},
+                                    {"store", storeReferenceJson(*state, umbilici->store)}, {"uuids", uuids}};
+        }
+    } catch (const std::exception&) {
+        // An unreadable store has no umbilicus to report; stores[] shows its availability.
+    }
+    result["umbilicus"] = umbilicus;
 
     // volume
     if (auto vol = state->currentVolume()) {
@@ -151,6 +194,7 @@ QJsonObject AgentBridgeServer::handleStateGet(const QJsonValue&)
     // Line and interpolation modes persist when manual-add is inactive.
     if (SegmentationModule* mod = _window->_segmentationModule.get()) {
         result["manualAddMode"] = mod->manualAddMode();
+        result["manualAddFollowingSheet"] = mod->manualAddSheetWalkRunning();
         result["correctionsPointMode"] = mod->correctionPointMode();
         // Explicit save/flush bookkeeping.
         const SegmentationModule::AutosaveStatus save = mod->autosaveStatus();
@@ -161,6 +205,7 @@ QJsonObject AgentBridgeServer::handleStateGet(const QJsonValue&)
         result["autosave"] = autosave;
     } else {
         result["manualAddMode"] = false;
+        result["manualAddFollowingSheet"] = false;
         result["correctionsPointMode"] = false;
         result["autosave"] = QJsonValue::Null;
     }
@@ -178,10 +223,12 @@ QJsonObject AgentBridgeServer::handleStateGet(const QJsonValue&)
         result["axisAlignedSlices"] = QJsonValue::Null;
     }
     if (SegmentationWidget* widget = _window->_segmentationWidget) {
+        result["segmentationGrowthMethod"] = segmentationGrowthMethodToString(widget->growthMethod());
         const ManualAddTool::Config cfg = widget->manualAddConfig();
         result["manualAddLineMode"] = linePreviewModeToString(cfg.linePreviewMode);
         result["manualAddInterpolation"] = interpolationModeToString(cfg.interpolationMode);
     } else {
+        result["segmentationGrowthMethod"] = QJsonValue::Null;
         result["manualAddLineMode"] = QJsonValue::Null;
         result["manualAddInterpolation"] = QJsonValue::Null;
     }
@@ -263,7 +310,7 @@ QJsonObject AgentBridgeServer::handleSegmentsList(const QJsonValue& /*params*/)
     const std::string activeId = _window->_state ? _window->_state->activeSurfaceId() : std::string{};
     QJsonArray segments;
     for (const auto& [uuid, row] : catalog.rows())
-        segments.push_back(surfaceRowJson(row, activeId));
+        segments.push_back(surfaceRowJson(row, activeId, *_window->_state));
     QJsonObject result;
     result["segments"] = segments;
     // A listing is still being read: what is here may be partial.
@@ -337,7 +384,7 @@ QJsonObject AgentBridgeServer::handleSegmentsActivate(const QJsonValue& params)
         }
     }
 
-    const QJsonObject segment = surfaceRowJson(*_window->_surfaceCatalog->row(segmentId), segmentId);
+    const QJsonObject segment = surfaceRowJson(*_window->_surfaceCatalog->row(segmentId), segmentId, *state);
 
     QJsonObject result;
     result["activated"] = true;
@@ -381,6 +428,22 @@ QJsonObject AgentBridgeServer::handleScreenshotCapture(const QJsonValue& params)
     }
 
     QPixmap pixmap = widget->grab();
+    // QWidget's raster grab does not support QOpenGLWidget contents. Composite
+    // each visible GL child's framebuffer in logical coordinates so 3D colours
+    // and legends survive full-window captures, including on Retina displays.
+    {
+        QPainter painter(&pixmap);
+        for (auto* gl : widget->findChildren<QOpenGLWidget*>()) {
+            if (!gl->isVisibleTo(widget) || gl->window() != widget->window()) continue;
+            const QImage frame = gl->grabFramebuffer();
+            if (frame.isNull()) continue;
+            const QPoint position = gl->mapTo(widget, QPoint{});
+            painter.save();
+            painter.setClipRegion(gl->visibleRegion().translated(position));
+            painter.drawImage(QRect(position, gl->size()), frame);
+            painter.restore();
+        }
+    }
 
     static constexpr int kMinCaptureDim = 8;
     if (pixmap.width() < kMinCaptureDim || pixmap.height() < kMinCaptureDim) {
@@ -499,7 +562,7 @@ QJsonObject AgentBridgeServer::handleProjectCreate(const QJsonValue& params)
         QJsonObject data{{"param", "path"}};
         throw AgentBridgeError{-32602, "path must not be blank", data};
     }
-    if (volume.trimmed().isEmpty()) {
+    if (p.contains("volume") && volume.trimmed().isEmpty()) {
         QJsonObject data{{"param", "volume"}};
         throw AgentBridgeError{-32602, "volume must not be blank", data};
     }
@@ -512,9 +575,10 @@ QJsonObject AgentBridgeServer::handleProjectCreate(const QJsonValue& params)
         throw AgentBridgeError{-32602, "path must be absolute", data};
     }
 
-    const std::string volumeLocation = volume.toStdString();
-    if (!vc::project::isLocationRemote(volumeLocation) &&
-        !vc::project::resolveLocalPath(volumeLocation).is_absolute()) {
+    const std::optional<std::string> volumeLocation =
+        p.contains("volume") ? std::optional(volume.toStdString()) : std::nullopt;
+    if (volumeLocation && !vcr::zarr::isRemote(*volumeLocation) &&
+        !vc::project::resolveLocalPath(*volumeLocation).is_absolute()) {
         QJsonObject data{{"param", "volume"}};
         throw AgentBridgeError{-32602, "local volume path must be absolute", data};
     }
@@ -535,7 +599,7 @@ QJsonObject AgentBridgeServer::handleProjectCreate(const QJsonValue& params)
     }
 
     const std::string validationError =
-        vc::project::validateSingleVolumeLocation(volumeLocation);
+        volumeLocation ? vc::project::validateSingleVolumeLocation(*volumeLocation) : std::string{};
     if (!validationError.empty()) {
         QJsonObject data{
             {"detail", QString::fromStdString(validationError)},
@@ -559,7 +623,6 @@ QJsonObject AgentBridgeServer::handleProjectCreate(const QJsonValue& params)
     for (const QJsonValue& tag : tagValues)
         tags.push_back(tag.toString().toStdString());
 
-    std::string recordedLocation;
     fs::path storePath = p.value("store").toString().toStdString();
     const auto requestedNewStore = p.value("newStore").toString();
     if (!storePath.empty() && !requestedNewStore.isEmpty())
@@ -573,36 +636,27 @@ QJsonObject AgentBridgeServer::handleProjectCreate(const QJsonValue& params)
     std::error_code sameError;
     if (storePath.lexically_normal() == outputPath || fs::equivalent(storePath, outputPath, sameError))
         throw AgentBridgeError{-32602, "The project and object store must be separate files", {}};
-    const auto staging = outputPath.parent_path() / ("." + outputPath.stem().string() + "-" + vc::objects::util::newUuid() + ".vcproj");
-    bool createdStore = false;
+    vc::project::CreatedProject created;
     try {
         if (_window && _window->_state && _window->_state->vpkg() &&
             (_window->_state->vpkg()->path() == outputPath || fs::equivalent(_window->_state->vpkg()->path(), outputPath, sameError)))
             throw std::runtime_error("the output is the open project");
-        fs::create_directories(outputPath.parent_path());
-        auto options = CState::storeOpenOptions(CState::storeAuthor(), !makeStore);
-        if (makeStore) { auto store = vc::objects::ObjectStore::create(storePath, options); createdStore = true; }
-        else { auto store = vc::objects::ObjectStore::open(storePath, options); }
-        auto document = vc::project::ProjectDocument::create(staging, projectName.toStdString(), storePath);
-        vc::project::LoadOptions loadOptions;
-        loadOptions.deferResolution = true;
-        auto package = VolumePkg::open(staging, loadOptions);
-        package->addVolumeEntry(volumeLocation, std::move(tags));
-        recordedLocation = package->volumeEntries().front().location;
-        vc::core::util::atomicWriteString(outputPath, package->document().data().dump(2) + "\n");
-        fs::remove(staging);
+        // An existing store's reference is read-only when this user cannot write it, as in New Project.
+        created = vc::project::createProject(outputPath, projectName.toStdString(),
+            {makeStore ? vc::project::StoreChoice::Mode::New : vc::project::StoreChoice::Mode::Existing, storePath,
+             !makeStore && !QFileInfo(QString::fromStdString(storePath.string())).isWritable()},
+            CState::storeOpenOptions(CState::storeAuthor(), false), volumeLocation, std::move(tags),
+            p.value("overwrite").toBool(false));
     } catch (const std::exception& error) {
-        std::error_code ignored;
-        fs::remove(staging, ignored);
-        if (createdStore) fs::remove(storePath, ignored);
         throw AgentBridgeError{-32005, "Project write failed", {{"detail", QString::fromUtf8(error.what())}}};
     }
 
     QJsonObject result;
     result["path"] = QString::fromStdString(outputPath.string());
     result["name"] = projectName;
-    result["store"] = QString::fromStdString(storePath.string());
-    result["volume"] = QString::fromStdString(recordedLocation);
+    result["store"] = QString::fromStdString(created.storePath.string());
+    result["volume"] = created.recordedVolume ? QJsonValue(QString::fromStdString(*created.recordedVolume))
+                                              : QJsonValue(QJsonValue::Null);
     return result;
 }
 
@@ -626,7 +680,7 @@ QJsonObject AgentBridgeServer::handleVolumeAttach(const QJsonValue& params)
     }
 
     const std::string input = location.toStdString();
-    if (!vc::project::isLocationRemote(input) &&
+    if (!vcr::zarr::isRemote(input) &&
         !vc::project::resolveLocalPath(input).is_absolute()) {
         throw AgentBridgeError{
             -32602,

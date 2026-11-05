@@ -36,30 +36,40 @@ void normalizeMetadata(GeometrySource& p, const std::string& coordinateContext)
     p.object.meta = metadata.dump();
 }
 }
+std::string detail::sourceUuid(const std::string& uuid)
+{
+    try { return util::canonicalUuid(uuid); }
+    catch (const std::exception& error) { throw GeometrySourceRejected(error.what()); }
+}
 int64_t detail::ingestGeometryBatch(ObjectStore& db, WriteTxn& write, std::vector<GeometrySource> batch,
     const std::string& coordinateContext, bool registeredInitial)
 {
     geometryCoordinates(nlohmann::json::parse(coordinateContext));
     auto* connection=ObjectStoreImplAccess::conn(write);
     std::set<std::string> incoming;
+    std::vector<std::string> clashes;
     // Check the entire batch under the writer lock before mutating any object.
     for(auto& p:batch) {
-        p.object.uuid = util::canonicalUuid(p.object.uuid);
-        if (p.object.kind != p.geometry.kind) throw std::invalid_argument("import object and geometry kinds differ");
+        p.object.uuid = sourceUuid(p.object.uuid);
+        if (p.object.kind != p.geometry.kind) throw GeometrySourceRejected("import object and geometry kinds differ");
         if(!incoming.insert(p.object.uuid).second)
-            throw std::runtime_error("duplicate object UUID in import: "+p.object.uuid);
+            throw GeometrySourceRejected("duplicate object UUID in import: "+p.object.uuid);
         const auto existing=db.objectByUuid(write,p.object.uuid);
         detail::Statement history(connection,"SELECT 1 FROM geometry_revisions WHERE object_uuid=? LIMIT 1",
             detail::parseUuid(p.object.uuid));
         detail::Statement prior(connection,"SELECT 1 FROM object_revisions WHERE object_uuid=? LIMIT 1", p.object.uuid);
-        if(registeredInitial ? (!existing || existing->retired || history.row()) : (existing.has_value() || prior.row()))
-            throw std::runtime_error("object already exists or was previously imported; re-import is unsupported: "+p.object.uuid);
+        if (registeredInitial && (!existing || existing->retired || history.row()))
+            throw GeometrySourceRejected("object already exists or was previously imported; re-import is unsupported: "+p.object.uuid);
+        if (!registeredInitial && (existing.has_value() || prior.row())) clashes.push_back(p.object.uuid);
     }
+    if (!clashes.empty()) throw GeometryIdentitiesExist(std::move(clashes));
 
     std::vector<detail::SourceRecord> sources;
     for (auto& p : batch) {
         const auto existing = db.objectByUuid(write, p.object.uuid);
-        normalizeMetadata(p, coordinateContext);
+        // Merging the source's declarations with the import's is source validation.
+        try { normalizeMetadata(p, coordinateContext); }
+        catch (const std::exception& error) { throw GeometrySourceRejected(error.what()); }
         auto record = existing.value_or(p.object);
         auto metadata = Json::parse(record.meta);
         const auto incoming = Json::parse(p.object.meta);
@@ -77,8 +87,13 @@ int64_t detail::ingestGeometryBatch(ObjectStore& db, WriteTxn& write, std::vecto
         sources.push_back({p.object, std::move(p.source)});
 
     }
-    return detail::importSourceRelationships(db, write, sources);
+    // Source JSON that does not describe its relationships rejects the source.
+    try { return detail::importSourceRelationships(db, write, sources); }
+    catch (const nlohmann::json::exception& error) { throw GeometrySourceRejected(error.what()); }
 }
+GeometryIdentitiesExist::GeometryIdentitiesExist(std::vector<std::string> existing)
+    : GeometrySourceRejected("object already exists or was previously imported; re-import is unsupported: " + existing.front()),
+      uuids(std::move(existing)) {}
 int64_t ingestGeometryBatch(ObjectStore& db, WriteTxn& txn, std::vector<GeometrySource> batch,
     const std::string& coordinateContext)
 {

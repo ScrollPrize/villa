@@ -10,8 +10,8 @@
 #include <string>
 #include <vector>
 
-#include "OpenDataVolumePrefill.hpp"
-#include "OpenDataManifest.hpp"
+#include <vc_reader/cache.hpp>
+#include "OpenDataResourceSelection.hpp"
 #include "OpenDataSampleProject.hpp"
 
 #include <functional>
@@ -61,7 +61,7 @@ public:
     // or attaches it beside the project.
     void cloneHostedStore(bool asProject);
     // Collects a kind, a source folder and an optional volume binding, then ingests
-    // it into the kind's store in the background (vc::objects::ingestGeometrySource).
+    // it into the kind's store in the background (StoreImportController).
     void importIntoObjectStore();
     // Terminal outcome of an asynchronous Open Data sample open.
     struct OpenDataSampleOpenOutcome {
@@ -88,9 +88,33 @@ public:
     // True while any sample open is in flight.
     bool openDataSampleOpenInFlight() const;
 
+    struct LasagnaManifestOutcome {
+        bool success{false};
+        bool alreadyAttached{false};
+        // The project was replaced or closed while the manifest loaded; nothing was attached.
+        bool projectReplaced{false};
+        QString error;
+        QString location;
+        bool fiberInference{false};
+        QStringList volumeIds;
+    };
+    // Loads and validates a local or remote .lasagna.json manifest in the
+    // background, as regular Lasagna data or as fiber inference (never inferred
+    // from the location), then attaches it to the project open at the start if
+    // it still is. False when an attachment is already loading or no project is open.
+    bool startLasagnaManifestAttachment(const QString& location, bool fiberInference,
+                                        std::function<void(const LasagnaManifestOutcome&)> onFinished,
+                                        QString* errorMessage = nullptr);
+    bool lasagnaManifestAttachmentInFlight() const { return _lasagnaAttachmentInFlight; }
+
     // Remove a project entry (volume, normal grid or Lasagna dataset) by
     // location, after asking.
     void detachEntryAt(const QString& location);
+    // The same without asking: removes the entry (for everyone using the
+    // project, or only you; VolumePkg::entryOwner) and refreshes the project's
+    // volumes and views. False when no entry has `location`; throws when the
+    // project cannot be saved.
+    bool removeEntry(const QString& location);
     // Open Data: the sample's project store, made or refreshed from the catalog.
     void resetOpenDataProject();
 
@@ -123,14 +147,6 @@ private slots:
     void exitApplication();
 
 signals:
-    // Emitted when the user picks Actions -> Merge Surfaces... CWindow
-    // wires this to SegmentationCommandHandler::onMergeSurfaces with an
-    // empty seed list so the dialog opens with an empty grid.
-    void mergeSurfacesFromMenuRequested();
-    // Emitted when the user picks Actions -> Patch Surface... CWindow
-    // wires this to SegmentationCommandHandler::onMergePatch with an
-    // empty seed list so the dialog opens with empty combo boxes.
-    void mergePatchFromMenuRequested();
     void growTrackPatchesFromMenuRequested();
     void openDataCatalogVisibilityChanged(bool visible);
 
@@ -216,13 +232,16 @@ private:
     QAction* _surfaceFromSelectionAct{nullptr};
     QAction* _selectionClearAct{nullptr};
     QAction* _rotateSurfaceAct{nullptr};
-    QAction* _mergeSurfacesAct{nullptr};
-    QAction* _mergePatchAct{nullptr};
     QAction* _growTrackPatchesAct{nullptr};
 
     QPointer<QDialog> _keybindsDialog;
     QPointer<vc3d::opendata::OpenDataCatalogWindow> _openDataCatalogDialog;
-    std::vector<QFutureWatcher<vc3d::opendata::OpenDataVolumePrefillResult>*> _openDataPrefillWatchers;
+    struct VolumePrefillResult : vcr::cache::PrefillResult {
+        std::string volumeId;
+        int level = 0;
+        int physicalLevel = 5;
+    };
+    std::vector<QFutureWatcher<VolumePrefillResult>*> _openDataPrefillWatchers;
     std::vector<std::shared_ptr<std::atomic<bool>>> _openDataPrefillCancelFlags;
     std::shared_ptr<std::atomic<bool>> _openDataPrefillCancelFlag;
     // True from launch until the finished slot runs; prevents overlapping opens.

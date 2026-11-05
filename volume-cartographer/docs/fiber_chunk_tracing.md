@@ -172,7 +172,7 @@ filtering are described below.
 ## Python
 
 The same implementation is available in `vc.fiber_trace`. Dataset handles are
-retained by `ChunkCache`; it copies both configurations at construction. Native
+retained by the chunk store; it copies both configurations at construction. Native
 construction, routing and replay release the GIL. Multiple Python threads may
 request chunks from the same cache, sharing in-flight builds. Returned NumPy
 arrays own their data and remain valid after the cache or result is destroyed.
@@ -555,7 +555,6 @@ must be chosen explicitly for the intended baseline, not inferred from a model):
   "scaledown_power": 0,
   "enable_width": true,
   "cache_bytes": 1073741824,
-  "loader": {"resource_scaled": true},
   "trace": {
     "parallel_threads": 1,
     "step_voxels": 16,
@@ -563,8 +562,6 @@ must be chosen explicitly for the intended baseline, not inferred from a model):
     "beam_lookahead_steps": 2
   },
   "chunks": {
-    "channel_hints": true,
-    "worker_cache_bytes": 0,
     "core_base": 512,
     "halo_base": 64,
     "grid_base": 4,
@@ -921,41 +918,13 @@ Reusable native profiling target: `bench_fiber_seed_grid CONFIG INPUTS OUTPUT
 independent per-point reference. This is a preparation microbenchmark, not a
 replacement for the manager-controlled end-to-end tracing benchmark.
 
-### Channel hints and cache scheduling
+### Reading channels
 
-`channel_hints=true` supplies the generic core read hint for the channels used
-by this construction. Reading presence schedules the other requested channels
-into their **ordinary decoded caches**, so subsequent ordinary reads reuse them.
-This is not a tracer-specific retention cache; see
-[generic channel-hint and partition APIs](chunk_channel_hints.md).
-
-The batch runner defaults to `loader.resource_scaled=true`: after manager
-admission it sizes local reads to `max(16, 2*granted cores)` and decoding to the
-granted core count. Metadata preflight exits before those execution pools exist.
-`resource_scaled=false` explicitly retains legacy host/benchmark pool settings.
-
-`loader.backend="queued"` selects the experimental generic batch admission
-backend; `"direct"` remains the default. `loader.queued_chunk_window=0` sizes the
-in-flight unique-key window from the granted read/decode capacities; a positive
-value overrides it. It coalesces concurrent ROI/hint requests and refills the
-pipeline on completion. Use shared `cache_bytes` (e.g. 10 GiB), with
-`chunks.worker_cache_bytes=0`; queued/local partitions cannot be combined.
-Window and decoded-cache budget do not cap caller-owned ROI/tensor memory.
-See [the queue API and limitations](chunk_channel_hints.md#optional-queued-batch-loader).
-
-`worker_cache_bytes=0` retains the large shared decoded cache. A positive value
-selects that many bytes per native preparation worker, using generic decoded
-partitions which still share the central I/O/decode pools. On the locked
-512-core Paris4 workload, 64 MiB per worker was faster than the equal-aggregate
-shared cache; this remains an opt-in experiment, not a global viewer default.
-Hints and partitions do not alter construction identity or numerical settings.
-Separate companion caches may load even if presence later rejects all seeds;
-packed storage already loads those companion bytes together.
-
-Measurements, exact output parity, commands and limitations:
-`/ephemeral/hendrik/fiber3d_train2/evaluations/channel_loader_20261025_v1/REPORT.md`.
-This extends the earlier sparse-grid timings above; it does not retroactively
-claim that sparse seed preparation alone improved sustained throughput.
+Chunk tensors read their channels through the opened `vcr::Array`s of the prediction
+and normal bindings, which share the field's memory cache (`cache_bytes`). There is no
+loader to configure: vc_reader fetches and decodes in parallel. The numbers reported in
+`channel_loader_20261025_v1` measured the removed VC chunk cache and queued loader; they
+do not describe this path.
 
 If new CUDA construction is needed, the command bootstraps/uses the existing GPU
 manager and requests a nonexclusive partial grant. By default all GPUs in the
@@ -1344,7 +1313,8 @@ and exception cleanup.
 
 ### Sampling overhead: retained chunks and owned ROIs
 
-The follow-up native benchmark `core/test/bench_fiber_sampling_overhead.cpp`
+Historical measurements of the removed VC chunk cache; the retained-chunk backend and
+this benchmark no longer exist. The follow-up native benchmark `core/test/bench_fiber_sampling_overhead.cpp`
 compares the current cached-request path with existing
 `detail::FiberChunkTensor` scalar sampling. This is measurement only, not a switch
 of the production direct tracer. Tensor normal/direction reconstruction and
@@ -1395,53 +1365,27 @@ mean/median/min/max statistics:
 `/ephemeral/hendrik/fiber3d_train2/evaluations/paris4_direct_separate_gates_20261027_v1/sampling_overhead_v1/REPORT.md`
 and `results.json`/`summary.json` alongside it.
 
-### Direct CPU tracing with retained decoded chunks
+### Direct CPU tracing with a sampling window
 
-Set `TraceConfig.sampling_window_voxels = 64` to use the retained-cache backend
-for direct CPU candidate-frontier sampling. `0` remains the default; valid nonzero
-sizes are 8–256 stored voxels. This does **not** build copied ROI channel arrays.
+Set `TraceConfig.sampling_window_voxels = 64` to sample direct CPU candidate frontiers
+from an owned window. `0` remains the default; valid nonzero sizes are 8–256 stored
+voxels. Each trace reads one `FiberChunkTensor` box and replaces it only when the next
+frontier leaves its coverage; the old window is released first. Interpolation performs
+no cache lookups, locks or I/O, and read errors propagate.
 
-The ownership/access flow is:
+Implementation: `core/src/fiber_tracer/FiberChunkTensor.cpp` holds the channels;
+`FiberTrace.cpp::scoreCandidateTasks` manages per-trace window reuse.
 
-1. `FiberPredictionField::chunkRegionChannels` checks publication readiness.
-2. `PinnedChunkRegion::pin` obtains ordinary decoded-cache `ChunkResult` references
-   and retains their buffers. This is shared ownership, not OS memory locking.
-3. `PinnedChunkGrid` builds an immutable table of raw pointers and strides for
-   each channel. Construction resolves packed-channel byte offsets and checks
-   payload extents. Missing/all-fill chunks use the source fill value; unpinned
-   in-volume dependencies throw, rather than silently becoming fill.
-4. `FiberChunkTensor` uses those tables for corner reads and the same interpolation,
-   direction reconstruction, validity masking and width math as its owned backend.
-   Interpolation performs no cache/map lookups, refcount updates, locks or I/O.
+Current scope: explicit one-worker scalar tracing, single-option byte prediction and
+normal channels on exactly matching lattices, byte/float width, no embeddings.
+Unsupported sources and oversized frontiers keep the existing sampler.
 
-Each trace retains one guarded window and replaces it only when the next candidate
-frontier leaves coverage. Old ownership is released before acquiring replacements.
-Forward and reverse traces may each retain a window. Cache eviction can remove its
-own reference without invalidating these views; buffers are freed when their last
-owner releases them. Full decoded storage chunks remain alive, so retained bytes
-can exceed the logical window size. This is not a second persistent cache.
+`TraceProfile` reports window loads, fallbacks, time, the largest window and the voxel
+bytes read into windows; these are not total process memory or a global memory cap.
 
-Implementation: `core/include/vc/core/render/PinnedChunkRegion.hpp` and
-`core/src/render/PinnedChunkRegion.cpp` provide the generic ownership/grid API;
-`core/src/fiber_tracer/FiberChunkTensor.cpp` provides shared interpolation/storage
-backends; `FiberTrace.cpp::scoreCandidateTasks` manages per-trace window reuse.
-
-Current scope: explicit one-worker scalar tracing, single-option byte prediction
-and normal channels on exactly matching lattices, byte/float width, no embeddings
-or caller-supplied pinned region. Unsupported sources and oversized frontiers keep
-the existing sampler. Read/readiness errors propagate. Initialization and committed
-step sampling still use their existing APIs. Dense/GPU construction is unchanged;
-`seedGrid` and `packGpu` deliberately require the owned backend.
-
-`TraceProfile` reports window loads/fallbacks/time, maximum retained physical bytes
-(deduplicated by payload within one window), pointer-table bytes, and ROI voxel
-bytes allocated/copied (zero). Pointer-table bytes exclude region map nodes;
-these counters are not total process memory or a global memory cap.
-
-Validation includes exact values across seams, packed channel offsets, missing
-chunks, masked normals, byte/float widths, independently chunked widths, cache
-eviction and owner lifetime, and concurrent read-only sampling. The approved
-runner suites `direct-sampling-window` and `direct-sampling-window-full` measure
+Validation includes packed channel offsets, missing chunks, masked normals, byte/float
+widths and independently chunked widths. The approved runner suites
+`direct-sampling-window` and `direct-sampling-window-full` measure
 cached Paris4 replay with unchanged tracing settings. Retained results are under
 `paris4_direct_separate_gates_20261027_v1/sampling_retained_v1`; the earlier
 `sampling_window_v1` measured the superseded **copied** ROI backend.
@@ -1751,15 +1695,62 @@ used by the neural volume runner. With `policy_grid_base: 8`, the rules are:
   satisfy the tracer's `width_hard_relative_tolerance`, relative to the querying
   trace's accumulated width. Unknown widths cannot reject a collision.
 
-This workflow does not enable the chunk conflict filter or FW/BW checks. Its
-collision semantics are not the older normal-oriented ellipse policy. Neither
-stopped directions nor discarded short pieces are GT error measurements.
+This workflow enables actual FW/BW reverse verification by default (since
+2026-10-29). The earlier full-volume output omitted it despite the optimized
+verifier being available in reference replay. That output is **not** verified
+and cannot be resumed into the new policy. The chunk conflict filter remains
+separate and is not used here. Collision semantics are not the older
+normal-oriented ellipse policy. Neither stopped directions nor discarded short
+pieces are GT error measurements.
+
+Streaming and reference replay share `FiberReverseCheckSchedule` and
+`verifyFiberReverseCheckpoint` in `FiberReverseConsistency.hpp/.cpp`. Defaults
+are checks every 512 base voxels, delayed four committed edges to supply reverse
+history, a 20/40-base acceptance ellipse, and early success after at least 1024
+base voxels when one point converges to an already verified prefix within 8 base
+voxels and 10 degrees. Reverse scoring freezes the current forward width mean.
+Presence/width stops check from four accepted edges before the endpoint and keep
+those history edges if the check passes. Other endpoints flush pending checks
+and verify the endpoint. A failed check cuts back to the last verified point,
+trimming all recorded normals, widths and segment costs together; its reason is
+`reverse_consistency_filtered`. Very short history-only tails are retained but
+are counted separately, not claimed to have passed a reverse trace.
+
+Checks run on the same native pool as forward tracing, independently per active
+direction, with no centralized Python verification stage or extra thread pool.
+The current direction waits for its check; other directions remain runnable.
+For a controlled off comparison set `stream.reverse_consistency: false`.
+Historical trace configs with a zero reverse interval are upgraded to the above
+defaults unless this explicit opt-out is supplied. Positive intervals retain
+their supplied delay/convergence tuning. Both run identity and each packed page
+record the effective reverse policy; mismatching or unlabelled old pages are
+rejected rather than silently reused. Existing completed exports are untouched.
+
+For the PHerc0332 server migration (2026-10-30), the local runner
+`local/test_stream_0332.py` uses `/data/hendrik` instead of `/ephemeral/hendrik`.
+Select `stream-0332-prepare` in `local/fiber_tests.json` and run
+`scripts/run_fiber_tests` for a non-launching preparation check. It creates the
+evaluation directory and `preparation.json`, validates the completed prediction
+provenance before writing `config.json`, and reports missing inputs explicitly.
+`stream-0332-build` rebuilds CPU bindings and runs the native/Python regressions
+in `volume-cartographer/build/fiber-stream-data-host`; copied binaries from the
+old host are not assumed ABI-compatible. `stream-0332-launch` remains the
+explicit start/resume action and is never part of preparation. Native system
+prerequisites must be installed before the build. The migration preserves the
+trace policy, 2240 active-pair slots, and 64-GiB cache. As requested on
+2026-11-02, the launcher selects half the host's logical CPUs: 96 tracing
+workers on this 192-logical-CPU host. This sets worker concurrency, not CPU
+affinity or a process-wide CPU quota; auxiliary loader threads still exist.
+Pytest is only the local approved orchestration wrapper, not part of tracing.
+The production entry point is `scripts/run_fiber_stream_volume.py CONFIG OUTPUT`,
+using the intended `VC_BUILD_DIR` and Python environment directly.
 
 Use the regular volume runner's prediction, cache, trace and chunk settings,
 plus this section (distances here are base voxels):
 
 ```json
 "stream": {
+  "reverse_consistency": true,
   "workers": 128,
   "active_fibers": 1280,
   "seed_workers": 8,
@@ -1795,6 +1786,52 @@ and per-priority work time/job counts (tiers 0: checks, 1: completion/admission,
 backend and effective limits. This CPU-only workflow does not request GPUs or
 run inference. The previous coordinator is retained only behind the explicit
 `--python-reference` diagnostic flag for matched before/after measurements.
+Reverse diagnostics include checks, failures, early convergences, accumulated
+worker seconds and reverse travel, stop-tail checks and history-only tails.
+Accumulated reverse worker seconds are not wall time.
+
+### Streaming FW/BW integration pilot (2026-10-29)
+
+Matched runs used the established 32 Paris4 seed tiles (X=35..38, Y=45..46,
+Z=95..98, 512-base tile size), 30,793 seed candidates, 224 native workers,
+2,240 active seed-pair slots, 4,096-base maximum per direction, and the same
+64-GiB prediction cache. Prediction input was
+`PHercParis4-20260411134726-las-sd1-9ef89ac3.zarr`, checkpoint hash
+`48f7cd9a7baa1437a273cc86e6a185db9870ecc45a744857407b80e0b024ce07`.
+No inference ran. Builds used GCC 13, RelWithDebInfo and the existing LTO flags.
+Each run started a fresh process and fresh output; source filesystem cache was
+reused. Three repeats alternated off/on, on/off, off/on. Worker collision order
+can change ownership and therefore piece counts between repeats.
+
+| FW/BW | Repeat | Wall s | Pieces | Saved length m | Mean piece mm | Median piece mm | P05 mm | P95 mm | Reverse-rejected directions |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| Off | 0 | 50.322 | 1,677 | 5.1404 | 3.0653 | 1.3440 | 0.9024 | 10.2912 | — |
+| On | 0 | 174.428 | 1,626 | 4.9642 | 3.0530 | 1.3440 | 0.9216 | 10.2912 | 648 |
+| On | 1 | 174.017 | 1,652 | 4.9358 | 2.9878 | 1.3056 | 0.9024 | 10.2912 | 647 |
+| Off | 1 | 50.154 | 1,677 | 5.1229 | 3.0548 | 1.3440 | 0.9024 | 10.2912 | — |
+| Off | 2 | 49.949 | 1,679 | 5.1312 | 3.0561 | 1.3440 | 0.9024 | 10.2912 | — |
+| On | 2 | 171.725 | 1,644 | 4.9472 | 3.0092 | 1.2960 | 0.9024 | 10.2912 | 657 |
+
+Median wall time: **50.154 → 174.017 s (3.47×)**. Per-column medians give
+**3.59% less saved length** and **1.97% fewer pieces**. Mean CPU utilization was
+197–200 core-equivalents, with 224 busy workers during the main phase. On runs
+performed 17,404–17,632 checks and 2,170–2,214 early convergences. The median
+length-weighted recorded modulated presence was 0.77983 off versus 0.78255 on.
+Rejected directions include short traces that would not have produced a saved
+piece; they are **not GT errors**. This pilot measures extraction behavior and
+runtime, not reference accuracy or recovery of the two prior GT failures. Saved
+length is the sum across output pieces, not a spatial-union coverage estimate.
+
+Artifacts/configs/logs:
+`/ephemeral/hendrik/fiber3d_train2/evaluations/paris4_stream_reverse_20261029_v1/`
+(`comparison.json`, `off_0..2/`, `on_0..2/`). The full-volume run was not restarted.
+Approved command: `/home/hendrik/villa3/scripts/run_fiber_tests`, using local
+suites `stream-reverse-build`, `stream-reverse-tests`, `stream-reverse-pilot`.
+The pilot requires fresh output directories to avoid timing a resume. Tests
+cover shared delayed cadence, rollback, terminal-tail preservation, native
+default-on behavior, explicit opt-out, attribute cardinalities and policy-safe
+resume. Historical completed pages remain untouched and deliberately cannot be
+reused as checked output.
 
 `busy_workers` counts assigned jobs, including jobs blocked in prediction-cache
 reads; it is not CPU utilization. Prediction sampling-window loads currently
@@ -1912,7 +1949,15 @@ coordinate scaling, output roundtrip, and shared neural-policy parity. Local
 production inputs and pilot timings remain under the ephemeral experiment
 directory rather than becoming repository defaults.
 
-### Cache/sampling timing diagnostics
+### Cache/sampling timing diagnostics and reader migration
+
+The following `SamplingWaitProfile` instrumentation describes the historical
+pre-`vc_reader` implementation, preserved on `fiber-stream-fwbw-before-main`.
+Current main replaced `ChunkCache.cpp` and `ChunkedPlaneSampler.cpp`; setting
+this environment variable does not instrument the replacement reader.
+See the [matched reader-port benchmark](benchmarks/fiber_reader_main_port.md)
+for current-main integration status, cache-pressure measurements and sampled
+CPU profiles.
 
 `VC_SAMPLING_WAIT_PROFILE=1` enables the opt-in `SamplingWaitProfile` hooks in
 `ChunkCache.cpp` and `ChunkedPlaneSampler.cpp`. Per-thread counters attribute
@@ -1922,9 +1967,10 @@ ten seconds per sampling thread, outside cache locks. Some timings are nested;
 do not sum all fields as exclusive wall time. Disabled profiling does not
 construct the thread-local stats or read clocks for these cache timers.
 
-The helper and its enabled/disabled regression test are retained through the
-main/object-store integration. Existing cache-pressure counters and standalone
-contention/ROI benchmarks remain available as well: unit tests check behavior,
-whereas throughput regressions require matched performance runs. The profiling
-hooks do not change cache policy, precision, or trace scoring. See
+The helper and its enabled/disabled regression test survived the earlier
+main/object-store integration, but not the later reader replacement. Historical
+cache-pressure counters are not interchangeable with current reader metrics:
+unit tests check behavior, whereas throughput regressions require matched
+performance runs. The historical profiling hooks did not change cache policy,
+precision, or trace scoring. See
 `scripts/FIBER_TEST_RUNNER.md` for isolated integration validation.

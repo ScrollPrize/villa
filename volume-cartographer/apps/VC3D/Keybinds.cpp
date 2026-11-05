@@ -484,6 +484,8 @@ QString buildKeybindsHelpText()
 
         { kSectionSegEditing, keypress::SegmentationUndo.description, HelpKeyType::KeyPress, nullptr, &keypress::SegmentationUndo, nullptr },
         { kSectionSegEditing, keypress::ManualAddToggle.description, HelpKeyType::KeyPress, nullptr, &keypress::ManualAddToggle, nullptr },
+        { kSectionSegEditing, "Manual Add: extend left / up / down / right (again: apply and continue)", HelpKeyType::Literal, nullptr, nullptr, "  1 / 2 / 3 / 4" },
+        { kSectionSegEditing, "Manual Add: extend only part of an edge", HelpKeyType::Literal, nullptr, nullptr, "  Shift+Drag along it" },
         { kSectionSegEditing, keypress::ToggleAnnotation.description, HelpKeyType::KeyPress, nullptr, &keypress::ToggleAnnotation, nullptr },
         { kSectionSegEditing, "Anchor correction drag", HelpKeyType::Literal, nullptr, nullptr, "Hold G + Drag" },
         { kSectionSegEditing, "Add correction point", HelpKeyType::Literal, nullptr, nullptr, "  Click" },

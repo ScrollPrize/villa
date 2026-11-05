@@ -288,6 +288,8 @@ public:
     // Opens a fiber imported from an Automated Fiber Volume, fitting the whole
     // line in both strips. A Lasagna dataset is optional. Errors are returned
     // through error instead of dialogs.
+    // Immutable, worker-safe reference used by the Line Annotation strips.
+    std::function<cv::Vec3f(const cv::Vec3f&)> displayCenterReference();
     LineAnnotationDialog* openCollectionFiber(uint64_t fiberId, QString* error = nullptr);
     // Opens a fiber annotation (with line_points) read-only, without adding it
     // to the package: nothing is written, optimized or edited, and the fiber
@@ -430,6 +432,11 @@ public:
     // Writes a vc3d_fiber_collection bundle without opening a dialog.
     bool exportFibersToPath(const std::filesystem::path& path,
                             QString* errorMessage = nullptr, int* exportedCount = nullptr);
+    // Publish every session's pending autosave now. stillValid (optional):
+    // checked after each flushed save (a yield); false stops the flush.
+    void flushAllPendingSessionAutoSaves(const std::function<bool()>& stillValid = {});
+    // A fiber merge, split or link is running; imports and other structural edits wait.
+    [[nodiscard]] bool structuralEditInProgress() const { return _structuralEditInProgress; }
     // Imports a fiber JSON, bundle, or directory without opening a dialog.
     bool importFibersFromPath(const std::filesystem::path& path,
                               QString* errorMessage = nullptr,
@@ -1280,9 +1287,6 @@ private:
     // so nothing reads a fiber whose newest geometry is still session-only.
     void scheduleSessionAutoSave(LineAnnotationSession& session);
     void flushSessionAutoSave(const std::string& surfaceName);
-    // stillValid (optional): checked after each flushed save (a yield);
-    // false stops the flush.
-    void flushAllPendingSessionAutoSaves(const std::function<bool()>& stillValid = {});
     [[nodiscard]] static nlohmann::json fiberSourceMetadata(const StoredFiber& fiber);
     friend int runObjectStoreControllerTests();
     // Runtime handles <-> store identities; cleared with each attachment.
@@ -1546,13 +1550,13 @@ private:
     // error names what refused.
     std::optional<QString> linkStoredControlPoints(StoredFiber& local,
                                                    int localControlIndex,
-                                                   StoredFiber& far,
+                                                   StoredFiber& farFiber,
                                                    int farControlIndex,
                                                    bool autoLink);
     // The pair-level part of linkStoredControlPoints' checks (same fiber,
     // read-only), so an operation can refuse BEFORE it mutates anything.
     [[nodiscard]] std::optional<QString> linkPairEligibilityError(const StoredFiber& local,
-                                                                  const StoredFiber& far) const;
+                                                                  const StoredFiber& farFiber) const;
     mutable QString _lastSuppressedError;
 
     // Transient (in-memory only) staging state for a designated control

@@ -242,7 +242,7 @@ python infer_winding_volume.py \
     --gpus 0,1 --native-phase-only
 ```
 
-The reference zarr's scale-0 grid defines the output coordinates, so use the volume the fit runs on. `--z-range` and `--winding-range` default to the fitted checkpoint's ranges. It also needs the scroll's `umbilicus.json` (`--umbilicus`, or found from the checkpoint's dataset). The cache is large — about 150 GB for all of PHerc. Paris 4.
+The reference zarr's scale-0 grid defines the output coordinates, so use the volume the fit runs on. `--z-range` and `--winding-range` default to the fitted checkpoint's ranges. It also needs the scroll's `umbilicus.json` (`--umbilicus`, or found from the checkpoint's dataset). The cache is large: it keeps the model's full float32 phase for every slab, 128 × 128 × 384 values or 25.2 MB per slab before compression for this model, so the ~1.56 million slabs behind the published PHerc. Paris 4 store come to about 39 TB of raw phase.
 
 **2. Export the compact store** into the dataset:
 
@@ -251,7 +251,22 @@ python export_spiral_supervision.py winding_native_phase.zarr \
     /path/to/dataset/winding_inference --workers 32
 ```
 
-The export is restartable, refuses to overwrite an existing store, and `--validate /path/to/dataset/winding_inference` checks a finished one. [`NATIVE_PHASE_CACHE.md`](https://github.com/ScrollPrize/villa/blob/main/vesuvius/src/vesuvius/neural_tracing/winding_models/NATIVE_PHASE_CACHE.md) documents both steps and the store format. To train your own winding model, run `train_winding_model.py <config.json>` on volumes paired with existing segments or spiral fits; the published model's `config.json` is a working example.
+The export is restartable, refuses to overwrite an existing store, and `--validate /path/to/dataset/winding_inference` checks a finished one. [`NATIVE_PHASE_CACHE.md`](https://github.com/ScrollPrize/villa/blob/main/vesuvius/src/vesuvius/neural_tracing/winding_models/NATIVE_PHASE_CACHE.md) documents both steps and the store format.
+
+**Without the cache.** If the compact store is all you need, replace `--native-phase-only` with `--spiral-supervision-only` and give the store directory as the output; step 2 is then skipped:
+
+```bash
+python infer_winding_volume.py \
+    /path/to/run/checkpoint_fitted.ckpt /path/to/dataset/winding_inference \
+    --model-ckpt models/winding_model_9um/ckpt_final.pth \
+    --reference-zarr /path/to/volume.zarr --volume-scale 0 \
+    --z-range 4000 17000 --winding-step 3 --seed-spacing 60 \
+    --gpus 0,1 --spiral-supervision-only
+```
+
+Each slab's centre ray is decoded in memory by the exporter's own code, so the store holds the same arrays that steps 1 and 2 produce from the same model output, without the cache on disk. An interrupted run resumes from `winding_inference.partial` when you repeat the command. Keep the cache if you also want the `--phase-cache` reconstructions (points, winding volume, `crossing_prob`).
+
+To train your own winding model, run `train_winding_model.py <config.json>` on volumes paired with existing segments or spiral fits; the published model's `config.json` is a working example.
 
 #### Configure
 

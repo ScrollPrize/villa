@@ -2,6 +2,7 @@
 
 #include <QObject>
 #include <QString>
+#include <stdexcept>
 #include <cstdint>
 #include <filesystem>
 #include <functional>
@@ -25,6 +26,7 @@ Q_DECLARE_METATYPE(vc::objects::StoreSessionEvent)
 
 class VolumePkg;
 class Volume;
+class OpenedVolumes;
 class QuadSurface;
 class Surface;
 class VCCollection;
@@ -39,28 +41,40 @@ struct POI
     bool suppressViewerRecenter = false;
 };
 
+// A store switch (detach, route, replace) was refused because pending edits
+// could not be saved or an edit operation is running; nothing changed.
+struct StoreSwitchRefused : std::runtime_error {
+    using std::runtime_error::runtime_error;
+};
+
 class CState : public QObject
 {
     Q_OBJECT
 
 public:
-    explicit CState(QObject* parent = nullptr,
-                    bool debugDownloadQueue = false, CState* objectStoreOwner = nullptr);
+    // cacheBytes sizes the opened volumes' memory cache (0: the RAM cache setting).
+    explicit CState(QObject* parent = nullptr, CState* objectStoreOwner = nullptr, std::size_t cacheBytes = 0);
     ~CState();
 
     // One session for all object kinds; controllers share this handle.
     std::shared_ptr<vc::objects::ObjectStoreSession> objectStoreSession() const { return _objectStoreSession; }
+    // The opened volume levels the tools sample, shared with the object-store owner's windows.
+    std::shared_ptr<OpenedVolumes> openedVolumes() const { return _openedVolumes; }
     // Decoded surface geometry kept for every store VC3D opens (all workspaces),
     // up to the surface geometry cache setting; re-read after Settings change.
     static std::shared_ptr<vc::objects::SurfaceTileCache> surfaceGeometryCache();
     static void applySurfaceGeometryCacheSettings();
     // The author VC3D writes as: the username setting, else the login name.
     static QString storeAuthor();
+    // Whether the username setting names an author (set, and not "anon").
+    static bool storeAuthorConfigured();
     // Open Options for attaching stores to the viewer's session.
     static vc::objects::OpenOptions storeOpenOptions(const QString& author, bool readOnly);
 
     // Project references are stable IDs; attachments exist only for available stores.
     std::optional<vc::objects::AttachmentIdentity> storeReference(const std::string& id) const;
+    // The project's reference id of an attached store.
+    std::optional<std::string> storeReferenceId(const vc::objects::AttachmentIdentity&) const;
     std::optional<vc::objects::AttachmentIdentity> sampleStore() const;
     vc::objects::AttachmentIdentity prepareStore(const std::filesystem::path&, const QString& author, bool readOnly = false);
     void releasePreparedStore(const vc::objects::AttachmentIdentity&);
@@ -121,8 +135,9 @@ public:
     // Write pending point-collection edits to the store now: the volume's,
     // and (through pointCollectionsSaveRequested) the open surface's corrections.
     void savePointCollections();
-
-    bool debugDownloadQueueEnabled() const { return _debugDownloadQueue; }
+    // The store one of the volume's point collections is kept in; nullopt for
+    // a surface's corrections and in windows without their own collections.
+    std::optional<vc::objects::AttachmentIdentity> pointCollectionStore(uint64_t collectionId) const;
 
     // --- Teardown ---
     void closeAll();
@@ -183,6 +198,7 @@ private:
     std::optional<vc::objects::AttachmentIdentity> attachedAt(const std::filesystem::path& path) const;
     CState* _objectStoreOwner = nullptr;
     std::shared_ptr<vc::objects::ObjectStoreSession> _objectStoreSession;
+    std::shared_ptr<OpenedVolumes> _openedVolumes;
     std::vector<vc::objects::AttachmentIdentity> _attachedStores;
     std::map<std::string, vc::objects::AttachmentIdentity> _storeReferences;
     QString _objectStoreObservationError;
@@ -200,8 +216,6 @@ private:
     VCCollection* _pointCollection;
     // Keeps the volume's point collections in the store (the main state only).
     vc3d::PointCollectionSync* _pointCollectionSync = nullptr;
-
-    bool _debugDownloadQueue = false;
 
     // Surface/POI data (formerly in CSurfaceCollection)
     std::unordered_map<std::string, std::shared_ptr<Surface>> _surfs;

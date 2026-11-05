@@ -1,5 +1,8 @@
 #include "SpiralWorkspace.hpp"
 
+#include <vc_reader/tifxyz.hpp>
+#include <vc_reader/zarr.hpp>
+
 #include "AxisAlignedSliceController.hpp"
 #include "CState.hpp"
 #include "ConsoleOutputWidget.hpp"
@@ -10,6 +13,7 @@
 #include "SpiralMinimap.hpp"
 #include "SurfaceOverlayColors.hpp"
 #include "VCSettings.hpp"
+#include "vc/core/util/RemoteCacheSettings.hpp"
 #include "ViewerManager.hpp"
 #include "elements/GrowOnlyLabel.hpp"
 #include "elements/ViewerSplitGrid.hpp"
@@ -29,7 +33,7 @@
 #include "vc/lasagna/Dataset.hpp"
 #include "vc/lasagna/Manifest.hpp"
 
-#include <opencv2/imgcodecs.hpp>
+#include "vc/core/util/ImageMat.hpp"
 
 #include <QDialog>
 #include <QDockWidget>
@@ -141,115 +145,49 @@ std::optional<std::array<std::size_t, 3>> parseBaseShapeZYX(
 std::optional<int> omeScaledownForGroup(
     const QString& rootPath, const QString& group, QString* errorMessage)
 {
-    QFile attributesFile(QDir(rootPath).filePath(QStringLiteral(".zattrs")));
-    if (!attributesFile.open(QIODevice::ReadOnly)) {
-        if (errorMessage) *errorMessage = QObject::tr("Cannot read OME metadata at %1")
-            .arg(attributesFile.fileName());
-        return std::nullopt;
-    }
-    QJsonParseError parseError;
-    const QJsonDocument document = QJsonDocument::fromJson(
-        attributesFile.readAll(), &parseError);
-    if (parseError.error != QJsonParseError::NoError || !document.isObject()) {
-        if (errorMessage) *errorMessage = QObject::tr("Malformed OME metadata at %1: %2")
-            .arg(attributesFile.fileName(), parseError.errorString());
-        return std::nullopt;
-    }
-    const QJsonArray multiscales = document.object()
-        .value(QStringLiteral("multiscales")).toArray();
-    if (multiscales.isEmpty()) {
-        if (errorMessage) *errorMessage = QObject::tr("OME multiscales metadata is missing");
-        return std::nullopt;
-    }
-    const QJsonArray datasets = multiscales.at(0).toObject()
-        .value(QStringLiteral("datasets")).toArray();
-    auto datasetScale = [&](const QString& wanted) -> std::optional<double> {
-        for (const QJsonValue& value : datasets) {
-            const QJsonObject dataset = value.toObject();
-            if (dataset.value(QStringLiteral("path")).toString() != wanted) continue;
-            std::optional<double> scale;
-            for (const QJsonValue& transformValue : dataset.value(
-                     QStringLiteral("coordinateTransformations")).toArray()) {
-                const QJsonObject transform = transformValue.toObject();
-                const QString type = transform.value(QStringLiteral("type")).toString();
-                const QJsonArray values = transform.value(type).toArray();
-                if (values.size() != 3) return std::nullopt;
-                if (type == QStringLiteral("translation")) {
-                    for (const QJsonValue& component : values)
-                        if (!component.isDouble() || !std::isfinite(component.toDouble()) ||
-                            std::abs(component.toDouble()) > 1.0e-9) return std::nullopt;
-                } else if (type == QStringLiteral("scale")) {
-                    const double first = values.at(0).toDouble(
-                        std::numeric_limits<double>::quiet_NaN());
-                    if (!std::isfinite(first) || first <= 0.0) return std::nullopt;
-                    for (const QJsonValue& component : values) {
-                        const double current = component.toDouble(
-                            std::numeric_limits<double>::quiet_NaN());
-                        if (!std::isfinite(current) || current <= 0.0 ||
-                            std::abs(current - first) >
-                                1.0e-9 * std::max({1.0, current, first})) return std::nullopt;
-                    }
-                    scale = first;
-                } else return std::nullopt;
-            }
-            return scale;
+    try {
+        const auto scale = vcr::zarr::Group::open(rootPath.toStdString(), vc::settings::remoteOpenOptions(vc3d::remoteCachePathFs()))
+                               .placement(group.toStdString()).scale;
+        const double levelValue = std::log2(scale[0]);
+        const int level = static_cast<int>(std::llround(levelValue));
+        if (scale[1] != scale[0] || scale[2] != scale[0] || level < 0 || level > 30 ||
+            std::abs(levelValue - static_cast<double>(level)) > 1.0e-9) {
+            if (errorMessage) *errorMessage = QObject::tr(
+                "OME scale for group %1 is not a dyadic L0 scale").arg(group);
+            return std::nullopt;
         }
-        return std::nullopt;
-    };
-    const auto baseScale = datasetScale(QStringLiteral("0"));
-    const auto groupScale = datasetScale(group);
-    if (!baseScale || !groupScale) {
-        if (errorMessage) *errorMessage = QObject::tr(
-            "OME scale metadata for groups 0 and %1 is required").arg(group);
+        return level;
+    } catch (const std::exception& error) {
+        if (errorMessage) *errorMessage = QObject::tr("Cannot read OME metadata at %1: %2")
+            .arg(rootPath, QString::fromUtf8(error.what()));
         return std::nullopt;
     }
-    const double levelValue = std::log2(*groupScale / *baseScale);
-    const int level = static_cast<int>(std::llround(levelValue));
-    if (level < 0 || level > 30 || !std::isfinite(levelValue) ||
-        std::abs(levelValue - static_cast<double>(level)) > 1.0e-9) {
-        if (errorMessage) *errorMessage = QObject::tr(
-            "OME scale for group %1 is not a dyadic L0 scale").arg(group);
-        return std::nullopt;
-    }
-    return level;
 }
 
 // Shape of an OME store's level-zero array, the grid its group scaledowns
-// are relative to. Reads the array metadata directly (Zarr v2 ``.zarray`` or
-// v3 ``zarr.json``) so it needs no chunk access.
+// are relative to, from its metadata alone.
 std::optional<std::array<std::size_t, 3>> omeLevelZeroShapeZYX(
     const QString& rootPath, QString* errorMessage)
 {
-    const QDir level(QDir(rootPath).filePath(QStringLiteral("0")));
-    for (const QString& name : {QStringLiteral(".zarray"), QStringLiteral("zarr.json")}) {
-        QFile metadataFile(level.filePath(name));
-        if (!metadataFile.open(QIODevice::ReadOnly)) continue;
-        QJsonParseError parseError;
-        const QJsonDocument document = QJsonDocument::fromJson(
-            metadataFile.readAll(), &parseError);
-        if (parseError.error != QJsonParseError::NoError || !document.isObject()) {
-            if (errorMessage) *errorMessage = QObject::tr("Malformed Zarr metadata at %1: %2")
-                .arg(metadataFile.fileName(), parseError.errorString());
+    try {
+        // Through the caches, under VC's cache settings (a remote store's levels are kept there).
+        const auto options = vc::settings::remoteOpenOptions(vc3d::remoteCachePathFs());
+        for (const auto& level : vcr::zarr::pyramidLevels(rootPath.toStdString(), options)) {
+            if (level.level != 0) continue;
+            if (level.meta.shape.size() == 3 &&
+                std::all_of(level.meta.shape.begin(), level.meta.shape.end(), [](auto size) { return size > 0; }))
+                return std::array<std::size_t, 3>{std::size_t(level.meta.shape[0]), std::size_t(level.meta.shape[1]),
+                                                  std::size_t(level.meta.shape[2])};
+            if (errorMessage) *errorMessage = QObject::tr(
+                "Zarr level zero below %1 must declare a three-axis positive shape").arg(rootPath);
             return std::nullopt;
         }
-        const QJsonArray shape = document.object().value(QStringLiteral("shape")).toArray();
-        std::array<std::size_t, 3> result{};
-        if (shape.size() == 3) {
-            bool valid = true;
-            for (int axis = 0; axis < 3; ++axis) {
-                const double value = shape.at(axis).toDouble(-1.0);
-                if (!(value > 0.0) || value != std::floor(value)) { valid = false; break; }
-                result[axis] = static_cast<std::size_t>(value);
-            }
-            if (valid) return result;
-        }
         if (errorMessage) *errorMessage = QObject::tr(
-            "Zarr metadata at %1 must declare a three-axis positive shape")
-            .arg(metadataFile.fileName());
-        return std::nullopt;
+            "Cannot read level-zero Zarr array metadata below %1").arg(rootPath);
+    } catch (const std::exception& error) {
+        if (errorMessage) *errorMessage = QObject::tr(
+            "Malformed Zarr metadata below %1: %2").arg(rootPath, QString::fromUtf8(error.what()));
     }
-    if (errorMessage) *errorMessage = QObject::tr(
-        "Cannot read level-zero Zarr array metadata below %1").arg(rootPath);
     return std::nullopt;
 }
 
@@ -278,10 +216,8 @@ SpiralWorkspace::SpiralWorkspace(CState* mainState, QWidget* parent)
 {
     setObjectName(QStringLiteral("spiralWorkspaceWindow"));
     setDockOptions(QMainWindow::AnimatedDocks | QMainWindow::AllowNestedDocks | QMainWindow::AllowTabbedDocks);
-    // Regular volume chunks use the process service. Derived surface tiles
-    // remain local to each ViewerManager.
-    _state = new CState(
-        this, _mainState && _mainState->debugDownloadQueueEnabled(), _mainState);
+    // Volumes are opened through the main state's OpenedVolumes.
+    _state = new CState(this, _mainState);
     connect(_state,&CState::objectStoreChanged,this,[this](const vc::objects::StoreSessionEvent& event) {
         if(event.kind==vc::objects::StoreSessionEvent::Kind::Attached || event.kind == vc::objects::StoreSessionEvent::Kind::Detached) {
             cancelLineAnnotationDraft();
@@ -302,11 +238,6 @@ SpiralWorkspace::SpiralWorkspace(CState* mainState, QWidget* parent)
         syncSurfaceDrafts();
     });
     _viewerManager = std::make_unique<ViewerManager>(_state, _state->pointCollection(), this);
-    // The flattened preview is this workspace's primary pane: stop publishing
-    // raw-path chunk demand for frames the SurfaceCache fully serves, so its
-    // tile fills are not starved behind interactive fetches the frame never
-    // reads.
-    _viewerManager->setPreferSurfaceTileFills(true);
     _slices = std::make_unique<AxisAlignedSliceController>(_state, this);
     _slices->setViewerManager(_viewerManager.get());
     // Spiral always uses axis-aligned slices; don't write the user's global
@@ -902,16 +833,35 @@ void SpiralWorkspace::loadInputSurfaces(const QJsonObject& servicePaths, quint64
             const QString category = QString::fromLatin1(categoryText);
             const QString rootPath = paths.value(QString::fromLatin1(pathKey)).toString();
             if (rootPath.isEmpty()) continue;
+            // The root is one surface, or holds surfaces: tifxyz directories with their metadata,
+            // which vc_reader lists (a directory missing a coordinate file is not one; malformed
+            // metadata is an entry with an error, skipped with a warning).
             QStringList candidates;
             const QFileInfo root(rootPath);
+            std::vector<vcr::tifxyz::Entry> entries;
             if (root.isDir() && QFileInfo(QDir(rootPath).filePath(QStringLiteral("meta.json"))).isFile()) {
-                candidates.push_back(root.absoluteFilePath());
+                vcr::tifxyz::Entry entry;
+                entry.location = root.absoluteFilePath().toStdString();
+                try {
+                    entry.metadata = vcr::tifxyz::readMetadata(entry.location);
+                } catch (const std::exception& error) {
+                    entry.error = error.what();
+                }
+                entries.push_back(std::move(entry));
             } else if (root.isDir()) {
-                const QFileInfoList children = QDir(rootPath).entryInfoList(
-                    QDir::Dirs | QDir::NoDotAndDotDot, QDir::Name);
-                for (const QFileInfo& child : children)
-                    if (QFileInfo(QDir(child.absoluteFilePath()).filePath(QStringLiteral("meta.json"))).isFile())
-                        candidates.push_back(child.absoluteFilePath());
+                try {
+                    entries = vcr::tifxyz::list(rootPath.toStdString(), false);
+                } catch (const std::exception& error) {
+                    result.warnings.push_back(QObject::tr("Cannot list %1: %2").arg(rootPath, QString::fromUtf8(error.what())));
+                }
+            }
+            for (const auto& entry : entries) {
+                if (!entry.error.empty()) {
+                    result.warnings.push_back(QObject::tr("Skipping %1: %2")
+                                                  .arg(QString::fromStdString(entry.location), QString::fromUtf8(entry.error.c_str())));
+                    continue;
+                }
+                candidates.push_back(QString::fromStdString(entry.location));
             }
             if (candidates.isEmpty()) {
                 result.warnings.push_back(QObject::tr("No TIFXYZ surfaces found for %1 at %2")
@@ -1192,8 +1142,10 @@ void SpiralWorkspace::appendLineAnnotationDraftPoint(
         modifiers != Qt::NoModifier || !_flattenedViewer ||
         _lineAnnotationDraft->surface.get() != _flattenedViewer->currentSurface()) return;
     const cv::Vec2f surface = _flattenedViewer->sceneToSurfaceCoords(scenePoint);
-    if (!std::isfinite(surface[0]) || !std::isfinite(surface[1]) ||
-        !_lineAnnotationDraft->surface->sampleAtSurface({surface[0], surface[1]})) {
+    const cv::Vec2f grid(_lineAnnotationDraft->surface->surfaceToGrid({surface[0], surface[1]}));
+    cv::Vec3f position;
+    _lineAnnotationDraft->surface->pointSurface()->pointsAt(grid.val, 1, position.val, nullptr);
+    if (!std::isfinite(cv::norm(position))) {
         statusBar()->showMessage(tr("Point must lie on valid Spiral surface data"), 5000);
         return;
     }
@@ -1241,7 +1193,7 @@ SpiralWorkspace::resolveFiberBaseShape(QString* errorMessage) const
     for (const QString& candidate : candidates) {
         try {
             const std::string location = candidate.toStdString();
-            const std::string resolved = vc::project::isLocationRemote(location)
+            const std::string resolved = vcr::zarr::isRemote(location)
                 ? location
                 : vc::project::resolveLocalPath(
                       location, vpkg->path().parent_path()).string();
@@ -1430,15 +1382,17 @@ void SpiralWorkspace::finalizeLineAnnotationDraft()
     std::vector<cv::Vec3d> controls;
     controls.reserve(_lineAnnotationDraft->surfacePoints.size());
     for (const QPointF& point : _lineAnnotationDraft->surfacePoints) {
-        const auto sample = _lineAnnotationDraft->surface->sampleAtSurface({point.x(), point.y()});
-        if (!sample) {
+        const cv::Vec2f grid(_lineAnnotationDraft->surface->surfaceToGrid({point.x(), point.y()}));
+        cv::Vec3f position;
+        _lineAnnotationDraft->surface->pointSurface()->pointsAt(grid.val, 1, position.val, nullptr);
+        if (!std::isfinite(cv::norm(position))) {
             statusBar()->showMessage(tr(
                 "A saved control no longer samples valid preview geometry"), 10000);
             return;
         }
-        controls.emplace_back(sample.volume[0] * previewToFiberBase,
-                              sample.volume[1] * previewToFiberBase,
-                              sample.volume[2] * previewToFiberBase);
+        controls.emplace_back(position[0] * previewToFiberBase,
+                              position[1] * previewToFiberBase,
+                              position[2] * previewToFiberBase);
     }
     for (size_t i = 0; i < controls.size(); ++i) {
         for (size_t j = 0; j < i; ++j) {
@@ -2010,8 +1964,11 @@ void SpiralWorkspace::loadPreview(const QString& manifestPath, qint64 generation
             || windingMapName.startsWith(QStringLiteral("../")))
             return failure(QObject::tr("Invalid Spiral winding-ID map path"));
         const QString windingMapPath = QDir(artifactRoot).filePath(windingMapName);
-        cv::Mat windingImage = cv::imread(
-            windingMapPath.toStdString(), cv::IMREAD_UNCHANGED);
+        cv::Mat windingImage;
+        try {
+            windingImage = vc::core::util::imageMat(vcr::sources::readImagePage(std::filesystem::path(windingMapPath.toStdString()).string(), 0));
+        } catch (const std::exception&) {
+        }
         if (windingImage.empty() || windingImage.channels() != 1)
             return failure(QObject::tr("Cannot read Spiral winding-ID map"));
         cv::Mat windingValues;
@@ -2066,10 +2023,14 @@ void SpiralWorkspace::loadPreview(const QString& manifestPath, qint64 generation
                     "Spiral winding bounds do not match the winding-ID map"));
         }
 
-        QFile metadata(QDir(surfacePath).filePath(QStringLiteral("meta.json")));
-        if (!metadata.open(QIODevice::ReadOnly))
+        QJsonObject meta;
+        try {
+            // The surface's metadata as vc_reader reads it; the compared fields are its extras.
+            const auto extra = vcr::tifxyz::readMetadata(surfacePath.toStdString()).extra.dump();
+            meta = QJsonDocument::fromJson(QByteArray::fromStdString(extra)).object();
+        } catch (const std::exception&) {
             return failure(QObject::tr("Spiral preview surface metadata is missing"));
-        const QJsonObject meta = QJsonDocument::fromJson(metadata.readAll()).object();
+        }
         if (meta.value(QStringLiteral("winding_id_map"))
                 != manifest.value(QStringLiteral("winding_id_map"))
             || meta.value(QStringLiteral("winding_bounds"))
@@ -2090,7 +2051,6 @@ void SpiralWorkspace::loadPreview(const QString& manifestPath, qint64 generation
             // compact display surface.
             auto surface = std::make_shared<QuadSurface>(surfacePath.toStdString());
             surface->id = surfaceId.toStdString();
-            surface->setStrictQuadRenderValidity(true);
             const cv::Size gridSize = surface->gridSize();
             const QJsonArray gridShape =
                 manifest.value(QStringLiteral("grid_shape")).toArray();
@@ -2586,8 +2546,7 @@ void SpiralWorkspace::panFlattenedViewerToColumn(float column)
     const cv::Vec2f viewCenter = _flattenedViewer->sceneToSurfaceCoords(
         view->mapToScene(view->viewport()->rect().center()));
     const float surfaceX = column / scale[0] - center[0];
-    _flattenedViewer->centerOnSurfacePoint(cv::Vec2f(surfaceX, viewCenter[1]),
-                                           true);
+    _flattenedViewer->centerOnSurfacePoint(cv::Vec2f(surfaceX, viewCenter[1]));
 }
 
 void SpiralWorkspace::updateWindingTransitionOverlay()
@@ -2723,7 +2682,6 @@ void SpiralWorkspace::applyPreviewWindingRange(bool preserveFocus)
                 cv::Mat windingDepth;
                 windingRegion.convertTo(windingDepth, CV_32F);
                 loaded->setChannel("d", windingDepth);
-                loaded->setStrictQuadRenderValidity(true);
                 return std::shared_ptr<QuadSurface>(std::move(loaded));
             } catch (const std::exception&) {
                 return std::shared_ptr<QuadSurface>{};

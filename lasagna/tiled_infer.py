@@ -2,7 +2,8 @@ from pathlib import Path
 import argparse
 from typing import Optional
 
-import tifffile
+from vc_reader import images
+from vc_reader.reader import open_zarr
 import numpy as np
 import torch
 import cv2
@@ -18,16 +19,9 @@ def _load_tiff_layer_uint8_norm(path: Path, layer: Optional[int], device: torch.
     - If stack is 3D, use the given `layer` index (default 0 if None).
     - If dtype is uint16: downscale to uint8 via division by 257.
     """
-    with tifffile.TiffFile(str(path)) as tif:
-        series = tif.series[0]
-        shape = series.shape
-        if len(shape) == 2:
-            img = series.asarray()
-        elif len(shape) == 3:
-            idx = 0 if layer is None else int(layer)
-            img = series.asarray(key=idx)
-        else:
-            raise ValueError(f"Unsupported TIFF shape {shape} for {path}")
+    img = images.read(path, page=0 if layer is None else int(layer))
+    if img.ndim != 2:
+        raise ValueError(f"Unsupported TIFF shape {img.shape} for {path}")
 
     if img.dtype == np.uint16:
         img = (img // 257).astype(np.uint8)
@@ -80,14 +74,7 @@ def _load_omezarr_z_uint8_norm(
     - `path` must point directly to a zarr array (not a group).
     - array must have exactly 3 dims: (Z,Y,X).
     """
-    try:
-        import zarr  # type: ignore
-    except Exception as e:  # pragma: no cover
-        raise ImportError("OME-Zarr loading requires the 'zarr' package") from e
-
-    a = zarr.open(str(path), mode="r")
-    if not hasattr(a, "shape"):
-        raise ValueError(f"OME-Zarr path must point to an array, got non-array: {path}")
+    a = open_zarr(path)
     sh = tuple(int(v) for v in a.shape)
     if len(sh) != 3:
         raise ValueError(f"OME-Zarr array must have shape (Z,Y,X), got {sh} for {path}")
@@ -196,13 +183,13 @@ def tiled_unet_infer(
     dir1_np = pred_np[3] if pred_np.shape[0] > 3 else None
 
     # Float32 TIFFs.
-    tifffile.imwrite(f"{prefix}_cos.tif", cos_np, compression="lzw")
+    images.write_tiff(f"{prefix}_cos.tif", cos_np, compression="lzw")
     if mag_np is not None:
-        tifffile.imwrite(f"{prefix}_mag.tif", mag_np, compression="lzw")
+        images.write_tiff(f"{prefix}_mag.tif", mag_np, compression="lzw")
     if dir0_np is not None:
-        tifffile.imwrite(f"{prefix}_dir0.tif", dir0_np, compression="lzw")
+        images.write_tiff(f"{prefix}_dir0.tif", dir0_np, compression="lzw")
     if dir1_np is not None:
-        tifffile.imwrite(f"{prefix}_dir1.tif", dir1_np, compression="lzw")
+        images.write_tiff(f"{prefix}_dir1.tif", dir1_np, compression="lzw")
 
     # 8-bit JPGs for fast visualization.
     cos_u8 = _to_uint8(cos_np)

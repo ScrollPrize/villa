@@ -12,7 +12,7 @@
 
 #include <exception>
 
-#include "utils/Json.hpp"
+#include <nlohmann/json.hpp>
 
 SegmentationCustomParamsPanel::SegmentationCustomParamsPanel(const QString& settingsGroup,
                                                              QWidget* parent)
@@ -103,7 +103,7 @@ void SegmentationCustomParamsPanel::validateCustomParamsText()
     _customParamsError = error;
 }
 
-utils::Json SegmentationCustomParamsPanel::parseCustomParams(QString* error) const
+nlohmann::json SegmentationCustomParamsPanel::parseCustomParams(QString* error) const
 {
     if (error) {
         error->clear();
@@ -111,18 +111,18 @@ utils::Json SegmentationCustomParamsPanel::parseCustomParams(QString* error) con
 
     const QString trimmed = paramsTextForProfile(_customParamsProfile).trimmed();
     if (trimmed.isEmpty()) {
-        return utils::Json{};
+        return nlohmann::json{};
     }
 
     try {
         const QByteArray utf8 = trimmed.toUtf8();
-        utils::Json parsed = utils::Json::parse(
+        nlohmann::json parsed = nlohmann::json::parse(
             std::string_view(utf8.constData(), utf8.size()));
         if (!parsed.is_object()) {
             if (error) {
                 *error = tr("Custom params must be a JSON object.");
             }
-            return utils::Json{};
+            return nlohmann::json{};
         }
         return parsed;
     } catch (const std::exception& ex) {
@@ -136,15 +136,15 @@ utils::Json SegmentationCustomParamsPanel::parseCustomParams(QString* error) con
         }
     }
 
-    return utils::Json{};
+    return nlohmann::json{};
 }
 
-utils::Json SegmentationCustomParamsPanel::customParamsJson() const
+nlohmann::json SegmentationCustomParamsPanel::customParamsJson() const
 {
     QString error;
     auto parsed = parseCustomParams(&error);
     if (!error.isEmpty()) {
-        return utils::Json{};
+        return nlohmann::json{};
     }
     return parsed;
 }

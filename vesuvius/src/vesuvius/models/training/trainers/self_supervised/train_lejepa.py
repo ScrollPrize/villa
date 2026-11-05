@@ -32,7 +32,7 @@ from vesuvius.models.training.lr_schedulers import get_scheduler
 from vesuvius.models.utils import empty_cache
 
 from vesuvius.models.build.primus_wrapper import PrimusEncoder
-from vesuvius.models.augmentation.pipelines.training_transforms import create_training_transforms
+from vesuvius.models.augmentation.pipelines.training_transforms import create_training_transforms, sample_seed
 
 
 class ProjectionMLP(nn.Module):
@@ -241,99 +241,36 @@ class TrainLeJEPA(BaseTrainer):
         - SharpeningTransform (texture variation)
         - InvertImageTransform (like RandomSolarize)
         """
-        from vesuvius.models.augmentation.transforms.intensity.contrast import ContrastTransform, BGContrast
-        from vesuvius.models.augmentation.transforms.intensity.gamma import GammaTransform
-        from vesuvius.models.augmentation.transforms.intensity.brightness import MultiplicativeBrightnessTransform
-        from vesuvius.models.augmentation.transforms.intensity.inversion import InvertImageTransform
-        from vesuvius.models.augmentation.transforms.spatial.low_resolution import SimulateLowResolutionTransform
-        from vesuvius.models.augmentation.transforms.noise.gaussian_blur import GaussianBlurTransform
-        from vesuvius.models.augmentation.transforms.noise import SharpeningTransform
-        from vesuvius.models.augmentation.transforms.spatial.mirroring import MirrorTransform
-        from vesuvius.models.augmentation.transforms.utils.random import RandomTransform
-        from vesuvius.models.augmentation.transforms.utils.compose import ComposeTransforms
-        from vesuvius.models.augmentation.transforms.utils.oneoftransform import OneOfTransform
+        from vc_reader import transforms as A
 
-        transforms = [
+        return A.Pipeline([
             # Geometric - H and V flip
-            MirrorTransform(allowed_axes=(0, 1)),
+            A.Flip(axes="yx", p_axis=0.5),
 
             # Intensity variations (like ColorJitter) - one of contrast or brightness
-            OneOfTransform([
-                RandomTransform(
-                    ContrastTransform(
-                        contrast_range=BGContrast((0.7, 1.3)),
-                        preserve_range=True,
-                        synchronize_channels=True,
-                        p_per_channel=1.0,
-                    ),
-                    apply_probability=0.5,
-                ),
-                RandomTransform(
-                    MultiplicativeBrightnessTransform(
-                        multiplier_range=BGContrast((0.7, 1.3)),
-                        synchronize_channels=True,
-                        p_per_channel=1.0,
-                    ),
-                    apply_probability=0.5,
-                ),
+            A.OneOf(transforms=[
+                A.Contrast(factor=A.Uniform(0.7, 1.3), preserve_range=True, shared=True, p=0.5),
+                A.BrightnessMultiply(factor=A.Uniform(0.7, 1.3), shared=True, p=0.5),
             ]),
 
-            # Gamma (non-linear intensity)
-            RandomTransform(
-                GammaTransform(
-                    gamma=BGContrast((0.7, 1.5)),
-                    p_invert_image=0,
-                    synchronize_channels=True,
-                    p_per_channel=1,
-                    p_retain_stats=1
-                ),
-                apply_probability=0.3
-            ),
+            # Gamma (non-linear intensity): half the draws below 1, half above
+            A.OneOf(transforms=[
+                A.Gamma(gamma=A.Uniform(0.7, 1), p_retain_stats=1, shared=True),
+                A.Gamma(gamma=A.Uniform(1, 1.5), p_retain_stats=1, shared=True),
+            ], p=0.3),
 
             # Gaussian blur
-            RandomTransform(
-                GaussianBlurTransform(
-                    blur_sigma=(0.1, 2.0),
-                    synchronize_channels=True,
-                    synchronize_axes=True,
-                    p_per_channel=1.0,
-                ),
-                apply_probability=0.5,
-            ),
+            A.GaussianBlur(sigma=A.Uniform(0.1, 2.0), shared=True, shared_axes=True, p=0.5),
 
             # Low resolution simulation - multi-scale robustness
-            RandomTransform(
-                SimulateLowResolutionTransform(
-                    scale=(0.5, 1.0),
-                    synchronize_channels=True,
-                    synchronize_axes=True,
-                    ignore_axes=None,
-                ),
-                apply_probability=0.25
-            ),
+            A.LowResolution(scale=A.Uniform(0.5, 1.0), shared=True, shared_axes=True, p=0.25),
 
             # Sharpening - texture variation
-            RandomTransform(
-                SharpeningTransform(
-                    strength=(0.1, 1.0),
-                    p_same_for_each_channel=1.0,
-                    p_per_channel=1.0,
-                ),
-                apply_probability=0.2
-            ),
+            A.Sharpen(strength=A.Uniform(0.1, 1.0), shared=True, p=0.2),
 
             # Inversion (like RandomSolarize from reference)
-            RandomTransform(
-                InvertImageTransform(
-                    p_invert_image=1,
-                    p_synchronize_channels=1.0,
-                    p_per_channel=1.0,
-                ),
-                apply_probability=0.1
-            ),
-        ]
-
-        return ComposeTransforms(transforms)
+            A.Invert(shared=True, p=0.1),
+        ], targets={"image": A.Image()})
 
     def _build_model(self):
         """Build PrimusEncoder and projection head for LeJEPA pretraining."""
@@ -446,9 +383,8 @@ class TrainLeJEPA(BaseTrainer):
             # Extract single sample (C, D, H, W)
             sample = x[i]
             # Apply augmentation - transforms expect dict with 'image' key
-            data_dict = {"image": sample}
-            aug_dict = self.augmentation(**data_dict)
-            augmented.append(aug_dict["image"])
+            aug_dict = self.augmentation({"image": sample.detach().cpu()}, seed=sample_seed(i))
+            augmented.append(aug_dict["image"].to(sample.device))
 
         return torch.stack(augmented, dim=0)
 
