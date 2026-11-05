@@ -34,10 +34,12 @@ class PatchCacheParams:
     unlabeled_fg_enabled: bool = True
     unlabeled_fg_threshold: float = 0.05
     unlabeled_fg_bbox_threshold: float = 0.15
+    bg_sampling_enabled: bool = False
+    bg_ignore_label: Optional[float] = None
 
     def to_dict(self) -> Dict[str, Any]:
-        """Convert to dictionary for serialization."""
-        return {
+        """Convert to dictionary; disabled-background keys remain unchanged."""
+        params = {
             "schema_version": SCHEMA_VERSION,
             "data_path": self.data_path,
             "volume_ids": list(self.volume_ids),
@@ -50,6 +52,9 @@ class PatchCacheParams:
             "unlabeled_fg_threshold": float(self.unlabeled_fg_threshold),
             "unlabeled_fg_bbox_threshold": float(self.unlabeled_fg_bbox_threshold),
         }
+        if self.bg_sampling_enabled:
+            params.update(bg_sampling_enabled=True, bg_ignore_label=self.bg_ignore_label)
+        return params
 
 
 @dataclass
@@ -70,6 +75,16 @@ class PatchCacheData:
     unlabeled_fg_patches: List[PatchEntry]
 
 
+def background_cache_options(enabled: bool, target_info: dict) -> dict:
+    """Bind background collection to the label target actually being scanned."""
+    if not enabled:
+        return {}
+    ignore = next((target_info.get(key) for key in
+                   ("ignore_label", "ignore_index", "ignore_value")
+                   if target_info.get(key) is not None), None)
+    return {"bg_sampling_enabled": True, "bg_ignore_label": ignore}
+
+
 def build_cache_params(
     *,
     data_path: str | Path,
@@ -82,8 +97,28 @@ def build_cache_params(
     unlabeled_fg_enabled: bool = True,
     unlabeled_fg_threshold: float = 0.05,
     unlabeled_fg_bbox_threshold: float = 0.15,
+    bg_sampling_enabled: bool = False,
+    bg_ignore_label: Optional[float] = None,
 ) -> PatchCacheParams:
     """Build cache params from individual arguments."""
+    if bg_sampling_enabled:
+        import math
+
+        def label(value, name):
+            if isinstance(value, bool):
+                raise ValueError(f"Background sampling requires a finite nonzero {name}")
+            try:
+                value = float(value)
+            except (TypeError, ValueError, OverflowError):
+                raise ValueError(f"Background sampling requires an explicit finite nonzero {name}") from None
+            if not math.isfinite(value) or value == 0:
+                raise ValueError(f"Background sampling requires a finite nonzero {name}")
+            return value
+
+        valid_patch_value = label(valid_patch_value, "valid_patch_value")
+        bg_ignore_label = label(bg_ignore_label, "ignore label for the scanned target")
+        if valid_patch_value == bg_ignore_label:
+            raise ValueError("Background foreground and ignore labels must differ")
     return PatchCacheParams(
         data_path=str(Path(data_path).resolve()),
         volume_ids=tuple(sorted(volume_ids)),
@@ -95,6 +130,8 @@ def build_cache_params(
         unlabeled_fg_enabled=bool(unlabeled_fg_enabled),
         unlabeled_fg_threshold=float(unlabeled_fg_threshold),
         unlabeled_fg_bbox_threshold=float(unlabeled_fg_bbox_threshold),
+        bg_sampling_enabled=bool(bg_sampling_enabled),
+        bg_ignore_label=bg_ignore_label,
     )
 
 
@@ -227,6 +264,8 @@ def try_load_patch_cache(
     unlabeled_fg_enabled: bool = True,
     unlabeled_fg_threshold: float = 0.05,
     unlabeled_fg_bbox_threshold: float = 0.15,
+    bg_sampling_enabled: bool = False,
+    bg_ignore_label: Optional[float] = None,
 ) -> Optional[PatchCacheData]:
     """
     Convenience function to build cache params and load cache if it exists.
@@ -272,5 +311,7 @@ def try_load_patch_cache(
         unlabeled_fg_enabled=unlabeled_fg_enabled,
         unlabeled_fg_threshold=unlabeled_fg_threshold,
         unlabeled_fg_bbox_threshold=unlabeled_fg_bbox_threshold,
+        bg_sampling_enabled=bool(bg_sampling_enabled),
+        bg_ignore_label=bg_ignore_label,
     )
     return load_patch_cache(cache_dir, params)
