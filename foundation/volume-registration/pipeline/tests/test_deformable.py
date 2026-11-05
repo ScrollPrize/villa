@@ -28,6 +28,7 @@ from volreg.cores.deformable import (
     fit_affine,
     fit_correction,
     fit_deformable,
+    fold_errors,
     normalisation,
     predict_deformable,
     smoother,
@@ -436,3 +437,19 @@ def test_a_capped_bend_takes_the_stiffest_of_the_levels_tied_lowest():
     again, _edf, _rows = choose_regularisation(nudged, moving, matrix, groups,
                                                max_leverage=0.5, groups=groups)
     assert again == lam
+
+
+def test_held_out_errors_read_off_the_full_fit_match_refitting_each_group():
+    rng = np.random.default_rng(3)
+    moving = rng.uniform(0, 1000, size=(120, 3))
+    fixed = moving * 1.01 + 5 + 3 * np.sin(moving / 150) + rng.normal(0, 0.3, size=moving.shape)
+    matrix = np.hstack([np.eye(3) * 1.01, np.full((3, 1), 5.0)])
+    labels = np.repeat(np.arange(30), 4)
+    centre, scale = normalisation(moving)
+    control = (moving - centre) / scale
+    for lam in (1e-4, 1e-2, 1.0):
+        weights = capped_weights(control, lam, labels, 0.5)
+        refitted = fold_errors(fixed, moving, matrix, labels, lam, centre, scale, weights)
+        read_off = fold_errors(fixed, moving, matrix, labels, lam, centre, scale, weights,
+                               smoother(control, lam, weights))
+        assert np.allclose(read_off, refitted, rtol=1e-8, atol=1e-10)

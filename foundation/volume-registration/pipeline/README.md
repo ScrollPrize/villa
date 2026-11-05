@@ -4,7 +4,10 @@ The production version of the registration review process; see `DESIGN.md` for w
 and why. Built so far:
 
 - **step 1**: the record and the migration of the first runs;
-- **step 2, in part**: the cores, merged in unchanged except for imports, with their tests;
+- **step 2, in part**: the cores, merged in unchanged except for imports, with their tests --
+  and one change since: `deformable.fold_errors` reads each held-out patch's error off the
+  full fit instead of refitting without it (the same numbers to 1e-12, one solve per
+  smoothing level instead of one per patch);
 - **step 3**: the engine, the stage table and the command;
 - **step 4**: every automatic stage. Capture check, hold-out draw and measurement, sampling
   and fitting run on `cores/fit_session.py`; scoring and storing run on the record.
@@ -40,7 +43,7 @@ Two things behave differently from the first runs:
 | `volreg/engine.py` | state read off the files, as make does: done, stale, running, failed, ready, waiting, blocked; background jobs; redo |
 | `volreg/stages.py` | the stage table of `DESIGN.md`, and what each stage does |
 | `volreg/cli.py` | `run`, `status`, `answer`, `more`, `redo`, `adopt`, `job`, `check`, `migrate`, `import` |
-| `volreg/cores/` | algorithms merged in from the research modules, unchanged except for imports: `deformable.py`, `transform_fit.py`, `dense_correlation.py`, the transform file I/O, point fits and volume reading of `transform_utils.py`, and `read_patch` of `blob_snap.py`, `fit_session.py` and `session_overview.py` |
+| `volreg/cores/` | algorithms merged in from the research modules, unchanged except for imports and the held-out errors of `deformable.fold_errors`: `deformable.py`, `transform_fit.py`, `dense_correlation.py`, the transform file I/O, point fits and volume reading of `transform_utils.py`, and `read_patch` of `blob_snap.py`, `fit_session.py` and `session_overview.py` |
 
 ## Stages
 

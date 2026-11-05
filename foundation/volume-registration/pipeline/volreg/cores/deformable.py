@@ -425,6 +425,9 @@ FOLDS = 8
 SEED = 0
 # Below this a fold is measuring conditioning rather than prediction.
 MIN_TRAIN = 10
+# Above this condition number of I - S_gg a held-out group is refitted rather than read
+# off the full fit: the spline follows it so closely that the identity loses digits.
+LEAVE_OUT_MAX_CONDITION = 1e8
 # With the leverage capped, smoothing levels whose held-out error is within this share of
 # the lowest count as tied, and the stiffest of them is taken.
 TIED_SHARE = 0.005
@@ -453,7 +456,7 @@ def spatial_folds(points, folds=FOLDS, seed=SEED):
 
 
 def fold_errors(fixed, moving, matrix, labels, lam, centre=None, scale=None,
-                point_weights=None):
+                point_weights=None, smoothing=None):
     """Error at every point, from a model that never saw that point's region.
 
     `lam` of None is the affine, refitted on the training set exactly as every bend is.
@@ -470,6 +473,17 @@ def fold_errors(fixed, moving, matrix, labels, lam, centre=None, scale=None,
 
     Normalisation is taken from the whole set so that a fold cannot change what `lam`
     means by changing the coordinates it is measured in.
+
+    With `smoothing`, the bend's `S` on all the points (`smoother` with the same `lam` and
+    weights), no fold is refitted: the spline is a penalised least-squares fit, so what
+    a fit without group g predicts at g follows from the fit on everything,
+
+        f_(-g)(x_g) = (I - S_gg)^-1 (fitted_g - S_gg y_g),
+
+    the leave-out identity of smoothing splines. One solve per smoothing level instead
+    of one per group: refitting cost the patch hold-out groups x points^3, which on 560
+    patches and 3400 octant points was hours a pass. A group where `I - S_gg` is near
+    singular (the spline all but interpolates it) is refitted as before.
     """
     fixed = np.asarray(fixed, float)
     moving = np.asarray(moving, float)
@@ -477,10 +491,22 @@ def fold_errors(fixed, moving, matrix, labels, lam, centre=None, scale=None,
     if centre is None or scale is None:
         centre, scale = normalisation(moving)
     errors = np.full(len(fixed), np.nan)
+    fitted = None
+    if smoothing is not None and lam is not None:
+        residual = fixed - (moving @ matrix[:, :3].T + matrix[:, 3])
+        fitted = smoothing @ residual
     for group in np.unique(labels):
         train, held = labels != group, labels == group
         if train.sum() < MIN_TRAIN:
             continue
+        if fitted is not None:
+            inside = np.flatnonzero(held)
+            block = np.eye(len(inside)) - smoothing[np.ix_(inside, inside)]
+            if np.linalg.cond(block) < LEAVE_OUT_MAX_CONDITION:
+                left_out = np.linalg.solve(block, fitted[inside]
+                                           - smoothing[np.ix_(inside, inside)] @ residual[inside])
+                errors[held] = np.linalg.norm(left_out - residual[inside], axis=1)
+                continue
         try:
             if lam is None:
                 linear, offset = fit_affine(fixed[train], moving[train])
@@ -584,10 +610,12 @@ def choose_regularisation(fixed, moving, matrix, labels=None, lambdas=LAMBDAS,
             weights = capped_weights(control, lam, groups, max_leverage)
             if weights is None:
                 continue
-        errors = fold_errors(fixed, moving, matrix, labels, lam, centre, scale, weights)
+        smoothing = smoother(control, lam, weights)
+        errors = fold_errors(fixed, moving, matrix, labels, lam, centre, scale, weights,
+                             smoothing)
         if np.isfinite(errors).sum() < MIN_TRAIN:
             continue
-        edf = effective_dof(control, lam, weights)
+        edf = float(np.trace(smoothing))
         rows.append((fold_score(f"lam={lam:.0e}", int(round(3 * edf)), errors, labels),
                      lam, edf))
 
