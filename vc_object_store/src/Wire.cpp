@@ -421,16 +421,20 @@ std::string kindQueryRequestToJson(const KindQuery& query)
     Json j = Json::object();
     if (query.kind) j["kind"] = *query.kind;
     if (query.includeRetired) j["include_retired"] = true;
+    if (query.unboundVolume) j["unbound_volume"] = *query.unboundVolume;
     return j.dump();
 }
 
 KindQuery kindQueryRequestFromJson(const std::string& text)
 {
     const auto j = Json::parse(text);
-    requireKeys(j, {"kind", "include_retired"}, "kind query");
+    requireKeys(j, {"kind", "include_retired", "unbound_volume"}, "kind query");
     KindQuery query;
     if (j.contains("kind")) query.kind = j.at("kind").get<std::string>();
     query.includeRetired = j.value("include_retired", false);
+    if (j.contains("unbound_volume")) query.unboundVolume = j.at("unbound_volume").get<std::string>();
+    if (query.unboundVolume && query.includeRetired)
+        throw std::invalid_argument("kind query: unbound counts are of live objects");
     return query;
 }
 

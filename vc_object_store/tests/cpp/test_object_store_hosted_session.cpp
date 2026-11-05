@@ -166,6 +166,10 @@ try {
             mustFail([&] { (void)reader.readGeometryArray(revision, "points", 0, 1 << 20); });
             ObjectSelection all; all.kind = "surface";
             require(reader.selectObjects(all).size() == 1 && reader.selectEdges({}).empty(), "reader listings");
+            const auto state = reader.status();
+            const std::vector<ObjectVersion> pair{{state.storeUuid, state.generation, surface, 1}, {state.storeUuid, state.generation, fiber, 1}};
+            require(reader.relationshipsAt(pair).size() == expected.relationshipsAt(pair).size(), "reader relationships at versions");
+            mustFail([&] { (void)reader.relationshipsAt({{state.storeUuid, state.generation, surface, 9}}); });
             const auto projected = reader.selectObjects(all, std::vector<std::string>{});
             require(projected.size() == 1 && projected[0].uuid == surface && projected[0].meta == "{}" &&
                     projected[0].version == expected.selectObjects(all).front().version, "reader projection");
@@ -209,8 +213,16 @@ try {
 
     // A checked edit through the session; its own cache sees it at once, and
     // the next check reports it with its kind.
+    const auto before = session.status(hosted);
     const auto receipt = session.submit(hosted, request(session, hosted, {{track, 1}}, {SetMetaOp{track, "note", "\"one\""}}));
     require(receipt.objects.at(track) == 2 && session.currentObject(hosted, track)->version == 2, "own edit visible");
+    session.readStore(hosted, [&](const StoreReader& reader, const auto&) {
+        const FeedCursor since{before.storeUuid, before.generation, before.commitSequence};
+        require(changesTouchKinds(reader, since, {"track"}) && !changesTouchKinds(reader, since, {"surface", "fiber"}) &&
+                changesTouchKinds(reader, {before.storeUuid, util::newUuid(), 0}, {}), "changed kinds since a position");
+        require(reader.unboundObjectCount("fiber", volume) == 0 && reader.unboundObjectCount("track", volume) == 1 &&
+                reader.unboundObjectCount("fiber", "elsewhere") == 1, "unbound counts");
+    });
     session.refresh(hosted);
     auto events = committedOf(session, hosted);
     require(events.size() == 1 && events[0].changes.size() == 1 && events[0].changes[0].recordUuid == track &&

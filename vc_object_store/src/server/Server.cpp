@@ -591,12 +591,15 @@ struct ServerState {
         const auto query = kindQueryRequestFromJson(body);
         if (!query.kind) throw std::invalid_argument("an object count needs a kind");
         auto txn = store->read();
-        return jsonReply(objectCountResultToJson(store->status(txn), store->objectCount(txn, *query.kind, query.includeRetired)));
+        const auto count = query.unboundVolume ? store->unboundObjectCount(txn, *query.kind, *query.unboundVolume)
+                                               : store->objectCount(txn, *query.kind, query.includeRetired);
+        return jsonReply(objectCountResultToJson(store->status(txn), count));
     }
 
     Reply queryTags(const std::string& body)
     {
         const auto query = kindQueryRequestFromJson(body);
+        if (query.includeRetired || query.unboundVolume) throw std::invalid_argument("tags take only a kind");
         auto txn = store->read();
         return jsonReply(objectTagsResultToJson(store->status(txn), store->objectTags(txn, query.kind)));
     }

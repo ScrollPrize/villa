@@ -84,11 +84,13 @@ std::string edgeQueryResultToJson(const StoreStatus&, const std::vector<EdgeReco
                                   const std::optional<std::vector<std::string>>& fields);
 std::vector<EdgeRecord> edgeQueryResultFromJson(const std::string&, StoreStatus* asOf);
 
-// Object counts and tags (ObjectStore::objectCount, objectTags): counts need
-// a kind; tags take an optional one and ignore `includeRetired`.
+// Object counts and tags (ObjectStore::objectCount, unboundObjectCount,
+// objectTags): counts need a kind (with `unboundVolume`, the live objects of
+// it not bound to that volume); tags take an optional kind and nothing else.
 struct KindQuery {
     std::optional<std::string> kind;
     bool includeRetired = false;
+    std::optional<std::string> unboundVolume;
 };
 std::string kindQueryRequestToJson(const KindQuery&);
 KindQuery kindQueryRequestFromJson(const std::string&);

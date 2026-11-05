@@ -117,6 +117,7 @@ public:
     // ObjectStore::componentOf / neighbours on the host (GraphQuery).
     std::vector<std::string> traverse(const GraphQuery&, StoreStatus* asOf = nullptr);
     int64_t objectCount(const std::string& kind, bool includeRetired = false, StoreStatus* asOf = nullptr);
+    int64_t unboundObjectCount(const std::string& kind, const std::string& volume, StoreStatus* asOf = nullptr);
     std::vector<std::string> objectTags(const std::optional<std::string>& kind = std::nullopt, StoreStatus* asOf = nullptr);
     // Every recorded revision of an object (empty when it never existed).
     std::vector<ObjectRevision> objectHistory(const std::string& objectUuid, StoreStatus* asOf = nullptr);

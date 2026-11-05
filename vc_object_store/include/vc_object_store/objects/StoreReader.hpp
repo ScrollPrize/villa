@@ -10,6 +10,9 @@
 // revisions) are exact, current heads may be from different commits.
 
 #include "vc_object_store/objects/ObjectStore.hpp"
+#include "vc_object_store/objects/Transactions.hpp"
+
+#include <set>
 
 namespace vc::objects {
 
@@ -19,10 +22,14 @@ public:
     // False once the reader can no longer answer (its transaction ended).
     virtual bool active() const = 0;
     virtual StoreStatus status() const = 0;
+    // The change feed after `cursor` (ObjectStore::changesSince).
+    virtual ChangePage changesSince(const FeedCursor& cursor, int64_t maxChanges = 4096) const = 0;
     // The live (or retired) current revision; nullopt when absent or deleted.
     virtual std::optional<ObjectRevision> currentObject(const std::string& objectUuid) const = 0;
     virtual std::vector<ObjectRevision> objectHistory(const std::string& objectUuid) const = 0;
     virtual std::vector<std::optional<ObjectRevision>> objectsAtVersions(const std::vector<ObjectVersion>&) const = 0;
+    // The relationships among objects at these versions (ObjectStore::relationshipsAt).
+    virtual std::vector<SelectedRelationship> relationshipsAt(const std::vector<ObjectVersion>&) const = 0;
     // The geometry of the object's current revision.
     virtual std::optional<GeometryRevision> currentGeometry(const std::string& objectUuid) const = 0;
     virtual std::optional<GeometryRevision> geometryRevision(const std::string& revisionUuid) const = 0;
@@ -57,8 +64,9 @@ public:
     virtual std::vector<std::string> neighbours(const std::string& objectUuid,
                                                 const std::optional<std::string>& edgeKind = std::nullopt,
                                                 const std::optional<std::string>& neighbourKind = std::nullopt) const = 0;
-    // As ObjectStore::objectCount and ObjectStore::objectTags.
+    // As ObjectStore::objectCount, unboundObjectCount and objectTags.
     virtual int64_t objectCount(const std::string& kind, bool includeRetired = false) const = 0;
+    virtual int64_t unboundObjectCount(const std::string& kind, const std::string& volume) const = 0;
     virtual std::vector<std::string> objectTags(const std::optional<std::string>& kind = std::nullopt) const = 0;
 
     // The transforms from the object's recorded volume to every reachable
@@ -80,6 +88,10 @@ void expectRelationshipEndpoints(const StoreReader&, VersionSelection& expected)
 // read dependencies of a write computed through a transformed view, so a
 // changed registration conflicts instead of mapping the edit wrongly.
 VersionSelection transformDependencies(const StoreReader&);
+// Whether commits after `since` may have changed records of `kinds`: true when
+// one did, when a change's kind cannot be learned (a removed relationship) or
+// when the feed position is gone. A cheap guard for caches keyed by such records.
+bool changesTouchKinds(const StoreReader&, const FeedCursor& since, const std::set<std::string>& kinds);
 
 // A reader over a caller's transaction, valid while it is.
 class LocalStoreReader final : public StoreReader {
@@ -90,9 +102,11 @@ public:
 
     bool active() const override { return txn_->active(); }
     StoreStatus status() const override;
+    ChangePage changesSince(const FeedCursor& cursor, int64_t maxChanges = 4096) const override;
     std::optional<ObjectRevision> currentObject(const std::string& objectUuid) const override;
     std::vector<ObjectRevision> objectHistory(const std::string& objectUuid) const override;
     std::vector<std::optional<ObjectRevision>> objectsAtVersions(const std::vector<ObjectVersion>&) const override;
+    std::vector<SelectedRelationship> relationshipsAt(const std::vector<ObjectVersion>&) const override;
     std::optional<GeometryRevision> currentGeometry(const std::string& objectUuid) const override;
     std::optional<GeometryRevision> geometryRevision(const std::string& revisionUuid) const override;
     std::vector<uint8_t> readGeometryArray(const std::string& revisionUuid, const std::string& arrayName,
@@ -115,6 +129,7 @@ public:
                                         const std::optional<std::string>& edgeKind = std::nullopt,
                                         const std::optional<std::string>& neighbourKind = std::nullopt) const override;
     int64_t objectCount(const std::string& kind, bool includeRetired = false) const override;
+    int64_t unboundObjectCount(const std::string& kind, const std::string& volume) const override;
     std::vector<std::string> objectTags(const std::optional<std::string>& kind = std::nullopt) const override;
 
 private:

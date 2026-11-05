@@ -551,14 +551,21 @@ std::vector<std::string> HostedStore::traverse(const GraphQuery& query, StoreSta
 int64_t HostedStore::objectCount(const std::string& kind, bool includeRetired, StoreStatus* asOf)
 {
     const auto response = impl_->http.request("POST", endpoint_ + "/v1/query/count",
-        kindQueryRequestToJson({kind, includeRetired}), {{"Content-Type", "application/json"}});
+        kindQueryRequestToJson({kind, includeRetired, std::nullopt}), {{"Content-Type", "application/json"}});
     return objectCountResultFromJson(expectOk(response, "object count").body, asOf);
+}
+
+int64_t HostedStore::unboundObjectCount(const std::string& kind, const std::string& volume, StoreStatus* asOf)
+{
+    const auto response = impl_->http.request("POST", endpoint_ + "/v1/query/count",
+        kindQueryRequestToJson({kind, false, volume}), {{"Content-Type", "application/json"}});
+    return objectCountResultFromJson(expectOk(response, "unbound object count").body, asOf);
 }
 
 std::vector<std::string> HostedStore::objectTags(const std::optional<std::string>& kind, StoreStatus* asOf)
 {
     const auto response = impl_->http.request("POST", endpoint_ + "/v1/query/tags",
-        kindQueryRequestToJson({kind, false}), {{"Content-Type", "application/json"}});
+        kindQueryRequestToJson({kind, false, std::nullopt}), {{"Content-Type", "application/json"}});
     return objectTagsResultFromJson(expectOk(response, "object tags").body, asOf);
 }
 

@@ -110,6 +110,10 @@ public:
     {
         return attachment_->objectsAtVersions(references);
     }
+    std::vector<SelectedRelationship> relationshipsAt(const std::vector<ObjectVersion>& versions) const override
+    {
+        return attachment_->client().relationshipsAt(versions);
+    }
     std::optional<GeometryRevision> currentGeometry(const std::string& objectUuid) const override;
     std::optional<GeometryRevision> geometryRevision(const std::string& revisionUuid) const override
     {
@@ -154,6 +158,14 @@ public:
     int64_t objectCount(const std::string& kind, bool includeRetired = false) const override
     {
         return attachment_->client().objectCount(kind, includeRetired);
+    }
+    int64_t unboundObjectCount(const std::string& kind, const std::string& volume) const override
+    {
+        return attachment_->client().unboundObjectCount(kind, volume);
+    }
+    ChangePage changesSince(const FeedCursor& cursor, int64_t maxChanges = 4096) const override
+    {
+        return attachment_->client().changesSince(cursor, maxChanges);
     }
     std::vector<std::string> objectTags(const std::optional<std::string>& kind = std::nullopt) const override
     {

@@ -102,7 +102,43 @@ VersionSelection transformDependencies(const StoreReader& reader)
     return result;
 }
 
+bool changesTouchKinds(const StoreReader& reader, const FeedCursor& since, const std::set<std::string>& kinds)
+{
+    const auto status = reader.status();
+    if (since.storeUuid != status.storeUuid || since.generation != status.generation) return true;
+    std::vector<ObjectVersion> objects;
+    std::vector<std::string> edges;
+    for (auto cursor = since;;) {
+        const auto page = reader.changesSince(cursor);
+        if (!page.cursorValid) return true;
+        for (const auto& commit : page.commits)
+            for (const auto& change : commit.changes)
+                if (change.recordKind == "object") objects.push_back({status.storeUuid, status.generation, change.uuid, change.version});
+                else edges.push_back(change.uuid);
+        cursor = page.next;
+        if (!page.more) break;
+    }
+    // Objects by their changed versions (a deletion's keeps the record it
+    // removed); relationships by their current record.
+    for (const auto& revision : objects.empty() ? std::vector<std::optional<ObjectRevision>>{} : reader.objectsAtVersions(objects))
+        if (!revision || kinds.contains(revision->record.kind)) return true;
+    if (edges.empty()) return false;
+    std::sort(edges.begin(), edges.end());
+    edges.erase(std::unique(edges.begin(), edges.end()), edges.end());
+    EdgeSelection selection;
+    selection.uuids = edges;
+    selection.includeRetired = true;
+    const auto found = reader.selectEdges(selection, std::vector<std::string>{"kind"});
+    if (found.size() != edges.size()) return true;
+    return std::any_of(found.begin(), found.end(), [&](const auto& edge) { return kinds.contains(edge.kind); });
+}
+
 StoreStatus LocalStoreReader::status() const { return store_->status(*txn_); }
+
+ChangePage LocalStoreReader::changesSince(const FeedCursor& cursor, int64_t maxChanges) const
+{
+    return store_->changesSince(*txn_, cursor, maxChanges);
+}
 
 std::optional<ObjectRevision> LocalStoreReader::currentObject(const std::string& objectUuid) const
 {
@@ -120,6 +156,11 @@ std::vector<std::optional<ObjectRevision>> LocalStoreReader::objectsAtVersions(
     const std::vector<ObjectVersion>& references) const
 {
     return store_->objectsAtVersions(*txn_, references);
+}
+
+std::vector<SelectedRelationship> LocalStoreReader::relationshipsAt(const std::vector<ObjectVersion>& versions) const
+{
+    return store_->relationshipsAt(*txn_, versions);
 }
 
 std::optional<GeometryRevision> LocalStoreReader::currentGeometry(const std::string& objectUuid) const
@@ -187,6 +228,11 @@ std::vector<std::string> LocalStoreReader::neighbours(const std::string& objectU
 int64_t LocalStoreReader::objectCount(const std::string& kind, bool includeRetired) const
 {
     return store_->objectCount(*txn_, kind, includeRetired);
+}
+
+int64_t LocalStoreReader::unboundObjectCount(const std::string& kind, const std::string& volume) const
+{
+    return store_->unboundObjectCount(*txn_, kind, volume);
 }
 
 std::vector<std::string> LocalStoreReader::objectTags(const std::optional<std::string>& kind) const
