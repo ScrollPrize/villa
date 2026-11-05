@@ -78,8 +78,9 @@ std::vector<Prepared> fibers(const std::filesystem::path& path, const std::vecto
     } else read(path);
     if (batch.empty()) throw std::runtime_error("no fibers were found");
     // Versions 1 and 3 name branch targets only by file, and declare each link from both ends with
-    // separately computed directions. Targets resolve through the peer file's UUID; the second
-    // declaration of a link must match the first and is dropped.
+    // separately computed directions. So do version-4 branches that VC3D saved with a branch_file
+    // but no target_uuid, as in the published fiber annotations. Targets resolve through the peer
+    // file's UUID; the second declaration of a link must match the first and is dropped.
     std::map<fs::path, std::string> fileUuids;
     std::map<std::tuple<std::string, int64_t, std::string, int64_t>, Json> fileLinks;
     const auto sameDirection = [](const Json& left, const Json& right) {
@@ -93,10 +94,13 @@ std::vector<Prepared> fibers(const std::filesystem::path& path, const std::vecto
         const auto self = batch[i].object.uuid;
         // Copy before appending peers, which can reallocate the batch.
         const auto metadata = batch[i].source;
-        const bool byFile = metadata.value("version", 0) < 4;
+        const bool legacy = metadata.value("version", 0) < 4;
         for (const auto* key : {"branches", "adjacent_branches"}) {
             auto kept = Json::array();
+            bool rewrite = legacy;
             for (auto branch : metadata.value(key, Json::array())) {
+                const bool byFile = legacy || (!branch.contains("target_uuid") && branch.contains("branch_file"));
+                rewrite = rewrite || byFile;
                 const auto peerPath = [&] {
                     return source.parent_path() / fs::path(branch.at("branch_file").get<std::string>()).filename();
                 };
@@ -125,7 +129,7 @@ std::vector<Prepared> fibers(const std::filesystem::path& path, const std::vecto
                     throw std::runtime_error("branch target UUID does not match its artifact");
                 add(peer, peerPath());
             }
-            if (byFile && metadata.contains(key)) batch[i].source[key] = std::move(kept);
+            if (rewrite && metadata.contains(key)) batch[i].source[key] = std::move(kept);
         }
     }
     return batch;

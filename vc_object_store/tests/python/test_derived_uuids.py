@@ -64,6 +64,22 @@ def test_legacy_fibers_without_uuids(tmp_path, version):
         assert again["uuids"] == [] and sorted(again["existing"]) == sorted(ids)
 
 
+def test_version4_fibers_with_branches_named_by_file(tmp_path):
+    """Version-4 files that carry a UUID but name branch targets only by file, as published."""
+    names = write_v3_fibers(tmp_path / "fibers")
+    ids = [str(uuid.uuid4()) for _ in names]
+    for name, uid in zip(names, ids):
+        path = tmp_path / "fibers" / (name + ".json")
+        document = json.loads(path.read_text())
+        document.update(version=4, uuid=uid)
+        path.write_text(json.dumps(document))
+    with ObjectStore.create(str(tmp_path / "v4.vcobj"), author="test") as store:
+        report = store.ingest_geometry_source("fiber", tmp_path / "fibers")
+        assert {k: report[k] for k in ("ingested", "edges_imported", "problems")} == dict(ingested=2, edges_imported=1, problems=[])
+        edge = store.edges_by_kind("fiber_branch")[0]
+        assert {edge["a"], edge["b"]} == set(ids)
+
+
 def test_canonical_fiber_uuids_are_kept_and_branches_resolve_to_them(tmp_path):
     kept = str(uuid.uuid4())
     write_v3_fibers(tmp_path / "fibers", kept_uuid=kept)
