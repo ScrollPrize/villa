@@ -61,12 +61,8 @@ public:
     void disconnectFromService();
     void reconnect();
 
-    // Convenience for the built-in local profile (compatibility with callers
-    // that only ever used the auto-launched loopback service).
-    void ensureStarted();
     void stopService();
 
-    ConnectionState connectionState() const { return _connectionState; }
     bool isReady() const { return _connectionState == ConnectionState::Ready; }
     bool hasActiveSession() const { return _hasActiveSession; }
     QJsonObject advertisedDataset() const { return _advertisedDataset; }
@@ -164,10 +160,8 @@ signals:
     void inputBatchFinished(const QString& error);
     void connectionStateChanged(SpiralServiceManager::ConnectionState state,
                                 const QString& message);
-    void serviceStateChanged(const QString& state);
     void datasetResolved(const QJsonObject& resolution);
     void configurationCatalogChanged(const QJsonObject& catalog);
-    void configurationReviewRequested();
     // Emitted once when this connection first observes a resident session,
     // whether VC3D loaded it or attached after another client did.
     void sessionSynchronized(const QJsonObject& sessionRequest,
@@ -202,16 +196,6 @@ signals:
                                const QStringList& reasons, const QString& stage,
                                const QString& message);
     void inputUploadFinished(const QString& inputId, const QString& error);
-    // On a CAS conflict, revision is the service's current revision and error
-    // is non-empty so tracked-fiber clients can update their base and retry.
-    void fiberRevisionUploadFinished(const QString& inputId,
-                                     const QString& revision,
-                                     const QString& error);
-    void pclReplacementUploadFinished(const QString& inputId,
-                                      const QString& currentRevision,
-                                      const QString& error);
-    void pclCommitConflict(const QString& currentRevision,
-                           const QString& error);
     void commitInputsFinished(const QStringList& committedIds, const QString& error);
     void logMessage(const QString& message);
     void errorOccurred(const QString& message);

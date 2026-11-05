@@ -296,30 +296,6 @@ PolylineArcGeometry makePolylineArcGeometry(const std::vector<cv::Vec3d>& points
     return geometry;
 }
 
-ForwardPolylineArcInterval selectForwardPolylineArcInterval(
-    const PolylineArcGeometry& geometry,
-    size_t beginVertexIndex,
-    std::optional<double> maximumLength)
-{
-    if (geometry.points.size() < 2 ||
-        geometry.vertexArcs.size() != geometry.points.size() ||
-        beginVertexIndex >= geometry.vertexArcs.size()) {
-        throw std::invalid_argument("forward polyline interval start is invalid");
-    }
-    if (maximumLength.has_value() &&
-        (!std::isfinite(*maximumLength) || !(*maximumLength > 0.0))) {
-        throw std::invalid_argument(
-            "forward polyline interval maximum length must be positive");
-    }
-    const double beginArc = geometry.vertexArcs[beginVertexIndex];
-    const double endArc = maximumLength.has_value()
-        ? std::min(geometry.length(), beginArc + *maximumLength)
-        : geometry.length();
-    if (!(endArc > beginArc))
-        throw std::invalid_argument("forward polyline interval has no forward extent");
-    return {beginArc, endArc};
-}
-
 PolylineArcSample samplePolylineArc(
     const PolylineArcGeometry& geometry,
     double inputArc)
@@ -367,19 +343,6 @@ std::vector<cv::Vec3d> slicePolylineArc(
     if (vectorLength(end - result.back()) > kEpsilon)
         result.push_back(end);
     return result;
-}
-
-std::vector<PolylineArcSegment> clippedPolylineArcSegments(
-    const PolylineArcGeometry& geometry,
-    double beginArc,
-    double endArc)
-{
-    std::vector<PolylineArcSegment> segments;
-    segments.reserve(geometry.points.size());
-    visitClippedPolylineArcSegments(
-        geometry, beginArc, endArc,
-        [&](const PolylineArcSegment& segment) { segments.push_back(segment); });
-    return segments;
 }
 
 PolylineArcProjection projectPointToPolylineSegment(

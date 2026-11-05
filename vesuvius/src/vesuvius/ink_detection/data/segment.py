@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 from pathlib import Path
+import warnings
 
 from vesuvius.ink_detection.config import InkDataConfig
 from vesuvius.ink_detection.types import Segment
@@ -46,6 +47,28 @@ def parse_label_asset_path(path: str | Path) -> dict[str, object] | None:
                 "extension": extension,
             }
     return None
+
+
+def _warn_if_validation_unused(
+    segment: Segment, selected: Path | None, extension: str
+) -> None:
+    """Warn when the directory holds validation masks but none was selected."""
+    if selected is not None:
+        return
+    unused = sorted(
+        path.name
+        for path in segment.segment_dir.iterdir()
+        if (parsed := parse_label_asset_path(path)) is not None
+        and parsed["label_kind"] == "validation_mask"
+    )
+    if unused:
+        warnings.warn(
+            f"{segment.segment_dir}: no validation mask selected, but found "
+            f"{unused}; label files must be named "
+            f"{segment.segment_name}_<kind>[_vN]{extension} "
+            f"(and match label_version if set). This segment has no validation.",
+            stacklevel=3,
+        )
 
 
 def discover_segment_labels(
@@ -93,6 +116,9 @@ def discover_segment_labels(
                 segment,
                 inklabels=None, supervision_mask=None, validation_mask=None
             )
+        _warn_if_validation_unused(
+            segment, selected.get("validation_mask"), normalized_extension
+        )
         return replace(
             segment,
             inklabels=selected["inklabels"],
@@ -114,6 +140,10 @@ def discover_segment_labels(
     selected_paths: dict[str, Path | None] = {}
     for kind, candidates in candidates_by_kind.items():
         selected_paths[kind] = candidates[max(candidates)] if candidates else None
+    if selected_paths["inklabels"] is not None:
+        _warn_if_validation_unused(
+            segment, selected_paths["validation_mask"], normalized_extension
+        )
     return replace(
         segment,
         inklabels=selected_paths["inklabels"],

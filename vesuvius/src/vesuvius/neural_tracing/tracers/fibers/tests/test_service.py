@@ -12,7 +12,7 @@ def follower():
     result = service.FiberFollow.__new__(service.FiberFollow)
     result.base_um = 2.
     result.g = 4.
-    result.vol = object()
+    result.ct, result.spec = object(), object()
     result.tracer = SimpleNamespace(frame_predictor=object(), p=SimpleNamespace(confidence=.5))
     result.policy = SimpleNamespace(confidence=.5)
     result.lock = threading.Lock()
@@ -36,9 +36,9 @@ def test_normals_use_checkpoint_frames_in_trace_coordinates(monkeypatch):
     points = np.array([[i*8., 0., 0.] for i in range(30)])
     calls = []
 
-    def frames(predictor, vol, positions, priors, paths, families):
+    def frames(predictor, ct, spec, positions, priors, paths, families):
         assert predictor is model.tracer.frame_predictor
-        assert vol is model.vol
+        assert ct is model.ct and spec is model.spec
         np.testing.assert_allclose(positions, points/4.)  # requested base_um=2
         assert all(f == 'H' for f in families)
         for p, path in zip(positions, paths):
@@ -80,7 +80,7 @@ def test_every_observed_history_resumes_in_travel_order(monkeypatch, length, sig
     path = np.array([[0., 0., 0.], [length*sign, 0., 0.]])
     opposite = np.array([-sign, 0., 0.])
 
-    def frames(predictor, vol, positions, priors, paths, families):
+    def frames(predictor, ct, spec, positions, priors, paths, families):
         np.testing.assert_allclose(priors[0], [sign, 0., 0.])
         np.testing.assert_allclose(paths[0][-1], path[-1])
         return [np.column_stack([[0., 1., 0.], [0., 0., sign], [sign, 0., 0.]])]

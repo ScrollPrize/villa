@@ -65,10 +65,6 @@ struct Constraint {
     bool active = true;
 };
 
-struct RawCrossing {
-    Crossing crossing;
-};
-
 // A V fiber split into z-monotone branches, each re-ordered to ascending z so
 // overlap queries can binary-search. Reordering the points does not change the
 // segment set, only the direction each segment is walked in.

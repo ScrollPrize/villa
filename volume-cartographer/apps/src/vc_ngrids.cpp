@@ -1,3 +1,4 @@
+#include <vc_reader/sampling.hpp>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -17,10 +18,12 @@
 #include <unordered_set>
 
 #include <boost/program_options.hpp>
-#include "utils/Json.hpp"
-#include <utils/zarr.hpp>
+#include <nlohmann/json.hpp>
+#include <vc_reader/zarr.hpp>
+#include <vc_reader/zarr_write.hpp>
+#include <vc_reader/array.hpp>
 #include <opencv2/core/types.hpp>
-#include <opencv2/imgcodecs.hpp>
+#include "vc/core/util/ImageMat.hpp"
 
 #include <ceres/tiny_solver.h>
 #include <ceres/tiny_solver_autodiff_function.h>
@@ -30,16 +33,13 @@
 #include "vc/core/util/NormalGridVolume.hpp"
 #include "vc/core/util/QuadSurface.hpp"
 #include "vc/core/util/SparseChunkSpool.hpp"
-#include "vc/core/util/Zarr.hpp"
-
-#include "vc/core/types/VcDataset.hpp"
 
 namespace fs = std::filesystem;
 namespace po = boost::program_options;
 
 namespace {
 
-using Json = utils::Json;
+using Json = nlohmann::json;
 
 template <typename Solver, typename = void>
 struct TinySolverParameterVector {
@@ -80,8 +80,7 @@ static void print_usage() {
         << "      --vis-normals PATH  Write fitted normals as PLY line segments\n\n"
         << "      --output-zarr PATH  Write fitted normals to a zarr directory (direction-field encoding)\n"
         << "      --step N            Sample step for --fit-normals (default: 16)\n"
-        << "      --metrics-json PATH Write structured run metrics json for fit/align modes\n\n"
-        << "      --align-normals     Align normals in an existing normals zarr (requires --output-zarr)\n\n"
+        << "      --metrics-json PATH Write structured run metrics json for fit mode\n\n"
         << "Notes:\n"
         << "  - Input can be a directory created by vc_gen_normalgrids (contains metadata.json and xy/xz/yz).\n"
         << "  - Or, input can be a normals zarr root (contains x/0, y/0, z/0 datasets).\n"
@@ -168,18 +167,18 @@ static FitOutputMaterializeStats materialize_fit_output_spool(
     std::vector<std::thread> threads;
     threads.reserve(numThreads);
 
+    auto dsx = vcr::zarr::Writer::open(out_zarr / "x" / "0");
+    auto dsy = vcr::zarr::Writer::open(out_zarr / "y" / "0");
+    auto dsz = vcr::zarr::Writer::open(out_zarr / "z" / "0");
+    auto ds_fit_rms = vcr::zarr::Writer::open(out_zarr / "fit_rms" / "0");
+    auto ds_fit_frac = vcr::zarr::Writer::open(out_zarr / "fit_frac_short_paths" / "0");
+    auto ds_fit_rad = vcr::zarr::Writer::open(out_zarr / "fit_used_radius" / "0");
+    auto ds_fit_sc = vcr::zarr::Writer::open(out_zarr / "fit_segment_count" / "0");
+
     for (size_t tid = 0; tid < numThreads; ++tid) {
         threads.emplace_back([&, tid]() {
             (void)tid;
             try {
-                vc::VcDataset dsx(out_zarr / "x" / "0");
-                vc::VcDataset dsy(out_zarr / "y" / "0");
-                vc::VcDataset dsz(out_zarr / "z" / "0");
-                vc::VcDataset ds_fit_rms(out_zarr / "fit_rms" / "0");
-                vc::VcDataset ds_fit_frac(out_zarr / "fit_frac_short_paths" / "0");
-                vc::VcDataset ds_fit_rad(out_zarr / "fit_used_radius" / "0");
-                vc::VcDataset ds_fit_sc(out_zarr / "fit_segment_count" / "0");
-
                 std::vector<uint8_t> buf_x(chunkElems, 128);
                 std::vector<uint8_t> buf_y(chunkElems, 128);
                 std::vector<uint8_t> buf_z(chunkElems, 128);
@@ -222,13 +221,14 @@ static FitOutputMaterializeStats materialize_fit_output_spool(
                         buf_fit_sc[lin] = record.values[6];
                     }
 
-                    dsx.writeChunk(chunk.z, chunk.y, chunk.x, buf_x.data(), buf_x.size());
-                    dsy.writeChunk(chunk.z, chunk.y, chunk.x, buf_y.data(), buf_y.size());
-                    dsz.writeChunk(chunk.z, chunk.y, chunk.x, buf_z.data(), buf_z.size());
-                    ds_fit_rms.writeChunk(chunk.z, chunk.y, chunk.x, buf_fit_rms.data(), buf_fit_rms.size());
-                    ds_fit_frac.writeChunk(chunk.z, chunk.y, chunk.x, buf_fit_frac.data(), buf_fit_frac.size());
-                    ds_fit_rad.writeChunk(chunk.z, chunk.y, chunk.x, buf_fit_rad.data(), buf_fit_rad.size());
-                    ds_fit_sc.writeChunk(chunk.z, chunk.y, chunk.x, buf_fit_sc.data(), buf_fit_sc.size());
+                    const vcr::Index index{int64_t(chunk.z), int64_t(chunk.y), int64_t(chunk.x)};
+                    dsx.writeChunk(index, buf_x.data(), buf_x.size());
+                    dsy.writeChunk(index, buf_y.data(), buf_y.size());
+                    dsz.writeChunk(index, buf_z.data(), buf_z.size());
+                    ds_fit_rms.writeChunk(index, buf_fit_rms.data(), buf_fit_rms.size());
+                    ds_fit_frac.writeChunk(index, buf_fit_frac.data(), buf_fit_frac.size());
+                    ds_fit_rad.writeChunk(index, buf_fit_rad.data(), buf_fit_rad.size());
+                    ds_fit_sc.writeChunk(index, buf_fit_sc.data(), buf_fit_sc.size());
                 }
             } catch (...) {
                 std::lock_guard<std::mutex> lock(errorMutex);
@@ -252,7 +252,7 @@ static FitOutputMaterializeStats materialize_fit_output_spool(
 }
 
 static inline uint8_t encode_dir_component(float v) {
-    // Match direction-field encoding used by Chunked3dVec3fFromUint8:
+    // Direction-field encoding:
     // decode: (u8 - 128) / 127 -> [-1, 1]
     if (!std::isfinite(v)) return 128;
     v = std::max(-1.0f, std::min(1.0f, v));
@@ -628,19 +628,6 @@ static bool clip_segment_to_crop(cv::Point3f& a, cv::Point3f& b, const CropBox3i
     return true;
 }
 
-static float dist_sq_point_segment(const cv::Point3f& p, const cv::Point3f& a, const cv::Point3f& b) {
-    const cv::Point3f ab = b - a;
-    const float ab2 = ab.dot(ab);
-    if (ab2 <= 1e-12f) {
-        const cv::Point3f d = p - a;
-        return d.dot(d);
-    }
-    const float t = std::max(0.f, std::min(1.f, (p - a).dot(ab) / ab2));
-    const cv::Point3f q = a + t * ab;
-    const cv::Point3f d = p - q;
-    return d.dot(d);
-}
-
 static inline float dist_sq_point_segment_appx(const cv::Point3f& p, const cv::Point3f& a, const cv::Point3f& b) {
     // Approximate distance: use the segment midpoint instead of true point-to-segment distance.
     const cv::Point3f m = 0.5f * (a + b);
@@ -851,17 +838,6 @@ static bool fit_normal_tiny(
     return true;
 }
 
-static std::shared_ptr<const vc::core::util::GridStore> try_load_grid(
-    const fs::path& base,
-    const std::string& plane_dir,
-    int slice_idx) {
-    char filename[256];
-    snprintf(filename, sizeof(filename), "%06d.grid", slice_idx);
-    fs::path grid_path = base / plane_dir / filename;
-    if (!fs::exists(grid_path)) return nullptr;
-    return std::make_shared<vc::core::util::GridStore>(grid_path.string());
-}
-
 static cv::Point3f point_for_slice_query(const cv::Point3f& base, int plane_idx, int slice_idx) {
     cv::Point3f p = base;
     if (plane_idx == 0) {
@@ -991,53 +967,43 @@ static void run_vis_ply(const fs::path& input_dir, const fs::path& out_ply, cons
 }
 
 static bool looks_like_normals_zarr_root(const fs::path& input_dir) {
-    // Minimal heuristic: groups x,y,z exist and each has a scale dataset directory ("0").
-    return fs::is_directory(input_dir / "x") && fs::is_directory(input_dir / "y") && fs::is_directory(input_dir / "z") &&
-           fs::is_directory(input_dir / "x" / "0") && fs::is_directory(input_dir / "y" / "0") && fs::is_directory(input_dir / "z" / "0");
+    // Groups x, y, z, each with a level-0 Zarr array.
+    for (const char* axis : {"x", "y", "z"})
+        if (!vcr::zarr::isLocalZarrArray(input_dir / axis / "0")) return false;
+    return true;
 }
 
 static void run_vis_normals_zarr_as_ply(const fs::path& zarr_root, const fs::path& out_ply, const std::optional<CropBox3i>& crop_opt) {
-    // Determine delimiter from x/0/.zarray (fallback "." to match other tools).
-    std::string delim = ".";
-    {
-        try {
-            auto meta = utils::ZarrArray::open(zarr_root / "x" / "0").metadata();
-            if (!meta.dimension_separator.empty()) delim = meta.dimension_separator;
-        } catch (...) {}
-    }
-
     // Optional metadata written by vc_ngrids --output-zarr.
     cv::Vec3i origin_xyz(0, 0, 0);
     int step = 1;
     {
         try {
-            utils::Json attrs = vc::readZarrAttributes(zarr_root);
+            const auto attrs = vcr::zarr::readAttributes(zarr_root);
             if (attrs.contains("grid_origin_xyz") && attrs["grid_origin_xyz"].is_array() && attrs["grid_origin_xyz"].size() == 3) {
-                origin_xyz = cv::Vec3i(attrs["grid_origin_xyz"][0].get_int(), attrs["grid_origin_xyz"][1].get_int(), attrs["grid_origin_xyz"][2].get_int());
+                origin_xyz = cv::Vec3i(attrs["grid_origin_xyz"][0].get<int>(), attrs["grid_origin_xyz"][1].get<int>(), attrs["grid_origin_xyz"][2].get<int>());
             }
             if (attrs.contains("sample_step")) {
-                step = std::max(1, attrs["sample_step"].get_int());
+                step = std::max(1, attrs["sample_step"].get<int>());
             }
         } catch (...) {
             // Attributes are optional; keep defaults.
         }
     }
 
-    auto open_u8_zyx = [&](const char* axis) -> std::unique_ptr<vc::VcDataset> {
-        return std::make_unique<vc::VcDataset>(zarr_root / axis / "0");
-    };
-
-    auto dsx = open_u8_zyx("x");
-    auto dsy = open_u8_zyx("y");
-    auto dsz = open_u8_zyx("z");
-    if (!dsx || !dsy || !dsz) {
-        throw std::runtime_error("Failed to open x/y/z datasets under zarr root: " + zarr_root.string());
+    auto dsx = vcr::zarr::openArray((zarr_root / "x" / "0").string(), {});
+    auto dsy = vcr::zarr::openArray((zarr_root / "y" / "0").string(), {});
+    auto dsz = vcr::zarr::openArray((zarr_root / "z" / "0").string(), {});
+    for (const auto* array : {&dsx, &dsy, &dsz}) {
+        if (array->meta.type.kind != 'u' || array->meta.itemsize() != 1) {
+            throw std::runtime_error("Expected uint8 direction-field data under: " + zarr_root.string());
+        }
     }
-    if (dsx->shape() != dsy->shape() || dsx->shape() != dsz->shape()) {
+    if (dsx.meta.shape != dsy.meta.shape || dsx.meta.shape != dsz.meta.shape) {
         throw std::runtime_error("x/y/z datasets have different shapes under: " + zarr_root.string());
     }
 
-    const auto& shape = dsx->shape();
+    const auto& shape = dsx.meta.shape;
     if (shape.size() != 3) {
         throw std::runtime_error("Expected 3D datasets (ZYX) for normals zarr under: " + zarr_root.string());
     }
@@ -1048,15 +1014,9 @@ static void run_vis_normals_zarr_as_ply(const fs::path& zarr_root, const fs::pat
     std::vector<uint8_t> ax(Z * Y * X, 0);
     std::vector<uint8_t> ay(Z * Y * X, 0);
     std::vector<uint8_t> az(Z * Y * X, 0);
-    {
-        std::vector<size_t> off = {0, 0, 0};
-        std::vector<size_t> regionShape = {Z, Y, X};
-        if (!dsx->readRegion(off, regionShape, ax.data()) ||
-            !dsy->readRegion(off, regionShape, ay.data()) ||
-            !dsz->readRegion(off, regionShape, az.data())) {
-            throw std::runtime_error("Failed to read x/y/z datasets under zarr root: " + zarr_root.string());
-        }
-    }
+    dsx.array->read_many({{0, 0, 0}}, {shape}, {ax.data()});
+    dsy.array->read_many({{0, 0, 0}}, {shape}, {ay.data()});
+    dsz.array->read_many({{0, 0, 0}}, {shape}, {az.data()});
 
     const CropBox3i crop = crop_opt.value_or(CropBox3i{
         cv::Vec3i(std::numeric_limits<int>::min() / 4,
@@ -1114,46 +1074,35 @@ static void run_vis_normals_zarr_on_surf_edges_as_ply(
     const fs::path& surf_tifxyz,
     const fs::path& out_ply,
     const std::optional<CropBox3i>& crop_opt) {
-    // Determine delimiter from x/0/.zarray (fallback ".").
-    std::string delim = ".";
-    {
-        try {
-            auto meta = utils::ZarrArray::open(zarr_root / "x" / "0").metadata();
-            if (!meta.dimension_separator.empty()) delim = meta.dimension_separator;
-        } catch (...) {}
-    }
-
     // Optional metadata written by vc_ngrids --output-zarr.
     cv::Vec3i origin_xyz(0, 0, 0);
     int step = 1;
     {
         try {
-            utils::Json attrs = vc::readZarrAttributes(zarr_root);
+            const auto attrs = vcr::zarr::readAttributes(zarr_root);
             if (attrs.contains("grid_origin_xyz") && attrs["grid_origin_xyz"].is_array() && attrs["grid_origin_xyz"].size() == 3) {
-                origin_xyz = cv::Vec3i(attrs["grid_origin_xyz"][0].get_int(), attrs["grid_origin_xyz"][1].get_int(), attrs["grid_origin_xyz"][2].get_int());
+                origin_xyz = cv::Vec3i(attrs["grid_origin_xyz"][0].get<int>(), attrs["grid_origin_xyz"][1].get<int>(), attrs["grid_origin_xyz"][2].get<int>());
             }
             if (attrs.contains("sample_step")) {
-                step = std::max(1, attrs["sample_step"].get_int());
+                step = std::max(1, attrs["sample_step"].get<int>());
             }
         } catch (...) {
             // optional
         }
     }
 
-    auto open_u8_zyx = [&](const char* axis) -> std::unique_ptr<vc::VcDataset> {
-        return std::make_unique<vc::VcDataset>(zarr_root / axis / "0");
-    };
-
-    auto dsx = open_u8_zyx("x");
-    auto dsy = open_u8_zyx("y");
-    auto dsz = open_u8_zyx("z");
-    if (!dsx || !dsy || !dsz) {
-        throw std::runtime_error("Failed to open x/y/z datasets under zarr root: " + zarr_root.string());
+    auto dsx = vcr::zarr::openArray((zarr_root / "x" / "0").string(), {});
+    auto dsy = vcr::zarr::openArray((zarr_root / "y" / "0").string(), {});
+    auto dsz = vcr::zarr::openArray((zarr_root / "z" / "0").string(), {});
+    for (const auto* array : {&dsx, &dsy, &dsz}) {
+        if (array->meta.type.kind != 'u' || array->meta.itemsize() != 1) {
+            throw std::runtime_error("Expected uint8 direction-field data under: " + zarr_root.string());
+        }
     }
-    if (dsx->shape() != dsy->shape() || dsx->shape() != dsz->shape()) {
+    if (dsx.meta.shape != dsy.meta.shape || dsx.meta.shape != dsz.meta.shape) {
         throw std::runtime_error("x/y/z datasets have different shapes under: " + zarr_root.string());
     }
-    const auto& shape = dsx->shape();
+    const auto& shape = dsx.meta.shape;
     if (shape.size() != 3) {
         throw std::runtime_error("Expected 3D datasets (ZYX) for normals zarr under: " + zarr_root.string());
     }
@@ -1164,15 +1113,9 @@ static void run_vis_normals_zarr_on_surf_edges_as_ply(
     std::vector<uint8_t> ax(Z * Y * X, 0);
     std::vector<uint8_t> ay(Z * Y * X, 0);
     std::vector<uint8_t> az(Z * Y * X, 0);
-    {
-        std::vector<size_t> off = {0, 0, 0};
-        std::vector<size_t> regionShape = {Z, Y, X};
-        if (!dsx->readRegion(off, regionShape, ax.data()) ||
-            !dsy->readRegion(off, regionShape, ay.data()) ||
-            !dsz->readRegion(off, regionShape, az.data())) {
-            throw std::runtime_error("Failed to read x/y/z datasets under zarr root: " + zarr_root.string());
-        }
-    }
+    dsx.array->read_many({{0, 0, 0}}, {shape}, {ax.data()});
+    dsy.array->read_many({{0, 0, 0}}, {shape}, {ay.data()});
+    dsz.array->read_many({{0, 0, 0}}, {shape}, {az.data()});
 
     const CropBox3i crop = crop_opt.value_or(CropBox3i{
         cv::Vec3i(std::numeric_limits<int>::min() / 4,
@@ -1194,59 +1137,16 @@ static void run_vis_normals_zarr_on_surf_edges_as_ply(
         const double gy = (static_cast<double>(p_xyz.y) - origin_xyz[1]) / static_cast<double>(step);
         const double gz = (static_cast<double>(p_xyz.z) - origin_xyz[2]) / static_cast<double>(step);
 
-        int x0 = static_cast<int>(std::floor(gx));
-        int y0 = static_cast<int>(std::floor(gy));
-        int z0 = static_cast<int>(std::floor(gz));
-        x0 = std::clamp(x0, 0, static_cast<int>(X) - 2);
-        y0 = std::clamp(y0, 0, static_cast<int>(Y) - 2);
-        z0 = std::clamp(z0, 0, static_cast<int>(Z) - 2);
-        const int x1 = x0 + 1;
-        const int y1 = y0 + 1;
-        const int z1 = z0 + 1;
-
-        if (is_fill(static_cast<size_t>(z0), static_cast<size_t>(y0), static_cast<size_t>(x0)) ||
-            is_fill(static_cast<size_t>(z1), static_cast<size_t>(y0), static_cast<size_t>(x0)) ||
-            is_fill(static_cast<size_t>(z0), static_cast<size_t>(y1), static_cast<size_t>(x0)) ||
-            is_fill(static_cast<size_t>(z1), static_cast<size_t>(y1), static_cast<size_t>(x0)) ||
-            is_fill(static_cast<size_t>(z0), static_cast<size_t>(y0), static_cast<size_t>(x1)) ||
-            is_fill(static_cast<size_t>(z1), static_cast<size_t>(y0), static_cast<size_t>(x1)) ||
-            is_fill(static_cast<size_t>(z0), static_cast<size_t>(y1), static_cast<size_t>(x1)) ||
-            is_fill(static_cast<size_t>(z1), static_cast<size_t>(y1), static_cast<size_t>(x1))) {
-            return false;
-        }
-
-        double tx = gx - x0;
-        double ty = gy - y0;
-        double tz = gz - z0;
-        tx = std::clamp(tx, 0.0, 1.0);
-        ty = std::clamp(ty, 0.0, 1.0);
-        tz = std::clamp(tz, 0.0, 1.0);
-
-        auto lerp = [](double a, double b, double t) { return (1.0 - t) * a + t * b; };
-        auto tri = [&](double c000, double c100, double c010, double c110,
-                       double c001, double c101, double c011, double c111) -> double {
-            const double c00 = lerp(c000, c001, tx);
-            const double c01 = lerp(c010, c011, tx);
-            const double c10 = lerp(c100, c101, tx);
-            const double c11 = lerp(c110, c111, tx);
-            const double c0 = lerp(c00, c01, ty);
-            const double c1 = lerp(c10, c11, ty);
-            return lerp(c0, c1, tz);
+        const int shapeZYX[3]{int(Z),int(Y),int(X)};
+        const double xyz[3]{gx,gy,gz};
+        const auto valid = [&](int z,int y,int x) { return !is_fill(z,y,x); };
+        const auto sample = [&](const std::vector<uint8_t>& field,double& out) {
+            return vcr::sampling::sampleCube([&](int z,int y,int x) {
+                return double(decode(field[(size_t(z)*Y+size_t(y))*X+size_t(x)]));
+            },valid,shapeZYX,xyz,out);
         };
-
-        auto c = [&](const std::vector<uint8_t>& a, int zz, int yy, int xx) -> double {
-            return static_cast<double>(decode(a[static_cast<size_t>(zz) * Y * X + static_cast<size_t>(yy) * X + static_cast<size_t>(xx)]));
-        };
-
-        const double nx = tri(
-            c(ax, z0, y0, x0), c(ax, z1, y0, x0), c(ax, z0, y1, x0), c(ax, z1, y1, x0),
-            c(ax, z0, y0, x1), c(ax, z1, y0, x1), c(ax, z0, y1, x1), c(ax, z1, y1, x1));
-        const double ny = tri(
-            c(ay, z0, y0, x0), c(ay, z1, y0, x0), c(ay, z0, y1, x0), c(ay, z1, y1, x0),
-            c(ay, z0, y0, x1), c(ay, z1, y0, x1), c(ay, z0, y1, x1), c(ay, z1, y1, x1));
-        const double nz = tri(
-            c(az, z0, y0, x0), c(az, z1, y0, x0), c(az, z0, y1, x0), c(az, z1, y1, x0),
-            c(az, z0, y0, x1), c(az, z1, y0, x1), c(az, z0, y1, x1), c(az, z1, y1, x1));
+        double nx,ny,nz;
+        if(!sample(ax,nx)||!sample(ay,ny)||!sample(az,nz))return false;
 
         const double nlen2 = nx * nx + ny * ny + nz * nz;
         if (!(nlen2 > 1e-24)) return false;
@@ -1309,70 +1209,11 @@ static void run_vis_normals_zarr_on_surf_edges_as_ply(
     ply.end_streaming();
 }
 
-static inline uint8_t flip_u8_dir_component(uint8_t u) {
-    // decode(u)=(u-128)/127. Flipping the decoded value maps approximately to (256-u).
-    const int v = 256 - static_cast<int>(u);
-    return static_cast<uint8_t>(std::max(0, std::min(255, v)));
-}
-
 struct CropIndexBox3z {
     // ZYX indices (half-open) in the zarr grid.
     std::vector<size_t> off = {0, 0, 0};
     std::vector<size_t> shape = {0, 0, 0};
 };
-
-static CropIndexBox3z crop_to_zarr_zyx(
-    const CropBox3i& crop_xyz,
-    const cv::Vec3i& origin_xyz,
-    int step,
-    const std::vector<size_t>& full_shape_zyx) {
-    // Convert voxel crop box to zarr indices (ZYX) using floor/ceil so we cover the requested voxel region.
-    const auto floor_div = [](int a, int b) -> int {
-        // b>0
-        if (a >= 0) return a / b;
-        return -(((-a + b - 1) / b));
-    };
-    const auto ceil_div = [&](int a, int b) -> int {
-        // ceil(a/b)
-        if (a >= 0) return (a + b - 1) / b;
-        return -((-a) / b);
-    };
-
-    const int ix0 = floor_div(crop_xyz.min[0] - origin_xyz[0], step);
-    const int iy0 = floor_div(crop_xyz.min[1] - origin_xyz[1], step);
-    const int iz0 = floor_div(crop_xyz.min[2] - origin_xyz[2], step);
-    const int ix1 = ceil_div(crop_xyz.max[0] - origin_xyz[0], step);
-    const int iy1 = ceil_div(crop_xyz.max[1] - origin_xyz[1], step);
-    const int iz1 = ceil_div(crop_xyz.max[2] - origin_xyz[2], step);
-
-    const int X = static_cast<int>(full_shape_zyx.at(2));
-    const int Y = static_cast<int>(full_shape_zyx.at(1));
-    const int Z = static_cast<int>(full_shape_zyx.at(0));
-
-    const int cx0 = std::max(0, std::min(X, ix0));
-    const int cy0 = std::max(0, std::min(Y, iy0));
-    const int cz0 = std::max(0, std::min(Z, iz0));
-    const int cx1 = std::max(0, std::min(X, ix1));
-    const int cy1 = std::max(0, std::min(Y, iy1));
-    const int cz1 = std::max(0, std::min(Z, iz1));
-
-    CropIndexBox3z out;
-    out.off = {static_cast<size_t>(cz0), static_cast<size_t>(cy0), static_cast<size_t>(cx0)};
-    out.shape = {static_cast<size_t>(std::max(0, cz1 - cz0)),
-                 static_cast<size_t>(std::max(0, cy1 - cy0)),
-                 static_cast<size_t>(std::max(0, cx1 - cx0))};
-    return out;
-}
-
-static double dot_decoded_u8(uint8_t ax, uint8_t ay, uint8_t az, uint8_t bx, uint8_t by, uint8_t bz) {
-    const auto d = [](uint8_t u) -> double { return (static_cast<int>(u) - 128) / 127.0; };
-    return d(ax) * d(bx) + d(ay) * d(by) + d(az) * d(bz);
-}
-
-static bool is_valid_normal_u8(uint8_t ux, uint8_t uy, uint8_t uz) {
-    // In our direction-field encoding, (128,128,128) is the neutral fill value meaning "no normal".
-    return !(ux == 128 && uy == 128 && uz == 128);
-}
 
 static std::optional<size_t> memAvailableBytes()
 {
@@ -1401,170 +1242,35 @@ struct NormalsZarrLayout {
     int sampleStep = 1;
 };
 
-struct NormalsCropU8 {
-    NormalsZarrLayout layout;
-    CropIndexBox3z cropZyx;
-    std::vector<uint8_t> x;
-    std::vector<uint8_t> y;
-    std::vector<uint8_t> z;
-};
-
-static std::unique_ptr<vc::VcDataset> open_normals_axis_dataset(
-    const fs::path& zarr_root,
-    const char* axis)
-{
-    return std::make_unique<vc::VcDataset>(zarr_root / axis / "0");
-}
-
-static void assert_normals_fill_value_128(const fs::path& zarr_root, const char* axis)
-{
-    const fs::path zarray_path = zarr_root / axis / "0" / ".zarray";
-    if (!fs::exists(zarray_path)) {
-        throw std::runtime_error(
-            std::string("Missing ") + axis + "/0/.zarray under normals zarr root: " +
-            zarr_root.string());
-    }
-
-    utils::Json j = utils::Json::parse_file(zarray_path);
-    if (!j.contains("fill_value")) {
-        throw std::runtime_error(
-            std::string("Missing fill_value in ") + axis + "/0/.zarray under normals zarr root: " +
-            zarr_root.string());
-    }
-
-    const int fv = j["fill_value"].get_int();
-    if (fv != 128) {
-        std::stringstream msg;
-        msg << "Normals zarr has unexpected fill_value=" << fv
-            << " for " << axis << "/0; expected 128";
-        throw std::runtime_error(msg.str());
-    }
-}
-
-static NormalsZarrLayout read_normals_zarr_layout(const fs::path& zarr_root)
-{
-    auto dsx = open_normals_axis_dataset(zarr_root, "x");
-    auto dsy = open_normals_axis_dataset(zarr_root, "y");
-    auto dsz = open_normals_axis_dataset(zarr_root, "z");
-    if (!dsx || !dsy || !dsz) {
-        throw std::runtime_error("Failed to open x/y/z datasets under zarr root: " + zarr_root.string());
-    }
-    if (dsx->shape() != dsy->shape() || dsx->shape() != dsz->shape()) {
-        throw std::runtime_error("x/y/z datasets have different shapes under: " + zarr_root.string());
-    }
-    if (dsx->shape().size() != 3) {
-        throw std::runtime_error("Expected 3D datasets (ZYX) for normals zarr under: " + zarr_root.string());
-    }
-
-    assert_normals_fill_value_128(zarr_root, "x");
-    assert_normals_fill_value_128(zarr_root, "y");
-    assert_normals_fill_value_128(zarr_root, "z");
-
-    NormalsZarrLayout layout;
-    layout.fullShapeZyx = {dsx->shape()[0], dsx->shape()[1], dsx->shape()[2]};
-    layout.chunkShapeZyx = {
-        dsx->defaultChunkShape()[0],
-        dsx->defaultChunkShape()[1],
-        dsx->defaultChunkShape()[2],
-    };
-
-    try {
-        utils::Json attrs = vc::readZarrAttributes(zarr_root);
-        if (attrs.contains("grid_origin_xyz") &&
-            attrs["grid_origin_xyz"].is_array() &&
-            attrs["grid_origin_xyz"].size() == 3) {
-            layout.originXyz = cv::Vec3i(
-                attrs["grid_origin_xyz"][0].get_int(),
-                attrs["grid_origin_xyz"][1].get_int(),
-                attrs["grid_origin_xyz"][2].get_int());
-        }
-        if (attrs.contains("sample_step")) {
-            layout.sampleStep = std::max(1, attrs["sample_step"].get_int());
-        }
-    } catch (...) {
-        // Attributes are optional; keep defaults.
-    }
-
-    return layout;
-}
-
-static NormalsCropU8 load_normals_crop_u8(
-    const fs::path& zarr_root,
-    const std::optional<CropBox3i>& crop_opt,
-    double* read_seconds = nullptr)
-{
-    const auto read_start = std::chrono::steady_clock::now();
-    NormalsCropU8 crop;
-    crop.layout = read_normals_zarr_layout(zarr_root);
-
-    const CropBox3i crop_xyz = crop_opt.value_or(CropBox3i{
-        cv::Vec3i(std::numeric_limits<int>::min() / 4,
-                  std::numeric_limits<int>::min() / 4,
-                  std::numeric_limits<int>::min() / 4),
-        cv::Vec3i(std::numeric_limits<int>::max() / 4,
-                  std::numeric_limits<int>::max() / 4,
-                  std::numeric_limits<int>::max() / 4),
-    });
-
-    crop.cropZyx = crop_to_zarr_zyx(
-        crop_xyz,
-        crop.layout.originXyz,
-        crop.layout.sampleStep,
-        crop.layout.fullShapeZyx);
-    const size_t CZ = crop.cropZyx.shape[0];
-    const size_t CY = crop.cropZyx.shape[1];
-    const size_t CX = crop.cropZyx.shape[2];
-    if (CZ == 0 || CY == 0 || CX == 0) {
-        throw std::runtime_error("--crop maps to empty region in normals zarr index space");
-    }
-
-    auto dsx = open_normals_axis_dataset(zarr_root, "x");
-    auto dsy = open_normals_axis_dataset(zarr_root, "y");
-    auto dsz = open_normals_axis_dataset(zarr_root, "z");
-
-    crop.x.assign(CZ * CY * CX, 0);
-    crop.y.assign(CZ * CY * CX, 0);
-    crop.z.assign(CZ * CY * CX, 0);
-
-    const std::vector<size_t> off(crop.cropZyx.off.begin(), crop.cropZyx.off.end());
-    const std::vector<size_t> region_shape(crop.cropZyx.shape.begin(), crop.cropZyx.shape.end());
-    if (!dsx->readRegion(off, region_shape, crop.x.data()) ||
-        !dsy->readRegion(off, region_shape, crop.y.data()) ||
-        !dsz->readRegion(off, region_shape, crop.z.data())) {
-        throw std::runtime_error("Failed to read x/y/z datasets under zarr root: " + zarr_root.string());
-    }
-
-    if (read_seconds != nullptr) {
-        *read_seconds = std::chrono::duration<double>(
-            std::chrono::steady_clock::now() - read_start).count();
-    }
-    return crop;
-}
-
 static void create_normals_output_zarr(
     const fs::path& out_zarr,
     const NormalsZarrLayout& layout,
     const std::optional<CropIndexBox3z>& crop_zyx = std::nullopt)
 {
     std::filesystem::create_directories(out_zarr);
-    vc::createZarrDataset(out_zarr / "x", "0", layout.fullShapeZyx, layout.chunkShapeZyx, vc::VcDtype::uint8, "blosc", "/", 128);
-    vc::createZarrDataset(out_zarr / "y", "0", layout.fullShapeZyx, layout.chunkShapeZyx, vc::VcDtype::uint8, "blosc", "/", 128);
-    vc::createZarrDataset(out_zarr / "z", "0", layout.fullShapeZyx, layout.chunkShapeZyx, vc::VcDtype::uint8, "blosc", "/", 128);
+    vcr::zarr::CreateOptions options;
+    options.shape.assign(layout.fullShapeZyx.begin(), layout.fullShapeZyx.end());
+    options.chunks.assign(layout.chunkShapeZyx.begin(), layout.chunkShapeZyx.end());
+    options.separator = "/";
+    options.fillValue = 128;
+    for (const auto* axis : {"x", "y", "z"}) {
+        vcr::zarr::Writer::create(out_zarr / axis / "0", options);
+    }
 
     auto mk3i = [](auto a, auto b, auto c) {
-        utils::Json arr = utils::Json::array();
+        nlohmann::json arr = nlohmann::json::array();
         arr.push_back(static_cast<int64_t>(a));
         arr.push_back(static_cast<int64_t>(b));
         arr.push_back(static_cast<int64_t>(c));
         return arr;
     };
 
-    utils::Json encoding = utils::Json::object();
+    nlohmann::json encoding = nlohmann::json::object();
     encoding["type"] = "direction-field-u8";
     encoding["decode"] = "(u8-128)/127";
     encoding["fill_value"] = 128;
 
-    utils::Json attrs = utils::Json::object();
+    nlohmann::json attrs = nlohmann::json::object();
     attrs["source"] = "vc_ngrids";
     attrs["description"] = "Direction-field encoded normals: x/0,y/0,z/0 uint8 with decode (u8-128)/127";
     attrs["encoding"] = encoding;
@@ -1578,7 +1284,7 @@ static void create_normals_output_zarr(
         attrs["crop_shape_zyx"] = mk3i(
             crop_zyx->shape[0], crop_zyx->shape[1], crop_zyx->shape[2]);
     }
-    vc::writeZarrAttributes(out_zarr, attrs);
+    vcr::zarr::writeAttributes(out_zarr, attrs);
 }
 
 static std::vector<size_t> bounded_normals_output_chunks(
@@ -1594,447 +1300,6 @@ static std::vector<size_t> bounded_normals_output_chunks(
         std::min(cap, full_shape_zyx[1]),
         std::min(cap, full_shape_zyx[2]),
     };
-}
-
-static void write_normals_crop_u8(
-    const fs::path& out_zarr,
-    const CropIndexBox3z& crop_zyx,
-    const std::vector<uint8_t>& ax,
-    const std::vector<uint8_t>& ay,
-    const std::vector<uint8_t>& az)
-{
-    auto out_dsx = open_normals_axis_dataset(out_zarr, "x");
-    auto out_dsy = open_normals_axis_dataset(out_zarr, "y");
-    auto out_dsz = open_normals_axis_dataset(out_zarr, "z");
-    const std::vector<size_t> crop_off(crop_zyx.off.begin(), crop_zyx.off.end());
-    const std::vector<size_t> crop_shape(crop_zyx.shape.begin(), crop_zyx.shape.end());
-
-    writeZarrRegionU8ByChunk(out_dsx.get(), crop_off, crop_shape, ax.data(), 128);
-    writeZarrRegionU8ByChunk(out_dsy.get(), crop_off, crop_shape, ay.data(), 128);
-    writeZarrRegionU8ByChunk(out_dsz.get(), crop_off, crop_shape, az.data(), 128);
-}
-
-static void run_align_normals_zarr(
-    const fs::path& zarr_root,
-    const fs::path& out_zarr,
-    const std::optional<CropBox3i>& crop_opt,
-    int seed_samples = 100,
-    int radius = 2,
-    int candidate_samples_per_iter = 100,
-    const std::optional<fs::path>& metrics_json_path = std::nullopt) {
-    const auto total_start = std::chrono::steady_clock::now();
-    Json metrics;
-    metrics["mode"] = "align-normals";
-    metrics["input"] = zarr_root.string();
-    metrics["output"] = out_zarr.string();
-    metrics["omp_threads"] = std::max(1, omp_get_max_threads());
-    metrics["seed_samples"] = seed_samples;
-    metrics["radius"] = radius;
-    metrics["candidate_samples_per_iter"] = candidate_samples_per_iter;
-
-    double read_seconds = 0.0;
-    NormalsCropU8 normals = load_normals_crop_u8(zarr_root, crop_opt, &read_seconds);
-    metrics["read_seconds"] = read_seconds;
-    const auto& crop_zyx = normals.cropZyx;
-    const auto& full_shape = normals.layout.fullShapeZyx;
-    const cv::Vec3i origin_xyz = normals.layout.originXyz;
-    const int step = normals.layout.sampleStep;
-    const size_t CZ = crop_zyx.shape[0];
-    const size_t CY = crop_zyx.shape[1];
-    const size_t CX = crop_zyx.shape[2];
-    auto& ax = normals.x;
-    auto& ay = normals.y;
-    auto& az = normals.z;
-    const CropBox3i crop_xyz = crop_opt.value_or(CropBox3i{
-        cv::Vec3i(std::numeric_limits<int>::min() / 4,
-                  std::numeric_limits<int>::min() / 4,
-                  std::numeric_limits<int>::min() / 4),
-        cv::Vec3i(std::numeric_limits<int>::max() / 4,
-                  std::numeric_limits<int>::max() / 4,
-                  std::numeric_limits<int>::max() / 4),
-    });
-
-    const size_t N = CZ * CY * CX;
-    auto lin_of = [&](size_t iz, size_t iy, size_t ix) -> size_t {
-        return (iz * CY + iy) * CX + ix;
-    };
-    auto idx_of_lin = [&](size_t lin, size_t& iz, size_t& iy, size_t& ix) {
-        ix = lin % CX;
-        const size_t t = lin / CX;
-        iy = t % CY;
-        iz = t / CY;
-    };
-
-    // State bits:
-    // bit0: aligned
-    // bit1: flipped relative to original
-    // bit2: in fringe (internal)
-    constexpr uint8_t kAligned = 1u << 0;
-    constexpr uint8_t kFlip = 1u << 1;
-    constexpr uint8_t kInFringe = 1u << 2;
-    std::vector<uint8_t> state(N, 0);
-    std::vector<size_t> fringe;
-    fringe.reserve(1024);
-
-    auto neighbor_iter = [&](size_t iz, size_t iy, size_t ix, int rad, const auto& fn) {
-        const int z0 = std::max(0, static_cast<int>(iz) - rad);
-        const int y0 = std::max(0, static_cast<int>(iy) - rad);
-        const int x0 = std::max(0, static_cast<int>(ix) - rad);
-        const int z1 = std::min(static_cast<int>(CZ) - 1, static_cast<int>(iz) + rad);
-        const int y1 = std::min(static_cast<int>(CY) - 1, static_cast<int>(iy) + rad);
-        const int x1 = std::min(static_cast<int>(CX) - 1, static_cast<int>(ix) + rad);
-        for (int zz = z0; zz <= z1; ++zz) {
-            for (int yy = y0; yy <= y1; ++yy) {
-                for (int xx = x0; xx <= x1; ++xx) {
-                    fn(static_cast<size_t>(zz), static_cast<size_t>(yy), static_cast<size_t>(xx));
-                }
-            }
-        }
-    };
-
-    auto divergence_parallel_invariant = [&](size_t lin, int rad, int& out_count) -> double {
-        size_t iz, iy, ix;
-        idx_of_lin(lin, iz, iy, ix);
-        const uint8_t ux = ax[lin_of(iz, iy, ix)];
-        const uint8_t uy = ay[lin_of(iz, iy, ix)];
-        const uint8_t uz = az[lin_of(iz, iy, ix)];
-        if (!is_valid_normal_u8(ux, uy, uz)) {
-            out_count = 0;
-            return 1e9;
-        }
-        double acc = 0.0;
-        int cnt = 0;
-        neighbor_iter(iz, iy, ix, rad, [&](size_t zz, size_t yy, size_t xx) {
-            const uint8_t vx = ax[lin_of(zz, yy, xx)];
-            const uint8_t vy = ay[lin_of(zz, yy, xx)];
-            const uint8_t vz = az[lin_of(zz, yy, xx)];
-            if (!is_valid_normal_u8(vx, vy, vz)) return;
-            const double d = dot_decoded_u8(ux, uy, uz, vx, vy, vz);
-            acc += (1.0 - std::abs(d));
-            ++cnt;
-        });
-        out_count = cnt;
-        if (cnt <= 1) return 1e9;
-        return acc / static_cast<double>(cnt);
-    };
-
-    // Collect valid normals in the crop.
-    std::vector<size_t> valid_lin;
-    valid_lin.reserve(N / 4);
-    for (size_t iz = 0; iz < CZ; ++iz) {
-        for (size_t iy = 0; iy < CY; ++iy) {
-            for (size_t ix = 0; ix < CX; ++ix) {
-                if (is_valid_normal_u8(ax[lin_of(iz, iy, ix)], ay[lin_of(iz, iy, ix)], az[lin_of(iz, iy, ix)])) {
-                    valid_lin.push_back(lin_of(iz, iy, ix));
-                }
-            }
-        }
-    }
-    if (valid_lin.empty()) {
-        throw std::runtime_error("No valid normals found in selected crop region");
-    }
-
-    // Seed selection: pick the locally smoothest (parallel-invariant) from random samples.
-    std::mt19937_64 rng(0xA11F10);
-    std::uniform_int_distribution<size_t> pick_valid(0, valid_lin.size() - 1);
-    size_t seed_lin = valid_lin[pick_valid(rng)];
-    double best_div = 1e9;
-    for (int s = 0; s < std::max(1, seed_samples); ++s) {
-        const size_t lin = valid_lin[pick_valid(rng)];
-        int cnt = 0;
-        const double div = divergence_parallel_invariant(lin, radius, cnt);
-        if (cnt < 8) continue;
-        if (div < best_div) {
-            best_div = div;
-            seed_lin = lin;
-        }
-    }
-
-    // Seed: mark aligned; orientation arbitrary (flip=0).
-    state[seed_lin] |= kAligned;
-
-    auto oriented_u8_at = [&](size_t lin, uint8_t& ox, uint8_t& oy, uint8_t& oz) {
-        size_t iz, iy, ix;
-        idx_of_lin(lin, iz, iy, ix);
-        ox = ax[lin_of(iz, iy, ix)];
-        oy = ay[lin_of(iz, iy, ix)];
-        oz = az[lin_of(iz, iy, ix)];
-        if (state[lin] & kFlip) {
-            ox = flip_u8_dir_component(ox);
-            oy = flip_u8_dir_component(oy);
-            oz = flip_u8_dir_component(oz);
-        }
-    };
-
-    auto add_fringe_neighbors = [&](size_t lin) {
-        size_t iz, iy, ix;
-        idx_of_lin(lin, iz, iy, ix);
-
-        // Parallelize neighbor checks, but keep fringe insertions serial (global state).
-        // Use the same threshold as candidate scoring.
-        const size_t fringe_size = fringe.size();
-        std::vector<size_t> to_add;
-        to_add.reserve(26);
-
-        #pragma omp parallel if(fringe_size >= 10000)
-        {
-            std::vector<size_t> local;
-            local.reserve(26);
-            #pragma omp for collapse(3) schedule(dynamic,1) nowait
-            for (int dz = -1; dz <= 1; ++dz) {
-                for (int dy = -1; dy <= 1; ++dy) {
-                    for (int dx = -1; dx <= 1; ++dx) {
-                        if (dx == 0 && dy == 0 && dz == 0) continue;
-                        const int zz = static_cast<int>(iz) + dz;
-                        const int yy = static_cast<int>(iy) + dy;
-                        const int xx = static_cast<int>(ix) + dx;
-                        if (zz < 0 || yy < 0 || xx < 0 || zz >= static_cast<int>(CZ) || yy >= static_cast<int>(CY) || xx >= static_cast<int>(CX)) continue;
-                        const size_t nlin = lin_of(static_cast<size_t>(zz), static_cast<size_t>(yy), static_cast<size_t>(xx));
-                        if (state[nlin] & kAligned) continue;
-                        if (!is_valid_normal_u8(ax[lin_of(static_cast<size_t>(zz), static_cast<size_t>(yy), static_cast<size_t>(xx))],
-                                                ay[lin_of(static_cast<size_t>(zz), static_cast<size_t>(yy), static_cast<size_t>(xx))],
-                                                az[lin_of(static_cast<size_t>(zz), static_cast<size_t>(yy), static_cast<size_t>(xx))])) {
-                            continue;
-                        }
-                        if (state[nlin] & kInFringe) continue;
-                        local.push_back(nlin);
-                    }
-                }
-            }
-
-            #pragma omp critical
-            {
-                to_add.insert(to_add.end(), local.begin(), local.end());
-            }
-        }
-
-        for (const size_t nlin : to_add) {
-            if (state[nlin] & kAligned) continue;
-            if (state[nlin] & kInFringe) continue;
-            state[nlin] |= kInFringe;
-            fringe.push_back(nlin);
-        }
-    };
-
-    auto score_candidate = [&](size_t cand_lin, int neigh_rad, int& aligned_neighbors, bool& out_flip) -> double {
-        size_t iz, iy, ix;
-        idx_of_lin(cand_lin, iz, iy, ix);
-        const uint8_t cx = ax[lin_of(iz, iy, ix)];
-        const uint8_t cy = ay[lin_of(iz, iy, ix)];
-        const uint8_t cz = az[lin_of(iz, iy, ix)];
-        if (!is_valid_normal_u8(cx, cy, cz)) {
-            aligned_neighbors = 0;
-            out_flip = false;
-            return -1e9;
-        }
-
-        // We intentionally do NOT normalize by neighbor count.
-        // This biases the selection toward candidates with more already-aligned neighbors.
-        double sum_dot_no = 0.0;
-        double sum_dot_fl = 0.0;
-        int cnt = 0;
-        neighbor_iter(iz, iy, ix, neigh_rad, [&](size_t zz, size_t yy, size_t xx) {
-            const size_t nlin = lin_of(zz, yy, xx);
-            if (!(state[nlin] & kAligned)) return;
-            uint8_t nx, ny, nz;
-            oriented_u8_at(nlin, nx, ny, nz);
-            const double d = dot_decoded_u8(cx, cy, cz, nx, ny, nz);
-            sum_dot_no += d;
-            sum_dot_fl += -d;
-            ++cnt;
-        });
-        aligned_neighbors = cnt;
-        if (cnt == 0) {
-            out_flip = false;
-            return -1e9;
-        }
-        if (sum_dot_fl > sum_dot_no) {
-            out_flip = true;
-            return sum_dot_fl;
-        }
-        out_flip = false;
-        return sum_dot_no;
-    };
-
-    add_fringe_neighbors(seed_lin);
-    size_t aligned_count = 1;
-    const auto align_start = std::chrono::steady_clock::now();
-
-    // One RNG per OpenMP thread for the lifetime of this function.
-    // Used for candidate sampling inside the OpenMP candidate loop.
-    const int omp_threads = std::max(1, omp_get_max_threads());
-    std::vector<std::mt19937_64> omp_rng(static_cast<size_t>(omp_threads));
-    for (int t = 0; t < omp_threads; ++t) {
-        // Deterministic but distinct streams.
-        omp_rng[static_cast<size_t>(t)] = std::mt19937_64(0xA11F10ull + 0x9E3779B97F4A7C15ull * static_cast<uint64_t>(t + 1));
-    }
-
-    const auto t0 = std::chrono::steady_clock::now();
-    auto t_last = t0;
-    while (aligned_count < valid_lin.size() && !fringe.empty()) {
-        const auto nowp = std::chrono::steady_clock::now();
-        if (nowp - t_last >= std::chrono::seconds(1)) {
-            const double elapsed = std::chrono::duration<double>(nowp - t0).count();
-            const double rate = (elapsed > 1e-9) ? (static_cast<double>(aligned_count) / elapsed) : 0.0;
-            const double rem = static_cast<double>((valid_lin.size() > aligned_count) ? (valid_lin.size() - aligned_count) : 0);
-            const double eta = (rate > 1e-9) ? (rem / rate) : 0.0;
-            std::cerr << "align-normals: aligned " << aligned_count << "/" << valid_lin.size()
-                      << " | fringe=" << fringe.size()
-                      << " | elapsed=" << elapsed << "s"
-                      << " | rate=" << rate << " vox/s"
-                      << " | ETA=" << eta << "s\n";
-            t_last = nowp;
-        }
-
-        const size_t fringe_size = fringe.size();
-        std::uniform_int_distribution<size_t> pick_fr(0, fringe_size - 1);
-        const int tries = std::min<int>(candidate_samples_per_iter, static_cast<int>(fringe_size));
-
-        // Candidate selection + scoring: parallelize, but keep state mutations serial.
-        struct BestCand {
-            size_t idx_in_fringe = 0;
-            size_t cand_lin = 0;
-            double score = -1e9;
-            int cnt = -1;
-            bool flip = false;
-        };
-
-        BestCand best;
-        best.idx_in_fringe = pick_fr(rng);
-        best.cand_lin = fringe[best.idx_in_fringe];
-
-        #pragma omp parallel if(fringe_size >= 10000)
-        {
-            const int tid = omp_get_thread_num();
-            BestCand local;
-            local.score = -1e9;
-            local.cnt = -1;
-            std::uniform_int_distribution<size_t> pick(0, fringe_size - 1);
-
-            // OpenMP loop runs over #cands (tries) with dynamic scheduling.
-            #pragma omp for schedule(dynamic,1) nowait
-            for (int t = 0; t < tries; ++t) {
-                (void)t;
-                const size_t cand_idx = pick(omp_rng[static_cast<size_t>(tid)]);
-                const size_t cand = fringe[cand_idx];
-                if (state[cand] & kAligned) continue;
-                int cnt = 0;
-                bool fl = false;
-                const double s = score_candidate(cand, /*neigh_rad=*/radius, cnt, fl);
-                if (cnt <= 0) continue;
-                if (s > local.score || (s == local.score && cnt > local.cnt)) {
-                    local.score = s;
-                    local.cnt = cnt;
-                    local.cand_lin = cand;
-                    local.idx_in_fringe = cand_idx;
-                    local.flip = fl;
-                }
-            }
-
-            #pragma omp critical
-            {
-                if (local.cnt > 0 && (local.score > best.score || (local.score == best.score && local.cnt > best.cnt))) {
-                    best = local;
-                }
-            }
-        }
-
-        const size_t best_idx_in_fringe = best.idx_in_fringe;
-        const size_t best_cand = best.cand_lin;
-        const double best_score = best.score;
-        const int best_cnt = best.cnt;
-        const bool best_flip = best.flip;
-
-        if (best_cnt <= 0) {
-            // Drop one stale fringe entry.
-            const size_t drop = pick_fr(rng);
-            state[fringe[drop]] &= ~kInFringe;
-            fringe[drop] = fringe.back();
-            fringe.pop_back();
-            continue;
-        }
-
-        state[best_cand] &= ~kInFringe;
-        state[best_cand] |= kAligned;
-        if (best_flip) state[best_cand] |= kFlip;
-        ++aligned_count;
-
-        // Remove best_cand from fringe (swap-erase by index; avoids linear scan).
-        // If this fails, it indicates a bug (e.g. duplicates or stale index), so fail hard.
-        if (!(best_idx_in_fringe < fringe.size() && fringe[best_idx_in_fringe] == best_cand)) {
-            std::stringstream msg;
-            msg << "Invariant violated: best_idx_in_fringe does not point to best_cand (idx=" << best_idx_in_fringe
-                << ", best_cand=" << best_cand << ", fringe_size=" << fringe.size() << ")";
-            throw std::runtime_error(msg.str());
-        }
-        fringe[best_idx_in_fringe] = fringe.back();
-        fringe.pop_back();
-
-        add_fringe_neighbors(best_cand);
-    }
-
-    // Apply flips to the crop arrays.
-    for (size_t lin = 0; lin < N; ++lin) {
-        if (!(state[lin] & kAligned)) continue;
-        if (!(state[lin] & kFlip)) continue;
-        size_t iz, iy, ix;
-        idx_of_lin(lin, iz, iy, ix);
-        ax[lin_of(iz, iy, ix)] = flip_u8_dir_component(ax[lin_of(iz, iy, ix)]);
-        ay[lin_of(iz, iy, ix)] = flip_u8_dir_component(ay[lin_of(iz, iy, ix)]);
-        az[lin_of(iz, iy, ix)] = flip_u8_dir_component(az[lin_of(iz, iy, ix)]);
-    }
-
-    metrics["align_seconds"] = std::chrono::duration<double>(
-        std::chrono::steady_clock::now() - align_start).count();
-    const auto write_start = std::chrono::steady_clock::now();
-    NormalsZarrLayout output_layout = normals.layout;
-    output_layout.chunkShapeZyx = bounded_normals_output_chunks(output_layout.fullShapeZyx);
-    for (const char* axis : {"x", "y", "z"}) {
-        std::error_code ec;
-        fs::remove_all(out_zarr / axis, ec);
-    }
-    create_normals_output_zarr(out_zarr, output_layout, crop_zyx);
-    write_normals_crop_u8(out_zarr, crop_zyx, ax, ay, az);
-
-    utils::Json attrs = vc::readZarrAttributes(out_zarr);
-    attrs["align_normals"] = true;
-    attrs["align_seed_samples"] = seed_samples;
-    attrs["align_radius_step_units"] = radius;
-    attrs["align_candidate_samples_per_iter"] = candidate_samples_per_iter;
-    {
-        auto mk3 = [](auto a, auto b, auto c) {
-            utils::Json arr = utils::Json::array();
-            arr.push_back(static_cast<int64_t>(a));
-            arr.push_back(static_cast<int64_t>(b));
-            arr.push_back(static_cast<int64_t>(c));
-            return arr;
-        };
-        attrs["crop_min_xyz"] = mk3(crop_xyz.min[0], crop_xyz.min[1], crop_xyz.min[2]);
-        attrs["crop_max_xyz"] = mk3(crop_xyz.max[0], crop_xyz.max[1], crop_xyz.max[2]);
-    }
-    vc::writeZarrAttributes(out_zarr, attrs);
-
-    metrics["write_seconds"] = std::chrono::duration<double>(
-        std::chrono::steady_clock::now() - write_start).count();
-    metrics["total_seconds"] = std::chrono::duration<double>(
-        std::chrono::steady_clock::now() - total_start).count();
-    {
-        auto mk3 = [](auto a, auto b, auto c) {
-            utils::Json arr = utils::Json::array();
-            arr.push_back(static_cast<int64_t>(a));
-            arr.push_back(static_cast<int64_t>(b));
-            arr.push_back(static_cast<int64_t>(c));
-            return arr;
-        };
-        metrics["full_shape_zyx"] = mk3(full_shape[0], full_shape[1], full_shape[2]);
-        metrics["crop_off_zyx"] = mk3(crop_zyx.off[0], crop_zyx.off[1], crop_zyx.off[2]);
-        metrics["crop_shape_zyx"] = mk3(crop_zyx.shape[0], crop_zyx.shape[1], crop_zyx.shape[2]);
-    }
-    metrics["valid_normals"] = valid_lin.size();
-    metrics["aligned_normals"] = aligned_count;
-    if (metrics_json_path.has_value()) {
-        write_metrics_json(*metrics_json_path, metrics);
-    }
 }
 
 struct FitPlaneConfig {
@@ -2291,7 +1556,7 @@ static void run_fit_normals(
     const int crop_off_z = sz0 / step;
     {
         auto mk3i = [](int a, int b, int c) {
-            utils::Json arr = utils::Json::array();
+            nlohmann::json arr = nlohmann::json::array();
             arr.push_back(a); arr.push_back(b); arr.push_back(c);
             return arr;
         };
@@ -2905,14 +2170,13 @@ static void run_fit_normals(
 
     if (dbg_tif) {
         // Write float TIFFs into the current working directory.
-        // NOTE: OpenCV will write 32-bit float TIFFs when passed CV_32F mats.
-        cv::imwrite((fs::path("dbg_fit_rms.tif")).string(), dbg_rms);
-        cv::imwrite((fs::path("dbg_fit_used_radius.tif")).string(), dbg_used_radius);
-        cv::imwrite((fs::path("dbg_fit_sample_count_sum.tif")).string(), dbg_nsamp_sum);
-        cv::imwrite((fs::path("dbg_fit_sample_count_xy.tif")).string(), dbg_nsamp_xy);
-        cv::imwrite((fs::path("dbg_fit_sample_count_xz.tif")).string(), dbg_nsamp_xz);
-        cv::imwrite((fs::path("dbg_fit_sample_count_yz.tif")).string(), dbg_nsamp_yz);
-        cv::imwrite((fs::path("dbg_fit_frac_used_short_paths.tif")).string(), dbg_frac_used_short_paths);
+        vcr::sources::writeTiff(fs::path("dbg_fit_rms.tif"), vc::core::util::imageBuffer(dbg_rms).view());
+        vcr::sources::writeTiff(fs::path("dbg_fit_used_radius.tif"), vc::core::util::imageBuffer(dbg_used_radius).view());
+        vcr::sources::writeTiff(fs::path("dbg_fit_sample_count_sum.tif"), vc::core::util::imageBuffer(dbg_nsamp_sum).view());
+        vcr::sources::writeTiff(fs::path("dbg_fit_sample_count_xy.tif"), vc::core::util::imageBuffer(dbg_nsamp_xy).view());
+        vcr::sources::writeTiff(fs::path("dbg_fit_sample_count_xz.tif"), vc::core::util::imageBuffer(dbg_nsamp_xz).view());
+        vcr::sources::writeTiff(fs::path("dbg_fit_sample_count_yz.tif"), vc::core::util::imageBuffer(dbg_nsamp_yz).view());
+        vcr::sources::writeTiff(fs::path("dbg_fit_frac_used_short_paths.tif"), vc::core::util::imageBuffer(dbg_frac_used_short_paths).view());
     }
 
     if (output_spool) {
@@ -2971,18 +2235,21 @@ static void run_fit_normals(
                 {static_cast<size_t>(crop_off_z), static_cast<size_t>(crop_off_y), static_cast<size_t>(crop_off_x)},
                 {static_cast<size_t>(crop_nz), static_cast<size_t>(crop_ny), static_cast<size_t>(crop_nx)},
             });
-        vc::createZarrDataset(out_zarr / "fit_rms", "0", output_shape_zyx, output_chunks_zyx, vc::VcDtype::uint8, "blosc", "/");
-        vc::createZarrDataset(out_zarr / "fit_frac_short_paths", "0", output_shape_zyx, output_chunks_zyx, vc::VcDtype::uint8, "blosc", "/");
-        vc::createZarrDataset(out_zarr / "fit_used_radius", "0", output_shape_zyx, output_chunks_zyx, vc::VcDtype::uint8, "blosc", "/");
-        vc::createZarrDataset(out_zarr / "fit_segment_count", "0", output_shape_zyx, output_chunks_zyx, vc::VcDtype::uint8, "blosc", "/");
+        vcr::zarr::CreateOptions options;
+        options.shape.assign(output_shape_zyx.begin(), output_shape_zyx.end());
+        options.chunks.assign(output_chunks_zyx.begin(), output_chunks_zyx.end());
+        options.separator = "/";
+        for (const auto* name : {"fit_rms", "fit_frac_short_paths", "fit_used_radius", "fit_segment_count"}) {
+            vcr::zarr::Writer::create(out_zarr / name / "0", options);
+        }
 
         materialize_stats = materialize_fit_output_spool(out_zarr, *output_spool, static_cast<size_t>(nthreads));
 
-        utils::Json attrs = vc::readZarrAttributes(out_zarr);
+        nlohmann::json attrs = vcr::zarr::readAttributes(out_zarr);
         attrs["radius"] = radius;
         {
             auto mk3 = [](auto a, auto b, auto c) {
-                utils::Json arr = utils::Json::array();
+                nlohmann::json arr = nlohmann::json::array();
                 arr.push_back(static_cast<int64_t>(a));
                 arr.push_back(static_cast<int64_t>(b));
                 arr.push_back(static_cast<int64_t>(c));
@@ -3001,7 +2268,7 @@ static void run_fit_normals(
         attrs["fit_frac_short_paths_decode"] = "v/255";
         attrs["fit_used_radius_decode"] = "2 + (v/255)*(512-2)";
         attrs["fit_segment_count_decode"] = "(v/255)*8192";
-        vc::writeZarrAttributes(out_zarr, attrs);
+        vcr::zarr::writeAttributes(out_zarr, attrs);
 
         std::error_code ec;
         fs::remove_all(spool_dir, ec);
@@ -3073,8 +2340,7 @@ int main(int argc, char** argv) {
         ("dbg-tif", "Write debug float TIFFs for --fit-normals (workdir): rms, used radius, sample counts (first z layer only)")
         ("output-zarr", po::value<std::string>(), "Write fitted normals to a zarr directory (direction-field encoding)")
         ("step", po::value<int>()->default_value(16), "Sample step for --fit-normals (default: 16)")
-        ("metrics-json", po::value<std::string>(), "Write structured fit/align metrics json")
-        ("align-normals", "Align normals in an existing normals zarr (requires --input zarr and --output-zarr)");
+        ("metrics-json", po::value<std::string>(), "Write structured fit metrics json");
 
     po::variables_map vm;
     try {
@@ -3145,25 +2411,6 @@ int main(int argc, char** argv) {
             }
             run_vis_ply(input_dir, fs::path(vm["vis-ply"].as<std::string>()), crop);
         }
-        return 0;
-    }
-
-    if (vm.count("align-normals")) {
-        if (!input_is_normals_zarr) {
-            std::cerr << "Error: --align-normals requires --input to be a normals zarr root\n";
-            return 1;
-        }
-        if (!vm.count("output-zarr")) {
-            std::cerr << "Error: --align-normals requires --output-zarr PATH\n";
-            return 1;
-        }
-        run_align_normals_zarr(input_dir,
-                               fs::path(vm["output-zarr"].as<std::string>()),
-                               crop,
-                               100,
-                               2,
-                               100,
-                               metrics_json);
         return 0;
     }
 

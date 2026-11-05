@@ -26,19 +26,18 @@ from pathlib import Path
 from uuid import uuid4
 
 import numpy as np
-from scipy import ndimage
-import tifffile
 import torch
+from vc_reader.reader import ZarrReader, open_zarr
 
 from vesuvius.neural_tracing.tracers.shared.geometry import resample_polyline
 from vesuvius.neural_tracing.tracers.shared.hub import checkpoint_source, hf_repo, hub_folder
-from vesuvius.neural_tracing.tracers.shared.crop_sampling.volume import ChunkedArray
 from vesuvius.neural_tracing.tracers.sheets import config as C
 from vesuvius.neural_tracing.tracers.sheets.data.episodes import collate_fibers
 from vesuvius.neural_tracing.tracers.sheets.checkpoint import load_checkpoint
 from vesuvius.neural_tracing.tracers.sheets.tracing.rollout import Front, Tracer
 from vesuvius.neural_tracing.tracers.sheets.sampling import view_radius
-from vesuvius.tifxyz import Tifxyz, write_tifxyz
+from vc_reader import tifxyz
+from vc_reader.geometry import label_components
 
 
 def resample(points: np.ndarray, spacing: float) -> np.ndarray:
@@ -55,7 +54,7 @@ def seed_from_patch(path, line: str, span: str, direction: str):
     axis, index = line.split(':')
     index = int(index)
     lo, hi = (int(v) for v in span.split(':'))
-    xyz = np.stack([tifffile.imread(Path(path)/f'{c}.tif') for c in 'xyz'], -1).astype(np.float64)
+    xyz = np.asarray(tifxyz.read(path).xyz, np.float64)
     sign = 1 if direction == '+' else -1
     if axis == 'col':
         xyz = xyz.transpose(1, 0, 2)
@@ -73,12 +72,12 @@ def seed_from_json(path):
     return points, np.broadcast_to(np.asarray(document['direction'], np.float64), points.shape)
 
 
-def read_block(volume: ChunkedArray, pos: np.ndarray, pad: float, level: int):
+def read_block(volume: ZarrReader, pos: np.ndarray, pad: float, level: int):
     scale = 1 << level
     lo, hi = pos.min(0)-pad, pos.max(0)+pad
     origin = np.floor((lo[::-1]+.5)/scale-.5).astype(np.int64)
     size = np.ceil((hi-lo)[::-1]/scale).astype(np.int64)+2
-    return volume.read(origin, size), origin
+    return volume.read_region(origin, size), origin
 
 
 def _reach_row(kept: np.ndarray, above: np.ndarray) -> np.ndarray:
@@ -101,7 +100,7 @@ def connected_keep(confs: np.ndarray, threshold: float) -> np.ndarray:
     always kept), so the output is one connected surface rather than separate islands."""
     keep = confs > threshold
     keep[0] = True
-    labels, _ = ndimage.label(keep)
+    labels, _ = label_components(keep, connectivity=4)
     return np.isin(labels, np.unique(labels[0]))
 
 
@@ -127,7 +126,7 @@ def trace(model, cfg, seed: np.ndarray, direction: np.ndarray, steps: int, devic
     pos = torch.tensor(seed, dtype=torch.float32, device=device)[None]
     prev = torch.tensor(seed-d.step*unit, dtype=torch.float32, device=device)[None]
     front = Front(pos, prev, torch.ones(1, count, device=device))
-    volume = ChunkedArray(f'{d.volume}/{d.volume_level}', 1 << 30)
+    volume = open_zarr(d.volume, level=d.volume_level, memory_cache=1 << 30)
     pad = view_radius(cfg.model)+d.step+4
     columns = lambda pos, conf, dense=None: tuple(x[0].cpu().numpy() for x in tracer.output_columns(pos, conf, dense))
     p, c = columns(front.pos, front.conf)
@@ -197,10 +196,9 @@ def write_surface(out: Path, rows: np.ndarray, keep: np.ndarray, row_step: float
             existing = None
         if isinstance(existing, str) and existing and existing != out.name:
             surface_uuid = existing
-    surface = Tifxyz(_x=xyz[..., 0], _y=xyz[..., 1], _z=xyz[..., 2], uuid=surface_uuid,
-                     _scale=(1./row_step, 1./column_step))
-    layout = dict(compression=None, tile_size=None) if mmap_layout else {}
-    write_tifxyz(out, surface, overwrite=overwrite, **layout)
+    surface = tifxyz.Surface(xyz, uuid=surface_uuid, scale=(1./row_step, 1./column_step))
+    layout = dict(compression='none', tile=None) if mmap_layout else {}
+    tifxyz.write(out, surface, overwrite=overwrite, **layout)
     add_area(out/'meta.json', xyz, voxel_size_um)
     if provenance is not None:
         (out/'trace.json').write_text(json.dumps(provenance, indent=2, default=str))
@@ -277,12 +275,22 @@ def main(argv=None):
                     help='replace the path prefix OLD by NEW in the checkpoint\'s data paths (volumes, patch '
                          'directories), e.g. for a checkpoint trained on another machine; repeatable')
     ap.add_argument('--device', default='cuda')
+    ap.add_argument('--voxel-size', type=float, help="level-0 voxel size (um) of --volume for area_cm2 (default: "
+                                                     "its meta.json voxelsize, else the checkpoint's)")
     args = ap.parse_args(argv)
     path = resolve_checkpoint(args.checkpoint)
     model, cfg, _ = load_checkpoint(path, args.device)
     C.path_mapper(args.path_map)(cfg)
     if args.volume:
         cfg.data.volume = args.volume
+        meta = Path(args.volume)/'meta.json'  # volpkg volume metadata, as neural_tracing/infer.py reads it
+        voxel_size = args.voxel_size or (json.loads(meta.read_text()).get('voxelsize') if meta.is_file() else None)
+        if not voxel_size:
+            print(f'No voxel size for {args.volume} (meta.json voxelsize or --voxel-size): area_cm2 assumes '
+                  f'{cfg.data.voxel_size_um} um')
+        cfg.data.voxel_size_um = voxel_size or cfg.data.voxel_size_um
+    elif args.voxel_size:
+        cfg.data.voxel_size_um = args.voxel_size
     if args.threshold is not None:
         cfg.trace.confidence_threshold = args.threshold
     if args.seed_json:

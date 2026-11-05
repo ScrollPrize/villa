@@ -1,5 +1,5 @@
 #include "formats/GeometryInput.hpp"
-#include "geometry/ArrayBytes.hpp"
+#include "vc_object_store/geometry/ArrayBytes.hpp"
 #include "vc_object_store/objects/GeometryCoordinates.hpp"
 #include "vc_object_store/geometry/Geometry.hpp"
 #include <charconv>
@@ -8,7 +8,7 @@
 namespace vc::objects::formats {
 using Json = nlohmann::json;
 namespace fs = std::filesystem;
-std::vector<Prepared> collections(const fs::path& source)
+std::vector<Prepared> collections(const fs::path& source, const SourceIngestOptions& options)
 {
     const auto root = readJson(source);
     if (root.value("vc_pointcollections_json_version", "") != "1" || !root.at("collections").is_object())
@@ -16,7 +16,9 @@ std::vector<Prepared> collections(const fs::path& source)
     std::vector<Prepared> result;
     const auto documentCoordinates = sourceGeometryCoordinates(root);
     std::set<std::string> seen;
-    for (const auto& [collectionId, original] : root.at("collections").items()) {
+    for (const auto& [collectionId, document] : root.at("collections").items()) {
+        auto original = document;
+        deriveSourceUuid(original, "point_collection", source.stem().string() + ":" + collectionId, options.uuidNamespace);
         Prepared p;
         p.object = sourceObject(original, "point_collection", source);
         if (!seen.insert(p.object.uuid).second) throw std::runtime_error("duplicate collection UUID");

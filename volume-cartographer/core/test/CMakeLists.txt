@@ -64,36 +64,18 @@ function(vc_add_test)
     vc_register_ctest(${T_NAME} ${T_NAME})
 endfunction()
 
-vc_add_test(NAME test_smoke LIBS doctest::doctest)
+
+
 vc_add_test(NAME test_fiber_view LIBS doctest::doctest vc_fiber_view)
 vc_add_test(NAME test_fiber_constraint_geometry LIBS doctest::doctest vc_object_store::vc_object_geometry)
-
-vc_add_test(NAME test_sampling_wait_profile)
-add_test(NAME test_sampling_wait_profile_enabled
-    COMMAND ${CMAKE_COMMAND} -E env VC_SAMPLING_WAIT_PROFILE=1
-        $<TARGET_FILE:test_sampling_wait_profile>)
-vc_register_ctest(test_sampling_wait_profile_enabled test_sampling_wait_profile)
-
 
 vc_add_test(NAME test_omp_thread_point_collection)
 
 vc_add_test(NAME test_surface_area_units)
 
-vc_add_test(NAME test_voxel_size_metadata)
-
-vc_add_test(NAME test_tifxyz_identity)
-
-vc_add_test(NAME test_appendmask_render)
-
-vc_add_test(NAME test_chunked_plane_sampler_fallback)
-
-vc_add_test(NAME test_volume_chunk_errors)
 
 vc_add_test(NAME test_segmentation_autosave_state
     LIBS doctest::doctest
-    INCLUDES ${PROJECT_SOURCE_DIR}/apps/VC3D)
-
-vc_add_test(NAME test_surface_display_name
     INCLUDES ${PROJECT_SOURCE_DIR}/apps/VC3D)
 
 vc_add_test(NAME test_volumetric_compositor
@@ -101,24 +83,23 @@ vc_add_test(NAME test_volumetric_compositor
             ${PROJECT_SOURCE_DIR}/apps/VC3D/volume_viewers/VolumetricCompositor.cpp
     INCLUDES ${PROJECT_SOURCE_DIR}/apps/VC3D)
 
-vc_add_test(NAME test_segmentation_intersection_invalidation
-    LIBS Qt6::Core Qt6::Gui Qt6::Test vc_core
-    INCLUDES ${PROJECT_SOURCE_DIR}/apps/VC3D)
-
 qt6_wrap_cpp(ink_detection_overlay_moc ${PROJECT_SOURCE_DIR}/apps/VC3D/overlays/InkDetectionOverlayController.hpp)
 qt6_wrap_cpp(viewer_overlay_base_ink_moc ${PROJECT_SOURCE_DIR}/apps/VC3D/overlays/ViewerOverlayControllerBase.hpp)
 qt6_wrap_cpp(viewer_manager_overlay_test_moc ${PROJECT_SOURCE_DIR}/apps/VC3D/ViewerManager.hpp)
-qt6_wrap_cpp(cstate_ink_detection_moc ${PROJECT_SOURCE_DIR}/apps/VC3D/CState.hpp)
+qt6_wrap_cpp(cstate_ink_detection_moc ${PROJECT_SOURCE_DIR}/apps/VC3D/CState.hpp
+             ${PROJECT_SOURCE_DIR}/apps/VC3D/PointCollectionSync.hpp)
 qt6_wrap_cpp(vccollection_ink_detection_moc ${PROJECT_SOURCE_DIR}/core/include/vc/ui/VCCollection.hpp)
+qt6_wrap_cpp(surface_catalog_ink_detection_moc ${PROJECT_SOURCE_DIR}/apps/VC3D/SurfaceCatalog.hpp)
 vc_add_test(NAME test_ink_detection_overlay
     SOURCES test_ink_detection_overlay.cpp
+            ${PROJECT_SOURCE_DIR}/apps/VC3D/Colormaps.cpp
             ${PROJECT_SOURCE_DIR}/apps/VC3D/overlays/InkDetectionOverlayController.cpp
             ${PROJECT_SOURCE_DIR}/apps/VC3D/overlays/ViewerOverlayControllerBase.cpp
-            ${PROJECT_SOURCE_DIR}/apps/VC3D/OpenDataSegmentCache.cpp
-            ${PROJECT_SOURCE_DIR}/apps/VC3D/OpenDataSegmentCacheIO.cpp
-            ${PROJECT_SOURCE_DIR}/apps/VC3D/OpenDataManifest.cpp
-            ${PROJECT_SOURCE_DIR}/apps/VC3D/VolumeViewerCmaps.cpp
+            ${PROJECT_SOURCE_DIR}/apps/VC3D/OpenDataResourceSelection.cpp
+            ${PROJECT_SOURCE_DIR}/apps/VC3D/SurfaceCatalog.cpp
             ${PROJECT_SOURCE_DIR}/apps/VC3D/CState.cpp
+            ${PROJECT_SOURCE_DIR}/apps/VC3D/OpenedVolumes.cpp
+            ${PROJECT_SOURCE_DIR}/apps/VC3D/PointCollectionSync.cpp
             ${PROJECT_SOURCE_DIR}/apps/VC3D/elements/COutlinedTextItem.cpp
             ${PROJECT_SOURCE_DIR}/apps/VC3D/volume_viewers/CVolumeViewerView.cpp
             ${PROJECT_SOURCE_DIR}/core/src/VCCollection.cpp
@@ -128,7 +109,8 @@ vc_add_test(NAME test_ink_detection_overlay
             ${viewer_manager_overlay_test_moc}
             ${cstate_ink_detection_moc}
             ${vccollection_ink_detection_moc}
-    LIBS vc_object_store::vc_objects doctest::doctest Qt6::Core Qt6::Gui Qt6::Widgets Qt6::Test vc_core
+            ${surface_catalog_ink_detection_moc}
+    LIBS opencv_imgcodecs vc_object_store::vc_objects vc_object_store::vc_object_geometry doctest::doctest Qt6::Core Qt6::Gui Qt6::Widgets Qt6::Test vc_core
     INCLUDES ${PROJECT_SOURCE_DIR}/apps/VC3D
     DEFS VC_TESTING)
 
@@ -140,9 +122,6 @@ vc_add_test(NAME test_viewer_overlay_surface_primitives
             ${PROJECT_SOURCE_DIR}/apps/VC3D/overlays/ViewerOverlayControllerBase.cpp
             ${PROJECT_SOURCE_DIR}/apps/VC3D/overlays/PointsOverlayController.cpp
             ${PROJECT_SOURCE_DIR}/apps/VC3D/overlays/OverlayBatchItem.cpp
-            ${PROJECT_SOURCE_DIR}/apps/VC3D/overlays/AtlasOverlayController.cpp
-            ${PROJECT_SOURCE_DIR}/apps/VC3D/overlays/AtlasControlPointsOverlayController.cpp
-            ${PROJECT_SOURCE_DIR}/apps/VC3D/AtlasControlPointsDock.cpp
             ${PROJECT_SOURCE_DIR}/apps/VC3D/elements/COutlinedTextItem.cpp
             ${PROJECT_SOURCE_DIR}/apps/VC3D/volume_viewers/CVolumeViewerView.cpp
             ${PROJECT_SOURCE_DIR}/core/src/VCCollection.cpp
@@ -151,7 +130,7 @@ vc_add_test(NAME test_viewer_overlay_surface_primitives
             ${points_overlay_surface_primitives_moc}
             ${vccollection_surface_primitives_moc}
             ${viewer_manager_overlay_test_moc}
-    LIBS Qt6::Core Qt6::Gui Qt6::Widgets Qt6::Test vc_core vc_atlas
+    LIBS Qt6::Core Qt6::Gui Qt6::Widgets Qt6::Test vc_core
     INCLUDES ${PROJECT_SOURCE_DIR}/apps/VC3D)
 
 vc_add_test(NAME test_line_annotation_context_menu
@@ -185,26 +164,21 @@ vc_add_test(NAME test_fiber_trace_review
 
 qt6_wrap_cpp(lasagna_service_manager_moc ${PROJECT_SOURCE_DIR}/apps/VC3D/LasagnaServiceManager.hpp)
 qt6_wrap_cpp(lasagna_batch_window_moc ${PROJECT_SOURCE_DIR}/apps/VC3D/LasagnaBatchWindow.hpp)
-vc_add_test(NAME test_lasagna_service_manager_factory
-    SOURCES test_lasagna_service_manager_factory.cpp
-            test_lasagna_service_manager_stub.cpp
-            ${lasagna_service_manager_moc}
-    LIBS Qt6::Core vc_core
-    INCLUDES ${PROJECT_SOURCE_DIR}/apps/VC3D)
-
 vc_add_test(NAME test_lasagna_batch_window
     SOURCES test_lasagna_batch_window.cpp
             ${PROJECT_SOURCE_DIR}/apps/VC3D/LasagnaBatchWindow.cpp
             test_lasagna_service_manager_stub.cpp
             ${lasagna_batch_window_moc}
             ${lasagna_service_manager_moc}
-    LIBS Qt6::Core Qt6::Gui Qt6::Widgets vc_core
+    LIBS Qt6::Core Qt6::Gui Qt6::Widgets Qt6::Test vc_core
     INCLUDES ${PROJECT_SOURCE_DIR}/apps/VC3D)
 
 qt6_wrap_cpp(segmentation_lasagna_panel_moc ${PROJECT_SOURCE_DIR}/apps/VC3D/segmentation/panels/SegmentationLasagnaPanel.hpp)
 qt6_wrap_cpp(collapsible_settings_group_moc ${PROJECT_SOURCE_DIR}/apps/VC3D/elements/CollapsibleSettingsGroup.hpp)
-qt6_wrap_cpp(cstate_lasagna_panel_moc ${PROJECT_SOURCE_DIR}/apps/VC3D/CState.hpp)
+qt6_wrap_cpp(cstate_lasagna_panel_moc ${PROJECT_SOURCE_DIR}/apps/VC3D/CState.hpp
+             ${PROJECT_SOURCE_DIR}/apps/VC3D/PointCollectionSync.hpp)
 qt6_wrap_cpp(vccollection_lasagna_panel_moc ${PROJECT_SOURCE_DIR}/core/include/vc/ui/VCCollection.hpp)
+qt6_wrap_cpp(surface_catalog_lasagna_panel_moc ${PROJECT_SOURCE_DIR}/apps/VC3D/SurfaceCatalog.hpp)
 vc_add_test(NAME test_segmentation_lasagna_panel_ui
     SOURCES test_segmentation_lasagna_panel_ui.cpp
             ${PROJECT_SOURCE_DIR}/apps/VC3D/segmentation/panels/SegmentationLasagnaPanel.cpp
@@ -212,14 +186,18 @@ vc_add_test(NAME test_segmentation_lasagna_panel_ui
             test_lasagna_service_manager_stub.cpp
             ${PROJECT_SOURCE_DIR}/apps/VC3D/elements/CollapsibleSettingsGroup.cpp
             ${PROJECT_SOURCE_DIR}/apps/VC3D/CState.cpp
+            ${PROJECT_SOURCE_DIR}/apps/VC3D/OpenedVolumes.cpp
+            ${PROJECT_SOURCE_DIR}/apps/VC3D/PointCollectionSync.cpp
             ${PROJECT_SOURCE_DIR}/core/src/VCCollection.cpp
+            ${PROJECT_SOURCE_DIR}/apps/VC3D/SurfaceCatalog.cpp
             ${segmentation_lasagna_panel_moc}
             ${lasagna_batch_window_moc}
             ${lasagna_service_manager_moc}
             ${collapsible_settings_group_moc}
             ${cstate_lasagna_panel_moc}
             ${vccollection_lasagna_panel_moc}
-    LIBS vc_object_store::vc_objects Qt6::Core Qt6::Gui Qt6::Widgets Qt6::Concurrent Qt6::Test vc_core vc_atlas
+            ${surface_catalog_lasagna_panel_moc}
+    LIBS vc_object_store::vc_objects vc_object_store::vc_object_geometry Qt6::Core Qt6::Gui Qt6::Widgets Qt6::Concurrent Qt6::Test vc_core
     INCLUDES ${PROJECT_SOURCE_DIR}/apps/VC3D
     DEFS VC_TEST_DISABLE_LASAGNA_DISCOVERY VC_TEST_DISABLE_LASAGNA_DIALOGS)
 
@@ -237,11 +215,12 @@ vc_add_test(NAME test_spiral_config_profile_editor
     INCLUDES ${PROJECT_SOURCE_DIR}/apps/VC3D)
 
 qt6_wrap_cpp(line_annotation_vccollection_moc ${PROJECT_SOURCE_DIR}/core/include/vc/ui/VCCollection.hpp)
-qt6_wrap_cpp(line_annotation_cstate_moc ${PROJECT_SOURCE_DIR}/apps/VC3D/CState.hpp)
+qt6_wrap_cpp(line_annotation_cstate_moc ${PROJECT_SOURCE_DIR}/apps/VC3D/CState.hpp
+             ${PROJECT_SOURCE_DIR}/apps/VC3D/PointCollectionSync.hpp)
 vc_add_test(NAME test_line_annotation_link_validation
     SOURCES test_line_annotation_link_validation.cpp
-            ${PROJECT_SOURCE_DIR}/apps/VC3D/FiberSliceGeometry.cpp
-            ${PROJECT_SOURCE_DIR}/apps/VC3D/FiberSliceGeometry.hpp
+            ${PROJECT_SOURCE_DIR}/apps/VC3D/FiberLineGeometry.cpp
+            ${PROJECT_SOURCE_DIR}/apps/VC3D/FiberLineGeometry.hpp
             ${PROJECT_SOURCE_DIR}/apps/VC3D/LineAnnotationFiberSegments.cpp
             ${PROJECT_SOURCE_DIR}/apps/VC3D/LineAnnotationFiberSegments.hpp
     LIBS doctest::doctest Qt6::Core vc_core vc_lasagna vc_fiber_tracer
@@ -249,8 +228,8 @@ vc_add_test(NAME test_line_annotation_link_validation
 
 vc_add_test(NAME test_line_annotation_structural_edits
     SOURCES test_line_annotation_structural_edits.cpp
-            ${PROJECT_SOURCE_DIR}/apps/VC3D/FiberSliceGeometry.cpp
-            ${PROJECT_SOURCE_DIR}/apps/VC3D/FiberSliceGeometry.hpp
+            ${PROJECT_SOURCE_DIR}/apps/VC3D/FiberLineGeometry.cpp
+            ${PROJECT_SOURCE_DIR}/apps/VC3D/FiberLineGeometry.hpp
             ${PROJECT_SOURCE_DIR}/apps/VC3D/LineAnnotationFiberSegments.cpp
             ${PROJECT_SOURCE_DIR}/apps/VC3D/LineAnnotationFiberSegments.hpp
             ${PROJECT_SOURCE_DIR}/apps/VC3D/LineAnnotationStructuralEdits.cpp
@@ -263,19 +242,22 @@ vc_add_test(NAME test_line_annotation_generated_views
             ${PROJECT_SOURCE_DIR}/apps/VC3D/LineAnnotationFiberSegments.cpp
             ${PROJECT_SOURCE_DIR}/apps/VC3D/LineAnnotationFiberSegments.hpp
             ${PROJECT_SOURCE_DIR}/apps/VC3D/CState.cpp
+            ${PROJECT_SOURCE_DIR}/apps/VC3D/OpenedVolumes.cpp
             ${PROJECT_SOURCE_DIR}/apps/VC3D/CState.hpp
-            ${PROJECT_SOURCE_DIR}/apps/VC3D/FiberSliceGeometry.cpp
-            ${PROJECT_SOURCE_DIR}/apps/VC3D/FiberSliceGeometry.hpp
+            ${PROJECT_SOURCE_DIR}/apps/VC3D/PointCollectionSync.cpp
+            ${PROJECT_SOURCE_DIR}/apps/VC3D/PointCollectionSync.hpp
+            ${PROJECT_SOURCE_DIR}/apps/VC3D/FiberLineGeometry.cpp
+            ${PROJECT_SOURCE_DIR}/apps/VC3D/FiberLineGeometry.hpp
             ${PROJECT_SOURCE_DIR}/core/src/VCCollection.cpp
             ${line_annotation_vccollection_moc}
             ${line_annotation_cstate_moc}
-    LIBS vc_object_store::vc_objects doctest::doctest Qt6::Core vc_core vc_lasagna vc_fiber_tracer
+    LIBS vc_object_store::vc_objects vc_object_store::vc_object_geometry doctest::doctest Qt6::Core vc_core vc_lasagna vc_fiber_tracer
     INCLUDES ${PROJECT_SOURCE_DIR}/apps/VC3D)
 
-vc_add_test(NAME test_fiber_slice_geometry
-    SOURCES test_fiber_slice_geometry.cpp
-            ${PROJECT_SOURCE_DIR}/apps/VC3D/FiberSliceGeometry.cpp
-            ${PROJECT_SOURCE_DIR}/apps/VC3D/FiberSliceGeometry.hpp
+vc_add_test(NAME test_fiber_line_geometry
+    SOURCES test_fiber_line_geometry.cpp
+            ${PROJECT_SOURCE_DIR}/apps/VC3D/FiberLineGeometry.cpp
+            ${PROJECT_SOURCE_DIR}/apps/VC3D/FiberLineGeometry.hpp
     LIBS doctest::doctest vc_core
     INCLUDES ${PROJECT_SOURCE_DIR}/apps/VC3D)
 
@@ -295,15 +277,13 @@ vc_add_test(NAME test_fiber_width_scoring LIBS doctest::doctest vc_fiber_tracer)
 vc_add_test(NAME test_fiber_reverse_consistency LIBS doctest::doctest vc_fiber_tracer)
 vc_add_test(NAME test_fiber_reference_replay_core LIBS doctest::doctest vc_fiber_tracer)
 vc_add_test(NAME test_fiber_chunk_trace LIBS doctest::doctest vc_fiber_tracer)
-vc_add_test(NAME test_prediction_pooling LIBS doctest::doctest vc_lasagna)
-vc_add_test(NAME test_fiber_live_readiness LIBS doctest::doctest vc_fiber_tracer)
 vc_add_test(NAME test_fiber_case_queue LIBS doctest::doctest vc_fiber_tracer)
 set_tests_properties(test_fiber_case_queue PROPERTIES TIMEOUT 30)
 vc_add_test(NAME test_fiberlet_storage LIBS doctest::doctest vc_fiber_tracer)
 vc_add_test(NAME test_fiberlet_crop_trace LIBS doctest::doctest vc_fiber_tracer)
-vc_add_test(NAME test_fiber_replay_visualization LIBS doctest::doctest vc_fiber_tracer)
+vc_add_test(NAME test_fiber_replay_visualization LIBS doctest::doctest vc_fiber_tracer opencv_imgcodecs)
 target_compile_definitions(test_fiber_replay_visualization PRIVATE VC_TESTING)
-vc_add_test(NAME test_fiberlet_paths LIBS doctest::doctest vc_fiber_tracer DEFS VC_TESTING)
+vc_add_test(NAME test_fiberlet_paths LIBS doctest::doctest vc_fiber_tracer opencv_imgcodecs DEFS VC_TESTING)
 if(TARGET test_fiberlet_paths AND CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
     # The inline optimized/reference kernels assert bitwise operation-order
     # equality. Do not let the compiler contract just one expression into FMA.
@@ -313,9 +293,6 @@ endif()
 
 # Qt-free data/IO layer.
 vc_add_test(NAME test_point_collections)
-
-vc_add_test(NAME test_open_data_coordinate_identity
-    INCLUDES ${PROJECT_SOURCE_DIR}/apps/VC3D)
 
 # VCCollection shim: verify the on*() hooks still emit Qt signals. Needs the
 # shim TU + its MOC (it isn't built into a lib anymore).
@@ -340,422 +317,43 @@ vc_add_test(NAME test_point_collection_widget
 
 vc_add_test(NAME test_quadsurface_save_roundtrip)
 
-vc_add_test(NAME test_atomic_imwrite_multi)
+vc_add_test(NAME test_post_process SOURCES test_post_process.cpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/DisplayPalette.cpp ${PROJECT_SOURCE_DIR}/apps/VC3D/Colormaps.cpp
+    INCLUDES ${PROJECT_SOURCE_DIR}/apps/VC3D)
 
-vc_add_test(NAME test_post_process)
+vc_add_test(NAME test_surface_meshing)
 
-# Pin the on-disk wire format: chunks must remain Blosc1-readable because
-# VcDataset writes Zarr v2 metadata advertising compressor_id = "blosc".
-# This catches any future migration to Blosc2 that would silently produce
-# chunks numcodecs / zarr-python cannot decode.
-#
-# Links vc_core directly so it can call vc::testing::bloscCompressForTest,
-# which exercises the *real* compress path used by VcDataset.
-vc_add_test(NAME test_blosc1_compat LIBS doctest::doctest vc_core Blosc::blosc)
+# These spawn the built command-line tools, so they only exist in
+# configurations that build the apps -- the test shards configure with
+# VC_BUILD_APPS=OFF and apps/ returns before the tool targets are created.
+if(VC_BUILD_APPS)
+    vc_add_test(NAME test_ngrids_zarr_output LIBS doctest::doctest vc_core Qt6::Core)
+    add_dependencies(test_ngrids_zarr_output vc_ngrids)
+    set_tests_properties(test_ngrids_zarr_output PROPERTIES
+        ENVIRONMENT "VC_NGRIDS_BIN=$<TARGET_FILE:vc_ngrids>"
+        TIMEOUT 180)
 
-# Parser-only regression tests for vc_merge_tifxyz: gmResolveGrid +
-# gmCheckConnected are compiled into vc_core, so link that and assert the
-# failure messages exactly without spawning the binary.
-vc_add_test(NAME test_merge_grid_resolve)
+    # Spawns the built vc_grow_seg_from_seed on a synthetic sheet in store mode.
+    vc_add_test(NAME test_grow_seg_store_mode)
+    add_dependencies(test_grow_seg_store_mode vc_grow_seg_from_seed)
+    set_tests_properties(test_grow_seg_store_mode PROPERTIES
+        ENVIRONMENT "VC_GROW_SEG_FROM_SEED_BIN=$<TARGET_FILE:vc_grow_seg_from_seed>")
 
-# End-to-end test that spawns the built vc_merge_tifxyz binary on two
-# synthetic 16x16 tifxyz dirs. Opt-in via VC_RUN_E2E=1; the test skips
-# itself if unset, so the default ctest run stays fast.
-add_executable(test_merge_e2e_small test_merge_e2e_small.cpp)
-target_link_libraries(test_merge_e2e_small PRIVATE doctest::doctest vc_core nlohmann_json::nlohmann_json)
-vc_register_test_target(test_merge_e2e_small)
-if(VC_RUN_E2E)
-    add_test(NAME test_merge_e2e_small COMMAND test_merge_e2e_small)
-    vc_register_ctest(test_merge_e2e_small test_merge_e2e_small)
-    # The binary path probe in the test prefers VC_MERGE_TIFXYZ_BIN, so
-    # CTest runs reliably regardless of the working directory.
-    set_tests_properties(test_merge_e2e_small PROPERTIES
-        ENVIRONMENT "VC_RUN_E2E=1;VC_MERGE_TIFXYZ_BIN=$<TARGET_FILE:vc_merge_tifxyz>")
-endif()
+    # Outputs of the mesh tools (OBJ export, OBJ rasterization)
+    # on small fixed inputs.
+    vc_add_test(NAME test_mesh_tool_outputs)
+    add_dependencies(test_mesh_tool_outputs vc_tifxyz2obj vc_obj2tifxyz vc_obj2tifxyz_legacy)
+    set_tests_properties(test_mesh_tool_outputs PROPERTIES
+        ENVIRONMENT "VC_TIFXYZ2OBJ_BIN=$<TARGET_FILE:vc_tifxyz2obj>;VC_OBJ2TIFXYZ_BIN=$<TARGET_FILE:vc_obj2tifxyz>;VC_OBJ2TIFXYZ_LEGACY_BIN=$<TARGET_FILE:vc_obj2tifxyz_legacy>")
 
-# End-to-end test that spawns the built vc_obj2tifxyz_legacy on two synthetic
-# plane meshes (clean, and with 3% stretched triangles) and checks the output
-# cell size under the three scale methods (median, mean, manual). Opt-in via
-# VC_RUN_E2E=1.
-add_executable(test_obj2tifxyz_legacy_scale test_obj2tifxyz_legacy_scale.cpp)
-target_link_libraries(test_obj2tifxyz_legacy_scale PRIVATE doctest::doctest vc_core)
-vc_register_test_target(test_obj2tifxyz_legacy_scale)
-if(VC_RUN_E2E)
-    add_test(NAME test_obj2tifxyz_legacy_scale COMMAND test_obj2tifxyz_legacy_scale)
-    vc_register_ctest(test_obj2tifxyz_legacy_scale test_obj2tifxyz_legacy_scale)
-    set_tests_properties(test_obj2tifxyz_legacy_scale PROPERTIES
-        ENVIRONMENT "VC_RUN_E2E=1;VC_OBJ2TIFXYZ_LEGACY_BIN=$<TARGET_FILE:vc_obj2tifxyz_legacy>")
-endif()
-
-add_executable(bench_volume_sample bench_volume_sample.cpp)
-target_link_libraries(bench_volume_sample PRIVATE doctest::doctest vc_core)
-vc_register_test_target(bench_volume_sample)
-# Bench has a generous wall-clock assertion; not part of default ctest
-# unless the user opts in via VC_RUN_BENCHES. Expose it as a target so
-# it's always built and runnable manually.
-if(VC_RUN_BENCHES)
-    add_test(NAME bench_volume_sample COMMAND bench_volume_sample)
-    vc_register_ctest(bench_volume_sample bench_volume_sample)
-endif()
-
-add_executable(bench_quadsurface_gen bench_quadsurface_gen.cpp)
-target_link_libraries(bench_quadsurface_gen PRIVATE doctest::doctest vc_core)
-vc_register_test_target(bench_quadsurface_gen)
-# Perf-regression guard for QuadSurface::gen() (warp helpers + per-surface
-# cache reuse). Loose relative assertion; opt-in via VC_RUN_BENCHES, always
-# built as a target so it's runnable manually.
-if(VC_RUN_BENCHES)
-    add_test(NAME bench_quadsurface_gen COMMAND bench_quadsurface_gen)
-    vc_register_ctest(bench_quadsurface_gen bench_quadsurface_gen)
-endif()
-
-add_executable(bench_chunked_plane_sampler bench_chunked_plane_sampler.cpp)
-target_link_libraries(bench_chunked_plane_sampler PRIVATE doctest::doctest vc_core)
-vc_register_test_target(bench_chunked_plane_sampler)
-
-add_executable(bench_chunk_cache_source_mirror bench_chunk_cache_source_mirror.cpp)
-target_link_libraries(bench_chunk_cache_source_mirror PRIVATE vc_core)
-vc_register_test_target(bench_chunk_cache_source_mirror)
-# Perf guard for the slice sampler hot path. Like bench_volume_sample it
-# carries only a loose wall-clock assertion, so it stays out of default
-# ctest unless the user opts in via VC_RUN_BENCHES; the target is always
-# built and runnable manually.
-if(VC_RUN_BENCHES)
-    add_test(NAME bench_chunked_plane_sampler COMMAND bench_chunked_plane_sampler)
-    vc_register_ctest(bench_chunked_plane_sampler bench_chunked_plane_sampler)
-endif()
-
-add_executable(bench_render_synthetic bench_render_synthetic.cpp)
-target_link_libraries(bench_render_synthetic PRIVATE vc_core)
-set(_render_benchmark_architecture "${CMAKE_SYSTEM_PROCESSOR}")
-if(NOT VC_MARCH_NATIVE AND
-   CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|amd64|AMD64)$" AND NOT WIN32)
-    set(_render_benchmark_architecture "x86-64-v3")
-elseif(VC_MARCH_NATIVE)
-    set(_render_benchmark_architecture "native")
-endif()
-target_compile_definitions(bench_render_synthetic PRIVATE
-    VC_RENDER_BENCH_COMPILER_ID="${CMAKE_CXX_COMPILER_ID}"
-    VC_RENDER_BENCH_COMPILER_VERSION="${CMAKE_CXX_COMPILER_VERSION}"
-    VC_RENDER_BENCH_BUILD_TYPE="${CMAKE_BUILD_TYPE}"
-    VC_RENDER_BENCH_ARCHITECTURE="${_render_benchmark_architecture}")
-vc_register_test_target(bench_render_synthetic)
-add_test(NAME test_render_synthetic_fixture
-    COMMAND bench_render_synthetic --verify-all)
-set_tests_properties(test_render_synthetic_fixture PROPERTIES
-    ENVIRONMENT "VC_RENDER_SAMPLER_THREADS=4")
-vc_register_ctest(test_render_synthetic_fixture bench_render_synthetic)
-add_test(NAME test_render_synthetic_fallback_1
-    COMMAND bench_render_synthetic
-        --fixture parallel --scenario fallback_1
-        --repetitions 1 --native-trials 1)
-set_tests_properties(test_render_synthetic_fallback_1 PROPERTIES
-    ENVIRONMENT "VC_RENDER_SAMPLER_THREADS=4")
-vc_register_ctest(test_render_synthetic_fallback_1 bench_render_synthetic)
-add_test(NAME test_render_sampler_worker_override_invalid
-    COMMAND bench_render_synthetic --fixture serial --scenario full_res)
-set_tests_properties(test_render_sampler_worker_override_invalid PROPERTIES
-    ENVIRONMENT "VC_RENDER_SAMPLER_THREADS=0"
-    WILL_FAIL TRUE)
-vc_register_ctest(
-    test_render_sampler_worker_override_invalid bench_render_synthetic)
-
-add_executable(bench_thread_pool_dispatch bench_thread_pool_dispatch.cpp)
-target_link_libraries(bench_thread_pool_dispatch PRIVATE vc_core)
-target_compile_definitions(bench_thread_pool_dispatch PRIVATE
-    VC_DISPATCH_BENCH_COMPILER_ID="${CMAKE_CXX_COMPILER_ID}"
-    VC_DISPATCH_BENCH_COMPILER_VERSION="${CMAKE_CXX_COMPILER_VERSION}"
-    VC_DISPATCH_BENCH_BUILD_TYPE="${CMAKE_BUILD_TYPE}"
-    VC_DISPATCH_BENCH_ARCHITECTURE="${_render_benchmark_architecture}")
-vc_register_test_target(bench_thread_pool_dispatch)
-
-add_library(vc_thread_sync_replay STATIC
-    thread_sync_replay/Replay.cpp
-    thread_sync_replay/RenderValgrind.cpp)
-target_include_directories(vc_thread_sync_replay PUBLIC
-    ${CMAKE_CURRENT_SOURCE_DIR})
-target_link_libraries(vc_thread_sync_replay PUBLIC
-    nlohmann_json::nlohmann_json)
-
-add_executable(bench_thread_sync_replay
-    thread_sync_replay/main.cpp
-    thread_sync_replay/RenderValgrindCli.cpp)
-target_link_libraries(bench_thread_sync_replay PRIVATE
-    vc_thread_sync_replay nlohmann_json::nlohmann_json)
-target_compile_definitions(bench_thread_sync_replay PRIVATE
-    VC_REPLAY_COMPILER_ID="${CMAKE_CXX_COMPILER_ID}"
-    VC_REPLAY_COMPILER_VERSION="${CMAKE_CXX_COMPILER_VERSION}"
-    VC_REPLAY_BUILD_TYPE="${CMAKE_BUILD_TYPE}"
-    VC_REPLAY_ARCHITECTURE="${_render_benchmark_architecture}")
-vc_register_test_target(bench_thread_sync_replay)
-
-vc_add_test(NAME test_thread_sync_replay_native
-    LIBS doctest::doctest vc_thread_sync_replay)
-add_test(NAME test_thread_pool_dispatch_fixture
-    COMMAND bench_thread_pool_dispatch
-        --mode futures --workers 4 --tasks 8 --work-iterations 100 --rounds 32)
-vc_register_ctest(test_thread_pool_dispatch_fixture bench_thread_pool_dispatch)
-add_test(NAME test_thread_pool_dispatch_work_kinds
-    COMMAND bench_thread_pool_dispatch
-        --mode serial --workers 1 --tasks 1 --work-iterations 257
-        --rounds 3 --warmup-rounds 1 --work-kind mixed
-        --working-set-bytes 65536)
-vc_register_ctest(test_thread_pool_dispatch_work_kinds bench_thread_pool_dispatch)
-add_test(NAME test_thread_pool_dispatch_grid_sample
-    COMMAND bench_thread_pool_dispatch
-        --mode serial --workers 1 --tasks 1 --work-iterations 257
-        --rounds 3 --warmup-rounds 1 --work-kind grid-sample
-        --working-set-bytes 65536)
-vc_register_ctest(test_thread_pool_dispatch_grid_sample bench_thread_pool_dispatch)
-foreach(_work_kind mixed-grid-phase mixed-grid-random)
-    string(REPLACE "-" "_" _work_kind_test_suffix "${_work_kind}")
-    add_test(NAME test_thread_pool_dispatch_${_work_kind_test_suffix}
-        COMMAND bench_thread_pool_dispatch
-            --mode serial --workers 1 --tasks 1 --work-iterations 260
-            --rounds 3 --warmup-rounds 1 --work-kind ${_work_kind}
-            --working-set-bytes 65536)
-    vc_register_ctest(
-        test_thread_pool_dispatch_${_work_kind_test_suffix}
-        bench_thread_pool_dispatch)
-endforeach()
-foreach(_work_kind cache-read cache-write)
-    string(REPLACE "-" "_" _work_kind_test_suffix "${_work_kind}")
-    add_test(NAME test_thread_pool_dispatch_${_work_kind_test_suffix}
-        COMMAND bench_thread_pool_dispatch
-            --mode serial --workers 1 --tasks 1 --work-iterations 257
-            --rounds 3 --warmup-rounds 1 --work-kind ${_work_kind}
-            --working-set-bytes 65536)
-    vc_register_ctest(
-        test_thread_pool_dispatch_${_work_kind_test_suffix}
-        bench_thread_pool_dispatch)
-endforeach()
-foreach(_work_kind
-        read-four read-eight write-eight
-        line-read-one line-read-eight line-write-one line-write-eight
-        line-r1-w1 line-r8-w1 line-r1-w8 line-r8-w8)
-    string(REPLACE "-" "_" _work_kind_test_suffix "${_work_kind}")
-    add_test(NAME test_thread_pool_dispatch_${_work_kind_test_suffix}
-        COMMAND bench_thread_pool_dispatch
-            --mode serial --workers 1 --tasks 1 --work-iterations 257
-            --rounds 3 --warmup-rounds 1 --work-kind ${_work_kind}
-            --working-set-bytes 65536)
-    vc_register_ctest(
-        test_thread_pool_dispatch_${_work_kind_test_suffix}
-        bench_thread_pool_dispatch)
-endforeach()
-add_test(NAME test_thread_pool_dispatch_gate_open
-    COMMAND bench_thread_pool_dispatch
-        --mode futures-gate-open --workers 4 --tasks 4
-        --work-iterations 100 --rounds 32)
-vc_register_ctest(test_thread_pool_dispatch_gate_open bench_thread_pool_dispatch)
-add_test(NAME test_thread_pool_dispatch_gate_closed
-    COMMAND bench_thread_pool_dispatch
-        --mode futures-gate-closed --workers 4 --tasks 4
-        --work-iterations 100 --rounds 32)
-vc_register_ctest(test_thread_pool_dispatch_gate_closed bench_thread_pool_dispatch)
-add_test(NAME test_thread_pool_dispatch_idle
-    COMMAND bench_thread_pool_dispatch
-        --mode futures --workers 4 --tasks 4
-        --work-iterations 100 --rounds 32 --idle-nanoseconds 100000)
-vc_register_ctest(test_thread_pool_dispatch_idle bench_thread_pool_dispatch)
-add_test(NAME test_thread_pool_dispatch_lifecycle
-    COMMAND bench_thread_pool_dispatch
-        --mode lifecycle --workers 4 --tasks 1
-        --work-iterations 0 --rounds 32)
-vc_register_ctest(test_thread_pool_dispatch_lifecycle bench_thread_pool_dispatch)
-
-if(VC_RUN_RENDER_BENCHMARKS)
-    find_package(Python3 REQUIRED COMPONENTS Interpreter)
-    if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND
-       CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|amd64|AMD64)$")
-        find_program(VC_VALGRIND_EXECUTABLE valgrind REQUIRED)
+    # Store modes of the command-line tools, compared with their tifxyz modes.
+    vc_add_test(NAME test_tool_store_modes)
+    if(TARGET flatboi)
+        add_dependencies(test_tool_store_modes flatboi)
     endif()
-
-    set(_render_benchmark_output "${CMAKE_BINARY_DIR}/render-benchmark")
-    set(_render_benchmark_runner
-        "${PROJECT_SOURCE_DIR}/scripts/run_render_callgrind.py")
-    set(_render_benchmark_baseline
-        "${PROJECT_SOURCE_DIR}/core/test/data/render_callgrind_baseline.json")
-    set(_render_benchmark_calibration
-        "${PROJECT_SOURCE_DIR}/core/test/data/render_callgrind_model.json")
-    add_test(NAME test_render_callgrind_runner_model
-        COMMAND ${Python3_EXECUTABLE}
-            "${PROJECT_SOURCE_DIR}/core/test/test_run_render_callgrind.py")
-    vc_register_ctest(test_render_callgrind_runner_model bench_render_synthetic)
-    add_test(NAME test_render_valgrind_ci_driver
-        COMMAND ${Python3_EXECUTABLE}
-            "${PROJECT_SOURCE_DIR}/core/test/test_run_render_valgrind_ci.py")
-    vc_register_ctest(test_render_valgrind_ci_driver bench_render_synthetic)
-    add_test(NAME test_render_valgrind_ci_no_site
-        COMMAND ${Python3_EXECUTABLE} -S
-            "${PROJECT_SOURCE_DIR}/core/test/test_render_valgrind_ci_no_site.py"
-            --replay-engine $<TARGET_FILE:bench_thread_sync_replay>)
-    vc_register_ctest(test_render_valgrind_ci_no_site bench_thread_sync_replay)
-    add_test(NAME test_thread_sync_replay_model
-        COMMAND ${Python3_EXECUTABLE}
-            "${PROJECT_SOURCE_DIR}/core/test/test_run_thread_sync_replay.py")
-    set_tests_properties(test_thread_sync_replay_model PROPERTIES
-        ENVIRONMENT
-            "VC_THREAD_SYNC_REPLAY_BIN=$<TARGET_FILE:bench_thread_sync_replay>")
-    vc_register_ctest(test_thread_sync_replay_model bench_thread_pool_dispatch)
-    add_test(NAME test_render_attribution_sensitivity
-        COMMAND ${Python3_EXECUTABLE}
-            "${PROJECT_SOURCE_DIR}/core/test/test_evaluate_render_attribution_sensitivity.py")
-    vc_register_ctest(test_render_attribution_sensitivity bench_thread_pool_dispatch)
-    add_test(NAME test_thread_dispatch_shared_calibration
-        COMMAND ${Python3_EXECUTABLE}
-            "${PROJECT_SOURCE_DIR}/core/test/test_calibrate_thread_dispatch_shared.py")
-    vc_register_ctest(test_thread_dispatch_shared_calibration bench_thread_pool_dispatch)
-    add_test(NAME test_thread_sync_synthetic_calibration
-        COMMAND ${Python3_EXECUTABLE}
-            "${PROJECT_SOURCE_DIR}/core/test/test_calibrate_thread_sync_synthetic.py")
-    vc_register_ctest(test_thread_sync_synthetic_calibration bench_thread_pool_dispatch)
-    add_test(NAME test_synthetic_event_cost_calibration
-        COMMAND ${Python3_EXECUTABLE}
-            "${PROJECT_SOURCE_DIR}/core/test/test_calibrate_synthetic_event_costs.py")
-    vc_register_ctest(test_synthetic_event_cost_calibration bench_thread_pool_dispatch)
-    add_test(NAME test_synthetic_event_cost_minimax_calibration
-        COMMAND ${Python3_EXECUTABLE}
-            "${PROJECT_SOURCE_DIR}/core/test/test_calibrate_synthetic_event_costs_minimax.py")
-    vc_register_ctest(test_synthetic_event_cost_minimax_calibration bench_thread_pool_dispatch)
-    add_test(NAME test_synthetic_event_feature_calibration
-        COMMAND ${Python3_EXECUTABLE}
-            "${PROJECT_SOURCE_DIR}/core/test/test_calibrate_synthetic_event_features.py")
-    vc_register_ctest(test_synthetic_event_feature_calibration bench_thread_pool_dispatch)
-    add_test(NAME test_render_thread_calibration_validation
-        COMMAND ${Python3_EXECUTABLE}
-            "${PROJECT_SOURCE_DIR}/core/test/test_validate_render_thread_calibration.py")
-    vc_register_ctest(test_render_thread_calibration_validation bench_render_synthetic)
-    add_test(NAME test_fixed_cpu_frequency_runner
-        COMMAND ${Python3_EXECUTABLE}
-            "${PROJECT_SOURCE_DIR}/core/test/test_run_with_fixed_cpu_frequency.py")
-    vc_register_ctest(test_fixed_cpu_frequency_runner bench_thread_pool_dispatch)
-    foreach(_fixture serial parallel)
-        foreach(_scenario full_res fallback_3 mixed_correlated mixed_shuffled)
-            set(_test_name "bench_render_callgrind_${_fixture}_${_scenario}")
-            add_test(NAME ${_test_name}
-                COMMAND ${Python3_EXECUTABLE} ${_render_benchmark_runner}
-                    --benchmark $<TARGET_FILE:bench_render_synthetic>
-                    --fixture ${_fixture}
-                    --scenario ${_scenario}
-                    --output-dir ${_render_benchmark_output}
-                    --baseline ${_render_benchmark_baseline}
-                    --calibration ${_render_benchmark_calibration}
-                    --check)
-            set_tests_properties(${_test_name} PROPERTIES
-                SKIP_RETURN_CODE 77
-                TIMEOUT 120)
-            if(_fixture STREQUAL "parallel")
-                set_tests_properties(${_test_name} PROPERTIES RUN_SERIAL TRUE)
-            endif()
-            vc_register_ctest(${_test_name} bench_render_synthetic)
-        endforeach()
-    endforeach()
-
-    if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND
-       CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|amd64|AMD64)$")
-        set(_render_valgrind_ci_root
-            "${CMAKE_BINARY_DIR}/render-valgrind-ci")
-        set(_render_valgrind_ci_model
-            "${PROJECT_SOURCE_DIR}/core/test/data/render_valgrind_ci_model.json")
-        set(_render_valgrind_ci_reference
-            "${PROJECT_SOURCE_DIR}/core/test/data/render_valgrind_ci_reference.json")
-        set(_render_valgrind_ci_measure_outputs)
-        set(_render_valgrind_ci_gate_outputs)
-
-        foreach(_fixture serial parallel)
-            foreach(_scenario full_res fallback_3 mixed_correlated mixed_shuffled)
-                set(_case_dir
-                    "${_render_valgrind_ci_root}/${_fixture}/${_scenario}")
-                set(_callgrind_dir "${_case_dir}/callgrind")
-                set(_callgrind_stamp
-                    "${_callgrind_dir}/collected.stamp")
-                set(_callgrind_prefix
-                    "${_callgrind_dir}/callgrind.out")
-                set(_callgrind_metadata
-                    "${_callgrind_dir}/metadata.json")
-                set(_callgrind_scheduler)
-                set(_callgrind_byproducts
-                    "${_callgrind_metadata}")
-                if(_fixture STREQUAL "parallel")
-                    set(_callgrind_scheduler
-                        "${_callgrind_dir}/scheduler.log")
-                    list(APPEND _callgrind_byproducts
-                        "${_callgrind_scheduler}")
-                endif()
-                set(_evaluation "${_case_dir}/evaluation.json")
-                add_custom_command(
-                    OUTPUT "${_evaluation}" "${_callgrind_stamp}"
-                    BYPRODUCTS ${_callgrind_byproducts}
-                    COMMAND ${Python3_EXECUTABLE}
-                        "${PROJECT_SOURCE_DIR}/scripts/run_render_valgrind_ci.py"
-                        collect-evaluate
-                        --valgrind "${VC_VALGRIND_EXECUTABLE}"
-                        --benchmark $<TARGET_FILE:bench_render_synthetic>
-                        --replay $<TARGET_FILE:bench_thread_sync_replay>
-                        --fixture ${_fixture}
-                        --scenario ${_scenario}
-                        --model "${_render_valgrind_ci_model}"
-                        --case-dir "${_case_dir}"
-                    DEPENDS
-                        bench_render_synthetic
-                        bench_thread_sync_replay
-                        "${PROJECT_SOURCE_DIR}/scripts/run_render_valgrind_ci.py"
-                        "${PROJECT_SOURCE_DIR}/scripts/render_valgrind_common.py"
-                        "${_render_valgrind_ci_model}"
-                    VERBATIM)
-                list(APPEND _render_valgrind_ci_measure_outputs "${_evaluation}")
-
-                set(_gate "${_case_dir}/checked.json")
-                set(_gate_command
-                    ${Python3_EXECUTABLE}
-                    "${PROJECT_SOURCE_DIR}/scripts/run_render_valgrind_ci.py"
-                    collect-evaluate --reuse-capture
-                    --valgrind "${VC_VALGRIND_EXECUTABLE}"
-                    --benchmark $<TARGET_FILE:bench_render_synthetic>
-                    --replay $<TARGET_FILE:bench_thread_sync_replay>
-                    --fixture ${_fixture}
-                    --scenario ${_scenario}
-                    --case-dir "${_case_dir}"
-                    --model "${_render_valgrind_ci_model}"
-                    --reference "${_render_valgrind_ci_reference}")
-                add_custom_command(
-                    OUTPUT "${_gate}"
-                    BYPRODUCTS "${_case_dir}/checked.failed.json"
-                    COMMAND ${_gate_command}
-                    DEPENDS
-                        "${_evaluation}"
-                        "${_callgrind_stamp}"
-                        bench_thread_sync_replay
-                        "${PROJECT_SOURCE_DIR}/scripts/run_render_valgrind_ci.py"
-                        "${_render_valgrind_ci_model}"
-                        "${_render_valgrind_ci_reference}"
-                    VERBATIM)
-                list(APPEND _render_valgrind_ci_gate_outputs "${_gate}")
-            endforeach()
-        endforeach()
-
-        add_custom_target(render_valgrind_ci_measure
-            DEPENDS ${_render_valgrind_ci_measure_outputs})
-        add_custom_target(render_valgrind_ci
-            DEPENDS ${_render_valgrind_ci_gate_outputs})
-    endif()
-endif()
-
-add_executable(bench_lasagna_line_edit bench_lasagna_line_edit.cpp)
-target_link_libraries(bench_lasagna_line_edit PRIVATE vc_lasagna)
-vc_register_test_target(bench_lasagna_line_edit)
-if(VC_RUN_BENCHES)
-    add_test(NAME bench_lasagna_line_edit COMMAND bench_lasagna_line_edit --help)
-    vc_register_ctest(bench_lasagna_line_edit bench_lasagna_line_edit)
-endif()
-
-add_executable(bench_fiber_intersections bench_fiber_intersections.cpp)
-target_link_libraries(bench_fiber_intersections PRIVATE vc_atlas vc_lasagna nlohmann_json::nlohmann_json)
-vc_register_test_target(bench_fiber_intersections)
-if(VC_RUN_BENCHES)
-    add_test(NAME bench_fiber_intersections COMMAND bench_fiber_intersections --help)
-    vc_register_ctest(bench_fiber_intersections bench_fiber_intersections)
+    add_dependencies(test_tool_store_modes vc_tifxyz2obj vc_render_tifxyz vc_obj2tifxyz vc_obj2tifxyz_legacy   vc_objrefine  vc_grow_seg_from_segments)
+    set_tests_properties(test_tool_store_modes PROPERTIES
+        ENVIRONMENT "$<$<TARGET_EXISTS:flatboi>:VC_FLATBOI_BIN=$<TARGET_FILE:flatboi>;>VC_TIFXYZ2OBJ_BIN=$<TARGET_FILE:vc_tifxyz2obj>;VC_RENDER_TIFXYZ_BIN=$<TARGET_FILE:vc_render_tifxyz>;VC_OBJ2TIFXYZ_BIN=$<TARGET_FILE:vc_obj2tifxyz>;VC_OBJ2TIFXYZ_LEGACY_BIN=$<TARGET_FILE:vc_obj2tifxyz_legacy>;VC_OBJREFINE_BIN=$<TARGET_FILE:vc_objrefine>;VC_GROW_SEG_FROM_SEGMENTS_BIN=$<TARGET_FILE:vc_grow_seg_from_segments>")
 endif()
 
 # Sanitizer canaries: one exe, one subcommand per sanitizer. Each canary
@@ -806,62 +404,35 @@ vc_add_test(NAME test_gridstore_branches)
 
 vc_add_test(NAME test_gridstore_malformed)
 
-# Live network test: anonymous read of the PHerc 0172 zarr on AWS S3.
-# Soft-skips on network failure so offline runs still pass; set
-# VC_TEST_REQUIRE_NETWORK=1 to flip those skips into hard failures.
-vc_add_test(NAME test_pherc0172_live)
-set_property(TEST test_pherc0172_live APPEND PROPERTY LABELS network)
-
-vc_add_test(NAME test_tiff)
-
 vc_add_test(NAME test_normalgridtools)
 
-# Live S3: PHerc 0172 sampling and PHerc 0139 catalog/object-store identity.
+# Live S3: PHerc 0139 catalog/object-store identity. Soft-skips when offline;
+# VC_TEST_REQUIRE_NETWORK=1 turns that into a failure.
 vc_add_test(NAME test_volume_live_s3
     INCLUDES ${PROJECT_SOURCE_DIR}/apps/VC3D)
 set_property(TEST test_volume_live_s3 APPEND PROPERTY LABELS network)
 
 vc_add_test(NAME test_normal_grid_volume)
+vc_add_test(NAME test_normal_grid_stream)
+vc_add_test(NAME test_normal_grid_generate)
 
-vc_add_test(NAME test_surface_patch_index)
+vc_add_test(NAME test_normal_constraint_grid_change
+    SOURCES test_normal_constraint_grid_change.cpp
+            normal_constraint_grid_change_fixture.cpp
+    LIBS doctest::doctest vc_core Ceres::ceres)
+set_tests_properties(test_normal_constraint_grid_change PROPERTIES TIMEOUT 30)
 
-vc_add_test(NAME test_tiff_merge)
+vc_add_test(NAME test_surface_query_set)
 
-vc_add_test(NAME test_http_fetch_errors)
-vc_add_test(NAME test_global_cache_root)
-vc_add_test(NAME test_sftp_fetch LIBS doctest::doctest vc_core Qt6::Core)
-if(VC_BUILD_PYTHON)
-    find_package(Python REQUIRED COMPONENTS Interpreter)
-    add_dependencies(test_sftp_fetch vc_volume)
-    add_test(NAME python_sftp_volume
-        COMMAND "${CMAKE_COMMAND}" -E env
-            "PYTHONPATH=${CMAKE_BINARY_DIR}/python"
-            "PYTHONNOUSERSITE=1"
-            "${Python_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/python/tests/test_sftp_volume.py"
-            --ssh-fixture "$<TARGET_FILE:test_sftp_fetch>"
-            --work-dir "${CMAKE_CURRENT_BINARY_DIR}")
-    set_tests_properties(python_sftp_volume PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 200)
-    vc_register_ctest(python_sftp_volume test_sftp_fetch)
-endif()
 
-# Live S3: stages PHerc 0172 level 5 to a local zarr dir, then exercises
-# the NormalGridGenerate library API against it. Soft-skips on network.
-vc_add_test(NAME test_normal_grid_live)
-set_property(TEST test_normal_grid_live APPEND PROPERTY LABELS network)
 
-vc_add_test(NAME test_normalgridtools_real)
-
-vc_add_test(NAME test_tiff_more)
 
 vc_add_test(NAME test_geometry)
-
-vc_add_test(NAME test_affine_transform)
 
 vc_add_test(NAME test_point_index)
 
 vc_add_test(NAME test_plane_surface)
 
-vc_add_test(NAME test_compositing)
 
 vc_add_test(NAME test_quadsurface_basics)
 
@@ -869,56 +440,49 @@ vc_add_test(NAME test_load_json)
 
 vc_add_test(NAME test_lasagna_manifest LIBS doctest::doctest vc_lasagna)
 vc_add_test(NAME test_lasagna_project_volumes LIBS doctest::doctest vc_lasagna)
-vc_add_test(NAME test_remote_file_cache)
 
 vc_add_test(NAME test_open_data_manifest
     SOURCES test_open_data_manifest.cpp
-            ${PROJECT_SOURCE_DIR}/apps/VC3D/OpenDataManifest.cpp
+            ${PROJECT_SOURCE_DIR}/apps/VC3D/OpenDataResourceSelection.cpp
             ${PROJECT_SOURCE_DIR}/apps/VC3D/OpenDataLasagna.cpp
             ${PROJECT_SOURCE_DIR}/apps/VC3D/OpenDataLasagna.hpp
-            ${PROJECT_SOURCE_DIR}/apps/VC3D/OpenDataManifest.hpp
+            ${PROJECT_SOURCE_DIR}/apps/VC3D/OpenDataResourceSelection.hpp
             ${PROJECT_SOURCE_DIR}/apps/VC3D/OpenDataSampleProject.cpp
             ${PROJECT_SOURCE_DIR}/apps/VC3D/OpenDataSampleProject.hpp
             ${PROJECT_SOURCE_DIR}/apps/VC3D/OpenDataNormalGrids.cpp
             ${PROJECT_SOURCE_DIR}/apps/VC3D/OpenDataNormalGrids.hpp
-            ${PROJECT_SOURCE_DIR}/apps/VC3D/OpenDataSegmentCache.cpp
-            ${PROJECT_SOURCE_DIR}/apps/VC3D/OpenDataSegmentCache.hpp
-            ${PROJECT_SOURCE_DIR}/apps/VC3D/OpenDataSegmentCacheIO.cpp
-            ${PROJECT_SOURCE_DIR}/apps/VC3D/OpenDataSegmentCacheIO.hpp
-    LIBS doctest::doctest Qt6::Core vc_core vc_lasagna
+    LIBS doctest::doctest Qt6::Core vc_core vc_lasagna vc_object_store::vc_objects vc_object_store::vc_object_geometry
     INCLUDES ${PROJECT_SOURCE_DIR}/apps/VC3D)
 
 vc_add_test(NAME test_lasagna_line_optimizer LIBS doctest::doctest vc_lasagna Ceres::ceres)
 
 vc_add_test(NAME test_lasagna_line_view_surfaces LIBS doctest::doctest vc_lasagna)
 
-vc_add_test(NAME test_lasagna_normal_sampler LIBS doctest::doctest vc_atlas)
+vc_add_test(NAME test_lasagna_normal_sampler LIBS doctest::doctest vc_lasagna)
 
-vc_add_test(NAME test_atlas LIBS doctest::doctest vc_atlas)
-
-# The vc_tifxyz_selfcross census kernel (header-only under apps/src, shared
-# with the command-line tool so the tested code is the shipped code).
-vc_add_test(NAME test_tifxyz_selfcross LIBS doctest::doctest opencv_core)
-
-vc_add_test(NAME test_seg_add_overlap_metrics)
-
-# End-to-end CLI contract for the same tool: exit codes, report
-# serialization, collection envelope. Needs the binary, so it only exists
-# in configurations that build the apps -- the test shards configure with
-# VC_BUILD_APPS=OFF and apps/ returns before the target is created, which
-# would make the TARGET_FILE expression a configure error.
-if(TARGET vc_tifxyz_selfcross)
-    vc_add_test(NAME test_tifxyz_selfcross_cli
-        LIBS doctest::doctest vc_core opencv_core opencv_imgcodecs
-        DEFS VC_SELFCROSS_BIN="$<TARGET_FILE:vc_tifxyz_selfcross>")
-    add_dependencies(test_tifxyz_selfcross_cli vc_tifxyz_selfcross)
+# The Python bindings' tests, when the project's virtual environment has what they need
+# (`uv sync --group test`).
+if(EXISTS "${PROJECT_SOURCE_DIR}/.venv/bin/python" AND TARGET vc_fiber_trace)
+    vc_register_test_target(vc_fiber_trace)
+    add_test(NAME vc_python_tests
+        COMMAND "${PROJECT_SOURCE_DIR}/.venv/bin/python" -m pytest
+            "${PROJECT_SOURCE_DIR}/python/tests" "${PROJECT_SOURCE_DIR}/python/test_fiberlets_cli.py"
+            "--vc-build-python=${PROJECT_BINARY_DIR}/python" -q -p no:cacheprovider
+        WORKING_DIRECTORY "${PROJECT_SOURCE_DIR}")
+    set_tests_properties(vc_python_tests PROPERTIES TIMEOUT 300)
+    vc_register_ctest(vc_python_tests vc_fiber_trace)
 endif()
 
-if(TARGET vc_seg_add_overlap)
-    vc_add_test(NAME test_seg_add_overlap_cli
-        LIBS doctest::doctest vc_core opencv_core opencv_imgcodecs
-        DEFS VC_SEG_ADD_OVERLAP_BIN="$<TARGET_FILE:vc_seg_add_overlap>")
-    add_dependencies(test_seg_add_overlap_cli vc_seg_add_overlap)
+if(TARGET vc_gen_normalgrids)
+    find_package(Python3 REQUIRED COMPONENTS Interpreter)
+    vc_register_test_target(vc_gen_normalgrids)
+    add_test(NAME test_normal_grid_threshold_resume
+        COMMAND ${Python3_EXECUTABLE}
+            "${CMAKE_CURRENT_SOURCE_DIR}/test_normal_grid_threshold_resume.py"
+            $<TARGET_FILE:vc_gen_normalgrids>)
+    set_tests_properties(test_normal_grid_threshold_resume PROPERTIES
+        LABELS network SKIP_RETURN_CODE 77 TIMEOUT 300)
+    vc_register_ctest(test_normal_grid_threshold_resume vc_gen_normalgrids)
 endif()
 
 if(TARGET vc_render_tifxyz)
@@ -930,62 +494,39 @@ if(TARGET vc_render_tifxyz)
             $<TARGET_FILE:vc_render_tifxyz>)
     set_tests_properties(test_render_tifxyz_logging PROPERTIES TIMEOUT 90)
     vc_register_ctest(test_render_tifxyz_logging vc_render_tifxyz)
-    add_test(NAME test_render_fetch_failure
-        COMMAND ${Python3_EXECUTABLE}
-            "${CMAKE_CURRENT_SOURCE_DIR}/test_render_fetch_failure.py"
-            $<TARGET_FILE:vc_render_tifxyz>)
-    set_tests_properties(test_render_fetch_failure PROPERTIES TIMEOUT 300)
-    vc_register_ctest(test_render_fetch_failure vc_render_tifxyz)
-    add_test(NAME test_render_band_prefetch
-        COMMAND ${Python3_EXECUTABLE}
-            "${CMAKE_CURRENT_SOURCE_DIR}/test_render_band_prefetch.py"
-            $<TARGET_FILE:vc_render_tifxyz>)
-    set_tests_properties(test_render_band_prefetch PROPERTIES TIMEOUT 120)
-    vc_register_ctest(test_render_band_prefetch vc_render_tifxyz)
+    vc_add_test(NAME test_render_zarr_output)
+    add_dependencies(test_render_zarr_output vc_render_tifxyz)
+    set_tests_properties(test_render_zarr_output PROPERTIES
+        TIMEOUT 180
+        ENVIRONMENT "VC_RENDER_TIFXYZ_BIN=$<TARGET_FILE:vc_render_tifxyz>")
 endif()
 
-vc_add_test(NAME test_fiber_intersections LIBS doctest::doctest vc_atlas)
+vc_add_test(NAME test_fiber_side_strip_intersections LIBS doctest::doctest vc_fiber_tracer)
 
 vc_add_test(NAME test_remote_url)
+vc_add_test(NAME test_loopback_http_server)
+vc_add_test(NAME test_remote_cache_settings)
 
 vc_add_test(NAME test_logging)
 
 vc_add_test(NAME test_plane_surface_branches)
 
-vc_add_test(NAME test_affine_transform_surface)
-
 vc_add_test(NAME test_quadsurface_more)
-vc_add_test(NAME test_quadsurface_smooth)
 
-vc_add_test(NAME test_surface_cache_dependencies)
-
-vc_add_test(NAME test_thinning)
 
 vc_add_test(NAME test_umbilicus)
 
-vc_add_test(NAME test_scroll_umbilicus)
+vc_add_test(NAME test_colormaps SOURCES test_colormaps.cpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/Colormaps.cpp INCLUDES ${PROJECT_SOURCE_DIR}/apps/VC3D)
 
-vc_add_test(NAME test_colormaps)
-
-vc_add_test(NAME test_quadsurface_io)
+vc_add_test(NAME test_quadsurface_io LIBS doctest::doctest vc_core opencv_imgcodecs)
 
 vc_add_test(NAME test_quadsurface_pointto)
+vc_add_test(NAME test_surface_losses LIBS doctest::doctest vc_core Ceres::ceres)
 
 vc_add_test(NAME test_quadsurface_snapshot)
 
-vc_add_test(NAME test_quadsurface_save_concurrency)
-
-vc_add_test(NAME test_quadsurface_cache_concurrency)
-
 vc_add_test(NAME test_quadsurface_save_paths)
-
-vc_add_test(NAME test_segmentation)
-
-vc_add_test(NAME test_chunked_tensor_meta LIBS doctest::doctest vc_tracer)
-
-vc_add_test(NAME test_post_process_util)
-
-vc_add_test(NAME test_render)
 
 vc_add_test(NAME test_growth_config
     LIBS doctest::doctest vc_tracer
@@ -1007,59 +548,19 @@ vc_add_test(NAME test_quadsurface_final)
 
 vc_add_test(NAME test_quadsurface_components)
 
+vc_add_test(NAME test_remote_cache_policy_first_open)
+
 vc_add_test(NAME test_volume_local)
 
-vc_add_test(NAME test_zarr_helpers)
-
-vc_add_test(NAME test_chunked_plane_sampler)
-
-vc_add_test(NAME test_slicing)
-# The vc_render_tifxyz prefetch planner and PrefetchedArrayView (header-only
-# under apps/src, shared with the command-line tool so the tested code is the
-# shipped code).
-vc_add_test(NAME test_render_prefetch)
-
 vc_add_test(NAME test_volume_pkg)
-
-vc_add_test(NAME test_volpkg_convert)
-
-vc_add_test(NAME test_vcdataset)
-
-vc_add_test(NAME test_zarr)
-
-vc_add_test(NAME test_chunk_cache)
-
-vc_add_test(NAME test_volume_extras)
-
-vc_add_test(NAME test_zarr_more)
-
-vc_add_test(NAME test_vcdataset_compressors)
-
-vc_add_test(NAME test_vcdataset_volcomp)
-
-vc_add_test(NAME test_zarr_shard_index_location)
-
-vc_add_test(NAME test_volume_static_read)
-
-vc_add_test(NAME test_volume_pyramid)
-
-vc_add_test(NAME test_chunk_cache_persist)
-
-vc_add_test(NAME test_persistent_zarr_cache_budget)
-
-vc_add_test(NAME test_open_data_volume_prefill
-    SOURCES test_open_data_volume_prefill.cpp
-            ${PROJECT_SOURCE_DIR}/apps/VC3D/OpenDataVolumePrefill.cpp
-    LIBS doctest::doctest vc_core
+vc_add_test(NAME test_opened_volumes
+    SOURCES test_opened_volumes.cpp ${PROJECT_SOURCE_DIR}/apps/VC3D/OpenedVolumes.cpp)
+vc_add_test(NAME test_viewer_sampling
+    SOURCES test_viewer_sampling.cpp ${PROJECT_SOURCE_DIR}/apps/VC3D/OpenedVolumes.cpp
+            ${PROJECT_SOURCE_DIR}/apps/VC3D/volume_viewers/ViewerSampling.cpp
     INCLUDES ${PROJECT_SOURCE_DIR}/apps/VC3D)
 
-vc_add_test(NAME test_zarr_chunk_fetcher)
 
-vc_add_test(NAME test_chunked_plane_sampler_more)
-
-vc_add_test(NAME test_slicing_more)
-
-vc_add_test(NAME test_vcdataset_more)
 
 # Real PHerc 0172 segments committed under core/test/data/segments/.
 vc_add_test(NAME test_quadsurface_fixtures)
@@ -1068,10 +569,13 @@ vc_add_test(NAME test_volume_pkg_full)
 
 vc_add_test(NAME test_load_quad_from_tifxyz)
 
-vc_add_test(NAME test_surface_patch_index_more)
 
 vc_add_test(NAME test_quadsurface_extras)
-
-vc_add_test(NAME test_surface_patch_index_cache)
+vc_add_test(NAME test_quadsurface_store)
 
 vc_add_test(NAME test_volume_pkg_more)
+
+vc_add_test(NAME test_seed_anchor LIBS doctest::doctest Ceres::ceres
+    INCLUDES "${CMAKE_CURRENT_SOURCE_DIR}/../include")
+
+vc_add_test(NAME test_sheet_seed)

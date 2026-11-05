@@ -1,20 +1,28 @@
 // Cross-process FIFO budget for decoded chunk caches. SQLite serializes the
-// rename, accounting and eviction together; reads never wait on this index.
+// rename, accounting and eviction together (payloads are written before that);
+// reads never wait on this index.
 #pragma once
 
 #include "chunk_io.hpp"
 #include "http.hpp"
+#include "vc_reader/zarr.hpp"
 
+#include <atomic>
+#include <iostream>
 #include <sqlite3.h>
 #include <algorithm>
+#include <limits>
+#include <map>
+#include <memory>
 #include <mutex>
 #include <tuple>
-#include <sys/file.h>
 
 namespace vcr {
 
 class DiskCache {
 public:
+    // max_bytes -1 keeps the limit stored in the root, unlimited for a new root;
+    // anything else replaces it. Only a limit ever evicts.
     DiskCache(const std::string& root, std::int64_t max_bytes)
         : root_(std::filesystem::weakly_canonical(root))
     {
@@ -34,7 +42,7 @@ public:
             exec("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;"
                  "CREATE TABLE IF NOT EXISTS budget(id INTEGER PRIMARY KEY, max_bytes INTEGER,"
                  " total INTEGER NOT NULL DEFAULT 0, clock INTEGER NOT NULL DEFAULT 0);"
-                 "INSERT OR IGNORE INTO budget(id,max_bytes) VALUES(1,1073741824);"
+                 "INSERT OR IGNORE INTO budget(id,max_bytes) VALUES(1,9223372036854775807);"
                  "CREATE TABLE IF NOT EXISTS chunks(path TEXT PRIMARY KEY, size INTEGER, age INTEGER);"
                  "CREATE INDEX IF NOT EXISTS oldest_chunk ON chunks(age,path);"
                  "CREATE TRIGGER IF NOT EXISTS add_chunk AFTER INSERT ON chunks BEGIN "
@@ -43,39 +51,23 @@ public:
                  "UPDATE budget SET total=total-old.size WHERE id=1; END;"
                  "CREATE TRIGGER IF NOT EXISTS resize_chunk AFTER UPDATE OF size ON chunks BEGIN "
                  "UPDATE budget SET total=total+new.size-old.size WHERE id=1; END;");
-            exec("CREATE TABLE IF NOT EXISTS file_headers(path TEXT PRIMARY KEY, etag TEXT, modified TEXT);");
+            // Remote files this budget downloaded (open_file); files found in place are not owned.
+            exec("DROP TABLE IF EXISTS file_headers;"
+                 "CREATE TABLE IF NOT EXISTS files(path TEXT PRIMARY KEY);");
+            exec("CREATE TABLE IF NOT EXISTS adopted_namespaces(path TEXT PRIMARY KEY);");
             exec("CREATE TABLE IF NOT EXISTS downloads(path TEXT PRIMARY KEY, size INTEGER NOT NULL);");
             transaction([&] {
-                // Reconcile after a crash or writes by an unbounded reader.
-                // Only numeric chunk files in the decoded-cache namespaces
-                // count. Metadata, markers, VC3D caches and other files stay.
-                exec("DELETE FROM chunks; UPDATE budget SET total=0,clock=0 WHERE id=1;");
-                using Entry = std::tuple<std::filesystem::file_time_type, std::string, std::int64_t>;
-                std::vector<Entry> files;
-                for (const auto* scheme : {"http", "https", "s3"}) {
-                    const auto base = root_ / scheme;
-                    if (!std::filesystem::is_directory(base) || std::filesystem::is_symlink(base))
-                        continue;
-                    scan(base, files);
-                }
-                const auto encoded = root_ / "encoded";
-                if (std::filesystem::is_directory(encoded)) {
-                    for (const auto& file : std::filesystem::directory_iterator(encoded))
-                        if (file.is_regular_file() && !file.is_symlink() && file.path().extension() == ".blob")
-                            files.emplace_back(file.last_write_time(), file.path().string(), file.file_size());
-                }
-                if (std::filesystem::is_directory(encoded)) {
-                    for (const auto& file : std::filesystem::directory_iterator(encoded))
-                        if (file.is_regular_file() && file.path().filename().string().find(".blob.tmp.") != std::string::npos)
-                            remove_abandoned(file.path().string());
-                }
                 clean_downloads();
-                std::sort(files.begin(), files.end());
-                for (const auto& [time, file, size] : files)
-                    record(file, size);
-                exec("DELETE FROM file_headers WHERE path NOT IN (SELECT path FROM chunks);");
+                // Budgets used to be seeded at 1 GiB, which nobody chose and which evicted the
+                // cache of whoever opened the root without a limit. Once, per index: lift it.
+                if (number("PRAGMA user_version") == 0)
+                    exec("UPDATE budget SET max_bytes=9223372036854775807 WHERE id=1 AND max_bytes=1073741824;"
+                         "PRAGMA user_version=1");
                 if (max_bytes >= 0) set_limit(max_bytes);
-                evict();
+                // Without a byte limit nothing reads the index: a walk of a large root on
+                // every open would only keep an unused total right.
+                if (number("SELECT max_bytes FROM budget WHERE id=1") != std::numeric_limits<std::int64_t>::max())
+                    reconcile();
             });
         } catch (...) {
             sqlite3_close(db_);
@@ -88,24 +80,67 @@ public:
     DiskCache(const DiskCache&) = delete;
     DiskCache& operator=(const DiskCache&) = delete;
 
+    // Adopt existing array chunks under a cache namespace once, preserving metadata.
+    // Persist its namespace so crash reconciliation also counts these chunks.
+    void adopt_chunks(const std::string& path)
+    {
+        const auto canonical=std::filesystem::weakly_canonical(path).string();
+        check_path(canonical);
+        std::lock_guard lock(mutex_);
+        transaction([&] {
+            Statement known(db_, "SELECT 1 FROM adopted_namespaces WHERE path=?");
+            known.text(1,canonical);
+            if (known.step()) return;
+            Statement adopted(db_, "INSERT INTO adopted_namespaces(path) VALUES(?)");
+            adopted.text(1,canonical); adopted.step();
+            if (!reconciled_) return;  // no limit: the walk waits until one needs the index
+            using Entry=std::tuple<std::filesystem::file_time_type,std::string,std::int64_t>;
+            std::vector<Entry> files;
+            scan(canonical,files);
+            std::sort(files.begin(),files.end());
+            for (const auto& [time,file,size] : files) record(file,size);
+            evict();
+        });
+    }
+
     void set_max_bytes(std::int64_t bytes)
     {
         if (bytes < 0)
             throw std::invalid_argument("cache_max_bytes must be nonnegative");
         std::lock_guard lock(mutex_);
-        transaction([&] { set_limit(bytes); evict(); });
+        transaction([&] {
+            set_limit(bytes);
+            if (!reconciled_ && bytes != std::numeric_limits<std::int64_t>::max()) reconcile();
+            evict();
+        });
+    }
+
+    // Keep this much of the disk free: a write that would leave less is skipped
+    // (served without caching) and nothing cached is removed. The first skip warns
+    // on stderr; low_space() reports the current state.
+    void set_min_free_bytes(std::int64_t bytes)
+    {
+        if (bytes < 0)
+            throw std::invalid_argument("cache_min_free_bytes must be nonnegative");
+        min_free_bytes_.store(bytes, std::memory_order_relaxed);
     }
 
     void write(const std::string& path, const std::uint8_t* data, std::size_t size)
     {
         check_path(path);
+        if (!leaves_free_space(size))
+            return;
+        // The payload goes to its per-thread temporary outside the index's lock, so writers
+        // only serialize on the rename, accounting and eviction. Unpublished, it is unlinked.
+        AtomicFile file(path);
+        file.write(data, size);
         std::lock_guard lock(mutex_);
         transaction([&] {
             const auto available = number("SELECT max_bytes FROM budget WHERE id=1") - reserved_bytes();
             if (size > static_cast<std::uint64_t>(available))
                 return;  // A chunk larger than the budget is served without caching.
             evict_to(available - static_cast<std::int64_t>(size));
-            atomic_write(path, data, size);
+            file.publish();
             record(path, static_cast<std::int64_t>(size));
             evict();
         });
@@ -117,114 +152,129 @@ public:
         return number("SELECT max_bytes FROM budget WHERE id=1");
     }
 
-    // Pin the inode before releasing the cross-process publication lock. A
-    // later eviction unlinks it without invalidating an active decoder's FD.
-    std::tuple<int, std::string, std::string, std::size_t> open_file(
-        const std::string& path, const std::string& url, const Auth& auth, bool offline, bool refresh)
+    // A cache's own metadata file (array and group documents, kept state): written atomically
+    // when the disk keeps its free-space floor. The byte limit bounds chunk bytes, which these
+    // documents never count toward: not accounted and never evicted, as reconcile() treats
+    // metadata. Whether it was written.
+    bool write_metadata(const std::string& path, const std::uint8_t* data, std::size_t size)
     {
         check_path(path);
-        if (std::filesystem::path(path).parent_path() != root_ / "encoded")
-            throw std::invalid_argument("encoded files must use the encoded cache namespace");
+        std::lock_guard lock(mutex_);
+        if (!leaves_free_space(size))
+            return false;
+        atomic_write(path, data, size);
+        return true;
+    }
+
+    // Whether the last write was skipped to keep the disk's free space.
+    bool low_space() const noexcept { return low_space_.load(std::memory_order_relaxed); }
+
+    // The bytes this budget accounts for.
+    std::int64_t total_bytes()
+    {
+        std::lock_guard lock(mutex_);
+        if (!reconciled_) transaction([&] { reconcile(); });
+        return number("SELECT total FROM budget WHERE id=1");
+    }
+
+    // A remote file cached at `path` (its URL's decoded-cache path, so mirrors
+    // laid out by bucket path are found in place). A cached copy is trusted like
+    // a chunk: it is never revalidated. Missing files are downloaded into the
+    // budget; files found in place are used, not owned, so never evicted.
+    // Returns the open descriptor (-1 if the remote file does not exist) and the
+    // bytes received. Eviction unlinks without invalidating the descriptor.
+    std::pair<int, std::size_t> open_file(const std::string& path, const std::string& url, const Auth& auth)
+    {
+        check_path(path);
+        if (int fd = platform::open_file(path, O_RDONLY); fd >= 0 || errno != ENOENT) {
+            if (fd < 0) throw std::system_error(errno, std::generic_category(), "open " + path);
+            platform::FileStat st;
+            if (platform::fstat(fd, st) != 0 || !st.regular) {
+                ::close(fd);
+                throw std::runtime_error("cached file is not a regular file: " + path);
+            }
+            return {fd, 0};
+        }
         // Only callers for the same object wait through its network request.
         // Keep the lock file: unlinking it could split concurrent lock owners.
-        std::filesystem::create_directories(root_ / "encoded");
-        File object_lock(::open((path + ".lock").c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0644));
+        const auto locks = root_ / ".vc_reader_locks";
+        std::filesystem::create_directories(locks);
+        const auto lock_path = locks / (std::to_string(std::hash<std::string>{}(path)) + ".lock");
+        File object_lock(platform::open_file(lock_path, O_RDWR | O_CREAT, 0644));
         if (!object_lock) throw std::system_error(errno, std::generic_category(), "open cache file lock");
         lock_file(object_lock.fd());
+        if (int fd = platform::open_file(path, O_RDONLY); fd >= 0)
+            return {fd, 0};  // another owner published it while we waited
         int fd = -1;
-        std::string etag, modified;
-        std::size_t bytes = 0;
         std::unique_ptr<AtomicFile> output;
         std::string temporary;
-        const auto cleanup = [&] {
-            std::lock_guard lock(mutex_);
-            transaction([&] {
-                // Delete/truncate payload before making its reservation reusable.
-                output.reset();
-                forget_download(temporary);
-            });
-        };
         try {
             {
                 std::lock_guard lock(mutex_);
                 transaction([&] {
-                    fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
-                    if (fd < 0 && errno != ENOENT)
-                        throw std::system_error(errno, std::generic_category(), "open " + path);
-                    if (fd >= 0) {
-                        Statement h(db_, "SELECT etag,modified FROM file_headers WHERE path=?");
-                        h.text(1, path);
-                        if (h.step()) {
-                            etag = reinterpret_cast<const char*>(sqlite3_column_text(h.get(), 0));
-                            modified = reinterpret_cast<const char*>(sqlite3_column_text(h.get(), 1));
-                        }
-                    }
-                    if (!offline && (fd < 0 || refresh)) {
-                        output = std::make_unique<AtomicFile>(path);
-                        temporary = output->temporary_path();
-                        lock_file(output->fd());
-                        record_download(temporary, 0);
-                    }
+                    output = std::make_unique<AtomicFile>(path);
+                    temporary = output->temporary_path();
+                    lock_file(output->fd());
+                    record_download(temporary, 0);
                 });
             }
-            if (output) {
-                HttpOptions options;
-                options.connections = 1;
-                options.auth = auth;
-                HttpClient client(options);
-                std::size_t received = 0, reserved = 0;
-                std::vector<std::pair<std::string, std::string>> headers;
-                if (fd >= 0 && !etag.empty()) headers.emplace_back("If-None-Match", etag);
-                else if (fd >= 0 && !modified.empty()) headers.emplace_back("If-Modified-Since", modified);
-                auto response = client.get_stream(url, [&] {
-                    std::lock_guard lock(mutex_);
-                    transaction([&] { output->reset(); record_download(temporary, 0); });
-                    received = reserved = 0;
-                }, [&](const char* data, std::size_t n) {
-                    if (n > reserved - received)
+            auto client = http_client(auth);
+            std::size_t received = 0, reserved = 0;
+            bool grows = false;
+            File unsized_turn;
+            auto response = client->get_stream(url, [&] {
+                std::lock_guard lock(mutex_);
+                transaction([&] { output->reset(); record_download(temporary, 0); });
+                received = reserved = 0;
+            }, [&](const char* data, std::size_t n) {
+                if (n > reserved - received) {
+                    if (!grows)
                         throw std::runtime_error("encoded file exceeds cache_max_bytes or declared Content-Length");
-                    output->write(reinterpret_cast<const std::uint8_t*>(data), n);
-                    received += n;
-                }, headers, 200, [&](const HttpResponse& header) {
-                    // Content-Length describes wire bytes. Compressed or
-                    // unsized responses reserve the whole budget before writing.
-                    const auto size = header.content_encoding.empty() || header.content_encoding == "identity"
-                        ? header.content_length : std::nullopt;
-                    reserved = reserve_download(temporary, size);
-                });
-                bytes = response.bytes;
-                {
-                    std::lock_guard lock(mutex_);
-                    transaction([&] {
-                        if (response.status == 200) {
-                            output->publish();
-                            forget_download(temporary);
-                            record(path, static_cast<std::int64_t>(received));
-                            etag = response.etag;
-                            modified = response.modified;
-                            Statement h(db_, "INSERT INTO file_headers(path,etag,modified) VALUES(?,?,?) "
-                                             "ON CONFLICT(path) DO UPDATE SET etag=excluded.etag,modified=excluded.modified");
-                            h.text(1, path); h.text(2, etag); h.text(3, modified); h.step();
-                            if (fd >= 0) ::close(fd);
-                            fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
-                            if (fd < 0) throw std::system_error(errno, std::generic_category(), "open " + path);
-                        } else if (response.status == 404) {
-                            if (fd >= 0) ::close(fd);
-                            fd = -1;
-                        }
-                        // A 304 uses the inode pinned before the request, even if
-                        // another download evicted its pathname in the meantime.
-                        output.reset();
-                        forget_download(temporary);
-                    });
+                    if (!leaves_free_space(n)) refuse_low_space(url);
+                    reserved = grow_download(temporary, received + n);
                 }
-            }
+                output->write(reinterpret_cast<const std::uint8_t*>(data), n);
+                received += n;
+            }, {}, 200, [&](const HttpResponse& header) {
+                // Content-Length describes wire bytes. Compressed or unsized responses
+                // reserve as their bytes arrive, one at a time on a limited budget: two
+                // each holding part of it could otherwise wait for each other forever.
+                // Sized downloads never grow, so they always finish and free what they hold.
+                const auto size = header.content_encoding.empty() || header.content_encoding == "identity"
+                    ? header.content_length : std::nullopt;
+                grows = !size;
+                if (size && !leaves_free_space(*size)) refuse_low_space(url);
+                if (grows && unsized_turn.fd() < 0 && max_bytes() != std::numeric_limits<std::int64_t>::max()) {
+                    unsized_turn = File(platform::open_file(locks / "unsized.lock", O_RDWR | O_CREAT, 0644));
+                    if (unsized_turn.fd() < 0) throw std::system_error(errno, std::generic_category(), "open cache file lock");
+                    lock_file(unsized_turn.fd());
+                }
+                reserved = size ? reserve_download(temporary, *size) : 0;
+            });
+            std::lock_guard lock(mutex_);
+            transaction([&] {
+                if (response.status == 200) {
+                    output->publish();
+                    forget_download(temporary);
+                    record(path, static_cast<std::int64_t>(received));
+                    Statement f(db_, "INSERT OR IGNORE INTO files(path) VALUES(?)");
+                    f.text(1, path); f.step();
+                    fd = platform::open_file(path, O_RDONLY);
+                    if (fd < 0) throw std::system_error(errno, std::generic_category(), "open " + path);
+                }
+                output.reset();
+                forget_download(temporary);
+            });
+            return {fd, response.bytes};
         } catch (...) {
             if (fd >= 0) ::close(fd);
-            try { cleanup(); } catch (...) {} // Preserve the original I/O error; startup reclaims abandoned reservations.
+            try {
+                std::lock_guard lock(mutex_);
+                // Delete/truncate payload before making its reservation reusable.
+                transaction([&] { output.reset(); forget_download(temporary); });
+            } catch (...) {} // Preserve the original I/O error; startup reclaims abandoned reservations.
             throw;
         }
-        return {fd, etag, modified, bytes};
     }
 
 private:
@@ -304,7 +354,7 @@ private:
 
     static void lock_file(int fd)
     {
-        while (::flock(fd, LOCK_EX) != 0)
+        while (platform::lock_exclusive(fd, true) != 0)
             if (errno != EINTR) throw std::system_error(errno, std::generic_category(), "lock cache file");
     }
 
@@ -314,7 +364,7 @@ private:
     {
         auto file = File::open_read(path);
         if (!file) return true;
-        if (::flock(file.fd(), LOCK_EX | LOCK_NB) != 0) {
+        if (platform::lock_exclusive(file.fd(), false) != 0) {
             if (errno == EWOULDBLOCK || errno == EAGAIN) return false;
             throw std::system_error(errno, std::generic_category(), "check download lock");
         }
@@ -350,16 +400,14 @@ private:
         }
     }
 
-    std::size_t reserve_download(const std::string& path, std::optional<std::size_t> size)
+    std::size_t reserve_download(const std::string& path, std::size_t needed)
     {
         for (;;) {
             {
                 std::lock_guard lock(mutex_);
                 bool admitted = false;
-                std::size_t needed = 0;
                 transaction([&] {
                     const auto limit = number("SELECT max_bytes FROM budget WHERE id=1");
-                    needed = size.value_or(static_cast<std::size_t>(limit));
                     if (needed > static_cast<std::uint64_t>(limit))
                         throw std::runtime_error("encoded file exceeds cache_max_bytes; increase the disk limit");
                     auto reserved = reserved_bytes();
@@ -381,6 +429,45 @@ private:
         }
     }
 
+    // Raises a growing download's reservation to at least `needed` bytes, evicting only what
+    // that takes. Spare room is reserved too, so a free budget is not asked on every write.
+    std::size_t grow_download(const std::string& path, std::size_t needed)
+    {
+        constexpr std::int64_t step = 16 << 20;
+        for (;;) {
+            {
+                std::lock_guard lock(mutex_);
+                std::size_t granted = 0;
+                transaction([&] {
+                    const auto limit = number("SELECT max_bytes FROM budget WHERE id=1");
+                    if (needed > static_cast<std::uint64_t>(limit))
+                        throw std::runtime_error("encoded file exceeds cache_max_bytes; increase the disk limit");
+                    std::int64_t own = 0;
+                    {
+                        Statement s(db_, "SELECT COALESCE(SUM(size),0) FROM downloads WHERE path=?");
+                        s.text(1, path);
+                        s.step();
+                        own = sqlite3_column_int64(s.get(), 0);
+                    }
+                    auto others = reserved_bytes() - own;
+                    const auto wanted = static_cast<std::int64_t>(needed);
+                    if (wanted > limit - others) {
+                        clean_downloads();
+                        others = reserved_bytes() - own;
+                        if (wanted > limit - others) return;  // sized downloads hold it; they finish
+                    }
+                    const auto spare = limit - others - number("SELECT total FROM budget WHERE id=1") - wanted;
+                    const auto target = wanted + std::clamp<std::int64_t>(spare, 0, step);
+                    evict_to(limit - others - target);
+                    record_download(path, static_cast<std::size_t>(target));
+                    granted = static_cast<std::size_t>(target);
+                });
+                if (granted) return granted;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+    }
+
     void evict_to(std::int64_t limit)
     {
         while (number("SELECT total FROM budget WHERE id=1") > limit) {
@@ -396,9 +483,47 @@ private:
             Statement s(db_, "DELETE FROM chunks WHERE path=?");
             s.text(1, path);
             s.step();
-            Statement h(db_, "DELETE FROM file_headers WHERE path=?");
-            h.text(1, path); h.step();
+            Statement f(db_, "DELETE FROM files WHERE path=?");
+            f.text(1, path); f.step();
         }
+    }
+
+    // One pooled client per set of credentials, so files downloaded one after another
+    // reuse connections instead of paying a TLS handshake each (a directory of small files).
+    std::shared_ptr<HttpClient> http_client(const Auth& auth)
+    {
+        const auto key = auth.kind + '\0' + auth.user + '\0' + auth.secret + '\0' + auth.token + '\0' + auth.region;
+        std::lock_guard lock(mutex_);
+        auto& client = clients_[key];
+        if (!client) {
+            HttpOptions options;
+            options.auth = auth;
+            client = std::make_shared<HttpClient>(options);
+        }
+        return client;
+    }
+
+    [[noreturn]] void refuse_low_space(const std::string& url) const
+    {
+        throw zarr::LowDiskSpace(url + ": caching it would leave under " +
+                                 std::to_string(min_free_bytes_.load(std::memory_order_relaxed)) +
+                                 " bytes free on the disk of " + root_.string() +
+                                 "; not cached, and nothing cached was removed");
+    }
+
+    bool leaves_free_space(std::size_t size)
+    {
+        const auto wanted = static_cast<std::uintmax_t>(min_free_bytes_.load(std::memory_order_relaxed));
+        if (wanted == 0) {
+            low_space_.store(false, std::memory_order_relaxed);  // nothing is skipped without a floor
+            return true;
+        }
+        const bool enough = std::filesystem::space(root_).available >= wanted + size;
+        if (!enough && !low_space_warned_.exchange(true, std::memory_order_relaxed))
+            std::cerr << "vc_reader: under " << wanted << " bytes free on the disk of " << root_.string()
+                      << "; no longer caching chunks there (reads continue from the network)\n";
+        low_space_.store(!enough, std::memory_order_relaxed);
+        return enough;
     }
 
     void check_path(const std::string& path)
@@ -406,6 +531,48 @@ private:
         const auto rel = std::filesystem::path(path).lexically_relative(root_);
         if (rel.empty() || rel.is_absolute() || *rel.begin() == "..")
             throw std::runtime_error("disk cache entry outside its root: " + path);
+    }
+
+    // Rebuild the index from the files, after a crash or writes by an unbounded reader.
+    // Only numeric chunk files in the decoded-cache namespaces count, plus explicitly
+    // adopted VC3D arrays. Metadata and markers stay.
+    void reconcile()
+    {
+        exec("DELETE FROM chunks; UPDATE budget SET total=0,clock=0 WHERE id=1;");
+        using Entry = std::tuple<std::filesystem::file_time_type, std::string, std::int64_t>;
+        std::vector<Entry> files;
+        for (const auto* scheme : {"http", "https", "s3"}) {
+            const auto base = root_ / scheme;
+            if (!std::filesystem::is_directory(base) || std::filesystem::is_symlink(base))
+                continue;
+            scan(base, files);
+        }
+        {
+            Statement adopted(db_, "SELECT path FROM adopted_namespaces");
+            while (adopted.step()) {
+                const std::string path=reinterpret_cast<const char*>(sqlite3_column_text(adopted.get(),0));
+                check_path(path);
+                if (std::filesystem::is_directory(path) && !std::filesystem::is_symlink(path))
+                    scan(path,files);
+            }
+        }
+        {
+            Statement owned(db_, "SELECT path FROM files");
+            while (owned.step()) {
+                const std::filesystem::path path = reinterpret_cast<const char*>(sqlite3_column_text(owned.get(), 0));
+                check_path(path.string());
+                std::error_code ec;
+                if (std::filesystem::is_regular_file(std::filesystem::symlink_status(path, ec)))
+                    files.emplace_back(std::filesystem::last_write_time(path), path.string(),
+                                       std::filesystem::file_size(path));
+            }
+        }
+        std::sort(files.begin(), files.end());
+        for (const auto& [time, file, size] : files)
+            record(file, size);
+        exec("DELETE FROM files WHERE path NOT IN (SELECT path FROM chunks);");
+        evict();
+        reconciled_ = true;
     }
 
     template<class Entries> void scan(const std::filesystem::path& base, Entries& files)
@@ -438,6 +605,10 @@ private:
     std::filesystem::path root_;
     sqlite3* db_ = nullptr;
     std::mutex mutex_;
+    bool reconciled_ = false;
+    std::atomic<std::int64_t> min_free_bytes_{0};
+    std::map<std::string, std::shared_ptr<HttpClient>> clients_;
+    std::atomic<bool> low_space_{false}, low_space_warned_{false};
 };
 
 }  // namespace vcr

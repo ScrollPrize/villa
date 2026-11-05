@@ -9,7 +9,7 @@ namespace vc::objects {
 // relationships. Omitted annotations follow stable IDs (or unchanged row order).
 // Directional reorderings and annotated sample resizes require explicit transforms.
 // Failure rolls back all arrays and prevents committing the checked transaction.
-// Array schema, coordinate frame, and patch dimensions must remain unchanged;
+// Array schema, coordinate frame, and surface dimensions must remain unchanged;
 // use the dedicated surface operations for channel/grid changes.
 std::string updateGeometryArrays(ObjectStore&, WriteTxn&, const std::string& objectUuid,
     const GeometryData& desired, const std::string& expectedGeometryRevision,

@@ -72,24 +72,4 @@ inline Parameters sample(const SurfacePerturb& t, const Sample& s, Random& r) {
 inline void apply(const SurfacePerturb&, Sample& s, const Parameters& p) {
     for (const auto& c : p.channels) { auto& a = s.at(c.key).array; require(c.field.size() == a.size(), "surface replay shape mismatch"); for (std::size_t i = 0; i < a.size(); ++i) a.set(i, a.get(i) + c.field[i]); }
 }
-
-// Crop planning happens before reading. This helper translates a volume-space
-// box while retaining a requested fraction of already-filtered supervised points.
-inline std::vector<std::int64_t> translate_crop_box(std::vector<std::int64_t> box, const std::vector<double>& points,
-    std::uint64_t seed, double p = .3, int minimum = 10, int maximum = 40, double keep = 1. / 3, int attempts = 24) {
-    require(box.size() == 6 && points.size() % 3 == 0, "expected ZYX start/stop box and (N, 3) points");
-    require(minimum >= 0 && maximum >= minimum && maximum <= 100000 && attempts >= 0 && attempts <= 100000, "invalid crop translation limits"); probability(keep);
-    for (int a = 0; a < 3; ++a) require(box[a] < box[a + 3], "box starts must precede stops");
-    for (auto v : points) require(std::isfinite(v), "crop points must be finite");
-    Random r{seed}; if (!r.chance(p) || points.empty()) return box;
-    auto required = std::max<std::size_t>(1, std::size_t(std::ceil(points.size() / 3 * keep)));
-    for (int attempt = 0; attempt < attempts; ++attempt) {
-        auto proposed = box; int first = r.chance(.5) ? 1 : 2, count = r.chance(.5) ? 2 : 1;
-        for (int j = 0; j < count; ++j) { int a = j == 0 ? first : 3 - first; auto shift = (minimum + std::int64_t(r.index(std::size_t(maximum - minimum + 1)))) * (r.chance(.5) ? 1 : -1); proposed[a] += shift; proposed[a + 3] += shift; }
-        std::size_t within = 0;
-        for (std::size_t i = 0; i < points.size(); i += 3) { bool inside = true; for (int a = 0; a < 3; ++a) inside &= points[i + a] >= proposed[a] && points[i + a] < proposed[a + 3]; within += inside; }
-        if (within >= required) return proposed;
-    }
-    return box;
-}
 } // namespace vcr::transforms

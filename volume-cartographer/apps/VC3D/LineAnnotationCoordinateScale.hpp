@@ -13,45 +13,10 @@
 
 namespace vc3d::line_annotation {
 
-// A viewer-created fiber uses the viewer's volume grid, not an inferred
-// level-0 grid (whose dimensions cannot be recovered exactly by scaling).
-inline std::array<std::size_t, 3> fiberCoordinateShapeFromVolume(
-    const std::array<int, 3>& shapeZYX)
-{
-    std::array<std::size_t, 3> result{};
-    for (std::size_t axis = 0; axis < result.size(); ++axis) {
-        if (shapeZYX[axis] <= 0)
-            throw std::runtime_error("Fiber creation requires a positive volume shape");
-        result[axis] = static_cast<std::size_t>(shapeZYX[axis]);
-    }
-    return result;
-}
-
 struct FiberNormalCoordinateScales {
     double fiberBaseToNormalBase = 1.0;
     double traceToNormalBase = 1.0;
 };
-
-// Fiber JSON geometry is canonical in the fiber manifest's base grid, while
-// an annotation viewer may be rendering a downsampled volume. Return the
-// factor that carries stored fiber coordinates into that volume's grid.
-inline double resolveFiberBaseToVolumeScale(
-    const std::optional<std::array<std::size_t, 3>>& fiberBaseShapeZYX,
-    const std::array<int, 3>& volumeShapeZYX)
-{
-    if (!fiberBaseShapeZYX) {
-        return 1.0;
-    }
-    std::array<std::size_t, 3> working{};
-    for (std::size_t axis = 0; axis < working.size(); ++axis) {
-        if (volumeShapeZYX[axis] <= 0) {
-            throw std::runtime_error("active volume shape must be positive");
-        }
-        working[axis] = static_cast<std::size_t>(volumeShapeZYX[axis]);
-    }
-    return vc::lasagna::dyadicCoordinateScaleBetweenShapes(
-        *fiberBaseShapeZYX, working, 5);
-}
 
 // The line geometry is stored in the fiber manifest's base coordinates, while
 // its normal field may have been published against another level of the same

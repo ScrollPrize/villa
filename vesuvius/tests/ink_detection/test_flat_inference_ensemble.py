@@ -5,7 +5,7 @@ import pytest
 import tifffile
 import torch
 from torch import nn
-import zarr
+from vc_reader.reader import ZarrWriter
 
 from vesuvius.ink_detection.config import InkConfig
 from vesuvius.ink_detection.inference.infer import (
@@ -17,7 +17,7 @@ from vesuvius.ink_detection.inference.infer import (
 )
 from vesuvius.ink_detection.models.model import make_model
 
-from .test_model_foundation import _config_mapping
+from .helpers import config_mapping
 
 
 class _ConstantLogits(nn.Module):
@@ -31,7 +31,7 @@ class _ConstantLogits(nn.Module):
 
 
 def _save_checkpoint(path, *, depth: int = 3, side: int = 16, seed: int = 0):
-    config_mapping = _config_mapping("vesuvius_unet_2p5d", depth=depth, side=side)
+    config_mapping = config_mapping("vesuvius_unet_2p5d", depth=depth, side=side)
     config_mapping["image_normalization"] = "robust_mad"
     torch.manual_seed(seed)
     model = make_model(InkConfig.from_mapping(config_mapping))
@@ -40,13 +40,11 @@ def _save_checkpoint(path, *, depth: int = 3, side: int = 16, seed: int = 0):
 
 
 def _write_surface(path, *, depth: int = 3, side: int = 16):
-    array = zarr.open(
+    array = ZarrWriter.create(
         path,
-        mode="w",
         shape=(depth, side, side),
         chunks=(depth, side, side),
         dtype="u1",
-        zarr_format=2,
     )
     array[:] = np.random.default_rng(0).integers(1, 255, size=(depth, side, side))
     return path

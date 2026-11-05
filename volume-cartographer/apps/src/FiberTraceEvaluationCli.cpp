@@ -1,3 +1,5 @@
+#include "vc/core/util/CudaSampling.hpp"
+#include "vc/core/util/ImageMat.hpp"
 #include "FiberTraceEvaluationCli.hpp"
 #include "FiberTraceCli.hpp"
 #include "vc/fiber_tracer/FiberLiveBridge.hpp"
@@ -9,11 +11,13 @@
 #include "vc/fiber_tracer/FiberJson.hpp"
 #include "vc/fiber_tracer/FiberReferenceReplayBenchmark.hpp"
 #include "vc/core/types/Volume.hpp"
-#include "vc/core/util/AtomicFile.hpp"
-#include "vc/core/util/GlobalCacheRoot.hpp"
+#include "vc/core/util/OutputDirectory.hpp"
 #include "vc/core/util/RemoteCacheSettings.hpp"
-#include "vc/core/util/SurfaceTexture.hpp"
-#include "vc/core/render/ChunkCache.hpp"
+#include <vc_reader/grid.hpp>
+#include <vc_reader/display.hpp>
+#include <vc_reader/array.hpp>
+#include <vc_reader/grid.hpp>
+#include <vc_reader/zarr.hpp>
 
 #if defined(__APPLE__)
 #include <sys/sysctl.h>
@@ -33,13 +37,38 @@
 #include <set>
 #include <thread>
 #include <unordered_map>
-#include <opencv2/imgcodecs.hpp>
 
 namespace {
+
+// The texture source as the artifacts record it: the level's map from base coordinates
+// (XYZ scale and offset, as before the placement replaced them).
+nlohmann::json textureSourceJson(const vc::fiber_tracer::FiberReplayStripTextureSource& source)
+{
+    std::array<double, 3> scale{}, offset{};
+    for (int axis = 0; axis < 3; ++axis) {
+        scale[axis] = 1.0 / source.placement.scale[2 - axis];
+        offset[axis] = -source.placement.offset[2 - axis] / source.placement.scale[2 - axis];
+    }
+    return {{"locator", source.locator}, {"shape_zyx", source.shapeZYX},
+            {"scale_from_base_xyz", scale}, {"offset_from_base_xyz", offset}};
+}
 using namespace vc::fiber_tracer;
 using Json = nlohmann::json;
 
-// One budget for all native sources and sampling paths, configured before binding.
+// A CT pyramid level named by its path (group/level), opened as a level of its group
+// so that it is placed relative to the group's level 0.
+vcr::zarr::OpenedArray openCtLevel(const std::string& locator, std::shared_ptr<vcr::MemoryCache> cache)
+{
+    auto path = std::filesystem::path(locator).lexically_normal();
+    if (path.filename().empty())
+        path = path.parent_path();
+    vcr::zarr::OpenOptions options;
+    options.memoryCache = std::move(cache);
+    return vcr::zarr::Group::open(path.parent_path().string(), options).array(path.filename().string());
+}
+
+// The decoded-chunk budget: one MemoryCache of the prediction, normal and render
+// CT arrays.
 size_t configureEvaluationCache(const Json& settings)
 {
     if (settings.contains("cache_bytes_per_channel"))
@@ -65,7 +94,6 @@ size_t configureEvaluationCache(const Json& settings)
     }
     if (!bytes || bytes > std::numeric_limits<size_t>::max())
         throw std::invalid_argument("cannot determine decoded cache budget; set decoded_cache_bytes explicitly");
-    vc::render::processChunkCacheService()->configureDecodedByteCapacity(size_t(bytes));
     std::cout << "Shared decoded cache budget: " << bytes << " bytes" << std::endl;
     return size_t(bytes);
 }
@@ -149,14 +177,7 @@ Json caseProfileJson(size_t index, double elapsed, const FiberReadinessProfile& 
         {"trace", {{"generations", trace.generations}, {"candidates", trace.candidateTasks},
             {"candidate_score_seconds_inclusive", trace.candidateScoreSeconds},
             {"prediction_batch_seconds_inclusive", trace.predictionBatchSeconds},
-            {"readiness_plan_seconds", trace.readinessPlanSeconds},
-            {"readiness_plan_points", trace.readinessPlanPoints},
-            {"readiness_plan_dependencies", trace.readinessPlanDependencies},
-            {"corner_prepare_seconds", trace.predictionCornerPrepareSeconds},
-            {"corner_layout_seconds", trace.predictionCornerLayoutSeconds},
-            {"corner_pin_seconds", trace.predictionCornerPinSeconds},
-            {"corner_gather_seconds", trace.predictionCornerGatherSeconds},
-            {"corner_points", trace.cornerPointCount},
+            {"corner_seconds", trace.predictionCornerSeconds},
             {"normal_batch_seconds_inclusive", trace.normalBatchSeconds},
             {"frontier_seconds", trace.frontierSeconds}, {"prune_seconds", trace.pruneSeconds},
             {"lookahead_decision_seconds", trace.lookaheadDecisionSeconds}}}};
@@ -172,8 +193,12 @@ struct Source {
     Json provenance;
     vc::lasagna::LasagnaDatasetManifest predictionManifest;
     std::unique_ptr<FiberChunkTraceCache> chunkCache;
-    std::shared_ptr<Volume> renderVolume;
     std::string renderCt;
+    // The CT level strips are textured from (working level 1 of a base pyramid when
+    // present), mapped from the strips' coordinates.
+    std::shared_ptr<vcr::zarr::OpenedArray> renderLevel;
+    vcr::grid::Level renderGridLevel;
+    int renderLevelIndex = 0;
     FiberReplayStripTextureSource renderSource;
 };
 
@@ -391,7 +416,7 @@ Json referencePlan(const Json& config, const std::filesystem::path& base)
         std::unique_ptr<vc::lasagna::LasagnaNormalSampler> proximityNormals;
         if(config.contains("self_proximity")) {
             vc::lasagna::LasagnaDatasetOpenOptions options;
-            options.remoteCacheRoot=vc::core::util::globalCacheRoot();
+            options.remoteCacheRoot=vcr::zarr::selectedVc3dCacheRoot();
             options.workingToBaseScale=1.0;
             proximityNormals=std::make_unique<vc::lasagna::LasagnaNormalSampler>(
                 vc::lasagna::LasagnaDataset::openLocation(sourceLocation(base,source.at("normal_manifest").get<std::string>()),options));
@@ -421,16 +446,13 @@ void writeRenderedOverview(const std::filesystem::path& output,
     std::filesystem::create_directories(output.parent_path());
     if (!std::filesystem::create_directory(output)) throw std::invalid_argument("render output already exists");
     for (size_t i = 0; i < overview.pages.size(); ++i)
-        if (!cv::imwrite((output / ("strips_" + std::to_string(i) + ".jpg")).string(), overview.pages[i].image))
-            throw std::runtime_error("failed writing replay strip image");
+        vcr::sources::writeImage(output / ("strips_" + std::to_string(i) + ".jpg"),
+            vc::core::util::imageBuffer(overview.pages[i].image).view());
     metadata["pages"] = overview.pages.size();
     metadata["rows"] = {"reference_top", "reference_side", "traced_top", "traced_side"};
     metadata["reference_color"] = "yellow";
     metadata["trace_and_failure_color"] = "cyan";
-    metadata["texture_source"] = {{"locator", overview.textureSource.locator},
-        {"shape_zyx", overview.textureSource.shapeZYX},
-        {"scale_from_base_xyz", overview.textureSource.scaleFromBaseXYZ},
-        {"offset_from_base_xyz", overview.textureSource.offsetFromBaseXYZ}};
+    metadata["texture_source"] = textureSourceJson(overview.textureSource);
     metadata["render_scale"] = overview.renderScale;
     metadata["component_gap_columns"] = overview.fiberletComponentGapColumns;
     metadata["components"] = Json::array();
@@ -451,7 +473,7 @@ void writeRenderedOverview(const std::filesystem::path& output,
                 {"traced_top_rows", p.fiberletTopRows}, {"traced_side_rows", p.fiberletSideRows}});
         metadata["page_layout"].push_back({{"shape_yx", {page.image.rows, page.image.cols}}, {"panels", panels}});
     }
-    vc::core::util::atomicWriteString(output / "render.json", metadata.dump(2) + "\n");
+    vcr::zarr::atomicWrite(output / "render.json", metadata.dump(2) + "\n", vcr::zarr::Durability::Fsync);
 }
 
 void renderArtifact(const std::filesystem::path& artifact, const std::filesystem::path& settingsPath)
@@ -460,7 +482,8 @@ void renderArtifact(const std::filesystem::path& artifact, const std::filesystem
     if (document.at("format") != "vc_native_replay_artifact" || document.at("version") != 1)
         throw std::invalid_argument("unsupported replay artifact");
     const auto settings = readJson(settingsPath);
-    configureEvaluationCache(settings);
+    // Render CT chunks are decoded into their own cache of the configured budget.
+    const auto ctCache = std::make_shared<vcr::MemoryCache>(configureEvaluationCache(settings));
     const auto replay = fiberReplayTraceFromJson(document.at("replay"));
     std::vector<cv::Vec3d> reference;
     for (const auto& point : document.at("reference_points_base_xyz")) {
@@ -471,7 +494,7 @@ void renderArtifact(const std::filesystem::path& artifact, const std::filesystem
     normalOptions.workingToBaseScale = settings.at("normal_working_to_base").get<double>();
     normalOptions.remoteCacheRoot = settings.contains("remote_cache_dir")
         ? std::filesystem::path(settings.at("remote_cache_dir").get<std::string>())
-        : vc::core::util::globalCacheRoot();
+        : vcr::zarr::selectedVc3dCacheRoot();
     const auto normalLocation = sourceLocation(settingsPath.parent_path(), settings.at("normal_manifest").get<std::string>());
     if (normalLocation != document.at("provenance").at("normal_manifest").get<std::string>())
         throw std::invalid_argument("render normals differ from the evaluated source binding");
@@ -483,11 +506,11 @@ void renderArtifact(const std::filesystem::path& artifact, const std::filesystem
     if (!document.at("provenance").contains("ct_volume") ||
         ct != document.at("provenance").at("ct_volume").get<std::string>())
         throw std::invalid_argument("render CT differs from or is absent in the evaluated source binding");
-    if (ct.find("://") != std::string::npos)
+    if (vcr::zarr::isRemote(ct))
         throw std::invalid_argument("post-hoc strip rendering currently requires local OME-Zarr CT metadata");
-    auto volume = Volume::New(ct);
+    const auto ctLevel = openCtLevel(ct, ctCache);
     auto overview = renderFiberReplayTraceOverview(reference, replay, normals,
-        normalOptions.workingToBaseScale, settings.value("threads", 1), *volume, ct);
+        normalOptions.workingToBaseScale, settings.value("threads", 1), ctLevel);
     const auto output = localPath(settingsPath.parent_path(), settings.at("output").get<std::string>());
     writeRenderedOverview(output, overview, Json{
         {"artifact", std::filesystem::absolute(artifact).string()}, {"settings", settings}});
@@ -500,7 +523,7 @@ int runFiberTraceEvaluationCli(int argc, char** argv)
         renderArtifact(argv[2], argv[4]);
         return 0;
     }
-    const auto usage = "Usage: vc_fiber_trace_metric replay-set --config evaluation.json [--render] | render-replay trace.json --config render.json";
+    const auto usage = "Usage: vc_fiber_trace_metric replay-set --config evaluation.json [--render] | render-replay trace.json --config render.json; each takes [--cuda] [--cuda-cache-gb N]";
     if (argc < 2 || (std::string_view(argv[1]) != "replay-set" && std::string_view(argv[1]) != "replay-references")) throw std::invalid_argument(usage);
     std::filesystem::path configArgument;
     bool renderFlag = false;
@@ -540,7 +563,10 @@ int runFiberTraceEvaluationCli(int argc, char** argv)
     persistedConfig.erase("resume_visualization");
     persistedConfig.erase("resume_render_limit");
     persistedConfig.erase("resume_render_cases");
-    persistedConfig["decoded_cache_bytes"] = configureEvaluationCache(config);
+    const size_t decodedCacheBytes = configureEvaluationCache(config);
+    persistedConfig["decoded_cache_bytes"] = decodedCacheBytes;
+    // Render CT levels share one cache of the configured budget.
+    const auto decodedCache = std::make_shared<vcr::MemoryCache>(decodedCacheBytes);
     const bool render = config.value("render", false) || renderFlag;
     persistedConfig["render"] = render;
     if (live) persistedConfig["live_endpoint"].erase("token");
@@ -559,7 +585,7 @@ int runFiberTraceEvaluationCli(int argc, char** argv)
     const auto output = localPath(configPath.parent_path(), config.at("output").get<std::string>());
     const auto cacheRoot = config.contains("remote_cache_dir")
         ? std::filesystem::path(config.at("remote_cache_dir").get<std::string>())
-        : vc::core::util::globalCacheRoot();
+        : vcr::zarr::selectedVc3dCacheRoot();
     std::vector<Source> sources;
     std::vector<Case> cases;
     std::set<std::string> ids;
@@ -584,7 +610,7 @@ int runFiberTraceEvaluationCli(int argc, char** argv)
         manifest.workingToBaseScale = source.traceScale;
         source.predictionManifest = manifest;
         source.predictions = std::make_unique<FiberPredictionField>(vc::lasagna::LasagnaDataset(std::move(manifest)),
-            FiberPredictionFieldOptions{.enableEmbeddings = trace.embeddingWeight > 0, .enableWidth = trace.widthRelativeTolerance > 0});
+            FiberPredictionFieldOptions{.memoryCache = decodedCache, .enableEmbeddings = trace.embeddingWeight > 0, .enableWidth = trace.widthRelativeTolerance > 0});
         options.workingToBaseScale = source.traceScale;
         if (referenceNormalMode == "lasagna") {
         const auto normals = vc::lasagna::LasagnaDataset::openLocation(normalLocation, options);
@@ -599,7 +625,8 @@ int runFiberTraceEvaluationCli(int argc, char** argv)
             if ((a > b ? a - b : b - a) > 1)
                 throw std::invalid_argument("prediction and normal base shapes disagree");
         }
-        source.normals = std::make_unique<vc::lasagna::LasagnaNormalSampler>(normals);
+        source.normals = std::make_unique<vc::lasagna::LasagnaNormalSampler>(
+            normals, vc::lasagna::LasagnaNormalSamplerOptions{.memoryCache = decodedCache});
         }
         const auto tracingNormalMode = entry.value("tracing_normals", std::string("lasagna"));
         if (tracingNormalMode != "lasagna" && tracingNormalMode != "fiber")
@@ -607,22 +634,11 @@ int runFiberTraceEvaluationCli(int argc, char** argv)
         if (referenceNormalMode == "baked" && tracingNormalMode != "fiber")
             throw std::invalid_argument("baked reference normals require fiber tracing normals");
         if (tracingNormalMode == "fiber") {
-            auto normalManifest = source.predictionManifest;
-            normalManifest.groups.clear();
-            for (const auto* channel : {"nx", "ny", "grad_mag"}) {
-                const auto name = std::string("sheet_") + channel;
-                const auto* group = source.predictionManifest.groupForChannel(name);
-                if (!group) throw std::invalid_argument("missing predicted normal channel " + name);
-                auto alias = *group;
-                alias.name = channel;
-                alias.channels = {channel};
-                normalManifest.groups.push_back(std::move(alias));
-            }
-            normalManifest.raw["grad_mag_encode_scale"] = 1.0;
-            normalManifest.raw["grad_mag_factor"] = 1.0;
+            auto normalManifest = vc::lasagna::fiberNormalManifest(source.predictionManifest);
             vc::lasagna::LasagnaDataset normalDataset(std::move(normalManifest));
             vc::lasagna::validateLasagnaNormalDatasetStructure(normalDataset);
-            source.tracingNormals = std::make_unique<vc::lasagna::LasagnaNormalSampler>(normalDataset);
+            source.tracingNormals = std::make_unique<vc::lasagna::LasagnaNormalSampler>(
+                normalDataset, vc::lasagna::LasagnaNormalSamplerOptions{.memoryCache = decodedCache});
         }
         source.provenance = entry;
         source.provenance["fiber_manifest"] = fiberLocation;
@@ -637,25 +653,46 @@ int runFiberTraceEvaluationCli(int argc, char** argv)
             if (entry.value("ct_base_volume", false)) {
                 // The input pyramid's level zero defines base coordinates;
                 // no inferred power-of-two transform for selected groups.
-                const bool remoteCt = source.renderCt.find("://") != std::string::npos;
+                const bool remoteCt = vcr::zarr::isRemote(source.renderCt);
                 if (remoteCt && std::filesystem::weakly_canonical(options.remoteCacheRoot) !=
                     std::filesystem::weakly_canonical(vc::settings::remoteCachePath()))
                     throw std::invalid_argument("render CT cache root must match the process-wide VC3D cache root");
-                source.renderVolume = remoteCt
-                    ? Volume::NewFromUrl(source.renderCt)
-                    : Volume::New(source.renderCt);
-                if (source.renderVolume->dtype() != vc::render::ChunkDtype::UInt8 ||
-                    !source.renderVolume->hasScaleLevel(0))
+                // A remote CT opens through Volume for VC3D's cache directory and
+                // working level (physical level baseScaleLevel()).
+                std::string location = source.renderCt;
+                vcr::zarr::OpenOptions ctOptions;
+                int working = 0;
+                if (remoteCt) {
+                    const auto volume = Volume::NewFromUrl(source.renderCt);
+                    location = volume->sourceLocation();
+                    ctOptions = volume->sourceOpenOptions();
+                    working = volume->baseScaleLevel();
+                }
+                ctOptions.memoryCache = decodedCache;
+                auto base = std::make_shared<vcr::zarr::OpenedArray>(
+                    vcr::zarr::openPyramidLevel(location, working, ctOptions));
+                if (base->meta.shape.size() != 3 || base->meta.type.kind != 'u' || base->meta.type.itemsize != 1)
                     throw std::invalid_argument("render CT base volume requires uint8 level zero");
-                source.renderSource = {source.renderCt, source.renderVolume->shape(0), {1, 1, 1}, {0, 0, 0}};
+                source.renderSource = {source.renderCt, {}, {}};
+                for (size_t axis = 0; axis < 3; ++axis)
+                    source.renderSource.shapeZYX[axis] = int(base->meta.shape[axis]);
+                source.renderLevel = base;
+                try {
+                    source.renderLevel = std::make_shared<vcr::zarr::OpenedArray>(
+                        vcr::zarr::openPyramidLevel(location, working + 1, ctOptions));
+                    source.renderLevelIndex = 1;
+                } catch (const std::out_of_range&) {
+                }
+                source.renderGridLevel = vcr::zarr::gridLevel(*source.renderLevel, base->placement, vc::cuda::toolReader(*source.renderLevel));
                 for (size_t axis = 0; axis < 3; ++axis)
                     if (source.renderSource.shapeZYX[axis] != dataset.manifest().baseShapeZYX->at(axis))
                         throw std::invalid_argument("render CT base shape differs from predictions");
             } else {
-                if (source.renderCt.find("://") != std::string::npos)
+                if (vcr::zarr::isRemote(source.renderCt))
                     throw std::invalid_argument("remote render CT must bind the base pyramid with ct_base_volume=true");
-                source.renderVolume = Volume::New(source.renderCt);
-                source.renderSource = validateFiberReplayStripCtVolume(*source.renderVolume, source.renderCt);
+                source.renderLevel = std::make_shared<vcr::zarr::OpenedArray>(openCtLevel(source.renderCt, decodedCache));
+                source.renderSource = validateFiberReplayStripCtVolume(*source.renderLevel);
+                source.renderGridLevel = vcr::zarr::gridLevel(*source.renderLevel, {}, vc::cuda::toolReader(*source.renderLevel));
             }
         }
         if(backend=="chunk-beam") {
@@ -877,7 +914,7 @@ int runFiberTraceEvaluationCli(int argc, char** argv)
                     throw std::invalid_argument("visualization-resume case selection is stale or duplicated");
             }
         } else {
-            // Select across sources deterministically. The shared chunk caches
+            // Select across sources deterministically. The shared memory caches
             // support concurrent readers and every selected direction may
             // issue demand independently.
             for (size_t rank = 0; resumeRenderCases.size() < resumeRenderLimit; ++rank) {
@@ -955,7 +992,7 @@ int runFiberTraceEvaluationCli(int argc, char** argv)
                 if (bridge && (!resumeVisualization || renderThisCase)) {
                     livePredictions = std::make_unique<FiberPredictionField>(
                         vc::lasagna::LasagnaDataset(source.predictionManifest),
-                        FiberPredictionFieldOptions{.enableEmbeddings = trace.embeddingWeight > 0, .enableWidth = trace.widthRelativeTolerance > 0});
+                        FiberPredictionFieldOptions{.memoryCache = decodedCache, .enableEmbeddings = trace.embeddingWeight > 0, .enableWidth = trace.widthRelativeTolerance > 0});
                     livePredictions->setReadinessGate([&](const auto& dependencies) {
                         readiness.await(dependencies, [&](const auto& missing) {
                             permit.suspend([&] { bridge->await(source.id, index, remaining.load(), missing,
@@ -1051,25 +1088,41 @@ int runFiberTraceEvaluationCli(int argc, char** argv)
                     return;
                 }
                 if (profileTracing)
-                    vc::core::util::atomicWriteString(output / "cases" / std::to_string(index) / "profile.json",
+                    vcr::zarr::atomicWrite(output / "cases" / std::to_string(index) / "profile.json",
                         caseProfileJson(index, std::chrono::duration<double>(std::chrono::steady_clock::now() - caseStart).count(),
-                            readinessProfile, traceProfile).dump(2) + "\n");
+                            readinessProfile, traceProfile).dump(2) + "\n", vcr::zarr::Durability::Fsync);
                 if (renderThisCase) {
                     // Render directly from this completed replay. Volume,
-                    // prediction and normal chunk caches are concurrent; all
+                    // prediction and normal memory caches are concurrent; all
                     // selected directions may render and request data together.
                     const auto& predictions = livePredictions ? *livePredictions : *source.predictions;
-                    // Coordinates stay in the bound source lattice; Volume applies
-                    // the pyramid transform. Do not divide coordinates a second time.
-                    const int ctLevel = source.provenance.value("ct_base_volume", false) &&
-                        source.renderVolume->hasScaleLevel(1) ? 1 : 0;
+                    // Coordinates stay in the bound source lattice; renderGridLevel maps
+                    // them to the rendered level. Do not divide coordinates a second time.
+                    const int ctLevel = source.renderLevelIndex;
                     const std::string ctSampling = "source level " + std::to_string(ctLevel) +
-                        "; trilinear; fine-to-coarse fallback";
+                        "; trilinear";
                     auto inspection = renderFiberReplayInspection(item.points, replay,
                         *referenceNormals, source.traceScale, source.renderSource,
                         [&](const auto& coords, int scale) -> cv::Mat_<uint8_t> {
-                            return vc::core::util::renderCoordsTextureFineToCoarse(
-                                coords, *source.renderVolume, ctLevel, scale, "Replay CT");
+                            return [&]() {
+                const auto& vertices = coords;
+                const int factor = std::max(1, scale);
+                std::vector<uint8_t> valid(vertices.total(), 1);
+                for (int r = 0; r < vertices.rows; ++r)
+                    for (int c = 0; c < vertices.cols; ++c)
+                        valid[std::size_t(r) * vertices.cols + c] = vertices(r,c) != cv::Vec3f(-1,-1,-1);
+                const vcr::grid::Surface surface({reinterpret_cast<const float*>(vertices.data),
+                    vertices.rows, vertices.cols, vertices.step1(), nullptr, valid.data()});
+                const double step = 1.0 / factor;
+                const vcr::grid::Raster raster{0.5*step-0.5, 0.5*step-0.5, step, step,
+                    vertices.cols*factor, vertices.rows*factor};
+                vcr::grid::Request request;
+                request.levels = {source.renderGridLevel};
+                const auto sampled = vcr::grid::sample(surface, raster, request);
+                cv::Mat_<uint8_t> texture(raster.height, raster.width);
+                vcr::display::toUint8(sampled.values.data(), texture.total(), texture.ptr());
+                return texture;
+            }();
                         },
                         [&](const auto& coords, int scale) {
                             return renderFiberReplayPresenceTexture(coords, scale, source.renderSource,
@@ -1084,21 +1137,18 @@ int runFiberTraceEvaluationCli(int argc, char** argv)
                     if (!std::filesystem::create_directory(writeDirectory))
                         throw std::runtime_error("render staging output already exists");
                     for (size_t p = 0; p < inspection.pages.size(); ++p)
-                        if (!cv::imwrite((writeDirectory / ("strips_" + std::to_string(p) + ".jpg")).string(), inspection.pages[p]))
-                            throw std::runtime_error("failed writing inspection image");
+                        vcr::sources::writeImage(writeDirectory / ("strips_" + std::to_string(p) + ".jpg"),
+                            vc::core::util::imageBuffer(inspection.pages[p]).view());
 
                     inspection.metadata.update({{"case_index", index}, {"provenance", provenance},
-                        {"texture_source", {{"locator", source.renderSource.locator},
-                            {"shape_zyx", source.renderSource.shapeZYX},
-                            {"scale_from_base_xyz", source.renderSource.scaleFromBaseXYZ},
-                            {"offset_from_base_xyz", source.renderSource.offsetFromBaseXYZ}}}});
+                        {"texture_source", textureSourceJson(source.renderSource)}});
                     // Renderer arcs are crop-local; recover positions on the original annotation.
                     const double originalBegin = item.selection.at("original_arcs_base")[0];
                     for (const char* key : {"restarts", "cross_sections"}) for (auto& entry : inspection.metadata[key]) {
                         entry["original_fiber_arc_base"] = entry["original_fiber_arc_base"].get<double>() + originalBegin;
                         entry["original_fiber_arc_mm"] = entry["original_fiber_arc_base"].get<double>() * source.voxelSizeUm / 1000;
                     }
-                    vc::core::util::atomicWriteString(writeDirectory / "render.json", inspection.metadata.dump(2) + "\n");
+                    vcr::zarr::atomicWrite(writeDirectory / "render.json", inspection.metadata.dump(2) + "\n", vcr::zarr::Durability::Fsync);
                     if (resumeVisualization) {
                         if (std::filesystem::exists(directory)) {
                             auto quarantine = caseDirectory / ("rendered.incomplete." + std::to_string(
@@ -1136,7 +1186,7 @@ int runFiberTraceEvaluationCli(int argc, char** argv)
     pool.clear(); // join before consuming results or propagating errors
     if (caseQueue) caseQueue->join();
     if (error) {
-        vc::core::util::atomicWriteString(output / "incomplete.json", Json{{"completed_cases", completed.load()}, {"requested_cases", cases.size()}, {"config", persistedConfig}}.dump(2) + "\n");
+        vcr::zarr::atomicWrite(output / "incomplete.json", Json{{"completed_cases", completed.load()}, {"requested_cases", cases.size()}, {"config", persistedConfig}}.dump(2) + "\n", vcr::zarr::Durability::Fsync);
         std::rethrow_exception(error);
     }
     if (resumeVisualization) {
@@ -1147,25 +1197,25 @@ int runFiberTraceEvaluationCli(int argc, char** argv)
         const Json status{{"format", "vc_visualization_resume"}, {"version", 1},
             {"cases", cases.size()}, {"rendered_cases", cases.size() - remaining.size()},
             {"remaining_cases", remaining}, {"batch_selected_cases", resumeRenderCases}};
-        vc::core::util::atomicWriteString(output / "visualization_resume.json", status.dump(2) + "\n");
+        vcr::zarr::atomicWrite(output / "visualization_resume.json", status.dump(2) + "\n", vcr::zarr::Durability::Fsync);
         // The Python publisher removes interruption markers only after the
         // complete visualization report validates every declared page.  The
         // original scientific summary and its timing remain byte-for-byte
         // untouched by this render-only operation.
-        vc::core::util::atomicWriteString(output / "incomplete.json", Json{
-            {"visualization_resume", status}, {"config", persistedConfig}}.dump(2) + "\n");
+        vcr::zarr::atomicWrite(output / "incomplete.json", Json{
+            {"visualization_resume", status}, {"config", persistedConfig}}.dump(2) + "\n", vcr::zarr::Durability::Fsync);
         return 0;
     }
     Json summaries = Json::array();
     if (trialSearch) {
         if (completed.load() != cases.size())
             throw std::runtime_error("incomplete failure-search work queue");
-        vc::core::util::atomicWriteString(output / "summary.json", Json{
+        vcr::zarr::atomicWrite(output / "summary.json", Json{
             {"completed", true}, {"backend", "failure_search"}, {"cases", cases.size()},
             {"evaluated_cases", completed.load() - skippedTrials.load()},
             {"cancelled_cases", skippedTrials.load()}, {"workers", workers},
             {"wall_seconds", std::chrono::duration<double>(std::chrono::steady_clock::now()-start).count()}
-        }.dump(2) + "\n");
+        }.dump(2) + "\n", vcr::zarr::Durability::Fsync);
         return 0;
     }
 
@@ -1223,7 +1273,7 @@ int runFiberTraceEvaluationCli(int argc, char** argv)
         evaluatedCases += selected.size();
         totalFailures += summary.totalFailures;
     }
-    vc::core::util::atomicWriteString(output / "summary.json", Json{
+    vcr::zarr::atomicWrite(output / "summary.json", Json{
         {"version", 3}, {"metric_definition", "corpus-failures-plus-one-v1"},
         {"completed", true}, {"cases", cases.size()}, {"workers", workers},
         {"evaluated_cases", evaluatedCases},
@@ -1244,6 +1294,6 @@ int runFiberTraceEvaluationCli(int argc, char** argv)
         {"mean_segment_length_mm", evaluatedCases == 0 ? Json(nullptr) : Json(directedLengthMm / (totalFailures + 1))},
         {"mean_segment_length_percent", evaluatedCases == 0 ? Json(nullptr) : Json(100.0 / (totalFailures + 1))},
         {"wall_seconds", std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count()},
-        {"config", persistedConfig}, {"effective_trace", cli::traceConfigJson(trace)}, {"sources", summaries}}.dump(2) + "\n");
+        {"config", persistedConfig}, {"effective_trace", cli::traceConfigJson(trace)}, {"sources", summaries}}.dump(2) + "\n", vcr::zarr::Durability::Fsync);
     return 0;
 }

@@ -1,13 +1,12 @@
 #include "VolumeOverlayController.hpp"
 #include "VolumeComboTooltip.hpp"
-#include "../OpenDataCoordinateIdentity.hpp"
 #include "../VolumeDisplayNames.hpp"
 
 #include "../ViewerManager.hpp"
-#include "../VolumeViewerCmaps.hpp"
 #include "../volume_viewers/VolumeViewerBase.hpp"
 #include "../VCSettings.hpp"
 
+#include "Colormaps.hpp"
 #include "vc/core/types/Volume.hpp"
 #include "vc/core/types/VolumePkg.hpp"
 
@@ -90,31 +89,23 @@ std::string sanitizedCompositeMethod(const std::string& method)
     return vc3d::settings::volume_overlay::COMPOSITE_METHOD_DEFAULT;
 }
 
-vc::Sampling sanitizedSamplingMethod(vc::Sampling method)
+QString samplingMethodName(int method)
 {
-    return method == vc::Sampling::Trilinear
-        ? vc::Sampling::Trilinear
-        : vc::Sampling::Nearest;
-}
-
-QString samplingMethodName(vc::Sampling method)
-{
-    return method == vc::Sampling::Trilinear
+    return method == 1
         ? QStringLiteral("trilinear")
         : QStringLiteral("nearest");
 }
 
-vc::Sampling samplingMethodFromName(const QString& name)
+int samplingMethodFromName(const QString& name)
 {
     return name.compare(QStringLiteral("trilinear"), Qt::CaseInsensitive) == 0
-        ? vc::Sampling::Trilinear
-        : vc::Sampling::Nearest;
+        ? 1
+        : 0;
 }
 
 std::string defaultOverlayColormap()
 {
-    const auto& entries = volume_viewer_cmaps::entries(
-        volume_viewer_cmaps::EntryScope::OverlayCompatible);
+    const auto& entries = vc::entries(vc::EntryScope::OverlayCompatible);
     return entries.empty() ? std::string{} : entries.front().id;
 }
 
@@ -271,9 +262,9 @@ void VolumeOverlayController::setUi(const UiRefs& ui)
         const QSignalBlocker blocker(_ui.samplingMethodSelect);
         _ui.samplingMethodSelect->clear();
         _ui.samplingMethodSelect->addItem(
-            tr("Nearest"), static_cast<int>(vc::Sampling::Nearest));
+            tr("Nearest"), static_cast<int>(0));
         _ui.samplingMethodSelect->addItem(
-            tr("Trilinear"), static_cast<int>(vc::Sampling::Trilinear));
+            tr("Trilinear"), static_cast<int>(1));
     }
     setSamplingMethod(_overlaySamplingMethod);
 
@@ -357,7 +348,7 @@ void VolumeOverlayController::clearVolumePkg()
     _overlayWindowHigh = 255.0f;
     _overlayIntensityAsAlpha = false;
     _overlayMaxDisplayedResolution = vc3d::settings::volume_overlay::MAX_DISPLAYED_RESOLUTION_DEFAULT;
-    _overlaySamplingMethod = vc::Sampling::Nearest;
+    _overlaySamplingMethod = 0;
     _compositeEnabled = vc3d::settings::volume_overlay::COMPOSITE_ENABLED_DEFAULT;
     _compositeMethod = vc3d::settings::volume_overlay::COMPOSITE_METHOD_DEFAULT;
     _compositeLayersFront = vc3d::settings::volume_overlay::COMPOSITE_LAYERS_FRONT_DEFAULT;
@@ -392,7 +383,7 @@ void VolumeOverlayController::refreshVolumeOptions()
         const auto volumeSuffixes = vc3d::volumeDisplaySuffixes(*_volumePkg);
         for (const auto& id : vc3d::orderedDisplayVolumeIds(*_volumePkg)) {
             if (!baseVolumeId.empty() &&
-                !vc3d::opendata::overlayCoordinatesCompatible(*_volumePkg, baseVolumeId, id))
+                !_volumePkg->overlayCompatible(baseVolumeId, id))
                 continue;
             std::shared_ptr<Volume> volume;
             try {
@@ -623,8 +614,7 @@ void VolumeOverlayController::populateColormapOptions()
         return;
     }
 
-    const auto& entries = volume_viewer_cmaps::entries(
-        volume_viewer_cmaps::EntryScope::OverlayCompatible);
+    const auto& entries = vc::entries(vc::EntryScope::OverlayCompatible);
     const QSignalBlocker blocker(_ui.colormapSelect);
     _ui.colormapSelect->clear();
     _ui.colormapSelect->addItem(tr("Grayscale"), QVariant(QString()));
@@ -634,7 +624,8 @@ void VolumeOverlayController::populateColormapOptions()
 
     for (const auto& entry : entries) {
         const int row = _ui.colormapSelect->count();
-        _ui.colormapSelect->addItem(entry.label, QVariant(QString::fromStdString(entry.id)));
+        _ui.colormapSelect->addItem(QString::fromStdString(entry.label),
+                                    QVariant(QString::fromStdString(entry.id)));
         if (entry.id == _overlayColormapName) {
             indexToSelect = row;
             found = true;
@@ -660,9 +651,9 @@ void VolumeOverlayController::applyOverlayVolume()
             ? primary->currentVolumeId()
             : std::string{};
         if (!baseVolumeId.empty() &&
-            !vc3d::opendata::overlayCoordinatesCompatible(*_volumePkg, baseVolumeId, _overlayVolumeId)) {
+            !_volumePkg->overlayCompatible(baseVolumeId, _overlayVolumeId)) {
             emit requestStatusMessage(
-                tr("Overlay rejected: volume coordinate spaces do not match."), 5000);
+                tr("Overlay rejected: the catalog places it in another frame."), 5000);
             _overlayVolumeId.clear();
             if (_ui.volumeSelect) {
                 const QSignalBlocker blocker(_ui.volumeSelect);
@@ -766,7 +757,7 @@ void VolumeOverlayController::loadState()
     _overlayWindowHigh = 255.0f;
     _overlayColormapName = defaultOverlayColormap();
     _overlayIntensityAsAlpha = false;
-    _overlaySamplingMethod = vc::Sampling::Nearest;
+    _overlaySamplingMethod = 0;
     _overlayMaxDisplayedResolution = vc3d::settings::volume_overlay::MAX_DISPLAYED_RESOLUTION_DEFAULT;
     _compositeEnabled = vc3d::settings::volume_overlay::COMPOSITE_ENABLED_DEFAULT;
     _compositeMethod = vc3d::settings::volume_overlay::COMPOSITE_METHOD_DEFAULT;
@@ -863,7 +854,6 @@ void VolumeOverlayController::saveState() const
     QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
     settings.beginGroup(QString::fromLatin1(kOverlaySettingsGroup));
     settings.beginGroup(groupKey);
-    settings.setValue(volume_overlay::PATH, _volpkgPath);
     settings.setValue(volume_overlay::VOLUME_ID, QString::fromStdString(_overlayVolumeId));
     settings.setValue(volume_overlay::OPACITY, _overlayOpacity);
     settings.setValue(volume_overlay::WINDOW_LOW, _overlayWindowLow);
@@ -941,9 +931,9 @@ void VolumeOverlayController::setOpacity(float value)
     }
 }
 
-void VolumeOverlayController::setSamplingMethod(vc::Sampling method)
+void VolumeOverlayController::setSamplingMethod(int method)
 {
-    _overlaySamplingMethod = sanitizedSamplingMethod(method);
+    _overlaySamplingMethod = method;
 
     if (_ui.samplingMethodSelect) {
         const QSignalBlocker blocker(_ui.samplingMethodSelect);
@@ -1180,7 +1170,7 @@ void VolumeOverlayController::handleSamplingMethodChanged(int index)
         return;
     }
 
-    setSamplingMethod(static_cast<vc::Sampling>(
+    setSamplingMethod(static_cast<int>(
         _ui.samplingMethodSelect->itemData(index).toInt()));
     if (!_suspendPersistence) {
         saveState();

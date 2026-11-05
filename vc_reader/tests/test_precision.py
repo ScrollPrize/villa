@@ -2,17 +2,13 @@
 import os
 import io
 import math
-from pathlib import Path
 import pickle
-import sys
 import unittest
 
 import numpy as np
 
-if os.environ.get('VC_READER_BUILD_DIR'):
-    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'benchmarks'))
-    from extension_build import load_extensions
-    load_extensions(Path(os.environ['VC_READER_BUILD_DIR']))
+from build_support import load_build
+load_build()
 
 from vc_reader import transforms as A
 
@@ -44,6 +40,57 @@ def elastic_field(plan):
 class PrecisionTests(unittest.TestCase):
     def backends(self):
         return ('cpu', 'cuda') if A._transforms.cuda_available() else ('cpu',)
+
+    def test_percentiles_select_lowest_rank_before_upper_partition(self):
+        for dtype in (np.float32, np.float64):
+            image = np.array([9, -1, 3, 7], dtype=dtype).reshape(1, 2, 2)
+            for lower, upper in ((0, 100), (1, 99), (25, 75)):
+                low, high = np.percentile(image, [lower, upper])
+                clipped = np.clip(image, low, high).astype(dtype)
+                for backend in self.backends():
+                    with self.subTest(dtype=dtype, lower=lower, backend=backend):
+                        clip = A.Pipeline([A.ClipOutliers(lower, upper, p_retain_std=0)], backend=backend)
+                        np.testing.assert_allclose(clip({'image': image}, seed=0)['image'], clipped, atol=1e-6)
+                        normalize = A.Pipeline([A.Normalize('percentile', lower=lower, upper=upper)], backend=backend)
+                        expected = ((np.clip(image.astype(np.float64), low, high) - low) / (high-low)).astype(dtype)
+                        np.testing.assert_allclose(normalize({'image': image}, seed=0)['image'], expected, atol=1e-6)
+
+    def test_masked_intensity_statistics_without_refilling(self):
+        image = np.array([-10, 2, 4, 6, 20, 3], np.float32).reshape(1, 2, 3)
+        mask = np.array([0, 1, 1, 1, 0, 1], bool).reshape(image.shape)
+        for backend in self.backends():
+            for valid in (mask, np.zeros_like(mask), np.ones_like(mask)):
+                for retain in (False, True):
+                    chosen = image[valid] if valid.any() else image.ravel()
+                    mean = chosen.mean(dtype=np.float64)
+                    contrast = (image - np.float32(mean)) * np.float32(1.7) + np.float32(mean)
+                    selected = contrast[valid] if valid.any() else contrast.ravel()
+                    low, high = selected.min(), selected.max()
+                    expected = np.clip((contrast - low) / max(high-low, 1e-6), 0, 1)**np.float32(.7) * (high-low) + low
+                    if retain:
+                        after = expected[valid] if valid.any() else expected.ravel()
+                        expected = ((expected.astype(np.float64)-after.mean(dtype=np.float64)) *
+                                    (selected.std(dtype=np.float64, ddof=1) / max(after.std(dtype=np.float64, ddof=1), 1e-7)) +
+                                    selected.mean(dtype=np.float64)).astype(np.float32)
+                    pipeline = A.Pipeline([A.Contrast(1.7, masked=True, preserve_range=False),
+                                           A.Gamma(.7, masked=True, clip=True, eps=1e-6, p_retain_stats=float(retain))],
+                                          targets={'image': A.Image(refill=False), 'padding_mask': A.ValidMask()}, backend=backend)
+                    sample = {'image': image, 'padding_mask': valid}
+                    output = pipeline(sample, seed=19)
+                    plan = pipeline.sample(sample, seed=19)
+                    np.testing.assert_allclose(output['image'], expected, rtol=2e-6, atol=2e-6)
+                    np.testing.assert_array_equal(plan.apply(sample)['image'], output['image'])
+                    np.testing.assert_array_equal(output['padding_mask'], valid)
+
+    def test_constant_masked_normalization_honors_epsilon_outside_mask(self):
+        image = np.array([1, 3, 3, 5], np.float32).reshape(1, 2, 2)
+        mask = np.array([0, 1, 1, 0], bool).reshape(image.shape)
+        for backend in self.backends():
+            for mode in ('zscore', 'minmax'):
+                pipeline = A.Pipeline([A.Normalize(mode, masked=True, eps=.5, **({"nonzero": False} if mode == "zscore" else {}))],
+                                      targets={'image': A.Image(refill=False), 'padding_mask': A.ValidMask()}, backend=backend)
+                output = pipeline({'image': image, 'padding_mask': mask}, seed=0)['image']
+                np.testing.assert_array_equal(output, (image-3)/.5)
 
     def test_transforms_and_replay(self):
         rng = np.random.default_rng(124)
@@ -484,15 +531,38 @@ class PrecisionTests(unittest.TestCase):
                     plan = pipeline.sample(sample, seed=0)
                     self.assertLess(len(plan._plan.dump()), 2048)
 
-    def test_zscore_large_baseline_small_deviation(self):
-        image = np.full((1, 17, 19), 1e6, dtype=np.float32)
-        image.ravel()[::3] += .125
-        reference = image.astype(np.float64)
-        reference = (reference-reference.mean())/reference.std()
-        for backend in self.backends():
-            pipeline = A.Pipeline([A.Normalize('zscore', nonzero=False)], backend=backend)
-            result = pipeline({'image': image}, seed=0)['image']
-            np.testing.assert_allclose(result, reference, atol=2e-6, rtol=0)
+    def test_zscore_float_extremes_and_cancellation(self):
+        rng = np.random.default_rng(391)
+        inputs = [rng.normal(size=(1, 31, 33, 35)).astype(np.float32),
+                  np.full((1, 17, 19), 1e6, np.float32), np.zeros((1, 9, 13), np.float32),
+                  np.full((1, 9, 13), np.finfo(np.float32).max, np.float32),
+                  np.resize(np.array([-1, 0, 1], np.float32)*np.finfo(np.float32).max, (1, 13, 17)),
+                  np.resize(np.array([0, 1, 2], np.float32)*np.nextafter(np.float32(0), np.float32(1)), (1, 13, 17))]
+        inputs[1].ravel()[::3] += .125  # A large baseline with a small deviation.
+        for image in inputs:
+            wide = image.astype(np.float64)
+            for eps in (0., 1e-6):
+                divisor = max(wide.std(), eps)
+                expected = (wide-wide.mean())/divisor if divisor else np.zeros_like(wide)
+                for backend in self.backends():
+                    pipeline = A.Pipeline([A.Normalize('zscore', nonzero=False, eps=eps)], backend=backend)
+                    actual = pipeline({'image': image}, seed=0)['image']
+                    np.testing.assert_allclose(actual, expected, atol=2e-6, rtol=2e-6)
+        for invalid in (np.nan, np.inf, -np.inf):
+            image = np.zeros((1, 9, 13), np.float32)
+            image[0, 3, 2] = invalid
+            with self.assertRaises((ValueError, RuntimeError)):
+                A.Pipeline([A.Normalize('zscore', nonzero=False)])({'image': image}, seed=0)
+
+    @unittest.skipUnless(os.environ.get('VC_READER_LARGE_TESTS') == '1', 'requires a 2 GiB CPU array')
+    def test_zscore_large_constant(self):
+        # A nonbinary constant and odd count make rounding of an unsegmented
+        # double sum observable as a false nonzero standard deviation.
+        value = np.nextafter(np.float32(1), np.float32(0))
+        image = np.full((1, 1, (1 << 29)+35), value, np.float32)
+        pipeline = A.Pipeline([A.Normalize('zscore', nonzero=False)], backend='cpu')
+        actual = pipeline({'image': image}, seed=0, inplace=True)['image']
+        self.assertEqual(np.count_nonzero(actual), 0)
 
     def test_gamma_and_sharpen_statistics(self):
         rng = np.random.default_rng(917)

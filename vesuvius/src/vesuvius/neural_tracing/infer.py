@@ -3,9 +3,7 @@ import json
 import time
 import queue
 import threading
-import zarr
-import cupy as cp
-from cucim.skimage.measure import label as cucim_label, regionprops_table
+from vc_reader.reader import open_group
 import torch
 import accelerate
 from accelerate.utils import TorchDynamoPlugin
@@ -15,7 +13,10 @@ from concurrent.futures import ThreadPoolExecutor
 from cachetools import LRUCache
 
 from vesuvius.neural_tracing.heatmap_single_point.dataset import get_crop_from_volume, build_localiser, make_heatmaps, mark_context_point
-from vesuvius.image_proc.intensity.normalization import normalize_zscore
+import vc_reader.transforms as A
+from vc_reader.geometry import label_components
+
+_ZSCORE = A.Normalize("zscore", nonzero=False, eps=1e-8)
 from vesuvius.models.run.tta import infer_with_tta
 
 
@@ -272,10 +273,9 @@ class Inference:
         self.model.eval()
 
         print(f"loading volume zarr {volume_zarr}...")
-        ome_zarr = zarr.open_group(volume_zarr, mode='r')
+        ome_zarr = open_group(volume_zarr)
         self.volume = ome_zarr[str(volume_scale)]
-        with open(f'{volume_zarr}/meta.json', 'rt') as meta_fp:
-            self.voxel_size_um = json.load(meta_fp)['voxelsize']
+        self.voxel_size_um = ome_zarr.voxel_size
         print(f"volume shape: {self.volume.shape}, dtype: {self.volume.dtype}, voxel-size: {self.voxel_size_um * 2 ** volume_scale}um")
 
         # cache for prefetching
@@ -421,31 +421,19 @@ class Inference:
 
     def get_blob_coordinates(self, heatmap, min_corner_zyx, threshold=0.5, min_size=8, connectivity=26):
 
-        binary_gpu = cp.asarray(heatmap > threshold)
+        binary = (heatmap > threshold).contiguous()
+        labels, count = label_components(binary, connectivity=connectivity)
+        labels = torch.from_dlpack(labels) if binary.is_cuda else torch.from_numpy(labels)
 
-        # connectivity 3 for cucim label is 26-connected, 2 would be 18
-        labels_gpu = cucim_label(binary_gpu, connectivity=3)
-
-        # area + centroid
-        props = regionprops_table(labels_gpu, properties=['label', 'area', 'centroid'])
-        areas = props['area'].get() 
-
-        # find largest component and extract centroid
-        if len(areas) > 0:
-            largest_idx = np.argmax(areas)
-            largest_size = areas[largest_idx]
-
-            if largest_size >= min_size:
-                centroid = np.array([
-                    props['centroid-0'][largest_idx].get(),
-                    props['centroid-1'][largest_idx].get(),
-                    props['centroid-2'][largest_idx].get()
-                ]) + min_corner_zyx.numpy()
+        # The largest component (the first label among equals) and its centroid.
+        centroid_zyxs = np.empty((0, 3), dtype=np.float32)
+        if count:
+            areas = torch.bincount(labels.flatten(), minlength=count + 1)[1:]
+            largest = int(torch.argmax(areas))
+            if int(areas[largest]) >= min_size:
+                voxels = torch.nonzero(labels == largest + 1).double()
+                centroid = voxels.mean(dim=0).cpu().numpy() + min_corner_zyx.numpy()
                 centroid_zyxs = centroid.reshape(1, 3).astype(np.float32)
-            else:
-                centroid_zyxs = np.empty((0, 3), dtype=np.float32)
-        else:
-            centroid_zyxs = np.empty((0, 3), dtype=np.float32)
 
         return torch.from_numpy(centroid_zyxs)
 
@@ -519,7 +507,7 @@ class Inference:
                 )
 
             # Apply z-score normalization
-            volume_crop_zscore = torch.from_numpy(normalize_zscore(volume_crop_raw.numpy()))
+            volume_crop_zscore = _ZSCORE(volume_crop_raw.float().reshape(1, 1, -1)).reshape(volume_crop_raw.shape)
 
             volume_crops.append(volume_crop_zscore)
             min_corner_zyxs.append(min_corner_zyx)

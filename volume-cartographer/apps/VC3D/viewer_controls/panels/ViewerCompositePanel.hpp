@@ -60,7 +60,6 @@ public:
 private:
     void setupControls();
     void setupVolumetricControls(QVBoxLayout* layout);
-    void initializeExistingViewers();
     void applyInitialSettingsToViewer(VolumeViewerBase* viewer);
     void syncUiFromManager();
     void updateCompositeParamsVisibility();

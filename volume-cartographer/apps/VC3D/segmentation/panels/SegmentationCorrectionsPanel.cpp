@@ -72,7 +72,7 @@ void SegmentationCorrectionsPanel::setCorrectionsEnabled(bool enabled)
         return;
     }
     _correctionsEnabled = enabled;
-    writeSetting(QStringLiteral("corrections_enabled"), _correctionsEnabled);
+    writeSetting(vc3d::settings::segmentation::CORRECTIONS_ENABLED, _correctionsEnabled);
 }
 
 void SegmentationCorrectionsPanel::setCorrectionCollections(
@@ -100,11 +100,7 @@ void SegmentationCorrectionsPanel::setCorrectionCollections(
 void SegmentationCorrectionsPanel::restoreSettings(QSettings& settings)
 {
     using namespace vc3d::settings;
-    _restoringSettings = true;
-
     _correctionsEnabled = settings.value(segmentation::CORRECTIONS_ENABLED, segmentation::CORRECTIONS_ENABLED_DEFAULT).toBool();
-
-    _restoringSettings = false;
 }
 
 void SegmentationCorrectionsPanel::syncUiState(bool editingEnabled, bool growthInProgress)

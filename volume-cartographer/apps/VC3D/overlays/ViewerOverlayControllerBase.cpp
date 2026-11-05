@@ -4,6 +4,7 @@
 #include "../volume_viewers/VolumeViewerBase.hpp"
 #include "../ViewerManager.hpp"
 #include "../elements/COutlinedTextItem.hpp"
+#include "../ObjectStoreRegions.hpp"
 
 #include <QGraphicsEllipseItem>
 #include <QGraphicsPathItem>
@@ -24,7 +25,6 @@
 
 #include "vc/core/util/PlaneSurface.hpp"
 #include "vc/core/util/QuadSurface.hpp"
-#include "vc/core/util/SurfacePatchIndex.hpp"
 
 namespace
 {
@@ -59,6 +59,22 @@ bool isDisplacedBoundaryProjection(QuadSurface* surface,
 }
 
 } // namespace
+
+namespace {
+// A path item bounded by its control points and pen. QGraphicsPathItem strokes its whole
+// path to find its bounds, dash by dash, which stalls the UI for the long intersection
+// lines rebuilt while a surface is edited.
+class LongPathItem : public QGraphicsPathItem {
+public:
+    using QGraphicsPathItem::QGraphicsPathItem;
+    QRectF boundingRect() const override
+    {
+        // Twice the width covers Qt's default miter limit on the pen's half width.
+        const qreal margin = pen().style() == Qt::NoPen ? 0.0 : pen().widthF() * 2.0 + 1.0;
+        return path().controlPointRect().adjusted(-margin, -margin, margin, margin);
+    }
+};
+}
 
 ViewerOverlayControllerBase::PathPrimitive
 ViewerOverlayControllerBase::PathPrimitive::densify(float samplingInterval) const
@@ -168,26 +184,6 @@ void ViewerOverlayControllerBase::OverlayBuilder::addCircle(const QPointF& cente
     CirclePrimitive prim;
     prim.center = center;
     prim.radius = radius;
-    prim.filled = filled;
-    prim.style = style;
-    _primitives.emplace_back(std::move(prim));
-}
-
-void ViewerOverlayControllerBase::OverlayBuilder::addRotatedEllipse(const QPointF& center,
-                                                                    qreal radiusX,
-                                                                    qreal radiusY,
-                                                                    qreal rotationRadians,
-                                                                    bool filled,
-                                                                    OverlayStyle style)
-{
-    if (radiusX <= 0.0 || radiusY <= 0.0) {
-        return;
-    }
-    RotatedEllipsePrimitive prim;
-    prim.center = center;
-    prim.radiusX = radiusX;
-    prim.radiusY = radiusY;
-    prim.rotationRadians = rotationRadians;
     prim.filled = filled;
     prim.style = style;
     _primitives.emplace_back(std::move(prim));
@@ -543,7 +539,9 @@ ViewerOverlayControllerBase::filterPoints(VolumeViewerBase* viewer,
     auto* planeSurface = options.clipToSurface ? dynamic_cast<PlaneSurface*>(surface) : nullptr;
     auto* quadSurface = options.clipToSurface ? dynamic_cast<QuadSurface*>(surface) : nullptr;
     auto* viewerManager = managerForViewer(viewer);
-    auto* patchIndex = viewerManager ? viewerManager->surfacePatchIndex() : nullptr;
+    std::vector<std::optional<ViewerManager::SurfaceLocation>> onSurface;
+    if (quadSurface && viewerManager)
+        onSurface = viewerManager->locate(*quadSurface, points, options.quadDistanceTolerance);
 
     QRectF visibleRect;
     if (options.requireSceneVisibility) {
@@ -562,12 +560,8 @@ ViewerOverlayControllerBase::filterPoints(VolumeViewerBase* viewer,
             }
         }
 
-        if (keep && quadSurface) {
-            cv::Vec3f ptr(0, 0, 0);
-            float res = quadSurface->pointTo(ptr, point, options.quadDistanceTolerance, 100, patchIndex);
-            if (res > options.quadDistanceTolerance) {
-                keep = false;
-            }
+        if (keep && quadSurface && (srcIndex >= onSurface.size() || !onSurface[srcIndex])) {
+            keep = false;
         }
 
         if (keep && options.volumePredicate) {
@@ -810,22 +804,13 @@ ViewerOverlayControllerBase::projectedPointChain(VolumeViewerBase* viewer,
     }
 
     auto* viewerManager = managerForViewer(viewer);
-    auto* patchIndex = viewerManager ? viewerManager->surfacePatchIndex() : nullptr;
-    SurfacePatchIndex::SurfacePtr indexedQuad;
-    bool usePatchIndex = false;
-    if (quad && patchIndex && !patchIndex->empty() && std::isfinite(tolerance)) {
-        indexedQuad = SurfacePatchIndex::SurfacePtr(quad, [](QuadSurface*) {});
-        usePatchIndex = patchIndex->containsSurface(indexedQuad);
-    }
-    const std::uint64_t surfaceGeneration = quad && patchIndex
-        ? patchIndex->globalGeneration()
-        : 0;
     const cv::Vec3f planeOrigin = plane ? plane->origin() : cv::Vec3f{};
     const cv::Vec3f planeBasisX = plane ? plane->basisX() : cv::Vec3f{};
     const cv::Vec3f planeBasisY = plane ? plane->basisY() : cv::Vec3f{};
     // Measure distances from the depth band the viewer displays (its normal
     // offset, widened to the slab while compositing).
     const SurfaceProjectionContext projectionContext = viewer->surfaceProjectionContext();
+    const std::uint64_t surfaceGeneration = quad ? projectionContext.surfaceEditEpoch : 0;
     const float depthLo = projectionContext.depthLo;
     const float depthHi = projectionContext.depthHi;
     const bool nominalDepth = depthLo == 0.0f && depthHi == 0.0f;
@@ -863,6 +848,11 @@ ViewerOverlayControllerBase::projectedPointChain(VolumeViewerBase* viewer,
         entry.sourceIndices.reserve(points.size());
         entry.opacities.reserve(points.size());
         entry.breakDistance = polylineBreakDistance(points);
+        // Where each point lies on a quad surface (stored or a draft), in one read.
+        std::vector<std::optional<ViewerManager::SurfaceLocation>> onSurface;
+        if (quad && viewerManager && std::isfinite(tolerance))
+            onSurface = viewerManager->locate(
+                *quad, points, std::max(tolerance + std::max(std::fabs(depthLo), std::fabs(depthHi)), 1.0e-3f));
 
         auto opacityForDistance = [tolerance](float distance) {
             if (!std::isfinite(distance) || distance < 0.0f) {
@@ -889,27 +879,22 @@ ViewerOverlayControllerBase::projectedPointChain(VolumeViewerBase* viewer,
                 surfacePoint = {projected[0], projected[1]};
             } else {
                 cv::Vec3f pointer = quad->pointer();
-                if (!usePatchIndex) {
-                    // Quad-surface overlays are UI-only and always have the
-                    // maintained patch index. If its current generation does
-                    // not contain this surface, skip the point rather than
-                    // falling back to pointTo()'s tolerance-dependent random
-                    // search; the next index generation invalidates the cache.
-                    valid = false;
-                } else {
-                    SurfacePatchIndex::PointQuery query;
-                    query.worldPoint = point;
-                    query.tolerance = std::max(
-                        tolerance + std::max(std::fabs(depthLo), std::fabs(depthHi)),
-                        1.0e-3f);
-                    query.surfaces.only = indexedQuad;
-                    if (const auto hit = patchIndex->locate(query)) {
+                {
+                    if (const auto& hit = index < onSurface.size() ? onSurface[index] : std::nullopt) {
                         pointer = hit->ptr;
                         distance = hit->distance;
                         if (!nominalDepth) {
-                            const cv::Vec3f coord = quad->coord(pointer);
-                            const cv::Vec3f normal = quad->normal(pointer);
-                            if (std::isfinite(coord[0]) && std::isfinite(coord[1]) &&
+                            cv::Vec3f coord = quad->coord(pointer);
+                            cv::Vec3f normal = quad->normal(pointer);
+                            bool physical = false;
+                            const cv::Vec2d grid = quad->surfaceToGrid({double(pointer[0]) / quad->scale()[0],
+                                                                        double(pointer[1]) / quad->scale()[1]});
+                            if (viewer->framePointAt(*quad, float(grid[0]), float(grid[1]), coord.val, normal.val))
+                                physical = std::isfinite(coord[0]) && std::isfinite(normal[0]);
+                            if (physical) {
+                                const float w = (point - coord).dot(normal) / normal.dot(normal);
+                                distance = float(cv::norm(point - (coord + normal * std::clamp(w, depthLo, depthHi))));
+                            } else if (std::isfinite(coord[0]) && std::isfinite(coord[1]) &&
                                 std::isfinite(coord[2]) && std::isfinite(normal[0]) &&
                                 std::isfinite(normal[1]) && std::isfinite(normal[2])) {
                                 distance =
@@ -1154,9 +1139,16 @@ QRectF ViewerOverlayControllerBase::visibleSceneRect(VolumeViewerBase* viewer) c
     return view->mapToScene(view->viewport()->rect()).boundingRect();
 }
 
-bool ViewerOverlayControllerBase::isScenePointVisible(VolumeViewerBase* viewer, const QPointF& scenePoint) const
+std::optional<vc::fibers::ViewRegion> ViewerOverlayControllerBase::planeViewRegion(VolumeViewerBase* viewer, double halfDepth) const
 {
-    return visibleSceneRect(viewer).contains(scenePoint);
+    if (!viewer || !dynamic_cast<PlaneSurface*>(viewer->currentSurface())) return std::nullopt;
+    const auto rect = visibleSceneRect(viewer);
+    if (rect.isEmpty()) return std::nullopt;
+    const auto corner = [&](const QPointF& scene) {
+        const auto p = viewer->sceneToVolume(scene);
+        return vc::fibers::Point{p[0], p[1], p[2]};
+    };
+    return vc3d::store::viewRegion(corner(rect.topLeft()), corner(rect.topRight()), corner(rect.bottomLeft()), halfDepth);
 }
 
 Surface* ViewerOverlayControllerBase::viewerSurface(VolumeViewerBase* viewer) const
@@ -1398,22 +1390,6 @@ void ViewerOverlayControllerBase::applyPrimitives(VolumeViewerBase* viewer,
                         style.brushColor = Qt::transparent;
                     }
                     addItem(item, style);
-                } else if constexpr (std::is_same_v<T, RotatedEllipsePrimitive>) {
-                    flushPointGroups();
-                    if (prim.radiusX <= 0.0 || prim.radiusY <= 0.0) {
-                        return;
-                    }
-                    QPainterPath path;
-                    path.addEllipse(QPointF(0.0, 0.0), prim.radiusX, prim.radiusY);
-                    QTransform transform;
-                    transform.translate(prim.center.x(), prim.center.y());
-                    transform.rotateRadians(prim.rotationRadians);
-                    auto* item = new QGraphicsPathItem(transform.map(path));
-                    auto style = prim.style;
-                    if (!prim.filled) {
-                        style.brushColor = Qt::transparent;
-                    }
-                    addItem(item, style);
                 } else if constexpr (std::is_same_v<T, LineStripPrimitive>) {
                     flushPointGroups();
                     if (prim.points.size() < 2) {
@@ -1461,7 +1437,7 @@ void ViewerOverlayControllerBase::applyPrimitives(VolumeViewerBase* viewer,
                     addItem(item, style);
                 } else if constexpr (std::is_same_v<T, PainterPathPrimitive>) {
                     flushPointGroups();
-                    auto* item = new QGraphicsPathItem(prim.path);
+                    auto* item = new LongPathItem(prim.path);
                     addItem(item, prim.style);
                 } else if constexpr (std::is_same_v<T, TextPrimitive>) {
                     flushPointGroups();

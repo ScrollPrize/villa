@@ -464,8 +464,6 @@ class ConfigManager:
         self.no_spatial = bool(self.dataset_config.get("no_spatial", False))
         # Control where augmentations run; default to CPU (in Dataset workers)
         self.augment_on_device = bool(self.tr_configs.get("augment_on_device", False))
-        # Enable per-augmentation timing (disabled by default)
-        self.profile_augmentations = bool(self.tr_configs.get("profile_augmentations", False))
 
         # Normalization configuration
         self.normalization_scheme = self.dataset_config.get("normalization_scheme", "zscore")

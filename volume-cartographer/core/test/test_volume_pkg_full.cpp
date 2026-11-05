@@ -1,34 +1,27 @@
-// VolumePkg coverage with real attached resources: a local zarr volume, the
-// committed PHerc 0172 tifxyz segment fixtures, and an empty normal-grid dir.
-// Exercises addSingleVolume/Segmentation/removeSingleVolume/Segmentation,
-// reload variants, loadSurface, unloadSurface, getSurface, volume(), etc.
+// VolumePkg coverage with real attached resources: a local zarr volume
+// and an empty normal-grid dir. Exercises attachment,
+// reload variants, volume(), etc.
 
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
 #include <doctest/doctest.h>
 
 #include "vc/core/types/VolumePkg.hpp"
 #include "vc/core/types/Volume.hpp"
-#include "vc/core/types/Segmentation.hpp"
+#include <nlohmann/json.hpp>
+#include <vc_reader/zarr.hpp>
+#include <vc_reader/zarr_write.hpp>
+#include <filesystem>
+#include <fstream>
+#include "support/TestProject.hpp"
 #include "vc/core/util/RemoteUrl.hpp"
 
 #include <atomic>
-#include <filesystem>
-#include <fstream>
 #include <random>
 #include <string>
 
 namespace fs = std::filesystem;
 
 namespace {
-
-#ifndef VC_TEST_FIXTURES_DIR
-#define VC_TEST_FIXTURES_DIR "core/test/data"
-#endif
-
-fs::path fixtureSegment(const std::string& name)
-{
-    return fs::path(VC_TEST_FIXTURES_DIR) / "segments" / name;
-}
 
 fs::path tmpDir(const std::string& tag)
 {
@@ -39,25 +32,13 @@ fs::path tmpDir(const std::string& tag)
     return p;
 }
 
-struct TestAutosaveRoot {
-    TestAutosaveRoot()
-        : previous(VolumePkg::autosaveRoot())
-        , root(tmpDir("autosave_root"))
-    {
-        VolumePkg::setAutosaveRoot(root);
-    }
-
-    ~TestAutosaveRoot()
-    {
-        VolumePkg::setAutosaveRoot(previous);
-        fs::remove_all(root);
-    }
-
-    fs::path previous;
-    fs::path root;
-};
-
-TestAutosaveRoot testAutosaveRoot;
+// The project at `path`, opened in a session of its own (as another process would).
+std::shared_ptr<VolumePkg> openElsewhere(const fs::path& path, bool readOnly = false,
+                                         const vc::project::LoadOptions& opts = {})
+{
+    if (readOnly) fs::permissions(path, fs::perms::owner_read | fs::perms::group_read | fs::perms::others_read);
+    return VolumePkg::open(path, opts);
+}
 
 // Build a small local zarr volume in `root/volumes/<id>/`. Returns the
 // volume path.
@@ -65,30 +46,13 @@ fs::path makeLocalVolume(const fs::path& root,
                          const std::string& id = "vol1")
 {
     auto volDir = root / "volumes" / id;
-    Volume::ZarrCreateOptions o;
-    o.shapeZYX = {16, 16, 16};
-    o.chunkShapeZYX = {16, 16, 16};
-    o.numLevels = 1;
-    o.compressor = "none";
-    o.overwriteExisting = true;
-    o.uuid = id;
-    o.name = id;
-    auto v = Volume::New(volDir, o);
+    const std::filesystem::path volumeRoot = volDir;
+    const vcr::zarr::CreateOptions levelZero{.shape = {16, 16, 16}, .chunks = {16, 16, 16}, .compressor = "", .overwrite = true};
+    vcr::zarr::Writer::create(volumeRoot / "0", levelZero);
+    std::ofstream(volumeRoot / "meta.json") << nlohmann::json{{"type", "vol"}, {"uuid", id}, {"name", id}, {"format", "zarr"}, {"width", 16}, {"height", 16}, {"slices", 16}, {"voxelsize", 1.0}}.dump();
+    auto v = Volume::New(volumeRoot);
     REQUIRE(v);
     return volDir;
-}
-
-// Stage the committed segment fixture(s) into `root/paths/`.
-void stageSegments(const fs::path& root)
-{
-    auto paths = root / "paths";
-    fs::create_directories(paths);
-    for (const auto& name : {std::string("20241113070770"),
-                             std::string("20241113080880")}) {
-        auto src = fixtureSegment(name);
-        if (!fs::exists(src / "meta.json")) continue;
-        fs::copy(src, paths / name, fs::copy_options::recursive);
-    }
 }
 
 } // namespace
@@ -97,135 +61,12 @@ TEST_CASE("VolumePkg::addVolumeEntry auto-loads vol1 from the volumes dir")
 {
     auto d = tmpDir("addvol");
     makeLocalVolume(d);
-    auto p = VolumePkg::newEmpty();
+    auto p = vc::test::emptyProject();
     p->addVolumeEntry((d / "volumes").string());
-    // resolveVolumeEntry already loaded vol1; addSingleVolume returns false
-    // for an already-present id. Either way, vol1 must be reachable.
-    (void)p->addSingleVolume("vol1");
     auto v = p->volume("vol1");
     CHECK(v != nullptr);
     auto vDefault = p->volume();
     CHECK(vDefault != nullptr);
-    fs::remove_all(d);
-}
-
-TEST_CASE("VolumePkg::removeSingleVolume drops a volume by id")
-{
-    auto d = tmpDir("rmvol");
-    makeLocalVolume(d);
-    auto p = VolumePkg::newEmpty();
-    p->addVolumeEntry((d / "volumes").string());
-    REQUIRE(p->volume("vol1") != nullptr);
-    CHECK(p->removeSingleVolume("vol1"));
-    CHECK(p->volume("vol1") == nullptr);
-    // Second remove is a no-op.
-    CHECK_FALSE(p->removeSingleVolume("vol1"));
-    fs::remove_all(d);
-}
-
-TEST_CASE("VolumePkg::reloadSingleVolume returns true after a successful reload")
-{
-    auto d = tmpDir("reloadvol");
-    makeLocalVolume(d);
-    auto p = VolumePkg::newEmpty();
-    p->addVolumeEntry((d / "volumes").string());
-    p->addSingleVolume("vol1");
-    CHECK(p->reloadSingleVolume("vol1"));
-    CHECK_FALSE(p->reloadSingleVolume("unknown"));
-    fs::remove_all(d);
-}
-
-TEST_CASE("VolumePkg: full project with segments + reload paths")
-{
-    auto d = tmpDir("full_proj");
-    makeLocalVolume(d);
-    stageSegments(d);
-
-    auto p = VolumePkg::newEmpty();
-    p->setName("Full Project");
-    p->addVolumeEntry((d / "volumes").string());
-    p->addSegmentsEntry((d / "paths").string());
-
-    auto segIds = p->segmentationIDs();
-    if (segIds.empty()) {
-        MESSAGE("Skipping: no segment fixtures present");
-        fs::remove_all(d);
-        return;
-    }
-    const std::string id = segIds[0];
-
-    SUBCASE("segmentation()") {
-        auto s = p->segmentation(id);
-        CHECK(s != nullptr);
-    }
-    SUBCASE("addSingleSegmentation is idempotent for known id") {
-        // Already present; adding the same id returns false.
-        CHECK_FALSE(p->addSingleSegmentation(id));
-    }
-    SUBCASE("reloadSingleSegmentation succeeds for known id") {
-        CHECK(p->reloadSingleSegmentation(id));
-        CHECK_FALSE(p->reloadSingleSegmentation("__nope__"));
-    }
-    SUBCASE("loadSurface returns a QuadSurface for tifxyz segments") {
-        auto surf = p->loadSurface(id);
-        if (surf) {
-            CHECK(p->getSurface(id) != nullptr);
-            CHECK(p->unloadSurface(id));
-        }
-    }
-    SUBCASE("loadSurfacesBatch + unloadAllSurfaces") {
-        std::vector<std::string> ids = {id};
-        p->loadSurfacesBatch(ids);
-        p->unloadAllSurfaces();
-        CHECK(p->getSurface(id) == nullptr);
-    }
-    SUBCASE("removeSingleSegmentation") {
-        CHECK(p->removeSingleSegmentation(id));
-        CHECK(p->segmentation(id) == nullptr);
-        CHECK_FALSE(p->removeSingleSegmentation(id));
-    }
-    SUBCASE("removeSegmentation by id") {
-        p->removeSegmentation(id);
-        CHECK(p->segmentation(id) == nullptr);
-    }
-
-    fs::remove_all(d);
-}
-
-TEST_CASE("VolumePkg::setSegmentationDirectory changes which subdir is scanned")
-{
-    auto d = tmpDir("seg_dir");
-    auto p = VolumePkg::newEmpty();
-    // Just exercise the call path; it triggers a refresh.
-    p->setSegmentationDirectory("paths");
-    p->setSegmentationDirectory("");
-    CHECK(true);
-}
-
-TEST_CASE("VolumePkg::setSegmentsChangedCallback fires on segment list changes")
-{
-    auto d = tmpDir("cb");
-    stageSegments(d);
-    auto p = VolumePkg::newEmpty();
-    std::atomic<int> fired{0};
-    p->setSegmentsChangedCallback([&]() { ++fired; });
-    p->addSegmentsEntry((d / "paths").string());
-    // At least one fire when entries scan finishes.
-    CHECK(fired.load() >= 0); // not pinning a count — callback semantics vary
-    // Unset the callback to verify the empty-fn path.
-    p->setSegmentsChangedCallback({});
-    fs::remove_all(d);
-}
-
-TEST_CASE("VolumePkg::addVolume directly inserts a constructed Volume")
-{
-    auto d = tmpDir("addvol_direct");
-    auto volDir = makeLocalVolume(d);
-    auto v = Volume::New(volDir);
-    REQUIRE(v);
-    auto p = VolumePkg::newEmpty();
-    CHECK(p->addVolume(v));
-    CHECK(p->volume(v->id()) != nullptr);
     fs::remove_all(d);
 }
 
@@ -235,10 +76,9 @@ TEST_CASE("VolumePkg::attachPreparedVolume persists one loaded entry idempotentl
     const auto firstPath = makeLocalVolume(d, "vol1");
     const auto secondRoot = d / "second";
     const auto secondPath = makeLocalVolume(secondRoot, "vol1");
-    const auto project = d / "project.volpkg.json";
+    const auto store = vc::test::createTestProject(d / "project.vcobj");
 
-    auto package = VolumePkg::newEmpty();
-    package->save(project);
+    auto package = store.open();
     auto first = Volume::New(firstPath);
     REQUIRE(first);
     CHECK(
@@ -268,9 +108,9 @@ TEST_CASE("VolumePkg::attachPreparedVolume persists one loaded entry idempotentl
 
     vc::project::LoadOptions deferred;
     deferred.deferResolution = true;
-    auto reloaded = VolumePkg::load(project, deferred);
+    auto reloaded = store.open(deferred);
     REQUIRE(reloaded->volumeEntries().size() == 1);
-    CHECK(reloaded->volumeEntries().front().location == firstPath.string());
+    CHECK(vc::project::resolveLocalPath(reloaded->volumeEntries().front().location, reloaded->directory()) == firstPath);
     CHECK(reloaded->volumeEntries().front().tags ==
           std::vector<std::string>{"overlay"});
     fs::remove_all(d);
@@ -280,16 +120,14 @@ TEST_CASE("VolumePkg::attachPreparedVolume recognizes a loaded relative entry")
 {
     auto d = tmpDir("attach_relative");
     const auto volumePath = makeLocalVolume(d, "vol1");
-    const auto project = d / "project.volpkg.json";
+    const auto store = vc::test::createTestProject(d / "project.vcobj");
 
     vc::project::LoadOptions deferred;
     deferred.deferResolution = true;
-    auto detached = VolumePkg::newDetached(deferred);
-    REQUIRE(detached->addVolumeEntry("volumes/vol1", {"original"}));
-    detached->save(project);
+    REQUIRE(store.open(deferred)->addVolumeEntry("volumes/vol1", {"original"}));
 
-    const auto relativeProject = fs::relative(project, fs::current_path());
-    auto package = VolumePkg::load(relativeProject);
+    // Relative entries resolve against the project's directory.
+    auto package = openElsewhere(fs::relative(store.path, fs::current_path()));
     auto prepared = Volume::New(volumePath);
     REQUIRE(prepared);
     CHECK(
@@ -324,13 +162,11 @@ TEST_CASE("VolumePkg::attachPreparedVolume sees through a directory symlink")
 {
     auto d = tmpDir("attach_symlink");
     const auto volumePath = makeLocalVolume(d, "vol1");
-    const auto project = d / "project.volpkg.json";
+    const auto store = vc::test::createTestProject(d / "project.vcobj");
 
     vc::project::LoadOptions deferred;
     deferred.deferResolution = true;
-    auto detached = VolumePkg::newDetached(deferred);
-    REQUIRE(detached->addVolumeEntry("volumes/vol1", {"original"}));
-    detached->save(project);
+    REQUIRE(store.open(deferred)->addVolumeEntry("volumes/vol1", {"original"}));
 
     const auto alias = aliasFor(d);
     if (alias.empty()) {
@@ -339,7 +175,7 @@ TEST_CASE("VolumePkg::attachPreparedVolume sees through a directory symlink")
     }
 
     // Package opened through the alias, volume attached through the real path.
-    auto package = VolumePkg::load(alias / "project.volpkg.json");
+    auto package = openElsewhere(alias / "project.vcproj");
     auto prepared = Volume::New(volumePath);
     REQUIRE(prepared);
     CHECK(
@@ -356,14 +192,12 @@ TEST_CASE("VolumePkg::attachPreparedVolume matches a container entry through a s
 {
     auto d = tmpDir("attach_container_symlink");
     const auto volumePath = makeLocalVolume(d, "vol1");
-    const auto project = d / "project.volpkg.json";
+    const auto store = vc::test::createTestProject(d / "project.vcobj");
 
     vc::project::LoadOptions deferred;
     deferred.deferResolution = true;
-    auto detached = VolumePkg::newDetached(deferred);
     // "volumes" is a collection entry: it holds zarr volumes but is not one.
-    REQUIRE(detached->addVolumeEntry("volumes", {"collection"}));
-    detached->save(project);
+    REQUIRE(store.open(deferred)->addVolumeEntry("volumes", {"collection"}));
 
     const auto alias = aliasFor(d);
     if (alias.empty()) {
@@ -371,7 +205,7 @@ TEST_CASE("VolumePkg::attachPreparedVolume matches a container entry through a s
         return;
     }
 
-    auto package = VolumePkg::load(alias / "project.volpkg.json");
+    auto package = openElsewhere(alias / "project.vcproj");
     auto prepared = Volume::New(volumePath);
     REQUIRE(prepared);
     CHECK(
@@ -388,13 +222,9 @@ TEST_CASE("VolumePkg::attachPreparedVolume persists a directly loaded volume")
 {
     auto d = tmpDir("attach_loaded_only");
     const auto volumePath = makeLocalVolume(d, "vol1");
-    const auto project = d / "project.volpkg.json";
-
-    auto package = VolumePkg::newEmpty();
-    package->save(project);
+    auto package = vc::test::emptyProject();
     auto prepared = Volume::New(volumePath);
     REQUIRE(prepared);
-    REQUIRE(package->addVolume(prepared));
 
     CHECK(
         package->attachPreparedVolume(
@@ -414,10 +244,7 @@ TEST_CASE("VolumePkg does not treat a direct Zarr as a collection entry")
     const auto stagedChild = makeLocalVolume(d / "staging", "child");
     const auto childPath = parentPath / "child";
     fs::rename(stagedChild, childPath);
-    const auto project = d / "project.volpkg.json";
-
-    auto package = VolumePkg::newEmpty();
-    package->save(project);
+    auto package = vc::test::emptyProject();
     REQUIRE(package->addVolumeEntry(parentPath.string()));
     CHECK_FALSE(package->matchingVolumeEntry(childPath.string()));
 
@@ -430,11 +257,11 @@ TEST_CASE("VolumePkg does not treat a direct Zarr as a collection entry")
     fs::remove_all(d);
 }
 
-TEST_CASE("VolumePkg matches legacy remote entries by resolved identity")
+TEST_CASE("VolumePkg matches older remote entries by resolved identity")
 {
     vc::project::LoadOptions deferred;
     deferred.deferResolution = true;
-    auto package = VolumePkg::newDetached(deferred);
+    auto package = vc::test::emptyProject(deferred);
     const std::string legacy = "s3://example-bucket/path/volume.zarr";
     REQUIRE(package->addVolumeEntry(
         legacy, {"vc-open-data-voxel-size-um:7.91"}));
@@ -447,83 +274,43 @@ TEST_CASE("VolumePkg matches legacy remote entries by resolved identity")
           std::vector<std::string>{"vc-open-data-voxel-size-um:7.91"});
 }
 
-TEST_CASE("VolumePkg::attachPreparedVolume restores autosave after write failure")
+TEST_CASE("VolumePkg::attachPreparedVolume leaves the project as it was when the write fails")
 {
     auto d = tmpDir("attach_rollback");
     const auto volumePath = makeLocalVolume(d, "vol1");
-    const auto project = d / "project.volpkg.json";
+    const auto store = vc::test::createTestProject(d / "project.vcobj");
 
-    auto package = VolumePkg::newEmpty();
-    package->save(project);
-    fs::remove(project);
-    fs::create_directory(project);
-
+    auto package = openElsewhere(store.path, /*readOnly=*/true);
     auto prepared = Volume::New(volumePath);
     REQUIRE(prepared);
     CHECK_THROWS(
         package->attachPreparedVolume(volumePath.string(), {}, prepared));
     CHECK(package->volumeEntries().empty());
     CHECK(package->volume("vol1") == nullptr);
-
-    vc::project::LoadOptions deferred;
-    deferred.deferResolution = true;
-    auto autosave = VolumePkg::load(VolumePkg::autosaveFile(), deferred);
-    CHECK(autosave->volumeEntries().empty());
+    CHECK(store.open()->volumeEntries().empty());
 
     fs::remove_all(d);
 }
 
-TEST_CASE("Volume entry tags produce remote-volume metadata")
+TEST_CASE("A catalog gives remote entries their catalog volume identity at every level")
 {
-    const auto metadata = vc::project::volumeMetadataFromEntryTags({
-        "vc-open-data-voxel-size-um:7.91",
-        "vc-open-data-name:Overlay",
-    });
-    CHECK(metadata.at("voxelsize").get_double() == doctest::Approx(7.91));
-    CHECK(metadata.at("name").get_string() == "Overlay");
+    const auto catalog = vcr::catalog::parseOpenDataManifest(R"({"samples": {"s": {
+      "volumes": {"vol": {"id": "vol", "suffix": "scan.zarr", "properties": {"pixel_size_um": 2.5},
+        "data": [
+          {"type": "zarr", "origins": [{"path": "s/vol.zarr", "access_roots": [
+            {"type": "https", "url": "https://example.test/", "usage": "public-read"}]}]},
+          {"type": "surface-prediction-zarr", "parameters": {"level": 1}, "origins": [{"path": "s/pred.zarr",
+            "access_roots": [{"type": "https", "url": "https://example.test/", "usage": "public-read"}]}]}]}}}}})");
+    const auto source = vc::project::catalogVolumeMetadata(&catalog, "https://example.test/s/vol.zarr");
+    CHECK(source.at("uuid").get<std::string>() == "vol");
+    CHECK_FALSE(source.contains("voxelsize"));  // the store's metadata decides, the catalog only fills gaps
+    const auto level = vc::project::catalogVolumeMetadata(&catalog, "https://example.test/s/vol.zarr#vc-base-scale=2");
+    CHECK(level.at("uuid").get<std::string>() == "vol");
+    CHECK(level.at("name").get<std::string>() == "scan.zarr [L2]");
+    const auto prediction = vc::project::catalogVolumeMetadata(&catalog, "https://example.test/s/pred.zarr");
+    CHECK_FALSE(prediction.contains("uuid"));
+    CHECK(prediction.at("name").get<std::string>() == "surface-prediction-zarr of scan.zarr [L1]");
+    CHECK(vc::project::catalogVolumeMetadata(&catalog, "https://example.test/elsewhere.zarr").empty());
+    CHECK(vc::project::catalogVolumeMetadata(nullptr, "https://example.test/s/vol.zarr").empty());
 }
 
-TEST_CASE("Only native catalog source entries use the catalog volume ID")
-{
-    const std::string catalogTag = "vc-open-data-volume-id:20260102150214";
-    const auto source = vc::project::volumeMetadataFromEntryTags({
-        catalogTag, "vc-open-data-preferred-source",
-        "vc-open-data-source-coordinate-level:0",
-    });
-    CHECK(source.at("uuid").get_string() == "20260102150214");
-    for (const auto& tags : std::vector<std::vector<std::string>>{
-             {}, {catalogTag}, {"vc-open-data-preferred-source"},
-             {"vc-open-data-preferred-source", "vc-open-data-volume-id:"},
-             {catalogTag, "prediction", "vc-open-data-source-coordinate-level:0"},
-             {catalogTag, "vc-open-data-virtual-source", "vc-open-data-source-coordinate-level:2"}}) {
-        CHECK_FALSE(vc::project::volumeMetadataFromEntryTags(tags).contains("uuid"));
-    }
-}
-
-TEST_CASE("Local volume entries take the catalog volume ID from their tags")
-{
-    auto d = tmpDir("localcatalogid");
-    makeLocalVolume(d);
-    auto p = VolumePkg::newEmpty();
-    p->addVolumeEntry((d / "volumes").string(),
-                      {"vc-open-data-volume-id:20251211183505",
-                       "vc-open-data-preferred-source"});
-    CHECK(p->volume("vol1") == nullptr);
-    auto v = p->volume("20251211183505");
-    REQUIRE(v != nullptr);
-    CHECK(v->name() == "vol1");
-    // The identity survives a reload from disk.
-    CHECK(p->reloadSingleVolume("20251211183505"));
-    CHECK(p->volume("20251211183505") != nullptr);
-    CHECK(p->volume("vol1") == nullptr);
-    fs::remove_all(d);
-}
-
-TEST_CASE("VolumePkg::setOutputSegments / clearOutputSegments toggle")
-{
-    auto p = VolumePkg::newEmpty();
-    p->addSegmentsEntry("/some/path");
-    p->setOutputSegments("/some/path");
-    p->clearOutputSegments();
-    CHECK(true);
-}

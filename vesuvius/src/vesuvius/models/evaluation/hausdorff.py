@@ -1,7 +1,9 @@
 import torch
 import numpy as np
 from typing import Dict
-from scipy.ndimage import distance_transform_edt
+import vc_reader.transforms as A
+
+_OUTSIDE_DISTANCE = A.DistanceTransform(mode="outside", implicit_background=True)
 from .base_metric import BaseMetric
 
 
@@ -111,8 +113,8 @@ def compute_hausdorff_distance(pred: torch.Tensor,
                 continue
             
             # Compute distance transforms
-            pred_dist = distance_transform_edt(~pred_mask)
-            gt_dist = distance_transform_edt(~gt_mask)
+            pred_dist = _OUTSIDE_DISTANCE(pred_mask[None])[0]
+            gt_dist = _OUTSIDE_DISTANCE(gt_mask[None])[0]
             
             # Get distances from pred to gt
             pred_to_gt_distances = pred_dist[gt_mask]

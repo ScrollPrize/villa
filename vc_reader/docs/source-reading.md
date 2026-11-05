@@ -6,11 +6,10 @@ TIFF, and explicitly ordered stacks of 2D files. It exposes `shape`, `dtype`,
 `stats()`, and `close()`. The source descriptor stays immutable.
 
 Zarr sources use the existing C++ reader, authentication, memory cache,
-chunk planning, disk cache, prefetch support, and worker lifecycle. Remote image
-files use that same HTTP/S3 transport and directory budget. No installation
-occurs at runtime. Image decoders come from the optional `labels` extra
-(NumPy, Pillow, tifffile); local image reads do not load the compiled extension,
-PyTorch, or CUDA. Unsupported TIFF compression identifies the required codec.
+chunk planning, disk cache, and worker lifecycle. Remote image
+files use that same HTTP/S3 transport and directory budget. Decoding uses libtiff,
+libpng and libjpeg, in the native library; a TIFF compression this libtiff lacks is
+named in the error. The reader is `vcr::sources::SourceReader` for C++ callers.
 
 ```python
 from vc_reader import Encoding, Source, Storage
@@ -42,6 +41,16 @@ An explicit `same_grid` binding checks spatial shape and available transforms
 before inheriting the parent's placement. Changing a parent selection does not
 silently change independently declared companion selections: declare matching
 companion grids when choosing a different pyramid level.
+
+## Plain image files
+
+`vc_reader.images` needs no descriptor. `read(path)` is the whole file, `read(path, page=0)` one
+page, `open(path)` a `SourceReader` for windows; they take the first series and level and name a page
+stack's axes `z, y, x`. `memmap(path)` maps a local uncompressed single-page TIFF, or with `shape` and
+`dtype` creates one of zeros and maps it. `write_tiff(path, image, compression=, tile=)` writes
+atomically (none, lzw, deflate, packbits, zstd; a third axis of more than 4 is pages), and
+`TiffWriter(path, shape, dtype, tile=, compression=)` writes one too large to hold, tile by tile.
+They are `vcr::sources::imageSource`, `readImage`, `readImagePage`, `tiffMapping`, `writeTiff`, `TiffWriter` in C++.
 
 ## Values and selection
 
@@ -129,6 +138,14 @@ placement. Explicit array placement keeps its crop origin and does not acquire
 an extra scale on the same grid. Corresponding-level requests require one exact
 resolution match, including a published cross-volume transform when applicable.
 
+Pyramid levels are block-reduced unless their metadata says otherwise: a level
+that declares a scale but no translation is centred `(s - s0) / 2` beyond the
+finest dataset's origin, because every Open Data CT pyramid is a 2x2x2 mean (level
+L voxel `j` covers level-0 voxels `2^L j .. 2^L (j+1) - 1`). A declared translation
+is honoured. Catalog and TIFF level fallbacks without transformations use
+`Affine.block_reduced(2**level)`. Native `vcr::zarr::Group::placement` and
+`OpenedArray::placement` apply the same rule for C++ consumers.
+
 Small affine compositions use the existing Python floating-point matrices.
 The regression with origin `2**26 + .25` demonstrates why float32 would lose a
 required subvoxel origin. Label IDs and shard offsets use exact integers; no
@@ -136,22 +153,27 @@ bulk float64 coordinate arrays are introduced.
 
 ## Bounded I/O, decoding, and workers
 
-Remote images stream into seekable disk files. The default encoded-file payload
-budget is 1 GiB. `cache_max_bytes` configures the shared directory budget for
-both image files and decoded Zarr chunks; omitting it reuses a previously set
-limit. Existing Zarr-only defaults are preserved. SQLite coordinates atomic
-publication and eviction across processes. Temporary materialization without
-a writable cache also has a finite budget. An image larger than the limit raises
-with instructions to increase it. Metadata/index files and filesystem overhead
+Remote images stream into seekable disk files. A cache directory's budget is
+unlimited until someone sets a limit, and only a limit evicts anything.
+`cache_max_bytes` configures the shared directory budget for both image files
+and decoded Zarr chunks; omitting it reuses a previously set limit, and
+`2**63 - 1` lifts one. SQLite coordinates atomic publication and eviction across
+processes. Temporary materialization without a writable cache is bounded at
+1 GiB unless `cache_max_bytes` says otherwise. An image larger than the limit
+raises with instructions to increase it. Metadata/index files and filesystem overhead
 are separate from the payload budget.
 
 Different image files download concurrently when the budget has room for their
-in-flight reservations. Responses without a usable Content-Length reserve the
-whole budget. Reducing the limit below active reservations raises; retry after
+in-flight reservations. Responses without a usable Content-Length reserve as
+their bytes arrive, evicting only what that takes, and download one at a time on
+a limited budget; an unlimited budget reserves nothing. Reducing the limit below active reservations raises; retry after
 the downloads finish. Interrupted workers' reservations are reclaimed using
 file locks, without removing live workers' temporary files.
 
-ETag/Last-Modified revalidation occurs once per image location and reader/process.
+A remote image file is cached at its URL's bucket path
+(`<cache_dir>/<scheme>/<host or bucket>/<path>`, the decoded-chunk layout), so
+mirrors laid out by bucket path are read in place. Cached files are trusted like
+chunks and never revalidated; files found in place are used but not evicted.
 Decoded keys include content identity. Repeated reads use pinned file handles
 and avoid rehashing unchanged content. `offline=True` serves cached files/chunks
 or raises `CacheMissError`; it does not fetch credentials for image-cache hits.
@@ -182,14 +204,18 @@ preserves explicitly shared cache ownership.
 ## Zarr v3 support
 
 The shared `ZarrReader` and `ZarrGroup` support v2 and the v3 layouts used by the
-published ink labels: regular grids, default/v2 chunk keys, bytes serialization,
-optional Blosc or Zstd compression, and `sharding_indexed`. Unsupported codec
+published ink labels and CT exports: regular grids, default/v2 chunk keys, bytes
+serialization, optional Blosc, Zstd, gzip, zlib (`numcodecs.zlib`), LZ4
+(`numcodecs.lz4`) or volcomp compression, and `sharding_indexed`. Zarr v2
+arrays additionally accept LZW and vc-delta3d compressors. volcomp chunks are 128³ uint8. Unsupported codec
 pipelines/storage transformers fail explicitly. Shard indexes support
 little-endian bytes with optional CRC32C and either index location, following the
 [Zarr sharding specification](https://zarr-specs.readthedocs.io/en/latest/v3/codecs/sharding-indexed/index.html).
 
 Only the index and requested compressed inner chunks are fetched. HTTP ranges
 are validated; ignored ranges are rejected before accepting a whole-shard body.
+Over `sftp://` the same byte ranges are read from the file; its modification
+time and size stand in for the ETag.
 A strong ETag binds payload ranges to the index version. Missing inner chunks
 retain the normal fill/cache behavior. Decoded inner chunks use the existing
 v2 disk-cache representation, including offline reads and shared budgets.

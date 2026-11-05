@@ -1,6 +1,7 @@
 #pragma once
 #include "reader.hpp"
-#include "../cuda_event.hpp"
+#include "../cuda_available.hpp"
+#include "../cuda_stream.hpp"
 #include <nanobind/stl/array.h>
 #include <nanobind/stl/optional.h>
 namespace vcr::reader_cuda {
@@ -29,12 +30,15 @@ inline nb::object outputs(Result result, int device) {
 inline void bind(nb::module_& m) {
     using Host=nb::ndarray<nb::ro,nb::c_contig,nb::device::cpu>;
     using Device=nb::ndarray<nb::array_api,nb::c_contig,nb::device::cuda>;
-    m.def("reader_cuda_available",[] { int n=0; return cudaGetDeviceCount(&n)==cudaSuccess && n>0; });
+    m.def("reader_cuda_available",&vcr::cuda::available);
     nb::class_<Owned>(m,"CudaStorage")
         .def("array",[](nb::handle self) { return nb::cast<const Owned&>(self).array(self); })
         .def("export",[](Owned& o) { o.storage->exported=true; });
-    m.def("_set_stream",[](std::uintptr_t handle) { device::current_stream()=handle ? device::stream_handle(handle) : nullptr; });
+    m.def("_set_stream",[](std::uintptr_t handle) { device::current_stream()=handle ? device::stream_handle(handle) : cudaStreamPerThread; });
     m.def("_get_stream",[] { return reinterpret_cast<std::uintptr_t>(device::current_stream()); });
+    m.def("_dlpack_stream",[] { return device::dlpack_handle(); });
+    m.def("_set_pool_release_threshold",[](int id,std::uint64_t bytes) { device::set_pool_release_threshold(id,bytes); });
+    m.def("_pool_release_threshold",[](int id) { device::prepare_pool(id); return device::pool_release_threshold(id); });
     m.def("_cuda_empty",[](std::size_t count,const std::string& kind,std::size_t item,int id) {
         if (count>SIZE_MAX/8 || (kind!="f" && kind!="i" && kind!="u" && kind!="b") ||
             (item!=1 && item!=2 && item!=4 && item!=8) || (kind=="b" && item!=1) || (kind=="f" && item<2))
@@ -46,12 +50,6 @@ inline void bind(nb::module_& m) {
           storage=device::allocate(count*item,id); device::complete(); }
         return owned(std::move(storage),count,{std::uint8_t(code),std::uint8_t(item*8),1},id);
     });
-    nb::class_<device::Event>(m,"CudaEvent")
-        .def("synchronize",&device::Event::synchronize,nb::call_guard<nb::gil_scoped_release>())
-        .def("wait",&device::Event::wait)
-        .def("done",&device::Event::done);
-    m.def("_record_event",[] { return std::make_shared<device::Event>(); });
-    nb::class_<PointPlan>(m,"CudaPointPlan");
     m.def("_cuda_view",[](Device input,const std::vector<std::size_t>& shape,std::size_t offset) {
         std::size_t n=1; for (auto s:shape) { if (s && n>SIZE_MAX/s) throw nb::value_error("shape overflow"); n*=s; }
         if (offset>input.size() || n>input.size()-offset) throw nb::value_error("view exceeds storage");
@@ -107,22 +105,17 @@ inline void bind(nb::module_& m) {
         for (std::size_t i=0;i<grids.size();++i) { auto& g=grids[i]; std::copy_n(shapes[i].begin(),3,g.shape); std::copy_n(bases[i].begin(),3,g.base); std::copy_n(origins[i].begin(),3,g.origin); std::copy_n(axes[i].begin(),9,g.axes); }
         return grids;
     };
+    nb::class_<Pool>(m,"CudaPool","A device brick cache that several CUDA readers share (one budget, one LRU order).")
+        .def("__init__",[](Pool* self,std::size_t budget,int device) { new (self) Pool(budget,device); },"budget"_a,"device"_a=0)
+        .def_prop_ro("budget",&Pool::budget)
+        .def_prop_ro("device",&Pool::device)
+        .def_prop_ro("slot_bytes",&Pool::slot_bytes)
+        .def_prop_ro("resident_bytes",&Pool::resident_bytes);
     nb::class_<Reader>(m,"CudaReader")
         .def(nb::init<Array&,std::size_t,int>(),nb::keep_alive<1,2>())
+        .def(nb::init<Array&,std::shared_ptr<Pool>>(),nb::keep_alive<1,2>())
         .def("clear",&Reader::clear,nb::call_guard<nb::gil_scoped_release>())
         .def("stats",&Reader::stats,nb::call_guard<nb::gil_scoped_release>())
-        .def("read_plan",[](Reader& r,const PointPlan& plan,const std::string& source,bool valid) {
-            Result result; { nb::gil_scoped_release release; result=r.read_plan(plan,source,valid); }
-            return outputs(std::move(result),r.device_id());
-        },"plan"_a,"source"_a,"valid"_a=false)
-        .def("prepare_points",[](Reader& r,Host points,const Index& base,int kind,int order) {
-            const auto dtype=points.dtype();
-            if (points.ndim()!=2 || points.shape(1)!=3 || dtype.lanes!=1 ||
-                (kind==2 ? (dtype.code!=std::uint8_t(nb::dlpack::dtype_code::Float) || (dtype.bits!=32 && dtype.bits!=64)) :
-                           (dtype.code!=std::uint8_t(nb::dlpack::dtype_code::Int) || (dtype.bits!=32 && dtype.bits!=64)))) throw nb::value_error("invalid point array");
-            nb::gil_scoped_release release;
-            return r.prepare_points(points.data(),points.shape(0),dtype.bits,base,kind,order);
-        },nb::keep_alive<0,1>())
         .def("grids",[](Reader& r,const std::vector<std::array<std::int64_t,3>>& shapes,
             const std::vector<std::array<std::int64_t,3>>& bases,const std::vector<std::array<float,3>>& origins,
             const std::vector<std::array<float,9>>& axes,int kind,int order,bool floating,const std::string& route,bool valid,nb::object out) -> nb::object {

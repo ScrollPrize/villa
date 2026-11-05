@@ -419,3 +419,7 @@
   and 10 TiB / 10,000-tile defaults without changing the normal prefetch path.
 - Made live progress cadence independent of TTY detection and report unique
   remote-missing chunks per listed Z plane.
+
+## 2026-11-02
+
+Use vc_reader sampling for coordinate and augmentation maps with its default numeric and boundary policies. Centralize selected winding sampling, CT rendering, and label transfer, and remove obsolete I/O tools.

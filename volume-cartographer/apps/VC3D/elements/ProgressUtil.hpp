@@ -21,7 +21,6 @@ public:
         Percent,
         Fraction,
         DoneRemaining,
-        Custom,
         None
     };
 
@@ -29,7 +28,6 @@ public:
         ProgressTextMode textMode = ProgressTextMode::Percent;
         QString prefix;
         QString suffix;
-        QString customFormat; // Supports {value}, {total}, {remaining}, {percent}
         int percentPrecision = 0;
         int fontPointSize = -1;
     };
@@ -83,9 +81,6 @@ public:
      */
     void stopProgress(bool resetValue = true);
 
-    bool isProgressActive() const { return _progressActive; }
-    int progressTotal() const { return _progressTotal; }
-    int progressValue() const { return _progressValue; }
 
 private slots:
     void updateAnimation();

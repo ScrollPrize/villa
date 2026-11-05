@@ -1,6 +1,10 @@
 #include "formats/GeometryOutput.hpp"
 #include "formats/TrackInput.hpp"
 #include "vc_object_store/Tiff.hpp"
+#include "vc_object_store/geometry/Geometry.hpp"
+#include "geometry/ArrayLayout.hpp"
+#include <algorithm>
+#include <bit>
 #include <fstream>
 #include <climits>
 #include <set>
@@ -59,19 +63,33 @@ void collection(const Snapshot& s, Json attributes, const fs::path& path)
     attributes["points"] = std::move(points);
     writeJson(path, {{"vc_pointcollections_json_version", "1"}, {"collections", {{collectionId, attributes}}}});
 }
-void patch(const Snapshot& s, Json attributes, const fs::path& path)
+void umbilicus(const Snapshot& s, Json attributes, const fs::path& path)
+{
+    const auto xyz = s.values<double>("points");
+    auto points = Json::array();
+    for (size_t i = 0; i < xyz.size(); i += 3) points.push_back({{"x", xyz[i]}, {"y", xyz[i+1]}, {"z", xyz[i+2]}});
+    attributes["uuid"] = s.revision.objectUuid;
+    attributes["vc_umbilicus_json_version"] = "1";
+    attributes["points"] = std::move(points);
+    writeJson(path, attributes);
+}
+void surface(const Snapshot& s, Json attributes, const fs::path& path, bool validOnly)
 {
     const auto descriptor = std::find_if(s.revision.arrays.begin(), s.revision.arrays.end(), [](const auto& a) { return a.name == "points"; });
     const auto& shape = descriptor->shape;
     if (shape[0] <= 0 || shape[1] <= 0 || shape[0] > INT_MAX || shape[1] > INT_MAX)
-        throw std::runtime_error("native patch export requires nonempty dimensions within int32 range");
-    const auto xyz = s.values<float>("points");
+        throw std::runtime_error("native surface export requires nonempty dimensions within int32 range");
+    auto xyz = s.values<float>("points");
+    if (validOnly && s.arrays.contains(detail::surfaceValidChannel)) {
+        const auto& valid = s.arrays.at(detail::surfaceValidChannel);
+        for (size_t v = 0; v < valid.size(); ++v)
+            if (!valid[v]) std::fill_n(xyz.begin() + std::ptrdiff_t(3 * v), 3, -1.f);
+    }
     std::array<float, 3> low{-1,-1,-1}, high = low;
     bool any = false;
     for (size_t i = 0; i < xyz.size(); i += 3) {
-        if (xyz[i+2] <= 0) {
-            if (xyz[i] != -1 || xyz[i+1] != -1 || xyz[i+2] != -1)
-                throw std::runtime_error("patch points with z <= 0 must use the (-1,-1,-1) invalid sentinel");
+        if (!vc::geometry::validSurfacePoint({xyz[i], xyz[i+1], xyz[i+2]})) {
+            std::fill_n(xyz.begin() + std::ptrdiff_t(i), 3, -1.f);
             continue;
         }
         for (int a = 0; a < 3; ++a) {
@@ -85,6 +103,32 @@ void patch(const Snapshot& s, Json attributes, const fs::path& path)
         for (size_t i = 0; i < plane.total(); ++i) plane.ptr<float>()[i] = xyz[3*i+axis];
         const auto file = path / (std::string(1, "xyz"[axis]) + ".tif");
         writeTiff(file, plane);
+        if (!isReadableTiff(file)) throw std::runtime_error("failed to write complete TIFF: " + file.string());
+    }
+    // Channels keep their exact samples; validity is VC's mask.tif (255 valid).
+    for (const auto& array : s.revision.arrays) {
+        if (array.name == "points") continue;
+        auto bytes = s.arrays.at(array.name);
+        if (array.name == detail::surfaceValidChannel) {
+            if (validOnly) continue;
+            for (auto& value : bytes) value = value ? 255 : 0;
+            writeTiffSamples(path / "mask.tif", {uint32_t(shape[1]), uint32_t(shape[0]), 8, SAMPLEFORMAT_UINT, 1, std::move(bytes)});
+            continue;
+        }
+        if (array.shape[0] <= 0 || array.shape[1] <= 0 || array.shape[0] > INT_MAX || array.shape[1] > INT_MAX)
+            throw std::runtime_error("native surface export requires channels within int32 range: " + array.name);
+        TiffSamples samples{uint32_t(array.shape[1]), uint32_t(array.shape[0]), 0, 0,
+            uint16_t(array.shape.size() == 3 ? array.shape[2] : 1), {}};
+        const auto& dtype = array.dtype;
+        samples.bits = uint16_t(8 * detail::geometryByteLength(dtype, {1}));
+        samples.sampleFormat = dtype == "<f4" || dtype == "<f8" ? SAMPLEFORMAT_IEEEFP
+            : dtype == "<i4" || dtype == "<i8" ? SAMPLEFORMAT_INT : SAMPLEFORMAT_UINT;
+        if constexpr (std::endian::native != std::endian::little)
+            for (size_t i = 0; i < bytes.size(); i += samples.bits / 8)
+                std::reverse(bytes.begin() + i, bytes.begin() + i + samples.bits / 8);
+        samples.bytes = std::move(bytes);
+        const auto file = path / (array.name + ".tif");
+        writeTiffSamples(file, samples);
         if (!isReadableTiff(file)) throw std::runtime_error("failed to write complete TIFF: " + file.string());
     }
     attributes["uuid"] = s.revision.objectUuid;

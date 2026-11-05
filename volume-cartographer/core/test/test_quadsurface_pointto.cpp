@@ -100,3 +100,26 @@ TEST_CASE("Free pointTo (Vec3d points overload)")
     float d = ::pointTo(loc, pts, target, 0.5f, 200, 1.0f);
     CHECK(d >= 0.0f);
 }
+
+TEST_CASE("Free pointTo rejects grids without a complete patch")
+{
+    cv::Vec2f loc(0, 0);
+    const cv::Vec3f target(0, 0, 0);
+    CHECK(::pointTo(loc, cv::Mat_<cv::Vec3f>(), target, .5f, 1, 1.f) == -1.f);
+    CHECK(::pointTo(loc, makePlanarGrid(1, 4), target, .5f, 1, 1.f) == -1.f);
+}
+
+TEST_CASE("pointTo and coord use the same curved surface interpolation")
+{
+    auto pts = makePlanarGrid(16, 16);
+    for (int r = 0; r < pts.rows; ++r)
+        for (int c = 0; c < pts.cols; ++c)
+            pts(r, c)[2] = float(c*c + r*r);
+    QuadSurface surface(pts, cv::Vec2f(1, 1));
+    cv::Vec3f ptr(.3f, -.4f, 0);
+    const cv::Vec3f target = surface.coord(ptr);
+    const float distance = surface.pointTo(ptr, target, .001f, 1);
+    CHECK(distance >= 0);
+    CHECK(distance < .001f);
+    CHECK(cv::norm(surface.coord(ptr) - target) < .001f);
+}

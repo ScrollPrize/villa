@@ -27,30 +27,6 @@ int main() try {
         require(fiberBatchEndpoints({decodeFiberJson(linked.dump()), decodeFiberJson(back.dump())}).empty(),
                 "links within the batch need no pins");
     }
-    {
-        auto legacy = root; legacy["version"] = 2;
-        mustFail([&] { decodeFiberJson(legacy.dump()); });
-    }
-    {
-        // Version 1: bare XYZ control points, and no optimization_mode (VC3D read it as lasagna).
-        auto version1 = root; version1["version"] = 1;
-        version1["control_points"] = {{1.25,2,3},{5.25,2,3}};
-        const auto fromVersion1 = decodeFiberJson(version1.dump());
-        require(fromVersion1.object.formatVersion == 4 && fromVersion1.object.fiber->controlPointCount == 2 &&
-                fromVersion1.object.fiber->length == 4 && fromVersion1.object.fiber->optimizationMode == "lasagna",
-                "version 1 control arrays and default optimization mode become version 4");
-    }
-    auto version3 = root; version3["version"] = 3;
-    version3["vc_open_data_coordinate_space"] = "PHercParis4/20260411134726@L0";
-    version3["vc_open_data_source_coordinate_scale_factor"] = 1;
-    version3["vc_open_data_source_path"] = "https://example.invalid/volume.zarr";
-    const auto fromVersion3 = decodeFiberJson(version3.dump());
-    require(fromVersion3.source["coordinates"] == Json({{"volume_uuid","20260411134726"},{"scale_factor",1}}) &&
-            !fromVersion3.source.contains("vc_open_data_source_path") && fromVersion3.object.formatVersion == 4,
-            "version 3 level-0 coordinate space becomes the volume binding");
-    version3["vc_open_data_coordinate_space"] = "PHercParis4/20260411134726@L2";
-    version3["vc_open_data_source_coordinate_scale_factor"] = 4;
-    mustFail([&] { decodeFiberJson(version3.dump()); });
     auto versionless = root; versionless.erase("version");
     mustFail([&] { decodeFiberJson(versionless.dump()); });
     auto oldControls = root; oldControls["control_points"] = {{1.25,2,3},{5.25,2,3}};

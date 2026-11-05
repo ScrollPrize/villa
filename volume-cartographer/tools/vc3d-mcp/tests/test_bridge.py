@@ -50,10 +50,7 @@ from vc3d_mcp.tools.session import (
 )
 from vc3d_mcp.tools.segmentation import (
     vc3d_activate_segment,
-    vc3d_attach_segments,
-    vc3d_create_editable_segment_copy,
     vc3d_delete_segment,
-    vc3d_fetch_segment,
     vc3d_grow_segment,
     vc3d_rename_segment,
     vc3d_save_segment,
@@ -235,16 +232,6 @@ class ToolLayerTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["kind"], "lasagna.optimize")
         self.assertNotIn("state", result)
 
-    async def test_vc3d_lasagna_start_optimization_forwards_init_shell_dir(self) -> None:
-        await vc3d_lasagna_start_optimization(
-            mode="new_model",
-            init_shell_dir="/service/pherc0332/init_shells",
-        )
-        self.assertEqual(
-            self.fake_server.received_requests[-1]["params"]["initShellDir"],
-            "/service/pherc0332/init_shells",
-        )
-
     async def test_vc3d_lasagna_start_optimization_wait_returns_terminal_status(self) -> None:
         result = await vc3d_lasagna_start_optimization(mode="reoptimize", wait=True)
         self.assertEqual(result["jobId"], "job-2")
@@ -252,72 +239,15 @@ class ToolLayerTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["kind"], "lasagna.optimize")
         self.assertIn("consoleTail", result)
 
-    async def test_vc3d_fetch_segment_already_materialized_is_synchronous(self) -> None:
-        result = await vc3d_fetch_segment("seg-ready")
-        self.assertTrue(result["fetched"])
-        self.assertTrue(result["alreadyMaterialized"])
-        self.assertNotIn("jobId", result)
-
-    async def test_vc3d_fetch_segment_placeholder_waits_for_job(self) -> None:
-        result = await vc3d_fetch_segment("seg-ph", wait=True)
-        self.assertEqual(result["jobId"], "job-3")
-        self.assertEqual(result["state"], "succeeded")
-
-    async def test_vc3d_fetch_segment_placeholder_no_wait_returns_job_id(self) -> None:
-        result = await vc3d_fetch_segment("seg-ph", wait=False)
-        self.assertEqual(result["jobId"], "job-3")
-        self.assertNotIn("state", result)
-
-    async def test_vc3d_attach_segments_strips_absent_tags(self) -> None:
-        result = await vc3d_attach_segments("/tmp/my-segments")
-        self.assertTrue(result["attached"])
-        self.assertEqual(
-            self.fake_server.received_requests[-1]["params"],
-            {"location": "/tmp/my-segments", "select": True},
-        )
-
-    async def test_vc3d_attach_segments_forwards_tags(self) -> None:
-        await vc3d_attach_segments(
-            "/tmp/my-segments",
-            tags=["source:manual", "status:working"],
-        )
-        self.assertEqual(
-            self.fake_server.received_requests[-1]["params"],
-            {
-                "location": "/tmp/my-segments",
-                "tags": ["source:manual", "status:working"],
-                "select": True,
-            },
-        )
-
-    async def test_vc3d_attach_segments_can_preserve_current_source(self) -> None:
-        result = await vc3d_attach_segments(
-            "/tmp/my-segments",
-            select=False,
-        )
-        self.assertFalse(result["selected"])
-        self.assertEqual(
-            self.fake_server.received_requests[-1]["params"],
-            {"location": "/tmp/my-segments", "select": False},
-        )
-
     async def test_vc3d_activate_segment_plain_success(self) -> None:
         result = await vc3d_activate_segment("seg-ready")
         self.assertTrue(result["activated"])
-        self.assertNotIn("fetched", result)
+        self.assertEqual(self.fake_server.received_requests[-1]["params"], {"segmentId": "seg-ready"})
 
-    async def test_vc3d_activate_segment_auto_fetches_placeholder(self) -> None:
-        # seg-ph refuses activation until fetched; auto_fetch (default) should
-        # fetch then retry, yielding activated + fetched.
-        result = await vc3d_activate_segment("seg-ph")
-        self.assertTrue(result["activated"])
-        self.assertTrue(result["fetched"])
-
-    async def test_vc3d_activate_segment_no_auto_fetch_raises_placeholder(self) -> None:
+    async def test_vc3d_activate_segment_unknown_raises(self) -> None:
         with self.assertRaises(BridgeError) as ctx:
-            await vc3d_activate_segment("seg-ph", auto_fetch=False)
-        self.assertEqual(ctx.exception.code, -32005)
-        self.assertIn("placeholder", str(ctx.exception).lower())
+            await vc3d_activate_segment("missing")
+        self.assertEqual(ctx.exception.code, -32007)
 
     async def test_vc3d_rotate_viewer_relative_default_accumulates(self) -> None:
         first = await vc3d_rotate_viewer("seg yz", 30.0)
@@ -431,8 +361,9 @@ class ToolLayerTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             result,
             {
-                "path": "/tmp/new-project.volpkg.json",
+                "path": "/tmp/new-project.vcproj",
                 "name": "new-project",
+                "store": "/tmp/new-project.vcobj",
                 "volume": "/tmp/volume",
             },
         )
@@ -447,26 +378,28 @@ class ToolLayerTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_vc3d_create_project_forwards_optional_values(self) -> None:
         await vc3d_create_project(
-            "/tmp/new-project.volpkg.json",
+            "/tmp/new-project.vcproj",
             "https://example.test/volume.zarr",
             name="Example",
             tags=["source:test"],
             overwrite=True,
+            store="/tmp/existing.vcobj",
         )
         self.assertEqual(
             self.fake_server.received_requests[-1]["params"],
             {
-                "path": "/tmp/new-project.volpkg.json",
+                "path": "/tmp/new-project.vcproj",
                 "volume": "https://example.test/volume.zarr",
                 "name": "Example",
                 "tags": ["source:test"],
                 "overwrite": True,
+                "store": "/tmp/existing.vcobj",
             },
         )
 
     async def test_vc3d_create_project_derives_name_case_insensitively(self) -> None:
         result = await vc3d_create_project(
-            "/tmp/Upper.VOLPKG.JSON",
+            "/tmp/Upper.VCPROJ",
             "/tmp/volume",
         )
         self.assertEqual(result["name"], "Upper")
@@ -483,13 +416,6 @@ class ToolLayerTest(unittest.IsolatedAsyncioTestCase):
         sent = self.fake_server.received_requests[-1]["params"]
         self.assertEqual(sent, {"segmentId": "seg-ready", "confirm": True})
 
-    async def test_vc3d_create_editable_segment_copy_forwards_segment_id(self) -> None:
-        result = await vc3d_create_editable_segment_copy("seg-catalog")
-        self.assertEqual(result["segmentId"], "seg-catalog")
-        self.assertTrue(result["activated"])
-        sent = self.fake_server.received_requests[-1]["params"]
-        self.assertEqual(sent, {"segmentId": "seg-catalog"})
-
     async def test_vc3d_delete_segment_default_confirm_false_is_forwarded_and_refused(self) -> None:
         # confirm defaults to False and IS forwarded (the bridge enforces the
         # guard); the fake refuses it with -32602.
@@ -501,8 +427,8 @@ class ToolLayerTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_vc3d_rename_segment_forwards_new_name(self) -> None:
         result = await vc3d_rename_segment("seg-ready", "seg_renamed")
-        self.assertEqual(result["oldId"], "seg-ready")
-        self.assertEqual(result["newId"], "seg_renamed")
+        self.assertEqual(result["id"], "seg-ready")
+        self.assertEqual(result["name"], "seg_renamed")
         sent = self.fake_server.received_requests[-1]["params"]
         self.assertEqual(sent, {"segmentId": "seg-ready", "newName": "seg_renamed"})
 

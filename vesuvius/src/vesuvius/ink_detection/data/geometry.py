@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
-import cc3d
 import numpy as np
 from numba import njit
 from scipy import ndimage
-from scipy.ndimage import distance_transform_edt
+
+import vc_reader.transforms as A
+from vc_reader.geometry import label_components
+
+_OUTSIDE_DISTANCE = A.DistanceTransform(mode="outside", implicit_background=True)
 
 
 NATIVE_COARSE_PAD_LEVEL0_VOXELS = 20.0
@@ -16,7 +19,9 @@ SURFACE_MASK_MAX_DISTANCE_LEVEL0_VOXELS = 10.0
 # are -t(1-t)^2/2 and -t^2(1-t)/2, which sum to t(1-t)/2 <= 1/8, so in 2D the
 # negative weights sum to at most 1/8 + 1/8 + 2/64. An interpolated coordinate
 # therefore lies within this fraction of the 16 points' range of their extremes.
-CATMULL_ROM_NEGATIVE_WEIGHT = 0.28125
+# One-sided derivatives at borders and holes (vc_reader's smooth patches) are at
+# most twice as large, so the bound doubles.
+SMOOTH_PATCH_NEGATIVE_WEIGHT = 0.5625
 
 
 def native_volume_downsample_factor(resolution: int) -> int:
@@ -41,6 +46,28 @@ def native_tifxyz_pyramid_params(resolution: int) -> tuple[int, float, int]:
     return factor, 1.0 / float(factor), pad
 
 
+def _flat_raster(patch_tifxyz, y0: int, y1: int, x0: int, x1: int, stride: int):
+    """Stored-grid origin, step and size of the full-resolution samples y0:y1:stride, x0:x1:stride."""
+    scale_y, scale_x = patch_tifxyz.scale
+    size = ((int(y1) - int(y0) + stride - 1) // stride, (int(x1) - int(x0) + stride - 1) // stride)
+    return (int(y0) * scale_y, int(x0) * scale_x), (stride * scale_y, stride * scale_x), size
+
+
+def _flat_positions(patch_tifxyz, y0: int, y1: int, x0: int, x1: int, stride: int):
+    """ZYX positions (-1 where missing) and validity of those full-resolution samples."""
+    origin, step, size = _flat_raster(patch_tifxyz, y0, y1, x0, x1, stride)
+    xyz, valid = patch_tifxyz.resample(origin, step, size, interpolation="smooth")
+    return np.where(valid[..., None], xyz[..., ::-1], -1.0).astype(np.float32), valid
+
+
+def read_normals_on_flat_grid(patch_tifxyz, *, y0: int, y1: int, x0: int, x1: int, flat_grid_stride: int = 1) -> np.ndarray:
+    """ZYX unit normals (row direction x column direction, NaN off the surface) of flat-grid points y0:y1, x0:x1."""
+    stride = int(flat_grid_stride)
+    origin, step, size = _flat_raster(patch_tifxyz, int(y0) * stride, int(y1) * stride, int(x0) * stride, int(x1) * stride, stride)
+    _, _, normals = patch_tifxyz.resample(origin, step, size, interpolation="smooth", normals=True)
+    return -normals[..., ::-1]
+
+
 def read_tifxyz_on_flat_grid(
     patch_tifxyz,
     *,
@@ -58,16 +85,10 @@ def read_tifxyz_on_flat_grid(
     scale = float(native_coordinate_scale)
     if scale <= 0.0:
         raise ValueError(f"native_coordinate_scale must be positive, got {scale!r}")
-    full_x, full_y, full_z, valid = patch_tifxyz[
-        slice(int(y0) * stride, int(y1) * stride, stride),
-        slice(int(x0) * stride, int(x1) * stride, stride),
-    ]
-    positions_zyx = np.stack([full_z, full_y, full_x], axis=-1).astype(
-        np.float32, copy=False
-    )
+    positions_zyx, valid = _flat_positions(patch_tifxyz, int(y0) * stride, int(y1) * stride, int(x0) * stride, int(x1) * stride, stride)
     if scale != 1.0:
         positions_zyx = positions_zyx * scale
-    return positions_zyx, np.asarray(valid, dtype=bool)
+    return positions_zyx, valid
 
 
 def compute_native_crop_bbox(
@@ -247,7 +268,7 @@ def _stored_resolution_bounds(
             return None
         (coarse_y0, coarse_y1, coarse_x0, coarse_x1), _, _ = selection
         stored_h, stored_w = (int(value) for value in coarse_positions_zyx.shape[:2])
-    full_h, full_w = (int(value) for value in patch_tifxyz.full_resolution_shape)
+    full_h, full_w = patch_tifxyz.full_shape
     if stored_h <= 0 or stored_w <= 0:
         raise ValueError(
             "stored-resolution tifxyz grid must have positive shape, "
@@ -278,17 +299,11 @@ def _read_flat_window(
     """Native positions and validity of the flat-grid points inside `bounds`."""
     y0, y1, x0, x1 = bounds
     stride = int(flat_grid_stride)
-    full_x, full_y, full_z, full_valid = patch_tifxyz[
-        slice(y0, y1, stride),
-        slice(x0, x1, stride),
-    ]
-    positions_zyx = np.stack([full_z, full_y, full_x], axis=-1).astype(
-        np.float32, copy=False
-    )
+    positions_zyx, full_valid = _flat_positions(patch_tifxyz, y0, y1, x0, x1, stride)
     scale = float(native_coordinate_scale)
     if scale != 1.0:
         positions_zyx *= scale
-    return positions_zyx, np.asarray(full_valid, dtype=bool)
+    return positions_zyx, full_valid
 
 
 def _stored_resolution_window(
@@ -376,30 +391,12 @@ def select_flat_pixels_via_stored_resolution(
     return support_bbox, support, support_valid
 
 
-def catmull_rom_vertex_mask(patch_tifxyz) -> np.ndarray | None:
-    """Stored-grid validity behind `patch_tifxyz`'s full-resolution positions.
-
-    Returns None unless those positions come from Tifxyz's Catmull-Rom
-    interpolation, the case `select_flat_pixel_bands_via_stored_resolution`
-    can bound.
-    """
-    if (
-        getattr(patch_tifxyz, "interp_method", None) != "catmull_rom"
-        or getattr(patch_tifxyz, "resolution", None) != "full"
-    ):
-        return None
-    return np.asarray(patch_tifxyz.valid_vertex_mask, dtype=bool)
-
-
 def _stored_cells(patch_tifxyz, start: int, stop: int, step: int, axis: int):
     """Stored-grid cell of each sampled full-resolution row or column.
 
-    Uses the float32 arithmetic of `Tifxyz.__getitem__`; a point in cell `c`
-    is interpolated from stored rows or columns `c - 1` to `c + 2`.
+    A point in cell `c` is interpolated from stored rows or columns `c - 1` to `c + 2`.
     """
-    stored = np.arange(start, stop, step).astype(np.float32)
-    stored = stored * patch_tifxyz.get_scale_tuple()[axis]
-    return np.asarray(stored, dtype=np.float32).astype(np.int64)
+    return (np.arange(start, stop, step) * patch_tifxyz.scale[axis]).astype(np.float32).astype(np.int64)
 
 
 def _reduce_4x4(values: np.ndarray, reduce) -> np.ndarray:
@@ -456,25 +453,26 @@ def _band_bounds(
     row0, row1 = int(rows[0]), int(min(rows[-1], height - 1)) + 1
     column0, column1 = int(columns[0]), int(min(columns[-1], width - 1)) + 1
     # A cell's points come from the 4x4 stored points around it, clamped to the
-    # grid, and are valid only when all 16 are.
+    # grid, and are valid only when its 4 corners are.
     near_rows = np.clip(np.arange(row0 - 1, row1 + 2), 0, height - 1)[:, None]
     near_columns = np.clip(np.arange(column0 - 1, column1 + 2), 0, width - 1)[None, :]
     controls = coarse_positions_zyx[near_rows, near_columns]
     lower = _reduce_4x4(controls, np.minimum).astype(np.float64)
     upper = _reduce_4x4(controls, np.maximum).astype(np.float64)
-    usable = _reduce_4x4(vertex_mask[near_rows, near_columns], np.logical_and)
+    corners = vertex_mask[near_rows, near_columns][1:-1, 1:-1]
+    usable = corners[:-1, :-1] & corners[1:, :-1] & corners[:-1, 1:] & corners[1:, 1:]
     scale = float(native_coordinate_scale)
     with np.errstate(invalid="ignore"):
         # One voxel on top of the bound covers float32 rounding of the result;
         # non-finite control points leave the cell unbounded.
-        margin = (upper - lower) * CATMULL_ROM_NEGATIVE_WEIGHT + 1.0
+        margin = (upper - lower) * SMOOTH_PATCH_NEGATIVE_WEIGHT + 1.0
         lower = np.where(np.isnan(margin), -np.inf, (lower - margin) * scale)
         upper = np.where(np.isnan(margin), np.inf, (upper + margin) * scale)
     candidate = usable & (upper >= np.asarray(crop_bbox_zyx[:3])).all(axis=-1)
     candidate &= (lower < np.asarray(crop_bbox_zyx[3:])).all(axis=-1)
     if not np.any(candidate):
         return []
-    labels, _ = ndimage.label(candidate, structure=np.ones((3, 3), dtype=np.uint8))
+    labels, _ = label_components(candidate, connectivity=8, threads=1)
     parts = []
     for cells in ndimage.find_objects(labels):
         band_rows = np.searchsorted(rows, (row0 + cells[0].start, row0 + cells[0].stop))
@@ -510,8 +508,8 @@ def select_flat_pixel_bands_via_stored_resolution(
     """`select_flat_pixels_via_stored_resolution`, as separate bands.
 
     A crop that meets several windings of a segment refines a window spanning
-    all of them, mostly points far from the crop. Given `vertex_mask` from
-    `catmull_rom_vertex_mask`, only the stored cells of that window whose
+    all of them, mostly points far from the crop. Given `vertex_mask`, the surface's
+    `valid`, only the stored cells of that window whose
     interpolated points can land in the crop are refined, in disjoint bands.
     Returns `(support_bbox, positions, valid)` per band, each cropped to its
     in-crop points; together they hold exactly the in-crop points of the whole
@@ -684,330 +682,13 @@ def project_surface_distance(
         squared = _local_squared_distance(occupancy, offsets, _UNREACHED)
         distance = np.full(occupancy.shape, np.inf)
         reached = squared != _UNREACHED
-        distance[reached] = np.sqrt(squared[reached].astype(np.float64))
+        # float32 distances, as the full transform below returns.
+        distance[reached] = np.sqrt(squared[reached].astype(np.float64)).astype(np.float32)
     else:
-        distance = distance_transform_edt(~occupancy)
+        distance = _OUTSIDE_DISTANCE(occupancy[None])[0].astype(np.float64)
     return np.clip(1.0 - distance / max_distance_voxels, 0.0, 1.0).astype(
         np.float32, copy=False
     )
-
-
-@njit(cache=True)
-def _mark(output, z, y, x, z0, y0, x0):
-    local_z = int(z) - z0
-    local_y = int(y) - y0
-    local_x = int(x) - x0
-    if (
-        local_z >= 0
-        and local_z < output.shape[0]
-        and local_y >= 0
-        and local_y < output.shape[1]
-        and local_x >= 0
-        and local_x < output.shape[2]
-    ):
-        output[local_z, local_y, local_x] = 1
-
-
-@njit(cache=True)
-def _draw_line(output, start, stop, z0, y0, x0):
-    delta_z = stop[0] - start[0]
-    delta_y = stop[1] - start[1]
-    delta_x = stop[2] - start[2]
-    steps = int(np.ceil(max(abs(delta_z), abs(delta_y), abs(delta_x))))
-    if steps <= 0:
-        _mark(output, start[0], start[1], start[2], z0, y0, x0)
-        return
-
-    inverse_steps = 1.0 / float(steps)
-    for step in range(steps + 1):
-        value = float(step) * inverse_steps
-        _mark(
-            output,
-            start[0] + delta_z * value,
-            start[1] + delta_y * value,
-            start[2] + delta_x * value,
-            z0,
-            y0,
-            x0,
-        )
-
-
-@njit(cache=True)
-def _chebyshev_distance(start, stop):
-    distance = abs(stop[0] - start[0])
-    delta = abs(stop[1] - start[1])
-    if delta > distance:
-        distance = delta
-    delta = abs(stop[2] - start[2])
-    if delta > distance:
-        distance = delta
-    return distance
-
-
-@njit(cache=True)
-def _dense_steps(distance):
-    steps = int(np.ceil(float(distance) * 2.0))
-    if steps < 1:
-        return 1
-    return steps
-
-
-@njit(cache=True)
-def _draw_bilinear(output, p00, p01, p10, p11, z0, y0, x0):
-    row_distance = _chebyshev_distance(p00, p10)
-    distance = _chebyshev_distance(p01, p11)
-    if distance > row_distance:
-        row_distance = distance
-    column_distance = _chebyshev_distance(p00, p01)
-    distance = _chebyshev_distance(p10, p11)
-    if distance > column_distance:
-        column_distance = distance
-    row_steps = _dense_steps(row_distance)
-    column_steps = _dense_steps(column_distance)
-    inverse_row_steps = 1.0 / float(row_steps)
-    inverse_column_steps = 1.0 / float(column_steps)
-    for row_step in range(row_steps + 1):
-        row_t = float(row_step) * inverse_row_steps
-        inverse_row = 1.0 - row_t
-        left_z = p00[0] * inverse_row + p10[0] * row_t
-        left_y = p00[1] * inverse_row + p10[1] * row_t
-        left_x = p00[2] * inverse_row + p10[2] * row_t
-        right_z = p01[0] * inverse_row + p11[0] * row_t
-        right_y = p01[1] * inverse_row + p11[1] * row_t
-        right_x = p01[2] * inverse_row + p11[2] * row_t
-        for column_step in range(column_steps + 1):
-            column_t = float(column_step) * inverse_column_steps
-            inverse_column = 1.0 - column_t
-            _mark(
-                output,
-                left_z * inverse_column + right_z * column_t,
-                left_y * inverse_column + right_y * column_t,
-                left_x * inverse_column + right_x * column_t,
-                z0,
-                y0,
-                x0,
-            )
-
-
-@njit(cache=True)
-def _draw_trilinear(
-    output,
-    lower_p00,
-    lower_p01,
-    lower_p10,
-    lower_p11,
-    upper_p00,
-    upper_p01,
-    upper_p10,
-    upper_p11,
-    z0,
-    y0,
-    x0,
-):
-    offset_distance = _chebyshev_distance(lower_p00, upper_p00)
-    distance = _chebyshev_distance(lower_p01, upper_p01)
-    if distance > offset_distance:
-        offset_distance = distance
-    distance = _chebyshev_distance(lower_p10, upper_p10)
-    if distance > offset_distance:
-        offset_distance = distance
-    distance = _chebyshev_distance(lower_p11, upper_p11)
-    if distance > offset_distance:
-        offset_distance = distance
-
-    row_distance = _chebyshev_distance(lower_p00, lower_p10)
-    distance = _chebyshev_distance(lower_p01, lower_p11)
-    if distance > row_distance:
-        row_distance = distance
-    distance = _chebyshev_distance(upper_p00, upper_p10)
-    if distance > row_distance:
-        row_distance = distance
-    distance = _chebyshev_distance(upper_p01, upper_p11)
-    if distance > row_distance:
-        row_distance = distance
-
-    column_distance = _chebyshev_distance(lower_p00, lower_p01)
-    distance = _chebyshev_distance(lower_p10, lower_p11)
-    if distance > column_distance:
-        column_distance = distance
-    distance = _chebyshev_distance(upper_p00, upper_p01)
-    if distance > column_distance:
-        column_distance = distance
-    distance = _chebyshev_distance(upper_p10, upper_p11)
-    if distance > column_distance:
-        column_distance = distance
-
-    offset_steps = _dense_steps(offset_distance)
-    row_steps = _dense_steps(row_distance)
-    column_steps = _dense_steps(column_distance)
-    inverse_offset_steps = 1.0 / float(offset_steps)
-    inverse_row_steps = 1.0 / float(row_steps)
-    inverse_column_steps = 1.0 / float(column_steps)
-    for offset_step in range(offset_steps + 1):
-        offset_t = float(offset_step) * inverse_offset_steps
-        inverse_offset = 1.0 - offset_t
-        p00_z = lower_p00[0] * inverse_offset + upper_p00[0] * offset_t
-        p00_y = lower_p00[1] * inverse_offset + upper_p00[1] * offset_t
-        p00_x = lower_p00[2] * inverse_offset + upper_p00[2] * offset_t
-        p01_z = lower_p01[0] * inverse_offset + upper_p01[0] * offset_t
-        p01_y = lower_p01[1] * inverse_offset + upper_p01[1] * offset_t
-        p01_x = lower_p01[2] * inverse_offset + upper_p01[2] * offset_t
-        p10_z = lower_p10[0] * inverse_offset + upper_p10[0] * offset_t
-        p10_y = lower_p10[1] * inverse_offset + upper_p10[1] * offset_t
-        p10_x = lower_p10[2] * inverse_offset + upper_p10[2] * offset_t
-        p11_z = lower_p11[0] * inverse_offset + upper_p11[0] * offset_t
-        p11_y = lower_p11[1] * inverse_offset + upper_p11[1] * offset_t
-        p11_x = lower_p11[2] * inverse_offset + upper_p11[2] * offset_t
-        for row_step in range(row_steps + 1):
-            row_t = float(row_step) * inverse_row_steps
-            inverse_row = 1.0 - row_t
-            left_z = p00_z * inverse_row + p10_z * row_t
-            left_y = p00_y * inverse_row + p10_y * row_t
-            left_x = p00_x * inverse_row + p10_x * row_t
-            right_z = p01_z * inverse_row + p11_z * row_t
-            right_y = p01_y * inverse_row + p11_y * row_t
-            right_x = p01_x * inverse_row + p11_x * row_t
-            for column_step in range(column_steps + 1):
-                column_t = float(column_step) * inverse_column_steps
-                inverse_column = 1.0 - column_t
-                _mark(
-                    output,
-                    left_z * inverse_column + right_z * column_t,
-                    left_y * inverse_column + right_y * column_t,
-                    left_x * inverse_column + right_x * column_t,
-                    z0,
-                    y0,
-                    x0,
-                )
-
-
-@njit(cache=True)
-def _offset_position(positions, normals, row, column, offset, output_position):
-    point_z = positions[row, column, 0]
-    point_y = positions[row, column, 1]
-    point_x = positions[row, column, 2]
-    normal_z = normals[row, column, 0]
-    normal_y = normals[row, column, 1]
-    normal_x = normals[row, column, 2]
-    if (
-        not np.isfinite(point_z)
-        or not np.isfinite(point_y)
-        or not np.isfinite(point_x)
-        or not np.isfinite(normal_z)
-        or not np.isfinite(normal_y)
-        or not np.isfinite(normal_x)
-    ):
-        return False
-
-    magnitude = np.sqrt(
-        normal_z * normal_z
-        + normal_y * normal_y
-        + normal_x * normal_x
-    )
-    if magnitude <= 1e-6:
-        return False
-
-    inverse_magnitude = 1.0 / magnitude
-    output_position[0] = point_z + offset * normal_z * inverse_magnitude
-    output_position[1] = point_y + offset * normal_y * inverse_magnitude
-    output_position[2] = point_x + offset * normal_x * inverse_magnitude
-    return True
-
-
-@njit(cache=True)
-def _project_mask_along_normals(
-    mask, positions, normals, valid, crop_start, output, half_thickness
-):
-    z0 = int(crop_start[0])
-    y0 = int(crop_start[1])
-    x0 = int(crop_start[2])
-    radius = int(np.ceil(half_thickness))
-    current = np.empty((3,), dtype=np.float32)
-    previous = np.empty((3,), dtype=np.float32)
-    right = np.empty((3,), dtype=np.float32)
-    down = np.empty((3,), dtype=np.float32)
-    diagonal = np.empty((3,), dtype=np.float32)
-    previous_right = np.empty((3,), dtype=np.float32)
-    previous_down = np.empty((3,), dtype=np.float32)
-    previous_diagonal = np.empty((3,), dtype=np.float32)
-    for row in range(mask.shape[0]):
-        for column in range(mask.shape[1]):
-            if mask[row, column] == 0 or not valid[row, column]:
-                continue
-            has_previous = False
-            has_previous_cell = False
-            for step in range(-radius, radius + 1):
-                if abs(step) > half_thickness + 1e-6:
-                    continue
-                if not _offset_position(positions, normals, row, column, float(step), current):
-                    break
-                _mark(output, current[0], current[1], current[2], z0, y0, x0)
-                if has_previous:
-                    _draw_line(output, previous, current, z0, y0, x0)
-                right_ok = (
-                    column + 1 < mask.shape[1]
-                    and mask[row, column + 1] != 0
-                    and valid[row, column + 1]
-                    and _offset_position(positions, normals, row, column + 1, float(step), right)
-                )
-                if right_ok:
-                    _draw_line(output, current, right, z0, y0, x0)
-                down_ok = (
-                    row + 1 < mask.shape[0]
-                    and mask[row + 1, column] != 0
-                    and valid[row + 1, column]
-                    and _offset_position(positions, normals, row + 1, column, float(step), down)
-                )
-                if down_ok:
-                    _draw_line(output, current, down, z0, y0, x0)
-                diagonal_ok = (
-                    row + 1 < mask.shape[0]
-                    and column + 1 < mask.shape[1]
-                    and mask[row + 1, column + 1] != 0
-                    and valid[row + 1, column + 1]
-                    and _offset_position(
-                        positions,
-                        normals,
-                        row + 1,
-                        column + 1,
-                        float(step),
-                        diagonal,
-                    )
-                )
-                cell_ok = right_ok and down_ok and diagonal_ok
-                if cell_ok:
-                    _draw_bilinear(
-                        output,
-                        current,
-                        right,
-                        down,
-                        diagonal,
-                        z0,
-                        y0,
-                        x0,
-                    )
-                    if has_previous_cell:
-                        _draw_trilinear(
-                            output,
-                            previous,
-                            previous_right,
-                            previous_down,
-                            previous_diagonal,
-                            current,
-                            right,
-                            down,
-                            diagonal,
-                            z0,
-                            y0,
-                            x0,
-                        )
-                previous[:] = current
-                if cell_ok:
-                    previous_right[:] = right
-                    previous_down[:] = down
-                    previous_diagonal[:] = diagonal
-                has_previous = True
-                has_previous_cell = cell_ok
 
 
 def project_binary_mask_along_normals(
@@ -1023,12 +704,10 @@ def project_binary_mask_along_normals(
     if half_thickness_voxels < 0.0:
         raise ValueError("half_thickness_voxels must be >= 0")
     flat_mask = (np.asarray(flat_mask) > 0).astype(np.uint8, copy=False)
-    if half_thickness_voxels <= 0.0:
-        return project_flat_patch(
-            flat_mask, positions_zyx, valid_mask, crop_bbox_zyx
-        ) > 0
     if normals_zyx is None:
-        raise ValueError("normals_zyx is required when projecting with thickness")
+        if half_thickness_voxels > 0.0:
+            raise ValueError("normals_zyx is required when projecting with thickness")
+        normals_zyx = np.zeros_like(positions_zyx, dtype=np.float32)
     positions_zyx = np.asarray(positions_zyx, dtype=np.float32)
     normals_zyx = np.asarray(normals_zyx, dtype=np.float32)
     valid_mask = np.asarray(valid_mask, dtype=np.bool_)
@@ -1048,17 +727,10 @@ def project_binary_mask_along_normals(
             f"got flat_mask={flat_mask.shape!r}, valid_mask={valid_mask.shape!r}"
         )
     z0, y0, x0, z1, y1, x1 = crop_bbox_zyx
-    output = np.zeros((z1 - z0, y1 - y0, x1 - x0), dtype=np.uint8)
-    _project_mask_along_normals(
-        np.ascontiguousarray(flat_mask),
-        np.ascontiguousarray(positions_zyx),
-        np.ascontiguousarray(normals_zyx),
-        np.ascontiguousarray(valid_mask),
-        np.asarray((z0, y0, x0), dtype=np.int64),
-        output,
-        float(half_thickness_voxels),
-    )
-    return output > 0
+    from vc_reader.resident import project_mask
+    return project_mask(flat_mask, positions_zyx, normals_zyx, valid_mask,
+                        (z0, y0, x0), (z1-z0, y1-y0, x1-x0),
+                        half_thickness=half_thickness_voxels) > 0
 
 
 def project_labels_and_supervision(
@@ -1167,9 +839,7 @@ def filter_support_bands(
     ) > 0
     if not np.any(occupancy):
         return support_bbox, valid
-    components = cc3d.connected_components(
-        occupancy.astype(np.uint8, copy=False), connectivity=26
-    )
+    components, _ = label_components(occupancy, connectivity=26, threads=1)
     supervised = np.concatenate(
         [(np.asarray(flat) > 0)[mask] for flat, mask in zip(supervision_flat, valid)]
     )
@@ -1246,15 +916,13 @@ def filter_support_bands(
                 )
                 for masks in (filtered, seeds)
             )
-            flat_components, _ = ndimage.label(
-                group_filtered, structure=np.ones((3, 3), dtype=np.uint8)
-            )
+            flat_components, _ = label_components(group_filtered, connectivity=8, threads=1)
             flat_component_ids = np.unique(flat_components[group_seed])
             group_filtered = np.isin(
                 flat_components, flat_component_ids[flat_component_ids > 0]
             )
             if max_supervision_grid_distance is not None and np.any(group_seed):
-                group_filtered &= distance_transform_edt(~group_seed) <= max_distance
+                group_filtered &= _OUTSIDE_DISTANCE(group_seed[None])[0] <= max_distance
             for index, (y0, y1, x0, x1) in zip(group, group_boxes):
                 filtered[index] = filtered[index] & group_filtered[
                     y0 - group_bbox[0] : y1 - group_bbox[0],

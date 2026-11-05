@@ -7,11 +7,6 @@ template<class T> __global__ void samples(const Job* jobs,T fill,void* out,bool*
     for(std::size_t i=blockIdx.x*blockDim.x+threadIdx.x;i<job.grid.count;i+=std::size_t(blockDim.x)*gridDim.x)
         sample(job.grid,job.keys,reinterpret_cast<const T* const*>(job.tiles),job.count,fill,out,valid,i);
 }
-__global__ void validity(Grid g,bool* valid) {
-    for(std::size_t i=blockIdx.x*blockDim.x+threadIdx.x;i<g.count;i+=std::size_t(blockDim.x)*gridDim.x) {
-        valid[output_index(g,i)]=supported(g,i);
-    }
-}
 __global__ void fields(float* data,bool* valid,std::size_t n,Field f) {
     for(std::size_t i=blockIdx.x*blockDim.x+threadIdx.x;i<n;i+=std::size_t(blockDim.x)*gridDim.x) if(valid[i]) field(data,valid,n,i,f);
 }
@@ -61,10 +56,6 @@ void launch(const Grid& g,const std::vector<std::int64_t>& keys,const std::vecto
             ElementType type,void* out,bool* valid,int id) {
     launch_many({g},{keys},{tiles},fill,type,out,valid,id);
 }
-void launch_valid(const Grid& g,bool* valid) {
-    if(g.count) validity<<<unsigned((g.count+255)/256),256,0,device::stream()>>>(g,valid);
-    device::check(cudaGetLastError());
-}
 __global__ void box_valid(Grid g,bool* valid) {
     for(std::size_t i=blockIdx.x*blockDim.x+threadIdx.x;i<g.count;i+=std::size_t(blockDim.x)*gridDim.x) {
         const std::int64_t p[3]{std::int64_t(i/g.shape[2]/g.shape[1])+g.base[0],
@@ -81,5 +72,17 @@ void launch_box(Triple source,Triple start,Triple shape,bool* valid) {
 void launch_field(float* data,bool* valid,std::size_t n,Field f) {
     if(n) fields<<<unsigned(std::min<std::size_t>((n+255)/256,65535)),256,0,device::stream()>>>(data,valid,n,f);
     device::check(cudaGetLastError());
+}
+void copy_cuda(const void* src,void* dst,std::size_t rows,std::size_t sw,std::size_t dw,std::size_t offset,std::size_t item,int){
+    if(rows&&sw)device::check(cudaMemcpy2DAsync(static_cast<char*>(dst)+offset*item,dw*item,src,sw*item,sw*item,rows,cudaMemcpyDeviceToDevice,device::stream()));device::complete();
+}
+void copy_region_cuda(const void* src,void* dst,Triple shape,Triple output,Triple offset,int channels,std::size_t item){
+    for(int c=0;c<channels;++c)for(std::int64_t z=0;z<shape[0];++z){
+        auto from=(std::size_t(c)*shape[0]+z)*shape[1]*shape[2]*item;
+        auto to=(((std::size_t(c)*output[0]+z+offset[0])*output[1]+offset[1])*output[2]+offset[2])*item;
+        if(shape[1]&&shape[2])device::check(cudaMemcpy2DAsync(static_cast<char*>(dst)+to,output[2]*item,
+            static_cast<const char*>(src)+from,shape[2]*item,shape[2]*item,shape[1],cudaMemcpyDeviceToDevice,device::stream()));
+    }
+    device::complete();
 }
 }

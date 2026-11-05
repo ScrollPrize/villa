@@ -13,9 +13,8 @@
 #include <QFutureWatcher>
 #include <QString>
 
+class OpenedVolumes;
 class SegmentationEditManager;
-class SegmentationWidget;
-class SegmentationOverlayController;
 class CState;
 class SegmentationModule;
 class QuadSurface;
@@ -28,14 +27,7 @@ class SegmentationPushPullTool : public SegmentationTool
 public:
     SegmentationPushPullTool(SegmentationModule& module,
                              SegmentationEditManager* editManager,
-                             SegmentationWidget* widget,
-                             SegmentationOverlayController* overlay,
                              CState* state);
-
-    void setDependencies(SegmentationEditManager* editManager,
-                         SegmentationWidget* widget,
-                         SegmentationOverlayController* overlay,
-                         CState* state);
 
     void setStepMultiplier(float multiplier);
     [[nodiscard]] float stepMultiplier() const { return _stepMultiplier; }
@@ -49,7 +41,6 @@ public:
     bool start(int direction, std::optional<bool> alphaOverride = std::nullopt);
     void stop(int direction);
     void stopAll();
-    bool applyStep();
 
     void cancel() override { stopAll(); }
     [[nodiscard]] bool isActive() const override { return _ppState.active; }
@@ -77,7 +68,6 @@ private:
     void launchAlphaCompute();
     void applyAlphaResult();
     void refreshActiveViewer(VolumeViewerBase* viewer);
-    void setDeferredPlaneIntersections(VolumeViewerBase* activeViewer, bool defer);
 
     static std::optional<cv::Vec3f> computeAlphaTargetStatic(
         const cv::Vec3f& centerWorld,
@@ -85,8 +75,8 @@ private:
         int direction,
         const AlphaPushPullConfig& config,
         const std::shared_ptr<Volume>& volume,
+        OpenedVolumes& volumes,
         int datasetIndex,
-        float scale,
         bool* outUnavailable,
         std::string* outNoTargetReason = nullptr);
 
@@ -95,14 +85,12 @@ private:
         int direction,
         const AlphaPushPullConfig& config,
         const std::shared_ptr<Volume>& volume,
+        OpenedVolumes& volumes,
         int datasetIndex,
-        float scale,
         std::uint64_t generation);
 
     SegmentationModule& _module;
     SegmentationEditManager* _editManager{nullptr};
-    SegmentationWidget* _widget{nullptr};
-    SegmentationOverlayController* _overlay{nullptr};
     CState* _state{nullptr};
 
     struct State
@@ -112,15 +100,10 @@ private:
     };
 
     State _ppState;
-    VolumeViewerBase* _activeViewer{nullptr};
-    VolumeViewerBase* _deferredPlaneIntersectionActiveViewer{nullptr};
     QTimer* _timer{nullptr};
-    QTimer* _deferredPlaneIntersectionReleaseTimer{nullptr};
     float _stepMultiplier{4.0f};
     bool _activeAlphaEnabled{false};
-    bool _alphaOverrideActive{false};
     AlphaPushPullConfig _alphaConfig{};
-    bool _undoCaptured{false};
     QString _lastAlphaStartFailure;
 
     // Cached state to avoid rebuilding samples every tick

@@ -21,6 +21,9 @@
 #include <sys/syscall.h>
 #include <unistd.h>
 #include <linux/fs.h>
+#elif defined(__APPLE__)
+#include <cerrno>
+#include <cstdio>
 #endif
 
 namespace vc::objects {
@@ -45,8 +48,12 @@ void publish(const fs::path& source, const fs::path& destination, bool overwrite
     const unsigned flags = exists ? RENAME_EXCHANGE : RENAME_NOREPLACE;
     if (syscall(SYS_renameat2, AT_FDCWD, source.c_str(), AT_FDCWD, destination.c_str(), flags) != 0)
         throw std::system_error(errno, std::generic_category(), "atomic geometry export publication");
+#elif defined(__APPLE__)
+    // The same exchange/no-replace guarantees as renameat2 on Linux.
+    if (renamex_np(source.c_str(), destination.c_str(), exists ? RENAME_SWAP : RENAME_EXCL) != 0)
+        throw std::system_error(errno, std::generic_category(), "atomic geometry export publication");
 #else
-    if (directory) throw std::runtime_error("atomic directory export requires Linux renameat2 support");
+    if (directory) throw std::runtime_error("atomic directory export requires Linux renameat2 or macOS renamex_np");
     if (overwrite) fs::rename(source, destination);
     else fs::create_hard_link(source, destination);
 #endif
@@ -54,7 +61,14 @@ void publish(const fs::path& source, const fs::path& destination, bool overwrite
 } // namespace
 
 std::string exportGeometry(ObjectStore& db, const std::string& objectUuid, const fs::path& destination,
-    const std::optional<std::string>& revisionUuid, bool overwrite)
+    const std::optional<std::string>& revisionUuid, bool overwrite, bool validOnly)
+{
+    const auto read = db.read();
+    return exportGeometry(db, read, objectUuid, destination, revisionUuid, overwrite, validOnly);
+}
+
+std::string exportGeometry(const ObjectStore& db, const ReadTxn& read, const std::string& objectUuid,
+    const fs::path& destination, const std::optional<std::string>& revisionUuid, bool overwrite, bool validOnly)
 {
     if (destination.empty()) throw std::invalid_argument("export destination is empty");
     const auto dest = fs::absolute(destination).lexically_normal();
@@ -74,7 +88,6 @@ std::string exportGeometry(ObjectStore& db, const std::string& objectUuid, const
     Json attributes;
     std::string fiberJson;
     {
-        auto read = db.read();
         const auto object = revisionUuid ? db.objectRevision(read, *revisionUuid) : db.currentObjectRevision(read, objectUuid);
         if (!object || object->objectUuid != util::canonicalUuid(objectUuid) || object->deleted || object->record.retired)
             throw std::runtime_error("active object revision not found for this object");
@@ -102,12 +115,14 @@ std::string exportGeometry(ObjectStore& db, const std::string& objectUuid, const
         const std::set<std::string> names = revision->kind == "fiber" ? std::set<std::string>{"control_points", "line_points", "control_point_ids"} :
             revision->kind == "point_collection" ? std::set<std::string>{"points", "point_ids"} : std::set<std::string>{"points"};
         if (revision->kind != "fiber") for (const auto& array : revision->arrays) {
-            if (!names.contains(array.name)) throw std::runtime_error("native export cannot represent auxiliary array: " + array.name);
+            // tifxyz carries surface channels as sidecar TIFFs.
+            if (!names.contains(array.name) && revision->kind != "surface")
+                throw std::runtime_error("native export cannot represent auxiliary array: " + array.name);
             snapshot.arrays[array.name] = db.readGeometryArray(read, revision->uuid, array.name);
         }
     }
     const auto& kind = snapshot.revision.kind;
-    const bool directory = kind == "patch" || kind == "track";
+    const bool directory = kind == "surface" || kind == "track";
     const auto stagingPath = dest.parent_path() / (".vc-export-" + util::newUuid());
     if (!fs::create_directory(stagingPath)) throw std::runtime_error("cannot create export staging directory");
     Stage stage{stagingPath};
@@ -120,8 +135,9 @@ std::string exportGeometry(ObjectStore& db, const std::string& objectUuid, const
         file.close();
     }
     else if (kind == "point_collection") formats::collection(snapshot, attributes, output);
-    else if (kind == "patch") formats::patch(snapshot, attributes, output);
+    else if (kind == "surface") formats::surface(snapshot, attributes, output, validOnly);
     else if (kind == "track") formats::track(snapshot, attributes, output);
+    else if (kind == "umbilicus") formats::umbilicus(snapshot, attributes, output);
     else throw std::runtime_error("unsupported geometry kind for export");
     publish(output, dest, overwrite, directory);
     return snapshot.revision.uuid;

@@ -1,13 +1,12 @@
 #pragma once
 
+#include "ToolProcess.hpp"
 #include <functional>
 
 #include <QObject>
 #include <QString>
 #include <QStringList>
-#include <QProcess>
 #include <QDialog>
-#include <QFile>
 
 #include "elements/ProgressUtil.hpp"
 #include "ConsoleOutputWidget.hpp"
@@ -32,11 +31,8 @@ public:
         RenderTifXYZ,
         GrowSegFromSegment,
         tifxyz2obj,
-        obj2tifxyz,
         AlphaCompRefine,
         NeighborCopy,
-        MergeTifxyz,
-        MergePatch,
         CustomCommand
     };
 
@@ -71,18 +67,22 @@ public:
     };
 
     void setVolumePath(const QString& path);
-    void setRemoteVolumeUrl(const QString& url);
-    void setRemoteVolumeAuth(const QString& accessKey,
-                             const QString& secretKey,
-                             const QString& sessionToken,
-                             const QString& region);
-    void setSegmentPath(const QString& path);
+    // Tools read and write surfaces in this object store (the attached store's
+    // file; a hosted replica's local file, which tools sync themselves), in the
+    // voxels of their volume at `voxelScale` of its own (--voxel-scale).
+    void setStore(const QString& storePath, double voxelScale);
+    // The stored surface a render or OBJ export reads.
+    void setSurface(const QString& uuid);
     void setOutputPattern(const QString& pattern);
 
+    // `store` and `volume`, when given, are the run's store contract (ToolProcess::Launch).
     bool executeCustomCommand(const QString& command,
                              const QStringList& args,
                              const QString& label = QString(),
-                             ExecutionOptions options = {});
+                             ExecutionOptions options = {},
+                             const QString& store = {},
+                             const QString& volume = {},
+                             double voxelScale = 1);
 
     // tool specific params 
     void setRenderParams(float scale, int resolution, int layers);
@@ -90,71 +90,48 @@ public:
     // Selects --tif-output vs --zarr-output for the next RenderTifXYZ run (default
     // TifStack; interactive re-asserts TifStack to avoid leaking a prior Zarr choice).
     void setRenderOutputFormat(RenderOutputFormat format);
+    // The volume a render reads the surface in, through the store's view of it,
+    // at `voxelScale` of its voxels.
+    void setRenderVolume(const QString& volumeUuid, double voxelScale);
     void setRenderAdvanced(int cropX, int cropY, int cropWidth, int cropHeight,
-                           const QString& affinePath, bool invertAffine,
-                           float scaleSegmentation, double rotateDegrees, int flipAxis);
-    void setTraceParams(QString volumePath, QString srcDir, QString tgtDir, QString jsonParams, QString srcSegment);
-    void setToObjParams(QString tifxyzPath, QString objPath);
+                           double rotateDegrees, int flipAxis);
+    // vc_grow_seg_from_segments: grow `srcSurface` along the surfaces of `volumeUuid`
+    // tagged `sourceTag` into new surfaces tagged `outputTag` and bound to the volume.
+    void setTraceParams(QString volumePath, QString volumeUuid, QString sourceTag, QString outputTag,
+                        QString jsonParams, QString srcSurface);
+    // vc_tifxyz2obj: export a stored surface to `objName` in its artifact directory.
+    // vc_tifxyz2obj: the surface exported in `volumeUuid`'s voxels.
+    void setToObjParams(QString surfaceUuid, QString objName, QString volumeUuid);
     void setToObjOptions(bool normalizeUV, bool alignGrid);
-    void setObj2TifxyzParams(const QString& objPath, const QString& outputDir,
-                             float stretchFactor = 1000.0f,
-                             float meshUnits = 1.0f,
-                             int stepSize = 20);
+    // vc_objrefine: `dstSurface` is a new surface's name, or `srcSurface` to refine in place;
+    // the surface is read in the voxels of `volumeUuid`, the volume at `volumePath`.
+    // `newName` names the refined surface; empty refines `srcSurface` in place.
     void setObjRefineParams(const QString& volumePath,
                             const QString& srcSurface,
-                            const QString& dstSurface,
-                            const QString& jsonParams);
+                            const QString& newName,
+                            const QString& jsonParams,
+                            const QString& volumeUuid);
+    // vc_grow_seg_from_seed: grow from (resume) `resumeSurface` into a new surface
+    // tagged `outputTag` and bound to `volumeUuid`.
     void setNeighborCopyParams(const QString& volumePath,
                                const QString& paramsJson,
                                const QString& resumeSurface,
-                               const QString& outputDir,
+                               const QString& volumeUuid,
+                               const QString& outputTag,
                                const QString& resumeOpt);
-    // vc_merge_tifxyz: only --merge is required; the remaining args are
-    // RANSAC + blend tunables that all have working defaults. pathsDir
-    // is forwarded as --paths-dir so the volpkg's actual segments
-    // directory (e.g. paths_2um_ds2/, traces/) is used instead of the
-    // tool's `<merge.parent>/paths` default.
-    void setMergeParams(const QString& mergeJsonPath,
-                        const QString& pathsDir,
-                        const QString& refSurface,
-                        int ransacIters,
-                        double ransacMinThresh,
-                        double ransacMaxThresh,
-                        double ransacMadK,
-                        int ransacSeed,
-                        int anchorCap,
-                        int stripCols);
-    // vc_merge_patch: two tifxyz dirs; the binary auto-detects parent vs
-    // child by valid-cell count unless explicitRoles is set, in which case
-    // we pass --parent / --child explicitly. The parent tifxyz is
-    // overwritten in place (the binary snapshots the pre-patch state to
-    // <parent_dir>/backups/<parent_name>/{0..7}/ first).
-    void setMergePatchParams(const QString& parentPath,
-                             const QString& childPath,
-                             bool explicitRoles,
-                             int borderCells,
-                             int blendCells,
-                             int idwK,
-                             int ransacIters,
-                             double ransacMinThresh,
-                             double ransacMaxThresh,
-                             double ransacMadK,
-                             int ransacSeed,
-                             int anchorCap);
     bool execute(Tool tool, ExecutionOptions options = {});
     void cancel();
     bool isRunning() const;
+    // Surfaces the current (or last) run created, from its `surface_uuid:` lines.
+    const QStringList& createdSurfaces() const { return _createdSurfaces; }
     
     void showConsoleOutput();
-    void hideConsoleOutput();
     void setIncludeTifs(bool include);
     // Applies to the next execute() attempt only.
     void setNextOmpThreads(int threads);
-    void setFlattenOptions(bool flatten, int iterations, int downsample = 1);
-    void setPreserveConsoleOutput(bool preserve);
 
 #ifdef VC_TESTING
-    QStringList argumentsForTesting(Tool tool) { return buildArguments(tool); }
+    QStringList argumentsForTesting(Tool tool) { return vc3d::ToolProcess::arguments(launchFor(tool)); }
 #endif
 
     // Valid while toolFinished is being delivered for the completed process.
@@ -170,17 +147,12 @@ signals:
     void toolFinished(Tool tool, bool success, const QString& message, const QString& outputPath, bool copyToClipboard = false);
     void consoleOutputReceived(const QString& output);
 
-private slots:
-    void onProcessStarted();
-    void onProcessFinished(int exitCode, QProcess::ExitStatus exitStatus);
-    void onProcessError(QProcess::ProcessError error);
-    void onProcessReadyRead();
-
 private:
     QStringList buildArguments(Tool tool);
+    // The tool's arguments and store contract (all but the executable and environment).
+    vc3d::ToolProcess::Launch launchFor(Tool tool);
     QString toolName(Tool tool) const;
     QString getOutputPath() const;
-    void closeLog();
     void finishExecution(bool success,
                          const QString& message,
                          const QString& outputPath = {},
@@ -189,25 +161,22 @@ private:
     std::function<QString()> _currentVolumePath;
     ProgressUtil* _progressUtil;
     
-    QProcess* _process;
+    vc3d::ToolProcess* _run = nullptr;
     ConsoleOutputWidget* _consoleOutput;
     QDialog* _consoleDialog;
     
     QString _volumePath;
-    QString _remoteVolumeUrl;
-    QString _remoteAccessKey;
-    QString _remoteSecretKey;
-    QString _remoteSessionToken;
-    QString _remoteRegion;
-    QString _segmentPath;
+    QString _storePath;
+    double _voxelScale = 1;
+    QString _surfaceUuid;
     QString _outputPattern;
-    QString _tgtDir;
-    QString _srcDir;
-    QString _srcSegment;
-    QString _tifxyzPath;
+    QString _sourceTag;
+    QString _outputTag;
+    QString _volumeUuid;
+    QString _sourceSurfaceUuid;
     QString _objPath;
     QString _jsonParams;
-    QString _resumeSurfacePath;
+    QString _resumeSurfaceUuid;
     QString _resumeOpt;
     
     float _scale;
@@ -221,17 +190,11 @@ private:
     int _cropY{0};
     int _cropWidth{0};
     int _cropHeight{0};
-    QString _affinePath;
-    bool _invertAffine{false};
-    float _scaleSeg{1.0f};
+    QString _renderVolumeUuid;
+    double _renderVoxelScale = 1;
     double _rotateDeg{0.0};
     int _flipAxis{-1};
     bool _includeTifs{false};
-
-    // ABF++ flattening options
-    bool _flatten{false};
-    int _flattenIters{10};
-    int _flattenDownsample{1};
 
     // vc_tifxyz2obj options
     bool _optNormalizeUV{false};
@@ -240,10 +203,10 @@ private:
     Tool _currentTool;
     QString _customCommand;
     QStringList _customArgs;
+    QString _customStore;
+    QString _customVolume;
+    double _customVoxelScale = 1;
     QString _customLabel;
-
-    QFile* _logFile;
-    QTextStream* _logStream;
 
     int _nextOmpThreads{-1};
     bool _explicitVolumePath{false};
@@ -251,38 +214,9 @@ private:
     ExecutionOptions _completionOptions;
     bool _deliveringCompletion{false};
     bool _terminalReported{true};
-    QString _pendingProcessError;
 
-    QString _objOutputDir;
-    float _objStretchFactor = 1000.0f;
-    float _objMeshUnits = 1.0f;
-    int _objStepSize = 20;
-    QString _refineDst;
-    bool _preserveConsoleOutput{false};
+    QString _refineName;  // the refined surface's name; empty: refined in place
+    QStringList _createdSurfaces;
+    QString _exportedObj;
 
-    // vc_merge_tifxyz parameters
-    QString _mergeJsonPath;
-    QString _mergePathsDir;
-    QString _mergeRefSurface;
-    int     _mergeRansacIters{3000};
-    double  _mergeRansacMinThresh{5.0};
-    double  _mergeRansacMaxThresh{10.0};
-    double  _mergeRansacMadK{3.0};
-    int     _mergeRansacSeed{0};
-    int     _mergeAnchorCap{0};
-    int     _mergeStripCols{0};
-
-    // vc_merge_patch parameters
-    QString _patchParentPath;
-    QString _patchChildPath;
-    bool    _patchExplicitRoles{false};
-    int     _patchBorderCells{16};
-    int     _patchBlendCells{6};
-    int     _patchIdwK{4};
-    int     _patchRansacIters{3000};
-    double  _patchRansacMinThresh{5.0};
-    double  _patchRansacMaxThresh{10.0};
-    double  _patchRansacMadK{3.0};
-    int     _patchRansacSeed{0};
-    int     _patchAnchorCap{0};
 };

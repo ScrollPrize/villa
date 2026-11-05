@@ -4,7 +4,7 @@ The package separates geometry, stored objects and file formats:
 
 | Layer | Public API | Responsibility |
 | --- | --- | --- |
-| Owned geometry | `geometry/Geometry.hpp`, `vc::geometry` | Point collections, fibers, tracks and patches; validation and geometry operations |
+| Owned geometry | `geometry/Geometry.hpp`, `vc::geometry` | Point collections, fibers, tracks, surfaces and umbilici; validation and geometry operations |
 | Stored geometry | `store/GeometryViews.hpp`, `vc::objects` | Snapshot views, bounded reads and checked sparse edits |
 | Object store | `objects/ObjectStore.hpp` | Identity, metadata, history, transactions, relationships and spatial queries |
 | Native formats | `objects/GeometryIngest.hpp`, `objects/GeometryExport.hpp` | Import/export orchestration; decoders and encoders live in `src/formats/` |
@@ -12,7 +12,7 @@ The package separates geometry, stored objects and file formats:
 Link `vc_geometry` for owned geometry alone, or `vc_objects` for stored geometry.
 Installed CMake targets have the `vc_object_store::` prefix. Owned geometry has no
 SQLite, OpenCV, Qt, volume-cartographer or spiral-fitting dependency.
-All four types and the snapshot/edit API are also available in Python.
+All five types and the snapshot/edit API are also available in Python.
 
 ## Owned geometry
 
@@ -26,14 +26,19 @@ conversion check invariants.
 | `PointCollection` | int64 `ids`, float64 XYZ `points` | `point(id)`, `indexOf(id)`, validation |
 | `Fiber` | float64 XYZ `controlPoints`, `linePoints`; int64 `controlPointIds` | Polyline length, validation |
 | `Track` | int32 XYZ `points` | Polyline length, validation |
-| `Patch` | `rows`, `columns`, column/row `scale`, float32 XYZ `points` | Vertex access, validity, validation |
+| `Surface` | `rows`, `columns`, column/row `scale`, float32 XYZ `points`, `validity`, `channels` | Vertex access, validity, validation |
+| `Umbilicus` | float64 XYZ `points` (ordered control polyline, at least one) | Validation |
 
 Coordinates remain source XYZ voxels; there is no implicit rescaling, unit
 conversion, or axis reversal. Native packed tracks use ZYX; the format adapter
 performs that conversion at the file boundary. Fiber length uses sampled line
-points if present, otherwise control points. A patch is row-major; scale is grid
-steps per source voxel, and invalid vertices use the existing `(-1,-1,-1)`
-sentinel. Stable point IDs are nonnegative and unique and need not be sorted.
+points if present, otherwise control points. A surface is row-major; scale is grid
+steps per source voxel, and vertices without coordinates use the
+`(-1,-1,-1)` sentinel. An umbilicus is a scroll's centre line; its native file
+is `{"vc_umbilicus_json_version": "1", "points": [{"x", "y", "z"}, ...]}` plus the
+object's name, tags, `coordinates` and other metadata (`vc_object_ingest --umbilicus`). `validity` is the surface's `valid` channel (empty, or one
+byte per vertex, nonzero = valid); `valid(row, column)` requires both coordinates
+and validity. `channels` holds the other aligned channels as generic arrays. Stable point IDs are nonnegative and unique and need not be sorted.
 
 ```cpp
 #include <vc_object_store/geometry/Geometry.hpp>
@@ -56,9 +61,9 @@ write.commit();
 
 `encode()` converts the typed variant to existing `GeometryData` arrays with
 explicit little-endian encoding. `decode()` performs the reverse conversion.
-Point order, IDs and scalar precision are preserved. Owned conversion rejects
-auxiliary arrays and additional immutable geometry attributes instead of silently
-dropping them. The generic array API remains available for those payloads.
+Point order, IDs and scalar precision are preserved. Owned conversion keeps
+surface channels and rejects other auxiliary arrays and additional immutable
+geometry attributes instead of silently dropping them. The generic array API remains available for those payloads.
 
 Python `put_geometry()` accepts either the existing array dictionary or one of
 the four owned types, including inside `store.write()` transactions:
@@ -84,8 +89,8 @@ native value.
 auto snapshot = store.geometrySnapshot();
 auto collection = snapshot.pointCollection(collectionUuid);
 auto xyz = collection.point(42);
-auto patch = snapshot.patch(patchUuid);
-auto tile = patch.readTile(30, 31, 4, 4); // row, column, rows, columns
+auto surface = snapshot.surface(surfaceUuid);
+auto tile = surface.readTile(30, 31, 4, 4); // row, column, rows, columns
 ```
 
 ```python
@@ -93,20 +98,21 @@ with store.geometry_snapshot() as snapshot:
     collection = snapshot.point_collection(collection_uuid)
     ids = collection.ids(0, len(collection))
     xyz = collection.point(42)
-    patch = snapshot.patch(patch_uuid)
-    tile = patch.read_tile(30, 31, 4, 4)
+    surface = snapshot.surface(surface_uuid)
+    tile = surface.read_tile(30, 31, 4, 4)
 ```
 
 `snapshot.geometry(uuid)` returns the corresponding view (a variant in C++).
 Typed factories reject kind mismatches and objects without stored geometry.
-Counts and patch dimensions come from the pinned geometry revision, not stored
+Counts and surface dimensions come from the pinned geometry revision, not stored
 import summaries.
 
 Views read only requested coordinate ranges or rectangles, through the existing
 verified chunk reader. Point lookup builds an ID index once per view, loading
 the ID array but not the coordinate array. Full materialization is explicit:
-`view.load()` returns the owned type. Large patches should use `readTile()` /
-`read_tile()` instead.
+`view.load()` returns the owned type. Large surfaces should use `readTile()` /
+`read_tile()` instead; a tile holds points and validity, and other channels are
+read with `readGeometryRectangle`.
 
 Snapshots pin a consistent database state at creation. Views keep
 that snapshot alive even if the snapshot variable goes out of scope. Explicit

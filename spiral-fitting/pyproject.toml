@@ -33,6 +33,9 @@ dependencies = [
     "torchdiffeq>=0.2.5",
     "tqdm>=4.68.3",
     "trimesh>=4.12.2",
+    # Monorepo-only C++ package (resolved via [tool.uv.sources]): surfaces, fibers
+    # and point collections are read and written through the object store.
+    "vc-object-store",
     # PyTorch ships no triton wheel for Windows; this community build stands in
     # for the triton 3.6 that torch 2.11 pins elsewhere.
     "triton-windows>=3.6,<3.7; sys_platform == 'win32'",
@@ -61,6 +64,7 @@ cuda = [
 default-groups = ["dev", "cuda"]
 
 [tool.uv.sources]
+vc-object-store = { path = "../vc_object_store", editable = true }
 torch = [
     { index = "pytorch-cu128", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
 ]

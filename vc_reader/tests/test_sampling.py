@@ -1,26 +1,21 @@
 """Independent small-array and analytic checks for aligned CPU/CUDA reads."""
 import itertools
+import math
 import multiprocessing
 from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import patch
 import json
-import os
 from pathlib import Path
 import pickle
-import subprocess
-import sys
 import tempfile
 import unittest
-from dataclasses import replace
 
 import numpy as np
 from PIL import Image
 import tifffile
 
-if os.environ.get('VC_READER_BUILD_DIR'):
-    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'benchmarks'))
-    from extension_build import load_extensions
-    load_extensions(Path(os.environ['VC_READER_BUILD_DIR']))
+from build_support import load_build
+load_build()
 
 from vc_reader import (Affine, Catalog, Companion, Encoding, Frame, Plane, QueryContext, Selection,
                        Source, Storage, ValueFrame, VolumeRegistration)
@@ -53,7 +48,7 @@ def reference(values, pull, start, shape, order, fill=0, plane=False):
         neighbours = []
         if supported:
             if not order:
-                at = tuple(round(v) for v in q)
+                at = tuple(math.floor(v) + (v-math.floor(v) >= .5) for v in q)  # spatial ties round up
                 neighbours = [(at, 1.)]
             else:
                 lo = tuple(int(np.floor(v)) for v in q)
@@ -154,10 +149,7 @@ class SamplingTests(unittest.TestCase):
                 for key in [Ellipsis, np.s_[1, 1:4, 2:5, 3:7], np.s_[-1, ..., -1],
                             np.s_[1:3, 2, :, :], np.s_[0, 1, 2, 3], np.s_[2:1], np.s_[:, 99:]]:
                     np.testing.assert_array_equal(host(view[key]), channels[key])
-                # Named target reads do not sample unrelated targets or masks.
-                with patch.object(reader, '_sample_many', wraps=reader._sample_many) as sample_many:
-                    saved = view[1, 1:3, 2:4, 3:5]
-                    self.assertEqual(sample_many.call_count, 1)
+                saved = view[1, 1:3, 2:4, 3:5]
                 for key in [np.s_[7], np.s_[-8], np.s_[::2], np.s_[..., ...],
                             np.s_[:, :, :, :], None, True, [0, 1], .5]:
                     with self.subTest(invalid=key), self.assertRaises(IndexError):
@@ -203,7 +195,7 @@ class SamplingTests(unittest.TestCase):
             data = (values-2**55).astype('float32') if order else values
             source = self.source('data'+str(order), data, role='scalar' if order else 'label', fill_value=3)
             for pull in matrices:
-                selected = replace(source, registration=replace(source.registration, affine=pull.inverse()))
+                selected = source.replace(registration=source.registration.replace(affine=pull.inverse()))
                 expected, mask = reference(data, pull, (-1, -1, -1), (7, 8, 9), order, 3)
                 for backend in self.backends():
                     with self.subTest(order=order, pull=pull, backend=backend), open_sample(self.ref, {'target': selected}, backend=backend) as reader:
@@ -226,7 +218,7 @@ class SamplingTests(unittest.TestCase):
                 result = reader.read((-2, 0, 0), (5, 1, 1))
                 np.testing.assert_array_equal(host(result['slice'].data).ravel(), [0, 10, 10, 10, 0])
                 np.testing.assert_array_equal(host(result['slice'].valid).ravel(), [False, True, True, True, False])
-            shifted = replace(source, registration=replace(source.registration, plane=replace(plane, origin=(.5, 0, 0))))
+            shifted = source.replace(registration=source.registration.replace(plane=plane.replace(origin=(.5, 0, 0))))
             with open_sample(self.ref, {'slice': shifted}, backend=backend) as reader:
                 result = reader.read((0, 0, 0), (1, 1, 2))
                 np.testing.assert_array_equal(host(result['slice'].data).ravel(), [5, 10])
@@ -242,16 +234,17 @@ class SamplingTests(unittest.TestCase):
         for backend in self.backends():
             with open_sample(self.ref, {'label': source}, backend=backend) as reader:
                 result = reader.read((0, 0, origin), (1, 1, 5))
-                np.testing.assert_array_equal(host(result['label'].data).ravel(), np.array([2**60, 2**60, 2**60+2, 2**60+2, 2**60+9], dtype='uint64'))
+                # Pixel coordinates -0.5 .. 3.5 are half ties, which round up.
+                np.testing.assert_array_equal(host(result['label'].data).ravel(), np.array([2**60, 2**60+1, 2**60+2, 2**60+3, 2**60+9], dtype='uint64'))
                 np.testing.assert_array_equal(host(result['label'].valid).ravel(), [True, True, True, True, False])
 
     def test_fields_frames_order_normals_and_metadata(self):
         values = np.broadcast_to(np.array([3, 2, 1], 'float32')[:, None, None, None], (3, 7, 8, 9)).copy()
         frame = ValueFrame(sample_id='s', volume_id='v', affine=Affine.from_rows(((-2, 0, 0, 10), (0, 3, 0, 20), (0, 0, 4, 30))))
         vec = self.source('vector', values, role='vector', component_order=('z', 'y', 'x'), value_frame=frame, normalize=False)
-        normal = replace(vec, role='normal', normalize=None)
-        coord = replace(vec, role='coordinate', normalize=None)
-        external = replace(coord, value_frame=ValueFrame(kind='external', name='instrument', units='um'))
+        normal = vec.replace(role='normal', normalize=None)
+        coord = vec.replace(role='coordinate', normalize=None)
+        external = coord.replace(value_frame=ValueFrame(kind='external', name='instrument', units='um'))
         for backend in self.backends():
             with open_sample(self.ref, {'v': vec, 'n': normal, 'c': coord, 'e': external}, backend=backend) as reader:
                 result = reader.read((1, 2, 3), (1, 1, 1))
@@ -274,8 +267,8 @@ class SamplingTests(unittest.TestCase):
         data = np.arange(2*7*8*9*3, dtype='int32').reshape(2, 7, 8, 9, 3)
         source = self.source('selected', data, axes=('t', 'z', 'y', 'x', 'c')).with_selection(time=1, channels=(2, 0))
         mask = self.source('mask', np.full((7, 8, 9), 7, 'uint8'))
-        mask = replace(mask, registration=None)
-        source = replace(source, companions=(Companion('supervision', mask, True),))
+        mask = mask.replace(registration=None)
+        source = source.replace(companions=(Companion('supervision', mask, True),))
         for backend in self.backends():
             with open_sample(self.ref, {'label': source}, backend=backend) as reader:
                 first, second = reader.read_many([((1, 2, 3), (2, 2, 2)), ((0, 0, 0), (1, 1, 1))])
@@ -292,15 +285,16 @@ class SamplingTests(unittest.TestCase):
         pyramid(path, scales=(1, 3, 6), units='micrometer')
         cat = Catalog({'samples': {'s': {'sample': {'id': 's'}, 'volumes': {'v': {
             'id': 'v', 'properties': {'pixel_size_um': 1}, 'data': [{'id': 'image', 'type': 'ome-zarr', 'origins': [
-                {'path': str(path), 'access_roots': [{'url': '', 'type': 'local'}]}]}]}}}}})
+                {'path': str(path).lstrip('/'), 'access_roots': [{'url': '/', 'type': 'local'}]}]}]}}}}})
         level = cat.samples['s'].volumes['v'].level(1)
         values = np.ones((3, 7, 8, 9), dtype='float32')
         field = self.source('level-field', values, role='vector', affine=Affine.scale(3),
                             component_order=('x', 'y', 'z'), normalize=False,
                             value_frame=ValueFrame(sample_id='s', volume_id='v', level=1))
-        with open_sample(level, {'label': replace(self.ref, role='label'), 'vector': field}) as reader:
-            np.testing.assert_array_equal(reader.read((0, 0, 0), (2, 2, 2))['vector'].data, 1)
-            self.assertEqual(reader._reference_map, Affine.scale(3))
+        with open_sample(level, {'label': self.ref.replace(role='label'), 'vector': field}) as reader:
+            # Vectors are moved through the reference map and back in float32.
+            np.testing.assert_allclose(reader.read((0, 0, 0), (2, 2, 2))['vector'].data, 1, atol=2e-7)
+            self.assertEqual(reader.reference_map, Affine.block_reduced(3))
             np.testing.assert_array_equal(reader.read((0, 0, 0), (2, 2, 2))['image'].data, 2)
 
     def test_budget_eviction_repeated_requests_and_worker_reopening(self):
@@ -345,7 +339,7 @@ class SamplingTests(unittest.TestCase):
                        encoding=Encoding('color', (((1, 2, 3), 2**63+17),), 'uint64'))
         missing = self.source('missing', np.ones((7, 8, 9), 'uint8'))
         (Path(missing.storage.location)/'0.0.0').unlink()
-        missing = replace(missing, registration=replace(missing.registration, affine=Affine.scale(2)),
+        missing = missing.replace(registration=missing.registration.replace(affine=Affine.scale(2)),
                           encoding=Encoding('integer', ((0, 2**63+19),), 'uint64'), fill_value=2**63+21)
         for backend in self.backends():
             with open_sample(self.ref, {'rgb': label, 'missing': missing}, backend=backend) as reader:
@@ -370,7 +364,7 @@ class SamplingTests(unittest.TestCase):
         frame = ValueFrame(sample_id='s', volume_id='v', affine=Affine.from_rows(((2, 0, 0, 10), (0, 3, 0, 20), (0, 0, 4, 30))))
         source = self.source('padding', values, role='coordinate', component_order=('x', 'y', 'z'), value_frame=frame)
         for affine in (Affine.identity(), Affine.from_rows(((1, 0, 0, .5), (0, 1, 0, 0), (0, 0, 1, 0)))):
-            selected = replace(source, registration=replace(source.registration, affine=affine))
+            selected = source.replace(registration=source.registration.replace(affine=affine))
             for backend in self.backends():
                 with open_sample(self.ref, {'t': selected}, backend=backend) as reader:
                     result = reader.read((0, 0, -2), (1, 1, 4))
@@ -384,7 +378,7 @@ class SamplingTests(unittest.TestCase):
         pull = Affine.from_rows(((1, .125, 0, .25), (0, 1, .125, .25), (0, 0, 1, .25)))
         source = self.source('u8-linear', values, role='scalar', affine=pull.inverse())
         mask = self.source('separate-mask', np.full((1, 1, 1), 5, dtype='uint8'))
-        source = replace(source, companions=(Companion('quality', mask),))
+        source = source.replace(companions=(Companion('quality', mask),))
         expected, valid = reference(values, pull, (0, 0, 0), (7, 8, 9), 1)
         for backend in self.backends():
             with open_sample(self.ref, {'s': source}, backend=backend) as reader:
@@ -438,7 +432,7 @@ class SamplingTests(unittest.TestCase):
         for backend in self.backends():
             with open_sample(self.ref, {'label': source}, backend=backend) as reader:
                 result = reader.read((0, 0, base), (1, 1, 5))
-                np.testing.assert_array_equal(host(result['label'].data).ravel(), values[[0, 2, 2, 4, 4]])
+                np.testing.assert_array_equal(host(result['label'].data).ravel(), values[[1, 2, 3, 4, 5]])  # x + .5 ties round up
             with open_sample(self.ref, {'label': block_source}, backend=backend) as reader:
                 result = reader.read((0, 0, 0), (2, 3, 129))
                 np.testing.assert_array_equal(host(result['label'].data), expected)
@@ -466,44 +460,42 @@ class SamplingTests(unittest.TestCase):
                     np.testing.assert_array_equal(host(result['label'].valid), valid)
 
 
-    def test_contract_errors_and_lazy_import(self):
+    def test_contract_errors(self):
         with self.assertRaisesRegex(ValueError, 'reserved'):
             open_sample(self.ref, {'image': self.ref})
         with self.assertRaisesRegex(ValueError, 'placement'):
-            open_sample(replace(self.ref, registration=VolumeRegistration('s', 'v')))
-        with self.assertRaisesRegex(ValueError, 'singular'):
-            open_sample(self.ref, {'bad': replace(self.ref, registration=VolumeRegistration('s', 'v', affine=Affine.scale(0)))})
+            open_sample(self.ref.replace(registration=VolumeRegistration('s', 'v')))
+        with self.assertRaisesRegex(ValueError, 'scale must be finite and positive'):
+            Affine.scale(0)
         with self.assertRaisesRegex(ValueError, 'relationship'):
-            open_sample(self.ref, {'bad': replace(self.ref, registration=VolumeRegistration('s', 'other', affine=Affine.identity()))})
+            open_sample(self.ref, {'bad': self.ref.replace(registration=VolumeRegistration('s', 'other', affine=Affine.identity()))})
         with open_sample(self.ref) as reader:
             self.assertEqual(reader.read_many([]), [])
             result = reader.read((0, 0, 0), (0, 1, 1))
             self.assertEqual(result['image'].data.shape, (1, 0, 1, 1))
         with self.assertRaisesRegex(ValueError, 'closed'):
             reader.read((0, 0, 0), (1, 1, 1))
-        code = "import sys; import vc_reader.sampling; assert not {'numpy', 'torch', 'PIL', 'vc_reader._reader'} & sys.modules.keys()"
-        subprocess.run([sys.executable, '-c', code], check=True)
 
     def test_catalog_contexts_and_source_reference_coordinates(self):
         cat = Catalog({'samples': {'s': {'sample': {'id': 's', 'properties': {'volume_transforms': [
             {'from_volume_id': 'a', 'transforms': [{'to_volume_id': 'v', 'matrix': Affine.scale(2).matrix}]}]}},
             'volumes': {'a': {'id': 'a'}, 'v': {'id': 'v'}}}}})
-        other = replace(self.ref, registration=VolumeRegistration('s', 'a', affine=Affine.identity()))
+        other = self.ref.replace(registration=VolumeRegistration('s', 'a', affine=Affine.identity()))
         for backend in self.backends():
             with open_sample(self.ref, {'other': other}, catalog=cat, backend=backend) as reader:
                 self.assertTrue(host(reader.read((0, 0, 0), (2, 2, 2))['other'].valid).all())
-            query = replace(other, query=QueryContext(Frame('s', 'v'), 'transform', Affine.scale(2)))
+            query = other.replace(query=QueryContext(Frame('s', 'v'), 'transform', Affine.scale(2)))
             with open_sample(self.ref, {'other': query}, backend=backend) as reader:
                 self.assertTrue(host(reader.read((0, 0, 0), (2, 2, 2))['other'].valid).all())
-        inverse_reference = replace(self.ref, query=QueryContext(Frame('s', 'a'), 'transform', Affine.scale(.5)))
+        inverse_reference = self.ref.replace(query=QueryContext(Frame('s', 'a'), 'transform', Affine.scale(.5)))
         with open_sample(inverse_reference, {'other': other}) as reader:
             self.assertTrue(reader.read((0, 0, 0), (2, 2, 2))['other'].valid.all())
         with self.assertRaisesRegex(ValueError, 'conflicts'):
-            open_sample(self.ref, {'bad': replace(query, query=replace(query.query, transform=Affine.scale(3)))}, catalog=cat)
+            open_sample(self.ref, {'bad': query.replace(query=query.query.replace(transform=Affine.scale(3)))}, catalog=cat)
         with self.assertRaisesRegex(ValueError, 'relationship'):
-            open_sample(self.ref, {'bad': replace(query, query=replace(query.query, reference=Frame('s', 'elsewhere')))})
+            open_sample(self.ref, {'bad': query.replace(query=query.query.replace(reference=Frame('s', 'elsewhere')))})
         mapping = Affine.from_rows(((0, -2, 0, 10), (3, 0, 0, 20), (0, 0, 4, 30)))
-        ref = replace(self.ref, registration=replace(self.ref.registration, affine=mapping))
+        ref = self.ref.replace(registration=self.ref.registration.replace(affine=mapping))
         xyz = np.stack(np.meshgrid(np.arange(7), np.arange(8), np.arange(9), indexing='ij')[::-1]).astype('float32')
         xyz = np.einsum('ij,jzyx->izyx', np.asarray(mapping.linear, dtype='float32'), xyz) + np.array(mapping.translation, dtype='float32')[:, None, None, None]
         coord = self.source('positions', xyz, role='coordinate', affine=mapping, component_order=('x', 'y', 'z'),

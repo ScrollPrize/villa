@@ -81,7 +81,6 @@ struct LasagnaNormalAlignmentField {
     std::vector<cv::Vec3f> rawNormals;
     LasagnaNormalAlignmentReport alignment;
     std::size_t candidateSamples = 0;
-    double prefetchMilliseconds = 0.0;
     double materializeMilliseconds = 0.0;
 
     [[nodiscard]] std::optional<AlignedLasagnaNormalSample> nearest(
