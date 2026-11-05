@@ -121,6 +121,7 @@ try {
     const auto local = session.attach(localPath, options);
     mustFail([&] { (void)session.attachHosted(endpoint, hostedOptions); }); // once per session
     require(session.hosted(hosted) && !session.hosted(local), "backend kinds");
+    require(session.location(hosted) == endpoint && session.location(local) == session.path(local).string(), "locations");
     require(session.freshness(hosted) && session.freshness(hosted)->error.empty() && !session.freshness(local), "freshness");
     (void)session.takeEvents();
 

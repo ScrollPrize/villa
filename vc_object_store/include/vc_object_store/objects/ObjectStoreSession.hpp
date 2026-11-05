@@ -242,6 +242,8 @@ public:
     // Throws when the endpoint does not answer or its store is already attached.
     AttachmentIdentity attachHosted(const std::string& endpoint, const HostedSessionOptions& = {});
     bool hosted(const AttachmentIdentity&) const;
+    // Where an attachment's store is: its file path, or a hosted store's endpoint.
+    std::string location(const AttachmentIdentity&);
     // nullopt for local attachments.
     std::optional<HostedFreshness> freshness(const AttachmentIdentity&) const;
     // Check a hosted attachment now (blocking); its commits then arrive

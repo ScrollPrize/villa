@@ -1274,6 +1274,13 @@ std::filesystem::path ObjectStoreSession::artifactDirectory(const AttachmentIden
     return directory;
 }
 
+std::string ObjectStoreSession::location(const AttachmentIdentity& identity)
+{
+    return withAttachment(identity, false, [](Attachment& attachment) {
+        return attachment.remote ? attachment.remote->client().endpoint() : attachment.store().path().string();
+    });
+}
+
 std::filesystem::path ObjectStoreSession::path(const AttachmentIdentity& identity)
 {
     return withAttachment(identity, false, [](Attachment& attachment) { return attachment.store().path(); });
