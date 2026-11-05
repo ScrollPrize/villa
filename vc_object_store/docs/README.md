@@ -159,7 +159,7 @@ publishing a new checked action, not by moving old heads.
 
 ## Numbered history and checked requests
 
-Schema 18 numbers history. Each object and relationship keeps its UUID; each
+Schema 18 introduced numbered history; schema 19 (current) stores it compactly. Each object and relationship keeps its UUID; each
 published state also has a version, starting at 1 and advancing once per
 transaction that changes the record (deletions and relationship removals are
 numbered too, so a deleted identity never looks newly absent). A historical
@@ -205,9 +205,9 @@ that every client then resolves from the store.
 Writable opens hold a host-local ownership lock on `<canonical path>-owner`:
 shared between standalone writers, exclusive for `OpenOptions::serviceOwner`.
 
-### Converting schema-17 stores
+### Converting schema-17 and schema-18 stores
 
-The runtime opens schema 18 only. Stop every client, settle hub replicas with
+The runtime opens schema 19 only. Stop every client, settle hub replicas with
 the old tooling, then convert into a new file (the source is never changed):
 
 ```sh
@@ -220,6 +220,15 @@ lists gaps rather than guessing: untimed baselines, relationship states without
 a recorded publication, geometry revisions that do not select one object
 version, metadata still holding old revision UUIDs, and an unversioned inventory
 of external artifact files. Converted commits have author `unrecorded`.
+
+A schema-17 source is numbered first (schema 18, on a scratch copy beside the
+destination), then copied into a store built by the current schema
+definition. Schema 19 keeps the same content in less space: history, version
+and head keys are 16-byte blobs, a revision without a parent stores its whole
+record rather than a patch from `{}` (later revisions stay RFC 6902 patches),
+and only heads with a parent keep a materialized record. A schema-18 source
+is copied directly; its mapping is read from its recorded versions. The report
+gives `source_bytes`, `destination_bytes` and the rows copied per table.
 
 ### Artifacts
 

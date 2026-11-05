@@ -19,7 +19,7 @@ std::set<std::string> changedObjects(sqlite3* db, const std::set<std::string>& c
     std::set<std::string> objects;
     Statement known(db, "SELECT 1 FROM object_revisions WHERE object_uuid=? LIMIT 1");
     for (const auto& id : changed) {
-        known.reset(); known.bind(1, id);
+        known.reset(); known.bind(1, parseUuid(id));
         if (known.row()) objects.insert(id);
     }
     return objects;

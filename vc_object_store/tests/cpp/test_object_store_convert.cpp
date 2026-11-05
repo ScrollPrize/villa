@@ -1,8 +1,14 @@
-// Offline schema-17 conversion: numbered history reconstructed from recorded
-// publication order equals the numbering the runtime assigns, the source is
-// untouched, gaps are reported, and unsettled replicas are refused.
+// Offline conversion of schema-17 and schema-18 stores to the current schema.
+// The fixtures (data/convert_schema17.sql, data/convert_schema18.sql) were
+// written by the schema-18 runtime from one history: tracks with geometry,
+// metadata edits, relationships retained and kept recorded through a geometry
+// edit, a removal, retirement and deletion, copy provenance naming an old
+// revision UUID, and a tiled surface with a sparse (delta) edit.
+// data/convert_expected.json holds what that runtime read back: every
+// revision, its numbered version and commit, the feed, relationship heads and
+// every geometry descriptor and array. A converted store must read back the
+// same, with the source untouched.
 #include "TestSupport.hpp"
-#include "vc_object_store/geometry/Geometry.hpp"
 #include "vc_object_store/migration/ConvertStore.hpp"
 #include "vc_object_store/objects/ObjectStore.hpp"
 #include "vc_object_store/objects/TransactionJson.hpp"
@@ -10,7 +16,7 @@
 #include <sqlite3.h>
 #include <nlohmann/json.hpp>
 
-#include <cstring>
+#include <cstdio>
 #include <fstream>
 #include <iostream>
 #include <iterator>
@@ -19,6 +25,14 @@ using namespace vc::objects;
 using Json = nlohmann::json;
 
 namespace {
+const std::filesystem::path kData = VC_OBJECT_STORE_TEST_DATA;
+
+std::string bytesOf(const std::filesystem::path& path)
+{
+    std::ifstream in(path, std::ios::binary);
+    return {std::istreambuf_iterator<char>(in), {}};
+}
+
 void sql(const std::filesystem::path& path, const std::string& text)
 {
     sqlite3* db = nullptr;
@@ -31,141 +45,137 @@ void sql(const std::filesystem::path& path, const std::string& text)
     if (rc != SQLITE_OK) throw std::runtime_error("fixture SQL: " + message);
 }
 
-// Schema 18 is schema 17 plus the numbered-history tables; removing them
-// reproduces the previous format exactly.
-void downgrade(const std::filesystem::path& path)
+int64_t scalar(const std::filesystem::path& path, const std::string& query)
 {
-    sql(path, "PRAGMA journal_mode=DELETE; DROP TABLE transaction_receipts; DROP TABLE store_changes; "
-              "DROP TABLE relationship_versions; DROP TABLE object_versions; DROP TABLE store_commits; "
-              "DROP TABLE history_generations; DROP TABLE store_history; PRAGMA user_version=17;");
+    sqlite3* db = nullptr;
+    require(sqlite3_open_v2(path.string().c_str(), &db, SQLITE_OPEN_READONLY, nullptr) == SQLITE_OK, "open store");
+    sqlite3_stmt* s = nullptr;
+    require(sqlite3_prepare_v2(db, query.c_str(), -1, &s, nullptr) == SQLITE_OK, ("prepare " + query).c_str());
+    require(sqlite3_step(s) == SQLITE_ROW, ("row " + query).c_str());
+    const auto value = sqlite3_column_int64(s, 0);
+    sqlite3_finalize(s);
+    sqlite3_close(db);
+    return value;
 }
 
-std::string bytesOf(const std::filesystem::path& path)
+std::string hex(const std::vector<uint8_t>& bytes)
 {
-    std::ifstream in(path, std::ios::binary);
-    return {std::istreambuf_iterator<char>(in), {}};
+    std::string out;
+    for (auto b : bytes) { char t[3]; std::snprintf(t, 3, "%02x", b); out += t; }
+    return out;
 }
 
-struct Numbered {
-    std::map<std::string, std::vector<std::tuple<int64_t, std::optional<int64_t>, bool>>> objects;
-    std::map<std::string, std::optional<int64_t>> relationshipHeads;
-    std::vector<std::tuple<int64_t, std::string, int64_t, bool>> feed;
-    int64_t sequence = 0;
-};
-
-Numbered numbered(ObjectStore& db, const std::vector<std::string>& objects, const std::vector<std::string>& edges)
+// Everything the fixture's runtime read back, read again from `path`.
+// `generation`: the converted store's generation replaces the recorded one
+// when a schema-17 source got a new one.
+void requireSameHistory(const std::filesystem::path& path, const Json& expected, const std::optional<std::string>& generation)
 {
-    Numbered result;
+    OpenOptions options; options.readOnly = true;
+    auto db = ObjectStore::open(path, options);
     auto txn = db.read();
-    for (const auto& object : objects)
-        for (const auto& revision : db.objectHistory(txn, object))
-            result.objects[object].emplace_back(revision.version, revision.commitSequence, revision.deleted);
-    for (const auto& edge : edges) result.relationshipHeads[edge] = db.currentRelationshipVersion(txn, edge);
     const auto status = db.status(txn);
-    result.sequence = status.commitSequence;
+    require(status.storeUuid == expected.at("store").get<std::string>() && status.commitSequence == expected.at("sequence").get<int64_t>(), "identity and sequence");
+    for (const auto& object : expected.at("objects")) {
+        const auto history = db.objectHistory(txn, object);
+        const auto& recorded = expected.at("history").at(object.get<std::string>());
+        require(history.size() == recorded.size(), "revision count");
+        for (size_t i = 0; i < history.size(); ++i) {
+            auto want = recorded.at(i);
+            if (generation) want["generation"] = *generation;
+            require(Json::parse(objectRevisionToJson(history[i])) == want, ("revision " + std::to_string(i) + " of " + object.get<std::string>()).c_str());
+        }
+    }
+    for (const auto& [uuid, geometry] : expected.at("geometry").items()) {
+        const auto g = db.geometryRevision(txn, uuid);
+        require(g && Json::parse(geometryRevisionToJson(*g)) == geometry.at("descriptor"), ("geometry descriptor " + uuid).c_str());
+        for (const auto& [name, bytes] : geometry.at("arrays").items())
+            require(hex(db.readGeometryArray(txn, uuid, name)) == bytes.get<std::string>(), ("geometry array " + name).c_str());
+    }
+    for (const auto& [edge, version] : expected.at("relationship_heads").items()) {
+        const auto head = db.currentRelationshipVersion(txn, edge);
+        require((head ? Json(*head) : Json(nullptr)) == version, "relationship head");
+    }
+    Json feed = Json::array();
     for (const auto& commit : db.changesSince(txn, {status.storeUuid, status.generation, 0, 0}, 1 << 20).commits)
-        for (const auto& change : commit.changes)
-            result.feed.emplace_back(commit.sequence, change.uuid, change.version, change.deleted);
-    return result;
+        for (const auto& change : commit.changes) feed.push_back({commit.sequence, change.uuid, change.version, change.deleted});
+    require(feed == expected.at("feed"), "feed");
+}
+
+// A converted store keeps working: a checked edit, and the old version still
+// reads at its number.
+void requireWritable(const std::filesystem::path& path, const std::string& object)
+{
+    OpenOptions options; options.author = "convert-test";
+    auto db = ObjectStore::open(path, options);
+    StoreStatus status; std::optional<int64_t> before; Json oldRecord;
+    { auto txn = db.read(); status = db.status(txn); before = db.currentVersion(txn, object);
+      oldRecord = Json::parse(objectRevisionToJson(*db.currentObjectRevision(txn, object))).at("record"); }
+    TransactionRequest r; r.requestUuid = util::newUuid(); r.storeUuid = status.storeUuid; r.generation = status.generation;
+    r.author = "convert-test"; r.expectedObjects = {{object, before}};
+    r.operations = {SetMetaOp{object, "after_conversion", "true"}};
+    const auto receipt = db.submit(r);
+    require(receipt.objects.at(object) == *before + 1, "edit after conversion");
+    auto txn = db.read();
+    const auto old = db.objectAtVersion(txn, {status.storeUuid, status.generation, object, *before});
+    require(old && Json::parse(objectRevisionToJson(*old)).at("record") == oldRecord, "old version reads back");
 }
 }
 
 int main()
 try {
     TemporaryDirectory directory;
-    const auto source = directory.path / "old.vcobj";
+    const auto expected = Json::parse(bytesOf(kData / "convert_expected.json"));
     OpenOptions options; options.author = "convert-test";
-    std::vector<std::string> objects, edges;
-    Numbered expected;
-    std::string storeUuid, firstRevision;
-    {
-        auto db = ObjectStore::create(source, options);
-        std::string a, b, gone;
+    for (const int schema : {17, 18}) {
+        const auto source = directory.path / ("old" + std::to_string(schema) + ".vcobj");
+        sql(source, bytesOf(kData / ("convert_schema" + std::to_string(schema) + ".sql")));
+        const auto before = bytesOf(source);
+        mustFail([&] { (void)ObjectStore::open(source, options); }); // the runtime refuses old schemas
+
+        const auto destination = directory.path / ("new" + std::to_string(schema) + ".vcobj");
+        const auto result = migration::convertStore(source, destination);
+        require(bytesOf(source) == before, "source untouched");
+        require(!std::filesystem::exists(destination.string() + ".converting"), "no staging file left");
+        const auto report = Json::parse(result.reportJson);
+        const auto mapping = Json::parse(result.mappingJson);
+        require(report.at("validation") == "ok" && report.at("source_role") == "standalone", "report");
+        require(report.at("source_schema") == schema && report.at("target_schema") == 19, "schemas reported");
+        mustFail([&] { (void)migration::convertStore(source, destination); }); // never overwrites
+        // Storage form: whole records for revisions without a parent, no
+        // materialized head record duplicating one, 16-byte keys.
+        require(scalar(destination, "SELECT count(*) FROM object_revisions WHERE parent_uuid IS NULL AND json_type(metadata_delta)<>'object'") == 0,
+                "root revisions hold records");
+        require(scalar(destination, "SELECT count(*) FROM object_head_records h JOIN object_revisions r ON r.uuid=h.revision_uuid "
+                                    "WHERE r.parent_uuid IS NULL") == 0, "no duplicate head records");
+        require(scalar(destination, "SELECT count(*) FROM object_versions WHERE length(object_uuid)<>16 OR length(revision_uuid)<>16") == 0,
+                "blob keys");
+
+        requireSameHistory(destination, expected,
+                           schema == 17 ? std::optional(mapping.at("generation").get<std::string>()) : std::nullopt);
         {
-            auto txn = db.write();
-            auto add = [&](int n) {
-                ObjectRecord record; record.kind = "track"; record.track.emplace();
-                record.track->datasetRef = "convert"; record.track->externalKey = util::newUuid();
-                const auto uuid = db.upsertObject(txn, record);
-                if (n == 0) return uuid; // deletable: no retained geometry
-                vc::geometry::Track track; for (int i = 0; i < n; ++i) track.points.push_back({double(i), 1, 2});
-                db.putGeometry(txn, uuid, vc::geometry::encode(track));
-                return uuid;
-            };
-            a = add(3); b = add(2); gone = add(0);
-            txn.commit();
+            const auto ref = mapping.at("objects").at(expected.at("first_revision").get<std::string>());
+            OpenOptions readOnly; readOnly.readOnly = true;
+            auto db = ObjectStore::open(destination, readOnly);
+            auto txn = db.read();
+            const auto revision = db.objectAtVersion(txn, {expected.at("store"), mapping.at("generation"), ref.at("object"), ref.at("version")});
+            require(revision && revision->uuid == expected.at("first_revision").get<std::string>(), "mapping resolves");
         }
-        objects = {a, b, gone};
-        auto heads = [&](std::vector<std::string> uuids) {
-            auto txn = db.read(); VersionSelection selection;
-            for (const auto& uuid : uuids) selection[uuid] = db.currentVersion(txn, uuid);
-            return selection;
-        };
-        storeUuid = [&] { auto txn = db.read(); return db.uuid(txn); }();
-        auto submit = [&](VersionSelection expected, std::vector<TransactionOperation> operations) {
-            TransactionRequest r; r.requestUuid = util::newUuid(); r.storeUuid = storeUuid;
-            r.generation = [&] { auto txn = db.read(); return db.status(txn).generation; }();
-            r.author = "convert-test"; r.expectedObjects = std::move(expected); r.operations = std::move(operations);
-            return db.submit(r);
-        };
-        submit(heads({a}), {SetMetaOp{a, "note", "\"first\""}});
-        const auto edge = util::newUuid(), other = util::newUuid();
-        EdgeRecord link; link.uuid = edge; link.kind = "test_link"; link.aUuid = a; link.bUuid = b;
-        link.aAnchor.wholeGeometry = link.bAnchor.wholeGeometry = true;
-        EdgeRecord second = link; second.uuid = other; second.kind = "other_link";
-        submit(heads({a, b}), {AddEdgeOp{edgeRecordJson(link)}, AddEdgeOp{edgeRecordJson(second)}});
-        std::vector<uint8_t> nine(8); const double value = 9; std::memcpy(nine.data(), &value, 8);
-        submit(heads({a, b}), {EditGeometryOp{a, {{"points", 0, nine}}, {{edge, "retain", "{}", "{}"}, {other, "keep_recorded", "{}", "{}"}}}});
-        submit(heads({a, b}), {RemoveEdgeOp{other}});
-        submit(heads({gone}), {RetireObjectOp{gone}});
-        submit(heads({gone}), {DeleteObjectOp{gone}});
-        // Copy provenance that names an old revision UUID in metadata.
-        firstRevision = [&] { auto txn = db.read(); return db.objectHistory(txn, a).front().uuid; }();
-        submit(heads({b}), {SetMetaOp{b, "copied_from", Json{{"object_revision", firstRevision}}.dump()}});
-        edges = {edge, other};
-        expected = numbered(db, objects, edges);
+        requireWritable(destination, expected.at("objects").at(1));
+        if (schema != 17) continue;
+        require(report.at("gaps").at("metadata_revision_references").at("count") == 2, "provenance reference reported");
+        require(report.at("gaps").at("untimed_object_versions").at("count") == 0, "no untimed history");
+        // Deterministic: converting again yields the same mapping.
+        require(migration::convertStore(source, directory.path / "again.vcobj").mappingJson == result.mappingJson, "deterministic mapping");
+        // A replica with unpublished edits is refused and leaves nothing behind.
+        sql(source, "CREATE TABLE hub_upstream(singleton INTEGER PRIMARY KEY); CREATE TABLE hub_pending(record_uuid TEXT PRIMARY KEY, "
+                    "counter INTEGER, geometry_after INTEGER); INSERT INTO hub_pending VALUES('x',1,0);");
+        const auto refused = directory.path / "refused.vcobj";
+        mustFail([&] { (void)migration::convertStore(source, refused); });
+        require(!std::filesystem::exists(refused) && !std::filesystem::exists(refused.string() + ".converting"), "no partial destination");
+        sql(source, "DELETE FROM hub_pending;");
+        const auto settled = Json::parse(migration::convertStore(source, directory.path / "settled.vcobj").reportJson);
+        require(settled.at("source_role") == "replica" && settled.at("removed_tables").size() == 2, "coordination removed");
     }
-    downgrade(source);
-    const auto before = bytesOf(source);
-    mustFail([&] { (void)ObjectStore::open(source, options); }); // the runtime refuses schema 17
-
-    const auto destination = directory.path / "new.vcobj";
-    const auto result = migration::convertStore(source, destination);
-    require(bytesOf(source) == before, "source untouched");
-    const auto report = Json::parse(result.reportJson);
-    const auto mapping = Json::parse(result.mappingJson);
-    require(report.at("validation") == "ok" && report.at("source_role") == "standalone", "report");
-    require(report.at("gaps").at("metadata_revision_references").at("count") == 2, "provenance reference reported");
-    require(report.at("gaps").at("untimed_object_versions").at("count") == 0, "no untimed history");
-    mustFail([&] { (void)migration::convertStore(source, destination); }); // never overwrites
-
-    {
-        auto db = ObjectStore::open(destination, options);
-        const auto converted = numbered(db, objects, edges);
-        require(converted.objects == expected.objects, "object versions and commits match runtime numbering");
-        require(converted.relationshipHeads == expected.relationshipHeads, "relationship versions match");
-        require(converted.feed == expected.feed && converted.sequence == expected.sequence, "feed matches");
-        auto txn = db.read();
-        const auto status = db.status(txn);
-        require(status.storeUuid == storeUuid && status.generation == mapping.at("generation").get<std::string>(), "identity kept");
-        const auto ref = mapping.at("objects").at(firstRevision);
-        const auto revision = db.objectAtVersion(txn, {storeUuid, status.generation, ref.at("object"), ref.at("version")});
-        require(revision && revision->uuid == firstRevision, "mapping resolves");
-    }
-    // Deterministic: converting again yields the same mapping.
-    const auto again = directory.path / "again.vcobj";
-    require(migration::convertStore(source, again).mappingJson == result.mappingJson, "deterministic mapping");
-
-    // A replica with unpublished edits is refused and leaves no destination.
-    sql(source, "CREATE TABLE hub_upstream(singleton INTEGER PRIMARY KEY); CREATE TABLE hub_pending(record_uuid TEXT PRIMARY KEY, "
-                "counter INTEGER, geometry_after INTEGER); INSERT INTO hub_pending VALUES('x',1,0);");
-    const auto refused = directory.path / "refused.vcobj";
-    mustFail([&] { (void)migration::convertStore(source, refused); });
-    require(!std::filesystem::exists(refused), "no partial destination");
-    sql(source, "DELETE FROM hub_pending;");
-    const auto settled = migration::convertStore(source, directory.path / "settled.vcobj");
-    const auto settledReport = Json::parse(settled.reportJson);
-    require(settledReport.at("source_role") == "replica" && settledReport.at("removed_tables").size() == 2, "coordination removed");
     std::cout << "object store convert: ok\n";
     return 0;
 } catch (const std::exception& error) {

@@ -63,6 +63,11 @@ namespace detail {
 // Called only after a read connection has pinned its new SQLite snapshot.
 void beginReadCaches(sqlite3*, StatementPool&, size_t geometryBudget, size_t spatialBudget);
 void beginSpatialRead(StatementPool&, size_t budget, int version);
+// The current schema version and the whole schema of a new store (one
+// history generation), inside the caller's transaction. The offline
+// converter builds its destination with the same function.
+inline constexpr int kSchemaVersion = 19;
+void createStoreSchema(sqlite3*, const std::string& generation);
 }
 // Hosting role, fixed at open by the presence of the hub_* tables.
 enum class HubRole { None, Hub, Replica };

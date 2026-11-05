@@ -14,10 +14,19 @@ ObjectStore::~ObjectStore() = default;
 ObjectStore::ObjectStore(ObjectStore&&) noexcept = default;
 ObjectStore& ObjectStore::operator=(ObjectStore&&) noexcept = default;
 
+void detail::createStoreSchema(sqlite3* db, const std::string& generation)
+{
+    createSchema(db);
+    createHistorySchema(db);
+    createLifecycleSchema(db);
+    createDependencyIndex(db);
+    createSourceIdentityIndex(db);
+    createVersionSchema(db, generation);
+}
+
 std::unique_ptr<ObjectStore::Impl> ObjectStore::openImpl(const std::filesystem::path& path, const OpenOptions& options, bool create)
 {
     const int kApplicationId = 0x56434f42;
-    const int kSchemaVersion = 18;
     if (create && options.readOnly) throw std::invalid_argument("create requires writable options");
     if (create && options.sharedFile) throw std::invalid_argument("object store: create a store locally, then initialize it as a hub");
     if (options.serviceOwner && (options.readOnly || options.sharedFile))
@@ -41,7 +50,8 @@ std::unique_ptr<ObjectStore::Impl> ObjectStore::openImpl(const std::filesystem::
             throw std::runtime_error("object store: unsupported database format: " + path.string());
         if (const int version = pragmaInt(db, "user_version"); version != kSchemaVersion)
             throw std::runtime_error("object store: unsupported database schema: " + path.string() +
-                (version == 17 ? " (schema 17: convert it with vc_object_convert)" : ""));
+                (version == 17 || version == 18 ? " (schema " + std::to_string(version) +
+                 ": convert it with vc_object_convert)" : std::string()));
         // A hub must keep its rollback journal: opening it with WAL from a
         // network mount would break locking for every other client.
         impl->hubRole = detectHubRole(db);
@@ -67,12 +77,7 @@ std::unique_ptr<ObjectStore::Impl> ObjectStore::openImpl(const std::filesystem::
         exec(impl->writer, ("PRAGMA application_id=" + std::to_string(kApplicationId) + ";").c_str());
         exec(impl->writer, "BEGIN IMMEDIATE;");
         try {
-            createSchema(impl->writer);
-            createHistorySchema(impl->writer);
-            createLifecycleSchema(impl->writer);
-            createDependencyIndex(impl->writer);
-            createSourceIdentityIndex(impl->writer);
-            createVersionSchema(impl->writer, util::newUuid());
+            createStoreSchema(impl->writer, util::newUuid());
             exec(impl->writer, ("PRAGMA user_version=" + std::to_string(kSchemaVersion) + ";").c_str());
             exec(impl->writer, "COMMIT;");
         } catch (...) {

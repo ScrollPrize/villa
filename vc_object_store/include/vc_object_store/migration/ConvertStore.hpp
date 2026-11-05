@@ -1,7 +1,9 @@
 #pragma once
-// Offline conversion of schema-17 stores (standalone, hub, or settled hub
-// replica) to the numbered-history schema. The only place that knows the
-// previous format; the runtime opens schema 18 only.
+// Offline conversion of schema-17 and schema-18 stores (standalone, hub, or
+// settled hub replica) to the current schema (19). The only place that knows
+// the previous formats; the runtime opens the current schema only. Schema 17
+// is numbered first (schema 18), then every format is copied into a store
+// built by the runtime's own schema definition.
 //
 // The source is never modified: it is read through one consistent SQLite
 // snapshot into a new destination. Identities, recorded history, geometry,
@@ -26,6 +28,7 @@ struct ConversionResult {
     std::string reportJson;
     // Old object/relationship revision UUID -> generation-qualified numbered
     // reference, for converting pins in external exports and job configs.
+    // Entries from a schema-18 source also name their own generation.
     std::string mappingJson;
 };
 

@@ -12,20 +12,20 @@ void detail::createVersionSchema(sqlite3* db, const std::string& generation, con
     exec(db, R"SQL(
 CREATE TABLE store_history(
   singleton INTEGER PRIMARY KEY CHECK(singleton=1),
-  active_generation TEXT NOT NULL,
+  active_generation BLOB NOT NULL,
   commit_sequence INTEGER NOT NULL DEFAULT 0 CHECK(commit_sequence>=0),
   feed_start INTEGER NOT NULL DEFAULT 0 CHECK(feed_start>=0)
 );
 CREATE TABLE history_generations(
-  generation TEXT PRIMARY KEY CHECK(length(generation)=36),
+  generation BLOB PRIMARY KEY CHECK(length(generation)=16),
   after_sequence INTEGER NOT NULL,
   started_at_us INTEGER NOT NULL,
   reason TEXT NOT NULL
 );
 CREATE TABLE store_commits(
   seq INTEGER PRIMARY KEY CHECK(seq>0),
-  generation TEXT NOT NULL REFERENCES history_generations(generation),
-  request_uuid TEXT,
+  generation BLOB NOT NULL REFERENCES history_generations(generation),
+  request_uuid BLOB,
   author TEXT NOT NULL, host TEXT NOT NULL,
   published_at_us INTEGER NOT NULL
 );
@@ -33,31 +33,31 @@ CREATE TABLE store_changes(
   seq INTEGER NOT NULL REFERENCES store_commits(seq),
   position INTEGER NOT NULL,
   record_kind TEXT NOT NULL CHECK(record_kind IN ('object','relationship')),
-  record_uuid TEXT NOT NULL,
+  record_uuid BLOB NOT NULL,
   version INTEGER NOT NULL CHECK(version>0),
   deleted INTEGER NOT NULL DEFAULT 0,
   PRIMARY KEY(seq,position)
-);
+) WITHOUT ROWID;
 CREATE TABLE object_versions(
-  object_uuid TEXT NOT NULL,
+  object_uuid BLOB NOT NULL,
   version INTEGER NOT NULL CHECK(version>0),
-  generation TEXT NOT NULL REFERENCES history_generations(generation),
+  generation BLOB NOT NULL REFERENCES history_generations(generation),
   commit_seq INTEGER REFERENCES store_commits(seq),
-  revision_uuid TEXT NOT NULL UNIQUE REFERENCES object_revisions(uuid),
+  revision_uuid BLOB NOT NULL UNIQUE REFERENCES object_revisions(uuid),
   PRIMARY KEY(object_uuid,version)
-);
+) WITHOUT ROWID;
 CREATE TABLE relationship_versions(
-  edge_uuid TEXT NOT NULL,
+  edge_uuid BLOB NOT NULL,
   version INTEGER NOT NULL CHECK(version>0),
-  generation TEXT NOT NULL REFERENCES history_generations(generation),
+  generation BLOB NOT NULL REFERENCES history_generations(generation),
   commit_seq INTEGER REFERENCES store_commits(seq),
-  revision_uuid TEXT UNIQUE REFERENCES relationship_revisions(uuid),
+  revision_uuid BLOB UNIQUE REFERENCES relationship_revisions(uuid),
   deleted INTEGER NOT NULL DEFAULT 0 CHECK(deleted=(revision_uuid IS NULL)),
   PRIMARY KEY(edge_uuid,version)
-);
+) WITHOUT ROWID;
 CREATE TABLE transaction_receipts(
-  request_uuid TEXT PRIMARY KEY CHECK(length(request_uuid)=36),
-  generation TEXT NOT NULL REFERENCES history_generations(generation),
+  request_uuid BLOB PRIMARY KEY CHECK(length(request_uuid)=16),
+  generation BLOB NOT NULL REFERENCES history_generations(generation),
   digest TEXT NOT NULL,
   commit_seq INTEGER REFERENCES store_commits(seq),
   receipt TEXT NOT NULL CHECK(json_valid(receipt))
@@ -73,15 +73,15 @@ CREATE TABLE transaction_receipts(
     }
     const auto now = std::chrono::duration_cast<std::chrono::microseconds>(
         std::chrono::system_clock::now().time_since_epoch()).count();
-    execute(db, "INSERT INTO history_generations VALUES(?,0,?,?)", generation, int64_t(now), reason);
-    execute(db, "INSERT INTO store_history(singleton,active_generation) VALUES(1,?)", generation);
+    execute(db, "INSERT INTO history_generations VALUES(?,0,?,?)", parseUuid(generation), int64_t(now), reason);
+    execute(db, "INSERT INTO store_history(singleton,active_generation) VALUES(1,?)", parseUuid(generation));
 }
 
 std::string detail::activeGeneration(sqlite3* db)
 {
     Statement s(db, "SELECT active_generation FROM store_history");
     if (!s.row()) throw std::runtime_error("object store: missing history generation");
-    return s.text(0);
+    return s.uuid(0);
 }
 
 int64_t detail::commitSequence(sqlite3* db)
@@ -101,7 +101,7 @@ std::string detail::storeUuidText(sqlite3* db)
 std::optional<int64_t> detail::headVersion(sqlite3* db, const std::string& objectUuid)
 {
     Statement s(db, "SELECT v.version FROM object_heads h JOIN object_versions v ON v.revision_uuid=h.revision_uuid "
-                    "WHERE h.object_uuid=?", objectUuid);
+                    "WHERE h.object_uuid=?", parseUuid(objectUuid));
     return s.row() ? std::optional(s.i64(0)) : std::nullopt;
 }
 
@@ -112,10 +112,10 @@ void detail::attachObjectVersions(sqlite3* db, std::vector<ObjectRecord>& record
     Statement s(db, "SELECT version,generation FROM object_versions WHERE object_uuid=? ORDER BY version DESC LIMIT 1");
     for (auto& record : records) {
         s.reset();
-        s.bind(1, record.uuid);
+        s.bind(1, parseUuid(record.uuid));
         if (s.row()) {
             record.version = s.i64(0);
-            record.versionGeneration = s.text(1);
+            record.versionGeneration = s.uuid(1);
         }
     }
 }
@@ -126,10 +126,10 @@ void detail::attachRelationshipVersions(sqlite3* db, std::vector<EdgeRecord>& re
                     "ORDER BY version DESC LIMIT 1");
     for (auto& record : records) {
         s.reset();
-        s.bind(1, record.uuid);
+        s.bind(1, parseUuid(record.uuid));
         if (s.row() && !s.i64(2)) {
             record.version = s.i64(0);
-            record.versionGeneration = s.text(1);
+            record.versionGeneration = s.uuid(1);
         }
     }
 }
@@ -137,14 +137,14 @@ void detail::attachRelationshipVersions(sqlite3* db, std::vector<EdgeRecord>& re
 std::optional<int64_t> detail::relationshipHeadVersion(sqlite3* db, const std::string& edgeUuid)
 {
     Statement s(db, "SELECT version,deleted FROM relationship_versions WHERE edge_uuid=? ORDER BY version DESC LIMIT 1",
-        edgeUuid);
+        parseUuid(edgeUuid));
     if (!s.row() || s.i64(1)) return std::nullopt;
     return s.i64(0);
 }
 
 int64_t detail::revisionVersion(sqlite3* db, const std::string& revisionUuid)
 {
-    Statement s(db, "SELECT version FROM object_versions WHERE revision_uuid=?", revisionUuid);
+    Statement s(db, "SELECT version FROM object_versions WHERE revision_uuid=?", parseUuid(revisionUuid));
     return s.row() ? s.i64(0) : 0;
 }
 
@@ -165,14 +165,14 @@ void CommitPublisher::begin()
         if (pool->second->actingAuthor) author = *pool->second->actingAuthor;
         if (!pool->second->commitHost.empty()) host = pool->second->commitHost;
     }
-    execute(db_, "INSERT INTO store_commits VALUES(?,?,?,?,?,?)", *sequence_, generation_, request, author, host,
-        publishedAtUs_);
+    execute(db_, "INSERT INTO store_commits VALUES(?,?,?,?,?,?)", *sequence_, parseUuid(generation_),
+        parseOptionalUuid(request), author, host, publishedAtUs_);
     execute(db_, "UPDATE store_history SET commit_sequence=?", *sequence_);
 }
 
 int64_t CommitPublisher::nextObject(const std::string& objectUuid)
 {
-    Statement s(db_, "SELECT coalesce(max(version),0) FROM object_versions WHERE object_uuid=?", objectUuid);
+    Statement s(db_, "SELECT coalesce(max(version),0) FROM object_versions WHERE object_uuid=?", parseUuid(objectUuid));
     s.row();
     return s.i64(0) + 1;
 }
@@ -181,9 +181,10 @@ int64_t CommitPublisher::object(const std::string& objectUuid, const std::string
 {
     begin();
     const auto version = nextObject(objectUuid);
-    execute(db_, "INSERT INTO object_versions VALUES(?,?,?,?,?)", objectUuid, version, generation_, *sequence_, revisionUuid);
+    execute(db_, "INSERT INTO object_versions VALUES(?,?,?,?,?)", parseUuid(objectUuid), version, parseUuid(generation_),
+        *sequence_, parseUuid(revisionUuid));
     execute(db_, "INSERT INTO store_changes VALUES(?,(SELECT count(*) FROM store_changes WHERE seq=?),'object',?,?,?)",
-        *sequence_, *sequence_, objectUuid, version, int64_t(deleted));
+        *sequence_, *sequence_, parseUuid(objectUuid), version, int64_t(deleted));
     return version;
 }
 
@@ -191,20 +192,20 @@ int64_t CommitPublisher::baseline(const std::string& objectUuid, const std::stri
 {
     const auto version = nextObject(objectUuid);
     execute(db_, "INSERT INTO object_versions(object_uuid,version,generation,revision_uuid) VALUES(?,?,?,?)",
-        objectUuid, version, generation_, revisionUuid);
+        parseUuid(objectUuid), version, parseUuid(generation_), parseUuid(revisionUuid));
     return version;
 }
 
 int64_t CommitPublisher::relationship(const std::string& edgeUuid, const std::optional<std::string>& revisionUuid)
 {
     begin();
-    Statement next(db_, "SELECT coalesce(max(version),0)+1 FROM relationship_versions WHERE edge_uuid=?", edgeUuid);
+    Statement next(db_, "SELECT coalesce(max(version),0)+1 FROM relationship_versions WHERE edge_uuid=?", parseUuid(edgeUuid));
     next.row();
     const auto version = next.i64(0);
-    execute(db_, "INSERT INTO relationship_versions VALUES(?,?,?,?,?,?)", edgeUuid, version, generation_, *sequence_,
-        revisionUuid, int64_t(!revisionUuid));
+    execute(db_, "INSERT INTO relationship_versions VALUES(?,?,?,?,?,?)", parseUuid(edgeUuid), version, parseUuid(generation_),
+        *sequence_, parseOptionalUuid(revisionUuid), int64_t(!revisionUuid));
     execute(db_, "INSERT INTO store_changes VALUES(?,(SELECT count(*) FROM store_changes WHERE seq=?),'relationship',?,?,?)",
-        *sequence_, *sequence_, edgeUuid, version, int64_t(!revisionUuid));
+        *sequence_, *sequence_, parseUuid(edgeUuid), version, int64_t(!revisionUuid));
     return version;
 }
 
@@ -265,7 +266,7 @@ TransactionReceipt detail::finishReceipt(sqlite3* db, const StatementPool& pool,
             *pool.publishedSequence);
         while (changes.row()) {
             const bool object = changes.text(0) == "object";
-            const auto uuid = changes.text(1);
+            const auto uuid = changes.uuid(1);
             const auto version = changes.i64(2);
             auto& target = object ? receipt.objects : receipt.relationships;
             target[uuid] = changes.i64(3) ? std::nullopt : std::optional(version);
@@ -274,20 +275,20 @@ TransactionReceipt detail::finishReceipt(sqlite3* db, const StatementPool& pool,
             Statement previous(db, object ? "SELECT 0 FROM object_versions v JOIN object_revisions r ON r.uuid=v.revision_uuid "
                                             "WHERE v.object_uuid=? AND v.version=? AND r.deleted=0"
                                           : "SELECT 0 FROM relationship_versions WHERE edge_uuid=? AND version=? AND deleted=0",
-                uuid, version - 1);
+                parseUuid(uuid), version - 1);
             if (!previous.row()) receipt.created.push_back(uuid);
         }
     }
     if (pool.requestUuid) {
-        execute(db, "INSERT INTO transaction_receipts VALUES(?,?,?,?,?)", *pool.requestUuid, receipt.generation,
-            pool.requestDigest.value_or(""), receipt.commitSequence, receiptToJson(receipt).dump());
+        execute(db, "INSERT INTO transaction_receipts VALUES(?,?,?,?,?)", parseUuid(*pool.requestUuid),
+            parseUuid(receipt.generation), pool.requestDigest.value_or(""), receipt.commitSequence, receiptToJson(receipt).dump());
     }
     return receipt;
 }
 
 std::optional<TransactionReceipt> detail::savedReceipt(sqlite3* db, const std::string& requestUuid, std::string* digest)
 {
-    Statement s(db, "SELECT receipt,digest FROM transaction_receipts WHERE request_uuid=?", canonical(requestUuid));
+    Statement s(db, "SELECT receipt,digest FROM transaction_receipts WHERE request_uuid=?", parseUuid(requestUuid));
     if (!s.row()) return std::nullopt;
     if (digest) *digest = s.text(1);
     return receiptFromJson(Json::parse(s.text(0)));
@@ -331,8 +332,8 @@ void detail::checkTransactionContext(sqlite3* db, const TransactionContext& cont
             "object history: read dependency changed: " + conflicts.front().uuid);
     for (const auto& [uuid, expected] : context.expectedObjects) {
         const auto id = canonical(uuid);
-        Statement head(db, "SELECT revision_uuid FROM object_heads WHERE object_uuid=?", id);
-        expectedRevisions[id] = head.row() ? std::optional(head.text(0)) : std::nullopt;
+        Statement head(db, "SELECT revision_uuid FROM object_heads WHERE object_uuid=?", parseUuid(id));
+        expectedRevisions[id] = head.row() ? std::optional(head.uuid(0)) : std::nullopt;
     }
 }
 
@@ -343,7 +344,7 @@ StoreStatus ObjectStore::status(const Txn& txn) const
     auto* db = static_cast<sqlite3*>(connection(txn));
     Statement s(db, "SELECT active_generation,commit_sequence,feed_start FROM store_history");
     if (!s.row()) throw std::runtime_error("object store: missing history state");
-    return {storeUuidText(db), s.text(0), s.i64(1), s.i64(2)};
+    return {storeUuidText(db), s.uuid(0), s.i64(1), s.i64(2)};
 }
 
 std::optional<TransactionReceipt> ObjectStore::receipt(const Txn& txn, const std::string& requestUuid) const
@@ -408,7 +409,7 @@ ChangePage ObjectStore::changesSince(const Txn& txn, const FeedCursor& cursor, i
         cursor.sequence);
     while (commits.row()) {
         FeedCommit commit;
-        commit.sequence = commits.i64(0); commit.requestUuid = commits.optText(1);
+        commit.sequence = commits.i64(0); commit.requestUuid = commits.optUuid(1);
         commit.author = commits.text(2); commit.host = commits.text(3); commit.publishedAtUs = commits.i64(4);
         const int64_t skip = commit.sequence == cursor.sequence + 1 ? cursor.offset : 0;
         Statement count(db, "SELECT count(*) FROM store_changes WHERE seq=?", commit.sequence);
@@ -419,7 +420,7 @@ ChangePage ObjectStore::changesSince(const Txn& txn, const FeedCursor& cursor, i
         Statement changes(db, "SELECT record_kind,record_uuid,version,deleted FROM store_changes WHERE seq=? "
                               "ORDER BY position LIMIT ? OFFSET ?", commit.sequence, take, skip);
         while (changes.row())
-            commit.changes.push_back({changes.text(0), changes.text(1), changes.i64(2), changes.i64(3) != 0});
+            commit.changes.push_back({changes.text(0), changes.uuid(1), changes.i64(2), changes.i64(3) != 0});
         delivered += take;
         commit.complete = take == remaining;
         page.next.sequence = commit.complete ? commit.sequence : commit.sequence - 1;
@@ -441,8 +442,8 @@ std::string ObjectStore::startHistoryGeneration(const std::string& reason)
     const auto generation = util::newUuid();
     const auto now = std::chrono::duration_cast<std::chrono::microseconds>(
         std::chrono::system_clock::now().time_since_epoch()).count();
-    execute(db, "INSERT INTO history_generations VALUES(?,?,?,?)", generation, commitSequence(db), int64_t(now), reason);
-    execute(db, "UPDATE store_history SET active_generation=?", generation);
+    execute(db, "INSERT INTO history_generations VALUES(?,?,?,?)", parseUuid(generation), commitSequence(db), int64_t(now), reason);
+    execute(db, "UPDATE store_history SET active_generation=?", parseUuid(generation));
     txn.commit();
     return generation;
 }

@@ -15,6 +15,8 @@ void check(int rc, sqlite3* db, const char* what = "sqlite");
 void exec(sqlite3* db, const char* sql);
 std::array<unsigned char, 16> parseUuid(const std::string& uuid);
 std::string formatUuid(const std::array<unsigned char, 16>& bytes);
+// UUID keys are stored as 16-byte blobs; null stays null.
+std::optional<std::array<unsigned char, 16>> parseOptionalUuid(const std::optional<std::string>& uuid);
 std::string nowIsoUtc();
 std::string detectHostname();
 void applyPragmas(sqlite3* db, const OpenOptions& options, bool queryOnly);
@@ -57,6 +59,9 @@ public:
     std::string text(int c) const;
     std::optional<std::string> optText(int c) const;
     std::array<unsigned char, 16> blob16(int c) const;
+    // A 16-byte UUID key column in canonical text form.
+    std::string uuid(int c) const;
+    std::optional<std::string> optUuid(int c) const;
     Statement(const Statement&) = delete;
     Statement& operator=(const Statement&) = delete;
     sqlite3_stmt* value = nullptr;

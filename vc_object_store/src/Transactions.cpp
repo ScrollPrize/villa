@@ -46,9 +46,8 @@ void Txn::release(bool commit)
             publishHistory(conn);
             enforceHubRules(conn, *activeStatementPools.at(conn), db_->impl_->hubRole);
             for (const auto& [uuid, expected] : expectedRevisions_) {
-                Statement head(conn, "SELECT revision_uuid FROM object_heads WHERE object_uuid=?",
-                               formatUuid(parseUuid(uuid)));
-                committedRevisions_[uuid] = head.row() ? std::optional(head.text(0)) : std::nullopt;
+                Statement head(conn, "SELECT revision_uuid FROM object_heads WHERE object_uuid=?", parseUuid(uuid));
+                committedRevisions_[uuid] = head.row() ? std::optional(head.uuid(0)) : std::nullopt;
             }
             auto expectedObjects = expectedObjectVersions_;
             for (const auto& [uuid, expected] : expectedRevisions_) expectedObjects.emplace(uuid, std::nullopt);

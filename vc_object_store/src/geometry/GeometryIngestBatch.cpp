@@ -51,7 +51,7 @@ int64_t detail::ingestGeometryBatch(ObjectStore& db, WriteTxn& write, std::vecto
         const auto existing=db.objectByUuid(write,p.object.uuid);
         detail::Statement history(connection,"SELECT 1 FROM geometry_revisions WHERE object_uuid=? LIMIT 1",
             detail::parseUuid(p.object.uuid));
-        detail::Statement prior(connection,"SELECT 1 FROM object_revisions WHERE object_uuid=? LIMIT 1", p.object.uuid);
+        detail::Statement prior(connection,"SELECT 1 FROM object_revisions WHERE object_uuid=? LIMIT 1", detail::parseUuid(p.object.uuid));
         if(registeredInitial ? (!existing || existing->retired || history.row()) : (existing.has_value() || prior.row()))
             throw std::runtime_error("object already exists or was previously imported; re-import is unsupported: "+p.object.uuid);
     }

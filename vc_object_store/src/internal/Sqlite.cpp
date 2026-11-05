@@ -218,6 +218,18 @@ std::optional<std::string> Statement::optText(int c) const
     return isNull(c) ? std::nullopt : std::optional(text(c));
 }
 
+std::string Statement::uuid(int c) const { return formatUuid(blob16(c)); }
+
+std::optional<std::string> Statement::optUuid(int c) const
+{
+    return isNull(c) ? std::nullopt : std::optional(uuid(c));
+}
+
+std::optional<std::array<unsigned char, 16>> parseOptionalUuid(const std::optional<std::string>& uuid)
+{
+    return uuid ? std::optional(parseUuid(*uuid)) : std::nullopt;
+}
+
 std::array<unsigned char, 16> Statement::blob16(int c) const
 {
     if (sqlite3_column_bytes(value, c) != 16)
