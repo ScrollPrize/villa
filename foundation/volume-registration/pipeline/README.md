@@ -40,6 +40,7 @@ Two things behave differently from the first runs:
 | `volreg/record.py` | the per-pair record: its files, whole-file writes, the append-only event log, the reviewer |
 | `volreg/scoring.py` | score a transform against the hold-out set, in fine voxels, from the record alone; the publishing bar |
 | `volreg/migrate.py` | convert a session of the first runs (`fit_session.py`) into a record |
+| `volreg/release.py` | gather the newest decided record of every pair into one release set |
 | `volreg/engine.py` | state read off the files, as make does: done, stale, running, failed, ready, waiting, blocked; background jobs; redo |
 | `volreg/stages.py` | the stage table of `DESIGN.md`, and what each stage does |
 | `volreg/cli.py` | `run`, `status`, `answer`, `more`, `redo`, `adopt`, `job`, `check`, `migrate`, `import` |
@@ -119,6 +120,18 @@ logged with the reason:
     uv run --python 3.12 --with-requirements requirements.txt python -m volreg.cli check RECORDS
     uv run --python 3.12 --with-requirements requirements.txt python -m volreg.cli migrate \
         SESSION OUT --handle HANDLE --email EMAIL --staged PUBLISH_CANDIDATES
+
+`release` gathers the newest decided record of every pair into a new folder, from any
+number of records folders (the pipeline's and the migrated first runs'). A pipeline record
+wins over a migrated one of the same pair. Each pair keeps `pair.json`, `holdout.json`
+(every answer with its reviewer's handle and email), `final-review.json`,
+`patch-reviews.json` where there is one, and `fit/`; the event log, the settings and `work/`
+stay behind. `index.json` lists each pair's source, decision, score, answer counts and file
+hashes, and what its record does not hold (a migrated record has no code commit or decision
+time, for example); nothing is filled in. Undecided and superseded records are listed as
+left out. `check` runs on a release as on any records folder:
+
+    uv run --python 3.12 --with-requirements requirements.txt python -m volreg.cli release OUT RECORDS [RECORDS ...]
 
 Tests:
 

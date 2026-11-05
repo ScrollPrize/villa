@@ -11,6 +11,7 @@
     python -m volreg.cli check RECORD [RECORD ...]
     python -m volreg.cli migrate SESSION OUT [--staged DIR]
     python -m volreg.cli import PAIR SESSION RECORD          a first run's patches, fits and answers
+    python -m volreg.cli release OUT RECORDS_DIR [...]      every pair's newest decided record
 
 The reviewer is taken from --handle and --email, or VOLREG_HANDLE and VOLREG_EMAIL.
 """
@@ -24,6 +25,7 @@ from pathlib import Path
 from . import engine
 from . import migrate as migration
 from . import record as rec
+from . import release as releasing
 from . import stages as pipeline_stages
 from .cores.transform_io import read_transform_json
 from .scoring import bar_check, score
@@ -224,6 +226,9 @@ def main(argv=None):
     imported.add_argument("pair")
     imported.add_argument("session")
     imported.add_argument("record")
+    released = commands.add_parser("release", help="gather every pair's newest decided record")
+    released.add_argument("out")
+    released.add_argument("records", nargs="+")
     for command in (answer, migrate, more, new, redo, revisit):
         command.add_argument("--handle")
         command.add_argument("--email")
@@ -253,6 +258,13 @@ def main(argv=None):
         with pipeline_stages.session_lock(pipeline):
             print(migration.import_session(args.session, args.record, args.pair))
         advance(args.pair)
+    elif args.command == "release":
+        index = releasing.release(args.out, args.records)
+        for pair in index["pairs"]:
+            missing = f"  (not recorded: {', '.join(pair['not_recorded'])})" if pair["not_recorded"] else ""
+            print(f"{pair['pair'][:52]:52s} {pair['decision']['publish']:6s} from {pair['source']}{missing}")
+        for item in index["left_out"]:
+            print(f"left out: {item['source']}: {item['why']}")
     elif args.command == "adopt":
         changed = pipeline_stages.pipeline(args.pair).adopt_needs(args.stage, args.reason)
         print(f"{args.stage}: {'now rests on its new needs' if changed else 'already up to date'}")
