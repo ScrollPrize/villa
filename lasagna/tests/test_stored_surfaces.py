@@ -103,7 +103,7 @@ class StoredSurfaceReadTest(unittest.TestCase):
 			with ObjectStore.open(str(store), author="test") as db:
 				with db.write(expected_versions={uid: 1}) as tx:
 					tx.put_geometry(uid, Surface.from_arrays(np.ascontiguousarray(xyz + 1), [1.0, 1.0]),
-									db.current_geometry(uid)["uuid"])
+									expected_version=1)
 			ref = stored_surfaces.surface_ref(uid, first.version)
 			self.assertEqual(stored_surfaces.parse_surface_ref(ref), (uid, first.version))
 			self.assertEqual(first.version[1], 1)
