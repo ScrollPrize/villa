@@ -176,6 +176,41 @@ try {
         const auto settled = Json::parse(migration::convertStore(source, directory.path / "settled.vcobj").reportJson);
         require(settled.at("source_role") == "replica" && settled.at("removed_tables").size() == 2, "coordination removed");
     }
+    // Schema 16 (the patches detail table, hub sync baselines): its form of
+    // the schema-17 fixture. Surface data is refused; without it the history
+    // converts as from schema 17.
+    {
+        const auto source = directory.path / "old16.vcobj";
+        sql(source, bytesOf(kData / "convert_schema17.sql"));
+        sql(source, "DROP TRIGGER surfaces_history_INSERT; DROP TRIGGER surfaces_history_UPDATE; DROP TRIGGER surfaces_history_DELETE;"
+                    "ALTER TABLE surfaces RENAME TO patches; ALTER TABLE patches DROP COLUMN area;"
+                    "CREATE TABLE sync_baselines(seq INTEGER PRIMARY KEY AUTOINCREMENT, peer TEXT NOT NULL, token TEXT NOT NULL,"
+                    " state TEXT NOT NULL, UNIQUE(peer,token));"
+                    "CREATE TABLE sync_baseline_records(peer TEXT NOT NULL, record_uuid TEXT NOT NULL, baseline_seq INTEGER NOT NULL,"
+                    " state TEXT NOT NULL, PRIMARY KEY(peer,record_uuid,baseline_seq));"
+                    "CREATE TABLE sync_baseline_cursors(baseline_seq INTEGER PRIMARY KEY, journal_seq INTEGER NOT NULL, geometry_seq INTEGER NOT NULL);"
+                    "PRAGMA user_version=16;");
+        const auto refused = directory.path / "refused16.vcobj";
+        mustFail([&] { (void)migration::convertStore(source, refused); }); // a surface
+        require(!std::filesystem::exists(refused) && !std::filesystem::exists(refused.string() + ".converting"), "nothing left");
+        sql(source, "DELETE FROM patches; UPDATE objects SET kind='test_surface' WHERE kind='surface';"
+                    "DELETE FROM history_dirty_objects; DELETE FROM history_dirty_edges;"
+                    "INSERT INTO sync_baselines(peer,token,state) VALUES('p','t','{}');");
+        mustFail([&] { (void)migration::convertStore(source, refused); }); // unsettled baselines
+        sql(source, "DELETE FROM sync_baselines;");
+        const auto destination = directory.path / "new16.vcobj";
+        const auto result = migration::convertStore(source, destination);
+        const auto report = Json::parse(result.reportJson);
+        require(report.at("source_schema") == 16 && report.at("validation") == "ok" && report.contains("upgraded_from_schema_16") &&
+                scalar(destination, "SELECT count(*) FROM sqlite_master WHERE name LIKE 'sync_baseline%' OR name='patches'") == 0,
+                "schema 16 upgraded");
+        // The unedited schema-17 conversion.
+        const auto reference = directory.path / "again.vcobj";
+        for (const auto* query : {"SELECT count(*) FROM object_versions", "SELECT count(*) FROM relationship_versions",
+                                  "SELECT count(*) FROM store_changes", "SELECT count(*) FROM store_commits"})
+            require(scalar(destination, query) == scalar(reference, query), "same numbered history as schema 17");
+        requireWritable(destination, expected.at("objects").at(1));
+    }
     std::cout << "object store convert: ok\n";
     return 0;
 } catch (const std::exception& error) {

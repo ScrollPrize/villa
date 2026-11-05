@@ -337,6 +337,34 @@ Json settle(sqlite3* db, Json& report)
     }
     return removed;
 }
+// Schema 16 -> 17 in place on the staged copy, for stores without surface
+// data: the patches detail table becomes surfaces (with the area the runtime
+// keeps), and the hub's sync baselines, which have no successor, go. A store
+// with patch records needs their record JSON rewritten (detail key "patch")
+// and surface areas computed; that is refused, as are unsettled baselines.
+void upgradeSchema16(sqlite3* db, Json& report)
+{
+    const auto patches = scalar(db, "SELECT count(*) FROM patches");
+    const auto surfaceObjects = scalar(db, "SELECT count(*) FROM objects WHERE kind='surface'");
+    const auto patchJson = scalar(db, "SELECT (SELECT count(*) FROM object_revisions WHERE metadata_delta LIKE '%\"patch\"%' "
+                                      "OR metadata_delta LIKE '%\"/patch%') + (SELECT count(*) FROM object_head_records "
+                                      "WHERE record LIKE '%\"patch\"%')");
+    if (patches || surfaceObjects || patchJson)
+        throw std::runtime_error("convert: schema-16 surface (patch) records are not supported (" + std::to_string(surfaceObjects) +
+            " surfaces, " + std::to_string(patches) + " patch rows, " + std::to_string(patchJson) + " records naming patch)");
+    for (const auto* table : {"sync_baselines", "sync_baseline_records", "sync_baseline_cursors"})
+        if (tableExists(db, table) && scalar(db, std::string("SELECT count(*) FROM ") + table) > 0)
+            throw std::runtime_error(std::string("convert: schema-16 store has sync baselines (") + table +
+                "); sync or settle it with the old tooling before converting");
+    exec(db, "DROP TRIGGER IF EXISTS patches_history_INSERT; DROP TRIGGER IF EXISTS patches_history_UPDATE;"
+             "DROP TRIGGER IF EXISTS patches_history_DELETE;");
+    exec(db, "ALTER TABLE patches RENAME TO surfaces; ALTER TABLE surfaces ADD COLUMN area REAL NOT NULL DEFAULT 0;");
+    for (const auto* table : {"sync_baseline_cursors", "sync_baseline_records", "sync_baselines"})
+        exec(db, (std::string("DROP TABLE IF EXISTS ") + table + ";").c_str());
+    report["upgraded_from_schema_16"] = {{"renamed", {{"patches", "surfaces"}}},
+                                         {"removed_tables", {"sync_baselines", "sync_baseline_records", "sync_baseline_cursors"}}};
+}
+
 // Schema 17 -> 18 in place on the staged copy: numbered versions and commits
 // from recorded publication order (the only reconstruction), plus the gaps
 // report. Returns the old revision UUID -> numbered reference mapping.
@@ -582,8 +610,8 @@ ConversionResult convertStore(const std::filesystem::path& source, const std::fi
     if (pragmaInt(in.db, "application_id") != kApplicationId)
         throw std::runtime_error("convert: not an object store: " + source.string());
     const int sourceSchema = pragmaInt(in.db, "user_version");
-    if (sourceSchema != 17 && sourceSchema != kNumberedSchema)
-        throw std::runtime_error("convert: expected schema 17 or 18, found " + std::to_string(sourceSchema));
+    if (sourceSchema != 16 && sourceSchema != 17 && sourceSchema != kNumberedSchema)
+        throw std::runtime_error("convert: expected schema 16, 17 or 18, found " + std::to_string(sourceSchema));
 
     Json report{{"source", source.string()}, {"destination", destination.string()},
                 {"source_schema", sourceSchema}, {"target_schema", kSchemaVersion}};
@@ -612,7 +640,8 @@ ConversionResult convertStore(const std::filesystem::path& source, const std::fi
         exec(db, "PRAGMA foreign_keys=ON;");
         exec(db, "BEGIN IMMEDIATE;");
         report["removed_tables"] = settle(db, report);
-        const auto mapping = sourceSchema == 17 ? numberSchema17(db, report, source) : mappingOfSchema18(db, report);
+        if (sourceSchema == 16) upgradeSchema16(db, report);
+        const auto mapping = sourceSchema < kNumberedSchema ? numberSchema17(db, report, source) : mappingOfSchema18(db, report);
         exec(db, "COMMIT;");
         staged = {};
 

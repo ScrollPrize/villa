@@ -1,7 +1,8 @@
 #pragma once
-// Offline conversion of schema-17 and schema-18 stores (standalone, hub, or
+// Offline conversion of schema-16, schema-17 and schema-18 stores (standalone, hub, or
 // settled hub replica) to the current schema (19). The only place that knows
-// the previous formats; the runtime opens the current schema only. Schema 17
+// the previous formats; the runtime opens the current schema only. Schema 16
+// (without surface data) is first brought to schema 17; schema 17
 // is numbered first (schema 18), then every format is copied into a store
 // built by the runtime's own schema definition.
 //

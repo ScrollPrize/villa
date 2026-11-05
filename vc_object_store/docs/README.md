@@ -315,7 +315,7 @@ which requests expect.
 Writable opens hold a host-local ownership lock on `<canonical path>-owner`:
 shared between standalone writers, exclusive for `OpenOptions::serviceOwner`.
 
-### Converting schema-17 and schema-18 stores
+### Converting schema-16, schema-17 and schema-18 stores
 
 The runtime opens schema 19 only. Stop every client, settle hub replicas with
 the old tooling, then convert into a new file (the source is never changed):
@@ -331,7 +331,10 @@ a recorded publication, geometry revisions that do not select one object
 version, metadata still holding old revision UUIDs, and an unversioned inventory
 of external artifact files. Converted commits have author `unrecorded`.
 
-A schema-17 source is numbered first (schema 18, on a scratch copy beside the
+A schema-16 source is first brought to schema 17 on the scratch copy: its
+empty `patches` detail table becomes `surfaces` and the hub's `sync_baselines`
+tables are dropped. Schema-16 stores holding surface (`patch`) records or sync
+baselines are refused; no known store has them. A schema-17 source is numbered first (schema 18, on a scratch copy beside the
 destination), then copied into a store built by the current schema
 definition. Schema 19 keeps the same content in less space: history, version
 and head keys are 16-byte blobs, a revision without a parent stores its whole
