@@ -61,7 +61,7 @@ public:
     // or attaches it beside the project.
     void cloneHostedStore(bool asProject);
     // Collects a kind, a source folder and an optional volume binding, then ingests
-    // it into the kind's store in the background (vc::objects::ingestGeometrySource).
+    // it into the kind's store in the background (StoreImportController).
     void importIntoObjectStore();
     // Terminal outcome of an asynchronous Open Data sample open.
     struct OpenDataSampleOpenOutcome {
@@ -88,9 +88,33 @@ public:
     // True while any sample open is in flight.
     bool openDataSampleOpenInFlight() const;
 
+    struct LasagnaManifestOutcome {
+        bool success{false};
+        bool alreadyAttached{false};
+        // The project was replaced or closed while the manifest loaded; nothing was attached.
+        bool projectReplaced{false};
+        QString error;
+        QString location;
+        bool fiberInference{false};
+        QStringList volumeIds;
+    };
+    // Loads and validates a local or remote .lasagna.json manifest in the
+    // background, as regular Lasagna data or as fiber inference (never inferred
+    // from the location), then attaches it to the project open at the start if
+    // it still is. False when an attachment is already loading or no project is open.
+    bool startLasagnaManifestAttachment(const QString& location, bool fiberInference,
+                                        std::function<void(const LasagnaManifestOutcome&)> onFinished,
+                                        QString* errorMessage = nullptr);
+    bool lasagnaManifestAttachmentInFlight() const { return _lasagnaAttachmentInFlight; }
+
     // Remove a project entry (volume, normal grid or Lasagna dataset) by
     // location, after asking.
     void detachEntryAt(const QString& location);
+    // The same without asking: removes the entry (for everyone using the
+    // project, or only you; VolumePkg::entryOwner) and refreshes the project's
+    // volumes and views. False when no entry has `location`; throws when the
+    // project cannot be saved.
+    bool removeEntry(const QString& location);
     // Open Data: the sample's project store, made or refreshed from the catalog.
     void resetOpenDataProject();
 

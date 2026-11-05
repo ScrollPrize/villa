@@ -222,6 +222,10 @@ set(srcs
     MenuActionController.hpp
     SshPrompts.cpp
     SshPrompts.hpp
+    ProjectResources.cpp
+    ProjectResources.hpp
+    StoreImportController.cpp
+    StoreImportController.hpp
     VolumeAttachmentController.cpp
     VolumeAttachmentController.hpp
     UnifiedBrowserDialog.cpp
