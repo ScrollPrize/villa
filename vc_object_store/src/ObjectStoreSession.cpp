@@ -1227,7 +1227,7 @@ std::filesystem::path ObjectStoreSession::path(const AttachmentIdentity& identit
 
 RevisionSelection ObjectStoreSession::editKeepingRelationships(const AttachmentIdentity& identity,
     const RevisionSelection& pins, const RevisionSelection& related,
-    const std::function<void(ObjectStore&, WriteTxn&, const KeepRecorded&)>& edit)
+    const std::function<void(ObjectStore&, WriteTxn&, const KeepRecorded&)>& edit, TransactionReceipt* receipt)
 {
     // Objects pinned without a revision are created by the edit: none to lease.
     std::vector<std::string> existing;
@@ -1262,7 +1262,7 @@ RevisionSelection ObjectStoreSession::editKeepingRelationships(const AttachmentI
             return result;
         };
         edit(store, txn, keep);
-    });
+    }, receipt);
 }
 
 void ObjectStoreSession::finalize()

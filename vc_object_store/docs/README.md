@@ -278,6 +278,21 @@ direct `ObjectStore` calls; every committed write has `Txn::receipt()`.
 `recordCatalogTransforms` publishes catalog registrations as versioned records
 that every client then resolves from the store.
 
+Geometry operations name each relationship decision explicitly, or set
+`keepAffectedRecorded`: every relationship the change affects without its own
+decision is then kept as recorded (its historical pins stay; the server decides
+which relationships are affected from the checked state). `SetSurfaceChannelsOp`
+replaces or removes surface channels. Through a session,
+`newRequest(attachment)` starts a request for the attachment's store, active
+generation and author. Helpers over a `StoreReader` fill in what an edit
+depends on: `expectRelationshipEndpoints` expects the far ends of an edited
+object's relationships, and `transformDependencies` makes an edit computed
+through a transformed view conflict when a recorded registration or route
+choice changes before it commits. `createSurfaceOperations` gives the
+operations that create a surface record and its geometry. Code holding an
+object keeps a `PinnedObject`: its version and history generation (`pinOf`),
+which requests expect.
+
 Writable opens hold a host-local ownership lock on `<canonical path>-owner`:
 shared between standalone writers, exclusive for `OpenOptions::serviceOwner`.
 

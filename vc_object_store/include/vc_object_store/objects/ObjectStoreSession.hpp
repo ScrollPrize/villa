@@ -300,7 +300,8 @@ public:
     // revision check alone), and hands the callback the decisions to pass to
     // geometry edits. Returns the receipt.
     RevisionSelection editKeepingRelationships(const AttachmentIdentity&, const RevisionSelection& pins,
-        const RevisionSelection& related, const std::function<void(ObjectStore&, WriteTxn&, const KeepRecorded&)>&);
+        const RevisionSelection& related, const std::function<void(ObjectStore&, WriteTxn&, const KeepRecorded&)>&,
+        TransactionReceipt* receipt = nullptr);
     // Edit the current revisions of these objects in one commit, keeping their
     // recorded relationships: `edit` runs once per object. Throws when one is
     // gone, or when one changed between the read and the commit.
