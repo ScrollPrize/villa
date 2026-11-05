@@ -2,8 +2,9 @@
 
 A stored surface is named by a reference string ``vcobj:<uuid>`` (its current version) or
 ``vcobj:<uuid>@<generation>/<version>`` (that numbered version of the store's history) in the
-places a tifxyz directory path is accepted; the store file and the volume whose voxels coordinates are in travel
-separately (``--store`` / ``--volume-uuid``). Geometry is a ``points`` array (rows x columns x 3, xyz, -1 for a
+places a tifxyz directory path is accepted; the store and the volume whose voxels coordinates are in travel
+separately (``--store`` / ``--volume-uuid``). A store is a location: a store file, or the endpoint of a
+``vc_object_server`` (``http://...``) for a store on another machine. Geometry is a ``points`` array (rows x columns x 3, xyz, -1 for a
 missing vertex), an optional ``valid`` array and per-vertex channels (``d``, ``approval``, ...), as VC3D stores
 surfaces; coordinates are bound to a volume by ``meta.coordinates`` ({volume_uuid, scale_factor}).
 
@@ -45,19 +46,14 @@ def parse_surface_ref(value: object) -> tuple[str, tuple[str, int] | None] | Non
 	return str(uuidlib.UUID(uuid_text)), (generation, int(number))
 
 
-def open_store(store: str | Path, *, read_only: bool = True, author: str | None = None):
-	from vc_object_store import ObjectStore
-	if read_only:
-		return ObjectStore.open(str(store), read_only=True, reader_pool_size=1)
-	return ObjectStore.open(str(store), author=author or getpass.getuser())
-
-
 def next_free_name(store: str | Path, root: str, mode: str) -> str:
-	"""The name a new surface of ``root`` takes among the store's surfaces: ``version`` gives the next
-	``<root>_vNNN`` after the highest stored, ``offset`` the first free ``<root>_offN``."""
+	"""The name a new surface of ``root`` takes among the store's surfaces (``store`` a location): ``version``
+	gives the next ``<root>_vNNN`` after the highest stored, ``offset`` the first free ``<root>_offN``."""
 	import re
-	with open_store(store) as db:
-		taken = {row["name"] for row in db.select_objects(object_kind="surface", fields=["name"])}
+	from vc_object_store.locations import attached
+	with attached(store, read_only=True) as (session, attachment):
+		rows = session.select_objects(attachment, {"selection": {"kind": "surface"}, "fields": ["name"]})
+	taken = {row["name"] for row in rows}
 	infix, width = ("_v", 3) if mode == "version" else ("_off", 1)
 	number = 1
 	if mode == "version":
@@ -71,19 +67,20 @@ def next_free_name(store: str | Path, root: str, mode: str) -> str:
 
 
 class StoreSession:
-	"""A store attached for this process. Files belonging to an object (a fit's model checkpoint) are its
-	artifacts: published into the store with the object's version and read back as cached local copies. Reads and
-	writes go through ``open_store`` connections to ``path``; every write is committed when it returns.
+	"""A store attached for this process: a store file, or a ``vc_object_server`` endpoint for a store on another
+	machine. Files belonging to an object (a fit's model checkpoint) are its artifacts: published into the store
+	with the object's version and read back as cached local copies. Writes go through short-lived attachments of
+	``location``; every write is committed when it returns.
 
 	``shared``: the file is another process's store (VC3D's, for a service on its host); this session attaches it
-	read-only and writes through short-lived connections."""
+	read-only (an endpoint is always attached writable)."""
 
-	def __init__(self, path: str | Path, *, author: str | None = None, shared: bool = False):
+	def __init__(self, location: str | Path, *, author: str | None = None, shared: bool = False):
 		from vc_object_store import ObjectStoreSession
-		self.path = str(path)
+		self.location = str(location)
 		self.author = author or getpass.getuser()
 		self._session = ObjectStoreSession()
-		self._attachment = self._session.attach(self.path, self.author, read_only=shared)
+		self._attachment = self._session.attach_location(self.location, self.author, shared)
 
 	@property
 	def store_uuid(self) -> str:
@@ -98,17 +95,13 @@ class StoreSession:
 	def publish_artifacts(self, object_uuid: str, files: dict[str, str | Path]) -> dict:
 		"""Publish local files ``{name: path}`` as artifacts of the object's current version (one checked
 		request; the bytes are copied into the store first)."""
-		from vc_object_store import ObjectStoreSession
-		session = ObjectStoreSession()
-		attachment = session.attach(self.path, self.author)
-		try:
+		from vc_object_store.locations import attached
+		with attached(self.location, author=self.author) as (session, attachment):
 			current = session.current_object(attachment, object_uuid)
 			if current is None:
 				raise ValueError(f"no object {object_uuid} to publish artifacts of")
 			return session.publish_artifacts(attachment, object_uuid, current["version"],
 											 {name: str(path) for name, path in files.items()}, self.author)
-		finally:
-			session.detach(attachment)
 
 	def close(self) -> None:
 		self._session.detach(self._attachment)
@@ -134,13 +127,14 @@ class StoredSurface:
 	def channel(self, name: str) -> np.ndarray | None:
 		if name not in self._channels:
 			return None
-		with open_store(self._store) as store:
-			return np.array(store.read_geometry_arrays([self._geometry], name).values)
+		from vc_object_store.locations import attached
+		with attached(self._store, read_only=True) as (session, attachment):
+			return np.array(session.read_geometry_arrays(attachment, [self._geometry], name).values)
 
 
 def read_surface(store: str | Path, ref: str, *, volume: str | None, target_scale: float = 1.0) -> StoredSurface:
 	"""The referenced surface in voxels of ``volume`` at ``target_scale`` of its own (``--voxel-scale``), through
-	the store's mapping to it."""
+	the store's mapping to it; ``store`` is a location."""
 	from vc_object_store.surfaces import read_surface as read_grid
 	parsed = parse_surface_ref(ref)
 	if parsed is None:

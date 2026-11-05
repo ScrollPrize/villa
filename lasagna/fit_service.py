@@ -698,7 +698,7 @@ def _stored_corr_points(uuids: list[Any], volume: str | None, target_scale: floa
         raise ValueError("corr_point_collections needs a store request (store_uuid and volume_uuid)")
     from vc_object_store.documents import point_collections
     collections: dict[str, Any] = {}
-    for index, stored in enumerate(point_collections(_require_store().path, [str(u) for u in uuids], volume,
+    for index, stored in enumerate(point_collections(_require_store().location, [str(u) for u in uuids], volume,
                                                                 target_scale), start=1):
         collection = dict(stored["source"])
         collection["uuid"] = stored["uuid"]
@@ -1989,7 +1989,7 @@ def _run_optimization(job: _JobState, body: dict[str, Any]) -> None:
         if model_init == "model" and model_input:
             args_section["model-input"] = str(model_input)
         if store_volume is not None:
-            args_section["store"] = _require_store().path
+            args_section["store"] = _require_store().location
             args_section["volume-uuid"] = store_volume
             args_section["voxel-scale"] = store_voxel_scale
         if not omit_model_output:
@@ -2092,7 +2092,7 @@ def _run_optimization(job: _JobState, body: dict[str, Any]) -> None:
             import fit2tifxyz
             export_argv = ["--input", str(model_output)]
             if store_volume is not None:
-                export_argv.extend(["--store", _require_store().path, "--volume-uuid", store_volume,
+                export_argv.extend(["--store", _require_store().location, "--volume-uuid", store_volume,
                                     "--voxel-scale", repr(store_voxel_scale)])
             else:
                 export_argv.extend(["--output", str(output_dir)])
@@ -2591,7 +2591,8 @@ def main() -> None:
     p.add_argument("--capture-dir", default=None,
                    help="Directory for captured queued jobs (default: ./job_captures)")
     p.add_argument("--store", default=None,
-                   help="VC object store file VC3D jobs read surfaces from and write to")
+                   help="VC object store VC3D jobs read surfaces from and write to: a store file, or the "
+                        "endpoint of the vc_object_server VC3D attached (http://...)")
     p.add_argument("--shared-store", action="store_true", default=False,
                    help="--store is the store file of the VC3D that started this service")
     args = p.parse_args()

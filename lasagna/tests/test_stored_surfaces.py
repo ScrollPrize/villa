@@ -286,11 +286,75 @@ class ServiceStoreRequestTest(unittest.TestCase):
 			cached = fit_service._store.artifact_file(self.source, "model.pt", Path(self._td.name) / "cache")
 			self.assertEqual(cached.read_bytes(), b"shared")
 			created = create_surface(
-				shared.path, np.zeros((2, 2, 3), np.float32), name="written", scale=1.0, volume=VOLUME, tool="test")
+				shared.location, np.zeros((2, 2, 3), np.float32), name="written", scale=1.0, volume=VOLUME, tool="test")
 		finally:
 			shared.close()
 		with ObjectStore.open(str(self.store_path), read_only=True) as db:
 			self.assertEqual(db.object(created)["name"], "written")
+
+
+
+SERVER = os.environ.get("VC_OBJECT_SERVER")
+
+
+@unittest.skipIf(ObjectStore is None or not SERVER, "needs vc_object_store and VC_OBJECT_SERVER (a vc_object_server binary)")
+class HostedStoreTest(unittest.TestCase):
+	"""A Lasagna service on another machine works on VC3D's store through its vc_object_server endpoint."""
+
+	def setUp(self) -> None:
+		import re
+		import subprocess
+		self._td = tempfile.TemporaryDirectory()
+		self.root = Path(self._td.name)
+		self.store_path = self.root / "objects.vcobj"
+		self.source, self.points = _source_surface(self.store_path)
+		self.server = subprocess.Popen([SERVER, str(self.store_path), "--port", "0"], stderr=subprocess.PIPE, text=True)
+		line = self.server.stderr.readline()
+		port = re.search(r":(\d+)\s*$", line)
+		if not port:
+			self.server.terminate()
+			raise RuntimeError(f"vc_object_server did not start: {line}")
+		self.endpoint = f"http://127.0.0.1:{port.group(1)}"
+
+	def tearDown(self) -> None:
+		self.server.terminate()
+		self.server.wait(timeout=30)
+		self._td.cleanup()
+
+	def test_fit_reads_and_export_writes_through_the_endpoint(self) -> None:
+		ref = stored_surfaces.surface_ref(self.source)
+		xyz, valid, meta = tifxyz_io.load_tifxyz(ref, store=self.endpoint, volume=VOLUME)
+		np.testing.assert_allclose(xyz[1, 1].numpy(), self.points[1, 1])
+		self.assertFalse(bool(valid[0, 0]))
+		surface = approval_inpaint.load_approval_surface(ref, store=self.endpoint, volume=VOLUME)
+		self.assertEqual(float(surface.d[1, 1]), 3.0)
+		self.assertEqual(stored_surfaces.next_free_name(self.endpoint, "source", "version"), "source_v001")
+
+		ckpt = self.root / "model.pt"
+		torch.save(_checkpoint(self.source), ckpt)
+		created: list[str] = []
+		fit2tifxyz.main(["--input", str(ckpt), "--store", self.endpoint, "--volume-uuid", VOLUME,
+						 "--output-name", "fitted.tifxyz", "--single-segment"], created_surfaces=created)
+		[surface_uuid] = created
+		# The service's file shows the results (read-only opens are allowed while it is served).
+		with ObjectStore.open(str(self.store_path), read_only=True) as db:
+			record = db.object(surface_uuid)
+			self.assertEqual(record["name"], "fitted")
+			self.assertEqual(record["meta"]["provenance"]["sources"], [self.source])
+		corr = attached_document(self.endpoint, surface_uuid, fit2tifxyz.CORR_RESULTS_ROLE)
+		self.assertEqual([p["point_id"] for p in corr["points_list"]], [1, 2])
+
+		# A service started on the endpoint resolves the published model.
+		fit_service._store = stored_surfaces.StoreSession(self.endpoint, author="service")
+		try:
+			with ObjectStore.open(str(self.store_path), read_only=True) as db:
+				self.assertEqual(fit_service._store.store_uuid, db.status()["store"])
+			resolved = fit_service._body_with_resolved_job_spec({"job_spec": {
+				"model": {"type": "surface", "uuid": surface_uuid}, "config": {}}})
+			self.assertEqual(Path(resolved["model_input"]).read_bytes(), ckpt.read_bytes())
+		finally:
+			fit_service._store.close()
+			fit_service._store = None
 
 
 if __name__ == "__main__":
