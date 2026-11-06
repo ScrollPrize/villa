@@ -6,14 +6,16 @@ Usage:
 
 from __future__ import annotations
 
+from dinovol_2.training.config import as_legacy_config
+
 import argparse
 import json
 from pathlib import Path
 import urllib.request
 
-from vc_reader.reader import open_zarr
+from dinovol_2.dataset.volume_reader import open_volume
 
-from dinovol_2.dataset.object_labels import load_or_build_volume_meshes, s3_auth
+from dinovol_2.dataset.object_labels import load_or_build_volume_meshes
 
 
 DEFAULT_METADATA_URL = "https://vesuvius-challenge-open-data.s3.amazonaws.com/metadata.json"
@@ -28,8 +30,8 @@ def ensure_metadata(metadata_path: Path, url: str = DEFAULT_METADATA_URL) -> Pat
 
 
 def _open_shape(vol_path: str, scale: int, s3_opts: dict) -> tuple[int, int, int]:
-    arr = open_zarr(str(vol_path).rstrip("/"), level=scale, auth=s3_auth(s3_opts))
-    return tuple(int(d) for d in arr.shape[:3])
+    with open_volume(vol_path, scale, s3_storage_options=s3_opts) as array:
+        return tuple(int(d) for d in array.shape[:3])
 
 
 def main() -> None:
@@ -55,7 +57,7 @@ def main() -> None:
     args = parser.parse_args()
 
     with args.config.open("r", encoding="utf-8") as f:
-        config = json.load(f)
+        config = as_legacy_config(json.load(f))
 
     dataset_cfg = dict(config.get("dataset") or {})
     obj_cfg = dict(dataset_cfg.get("object_points") or {})

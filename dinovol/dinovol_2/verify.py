@@ -6,11 +6,14 @@ from pathlib import Path
 import sys
 from typing import Any, Mapping
 
+
 if __package__ in {None, ""}:
     sys.path.append(str(Path(__file__).resolve().parents[1]))
     from dinovol_2.pretrain import DinoIBOTPretrainer
 else:
     from .pretrain import DinoIBOTPretrainer
+
+from dinovol_2.training.config import normalize_config
 
 def load_config(config_path: str | Path) -> dict[str, Any]:
     with open(config_path, "r", encoding="utf-8") as f:
@@ -23,9 +26,9 @@ def build_verification_report(
     step: int = 0,
     use_amp: bool | None = None,
 ) -> dict[str, Any]:
-    resolved_config = dict(config)
+    resolved_config = normalize_config(config)
     if use_amp is not None:
-        resolved_config["use_amp"] = bool(use_amp)
+        resolved_config["runtime"]["use_amp"] = bool(use_amp)
     trainer = DinoIBOTPretrainer(resolved_config)
     dataloader = trainer.build_dataloader()
     try:

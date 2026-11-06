@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from dinovol_2.training.config import as_legacy_config
+
 import json
 import os
 import shlex
@@ -19,7 +21,7 @@ def launch_training() -> Path:
     checkpoint = (RUN_DIR / "checkpoint_step_160000.pt").resolve()
     if not checkpoint.is_file():
         raise FileNotFoundError(f"Benchmark seed checkpoint is missing: {checkpoint}")
-    cfg = json.loads((RUN_DIR / "config.json").read_text())
+    cfg = as_legacy_config(json.loads((RUN_DIR / "config.json").read_text()))
     cfg["batch_size"] = 10
     cfg["grad_accumulation_steps"] = 1
     cfg["model"]["grad_checkpointing"] = False
