@@ -143,7 +143,7 @@ try {
     // in ranges no larger than the server's 1 MiB response limit.
     const auto big = util::newUuid();
     vc::geometry::Track track;
-    for (int i = 0; i < 400000; ++i) track.points.push_back({double(i), double(i) * 0.5, double(i % 97)});
+    for (int i = 0; i < 400000; ++i) track.points.push_back({i, i / 2, i % 97});
     const auto encoded = vc::geometry::encode(track);
     const auto created = hosted.submit(request({{big, std::nullopt}},
         {CreateObjectOp{objectRecordJson(trackRecord(big))}, PutGeometryOp{big, encoded, {}}}, "uploader"));
