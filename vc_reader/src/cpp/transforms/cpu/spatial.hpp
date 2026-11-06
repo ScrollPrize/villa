@@ -450,7 +450,7 @@ inline Parameters sample(const SheetCompression& t, const Sample& s, Random& r) 
             }
     if (smooth > .5) { std::vector<double> sigmas(d, smooth); sigmas[chosen] = 0; gaussian_blur(values, g, sigmas, 6, Boundary::Mirror, true); }
     p.field = std::vector<float>(g.size * d);
-    for (std::size_t i = 0; i < g.size; ++i) p.field[i * d + chosen] = -values[i] * double(g.shape[chosen] - 1) / g.shape[chosen];
+    for (std::size_t i = 0; i < g.size; ++i) p.field[i * d + chosen] = values[i];
     p.border = true;
     };
     if (image.bytes==4) build.template operator()<float>(); else build.template operator()<double>();
