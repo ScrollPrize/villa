@@ -100,7 +100,8 @@ add_library(vc_object_store::vc_objects ALIAS vc_objects)
 # Offline schema conversion; the runtime library knows only the current schema.
 add_library(vc_object_migration STATIC migration/ConvertStore.cpp)
 target_include_directories(vc_object_migration PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
-target_link_libraries(vc_object_migration PUBLIC vc_objects PRIVATE nlohmann_json::nlohmann_json)
+# geometry/GeometryInternal.hpp includes <openssl/evp.h>; Homebrew OpenSSL is not on the default include path.
+target_link_libraries(vc_object_migration PUBLIC vc_objects PRIVATE OpenSSL::Crypto nlohmann_json::nlohmann_json)
 target_compile_features(vc_object_migration PUBLIC cxx_std_20)
 add_library(vc_object_store::vc_geometry ALIAS vc_geometry)
 
@@ -108,6 +109,10 @@ add_library(vc_object_store::vc_geometry ALIAS vc_geometry)
 if(VC_OBJECT_STORE_BUILD_SERVER)
     add_library(vc_object_server STATIC server/Server.cpp)
     target_link_libraries(vc_object_server PUBLIC vc_objects PRIVATE Boost::headers Threads::Threads nlohmann_json::nlohmann_json)
+    if(WIN32)
+        # Asio sockets on Windows need Winsock and AcceptEx.
+        target_link_libraries(vc_object_server PRIVATE ws2_32 mswsock)
+    endif()
     target_compile_features(vc_object_server PUBLIC cxx_std_20)
     add_library(vc_object_store::vc_object_server ALIAS vc_object_server)
 endif()
