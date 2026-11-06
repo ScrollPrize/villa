@@ -6,6 +6,7 @@
 #include "internal/Digest.hpp"
 #include <bit>
 #include <iostream>
+#include <set>
 using namespace vc::objects;
 using namespace vc::objects::detail;
 
@@ -14,39 +15,48 @@ using namespace vc::objects::detail;
 void schema17(const std::filesystem::path& path)
 {
     std::unique_ptr<sqlite3,decltype(&sqlite3_close)> db(openConnection(path,SQLITE_OPEN_READWRITE,{},false),sqlite3_close);
-    std::vector<std::string> triggers;
-    Statement rows(db.get(), "SELECT name FROM sqlite_schema WHERE type='trigger' AND instr(sql,'store_write_state')>0");
-    while (rows.row()) triggers.push_back(rows.text(0));
-    for (const auto& name : triggers) exec(db.get(), ("DROP TRIGGER \""+name+"\"").c_str());
-    exec(db.get(),"DROP TRIGGER geometry_chunks_external_insert; DROP TRIGGER geometry_chunks_external_update;");
-    exec(db.get(),"DROP VIEW endpoint_keys; DROP TABLE external_object_keys;");
+    std::vector<std::pair<std::string,std::string>> programs;
+    Statement rows(db.get(),"SELECT name,sql,tbl_name FROM sqlite_schema WHERE type='trigger'");
+    std::vector<std::string> names;
+    const std::set<std::string> v2Tables{"table_key_columns","table_directory","database_identity","key_allocators",
+        "store_required_features","store_write_state","store_manifest"};
+    while(rows.row()) {
+        names.push_back(rows.text(0));
+        if(!v2Tables.contains(rows.text(2)))programs.emplace_back(rows.text(0),rows.text(1));
+    }
+    for(const auto& name:names)exec(db.get(),("DROP TRIGGER \""+name+"\"").c_str());
+    std::erase_if(programs,[](const auto& program){return program.second.find("store_write_state")!=std::string::npos;});
+    exec(db.get(),"CREATE TABLE geometry_heads(object_uuid BLOB PRIMARY KEY REFERENCES objects(uuid) ON DELETE RESTRICT,"
+        "revision_uuid BLOB NOT NULL,FOREIGN KEY(object_uuid,revision_uuid) REFERENCES geometry_revisions(object_uuid,uuid));");
+    {
+        Statement objects(db.get(),"SELECT uuid,storage_ref FROM objects WHERE geometry_manifest IS NOT NULL");
+        while(objects.row())execute(db.get(),"INSERT INTO geometry_heads VALUES(?,?)",objects.blob16(0),parseUuid(objects.text(1)));
+    }
     exec(db.get(), "DROP TABLE table_key_columns; DROP TABLE table_directory; DROP TABLE database_identity; DROP TABLE key_allocators;"
         "DROP TABLE store_required_features; DROP TABLE store_write_state; DROP TABLE store_manifest;"
         "ALTER TABLE object_revisions DROP COLUMN generation; ALTER TABLE relationship_revisions DROP COLUMN generation;"
-        "DROP INDEX edges_unique; ALTER TABLE edges DROP COLUMN relation_key;"
-        "CREATE UNIQUE INDEX edges_unique ON edges(kind,a_id,b_id,a_dependencies,b_dependencies); PRAGMA user_version=17;");
+        "ALTER TABLE objects DROP COLUMN geometry_manifest;"
+        "ALTER TABLE objects DROP COLUMN deleted;"
+        "DROP INDEX IF EXISTS edges_unique;"
+        "PRAGMA user_version=17;");
     // Real v1 stored current pins and a duplicate dependency index. New native
     // stores deliberately do not; reconstitute their legacy representation.
     exec(db.get(),"CREATE TABLE edge_geometry_bindings(edge_id INTEGER PRIMARY KEY REFERENCES edges(id) ON DELETE CASCADE,"
         "a_revision BLOB REFERENCES geometry_revisions(uuid),b_revision BLOB REFERENCES geometry_revisions(uuid));"
         "INSERT INTO edge_geometry_bindings SELECT e.id,ga.revision_uuid,gb.revision_uuid FROM edges e "
-        "JOIN objects a ON a.id=e.a_id JOIN objects b ON b.id=e.b_id "
+        "JOIN objects a ON a.uuid=e.a_uuid JOIN objects b ON b.uuid=e.b_uuid "
         "LEFT JOIN geometry_heads ga ON ga.object_uuid=a.uuid LEFT JOIN geometry_heads gb ON gb.object_uuid=b.uuid;"
         "CREATE TABLE edge_lifecycle_bindings(edge_id INTEGER PRIMARY KEY REFERENCES edges(id) ON DELETE CASCADE,a_epoch TEXT NOT NULL,b_epoch TEXT NOT NULL);"
         "INSERT INTO edge_lifecycle_bindings SELECT e.id,coalesce(a.epoch,''),coalesce(b.epoch,'') FROM edges e "
-        "LEFT JOIN object_lifecycle a ON a.object_id=e.a_id LEFT JOIN object_lifecycle b ON b.object_id=e.b_id;"
+        "LEFT JOIN object_lifecycle a ON a.object_id=(SELECT id FROM objects WHERE uuid=e.a_uuid) "
+        "LEFT JOIN object_lifecycle b ON b.object_id=(SELECT id FROM objects WHERE uuid=e.b_uuid);"
         "CREATE TABLE geometry_edge_dependencies(edge_id INTEGER NOT NULL REFERENCES edges(id) ON DELETE CASCADE,"
         "object_id INTEGER NOT NULL REFERENCES objects(id),array_name TEXT NOT NULL,point_id INTEGER NOT NULL,"
         "PRIMARY KEY(object_id,array_name,point_id,edge_id)) WITHOUT ROWID;"
         "CREATE INDEX geometry_dependencies_edge ON geometry_edge_dependencies(edge_id);");
-    for(const auto& [name,sql]:legacyCurrentTriggers())exec(db.get(),sql.c_str());
     // Real v1 chunks are NOT NULL. Keep native triggers while reconstructing
     // that legacy table, before adding the extension dependency regression.
-    std::vector<std::pair<std::string,std::string>> programs;
-    { Statement schema(db.get(),"SELECT name,sql FROM sqlite_schema WHERE type='trigger'");
-      while(schema.row()) programs.emplace_back(schema.text(0),schema.text(1)); }
     exec(db.get(),"PRAGMA foreign_keys=OFF;");
-    for(const auto& [name,sql]:programs)exec(db.get(),("DROP TRIGGER \""+name+"\"").c_str());
     for(const auto& [table,digest]:std::map<std::string,std::string>{
         {"geometry_chunks","hash"},{"geometry_revisions","content_hash"},
         {"geometry_revision_chunks","hash"},{"geometry_deltas","manifest_hash"},
@@ -60,26 +70,52 @@ void schema17(const std::filesystem::path& path)
             replace(digest+" BLOB",digest+" TEXT");
             replace("CHECK(typeof("+digest+")='blob' AND length("+digest+")=32)","CHECK(length("+digest+")=64)");
         }
-        if(table=="edges")for(const auto* endpoint:{"a_id","b_id"})
-            replace(std::string(endpoint)+" INTEGER NOT NULL,",std::string(endpoint)+" INTEGER NOT NULL REFERENCES objects(id) ON DELETE RESTRICT,");
+        if(table=="edges"){
+            replace("deleted INTEGER NOT NULL DEFAULT 0 CHECK(deleted IN (0,1)),","");
+            for(const auto* side:{"a","b"}){
+                const auto from=std::string(side)+"_uuid",to=std::string(side)+"_id";
+                replace(from+" BLOB NOT NULL CHECK(length("+from+")=16)",to+" INTEGER NOT NULL REFERENCES objects(id) ON DELETE RESTRICT");
+                for(size_t p=0;(p=definition.find(from,p))!=std::string::npos;p+=to.size())definition.replace(p,from.size(),to);
+            }
+        }
         if(table=="relationship_revisions")for(const auto* endpoint:{"a_revision","b_revision"})
             replace(std::string(endpoint)+" TEXT NOT NULL,",std::string(endpoint)+" TEXT NOT NULL REFERENCES object_revisions(uuid) DEFERRABLE INITIALLY DEFERRED,");
         if(table=="geometry_chunks")replace("data BLOB CHECK(data IS NULL OR (length(data)>0 AND length(data)<=1048576))",
             "data BLOB NOT NULL CHECK(length(data)>0 AND length(data)<=1048576)");
         std::vector<std::string> indexes;
         Statement index(db.get(),"SELECT sql FROM sqlite_schema WHERE tbl_name=? AND type='index' AND sql IS NOT NULL",table);
-        while(index.row())indexes.push_back(index.text(0));
+        while(index.row()){
+            auto sql=index.text(0);
+            if(table=="edges")for(const auto* side:{"a","b"}){
+                const auto from=std::string(side)+"_uuid",to=std::string(side)+"_id";
+                for(size_t p=0;(p=sql.find(from,p))!=std::string::npos;p+=to.size())sql.replace(p,from.size(),to);
+            }
+            indexes.push_back(std::move(sql));
+        }
         std::string projection="rowid",columns="rowid";
         Statement fields(db.get(),"SELECT name FROM pragma_table_xinfo(?) ORDER BY cid",table);
         while(fields.row()) {
-            const auto name=fields.text(0);columns+=",\""+name+"\"";
+            const auto name=fields.text(0);
+            if(table=="edges"&&name=="deleted")continue;
+            if(table=="edges"&&(name=="a_uuid"||name=="b_uuid")){
+                columns+=name=="a_uuid"?",a_id":",b_id";
+                projection+=",(SELECT id FROM objects WHERE uuid=edges."+name+")";
+                continue;
+            }
+            columns+=",\""+name+"\"";
             projection+=name==digest?",lower(hex(\""+name+"\"))":",\""+name+"\"";
         }
         exec(db.get(),("CREATE TABLE legacy_digest"+definition+"; INSERT INTO legacy_digest("+columns+") SELECT "+projection+
             " FROM \""+table+"\"; DROP TABLE \""+table+"\"; ALTER TABLE legacy_digest RENAME TO \""+table+"\";").c_str());
         for(const auto& sql:indexes)exec(db.get(),sql.c_str());
     }
-    for(const auto& [name,sql]:programs)exec(db.get(),sql.c_str());
+    const auto endpointTriggers=legacyEndpointHistoryTriggers();
+    for(const auto& [name,definition]:programs){
+        const auto legacy=endpointTriggers.find(name);
+        exec(db.get(),(legacy==endpointTriggers.end()?definition:legacy->second).c_str());
+    }
+    for(const auto& [name,sql]:legacyCurrentTriggers())exec(db.get(),sql.c_str());
+    exec(db.get(),"CREATE UNIQUE INDEX edges_unique ON edges(kind,a_id,b_id,a_dependencies,b_dependencies);");
     exec(db.get(),"PRAGMA foreign_keys=ON;"
         "CREATE VIEW extension_chunk_sizes AS SELECT hash,length(data) bytes FROM geometry_chunks;"
         "CREATE VIEW extension_chunk_total AS SELECT sum(bytes) bytes FROM extension_chunk_sizes;"
@@ -164,6 +200,10 @@ int main() try
         "CREATE TRIGGER edge_geometry_bindings_history_UPDATE AFTER UPDATE ON edge_geometry_bindings BEGIN SELECT 1;END;");
     rejectsStaleLegacy(dir.path/"altered-dependency-trigger","DROP TRIGGER geometry_dependencies_insert;"
         "CREATE TRIGGER geometry_dependencies_insert AFTER INSERT ON edges BEGIN SELECT 1;END;");
+    rejectsStaleLegacy(dir.path/"altered-endpoint-history","DROP TRIGGER edges_history_UPDATE;"
+        "CREATE TRIGGER edges_history_UPDATE AFTER UPDATE ON edges BEGIN SELECT 1;END;");
+    rejectsStaleLegacy(dir.path/"endpoint-extension","CREATE VIEW custom_endpoint_ids AS SELECT a_id,b_id FROM edges;");
+    rejectsStaleLegacy(dir.path/"altered-endpoint-index","DROP INDEX edges_a; CREATE INDEX edges_a ON edges(a_id,generation);");
     const auto path = dir.path / "legacy.vcobj";
     std::string storeId, object, geometry, exported;
     {
@@ -200,6 +240,12 @@ int main() try
         auto* sql=ObjectStoreImplAccess::conn(read);
         {Statement removed(sql,"SELECT count(*) FROM sqlite_schema WHERE name IN ('edge_geometry_bindings','edge_lifecycle_bindings','geometry_edge_dependencies')");
             require(removed.row()&&removed.i64(0)==0,"conversion removes duplicate current-state binding materialization");}
+        {Statement endpoints(sql,"SELECT length(a_uuid),length(b_uuid),deleted FROM edges");
+            require(endpoints.row()&&endpoints.i64(0)==16&&endpoints.i64(1)==16&&endpoints.i64(2)==0,"conversion stores original endpoint UUIDs directly");}
+        {Statement triggers(sql,"SELECT sql FROM sqlite_schema WHERE type='trigger' AND (name GLOB 'edges_history_*' OR name GLOB 'edge_tags_history_*')");
+            int count=0;while(triggers.row()) {const auto definition=triggers.text(0);
+                require(definition.find("a_id")==std::string::npos&&definition.find("b_id")==std::string::npos,"converted history triggers use native endpoint keys");++count;}
+            require(count==6,"conversion retains all endpoint history triggers");}
         { Statement checks(sql,"SELECT m.bytes=t.bytes,(SELECT count(*) FROM sqlite_schema WHERE name='extension_chunk_length') "
             "FROM extension_marks m CROSS JOIN extension_chunk_total t WHERE m.id=1");
           require(checks.row() && checks.i64(0)==1 && checks.i64(1)==1,"conversion preserves dependent views, trigger output and chunk index"); }

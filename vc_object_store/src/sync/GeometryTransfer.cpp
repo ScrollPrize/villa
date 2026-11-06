@@ -77,8 +77,8 @@ void GeometryStage::read(sqlite3* source, sqlite3* known, const std::string& obj
         if(parsed.contains("sequences"))for(const auto& state:parsed.at("sequences"))
             for(const auto* field:{"identities","allocated","annotations"})if(state.contains(field))
                 metadataPayloads(source,state.at(field),[&](const std::vector<uint8_t>& bytes){revision.metadata.push_back(bytes);});
-        Statement chunks(source, "SELECT r.array_name,r.chunk_index,c.hash,c.data FROM geometry_revision_chunks r "
-            "JOIN geometry_chunks c ON c.hash=r.hash WHERE r.revision_uuid=? ORDER BY r.array_name,r.chunk_index",
+        Statement chunks(source, "SELECT r.array_name,r.chunk_index,r.hash,c.data FROM geometry_revision_chunks r "
+            "LEFT JOIN geometry_chunks c ON c.hash=r.hash WHERE r.revision_uuid=? ORDER BY r.array_name,r.chunk_index",
             revisions.blob16(0));
         while (chunks.row()) {
             std::vector<uint8_t> external;
@@ -132,11 +132,11 @@ void GeometryStage::install(sqlite3* destination, const std::string& objectUuid)
             const auto size = int(chunk.data.size());
             Statement old(destination, "SELECT hash,data FROM geometry_chunks WHERE hash=?", parseDigest(chunk.hash));
             if (old.row()) {
-                if(old.isNull(1)) {
-                    if(readExternalGeometryPayload(destination,chunk.hash)!=chunk.data)
-                        throw std::runtime_error("sync: external geometry chunk hash collision");
-                } else if (sqlite3_column_bytes(old.value, 1) != size || std::memcmp(sqlite3_column_blob(old.value, 1), chunk.data.data(), size))
+                if (sqlite3_column_bytes(old.value, 1) != size || std::memcmp(sqlite3_column_blob(old.value, 1), chunk.data.data(), size))
                     throw std::runtime_error("sync: geometry chunk hash collision");
+            } else if(hasExternalGeometryPayload(destination,chunk.hash)) {
+                if(readExternalGeometryPayload(destination,chunk.hash)!=chunk.data)
+                    throw std::runtime_error("sync: external geometry chunk hash collision");
             } else {
                 execute(destination, "INSERT INTO geometry_chunks VALUES(?,?)", parseDigest(chunk.hash), std::span(chunk.data));
             }

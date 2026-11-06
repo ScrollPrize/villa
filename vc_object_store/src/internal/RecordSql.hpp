@@ -61,7 +61,6 @@ std::vector<ObjectRecord> readObjectRows(sqlite3* db, Statement& rows, const Obj
 std::optional<int64_t> objectIdByUuid(sqlite3* db, const std::array<unsigned char, 16>& uuid);
 // Endpoint handles are positive for owned objects and negative for compact
 // qualified external keys. They never imply a copied object/detail record.
-std::optional<int64_t> endpointIdByUuid(sqlite3*, const std::array<unsigned char,16>&);
 
 void writeObjectDetail(sqlite3* db, int64_t id, const ObjectRecord& rec);
 void insertObjectDetail(sqlite3* db, int64_t id, const ObjectRecord& rec);

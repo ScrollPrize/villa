@@ -41,24 +41,32 @@ void applyHeadsAndEdges(ObjectStore& store, WriteTxn& txn, const Json& before, c
     auto* db = ObjectStoreImplAccess::conn(txn);
     for (const auto& [id, record] : merged.items()) if (isObjectRecord(record) && record != recordAt(before, id)) {
         if (recordHead(record) != nullptr) {
-            execute(db, "INSERT INTO geometry_heads VALUES(?,?) ON CONFLICT(object_uuid) DO UPDATE SET revision_uuid=excluded.revision_uuid",
-                parseUuid(id), parseUuid(recordHead(record).get<std::string>()));
             if (recordHead(record) != recordHead(recordAt(before, id))) {
                 materializeGeometry(db, id, recordHead(record).get<std::string>());
                 refreshGeometryBounds(db, id);
             }
+        } else if(recordHead(recordAt(before,id))!=nullptr) {
+            clearGeometryMaterialization(db,id);
+            execute(db,"UPDATE objects SET geometry_manifest=NULL WHERE uuid=?",parseUuid(id));
+            refreshGeometryBounds(db,id);
         }
         auto dataGeneration = record.value("data_generation", int64_t(0));
+        auto storageKind=record.at("storage_kind").get<std::string>();
+        auto storageRef=record.at("storage_ref").get<std::string>();
+        std::optional<std::string> checksum;
+        if(record.contains("data_checksum"))checksum=record.at("data_checksum").get<std::string>();
         if (recordHead(record) != nullptr) {
-            Statement head(db, "SELECT object_generation FROM geometry_revisions WHERE uuid=?",
+            Statement head(db, "SELECT object_generation,content_hash FROM geometry_revisions WHERE uuid=?",
                 parseUuid(recordHead(record).get<std::string>()));
             if (!head.row()) throw std::runtime_error("sync: missing geometry publication");
             dataGeneration = head.i64(0);
+            // Old archived metadata may still carry the pre-v2 empty or
+            // external storage reference. The selected geometry is authoritative.
+            storageKind="sqlite";storageRef=recordHead(record).get<std::string>();checksum=readDigest(head,1);
         }
         Statement storage(db, "UPDATE objects SET storage_kind=?,storage_ref=?,data_generation=?,data_checksum=? WHERE uuid=?",
-            record.at("storage_kind").get<std::string>(), record.at("storage_ref").get<std::string>(),
-            dataGeneration);
-        if (record.contains("data_checksum")) storage.bind(4, record.at("data_checksum").get<std::string>()); else storage.bindNull(4);
+            storageKind,storageRef,dataGeneration);
+        storage.bind(4,checksum);
         storage.bind(5, parseUuid(id)); storage.stepDone();
     }
     for (const auto& [id, record] : merged.items()) if (!isObjectRecord(record) && record != recordAt(before, id)) {

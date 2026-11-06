@@ -6,6 +6,7 @@ using SharedJson = nlohmann::json;
 // Raw content-addressed payload access, local or explicitly linked. Callers
 // account budgets and verify the appropriate content hash exactly once.
 int64_t geometryPayloadSize(sqlite3*, const std::string& hash);
+bool hasExternalGeometryPayload(sqlite3*, const std::string& hash);
 std::vector<uint8_t> readGeometryPayload(sqlite3*, const std::string& hash);
 std::vector<uint8_t> readExternalGeometryPayload(sqlite3*, const std::string& hash);
 std::vector<std::string> reachableGeometryMetadata(sqlite3*, const SharedJson& manifest);

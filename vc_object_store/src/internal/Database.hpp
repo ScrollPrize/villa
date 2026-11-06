@@ -32,17 +32,25 @@
 
 namespace vc::objects {
 namespace detail { class GeometryReadCache; class SpatialReadCache; }
+// Only ordinary history-off edits need this transaction-local validation
+// state. Savepoints retain copy-on-write snapshots; nothing is stored in SQL.
+struct CurrentWriteState {
+    std::map<std::string,nlohmann::json> before;
+    std::map<std::string,std::pair<nlohmann::json,nlohmann::json>> validated;
+};
 // Connections are leased to one thread per transaction. Cache idle statements
 // on the connection; the thread-local registry only identifies the active lease.
 struct StatementPool {
     // Installed only by a collection transaction with pinned dependencies.
-    // Each callback must require an explicit hash -> dependency mapping.
+    // Hashes resolve directly through pinned readonly dependencies, without
+    // per-reference registration. Size returns zero when no dependency owns it.
     std::function<std::vector<uint8_t>(const std::string&)> externalGeometryChunk;
     std::function<int64_t(const std::string&)> externalGeometryChunkSize;
     std::function<ObjectRecord(const std::string&)> externalEndpointRecord;
     std::function<std::string(const std::string&)> externalEndpointVersion;
+    std::function<std::optional<std::string>(const std::string&)> externalEndpointOwner;
     std::function<void(const std::string&,const Anchor&)> externalEndpointValidateAnchor;
-    std::string promotedEndpointUuid;
+    std::shared_ptr<CurrentWriteState> currentWrite;
     bool historyEnabled = true;
     bool spatialEnabled = true;
     bool immutableInitial = false;
@@ -77,12 +85,11 @@ void createChangeTracking(sqlite3*);
 void createStorageDirectory(sqlite3*, const std::string& databaseUuid = {});
 void registerStorageTables(sqlite3*);
 void forkStorageIdentity(sqlite3*);
-void createCurrentGeometrySchema(sqlite3*);
 void validateCurrentRelationships(sqlite3*);
-void indexCurrentMetadata(sqlite3*, const std::string& object, const nlohmann::json& manifest);
 // Called only after a read connection has pinned its new SQLite snapshot.
 void beginReadCaches(sqlite3*, StatementPool&, size_t geometryBudget, size_t spatialBudget);
 void beginSpatialRead(StatementPool&, size_t budget, int version);
+void beforeCurrentObjectEdit(sqlite3*, const std::string& uuid);
 }
 // Hosting role, fixed at open by the presence of the hub_* tables.
 enum class HubRole { None, Hub, Replica };

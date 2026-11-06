@@ -1,4 +1,8 @@
 find_package(Threads REQUIRED)
+add_executable(test_geometry_sync test_geometry_sync.cpp)
+target_include_directories(test_geometry_sync PRIVATE ../../src)
+target_link_libraries(test_geometry_sync PRIVATE vc_objects nlohmann_json::nlohmann_json)
+add_test(NAME object_store_geometry_sync COMMAND test_geometry_sync)
 add_executable(test_prepared_dependencies test_prepared_dependencies.cpp)
 target_include_directories(test_prepared_dependencies PRIVATE ../../src)
 target_link_libraries(test_prepared_dependencies PRIVATE vc_objects nlohmann_json::nlohmann_json)

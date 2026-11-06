@@ -241,7 +241,7 @@ Json importNative(const Json& config,const std::filesystem::path& input,const st
                 if(actual->a.objectUuid==expected.bUuid){std::swap(expected.aUuid,expected.bUuid);std::swap(expected.aAnchor,expected.bAnchor);}
                 if(actual->a!=ObjectKey{owner,expected.aUuid}||actual->b!=ObjectKey{owner,expected.bUuid}||
                     actual->record.aAnchor!=expected.aAnchor||actual->record.bAnchor!=expected.bAnchor||actual->record.kind!=expected.kind||
-                    actual->record.relationKey!=expected.relationKey||Json::parse(actual->record.meta)!=Json::parse(expected.meta))
+                    Json::parse(actual->record.meta)!=Json::parse(expected.meta))
                     throw std::runtime_error("published constraint differs from source");
                 if(n==0)edgeSamples[i]=expected;
             }

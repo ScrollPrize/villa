@@ -3,11 +3,12 @@
 
 namespace vc::objects {
 namespace detail { struct CollectionReadContext; struct InitialCollectionAccess; }
-// Namespace-qualified logical identities. Local SQL row IDs are deliberately
-// not treated as globally unique across independently created stores.
+// The UUID is the complete logical identity. storeUuid is a routing hint and
+// provenance for numeric lookup, never a second part of object identity.
 struct ObjectKey {
     std::string storeUuid, objectUuid;
-    auto operator<=>(const ObjectKey&) const = default;
+    auto operator<=>(const ObjectKey& other) const { return objectUuid<=>other.objectUuid; }
+    bool operator==(const ObjectKey& other) const { return objectUuid==other.objectUuid; }
 };
 struct CollectionObject { ObjectKey key; ObjectRecord record; };
 struct CollectionEdge { ObjectKey key, a, b; EdgeRecord record; };

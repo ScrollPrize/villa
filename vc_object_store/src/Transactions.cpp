@@ -41,8 +41,9 @@ void Txn::release(bool commit)
             pool->second->externalGeometryChunkSize = {};
             pool->second->externalEndpointRecord = {};
             pool->second->externalEndpointVersion = {};
+            pool->second->externalEndpointOwner = {};
             pool->second->externalEndpointValidateAnchor = {};
-            pool->second->promotedEndpointUuid.clear();
+            pool->second->currentWrite.reset();
         }
         activeStatementPools.erase(conn);
         if (write_) db_->impl_->writerMutex.unlock();

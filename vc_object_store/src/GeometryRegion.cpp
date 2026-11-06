@@ -335,10 +335,10 @@ RegionResult ObjectStore::geometryRegion(const ReadTxn& txn, const RegionSlice& 
                 : "spatial_regions_rtree r CROSS JOIN spatial_regions b ON b.id=r.id CROSS JOIN objects o ON o.id=b.object_id ";
             // Surfaces have no family or length summary; their filters are rejected above.
             const std::string family = kind.surface ? "''" : "COALESCE(f.family,'')";
-            std::string sql="SELECT o.uuid,o.id,h.revision_uuid," + family + " FROM " + from +
-                "JOIN geometry_heads h ON h.object_uuid=o.uuid LEFT JOIN " + std::string(kind.table) + " f ON f.object_id=o.id "
-                "LEFT JOIN object_lifecycle l ON l.object_id=o.id WHERE o.kind=?12 AND b.array_name='' "
-                "AND COALESCE(l.retired,0)=0 AND "+spatialOverlapSql()+
+            std::string sql="SELECT o.uuid,o.id,o.storage_ref," + family + " FROM " + from +
+                "LEFT JOIN " + std::string(kind.table) + " f ON f.object_id=o.id "
+                "LEFT JOIN object_lifecycle l ON l.object_id=o.id WHERE o.deleted=0 AND o.kind=?12 AND b.array_name='' "
+                "AND o.geometry_manifest IS NOT NULL AND COALESCE(l.retired,0)=0 AND "+spatialOverlapSql()+
                 (kind.surface ? std::string() : " AND COALESCE(f.length,0)>=?7 AND (?8 IS NULL OR "+family+"=?8)");
             if(includedIds)sql+=" AND o.id IN (SELECT value FROM json_each(?10))";
             if(options.coordinates)sql+=coordinateFilterSql("o", "?11");

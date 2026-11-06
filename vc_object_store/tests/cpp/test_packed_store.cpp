@@ -339,12 +339,17 @@ int main()
             auto write = branch.write(); branch.editGeometry(write, key, {edit}, revision); branch.seal(write); write.commit();
         }
         {
-            // DFS order is root, derived, common base, branch. The branch's
-            // borrowed chunks point backward in that enumeration, but forward
-            // along a valid dependency edge; vector order must not reject it.
+            // The first same-key record wins as a whole: a metadata override
+            // in derived also keeps its geometry, rather than merging it with
+            // an unrelated later branch's geometry component.
             auto dag = ObjectCollection::create(dagPath, {derivedPath, branchPath}, collectionOptions);
-            { auto read = dag.read(); require(dag.readGeometryArray(read, key, "line_points") == deformed, "shared-base DAG geometry resolution"); }
+            { auto read = dag.read(); require(dag.readGeometryArray(read, key, "line_points") == originalGeometry, "shared-base DAG whole-record precedence"); }
             auto write = dag.write(); dag.seal(write); write.commit();
+        }
+        {
+            auto reversed = ObjectCollection::create(temp.path / "reversed-dag.vcobj", {branchPath, derivedPath}, collectionOptions);
+            auto read = reversed.read();
+            require(reversed.readGeometryArray(read,key,"line_points")==deformed,"first linked same-key geometry override wins");
         }
         packObjectCollection(dagPath, temp.path / "dag-packed.vcobj", options);
         std::filesystem::rename(basePath, temp.path / "old-linked-base.vcobj");
@@ -357,7 +362,7 @@ int main()
             require(packed.readGeometryArray(read, key, "line_points") == originalGeometry, "packed inherited geometry changed");
         }
         { auto dag = ObjectCollection::open(temp.path / "dag-packed.vcobj", OpenOptions{.readOnly=true}); auto read = dag.read();
-          require(dag.readGeometryArray(read, key, "line_points") == deformed, "packed shared-base DAG borrowed payload changed"); }
+          require(dag.readGeometryArray(read, key, "line_points") == originalGeometry, "packed shared-base DAG whole-record precedence changed"); }
 
         // sqlite3_backup must include committed pages still in a WAL.
         const auto wal = temp.path / "wal.sqlite";

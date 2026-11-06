@@ -245,10 +245,18 @@ std::array<unsigned char, 16> Statement::blob16(int c) const
     return out;
 }
 
-Savepoint::Savepoint(sqlite3* db) : db_(db) { exec(db_, "SAVEPOINT object_operation"); }
+Savepoint::Savepoint(sqlite3* db) : db_(db) {
+    if(const auto found=activeStatementPools.find(db);found!=activeStatementPools.end()) {
+        pool_=found->second;currentWrite_=pool_->currentWrite;
+    }
+    exec(db_, "SAVEPOINT object_operation");
+}
 Savepoint::~Savepoint()
 {
-    if (db_) sqlite3_exec(db_, "ROLLBACK TO object_operation; RELEASE object_operation", nullptr, nullptr, nullptr);
+    if (db_) {
+        sqlite3_exec(db_, "ROLLBACK TO object_operation; RELEASE object_operation", nullptr, nullptr, nullptr);
+        if(pool_)pool_->currentWrite=std::move(currentWrite_);
+    }
 }
 void Savepoint::release()
 {

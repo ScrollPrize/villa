@@ -4,11 +4,12 @@
 #include <cstdint>
 #include <filesystem>
 #include <optional>
+#include <memory>
 #include <span>
 #include <string>
 #include "vc_object_store/objects/ObjectStore.hpp"
 
-namespace vc::objects { struct StatementPool; }
+namespace vc::objects { struct StatementPool; struct CurrentWriteState; }
 namespace vc::objects::detail {
 [[noreturn]] void fail(sqlite3* db, const std::string& what);
 void check(int rc, sqlite3* db, const char* what = "sqlite");
@@ -88,5 +89,7 @@ public:
     void release();
 private:
     sqlite3* db_;
+    StatementPool* pool_ = nullptr;
+    std::shared_ptr<CurrentWriteState> currentWrite_;
 };
 } // namespace vc::objects::detail

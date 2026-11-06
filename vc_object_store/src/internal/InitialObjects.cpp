@@ -31,8 +31,8 @@ std::vector<std::pair<std::string,int64_t>> insertInitialObjects(
     for(size_t i=0;i<input.size();++i){
         const auto& value=input[i];auto rec=prepareObjectRecord(value.record);
         normalizeObjectCoordinates(rec,true);
-        {Statement edge(db,"SELECT 1 FROM edges WHERE uuid=?1 UNION ALL SELECT 1 FROM external_object_keys WHERE uuid=?1",parseUuid(rec.uuid));
-            if(edge.row())throw std::invalid_argument("object store: UUID already belongs to an edge or endpoint key");}
+        {Statement edge(db,"SELECT 1 FROM edges WHERE uuid=?",parseUuid(rec.uuid));
+            if(edge.row())throw std::invalid_argument("object store: UUID already belongs to an edge");}
         std::optional<PreparedInitialGeometry> geometry;
         if(value.geometry){geometry=prepareInitialGeometry(db,rec,*value.geometry);rec=geometry->record;}
         else if(rec.storageKind=="sqlite")

@@ -16,8 +16,7 @@ inline bool isObjectRecord(const Json& record) { return record.is_object() && re
 // Every relationship touching an object, including dormant ones.
 inline void incidentEdges(sqlite3* db, const std::string& object, std::set<std::string>& ids)
 {
-    Statement edges(db, "SELECT uuid FROM edges WHERE a_id=(SELECT id FROM objects WHERE uuid=?1) "
-                        "OR b_id=(SELECT id FROM objects WHERE uuid=?1)", parseUuid(object));
+    Statement edges(db, "SELECT uuid FROM edges WHERE a_uuid=?1 OR b_uuid=?1", parseUuid(object));
     while (edges.row()) ids.insert(formatUuid(edges.blob16(0)));
 }
 

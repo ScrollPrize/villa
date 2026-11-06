@@ -1,36 +1,25 @@
-"""Independent observations retain their native relationship identities."""
+"""An edge's UUID identifies an independent observation."""
 import pytest
 
 
-def test_distinct_observations_roundtrip_and_keys_are_immutable(db):
+def test_distinct_observations_use_their_own_keys(db):
     a = db.upsert_object(dict(kind="fiber", name="a"))
     b = db.upsert_object(dict(kind="fiber", name="b"))
-    first = db.add_edge(dict(kind="perpendicular", a=a, b=b, relation_key="sample:1"))
-    second = db.add_edge(dict(kind="perpendicular", a=a, b=b, relation_key="sample:2"))
+    first = db.add_edge(dict(kind="perpendicular", a=a, b=b))
+    second = db.add_edge(dict(kind="perpendicular", a=a, b=b))
     assert first != second
-    assert db.edge(first)["relation_key"] == "sample:1"
-    assert db.edge(second)["relation_key"] == "sample:2"
-    with pytest.raises(RuntimeError, match="UNIQUE constraint"):
-        db.add_edge(dict(kind="perpendicular", a=a, b=b, relation_key="sample:1"))
+    assert db.edge(first)["uuid"] == first
+    assert "relation_key" not in db.edge(first)
     with pytest.raises(Exception):
-        db.add_edge(dict(uuid=first, kind="perpendicular", a=a, b=b, relation_key="changed"))
-    assert db.edge(first)["relation_key"] == "sample:1"
-
-
-def test_default_key_preserves_legacy_identity(db):
-    a = db.upsert_object(dict(kind="fiber"))
-    b = db.upsert_object(dict(kind="fiber"))
-    edge = db.add_edge(dict(kind="parallel", a=a, b=b))
-    assert db.edge(edge)["relation_key"] == ""
-    with pytest.raises(RuntimeError, match="UNIQUE constraint"):
-        db.add_edge(dict(kind="parallel", a=a, b=b))
+        db.add_edge(dict(uuid=first, kind="perpendicular", a=a, b=b))
+    assert len(db.edges_of(a)) == 2
 
 
 def test_history_generations_are_the_shared_publication_generation(db):
     with db.write() as tx:
         a = tx.upsert_object(dict(kind="fiber"))
         b = tx.upsert_object(dict(kind="fiber"))
-        edge = tx.add_edge(dict(kind="perpendicular", a=a, b=b, relation_key="observed"))
+        edge = tx.add_edge(dict(kind="perpendicular", a=a, b=b))
     revisions = {uid: db.current_object_revision(uid) for uid in (a, b)}
     generation = db.edge(edge)["generation"]
     assert generation == 2

@@ -112,7 +112,6 @@ nlohmann::json edgeToJson(EdgeRecord e, const std::set<std::string>* fields, boo
     auto j = commonToJson(e, fields);
     j["a"] = e.aUuid;
     j["b"] = e.bUuid;
-    if (includeField(fields, "relation_key") && (!e.relationKey.empty() || fields)) j["relation_key"] = e.relationKey;
     if (includeField(fields, "a_anchor")) j["a_anchor"] = anchorToJson(e.aAnchor);
     if (includeField(fields, "b_anchor")) j["b_anchor"] = anchorToJson(e.bAnchor);
     return j;
@@ -124,7 +123,6 @@ EdgeRecord edgeFromJson(const nlohmann::json& j)
     e.uuid = j.at("uuid").get<std::string>(); e.kind = j.at("kind").get<std::string>();
     e.aUuid = util::canonicalUuid(j.at("a").get<std::string>());
     e.bUuid = util::canonicalUuid(j.at("b").get<std::string>());
-    e.relationKey = j.value("relation_key", "");
     if (j.contains("a_anchor")) e.aAnchor = anchorFromJson(j.at("a_anchor"));
     if (j.contains("b_anchor")) e.bAnchor = anchorFromJson(j.at("b_anchor"));
     if (j.contains("tags")) e.tags = j.at("tags").get<std::vector<std::string>>();

@@ -5,6 +5,7 @@
 #include "internal/Database.hpp"
 #include "internal/History.hpp"
 #include "internal/RecordJson.hpp"
+#include "geometry/GeometryReader.hpp"
 #include <bit>
 #include <iostream>
 
@@ -57,9 +58,9 @@ void exercise(bool spatial)
             // representation. Policy changes must not silently delete it.
             exec(ObjectStoreImplAccess::conn(txn),
                 "CREATE TABLE extension_events(n INTEGER);"
-                "CREATE VIEW extension_current AS SELECT uuid FROM geometry_revisions;"
+                "CREATE VIEW extension_current AS SELECT uuid FROM objects WHERE geometry_manifest IS NOT NULL;"
                 "CREATE TRIGGER extension_geometry_note AFTER UPDATE OF name ON objects BEGIN "
-                "INSERT INTO extension_events SELECT count(*) FROM geometry_revisions; END;");
+                "INSERT INTO extension_events SELECT count(*) FROM objects WHERE geometry_manifest IS NOT NULL; END;");
             txn.commit();
         }
         {
@@ -81,6 +82,17 @@ void exercise(bool spatial)
             store.retainRelationship(txn, edge); txn.commit();
         }
         auto txn = store.read();
+        require(scalar(txn,"SELECT count(*) FROM sqlite_schema WHERE name IN "
+            "('geometry_heads','current_geometry','current_geometry_chunks','current_shared_payloads')")==0,
+            "history-on also uses direct current object geometry");
+        require(scalar(txn,"SELECT count(*) FROM objects WHERE geometry_manifest IS NOT NULL")==2,
+            "both current objects directly contain their geometry descriptors");
+        {
+            Statement current(ObjectStoreImplAccess::conn(txn),"SELECT storage_ref,geometry_manifest FROM objects WHERE uuid=?",parseUuid(a));
+            require(current.row()&&current.text(0)==head,"object contains the current geometry token");
+            require(nlohmann::json::parse(current.text(1))==GeometryReader(txn,head).manifest(),
+                "current descriptor is complete after sparse and full edits");
+        }
         require(scalar(txn, "SELECT count(*) FROM geometry_deltas") == 2, "fixture has delta after large shared-array revision");
         for (const auto& array : encoded.arrays) expected[array.name] = store.readGeometryArray(txn, head, array.name);
         annotations = store.geometryPointAnnotations(txn, head, "control_points");

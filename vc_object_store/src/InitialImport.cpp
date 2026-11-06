@@ -98,7 +98,7 @@ std::vector<InitialObjectIdentity> InitialShardImport::appendObjects(std::span<c
         if(p.endpoints) {
             if(identities.size()!=objects.size())throw std::logic_error("initial object identity count differs from input");
             for(size_t i=0;i<identities.size();++i) {
-                detail::InitialEndpoint endpoint;endpoint.id=identities[i].id;endpoint.retired=objects[i].record.retired;
+                detail::InitialEndpoint endpoint;endpoint.retired=objects[i].record.retired;
                 if(objects[i].geometry)endpoint.geometry=detail::prepareDependencies(*objects[i].geometry);
                 if(!p.endpoints->emplace(identities[i].key,std::move(endpoint)).second)
                     throw std::runtime_error("initial object has a duplicate qualified identity");

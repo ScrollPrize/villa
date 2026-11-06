@@ -54,7 +54,7 @@ struct InitialEdgeInserter::Impl {
     std::shared_ptr<Endpoint> endpoint(const std::string& uuid) {
         if(const auto found=endpoints.find(uuid);found!=endpoints.end()) return found->second;
         Statement row(db,"SELECT o.id,coalesce(l.retired,0) "
-            "FROM objects o LEFT JOIN object_lifecycle l ON l.object_id=o.id WHERE o.uuid=?",parseUuid(uuid));
+            "FROM objects o LEFT JOIN object_lifecycle l ON l.object_id=o.id WHERE o.uuid=? AND o.deleted=0",parseUuid(uuid));
         if(!row.row()) throw std::runtime_error("object store: edge endpoint not found: "+uuid);
         auto value=std::make_shared<Endpoint>();value->id=row.i64(0);value->retired=row.i64(1)!=0;
         if(value->retired) throw std::runtime_error("initial edge endpoint is retired: "+uuid);
@@ -102,11 +102,10 @@ void InitialEdgeInserter::append(std::span<const EdgeRecord> edges) {
         for(size_t i=0;i<edges.size();++i) {
             auto edge=edges[i];const auto binaryUuid=normalizeNewEdge(edge);
             auto a=p.endpoint(edge.aUuid),b=p.endpoint(edge.bUuid);
-            if(a->id>b->id) {std::swap(a,b);swapEndpoints(edge);}
             p.validate(*a,edge.aAnchor);p.validate(*b,edge.bAnchor);
             const auto id=first+int64_t(i);
             prepared.push_back(std::move(edge));
-            rows.push_back({&prepared.back(),id,a->id,b->id,binaryUuid});
+            rows.push_back({&prepared.back(),id,parseUuid(prepared.back().aUuid),parseUuid(prepared.back().bUuid),binaryUuid});
         }
         }
         if(!p.immutable) { GeometryPhase phase("initial_edges.uuid_collision_check");
@@ -123,34 +122,28 @@ void InitialEdgeInserter::finish() {
         if(p.immutable&&p.hasRows) {
             GeometryPhase phase("initial_edges.finish_uuid_check");
             // Only private, unpublished construction may defer this check.
-            // Walk endpoint namespaces and probe the always-live edge UUID
-            // index, rather than probing both namespaces for every input row.
+            // Probe the object UUID namespace once after the bulk append.
             Statement collision(p.db,
-                "SELECT 1 FROM objects o CROSS JOIN edges e ON e.uuid=o.uuid UNION ALL "
-                "SELECT 1 FROM external_object_keys k CROSS JOIN edges e ON e.uuid=k.uuid LIMIT 1");
-            if(collision.row())throw std::runtime_error("object store: UUID already belongs to an object or endpoint key");
+                "SELECT 1 FROM objects o CROSS JOIN edges e ON e.uuid=o.uuid LIMIT 1");
+            if(collision.row())throw std::runtime_error("object store: UUID already belongs to an object");
         }
         {GeometryPhase phase("initial_edges.finish_indexes");
             for(const auto& sql:p.indexes) exec(p.db,sql.c_str());}
         p.finished=true;p.endpoints.clear();}
     catch(...) {p.failed=true;throw;}
 }
-void InitialEdgeInserter::appendResolved(std::span<EdgeRecord> input,std::span<const std::pair<int64_t,int64_t>> endpoints) {
+void InitialEdgeInserter::appendResolved(std::span<EdgeRecord> input) {
     auto& p=*impl_;p.usable();
     try {
-        if(input.size()!=endpoints.size())throw std::logic_error("resolved edge/endpoint count mismatch");
         if(input.empty())return;
         GeometryPhase phase("native.initial_edges.append_resolved");
         const auto first=p.reserve(input.size()),generation=writeGeneration(p.db);
         std::vector<EdgeInsertRow> rows;rows.reserve(input.size());
         {GeometryPhase preparation("initial_edges.prepare_resolved");
         for(size_t i=0;i<input.size();++i){
-            auto& rec=input[i];bool swapped=false;
-            const auto binaryUuid=normalizeNewEdge(rec,&swapped);
-            auto [a,b]=endpoints[i];
-            if(swapped)std::swap(a,b);
-            if(a>b){std::swap(a,b);swapEndpoints(rec);}
-            rows.push_back({&rec,first+int64_t(i),a,b,binaryUuid});
+            auto& rec=input[i];
+            const auto binaryUuid=normalizeNewEdge(rec);
+            rows.push_back({&rec,first+int64_t(i),parseUuid(rec.aUuid),parseUuid(rec.bUuid),binaryUuid});
         }}
         if(!p.immutable){GeometryPhase collision("initial_edges.uuid_collision_check");
             requireUnusedObjectUuids(p.db,rows,256);}

@@ -58,8 +58,10 @@ int main() try
             auto* db=ObjectStoreImplAccess::conn(*txn);
             Statement chunks(db,"SELECT count(*) FROM geometry_chunks WHERE typeof(hash)!='blob' OR length(hash)!=32");
             chunks.row();require(chunks.i64(0)==0,"geometry payload identities must be binary SHA-256");
-            Statement descriptors(db,"SELECT count(*) FROM current_geometry WHERE typeof(content_hash)!='blob' OR length(content_hash)!=32");
-            descriptors.row();require(descriptors.i64(0)==0,"geometry descriptor identities must be binary SHA-256");
+            Statement descriptors(db,"SELECT count(*) FROM objects WHERE geometry_manifest IS NULL OR length(data_checksum)!=64");
+            descriptors.row();require(descriptors.i64(0)==0,"current objects directly hold their geometry descriptors");
+            Statement redundant(db,"SELECT count(*) FROM sqlite_schema WHERE name IN ('current_geometry','current_geometry_chunks','current_shared_payloads')");
+            redundant.row();require(redundant.i64(0)==0,"no alternate history-off geometry schema");
         }
         for(const auto& entry:records){
             const auto expected=scalar.objectByUuid(a,entry.record.uuid),actual=initial.objectByUuid(b,entry.record.uuid);

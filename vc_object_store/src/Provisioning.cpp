@@ -205,43 +205,4 @@ DatabaseIdentity ObjectStore::databaseIdentity(const Txn& txn) const
     return result;
 }
 
-void detail::createCurrentGeometrySchema(sqlite3* db)
-{
-    // A current descriptor is required even without history. Read views let
-    // the common verified geometry reader address its opaque current token;
-    // there are no parent links, deltas, historical heads or retained versions.
-    exec(db, R"SQL(
-CREATE TABLE current_geometry(
- object_uuid BLOB PRIMARY KEY REFERENCES objects(uuid) ON DELETE CASCADE CHECK(length(object_uuid)=16),
- content_hash BLOB NOT NULL CHECK(typeof(content_hash)='blob' AND length(content_hash)=32),
- manifest TEXT NOT NULL CHECK(json_valid(manifest)),
- object_generation INTEGER NOT NULL,
- created_by TEXT NOT NULL, created_at TEXT NOT NULL, created_host TEXT NOT NULL
-);
-CREATE TABLE current_geometry_chunks(
- object_uuid BLOB NOT NULL REFERENCES current_geometry(object_uuid) ON DELETE CASCADE,
- array_name TEXT NOT NULL, chunk_index INTEGER NOT NULL CHECK(chunk_index>=0),
- hash BLOB NOT NULL REFERENCES geometry_chunks(hash),
- PRIMARY KEY(object_uuid,array_name,chunk_index)
-);
-CREATE INDEX current_chunk_hash ON current_geometry_chunks(hash);
-CREATE TABLE current_shared_payloads(
- object_uuid BLOB NOT NULL REFERENCES current_geometry(object_uuid) ON DELETE CASCADE,
- hash BLOB NOT NULL REFERENCES geometry_chunks(hash),
- PRIMARY KEY(object_uuid,hash)
-);
-CREATE INDEX current_shared_hash ON current_shared_payloads(hash);
-CREATE VIEW geometry_revisions AS SELECT 'current:'||lower(hex(object_uuid))||':'||object_generation AS uuid,object_uuid,NULL AS parent_uuid,content_hash,manifest,object_generation,created_by,created_at,created_host FROM current_geometry;
-CREATE VIEW geometry_heads AS SELECT object_uuid,'current:'||lower(hex(object_uuid))||':'||object_generation AS revision_uuid FROM current_geometry;
-CREATE VIEW geometry_revision_chunks AS SELECT 'current:'||lower(hex(g.object_uuid))||':'||g.object_generation AS revision_uuid,c.array_name,c.chunk_index,c.hash FROM current_geometry_chunks c JOIN current_geometry g ON g.object_uuid=c.object_uuid;
-)SQL");
-}
-
-void detail::indexCurrentMetadata(sqlite3* db, const std::string& object, const nlohmann::json& manifest)
-{
-    // Shared sequence metadata forms a hash-addressed tree. Record the live
-    // reachable chunks as current ownership, not a history of old roots.
-    Statement reference(db, "INSERT INTO current_shared_payloads VALUES(?,?)");
-    for(const auto& hash:reachableGeometryMetadata(db,manifest)) reference.run(parseUuid(object),parseDigest(hash));
-}
 } // namespace vc::objects

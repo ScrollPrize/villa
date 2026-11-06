@@ -57,9 +57,9 @@ std::unique_ptr<ObjectStore::Impl> ObjectStore::openImpl(const std::filesystem::
         Statement features(db, "SELECT name FROM store_required_features");
         bool currentState=false,binaryHashes=false,endpointKeys=false;
         while (features.row()) {
-            if(features.text(0)=="current-state-v1"){currentState=true;continue;}
+            if(features.text(0)=="direct-geometry-v1"){currentState=true;continue;}
             if(features.text(0)=="binary-sha256-v1"){binaryHashes=true;continue;}
-            if(features.text(0)=="endpoint-keys-v1"){endpointKeys=true;continue;}
+            if(features.text(0)=="direct-endpoint-keys-v1"){endpointKeys=true;continue;}
             if (features.text(0)=="collection-v1" && options.physicalPartitionOnly) continue;
             if (features.text(0)==immutableImportFeature) {
                 if(!options.readOnly || !manifest.i64(2) || manifest.i64(1) || manifest.i64(3))
@@ -69,7 +69,7 @@ std::unique_ptr<ObjectStore::Impl> ObjectStore::openImpl(const std::filesystem::
             throw std::runtime_error("object store: unsupported required feature (use ObjectCollection for collections): " + features.text(0));
         }
         if(!currentState) throw std::runtime_error("object store: legacy current-state layout requires separate conversion; refusing mixed v2 semantics");
-        if(!binaryHashes||!endpointKeys) throw std::runtime_error("object store: earlier experimental v2 layout requires rebuilding (binary hashes/qualified endpoint keys absent)");
+        if(!binaryHashes||!endpointKeys) throw std::runtime_error("object store: earlier experimental v2 layout requires rebuilding (binary hashes/direct endpoint UUIDs absent)");
         Statement physical(db, "SELECT schema_version FROM database_identity WHERE singleton=1");
         if (!physical.row() || physical.i64(0) != kSchemaVersion)
             throw std::runtime_error("object store: invalid database identity/schema");

@@ -63,10 +63,10 @@ bool matchesEdgeSelection(const EdgeRecord& edge, const EdgeSelection& selection
 }
 
 const char* kEdgeCols =
-    "id,uuid,a_id,b_id,kind,generation,created_by,created_at,created_host,changed_by,changed_at,changed_host,"
+    "id,uuid,a_uuid,b_uuid,kind,generation,created_by,created_at,created_host,changed_by,changed_at,changed_host,"
     "approval_state,approved_by,approved_at,approved_host,approved_generation,"
     "a_anchor_x,a_anchor_y,a_anchor_z,a_dir_x,a_dir_y,a_dir_z,"
-    "b_anchor_x,b_anchor_y,b_anchor_z,b_dir_x,b_dir_y,b_dir_z,meta,a_dependencies,b_dependencies,relation_key";
+    "b_anchor_x,b_anchor_y,b_anchor_z,b_dir_x,b_dir_y,b_dir_z,meta,a_dependencies,b_dependencies";
 
 std::string projectedEdgeColumns(const ObjectFields& fields)
 {
@@ -79,7 +79,7 @@ std::string projectedEdgeColumns(const ObjectFields& fields)
         std::string field = name;
         if (name.starts_with("a_anchor_") || name.starts_with("a_dir_") || name == "a_dependencies") field = "a_anchor";
         if (name.starts_with("b_anchor_") || name.starts_with("b_dir_") || name == "b_dependencies") field = "b_anchor";
-        const bool identity = name == "id" || name == "uuid" || name == "kind" || name == "a_id" || name == "b_id";
+        const bool identity = name == "id" || name == "uuid" || name == "kind" || name == "a_uuid" || name == "b_uuid";
         if (!identity || name == "uuid" || name == "kind") valid.insert(field);
         if (!sql.empty()) sql += ',';
         sql += identity || fields->contains(field) ? name :
@@ -108,29 +108,12 @@ void bindAnchor(Statement& s, int firstIdx, const Anchor& a)
     }
 }
 
-std::string uuidTextByObjectId(sqlite3* db, int64_t id)
-{
-    Statement s(db, id>0 ? "SELECT uuid FROM objects WHERE id=?" : "SELECT uuid FROM external_object_keys WHERE id=?", id);
-    if (!s.row()) throw std::runtime_error("object store: dangling edge endpoint id");
-    return formatUuid(s.blob16(0));
-}
-
-std::optional<int64_t> endpointIdByUuid(sqlite3* db,const std::array<unsigned char,16>& uuid)
-{
-    if(auto local=objectIdByUuid(db,uuid))return local;
-    Statement s(db,"SELECT id FROM external_object_keys WHERE uuid=?",uuid);
-    if(!s.row())return {};
-    const auto id=s.i64(0);
-    if(s.row())throw std::runtime_error("object store: ambiguous endpoint identity");
-    return id;
-}
-
 EdgeRecord readEdgeRow(sqlite3* db, const Statement& s, bool details, const ObjectFields& fields)
 {
     EdgeRecord rec;
     const int64_t id = s.i64(0);
-    const int64_t aId = s.i64(2);
-    const int64_t bId = s.i64(3);
+    rec.aUuid = formatUuid(s.blob16(2));
+    rec.bUuid = formatUuid(s.blob16(3));
     readCommon(rec, s, 1, 4, 5);
     if (wants(fields, "a_anchor")) {
         rec.aAnchor = readAnchor(s, 17);
@@ -141,10 +124,7 @@ EdgeRecord readEdgeRow(sqlite3* db, const Statement& s, bool details, const Obje
         dependenciesFromJson(rec.bAnchor, nlohmann::json::parse(s.text(31)));
     }
     rec.meta = s.text(29);
-    rec.relationKey = s.text(32);
     if (!details) return rec;
-    rec.aUuid = uuidTextByObjectId(db, aId);
-    rec.bUuid = uuidTextByObjectId(db, bId);
     Statement tags(db, "SELECT tag FROM edge_tags WHERE edge_id=? ORDER BY tag", id);
     while (tags.row()) rec.tags.push_back(tags.text(0));
     return rec;
@@ -162,14 +142,6 @@ std::vector<EdgeRecord> readEdgeRows(sqlite3* db, Statement& rows, const ObjectF
     }
     if (result.empty()) return result;
     const auto selection = ids.dump();
-    Statement endpoints(db, "SELECT e.id,a.uuid,b.uuid FROM edges e "
-        "JOIN endpoint_keys a ON a.id=e.a_id JOIN endpoint_keys b ON b.id=e.b_id "
-        "WHERE e.id IN (SELECT value FROM json_each(?))", selection);
-    while (endpoints.row()) {
-        auto& edge = result.at(positions.at(endpoints.i64(0)));
-        edge.aUuid = formatUuid(endpoints.blob16(1));
-        edge.bUuid = formatUuid(endpoints.blob16(2));
-    }
     if (wants(fields, "tags")) {
         Statement tags(db, "SELECT edge_id,tag FROM edge_tags "
             "WHERE edge_id IN (SELECT value FROM json_each(?)) ORDER BY edge_id,tag", selection);
@@ -198,11 +170,11 @@ std::array<unsigned char,16> normalizeNewEdge(EdgeRecord& rec,bool* swapped)
     return parseUuid(rec.uuid);
 }
 
-void insertEdgeRow(sqlite3* db,const EdgeRecord& rec,int64_t id,int64_t aId,int64_t bId,
+void insertEdgeRow(sqlite3* db,const EdgeRecord& rec,int64_t id,
                    int64_t generation,const std::string& author,const std::string& host,
                    const std::string& now,bool preserveRecord)
 {
-    const EdgeInsertRow row{&rec,id,aId,bId};
+    const EdgeInsertRow row{&rec,id,parseUuid(rec.aUuid),parseUuid(rec.bUuid)};
     insertEdgeRows(db,std::span(&row,1),generation,author,host,now,preserveRecord);
 }
 
@@ -215,12 +187,11 @@ void requireUnusedObjectUuids(sqlite3* db,std::span<const EdgeInsertRow> rows,si
         const auto count=std::min(capacity,rows.size()-begin);
         std::string parameters;
         for(size_t i=0;i<count;++i){if(i)parameters+=',';parameters+='?'+std::to_string(i+1);}
-        std::string sql="SELECT 1 FROM objects WHERE uuid IN ("+parameters+") UNION ALL "
-            "SELECT 1 FROM external_object_keys WHERE uuid IN ("+parameters+") LIMIT 1";
+        std::string sql="SELECT 1 FROM objects WHERE uuid IN ("+parameters+") LIMIT 1";
         Statement collision(db,sql);
         for(size_t i=0;i<count;++i){const auto& row=rows[begin+i];
             collision.bind(int(i+1),row.binaryUuid?*row.binaryUuid:parseUuid(row.record->uuid));}
-        if(collision.row())throw std::runtime_error("object store: UUID already belongs to an object or endpoint key");
+        if(collision.row())throw std::runtime_error("object store: UUID already belongs to an object");
         begin+=count;
     }
 }
@@ -232,12 +203,12 @@ void insertEdgeRows(sqlite3* db,std::span<const EdgeInsertRow> rows,int64_t gene
     if(!preserveRecord){
         // New records share provenance. Approval defaults are the same as the
         // ordinary insert; avoid rebinding shared/default values per row.
-        writeSqlValuesShared(db,"INSERT INTO edges(uuid,a_id,b_id,kind,generation,created_by,created_at,created_host,"
+        writeSqlValuesShared(db,"INSERT INTO edges(uuid,a_uuid,b_uuid,kind,generation,created_by,created_at,created_host,"
             "changed_by,changed_at,changed_host,a_anchor_x,a_anchor_y,a_anchor_z,a_dir_x,a_dir_y,a_dir_z,"
-            "b_anchor_x,b_anchor_y,b_anchor_z,b_dir_x,b_dir_y,b_dir_z,meta,a_dependencies,b_dependencies,id,relation_key)",
-            4,21,rows.size(),sqlBatchRows,[](size_t offset){
+            "b_anchor_x,b_anchor_y,b_anchor_z,b_dir_x,b_dir_y,b_dir_z,meta,a_dependencies,b_dependencies,id)",
+            4,20,rows.size(),sqlBatchRows,[](size_t offset){
                 std::string pattern="(";
-                for(size_t i=1;i<=21;++i){
+                for(size_t i=1;i<=20;++i){
                     if(i!=1)pattern+=',';
                     pattern+='?'+std::to_string(offset+i);
                     if(i==4)pattern+=",?1,?2,?3,?4,?2,?3,?4";
@@ -246,19 +217,19 @@ void insertEdgeRows(sqlite3* db,std::span<const EdgeInsertRow> rows,int64_t gene
             },[&](Statement& s){s.bind(1,generation);s.bindBorrowedText(2,author);s.bindBorrowedText(3,now);s.bindBorrowedText(4,host);},
             [&](Statement& s,size_t index,int offset){
                 const auto& row=rows[index];const auto& rec=*row.record;
-                s.bind(offset+1,row.binaryUuid?*row.binaryUuid:parseUuid(rec.uuid));s.bind(offset+2,row.aId);s.bind(offset+3,row.bId);s.bindBorrowedText(offset+4,rec.kind);
+                s.bind(offset+1,row.binaryUuid?*row.binaryUuid:parseUuid(rec.uuid));s.bind(offset+2,row.aUuid);s.bind(offset+3,row.bUuid);s.bindBorrowedText(offset+4,rec.kind);
                 bindAnchor(s,offset+5,rec.aAnchor);bindAnchor(s,offset+11,rec.bAnchor);
                 s.bindBorrowedText(offset+17,rec.meta);bindDependencies(s,offset+18,rec.aAnchor);
-                bindDependencies(s,offset+19,rec.bAnchor);s.bind(offset+20,row.id);s.bindBorrowedText(offset+21,rec.relationKey);
+                bindDependencies(s,offset+19,rec.bAnchor);s.bind(offset+20,row.id);
             });
     }else{
-    writeSqlValues(db,"INSERT INTO edges(uuid,a_id,b_id,kind,generation,created_by,created_at,created_host,changed_by,changed_at,"
+    writeSqlValues(db,"INSERT INTO edges(uuid,a_uuid,b_uuid,kind,generation,created_by,created_at,created_host,changed_by,changed_at,"
                     "changed_host,approval_state,approved_by,approved_at,approved_host,approved_generation,"
                     "a_anchor_x,a_anchor_y,a_anchor_z,a_dir_x,a_dir_y,a_dir_z,"
-                    "b_anchor_x,b_anchor_y,b_anchor_z,b_dir_x,b_dir_y,b_dir_z,meta,a_dependencies,b_dependencies,id,relation_key)",
-        "",33,rows.size(),sqlBatchRows,[&](Statement& s,size_t index,int offset){
+                    "b_anchor_x,b_anchor_y,b_anchor_z,b_dir_x,b_dir_y,b_dir_z,meta,a_dependencies,b_dependencies,id)",
+        "",32,rows.size(),sqlBatchRows,[&](Statement& s,size_t index,int offset){
     const auto& row=rows[index];const auto& rec=*row.record;
-    s.bind(offset+1,row.binaryUuid?*row.binaryUuid:parseUuid(rec.uuid));s.bind(offset+2,row.aId);s.bind(offset+3,row.bId);
+    s.bind(offset+1,row.binaryUuid?*row.binaryUuid:parseUuid(rec.uuid));s.bind(offset+2,row.aUuid);s.bind(offset+3,row.bUuid);
     s.bind(offset+4,rec.kind);s.bind(offset+5,generation);
     s.bind(offset+6,author);s.bind(offset+7,now);s.bind(offset+8,host);
     s.bind(offset+9,author);s.bind(offset+10,now);s.bind(offset+11,host);
@@ -274,7 +245,6 @@ void insertEdgeRows(sqlite3* db,std::span<const EdgeInsertRow> rows,int64_t gene
     bindDependencies(s,offset+30,rec.aAnchor);
     bindDependencies(s,offset+31,rec.bAnchor);
     s.bind(offset+32, row.id);
-    s.bind(offset+33, rec.relationKey);
     });
     }
     for(const auto& row:rows) insertTags(db,"edge_tags","edge_id",row.id,row.record->tags);
@@ -286,14 +256,15 @@ EdgeRecord addEdgeImpl(sqlite3* db, const std::string& author, const std::string
     GeometryPhase phase("native.edge.sql");
     Savepoint savepoint(db);
     auto rec=prepareNewEdge(input);
-    const EdgeInsertRow identity{&rec,0,0,0};requireUnusedObjectUuids(db,std::span(&identity,1));
-    auto aId=endpointIdByUuid(db,parseUuid(rec.aUuid)),bId=endpointIdByUuid(db,parseUuid(rec.bUuid));
-    if(!aId) throw std::runtime_error("object store: edge endpoint not found: "+rec.aUuid);
-    if(!bId) throw std::runtime_error("object store: edge endpoint not found: "+rec.bUuid);
+    if(preserveRecord&&rec.aUuid!=formatUuid(parseUuid(input.aUuid)))swapEndpoints(rec);
+    const EdgeInsertRow identity{&rec,0,{},{}};requireUnusedObjectUuids(db,std::span(&identity,1));
     if(!lifecycleBindingMatches(db,rec)) throw std::runtime_error("relationship endpoints must be active");
-    if(*aId>*bId) {std::swap(aId,bId);swapEndpoints(rec);}
+    // A caller explicitly inserting this UUID may replace its deletion marker.
+    // Merely reviving an endpoint never reactivates relationships. Historical
+    // relationship revisions retain the earlier state independently.
+    execute(db,"DELETE FROM edges WHERE uuid=? AND deleted=1",parseUuid(rec.uuid));
     const auto id=allocateRecordId(db,"edges");
-    insertEdgeRow(db,rec,id,*aId,*bId,writeGeneration(db),author,host,nowIsoUtc(),preserveRecord);
+    insertEdgeRow(db,rec,id,writeGeneration(db),author,host,nowIsoUtc(),preserveRecord);
     if (preserveRecord) restoreCommon(db, "edges", rec);
     appendJournal(db, author, host, parseUuid(rec.uuid), preserveRecord ? rec.generation : writeGeneration(db), preserveRecord ? importOperation : "add_edge");
     savepoint.release();

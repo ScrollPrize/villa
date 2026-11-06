@@ -24,7 +24,7 @@ std::string ObjectStore::exportJson(const Txn& txn, const JsonExportOptions& opt
         return selected;
     };
     const auto objectProjection = projection({"name", "format_version", "storage_kind", "storage_ref", "data_generation", "data_checksum", "fiber", "surface", "track"});
-    const auto edgeProjection = projection({"a", "b", "a_anchor", "b_anchor", "relation_key"});
+    const auto edgeProjection = projection({"a", "b", "a_anchor", "b_anchor"});
     ObjectFields edgeFields = edgeProjection ? ObjectFields(std::in_place, edgeProjection->begin(), edgeProjection->end()) : std::nullopt;
     // Export canonicalizes endpoint order, including self-link dependency order.
     // Both anchors are needed for that even when only one is requested.
@@ -37,14 +37,15 @@ std::string ObjectStore::exportJson(const Txn& txn, const JsonExportOptions& opt
             record["geometry"] = {{"revision_uuid", geometry->uuid}, {"content_hash", geometry->contentHash}};
         out["objects"].push_back(std::move(record));
     }
-    std::string members = "SELECT e.id FROM json_each(?1) selected CROSS JOIN edges e INDEXED BY edges_a "
-        "WHERE e.a_id=selected.value AND e.b_id IN (SELECT value FROM json_each(?1))";
+    std::string members = "SELECT e.id FROM json_each(?1) selected CROSS JOIN objects selected_object ON selected_object.id=selected.value "
+        "CROSS JOIN edges e INDEXED BY edges_a WHERE e.deleted=0 AND e.a_uuid=selected_object.uuid "
+        "AND e.b_uuid IN (SELECT uuid FROM objects WHERE id IN (SELECT value FROM json_each(?1)))";
     if (!options.selection.includeRetired)
         members += " AND e.id IN (SELECT id FROM edges WHERE " + activeEdgeSql() + ")";
     if (!options.selection.edgeKinds.empty()) members += " AND e.kind IN (SELECT value FROM json_each(?2))";
-    Statement states(db, "SELECT e.uuid,ha.revision_uuid,hb.revision_uuid FROM edges e "
-        "JOIN objects a ON a.id=e.a_id JOIN objects z ON z.id=e.b_id "
-        "LEFT JOIN geometry_heads ha ON ha.object_uuid=a.uuid LEFT JOIN geometry_heads hb ON hb.object_uuid=z.uuid "
+    Statement states(db, "SELECT e.uuid,CASE WHEN a.geometry_manifest IS NOT NULL THEN a.storage_ref END,"
+        "CASE WHEN z.geometry_manifest IS NOT NULL THEN z.storage_ref END FROM edges e "
+        "JOIN objects a ON a.uuid=e.a_uuid JOIN objects z ON z.uuid=e.b_uuid "
         "WHERE e.id IN (" + members + ")", included.dump());
     if (!options.selection.edgeKinds.empty()) states.bind(2, nlohmann::json(options.selection.edgeKinds).dump());
     std::map<std::string, EdgeGeometryState> geometryStates;

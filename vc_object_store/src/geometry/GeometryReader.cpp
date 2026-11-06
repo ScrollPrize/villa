@@ -108,7 +108,7 @@ GeometryReader::GeometryReader(sqlite3* db, const std::string& revision, bool ca
     if(currentOnly_==historyEnabled(db_))throw std::invalid_argument("geometry: revision belongs to a different history layout");
     revision_=parseUuid(current ? current->objectUuid : revision);
     Statement row(db_, current ?
-        "SELECT content_hash,manifest,object_uuid,NULL FROM current_geometry WHERE object_uuid=? AND object_generation=?" :
+        "SELECT data_checksum,geometry_manifest,uuid,NULL FROM objects WHERE uuid=? AND data_generation=? AND deleted=0 AND geometry_manifest IS NOT NULL" :
         "SELECT content_hash,manifest,object_uuid,parent_uuid FROM geometry_revisions WHERE uuid=?");
     row.bind(1,revision_);if(current)row.bind(2,current->generation);
     if (!row.row()) throw std::invalid_argument("geometry: revision not found");
@@ -116,7 +116,18 @@ GeometryReader::GeometryReader(sqlite3* db, const std::string& revision, bool ca
     // Charge JSON nodes/strings, layouts and cache bookkeeping conservatively,
     // in addition to the separately accounted retained payload bytes.
     metadataCharge_ = text.size() * 32 + 4096;
-    manifest_ = loadGeometryManifest(db_, revision, text, readDigest(row,0));
+    manifest_ = loadGeometryManifest(db_, revision, text, current ? row.text(0) : readDigest(row,0));
+    std::optional<nlohmann::json> currentDescriptor;
+    if(!current) {
+        Statement object(db_,"SELECT geometry_manifest,data_checksum FROM objects WHERE uuid=? AND storage_ref=? AND deleted=0 AND geometry_manifest IS NOT NULL",
+            row.blob16(2),revision);
+        if(object.row()) {
+            if(object.text(1)!=readDigest(row,0))
+                throw std::runtime_error("geometry: current checksum disagrees with archive revision");
+            currentDescriptor=verifiedGeometryManifest(object.text(0),object.text(1));
+            metadataCharge_+=object.text(0).size()*32;
+        }
+    }
     if (manifest_.contains("delta")) {
         const auto target = manifest_;
         const auto object = row.blob16(2);
@@ -125,7 +136,10 @@ GeometryReader::GeometryReader(sqlite3* db, const std::string& revision, bool ca
             object, revision_);
         if (current.row()) {
             const auto full = current.text(0);
-            manifest_ = verifiedGeometryManifest(full, target.at("delta").at("result_hash"));
+            auto materialized=verifiedGeometryManifest(full,target.at("delta").at("result_hash"));
+            if(currentDescriptor && *currentDescriptor!=materialized)
+                throw std::runtime_error("geometry: current descriptor disagrees with materialized archive");
+            manifest_=currentDescriptor ? *currentDescriptor : std::move(materialized);
             auto compact = manifest_;
             for (auto& a : compact.at("arrays")) a.erase("chunks");
             auto expected = target; expected.erase("delta");
@@ -194,6 +208,11 @@ GeometryReader::GeometryReader(sqlite3* db, const std::string& revision, bool ca
         }
         metadataCharge_ += manifest_.dump().size() * 32;
     }
+    if(currentDescriptor) {
+        if(manifest_!=*currentDescriptor)
+            throw std::runtime_error("geometry: current descriptor disagrees with archive");
+        manifest_=std::move(*currentDescriptor);
+    }
     for (const auto& [name, array] : manifest_.at("arrays").items())
         layouts_.emplace(name, geometryLayout(array));
 }
@@ -255,24 +274,19 @@ void GeometryReader::visitChunk(const std::string& name, int64_t index,
             owned = inherited.chunk(name, index);
             storedHash = original.at("chunks").at(index).get<std::string>();
         } else {
-            if (readRequest) {
-                Statement size(db_, currentOnly_ ? "SELECT length(c.data),r.hash FROM current_geometry_chunks r JOIN geometry_chunks c ON c.hash=r.hash WHERE r.object_uuid=? AND r.array_name=? AND r.chunk_index=?" :
-                    "SELECT length(c.data),r.hash FROM geometry_revision_chunks r JOIN geometry_chunks c ON c.hash=r.hash WHERE r.revision_uuid=? AND r.array_name=? AND r.chunk_index=?",
-                    baseRevision_.empty() ? revision_ : parseUuid(baseRevision_), name, index);
-                if (!size.row()) throw std::runtime_error("geometry: missing payload chunk");
-                requestBytes(size.isNull(0) ? geometryPayloadSize(db_,readDigest(size,1)) : size.i64(0), &RegionStats::payloadBytes);
+            storedHash = descriptor.at("chunks").at(index).get<std::string>();
+            // The descriptor is the ordered chunk index. For an archived
+            // delta chain, start from the earliest pre-change payload.
+            bool foundBase=false;
+            for(const auto& [id,delta]:deltas_) {
+                for(const auto& c:delta.at("delta").at("chunks"))
+                    if(c.at("array")==name&&c.at("index")==index) {
+                        storedHash=c.at("before").get<std::string>();foundBase=true;break;
+                    }
+                if(foundBase)break;
             }
-            Statement chunk(db_, currentOnly_ ? "SELECT c.data,r.hash FROM current_geometry_chunks r JOIN geometry_chunks c ON c.hash=r.hash WHERE r.object_uuid=? AND r.array_name=? AND r.chunk_index=?" :
-                                 "SELECT c.data,r.hash FROM geometry_revision_chunks r JOIN geometry_chunks c ON c.hash=r.hash "
-                                 "WHERE r.revision_uuid=? AND r.array_name=? AND r.chunk_index=?",
-                baseRevision_.empty() ? revision_ : parseUuid(baseRevision_), name, index);
-            if (!chunk.row()) throw std::runtime_error("geometry: missing payload chunk");
-            storedHash = readDigest(chunk,1);
-            if(chunk.isNull(0)) owned=readExternalGeometryPayload(db_,storedHash);
-            else {
-                const auto* p = static_cast<const uint8_t*>(sqlite3_column_blob(chunk.value, 0));
-                owned.assign(p, p + sqlite3_column_bytes(chunk.value, 0));
-            }
+            if (readRequest) requestBytes(geometryPayloadSize(db_,storedHash), &RegionStats::payloadBytes);
+            owned=readGeometryPayload(db_,storedHash);
             if (geometryWork) geometryWork->readBytes[name] += owned.size();
             if (!deltas_.empty()) verifyGeometryChunk(owned, storedHash, storedHash, expectedSize, name);
         }
@@ -499,13 +513,13 @@ PackedGeometryArray ObjectStore::readGeometryArrays(const Txn& txn,
     };
     for (size_t begin = 0; begin < revisions.size(); begin += window) {
         const auto count = std::min(window, revisions.size() - begin);
-        Statement manifests(db, request(count) + "SELECT q.pos,r.content_hash,r.manifest FROM requested q " +
-            (currentOnly ? "LEFT JOIN current_geometry r ON r.object_uuid=q.uuid AND r.object_generation=q.generation ORDER BY q.pos" :
+        Statement manifests(db, request(count) + (currentOnly ? "SELECT q.pos,r.data_checksum,r.geometry_manifest FROM requested q " : "SELECT q.pos,r.content_hash,r.manifest FROM requested q ") +
+            (currentOnly ? "LEFT JOIN objects r ON r.uuid=q.uuid AND r.data_generation=q.generation ORDER BY q.pos" :
              "LEFT JOIN geometry_revisions r ON r.uuid=q.uuid ORDER BY q.pos"));
         bind(manifests, begin, count);
         while (manifests.row()) {
             if (manifests.isNull(1)) throw std::invalid_argument("geometry: revision not found");
-            auto manifest = loadGeometryManifest(db, revisions[begin + size_t(manifests.i64(0))], manifests.text(2), readDigest(manifests,1));
+            auto manifest = loadGeometryManifest(db, revisions[begin + size_t(manifests.i64(0))], manifests.text(2), currentOnly ? manifests.text(1) : readDigest(manifests,1));
             if (manifest.contains("delta") || (manifest.at("arrays").contains(name) && manifest.at("arrays").at(name).contains("source_revision"))) {
                 // Snapshot-only batches keep the SQL fast path below. Mixed
                 // batches use the same verified reader as all other APIs.
@@ -558,35 +572,45 @@ PackedGeometryArray ObjectStore::readGeometryArrays(const Txn& txn,
         if (plan.size() != begin + count) throw std::runtime_error("geometry: incomplete revision selection");
     }
     result.data.resize(totalBytes);
-    for (size_t begin = 0; begin < revisions.size(); begin += window) {
-        const auto count = std::min(window, revisions.size() - begin);
-        // Keep requested revisions outermost: otherwise SQLite can scan the
-        // entire reference table for every window, even with its primary key.
-        Statement chunks(db, request(count) + "SELECT q.pos,r.chunk_index,r.hash,c.data,c.hash FROM requested q "
-            + (currentOnly ? "CROSS JOIN current_geometry_chunks r ON r.object_uuid=q.uuid AND r.array_name=?" :
-               "CROSS JOIN geometry_revision_chunks r ON r.revision_uuid=q.uuid AND r.array_name=?") + std::to_string(count*(currentOnly?2:1)+1) +
-            " LEFT JOIN geometry_chunks c ON c.hash=r.hash");
-        bind(chunks, begin, count); chunks.bind(int(count*(currentOnly?2:1)+1), name);
-        std::vector<int64_t> seen(count, 0);
-        while (chunks.row()) {
-            const auto row = size_t(chunks.i64(0));
-            const auto index = chunks.i64(1);
-            ++seen.at(row); // unique (revision,array,index), independent of SQL row order
-            if (chunks.isNull(4)) throw std::runtime_error("geometry: missing payload chunk");
-            std::vector<uint8_t> external;
-            if(chunks.isNull(3)) external=readExternalGeometryPayload(db,readDigest(chunks,2));
-            const auto bytes = chunks.isNull(3) ? std::span<const uint8_t>(external) :
-                std::span(static_cast<const uint8_t*>(sqlite3_column_blob(chunks.value, 3)),
-                          size_t(sqlite3_column_bytes(chunks.value, 3)));
-            const auto& array = plan.at(begin + row);
-            const auto expectedSize = array.layout.chunkBytes(index);
-            if (geometryWork) geometryWork->readBytes[name] += bytes.size();
-            verifyGeometryChunk(bytes, readDigest(chunks,2), array.hashes.at(index), expectedSize, name);
-            copyGeometryChunk(array.layout, index, bytes, result.data.data() + array.offset);
+    struct ChunkRequest {size_t array;int64_t index;};
+    std::vector<ChunkRequest> requested;
+    const auto flush=[&]{
+        if(requested.empty())return;
+        std::string sql="WITH requested(pos,hash) AS (VALUES ";
+        for(size_t i=0;i<requested.size();++i) {
+            if(i)sql+=',';
+            sql+='('+std::to_string(i)+",?"+std::to_string(i+1)+')';
         }
-        for (size_t i = 0; i < count; ++i)
-            if (seen[i] != plan[begin+i].layout.chunkCount()) throw std::runtime_error("geometry: missing payload chunk");
-    }
+        sql+=") SELECT q.pos,c.data FROM requested q LEFT JOIN geometry_chunks c ON c.hash=q.hash";
+        Statement chunks(db,sql);
+        for(size_t i=0;i<requested.size();++i) {
+            const auto& q=requested[i];
+            chunks.bind(int(i+1),parseDigest(plan[q.array].hashes.at(q.index)));
+        }
+        size_t seen=0;
+        while(chunks.row()) {
+            const auto& q=requested.at(size_t(chunks.i64(0)));
+            const auto& array=plan[q.array];
+            const auto& hash=array.hashes.at(q.index);
+            std::vector<uint8_t> external;
+            if(chunks.isNull(1))external=readExternalGeometryPayload(db,hash);
+            const auto bytes=chunks.isNull(1)?std::span<const uint8_t>(external):
+                std::span(static_cast<const uint8_t*>(sqlite3_column_blob(chunks.value,1)),
+                          size_t(sqlite3_column_bytes(chunks.value,1)));
+            if(geometryWork)geometryWork->readBytes[name]+=bytes.size();
+            verifyGeometryChunk(bytes,hash,hash,array.layout.chunkBytes(q.index),name);
+            copyGeometryChunk(array.layout,q.index,bytes,result.data.data()+array.offset);
+            ++seen;
+        }
+        if(seen!=requested.size())throw std::runtime_error("geometry: incomplete payload selection");
+        requested.clear();
+    };
+    for(size_t i=0;i<plan.size();++i)
+        for(int64_t j=0;j<plan[i].layout.chunkCount();++j) {
+            requested.push_back({i,j});
+            if(requested.size()==window)flush();
+        }
+    flush();
     return result;
 }
 

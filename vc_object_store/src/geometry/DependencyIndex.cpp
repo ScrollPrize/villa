@@ -21,7 +21,7 @@ std::vector<EdgeRecord> structuralEdgeCandidates(sqlite3* db,const std::string& 
         return false;
     };
     std::vector<EdgeRecord> result;
-    Statement edges(db,std::string("SELECT ")+kEdgeCols+" FROM edges WHERE a_id=? OR b_id=? ORDER BY id",*object,*object);
+    Statement edges(db,std::string("SELECT ")+kEdgeCols+" FROM edges WHERE (a_uuid=?1 OR b_uuid=?1) AND deleted=0 ORDER BY id",parseUuid(canonical));
     while(edges.row()){
         auto edge=readEdgeRow(db,edges);
         if((edge.aUuid==canonical&&affected(edge.aAnchor))||(edge.bUuid==canonical&&affected(edge.bAnchor)))

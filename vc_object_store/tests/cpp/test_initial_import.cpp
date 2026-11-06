@@ -51,7 +51,7 @@ void roundTrip(size_t shards,bool packed)
         require(ids[0].key==ObjectKey{part.storeUuid(),uuids[i]},"qualified native identity");
         require(ids[0].id==*row.id,"explicit numeric ID preserved");
         bool sent=false;require(part.importEdges([&](auto& batch){
-            if(sent)return false;sent=true;EdgeRecord e;e.uuid=edges[i];e.kind="perpendicular";e.relationKey="one";
+            if(sent)return false;sent=true;EdgeRecord e;e.uuid=edges[i];e.kind="perpendicular";
             e.aAnchor.wholeGeometry=e.bAnchor.wholeGeometry=true;e.aAnchor.position=std::array<double,3>{1,2,3};
             e.meta=R"({"source":{"measurement":1.25}})";batch.push_back({ids[0].key,reference,e});return true;
         })==1,"native edge count");
@@ -73,7 +73,7 @@ void roundTrip(size_t shards,bool packed)
         require(store.readGeometryArray(r,reference,"line_points").size()==6*sizeof(double),"external geometry readable after publication");
         const auto edge=store.edge(r,{result.storeUuid,edges[i]});
         require(edge && (edge->a==reference || edge->b==reference),"dependency endpoint routed");
-        require(edge->record.relationKey=="one","independent relation identity retained");
+        require(edge->record.uuid==edges[i],"independent relation identity retained");
     }
     // A sealed output cannot be reopened writable, independently of callback lifetime.
     mustFail([&]{auto mutableStore=ObjectCollection::open(result.path,opt.store);auto w=mutableStore.write();mutableStore.seal(w);});
@@ -205,9 +205,10 @@ void phaseFailures()
         fail([&](size_t i,auto& shard){auto row=fiber(ids[i]);shard.appendObjects(std::span(&row,1));},
             [&](size_t i,auto& shard){
                 int batchNumber=0;
+                const auto edgeUuid=util::newUuid();
                 try{shard.importEdges([&](auto& batch){
                     if(batchNumber++==2)return false;
-                    EdgeRecord edge;edge.uuid=util::newUuid();edge.kind="duplicate";
+                    EdgeRecord edge;edge.uuid=edgeUuid;edge.kind="duplicate";
                     edge.aAnchor.wholeGeometry=edge.bAnchor.wholeGeometry=true;
                     batch.push_back({{shard.storeUuid(),ids[i]},{shard.storeUuid(),ids[(i+1)%3]},edge});
                     return true;

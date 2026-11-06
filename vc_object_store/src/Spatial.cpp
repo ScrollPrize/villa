@@ -58,9 +58,9 @@ std::vector<std::string> remoteSurfacesIn(sqlite3* db, const Bounds& bounds, con
                                           const std::optional<std::string>& coordinates)
 {
     std::string sql = "SELECT o.uuid FROM spatial_regions_rtree r CROSS JOIN spatial_regions b ON b.id=r.id "
-        "CROSS JOIN objects o ON o.id=b.object_id LEFT JOIN geometry_heads h ON h.object_uuid=o.uuid "
-        "LEFT JOIN object_lifecycle l ON l.object_id=o.id WHERE o.kind='surface' AND b.array_name='' "
-        "AND h.object_uuid IS NULL AND o.storage_kind!='' AND COALESCE(l.retired,0)=0 AND " + spatialOverlapSql();
+        "CROSS JOIN objects o ON o.id=b.object_id "
+        "LEFT JOIN object_lifecycle l ON l.object_id=o.id WHERE o.deleted=0 AND o.kind='surface' AND b.array_name='' "
+        "AND o.geometry_manifest IS NULL AND o.storage_kind!='' AND COALESCE(l.retired,0)=0 AND " + spatialOverlapSql();
     if (includedIds) sql += " AND o.id IN (SELECT value FROM json_each(?8))";
     if (coordinates) sql += coordinateFilterSql("o", "?7");
     sql += " ORDER BY o.uuid";
@@ -289,7 +289,7 @@ void refreshSurfaceArea(sqlite3* db, int64_t objectId, const std::string& revisi
 
 void refreshGeometryBounds(sqlite3* db, const std::string& objectUuid)
 {
-    Statement head(db, "SELECT o.id,h.revision_uuid FROM objects o JOIN geometry_heads h ON h.object_uuid=o.uuid WHERE o.uuid=?",
+    Statement head(db, "SELECT id,storage_ref FROM objects WHERE uuid=? AND geometry_manifest IS NOT NULL",
         parseUuid(objectUuid));
     if (!head.row()) return;
     const auto revision = readGeometryTokenColumn(head,1);

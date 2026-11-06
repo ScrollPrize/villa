@@ -116,8 +116,8 @@ void directStore(bool spatial)
         require(!store.geometryRevision(t, original), "old geometry is not retained");
         require(store.currentGeometry(t, a)->uuid == replacement, "new current geometry");
         require(!store.edgeGeometryState(t, edgeId).stale, "unaffected relationship rebound to current geometry");
-        require(scalar(store, t, "SELECT count(*) FROM current_geometry") == 2, "one descriptor per object");
-        require(scalar(store, t, "SELECT count(*) FROM geometry_chunks c WHERE NOT EXISTS (SELECT 1 FROM current_geometry_chunks m WHERE m.hash=c.hash) AND NOT EXISTS (SELECT 1 FROM current_shared_payloads p WHERE p.hash=c.hash)") == 0, "no superseded unreferenced payloads retained");
+        require(scalar(store, t, "SELECT count(*) FROM objects WHERE geometry_manifest IS NOT NULL") == 2, "one descriptor directly on each object");
+        require(scalar(store, t, "SELECT count(*) FROM sqlite_schema WHERE name IN ('current_geometry','current_geometry_chunks','current_shared_payloads')") == 0, "no alternate current geometry tables");
     }
     // Another writable handle must observe sealing even if opened beforehand.
     auto second = ObjectStore::open(path, OpenOptions{.author="other"});

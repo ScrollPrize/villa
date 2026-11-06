@@ -35,9 +35,9 @@ EdgeRecord edge(bool points=false) {
 }
 nlohmann::json snapshot(sqlite3* db) {
     nlohmann::json rows=nlohmann::json::array();
-    Statement s(db,"SELECT e.uuid,a.uuid,b.uuid,e.kind,e.generation,e.approval_state,e.meta,e.a_dependencies,e.b_dependencies,"
-        "e.relation_key "
-        "FROM edges e JOIN objects a ON a.id=e.a_id JOIN objects b ON b.id=e.b_id "
+    Statement s(db,"SELECT e.uuid,e.a_uuid,e.b_uuid,e.kind,e.generation,e.approval_state,e.meta,e.a_dependencies,e.b_dependencies,"
+        "e.uuid "
+        "FROM edges e "
         "ORDER BY e.id");
     while(s.row()) {nlohmann::json row=nlohmann::json::array();
         for(int i=0;i<10;++i) {
@@ -51,7 +51,7 @@ void parity(bool geometry,bool defer,size_t sqlRows=1,size_t rowCount=2,int vari
     TemporaryDirectory dir;OpenOptions opts;opts.author="test";opts.history=HistoryMode::Off;
     auto ordinary=ObjectStore::create(dir.path/"ordinary.vcobj",opts),bulk=ObjectStore::create(dir.path/"bulk.vcobj",opts);
     std::vector<EdgeRecord> input;
-    for(size_t i=0;i<rowCount;++i){auto e=edge(geometry);e.relationKey=std::to_string(i);
+    for(size_t i=0;i<rowCount;++i){auto e=edge(geometry);
         e.kind=i%2?"parallel":"perpendicular";
         e.meta=i%5?nlohmann::json({{"row",i},{"text","different-"+std::to_string(i)}}).dump():"";
         e.tags={"tag-"+std::to_string(i),"","tag-"+std::to_string(i)};
@@ -65,7 +65,7 @@ void parity(bool geometry,bool defer,size_t sqlRows=1,size_t rowCount=2,int vari
         auto txn=store->write();auto* db=ObjectStoreImplAccess::conn(txn);objects(*store,txn,geometry);
         if(store==&ordinary) for(const auto& e:input) store->addEdge(txn,e);
         else {
-            exec(db,"CREATE INDEX custom_edge_index ON edges(relation_key)");
+            exec(db,"CREATE INDEX custom_edge_index ON edges(generation)");
             if(variables)sqlite3_limit(db,SQLITE_LIMIT_VARIABLE_NUMBER,variables);
             Savepoint whole(db);InitialEdgeInserter initial(*store,txn,defer,1,sqlRows);
             const auto first=rowCount>2?size_t(65):size_t(1);
@@ -110,7 +110,6 @@ void failures(size_t sqlRows=1) {
         require(scalar(db,"SELECT count(*) FROM sqlite_schema WHERE name='edges_a'")==1,"deferred indexes rolled back");tx.commit();
     };
     auto good=edge(true),bad=good;run({good,bad});
-    bad.uuid=util::newUuid();run({good,bad}); // native relation identity duplicate
     bad=edge(true);bad.uuid=a;run({good,bad});
     bad=edge(true);bad.aUuid=util::newUuid();run({good,bad});
     bad=edge(true);bad.meta="[]";run({good,bad});
@@ -119,7 +118,7 @@ void failures(size_t sqlRows=1) {
     bad=edge(true);bad.aAnchor.points={{"line_points",{999}}};run({good,bad});
     bad=edge(true);bad.aUuid=bad.bUuid;bad.aAnchor.points=bad.bAnchor.points;run({good,bad});
     std::vector<EdgeRecord> across;
-    for(int i=0;i<513;++i){auto e=edge(true);e.relationKey=std::to_string(i);across.push_back(std::move(e));}
+    for(int i=0;i<513;++i){auto e=edge(true);across.push_back(std::move(e));}
     across.back()=across.front();run(across); // failure beyond two full UUID-check chunks
     across.back()=edge(true);across.back().uuid=a;run(across); // collision in a partial check chunk
     {auto tx=store.write();Savepoint whole(ObjectStoreImplAccess::conn(tx));InitialEdgeInserter initial(store,tx);
@@ -138,7 +137,7 @@ void invalidateAndExhaust() {
     // invalidate the initial writer's immutable endpoint cache.
     auto obj=*store.objectByUuid(tx,a);obj.meta=R"({"a":9,"null":null})";store.upsertObject(tx,obj);
     store.retainRelationship(tx,first.uuid);initial.invalidateEndpoint(a);
-    auto second=edge();second.relationKey="second";initial.append(std::span(&second,1));initial.finish();whole.release();
+    auto second=edge();initial.append(std::span(&second,1));initial.finish();whole.release();
     require(scalar(db,"SELECT count(*) FROM edges WHERE id=9223372036854775807")==1,"maximum ID allocated without overflow");
     require(scalar(db,"SELECT next_id IS NULL FROM key_allocators WHERE name='edges'")==1,"range exhausted");tx.commit();
 }
@@ -202,30 +201,29 @@ void resolvedMutableRows()
         auto txn=db.write();auto* sql=ObjectStoreImplAccess::conn(txn);
         // Deliberately reverse numeric ID order relative to lexical UUID order.
         for(const auto& id:{b,a}){ObjectRecord object;object.uuid=id;object.kind="note";db.upsertObject(txn,object);}
-        const auto ai=*objectIdByUuid(sql,parseUuid(a)),bi=*objectIdByUuid(sql,parseUuid(b));
-        std::vector<EdgeRecord> records;std::vector<std::pair<int64_t,int64_t>> endpoints;
-        for(int i=0;i<67;++i){auto record=edge();record.relationKey="resolved-"+std::to_string(i);
-            if(i%2){swapEndpoints(record);endpoints.emplace_back(ai,bi);}else endpoints.emplace_back(bi,ai);
+        std::vector<EdgeRecord> records;
+        for(int i=0;i<67;++i){auto record=edge();
+            if(i%2)swapEndpoints(record);
             if(i%3==0){for(char& ch:record.aUuid)ch=char(std::toupper(static_cast<unsigned char>(ch)));
                 for(char& ch:record.bUuid)ch=char(std::toupper(static_cast<unsigned char>(ch)));}
             record.kind=i%2?"parallel":"perpendicular";
             record.meta=nlohmann::json({{"index",i},{"payload",std::string(size_t(i+1),'x')}}).dump();
             originals.push_back(record);records.push_back(std::move(record));}
         Savepoint save(sql);InitialEdgeInserter writer(db,txn,true,2,32);
-        writer.appendResolved(std::span(records).first(33),std::span(endpoints).first(33));
-        writer.appendResolved(std::span(records).subspan(33),std::span(endpoints).subspan(33));
+        writer.appendResolved(std::span(records).first(33));
+        writer.appendResolved(std::span(records).subspan(33));
         writer.finish();save.release();
         // The insert must own bytes already; destroy/replace all borrowed input fields.
-        for(auto& record:records){record.kind.assign(2000,'k');record.meta.assign(2000,'m');record.relationKey.clear();}
+        for(auto& record:records){record.kind.assign(2000,'k');record.meta.assign(2000,'m');}
         records.clear();txn.commit();
     }
     auto read=db.read();
     for(auto expected:originals){const auto actual=db.edgeByUuid(read,expected.uuid);require(bool(actual),"resolved edge missing");
         expected.aUuid=util::canonicalUuid(expected.aUuid);expected.bUuid=util::canonicalUuid(expected.bUuid);
-        if(expected.aUuid!=b)swapEndpoints(expected);
-        require(actual->aUuid==b&&actual->bUuid==a&&actual->aAnchor==expected.aAnchor&&actual->bAnchor==expected.bAnchor&&
-                actual->kind==expected.kind&&actual->meta==expected.meta&&actual->relationKey==expected.relationKey&&actual->tags==std::vector<std::string>{"tag"},
-                "mutable resolved batch lost numeric endpoint orientation or borrowed content");
+        if(expected.aUuid!=a)swapEndpoints(expected);
+        require(actual->aUuid==a&&actual->bUuid==b&&actual->aAnchor==expected.aAnchor&&actual->bAnchor==expected.bAnchor&&
+                actual->kind==expected.kind&&actual->meta==expected.meta&&actual->tags==std::vector<std::string>{"tag"},
+                "mutable resolved batch lost UUID endpoint orientation or borrowed content");
         require(actual->createdBy=="resolved"&&actual->changedBy=="resolved"&&actual->createdAt==actual->changedAt,
                 "resolved shared provenance mismatch");}
 }
@@ -253,7 +251,7 @@ void immutableNamespaceCollisions() {
             try {part.importEdges([&](auto& batch){
                 if(sent){exhausted=true;return false;}sent=true;
                 EdgeRecord record;record.kind="perpendicular";
-                record.uuid=foreign?util::nameUuid(part.storeUuid(),"reference:"+external.storeUuid+":"+external.objectUuid):a;
+                record.uuid=a;
                 batch.push_back({{part.storeUuid(),a},foreign?external:ObjectKey{part.storeUuid(),b},record});
                 return true;
             });}catch(const std::exception& error){

@@ -29,7 +29,7 @@ int main()
     std::vector<InitialCollectionEdge> inputs;
     for(int i=0;i<7;++i){
         EdgeRecord edge;edge.uuid=util::nameUuid("initial-edge-"+std::to_string(i));edge.kind="perpendicular";
-        edge.relationKey="observation-"+std::to_string(i);edge.meta=Json({{"measurement",i}}).dump();
+        edge.meta=Json({{"measurement",i}}).dump();
         edge.aAnchor.wholeGeometry=edge.bAnchor.wholeGeometry=true;
         edge.aAnchor.metadataKeys={"label"};edge.bAnchor.metadataKeys={"label","missing"};
         edge.aAnchor.position=std::array<double,3>{double(i),2,3};edge.bAnchor.position=std::array<double,3>{4,5,double(i)};
@@ -56,7 +56,7 @@ int main()
             const auto result=store.edge(r,{store.uuid(r),e.record.uuid});
             require(result && result->a==e.a && result->b==e.b && result->record.aAnchor==e.record.aAnchor &&
                 result->record.bAnchor==e.record.bAnchor && result->record.tags==e.record.tags &&
-                result->record.relationKey==e.record.relationKey && Json::parse(result->record.meta)==Json::parse(e.record.meta),
+                Json::parse(result->record.meta)==Json::parse(e.record.meta),
                 "bulk native edge equals scalar, including canonical endpoints and dependencies");
         }
         require(store.edgesOf(r,a).size()==7,"adjacency indexes available after finish");
@@ -78,27 +78,21 @@ int main()
         w.commit();verify(store);
     }
     {
-        // The direct comparison CHECK has the same SQL affinity/NULL domain
-        // as IN, without constructing a temporary B-tree for every proxy row.
+        // A real edit creates one ordinary same-key record; merely inserting
+        // relations above did not create endpoint or alias rows.
         {
             auto collection=ObjectCollection::open(dir.path/"bulk-deferred.vcobj",options);
             auto edit=collection.write();collection.setMeta(edit,d,"unrelated","true");edit.commit();
         }
         auto rawOptions=options;rawOptions.physicalPartitionOnly=true;
         auto store=ObjectStore::open(dir.path/"bulk-deferred.vcobj",rawOptions);
-        auto w=store.write();auto* db=ObjectStoreImplAccess::conn(w);
-        {detail::Statement count(db,"SELECT count(*) FROM collection_refs WHERE state='override'");
-         require(count.row()&&count.i64(0)==1,"CHECK parity fixture needs one actual override row");}
-        detail::exec(db,"CREATE TEMP TABLE old_state(value TEXT NOT NULL CHECK(value IN ('reference','override','deleted')))");
-        for(const auto* value:{"'reference'","'override'","'deleted'","NULL","0","''","'Reference'","'reference '","X'7265666572656e6365'","'reference'||char(0)"}){
-            detail::Savepoint rollback(db);
-            auto accepts=[&](const std::string& sql){
-                const int code=sqlite3_exec(db,sql.c_str(),nullptr,nullptr,nullptr);
-                require(code==SQLITE_OK||(code&255)==SQLITE_CONSTRAINT,"unexpected CHECK failure");return code==SQLITE_OK;
-            };
-            require(accepts(std::string("INSERT INTO old_state VALUES(")+value+")")==
-                accepts(std::string("UPDATE collection_refs SET state=")+value),"reference CHECK domain parity");
-        }
+        auto read=store.read();auto* db=ObjectStoreImplAccess::conn(read);
+        detail::Statement record(db,"SELECT uuid,deleted FROM objects");
+        require(record.row()&&detail::formatUuid(record.blob16(0))==d.objectUuid&&
+            record.i64(1)==0&&!record.row(),"actual override must retain its original UUID");
+        detail::Statement redundant(db,"SELECT count(*) FROM sqlite_schema WHERE name IN "
+            "('external_object_keys','endpoint_keys','collection_refs','collection_edge_tombstones')");
+        require(redundant.row()&&redundant.i64(0)==0,"batch import must not create endpoint registration structures");
     }
     {
         auto store=ObjectCollection::create(dir.path/"late-endpoint.vcobj",{basePath},options);
@@ -123,11 +117,11 @@ int main()
         auto raw=ObjectStore::open(dir.path/"late-endpoint.vcobj",OpenOptions{.physicalPartitionOnly=true,.readOnly=true});
         auto rt=raw.read();
         const auto actual=store.edge(r,{store.uuid(r),indexed.record.uuid});
-        require(actual&&((actual->a==a&&actual->b==b)||(actual->a==b&&actual->b==a)),"initial indexed edge retains qualified endpoint keys");
+        require(actual&&((actual->a==a&&actual->b==b)||(actual->a==b&&actual->b==a)),"initial indexed edge retains direct endpoint keys");
         require(store.currentGeometry(r,a).has_value(),"indexed geometry resolves through the collection");
         detail::Statement counts(ObjectStoreImplAccess::conn(rt),"SELECT (SELECT count(*) FROM objects),"
-            "(SELECT count(*) FROM fibers),(SELECT count(*) FROM current_geometry),(SELECT count(*) FROM geometry_chunks),"
-            "(SELECT count(*) FROM collection_refs)");
+            "(SELECT count(*) FROM fibers),(SELECT count(*) FROM objects WHERE geometry_manifest IS NOT NULL),(SELECT count(*) FROM geometry_chunks),"
+            "(SELECT count(*) FROM sqlite_schema WHERE name IN ('external_object_keys','endpoint_keys','collection_refs','collection_edge_tombstones'))");
         require(counts.row()&&counts.i64(0)==0&&counts.i64(1)==0&&counts.i64(2)==0&&counts.i64(3)==0&&counts.i64(4)==0,
             "indexed initial references must not materialize endpoint records or geometry");
     }

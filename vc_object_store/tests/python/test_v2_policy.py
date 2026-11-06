@@ -18,7 +18,9 @@ def test_history_off_spatial_off_and_atomic_seal(tmp_path):
                                         spatial_index=False, sealed=False)
         identity = db.database_identity()
         assert identity["schema_version"] == 18
-        assert any(table["name"] == "current_geometry" for table in identity["tables"])
+        tables = {table["name"] for table in identity["tables"]}
+        assert {"objects", "geometry_chunks"} <= tables
+        assert not {"geometry_heads", "current_geometry", "current_geometry_chunks", "current_shared_payloads"} & tables
         a = db.upsert_object(dict(kind="fiber"))
         geometry = db.put_geometry(a, Fiber([], [[1, 2, 3], [4, 5, 6]]))
         data = raw(db, geometry, "line_points")

@@ -59,6 +59,17 @@ int main()try{
     {
         auto r=overlay.read();require(overlay.object(r,a).has_value()&&overlay.edgesOf(r,a).size()==1,"child changes do not change sealed parent");
     }
+    {
+        auto raw=ObjectStore::open(dir.path/"child.vcobj",OpenOptions{.physicalPartitionOnly=true,.readOnly=true});
+        auto r=raw.read();auto* sql=ObjectStoreImplAccess::conn(r);
+        Statement object(sql,"SELECT deleted FROM objects WHERE uuid=?",parseUuid(a.objectUuid));
+        require(object.row()&&object.i64(0)==1,"inherited object deletion must use its original UUID row");
+        Statement relation(sql,"SELECT deleted FROM edges WHERE uuid=?",parseUuid(edge.objectUuid));
+        require(relation.row()&&relation.i64(0)==1,"inherited edge deletion must use its original UUID row");
+        Statement redundant(sql,"SELECT count(*) FROM sqlite_schema WHERE name IN "
+            "('collection_refs','collection_edge_tombstones','external_object_keys','endpoint_keys')");
+        require(redundant.row()&&redundant.i64(0)==0,"overlay must not add alias or tombstone tables");
+    }
     for(const auto history:{HistoryMode::Off,HistoryMode::On}){
         auto opt=options;opt.history=history;auto file=dir.path/(history==HistoryMode::Off?"geometry-off.vcobj":"geometry-on.vcobj");
         auto c=ObjectCollection::create(file,{basePath},opt);
@@ -68,7 +79,7 @@ int main()try{
         auto expected=geometry;std::memcpy(expected.data(),&value,8);
         {auto r=c.read();require(c.readGeometryArray(r,a,"line_points")==expected,"linked sparse geometry edit exact");}
         {auto raw=ObjectStore::open(file,OpenOptions{.physicalPartitionOnly=true,.readOnly=true});auto r=raw.read();
-            Statement bytes(ObjectStoreImplAccess::conn(r),"SELECT count(*) FROM geometry_chunks WHERE data IS NULL");bytes.row();require(bytes.i64(0)>0,"unchanged parent chunks stay external");
+            Statement bytes(ObjectStoreImplAccess::conn(r),"SELECT count(*) FROM geometry_chunks WHERE data IS NULL");bytes.row();require(bytes.i64(0)==0,"linked chunks create no placeholder rows");
             mustFail([&]{auto records=raw.objectsByKind(r,"fiber");auto rev=raw.currentGeometry(r,records[0].uuid);raw.readGeometryArray(r,rev->uuid,"line_points");});}
         {auto w=c.write();c.seal(w);w.commit();}
         auto deeper=ObjectCollection::create(dir.path/(history==HistoryMode::Off?"deeper-off.vcobj":"deeper-on.vcobj"),{file},opt);
@@ -110,7 +121,7 @@ int main()try{
                 const auto object=db.insertObjectWithId(w,fiber(),id);ids.emplace(id,ObjectKey{owner,object});endpoints.push_back(object);}
             require(endpoints.size()>=2,"custom edge route fixture needs two endpoints");
             for(int64_t id=1;id<=12;++id)if(rule.matches(id)){
-                EdgeRecord edge;edge.kind="routed";edge.relationKey=std::to_string(id);edge.aUuid=endpoints[0];edge.bUuid=endpoints[1];
+                EdgeRecord edge;edge.kind="routed";edge.aUuid=endpoints[0];edge.bUuid=endpoints[1];
                 edgeIds.emplace(id,ObjectKey{owner,db.insertEdgeWithId(w,edge,id)});
                 mustFail([&]{db.insertEdgeWithId(w,edge,id);});}
             rules.push_back(rule);rule.keySpace="edges";rules.push_back(rule);db.seal(w);w.commit();}

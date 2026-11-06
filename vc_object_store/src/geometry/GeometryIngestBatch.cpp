@@ -49,7 +49,8 @@ int64_t detail::ingestGeometryBatch(ObjectStore& db, WriteTxn& write, std::vecto
         if(!incoming.insert(p.object.uuid).second)
             throw std::runtime_error("duplicate object UUID in import: "+p.object.uuid);
         const auto existing=db.objectByUuid(write,p.object.uuid);
-        detail::Statement history(connection,"SELECT 1 FROM geometry_revisions WHERE object_uuid=? LIMIT 1",
+        detail::Statement history(connection,detail::historyEnabled(connection)?"SELECT 1 FROM geometry_revisions WHERE object_uuid=? LIMIT 1":
+            "SELECT 1 FROM objects WHERE uuid=? AND geometry_manifest IS NOT NULL",
             detail::parseUuid(p.object.uuid));
         bool previouslyImported = false;
         if (detail::historyEnabled(connection)) {

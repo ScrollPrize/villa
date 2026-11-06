@@ -6,8 +6,10 @@ using namespace detail;
 namespace {
 std::pair<const char*, int64_t> recordLocation(sqlite3* db, const std::array<unsigned char, 16>& bytes, const std::string& uuid)
 {
-    if (auto id = objectIdByUuid(db, bytes)) return {"objects", *id};
-    if (auto id = edgeIdByUuid(db, bytes)) return {"edges", *id};
+    Statement object(db,"SELECT id FROM objects WHERE uuid=? AND deleted=0",bytes);
+    if(object.row())return {"objects",object.i64(0)};
+    Statement edge(db,"SELECT id FROM edges WHERE uuid=? AND deleted=0",bytes);
+    if(edge.row())return {"edges",edge.i64(0)};
     throw std::runtime_error("object store: record not found: " + uuid);
 }
 }
@@ -64,6 +66,7 @@ void mutateMeta(sqlite3* db, const std::string& author, const std::string& host,
             return;
         }
     }
+    if(std::string_view(table)=="objects")beforeCurrentObjectEdit(db,recordUuid);
     if (jsonValue) {
         execute(db, std::string("UPDATE ") + table + " SET meta=json_set(meta,?,json(?)) WHERE id=?", path, *jsonValue,
             id);

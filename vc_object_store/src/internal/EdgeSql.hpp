@@ -16,7 +16,6 @@ Anchor readAnchor(const Statement& s, int firstCol);
 
 void bindAnchor(Statement& s, int firstIdx, const Anchor& a);
 
-std::string uuidTextByObjectId(sqlite3* db, int64_t id);
 
 EdgeRecord readEdgeRow(sqlite3* db, const Statement& s, bool details = true,
                        const ObjectFields& fields = std::nullopt);
@@ -25,14 +24,15 @@ EdgeRecord prepareNewEdge(const EdgeRecord&);
 std::array<unsigned char,16> normalizeNewEdge(EdgeRecord&,bool* swapped=nullptr);
 struct EdgeInsertRow {
     const EdgeRecord* record;
-    int64_t id,aId,bId;
+    int64_t id;
+    std::array<unsigned char,16> aUuid,bUuid;
     std::optional<std::array<unsigned char,16>> binaryUuid;
 };
 void requireUnusedObjectUuids(sqlite3*,std::span<const EdgeInsertRow>,size_t sqlBatchRows=1);
 void insertEdgeRows(sqlite3*, std::span<const EdgeInsertRow>,int64_t generation,
     const std::string& author,const std::string& host,const std::string& time,
     bool preserveRecord=false,size_t sqlBatchRows=1);
-void insertEdgeRow(sqlite3*, const EdgeRecord&, int64_t id, int64_t aId, int64_t bId,
+void insertEdgeRow(sqlite3*, const EdgeRecord&, int64_t id,
     int64_t generation, const std::string& author, const std::string& host,
     const std::string& time, bool preserveRecord = false);
 std::vector<int64_t> componentIds(sqlite3* db, const std::string& start,

@@ -62,11 +62,12 @@ void appendJournal(sqlite3* db, const std::string& author, const std::string& ho
 {
     if (!historyEnabled(db)) return;
     generation = writeGeneration(db);
-    Statement state(db, "SELECT kind,approval_state,approved_by,approved_at,approved_host,approved_generation FROM objects WHERE uuid=? "
-        "UNION ALL SELECT kind,approval_state,approved_by,approved_at,approved_host,approved_generation FROM edges WHERE uuid=?",
+    Statement state(db, "SELECT kind,approval_state,approved_by,approved_at,approved_host,approved_generation FROM objects WHERE uuid=? AND deleted=0 "
+        "UNION ALL SELECT kind,approval_state,approved_by,approved_at,approved_host,approved_generation FROM edges WHERE uuid=? AND deleted=0",
         uuid, uuid);
     const bool hasState = state.row();
-    // Deleted records no longer have a row; their caller read the kind first.
+    // Deleted entries have no current approval state. Their caller supplies
+    // the record kind even though the UUID row remains as a tombstone.
     const std::string kind = hasState ? state.text(0) : deletedKind;
     if (kind.empty()) throw std::logic_error("object store: journal entry without record kind");
     Statement s(db, "INSERT INTO journal(record_uuid,record_kind,generation,author,hostname,timestamp,change_kind,"
@@ -366,13 +367,8 @@ std::string upsertObjectImpl(sqlite3* db, const std::string& author, const std::
     const auto bounds = detail::recordBounds(rec);
     Statement collision(db, "SELECT 1 FROM edges WHERE uuid=?", uuid);
     if (collision.row()) throw std::runtime_error("object store: UUID already belongs to an edge");
-    if(!objectIdByUuid(db,uuid)){
-        Statement external(db,"SELECT 1 FROM external_object_keys WHERE uuid=?",uuid);
-        if(external.row()&&activeStatementPools.at(db)->promotedEndpointUuid!=rec.uuid)
-            throw std::runtime_error("object store: UUID belongs to an external endpoint; use qualified replacement");
-    }
     const std::string now = nowIsoUtc();
-    Statement managed(db, "SELECT o.data_generation,o.data_checksum,o.storage_ref FROM objects o JOIN geometry_heads h ON h.object_uuid=o.uuid WHERE o.uuid=?",
+    Statement managed(db, "SELECT data_generation,data_checksum,storage_ref FROM objects WHERE uuid=? AND geometry_manifest IS NOT NULL",
         uuid);
     const bool hasGeometry = managed.row();
     if (hasGeometry) {
@@ -392,7 +388,8 @@ std::string upsertObjectImpl(sqlite3* db, const std::string& author, const std::
         (void)cur.row();
         if (cur.text(0) != rec.kind)
             throw std::runtime_error("object store: object kind cannot change (" + cur.text(0) + " -> " + rec.kind + ")");
-        execute(db, "UPDATE objects SET name=?,generation=?,changed_by=?,changed_at=?,changed_host=?,"
+        beforeCurrentObjectEdit(db,rec.uuid);
+        execute(db, "UPDATE objects SET deleted=0,name=?,generation=?,changed_by=?,changed_at=?,changed_host=?,"
                         "approval_state='pending',approved_by=NULL,approved_at=NULL,approved_host=NULL,approved_generation=NULL,"
                         "format_version=?,storage_kind=?,storage_ref=?,data_generation=?,data_checksum=?,meta=? WHERE id=?",
             rec.name, generation, author, now, host, rec.formatVersion, rec.storageKind, rec.storageRef,
@@ -444,11 +441,7 @@ std::string jsonPathForKey(const std::string& key)
 
 std::optional<std::string> geometryHead(sqlite3* db, const std::string& objectUuid)
 {
-    if(!historyEnabled(db)){
-        Statement current(db,"SELECT object_generation FROM current_geometry WHERE object_uuid=?",parseUuid(objectUuid));
-        return current.row()?std::optional(currentGeometryToken(objectUuid,current.i64(0))):std::nullopt;
-    }
-    Statement s(db, "SELECT revision_uuid FROM geometry_heads WHERE object_uuid=?", parseUuid(objectUuid));
-    return s.row() ? std::optional(formatUuid(s.blob16(0))) : std::nullopt;
+    Statement s(db,"SELECT storage_ref FROM objects WHERE uuid=? AND deleted=0 AND geometry_manifest IS NOT NULL",parseUuid(objectUuid));
+    return s.row()?std::optional(s.text(0)):std::nullopt;
 }
 } // namespace vc::objects::detail

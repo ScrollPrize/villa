@@ -51,7 +51,7 @@ These are proposed logical records; exact SQL names and layouts remain open. Use
 | Key-space reservations | Key-space UUID, reserved integer ranges and owner; distinct from populated ranges |
 | Routing rules | Logical table, routing key, range boundaries, partition rule and destination table UUIDs |
 | Linked stores | Target store UUID, expected generation, locator hints and dependency/overlay role; target must be sealed |
-| Overlay declarations | Inherited records/properties overridden or deleted, and explicit precedence |
+| Overlay precedence | Explicit linked-store ordering; same-key replacement/deletion lives on ordinary records, not a per-object registry |
 | Accelerator directory | Index kind, coverage, backing table/database, source store UUID and generation, and availability |
 | Container directory | Database UUID to logical size and physical extents, or contiguous offset/length |
 
@@ -61,10 +61,10 @@ The container also needs a small bootstrap header identifying its version and th
 
 Distinguish logical ownership from storage location:
 
-- Store UUID: logical ownership.
+- Store UUID: logical publication/provenance and numeric-ID namespace, not part of object identity.
 - Database UUID: an independent SQLite database.
 - Table UUID: a particular table instance.
-- Object/edge UUID: persistent entity identity.
+- Object/edge UUID: the complete persistent entity key across all stores. A repeated UUID is one logical entity and is resolved by overlay precedence.
 - Store UUID plus generation: the logical state referenced by a dependency.
 
 Repacking a file must not change its logical identities. A path is a locator, not an identity; resolved dependencies must match their declared identity and state. A collection is represented by a store manifest and its links, rather than requiring a separate identity for every dependency-list file.
@@ -116,7 +116,7 @@ A higher generation orders dependent states; it does not imply that an unrelated
 
 Independent import workers build unpublished shards under one reserved logical store generation. Finalization publishes the complete store manifest at that generation only after all shards are ready. There is no reader-visible partial store and no need for a transaction spanning the shard databases. Subsequent edits use the writable overlay's generation counter.
 
-Relations must address sibling-shard objects directly by qualified identity, without copying object records or geometry and without joining or opening another worker's SQLite transaction. The coordinated bulk API completes the object phase across workers, shares an immutable compact endpoint directory, then imports relations into independently written shards. This barrier is not a requirement to publish/seal each sibling first. Relations to pre-existing external stores use sealed dependencies. A local endpoint-key mapping is permitted for compact SQL edge handles; it stores identity only, not a duplicate object. Readers resolve the owning shard/store, and actual edits create overrides only when requested.
+Relations must address sibling-shard objects directly by logical key, without copying object records or geometry and without joining or opening another worker's SQLite transaction. The coordinated bulk API completes the object phase across workers, shares an immutable compact endpoint directory, then imports relations into independently written shards. This barrier is not a requirement to publish/seal each sibling first. Relations to pre-existing external stores use sealed dependencies. Do not allocate alias UUIDs, negative local endpoint handles or per-endpoint registration rows. Sharding and linking change routing metadata only; the stored relation representation must be identical for local and remote endpoints. Readers resolve the owning shard/store, and actual edits create same-key overrides only when requested.
 
 Payload hashes and native digest references use binary SHA-256 keys (32-byte BLOBs), computed by the shared C++ implementation and bound directly, not SQL conversion functions. Public textual hashes remain an API representation. Object kinds retain their typed records and use the existing composite kind/UUID index; do not add a redundant kind-only index.
 
@@ -124,7 +124,7 @@ Payload hashes and native digest references use binary SHA-256 keys (32-byte BLO
 
 Reserve ranges before parallel import and give workers predetermined IDs. Related tables such as `objects` and `fibers` share the same object key space. Current `objects.id` is shared across kinds: do not allocate overlapping fiber/surface IDs unless references also include a namespace. Initially retain one object key space and a separate edge key space.
 
-Independent stores cannot guarantee globally non-overlapping integer ranges merely by inspecting their existing links. References therefore need namespace qualification; reservations provide fast routing within that namespace. Cross-store edges cannot rely on the current local integer foreign keys alone.
+Independent stores cannot guarantee globally non-overlapping integer ranges merely by inspecting their existing links. Numeric-ID lookup therefore retains a store namespace as a routing hint, but relations store the complete object UUID directly. Reservations route physical rows; they do not change endpoint identity or require local endpoint aliases. Cross-store edges must not depend on local integer foreign keys.
 
 Support these explicit routing rules:
 
@@ -148,10 +148,10 @@ For edits in the local overlay:
 - Resolve unchanged data from the parent.
 - Store changed metadata locally.
 - Reference new geometry chunks while retaining unchanged parent chunk references.
-- Represent deletions with explicit tombstones.
+- Set the ordinary same-key object's or edge's deleted flag to shadow all lower-precedence occurrences. Do not create separate reference or tombstone tables.
 - Allocate new objects from newly reserved IDs.
 
-An override retains the inherited object's identity; it is not a new object. The exact choice between property patches and replacement metadata records remains open. Either choice must have explicit precedence and deletion semantics.
+An override is an ordinary replacement record with the same UUID, not a new object or a store-qualified alias. Reads check local UUID first: replacement wins, deleted stops fallback, absent continues into ordered links. An identical UUID in two linked stores is not two distinct objects. References to chunks keep their existing hashes; sharding and linking add only routing/provisioning metadata.
 
 Initially all mutable work lives in one ordinary SQLite database. Linked stores and published shards are read-only. No cross-shard write transaction is needed.
 
@@ -170,7 +170,7 @@ A slim immutable import has history off and can omit spatial indexes, journals a
 
 Spatial queries without a spatial accelerator initially throw an explicit error. Later, an accelerator can be built in a separate file linked to the immutable source's UUID and generation.
 
-History records changes in the writable overlay against its immutable baseline, without copying the parent's entire history or geometry. References distinguish the object's owning store from the store holding a newer version.
+History records changes in the writable overlay against its immutable baseline, without copying the parent's entire history or geometry. Version provenance distinguishes the publishing store/generation from the object's UUID; the latter remains the complete key across all versions and linked stores.
 
 History mode rules:
 
@@ -185,7 +185,7 @@ Direct edits still use ordinary SQLite transactions even with history off. Enabl
 
 ### One authoritative current state
 
-Ordinary typed object/detail records and edges are the current state. Current geometry is attached directly to the object through its array descriptors and ordered chunk references. Do not duplicate current records into serialized history caches or manufacture an initial revision merely to read an object.
+Ordinary typed object/detail records and edges are the current state. Current geometry is attached directly to the object through its array descriptors and ordered chunk references, using the same fields and payload table with history on or off. Do not add alternate current-only descriptor/mapping tables, per-linked-chunk registrations, NULL chunk placeholders or a second relation identity. An overlay replacement retains its logical key; a deleted record at that key shadows the parent. Only absent keys fall through to dependencies. Do not duplicate current records into serialized history caches or manufacture an initial revision merely to read an object.
 
 An unchanged object needs no historical representation rows, even in a store with history enabled. History-only tables may be created lazily when first needed; their absence has explicit schema/capability semantics, not an inferred error-recovery path. All readers use one common current-state interface.
 
@@ -222,7 +222,7 @@ Use a proposed `state_representations` table for history, generalized across obj
 | Field group | Purpose |
 | --- | --- |
 | Representation ID | Identifies the physical representation, independently of logical version identity |
-| Entity kind/key and component | Selects object metadata, geometry, edge state, etc.; namespace-qualified when external |
+| Entity kind/key and component | Selects object metadata, geometry, edge state, etc.; object/edge UUID is the complete logical key |
 | Source and target generations | Exact endpoints of a delta; a full checkpoint has only its represented generation |
 | Encoding and codec version | Full checkpoint, reversible delta, or explicitly directed delta |
 | Source/target verification information | Detects applying a delta to the wrong contents |
@@ -321,8 +321,7 @@ Measure current and intermediate-version reads as well as writes: query counts, 
 ## Decisions still open
 
 - Exact SQL schemas and required feature identifiers; schema-17 conversion follows the separate validated replacement policy above.
-- Namespace-qualified key encoding and allocation across independent branches.
-- Overlay patch versus replacement-record representation.
+- Numeric-ID reservation/routing across independent branches; logical entity keys are UUID-only and are not namespace-qualified.
 - Integrity verification beyond the store UUID and generation change token.
 - Initial mandatory lookup indexes versus optional accelerators.
 - History checkpoint thresholds, reversible codecs, payload packing and the measured benefit of implicit initial per-record generations.

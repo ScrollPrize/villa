@@ -1,4 +1,5 @@
 #include "internal/RecordSql.hpp"
+#include "geometry/GeometryDelta.hpp"
 
 namespace vc::objects {
 using namespace detail;
@@ -18,7 +19,7 @@ std::string ObjectStore::insertObjectWithId(WriteTxn& txn, const ObjectRecord& r
 std::optional<ObjectRecord> ObjectStore::objectByUuid(const Txn& txn, const std::string& uuid) const
 {
     sqlite3* db = static_cast<sqlite3*>(connection(txn));
-    Statement s(db, std::string("SELECT ") + kObjectCols + " FROM objects WHERE uuid=?", parseUuid(uuid));
+    Statement s(db, std::string("SELECT ") + kObjectCols + " FROM objects WHERE uuid=? AND deleted=0", parseUuid(uuid));
     if (!s.row()) return std::nullopt;
     return readObjectRow(db, s);
 }
@@ -27,7 +28,7 @@ std::vector<ObjectRecord> ObjectStore::objectsByKind(const Txn& txn, const std::
                                                  const std::optional<std::string>& approvalState, bool includeRetired) const
 {
     sqlite3* db = static_cast<sqlite3*>(connection(txn));
-    std::string sql = std::string("SELECT ") + kObjectCols + " FROM objects WHERE kind=?";
+    std::string sql = std::string("SELECT ") + kObjectCols + " FROM objects WHERE kind=? AND deleted=0";
     if (!includeRetired) sql += " AND " + activeObjectSql("objects.id");
     if (approvalState) sql += " AND approval_state=?";
     sql += " ORDER BY id";
@@ -39,7 +40,7 @@ std::vector<ObjectRecord> ObjectStore::objectsByKind(const Txn& txn, const std::
 int64_t ObjectStore::objectCount(const Txn& txn, const std::string& kind, bool includeRetired) const
 {
     auto* db = static_cast<sqlite3*>(connection(txn));
-    Statement s(db, "SELECT count(*) FROM objects WHERE kind=?" +
+    Statement s(db, "SELECT count(*) FROM objects WHERE kind=? AND deleted=0" +
         (includeRetired ? std::string() : " AND " + activeObjectSql("objects.id")), kind);
     (void)s.row();
     return s.i64(0);
@@ -52,7 +53,7 @@ std::vector<ObjectRecord> ObjectStore::objectsByTag(const Txn& txn, const std::s
     Statement s(db, "SELECT o.id,o.uuid,o.kind,o.name,o.generation,o.created_by,o.created_at,o.created_host,o.changed_by,o.changed_at,"
                     "o.changed_host,o.approval_state,o.approved_by,o.approved_at,o.approved_host,o.approved_generation,o.format_version,"
                     "o.storage_kind,o.storage_ref,o.data_generation,o.data_checksum,o.meta FROM objects o "
-                    "JOIN object_tags t INDEXED BY object_tags_tag ON t.object_id=o.id WHERE t.tag=?" +
+                    "JOIN object_tags t INDEXED BY object_tags_tag ON t.object_id=o.id WHERE t.tag=? AND o.deleted=0" +
                     (includeRetired ? std::string() : " AND " + activeObjectSql("o.id")) + " ORDER BY o.id", tag);
     return readObjectRows(db, s);
 }
@@ -73,14 +74,21 @@ void ObjectStore::deleteObject(WriteTxn& txn, const std::string& uuid)
     sqlite3* db = static_cast<sqlite3*>(connection(txn));
     Savepoint savepoint(db);
     const auto bytes = parseUuid(uuid);
-    Statement row(db, "SELECT id,kind FROM objects WHERE uuid=?", bytes);
+    Statement row(db, "SELECT id,kind FROM objects WHERE uuid=? AND deleted=0", bytes);
     if (!row.row()) throw std::runtime_error("object store: object not found: " + uuid);
     const auto kind = row.text(1);
-    // Edge endpoints may also be qualified external handles, so the edges
-    // table cannot use an objects-only FK. Preserve RESTRICT at the native API.
-    Statement incident(db, "SELECT 1 FROM edges WHERE a_id=? OR b_id=? LIMIT 1", row.i64(0), row.i64(0));
+    // UUID endpoints may live in linked stores; RESTRICT is checked by the API.
+    Statement incident(db, "SELECT 1 FROM edges WHERE deleted=0 AND (a_uuid=?1 OR b_uuid=?1) LIMIT 1", bytes);
     if (incident.row()) throw std::runtime_error("object store: remove incident relationships before deletion");
-    execute(db, "DELETE FROM objects WHERE id=?", row.i64(0));
+    beforeCurrentObjectEdit(db,uuid);
+    // Keep only the same-key deletion marker, not live subtype identities or
+    // tags. In particular a deleted track must release its source identity.
+    for(const auto* table:{"fibers","surfaces","tracks","object_tags","object_lifecycle"})
+        execute(db,std::string("DELETE FROM ")+table+" WHERE object_id=?",row.i64(0));
+    clearGeometryMaterialization(db,uuid);
+    execute(db,"UPDATE objects SET deleted=1,geometry_manifest=NULL,storage_kind='',storage_ref='',data_generation=0,data_checksum=NULL,"
+        "generation=?,changed_by=?,changed_host=?,changed_at=? WHERE id=?",
+        writeGeneration(db),impl_->options.author,impl_->hostname,nowIsoUtc(),row.i64(0));
     appendJournal(db, impl_->options.author, impl_->hostname, bytes, 0, "delete", kind);
     savepoint.release();
 }

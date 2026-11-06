@@ -59,7 +59,6 @@ std::string edgeIdentity(const EdgeRecord& input)
     canonicalizeEdge(edge);
     auto identity = nlohmann::json::array({edge.kind, edge.aUuid, edge.bUuid,
         dependenciesToJson(edge.aAnchor), dependenciesToJson(edge.bAnchor)});
-    if (!input.relationKey.empty()) identity.push_back(input.relationKey);
     return identity.dump();
 }
 

@@ -19,9 +19,9 @@ public:
     InitialEdgeInserter(const InitialEdgeInserter&) = delete;
     InitialEdgeInserter& operator=(const InitialEdgeInserter&) = delete;
     void append(std::span<const EdgeRecord>);
-    // Endpoint ids/dependencies already resolved and checked by the collection
+    // Endpoint keys/dependencies already checked by the collection
     // preparation boundary. This performs only native row preparation/writes.
-    void appendResolved(std::span<EdgeRecord>,std::span<const std::pair<int64_t,int64_t>>);
+    void appendResolved(std::span<EdgeRecord>);
     void finish();
     void invalidateEndpoint(const std::string&);
 private:

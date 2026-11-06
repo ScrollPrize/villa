@@ -257,7 +257,7 @@ def test_reads_detect_corruption_after_success(db, damage):
     sql = {
         'payload': 'DROP TRIGGER geometry_chunks_immutable_update; UPDATE geometry_chunks SET data=zeroblob(length(data));',
         'manifest': "DROP TRIGGER geometry_revisions_immutable_update; UPDATE geometry_revisions SET manifest='{}';",
-        'missing_chunk': 'DROP TRIGGER geometry_revision_chunks_immutable_delete; DELETE FROM geometry_revision_chunks;',
+        'missing_chunk': 'DROP TRIGGER geometry_chunks_immutable_delete; DELETE FROM geometry_chunks;',
     }[damage]
     # Separate SQLite builds must not share POSIX WAL locks in this process.
     subprocess.run([sys.executable, '-c', 'import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); c.executescript(sys.argv[2]); c.close()', db.path, sql], check=True)

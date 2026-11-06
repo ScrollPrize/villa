@@ -112,10 +112,6 @@ struct Anchor {
 struct EdgeRecord : RecordCommon {
     std::string aUuid, bUuid;  // endpoint order is normalised by addEdge
     Anchor aAnchor, bAnchor;
-    // Independent observations of the same endpoints/dependencies may have
-    // distinct stable keys. Empty preserves the original unique-relation rule.
-    // Part of relationship identity, immutable after creation.
-    std::string relationKey;
 };
 
 // Object UUID -> immutable object revision UUID. null means expect no object.
@@ -616,7 +612,7 @@ public:
 
 
     // Edges. addEdge normalises endpoint order (swapping anchors to
-    // match) and enforces (kind, endpoints, dependencies, relationKey) uniqueness.
+    // match) and enforces uniqueness of the edge's own UUID.
     std::string addEdge(WriteTxn& txn, const EdgeRecord& record);
     // Import-only explicit edge ID within the reserved edge key range. Uses
     // the same current-endpoint validation and history as addEdge.

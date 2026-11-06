@@ -107,7 +107,7 @@ Db backupTo(sqlite3* source, const std::filesystem::path& path)
 }
 
 const std::set<std::string> legacyCurrentTables{
-    "edge_geometry_bindings","edge_lifecycle_bindings","geometry_edge_dependencies"};
+    "geometry_heads","edge_geometry_bindings","edge_lifecycle_bindings","geometry_edge_dependencies"};
 
 const std::map<std::string,std::string> legacyDigestColumns{
     {"geometry_chunks","hash"},{"geometry_revisions","content_hash"},
@@ -127,6 +127,10 @@ void convertLegacyDigests(sqlite3* db)
         while(columns.row())names.push_back(columns.text(0));
         Statement native(layout.get(),"SELECT name FROM pragma_table_xinfo(?) ORDER BY cid",table);
         while(native.row())expected.push_back(native.text(0));
+        if(table=="edges"){
+            std::erase(expected,"deleted");
+            for(auto& name:expected){if(name=="a_uuid")name="a_id";if(name=="b_uuid")name="b_id";}
+        }
         if(names!=expected)throw std::runtime_error("conversion: custom geometry columns require an explicit migration: "+table);
         // An extension key containing textual hashes also needs conversion;
         // do not silently leave it dangling or invent its data semantics.
@@ -138,26 +142,46 @@ void convertLegacyDigests(sqlite3* db)
                 throw std::runtime_error("conversion: extension digest foreign key requires an explicit migration: "+tables.text(0));
         }
         std::vector<std::string> indexes;
-        Statement index(db,"SELECT sql FROM sqlite_schema WHERE type='index' AND tbl_name=? AND sql IS NOT NULL ORDER BY rowid",table);
-        while(index.row())indexes.push_back(index.text(0));
+        Statement index(db,"SELECT name,sql FROM sqlite_schema WHERE type='index' AND tbl_name=? AND sql IS NOT NULL ORDER BY rowid",table);
+        while(index.row()){
+            auto sql=index.text(1);
+            if(table=="edges"&&(sql.find("a_id")!=std::string::npos||sql.find("b_id")!=std::string::npos)){
+                if(index.text(0)!="edges_a"&&index.text(0)!="edges_b")
+                    throw std::runtime_error("conversion: extension index on legacy endpoint IDs requires explicit migration: "+index.text(0));
+                auto actual=sql;
+                while(!actual.empty()&&(std::isspace(static_cast<unsigned char>(actual.back()))||actual.back()==';'))actual.pop_back();
+                const auto expected="CREATE INDEX "+index.text(0)+" ON edges("+(index.text(0)=="edges_a"?std::string("a_id"):std::string("b_id"))+", kind)";
+                if(actual!=expected)throw std::runtime_error("conversion: altered native endpoint index requires explicit migration: "+index.text(0));
+                Statement replacement(layout.get(),"SELECT sql FROM sqlite_schema WHERE name=?",index.text(0));
+                if(!replacement.row())throw std::runtime_error("conversion: missing native endpoint index");
+                sql=replacement.text(0);
+            }
+            indexes.push_back(std::move(sql));
+        }
         Statement schema(layout.get(),"SELECT sql FROM sqlite_schema WHERE type='table' AND name=?",table);schema.row();
         const auto definition=schema.text(0);const auto opening=definition.find('(');
         if(opening==std::string::npos)throw std::runtime_error("conversion: invalid native table schema");
         const auto temporary="_v2_digest_"+table;
         exec(db,("CREATE TABLE "+quoteSqlIdentifier(temporary)+definition.substr(opening)).c_str());
-        std::string projection="rowid",parameters="?";int digestIndex=-1;
+        std::string projection="rowid",targetColumns="rowid",parameters="?";int digestIndex=-1;
         for(size_t i=0;i<names.size();++i) {
             projection+=","+quoteSqlIdentifier(names[i]);parameters+=",?";
+            const auto mapped=table=="edges"&&names[i]=="a_id"?"a_uuid":table=="edges"&&names[i]=="b_id"?"b_uuid":names[i];
+            targetColumns+=","+quoteSqlIdentifier(mapped);
             if(names[i]==digest)digestIndex=int(i)+1;
         }
         Statement source(db,"SELECT "+projection+" FROM "+quoteSqlIdentifier(table)+" ORDER BY rowid");
-        Statement target(db,"INSERT INTO "+quoteSqlIdentifier(temporary)+"("+projection+") VALUES("+parameters+")");
+        Statement target(db,"INSERT INTO "+quoteSqlIdentifier(temporary)+"("+targetColumns+") VALUES("+parameters+")");
         while(source.row()) {
             for(int c=0;c<sqlite3_column_count(source.value);++c) {
                 if(c==digestIndex) {
                     if(sqlite3_column_type(source.value,c)!=SQLITE_TEXT)
                         throw std::runtime_error("conversion: legacy digest is not TEXT: "+table);
                     bindDigest(target,c+1,source.text(c));
+                } else if(table=="edges"&&c>0&&(names.at(c-1)=="a_id"||names.at(c-1)=="b_id")){
+                    Statement endpoint(db,"SELECT uuid FROM objects WHERE id=?",source.i64(c));
+                    if(!endpoint.row())throw std::runtime_error("conversion: dangling legacy endpoint");
+                    target.bind(c+1,endpoint.blob16(0));
                 } else check(sqlite3_bind_value(target.value,c+1,sqlite3_column_value(source.value,c)),db,"copy legacy geometry value");
             }
             target.stepDone();target.reset();
@@ -170,6 +194,13 @@ void convertLegacyDigests(sqlite3* db)
 
 void validateLegacyCurrentRelationships(sqlite3* db)
 {
+    const auto currentMetadata=[&](const std::string& uuid,const Anchor& anchor){
+        Statement row(db,"SELECT o.meta,coalesce(l.retired,0),coalesce(l.epoch,'') FROM objects o "
+            "LEFT JOIN object_lifecycle l ON l.object_id=o.id WHERE o.uuid=?",parseUuid(uuid));
+        if(!row.row())throw std::runtime_error("conversion: legacy endpoint missing");
+        const auto meta=nlohmann::json::parse(row.text(0));
+        return dependencyFields(&meta,row.i64(1)!=0,row.text(2),anchor);
+    };
     // A historical pin cannot be silently reinterpreted as a current relation.
     // Keep the source intact and require explicit repair/revalidation in the
     // legacy application when any current observation is no longer current.
@@ -191,8 +222,8 @@ void validateLegacyCurrentRelationships(sqlite3* db)
         bool found=false;
         while(relations.row()) {
             found=true;const auto edge=edgeFromJson(nlohmann::json::parse(relations.text(0)));
-            if(historicalDependencyMetadata(db,relations.text(1),edge.aAnchor)!=currentDependencyMetadata(db,edge.aUuid,edge.aAnchor) ||
-               historicalDependencyMetadata(db,relations.text(2),edge.bAnchor)!=currentDependencyMetadata(db,edge.bUuid,edge.bAnchor))
+            if(historicalDependencyMetadata(db,relations.text(1),edge.aAnchor)!=currentMetadata(edge.aUuid,edge.aAnchor) ||
+               historicalDependencyMetadata(db,relations.text(2),edge.bAnchor)!=currentMetadata(edge.bUuid,edge.bAnchor))
                 throw std::runtime_error("conversion: legacy current relationship has stale endpoint metadata; revalidate or remove it before conversion");
         }
         if(!found)throw std::runtime_error("conversion: legacy metadata-dependent relationship has no published dependency snapshot");
@@ -202,7 +233,11 @@ void validateLegacyCurrentRelationships(sqlite3* db)
 std::vector<SchemaProgram> retainedLegacyPrograms(sqlite3* db)
 {
     const auto nativeTriggers=legacyCurrentTriggers();
+    const auto endpointTriggers=legacyEndpointHistoryTriggers();
+    Db nativeLayout(openConnection(":memory:",SQLITE_OPEN_READWRITE|SQLITE_OPEN_CREATE,{},false),sqlite3_close_v2);
+    createProvisioning(nativeLayout.get(),true,false);createSchema(nativeLayout.get(),true);createHistorySchema(nativeLayout.get());
     const std::map<std::string,std::vector<std::string>> expected{
+        {"geometry_heads",{"object_uuid","revision_uuid"}},
         {"edge_geometry_bindings",{"edge_id","a_revision","b_revision"}},
         {"edge_lifecycle_bindings",{"edge_id","a_epoch","b_epoch"}},
         {"geometry_edge_dependencies",{"edge_id","object_id","array_name","point_id"}}};
@@ -217,6 +252,16 @@ std::vector<SchemaProgram> retainedLegacyPrograms(sqlite3* db)
     }
     std::vector<SchemaProgram> result;
     for(const auto& program:schemaPrograms(db)) {
+        if(const auto native=endpointTriggers.find(program.name);native!=endpointTriggers.end()) {
+            auto sql=program.sql;
+            while(!sql.empty()&&(std::isspace(static_cast<unsigned char>(sql.back()))||sql.back()==';'))sql.pop_back();
+            if(program.type!="trigger"||sql!=native->second)
+                throw std::runtime_error("conversion: altered native endpoint history trigger requires an explicit migration: "+program.name);
+            Statement replacement(nativeLayout.get(),"SELECT sql FROM sqlite_schema WHERE type='trigger' AND name=?",program.name);
+            if(!replacement.row())throw std::runtime_error("conversion: missing native endpoint history trigger: "+program.name);
+            result.push_back({program.type,program.name,program.owner,replacement.text(0)});
+            continue;
+        }
         if(const auto native=nativeTriggers.find(program.name);native!=nativeTriggers.end()) {
             // SQLite omits the final statement terminator in sqlite_schema.
             // Do not normalize the body: a same-name replacement is an
@@ -233,6 +278,10 @@ std::vector<SchemaProgram> retainedLegacyPrograms(sqlite3* db)
         std::transform(lower.begin(),lower.end(),lower.begin(),[](unsigned char c){return char(std::tolower(c));});
         for(const auto& table:legacyCurrentTables)if(lower.find(table)!=std::string::npos)
             throw std::runtime_error("conversion: extension references removed current-state bookkeeping: "+program.name);
+        // An extension using endpoint row IDs needs a deliberate semantic
+        // migration. Reject conservatively rather than guessing SQL aliases.
+        if(lower.find("a_id")!=std::string::npos||lower.find("b_id")!=std::string::npos)
+            throw std::runtime_error("conversion: extension references legacy endpoint IDs: "+program.name);
         result.push_back(program);
     }
     Statement tables(db,"SELECT name FROM sqlite_schema WHERE type='table'");
@@ -259,7 +308,7 @@ ConversionReport convertV1ToV2(const std::filesystem::path& input)
     auto target=backupTo(source.get(),staged.path);
     exec(target.get(), "PRAGMA synchronous=FULL; PRAGMA foreign_keys=OFF; BEGIN IMMEDIATE;");
     createProvisioning(target.get(), true, true);
-    exec(target.get(),"INSERT INTO store_required_features VALUES('current-state-v1'),('binary-sha256-v1'),('endpoint-keys-v1');");
+    exec(target.get(),"INSERT INTO store_required_features VALUES('direct-geometry-v1'),('binary-sha256-v1'),('direct-endpoint-keys-v1');");
     for (const auto* name : {"objects","edges"}) {
         Statement ids(target.get(),"SELECT coalesce(max(id),0) FROM "+quoteSqlIdentifier(name)); ids.row();
         Statement owner(target.get(),"SELECT uuid FROM store_identity"); owner.row();
@@ -269,9 +318,10 @@ ConversionReport convertV1ToV2(const std::filesystem::path& input)
     // Legacy publications have no store-global generation. Zero explicitly
     // means pre-v2, not a fabricated ordering between independent old counters.
     exec(target.get(), "ALTER TABLE object_revisions ADD COLUMN generation INTEGER NOT NULL DEFAULT 0;"
-                       "ALTER TABLE relationship_revisions ADD COLUMN generation INTEGER NOT NULL DEFAULT 0;");
-    exec(target.get(), "ALTER TABLE edges ADD COLUMN relation_key TEXT NOT NULL DEFAULT '';");
-    createEdgeIdentityIndex(target.get());
+                       "ALTER TABLE relationship_revisions ADD COLUMN generation INTEGER NOT NULL DEFAULT 0;"
+                       "ALTER TABLE objects ADD COLUMN geometry_manifest TEXT;"
+                       "ALTER TABLE objects ADD COLUMN deleted INTEGER NOT NULL DEFAULT 0 CHECK(deleted IN (0,1));");
+    exec(target.get(),"DROP INDEX IF EXISTS edges_unique;");
     {
         const auto programs=schemaPrograms(target.get());
         const auto retained=retainedLegacyPrograms(target.get());
@@ -280,13 +330,19 @@ ConversionReport convertV1ToV2(const std::filesystem::path& input)
         // references and triggers owned by other tables. No SQL-text guessing.
         suspendPrograms(target.get(),programs,true);
         convertLegacyDigests(target.get());
-        createEndpointSchema(target.get());
-        for(const auto& table:legacyCurrentTables)exec(target.get(),("DROP TABLE IF EXISTS "+quoteSqlIdentifier(table)).c_str());
-        // Unlike history removal, this migration removes no columns or tables
-        // referenced by the unchanged programs. Keep even INSTEAD OF triggers
+        // Recognized native endpoint history programs are replaced above;
+        // unaffected extensions retain their exact SQL. Keep INSTEAD OF triggers
         // on views, whose unsupported *other* write operations need not compile.
+        Statement heads(target.get(),"SELECT object_uuid,revision_uuid FROM geometry_heads");
+        while(heads.row()) {
+            const auto token=formatUuid(heads.blob16(1));
+            GeometryReader reader(target.get(),token,false);
+            execute(target.get(),"UPDATE objects SET storage_ref=?,geometry_manifest=? WHERE uuid=?",
+                token,reader.manifest().dump(),heads.blob16(0));
+        }
+        heads.reset();
+        for(const auto& table:legacyCurrentTables)exec(target.get(),("DROP TABLE IF EXISTS "+quoteSqlIdentifier(table)).c_str());
         restorePrograms(target.get(),retained,true,false);
-        createGeometryChunkGuards(target.get());
     }
     Statement high(target.get(), "SELECT max(g) FROM (SELECT coalesce(max(generation),0) g FROM objects UNION ALL "
         "SELECT coalesce(max(generation),0) FROM edges UNION ALL SELECT coalesce(max(object_generation),0) FROM geometry_revisions)");
@@ -326,12 +382,34 @@ ConversionReport convertV1ToV2(const std::filesystem::path& input)
         // Both ordered reads use the table's primary B-tree. Do not EXCEPT
         // entire BLOB tables into a temporary sorter during large conversions.
         Statement original(source.get(), "SELECT " + projection + " FROM main." + quoteSqlIdentifier(name) + " ORDER BY " + order);
-        Statement converted(source.get(), "SELECT " + projection + " FROM converted." + quoteSqlIdentifier(name) + " ORDER BY " + order);
+        std::string convertedProjection=projection;
+        if(name=="edges"){
+            convertedProjection.clear();
+            for(const auto& column:columnNames){
+                if(!convertedProjection.empty())convertedProjection+=",";
+                if(column=="a_id"||column=="b_id")convertedProjection+="(SELECT id FROM main.objects WHERE uuid="+
+                    std::string(column=="a_id"?"a_uuid":"b_uuid")+")";
+                else convertedProjection+=quoteSqlIdentifier(column);
+            }
+        }
+        Statement converted(source.get(), "SELECT " + convertedProjection + " FROM converted." + quoteSqlIdentifier(name) + " ORDER BY " + order);
         while (true) {
             const bool a = original.row(), b = converted.row();
             if (a != b) throw std::runtime_error("conversion: row count differs: " + name);
             if (!a) break;
             for (int c = 0; c < sqlite3_column_count(original.value); ++c) {
+                if(name=="objects"&&columnNames.at(c)=="storage_ref") {
+                    // Managed geometry now points directly from the current
+                    // record. Check the derived value, not the old empty slot.
+                    const auto uuidColumn=std::find(columnNames.begin(),columnNames.end(),"uuid");
+                    if(uuidColumn==columnNames.end())throw std::runtime_error("conversion: object UUID column missing");
+                    Statement head(source.get(),"SELECT revision_uuid FROM geometry_heads WHERE object_uuid=?",
+                        original.blob16(int(uuidColumn-columnNames.begin())));
+                    if(head.row()) {
+                        if(converted.text(c)!=formatUuid(head.blob16(0)))throw std::runtime_error("conversion: current geometry pointer differs");
+                        continue;
+                    }
+                }
                 if(const auto digest=legacyDigestColumns.find(name);digest!=legacyDigestColumns.end() && columnNames.at(c)==digest->second) {
                     if(sqlite3_column_type(original.value,c)!=SQLITE_TEXT ||
                        formatDigest(parseDigest(original.text(c)))!=readDigest(converted,c))
@@ -369,8 +447,10 @@ void changeHistoryMode(const std::filesystem::path& input, HistoryMode mode)
     using namespace detail;
     const auto path=std::filesystem::absolute(input);
     auto source=exclusive(path,18);
-    {Statement feature(source.get(),"SELECT 1 FROM store_required_features WHERE name='current-state-v1'");
-        if(!feature.row())throw std::runtime_error("history policy: legacy current-state layout requires separate conversion");}
+    for(const auto* name:{"direct-geometry-v1","binary-sha256-v1","direct-endpoint-keys-v1"}) {
+        Statement feature(source.get(),"SELECT 1 FROM store_required_features WHERE name=?",std::string(name));
+        if(!feature.row())throw std::runtime_error("history policy: legacy current-state layout requires separate conversion");
+    }
     const bool enabled=mode==HistoryMode::On;
     Statement policy(source.get(),"SELECT history_enabled,sealed,spatial_enabled,generation FROM store_manifest"); policy.row();
     if (policy.i64(1)) throw std::runtime_error("history policy: sealed stores require a new export");
@@ -409,14 +489,14 @@ void changeHistoryMode(const std::filesystem::path& input, HistoryMode mode)
     // Disable extension triggers while rewriting physical representation. They
     // are reinstated and checked before publication, not run as user edits.
     suspendPrograms(db,extensions,false);
-    exec(db,"CREATE TABLE _v2_geometry AS SELECT * FROM geometry_revisions WHERE 0;"
+    exec(db,"CREATE TABLE _v2_geometry(uuid,object_uuid,parent_uuid,content_hash,manifest,object_generation,created_by,created_at,created_host);"
             "CREATE TABLE _v2_chunks(object_uuid BLOB,revision_uuid BLOB,array_name TEXT,chunk_index INTEGER,hash BLOB);"
             "CREATE TABLE _v2_revision_ids(old_uuid BLOB PRIMARY KEY,new_uuid BLOB NOT NULL UNIQUE);"
             "CREATE TABLE _v2_bounds AS SELECT 0 object_id,NULL revision_uuid,0.0 min_x,0.0 min_y,0.0 min_z,0.0 max_x,0.0 max_y,0.0 max_z WHERE 0;");
     if (policy.i64(2)) exec(db,"INSERT INTO _v2_bounds SELECT * FROM object_bounds;");
     {
-        Statement heads(db,"SELECT r.uuid,r.object_uuid,r.object_generation,r.created_by,r.created_at,r.created_host "
-                           "FROM geometry_revisions r JOIN geometry_heads h ON h.revision_uuid=r.uuid");
+        Statement heads(db,"SELECT storage_ref,uuid,data_generation,changed_by,changed_at,changed_host "
+                           "FROM objects WHERE geometry_manifest IS NOT NULL");
         while (heads.row()) {
             const auto uuid=readGeometryTokenColumn(heads,0); GeometryReader reader(db,uuid,false);
             const auto object=formatUuid(heads.blob16(1));
@@ -449,8 +529,7 @@ void changeHistoryMode(const std::filesystem::path& input, HistoryMode mode)
         "object_relationship_deltas","object_relationship_heads","history_dirty_objects","history_dirty_edges",
         "history_expected","history_checked","history_required","history_validated_edges","geometry_revisions",
         "geometry_heads","geometry_revision_chunks","geometry_deltas","geometry_materializations","geometry_current_chunks",
-        "current_geometry","current_geometry_chunks","current_shared_payloads","current_edge_metadata",
-        "current_changed_objects","current_unused_chunks","object_bounds"};
+"object_bounds"};
     std::vector<std::pair<std::string,std::string>> dropped;
     {
         Statement schema(db,"SELECT type,name,sql FROM sqlite_schema WHERE type IN ('trigger','view','table') AND sql IS NOT NULL");
@@ -479,16 +558,14 @@ void changeHistoryMode(const std::filesystem::path& input, HistoryMode mode)
     if(!enabled)beginCurrentWrite(db);
     if (enabled) {
         exec(db,"INSERT INTO geometry_revisions SELECT * FROM _v2_geometry;"
-                "INSERT INTO geometry_heads SELECT object_uuid,uuid FROM _v2_geometry;"
                 "INSERT INTO geometry_revision_chunks SELECT revision_uuid,array_name,chunk_index,hash FROM _v2_chunks;"
                 "INSERT INTO history_dirty_objects SELECT uuid FROM objects WHERE 1 ON CONFLICT DO NOTHING;"
                 "INSERT INTO history_dirty_edges SELECT uuid FROM edges WHERE 1 ON CONFLICT DO NOTHING;");
-    } else {
-        exec(db,"INSERT INTO current_geometry SELECT object_uuid,content_hash,manifest,object_generation,created_by,created_at,created_host FROM _v2_geometry;"
-                "INSERT INTO current_geometry_chunks SELECT object_uuid,array_name,chunk_index,hash FROM _v2_chunks;");
-        Statement rows(db,"SELECT object_uuid,manifest FROM current_geometry");
-        while(rows.row()) indexCurrentMetadata(db,formatUuid(rows.blob16(0)),nlohmann::json::parse(rows.text(1)));
-        exec(db,"INSERT INTO temp.current_unused_chunks SELECT hash FROM geometry_chunks WHERE 1 ON CONFLICT DO NOTHING;");
+    }
+    {
+        Statement rows(db,"SELECT object_uuid,uuid,content_hash,manifest,object_generation FROM _v2_geometry");
+        while(rows.row())execute(db,"UPDATE objects SET storage_ref=?,data_checksum=?,geometry_manifest=?,data_generation=? WHERE uuid=?",
+            readGeometryTokenColumn(rows,1),readDigest(rows,2),rows.text(3),rows.i64(4),rows.blob16(0));
     }
     {Statement sourceIndex(db,"SELECT 1 FROM sqlite_schema WHERE type='table' AND name='source_collections'");
         if(sourceIndex.row())exec(db,"UPDATE source_collections SET revision_uuid=coalesce("
@@ -497,7 +574,7 @@ void changeHistoryMode(const std::filesystem::path& input, HistoryMode mode)
                             "WHERE revision_uuid IN (SELECT old_uuid FROM _v2_revision_ids);"
                             "DELETE FROM spatial_regions WHERE array_name=''; INSERT INTO object_bounds SELECT * FROM _v2_bounds;");
     {
-        Statement geometries(db,"SELECT h.object_uuid,r.content_hash FROM geometry_revisions r JOIN geometry_heads h ON h.revision_uuid=r.uuid");
+        Statement geometries(db,"SELECT object_uuid,content_hash FROM _v2_geometry");
         while(geometries.row())execute(db,"UPDATE objects SET data_checksum=?,generation=?,data_generation=?,"
             "approved_generation=CASE WHEN approved_generation IS NOT NULL THEN ? ELSE NULL END WHERE uuid=?",
             readDigest(geometries,1),writeGeneration(db),writeGeneration(db),writeGeneration(db),geometries.blob16(0));

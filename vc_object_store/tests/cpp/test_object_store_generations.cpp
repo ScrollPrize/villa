@@ -112,6 +112,19 @@ void nativeChanges(HistoryMode history)
         auto txn = store.write(); store.removeEdge(txn, edge); store.deleteObject(txn, b); txn.commit();
     }
     require(generation(store) == 4, "deletion advances generation");
+    {
+        auto txn=store.read();auto* sql=ObjectStoreImplAccess::conn(txn);
+        require(!store.objectByUuid(txn,b)&&!store.edgeByUuid(txn,edge),
+                "deleted objects and relations are absent from current UUID lookups");
+        require(store.objectCount(txn,"fiber",true)==1&&store.edgesOf(txn,a,true).empty(),
+                "include-retired queries do not expose deleted records");
+        detail::Statement object(sql,"SELECT deleted,generation FROM objects WHERE uuid=?",detail::parseUuid(b));
+        require(object.row()&&object.i64(0)==1&&object.i64(1)==4,"object deletion is an ordinary stamped tombstone");
+        detail::Statement relation(sql,"SELECT deleted,generation,a_uuid,b_uuid FROM edges WHERE uuid=?",detail::parseUuid(edge));
+        require(relation.row()&&relation.i64(0)==1&&relation.i64(1)==4,"edge deletion is an ordinary stamped tombstone");
+        const auto first=detail::formatUuid(relation.blob16(2)),second=detail::formatUuid(relation.blob16(3));
+        require((first==a&&second==b)||(first==b&&second==a),"tombstones retain original endpoint UUIDs");
+    }
     if (history == HistoryMode::On) {
         auto txn = store.read();
         const auto events = store.journalSince(txn, cursor);
@@ -120,6 +133,99 @@ void nativeChanges(HistoryMode history)
         const auto versions = store.objectHistory(txn, b);
         require(versions.back().deleted && versions.back().generation == 4, "deleted history version global generation");
     }
+    {
+        auto txn=store.write();
+        for(const auto& uuid:{b,edge}){
+            mustFail([&]{store.setMeta(txn,uuid,"value","9");});
+            mustFail([&]{store.removeMeta(txn,uuid,"absent");});
+            mustFail([&]{store.setApproval(txn,uuid,"approved");});
+        }
+        mustFail([&]{store.putGeometry(txn,b,vc::geometry::encode(vc::geometry::Fiber{{},{{0,0,0},{1,0,0}},{}}));});
+        txn.commit();
+    }
+    require(generation(store)==4,"rejected tombstone edits do not publish a generation");
+    {
+        auto txn=store.write();store.upsertObject(txn,fiber(b));txn.commit();
+    }
+    {
+        auto txn=store.read();
+        require(store.objectByUuid(txn,b).has_value()&&store.objectCount(txn,"fiber",true)==2,
+                "explicit object upsert revives a tombstone at the same UUID");
+        require(!store.edgeByUuid(txn,edge),"object revival does not revive deleted relationships");
+    }
+}
+
+void deletedTrackIdentity(HistoryMode history)
+{
+    TemporaryDirectory dir;
+    OpenOptions options;options.author="deleted-track";options.history=history;
+    auto store=ObjectStore::create(dir.path/"tracks.vcobj",options);
+    ObjectRecord original;original.uuid=util::newUuid();original.kind="track";
+    original.track.emplace();original.track->datasetRef="source";original.track->externalKey="track-1";
+    {auto txn=store.write();store.upsertObject(txn,original);txn.commit();}
+    {auto txn=store.write();store.deleteObject(txn,original.uuid);txn.commit();}
+    auto replacement=original;replacement.uuid=util::newUuid();
+    {auto txn=store.write();store.upsertObject(txn,replacement);txn.commit();}
+    auto txn=store.read();
+    require(!store.objectByUuid(txn,original.uuid)&&store.objectByUuid(txn,replacement.uuid).has_value(),
+            "deleting a track releases its current source identity without deleting its UUID tombstone");
+    require(store.objectCount(txn,"track",true)==1,"only the replacement track is current");
+    if(history==HistoryMode::On){
+        const auto versions=store.objectHistory(txn,original.uuid);
+        require(versions.size()>=2&&versions.front().record.track&&
+                versions.front().record.track->externalKey=="track-1"&&versions.back().deleted,
+                "track deletion preserves historical source identity");
+    }
+}
+
+void deletedGeometryRevival(HistoryMode history)
+{
+    TemporaryDirectory dir;
+    OpenOptions options;options.author="deleted-geometry";options.history=history;
+    auto store=ObjectStore::create(dir.path/"geometry.vcobj",options);
+    const auto uuid=util::newUuid();std::string geometry;
+    {auto txn=store.write();store.upsertObject(txn,fiber(uuid));
+        geometry=store.putGeometry(txn,uuid,vc::geometry::encode(vc::geometry::Fiber{{},{{0,0,0},{1,0,0}},{}}));txn.commit();}
+    RevisionSelection selected;
+    if(history==HistoryMode::On){auto txn=store.read();selected[uuid]=store.currentObjectRevision(txn,uuid)->uuid;}
+    {auto txn=history==HistoryMode::On?store.write(selected):store.write();store.retireObject(txn,uuid);txn.commit();}
+    {auto txn=store.write();store.deleteObject(txn,uuid);txn.commit();}
+    {auto txn=store.write();store.upsertObject(txn,fiber(uuid));txn.commit();}
+    auto txn=store.read();const auto revived=store.objectByUuid(txn,uuid);
+    require(revived&&!revived->retired&&revived->lifecycleEpoch.empty(),
+            "explicit revival starts active rather than retaining a deleted lifecycle");
+    require(!store.currentGeometry(txn,uuid),"explicit revival does not resurrect deleted current geometry");
+    if(history==HistoryMode::On)
+        require(store.readGeometryArray(txn,geometry,"line_points").size()==48,
+                "deletion and revival retain archived historical geometry");
+}
+
+void deletedEdgeRevival(HistoryMode history)
+{
+    TemporaryDirectory dir;OpenOptions options;options.author="edge-revival";options.history=history;
+    auto store=ObjectStore::create(dir.path/"edges.vcobj",options);
+    const auto a=util::newUuid(),b=util::newUuid();
+    EdgeRecord edge;edge.uuid=util::newUuid();edge.kind="perpendicular";edge.aUuid=a;edge.bUuid=b;
+    edge.tags={"old"};edge.meta=R"({"version":1})";
+    {auto txn=store.write();store.upsertObject(txn,fiber(a));store.upsertObject(txn,fiber(b));
+        store.addEdge(txn,edge);txn.commit();}
+    std::string original;
+    if(history==HistoryMode::On){auto txn=store.read();original=store.currentObjectRevision(txn,a)->uuid;}
+    {auto txn=store.write();store.removeEdge(txn,edge.uuid);txn.commit();}
+    {auto txn=store.read();require(!store.edgeByUuid(txn,edge.uuid),"removed edge remains absent until explicit add");}
+    edge.tags={"new"};edge.meta=R"({"version":2})";
+    {auto txn=store.write();require(store.addEdge(txn,edge)==edge.uuid,"explicit recreation keeps edge UUID");txn.commit();}
+    {auto txn=store.read();const auto current=store.edgeByUuid(txn,edge.uuid);
+        require(current&&current->tags==edge.tags&&current->meta==edge.meta&&current->generation==4,
+                "explicit recreation replaces the deletion marker and old current tags");
+        require(store.edgesOf(txn,a).size()==1&&store.edgesOf(txn,b).size()==1,"recreated edge is visible at both UUID endpoints");
+        if(history==HistoryMode::On){
+            const auto historical=store.recordedRelationships(txn,original);
+            require(historical.size()==1&&historical.front().record.meta==R"({"version":1})",
+                    "recreation retains original historical relationship");
+        }}
+    {auto txn=store.write();mustFail([&]{store.addEdge(txn,edge);});txn.commit();}
+    require(generation(store)==4,"explicit insertion still rejects a duplicate live edge UUID");
 }
 
 void metadataImport(HistoryMode history)
@@ -285,6 +391,12 @@ int main()
 {
     nativeChanges(HistoryMode::On);
     nativeChanges(HistoryMode::Off);
+    deletedTrackIdentity(HistoryMode::On);
+    deletedTrackIdentity(HistoryMode::Off);
+    deletedGeometryRevival(HistoryMode::On);
+    deletedGeometryRevival(HistoryMode::Off);
+    deletedEdgeRevival(HistoryMode::On);
+    deletedEdgeRevival(HistoryMode::Off);
     metadataImport(HistoryMode::On);
     metadataImport(HistoryMode::Off);
     transferredGeometry();

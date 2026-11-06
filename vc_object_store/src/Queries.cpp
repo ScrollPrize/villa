@@ -56,7 +56,8 @@ SelectionFilter objectFilter(sqlite3* db, const ObjectSelection& selection, cons
         connected.insert(ids.begin(), ids.end());
     }
     SelectionFilter filter;
-    if (!selection.includeRetired) filter.sql = " AND " + activeObjectSql("o.id");
+    filter.sql = " AND o.deleted=0";
+    if (!selection.includeRetired) filter.sql += " AND " + activeObjectSql("o.id");
     auto bind = [&](const std::string& clause, const std::string& value) {
         filter.sql += clause; filter.parameters.push_back(value);
     };
@@ -205,7 +206,7 @@ std::vector<VolumeRow> registeredVolumeSelection(sqlite3* db,const ObjectSelecti
         while(query->row()) {
             VolumeRow row{formatUuid(query->blob16(0))};
             if(byLength||selection.minLength) {
-                Statement head(db,"SELECT revision_uuid FROM geometry_heads WHERE object_uuid=?",parseUuid(row.uuid));
+                Statement head(db,"SELECT storage_ref FROM objects WHERE uuid=? AND geometry_manifest IS NOT NULL",parseUuid(row.uuid));
                 if(!head.row())continue;
                 row.volume=transformedLength(db,readGeometryTokenColumn(head,0),frame.mapping,*selection.kind);
                 if(selection.minLength&&row.volume<*selection.minLength)continue;

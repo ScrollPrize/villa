@@ -212,7 +212,6 @@ bool AfcSource::next(EdgeRecord& edge)
     for(int col:{0,1,2})if(sqlite3_column_type(s.value,col)!=SQLITE_INTEGER || s.i64(col)<0)
         throw std::invalid_argument("missing or invalid AFC constraint/fiber ID");
     edge={};edge.uuid=util::nameUuid(p.uuid,"constraint:"+std::to_string(s.i64(0)));
-    edge.relationKey=edge.uuid;
     edge.aUuid=util::nameUuid(p.uuid,"fiber:"+std::to_string(s.i64(1)));
     edge.bUuid=util::nameUuid(p.uuid,"fiber:"+std::to_string(s.i64(2)));
     for(int col:{5,6,7,8,9,10,11,12})

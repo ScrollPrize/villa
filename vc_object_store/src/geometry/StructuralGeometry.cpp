@@ -89,7 +89,7 @@ std::string ObjectStore::editGeometrySequence(WriteTxn& txn,const std::string& o
             originalIds=idsOf(reader,idsName,oldCount);
             // Restoration must not allow a previously allocated ID to be reused.
             Statement latest(db,historyEnabled(db) ? "SELECT manifest FROM geometry_revisions WHERE object_uuid=? ORDER BY rowid DESC LIMIT 1" :
-                "SELECT manifest FROM current_geometry WHERE object_uuid=?",
+                "SELECT geometry_manifest FROM objects WHERE uuid=? AND geometry_manifest IS NOT NULL",
                 parseUuid(uuid));
             if(latest.row()) {
                 const auto tip=Json::parse(latest.text(0));

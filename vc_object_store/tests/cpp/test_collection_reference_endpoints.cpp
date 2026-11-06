@@ -58,11 +58,10 @@ Base makeBase(const std::filesystem::path& path, const std::string& sharedUuid, 
     return base;
 }
 
-EdgeRecord observation(const std::string& key)
+EdgeRecord observation(const std::string&)
 {
     EdgeRecord edge;
     edge.kind = "perpendicular";
-    edge.relationKey = key;
     edge.meta = Json{{"distance", 1.25}, {"enabled", true}}.dump();
     edge.aAnchor.points = edge.bAnchor.points = {{"line_points", {1}}};
     edge.aAnchor.metadataKeys = edge.bAnchor.metadataKeys = {"quality"};
@@ -84,15 +83,19 @@ void noEndpointCopies(const std::filesystem::path& path)
     auto db = ObjectStore::open(path, OpenOptions{.physicalPartitionOnly = true, .readOnly = true});
     auto read = db.read();
     auto* sql = ObjectStoreImplAccess::conn(read);
-    for (const auto* table : {"objects", "fibers", "current_geometry", "geometry_chunks", "collection_refs"}) {
+    for (const auto* table : {"objects", "fibers", "geometry_chunks"}) {
         const auto message = "reference-only edge copied endpoint state into " + std::string(table);
         require(tableRows(sql, table) == 0, message.c_str());
     }
+    Statement redundant(sql,"SELECT count(*) FROM sqlite_schema WHERE name IN "
+        "('external_object_keys','endpoint_keys','collection_refs','collection_edge_tombstones',"
+        "'collection_external_chunks','current_geometry','current_geometry_chunks','current_shared_payloads')");
+    require(redundant.row()&&redundant.i64(0)==0,"relations must not provision alias, proxy or chunk registration structures");
     const auto edges=db.edgesByKind(read,"perpendicular",true);
     if(!edges.empty()){
         const auto& first=edges.front();
         require(!db.neighbours(read,first.aUuid,{}, {},true).empty(),"physical neighbour traversal dropped an external endpoint");
-        require(db.componentOf(read,first.aUuid,{},nullptr,true).size()==2,"physical component traversal lost negative endpoint handles");
+        require(db.componentOf(read,first.aUuid,{},nullptr,true).size()==2,"physical component traversal lost direct endpoint keys");
         mustFail([&]{db.neighbours(read,first.aUuid);});
         mustFail([&]{db.componentOf(read,first.aUuid);});
         mustFail([&]{db.neighbours(read,first.aUuid,{},"fiber",true);});
@@ -105,17 +108,19 @@ void verify(ObjectCollection& collection, const Base& a, const Base& b, size_t c
     const auto edges = collection.edgesByKind(read, "perpendicular");
     require(edges.size() == count, "relation count mismatch");
     require(collection.edgesOf(read, a.active).size() == count &&
-            collection.edgesOf(read, b.active).size() == count, "qualified endpoint adjacency mismatch");
+            collection.edgesOf(read, b.active).size() == count, "direct endpoint adjacency mismatch");
     require(collection.edgesOf(read, a.retired).empty(), "unrelated retired endpoint gained edges");
     for (const auto& edge : edges) {
         require((edge.a == a.active && edge.b == b.active) ||
-                (edge.a == b.active && edge.b == a.active), "same UUID in separate stores lost qualification");
+                (edge.a == b.active && edge.b == a.active), "relation changed original endpoint UUIDs");
+        require(edge.record.aUuid==edge.a.objectUuid&&edge.record.bUuid==edge.b.objectUuid,
+                "native edge must contain original keys, not aliases");
         const auto direct = collection.edge(read, edge.key);
         require(direct && direct->a == edge.a && direct->b == edge.b, "edge key lookup lost endpoint routing");
         require(Json::parse(edge.record.meta).at("distance") == 1.25, "edge evidence changed");
     }
     require(collection.object(read, a.active)->key == a.active &&
-            collection.object(read, b.active)->key == b.active, "external object reads do not preserve owner");
+            collection.object(read, b.active)->key == b.active, "external object reads do not preserve logical UUID");
     require(collection.readGeometryArray(read, a.active, "line_points") == a.bytes &&
             collection.readGeometryArray(read, b.active, "line_points") == b.bytes, "geometry lookup failed through references");
     size_t objectCount = 0;
@@ -126,9 +131,8 @@ void verify(ObjectCollection& collection, const Base& a, const Base& b, size_t c
 void externalReferences()
 {
     TemporaryDirectory directory;
-    const auto shared = util::newUuid();
-    const auto a = makeBase(directory.path / "a", shared, 1);
-    const auto b = makeBase(directory.path / "b", shared, 2);
+    const auto a = makeBase(directory.path / "a", util::newUuid(), 1);
+    const auto b = makeBase(directory.path / "b", util::newUuid(), 2);
     for (const bool bulk : {false, true}) {
         const auto output = directory.path / (bulk ? "bulk" : "scalar");
         auto collection = ObjectCollection::create(output, {a.path, b.path}, directOptions());
@@ -177,7 +181,7 @@ void externalReferences()
             auto read = collection.read();
             require(collection.edgesOf(read, a.active).empty(), "explicitly removed external relation survived");
             require(Json::parse(collection.object(read, a.active)->record.meta).at("quality") == 9, "actual override missing");
-            require(Json::parse(collection.object(read, b.active)->record.meta).at("quality") == 2, "other same-UUID endpoint changed");
+            require(Json::parse(collection.object(read, b.active)->record.meta).at("quality") == 2, "unrelated endpoint changed");
         }
         auto base = ObjectStore::open(a.path, OpenOptions{.readOnly = true});
         auto read = base.read();
@@ -227,53 +231,102 @@ void failedPublication()
     }
 }
 
-void aliasCollisions()
+void uuidPrecedence()
 {
     TemporaryDirectory directory;
     const auto shared=util::newUuid();
     const auto a=makeBase(directory.path/"a",shared,1);
     const auto b=makeBase(directory.path/"b",shared,2);
-    auto collection=ObjectCollection::create(directory.path/"alias-existing",{a.path,b.path},directOptions());
-    std::string owner;
-    {auto read=collection.read();owner=collection.uuid(read);}
-    const auto alias=util::nameUuid(owner,"reference:"+a.active.storeUuid+":"+a.active.objectUuid);
+    const auto path=directory.path/"overlay";
+    auto collection=ObjectCollection::create(path,{a.path,b.path},directOptions());
     {
-        auto write=collection.write();
-        collection.addEdge(write,a.active,b.active,observation("first"));
-        write.commit();
+        auto read=collection.read();
+        require(a.active==b.active,"store hints must not split one logical object UUID");
+        require(Json::parse(collection.object(read,a.active)->record.meta).at("quality")==1,
+                "first linked store has explicit precedence");
+        require(Json::parse(collection.object(read,b.active)->record.meta).at("quality")==1,
+                "store hint must not bypass overlay precedence");
+        size_t count=0;
+        collection.scanObjects(read,[&](const auto&){++count;return true;},"fiber");
+        require(count==1,"same UUID must enumerate once across linked stores");
+    }
+    auto reverse=ObjectCollection::create(directory.path/"reversed",{b.path,a.path},directOptions());
+    {
+        auto read=reverse.read();
+        require(Json::parse(reverse.object(read,a.active)->record.meta).at("quality")==2,
+                "linked-store ordering must define deterministic precedence");
     }
     {
         auto write=collection.write();
-        mustFail([&]{collection.upsertObject(write,fiber(alias,9));});
-        auto edge=observation("bad-edge-id");edge.uuid=alias;
-        mustFail([&]{collection.addEdge(write,a.active,b.active,edge);});
+        collection.setMeta(write,b.active,"quality","9");
         write.commit();
     }
-    noEndpointCopies(directory.path/"alias-existing");
-    verify(collection,a,b,1);
+    {
+        auto read=collection.read();
+        for(const auto& key:{a.active,b.active})
+            require(collection.object(read,key)->record.uuid==shared&&
+                    Json::parse(collection.object(read,key)->record.meta).at("quality")==9,
+                    "replacement retains UUID and shadows every occurrence");
+        require(collection.readGeometryArray(read,a.active,"line_points")==a.bytes,
+                "metadata override preserves inherited geometry");
+    }
+    {
+        auto raw=ObjectStore::open(path,OpenOptions{.physicalPartitionOnly=true,.readOnly=true});
+        auto read=raw.read();auto* sql=ObjectStoreImplAccess::conn(read);
+        Statement record(sql,"SELECT uuid,deleted FROM objects");
+        require(record.row()&&formatUuid(record.blob16(0))==shared&&record.i64(1)==0&&!record.row(),
+                "overlay stores one same-key replacement, not an alias record");
+        require(tableRows(sql,"geometry_chunks")==0,"metadata replacement copied geometry");
+    }
+    {
+        auto write=collection.write();collection.deleteObject(write,a.active);collection.seal(write);write.commit();
+        auto read=collection.read();
+        require(!collection.object(read,a.active)&&!collection.object(read,b.active),
+                "deleted key must stop fallback to every linked store");
+    }
+    {
+        auto raw=ObjectStore::open(path,OpenOptions{.physicalPartitionOnly=true,.readOnly=true});
+        auto read=raw.read();auto* sql=ObjectStoreImplAccess::conn(read);
+        Statement record(sql,"SELECT uuid,deleted FROM objects");
+        require(record.row()&&formatUuid(record.blob16(0))==shared&&record.i64(1)==1&&!record.row(),
+                "deletion belongs to the same-key object row");
+        Statement removed(sql,"SELECT count(*) FROM sqlite_schema WHERE name IN "
+            "('external_object_keys','endpoint_keys','collection_refs','collection_edge_tombstones')");
+        require(removed.row()&&removed.i64(0)==0,"overlay provisioned redundant registration tables");
+    }
+    auto child=ObjectCollection::create(directory.path/"child",{path,b.path},directOptions());
+    {
+        auto read=child.read();
+        require(!child.object(read,a.active),"deeper link resurrected a shadowed deleted object");
+    }
+    for(const auto& base:{a,b}) {
+        auto source=ObjectStore::open(base.path,OpenOptions{.readOnly=true});auto read=source.read();
+        require(source.objectByUuid(read,shared).has_value(),"overlay deletion changed readonly source");
+    }
+}
 
-    auto reverse=ObjectCollection::create(directory.path/"edge-first",{a.path,b.path},directOptions());
-    {
-        auto write=reverse.write();
-        const auto futureAlias=util::nameUuid(reverse.uuid(write),"reference:"+a.active.storeUuid+":"+a.active.objectUuid);
-        const auto x=reverse.upsertObject(write,fiber(util::newUuid(),1));
-        const auto y=reverse.upsertObject(write,fiber(util::newUuid(),1));
-        reverse.putGeometry(write,x,geometry());reverse.putGeometry(write,y,geometry());
-        auto edge=observation("owned");edge.uuid=futureAlias;
-        const auto original=reverse.addEdge(write,x,y,edge);
-        mustFail([&]{reverse.addEdge(write,a.active,b.active,observation("external"));});
-        require(reverse.edge(write,original).has_value(),"external alias collision changed existing owned edge");
-        require(reverse.edgesByKind(write,"perpendicular").size()==1,"alias collision left partial relation");
-        write.commit();
-    }
+void formerAliasNamesRemainOrdinaryKeys()
+{
+    TemporaryDirectory directory;
+    const auto a=makeBase(directory.path/"a",util::newUuid(),1);
+    const auto b=makeBase(directory.path/"b",util::newUuid(),2);
+    auto collection=ObjectCollection::create(directory.path/"overlay",{a.path,b.path},directOptions());
+    auto write=collection.write();
+    const auto formerAlias=util::nameUuid(collection.uuid(write),"reference:"+a.active.storeUuid+":"+a.active.objectUuid);
+    const auto owned=collection.upsertObject(write,fiber(formerAlias,9));
+    const auto edge=collection.addEdge(write,a.active,b.active,observation("external"));
+    require(collection.object(write,owned)->record.uuid==formerAlias,"alias-free references reserved an unrelated key");
+    require(collection.edge(write,edge).has_value(),"ordinary owned key blocked a direct external endpoint");
+    auto duplicate=observation("duplicate");duplicate.uuid=formerAlias;
+    mustFail([&]{collection.addEdge(write,a.active,b.active,duplicate);});
+    write.commit();
 }
 
 void historicalWrapper()
 {
     TemporaryDirectory directory;
-    const auto shared = util::newUuid();
-    const auto a = makeBase(directory.path / "a", shared, 1);
-    const auto b = makeBase(directory.path / "b", shared, 2);
+    const auto a = makeBase(directory.path / "a", util::newUuid(), 1);
+    const auto b = makeBase(directory.path / "b", util::newUuid(), 2);
     const auto output = directory.path / "history-wrapper";
     auto options = directOptions();
     options.history = HistoryMode::On;
@@ -354,9 +407,17 @@ void siblingReferences()
             auto raw = ObjectStore::open(member.locator, OpenOptions{.physicalPartitionOnly = true, .readOnly = true});
             auto nativeRead = raw.read();
             auto* sql = ObjectStoreImplAccess::conn(nativeRead);
-            require(tableRows(sql, "objects") == 1 && tableRows(sql, "fibers") == 1 &&
-                    tableRows(sql, "current_geometry") == 1 && tableRows(sql, "collection_refs") == 0,
+            require(tableRows(sql, "objects") == 1 && tableRows(sql, "fibers") == 1,
                     "sibling relation materialized a foreign endpoint");
+            Statement registrations(sql,"SELECT count(*) FROM sqlite_schema WHERE name IN "
+                "('external_object_keys','endpoint_keys','collection_refs','collection_edge_tombstones')");
+            require(registrations.row()&&registrations.i64(0)==0,"sibling references require no local registration structures");
+            Statement endpoints(sql,"SELECT a_uuid,b_uuid FROM edges WHERE deleted=0");
+            while(endpoints.row()) {
+                const auto endpointA=formatUuid(endpoints.blob16(0)),endpointB=formatUuid(endpoints.blob16(1));
+                require((endpointA==ids[0]&&endpointB==ids[1])||(endpointA==ids[1]&&endpointB==ids[0]),
+                    "sharding must not translate endpoint UUIDs into local aliases");
+            }
         }
         require(partitions == 2, "published sibling shard count differs");
     }
@@ -397,7 +458,8 @@ int main()
     try {
         externalReferences();
         failedPublication();
-        aliasCollisions();
+        uuidPrecedence();
+        formerAliasNamesRemainOrdinaryKeys();
         historicalWrapper();
         siblingReferences();
         std::cout << "reference-only endpoint tests passed\n";

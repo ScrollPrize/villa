@@ -100,7 +100,7 @@ void adjacencyCandidates()
     const auto geometry=vc::geometry::encode(vc::geometry::Fiber{{{1,2,3},{4,5,6}},{{1,2,3},{4,5,6}},{7,9}});
     auto txn=store.write();for(const auto& r:{a,b}){store.upsertObject(txn,r);store.putGeometry(txn,r.uuid,geometry);}
     auto add=[&](const std::string& key,Anchor anchor,bool reverse=false){
-        EdgeRecord edge;edge.kind="test";edge.relationKey=key;edge.aUuid=a.uuid;edge.bUuid=b.uuid;
+        EdgeRecord edge;edge.kind="test";edge.aUuid=a.uuid;edge.bUuid=b.uuid;
         edge.aAnchor=std::move(anchor);edge.bAnchor.wholeGeometry=true;
         if(reverse){std::swap(edge.aUuid,edge.bUuid);std::swap(edge.aAnchor,edge.bAnchor);}
         return store.addEdge(txn,edge);

@@ -33,7 +33,7 @@ int main() try {
     require(generation(overlay)==initial,"same inherited content advanced generation");
     {
         auto raw=ObjectStore::open(overlayPath,OpenOptions{.physicalPartitionOnly=true,.readOnly=true});auto r=raw.read();
-        Statement count(ObjectStoreImplAccess::conn(r),"SELECT count(*) FROM collection_refs");count.row();require(count.i64(0)==0,"no-op left a proxy behind");
+        Statement count(ObjectStoreImplAccess::conn(r),"SELECT count(*) FROM objects");count.row();require(count.i64(0)==0,"no-op materialized an inherited object");
     }
     {
         auto w=overlay.write();overlay.setMeta(w,a,"foo","2");w.commit();
@@ -43,19 +43,23 @@ int main() try {
         auto w=overlay.write();overlay.setMeta(w,a,"foo","2.0");overlay.replaceObject(w,a,overlay.object(w,a)->record);w.commit();
     }
     require(generation(overlay)==changed,"same overlay content advanced generation");
-    std::string owner,proxy;
+    std::string owner;
     {auto r=overlay.read();owner=overlay.uuid(r);}
     {
         auto raw=ObjectStore::open(overlayPath,OpenOptions{.physicalPartitionOnly=true,.readOnly=true});auto r=raw.read();
-        Statement refs(ObjectStoreImplAccess::conn(r),"SELECT local_uuid FROM collection_refs WHERE owner_uuid=? AND object_uuid=?",parseUuid(a.storeUuid),parseUuid(a.objectUuid));
-        require(refs.row(),"changed inherited record lacks proxy");proxy=formatUuid(refs.blob16(0));
+        Statement record(ObjectStoreImplAccess::conn(r),"SELECT uuid,deleted FROM objects");
+        require(record.row()&&formatUuid(record.blob16(0))==a.objectUuid&&record.i64(1)==0&&!record.row(),
+            "changed inherited record must be stored once at its original UUID");
     }
-    {auto r=overlay.read();require(!overlay.object(r,{owner,proxy}),"internal proxy became a second owned identity");}
+    {auto r=overlay.read();require(overlay.object(r,{owner,a.objectUuid})->key==a,
+        "the same UUID with an overlay routing hint must resolve to the same logical object");}
     const auto collision=util::nameUuid(owner,"reference:"+b.storeUuid+":"+b.objectUuid);
     {
         auto w=overlay.write();auto record=fiber();record.uuid=collision;record.name="keep-owned";overlay.upsertObject(w,record);w.commit();
-        auto retry=overlay.write();mustFail([&]{overlay.setMeta(retry,b,"foo","9");});retry.commit();
+        auto retry=overlay.write();overlay.setMeta(retry,b,"foo","9");retry.commit();
         auto r=overlay.read();require(overlay.object(r,{owner,collision})->record.name=="keep-owned","reference creation overwrote owned UUID");
+        require(nlohmann::json::parse(overlay.object(r,b)->record.meta).at("foo")==9,
+            "an unrelated former alias UUID must not prevent an inherited edit");
     }
     ObjectKey edge;
     {
@@ -66,14 +70,20 @@ int main() try {
     {auto r=overlay.read();require(overlay.edgeById(r,owner,17)->key==edge,"qualified explicit edge ID was not preserved");}
     {
         auto read=overlay.read();const auto current=overlay.edge(read,edge);
-        require(current&&((current->a==a&&current->b==c)||(current->a==c&&current->b==a)),"indexed edge retains qualified endpoint keys");
+        require(current&&((current->a==a&&current->b==c)||(current->a==c&&current->b==a)),"indexed edge retains direct endpoint keys");
         require(overlay.currentGeometry(read,a)&&overlay.readGeometryArray(read,a,"line_points")==expected,
                 "indexed inherited geometry resolves through its original owner");
         auto raw=ObjectStore::open(overlayPath,OpenOptions{.physicalPartitionOnly=true,.readOnly=true});auto r=raw.read();
         Statement counts(ObjectStoreImplAccess::conn(r),"SELECT (SELECT count(*) FROM objects),"
-            "(SELECT count(*) FROM collection_refs),(SELECT count(*) FROM current_geometry),(SELECT count(*) FROM geometry_chunks)");
-        require(counts.row()&&counts.i64(0)==2&&counts.i64(1)==1&&counts.i64(2)==0&&counts.i64(3)==0,
-            "adding indexed edge must not copy endpoint beyond the existing override and owned object");
+            "(SELECT count(*) FROM sqlite_schema WHERE name IN ('external_object_keys','endpoint_keys','collection_refs','collection_edge_tombstones')),"
+            "(SELECT count(*) FROM objects WHERE geometry_manifest IS NOT NULL),(SELECT count(*) FROM geometry_chunks)");
+        // The metadata override for a retains its existing geometry descriptor
+        // in the ordinary object row, but all payload bytes remain inherited.
+        require(counts.row()&&counts.i64(0)==3&&counts.i64(1)==0&&counts.i64(2)==1&&counts.i64(3)==0,
+            "adding indexed edge must not copy endpoints beyond two existing overrides and the owned object");
+        Statement descriptor(ObjectStoreImplAccess::conn(r),"SELECT uuid FROM objects WHERE geometry_manifest IS NOT NULL");
+        require(descriptor.row()&&formatUuid(descriptor.blob16(0))==a.objectUuid&&!descriptor.row(),
+            "only the explicit metadata override retains its inherited geometry descriptor");
     }
     const auto boundGeneration=generation(overlay);
     {
@@ -131,21 +141,21 @@ int main() try {
             auto invalid=edge;invalid.kind.clear();mustFail([&]{db.insertEdgeWithId(w,invalid,102);});
             const auto automatic=db.addEdge(w,edge);
             require(edgeIdByUuid(sql,parseUuid(automatic))==100,"failed explicit edge insertion moved allocator");
-            edge.relationKey="high";high=db.insertEdgeWithId(w,edge,103);
-            edge.relationKey="low";low=db.insertEdgeWithId(w,edge,101);
+            high=db.insertEdgeWithId(w,edge,103);
+            low=db.insertEdgeWithId(w,edge,101);
             require(edgeIdByUuid(sql,parseUuid(high))==103&&edgeIdByUuid(sql,parseUuid(low))==101,"explicit edge IDs changed");
             mustFail([&]{db.insertEdgeWithId(w,edge,101);});
             mustFail([&]{db.insertEdgeWithId(w,edge,104);});
             auto sameUuid=edge;sameUuid.uuid=high;mustFail([&]{db.insertEdgeWithId(w,sameUuid,102);});
-            edge.relationKey="automatic-exhausted";mustFail([&]{db.addEdge(w,edge);});w.commit();
+            mustFail([&]{db.addEdge(w,edge);});w.commit();
         }
         int64_t before;{auto r=db.read();before=db.provisioning(r).generation;}
-        {auto rollback=db.write();edge.relationKey="rolled-back";db.insertEdgeWithId(rollback,edge,102);}
+        {auto rollback=db.write();db.insertEdgeWithId(rollback,edge,102);}
         {auto r=db.read();require(db.provisioning(r).generation==before&&db.edgesByKind(r,"explicit").size()==3,"explicit edge rollback leaked state");}
         {
-            auto w=db.write();edge.relationKey="final";const auto final=db.insertEdgeWithId(w,edge,102);
+            auto w=db.write();const auto final=db.insertEdgeWithId(w,edge,102);
             require(edgeIdByUuid(ObjectStoreImplAccess::conn(w),parseUuid(final))==102,"rolled-back edge ID was not reusable");
-            edge.relationKey="still-exhausted";mustFail([&]{db.addEdge(w,edge);});w.commit();
+            mustFail([&]{db.addEdge(w,edge);});w.commit();
         }
         auto r=db.read();require(db.edgesByKind(r,"explicit").size()==4,"explicit edges not published");
         require(db.provisioning(r).generation==before+1,"explicit edge publication generation changed incorrectly");
