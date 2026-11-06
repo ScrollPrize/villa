@@ -73,6 +73,8 @@ vc_add_test(NAME test_omp_thread_point_collection)
 
 vc_add_test(NAME test_surface_area_units)
 
+vc_add_test(NAME test_inpaint_surface LIBS doctest::doctest vc_inpaint)
+
 
 vc_add_test(NAME test_segmentation_autosave_state
     LIBS doctest::doctest
