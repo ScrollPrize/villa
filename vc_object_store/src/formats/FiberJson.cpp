@@ -63,7 +63,9 @@ GeometrySource decodeFiberJson(const std::string& text)
     if (version != 1 && version != 3 && version != 4)
         throw std::runtime_error("Fiber transfer requires version 1, 3 or 4");
     if (version == 1) version1Fields(root);
-    if (version < 4) version3Coordinates(root);
+    // VC3D's version 4 files from before the store still name their frame the version 3 way.
+    if (version < 4 || (!root.contains("coordinates") && root.contains("vc_open_data_coordinate_space")))
+        version3Coordinates(root);
     GeometrySource p;
     p.object.uuid = util::canonicalUuid(root.at("uuid").get<std::string>());
     p.object.kind = "fiber";
