@@ -137,11 +137,16 @@ def test_cuda_ema_overhead_and_bf16():
     import json
     import statistics
     import time
-    from pathlib import Path
     from vesuvius.neural_tracing.fiber_trace_3d.model import build_fiber_trace_3d_model
     torch.cuda.set_per_process_memory_fraction(16 * 1024**3 / torch.cuda.get_device_properties(0).total_memory)
-    config = json.loads((Path(__file__).parents[2] /
-        "src/vesuvius/neural_tracing/fiber_trace_3d/configs/train_s1a_nml_16x8.json").read_text())
+    # Keep the historical benchmark architecture without depending on a local
+    # training config or its dataset paths.
+    config = {"model_3d": {
+        "input_channels": 1, "output_channels": 7,
+        "unet_base_channels": 16, "unet_depth": 5,
+        "normalization": "group", "decoder_upsample_mode": "pixelshuffle",
+        "output_stride": 4,
+    }}
     torch.manual_seed(11)
     model = build_fiber_trace_3d_model(config).cuda()
     optimizer = torch.optim.AdamW(model.parameters(), lr=.01)
