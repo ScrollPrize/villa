@@ -82,12 +82,12 @@ void writeCollection(const StoreReader& reader, TransactionRequest& request, con
         return;
     }
     record.meta = meta.dump();
-    operations.push_back(UpdateObjectOp{objectRecordJson(record)});
     if (frame) {
         const auto shown = GeometrySnapshot(reader).viewTransformedAt(uuid, frame->volume, frame->scale);
         points = shown.canonicalPointCollection(points);
-        for (auto& [transform, version] : transformDependencies(reader)) request.readDependencies.emplace(transform, version);
+        operations.push_back(shown.checkMappingOperation());
     }
+    operations.push_back(UpdateObjectOp{objectRecordJson(record)});
     const auto previous = std::get<geometry::PointCollection>(geometry::decode(reader.readGeometryData(head->uuid)));
     const auto previousAnnotations = reader.geometryPointAnnotations(head->uuid, "points");
     if (previous.ids == points.ids && previous.points == points.points && previousAnnotations == wanted.annotations) {

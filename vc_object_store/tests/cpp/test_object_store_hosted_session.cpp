@@ -518,6 +518,62 @@ try {
                 "a concurrent record edit conflicts without losing the other writer's metadata");
     }
 
+    // Inverse collection edits must validate the mapping, not freshly read
+    // transform versions paired with an older cached mapping. Exercise both an
+    // updated registration and a newly selected route without polling first.
+    for (const bool newRoute : {false, true}) {
+        const auto source = util::newUuid(), target = util::newUuid();
+        AttachedCollection collection;
+        collection.uuid = util::newUuid(); collection.name = "mapped collection";
+        collection.points.ids = {0}; collection.points.points = {{5, 6, 7}};
+        collection.annotations = nlohmann::json::array({nlohmann::json::object()});
+        writeVolumeCollections(session, hosted, {source, 1}, {collection}, {});
+        const auto registration = registerVolumeTransform(session, hosted, source, target, VolumeAffine::scale(2), "initial");
+        auto read = [&] {
+            std::vector<AttachedCollection> result;
+            session.readStore(hosted, [&](const StoreReader& reader, const auto&) {
+                result = pointCollections(reader, {collection.uuid}, {target, 1});
+            });
+            return result;
+        };
+        auto shown = read(); // cache the original mapping
+        require(shown.front().points.points.front()[0] == 10, "initial collection mapping");
+        HostedStore other(endpoint);
+        const auto before = other.currentObjectRevision(collection.uuid);
+        auto change = session.newRequest(hosted);
+        if (newRoute) {
+            ObjectRecord route; route.uuid = util::newUuid();
+            ObjectRecord choice; choice.uuid = util::newUuid();
+            change.expectedObjects = {{route.uuid, std::nullopt}};
+            change.operations = {CreateObjectOp{objectRecordJson(
+                volumeTransformRecord(route, source, target, VolumeAffine::scale(10), "new route"))}};
+            other.submit(change);
+            const auto key = route.uuid + "@" + other.currentObjectRevision(route.uuid)->uuid;
+            change = session.newRequest(hosted);
+            change.expectedObjects = {{choice.uuid, std::nullopt}};
+            change.operations = {CreateObjectOp{objectRecordJson(volumeTransformChoiceRecord(choice, source, target, {key}))}};
+        } else {
+            const auto head = other.currentObjectRevision(registration);
+            change.expectedObjects[registration] = head->version;
+            change.operations = {UpdateObjectOp{objectRecordJson(
+                volumeTransformRecord(head->record, source, target, VolumeAffine::scale(10), "updated"))}};
+        }
+        other.submit(change);
+        shown.front().points.points.front() = {20, 20, 20};
+        bool conflicted = false;
+        try { writeVolumeCollections(session, hosted, {target, 1}, shown, {}); }
+        catch (const TransactionConflict& conflict) { conflicted = conflict.reason() == TransactionConflict::Reason::ReadDependency; }
+        const auto unchanged = other.currentObjectRevision(collection.uuid);
+        require(conflicted && unchanged->version == before->version && unchanged->geometryRevision == before->geometryRevision,
+                "stale collection mapping conflicts without changing geometry or metadata");
+        session.refresh(hosted);
+        shown = read();
+        shown.front().points.points.front() = {20, 20, 20};
+        writeVolumeCollections(session, hosted, {target, 1}, shown, {});
+        require(read().front().points.points.front() == vc::geometry::Point{20, 20, 20},
+                "collection saves correctly after refreshing the mapping");
+    }
+
     // Detaching stops the poller: nothing arrives after Detached.
     (void)session.takeEvents();
     session.detach(hosted);

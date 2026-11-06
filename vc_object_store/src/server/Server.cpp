@@ -840,6 +840,10 @@ private:
         keepAlive_ = header_->get().keep_alive();
         version_ = header_->get().version();
         if (const auto upload = ServerState::uploadTarget(header_->get())) return startUpload(*upload);
+        // Beast checked Content-Length while parsing the unrestricted header.
+        // Lowering body_limit now only bounds chunked bodies.
+        if (const auto length = header_->content_length(); length && *length > server_.options.maxCommandBytes)
+            return refuse(http::status::payload_too_large, "request body exceeds the server limit");
         command_.emplace(std::move(*header_));
         command_->body_limit(server_.options.maxCommandBytes);
         http::async_read(stream_, buffer_, *command_,

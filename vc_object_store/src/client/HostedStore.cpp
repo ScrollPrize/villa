@@ -156,10 +156,20 @@ std::vector<uint8_t> HostedStore::readGeometryArray(const std::string& revisionU
     auto ranged = [&](int64_t total, int64_t range) {
         std::vector<uint8_t> result;
         result.reserve(static_cast<std::size_t>(total));
-        for (int64_t done = 0; done < total; done += range) {
-            const auto response = get(byteOffset + done, std::min(range, total - done));
+        for (int64_t done = 0; done < total;) {
+            const auto want = std::min(range, total - done);
+            const auto response = get(byteOffset + done, want);
+            if (response.status == 413) {
+                int64_t serverMax = 0;
+                try { serverMax = Json::parse(response.body).value("max_response_bytes", int64_t(0)); } catch (const Json::exception&) {}
+                if (serverMax > 0 && serverMax < want) {
+                    range = serverMax;
+                    continue; // retry the same offset within the server's limit
+                }
+            }
             const auto& body = expectOk(response, "geometry array").body;
             result.insert(result.end(), body.begin(), body.end());
+            done += want;
         }
         return result;
     };

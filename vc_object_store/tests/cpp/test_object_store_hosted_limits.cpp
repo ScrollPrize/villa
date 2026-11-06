@@ -116,6 +116,7 @@ try {
     o.maxPayloadBytes = 24u << 20;
     o.maxStagedBytes = 160u << 20;
     o.maxResponseBytes = 1u << 20;
+    o.maxCommandBytes = 64u << 10;
     o.checkpointInterval = std::chrono::milliseconds(50);
     o.walTruncateBytes = 0;  // truncate whenever a checkpoint copied everything
     auto service = std::make_unique<server::Server>(path, o);
@@ -130,6 +131,23 @@ try {
         require(std::filesystem::exists(stagingDir / (std::string(64, '9') + ".1")), "refused service leaves staging alone");
     }
     const auto endpoint = "http://127.0.0.1:" + std::to_string(port);
+    // Content-Length must be refused from the header, before allocating or
+    // waiting for the body. Chunked commands still enforce the same bound.
+    {
+        vcr::http::Options once; once.retries = 0;
+        vcr::http::Session http(once);
+        auto body = kindQueryRequestToJson({"track", false, std::nullopt});
+        body.resize(o.maxCommandBytes, ' ');
+        require(http.request("POST", endpoint + "/v1/query/count", body).status == 200,
+                "command at the size limit accepted");
+        const auto oversized = rawExchange(port,
+            "POST /v1/query/count HTTP/1.1\r\nHost: x\r\nContent-Length: " +
+            std::to_string(o.maxCommandBytes + 1) + "\r\n\r\n", true);
+        require(oversized.starts_with("HTTP/1.1 413"), "oversized command refused before receiving its body");
+        const auto chunked = rawExchange(port,
+            "POST /v1/query/count HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n10001\r\n", true);
+        require(chunked.starts_with("HTTP/1.1 413"), "oversized chunked command refused");
+    }
     HostedStore hosted(endpoint);
     const auto initial = hosted.status();
     auto request = [&](VersionSelection expected, std::vector<TransactionOperation> operations, std::string author) {
@@ -171,6 +189,19 @@ try {
         auto txn = inspect.read();
         require(client.readGeometryArray(descriptor->uuid, array.name) ==
                     inspect.readGeometryArray(txn, descriptor->uuid, array.name), "client-side ranges");
+    }
+    {
+        HostedStoreOptions larger; larger.rangeBytes = 2 * o.maxResponseBytes;
+        HostedStore client(endpoint, larger);
+        const auto& array = descriptor->arrays.front();
+        auto txn = inspect.read();
+        const auto expected = inspect.readGeometryArray(txn, descriptor->uuid, array.name);
+        require(array.byteLength > larger.rangeBytes, "fixture exceeds the client range size");
+        require(client.readGeometryArray(descriptor->uuid, array.name, 0, array.byteLength) == expected,
+                "explicit count negotiates smaller server ranges");
+        require(client.readGeometryArray(descriptor->uuid, array.name, 3, array.byteLength - 7) ==
+                    std::vector<uint8_t>(expected.begin() + 3, expected.end() - 4),
+                "range negotiation preserves the offset and final partial range");
     }
 
     // A 3 MiB artifact streams in and comes back through 1 MiB ranges.
