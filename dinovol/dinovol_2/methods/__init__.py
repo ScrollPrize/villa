@@ -6,4 +6,7 @@ def build_method(config, **runtime):
     if name == "dino":
         from .dino import DinoMethod
         return DinoMethod(config, **runtime)
+    if name == "jem":
+        from .jem import JemMethod
+        return JemMethod(config, **runtime)
     raise ValueError(f"Unknown training method: {name!r}")

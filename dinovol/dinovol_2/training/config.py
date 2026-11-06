@@ -15,7 +15,7 @@ DATA_KEYS = {
 OPTIMIZER_KEYS = {
     'lr', 'min_lr', 'lr_schedule', 'weight_decay', 'weight_decay_end', 'betas',
     'clip_grad', 'layer_decay', 'layerwise_decay', 'patch_embed_lr_mult',
-    'warmup_steps', 'warmup_ratio', 'fused_optimizer', 'rewarmup_start_step', 'rewarmup_steps',
+    'warmup_steps', 'warmup_ratio', 'fused_optimizer', 'rewarmup_start_step', 'rewarmup_steps', 'lr_scaling',
 }
 DINO_KEYS = {
     'dino_loss_weight', 'ibot_loss_weight', 'koleo_loss_weight', 'koleo_distributed',
@@ -78,12 +78,19 @@ def normalize_config(config: Mapping[str, Any], *, legacy_checkpoint=False) -> d
     for model_key, data_key in [('global_crops_size', 'global_crop_size'), ('local_crops_size', 'local_crop_size')]:
         if data_key in dataset:
             backbone.setdefault(model_key, dataset[data_key])
+    if result['method']['name'] == 'jem':
+        from dinovol_2.methods.jem_config import disable_rope_augmentation
+        backbone = disable_rope_augmentation(backbone)
     result['backbone'] = materialize_backbone_config(backbone)
     result['backbone'].pop('model_type', None)
     # Resolve recipe defaults here, independently of the architecture.
     optimizer = result['optimizer']
     optimizer.setdefault('lr_schedule', 'constant')
     optimizer.setdefault('weight_decay_end', optimizer.get('weight_decay', 0.04))
+    if result['method']['name'] == 'jem':
+        from dinovol_2.methods.jem_config import resolve_jem_method, validate_jem_backbone
+        result['method'] = resolve_jem_method(result['method'])
+        validate_jem_backbone(result['backbone'])
     if result['method']['name'] == 'dino':
         method = result['method']
         method.setdefault('momentum_teacher', 0.994)
