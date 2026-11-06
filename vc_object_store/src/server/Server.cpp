@@ -14,6 +14,7 @@
 #include <boost/beast/core.hpp>
 #include <boost/beast/http.hpp>
 #include <nlohmann/json.hpp>
+#include <vc_reader/native/sigv4.hpp>
 
 #include <algorithm>
 #include <atomic>
@@ -303,7 +304,7 @@ Target parseTarget(std::string_view target)
     while (!path.empty()) {
         if (path.front() == '/') { path.remove_prefix(1); continue; }
         const auto end = path.find('/');
-        result.path.emplace_back(path.substr(0, end));
+        result.path.push_back(vcr::percent_decode(std::string(path.substr(0, end))));
         path.remove_prefix(end == std::string_view::npos ? path.size() : end);
     }
     if (q != std::string_view::npos) {

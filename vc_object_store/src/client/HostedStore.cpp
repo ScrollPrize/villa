@@ -9,6 +9,7 @@
 
 #include <fcntl.h>
 #include <vc_reader/http.hpp>
+#include <vc_reader/native/sigv4.hpp>
 
 #include <algorithm>
 #include <stdexcept>
@@ -21,6 +22,14 @@ namespace vc::objects {
 using Json = nlohmann::json;
 
 namespace {
+std::string arrayPathSegment(const std::string& name)
+{
+    // Dot-only names are valid arrays but URL clients normalize literal dot segments.
+    if (name == ".") return "%2E";
+    if (name == "..") return "%2E%2E";
+    return vcr::aws_uri_encode(name, false);
+}
+
 std::string serverError(const vcr::http::Response& response)
 {
     try {
@@ -34,7 +43,7 @@ std::string serverError(const vcr::http::Response& response)
 
 struct HostedStore::Impl {
     explicit Impl(const HostedStoreOptions& o)
-        : http(vcr::http::Options{o.connections, o.connectTimeoutMs, o.stallTimeoutS, o.retries, o.requestTimeoutMs}) {}
+        : http(vcr::http::Options{o.connections, o.connectTimeoutMs, o.stallTimeoutS, o.retries, o.requestTimeoutMs, true}) {}
     vcr::http::Session http;
 };
 
@@ -149,7 +158,7 @@ std::vector<uint8_t> HostedStore::readGeometryArray(const std::string& revisionU
                                                     int64_t byteOffset, const std::optional<int64_t>& byteCount)
 {
     auto get = [&](int64_t offset, const std::optional<int64_t>& count) {
-        auto url = endpoint_ + "/v1/geometry/" + revisionUuid + "/arrays/" + arrayName + "?offset=" + std::to_string(offset);
+        auto url = endpoint_ + "/v1/geometry/" + revisionUuid + "/arrays/" + arrayPathSegment(arrayName) + "?offset=" + std::to_string(offset);
         if (count) url += "&count=" + std::to_string(*count);
         return impl_->http.request("GET", url);
     };
@@ -547,7 +556,7 @@ std::vector<std::optional<ObjectRevision>> HostedStore::objectsAtVersions(const 
 
 nlohmann::json HostedStore::geometryPointAnnotations(const std::string& revisionUuid, const std::string& arrayName)
 {
-    const auto response = impl_->http.request("GET", endpoint_ + "/v1/geometry/" + revisionUuid + "/annotations/" + arrayName);
+    const auto response = impl_->http.request("GET", endpoint_ + "/v1/geometry/" + revisionUuid + "/annotations/" + arrayPathSegment(arrayName));
     if (response.status == 404) throw std::invalid_argument("geometry revision not found: " + revisionUuid);
     return Json::parse(expectOk(response, "point annotations").body);
 }

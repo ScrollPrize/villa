@@ -244,10 +244,10 @@ StoreStatus ObjectStoreSession::status(const AttachmentIdentity& identity)
     });
 }
 
-PinnedObject pinOf(const AttachmentIdentity& attachment, const ObjectRevision& revision)
+PinnedObject pinOf(const AttachmentIdentity& attachment, const ObjectRevision& revision, const std::string& activeGeneration)
 {
     return {attachment, {attachment.storeUuid, revision.objectUuid}, revision.generation, revision.version,
-            revision.geometryRevision};
+            revision.geometryRevision, activeGeneration};
 }
 
 TransactionRequest ObjectStoreSession::newRequest(const AttachmentIdentity& identity)
@@ -331,13 +331,13 @@ VolumeTransforms ObjectStoreSession::volumeTransforms(const AttachmentIdentity& 
 }
 
 std::vector<ArtifactFile> ObjectStoreSession::artifacts(const AttachmentIdentity& identity, const std::string& objectUuid,
-                                                       const std::optional<int64_t>& version)
+                                                       const std::optional<int64_t>& version, const std::optional<std::string>& generation)
 {
     const auto uuid = util::canonicalUuid(objectUuid);
     std::optional<ObjectRevision> revision;
     if (version) {
         const auto status = this->status(identity);
-        revision = objectsAtVersions(identity, {{status.storeUuid, status.generation, uuid, *version}}).front();
+        revision = objectsAtVersions(identity, {{status.storeUuid, generation.value_or(status.generation), uuid, *version}}).front();
     } else {
         revision = currentObject(identity, uuid);
     }
@@ -347,9 +347,9 @@ std::vector<ArtifactFile> ObjectStoreSession::artifacts(const AttachmentIdentity
 
 std::vector<ArtifactFile> ObjectStoreSession::materializeArtifacts(const AttachmentIdentity& identity, const std::string& objectUuid,
                                                                   const std::filesystem::path& destination,
-                                                                  const std::optional<int64_t>& version)
+                                                                  const std::optional<int64_t>& version, const std::optional<std::string>& generation)
 {
-    const auto files = artifacts(identity, objectUuid, version);
+    const auto files = artifacts(identity, objectUuid, version, generation);
     for (const auto& file : files) writeArtifact(identity, file, destination / std::filesystem::path(file.name));
     return files;
 }
@@ -370,9 +370,9 @@ void ObjectStoreSession::writeArtifact(const AttachmentIdentity& identity, const
 std::optional<std::filesystem::path> ObjectStoreSession::artifactFile(const AttachmentIdentity& identity,
                                                                       const std::string& objectUuid, const std::string& name,
                                                                       const std::filesystem::path& cacheDirectory,
-                                                                      const std::optional<int64_t>& version)
+                                                                      const std::optional<int64_t>& version, const std::optional<std::string>& generation)
 {
-    const auto files = artifacts(identity, objectUuid, version);
+    const auto files = artifacts(identity, objectUuid, version, generation);
     const auto file = std::find_if(files.begin(), files.end(), [&](const auto& f) { return f.name == name; });
     if (file == files.end()) return std::nullopt;
     // Content-addressed: a complete file at its path is that content (writes are atomic and verified).
@@ -389,18 +389,6 @@ TransactionReceipt ObjectStoreSession::publishArtifacts(const AttachmentIdentity
                                                         const std::string& author)
 {
     const auto uuid = util::canonicalUuid(objectUuid);
-    std::map<std::string, ArtifactFile> manifest;
-    for (auto& file : artifacts(identity, uuid, expectedVersion)) manifest[file.name] = std::move(file);
-    // Bytes first: the request may only name what the store holds.
-    withAttachment(identity, true, [&](Attachment& attachment) {
-        for (const auto& [name, path] : files) {
-            const auto hash = attachment.remote ? attachment.remote->client().putArtifact(path) : attachment.store().putArtifact(path);
-            manifest[name] = ArtifactFile{name, hash, uint64_t(std::filesystem::file_size(path))};
-        }
-        return 0;
-    });
-    std::vector<ArtifactFile> listed;
-    for (auto& [name, file] : manifest) listed.push_back(std::move(file));
     TransactionRequest request;
     if (author.empty()) {
         request = newRequest(identity);
@@ -411,6 +399,26 @@ TransactionReceipt ObjectStoreSession::publishArtifacts(const AttachmentIdentity
         request.generation = status.generation;
         request.author = author;
     }
+    // Read the manifest from the expected head, whose publication generation
+    // can predate the active history. The request still guards both the head
+    // version and the active generation across the uploads below.
+    const auto head = currentObject(identity, uuid);
+    const auto actual = head && !head->deleted ? std::optional(head->version) : std::nullopt;
+    if (actual != expectedVersion)
+        throw TransactionConflict(TransactionConflict::Reason::Version, {{"object", uuid, expectedVersion, actual}},
+                                  "artifact publication: expected version changed for " + uuid);
+    std::map<std::string, ArtifactFile> manifest;
+    for (auto& file : artifactManifest(head->record)) manifest[file.name] = std::move(file);
+    // Bytes first: the request may only name what the store holds.
+    withAttachment(identity, true, [&](Attachment& attachment) {
+        for (const auto& [name, path] : files) {
+            const auto hash = attachment.remote ? attachment.remote->client().putArtifact(path) : attachment.store().putArtifact(path);
+            manifest[name] = ArtifactFile{name, hash, uint64_t(std::filesystem::file_size(path))};
+        }
+        return 0;
+    });
+    std::vector<ArtifactFile> listed;
+    for (auto& [name, file] : manifest) listed.push_back(std::move(file));
     request.expectedObjects = {{uuid, expectedVersion}};
     request.operations = {SetMetaOp{uuid, kArtifactsMetaKey, artifactManifestJson(std::move(listed))}};
     return submit(identity, request);
@@ -1316,7 +1324,8 @@ void ObjectStoreSession::requireCurrent(const PinnedObject& pin)
 {
     readStore(pin.attachment, [&](const StoreReader& reader, const auto&) {
         const auto head = reader.currentObject(pin.object.objectUuid);
-        if (!head || head->version != pin.version || head->generation != pin.generation)
+        if (reader.status().generation != pin.writeGeneration ||
+            !head || head->version != pin.version || head->generation != pin.generation)
             throw std::runtime_error("It changed in the object store since it was opened; reopen it to edit");
     });
 }

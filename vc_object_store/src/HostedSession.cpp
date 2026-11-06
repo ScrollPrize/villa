@@ -121,6 +121,7 @@ void HostedAttachment::check()
             cache_.clear();
             ++invalidations_;
             transforms_.reset();
+            ++transformInvalidations_;
             StoreSessionEvent event{StoreSessionEvent::Kind::Committed, identity, cursor.sequence, {}};
             event.revalidate = true;
             events.push_back(std::move(event));
@@ -171,6 +172,7 @@ void HostedAttachment::check()
             if (transformsChanged) {
                 std::lock_guard lock(cacheMutex_);
                 transforms_.reset();
+                ++transformInvalidations_;
             }
             events.push_back(std::move(event));
         }
@@ -198,6 +200,7 @@ TransactionReceipt HostedAttachment::submit(const TransactionRequest& request)
     invalidate(touched);
     std::lock_guard lock(cacheMutex_);
     transforms_.reset();
+    ++transformInvalidations_;
     return receipt;
 }
 
@@ -319,26 +322,33 @@ std::shared_ptr<const nlohmann::json> HostedAttachment::geometryPointAnnotations
 
 VolumeTransforms HostedAttachment::volumeTransforms()
 {
-    {
+    for (int attempt = 0; attempt < 4; ++attempt) {
+        uint64_t epoch;
+        {
+            std::lock_guard lock(cacheMutex_);
+            if (transforms_) return *transforms_;
+            epoch = transformInvalidations_;
+        }
+        // Recorded registrations and choices only: a shared store never applies
+        // a client's unrecorded catalog registrations.
+        ObjectSelection registrations;
+        registrations.kind = "volume_transform";
+        std::vector<std::pair<ObjectRecord, std::string>> recorded;
+        for (auto& record : client_.selectAllObjects(registrations)) {
+            const auto head = client_.currentObjectRevision(record.uuid);
+            if (!head) continue; // removed since the listing; the next check invalidates
+            recorded.emplace_back(std::move(record), head->uuid);
+        }
+        ObjectSelection choices;
+        choices.kind = "volume_transform_choice";
+        auto transforms = volumeTransformsFrom(recorded, client_.selectAllObjects(choices), nullptr);
         std::lock_guard lock(cacheMutex_);
-        if (transforms_) return *transforms_;
+        // A poll or submission may have invalidated the snapshot while HTTP was in flight.
+        if (epoch != transformInvalidations_) continue;
+        transforms_ = transforms;
+        return transforms;
     }
-    // Recorded registrations and choices only: a shared store never applies
-    // a client's unrecorded catalog registrations.
-    ObjectSelection registrations;
-    registrations.kind = "volume_transform";
-    std::vector<std::pair<ObjectRecord, std::string>> recorded;
-    for (auto& record : client_.selectAllObjects(registrations)) {
-        const auto head = client_.currentObjectRevision(record.uuid);
-        if (!head) continue; // removed since the listing; the next check invalidates
-        recorded.emplace_back(std::move(record), head->uuid);
-    }
-    ObjectSelection choices;
-    choices.kind = "volume_transform_choice";
-    auto transforms = volumeTransformsFrom(recorded, client_.selectAllObjects(choices), nullptr);
-    std::lock_guard lock(cacheMutex_);
-    transforms_ = transforms;
-    return transforms;
+    throw StoreBusy("hosted store: transforms kept changing while reading; retry later");
 }
 
 std::set<std::string> HostedAttachment::holds(const std::set<std::string>& uuids)

@@ -32,20 +32,23 @@ struct AttachmentIdentity {
 };
 
 // An object as some code holds it: its numbered version (0: not stored yet)
-// in the store's history generation, and the geometry of that version.
-// Checked requests editing it expect that version in that generation.
+// in its publication generation, and the geometry of that version.
+// Writes expect the active history generation observed when it was read,
+// which may differ from the generation that published an unchanged head.
 struct PinnedObject {
     AttachmentIdentity attachment;
     ObjectIdentity object;
     std::string generation;
     int64_t version = 0;
     std::optional<std::string> geometryRevision;
+    std::string writeGeneration;
     bool stored() const { return version > 0; }
     ObjectVersion reference() const { return {object.storeUuid, generation, object.objectUuid, version}; }
     bool operator==(const PinnedObject&) const = default;
 };
 // The pin of a revision read from `attachment`.
-PinnedObject pinOf(const AttachmentIdentity& attachment, const ObjectRevision& revision);
+PinnedObject pinOf(const AttachmentIdentity& attachment, const ObjectRevision& revision,
+                   const std::string& activeGeneration);
 
 // An object's published geometry could not be fetched (offline, missing, invalid).
 struct GeometryUnavailable : std::runtime_error {
@@ -238,20 +241,23 @@ public:
     // (and, locally, the client catalog's unrecorded registrations).
     VolumeTransforms volumeTransforms(const AttachmentIdentity&);
     // Artifacts (objects/Artifacts.hpp) on any attachment: the manifest of an
-    // object's current version (or `version`, in the active generation).
+    // object's current version (or `version` in `generation`, default active).
     std::vector<ArtifactFile> artifacts(const AttachmentIdentity&, const std::string& objectUuid,
-                                        const std::optional<int64_t>& version = std::nullopt);
+                                        const std::optional<int64_t>& version = std::nullopt,
+                                         const std::optional<std::string>& generation = std::nullopt);
     // Writes those files under `destination` (local to this process; names
     // are relative paths), each atomically and verified against the manifest.
     std::vector<ArtifactFile> materializeArtifacts(const AttachmentIdentity&, const std::string& objectUuid,
                                                    const std::filesystem::path& destination,
-                                                   const std::optional<int64_t>& version = std::nullopt);
+                                                   const std::optional<int64_t>& version = std::nullopt,
+                                                   const std::optional<std::string>& generation = std::nullopt);
     // One artifact as a local file, kept by content: <cacheDirectory>/<sha256>/
     // <file name of `name`>, written (verified) unless it is there. nullopt
     // when that version of the object has no artifact of that name.
     std::optional<std::filesystem::path> artifactFile(const AttachmentIdentity&, const std::string& objectUuid,
                                                       const std::string& name, const std::filesystem::path& cacheDirectory,
-                                                      const std::optional<int64_t>& version = std::nullopt);
+                                                      const std::optional<int64_t>& version = std::nullopt,
+                                                      const std::optional<std::string>& generation = std::nullopt);
     // Stores each (name, local file) durably, then names them in the object's
     // manifest (replacing entries of the same names) in one checked request
     // that expects `expectedVersion` of the object; returns its receipt. An

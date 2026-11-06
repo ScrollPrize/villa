@@ -715,25 +715,25 @@ void bindSessionOperations(nb::class_<vo::ObjectStoreSession> session)
             return toPy(revisions);
         }, nb::arg("attachment"), nb::arg("refs"))
         .def("artifacts", [=](Session& self, const vo::AttachmentIdentity& attachment, const std::string& uuid,
-                              const std::optional<int64_t>& version) {
+                              const std::optional<int64_t>& version, const std::optional<std::string>& generation) {
             std::vector<vo::ArtifactFile> files;
-            { nb::gil_scoped_release release; files = self.artifacts(attachment, uuid, version); }
+            { nb::gil_scoped_release release; files = self.artifacts(attachment, uuid, version, generation); }
             return filesPy(files);
-        }, nb::arg("attachment"), nb::arg("object_uuid"), nb::arg("version") = std::nullopt)
+        }, nb::arg("attachment"), nb::arg("object_uuid"), nb::arg("version") = std::nullopt, nb::arg("generation") = std::nullopt)
         .def("materialize_artifacts", [=](Session& self, const vo::AttachmentIdentity& attachment, const std::string& uuid,
-                                          const std::filesystem::path& destination, const std::optional<int64_t>& version) {
+                                          const std::filesystem::path& destination, const std::optional<int64_t>& version, const std::optional<std::string>& generation) {
             std::vector<vo::ArtifactFile> files;
-            { nb::gil_scoped_release release; files = self.materializeArtifacts(attachment, uuid, destination, version); }
+            { nb::gil_scoped_release release; files = self.materializeArtifacts(attachment, uuid, destination, version, generation); }
             return filesPy(files);
-        }, nb::arg("attachment"), nb::arg("object_uuid"), nb::arg("destination"), nb::arg("version") = std::nullopt)
+        }, nb::arg("attachment"), nb::arg("object_uuid"), nb::arg("destination"), nb::arg("version") = std::nullopt, nb::arg("generation") = std::nullopt)
         .def("artifact_file", [=](Session& self, const vo::AttachmentIdentity& attachment, const std::string& uuid,
                                   const std::string& name, const std::filesystem::path& cacheDirectory,
-                                  const std::optional<int64_t>& version) -> nb::object {
+                                  const std::optional<int64_t>& version, const std::optional<std::string>& generation) -> nb::object {
             std::optional<std::filesystem::path> path;
-            { nb::gil_scoped_release release; path = self.artifactFile(attachment, uuid, name, cacheDirectory, version); }
+            { nb::gil_scoped_release release; path = self.artifactFile(attachment, uuid, name, cacheDirectory, version, generation); }
             return path ? nb::cast(*path) : nb::none();
         }, nb::arg("attachment"), nb::arg("object_uuid"), nb::arg("name"), nb::arg("cache_directory"),
-           nb::arg("version") = std::nullopt,
+           nb::arg("version") = std::nullopt, nb::arg("generation") = std::nullopt,
            "One artifact as a local file under cache_directory/<sha256>/ (written unless there); None without it.")
         .def("publish_artifacts", [=](Session& self, const vo::AttachmentIdentity& attachment, const std::string& uuid,
                                       int64_t expectedVersion, const std::map<std::string, std::filesystem::path>& files,

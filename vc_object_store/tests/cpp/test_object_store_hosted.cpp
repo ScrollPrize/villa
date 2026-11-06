@@ -129,6 +129,37 @@ try {
     const auto created = both(create, "creation parity");
     require(created.commitSequence == 1 && created.objects.at(a) == 1, "hosted creation");
 
+    // Channel names are arbitrary UTF-8 strings, not URL path syntax.
+    {
+        const auto uuid = util::newUuid();
+        vc::geometry::Surface surface{2, 2, {1, 1}, {{1,1,1}, {2,1,1}, {1,2,1}, {2,2,1}}};
+        auto data = vc::geometry::encode(surface);
+        const std::vector<std::string> names{"ink prediction", "ink/score?x=1#part", "50%+ink", "ink%2Fscore", "墨", ".", ".."};
+        for (const auto& name : names) data.arrays.push_back({name, "|u1", {2,2}, {1,2,3,4}});
+        ObjectRecord record; record.uuid = uuid; record.kind = "surface";
+        // A separate store keeps the following parity/sequence checks unchanged.
+        const auto path = directory.path / "channels.vcobj";
+        std::string geometry;
+        {
+            auto db = ObjectStore::create(path, options);
+            auto txn = db.write();
+            db.upsertObject(txn, record);
+            geometry = db.putGeometry(txn, uuid, data);
+            txn.commit();
+        }
+        auto limits = serverOptions(); limits.maxResponseBytes = 2;
+        server::Server server(path, limits); server.start();
+        HostedStore client("http://127.0.0.1:" + std::to_string(server.port()));
+        for (const auto& name : names) {
+            try {
+                require(client.readGeometryArray(geometry, name) == std::vector<uint8_t>({1,2,3,4}),
+                        "hosted channel names survive URL encoding and ranged retries");
+            } catch (const std::exception& e) {
+                throw std::runtime_error("channel '" + name + "': " + e.what());
+            }
+        }
+    }
+
     // A lost reply: the identical request is answered by its receipt.
     const auto again = hosted.submit(create.hosted);
     require(again.replayed && sameReceipt(again, created), "hosted retry replays");

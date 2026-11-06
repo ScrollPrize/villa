@@ -3,6 +3,7 @@
 #include "TestSupport.hpp"
 #include "vc_object_store/objects/Artifacts.hpp"
 #include "vc_object_store/objects/ObjectStore.hpp"
+#include "vc_object_store/objects/ObjectStoreSession.hpp"
 #include "vc_object_store/objects/TransactionJson.hpp"
 
 #include <fstream>
@@ -130,6 +131,34 @@ try {
         require(inspect.artifactLength(hash) == model.size(), "read-only artifact read");
         writeFile(directory.path / "more", "more");
         mustFail([&] { (void)inspect.putArtifact(directory.path / "more"); });
+    }
+
+    // A reset changes the write lineage, not the generations of existing heads.
+    {
+        ObjectStoreSession session;
+        const auto attachment = session.attach(path, options);
+        const auto before = session.currentObject(attachment, object);
+        const auto oldPin = pinOf(attachment, *before, session.status(attachment).generation);
+        const auto generation = db.startHistoryGeneration("restored backup");
+        mustFail([&] { session.requireCurrent(oldPin); });
+        const auto reopened = pinOf(attachment, *session.currentObject(attachment, object), generation);
+        require(reopened.reference() == oldPin.reference() && reopened.writeGeneration != oldPin.writeGeneration,
+                "reopening preserves the historical reference and observes the new write generation");
+        session.requireCurrent(reopened);
+        require(session.artifacts(attachment, object, before->version, before->generation) ==
+                    std::vector<ArtifactFile>{files[1]}, "historical artifacts after reset");
+        mustFail([&] { (void)session.artifacts(attachment, object, before->version, generation); });
+        const auto receipt = session.publishArtifacts(attachment, object, before->version, {{"more.txt", directory.path / "more"}});
+        require(receipt.generation == generation && session.artifacts(attachment, object).size() == 2,
+                "publication preserves the old manifest across generations");
+        session.materializeArtifacts(attachment, object, directory.path / "old", before->version, before->generation);
+        require(std::filesystem::file_size(directory.path / "old/log.txt") == 8, "materialize old-generation artifacts");
+        require(session.artifactFile(attachment, object, "log.txt", directory.path / "cache", before->version,
+                                     before->generation).has_value(), "cache old-generation artifact");
+        bool conflict = false;
+        try { session.publishArtifacts(attachment, object, before->version, {}); }
+        catch (const TransactionConflict& e) { conflict = e.reason() == TransactionConflict::Reason::Version; }
+        require(conflict && session.artifacts(attachment, object).size() == 2, "stale artifact publisher cannot overwrite manifest");
     }
 
     std::cout << "object_store_artifacts: ok\n";

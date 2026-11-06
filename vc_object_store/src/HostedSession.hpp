@@ -88,6 +88,7 @@ private:
     // Advances with every head invalidation: a head read that started before
     // one is not cached.
     uint64_t invalidations_ = 0;
+    uint64_t transformInvalidations_ = 0;
 
     // Poller state.
     mutable std::mutex stateMutex_;

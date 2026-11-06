@@ -1,5 +1,6 @@
 """Numbered history, checked requests, artifacts and selection records from Python."""
 import uuid
+from pathlib import Path
 
 import pytest
 
@@ -68,3 +69,27 @@ def test_artifacts_named_by_manifest(db, tmp_path):
     with pytest.raises(Exception):
         db.submit(unheld)
     assert db.current_version(obj) == 2
+
+
+def test_session_artifacts_across_history_reset(db, db_path, tmp_path):
+    status = db.status()
+    obj, _, _ = create(db, "model", status)
+    session = vos.ObjectStoreSession()
+    attachment = session.attach(db_path, "pytest")
+    original = tmp_path / "original.bin"
+    original.write_bytes(b"old artifact")
+    first = session.publish_artifacts(attachment, obj, 1, {"original.bin": str(original)})
+    version, generation = first["objects"][obj], first["generation"]
+    db.start_history_generation("restored backup")
+    files = session.artifacts(attachment, obj, version=version, generation=generation)
+    assert [f["name"] for f in files] == ["original.bin"]
+    newer = tmp_path / "newer.bin"
+    newer.write_bytes(b"new artifact")
+    session.publish_artifacts(attachment, obj, version, {"newer.bin": str(newer)})
+    assert {f["name"] for f in session.artifacts(attachment, obj)} == {"original.bin", "newer.bin"}
+    output = tmp_path / "historical"
+    assert session.materialize_artifacts(attachment, obj, str(output), version=version, generation=generation) == files
+    assert (output / "original.bin").read_bytes() == original.read_bytes()
+    cached = session.artifact_file(attachment, obj, "original.bin", str(tmp_path / "cache"),
+                                   version=version, generation=generation)
+    assert Path(cached).read_bytes() == original.read_bytes()

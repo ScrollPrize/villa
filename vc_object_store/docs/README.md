@@ -210,7 +210,9 @@ records that earlier attachments do not hide. It reads further pages when some
 are hidden, so a short result means there are no more.
 
 Artifacts work the same way on every attachment. `artifacts(attachment, object,
-version)` lists an object version's manifest. `materializeArtifacts` writes those
+version, generation)` lists an object version's manifest (`generation` defaults
+to the active history). The optional generation also applies to
+`materializeArtifacts` and `artifactFile`, including their Python bindings. `materializeArtifacts` writes those
 files under a local directory, each one atomic and verified.
 `publishArtifacts(attachment, object, expectedVersion, files, author)` stores the
 bytes durably, then names them in the manifest in one checked request (an empty
@@ -330,8 +332,11 @@ operations of the corresponding store writes; `registerVolumeTransform`,
 `chooseVolumeTransform` and `importVolumeUmbilicus` submit them.
 `createSurfaceOperations` gives the operations that create a surface record
 and its geometry. Code holding an
-object keeps a `PinnedObject`: its version and history generation (`pinOf`),
-which requests expect.
+object keeps a `PinnedObject`, created by `pinOf(attachment, revision, activeGeneration)`.
+Its `generation` identifies the published version for historical reads;
+`writeGeneration` captures the active history when opened, which write requests
+expect. They can differ for unchanged heads after a history reset. Reopen such
+objects to edit them; edits opened before the reset still conflict.
 
 Writable opens hold a host-local ownership lock on `<canonical path>-owner`:
 shared between standalone writers, exclusive for `OpenOptions::serviceOwner`.

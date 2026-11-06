@@ -285,7 +285,7 @@ int main() try
     require(session.currentObject(replacement, named)->record.name == "renamed", "a copy can be named");
     {
         // Editing starts from the version on screen.
-        const auto pin = pinOf(replacement, *session.currentObject(replacement, named));
+        const auto pin = pinOf(replacement, *session.currentObject(replacement, named), session.status(replacement).generation);
         require(pin.stored() && pin.reference() == ObjectVersion{replacement.storeUuid, pin.generation, named, pin.version},
                 "pin of the current revision");
         session.requireCurrent(pin);
