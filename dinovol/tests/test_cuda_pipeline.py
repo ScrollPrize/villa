@@ -14,7 +14,7 @@ from vc_reader import transforms as A
 from torch.nn import functional as F
 
 from dinovol_2.dataset.cuda_pipeline import (
-    CropView, CudaBatchProcessor, CudaDataLoader, SpatialPlan, _prefetched, normalize_batch, point_pipeline,
+    CropView, BatchProcessor, BatchDataLoader, SpatialPlan, _prefetched, normalize_batch, point_pipeline,
     spatial_transforms,
 )
 from dinovol_2.dataset.ssl_zarr_dataset import SSLZarrDataset
@@ -55,7 +55,7 @@ class CudaPipelineTests(unittest.TestCase):
         normalized = (clipped - median) / (1.4826 * np.median(np.abs(clipped - median)))
         expected = F.interpolate(torch.from_numpy(normalized)[None, None], size=(12, 8, 20),
                                  mode='trilinear', align_corners=False)
-        actual = CudaBatchProcessor({})([CropView(torch.from_numpy(raw), (12, 8, 20))])
+        actual = BatchProcessor({})([CropView(torch.from_numpy(raw), (12, 8, 20))])
         self.assertTrue(actual.is_cuda)
         torch.testing.assert_close(actual.cpu(), expected, atol=2e-6, rtol=1e-5)
         for scheme in ('robust', 'minmax', 'zscore', 'none'):
@@ -76,7 +76,7 @@ class CudaPipelineTests(unittest.TestCase):
         for shape in ((8, 8, 8), (4, 8, 8), (4, 6, 8)):
             points = torch.cartesian_prod(*(torch.arange(n) for n in shape)).float()
             raw = torch.arange(int(np.prod(shape)), dtype=torch.float32).reshape(shape)
-            processor = CudaBatchProcessor({'normalization_scheme': 'none'})
+            processor = BatchProcessor({'normalization_scheme': 'none'})
             for _ in range(20):
                 planned = SpatialPlan(shape)(image=CropView(raw, shape), keypoints=points)
                 view = planned['image']
@@ -89,7 +89,7 @@ class CudaPipelineTests(unittest.TestCase):
         shape = (4,) * 3
         points = torch.cartesian_prod(*(torch.arange(n) for n in shape)).float()
         raw = torch.arange(64, dtype=torch.float32).reshape(shape)
-        processor = CudaBatchProcessor({'normalization_scheme': 'none'})
+        processor = BatchProcessor({'normalization_scheme': 'none'})
         seen = set()
         for order in itertools.permutations('zyx'):
             for flips in itertools.product((False, True), repeat=3):
@@ -102,7 +102,7 @@ class CudaPipelineTests(unittest.TestCase):
         self.assertEqual(len(seen), 48)
 
     def test_intensity_preserves_labels(self):
-        processor = CudaBatchProcessor({})
+        processor = BatchProcessor({})
         operations = [A.RicianNoise(std=2), *processor.scanner((16,) * 3), *processor.intensity((16,) * 3)]
         # Exercise every intensity effect, rather than relying on random selection.
         operations = [getattr(A, op._constructor.__name__)(*op._args, **{**op._kwargs, 'p': 1}) for op in operations]
@@ -121,7 +121,7 @@ class CudaPipelineTests(unittest.TestCase):
         self.assertTrue(torch.isfinite(result['image']).all())
 
     def test_full_augmentation_independent_of_batch_composition(self):
-        processor = CudaBatchProcessor({})  # full is the default recipe
+        processor = BatchProcessor({})  # full is the default recipe
         views = [CropView(torch.randint(256, (19,) * 3, dtype=torch.uint8), (16,) * 3,
                           seed=seed, augment=True) for seed in range(32)]
         together = processor(views)
@@ -134,7 +134,7 @@ class CudaPipelineTests(unittest.TestCase):
 
     def test_paired_views_and_local_batching(self):
         for recipe in ('full', 'dino'):
-            processor = CudaBatchProcessor({'augmentation': recipe}, collate())
+            processor = BatchProcessor({'augmentation': recipe}, collate())
             samples = []
             for _ in range(2):
                 globals_, teachers = [], []
@@ -179,7 +179,7 @@ class CudaPipelineTests(unittest.TestCase):
                                    points_per_object=8, max_objects=4))
             for workers in (0, 2):
                 dataset = SSLZarrDataset(copy.deepcopy(config), do_augmentations=True)
-                loader = CudaDataLoader(dataset, batch_size=2, num_workers=workers,
+                loader = BatchDataLoader(dataset, batch_size=2, num_workers=workers,
                     persistent_workers=bool(workers), pin_memory=True, collate_fn=collate())
                 try:
                     for result in loader:
@@ -196,14 +196,14 @@ class CudaPipelineTests(unittest.TestCase):
             config.update(num_local_crops=0, gram_teacher_crop_size=None, epoch_length=2)
             dataset = SSLZarrDataset(config)
             try:
-                result = next(iter(CudaDataLoader(dataset, batch_size=2, collate_fn=collate())))
+                result = next(iter(BatchDataLoader(dataset, batch_size=2, collate_fn=collate())))
                 self.assertTrue(result['collated_local_crops'].is_cuda)
                 self.assertEqual(len(result['collated_local_crops']), 0)
             finally:
                 dataset.close()
 
     def test_transform_oom_rebuilds_pipeline_and_retries(self):
-        processor = CudaBatchProcessor({})
+        processor = BatchProcessor({})
         view = CropView(torch.randint(0, 255, (8, 8, 8), dtype=torch.uint8), (8, 8, 8))
         expected = processor([view])
         key = next(k for k in processor.pipelines if k[0] == 'prepare')
@@ -246,7 +246,7 @@ class CudaPipelineTests(unittest.TestCase):
                         shape = dataset._sample_crop_shape(dataset.global_crop_scale, target)
                         self.assertEqual(shape[1], shape[2])
                         self.assertLessEqual(abs(shape[0] - shape[1] * target[0] / target[1]), .5)
-                loader = CudaDataLoader(dataset, batch_size=2, collate_fn=collate((4, 32, 32)))
+                loader = BatchDataLoader(dataset, batch_size=2, collate_fn=collate((4, 32, 32)))
                 for result in loader:
                     self.assertEqual(result['collated_global_crops'].shape, (4, 1, 4, 32, 32))
                     self.assertEqual(result['collated_local_crops'].shape, (4, 1, 4, 16, 16))
@@ -271,7 +271,7 @@ class CudaPipelineTests(unittest.TestCase):
                 augmentation='dino')
             dataset = SSLZarrDataset(config)
             try:
-                batch = next(iter(CudaDataLoader(dataset, batch_size=2, collate_fn=collate_multicrop_batch)))
+                batch = next(iter(BatchDataLoader(dataset, batch_size=2, collate_fn=collate_multicrop_batch)))
                 self.assertEqual(batch['collated_global_crops'].shape, (6,1,16,16,16))
                 self.assertEqual(batch['collated_local_crops'].shape, (2,1,8,8,8))
                 self.assertNotIn('collated_masks', batch)
@@ -328,9 +328,16 @@ class CudaPipelineTests(unittest.TestCase):
         torch.testing.assert_close(padded[:, :5, :7, :9], image)
         self.assertEqual(float(padded[0, -1, -1, -1]), 1.)
 
-    def test_cuda_required(self):
-        with self.assertRaisesRegex(ValueError, 'requires CUDA'):
-            CudaBatchProcessor({}, device='cpu')
+    def test_cpu_backend_matches_cuda(self):
+        # The same native plans run per view on CPU; image arithmetic agrees within tolerance.
+        raw = torch.from_numpy(np.random.default_rng(3).integers(0, 255, (12, 8, 20), dtype=np.uint8))
+        views = lambda: [CropView(raw.clone(), (12, 8, 20), (('transpose', 'zxy'), ('flip', 'zy')), seed=5)]
+        cuda = BatchProcessor({})(views()).cpu()
+        cpu = BatchProcessor({}, device='cpu')(views())
+        self.assertEqual(cpu.device.type, 'cpu')
+        torch.testing.assert_close(cpu, cuda, rtol=1e-4, atol=1e-4)
+        with self.assertRaisesRegex(ValueError, 'CPU or CUDA'):
+            BatchProcessor({}, device='meta')
 
 
 @unittest.skipUnless(torch.cuda.is_available(), 'GPU prefetch needs CUDA')
@@ -390,7 +397,7 @@ class GpuPrefetchTests(unittest.TestCase):
                     random.seed(0)
                     np.random.seed(0)
                     torch.manual_seed(0)
-                    loader = CudaDataLoader(dataset, batch_size=2, collate_fn=collate_multicrop_batch,
+                    loader = BatchDataLoader(dataset, batch_size=2, collate_fn=collate_multicrop_batch,
                                             gpu_prefetch=prefetch)
                     results.append([{k: v.clone() for k, v in b.items() if isinstance(v, torch.Tensor)} for b in loader])
                 finally:

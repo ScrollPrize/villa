@@ -97,7 +97,7 @@ class RotatedWindowTests(unittest.TestCase):
             dataset.close()
 
     def test_rotated_samples_through_the_loader(self):
-        from dinovol_2.dataset.cuda_pipeline import CudaDataLoader
+        from dinovol_2.dataset.cuda_pipeline import BatchDataLoader
         dataset = SSLZarrDataset(copy.deepcopy(self.config), do_augmentations=True)
         try:
             plans = [dataset._draw_source_plan(0.0) for _ in range(20)]
@@ -105,7 +105,7 @@ class RotatedWindowTests(unittest.TestCase):
             for plan in plans:
                 np.testing.assert_allclose(plan.axes @ plan.axes.T, np.eye(3), atol=1e-6)
                 self.assertAlmostEqual(float(np.linalg.det(plan.axes)), 1.0, places=6)
-            for result in CudaDataLoader(dataset, batch_size=2, collate_fn=collate((4, 16, 16))):
+            for result in BatchDataLoader(dataset, batch_size=2, collate_fn=collate((4, 16, 16))):
                 self.assertEqual(tuple(result["collated_global_crops"].shape), (4, 1, 4, 16, 16))
                 self.assertEqual(tuple(result["collated_local_crops"].shape), (4, 1, 4, 8, 8))
                 self.assertTrue(torch.isfinite(result["global_token_targets"]).all())

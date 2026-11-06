@@ -1,4 +1,4 @@
-"""Worker crop plans and batched, device-resident image processing with vc_reader."""
+"""Worker crop plans and batched image processing with vc_reader on CPU or CUDA."""
 from collections import defaultdict, OrderedDict
 from dataclasses import dataclass
 from itertools import permutations
@@ -110,22 +110,30 @@ def crop_collate(samples):
     return samples
 
 
-class CudaBatchProcessor:
+class BatchProcessor:
+    """Run native vc_reader pipelines on the device's backend: batched on CUDA, per view on CPU.
+
+    Every view carries its own seed, so a view's output does not depend on the other
+    views processed with it (alone, reordered or in chunks give the same result).
+    """
     def __init__(self, config, collate=None, *, device="cuda"):
         self.config, self.collate, self.device = dict(config), collate, torch.device(device)
-        if self.device.type != "cuda":
-            raise ValueError("Dinovol image processing requires CUDA")
+        if self.device.type not in ("cuda", "cpu"):
+            raise ValueError(f"Dinovol image processing runs on CPU or CUDA, got {self.device}")
+        self.backend = self.device.type
         self.A = A
         self.pipelines = OrderedDict()
-        # Fail before starting workers if vc_reader was built without CUDA.
+        # Fail before starting workers if vc_reader was built without the backend.
         self.pipeline(("normalize",), lambda: normalization_transforms(
             self.config.get("normalization_scheme", "robust"), self.config.get("intensity_properties")))
-        self.device_index = self.device.index if self.device.index is not None else torch.cuda.current_device()
+        self.device_index = None
+        if self.backend == "cuda":
+            self.device_index = self.device.index if self.device.index is not None else torch.cuda.current_device()
 
     def pipeline(self, key, operations, *, targets=None):
         if key not in self.pipelines:
             self.pipelines[key] = A.Pipeline(operations(), targets=targets or {"image": A.Image(valid=None)},
-                                             backend="cuda", compact=False)
+                                             backend=self.backend, compact=False)
             # Crop shapes and geometry can vary indefinitely; bound native plan retention.
             if len(self.pipelines) > 256:
                 self.pipelines.popitem(last=False)
@@ -133,8 +141,17 @@ class CudaBatchProcessor:
         return self.pipelines[key]
 
     def batch(self, pipeline, images, entries, offset=0):
-        inputs = {"image": _image_dtype(images, self.device)}
         seeds = [e[2].seed + offset for e in entries]
+        return self.run(pipeline, images, seeds)
+
+    def run(self, pipeline, images, seeds):
+        """Apply `pipeline` to (B, C, ...) images with one seed per image."""
+        if self.backend == "cpu":
+            if images.dtype not in (torch.uint8, torch.float32):
+                images = images.float()
+            outputs = [pipeline({"image": image}, seed=int(seed))["image"] for image, seed in zip(images, seeds)]
+            return torch.stack([torch.as_tensor(output) for output in outputs])
+        inputs = {"image": _image_dtype(images, self.device)}
         try:
             return pipeline.batch(inputs, seeds=seeds, device=self.device)["image"]
         except RuntimeError as exc:
@@ -168,38 +185,44 @@ class CudaBatchProcessor:
                 A.SliceIllumination(axis="z", defects=(1, 3), width=(depth / 12, depth / 4),
                     reduction=(.75, 1.1), base_p=(.1, .2), base_reduction=(.9, 1), p=.15)]
 
-    def intensity(self, target):
+    def intensity_recipe(self, target):
+        """Named per-view intensity operations of the configured augmentation recipe."""
         A = self.A
         # Length scales follow the view's largest extent (its plane, for slab views).
         size = max(target)
         if self.config.get("augmentation", "full") == "dino":
-            return [A.OneOf([
+            return [("OneOf", A.OneOf([
                 A.Contrast(factor=A.BalancedContrast(.75, 1.25), preserve_range=True, p=.3, p_channel=.5),
-                A.BrightnessMultiply(factor=A.BalancedContrast(.75, 1.25), p=.3, p_channel=.5)]),
-                A.BrightnessAdd(shift=A.Normal(0, .5), p=.1, p_channel=.5)]
+                A.BrightnessMultiply(factor=A.BalancedContrast(.75, 1.25), p=.3, p_channel=.5)])),
+                ("BrightnessAdd", A.BrightnessAdd(shift=A.Normal(0, .5), p=.1, p_channel=.5))]
         # Probabilities apply once per view; every channel participates when selected.
         local_scale = (size / 6, size / 2)
         return [
-            A.BiasField(std=(.05, .2), scale=.025, p=.15),
-            A.BrightnessGradient(scale=local_scale, loc=(-.5, 1.5), strength=.25,
-                                 mean_centered=True, clip=False, p=.15),
-            A.PlasmaBrightnessContrast(brightness=(-.1, .1), contrast=(0, .15), p=.10),
-            A.Vignetting(strength=(.1, .3), radius=.8, p=.10),
-            A.CLAHE(clip_limit=(1.5, 2.5), tile_shape=tuple(max(4, extent // 4) for extent in target), bins=256, p=.10),
-            A.Contrast(factor=A.BalancedContrast(.8, 1.2), preserve_range=True, p=.25),
-            A.LocalContrast(scale=local_scale, loc=(-.5, 1.5), factor=(.8, 1.2), p=.15),
-            A.Gamma(gamma=A.BalancedContrast(.8, 1.25), p_retain_stats=1, p=.25),
-            A.LocalGamma(scale=local_scale, loc=(-.5, 1.5), gamma=(.8, 1.25), p=.15),
-            A.GaussianBlur(sigma=(.3, .8), shared_axes=False, p=.08),
-            A.Defocus(radius=(1, 2), p=.05),
-            A.MedianFilter(size=3, p=.05),
-            A.LowResolution(scale=(.6, 1), shared_axes=True, p=.10),
-            A.GibbsRinging(cutoff=(.75, .95), p=.08),
-            A.Sharpen(strength=(.1, .4), p_clamp=1, p=.10),
-            A.UnsharpMask(strength=(.1, .3), sigma=(.5, 1), p=.10),
-            A.BrightnessAdd(shift=A.Normal(0, .15), p=.15),
-            A.Invert(p=.15),
+            ("BiasField", A.BiasField(std=(.05, .2), scale=.025, p=.15)),
+            ("BrightnessGradient", A.BrightnessGradient(scale=local_scale, loc=(-.5, 1.5), strength=.25,
+                                                        mean_centered=True, clip=False, p=.15)),
+            ("PlasmaBrightnessContrast", A.PlasmaBrightnessContrast(brightness=(-.1, .1), contrast=(0, .15), p=.10)),
+            ("Vignetting", A.Vignetting(strength=(.1, .3), radius=.8, p=.10)),
+            ("CLAHE", A.CLAHE(clip_limit=(1.5, 2.5), tile_shape=tuple(max(4, extent // 4) for extent in target),
+                              bins=256, p=.10)),
+            ("Contrast", A.Contrast(factor=A.BalancedContrast(.8, 1.2), preserve_range=True, p=.25)),
+            ("LocalContrast", A.LocalContrast(scale=local_scale, loc=(-.5, 1.5), factor=(.8, 1.2), p=.15)),
+            ("Gamma", A.Gamma(gamma=A.BalancedContrast(.8, 1.25), p_retain_stats=1, p=.25)),
+            ("LocalGamma", A.LocalGamma(scale=local_scale, loc=(-.5, 1.5), gamma=(.8, 1.25), p=.15)),
+            ("GaussianBlur", A.GaussianBlur(sigma=(.3, .8), shared_axes=False, p=.08)),
+            ("Defocus", A.Defocus(radius=(1, 2), p=.05)),
+            ("MedianFilter", A.MedianFilter(size=3, p=.05)),
+            ("LowResolution", A.LowResolution(scale=(.6, 1), shared_axes=True, p=.10)),
+            ("GibbsRinging", A.GibbsRinging(cutoff=(.75, .95), p=.08)),
+            ("Sharpen", A.Sharpen(strength=(.1, .4), p_clamp=1, p=.10)),
+            ("UnsharpMask", A.UnsharpMask(strength=(.1, .3), sigma=(.5, 1), p=.10)),
+            ("BrightnessAdd", A.BrightnessAdd(shift=A.Normal(0, .15), p=.15)),
+            ("Invert", A.Invert(p=.15)),
         ]
+
+    def intensity(self, target, exclude=()):
+        exclude = set(exclude)
+        return [operation for name, operation in self.intensity_recipe(target) if name not in exclude]
 
     def __call__(self, samples):
         single = isinstance(samples[0], CropView)
@@ -244,17 +267,20 @@ class CudaBatchProcessor:
         return self.collate(samples) if self.collate is not None else samples
 
 
-class CudaDataLoader(DataLoader):
-    """Read ahead on CPU, deliver fully processed CUDA batches on the rank's device.
+class BatchDataLoader(DataLoader):
+    """Read ahead on CPU workers, deliver fully processed batches on the rank's device.
 
     gpu_prefetch processes the next batch in a background thread on a side CUDA stream, so
     its host work and uploads overlap the consumer's compute. Batches are unchanged and in
     order: vc_reader augmentation is seeded per view, and the collate's global ``random``
     draws (iBOT masks) all happen on that one thread.
     """
-    def __init__(self, dataset, *, collate_fn=None, device="cuda", gpu_prefetch=False, **kwargs):
-        self.processor = CudaBatchProcessor(dataset.config, collate_fn, device=device)
+    def __init__(self, dataset, *, collate_fn=None, device="cuda", gpu_prefetch=False, processor=None, **kwargs):
+        self.processor = processor if processor is not None else BatchProcessor(dataset.config, collate_fn,
+                                                                                device=device)
         self.gpu_prefetch = bool(gpu_prefetch)
+        if self.gpu_prefetch and self.processor.device.type != "cuda":
+            raise ValueError("gpu_prefetch requires a CUDA device")
         if kwargs.get("num_workers", 0):
             kwargs.setdefault("multiprocessing_context", "spawn")
         super().__init__(dataset, collate_fn=crop_collate, **kwargs)
