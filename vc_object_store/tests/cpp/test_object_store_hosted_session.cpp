@@ -6,6 +6,7 @@
 // drafts like local ones; a lost feed position is a revalidation; an
 // unreachable host keeps cached data and reports the failure.
 #include "vc_object_store/objects/VolumeTransforms.hpp"
+#include "vc_object_store/objects/VolumeUmbilicus.hpp"
 #include "vc_object_store/objects/AttachedDocument.hpp"
 #include "vc_object_store/objects/Project.hpp"
 #include "TestSupport.hpp"
@@ -597,6 +598,39 @@ try {
         writeVolumeCollections(session, hosted, {target, 1}, shown, {});
         require(read().front().points.points.front() == vc::geometry::Point{20, 20, 20},
                 "collection saves correctly after refreshing the mapping");
+    }
+
+    // Two imports prepared before either commits must not create two live
+    // umbilici for a volume. Exercise the same request over both backends.
+    for (const auto& attachment : {local, hosted}) {
+        const auto target = util::newUuid();
+        ObjectRecord first; first.uuid = util::newUuid(); first.kind = "umbilicus";
+        first.meta = nlohmann::json{{"coordinates", volumeCoordinates(target, 1)}}.dump();
+        auto second = first; second.uuid = util::newUuid();
+        const vc::geometry::Umbilicus geometry{{{1, 2, 3}, {4, 5, 6}}};
+        auto prepare = [&](const ObjectRecord& record) {
+            auto pending = session.newRequest(attachment);
+            session.readStore(attachment, [&](const StoreReader& reader, const auto&) {
+                setVolumeUmbilicusRequest(reader, pending, target, record, geometry);
+            });
+            return pending;
+        };
+        const auto a = prepare(first), b = prepare(second);
+        session.submit(attachment, a);
+        bool conflicted = false;
+        try { session.submit(attachment, b); }
+        catch (const TransactionConflict& conflict) {
+            conflicted = conflict.reason() == TransactionConflict::Reason::CommitSequence;
+        }
+        require(conflicted, "an import based on an empty selection must reject an intervening import");
+        const auto selected = volumeUmbilicus(session, attachment, {target, 1});
+        require(selected && selected->uuid == first.uuid && selected->points == geometry.points,
+                "a rejected import leaves one readable umbilicus");
+        require(!session.currentObject(attachment, second.uuid), "a rejected import creates nothing");
+        session.submit(attachment, prepare(second));
+        const auto replaced = volumeUmbilicus(session, attachment, {target, 1});
+        require(replaced && replaced->uuid == second.uuid && replaced->points == geometry.points,
+                "rebuilding the import replaces the first umbilicus");
     }
 
     // Detaching stops the poller: nothing arrives after Detached.

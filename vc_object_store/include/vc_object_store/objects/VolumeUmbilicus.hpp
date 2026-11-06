@@ -28,7 +28,9 @@ std::optional<VolumeUmbilicus> volumeUmbilicus(ObjectStoreSession&, const Attach
 std::string setVolumeUmbilicus(ObjectStore&, WriteTxn&, const std::string& volume, ObjectRecord record,
                                const geometry::Umbilicus& geometry);
 // The same as a checked request read through `reader`: expects the umbilici it
-// retires at their current versions and record.uuid (required) absent.
+// retires at their current versions and record.uuid (required) absent. Guards
+// the commit sequence before selecting, unless the request already has a guard;
+// rebuild the request after a conflicting commit.
 void setVolumeUmbilicusRequest(const StoreReader&, TransactionRequest&, const std::string& volume,
                                const ObjectRecord& record, const geometry::Umbilicus& geometry);
 }

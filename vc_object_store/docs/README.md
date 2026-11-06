@@ -330,6 +330,9 @@ recorded, and the session's `editCurrent(attachment, uuids, operations)` and
 `volumeTransformChoiceRecord` and `setVolumeUmbilicusRequest` give the
 operations of the corresponding store writes; `registerVolumeTransform`,
 `chooseVolumeTransform` and `importVolumeUmbilicus` submit them.
+Umbilicus imports guard the commit sequence before selecting the umbilici to
+replace, including when none exist. An intervening commit conflicts; rebuild
+the request from a fresh read before retrying.
 `createSurfaceOperations` gives the operations that create a surface record
 and its geometry. Code holding an
 object keeps a `PinnedObject`, created by `pinOf(attachment, revision, activeGeneration)`.

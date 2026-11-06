@@ -70,6 +70,10 @@ void setVolumeUmbilicusRequest(const StoreReader& reader, TransactionRequest& re
                                const ObjectRecord& record, const geometry::Umbilicus& geometry)
 {
     if (record.uuid.empty()) throw std::invalid_argument("setVolumeUmbilicusRequest needs the record's UUID");
+    // Guard before reading: new umbilici or registrations can change the
+    // selection without changing any of the object versions it returns.
+    // Preserve an earlier guard if this request already depends on a snapshot.
+    if (!request.expectedCommitSequence) request.expectedCommitSequence = reader.status().commitSequence;
     requireUmbilicusFor(reader.volumeTransforms(), record, volume);
     for (const auto& existing : volumeUmbilici(reader, volume)) {
         request.expectedObjects[existing.uuid] = existing.version;
