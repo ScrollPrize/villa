@@ -14723,7 +14723,7 @@ std::vector<LineAnnotationController::StoredFiber> LineAnnotationController::rea
                         fiber.optimizationMode = vc3d::line_annotation::fiberOptimizationModeFromString(object.fiber->optimizationMode);
                     if (object.fiber->manualFamily) fiber.manualHvTag = object.fiber->family;
                 }
-                const auto attributes = nlohmann::json::parse(reader.geometryPointAnnotations(*head.geometryRevision, "control_points"));
+                const auto attributes = reader.geometryPointAnnotations(*head.geometryRevision, "control_points");
                 for (size_t i = 0; i < geometry.controlPoints.size(); ++i) {
                     auto entry = attributes.at(i);
                     if (entry.is_null()) entry = nlohmann::json::object();
@@ -14761,12 +14761,13 @@ std::vector<LineAnnotationController::StoredFiber> LineAnnotationController::rea
         // version), read in batches: one listing, then the versions it names.
         std::vector<ObjectRevision> objects;
         std::set<std::string> requested;
+        const auto state = reader.status();
         auto heads = [&](ObjectSelection selection) {
             selection.kind = "fiber";
             std::vector<ObjectVersion> references;
             for (const auto& record : reader.selectObjects(selection, std::vector<std::string>{})) {
                 if (!record.version) throw std::runtime_error("Fiber listing without versions");
-                references.push_back({reader.status().storeUuid, record.versionGeneration, record.uuid, *record.version});
+                references.push_back({state.storeUuid, record.versionGeneration, record.uuid, *record.version});
             }
             std::map<std::string, ObjectRevision> result;
             if (references.empty()) return result;
@@ -14804,7 +14805,6 @@ std::vector<LineAnnotationController::StoredFiber> LineAnnotationController::rea
         std::vector<ObjectVersion> versions;
         std::vector<StoredFiber> decoded;
         std::unordered_map<std::string, size_t> byUuid;
-        const auto state = reader.status();
         for (const auto& head : objects) {
             if (cancel.load()) throw std::runtime_error("Object store read cancelled");
             versions.push_back({state.storeUuid, head.generation, head.objectUuid, head.version});

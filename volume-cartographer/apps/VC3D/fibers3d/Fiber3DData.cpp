@@ -226,7 +226,7 @@ Scene loadStore(const StoreSource& source, const QueryOptions& options, const st
                     styleRange(fiber, a, b, SpanStyle::InferredGap);
                 }
                 const auto controls = canonical.controlPoints(0, nc);
-                auto attrs = Json::parse(reader.geometryPointAnnotations(canonical.revision().uuid, "control_points"));
+                auto attrs = reader.geometryPointAnnotations(canonical.revision().uuid, "control_points");
                 const auto attrBytes = attrs.dump().size();
                 const size_t overhead = sizeof(Fiber) + size_t(nc) * (3 * sizeof(Marker) + 2 * sizeof(std::optional<cv::Vec3d>)) +
                                         fiber.runs.size() * sizeof(Run) + size_t(n) * sizeof(SpanStyle) + attrBytes;
