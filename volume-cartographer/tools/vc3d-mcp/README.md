@@ -220,8 +220,11 @@ Tool names use a `vc3d_` prefix and snake_case. The surface includes:
 - project creation and Save As, attached volumes, normal grids, Lasagna
   datasets and umbilici, store attachment and routing, and the Open Data
   catalog;
-- viewer navigation, screenshots, render settings, and volume overlays;
-- segment loading, growth, editing, refinement, and review;
+- viewer navigation, mouse, keyboard and wheel input, workspaces,
+  screenshots, render settings, volume overlays, and the ink detection
+  overlay;
+- segment loading, growth, editing, editing settings, refinement, transforms,
+  exports, neighbor copy, merge and patch, and review;
 - points, tags, winding annotations, seeding, and push/pull;
 - fiber annotation and Lasagna workflows;
 - importing tifxyz surfaces, fibers and point collections into the project's
@@ -373,6 +376,18 @@ propagates.
 
 Only asynchronous tools expose `wait`; check the generated input schema to see
 whether a tool supports it.
+
+### Seeing the result of an action
+
+The interaction tools (click, drag, key, wheel, center, zoom, rotate, and
+workspace switch) accept `observe`: `state` adds a JSON Patch diff of
+`vc3d_get_state` from just before to just after the call to the result. Their
+results stay plain JSON objects with the same output schema; `observe`
+defaults to `none`, which returns them unchanged. `vc3d_observe` shows what
+changed since the last observation, including changes a person made in the
+GUI, and with `mode` `screenshot` or `both` also returns an image.
+Observation bookkeeping belongs to the server process, which serves one MCP
+client over stdio.
 
 ## Development
 

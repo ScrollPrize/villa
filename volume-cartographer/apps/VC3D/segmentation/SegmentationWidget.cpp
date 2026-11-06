@@ -125,6 +125,9 @@ void SegmentationWidget::buildUi()
             this, &SegmentationWidget::growthMethodChanged);
     connect(_growthPanel, &SegmentationGrowthPanel::growthMethodChanged,
             this, &SegmentationWidget::syncUiState);
+    connect(_growthPanel, &SegmentationGrowthPanel::growthMethodChanged,
+            this, &SegmentationWidget::noteGrowthMethod);
+    noteGrowthMethod(_growthPanel->growthMethod());
     connect(_growthPanel, &SegmentationGrowthPanel::volumeSelectionChanged,
             this, &SegmentationWidget::volumeSelectionChanged);
     connect(_growthPanel, &SegmentationGrowthPanel::correctionsZRangeChanged,
@@ -336,11 +339,19 @@ ManualAddTool::InterpolationMode SegmentationWidget::setManualAddInterpolationMo
 }
 std::vector<SegmentationGrowthDirection> SegmentationWidget::allowedGrowthDirections() const { return _growthPanel->allowedGrowthDirections(); }
 std::optional<std::pair<int, int>> SegmentationWidget::correctionsZRange() const { return _growthPanel->correctionsZRange(); }
+std::pair<int, int> SegmentationWidget::correctionsZBounds() const { return _growthPanel->correctionsZBounds(); }
 
 void SegmentationWidget::setGrowthMethod(SegmentationGrowthMethod method)
 {
     if (_manualAddBusy) return;
     _growthPanel->setGrowthMethod(method);
+}
+
+void SegmentationWidget::noteGrowthMethod(SegmentationGrowthMethod method)
+{
+    if (!isManualGrowthMethod(method)) {
+        _lastNonManualGrowthMethod = method;
+    }
 }
 void SegmentationWidget::setManualAddBusy(bool busy)
 {
@@ -357,6 +368,10 @@ void SegmentationWidget::setManualAddActive(bool active)
     syncUiState();
 }
 void SegmentationWidget::setGrowthSteps(int steps, bool persist) { _growthPanel->setGrowthSteps(steps, persist); }
+void SegmentationWidget::setGrowthScale(int scale) { _growthPanel->setGrowthScale(scale); }
+void SegmentationWidget::setCorrectionsZRange(bool enabled, int zMin, int zMax) { _growthPanel->setCorrectionsZRange(enabled, zMin, zMax); }
+void SegmentationWidget::setAllowedGrowthDirections(const std::vector<SegmentationGrowthDirection>& directions) { _growthPanel->setAllowedGrowthDirections(directions); }
+bool SegmentationWidget::selectGrowthVolume(const QString& volumeId) { return _growthPanel->selectGrowthVolume(volumeId); }
 void SegmentationWidget::setGrowthInProgress(bool running)
 {
     if (_growthInProgress == running) {

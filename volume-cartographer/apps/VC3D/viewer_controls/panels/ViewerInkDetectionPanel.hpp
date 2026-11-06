@@ -18,6 +18,8 @@ public:
 private:
     void populateDetections();
     void populateColormaps();
+    void syncSelection();
+    void syncColormap(const QString& colormapId);
     void updateControlState();
 
     ViewerManager* _viewerManager{nullptr};
