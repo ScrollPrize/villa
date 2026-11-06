@@ -1,6 +1,7 @@
 {
 	"args": {
-		"model-init": "model"
+		"model-init": "model",
+		"tifxyz-flow-gate-channels": true
 	},
 	"base": {
 		"normal": 1.0,
@@ -14,8 +15,7 @@
 		"pred_dt": 0.001,
 		"corr": 0.001,
 		"bend": 100.0,
-		"ext_offset": 0.0,
-		"tifxyz-flow-gate-channels": true
+		"ext_offset": 0.0
 	},
 	"stages": [
 		{
@@ -23,7 +23,9 @@
 			"steps": 1000,
 			"min_scaledown": 0,
 			"lr": 1.0,
-			"params": ["mesh_ms"],
+			"params": [
+				"mesh_ms"
+			],
 			"args": {
 				"status_interval": 10,
 				"pred_dt_flow_gate": {
@@ -39,7 +41,11 @@
 						"inlier_zero": 80.0,
 						"inlier_one": 120.0,
 						"loss_weight": 2.0,
-						"_debug_roi_center_xyz": [17499, 13412, 51144],
+						"_debug_roi_center_xyz": [
+							17499,
+							13412,
+							51144
+						],
 						"debug_roi_k": 8,
 						"debug_roi_root_min": 0.5,
 						"debug_roi_tip_max": 0.5,
