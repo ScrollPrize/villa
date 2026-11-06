@@ -45,4 +45,15 @@ inline std::uint64_t pool_release_threshold(int device) {
     pool_check(cudaMemPoolGetAttribute(default_pool(device), cudaMemPoolAttrReleaseThreshold, &bytes));
     return bytes == 1 ? 0 : bytes;
 }
+// Bytes reserved by and used from device's default pool, currently and at their peak.
+struct PoolStats { std::uint64_t reserved, reserved_high, used, used_high; };
+inline PoolStats pool_stats(int device) {
+    PoolStats stats{};
+    auto pool = default_pool(device);
+    pool_check(cudaMemPoolGetAttribute(pool, cudaMemPoolAttrReservedMemCurrent, &stats.reserved));
+    pool_check(cudaMemPoolGetAttribute(pool, cudaMemPoolAttrReservedMemHigh, &stats.reserved_high));
+    pool_check(cudaMemPoolGetAttribute(pool, cudaMemPoolAttrUsedMemCurrent, &stats.used));
+    pool_check(cudaMemPoolGetAttribute(pool, cudaMemPoolAttrUsedMemHigh, &stats.used_high));
+    return stats;
+}
 }

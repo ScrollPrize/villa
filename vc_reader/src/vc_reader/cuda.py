@@ -125,6 +125,15 @@ def pool_release_threshold(*, device=0):
     return _reader._pool_release_threshold(int(device))
 
 
+def pool_stats(*, device=0):
+    """Bytes reserved by and used from the device's default pool, currently and at their peak.
+
+    Keys: ``reserved``, ``reserved_high``, ``used``, ``used_high``. The pool is shared
+    with every stream-ordered allocation in the process, transform scratch included.
+    """
+    return dict(_reader._pool_stats(int(device)))
+
+
 def is_device_array(value):
     """True for DeviceArray or any CUDA DLPack producer (e.g. a CUDA torch tensor)."""
     if isinstance(value, DeviceArray):

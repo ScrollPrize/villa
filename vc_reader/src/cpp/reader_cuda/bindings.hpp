@@ -39,6 +39,11 @@ inline void bind(nb::module_& m) {
     m.def("_dlpack_stream",[] { return device::dlpack_handle(); });
     m.def("_set_pool_release_threshold",[](int id,std::uint64_t bytes) { device::set_pool_release_threshold(id,bytes); });
     m.def("_pool_release_threshold",[](int id) { device::prepare_pool(id); return device::pool_release_threshold(id); });
+    m.def("_pool_stats",[](int id) {
+        const auto s=device::pool_stats(id);
+        nb::dict d; d["reserved"]=s.reserved; d["reserved_high"]=s.reserved_high; d["used"]=s.used; d["used_high"]=s.used_high;
+        return d;
+    });
     m.def("_cuda_empty",[](std::size_t count,const std::string& kind,std::size_t item,int id) {
         if (count>SIZE_MAX/8 || (kind!="f" && kind!="i" && kind!="u" && kind!="b") ||
             (item!=1 && item!=2 && item!=4 && item!=8) || (kind=="b" && item!=1) || (kind=="f" && item<2))
