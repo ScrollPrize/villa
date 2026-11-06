@@ -237,3 +237,13 @@ def test_real_scroll_structure_and_normalization():
         expected_grad, = torch.autograd.grad(expected.square().mean(), image)
         actual_grad, = torch.autograd.grad(result.square().mean(), image)
         torch.testing.assert_close(actual_grad, expected_grad, atol=.001, rtol=1e-4)
+
+
+def test_balanced_contrast_moves_both_ways_within_its_bounds():
+    image = np.ones((1, 4, 4), np.float32)
+    pipeline = A.Pipeline([A.BrightnessMultiply(factor=A.BalancedContrast(.5, 2.))])
+    factors = np.array([pipeline({"image": image}, seed=seed)["image"][0, 0, 0] for seed in range(400)])
+    assert ((factors >= .5) & (factors <= 2.)).all()
+    assert .35 < (factors < 1).mean() < .65
+    with pytest.raises(ValueError, match="bracket one"):
+        A.Pipeline([A.BrightnessMultiply(factor=A.BalancedContrast(1.2, 2.))])({"image": image}, seed=0)
