@@ -3,14 +3,14 @@
     "attention_type": "full",
     "attention_backend": "flash",
     "global_crops_size": [
-      256,
-      256,
-      256
+      160,
+      160,
+      160
     ],
     "local_crops_size": [
-      144,
-      144,
-      144
+      88,
+      88,
+      88
     ],
     "embed_dim": 512,
     "patch_size": [
@@ -106,9 +106,9 @@
     "regularizer_warmup_steps": 12500,
     "views": {
       "source_size": 512,
-      "teacher_size": 256,
-      "global_size": 256,
-      "local_size": 144,
+      "teacher_size": 160,
+      "global_size": 160,
+      "local_size": 88,
       "locals_per_set": 4,
       "min_overlap_fraction": 0.1,
       "min_overlap_count": 2

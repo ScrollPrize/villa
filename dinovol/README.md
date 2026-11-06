@@ -1223,7 +1223,7 @@ no gradient accumulation. The peak LR is resolved once from the global batch by
 `optimizer.lr_scaling` (`3e-4 * sqrt(48/64)`).
 
 **Views.** Each independent source yields two view sets of one teacher global,
-one student global and four student locals (256³ / 144³ voxels, 8³ token cells)
+one student global and four student locals (160³ / 88³ voxels, 8³ token cells)
 at the level's native spacing, with no resizing, zoom or aspect change. vc_reader
 (`views.plan_view_sets`) places all crops on the 512³ window's patch lattice and
 accepts a student only when at least 10% of its tokens (and two) overlap its own
@@ -1271,16 +1271,24 @@ average is the exact first-order gradient of the full-batch objective. Only the 
 chunk's backward synchronizes DDP. The logged `global_collapse_loss` is the true
 objective; `surrogate_value` only carries gradients. `batch_storage: "host"` keeps
 processed crops (in the autocast dtype) in pinned host memory between passes.
-Each loader worker assembles a whole 48-source batch (about 4.4 GB of raw crops in
-`/dev/shm`), so the recipe uses 4 workers with `prefetch_factor: 1`; a step takes
-minutes, which leaves the loader far ahead.
+Each loader worker assembles a whole 48-source batch (about 1 GB of raw crops in
+`/dev/shm` at 160³ / 88³), so the recipe uses 4 workers with `prefetch_factor: 1`.
 
-Measured on one RTX 5090 (recipe as configured, real 8–9 µm volumes, BF16, one
-source per chunk, three steps): 167–176 s per 48-source update (about 3.5 s per
-source for both passes), plus 12–16 s of parent-side view processing per batch;
-peak 21.6 GiB allocated / 22.4 GiB reserved. Each position's marginal pooled 96
-global / 384 local vectors from 48 sources. A 500k-update run therefore needs
-multi-GPU DDP (`data.batch_size` = 48 / world size).
+Measured on one RTX 5090 (real 8–9 µm volumes, BF16, three steps each):
+
+| Crops (teacher/global / local) | Sources per chunk | Time per source, both passes | Peak allocated |
+| --- | --- | --- | --- |
+| 160³ / 88³ (recipe) | 1 | 0.49 s | 5.8 GiB |
+| 160³ / 88³ | 4 | 0.54 s | 20.3 GiB |
+| 256³ / 144³ | 1 | 3.5 s (167–176 s per 48-source update) | 21.6 GiB |
+
+The 160³ recipe therefore needs about 24 s of model time per 48-source update on
+one 5090 (extrapolated from 4-source batches); 160³ placement in the 512³ window
+rejects about 35–40 student proposals per source (versus about 5 at 256³) with no
+source redraws. `pretrain_jem_3d_large.json` is the L-style preset (1024 wide,
+24 blocks, 16 heads, GELU MLP 4096, LayerScale 1e-5, drop-path 0.3, Compass RoPE,
+alignment {8, 16, 24}, structural {0, 8, 16}, heads 2048 / 256 / 1024) at 256³ /
+144³; one source per chunk does not fit in 32 GB.
 
 **Diagnostics.** Per depth and crop type: alignment, visible/masked KL, global
 collapse, MI, marginal/conditional entropy, marginal perplexity, minimum valid
