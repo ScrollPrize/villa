@@ -3,5 +3,5 @@
 #include <nlohmann/json.hpp>
 namespace vc::objects::detail {
 // Annotations and topology from the selected object revisions.
-nlohmann::json nativeMetadata(ObjectStore&, const Txn&, const ObjectRecord&, const GeometryRevision&, const RevisionSelection&);
+nlohmann::json nativeMetadata(const ObjectStore&, const Txn&, const ObjectRecord&, const GeometryRevision&, const RevisionSelection&);
 }
