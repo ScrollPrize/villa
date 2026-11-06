@@ -5,7 +5,7 @@
 
 namespace vc::objects::detail {
 using Json = nlohmann::json;
-Json nativeMetadata(ObjectStore& db, const Txn& txn, const ObjectRecord& object, const GeometryRevision& revision, const RevisionSelection& selection)
+Json nativeMetadata(const ObjectStore& db, const Txn& txn, const ObjectRecord& object, const GeometryRevision& revision, const RevisionSelection& selection)
 {
     const auto metadata = Json::parse(object.meta);
     auto result = geometryTransferMetadata(metadata);

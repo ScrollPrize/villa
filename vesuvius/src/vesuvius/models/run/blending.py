@@ -13,7 +13,7 @@ from scipy.ndimage import gaussian_filter
 from tqdm.auto import tqdm
 
 from vc_reader.reader import ObjectStore, ZarrWriter, open_zarr
-from vesuvius.utils.io.zarr_utils import wait_for_zarr_creation
+from vesuvius.utils.io.zarr_utils import mark_zarr_ready, wait_for_zarr_creation
 from vesuvius.utils.k8s import get_tqdm_kwargs
 from vesuvius.utils.cli import HyphenUnderscoreParser
 
@@ -602,6 +602,28 @@ def create_blend_output(output_path, original_volume_shape, num_classes, patch_s
     return output_chunks
 
 
+def part_z_range(patch_coords, patch_size, volume_shape, z_chunk, num_parts, part_id):
+    """Chunk-aligned Z slab [z0, z1) that part `part_id` of `num_parts` blends in memory.
+
+    Like the split in `merge_inference_outputs`, the parts divide output chunk rows, not Z
+    coordinates, so a boundary never cuts a chunk. Only the chunk rows the patches cover are
+    divided, so a `--bbox` run does not leave most parts empty.
+    """
+    origin, shape = InMemoryBlender.extent(patch_coords, patch_size, volume_shape)
+    first = origin[0] // z_chunk
+    last = -(-(origin[0] + shape[0]) // z_chunk)  # exclusive
+    rows = max(last - first, 0)
+    start = first + (part_id * rows) // num_parts
+    end = first + ((part_id + 1) * rows) // num_parts
+    return start * z_chunk, min(end * z_chunk, int(volume_shape[0]))
+
+
+def patches_in_z_range(patch_coords, patch_size_z, z_range):
+    """Indices of the patches whose Z extent overlaps [z0, z1): the ones a part has to run."""
+    z = np.asarray(patch_coords, dtype=np.int64).reshape(-1, 3)[:, 0]
+    return np.flatnonzero((z < z_range[1]) & (z + int(patch_size_z) > z_range[0]))
+
+
 class InMemoryBlender:
     """Gaussian-blend patch logits in RAM while inference produces them.
 
@@ -615,14 +637,20 @@ class InMemoryBlender:
     and all-zero (skipped) patches add no weight, as there. Where several patches overlap, the
     float32 sums are accumulated in the order `add()` is called rather than in the order the
     chunked blend visits them, which can move a value by one float32 rounding step.
+
+    With `z_range=(z0, z1)` only that Z slab is kept and written: patches reaching into it from
+    above or below add their overlapping part, so every output chunk inside the slab gets the
+    same sums as when the whole region is blended at once. A split run gives each part its own
+    chunk-aligned slab (see `part_z_range`), so the parts write disjoint chunks.
     """
 
-    def __init__(self, patch_coords, patch_size, num_classes, volume_shape, sigma_scale=8.0):
+    def __init__(self, patch_coords, patch_size, num_classes, volume_shape, sigma_scale=8.0, z_range=None):
         self.patch_size = tuple(int(p) for p in patch_size)
         self.num_classes = int(num_classes)
         self.volume_shape = tuple(int(v) for v in volume_shape)
         self.coords = np.asarray(patch_coords, dtype=np.int64).reshape(-1, 3)
-        self.origin, self.shape = self.extent(self.coords, self.patch_size, self.volume_shape)
+        self.z_range = None if z_range is None else (int(z_range[0]), int(z_range[1]))
+        self.origin, self.shape = self.extent(self.coords, self.patch_size, self.volume_shape, self.z_range)
         self.gaussian = generate_gaussian_map(self.patch_size, sigma_scale=sigma_scale)[0]
         self.logits = np.zeros((self.num_classes, *self.shape), dtype=np.float32)
         self.weights = np.zeros(self.shape, dtype=np.float32)
@@ -631,19 +659,22 @@ class InMemoryBlender:
         self._scratch = None
 
     @staticmethod
-    def extent(patch_coords, patch_size, volume_shape):
-        """Origin and shape of the volume region the patches cover, clipped to the volume."""
+    def extent(patch_coords, patch_size, volume_shape, z_range=None):
+        """Origin and shape of the volume region the patches cover, clipped to the volume
+        (and to the Z slab `z_range`, if given)."""
         coords = np.asarray(patch_coords, dtype=np.int64).reshape(-1, 3)
         if len(coords) == 0:
             return (0, 0, 0), (0, 0, 0)
         lo = np.maximum(coords.min(axis=0), 0)
         hi = np.minimum(coords.max(axis=0) + np.asarray(patch_size), np.asarray(volume_shape))
+        if z_range is not None:
+            lo[0], hi[0] = max(lo[0], z_range[0]), min(hi[0], z_range[1])
         return tuple(int(v) for v in lo), tuple(int(v) for v in np.maximum(hi - lo, 0))
 
     @classmethod
-    def required_bytes(cls, patch_coords, patch_size, num_classes, volume_shape):
+    def required_bytes(cls, patch_coords, patch_size, num_classes, volume_shape, z_range=None):
         """Memory the float32 sums take: one array per class plus the weights."""
-        _, shape = cls.extent(patch_coords, patch_size, volume_shape)
+        _, shape = cls.extent(patch_coords, patch_size, volume_shape, z_range)
         return (int(num_classes) + 1) * 4 * int(np.prod(shape, dtype=np.int64))
 
     def add(self, patch_index, patch_logits):
@@ -677,15 +708,44 @@ class InMemoryBlender:
         """`blender[i] = logits` adds a patch, so the blender can stand in for the logits store."""
         self.add(patch_index, patch_logits)
 
-    def write(self, output_path, chunk_size=None, compression_level=1, finalize_config=None,
+    def _output_chunks(self, chunk_size):
+        output_chunks = _blend_output_chunks(self.patch_size, chunk_size)
+        if self.z_range is not None:
+            z_chunk = output_chunks[1]
+            z0, z1 = self.z_range
+            if z0 % z_chunk or (z1 % z_chunk and z1 != self.volume_shape[0]):
+                raise ValueError(f"z_range {self.z_range} is not aligned to the output chunk size {z_chunk}; "
+                                 "parts would overwrite each other's chunks.")
+        return output_chunks
+
+    def prepare_output(self, output_path, chunk_size=None, compression_level=1, finalize_config=None,
+                       verbose=True, create=True, part_id=0, run_id=None, wait_timeout=300):
+        """Create or wait for the shared output before any part starts inference.
+
+        Split jobs must share a fresh run_id, so an old output cannot release waiting parts.
+        Part 0 publishes readiness only after creation completes, including on an empty slab.
+        """
+        self._output_chunks(chunk_size)  # Validate the slab before replacing an existing output.
+        if self.z_range is not None and (not run_id or not run_id.strip()):
+            raise ValueError("Split in-memory blending requires a non-empty run_id shared by all parts.")
+        if create:
+            create_blend_output(output_path, self.volume_shape, self.num_classes, self.patch_size,
+                                chunk_size, compression_level, finalize_config, verbose)
+            if run_id is not None:
+                mark_zarr_ready(output_path, run_id)
+        else:
+            wait_for_zarr_creation(output_path, max_wait_time=wait_timeout, verbose=verbose,
+                                   part_id=part_id, run_id=run_id)
+
+    def write(self, output_path, chunk_size=None, finalize_config=None,
               verbose=True, epsilon=1e-8, num_workers=None):
-        """Normalise, optionally finalize, and write every chunk that received a patch.
+        """Normalise, optionally finalize, and write to an already prepared output.
 
         Chunks are disjoint, so they are finalized and written by `num_workers` threads
         (default: the CPUs this process may use, at most 8; each thread holds one chunk's copy).
+        This never creates or clears the array: other parts may already have written their slabs.
         """
-        output_chunks = create_blend_output(output_path, self.volume_shape, self.num_classes, self.patch_size,
-                                            chunk_size, compression_level, finalize_config, verbose)
+        output_chunks = self._output_chunks(chunk_size)
         output_store = ZarrWriter.open(output_path, skip_empty=True)
         steps = output_chunks[1:]
         ranges = [range((o // c) * c, o + n, c) for o, n, c in zip(self.origin, self.shape, steps)]

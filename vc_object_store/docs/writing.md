@@ -166,6 +166,11 @@ ref = store.export_geometry(uuid, "/data/out", overwrite=True)
 # CLI: vc_object_export --db DB --uuid UUID --output PATH [--version N] [--generation G] [--overwrite] [--valid-only]
 ```
 
+C++ `exportGeometry` also has an overload taking the caller's `ReadTxn` (for
+example inside `ObjectStoreSession::read`), so read-only stores export too and
+the caller can report the same snapshot. Publication is atomic: Linux
+`renameat2` or macOS `renamex_np`.
+
 Export selects an immutable object revision — metadata and relationship
 snapshot included — and stages output before publication; the return value is
 the exported `{store, generation, object, version}` reference. Without

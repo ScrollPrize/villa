@@ -2,6 +2,7 @@
 
 #include <opencv2/core/mat.hpp>
 
+#include <array>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -42,6 +43,9 @@ struct OverlayColormapEntry {
 
 const std::vector<OverlayColormapSpec>& specs() noexcept;
 const OverlayColormapSpec& resolve(const std::string& id);
+
+// Scale a grayscale ramp by an RGB tint, rounding through the display converter.
+std::array<uint32_t, 256> tintPalette(const cv::Vec3f& tint);
 
 // Apply colormap and write directly into a caller-provided ARGB32 buffer.
 // outBuf must point to rows*outStride uint32_t elements.

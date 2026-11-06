@@ -25,6 +25,8 @@ def test_cooperative_scheduler_cold_ct_and_resume(inputs):
     assert result['started_pairs']==result['finished_pairs']>0
     assert result['active_fibers']==0 and result['peak_active_fibers']<=40
     assert result['collision_checks']>0 and result['pieces']>0
+    assert result['reverse_policy']['enabled']
+    assert result['reverse_checks']>0
     pages=sorted((output/'tiles').glob('*.msgpack.zst'))
     for page in pages:
         payload=read_page(page)
@@ -55,6 +57,14 @@ def test_cooperative_scheduler_cold_ct_and_resume(inputs):
     assert before=={p.name:(p.stat().st_mtime_ns,p.read_bytes()) for p in pages}
     # A native exception must survive future.get(), not be masked by cleanup.
     import pytest
+    with pytest.raises(ValueError,match='reverse policy differs'):
+        ft.run_stream_volume(field,normals,trace,chunk_config(),
+            json.dumps(dict(options,reverse_consistency=False)),keys,str(output))
+    disabled=ft.stream_trace_config(ft.stream_trace_config(trace),False)
+    off=json.loads(ft.run_stream_volume(field,normals,disabled,chunk_config(),
+        json.dumps(dict(options,reverse_consistency=False)),keys,str(inputs/'stream-off')))
+    assert off['complete'] and off['reverse_checks']==0
+    assert not off['reverse_policy']['enabled']
     # Incompatible historical pages must never be treated as completed work.
     import msgpack
     from vc_reader.reader import compress_bytes
@@ -67,6 +77,34 @@ def test_cooperative_scheduler_cold_ct_and_resume(inputs):
     options['ct_level']=9
     with pytest.raises(ValueError,match='CT level unavailable'):
         ft.run_stream_volume(field,normals,trace,chunk_config(),json.dumps(options),keys,str(output))
+
+def test_stream_defaults_enable_tuned_reverse_policy():
+    original=trace_config()
+    cfg=ft.stream_trace_config(original)
+    assert original.to_dict()['replay_reverse_interval_base']==0
+    values=cfg.to_dict()
+    assert values['replay_reverse_interval_base']==512
+    assert values['replay_reverse_delay_steps']==4
+    assert values['replay_reverse_convergence_min_base']==1024
+    assert values['replay_reverse_convergence_distance_base']==8
+    assert values['replay_reverse_convergence_angle_degrees']==10
+    assert values['replay_reverse_convergence_steps']==1
+    assert values['replay_reverse_to_start'] and values['replay_reverse_all_endpoints']
+    assert ft.stream_trace_config(cfg,False).to_dict()['replay_reverse_interval_base']==0
+    assert ft.stream_trace_config(cfg,False).to_dict()['replay_reverse_delay_steps']==0
+    assert ft.stream_trace_config(cfg,False).to_dict()['replay_reverse_convergence_min_base']==0
+    values['replay_reverse_interval_base']=256
+    cfg=ft.TraceConfig.from_dict(values)
+    assert ft.stream_trace_config(cfg).to_dict()['replay_reverse_interval_base']==256
+
+def test_legacy_reference_cannot_silently_skip_default_reverse_checks(tmp_path):
+    import json
+    import pytest
+    from vc.fiber_stream_volume import main
+    config=tmp_path/'config.json'
+    config.write_text(json.dumps({'stream':{}}))
+    with pytest.raises(ValueError,match='FW/BW verification requires the native runner'):
+        main([str(config),str(tmp_path/'output'),'--python-reference'])
 
 def test_native_coverage_matches_shared_policy():
     from vesuvius.neural_tracing.tracers.fibers.tracing.volume_policy import Owned,LivePaths,unit,tangents

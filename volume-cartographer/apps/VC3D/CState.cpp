@@ -317,11 +317,19 @@ CState::~CState()
     }
 }
 
-QString CState::storeAuthor()
+namespace {
+QString configuredAuthor()
 {
     const QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
-    auto author = settings.value(vc3d::settings::viewer::USERNAME).toString().trimmed();
-    if (author.isEmpty() || author == QStringLiteral("anon"))
+    return settings.value(vc3d::settings::viewer::USERNAME).toString().trimmed();
+}
+bool namesAuthor(const QString& author) { return !author.isEmpty() && author != QStringLiteral("anon"); }
+}
+
+QString CState::storeAuthor()
+{
+    auto author = configuredAuthor();
+    if (!namesAuthor(author))
         author = qEnvironmentVariable("USER", qEnvironmentVariable("USERNAME", "vc3d"));
     return author;
 }
@@ -353,6 +361,8 @@ vc::objects::AttachmentIdentity CState::attachHostedStore(const std::string& end
     return attachment;
 }
 
+bool CState::storeAuthorConfigured() { return namesAuthor(configuredAuthor()); }
+
 vc::objects::OpenOptions CState::storeOpenOptions(const QString& author, bool readOnly)
 {
     auto options = viewerOpenOptions();
@@ -366,6 +376,17 @@ std::optional<vc::objects::AttachmentIdentity> CState::storeReference(const std:
     if (_objectStoreOwner) return _objectStoreOwner->storeReference(id);
     const auto found = _storeReferences.find(id);
     return found == _storeReferences.end() ? std::nullopt : std::optional(found->second);
+}
+std::optional<vc::objects::AttachmentIdentity> CState::pointCollectionStore(uint64_t collectionId) const
+{
+    return _pointCollectionSync ? _pointCollectionSync->storeOf(collectionId) : std::nullopt;
+}
+std::optional<std::string> CState::storeReferenceId(const vc::objects::AttachmentIdentity& attachment) const
+{
+    if (_objectStoreOwner) return _objectStoreOwner->storeReferenceId(attachment);
+    for (const auto& [id, store] : _storeReferences)
+        if (store == attachment) return id;
+    return std::nullopt;
 }
 std::optional<vc::objects::AttachmentIdentity> CState::sampleStore() const
 {
@@ -421,8 +442,7 @@ vc::objects::AttachmentIdentity CState::attachStore(const std::filesystem::path&
 void CState::detachStore(const vc::objects::AttachmentIdentity& attachment)
 {
     if (_objectStoreOwner) { _objectStoreOwner->detachStore(attachment); return; }
-    for (const auto& [id, store] : _storeReferences)
-        if (store == attachment) { const auto copy = id; detachStoreReference(copy); return; }
+    if (const auto id = storeReferenceId(attachment)) detachStoreReference(*id);
 }
 void CState::detachStoreReference(const std::string& id)
 {
@@ -431,9 +451,9 @@ void CState::detachStoreReference(const std::string& id)
     auto data = _vpkg->document().data();
     auto& stores = data["stores"];
     if (stores.size() <= 1) throw std::runtime_error("A project must reference at least one store");
-    if (prepareStoreSwitch && !prepareStoreSwitch()) throw std::runtime_error("Store switch cancelled: pending edits could not be saved");
+    if (prepareStoreSwitch && !prepareStoreSwitch()) throw StoreSwitchRefused("Store switch cancelled: pending edits could not be saved");
     if (_pointCollectionSync && !_pointCollectionSync->flush())
-        throw std::runtime_error("Pending point-collection edits could not be saved");
+        throw StoreSwitchRefused("Pending point-collection edits could not be saved");
     stores.erase(std::remove_if(stores.begin(), stores.end(), [&](const auto& entry) { return entry.at("id") == id; }), stores.end());
     for (auto& selection : data["selections"]) if (selection == id) selection = nullptr;
     if (data.contains("open_data") && data["open_data"]["store"] == id) data.erase("open_data");
@@ -456,9 +476,9 @@ void CState::replaceStoreReference(const std::string& id, const std::filesystem:
     if (entry == data["stores"].end()) throw std::invalid_argument("Unknown store reference");
     if (vc::project::ProjectDocument::hostedStore(*entry))
         throw std::invalid_argument("A hosted store has no file to locate; detach it and attach its endpoint again");
-    if (prepareStoreSwitch && !prepareStoreSwitch()) throw std::runtime_error("Store switch cancelled");
+    if (prepareStoreSwitch && !prepareStoreSwitch()) throw StoreSwitchRefused("Store switch cancelled");
     if (_pointCollectionSync && !_pointCollectionSync->flush())
-        throw std::runtime_error("Pending point-collection edits could not be saved");
+        throw StoreSwitchRefused("Pending point-collection edits could not be saved");
     const auto existing = attachedAt(path);
     if (existing && existing != storeReference(id)) throw std::invalid_argument("Store is already attached");
     const auto replacement = prepareStore(path, storeAuthor(), entry->value("read_only", false));
@@ -493,8 +513,7 @@ void CState::setStoreFor(const std::string& kind, const std::optional<vc::object
 {
     if (_objectStoreOwner) { _objectStoreOwner->setStoreFor(kind, store); return; }
     if (!store) { setStoreSelection(kind, {}); return; }
-    for (const auto& [id, attachment] : _storeReferences)
-        if (attachment == store) { setStoreSelection(kind, id); return; }
+    if (const auto id = storeReferenceId(*store)) { setStoreSelection(kind, *id); return; }
     throw std::invalid_argument("Store is not attached to this project");
 }
 void CState::setStoreSelection(const std::string& kind, const std::string& id)
@@ -505,9 +524,9 @@ void CState::setStoreSelection(const std::string& kind, const std::string& id)
     if (!data["selections"].contains(kind)) throw std::invalid_argument("Unknown object kind");
     const nlohmann::json selected = id.empty() ? nlohmann::json(nullptr) : nlohmann::json(id);
     if (data["selections"][kind] == selected) return;
-    if (prepareStoreSwitch && !prepareStoreSwitch()) throw std::runtime_error("Store switch cancelled: pending edits could not be saved");
+    if (prepareStoreSwitch && !prepareStoreSwitch()) throw StoreSwitchRefused("Store switch cancelled: pending edits could not be saved");
     if (_pointCollectionSync && !_pointCollectionSync->flush())
-        throw std::runtime_error("Pending point-collection edits could not be saved");
+        throw StoreSwitchRefused("Pending point-collection edits could not be saved");
     data["selections"][kind] = selected;
     _vpkg->document().replace(std::move(data));
     emit storeRoutesChanged();

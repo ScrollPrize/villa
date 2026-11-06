@@ -246,7 +246,7 @@ VCR_API void vcr_pending_release(vcr_pending* pending);
 
 /* ---- display ------------------------------------------------------------------- */
 
-/* Floats to bytes (truncating, clamped; NaN to 0); coverage (may be NULL) is 1
+/* Floats to bytes (nearest even, clamped; nonfinite to 0); coverage (may be NULL) is 1
  * where the input is finite, else 0. */
 VCR_API void vcr_to_uint8(const float* input, size_t n, uint8_t* output, uint8_t* coverage);
 /* 256-entry ARGB lookup tables. */

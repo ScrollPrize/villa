@@ -85,6 +85,9 @@ namespace object_store {
     constexpr int DRAFT_CHECKPOINT_SECONDS_DEFAULT = 30;
     // Where checkpoints go (empty: "drafts" in the application data directory).
     constexpr auto DRAFT_DIRECTORY = "object_store/draft_directory";
+    // Followed by the percent-encoded canonical source folder: the UUID namespace
+    // last used to import it, offered again so a repeat import keeps its identities.
+    constexpr auto IMPORT_UUID_NAMESPACE_PREFIX = "object_store/import_uuid_namespace/";
 }
 
 // -----------------------------------------------------------------------------

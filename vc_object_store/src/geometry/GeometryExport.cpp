@@ -23,6 +23,9 @@
 #include <sys/syscall.h>
 #include <unistd.h>
 #include <linux/fs.h>
+#elif defined(__APPLE__)
+#include <cerrno>
+#include <cstdio>
 #endif
 
 namespace vc::objects {
@@ -47,8 +50,12 @@ void publish(const fs::path& source, const fs::path& destination, bool overwrite
     const unsigned flags = exists ? RENAME_EXCHANGE : RENAME_NOREPLACE;
     if (syscall(SYS_renameat2, AT_FDCWD, source.c_str(), AT_FDCWD, destination.c_str(), flags) != 0)
         throw std::system_error(errno, std::generic_category(), "atomic geometry export publication");
+#elif defined(__APPLE__)
+    // The same exchange/no-replace guarantees as renameat2 on Linux.
+    if (renamex_np(source.c_str(), destination.c_str(), exists ? RENAME_SWAP : RENAME_EXCL) != 0)
+        throw std::system_error(errno, std::generic_category(), "atomic geometry export publication");
 #else
-    if (directory) throw std::runtime_error("atomic directory export requires Linux renameat2 support");
+    if (directory) throw std::runtime_error("atomic directory export requires Linux renameat2 or macOS renamex_np");
     if (overwrite) fs::rename(source, destination);
     else fs::create_hard_link(source, destination);
 #endif
@@ -57,6 +64,13 @@ void publish(const fs::path& source, const fs::path& destination, bool overwrite
 
 ObjectVersion exportGeometry(ObjectStore& db, const std::string& objectUuid, const fs::path& destination,
     const std::optional<ObjectVersion>& version, bool overwrite, bool validOnly)
+{
+    const auto read = db.read();
+    return exportGeometry(db, read, objectUuid, destination, version, overwrite, validOnly);
+}
+
+ObjectVersion exportGeometry(const ObjectStore& db, const ReadTxn& read, const std::string& objectUuid,
+    const fs::path& destination, const std::optional<ObjectVersion>& version, bool overwrite, bool validOnly)
 {
     if (destination.empty()) throw std::invalid_argument("export destination is empty");
     const auto dest = fs::absolute(destination).lexically_normal();
@@ -77,7 +91,6 @@ ObjectVersion exportGeometry(ObjectStore& db, const std::string& objectUuid, con
     Json attributes;
     std::string fiberJson;
     {
-        auto read = db.read();
         if (version && util::canonicalUuid(version->objectUuid) != util::canonicalUuid(objectUuid))
             throw std::invalid_argument("export version names another object");
         const auto object = version ? db.objectAtVersion(read, *version) : db.currentObjectRevision(read, objectUuid);

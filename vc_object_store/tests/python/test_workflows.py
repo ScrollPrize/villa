@@ -390,7 +390,7 @@ def test_fiber_branch_transfer_preserves_identity_approval_and_stable_ids(db, tm
     assert 'optimization_mode' not in first
     with ObjectStore.create(str(tmp_path / 'imported.vcobj'), author='test') as other:
         report = other.ingest_geometry_source('fiber', directory)
-        assert report == dict(ingested=2, edges_imported=1, problems=[])
+        assert {k: report[k] for k in ('ingested', 'edges_imported', 'problems')} == dict(ingested=2, edges_imported=1, problems=[])
         edge = other.edges_by_kind('fiber_branch')[0]
         assert edge['uuid'] == edge_uuid and edge['approval_state'] == 'approved'
     # Conflicting reciprocal declarations must roll back the whole batch.
@@ -482,7 +482,7 @@ def test_version3_fiber_directory_import_resolves_links_by_file(tmp_path):
     with ObjectStore.create(str(tmp_path / 'v3.vcobj'), author='test') as store:
         report = store.ingest_geometry_source(
             'fiber', tmp_path / 'fibers', coordinate_context=dict(volume_uuid='20260411134726', scale_factor=1))
-        assert report == dict(ingested=3, edges_imported=1, problems=[])
+        assert {k: report[k] for k in ('ingested', 'edges_imported', 'problems')} == dict(ingested=3, edges_imported=1, problems=[])
         edge = store.edges_by_kind('fiber_branch')[0]
         assert {edge['a'], edge['b']} == set(ids[:2]) and edge['approval_state'] == 'approved'
         for uid in ids:
@@ -519,8 +519,11 @@ def test_uuidless_fiber_files_are_named_from_their_file_names(tmp_path):
     expected = {str(uuid.uuid5(namespace, 'vc3d_fiber/' + name)) for name in files}
     for store_name in ('a.vcobj', 'b.vcobj'):
         with ObjectStore.create(str(tmp_path / store_name), author='test') as store:
-            assert store.ingest_geometry_source('fiber', tmp_path / 'fibers') == dict(
+            report = store.ingest_geometry_source('fiber', tmp_path / 'fibers')
+            assert {k: report[k] for k in ('ingested', 'edges_imported', 'problems')} == dict(
                 ingested=3, edges_imported=1, problems=[])
+            assert expected <= set(report['uuids']) and len(report['uuids']) == 3 and report['existing'] == []
+            assert report['cancelled'] is False and report['fatal_error'] is None
             edge = store.edges_by_kind('fiber_branch')[0]
             assert {edge['a'], edge['b']} == expected
             assert store.object(str(uuid.uuid5(namespace, 'vc3d_fiber/' + version1)))['kind'] == 'fiber'

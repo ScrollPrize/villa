@@ -9,6 +9,8 @@
 #include "vc_object_store/objects/ObjectStoreSession.hpp"
 #include "vc_object_store/store/GeometryViews.hpp"
 #include <nlohmann/json.hpp>
+#include <algorithm>
+#include <atomic>
 #include <fstream>
 #include <iostream>
 #include <memory>
@@ -185,6 +187,8 @@ int main() try
         "{}", {"folder", "reviewed"});
     require(folderReport.ingested == 2 && folderReport.problems.size() == 1 &&
             folderReport.problems[0].find("broken") != std::string::npos, "a folder ingests each surface on its own");
+    require(folderReport.uuids.size() == 2 && folderReport.existing.empty() && !folderReport.cancelled &&
+            !folderReport.fatalError, "the report names the created surfaces");
     require(progressed == std::vector<std::string>{"a", "b", "broken"}, "surfaces ingest in name order");
     bool surfacesCommitted = false;
     for (const auto& event : session.takeEvents())
@@ -201,9 +205,107 @@ int main() try
     });
     require(!ingestGeometrySource(session, attachment, "surface", folder / "notes").problems.empty(),
             "a folder without surfaces is reported");
+    {
+        // A repeated import reports the identities the store already has.
+        const auto again = ingestGeometrySource(session, attachment, "surface", folder);
+        auto existing = again.existing, created = folderReport.uuids;
+        std::sort(existing.begin(), existing.end()); std::sort(created.begin(), created.end());
+        require(again.ingested == 0 && again.uuids.empty() && existing == created && again.problems.size() == 3,
+                "existing identities are reported, not re-imported");
+    }
+    {
+        // Infrastructure failures stop a stopOnInfrastructureError ingest with what was committed;
+        // ordinary problems (the broken surface) do not.
+        SourceIngestOptions strict; strict.stopOnInfrastructureError = true;
+        const auto store = directory.path / "strict.vcobj";
+        ObjectStore::create(store, options);
+        auto target = session.attach(store, options);
+        const auto failing = [](const util::ProgressUpdate& update) {
+            if (update.detail == "b") throw std::runtime_error("injected store failure");
+        };
+        const auto stopped = ingestGeometrySource(session, target, "surface", folder, failing, "{}", {}, strict);
+        require(stopped.fatalError && stopped.fatalError->find("injected store failure") != std::string::npos &&
+                stopped.ingested == 1 && stopped.uuids.size() == 1 && stopped.problems.empty() && !stopped.cancelled,
+                "an infrastructure failure stops ingestion and keeps the committed surface");
+        session.readStore(target, [&](const StoreReader& reader, const auto&) {
+            ObjectSelection surfaces; surfaces.kind = "surface";
+            require(reader.selectObjects(surfaces).size() == 1, "the surface before the failure stays committed");
+        });
+        const auto continued = ingestGeometrySource(session, target, "surface", folder, failing);
+        require(!continued.fatalError && !continued.problems.empty() &&
+                continued.problems.back().find("injected store failure") != std::string::npos,
+                "by default the failure is a problem, as before");
+        const auto broken = ingestGeometrySource(session, target, "surface", folder / "broken", {}, "{}", {}, strict);
+        require(!broken.fatalError && broken.problems.size() == 1, "a malformed source stays an ordinary problem");
+        const auto existing = ingestGeometrySource(session, target, "surface", folder / "a", {}, "{}", {}, strict);
+        require(!existing.fatalError && existing.existing.size() == 1, "an existing identity stays an ordinary problem");
+        const auto declared = directory.path / "declared";
+        fs::create_directories(declared);
+        writeTiff(declared / "x.tif", x); writeTiff(declared / "y.tif", y); writeTiff(declared / "z.tif", z);
+        std::ofstream(declared / "meta.json") << nlohmann::json{{"uuid", util::newUuid()}, {"scale", {1, 1}},
+            {"format", "tifxyz"}, {"type", "seg"}, {"coordinates", {{"volume_uuid", "v"}, {"scale_factor", 2}}}}.dump();
+        const auto conflict = ingestGeometrySource(session, target, "surface", declared, {},
+            R"({"volume_uuid":"v","scale_factor":1})", {}, strict);
+        require(!conflict.fatalError && conflict.ingested == 0 && conflict.problems.size() == 1 &&
+                conflict.problems[0].find("coordinate conflict") != std::string::npos,
+                "a coordinate conflict stays an ordinary problem");
+
+        // Cancellation stops before the next surface and keeps what was committed.
+        const auto cancelStore = directory.path / "cancel.vcobj";
+        ObjectStore::create(cancelStore, options);
+        auto cancelTarget = session.attach(cancelStore, options);
+        std::atomic_bool cancel{false};
+        const auto cancelled = ingestGeometrySource(session, cancelTarget, "surface", folder,
+            [&](const util::ProgressUpdate& update) { if (update.detail == "a") cancel = true; },
+            "{}", {}, strict, &cancel);
+        require(cancelled.cancelled && cancelled.ingested == 1 && !cancelled.fatalError, "cancellation is reported");
+
+        // A store that cannot take the ingestion is fatal with an empty report.
+        auto readOnly = options; readOnly.readOnly = true;
+        cancelTarget = session.replace(cancelTarget, cancelStore, readOnly);
+        const auto refused = ingestGeometrySource(session, cancelTarget, "surface", folder, {}, "{}", {}, strict);
+        require(refused.fatalError && refused.ingested == 0 && refused.uuids.empty(), "session-entry failure is fatal");
+        session.detach(cancelTarget);
+
+        // Export runs in a read transaction, on a read-only store too.
+        const auto exportTo = directory.path / "exported-read-only";
+        auto reader = ObjectStore::open(store, readOnly);
+        {
+            auto txn = reader.read();
+            const auto revision = exportGeometry(reader, txn, stopped.uuids.front(), exportTo);
+            require(revision.version > 0 && fs::exists(exportTo / "meta.json"), "a read-only store exports a surface");
+            const auto meta = nlohmann::json::parse(std::ifstream(exportTo / "meta.json"));
+            require(meta.at("uuid") == stopped.uuids.front(), "export keeps the object UUID");
+            mustFail([&] { exportGeometry(reader, txn, stopped.uuids.front(), exportTo); });
+            require(exportGeometry(reader, txn, stopped.uuids.front(), exportTo, std::nullopt, true) == revision,
+                    "an explicit overwrite republishes the directory");
+        }
+        session.detach(target);
+    }
     auto readOnly = options; readOnly.readOnly = true;
     attachment = session.replace(attachment, sessionPath, readOnly);
     mustFail([&] { ingestGeometrySource(session, attachment, "surface", folder / "a"); });
+    {
+        // A fiber file without a UUID is named from its file by default; with
+        // requireSourceUuids it needs a namespace instead.
+        const auto fibers = directory.path / "fibers";
+        fs::create_directories(fibers);
+        std::ofstream(fibers / "legacy.json") << nlohmann::json{{"type", "vc3d_fiber"}, {"version", 4},
+            {"control_point_ids", {0, 1}}, {"control_points", {{{"position", {1, 2, 3}}}, {{"position", {5, 2, 3}}}}},
+            {"line_points", {{1, 2, 3}, {5, 2, 3}}}}.dump();
+        auto fallback = ObjectStore::create(directory.path / "fallback.vcobj", options);
+        const auto named = ingestGeometrySource(fallback, "fiber", fibers);
+        require(named.ingested == 1 && named.uuids == std::vector<std::string>{util::nameUuid("vc3d_fiber/legacy.json")},
+                "the default keeps the file-name identity");
+        SourceIngestOptions strictIdentity; strictIdentity.requireSourceUuids = true;
+        auto strictStore = ObjectStore::create(directory.path / "strict-identity.vcobj", options);
+        const auto refused = ingestGeometrySource(strictStore, "fiber", fibers, {}, "{}", {}, strictIdentity);
+        require(refused.ingested == 0 && refused.problems.size() == 1 &&
+                refused.problems[0].find("UUID namespace") != std::string::npos, "strict identity needs a namespace");
+        strictIdentity.uuidNamespace = util::newUuid();
+        require(ingestGeometrySource(strictStore, "fiber", fibers, {}, "{}", {}, strictIdentity).ingested == 1,
+                "a namespace admits it");
+    }
     std::cout << "surface tifxyz workflow passed\n";
     return 0;
 } catch (const std::exception& error) {

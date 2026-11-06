@@ -262,6 +262,11 @@ nb::dict geometryReportToPy(const vo::GeometryIngestReport& r)
 {
     nb::dict result;
     result["edges_imported"] = r.edgesImported; result["ingested"] = r.ingested; result["problems"] = r.problems;
+    result["uuids"] = r.uuids; result["existing"] = r.existing; result["cancelled"] = r.cancelled;
+    if (r.fatalError) {
+        nb::dict fatal; fatal["message"] = *r.fatalError;
+        result["fatal_error"] = fatal;
+    } else result["fatal_error"] = nb::none();
     return result;
 }
 

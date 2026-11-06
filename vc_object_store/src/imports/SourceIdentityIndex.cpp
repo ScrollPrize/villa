@@ -1,4 +1,5 @@
 #include "imports/SourceIdentityIndex.hpp"
+#include "vc_object_store/objects/GeometryIngest.hpp"
 #include "geometry/GeometryReader.hpp"
 #include "geometry/GeometrySnapshot.hpp"
 #include "geometry/SequenceMetadata.hpp"
@@ -123,7 +124,7 @@ std::optional<SourcePoint> sourcePoint(sqlite3* db, const std::string& origin, i
     if(geometryWork) ++geometryWork->identityRows;
     if(!s.row()) return std::nullopt;
     SourcePoint result{formatUuid(s.blob16(0)),s.i64(1)};
-    if(s.row()) throw std::invalid_argument("duplicate point ID in source document");
+    if(s.row()) throw GeometrySourceRejected("duplicate point ID in source document");
     return result;
 }
 std::optional<std::string> sourceCollection(sqlite3* db, const std::string& origin, const std::string& id) {
@@ -132,7 +133,7 @@ std::optional<std::string> sourceCollection(sqlite3* db, const std::string& orig
     if(geometryWork) ++geometryWork->identityRows;
     if(!s.row()) return std::nullopt;
     const auto result=formatUuid(s.blob16(0));
-    if(s.row()) throw std::invalid_argument("duplicate source collection ID");
+    if(s.row()) throw GeometrySourceRejected("duplicate source collection ID");
     return result;
 }
 void validateSourceIdentities(sqlite3* db, const std::string& object) {

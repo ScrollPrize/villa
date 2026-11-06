@@ -1,4 +1,4 @@
-#include <vc_reader/sampling.hpp>
+#include <vc_reader/native/sampling_math.hpp>
 // Optional resident CUDA chunk backend and standalone fixture benchmark.
 // One block owns each seed half; fields, search state and paths stay on device.
 #include <cuda_runtime.h>

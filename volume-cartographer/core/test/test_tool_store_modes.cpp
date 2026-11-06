@@ -278,6 +278,30 @@ TEST_CASE("vc_objrefine refines a stored surface into a new object or in place")
     CHECK(db.objectByUuid(txn, created)->name == "refined");
 }
 
+TEST_CASE("vc_objrefine retains fractional intensities when computing offsets")
+{
+    Fixture f;
+    writeRampVolume(f.dir / "volume.zarr");
+    std::ofstream(f.dir / "input.obj") << "v 10 10 10.25\nvn 0 0 1\n";
+    std::ofstream(f.dir / "params.json") << R"({"refine": true, "start": 0, "stop": 1,
+        "step": 1, "r": 0, "low": 0, "high": 255, "border_off": 0,
+        "scale_group": "0", "reader_scale": 1})";
+    run(tool("VC_OBJREFINE_BIN") + " \"" + (f.dir / "volume.zarr").string() + "\" \"" +
+        (f.dir / "input.obj").string() + "\" \"" + (f.dir / "output.obj").string() + "\" \"" +
+        (f.dir / "params.json").string() + "\"", f.dir / "fractional.log");
+    std::ifstream output(f.dir / "output.obj");
+    std::string tag;
+    double x, y, z;
+    REQUIRE(bool(output >> tag >> x >> y >> z));
+    REQUIRE(tag == "v");
+    // The two ramp samples are 60.75 and 63.75. No blur with a 1x1 patch.
+    const double a0 = 60.75 / 255.0, a1 = 63.75 / 255.0;
+    const double expected = 10.25 + (1 - a0) * a1 / (a0 + (1 - a0) * a1 + 1e-5);
+    CHECK(x == 10);
+    CHECK(y == 10);
+    CHECK(z == doctest::Approx(expected).epsilon(1e-5));
+}
+
 TEST_CASE("vc_grow_seg_from_segments grows a stored surface from stored sources")
 {
     // The growth itself is not repeatable (unseeded rand() and OpenMP), so this
