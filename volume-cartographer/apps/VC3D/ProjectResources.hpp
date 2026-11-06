@@ -46,7 +46,7 @@ std::string importUmbilicus(const CState&, const UmbilicusImportPlan&, double st
 struct AnnotationUmbilici {
     vc::objects::AttachmentIdentity store;
     std::string volume;
-    vc::objects::RevisionSelection pins;
+    std::vector<std::string> uuids;
 };
 // nullopt without a project, volume or umbilicus store.
 std::optional<AnnotationUmbilici> annotationUmbilici(const CState&);

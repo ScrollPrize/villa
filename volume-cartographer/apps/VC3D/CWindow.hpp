@@ -120,9 +120,9 @@ public slots:
     void onFocusViewsRequested(uint64_t collectionId, std::optional<vc::PointRef> point);
 
 public:
-    // Status bar and conflict prompt for an attached hosted replica.
-    void updateHubStatus();
-    void promptHubConflicts();
+    // Each hosted store's freshness (current as of its last check, or
+    // disconnected) and pending saves, in the status bar.
+    void updateHostedStatus();
     enum class VolumeOpenError {
         None,
         PackageLoadFailed,
@@ -175,6 +175,8 @@ private:
     void UpdateVolpkgLabel(int filterCounter);
     void updateVolumePackageEmptyState();
     void showStatusBarMessage(const QString& text, int timeout = 0);
+    // Crash recovery of drafts (settings: object_store/draft_*).
+    void startDraftRecovery();
     void clearStatusBarMessage();
 
 
@@ -294,8 +296,7 @@ private:
     QPointer<QLabel> _lineAnnotationLengthLabel;
     QLabel* _sharedCacheStatsLabel{nullptr};
     QLabel* _persistentCacheLowSpaceLabel{nullptr};
-    QLabel* _hubStatusLabel{nullptr};
-    std::vector<std::string> _hubPromptedConflicts;
+    QLabel* _hostedStatusLabel{nullptr};
     QLabel* _persistentCacheWarningText{nullptr};
     QFrame* _persistentCacheWarningBanner{nullptr};
     QTimer* _statusMessageTimer{nullptr};

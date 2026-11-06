@@ -54,6 +54,21 @@ void commonFromJson(const nlohmann::json& j, RecordCommon& r)
         throw std::runtime_error("object store: pending snapshot has approval stamps");
 }
 
+void presentCommonFromJson(const nlohmann::json& j, RecordCommon& r)
+{
+    commonFields(r, [&](const char* key, auto& field) {
+        if (!j.contains(key)) return;
+        const auto& value = j.at(key);
+        using T = std::remove_cvref_t<decltype(field)>;
+        if constexpr (std::is_same_v<T, std::optional<std::string>> || std::is_same_v<T, std::optional<int64_t>>) {
+            if (value.is_null()) field.reset();
+            else field = value.get<typename T::value_type>();
+        } else {
+            value.get_to(field);
+        }
+    });
+}
+
 nlohmann::json objectToJson(const ObjectRecord& r, const std::set<std::string>* fields)
 {
     nlohmann::json j = commonToJson(r, fields);
@@ -106,7 +121,7 @@ nlohmann::json edgeToJson(EdgeRecord e, const std::set<std::string>* fields, boo
     return j;
 }
 
-EdgeRecord edgeFromJson(const nlohmann::json& j)
+EdgeRecord edgeFromJson(const nlohmann::json& j, bool projected)
 {
     EdgeRecord e;
     e.uuid = j.at("uuid").get<std::string>(); e.kind = j.at("kind").get<std::string>();
@@ -117,7 +132,8 @@ EdgeRecord edgeFromJson(const nlohmann::json& j)
     if (j.contains("tags")) e.tags = j.at("tags").get<std::vector<std::string>>();
     if (j.contains("meta")) e.meta = j.at("meta").dump();
     e.approvalState = j.value("approval_state", "pending");
-    commonFromJson(j, e);
+    if (projected) presentCommonFromJson(j, e);
+    else commonFromJson(j, e);
     return e;
 }
 } // namespace vc::objects::detail

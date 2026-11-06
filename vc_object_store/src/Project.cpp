@@ -1,5 +1,7 @@
 #include "vc_object_store/objects/Project.hpp"
 #include "vc_object_store/Uuid.hpp"
+#include "vc_object_store/objects/TransactionJson.hpp"
+#include "vc_object_store/objects/Artifacts.hpp"
 #include "internal/Sqlite.hpp"
 #include <algorithm>
 #include <map>
@@ -14,26 +16,31 @@ std::string projectViewUuid(const std::string& author)
     return util::nameUuid(std::string(kProjectViewKind) + "/" + author);
 }
 
-std::optional<std::string> currentRevision(ObjectStoreSession& session, const AttachmentIdentity& attachment,
-                                           const std::string& uuid, std::optional<ObjectRecord>* record = nullptr)
+std::optional<int64_t> currentRevision(ObjectStoreSession& session, const AttachmentIdentity& attachment,
+                                       const std::string& uuid, std::optional<ObjectRecord>* record = nullptr)
 {
-    std::optional<std::string> revision;
-    session.read(attachment, [&](const auto& store, const auto& txn, const auto&) {
-        if (const auto head = store.currentObjectRevision(txn, uuid)) revision = head->uuid;
-        if (record) *record = store.objectByUuid(txn, uuid);
+    std::optional<int64_t> version;
+    session.readStore(attachment, [&](const StoreReader& reader, const auto&) {
+        version = currentVersionOf(reader, uuid);
+        if (record) {
+            const auto head = reader.currentObject(uuid);
+            *record = head ? std::optional(head->record) : std::nullopt;
+        }
     });
-    return revision;
+    return version;
 }
 
-// Write `record` over the object's current revision (or as a new object), leased on a hosted replica.
+// Write `record` over the object's current version `version` (created when
+// it is not in the store; restored first when `restore`), in one checked request.
 void writeRecord(ObjectStoreSession& session, const AttachmentIdentity& attachment, const ObjectRecord& record,
-                 const std::optional<std::string>& revision, bool restore = false)
+                 const std::optional<int64_t>& version, bool present, bool restore = false)
 {
-    const auto lease = revision ? session.holdLeases(attachment, {record.uuid}) : LeaseHold{};
-    session.act(attachment, {{record.uuid, revision}}, [&](ObjectStore& store, WriteTxn& txn) {
-        if (restore) store.restoreObject(txn, record.uuid);
-        store.upsertObject(txn, record);
-    });
+    auto request = session.newRequest(attachment);
+    request.expectedObjects[util::canonicalUuid(record.uuid)] = version;
+    if (restore) request.operations.push_back(RestoreObjectOp{record.uuid, std::nullopt});
+    if (present) request.operations.push_back(UpdateObjectOp{objectRecordJson(record)});
+    else request.operations.push_back(CreateObjectOp{objectRecordJson(record)});
+    session.submit(attachment, request);
 }
 } // namespace
 
@@ -49,7 +56,7 @@ void createProject(const std::filesystem::path& path, const std::string& name, c
     auto store = ObjectStore::create(path, options);
     ObjectRecord record;
     record.uuid = util::newUuid();
-    auto txn = store.write({{record.uuid, std::nullopt}});
+    auto txn = store.write(VersionSelection{{record.uuid, std::nullopt}});
     record.kind = kProjectKind;
     record.name = name;
     record.meta = meta.is_object() ? meta.dump() : "{}";
@@ -95,14 +102,10 @@ void copyProject(ObjectStoreSession& session, const AttachmentIdentity& attachme
                              "BEGIN SELECT RAISE(ABORT,'store identity is immutable'); END;"
                              "CREATE TRIGGER store_identity_immutable_delete BEFORE DELETE ON store_identity "
                              "BEGIN SELECT RAISE(ABORT,'store identity is retained'); END;");
-            detail::execute(db, "UPDATE sync_replica SET uuid=?", util::newUuid());
-            for (const auto* table : {"hub_upstream", "hub_versions", "hub_pending", "hub_inflight", "hub_conflicts", "hub_leases"})
-                detail::exec(db, (std::string("DROP TABLE IF EXISTS ") + table + ";").c_str());
             detail::exec(db, "COMMIT;");
         } catch (...) { sqlite3_exec(db, "ROLLBACK;", nullptr, nullptr, nullptr); sqlite3_close(db); throw; }
         sqlite3_close(db);
-        // The artifacts of a hosted replica are beside its hub.
-        const auto artifacts = session.artifactDirectory(attachment, util::newUuid(), false).parent_path();
+        const auto artifacts = artifactBlobDirectory(source).parent_path();
         if (fs::is_directory(artifacts))
             fs::copy(artifacts, fs::path(destination.string() + ".artifacts"), fs::copy_options::recursive);
         ObjectStoreSession copy;
@@ -116,17 +119,28 @@ void copyProject(ObjectStoreSession& session, const AttachmentIdentity& attachme
     }
 }
 
-std::optional<ObjectRecord> projectRecord(const ObjectStore& store, const Txn& txn)
+std::optional<ObjectRecord> projectRecord(const StoreReader& reader)
 {
-    auto records = store.objectsByKind(txn, kProjectKind);
+    ObjectSelection selection;
+    selection.kind = kProjectKind;
+    auto records = reader.selectObjects(selection);
     if (records.empty()) return std::nullopt;
-    return std::move(records.front());
+    if (records.size() == 1) return std::move(records.front());
+    // A store holds one; with several, the first added.
+    const auto added = [&](const ObjectRecord& record) {
+        const auto history = reader.objectHistory(record.uuid);
+        return history.empty() ? std::nullopt : history.front().publishedAtUs;
+    };
+    auto first = std::min_element(records.begin(), records.end(), [&](const auto& a, const auto& b) {
+        return std::pair(added(a).value_or(0), a.uuid) < std::pair(added(b).value_or(0), b.uuid);
+    });
+    return std::move(*first);
 }
 
 void setProjectName(ObjectStoreSession& session, const AttachmentIdentity& attachment, const std::string& name)
 {
     std::optional<ObjectRecord> record;
-    session.read(attachment, [&](const auto& store, const auto& txn, const auto&) { record = projectRecord(store, txn); });
+    session.readStore(attachment, [&](const StoreReader& reader, const auto&) { record = projectRecord(reader); });
     if (record && record->name == name) return;
     if (!record) {
         record.emplace();
@@ -134,19 +148,23 @@ void setProjectName(ObjectStoreSession& session, const AttachmentIdentity& attac
         record->kind = kProjectKind;
     }
     record->name = name;
-    writeRecord(session, attachment, *record, currentRevision(session, attachment, record->uuid));
+    std::optional<ObjectRecord> existing;
+    const auto version = currentRevision(session, attachment, record->uuid, &existing);
+    writeRecord(session, attachment, *record, version, existing.has_value());
 }
 
-std::vector<ProjectResource> projectResources(const ObjectStore& store, const Txn& txn, const std::string& kind,
+std::vector<ProjectResource> projectResources(const StoreReader& reader, const std::string& kind,
                                               const std::optional<std::string>& viewer)
 {
     if (!isProjectResourceKind(kind)) throw std::invalid_argument("not a project resource kind: " + kind);
-    auto records = store.objectsByKind(txn, kind);
+    ObjectSelection selection;
+    selection.kind = kind;
+    auto records = reader.selectObjects(selection);
     // Added order: when the first revision was published (microseconds), or
-    // created (seconds) for a hub baseline without its publication time.
+    // created (seconds) for an imported baseline without its publication time.
     std::map<std::string, std::pair<std::string, int64_t>> added;
     for (const auto& record : records) {
-        const auto history = store.objectHistory(txn, record.uuid);
+        const auto history = reader.objectHistory(record.uuid);
         const auto published = history.empty() ? std::nullopt : history.front().publishedAtUs;
         added[record.uuid] = published ? std::pair(std::string{}, *published) : std::pair(record.createdAt, int64_t(0));
     }
@@ -200,7 +218,7 @@ bool addProjectResource(ObjectStoreSession& session, const AttachmentIdentity& a
     if (existing && !existing->retired && existing->tags == record.tags &&
         Json::parse(existing->meta) == Json::parse(record.meta))
         return false;
-    writeRecord(session, attachment, record, revision, existing && existing->retired);
+    writeRecord(session, attachment, record, revision, existing.has_value(), existing && existing->retired);
     return true;
 }
 
@@ -216,7 +234,7 @@ void updateProjectResourceMeta(ObjectStoreSession& session, const AttachmentIden
     merged.update(meta);
     if (merged == before) return;
     record->meta = merged.dump();
-    writeRecord(session, attachment, *record, revision);
+    writeRecord(session, attachment, *record, revision, true);
 }
 
 bool removeProjectResource(ObjectStoreSession& session, const AttachmentIdentity& attachment, const std::string& uuid)
@@ -224,16 +242,18 @@ bool removeProjectResource(ObjectStoreSession& session, const AttachmentIdentity
     std::optional<ObjectRecord> record;
     const auto revision = currentRevision(session, attachment, uuid, &record);
     if (!record || record->retired || !isProjectResourceKind(record->kind)) return false;
-    const auto lease = session.holdLeases(attachment, {uuid});
-    session.act(attachment, {{uuid, revision}}, [&](ObjectStore& store, WriteTxn& txn) { store.retireObject(txn, uuid); });
+    auto request = session.newRequest(attachment);
+    request.expectedObjects[util::canonicalUuid(uuid)] = revision;
+    request.operations.push_back(RetireObjectOp{uuid});
+    session.submit(attachment, request);
     return true;
 }
 
-Json projectView(const ObjectStore& store, const Txn& txn, const std::string& author)
+Json projectView(const StoreReader& reader, const std::string& author)
 {
-    const auto record = store.objectByUuid(txn, projectViewUuid(author));
-    if (!record || record->retired) return Json::object();
-    auto view = Json::parse(record->meta);
+    const auto head = reader.currentObject(projectViewUuid(author));
+    if (!head || head->record.retired) return Json::object();
+    auto view = Json::parse(head->record.meta);
     return view.is_object() ? view : Json::object();
 }
 
@@ -249,7 +269,7 @@ void setProjectView(ObjectStoreSession& session, const AttachmentIdentity& attac
     std::optional<ObjectRecord> existing;
     const auto revision = currentRevision(session, attachment, record.uuid, &existing);
     if (existing && Json::parse(existing->meta) == Json::parse(record.meta)) return;
-    writeRecord(session, attachment, record, revision);
+    writeRecord(session, attachment, record, revision, existing.has_value());
 }
 
 } // namespace vc::objects

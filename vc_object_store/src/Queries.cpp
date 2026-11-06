@@ -1,3 +1,4 @@
+#include "internal/Versions.hpp"
 #include "internal/EdgeSql.hpp"
 #include "internal/SpatialCache.hpp"
 #include "internal/CoordinateFilter.hpp"
@@ -336,7 +337,9 @@ std::vector<ObjectRecord> ObjectStore::selectObjects(const Txn& txn, const Objec
     const ObjectFields fields = projection ? ObjectFields(std::in_place, projection->begin(), projection->end()) : std::nullopt;
     if (!selection.volume && !selection.includeUnbound) {
         auto rows = objectSelectionQuery(db, selection, projectedObjectColumns(fields));
-        return readObjectRows(db, *rows, fields);
+        auto records = readObjectRows(db, *rows, fields);
+        if (!txn.write_) attachObjectVersions(db, records);
+        return records;
     }
     const auto order = volumeSelection(db, selection);
     if (order.empty()) return {};
@@ -353,6 +356,7 @@ std::vector<ObjectRecord> ObjectStore::selectObjects(const Txn& txn, const Objec
     if (selection.orderBy == "length_desc")
         for (auto& record : records)
             if (const auto& row = order[position.at(record.uuid)]; row.bound) record.volumeLength = row.volume;
+    if (!txn.write_) attachObjectVersions(db, records);
     return records;
 }
 

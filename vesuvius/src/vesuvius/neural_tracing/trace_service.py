@@ -282,7 +282,8 @@ def _process_copy_request(request, state):
             "checkpoint_path": copy_args.get("checkpoint_path"),
             "store": copy_args.get("store"),
             "surface_uuid": copy_args.get("surface_uuid"),
-            "geometry_revision": copy_args.get("geometry_revision"),
+            "surface_version": copy_args.get("surface_version"),
+            "surface_generation": copy_args.get("surface_generation"),
             "output_prefix": copy_args.get("output_prefix"),
         },
     }
