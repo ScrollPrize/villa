@@ -16,7 +16,7 @@ struct compression_prefix_launch {
     template<class... Args> __device__ void operator()(KernelIndex index, Args... args) const { compression_prefix(index,args...); }
 };
 template<class T> __device__ void compression_field(KernelIndex vcr_launch, const T* values,float* field,Layout g,int axis) {
-    EACH_INDEX(g.size) for(int a=0;a<g.dim;++a) field[i*g.dim+a]=a==axis?-values[i]*double(g.shape[a]-1)/g.shape[a]:0;
+    EACH_INDEX(g.size) for(int a=0;a<g.dim;++a) field[i*g.dim+a]=a==axis?values[i]:0;
 }
 struct compression_field_launch {
     template<class... Args> __device__ void operator()(KernelIndex index, Args... args) const { compression_field(index,args...); }
