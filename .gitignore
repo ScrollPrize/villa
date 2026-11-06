@@ -1,5 +1,6 @@
 # Python venvs, IDE files, build artifacts
 /local/
+/plans/
 /task.md
 /experiments/
 /global-fiber-sgd

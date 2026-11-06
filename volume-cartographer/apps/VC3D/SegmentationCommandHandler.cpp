@@ -1,4 +1,5 @@
 #include "SegmentationCommandHandler.hpp"
+#include "ToolOutput.hpp"
 
 #include "CState.hpp"
 #include "SurfacePanelController.hpp"
@@ -558,14 +559,8 @@ void SegmentationCommandHandler::onRenderSegment(const std::string& segmentId)
     const auto stored = requireStoredSurface(segmentId, false, true);
     if (!stored) return;
 
-    QString artifacts;
-    try {
-        auto* catalog = _surfacePanel->catalog();
-        artifacts = QString::fromStdString(catalog->session()->artifactDirectory(*catalog->attachment(), stored->uuid).string());
-    } catch (const std::exception& e) {
-        QMessageBox::warning(_parentWidget, tr("Error"), tr("No artifact directory for the surface: %1").arg(e.what()));
-        return;
-    }
+    // Renders are local outputs: the surface's export directory by default.
+    const QString artifacts = vc3d::surfaceExportDirectory(QString::fromStdString(stored->uuid));
     const float scale = 1.0f;
     const int resolution = 0;
     const int layers = 31;
@@ -845,15 +840,14 @@ bool SegmentationCommandHandler::startRenderImpl(const std::string& segmentId,
     }
 
     // An explicit output pattern, else one in the output base (relative to the
-    // package, or the surface's artifacts), created if needed.
+    // package, or the surface's export directory), created if needed.
     QString outputPattern = params.outputPattern;
     if (outputPattern.isEmpty()) {
         const std::filesystem::path volpkgPath(_state->projectDirectory().toStdString());
         std::filesystem::path baseDir;
         try {
             if (params.outputDir.isEmpty()) {
-                auto* catalog = _surfacePanel->catalog();
-                baseDir = catalog->session()->artifactDirectory(*catalog->attachment(), stored->uuid);
+                baseDir = vc3d::surfaceExportDirectory(QString::fromStdString(stored->uuid)).toStdString();
             } else {
                 std::filesystem::path requested(params.outputDir.toStdString());
                 baseDir = requested.is_absolute() ? requested : (volpkgPath / requested);
@@ -1695,7 +1689,8 @@ bool SegmentationCommandHandler::startConvertToObjImpl(const std::string& segmen
         return false;
     }
 
-    // The tool writes into the surface's artifact directory and reports the path.
+    // The tool publishes the OBJ as an artifact of the surface version it read;
+    // the runner copies it to the exports folder and reports that path.
     _cmdRunner->setStore(stored->store, stored->voxelScale);
     _cmdRunner->setToObjParams(QString::fromStdString(stored->uuid), objName, stored->volumeUuid);
     _cmdRunner->setNextOmpThreads(params.ompThreads);

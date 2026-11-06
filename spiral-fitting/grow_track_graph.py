@@ -2414,8 +2414,8 @@ def retire_surfaces(store: str | Path, uuids: list[str]) -> None:
     from vc_object_store import ObjectStore
 
     with ObjectStore.open(str(store), author=getpass.getuser()) as db:
-        pins = {u: db.current_object_revision(u)["uuid"] for u in uuids}
-        with db.write(expected_revisions=pins) as tx:
+        pins = {u: db.current_version(u) for u in uuids}
+        with db.write(expected_versions=pins) as tx:
             for u in uuids:
                 tx.retire_object(u)
 

@@ -557,9 +557,14 @@ private:
     // The store edit of the active surface, kept across editing sessions so
     // saves continue from their own revisions.
     std::shared_ptr<SurfaceStoreEdit> _storeEdit;
-    // The edited object's hold (ObjectStoreSession::holdForEditing) while a session lasts.
-    vc::objects::LeaseHold _editLease;
     std::shared_ptr<SurfaceStoreEdit> storeEditFor(QuadSurface* surface);
+    // The frame an edit's points are in (its view, else the stored coordinates).
+    vc::objects::CoordinateJson editCoordinates(const SurfaceStoreEdit& storeEdit) const;
+    // The open surface has unsaved edits recovered from an earlier session:
+    // ask to restore (reapplied on the version on screen and autosaved),
+    // keep for later, or discard them.
+    void offerRecoveredDraft(const QString& objectUuid);
+    bool _offeringRecoveredDraft = false;
     std::vector<AutosaveVertexUpdate> _pendingAutosaveVertexUpdates;
     std::unordered_map<std::uint64_t, std::size_t> _pendingAutosaveVertexUpdateIndex;
 

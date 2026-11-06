@@ -315,10 +315,12 @@ void refreshSegmentationViewers(ViewerManager* manager)
 struct CopyDisplacementJob
 {
     QString socketPath;
-    // The input surface, read at geometryRevision from the store file the
-    // service shares with this session; the outputs are new surfaces there.
+    // The input surface, read at its numbered version (in generation) from
+    // the store file the service shares with this session; the outputs are
+    // new surfaces there.
     QString store;
-    std::string surfaceUuid, geometryRevision, volumeUuid;
+    std::string surfaceUuid, generation, volumeUuid;
+    int64_t version{0};
     QString volumeZarrPath;
     int volumeScale{0};
     QString checkpointPath;
@@ -342,7 +344,8 @@ TracerGrowthResult runCopyDisplacementGrowth(const CopyDisplacementJob& job)
     request["request_type"] = "displacement_copy_grow";
     request["store"] = job.store.toStdString();
     request["surface_uuid"] = job.surfaceUuid;
-    request["geometry_revision"] = job.geometryRevision;
+    request["surface_version"] = job.version;
+    request["surface_generation"] = job.generation;
     request["volume_uuid"] = job.volumeUuid;
     request["volume_path"] = job.volumeZarrPath.toStdString();
     request["volume_scale"] = std::max(0, job.volumeScale);
@@ -850,7 +853,7 @@ bool SegmentationGrower::startCopyWithNt(const VolumeContext& volumeContext)
     }
     const auto pin = _context.module->storePin(segmentationSurface.get());
     const auto* row = catalog->row(segmentationSurface->id);
-    if (!pin || !pin->geometryRevision || !row || !row->bound()) {
+    if (!pin || !pin->stored() || !pin->geometryRevision || !row || !row->bound()) {
         showStatus(tr("Copy with NT needs a surface of the writable object store that opens in the current volume."),
                    kStatusLong);
         return false;
@@ -869,7 +872,8 @@ bool SegmentationGrower::startCopyWithNt(const VolumeContext& volumeContext)
     copyJob.socketPath = socketPath;
     copyJob.store = QString::fromStdString(toolStore.store.string());
     copyJob.surfaceUuid = pin->object.objectUuid;
-    copyJob.geometryRevision = *pin->geometryRevision;
+    copyJob.version = pin->version;
+    copyJob.generation = pin->generation;
     // The service works in level-0 voxels of the zarr it is given, not in the
     // open volume's working level: the store volume's own voxels.
     copyJob.volumeUuid = toolStore.volume.volume;

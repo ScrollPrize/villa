@@ -1,5 +1,6 @@
 #include "vc/core/types/ProjectDocument.hpp"
 #include <vc_reader/zarr.hpp>
+#include <vc_reader/sftp.hpp>
 #include <vc_object_store/Uuid.hpp>
 #include <algorithm>
 #include <cctype>
@@ -33,6 +34,7 @@ const std::vector<std::string>& ProjectDocument::kinds() {
     static const std::vector<std::string> value{"surface", "fiber", "point_collection", "umbilicus", "volume_transform"};
     return value;
 }
+bool ProjectDocument::hostedStore(const nlohmann::json& entry) { return entry.value("hosted", false); }
 void ProjectDocument::validate(const nlohmann::json& data) {
     if (!data.is_object() || data.value("format", std::string{}) != "vcproj" || data.at("version") != 1)
         throw std::invalid_argument("Unsupported VC3D project format or version");
@@ -43,7 +45,11 @@ void ProjectDocument::validate(const nlohmann::json& data) {
     for (const auto& store : stores) {
         const auto id = store.at("id").get<std::string>();
         const auto location = store.at("location").get<std::string>();
-        if (id.empty() || location.empty() || remote(location) || !ids.insert(id).second || !paths.insert(location).second)
+        const bool ssh = vcr::sftp::isSftpUrl(location);
+        if (hostedStore(store) && ssh) (void)vcr::sftp::parseForwardUrl(location);
+        const bool endpoint = location.rfind("http://", 0) == 0 || location.rfind("https://", 0) == 0 || ssh;
+        if (id.empty() || location.empty() || (hostedStore(store) ? !endpoint : remote(location)) ||
+            !ids.insert(id).second || !paths.insert(location).second)
             throw std::invalid_argument("Invalid or duplicate project store reference");
         (void)store.value("read_only", false);
     }

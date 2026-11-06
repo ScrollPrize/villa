@@ -665,13 +665,15 @@ references (`stores`) and each kind's selected store (`routes`).
     `store: null` (store references belong to the old project).
 - `objects.export` writes one surface (tifxyz directory), fiber (fiber JSON)
   or point collection (`vc_pointcollections` JSON with that collection) of an
-  attached project store, read-only stores included. Without `store` the UUID
+  attached project store, read-only stores included; objects of a hosted store
+  cannot be exported (-32602). Without `store` the UUID
   is looked up across the project's attached stores; several matches fail
   -32602 with the candidates. Catalog-only objects are not candidates. Pending
   edits of the object are saved first (-32004 when an edit operation prevents
   it, -32005 when saving fails, without export). It is an `export` job, not
-  cancellable; its result is `{path, uuid, kind, store, objectRevision,
-  geometryRevision}` from one read snapshot. The files carry the stored frame:
+  cancellable; its result is `{path, uuid, kind, store, version,
+  geometryRevision}` from one read snapshot, `version` being the exported
+  `{store, generation, object, version}` reference. The files carry the stored frame:
   `uuid`, `coordinates: {volume_uuid, scale_factor}` (stored units per voxel
   of that volume, null when unknown) and `coordinate_binding` when recorded.
   Re-importing them keeps UUID and coordinates.

@@ -1,3 +1,5 @@
+#include "vc_object_store/objects/StoreReader.hpp"
+#include "internal/Versions.hpp"
 #include "internal/EdgeSql.hpp"
 #include "geometry/Dependencies.hpp"
 #include "internal/History.hpp"
@@ -13,7 +15,7 @@ std::string ObjectStore::addEdge(WriteTxn& txn, const EdgeRecord& record)
             detail::validateDependencies(anchor, detail::dependencyGeometry(*this, txn, *revision));
     auto* db = static_cast<sqlite3*>(connection(txn));
     Savepoint savepoint(db);
-    const auto uuid = addEdgeImpl(db, impl_->options.author, impl_->hostname, record, false);
+    const auto uuid = addEdgeImpl(db, author(), impl_->hostname, record, false);
     recordRelationshipValidation(db, *edgeByUuid(txn, uuid));
     savepoint.release();
     return uuid;
@@ -75,7 +77,7 @@ void ObjectStore::removeEdge(WriteTxn& txn, const std::string& uuid)
     if (!row.row()) throw std::runtime_error("object store: edge not found: " + uuid);
     const auto kind = row.text(1);
     execute(db, "DELETE FROM edges WHERE id=?", row.i64(0));
-    appendJournal(db, impl_->options.author, impl_->hostname, bytes, 0, "remove_edge", kind);
+    appendJournal(db, author(), impl_->hostname, bytes, 0, "remove_edge", kind);
     savepoint.release();
 }
 
@@ -170,10 +172,12 @@ std::vector<EdgeRecord> ObjectStore::selectEdges(const Txn& txn, const EdgeSelec
         return selectEdges(txn, selected, projection);
     }
     auto rows = edgeSelectionQuery(db, selection, columns);
-    return readEdgeRows(db, *rows, fields);
+    auto records = readEdgeRows(db, *rows, fields);
+    if (!txn.write_) attachRelationshipVersions(db, records);
+    return records;
 }
 
-std::string ObjectStore::attach(WriteTxn& txn, const std::string& dataUuid, const std::string& ownerUuid, const std::string& role)
+EdgeRecord attachmentEdge(const std::string& dataUuid, const std::string& ownerUuid, const std::string& role)
 {
     EdgeRecord edge;
     edge.kind = kAttachmentEdgeKind;
@@ -182,21 +186,18 @@ std::string ObjectStore::attach(WriteTxn& txn, const std::string& dataUuid, cons
     edge.aAnchor.wholeGeometry = true;
     edge.bAnchor.wholeGeometry = true;
     edge.meta = nlohmann::json{{"role", role}}.dump();
-    return addEdge(txn, edge);
+    return edge;
+}
+
+std::string ObjectStore::attach(WriteTxn& txn, const std::string& dataUuid, const std::string& ownerUuid, const std::string& role)
+{
+    return addEdge(txn, attachmentEdge(dataUuid, ownerUuid, role));
 }
 
 std::vector<EdgeRecord> ObjectStore::attachments(const Txn& txn, const std::string& ownerUuid,
                                                  const std::optional<std::string>& role) const
 {
-    EdgeSelection selection;
-    selection.kind = kAttachmentEdgeKind;
-    selection.endpointUuids = std::vector<std::string>{ownerUuid};
-    auto edges = selectEdges(txn, selection);
-    if (role)
-        std::erase_if(edges, [&](const EdgeRecord& edge) {
-            return nlohmann::json::parse(edge.meta).value("role", std::string{}) != *role;
-        });
-    return edges;
+    return vc::objects::attachments(LocalStoreReader(*this, txn), ownerUuid, role);
 }
 
 } // namespace vc::objects

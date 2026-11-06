@@ -22,6 +22,9 @@ public:
     ProjectDocument saveAs(const std::filesystem::path& destination) const;
     std::string location(const std::filesystem::path& path) const;
     std::filesystem::path resolve(const std::string& location) const;
+    // A store entry served by vc_object_server: its "location" is the
+    // service endpoint (http(s)://, ssh:// or sftp://), not a file.
+    static bool hostedStore(const nlohmann::json& entry);
 private:
     std::filesystem::path path_;
     nlohmann::json data_;

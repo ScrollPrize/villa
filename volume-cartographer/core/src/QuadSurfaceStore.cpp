@@ -3,6 +3,7 @@
 
 #include <vc_object_store/geometry/Geometry.hpp>
 #include <vc_object_store/store/GeometryViews.hpp>
+#include <vc_object_store/objects/StoreReader.hpp>
 #include <vc_object_store/objects/GeometryCoordinates.hpp>
 #include <vc_object_store/Uuid.hpp>
 #include <vc_reader/tifxyz.hpp>
@@ -79,25 +80,17 @@ std::vector<int64_t> pointsShape(const vc::objects::GeometryRevision& revision)
     throw std::runtime_error("stored surface has no points");
 }
 
-vc::objects::GeometryRevision currentSurface(const vc::objects::ObjectStore& db, const vc::objects::Txn& txn,
-                                             const std::string& objectUuid, const std::string& expected)
-{
-    const auto revision = db.currentGeometry(txn, objectUuid);
-    if (!revision || revision->kind != "surface") throw std::runtime_error("not a stored surface: " + objectUuid);
-    if (revision->uuid != vc::objects::util::canonicalUuid(expected))
-        throw std::runtime_error("stored surface changed; reload before writing: " + objectUuid);
-    return *revision;
-}
 } // namespace
 
-std::unique_ptr<QuadSurface> load_quad_from_store(const vc::objects::ObjectStore& db, const vc::objects::Txn& txn,
+std::unique_ptr<QuadSurface> load_quad_from_store(const vc::objects::StoreReader& reader,
     const std::string& objectUuid, const std::optional<std::string>& geometryRevision, bool applyValidity, const vc::objects::TransformedGeometryView* transformed)
 {
-    const auto object = db.objectByUuid(txn, objectUuid);
-    if (!object || object->kind != "surface") throw std::runtime_error("not a surface object: " + objectUuid);
-    const auto revision = geometryRevision ? db.geometryRevision(txn, *geometryRevision) : db.currentGeometry(txn, object->uuid);
+    const auto current = reader.currentObject(vc::objects::util::canonicalUuid(objectUuid));
+    if (!current || current->record.kind != "surface") throw std::runtime_error("not a surface object: " + objectUuid);
+    const auto* object = &current->record;
+    const auto revision = geometryRevision ? reader.geometryRevision(*geometryRevision) : reader.currentGeometry(object->uuid);
     if (!revision || revision->objectUuid != object->uuid) throw std::runtime_error("surface has no such geometry revision: " + objectUuid);
-    const auto view = vc::objects::GeometrySnapshot(db, txn).surface(object->uuid, revision->uuid);
+    const auto view = vc::objects::GeometrySnapshot(reader).surface(object->uuid, revision->uuid);
     const int rows = int(view.rows()), cols = int(view.columns());
     const auto stored = view.readTile(0, 0, rows, cols);
     auto points = std::make_unique<cv::Mat_<cv::Vec3f>>(rows, cols);
@@ -144,24 +137,24 @@ std::function<cv::Mat(const std::string&)> store_channel_loader(
 {
     return [session = std::move(session), attachment = std::move(attachment), revision = std::move(geometryRevision)](const std::string& name) {
         cv::Mat result;
-        session->read(attachment, [&](const auto& db, const auto& txn, const auto&) {
-            const auto descriptor = db.geometryRevision(txn, revision);
+        session->readStore(attachment, [&](const vc::objects::StoreReader& reader, const auto&) {
+            const auto descriptor = reader.geometryRevision(revision);
             if (!descriptor) throw std::runtime_error("geometry revision not found: " + revision);
             for (const auto& array : descriptor->arrays)
                 if (array.name == name)
                     result = matFromBytes(array.dtype, array.shape,
-                        db.readGeometryRectangle(txn, revision, name, 0, 0, array.shape[0], array.shape[1]));
+                        reader.readGeometryRectangle(revision, name, 0, 0, array.shape[0], array.shape[1]));
         });
         return result;
     };
 }
 
-void create_quad_in_store(vc::objects::ObjectStore& db, vc::objects::WriteTxn& txn, const std::string& uuid, QuadSurface& surface,
+std::vector<vc::objects::TransactionOperation> create_quad_operations(const std::string& uuid, QuadSurface& surface,
     const std::string& name, const std::vector<std::string>& tags, const nlohmann::json& coordinates,
     const vc::objects::SurfaceProvenance& provenance)
 {
-    vc::objects::createSurface(db, txn, uuid, name, tags, coordinates, provenance, surface.meta,
-                               quad_surface_geometry(surface));
+    return vc::objects::createSurfaceOperations(uuid, name, tags, coordinates, provenance, surface.meta,
+                                                quad_surface_geometry(surface));
 }
 
 vc::geometry::Surface quad_surface_grid(QuadSurface& surface)
@@ -189,27 +182,17 @@ vc::objects::GeometryData quad_surface_geometry(QuadSurface& surface)
     return vc::geometry::encode(geometry);
 }
 
-std::string write_quad_rect_to_store(vc::objects::ObjectStore& db, vc::objects::WriteTxn& txn, const std::string& objectUuid,
-    QuadSurface& surface, const cv::Rect& rect, const std::string& expected,
-    const vc::objects::ObjectStoreSession::KeepRecorded& decide, const vc::objects::TransformedGeometryView* transformed)
+std::optional<vc::objects::EditGeometryOp> quad_rect_edit(const vc::objects::TransformedGeometryView& view,
+    QuadSurface& surface, const cv::Rect& rect, const std::vector<uint8_t>* validity)
 {
-    const auto revision = currentSurface(db, txn, objectUuid, expected);
+    const auto& revision = view.revision();
+    if (revision.kind != "surface") throw std::runtime_error("not a stored surface: " + revision.objectUuid);
     const auto shape = pointsShape(revision);
     const auto& points = *surface.rawPointsPtr();
     if (points.rows != shape[0] || points.cols != shape[1])
         throw std::runtime_error("surface grid differs from the stored grid; resize it first");
     const auto area = rect & cv::Rect(0, 0, points.cols, points.rows);
-    if (area.empty()) return revision.uuid;
-    // Without a transformed view the surface holds stored coordinates; an
-    // edit made through one is refused once the object or its registration
-    // has moved on since the view was opened.
-    std::optional<vc::objects::TransformedGeometryView> stored;
-    if (transformed) {
-        transformed->validateForWrite(db, txn);
-    } else {
-        stored.emplace(vc::objects::GeometrySnapshot(db, txn).viewStored(objectUuid, revision.uuid));
-        transformed = &*stored;
-    }
+    if (area.empty()) return std::nullopt;
     std::vector<vc::geometry::SurfacePoint> desired;
     desired.reserve(size_t(area.width) * area.height);
     for (int r = area.y; r < area.y + area.height; ++r)
@@ -217,25 +200,22 @@ std::string write_quad_rect_to_store(vc::objects::ObjectStore& db, vc::objects::
             const auto p = points(r, c);
             desired.push_back({p[0], p[1], p[2]});
         }
-    const auto edits = transformed->surfaceEdits(area.y, area.x, area.height, area.width, desired);
-    // One plan decides the affected relationships and commits.
-    return decide ? db.editGeometry(txn, objectUuid, edits, revision.uuid, vc::objects::ObjectStore::EdgeDecider(decide))
-                  : db.editGeometry(txn, objectUuid, edits, revision.uuid);
+    auto edits = view.surfaceEdits(area.y, area.x, area.height, area.width, desired, validity);
+    if (edits.empty()) return std::nullopt;
+    return vc::objects::EditGeometryOp{revision.objectUuid, std::move(edits), {}, true};
 }
 
-std::string write_quad_channels_to_store(vc::objects::ObjectStore& db, vc::objects::WriteTxn& txn, const std::string& objectUuid,
-    QuadSurface& surface, const std::vector<std::string>& names, const std::vector<std::string>& remove,
-    const std::string& expected, const std::vector<vc::objects::GeometryEdgeEdit>& edgeEdits)
+vc::objects::SetSurfaceChannelsOp quad_channels_operation(const std::string& objectUuid, QuadSurface& surface,
+    const std::vector<std::string>& names, const std::vector<std::string>& remove, int rows, int columns)
 {
-    const auto revision = currentSurface(db, txn, objectUuid, expected);
-    const auto shape = pointsShape(revision);
-    std::vector<GeometryArray> channels;
+    vc::objects::SetSurfaceChannelsOp op;
+    op.objectUuid = objectUuid;
+    op.keepAffectedRecorded = true;
     for (const auto& name : names) {
         const auto channel = surface.channel(name, SURF_CHANNEL_NORESIZE);
         if (channel.empty()) throw std::runtime_error("surface has no channel " + name);
-        channels.push_back(name == "mask" ? validFromMask(channel, int(shape[0]), int(shape[1])) : arrayFromMat(name, channel));
+        op.channels.push_back(name == "mask" ? validFromMask(channel, rows, columns) : arrayFromMat(name, channel));
     }
-    std::vector<std::string> removed;
-    for (const auto& name : remove) removed.push_back(name == "mask" ? "valid" : name);
-    return db.updateSurfaceChannels(txn, objectUuid, channels, removed, revision.uuid, edgeEdits);
+    for (const auto& name : remove) op.remove.push_back(name == "mask" ? "valid" : name);
+    return op;
 }

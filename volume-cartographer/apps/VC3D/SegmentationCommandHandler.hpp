@@ -333,7 +333,7 @@ private:
     struct StoredSurface {
         std::string uuid;
         QString name;        // record name; the UUID when unnamed
-        QString store;       // the store file (a hosted replica's local file)
+        QString store;       // the store file
         QString volumeUuid;  // the current volume, which outputs are bound to
         double voxelScale = 1;  // tools' voxels per voxel of it (its working level)
     };

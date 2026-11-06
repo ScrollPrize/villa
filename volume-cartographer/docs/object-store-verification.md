@@ -11,10 +11,11 @@ Surfaces follow the same rules: VC3D lists, opens and edits `surface` objects
 only (no tifxyz reads), Open Data segments are surfaces of read-only per-sample
 catalog stores, and tools run in `--store` mode.
 
-Native export accepts an **object revision** pin, so metadata, coordinates and
-applicable topology agree with the selected geometry. Python names this argument
-`object_revision_uuid`; the CLI retains `--revision`. The return value is the
-geometry revision UUID. Historical exports do not read current annotations.
+Native export accepts a recorded **object version**, so metadata, coordinates and
+applicable topology agree with the selected geometry. Python takes `version=`
+(and `generation=`, default the active one); the CLI takes `--version N`
+(and `--generation G`). The return value is the exported numbered version.
+Historical exports do not read current annotations.
 
 ## Build and checks
 
@@ -52,9 +53,9 @@ store, edits persist before Save, external journal updates are observed, and
 edits survive a fresh VC3D process. For surfaces it lists a project surface
 beside an Open Data catalog surface; activation, tags, rename and review commit
 to the store; cropping commits a child geometry revision; the catalog surface is
-edited, renamed and tagged in place. Two hosted replicas, each opened as the
-project, exchange fiber and surface edits through a hub, and a lease held
-elsewhere blocks editing. Supplying `--database PATH` instead runs against a
+edited, renamed and tagged in place. Two VC3D clients of one `vc_object_server`
+(found beside `--vc3d`, or `--object-server PATH`), each opening it as the
+project, exchange fiber and surface edits. Supplying `--database PATH` instead runs against a
 disposable backup of a current database.
 
 Regression tests also cover advisory-coordinate differences during merge, the
@@ -82,6 +83,40 @@ ninja -C build VC3D vc_fiber_constraints test_fiber_constraint_geometry \
 ctest --test-dir build --output-on-failure \
   -R '^(object_store_(session|fiber_json|fiber_session|vc3d_controller)|test_fiber_constraint_geometry)$'
 ```
+
+## Hosted feed and workspace counts
+
+With existing test-enabled builds, run from the repository root:
+
+```sh
+AGENTS_AGENT_MODE=1 cmake --build vc_object_store/build --target test_object_store_hosted_cache -j 4
+ctest --test-dir vc_object_store/build -R '^object_store_hosted_cache$' --output-on-failure
+AGENTS_AGENT_MODE=1 cmake --build volume-cartographer/build --target VC3D test_project_store_counts -j 4
+ctest --test-dir volume-cartographer/build -R '^project_store_counts$' --output-on-failure
+```
+
+Substitute the configured object-store build directory when using a standalone
+build elsewhere. The hosted test requires loopback sockets. It checks cache
+invalidation during reads and a 1,025-object commit split across feed pages,
+including event order, attribution, cached heads and cursor advancement.
+The workspace test holds a background read open while the Qt event loop runs,
+coalesces repeated refreshes, preserves counts after errors, and rejects results
+for detached attachments or destroyed owners. These are self-contained tests;
+they do not require scroll data or a display server.
+
+## Draft recovery
+
+To verify draft mask recovery on a real surface store with the existing build:
+
+```sh
+AGENTS_AGENT_MODE=1 cmake --build volume-cartographer/build --target test_surface_catalog -j 4
+QT_QPA_PLATFORM=offscreen volume-cartographer/build/bin/test_surface_catalog /path/to/surfaces.vcobj
+```
+
+Run from the repository root. The optional store is opened read-only; its first
+surface is copied to a temporary store. The check masks a valid vertex,
+checkpoints it, restores it in a new session, saves, and compares every stored
+XYZ with the original. The ordinary catalog regressions then run as well.
 
 ## Limits
 

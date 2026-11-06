@@ -115,10 +115,11 @@ QJsonObject AgentBridgeServer::stateSnapshot()
     const auto session = state->objectStoreSession();
     const auto describeStore = [&](const vc::objects::AttachmentIdentity& attachment) {
         QJsonObject store;
-        store["path"] = QString::fromStdString(session->path(attachment).string());
+        const bool hosted = session->hosted(attachment);
+        store[hosted ? "endpoint" : "path"] = QString::fromStdString(session->location(attachment));
         store["storeUuid"] = QString::fromStdString(attachment.storeUuid);
         store["writable"] = session->writable(attachment);
-        store["hosted"] = session->hubStatus(attachment).has_value();
+        store["hosted"] = hosted;
         return store;
     };
     // Edits are recorded under this author; never empty.
@@ -148,8 +149,10 @@ QJsonObject AgentBridgeServer::stateSnapshot()
         for (const auto& reference : project->document().data().at("stores")) {
             const auto id = reference.at("id").get<std::string>();
             const auto attachment = state->storeReference(id);
-            auto store = attachment ? describeStore(*attachment) : QJsonObject{
-                {"path", QString::fromStdString(project->document().resolve(reference.at("location")).string())}};
+            auto store = attachment ? describeStore(*attachment)
+                : vc::project::ProjectDocument::hostedStore(reference)
+                    ? QJsonObject{{"endpoint", QString::fromStdString(reference.at("location").get<std::string>())}, {"hosted", true}}
+                    : QJsonObject{{"path", QString::fromStdString(project->document().resolve(reference.at("location")).string())}};
             store["id"] = QString::fromStdString(id);
             store["available"] = attachment.has_value();
             stores.append(store);
@@ -167,7 +170,7 @@ QJsonObject AgentBridgeServer::stateSnapshot()
     try {
         if (const auto umbilici = vc3d::annotationUmbilici(*state)) {
             QJsonArray uuids;
-            for (const auto& [uuid, revision] : umbilici->pins) uuids.append(QString::fromStdString(uuid));
+            for (const auto& uuid : umbilici->uuids) uuids.append(QString::fromStdString(uuid));
             umbilicus = QJsonObject{{"volume", QString::fromStdString(umbilici->volume)},
                                     {"store", storeReferenceJson(*state, umbilici->store)}, {"uuids", uuids}};
         }

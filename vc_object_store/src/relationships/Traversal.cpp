@@ -134,22 +134,45 @@ std::vector<std::string> uuidList(sqlite3* db, const std::vector<int64_t>& ids)
 }
 }  // namespace
 
-std::vector<int64_t> detail::componentIds(sqlite3* db, const std::string& start,
-                                        const std::vector<std::string>& kinds, bool includeRetired, std::optional<bool> adjacentFilter)
+namespace {
+// The component of `start`, cached on read connections (nullptr elsewhere,
+// with the walk in `walked`).
+std::shared_ptr<StatementPool::Component> cachedComponent(
+    sqlite3* db, const std::string& start, const std::vector<std::string>& kinds, bool includeRetired,
+    std::optional<bool> adjacentFilter, const std::atomic_bool* cancel, std::vector<int64_t>& walked)
 {
     StatementPool* pool = nullptr;
     if (auto it = activeStatementPools.find(db); it != activeStatementPools.end() && it->second->readSnapshot)
         pool = it->second;
-    const auto key = nlohmann::json({formatUuid(parseUuid(start)), kinds, includeRetired, adjacentFilter ? nlohmann::json(*adjacentFilter) : nlohmann::json(nullptr)}).dump();
-    if (pool) if (auto it = pool->components.find(key); it != pool->components.end()) return it->second;
-    auto ids = traverse(db, start, INT_MAX, kinds, nullptr, includeRetired, adjacentFilter);
-    // Bound the transaction-local membership cache; never reuse across snapshots.
-    if (pool && ids.size() <= 262144) {
+    const auto startId = pool ? objectIdByUuid(db, parseUuid(start)) : std::nullopt;
+    const auto prefix = nlohmann::json({kinds, includeRetired, adjacentFilter ? nlohmann::json(*adjacentFilter) : nlohmann::json(nullptr)}).dump() + "/";
+    if (startId) if (auto it = pool->components.find(prefix + std::to_string(*startId)); it != pool->components.end()) return it->second;
+    // Cancellation only stops a walk; a completed one is the same component.
+    auto ids = traverse(db, start, INT_MAX, kinds, cancel, includeRetired, adjacentFilter);
+    // Bound the membership cache; it is reused across snapshots only while
+    // nothing has been committed (see beginReadCaches). Every member has the same component (the walk is undirected,
+    // and without retired records an edge is only followed between active
+    // endpoints), so it is filed under each of them: a component is walked once
+    // however many of its members are asked for.
+    if (startId && ids.size() <= 262144) {
         if (pool->componentNodes + ids.size() > 262144) { pool->components.clear(); pool->componentNodes = 0; }
         pool->componentNodes += ids.size();
-        pool->components.emplace(key, ids);
+        const auto shared = std::make_shared<StatementPool::Component>(StatementPool::Component{std::move(ids), std::nullopt});
+        for (const auto id : shared->ids) pool->components.emplace(prefix + std::to_string(id), shared);
+        return shared;
     }
-    return ids;
+    walked = std::move(ids);
+    return nullptr;
+}
+}  // namespace
+
+std::vector<int64_t> detail::componentIds(sqlite3* db, const std::string& start,
+                                        const std::vector<std::string>& kinds, bool includeRetired, std::optional<bool> adjacentFilter,
+                                        const std::atomic_bool* cancel)
+{
+    std::vector<int64_t> walked;
+    const auto component = cachedComponent(db, start, kinds, includeRetired, adjacentFilter, cancel, walked);
+    return component ? component->ids : walked;
 }
 
 std::vector<std::string> ObjectStore::componentOf(const Txn& txn, const std::string& objectUuid,
@@ -159,9 +182,13 @@ std::vector<std::string> ObjectStore::componentOf(const Txn& txn, const std::str
 {
     auto* db = static_cast<sqlite3*>(connection(txn));
     if (applicableOnly) requirePublishedGraphRead(txn);
-    return uuidList(db, (cancel || applicableOnly) ? traverse(db, objectUuid, INT_MAX, edgeKindFilter, cancel, includeRetired,
-                                                           adjacentFilter, applicableOnly ? this : nullptr, &txn)
-                              : componentIds(db, objectUuid, edgeKindFilter, includeRetired, adjacentFilter));
+    if (applicableOnly)
+        return uuidList(db, traverse(db, objectUuid, INT_MAX, edgeKindFilter, cancel, includeRetired, adjacentFilter, this, &txn));
+    std::vector<int64_t> walked;
+    const auto component = cachedComponent(db, objectUuid, edgeKindFilter, includeRetired, adjacentFilter, cancel, walked);
+    if (!component) return uuidList(db, walked);
+    if (!component->uuids) component->uuids = uuidList(db, component->ids);
+    return *component->uuids;
 }
 
 std::vector<std::string> ObjectStore::reachableWithin(const Txn& txn, const std::string& objectUuid, int maxDepth,
@@ -238,6 +265,21 @@ GraphReadView ObjectStore::graphReadView(const Txn& txn, const ObjectSelection& 
     return result;
 }
 
+GraphReadView ObjectStore::graphReadViewAt(const Txn& txn, const std::vector<ObjectVersion>& versions,
+                                         const EdgeSelection& edges) const
+{
+    RevisionSelection selection;
+    const auto revisions = objectsAtVersions(txn, versions);
+    for (size_t i = 0; i < versions.size(); ++i) {
+        if (!revisions[i])
+            throw std::invalid_argument("object history: version " + std::to_string(versions[i].version) + " of " +
+                                        versions[i].objectUuid + " is not recorded in this store and generation");
+        if (!selection.emplace(revisions[i]->objectUuid, revisions[i]->uuid).second)
+            throw std::invalid_argument("duplicate object in version selection");
+    }
+    return graphReadViewAt(txn, selection, edges);
+}
+
 GraphReadView ObjectStore::graphReadViewAt(const Txn& txn, const RevisionSelection& selection,
                                          const EdgeSelection& edges) const
 {
@@ -245,7 +287,7 @@ GraphReadView ObjectStore::graphReadViewAt(const Txn& txn, const RevisionSelecti
     requirePublishedGraphRead(txn);
     validateEdgeSelection(edges);
     if (edges.endpointUuids)
-        throw std::invalid_argument("graph endpoint scope is specified by its revision selection");
+        throw std::invalid_argument("graph endpoint scope is specified by its version selection");
     GraphReadView result;
     result.selectedObjects.emplace(); result.selectedRelationships.emplace();
     RevisionSelection resolved;

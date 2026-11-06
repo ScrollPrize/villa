@@ -35,7 +35,15 @@ The version 1 document contains:
 
 - `format: "vcproj"`, `version: 1`, and `name`.
 - `stores`: entries with a stable project-local `id`, local `location`, and
-  `read_only` preference. Hosted replicas remain local store references.
+  `read_only` preference. An
+  entry with `"hosted": true` names a `vc_object_server` instead: its
+  `location` is the service endpoint (`http://` or `https://`, e.g.
+  `http://127.0.0.1:8750` through an SSH tunnel). Stores > Attach Hosted
+  Store... adds one. VC3D never opens its database; the status bar shows each
+  hosted store as current as of its last check (every 2 s) or disconnected,
+  with saves still pending. An unreachable endpoint shows as Unreachable in
+  the project's store list until the project is reopened. Command-line tools
+  and the Lasagna service still need a store file.
 - `selections`: `surface`, `fiber`, `point_collection`, `umbilicus`, and
   `volume_transform`, each a store reference ID or null. Registrations and their
   route choices use the `volume_transform` selection.
