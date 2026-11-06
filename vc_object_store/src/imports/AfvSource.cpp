@@ -49,12 +49,20 @@ AfvSource::AfvSource(const std::filesystem::path& path, int64_t firstId, int64_t
         root.value("coordinate_units", "") != "voxel")
         throw std::invalid_argument("AFV must declare native XYZ voxel coordinates");
     p.metadata = meta.dump();
-    p.full = firstId == 0 && pastLastId == INT64_MAX;
     p.rows = std::make_unique<detail::Statement>(p.db,
         "SELECT f.id,f.name,f.family,f.point_count,f.length,"
         "f.min_x,f.min_y,f.min_z,f.max_x,f.max_y,f.max_z,f.annotation,"
         "b.first_segment,b.points FROM fibers f LEFT JOIN blocks b ON b.fiber_id=f.id "
-        "WHERE f.id>=? AND f.id<? ORDER BY f.id,b.first_segment", firstId, pastLastId);
+        "WHERE f.id>=? AND f.id<? ORDER BY f.id,b.first_segment");
+    selectRange(firstId,pastLastId);
+}
+void AfvSource::selectRange(int64_t firstId,int64_t pastLastId)
+{
+    if(firstId<0||pastLastId<firstId)throw std::invalid_argument("invalid AFV ID interval");
+    auto& p=*impl_;
+    p.rows->reset();p.row=false;p.readFibers=0;p.readPoints=0;
+    p.full=firstId==0&&pastLastId==INT64_MAX;
+    p.rows->bind(1,firstId);p.rows->bind(2,pastLastId);
     p.row = p.rows->row();
 }
 AfvSource::~AfvSource() = default;

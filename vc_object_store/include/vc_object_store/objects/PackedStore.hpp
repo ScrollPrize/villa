@@ -24,6 +24,12 @@ struct PackedStoreOptions {
     // Optional asynchronous persistence; false defers it until finalize().
     // Bounded-cache mode may still spill synchronously at its resident limit.
     bool backgroundFlush = true;
+    // Independent compact-export writers; one is the conservative default.
+    // Actual concurrency is capped by member count, hardware, and RAM budget.
+    std::size_t exportWorkers = 1;
+    // Set the compact output's logical payload length before copying; this is
+    // sparse sizing, not physical preallocation. Final directory follows it.
+    bool preSizeExport = false;
 };
 
 struct PackedDatabaseInfo {

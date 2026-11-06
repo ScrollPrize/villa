@@ -48,6 +48,37 @@ int main()
         require(!source.next(f),"EOF");
     }
     { AfvSource source(good,1,10); AfvFiber f; require(source.next(f)&&f.id==9&&!source.next(f),"bounded sparse reader"); }
+    {
+        AfvSource source(good);AfvFiber f;
+        require(source.next(f)&&f.id==0,"range cursor initial scan");const auto bytes=f.xyz;
+        source.selectRange(9,10);require(source.next(f)&&f.id==9&&!source.next(f),"seek abandons unfinished scan");
+        source.selectRange(1,9);require(!source.next(f)&&!source.next(f),"empty reused range remains exhausted");
+        source.selectRange(0,1);mustFail([&]{source.selectRange(-1,1);});mustFail([&]{source.selectRange(10,9);});
+        require(source.next(f)&&f.id==0&&f.xyz==bytes&&!source.next(f),"invalid range leaves selected scan intact");
+        source.selectRange(0,INT64_MAX);int count=0;while(source.next(f))++count;
+        require(count==2,"full rescan resets metadata total accounting");
+    }
+    {
+        const auto snapshot=dir.path/"snapshot.afv";std::filesystem::copy_file(good,snapshot);
+        sqlite3* writer=nullptr;detail::check(sqlite3_open(snapshot.string().c_str(),&writer),writer);
+        detail::exec(writer,"PRAGMA journal_mode=WAL");
+        {
+            AfvSource source(snapshot,0,0);AfvFiber f;
+            detail::exec(writer,"UPDATE fibers SET annotation='{\"new\":true}' WHERE id=9");
+            source.selectRange(9,10);require(source.next(f)&&f.annotation=="{}","range changes retain original validated snapshot");
+        }
+        sqlite3_close(writer);
+        AfvSource changed(snapshot,9,10);AfvFiber f;
+        require(changed.next(f)&&Json::parse(f.annotation).at("new")==true,"new reader sees committed source update");
+    }
+    {
+        const auto counts=dir.path/"range-counts.afv";std::filesystem::copy_file(good,counts);
+        sqlite3* writer=nullptr;detail::check(sqlite3_open(counts.string().c_str(),&writer),writer);
+        detail::exec(writer,"UPDATE metadata SET value='263' WHERE key='point_count'");sqlite3_close(writer);
+        AfvSource source(counts);AfvFiber f;require(source.next(f),"unfinished scan before range selection");
+        source.selectRange(9,10);require(source.next(f)&&!source.next(f),"bounded scan checks its fibers, not full totals");
+        source.selectRange(0,INT64_MAX);mustFail([&]{while(source.next(f)){};});
+    }
     for (const auto* mutation:{"UPDATE metadata SET value='263' WHERE key='point_count'",
         "UPDATE blocks SET first_segment=255 WHERE first_segment=256",
         "DELETE FROM blocks WHERE fiber_id=9", "UPDATE blocks SET points=zeroblob(25) WHERE fiber_id=0 AND first_segment=0",

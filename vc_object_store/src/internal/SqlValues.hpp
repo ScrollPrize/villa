@@ -22,8 +22,8 @@ void writeSqlValuesShared(sqlite3* db,std::string_view prefix,size_t shared,size
             std::string sql(prefix);sql+=" VALUES";
             for(size_t i=0;i<n;++i){if(i)sql+=',';sql+=pattern(shared+i*columns);}
             statement=std::make_unique<Statement>(db,sql);previous=n;
-        }else statement->reset();
-        fixed(*statement);
+            fixed(*statement);
+        }else statement->resetKeepingBindings();
         for(size_t i=0;i<n;++i)bind(*statement,begin+i,int(shared+i*columns));
         statement->stepDone();begin+=n;
     }

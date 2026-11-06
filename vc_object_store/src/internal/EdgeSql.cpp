@@ -9,7 +9,7 @@ void bindDependencies(Statement& s,int index,const Anchor& anchor)
     if(anchor.points.empty()&&anchor.channels.empty()&&anchor.metadataKeys.empty()){
         validateAnchor(anchor);
         static const std::string empty="{}",whole=R"({"whole_geometry":true})";
-        s.bind(index,anchor.wholeGeometry?whole:empty);
+        s.bindBorrowedText(index,anchor.wholeGeometry?whole:empty);
     }else s.bind(index,dependenciesToJson(anchor).dump());
 }
 }
@@ -180,16 +180,22 @@ std::vector<EdgeRecord> readEdgeRows(sqlite3* db, Statement& rows, const ObjectF
 
 EdgeRecord prepareNewEdge(const EdgeRecord& input)
 {
-    if (input.kind.empty())
+    EdgeRecord rec=input;
+    normalizeNewEdge(rec);
+    return rec;
+}
+
+std::array<unsigned char,16> normalizeNewEdge(EdgeRecord& rec,bool* swapped)
+{
+    if (rec.kind.empty())
         throw std::runtime_error("object store: edge kind must be non-empty");
-    EdgeRecord rec = input;
-    canonicalizeEdge(rec);
+    const bool reversed=canonicalizeEdge(rec);
+    if(swapped)*swapped=reversed;
     if (rec.uuid.empty())
         rec.uuid = util::newUuid();
     if (rec.meta.empty())
         rec.meta = "{}";
-    (void)parseUuid(rec.uuid);
-    return rec;
+    return parseUuid(rec.uuid);
 }
 
 void insertEdgeRow(sqlite3* db,const EdgeRecord& rec,int64_t id,int64_t aId,int64_t bId,
@@ -212,7 +218,8 @@ void requireUnusedObjectUuids(sqlite3* db,std::span<const EdgeInsertRow> rows,si
         std::string sql="SELECT 1 FROM objects WHERE uuid IN ("+parameters+") UNION ALL "
             "SELECT 1 FROM external_object_keys WHERE uuid IN ("+parameters+") LIMIT 1";
         Statement collision(db,sql);
-        for(size_t i=0;i<count;++i)collision.bind(int(i+1),parseUuid(rows[begin+i].record->uuid));
+        for(size_t i=0;i<count;++i){const auto& row=rows[begin+i];
+            collision.bind(int(i+1),row.binaryUuid?*row.binaryUuid:parseUuid(row.record->uuid));}
         if(collision.row())throw std::runtime_error("object store: UUID already belongs to an object or endpoint key");
         begin+=count;
     }
@@ -236,13 +243,13 @@ void insertEdgeRows(sqlite3* db,std::span<const EdgeInsertRow> rows,int64_t gene
                     if(i==4)pattern+=",?1,?2,?3,?4,?2,?3,?4";
                 }
                 return pattern+')';
-            },[&](Statement& s){s.bind(1,generation);s.bind(2,author);s.bind(3,now);s.bind(4,host);},
+            },[&](Statement& s){s.bind(1,generation);s.bindBorrowedText(2,author);s.bindBorrowedText(3,now);s.bindBorrowedText(4,host);},
             [&](Statement& s,size_t index,int offset){
                 const auto& row=rows[index];const auto& rec=*row.record;
-                s.bind(offset+1,parseUuid(rec.uuid));s.bind(offset+2,row.aId);s.bind(offset+3,row.bId);s.bind(offset+4,rec.kind);
+                s.bind(offset+1,row.binaryUuid?*row.binaryUuid:parseUuid(rec.uuid));s.bind(offset+2,row.aId);s.bind(offset+3,row.bId);s.bindBorrowedText(offset+4,rec.kind);
                 bindAnchor(s,offset+5,rec.aAnchor);bindAnchor(s,offset+11,rec.bAnchor);
-                s.bind(offset+17,rec.meta);bindDependencies(s,offset+18,rec.aAnchor);
-                bindDependencies(s,offset+19,rec.bAnchor);s.bind(offset+20,row.id);s.bind(offset+21,rec.relationKey);
+                s.bindBorrowedText(offset+17,rec.meta);bindDependencies(s,offset+18,rec.aAnchor);
+                bindDependencies(s,offset+19,rec.bAnchor);s.bind(offset+20,row.id);s.bindBorrowedText(offset+21,rec.relationKey);
             });
     }else{
     writeSqlValues(db,"INSERT INTO edges(uuid,a_id,b_id,kind,generation,created_by,created_at,created_host,changed_by,changed_at,"
@@ -251,7 +258,7 @@ void insertEdgeRows(sqlite3* db,std::span<const EdgeInsertRow> rows,int64_t gene
                     "b_anchor_x,b_anchor_y,b_anchor_z,b_dir_x,b_dir_y,b_dir_z,meta,a_dependencies,b_dependencies,id,relation_key)",
         "",33,rows.size(),sqlBatchRows,[&](Statement& s,size_t index,int offset){
     const auto& row=rows[index];const auto& rec=*row.record;
-    s.bind(offset+1,parseUuid(rec.uuid));s.bind(offset+2,row.aId);s.bind(offset+3,row.bId);
+    s.bind(offset+1,row.binaryUuid?*row.binaryUuid:parseUuid(rec.uuid));s.bind(offset+2,row.aId);s.bind(offset+3,row.bId);
     s.bind(offset+4,rec.kind);s.bind(offset+5,generation);
     s.bind(offset+6,author);s.bind(offset+7,now);s.bind(offset+8,host);
     s.bind(offset+9,author);s.bind(offset+10,now);s.bind(offset+11,host);

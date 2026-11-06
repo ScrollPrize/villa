@@ -28,6 +28,10 @@ public:
     // Balanced contiguous ID intervals for parallel readers, without decoding
     // geometry. A nonzero limit selects an explicit prefix of fibers.
     std::vector<std::array<int64_t,2>> idRanges(size_t partitions, int64_t limit = 0) const;
+    // Reuse the same validated snapshot and prepared cursor for another ID
+    // interval. Abandons any unfinished scan and resets its accounting. Full
+    // collection totals are checked only if [0, INT64_MAX) reaches EOF.
+    void selectRange(int64_t firstId, int64_t pastLastId);
     bool next(AfvFiber&);
 private:
     struct Impl;

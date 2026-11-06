@@ -22,9 +22,11 @@ EdgeRecord readEdgeRow(sqlite3* db, const Statement& s, bool details = true,
                        const ObjectFields& fields = std::nullopt);
 std::vector<EdgeRecord> readEdgeRows(sqlite3* db, Statement& rows, const ObjectFields& fields = std::nullopt);
 EdgeRecord prepareNewEdge(const EdgeRecord&);
+std::array<unsigned char,16> normalizeNewEdge(EdgeRecord&,bool* swapped=nullptr);
 struct EdgeInsertRow {
     const EdgeRecord* record;
     int64_t id,aId,bId;
+    std::optional<std::array<unsigned char,16>> binaryUuid;
 };
 void requireUnusedObjectUuids(sqlite3*,std::span<const EdgeInsertRow>,size_t sqlBatchRows=1);
 void insertEdgeRows(sqlite3*, std::span<const EdgeInsertRow>,int64_t generation,

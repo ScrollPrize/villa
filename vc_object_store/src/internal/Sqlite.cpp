@@ -118,7 +118,7 @@ sqlite3* openConnection(const std::filesystem::path& path, int flags, const Open
     if (vfs && !sqlite3_vfs_find(vfs))
         throw std::runtime_error("object store: this SQLite build lacks the unix-dotfile VFS needed for shared files");
     const int rc = sqlite3_open_v2(remote || packed ? name.c_str() : reinterpret_cast<const char*>(path.u8string().c_str()), &db,
-                                   flags | SQLITE_OPEN_FULLMUTEX, vfs);
+                                   flags & SQLITE_OPEN_NOMUTEX ? flags : flags | SQLITE_OPEN_FULLMUTEX, vfs);
     if (rc != SQLITE_OK) {
         std::string msg = db ? sqlite3_errmsg(db) : "open failed";
         if (remote && !sftpLastError().empty()) msg += " (" + sftpLastError() + ")";
@@ -177,6 +177,9 @@ void Statement::bind(int i, double v)
 void Statement::bind(int i, const std::string& v)
 { check(sqlite3_bind_text(value, i, v.c_str(), int(v.size()), SQLITE_TRANSIENT), db_, "bind"); }
 
+void Statement::bindBorrowedText(int i, const std::string& v)
+{ check(sqlite3_bind_text(value, i, v.data(), int(v.size()), SQLITE_STATIC), db_, "bind"); }
+
 void Statement::bind(int i, std::span<const uint8_t> bytes)
 { check(sqlite3_bind_blob64(value, i, bytes.data(), bytes.size(), SQLITE_TRANSIENT), db_, "bind"); }
 
@@ -205,9 +208,12 @@ void Statement::stepDone()
 
 void Statement::reset()
 {
-    check(sqlite3_reset(value), db_, "reset");
+    resetKeepingBindings();
     check(sqlite3_clear_bindings(value), db_, "clear_bindings");
 }
+
+void Statement::resetKeepingBindings()
+{ check(sqlite3_reset(value), db_, "reset"); }
 
 bool Statement::isNull(int c) const
 { return sqlite3_column_type(value, c) == SQLITE_NULL; }

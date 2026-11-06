@@ -21,27 +21,34 @@ void validateAnchor(const Anchor& anchor)
             std::any_of(point.index.begin(), point.index.end(), [](auto i) { return i < 0; }))
             throw std::invalid_argument("invalid anchor point reference");
 }
-void validateEdgeAnchors(const EdgeRecord& edge)
+namespace {
+void validateEdgeAnchorsWithIdentity(const EdgeRecord& edge,bool sameObject)
 {
     validateAnchor(edge.aAnchor); validateAnchor(edge.bAnchor);
-    if (util::canonicalUuid(edge.aUuid) == util::canonicalUuid(edge.bUuid) &&
+    if (sameObject &&
         (edge.aAnchor.points.empty() || edge.bAnchor.points.empty() ||
          edge.aAnchor.points.front() == edge.bAnchor.points.front()))
         throw std::invalid_argument("self-edges require two distinct point references");
+}
+}
+void validateEdgeAnchors(const EdgeRecord& edge)
+{
+    validateEdgeAnchorsWithIdentity(edge,util::canonicalUuid(edge.aUuid)==util::canonicalUuid(edge.bUuid));
 }
 void swapEndpoints(EdgeRecord& edge)
 {
     std::swap(edge.aUuid, edge.bUuid);
     std::swap(edge.aAnchor, edge.bAnchor);
 }
-void canonicalizeEdge(EdgeRecord& edge)
+bool canonicalizeEdge(EdgeRecord& edge)
 {
     edge.aUuid = util::canonicalUuid(edge.aUuid);
     edge.bUuid = util::canonicalUuid(edge.bUuid);
-    validateEdgeAnchors(edge);
-    if (edge.bUuid < edge.aUuid || (edge.aUuid == edge.bUuid &&
-        dependenciesToJson(edge.bAnchor).dump() < dependenciesToJson(edge.aAnchor).dump()))
-        swapEndpoints(edge);
+    validateEdgeAnchorsWithIdentity(edge,edge.aUuid==edge.bUuid);
+    const bool swapped=edge.bUuid < edge.aUuid || (edge.aUuid == edge.bUuid &&
+        dependenciesToJson(edge.bAnchor).dump() < dependenciesToJson(edge.aAnchor).dump());
+    if(swapped)swapEndpoints(edge);
+    return swapped;
 }
 std::string edgeIdentity(const EdgeRecord& input)
 {

@@ -88,7 +88,10 @@ std::unique_ptr<ObjectStore::Impl> ObjectStore::openImpl(const std::filesystem::
         std::error_code ec;
         if (!isPackedDatabasePath(path) && std::filesystem::exists(path) && std::filesystem::file_size(path, ec) > 0)
             throw std::runtime_error("object store: create refuses existing non-empty file: " + path.string());
-        impl->writer = openConnection(path, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, options, false);
+        // Private initial-import writers are owned by one worker and never
+        // exposed as editable stores. Keep mutex protection on normal stores.
+        impl->writer = openConnection(path, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE |
+            (immutable ? SQLITE_OPEN_NOMUTEX : 0), options, false);
         if (buildingPacked && pragmaInt(impl->writer, "page_count") != 0)
             throw std::runtime_error("object store: create refuses non-empty packed database: " + path.string());
         // Private bulk-built databases use large pages: dense sequential rows

@@ -33,6 +33,9 @@ public:
     void bind(int i, int64_t v);
     void bind(int i, double v);
     void bind(int i, const std::string& v);
+    // The referenced bytes must outlive statement stepping and remain valid
+    // until replaced, clear/reset(), or destruction. Never pass a temporary.
+    void bindBorrowedText(int i, const std::string& v);
     void bind(int i, std::span<const uint8_t> bytes);
     template<class T> void bind(int i, const std::optional<T>& value) {
         if (value) bind(i, *value); else bindNull(i);
@@ -52,6 +55,7 @@ public:
     bool row();
     void stepDone();
     void reset();
+    void resetKeepingBindings();
     bool isNull(int c) const;
     int64_t i64(int c) const;
     double f64(int c) const;

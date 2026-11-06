@@ -10,11 +10,13 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <condition_variable>
 #include <cerrno>
 #include <cstring>
 #include <limits>
 #include <iterator>
+#include <future>
 #include <list>
 #include <map>
 #include <mutex>
@@ -106,6 +108,11 @@ public:
         check(file_->pMethods->xFileSize(file_, &size), "size packed backing file");
         if (size < 0) throw std::runtime_error("negative packed file size");
         return std::uint64_t(size);
+    }
+    void truncate(std::uint64_t bytes)
+    {
+        checkedEnd(bytes,0);std::lock_guard lock(mutex_);
+        check(file_->pMethods->xTruncate(file_,sqlite3_int64(bytes)),"size packed backing file");
     }
     void sync() { std::lock_guard lock(mutex_); check(file_->pMethods->xSync(file_, SQLITE_SYNC_FULL), "sync packed backing file"); }
 };
@@ -252,7 +259,7 @@ struct BuildState {
     std::exception_ptr failure;
     std::uint64_t next = headerBytes, clock = 0;
     std::size_t resident = 0;
-    bool stopping = false, finalized = false, closing = false;
+    bool stopping = false, finalized = false, closing = false, compactExport = false;
 
     ~BuildState()
     {
@@ -364,8 +371,17 @@ struct BuildState {
             flush(*oldest);
             discard(oldest);
         }
-        block->data.assign(options.extentBytes, 0);
-        resident += options.extentBytes;
+        if(options.memoryFirst){
+            // Reserve under the shared budget lock, but first-touch zeroing is
+            // private to this member. Other shards need not wait for MiB fills.
+            resident+=options.extentBytes;
+            std::vector<char> bytes;lock.unlock();
+            try{detail::GeometryPhase allocate("packed.memory.allocate");bytes.assign(options.extentBytes,0);}
+            catch(...){lock.lock();resident-=options.extentBytes;failure=std::current_exception();throw;}
+            {detail::GeometryPhase wait("packed.memory.global_wait");lock.lock();}
+            try{healthy();}catch(...){resident-=options.extentBytes;throw;}
+            block->data=std::move(bytes);
+        }else {block->data.assign(options.extentBytes,0);resident+=options.extentBytes;}
         lru.push_front(block); block->lru = lru.begin();
         if (block->persisted && !overwrite) file->read(block->data.data(), block->data.size(), block->physical);
         block->touched = ++clock;
@@ -398,6 +414,14 @@ struct BuildState {
         catch(...){lock.lock();failure=std::current_exception();block->inFlight=false;wake.notify_all();throw;}
         lock.lock();block->inFlight=false;wake.notify_all();healthy();
     }
+    template<class F> void residentOperation(std::unique_lock<std::mutex>& lock,F&& operation)
+    {
+        lock.unlock();
+        try{detail::GeometryPhase copy("packed.memory.copy");operation();}
+        catch(...){lock.lock();failure=std::current_exception();throw;}
+        {detail::GeometryPhase wait("packed.memory.global_wait");lock.lock();}
+        healthy();
+    }
     void write(MutableMember& member, const void* data, std::size_t bytes, std::uint64_t offset)
     {
         std::unique_lock operation(member.operations,std::defer_lock);
@@ -409,6 +433,20 @@ struct BuildState {
         const auto end = checkedEnd(offset, bytes);
         ensure(member, end, lock);
         const auto* p = static_cast<const char*>(data);
+        if(options.memoryFirst&&!options.backgroundFlush){
+            // Every block is retained, no eviction/snapshot thread can touch
+            // it, and this member's operation lock excludes reads/truncation.
+            // Metadata shared with other members stays under the global lock.
+            residentOperation(lock,[&]{
+                while(bytes){
+                    auto block=member.blocks.at(offset/options.extentBytes);
+                    const auto within=std::size_t(offset%options.extentBytes),n=std::min(bytes,options.extentBytes-within);
+                    std::memcpy(block->data.data()+within,p,n);markDirty(block,within,n);
+                    p+=n;offset+=n;bytes-=n;
+                }
+            });
+            member.size=std::max(member.size,end);return;
+        }
         while (bytes) {
             auto block = member.blocks.at(offset / options.extentBytes);
             const auto within = std::size_t(offset % options.extentBytes), n = std::min(bytes, options.extentBytes - within);
@@ -438,6 +476,16 @@ struct BuildState {
         detail::GeometryPhase work("packed.read.work");
         healthy();
         auto* p = static_cast<char*>(data);
+        if(options.memoryFirst&&!options.backgroundFlush){
+            residentOperation(lock,[&]{
+                while(bytes){
+                    const auto& block=member.blocks.at(offset/options.extentBytes);
+                    const auto within=std::size_t(offset%options.extentBytes),n=std::min(bytes,options.extentBytes-within);
+                    std::memcpy(p,block->data.data()+within,n);p+=n;offset+=n;bytes-=n;
+                }
+            });
+            return;
+        }
         while (bytes) {
             auto block = member.blocks.at(offset / options.extentBytes);
             const auto within = std::size_t(offset % options.extentBytes), n = std::min(bytes, options.extentBytes - within);
@@ -482,7 +530,7 @@ struct BuildState {
         for (;;) {
             // Memory-first finalization can export directly from retained RAM.
             // Do not first drain an unused copy of every page into staging.
-            if(options.memoryFirst && stopping)return;
+            if(stopping && (options.memoryFirst || compactExport))return;
             std::shared_ptr<Block> selected;
             while (!dirty.empty() && !selected) {
                 auto b = dirty.front().lock(); dirty.pop_front();
@@ -828,6 +876,7 @@ PackedStoreBuilder::PackedStoreBuilder(const std::filesystem::path& destination,
         throw std::invalid_argument("packed builder requires power-of-two MiB extents and at least one resident extent");
     if(options.memoryFirst && !options.disposableBulk)
         throw std::invalid_argument("packed memory-first requires disposableBulk=true; durability begins at finalize");
+    if(!options.exportWorkers)throw std::invalid_argument("packed exportWorkers must be positive");
     packedStoreVfs();
     auto state = std::make_shared<BuildState>();
     state->options = options;
@@ -919,7 +968,7 @@ void PackedStoreBuilder::finalize(const std::string& rootDatabaseUuid, bool comp
         std::unique_lock lock(state.mutex); state.healthy();
         if (!state.members.contains(root) || !state.members.at(root)->database) throw std::runtime_error("packed root database missing");
         for (const auto& [_, member] : state.members) if (member->handles) throw std::runtime_error("close all packed database handles before finalize");
-        state.closing = true; state.stopping = true; state.wake.notify_all();
+        state.closing = true; state.stopping = true; state.compactExport = compact; state.wake.notify_all();
     }
     if (state.worker.joinable()) state.worker.join();
     if (state.failure) std::rethrow_exception(state.failure);
@@ -931,36 +980,76 @@ void PackedStoreBuilder::finalize(const std::string& rootDatabaseUuid, bool comp
         target = std::make_shared<PhysicalFile>(state.compactStaging, true, true);
         const std::array<unsigned char, headerBytes> empty{}; target->write(empty.data(), empty.size(), 0);
     }
-    std::vector<char> buffer(state.options.extentBytes);
+    struct ExportMember { std::shared_ptr<MutableMember> member; std::uint64_t position; };
+    std::vector<ExportMember> exports;
     for (const auto& [uuid, member] : state.members) {
         if (!member->database) continue;
         std::vector<std::uint64_t> offsets;
-        if (compact) offsets.push_back(position);
-        std::uint64_t copied = 0;
-        for (const auto& block : member->blocks) {
-            if(compact && state.options.memoryFirst) {
-                const auto n=std::size_t(std::min<std::uint64_t>(buffer.size(),member->size-copied));
-                if(block->data.size()!=state.options.extentBytes)
-                    throw std::logic_error("packed memory-first extent lost residency");
-                target->write(block->data.data(),n,position);
-                position=checkedEnd(position,n);copied+=n;
-                continue;
-            }
+        if (compact) {
+            offsets.push_back(position);
+            exports.push_back({member,position});
+            position=checkedEnd(position,member->size);
+        } else for (const auto& block : member->blocks) {
             state.flush(*block);
             // Sparse extended ranges have no prior writes; persist zero extents.
             if (!block->persisted) {
-                std::fill(buffer.begin(), buffer.end(), 0);
+                std::vector<char> buffer(state.options.extentBytes,0);
                 state.file->write(buffer.data(), buffer.size(), block->physical);
                 block->persisted = true;
             }
-            if (compact) {
-                const auto n = std::size_t(std::min<std::uint64_t>(buffer.size(), member->size - copied));
-                state.file->read(buffer.data(), n, block->physical);
-                target->write(buffer.data(), n, position);
-                position = checkedEnd(position, n); copied += n;
-            } else offsets.push_back(block->physical);
+            offsets.push_back(block->physical);
         }
         directory["databases"].push_back({{"uuid", uuid}, {"size", member->size}, {"contiguous", compact}, {"offsets", offsets}});
+    }
+    if(compact){
+        if(state.options.preSizeExport)target->truncate(position);
+        // All SQLite handles are closed and the background writer has joined.
+        // Assign ranges deterministically, then copy independent members through
+        // separate native handles. There are no overlapping writes or shared
+        // sqlite3_file calls; the final sync covers the complete physical file.
+        // Resident blocks go straight to the final file in either cache mode:
+        // flushing them into staging and reading them back would duplicate I/O.
+        std::atomic<std::size_t> next{0};
+        auto exportMembers=[&](PhysicalFile& output){
+            std::unique_ptr<PhysicalFile> input;
+            std::vector<char> buffer;
+            for(;;){
+                const auto index=next.fetch_add(1,std::memory_order_relaxed);
+                if(index>=exports.size())return;
+                const auto& task=exports[index];std::uint64_t copied=0;
+                for(const auto& block:task.member->blocks){
+                    const auto n=std::size_t(std::min<std::uint64_t>(state.options.extentBytes,task.member->size-copied));
+                    const char* bytes=nullptr;
+                    if(!block->data.empty())bytes=block->data.data();
+                    else {
+                        if(state.options.memoryFirst)throw std::logic_error("packed memory-first extent lost residency");
+                        buffer.resize(state.options.extentBytes);
+                        if(block->persisted){
+                            if(!input)input=std::make_unique<PhysicalFile>(state.staging,false);
+                            input->read(buffer.data(),n,block->physical);
+                        }else std::fill_n(buffer.data(),n,0);
+                        bytes=buffer.data();
+                    }
+                    output.write(bytes,n,task.position+copied);copied+=n;
+                }
+                if(copied!=task.member->size)throw std::logic_error("packed member extent coverage mismatch");
+            }
+        };
+        // Avoid thread setup for small exports; cap extra scratch memory and
+        // native handles independently of the number of imported shards.
+        const auto workers=position-headerBytes<8*1024*1024 ? std::size_t(1) :
+            std::min<std::size_t>({exports.size(),state.options.exportWorkers,std::max(1u,std::thread::hardware_concurrency()),
+                state.options.residentBytes/state.options.extentBytes});
+        if(workers<=1)exportMembers(*target);
+        else {
+            std::vector<std::future<void>> pending;pending.reserve(workers);
+            for(std::size_t i=0;i<workers;++i)pending.push_back(std::async(std::launch::async,[&]{
+                PhysicalFile output(state.compactStaging,true);exportMembers(output);
+            }));
+            std::exception_ptr error;
+            for(auto& worker:pending)try{worker.get();}catch(...){if(!error)error=std::current_exception();}
+            if(error)std::rethrow_exception(error);
+        }
     }
     writeDirectory(*target, directory, position);
     const auto publish = compact ? state.compactStaging : state.staging;

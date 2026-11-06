@@ -746,7 +746,7 @@ int64_t ObjectCollection::importInitialEdges(CollectionTxn& t,
     std::map<ObjectKey,Endpoint> endpoints;
     std::vector<InitialCollectionEdge> batch;
     std::vector<EdgeRecord> native;
-    std::vector<EdgeInsertRow> rows;
+    std::vector<std::pair<int64_t,int64_t>> rows;
     int64_t count=0;
     for(;;){
         batch.clear();
@@ -812,9 +812,9 @@ int64_t ObjectCollection::importInitialEdges(CollectionTxn& t,
             auto& b=resolveEndpoint(input.b,input.record.bAnchor);
             input.record.aUuid=a.alias;input.record.bUuid=b.alias;
             native.push_back(std::move(input.record));
-            rows.push_back({&native.back(),0,a.id,b.id});
+            rows.emplace_back(a.id,b.id);
         }
-        writer.appendResolved(rows);
+        writer.appendResolved(native,rows);
         count+=static_cast<int64_t>(native.size());
     }
     writer.finish();

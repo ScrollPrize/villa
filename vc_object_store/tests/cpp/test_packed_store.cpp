@@ -104,6 +104,7 @@ int main()
         PackedStoreOptions options;
         options.extentBytes = 1024 * 1024;
         options.residentBytes = 2 * options.extentBytes;
+        {auto invalid=options;invalid.exportWorkers=0;mustFail([&]{PackedStoreBuilder b(temp.path/"invalid-workers.vcobj",invalid);});}
         const auto root = util::newUuid(), second = util::newUuid();
         const auto container = temp.path / "extents.vcobj";
         {
@@ -148,6 +149,32 @@ int main()
             builder.finalize(root);
         }
         verify(packedDatabasePath(temp.path/"memory-sql.vcobj"));
+        // Compact publication writes deterministic disjoint member ranges in
+        // parallel. Exercise partial final extents and deferred RAM-only data.
+        {
+            const auto destination=temp.path/"memory-parallel.vcobj";
+            auto parallel=memoryOptions;parallel.exportWorkers=8;parallel.preSizeExport=true;
+            PackedStoreBuilder builder(destination,parallel);
+            std::vector<std::string> ids;
+            std::vector<std::filesystem::path> paths;
+            for(int i=0;i<8;++i){ids.push_back(util::newUuid());paths.push_back(builder.addDatabase(ids.back()));}
+            std::vector<std::future<void>> writers;
+            for(int i=0;i<8;++i)writers.push_back(std::async(std::launch::async,[&,i]{
+                RawFile raw(paths[i],true);
+                std::vector<char> bytes(options.extentBytes+17,char('a'+i));bytes.front()=char(i);bytes.back()=char(i+1);
+                require(raw.file->pMethods->xWrite(raw.file,bytes.data(),int(bytes.size()),0)==SQLITE_OK,"RAM parallel export input");
+                std::vector<char> got(bytes.size());require(raw.file->pMethods->xRead(raw.file,got.data(),int(got.size()),0)==SQLITE_OK&&got==bytes,"independent RAM copy integrity");
+            }));
+            for(auto& writer:writers)writer.get();
+            builder.finalize(ids.front());
+            for(int i=0;i<8;++i){
+                RawFile raw(packedDatabasePath(destination,ids[i]),false);
+                std::vector<char> got(options.extentBytes+17),expected(got.size(),char('a'+i));
+                expected.front()=char(i);expected.back()=char(i+1);
+                require(raw.file->pMethods->xRead(raw.file,got.data(),int(got.size()),0)==SQLITE_OK&&got==expected,
+                    "parallel RAM export changed member bytes or partial extent tail");
+            }
+        }
         // Exercise concurrent snapshot/rewrite/journal retirement as well as
         // extent-layout publication; retaining memory must not lose updates.
         {
@@ -233,10 +260,11 @@ int main()
         // Independent writers must remain correct after their working sets
         // exceed the shared cache and nonresident page I/O runs concurrently.
         {
-            auto parallelOptions=options;parallelOptions.disposableBulk=true;
+            auto parallelOptions=options;parallelOptions.disposableBulk=true;parallelOptions.exportWorkers=8;
             PackedStoreBuilder builder(temp.path/"parallel-raw.vcobj",parallelOptions);
             std::vector<std::filesystem::path> paths;
             for(int i=0;i<8;++i)paths.push_back(builder.addDatabase(util::newUuid()));
+            std::vector<std::vector<char>> allExpected(8);
             std::vector<std::future<void>> workers;
             for(int i=0;i<8;++i)workers.push_back(std::async(std::launch::async,[&,i]{
                 RawFile raw(paths[i],true);std::vector<char> expected(3*options.extentBytes,char('a'+i));
@@ -251,8 +279,16 @@ int main()
                 }
                 std::vector<char> got(expected.size());
                 require(raw.file->pMethods->xRead(raw.file,got.data(),int(got.size()),0)==SQLITE_OK&&got==expected,"parallel persisted bytes changed");
+                allExpected[i]=std::move(expected);
             }));
             for(auto& worker:workers)worker.get();
+            builder.finalize(packedDatabaseUuid(paths.front()));
+            for(int i=0;i<8;++i){
+                RawFile raw(packedDatabasePath(temp.path/"parallel-raw.vcobj",packedDatabaseUuid(paths[i])),false);
+                std::vector<char> got(allExpected[i].size());
+                require(raw.file->pMethods->xRead(raw.file,got.data(),int(got.size()),0)==SQLITE_OK&&got==allExpected[i],
+                    "parallel compact export mixed persisted/resident bytes");
+            }
         }
 
         // Real ObjectStore operations route automatically, including history-off
@@ -377,10 +413,11 @@ int main()
             // destination cannot stall or fail RAM ingestion. Publication must
             // still expose the real I/O error rather than claiming success.
             ScopedFileLimit limited;
-            PackedStoreBuilder builder(temp.path/"memory-io-failure.vcobj",memoryOptions);
-            const auto path=builder.addDatabase(root);
-            {
-                RawFile raw(path,true);std::vector<char> bytes(2*options.extentBytes,'m');
+            auto parallel=memoryOptions;parallel.exportWorkers=8;
+            PackedStoreBuilder builder(temp.path/"memory-io-failure.vcobj",parallel);
+            for(int i=0;i<8;++i){
+                const auto path=builder.addDatabase(i==0?root:util::newUuid());
+                RawFile raw(path,true);std::vector<char> bytes(options.extentBytes+17,'m');
                 require(raw.file->pMethods->xWrite(raw.file,bytes.data(),int(bytes.size()),0)==SQLITE_OK,"memory ingestion attempted backing I/O");
                 require(raw.file->pMethods->xSync(raw.file,SQLITE_SYNC_FULL)==SQLITE_OK,"memory sync attempted backing I/O");
             }

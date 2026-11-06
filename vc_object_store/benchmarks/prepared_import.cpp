@@ -36,15 +36,35 @@ struct Prepared {
     std::vector<std::pair<int64_t,int64_t>> endpoints;
     std::vector<std::string> objectPayload,edgePayload;
     uint64_t points=0,bytes=0;
+    int64_t sourceFibers=0,sourcePoints=0,sourceConstraints=0;
+    size_t geometryReaders=0,geometryRanges=0;
     double readSeconds=0,baselineEncodingSeconds=0;
 };
+InitialObjectRecord geometryRecord(Prepared& data,AfvFiber&& fiber,const std::string& uuid,int64_t id,uint64_t maxBytes)
+{
+    if(fiber.xyz.size()>maxBytes || data.bytes>maxBytes-fiber.xyz.size())
+        throw std::runtime_error("prepared geometry exceeds max_prepared_xyz_bytes; reduce the input count, not its precision");
+    InitialObjectRecord o;o.id=id;o.record.uuid=uuid;
+    o.record.kind="fiber";o.record.name=std::move(fiber.name);o.record.fiber=std::move(fiber.detail);
+    o.record.meta=Json({{"annotation",Json::parse(fiber.annotation)}}).dump();
+    GeometryData g;g.kind="fiber";
+    g.arrays={{"control_points","<f8",{0,3},{}},{"control_point_ids","<i8",{0},{}},
+        {"line_points","<f8",{o.record.fiber->linePointCount,3},std::move(fiber.xyz)}};
+    data.points+=o.record.fiber->linePointCount;data.bytes+=g.arrays.back().bytes.size();
+    o.geometry=std::move(g);return o;
+}
 Prepared prepare(const Json& config){
     Prepared data;const auto start=Clock::now();
-    AfvSource source(config.at("source").get<std::string>());
+    const auto sourcePath=config.at("source").get<std::string>();AfvSource source(sourcePath,0,0);
+    data.sourceFibers=source.fiberCount();data.sourcePoints=source.pointCount();
     const size_t limit=config.at("count");require(limit>0,"count must be positive");
-    if(config.at("workload")=="relations"){
+    const uint64_t maxBytes=config.value("max_prepared_xyz_bytes",uint64_t(1024)*1024*1024);
+    const auto workload=config.at("workload").get<std::string>();
+    if(workload=="relations"||workload=="combined"){
         AfcSource constraints(config.at("constraints").get<std::string>(),source.uuid());
+        data.sourceConstraints=constraints.constraintCount();
         std::unordered_map<std::string,int64_t> ids;
+        std::map<int64_t,int64_t> sourceIds;
         const auto endpoint=[&](const std::string& uuid){
             auto [it,added]=ids.try_emplace(uuid,int64_t(ids.size()+1));
             if(added){InitialObjectRecord o;o.id=it->second;o.record.uuid=uuid;
@@ -54,33 +74,74 @@ Prepared prepare(const Json& config){
         EdgeRecord edge;
         while(data.edges.size()<limit&&constraints.next(edge)){
             const auto a=endpoint(edge.aUuid),b=endpoint(edge.bUuid);
+            if(workload=="combined") {
+                const auto meta=Json::parse(edge.meta).at("afc");
+                for(const auto& [key,logical]:std::array<std::pair<const char*,int64_t>,2>{{{"source_fiber_a",a},{"source_fiber_b",b}}}) {
+                    const auto original=meta.at(key).get<int64_t>();
+                    auto [found,added]=sourceIds.emplace(original,logical);
+                    require(added||found->second==logical,"AFC endpoint source identity is inconsistent");
+                }
+            }
             data.endpoints.emplace_back(a,b);data.edges.push_back(std::move(edge));
         }
         require(data.edges.size()==limit,"insufficient constraints");
+        // Seek only required fibers using the native range reader. Consecutive
+        // source IDs share one cursor; each requested geometry is decoded once.
+        if(workload=="combined")for(auto first=sourceIds.begin();first!=sourceIds.end();) {
+            auto last=std::next(first);
+            while(last!=sourceIds.end()&&last->first==std::prev(last)->first+1)++last;
+            const auto finalId=std::prev(last)->first;
+            require(finalId<INT64_MAX,"source fiber ID cannot form a bounded interval");
+            source.selectRange(first->first,finalId+1);data.geometryReaders=1;++data.geometryRanges;
+            AfvFiber fiber;
+            for(auto entry=first;entry!=last;++entry) {
+                require(source.next(fiber)&&fiber.id==entry->first,"required AFC endpoint geometry is missing");
+                const auto index=size_t(entry->second-1);
+                const auto uuid=util::nameUuid(source.uuid(),"fiber:"+std::to_string(fiber.id));
+                require(data.objects.at(index).record.uuid==uuid,"AFC and AFV endpoint UUID mismatch");
+                data.objects[index]=geometryRecord(data,std::move(fiber),uuid,entry->second,maxBytes);
+            }
+            require(!source.next(fiber),"bounded AFV reader returned extra fibers");first=last;
+        }
     }else{
-        require(config.at("workload")=="geometry","unknown workload");
+        require(workload=="geometry","unknown workload");
+        if(config.contains("constraints")) {
+            AfcSource constraints(config.at("constraints").get<std::string>(),source.uuid());
+            data.sourceConstraints=constraints.constraintCount();
+        }
+        const auto sampling=config.value("geometry_sampling",std::string("prefix"));
+        require(sampling=="prefix"||sampling=="uniform","unknown geometry_sampling");
+        const auto accept=[&](AfvFiber&& fiber) {
+            const auto uuid=util::nameUuid(source.uuid(),"fiber:"+std::to_string(fiber.id));
+            data.objects.push_back(geometryRecord(data,std::move(fiber),uuid,int64_t(data.objects.size()+1),maxBytes));
+        };
         AfvFiber fiber;
-        while(data.objects.size()<limit&&source.next(fiber)){
-            InitialObjectRecord o;o.id=int64_t(data.objects.size()+1);
-            o.record.uuid=util::nameUuid(source.uuid(),"fiber:"+std::to_string(fiber.id));
-            o.record.kind="fiber";o.record.name=fiber.name;o.record.fiber=fiber.detail;
-            o.record.meta=Json({{"annotation",Json::parse(fiber.annotation)}}).dump();
-            GeometryData g;g.kind="fiber";
-            g.arrays={{"control_points","<f8",{0,3},{}},{"control_point_ids","<i8",{0},{}},
-                {"line_points","<f8",{fiber.detail.linePointCount,3},std::move(fiber.xyz)}};
-            data.points+=fiber.detail.linePointCount;data.bytes+=g.arrays.back().bytes.size();
-            o.geometry=std::move(g);data.objects.push_back(std::move(o));
+        if(sampling=="prefix") {
+            source.selectRange(0,INT64_MAX);data.geometryReaders=1;++data.geometryRanges;
+            while(data.objects.size()<limit&&source.next(fiber))accept(std::move(fiber));
+        } else {
+            // One catalog-only partition scan, not one scan per sample. The
+            // first fiber in each balanced interval is a deterministic sample.
+            const auto ranges=source.idRanges(limit);
+            require(ranges.size()==limit,"insufficient fibers for uniform sample");
+            for(const auto& range:ranges) {
+                source.selectRange(range[0],range[1]);data.geometryReaders=1;++data.geometryRanges;
+                require(source.next(fiber),"empty uniform geometry interval");accept(std::move(fiber));
+            }
         }
         require(data.objects.size()==limit,"insufficient fibers");
     }
-    data.readSeconds=elapsed(start);const auto encoding=Clock::now();
+    data.readSeconds=elapsed(start);return data;
+}
+void preparePrototype(Prepared& data){
+    const auto encoding=Clock::now();
     // The reduced prototype stores the SAME input attributes in opaque payloads;
     // they are not dropped to make its insertion cheaper. No event bundling.
     for(const auto& o:data.objects){data.objectIds.push_back(d::parseUuid(o.record.uuid));
         data.objectPayload.push_back(d::objectToJson(o.record).dump());}
     for(const auto& e:data.edges){data.edgeIds.push_back(d::parseUuid(e.uuid));
         data.edgePayload.push_back(d::edgeToJson(e,nullptr,false).dump());}
-    data.baselineEncodingSeconds=elapsed(encoding);return data;
+    data.baselineEncodingSeconds=elapsed(encoding);
 }
 Json inventory(const fs::path& path){
     std::vector<fs::path> members;
@@ -143,10 +204,23 @@ Json reduced(const Prepared& data,const fs::path& path){
     const auto verify=Clock::now();
     d::Statement rows(db.p,"SELECT meta FROM edges ORDER BY id");
     for(const auto& payload:data.edgePayload)require(rows.row()&&rows.text(0)==payload,"reduced payload mismatch");
-    require(!rows.row(),"extra reduced edge");result["verify_seconds"]=elapsed(verify);
+    require(!rows.row(),"extra reduced edge");
+    for(size_t i=0;i<data.objects.size();i+=std::max(size_t(1),data.objects.size()/10))if(data.objects[i].geometry) {
+        d::Statement chunks(db.p,"SELECT c.data FROM geometry_revision_chunks r JOIN geometry_chunks c ON c.hash=r.hash "
+            "WHERE r.revision_uuid=? AND r.array_name='line_points' ORDER BY r.chunk_index",data.objectIds[i]);
+        const auto& expected=data.objects[i].geometry->arrays.back().bytes;size_t offset=0;
+        while(chunks.row()) {
+            const auto size=size_t(sqlite3_column_bytes(chunks.value,0));
+            require(offset<=expected.size()&&size<=expected.size()-offset,"extra reduced geometry bytes");
+            require(!size||std::memcmp(sqlite3_column_blob(chunks.value,0),expected.data()+offset,size)==0,"reduced geometry mismatch");offset+=size;
+        }
+        require(offset==expected.size(),"missing reduced geometry bytes");
+    }
+    result["verify_seconds"]=elapsed(verify);
     return result;
 }
-Json native(const Prepared& data,const fs::path& path,bool linked,bool packed,size_t workers=1,size_t sqlRows=1){
+Json native(const Prepared& data,const fs::path& path,bool linked,bool packed,size_t workers,size_t sqlRows,
+    size_t exportWorkers,bool preSizeExport,size_t residentBytes){
     InitialImportOptions opt;opt.store.author="prepared-benchmark";opt.store.sqliteCacheBytes=512*1024*1024;
     opt.edges.sqlBatchRows=sqlRows;
     require(workers>0&&workers<=data.objects.size(),"sharded benchmark needs at least one object per worker");
@@ -160,7 +234,8 @@ Json native(const Prepared& data,const fs::path& path,bool linked,bool packed,si
         }
     }
     if(packed){opt.packed.emplace();opt.packed->disposableBulk=true;opt.packed->memoryFirst=true;
-        opt.packed->backgroundFlush=false;opt.packed->residentBytes=size_t(4)*1024*1024*1024;}
+        opt.packed->backgroundFlush=false;opt.packed->residentBytes=residentBytes;
+        opt.packed->exportWorkers=exportWorkers;opt.packed->preSizeExport=preSizeExport;}
     // Same 256-record native batches and statement size as the production pilot.
     std::string owner;double dependency=0;
     const auto appendObjects=[&](size_t worker,InitialShardImport& part){
@@ -172,10 +247,14 @@ Json native(const Prepared& data,const fs::path& path,bool linked,bool packed,si
         owner=result.storeUuid;dependency=elapsed(start);opt.dependencies={base};}
     std::vector<d::GeometryWork> work(workers);
     const auto objectProducer=[&](size_t i,InitialShardImport& part){
-        d::GeometryWorkScope profile(work[i]);if(!linked)appendObjects(i,part);
+        // The builder uses fresh std::async worker threads and joins them before
+        // returning. Keep profiling until thread exit so seal/commit/checkpoint
+        // are covered too; work remains alive until after every thread joins.
+        thread_local std::unique_ptr<d::GeometryWorkScope> profile;
+        profile=std::make_unique<d::GeometryWorkScope>(work[i]);
+        if(!linked)appendObjects(i,part);
     };
     const auto edgeProducer=[&](size_t i,InitialShardImport& part){
-        d::GeometryWorkScope profile(work[i]);
         const auto& endpointOwner=linked?owner:part.storeUuid();
         const auto [start,last]=bounds(data.edges.size(),i);size_t next=start;
         if(!data.edges.empty())part.importEdges([&](std::vector<InitialCollectionEdge>& batch){
@@ -215,39 +294,82 @@ Json native(const Prepared& data,const fs::path& path,bool linked,bool packed,si
         require((found->a.objectUuid==data.edges[i].aUuid&&found->b.objectUuid==data.edges[i].bUuid)||
             (found->b.objectUuid==data.edges[i].aUuid&&found->a.objectUuid==data.edges[i].bUuid),"native endpoints mismatch");
     }
-    if(!data.objects.empty()&&data.objects.front().geometry)
-        require(collection.readGeometryArray(txn,{owner,data.objects.front().record.uuid},"line_points")==
-            data.objects.front().geometry->arrays.back().bytes,"native geometry mismatch");
+    for(size_t i=0;i<data.objects.size();i+=std::max(size_t(1),data.objects.size()/10))if(data.objects[i].geometry)
+        require(collection.readGeometryArray(txn,{owner,data.objects[i].record.uuid},"line_points")==
+            data.objects[i].geometry->arrays.back().bytes,"native geometry mismatch");
     out["verify_seconds"]=elapsed(verify);return out;
 }
 }
 int main(int argc,char** argv){try{
     require(argc==2,"usage: vc_bench_prepared_import CONFIG.json");
     sqlite3_config(SQLITE_CONFIG_MEMSTATUS,0);
-    std::ifstream input(argv[1]);const auto config=Json::parse(input);auto data=prepare(config);
+    std::ifstream input(argv[1]);const auto config=Json::parse(input);
+    Json cases=config.value("cases",Json::array());
+    if(!config.contains("cases"))cases.push_back({{"variant",config.at("variant")}});
+    require(cases.is_array()&&!cases.empty(),"cases must be a nonempty array");
+    bool needsPrototype=false;
+    for(const auto& run:cases) {
+        require(run.is_object(),"each case must be an object");
+        for(const auto& [key,value]:run.items())require(key=="variant"||key=="workers"||key=="sql_batch_rows"||key=="repetitions"||key=="label"||
+            key=="export_workers"||key=="pre_size_export"||key=="resident_bytes",
+            "cases may change only variant, workers, sql_batch_rows, repetitions, label, export_workers, pre_size_export or resident_bytes; input is shared");
+        const std::string variant=run.at("variant");
+        require(variant=="prototype"||variant=="native"||variant=="linked"||variant=="native_packed"||
+            variant=="native_sharded"||variant=="native_packed_sharded","unknown variant");
+        require(run.value("repetitions",config.value("repetitions",1))>0,"repetitions must be positive");
+        needsPrototype|=variant=="prototype";
+    }
+    auto data=prepare(config);
+    if(needsPrototype)preparePrototype(data);
+    size_t indexedAnchors=0,positionAnchors=0,wholeAnchors=0;
+    for(const auto& edge:data.edges)for(const auto* anchor:{&edge.aAnchor,&edge.bAnchor}) {
+        indexedAnchors+=!anchor->points.empty();positionAnchors+=bool(anchor->position);wholeAnchors+=anchor->wholeGeometry;
+    }
     std::cout<<Json({{"stage","prepared"},{"objects",data.objects.size()},{"constraints",data.edges.size()},
         {"points",data.points},{"xyz_bytes",data.bytes},{"source_seconds",data.readSeconds},
-        {"prototype_encoding_seconds",data.baselineEncodingSeconds},
+        {"prototype_encoding_seconds",data.baselineEncodingSeconds},{"prototype_encoding_performed",needsPrototype},
+        {"geometry_reader_count",data.geometryReaders},{"geometry_range_count",data.geometryRanges},{"indexed_anchors",indexedAnchors},
+        {"position_anchors",positionAnchors},{"whole_geometry_anchors",wholeAnchors},
+        {"source_totals",{{"fibers",data.sourceFibers},{"points",data.sourcePoints},{"constraints",data.sourceConstraints}}},
         {"build",{{"compiler",__VERSION__},{"compiled",std::string(__DATE__)+" "+__TIME__},
             {"cplusplus",__cplusplus},{"sqlite",sqlite3_libversion()},
             {"source_revision",config.value("source_revision",std::string("unrecorded"))}}},
         {"configuration",config}}).dump()<<std::endl;
     const fs::path root=config.at("output_root").get<std::string>();require(fs::is_directory(root),"output_root must exist");
-    const std::string variant=config.at("variant");
-    require(variant=="prototype"||variant=="native"||variant=="linked"||variant=="native_packed"||
-        variant=="native_sharded"||variant=="native_packed_sharded","unknown variant");
-    const bool sharded=variant.ends_with("_sharded");
-    const size_t workers=sharded?config.value("workers",size_t(4)):1;
-    for(int repeat=0;repeat<config.value("repetitions",1);++repeat){
-        const auto path=root/(variant+std::to_string(repeat)+".sqlite");require(!fs::exists(path),"refusing overwrite");
-        Json result=variant=="prototype"?reduced(data,path):native(data,path,variant=="linked",variant.starts_with("native_packed"),workers,config.value("sql_batch_rows",size_t(1)));
-        result["variant"]=variant;result["repetition"]=repeat;result["tables"]=inventory(path);
+    for(size_t caseIndex=0;caseIndex<cases.size();++caseIndex) {
+      const auto& run=cases[caseIndex];const std::string variant=run.at("variant");
+      const bool sharded=variant.ends_with("_sharded");
+      const size_t workers=sharded?run.value("workers",config.value("workers",size_t(4))):1;
+      const size_t sqlRows=run.value("sql_batch_rows",config.value("sql_batch_rows",size_t(1)));
+      const size_t exportWorkers=run.value("export_workers",config.value("export_workers",size_t(1)));
+      const bool preSizeExport=run.value("pre_size_export",config.value("pre_size_export",false));
+      const size_t residentBytes=run.value("resident_bytes",config.value("resident_bytes",size_t(4)*1024*1024*1024));
+      require(exportWorkers>0&&residentBytes>0,"export_workers and resident_bytes must be positive");
+      for(int repeat=0;repeat<run.value("repetitions",config.value("repetitions",1));++repeat){
+        const auto path=root/("case"+std::to_string(caseIndex)+"-"+variant+std::to_string(repeat)+".sqlite");require(!fs::exists(path),"refusing overwrite");
+        std::cout<<Json({{"stage","case_start"},{"case",caseIndex},{"variant",variant},{"workers",workers},{"repetition",repeat}}).dump()<<std::endl;
+        Json result=variant=="prototype"?reduced(data,path):native(data,path,variant=="linked",variant.starts_with("native_packed"),workers,sqlRows,
+            exportWorkers,preSizeExport,residentBytes);
+        result["case"]=caseIndex;result["label"]=run.value("label",variant);result["variant"]=variant;result["workers"]=workers;
+        result["sql_batch_rows"]=sqlRows;result["repetition"]=repeat;result["tables"]=inventory(path);
+        result["packed_export_options_applied"]=variant.starts_with("native_packed");
+        result["export_workers"]=exportWorkers;result["pre_size_export"]=preSizeExport;result["resident_bytes"]=residentBytes;
         require(result["tables"].value("edges",size_t(0))==data.edges.size(),"edge count mismatch");
         require(result["tables"].value("objects",size_t(0))==(variant=="linked"?0:data.objects.size()),"objects must not be duplicated into relation shards");
         uint64_t bytes=0;
         if(fs::is_directory(path)){for(const auto& member:fs::directory_iterator(path))if(member.path().extension()==".vcobj")bytes+=fs::file_size(member.path());}
         else bytes=fs::file_size(path);
         result["database_bytes"]=bytes;std::cout<<result.dump()<<std::endl;
+        // Outputs are private benchmark fixtures, not experiment deliverables.
+        // Remove only successfully created paths; the runner handles aborts.
+        if(config.value("remove_completed_outputs",true)) {
+            std::vector<fs::path> outputs{path};if(variant=="linked")outputs.emplace_back(path.string()+".base");
+            for(const auto& output:outputs) {
+                fs::remove_all(output);
+                for(const auto* suffix:{"-wal","-shm","-journal"})fs::remove(output.string()+suffix);
+            }
+        }
+      }
     }
     return 0;
 }catch(const std::exception& e){std::cerr<<e.what()<<'\n';return 1;}}
