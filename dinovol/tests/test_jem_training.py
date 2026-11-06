@@ -196,6 +196,10 @@ class ViewTests(JemTestCase):
         together = processor(samples)
         reordered = processor([samples[2], samples[0], samples[1]])
         alone = processor([samples[1]])
+        processor.group_size = 1  # grouped processing gives the same crops
+        grouped = processor(samples)
+        for kind in ("teacher", "global", "local"):
+            torch.testing.assert_close(grouped[f"{kind}_crops"], together[f"{kind}_crops"], rtol=0, atol=0)
         for kind in ("teacher", "global", "local"):
             crops = together[f"{kind}_crops"]
             n = len(crops) // 3

@@ -65,7 +65,7 @@ def patch_masks(spec_grid, seeds, settings) -> dict[str, torch.Tensor]:
 
 class JemBatchProcessor(BatchProcessor):
     def __init__(self, config, *, device, patch: int, masking=None, lattice: bool = False,
-                 storage: str = "device", dtype: torch.dtype = torch.float32):
+                 storage: str = "device", dtype: torch.dtype = torch.float32, group_size: int | None = None):
         super().__init__(config, None, device=device)
         self.patch = int(patch)
         self.masking = resolve_masking(masking)
@@ -74,6 +74,8 @@ class JemBatchProcessor(BatchProcessor):
             raise ValueError("JEM batch storage must be 'device' or 'host'")
         self.storage = storage
         self.dtype = dtype
+        # Sources processed together; host storage defaults to small groups to bound device memory.
+        self.group_size = int(group_size) if group_size is not None else (4 if storage == "host" else 1 << 30)
 
     def recipe(self, target) -> dict[str, Any]:
         """Resolved per-view operations, for the run recipe and checkpoints."""
@@ -125,11 +127,10 @@ class JemBatchProcessor(BatchProcessor):
                 outputs[i] = image
         return outputs
 
-    def _store(self, images):
-        images = images.to(self.dtype)
-        if self.storage == "host" and images.is_cuda:
-            return images.cpu().pin_memory()
-        return images
+    def _empty(self, rows, size):
+        pin = self.storage == "host" and self.device.type == "cuda"
+        device = "cpu" if self.storage == "host" else self.device
+        return torch.empty((rows, 1, size, size, size), dtype=self.dtype, device=device, pin_memory=pin)
 
     def __call__(self, samples):
         from vc_reader import views as native
@@ -137,36 +138,47 @@ class JemBatchProcessor(BatchProcessor):
         plans = [sample["jem_plan"] for sample in samples]
         n_sets = len(samples[0]["teacher_views"])
         L = len(samples[0]["local_views"]) // n_sets
-        teacher = [samples[b]["teacher_views"][s] for s in range(n_sets) for b in range(B)]
-        global_views = [samples[b]["global_views"][s] for s in range(n_sets) for b in range(B)]
-        local_views = [samples[b]["local_views"][v] for v in range(n_sets * L) for b in range(B)]
-        processed = self._process(teacher + global_views + local_views)
-        n_t, n_g = len(teacher), len(global_views)
-        teacher_crops = torch.stack(processed[:n_t])
-        global_crops = torch.stack(processed[n_t:n_t + n_g])
-        local_crops = torch.stack(processed[n_t + n_g:])
-
-        device = global_crops.device
         patch = self.patch
+        slots = {"teacher": n_sets, "global": n_sets, "local": n_sets * L}
+        field = {"teacher": "teacher_views", "global": "global_views", "local": "local_views"}
         # Crops are cubic, so orientation leaves the token grid shape unchanged.
-        grid = {"global": (int(global_crops.shape[-1]) // patch,) * 3,
-                "local": (int(local_crops.shape[-1]) // patch,) * 3}
-        teacher_grid = (int(teacher_crops.shape[-1]) // patch,) * 3
+        size = {kind: int(samples[0][field[kind]][0].target[0]) for kind in slots}
+        grid = {kind: (size[kind] // patch,) * 3 for kind in slots}
+        device = self.device
 
+        masks = {}
+        for kind in ("global", "local"):
+            seeds = torch.stack([plans[b][f"{kind}_mask_seeds"][v] for v in range(slots[kind]) for b in range(B)])
+            masks[kind] = patch_masks(grid[kind], seeds, self.masking[kind])
+            masks[kind]["device"] = masks[kind]["masks"].to(device)
+
+        # Process a group of sources at a time and move its crops to their storage, so device
+        # memory is bounded by the group rather than the whole batch. Rows: slot * B + b.
+        outputs = {kind: self._empty(slots[kind] * B, size[kind]) for kind in slots}
+        for start in range(0, B, self.group_size):
+            group = range(start, min(start + self.group_size, B))
+            rows = {kind: [v * B + b for v in range(slots[kind]) for b in group] for kind in slots}
+            views = [samples[b][field[kind]][v] for kind in slots for v in range(slots[kind]) for b in group]
+            processed = iter(self._process(views))
+            for kind in slots:
+                images = torch.stack([next(processed) for _ in rows[kind]])
+                if kind != "teacher":
+                    cells = masks[kind]["device"][rows[kind]].view(len(images), *grid[kind])
+                    images = native.mask_patch_cells(images, cells, (patch,) * 3)
+                outputs[kind][torch.tensor(rows[kind])] = images.to(outputs[kind].device, self.dtype)
+
+        teacher_grid = grid["teacher"]
         batch: dict[str, Any] = {"jem": True, "batch_size": B, "n_sets": n_sets,
                                  "n_global_views": n_sets, "n_local_views": n_sets * L, "patch": patch}
         support = torch.stack([plan["support"] for plan in plans]).to(device)
         sources = torch.arange(B)
-        for kind, crops, slots in (("global", global_crops, n_sets), ("local", local_crops, n_sets * L)):
+        for kind, crops, slots in (("global", outputs["global"], n_sets), ("local", outputs["local"], n_sets * L)):
             # Row r = slot * B + b; the teacher of slot v is set v // per_set.
             per_set = slots // n_sets
             slot = torch.arange(slots).repeat_interleave(B)
             source = sources.repeat(slots)
             teacher_rows = (slot // per_set) * B + source
-            seeds = torch.stack([plans[b][f"{kind}_mask_seeds"][v] for v in range(slots) for b in range(B)])
-            masks = patch_masks(grid[kind], seeds, self.masking[kind])
-            mask_tensor = masks["masks"].to(device)
-            crops = native.mask_patch_cells(crops, mask_tensor.view(len(crops), *grid[kind]), (patch,) * 3)
+            mask_tensor = masks[kind]["device"]
             student_origins = torch.stack([plans[b][f"{kind}_origins"][v] for v in range(slots) for b in range(B)])
             student_orient = torch.stack([plans[b][f"{kind}_orientations"][v] for v in range(slots) for b in range(B)])
             teacher_set = slot // per_set
@@ -177,10 +189,10 @@ class JemBatchProcessor(BatchProcessor):
             corr = native.correspondence(
                 support, source, student_origins, grid[kind], student_orient,
                 teacher_origins, teacher_grid, teacher_orient, lattice=self.lattice)
-            batch[f"{kind}_crops"] = self._store(crops)
+            batch[f"{kind}_crops"] = crops
             batch[f"{kind}_masks"] = mask_tensor
-            batch[f"{kind}_mask_applied"] = masks["applied"]
-            batch[f"{kind}_mask_counts"] = masks["counts"]
+            batch[f"{kind}_mask_applied"] = masks[kind]["applied"]
+            batch[f"{kind}_mask_counts"] = masks[kind]["counts"]
             batch[f"{kind}_targets"] = torch.as_tensor(corr["teacher_index"]).long()
             batch[f"{kind}_valid"] = torch.as_tensor(corr["student_valid"]).bool()
             if self.lattice:
@@ -192,7 +204,7 @@ class JemBatchProcessor(BatchProcessor):
             batch[f"{kind}_orientations"] = student_orient
             batch[f"{kind}_overlap"] = torch.stack([plans[b][f"{kind}_overlap"][v]
                                                     for v in range(slots) for b in range(B)])
-        batch["teacher_crops"] = self._store(teacher_crops)
+        batch["teacher_crops"] = outputs["teacher"]
         batch["teacher_grid"] = teacher_grid
         batch["teacher_orientations"] = torch.stack([plans[b]["teacher_orientations"][s]
                                                      for s in range(n_sets) for b in range(B)])
