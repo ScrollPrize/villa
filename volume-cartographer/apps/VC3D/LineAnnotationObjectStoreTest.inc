@@ -1,4 +1,5 @@
 #include <iostream>
+#include <vc_reader/http.hpp>
 #include <QApplication>
 #include <QElapsedTimer>
 #include <QThread>
@@ -43,6 +44,7 @@ int runObjectStoreControllerTests()
     auto require = [](bool value, const char* message) { if (!value) throw std::runtime_error(message); };
     const auto path = std::filesystem::temp_directory_path() / ("vc3d-store-test-"+vc::objects::util::newUuid()+".vcobj");
     try {
+#include "LineAnnotationNearbyBenchmark.inc"
         if (const char* endpoint = std::getenv("VC3D_SSH_STORE_TEST")) {
             QTemporaryDir directory;
             const auto local = fs::path(directory.path().toStdString()) / "local.vcobj";
@@ -558,6 +560,12 @@ int runObjectStoreControllerTests()
                     "fibers without a binding list without a volume length");
         }
         require(controller.fiberSnapshotsForSideStripQuery({a, b}).size() == 2, "warm linked fiber snapshots");
+        {
+            const auto retained = controller._sideStripStoredSnapshotCache.at(b.id).snapshot.polyline;
+            (void)controller.fiberSnapshotsForSideStripQuery({a});
+            require(controller._sideStripStoredSnapshotCache.at(b.id).snapshot.polyline == retained,
+                    "visiting a different candidate set retains immutable stored snapshots");
+        }
         collection.selectFiber(a.id, false, false);
         {
             const auto generation = controller._fiberDataGeneration;

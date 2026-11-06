@@ -557,7 +557,10 @@ private:
         std::function<void(std::vector<SideStripMarker> markers)>;
     using SideStripCancelCallback = std::function<bool()>;
 
+    struct FiberReadContext;
+    struct SideStripLoadContext;
     struct SideStripIntersectionRequest {
+        std::shared_ptr<SideStripLoadContext> load;
         size_t unboundFibers = 0;
         bool suppressErrorDialogs = false;
         uint64_t token = 0;
@@ -571,9 +574,11 @@ private:
         cv::Mat_<cv::Vec3f> stripPoints;
         std::vector<SideStripFiberSnapshot> fibers;
         std::vector<vc::fiber_tracer::FiberSideStripLineQuery> branchLinks;
+        std::set<uint64_t> sameHvBranchIds;
     };
 
     struct SideStripIntersectionTaskResult {
+        std::shared_ptr<SideStripLoadContext> load;
         size_t unboundFibers = 0;
         bool ok = false;
         bool suppressErrorDialogs = false;
@@ -1095,6 +1100,7 @@ private:
     // "H"/"V" from the manual tag, falling back to the automatic classification;
     // empty when unknown or the fiber is not in the store.
     [[nodiscard]] QString fiberHvDirectionTag(uint64_t fiberId) const;
+    static QString storedFiberHvDirectionTag(const StoredFiber&);
     // Pushes the H/V tag and the clickable tag buttons to the pane's dialog.
     void pushFiberUiState(const PaneRecord& pane) const;
     [[nodiscard]] std::optional<std::string> pickDataset(QWidget* parent,
@@ -1166,6 +1172,15 @@ private:
     [[nodiscard]] std::vector<SideStripFiberSnapshot> fiberSnapshotsForSideStripQuery(
         const std::vector<StoredFiber>& stored) const;
     void startSideStripIntersectionQuery(SideStripIntersectionRequest request);
+    void calculateSideStripIntersections(SideStripIntersectionRequest request);
+    bool sideStripContextCurrent(const SideStripLoadContext&) const;
+    static std::vector<StoredFiber> readStoredFibersInContext(
+        FiberReadContext&, const std::optional<std::vector<std::string>>&, bool, FiberDependencies*);
+    static std::vector<StoredFiberPtr> storedFibersInContext(
+        FiberReadContext&, const std::optional<std::vector<std::string>>&, bool);
+    static void prepareSideStripSnapshots(SideStripIntersectionRequest&);
+    static SideStripFiberSnapshot makeSideStripSnapshot(uint64_t id, uint64_t generation,
+        const std::vector<cv::Vec3d>& points, const std::vector<cv::Vec3d>& controls);
     void updateSideStripIntersectionProgress(uint64_t token,
                                              const std::string& surfaceName,
                                              const std::string& stage,
@@ -1469,13 +1484,16 @@ private:
     QString _runningSideStripFingerprint;
     // Per-fiber snapshot caches behind fiberSnapshotsForSideStripQuery():
     // stored fibers keyed by generation, open sessions keyed by
-    // (lineRevision, solve-queue epoch). Entries for fibers that vanished
-    // are swept on each rebuild.
+    // (lineRevision, solve-queue epoch). Stored snapshots survive candidate
+    // changes within a 256 MiB budget; sessions are swept on each rebuild.
     struct SideStripSnapshotCacheEntry {
         uint64_t validityA = 0;
         uint64_t validityB = 0;
         SideStripFiberSnapshot snapshot;
+        uint64_t lastUse = 0;
     };
+    static void trimSideStripSnapshots(std::unordered_map<uint64_t, SideStripSnapshotCacheEntry>&);
+    mutable uint64_t _sideStripSnapshotClock = 0;
     mutable std::unordered_map<uint64_t, SideStripSnapshotCacheEntry>
         _sideStripStoredSnapshotCache;
     mutable std::unordered_map<uint64_t, SideStripSnapshotCacheEntry>

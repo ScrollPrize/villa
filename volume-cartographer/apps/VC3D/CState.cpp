@@ -330,6 +330,9 @@ vc::objects::HostedSessionOptions CState::hostedOptions(const QString& author)
 {
     vc::objects::HostedSessionOptions options;
     options.author = author.toStdString();
+    options.cacheDirectory = vc::settings::remoteCachePath();
+    options.diskCacheBytes = vc::settings::remoteCacheMaxBytes();
+    options.minFreeBytes = vc::settings::remoteCacheMinFreeBytes();
     return options;
 }
 

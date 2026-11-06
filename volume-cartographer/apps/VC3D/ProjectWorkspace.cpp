@@ -51,7 +51,7 @@
 namespace {
 
 enum StoreColumn { StoreName, StoreAccess, StoreSurfaces, StoreFibers, StorePointCollections, StoreSize,
-                   StoreFolder, StoreColumns };
+                   StoreDownload, StoreFolder, StoreColumns };
 enum ResourceColumn { ResName, ResLocation, ResTags, ResShape, ResVoxel, ResLevels, ResType, ResCache,
                       ResColumns };
 // Item data: what a resource row is.
@@ -339,7 +339,7 @@ ProjectWorkspace::ProjectWorkspace(CState* state, MenuActionController* menu, QW
     _stores->setAlternatingRowColors(true);
     _stores->setColumnCount(StoreColumns);
     _stores->setHeaderLabels({tr("Store"), tr("Access"), tr("Surfaces"), tr("Fibers"), tr("Point collections"),
-                              tr("Size"), tr("Folder")});
+                              tr("Size"), tr("Objects cache"), tr("Folder")});
     _stores->header()->setStretchLastSection(true);
     connect(_stores, &QTreeWidget::itemSelectionChanged, this, &ProjectWorkspace::updateStoreButtons);
     storeRow->addWidget(_stores, 1);
@@ -540,6 +540,7 @@ void ProjectWorkspace::rebuildStores()
             continue;
         }
         if (!available) {
+            item->setText(StoreDownload, tr("Local"));
             const auto path = _state->vpkg()->document().resolve(reference.at("location"));
             item->setText(StoreName, QString::fromStdString(path.filename().string()));
             item->setText(StoreAccess, tr("Missing"));
@@ -567,8 +568,63 @@ void ProjectWorkspace::rebuildStores()
         });
         if (hosted) {
             item->setText(StoreFolder, tr("hosted"));
+            auto* controls = new QWidget(_stores);
+            auto* layout = new QVBoxLayout(controls);
+            layout->setContentsMargins(2, 2, 2, 2);
+            auto* progress = new QLabel(controls);
+            progress->setWordWrap(true);
+            progress->setFixedWidth(280);
+            progress->setFixedHeight(progress->fontMetrics().lineSpacing() * 3);
+            auto* download = new QPushButton(tr("Download Objects"), controls);
+            download->setObjectName(QStringLiteral("downloadStoreObjects"));
+            layout->addWidget(progress);
+            layout->addWidget(download);
+            _stores->setItemWidget(item, StoreDownload, controls);
+            const auto update = [session, store, download, progress] {
+                const auto job = session->objectPrefetch(store);
+                const auto freshness = session->freshness(store);
+                const bool reachable = freshness && freshness->error.empty();
+                if (!job) {
+                    download->setText(QObject::tr("Download Objects"));
+                    download->setEnabled(reachable);
+                    progress->setText(QObject::tr("Not downloaded"));
+                    return;
+                }
+                const auto state = job->snapshot();
+                progress->show();
+                QString text = QString::fromStdString(state.stage) +
+                    QObject::tr(" · %1/%2 objects · %3").arg(state.completed).arg(state.total).arg(bytes(state.downloadedBytes));
+                if (state.done && state.captured) text += QObject::tr(" · revision %1").arg(state.captured->commitSequence);
+                progress->setText(text);
+                QStringList errors;
+                for (const auto& error : state.errors) errors << QString::fromStdString(error);
+                progress->setToolTip(errors.join('\n'));
+                const bool newer = state.captured && freshness && freshness->status &&
+                    (state.captured->generation != freshness->status->generation ||
+                     state.captured->commitSequence != freshness->status->commitSequence);
+                download->setText(!state.done ? QObject::tr("Cancel") : newer ? QObject::tr("Update Cache") :
+                    state.complete ? QObject::tr("Check Cache") : QObject::tr("Resume Download"));
+                download->setEnabled(!state.done || reachable);
+            };
+            connect(download, &QPushButton::clicked, controls, [session, store, update, controls] {
+                try {
+                    const auto job = session->objectPrefetch(store);
+                    if (job && !job->snapshot().done) job->cancel();
+                    else session->prefetchObjects(store);
+                    update();
+                } catch (const std::exception& error) {
+                    QMessageBox::warning(controls, QObject::tr("Download Objects"), QString::fromUtf8(error.what()));
+                }
+            });
+            auto* timer = new QTimer(controls);
+            timer->setInterval(250);
+            connect(timer, &QTimer::timeout, controls, update);
+            timer->start();
+            update();
+            item->setSizeHint(StoreDownload, controls->sizeHint());
             continue;
         }
+        item->setText(StoreDownload, tr("Local"));
         std::error_code ec;
         const auto size = std::filesystem::file_size(path, ec);
         item->setText(StoreSize, ec ? QString() : bytes(size));
@@ -578,11 +634,12 @@ void ProjectWorkspace::rebuildStores()
     updateStoreCounts();
     for (int c = 0; c < StoreFolder; ++c) _stores->resizeColumnToContents(c);
     // As tall as its rows (or the routes beside it), so the data list above gets the room.
-    const int rowHeight = _stores->topLevelItemCount() ? _stores->visualItemRect(_stores->topLevelItem(0)).height() : 0;
+    int rowsHeight = 0;
+    for (int row = 0; row < _stores->topLevelItemCount(); ++row)
+        rowsHeight += std::max(_stores->visualItemRect(_stores->topLevelItem(row)).height(), fontMetrics().height() + 4);
     _stores->setFixedHeight(std::max(_routesPanel->sizeHint().height(),
                                      _stores->header()->sizeHint().height() + 2 * _stores->frameWidth() +
-                                         std::max(1, _stores->topLevelItemCount()) *
-                                             std::max(rowHeight, fontMetrics().height() + 4) + 4));
+                                         rowsHeight + 4));
     updateStoreButtons();
 }
 
