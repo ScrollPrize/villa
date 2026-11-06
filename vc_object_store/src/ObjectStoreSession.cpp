@@ -9,6 +9,7 @@
 #include "vc_object_store/objects/StoreReader.hpp"
 #include "vc_object_store/objects/TransactionJson.hpp"
 #include "vc_object_store/Uuid.hpp"
+#include <vc_reader/native/platform_io.hpp>
 #include <algorithm>
 #include <nlohmann/json.hpp>
 #include <stdexcept>
@@ -498,7 +499,7 @@ std::string ObjectStoreSession::copyObject(const AttachmentIdentity& from, const
     std::optional<ObjectCopy> copy;
     readStore(from, [&](const StoreReader& reader, const auto&) { copy = readObjectCopy(reader, objectUuid); });
     if (!name.empty()) copy->record.name = name;
-    submitCopy(to, *copy);
+    submitCopy(from, to, *copy);
     return copy->record.uuid;
 }
 
@@ -510,14 +511,41 @@ void ObjectStoreSession::importObject(const AttachmentIdentity& from, const Atta
     readStore(from, [&](const StoreReader& reader, const auto&) {
         copy = readObjectCopy(reader, objectUuid, util::canonicalUuid(objectUuid));
     });
-    submitCopy(to, *copy);
+    submitCopy(from, to, *copy);
 }
 
-void ObjectStoreSession::submitCopy(const AttachmentIdentity& to, const ObjectCopy& copy)
+void ObjectStoreSession::submitCopy(const AttachmentIdentity& from, const AttachmentIdentity& to, const ObjectCopy& copy)
 {
     auto request = newRequest(to);
     request.expectedObjects[copy.record.uuid] = std::nullopt;
     request.operations = objectCopyOperations(copy);
+    // The manifest belongs to the version read above. Transfer its immutable
+    // blobs before publishing the copy, without rereading the source's head.
+    const auto files = artifactManifest(copy.record);
+    if (from != to && !files.empty()) {
+        withAttachment(to, true, [&](Attachment& destination) {
+            struct Staging {
+                std::filesystem::path path;
+                ~Staging() {
+                    if (!path.empty()) { std::error_code ignored; std::filesystem::remove_all(path, ignored); }
+                }
+            } staging;
+            for (const auto& file : files) {
+                const auto held = destination.remote ? destination.remote->client().artifactLength(file.sha256)
+                                                     : destination.store().artifactLength(file.sha256);
+                if (held == file.length) continue;
+                if (staging.path.empty())
+                    staging.path = vcr::platform::make_temp_directory(
+                        (std::filesystem::temp_directory_path() / "vc-object-copy-XXXXXX").string());
+                const auto path = staging.path / file.sha256;
+                writeArtifact(from, file, path);
+                const auto hash = destination.remote ? destination.remote->client().putArtifact(path)
+                                                     : destination.store().putArtifact(path, true);
+                if (hash != file.sha256) throw std::runtime_error("copied artifact hash mismatch: " + file.name);
+                std::filesystem::remove(path);
+            }
+        });
+    }
     submit(to, request);
 }
 
@@ -528,10 +556,15 @@ std::optional<TransactionReceipt> ObjectStoreSession::editCurrent(const Attachme
     if (objectUuids.empty()) return std::nullopt;
     auto request = newRequest(identity);
     readStore(identity, [&](const StoreReader& reader, const auto&) {
+        // Guard the versions before callbacks read or compute their edits. A
+        // hosted poll during a callback must not advance these expectations.
+        editCurrentRequest(reader, request, objectUuids, {});
         std::vector<TransactionOperation> edits;
         for (const auto& objectUuid : objectUuids)
             for (auto& operation : operations(reader, util::canonicalUuid(objectUuid))) edits.push_back(std::move(operation));
-        editCurrentRequest(reader, request, objectUuids, std::move(edits));
+        // Relationship decisions still run after the edits they describe.
+        for (auto& operation : request.operations) edits.push_back(std::move(operation));
+        request.operations = std::move(edits);
     });
     return submit(identity, request);
 }

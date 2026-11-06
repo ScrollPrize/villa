@@ -284,6 +284,13 @@ try {
         auto byLength = tracks; byLength.orderBy = "length_desc";
         require(ids(hosted.selectAllObjects(byLength, std::nullopt, 3)) == ids(local.selectObjects(txn, byLength)),
             "offset-paged selection parity");
+        for (const auto offset : {1, 3, 7, 10}) {
+            auto afterOffset = tracks;
+            afterOffset.offset = offset;
+            require(ids(hosted.selectAllObjects(afterOffset, std::nullopt, 2, 3, &asOf)) ==
+                        ids(local.selectObjects(txn, afterOffset)), "UUID listing with an initial offset");
+            require(asOf.commitSequence == local.status(txn).commitSequence, "offset listing snapshot");
+        }
         auto page = tracks; page.limit = 3;
         const std::vector<std::string> metaOnly{"meta"};
         const auto projected = hosted.selectObjects(page, metaOnly);

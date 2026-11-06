@@ -302,13 +302,13 @@ public:
     // Add, then remove, tags of these objects.
     void tagObjects(const AttachmentIdentity&, const std::vector<std::string>& objectUuids,
                     const std::vector<std::string>& add, const std::vector<std::string>& remove = {});
-    // Copy an object's current record and geometry from one attachment into
+    // Copy an object's current record, geometry and artifacts from one attachment into
     // another as a new object (objects/ObjectCopy.hpp) named `name` (empty: the
     // original's name), in one commit; returns its UUID.
     std::string copyObject(const AttachmentIdentity& from, const AttachmentIdentity& to, const std::string& objectUuid,
                            const std::string& name = {});
     // Bring an object into another attachment as the same object (same UUID):
-    // its current record and geometry become its first revision there. Throws
+    // its current record, geometry and artifacts become its first revision there. Throws
     // when the destination already has the object. An object without local
     // geometry is fetched first.
     void importObject(const AttachmentIdentity& from, const AttachmentIdentity& to, const std::string& objectUuid);
@@ -402,7 +402,7 @@ public:
     void requireCurrent(const PinnedObject&);
 
 private:
-    void submitCopy(const AttachmentIdentity& to, const ObjectCopy&);
+    void submitCopy(const AttachmentIdentity& from, const AttachmentIdentity& to, const ObjectCopy&);
     struct Attachment;
     std::shared_ptr<Attachment> open(const std::filesystem::path&, const OpenOptions&);
     std::shared_ptr<Attachment> find(const AttachmentIdentity&) const;

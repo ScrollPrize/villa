@@ -452,6 +452,72 @@ try {
         }
     }
 
+    // Copies and imports transfer the artifacts named by the copied version,
+    // for every local/hosted direction, including a second copy of held bytes.
+    {
+        const auto secondPath = directory.path / "second.vcobj";
+        { auto store = ObjectStore::create(secondPath, options); }
+        auto secondOptions = serverOptions;
+        secondOptions.port = 0;
+        server::Server secondService(secondPath, secondOptions);
+        secondService.start();
+        const auto second = session.attachHosted("http://127.0.0.1:" + std::to_string(secondService.port()), hostedOptions);
+        const auto anotherPath = directory.path / "another.vcobj";
+        { auto store = ObjectStore::create(anotherPath, options); }
+        const auto another = session.attach(anotherPath, options);
+        for (const auto& from : {local, hosted}) for (const bool importing : {false, true}) {
+            const auto object = util::newUuid();
+            ObjectRecord record; record.uuid = object; record.kind = "surface";
+            session.submit(from, request(session, from, {{object, std::nullopt}},
+                {CreateObjectOp{objectRecordJson(record)}, PutGeometryOp{object, vc::geometry::encode(tilted(0)), {}}}));
+            const auto model = directory.path / "model.pt", empty = directory.path / "empty.bin";
+            const auto content = "model of " + object;
+            { std::ofstream(model, std::ios::binary) << content; std::ofstream(empty, std::ios::binary); }
+            session.publishArtifacts(from, object, 1, {{"model.pt", model}, {"nested/model.pt", model}, {"empty.bin", empty}});
+            const auto manifest = artifactManifestJson(session.artifacts(from, object));
+            for (const auto& to : {another, second}) {
+                for (int attempt = 0; attempt < (importing ? 1 : 2); ++attempt) {
+                    std::string copied;
+                    if (importing) { session.importObject(from, to, object); copied = object; }
+                    else copied = session.copyObject(from, to, object, "copied with files");
+                    const auto out = directory.path / copied;
+                    require(artifactManifestJson(session.materializeArtifacts(to, copied, out)) == manifest,
+                            "copied artifact manifest");
+                    for (const auto* name : {"model.pt", "nested/model.pt"}) {
+                        std::ifstream in(out / name, std::ios::binary);
+                        require(std::string(std::istreambuf_iterator<char>(in), {}) == content, "copied artifact bytes");
+                    }
+                    require(std::filesystem::file_size(out / "empty.bin") == 0, "copied empty artifact");
+                }
+            }
+        }
+        session.detach(second);
+        session.detach(another);
+    }
+
+    // A poll between constructing an edit and submitting it must not advance
+    // its expected version past the metadata the editor actually read.
+    {
+        const auto object = util::newUuid();
+        ObjectRecord record; record.uuid = object; record.kind = "note"; record.name = "original";
+        session.submit(hosted, request(session, hosted, {{object, std::nullopt}}, {CreateObjectOp{objectRecordJson(record)}}));
+        HostedStore other(endpoint);
+        bool conflicted = false;
+        try {
+            session.editRecords(hosted, {object}, [&](ObjectRecord& record) {
+                record.name = "renamed";
+                other.submit(request(session, hosted, {{object, 1}}, {SetMetaOp{object, "other_writer", "true"}}));
+                session.refresh(hosted); // deterministic poller interleaving
+            });
+        } catch (const TransactionConflict& conflict) {
+            conflicted = conflict.reason() == TransactionConflict::Reason::Version;
+        }
+        const auto current = other.currentObjectRevision(object);
+        require(conflicted && current->version == 2 && current->record.name == "original" &&
+                    nlohmann::json::parse(current->record.meta).at("other_writer") == true,
+                "a concurrent record edit conflicts without losing the other writer's metadata");
+    }
+
     // Detaching stops the poller: nothing arrives after Detached.
     (void)session.takeEvents();
     session.detach(hosted);

@@ -358,11 +358,11 @@ std::vector<ObjectRecord> HostedStore::selectAllObjects(ObjectSelection selectio
 {
     if (selection.limit) throw std::invalid_argument("hosted store: selectAllObjects pages itself; remove the limit");
     // UUID order pages by cursor and catches up from the feed. Length order
-    // and volume listings with unbound objects page by offset, which is exact
-    // only within one snapshot: they restart when a commit lands.
-    const bool byCursor = selection.orderBy == "uuid" && !selection.includeUnbound;
+    // and volume listings with unbound objects, or an explicit initial offset,
+    // page by offset within one snapshot: they restart when a commit lands.
+    const bool byCursor = selection.orderBy == "uuid" && !selection.includeUnbound && selection.offset == 0;
     if (!byCursor && (selection.afterUuid || selection.afterLength))
-        throw std::invalid_argument("hosted store: selectAllObjects starts length/unbound listings at an offset, not a cursor");
+        throw std::invalid_argument("hosted store: selectAllObjects cannot combine a cursor with offset paging");
     const auto start = selection;
     if (byCursor) {
         CatchUp<ObjectRecord> listing{*this, pageSize, maxRestarts};

@@ -98,7 +98,8 @@ public:
     // applicableOnly edges, an expired feed position), and throws StoreBusy
     // after `maxRestarts` restarts or when the feed never goes quiet
     // (sustained writes far above interactive rates). Length-ordered and
-    // unbound-volume listings page by offset and restart on any commit. The
+    // unbound-volume listings, and listings starting at a nonzero offset,
+    // page by offset and restart on any commit. The
     // selection must not carry a limit; its starting cursor/offset is kept.
     std::vector<ObjectRecord> selectAllObjects(ObjectSelection,
         const std::optional<std::vector<std::string>>& fields = std::nullopt, int64_t pageSize = 1000,
