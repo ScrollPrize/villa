@@ -290,6 +290,20 @@ class ObjectiveTests(JemTestCase):
             torch.testing.assert_close(m[f"contrib_{name}_masked"] + m[f"contrib_{name}_unmasked"], total,
                                        rtol=1e-4, atol=1e-6)
 
+    def test_linear_tokenizer_comparison(self):
+        config = tiny_config(self.root)
+        backbone = dict(config["backbone"], embedding_type="default")
+        config = normalize_config({**config, "backbone": backbone})
+        torch.manual_seed(0)
+        method = JemMethod(config, device="cpu")
+        embed = method.model_module.student.backbone.down_projection.proj
+        self.assertEqual((tuple(embed.kernel_size), tuple(embed.stride), embed.bias is not None), ((4,) * 3, (4,) * 3, True))
+        dataset = SSLZarrDataset(method.dataset_config(config["data"]["dataset"], training=True), do_augmentations=True)
+        batch, _ = batch_for(method, dataset, "cpu")
+        output, grads = run(method, batch)
+        self.assertTrue(math.isfinite(float(output.loss)))
+        self.assertTrue(all(torch.isfinite(g).all() for g in grads.values()))
+
     @unittest.skipUnless(CUDA, "CUDA")
     def test_cuda_bf16_step(self):
         method, dataset, _ = build(self.root, device="cuda", chunk=2)
