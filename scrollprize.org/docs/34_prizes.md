@@ -312,14 +312,14 @@ The prizes above feel too ambitious? There are plenty of other ways to contribut
 <div className="vc-deadline">
 
 {/* progress-prizes:deadline:start */}
-Submissions are evaluated monthly, and multiple submissions/awards per month are permitted. The next deadline is 11:59pm Pacific, October 31st, 2026!
+Submissions are evaluated monthly, and multiple submissions/awards per month are permitted. The next deadline is 11:59pm Pacific, November 30th, 2026!
 {/* progress-prizes:deadline:end */}
 
 </div>
 <div className="vc-submit">
 
 {/* progress-prizes:form:start */}
-[Submission Form](https://docs.google.com/forms/d/e/1FAIpQLSc4flEfgK2nyjoczz2_U_XrIGMlgrnSknWatLqrFPnbtKfZwg/viewform)
+[Submission Form](https://docs.google.com/forms/d/e/1FAIpQLSeB6MC_--4UCCEGc3zalX57-uE4puRcE_vJoYJCrEt4uYaaaw/viewform)
 {/* progress-prizes:form:end */}
 
 </div>
@@ -337,16 +337,16 @@ We favor submissions that:
 * Are **released or open-sourced early**. Tools released earlier have a higher chance of being used for reading the scrolls than those released the last day of the month. This includes releasing model weights and training data where applicable.
 * Actually **get used**. We’ll look for signals from the community: questions, comments, bug reports, feature requests. Our Annotation Team will publicly provide comments on tools they use.
 * Improve results quantitatively and/or qualitatively on **real data**. If you are working on [ink detection](/data_datasets#ink-labels-2026-07) or [surface prediction](/data_datasets#surface-labels-2026-07) your method should be evaluated on our public datasets. If you are working on virtual unwrapping, show visually that papyrus fibers are visible on your output surface, and it doesn't jump across sheets in cross-section.
-* Resolve outstanding **bugs in tools that people are using**, and that you are using yourself, evidenced by before/after screenshots, logs, etc.
-* Reveal **insightful, actionable** information. If you are building analytic tools, show how they facilitated improvements to unwrapping or ink detection, for example by detecting failure-cases of existing methods on real scroll data, or producing information that resulted in better model results for the relevant task (see above).
+* Resolve outstanding **bugs in tools that people are using**, and that you are using yourself, evidenced by before/after screenshots, logs, etc. Fixes for issues that are theoretically wrong but rarely or never cause problems in practice are unlikely to be awarded.
 * Are **well documented**. It helps a lot if relevant documentation, walkthroughs, images, tutorials or similar are included with the work so that others can use it!
 
 Any contribution that makes any of the [Open Problems](/2026_open_problems) easier to address will be eligible for a Progress Prize.
 We maintain a [public wishlist](https://github.com/ScrollPrize/villa/issues?q=is%3Aissue%20state%3Aopen%20label%3A%22help%20wanted%22) of ideas that would make excellent progress prize submissions.
 [Improvements to VC3D](https://github.com/ScrollPrize/villa/issues?q=is%3Aissue%20state%3Aopen%20label%3AVC3D) can be also considered for progress prizes!
 Some are additionally labeled as [good first issues](https://github.com/ScrollPrize/villa/issues?q=is%3Aissue%20state%3Aopen%20label%3A%22good%20first%20issue%22) for newcomers!
+We discourage standalone analytic, auditing or evaluation tools, and instead encourage work that directly **advances unwrapping or ink detection**.
 
-If you make multiple small contributions in a month, for example several bugfix PRs on our [villa](https://github.com/ScrollPrize/villa) monorepo, please bundle them into a single submission. More substantial contributions (new methods, models or datasets) should each be submitted separately, unless they are closely coupled.
+If you make multiple small contributions in a month, for example improvements to tooling, please bundle them into a single submission. More substantial contributions (new methods, models or datasets) should each be submitted separately, unless they are closely coupled.
 
 <details>
 <summary>Submission criteria and requirements</summary>

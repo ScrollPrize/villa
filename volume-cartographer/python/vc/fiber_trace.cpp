@@ -1154,6 +1154,7 @@ NB_MODULE(fiber_trace, m)
             nb::gil_scoped_release release;return c.liveHit(toVec(p),toVec(d),r,pair,epoch,w,t);
         })
         .def("drop_live",&ft::FiberVolumeCoverage::dropLive,nb::call_guard<nb::gil_scoped_release>());
+    m.def("stream_trace_config",&ft::fiberStreamTraceConfig,"trace"_a,"reverse_consistency"_a=true);
     m.def("run_stream_volume",[](const PredictionFieldHandle& field,const NormalSamplerHandle& normals,
         const ft::FiberTraceConfig& trace,const ft::FiberChunkTraceConfig& chunks,const std::string& options,
         const std::vector<std::array<int,3>>& keys,const std::string& output) {

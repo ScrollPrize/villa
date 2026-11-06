@@ -136,15 +136,4 @@ void AgentBridgeServer::registerFiberHandlers()
             .mcp = Mcp::exact(QStringLiteral("vc3d_fiber_export")),
         },
         [this](const QJsonValue& p) { return handleFiberExport(p); });
-
-    registerMethod(
-        {
-            .name = QStringLiteral("fiber.import"),
-            .params = {
-                Params::requiredString(QStringLiteral("path")),
-            },
-            .errors = {-32602, -32000, -32010, -32007, -32005},
-            .mcp = Mcp::exact(QStringLiteral("vc3d_fiber_import")),
-        },
-        [this](const QJsonValue& p) { return handleFiberImport(p); });
 }

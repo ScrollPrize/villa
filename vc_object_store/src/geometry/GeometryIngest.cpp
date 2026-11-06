@@ -9,6 +9,7 @@
 #include "formats/RemoteSource.hpp"
 #include <nlohmann/json.hpp>
 #include <algorithm>
+#include <functional>
 #include <map>
 #include <set>
 
@@ -41,17 +42,21 @@ void ingestBatch(const Commit& commit, std::vector<Prepared> batch,
 {
     const auto count = batch.size();
     int64_t edges = 0;
+    std::vector<std::string> created;
     commit([&](ObjectStore& db, WriteTxn& write) {
+        created.clear();
         for (const auto& p : batch) {
             const auto existing = db.objectByUuid(write, p.object.uuid);
             const auto& e = expectations.at(p.object.uuid);
             if ((existing ? std::optional(existing->generation) : std::nullopt) != e.generation)
-                throw std::runtime_error("object changed while reading source; retry ingestion");
-            if (existing && existing->kind != p.object.kind) throw std::runtime_error("source UUID belongs to another object kind");
+                throw GeometrySourceRejected("object changed while reading source; retry ingestion");
+            if (existing && existing->kind != p.object.kind) throw GeometrySourceRejected("source UUID belongs to another object kind");
         }
+        for (const auto& p : batch) created.push_back(detail::sourceUuid(p.object.uuid));
         edges = detail::ingestGeometryBatch(db, write, std::move(batch), coordinateContext, registeredInitial);
     });
     report.ingested += count; report.edgesImported += edges;
+    report.uuids.insert(report.uuids.end(), created.begin(), created.end());
 }
 void ingestOne(const Commit& commit, Prepared p, const Expected& expected, GeometryIngestReport& report,
     const std::string& coordinateContext)
@@ -85,11 +90,12 @@ void problem(GeometryIngestReport& report, const std::string& label, const std::
 }
 
 std::vector<GeometrySource> prepareGeometrySource(const std::string& kind, const fs::path& source,
-    const std::vector<std::string>& availableUuids)
+    const std::vector<std::string>& availableUuids, const SourceIngestOptions& options)
 {
-    if (kind == "fiber") return formats::fibers(source, availableUuids);
-    if (kind == "surface") return {surface(source)};
-    if (kind == "point_collection") return collections(source);
+    if (options.uuidNamespace) util::canonicalUuid(*options.uuidNamespace);
+    if (kind == "fiber") return formats::fibers(source, availableUuids, options);
+    if (kind == "surface") return {surface(source, options.uuidNamespace)};
+    if (kind == "point_collection") return collections(source, options);
     if (kind == "umbilicus") return {formats::umbilicus(source)};
     throw std::invalid_argument("unsupported batch geometry kind: " + kind);
 }
@@ -177,17 +183,45 @@ GeometryIngestReport ingestRegisteredGeometry(ObjectStore& db, const std::option
 }
 
 namespace {
-// Stops before the next surface or track once `cancelled` is set.
-GeometryIngestReport ingestSource(ObjectStore& db, const Commit& commit, const std::string& kind,
-    const fs::path& source, const util::ProgressCallback& progress, const std::string& coordinateContext,
-    const std::vector<std::string>& tags, const std::atomic_bool& cancelled)
+// Ends ingestion at a failure that is not the source's (stopOnInfrastructureError).
+struct Stopped {};
+// Reports the failure of the step `label`. A rejected source is a problem of
+// that source. Any other failure is the store's: a problem as well, unless the
+// options stop ingestion at it.
+void failed(GeometryIngestReport& report, const SourceIngestOptions& options, const std::string& label,
+    const std::exception& error)
 {
-    GeometryIngestReport report;
+    if (const auto* exists = dynamic_cast<const GeometryIdentitiesExist*>(&error))
+        report.existing.insert(report.existing.end(), exists->uuids.begin(), exists->uuids.end());
+    if (dynamic_cast<const GeometrySourceRejected*>(&error) || !options.stopOnInfrastructureError) {
+        problem(report, label, error);
+        return;
+    }
+    report.fatalError = label + ": " + error.what();
+    throw Stopped{};
+}
+// A step that only reads and decodes source files or the caller's request:
+// whatever fails there rejects the source.
+template <class Step> auto fromSource(Step&& step)
+{
+    try { return step(); }
+    catch (const GeometrySourceRejected&) { throw; }
+    catch (const std::exception& error) { throw GeometrySourceRejected(error.what()); }
+}
+// Stops before the next surface or track, or before a batch commits, once `stop` is true.
+void ingestSource(GeometryIngestReport& report, ObjectStore& db, const Commit& commit, const std::string& kind,
+    const fs::path& source, const util::ProgressCallback& progress, const std::string& coordinateContext,
+    const std::vector<std::string>& tags, const SourceIngestOptions& options, const std::function<bool()>& stop)
+try {
     try {
-        geometryCoordinates(Json::parse(coordinateContext));
+        fromSource([&] {
+            geometryCoordinates(Json::parse(coordinateContext));
+            if (options.uuidNamespace) util::canonicalUuid(*options.uuidNamespace);
+            return 0;
+        });
         if (kind == "track") {
-            const auto packed = resolvePackedTrackStore(source);
-            PackedTrackStore store(packed);
+            const auto packed = fromSource([&] { return resolvePackedTrackStore(source); });
+            const auto store = fromSource([&] { return std::make_unique<PackedTrackStore>(packed); });
             std::map<std::string, ObjectRecord> existing;
             std::map<std::string, Expected> expectations;
             std::set<std::string> refs;
@@ -204,11 +238,12 @@ GeometryIngestReport ingestSource(ObjectStore& db, const Commit& commit, const s
                     }
                 }
             }
-            if (refs.size() > 1) throw std::runtime_error("track dataset registered under multiple aliases");
+            if (refs.size() > 1) throw GeometrySourceRejected("track dataset registered under multiple aliases");
             const auto ref = refs.empty() ? packed.string() : *refs.begin();
-            for (size_t row = 0; row < store.sourceIds().size() && !cancelled; ++row) {
-                const auto key = std::to_string(store.sourceIds()[row]);
-                util::reportProgress(progress, "ingesting tracks", row, store.sourceIds().size(), key);
+            size_t row = 0;
+            for (; row < store->sourceIds().size() && !stop(); ++row) {
+                const auto key = std::to_string(store->sourceIds()[row]);
+                util::reportProgress(progress, "ingesting tracks", row, store->sourceIds().size(), key);
                 try {
                     ObjectRecord object;
                     if (existing.contains(key)) object = existing.at(key);
@@ -218,26 +253,32 @@ GeometryIngestReport ingestSource(ObjectStore& db, const Commit& commit, const s
                         object.track = TrackDetail{}; object.track->datasetRef = ref; object.track->externalKey = key;
                     }
                     const auto e = expectations.contains(object.uuid) ? expectations.at(object.uuid) : Expected{};
-                    auto prepared = track(store, row, object);
-                    if (fs::exists(packed / "metadata.json")) prepared.source = readJson(packed / "metadata.json");
+                    auto prepared = fromSource([&] {
+                        auto p = track(*store, row, object);
+                        if (fs::exists(packed / "metadata.json")) p.source = readJson(packed / "metadata.json");
+                        return p;
+                    });
                     addTags(prepared, tags);
                     ingestOne(commit, std::move(prepared), e, report, coordinateContext);
-                } catch (const std::exception& error) { problem(report, key, error); }
+                } catch (const std::exception& error) { failed(report, options, key, error); }
             }
+            report.cancelled = row < store->sourceIds().size();
         } else if (kind == "surface") {
             // Surfaces have no native relationships among themselves: each commits on its own.
-            const auto directories = surfaceDirectories(source);
-            for (size_t i = 0; i < directories.size() && !cancelled; ++i) {
+            const auto directories = fromSource([&] { return surfaceDirectories(source); });
+            size_t i = 0;
+            for (; i < directories.size() && !stop(); ++i) {
                 const auto& directory = directories[i];
                 util::reportProgress(progress, "ingesting surfaces", i, directories.size(), directory.filename().string());
                 try {
                     Expected expected;
-                    auto prepared = surface(directory);
+                    auto prepared = fromSource([&] { return surface(directory, options.uuidNamespace); });
                     addTags(prepared, tags);
                     { auto read = db.read(); expected = expectedAt(db, read, prepared.object.uuid); }
                     ingestOne(commit, std::move(prepared), expected, report, coordinateContext);
-                } catch (const std::exception& error) { problem(report, directory.string(), error); }
+                } catch (const std::exception& error) { failed(report, options, directory.string(), error); }
             }
+            report.cancelled = i < directories.size();
             util::reportProgress(progress, "ingesting surfaces", directories.size(), directories.size());
         } else {
             std::vector<Prepared> batch;
@@ -248,31 +289,42 @@ GeometryIngestReport ingestSource(ObjectStore& db, const Commit& commit, const s
                 auto read = db.read();
                 std::vector<std::string> available;
                 for (const auto& object : db.objectsByKind(read, kind)) available.push_back(object.uuid);
-                batch = prepareGeometrySource(kind, source, available);
+                batch = fromSource([&] { return prepareGeometrySource(kind, source, available, options); });
                 for (auto& p : batch) { expectations[p.object.uuid] = expectedAt(db, read, p.object.uuid); addTags(p, tags); }
             }
+            // The batch commits whole or not at all.
+            if (stop()) { report.cancelled = true; return; }
             ingestBatch(commit, std::move(batch), expectations, report, coordinateContext);
         }
-    } catch (const std::exception& error) { problem(report, source.string(), error); }
-    return report;
-}
+    } catch (const std::exception& error) { failed(report, options, source.string(), error); }
+} catch (const Stopped&) {}
 }
 
 GeometryIngestReport ingestGeometrySource(ObjectStore& db, const std::string& kind, const fs::path& source,
-    const util::ProgressCallback& progress, const std::string& coordinateContext, const std::vector<std::string>& tags)
+    const util::ProgressCallback& progress, const std::string& coordinateContext, const std::vector<std::string>& tags,
+    const SourceIngestOptions& options)
 {
-    static const std::atomic_bool never{false};
-    return ingestSource(db, directCommit(db), kind, source, progress, coordinateContext, tags, never);
+    GeometryIngestReport report;
+    ingestSource(report, db, directCommit(db), kind, source, progress, coordinateContext, tags, options, [] { return false; });
+    return report;
 }
 
 GeometryIngestReport ingestGeometrySource(ObjectStoreSession& session, const AttachmentIdentity& attachment,
     const std::string& kind, const fs::path& source, const util::ProgressCallback& progress,
-    const std::string& coordinateContext, const std::vector<std::string>& tags)
+    const std::string& coordinateContext, const std::vector<std::string>& tags, const SourceIngestOptions& options,
+    const std::atomic_bool* cancel)
 {
+    // Outside the job, so a failure entering or leaving it keeps what was committed.
     GeometryIngestReport report;
-    session.writeJob(attachment, [&](ObjectStore& db, const Commit& commit, const std::atomic_bool& cancelled) {
-        report = ingestSource(db, commit, kind, source, progress, coordinateContext, tags, cancelled);
-    });
+    try {
+        session.writeJob(attachment, [&](ObjectStore& db, const Commit& commit, const std::atomic_bool& cancelled) {
+            ingestSource(report, db, commit, kind, source, progress, coordinateContext, tags, options,
+                         [&] { return cancelled.load() || (cancel && cancel->load()); });
+        });
+    } catch (const std::exception& error) {
+        if (!options.stopOnInfrastructureError) throw;
+        if (!report.fatalError) report.fatalError = error.what();
+    }
     return report;
 }
 std::string importSurfaceChannel(ObjectStore& db, WriteTxn& txn, const std::string& objectUuid,

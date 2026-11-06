@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import functools
 import math
 
 import torch
@@ -49,6 +50,16 @@ def calibrated_gap_softplus_scale(
     )
 
 
+@functools.lru_cache(maxsize=None)
+def _bias_and_softplus(bias: float, device: torch.device, dtype: torch.dtype):
+    # Built once per (bias, device, dtype): new_tensor(bias) on every call is
+    # a blocking host-to-device copy on CUDA/HIP.  Built outside inference
+    # mode so a first call from a metrics pass still serves training.
+    with torch.inference_mode(False):
+        bias_tensor = torch.tensor(bias, device=device, dtype=dtype)
+        return bias_tensor, F.softplus(bias_tensor)
+
+
 def lower_bounded_gap(
     effective_latent: torch.Tensor,
     dr_per_winding: torch.Tensor,
@@ -62,8 +73,8 @@ def lower_bounded_gap(
     stable for large positive inputs, so the positive tail grows linearly
     instead of exponentially.
     """
-    bias_tensor = effective_latent.new_tensor(bias)
-    denominator = F.softplus(bias_tensor)
+    bias_tensor, denominator = _bias_and_softplus(
+        bias, effective_latent.device, effective_latent.dtype)
     ratio = F.softplus(
         bias_tensor + softplus_scale * effective_latent) / denominator
     return min_gap + (dr_per_winding - min_gap) * ratio

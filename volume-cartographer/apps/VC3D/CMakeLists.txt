@@ -222,6 +222,10 @@ set(srcs
     MenuActionController.hpp
     SshPrompts.cpp
     SshPrompts.hpp
+    ProjectResources.cpp
+    ProjectResources.hpp
+    StoreImportController.cpp
+    StoreImportController.hpp
     VolumeAttachmentController.cpp
     VolumeAttachmentController.hpp
     UnifiedBrowserDialog.cpp
@@ -332,6 +336,7 @@ set(srcs
     agent_bridge/AgentBridgeMethods_points.cpp
     agent_bridge/AgentBridgeMethods_seeding.cpp
     agent_bridge/AgentBridgeMethods_session.cpp
+    agent_bridge/AgentBridgeMethods_stores.cpp
     agent_bridge/AgentBridgeMethods_surfaceops.cpp
     agent_bridge/AgentBridgeMethods_viewer.cpp
     agent_bridge/AgentBridgeMethods_wrap.cpp
@@ -340,6 +345,7 @@ set(srcs
     agent_bridge/AgentBridgeJobs.cpp
     agent_bridge/AgentBridgeHandlers_catalog.cpp
     agent_bridge/AgentBridgeHandlers_session.cpp
+    agent_bridge/AgentBridgeHandlers_stores.cpp
     agent_bridge/AgentBridgeHandlers_editing.cpp
     agent_bridge/AgentBridgeHandlers_wrap.cpp
     agent_bridge/AgentBridgeHandlers_fiber.cpp
