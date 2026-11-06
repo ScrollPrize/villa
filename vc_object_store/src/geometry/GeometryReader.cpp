@@ -57,7 +57,11 @@ private:
 
 void beginReadCaches(sqlite3* db, StatementPool& pool, size_t geometryBudget, size_t spatialBudget)
 {
-    const int version = geometryBudget || spatialBudget ? pragmaInt(db, "data_version") : 0;
+    const int version = pragmaInt(db, "data_version");
+    // Components stay valid while no connection has committed since.
+    if (pool.componentsVersion != version) {
+        pool.components.clear(); pool.componentNodes = 0; pool.componentsVersion = version;
+    }
     if (!geometryBudget) pool.geometryCache.reset();
     else {
         if (!pool.geometryCache) pool.geometryCache = std::make_shared<GeometryReadCache>(geometryBudget);

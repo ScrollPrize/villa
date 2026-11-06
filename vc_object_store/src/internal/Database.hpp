@@ -44,10 +44,16 @@ struct StatementPool {
     std::optional<std::string> actingAuthor, requestUuid, requestDigest;
     std::string commitAuthor, commitHost;
     std::optional<int64_t> publishedSequence; // set by publishHistory
-    // Components read in this snapshot, filed under every member's id (one
-    // shared list per component; see detail::componentIds).
-    std::unordered_map<std::string, std::shared_ptr<const std::vector<int64_t>>> components;
+    // Components read on this connection, filed under every member's id (one
+    // shared list per component; see detail::componentIds). Kept across read
+    // snapshots while the connection's data_version is unchanged.
+    struct Component {
+        std::vector<int64_t> ids;
+        std::optional<std::vector<std::string>> uuids; // filled on first ask
+    };
+    std::unordered_map<std::string, std::shared_ptr<Component>> components;
     size_t componentNodes = 0;
+    std::optional<int> componentsVersion;
     std::shared_ptr<detail::GeometryReadCache> geometryCache;
     std::shared_ptr<detail::SpatialReadCache> spatialCache;
     std::unordered_multimap<std::string, sqlite3_stmt*> idle;

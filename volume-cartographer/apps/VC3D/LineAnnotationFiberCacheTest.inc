@@ -151,6 +151,20 @@ if (const char* source = std::getenv("VC3D_FIBER_CACHE_TEST_STORE")) {
                         "cached relationship endpoints and exact directions match fresh reads");
             }
         }
+        // Summaries read lines only through their digests; they follow edits.
+        const auto summaries = controller.fiberSummaries(ids);
+        require(summaries.size() == fresh.size(), "a summary per live fiber");
+        for (size_t i = 0; i < fresh.size(); ++i) {
+            const auto& summary = summaries[i]; const auto& fiber = fresh[i];
+            const auto spans = Controller::controlSpansForFiber(fiber);
+            require(summary.id == fiber.id && summary.linePointCount == int(fiber.linePoints.size()) &&
+                    summary.lengthVx == vc::fiber_tracer::fiberLineLengthVx(fiber.linePoints) &&
+                    summary.spans.size() == spans.size() &&
+                    std::equal(spans.begin(), spans.end(), summary.spans.begin(), [](const auto& a, const auto& b) {
+                        return a.lengthVx == b.lengthVx && a.linePointCount == b.linePointCount &&
+                               a.firstControlIndex == b.firstControlIndex && a.secondControlIndex == b.secondControlIndex;
+                    }), "summary line digests match fresh reads");
+        }
     };
     warm();
     auto edited = read(original.uuid);
@@ -163,14 +177,14 @@ if (const char* source = std::getenv("VC3D_FIBER_CACHE_TEST_STORE")) {
             [&](const auto& branch) { return branch.branchFiberId == fiber.id; });
     });
     require(unrelated != all.end(), "unrelated real fiber exists");
-    const auto* decodedPoints = controller._storedFiberDecodeCache.at(unrelated->uuid).linePoints.data();
+    const auto* decodedPoints = controller._storedFiberDecodeCache.at(unrelated->uuid)->linePoints.data();
     const auto sidePolyline = controller._sideStripStoredSnapshotCache.at(unrelated->id).snapshot.polyline;
     edited.width += .001;
     controller.commitFibers({&edited});
     checkFresh(); // before polling: peer generation checks must already work
     state.pollObjectStoreChanges();
     require(controller._storedFiberDecodeCache.contains(unrelated->uuid) &&
-            controller._storedFiberDecodeCache.at(unrelated->uuid).linePoints.data() == decodedPoints &&
+            controller._storedFiberDecodeCache.at(unrelated->uuid)->linePoints.data() == decodedPoints &&
             controller._sideStripStoredSnapshotCache.at(unrelated->id).snapshot.polyline == sidePolyline,
             "a local edit preserves unrelated decoded fibers and side-strip snapshots");
     checkFresh();

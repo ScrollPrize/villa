@@ -69,7 +69,6 @@ ReadTxn ObjectStore::read()
         activeStatementPools[conn] = impl_->statementPools.at(conn).get();
         auto& pool = *impl_->statementPools.at(conn);
         pool.readSnapshot = true;
-        pool.components.clear(); pool.componentNodes = 0;
         exec(conn, "BEGIN;");
         // Establish the snapshot now, so all reads in this transaction
         // see one consistent state even before the first real query.

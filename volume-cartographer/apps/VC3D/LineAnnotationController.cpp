@@ -4924,8 +4924,16 @@ bool LineAnnotationController::showGeneratedControlPointContextMenu(CChunkedVolu
 std::vector<LineAnnotationController::ControlSpanRecord>
 LineAnnotationController::controlSpansForFiber(const StoredFiber& fiber)
 {
+    return controlSpansForFiber(fiber.controlPoints, fiber.linePoints);
+}
+
+std::vector<LineAnnotationController::ControlSpanRecord>
+LineAnnotationController::controlSpansForFiber(
+    const std::vector<vc3d::line_annotation::StoredControlPoint>& controlPoints,
+    const std::vector<cv::Vec3d>& linePoints)
+{
     std::vector<ControlSpanRecord> spans;
-    if (fiber.controlPoints.size() < 2 || fiber.linePoints.size() < 2) {
+    if (controlPoints.size() < 2 || linePoints.size() < 2) {
         return spans;
     }
 
@@ -4934,15 +4942,15 @@ LineAnnotationController::controlSpansForFiber(const StoredFiber& fiber)
         size_t lineIndex = 0;
     };
     std::vector<ControlIndex> controls;
-    controls.reserve(fiber.controlPoints.size());
-    for (size_t i = 0; i < fiber.controlPoints.size(); ++i) {
-        const cv::Vec3d& control = fiber.controlPoints[i];
+    controls.reserve(controlPoints.size());
+    for (size_t i = 0; i < controlPoints.size(); ++i) {
+        const cv::Vec3d& control = controlPoints[i];
         if (!finitePoint(control)) {
             continue;
         }
         controls.push_back({
             static_cast<int>(i),
-            vc3d::fiber_line::nearestLinePointIndex(fiber.linePoints, control),
+            vc3d::fiber_line::nearestLinePointIndex(linePoints, control),
         });
     }
     std::sort(controls.begin(),
@@ -4968,7 +4976,7 @@ LineAnnotationController::controlSpansForFiber(const StoredFiber& fiber)
         span.firstLineIndex = left.lineIndex;
         span.lastLineIndex = right.lineIndex;
         span.linePointCount = static_cast<int>(right.lineIndex - left.lineIndex + 1);
-        span.lengthVx = vc3d::fiber_line::polylineLengthRange(fiber.linePoints,
+        span.lengthVx = vc3d::fiber_line::polylineLengthRange(linePoints,
                                                                span.firstLineIndex,
                                                                span.lastLineIndex);
         spans.push_back(span);
@@ -5346,27 +5354,68 @@ std::optional<LineAnnotationController::FiberSummary> LineAnnotationController::
 std::vector<LineAnnotationController::FiberSummary> LineAnnotationController::fiberSummaries(
     const std::optional<std::vector<std::string>>& uuids) const
 {
-    const auto fibers = readStoredFibers(uuids, true);
+    // Decoded fibers without their lines: a summary needs only the line's
+    // digest, kept per geometry revision and frame.
+    const auto fibers = storedFibersShared(uuids, false);
     std::vector<FiberSummary> summaries;
     if (fibers.empty()) return summaries;
-    // Fibers chained together through branch links, each one included.
-    std::unordered_map<uint64_t, int> linkedFiberCounts;
-    _state->objectStoreSession()->readStore(fibers.front().storePin->attachment, [&](const vc::objects::StoreReader& reader, const auto&) {
+    const auto sameFrame = [](const auto& a, const auto& b) {
+        return a.has_value() == b.has_value() &&
+               (!a || (a->volume == b->volume && a->storedToVolume.values == b->storedToVolume.values));
+    };
+    std::vector<const StoredFiber*> stale;
+    for (const auto& fiber : fibers) {
+        if (!fiber->editorError.empty()) continue;
+        const auto digest = _fiberLineDigests.find(fiber->uuid);
+        if (digest == _fiberLineDigests.end() || !fiber->storePin ||
+            digest->second.geometryRevision != fiber->storePin->geometryRevision ||
+            !sameFrame(digest->second.frame, fiber->frame))
+            stale.push_back(fiber.get());
+    }
+    std::vector<const StoredFiber*> unread;
+    for (const auto* fiber : stale)
+        if (!fiber->linePointsLoaded) unread.push_back(fiber);
+    auto lines = readFiberLines(unread);
+    for (size_t i = 0, next = 0; i < stale.size(); ++i) {
+        const auto& fiber = *stale[i];
+        const auto& points = fiber.linePointsLoaded ? fiber.linePoints : lines[next++];
+        FiberLineDigest digest;
+        digest.geometryRevision = fiber.storePin->geometryRevision;
+        digest.frame = fiber.frame;
+        digest.linePointCount = static_cast<int>(points.size());
+        digest.lineLengthVx = vc::fiber_tracer::fiberLineLengthVx(points);
+        digest.spans = controlSpansForFiber(fiber.controlPoints, points);
+        _fiberLineDigests.insert_or_assign(fiber.uuid, std::move(digest));
+    }
+    // Fibers chained together through branch links, each one included: one
+    // read per component, which every member shares.
+    std::unordered_map<std::string, int> componentSizes;
+    _state->objectStoreSession()->readStore(fibers.front()->storePin->attachment, [&](const vc::objects::StoreReader& reader, const auto&) {
         for (const auto& fiber : fibers)
-            if (!fiber.branches.empty())
-                linkedFiberCounts[fiber.id] = static_cast<int>(reader.componentOf(fiber.uuid, {"fiber_branch"}).size());
+            if (!fiber->branches.empty() && !componentSizes.contains(fiber->uuid)) {
+                const auto component = reader.componentOf(fiber->uuid, {"fiber_branch"});
+                for (const auto& member : component) componentSizes[member] = static_cast<int>(component.size());
+                componentSizes[fiber->uuid] = static_cast<int>(component.size());
+            }
     });
-    summaries.reserve(fibers.size());
+    std::unordered_map<uint64_t, int> linkedFiberCounts;
     for (const auto& fiber : fibers)
-        summaries.push_back(summarizeStoredFiber(fiber, linkedFiberCounts[fiber.id]));
+        if (!fiber->branches.empty()) linkedFiberCounts[fiber->id] = componentSizes[fiber->uuid];
+    summaries.reserve(fibers.size());
+    const FiberLineDigest none;
+    for (const auto& fiber : fibers) {
+        const auto digest = fiber->editorError.empty() ? _fiberLineDigests.find(fiber->uuid) : _fiberLineDigests.end();
+        summaries.push_back(summarizeStoredFiber(*fiber, linkedFiberCounts[fiber->id],
+                                                 digest == _fiberLineDigests.end() ? none : digest->second));
+    }
     return summaries;
 }
 
 LineAnnotationController::FiberSummary LineAnnotationController::summarizeStoredFiber(
-    const StoredFiber& fiber, int linkedFiberCount) const
+    const StoredFiber& fiber, int linkedFiberCount, const FiberLineDigest& line) const
 {
     std::vector<FiberSummary::SpanSummary> spanSummaries;
-    const std::vector<ControlSpanRecord>& spans = cachedControlSpansForFiber(fiber);
+    const std::vector<ControlSpanRecord>& spans = line.spans;
     spanSummaries.reserve(spans.size());
     for (const auto& span : spans) {
         FiberSummary::SpanSummary summary;
@@ -5396,7 +5445,7 @@ LineAnnotationController::FiberSummary LineAnnotationController::summarizeStored
     // rule as fiber_line::annotatedLineLengthVx: without two finite
     // controls the whole line, otherwise the line between the outermost
     // ones - which is nothing when they all sit on one line point.
-    const double lineLength = vc::fiber_tracer::fiberLineLengthVx(fiber.linePoints);
+    const double lineLength = line.lineLengthVx;
     double annotatedLength = 0.0;
     if (!spans.empty()) {
         for (const auto& span : spans) {
@@ -5415,7 +5464,7 @@ LineAnnotationController::FiberSummary LineAnnotationController::summarizeStored
         fiber.id,
         fiber.fileName,
         static_cast<int>(fiber.controlPoints.size()),
-        static_cast<int>(fiber.linePoints.size()),
+        line.linePointCount,
         lineLength,
         annotatedLength,
         cachedAlignmentForFiber(fiber.id),
@@ -5513,14 +5562,15 @@ LineAnnotationController::FiberMapSnapshot LineAnnotationController::fiberMapSna
     snapshot.catalogVolume = fiberMapCatalogVolume();
 
     // The map covers every store fiber bound to the current volume.
-    std::vector<StoredFiber> fibers = readStoredFibers(std::nullopt, true);
-    std::erase_if(fibers, [&](const StoredFiber& fiber) { return !fiber.editorError.empty() || !fiberInVolume(fiber); });
+    auto fibers = storedFibersShared(std::nullopt, true);
+    std::erase_if(fibers, [&](const StoredFiberPtr& fiber) { return !fiber->editorError.empty() || !fiberInVolume(*fiber); });
     std::unordered_set<uint64_t> boundIds;
     boundIds.reserve(fibers.size());
-    for (const StoredFiber& fiber : fibers) boundIds.insert(fiber.id);
+    for (const auto& fiber : fibers) boundIds.insert(fiber->id);
 
     snapshot.fibers.reserve(fibers.size());
-    for (const StoredFiber& fiber : fibers) {
+    for (const auto& shared : fibers) {
+        const StoredFiber& fiber = *shared;
         const StoredFiber& display = fiber;
         FiberMapFiber entry;
         entry.id = fiber.id;
@@ -14657,17 +14707,32 @@ void LineAnnotationController::ensureFiberLines(const StoredFiber& fiber) const
 {
     if (!fiber.editorError.empty()) throw std::runtime_error(fiber.editorError);
     if (fiber.linePointsLoaded) return;
-    if (!fiber.storePin || !fiber.storePin->geometryRevision) throw std::runtime_error("Fiber geometry pin is missing");
-    const auto& pin = *fiber.storePin;
-    std::vector<cv::Vec3d> points;
-    _state->objectStoreSession()->readStore(pin.attachment, [&](const vc::objects::StoreReader& reader, const auto&) {
-        const auto view = vc::objects::GeometrySnapshot(reader).fiber(fiber.uuid, *pin.geometryRevision);
-        const auto line = storedFiberLinePoints(view, fiber.frame);
-        points.reserve(line.size());
-        for (const auto& point : line) points.emplace_back(point[0],point[1],point[2]);
-    });
-    fiber.linePoints = std::move(points);
+    fiber.linePoints = std::move(readFiberLines({&fiber}).front());
     fiber.linePointsLoaded = true;
+}
+
+std::vector<std::vector<cv::Vec3d>> LineAnnotationController::readFiberLines(
+    const std::vector<const StoredFiber*>& fibers) const
+{
+    std::vector<std::vector<cv::Vec3d>> lines(fibers.size());
+    if (fibers.empty()) return lines;
+    for (const auto* fiber : fibers)
+        if (!fiber->storePin || !fiber->storePin->geometryRevision) throw std::runtime_error("Fiber geometry pin is missing");
+    const auto& attachment = fibers.front()->storePin->attachment;
+    _state->objectStoreSession()->readStore(attachment, [&](const vc::objects::StoreReader& reader, const auto& cancel) {
+        vc::objects::GeometrySnapshot snapshot(reader);
+        for (size_t i = 0; i < fibers.size(); ++i) {
+            if (cancel.load()) throw std::runtime_error("Object store read cancelled");
+            const auto& fiber = *fibers[i];
+            if (fiber.storePin->attachment.storeUuid != attachment.storeUuid)
+                throw std::runtime_error("Fiber lines read from more than one store");
+            const auto view = snapshot.fiber(fiber.uuid, *fiber.storePin->geometryRevision);
+            const auto line = storedFiberLinePoints(view, fiber.frame);
+            lines[i].reserve(line.size());
+            for (const auto& point : line) lines[i].emplace_back(point[0], point[1], point[2]);
+        }
+    });
+    return lines;
 }
 
 std::vector<LineAnnotationController::StoredFiber> LineAnnotationController::readStoredFibers(
@@ -14723,9 +14788,9 @@ std::vector<LineAnnotationController::StoredFiber> LineAnnotationController::rea
                         fiber.optimizationMode = vc3d::line_annotation::fiberOptimizationModeFromString(object.fiber->optimizationMode);
                     if (object.fiber->manualFamily) fiber.manualHvTag = object.fiber->family;
                 }
-                const auto attributes = reader.geometryPointAnnotations(*head.geometryRevision, "control_points");
+                auto attributes = reader.geometryPointAnnotations(*head.geometryRevision, "control_points");
                 for (size_t i = 0; i < geometry.controlPoints.size(); ++i) {
-                    auto entry = attributes.at(i);
+                    auto entry = std::move(attributes.at(i));
                     if (entry.is_null()) entry = nlohmann::json::object();
                     entry["position"] = geometry.controlPoints[i];
                     vc3d::line_annotation::StoredControlPoint cp{cv::Vec3d{geometry.controlPoints[i][0],geometry.controlPoints[i][1],geometry.controlPoints[i][2]}};
@@ -14923,9 +14988,29 @@ void LineAnnotationController::invalidateStoredFiberCaches(const vc::objects::St
 std::vector<LineAnnotationController::StoredFiber> LineAnnotationController::readStoredFibersCached(
     const std::vector<std::string>& uuids, bool lines) const
 {
+    std::vector<StoredFiber> result;
+    for (const auto& fiber : storedFibersShared(uuids, lines)) result.push_back(*fiber);
+    return result;
+}
+
+std::vector<LineAnnotationController::StoredFiberPtr> LineAnnotationController::storedFibersShared(
+    const std::optional<std::vector<std::string>>& requested, bool lines) const
+{
     const auto connection = _state ? _state->objectStoreSession() : nullptr;
     const auto attachment = _state ? _state->storeFor("fiber") : std::nullopt;
-    if (!attachment || uuids.empty()) return readStoredFibers(uuids, lines);
+    if (!attachment || (requested && requested->empty())) return {};
+    // Every live fiber, in UUID order like readStoredFibers(nullopt).
+    std::vector<std::string> uuids;
+    if (requested) uuids = *requested;
+    else {
+        connection->readStore(*attachment, [&](const vc::objects::StoreReader& reader, const auto&) {
+            vc::objects::ObjectSelection all;
+            all.kind = "fiber";
+            for (auto& record : reader.selectObjects(all, std::vector<std::string>{})) uuids.push_back(std::move(record.uuid));
+        });
+        std::sort(uuids.begin(), uuids.end());
+        if (uuids.empty()) return {};
+    }
     // Bound fibers decode in the open volume's voxels.
     const vc::objects::VolumeVoxels voxels = _state->annotationVolume().value_or(vc::project::AnnotationVolume{});
     if (voxels != _storedFiberDecodeVolume) {
@@ -14978,8 +15063,8 @@ std::vector<LineAnnotationController::StoredFiber> LineAnnotationController::rea
         for (const auto& [uuid, generation] : live) {
             const auto cached = _storedFiberDecodeCache.find(uuid);
             const auto dependency = _storedFiberDependencies.find(uuid);
-            if (cached == _storedFiberDecodeCache.end() || cached->second.generation != generation ||
-                (lines && !cached->second.linePointsLoaded) || dependency == _storedFiberDependencies.end() ||
+            if (cached == _storedFiberDecodeCache.end() || cached->second->generation != generation ||
+                (lines && !cached->second->linePointsLoaded) || dependency == _storedFiberDependencies.end() ||
                 std::any_of(dependency->second.peers.begin(), dependency->second.peers.end(),
                     [&](const auto& peer) { return generationOf(peer.first) != peer.second; }))
                 missing.push_back(uuid);
@@ -14990,10 +15075,10 @@ std::vector<LineAnnotationController::StoredFiber> LineAnnotationController::rea
         for (auto& fiber : readStoredFibers(missing, lines, &dependencies)) {
             auto uuid = fiber.uuid;
             _storedFiberDependencies.insert_or_assign(uuid, std::move(dependencies.at(uuid)));
-            _storedFiberDecodeCache.insert_or_assign(std::move(uuid), std::move(fiber));
+            _storedFiberDecodeCache.insert_or_assign(std::move(uuid), std::make_shared<const StoredFiber>(std::move(fiber)));
         }
     }
-    std::vector<StoredFiber> result;
+    std::vector<StoredFiberPtr> result;
     result.reserve(live.size());
     for (const auto& [uuid, generation] : live)
         if (const auto cached = _storedFiberDecodeCache.find(uuid); cached != _storedFiberDecodeCache.end())
@@ -15019,6 +15104,7 @@ void LineAnnotationController::resetStoreDerivedState()
     _sideStripStoredSnapshotCache.clear(); _sideStripSessionSnapshotCache.clear();
     _storedFiberDecodeCache.clear();
     _storedFiberDependencies.clear();
+    _fiberLineDigests.clear();
     _storedFiberCachePosition.reset();
     _fiberAlignmentMetrics.clear(); _pendingFiberAlignmentMetrics.clear();
     _pendingFiberAlignmentMetricTokens.clear(); ++_nextFiberAlignmentMetricToken;
