@@ -7,6 +7,7 @@
 #include "Colormaps.hpp"
 
 #include <QComboBox>
+#include <QFileDialog>
 #include <QLabel>
 #include <QPushButton>
 #include <QSignalBlocker>
@@ -26,6 +27,22 @@ ViewerInkDetectionPanel::ViewerInkDetectionPanel(ViewerManager* viewerManager, Q
     auto* detectionRow = new LabeledControlRow(tr("Detection"), this);
     _detectionCombo = new QComboBox(detectionRow);
     detectionRow->addControl(_detectionCombo, 1);
+    auto* addImageButton = new QPushButton(tr("Add Image..."), detectionRow);
+    addImageButton->setToolTip(tr("Overlay a local prediction image of this segment (render pixels)."));
+    detectionRow->addControl(addImageButton);
+    connect(addImageButton, &QPushButton::clicked, this, [this]() {
+        auto* overlay = _viewerManager ? _viewerManager->inkDetectionOverlay() : nullptr;
+        if (!overlay) {
+            return;
+        }
+        const QString path = QFileDialog::getOpenFileName(this, tr("Add Ink Prediction Image"), QString(),
+                                                          tr("Images (*.tif *.tiff *.png *.jpg)"));
+        if (path.isEmpty()) {
+            return;
+        }
+        overlay->addLocalDetection(std::filesystem::path(path.toStdString()));
+        populateDetections();
+    });
     layout->addWidget(detectionRow);
 
     auto* colormapRow = new LabeledControlRow(tr("Colormap"), this);
