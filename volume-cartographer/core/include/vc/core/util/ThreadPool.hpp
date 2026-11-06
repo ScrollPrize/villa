@@ -41,9 +41,14 @@ public:
     }
 
     ~ThreadPool() {
-        // Request stop on all jthreads (auto-joined on destruction).
-        for (auto& w : workers_)
-            w.request_stop();
+        // Serialize the stop transition with the worker wait predicate. Without
+        // holding mu_, request_stop() + notify_all() can land between a worker's
+        // predicate check and its wait, leaving the jthread join blocked.
+        {
+            std::lock_guard lk(mu_);
+            for (auto& w : workers_)
+                w.request_stop();
+        }
         cv_.notify_all();
         // jthread destructors join here.
     }
@@ -183,7 +188,17 @@ private:
                 active_.fetch_add(1, std::memory_order_acq_rel);
             }
             task();
-            active_.fetch_sub(1, std::memory_order_release);
+            {
+                // Under mu_: wait_idle() reads active_ in its predicate under
+                // this mutex, then releases it atomically as it parks. A
+                // decrement and notify outside the lock can land in between,
+                // after the predicate saw active_ == 1 and before the waiter
+                // parked, and that notification is lost: wait_idle() then sleeps
+                // on an idle pool (#1686, seen on Windows within a few hundred
+                // batches).
+                std::lock_guard lk(mu_);
+                active_.fetch_sub(1, std::memory_order_acq_rel);
+            }
             idle_cv_.notify_all();
         }
     }

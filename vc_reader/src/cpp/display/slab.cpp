@@ -13,8 +13,9 @@ void compositeSlab(const Slab& slab,uint8_t* rgb,uint8_t* coverage) {
     if(!rgb || !coverage || !slab.layers || !slab.colors || !slab.opacity || slab.count<=0 ||
         (slab.projection.perspective ? !slab.projection.layerNum : !slab.projection.layerOffsets))
         throw std::invalid_argument("slab requires layers, palettes and output buffers");
-    static ThreadPool pool(std::max(1u,std::thread::hardware_concurrency()));
-    pool.parallel_for(std::size_t(slab.height),[&](std::size_t y) {
+    // Never destroyed; see samplingPool() in thread_pool.hpp.
+    static auto* pool=new ThreadPool(std::max(1u,std::thread::hardware_concurrency()));
+    pool->parallel_for(std::size_t(slab.height),[&](std::size_t y) {
         for(int x=0;x<slab.width;++x) {
             const auto i=y*slab.width+x;
             detail::slabPixel(slab,x,int(y),rgb+3*i,coverage+i);

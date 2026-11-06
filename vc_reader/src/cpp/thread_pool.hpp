@@ -178,10 +178,14 @@ private:
 
 // Sampling, transfer and projection share a bounded pool rather than each
 // retaining their own workers. Small callers can still execute synchronously.
+//
+// Never destroyed, like every function-local static pool here: on Windows the
+// static destructors of a DLL run during process exit, after the OS has ended
+// every other thread, and joining the workers there never returns (#1686).
 inline ThreadPool& samplingPool()
 {
-    static ThreadPool pool(std::min(8u, std::max(1u, std::thread::hardware_concurrency())));
-    return pool;
+    static auto* pool = new ThreadPool(std::min(8u, std::max(1u, std::thread::hardware_concurrency())));
+    return *pool;
 }
 
 // The workers of every array asking for `threads` workers: arrays open at the same
