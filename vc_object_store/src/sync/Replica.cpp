@@ -11,6 +11,7 @@ std::string ObjectStore::replicaUuid(const Txn& txn) const {
 std::string ObjectStore::forkReplica() {
     auto txn = write(); auto* db = static_cast<sqlite3*>(connection(txn));
     const auto id = util::newUuid();
+    forkStorageIdentity(db);
     execute(db, "UPDATE sync_replica SET uuid=? WHERE singleton=1", id);
     txn.commit(); return id;
 }

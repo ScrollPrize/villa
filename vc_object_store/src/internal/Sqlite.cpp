@@ -1,6 +1,8 @@
 #include "internal/Database.hpp"
 #include "internal/ReadRequest.hpp"
 #include "sftp/SftpVfs.hpp"
+#include "vc_object_store/objects/PackedStore.hpp"
+#include <limits>
 
 namespace vc::objects::detail {
 [[noreturn]] void fail(sqlite3* db, const std::string& what)
@@ -88,7 +90,11 @@ void applyPragmas(sqlite3* db, const OpenOptions& options, bool queryOnly)
     sqlite3_busy_timeout(db, options.busyTimeoutMs);
     exec(db, "PRAGMA foreign_keys=ON;");
     exec(db, "PRAGMA temp_store=MEMORY;");
-    exec(db, "PRAGMA cache_size=-8000;");
+    const auto cacheKiB=options.sqliteCacheBytes/1024+(options.sqliteCacheBytes%1024!=0);
+    if(cacheKiB>static_cast<size_t>(std::numeric_limits<int>::max()))
+        throw std::invalid_argument("object store: SQLite cache budget exceeds supported range");
+    const auto cachePragma="PRAGMA cache_size=-"+std::to_string(cacheKiB)+";";
+    exec(db,cachePragma.c_str());
     if (queryOnly)
         exec(db, "PRAGMA query_only=ON;");
 }
@@ -97,20 +103,26 @@ sqlite3* openConnection(const std::filesystem::path& path, int flags, const Open
 {
     sqlite3* db = nullptr;
     const bool remote = isRemotePath(path);
+    const bool packedLocator = isPackedDatabasePath(path);
+    const bool packedFile = !remote && !packedLocator && isPackedStore(path);
+    const bool packed = packedLocator || packedFile;
     if (remote && !options.sharedFile)
         throw std::invalid_argument("object store: only hosted hubs open from sftp:// or ssh:// locations; clone one to a local replica");
-    const auto name = remote ? canonicalRemotePath(path) : path.string();
-    if (!remote && options.sharedFile && std::filesystem::exists(path.string() + ".lock/" + kProcessLockName))
+    if (packed && options.sharedFile)
+        throw std::invalid_argument("object store: packed databases are not shared mutable hubs");
+    const auto name = remote ? canonicalRemotePath(path) : packedFile ? packedDatabasePath(path).string() : path.string();
+    if (!remote && !packed && options.sharedFile && std::filesystem::exists(path.string() + ".lock/" + kProcessLockName))
         throw std::runtime_error("hub: this hub uses SSH process locking; access it through its sftp:// address");
     // Network filesystems lack the shared memory and byte-range locks WAL needs.
-    const char* vfs = remote ? sftpVfs() : options.sharedFile ? "unix-dotfile" : nullptr;
+    const char* vfs = packed ? packedStoreVfs() : remote ? sftpVfs() : options.sharedFile ? "unix-dotfile" : nullptr;
     if (vfs && !sqlite3_vfs_find(vfs))
         throw std::runtime_error("object store: this SQLite build lacks the unix-dotfile VFS needed for shared files");
-    const int rc = sqlite3_open_v2(remote ? name.c_str() : reinterpret_cast<const char*>(path.u8string().c_str()), &db,
+    const int rc = sqlite3_open_v2(remote || packed ? name.c_str() : reinterpret_cast<const char*>(path.u8string().c_str()), &db,
                                    flags | SQLITE_OPEN_FULLMUTEX, vfs);
     if (rc != SQLITE_OK) {
         std::string msg = db ? sqlite3_errmsg(db) : "open failed";
         if (remote && !sftpLastError().empty()) msg += " (" + sftpLastError() + ")";
+        if (packed && !packedStoreLastError().empty()) msg += " (" + packedStoreLastError() + ")";
         if (db) sqlite3_close(db);
         throw std::runtime_error("object store: cannot open " + name + ": " + msg);
     }

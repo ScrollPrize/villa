@@ -50,8 +50,10 @@ std::string edgeIdentity(const EdgeRecord& input)
     edge.kind = input.kind; edge.aUuid = input.aUuid; edge.bUuid = input.bUuid;
     edge.aAnchor = input.aAnchor; edge.bAnchor = input.bAnchor;
     canonicalizeEdge(edge);
-    return nlohmann::json::array({edge.kind, edge.aUuid, edge.bUuid,
-        dependenciesToJson(edge.aAnchor), dependenciesToJson(edge.bAnchor)}).dump();
+    auto identity = nlohmann::json::array({edge.kind, edge.aUuid, edge.bUuid,
+        dependenciesToJson(edge.aAnchor), dependenciesToJson(edge.bAnchor)});
+    if (!input.relationKey.empty()) identity.push_back(input.relationKey);
+    return identity.dump();
 }
 
 nlohmann::json dependenciesToJson(const Anchor& anchor)

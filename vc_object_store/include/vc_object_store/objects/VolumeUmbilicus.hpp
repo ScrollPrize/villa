@@ -9,6 +9,8 @@ struct AttachmentIdentity;
 // A volume has at most one umbilicus: the live umbilicus object whose
 // coordinates map to it (bound to it, or through a registration).
 struct VolumeUmbilicus {
+    // objectRevision is empty in history-off stores; use store-generation
+    // checks for subsequent edits instead of inventing a historical pin.
     std::string uuid, name, objectRevision;
     std::vector<geometry::Point> points; // in the volume's voxels
 };
@@ -23,7 +25,8 @@ std::optional<VolumeUmbilicus> volumeUmbilicus(ObjectStoreSession&, const Attach
 // Makes `record` (an umbilicus whose meta.coordinates map to `volume`) with
 // `geometry` the umbilicus of `volume`, retiring those it replaces. The
 // caller's checked transaction pins volumeUmbilicusRevisions and expects
-// record.uuid to be absent. Returns the UUID.
+// record.uuid to be absent, or checks the store generation in history-off
+// mode. Returns the UUID.
 std::string setVolumeUmbilicus(ObjectStore&, WriteTxn&, const std::string& volume, ObjectRecord record,
                                const geometry::Umbilicus& geometry);
 }

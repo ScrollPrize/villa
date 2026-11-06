@@ -1,0 +1,43 @@
+# Native AFV import and v2 validation
+
+This initial importer is a correctness/reference workflow, not yet the fast initial-state batch constructor. In particular, relation shards call the ordinary per-edge collection API inside one transaction; relation-only packed import is not implemented here. Sharding alone does not remove editing-path overhead. Fast batched construction and memory-first relation publication are follow-up work. Do not interpret this workflow's throughput as the intended v2 bulk-import limit.
+
+`vc_object_import_afv CONFIG.json` streams an AFV v1 snapshot into a new, sealed, history-off, spatial-index-free v2 store. It uses the same native `AfvSource` decoder as the Python AFV workflow. The input is read-only; records are processed in bounded batches, and failure removes the private sibling staging directory. Publication refuses an existing destination. The source dataset namespace plus the original fiber ID determines each object UUID, so identities are unchanged by batching or path relocation.
+
+```json
+{
+  "source": "/datasets/fibers.afv",
+  "output": "/scratch/fibers.vcobj",
+  "volume_id": "catalog-volume-id",
+  "batch_size": 256,
+  "batch_bytes": 67108864,
+  "fiber_limit": 1000,
+  "report": "/scratch/import-report.json"
+}
+```
+
+Build the `vc_object_import_afv` target in a normal vc_object_store CMake build (`VC_OBJECT_STORE_BUILD_TOOLS=ON` or `VC_OBJECT_STORE_BUILD_TESTS=ON`). Start with a finite pilot; set `fiber_limit` to zero for the entire source. `volume_id` is the actual catalog volume identifier, not a newly generated UUID. Alternatively specify `unbound:true`. `scale_factor` defaults to 1 and records the coordinate binding without transforming samples.
+
+Every original float64 XYZ byte is retained in `line_points`. Both the native importer and Python `scripts/import_afv.py` declare empty control arrays, with no invented control points or IDs. This changes the older Python AFV import's synthetic endpoint-control behavior; actual control points in other input formats are unaffected. The fiber name, family, point count, length, bounds and annotations are preserved; collection metadata is stored once.
+
+Optionally add `"constraints":"/datasets/constraints.afc.sqlite"` to import the associated integer-ID AFV constraint database, with one edge per original constraint. Its declared AFV UUID must match. The stable source constraint UUID is also its native `relation_key`: independent observations of the same pair remain separate without inventing geometry dependencies or per-observation edge kinds. For a fiber-limited pilot, only edges between imported fibers are eligible; `constraint_limit` optionally limits their count, and zero means all eligible edges. Neither input is changed. Reports separately count/timestamp edges and mark whether constraints were imported. A geometry-only run explicitly reports `constraints_imported:false` and does not claim to be a complete winding-solver dataset. Newer AFC files with UUID object endpoints do not need AFV ID translation and are intentionally rejected by this adapter. Unknown constraint columns are rejected rather than silently dropped.
+
+The decoder validates format/version, completeness, native-coordinate declarations, block ordering, identical shared block endpoints, catalog point counts, finite coordinates and bounds. Full scans also validate collection totals. Import reports separate source decoding, store ingestion, sealing and full exact-byte geometry readback. Each imported fiber is read back, not just a sample. Extrapolations are labeled estimates and exclude readback time. A prefix pilot can have a different length distribution than the full volume, so report exact full-volume measurements when available.
+
+## Shards and packed containers
+
+Set `shards` to a positive worker count (maximum 256) to partition a geometry import by balanced contiguous source-ID intervals. Each worker has an independent source reader and SQLite store, performs one bulk transaction and seals at the same generation. Object UUIDs remain identical to the unsharded import. Every independently created import gets a fresh logical store UUID shared by its shards; the source AFV UUID is provenance, not the publication identity. This prevents a prefix pilot and a full import with different contents from satisfying the same dependency pin. Explicit numeric object IDs are original AFV IDs plus 2, with ID 1 reserved for collection metadata; range reservations prevent collisions. The published readonly `ObjectCollection` routes across the physical stores. Without packing, `output` is a new directory containing `collection.vcobj` and its shard files.
+
+Add `packed:true` to create those independent databases directly through the packed VFS and publish one compact container at `output`. `resident_bytes` controls the packed writer cache (default 256 MiB); SQLite worker caches and active fibers are additional memory. Packed bulk writes are disposable until `finalize`, which durably publishes the container. Geometry-sharded imports reject an AFC input; use the separate relation-sharded workflow below. Every shard's geometry is checked byte-for-byte and fiber metadata by value; the collection additionally verifies numeric and geometry routing at each shard boundary. Reports include per-shard timings, aggregate wall time, publication/export time and peak resident process memory (Linux/macOS).
+
+## Parallel relation-only overlays
+
+After importing geometry, supply `geometry_collection` (the published collection manifest or packed container), `constraints`, and `shards` to import independent relation shards. `source` still identifies the original AFV namespace. `output` is a new directory. Each worker links the sealed geometry collection, stores only lightweight endpoint references and its own native edges, and seals independently; the final manifest composes those stores. Geometry is not copied. `constraint_limit` selects an explicit prefix for a pilot; zero imports the full AFC source. Partitioning uses contiguous constraint ID ranges and checks the aggregate row count. Readback resolves qualified original endpoint identities through the collection API and compares all anchors and metadata. This workflow currently creates ordinary SQLite shard files, not a packed output.
+
+For an explicit allocator-contention comparison, `sqlite_memory_statistics:false` disables SQLite's global memory accounting before any SQLite initialization in this executable. It does not change production `ObjectStore` defaults, transaction semantics, or stored values. Keep the setting in the recorded local benchmark config when comparing runs; process peak RSS remains reported independently of SQLite accounting.
+
+`sqlite_cache_bytes` configures the SQLite page cache per connection, including readonly linked-store connections. The unchanged default is 8,192,000 bytes (`cache_size=-8000`). Large randomly accessed relationship imports can benefit from a larger budget, for example 134,217,728 bytes, but the possible total multiplies by the worker count, linked stores and connection pools. This setting is independent of the packed VFS's `resident_bytes` and native geometry caches; it is available to C++ callers as `OpenOptions::sqliteCacheBytes`. The report records the selected budget and measured process RSS.
+
+For relation-import profiling, `profile:true` adds per-worker source decoding, native insertion and exclusive phase timings to the progress records. Phase timings include waits, are opt-in, and must not be interpreted as CPU samples. Progress counts describe work attempted before transaction publication, not a validated completed import. Use short, externally time-limited trials for slow full-ID-range workloads and report extrapolated ingestion time separately from commit, readback and publication. Prefix-only pilots may miss the full graph's larger endpoint working set.
+
+The current edge schema has native endpoint identities and anchor positions/directions. AFC arc offsets, normals, winding distances, parallel/perpendicular scores, evidence weights and diagnostic measurements do not yet have native typed columns: this adapter preserves them as parsed values under `meta.afc`, including explicit original endpoint identities so canonical endpoint reordering cannot reverse their meaning. Normals are not mislabeled as fiber-tangent directions. Collection-level AFC metadata is stored once. Every imported edge is read back with its exact anchor positions, endpoint identities and full metadata; reports separate metadata JSON bytes from geometry bytes. One source constraint remains one edge, with no pair bundling or silent attribute dropping.

@@ -1,5 +1,6 @@
 #include "internal/RecordJson.hpp"
 #include "internal/EdgeSql.hpp"
+#include "internal/History.hpp"
 
 namespace vc::objects {
 using namespace detail;
@@ -22,7 +23,7 @@ std::string ObjectStore::exportJson(const Txn& txn, const JsonExportOptions& opt
         return selected;
     };
     const auto objectProjection = projection({"name", "format_version", "storage_kind", "storage_ref", "data_generation", "data_checksum", "fiber", "surface", "track"});
-    const auto edgeProjection = projection({"a", "b", "a_anchor", "b_anchor"});
+    const auto edgeProjection = projection({"a", "b", "a_anchor", "b_anchor", "relation_key"});
     ObjectFields edgeFields = edgeProjection ? ObjectFields(std::in_place, edgeProjection->begin(), edgeProjection->end()) : std::nullopt;
     // Export canonicalizes endpoint order, including self-link dependency order.
     // Both anchors are needed for that even when only one is requested.
@@ -103,7 +104,7 @@ void ObjectStore::importJson(WriteTxn& txn, const std::string& jsonText)
         if (edgeByUuid(txn, object.uuid))
             throw std::runtime_error("object store: snapshot UUID belongs to an edge: " + object.uuid);
         if (auto existing = objectByUuid(txn, object.uuid)) {
-            if (objectToJson(*existing) == objectToJson(object)) continue;
+            if (recordContent(objectToJson(*existing)) == recordContent(objectToJson(object))) continue;
             throw std::runtime_error("object store: snapshot conflicts with existing object: " + object.uuid);
         }
         upsertObjectImpl(db, impl_->options.author, impl_->hostname, object, true);
@@ -114,10 +115,11 @@ void ObjectStore::importJson(WriteTxn& txn, const std::string& jsonText)
         if (objectByUuid(txn, e.uuid))
             throw std::runtime_error("object store: snapshot UUID belongs to an object: " + e.uuid);
         if (auto existing = edgeByUuid(txn, e.uuid)) {
-            if (edgeToJson(*existing) == edgeToJson(e)) continue;
+            if (recordContent(edgeToJson(*existing)) == recordContent(edgeToJson(e))) continue;
             throw std::runtime_error("object store: snapshot conflicts with existing edge: " + e.uuid);
         }
         addEdgeImpl(db, impl_->options.author, impl_->hostname, e, true);
+        recordRelationshipValidation(db, *edgeByUuid(txn, e.uuid));
     }
     savepoint.release();
 }

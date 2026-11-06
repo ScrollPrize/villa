@@ -7,6 +7,14 @@ std::string ObjectStore::upsertObject(WriteTxn& txn, const ObjectRecord& record)
     return upsertObjectImpl(static_cast<sqlite3*>(connection(txn)), impl_->options.author, impl_->hostname, record, false);
 }
 
+std::string ObjectStore::insertObjectWithId(WriteTxn& txn, const ObjectRecord& record, int64_t id)
+{
+    auto* db = static_cast<sqlite3*>(connection(txn));
+    ExplicitRecordId allocation(db,"objects",record.uuid,id);
+    const auto result=upsertObject(txn,record);
+    allocation.finish();return result;
+}
+
 std::optional<ObjectRecord> ObjectStore::objectByUuid(const Txn& txn, const std::string& uuid) const
 {
     sqlite3* db = static_cast<sqlite3*>(connection(txn));

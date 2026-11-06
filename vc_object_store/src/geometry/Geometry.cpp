@@ -48,8 +48,9 @@ std::optional<GeometryRevision> ObjectStore::currentGeometry(const Txn& txn, con
 
 std::vector<GeometryRevision> ObjectStore::geometryHistory(const Txn& txn, const std::string& objectUuid) const
 {
+    requireHistory(static_cast<sqlite3*>(connection(txn)));
     (void)connection(txn);
-    Statement s(static_cast<sqlite3*>(connection(txn)), std::string("SELECT ") + geometryColumns + " FROM geometry_revisions WHERE object_uuid=? ORDER BY object_generation",
+    Statement s(static_cast<sqlite3*>(connection(txn)), std::string("SELECT ") + geometryColumns + " FROM geometry_revisions WHERE object_uuid=? ORDER BY rowid",
         parseUuid(objectUuid));
     std::vector<GeometryRevision> result;
     while (s.row()) result.push_back(readGeometryRevision(s));
@@ -140,13 +141,43 @@ void applyEdgeDecisions(ObjectStore& store, WriteTxn& txn, sqlite3* db,
     }
 }
 
+void rebindUnchangedEdges(sqlite3* db, const std::string& object, const std::optional<GeometryRevision>& current,
+                          const std::string& next, const std::vector<EdgeRecord>& affected)
+{
+    if (historyEnabled(db) || !current) return;
+    std::set<std::string> changed;
+    for (const auto& edge : affected) changed.insert(edge.uuid);
+    Statement edges(db, "SELECT e.id,e.uuid,e.a_id=(SELECT id FROM objects WHERE uuid=?),e.b_id=(SELECT id FROM objects WHERE uuid=?) "
+        "FROM edges e WHERE e.a_id=(SELECT id FROM objects WHERE uuid=?) OR e.b_id=(SELECT id FROM objects WHERE uuid=?)",
+        parseUuid(object), parseUuid(object), parseUuid(object), parseUuid(object));
+    while (edges.row()) {
+        if (changed.contains(formatUuid(edges.blob16(1)))) continue;
+        for (int side = 0; side < 2; ++side) {
+            if (!edges.i64(2 + side)) continue;
+            const std::string column = side ? "b_revision" : "a_revision";
+            execute(db, "UPDATE edge_geometry_bindings SET " + column + "=? WHERE edge_id=? AND " + column + "=?",
+                parseUuid(next), edges.i64(0), parseUuid(current->uuid));
+        }
+    }
+}
+
 void writeRevision(sqlite3* db, const ObjectStore& store, const ObjectRecord& object,
     const std::string& uuid, const GeometryRevision* parent, const std::string& hash, const std::string& text)
 {
+    if (!historyEnabled(db)) {
+        // Replace only the current descriptor, inside the caller's savepoint.
+        // Chunk mappings cascade; payload reclamation happens after writing
+        // the replacement, so unchanged hashes can be reused.
+        execute(db, "DELETE FROM current_geometry WHERE object_uuid=?", parseUuid(object.uuid));
+        execute(db, "INSERT INTO current_geometry VALUES(?,?,?,?,?,?,?,?)", parseUuid(uuid), parseUuid(object.uuid),
+            hash, text, writeGeneration(db), store.author(), nowIsoUtc(), store.hostname());
+        indexCurrentMetadata(db, object.uuid, nlohmann::json::parse(text));
+        return;
+    }
     Statement revision(db, "INSERT INTO geometry_revisions VALUES(?,?,?,?,?,?,?,?,?)", parseUuid(uuid),
         parseUuid(object.uuid));
     if (parent) revision.bind(3, parseUuid(parent->uuid)); else revision.bindNull(3);
-    revision.bind(4, hash); revision.bind(5, text); revision.bind(6, object.generation + 1);
+    revision.bind(4, hash); revision.bind(5, text); revision.bind(6, writeGeneration(db));
     revision.bind(7, store.author()); revision.bind(8, nowIsoUtc()); revision.bind(9, store.hostname());
     revision.stepDone();
 }
@@ -164,7 +195,8 @@ void writeArrays(sqlite3* db, const std::string& revisionUuid,
 {
     Statement insert(db, "INSERT INTO geometry_chunks(hash,data) VALUES(?,?) ON CONFLICT(hash) DO NOTHING");
     Statement verify(db, "SELECT data FROM geometry_chunks WHERE hash=?");
-    Statement reference(db, "INSERT INTO geometry_revision_chunks VALUES(?,?,?,?)");
+    Statement reference(db, historyEnabled(db) ? "INSERT INTO geometry_revision_chunks VALUES(?,?,?,?)" :
+                                               "INSERT INTO current_geometry_chunks VALUES(?,?,?,?)");
     for (const auto& array : arrays) {
         const auto layout = detail::geometryLayout(manifest.at("arrays").at(array.name));
         detail::forEachGeometryChunk(array, layout.tile, [&](int64_t index, std::span<const uint8_t> bytes) {
@@ -175,7 +207,12 @@ void writeArrays(sqlite3* db, const std::string& revisionUuid,
             if (geometryWork && sqlite3_changes(db)) geometryWork->writtenBytes[array.name] += bytes.size();
             // Never silently reuse corrupt data, even on a hash collision.
             verify.reset(); verify.bind(1, hash);
-            if (!verify.row() || sqlite3_column_bytes(verify.value, 0) != static_cast<int>(bytes.size()) ||
+            if (!verify.row()) throw std::runtime_error("geometry: missing payload after insertion");
+            if(verify.isNull(0)) {
+                const auto existing=readExternalGeometryPayload(db,hash);
+                if(!std::equal(existing.begin(),existing.end(),bytes.begin(),bytes.end()))
+                    throw std::runtime_error("geometry: corrupt or colliding external payload hash");
+            } else if (sqlite3_column_bytes(verify.value, 0) != static_cast<int>(bytes.size()) ||
                 std::memcmp(sqlite3_column_blob(verify.value, 0), bytes.data(), bytes.size()) != 0)
                 throw std::runtime_error("geometry: corrupt or colliding payload hash");
             if (geometryWork) geometryWork->readBytes[array.name] += bytes.size();
@@ -183,6 +220,25 @@ void writeArrays(sqlite3* db, const std::string& revisionUuid,
         });
     }
 
+}
+
+void setGeometryHead(sqlite3* db, const std::string& object, const std::string& revision)
+{
+    if (!historyEnabled(db)) return; // The current descriptor is the head.
+    execute(db, "INSERT INTO geometry_heads VALUES(?,?) ON CONFLICT(object_uuid) DO UPDATE SET revision_uuid=excluded.revision_uuid",
+        parseUuid(object), parseUuid(revision));
+}
+
+// Materialize an already-computed snapshot. Shared by history-off sparse and
+// structural edits; no alternate geometry/dependency calculation.
+GeometryData snapshotData(const nlohmann::json& manifest, const DependencyGeometry& source)
+{
+    GeometryData data;
+    data.kind = manifest.at("kind"); data.formatVersion = manifest.at("format_version");
+    data.coordinateSystem = manifest.at("coordinate_system"); data.attributes = manifest.at("attributes").dump();
+    for (const auto& [name, array] : manifest.at("arrays").items())
+        data.arrays.push_back({name, array.at("dtype"), array.at("shape"), source.read(name, 0, array.at("byte_length"))});
+    return data;
 }
 
 }
@@ -248,14 +304,42 @@ std::string ObjectStore::putGeometry(WriteTxn& txn, const std::string& objectUui
     writeArrays(db, revisionUuid, data.arrays, manifest);
 
     detail::clearGeometryMaterialization(db, objectUuid);
-    execute(db, "INSERT INTO geometry_heads VALUES(?,?) ON CONFLICT(object_uuid) DO UPDATE SET revision_uuid=excluded.revision_uuid",
-        parseUuid(objectUuid), parseUuid(revisionUuid));
+    setGeometryHead(db, objectUuid, revisionUuid);
     const auto id = *objectIdByUuid(db, parseUuid(objectUuid));
     detail::indexGeometryBounds(db, id, revisionUuid, data);
     stampGeometry(db, *this, objectUuid, id, contentHash);
+    rebindUnchangedEdges(db, objectUuid, current, revisionUuid, affected);
     applyEdgeDecisions(*this, txn, db, affected, decisions);
     savepoint.release();
     return revisionUuid;
+}
+
+std::string detail::publishReferencedGeometry(ObjectStore& store, WriteTxn& txn, const std::string& objectUuid,
+                                              const SharedJson& manifest)
+{
+    auto* db=ObjectStoreImplAccess::conn(txn);
+    const auto object=store.objectByUuid(txn,objectUuid);
+    if(!object||object->kind!=manifest.at("kind").get<std::string>()||store.currentGeometry(txn,objectUuid))
+        throw std::invalid_argument("geometry: referenced import requires an empty matching object");
+    Savepoint save(db);
+    const auto text=manifest.dump(), hash=hashText(text), revision=util::newUuid();
+    writeRevision(db,store,*object,revision,nullptr,hash,text);
+    Statement reference(db,historyEnabled(db)?"INSERT INTO geometry_revision_chunks VALUES(?,?,?,?)":"INSERT INTO current_geometry_chunks VALUES(?,?,?,?)");
+    for(const auto& [name,array]:manifest.at("arrays").items()){
+        if(array.contains("source_revision"))throw std::invalid_argument("geometry: referenced import must be a full descriptor");
+        int64_t index=0;for(const auto& chunk:array.at("chunks"))reference.run(parseUuid(revision),name,index++,chunk.get<std::string>());
+    }
+    setGeometryHead(db,objectUuid,revision);
+    refreshGeometryBounds(db,objectUuid);
+    stampGeometry(db,store,objectUuid,*objectIdByUuid(db,parseUuid(objectUuid)),hash);
+    for(const auto& edge:store.edgesOf(txn,objectUuid,true)){
+        auto state=store.edgeGeometryState(txn,edge.uuid);
+        EdgeGeometryRepair repair;repair.edgeUuid=edge.uuid;repair.expectedGeneration=edge.generation;
+        repair.aRevision=edge.aUuid==objectUuid?std::optional(revision):state.aRevision;
+        repair.bRevision=edge.bUuid==objectUuid?std::optional(revision):state.bRevision;
+        repair.aAnchor=edge.aAnchor;repair.bAnchor=edge.bAnchor;store.repairEdgeGeometry(txn,repair);
+    }
+    save.release();return revision;
 }
 
 namespace {
@@ -422,8 +506,9 @@ std::string detail::publishStructuralSnapshot(ObjectStore& store, WriteTxn& txn,
     writeRevision(db, store, object, uuid, &*current, hash, text);
     writeArrays(db,uuid,data.arrays,manifest); clearGeometryMaterialization(db,objectUuid);
     indexGeometryBounds(db,id,uuid,data);
-    execute(db,"UPDATE geometry_heads SET revision_uuid=? WHERE object_uuid=?", parseUuid(uuid), parseUuid(objectUuid));
+    setGeometryHead(db, objectUuid, uuid);
     stampGeometry(db, store, objectUuid, id, hash);
+    rebindUnchangedEdges(db, objectUuid, current, uuid, affected);
     if (manifest.at("kind")=="point_collection" && changedIds && changedIds->first=="point_ids")
         updateSourcePointIdentities(db,objectUuid,current->uuid,uuid,manifest,changedIds->second);
     applyEdgeDecisions(store,txn,db,affected,decisions);
@@ -464,6 +549,15 @@ std::string ObjectStore::editGeometry(WriteTxn& txn, const std::string& objectId
     const auto affected = affectedEdges(*this, txn, objectUuid, current, plan->after);
     const auto decisions = validateEdgeEdits(*this, txn, db, objectUuid, plan->after, affected,
                                              decide ? (*decide)(affected) : edgeEdits);
+    if (!historyEnabled(db)) {
+        const auto data = snapshotData(plan->manifest, plan->after);
+        Savepoint savepoint(db);
+        std::vector<GeometryEdgeEdit> resolved;
+        for (const auto& [id, decision] : decisions) resolved.push_back(decision);
+        const auto result = publishStructuralSnapshot(*this, txn, objectUuid, data, plan->manifest, expected, resolved);
+        savepoint.release();
+        return result;
+    }
     // The cells whose area the edit changes, measured before it.
     const auto areaBefore = editedSurfaceCells(db, current.uuid, edits);
     if (geometryDeltaRawSize(plan->changes) > std::min(impl_->options.maxGeometryDeltaBytes, maxGeometryDeltaBytes)) {
@@ -602,6 +696,15 @@ std::string ObjectStore::updateSurfaceChannels(WriteTxn& txn, const std::string&
     const auto decisions = validateEdgeEdits(*this, txn, db, objectUuid, after, affected, edgeEdits);
     const auto object = *objectByUuid(txn, objectUuid);
     const auto uuid = util::newUuid(), text = manifest.dump(), hash = hashText(text);
+    if (!historyEnabled(db)) {
+        auto data = snapshotData(original, dependencyGeometry(*this, txn, *current));
+        std::erase_if(data.arrays, [&](const GeometryArray& a) { return names.contains(a.name); });
+        data.arrays.insert(data.arrays.end(), channels.begin(), channels.end());
+        Savepoint savepoint(db);
+        const auto result = publishStructuralSnapshot(*this, txn, objectUuid, data, original, expected, edgeEdits);
+        savepoint.release();
+        return result;
+    }
     Savepoint savepoint(db);
     writeRevision(db, *this, object, uuid, &*current, hash, text);
     writeArrays(db, uuid, channels, manifest);

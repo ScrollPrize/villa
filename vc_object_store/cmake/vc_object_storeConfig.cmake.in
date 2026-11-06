@@ -1,6 +1,6 @@
 @PACKAGE_INIT@
 include(CMakeFindDependencyMacro)
-find_dependency(SQLite3)
+find_dependency(SQLite3 3.37)
 find_dependency(Threads)
 find_dependency(vc_reader CONFIG)
 find_dependency(OpenSSL COMPONENTS Crypto)

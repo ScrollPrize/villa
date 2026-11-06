@@ -1,9 +1,6 @@
 # Object store
 
-`ObjectStore` keeps objects, immutable geometry, metadata and relationships in one
-SQLite file. Source files are needed for ingestion; subsequent queries, edits,
-detection and export use stored revisions. CT remains an input to fiber/track
-surface detection. See [build/CLI instructions](../README.md),
+`ObjectStore` keeps objects, geometry, metadata and relationships in one SQLite file. V2 supports history-on or current-only storage; [collections](collections.md) add immutable links, independent shards and optional packed files. Source files are needed for ingestion; subsequent queries, edits, detection and export use stored data. CT remains an input to fiber/track surface detection. See [v2 policies](v2-store-format.md), [build/CLI instructions](../README.md),
 [typed geometry](typed-geometry.md) and [structural editing](structural-editing.md).
 C++ callers link `vc_objects` for storage, `vc_object_geometry` for native I/O,
 and `vc_object_links` for detectors. Public signatures live in
@@ -654,9 +651,7 @@ spatial candidates by UUID. Geometry and intersection predicates are unchanged.
 Volume targets never parse every object's metadata. The `objects` table carries
 `coordinate_volume` and `coordinate_scale`, virtual generated columns equal to
 `json_extract` of `meta.coordinates`, indexed as `objects_coordinates(kind,
-coordinate_volume, coordinate_scale)` (schema version 17; earlier stores are
-rejected and must be rebuilt). Version 16 also records object/edge kinds in the
-journal, including deletions, for selective cache invalidation. A target finds its frames with one index seek per
+coordinate_volume, coordinate_scale)` (introduced in schema version 17). See the [v2 format status](v2-store-format.md) for the current schema and conversion requirements. History-enabled stores also record object/edge kinds in the journal, including deletions, for selective cache invalidation. A target finds its frames with one index seek per
 distinct scale, and the unbound tail reads only the index ranges outside the
 volume's binding. `unboundObjectCount(txn, kind, volume)` counts that tail the
 same way. SQLite never answers a generated column from an index alone, so an

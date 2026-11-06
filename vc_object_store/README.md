@@ -12,7 +12,7 @@ The object store imports geometry files (tifxyz, pcl, fiber, track) and stores t
 
 PCL to Surface edges can be absolute winding, relative winding, or same-winding (which is the same as relative with a 0 delta along `wind_a`)
 
-Modifications to geometry are stored as the delta to the previous iteration and contain a timestamp. If the object requires modifications to its shape a "checkpoint" is created, and any later deltas for history refer to this checkpoint. "Point-in-time" database views can be recovered by simply providing the timestamp 
+With history enabled, modifications to geometry are stored as the delta to the previous iteration and contain a timestamp. If the object requires modifications to its shape a "checkpoint" is created, and any later deltas for history refer to this checkpoint. "Point-in-time" database views can be recovered by simply providing the timestamp. History-off stores retain current data only and reject historical queries.
 
 ```python
 view = store.revision_read_view_at(timestamp_us)
@@ -24,7 +24,7 @@ view["selection"]     # Object UUID → selected revision UUID
 
 The object store can be used in place of tifxyz files, fiber jsons, track crossings/dbm files, and pcl jsons in any workflow where these are used and edit history is desired. The store contains the information necessary for any tool which works with these files to instead use the db. The object store can export these files after revision if this is needed. 
 
-The db has fast spatial queries through a persisted r-tree backed index with optional in-memory views for repeated queries. 
+Stores with spatial indexing enabled have fast spatial queries through a persisted R-tree backed index with optional in-memory views for repeated queries. Slim stores may omit this index; spatial queries then fail explicitly rather than return empty results.
 
 The C++ `ObjectStoreSession` accepts writable or read-only attachments. Read-only
 sessions reject actions before invoking their callbacks. VC3D calls the database's
@@ -52,6 +52,8 @@ file without a `uuid` is given a name-based (version 5) UUID derived from its
 file name, so separate imports of the same file agree on its identity.
 
 ## Use
+
+See the [v2 format](docs/v2-store-format.md) for persistent history-off storage, optional spatial indexing, sealing, shared generations and database/table identities; [collections](docs/collections.md) for linking/overlays and independent shards; and [packed stores](docs/packed-stores.md) for the optional single-file VFS container. Existing schema-17 stores require the separate `vc_object_convert` tool; never change their schema version manually. The proposed redesigned lazy/delta history remains a follow-up, not part of this implementation.
 
 ```python
 from vc_object_store import ObjectStore

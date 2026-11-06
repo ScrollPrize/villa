@@ -9,7 +9,8 @@ ObjectCopy readObjectCopy(const ObjectStore& store, const Txn& txn, const std::s
 {
     const auto object = store.objectByUuid(txn, objectUuid);
     if (!object) throw std::invalid_argument("object to copy not found: " + objectUuid);
-    const auto head = store.currentObjectRevision(txn, object->uuid);
+    const auto head = store.provisioning(txn).history == HistoryMode::On
+        ? store.currentObjectRevision(txn, object->uuid) : std::optional<ObjectRevision>{};
     const auto geometry = store.currentGeometry(txn, object->uuid);
     ObjectCopy copy;
     auto& record = copy.record;
@@ -23,6 +24,7 @@ ObjectCopy readObjectCopy(const ObjectStore& store, const Txn& txn, const std::s
     record.track = object->track;
     auto meta = nlohmann::json::parse(object->meta);
     meta["copied_from"] = {{"store_uuid", store.uuid(txn)}, {"object_uuid", object->uuid},
+        {"store_generation", store.provisioning(txn).generation},
         {"object_revision", head ? nlohmann::json(head->uuid) : nlohmann::json()},
         {"geometry_revision", geometry ? nlohmann::json(geometry->uuid) : nlohmann::json()}};
     if (geometry) {

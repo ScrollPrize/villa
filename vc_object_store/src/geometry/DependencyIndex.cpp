@@ -28,7 +28,7 @@ CREATE INDEX geometry_dependencies_edge ON geometry_edge_dependencies(edge_id);
     exec(db,("CREATE TRIGGER geometry_dependencies_update AFTER UPDATE OF a_id,b_id,a_dependencies,b_dependencies ON edges BEGIN "
         "DELETE FROM geometry_edge_dependencies WHERE edge_id=old.id;"+rows("new")+" END;").c_str());
     // Revision allocation and latest-ledger queries must not sort full history.
-    exec(db,"CREATE INDEX geometry_revision_generation ON geometry_revisions(object_uuid,object_generation DESC);");
+    if (historyEnabled(db)) exec(db,"CREATE INDEX geometry_revision_generation ON geometry_revisions(object_uuid,object_generation DESC);");
 }
 std::vector<EdgeRecord> structuralEdgeCandidates(sqlite3* db,const std::string& uuid,const std::string& array,const std::vector<int64_t>& ids) {
     const auto object=*objectIdByUuid(db,parseUuid(uuid));std::set<int64_t> candidates;

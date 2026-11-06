@@ -44,16 +44,14 @@ CREATE TRIGGER source_identity_object_update AFTER UPDATE OF meta,storage_ref,ki
  json_extract(new.meta,'$.source.source_collection_id') IS NOT json_extract(old.meta,'$.source.source_collection_id') OR
  (json_extract(new.meta,'$.source.origin') IS NULL AND new.storage_ref IS NOT old.storage_ref)) BEGIN
  INSERT OR IGNORE INTO source_identity_dirty VALUES(new.uuid); END;
-CREATE TRIGGER source_identity_head_insert AFTER INSERT ON geometry_heads
- WHEN (SELECT kind FROM objects WHERE uuid=new.object_uuid)='point_collection' BEGIN
- INSERT OR IGNORE INTO source_identity_dirty VALUES(new.object_uuid); END;
-CREATE TRIGGER source_identity_head_update AFTER UPDATE ON geometry_heads
- WHEN (SELECT kind FROM objects WHERE uuid=new.object_uuid)='point_collection' BEGIN
- INSERT OR IGNORE INTO source_identity_dirty VALUES(new.object_uuid); END;
-CREATE TRIGGER source_identity_head_delete AFTER DELETE ON geometry_heads
- WHEN EXISTS(SELECT 1 FROM objects WHERE uuid=old.object_uuid AND kind='point_collection') BEGIN
- INSERT OR IGNORE INTO source_identity_dirty VALUES(old.object_uuid); END;
 )SQL");
+    const std::string table = historyEnabled(db) ? "geometry_heads" : "current_geometry";
+    for (const auto* op : {"INSERT", "UPDATE", "DELETE"}) {
+        const std::string row = std::string(op) == "DELETE" ? "old" : "new";
+        exec(db, ("CREATE TRIGGER source_identity_head_" + std::string(op) + " AFTER " + op + " ON " + table +
+            " WHEN EXISTS(SELECT 1 FROM objects WHERE uuid=" + row + ".object_uuid AND kind='point_collection') BEGIN "
+            "INSERT INTO source_identity_dirty VALUES(" + row + ".object_uuid) ON CONFLICT(object_uuid) DO NOTHING; END;").c_str());
+    }
 }
 void refreshSourceIdentityIndex(sqlite3* db) {
     GeometryPhase phase("sourceIdentityIndex");
@@ -76,7 +74,7 @@ void refreshSourceIdentityIndex(sqlite3* db) {
         if(old.row()) {
             previous=formatUuid(old.blob16(1));
             if(previous==revision) rebuild=false;
-            else {
+            else if (historyEnabled(db)) {
                 GeometryReader before(db,previous), after(db,revision);
                 rebuild=idsDescriptor(before)!=idsDescriptor(after);
             }

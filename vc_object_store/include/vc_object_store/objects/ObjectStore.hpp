@@ -58,7 +58,7 @@ struct TrackDetail {
 struct RecordCommon {
     std::string uuid;  // canonical text; empty on create = mint a new one
     std::string kind;  // required, non-empty
-    int64_t generation = 0;
+    int64_t generation = 0; // Last local store publication, not a per-object edit counter.
     std::string createdBy, createdAt, createdHost;
     std::string changedBy, changedAt, changedHost;
     std::string approvalState = "pending";  // pending | approved | rejected
@@ -112,6 +112,10 @@ struct Anchor {
 struct EdgeRecord : RecordCommon {
     std::string aUuid, bUuid;  // endpoint order is normalised by addEdge
     Anchor aAnchor, bAnchor;
+    // Independent observations of the same endpoints/dependencies may have
+    // distinct stable keys. Empty preserves the original unique-relation rule.
+    // Part of relationship identity, immutable after creation.
+    std::string relationKey;
 };
 
 // Object UUID -> immutable object revision UUID. null means expect no object.
@@ -122,6 +126,7 @@ struct ObjectRevision {
     std::string uuid, objectUuid;
     std::optional<std::string> parentUuid, geometryRevision;
     int64_t sequence = 0;
+    int64_t generation = 0; // Store publication generation, not the sequence cursor.
     // False for baselines a hub pull installed without their original metadata history.
     bool metadataComplete = true;
     // UTC Unix microseconds assigned once per atomic publication, monotonically
@@ -143,6 +148,7 @@ inline constexpr const char* kAttachmentEdgeKind = "attachment";
 // Pins are immutable objectRevision() UUIDs, never moving heads.
 struct RelationshipRevision {
     std::string uuid;
+    int64_t generation = 0;
     EdgeRecord record;
     std::string aRevision, bRevision;
     std::optional<std::string> aGeometryRevision, bGeometryRevision;
@@ -165,7 +171,44 @@ struct JournalEntry {
     std::optional<int64_t> approvedGeneration;
 };
 
+enum class HistoryMode { Off, On };
+
+struct StoreProvisioning {
+    int formatVersion = 2;
+    int64_t generation = 1;
+    HistoryMode history = HistoryMode::On;
+    bool sealed = false;
+    bool spatialIndex = true;
+};
+
+// Physical identities are distinct from the logical store UUID. Moving or
+// copying a database preserves them; independently created stores do not.
+struct TableIdentity {
+    std::string uuid, name;
+    std::vector<std::string> primaryKey;
+};
+
+struct DatabaseIdentity {
+    std::string uuid;
+    int schemaVersion = 0;
+    std::vector<TableIdentity> tables;
+};
+
 struct OpenOptions {
+    // Creation only. Opening reads the persistent policy, never overrides it.
+    HistoryMode history = HistoryMode::On;
+    // Creation only. Omit bounds/R-tree storage; spatial queries then throw.
+    // Ordinary geometry, metadata and graph operations remain available.
+    bool spatialIndex = true;
+    // Creation-only provisioning for independently built shards. Integer key
+    // ranges are reservations, not counts of currently populated records.
+    std::optional<std::string> creationStoreUuid;
+    int64_t initialGeneration = 1;
+    std::array<int64_t,2> objectIdRange{1,INT64_MAX};
+    std::array<int64_t,2> edgeIdRange{1,INT64_MAX};
+    // Explicit low-level access to one physical partition. Ordinary opens of
+    // collections fail rather than silently return only locally stored data.
+    bool physicalPartitionOnly = false;
     std::shared_ptr<const vcr::catalog::RegistrationGraph> catalogTransforms;
     bool readOnly = false;
     int readerPoolSize = 4;
@@ -175,6 +218,10 @@ struct OpenOptions {
     // Retained verified geometry per pooled read connection; zero disables it.
     // Payload bytes plus conservatively charged metadata, excluding active reads.
     std::size_t geometryCacheBytes = 16 * 1024 * 1024;
+    // SQLite page-cache budget per connection (not total process memory).
+    // Preserves the historical PRAGMA cache_size=-8000 default. Collections
+    // apply this to dependency connections too; multiply by workers/stores.
+    std::size_t sqliteCacheBytes = 8000 * 1024;
     // Resident spatial descriptors/index per read connection; zero uses SQL.
     // Built lazily; snapshots too large for this budget also use SQL.
     std::size_t spatialCacheBytes = 16 * 1024 * 1024;
@@ -365,6 +412,12 @@ struct GeometryEdgeEdit {
 class ObjectStore {
 public:
     static ObjectStore create(const std::filesystem::path&, const OpenOptions&);
+    StoreProvisioning provisioning(const Txn&) const;
+    DatabaseIdentity databaseIdentity(const Txn&) const;
+    // Irreversible publication: future writes (including through already-open
+    // handles) are rejected. Linked stores must have been sealed, not merely
+    // opened using readOnly=true.
+    void seal(WriteTxn&);
     static ObjectStore open(const std::filesystem::path&, const OpenOptions&);
     ObjectStore(ObjectStore&&) noexcept;
     ObjectStore& operator=(ObjectStore&&) noexcept;
@@ -418,12 +471,16 @@ public:
     std::string uuid(const Txn&) const;
 
     std::string replicaUuid(const Txn&) const;
-    // Assign a copied database its own replica identity.
+    // Assign a copied database its own replica, physical database and table
+    // identities. The hub-family logical store identity remains unchanged.
     std::string forkReplica();
 
     // Create/update by UUID (mint one if empty). Updates bump generation, stamp
     // changed_*, reset approval and journal. Returns the UUID.
     std::string upsertObject(WriteTxn& txn, const ObjectRecord& record);
+    // Import-only explicit local row ID, within this store's reserved range.
+    // UUID remains the portable identity. Existing UUIDs cannot be renumbered.
+    std::string insertObjectWithId(WriteTxn&, const ObjectRecord&, int64_t id);
     std::optional<ObjectRecord> objectByUuid(const Txn& txn, const std::string& uuid) const;
     std::vector<ObjectRecord> objectsByKind(const Txn& txn, const std::string& kind,
                                             const std::optional<std::string>& approvalState = std::nullopt, bool includeRetired = false) const;
@@ -559,8 +616,11 @@ public:
 
 
     // Edges. addEdge normalises endpoint order (swapping anchors to
-    // match) and enforces (kind, endpoints, anchors) uniqueness.
+    // match) and enforces (kind, endpoints, dependencies, relationKey) uniqueness.
     std::string addEdge(WriteTxn& txn, const EdgeRecord& record);
+    // Import-only explicit edge ID within the reserved edge key range. Uses
+    // the same validation, geometry bindings and history as addEdge.
+    std::string insertEdgeWithId(WriteTxn&, const EdgeRecord&, int64_t id);
     // Refresh anchors/tags/meta while retaining UUID, endpoints, kind and history.
     // Changes reset approval; revision bindings remain stale until explicitly checked.
     void updateEdge(WriteTxn& txn, const EdgeRecord& record);

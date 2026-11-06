@@ -2,10 +2,11 @@
 #include "geometry/GeometrySnapshot.hpp"
 #include "geometry/GeometryReader.hpp"
 #include "vc_object_store/objects/GeometryCoordinates.hpp"
+#include "internal/History.hpp"
 
 namespace vc::objects::detail {
 using Json = nlohmann::json;
-Json nativeMetadata(ObjectStore& db, const Txn& txn, const ObjectRecord& object, const GeometryRevision& revision, const RevisionSelection& selection)
+Json nativeMetadata(ObjectStore& db, const Txn& txn, const ObjectRecord& object, const GeometryRevision& revision, const std::optional<RevisionSelection>& selection)
 {
     const auto metadata = Json::parse(object.meta);
     auto result = geometryTransferMetadata(metadata);
@@ -36,9 +37,16 @@ Json nativeMetadata(ObjectStore& db, const Txn& txn, const ObjectRecord& object,
         if (!extras.is_array() || extras.size() != ids.size()) throw std::runtime_error("point annotations do not match geometry");
         for (auto& point : extras) { if (point.is_null()) point = Json::object(); point["links"] = Json::array(); }
         result["windings_linked"] = Json::array();
-        for (const auto& selected : db.relationshipsAt(txn, selection)) {
-            const auto& edge = selected.relationship.record;
-            if (!selected.applicable || (edge.aUuid != object.uuid && edge.bUuid != object.uuid)) continue;
+        std::vector<EdgeRecord> edges;
+        if (selection) {
+            for (const auto& selected : db.relationshipsAt(txn,*selection))
+                if(selected.applicable) edges.push_back(selected.relationship.record);
+        } else {
+            for(const auto& edge:db.edgesOf(txn,object.uuid))
+                if(currentRelationshipApplicable(db,txn,edge.uuid)) edges.push_back(edge);
+        }
+        for (const auto& edge : edges) {
+            if (edge.aUuid != object.uuid && edge.bUuid != object.uuid) continue;
             if (edge.kind != "point_link" && edge.kind != "collection_winding") continue;
             if (edge.kind == "point_link") {
                 auto link = [&](const std::string& owner, const Anchor& a, const Anchor& b) {
@@ -50,8 +58,11 @@ Json nativeMetadata(ObjectStore& db, const Txn& txn, const ObjectRecord& object,
                 };
                 link(edge.aUuid, edge.aAnchor, edge.bAnchor); link(edge.bUuid, edge.bAnchor, edge.aAnchor);
             } else {
-                const auto target = db.objectRevision(txn, *selection.at(edge.aUuid == object.uuid ? edge.bUuid : edge.aUuid));
-                const auto targetMeta = Json::parse(target->record.meta).at("source");
+                const auto targetId=edge.aUuid == object.uuid ? edge.bUuid : edge.aUuid;
+                const auto target = selection ? std::optional(db.objectRevision(txn,*selection->at(targetId))->record)
+                                              : db.objectByUuid(txn,targetId);
+                if (!target) throw std::runtime_error("native winding link target is missing");
+                const auto targetMeta = Json::parse(target->meta).at("source");
                 result["windings_linked"].push_back(std::stoll(targetMeta.at("source_collection_id").get<std::string>()));
             }
         }

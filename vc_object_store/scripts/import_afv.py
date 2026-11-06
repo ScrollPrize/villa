@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Stream an Automated Fiber Volume v1 into a NEW object store.
 
-All AFV handling lives here; writes use the public vc_object_store Python API.
-Requires the existing Python extension and NumPy (no setup is performed):
+AFV decoding uses the shared native reader; writes use the public Python API.
+Requires the existing Python extension (no setup is performed):
 
   PYTHONPATH=build/python python3 scripts/import_afv.py INPUT.afv OUTPUT.vcobj \
       --volume-id CATALOG_VOLUME_ID --volume /path/to/volume.zarr
@@ -26,8 +26,8 @@ Paris 4:
 vc_reader identifies this as PHercParis4/20260411134726. Its catalog volume ID
 20260411134726 is stored unchanged as coordinates.volume_uuid.
 
-Every original float64 XYZ sample becomes line_points. Two endpoint controls
-with stable IDs 0,1 make the polyline editable without duplicating all samples.
+Every original float64 XYZ sample becomes line_points. Control arrays stay empty:
+AFV traces do not contain control points, and none are invented during import.
 Names, families, catalog summaries and per-fiber annotations are retained;
 collection metadata/provenance is stored once in a generic collection object.
 Trace annotations such as fiber_follow.links remain provenance: they describe
@@ -43,96 +43,41 @@ from __future__ import annotations
 import argparse
 import contextlib
 import getpass
-import itertools
 import json
 import math
 import os
 from pathlib import Path
 import sqlite3
-import struct
 import tempfile
 import time
 import uuid
 
-import numpy as np
-from vc_object_store import ObjectStore
+from vc_object_store import ObjectStore, AfvSource
 
 
 @contextlib.contextmanager
 def open_afv(path):
     # Hold one read snapshot: metadata and blocks must describe the same source.
-    with contextlib.closing(sqlite3.connect(Path(path).resolve().as_uri() + '?mode=ro', uri=True)) as db:
-        db.execute('PRAGMA query_only=ON')
-        db.execute('PRAGMA cache_size=-32768')
-        db.execute('BEGIN')
-        if (db.execute('PRAGMA application_id').fetchone()[0],
-                db.execute('PRAGMA user_version').fetchone()[0]) != (0x56434643, 1):
-            raise ValueError('Expected AFV application ID and format version 1')
-        metadata = {k: json.loads(v) for k, v in db.execute('SELECT key,value FROM metadata')}
-        if metadata.get('complete') is not True:
-            raise ValueError('AFV is incomplete')
-        uuid.UUID(metadata['uuid'])
-        for key in ('fiber_count', 'point_count'):
-            if type(metadata[key]) is not int or metadata[key] < 0:
-                raise ValueError(f'Invalid AFV {key}')
-        frame, root = metadata['frame'], metadata['root']
-        for declaration in (frame, root):
-            if (declaration.get('vc_open_data_source_coordinate_level', 0) != 0 or
-                    declaration.get('vc_open_data_source_coordinate_scale_factor', 1) != 1):
-                raise ValueError('Only native L0 AFV coordinates are supported')
-        if root.get('scale', 1) != 1:
-            raise ValueError('Only native L0 AFV coordinates are supported')
-        if root.get('coordinate_order') != 'XYZ' or root.get('coordinate_units') != 'voxel':
-            raise ValueError('AFV must declare XYZ voxel coordinates')
-        yield db, metadata
+    source = AfvSource(Path(path).resolve())
+    yield source, source.metadata
 
 
 def fibers(db):
-    """One fiber in memory, no per-fiber SQL and no Python coordinate lists."""
-    # The UNIQUE(fiber_id,first_segment) index supplies order, without a blob sort.
-    query = '''SELECT f.id,f.name,f.family,f.point_count,f.length,
-        f.min_x,f.min_y,f.min_z,f.max_x,f.max_y,f.max_z,f.annotation,
-        b.first_segment,b.points FROM fibers f
-        LEFT JOIN blocks b ON b.fiber_id=f.id ORDER BY f.id,b.first_segment'''
-    for _, group in itertools.groupby(db.execute(query), key=lambda row: row[0]):
-        first = next(group)
-        fid, name, family, count, length, *rest = first[:12]
-        bounds, annotation = rest[:6], rest[6]
-        if count < 2 or not math.isfinite(length) or length < 0:
-            raise ValueError(f'Invalid catalog entry for fiber {fid}')
-        pieces, next_segment, previous = [], 0, None
-        for row in itertools.chain((first,), group):
-            start, blob = row[-2:]
-            if not isinstance(blob, bytes) or len(blob) % 24 or not 2 <= len(blob) // 24 <= 257:
-                raise ValueError(f'Invalid block size for fiber {fid}')
-            if start != next_segment or (previous is not None and blob[:24] != previous):
-                raise ValueError(f'Discontinuous blocks for fiber {fid}')
-            pieces.append(blob if previous is None else blob[24:])
-            previous = blob[-24:]
-            next_segment += len(blob) // 24 - 1
-        if next_segment + 1 != count:
-            raise ValueError(f'Point count mismatch for fiber {fid}')
-        raw = b''.join(pieces)
-        points = np.frombuffer(raw, dtype='<f8').reshape(-1, 3)
-        if not np.isfinite(points).all():
-            raise ValueError(f'Non-finite coordinates in fiber {fid}')
-        actual = np.concatenate((points.min(axis=0), points.max(axis=0)))
-        if not np.array_equal(actual, bounds):
-            raise ValueError(f'Bounds mismatch for fiber {fid}')
-        yield fid, name, family, count, length, bounds, json.loads(annotation), raw
+    """Native streaming cursor shared with the C++ bulk import workflow."""
+    yield from db
 
 
 def prepared(row, collection_uuid, coordinates):
     fid, name, family, count, length, bounds, annotation, raw = row
     object_uuid = str(uuid.uuid5(uuid.UUID(collection_uuid), f'fiber:{fid}'))
     record = dict(uuid=object_uuid, kind='fiber', name=name, format_version=4,
-        fiber=dict(family=family, control_point_count=2, line_point_count=count,
+        fiber=dict(family=family, control_point_count=0, line_point_count=count,
                    length=length, bbox=bounds),
         meta=dict(coordinates=coordinates, source=dict(afv=dict(
             collection_uuid=collection_uuid, fiber_id=fid, annotation=annotation))))
     geometry = dict(kind='fiber', arrays=[
-        dict(name='control_points', dtype='<f8', shape=[2, 3], data=raw[:24] + raw[-24:]),
-        dict(name='control_point_ids', dtype='<i8', shape=[2], data=struct.pack('<2q', 0, 1)),
+        dict(name='control_points', dtype='<f8', shape=[0, 3], data=b''),
+        dict(name='control_point_ids', dtype='<i8', shape=[0], data=b''),
         dict(name='line_points', dtype='<f8', shape=[count, 3], data=raw)])
     return record, geometry
 

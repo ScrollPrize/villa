@@ -173,6 +173,7 @@ nb::dict edgeToPy(const vo::EdgeRecord& e, const std::set<std::string>* fields =
     commonToPy(d, e, fields);
     d["a"] = e.aUuid;
     d["b"] = e.bUuid;
+    if (!fields || fields->contains("relation_key")) d["relation_key"] = e.relationKey;
     if (!fields || fields->contains("a_anchor")) d["a_anchor"] = anchorToPy(e.aAnchor);
     if (!fields || fields->contains("b_anchor")) d["b_anchor"] = anchorToPy(e.bAnchor);
     return d;
@@ -185,6 +186,7 @@ vo::EdgeRecord edgeFromPy(const nb::dict& d)
     e.kind = getStr(d, "kind");
     e.aUuid = getStr(d, "a");
     e.bUuid = getStr(d, "b");
+    e.relationKey = getStr(d, "relation_key");
     if (has(d, "a_anchor")) e.aAnchor = anchorFromPy(d["a_anchor"]);
     if (has(d, "b_anchor")) e.bAnchor = anchorFromPy(d["b_anchor"]);
     e.tags = getTags(d);
@@ -295,9 +297,12 @@ struct PyObjectStore {
 
     static PyObjectStore create(const std::string& path, const std::string& author,
                                              const std::optional<std::string>& hostname, int readerPoolSize,
-                                             size_t geometryCacheBytes, size_t spatialCacheBytes, const nb::object& catalog)
+                                             size_t geometryCacheBytes, size_t spatialCacheBytes, const nb::object& catalog,
+                                             bool historyEnabled, bool spatialIndex)
     {
         vo::OpenOptions o;
+        o.history = historyEnabled ? vo::HistoryMode::On : vo::HistoryMode::Off;
+        o.spatialIndex = spatialIndex;
         o.author = author;
         o.hostnameOverride = hostname;
         o.readerPoolSize = readerPoolSize;

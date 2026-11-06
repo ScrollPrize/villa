@@ -302,6 +302,7 @@ std::vector<VolumeRow> volumeSelection(sqlite3* db, const ObjectSelection& selec
 std::unique_ptr<Statement> detail::objectSelectionQuery(sqlite3* db, const ObjectSelection& selection,
                                                        const std::string& columns, const FrameFilter* frame)
 {
+    if (selection.bbox) requireSpatial(db);
     auto filter = objectFilter(db, selection, frame);
     const bool candidates = selection.bbox || !selection.uuids.empty() || selection.connectedTo || selection.tag ||
                             !selection.tagGroups.empty() ||
@@ -331,6 +332,7 @@ std::vector<ObjectRecord> ObjectStore::selectObjects(const Txn& txn, const Objec
     const std::optional<std::vector<std::string>>& projection) const
 {
     auto* db = static_cast<sqlite3*>(connection(txn));
+    if (requested.bbox) requireSpatial(db);
     auto selection=requested;
     if(selection.volume&&!selection.transforms)selection.transforms=std::make_shared<VolumeTransforms>(volumeTransforms(txn));
     const ObjectFields fields = projection ? ObjectFields(std::in_place, projection->begin(), projection->end()) : std::nullopt;
@@ -375,6 +377,7 @@ int64_t ObjectStore::unboundObjectCount(const Txn& txn, const std::string& kind,
 std::vector<SpatialRegion> ObjectStore::spatialRegions(const Txn& txn, const ObjectSelection& requested) const
 {
     auto* db = static_cast<sqlite3*>(connection(txn));
+    requireSpatial(db);
     auto selection=requested;
     if(selection.volume&&!selection.transforms)selection.transforms=std::make_shared<VolumeTransforms>(volumeTransforms(txn));
     if (selection.orderBy != "uuid") throw std::invalid_argument("spatial regions use UUID order");

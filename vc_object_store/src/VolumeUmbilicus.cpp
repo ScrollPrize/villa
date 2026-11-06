@@ -33,7 +33,9 @@ std::optional<VolumeUmbilicus> volumeUmbilicus(const ObjectStore& store, const T
     if (!store.currentGeometry(txn, record.uuid))
         throw std::runtime_error("umbilicus " + record.name + " has no geometry");
     const auto canonical = GeometrySnapshot(store, txn).umbilicus(record.uuid);
-    VolumeUmbilicus result{record.uuid, record.name, store.currentObjectRevision(txn, record.uuid)->uuid,
+    const auto objectRevision=store.provisioning(txn).history==HistoryMode::On
+        ? store.currentObjectRevision(txn,record.uuid) : std::optional<ObjectRevision>{};
+    VolumeUmbilicus result{record.uuid, record.name, objectRevision ? objectRevision->uuid : std::string{},
                            canonical.viewTransformedAt(volume.volume, volume.scale).points("points", 0, canonical.size())};
     return result;
 }
@@ -54,7 +56,7 @@ std::string setVolumeUmbilicus(ObjectStore& store, WriteTxn& txn, const std::str
     if (record.kind != "umbilicus") throw std::invalid_argument("setVolumeUmbilicus needs an umbilicus record");
     if (!store.volumeTransforms(txn).toVolume(nlohmann::json::parse(record.meta), volume))
         throw std::invalid_argument("umbilicus " + record.name + " does not map to volume " + volume);
-    for (const auto& [uuid, revision] : volumeUmbilicusRevisions(store, txn, volume)) store.retireObject(txn, uuid);
+    for (const auto& previous : store.selectObjects(txn,umbilici(volume))) store.retireObject(txn,previous.uuid);
     const auto uuid = store.upsertObject(txn, record);
     store.putGeometry(txn, uuid, geometry::encode(geometry));
     return uuid;

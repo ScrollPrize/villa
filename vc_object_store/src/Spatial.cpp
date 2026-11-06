@@ -238,18 +238,20 @@ void indexGeometry(sqlite3* db, int64_t objectId, const std::string& revision,
 void setSpatialBounds(sqlite3* db, int64_t objectId, const std::optional<Bounds>& bounds,
                       const std::optional<std::string>& revision)
 {
+    if (!spatialEnabled(db)) return;
     writeBounds(db, objectId, bounds, revision);
 }
 
 void indexGeometryBounds(sqlite3* db, int64_t objectId, const std::string& revision, const GeometryData& geometry)
 {
+    if (geometry.kind == "surface") refreshSurfaceArea(db, objectId, revision);
+    if (!spatialEnabled(db)) return;
     std::vector<GeometryArrayInfo> arrays;
     std::map<std::string, const GeometryArray*> data;
     for (const auto& a : geometry.arrays) {
         arrays.push_back({a.name, a.dtype, a.shape, static_cast<int64_t>(a.bytes.size())});
         data.emplace(a.name, &a);
     }
-    if (geometry.kind == "surface") refreshSurfaceArea(db, objectId, revision);
     indexGeometry(db, objectId, revision, geometry.kind, arrays,
         [&](const std::string& name, int64_t offset, int64_t count) {
             return std::span<const uint8_t>(data.at(name)->bytes).subspan(offset, count);
@@ -291,12 +293,13 @@ void refreshGeometryBounds(sqlite3* db, const std::string& objectUuid)
         parseUuid(objectUuid));
     if (!head.row()) return;
     const auto revision = formatUuid(head.blob16(1));
+    refreshSurfaceArea(db, head.i64(0), revision);
+    if (!spatialEnabled(db)) return;
     GeometryReader reader(db, revision);
     const auto& manifest = reader.manifest();
     std::vector<GeometryArrayInfo> arrays;
     for (const auto& [name, a] : manifest.at("arrays").items())
         arrays.push_back({name, a.at("dtype"), a.at("shape").get<std::vector<int64_t>>(), a.at("byte_length")});
-    refreshSurfaceArea(db, head.i64(0), revision);
     indexGeometry(db, head.i64(0), revision, manifest.at("kind").get<std::string>(), arrays,
         [&](const std::string& name, int64_t offset, int64_t count) { return reader.read(name, offset, count); },
         [&](const std::string& name, int64_t row, int64_t col, int64_t rows, int64_t cols) {
@@ -387,6 +390,7 @@ void updateEditedGeometryBounds(sqlite3* db, int64_t objectId, const std::string
             refreshSurfaceArea(db, objectId, revision);
         }
     }
+    if (!spatialEnabled(db)) return;
     std::set<RegionKey> dirty;
     for (const auto& edit : edits) {
         if (edit.bytes.empty() || !coordinates(kind, edit.array)) continue;
@@ -497,15 +501,15 @@ void createSpatialSchema(sqlite3* db)
     // Exact double bounds remain authoritative. SQLite's float R-tree is only
     // the broad phase. Saturation preserves ordering for very large doubles;
     // queries apply the same saturation and then recheck exact double bounds.
-    exec(db, R"SQL(
+    const std::string geometryTable = historyEnabled(db) ? "geometry_revisions" : "current_geometry";
+    exec(db, (R"SQL(
 CREATE TABLE object_bounds(
   object_id INTEGER PRIMARY KEY REFERENCES objects(id) ON DELETE CASCADE,
-  revision_uuid BLOB REFERENCES geometry_revisions(uuid),
+  revision_uuid BLOB REFERENCES )SQL" + geometryTable + R"SQL((uuid) DEFERRABLE INITIALLY DEFERRED,
   min_x REAL NOT NULL,min_y REAL NOT NULL,min_z REAL NOT NULL,
   max_x REAL NOT NULL,max_y REAL NOT NULL,max_z REAL NOT NULL
 );
-CREATE INDEX objects_kind_uuid ON objects(kind,uuid);
-)SQL");
+)SQL").c_str());
     createRegionSchema(db);
 }
 

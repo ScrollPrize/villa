@@ -1,4 +1,5 @@
 #include "StorageBindings.hpp"
+#include "AfvBindings.hpp"
 #include "ObjectReadBindings.hpp"
 #include "TypedGeometryBindings.hpp"
 #include "vc_object_store/objects/GeometryCoordinates.hpp"
@@ -10,6 +11,7 @@
 #include "vc_object_store/objects/ObjectStore.hpp"
 #include "vc_object_store/objects/Hub.hpp"
 #include "vc_object_store/objects/Project.hpp"
+#include "vc_object_store/objects/StoreConversion.hpp"
 #include "vc_reader/sftp.hpp"
 #include "vc_object_store/object_links/ObjectLinks.hpp"
 #include "vc_object_store/CtSheetNormal.hpp"
@@ -22,6 +24,7 @@ nb::dict objectRevisionToPy(const vo::ObjectRevision& revision)
     d["parent_uuid"] = revision.parentUuid; d["geometry_revision"] = revision.geometryRevision;
     d["sequence"] = revision.sequence; d["metadata_complete"] = revision.metadataComplete;
     d["published_at_us"] = revision.publishedAtUs; d["deleted"] = revision.deleted;
+    d["generation"] = revision.generation;
     d["record"] = objectToPy(revision.record);
     return d;
 }
@@ -30,6 +33,7 @@ nb::dict relationshipRevisionToPy(const vo::RelationshipRevision& revision)
 {
     nb::dict d;
     d["uuid"] = revision.uuid; d["record"] = edgeToPy(revision.record);
+    d["generation"] = revision.generation;
     d["a_revision"] = revision.aRevision; d["b_revision"] = revision.bRevision;
     d["a_geometry_revision"] = revision.aGeometryRevision; d["b_geometry_revision"] = revision.bGeometryRevision;
     return d;
@@ -292,6 +296,7 @@ void bindMutations(nb::class_<T>& cls)
 
 NB_MODULE(_native, m)
 {
+    bindAfvSource(m);
     nb::class_<vc::CtSheetNormalSampler>(m, "CtSheetNormalSampler")
         .def(nb::init<const std::filesystem::path&, int, double>(),
              nb::arg("ct_volume"), nb::arg("level") = 0, nb::arg("working_to_ct_scale") = 1.0)
@@ -307,6 +312,19 @@ NB_MODULE(_native, m)
         }, nb::arg("point_xyz"));
 
     m.doc() = "Revisioned objects and relationships, with owned geometry and typed snapshot views.";
+
+    m.def("convert_v1_to_v2", [](const std::filesystem::path& path) {
+        vo::ConversionReport report;
+        { nb::gil_scoped_release release; report = vo::convertV1ToV2(path); }
+        nb::dict result; result["tables"] = report.tables; result["rows"] = report.rows; result["bytes"] = report.bytes;
+        return result;
+    }, nb::arg("path"), "Offline verified schema-17 conversion with atomic replacement; close all store handles first.");
+    m.def("enable_history", [](const std::filesystem::path& path) {
+        nb::gil_scoped_release release; vo::changeHistoryMode(path, vo::HistoryMode::On);
+    }, nb::arg("path"), "Offline history enablement; close all handles and reload geometry tokens afterward.");
+    m.def("remove_history_and_disable", [](const std::filesystem::path& path) {
+        nb::gil_scoped_release release; vo::changeHistoryMode(path, vo::HistoryMode::Off);
+    }, nb::arg("path"), "Explicitly remove all retained history and disable future history; close all handles first.");
 
     bindGraphReadView(m);
     bindGeometryRegion(m);
@@ -327,6 +345,9 @@ NB_MODULE(_native, m)
     m.def("project_resource_uuid", &vo::projectResourceUuid, nb::arg("kind"), nb::arg("location"), nb::arg("owner") = "");
     m.def("hub_init", &vo::initHub, nb::arg("path"), nb::arg("author"),
           "Turn a local store with no other connections into a hub for a network share.");
+    m.def("hub_enable_ssh_locking", [](const std::filesystem::path& hub) {
+        nb::gil_scoped_release release; vo::enableHubProcessLocking(hub);
+    }, nb::arg("hub"), "Explicitly enable process locking for an SSH/SFTP hub before using remote writes.");
     m.def("hub_clone", [](const std::filesystem::path& hub, const std::filesystem::path& replica, const std::string& author) {
         vo::OpenOptions options; options.author = author;
         nb::gil_scoped_release release;
@@ -373,6 +394,7 @@ NB_MODULE(_native, m)
                     nb::arg("hostname") = std::nullopt, nb::arg("reader_pool_size") = 4,
                     nb::arg("geometry_cache_bytes") = 16 * 1024 * 1024,
                     nb::arg("spatial_cache_bytes") = 16 * 1024 * 1024, nb::arg("catalog") = nb::none(),
+                    nb::kw_only(), nb::arg("history_enabled") = true, nb::arg("spatial_index") = true,
                     "Create a new object database at path (refuses existing files).")
         .def_static("open", &PyObjectStore::open, nb::arg("path"), nb::arg("author") = std::nullopt,
                     nb::arg("read_only") = false, nb::arg("hostname") = std::nullopt,
@@ -392,6 +414,25 @@ NB_MODULE(_native, m)
         .def_prop_ro("path", [](PyObjectStore& self) { return self.require().path().string(); })
         .def_prop_ro("hostname", [](PyObjectStore& self) { return self.require().hostname(); })
         .def_prop_ro("author", [](PyObjectStore& self) { return self.require().author(); })
+        .def("provisioning", [](PyObjectStore& self) {
+            const auto p = self.withRead([](auto& db, auto& txn) { return db.provisioning(txn); });
+            nb::dict result; result["format_version"] = p.formatVersion; result["generation"] = p.generation;
+            result["history_enabled"] = p.history == vo::HistoryMode::On;
+            result["spatial_index"] = p.spatialIndex; result["sealed"] = p.sealed;
+            return result;
+        })
+        .def("database_identity", [](PyObjectStore& self) {
+            const auto id = self.withRead([](auto& db, auto& txn) { return db.databaseIdentity(txn); });
+            nb::dict result; result["uuid"] = id.uuid; result["schema_version"] = id.schemaVersion;
+            nb::list tables;
+            for (const auto& table : id.tables) {
+                nb::dict row; row["uuid"] = table.uuid; row["name"] = table.name; row["primary_key"] = table.primaryKey;
+                tables.append(row);
+            }
+            result["tables"] = tables; return result;
+        })
+        .def("seal", [](PyObjectStore& self) { self.withWrite([](auto& db, auto& txn) { db.seal(txn); }); },
+             "Permanently seal this database against writes; read-only opens remain available.")
         .def("object", readMethod<&vo::ObjectStore::objectByUuid>(),
              nb::arg("uuid"))
         .def("objects_by_kind", readMethod<&vo::ObjectStore::objectsByKind>(),
@@ -917,6 +958,7 @@ NB_MODULE(_native, m)
         return self.withWrite([&](auto& db,auto& txn){return db.chooseVolumeTransform(txn,source,target,path);});
     },nb::arg("source_volume"),nb::arg("target_volume"),nb::arg("path"));
     auto writer = nb::class_<PyObjectWriteTxn>(m, "WriteTransaction")
+        .def("seal", [](PyObjectWriteTxn& self) { self.withWrite([](auto& db, auto& txn) { db.seal(txn); }); })
         .def("__enter__", [](nb::object self) {
             nb::cast<PyObjectWriteTxn&>(self).enter();
             return self;

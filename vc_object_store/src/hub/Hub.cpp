@@ -23,6 +23,23 @@ constexpr int kHubBusyTimeoutMs = 60000;
 sqlite3* conn(const Txn& txn) { return ObjectStoreImplAccess::conn(txn); }
 StatementPool& pool(const Txn& txn) { return *activeStatementPools.at(conn(txn)); }
 
+// These exclusive provisioning transactions run before/after hosted handles
+// exist, so they must enforce the same persistent policy as ObjectStore::write.
+void requireHostedProvisioning(sqlite3* db)
+{
+    requireHistory(db);
+    Statement manifest(db, "SELECT sealed FROM store_manifest WHERE singleton=1");
+    if (!manifest.row() || manifest.i64(0)) throw std::runtime_error("hub: store is sealed or has no v2 manifest");
+    (void)writeGeneration(db); // Reject exhaustion before altering the schema.
+}
+
+void publishHostedProvisioning(sqlite3* db)
+{
+    registerStorageTables(db);
+    execute(db, "UPDATE store_manifest SET generation=? WHERE singleton=1", writeGeneration(db));
+    exec(db, "UPDATE store_write_state SET dirty=0 WHERE singleton=1;");
+}
+
 Upstream upstream(sqlite3* db)
 {
     if (detectHubRole(db) != HubRole::Replica) throw std::runtime_error("hub: store is not a hosted replica");
@@ -108,7 +125,8 @@ std::vector<HubConflict> conflicts(ObjectStore& replica, const Txn& txn)
     std::vector<HubConflict> result;
     Statement rows(conn(txn), "SELECT record_uuid,version,record FROM hub_conflicts ORDER BY record_uuid");
     while (rows.row())
-        result.push_back({rows.text(0), rows.i64(1), rows.text(2), syncRecord(replica, txn, rows.text(0)).dump()});
+        result.push_back({rows.text(0), rows.i64(1), recordContent(Json::parse(rows.text(2))).dump(),
+                          syncRecord(replica, txn, rows.text(0)).dump()});
     return result;
 }
 
@@ -272,6 +290,8 @@ void initHub(const std::filesystem::path& path, const std::string& author)
         // The ordinary open validates the format and schema.
         auto check = options; check.readOnly = true;
         auto store = ObjectStore::open(path, check);
+        auto txn = store.read();
+        requireHostedProvisioning(conn(txn));
     }
     auto* db = openConnection(path, SQLITE_OPEN_READWRITE, options, false);
     try {
@@ -282,7 +302,12 @@ void initHub(const std::filesystem::path& path, const std::string& author)
                 throw std::runtime_error("hub: cannot leave WAL mode; close every other connection to " + path.string());
         }
         exec(db, "BEGIN IMMEDIATE;");
-        try { createHubTables(db); exec(db, "COMMIT;"); }
+        try {
+            requireHostedProvisioning(db);
+            createHubTables(db);
+            publishHostedProvisioning(db);
+            exec(db, "COMMIT;");
+        }
         catch (...) { sqlite3_exec(db, "ROLLBACK;", nullptr, nullptr, nullptr); throw; }
     } catch (...) { sqlite3_close(db); throw; }
     sqlite3_close(db);
@@ -308,15 +333,18 @@ void cloneHub(const std::filesystem::path& hubPath, const std::filesystem::path&
     try {
         if (pragmaInt(source, "application_id") != 0x56434f42 || detectHubRole(source) != HubRole::Hub)
             throw std::runtime_error("hub: not a hosted hub: " + hub);
+        requireHostedProvisioning(source);
         copyHubFile(source, hub, partial, progress);
         target = openConnection(partial, SQLITE_OPEN_READWRITE, options, false);
         exec(target, "PRAGMA journal_mode=WAL;");
         exec(target, "BEGIN IMMEDIATE;");
         try {
+            requireHostedProvisioning(target);
             createReplicaTables(target);
             const auto cursor = syncCursor(target);
             execute(target, "INSERT INTO hub_upstream VALUES(1,?,?,?,?,?)", hub, replicaIdentity(target),
                 cursor.journal, cursor.journal, cursor.geometry);
+            publishHostedProvisioning(target);
             exec(target, "COMMIT;");
         } catch (...) { sqlite3_exec(target, "ROLLBACK;", nullptr, nullptr, nullptr); throw; }
         close();
@@ -385,8 +413,10 @@ void detachHub(const std::filesystem::path& path, const std::string& author)
         if (detectHubRole(db) != HubRole::Replica) throw std::runtime_error("hub: store is not a hosted replica");
         exec(db, "BEGIN IMMEDIATE;");
         try {
+            requireHostedProvisioning(db);
             for (const auto* table : {"hub_upstream", "hub_versions", "hub_pending", "hub_inflight", "hub_conflicts", "hub_leases"})
                 exec(db, (std::string("DROP TABLE ") + table + ";").c_str());
+            publishHostedProvisioning(db);
             exec(db, "COMMIT;");
         } catch (...) { sqlite3_exec(db, "ROLLBACK;", nullptr, nullptr, nullptr); throw; }
     } catch (...) { sqlite3_close(db); throw; }

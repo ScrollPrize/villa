@@ -20,6 +20,7 @@ bool before(const SurfaceProximityHit& a, const SurfaceProximityHit& b)
 
 std::vector<SurfaceProximityHit> ObjectStore::nearestSurfaces(const ReadTxn& txn, const SurfaceProximityQuery& requested) const
 {
+    detail::requireSpatial(static_cast<sqlite3*>(connection(txn)));
     auto query = requested;
     if(query.volume&&!query.transforms) query.transforms=std::make_shared<VolumeTransforms>(volumeTransforms(txn));
     auto* db = static_cast<sqlite3*>(connection(txn));

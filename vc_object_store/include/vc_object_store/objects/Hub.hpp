@@ -26,7 +26,8 @@ struct HubLease {
 struct HubConflict {
     std::string uuid;
     int64_t hubVersion = 0;
-    std::string hubRecord, localRecord;  // canonical sync JSON, "null" when absent
+    // Canonical content JSON (no database-local generation counters), "null" when absent.
+    std::string hubRecord, localRecord;
 };
 
 struct HubSyncReport {

@@ -72,6 +72,7 @@ void detail::bindLifecycle(sqlite3* db, const EdgeRecord& edge, const std::strin
 namespace {
 void requireCheckedLifecycle(sqlite3* db)
 {
+    if (!historyEnabled(db)) return;
     Statement checked(db, "SELECT 1 FROM history_checked");
     if (!checked.row()) throw std::runtime_error("object lifecycle requires write(expected_revisions)");
 }
@@ -100,6 +101,17 @@ void ObjectStore::restoreObject(WriteTxn& txn, const std::string& uuid,
     const auto current = objectByUuid(txn, uuid);
     if (!current) throw std::invalid_argument("object lifecycle: unknown object");
     if (!current->retired && !sourceRevision) return;
+    if (!historyEnabled(db)) {
+        if (sourceRevision) requireHistory(db);
+        Savepoint savepoint(db);
+        auto restored = *current;
+        restored.retired = false; restored.lifecycleEpoch = util::newUuid();
+        const auto id = *objectIdByUuid(db, parseUuid(uuid));
+        writeLifecycle(db, id, restored);
+        stampContentChange(db, author(), hostname(), "objects", id, parseUuid(uuid), "restore");
+        savepoint.release();
+        return;
+    }
     std::optional<ObjectRevision> source;
     if (sourceRevision) source = objectRevision(txn, *sourceRevision);
     else {

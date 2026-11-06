@@ -9,9 +9,11 @@ using namespace detail;
 namespace {
 using Json=nlohmann::json;
 void checked(sqlite3* db) {
+    if (!historyEnabled(db)) return; // Geometry's expected current token is still checked.
     if (!activeStatementPools.at(db)->checkedAction) throw std::runtime_error("structural editing requires write(expected revisions)");
 }
 void requireSource(sqlite3* db,const std::string& uuid) {
+    if (!historyEnabled(db)) return;
     execute(db,"INSERT OR IGNORE INTO history_required VALUES(?)", uuid);
 }
 std::vector<int64_t> idsOf(GeometryReader& reader,const std::string& ids,int64_t count) {
@@ -86,7 +88,8 @@ std::string ObjectStore::editGeometrySequence(WriteTxn& txn,const std::string& o
         if(!idsName.empty()) {
             originalIds=idsOf(reader,idsName,oldCount);
             // Restoration must not allow a previously allocated ID to be reused.
-            Statement latest(db,"SELECT manifest FROM geometry_revisions WHERE object_uuid=? ORDER BY object_generation DESC,rowid DESC LIMIT 1",
+            Statement latest(db,historyEnabled(db) ? "SELECT manifest FROM geometry_revisions WHERE object_uuid=? ORDER BY rowid DESC LIMIT 1" :
+                "SELECT manifest FROM current_geometry WHERE object_uuid=?",
                 parseUuid(uuid));
             if(latest.row()) {
                 const auto tip=Json::parse(latest.text(0));

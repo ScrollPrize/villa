@@ -155,6 +155,7 @@ void applyGeometryDelta(std::vector<uint8_t>& bytes, const GeometryChunkChange& 
         throw std::runtime_error("geometry delta: result chunk mismatch");
 }
 void clearGeometryMaterialization(sqlite3* db, const std::string& object) {
+    if (!historyEnabled(db)) return;
     for (const auto* table : {"geometry_current_chunks", "geometry_materializations"}) {
         execute(db, std::string("DELETE FROM ") + table + " WHERE object_uuid=?", parseUuid(object));
     }

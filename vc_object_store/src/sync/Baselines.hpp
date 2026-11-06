@@ -25,7 +25,7 @@ inline Json syncRecord(ObjectStore& store, const Txn& txn, const std::string& id
         auto record = objectToJson(*object); record["record_type"] = "objects";
         if (const auto geometry = store.currentGeometry(txn, id))
             record["geometry"] = {{"revision_uuid", geometry->uuid}, {"content_hash", geometry->contentHash}};
-        return record;
+        return recordContent(std::move(record));
     }
     if (const auto edge = store.edgeByUuid(txn, id)) {
         auto record = edgeToJson(*edge); record["record_type"] = "edges";
@@ -40,7 +40,7 @@ inline Json syncRecord(ObjectStore& store, const Txn& txn, const std::string& id
                                              {"b", swap ? epochs.first : epochs.second}};
         auto revision = [&](int column) -> Json { return binding.isNull(column) ? Json() : Json(formatUuid(binding.blob16(column))); };
         record["geometry_bindings"] = {{"a", revision(swap ? 1 : 0)}, {"b", revision(swap ? 0 : 1)}};
-        return record;
+        return recordContent(std::move(record));
     }
     return nullptr;
 }

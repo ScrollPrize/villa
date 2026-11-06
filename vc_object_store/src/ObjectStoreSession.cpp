@@ -23,6 +23,7 @@ struct ObjectStoreSession::Attachment {
     // writer serializes accepted actions; journal guards journalPosition.
     std::mutex writer, journal;
     int64_t journalPosition = 0;
+    int64_t storeGeneration = 0;
     // Hosted replicas only; declared after store so it stops first.
     std::unique_ptr<detail::HubWorker> hub;
     // Writable attachments: fetches the geometry of objects published elsewhere
@@ -66,10 +67,12 @@ std::shared_ptr<ObjectStoreSession::Attachment> ObjectStoreSession::open(const s
     // Exercise write access without changing records. Opening a read connection
     // successfully is not sufficient validation for an editing session.
     next->writable = !options.readOnly;
-    if (next->writable) { auto writable = next->store.write(RevisionSelection{}); writable.commit(); }
+    if (next->writable) { auto writable = next->store.write(); writable.commit(); }
     auto txn = next->store.read();
     next->identity.storeUuid = next->store.uuid(txn);
-    next->journalPosition = next->store.journalPosition(txn);
+    const auto policy=next->store.provisioning(txn);
+    next->storeGeneration=policy.generation;
+    if(policy.history==HistoryMode::On)next->journalPosition = next->store.journalPosition(txn);
     return next;
 }
 
@@ -230,13 +233,31 @@ RevisionSelection ObjectStoreSession::act(const AttachmentIdentity& identity,
     return committed;
 }
 
+void ObjectStoreSession::actAtGeneration(const AttachmentIdentity& identity,int64_t expected,const Action& callback)
+{
+    auto attachment=acquire(identity,true);
+    try{
+        std::lock_guard writer(attachment->writer);
+        auto txn=attachment->store.write();
+        if(attachment->store.provisioning(txn).generation!=expected)
+            throw std::runtime_error("object store changed; reload before committing");
+        callback(attachment->store,txn);txn.commit();
+        if(attachment->hub)attachment->hub->requestSync(true);
+    }catch(...){release(*attachment,true);throw;}
+    release(*attachment,true);
+}
+
 std::string ObjectStoreSession::copyObject(const AttachmentIdentity& from, const AttachmentIdentity& to,
                                            const std::string& objectUuid, const std::string& name)
 {
     std::optional<ObjectCopy> copy;
     read(from, [&](const auto& store, const auto& txn, const auto&) { copy = readObjectCopy(store, txn, objectUuid); });
     if (!name.empty()) copy->record.name = name;
-    act(to, {{copy->record.uuid, std::nullopt}}, [&](auto& store, auto& txn) { writeObjectCopy(store, txn, *copy); });
+    StoreProvisioning policy;
+    read(to,[&](const auto& store,const auto& txn,const auto&){policy=store.provisioning(txn);});
+    if(policy.history==HistoryMode::Off)
+        actAtGeneration(to,policy.generation,[&](auto& store,auto& txn){writeObjectCopy(store,txn,*copy);});
+    else act(to, {{copy->record.uuid, std::nullopt}}, [&](auto& store, auto& txn) { writeObjectCopy(store, txn, *copy); });
     return copy->record.uuid;
 }
 
@@ -248,7 +269,14 @@ void ObjectStoreSession::importObject(const AttachmentIdentity& from, const Atta
     read(from, [&](const auto& store, const auto& txn, const auto&) {
         copy = readObjectCopy(store, txn, objectUuid, util::canonicalUuid(objectUuid));
     });
-    act(to, {{copy->record.uuid, std::nullopt}}, [&](auto& store, auto& txn) { writeObjectCopy(store, txn, *copy); });
+    StoreProvisioning policy;
+    read(to,[&](const auto& store,const auto& txn,const auto&){policy=store.provisioning(txn);});
+    const Action action=[&](auto& store,auto& txn){
+        if(store.objectByUuid(txn,copy->record.uuid))throw std::runtime_error("import target already contains object");
+        writeObjectCopy(store,txn,*copy);
+    };
+    if(policy.history==HistoryMode::Off)actAtGeneration(to,policy.generation,action);
+    else act(to,{{copy->record.uuid,std::nullopt}},action);
 }
 
 void ObjectStoreSession::writeJob(const AttachmentIdentity& identity, const Job& job)
@@ -276,15 +304,29 @@ void ObjectStoreSession::editCurrent(const AttachmentIdentity& identity, const s
                                      const std::function<void(ObjectStore&, WriteTxn&, const std::string&)>& edit)
 {
     RevisionSelection pins;
+    std::optional<int64_t> directGeneration;
     read(identity, [&](const auto& store, const auto& txn, const auto&) {
+        const auto policy=store.provisioning(txn);
+        if(policy.history==HistoryMode::Off)directGeneration=policy.generation;
         for (const auto& objectUuid : objectUuids) {
             const auto uuid = util::canonicalUuid(objectUuid);
+            if(directGeneration){
+                if(!store.objectByUuid(txn,uuid))throw std::runtime_error("object is not in the store: "+uuid);
+                pins[uuid]=std::nullopt;continue;
+            }
             const auto current = store.currentObjectRevision(txn, uuid);
             if (!current) throw std::runtime_error("object is not in the store: " + uuid);
             pins[uuid] = current->uuid;
         }
     });
     if (pins.empty()) return;
+    if(directGeneration){
+        // Old relationship/geometry snapshots cannot be kept in history-off
+        // storage. Native current-dependency validation still rejects edits
+        // that require explicit relationship repair or removal.
+        actAtGeneration(identity,*directGeneration,[&](auto& store,auto& txn){for(const auto& [uuid,_]:pins)edit(store,txn,uuid);});
+        return;
+    }
     editKeepingRelationships(identity, pins, {}, [&](auto& store, auto& txn, const auto&) {
         for (const auto& [uuid, revision] : pins) {
             edit(store, txn, uuid);
@@ -340,9 +382,9 @@ void ObjectStoreSession::startFetching(Attachment& attachment)
             if (!fetch) throw std::runtime_error("no geometry fetcher for " + uuid);
             // A placeholder another replica pushed is edited by fetching it.
             const auto lease = holdLeases(identity, {uuid});
-            fetch(held->store, uuid, [&](const RevisionSelection& expected, const Action& action) {
-                return fetchWrite(identity, expected, action);
-            });
+            fetch(held->store,uuid,FetchWrite{
+                [&](const RevisionSelection& expected,const Action& action){return fetchWrite(identity,expected,action);},
+                [&](int64_t expected,const Action& action){fetchWriteAtGeneration(identity,expected,action);}});
         } catch (...) { release(*held, false); throw; }
         release(*held, false);
     });
@@ -351,12 +393,25 @@ void ObjectStoreSession::startFetching(Attachment& attachment)
 RevisionSelection ObjectStoreSession::fetchWrite(const AttachmentIdentity& identity, const RevisionSelection& expected,
                                                  const Action& callback)
 {
+    return fetchWriteChecked(identity,expected,std::nullopt,callback);
+}
+
+void ObjectStoreSession::fetchWriteAtGeneration(const AttachmentIdentity& identity,int64_t expected,const Action& callback)
+{
+    (void)fetchWriteChecked(identity,{},expected,callback);
+}
+
+RevisionSelection ObjectStoreSession::fetchWriteChecked(const AttachmentIdentity& identity,const RevisionSelection& expected,
+                                                       std::optional<int64_t> generation,const Action& callback)
+{
     RevisionSelection committed;
     auto attachment = acquire(identity, false);
     try {
         if (!attachment->fetches) throw std::runtime_error("Object store is attached read-only");
         std::lock_guard writer(attachment->writer);
-        auto txn = attachment->store.write(expected);
+        auto txn = generation ? attachment->store.write() : attachment->store.write(expected);
+        if(generation&&attachment->store.provisioning(txn).generation!=*generation)
+            throw std::runtime_error("object store changed during geometry fetch; retry");
         callback(attachment->store, txn);
         txn.commit();
         committed = txn.committedRevisions();
@@ -743,12 +798,21 @@ void ObjectStoreSession::observe(Attachment& attachment)
 {
     std::lock_guard journal(attachment.journal);
     auto txn = attachment.store.read();
+    const auto policy=attachment.store.provisioning(txn);
+    if(policy.history==HistoryMode::Off){
+        if(policy.generation==attachment.storeGeneration)return;
+        std::lock_guard lock(mutex_);
+        events_.push_back({StoreSessionEvent::Kind::Committed,attachment.identity,0,{},policy.generation,true});
+        attachment.storeGeneration=policy.generation;
+        return;
+    }
     auto changes = attachment.store.journalSince(txn, attachment.journalPosition);
     if (changes.empty()) return;
     const auto position = changes.back().seq;
     std::lock_guard lock(mutex_);
-    events_.push_back({StoreSessionEvent::Kind::Committed, attachment.identity, position, std::move(changes)});
+    events_.push_back({StoreSessionEvent::Kind::Committed, attachment.identity, position, std::move(changes),policy.generation,false});
     attachment.journalPosition = position;
+    attachment.storeGeneration = policy.generation;
 }
 
 std::vector<StoreSessionEvent> ObjectStoreSession::takeEvents()
@@ -775,6 +839,7 @@ std::vector<StoreSessionEvent> ObjectStoreSession::takeEvents()
 
 bool StoreSessionEvent::touches(std::initializer_list<std::string_view> kinds) const
 {
+    if(fullInvalidation)return true;
     if (kind != Kind::Committed && kind != Kind::Draft) return true;
     return std::any_of(changes.begin(), changes.end(), [&](const auto& change) {
         return std::find(kinds.begin(), kinds.end(), change.kind) != kinds.end();
@@ -783,8 +848,18 @@ bool StoreSessionEvent::touches(std::initializer_list<std::string_view> kinds) c
 
 LeaseHold ObjectStoreSession::holdForEditing(const PinnedObject& pin)
 {
+    if(pin.object.storeUuid!=pin.attachment.storeUuid)
+        throw std::invalid_argument("pinned object belongs to another store");
     auto lease = holdLeases(pin.attachment, {pin.object.objectUuid});
     read(pin.attachment, [&](const auto& store, const auto& txn, const auto&) {
+        if(store.provisioning(txn).history==HistoryMode::Off){
+            const auto object=store.objectByUuid(txn,pin.object.objectUuid);
+            const auto geometry=store.currentGeometry(txn,pin.object.objectUuid);
+            const auto token=geometry?std::optional(geometry->uuid):std::nullopt;
+            if(!pin.objectRevision.empty()||pin.objectGeneration<=0||!object||object->generation!=pin.objectGeneration||token!=pin.geometryRevision)
+                throw std::runtime_error("It changed in the object store since it was opened; reopen it to edit");
+            return;
+        }
         const auto head = store.currentObjectRevision(txn, pin.object.objectUuid);
         if (!head || head->uuid != pin.objectRevision)
             throw std::runtime_error("It changed in the object store since it was opened; reopen it to edit");

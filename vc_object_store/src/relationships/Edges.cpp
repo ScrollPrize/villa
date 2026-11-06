@@ -1,5 +1,6 @@
 #include "internal/EdgeSql.hpp"
 #include "geometry/Dependencies.hpp"
+#include "geometry/GeometryInternal.hpp"
 #include "internal/History.hpp"
 #include <nlohmann/json.hpp>
 
@@ -7,16 +8,30 @@ namespace vc::objects {
 using namespace detail;
 std::string ObjectStore::addEdge(WriteTxn& txn, const EdgeRecord& record)
 {
+    GeometryPhase phase("native.edge");
     detail::DependencyScope dependencyScope;
-    for (const auto& [uuid, anchor] : {std::pair{record.aUuid, record.aAnchor}, std::pair{record.bUuid, record.bAnchor}})
+    {GeometryPhase geometryPhase("native.edge.geometry");
+    for (const auto& [uuid, anchor] : {std::pair{record.aUuid, record.aAnchor}, std::pair{record.bUuid, record.bAnchor}}) {
+        // validateDependencies immediately accepts this case. Anchor syntax
+        // and finite values are still checked by canonicalizeEdge below.
+        if (anchor.wholeGeometry && anchor.points.empty()) continue;
         if (const auto revision = currentGeometry(txn, uuid))
             detail::validateDependencies(anchor, detail::dependencyGeometry(*this, txn, *revision));
+    }
+    }
     auto* db = static_cast<sqlite3*>(connection(txn));
     Savepoint savepoint(db);
-    const auto uuid = addEdgeImpl(db, impl_->options.author, impl_->hostname, record, false);
-    recordRelationshipValidation(db, *edgeByUuid(txn, uuid));
+    const auto inserted = addEdgeImpl(db, impl_->options.author, impl_->hostname, record, false);
+    {GeometryPhase validate("native.edge.validation");recordRelationshipValidation(db,inserted);}
     savepoint.release();
-    return uuid;
+    return inserted.uuid;
+}
+
+std::string ObjectStore::insertEdgeWithId(WriteTxn& txn,const EdgeRecord& record,int64_t id)
+{
+    ExplicitRecordId allocation(static_cast<sqlite3*>(connection(txn)),"edges",record.uuid,id);
+    const auto result=addEdge(txn,record);
+    allocation.finish();return result;
 }
 
 void ObjectStore::updateEdge(WriteTxn& txn, const EdgeRecord& record)
@@ -29,8 +44,8 @@ void ObjectStore::updateEdge(WriteTxn& txn, const EdgeRecord& record)
     canonicalizeEdge(rec);
     if (rec.aUuid != rec.bUuid && rec.aUuid == existing->bUuid && rec.bUuid == existing->aUuid)
         swapEndpoints(rec);
-    if (rec.kind != existing->kind || rec.aUuid != existing->aUuid || rec.bUuid != existing->bUuid)
-        throw std::runtime_error("object store: edge kind and endpoints cannot change");
+    if (rec.kind != existing->kind || rec.aUuid != existing->aUuid || rec.bUuid != existing->bUuid || rec.relationKey != existing->relationKey)
+        throw std::runtime_error("object store: edge kind, endpoints and relation key cannot change");
     for (const auto& [uuid, anchor] : {std::pair{rec.aUuid, rec.aAnchor}, std::pair{rec.bUuid, rec.bAnchor}})
         if (const auto revision = currentGeometry(txn, uuid))
             detail::validateDependencies(anchor, detail::dependencyGeometry(*this, txn, *revision));

@@ -32,6 +32,9 @@ struct PinnedObject {
     ObjectIdentity object;
     std::string objectRevision;
     std::optional<std::string> geometryRevision;
+    // Required instead of objectRevision when pinning history-off current data.
+    // Capture from the same read transaction as geometry and metadata.
+    int64_t objectGeneration = 0;
     bool operator==(const PinnedObject&) const = default;
 };
 
@@ -57,6 +60,10 @@ struct StoreSessionEvent {
     // Generic record UUIDs: objects AND relationships, including deleted records.
     // Consumers invalidate by identity, never by names or storage paths.
     std::vector<JournalEntry> changes;
+    // History-off stores have no event log: a changed global generation emits
+    // a whole-store invalidation, never a fabricated per-record journal.
+    int64_t storeGeneration = 0;
+    bool fullInvalidation = false;
     // Whether it may have changed records of these kinds: a commit or draft
     // touching one, or any attachment or hub event.
     bool touches(std::initializer_list<std::string_view> kinds) const;
@@ -138,7 +145,18 @@ public:
                                const HubSessionOptions& = {});
     void detach(const AttachmentIdentity&);
     // Writes by a geometry fetcher (setGeometryFetcher) on a writable attachment.
-    using FetchWrite = std::function<RevisionSelection(const RevisionSelection& expected, const Action&)>;
+    struct FetchWrite {
+        std::function<RevisionSelection(const RevisionSelection&, const Action&)> revisions;
+        std::function<void(int64_t, const Action&)> generation;
+        RevisionSelection operator()(const RevisionSelection& expected,const Action& action) const {
+            return revisions(expected,action);
+        }
+        // Current-only stores have no revision UUIDs. Check the generation
+        // observed before fetching instead, including concurrent metadata edits.
+        void atGeneration(int64_t expected,const Action& action) const {
+            generation(expected,action);
+        }
+    };
     // Fetches one object's geometry and writes it with `write`; throws when it
     // cannot. Runs on the attachment's fetch thread; must only read `store`.
     using GeometryFetcher = std::function<void(ObjectStore& store, const std::string& objectUuid, const FetchWrite& write)>;
@@ -150,6 +168,7 @@ public:
     // again. An empty `fetch` removes the fetcher. Read-only attachments never fetch.
     void setGeometryFetcher(const std::string& metaKey, GeometryFetcher fetch);
     RevisionSelection fetchWrite(const AttachmentIdentity&, const RevisionSelection& expected, const Action&);
+    void fetchWriteAtGeneration(const AttachmentIdentity&, int64_t expectedGeneration, const Action&);
     // Fetch these again (their published geometry changed), read or not.
     void refetch(const AttachmentIdentity&, const std::vector<std::string>& objectUuids);
     // Block until the object's geometry is local, fetching it now when it has
@@ -164,6 +183,9 @@ public:
     // All writes are immediate checked atomic actions. The library enforces
     // expectations for every affected object and relationship endpoint.
     RevisionSelection act(const AttachmentIdentity&, const RevisionSelection&, const Action&);
+    // Conservative current-state check, available with or without history.
+    // Any committed change since the observed store generation rejects it.
+    void actAtGeneration(const AttachmentIdentity&, int64_t expectedGeneration, const Action&);
     // Decisions for relationships an edit affects: each is kept as recorded, with
     // its historical pins and no claim that it applies to the new geometry.
     using KeepRecorded = std::function<std::vector<GeometryEdgeEdit>(const std::vector<EdgeRecord>&)>;
@@ -284,6 +306,8 @@ private:
     void observe(Attachment&);
     void hubChanged(const Attachment*);
     void startFetching(Attachment&);
+    RevisionSelection fetchWriteChecked(const AttachmentIdentity&, const RevisionSelection&,
+                                        std::optional<int64_t> expectedGeneration, const Action&);
 
     // transition_ serializes lifecycle operations and is never held by read
     // callbacks. mutex_ protects the attachment list, admission and events.

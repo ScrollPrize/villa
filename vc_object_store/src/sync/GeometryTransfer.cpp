@@ -18,10 +18,11 @@ template<class Row> Row values(const Statement& statement)
     }
     return row;
 }
-template<class Row> bool equalRows(const Row& a, const Statement& b)
+template<class Row> bool equalRows(const Row& a, const Statement& b, int localColumn = -1)
 {
     if (int(a.size()) != sqlite3_column_count(b.value)) return false;
     for (int i = 0; i < int(a.size()); ++i) {
+        if (i == localColumn) continue;
         auto* value = a[i].get();
         if (sqlite3_value_type(value) != sqlite3_column_type(b.value, i)) return false;
         const auto size = sqlite3_value_bytes(value);
@@ -30,10 +31,11 @@ template<class Row> bool equalRows(const Row& a, const Statement& b)
     }
     return true;
 }
-template<class Row> void insertRow(sqlite3* destination, const Row& row, const char* sql)
+template<class Row> void insertRow(sqlite3* destination, const Row& row, const char* sql, int localColumn = -1)
 {
     Statement insert(destination, sql);
     for (int i = 0; i < int(row.size()); ++i) check(sqlite3_bind_value(insert.value, i + 1, row[i].get()), destination);
+    if (localColumn >= 0) insert.bind(localColumn + 1, writeGeneration(destination));
     insert.stepDone();
 }
 }
@@ -41,7 +43,7 @@ template<class Row> void insertRow(sqlite3* destination, const Row& row, const c
 void GeometryStage::read(sqlite3* source, sqlite3* known, const std::string& objectUuid, int64_t afterRow)
 {
     std::vector<Revision> staged;
-    Statement revisions(source, "SELECT " + columns + " FROM geometry_revisions WHERE object_uuid=? AND rowid>? ORDER BY object_generation,uuid",
+    Statement revisions(source, "SELECT " + columns + " FROM geometry_revisions WHERE object_uuid=? AND rowid>? ORDER BY rowid",
         parseUuid(objectUuid), afterRow);
     while (revisions.row()) {
         auto& revision = staged.emplace_back(Revision{formatUuid(revisions.blob16(0)), revisions.text(4), values<Row>(revisions), {}});
@@ -79,14 +81,17 @@ void GeometryStage::read(sqlite3* source, sqlite3* known, const std::string& obj
             "JOIN geometry_chunks c ON c.hash=r.hash WHERE r.revision_uuid=? ORDER BY r.array_name,r.chunk_index",
             revisions.blob16(0));
         while (chunks.row()) {
-            const auto* data = static_cast<const uint8_t*>(sqlite3_column_blob(chunks.value, 3));
-            const auto size = sqlite3_column_bytes(chunks.value, 3);
+            std::vector<uint8_t> external;
+            if(chunks.isNull(3)) external=readExternalGeometryPayload(source,chunks.text(2));
+            const auto bytes=chunks.isNull(3) ? std::span<const uint8_t>(external) :
+                std::span(static_cast<const uint8_t*>(sqlite3_column_blob(chunks.value, 3)),
+                          size_t(sqlite3_column_bytes(chunks.value, 3)));
             const auto& a=parsed.at("arrays").at(chunks.text(0));
             const auto hash=a.at("chunks").at(chunks.i64(1));
-            if (size != layouts.at(chunks.text(0)).chunkBytes(chunks.i64(1)) ||
-                geometryHash(std::span(data, size)) != chunks.text(2) || hash != chunks.text(2))
+            if (bytes.size() != uint64_t(layouts.at(chunks.text(0)).chunkBytes(chunks.i64(1))) ||
+                geometryHash(bytes) != chunks.text(2) || hash != chunks.text(2))
                 throw std::runtime_error("sync: corrupt geometry chunk");
-            revision.chunks.push_back({chunks.text(0), chunks.text(2), chunks.i64(1), std::vector<uint8_t>(data, data + size)});
+            revision.chunks.push_back({chunks.text(0), chunks.text(2), chunks.i64(1), std::vector<uint8_t>(bytes.begin(),bytes.end())});
         }
         if (revision.chunks.size() != expected) throw std::runtime_error("sync: missing geometry chunks");
     }
@@ -101,11 +106,13 @@ void GeometryStage::install(sqlite3* destination, const std::string& objectUuid)
         const auto uuid = parseUuid(revision.uuid);
         Statement existing(destination, "SELECT " + columns + " FROM geometry_revisions WHERE uuid=?", uuid);
         if (existing.row()) {
-            if (!equalRows(revision.row, existing)) throw std::runtime_error("sync: geometry revision UUID collision");
+            // A revision's identity/content/provenance are portable; the
+            // generation at which each database installed it is local.
+            if (!equalRows(revision.row, existing, 5)) throw std::runtime_error("sync: geometry revision UUID collision");
             continue;
         }
         if (!revision.payload) throw std::runtime_error("sync: geometry revision " + revision.uuid + " left the destination while staged");
-        insertRow(destination, revision.row, "INSERT INTO geometry_revisions VALUES(?,?,?,?,?,?,?,?,?)");
+        insertRow(destination, revision.row, "INSERT INTO geometry_revisions VALUES(?,?,?,?,?,?,?,?,?)", 5);
         if (!revision.delta.empty()) {
             insertRow(destination, revision.delta, "INSERT INTO geometry_deltas VALUES(?,?,?)");
             // Resolve/validate ancestry and the resulting manifest as well.
@@ -125,7 +132,10 @@ void GeometryStage::install(sqlite3* destination, const std::string& objectUuid)
             const auto size = int(chunk.data.size());
             Statement old(destination, "SELECT hash,data FROM geometry_chunks WHERE hash=?", chunk.hash);
             if (old.row()) {
-                if (sqlite3_column_bytes(old.value, 1) != size || std::memcmp(sqlite3_column_blob(old.value, 1), chunk.data.data(), size))
+                if(old.isNull(1)) {
+                    if(readExternalGeometryPayload(destination,chunk.hash)!=chunk.data)
+                        throw std::runtime_error("sync: external geometry chunk hash collision");
+                } else if (sqlite3_column_bytes(old.value, 1) != size || std::memcmp(sqlite3_column_blob(old.value, 1), chunk.data.data(), size))
                     throw std::runtime_error("sync: geometry chunk hash collision");
             } else {
                 execute(destination, "INSERT INTO geometry_chunks VALUES(?,?)", chunk.hash, std::span(chunk.data));

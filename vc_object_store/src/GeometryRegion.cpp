@@ -114,6 +114,7 @@ Bounds detail::slabBounds(const RegionSlice& view) {
 RegionResult ObjectStore::geometryRegion(const ReadTxn& txn, const RegionSlice& view,
     const RegionOptions& requested, const RegionCancel& cancel) const
 {
+    detail::requireSpatial(static_cast<sqlite3*>(connection(txn)));
     auto options=requested;
     if(options.volume&&!options.transforms)options.transforms=std::make_shared<VolumeTransforms>(volumeTransforms(txn));
     auto* db = static_cast<sqlite3*>(connection(txn));

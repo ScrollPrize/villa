@@ -11,6 +11,7 @@
 #include <cstdio>
 #include <cstring>
 #include <fstream>
+#include <functional>
 #include <map>
 #include <sstream>
 #include <ctime>
@@ -34,6 +35,13 @@ namespace detail { class GeometryReadCache; class SpatialReadCache; }
 // Connections are leased to one thread per transaction. Cache idle statements
 // on the connection; the thread-local registry only identifies the active lease.
 struct StatementPool {
+    // Installed only by a collection transaction with pinned dependencies.
+    // Each callback must require an explicit hash -> dependency mapping.
+    std::function<std::vector<uint8_t>(const std::string&)> externalGeometryChunk;
+    std::function<int64_t(const std::string&)> externalGeometryChunkSize;
+    bool historyEnabled = true;
+    bool spatialEnabled = true;
+    int startSchemaVersion = 0;
     std::map<std::string,double> transformedLengths;
     bool readSnapshot = false;
     bool checkedAction = false, actionConflict = false;
@@ -53,6 +61,20 @@ struct StatementPool {
 // a dynamically initialized inline thread_local, so each TU would define it.
 extern thread_local std::unordered_map<sqlite3*, StatementPool*> activeStatementPools;
 namespace detail {
+bool historyEnabled(sqlite3*);
+void requireHistory(sqlite3*);
+bool spatialEnabled(sqlite3*);
+void requireSpatial(sqlite3*);
+int64_t writeGeneration(sqlite3*);
+int64_t allocateRecordId(sqlite3*, const char* keySpace);
+void createProvisioning(sqlite3*, bool history, bool spatial = true);
+void createChangeTracking(sqlite3*);
+void createStorageDirectory(sqlite3*, const std::string& databaseUuid = {});
+void registerStorageTables(sqlite3*);
+void forkStorageIdentity(sqlite3*);
+void createCurrentGeometrySchema(sqlite3*);
+void validateCurrentRelationships(sqlite3*);
+void indexCurrentMetadata(sqlite3*, const std::string& object, const nlohmann::json& manifest);
 // Called only after a read connection has pinned its new SQLite snapshot.
 void beginReadCaches(sqlite3*, StatementPool&, size_t geometryBudget, size_t spatialBudget);
 void beginSpatialRead(StatementPool&, size_t budget, int version);

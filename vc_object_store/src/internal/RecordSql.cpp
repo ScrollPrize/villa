@@ -8,6 +8,27 @@ const char* kObjectCols =
     "approval_state,approved_by,approved_at,approved_host,approved_generation,format_version,storage_kind,"
     "storage_ref,data_generation,data_checksum,meta";
 
+ExplicitRecordId::ExplicitRecordId(sqlite3* db,const char* keySpace,const std::string& uuid,int64_t id)
+    :db_(db),keySpace_(keySpace),id_(id),save_(db)
+{
+    if(keySpace_!="objects"&&keySpace_!="edges")throw std::invalid_argument("object store: invalid explicit key space");
+    Statement range(db_,"SELECT lower_bound,upper_bound,next_id FROM key_allocators WHERE name=?",keySpace_);
+    if(!range.row()||id_<range.i64(0)||id_>range.i64(1))throw std::invalid_argument("object store: explicit ID outside reservation");
+    Statement occupied(db_,"SELECT 1 FROM "+keySpace_+" WHERE id=?",id_);
+    if(occupied.row())throw std::invalid_argument("object store: explicit insertion ID already exists");
+    if(!uuid.empty()){
+        Statement existing(db_,"SELECT 1 FROM "+keySpace_+" WHERE uuid=?",parseUuid(uuid));
+        if(existing.row())throw std::invalid_argument("object store: explicit insertion UUID already exists");
+    }
+    if(!range.isNull(2))next_=range.i64(2);
+    execute(db_,"UPDATE key_allocators SET next_id=? WHERE name=?",id_,keySpace_);
+}
+void ExplicitRecordId::finish()
+{
+    if(!next_||*next_>id_)execute(db_,"UPDATE key_allocators SET next_id=? WHERE name=?",next_,keySpace_);
+    save_.release();
+}
+
 bool wants(const ObjectFields& fields, const std::string& name) {
     return !fields || fields->contains(name) || name == "uuid" || name == "kind";
 }
@@ -38,6 +59,8 @@ void appendJournal(sqlite3* db, const std::string& author, const std::string& ho
                    const std::array<unsigned char, 16>& uuid, int64_t generation, const char* changeKind,
                    const std::string& deletedKind)
 {
+    if (!historyEnabled(db)) return;
+    generation = writeGeneration(db);
     Statement state(db, "SELECT kind,approval_state,approved_by,approved_at,approved_host,approved_generation FROM objects WHERE uuid=? "
         "UNION ALL SELECT kind,approval_state,approved_by,approved_at,approved_host,approved_generation FROM edges WHERE uuid=?",
         uuid, uuid);
@@ -255,11 +278,14 @@ void writeTags(sqlite3* db, const char* table, const char* idColumn, int64_t id,
 
 void restoreCommon(sqlite3* db, const char* table, const RecordCommon& rec)
 {
+    // Preserve authorship/approval evidence, not another database's version
+    // counter. The imported state is published here by this transaction.
+    const auto generation = writeGeneration(db);
     execute(db, std::string("UPDATE ") + table + " SET generation=?,created_by=?,created_at=?,created_host=?,"
         "changed_by=?,changed_at=?,changed_host=?,approval_state=?,approved_by=?,approved_at=?,approved_host=?,approved_generation=? WHERE uuid=?",
-        rec.generation, rec.createdBy, rec.createdAt, rec.createdHost, rec.changedBy, rec.changedAt,
+        generation, rec.createdBy, rec.createdAt, rec.createdHost, rec.changedBy, rec.changedAt,
         rec.changedHost, rec.approvalState, rec.approvedBy, rec.approvedAt, rec.approvedHost,
-        rec.approvedGeneration, parseUuid(rec.uuid));
+        rec.approvedGeneration ? std::optional<int64_t>(generation) : std::nullopt, parseUuid(rec.uuid));
 }
 
 void validateGeometrySourceMetadata(sqlite3* db, const std::string& uuid, const nlohmann::json& source)
@@ -313,23 +339,23 @@ std::string upsertObjectImpl(sqlite3* db, const std::string& author, const std::
     }
 
     int64_t id = 0;
-    int64_t generation = 1;
+    const int64_t generation = writeGeneration(db);
     if (auto existing = objectIdByUuid(db, uuid)) {
         id = *existing;
         Statement cur(db, "SELECT kind,generation FROM objects WHERE id=?", id);
         (void)cur.row();
         if (cur.text(0) != rec.kind)
             throw std::runtime_error("object store: object kind cannot change (" + cur.text(0) + " -> " + rec.kind + ")");
-        generation = cur.i64(1) + 1;
         execute(db, "UPDATE objects SET name=?,generation=?,changed_by=?,changed_at=?,changed_host=?,"
                         "approval_state='pending',approved_by=NULL,approved_at=NULL,approved_host=NULL,approved_generation=NULL,"
                         "format_version=?,storage_kind=?,storage_ref=?,data_generation=?,data_checksum=?,meta=? WHERE id=?",
             rec.name, generation, author, now, host, rec.formatVersion, rec.storageKind, rec.storageRef,
             rec.dataGeneration, rec.dataChecksum, rec.meta, id);
     } else {
+        id = allocateRecordId(db, "objects");
         Statement s(db, "INSERT INTO objects(uuid,kind,name,generation,created_by,created_at,created_host,changed_by,changed_at,"
                         "changed_host,approval_state,approved_by,approved_at,approved_host,approved_generation,format_version,"
-                        "storage_kind,storage_ref,data_generation,data_checksum,meta) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                        "storage_kind,storage_ref,data_generation,data_checksum,meta,id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             uuid, rec.kind, rec.name, generation, author, now, host, author, now, host);
         const std::string state = preserveRecord ? rec.approvalState : "pending";
         s.bind(11, state.empty() ? std::string("pending") : state);
@@ -340,8 +366,8 @@ std::string upsertObjectImpl(sqlite3* db, const std::string& author, const std::
         s.bind(16, rec.formatVersion); s.bind(17, rec.storageKind); s.bind(18, rec.storageRef); s.bind(19, rec.dataGeneration);
         s.bind(20, rec.dataChecksum);
         s.bind(21, rec.meta);
+        s.bind(22, id);
         s.stepDone();
-        id = sqlite3_last_insert_rowid(db);
     }
     writeObjectDetail(db, id, rec);
     if (!hasGeometry) detail::setSpatialBounds(db, id, bounds);
@@ -365,12 +391,7 @@ std::optional<int64_t> edgeIdByUuid(sqlite3* db, const std::array<unsigned char,
 void stampContentChange(sqlite3* db, const std::string& author, const std::string& host, const char* table,
                         int64_t id, const std::array<unsigned char, 16>& uuid, const char* changeKind)
 {
-    int64_t generation = 0;
-    {
-        Statement cur(db, std::string("SELECT generation FROM ") + table + " WHERE id=?", id);
-        (void)cur.row();
-        generation = cur.i64(0) + 1;
-    }
+    const int64_t generation = writeGeneration(db);
     execute(db, std::string("UPDATE ") + table +
                         " SET generation=?,changed_by=?,changed_at=?,changed_host=?,approval_state='pending',"
                         "approved_by=NULL,approved_at=NULL,approved_host=NULL,approved_generation=NULL WHERE id=?",

@@ -351,11 +351,18 @@ std::string importVolumeUmbilicus(ObjectStoreSession& session, const AttachmentI
     record.name = name;
     record.meta = Json{{"coordinates", volumeCoordinates(volume, storedUnitsPerVoxel)}, {"provenance", std::move(provenance)}}.dump();
     RevisionSelection pins;
-    session.read(attachment, [&](const auto& db, const auto& txn, const auto&) { pins = volumeUmbilicusRevisions(db, txn, volume); });
-    pins[record.uuid] = std::nullopt;
-    session.act(attachment, pins, [&](auto& db, auto& txn) {
-        setVolumeUmbilicus(db, txn, volume, record, geometry::Umbilicus{file.points});
+    std::optional<int64_t> directGeneration;
+    session.read(attachment, [&](const auto& db, const auto& txn, const auto&) {
+        const auto policy=db.provisioning(txn);
+        if(policy.history==HistoryMode::Off) directGeneration=policy.generation;
+        else pins=volumeUmbilicusRevisions(db,txn,volume);
     });
+    pins[record.uuid] = std::nullopt;
+    const auto apply=[&](auto& db,auto& txn) {
+        setVolumeUmbilicus(db, txn, volume, record, geometry::Umbilicus{file.points});
+    };
+    if(directGeneration) session.actAtGeneration(attachment,*directGeneration,apply);
+    else session.act(attachment,pins,apply);
     return record.uuid;
 }
 }

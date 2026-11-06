@@ -6,6 +6,7 @@
 #include "vc_object_store/objects/GeometryCoordinates.hpp"
 #include "geometry/Dependencies.hpp"
 #include "geometry/GeometrySnapshot.hpp"
+#include "internal/History.hpp"
 #include <algorithm>
 #include <set>
 
@@ -231,29 +232,17 @@ Json fiberBranchJson(const ObjectStore& db, const Txn& txn, const EdgeRecord& ed
 }
 }
 
-std::map<std::string, std::string> fiberNetworkJson(
-    const ObjectStore& db, const Txn& txn, const RevisionSelection& selection,
-    const std::vector<std::string>& roots, uint64_t byteBudget)
+namespace {
+struct FiberExportState { ObjectRecord record; std::optional<std::string> geometryRevision; };
+std::map<std::string,std::string> encodeFiberNetwork(
+    const ObjectStore& db,const Txn& txn,const std::map<std::string,FiberExportState>& revisions,
+    const std::vector<EdgeRecord>& edges,const std::vector<std::string>& roots,uint64_t byteBudget)
 {
-    std::map<std::string, ObjectRevision> revisions;
-    for (const auto& [uuid, pin] : selection) {
-        if (!pin) throw std::invalid_argument("Fiber export requires explicit object revision pins");
-        const auto revision = db.objectRevision(txn, *pin);
-        if (!revision || revision->objectUuid != uuid || revision->record.kind != "fiber" ||
-            revision->deleted)
-            throw std::invalid_argument("Invalid fiber export revision for " + uuid);
-        revisions.emplace(uuid, *revision);
-    }
-    std::vector<EdgeRecord> edges;
     std::map<std::string, std::vector<std::string>> neighbours;
-    for (const auto& selected : db.relationshipsAt(txn, selection)) {
-        const auto& edge = selected.relationship.record;
-        if (edge.kind != "fiber_branch") continue;
+    for (const auto& edge : edges) {
         // An omitted endpoint must never silently remove a branch constraint.
         if (!revisions.contains(edge.aUuid) || !revisions.contains(edge.bUuid))
             throw std::invalid_argument("Fiber export selection is missing a branch endpoint");
-        if (!selected.applicable) continue;
-        edges.push_back(edge);
         neighbours[edge.aUuid].push_back(edge.bUuid);
         neighbours[edge.bUuid].push_back(edge.aUuid);
     }
@@ -269,8 +258,13 @@ std::map<std::string, std::string> fiberNetworkJson(
         for (const auto& peer : neighbours[uuid]) pending.push_back(peer);
     }
     std::map<std::string, Json> fibers;
-    for (const auto& uuid : included)
-        fibers.emplace(uuid, Json::parse(fiberRevisionJson(db, txn, revisions.at(uuid).uuid, byteBudget)));
+    for (const auto& uuid : included) {
+        const auto& state = revisions.at(uuid);
+        const auto geometry = state.geometryRevision ? db.geometryRevision(txn,*state.geometryRevision) : std::nullopt;
+        if (!geometry) throw std::runtime_error("Fiber export has no geometry: " + uuid);
+        fibers.emplace(uuid,Json::parse(encodeFiberJson(uuid,db.readGeometryData(txn,geometry->uuid,byteBudget),
+            detail::fiberMetadata(db,txn,state.record,*geometry).dump())));
+    }
     for (const auto& edge : edges) {
         if (!included.contains(edge.aUuid)) continue;
         const auto aGeometry = db.geometryRevision(txn, *revisions.at(edge.aUuid).geometryRevision);
@@ -282,6 +276,45 @@ std::map<std::string, std::string> fiberNetworkJson(
     std::map<std::string, std::string> result;
     for (auto& [uuid, fiber] : fibers) result.emplace(uuid, fiber.dump());
     return result;
+}
+}
+
+std::map<std::string,std::string> fiberNetworkJson(
+    const ObjectStore& db,const Txn& txn,const RevisionSelection& selection,
+    const std::vector<std::string>& roots,uint64_t byteBudget)
+{
+    std::map<std::string,FiberExportState> revisions;
+    for(const auto& [uuid,pin]:selection) {
+        if(!pin) throw std::invalid_argument("Fiber export requires explicit object revision pins");
+        const auto revision=db.objectRevision(txn,*pin);
+        if(!revision || revision->objectUuid!=uuid || revision->record.kind!="fiber" || revision->deleted)
+            throw std::invalid_argument("Invalid fiber export revision for "+uuid);
+        revisions.emplace(uuid,FiberExportState{revision->record,revision->geometryRevision});
+    }
+    std::vector<EdgeRecord> edges;
+    for(const auto& selected:db.relationshipsAt(txn,selection)) {
+        const auto& edge=selected.relationship.record;
+        if(edge.kind!="fiber_branch") continue;
+        if(!revisions.contains(edge.aUuid) || !revisions.contains(edge.bUuid))
+            throw std::invalid_argument("Fiber export selection is missing a branch endpoint");
+        if(selected.applicable) edges.push_back(edge);
+    }
+    return encodeFiberNetwork(db,txn,revisions,edges,roots,byteBudget);
+}
+
+std::map<std::string,std::string> currentFiberNetworkJson(
+    const ObjectStore& db,const Txn& txn,const std::vector<std::string>& roots,uint64_t byteBudget)
+{
+    detail::requirePublishedGraphRead(txn);
+    std::map<std::string,FiberExportState> revisions;
+    for(const auto& object:db.objectsByKind(txn,"fiber",{},true)) {
+        const auto geometry=db.currentGeometry(txn,object.uuid);
+        revisions.emplace(object.uuid,FiberExportState{object,geometry ? std::optional(geometry->uuid) : std::nullopt});
+    }
+    std::vector<EdgeRecord> edges;
+    for(const auto& edge:db.edgesByKind(txn,"fiber_branch",true))
+        if(detail::currentRelationshipApplicable(db,txn,edge.uuid)) edges.push_back(edge);
+    return encodeFiberNetwork(db,txn,revisions,edges,roots,byteBudget);
 }
 
 }

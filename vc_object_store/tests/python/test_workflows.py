@@ -614,8 +614,10 @@ def test_scripts_sync_a_hub_addressed_over_sftp_with_a_password(tmp_path, monkey
     prompts = []
     vos.set_sftp_authenticator(lambda destination, prompt, confirmation: prompts.append(destination) or 'hunter2')
     try:
+        vos.hub_enable_ssh_locking(url)
         vos.hub_clone(url, str(tmp_path / 'replica.vcobj'), 'script')
-        vos.hub_clone(str(hub), str(tmp_path / 'local.vcobj'), 'viewer')
+        # Both clients use the same process-lock protocol once it is enabled.
+        vos.hub_clone(url, str(tmp_path / 'local.vcobj'), 'viewer')
         with ObjectStore.open(str(tmp_path / 'replica.vcobj'), author='script') as script, \
                 ObjectStore.open(str(tmp_path / 'local.vcobj'), author='viewer') as viewer:
             assert script.hub_status()['hub'] == url
@@ -624,7 +626,8 @@ def test_scripts_sync_a_hub_addressed_over_sftp_with_a_password(tmp_path, monkey
             assert script.hub_sync()['pushed'] == 1
             assert viewer.hub_sync()['pulled'] == 1 and viewer.object(fiber)['meta']['review'] == 'remote'
         assert prompts and set(prompts) == {'annotator@test-host'}
-        assert vos.hub_lock_age(url) is None
+        with pytest.raises(RuntimeError, match='process locks release automatically'):
+            vos.hub_lock_age(url)
     finally:
         vos.set_sftp_authenticator(None)
 

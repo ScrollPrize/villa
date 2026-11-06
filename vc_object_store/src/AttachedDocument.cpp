@@ -188,8 +188,15 @@ void replaceAttachedCollections(ObjectStoreSession& session, const AttachmentIde
     for (const auto& collection : collections) desired[util::canonicalUuid(collection.uuid)] = &collection;
     std::map<std::string, EdgeRecord> linked;
     RevisionSelection pins, related;
+    std::optional<int64_t> directGeneration;
     session.read(attachment, [&](const auto& store, const auto& txn, const auto&) {
         linked = attachedEdges(store, txn, objectUuid, role);
+        const auto policy=store.provisioning(txn);
+        if(policy.history==HistoryMode::Off) {
+            if(!store.objectByUuid(txn,objectUuid)) throw std::runtime_error("object not found: "+objectUuid);
+            directGeneration=policy.generation;
+            return;
+        }
         const auto object = store.currentObjectRevision(txn, objectUuid);
         if (!object) throw std::runtime_error("object not found: " + objectUuid);
         related[objectUuid] = object->uuid;
@@ -200,7 +207,7 @@ void replaceAttachedCollections(ObjectStoreSession& session, const AttachmentIde
         for (const auto& [uuid, edge] : linked) pin(uuid);
         for (const auto& [uuid, collection] : desired) pin(uuid);
     });
-    session.editKeepingRelationships(attachment, pins, related, [&](auto& store, auto& txn, const auto&) {
+    const auto apply=[&](auto& store,auto& txn) {
         for (const auto& [uuid, wanted] : desired) {
             writeCollection(store, txn, uuid, *wanted, {{"coordinates", coordinates}, {"role", role}}, frame);
             if (!linked.contains(uuid)) store.attach(txn, uuid, objectUuid, role);
@@ -210,7 +217,9 @@ void replaceAttachedCollections(ObjectStoreSession& session, const AttachmentIde
             store.removeEdge(txn, edge.uuid);
             store.retireObject(txn, uuid);
         }
-    });
+    };
+    if(directGeneration) session.actAtGeneration(attachment,*directGeneration,apply);
+    else session.editKeepingRelationships(attachment,pins,related,[&](auto& store,auto& txn,const auto&) { apply(store,txn); });
 }
 
 std::vector<AttachedCollection> volumeCollections(const ObjectStore& store, const Txn& txn, const VolumeVoxels& volume)
@@ -255,7 +264,10 @@ void writeVolumeCollections(ObjectStoreSession& session, const AttachmentIdentit
                             const std::vector<AttachedCollection>& changed, const std::vector<std::string>& removed)
 {
     RevisionSelection pins;
+    std::optional<int64_t> directGeneration;
     session.read(attachment, [&](const auto& store, const auto& txn, const auto&) {
+        const auto policy=store.provisioning(txn);
+        if(policy.history==HistoryMode::Off) { directGeneration=policy.generation; return; }
         auto pin = [&](const std::string& uuid) {
             const auto head = store.currentObjectRevision(txn, uuid);
             pins[util::canonicalUuid(uuid)] = head ? std::optional(head->uuid) : std::nullopt;
@@ -263,13 +275,15 @@ void writeVolumeCollections(ObjectStoreSession& session, const AttachmentIdentit
         for (const auto& collection : changed) pin(collection.uuid);
         for (const auto& uuid : removed) pin(uuid);
     });
-    session.editKeepingRelationships(attachment, pins, {}, [&](auto& store, auto& txn, const auto&) {
+    const auto apply=[&](auto& store,auto& txn) {
         for (const auto& collection : changed)
             writeCollection(store, txn, util::canonicalUuid(collection.uuid), collection,
                             {{"coordinates", volumeCoordinates(volume)}}, ViewFrame{volume.volume, volume.scale});
         for (const auto& uuid : removed)
             if (const auto object = store.objectByUuid(txn, util::canonicalUuid(uuid)); object && !object->retired)
                 store.retireObject(txn, object->uuid);
-    });
+    };
+    if(directGeneration) session.actAtGeneration(attachment,*directGeneration,apply);
+    else session.editKeepingRelationships(attachment,pins,{},[&](auto& store,auto& txn,const auto&) { apply(store,txn); });
 }
 }

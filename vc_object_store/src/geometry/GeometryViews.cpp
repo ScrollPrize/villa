@@ -25,6 +25,7 @@ struct GeometryViewState {
     std::shared_ptr<GeometryReadState> read;
     GeometryRevision revision;
     std::string objectRevision;
+    int64_t objectGeneration = 0;
     std::optional<std::map<int64_t, int64_t>> pointIndex;
     const GeometryArrayInfo& array(const std::string& name) const {
         read->require();
@@ -130,19 +131,24 @@ std::shared_ptr<State> GeometrySnapshot::view(const std::string& id, const std::
                                               const std::optional<std::string>& geometryRevision) const
 {
     state_->require();
-    const auto object = state_->db->currentObjectRevision(*state_->txn, id);
-    if (!object || object->deleted) throw std::invalid_argument("object not found");
+    const auto object = state_->db->objectByUuid(*state_->txn, id);
+    if (!object) throw std::invalid_argument("object not found");
     const auto revision = geometryRevision ? state_->db->geometryRevision(*state_->txn, *geometryRevision)
                                            : state_->db->currentGeometry(*state_->txn, id);
     if (!revision) throw std::invalid_argument("object has no stored geometry");
-    if (revision->objectUuid != object->objectUuid)
+    if (revision->objectUuid != object->uuid)
         throw std::invalid_argument("geometry revision belongs to another object");
     if (!kind.empty() && revision->kind != kind) throw std::invalid_argument("geometry kind mismatch: expected " + kind);
     if (revision->formatVersion != 1 || revision->coordinateSystem != "source_xyz")
         throw std::invalid_argument("unsupported geometry version or coordinate system");
     auto result = std::make_shared<State>();
     result->read = state_; result->revision = *revision;
-    if (!geometryRevision) result->objectRevision = object->uuid;
+    result->objectGeneration = object->generation;
+    if (!geometryRevision && state_->db->provisioning(*state_->txn).history == HistoryMode::On) {
+        const auto historical = state_->db->currentObjectRevision(*state_->txn, id);
+        if (!historical || historical->deleted) throw std::invalid_argument("object has no published revision");
+        result->objectRevision = historical->uuid;
+    }
     if (revision->kind == "point_collection") {
         result->require("points", "<f8", 2);
         result->require("point_ids", "<i8", 1);
@@ -175,6 +181,7 @@ TypedGeometryView GeometrySnapshot::geometry(const std::string& id, const std::o
 GeometryView::GeometryView(std::shared_ptr<State> state) : state_(std::move(state)) {}
 const GeometryRevision& GeometryView::revision() const { state_->read->require(); return state_->revision; }
 const std::string& GeometryView::objectRevision() const { state_->read->require(); return state_->objectRevision; }
+int64_t GeometryView::objectGeneration() const { state_->read->require(); return state_->objectGeneration; }
 geometry::Geometry GeometryView::loadGeometry() const
 {
     state_->read->require();
@@ -319,10 +326,15 @@ std::vector<GeometryArrayEdit> TransformedGeometryView::coordinateEdits(const st
 void TransformedGeometryView::validateForWrite(const ObjectStore& db,const Txn& txn) const {
     const auto& pinned=revision();
     const auto head=db.currentGeometry(txn,pinned.objectUuid);
-    const auto object=db.currentObjectRevision(txn,pinned.objectUuid);
-    if(!head||head->uuid!=pinned.uuid||!object||object->uuid!=objectRevision())
+    const auto object=db.objectByUuid(txn,pinned.objectUuid);
+    const auto generation=std::visit([](const auto& v){return v.objectGeneration();},source_);
+    if(!head||head->uuid!=pinned.uuid||!object||object->generation!=generation)
         throw std::runtime_error("object changed; reopen its transformed view");
-    const auto mapping=db.volumeTransforms(txn).toVolume(nlohmann::json::parse(object->record.meta),target_,targetScale_);
+    if(db.provisioning(txn).history==HistoryMode::On){
+        const auto historical=db.currentObjectRevision(txn,pinned.objectUuid);
+        if(!historical||historical->uuid!=objectRevision())throw std::runtime_error("object changed; reopen its transformed view");
+    }
+    const auto mapping=db.volumeTransforms(txn).toVolume(nlohmann::json::parse(object->meta),target_,targetScale_);
     if(!mapping||*mapping!=mapping_)throw std::runtime_error("volume registration changed; reopen its transformed view");
 }
 std::string TransformedGeometryView::writeCoordinates(ObjectStore& db,WriteTxn& txn,const std::string& array,int64_t start,

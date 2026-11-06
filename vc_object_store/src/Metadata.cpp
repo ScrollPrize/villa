@@ -22,14 +22,9 @@ void ObjectStore::setApproval(WriteTxn& txn, const std::string& recordUuid, cons
         throw std::runtime_error("object store: explicitly update the relationship before approving stale geometry");
     const auto bytes = parseUuid(recordUuid);
     const auto [table, id] = recordLocation(db, bytes, recordUuid);
-    int64_t generation;
-    {
-        Statement cur(db, std::string("SELECT generation FROM ") + table + " WHERE id=?", id);
-        (void)cur.row();
-        generation = cur.i64(0);
-    }
+    const int64_t generation = writeGeneration(db);
     Statement s(db, std::string("UPDATE ") + table +
-                        " SET approval_state=?,approved_by=?,approved_at=?,approved_host=?,approved_generation=? WHERE id=?",
+                        " SET approval_state=?,approved_by=?,approved_at=?,approved_host=?,approved_generation=?,generation=? WHERE id=?",
         state);
     if (state == "pending") {
         s.bindNull(2); s.bindNull(3); s.bindNull(4); s.bindNull(5);
@@ -39,7 +34,7 @@ void ObjectStore::setApproval(WriteTxn& txn, const std::string& recordUuid, cons
         s.bind(4, impl_->hostname);
         s.bind(5, generation);
     }
-    s.bind(6, id);
+    s.bind(6, generation); s.bind(7, id);
     s.stepDone();
     appendJournal(db, impl_->options.author, impl_->hostname, bytes, generation, "approval");
     savepoint.release();
@@ -116,6 +111,7 @@ void ObjectStore::removeMeta(WriteTxn& txn, const std::string& recordUuid, const
 
 int64_t ObjectStore::journalPosition(const Txn& txn) const
 {
+    requireHistory(static_cast<sqlite3*>(connection(txn)));
     Statement position(static_cast<sqlite3*>(connection(txn)), "SELECT COALESCE(MAX(seq),0) FROM journal");
     position.row();
     return position.i64(0);
@@ -123,6 +119,7 @@ int64_t ObjectStore::journalPosition(const Txn& txn) const
 
 std::vector<JournalEntry> ObjectStore::journalSince(const Txn& txn, int64_t afterSeq) const
 {
+    requireHistory(static_cast<sqlite3*>(connection(txn)));
     sqlite3* db = static_cast<sqlite3*>(connection(txn));
     Statement s(db, "SELECT seq,record_uuid,generation,author,hostname,timestamp,change_kind,"
                     "approval_state,approved_by,approved_at,approved_host,approved_generation,record_kind FROM journal WHERE seq>? ORDER BY seq",

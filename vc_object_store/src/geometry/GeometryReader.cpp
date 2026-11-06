@@ -1,5 +1,6 @@
 #include "geometry/GeometryReader.hpp"
 #include "geometry/GeometryDelta.hpp"
+#include "geometry/SharedGeometry.hpp"
 #include "vc_object_store/geometry/ArrayBytes.hpp"
 #include "vc_object_store/geometry/Geometry.hpp"
 
@@ -236,7 +237,7 @@ void GeometryReader::visitChunk(const std::string& name, int64_t index,
             const auto source = descriptor.at("source_revision").get<std::string>();
             // References always point backwards within the same object. This
             // also bounds corrupt cycles without relying on recursion depth.
-            Statement ancestry(db_, "SELECT a.object_uuid=b.object_uuid AND a.object_generation<b.object_generation "
+            Statement ancestry(db_, "SELECT a.object_uuid=b.object_uuid AND a.rowid<b.rowid "
                 "FROM geometry_revisions a,geometry_revisions b WHERE a.uuid=? AND b.uuid=?",
                 parseUuid(source), revision_);
             if (!ancestry.row() || !ancestry.i64(0)) throw std::runtime_error("geometry: invalid array source");
@@ -249,19 +250,23 @@ void GeometryReader::visitChunk(const std::string& name, int64_t index,
             storedHash = original.at("chunks").at(index).get<std::string>();
         } else {
             if (readRequest) {
-                Statement size(db_, "SELECT length(c.data) FROM geometry_revision_chunks r JOIN geometry_chunks c ON c.hash=r.hash "
+                Statement size(db_, "SELECT length(c.data),r.hash FROM geometry_revision_chunks r JOIN geometry_chunks c ON c.hash=r.hash "
                     "WHERE r.revision_uuid=? AND r.array_name=? AND r.chunk_index=?",
                     baseRevision_.empty() ? revision_ : parseUuid(baseRevision_), name, index);
                 if (!size.row()) throw std::runtime_error("geometry: missing payload chunk");
-                requestBytes(size.i64(0), &RegionStats::payloadBytes);
+                requestBytes(size.isNull(0) ? geometryPayloadSize(db_,size.text(1)) : size.i64(0), &RegionStats::payloadBytes);
             }
             Statement chunk(db_, "SELECT c.data,r.hash FROM geometry_revision_chunks r JOIN geometry_chunks c ON c.hash=r.hash "
                                  "WHERE r.revision_uuid=? AND r.array_name=? AND r.chunk_index=?",
                 baseRevision_.empty() ? revision_ : parseUuid(baseRevision_), name, index);
             if (!chunk.row()) throw std::runtime_error("geometry: missing payload chunk");
-            const auto* p = static_cast<const uint8_t*>(sqlite3_column_blob(chunk.value, 0));
-            if (geometryWork) geometryWork->readBytes[name] += sqlite3_column_bytes(chunk.value, 0);
-            owned.assign(p, p + sqlite3_column_bytes(chunk.value, 0)); storedHash = chunk.text(1);
+            storedHash = chunk.text(1);
+            if(chunk.isNull(0)) owned=readExternalGeometryPayload(db_,storedHash);
+            else {
+                const auto* p = static_cast<const uint8_t*>(sqlite3_column_blob(chunk.value, 0));
+                owned.assign(p, p + sqlite3_column_bytes(chunk.value, 0));
+            }
+            if (geometryWork) geometryWork->readBytes[name] += owned.size();
             if (!deltas_.empty()) verifyGeometryChunk(owned, storedHash, storedHash, expectedSize, name);
         }
     }
@@ -542,7 +547,7 @@ PackedGeometryArray ObjectStore::readGeometryArrays(const Txn& txn,
         const auto count = std::min(window, revisions.size() - begin);
         // Keep requested revisions outermost: otherwise SQLite can scan the
         // entire reference table for every window, even with its primary key.
-        Statement chunks(db, request(count) + "SELECT q.pos,r.chunk_index,r.hash,c.data FROM requested q "
+        Statement chunks(db, request(count) + "SELECT q.pos,r.chunk_index,r.hash,c.data,c.hash FROM requested q "
             "CROSS JOIN geometry_revision_chunks r ON r.revision_uuid=q.uuid AND r.array_name=?" + std::to_string(count+1) +
             " LEFT JOIN geometry_chunks c ON c.hash=r.hash");
         bind(chunks, begin, count); chunks.bind(int(count+1), name);
@@ -551,9 +556,12 @@ PackedGeometryArray ObjectStore::readGeometryArrays(const Txn& txn,
             const auto row = size_t(chunks.i64(0));
             const auto index = chunks.i64(1);
             ++seen.at(row); // unique (revision,array,index), independent of SQL row order
-            if (chunks.isNull(3)) throw std::runtime_error("geometry: missing payload chunk");
-            const auto bytes = std::span(static_cast<const uint8_t*>(sqlite3_column_blob(chunks.value, 3)),
-                                        size_t(sqlite3_column_bytes(chunks.value, 3)));
+            if (chunks.isNull(4)) throw std::runtime_error("geometry: missing payload chunk");
+            std::vector<uint8_t> external;
+            if(chunks.isNull(3)) external=readExternalGeometryPayload(db,chunks.text(2));
+            const auto bytes = chunks.isNull(3) ? std::span<const uint8_t>(external) :
+                std::span(static_cast<const uint8_t*>(sqlite3_column_blob(chunks.value, 3)),
+                          size_t(sqlite3_column_bytes(chunks.value, 3)));
             const auto& array = plan.at(begin + row);
             const auto expectedSize = array.layout.chunkBytes(index);
             if (geometryWork) geometryWork->readBytes[name] += bytes.size();

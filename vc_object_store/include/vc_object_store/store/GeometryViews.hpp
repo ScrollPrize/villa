@@ -16,7 +16,10 @@ public:
     TransformedGeometryView viewTransformedAt(const std::string& targetVolume, double targetScale=1) const;
     std::vector<vcr::catalog::TransformResolution> availableTransforms() const;
     const GeometryRevision& revision() const;
+    // Historical UUID is empty for history-off snapshots; generation still
+    // supplies a stable, transaction-scoped current-content freshness check.
     const std::string& objectRevision() const;
+    int64_t objectGeneration() const;
 protected:
     explicit GeometryView(std::shared_ptr<detail::GeometryViewState>);
     geometry::Geometry loadGeometry() const;

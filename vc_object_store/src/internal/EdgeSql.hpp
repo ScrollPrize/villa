@@ -25,7 +25,10 @@ std::vector<int64_t> componentIds(sqlite3* db, const std::string& start,
                                  const std::vector<std::string>& kinds, bool includeRetired = false,
                                  std::optional<bool> adjacent = std::nullopt);
 
-std::string addEdgeImpl(sqlite3* db, const std::string& author, const std::string& host, const EdgeRecord& input,
+// Return the normalized identity/endpoints/anchors used for insertion, so
+// dependency validation need not hydrate the just-written edge from SQL.
+// This is not a readback of generated provenance or approval stamps.
+EdgeRecord addEdgeImpl(sqlite3* db, const std::string& author, const std::string& host, const EdgeRecord& input,
                         bool preserveRecord = false, const char* importOperation = "import");
 
 

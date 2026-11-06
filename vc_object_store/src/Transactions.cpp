@@ -33,14 +33,28 @@ void Txn::release(bool commit)
     auto* conn = static_cast<sqlite3*>(handle_);
     handle_ = nullptr;
     auto releaseConnection = [&] {
+        // Collection resolvers capture the transaction's pinned dependencies;
+        // pooled connections must never retain those captures after release.
+        if (const auto pool = activeStatementPools.find(conn); pool != activeStatementPools.end()) {
+            pool->second->externalGeometryChunk = {};
+            pool->second->externalGeometryChunkSize = {};
+        }
         activeStatementPools.erase(conn);
         if (write_) db_->impl_->writerMutex.unlock();
         else db_->impl_->checkinReader(conn);
     };
     try {
         if (commit && write_) {
+            if (pragmaInt(conn, "schema_version") != activeStatementPools.at(conn)->startSchemaVersion) {
+                registerStorageTables(conn);
+                exec(conn, "UPDATE store_write_state SET dirty=1 WHERE singleton=1;");
+            }
             refreshSourceIdentityIndex(conn);
-            publishHistory(conn);
+            if (historyEnabled(conn)) publishHistory(conn);
+            else validateCurrentRelationships(conn);
+            exec(conn, "UPDATE store_manifest SET generation=generation+1 WHERE singleton=1 AND "
+                       "(SELECT dirty FROM store_write_state WHERE singleton=1)=1;"
+                       "UPDATE store_write_state SET dirty=0 WHERE singleton=1 AND dirty=1;");
             enforceHubRules(conn, *activeStatementPools.at(conn), db_->impl_->hubRole);
             for (const auto& [uuid, expected] : expectedRevisions_) {
                 Statement head(conn, "SELECT revision_uuid FROM object_heads WHERE object_uuid=?",
@@ -77,7 +91,7 @@ ReadTxn ObjectStore::read()
         Statement pin(conn, "SELECT uuid FROM store_identity LIMIT 1");
         (void)pin.row();
         detail::beginReadCaches(conn, *impl_->statementPools.at(conn),
-                               impl_->options.geometryCacheBytes, impl_->options.spatialCacheBytes);
+                               impl_->options.geometryCacheBytes, impl_->options.spatialIndex ? impl_->options.spatialCacheBytes : 0);
     } catch (...) {
         sqlite3_exec(conn, "ROLLBACK;", nullptr, nullptr, nullptr);
         activeStatementPools.erase(conn);
@@ -98,6 +112,11 @@ WriteTxn ObjectStore::write()
     impl_->statementPools.at(impl_->writer)->actionConflict = false;
     try {
         exec(impl_->writer, "BEGIN IMMEDIATE;");
+        impl_->statementPools.at(impl_->writer)->startSchemaVersion = pragmaInt(impl_->writer, "schema_version");
+        Statement manifest(impl_->writer, "SELECT sealed,generation,history_enabled FROM store_manifest WHERE singleton=1");
+        if (!manifest.row() || manifest.i64(0)) throw std::runtime_error("object store: store is sealed");
+        if (manifest.i64(1) == INT64_MAX) throw std::runtime_error("object store: generation exhausted");
+        impl_->statementPools.at(impl_->writer)->historyEnabled = manifest.i64(2) != 0;
         if (impl_->hubRole != HubRole::None) beginHubWrite(impl_->writer, *impl_->statementPools.at(impl_->writer));
     }
     catch (...) { sqlite3_exec(impl_->writer, "ROLLBACK;", nullptr, nullptr, nullptr); activeStatementPools.erase(impl_->writer); throw; }
@@ -108,6 +127,7 @@ WriteTxn ObjectStore::write()
 WriteTxn ObjectStore::write(const RevisionSelection& expected)
 {
     auto txn = write();
+    requireHistory(static_cast<sqlite3*>(connection(txn)));
     expectHistory(static_cast<sqlite3*>(connection(txn)), expected);
     txn.expectedRevisions_ = expected;
     return txn;

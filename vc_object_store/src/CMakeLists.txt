@@ -30,6 +30,7 @@ add_library(vc_objects ${_vc_store_library_type}
     sftp/SftpVfs.cpp
     internal/Anchors.cpp
     internal/Sqlite.cpp
+    internal/Schema.cpp
     internal/RecordSql.cpp
     internal/EdgeSql.cpp
     internal/RecordJson.cpp
@@ -37,6 +38,12 @@ add_library(vc_objects ${_vc_store_library_type}
     internal/JsonFields.cpp
     formats/FiberJson.cpp
     Database.cpp
+    Provisioning.cpp
+    ObjectCollection.cpp
+    PackedStore.cpp
+    PackedCollection.cpp
+    StoreConversion.cpp
+    imports/AfvSource.cpp
     VolumeTransforms.cpp
     ObjectStoreSession.cpp
     Project.cpp

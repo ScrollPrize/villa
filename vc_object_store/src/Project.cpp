@@ -1,6 +1,6 @@
 #include "vc_object_store/objects/Project.hpp"
 #include "vc_object_store/Uuid.hpp"
-#include "internal/Sqlite.hpp"
+#include "internal/Database.hpp"
 #include <algorithm>
 #include <map>
 #include <tuple>
@@ -14,26 +14,31 @@ std::string projectViewUuid(const std::string& author)
     return util::nameUuid(std::string(kProjectViewKind) + "/" + author);
 }
 
-std::optional<std::string> currentRevision(ObjectStoreSession& session, const AttachmentIdentity& attachment,
+struct WritePin { std::optional<std::string> revision; std::optional<int64_t> generation; };
+WritePin currentRevision(ObjectStoreSession& session, const AttachmentIdentity& attachment,
                                            const std::string& uuid, std::optional<ObjectRecord>* record = nullptr)
 {
-    std::optional<std::string> revision;
+    WritePin pin;
     session.read(attachment, [&](const auto& store, const auto& txn, const auto&) {
-        if (const auto head = store.currentObjectRevision(txn, uuid)) revision = head->uuid;
+        const auto policy=store.provisioning(txn);
+        if(policy.history==HistoryMode::Off) pin.generation=policy.generation;
+        else if (const auto head = store.currentObjectRevision(txn, uuid)) pin.revision = head->uuid;
         if (record) *record = store.objectByUuid(txn, uuid);
     });
-    return revision;
+    return pin;
 }
 
 // Write `record` over the object's current revision (or as a new object), leased on a hosted replica.
 void writeRecord(ObjectStoreSession& session, const AttachmentIdentity& attachment, const ObjectRecord& record,
-                 const std::optional<std::string>& revision, bool restore = false)
+                 const WritePin& pin, bool restore = false)
 {
-    const auto lease = revision ? session.holdLeases(attachment, {record.uuid}) : LeaseHold{};
-    session.act(attachment, {{record.uuid, revision}}, [&](ObjectStore& store, WriteTxn& txn) {
+    const auto lease = pin.revision ? session.holdLeases(attachment, {record.uuid}) : LeaseHold{};
+    const auto apply=[&](ObjectStore& store, WriteTxn& txn) {
         if (restore) store.restoreObject(txn, record.uuid);
         store.upsertObject(txn, record);
-    });
+    };
+    if(pin.generation) session.actAtGeneration(attachment,*pin.generation,apply);
+    else session.act(attachment,{{record.uuid,pin.revision}},apply);
 }
 } // namespace
 
@@ -49,7 +54,7 @@ void createProject(const std::filesystem::path& path, const std::string& name, c
     auto store = ObjectStore::create(path, options);
     ObjectRecord record;
     record.uuid = util::newUuid();
-    auto txn = store.write({{record.uuid, std::nullopt}});
+    auto txn = store.write();
     record.kind = kProjectKind;
     record.name = name;
     record.meta = meta.is_object() ? meta.dump() : "{}";
@@ -68,11 +73,12 @@ void copyProject(ObjectStoreSession& session, const AttachmentIdentity& attachme
         sqlite3* from = nullptr;
         sqlite3* to = nullptr;
         const auto close = [&] { sqlite3_close(from); sqlite3_close(to); };
-        if (sqlite3_open_v2(reinterpret_cast<const char*>(source.u8string().c_str()), &from, SQLITE_OPEN_READONLY, nullptr) != SQLITE_OK ||
-            sqlite3_open_v2(reinterpret_cast<const char*>(destination.u8string().c_str()), &to, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, nullptr) != SQLITE_OK) {
-            const std::string error = from ? sqlite3_errmsg(to ? to : from) : "out of memory";
+        try {
+            from=detail::openConnection(source,SQLITE_OPEN_READONLY,options,true);
+            to=detail::openConnection(destination,SQLITE_OPEN_READWRITE|SQLITE_OPEN_CREATE,options,false);
+        } catch(...) {
             close();
-            throw std::runtime_error("object store: cannot copy " + source.string() + ": " + error);
+            throw;
         }
         auto* backup = sqlite3_backup_init(to, "main", from, "main");
         const int rc = backup ? sqlite3_backup_step(backup, -1) : SQLITE_ERROR;
@@ -89,8 +95,14 @@ void copyProject(ObjectStoreSession& session, const AttachmentIdentity& attachme
         auto* db = detail::openConnection(destination, SQLITE_OPEN_READWRITE, options, false);
         try {
             detail::exec(db, "BEGIN IMMEDIATE;");
+            detail::forkStorageIdentity(db);
+            // This is a new independent publication, not an in-place unseal.
+            // The immutable source and its pins remain completely untouched.
+            detail::exec(db,"UPDATE store_manifest SET sealed=0;");
+            const auto newStore=detail::parseUuid(util::newUuid());
             detail::exec(db, "DROP TRIGGER store_identity_immutable_update; DROP TRIGGER store_identity_immutable_delete;");
-            detail::execute(db, "UPDATE store_identity SET uuid=?", detail::parseUuid(util::newUuid()));
+            detail::execute(db, "UPDATE store_identity SET uuid=?",newStore);
+            detail::execute(db,"UPDATE key_allocators SET namespace_uuid=?",newStore);
             detail::exec(db, "CREATE TRIGGER store_identity_immutable_update BEFORE UPDATE ON store_identity "
                              "BEGIN SELECT RAISE(ABORT,'store identity is immutable'); END;"
                              "CREATE TRIGGER store_identity_immutable_delete BEFORE DELETE ON store_identity "
@@ -98,6 +110,9 @@ void copyProject(ObjectStoreSession& session, const AttachmentIdentity& attachme
             detail::execute(db, "UPDATE sync_replica SET uuid=?", util::newUuid());
             for (const auto* table : {"hub_upstream", "hub_versions", "hub_pending", "hub_inflight", "hub_conflicts", "hub_leases"})
                 detail::exec(db, (std::string("DROP TABLE IF EXISTS ") + table + ";").c_str());
+            detail::registerStorageTables(db);
+            detail::execute(db,"UPDATE store_manifest SET generation=?",detail::writeGeneration(db));
+            detail::exec(db,"UPDATE store_write_state SET dirty=0;");
             detail::exec(db, "COMMIT;");
         } catch (...) { sqlite3_exec(db, "ROLLBACK;", nullptr, nullptr, nullptr); sqlite3_close(db); throw; }
         sqlite3_close(db);
@@ -126,7 +141,13 @@ std::optional<ObjectRecord> projectRecord(const ObjectStore& store, const Txn& t
 void setProjectName(ObjectStoreSession& session, const AttachmentIdentity& attachment, const std::string& name)
 {
     std::optional<ObjectRecord> record;
-    session.read(attachment, [&](const auto& store, const auto& txn, const auto&) { record = projectRecord(store, txn); });
+    WritePin pin;
+    session.read(attachment, [&](const auto& store, const auto& txn, const auto&) {
+        record=projectRecord(store,txn);
+        const auto policy=store.provisioning(txn);
+        if(policy.history==HistoryMode::Off) pin.generation=policy.generation;
+        else if(record) pin.revision=store.currentObjectRevision(txn,record->uuid)->uuid;
+    });
     if (record && record->name == name) return;
     if (!record) {
         record.emplace();
@@ -134,7 +155,7 @@ void setProjectName(ObjectStoreSession& session, const AttachmentIdentity& attac
         record->kind = kProjectKind;
     }
     record->name = name;
-    writeRecord(session, attachment, *record, currentRevision(session, attachment, record->uuid));
+    writeRecord(session, attachment, *record, pin);
 }
 
 std::vector<ProjectResource> projectResources(const ObjectStore& store, const Txn& txn, const std::string& kind,
@@ -146,7 +167,8 @@ std::vector<ProjectResource> projectResources(const ObjectStore& store, const Tx
     // created (seconds) for a hub baseline without its publication time.
     std::map<std::string, std::pair<std::string, int64_t>> added;
     for (const auto& record : records) {
-        const auto history = store.objectHistory(txn, record.uuid);
+        const auto history = store.provisioning(txn).history==HistoryMode::On
+            ? store.objectHistory(txn,record.uuid) : std::vector<ObjectRevision>{};
         const auto published = history.empty() ? std::nullopt : history.front().publishedAtUs;
         added[record.uuid] = published ? std::pair(std::string{}, *published) : std::pair(record.createdAt, int64_t(0));
     }
@@ -224,8 +246,10 @@ bool removeProjectResource(ObjectStoreSession& session, const AttachmentIdentity
     std::optional<ObjectRecord> record;
     const auto revision = currentRevision(session, attachment, uuid, &record);
     if (!record || record->retired || !isProjectResourceKind(record->kind)) return false;
-    const auto lease = session.holdLeases(attachment, {uuid});
-    session.act(attachment, {{uuid, revision}}, [&](ObjectStore& store, WriteTxn& txn) { store.retireObject(txn, uuid); });
+    const auto lease = revision.revision ? session.holdLeases(attachment, {uuid}) : LeaseHold{};
+    const auto apply=[&](ObjectStore& store,WriteTxn& txn) { store.retireObject(txn,uuid); };
+    if(revision.generation) session.actAtGeneration(attachment,*revision.generation,apply);
+    else session.act(attachment,{{uuid,revision.revision}},apply);
     return true;
 }
 

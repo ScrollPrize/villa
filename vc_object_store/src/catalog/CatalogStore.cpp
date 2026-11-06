@@ -146,8 +146,11 @@ CatalogStoreReport updateCatalogRecords(ObjectStoreSession& session, const Attac
     }
     report.surfaces = int(records.size());
     RevisionSelection expected;
+    std::optional<int64_t> directGeneration;
     std::vector<ObjectRecord> changed;
     session.read(attachment, [&](const auto& db, const auto& read, const auto&) {
+        const auto policy=db.provisioning(read);
+        if(policy.history==HistoryMode::Off)directGeneration=policy.generation;
         for (auto& record : records) {
             const auto existing = db.objectByUuid(read, record.uuid);
             if (!existing) {
@@ -179,20 +182,23 @@ CatalogStoreReport updateCatalogRecords(ObjectStoreSession& session, const Attac
                 }
             }
             record.tags = existing->tags;
-            expected[record.uuid] = db.currentObjectRevision(read, record.uuid)->uuid;
+            if(!directGeneration)expected[record.uuid] = db.currentObjectRevision(read, record.uuid)->uuid;
             ++report.updated;
             changed.push_back(std::move(record));
         }
     });
-    if (!changed.empty())
-        session.fetchWrite(attachment, expected, [&](ObjectStore& db, WriteTxn& txn) {
+    if (!changed.empty()) {
+        const ObjectStoreSession::Action action=[&](ObjectStore& db, WriteTxn& txn) {
             for (auto record : changed) {
                 auto meta = Json::parse(record.meta);
                 meta["catalog_write"] = util::newUuid();
                 record.meta = meta.dump();
                 db.upsertObject(txn, record);
             }
-        });
+        };
+        if(directGeneration)session.fetchWriteAtGeneration(attachment,*directGeneration,action);
+        else session.fetchWrite(attachment,expected,action);
+    }
     return report;
 }
 
@@ -217,6 +223,7 @@ void fetchCatalogSurface(ObjectStore& db, const std::string& uuid, const ObjectS
 {
     std::optional<ObjectRecord> record;
     std::optional<std::string> geometry, revision;
+    std::optional<int64_t> directGeneration;
     {
         auto read = db.read();
         record = db.objectByUuid(read, uuid);
@@ -225,7 +232,9 @@ void fetchCatalogSurface(ObjectStore& db, const std::string& uuid, const ObjectS
             if (record && locallyEdited(*record, *current)) return;
             geometry = current->uuid;
         }
-        if (const auto current = db.currentObjectRevision(read, uuid)) revision = current->uuid;
+        const auto policy=db.provisioning(read);
+        if(policy.history==HistoryMode::Off)directGeneration=policy.generation;
+        else if (const auto current = db.currentObjectRevision(read, uuid)) revision = current->uuid;
     }
     const auto reference = record ? catalogReference(*record) : std::nullopt;
     if (!reference || reference->url.empty()) throw std::runtime_error("not a catalog surface: " + uuid);
@@ -252,12 +261,14 @@ void fetchCatalogSurface(ObjectStore& db, const std::string& uuid, const ObjectS
     updated.surface->scale = prepared.object.surface->scale;
     // Expected at the revision read: a concurrent change (another fetch, a
     // refresh) fails this write, and the next read fetches again.
-    write({{uuid, revision}}, [&](ObjectStore& store, WriteTxn& txn) {
+    const ObjectStoreSession::Action action=[&](ObjectStore& store, WriteTxn& txn) {
         store.upsertObject(txn, updated);
         const auto fetched = store.putGeometry(txn, uuid, prepared.geometry, geometry);
         store.setMeta(txn, uuid, "catalog_geometry_revision", Json(fetched).dump());
         store.setMeta(txn, uuid, "catalog_write", Json(util::newUuid()).dump());
-    });
+    };
+    if(directGeneration)write.atGeneration(*directGeneration,action);
+    else write({{uuid,revision}},action);
 }
 
 CatalogStoreReport addCatalogSample(ObjectStoreSession& session, const AttachmentIdentity& attachment,

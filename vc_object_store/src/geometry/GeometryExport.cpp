@@ -75,28 +75,32 @@ std::string exportGeometry(ObjectStore& db, const std::string& objectUuid, const
     std::string fiberJson;
     {
         auto read = db.read();
-        const auto object = revisionUuid ? db.objectRevision(read, *revisionUuid) : db.currentObjectRevision(read, objectUuid);
-        if (!object || object->objectUuid != util::canonicalUuid(objectUuid) || object->deleted || object->record.retired)
-            throw std::runtime_error("active object revision not found for this object");
-        if (!object->geometryRevision) throw std::runtime_error("object revision has no geometry");
-        const auto revision = db.geometryRevision(read, *object->geometryRevision);
-        if (!revision) throw std::runtime_error("geometry revision not found");
-        RevisionSelection selection;
+        std::optional<ObjectRecord> object;
+        std::optional<GeometryRevision> revision;
+        std::optional<RevisionSelection> selection;
         if (revisionUuid) {
-            if (!object->publishedAtUs) throw std::runtime_error("object revision has no publication time");
-            selection = db.revisionSelectionAt(read, *object->publishedAtUs, true);
+            const auto historical = db.objectRevision(read,*revisionUuid);
+            if (!historical || historical->objectUuid!=util::canonicalUuid(objectUuid) || historical->deleted)
+                throw std::runtime_error("active object revision not found for this object");
+            object=historical->record;
+            if(historical->geometryRevision) revision=db.geometryRevision(read,*historical->geometryRevision);
+            if (!historical->publishedAtUs) throw std::runtime_error("object revision has no publication time");
+            selection = db.revisionSelectionAt(read,*historical->publishedAtUs,true);
         } else {
-            ObjectSelection all; all.includeRetired = true;
-            for (const auto& record : db.selectObjects(read, all))
-                selection[record.uuid] = db.currentObjectRevision(read, record.uuid)->uuid;
+            object=db.objectByUuid(read,objectUuid);
+            revision=db.currentGeometry(read,objectUuid);
         }
+        if (!object || object->retired) throw std::runtime_error("active object revision not found for this object");
+        if (!revision) throw std::runtime_error("object revision has no geometry");
         snapshot.revision = *revision;
         if (revision->kind == "fiber") {
-            RevisionSelection fibers;
-            for (const auto& [uuid, pin] : selection)
-                if (pin && db.objectRevision(read, *pin)->record.kind == "fiber") fibers.emplace(uuid, pin);
-            fiberJson = fiberNetworkJson(db, read, fibers, {object->objectUuid}, std::numeric_limits<uint64_t>::max()).at(object->objectUuid);
-        } else attributes = detail::nativeMetadata(db, read, object->record, *revision, selection);
+            if(selection) {
+                RevisionSelection fibers;
+                for (const auto& [uuid, pin] : *selection)
+                    if (pin && db.objectRevision(read, *pin)->record.kind == "fiber") fibers.emplace(uuid, pin);
+                fiberJson=fiberNetworkJson(db,read,fibers,{object->uuid},std::numeric_limits<uint64_t>::max()).at(object->uuid);
+            } else fiberJson=currentFiberNetworkJson(db,read,{object->uuid},std::numeric_limits<uint64_t>::max()).at(object->uuid);
+        } else attributes = detail::nativeMetadata(db, read, *object, *revision, selection);
         if (revision->formatVersion != 1 || revision->coordinateSystem != "source_xyz")
             throw std::runtime_error("unsupported geometry format for native export");
         const std::set<std::string> names = revision->kind == "fiber" ? std::set<std::string>{"control_points", "line_points", "control_point_ids"} :

@@ -4,6 +4,20 @@
 
 namespace vc::objects::detail {
 extern const char* kObjectCols;
+// Stage one caller-supplied ID for the ordinary native insertion path. The
+// savepoint rolls back allocator/record changes on failure; finish preserves
+// monotonic allocation and cannot reopen an exhausted range.
+class ExplicitRecordId {
+public:
+    ExplicitRecordId(sqlite3*, const char* keySpace, const std::string& uuid, int64_t id);
+    void finish();
+private:
+    sqlite3* db_;
+    std::string keySpace_;
+    int64_t id_;
+    std::optional<int64_t> next_;
+    Savepoint save_;
+};
 void createLifecycleSchema(sqlite3*);
 void readLifecycle(sqlite3*, int64_t id, ObjectRecord&);
 void writeLifecycle(sqlite3*, int64_t id, const ObjectRecord&);
@@ -57,8 +71,8 @@ std::string upsertObjectImpl(sqlite3* db, const std::string& author, const std::
 
 std::optional<int64_t> edgeIdByUuid(sqlite3* db, const std::array<unsigned char, 16>& uuid);
 
-// Shared content-mutation stamp for setMeta/removeMeta: bumps
-// generation, restamps changed_*, resets approval, journals.
+// Shared content-mutation stamp: uses the transaction publication generation,
+// restamps changed_*, resets approval and journals.
 void stampContentChange(sqlite3* db, const std::string& author, const std::string& host, const char* table,
                         int64_t id, const std::array<unsigned char, 16>& uuid, const char* changeKind);
 

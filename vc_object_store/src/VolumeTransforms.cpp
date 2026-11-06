@@ -59,20 +59,28 @@ std::optional<ObjectRecord> volumeTransformChoice(const ObjectStore& store,const
 std::string registerVolumeTransform(ObjectStoreSession& session,const AttachmentIdentity& attachment,const std::string& source,
     const std::string& target,const VolumeAffine& matrix,const std::string& name) {
     const auto uuid=util::newUuid();
-    session.act(attachment,{{uuid,std::nullopt}},[&](auto& store,auto& txn){store.registerVolumeTransform(txn,source,target,matrix,name,uuid);});
+    StoreProvisioning policy;
+    session.read(attachment,[&](const auto& store,const auto& txn,const auto&){policy=store.provisioning(txn);});
+    const ObjectStoreSession::Action action=[&](auto& store,auto& txn){store.registerVolumeTransform(txn,source,target,matrix,name,uuid);};
+    if(policy.history==HistoryMode::Off)session.actAtGeneration(attachment,policy.generation,action);
+    else session.act(attachment,{{uuid,std::nullopt}},action);
     return uuid;
 }
 std::string chooseVolumeTransform(ObjectStoreSession& session,const AttachmentIdentity& attachment,const std::string& source,
     const std::string& target,const std::vector<std::string>& path) {
     std::string uuid=util::newUuid();
     std::optional<std::string> revision;
+    StoreProvisioning policy;
     session.read(attachment,[&](const auto& store,const auto& txn,const auto&) {
+        policy=store.provisioning(txn);
         if(const auto existing=volumeTransformChoice(store,txn,source,target)) {
             uuid=existing->uuid;
-            revision=store.currentObjectRevision(txn,uuid)->uuid;
+            if(policy.history==HistoryMode::On)revision=store.currentObjectRevision(txn,uuid)->uuid;
         }
     });
-    session.act(attachment,{{uuid,revision}},[&](auto& store,auto& txn){store.chooseVolumeTransform(txn,source,target,path,uuid);});
+    const ObjectStoreSession::Action action=[&](auto& store,auto& txn){store.chooseVolumeTransform(txn,source,target,path,uuid);};
+    if(policy.history==HistoryMode::Off)session.actAtGeneration(attachment,policy.generation,action);
+    else session.act(attachment,{{uuid,revision}},action);
     return uuid;
 }
 std::array<double,6> transformBounds(const std::array<double,6>& b,const VolumeAffine& m) {
@@ -95,9 +103,19 @@ VolumeTransforms ObjectStore::volumeTransforms(const Txn& txn) const {
     for(const auto& object:objectsByKind(txn,"volume_transform")) {
         const auto meta=nlohmann::json::parse(object.meta);
         const auto& value=meta.at("registration");
-        const auto head=currentObjectRevision(txn,object.uuid);
-        if(!head)throw std::runtime_error("commit new volume registrations before resolving views");
-        result.graph.add({object.uuid,head->uuid,
+        const auto policy=provisioning(txn);
+        std::string version;
+        if(policy.history==HistoryMode::On) {
+            const auto head=currentObjectRevision(txn,object.uuid);
+            if(!head)throw std::runtime_error("commit new volume registrations before resolving views");
+            version=head->uuid;
+        } else {
+            if(object.generation>policy.generation)throw std::runtime_error("commit new volume registrations before resolving views");
+            // The transform graph uses an opaque cache/freshness token, not a
+            // historical revision reference. No history rows are synthesized.
+            version="generation:"+std::to_string(object.generation);
+        }
+        result.graph.add({object.uuid,version,
             value.at("source_volume").get<std::string>(),value.at("target_volume").get<std::string>(),
             VolumeAffine::fromJson(value.at("matrix")),value.value("description",std::string{})});
     }

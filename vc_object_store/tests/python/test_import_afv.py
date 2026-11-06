@@ -3,7 +3,6 @@ import importlib.util
 import json
 from pathlib import Path
 import sqlite3
-import struct
 
 import numpy as np
 import pytest
@@ -57,8 +56,9 @@ def test_import_keeps_exact_bytes_metadata_and_refuses_existing_output(tmp_path)
             expected = points if fid == 0 else points[-2:]
             revision = store.current_geometry(record['uuid'])['uuid']
             assert raw(store, revision, 'line_points') == expected.tobytes()
-            assert raw(store, revision, 'control_points') == expected[[0, -1]].tobytes()
-            assert raw(store, revision, 'control_point_ids') == struct.pack('<2q', 0, 1)
+            assert raw(store, revision, 'control_points') == b''
+            assert raw(store, revision, 'control_point_ids') == b''
+            assert record['fiber']['control_point_count'] == 0
             assert record['meta']['coordinates'] == dict(volume_uuid='20260411134726', scale_factor=4)
             assert record['fiber']['family'] == ('H' if fid == 0 else 'V')
             assert record['meta']['source']['afv']['annotation']['fiber_follow']['links'] == [-1, 0]

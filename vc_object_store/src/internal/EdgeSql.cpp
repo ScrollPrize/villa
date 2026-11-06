@@ -1,4 +1,5 @@
 #include "internal/EdgeSql.hpp"
+#include "geometry/GeometryInternal.hpp"
 
 namespace vc::objects::detail {
 std::string fiberAdjacencySql(std::optional<bool> adjacent)
@@ -54,7 +55,7 @@ const char* kEdgeCols =
     "id,uuid,a_id,b_id,kind,generation,created_by,created_at,created_host,changed_by,changed_at,changed_host,"
     "approval_state,approved_by,approved_at,approved_host,approved_generation,"
     "a_anchor_x,a_anchor_y,a_anchor_z,a_dir_x,a_dir_y,a_dir_z,"
-    "b_anchor_x,b_anchor_y,b_anchor_z,b_dir_x,b_dir_y,b_dir_z,meta,a_dependencies,b_dependencies";
+    "b_anchor_x,b_anchor_y,b_anchor_z,b_dir_x,b_dir_y,b_dir_z,meta,a_dependencies,b_dependencies,relation_key";
 
 std::string projectedEdgeColumns(const ObjectFields& fields)
 {
@@ -119,6 +120,7 @@ EdgeRecord readEdgeRow(sqlite3* db, const Statement& s, bool details, const Obje
         dependenciesFromJson(rec.bAnchor, nlohmann::json::parse(s.text(31)));
     }
     rec.meta = s.text(29);
+    rec.relationKey = s.text(32);
     if (!details) return rec;
     rec.aUuid = uuidTextByObjectId(db, aId);
     rec.bUuid = uuidTextByObjectId(db, bId);
@@ -155,9 +157,10 @@ std::vector<EdgeRecord> readEdgeRows(sqlite3* db, Statement& rows, const ObjectF
     return result;
 }
 
-std::string addEdgeImpl(sqlite3* db, const std::string& author, const std::string& host, const EdgeRecord& input,
+EdgeRecord addEdgeImpl(sqlite3* db, const std::string& author, const std::string& host, const EdgeRecord& input,
                         bool preserveRecord, const char* importOperation)
 {
+    GeometryPhase phase("native.edge.sql");
     Savepoint savepoint(db);
     if (input.kind.empty())
         throw std::runtime_error("object store: edge kind must be non-empty");
@@ -180,12 +183,13 @@ std::string addEdgeImpl(sqlite3* db, const std::string& author, const std::strin
         swapEndpoints(rec);
     }
     const std::string now = nowIsoUtc();
+    const int64_t id = allocateRecordId(db, "edges");
     Statement s(db, "INSERT INTO edges(uuid,a_id,b_id,kind,generation,created_by,created_at,created_host,changed_by,changed_at,"
                     "changed_host,approval_state,approved_by,approved_at,approved_host,approved_generation,"
                     "a_anchor_x,a_anchor_y,a_anchor_z,a_dir_x,a_dir_y,a_dir_z,"
-                    "b_anchor_x,b_anchor_y,b_anchor_z,b_dir_x,b_dir_y,b_dir_z,meta,a_dependencies,b_dependencies) "
-                    "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", parseUuid(rec.uuid),
-        *aId, *bId, rec.kind, int64_t(1), author, now, host, author, now, host);
+                    "b_anchor_x,b_anchor_y,b_anchor_z,b_dir_x,b_dir_y,b_dir_z,meta,a_dependencies,b_dependencies,id,relation_key) "
+                    "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", parseUuid(rec.uuid),
+        *aId, *bId, rec.kind, writeGeneration(db), author, now, host, author, now, host);
     const std::string state = preserveRecord ? rec.approvalState : "pending";
     s.bind(12, state.empty() ? std::string("pending") : state);
     if (preserveRecord && rec.approvedBy) s.bind(13, *rec.approvedBy); else s.bindNull(13);
@@ -197,16 +201,17 @@ std::string addEdgeImpl(sqlite3* db, const std::string& author, const std::strin
     s.bind(29, rec.meta);
     s.bind(30, dependenciesToJson(rec.aAnchor).dump());
     s.bind(31, dependenciesToJson(rec.bAnchor).dump());
+    s.bind(32, id);
+    s.bind(33, rec.relationKey);
     s.stepDone();
-    const int64_t id = sqlite3_last_insert_rowid(db);
     execute(db, "INSERT INTO edge_geometry_bindings(edge_id,a_revision,b_revision) VALUES(?,"
         "(SELECT revision_uuid FROM geometry_heads WHERE object_uuid=?),"
         "(SELECT revision_uuid FROM geometry_heads WHERE object_uuid=?))", id, parseUuid(rec.aUuid),
         parseUuid(rec.bUuid));
     writeTags(db, "edge_tags", "edge_id", id, rec.tags);
     if (preserveRecord) restoreCommon(db, "edges", rec);
-    appendJournal(db, author, host, parseUuid(rec.uuid), preserveRecord ? rec.generation : 1, preserveRecord ? importOperation : "add_edge");
+    appendJournal(db, author, host, parseUuid(rec.uuid), preserveRecord ? rec.generation : writeGeneration(db), preserveRecord ? importOperation : "add_edge");
     savepoint.release();
-    return rec.uuid;
+    return rec;
 }
 } // namespace vc::objects::detail
