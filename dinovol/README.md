@@ -618,9 +618,12 @@ For a build machine without a visible GPU, specify the deployment architecture,
 for example `uv sync --config-setting-package vc-reader:cmake.define.CMAKE_CUDA_ARCHITECTURES=120-real`.
 Rebuild vc_reader after changing its native sources.
 
-`CudaDataLoader` workers use the native reader and sample raw crop windows plus
-point metadata. The parent process normalizes each crop on CUDA **before** native
-affine resampling, then applies scanner, geometry and intensity transforms.
+`BatchDataLoader` workers use the native reader and sample raw crop windows plus
+point metadata. The parent process (`BatchProcessor`) normalizes each crop
+**before** native affine resampling, then applies scanner, geometry and intensity
+transforms. Processing runs on the training device's backend: batched on CUDA, or
+per view on CPU with the same seeded native plans (CPU runs are for tests and
+references).
 Images remain CUDA tensors through collation and the model. Point coordinates,
 object labels and cross-view token targets share the image geometry. Paired
 Gram-teacher crops share that geometry and optionally the augmentation seed.
@@ -1203,6 +1206,90 @@ image a visualisation, not a held-out test.
 cache, and `--offline` refuses them instead. `_render.json` records the
 normalization, lattice, timings and files.
 
+## JEM pretraining
+
+`method.name: "jem"` trains the patch-level objective of *Scalable Patch-Level
+Self-Supervised Learning* (Seitzer et al.) adapted to volumes; the design and every
+adopted convention are in [plans/JEM_impl.md](plans/JEM_impl.md). The recipe is
+`dinovol_2/configs/pretrain_jem_3d.json`:
+
+```bash
+.venv/bin/python -m dinovol_2.pretrain dinovol_2/configs/pretrain_jem_3d.json
+torchrun --nproc_per_node=4 -m dinovol_2.pretrain dinovol_2/configs/pretrain_jem_3d.json --ddp  # set data.batch_size to 48/4
+```
+
+`method.global_batch_size` (48) must equal `data.batch_size` x world size; JEM uses
+no gradient accumulation. The peak LR is resolved once from the global batch by
+`optimizer.lr_scaling` (`3e-4 * sqrt(48/64)`).
+
+**Views.** Each independent source yields two view sets of one teacher global,
+one student global and four student locals (256³ / 144³ voxels, 8³ token cells)
+at the level's native spacing, with no resizing, zoom or aspect change. vc_reader
+(`views.plan_view_sets`) places all crops on the 512³ window's patch lattice and
+accepts a student only when at least 10% of its tokens (and two) overlap its own
+teacher on valid support; contained and coincident crops are allowed. The union
+box is read once. Every crop then gets an independent uniform draw from the 48
+signed axis permutations, applied by exact Transpose/Flip reindexing, and its own
+intensity seed. `views.correspondence` gives each final student token its teacher
+token (or -1) through both orientations with integer arithmetic only. Masks are
+seeded per view (`views.patch_masks`): globals 3D multiblock with cyclic shift,
+locals uniform random, each applied with probability 0.7 to 55% / 40% of tokens;
+masked cells are zero-filled by `views.mask_patch_cells` before the CNN stem and
+replaced by the learned mask token after it. Teachers are never masked. The JEM
+intensity recipe drops Defocus, GaussianBlur and LowResolution (DINO keeps them).
+
+**Model.** A CLS-free backbone (four registers) feeds one categorical head per
+alignment depth {4, 8, 12} (MLP 512-1024-1024-256, L2 bottleneck, bias-free
+linear layer to K=512, teacher copies by EMA 0.994 of the plain weights) and one
+structural head per target depth {0, 4, 8} on the final student features.
+Categorical inputs reuse the backbone patch LayerNorm per tap; structural targets
+are raw teacher taps after a non-affine LayerNorm and L2 normalization. RoPE
+coordinate augmentation is disabled for JEM.
+
+**Objective.** `L = L_align + w_global(t) R_global + w_struct(t) R_struct` with
+FP32 reductions:
+- alignment: per view and depth, `0.2 * mean visible KL + 0.8 * mean masked KL`
+  over valid overlapping tokens (teacher and student temperatures 0.1), depth
+  weights {0.25, 0.25, 1} unnormalized, the ten student views equally weighted;
+- global collapse: per depth, crop type (`entropy_view_scope: "crop_type"`, or
+  `"slot"` for the ablation) and **final student position**, mean conditional
+  entropy minus entropy of the marginal over the whole logical batch (all ranks
+  and chunks), 0.2 global / 0.8 local;
+- structural collapse: per view, mean over ordered off-diagonal overlap pairs of
+  `(a_i.a_j - b_i.b_j)^2`, averaged over target depths. `structural_pair_weighting:
+  "distance_stratified"` weights near / intermediate / far bands (edges 2 and 8 token
+  cells, in physical units) equally instead.
+- schedules over successful updates: `w_global` 1 -> 0.1 over 12.5k updates;
+  `w_struct` 0 -> 0.05 over 12.5k, then -> 1 at the final update.
+
+**Batches larger than memory.** `method.source_chunk_size` sources run per forward.
+With several chunks, a statistics pass runs the student without gradients on every
+chunk (saving each chunk's RNG state) and the marginal statistics are all-reduced;
+the gradient pass then replays each chunk with the same drop-path draws, adds the
+teacher, and backpropagates `W/M * (C + S . stop_grad(log mu + 1))`, whose DDP
+average is the exact first-order gradient of the full-batch objective. Only the last
+chunk's backward synchronizes DDP. The logged `global_collapse_loss` is the true
+objective; `surrogate_value` only carries gradients. `batch_storage: "host"` keeps
+processed crops (in the autocast dtype) in pinned host memory between passes.
+Each loader worker assembles a whole 48-source batch (about 4.4 GB of raw crops in
+`/dev/shm`), so the recipe uses 4 workers with `prefetch_factor: 1`; a step takes
+minutes, which leaves the loader far ahead.
+
+**Diagnostics.** Per depth and crop type: alignment, visible/masked KL, global
+collapse, MI, marginal/conditional entropy, marginal perplexity, minimum valid
+vectors and distinct sources per position; structural loss per depth; overlap,
+validity and mask fractions; placement attempts/rejections; whole-view mask-status
+contributions (`contrib_*_masked/unmasked`, which add up to each weighted loss and
+use the full-batch marginal). Monitor images show oriented student/teacher slices
+with masks and correspondence support.
+
+Auxiliary object/ink/region/point objectives are not implemented for JEM; nonzero
+`method.auxiliaries` weights are rejected. `torch.compile` is not wired up for JEM.
+Tests: `tests/test_jem_losses.py` (fixed reduction fixtures, dense references) and
+`tests/test_jem_training.py` (exact correspondence through the processor on CPU and
+CUDA, masks and withheld voxels, view replay, chunked/single/dense gradients, EMA,
+config validation, fit and resume).
+
 ## Extending the training method
 
 `dinovol_2.pretrain` is the CLI. `training/trainer.py` owns iteration, AMP,
@@ -1216,8 +1303,12 @@ losses; it consumes pending centers without enqueuing further updates. Rendering
 Implement `TrainingMethod` and add a construction branch in `methods.build_method`
 to introduce another method. `Trainer(config, method=...)` also accepts an
 already constructed method. Its forward returns `StepOutput(loss, metrics)`;
-metrics are scalar tensors, and `loss` retains its gradient. The trainer runs
-forward once per microbatch and handles backward. Method hooks before/after the
+metrics are scalar tensors, and `loss` retains its gradient. By default the
+trainer runs forward once per microbatch and handles backward; a method that
+needs several backward passes per microbatch overrides `forward_backward`, which
+receives the autocast context, a DDP `sync_context(sync)` and the scaled
+`backward`. `optimizer_step_skipped` replaces `after_optimizer_step` when the AMP
+scaler skipped an update, and `build_processor` supplies the batch processor. Method hooks before/after the
 optimizer step run once per accumulated step. Trainable forwards must pass
 through the method's DDP-wrapped model. DINO keeps its region-head gradient
 reduction in `before_optimizer_step` and EMA/Gram updates in
