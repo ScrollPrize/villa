@@ -36,6 +36,28 @@ cv::Vec2f align_and_extract_umbilicus(const GridStore& grid_store,
                                       std::optional<std::uint32_t> seed = std::nullopt,
                                       float uncrush = 0.0f);
 
+/**
+ * @brief Fits one smooth axis through per-slice umbilicus estimates (robust local-linear, LOWESS).
+ *
+ * align_and_extract_umbilicus sees one slice at a time, and its estimate is randomised, so the
+ * points of neighbouring slices scatter around the axis and now and then one lands far off. The
+ * axis itself is a continuous curve in z. For each query z0 this fits x(z) and y(z) by weighted
+ * least squares on a line, with tricube weights of half-width `half_width` in z, and repeats the
+ * fit with bisquare weights on each estimate's 2D residual over 6 times the median residual, so an
+ * estimate far from its neighbours stops counting (Cleveland 1979).
+ *
+ * @param estimates (z, x, y) of every estimate; several may share a z (repeats).
+ * @param query_z The z at which the fitted axis is returned.
+ * @param half_width Window half-width, in the units of z. Must be > 0.
+ * @param robustness_iterations Bisquare reweightings; 0 gives the plain local-linear fit.
+ * @return (x, y) at each query z. Where fewer than 3 estimates fall inside the window, the
+ *         coordinatewise median of the estimates at exactly that z, or NaN if there are none.
+ */
+std::vector<cv::Vec2d> fit_umbilicus_along_z(const std::vector<cv::Vec3d>& estimates,
+                                             const std::vector<double>& query_z,
+                                             double half_width,
+                                             int robustness_iterations = 3);
+
 // Adds each trace to the grid, resampled so that consecutive kept points are at
 // least `spiral_step` apart. Traces that end up with fewer than two points are
 // skipped.
