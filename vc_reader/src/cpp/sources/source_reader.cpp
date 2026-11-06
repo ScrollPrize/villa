@@ -1058,6 +1058,21 @@ Array* SourceReader::directArray()
     return backend_->reader->array.get();
 }
 
+// A Zarr array whose channel axis is read in full and in stored order, with no time axis and
+// no encoding: regions then read straight from the array, channels included.
+bool SourceReader::wholeChannels()
+{
+    ready();
+    if (!zarr_ || lookup_ || fill_ != backend_->fill || dtype_ != rawDtype_ || !channels_ || hasAxis(rawAxes_, "t") || axes_ != rawAxes_) return false;
+    const auto c = axisIndex(rawAxes_, "c");
+    if (std::int64_t(channels_->size()) != rawShape_[c]) return false;
+    for (std::size_t i = 0; i < channels_->size(); ++i)
+        if ((*channels_)[i] != std::int64_t(i)) return false;
+    auto spatial = rawAxes_;
+    spatial.erase(spatial.begin() + std::ptrdiff_t(c));
+    return spatial == spatialAxes_;
+}
+
 Block SourceReader::read(const std::vector<std::int64_t>& start, const std::vector<std::int64_t>& size)
 {
     return annotated(source_.id, [&]() -> Block {
@@ -1309,6 +1324,26 @@ std::vector<Block> SourceReader::readMany(const std::vector<std::pair<std::vecto
                 outs.push_back(out.back().data.get());
             }
             direct->read_many(starts, sizes, outs);
+            return out;
+        }
+        if (wholeChannels()) {
+            // Every channel in stored order: one batched read of full-channel regions instead
+            // of one read per region and channel.
+            const auto c = axisIndex(rawAxes_, "c");
+            std::vector<Index> starts, sizes;
+            std::vector<std::uint8_t*> outs;
+            for (const auto& [start, size] : regions) {
+                if (start.size() != spatialAxes_.size() || size.size() != start.size() || std::any_of(size.begin(), size.end(), [](auto n) { return n < 0; }))
+                    bad("start/size must have " + std::to_string(spatialAxes_.size()) + " spatial entries and nonnegative sizes");
+                Index fullStart(start.begin(), start.end()), fullSize(size.begin(), size.end());
+                fullStart.insert(fullStart.begin() + std::ptrdiff_t(c), 0);
+                fullSize.insert(fullSize.begin() + std::ptrdiff_t(c), rawShape_[c]);
+                out.push_back(Block::allocate(std::vector<std::int64_t>(fullSize.begin(), fullSize.end()), dtype_));
+                starts.push_back(std::move(fullStart));
+                sizes.push_back(std::move(fullSize));
+                outs.push_back(out.back().data.get());
+            }
+            backend_->reader->array->read_many(starts, sizes, outs);
             return out;
         }
         for (const auto& [start, size] : regions) out.push_back(read(start, size));

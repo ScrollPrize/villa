@@ -274,6 +274,8 @@ public:
     // The one array this reads directly, when it is a Zarr array of exactly its spatial axes,
     // unencoded, with the array's own fill: samplers may go straight to it.
     [[nodiscard]] Array* directArray();
+    // A channel axis read in full and in stored order, with no time axis or encoding.
+    [[nodiscard]] bool wholeChannels();
     [[nodiscard]] bool isZarr();
     [[nodiscard]] const std::vector<std::string>& rawAxes();
     // The opened Zarr array, when there is one.

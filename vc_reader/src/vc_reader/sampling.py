@@ -132,14 +132,17 @@ class SampleReader(SamplingEngine):
             return registration.surface
         return self._ready().surface_named(getattr(surface, 'id', surface))
 
-    def render_surface(self, surface, start, size, *, offsets_um=(0,), interpolation='bicubic'):
+    def render_surface(self, surface, start, size, *, offsets_um=(0,), interpolation='bicubic', step=1):
         """Sample physical-offset layers over a YX patch in full-resolution surface UV.
 
         ``interpolation`` defaults to ``'bicubic'``; ``'linear'`` selects bilinear patches.
+        ``step`` (an integer or YX pair) samples every step-th UV pixel: output pixel
+        (row, col) is UV ``start + (row*step_y, col*step_x)``, so ``size`` counts output pixels.
         """
         native = self._ready()
         start, size = _yx(start, size)
-        return native.render_surface(self._surface(surface), start, size, [float(v) for v in offsets_um], interpolation)
+        return native.render_surface(self._surface(surface), start, size, [float(v) for v in offsets_um], interpolation,
+                                     _step(step))
 
     def project_surface(self, surface, start, size, *, label_target, thickness_um=0, padding_um=0):
         """Use a label YX patch to bound a crop, then project its sheet across it.
@@ -163,6 +166,16 @@ class SampleReader(SamplingEngine):
         for origin, shape in projection.regions(tile_size):
             self._ready()
             yield projection.read_crop(origin, shape)
+
+
+def _step(step):
+    try:
+        step = (operator.index(step),) * 2 if not isinstance(step, (tuple, list)) else tuple(map(operator.index, step))
+    except TypeError:
+        step = ()
+    if len(step) != 2 or any(v <= 0 for v in step):
+        raise ValueError('step must be a positive integer or a YX pair of positive integers')
+    return step
 
 
 def _yx(start, size):

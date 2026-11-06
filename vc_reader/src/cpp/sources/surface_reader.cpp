@@ -92,14 +92,16 @@ Local pixelPoints(const float* uv, std::size_t n, const Affine& mapping, const s
     std::swap(local.base[0], local.base[2]);
     return local;
 }
-std::vector<float> patchUv(const Pair& size)
+// XY uv of each output pixel relative to the patch start: pixel (y, x) samples UV
+// (x * step[1], y * step[0]).
+std::vector<float> patchUv(const Pair& size, const Pair& step = {1, 1})
 {
     std::vector<float> uv(std::size_t(size[0] * size[1]) * 2);
     std::size_t at = 0;
     for (std::int64_t y = 0; y < size[0]; ++y)
         for (std::int64_t x = 0; x < size[1]; ++x) {
-            uv[at++] = float(x);
-            uv[at++] = float(y);
+            uv[at++] = float(x * step[1]);
+            uv[at++] = float(y * step[0]);
         }
     return uv;
 }
@@ -344,17 +346,19 @@ void checkBudget(AlignedEngine::Impl& s, const Triple& shape, const std::optiona
 }
 // A UV patch as a raster over the stored grid, with the vertex window it reads. None when
 // the patch misses the grid. A grid position's patch is the cell at its floor, so the window
-// holds every cell the patch can reach.
+// holds every cell the patch can reach. Output pixel (y, x) is UV start + (y * step[0], x * step[1]).
 struct Patch {
     std::shared_ptr<const GeometryTile> tile;
     grid::Raster raster;
 };
-std::optional<Patch> patchOf(Geometry& geom, const Pair& start, const Pair& size)
+std::optional<Patch> patchOf(Geometry& geom, const Pair& start, const Pair& size, const Pair& step = {1, 1})
 {
     const auto& m = geom.fromUv.forward;
     const double u = double(start[1]), v = double(start[0]);
-    const double sx = m(0, 0), kx = m(0, 1), ky = m(1, 0), sy = m(1, 1);
-    const double x0 = sx * u + kx * v + m(0, 3), y0 = ky * u + sy * v + m(1, 3);
+    const double x0 = m(0, 0) * u + m(0, 1) * v + m(0, 3), y0 = m(1, 0) * u + m(1, 1) * v + m(1, 3);
+    // Grid-position change per output pixel: one UV step along each axis.
+    const double su = double(step[1]), sv = double(step[0]);
+    const double sx = m(0, 0) * su, kx = m(0, 1) * sv, ky = m(1, 0) * su, sy = m(1, 1) * sv;
     double minX = INFINITY, maxX = -INFINITY, minY = INFINITY, maxY = -INFINITY;
     for (const std::int64_t i : {std::int64_t(0), size[1] - 1})
         for (const std::int64_t j : {std::int64_t(0), size[0] - 1}) {
@@ -435,12 +439,15 @@ TargetResult renderVolume(AlignedEngine::Impl& s, Target& target, const grid::Su
 }
 } // namespace
 
-SampleResult SampleReader::renderSurface(const Surface& surface, const Pair& start, const Pair& size, const std::vector<double>& offsetsUm, grid::Interpolation interpolation)
+SampleResult SampleReader::renderSurface(const Surface& surface, const Pair& start, const Pair& size, const std::vector<double>& offsetsUm, grid::Interpolation interpolation,
+                                         const Pair& step)
 {
     auto& s = *impl_;
     std::lock_guard lock(s.mutex);
     s.checkOpen();
     checkPatch(start, size);
+    for (const auto n : step)
+        if (n <= 0 || n > (1 << 24)) bad("step must be a positive integer or a YX pair of positive integers");
     if (offsetsUm.empty() || std::any_of(offsetsUm.begin(), offsetsUm.end(), [](double v) { return !std::isfinite(v); })) bad("offsets_um must be nonempty and finite");
     auto geom = geometryOf(s, surface);
     s.usedSurface = true;
@@ -454,9 +461,9 @@ SampleResult SampleReader::renderSurface(const Surface& surface, const Pair& sta
     const auto toReference = s.referenceMap.forward.inverse() * between.forward * surface.xyzToVolume->forward;
     SampleResult result;
     result.metadata = s.metadata.is_null() ? json::object() : s.metadata;
-    result.metadata["surface"] = {{"id", surface.id}, {"uv_start", start}, {"uv_size", size}, {"offsets_um", offsetsUm},
+    result.metadata["surface"] = {{"id", surface.id}, {"uv_start", start}, {"uv_size", size}, {"uv_step", step}, {"offsets_um", offsetsUm},
                                   {"coordinate_frame", surfaceFrame(surface)}, {"reference_frame", s.referenceFrame}, {"array_to_level0", s.referenceMap.forward.json()}};
-    const auto patch = patchOf(*geom, start, size);
+    const auto patch = patchOf(*geom, start, size, step);
     const auto sheet = patch ? gridSurface(*geom, *patch->tile, interpolation) : nullptr;
     const grid::Raster raster = patch ? patch->raster : grid::Raster{};
     const std::vector<float> layers(offsetsUm.begin(), offsetsUm.end());
@@ -466,7 +473,7 @@ SampleResult SampleReader::renderSurface(const Surface& surface, const Pair& sta
         result.targets.emplace_back(name, std::move(out));
     }
     // Surface-registered targets are read at the patch's own UV pixels.
-    const auto uv = patchUv(size);
+    const auto uv = patchUv(size, step);
     const auto count = uv.size() / 2;
     const std::array<double, 3> uvOrigin{double(start[1]), double(start[0]), 0};
     for (const auto& [name, target] : s.surfaceTargets) {

@@ -105,9 +105,10 @@ public:
     [[nodiscard]] bool hasTarget(const std::string& name) const;
 
     // Physical-offset layers over a YX patch in full-resolution surface UV, the surface
-    // interpolated between its vertices linearly or smoothly (grid::Interpolation).
+    // interpolated between its vertices linearly or smoothly (grid::Interpolation). `step`
+    // samples every step-th UV pixel: output pixel (y, x) is UV start + (y * step[0], x * step[1]).
     [[nodiscard]] SampleResult renderSurface(const Surface& surface, const std::array<std::int64_t, 2>& start, const std::array<std::int64_t, 2>& size, const std::vector<double>& offsetsUm = {0},
-                                             grid::Interpolation interpolation = grid::Interpolation::Bicubic);
+                                             grid::Interpolation interpolation = grid::Interpolation::Bicubic, const std::array<std::int64_t, 2>& step = {1, 1});
     // Uses a label YX patch to bound a crop, then projects its sheet across it. Geometric
     // coverage includes sheet outside the selecting patch; label validity additionally
     // requires annotation support at the surface point.

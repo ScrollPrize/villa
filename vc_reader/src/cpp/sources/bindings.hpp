@@ -363,15 +363,15 @@ inline void bind(nb::module_& m)
             }
             return pairOf(std::move(*value));
         }, "name"_a, "start"_a, "size"_a)
-        .def("render_surface", [](SampleReader& r, const Surface& surface, const Pair& start, const Pair& size, const std::vector<double>& offsets, const std::string& interpolation) {
+        .def("render_surface", [](SampleReader& r, const Surface& surface, const Pair& start, const Pair& size, const std::vector<double>& offsets, const std::string& interpolation, const Pair& step) {
             const auto mode = grid::interpolationNamed(interpolation);
             std::optional<SampleResult> value;
             {
                 nb::gil_scoped_release release;
-                value = r.renderSurface(surface, start, size, offsets, mode);
+                value = r.renderSurface(surface, start, size, offsets, mode, step);
             }
             return sampleResult(*value);
-        }, "surface"_a, "start"_a, "size"_a, "offsets_um"_a, "interpolation"_a)
+        }, "surface"_a, "start"_a, "size"_a, "offsets_um"_a, "interpolation"_a, "step"_a = Pair{1, 1})
         .def("projection", [](SampleReader& r, const Surface& surface, const Pair& start, const Pair& size, const std::string& label, double thickness, double padding) {
             nb::gil_scoped_release release;
             return r.projection(surface, start, size, label, thickness, padding);

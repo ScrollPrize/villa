@@ -112,7 +112,9 @@ with open_sample(reference, {"ink": ink}, backend="cuda") as reader:
 ```
 
 Here `start` and `size` are YX in **full-resolution surface UV pixels**, rather than the
-label grid. Volume outputs are `(C, D, H, W)` in the supplied offset order;
+label grid. `step=` (an integer or YX pair) samples every step-th UV pixel instead:
+output pixel `(row, col)` is UV `start + (row * step_y, col * step_x)`, so `size`
+counts output pixels (e.g. one pixel per voxel of a coarser pyramid level). Volume outputs are `(C, D, H, W)` in the supplied offset order;
 labels and masks remain `(C, H, W)`. Each volume target is one native
 `vcr::grid` call (the sampler of VC3D's viewer): the patch becomes a raster
 over the stored coordinate grid, the window of vertices it reaches is read once,

@@ -971,6 +971,28 @@ class RemoteTests(RemoteFixtureCase):
         self.assertEqual(list(self.cache.rglob('*.tmp.*')), [])
 
 
+
+class ChannelReadManyTests(unittest.TestCase):
+    def test_whole_channel_batched_reads_match_single_reads(self):
+        from vc_reader import Source, Storage, Selection
+        with tempfile.TemporaryDirectory() as tmp:
+            data = np.arange(6 * 7 * 8 * 5, dtype=np.int8).reshape(6, 7, 8, 5)
+            array(Path(tmp) / 'emb.zarr', data, {'_ARRAY_DIMENSIONS': ['z', 'y', 'x', 'c']})
+            regions = [((0, 0, 0), (3, 4, 5)), ((4, 5, 6), (4, 4, 4)), ((-2, 1, 2), (3, 3, 3))]
+            full = Source('emb', Storage(str(Path(tmp) / 'emb.zarr'), 'zarr'), axes=('z', 'y', 'x', 'c')).open()
+            try:
+                for got, (start, size) in zip(full.read_many(regions), regions):
+                    np.testing.assert_array_equal(got, full.read(start, size))
+            finally:
+                full.close()
+            picked = Source('emb', Storage(str(Path(tmp) / 'emb.zarr'), 'zarr', selection=Selection(channels=(3, 1))),
+                            axes=('z', 'y', 'x', 'c')).open()
+            try:
+                np.testing.assert_array_equal(picked.read_many(regions[:1])[0], data[:3, :4, :5][..., [3, 1]])
+            finally:
+                picked.close()
+
+
 class Delta3DChannelChunkTests(unittest.TestCase):
     def test_reads_multichannel_signed_delta3d_chunks(self):
         from vc_reader import _reader
