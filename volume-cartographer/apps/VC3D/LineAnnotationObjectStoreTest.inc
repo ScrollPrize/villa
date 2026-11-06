@@ -13,6 +13,7 @@
 #include <nlohmann/json.hpp>
 #include <vc_reader/zarr.hpp>
 #include <vc_reader/zarr_write.hpp>
+#include <vc_reader/sftp.hpp>
 #include <filesystem>
 #include <fstream>
 #include "fibers3d/Fiber3DCanvas.hpp"
@@ -42,6 +43,42 @@ int runObjectStoreControllerTests()
     auto require = [](bool value, const char* message) { if (!value) throw std::runtime_error(message); };
     const auto path = std::filesystem::temp_directory_path() / ("vc3d-store-test-"+vc::objects::util::newUuid()+".vcobj");
     try {
+        if (const char* endpoint = std::getenv("VC3D_SSH_STORE_TEST")) {
+            QTemporaryDir directory;
+            const auto local = fs::path(directory.path().toStdString()) / "local.vcobj";
+            OpenOptions options; options.author = "ssh-gui-test";
+            { auto store = ObjectStore::create(local, options); }
+            CState state;
+            openStoreAsProject(state, QString::fromStdString(local.string()), options.author.c_str());
+            int prompts = 0, heartbeats = 0;
+            vcr::sftp::setAuthenticator([&](const vcr::sftp::Prompt& prompt) -> std::optional<std::string> {
+                if (!prompt.confirmation) return std::nullopt;
+                QMetaObject::invokeMethod(qApp, [&] { ++prompts; }, Qt::BlockingQueuedConnection);
+                return "yes"; // disposable local sshd from run_ssh_test.py
+            });
+            const auto resetAuth = qScopeGuard([] { vcr::sftp::setAuthenticator({}); });
+            QTimer heartbeat; heartbeat.setInterval(5);
+            QObject::connect(&heartbeat, &QTimer::timeout, [&] {
+                ++heartbeats;
+                state.objectStoreSession()->finalize();
+            });
+            heartbeat.start();
+            const auto hosted = state.attachHostedStore(endpoint, options.author.c_str());
+            state.setStoreFor("fiber", hosted);
+            const auto project = state.vpkg()->document().path();
+            require(prompts == 1 && heartbeats > 0, "SSH prompts and GUI events run during attachment");
+            require(state.objectStoreSession()->location(hosted) == endpoint, "project retains pasted SSH endpoint");
+            state.closeProject();
+            state.setVpkg(VolumePkg::open(project));
+            require(state.storeFor("fiber") && state.objectStoreSession()->location(*state.storeFor("fiber")) == endpoint,
+                    "project reopening reestablishes its SSH hosted store");
+            auto invalid = state.vpkg()->document().data();
+            invalid["stores"][1]["location"] = "sftp://host:8750/file.vcobj";
+            bool refused = false;
+            try { state.vpkg()->document().replace(invalid); } catch (...) { refused = true; }
+            require(refused, "hosted endpoints reject SFTP file paths");
+            state.closeProject();
+        }
         if (const char* legacy = std::getenv("VC3D_UPGRADE_STORE_TEST")) {
             QTemporaryDir directory;
             const auto source = fs::path(directory.path().toStdString()) / "legacy.vcobj";

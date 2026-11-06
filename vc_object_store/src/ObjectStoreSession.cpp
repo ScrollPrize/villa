@@ -10,6 +10,7 @@
 #include "vc_object_store/objects/TransactionJson.hpp"
 #include "vc_object_store/Uuid.hpp"
 #include <vc_reader/native/platform_io.hpp>
+#include <vc_reader/sftp.hpp>
 #include <algorithm>
 #include <nlohmann/json.hpp>
 #include <stdexcept>
@@ -178,7 +179,7 @@ void ObjectStoreSession::detach(const AttachmentIdentity& identity)
 
 AttachmentIdentity ObjectStoreSession::attachLocation(const std::string& location, const OpenOptions& options)
 {
-    if (location.starts_with("http://") || location.starts_with("https://")) {
+    if (location.starts_with("http://") || location.starts_with("https://") || vcr::sftp::isSftpUrl(location)) {
         HostedSessionOptions hosted;
         hosted.author = options.author;
         return attachHosted(location, hosted);
@@ -188,8 +189,10 @@ AttachmentIdentity ObjectStoreSession::attachLocation(const std::string& locatio
 
 AttachmentIdentity ObjectStoreSession::attachHosted(const std::string& endpoint, const HostedSessionOptions& options)
 {
-    std::lock_guard transition(transition_);
+    // Authentication may ask the GUI for input. Do not hold the attachment
+    // barrier while waiting: that thread may need to finalize existing edits.
     auto next = std::make_shared<Attachment>(std::make_unique<detail::HostedAttachment>(endpoint, options));
+    std::lock_guard transition(transition_);
     next->identity.storeUuid = next->remote->storeUuid();
     next->author = options.author;
     {

@@ -18,6 +18,10 @@
 #include <QCoreApplication>
 #include <QProcess>
 #include <QStandardPaths>
+#include <QEventLoop>
+#include <QThread>
+#include <future>
+#include <vc_reader/sftp.hpp>
 
 #include "vc/core/types/VolumePkg.hpp"
 #include <vc_object_store/geometry/Geometry.hpp>
@@ -30,6 +34,28 @@
 #include "vc/core/util/PlaneSurface.hpp"
 
 namespace {
+
+vc::objects::AttachmentIdentity connectHostedStore(
+    const std::shared_ptr<vc::objects::ObjectStoreSession>& session,
+    const std::string& endpoint, const vc::objects::HostedSessionOptions& options)
+{
+    const auto* app = QCoreApplication::instance();
+    if (!vcr::sftp::isSftpUrl(endpoint) || !app || QThread::currentThread() != app->thread())
+        return session->attachHosted(endpoint, options);
+    // SSH asks the GUI for host trust/passwords. Keep its queued prompts alive
+    // while preventing another user-initiated project switch during attachment.
+    auto connection = std::async(std::launch::async, [session, endpoint, options] {
+        return session->attachHosted(endpoint, options);
+    });
+    QEventLoop loop;
+    QTimer timer;
+    QObject::connect(&timer, &QTimer::timeout, &loop, [&] {
+        if (connection.wait_for(std::chrono::seconds(0)) == std::future_status::ready) loop.quit();
+    });
+    timer.start(20);
+    loop.exec(QEventLoop::ExcludeUserInputEvents);
+    return connection.get();
+}
 
 std::shared_ptr<const vcr::catalog::RegistrationGraph> catalogTransformSnapshot()
 {
@@ -311,7 +337,7 @@ vc::objects::AttachmentIdentity CState::attachHostedStore(const std::string& end
 {
     if (_objectStoreOwner) return _objectStoreOwner->attachHostedStore(endpoint, author);
     if (!_vpkg) throw std::runtime_error("Open a project first");
-    const auto attachment = _objectStoreSession->attachHosted(endpoint, hostedOptions(author));
+    const auto attachment = connectHostedStore(_objectStoreSession, endpoint, hostedOptions(author));
     const auto id = vc::objects::util::newUuid();
     auto data = _vpkg->document().data();
     data["stores"].push_back({{"id", id}, {"location", endpoint}, {"hosted", true}, {"read_only", false}});
@@ -495,7 +521,7 @@ void CState::restoreStoreRoutes()
             vc::objects::AttachmentIdentity attachment;
             try {
                 attachment = vc::project::ProjectDocument::hostedStore(entry)
-                    ? _objectStoreSession->attachHosted(entry.at("location").get<std::string>(), hostedOptions(storeAuthor()))
+                    ? connectHostedStore(_objectStoreSession, entry.at("location").get<std::string>(), hostedOptions(storeAuthor()))
                     : prepareStore(_vpkg->document().resolve(entry.at("location")), storeAuthor(), entry.value("read_only", false));
             } catch (const std::exception& error) {
                 if (vc::project::ProjectDocument::hostedStore(entry) || entry.value("read_only", false) ||

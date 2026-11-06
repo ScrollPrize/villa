@@ -41,14 +41,20 @@ std::string shellQuote(const std::string& text)
     return quoted + "'";
 }
 
-std::vector<std::string> sshArguments(const Url& url, const Options& options, bool interactive)
+std::vector<std::string> sshArguments(const Url& url, const Options& options, bool interactive,
+                                     const std::string& forwarding)
 {
     std::vector<std::string> args{"ssh", "-T", interactive ? "-oBatchMode=no" : "-oBatchMode=yes",
-        interactive ? "-oStrictHostKeyChecking=ask" : "-oStrictHostKeyChecking=yes", "-oClearAllForwardings=yes",
+        interactive ? "-oStrictHostKeyChecking=ask" : "-oStrictHostKeyChecking=yes",
+        forwarding.empty() ? "-oClearAllForwardings=yes" : "-oClearAllForwardings=no",
         "-oConnectTimeout=" + std::to_string(options.connectTimeout.count())};
     if (!url.user.empty()) args.insert(args.end(), {"-l", url.user});
     if (url.port) args.insert(args.end(), {"-p", std::to_string(*url.port)});
-    args.insert(args.end(), {"-s", "--", url.host, "sftp"});
+    if (forwarding.empty()) args.insert(args.end(), {"-s", "--", url.host, "sftp"});
+    else args.insert(args.end(), {"-oExitOnForwardFailure=yes", "-oGatewayPorts=no",
+        "-oControlMaster=no", "-oControlPath=none", "-oForkAfterAuthentication=no", "-oRemoteCommand=none",
+        "-oServerAliveInterval=15", "-oServerAliveCountMax=3", "-oPermitLocalCommand=yes",
+        "-oLocalCommand=echo VC_SSH_FORWARD_READY", "-N", "-L", forwarding, "--", url.host});
     return args;
 }
 
@@ -245,12 +251,12 @@ struct SshProcess::Impl {
     }
 };
 
-SshProcess::SshProcess(const Url& destination, const Options& options, Authenticator)
+SshProcess::SshProcess(const Url& destination, const Options& options, Authenticator, const std::string& forwarding)
     : impl_(std::make_unique<Impl>())
 {
     // Windows has no SSH_ASKPASS integration here: ssh runs in batch mode.
     std::wstring command;
-    for (const auto& argument : sshArguments(destination, options, false))
+    for (const auto& argument : sshArguments(destination, options, false, forwarding))
         command += (command.empty() ? L"" : L" ") + quoteArgument(widen(argument));
     SECURITY_ATTRIBUTES inherit{sizeof(SECURITY_ATTRIBUTES), nullptr, TRUE};
     HANDLE childInput = nullptr, childOutput = nullptr, childErrors = nullptr;
@@ -377,12 +383,13 @@ int aboveStandard(int fd)
 }
 }  // namespace
 
-SshProcess::SshProcess(const Url& destination, const Options& options, Authenticator authenticator)
+SshProcess::SshProcess(const Url& destination, const Options& options, Authenticator authenticator,
+                       const std::string& forwarding)
     : impl_(std::make_unique<Impl>())
 {
     const bool interactive = static_cast<bool>(authenticator);
     if (interactive) impl_->askpass = std::make_unique<Askpass>(std::move(authenticator), destination.authority());
-    const auto arguments = sshArguments(destination, options, interactive);
+    const auto arguments = sshArguments(destination, options, interactive, forwarding);
     std::vector<std::string> environment;
     for (char** entry = environ; entry && *entry; ++entry) {
         const std::string_view value(*entry);

@@ -26,6 +26,35 @@ bound its queues and staged uploads; a full queue answers 503 with
 queue, staging, and WAL-checkpoint state. In VC3D: Stores → Attach Hosted
 Store...
 
+## Pasting an SSH address in VC3D
+
+With `vc_object_server` running on the storage host, use **File → Stores →
+Attach Hosted Store...** and paste `ssh://dl.ash2txt.org:8750` or
+`sftp://dl.ash2txt.org:8750`. Both mean the database service listening on the
+remote host's loopback port **8750**. The SSH login port comes from `~/.ssh/config`
+(normally 22); an optional `user@` selects the login name. These service
+addresses do not accept a `.vcobj` file path. Select the attached store under
+**Show Fibers From**, **Show Surfaces From**, etc. as needed.
+
+VC3D manages a local loopback-only tunnel, uses the existing SSH key/agent and
+host-trust/password prompts, and saves the pasted address in the project.
+Reopening the project reconnects; detaching releases the connection. After a
+network failure that terminates SSH, reopen the project to reconnect. No
+manual `ssh -N -L` command is needed. `HostedStore` and
+`ObjectStoreSession::attachLocation` accept these addresses in C++ and Python too.
+
+The transport regression can use a closed real store, copied into a disposable
+directory. It starts a local sshd with temporary keys and configuration, tests
+both schemes and a write through the service, and checks listener cleanup.
+`--gui` also checks GUI-thread authentication and persisted-project reopening.
+It requires installed OpenSSH `ssh`, `sshd`, and `ssh-keygen`; installs nothing:
+
+```sh
+cmake --build volume-cartographer/build --target VC3D vc_object_server_app test_object_store_ssh -j 4
+python3 vc_object_store/tests/run_ssh_test.py --build volume-cartographer/build \
+  --store /path/to/closed-current-schema.vcobj --gui
+```
+
 ## Clients
 
 Python `HostedStore(endpoint)` mirrors the local store's forms: requests are

@@ -1,5 +1,6 @@
 #include "vc/core/types/ProjectDocument.hpp"
 #include <vc_reader/zarr.hpp>
+#include <vc_reader/sftp.hpp>
 #include <vc_object_store/Uuid.hpp>
 #include <algorithm>
 #include <cctype>
@@ -44,7 +45,9 @@ void ProjectDocument::validate(const nlohmann::json& data) {
     for (const auto& store : stores) {
         const auto id = store.at("id").get<std::string>();
         const auto location = store.at("location").get<std::string>();
-        const bool endpoint = location.rfind("http://", 0) == 0 || location.rfind("https://", 0) == 0;
+        const bool ssh = vcr::sftp::isSftpUrl(location);
+        if (hostedStore(store) && ssh) (void)vcr::sftp::parseForwardUrl(location);
+        const bool endpoint = location.rfind("http://", 0) == 0 || location.rfind("https://", 0) == 0 || ssh;
         if (id.empty() || location.empty() || (hostedStore(store) ? !endpoint : remote(location)) ||
             !ids.insert(id).second || !paths.insert(location).second)
             throw std::invalid_argument("Invalid or duplicate project store reference");

@@ -9,6 +9,7 @@
 
 #include <fcntl.h>
 #include <vc_reader/http.hpp>
+#include <vc_reader/sftp.hpp>
 #include <vc_reader/native/sigv4.hpp>
 
 #include <algorithm>
@@ -42,17 +43,21 @@ std::string serverError(const vcr::http::Response& response)
 } // namespace
 
 struct HostedStore::Impl {
-    explicit Impl(const HostedStoreOptions& o)
-        : http(vcr::http::Options{o.connections, o.connectTimeoutMs, o.stallTimeoutS, o.retries, o.requestTimeoutMs, true}) {}
+    explicit Impl(const HostedStoreOptions& o, bool ssh)
+        : http(vcr::http::Options{o.connections, o.connectTimeoutMs, o.stallTimeoutS, o.retries, o.requestTimeoutMs, true, ssh}) {}
+    std::unique_ptr<vcr::sftp::Forward> forward;
     vcr::http::Session http;
 };
 
 HostedStore::HostedStore(std::string endpoint, HostedStoreOptions options)
     : endpoint_(std::move(endpoint)), rangeBytes_(std::max<int64_t>(options.rangeBytes, 1)),
-      impl_(std::make_unique<Impl>(options))
+      impl_(std::make_unique<Impl>(options, vcr::sftp::isSftpUrl(endpoint_)))
 {
     while (!endpoint_.empty() && endpoint_.back() == '/') endpoint_.pop_back();
     if (endpoint_.empty()) throw std::invalid_argument("hosted store: endpoint required");
+    if (vcr::sftp::isSftpUrl(endpoint_))
+        impl_->forward = std::make_unique<vcr::sftp::Forward>(endpoint_);
+    requestEndpoint_ = impl_->forward ? impl_->forward->endpoint() : endpoint_;
 }
 
 HostedStore::~HostedStore() = default;
@@ -72,12 +77,12 @@ const vcr::http::Response& expectOk(const vcr::http::Response& response, const s
 
 StoreStatus HostedStore::status()
 {
-    return storeStatusFromJson(expectOk(impl_->http.request("GET", endpoint_ + "/v1/status"), "status").body);
+    return storeStatusFromJson(expectOk(impl_->http.request("GET", requestEndpoint_ + "/v1/status"), "status").body);
 }
 
 std::string HostedStore::serviceReport()
 {
-    return expectOk(impl_->http.request("GET", endpoint_ + "/v1/service"), "service").body;
+    return expectOk(impl_->http.request("GET", requestEndpoint_ + "/v1/service"), "service").body;
 }
 
 TransactionReceipt HostedStore::submit(const TransactionRequest& request)
@@ -86,7 +91,7 @@ TransactionReceipt HostedStore::submit(const TransactionRequest& request)
     const auto body = transactionRequestToJson(request, &payloads);
     auto upload = [&](const std::string& hash) {
         const auto& bytes = payloads.at(hash);
-        const auto response = impl_->http.request("PUT", endpoint_ + "/v1/payloads/" + hash,
+        const auto response = impl_->http.request("PUT", requestEndpoint_ + "/v1/payloads/" + hash,
             std::string_view(reinterpret_cast<const char*>(bytes.data()), bytes.size()),
             {{"Content-Type", "application/octet-stream"}});
         expectOk(response, "stage payload " + hash);
@@ -95,7 +100,7 @@ TransactionReceipt HostedStore::submit(const TransactionRequest& request)
     // Staging can expire between upload and submit (or before a retry): the
     // server names what it lacks and the identical request is sent again.
     for (int attempt = 0;; ++attempt) {
-        const auto response = impl_->http.request("POST", endpoint_ + "/v1/transactions", body,
+        const auto response = impl_->http.request("POST", requestEndpoint_ + "/v1/transactions", body,
             {{"Content-Type", "application/json"}});
         if (response.status != 422 || attempt == 3) {
             return transactionReceiptFromJson(expectOk(response, "submit " + request.requestUuid).body);
@@ -111,20 +116,20 @@ TransactionReceipt HostedStore::submit(const TransactionRequest& request)
 
 std::optional<TransactionReceipt> HostedStore::receipt(const std::string& requestUuid)
 {
-    const auto response = impl_->http.request("GET", endpoint_ + "/v1/receipts/" + requestUuid);
+    const auto response = impl_->http.request("GET", requestEndpoint_ + "/v1/receipts/" + requestUuid);
     if (response.status == 404) return std::nullopt;
     return transactionReceiptFromJson(expectOk(response, "receipt").body);
 }
 
 ChangePage HostedStore::changesSince(const FeedCursor& cursor, int64_t maxChanges)
 {
-    const auto url = endpoint_ + "/v1/changes?" + feedCursorQuery(cursor) + "&max=" + std::to_string(maxChanges);
+    const auto url = requestEndpoint_ + "/v1/changes?" + feedCursorQuery(cursor) + "&max=" + std::to_string(maxChanges);
     return changePageFromJson(expectOk(impl_->http.request("GET", url), "changes").body);
 }
 
 std::optional<ObjectRevision> HostedStore::currentObjectRevision(const std::string& objectUuid, StoreStatus* asOf)
 {
-    const auto response = impl_->http.request("GET", endpoint_ + "/v1/objects/" + objectUuid);
+    const auto response = impl_->http.request("GET", requestEndpoint_ + "/v1/objects/" + objectUuid);
     if (response.status == 404) return std::nullopt;
     const auto j = Json::parse(expectOk(response, "object").body);
     if (asOf) *asOf = storeStatusFromJson(j.at("status").dump());
@@ -140,7 +145,7 @@ std::optional<int64_t> HostedStore::currentVersion(const std::string& objectUuid
 
 std::optional<ObjectRevision> HostedStore::objectAtVersion(const ObjectVersion& reference)
 {
-    const auto url = endpoint_ + "/v1/objects/" + reference.objectUuid + "/versions/" + std::to_string(reference.version) +
+    const auto url = requestEndpoint_ + "/v1/objects/" + reference.objectUuid + "/versions/" + std::to_string(reference.version) +
                      "?store=" + reference.storeUuid + "&generation=" + reference.generation;
     const auto response = impl_->http.request("GET", url);
     if (response.status == 404) return std::nullopt;
@@ -149,7 +154,7 @@ std::optional<ObjectRevision> HostedStore::objectAtVersion(const ObjectVersion& 
 
 std::optional<GeometryRevision> HostedStore::geometryRevision(const std::string& revisionUuid)
 {
-    const auto response = impl_->http.request("GET", endpoint_ + "/v1/geometry/" + revisionUuid);
+    const auto response = impl_->http.request("GET", requestEndpoint_ + "/v1/geometry/" + revisionUuid);
     if (response.status == 404) return std::nullopt;
     return geometryRevisionFromJson(expectOk(response, "geometry").body);
 }
@@ -158,7 +163,7 @@ std::vector<uint8_t> HostedStore::readGeometryArray(const std::string& revisionU
                                                     int64_t byteOffset, const std::optional<int64_t>& byteCount)
 {
     auto get = [&](int64_t offset, const std::optional<int64_t>& count) {
-        auto url = endpoint_ + "/v1/geometry/" + revisionUuid + "/arrays/" + arrayPathSegment(arrayName) + "?offset=" + std::to_string(offset);
+        auto url = requestEndpoint_ + "/v1/geometry/" + revisionUuid + "/arrays/" + arrayPathSegment(arrayName) + "?offset=" + std::to_string(offset);
         if (count) url += "&count=" + std::to_string(*count);
         return impl_->http.request("GET", url);
     };
@@ -359,7 +364,7 @@ std::vector<std::string> restrictTo(const std::vector<std::string>& chunk, const
 std::vector<ObjectRecord> HostedStore::selectObjects(const ObjectSelection& selection,
     const std::optional<std::vector<std::string>>& fields, StoreStatus* asOf)
 {
-    const auto response = impl_->http.request("POST", endpoint_ + "/v1/query/objects",
+    const auto response = impl_->http.request("POST", requestEndpoint_ + "/v1/query/objects",
         objectQueryRequestToJson(selection, fields), {{"Content-Type", "application/json"}});
     return objectQueryResultFromJson(expectOk(response, "object query").body, asOf);
 }
@@ -367,7 +372,7 @@ std::vector<ObjectRecord> HostedStore::selectObjects(const ObjectSelection& sele
 std::vector<EdgeRecord> HostedStore::selectEdges(const EdgeSelection& selection,
     const std::optional<std::vector<std::string>>& fields, StoreStatus* asOf)
 {
-    const auto response = impl_->http.request("POST", endpoint_ + "/v1/query/edges",
+    const auto response = impl_->http.request("POST", requestEndpoint_ + "/v1/query/edges",
         edgeQueryRequestToJson(selection, fields), {{"Content-Type", "application/json"}});
     return edgeQueryResultFromJson(expectOk(response, "edge query").body, asOf);
 }
@@ -528,7 +533,7 @@ SelectionRecord HostedStore::recordSelection(const ObjectSelection& selection, i
 
 std::vector<ObjectRevision> HostedStore::objectHistory(const std::string& objectUuid, StoreStatus* asOf)
 {
-    const auto response = impl_->http.request("GET", endpoint_ + "/v1/objects/" + objectUuid + "/history");
+    const auto response = impl_->http.request("GET", requestEndpoint_ + "/v1/objects/" + objectUuid + "/history");
     if (response.status == 404) {
         if (asOf) *asOf = status();
         return {};
@@ -545,7 +550,7 @@ std::vector<std::optional<ObjectRevision>> HostedStore::objectsAtVersions(const 
     for (std::size_t i = 0; i < references.size(); i += std::size_t(batch)) {
         const std::vector<ObjectVersion> part(references.begin() + i,
             references.begin() + std::min(references.size(), i + std::size_t(batch)));
-        const auto response = impl_->http.request("POST", endpoint_ + "/v1/query/versions",
+        const auto response = impl_->http.request("POST", requestEndpoint_ + "/v1/query/versions",
             objectVersionsRequestToJson(part), {{"Content-Type", "application/json"}});
         auto revisions = objectsAtVersionsResultFromJson(expectOk(response, "versions query").body, nullptr);
         if (revisions.size() != part.size()) throw std::runtime_error("hosted store: versions answer has the wrong length");
@@ -556,56 +561,56 @@ std::vector<std::optional<ObjectRevision>> HostedStore::objectsAtVersions(const 
 
 nlohmann::json HostedStore::geometryPointAnnotations(const std::string& revisionUuid, const std::string& arrayName)
 {
-    const auto response = impl_->http.request("GET", endpoint_ + "/v1/geometry/" + revisionUuid + "/annotations/" + arrayPathSegment(arrayName));
+    const auto response = impl_->http.request("GET", requestEndpoint_ + "/v1/geometry/" + revisionUuid + "/annotations/" + arrayPathSegment(arrayName));
     if (response.status == 404) throw std::invalid_argument("geometry revision not found: " + revisionUuid);
     return Json::parse(expectOk(response, "point annotations").body);
 }
 
 std::vector<std::string> HostedStore::traverse(const GraphQuery& query, StoreStatus* asOf)
 {
-    const auto response = impl_->http.request("POST", endpoint_ + "/v1/query/graph",
+    const auto response = impl_->http.request("POST", requestEndpoint_ + "/v1/query/graph",
         graphQueryRequestToJson(query), {{"Content-Type", "application/json"}});
     return uuidListResultFromJson(expectOk(response, "graph query").body, asOf);
 }
 
 int64_t HostedStore::objectCount(const std::string& kind, bool includeRetired, StoreStatus* asOf)
 {
-    const auto response = impl_->http.request("POST", endpoint_ + "/v1/query/count",
+    const auto response = impl_->http.request("POST", requestEndpoint_ + "/v1/query/count",
         kindQueryRequestToJson({kind, includeRetired, std::nullopt}), {{"Content-Type", "application/json"}});
     return objectCountResultFromJson(expectOk(response, "object count").body, asOf);
 }
 
 int64_t HostedStore::unboundObjectCount(const std::string& kind, const std::string& volume, StoreStatus* asOf)
 {
-    const auto response = impl_->http.request("POST", endpoint_ + "/v1/query/count",
+    const auto response = impl_->http.request("POST", requestEndpoint_ + "/v1/query/count",
         kindQueryRequestToJson({kind, false, volume}), {{"Content-Type", "application/json"}});
     return objectCountResultFromJson(expectOk(response, "unbound object count").body, asOf);
 }
 
 std::vector<std::string> HostedStore::objectTags(const std::optional<std::string>& kind, StoreStatus* asOf)
 {
-    const auto response = impl_->http.request("POST", endpoint_ + "/v1/query/tags",
+    const auto response = impl_->http.request("POST", requestEndpoint_ + "/v1/query/tags",
         kindQueryRequestToJson({kind, false, std::nullopt}), {{"Content-Type", "application/json"}});
     return objectTagsResultFromJson(expectOk(response, "object tags").body, asOf);
 }
 
 std::vector<SelectedRelationship> HostedStore::relationshipsAt(const std::vector<ObjectVersion>& versions, StoreStatus* asOf)
 {
-    const auto response = impl_->http.request("POST", endpoint_ + "/v1/query/relationships",
+    const auto response = impl_->http.request("POST", requestEndpoint_ + "/v1/query/relationships",
         objectVersionsRequestToJson(versions), {{"Content-Type", "application/json"}});
     return relationshipQueryResultFromJson(expectOk(response, "relationship query").body, asOf);
 }
 
 RegionResult HostedStore::geometryRegion(const RegionSlice& slice, const RegionOptions& options, StoreStatus* asOf)
 {
-    const auto response = impl_->http.request("POST", endpoint_ + "/v1/query/region",
+    const auto response = impl_->http.request("POST", requestEndpoint_ + "/v1/query/region",
         regionQueryRequestToJson(slice, options), {{"Content-Type", "application/json"}});
     return regionQueryResultFromJson(expectOk(response, "region query").body, asOf);
 }
 
 std::vector<SurfaceProximityHit> HostedStore::nearestSurfaces(const SurfaceProximityQuery& query, StoreStatus* asOf)
 {
-    const auto response = impl_->http.request("POST", endpoint_ + "/v1/query/nearest_surfaces",
+    const auto response = impl_->http.request("POST", requestEndpoint_ + "/v1/query/nearest_surfaces",
         proximityQueryRequestToJson(query), {{"Content-Type", "application/json"}});
     return proximityQueryResultFromJson(expectOk(response, "proximity query").body, asOf);
 }
@@ -613,7 +618,7 @@ std::vector<SurfaceProximityHit> HostedStore::nearestSurfaces(const SurfaceProxi
 std::optional<uint64_t> HostedStore::artifactLength(const std::string& sha256)
 {
     if (!isArtifactHash(sha256)) throw std::invalid_argument("hosted store: invalid artifact SHA-256 " + sha256);
-    const auto response = impl_->http.request("GET", endpoint_ + "/v1/artifacts/" + sha256 + "/info");
+    const auto response = impl_->http.request("GET", requestEndpoint_ + "/v1/artifacts/" + sha256 + "/info");
     if (response.status == 404) return std::nullopt;
     return Json::parse(expectOk(response, "artifact info").body).at("length").get<uint64_t>();
 }
@@ -641,7 +646,7 @@ std::string HostedStore::putArtifact(const std::filesystem::path& file)
     hasher.update(bytes.data(), bytes.size());
     const auto hash = hasher.finish();
     if (artifactLength(hash) == uint64_t(bytes.size())) return hash;
-    expectOk(impl_->http.request("PUT", endpoint_ + "/v1/artifacts/" + hash, bytes,
+    expectOk(impl_->http.request("PUT", requestEndpoint_ + "/v1/artifacts/" + hash, bytes,
                                  {{"Content-Type", "application/octet-stream"}}), "put artifact " + hash);
     return hash;
 }
@@ -651,7 +656,7 @@ std::vector<uint8_t> HostedStore::readArtifact(const std::string& sha256, uint64
 {
     if (!isArtifactHash(sha256)) throw std::invalid_argument("hosted store: invalid artifact SHA-256 " + sha256);
     auto get = [&](uint64_t from, const std::optional<uint64_t>& n) {
-        auto url = endpoint_ + "/v1/artifacts/" + sha256 + "?offset=" + std::to_string(from);
+        auto url = requestEndpoint_ + "/v1/artifacts/" + sha256 + "?offset=" + std::to_string(from);
         if (n) url += "&count=" + std::to_string(*n);
         return impl_->http.request("GET", url);
     };

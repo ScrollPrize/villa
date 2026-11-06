@@ -2103,7 +2103,9 @@ bool MenuActionController::attachHostedStore()
     if (!requireProject(QObject::tr("Attaching a store"))) return false;
     bool ok = false;
     const auto endpoint = QInputDialog::getText(_window, QObject::tr("Attach Hosted Store"),
-        QObject::tr("Endpoint of a vc_object_server (for example http://127.0.0.1:8750 through an SSH tunnel):"),
+        QObject::tr("Server address, for example ssh://host:8750.\n"
+                    "ssh:// and sftp:// connect automatically using SSH; the port is the database service port.\n"
+                    "http:// and https:// endpoints are also supported."),
         QLineEdit::Normal, QStringLiteral("http://127.0.0.1:8750"), &ok).trimmed();
     if (!ok || endpoint.isEmpty()) return false;
     const auto author = objectStoreAuthor();

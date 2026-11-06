@@ -65,6 +65,26 @@ struct Options {
     std::function<bool()> cancelled;  // polled while waiting
 };
 
+// A hosted-service address: ssh://[user@]host:SERVICE_PORT (sftp:// is an alias).
+// The port is the remote loopback service port, not the SSH login port. SSH's
+// own port, keys and ProxyJump come from OpenSSH configuration. No file path.
+Url parseForwardUrl(std::string_view endpoint);
+
+// Owns a loopback-only local TCP forward and the ssh process for its lifetime.
+// Uses setAuthenticator like Session. OpenSSH must be installed. Disconnects
+// fail existing requests; create a new Forward to reconnect.
+class Forward {
+public:
+    explicit Forward(const std::string& endpoint, Options options = {});
+    ~Forward();
+    Forward(const Forward&) = delete;
+    Forward& operator=(const Forward&) = delete;
+    const std::string& endpoint() const;
+private:
+    struct Impl;
+    std::unique_ptr<Impl> impl_;
+};
+
 enum Status : uint32_t {
     Eof = 1, NoSuchFile = 2, PermissionDenied = 3, Failure = 4, BadMessage = 5,
     NoConnection = 6, ConnectionLost = 7, OpUnsupported = 8,

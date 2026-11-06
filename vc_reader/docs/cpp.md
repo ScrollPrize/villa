@@ -92,6 +92,17 @@ reader uses (at most 8 sessions per host, transport failures retried, a missing
 file reads as not stored) and directory listing. Without an
 `sftp::setAuthenticator` callback, ssh runs in batch mode and never prompts.
 
+`sftp::Forward("ssh://[user@]host:8750")` owns a TCP forward to port 8750
+on the remote host's loopback interface. `sftp://` is accepted as an alias in
+this service context; file paths are rejected and the explicit port is the
+**service port**, while OpenSSH configuration supplies the SSH login port.
+`Forward::endpoint()` returns the temporary local HTTP endpoint. Keep the object
+alive while using it; destruction closes the SSH process and listener. It uses
+the same authenticator, keys and host verification as SFTP, without starting a
+remote command. Recreate the forward after an SSH disconnect. In Python this
+class is available as `vc_reader.SshForward(endpoint)` with an `endpoint` property.
+Interactive prompts are supported on Linux/macOS; Windows uses keys and the agent.
+
 ## Opening and writing Zarr arrays
 
 ```cpp

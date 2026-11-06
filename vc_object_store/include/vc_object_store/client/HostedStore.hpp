@@ -1,6 +1,7 @@
 #pragma once
 // Client of a store hosted by vc_object_server. Requests go to the server's
-// endpoint (e.g. http://127.0.0.1:8750 through an SSH tunnel); the client never
+// endpoint (HTTP(S), or ssh://[user@]host:SERVICE_PORT / sftp:// alias with
+// an automatically owned SSH tunnel); the client never
 // opens the database or its artifacts. Results are the same types the local
 // ObjectStore API returns, and conflicts throw the same TransactionConflict.
 //
@@ -142,6 +143,7 @@ public:
 private:
     struct Impl;
     std::string endpoint_;
+    std::string requestEndpoint_;
     int64_t rangeBytes_;
     std::unique_ptr<Impl> impl_;
 };

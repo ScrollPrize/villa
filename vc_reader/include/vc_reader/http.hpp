@@ -18,6 +18,7 @@ struct Options {
     int retries = 5;
     long requestTimeoutMs = 0;      // whole-attempt limit; 0 = none
     bool pathAsIs = false;          // preserve dot segments when paths contain opaque identifiers
+    bool bypassProxy = false;       // owned local transports must not use environment proxies
 };
 
 struct Response {

@@ -8,7 +8,10 @@ namespace vcr::sftp::detail {
 // answered on a background thread until authenticated() is called.
 class SshProcess {
 public:
-    SshProcess(const Url& destination, const Options& options, Authenticator authenticator);
+    // A nonempty forwarding specification runs an owned `ssh -N -L` process
+    // instead of the SFTP subsystem, using the same authentication handling.
+    SshProcess(const Url& destination, const Options& options, Authenticator authenticator,
+               const std::string& forwarding = {});
     ~SshProcess();
     SshProcess(const SshProcess&) = delete;
     SshProcess& operator=(const SshProcess&) = delete;
