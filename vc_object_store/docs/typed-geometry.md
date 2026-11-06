@@ -1,55 +1,47 @@
-# Shared geometry API
+# Typed geometry
 
-The package separates geometry, stored objects and file formats:
+Geometry comes in two forms: **owned values** (`vc::geometry`, no database
+needed) and **snapshot views** over stored revisions (bounded reads of exactly
+the ranges asked for). Owned values hold geometry only — names, UUIDs, tags,
+annotations, and relationships belong to stored objects. This page is the
+type reference; day-to-day use is in [reading](reading.md),
+[writing](writing.md#creating-objects-and-geometry), and
+[editing](editing.md).
 
 | Layer | Public API | Responsibility |
 | --- | --- | --- |
-| Owned geometry | `geometry/Geometry.hpp`, `vc::geometry` | Point collections, fibers, tracks, surfaces and umbilici; validation and geometry operations |
-| Stored geometry | `store/GeometryViews.hpp`, `vc::objects` | Snapshot views, bounded reads and checked sparse edits |
-| Object store | `objects/ObjectStore.hpp` | Identity, metadata, history, transactions, relationships and spatial queries |
-| Native formats | `objects/GeometryIngest.hpp`, `objects/GeometryExport.hpp` | Import/export orchestration; decoders and encoders live in `src/formats/` |
+| Owned geometry | [geometry/Geometry.hpp](../include/vc_object_store/geometry/Geometry.hpp), `vc::geometry` | The five types below; validation and geometry operations |
+| Stored geometry | [store/GeometryViews.hpp](../include/vc_object_store/store/GeometryViews.hpp), `vc::objects` | Snapshot views, bounded reads, checked sparse edits |
+| Object store | [objects/ObjectStore.hpp](../include/vc_object_store/objects/ObjectStore.hpp) | Identity, metadata, history, transactions, relationships, spatial queries |
+| Native formats | [objects/GeometryIngest.hpp](../include/vc_object_store/objects/GeometryIngest.hpp), [objects/GeometryExport.hpp](../include/vc_object_store/objects/GeometryExport.hpp) | Import/export orchestration; codecs live in `src/formats/` |
 
-Link `vc_geometry` for owned geometry alone, or `vc_objects` for stored geometry.
-Installed CMake targets have the `vc_object_store::` prefix. Owned geometry has no
-SQLite, OpenCV, Qt, volume-cartographer or spiral-fitting dependency.
-All five types and the snapshot/edit API are also available in Python.
+Link `vc_object_store::vc_geometry` for owned geometry alone (no SQLite,
+OpenCV, Qt, or volume-cartographer dependency), or `vc_objects` for stored
+geometry. All five types and the snapshot/edit API are also in Python.
 
-## Owned geometry
+## Owned types
 
-Owned values contain geometry only. Names, UUIDs, tags, source annotations and
-relationships belong to stored objects. Values can be created without opening a
-database. Public fields allow construction and editing; `validate()` and storage
-conversion check invariants.
+Public fields allow direct construction and editing; `validate()` (and
+storage conversion) checks invariants. Coordinates are source XYZ voxels —
+no implicit rescaling, unit conversion, or axis reversal. (Native packed
+tracks are ZYX on disk; the format adapter converts at the file boundary.)
+Stable point IDs are nonnegative, unique, and need not be sorted.
 
-| Type | Fields | Operations |
+| Type | Fields | Notes |
 | --- | --- | --- |
-| `PointCollection` | int64 `ids`, float64 XYZ `points` | `point(id)`, `indexOf(id)`, validation |
-| `Fiber` | float64 XYZ `controlPoints`, `linePoints`; int64 `controlPointIds` | Polyline length, validation |
-| `Track` | int32 XYZ `points` | Polyline length, validation |
-| `Surface` | `rows`, `columns`, column/row `scale`, float32 XYZ `points`, `validity`, `channels` | Vertex access, validity, validation |
-| `Umbilicus` | float64 XYZ `points` (ordered control polyline, at least one) | Validation |
-
-Coordinates remain source XYZ voxels; there is no implicit rescaling, unit
-conversion, or axis reversal. Native packed tracks use ZYX; the format adapter
-performs that conversion at the file boundary. Fiber length uses sampled line
-points if present, otherwise control points. A surface is row-major; scale is grid
-steps per source voxel, and vertices without coordinates use the
-`(-1,-1,-1)` sentinel. An umbilicus is a scroll's centre line; its native file
-is `{"vc_umbilicus_json_version": "1", "points": [{"x", "y", "z"}, ...]}` plus the
-object's name, tags, `coordinates` and other metadata (`vc_object_ingest --umbilicus`). `validity` is the surface's `valid` channel (empty, or one
-byte per vertex, nonzero = valid); `valid(row, column)` requires both coordinates
-and validity. `channels` holds the other aligned channels as generic arrays. Stable point IDs are nonnegative and unique and need not be sorted.
+| `PointCollection` | int64 `ids`, float64 XYZ `points` | `point(id)` looks up by ID, not row; `indexOf(id)` |
+| `Fiber` | float64 XYZ `controlPoints`, `linePoints`; int64 `controlPointIds` | Length uses line points when present, else controls |
+| `Track` | int32 XYZ `points` | Polyline length |
+| `Surface` | `rows`, `columns`, column/row `scale`, float32 XYZ `points`, `validity`, `channels` | Row-major; `scale` is grid steps per source voxel; missing vertices are `(-1,-1,-1)`. `validity` is the `valid` channel (empty, or one byte per vertex); `valid(row, column)` requires coordinates **and** validity. `channels` holds the other aligned channels |
+| `Umbilicus` | float64 XYZ `points` (ordered control polyline, at least one) | A scroll's centre line; native file is `vc_umbilicus` JSON |
 
 ```cpp
 #include <vc_object_store/geometry/Geometry.hpp>
 #include <vc_object_store/objects/ObjectStore.hpp>
 
-vc::geometry::PointCollection points{
-    {42, 7},
-    {{1.0, 2.0, 3.0}, {4.0, 5.0, 6.0}}
-};
+vc::geometry::PointCollection points{{42, 7}, {{1.0, 2.0, 3.0}, {4.0, 5.0, 6.0}}};
 points.validate();
-auto position = points.point(42); // optional XYZ, not row 42
+auto position = points.point(42);   // optional XYZ, not row 42
 
 auto write = store.write();
 vc::objects::ObjectRecord record;
@@ -58,15 +50,6 @@ auto id = store.upsertObject(write, record);
 store.putGeometry(write, id, vc::geometry::encode(points));
 write.commit();
 ```
-
-`encode()` converts the typed variant to existing `GeometryData` arrays with
-explicit little-endian encoding. `decode()` performs the reverse conversion.
-Point order, IDs and scalar precision are preserved. Owned conversion keeps
-surface channels and rejects other auxiliary arrays and additional immutable
-geometry attributes instead of silently dropping them. The generic array API remains available for those payloads.
-
-Python `put_geometry()` accepts either the existing array dictionary or one of
-the four owned types, including inside `store.write()` transactions:
 
 ```python
 from vc_object_store import ObjectStore, PointCollection
@@ -77,11 +60,16 @@ with ObjectStore.create("points.vcobj", author="reviewer") as store:
         write.put_geometry(uid, PointCollection([42, 7], [[1, 2, 3], [4, 5, 6]]))
 ```
 
-Python fields are converted to ordinary Python lists. Assign a modified list
-back to a field; mutating a list returned by a field getter does not modify the
-native value.
+`encode()` / `decode()` convert between owned values and `GeometryData`
+arrays with explicit little-endian encoding, preserving point order, IDs,
+scalar precision, and surface channels. Owned conversion **rejects** other
+auxiliary arrays and extra immutable geometry attributes rather than dropping
+them — use the generic array API for those payloads
+([raw array reads](reading.md#raw-array-reads)). In Python, fields convert to
+ordinary lists: assign a modified list back to the field; mutating a returned
+list does not modify the native value.
 
-## Snapshot views and bounded reads
+## Snapshot views
 
 ```cpp
 #include <vc_object_store/store/GeometryViews.hpp>
@@ -89,90 +77,53 @@ native value.
 auto snapshot = store.geometrySnapshot();
 auto collection = snapshot.pointCollection(collectionUuid);
 auto xyz = collection.point(42);
-auto surface = snapshot.surface(surfaceUuid);
-auto tile = surface.readTile(30, 31, 4, 4); // row, column, rows, columns
+auto tile = snapshot.surface(surfaceUuid).readTile(30, 31, 4, 4);  // row, column, rows, columns
 ```
 
-```python
-with store.geometry_snapshot() as snapshot:
-    collection = snapshot.point_collection(collection_uuid)
-    ids = collection.ids(0, len(collection))
-    xyz = collection.point(42)
-    surface = snapshot.surface(surface_uuid)
-    tile = surface.read_tile(30, 31, 4, 4)
-```
+`snapshot.geometry(uuid)` returns the matching view (a variant in C++);
+typed factories reject kind mismatches and objects without geometry. Counts
+and dimensions come from the pinned revision, not import summaries. Views
+read through the verified chunk reader; `point(id)` builds an ID index once
+per view (loading IDs, not coordinates). `view.load()` materializes the owned
+value; large surfaces should use `readTile` instead, and read other channels
+with `readGeometryRectangle`.
 
-`snapshot.geometry(uuid)` returns the corresponding view (a variant in C++).
-Typed factories reject kind mismatches and objects without stored geometry.
-Counts and surface dimensions come from the pinned geometry revision, not stored
-import summaries.
+Lifetime: a snapshot pins one consistent state at creation, views keep it
+alive, and `snapshot.close()` (or Python context-manager exit) invalidates
+all views. Snapshots are thread-confined and hold one reader slot. A C++
+snapshot borrowing `ObjectStore&` must finish before the store moves or dies;
+the `GeometrySnapshot(std::shared_ptr<ObjectStore>)` overload owns a lease
+(Python uses it and rejects closing a store with active snapshots). Loaded
+owned geometry outlives the snapshot. Views also work over any
+`StoreReader`, hosted included — see [hosted](hosted.md).
 
-Views read only requested coordinate ranges or rectangles, through the existing
-verified chunk reader. Point lookup builds an ID index once per view, loading
-the ID array but not the coordinate array. Full materialization is explicit:
-`view.load()` returns the owned type. Large surfaces should use `readTile()` /
-`read_tile()` instead; a tile holds points and validity, and other channels are
-read with `readGeometryRectangle`.
+## Edits go through transactions
 
-Snapshots pin a consistent database state at creation. Views keep
-that snapshot alive even if the snapshot variable goes out of scope. Explicit
-`snapshot.close()` (also Python context-manager exit) invalidates all its views
-and releases the reader. Snapshots are thread-confined and consume
-one slot in the store's reader pool; close them promptly.
-
-A C++ snapshot borrowing `ObjectStore&` must finish before the store is moved or
-destroyed. The `GeometrySnapshot(std::shared_ptr<ObjectStore>)` overload owns a
-store lease; Python uses this overload and rejects closing a store with active
-snapshots. Returned owned geometry remains valid after snapshot closure.
-
-## Checked edits and relationships
-
-Views are read-only. Use the existing checked store transaction for mutations;
-there is no separate typed editor or commit path.
+Views are read-only; there is no separate typed editor or commit path.
+Mutate through the checked store transaction, expecting the version the view
+read — the view keeps reading its pinned revision afterwards:
 
 ```python
 import struct
+
 with store.geometry_snapshot() as snapshot:
     collection = snapshot.point_collection(collection_uuid)
     with store.write(expected_versions={collection_uuid: collection.version}) as tx:
-        new_revision = tx.edit_geometry(collection_uuid, [dict(
+        revision = tx.edit_geometry(collection_uuid, [dict(
             array="points", element_offset=0, data=struct.pack("<3d", 10, 20, 30)
         )], collection.version)
-    # collection still reads the original revision.
 ```
 
-The transaction checks the object version the view read, including for
-no-ops. Affected relationships require explicit retain, update, remove or keep
-recorded decisions through `edit_geometry(edge_edits=...)`; include the affected
-endpoints in the transaction's expected versions. No relationship meaning is
-inferred by the geometry layer.
-
-C++ clients applying full desired arrays can use `updateGeometryArrays`: it
-uses these same sparse and structural transactions, preserves auxiliary
-channels and exact scalar bytes, and accepts explicit annotation transforms.
-
-For adding/removing/reordering points or changing dimensions, use
-[structural edits](structural-editing.md). Full `put_geometry` replacement remains
-available before structural management begins; `affected_geometry_edges()` previews
-its relationship dependencies. Multi-object actions use checked write transactions.
-
-## Validation
-
-Import-summary counts/lengths remain historical annotations; view counts and owned
-measurements describe current geometry. Generic arrays retain their stored names,
-dtypes and byte order. See the [build/test commands](../README.md#build).
-
-Native directory export currently requires Linux `renameat2`.
+The version check applies even to no-ops. Affected relationships need
+explicit decisions via `edge_edits` ([graph edges](graph-edges.md#decisions-when-geometry-changes));
+the geometry layer infers none. For whole desired arrays use
+[`updateGeometryArrays`](editing.md#whole-array-updates-updategeometryarrays);
+for adding/removing rows or resizing grids, the
+[structural edits](editing.md#structural-sequence-edits).
 
 Sequence geometry (fibers, point collections, tracks) is created once with
-`putGeometry` / `put_geometry`. Initial per-point annotations supplied in source
-metadata are consumed into that geometry revision. Read them with
-`geometryPointAnnotations` / `geometry_point_annotations`; edit them through
-sequence operations, alongside the points they describe. Fiber controls and
-point collections have stable IDs from creation. Fiber JSON transfer preserves
-`control_point_ids` and allocates IDs when a new input omits them.
-
-C++ callers with owned arrays can use `updateGeometryArrays` for all geometry
-kinds. It delegates to sparse and structural edits in one checked transaction.
-Directional reorderings require explicitly transformed annotations. A failed
-update rolls back all its arrays and prevents the enclosing action from committing.
+`putGeometry` / `put_geometry`. Source annotations supplied at creation are
+consumed into that revision, read with `geometry_point_annotations`, and
+edited through sequence operations alongside the points they describe.
+Import-summary counts and lengths stay historical annotations; view counts
+and owned measurements describe current geometry.

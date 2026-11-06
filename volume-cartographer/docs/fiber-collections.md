@@ -17,7 +17,7 @@ last current. Every save is a checked request: a fiber someone else changed
 since you opened it is refused, and you reopen it to edit. Remote volumes (URLs)
 of a shared project are everyone's; a volume at a local path is listed only for
 the person who attached it. See [hosting a
-store](../../vc_object_store/docs/README.md#hosting-a-store-vc_object_server).
+store](../../vc_object_store/docs/hosted.md#serving-a-store).
 
 Create the database outside VC3D, using the sibling object-store tools:
 
