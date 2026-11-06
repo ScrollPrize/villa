@@ -535,11 +535,11 @@ std::vector<std::optional<ObjectRevision>> HostedStore::objectsAtVersions(const 
     return result;
 }
 
-std::string HostedStore::geometryPointAnnotations(const std::string& revisionUuid, const std::string& arrayName)
+nlohmann::json HostedStore::geometryPointAnnotations(const std::string& revisionUuid, const std::string& arrayName)
 {
     const auto response = impl_->http.request("GET", endpoint_ + "/v1/geometry/" + revisionUuid + "/annotations/" + arrayName);
     if (response.status == 404) throw std::invalid_argument("geometry revision not found: " + revisionUuid);
-    return expectOk(response, "point annotations").body;
+    return Json::parse(expectOk(response, "point annotations").body);
 }
 
 std::vector<std::string> HostedStore::traverse(const GraphQuery& query, StoreStatus* asOf)

@@ -34,7 +34,7 @@ ObjectCopy readObjectCopy(const StoreReader& reader, const std::string& objectUu
             if (copy.geometry->kind == "surface" ||
                 (array.name != "points" && array.name != "control_points" && array.name != "line_points")) continue;
             const auto key = copy.geometry->kind == "point_collection" ? std::string("point_attributes") : array.name + "_attributes";
-            source[key] = nlohmann::json::parse(reader.geometryPointAnnotations(*geometry, array.name));
+            source[key] = reader.geometryPointAnnotations(*geometry, array.name);
         }
         if (!source.empty()) meta["source"] = std::move(source);
     }

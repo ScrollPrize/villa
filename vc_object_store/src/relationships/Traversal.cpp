@@ -135,19 +135,27 @@ std::vector<std::string> uuidList(sqlite3* db, const std::vector<int64_t>& ids)
 }  // namespace
 
 std::vector<int64_t> detail::componentIds(sqlite3* db, const std::string& start,
-                                        const std::vector<std::string>& kinds, bool includeRetired, std::optional<bool> adjacentFilter)
+                                        const std::vector<std::string>& kinds, bool includeRetired, std::optional<bool> adjacentFilter,
+                                        const std::atomic_bool* cancel)
 {
     StatementPool* pool = nullptr;
     if (auto it = activeStatementPools.find(db); it != activeStatementPools.end() && it->second->readSnapshot)
         pool = it->second;
-    const auto key = nlohmann::json({formatUuid(parseUuid(start)), kinds, includeRetired, adjacentFilter ? nlohmann::json(*adjacentFilter) : nlohmann::json(nullptr)}).dump();
-    if (pool) if (auto it = pool->components.find(key); it != pool->components.end()) return it->second;
-    auto ids = traverse(db, start, INT_MAX, kinds, nullptr, includeRetired, adjacentFilter);
-    // Bound the transaction-local membership cache; never reuse across snapshots.
-    if (pool && ids.size() <= 262144) {
+    const auto startId = pool ? objectIdByUuid(db, parseUuid(start)) : std::nullopt;
+    const auto prefix = nlohmann::json({kinds, includeRetired, adjacentFilter ? nlohmann::json(*adjacentFilter) : nlohmann::json(nullptr)}).dump() + "/";
+    if (startId) if (auto it = pool->components.find(prefix + std::to_string(*startId)); it != pool->components.end()) return *it->second;
+    // Cancellation only stops a walk; a completed one is the same component.
+    auto ids = traverse(db, start, INT_MAX, kinds, cancel, includeRetired, adjacentFilter);
+    // Bound the transaction-local membership cache; never reuse across
+    // snapshots. Every member has the same component (the walk is undirected,
+    // and without retired records an edge is only followed between active
+    // endpoints), so it is filed under each of them: a component is walked once
+    // however many of its members are asked for.
+    if (startId && ids.size() <= 262144) {
         if (pool->componentNodes + ids.size() > 262144) { pool->components.clear(); pool->componentNodes = 0; }
         pool->componentNodes += ids.size();
-        pool->components.emplace(key, ids);
+        const auto shared = std::make_shared<const std::vector<int64_t>>(ids);
+        for (const auto id : ids) pool->components.emplace(prefix + std::to_string(id), shared);
     }
     return ids;
 }
@@ -159,9 +167,9 @@ std::vector<std::string> ObjectStore::componentOf(const Txn& txn, const std::str
 {
     auto* db = static_cast<sqlite3*>(connection(txn));
     if (applicableOnly) requirePublishedGraphRead(txn);
-    return uuidList(db, (cancel || applicableOnly) ? traverse(db, objectUuid, INT_MAX, edgeKindFilter, cancel, includeRetired,
-                                                           adjacentFilter, applicableOnly ? this : nullptr, &txn)
-                              : componentIds(db, objectUuid, edgeKindFilter, includeRetired, adjacentFilter));
+    return uuidList(db, applicableOnly ? traverse(db, objectUuid, INT_MAX, edgeKindFilter, cancel, includeRetired,
+                                                  adjacentFilter, this, &txn)
+                                       : componentIds(db, objectUuid, edgeKindFilter, includeRetired, adjacentFilter, cancel));
 }
 
 std::vector<std::string> ObjectStore::reachableWithin(const Txn& txn, const std::string& objectUuid, int maxDepth,

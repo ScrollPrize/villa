@@ -49,7 +49,7 @@ public:
                                                        int64_t row, int64_t column, int64_t rows,
                                                        int64_t columns) const = 0;
     // Per-point annotations of a sequence array (ObjectStore::geometryPointAnnotations).
-    virtual std::string geometryPointAnnotations(const std::string& revisionUuid, const std::string& arrayName) const = 0;
+    virtual nlohmann::json geometryPointAnnotations(const std::string& revisionUuid, const std::string& arrayName) const = 0;
     virtual VolumeTransforms volumeTransforms() const = 0;
     // Complete listings (every page when the selection has no limit), with
     // the projections of ObjectStore::selectObjects/selectEdges.
@@ -141,7 +141,7 @@ public:
     std::vector<uint8_t> readGeometryRectangle(const std::string& revisionUuid, const std::string& arrayName,
                                                int64_t row, int64_t column, int64_t rows,
                                                int64_t columns) const override;
-    std::string geometryPointAnnotations(const std::string& revisionUuid, const std::string& arrayName) const override;
+    nlohmann::json geometryPointAnnotations(const std::string& revisionUuid, const std::string& arrayName) const override;
     VolumeTransforms volumeTransforms() const override;
     std::vector<ObjectRecord> selectObjects(
         const ObjectSelection&, const std::optional<std::vector<std::string>>& fields = std::nullopt) const override;

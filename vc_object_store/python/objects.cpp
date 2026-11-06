@@ -935,7 +935,7 @@ NB_MODULE(_native, m)
             },
             nb::arg("after_seq") = 0)
         .def("geometry_point_annotations", [](PyObjectStore& self,const std::string& revision,const std::string& array) {
-            return jsonLoads(self.withRead([&](vo::ObjectStore& db,vo::ReadTxn& txn) { return db.geometryPointAnnotations(txn,revision,array); }));
+            return jsonLoads(self.withRead([&](vo::ObjectStore& db,vo::ReadTxn& txn) { return db.geometryPointAnnotations(txn,revision,array).dump(); }));
         },nb::arg("revision_uuid"),nb::arg("array_name"))
         .def("current_geometry", readMethod<&vo::ObjectStore::currentGeometry>(),
              nb::arg("object_uuid"))

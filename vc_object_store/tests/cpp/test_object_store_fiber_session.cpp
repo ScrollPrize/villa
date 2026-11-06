@@ -98,8 +98,8 @@ int main() try
         const auto original = *store.objectByUuid(txn, a);
         ObjectRecord record; record.uuid = source; record.kind = "fiber";
         record.name = original.name; record.fiber = original.fiber;
-        record.meta = Json{{"source", {{"control_points_attributes", Json::parse(store.geometryPointAnnotations(
-            txn, store.currentGeometry(txn, a)->uuid, "control_points"))}}}}.dump();
+        record.meta = Json{{"source", {{"control_points_attributes", store.geometryPointAnnotations(
+            txn, store.currentGeometry(txn, a)->uuid, "control_points")}}}}.dump();
         store.upsertObject(txn, record);
         store.putGeometry(txn, source, vc::geometry::encode(geometry));
     });
@@ -130,7 +130,7 @@ int main() try
         require(store.objectByUuid(txn, source)->retired, "atomic source retirement");
         for (const auto& uuid : {left,right}) mergeHeads[uuid] = store.currentVersion(txn, uuid);
         leftGeometry = store.currentGeometry(txn, left)->uuid; rightGeometry = store.currentGeometry(txn, right)->uuid;
-        require(Json::parse(store.geometryPointAnnotations(txn, rightGeometry, "control_points"))[0]["label"] == "c", "split annotations");
+        require(store.geometryPointAnnotations(txn, rightGeometry, "control_points")[0]["label"] == "c", "split annotations");
     });
     storeAct(db, mergeHeads, [&](auto& store, auto& txn) {
         GeometrySequenceEdit sequence; sequence.array = "control_points"; sequence.start = 2;

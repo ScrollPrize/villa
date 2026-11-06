@@ -7,6 +7,7 @@
 #include "vc_object_store/objects/Geometry.hpp"
 #include "vc_object_store/objects/GeometryRegion.hpp"
 #include "vc_object_store/objects/Transactions.hpp"
+#include <nlohmann/json_fwd.hpp>
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -583,8 +584,9 @@ public:
     std::string resizeSurface(WriteTxn&, const std::string& objectUuid,
         const GeometrySurfaceResize&, const std::string& expectedRevision,
         const std::vector<GeometryEdgeEdit>& edgeEdits = {});
-    // Aligned annotations for a geometry revision, derived from stable IDs.
-    std::string geometryPointAnnotations(const Txn&, const std::string& revisionUuid,
+    // Aligned annotations for a geometry revision, derived from stable IDs: a
+    // JSON array with one value per point.
+    nlohmann::json geometryPointAnnotations(const Txn&, const std::string& revisionUuid,
         const std::string& arrayName) const;
 
     // Dense row-major rectangle from any aligned surface array. Exact

@@ -15,7 +15,7 @@ Json nativeMetadata(ObjectStore& db, const Txn& txn, const ObjectRecord& object,
     if (structure.manifest().contains("sequences"))
         for (const auto& [name,state]:structure.manifest().at("sequences").items())
             result[object.kind=="point_collection" ? "point_attributes" : name+"_attributes"] =
-                Json::parse(db.geometryPointAnnotations(txn,revision.uuid,name));
+                db.geometryPointAnnotations(txn,revision.uuid,name);
     result["name"] = object.name;
     if (object.kind == "point_collection" && metadata.contains("source") && result.contains("tags") && result.at("tags").is_object()) {
         auto tags = Json::object();

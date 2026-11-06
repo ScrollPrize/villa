@@ -261,7 +261,7 @@ std::vector<uint8_t> LocalStoreReader::readGeometryRectangle(const std::string& 
     return store_->readGeometryRectangle(*txn_, revisionUuid, arrayName, row, column, rows, columns);
 }
 
-std::string LocalStoreReader::geometryPointAnnotations(const std::string& revisionUuid, const std::string& arrayName) const
+nlohmann::json LocalStoreReader::geometryPointAnnotations(const std::string& revisionUuid, const std::string& arrayName) const
 {
     return store_->geometryPointAnnotations(*txn_, revisionUuid, arrayName);
 }

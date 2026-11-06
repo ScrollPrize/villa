@@ -44,7 +44,9 @@ struct StatementPool {
     std::optional<std::string> actingAuthor, requestUuid, requestDigest;
     std::string commitAuthor, commitHost;
     std::optional<int64_t> publishedSequence; // set by publishHistory
-    std::map<std::string, std::vector<int64_t>> components;
+    // Components read in this snapshot, filed under every member's id (one
+    // shared list per component; see detail::componentIds).
+    std::unordered_map<std::string, std::shared_ptr<const std::vector<int64_t>>> components;
     size_t componentNodes = 0;
     std::shared_ptr<detail::GeometryReadCache> geometryCache;
     std::shared_ptr<detail::SpatialReadCache> spatialCache;

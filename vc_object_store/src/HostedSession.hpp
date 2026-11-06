@@ -14,6 +14,7 @@
 #include "vc_object_store/objects/StoreReader.hpp"
 
 #include <vc_reader/native/lru.hpp>
+#include <nlohmann/json.hpp>
 
 #include <condition_variable>
 #include <functional>
@@ -53,7 +54,7 @@ public:
     std::vector<std::optional<ObjectRevision>> objectsAtVersions(const std::vector<ObjectVersion>&);
     std::optional<GeometryRevision> geometryRevision(const std::string& revisionUuid);
     std::shared_ptr<const std::vector<uint8_t>> geometryArray(const std::string& revisionUuid, const std::string& array);
-    std::string geometryPointAnnotations(const std::string& revisionUuid, const std::string& array);
+    std::shared_ptr<const nlohmann::json> geometryPointAnnotations(const std::string& revisionUuid, const std::string& array);
     VolumeTransforms volumeTransforms();
     // The UUIDs among `uuids` that the store holds (retired included).
     std::set<std::string> holds(const std::set<std::string>& uuids);
@@ -76,6 +77,7 @@ private:
         std::optional<ObjectRevision> revision;
         std::optional<GeometryRevision> geometry;
         std::shared_ptr<const std::vector<uint8_t>> bytes;
+        std::shared_ptr<const nlohmann::json> json;
     };
     mutable std::mutex cacheMutex_;
     vcr::Lru<Entry> cache_;
@@ -138,9 +140,9 @@ public:
     {
         return attachment_->selectEdges(selection, fields);
     }
-    std::string geometryPointAnnotations(const std::string& revisionUuid, const std::string& arrayName) const override
+    nlohmann::json geometryPointAnnotations(const std::string& revisionUuid, const std::string& arrayName) const override
     {
-        return attachment_->geometryPointAnnotations(revisionUuid, arrayName);
+        return *attachment_->geometryPointAnnotations(revisionUuid, arrayName);
     }
     std::vector<std::string> componentOf(const std::string& objectUuid, const std::vector<std::string>& edgeKinds = {},
                                          const std::atomic_bool* = nullptr) const override

@@ -43,7 +43,7 @@ AttachedCollection readCollection(const StoreReader& reader, const ObjectRecord&
         const auto shown = GeometrySnapshot(reader).viewTransformedAt(object.uuid, frame->volume, frame->scale);
         collection.points.points = shown.points("points", 0, int64_t(collection.points.points.size()));
     }
-    collection.annotations = nlohmann::json::parse(reader.geometryPointAnnotations(head, "points"));
+    collection.annotations = reader.geometryPointAnnotations(head, "points");
     collection.source = nlohmann::json::parse(object.meta).value("source", nlohmann::json::object());
     return collection;
 }
@@ -89,7 +89,7 @@ void writeCollection(const StoreReader& reader, TransactionRequest& request, con
         for (auto& [transform, version] : transformDependencies(reader)) request.readDependencies.emplace(transform, version);
     }
     const auto previous = std::get<geometry::PointCollection>(geometry::decode(reader.readGeometryData(head->uuid)));
-    const auto previousAnnotations = nlohmann::json::parse(reader.geometryPointAnnotations(head->uuid, "points"));
+    const auto previousAnnotations = reader.geometryPointAnnotations(head->uuid, "points");
     if (previous.ids == points.ids && previous.points == points.points && previousAnnotations == wanted.annotations) {
         // Only the record changed: its relationships still apply.
         EdgeSelection edges;
@@ -146,7 +146,7 @@ std::optional<nlohmann::json> attachedDocument(const StoreReader& reader, const 
         const auto source = nlohmann::json::parse(object->record.meta).value("source", nlohmann::json::object());
         auto document = source.value("document", nlohmann::json::object());
         document[source.value("list_key", std::string("records"))] =
-            nlohmann::json::parse(reader.geometryPointAnnotations(*object->geometryRevision, "points"));
+            reader.geometryPointAnnotations(*object->geometryRevision, "points");
         return document;
     }
     return std::nullopt;

@@ -268,20 +268,21 @@ std::shared_ptr<const std::vector<uint8_t>> HostedAttachment::geometryArray(cons
     return bytes;
 }
 
-std::string HostedAttachment::geometryPointAnnotations(const std::string& revisionUuid, const std::string& array)
+std::shared_ptr<const nlohmann::json> HostedAttachment::geometryPointAnnotations(const std::string& revisionUuid,
+                                                                                  const std::string& array)
 {
-    // Immutable per geometry revision, cached as the JSON text's bytes.
+    // Immutable per geometry revision, cached parsed.
     const auto key = "annotations/" + revisionUuid + "/" + array;
     {
         std::lock_guard lock(cacheMutex_);
-        if (const auto* entry = cache_.get(key); entry && entry->bytes)
-            return std::string(entry->bytes->begin(), entry->bytes->end());
+        if (const auto* entry = cache_.get(key); entry && entry->json) return entry->json;
     }
-    auto text = client_.geometryPointAnnotations(revisionUuid, array);
-    auto bytes = std::make_shared<const std::vector<uint8_t>>(text.begin(), text.end());
+    auto json = std::make_shared<const nlohmann::json>(client_.geometryPointAnnotations(revisionUuid, array));
+    // Cost: an estimate per annotated point (the parsed form is not measured).
+    const auto cost = 1024 + 512 * json->size();
     std::lock_guard lock(cacheMutex_);
-    cache_.put(key, Entry{std::nullopt, std::nullopt, bytes}, bytes->size() + 128);
-    return text;
+    cache_.put(key, Entry{std::nullopt, std::nullopt, nullptr, json}, cost);
+    return json;
 }
 
 VolumeTransforms HostedAttachment::volumeTransforms()

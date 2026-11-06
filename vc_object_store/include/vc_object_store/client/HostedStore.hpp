@@ -112,8 +112,8 @@ public:
     // coordinate selections. Restarts (then StoreBusy) like selectAllObjects,
     // and when a transform changed while they were read.
     SelectionRecord recordSelection(const ObjectSelection&, int64_t pageSize = 1000, int maxRestarts = 3);
-    // ObjectStore::geometryPointAnnotations: exact JSON text.
-    std::string geometryPointAnnotations(const std::string& revisionUuid, const std::string& arrayName);
+    // ObjectStore::geometryPointAnnotations.
+    nlohmann::json geometryPointAnnotations(const std::string& revisionUuid, const std::string& arrayName);
     // ObjectStore::componentOf / neighbours on the host (GraphQuery).
     std::vector<std::string> traverse(const GraphQuery&, StoreStatus* asOf = nullptr);
     int64_t objectCount(const std::string& kind, bool includeRetired = false, StoreStatus* asOf = nullptr);

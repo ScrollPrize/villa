@@ -257,7 +257,7 @@ int main() try
         const auto copied = session.copyObject(catalog, replacement, original);
         require(copied != original, "copies get new UUIDs");
         GeometryData source, target;
-        std::string sourceAnnotations, targetAnnotations;
+        nlohmann::json sourceAnnotations, targetAnnotations;
         session.readStore(catalog, [&](const StoreReader& reader, const auto&) {
             const auto revision = reader.currentGeometry(original)->uuid;
             source = reader.readGeometryData(revision);

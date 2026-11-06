@@ -507,7 +507,7 @@ struct ServerState {
         auto txn = store->read();
         const auto revision = uuidSegment(revisionUuid);
         if (!store->geometryRevision(txn, revision)) return errorReply(http::status::not_found, "no geometry revision " + revisionUuid);
-        auto text = store->geometryPointAnnotations(txn, revision, array);
+        auto text = store->geometryPointAnnotations(txn, revision, array).dump();
         if (int64_t(text.size()) > options.maxResponseBytes)
             return errorReply(http::status::payload_too_large, "point annotations exceed the response limit");
         return jsonReply(std::move(text));

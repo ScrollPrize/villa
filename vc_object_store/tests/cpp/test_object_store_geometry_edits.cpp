@@ -72,7 +72,7 @@ int main() try {
                 require(db.readGeometryArray(txn,editedGeometry,desired.name) == desired.bytes,"generic edit preserves exact bytes");
             for (const auto& original : first.arrays)
                 require(db.readGeometryArray(txn,initialGeometry,original.name) == original.bytes,"historical arrays are immutable");
-            if (annotated) require(Json::parse(db.geometryPointAnnotations(txn,editedGeometry,array)) ==
+            if (annotated) require(db.geometryPointAnnotations(txn,editedGeometry,array) ==
                 Json::array({Json{{"note","second"}},Json::object(),Json{{"note","first"}}}),"annotations follow stable IDs through splice");
             // Typed views over the read's own transaction, at a pinned or the current revision.
             GeometrySnapshot inSession(db, txn);
@@ -206,9 +206,9 @@ int main() try {
     storeAct(store, pins, [&](auto& db, auto& txn) {
         const auto head = updateGeometryArrays(db, txn, uuid, vc::geometry::encode(reverse), initial,
             {{"control_points", R"([{"segment_to_next":{"direction":[-1,0,0]}},{}])"}});
-        require(Json::parse(db.geometryPointAnnotations(txn, head, "control_points"))[0]["segment_to_next"]["direction"][0] == -1,
+        require(db.geometryPointAnnotations(txn, head, "control_points")[0]["segment_to_next"]["direction"][0] == -1,
             "explicit directional transform is preserved");
-        require(Json::parse(db.geometryPointAnnotations(txn, initial, "control_points"))[0]["segment_to_next"]["direction"][0] == 1,
+        require(db.geometryPointAnnotations(txn, initial, "control_points")[0]["segment_to_next"]["direction"][0] == 1,
             "initial annotations remain immutable");
     });
     {
@@ -334,7 +334,7 @@ int main() try {
         }
         {
             auto read = store.read();
-            require(Json::parse(store.geometryPointAnnotations(read, second, "points")) ==
+            require(store.geometryPointAnnotations(read, second, "points") ==
                     Json::array({label, Json{{"label", "C"}}, Json{{"label", "B"}}}), "annotations follow their points");
             require(scalarsFromBytes<int64_t>(store.readGeometryArray(read, second, "point_ids")) == std::vector<int64_t>{10, 30, 20},
                     "stable IDs in sequence order");

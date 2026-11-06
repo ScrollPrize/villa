@@ -363,7 +363,7 @@ try {
             const auto head = edits.currentGeometry(txn, collection);
             const auto stored = std::get<vc::geometry::PointCollection>(vc::geometry::decode(edits.readGeometryData(txn, head->uuid)));
             require(stored.ids == points.ids && stored.points == points.points &&
-                    nlohmann::json::parse(edits.geometryPointAnnotations(txn, head->uuid, "points")) ==
+                    edits.geometryPointAnnotations(txn, head->uuid, "points") ==
                         nlohmann::json::parse(R"([{"n":5},{"n":6}])"), "arrays and annotations updated");
             require(retained.objects.at(collection) == 3 && !edits.edgeGeometryState(txn, anchored).stale, "relationship retained");
             relationshipVersion = *edits.currentRelationshipVersion(txn, anchored);
@@ -374,7 +374,7 @@ try {
         {
             auto txn = edits.read();
             require(edits.currentRelationshipVersion(txn, anchored) == relationshipVersion, "relationship kept as recorded");
-            require(nlohmann::json::parse(edits.geometryPointAnnotations(txn, edits.currentGeometry(txn, collection)->uuid, "points")) ==
+            require(edits.geometryPointAnnotations(txn, edits.currentGeometry(txn, collection)->uuid, "points") ==
                         nlohmann::json::parse(R"([{"n":5},{"n":6}])"), "annotations follow stable IDs");
         }
     }

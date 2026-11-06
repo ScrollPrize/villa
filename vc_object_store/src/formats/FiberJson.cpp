@@ -187,7 +187,7 @@ Json fiberMetadata(const StoreReader& reader, const ObjectRecord& record, const 
 {
     auto source = geometryTransferMetadata(Json::parse(record.meta));
     for (const auto* name : {"control_points", "line_points"}) {
-        const auto attrs = Json::parse(reader.geometryPointAnnotations(geometry.uuid, name));
+        const auto attrs = reader.geometryPointAnnotations(geometry.uuid, name);
         const auto key = std::string(name) + "_attributes";
         if (std::any_of(attrs.begin(), attrs.end(), [](const auto& a) { return !a.is_null() && !a.empty(); })) source[key] = attrs;
         else source.erase(key);
