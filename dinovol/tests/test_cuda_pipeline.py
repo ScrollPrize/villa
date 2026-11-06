@@ -103,9 +103,7 @@ class CudaPipelineTests(unittest.TestCase):
 
     def test_intensity_preserves_labels(self):
         processor = CudaBatchProcessor({})
-        operations = [A.RicianNoise(std=2), *processor.scanner((16,) * 3), *processor.intensity((16,) * 3),
-                      A.FDA(reference='style', blend=.2, fraction=.1, on='image'),
-                      A.PixelDistributionAdaptation(reference='style', blend=.2, on='image')]
+        operations = [A.RicianNoise(std=2), *processor.scanner((16,) * 3), *processor.intensity((16,) * 3)]
         # Exercise every intensity effect, rather than relying on random selection.
         operations = [getattr(A, op._constructor.__name__)(*op._args, **{**op._kwargs, 'p': 1}) for op in operations]
         geometry = (('transpose', 'xyz'), ('flip', 'zy'))
@@ -113,14 +111,26 @@ class CudaPipelineTests(unittest.TestCase):
         labels = torch.randint(4, image.shape, device='cuda', dtype=torch.int32)
         original = labels.clone()
         pipeline = A.Pipeline([*operations, *spatial_transforms(geometry)], targets={
-            'image': A.Image(valid=None), 'mask': A.Label(), 'style': A.ScalarField()}, backend='cuda')
-        result = pipeline.batch({'image': image, 'mask': labels, 'style': image.flip(0)}, seeds=[7, 9])
+            'image': A.Image(valid=None), 'mask': A.Label()}, backend='cuda')
+        result = pipeline.batch({'image': image, 'mask': labels}, seeds=[7, 9])
         expected = labels.permute(0, 1, 4, 3, 2).flip((2, 3))
         torch.testing.assert_close(result['mask'], expected, rtol=0, atol=0)
         torch.testing.assert_close(labels, original, rtol=0, atol=0)
         self.assertEqual(result['mask'].dtype, labels.dtype)
         self.assertTrue(result['image'].is_cuda)
         self.assertTrue(torch.isfinite(result['image']).all())
+
+    def test_full_augmentation_independent_of_batch_composition(self):
+        processor = CudaBatchProcessor({})  # full is the default recipe
+        views = [CropView(torch.randint(256, (19,) * 3, dtype=torch.uint8), (16,) * 3,
+                          seed=seed, augment=True) for seed in range(32)]
+        together = processor(views)
+        chunked = torch.cat([processor(views[start:start + 4]) for start in range(0, len(views), 4)])
+        alone = torch.cat([processor([view]) for view in views])
+        order = torch.randperm(len(views))
+        reordered = processor([views[index] for index in order.tolist()])
+        for actual in (chunked, alone, reordered[order.argsort()]):
+            torch.testing.assert_close(actual, together, rtol=1e-5, atol=2e-6)
 
     def test_paired_views_and_local_batching(self):
         for recipe in ('full', 'dino'):

@@ -732,19 +732,18 @@ training quality should guide subsequent tuning.
 | --- | --- |
 | 25% | contrast, gamma |
 | 15% | bias field, brightness gradient, local contrast, local gamma, brightness add, invert, slice illumination |
-| 10% | CLAHE, low resolution, plasma brightness/contrast, Rician noise, sharpen, unsharp mask, vignetting, smear, FDA, pixel distribution adaptation |
+| 10% | CLAHE, low resolution, plasma brightness/contrast, Rician noise, sharpen, unsharp mask, vignetting, smear |
 | 8% | Gaussian blur, Gibbs ringing |
 | 5% | defocus, median filter |
 
 Rician noise uses a standard deviation of 1–4 raw uint8 intensity levels before
 normalization; magnitude noise requires nonnegative source intensities. Smear
 and slice illumination run before orientation changes, so artifacts follow scan
-axes. Gaussian blur uses sigma 0.3–0.8 voxels. FDA mixes 10–30% of the low-frequency
-amplitude from another crop in the same resolution group (frequency fraction
-0.05). Pixel distribution adaptation blends 10–30% toward the reference crop’s
-mean and standard deviation. Both reference crops and their statistics remain
-on CUDA. These effects are skipped when there is no other independently seeded
-view available in that group.
+axes. Gaussian blur uses sigma 0.3–0.8 voxels. The full recipe has no FDA or pixel
+distribution adaptation: each crop's augmentation depends on its own image and
+seed, independent of its batch companions. This also applies to existing DINO
+recipes using `augmentation: "full"`; continuing an older run uses the revised
+augmentation distribution.
 
 Only geometry applies to supervision: label IDs and values are unchanged;
 point coordinates, object points and token correspondences follow their image's

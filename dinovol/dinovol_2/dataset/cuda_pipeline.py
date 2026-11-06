@@ -201,29 +201,6 @@ class CudaBatchProcessor:
             A.Invert(p=.15),
         ]
 
-    def adapt_distribution(self, images, entries):
-        # Repeated seeds (paired student/Gram views) use the same reference crop.
-        first = {}
-        for index, entry in enumerate(entries):
-            first.setdefault(entry[2].seed, index)
-        seeds = sorted(first)
-        if len(seeds) < 2:
-            return images
-        references = []
-        for entry in entries:
-            choices = [seed for seed in seeds if seed != entry[2].seed]
-            other = random.Random(entry[2].seed ^ 0xFDA).choice(choices)
-            references.append(first[other])
-        indices = torch.tensor(references, device=self.device)
-        pipeline = self.pipeline(("reference_intensity",), lambda: [
-            A.FDA(reference="style", blend=(.1, .3), fraction=.05, p=.10, on="image"),
-            A.PixelDistributionAdaptation(reference="style", blend=(.1, .3), mode="standard",
-                                          p=.10, on="image")],
-            targets={"image": A.Image(valid=None), "style": A.ScalarField()})
-        return pipeline.batch(
-            {"image": images, "style": images.index_select(0, indices)},
-            seeds=[entry[2].seed + 2 for entry in entries], device=self.device)["image"]
-
     def __call__(self, samples):
         single = isinstance(samples[0], CropView)
         containers = [[view] for view in samples] if single else [
@@ -258,8 +235,6 @@ class CudaBatchProcessor:
         for (target, augment), entries in intensity_groups.items():
             images = torch.stack([e[3] for e in entries])
             if augment:
-                if self.config.get("augmentation", "full") == "full":
-                    images = self.adapt_distribution(images, entries)
                 pipeline = self.pipeline(("intensity", target), lambda: self.intensity(target))
                 images = self.batch(pipeline, images, entries, offset=1)
             for (views, index, _, _), image in zip(entries, images):

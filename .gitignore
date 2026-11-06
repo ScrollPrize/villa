@@ -92,3 +92,6 @@ dinovol/cufile.log
 /dinovol/outputs
 /dinovol/perf_results
 /volume-cartographer/benchmarks/saved
+/vc_reader/build-native-cuda
+/volume-cartographer/benchmarks/cache
+/volume-cartographer/benchmarks/out
