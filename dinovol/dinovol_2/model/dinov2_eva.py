@@ -631,7 +631,9 @@ class Eva(nn.Module):
         if drop_path_uniform is True:
             dpr = [drop_path_rate] * depth
         else:
-            dpr = [x.item() for x in torch.linspace(0, drop_path_rate, depth)]  # stochastic depth decay rule
+            # Linear ramp from 0 at the first block to drop_path_rate at the last (host values,
+            # also when constructing under a meta/CUDA default device).
+            dpr = [x.item() for x in torch.linspace(0, drop_path_rate, depth, device="cpu")]
 
         block_fn = EvaBlock
         self.blocks = nn.ModuleList([
@@ -866,11 +868,16 @@ class Eva(nn.Module):
         skips.extend(torch.cat(level, dim=0) for level in zip(*(levels for _, levels in outputs)))
         return torch.cat([tokens for tokens, _ in outputs], dim=0)
 
-    def prepare_tokens_with_masks(self, x, masks=None, *, view_kind: str = "global", skips=None):
-        """skips: optional list that receives the CNN embedding's intermediate stage outputs."""
+    def prepare_tokens_with_masks(self, x, masks=None, *, view_kind: str = "global", skips=None, embedding=None,
+                                  mask_voxels: bool = True):
+        """skips: optional list that receives the CNN embedding's intermediate stage outputs.
+        embedding: optional list that receives the patch-embedding tokens [B, N, D] before
+        mask tokens, prefixes and position encoding (layer zero).
+        mask_voxels=False: the masked token cells were already hidden in the input (JEM masks
+        them with vc_reader); only the learned mask tokens are inserted here."""
         spatial = tuple(x.shape[2:])
         self._assert_patch_aligned(spatial, tuple(self.patch_size), context="input shape")
-        if masks is not None:
+        if masks is not None and mask_voxels:
             x = self._mask_input_voxels(x, masks)
         batch_chunk_size = self.deeper_embed_batch_chunk_size
         if skips is not None:
@@ -886,6 +893,8 @@ class Eva(nn.Module):
         else:
             x = rearrange(x, 'b c d h w -> b (d h w) c').contiguous()
 
+        if embedding is not None:
+            embedding.append(x)
         if masks is not None:
             # Keep an explicit learned marker after hiding the underlying voxels.
             x = torch.where(masks.unsqueeze(-1), self.mask_token.to(x.dtype), x)
@@ -942,19 +951,62 @@ class Eva(nn.Module):
             "masks": masks,
         }
 
-    def forward_features(self, x, masks=None, *, view_kind: str = "global", point_coordinates=None):
+    def _validate_taps(self, taps):
+        """Tap depths are one-based block counts; 0 is the patch embedding (layer zero)."""
+        taps = tuple(sorted({int(depth) for depth in taps or ()}))
+        depth = self.depth_in_blocks
+        if any(tap < 0 or tap > depth for tap in taps):
+            raise ValueError(f"tap depths must lie in [0, {depth}], got {taps}")
+        return taps
+
+    @property
+    def depth_in_blocks(self) -> int:
+        return sum(len(blk) if isinstance(blk, nn.ModuleList) else 1 for blk in self.blocks)
+
+    def _run_block(self, block, x, rot_pos_embed, rope_shape, rope_coords):
+        if self.grad_checkpointing and not torch.jit.is_scripting():
+            return checkpoint(block, x, rope=rot_pos_embed, rope_shape=rope_shape, rope_coords=rope_coords,
+                              use_reentrant=False, **self._attention_checkpoint_kwargs())
+        return block(x, rope=rot_pos_embed, rope_shape=rope_shape, rope_coords=rope_coords)
+
+    def _run_blocks(self, x, rot_pos_embed, rope_shape, rope_coords, taps=(), tapped=None):
+        """Run every block; record raw patch tokens (prefixes removed) after each tapped depth.
+
+        A chunked block list advances several blocks per checkpoint, so taps must
+        fall on chunk boundaries there.
+        """
+        depth = 0
+        for block in self.blocks:
+            x = self._run_block(block, x, rot_pos_embed, rope_shape, rope_coords)
+            previous, depth = depth, depth + (len(block) if isinstance(block, nn.ModuleList) else 1)
+            if tapped is not None:
+                inside = [tap for tap in taps if previous < tap < depth]
+                if inside:
+                    raise ValueError(f"tap depths {inside} fall inside a block chunk ending at depth {depth}")
+                if depth in taps:
+                    tapped[depth] = x[:, self.num_prefix_tokens:]
+        return x
+
+    def forward_features(self, x, masks=None, *, view_kind: str = "global", point_coordinates=None, taps=None,
+                         mask_voxels: bool = True):
+        """taps: optional depths whose raw patch tokens are returned as features["taps"][depth]
+        (one-based block outputs; 0 is the patch embedding before prefixes and positions)."""
         skips = [] if self.return_embed_skips and view_kind == "global" else None
+        taps = self._validate_taps(taps) if taps is not None else ()
+        tapped = {} if taps else None
+        embedding = [] if 0 in taps else None
         input_shape = tuple(x.shape[2:])
-        x, rot_pos_embed, rope_shape = self.prepare_tokens_with_masks(x, masks, view_kind=view_kind, skips=skips)
+        x, rot_pos_embed, rope_shape = self.prepare_tokens_with_masks(
+            x, masks, view_kind=view_kind, skips=skips, embedding=embedding, mask_voxels=mask_voxels)
+        if embedding:
+            tapped[0] = embedding[0]
         skips, skip_points = self._sample_embed_skips(skips, point_coordinates, input_shape)
         rope_coords = self._get_shared_per_block_rope_coords(rope_shape)
-        for blk in self.blocks:
-            if self.grad_checkpointing and not torch.jit.is_scripting():
-                x = checkpoint(blk, x, rope=rot_pos_embed, rope_shape=rope_shape, rope_coords=rope_coords,
-                               use_reentrant=False, **self._attention_checkpoint_kwargs())
-            else:
-                x = blk(x, rope=rot_pos_embed, rope_shape=rope_shape, rope_coords=rope_coords)
-        return self._with_skips(self._format_features(x, masks, view_kind=view_kind), skips, skip_points)
+        x = self._run_blocks(x, rot_pos_embed, rope_shape, rope_coords, taps, tapped)
+        features = self._with_skips(self._format_features(x, masks, view_kind=view_kind), skips, skip_points)
+        if tapped is not None:
+            features["taps"] = tapped
+        return features
 
     def _attention_checkpoint_kwargs(self):
         return {"context_fn": _save_attention_context} if self.checkpoint_save_attention else {}
@@ -1171,30 +1223,6 @@ class EvaWithChunking(Eva):
             block_chunk = BlockChunk(self.blocks[i: i + chunksize])
             chunks.append(block_chunk)
         self.blocks = nn.ModuleList(chunks)
-
-    def forward_features(self, x, masks=None, *, view_kind: str = "global", point_coordinates=None):
-        skips = [] if self.return_embed_skips and view_kind == "global" else None
-        input_shape = tuple(x.shape[2:])
-        x, rot_pos_embed, rope_shape = self.prepare_tokens_with_masks(x, masks, view_kind=view_kind, skips=skips)
-        skips, skip_points = self._sample_embed_skips(skips, point_coordinates, input_shape)
-        rope_coords = self._get_shared_per_block_rope_coords(rope_shape)
-
-        if self.chunked_blocks:
-            for chunk in self.blocks:
-                if self.grad_checkpointing and not torch.jit.is_scripting():
-                    x = checkpoint(chunk, x, rope=rot_pos_embed, rope_shape=rope_shape, rope_coords=rope_coords,
-                                   use_reentrant=False, **self._attention_checkpoint_kwargs())
-                else:
-                    x = chunk(x, rope=rot_pos_embed, rope_shape=rope_shape, rope_coords=rope_coords)
-        else:
-            for blk in self.blocks:
-                if self.grad_checkpointing and not torch.jit.is_scripting():
-                    x = checkpoint(blk, x, rope=rot_pos_embed, rope_shape=rope_shape, rope_coords=rope_coords,
-                                   use_reentrant=False, **self._attention_checkpoint_kwargs())
-                else:
-                    x = blk(x, rope=rot_pos_embed, rope_shape=rope_shape, rope_coords=rope_coords)
-
-        return self._with_skips(self._format_features(x, masks, view_kind=view_kind), skips, skip_points)
 
     def forward(self, x, masks=None, is_training=True, *, view_kind: str = "global", point_coordinates=None):
         return self.forward_features_list(x, masks, view_kind=view_kind, point_coordinates=point_coordinates)
