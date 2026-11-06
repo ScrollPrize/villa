@@ -1525,7 +1525,7 @@ def infer_folder(
     *,
     device: torch.device,
 ) -> None:
-    """Run sorted folder segments, skipping any previously dated prediction."""
+    """Run sorted folder segments, skipping matching full-image or ROI outputs."""
 
     folder = Path(args.folder)
     if not folder.is_dir():
@@ -1553,13 +1553,28 @@ def infer_folder(
             LOGGER.warning("Skipping %s: %s", segment_dir, exc)
             skipped_count += 1
             continue
+        roi_suffix = ""
+        roi_values = getattr(args, "roi", None)
+        if roi_values is not None:
+            root = open_volume_root(input_zarr)
+            resolution = "0" if hasattr(root, "shape") else str(args.resolution)
+            volume = select_volume_level(root, resolution, source=str(input_zarr))
+            _, _, height, width, _, _ = _volume_axes(volume)
+            r0, r1, c0, c1 = resolve_roi_bounds(
+                roi_values, height=height, width=width
+            )
+            roi_suffix = f"_roi_r{r0}-{r1}_c{c0}-{c1}"
         for direction in resolve_run_directions(args.direction):
             name_prefix = (
-                f"{prefix}{segment_dir.name}_{checkpoint_stem}_{direction}_"
+                f"{prefix}{segment_dir.name}_{checkpoint_stem}{roi_suffix}_{direction}_"
             )
             prediction_dir = segment_dir / "preds"
             existing = (
-                next(prediction_dir.glob(f"{name_prefix}*.tif"), None)
+                next((
+                    path for path in prediction_dir.glob(f"{name_prefix}*.tif")
+                    if roi_values is not None
+                    or not path.with_suffix(path.suffix + ".roi.json").exists()
+                ), None)
                 if prediction_dir.exists()
                 else None
             )
@@ -1572,12 +1587,20 @@ def infer_folder(
                 )
                 skipped_count += 1
                 continue
+            output_tiff = prediction_dir / f"{name_prefix}{date}.tif"
+            full_index = 0
+            # Older ROI outputs used this full-image name; keep their image/frame.
+            while roi_values is None and output_tiff.with_suffix(
+                output_tiff.suffix + ".roi.json"
+            ).exists():
+                full_index += 1
+                output_tiff = prediction_dir / f"{name_prefix}full{full_index}_{date}.tif"
             infer_single_zarr(
                 args=args,
                 input_zarr=input_zarr,
                 configured_model=configured_model,
                 device=device,
-                output_tiff=prediction_dir / f"{name_prefix}{date}.tif",
+                output_tiff=output_tiff,
                 layer_direction=direction,
             )
             ran_count += 1
