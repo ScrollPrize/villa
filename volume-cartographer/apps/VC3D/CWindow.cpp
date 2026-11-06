@@ -29,6 +29,7 @@
 #include "OpenDataNormalGrids.hpp"
 #include "viewer_controls/panels/ViewerCompositePanel.hpp"
 #include "viewer_controls/panels/ViewerInkDetectionPanel.hpp"
+#include "inklabels/InkLabelPanel.hpp"
 #include <QLoggingCategory>
 #include <QAction>
 #include <QVBoxLayout>
@@ -1049,6 +1050,11 @@ CWindow::CWindow(size_t cacheSizeGB) :
     _inkDetectionOverlay = std::make_unique<InkDetectionOverlayController>(_state, this);
     _viewerManager->setInkDetectionOverlay(_inkDetectionOverlay.get());
 
+    _inkLabelController = std::make_unique<InkLabelController>(_state, this);
+    _inkLabelController->bindViewerManager(_viewerManager.get());
+    connect(_inkLabelController.get(), &InkLabelController::statusMessageRequested,
+            this, &CWindow::onShowStatusMessage);
+
     _planeSlicingOverlay = std::make_unique<PlaneSlicingOverlayController>(_state, this);
     _planeSlicingOverlay->bindToViewerManager(_viewerManager.get());
     _planeSlicingOverlay->setRotationSetter([this](const std::string& planeName, float degrees) {
@@ -1635,6 +1641,7 @@ void CWindow::populateDockToggleMenu(QMenu* menu) const
     addDock(menu, ui.dockWidgetViewerControls);
     addDock(menu, ui.dockWidgetOverlay);
     addDock(menu, _inkDetectionDock);
+    addDock(menu, _inkLabelDock);
     addDock(menu, _transformsDock);
     addDock(menu, ui.dockWidgetComposite);
     addDock(menu, _lasagnaDock);
@@ -2694,6 +2701,9 @@ void CWindow::CreateWidgets(void)
     if (_inkDetectionOverlay) {
         _inkDetectionOverlay->setSurfaceCatalog(_surfaceCatalog.get());
     }
+    if (_inkLabelController) {
+        _inkLabelController->setSurfaceCatalog(_surfaceCatalog.get());
+    }
     auto updateSurfaceSource = [this]() {
         _surfaceCatalog->setSource(_state->storeFor("surface"), _state->currentVolume(),
                                    _state->annotationVolume().value_or(vc::project::AnnotationVolume{}));
@@ -3584,6 +3594,12 @@ void CWindow::CreateWidgets(void)
                            new ViewerInkDetectionPanel(_viewerManager.get(), _inkDetectionDock),
                            QStringLiteral("dockWidgetInkDetectionContent"));
 
+    _inkLabelDock = new QDockWidget(tr("Ink Labels"), this);
+    _inkLabelDock->setObjectName(QStringLiteral("dockWidgetInkLabels"));
+    attachScrollAreaToDock(_inkLabelDock,
+                           new InkLabelPanel(_inkLabelController.get(), _inkLabelDock),
+                           QStringLiteral("dockWidgetInkLabelsContent"));
+
     _transformsDock = new QDockWidget(tr("Transforms"), this);
     _transformsDock->setObjectName(QStringLiteral("dockWidgetTransforms"));
     auto* transformsPanel = new VolumeRegistrationsPanel(_state, _transformsDock);
@@ -3611,6 +3627,7 @@ void CWindow::CreateWidgets(void)
     _segmentWorkspaceWindow->addDockWidget(Qt::LeftDockWidgetArea, _transformsDock);
     _segmentWorkspaceWindow->splitDockWidget(ui.dockWidgetViewerControls, ui.dockWidgetOverlay, Qt::Vertical);
     _segmentWorkspaceWindow->splitDockWidget(ui.dockWidgetOverlay, _inkDetectionDock, Qt::Vertical);
+    _segmentWorkspaceWindow->tabifyDockWidget(_inkDetectionDock, _inkLabelDock);
     _segmentWorkspaceWindow->splitDockWidget(_inkDetectionDock, _transformsDock, Qt::Vertical);
 
     auto hideLegacyViewerDocks = [this]() {

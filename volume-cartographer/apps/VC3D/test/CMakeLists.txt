@@ -667,6 +667,16 @@ add_test(NAME spiral_service_protocol COMMAND test_spiral_service_protocol)
 vc_register_test_target(test_spiral_service_protocol)
 vc_register_ctest(spiral_service_protocol test_spiral_service_protocol)
 set_tests_properties(spiral_service_protocol PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
+add_executable(test_ink_label_layer test_ink_label_layer.cpp
+    ../inklabels/InkLabelLayer.cpp ../inklabels/InkLabelLayer.hpp
+    ../inklabels/InkLabelIO.cpp ../inklabels/InkLabelIO.hpp)
+set_target_properties(test_ink_label_layer PROPERTIES AUTOMOC ON AUTOUIC OFF AUTORCC OFF)
+target_include_directories(test_ink_label_layer PRIVATE ${PROJECT_SOURCE_DIR}/apps/VC3D)
+target_link_libraries(test_ink_label_layer PRIVATE vc_core opencv_core opencv_imgproc opencv_imgcodecs Qt6::Core Qt6::Test)
+add_test(NAME ink_label_layer COMMAND test_ink_label_layer)
+vc_register_test_target(test_ink_label_layer)
+vc_register_ctest(ink_label_layer test_ink_label_layer)
+
 add_executable(test_spiral_brush_patch test_spiral_brush_patch.cpp)
 set_target_properties(test_spiral_brush_patch PROPERTIES AUTOMOC ON AUTOUIC OFF AUTORCC OFF)
 target_include_directories(test_spiral_brush_patch PRIVATE ${PROJECT_SOURCE_DIR}/apps/VC3D)
@@ -697,6 +707,10 @@ if(TARGET VC3D)
         ENVIRONMENT "QT_QPA_PLATFORM=offscreen;VC3D_CONFIG_DIR=${CMAKE_CURRENT_BINARY_DIR}/viewer-regression-config"
         TIMEOUT 90)
     vc_register_ctest(viewer_regressions VC3D)
+    add_test(NAME ink_labels_vc3d COMMAND VC3D --test-ink-labels)
+    set_tests_properties(ink_labels_vc3d PROPERTIES
+        ENVIRONMENT "QT_QPA_PLATFORM=offscreen" TIMEOUT 90)
+    vc_register_ctest(ink_labels_vc3d VC3D)
 endif()
 
 add_executable(test_surface_catalog test_surface_catalog.cpp ../SurfaceCatalog.cpp ../SurfaceCatalog.hpp
