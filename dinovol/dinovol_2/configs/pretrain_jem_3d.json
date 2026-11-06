@@ -1,0 +1,461 @@
+{
+  "backbone": {
+    "attention_type": "full",
+    "attention_backend": "flash",
+    "global_crops_size": [
+      256,
+      256,
+      256
+    ],
+    "local_crops_size": [
+      144,
+      144,
+      144
+    ],
+    "embed_dim": 512,
+    "patch_size": [
+      8,
+      8,
+      8
+    ],
+    "embedding_type": "deeper",
+    "deeper_embed_use_stem": true,
+    "deeper_embed_stem_type": "residual",
+    "deeper_embed_stem_channels": 32,
+    "deeper_embed_stage_channels": [
+      32,
+      64,
+      128
+    ],
+    "deeper_embed_stage_strides": [
+      [
+        2,
+        2,
+        2
+      ],
+      [
+        2,
+        2,
+        2
+      ],
+      [
+        2,
+        2,
+        2
+      ]
+    ],
+    "deeper_embed_depth_per_level": [
+      1,
+      1,
+      1
+    ],
+    "deeper_embed_final_projection": true,
+    "deeper_embed_batch_chunk_size": 1,
+    "deeper_embed_channels_last": true,
+    "depth": 12,
+    "num_heads": 8,
+    "qkv_bias": false,
+    "qk_norm": true,
+    "swiglu_mlp": true,
+    "mlp_ratio": 2.0,
+    "scale_mlp": false,
+    "drop_path_rate": 0.1,
+    "drop_path_uniform": false,
+    "init_values": 1e-05,
+    "num_reg_tokens": 4,
+    "class_token": false,
+    "untie_cls_and_patch_norms": false,
+    "untie_global_and_local_cls_norm": false,
+    "use_rot_pos_emb": true,
+    "rope_type": "compass",
+    "grad_checkpointing": true,
+    "block_chunks": 0
+  },
+  "method": {
+    "name": "jem",
+    "global_batch_size": 48,
+    "source_chunk_size": 1,
+    "categories": 512,
+    "head_hidden_dim": 1024,
+    "head_bottleneck_dim": 256,
+    "structural_dim": 512,
+    "head_nlayers": 3,
+    "last_layer_type": "linear",
+    "alignment_depths": [
+      4,
+      8,
+      12
+    ],
+    "structural_depths": [
+      0,
+      4,
+      8
+    ],
+    "depth_weights": {
+      "4": 0.25,
+      "8": 0.25,
+      "12": 1.0
+    },
+    "teacher_temperature": 0.1,
+    "student_temperature": 0.1,
+    "entropy_rank_scope": "logical_batch",
+    "entropy_view_scope": "crop_type",
+    "structural_pair_weighting": "uniform",
+    "structural_backend": "contraction",
+    "momentum_teacher": 0.994,
+    "regularizer_warmup_steps": 12500,
+    "views": {
+      "source_size": 512,
+      "teacher_size": 256,
+      "global_size": 256,
+      "local_size": 144,
+      "locals_per_set": 4,
+      "min_overlap_fraction": 0.1,
+      "min_overlap_count": 2
+    },
+    "masking": {
+      "global": {
+        "mode": "multiblock",
+        "probability": 0.7,
+        "fraction": 0.55
+      },
+      "local": {
+        "mode": "random",
+        "probability": 0.7,
+        "fraction": 0.4
+      }
+    },
+    "batch_storage": "host",
+    "checkpoint_heads": true,
+    "checkpoint_losses": true
+  },
+  "optimizer": {
+    "lr_scaling": {
+      "base_lr": 0.0003,
+      "reference_batch": 64,
+      "rule": "sqrt"
+    },
+    "lr_schedule": "constant",
+    "warmup_steps": 50000,
+    "weight_decay": 0.04,
+    "weight_decay_end": 0.04,
+    "betas": [
+      0.9,
+      0.99
+    ],
+    "clip_grad": 3.0,
+    "layer_decay": 1.0,
+    "patch_embed_lr_mult": 1.0,
+    "fused_optimizer": true
+  },
+  "data": {
+    "batch_size": 48,
+    "num_workers": 16,
+    "prefetch_factor": 2,
+    "persistent_workers": true,
+    "dataset": {
+      "occupancy_level": 5,
+      "object_mask": {
+        "enabled": true,
+        "gap_um": 2000,
+        "z_trim_pct": 0.05
+      },
+      "augmentation": "full",
+      "normalization_scheme": "robust",
+      "s3_storage_options": {
+        "anon": true
+      },
+      "volume_cache_dir": "/mnt/raid_nvme/volume_cache",
+      "datasets": [
+        {
+          "sample_id": "PHerc0125",
+          "pixel_size_um": 9.362,
+          "scan_location": "ESRF Grenoble",
+          "volume_path": "s3://vesuvius-challenge-open-data/PHerc0125/volumes/20250821151825-9.362um-1.2m-113keV-masked.zarr/",
+          "volume_scale": 0
+        },
+        {
+          "sample_id": "PHerc0139",
+          "pixel_size_um": 9.596,
+          "scan_location": "ESRF Grenoble",
+          "volume_path": "s3://vesuvius-challenge-open-data/PHerc0139/volumes/20260102150214-2.399um-0.2m-78keV-masked.zarr/",
+          "volume_scale": 2
+        },
+        {
+          "sample_id": "PHerc0172",
+          "pixel_size_um": 7.91,
+          "scan_location": "DLS (Diamond Light Source)",
+          "volume_path": "s3://vesuvius-challenge-open-data/PHerc0172/volumes/20241024131839-7.910um-53keV-masked.zarr/",
+          "volume_scale": 0
+        },
+        {
+          "sample_id": "PHerc0175A",
+          "pixel_size_um": 8.64,
+          "scan_location": "ESRF Grenoble",
+          "volume_path": "s3://vesuvius-challenge-open-data/PHerc0175A/volumes/20250521115057-8.640um-1.2m-116keV-masked.zarr/",
+          "volume_scale": 0
+        },
+        {
+          "sample_id": "PHerc0175B",
+          "pixel_size_um": 8.64,
+          "scan_location": "ESRF Grenoble",
+          "volume_path": "s3://vesuvius-challenge-open-data/PHerc0175B/volumes/20250521125822-8.640um-1.2m-116keV-masked.zarr/",
+          "volume_scale": 0
+        },
+        {
+          "sample_id": "PHerc0191",
+          "pixel_size_um": 9.362,
+          "scan_location": "ESRF Grenoble",
+          "volume_path": "s3://vesuvius-challenge-open-data/PHerc0191/volumes/20250821151635-9.362um-1.2m-113keV-masked.zarr/",
+          "volume_scale": 0
+        },
+        {
+          "sample_id": "PHerc0211",
+          "pixel_size_um": 9.362,
+          "scan_location": "ESRF Grenoble",
+          "volume_path": "s3://vesuvius-challenge-open-data/PHerc0211/volumes/20250821151803-9.362um-1.2m-113keV-masked.zarr/",
+          "volume_scale": 0
+        },
+        {
+          "sample_id": "PHerc0257",
+          "pixel_size_um": 9.362,
+          "scan_location": "ESRF Grenoble",
+          "volume_path": "s3://vesuvius-challenge-open-data/PHerc0257/volumes/20250821151750-9.362um-1.2m-113keV-masked.zarr/",
+          "volume_scale": 0
+        },
+        {
+          "sample_id": "PHerc0268",
+          "pixel_size_um": 8.64,
+          "scan_location": "ESRF Grenoble",
+          "volume_path": "s3://vesuvius-challenge-open-data/PHerc0268/volumes/20251110183117-8.640um-1.2m-116keV-masked.zarr/",
+          "volume_scale": 0
+        },
+        {
+          "sample_id": "PHerc0306B",
+          "pixel_size_um": 8.64,
+          "scan_location": "ESRF Grenoble",
+          "volume_path": "s3://vesuvius-challenge-open-data/PHerc0306B/volumes/20250521133212-8.640um-1.2m-116keV-masked.zarr/",
+          "volume_scale": 0
+        },
+        {
+          "sample_id": "PHerc0332",
+          "pixel_size_um": 9.596,
+          "scan_location": "DLS (Diamond Light Source)",
+          "volume_path": "s3://vesuvius-challenge-open-data/PHerc0332/volumes/20251211183505-2.399um-0.2m-78keV-masked.zarr/",
+          "volume_scale": 2
+        },
+        {
+          "sample_id": "PHerc0343",
+          "pixel_size_um": 8.64,
+          "scan_location": "ESRF Grenoble",
+          "volume_path": "s3://vesuvius-challenge-open-data/PHerc0343/volumes/20250521140437-8.640um-1.2m-116keV-masked.zarr/",
+          "volume_scale": 0
+        },
+        {
+          "sample_id": "PHerc0358",
+          "pixel_size_um": 9.362,
+          "scan_location": "ESRF Grenoble",
+          "volume_path": "s3://vesuvius-challenge-open-data/PHerc0358/volumes/20250821151737-9.362um-1.2m-113keV-masked.zarr/",
+          "volume_scale": 0
+        },
+        {
+          "sample_id": "PHerc0483A",
+          "pixel_size_um": 8.64,
+          "scan_location": "ESRF Grenoble",
+          "volume_path": "s3://vesuvius-challenge-open-data/PHerc0483A/volumes/20250521140913-8.640um-1.2m-116keV-masked.zarr/",
+          "volume_scale": 0
+        },
+        {
+          "sample_id": "PHerc0483B",
+          "pixel_size_um": 8.64,
+          "scan_location": "ESRF Grenoble",
+          "volume_path": "s3://vesuvius-challenge-open-data/PHerc0483B/volumes/20251124083638-8.640um-1.2m-116keV-masked.zarr/",
+          "volume_scale": 0
+        },
+        {
+          "sample_id": "PHerc0490A",
+          "pixel_size_um": 8.64,
+          "scan_location": "ESRF Grenoble",
+          "volume_path": "s3://vesuvius-challenge-open-data/PHerc0490A/volumes/20250521151210-8.640um-1.2m-116keV-masked.zarr/",
+          "volume_scale": 0
+        },
+        {
+          "sample_id": "PHerc0490B",
+          "pixel_size_um": 8.64,
+          "scan_location": "ESRF Grenoble",
+          "volume_path": "s3://vesuvius-challenge-open-data/PHerc0490B/volumes/20250521151215-8.640um-1.2m-116keV-masked.zarr/",
+          "volume_scale": 0
+        },
+        {
+          "sample_id": "PHerc0800",
+          "pixel_size_um": 8.64,
+          "scan_location": "ESRF Grenoble",
+          "volume_path": "s3://vesuvius-challenge-open-data/PHerc0800/volumes/20250521135224-8.640um-1.2m-116keV-masked.zarr/",
+          "volume_scale": 0
+        },
+        {
+          "sample_id": "PHerc0813",
+          "pixel_size_um": 9.362,
+          "scan_location": "ESRF Grenoble",
+          "volume_path": "s3://vesuvius-challenge-open-data/PHerc0813/volumes/20250821151723-9.362um-1.2m-113keV-masked.zarr/",
+          "volume_scale": 0
+        },
+        {
+          "sample_id": "PHerc0814",
+          "pixel_size_um": 9.362,
+          "scan_location": "ESRF Grenoble",
+          "volume_path": "s3://vesuvius-challenge-open-data/PHerc0814/volumes/20250804134230-9.362um-1.2m-113keV-masked.zarr/",
+          "volume_scale": 0
+        },
+        {
+          "sample_id": "PHerc0826",
+          "pixel_size_um": 9.362,
+          "scan_location": "ESRF Grenoble",
+          "volume_path": "s3://vesuvius-challenge-open-data/PHerc0826/volumes/20250821151701-9.362um-1.2m-113keV-masked.zarr/",
+          "volume_scale": 0
+        },
+        {
+          "sample_id": "PHerc0841",
+          "pixel_size_um": 9.366,
+          "scan_location": "ESRF Grenoble",
+          "volume_path": "s3://vesuvius-challenge-open-data/PHerc0841/volumes/20250821151531-9.366um-1.2m-113keV-masked.zarr/",
+          "volume_scale": 0
+        },
+        {
+          "sample_id": "PHerc0846A",
+          "pixel_size_um": 9.362,
+          "scan_location": "ESRF Grenoble",
+          "volume_path": "s3://vesuvius-challenge-open-data/PHerc0846A/volumes/20250728152254-9.362um-1.2m-113keV-masked.zarr/",
+          "volume_scale": 0
+        },
+        {
+          "sample_id": "PHerc0846B",
+          "pixel_size_um": 9.362,
+          "scan_location": "ESRF Grenoble",
+          "volume_path": "s3://vesuvius-challenge-open-data/PHerc0846B/volumes/20250804142305-9.362um-1.2m-113keV-masked.zarr/",
+          "volume_scale": 0
+        },
+        {
+          "sample_id": "PHerc1203",
+          "pixel_size_um": 9.362,
+          "scan_location": "ESRF Grenoble",
+          "volume_path": "s3://vesuvius-challenge-open-data/PHerc1203/volumes/20250820131727-9.362um-1.2m-113keV-masked.zarr/",
+          "volume_scale": 0
+        },
+        {
+          "sample_id": "PHerc1218",
+          "pixel_size_um": 8.64,
+          "scan_location": "ESRF Grenoble",
+          "volume_path": "s3://vesuvius-challenge-open-data/PHerc1218/volumes/20250521120456-8.640um-1.2m-116keV-masked.zarr/",
+          "volume_scale": 0
+        },
+        {
+          "sample_id": "PHerc1447",
+          "pixel_size_um": 8.64,
+          "scan_location": "ESRF Grenoble",
+          "volume_path": "s3://vesuvius-challenge-open-data/PHerc1447/volumes/20250521151220-8.640um-1.2m-116keV-masked.zarr/",
+          "volume_scale": 0
+        },
+        {
+          "sample_id": "PHerc1451",
+          "pixel_size_um": 9.596,
+          "scan_location": "ESRF Grenoble",
+          "volume_path": "s3://vesuvius-challenge-open-data/PHerc1451/volumes/20260319101107-2.399um-0.2m-78keV-masked.zarr/",
+          "volume_scale": 2
+        },
+        {
+          "sample_id": "PHerc1545",
+          "pixel_size_um": 9.362,
+          "scan_location": "ESRF Grenoble",
+          "volume_path": "s3://vesuvius-challenge-open-data/PHerc1545/volumes/20250821151648-9.362um-1.2m-113keV-masked.zarr/",
+          "volume_scale": 0
+        },
+        {
+          "sample_id": "PHerc1667",
+          "pixel_size_um": 9.596,
+          "scan_location": "ESRF Grenoble",
+          "volume_path": "s3://vesuvius-challenge-open-data/PHerc1667/volumes/20251217075048-2.399um-0.2m-78keV-masked.zarr/",
+          "volume_scale": 2
+        },
+        {
+          "sample_id": "PHercParis4",
+          "pixel_size_um": 9.6,
+          "scan_location": "DLS (Diamond Light Source)",
+          "volume_path": "s3://vesuvius-challenge-open-data/PHercParis4/volumes/20260411134726-2.400um-0.2m-78keV-masked.zarr/",
+          "volume_scale": 2
+        },
+        {
+          "sample_id": "PHerc1299",
+          "pixel_size_um": 9.596,
+          "scan_location": "ESRF Grenoble",
+          "volume_path": "s3://vesuvius-challenge-open-data/PHerc1299/volumes/20260309130042-2.399um-0.2m-78keV-masked.zarr/",
+          "volume_scale": 2
+        },
+        {
+          "sample_id": "PHercMAN5",
+          "pixel_size_um": 9.596,
+          "scan_location": "ESRF Grenoble",
+          "volume_path": "s3://vesuvius-challenge-open-data/PHercMAN5/volumes/20260311104824-2.399um-0.2m-78keV-masked.zarr/",
+          "volume_scale": 2
+        },
+        {
+          "sample_id": "PHercMANB",
+          "pixel_size_um": 9.596,
+          "scan_location": "ESRF Grenoble",
+          "volume_path": "s3://vesuvius-challenge-open-data/PHercMANB/volumes/20260323091048-2.399um-0.2m-78keV-masked.zarr/",
+          "volume_scale": 2
+        },
+        {
+          "sample_id": "PHercMANBp",
+          "pixel_size_um": 9.596,
+          "scan_location": "ESRF Grenoble",
+          "volume_path": "s3://vesuvius-challenge-open-data/PHercMANBp/volumes/20251216152116-2.399um-0.2m-78keV-masked.zarr/",
+          "volume_scale": 2
+        },
+        {
+          "sample_id": "PHercParis3",
+          "pixel_size_um": 9.6,
+          "scan_location": "ESRF Grenoble",
+          "volume_path": "s3://vesuvius-challenge-open-data/PHercParis3/volumes/20260427095331-2.400um-0.2m-78keV-masked.zarr/",
+          "volume_scale": 2
+        },
+        {
+          "sample_id": "PHerc0009B",
+          "pixel_size_um": 9.604,
+          "scan_location": "ESRF Grenoble",
+          "volume_path": "s3://vesuvius-challenge-open-data/PHerc0009B/volumes/20260319104112-2.401um-0.3m-77keV-masked.zarr/",
+          "volume_scale": 2
+        },
+        {
+          "sample_id": "PHerc0343P",
+          "pixel_size_um": 8.86,
+          "scan_location": "ESRF Grenoble",
+          "volume_path": "s3://vesuvius-challenge-open-data/PHerc0343P/volumes/20260304131111-2.215um-0.4m-111keV-masked.zarr/",
+          "volume_scale": 2
+        },
+        {
+          "sample_id": "PHerc0500P2",
+          "pixel_size_um": 8.86,
+          "scan_location": "ESRF Grenoble",
+          "volume_path": "s3://vesuvius-challenge-open-data/PHerc0500P2/volumes/20250526151718-2.215um-0.4m-111keV-masked.zarr/",
+          "volume_scale": 2
+        }
+      ]
+    }
+  },
+  "runtime": {
+    "output_dir": "./runs/jem_3d",
+    "max_iterations": 500000,
+    "use_amp": true,
+    "amp_dtype": "bfloat16",
+    "compile": false,
+    "cuda_expandable_segments": true,
+    "cudnn_benchmark": true,
+    "save_every_n": 2500,
+    "keep_last_checkpoints": 3,
+    "train_monitor_every_n": 500,
+    "log_every": 10,
+    "resume": true,
+    "auto_resume": true
+  }
+}
