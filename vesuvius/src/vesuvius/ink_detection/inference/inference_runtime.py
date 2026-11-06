@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import itertools
 import logging
+import os
+import sys
+import warnings
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -223,6 +226,72 @@ def maybe_compile_model(
 
 
 DEVICE_CHOICES = ("auto", "cpu", "mps", "cuda")
+BACKEND_CHOICES = ("torch", "openvino")
+
+
+class _OpenVINOModel(nn.Module):
+    """A compiled OpenVINO graph behind the torch module call interface."""
+
+    def __init__(self, compiled_model: Any) -> None:
+        super().__init__()
+        self._compiled_model = compiled_model
+
+    def forward(self, image_BCZYX: torch.Tensor) -> torch.Tensor:
+        # share_outputs=False: callers sum TTA outputs and apply sigmoid_ in
+        # place, so the result must not alias the next request's buffer.
+        outputs = self._compiled_model(
+            image_BCZYX.contiguous().numpy(), share_outputs=False
+        )
+        return torch.from_numpy(outputs[0])
+
+
+def convert_for_openvino(
+    model: nn.Module, input_shape_CZYX: Sequence[int]
+) -> nn.Module:
+    """Convert an eval-mode model to an fp32 OpenVINO CPU graph with dynamic batch."""
+
+    if "tcmalloc" in os.environ.get("LD_PRELOAD", ""):
+        raise RuntimeError(
+            "--backend openvino aborts with heap corruption under a tcmalloc "
+            "LD_PRELOAD; unset LD_PRELOAD for this backend"
+        )
+    # convert_model otherwise sends usage telemetry from a subprocess; on
+    # Python 3.14 the forkserver child re-imports this CLI and inference ran up
+    # to 1.3x slower. OpenVINO falls back to its no-op stub without the module.
+    sys.modules.setdefault("openvino_telemetry", None)
+    try:
+        import openvino as ov
+    except ImportError as exc:
+        raise ImportError(
+            "--backend openvino needs OpenVINO: add --extra cpu-inference to "
+            "uv sync, or pip install openvino"
+        ) from exc
+    shape = [int(value) for value in input_shape_CZYX]
+    with warnings.catch_warnings():
+        # Tracing bakes the checkpoint's fixed C/Z/Y/X; only the batch is dynamic.
+        warnings.simplefilter("ignore", torch.jit.TracerWarning)
+        converted = ov.convert_model(
+            model.cpu().eval(),
+            example_input=torch.zeros(1, *shape),
+            input=[[-1, *shape]],
+        )
+    # Without the f32 hint OpenVINO runs bf16 on AMX/AVX512-BF16 CPUs and f16 on ARM.
+    # The LATENCY hint picks its own pool (one socket) and ignores
+    # OMP_NUM_THREADS; capping it at torch's count gives both backends one budget.
+    compiled = ov.compile_model(
+        converted,
+        "CPU",
+        {
+            "INFERENCE_PRECISION_HINT": "f32",
+            "PERFORMANCE_HINT": "LATENCY",
+            "INFERENCE_NUM_THREADS": torch.get_num_threads(),
+        },
+    )
+    LOGGER.info(
+        "OpenVINO inference threads: %s",
+        compiled.get_property("INFERENCE_NUM_THREADS"),
+    )
+    return _OpenVINOModel(compiled)
 
 
 def prepare_model_for_inference(

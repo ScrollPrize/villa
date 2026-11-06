@@ -100,6 +100,9 @@ blending = [
 # tifffile checks written TIFFs independently of vc_reader.
 tests = ["pytest>=8.4.2", "tifffile>=2024.8.30"]
 
+# OpenVINO runtime for flat ink `infer --backend openvino` (fp32 CPU forward)
+cpu-inference = ["openvino>=2026.4.1"]
+
 # Geometry-driven TIFXYZ label production (no torch/GUI dependency)
 label-transfer = [
     "vc-reader",
@@ -151,6 +154,9 @@ all = [
     # Tests
     "pytest>=8.4.2",
     "tifffile>=2024.8.30",
+
+    # CPU inference runtime
+    "openvino>=2026.4.1",
 
     # Data pipeline / I/O and compression
     "fastremap>=1.15",
