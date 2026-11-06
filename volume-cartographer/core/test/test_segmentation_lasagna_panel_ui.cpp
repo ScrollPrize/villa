@@ -420,6 +420,40 @@ int main(int argc, char** argv)
     };
     auto surface = openSurface(fittedUuid);
 
+    // An imported surface links to itself. The service accepts only numbered
+    // versions, including heads published before the active history generation.
+    state.setSurface("segmentation", openSurface(referenceUuid), true);
+    std::optional<vc::objects::ObjectRevision> reference;
+    session->readStore(attachment, [&](const vc::objects::StoreReader& reader, const auto&) {
+        reference = reader.currentObject(referenceUuid);
+    });
+    {
+        vc::objects::OpenOptions options;
+        options.author = "lasagna-test";
+        auto store = vc::objects::ObjectStore::open(storePath, options);
+        store.startHistoryGeneration("test historical head in Lasagna request");
+    }
+    require(reference && reference->generation != session->status(attachment).generation,
+            "The selected head should belong to an earlier history generation");
+    for (const auto mode : {SegmentationLasagnaPanel::LasagnaMode::NewModel,
+                            SegmentationLasagnaPanel::LasagnaMode::Offset}) {
+        QString error;
+        require(panel.startOptimizationHeadless(&state, mode, configPath, cv::Vec3i{4, 5, 6}, &error),
+                "An imported surface should launch a Lasagna job");
+        const auto spec = g_lastLasagnaOptimizationRequest[QStringLiteral("job_spec")].toObject();
+        const auto links = spec[QStringLiteral("linked_surfaces")].toArray();
+        const auto external = spec[QStringLiteral("config")].toObject()[QStringLiteral("external_surfaces")].toArray();
+        require(links.size() == 1 && external.size() == 1, "The imported surface should link to itself");
+        for (const auto& value : {links[0], external[0]}) {
+            const auto ref = value.toObject();
+            require(ref[QStringLiteral("uuid")].toString() == QString::fromStdString(referenceUuid) &&
+                        ref[QStringLiteral("generation")].toString() == QString::fromStdString(reference->generation) &&
+                        ref[QStringLiteral("version")].toInteger() == reference->version &&
+                        !ref.contains(QStringLiteral("revision")),
+                    "Lasagna references must pin the selected object's numbered version and its own generation");
+        }
+    }
+
     state.setSurface("segmentation", surface, true);
     panel._lastLasagnaMode = SegmentationLasagnaPanel::LasagnaMode::NewModel;
     panel.setState(&state);
