@@ -14,6 +14,7 @@
 #include <vc_reader/affine.hpp>
 
 #include "vc/core/util/Compositing.hpp"
+#include "volume_viewers/ViewerHud.hpp"
 
 
 class QMdiArea;
@@ -169,6 +170,9 @@ public:
     // --- Fleet setters: apply a viewer preference to every viewer ---
     void setShowSurfaceNormals(bool show);
     void setShowCoordinateFrames(bool show);
+    // Measurement overlays: on-screen histogram, line profile, volume grid, loupe.
+    void setHudOptions(const vc3d::hud::Options& options);
+    const vc3d::hud::Options& hudOptions() const { return _hudOptions; }
     void setPlaneIntersectionLinesVisible(bool visible);
 
     // --- Reset-view-on-surface-change policy ---
@@ -206,6 +210,7 @@ public:
                                                        float tolerance) const;
 
 signals:
+    void hudOptionsChanged(const vc3d::hud::Options& options);
     // Request the shared Composite View mode from another viewer control.
     void volumetricModeRequested(bool enabled);
     void baseViewerCreated(VolumeViewerBase* viewer);
@@ -273,6 +278,7 @@ private:
     VolumeViewerBase* _pendingLinkedCursorSource{nullptr};
     std::optional<cv::Vec3f> _pendingLinkedCursorPoint;
     bool _showCoordinateFrames{true};
+    vc3d::hud::Options _hudOptions;
     double _zScrollSensitivity{1.0};
 
 
