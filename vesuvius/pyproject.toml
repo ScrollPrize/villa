@@ -171,6 +171,8 @@ Homepage = "https://github.com/ScrollPrize/villa"
 "vesuvius.train" = "vesuvius.models.training.train:main"
 "vesuvius.find_patches" = "vesuvius.models.preprocessing.patches.cli:main"
 "vesuvius.fiber_spline_generator" = "vesuvius.fiber_spline_generator.cli:main"
+"vesuvius.label_topology_audit" = "vesuvius.label_processing.label_topology_audit:main"
+"vesuvius.surface_placement_audit" = "vesuvius.label_processing.surface_placement_audit:main"
 
 [tool.setuptools]
 include-package-data = true
