@@ -3,6 +3,7 @@
 #include "internal/Publication.hpp"
 #include "internal/ImmutableImport.hpp"
 #include "internal/InitialEndpoints.hpp"
+#include "geometry/GeometryInternal.hpp"
 #include "vc_reader/publication.hpp"
 #include <algorithm>
 #include <atomic>
@@ -209,9 +210,11 @@ InitialImportResult importInitialCollection(const std::filesystem::path& target,
                     // A single merge publishes it only after every object phase
                     // has finished; no other thread touches a worker's SQLite DB.
                     {
+                        detail::GeometryPhase barrier("initial.objects.barrier_wait");
                         std::unique_lock lock(failure.mutex);
                         workerEndpoints[i]=std::move(shard.impl_->endpoints);
                         if(--objectsRemaining==0 && !failure.failed.load(std::memory_order_acquire)) {
+                            detail::GeometryPhase merge("initial.endpoints.serial_merge");
                             auto combined=std::make_shared<detail::InitialEndpointDirectory>();
                             for(auto& local:workerEndpoints) {
                                 combined->merge(*local);

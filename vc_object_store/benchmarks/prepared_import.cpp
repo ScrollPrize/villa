@@ -273,11 +273,20 @@ Json native(const Prepared& data,const fs::path& path,bool linked,bool packed,si
         summed.producerSeconds+=shard.producerSeconds;summed.creationSeconds+=shard.creationSeconds;summed.sealCommitSeconds+=shard.sealCommitSeconds;}
     Json phases=Json::object();for(const auto& worker:work)for(const auto& [name,ns]:worker.phaseNanoseconds)
         phases[name]=phases.value(name,0.0)+double(ns)*1e-9;
+    Json perWorker=Json::array();
+    for(size_t i=0;i<workers;++i) {
+        const auto& shard=result.shards[i];Json seconds=Json::object();
+        for(const auto& [name,ns]:work[i].phaseNanoseconds)seconds[name]=double(ns)*1e-9;
+        perWorker.push_back({{"worker",i},{"objects",shard.objects},{"edges",shard.edges},
+            {"objects_seconds",shard.objectSeconds},{"edges_seconds",shard.edgeSeconds},
+            {"creation_seconds",shard.creationSeconds},{"seal_commit_seconds",shard.sealCommitSeconds},
+            {"producer_seconds",shard.producerSeconds},{"phase_seconds",seconds}});
+    }
     Json out={{"total_seconds",result.totalSeconds},{"objects_seconds",summed.objectSeconds},
         {"edges_seconds",summed.edgeSeconds},{"producer_seconds",summed.producerSeconds},
         {"creation_seconds",summed.creationSeconds},{"seal_commit_seconds",summed.sealCommitSeconds},
         {"manifest_seconds",result.manifestSeconds},{"persistence_seconds",result.persistenceSeconds},
-        {"dependency_preparation_seconds_excluded",dependency},{"phase_seconds",phases},
+        {"dependency_preparation_seconds_excluded",dependency},{"phase_seconds",phases},{"per_worker",perWorker},
         {"workers",workers},{"component_times_are_worker_sums",workers>1},{"ingestion_seconds",result.ingestionSeconds}};
     if(workers>1) {
         std::vector<size_t> ownerById(data.objects.size()+1);

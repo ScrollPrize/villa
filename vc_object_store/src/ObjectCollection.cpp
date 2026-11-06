@@ -400,6 +400,7 @@ std::optional<ObjectCollection::Impl::Located> ObjectCollection::Impl::locateSql
     return found;
 }
 std::string ObjectCollection::Impl::ensureEndpoint(CollectionTxn& t,const ObjectKey& key){
+    GeometryPhase phase("initial.endpoints.ensure_reference");
     auto* sql=db(t,0);
     if(auto v=ref(t,0,key);v){if(v->state=="deleted")throw std::runtime_error("collection: deleted endpoint");return v->local;}
     if(key.storeUuid==nodes[0].member.storeUuid&&objectIdByUuid(sql,parseUuid(key.objectUuid)))return key.objectUuid;
