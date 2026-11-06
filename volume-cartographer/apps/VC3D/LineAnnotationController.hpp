@@ -432,6 +432,11 @@ public:
     // Writes a vc3d_fiber_collection bundle without opening a dialog.
     bool exportFibersToPath(const std::filesystem::path& path,
                             QString* errorMessage = nullptr, int* exportedCount = nullptr);
+    // Publish every session's pending autosave now. stillValid (optional):
+    // checked after each flushed save (a yield); false stops the flush.
+    void flushAllPendingSessionAutoSaves(const std::function<bool()>& stillValid = {});
+    // A fiber merge, split or link is running; imports and other structural edits wait.
+    [[nodiscard]] bool structuralEditInProgress() const { return _structuralEditInProgress; }
     // Imports a fiber JSON, bundle, or directory without opening a dialog.
     bool importFibersFromPath(const std::filesystem::path& path,
                               QString* errorMessage = nullptr,
@@ -1282,9 +1287,6 @@ private:
     // so nothing reads a fiber whose newest geometry is still session-only.
     void scheduleSessionAutoSave(LineAnnotationSession& session);
     void flushSessionAutoSave(const std::string& surfaceName);
-    // stillValid (optional): checked after each flushed save (a yield);
-    // false stops the flush.
-    void flushAllPendingSessionAutoSaves(const std::function<bool()>& stillValid = {});
     [[nodiscard]] static nlohmann::json fiberSourceMetadata(const StoredFiber& fiber);
     friend int runObjectStoreControllerTests();
     // Runtime handles <-> store identities; cleared with each attachment.

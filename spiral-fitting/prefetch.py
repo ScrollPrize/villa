@@ -163,6 +163,11 @@ class StepPrefetcher:
         if pending is not None:
             pending.result()
 
+    def wait_idle(self):
+        # Wait for every pending batch without consuming it.
+        for pending in list(self._pending.values()):
+            pending.result()
+
 
 _PREFETCHER = None
 

@@ -32,6 +32,12 @@ public:
     // Flush, then drop the volume's collections from memory, leaving the store
     // as it is (closing the project).
     void unload();
+    // The store a collection in memory is kept in; nullopt for one this sync
+    // does not keep (a surface's corrections).
+    std::optional<vc::objects::AttachmentIdentity> storeOf(uint64_t collectionId) const
+    {
+        return uuids_.contains(collectionId) ? attachment_ : std::nullopt;
+    }
 
 private:
     void reload();

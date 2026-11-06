@@ -1,3 +1,4 @@
+import os
 from typing import Optional
 
 import numpy as np
@@ -8,6 +9,51 @@ import torch.nn.functional as F
 import flow_grad_smoothing
 import flow_triton
 from geom_utils import grid_sample_border
+
+
+_SEP_W = {}
+
+
+def _graph_rk4_enabled():
+    # FIT_SPIRAL_GRAPH_RK4=1: replay the eager RK4 slab integration as CUDA/HIP
+    # graphs (see graph_rk4).
+    return os.environ.get('FIT_SPIRAL_GRAPH_RK4', '0') == '1'
+
+
+def _linear_interp_matrix(n_in, n_out, device, dtype):
+    key = (n_in, n_out, device, dtype)
+    w = _SEP_W.get(key)
+    if w is None:
+        scale = n_in / n_out
+        src = ((torch.arange(n_out, dtype=torch.float64) + 0.5) * scale - 0.5).clamp(min=0)
+        i0 = src.floor().long().clamp(max=n_in - 1)
+        i1 = (i0 + 1).clamp(max=n_in - 1)
+        l1 = src - i0.double()
+        w = torch.zeros(n_out, n_in, dtype=torch.float64)
+        rows = torch.arange(n_out)
+        w.index_put_((rows, i0), 1 - l1, accumulate=True)
+        w.index_put_((rows, i1), l1, accumulate=True)
+        w = _SEP_W[key] = w.to(device=device, dtype=dtype)
+    return w
+
+
+def _sep_trilinear(x, size):
+    D, H, W = x.shape[-3:]
+    wz = _linear_interp_matrix(D, size[0], x.device, x.dtype)
+    wy = _linear_interp_matrix(H, size[1], x.device, x.dtype)
+    wx = _linear_interp_matrix(W, size[2], x.device, x.dtype)
+    x = torch.einsum('...dhw,zd->...zhw', x, wz)
+    x = torch.einsum('...zhw,yh->...zyw', x, wy)
+    return torch.einsum('...zyw,xw->...zyx', x, wx)
+
+
+def _upsample_lr(lr_flow, size):
+    # FIT_SPIRAL_SEP_UPSAMPLE=1: trilinear upsampling (align_corners=False) as
+    # three 1-D interpolation matmuls. Same math as F.interpolate; its backward
+    # is three small GEMMs, much faster than upsample_trilinear3d_backward on ROCm.
+    if os.environ.get('FIT_SPIRAL_SEP_UPSAMPLE', '0') == '1':
+        return _sep_trilinear(lr_flow, size)
+    return F.interpolate(lr_flow, size=size, mode='trilinear')
 
 
 def sample_field(normalised_zyx, field_for_grid_sample):
@@ -254,6 +300,57 @@ class _SparseAccumTrilinearSample(torch.autograd.Function):
         return grad_pts, None, None, None, None
 
 
+def _rk4_forward_stages(y0, sampler, h, n_steps, stages=None):
+    # Graph capture writes into static stage storage; eager autograd saves a list.
+    stage_points = [] if stages is None else stages
+    y = y0
+    for i in range(n_steps):
+        k1 = sampler(y)
+        x2 = y + (h / 2) * k1
+        k2 = sampler(x2)
+        x3 = y + (h / 2) * k2
+        k3 = sampler(x3)
+        x4 = y + h * k3
+        k4 = sampler(x4)
+        if stages is None:
+            stage_points.extend([y, x2, x3, x4])
+        else:
+            for j, point in enumerate((y, x2, x3, x4)):
+                stages[4 * i + j].copy_(point)
+        y = y + (h / 6) * (k1 + 2 * k2 + 2 * k3 + k4)
+    return y, stage_points
+
+
+def _rk4_sparse_backward(grad_y, stage_points, low_field, high_field, scale, acc, h, n_steps):
+    consts = _field_consts(low_field, grad_y.dtype)
+    corners = _corner_bits(grad_y.device)
+    if consts['signs'].dtype == grad_y.dtype:
+        signs = consts['signs']
+    else:
+        signs = (2 * corners - 1).to(grad_y.dtype)
+    Y, X = low_field.shape[2], low_field.shape[3]
+
+    def stage_grad(g, pts):
+        return _sparse_backward_impl(
+            g, pts, low_field, high_field, scale, acc,
+            consts['shape_m1'], consts['zeros'], consts['shape_m2'],
+            consts['corner_offsets'], signs, corners, Y, X,
+        )
+
+    for step in range(n_steps - 1, -1, -1):
+        x1, x2, x3, x4 = stage_points[4 * step: 4 * step + 4]
+        g6 = grad_y * (h / 6)
+        xb4 = stage_grad(g6, x4)
+        xb3 = stage_grad(g6 * 2 + xb4 * h, x3)
+        xb2 = stage_grad(g6 * 2 + xb3 * (h / 2), x2)
+        xb1 = stage_grad(g6 + xb2 * (h / 2), x1)
+        grad_y = grad_y + xb4
+        grad_y = grad_y + xb3
+        grad_y = grad_y + xb2
+        grad_y = grad_y + xb1
+    return grad_y
+
+
 class _RK4SparseFlowIntegrate(torch.autograd.Function):
     # The whole time-invariant RK4 integration as a single autograd node.
     #
@@ -279,18 +376,9 @@ class _RK4SparseFlowIntegrate(torch.autograd.Function):
     @staticmethod
     def forward(ctx, y0, low_field, high_field, high_scale, acc, h, n_steps):
         ctx.set_materialize_grads(False)
-        stage_points = []
-        y = y0
-        for _ in range(n_steps):
-            k1 = sample_field(y, low_field) + sample_field(y, high_field) * high_scale
-            x2 = y + (h / 2) * k1
-            k2 = sample_field(x2, low_field) + sample_field(x2, high_field) * high_scale
-            x3 = y + (h / 2) * k2
-            k3 = sample_field(x3, low_field) + sample_field(x3, high_field) * high_scale
-            x4 = y + h * k3
-            k4 = sample_field(x4, low_field) + sample_field(x4, high_field) * high_scale
-            stage_points.extend([y, x2, x3, x4])
-            y = y + (h / 6) * (k1 + 2 * k2 + 2 * k3 + k4)
+        y, stage_points = _rk4_forward_stages(
+            y0, lambda p: sample_field(p, low_field) + sample_field(p, high_field) * high_scale,
+            h, n_steps)
         ctx.save_for_backward(low_field, high_field, *stage_points)
         ctx.high_scale = float(high_scale)
         ctx.acc = acc
@@ -308,32 +396,8 @@ class _RK4SparseFlowIntegrate(torch.autograd.Function):
         h = ctx.h
         scale = ctx.high_scale
         acc = ctx.acc
-        consts = _field_consts(low_field, grad_y.dtype)
-        corners = _corner_bits(grad_y.device)
-        if consts['signs'].dtype == grad_y.dtype:
-            signs = consts['signs']
-        else:
-            signs = (2 * corners - 1).to(grad_y.dtype)
-        Y, X = low_field.shape[2], low_field.shape[3]
-
-        def stage_grad(g, pts):
-            return _sparse_backward_impl(
-                g, pts, low_field, high_field, scale, acc,
-                consts['shape_m1'], consts['zeros'], consts['shape_m2'],
-                consts['corner_offsets'], signs, corners, Y, X,
-            )
-
-        for step in range(ctx.n_steps - 1, -1, -1):
-            x1, x2, x3, x4 = stage_points[4 * step: 4 * step + 4]
-            g6 = grad_y * (h / 6)
-            xb4 = stage_grad(g6, x4)
-            xb3 = stage_grad(g6 * 2 + xb4 * h, x3)
-            xb2 = stage_grad(g6 * 2 + xb3 * (h / 2), x2)
-            xb1 = stage_grad(g6 + xb2 * (h / 2), x1)
-            grad_y = grad_y + xb4
-            grad_y = grad_y + xb3
-            grad_y = grad_y + xb2
-            grad_y = grad_y + xb1
+        grad_y = _rk4_sparse_backward(
+            grad_y, stage_points, low_field, high_field, scale, acc, h, ctx.n_steps)
         return grad_y, None, None, None, None, None, None
 
 
@@ -402,7 +466,7 @@ class CartesianFlowField(nn.Module):
         lr_flow, hr_flow = self.flows[0], self.flows[1]
         hr_shape = tuple(hr_flow.shape[2:])
         # HR flow is already at the target resolution, so only LR interpolates.
-        lr_upsampled = F.interpolate(lr_flow, size=hr_shape, mode='trilinear')
+        lr_upsampled = _upsample_lr(lr_flow, hr_shape)
         training_field = torch.is_grad_enabled() and (lr_flow.requires_grad or hr_flow.requires_grad)
         if not training_field:
             return lr_upsampled, hr_flow.detach(), None
@@ -415,6 +479,9 @@ class CartesianFlowField(nn.Module):
         low_field = lr_upsampled.detach()
         high_field = hr_flow.detach()
         if self._field_grad_acc is None or self._field_grad_acc.shape != high_field.shape:
+            if self._field_grad_acc is not None and _graph_rk4_enabled():
+                import graph_rk4
+                graph_rk4.clear()
             self._field_grad_acc = torch.zeros_like(high_field)
         else:
             self._field_grad_acc.zero_()
@@ -487,6 +554,21 @@ class CartesianFlowField(nn.Module):
 
             return integrate
 
+        # Frozen fields have no persistent training state. Keep their point
+        # gradients on the eager path instead of caching a fresh LR field on
+        # every call. Triton and get_sampler never need graph-owned storage.
+        use_graph = _graph_rk4_enabled() and low_field.is_cuda and acc is not None
+        if use_graph:
+            # Graph replays bake in field pointers: keep the upsampled LR field
+            # in one persistent buffer, and drop graphs that point at an old one.
+            buf = getattr(self, '_graph_low_buf', None)
+            if buf is None or buf.shape != low_field.shape:
+                import graph_rk4
+                graph_rk4.clear()
+                buf = self._graph_low_buf = torch.empty_like(low_field)
+            buf.copy_(low_field)
+            low_field = buf
+
         num_stages = self.num_stages
 
         def integrate(y_flat, h, n_steps, reverse=False):
@@ -501,6 +583,12 @@ class CartesianFlowField(nn.Module):
                     y = _rk4_sampler_loop(
                         y, lambda p: sample_field(p, low) + sample_field(p, high),
                         h, n_steps)
+                elif use_graph and y.is_cuda:
+                    import graph_rk4
+                    y = graph_rk4.RK4GraphIntegrate.apply(
+                        y, low, high,
+                        None if acc is None else acc[slab], h, n_steps,
+                    )
                 else:
                     y = _RK4SparseFlowIntegrate.apply(
                         y, low, high, 1.0,
