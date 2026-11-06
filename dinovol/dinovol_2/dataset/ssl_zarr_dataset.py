@@ -224,6 +224,8 @@ class SSLZarrDataset(Dataset):
         self.volume_auth = self.config["volume_auth"] if "volume_auth" in self.config else None
         self.s3_storage_options = self.config.get("s3_storage_options")
         self.volume_cache_dir = self.config.get("volume_cache_dir")
+        # volume_cache_writes=false reads the cache without adding chunks to it (misses stay in memory).
+        self.volume_cache_writes = bool(self.config.get("volume_cache_writes", True))
         self.vol_trim_pct = self.config.get("vol_trim_pct", 0.60)
         point_config = dict(self.config.get("point_supervision") or {})
         self.point_supervision_enabled = bool(point_config.get("enabled", False)) and not self.single_crop_only
@@ -405,7 +407,7 @@ class SSLZarrDataset(Dataset):
             volume_path = dataset["volume_path"]
             volume_scale = dataset["volume_scale"]
             handle = open_volume(volume_path, volume_scale, self.volume_auth, self.s3_storage_options,
-                                 cache_dir=self.volume_cache_dir)
+                                 cache_dir=self.volume_cache_dir, cache_writes=self.volume_cache_writes)
             try:
                 d_zarr = handle
                 z, y, x = d_zarr.shape
@@ -577,6 +579,7 @@ class SSLZarrDataset(Dataset):
                     self.volume_auth,
                     self.s3_storage_options,
                     cache_dir=self.volume_cache_dir,
+                    cache_writes=self.volume_cache_writes,
                 )
                 scale0_shape = tuple(int(value) for value in scale0_handle.shape)
 
@@ -625,7 +628,7 @@ class SSLZarrDataset(Dataset):
         bbox_lo = np.asarray(volume.usable_bbox[:3]) // factor
         bbox_hi = -(-np.asarray(volume.usable_bbox[3:]) // factor)
         handle = open_volume(volume.path, level, self.volume_auth, self.s3_storage_options,
-                             cache_dir=self.volume_cache_dir)
+                             cache_dir=self.volume_cache_dir, cache_writes=self.volume_cache_writes)
         try:
             array = handle
             # Read one extra cell on each side for the dilation below.
@@ -658,7 +661,7 @@ class SSLZarrDataset(Dataset):
         pool = max(1, 2 ** level // read_factor)
         factor = read_factor * pool
         handle = open_volume(volume.path, level, self.volume_auth, self.s3_storage_options,
-                             cache_dir=self.volume_cache_dir)
+                             cache_dir=self.volume_cache_dir, cache_writes=self.volume_cache_writes)
         try:
             array = handle
             cells = -(-np.asarray(array.shape) // pool)
@@ -842,7 +845,7 @@ class SSLZarrDataset(Dataset):
         handle = self._volume_handles.get(key)
         if handle is None:
             handle = open_volume(path, level, self.volume_auth, self.s3_storage_options,
-                                 cache_dir=self.volume_cache_dir)
+                                 cache_dir=self.volume_cache_dir, cache_writes=self.volume_cache_writes)
             self._volume_handles[key] = handle
         return handle
 
