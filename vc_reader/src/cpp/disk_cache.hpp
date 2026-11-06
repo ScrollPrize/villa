@@ -125,7 +125,9 @@ public:
         min_free_bytes_.store(bytes, std::memory_order_relaxed);
     }
 
-    void write(const std::string& path, const std::uint8_t* data, std::size_t size)
+    // owned_file also registers non-Zarr payloads for startup reconciliation.
+    // They share the same budget and atomic publication as numeric chunks.
+    void write(const std::string& path, const std::uint8_t* data, std::size_t size, bool owned_file = false)
     {
         check_path(path);
         if (!leaves_free_space(size))
@@ -142,6 +144,10 @@ public:
             evict_to(available - static_cast<std::int64_t>(size));
             file.publish();
             record(path, static_cast<std::int64_t>(size));
+            if (owned_file) {
+                Statement owned(db_, "INSERT OR IGNORE INTO files(path) VALUES(?)");
+                owned.text(1, path); owned.step();
+            }
             evict();
         });
     }
