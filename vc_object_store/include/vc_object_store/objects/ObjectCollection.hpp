@@ -23,7 +23,6 @@ struct InitialObjectRecord {
 struct InitialObjectIdentity { ObjectKey key; int64_t id; };
 struct InitialEdgeImportOptions {
     bool deferIndexes = true;
-    std::size_t maxCachedEndpoints = 65536;
     std::size_t sqlBatchRows = 1;
 };
 struct CollectionMember {
@@ -36,15 +35,19 @@ struct CollectionMember {
 // Rules operate on positive signed SQLite IDs. One group has one rule kind;
 // ranges may have multiple disjoint entries per destination. HashV1 is the
 // documented SplitMix64 finalizer, not std::hash or a platform-dependent hash.
-enum class RoutingKind { Range, Modulo, Bits, HashV1 };
+enum class RoutingKind { Range, Modulo, Bits, HashV1, UuidHashV1 };
+// Stable FNV-1a64 over the canonical 16 UUID bytes, modulo shardCount.
+// Use this exact function in producers declaring UUID-hash routing.
+std::size_t uuidShardIndex(const std::string& uuid, std::size_t shardCount);
 struct KeyRoute {
-    std::string keySpace; // objects or edges
+    std::string keySpace; // objects/edges: numeric IDs; objects.uuid/edges.uuid: UUID keys
     RoutingKind kind = RoutingKind::Range;
     int64_t lower = 1, upper = INT64_MAX;
     uint64_t divisor = 1, remainder = 0;
     unsigned shift = 0;
     std::string databaseUuid;
     bool matches(int64_t id) const;
+    bool matchesUuid(const std::string& uuid) const;
 };
 class ObjectCollection;
 class CollectionTxn {
@@ -81,8 +84,10 @@ public:
     void checkpoint();
     std::vector<CollectionMember> members() const;
     std::optional<CollectionObject> object(const CollectionTxn&, const ObjectKey&) const;
-    // Numeric lookup routes through partition reservations; UUID lookup is
-    // indexed within each relevant partition. It never interprets a hole in a
+    // Numeric lookup routes through partition reservations. Declared UUID-hash
+    // routes query only the selected shard per layer (no fallback fanout).
+    // Legacy arbitrary partitions without UUID routes require explicit fanout.
+    // It never interprets a hole in a
     // reserved range as permission to allocate that ID in another partition.
     std::optional<CollectionObject> objectById(const CollectionTxn&, const std::string& owner, int64_t id) const;
     void scanObjects(const CollectionTxn&, const std::function<bool(const CollectionObject&)>&, const std::optional<std::string>& kind = {}) const;

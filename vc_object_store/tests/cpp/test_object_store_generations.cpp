@@ -37,6 +37,14 @@ void nativeChanges(HistoryMode history)
     TemporaryDirectory dir;
     OpenOptions options; options.author = "native"; options.history = history;
     auto store = ObjectStore::create(dir.path / "native.vcobj", options);
+    {
+        auto txn=store.read();auto* sql=ObjectStoreImplAccess::conn(txn);
+        detail::Statement removed(sql,"SELECT count(*) FROM sqlite_schema WHERE name IN ('object_lifecycle','retired_objects')");
+        require(removed.row()&&removed.i64(0)==0,"lifecycle has no separate table or index");
+        detail::Statement columns(sql,"SELECT count(*) FROM pragma_table_info('objects') WHERE name IN ('retired','lifecycle_epoch')");
+        require(columns.row()&&columns.i64(0)==2,"lifecycle state is directly on objects");
+        require(!store.replicaUuid(txn).empty(),"ordinary editable store retains its sync identity");
+    }
     const auto a = util::newUuid(), b = util::newUuid();
     std::vector<std::string> revisions;
     std::string edge;
@@ -153,6 +161,29 @@ void nativeChanges(HistoryMode history)
                 "explicit object upsert revives a tombstone at the same UUID");
         require(!store.edgeByUuid(txn,edge),"object revival does not revive deleted relationships");
     }
+}
+
+void immutableSyncCapability()
+{
+    TemporaryDirectory dir;OpenOptions options;
+    options.author="immutable-sync";options.history=HistoryMode::Off;options.spatialIndex=false;
+    const auto path=dir.path/"immutable.vcobj";
+    {
+        auto store=ObjectStoreImplAccess::createInitial(path,options);
+        auto txn=store.write();store.seal(txn);txn.commit();
+    }
+    auto store=ObjectStore::open(path,OpenOptions{.readOnly=true});
+    auto txn=store.read();
+    detail::Statement absent(ObjectStoreImplAccess::conn(txn),"SELECT count(*) FROM sqlite_schema WHERE name IN ('sync_replica','object_lifecycle')");
+    require(absent.row()&&absent.i64(0)==0,"immutable batch store omits replica identity and separate lifecycle");
+    auto unsupported=[&](auto&& call){
+        try{call();throw std::runtime_error("sync unexpectedly available");}
+        catch(const std::runtime_error& error){require(std::string(error.what()).find("sync is unavailable for immutable batch stores")!=std::string::npos,
+            "immutable sync APIs report explicit capability error");}
+    };
+    unsupported([&]{store.replicaUuid(txn);});
+    txn.commit();
+    unsupported([&]{store.forkReplica();});
 }
 
 void deletedTrackIdentity(HistoryMode history)
@@ -391,6 +422,7 @@ int main()
 {
     nativeChanges(HistoryMode::On);
     nativeChanges(HistoryMode::Off);
+    immutableSyncCapability();
     deletedTrackIdentity(HistoryMode::On);
     deletedTrackIdentity(HistoryMode::Off);
     deletedGeometryRevival(HistoryMode::On);

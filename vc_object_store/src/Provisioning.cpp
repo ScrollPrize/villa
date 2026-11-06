@@ -48,6 +48,12 @@ void detail::requireHistory(sqlite3* db)
     if (!historyEnabled(db)) throw std::runtime_error("object store: history is disabled for this store");
 }
 
+void detail::requireSyncReplica(sqlite3* db)
+{
+    Statement capability(db,"SELECT 1 FROM sqlite_schema WHERE type='table' AND name='sync_replica'");
+    if(!capability.row())throw std::runtime_error("object store: sync is unavailable for immutable batch stores; create an editable linked store");
+}
+
 bool detail::spatialEnabled(sqlite3* db)
 {
     const auto pool = activeStatementPools.find(db);
@@ -91,7 +97,7 @@ void detail::createChangeTracking(sqlite3* db)
 {
     // Transactional dirty marker, including savepoint rollback. Do not use
     // sqlite3_total_changes(): that also counts changes rolled back to a savepoint.
-    for (const auto* table : {"objects", "fibers", "surfaces", "tracks", "object_tags", "edges", "edge_tags", "object_lifecycle", "table_directory", "table_key_columns", "store_required_features"}) {
+    for (const auto* table : {"objects", "fibers", "surfaces", "tracks", "object_tags", "edges", "edge_tags", "table_directory", "table_key_columns", "store_required_features"}) {
         for (const auto* op : {"INSERT", "UPDATE", "DELETE"}) {
             const auto sql = std::string("CREATE TRIGGER ") + table + "_v2_" + op + " AFTER " + op + " ON " + table +
                 " BEGIN UPDATE store_write_state SET dirty=1 WHERE singleton=1 AND dirty=0; END;";

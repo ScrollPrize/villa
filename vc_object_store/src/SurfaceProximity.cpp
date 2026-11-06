@@ -59,8 +59,7 @@ std::vector<SurfaceProximityHit> ObjectStore::nearestSurfaces(const ReadTxn& txn
             impl_->options.remoteGeometryReached(remote);
     std::string sql = "SELECT o.uuid,o.storage_ref,b.row_start,b.col_start,b.row_count,b.col_count "
         "FROM spatial_regions_rtree r CROSS JOIN spatial_regions b ON b.id=r.id CROSS JOIN objects o ON o.id=b.object_id "
-        "LEFT JOIN object_lifecycle l ON l.object_id=o.id "
-        "WHERE o.deleted=0 AND o.geometry_manifest IS NOT NULL AND o.kind='surface' AND b.array_name='points' AND COALESCE(l.retired,0)=0 AND " + spatialOverlapSql();
+        "WHERE o.deleted=0 AND o.geometry_manifest IS NOT NULL AND o.kind='surface' AND b.array_name='points' AND o.retired=0 AND " + spatialOverlapSql();
     if (includedIds) sql += " AND o.id IN (SELECT value FROM json_each(?8))";
     if (query.coordinates) sql += coordinateFilterSql("o", "?7");
     sql += " ORDER BY o.uuid,b.row_start,b.col_start";

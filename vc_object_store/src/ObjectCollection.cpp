@@ -18,7 +18,18 @@
 
 namespace vc::objects {
 using namespace detail;
+std::size_t uuidShardIndex(const std::string& uuid,std::size_t shardCount) {
+    if(!shardCount)throw std::invalid_argument("collection: UUID shard count must be positive");
+    uint64_t hash=UINT64_C(14695981039346656037);
+    for(const auto byte:parseUuid(uuid)){hash^=byte;hash*=UINT64_C(1099511628211);}
+    return hash%shardCount;
+}
+bool KeyRoute::matchesUuid(const std::string& uuid) const {
+    if(kind!=RoutingKind::UuidHashV1)return false;
+    return uuidShardIndex(uuid,divisor)==remainder;
+}
 bool KeyRoute::matches(int64_t id) const {
+    if(kind==RoutingKind::UuidHashV1)return false;
     if(id<lower||id>upper)return false;
     if(kind==RoutingKind::Range)return true;
     if(divisor==0||remainder>=divisor||shift>62)throw std::invalid_argument("collection: invalid routing rule");
@@ -40,8 +51,8 @@ CREATE TABLE collection_members(
  object_low INTEGER NOT NULL, object_high INTEGER NOT NULL, edge_low INTEGER NOT NULL, edge_high INTEGER NOT NULL
 );
 CREATE TABLE collection_routes(
- key_space TEXT NOT NULL CHECK(key_space IN ('objects','edges')),
- kind INTEGER NOT NULL CHECK(kind BETWEEN 0 AND 3),
+ key_space TEXT NOT NULL CHECK(key_space IN ('objects','edges','objects.uuid','edges.uuid')),
+ kind INTEGER NOT NULL CHECK(kind BETWEEN 0 AND 4),
  lower_bound INTEGER NOT NULL CHECK(lower_bound>0), upper_bound INTEGER NOT NULL CHECK(upper_bound>=lower_bound),
  divisor INTEGER NOT NULL CHECK(divisor>0), remainder INTEGER NOT NULL CHECK(remainder>=0 AND remainder<divisor),
  shift INTEGER NOT NULL CHECK(shift BETWEEN 0 AND 62),
@@ -102,11 +113,19 @@ std::vector<KeyRoute> rangeRoutes(const std::vector<CollectionMember>& members) 
     }
     return routes;
 }
+std::vector<KeyRoute> initialRoutes(const std::vector<CollectionMember>& members,bool uuidHashRouting) {
+    auto routes=rangeRoutes(members);
+    if(uuidHashRouting)for(size_t i=0;i<members.size();++i)for(const auto* space:{"objects.uuid","edges.uuid"})
+        routes.push_back({space,RoutingKind::UuidHashV1,1,INT64_MAX,members.size(),i,0,members[i].databaseUuid});
+    return routes;
+}
 // Shared encoding only. Discovery/validation belongs to the caller, not this
 // writer: the batch builder already owns every member and reserved range.
 void writeShardManifest(ObjectStore& store,const std::filesystem::path& path,
     const std::vector<CollectionMember>& members,const std::vector<KeyRoute>& routes) {
     auto w=store.write();auto* db=ObjectStoreImplAccess::conn(w);collectionSchema(db);
+    if(std::any_of(routes.begin(),routes.end(),[](const auto& r){return r.kind==RoutingKind::UuidHashV1;}))
+        exec(db,"INSERT INTO store_required_features VALUES('uuid-hash-routing-v1');");
     execute(db,"UPDATE key_allocators SET next_id=NULL");
     int64_t i=0;for(const auto& m:members)insertMember(db,i++,m,locator(path,m.locator));
     for(const auto& route:routes)execute(db,"INSERT INTO collection_routes VALUES(?,?,?,?,?,?,?,?)",route.keySpace,int64_t(route.kind),route.lower,route.upper,int64_t(route.divisor),int64_t(route.remainder),int64_t(route.shift),parseUuid(route.databaseUuid));
@@ -156,7 +175,21 @@ void validateRoutes(const std::vector<KeyRoute>& routes,const std::vector<Collec
                 (r.kind==RoutingKind::Range||r.remainder==group[b].remainder))throw std::invalid_argument("collection: overlapping key routes");
         }
     }
-    for(auto& r:routes)if(r.keySpace!="objects"&&r.keySpace!="edges")throw std::invalid_argument("collection: unknown key space");
+    for(const auto* space:{"objects.uuid","edges.uuid"}){
+        std::vector<const KeyRoute*> group;for(const auto& r:routes)if(r.keySpace==space)group.push_back(&r);
+        if(group.empty())continue;
+        const auto count=std::count_if(members.begin(),members.end(),[](const auto& m){return m.partition;});
+        if(group.size()!=size_t(count))throw std::invalid_argument("collection: incomplete UUID shard routing");
+        std::set<uint64_t> remainders;std::set<std::string> destinations;
+        for(const auto* rule:group){const auto& r=*rule;
+            if(r.kind!=RoutingKind::UuidHashV1||r.lower!=1||r.upper!=INT64_MAX||r.shift!=0||r.divisor!=group.size()||r.remainder>=r.divisor||
+               !remainders.insert(r.remainder).second||!destinations.insert(r.databaseUuid).second)
+                throw std::invalid_argument("collection: invalid UUID shard routing");
+            if(std::none_of(members.begin(),members.end(),[&](const auto& m){return m.partition&&m.databaseUuid==r.databaseUuid;}))
+                throw std::invalid_argument("collection: UUID destination is not a partition");
+        }
+    }
+    for(auto& r:routes)if(r.keySpace!="objects"&&r.keySpace!="edges"&&r.keySpace!="objects.uuid"&&r.keySpace!="edges.uuid")throw std::invalid_argument("collection: unknown key space");
 }
 }
 
@@ -164,11 +197,37 @@ struct ObjectCollection::Impl {
     struct Node { std::unique_ptr<ObjectStore> store; CollectionMember member; bool collection=false; std::vector<KeyRoute> routes; std::vector<std::string> children; };
     std::vector<Node> nodes;
     OpenOptions options;
-    std::shared_ptr<const InitialEndpointDirectory> initialEndpoints;
     // DFS insertion order is explicit precedence: local, then bases in manifest order.
     // Originals are resolved only after considering all overrides/tombstones.
     std::map<std::string,size_t> byDatabase;
     std::map<std::string,int64_t> pinned;
+    std::vector<size_t> uuidReadOrder(const std::string& uuid,const char* space)const{
+        std::vector<size_t> order;std::set<size_t> included;std::set<std::pair<size_t,bool>> visited;
+        const std::string keySpace=std::string(space)+".uuid";
+        std::function<void(size_t,bool)> visit=[&](size_t n,bool local){
+            if(!visited.emplace(n,local).second)return;
+            if(local&&included.insert(n).second)order.push_back(n);
+            std::optional<std::string> routed;
+            std::optional<size_t> remainder;
+            for(const auto& r:nodes[n].routes)if(r.keySpace==keySpace){
+                if(!remainder)remainder=uuidShardIndex(uuid,r.divisor);
+                if(*remainder==r.remainder)routed=r.databaseUuid;
+            }
+            // Sibling partitions are one overlay layer, not ordered bases.
+            // Query its selected local row before ANY partition's dependencies;
+            // otherwise an earlier unselected shard can expose a base record
+            // that incorrectly shadows the selected shard's replacement.
+            for(const auto& child:nodes[n].children){const auto i=byDatabase.at(child);
+                if(nodes[i].member.partition&&(!routed||*routed==child)&&included.insert(i).second)order.push_back(i);
+            }
+            for(const auto& child:nodes[n].children){const auto i=byDatabase.at(child);
+                // Even an unselected shard can link to readonly dependencies.
+                // Skip its rows, not the logical bases it references.
+                visit(i,!nodes[i].member.partition);
+            }
+        };
+        visit(0,true);return order;
+    }
     void load(const std::filesystem::path&,bool,const std::optional<CollectionMember>&,std::set<std::string>&,sqlite3* existingRoot=nullptr);
     bool depends(size_t n,size_t target)const{
         std::set<size_t> seen;std::vector<size_t> todo{n};
@@ -367,7 +426,7 @@ std::optional<ObjectCollection::Impl::Located> ObjectCollection::Impl::locate(co
 std::optional<ObjectCollection::Impl::Located> ObjectCollection::Impl::locateSql(const ObjectKey& key,
     const std::function<sqlite3*(size_t)>& get,size_t start,const std::function<bool(size_t)>& eligible)const{
     // UUID is the complete key. The first present row wins, including deletion.
-    for(size_t n=start;n<nodes.size();++n)if(!eligible||eligible(n)){
+    for(const auto n:uuidReadOrder(key.objectUuid,"objects"))if(n>=start&&(!eligible||eligible(n))){
         auto* sql=get(n);
         Statement state(sql,"SELECT deleted FROM objects WHERE uuid=?",parseUuid(key.objectUuid));
         if(!state.row())continue;
@@ -472,10 +531,6 @@ ObjectCollection detail::InitialCollectionAccess::create(const std::filesystem::
     for(const auto& m:members)p->load(m.locator,false,m,visiting);
     p->nodes[0].store=std::move(store);return ObjectCollection(std::move(p));
 }
-void detail::InitialCollectionAccess::setEndpoints(ObjectCollection& collection,std::shared_ptr<const InitialEndpointDirectory> endpoints)
-{
-    collection.impl_->initialEndpoints=std::move(endpoints);
-}
 CollectionMember detail::InitialCollectionAccess::sealShard(ObjectCollection& collection,CollectionTxn& transaction) {
     collection.seal(transaction);
     auto member=collection.impl_->nodes[0].member;
@@ -485,12 +540,12 @@ CollectionMember detail::InitialCollectionAccess::sealShard(ObjectCollection& co
     return member;
 }
 void detail::InitialCollectionAccess::writeManifest(const std::filesystem::path& path,
-    const std::vector<CollectionMember>& members,const OpenOptions& options) {
+    const std::vector<CollectionMember>& members,const OpenOptions& options,bool uuidHashRouting) {
     const auto& first=members.at(0);
     auto opt=options;opt.history=HistoryMode::Off;opt.spatialIndex=false;
     opt.creationStoreUuid=first.storeUuid;opt.initialGeneration=first.generation-1;opt.physicalPartitionOnly=true;
     auto store=ObjectStoreImplAccess::createInitial(path,opt);
-    writeShardManifest(store,path,members,rangeRoutes(members));
+    writeShardManifest(store,path,members,initialRoutes(members,uuidHashRouting));
 }
 ObjectCollection ObjectCollection::publishShards(const std::filesystem::path& path,const std::vector<std::filesystem::path>& shards,const OpenOptions& options,const std::vector<KeyRoute>& requestedRoutes){
     if(shards.empty())throw std::runtime_error("collection: empty shard list");
@@ -510,7 +565,15 @@ ObjectCollection ObjectCollection::publishShards(const std::filesystem::path& pa
     if(!requestedRoutes.empty())for(auto& m:members){auto store=ObjectStore::open(m.locator,OpenOptions{.readOnly=true});auto r=store.read();
         for(const auto* space:{"objects","edges"}){Statement ids(ObjectStoreImplAccess::conn(r),std::string("SELECT id FROM ")+space);
             while(ids.row()){size_t matches=0;for(auto& route:routes)if(route.keySpace==space&&route.matches(ids.i64(0))){if(route.databaseUuid!=m.databaseUuid)throw std::runtime_error("collection: misplaced shard key");++matches;}
-                if(matches!=1)throw std::runtime_error("collection: shard key not uniquely routed");}}}
+                if(matches!=1)throw std::runtime_error("collection: shard key not uniquely routed");}
+            const auto uuidSpace=std::string(space)+".uuid";
+            if(std::any_of(routes.begin(),routes.end(),[&](const auto& route){return route.keySpace==uuidSpace;})){
+                Statement keys(ObjectStoreImplAccess::conn(r),std::string("SELECT uuid FROM ")+space);
+                while(keys.row()){size_t matches=0;for(const auto& route:routes)if(route.keySpace==uuidSpace&&route.matchesUuid(formatUuid(keys.blob16(0)))){
+                    if(route.databaseUuid!=m.databaseUuid)throw std::runtime_error("collection: misplaced shard UUID");++matches;}
+                    if(matches!=1)throw std::runtime_error("collection: shard UUID not uniquely routed");}
+            }
+        }}
     auto opt=options;opt.history=HistoryMode::Off;opt.spatialIndex=false;opt.creationStoreUuid=first.storeUuid;opt.initialGeneration=first.generation-1;opt.physicalPartitionOnly=true;
     const bool packed=isBuildingPackedDatabasePath(path);
     StagedDatabase staged(path,packed);const auto& stage=staged.path;
@@ -616,7 +679,7 @@ std::vector<CollectionEdge> ObjectCollection::edgesByKind(const CollectionTxn& t
 }
 std::optional<CollectionEdge> ObjectCollection::edge(const CollectionTxn& t,const ObjectKey& input)const{
     const auto key=canonical(input);
-    for(size_t n=0;n<impl_->nodes.size();++n){
+    for(const auto n:impl_->uuidReadOrder(key.objectUuid,"edges")){
         Statement state(impl_->db(t,n),"SELECT deleted FROM edges WHERE uuid=?",parseUuid(key.objectUuid));
         if(!state.row())continue;
         if(state.i64(0))return {};
@@ -711,14 +774,11 @@ int64_t ObjectCollection::importInitialEdges(CollectionTxn& t,
     const std::function<bool(std::vector<InitialCollectionEdge>&)>& producer,
     const InitialEdgeImportOptions& options)
 {
-    if(!producer || !options.maxCachedEndpoints)
-        throw std::invalid_argument("collection: initial edge import requires a producer and positive endpoint cache limit");
+    if(!producer)
+        throw std::invalid_argument("collection: initial edge import requires a producer");
     auto& w=impl_->writer(t);auto* db=impl_->db(t,0);
     Savepoint save(db);
-    detail::InitialEdgeInserter writer(*impl_->nodes[0].store,w,options.deferIndexes,options.maxCachedEndpoints,options.sqlBatchRows);
-    struct Endpoint {std::string uuid;const PreparedDependencies* prepared=nullptr;
-        std::optional<DependencyGeometry> geometry;bool geometryLoaded=false;};
-    std::map<ObjectKey,Endpoint> endpoints;
+    detail::InitialEdgeInserter writer(*impl_->nodes[0].store,w,options.deferIndexes,options.sqlBatchRows);
     std::vector<InitialCollectionEdge> batch;
     std::vector<EdgeRecord> native;
     int64_t count=0;
@@ -740,49 +800,11 @@ int64_t ObjectCollection::importInitialEdges(CollectionTxn& t,
         if(batch.empty())throw std::invalid_argument("collection: initial edge producer returned an empty nonterminal batch");
         if(batch.size()>static_cast<uint64_t>(INT64_MAX-count))throw std::overflow_error("collection: initial edge count overflow");
         native.clear();native.reserve(batch.size());
-        if(endpoints.size()>=options.maxCachedEndpoints)endpoints.clear();
-        auto resolveEndpoint=[&](const ObjectKey& original,const Anchor& anchor)->Endpoint&{
-            // Accepted canonical keys dominate batch input. A cache hit has
-            // already been validated; noncanonical spellings still normalize
-            // and resolve through exactly the same path on a miss.
-            auto it=endpoints.find(original);
-            const auto key=it==endpoints.end()?canonical(original):original;
-            if(it==endpoints.end())it=endpoints.find(key);
-            if(it==endpoints.end()){
-                Endpoint endpoint;
-                const InitialEndpoint* prepared=nullptr;
-                if(impl_->initialEndpoints){auto p=impl_->initialEndpoints->find(key);if(p!=impl_->initialEndpoints->end())prepared=&p->second;}
-                if(prepared){
-                    if(prepared->retired)throw std::runtime_error("collection: retired initial endpoint");
-                    endpoint.uuid=key.objectUuid;
-                    endpoint.prepared=prepared->geometry?&*prepared->geometry:nullptr;endpoint.geometryLoaded=true;
-                }else{
-                    auto current=impl_->locate(t,key);
-                    if(!current||current->record.retired)throw std::runtime_error("collection: missing/deleted/retired endpoint");
-                    endpoint.uuid=key.objectUuid;
-                }
-                it=endpoints.emplace(key,std::move(endpoint)).first;
-            }
-            auto& endpoint=it->second;
-            if(!anchor.wholeGeometry||!anchor.points.empty()){
-                if(endpoint.prepared)validateDependencies(anchor,*endpoint.prepared);
-                else{
-                    if(!endpoint.geometryLoaded){
-                        if(auto g=impl_->geometry(t,key))endpoint.geometry=dependencyGeometry(*impl_->nodes[g->first].store,impl_->txn(t,g->first),g->second);
-                        endpoint.geometryLoaded=true;
-                    }
-                    if(endpoint.geometry)validateDependencies(anchor,*endpoint.geometry);
-                }
-            }
-            return endpoint;
-        };
         for(auto& input:batch){
-            auto& a=resolveEndpoint(input.a,input.record.aAnchor);
-            auto& b=resolveEndpoint(input.b,input.record.bAnchor);
-            input.record.aUuid=a.uuid;input.record.bUuid=b.uuid;
+            input.record.aUuid=input.a.objectUuid;input.record.bUuid=input.b.objectUuid;
             native.push_back(std::move(input.record));
         }
-        writer.appendResolved(native);
+        writer.append(native);
         count+=static_cast<int64_t>(native.size());
     }
     writer.finish();
@@ -794,8 +816,6 @@ std::vector<InitialObjectIdentity> ObjectCollection::importInitialObjects(
 {
     auto& w=impl_->writer(t);auto* db=impl_->db(t,0);
     if(historyEnabled(db))throw std::runtime_error("initial objects require history-off storage");
-    Statement edges(db,"SELECT 1 FROM edges LIMIT 1");
-    if(edges.row())throw std::runtime_error("initial owned objects must precede local edges");
     Savepoint save(db);
     const auto inserted=detail::insertInitialObjects(*impl_->nodes[0].store,w,records);
     std::vector<InitialObjectIdentity> result;result.reserve(inserted.size());

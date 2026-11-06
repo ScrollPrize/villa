@@ -31,8 +31,6 @@ std::vector<std::pair<std::string,int64_t>> insertInitialObjects(
     for(size_t i=0;i<input.size();++i){
         const auto& value=input[i];auto rec=prepareObjectRecord(value.record);
         normalizeObjectCoordinates(rec,true);
-        {Statement edge(db,"SELECT 1 FROM edges WHERE uuid=?",parseUuid(rec.uuid));
-            if(edge.row())throw std::invalid_argument("object store: UUID already belongs to an edge");}
         std::optional<PreparedInitialGeometry> geometry;
         if(value.geometry){geometry=prepareInitialGeometry(db,rec,*value.geometry);rec=geometry->record;}
         else if(rec.storageKind=="sqlite")
@@ -41,7 +39,7 @@ std::vector<std::pair<std::string,int64_t>> insertInitialObjects(
         insertObjectRow(db,rec,id,generation,author,host,time);
         insertObjectDetail(db,id,rec);
         insertTags(db,"object_tags","object_id",id,rec.tags);
-        // The missing lifecycle row is the normal native false/empty state.
+        // Active/default state is stored directly in the object row.
         if(rec.retired||!rec.lifecycleEpoch.empty())writeLifecycle(db,id,rec);
         if(geometry)writeInitialGeometry(store,txn,*geometry,*value.geometry,id);
         else setSpatialBounds(db,id,recordBounds(rec));

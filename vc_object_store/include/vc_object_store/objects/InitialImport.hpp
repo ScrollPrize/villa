@@ -12,6 +12,10 @@ struct InitialShardSpec {
 struct InitialImportOptions {
     OpenOptions store=[] {OpenOptions o;o.history=HistoryMode::Off;o.spatialIndex=false;return o;}();
     std::vector<InitialShardSpec> shards{InitialShardSpec{}};
+    // Producers MUST send each object/edge UUID to uuidShardIndex(uuid,N).
+    // False is explicit compatibility for arbitrary partitions: UUID reads
+    // then fan out instead of claiming a routing contract they cannot honor.
+    bool uuidHashRouting = true;
     std::vector<std::filesystem::path> dependencies;
     std::optional<PackedStoreOptions> packed;
     InitialEdgeImportOptions edges;
@@ -29,9 +33,9 @@ struct InitialImportResult {
 };
 
 // Available only during the producer callback, on its assigned worker thread.
-// No mutable store/transaction handle is exposed. Objects precede relations;
-// The one-phase form allows this shard's objects and sealed dependencies;
-// the phased form additionally allows objects in sibling shards.
+// No mutable store/transaction handle is exposed. Objects precede relations
+// within each worker. Endpoint UUIDs are supplied directly by the controlled
+// producer, including references to sibling shards and sealed dependencies.
 class InitialShardImport {
 public:
     ~InitialShardImport();
@@ -60,15 +64,15 @@ private:
 // Dependencies must already be sealed; sibling shards are not mutable links.
 // A fresh logical UUID is allocated for every import; creationStoreUuid must be
 // unset. Producers must supply globally unique object and edge UUIDs across all
-// shards. Native uniqueness is enforced per shard; the phased form additionally
-// rejects duplicate object identities while merging its endpoint directory.
+// shards. Native uniqueness is enforced per shard. UUID-hash routing sends any
+// repeated key to the same shard, without constructing a per-object directory.
 InitialImportResult importInitialCollection(const std::filesystem::path& destination,
     const InitialImportOptions&,
     const std::function<void(size_t,InitialShardImport&)>& producer);
 
-// Phased form: all workers finish their object producer before any edge
-// producer starts. Edges can then address any accepted object in this import,
-// including sibling shards, without opening another worker's SQLite connection.
+// Two callbacks per worker: its object producer finishes before its edge
+// producer starts, without a cross-worker barrier or endpoint directory.
+// Edges address original UUIDs without opening another worker's connection.
 // Object producers may only append objects; edge producers may only import
 // edges. Failure in either phase cancels peers and prevents publication.
 InitialImportResult importInitialCollection(const std::filesystem::path& destination,

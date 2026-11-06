@@ -197,7 +197,7 @@ void failedPublication()
     for (const bool packed : {false, true}) {
         const auto name = std::string(packed ? "failed-packed" : "failed-plain");
         const auto output = directory.path / name;
-        InitialImportOptions options;
+        InitialImportOptions options;options.uuidHashRouting=false;
         options.store = directOptions();
         options.dependencies = {base.path};
         if (packed) {
@@ -212,9 +212,8 @@ void failedPublication()
             importInitialCollection(output, options, [&](size_t, InitialShardImport& shard) {
                 size_t batchNumber = 0;
                 shard.importEdges([&](auto& batch) {
-                    if (batchNumber == 2) return false;
-                    const auto other = batchNumber++ == 0 ? base.active
-                        : ObjectKey{base.active.storeUuid, util::newUuid()};
+                    if(batchNumber==1)throw std::runtime_error("source failure after first inserted batch");
+                    ++batchNumber;const auto other=base.active;
                     auto edge=observation("source-batch-"+std::to_string(batchNumber));
                     edge.bAnchor.points={{"line_points",{0}}};
                     batch.push_back({base.active,other,std::move(edge)});
@@ -222,7 +221,7 @@ void failedPublication()
                 });
             });
         });
-        require(!std::filesystem::exists(output), "dangling edge published an incomplete collection");
+        require(!std::filesystem::exists(output), "producer failure published an incomplete collection");
         for (const auto& entry : std::filesystem::directory_iterator(directory.path)) {
             const auto filename = entry.path().filename().string();
             require(!filename.starts_with("." + name + "-") && !filename.starts_with(name + ".building-"),
@@ -356,12 +355,61 @@ void historicalWrapper()
     verify(reopened, a, b, 0);
 }
 
+void routedPartitionsPrecedeTheirBases()
+{
+    TemporaryDirectory directory;
+    const auto inSecondShard=[] {
+        auto uuid=util::newUuid();while(uuidShardIndex(uuid,2)!=1)uuid=util::newUuid();return uuid;
+    };
+    const auto a=inSecondShard(),b=util::newUuid(),edgeUuid=inSecondShard();
+    const auto basePath=directory.path/"base";
+    {
+        auto base=ObjectStore::create(basePath,directOptions());auto write=base.write();
+        base.upsertObject(write,fiber(a,1));base.upsertObject(write,fiber(b,2));
+        EdgeRecord e;e.uuid=edgeUuid;e.aUuid=a;e.bUuid=b;e.kind="routing";e.meta=R"({"quality":1})";
+        e.aAnchor.wholeGeometry=e.bAnchor.wholeGeometry=true;
+        base.addEdge(write,e);base.seal(write);write.commit();
+    }
+    InitialImportOptions options;options.store=directOptions();options.dependencies={basePath};
+    options.shards={InitialShardSpec{{1,100},{1,100}},InitialShardSpec{{101,200},{101,200}}};
+    const auto result=importInitialCollection(directory.path/"routed",options,
+        [&](size_t i,InitialShardImport& shard){
+            if(i!=1)return;
+            const std::array rows{InitialObjectRecord{fiber(a,9),{},geometry()}};shard.appendObjects(rows);
+            bool supplied=false;shard.importEdges([&](auto& batch){
+                if(supplied)return false;supplied=true;
+                EdgeRecord e;e.uuid=edgeUuid;e.kind="routing";e.meta=R"({"quality":9})";
+                e.aAnchor.wholeGeometry=e.bAnchor.wholeGeometry=true;
+                batch.push_back({{shard.storeUuid(),a},{{},b},e});
+                return true;
+            });
+        });
+    {
+        auto collection=ObjectCollection::open(result.path,OpenOptions{.readOnly=true});auto read=collection.read();
+        require(Json::parse(collection.object(read,{{},a})->record.meta).at("quality")==9,
+            "selected later shard replacement must precede an earlier shard's shared base");
+        require(Json::parse(collection.edge(read,{{},edgeUuid})->record.meta).at("quality")==9,
+            "selected later shard edge must precede inherited edge with same UUID");
+        require(collection.object(read,{{},b}).has_value(),"unselected shard dependencies remain visible");
+    }
+    auto overlay=ObjectCollection::create(directory.path/"overlay",{result.path},directOptions());
+    {auto write=overlay.write();overlay.setMeta(write,{{},a},"quality","11");write.commit();}
+    {auto read=overlay.read();require(Json::parse(overlay.object(read,{{},a})->record.meta).at("quality")==11,
+        "local overlay replacement precedes UUID-routed shards");}
+    {auto write=overlay.write();overlay.removeEdge(write,{{},edgeUuid});overlay.deleteObject(write,{{},a});overlay.seal(write);write.commit();}
+    {auto read=overlay.read();require(!overlay.object(read,{{},a})&&!overlay.edge(read,{{},edgeUuid}),
+        "local tombstones stop fallback to routed partitions and their bases");}
+    auto child=ObjectCollection::create(directory.path/"child",{directory.path/"overlay",basePath},directOptions());
+    {auto read=child.read();require(!child.object(read,{{},a})&&!child.edge(read,{{},edgeUuid}),
+        "routed-layer tombstones stay authoritative through a deeper linked overlay");}
+}
+
 void siblingReferences()
 {
     TemporaryDirectory directory;
     const std::array ids{util::newUuid(), util::newUuid()};
     for (const bool packed : {false, true}) {
-        InitialImportOptions options;
+        InitialImportOptions options;options.uuidHashRouting=false;
         options.store = directOptions();
         options.shards = {InitialShardSpec{{1,100},{1,100}}, InitialShardSpec{{101,200},{101,200}}};
         if (packed) {
@@ -372,16 +420,13 @@ void siblingReferences()
             settings.residentBytes = 64 * 1024 * 1024;
             options.packed = settings;
         }
-        std::atomic_size_t objectCallbacks{0};
         const auto output = directory.path / (packed ? "siblings-packed" : "siblings-plain");
         const auto result = importInitialCollection(output, options,
             [&](size_t index, InitialShardImport& shard) {
                 const std::array rows{InitialObjectRecord{fiber(ids[index], int(index)), {}, geometry()}};
                 shard.appendObjects(rows);
-                ++objectCallbacks;
             },
             [&](size_t index, InitialShardImport& shard) {
-                require(objectCallbacks.load() == 2, "edge producer ran before all object producers finished");
                 bool produced = false;
                 shard.importEdges([&](auto& batch) {
                     if (produced) return false;
@@ -422,15 +467,15 @@ void siblingReferences()
         require(partitions == 2, "published sibling shard count differs");
     }
 
-    InitialImportOptions failed;
+    InitialImportOptions failed;failed.uuidHashRouting=false;
     failed.store = directOptions();
     failed.shards = {InitialShardSpec{{1,100},{1,100}}, InitialShardSpec{{101,200},{101,200}}};
     for (const bool failObjectPhase : {false, true}) {
-        const auto output = directory.path / (failObjectPhase ? "object-phase-failure" : "missing-sibling");
+        const auto output = directory.path / (failObjectPhase ? "object-phase-failure" : "malformed-edge");
         mustFail([&] {
             importInitialCollection(output, failed,
                 [&](size_t index, InitialShardImport& shard) {
-                    if (failObjectPhase && index == 0) throw std::runtime_error("source failed before barrier");
+                    if (failObjectPhase && index == 0) throw std::runtime_error("object source failed");
                     const std::array rows{InitialObjectRecord{fiber(ids[index], int(index)), {}, geometry()}};
                     shard.appendObjects(rows);
                 },
@@ -440,7 +485,8 @@ void siblingReferences()
                     shard.importEdges([&](auto& batch) {
                         if (produced) return false;
                         produced = true;
-                        batch.push_back({{shard.storeUuid(),ids[0]}, {shard.storeUuid(),util::newUuid()}, observation("missing")});
+                        auto invalid=observation("malformed");invalid.uuid="invalid-uuid";
+                        batch.push_back({{shard.storeUuid(),ids[0]}, {shard.storeUuid(),ids[1]}, invalid});
                         return true;
                     });
                 });
@@ -461,6 +507,7 @@ int main()
         uuidPrecedence();
         formerAliasNamesRemainOrdinaryKeys();
         historicalWrapper();
+        routedPartitionsPrecedeTheirBases();
         siblingReferences();
         std::cout << "reference-only endpoint tests passed\n";
         return 0;

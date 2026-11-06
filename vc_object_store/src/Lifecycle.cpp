@@ -8,41 +8,28 @@
 namespace vc::objects {
 using namespace detail;
 
-void detail::createLifecycleSchema(sqlite3* db)
-{
-    exec(db, R"SQL(
-CREATE TABLE object_lifecycle(
-  object_id INTEGER PRIMARY KEY REFERENCES objects(id) ON DELETE CASCADE,
-  retired INTEGER NOT NULL CHECK(retired IN (0,1)), epoch TEXT NOT NULL
-);
-CREATE INDEX retired_objects ON object_lifecycle(retired,object_id);
-)SQL");
-}
-
 void detail::readLifecycle(sqlite3* db, int64_t id, ObjectRecord& record)
 {
-    Statement s(db, "SELECT retired,epoch FROM object_lifecycle WHERE object_id=?", id);
+    Statement s(db, "SELECT retired,lifecycle_epoch FROM objects WHERE id=?", id);
     if (s.row()) { record.retired = s.i64(0); record.lifecycleEpoch = s.text(1); }
 }
 
 void detail::writeLifecycle(sqlite3* db, int64_t id, const ObjectRecord& record)
 {
     beforeCurrentObjectEdit(db,record.uuid);
-    execute(db, "INSERT INTO object_lifecycle VALUES(?,?,?) ON CONFLICT(object_id) "
-        "DO UPDATE SET retired=excluded.retired,epoch=excluded.epoch", id, int64_t(record.retired),
-        record.lifecycleEpoch);
+    execute(db, "UPDATE objects SET retired=?,lifecycle_epoch=? WHERE id=?",int64_t(record.retired),
+        record.lifecycleEpoch,id);
 }
 
 std::string detail::activeObjectSql(const std::string& id)
 {
-    return "NOT EXISTS(SELECT 1 FROM objects owned LEFT JOIN object_lifecycle lc ON lc.object_id=owned.id "
-        "WHERE owned.id="+id+" AND (owned.deleted=1 OR lc.retired=1))";
+    return "NOT EXISTS(SELECT 1 FROM objects owned WHERE owned.id="+id+" AND (owned.deleted=1 OR owned.retired=1))";
 }
 
 std::string detail::activeEdgeSql()
 {
-    return "edges.deleted=0 AND NOT EXISTS(SELECT 1 FROM objects owned LEFT JOIN object_lifecycle lc ON lc.object_id=owned.id "
-        "WHERE (owned.uuid=edges.a_uuid OR owned.uuid=edges.b_uuid) AND (owned.deleted=1 OR lc.retired=1))";
+    return "edges.deleted=0 AND NOT EXISTS(SELECT 1 FROM objects owned "
+        "WHERE (owned.uuid=edges.a_uuid OR owned.uuid=edges.b_uuid) AND (owned.deleted=1 OR owned.retired=1))";
 }
 
 namespace {

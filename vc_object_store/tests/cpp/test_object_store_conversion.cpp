@@ -26,6 +26,11 @@ void schema17(const std::filesystem::path& path)
     }
     for(const auto& name:names)exec(db.get(),("DROP TRIGGER \""+name+"\"").c_str());
     std::erase_if(programs,[](const auto& program){return program.second.find("store_write_state")!=std::string::npos;});
+    exec(db.get(),"CREATE TABLE object_lifecycle(object_id INTEGER PRIMARY KEY REFERENCES objects(id) ON DELETE CASCADE,"
+        "retired INTEGER NOT NULL CHECK(retired IN (0,1)),epoch TEXT NOT NULL);"
+        "CREATE INDEX retired_objects ON object_lifecycle(retired,object_id);"
+        "INSERT INTO object_lifecycle SELECT id,retired,lifecycle_epoch FROM objects WHERE retired<>0 OR lifecycle_epoch<>'';"
+        "ALTER TABLE objects DROP COLUMN retired; ALTER TABLE objects DROP COLUMN lifecycle_epoch;");
     exec(db.get(),"CREATE TABLE geometry_heads(object_uuid BLOB PRIMARY KEY REFERENCES objects(uuid) ON DELETE RESTRICT,"
         "revision_uuid BLOB NOT NULL,FOREIGN KEY(object_uuid,revision_uuid) REFERENCES geometry_revisions(object_uuid,uuid));");
     {
@@ -149,23 +154,32 @@ void rejectsStaleLegacy(const std::filesystem::path& path,const std::string& cor
 
 void digestHistory(const std::filesystem::path& path)
 {
-    std::string object,first,last;std::vector<uint8_t> expected;
+    std::string object,first,last,retired,epoch;std::vector<uint8_t> expected;
     {
         OpenOptions options;options.author="test";options.maxGeometryDeltaBytes=1024;
         auto store=ObjectStore::create(path,options);
         vc::geometry::Fiber fiber;for(int i=0;i<10000;++i)fiber.linePoints.push_back({double(i),0,0});
         {auto txn=store.write();ObjectRecord record;record.kind="fiber";object=store.upsertObject(txn,record);
-            first=store.putGeometry(txn,object,vc::geometry::encode(fiber));txn.commit();}
+            first=store.putGeometry(txn,object,vc::geometry::encode(fiber));
+            ObjectRecord note;note.kind="note";retired=store.upsertObject(txn,note);txn.commit();}
         {auto txn=store.write();GeometryArrayEdit edit{"line_points",0,std::vector<uint8_t>(8)};
             const auto bits=std::bit_cast<uint64_t>(3.5);for(int i=0;i<8;++i)edit.bytes[i]=uint8_t(bits>>(8*i));
             last=store.editGeometry(txn,object,{edit},first);txn.commit();}
+        RevisionSelection selection;
+        {auto txn=store.read();selection[retired]=store.currentObjectRevision(txn,retired)->uuid;}
+        {auto txn=store.write(selection);store.retireObject(txn,retired);txn.commit();}
         auto txn=store.read();expected=store.readGeometryArray(txn,last,"line_points");
+        epoch=store.objectByUuid(txn,retired)->lifecycleEpoch;
         Statement deltas(ObjectStoreImplAccess::conn(txn),"SELECT count(*) FROM geometry_deltas");
         require(deltas.row()&&deltas.i64(0)>0,"legacy fixture includes sparse historical delta");
     }
     schema17(path);convertV1ToV2(path);
     {
         auto store=ObjectStore::open(path,OpenOptions{.readOnly=true});auto txn=store.read();
+        const auto lifecycle=store.objectByUuid(txn,retired);
+        require(lifecycle&&lifecycle->retired&&lifecycle->lifecycleEpoch==epoch,"conversion preserves lifecycle state directly on object");
+        Statement removed(ObjectStoreImplAccess::conn(txn),"SELECT count(*) FROM sqlite_schema WHERE name='object_lifecycle'");
+        require(removed.row()&&removed.i64(0)==0,"converter removes obsolete lifecycle table");
         require(store.readGeometryArray(txn,last,"line_points")==expected,"binary digest conversion preserves delta geometry");
         require(store.readGeometryArray(txn,first,"line_points")!=expected,"binary digest conversion preserves earlier full revision");
         for(const auto& [table,column]:std::map<std::string,std::string>{{"geometry_chunks","hash"},
@@ -178,6 +192,8 @@ void digestHistory(const std::filesystem::path& path)
     for(const auto mode:{HistoryMode::Off,HistoryMode::On}) {
         changeHistoryMode(path,mode);auto store=ObjectStore::open(path,OpenOptions{.readOnly=true});auto txn=store.read();
         const auto geometry=store.currentGeometry(txn,object);
+        require(store.objectByUuid(txn,retired)->retired&&store.objectByUuid(txn,retired)->lifecycleEpoch==epoch,
+                "history policy transitions retain inline lifecycle");
         require(store.readGeometryArray(txn,geometry->uuid,"line_points")==expected,"policy transition preserves converted delta data");
         Statement checksum(ObjectStoreImplAccess::conn(txn),"SELECT typeof(data_checksum),length(data_checksum) FROM objects WHERE uuid=?",parseUuid(object));
         require(checksum.row()&&checksum.text(0)=="text"&&checksum.i64(1)==64,"generic object checksum remains hexadecimal text");

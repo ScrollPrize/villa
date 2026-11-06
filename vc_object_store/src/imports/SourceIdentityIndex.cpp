@@ -136,7 +136,7 @@ void updateSourcePointIdentities(sqlite3* db, const std::string& object,
 }
 std::optional<SourcePoint> sourcePoint(sqlite3* db, const std::string& origin, int64_t id) {
     if(!hasSourceIdentityIndex(db))return std::nullopt;
-    Statement s(db,"SELECT p.object_uuid,p.point_offset FROM source_points p JOIN objects o ON o.uuid=p.object_uuid LEFT JOIN object_lifecycle l ON l.object_id=o.id WHERE o.deleted=0 AND p.origin=? AND p.point_id=? AND coalesce(l.retired,0)=0 LIMIT 2",
+    Statement s(db,"SELECT p.object_uuid,p.point_offset FROM source_points p JOIN objects o ON o.uuid=p.object_uuid WHERE o.deleted=0 AND p.origin=? AND p.point_id=? AND o.retired=0 LIMIT 2",
         origin, id);
     if(geometryWork) ++geometryWork->identityRows;
     if(!s.row()) return std::nullopt;
@@ -146,7 +146,7 @@ std::optional<SourcePoint> sourcePoint(sqlite3* db, const std::string& origin, i
 }
 std::optional<std::string> sourceCollection(sqlite3* db, const std::string& origin, const std::string& id) {
     if(!hasSourceIdentityIndex(db))return std::nullopt;
-    Statement s(db,"SELECT s.object_uuid FROM source_collections s JOIN objects o ON o.uuid=s.object_uuid LEFT JOIN object_lifecycle l ON l.object_id=o.id WHERE o.deleted=0 AND s.origin=? AND s.collection_id=? AND coalesce(l.retired,0)=0 LIMIT 2",
+    Statement s(db,"SELECT s.object_uuid FROM source_collections s JOIN objects o ON o.uuid=s.object_uuid WHERE o.deleted=0 AND s.origin=? AND s.collection_id=? AND o.retired=0 LIMIT 2",
         origin, id);
     if(geometryWork) ++geometryWork->identityRows;
     if(!s.row()) return std::nullopt;

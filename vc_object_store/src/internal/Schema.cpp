@@ -10,11 +10,13 @@ void createGeometryChunkTable(sqlite3* db, const std::string& name)
         "data BLOB NOT NULL CHECK(length(data)>0 AND length(data)<=1048576))").c_str());
 }
 void createSchema(sqlite3* db, bool history, const std::optional<std::string>& storeUuid, bool immutable) {
-    exec(db,"INSERT INTO store_required_features VALUES('direct-geometry-v1'),('binary-sha256-v1'),('direct-endpoint-keys-v1');");
+    exec(db,"INSERT INTO store_required_features VALUES('direct-geometry-v1'),('binary-sha256-v1'),('direct-endpoint-keys-v1'),('inline-lifecycle-v1');");
     exec(db, R"SQL(CREATE TABLE objects(
   id INTEGER PRIMARY KEY,
   uuid BLOB NOT NULL UNIQUE,
   deleted INTEGER NOT NULL DEFAULT 0 CHECK(deleted IN (0,1)),
+  retired INTEGER NOT NULL DEFAULT 0 CHECK(retired IN (0,1)),
+  lifecycle_epoch TEXT NOT NULL DEFAULT '',
   kind TEXT NOT NULL CHECK(length(kind)>0),
   name TEXT NOT NULL DEFAULT '',
   generation INTEGER NOT NULL DEFAULT 1,
@@ -165,8 +167,10 @@ CREATE TABLE geometry_current_chunks(
 );
 
 )SQL");
-    exec(db, "CREATE TABLE sync_replica(singleton INTEGER PRIMARY KEY CHECK(singleton=1), uuid TEXT NOT NULL);");
-    execute(db, "INSERT INTO sync_replica VALUES(1,?)", util::newUuid());
+    if(!immutable){
+        exec(db, "CREATE TABLE sync_replica(singleton INTEGER PRIMARY KEY CHECK(singleton=1), uuid TEXT NOT NULL);");
+        execute(db, "INSERT INTO sync_replica VALUES(1,?)", util::newUuid());
+    }
     exec(db, "CREATE INDEX objects_kind_uuid ON objects(kind,uuid);");
     if (spatialEnabled(db)) detail::createSpatialSchema(db);
     exec(db, "CREATE TABLE store_identity(singleton INTEGER PRIMARY KEY CHECK(singleton=1), uuid BLOB NOT NULL UNIQUE CHECK(length(uuid)=16));");

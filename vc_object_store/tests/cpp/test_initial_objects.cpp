@@ -58,7 +58,7 @@ void rollbackAndLifecycle(){
         require(scalar(db,"SELECT count(*) FROM geometry_chunks")==0,"failed initial geometry leaves no chunks");
         require(scalar(db,"SELECT next_id FROM key_allocators WHERE name='objects'")==next,"allocator rollback");};
     fails({{record(),{},{}},{a,{},{}}});fails({{record(),10,{}}});fails({{record(),31,{}}});
-    auto bad=record();bad.uuid=relation;fails({{bad,{},{}}});bad=record();bad.meta="[]";fails({{bad,{},{}}});
+    auto bad=record();bad.meta="[]";fails({{bad,{},{}}});
     bad=record();bad.storageKind="sqlite";fails({{bad,{},{}}});
     auto duplicate=record();fails({{duplicate,{},{}},{duplicate,{},{}}});
     vc::geometry::Fiber data;data.linePoints={{1,2,3},{4,5,6}};
@@ -66,7 +66,7 @@ void rollbackAndLifecycle(){
     fails({{fiber,{},vc::geometry::encode(data)},{a,{},{}}});
     {auto t=store.write();Savepoint all(ObjectStoreImplAccess::conn(t));auto retired=record();retired.retired=true;retired.lifecycleEpoch="epoch";
         InitialObjectRecord input{retired,30,{}};insertInitialObjects(store,t,std::span(&input,1));
-        auto read=store.objectByUuid(t,retired.uuid);require(read&&read->retired&&read->lifecycleEpoch=="epoch","proxy lifecycle preserved with existing local edges");
+        auto read=store.objectByUuid(t,retired.uuid);require(read&&read->retired&&read->lifecycleEpoch=="epoch","supplied lifecycle preserved with existing local edges");
         input={record(),20,{}};insertInitialObjects(store,t,std::span(&input,1)); // hole after exhausted allocator
         require(scalar(ObjectStoreImplAccess::conn(t),"SELECT next_id IS NULL FROM key_allocators WHERE name='objects'")==1,"explicit hole cannot reopen exhausted allocator");
         all.release();t.commit();}

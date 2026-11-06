@@ -18,7 +18,6 @@ private:
     std::optional<int64_t> next_;
     Savepoint save_;
 };
-void createLifecycleSchema(sqlite3*);
 void readLifecycle(sqlite3*, int64_t id, ObjectRecord&);
 void writeLifecycle(sqlite3*, int64_t id, const ObjectRecord&);
 std::string activeObjectSql(const std::string& id);

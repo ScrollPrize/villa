@@ -107,6 +107,7 @@ void copyProject(ObjectStoreSession& session, const AttachmentIdentity& attachme
                              "BEGIN SELECT RAISE(ABORT,'store identity is immutable'); END;"
                              "CREATE TRIGGER store_identity_immutable_delete BEFORE DELETE ON store_identity "
                              "BEGIN SELECT RAISE(ABORT,'store identity is retained'); END;");
+            detail::requireSyncReplica(db);
             detail::execute(db, "UPDATE sync_replica SET uuid=?", util::newUuid());
             for (const auto* table : {"hub_upstream", "hub_versions", "hub_pending", "hub_inflight", "hub_conflicts", "hub_leases"})
                 detail::exec(db, (std::string("DROP TABLE IF EXISTS ") + table + ";").c_str());

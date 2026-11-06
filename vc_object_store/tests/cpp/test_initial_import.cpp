@@ -19,7 +19,7 @@ struct CountConnections {
 };
 InitialImportOptions options(size_t shards=1,bool packed=false)
 {
-    InitialImportOptions result;result.store.author="bulk-api-test";result.shards.clear();
+    InitialImportOptions result;result.store.author="bulk-api-test";result.uuidHashRouting=false;result.shards.clear();
     for(size_t i=0;i<shards;++i)result.shards.push_back({{int64_t(i*100+1),int64_t((i+1)*100)},
         {int64_t(i*100+1),int64_t((i+1)*100)}});
     if(packed){result.packed.emplace();result.packed->memoryFirst=true;result.packed->disposableBulk=true;
@@ -125,23 +125,33 @@ void failures()
 }
 void phased(bool packed)
 {
-    TemporaryDirectory dir;auto opt=options(3,packed);
-    std::vector<std::string> ids(3),edges(3);for(auto& id:ids)id=util::newUuid();for(auto& id:edges)id=util::newUuid();
-    std::atomic<size_t> objectsFinished=0;
+    TemporaryDirectory dir;auto opt=options(2,packed);opt.uuidHashRouting=true;
+    std::vector<std::string> ids(2),edges(2);
+    for(size_t i=0;i<2;++i){
+        do{ids[i]=util::newUuid();}while(uuidShardIndex(ids[i],2)!=i);
+        do{edges[i]=util::newUuid();}while(uuidShardIndex(edges[i],2)!=i);
+    }
+    std::promise<void> firstEdgesImported;auto ready=firstEdgesImported.get_future();
+    std::atomic<bool> secondObjectStarted=false;
     const auto result=importInitialCollection(dir.path/"phased",opt,[&](size_t i,auto& shard){
+        if(i==1){
+            require(ready.wait_for(std::chrono::seconds(5))==std::future_status::ready,
+                "one worker's edges must not wait for other object producers");
+            secondObjectStarted=true;
+        }
         auto row=fiber(ids[i]);row.id=opt.shards[i].objectIds[0];shard.appendObjects(std::span(&row,1));
-        ++objectsFinished;
     },[&](size_t i,auto& shard){
-        require(objectsFinished==3,"all object producers precede any edge producer");
+        if(i==0)require(!secondObjectStarted,"referenced sibling object must not exist yet");
         bool sent=false;shard.importEdges([&](auto& batch){if(sent)return false;sent=true;
             EdgeRecord edge;edge.uuid=edges[i];edge.kind="sibling";edge.aAnchor.points={{"line_points",{1}}};
             edge.bAnchor.points={{"line_points",{0}}};edge.aAnchor.metadataKeys={"native"};
-            batch.push_back({{shard.storeUuid(),ids[i]},{shard.storeUuid(),ids[(i+1)%3]},edge});return true;});
+            batch.push_back({{shard.storeUuid(),ids[i]},{shard.storeUuid(),ids[(i+1)%2]},edge});return true;});
+        if(i==0)firstEdgesImported.set_value();
     });
     auto store=ObjectCollection::open(result.path,OpenOptions{.readOnly=true});auto txn=store.read();
-    for(size_t i=0;i<3;++i) {
+    for(size_t i=0;i<2;++i) {
         const auto edge=store.edge(txn,{result.storeUuid,edges[i]});require(bool(edge),"phased sibling edge published");
-        const ObjectKey a{result.storeUuid,ids[i]},b{result.storeUuid,ids[(i+1)%3]};
+        const ObjectKey a{result.storeUuid,ids[i]},b{result.storeUuid,ids[(i+1)%2]};
         require((edge->a==a&&edge->b==b)||(edge->a==b&&edge->b==a),"phased endpoint identities retained");
         require(store.readGeometryArray(txn,b,"line_points").size()==6*sizeof(double),"phased sibling geometry routes after publication");
     }
@@ -188,13 +198,14 @@ void phaseFailures()
     fail([](size_t,auto&){},[](size_t i,auto&){if(i==0)throw std::runtime_error("edge producer failed");});
     fail([](size_t,auto& shard){shard.importEdges([](auto&){return false;});},[](size_t,auto&){});
     fail([](size_t,auto&){},[](size_t,auto& shard){shard.appendObjects({});});
-    const auto duplicate=util::newUuid();
-    fail([&](size_t,auto& shard){auto row=fiber(duplicate);shard.appendObjects(std::span(&row,1));},[](size_t,auto&){});
-    // Cross-shard geometry validation still rejects an out-of-range anchor.
+    // Per-shard primary key uniqueness remains enforced by SQLite.
+    fail([&](size_t,auto& shard){auto row=fiber(util::newUuid());shard.appendObjects(std::span(&row,1));
+        shard.appendObjects(std::span(&row,1));},[](size_t,auto&){});
+    // Malformed fields still fail without inspecting referenced geometry.
     std::vector<std::string> ids(3);for(auto& id:ids)id=util::newUuid();
     fail([&](size_t i,auto& shard){auto row=fiber(ids[i]);shard.appendObjects(std::span(&row,1));},[&](size_t i,auto& shard){
         bool sent=false;shard.importEdges([&](auto& batch){if(sent)return false;sent=true;
-            EdgeRecord edge;edge.kind="bad";edge.bAnchor.points={{"line_points",{999}}};
+            EdgeRecord edge;edge.kind="bad";edge.uuid="not-a-uuid";
             batch.push_back({{shard.storeUuid(),ids[i]},{shard.storeUuid(),ids[(i+1)%3]},edge});return true;});
     });
     // Uniqueness must reject even cross-batch duplicates before any

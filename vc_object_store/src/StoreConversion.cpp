@@ -107,7 +107,7 @@ Db backupTo(sqlite3* source, const std::filesystem::path& path)
 }
 
 const std::set<std::string> legacyCurrentTables{
-    "geometry_heads","edge_geometry_bindings","edge_lifecycle_bindings","geometry_edge_dependencies"};
+    "geometry_heads","edge_geometry_bindings","edge_lifecycle_bindings","geometry_edge_dependencies","object_lifecycle"};
 
 const std::map<std::string,std::string> legacyDigestColumns{
     {"geometry_chunks","hash"},{"geometry_revisions","content_hash"},
@@ -240,6 +240,7 @@ std::vector<SchemaProgram> retainedLegacyPrograms(sqlite3* db)
         {"geometry_heads",{"object_uuid","revision_uuid"}},
         {"edge_geometry_bindings",{"edge_id","a_revision","b_revision"}},
         {"edge_lifecycle_bindings",{"edge_id","a_epoch","b_epoch"}},
+        {"object_lifecycle",{"object_id","retired","epoch"}},
         {"geometry_edge_dependencies",{"edge_id","object_id","array_name","point_id"}}};
     for(const auto& [table,columns]:expected) {
         Statement schema(db,"SELECT name FROM pragma_table_xinfo(?) ORDER BY cid",table);
@@ -247,7 +248,8 @@ std::vector<SchemaProgram> retainedLegacyPrograms(sqlite3* db)
         if(actual.empty()&&table=="geometry_edge_dependencies")continue;
         if(actual!=columns)throw std::runtime_error("conversion: custom legacy bookkeeping columns require an explicit migration: "+table);
         Statement indexes(db,"SELECT name FROM sqlite_schema WHERE type='index' AND tbl_name=? AND sql IS NOT NULL",table);
-        while(indexes.row())if(table!="geometry_edge_dependencies"||indexes.text(0)!="geometry_dependencies_edge")
+        while(indexes.row())if(!((table=="geometry_edge_dependencies"&&indexes.text(0)=="geometry_dependencies_edge")||
+                                (table=="object_lifecycle"&&indexes.text(0)=="retired_objects")))
             throw std::runtime_error("conversion: custom index on removed bookkeeping table requires an explicit migration: "+indexes.text(0));
     }
     std::vector<SchemaProgram> result;
@@ -308,7 +310,7 @@ ConversionReport convertV1ToV2(const std::filesystem::path& input)
     auto target=backupTo(source.get(),staged.path);
     exec(target.get(), "PRAGMA synchronous=FULL; PRAGMA foreign_keys=OFF; BEGIN IMMEDIATE;");
     createProvisioning(target.get(), true, true);
-    exec(target.get(),"INSERT INTO store_required_features VALUES('direct-geometry-v1'),('binary-sha256-v1'),('direct-endpoint-keys-v1');");
+    exec(target.get(),"INSERT INTO store_required_features VALUES('direct-geometry-v1'),('binary-sha256-v1'),('direct-endpoint-keys-v1'),('inline-lifecycle-v1');");
     for (const auto* name : {"objects","edges"}) {
         Statement ids(target.get(),"SELECT coalesce(max(id),0) FROM "+quoteSqlIdentifier(name)); ids.row();
         Statement owner(target.get(),"SELECT uuid FROM store_identity"); owner.row();
@@ -320,7 +322,9 @@ ConversionReport convertV1ToV2(const std::filesystem::path& input)
     exec(target.get(), "ALTER TABLE object_revisions ADD COLUMN generation INTEGER NOT NULL DEFAULT 0;"
                        "ALTER TABLE relationship_revisions ADD COLUMN generation INTEGER NOT NULL DEFAULT 0;"
                        "ALTER TABLE objects ADD COLUMN geometry_manifest TEXT;"
-                       "ALTER TABLE objects ADD COLUMN deleted INTEGER NOT NULL DEFAULT 0 CHECK(deleted IN (0,1));");
+                       "ALTER TABLE objects ADD COLUMN deleted INTEGER NOT NULL DEFAULT 0 CHECK(deleted IN (0,1));"
+                       "ALTER TABLE objects ADD COLUMN retired INTEGER NOT NULL DEFAULT 0 CHECK(retired IN (0,1));"
+                       "ALTER TABLE objects ADD COLUMN lifecycle_epoch TEXT NOT NULL DEFAULT '';");
     exec(target.get(),"DROP INDEX IF EXISTS edges_unique;");
     {
         const auto programs=schemaPrograms(target.get());
@@ -329,6 +333,10 @@ ConversionReport convertV1ToV2(const std::filesystem::path& input)
         // definitions while the old table name is absent, including indirect
         // references and triggers owned by other tables. No SQL-text guessing.
         suspendPrograms(target.get(),programs,true);
+        // This is representation migration, not an object edit. Populate the
+        // inline lifecycle only while history/extension triggers are suspended.
+        exec(target.get(),"UPDATE objects SET retired=coalesce((SELECT retired FROM object_lifecycle WHERE object_id=objects.id),0),"
+            "lifecycle_epoch=coalesce((SELECT epoch FROM object_lifecycle WHERE object_id=objects.id),'');");
         convertLegacyDigests(target.get());
         // Recognized native endpoint history programs are replaced above;
         // unaffected extensions retain their exact SQL. Keep INSTEAD OF triggers
@@ -363,7 +371,7 @@ ConversionReport convertV1ToV2(const std::filesystem::path& input)
     Statement tables(source.get(), "SELECT name,wr FROM pragma_table_list WHERE schema='main' AND type<>'view' AND name<>'sqlite_schema' ORDER BY name");
     while (tables.row()) {
         const auto name = tables.text(0);
-        if (name == "sqlite_temp_schema" || legacyCurrentTables.contains(name)) continue;
+        if (name == "sqlite_temp_schema" || (legacyCurrentTables.contains(name)&&name!="object_lifecycle")) continue;
         Statement columns(source.get(), "SELECT name FROM pragma_table_xinfo(?) ORDER BY cid", name);
         std::string projection = tables.i64(1) ? "" : "rowid";
         std::vector<std::string> columnNames;
@@ -392,7 +400,10 @@ ConversionReport convertV1ToV2(const std::filesystem::path& input)
                 else convertedProjection+=quoteSqlIdentifier(column);
             }
         }
-        Statement converted(source.get(), "SELECT " + convertedProjection + " FROM converted." + quoteSqlIdentifier(name) + " ORDER BY " + order);
+        const auto convertedQuery=name=="object_lifecycle"
+            ? "SELECT id,id,retired,lifecycle_epoch FROM converted.objects WHERE id IN (SELECT object_id FROM main.object_lifecycle) ORDER BY id"
+            : "SELECT " + convertedProjection + " FROM converted." + quoteSqlIdentifier(name) + " ORDER BY " + order;
+        Statement converted(source.get(), convertedQuery);
         while (true) {
             const bool a = original.row(), b = converted.row();
             if (a != b) throw std::runtime_error("conversion: row count differs: " + name);
@@ -447,7 +458,7 @@ void changeHistoryMode(const std::filesystem::path& input, HistoryMode mode)
     using namespace detail;
     const auto path=std::filesystem::absolute(input);
     auto source=exclusive(path,18);
-    for(const auto* name:{"direct-geometry-v1","binary-sha256-v1","direct-endpoint-keys-v1"}) {
+    for(const auto* name:{"direct-geometry-v1","binary-sha256-v1","direct-endpoint-keys-v1","inline-lifecycle-v1"}) {
         Statement feature(source.get(),"SELECT 1 FROM store_required_features WHERE name=?",std::string(name));
         if(!feature.row())throw std::runtime_error("history policy: legacy current-state layout requires separate conversion");
     }
@@ -470,7 +481,7 @@ void changeHistoryMode(const std::filesystem::path& input, HistoryMode mode)
         createProvisioning(result.get(),history,policy.i64(2)!=0);
         createSchema(result.get(),history);
         if (history) createHistorySchema(result.get());
-        createLifecycleSchema(result.get()); createGeometryHistoryIndex(result.get());
+        createGeometryHistoryIndex(result.get());
         Statement sourceIndex(source.get(),"SELECT 1 FROM sqlite_schema WHERE type='table' AND name='source_collections'");
         if(sourceIndex.row())createSourceIdentityIndex(result.get());
         createStorageDirectory(result.get()); createChangeTracking(result.get());

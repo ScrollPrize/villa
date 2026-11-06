@@ -3,6 +3,7 @@
 #include "vc_object_store/objects/PackedStore.hpp"
 #include "vc_object_store/geometry/Geometry.hpp"
 #include "internal/RecordSql.hpp"
+#include "internal/Anchors.hpp"
 #include <nlohmann/json.hpp>
 
 using namespace vc::objects;
@@ -40,7 +41,7 @@ int main()
         const auto count=store.importInitialEdges(txn,[&](auto& batch){
             for(int n=0;n<2 && next<inputs.size();++n)batch.push_back(inputs[next++]);
             return !batch.empty();
-        },{defer,2,3});
+        },{defer,3});
         require(count==7,"all streamed relation batches imported");
     };
     std::vector<CollectionEdge> expected;
@@ -100,16 +101,17 @@ int main()
         auto indexed=inputs.front();indexed.a=a;indexed.b=b;
         indexed.record.aAnchor.wholeGeometry=false;
         indexed.record.aAnchor.points.push_back({"line_points",{1}});
-        auto rejected=inputs.back();rejected.a=a;rejected.b=c;bool supplied=false;
+        auto rejected=inputs.back();rejected.a=a;rejected.b=c;rejected.record.meta="[]";bool supplied=false;
         mustFail([&]{store.importInitialEdges(w,[&](auto& batch){
             if(supplied)return false;supplied=true;batch.push_back(rejected);return true;
         },{true,1});});
-        require(store.edgesByKind(w,"perpendicular").empty(),"retired endpoint rejects stream without partial rows");
-        auto late=inputs.back();late.a=a;late.b=d;
+        require(store.edgesByKind(w,"perpendicular").empty(),"invalid record rejects stream without partial rows");
+        auto late=inputs.back();late.a=a;late.b=c;
+        late.record.aAnchor.points={{"line_points",{999}}};late.record.aAnchor.wholeGeometry=false;
         store.importInitialEdges(w,[&](auto& batch){
             if(next==2)return false;batch.push_back(next++?late:indexed);return true;
         },{true,1});
-        mustFail([&]{store.importInitialObjects(w,{});});
+        require(store.importInitialObjects(w,{}).empty(),"trusted empty object batch remains a no-op after relations");
         w.commit();
         auto r=store.read();require(store.object(r,c)->record.retired,"readonly retired endpoint remains retired");
         require(!store.object(r,d)->record.retired,"late active endpoint remains active");
@@ -118,6 +120,14 @@ int main()
         auto rt=raw.read();
         const auto actual=store.edge(r,{store.uuid(r),indexed.record.uuid});
         require(actual&&((actual->a==a&&actual->b==b)||(actual->a==b&&actual->b==a)),"initial indexed edge retains direct endpoint keys");
+        detail::Statement unchecked(ObjectStoreImplAccess::conn(rt),
+            "SELECT a_uuid,b_uuid,a_dependencies,b_dependencies FROM edges WHERE uuid=?",detail::parseUuid(late.record.uuid));
+        require(unchecked.row(),"trusted import persists references that ordinary graph readers may hide");
+        const auto first=detail::formatUuid(unchecked.blob16(0)),second=detail::formatUuid(unchecked.blob16(1));
+        require((first==a.objectUuid&&second==c.objectUuid)||(first==c.objectUuid&&second==a.objectUuid),
+            "trusted initial import stores supplied retired endpoint UUIDs");
+        require(Json::parse(unchecked.text(first==a.objectUuid?2:3))==detail::dependenciesToJson(late.record.aAnchor),
+            "indexed geometry references are persisted without fetching or validating endpoint geometry");
         require(store.currentGeometry(r,a).has_value(),"indexed geometry resolves through the collection");
         detail::Statement counts(ObjectStoreImplAccess::conn(rt),"SELECT (SELECT count(*) FROM objects),"
             "(SELECT count(*) FROM fibers),(SELECT count(*) FROM objects WHERE geometry_manifest IS NOT NULL),(SELECT count(*) FROM geometry_chunks),"

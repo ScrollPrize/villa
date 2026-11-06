@@ -83,10 +83,10 @@ void ObjectStore::deleteObject(WriteTxn& txn, const std::string& uuid)
     beforeCurrentObjectEdit(db,uuid);
     // Keep only the same-key deletion marker, not live subtype identities or
     // tags. In particular a deleted track must release its source identity.
-    for(const auto* table:{"fibers","surfaces","tracks","object_tags","object_lifecycle"})
+    for(const auto* table:{"fibers","surfaces","tracks","object_tags"})
         execute(db,std::string("DELETE FROM ")+table+" WHERE object_id=?",row.i64(0));
     clearGeometryMaterialization(db,uuid);
-    execute(db,"UPDATE objects SET deleted=1,geometry_manifest=NULL,storage_kind='',storage_ref='',data_generation=0,data_checksum=NULL,"
+    execute(db,"UPDATE objects SET deleted=1,retired=0,lifecycle_epoch='',geometry_manifest=NULL,storage_kind='',storage_ref='',data_generation=0,data_checksum=NULL,"
         "generation=?,changed_by=?,changed_host=?,changed_at=? WHERE id=?",
         writeGeneration(db),impl_->options.author,impl_->hostname,nowIsoUtc(),row.i64(0));
     appendJournal(db, impl_->options.author, impl_->hostname, bytes, 0, "delete", kind);

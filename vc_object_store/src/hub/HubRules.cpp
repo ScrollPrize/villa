@@ -96,6 +96,7 @@ std::string isoFromMicros(int64_t micros)
 
 std::string replicaIdentity(sqlite3* db)
 {
+    requireSyncReplica(db);
     Statement row(db, "SELECT uuid FROM sync_replica WHERE singleton=1");
     if (!row.row()) throw std::runtime_error("object store: missing replica identity");
     return row.text(0);

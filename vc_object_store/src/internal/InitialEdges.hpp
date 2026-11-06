@@ -5,25 +5,18 @@
 
 namespace vc::objects::detail {
 struct EdgeInsertRow;
-// Private initial-state construction only. Caller owns a savepoint spanning
-// the entire stream and must roll it back on failure. Existing endpoints must
-// remain immutable unless invalidateEndpoint is called before their next use.
-// finish validates UUID namespace disjointness for private immutable imports
-// and restores deferred accelerators before graph reads/publication. Mutable
-// lower-level streams validate UUID namespace collisions during append.
+// Trusted initial-state construction only. Caller owns the complete input and
+// savepoint; endpoint existence, state, geometry and cross-table UUID identity
+// are not rediscovered here. finish restores deferred lookup indexes only.
 class InitialEdgeInserter {
 public:
     InitialEdgeInserter(ObjectStore&, WriteTxn&, bool deferIndexes = true,
-                        size_t maxCachedEndpoints = 65536,size_t sqlBatchRows = 1);
+                        size_t sqlBatchRows = 1);
     ~InitialEdgeInserter();
     InitialEdgeInserter(const InitialEdgeInserter&) = delete;
     InitialEdgeInserter& operator=(const InitialEdgeInserter&) = delete;
-    void append(std::span<const EdgeRecord>);
-    // Endpoint keys/dependencies already checked by the collection
-    // preparation boundary. This performs only native row preparation/writes.
-    void appendResolved(std::span<EdgeRecord>);
+    void append(std::span<EdgeRecord>);
     void finish();
-    void invalidateEndpoint(const std::string&);
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;

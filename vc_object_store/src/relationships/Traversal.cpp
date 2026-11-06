@@ -92,7 +92,7 @@ std::vector<std::string> traverse(sqlite3* db, const std::string& startUuid, int
             const_cast<std::atomic_bool*>(cancel));
     const auto startBytes = parseUuid(startUuid);
     auto active=[&](const std::string& uuid) {
-        Statement local(db,"SELECT o.deleted,coalesce(l.retired,0) FROM objects o LEFT JOIN object_lifecycle l ON l.object_id=o.id WHERE o.uuid=?",parseUuid(uuid));
+        Statement local(db,"SELECT deleted,retired FROM objects WHERE uuid=?",parseUuid(uuid));
         if(local.row())return !local.i64(0)&&(includeRetired||!local.i64(1));
         return includeRetired||!externalEndpointRecord(db,uuid).retired;
     };

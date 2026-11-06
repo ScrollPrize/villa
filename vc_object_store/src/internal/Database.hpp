@@ -76,6 +76,7 @@ extern thread_local std::unordered_map<sqlite3*, StatementPool*> activeStatement
 namespace detail {
 bool historyEnabled(sqlite3*);
 void requireHistory(sqlite3*);
+void requireSyncReplica(sqlite3*);
 bool spatialEnabled(sqlite3*);
 void requireSpatial(sqlite3*);
 int64_t writeGeneration(sqlite3*);

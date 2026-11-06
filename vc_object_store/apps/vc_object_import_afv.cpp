@@ -119,10 +119,12 @@ Json importNative(const Json& config,const std::filesystem::path& input,const st
     if(!linked&&hasEdges)edgeSource=std::make_unique<AfcSource>(config.at("constraints").get<std::string>(),sourceUuid,
         limit?ranges.back()[1]:INT64_MAX);
     InitialImportOptions options;options.store.author=config.value("author",std::string("afv-import"));
+    // This streaming source partitions by AFV numeric ID ranges, not UUID hash.
+    // Do not advertise direct UUID routing until the producer is repartitioned.
+    options.uuidHashRouting=false;
     options.store.sqliteCacheBytes=config.value("sqlite_cache_bytes",options.store.sqliteCacheBytes);
     options.store.readerPoolSize=1;options.store.geometryCacheBytes=0;options.store.spatialCacheBytes=0;
     options.edges.deferIndexes=config.value("defer_indexes",true);
-    options.edges.maxCachedEndpoints=config.value("endpoint_cache_entries",size_t(65536));
     options.edges.sqlBatchRows=config.value("sql_batch_rows",size_t(1));
     if(config.value("packed",false)){
         options.packed=PackedStoreOptions{};options.packed->disposableBulk=true;

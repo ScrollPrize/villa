@@ -13,7 +13,7 @@ nlohmann::json dependencyMetadata(const nlohmann::json&, const Anchor&);
 // Identical dependency projection, without loading unrelated current-object data.
 nlohmann::json currentDependencyMetadata(sqlite3*, const std::string& objectUuid, const Anchor&);
 nlohmann::json historicalDependencyMetadata(sqlite3*, const std::string& revision, const Anchor&);
-// Shared dependency projection for an immutable endpoint cached by a batch.
+// Shared dependency projection for current/archived records and v1 conversion.
 nlohmann::json dependencyFields(const nlohmann::json* metadata, bool retired,
     const std::string& lifecycleEpoch, const Anchor&);
 // Latest-head checks reuse the selected-revision dependency evaluator. Indexed

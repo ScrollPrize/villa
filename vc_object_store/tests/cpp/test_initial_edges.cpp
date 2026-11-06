@@ -7,6 +7,7 @@
 #include "vc_object_store/objects/InitialImport.hpp"
 #include <iostream>
 #include <limits>
+#include <string_view>
 
 using namespace vc::objects;
 using namespace vc::objects::detail;
@@ -35,12 +36,11 @@ EdgeRecord edge(bool points=false) {
 }
 nlohmann::json snapshot(sqlite3* db) {
     nlohmann::json rows=nlohmann::json::array();
-    Statement s(db,"SELECT e.uuid,e.a_uuid,e.b_uuid,e.kind,e.generation,e.approval_state,e.meta,e.a_dependencies,e.b_dependencies,"
-        "e.uuid "
+    Statement s(db,"SELECT e.uuid,e.a_uuid,e.b_uuid,e.kind,e.generation,e.approval_state,e.meta,e.a_dependencies,e.b_dependencies "
         "FROM edges e "
         "ORDER BY e.id");
     while(s.row()) {nlohmann::json row=nlohmann::json::array();
-        for(int i=0;i<10;++i) {
+        for(int i=0;i<9;++i) {
             if(i<3) row.push_back(formatUuid(s.blob16(i)));
             else if(i==4) row.push_back(s.i64(i));
             else row.push_back(s.text(i));
@@ -67,7 +67,7 @@ void parity(bool geometry,bool defer,size_t sqlRows=1,size_t rowCount=2,int vari
         else {
             exec(db,"CREATE INDEX custom_edge_index ON edges(generation)");
             if(variables)sqlite3_limit(db,SQLITE_LIMIT_VARIABLE_NUMBER,variables);
-            Savepoint whole(db);InitialEdgeInserter initial(*store,txn,defer,1,sqlRows);
+            Savepoint whole(db);InitialEdgeInserter initial(*store,txn,defer,sqlRows);
             const auto first=rowCount>2?size_t(65):size_t(1);
             initial.append(std::span(input).first(first));initial.append(std::span(input).subspan(first));initial.finish();whole.release();
             require(scalar(db,"SELECT count(*) FROM sqlite_schema WHERE name='edges_a'")==1,"restored index");
@@ -101,57 +101,65 @@ void failures(size_t sqlRows=1) {
     TemporaryDirectory dir;OpenOptions opts;opts.author="test";opts.history=HistoryMode::Off;
     auto store=ObjectStore::create(dir.path/"failures.vcobj",opts);
     {auto tx=store.write();objects(store,tx,true);tx.commit();}
-    auto run=[&](const std::vector<EdgeRecord>& input) {
+    auto run=[&](std::vector<EdgeRecord> input) {
         auto tx=store.write();auto* db=ObjectStoreImplAccess::conn(tx);const auto before=scalar(db,"SELECT next_id FROM key_allocators WHERE name='edges'");
-        {Savepoint whole(db);InitialEdgeInserter initial(store,tx,true,2,sqlRows);
+        {Savepoint whole(db);InitialEdgeInserter initial(store,tx,true,sqlRows);
             mustFail([&]{initial.append(input);});mustFail([&]{initial.finish();});}
         require(scalar(db,"SELECT count(*) FROM edges")==0,"whole stream rolled back");
         require(scalar(db,"SELECT next_id FROM key_allocators WHERE name='edges'")==before,"allocator rolled back");
         require(scalar(db,"SELECT count(*) FROM sqlite_schema WHERE name='edges_a'")==1,"deferred indexes rolled back");tx.commit();
     };
     auto good=edge(true),bad=good;run({good,bad});
-    bad=edge(true);bad.uuid=a;run({good,bad});
-    bad=edge(true);bad.aUuid=util::newUuid();run({good,bad});
     bad=edge(true);bad.meta="[]";run({good,bad});
     bad=edge(true);bad.uuid="invalid";run({good,bad});
     bad=edge(true);bad.aAnchor.position=std::array<double,3>{0,std::numeric_limits<double>::infinity(),0};run({good,bad});
-    bad=edge(true);bad.aAnchor.points={{"line_points",{999}}};run({good,bad});
     bad=edge(true);bad.aUuid=bad.bUuid;bad.aAnchor.points=bad.bAnchor.points;run({good,bad});
     std::vector<EdgeRecord> across;
     for(int i=0;i<513;++i){auto e=edge(true);across.push_back(std::move(e));}
-    across.back()=across.front();run(across); // failure beyond two full UUID-check chunks
-    across.back()=edge(true);across.back().uuid=a;run(across); // collision in a partial check chunk
+    across.back()=across.front();run(across); // SQLite primary-key rejection in a late SQL chunk
     {auto tx=store.write();Savepoint whole(ObjectStoreImplAccess::conn(tx));InitialEdgeInserter initial(store,tx);
         initial.append(std::span(&good,1));initial.finish();whole.release();tx.commit();}
     {auto tx=store.write();mustFail([&]{InitialEdgeInserter initial(store,tx);});}
     opts.history=HistoryMode::On;auto historical=ObjectStore::create(dir.path/"history.vcobj",opts);
     auto tx=historical.write();mustFail([&]{InitialEdgeInserter initial(historical,tx);});
 }
-void invalidateAndExhaust() {
+void exhaustIds() {
     TemporaryDirectory dir;OpenOptions opts;opts.author="test";opts.history=HistoryMode::Off;
     opts.edgeIdRange={std::numeric_limits<int64_t>::max()-1,std::numeric_limits<int64_t>::max()};
     auto store=ObjectStore::create(dir.path/"range.vcobj",opts);auto tx=store.write();auto* db=ObjectStoreImplAccess::conn(tx);
     objects(store,tx);Savepoint whole(db);InitialEdgeInserter initial(store,tx,false,2);
     auto first=edge();initial.append(std::span(&first,1));
-    // Revalidate the first edge after changing its endpoint, then explicitly
-    // invalidate the initial writer's immutable endpoint cache.
-    auto obj=*store.objectByUuid(tx,a);obj.meta=R"({"a":9,"null":null})";store.upsertObject(tx,obj);
-    store.retainRelationship(tx,first.uuid);initial.invalidateEndpoint(a);
     auto second=edge();initial.append(std::span(&second,1));initial.finish();whole.release();
     require(scalar(db,"SELECT count(*) FROM edges WHERE id=9223372036854775807")==1,"maximum ID allocated without overflow");
     require(scalar(db,"SELECT next_id IS NULL FROM key_allocators WHERE name='edges'")==1,"range exhausted");tx.commit();
 }
-void rejectRetiredEndpoint() {
+void trustedEndpointInputs() {
     TemporaryDirectory dir;OpenOptions opts;opts.author="test";opts.history=HistoryMode::Off;
     auto store=ObjectStore::create(dir.path/"retired.vcobj",opts);auto e=edge();
     e.aAnchor.metadataKeys.clear();e.bAnchor.metadataKeys.clear();
     {auto tx=store.write();objects(store,tx);store.retireObject(tx,a);tx.commit();}
     {auto tx=store.write();
-        Savepoint whole(ObjectStoreImplAccess::conn(tx));InitialEdgeInserter initial(store,tx);
-        mustFail([&]{initial.append(std::span(&e,1));});}
-    {auto tx=store.read();require(!store.edgeByUuid(tx,e.uuid),"failed retired-endpoint import leaves no edge");}
-    {auto tx=store.write();store.restoreObject(tx,a);tx.commit();}
-    {auto tx=store.read();require(!store.edgeByUuid(tx,e.uuid),"restoration cannot revive rejected relationship");}
+        auto* sql=ObjectStoreImplAccess::conn(tx);Savepoint whole(sql);InitialEdgeInserter initial(store,tx);
+        {
+            struct NoEndpointReads {
+                sqlite3* db;
+                explicit NoEndpointReads(sqlite3* value):db(value){
+                    require(sqlite3_set_authorizer(db,[](void*,int action,const char* table,const char*,const char*,const char*){
+                        if(action==SQLITE_READ&&table){const std::string_view name(table);
+                            if(name=="objects"||name=="fibers"||name=="object_lifecycle"||name.starts_with("geometry_"))return SQLITE_DENY;}
+                        return SQLITE_OK;
+                    },nullptr)==SQLITE_OK,"install endpoint read prohibition");}
+                ~NoEndpointReads(){sqlite3_set_authorizer(db,nullptr,nullptr);}
+            } forbid(sql);
+            initial.append(std::span(&e,1));
+            auto absent=edge();absent.aUuid=util::newUuid();absent.bUuid=util::newUuid();
+            absent.aAnchor.points={{"line_points",{999}}};initial.append(std::span(&absent,1));
+            initial.finish();
+        }
+        whole.release();tx.commit();}
+    {auto tx=store.read();require(store.edgeByUuid(tx,e.uuid).has_value(),"trusted import stores retired endpoint references without resolving them");
+        require(scalar(ObjectStoreImplAccess::conn(tx),"SELECT count(*) FROM edges")==2,"trusted import stores absent endpoint and unverified geometry references");}
+    {auto tx=store.write();auto checked=edge();mustFail([&]{store.addEdge(tx,checked);});}
 }
 
 void sharedStatementBindings()
@@ -209,9 +217,9 @@ void resolvedMutableRows()
             record.kind=i%2?"parallel":"perpendicular";
             record.meta=nlohmann::json({{"index",i},{"payload",std::string(size_t(i+1),'x')}}).dump();
             originals.push_back(record);records.push_back(std::move(record));}
-        Savepoint save(sql);InitialEdgeInserter writer(db,txn,true,2,32);
-        writer.appendResolved(std::span(records).first(33));
-        writer.appendResolved(std::span(records).subspan(33));
+        Savepoint save(sql);InitialEdgeInserter writer(db,txn,true,32);
+        writer.append(std::span(records).first(33));
+        writer.append(std::span(records).subspan(33));
         writer.finish();save.release();
         // The insert must own bytes already; destroy/replace all borrowed input fields.
         for(auto& record:records){record.kind.assign(2000,'k');record.meta.assign(2000,'m');}
@@ -228,49 +236,11 @@ void resolvedMutableRows()
                 "resolved shared provenance mismatch");}
 }
 }
-void immutableNamespaceCollisions() {
-    TemporaryDirectory dir;OpenOptions options;options.author="test";options.history=HistoryMode::Off;
-    const auto basePath=dir.path/"base.vcobj";ObjectKey external;
-    {
-        auto base=ObjectStore::create(basePath,options);auto tx=base.write();
-        ObjectRecord object;object.uuid=util::newUuid();object.kind="note";
-        external={base.uuid(tx),base.upsertObject(tx,object)};base.seal(tx);tx.commit();
-    }
-    for(bool packed:{false,true})for(bool foreign:{false,true}) {
-        InitialImportOptions opt;opt.store.author="test";opt.dependencies={basePath};
-        if(packed){opt.packed.emplace();opt.packed->memoryFirst=true;opt.packed->disposableBulk=true;
-            opt.packed->backgroundFlush=false;opt.packed->residentBytes=64*1024*1024;}
-        const auto output=dir.path/(std::string("failed-")+(packed?"packed-":"plain-")+(foreign?"external":"owned"));
-        bool exhausted=false,caught=false;
-        mustFail([&]{importInitialCollection(output,opt,[&](size_t,InitialShardImport& part){
-            std::vector<InitialObjectRecord> rows(2);
-            rows[0].record.uuid=a;rows[1].record.uuid=b;
-            for(auto& row:rows)row.record.kind="note";
-            part.appendObjects(rows);
-            bool sent=false;
-            try {part.importEdges([&](auto& batch){
-                if(sent){exhausted=true;return false;}sent=true;
-                EdgeRecord record;record.kind="perpendicular";
-                record.uuid=a;
-                batch.push_back({{part.storeUuid(),a},foreign?external:ObjectKey{part.storeUuid(),b},record});
-                return true;
-            });}catch(const std::exception& error){
-                caught=true;require(std::string(error.what()).find("UUID already belongs")!=std::string::npos,
-                    "namespace collision must report the actual validation failure");
-            }
-        });});
-        require(exhausted&&caught,"private UUID collision checked at finish after source exhaustion");
-        require(!std::filesystem::exists(output),"caught finish failure must still prevent publication");
-        for(const auto& entry:std::filesystem::directory_iterator(dir.path))
-            require(entry.path().filename().string().find(output.filename().string())!=0,
-                "failed private import staging must be cleaned");
-    }
-}
 int main() {try {
     const std::string mixed="AbCdEFab-1234-ABcd-5678-90aBcDeF0123";
     require(util::canonicalUuid(mixed)==formatUuid(parseUuid(mixed)),"single-pass UUID normalization matches binary representation");
     for(size_t i=0;i<mixed.size();++i){auto invalid=mixed;invalid[i]='!';mustFail([&]{util::canonicalUuid(invalid);});}
     mustFail([]{util::canonicalUuid("");});
     parity(false,false);parity(false,true);parity(true,true);
-    parity(false,true,64,133);parity(true,true,64,133,99);failures();failures(64);invalidateAndExhaust();rejectRetiredEndpoint();sharedStatementBindings();resolvedMutableRows();immutableNamespaceCollisions();
+    parity(false,true,64,133);parity(true,true,64,133,99);failures();failures(64);exhaustIds();trustedEndpointInputs();sharedStatementBindings();resolvedMutableRows();
     std::cout<<"initial edge tests passed\n";return 0;}catch(const std::exception& e){std::cerr<<e.what()<<'\n';return 1;}}

@@ -28,8 +28,8 @@ nlohmann::json detail::currentDependencyMetadata(sqlite3* db,const std::string& 
     // serialization are dependencies. Do not even fetch/parse meta when the
     // relationship declares no metadata keys; lifecycle checks remain present.
     Statement row(db,anchor.metadataKeys.empty()
-        ? "SELECT (o.deleted OR coalesce(l.retired,0)),coalesce(l.epoch,''),NULL FROM objects o LEFT JOIN object_lifecycle l ON l.object_id=o.id WHERE o.uuid=?"
-        : "SELECT (o.deleted OR coalesce(l.retired,0)),coalesce(l.epoch,''),o.meta FROM objects o LEFT JOIN object_lifecycle l ON l.object_id=o.id WHERE o.uuid=?",
+        ? "SELECT (deleted OR retired),lifecycle_epoch,NULL FROM objects WHERE uuid=?"
+        : "SELECT (deleted OR retired),lifecycle_epoch,meta FROM objects WHERE uuid=?",
         parseUuid(object));
     if(!row.row()) {
         const auto record=externalEndpointRecord(db,object);
@@ -303,8 +303,7 @@ void detail::beforeCurrentObjectEdit(sqlite3* db,const std::string& input)
     const auto uuid=formatUuid(parseUuid(input));
     const auto& state=activeStatementPools.at(db)->currentWrite;
     if(state&&state->before.contains(uuid))return;
-    Statement object(db,"SELECT meta,(o.deleted OR coalesce(l.retired,0)),coalesce(l.epoch,'') "
-        "FROM objects o LEFT JOIN object_lifecycle l ON l.object_id=o.id WHERE o.uuid=?",parseUuid(uuid));
+    Statement object(db,"SELECT meta,(deleted OR retired),lifecycle_epoch FROM objects WHERE uuid=?",parseUuid(uuid));
     if(!object.row())return;
     mutableCurrentWrite(db).before.emplace(uuid,Json{{"meta",Json::parse(object.text(0))},
         {"retired",bool(object.i64(1))},{"lifecycle_epoch",object.text(2)}});

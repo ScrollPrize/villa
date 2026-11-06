@@ -1,6 +1,5 @@
 #pragma once
 #include "vc_object_store/objects/ObjectCollection.hpp"
-#include "internal/InitialEndpoints.hpp"
 struct sqlite3;
 
 namespace vc::objects::detail {
@@ -11,11 +10,10 @@ bool immutableInitial(sqlite3*);
 struct InitialCollectionAccess {
     static ObjectCollection create(const std::filesystem::path&,
         const std::vector<std::filesystem::path>&,const OpenOptions&);
-    static void setEndpoints(ObjectCollection&,std::shared_ptr<const InitialEndpointDirectory>);
     static CollectionMember sealShard(ObjectCollection&,CollectionTxn&);
     // Builder-owned private destination and already completed shard descriptors.
     // Writes routing directly; never opens or validates a collection/shard.
     static void writeManifest(const std::filesystem::path&,
-        const std::vector<CollectionMember>&,const OpenOptions&);
+        const std::vector<CollectionMember>&,const OpenOptions&,bool uuidHashRouting);
 };
 }
