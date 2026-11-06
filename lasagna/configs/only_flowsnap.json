@@ -21,16 +21,8 @@
 			"name": "snap",
 			"steps": 1000,
 			"min_scaledown": 0,
-			"lr": [
-				1.0,
-				0.1,
-				0.01,
-				0.001,
-				0.0001
-			],
-			"params": [
-				"mesh_ms"
-			],
+			"lr": [1.0, 0.1, 0.01, 0.001, 0.0001],
+			"params": ["mesh_ms"],
 			"args": {
 				"pred_dt_flow_gate": {
 					"enabled": true,
