@@ -141,10 +141,13 @@ For `flatten_solver: "forward"`:
 2. A regular output canvas is chosen from UV bounds plus
    `flatten_output_margin` padding, but never smaller than the old 20 percent
    larger source-based canvas.
-3. Candidate source cells are found by a KD-tree over UV cell centers when
-   `scipy.spatial.cKDTree` is available.
-4. Each output UV pixel tries barycentric coordinates in the candidate cell's
-   `(p00,p10,p01)` and `(p10,p11,p01)` triangles.
+3. Each valid source cell's fixed-diagonal UV triangles, `(p00,p10,p01)` and
+   `(p10,p11,p01)`, are rasterized: only the output pixels inside a triangle's
+   bounding box are tested with barycentric coordinates. The cost scales with
+   the number of source cells, not with the output canvas, and no spatial
+   index is needed.
+4. Where triangles overlap (folds), the smallest barycentric residual wins,
+   then the nearest cell center, then the first triangle.
 5. Successful inversions barycentrically sample the same source mesh triangle.
 6. Failed inversions remain invalid and export as `-1`.
 
@@ -172,10 +175,8 @@ Additional synthetic smoke:
 
 ## Known Limitations
 
-- Forward export uses a CPU KD-tree candidate search and vectorized barycentric
-  triangle solves on the model device. Large outputs may still need profiling.
-- `scipy.spatial.cKDTree` is optional for small exports but required by the
-  current implementation for large forward exports.
+- Forward export rasterizes the source triangles on the CPU in bounded
+  batches; it does not use the model device.
 - Triangle orientation and source-axis ordering are penalties, not hard
   constraints. Bad steps can still cross either barrier if weights or step
   caps are too loose.
@@ -203,11 +204,8 @@ Good follow-up tasks:
 - Benchmark `flatten_fast.json` vs `flatten_long.json` on a representative
   real tifxyz and record wall time, final loss, valid output fraction, and
   visual quality.
-- Profile `_flatten_invert_forward_uv_map(...)` on large outputs.
 - Save the optimized forward UV map in checkpoints under a separate field,
   for example `flatten_forward_uv_flat`, while keeping `flatten_map_flat`
   as the compatible exported inverse map.
 - Add a stricter line-search or projected update for forward UV orientation if
   real data shows fold spikes.
-- Consider a faster spatial index for UV inversion if KD-tree candidate search
-  becomes the export bottleneck.
