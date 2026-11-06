@@ -100,17 +100,18 @@ void HostedAttachment::check()
         if (status.storeUuid != storeUuid_)
             throw std::runtime_error("hosted store: " + client_.endpoint() + " now serves another store");
         auto cursor = *cursor_;
-        std::vector<std::pair<FeedCommit, ChangeRecord>> changes;
+        // Keep each feed page's commit once: copying it per change duplicates
+        // its entire change vector and makes bulk edits quadratic in memory.
+        std::vector<FeedCommit> commits;
         bool revalidate = false;
         while (cursor.generation != status.generation || cursor.sequence < status.commitSequence || cursor.offset) {
-            const auto page = client_.changesSince(cursor);
+            auto page = client_.changesSince(cursor);
             if (!page.cursorValid) {
                 revalidate = true;
                 cursor = page.next;
                 break;
             }
-            for (const auto& commit : page.commits)
-                for (const auto& change : commit.changes) changes.emplace_back(commit, change);
+            for (auto& commit : page.commits) commits.push_back(std::move(commit));
             cursor = page.next;
             if (!page.more) break;
         }
@@ -125,13 +126,13 @@ void HostedAttachment::check()
             StoreSessionEvent event{StoreSessionEvent::Kind::Committed, identity, cursor.sequence, {}};
             event.revalidate = true;
             events.push_back(std::move(event));
-        } else if (!changes.empty()) {
+        } else if (!commits.empty()) {
             // Kinds for consumers' touches(): objects from their versions (a
             // deletion's version keeps the record it removed), relationships
             // from their current or last seen record.
             std::vector<ObjectVersion> objects;
             std::vector<std::string> edges, touched;
-            for (const auto& [commit, change] : changes) {
+            for (const auto& commit : commits) for (const auto& change : commit.changes) {
                 if (change.recordKind == "object") {
                     objects.push_back({status.storeUuid, status.generation, change.uuid, change.version});
                     touched.push_back(change.uuid);
@@ -158,7 +159,7 @@ void HostedAttachment::check()
             }
             StoreSessionEvent event{StoreSessionEvent::Kind::Committed, identity, cursor.sequence, {}};
             bool transformsChanged = false;
-            for (const auto& [commit, change] : changes) {
+            for (const auto& commit : commits) for (const auto& change : commit.changes) {
                 JournalEntry entry;
                 entry.seq = commit.sequence;
                 entry.recordUuid = change.uuid;

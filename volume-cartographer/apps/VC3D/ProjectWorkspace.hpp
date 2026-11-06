@@ -13,6 +13,7 @@
 
 class CState;
 class MenuActionController;
+class ProjectStoreCounts;
 class QComboBox;
 class QLabel;
 class QLineEdit;
@@ -53,6 +54,7 @@ private:
     void rebuild();
     void rebuildProject();
     void rebuildStores();
+    void updateStoreCounts();
     void rebuildRoutes();
     void rebuildResources();
     void updateCaches();
@@ -79,6 +81,7 @@ private:
 
     // Stores
     QTreeWidget* _stores = nullptr;
+    ProjectStoreCounts* _storeCounts = nullptr;
     QPushButton* _detachStore = nullptr;
     QPushButton* _revealStore = nullptr;
     QPushButton* _replaceStore = nullptr;

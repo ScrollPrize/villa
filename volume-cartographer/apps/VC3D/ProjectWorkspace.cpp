@@ -1,4 +1,5 @@
 #include "ProjectWorkspace.hpp"
+#include "ProjectStoreCounts.hpp"
 #include <vc_reader/zarr.hpp>
 
 #include "CState.hpp"
@@ -416,6 +417,8 @@ ProjectWorkspace::ProjectWorkspace(CState* state, MenuActionController* menu, QW
         rebuildResources();
     });
 
+    _storeCounts = new ProjectStoreCounts(this, [this] { updateStoreCounts(); });
+
     // Many store events arrive together (an import, a sync); refresh once.
     _refreshTimer = new QTimer(this);
     _refreshTimer->setSingleShot(true);
@@ -508,6 +511,7 @@ void ProjectWorkspace::rebuildStores()
 {
     const auto session = _state->objectStoreSession();
     const auto attached = _state->attachedStores();
+    _storeCounts->retain(attached);
     const auto selectedId = _stores->currentItem() ? _stores->currentItem()->data(0, kStoreIndexRole).toString() : QString();
     QSignalBlocker block(_stores);
     _stores->clear();
@@ -554,21 +558,13 @@ void ProjectWorkspace::rebuildStores()
         QString access = session->writable(store) ? tr("Read-write") : tr("Read-only");
         if (hosted) access += tr(" · hosted");
         item->setText(StoreAccess, access);
-        std::map<std::string, int64_t> counts;
-        try {
+        _storeCounts->request(store, [session, store] {
+            ProjectStoreCounts::Counts counts;
             session->readStore(store, [&](const vc::objects::StoreReader& reader, const std::atomic_bool&) {
                 for (const auto& kind : CState::routableKinds()) counts[kind] = reader.objectCount(kind);
             });
-        } catch (const std::exception& error) {
-            item->setToolTip(StoreSurfaces, QString::fromUtf8(error.what()));
-        }
-        const auto count = [&](const char* kind) {
-            const auto it = counts.find(kind);
-            return it == counts.end() ? QStringLiteral("?") : QLocale().toString(qlonglong(it->second));
-        };
-        item->setText(StoreSurfaces, count("surface"));
-        item->setText(StoreFibers, count("fiber"));
-        item->setText(StorePointCollections, count("point_collection"));
+            return counts;
+        });
         if (hosted) {
             item->setText(StoreFolder, tr("hosted"));
             continue;
@@ -579,6 +575,7 @@ void ProjectWorkspace::rebuildStores()
         item->setText(StoreFolder, folder(path));
         item->setToolTip(StoreFolder, QString::fromStdString(path.string()));
     }
+    updateStoreCounts();
     for (int c = 0; c < StoreFolder; ++c) _stores->resizeColumnToContents(c);
     // As tall as its rows (or the routes beside it), so the data list above gets the room.
     const int rowHeight = _stores->topLevelItemCount() ? _stores->visualItemRect(_stores->topLevelItem(0)).height() : 0;
@@ -587,6 +584,27 @@ void ProjectWorkspace::rebuildStores()
                                          std::max(1, _stores->topLevelItemCount()) *
                                              std::max(rowHeight, fontMetrics().height() + 4) + 4));
     updateStoreButtons();
+}
+
+void ProjectWorkspace::updateStoreCounts()
+{
+    for (int row = 0; row < _stores->topLevelItemCount(); ++row) {
+        auto* item = _stores->topLevelItem(row);
+        const auto store = _state->storeReference(item->data(0, kStoreIndexRole).toString().toStdString());
+        if (!store) continue;
+        const auto* snapshot = _storeCounts->snapshot(*store);
+        for (const auto& [column, kind] : {std::pair{StoreSurfaces, "surface"},
+                                         {StoreFibers, "fiber"}, {StorePointCollections, "point_collection"}}) {
+            QString count = QStringLiteral("?");
+            if (snapshot) {
+                const auto found = snapshot->values.find(kind);
+                if (found != snapshot->values.end()) count = QLocale().toString(qlonglong(found->second));
+            }
+            item->setText(column, count);
+            item->setToolTip(column, snapshot ? snapshot->error : QString());
+        }
+    }
+    for (int c : {StoreSurfaces, StoreFibers, StorePointCollections}) _stores->resizeColumnToContents(c);
 }
 
 void ProjectWorkspace::rebuildRoutes()

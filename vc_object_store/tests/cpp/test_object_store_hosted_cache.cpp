@@ -134,12 +134,67 @@ void invalidationDuringRead(bool poll)
     const auto cached = attachment.volumeTransforms().toVolume(metadata, "target");
     require(cached == fetched, "cache retains the new mapping");
 }
+
+void multiPageCommitInvalidatesHeads()
+{
+    TemporaryDirectory directory;
+    const auto path = directory.path / "feed.vcobj";
+    OpenOptions options; options.author = "feed-test";
+    std::vector<std::string> uuids;
+    {
+        auto store = ObjectStore::create(path, options);
+        auto txn = store.write();
+        for (int i = 0; i < 1025; ++i) {
+            ObjectRecord object; object.kind = "surface";
+            uuids.push_back(store.upsertObject(txn, object));
+        }
+        txn.commit();
+    }
+    std::sort(uuids.begin(), uuids.end());
+    server::ServerOptions serverOptions; serverOptions.maxFeedChanges = 1024;
+    server::Server server(path, serverOptions); server.start();
+    const auto endpoint = "http://127.0.0.1:" + std::to_string(server.port());
+    HostedStore writer(endpoint);
+    HostedSessionOptions hosted; hosted.pollInterval = std::chrono::hours(1);
+    detail::HostedAttachment attachment(endpoint, hosted);
+    std::vector<StoreSessionEvent> events;
+    const AttachmentIdentity identity{attachment.storeUuid(), 1};
+    attachment.start(identity, [&](StoreSessionEvent event) { events.push_back(std::move(event)); });
+    require(attachment.currentObject(uuids.front())->version == 1, "cache first head before bulk edit");
+    require(attachment.currentObject(uuids.back())->version == 1, "cache last head before bulk edit");
+    const auto before = writer.status();
+    TransactionRequest request;
+    request.requestUuid = util::newUuid(); request.storeUuid = before.storeUuid;
+    request.generation = before.generation; request.author = "bulk-editor";
+    for (const auto& uuid : uuids) {
+        request.expectedObjects[uuid] = 1;
+        request.operations.push_back(SetMetaOp{uuid, "edited", "true"});
+    }
+    const auto receipt = writer.submit(request);
+    attachment.refresh();
+    require(attachment.freshness().error.empty(), "bulk feed refresh succeeds");
+    require(events.size() == 1 && events.front().attachment == identity, "one complete bulk event");
+    const auto& changes = events.front().changes;
+    require(changes.size() == uuids.size(), "all continuation pages delivered exactly once");
+    for (size_t i = 0; i < uuids.size(); ++i) {
+        require(changes[i].recordUuid == uuids[i] && changes[i].seq == *receipt.commitSequence,
+                "feed order and sequence preserved");
+        require(changes[i].author == "bulk-editor" && changes[i].kind == "surface" &&
+                    changes[i].changeKind == "published", "feed attribution and kind preserved");
+    }
+    require(attachment.currentObject(uuids.front())->version == 2 &&
+                attachment.currentObject(uuids.back())->version == 2, "bulk edit invalidates cached heads");
+    attachment.refresh();
+    require(events.size() == 1, "bulk feed cursor advances past the entire commit");
+    attachment.stop();
+}
 }
 
 int main()
 try {
     invalidationDuringRead(false);
     invalidationDuringRead(true);
+    multiPageCommitInvalidatesHeads();
     std::cout << "object_store_hosted_cache: ok\n";
 } catch (const std::exception& error) {
     std::cerr << "object_store_hosted_cache: " << error.what() << '\n';

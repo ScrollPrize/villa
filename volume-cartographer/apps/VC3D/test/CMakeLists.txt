@@ -1,5 +1,14 @@
 find_package(Qt6 REQUIRED COMPONENTS Concurrent Core Network Test Widgets)
 
+add_executable(test_project_store_counts test_project_store_counts.cpp)
+set_target_properties(test_project_store_counts PROPERTIES AUTOMOC ON AUTOUIC OFF AUTORCC OFF)
+target_include_directories(test_project_store_counts PRIVATE ${PROJECT_SOURCE_DIR}/apps/VC3D)
+target_link_libraries(test_project_store_counts PRIVATE vc_core Qt6::Concurrent Qt6::Test)
+add_test(NAME project_store_counts COMMAND test_project_store_counts)
+set_tests_properties(project_store_counts PROPERTIES TIMEOUT 30)
+vc_register_test_target(test_project_store_counts)
+vc_register_ctest(project_store_counts test_project_store_counts)
+
 add_executable(test_manual_add_extend test_manual_add_extend.cpp
     ../segmentation/SurfaceGridEdit.cpp
     ../segmentation/tools/AutoExtend.cpp

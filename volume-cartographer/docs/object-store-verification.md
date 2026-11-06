@@ -84,6 +84,26 @@ ctest --test-dir build --output-on-failure \
   -R '^(object_store_(session|fiber_json|fiber_session|vc3d_controller)|test_fiber_constraint_geometry)$'
 ```
 
+## Hosted feed and workspace counts
+
+With existing test-enabled builds, run from the repository root:
+
+```sh
+AGENTS_AGENT_MODE=1 cmake --build vc_object_store/build --target test_object_store_hosted_cache -j 4
+ctest --test-dir vc_object_store/build -R '^object_store_hosted_cache$' --output-on-failure
+AGENTS_AGENT_MODE=1 cmake --build volume-cartographer/build --target VC3D test_project_store_counts -j 4
+ctest --test-dir volume-cartographer/build -R '^project_store_counts$' --output-on-failure
+```
+
+Substitute the configured object-store build directory when using a standalone
+build elsewhere. The hosted test requires loopback sockets. It checks cache
+invalidation during reads and a 1,025-object commit split across feed pages,
+including event order, attribution, cached heads and cursor advancement.
+The workspace test holds a background read open while the Qt event loop runs,
+coalesces repeated refreshes, preserves counts after errors, and rejects results
+for detached attachments or destroyed owners. These are self-contained tests;
+they do not require scroll data or a display server.
+
 ## Draft recovery
 
 To verify draft mask recovery on a real surface store with the existing build:
