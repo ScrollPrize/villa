@@ -8,17 +8,29 @@ import numpy as np
 
 def parse_index(key: Any, shape: tuple[int, ...]) -> tuple[list[int], list[int], list[bool]]:
     """numpy basic indexing (ints, unit-step slices, Ellipsis) -> start, size, axes to drop."""
+    start, size, step, squeeze = parse_selection(key, shape)
+    if any(s != 1 for s in step):
+        raise IndexError("only unit-step slices are supported")
+    return start, size, squeeze
+
+
+def parse_selection(key: Any, shape: tuple[int, ...]) -> tuple[list[int], list[int], list[int], list[bool]]:
+    """numpy basic indexing (ints, positive-step slices, Ellipsis) -> start, size, step, axes to drop.
+
+    Output index t of an axis reads source index start + t * step.
+    """
     if not isinstance(key, tuple):
         key = (key,)
     key = expand_index(key, len(shape))
-    start, size, squeeze = [], [], []
+    start, size, steps, squeeze = [], [], [], []
     for k, dim in zip(key, shape):
         if isinstance(k, slice):
+            if k.step is not None and operator.index(k.step) < 0:
+                raise IndexError("slice steps must be positive")
             a, b, step = k.indices(dim)
-            if step != 1:
-                raise IndexError("only unit-step slices are supported")
             start.append(a)
-            size.append(max(b - a, 0))
+            size.append(len(range(a, b, step)))
+            steps.append(step)
             squeeze.append(False)
         else:
             if isinstance(k, (bool, np.bool_)):
@@ -26,15 +38,16 @@ def parse_index(key: Any, shape: tuple[int, ...]) -> tuple[list[int], list[int],
             try:
                 i = operator.index(k)
             except TypeError:
-                raise IndexError("indices must be integers, unit-step slices, or ellipsis") from None
+                raise IndexError("indices must be integers, slices, or ellipsis") from None
             if i < 0:
                 i += dim
             if not 0 <= i < dim:
                 raise IndexError(f"index {k} out of bounds for axis of size {dim}")
             start.append(i)
             size.append(1)
+            steps.append(1)
             squeeze.append(True)
-    return start, size, squeeze
+    return start, size, steps, squeeze
 
 
 def expand_index(keys: tuple, ndim: int) -> tuple:

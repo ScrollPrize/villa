@@ -4,6 +4,7 @@
 namespace vcr::reader_cuda {
 struct Grid {
     std::int64_t shape[3]{}, base[3]{};
+    std::int64_t step[3]{1, 1, 1};  // region crops (kind 0): sample i of an axis reads base + i * step
     float origin[3]{}, axes[9]{};
     std::size_t offset = 0, count = 0;
 };

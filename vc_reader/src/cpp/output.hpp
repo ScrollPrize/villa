@@ -36,6 +36,9 @@ struct BoxOutput {
     std::size_t itemsize;
     std::vector<std::uint8_t> fill;
     std::function<void(const std::uint8_t*, const Index&, std::uint8_t*, const Index&, const Index&)> copy;
+    // As copy, with consecutive source row elements `inner` bytes apart (stepped reads).
+    std::function<void(const std::uint8_t*, const Index&, std::int64_t, std::uint8_t*, const Index&, const Index&)>
+        copy_stepped;
 
     template <class T>
     static BoxOutput make(const ElementType& source, const std::vector<std::uint8_t>& source_fill)
@@ -52,6 +55,14 @@ struct BoxOutput {
                     auto* out = reinterpret_cast<T*>(dst);
                     for (std::size_t i = 0; i < n; ++i)
                         out[i] = static_cast<T>(load(src + i * stride));
+                });
+            };
+            output.copy_stepped = [load](const std::uint8_t* s, const Index& ss, std::int64_t inner,
+                    std::uint8_t* d, const Index& ds, const Index& extent) {
+                transform_box(s, ss, d, ds, extent, [&](const std::uint8_t* src, std::uint8_t* dst, std::size_t n) {
+                    auto* out = reinterpret_cast<T*>(dst);
+                    for (std::size_t i = 0; i < n; ++i)
+                        out[i] = static_cast<T>(load(src + i * inner));
                 });
             };
         });
