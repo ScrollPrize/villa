@@ -364,6 +364,7 @@ endif()
 add_library(vc3d_app OBJECT ${srcs} resources.qrc)
 add_executable(VC3D VCAppMain.cpp)
 target_link_libraries(VC3D PRIVATE vc3d_app)
+add_dependencies(VC3D vc_object_convert)
 # Its uic headers (ui_*.h) are included by VCAppMain.cpp and the benchmarks too.
 target_include_directories(vc3d_app PUBLIC ${CMAKE_CURRENT_BINARY_DIR}/vc3d_app_autogen/include)
 

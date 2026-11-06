@@ -42,6 +42,32 @@ int runObjectStoreControllerTests()
     auto require = [](bool value, const char* message) { if (!value) throw std::runtime_error(message); };
     const auto path = std::filesystem::temp_directory_path() / ("vc3d-store-test-"+vc::objects::util::newUuid()+".vcobj");
     try {
+        if (const char* legacy = std::getenv("VC3D_UPGRADE_STORE_TEST")) {
+            QTemporaryDir directory;
+            const auto source = fs::path(directory.path().toStdString()) / "legacy.vcobj";
+            fs::copy_file(legacy, source);
+            if (fs::exists(std::string(legacy) + ".artifacts"))
+                fs::copy(std::string(legacy) + ".artifacts", source.string() + ".artifacts", fs::copy_options::recursive);
+            CState state;
+            openStoreAsProject(state, QString::fromStdString(source.string()), "test", true);
+            const auto original = state.vpkg()->document().data();
+            require(!state.storeFor("fiber"), "read-only legacy store is not upgraded");
+            state.closeProject();
+            openStoreAsProject(state, QString::fromStdString(source.string()), "test");
+            require(state.storeFor("fiber").has_value(), "writable legacy store upgrades and attaches automatically");
+            const auto project = state.vpkg()->document().path();
+            const auto data = state.vpkg()->document().data();
+            const auto upgraded = state.vpkg()->document().resolve(data["stores"][0]["location"]);
+            require(upgraded != source && fs::exists(source), "upgrade keeps the original database");
+            require(data["selections"] == original["selections"], "upgrade preserves store routes");
+            std::ifstream reportFile(upgraded.string() + ".report.json");
+            const auto report = nlohmann::json::parse(reportFile);
+            require(report["validation"] == "ok" && fs::exists(upgraded.string() + ".mapping.json"), "upgrade retains conversion report and revision mapping");
+            state.closeProject();
+            state.setVpkg(VolumePkg::open(project));
+            require(state.storeFor("fiber") && state.vpkg()->document().data() == data, "reopening uses the upgraded store without another conversion");
+            state.closeProject();
+        }
 #include "LineAnnotationFiberCacheTest.inc"
         if (const char* source = std::getenv("VC3D_OBJECT_STORE_READ_ONLY_BENCH")) {
             CState state;

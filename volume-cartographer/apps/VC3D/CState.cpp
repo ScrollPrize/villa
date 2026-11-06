@@ -15,6 +15,9 @@
 #include <optional>
 #include <QSettings>
 #include <QTimer>
+#include <QCoreApplication>
+#include <QProcess>
+#include <QStandardPaths>
 
 #include "vc/core/types/VolumePkg.hpp"
 #include <vc_object_store/geometry/Geometry.hpp>
@@ -485,11 +488,32 @@ void CState::restoreStoreRoutes()
 {
     if (!_vpkg) return;
     QStringList failures;
-    for (const auto& entry : _vpkg->document().data().at("stores")) {
+    const auto stores = _vpkg->document().data().at("stores");
+    for (size_t index = 0; index < stores.size(); ++index) {
+        const auto& entry = stores[index];
         try {
-            const auto attachment = vc::project::ProjectDocument::hostedStore(entry)
-                ? _objectStoreSession->attachHosted(entry.at("location").get<std::string>(), hostedOptions(storeAuthor()))
-                : prepareStore(_vpkg->document().resolve(entry.at("location")), storeAuthor(), entry.value("read_only", false));
+            vc::objects::AttachmentIdentity attachment;
+            try {
+                attachment = vc::project::ProjectDocument::hostedStore(entry)
+                    ? _objectStoreSession->attachHosted(entry.at("location").get<std::string>(), hostedOptions(storeAuthor()))
+                    : prepareStore(_vpkg->document().resolve(entry.at("location")), storeAuthor(), entry.value("read_only", false));
+            } catch (const std::exception& error) {
+                if (vc::project::ProjectDocument::hostedStore(entry) || entry.value("read_only", false) ||
+                    !_vpkg->writable() || !QString::fromUtf8(error.what()).contains(": convert it with vc_object_convert)")) throw;
+                // Reuse the offline converter; retain the original and its relative references.
+                const auto source = _vpkg->document().resolve(entry.at("location"));
+                const auto destination = source.parent_path() / (source.stem().string() + "-upgraded-" + vc::objects::util::newUuid() + ".vcobj");
+                QProcess converter;
+                converter.start(QStandardPaths::findExecutable("vc_object_convert", {QCoreApplication::applicationDirPath()}),
+                                {QString::fromStdString(source.string()), QString::fromStdString(destination.string())});
+                if (!converter.waitForFinished(-1) || converter.exitStatus() != QProcess::NormalExit || converter.exitCode() != 0)
+                    throw std::runtime_error("Store upgrade failed: " + converter.errorString().toStdString() + "\n" + converter.readAllStandardError().toStdString());
+                attachment = prepareStore(destination, storeAuthor());
+                auto data = _vpkg->document().data();
+                data["stores"][index]["location"] = _vpkg->document().location(destination);
+                try { _vpkg->document().replace(std::move(data)); }
+                catch (...) { releasePreparedStore(attachment); throw; }
+            }
             if (std::find(_attachedStores.begin(), _attachedStores.end(), attachment) != _attachedStores.end())
                 throw std::runtime_error("Store is referenced more than once");
             _attachedStores.push_back(attachment);

@@ -1809,7 +1809,12 @@ void LineAnnotationController::launchFromViewerAtPoint(CChunkedVolumeViewer* vie
                                                        bool replaceOwningAnnotation,
                                                        bool modelOnly)
 {
-    if (!canLaunchFromViewer(viewer)) {
+    if (!viewerSupportsLaunch(viewer)) {
+        return;
+    }
+    if (!_state->storeFor("fiber")) {
+        showError(tr("No fiber store is available. Check the project store loading error, "
+                     "or select a store under File > Stores > Show Fibers From."));
         return;
     }
 
