@@ -768,8 +768,12 @@ int64_t ObjectCollection::importInitialEdges(CollectionTxn& t,
         native.clear();native.reserve(batch.size());rows.clear();rows.reserve(batch.size());
         if(endpoints.size()>=options.maxCachedEndpoints)endpoints.clear();
         auto resolveEndpoint=[&](const ObjectKey& original,const Anchor& anchor)->Endpoint&{
-            const auto key=canonical(original);
-            auto it=endpoints.find(key);
+            // Accepted canonical keys dominate batch input. A cache hit has
+            // already been validated; noncanonical spellings still normalize
+            // and resolve through exactly the same path on a miss.
+            auto it=endpoints.find(original);
+            const auto key=it==endpoints.end()?canonical(original):original;
+            if(it==endpoints.end())it=endpoints.find(key);
             if(it==endpoints.end()){
                 Endpoint endpoint;
                 const InitialEndpoint* prepared=nullptr;

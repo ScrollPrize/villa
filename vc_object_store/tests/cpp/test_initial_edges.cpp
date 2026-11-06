@@ -73,6 +73,11 @@ void parity(bool geometry,bool defer,size_t sqlRows=1,size_t rowCount=2,int vari
         require(expected&&actual&&expected->aUuid==actual->aUuid&&expected->bUuid==actual->bUuid&&
             expected->aAnchor==actual->aAnchor&&expected->bAnchor==actual->bAnchor&&expected->tags==actual->tags,
             "anchor values, endpoint order and tags preserved");
+        require(actual->createdBy=="test"&&actual->changedBy=="test"&&
+            actual->createdHost==actual->changedHost&&actual->createdAt==actual->changedAt&&
+            actual->approvalState=="pending"&&!actual->approvedBy&&!actual->approvedAt&&
+            !actual->approvedHost&&!actual->approvedGeneration,
+            "shared batch provenance and SQL approval defaults preserved");
         require(currentRelationshipApplicable(ordinary,x,e.uuid)&&currentRelationshipApplicable(bulk,y,e.uuid),
             "ordinary and bulk relationships are valid against current endpoints");
         const auto os=ordinary.edgeGeometryState(x,e.uuid),bs=bulk.edgeGeometryState(y,e.uuid);
@@ -140,6 +145,11 @@ void rejectRetiredEndpoint() {
     {auto tx=store.read();require(!store.edgeByUuid(tx,e.uuid),"restoration cannot revive rejected relationship");}
 }
 }
-int main() {try {parity(false,false);parity(false,true);parity(true,true);
+int main() {try {
+    const std::string mixed="AbCdEFab-1234-ABcd-5678-90aBcDeF0123";
+    require(util::canonicalUuid(mixed)==formatUuid(parseUuid(mixed)),"single-pass UUID normalization matches binary representation");
+    for(size_t i=0;i<mixed.size();++i){auto invalid=mixed;invalid[i]='!';mustFail([&]{util::canonicalUuid(invalid);});}
+    mustFail([]{util::canonicalUuid("");});
+    parity(false,false);parity(false,true);parity(true,true);
     parity(false,true,64,133);parity(true,true,64,133,99);failures();failures(64);invalidateAndExhaust();rejectRetiredEndpoint();
     std::cout<<"initial edge tests passed\n";return 0;}catch(const std::exception& e){std::cerr<<e.what()<<'\n';return 1;}}

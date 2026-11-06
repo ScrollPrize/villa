@@ -158,6 +158,23 @@ void phaseFailures()
             EdgeRecord edge;edge.kind="bad";edge.bAnchor.points={{"line_points",{999}}};
             batch.push_back({{shard.storeUuid(),ids[i]},{shard.storeUuid(),ids[(i+1)%3]},edge});return true;});
     });
+    // Uniqueness must reject even cross-batch duplicates before any
+    // ordinary or packed shard becomes visible, including when the producer
+    // catches the import exception itself.
+    for(bool packed:{false,true}){
+        opt=options(3,packed);
+        fail([&](size_t i,auto& shard){auto row=fiber(ids[i]);shard.appendObjects(std::span(&row,1));},
+            [&](size_t i,auto& shard){
+                int batchNumber=0;
+                try{shard.importEdges([&](auto& batch){
+                    if(batchNumber++==2)return false;
+                    EdgeRecord edge;edge.uuid=util::newUuid();edge.kind="duplicate";
+                    edge.aAnchor.wholeGeometry=edge.bAnchor.wholeGeometry=true;
+                    batch.push_back({{shard.storeUuid(),ids[i]},{shard.storeUuid(),ids[(i+1)%3]},edge});
+                    return true;
+                });}catch(const std::exception&){}
+            });
+    }
 }
 }
 int main(){try{for(bool packed:{false,true}){for(size_t count:{1u,2u})roundTrip(count,packed);phased(packed);}failures();phaseFailures();

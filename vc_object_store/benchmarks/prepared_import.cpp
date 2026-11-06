@@ -146,8 +146,9 @@ Json reduced(const Prepared& data,const fs::path& path){
     require(!rows.row(),"extra reduced edge");result["verify_seconds"]=elapsed(verify);
     return result;
 }
-Json native(const Prepared& data,const fs::path& path,bool linked,bool packed,size_t workers=1){
+Json native(const Prepared& data,const fs::path& path,bool linked,bool packed,size_t workers=1,size_t sqlRows=1){
     InitialImportOptions opt;opt.store.author="prepared-benchmark";opt.store.sqliteCacheBytes=512*1024*1024;
+    opt.edges.sqlBatchRows=sqlRows;
     require(workers>0&&workers<=data.objects.size(),"sharded benchmark needs at least one object per worker");
     const auto bounds=[&](size_t count,size_t i){return std::pair{count*i/workers,count*(i+1)/workers};};
     if(workers>1) {
@@ -239,7 +240,7 @@ int main(int argc,char** argv){try{
     const size_t workers=sharded?config.value("workers",size_t(4)):1;
     for(int repeat=0;repeat<config.value("repetitions",1);++repeat){
         const auto path=root/(variant+std::to_string(repeat)+".sqlite");require(!fs::exists(path),"refusing overwrite");
-        Json result=variant=="prototype"?reduced(data,path):native(data,path,variant=="linked",variant.starts_with("native_packed"),workers);
+        Json result=variant=="prototype"?reduced(data,path):native(data,path,variant=="linked",variant.starts_with("native_packed"),workers,config.value("sql_batch_rows",size_t(1)));
         result["variant"]=variant;result["repetition"]=repeat;result["tables"]=inventory(path);
         require(result["tables"].value("edges",size_t(0))==data.edges.size(),"edge count mismatch");
         require(result["tables"].value("objects",size_t(0))==(variant=="linked"?0:data.objects.size()),"objects must not be duplicated into relation shards");

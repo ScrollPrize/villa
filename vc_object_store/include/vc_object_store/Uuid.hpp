@@ -25,8 +25,18 @@ inline bool isUuid(const std::string& value)
 
 inline std::string canonicalUuid(std::string value)
 {
-    if (!isUuid(value)) throw std::invalid_argument("invalid UUID: " + value);
-    std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) { return char(std::tolower(c)); });
+    // UUIDs contain ASCII hex, not locale-dependent text. Validate and lower
+    // in one pass rather than two ctype calls for every character of every key.
+    const auto invalid=[&]{throw std::invalid_argument("invalid UUID: " + value);};
+    if(value.size()!=36)invalid();
+    for(size_t i=0;i<value.size();++i){
+        auto& c=value[i];
+        if(i==8||i==13||i==18||i==23){if(c!='-')invalid();}
+        else if(c>='0'&&c<='9'){}
+        else if(c>='a'&&c<='f'){}
+        else if(c>='A'&&c<='F')c=char(c+('a'-'A'));
+        else invalid();
+    }
     return value;
 }
 

@@ -91,6 +91,11 @@ std::unique_ptr<ObjectStore::Impl> ObjectStore::openImpl(const std::filesystem::
         impl->writer = openConnection(path, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, options, false);
         if (buildingPacked && pragmaInt(impl->writer, "page_count") != 0)
             throw std::runtime_error("object store: create refuses non-empty packed database: " + path.string());
+        // Private bulk-built databases use large pages: dense sequential rows
+        // and geometry payloads otherwise waste space in 4-KiB leaf pages.
+        // Set before the first schema/application-id write; ordinary stores
+        // and existing files retain their page size.
+        if(immutable)exec(impl->writer,"PRAGMA page_size=65536;");
         exec(impl->writer, immutable?"PRAGMA journal_mode=OFF;PRAGMA synchronous=OFF;":journalMode);
         if(!immutable)exec(impl->writer, "PRAGMA synchronous=FULL;");
         exec(impl->writer, ("PRAGMA application_id=" + std::to_string(kApplicationId) + ";").c_str());

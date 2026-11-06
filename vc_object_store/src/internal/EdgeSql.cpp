@@ -3,6 +3,16 @@
 #include "geometry/GeometryInternal.hpp"
 
 namespace vc::objects::detail {
+namespace {
+void bindDependencies(Statement& s,int index,const Anchor& anchor)
+{
+    if(anchor.points.empty()&&anchor.channels.empty()&&anchor.metadataKeys.empty()){
+        validateAnchor(anchor);
+        static const std::string empty="{}",whole=R"({"whole_geometry":true})";
+        s.bind(index,anchor.wholeGeometry?whole:empty);
+    }else s.bind(index,dependenciesToJson(anchor).dump());
+}
+}
 std::string fiberAdjacencySql(std::optional<bool> adjacent)
 {
     if (!adjacent) return {};
@@ -212,6 +222,29 @@ void insertEdgeRows(sqlite3* db,std::span<const EdgeInsertRow> rows,int64_t gene
                    const std::string& author,const std::string& host,const std::string& now,
                    bool preserveRecord,size_t sqlBatchRows)
 {
+    if(!preserveRecord){
+        // New records share provenance. Approval defaults are the same as the
+        // ordinary insert; avoid rebinding shared/default values per row.
+        writeSqlValuesShared(db,"INSERT INTO edges(uuid,a_id,b_id,kind,generation,created_by,created_at,created_host,"
+            "changed_by,changed_at,changed_host,a_anchor_x,a_anchor_y,a_anchor_z,a_dir_x,a_dir_y,a_dir_z,"
+            "b_anchor_x,b_anchor_y,b_anchor_z,b_dir_x,b_dir_y,b_dir_z,meta,a_dependencies,b_dependencies,id,relation_key)",
+            4,21,rows.size(),sqlBatchRows,[](size_t offset){
+                std::string pattern="(";
+                for(size_t i=1;i<=21;++i){
+                    if(i!=1)pattern+=',';
+                    pattern+='?'+std::to_string(offset+i);
+                    if(i==4)pattern+=",?1,?2,?3,?4,?2,?3,?4";
+                }
+                return pattern+')';
+            },[&](Statement& s){s.bind(1,generation);s.bind(2,author);s.bind(3,now);s.bind(4,host);},
+            [&](Statement& s,size_t index,int offset){
+                const auto& row=rows[index];const auto& rec=*row.record;
+                s.bind(offset+1,parseUuid(rec.uuid));s.bind(offset+2,row.aId);s.bind(offset+3,row.bId);s.bind(offset+4,rec.kind);
+                bindAnchor(s,offset+5,rec.aAnchor);bindAnchor(s,offset+11,rec.bAnchor);
+                s.bind(offset+17,rec.meta);bindDependencies(s,offset+18,rec.aAnchor);
+                bindDependencies(s,offset+19,rec.bAnchor);s.bind(offset+20,row.id);s.bind(offset+21,rec.relationKey);
+            });
+    }else{
     writeSqlValues(db,"INSERT INTO edges(uuid,a_id,b_id,kind,generation,created_by,created_at,created_host,changed_by,changed_at,"
                     "changed_host,approval_state,approved_by,approved_at,approved_host,approved_generation,"
                     "a_anchor_x,a_anchor_y,a_anchor_z,a_dir_x,a_dir_y,a_dir_z,"
@@ -231,11 +264,12 @@ void insertEdgeRows(sqlite3* db,std::span<const EdgeInsertRow> rows,int64_t gene
     bindAnchor(s, offset+17, rec.aAnchor);
     bindAnchor(s, offset+23, rec.bAnchor);
     s.bind(offset+29, rec.meta);
-    s.bind(offset+30, dependenciesToJson(rec.aAnchor).dump());
-    s.bind(offset+31, dependenciesToJson(rec.bAnchor).dump());
+    bindDependencies(s,offset+30,rec.aAnchor);
+    bindDependencies(s,offset+31,rec.bAnchor);
     s.bind(offset+32, row.id);
     s.bind(offset+33, rec.relationKey);
     });
+    }
     for(const auto& row:rows) insertTags(db,"edge_tags","edge_id",row.id,row.record->tags);
 }
 
