@@ -49,3 +49,17 @@ def test_older_revisions_read_in_the_frame_they_were_stored_in(db_path):
     assert read_surface(db_path, uid, volume="a", version=1, generation=older.generation).geometry_revision == first
     with pytest.raises(ValueError, match="version 1"):
         read_surface(db_path, uid, volume="a", version=1, generation="00000000-0000-4000-8000-000000000000")
+
+
+def test_numbered_surface_uses_its_metadata_when_geometry_is_shared(db_path):
+    ObjectStore.create(db_path, author="pytest").close()
+    xyz = np.array([[[2, 4, 6], [8, 10, 12]]], dtype=np.float32)
+    uid = create_surface(db_path, xyz, name="s", scale=1, volume="a", tool="pytest")
+    with ObjectStore.open(db_path, author="pytest") as db:
+        db.set_meta(uid, "coordinates", {"volume_uuid": "a", "scale_factor": 2})
+    first = read_surface(db_path, uid, volume="a", version=1)
+    current = read_surface(db_path, uid, volume="a")
+    assert first.geometry_revision == current.geometry_revision
+    np.testing.assert_array_equal(first.points, xyz)
+    np.testing.assert_array_equal(current.points, xyz / 2)
+    assert first.record["meta"]["coordinates"]["scale_factor"] == 1

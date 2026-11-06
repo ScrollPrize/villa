@@ -15,6 +15,10 @@ public:
     // This revision in `targetVolume`'s voxels; an older revision maps with the
     // coordinates of the latest object revision that held it.
     TransformedGeometryView viewTransformedAt(const std::string& targetVolume, double targetScale=1) const;
+    // Use this numbered revision's coordinate metadata, even when later
+    // object revisions share the same geometry. The revision must name this view.
+    TransformedGeometryView viewTransformedAt(const ObjectRevision&, const std::string& targetVolume,
+                                             double targetScale=1) const;
     std::vector<vcr::catalog::TransformResolution> availableTransforms() const;
     const GeometryRevision& revision() const;
     // The numbered version of the object this view read (its current one);

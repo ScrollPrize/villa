@@ -3,6 +3,7 @@
 #include "vc_object_store/objects/GeometryCoordinates.hpp"
 #include "vc_object_store/objects/ObjectStore.hpp"
 #include "vc_object_store/objects/StoreReader.hpp"
+#include "vc_object_store/objects/SurfaceGrid.hpp"
 #include "vc_object_store/store/GeometryViews.hpp"
 #include "vc_object_store/objects/VolumeUmbilicus.hpp"
 #include "vc_object_store/objects/UmbilicusFile.hpp"
@@ -355,6 +356,50 @@ int main() try {
                 "a collection written at a scale is bound at that scale");
         const auto again=volumeCollections(session,attachment,{"w",0.25});
         require(again.size()==1&&again[0].points.points[0]==std::array<double,3>{7,8,9},"and reads back at it");
+    }
+    // Several numbered object versions can share one geometry payload. Each
+    // historical read must use the coordinate metadata of the selected version.
+    {
+        auto history = ObjectStore::create(directory.path / "surface-history.vcobj", options);
+        std::string uuid;
+        vc::geometry::Surface grid{1, 2, {1, 1}, {{2, 4, 6}, {8, 10, 12}}};
+        {
+            auto txn = history.write();
+            ObjectRecord record; record.kind = "surface";
+            record.meta = R"({"coordinates":{"volume_uuid":"a","scale_factor":1}})";
+            uuid = history.upsertObject(txn, record);
+            history.putGeometry(txn, uuid, vc::geometry::encode(grid));
+            txn.commit();
+        }
+        {
+            auto txn = history.write();
+            history.setMeta(txn, uuid, "coordinates", R"({"volume_uuid":"c","scale_factor":2})");
+            txn.commit();
+        }
+        auto check = [&] {
+            auto txn = history.read();
+            LocalStoreReader reader(history, txn);
+            const auto first = readSurfaceGrid(reader, uuid, "a", 1, 1);
+            const auto second = readSurfaceGrid(reader, uuid, "c", 1, 2);
+            require(first.points == std::vector<float>{2, 4, 6, 8, 10, 12} &&
+                    second.points == std::vector<float>{1, 2, 3, 4, 5, 6}, "historical coordinate metadata");
+            require(first.scale == std::array<double, 2>{1, 1} && second.scale == std::array<double, 2>{2, 2},
+                    "historical grid scale");
+            require(first.geometryRevision == second.geometryRevision && first.version == 1 && second.version == 2,
+                    "metadata-only versions share geometry");
+            require(nlohmann::json::parse(first.record.meta).at("coordinates").at("volume_uuid") == "a",
+                    "record and geometry use the same numbered version");
+            const auto scaled = readSurfaceGrid(reader, uuid, "a", .5, 1);
+            require(scaled.points == second.points, "historical reads respect target scale");
+        };
+        check();
+        {
+            auto txn = history.write();
+            grid.points[0][0] = 20;
+            history.putGeometry(txn, uuid, vc::geometry::encode(grid), history.currentGeometry(txn, uuid)->uuid);
+            txn.commit();
+        }
+        check(); // The historical payload is no longer the current geometry.
     }
     std::cout<<"object volume transformation checks passed\n";return 0;
 }catch(const std::exception& e){std::cerr<<e.what()<<'\n';return 1;}

@@ -25,7 +25,7 @@ SurfaceGrid readSurfaceGrid(const StoreReader& reader, const std::string& surfac
     const auto canonical = snapshot.surface(surfaceUuid, *revision->geometryRevision);
     std::optional<TransformedGeometryView> view;
     try {
-        view = canonical.viewTransformedAt(volume, targetScale);
+        view = canonical.viewTransformedAt(*revision, volume, targetScale);
     } catch (const std::runtime_error& error) {
         throw std::invalid_argument("surface " + surfaceUuid + " does not map to volume " + volume + ": " + error.what());
     }
