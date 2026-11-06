@@ -13,9 +13,12 @@ from skimage.morphology import ball
 from skimage.morphology.binary import binary_dilation
 from vc_reader.reader import open_group
 
-from dinovol_2.dataset.normalization import NORMALIZATION_SCHEMES, get_normalization
-from dinovol_2.dataset.ssl_zarr_dataset import open_volume_level
-from dinovol_2.model.model import DinoVitStudentTeacher, PointDenseHead, _upgrade_weight_norm_state_dict_keys
+from dinovol_2.dataset.cuda_pipeline import NORMALIZATION_SCHEMES, normalize_batch
+from dinovol_2.dataset.volume_reader import open_volume
+from dinovol_2.model import build_backbone
+from dinovol_2.training.config import as_legacy_config
+from dinovol_2.training.checkpoint import backbone_state, method_state
+from dinovol_2.model.model import PointDenseHead, _upgrade_weight_norm_state_dict_keys
 from dinovol_2.ops.point_embeddings import sample_grid_points
 
 DEFAULT_NORMALIZATION_SCHEME = "robust"
@@ -179,7 +182,7 @@ def _combine_coordinate_transforms(
 
 def load_ome_zarr_spec(path: str | Path) -> OmeZarrSpec:
     path_str = _normalize_path_string(path)
-    root = open_group(path_str)
+    root = open_group(path_str, auth=None, threads=1)
     multiscales = root.attrs.get("multiscales")
     if not isinstance(multiscales, list) or not multiscales:
         raise ValueError("OME-Zarr root is missing multiscales metadata")
@@ -254,7 +257,11 @@ def _reorder_ome_zarr_array(array: np.ndarray, *, axes: tuple[str, ...]) -> np.n
 
 
 def load_ome_zarr_array(path: str | Path, scale: OmeZarrScale) -> np.ndarray:
-    array = open_volume_level(_normalize_path_string(path), scale.path)[...]
+    handle = open_volume(_normalize_path_string(path), scale.path)
+    try:
+        array = np.asarray(handle)
+    finally:
+        handle.close()
     return _reorder_ome_zarr_array(array, axes=scale.axes)
 
 
@@ -275,11 +282,7 @@ def _as_3tuple(value: Any, *, name: str) -> tuple[int, int, int]:
 
 
 def _select_device() -> torch.device:
-    if torch.cuda.is_available():
-        return torch.device("cuda")
-    if torch.backends.mps.is_available():
-        return torch.device("mps")
-    return torch.device("cpu")
+    return torch.device("cuda")
 
 
 def _extract_model_config(checkpoint: dict[str, Any]) -> dict[str, Any]:
@@ -287,7 +290,7 @@ def _extract_model_config(checkpoint: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(config, dict):
         raise ValueError("checkpoint does not contain a saved config dictionary")
 
-    model_config = config.get("model")
+    model_config = as_legacy_config(config, legacy_checkpoint=True).get("model")
     if not isinstance(model_config, dict):
         raise ValueError("checkpoint config does not contain a model configuration")
     return model_config
@@ -297,7 +300,7 @@ def _extract_dataset_config(checkpoint: dict[str, Any]) -> dict[str, Any]:
     config = checkpoint.get("config")
     if not isinstance(config, dict):
         return {}
-    dataset_config = config.get("dataset")
+    dataset_config = as_legacy_config(config, legacy_checkpoint=True).get("dataset")
     return dataset_config if isinstance(dataset_config, dict) else {}
 
 
@@ -306,25 +309,8 @@ def _extract_backbone_state_dict(
     *,
     preferred_branch: str = "teacher",
 ) -> tuple[dict[str, Any], str]:
-    branch_order = [preferred_branch]
-    if preferred_branch != "teacher":
-        branch_order.append("teacher")
-    if preferred_branch != "student":
-        branch_order.append("student")
-
-    for branch_name in branch_order:
-        branch_state = checkpoint.get(branch_name)
-        if not isinstance(branch_state, dict):
-            continue
-        backbone_state = {
-            key.replace("backbone.", "", 1): value
-            for key, value in branch_state.items()
-            if key.startswith("backbone.")
-        }
-        if backbone_state:
-            return _upgrade_weight_norm_state_dict_keys(backbone_state), branch_name
-
-    raise ValueError("checkpoint does not contain teacher.backbone or student.backbone weights")
+    state, source = backbone_state(checkpoint, preferred_branch=preferred_branch)
+    return _upgrade_weight_norm_state_dict_keys(state), source
 
 
 def _build_dense_head_from_checkpoint(
@@ -339,7 +325,7 @@ def _build_dense_head_from_checkpoint(
     if not skip_channels:
         return None
 
-    branch_state = checkpoint.get(source_branch)
+    branch_state = method_state(checkpoint).get(source_branch)
     if not isinstance(branch_state, dict):
         return None
     dense_state = {
@@ -350,7 +336,7 @@ def _build_dense_head_from_checkpoint(
     if not dense_state:
         return None
 
-    config = checkpoint.get("config") if isinstance(checkpoint.get("config"), dict) else {}
+    config = as_legacy_config(checkpoint.get("config") or {}, legacy_checkpoint=True)
     obj_cfg = config.get("object_losses") if isinstance(config.get("object_losses"), dict) else {}
     head_cfg = obj_cfg.get("head") if isinstance(obj_cfg.get("head"), dict) else {}
 
@@ -398,7 +384,7 @@ def load_backbone_from_checkpoint(
         checkpoint,
         preferred_branch=preferred_branch,
     )
-    backbone = DinoVitStudentTeacher._build_backbone(model_config)
+    backbone = build_backbone(model_config)
     backbone.load_state_dict(backbone_state_dict, strict=True)
 
     selected_device = device or _select_device()
@@ -556,35 +542,20 @@ def resolve_z_slab_bounds(
 
 
 def normalize_volume(
-    volume: np.ndarray,
-    *,
-    normalization_scheme: str,
-    intensity_properties: dict[str, Any] | None = None,
-) -> np.ndarray:
-    normalizer = get_normalization(normalization_scheme, intensityproperties=intensity_properties)
-    if normalizer is None:
-        return volume.astype(np.float32, copy=False)
-
-    normalized = np.empty_like(volume, dtype=np.float32)
-    for channel_index in range(volume.shape[0]):
-        normalized[channel_index] = normalizer.run(volume[channel_index])
-    return normalized
+    volume: np.ndarray, *, normalization_scheme: str,
+    intensity_properties: dict[str, Any] | None = None, device="cuda",
+) -> torch.Tensor:
+    return normalize_batch(torch.from_numpy(np.ascontiguousarray(volume))[None], normalization_scheme,
+                           device=device, intensity_properties=intensity_properties)[0]
 
 
 def pad_volume_to_patch_size(
-    volume: np.ndarray,
-    patch_size: tuple[int, int, int],
-) -> tuple[np.ndarray, tuple[int, int, int]]:
-    spatial_shape = tuple(int(v) for v in volume.shape[-3:])
-    padding = []
-    padded_shape = []
-    for size, patch in zip(spatial_shape, patch_size):
-        remainder = size % patch
-        pad_after = 0 if remainder == 0 else patch - remainder
-        padding.append((0, pad_after))
-        padded_shape.append(size + pad_after)
-    padded = np.pad(volume, ((0, 0), *padding), mode="edge")
-    return padded, tuple(padded_shape)
+    volume: torch.Tensor, patch_size: tuple[int, int, int],
+) -> tuple[torch.Tensor, tuple[int, int, int]]:
+    spatial_shape = tuple(volume.shape[-3:])
+    after = tuple((-size) % patch for size, patch in zip(spatial_shape, patch_size))
+    padded = F.pad(volume[None], tuple(v for pad in reversed(after) for v in (0, pad)), mode="replicate")[0]
+    return padded, tuple(size + pad for size, pad in zip(spatial_shape, after))
 
 
 def _patch_grid_shape_for_spatial_shape(
@@ -705,16 +676,7 @@ def _evaluate_dense_head_grid(
         raise ValueError(f"unsupported dense head embedding_source {embedding_source!r}")
 
     dtype = token_grid.dtype
-    coarser_skips = skips[dense_head._fpn_skip_start:]
-    x = dense_head.fpn_in(token_grid.permute(0, 4, 1, 2, 3).contiguous())
-    for skip, lateral, refine in zip(reversed(coarser_skips), dense_head.fpn_laterals, dense_head.fpn_refines):
-        target_size = skip.shape[2:]
-        if x.shape[2:] != target_size:
-            x = F.interpolate(x, size=target_size, mode="trilinear", align_corners=False)
-        x = x + lateral(skip.to(dtype))
-        x = x + refine(x)
-    fpn_grid = x.permute(0, 2, 3, 4, 1).contiguous()
-    del x
+    fpn_grid = dense_head.fpn_grid(token_grid, skips)
     skip_grids = [level.permute(0, 2, 3, 4, 1) for level in skips]
 
     grid_shape = tuple(max(1, int(size) // int(st)) for size, st in zip(spatial_shape, stride))
@@ -727,7 +689,6 @@ def _evaluate_dense_head_grid(
     zz, yy, xx = torch.meshgrid(*axes, indexing="ij")
     all_points = torch.stack([zz, yy, xx], dim=-1).reshape(-1, 3)
 
-    proj = dense_head.ink_proj if embedding_source == "ink" else dense_head.obj_proj
     out_dim = int(dense_head.ink_dim if embedding_source == "ink" else dense_head.out_dim)
     total_points = int(all_points.shape[0])
     out_flat = np.empty((total_points, out_dim), dtype=np.float32)
@@ -737,23 +698,15 @@ def _evaluate_dense_head_grid(
         pts = all_points[start:stop].unsqueeze(0)
         tokens = sample_grid_points(token_grid, pts, spatial_shape)
         fpn_pts = dense_head.fpn_norm(sample_grid_points(fpn_grid, pts, spatial_shape).to(dtype))
-        skip_parts = [
-            norm(sample_grid_points(sg, pts, spatial_shape).to(dtype))
-            for norm, sg in zip(dense_head.skip_norms, skip_grids)
-        ]
-        tokens_cast = tokens.to(dtype)
-        trunk = dense_head.trunk_norm(
-            dense_head.mlp(torch.cat([tokens_cast, *skip_parts, fpn_pts], dim=-1))
-            + dense_head.token_shortcut(tokens_cast)
-        )
-        emb = F.normalize(proj(trunk).float(), dim=-1).squeeze(0)
+        skip_pts = [sample_grid_points(sg, pts, spatial_shape) for sg in skip_grids]
+        emb = dense_head.readout(tokens, skip_pts, fpn_pts, dtype=dtype)[embedding_source].squeeze(0)
         out_flat[start:stop] = emb.detach().cpu().numpy()
 
     return out_flat.reshape(*grid_shape, out_dim)
 
 
 def _compute_patch_embedding_grid_full_volume(
-    padded: np.ndarray,
+    padded: torch.Tensor,
     *,
     padded_shape: tuple[int, int, int],
     loaded_backbone: LoadedBackbone,
@@ -771,7 +724,7 @@ def _compute_patch_embedding_grid_full_volume(
     prev_skips = getattr(loaded_backbone.backbone, "return_embed_skips", False)
     loaded_backbone.backbone.return_embed_skips = need_dense
     try:
-        tensor = torch.from_numpy(padded).unsqueeze(0).to(loaded_backbone.device)
+        tensor = padded.unsqueeze(0)
         outputs = loaded_backbone.backbone.forward_features(tensor, masks=None, view_kind="global")
         patch_tokens = outputs["x_norm_patchtokens"]
         patch_grid_shape = _patch_grid_shape_for_spatial_shape(padded_shape, loaded_backbone.patch_size)
@@ -796,7 +749,7 @@ def _compute_patch_embedding_grid_full_volume(
 
 
 def _compute_patch_embedding_grid_windowed(
-    padded: np.ndarray,
+    padded: torch.Tensor,
     *,
     padded_shape: tuple[int, int, int],
     loaded_backbone: LoadedBackbone,
@@ -845,7 +798,7 @@ def _compute_patch_embedding_grid_windowed(
             )
             tile = padded[(slice(None), *voxel_slices)]
             _configure_backbone_for_spatial_shape(loaded_backbone.backbone, window_spatial_shape)
-            tensor = torch.from_numpy(tile).unsqueeze(0).to(loaded_backbone.device)
+            tensor = tile.unsqueeze(0).contiguous()
             outputs = loaded_backbone.backbone.forward_features(tensor, masks=None, view_kind="global")
             patch_tokens = outputs["x_norm_patchtokens"]
             if not need_dense:
@@ -908,6 +861,7 @@ def compute_patch_embedding_grid(
     normalized = normalize_volume(
         prepared,
         normalization_scheme=loaded_backbone.normalization_scheme,
+        device=loaded_backbone.device,
         intensity_properties=loaded_backbone.intensity_properties,
     )
     padded, padded_shape = pad_volume_to_patch_size(normalized, loaded_backbone.patch_size)
@@ -1519,7 +1473,7 @@ if _QT_AVAILABLE:
             )
 
             path_str = _normalize_path_string(self.ome_zarr_spec.path)
-            root = open_group(path_str)
+            root = open_group(path_str, auth=None, threads=1)
             self._zarr_root = root
 
             multiscale_data = []

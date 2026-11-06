@@ -19,6 +19,7 @@ from tqdm.auto import tqdm
 
 from dinovol_2.eval.download_data import download_tasks
 from dinovol_2.model.patch_encode_decode import LayerNormNd, PatchDecode
+from dinovol_2.ops.precision import resolve_amp_dtype
 
 
 _DEFAULT_TASK_NAMES = ("surfaces", "ink")
@@ -435,9 +436,9 @@ class PatchEncodeDecodeTaskDecoder(nn.Module):
 
 
 class Dinov2TaskModel(nn.Module):
-    def __init__(self, teacher_backbone: nn.Module, num_classes: int, decoder_type: str) -> None:
+    def __init__(self, backbone: nn.Module, num_classes: int, decoder_type: str) -> None:
         super().__init__()
-        self.backbone = deepcopy(teacher_backbone)
+        self.backbone = deepcopy(backbone)
         for parameter in self.backbone.parameters():
             parameter.requires_grad = False
 
@@ -478,6 +479,7 @@ class TaskEvalRunner:
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.device = device
         self.use_amp = bool(use_amp and device.type == "cuda")
+        self.amp_dtype = resolve_amp_dtype(self.config.get("amp_dtype", "bfloat16"))
         self.tasks = resolve_eval_tasks(self.config.get("eval_task", "both"))
         self.train_iters = int(self.config.get("eval_task_train_iters", 500))
         if self.train_iters < 0:
@@ -668,7 +670,7 @@ class TaskEvalRunner:
 
     @classmethod
     def _probability_preview(cls, prediction_probability: torch.Tensor) -> np.ndarray:
-        prediction = prediction_probability.detach().cpu()
+        prediction = prediction_probability.detach().float().cpu()
         if prediction.ndim == 2:
             prediction_slice = prediction.numpy()
         else:
@@ -700,7 +702,7 @@ class TaskEvalRunner:
         *,
         task_name: str,
         dataset: TaskVolumeSet,
-        teacher_backbone: nn.Module,
+        backbone: nn.Module,
         step: int,
     ) -> dict[str, Any]:
         task_seed = self._task_seed(self.seed, task_name, step)
@@ -708,7 +710,7 @@ class TaskEvalRunner:
         if torch.cuda.is_available():
             torch.cuda.manual_seed_all(task_seed)
         rng = np.random.default_rng(task_seed + 1000003 * self.rank)
-        model = Dinov2TaskModel(teacher_backbone, 1, self.decoder_type).to(self.device)
+        model = Dinov2TaskModel(backbone, 1, self.decoder_type).to(self.device)
         ddp_model: nn.Module = model
         if self.world_size > 1:
             ddp_model = DDP(model, **self._ddp_kwargs(self.device))
@@ -717,7 +719,7 @@ class TaskEvalRunner:
             lr=self.learning_rate,
             weight_decay=self.weight_decay,
         )
-        scaler = torch.amp.GradScaler("cuda", enabled=self.use_amp)
+        scaler = torch.amp.GradScaler("cuda", enabled=self.use_amp and self.amp_dtype == torch.float16)
 
         train_loss_total = 0.0
         ddp_model.train()
@@ -735,7 +737,7 @@ class TaskEvalRunner:
                 target = target.unsqueeze(0).to(self.device, non_blocking=True)
 
                 optimizer.zero_grad(set_to_none=True)
-                with torch.autocast(device_type=self.device.type, enabled=self.use_amp):
+                with torch.autocast(device_type=self.device.type, dtype=self.amp_dtype, enabled=self.use_amp):
                     logits = ddp_model(image)
                     loss = self._task_loss(task_name, logits, target)
                 scaler.scale(loss).backward()
@@ -752,7 +754,7 @@ class TaskEvalRunner:
         val_names: list[str] = []
         image_path: Path | None = None
         validation_image_rows: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
-        with torch.no_grad(), torch.autocast(device_type=self.device.type, enabled=self.use_amp):
+        with torch.no_grad(), torch.autocast(device_type=self.device.type, dtype=self.amp_dtype, enabled=self.use_amp):
             for val_image, val_target, val_name in validation_crops:
                 val_names.append(val_name)
                 val_batch = val_image.unsqueeze(0).to(self.device, non_blocking=True)
@@ -793,9 +795,9 @@ class TaskEvalRunner:
             "image_path": image_path,
         }
 
-    def run(self, *, teacher_backbone: nn.Module, step: int) -> dict[str, dict[str, Any]]:
+    def run(self, *, backbone: nn.Module, step: int) -> dict[str, dict[str, Any]]:
         self._ensure_data()
-        crop_size = tuple(int(v) for v in teacher_backbone.global_crops_size)
+        crop_size = tuple(int(v) for v in backbone.global_crops_size)
         results: dict[str, dict[str, Any]] = {}
         for task_name in self.tasks:
             dataset = self._dataset_for(task_name, crop_size)
@@ -803,7 +805,7 @@ class TaskEvalRunner:
                 results[task_name] = self._run_single_task(
                     task_name=task_name,
                     dataset=dataset,
-                    teacher_backbone=teacher_backbone,
+                    backbone=backbone,
                     step=step,
                 )
             except Exception:
