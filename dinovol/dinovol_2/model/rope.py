@@ -415,7 +415,11 @@ class CompassRopePositionEmbedding(_BaseRopePositionEmbedding):
         self.radii.mul_(self.periods.reciprocal())
         bins = torch.arange(self.num_pairs, device=self.periods.device, dtype=self.periods.dtype)
         azimuth = (bins + torch.rand_like(self.radii)) * (2 * math.pi / self.num_pairs)
-        self.angles[..., 0].copy_(azimuth)
+        # Decouple azimuth from the ordered geometric radii while keeping one
+        # angle per bin. Otherwise large frequencies favor the first azimuths.
+        for head in range(self.num_heads):
+            order = torch.randperm(self.num_pairs, device=self.periods.device)
+            self.angles[head, :, 0].copy_(azimuth[head, order])
         if self.ndim == 3:
             # Uniform polar angles would concentrate directions at the poles.
             # Stratify cos(polar) instead, and independently permute its bins

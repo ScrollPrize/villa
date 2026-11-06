@@ -854,7 +854,7 @@ The following settings can be added to a training config:
   initialization, and unitary Fourier mixing within each head, independently
   per block. Its 2D path implements the paper's complex DFT exactly using real
   matrix products. The paper does not define a 3D version: Dinovol extends it
-  with spherical directions (stratified azimuth and independently shuffled,
+  with spherical directions (independently shuffled stratified azimuth and
   stratified cos(polar)) and a real orthogonal Hartley transform across pairs,
   applied identically to all three frequency components. This preserves frequency
   energy and commutes with spatial rotations. It is an unvalidated 3D adaptation,
@@ -864,6 +864,10 @@ The following settings can be added to a training config:
   `2*pi` frequency convention and coordinate augmentations. Radii initialize
   from the configured geometric period schedule over all pairs, with 1% uniform
   multiplicative jitter (the paper leaves the noise amplitude unspecified).
+  In both 2D and 3D, azimuth assignments are independently shuffled per head to
+  avoid coupling direction to the ordered radii. This removes that source of
+  initialization bias; learned frequencies are not constrained to be isotropic.
+  Saved radii and angles are restored as usual when loading a checkpoint.
   Set `rope_kwargs: {"use_dft": false}` for the no-mixing ablation, or
   `rope_kwargs: {"radial_jitter": 0.0}` to disable initialization noise.
   Phase computation disables autocast and requires FP32 (default) or FP64;
