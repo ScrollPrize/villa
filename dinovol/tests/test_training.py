@@ -230,3 +230,27 @@ class TrainingTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class SkippedStepTests(unittest.TestCase):
+    @unittest.skipUnless(torch.cuda.is_available(), 'GradScaler skipping needs CUDA float16')
+    def test_skipped_scaler_step_calls_the_skip_hook(self):
+        class Counting(RegressionMethod):
+            def __init__(self):
+                super().__init__()
+                self.skipped = 0
+
+            def optimizer_step_skipped(self, step):
+                self.skipped += 1
+
+        with tempfile.TemporaryDirectory() as folder:
+            config = tiny_config(folder, device='cuda')
+            config.update(use_amp=True, amp_dtype='float16')
+            method = Counting().cuda()
+            trainer = Trainer(config, method=method)
+            trainer.train_step(torch.ones(4, 3, device='cuda'), 0)
+            self.assertEqual((method.updates, method.skipped), (1, 0))
+            weight = method.encoder.weight.detach().clone()
+            trainer.train_step(torch.full((4, 3), float('inf'), device='cuda'), 1)
+            self.assertEqual((method.updates, method.skipped), (1, 1))
+            torch.testing.assert_close(method.encoder.weight, weight)
