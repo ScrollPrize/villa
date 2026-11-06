@@ -8,31 +8,154 @@ The canonical source is
 Run project commands from the monorepository's `dinovol/` directory.
 
 - `dinov2_eva` is adapted from [dynamic-network-architectures](https://github.com/MIC-DKFZ/dynamic-network-architectures/blob/main/dynamic_network_architectures/architectures/dinov2_eva.py), with minimal changes.
+- Volume reads, normalization, resampling and augmentations use [vc_reader](../vc_reader) with CUDA.
 - RoPE is adapted from the [DINOv3 implementation](https://github.com/facebookresearch/dinov3/blob/main/dinov3/layers/rope_position_encoding.py) and extended to support 3D.
 
 This implementation is still incomplete. Pretraining works, but finetuning has
 not yet been implemented.
 
-Use the `v3` preset for new runs, as selected by every example recipe. It uses
-plain SwiGLU with a 2x hidden width and no query/key/value projection biases,
-axial 3D RoPE, separate local/global CLS output normalization, constant LR after
-warmup, constant weight decay and teacher momentum, and KoLeo groups of up to 16.
-The `v2` preset and configs without `model_type` retain their older defaults for
-checkpoint compatibility. Explicit config values override preset defaults.
-To select the new defaults, set `model.model_type` to `v3`:
+DINO uses the current v3 defaults automatically: plain SwiGLU with a 2x hidden
+width, no query/key/value projection biases, axial 3D RoPE, separate local/global
+CLS output normalization, constant LR after warmup, constant weight decay and
+teacher momentum, and KoLeo groups of up to 16. No `model_type` is needed.
+Architecture options and training schedules can be overridden independently.
+
+Recipes now separate five concerns:
+
+| Section | Settings |
+| --- | --- |
+| `data` | `dataset`, `val_dataset`, `monitor_dataset`, batch size and loader workers |
+| `backbone` | CNN/ViT architecture, patch size, RoPE and crop sizes |
+| `method` | `name` (default `dino`), loss weights, teachers, masks, auxiliary supervision; `heads` holds projection-head settings |
+| `optimizer` | LR/weight-decay schedules, AdamW, clipping and parameter-group multipliers |
+| `runtime` | Device/DDP, precision, compilation, iteration count, accumulation, logging, evaluation and output paths |
 
 ```json
 {
-  "model": {
-    "model_type": "v3",
+  "backbone": {
     "embedding_type": "default",
     "global_crops_size": [96, 96, 96],
     "local_crops_size": [48, 48, 48]
-  }
+  },
+  "method": {"name": "dino"},
+  "optimizer": {"lr": 0.0001},
+  "runtime": {"max_iterations": 1000000}
 }
 ```
 
+Add volume sources under `data.dataset` as in the complete recipes below. Crop
+sizes can be inferred from `data.dataset` when omitted from `backbone`.
+`training.config.normalize_config` also accepts existing flat JSON configs;
+explicit section values take precedence. Legacy explicit `model_type: "v2"`
+settings are expanded by that adapter. Newly supplied unnamed configs now use
+current defaults; old unnamed checkpoint configurations are interpreted using
+their historical defaults when loading for inference. Detailed setting names
+below also retain their legacy flat spelling for compatibility.
+
 ## Pretraining on 8–9 µm scroll volumes
+
+`dinovol_2/configs/pretrain_8_9um_heads32768.json` uses only volume data:
+surface/fiber predictions, metadata meshes, and auxiliary object losses are
+disabled. Its sampling mask is derived from the volume itself.
+Despite its original filename, this recipe now uses only the next coarser
+resolution: level 1 for native 8–9 µm scans and level 3 for roughly 2.4 µm
+scans. All 39 entries have doubled `pixel_size_um` (15.82–19.208 µm across
+the scans); the original level-0/2 entries are replaced. The occupancy/mask
+level remains 5, and prefetch selects the new training levels automatically.
+This recipe uses a 384-wide backbone, two `16×192×192` global crops and four
+`16×64×64` local crops (Z, Y, X), with `16×8×8` patches: 576 global tokens
+and 64 local tokens. The CNN strides are `[2,1,1]`, then three `[2,2,2]`
+stages. The source sampling window is `24×288×288`; random resized crop scales
+remain unchanged. Its output directory identifies the new crop and patch sizes
+and CNN initialization. This recipe starts a fresh run (`resume` and
+`auto_resume` are false), initializing the CNN stem and stages from
+`/mnt/raid_nvme/dinovol_ckpts/teacher_615k.pt`. The final CNN projection,
+transformer, and heads start randomly initialized; optimizer and schedules
+start at step zero. Enable auto-resume when restarting this new run.
+A short RTX 5090 check with larger `16×384×384` global and `16×128×128`
+local crops, the same embedding, and random initialization at batch 12 with
+two accumulation
+microbatches measured 16.12 GiB peak allocated VRAM and 1.58 s mean per optimizer
+step (three measured steps after three warmups, BF16, compilation and
+checkpointing enabled). It used synthetic volume data passed through the crop
+pipeline, then GPU-resident batches for full teacher/student forward, backward,
+AdamW, and EMA. Timings exclude data loading, augmentation, monitoring, and
+compilation; this checks feasibility, not training quality or maximum batch size.
+`data.dataset.volume_cache_dir` is `/mnt/raid_nvme/volume_cache`; the reader
+appends `s3/vesuvius-challenge-open-data/<volume path>/<level>/`, reuses existing
+cached chunks, and fetches missing chunks into the same layout. Newly created
+training caches use lossless VC-Delta3D compression (`quant=1`), including
+occupancy/mask levels. Existing caches retain their recorded format. Keep the S3
+volume URLs so partial caches can be filled. Remote metadata is still checked
+when opening a volume.
+
+To prefetch the configured volume levels, run from the repository root:
+
+```bash
+# Metadata only: report chunk counts and dense, uncompressed size.
+.venv/bin/python -m dinovol_2.prefetch_volumes \
+  --config dinovol_2/configs/pretrain_8_9um_heads32768.json --dry-run
+
+# Fill the same cache used by training, with lossless compression for new stores.
+.venv/bin/python -m dinovol_2.prefetch_volumes \
+  --config dinovol_2/configs/pretrain_8_9um_heads32768.json \
+  --connections 32 --compress-cache
+```
+
+To keep a progress log that can be followed later, add `--log-file PATH`.
+This appends output and timestamped progress lines instead of terminal bars;
+`--log-interval` controls the update interval in seconds (default 30). The log
+includes per-level counts, percentage, rate, ETA, GETs, fetched bytes, and exit
+status. Completed counts include cached and absent chunks, so the rate and ETA
+measure planned positions processed, not only downloads.
+
+```bash
+.venv/bin/python -m dinovol_2.prefetch_volumes \
+  --config dinovol_2/configs/pretrain_8_9um_heads32768.json \
+  --connections 64 --compress-cache --log-file /tmp/prefetch.log
+# In another terminal:
+tail -f /tmp/prefetch.log
+```
+
+All configured occupancy/mask levels (level 5 in this recipe) are cached first,
+across every selected volume. The script then reads those cached volumes in
+bounded slabs and selects training-level chunks overlapping their nonzero mask,
+with a one-coarse-voxel boundary margin. Filtering is enabled by default. Each
+volume reports its selected/skipped chunk counts and has a progress bar sized
+to the selected chunks. No labels are downloaded.
+
+`--mask-padding N` changes that boundary margin; `--no-mask-filter` restores
+full-level downloads. A coarse zero is a heuristic, not proof that finer data
+is absent: skipped chunks are never recorded as missing, and training can fetch
+them normally. This is a nonzero occupancy mask, not the closed/eroded sampling
+envelope used by `object_mask`. Some selected chunks may still be absent.
+`--dry-run` reads metadata only and reports **unfiltered** sizes; filtered counts
+require the coarse cache to be populated and read. Size estimates include cached
+data and absent chunks, and are not download or compressed disk-size predictions.
+Configs without an occupancy level fall back to full training-level downloads.
+
+`--scope occupancy` stops after the coarse levels; `--scope training` includes
+the coarse prerequisites when filtering is enabled. Repeat
+`--sample-id ID` to select individual datasets. `--cache-dir` overrides the
+cache root (the directory above `s3/`).
+Direct execution from `dinovol_2/` also works:
+`python prefetch_volumes.py --config configs/pretrain_8_9um_heads32768.json --connections 32 --compress-cache`.
+It imports the current checkout even when an older package copy is installed.
+
+Downloads use vc_reader's cache prefill with a configurable connection limit,
+`--batch-chunks` (default 512) chunks at a time. The progress bar counts
+completed chunk positions, including cache hits and cached absent-chunk markers;
+its GET and fetched-byte counters refer to the current level. Interrupt and rerun
+the same command to resume: completed chunks are reused. Remote metadata is still
+checked when opening stores.
+
+`--compress-cache` uses vc_reader's native lossless `vc-delta3d` codec for newly
+created 3D uint8/uint16 stores. Training reads these automatically with identical
+voxel values. Existing stores retain their current codec, including raw caches;
+this option does not convert existing stores. Omit the flag for new raw stores.
+Cache path structure remains unchanged. Local HTTP regression tests cover cache
+reuse, missing chunks, failed-download recovery, dry-run behavior, and Delta3D
+round trips (`python -m unittest discover -s tests -p 'test_prefetch_volumes.py'`).
 
 [`dinovol_2/configs/pretrain_8_9um.json`](dinovol_2/configs/pretrain_8_9um.json)
 is a standalone pretraining config with 128³ global crops and 64³ local crops.
@@ -45,10 +168,18 @@ and point supervision are disabled.
 The FFN uses `mlp_ratio: 7.2` (3,456 / 480); its packed input projection produces
 two 3,456-wide branches before gating.
 
-Compilation is enabled for this recipe with the top-level setting:
+When `use_amp` is enabled, autocast defaults to BF16 (`"amp_dtype": "bfloat16"`).
+Training, monitoring, validation, and task evaluation use the same setting.
+Parameters remain FP32, and BF16 runs disable gradient scaling. Set `runtime.amp_dtype` to `"float16"` to use FP16 autocast with CUDA gradient scaling, or
+`"use_amp": false` to disable autocast. The aliases `bf16` and `fp16` are accepted.
+Resuming uses the current config's precision setting; old configs without
+`amp_dtype` now select BF16. Saved FP16 scaler state is ignored when resuming in
+BF16. The FP16 performance measurements below predate this default change.
+
+Compilation is enabled for this recipe with this setting in `runtime`:
 
 ```json
-"compile": {"enabled": true, "backend": "inductor", "mode": "max-autotune-no-cudagraphs", "dynamic": {"backbone": false}}
+"compile": {"enabled": true, "backend": "inductor", "mode": "default", "dynamic": {"backbone": false}}
 ```
 
 The trainer compiles the student and teacher backbones (CNN plus transformer)
@@ -61,6 +192,11 @@ Compiled backward graphs are captured with autocast disabled for backward,
 matching the trainer's existing AMP forward / non-autocast backward sequence.
 
 Other configs default to compilation disabled; `"compile": false` disables it.
+Under DDP, `optimize_ddp` (default `false`) keeps Dynamo from splitting compiled
+graphs at gradient-bucket boundaries: the split graphs drop the checkpoint
+save-attention policy, so every student attention forward ran again in backward
+(g256 crops on 3× H100: 5.75 → 4.47 s/step with it off). `"python_reducer"`
+traces DDP's reducer into compiled autograd instead; it measured the same as `false`.
 Optional settings are `backend`, `mode`, `dynamic` (default `null`, automatic
 dynamic-shape handling), and `fullgraph` (default `false`, allowing graph breaks).
 `dynamic` may also map `backbone`, `dino_head`, and `ibot_head` to `true`,
@@ -78,21 +214,74 @@ workspace memory. Measure throughput and peak VRAM after warmup on the target GP
 compiled execution can change floating-point rounding and random-number streams.
 For compiler diagnostics, run with `TORCH_LOGS=graph_breaks,recompiles`.
 
-The recipe also enables these throughput and memory settings. Each is off unless
-a config sets it:
+The recipe uses these throughput and memory settings. Defaults are noted below:
 
-- `ibot_fused_last_layer` (top level): the heads return the iBOT bottleneck
+- `method.ibot_fused_last_layer`: the heads return the iBOT bottleneck
   features and last-layer weight, and the loss forms the
   `[n_masked, ibot_out_dim]` logits, Sinkhorn-Knopp targets, and gradients one
   chunk of `ibot_masked_loss_chunk_size` rows at a time. Sinkhorn-Knopp reduces to
   per-prototype scales `b` with targets `softmax(teacher_logits / T + log b)`, so
   three passes over recomputed teacher logits replace the stored matrices. The
   math is unchanged; only floating-point rounding differs.
-- `model.deeper_embed_channels_last`: CNN activations and weights use the
+- `ibot_kernel_backend: "triton"` (optional, default `"torch"`): with
+  `ibot_fused_last_layer: true` and Sinkhorn centering, tile the projection and
+  Sinkhorn/soft-target-loss reductions without storing FP32 logit or target
+  matrices. Backward retains a row chunk of FP16/BF16 logit gradients for cuBLAS
+  feature/weight-gradient GEMMs. FP32 accumulation and the AMP logit rounding
+  boundary are retained; reduction order changes rounding. No prototype sampling,
+  gradient filtering, or precision reduction is used. CUDA devices with compute
+  capability 8+ and contiguous FP16/BF16 features use the kernel; other inputs and
+  installations without Triton use the existing PyTorch path. This setting does
+  not change checkpoint parameter names or shapes. Sinkhorn reuses partial
+  reduction buffers bounded by `ibot_masked_loss_chunk_size` rows (4,096 when
+  unset), accumulating prototype sums in chunk order before each distributed
+  reduction. This bounds scratch memory as the masked batch grows; the final
+  per-row scales still grow with the batch. On SM120 GPUs, the measured
+  256-wide / 131,072-prototype head uses 64-row projection tiles; other devices
+  and head shapes retain 32-row tiles. Backward adds half-precision GEMM results
+  directly into the FP32 weight-gradient accumulator without a separate FP32
+  conversion buffer. Precision and the backward row chunk size are unchanged.
+- `backbone.deeper_embed_channels_last`: CNN activations and weights use the
   channels-last 3D layout, which cuDNN's tensor-core convolutions use natively.
   Weights are converted after initialization; checkpoints are layout-independent.
-- `model.deeper_embed_batch_chunk_size: null`: the CNN embeds the whole batch at
-  once instead of one sample at a time (the default of 1).
+- `backbone.checkpoint_save_attention: true` (default): when gradient checkpointing
+  is enabled, retain fused SDPA results and their backward auxiliaries while
+  recomputing the rest of each transformer block. This also supports block
+  chunking. The math-attention fallback retains the original recomputation
+  policy, avoiding saved quadratic attention matrices. Set this to `false`
+  to restore the original transformer checkpoint policy. Fused attention with
+  nonzero attention dropout is also recomputed so that replay preserves the RNG
+  stream for subsequent dropout operations.
+- `backbone.deeper_embed_norm_backend: "auto"` (default): use a Triton CNN channel
+  normalization on supported CUDA inputs, including fused ReLU and residual/ReLU
+  where applicable. The custom backward finishes input and affine gradients
+  together, preventing cross-stage compiler fusion from extending full-volume
+  buffer lifetimes. It recomputes statistics and uses bounded FP32 affine-gradient
+  scratch space, with no atomic reductions. FP32 statistics and affine arithmetic
+  and the original FP16/BF16 activation rounding boundaries are preserved;
+  reduction order can change rounding. Outputs use channels-last 3D layout.
+  NVIDIA compute capability 8+, up to 256 channels, FP16/BF16/FP32 5D activations,
+  and FP32 affine parameters are supported. CPU, other shapes/dtypes, and
+  installations without Triton fall back to PyTorch. `"triton"` has the same
+  compatibility fallback; `"torch"` disables the custom path. Use `"torch"` for
+  higher-order differentiation. Parameter names and shapes are unchanged.
+  An isolated full-resolution forward/backward comparison is available with
+  `AGENTS_AGENT_MODE=1 .venv/bin/python -m dinovol_2.bench_kernels channel_norm
+  --dim 32 --spatial-size 192 --batch-size 2 --backend triton --compile`;
+  use `--backend torch --compile` for the compiled reference. This microbenchmark
+  uses synthetic activations and does not predict whole-model peak memory.
+- `backbone.attention_backend: "flash"` (default): prefer FlashAttention, retaining
+  the other SDPA kernels as fallbacks when it is unavailable.
+- `backbone.deeper_embed_batch_chunk_size: 1` (default): embed one view at a time
+  through the CNN to lower peak VRAM, while preserving every view. Set `null`
+  to embed the whole batch together.
+- `runtime.num_threads` (optional positive integer): set PyTorch CPU intra-op
+  threads before model and data-loader setup. This is independent of
+  `data.num_workers`; omitted or `null` retains the current PyTorch setting.
+  `pretrain_8_9um_heads32768.json` uses `num_threads: 1` to avoid excessive
+  threading overhead when stacking raw crops, and CNN batch chunk size 4.
+  Run it with the usual `python pretrain.py configs/pretrain_8_9um_heads32768.json`
+  from `dinovol_2/`; no `OMP_NUM_THREADS` environment variable is needed.
 - `fused_optimizer`: fused CUDA AdamW.
 - `cuda_expandable_segments`: the CUDA caching allocator uses expandable
   segments, avoiding fragmentation-driven cache flushes near full memory.
@@ -100,10 +289,46 @@ a config sets it:
   (fixed) crop shapes on first use. On the H100 this cut the
   `pretrain_8_9um.json` step from 1.65 s to 1.53 s. Algorithm choice can change
   floating-point rounding.
-- `compile.mode: "max-autotune-no-cudagraphs"` (used by `pretrain_8_9um.json`)
-  benchmarks Triton matmul and convolution kernels against the library ones at
-  compile time and keeps the fastest. The first launch compiles for about 13
-  minutes; the inductor cache makes later launches fast.
+- `compile.mode: "default"` (used by `pretrain_8_9um.json`) uses regular
+  Inductor compilation without maximum autotuning. This reduces startup time
+  when testing changes. Maximum autotuning remains an explicit opt-in; the
+  historical measurements below used it.
+
+On an RTX 5090 with PyTorch 2.10/CUDA 12.8, the `teacher_585k.pt` configuration
+(depth 10, width 480, 10 heads, patch size 8) was measured on one fixed real
+PHerc0125 sample with two 192³ global and two 64³ local views. Both branches
+were initialized from the teacher checkpoint. With FP16 autocast, cuDNN attention,
+and `max-autotune-no-cudagraphs`, three warmups followed by ten forward/backward
+iterations gave:
+
+| checkpoint / CNN normalization | mean ms | median [min–max] ms | peak allocated GiB |
+| --- | ---: | ---: | ---: |
+| original / PyTorch | 622 | 617 [611–641] | 11.44 |
+| save attention / PyTorch | 572 | 569 [564–596] | 11.44 |
+| save attention / Triton | 559 | 557 [548–576] | 9.25 |
+
+These exclude compilation, data loading/augmentation, optimizer steps/moments,
+and EMA. The fixture has unlabeled object points and no surface/fiber/ink labels.
+The custom CNN path reduces overlapping full-resolution backward buffers and
+layout conversions; this whole-model result is distinct from the isolated
+normalization benchmark above. All 160.7M gradient elements were compared:
+the combined implementation had 0.61% relative L2 error and 0.99998 cosine
+similarity to the original path on this batch, with finite gradients throughout.
+The switches above retain the original paths for comparison.
+
+A separate comparison with both optimizations and `backbone.attention_backend:
+"flash"` took 523 ms mean, 519 ms median [516–546], with the same 9.25 GiB
+allocated peak. The profiler confirmed FlashAttention forward and backward.
+Compared with the optimized cuDNN run, full gradients differed by 0.56% relative
+L2 with 0.99998 cosine similarity. These historical single-batch checks do not
+assess training convergence.
+
+With BF16 and regular compilation (`mode: "default"`), the same four-view
+workload measured 557 ms mean and 9.25 GiB peak allocated with cuDNN attention
+and whole-batch CNN embedding. FlashAttention plus CNN chunk size 1 measured
+526 ms mean and 8.72 GiB peak allocated over ten steps after three warmups.
+Those are now the model defaults and the settings in `pretrain_8_9um.json`.
+The timing and memory exclusions listed above still apply.
 
 Historical optimizer-step measurements used an earlier version of
 `pretrain_8_9um.json` with width 288, a 2,048-wide FFN, a 16-channel CNN stem,
@@ -115,7 +340,7 @@ memory so there is no data wait; median of 10 steps after 6 warmup steps):
 | --- | --- | --- |
 | previous config | 1.649 | 19.4 |
 | + `cudnn_benchmark` | 1.527 | 21.0 |
-| + `model.attention_backend: "cudnn"` | 1.389 | 23.0 |
+| + `backbone.attention_backend: "cudnn"` | 1.389 | 23.0 |
 | + `compile.mode: "max-autotune-no-cudagraphs"` | 1.350 | 23.7 |
 
 In those measurements, the GPU was the bottleneck (97–100% utilization in
@@ -159,17 +384,16 @@ mostly empty.
   on PHerc0826). Startup reads ~13 GB nominal (less in practice: masked-out
   chunks are absent from S3), most of it the twelve 2.2–2.4 µm volumes' 8× levels.
 - `dataset.read_ahead`: each loader process reads this many future source
-  windows in background threads while it augments the current sample. Window
+  windows in background threads while it prepares crop and point metadata. Window
   locations are still drawn in the loader process, so sampling stays
   deterministic, but enabling it changes the order of random draws.
-- `dataset.gaussian_blur: true` and `dataset.global_crop_scale: [0.18, 0.45]` /
+- `dataset.global_crop_scale: [0.18, 0.45]` /
   `dataset.local_crop_scale: [0.023, 0.057]`: views are resampled only 0.87–1.18×
   from the 192³ source window (global 108–147 → 128 voxels, local 55–74 → 64)
   with Gaussian blur enabled as part of the augmentation. The zoom range
   covers the 7.9–9.4 µm spread in voxel size between scans.
-- `num_workers: 24`, `prefetch_factor: 2`, `persistent_workers: true`: with
-  read-ahead, one worker produces about 1.8 samples/s (augmentation-bound), so 24
-  workers comfortably exceed the GPU's ~20 samples/s on an H100.
+- `num_workers: 24`, `prefetch_factor: 2`, `persistent_workers: true`:
+  workers read source windows and prepare crop plans ahead of batched CUDA processing.
 
 The teacher forward now runs before the student forward, so its no-grad
 intermediates are freed before student activations accumulate.
@@ -243,10 +467,6 @@ parameter layout. All CNN embeddings now use zero padding; older checkpoints
 can load with matching architecture, but their boundary behavior changes.
 Spatial CNN chunking and the separate `*_view_size` dataset settings have been
 removed; use `*_crop_size` and optionally `deeper_embed_batch_chunk_size`.
-The CNN regression tests check the recipe's architecture
-on a 32³ synthetic crop, gradients, masking, and checkpoint reconstruction;
-the pretraining smoke suite also exercises the projection-free path with a
-smaller CNN and synthetic volume.
 
 The volume list is pinned from the public
 [scan metadata](https://vesuvius-challenge-open-data.s3.amazonaws.com/metadata.json),
@@ -275,6 +495,99 @@ PHerc0332, PHerc1451, PHerc1299 and PHercParis4. PHercParis3 has no surface or f
 predictions in this format and trains without object labels. MANBp, 0343P and 0500P2
 are thinner than a source window and use `object_mask_min_inside: 0.5`.
 
+### Interpolation and iBOT kernel validation
+
+Cross-view teacher interpolation selects the valid masked coordinates before
+sampling. On CUDA with Triton it accumulates the eight neighbours directly into
+the output, avoiding copied source grids and `[points, 8, channels] intermediates.
+CPU, differentiable callers, and installations without Triton use the shared
+PyTorch sampler. Point supervision's differentiable sampler is unchanged.
+
+The real-volume validator checks that every required cached Zarr chunk exists,
+reads four overlapping 192³ crops, applies the checkpoint's normalization, and
+encodes masked/unmasked views with its teacher weights. It compares interpolation,
+Sinkhorn scales, loss, and feature/classifier gradients. New fixtures use BF16
+autocast without gradient scaling. The saved fixture allows both backends to benchmark identical real features without I/O or
+backbone time in the measurement. It is an operator validation, not a full
+training throughput or downstream-quality measurement.
+
+```bash
+AGENTS_AGENT_MODE=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 \
+  .venv/bin/python -m dinovol_2.validate_real_kernels \
+  --checkpoint /mnt/raid_nvme/dinovol_ckpts/teacher_585k.pt \
+  --volume /mnt/raid_nvme/volume_cache/s3/vesuvius-challenge-open-data/PHerc0125/volumes/20250821151825-9.362um-1.2m-113keV-masked.zarr/0 \
+  --start 10240 3840 3840 --features /tmp/dinovol-real-kernel-features.pt
+```
+
+Recheck that fixture with `--reuse --features /tmp/dinovol-real-kernel-features.pt`
+instead of the checkpoint/volume arguments. To benchmark, run each command below
+with both `--backend torch` and `--backend triton`, sequentially on an idle GPU:
+
+```bash
+AGENTS_AGENT_MODE=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 \
+  .venv/bin/python -m dinovol_2.bench_kernels interpolation \
+  --backend torch --dtype float32 --features /tmp/dinovol-real-kernel-features.pt \
+  --warmup 6 --iterations 20 --profile
+
+AGENTS_AGENT_MODE=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 \
+  .venv/bin/python -m dinovol_2.bench_kernels ibot \
+  --backend torch --compile --features /tmp/dinovol-real-kernel-features.pt \
+  --warmup 6 --iterations 20 --profile
+```
+
+`--compile` uses regular Inductor compilation (`mode="default"`) for the iBOT
+baseline; the Triton backend supplies its own kernels. Omitting `--features`
+benchmarks seeded synthetic inputs (BF16 by default); `--rows`, `--dim`,
+`--prototypes`, and `--chunk-size` control the iBOT workload. No dependencies are installed by these
+commands. CUDA access is required for benchmarks and real-volume validation.
+
+Measured on an RTX 5090, PyTorch 2.10.0+cu128 / Triton 3.6.0, using the above real
+crops (origins ZYX: `(10240,3840,3840)`, `(10368,3968,3968)`,
+`(10272,3857,3863)`, `(10387,3997,3979)`), 6,007 selected rows, 131,072 prototypes,
+256-wide FP16 bottlenecks, and 4,096-row chunks. Timings are synchronized wall time
+after six warmups, over twenty iterations, excluding compilation and profiling.
+Interpolation uses FP32 token features; iBOT includes all three Sinkhorn
+iterations, loss forward, and backward.
+
+| Operation | Backend | Mean / median ms | Min–max ms | Peak allocated MiB |
+| --- | --- | --- | --- | --- |
+| Cross-view interpolation + selection | Original PyTorch | 3.192 / 3.004 | 2.988–3.699 | 1940.4 |
+| Cross-view interpolation + selection | Selected Triton | 0.036 / 0.034 | 0.032–0.052 | 113.7 |
+| iBOT including backward | Compiled PyTorch | 36.005 / 35.867 | 34.768–37.802 | 4378.1 |
+| iBOT including backward | Tiled Triton | 30.399 / 30.228 | 29.300–31.929 | 1490.1 |
+
+These peaks include the operator inputs and outputs, not the model or CUDA
+allocator reservation. The interpolation profile was dominated by indexing,
+weighted products, and reductions; tiled iBOT is dominated by projection/reduction
+kernels and gradient GEMMs. The real-data loss differed by at most `4.77e-7` across
+validation runs; gradient relative L2 differences were below `3.7e-5` and interpolation maximum
+absolute error was `9.54e-7`. This is floating-point agreement, not bitwise
+equivalence. Benchmark on the training GPU before enabling the optional iBOT
+backend, especially for different prototype counts or bottleneck widths.
+
+The subsequent iBOT tile/scratch changes were checked on one real 192³ global
+crop and one 64³ local crop from the same PHerc0125 array and checkpoint, at
+ZYX origins `(10240,3840,3840)` and `(10305,3901,3897)`. The global view had 4,182
+masked tokens, with 131,072 prototypes, 256-wide FP16 bottlenecks, and 4,096-row
+chunks. The local view had 512 tokens; local tokens do not enter the iBOT loss.
+On the same RTX 5090 / PyTorch 2.10.0 / Triton 3.6.0 environment, synchronized
+operator timings over 30 iterations after six warmups were:
+
+| iBOT including Sinkhorn and backward | Mean / median ms | Min–max ms | Peak allocated MiB |
+| --- | --- | --- | --- |
+| Initial tiled kernels | 20.921 / 20.628 | 20.222–22.201 | 1588.1 |
+| Tuned tiles, bounded Sinkhorn, no FP32 conversion buffer | 17.424 / 17.365 | 16.654–18.541 | 1460.1 |
+
+Isolated Sinkhorn scratch/output overhead fell from 67.0 to 34.0 MiB.
+The final loss matched the PyTorch reference on this fixture; feature and weight
+gradient relative L2 errors were `3.73e-5` and `2.78e-5` or less, using an upstream
+AMP gradient scale of 1,024. These peaks include the retained fixture tensors,
+not the backbone, and timings exclude data loading, encoding, compilation, and
+profiling. This is not a full training-step measurement: cross-view training
+requires two global views. The kernel regression command above checks both
+projection tiles, FP16/BF16 gradients, a bounded allocation budget for all three
+Sinkhorn reduction modes, and distributed reductions with an empty local shard.
+
 ### Local benchmark launcher
 
 `dinovol_2/bench_speed.py` is a machine-specific launcher using the paths defined
@@ -294,12 +607,57 @@ recorded in `BENCH_ROOT/latest-run.txt`. Earlier benchmark directories are kept,
 including when a later launch fails. The launcher does not stop existing GPU
 processes; choose a free GPU before running it.
 
-The filesystem behavior is checked with mocked process launches (no GPU or
-training process is started):
+### CUDA data pipeline
+
+Dinovol requires the sibling `../vc_reader` package built with CUDA, a CUDA-capable
+PyTorch installation, and an NVIDIA GPU. `pyproject.toml` resolves vc_reader from
+that checkout and enables its CUDA build. Follow [vc_reader's build requirements](../vc_reader/README.md)
+for the native libraries and CUDA toolkit, then run `uv sync` from `dinovol/`.
+The default build targets the visible GPU (`CMAKE_CUDA_ARCHITECTURES=native`).
+For a build machine without a visible GPU, specify the deployment architecture,
+for example `uv sync --config-setting-package vc-reader:cmake.define.CMAKE_CUDA_ARCHITECTURES=120-real`.
+Rebuild vc_reader after changing its native sources.
+
+`CudaDataLoader` workers use the native reader and sample raw crop windows plus
+point metadata. The parent process normalizes each crop on CUDA **before** native
+affine resampling, then applies scanner, geometry and intensity transforms.
+Images remain CUDA tensors through collation and the model. Point coordinates,
+object labels and cross-view token targets share the image geometry. Paired
+Gram-teacher crops share that geometry and optionally the augmentation seed.
+Inference normalization also uses CUDA.
+
+Each DDP rank's loader
+draws its worker seeds from its own generator (one global torch draw mixed with the
+rank): resuming from a checkpoint with a single RNG state restores identical states
+on every rank, which previously gave all ranks identical samples.
+`data.gpu_prefetch: true` processes the next batch on a side CUDA stream in a
+background thread; with the GPU saturated by training it measured slower on one
+H100 (4.45 vs 4.34 s/step), so it is off by default.
+
+All image stages use `Pipeline.batch()`. For the batch-12 recipe with two global
+and four local views per sample, intensity transforms process all 24 global
+crops together and all 48 local crops together. Preparation groups variable input
+sizes; geometry groups matching output shapes and sampled operations. Per-axis
+affine scales support anisotropic crops. Every view has its own random seed;
+`augmentation: "dino"` selects the lighter contrast/brightness recipe.
+
+To benchmark only data delivery using the local partial volume cache:
 
 ```bash
-python -m unittest discover -s tests -p test_bench_speed.py
+export OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1
+.venv/bin/python -m dinovol_2.bench_data_pipeline --prepare
+.venv/bin/python -m dinovol_2.bench_data_pipeline --warmup 48 --batches 120 --tag run1 --profile
+.venv/bin/python -m unittest discover -s tests -p 'test_cuda_pipeline.py' -v
 ```
+
+The default config is `dinovol_2/configs/pretrain_8_9um_heads32768.json`; the cache
+is `/mnt/raid_nvme/volume_cache/s3/vesuvius-challenge-open-data`. Preparation
+inventories files locally and samples only complete chunk neighborhoods, with
+nonzero rejection. Missing occupancy masks and mesh/surface/fiber label sources
+are excluded from this benchmark; unlabeled object points and cross-view token
+targets remain enabled. No model or optimizer is timed. The exact inventory,
+resolved configuration, batch latencies and optional CUDA trace are written to
+`perf_results/cuda_pipeline/`. Warmup and profiling are excluded from throughput.
 
 ### Pseudo-object losses
 
@@ -360,20 +718,43 @@ student) and the optimizer state of existing parameters is kept.
 `grad_accumulation_steps: 2` runs two batches of 12 per optimizer step
 (effective batch 24 per GPU). The configured learning rate is `1.768e-4`.
 
-`dataset.augmentation` selects the view augmentation applied after the random
-resized crop. `"full"` (the default, used by `pretrain_8_9um.json` together with
-`gaussian_blur: true`) applies simulated scanner artifacts (smear, slice
-illumination), right-angle rotations, flips and axis transposes, local brightness
-gradients and gamma, blur, noise, sharpening, contrast and brightness, low
-resolution, gamma and inversion. `"dino"` keeps only the rotations, flips,
-transposes and the contrast and brightness jitter. Rotations and transposes use
-every pair of axes with equal crop size (all three for cubic crops). The scanner
-artifacts act along fixed tensor axes, so they run before the rotations: they
-follow the volume's axes, as real scan artifacts do, instead of always lying along
-the same axes of the augmented view. Every crop draws its own augmentation (with
-the probabilities above, most intensity transforms change a 1-channel crop in
-10 to 40% of crops, since they also apply per channel with probability 0.5).
-Points, object points and token correspondences follow the spatial transforms.
+`dataset.augmentation: "full"` is the default. Geometry chooses uniformly among
+all 48 cube orientations: six axis permutations and independent 50% flips on
+each axis. This includes every right-angle rotation and reflection without a
+second, duplicate mirror operation. Noncubic views use only permutations that
+preserve both student and paired teacher shapes.
+
+Intensity probabilities below are independent per view, with all image channels
+participating when an effect is selected. These are moderate starting settings;
+training quality should guide subsequent tuning.
+
+| Probability | Transforms |
+| --- | --- |
+| 25% | contrast, gamma |
+| 15% | bias field, brightness gradient, local contrast, local gamma, brightness add, invert, slice illumination |
+| 10% | CLAHE, low resolution, plasma brightness/contrast, Rician noise, sharpen, unsharp mask, vignetting, smear, FDA, pixel distribution adaptation |
+| 8% | Gaussian blur, Gibbs ringing |
+| 5% | defocus, median filter |
+
+Rician noise uses a standard deviation of 1–4 raw uint8 intensity levels before
+normalization; magnitude noise requires nonnegative source intensities. Smear
+and slice illumination run before orientation changes, so artifacts follow scan
+axes. Gaussian blur uses sigma 0.3–0.8 voxels. FDA mixes 10–30% of the low-frequency
+amplitude from another crop in the same resolution group (frequency fraction
+0.05). Pixel distribution adaptation blends 10–30% toward the reference crop’s
+mean and standard deviation. Both reference crops and their statistics remain
+on CUDA. These effects are skipped when there is no other independently seeded
+view available in that group.
+
+Only geometry applies to supervision: label IDs and values are unchanged;
+point coordinates, object points and token correspondences follow their image's
+geometry. Worker point metadata uses vc_reader's native `Pipeline.map_points()`
+with the same spatial operations as CUDA images, without allocating an image.
+Intensity stages receive images only. Dense masks supplied to vc_reader should
+be declared `Label()` for geometry with nearest-neighbor sampling and exclusion
+from intensity transforms. `"dino"` uses the same geometry with contrast and
+brightness jitter. Paired Gram views share geometry and, when enabled, intensity
+seeds and reference crops.
 
 `ibot_targets: "cross_view"` (used by `pretrain_8_9um.json`; default
 `"same_view"`) takes the teacher's iBOT target for a masked student token from the
@@ -418,12 +799,9 @@ The following settings can be added to a training config:
 
 ```json
 {
-  "lr_schedule": "constant",
-  "warmup_steps": 1000,
-  "koleo_distributed": true,
-  "koleo_loss_group_size": 16,
-  "model": {
-    "model_type": "v3",
+  "optimizer": {"lr_schedule": "constant", "warmup_steps": 1000},
+  "method": {"koleo_distributed": true, "koleo_loss_group_size": 16},
+  "backbone": {
     "rope_type": "axial",
     "scale_mlp": false,
     "mlp_ratio": 2.0,
@@ -434,17 +812,17 @@ The following settings can be added to a training config:
 }
 ```
 
-- `lr_schedule` defaults to `constant` for `v3`, and `cosine` for older presets. `constant` uses the existing linear
+- `optimizer.lr_schedule` defaults to `constant`. `constant` uses the existing linear
   warmup and then holds the configured `lr`, including beyond `max_iterations`;
   it ignores `min_lr`. Last-layer freezing and parameter-group LR multipliers
   still apply. Weight decay, teacher momentum, and temperature retain their
-  own schedules. In `v3`, weight decay defaults to a constant `0.04` and teacher
+  own schedules. Weight decay defaults to a constant `0.04` and teacher
   momentum to a constant `0.994`; overriding their initial values also changes
   their default final values. Set `weight_decay_end` equal to `weight_decay` and
   `final_momentum_teacher` equal to `momentum_teacher` to hold those constant too.
   `warmup_steps: 0` disables LR warmup; otherwise the default is 10% of the run.
 - `scale_mlp`, `mlp_ratio`, and `qkv_bias` default to `false`, `2.0`, and
-  `false` in `v3`, following the DINOv3 7B pretraining block. `scale_mlp: false`
+  `false`, following the DINOv3 7B pretraining block. `scale_mlp: false`
   removes the extra normalization inside SwiGLU; the usual pre-attention and
   pre-MLP norms remain. Our ratio specifies the effective hidden width directly:
   DINOv3's `ffn_ratio: 3` applies an internal two-thirds adjustment. Older presets
@@ -452,17 +830,48 @@ The following settings can be added to a training config:
   architecture, preserve their saved model configuration or explicitly set all
   three old values (`mlp_ratio: 2.6666666666666665` in JSON); changing these
   settings changes parameter shapes and state-dict keys.
-- `attention_backend` (default `null`, PyTorch's choice) names the preferred
+- `qk_norm` (default `false` for all presets) applies separate learned RMSNorms
+  to Q and K over each head's channels after projection and before RoPE, for
+  both full and axial attention. Each norm shares its channel scales across
+  heads and uses epsilon `1e-6`; V and the attention scaling are unchanged.
+  `pretrain_8_9um_heads32768.json` enables it. Enabling it adds Q/K norm weights
+  and changes attention behavior: use a fresh run/output directory rather than
+  auto-resuming a checkpoint trained without it. Leave it disabled to preserve
+  existing checkpoint layouts and behavior.
+- `attention_backend` (default `"flash"`) names the preferred
   fused attention kernel: `cudnn`, `flash`, `efficient` or `math`, with the others
   as fallbacks. Each attention call applies it, so compiled graphs record the
   choice when traced (a process-wide setting would not reach graphs reloaded from
-  the compile cache). With 4101 tokens and head dimension 48, cuDNN attention
-  takes 7.1 ms forward plus backward per 32 global crops on the H100, against
-  12.4 ms for FlashAttention-2; `pretrain_8_9um.json` uses `cudnn`.
-- `rope_type` selects the existing 3D `axial` or learnable per-block `mixed`
+  the compile cache). Set `null` to use PyTorch's kernel selection, or set
+  `"cudnn"` to prefer cuDNN. Performance depends on the GPU and token shape;
+  `pretrain_8_9um.json` uses `"flash"`.
+- `rope_type` selects 3D `axial`, learnable per-block `mixed`, or `compass`
   implementation. The default is `axial` for `v3`, `mixed` for `v2`, and `axial`
-  for the original unversioned model. Both support variable crop sizes and coordinate rescaling.
-  The attention head dimension must be divisible by six for 3D RoPE.
+  for the original unversioned model. All support variable crop sizes and coordinate rescaling.
+  The attention head dimension must be divisible by six for axial/mixed 3D RoPE;
+  Compass only requires an even head dimension.
+- `rope_type: "compass"` implements [Compass-RoPE](https://openreview.net/pdf?id=kbIXDF7PD0)
+  (Section 5 and Appendix F): signed learnable radii, stratified angular
+  initialization, and unitary Fourier mixing within each head, independently
+  per block. Its 2D path implements the paper's complex DFT exactly using real
+  matrix products. The paper does not define a 3D version: Dinovol extends it
+  with spherical directions (stratified azimuth and independently shuffled,
+  stratified cos(polar)) and a real orthogonal Hartley transform across pairs,
+  applied identically to all three frequency components. This preserves frequency
+  energy and commutes with spatial rotations. It is an unvalidated 3D adaptation,
+  not a reproduction of the paper's 2D results.
+  Phases use Cartesian dot products, equivalent to the polar formula without
+  singularities at the origin, and retain Dinovol's normalized coordinates,
+  `2*pi` frequency convention and coordinate augmentations. Radii initialize
+  from the configured geometric period schedule over all pairs, with 1% uniform
+  multiplicative jitter (the paper leaves the noise amplitude unspecified).
+  Set `rope_kwargs: {"use_dft": false}` for the no-mixing ablation, or
+  `rope_kwargs: {"radial_jitter": 0.0}` to disable initialization noise.
+  Phase computation disables autocast and requires FP32 (default) or FP64;
+  radii and angles receive no weight decay, as with mixed frequencies.
+  `pretrain_8_9um_heads32768.json` enables Compass. Start a fresh run when switching
+  from axial/mixed: their frequency tensors and optimizer states cannot be
+  resumed as Compass parameters. Existing Compass checkpoints resume normally.
 - `rope_shift_coords`, `rope_jitter_coords` and `rope_rescale_coords` augment the
   student's RoPE coordinates during training (the EMA teacher always uses the
   plain grid): a uniform shift in `[-shift, shift]` per axis (coordinates span
@@ -500,7 +909,7 @@ The following settings can be added to a training config:
 Model head dimensions and `pretrained_weights` are preserved in the resolved
 training config. When enabling separate norms on an older checkpoint, missing
 norm weights are initialized from its trained shared norm (or its existing CLS
-norm for the new local norm). Use `model.pretrained_weights` to start a new run
+norm for the new local norm). Use `backbone.pretrained_weights` to start a new run
 when changing normalization options; resuming optimizer state requires the same
 parameter layout. A checkpoint written with axial RoPE can be resumed with
 `rope_type: "mixed"`: each block's mixed frequencies start at the axial layout, so
@@ -508,6 +917,14 @@ outputs are unchanged at the resume step, and they then train (without weight
 decay); optimizer state of all existing parameters is kept, matched by name.
 Other switches between mixed and axial RoPE are architecture changes, not exact
 checkpoint conversions.
+
+For CNN-only initialization, set `method.pretrained_cnn_weights` to a teacher
+export or training checkpoint. This requires `embedding_type: "deeper"` and
+loads only `down_projection.stem` and `down_projection.stages` from the preferred
+teacher backbone. All CNN keys and tensor shapes must match; strides may differ.
+The final projection, transformer, and heads retain their random initialization,
+then the complete student is copied into the frozen EMA teacher. This option is
+mutually exclusive with `pretrained_weights` and does not restore training state.
 
 ## Training monitor
 
@@ -533,8 +950,7 @@ token-only masking, including parameter gradients. For `"deeper"`, it prevents
 neighboring embeddings from observing the hidden voxel values and changes
 training behavior, including when resuming an older checkpoint. There is no
 legacy masking mode or configuration switch; checkpoint parameter shapes stay
-unchanged. Output/gradient equivalence and hidden-voxel isolation are covered by
-`tests/test_voxel_masking.py` in the standard test suite.
+unchanged.
 
 ## Gram Anchoring And HR Adaptation
 
@@ -617,23 +1033,6 @@ To sanity-check one batch end to end:
 uv run python -m dinovol_2.verify dinovol_2/example_config.json --no-amp
 ```
 
-To run the synthetic smoke suite:
-
-```bash
-uv run python -m unittest discover -s tests -v
-```
-
-With an existing environment, run without installing or updating dependencies:
-
-```bash
-AGENTS_AGENT_MODE=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 .venv/bin/python -m unittest discover -s tests -v
-```
-
-The suite includes synthetic volume smoke tests and regressions for checkpoint
-initialization, output norms, both RoPE implementations, constant LR, paired Gram
-geometry, and two-rank KoLeo gradients. It does not establish downstream quality;
-validate training changes on real held-out volumes before a long run.
-
 ## Point-supervised pretraining
 
 Pretraining can optionally reinforce patch embeddings with sparse annotated points while DINO, iBOT, KoLeo, and Gram remain active. The top-level defaults are:
@@ -709,3 +1108,152 @@ Workflow:
 - click `Similarity For Selected Points` or `Similarity For All Points`
 
 The widget rebuilds the teacher backbone from the saved checkpoint config, computes a patch embedding grid only inside the active bbox for the selected OME-Zarr scale, and limits the PCA and cosine-similarity outputs to that same crop. The dock widget opens on the bottom of the napari window.
+
+## Embedding a volume region
+
+`dinovol_2/eval/embed_volume.py` embeds a z slab (optionally restricted in y/x)
+with a checkpoint's teacher backbone and writes a zarr v2 group (channel-last,
+Zstd) with three outputs:
+
+| Array | Grid step | Values |
+| --- | --- | --- |
+| `tokens` | patch size | blended backbone `x_norm_patchtokens` |
+| `tokens_unit` | patch size | the same tokens L2-normalized (dot product = cosine) |
+| `dense` | `--dense-stride` voxels | `PointDenseHead` object embedding, unit length |
+| `ink` | `--dense-stride` voxels | `PointDenseHead` ink embedding, unit length |
+
+```bash
+.venv/bin/python -m dinovol_2.eval.embed_volume \
+  --checkpoint /mnt/raid_nvme/dinovol_ckpts/checkpoint_step_640000.pt \
+  --volume s3://vesuvius-challenge-open-data/PHercParis4/volumes/20260411134726-2.400um-0.2m-78keV-masked.zarr/ \
+  --level 2 --cache-dir /mnt/raid_nvme/volume_cache --z-start 14000 --depth 192 \
+  --output outputs/PHercParis4_L2_z14000-14192.zarr
+```
+
+Tiles use the training global crop size (192³ for the 640k checkpoint) on one
+global lattice per axis: tile `k` starts at `k*stride - margin`, and contributes
+on `[k*stride, k*stride + stride + ramp)` with linear ramps whose overlaps sum to
+one. The `margin` voxels at each face are context only. Every output is
+therefore a fixed blend of the tiles covering its global position: any slab or
+y/x range reproduces the same values (`--y-range`/`--x-range` select whole
+lattice cells). Margin and ramp default to `tile/6` (32 voxels, stride 96): with
+the 640k checkpoint, token agreement with a centered view is 0.88 at a tile face
+and 0.98 six tokens in. Larger `--tile` values run (RoPE is trained with
+coordinate rescaling), but the embedding itself changes with tile size: at the
+same voxel, 192³ and 384³ tiles agree at cosine 0.71 (tokens) and 0.70 (dense),
+and the drift does not converge up to 448³. Keep one tile size for outputs
+that will be compared; the default matches training.
+
+Volume reads and normalization use vc_reader. Training normalized each crop with
+its own statistics, which would make adjacent tiles disagree, so the
+checkpoint's scheme is applied with fixed statistics. They come from the nonzero
+voxels of every 8th chunk along each axis of the whole volume. Robust
+normalization clips only the upper percentile, so masked zeros stay below scroll
+air. The statistics are saved in `.zattrs`. Pass that file to
+`--normalization-stats` to reuse them for other slabs. Outputs whose patch or
+stride block has no nonzero voxel are not embedded (zero vectors, chunks not
+written), and tiles without such outputs are skipped.
+
+`--dtype int8` (default) stores a symmetric per-vector quantization:
+`value = q * <name>_scale`. On real tiles it keeps cosine similarity ≥ 0.9998
+against fp32; `--dtype float16` stores values directly. `read_embeddings(path,
+name, selection)` returns dequantized float32 arrays. To add `tokens_unit` to a
+group written without it, run `.venv/bin/python -m dinovol_2.eval.embed_volume
+--add-unit-tokens <group.zarr>`. It derives the array from the stored `tokens`
+(cosine ≥ 0.99999 against computing it during the run). At `--dense-stride 1` the
+full PHercParis4 level-2 slab is roughly 345 GB (dense 220, ink 120, tokens 3).
+
+## Rendering embeddings on a segment
+
+`dinovol_2/eval/render_surface_embeddings.py` renders the embeddings on a tifxyz
+segment as a mesh intersection. vc_reader bilinearly interpolates the stored
+grid at every output pixel and samples each volume there trilinearly on CUDA.
+`render_surface(..., step=)` sets one pixel per embedding-level voxel by default.
+Only the lattice cells near the surface are embedded: the voxels it passes
+through, dilated by two. They go to a sparse zarr using the same globally
+consistent tiling as `embed_volume`, one worker process per GPU, and are
+deleted after rendering unless `--keep-embeddings` is given.
+
+```bash
+.venv/bin/python -m dinovol_2.eval.render_surface_embeddings \
+  --volume s3://vesuvius-challenge-open-data/PHerc1667/volumes/20251217075048-2.399um-0.2m-78keV-masked.zarr/ \
+  --level 2 --cache-dir /ephemeral/zarr_cache --no-cache-writes \
+  --tifxyz <segment>/mesh/<id>-on-<volume>-level2.tifxyz \
+  --checkpoint checkpoint_step_640000.pt --out renders/1531 --gpus 5,6,7 \
+  --labels <segment.tifxyz>/ink-labels/<labels>
+```
+
+Outputs (uint8 TIFFs at render resolution):
+
+- `_ct`: the CT on the surface.
+- `_{tokens,dense,ink}_pca`: the top three principal components of each unit embedding, as RGB.
+- `_inklabels`, `_supervision`: the labels upsampled to the render.
+- `_inkfocus_{ink,tokens}`: cos(e, ink) − cos(e, non-ink) against reference embeddings.
+
+The ink references come from the labels. Ink is labelled ink pixels. Non-ink is
+only supervised pixels labelled zero: unlabelled pixels are unknown, never
+background. Segments without labels can reuse `--ink-prototypes` saved by
+another render. References from a segment's own labels make its ink-focus
+image a visualisation, not a held-out test.
+
+`--no-cache-writes` reads uncached chunks remotely without adding them to the
+cache, and `--offline` refuses them instead. `_render.json` records the
+normalization, lattice, timings and files.
+
+## Extending the training method
+
+`dinovol_2.pretrain` is the CLI. `training/trainer.py` owns iteration, AMP,
+gradient accumulation, backward, AdamW, logging and checkpoint cadence.
+`methods/dino.py` owns the DINO/iBOT model, teachers, loss state, schedules and
+optional point/object supervision. Training and validation share one objective
+implementation. Validation retains same-view, unfused iBOT and excludes object
+losses; it consumes pending centers without enqueuing further updates. Rendering and pipeline diagnostics live in
+`training/monitoring.py` and `training/diagnostics.py`.
+
+Implement `TrainingMethod` and add a construction branch in `methods.build_method`
+to introduce another method. `Trainer(config, method=...)` also accepts an
+already constructed method. Its forward returns `StepOutput(loss, metrics)`;
+metrics are scalar tensors, and `loss` retains its gradient. The trainer runs
+forward once per microbatch and handles backward. Method hooks before/after the
+optimizer step run once per accumulated step. Trainable forwards must pass
+through the method's DDP-wrapped model. DINO keeps its region-head gradient
+reduction in `before_optimizer_step` and EMA/Gram updates in
+`after_optimizer_step`. `evaluation_backbone()` selects the encoder supplied to
+downstream evaluation. `model.build_backbone()` constructs a standalone encoder
+without projection heads or a teacher.
+
+The shared `MultiCropBatch` contract is defined in `ops/collate.py`. Global and
+local crops have independent spatial sizes and view-major rows:
+`row = view_index * batch_size + sample_index`. The same sample index across
+views refers to the same source. Zero local views is supported. Crops and
+annotations are collated independently of the method; `methods/dino_data.py`
+adds iBOT masks and preserves labeled-point interpolation support. Shared data
+loading supports arbitrary positive global-view counts. DINO and paired
+cross-view token correspondences require exactly two.
+
+New checkpoints use `format_version: 2`. The trainer saves optimizer/scaler and
+per-rank runtime state; the method supplies its own named state. DINO includes
+student/teacher weights, centers, the Gram teacher and auxiliary-head ramp state.
+Pending center reductions are completed before saving. Ink queues and RNG state
+are saved per rank. An evaluation-backbone export is included for other methods.
+Legacy DINO checkpoints remain readable by training and inference adapters.
+A checkpoint from a different method is rejected before loading model weights.
+
+Checkpoint saving is collective under DDP: every rank must call
+`save_checkpoint`, and rank zero writes the file atomically. Resuming restores
+saved RNG streams, sampler epochs and monitor selection state. Worker prefetch
+queues and the exact position within a dataset iterator are not serialized, so
+resuming a live data pipeline does not promise the exact next batch. Changing
+world size also changes rank streams. Fixed-batch optimizer continuation is
+covered by tests, including centering and auxiliary state.
+
+Run the regression and CUDA integration suite from this directory:
+
+```bash
+AGENTS_AGENT_MODE=1 .venv/bin/python -m unittest discover -s tests -v
+```
+
+The suite includes a teacher-free method, shared crop ordering/geometry,
+legacy/new checkpoints, and two-rank CPU/Gloo coverage for the region head and
+rank-local resume. CUDA tests require GPU access; run outside a restrictive
+sandbox when necessary.
