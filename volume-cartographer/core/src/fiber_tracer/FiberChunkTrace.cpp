@@ -325,6 +325,8 @@ std::shared_ptr<FiberChunkPaths> buildFiberChunkPaths(const std::array<int,3>& k
         throw std::invalid_argument("delayed reverse verification is supported by direct CPU replay only");
     if(trace.replayPresenceIgnoreWidth || trace.widthHardRelativeTolerance>0)
         throw std::invalid_argument("separate width/presence eligibility is currently supported by direct CPU tracing only");
+    if(trace.sheetPlaneWeight>0)
+        throw std::invalid_argument("sheet_plane_weight is currently supported by direct CPU tracing only");
     if(c.onlineRefineIterations && c.gpuLibrary.empty())
         throw std::invalid_argument("online refinement requires GPU backend");
     if(c.beamCommitMode=="rolling" && (c.gpuLibrary.empty() ||
