@@ -1,0 +1,7 @@
+<RCC>
+    <qresource prefix="/themes">
+        <file alias="modern-dark.vc3dtheme">builtin/modern-dark.vc3dtheme</file>
+        <file alias="modern-light.vc3dtheme">builtin/modern-light.vc3dtheme</file>
+        <file alias="theme.qss.in">builtin/theme.qss.in</file>
+    </qresource>
+</RCC>

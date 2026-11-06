@@ -13,6 +13,12 @@ set(srcs
     CState.hpp
     Keybinds.cpp
     Keybinds.hpp
+    KeybindsSheet.cpp
+    KeybindsSheet.hpp
+    CommandCatalog.cpp
+    CommandCatalog.hpp
+    CommandPalette.cpp
+    CommandPalette.hpp
     CWindow.cpp
     FiberCollectionGenerator.cpp
     FiberCollectionGeneratorDialog.cpp
@@ -141,7 +147,15 @@ set(srcs
     elements/GrowOnlyLabel.hpp
     elements/ViewerSplitGrid.cpp
     elements/ViewerSplitGrid.hpp
+    SettingsFilter.cpp
+    SettingsFilter.hpp
     SettingsDialog.cpp
+    themes/ClassicTheme.cpp
+    themes/ClassicTheme.hpp
+    themes/ThemeEngine.cpp
+    themes/ThemeEngine.hpp
+    themes/ThemeManager.cpp
+    themes/ThemeManager.hpp
     SurfaceTreeWidget.hpp
     SurfaceTreeWidget.cpp
     SeedingBatchTracker.cpp
@@ -367,7 +381,7 @@ endif()
 
 # Everything but main() is one object library, so the app and the benchmarks
 # (VC_BUILD_BENCHMARKS) link the same compiled viewer and controller code.
-add_library(vc3d_app OBJECT ${srcs} resources.qrc)
+add_library(vc3d_app OBJECT ${srcs} resources.qrc themes/themes.qrc)
 add_executable(VC3D VCAppMain.cpp)
 target_link_libraries(VC3D PRIVATE vc3d_app)
 add_dependencies(VC3D vc_object_convert)

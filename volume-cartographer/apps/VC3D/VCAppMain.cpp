@@ -17,6 +17,7 @@
 #include "SshPrompts.hpp"
 #include "agent_bridge/AgentBridgeServer.hpp"
 #include "VCSettings.hpp"
+#include "themes/ThemeManager.hpp"
 #include "vc/core/Version.hpp"
 #include <QSettings>
 #include "vc/core/types/Volume.hpp"
@@ -353,6 +354,14 @@ auto main(int argc, char* argv[]) -> int
         "name");
     parser.addOption(agentBridgeNameOption);
 
+    QCommandLineOption themeOption(
+        "theme",
+        "Use a theme for this run without saving it: classic, modern-dark, "
+        "modern-light, an installed theme id, or the path of a .vc3dtheme file "
+        "or theme folder. Overrides VC3D_THEME and the saved theme.",
+        "id-or-path");
+    parser.addOption(themeOption);
+
     parser.process(app);
 
     if (parser.isSet(debugOption)) {
@@ -390,6 +399,10 @@ auto main(int argc, char* argv[]) -> int
         }
         cacheSizeGB = static_cast<size_t>(parsed);
     }
+
+    // The main window applies the theme where it always applied the classic
+    // look; it uses this override.
+    vc3d::theme::ThemeManager::instance().setStartupOverride(parser.value(themeOption));
 
     int rc = 0;
     {
