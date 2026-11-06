@@ -98,7 +98,22 @@ def _upgrade_weight_norm_state_dict_keys(state_dict: Mapping[str, Any]) -> dict[
     return upgraded
 
 
+LAST_LAYER_TYPES = ("weight_norm", "linear", "none")
+
+
 class DINOHead(nn.Module):
+    """MLP -> L2-normalized bottleneck -> optional bias-free final layer.
+
+    last_layer_type selects the final-layer parameterization:
+      - "weight_norm" (DINO default): W = g * v / ||v|| per output row, g initialized to 1.
+        norm_last_layer=True freezes g; False leaves it trainable. Neither removes the
+        weight normalization.
+      - "linear": an ordinary bias-free nn.Linear whose weight is initialized with a
+        truncated normal (std 0.02) like the MLP; rows are not normalized.
+      - "none": no final layer; forward returns the normalized bottleneck.
+    nlayers counts the affine stages up to and including the bottleneck projection.
+    """
+
     def __init__(
         self,
         in_dim: int,
@@ -108,10 +123,16 @@ class DINOHead(nn.Module):
         nlayers: int = 3,
         use_bn: bool = False,
         norm_last_layer: bool = False,
+        last_layer_type: str = "weight_norm",
     ) -> None:
         super().__init__()
         if nlayers < 1:
             raise ValueError(f"DINO head needs at least one layer, got nlayers={nlayers}")
+        if last_layer_type not in LAST_LAYER_TYPES:
+            raise ValueError(f"last_layer_type must be one of {LAST_LAYER_TYPES}, got {last_layer_type!r}")
+        if norm_last_layer and last_layer_type != "weight_norm":
+            raise ValueError("norm_last_layer freezes the weight-norm scale and needs last_layer_type='weight_norm'")
+        self.last_layer_type = last_layer_type
 
         if nlayers == 1:
             self.mlp = nn.Linear(in_dim, bottleneck_dim)
@@ -131,11 +152,18 @@ class DINOHead(nn.Module):
             self.mlp = nn.Sequential(*layers)
 
         self.apply(self._init_weights)
-        self.last_layer = weight_norm(nn.Linear(bottleneck_dim, out_dim, bias=False))
-        last_layer_scale = _weight_norm_scale_parameter(self.last_layer)
-        last_layer_scale.data.fill_(1.0)
-        if norm_last_layer:
-            last_layer_scale.requires_grad = False
+        if last_layer_type == "weight_norm":
+            self.last_layer = weight_norm(nn.Linear(bottleneck_dim, out_dim, bias=False))
+            last_layer_scale = _weight_norm_scale_parameter(self.last_layer)
+            last_layer_scale.data.fill_(1.0)
+            if norm_last_layer:
+                last_layer_scale.requires_grad = False
+        elif last_layer_type == "linear":
+            # Built before initialization so it does not keep nn.Linear's default init.
+            self.last_layer = nn.Linear(bottleneck_dim, out_dim, bias=False)
+            self._init_weights(self.last_layer)
+        else:
+            self.last_layer = None
 
     @staticmethod
     def _init_weights(module: nn.Module) -> None:
@@ -148,9 +176,65 @@ class DINOHead(nn.Module):
         x = self.mlp(x)
         eps = 1e-6 if x.dtype == torch.float16 else 1e-12
         x = F.normalize(x, dim=-1, p=2, eps=eps)
-        if not apply_last_layer:
+        if not apply_last_layer or self.last_layer is None:
             return x
         return self.last_layer(x)
+
+
+@torch.no_grad()
+def ema_update_(teacher: list[torch.Tensor], student: list[torch.Tensor], momentum: float) -> None:
+    """teacher <- momentum * teacher + (1 - momentum) * student, elementwise, in place."""
+    if not 0.0 <= momentum <= 1.0:
+        raise ValueError(f"EMA momentum must be in [0, 1], got {momentum}")
+    if len(teacher) != len(student):
+        raise ValueError("EMA needs one student tensor per teacher tensor")
+    if not teacher:
+        return
+    torch._foreach_mul_(teacher, momentum)
+    torch._foreach_add_(teacher, student, alpha=1.0 - momentum)
+
+
+def vit_parameter_groups(
+    module: nn.Module,
+    *,
+    num_layers: int,
+    chunked_blocks: bool = False,
+    lr_decay_rate: float = 1.0,
+    patch_embed_lr_mult: float = 1.0,
+) -> list[dict[str, Any]]:
+    """AdamW groups for a student ModuleDict holding a ViT under "backbone" plus heads.
+
+    Biases, norms, LayerScale gammas and modules' no_weight_decay() names have no
+    weight decay; layerwise LR decay follows block depth; patch-embedding LR is scaled.
+    """
+    no_decay_names: set[str] = set()
+    for module_name, child in module.named_modules():
+        if child is module or not hasattr(child, "no_weight_decay"):
+            continue
+        module_prefix = f"{module_name}." if module_name else ""
+        no_decay_names.update(module_prefix + name for name in child.no_weight_decay())
+
+    params_groups: list[dict[str, Any]] = []
+    for name, parameter in module.named_parameters():
+        if not parameter.requires_grad:
+            continue
+        group = {
+            "params": parameter,
+            "is_last_layer": "last_layer" in name,
+            "lr_multiplier": _get_vit_lr_decay_rate(
+                name,
+                lr_decay_rate=lr_decay_rate,
+                num_layers=num_layers,
+                chunked_blocks=chunked_blocks,
+            ),
+            "wd_multiplier": 1.0,
+        }
+        if name in no_decay_names or name.endswith(".bias") or "norm" in name or "gamma" in name:
+            group["wd_multiplier"] = 0.0
+        if "patch_embed" in name or "down_projection" in name:
+            group["lr_multiplier"] *= patch_embed_lr_mult
+        params_groups.append(group)
+    return _fuse_params_groups(params_groups)
 
 
 class PointDenseHead(nn.Module):
@@ -423,49 +507,14 @@ class DinoVitStudentTeacher(nn.Module):
         lr_decay_rate: float = 1.0,
         patch_embed_lr_mult: float = 1.0,
     ) -> list[dict[str, Any]]:
-        no_decay_names: set[str] = set()
-        for module_name, module in self.student.named_modules():
-            if module is self.student or not hasattr(module, "no_weight_decay"):
-                continue
-            module_prefix = f"{module_name}." if module_name else ""
-            no_decay_names.update(module_prefix + name for name in module.no_weight_decay())
-
-        backbone = self.student.backbone
         backbone_defaults = _resolve_backbone_defaults(self.config)
-        num_layers = int(self.config.get("depth", backbone_defaults["depth"]))
-        chunked_blocks = bool(getattr(backbone, "chunked_blocks", False))
-
-        params_groups: list[dict[str, Any]] = []
-        for name, parameter in self.student.named_parameters():
-            if not parameter.requires_grad:
-                continue
-
-            group = {
-                "params": parameter,
-                "is_last_layer": "last_layer" in name,
-                "lr_multiplier": _get_vit_lr_decay_rate(
-                    name,
-                    lr_decay_rate=lr_decay_rate,
-                    num_layers=num_layers,
-                    chunked_blocks=chunked_blocks,
-                ),
-                "wd_multiplier": 1.0,
-            }
-
-            if (
-                name in no_decay_names
-                or name.endswith(".bias")
-                or "norm" in name
-                or "gamma" in name
-            ):
-                group["wd_multiplier"] = 0.0
-
-            if "patch_embed" in name or "down_projection" in name:
-                group["lr_multiplier"] *= patch_embed_lr_mult
-
-            params_groups.append(group)
-
-        return _fuse_params_groups(params_groups)
+        return vit_parameter_groups(
+            self.student,
+            num_layers=int(self.config.get("depth", backbone_defaults["depth"])),
+            chunked_blocks=bool(getattr(self.student.backbone, "chunked_blocks", False)),
+            lr_decay_rate=lr_decay_rate,
+            patch_embed_lr_mult=patch_embed_lr_mult,
+        )
 
     def load_pretrained_cnn_weights(self, checkpoint_path: str) -> None:
         """Initialize the deeper CNN stem/stages, keeping the final projection random.
@@ -527,12 +576,10 @@ class DinoVitStudentTeacher(nn.Module):
 
     @torch.no_grad()
     def update_teacher(self, momentum: float) -> None:
-        if not 0.0 <= momentum <= 1.0:
-            raise ValueError(f"EMA momentum must be in [0, 1], got {momentum}")
-        teacher_params = [parameter.data for parameter in self.teacher.parameters()]
-        student_params = [parameter.data for parameter in self.student.parameters()]
-        torch._foreach_mul_(teacher_params, momentum)
-        torch._foreach_add_(teacher_params, student_params, alpha=1.0 - momentum)
+        # Stored parameters are averaged: for weight-normalized heads that is g and v
+        # separately, not the effective weight.
+        ema_update_([parameter.data for parameter in self.teacher.parameters()],
+                    [parameter.data for parameter in self.student.parameters()], momentum)
 
     @staticmethod
     def _apply_head(head: nn.Module, tokens: torch.Tensor) -> torch.Tensor:
