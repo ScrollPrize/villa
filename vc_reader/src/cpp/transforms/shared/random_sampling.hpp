@@ -1,10 +1,7 @@
 #pragma once
 #include "volume_grid.hpp"
 namespace vcr::transforms::volume_detail {
-VCR_HD inline std::uint64_t mix(std::uint64_t z) {
-    z=(z^(z>>30))*UINT64_C(0xbf58476d1ce4e5b9);
-    z=(z^(z>>27))*UINT64_C(0x94d049bb133111eb); return z^(z>>31);
-}
+VCR_HD inline std::uint64_t mix(std::uint64_t z) { return splitmix::mix(z); }
 VCR_HD inline double uniform(std::uint64_t seed,std::uint64_t index) {
     return (double(mix(seed+UINT64_C(0x9e3779b97f4a7c15)*(index+1))>>11)+.5)*0x1.0p-53;
 }

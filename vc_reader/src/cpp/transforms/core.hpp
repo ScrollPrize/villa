@@ -18,6 +18,7 @@
 #include <variant>
 #include <vector>
 #include "../rounding.hpp"
+#include "../splitmix.hpp"
 
 // Helpers shared by CPU and CUDA implementations.
 #ifdef __CUDACC__
@@ -76,12 +77,7 @@ inline int axis(char c, std::size_t dim) {
 
 struct Random {
     std::uint64_t state;
-    VCR_HD std::uint64_t next() {
-        auto z = (state += UINT64_C(0x9e3779b97f4a7c15));
-        z = (z ^ (z >> 30)) * UINT64_C(0xbf58476d1ce4e5b9);
-        z = (z ^ (z >> 27)) * UINT64_C(0x94d049bb133111eb);
-        return z ^ (z >> 31);
-    }
+    VCR_HD std::uint64_t next() { return splitmix::next(state); }
     VCR_HD double uniform() { return (double(next() >> 11) + 0.5) * 0x1.0p-53; }
     bool chance(double p) { probability(p); return uniform() < p; }
     std::size_t index(std::size_t n) {

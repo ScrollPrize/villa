@@ -191,6 +191,7 @@ integer writes. All these operations use float32 on CPU and CUDA.
 | PyTorch GPU transforms and prefetching; masked normalization; differentiable structure tensors | `transforms.hpp`: `StructureTensor` (component cotangent via `gradient`) | `transforms/` | `torch.py`: `CudaLoader`, `structure_tensor`; direct calls `A.Normalize(...).batch` |
 | Pavel/Gaussian structure components, directions; Euclidean distances; Hessian ridge responses | `transforms.hpp`: `StructureTensor`, `DistanceTransform`, `Ridges` | `transforms/cpu/`, `transforms/cuda/` | `transforms.StructureTensor`, `DistanceTransform`, `Ridges` |
 | Coherence-enhancing diffusion of a single image or volume, on CPU or CUDA | `transforms.hpp`: `CoherenceEnhancingDiffusion` | `transforms/cpu/coherence_enhancing_diffusion.hpp`, `transforms/cuda/coherence_enhancing_diffusion.cu` | `transforms.CoherenceEnhancingDiffusion` |
+| Self-supervised patch-lattice views: 48 signed axis orientations, token support, teacher/student crop placement, oriented token correspondence, random or 3D multiblock token masks, masked-cell fill. Support, correspondence and fill run on CPU or CUDA; placement and masks are sequential host code | `views.hpp`: `views::orientation`, `drawOrientations`, `tokenSupport`, `planViewSets`, `correspondence`, `patchMasks`, `maskPatchCells`, `views::cuda::` | `views/` | `views.py`: `orientation`, `draw_orientations`, `token_support`, `plan_view_sets`, `correspondence`, `patch_masks`, `mask_patch_cells` |
 
 ### Shared primitives
 
@@ -200,6 +201,7 @@ included as `vc_reader/native/<file>`. They have no stability guarantee beyond t
 | Need | File |
 | --- | --- |
 | Tie rules for rounding coordinates and values | `rounding.hpp` |
+| Counter-based SplitMix64 stream for seeded draws on CPU and CUDA | `splitmix.hpp` |
 | Bilinear, trilinear and masked interpolation; corner weights | `sampling_math.hpp`, `sample_point.hpp` |
 | Numpy typestrs and element types; encoding element values | `element_type.hpp`, `element_value.hpp` |
 | Symmetric eigendecomposition | `symmetric_eigen.hpp` |

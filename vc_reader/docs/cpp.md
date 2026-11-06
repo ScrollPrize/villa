@@ -270,3 +270,14 @@ must fit memory. CUDA tracing uses several image-sized work arrays and up to
 `transforms::RidgeTrace` produces uint8 visit-index fields. `MedialSurface.method`
 selects the shared skeleton algorithm. These transforms accept explicit `on`
 fields or default to label targets and keep intermediate CUDA arrays resident.
+
+## Patch-lattice views
+
+Link `vc_reader::views` and include `views.hpp` for self-supervised view
+construction on a token lattice: orientation ids, token support, teacher/student
+placement, token correspondence, token masks and masked-cell fill. Each seed
+draws from its own SplitMix64 stream; the header documents the order of draws.
+`views::cuda::tokenSupport`, `correspondence` and `maskPatchCells` take device
+pointers (correspondence pairs stay on the host) and enqueue on the calling
+thread's vc_reader stream without waiting; order consumers on that stream or
+call `device::complete()`. CPU and CUDA correspondence results are identical.
