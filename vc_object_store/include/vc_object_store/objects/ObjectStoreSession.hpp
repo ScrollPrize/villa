@@ -109,6 +109,10 @@ struct HostedSessionOptions {
     // by revision, records at numbered versions, and current heads until the
     // feed reports them changed.
     std::size_t cacheBytes = std::size_t(256) << 20;
+    // Empty disables persistent caching. Shared with vc_reader volume caches.
+    std::filesystem::path cacheDirectory;
+    std::optional<int64_t> diskCacheBytes;
+    int64_t minFreeBytes = 0;
 };
 
 // What a hosted attachment knows about its store, for the UI: current as of
@@ -117,6 +121,29 @@ struct HostedFreshness {
     std::optional<StoreStatus> status;
     std::optional<int64_t> checkedAtUs; // UTC Unix microseconds of that check
     std::string error;                  // empty when the last check succeeded
+};
+
+// A session-owned download survives Project row rebuilds. snapshot() is safe
+// from any thread; cancellation keeps every successfully published cache block.
+struct ObjectPrefetchProgress {
+    std::string stage = "discovering";
+    size_t completed = 0, total = 0;
+    uint64_t downloadedBytes = 0;
+    std::optional<StoreStatus> captured;
+    bool done = false, cancelled = false, complete = false;
+    std::vector<std::string> errors;
+};
+namespace detail { class HostedAttachment; }
+class ObjectPrefetchJob {
+public:
+    void cancel() { cancelled_.store(true); }
+    ObjectPrefetchProgress snapshot() const { std::lock_guard lock(mutex_); return progress_; }
+private:
+    friend class ObjectStoreSession;
+    friend class detail::HostedAttachment;
+    mutable std::mutex mutex_;
+    std::atomic_bool cancelled_{false};
+    ObjectPrefetchProgress progress_;
 };
 
 // Durable drafts (useDraftDirectory): what the session knows of one draft.
@@ -220,6 +247,11 @@ public:
     // Check a hosted attachment now (blocking); its commits then arrive
     // through takeEvents(). A failed check is reported by freshness().
     void refresh(const AttachmentIdentity&);
+
+    // One sequential background transfer per hosted attachment. Repeated starts
+    // return the active job; after completion a start captures a new revision.
+    std::shared_ptr<ObjectPrefetchJob> prefetchObjects(const AttachmentIdentity&);
+    std::shared_ptr<ObjectPrefetchJob> objectPrefetch(const AttachmentIdentity&) const;
 
     // Typed operations, the same for local and hosted attachments.
     StoreStatus status(const AttachmentIdentity&);

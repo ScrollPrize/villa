@@ -105,6 +105,18 @@ template<class F> void readBlocks(int fd, uint64_t offset, uint64_t size, F&& ch
 }
 } // namespace
 
+bool detail::artifactFileMatches(const ArtifactFileRef& file, const std::filesystem::path& path)
+{
+    try {
+        Descriptor input(path, O_RDONLY);
+        platform::FileStat status;
+        if (platform::fstat(input.fd, status) != 0 || !status.regular || uint64_t(status.size) != file.length) return false;
+        PayloadHasher hasher;
+        readBlocks(input.fd, 0, file.length, [&](const uint8_t* data, size_t size) { hasher.update(data, size); });
+        return hasher.finish() == file.sha256;
+    } catch (const std::exception&) { return false; }
+}
+
 bool isArtifactHash(const std::string& text)
 {
     return text.size() == 64 && std::all_of(text.begin(), text.end(), [](char c) {

@@ -256,3 +256,46 @@ staging lifetime and directory, per-request deadlines, WAL checkpoint
 scheduling, query page size, and region budgets; staged uploads stream to
 disk and reserve their declared length up front, so a slow disk slows the
 sender instead of filling memory.
+
+## Persistent hosted reads and object downloads
+
+`HostedSessionOptions::cacheDirectory` opts an attachment into persistent caching.
+`diskCacheBytes` and `minFreeBytes` use the same `vc_reader` disk budget as volume
+caches; leaving the directory empty preserves memory-only behavior. VC3D supplies
+its configured remote-cache directory and limits automatically.
+
+Numbered records, geometry descriptors, positional annotations, selected
+relationship revisions, geometry blocks, and attached-file blocks persist across
+restarts. Store UUID and history generation identify revision entries; SSH forward
+ports are never part of their identity. Geometry and artifacts use shared 1 MiB
+blocks for range reads and downloads. Atomic envelopes include SHA-256 checksums;
+materialized attached files are also checked against their manifests. Cache write
+failures leave interactive network reads usable. Heads, spatial queries, and
+freshness checks still require the service; this is not offline editing.
+
+```cpp
+vc::objects::HostedSessionOptions options;
+options.cacheDirectory = cacheRoot;
+options.diskCacheBytes = int64_t(20) << 30;
+options.minFreeBytes = int64_t(2) << 30;
+auto attachment = session.attachHosted(endpoint, options);
+auto job = session.prefetchObjects(attachment); // returns immediately
+const auto progress = job->snapshot();         // thread-safe copy
+// job->cancel();
+```
+
+One sequential prefetch runs per attachment, yielding between bounded transfers to
+interactive payload reads. It captures the current non-retired objects at numbered
+versions, their associated relationships, and store-held payloads. It does not fetch
+external CT datasets or materialize catalog placeholders. `captured` identifies the
+selection's store generation and commit sequence. Progress reports discovery,
+loading and coverage checking, object counts, payload bytes downloaded, errors,
+and cancellation. `complete` means the required entries remained in the disk cache
+when coverage was checked; later use of the shared budget can evict them.
+
+Jobs belong to the session, independently of UI rows. Detaching cancels a job
+without waiting for its current network transfer. Completed blocks survive
+cancellation. Re-running skips valid blocks, including after a restart. Missing
+payloads, write failures, low free space, and eviction report incomplete coverage.
+VC3D's Project tab exposes this as **Download Objects**, **Cancel**, and, after
+new commits, **Update Cache**. Local store rows display **Local**.

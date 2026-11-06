@@ -16,6 +16,7 @@ void checkArtifactReferences(const std::filesystem::path& storePath, const std::
 // in ranges of at most `range` through `read(offset, count)`, and verifies
 // its length and SHA-256 before publishing it.
 struct ArtifactFileRef { std::string name, sha256; uint64_t length = 0; };
+bool artifactFileMatches(const ArtifactFileRef&, const std::filesystem::path&);
 void writeArtifactFile(const ArtifactFileRef&, const std::filesystem::path& destination, uint64_t range,
                        const std::function<std::vector<uint8_t>(uint64_t offset, uint64_t count)>& read);
 } // namespace vc::objects::detail

@@ -43,6 +43,7 @@ struct ObjectStoreSession::Attachment {
     // Writable attachments: fetches the geometry of objects published elsewhere
     // (setGeometryFetcher).
     std::unique_ptr<detail::FetchQueue> fetches;
+    std::shared_ptr<ObjectPrefetchJob> prefetch; // guarded by session mutex
 };
 
 template <class F>
@@ -362,7 +363,7 @@ void ObjectStoreSession::writeArtifact(const AttachmentIdentity& identity, const
 {
     withAttachment(identity, false, [&](Attachment& attachment) {
         std::filesystem::create_directories(target.parent_path());
-        if (attachment.remote) { attachment.remote->client().fetchArtifact(file, target); return 0; }
+        if (attachment.remote) { attachment.remote->writeArtifact(file, target); return 0; }
         auto& store = attachment.store();
         detail::writeArtifactFile({file.name, file.sha256, file.length}, target, uint64_t(32) << 20,
                                   [&](uint64_t offset, uint64_t count) { return store.readArtifact(file.sha256, offset, count); });
@@ -380,8 +381,7 @@ std::optional<std::filesystem::path> ObjectStoreSession::artifactFile(const Atta
     if (file == files.end()) return std::nullopt;
     // Content-addressed: a complete file at its path is that content (writes are atomic and verified).
     const auto target = cacheDirectory / file->sha256 / std::filesystem::path(file->name).filename();
-    std::error_code error;
-    if (!std::filesystem::is_regular_file(target, error) || std::filesystem::file_size(target, error) != file->length || error)
+    if (!detail::artifactFileMatches({file->name, file->sha256, file->length}, target))
         writeArtifact(identity, *file, target);
     return target;
 }
@@ -488,6 +488,31 @@ void ObjectStoreSession::release(Attachment& attachment, bool write)
     std::lock_guard lock(mutex_);
     --(write ? attachment.writers : attachment.readers);
     idle_.notify_all();
+}
+
+std::shared_ptr<ObjectPrefetchJob> ObjectStoreSession::objectPrefetch(const AttachmentIdentity& identity) const
+{
+    std::lock_guard lock(mutex_);
+    for (const auto& attachment : attached_)
+        if (attachment->identity == identity) return attachment->prefetch;
+    return {};
+}
+
+std::shared_ptr<ObjectPrefetchJob> ObjectStoreSession::prefetchObjects(const AttachmentIdentity& identity)
+{
+    std::lock_guard lock(mutex_);
+    const auto found = std::find_if(attached_.begin(), attached_.end(), [&](const auto& attachment) {
+        return attachment->identity == identity && attachment->accepting;
+    });
+    if (found == attached_.end() || !(*found)->remote) throw std::runtime_error("Hosted store is unavailable");
+    auto attachment = *found;
+    if (attachment->prefetch && !attachment->prefetch->snapshot().done) return attachment->prefetch;
+    auto job = std::make_shared<ObjectPrefetchJob>();
+    attachment->prefetch = job;
+    // Owning the attachment keeps transport alive without admitting a long-lived
+    // session reader. Detachment cancels without waiting for this transfer.
+    std::thread([attachment, job] { attachment->remote->prefetch(*job, attachment->cancelled); }).detach();
+    return job;
 }
 
 void ObjectStoreSession::readStore(const AttachmentIdentity& identity, const StoreRead& callback)

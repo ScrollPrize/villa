@@ -9,6 +9,10 @@
 #include <boost/beast/http.hpp>
 #include <condition_variable>
 #include <future>
+#include <fstream>
+#ifdef VC_REAL_SURFACE
+#include "vc_object_store/objects/GeometryIngest.hpp"
+#endif
 #include <iostream>
 
 using namespace vc::objects;
@@ -35,6 +39,7 @@ public:
         for (auto& worker : workers_) worker.join();
     }
     std::string endpoint() const { return "http://127.0.0.1:" + std::to_string(port_); }
+    std::atomic<size_t> payloadRequests{0}, payloadBytes{0};
     void wait()
     {
         std::unique_lock lock(mutex_);
@@ -63,6 +68,10 @@ private:
                     vcr::http::Session transport(options);
                     const auto reply = transport.request(std::string(request.method_string()).c_str(),
                         upstream_ + std::string(request.target()), request.body());
+                    const std::string target(request.target());
+                    if (target.find("/arrays/") != std::string::npos || target.starts_with("/v1/artifacts/")) {
+                        ++payloadRequests; payloadBytes += reply.body.size();
+                    }
                     if (request.target() == target_) {
                         std::unique_lock lock(mutex_);
                         if (!paused_) {
@@ -188,10 +197,173 @@ void multiPageCommitInvalidatesHeads()
     require(events.size() == 1, "bulk feed cursor advances past the entire commit");
     attachment.stop();
 }
+#ifdef VC_REAL_SURFACE
+void persistentObjects()
+{
+    // Published scroll coordinates from the repository; never modify the input.
+    TemporaryDirectory directory;
+    const auto path = directory.path / "real.vcobj";
+    OpenOptions options; options.author = "persistent-cache-test";
+    std::string uuid, geometry;
+    std::vector<uint8_t> expected;
+    size_t expectedPayloads = 1; // one attached file
+    {
+        auto store = ObjectStore::create(path, options);
+        const auto source = directory.path / "surface";
+        std::filesystem::copy(VC_REAL_SURFACE, source, std::filesystem::copy_options::recursive);
+        // The repository fixture uses a catalog ID; imported identities are UUIDs.
+        std::ifstream metadata(source / "meta.json");
+        auto meta = nlohmann::json::parse(metadata); metadata.close();
+        meta["uuid"] = util::newUuid();
+        std::ofstream(source / "meta.json") << meta.dump();
+        const auto report = ingestGeometrySource(store, "surface", source);
+        for (const auto& problem : report.problems) std::cerr << problem << "\n";
+        require(report.ingested == 1 && report.problems.empty(), "real scroll tifxyz ingests");
+        auto txn = store.read();
+        uuid = store.selectObjects(txn, {}).at(0).uuid;
+        const auto descriptor = store.currentGeometry(txn, uuid);
+        geometry = descriptor->uuid;
+        for (const auto& array : descriptor->arrays) expectedPayloads += (array.byteLength + (1 << 20) - 1) / (1 << 20);
+        expected = store.readGeometryArray(txn, geometry, "points");
+    }
+    {
+        ObjectStoreSession local;
+        auto attachment = local.attach(path, options);
+        const auto head = local.currentObject(attachment, uuid);
+        local.publishArtifacts(attachment, uuid, head->version,
+            {{"source/x.tif", std::filesystem::path(VC_REAL_SURFACE) / "x.tif"}});
+    }
+    server::Server server(path, {}); server.start();
+    const auto endpoint = "http://127.0.0.1:" + std::to_string(server.port());
+    HostedSessionOptions hosted;
+    hosted.cacheDirectory = directory.path / "cache";
+    hosted.diskCacheBytes = 16 << 20;
+    hosted.cacheBytes = 128; // real surface is larger than the entire memory cache
+    hosted.pollInterval = std::chrono::hours(1);
+    const auto finish = [](const auto& job) {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(20);
+        while (!job->snapshot().done && std::chrono::steady_clock::now() < deadline)
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        require(job->snapshot().done, "prefetch completes without blocking its owner");
+        return job->snapshot();
+    };
+    StoreStatus captured;
+    {
+        PausingProxy proxy(endpoint, "never");
+        ObjectStoreSession session;
+        const auto attachment = session.attachHosted(proxy.endpoint(), hosted);
+        auto job = session.prefetchObjects(attachment);
+        require(session.prefetchObjects(attachment) == job, "one prefetch per attachment");
+        const auto result = finish(job);
+        if (!result.errors.empty()) std::cerr << result.errors.front() << '\n';
+        require(result.complete && result.completed == 1 && result.total == 1 && result.downloadedBytes > 0,
+                "prefetch caches real geometry and attached file");
+        require(proxy.payloadRequests > 0, "cold cache downloads payloads");
+        captured = *result.captured;
+    }
+    // New session and a different forwarded port: only immutable store identity
+    // determines the namespace. Both normal access paths use the prefetch cache.
+    {
+        PausingProxy proxy(endpoint, "never");
+        ObjectStoreSession session;
+        const auto attachment = session.attachHosted(proxy.endpoint(), hosted);
+        require(session.readGeometryArray(attachment, geometry, "points") == expected, "restart preserves exact real geometry");
+        session.readStore(attachment, [&](const StoreReader& reader, const auto&) {
+            require(reader.readGeometryArray(geometry, "points", 13, 111) ==
+                std::vector<uint8_t>(expected.begin() + 13, expected.begin() + 124), "unaligned range shares prefetch blocks");
+        });
+        const auto artifact = session.artifactFile(attachment, uuid, "source/x.tif", directory.path / "materialized");
+        require(artifact && std::filesystem::file_size(*artifact) == std::filesystem::file_size(std::filesystem::path(VC_REAL_SURFACE) / "x.tif"),
+                "normal artifact access uses prefetched bytes");
+        const auto result = finish(session.prefetchObjects(attachment));
+        require(result.complete && result.downloadedBytes == 0 && proxy.payloadRequests == 0,
+                "disk-warm restart downloads no geometry or artifact payloads");
+    }
+    const auto key = captured.storeUuid + "/" + captured.generation + "/block/" + geometry + "/points/" +
+        std::to_string(expected.size()) + "/0";
+    const auto cached = hosted.cacheDirectory / "objects" / payloadHash(std::vector<uint8_t>(key.begin(), key.end()));
+    { std::ofstream corrupt(cached, std::ios::binary | std::ios::trunc); corrupt << "interrupted"; }
+    {
+        PausingProxy proxy(endpoint, "never");
+        ObjectStoreSession session;
+        const auto attachment = session.attachHosted(proxy.endpoint(), hosted);
+        require(session.readGeometryArray(attachment, geometry, "points") == expected && proxy.payloadRequests > 0,
+                "truncated block is discarded and refetched");
+    }
+    {
+        auto concurrent = hosted; concurrent.cacheDirectory = directory.path / "concurrent";
+        const auto range = std::min<size_t>(1 << 20, expected.size());
+        PausingProxy proxy(endpoint, "/v1/geometry/" + geometry + "/arrays/points?offset=0&count=" + std::to_string(range));
+        ObjectStoreSession session;
+        const auto attachment = session.attachHosted(proxy.endpoint(), concurrent);
+        auto job = session.prefetchObjects(attachment);
+        proxy.wait();
+        auto interactive = std::async(std::launch::async, [&] { return session.readGeometryArray(attachment, geometry, "points"); });
+        // A new metadata commit while transfer is paused must not change its
+        // captured version or invalidate immutable geometry already downloaded.
+        HostedStore writer(endpoint);
+        const auto status = writer.status();
+        const auto head = writer.currentObjectRevision(uuid);
+        TransactionRequest edit;
+        edit.requestUuid = util::newUuid(); edit.storeUuid = status.storeUuid;
+        edit.generation = status.generation; edit.author = "cache-test";
+        edit.expectedObjects = {{uuid, head->version}};
+        edit.operations = {SetMetaOp{uuid, "during_prefetch", "true"}};
+        writer.submit(edit);
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        proxy.release();
+        require(interactive.get() == expected, "interactive reads share an active prefetch miss");
+        const auto result = finish(job);
+        require(result.complete && result.captured->commitSequence == status.commitSequence,
+                "prefetch remains pinned across a remote edit");
+        require(proxy.payloadRequests == expectedPayloads, "concurrent interactive reads add no duplicate payload transfers");
+    }
+    {
+        auto detached = hosted; detached.cacheDirectory = directory.path / "detached";
+        const auto range = std::min<size_t>(1 << 20, expected.size());
+        PausingProxy proxy(endpoint, "/v1/geometry/" + geometry + "/arrays/points?offset=0&count=" + std::to_string(range));
+        ObjectStoreSession session;
+        const auto attachment = session.attachHosted(proxy.endpoint(), detached);
+        auto job = session.prefetchObjects(attachment);
+        proxy.wait();
+        const auto started = std::chrono::steady_clock::now();
+        session.detach(attachment);
+        require(std::chrono::steady_clock::now() - started < std::chrono::seconds(1), "detach does not wait for prefetch transport");
+        proxy.release();
+        require(finish(job).cancelled, "detachment cancels obsolete work");
+    }
+    {
+        PausingProxy proxy(endpoint, "/v1/query/objects");
+        ObjectStoreSession session;
+        const auto attachment = session.attachHosted(proxy.endpoint(), hosted);
+        auto job = session.prefetchObjects(attachment);
+        proxy.wait(); job->cancel(); proxy.release();
+        require(finish(job).cancelled, "cancel during discovery keeps completed cache entries");
+        require(finish(session.prefetchObjects(attachment)).complete, "cancelled prefetch resumes");
+    }
+    {
+        ObjectStoreSession session;
+        auto limited = hosted; limited.cacheDirectory = directory.path / "limited"; limited.diskCacheBytes = 0;
+        const auto attachment = session.attachHosted(endpoint, limited);
+        require(!finish(session.prefetchObjects(attachment)).complete, "eviction is reported as incomplete coverage");
+        require(session.readGeometryArray(attachment, geometry, "points") == expected, "uncacheable interactive read succeeds");
+    }
+    {
+        ObjectStoreSession session;
+        auto limited = hosted; limited.cacheDirectory = directory.path / "low-space"; limited.minFreeBytes = INT64_MAX;
+        const auto attachment = session.attachHosted(endpoint, limited);
+        require(!finish(session.prefetchObjects(attachment)).complete, "minimum free space reports incomplete coverage");
+    }
+}
+#endif
+
 }
 
 int main()
 try {
+#ifdef VC_REAL_SURFACE
+    persistentObjects();
+#endif
     invalidationDuringRead(false);
     invalidationDuringRead(true);
     multiPageCommitInvalidatesHeads();

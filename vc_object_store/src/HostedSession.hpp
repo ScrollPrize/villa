@@ -18,11 +18,14 @@
 
 #include <condition_variable>
 #include <functional>
+#include <future>
 #include <map>
 #include <memory>
 #include <mutex>
 #include <set>
 #include <thread>
+
+namespace vcr { class DiskCache; }
 
 namespace vc::objects::detail {
 
@@ -52,11 +55,16 @@ public:
     TransactionReceipt submit(const TransactionRequest&);
     std::optional<ObjectRevision> currentObject(const std::string& objectUuid);
     std::vector<std::optional<ObjectRevision>> objectsAtVersions(const std::vector<ObjectVersion>&);
+    std::vector<SelectedRelationship> relationshipsAt(const std::vector<ObjectVersion>&);
     std::optional<GeometryRevision> geometryRevision(const std::string& revisionUuid);
     std::shared_ptr<const std::vector<uint8_t>> geometryArray(const std::string& revisionUuid, const std::string& array);
     std::vector<uint8_t> geometryArrayRange(const std::string& revisionUuid, const std::string& array,
                                            int64_t offset, const std::optional<int64_t>& count);
     std::shared_ptr<const nlohmann::json> geometryPointAnnotations(const std::string& revisionUuid, const std::string& array);
+    std::vector<uint8_t> artifactRange(const ArtifactFile&, uint64_t offset, uint64_t count);
+    void writeArtifact(const ArtifactFile&, const std::filesystem::path&);
+    void prefetch(ObjectPrefetchJob&, const std::atomic_bool& detached);
+    bool persistentCacheEnabled() const { return bool(disk_); }
     VolumeTransforms volumeTransforms();
     // The UUIDs among `uuids` that the store holds (retired included).
     std::set<std::string> holds(const std::set<std::string>& uuids);
@@ -70,6 +78,19 @@ private:
     void check();
     void invalidate(const std::vector<std::string>& objectUuids);
 
+    void publishPayload(const std::string&, const std::vector<uint8_t>&);
+    std::optional<std::vector<uint8_t>> readCachedPayload(const std::string&, std::optional<size_t>);
+    std::vector<uint8_t> cachedPayload(const std::string& key,
+        const std::function<std::vector<uint8_t>()>& fetch,
+        std::optional<size_t> length = std::nullopt);
+    std::string payloadKey(const std::string&) const;
+    std::shared_ptr<vcr::DiskCache> disk_;
+    std::filesystem::path diskRoot_;
+    std::atomic_uint interactivePayloads_{0};
+    std::mutex priorityMutex_;
+    std::condition_variable priorityWake_;
+    std::mutex missesMutex_;
+    std::map<std::string, std::shared_future<std::vector<uint8_t>>> misses_;
     HostedStore client_;
     std::string storeUuid_;
     std::chrono::milliseconds interval_;
@@ -117,7 +138,7 @@ public:
     }
     std::vector<SelectedRelationship> relationshipsAt(const std::vector<ObjectVersion>& versions) const override
     {
-        return attachment_->client().relationshipsAt(versions);
+        return attachment_->relationshipsAt(versions);
     }
     std::optional<GeometryRevision> currentGeometry(const std::string& objectUuid) const override;
     std::optional<GeometryRevision> geometryRevision(const std::string& revisionUuid) const override
