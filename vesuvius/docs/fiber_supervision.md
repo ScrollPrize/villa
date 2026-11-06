@@ -77,13 +77,24 @@ reviewed-failure benchmark. It requires `interval`, `template`, `split_root`
 and `native_binary`; the selected reference cohort and inference template are
 external inputs, not bundled datasets or local runner scripts. The original
 angle gate, sample-axis logging, restart/retained-length accounting and snapshot
-selection are retained. Raw snapshots retain both first/latest tied
-best-by-restarts choices; EMA tracks retain their configured loss selection.
+selection are retained. Trace testing defaults to `weights: "ema_0p999"`
+(requires `training.ema_decays` to include `0.999`) and
+`presence_cutoff: 0.25` in modulated-presence mode. Explicit `weights: "raw"`
+remains available for comparisons.
+
+`best_reviewed_trace.pt` and `best_reviewed_trace_last.pt` save the exact tested
+weights for the first and latest tied minimum restart count, respectively.
+With the default trace settings these are EMA999 inference snapshots; resume
+training from `current.pt` to retain the raw optimizer and refinement state.
+The separate `best_ema_0p999.pt` snapshot remains selected by EMA test loss.
 
 The supervisor calls `training_trace_benchmark` with resident inference workers
 under its current manager grant. The native CPU replay process uses the shared
 case queue/live bridge and writes canonical replay artifacts. It does not
 register an overlapping GPU task or reload a Python training process.
+Resident workers temporarily apply their existing EMA999 state and restore raw
+parameters, gradients, optimizer state, module modes and RNG state afterward,
+including when trace inference is interrupted.
 
 Build `vc_fiber_trace_metric` and `vc_cache_root` in a configured native build.
 The benchmark's native `replay-set` entrypoint preserves prediction-aligned

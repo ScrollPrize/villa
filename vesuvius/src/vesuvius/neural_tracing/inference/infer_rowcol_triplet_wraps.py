@@ -57,7 +57,8 @@ _COPY_ARG_TO_CLI = {
     "tifxyz_path": "--tifxyz-path",
     "store": "--store",
     "surface_uuid": "--surface",
-    "geometry_revision": "--geometry-revision",
+    "surface_version": "--surface-version",
+    "surface_generation": "--surface-generation",
     "volume_uuid": "--volume-uuid",
     "volume_path": "--volume-path",
     "checkpoint_path": "--checkpoint-path",
@@ -579,8 +580,10 @@ def parse_args(argv=None):
                         help="Object store (a local store or a hub's local replica): the input is --surface and "
                              "the outputs are new surface objects bound to --volume-uuid.")
     parser.add_argument("--surface", dest="surface_uuid", type=str, default=None)
-    parser.add_argument("--geometry-revision", type=str, default=None,
-                        help="Read this revision of --surface instead of its current geometry.")
+    parser.add_argument("--surface-version", type=int, default=None,
+                        help="Read this numbered version of --surface instead of its current one.")
+    parser.add_argument("--surface-generation", type=str, default=None,
+                        help="History generation of --surface-version (default: the store's active one).")
     parser.add_argument("--volume-uuid", type=str, default=None)
     parser.add_argument("--volume-path", type=str, required=True)
     parser.add_argument("--checkpoint-path", type=str, required=True)
@@ -751,8 +754,13 @@ def parse_args(argv=None):
         parser.error("give exactly one of --tifxyz-path and --store.")
     if args.store is not None and (args.surface_uuid is None or args.volume_uuid is None):
         parser.error("--store needs --surface and --volume-uuid.")
-    if args.store is None and (args.surface_uuid or args.geometry_revision or args.volume_uuid):
-        parser.error("--surface, --geometry-revision and --volume-uuid need --store.")
+    if args.store is None and (args.surface_uuid or args.surface_version is not None or args.surface_generation
+                               or args.volume_uuid):
+        parser.error("--surface, --surface-version, --surface-generation and --volume-uuid need --store.")
+    if args.surface_generation and args.surface_version is None:
+        parser.error("--surface-generation needs --surface-version.")
+    if args.surface_version is not None and args.surface_version < 1:
+        parser.error("--surface-version must be at least 1.")
     if args.store is not None and args.out_dir is not None:
         parser.error("--out-dir is for tifxyz outputs; stored outputs go to --store.")
     if args.iterations is not None and args.iterations < 1:
@@ -771,6 +779,11 @@ def normalize_copy_args(copy_args):
     for key, value in copy_args.items():
         key_norm = str(key).replace("-", "_")
         normalized[_COPY_ARG_ALIASES.get(key_norm, key_norm)] = value
+    if normalized.get("geometry_revision") is not None:
+        # A job from before numbered store history: never read the current version in its place.
+        raise RuntimeError("copy_args geometry_revision is no longer accepted; select the input with "
+                           "surface_version (and surface_generation)")
+    normalized.pop("geometry_revision", None)
     return normalized
 
 
@@ -1968,19 +1981,25 @@ class _TifxyzSurfaces:
 
 
 class _StoredSurfaces:
-    """Input and outputs as surface objects of a store: ``source`` (read at ``geometry_revision`` when given) is
-    the input, outputs are new surfaces bound to ``volume`` with ``source`` as their source."""
+    """Input and outputs as surface objects of a store: ``source`` (read at numbered ``version`` in ``generation``
+    when given, else its current version) is the input, outputs are new surfaces bound to ``volume`` with
+    ``source`` as their source and the version read in their parameters (``input``)."""
 
-    def __init__(self, store, volume, source, geometry_revision=None):
+    def __init__(self, store, volume, source, version=None, generation=None):
         self.store = store
         self.volume = volume
         self.source = source
-        self.geometry_revision = geometry_revision
+        self.version = version
+        self.generation = generation
+        self.source_version = None  # {generation, version} of the source once loaded
 
     def load(self, ref, retarget_factor):
-        revision = self.geometry_revision if ref == self.source else None
-        return _surface_grid(read_surface(self.store, ref, volume=self.volume, geometry_revision=revision),
-                             retarget_factor)
+        pinned = ref == self.source
+        surface = read_surface(self.store, ref, volume=self.volume, version=self.version if pinned else None,
+                               generation=self.generation if pinned else None)
+        if pinned:
+            self.source_version = surface.extra['store_version']
+        return _surface_grid(surface, retarget_factor)
 
     def name(self, ref):
         with ObjectStore.open(str(self.store), read_only=True, reader_pool_size=1) as store:
@@ -2000,7 +2019,8 @@ class _StoredSurfaces:
             scale=(1.0 / step_size, 1.0 / step_size),
             volume=self.volume,
             tool="vesuvius-displacement-copy",
-            parameters={"checkpoint": str(source)},
+            parameters={"checkpoint": str(source),
+                        "input": {"surface": self.source, **(self.source_version or {})}},
             sources=[self.source],
             meta={"area_vx2": area_vx2, "area_cm2": area_cm2, **metadata_out},
         )
@@ -2588,7 +2608,8 @@ def run(args):
     retarget_factor = float(2 ** int(args.volume_scale))
     if args.store is not None:
         input_ref = str(args.surface_uuid)
-        surfaces = _StoredSurfaces(args.store, args.volume_uuid, input_ref, args.geometry_revision)
+        surfaces = _StoredSurfaces(args.store, args.volume_uuid, input_ref, args.surface_version,
+                                   args.surface_generation)
     else:
         out_dir = str(Path(args.out_dir).resolve()) if args.out_dir else str(Path(args.tifxyz_path).resolve().parent)
         surfaces = _TifxyzSurfaces(out_dir)

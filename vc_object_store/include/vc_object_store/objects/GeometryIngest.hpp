@@ -62,6 +62,16 @@ std::vector<GeometrySource> prepareGeometrySource(const std::string& kind,
 int64_t ingestGeometryBatch(ObjectStore&, WriteTxn&, std::vector<GeometrySource>,
     const std::string& coordinateContext = "{}");
 
+class StoreReader;
+// Adds an IngestGeometryOp of `batch` to `request` with its expectations,
+// read through `reader`: every new object expected absent (an existing one at
+// its current version, so importing it again fails as a re-import), every
+// existing fiber a source branch links to at its current version. Links
+// resolved by source identity (point and winding links) must stay within
+// the batch.
+void addIngestOperation(TransactionRequest&, const StoreReader&, std::vector<GeometrySource> batch,
+    const std::string& coordinateContext = "{}");
+
 struct GeometryIngestReport {
     int64_t ingested = 0, edgesImported = 0;
     std::vector<std::string> problems;
@@ -103,11 +113,12 @@ GeometryIngestReport ingestGeometrySource(ObjectStore& db, const std::string& ki
     const std::filesystem::path& source, const util::ProgressCallback& progress = {},
     const std::string& coordinateContext = "{}", const std::vector<std::string>& tags = {},
     const SourceIngestOptions& options = {});
-// The same into a writable session attachment (ObjectStoreSession::writeJob),
-// on the caller's thread. Detaching, or setting `cancel`, stops it before the
-// next surface or track, and before a fiber or collection batch commits.
-// A failure to enter or leave the job is thrown, or with stopOnInfrastructureError
-// reported as fatalError alongside whatever was committed.
+// Every commit is a checked request (addIngestOperation). The same into any
+// writable session attachment, local or hosted, on the caller's thread.
+// Detaching, or setting `cancel`, stops it before the next surface or track,
+// and before a fiber or collection batch commits.
+// An attachment that is not writable is thrown, or with stopOnInfrastructureError
+// reported as fatalError.
 GeometryIngestReport ingestGeometrySource(ObjectStoreSession&, const AttachmentIdentity&, const std::string& kind,
     const std::filesystem::path& source, const util::ProgressCallback& progress = {},
     const std::string& coordinateContext = "{}", const std::vector<std::string>& tags = {},

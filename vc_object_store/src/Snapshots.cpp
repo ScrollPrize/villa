@@ -106,7 +106,7 @@ void ObjectStore::importJson(WriteTxn& txn, const std::string& jsonText)
             if (objectToJson(*existing) == objectToJson(object)) continue;
             throw std::runtime_error("object store: snapshot conflicts with existing object: " + object.uuid);
         }
-        upsertObjectImpl(db, impl_->options.author, impl_->hostname, object, true);
+        upsertObjectImpl(db, author(), impl_->hostname, object, true);
     }
     for (const auto& j : root.at("edges")) {
         auto e = edgeFromJson(j);
@@ -117,7 +117,7 @@ void ObjectStore::importJson(WriteTxn& txn, const std::string& jsonText)
             if (edgeToJson(*existing) == edgeToJson(e)) continue;
             throw std::runtime_error("object store: snapshot conflicts with existing edge: " + e.uuid);
         }
-        addEdgeImpl(db, impl_->options.author, impl_->hostname, e, true);
+        addEdgeImpl(db, author(), impl_->hostname, e, true);
     }
     savepoint.release();
 }

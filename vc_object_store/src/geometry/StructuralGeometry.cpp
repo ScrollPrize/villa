@@ -9,7 +9,7 @@ using namespace detail;
 namespace {
 using Json=nlohmann::json;
 void checked(sqlite3* db) {
-    if (!activeStatementPools.at(db)->checkedAction) throw std::runtime_error("structural editing requires write(expected revisions)");
+    if (!activeStatementPools.at(db)->checkedAction) throw std::runtime_error("structural editing requires a checked write (expected versions)");
 }
 void requireSource(sqlite3* db,const std::string& uuid) {
     execute(db,"INSERT OR IGNORE INTO history_required VALUES(?)", uuid);
@@ -56,12 +56,12 @@ GeometryArray& arrayNamed(GeometryData& data,const std::string& name) {
 }
 }
 
-std::string ObjectStore::geometryPointAnnotations(const Txn& txn,const std::string& revision,const std::string& name) const {
+nlohmann::json ObjectStore::geometryPointAnnotations(const Txn& txn,const std::string& revision,const std::string& name) const {
     MetadataCacheScope cache;
     const auto r=geometryRevision(txn,revision);
     if (!r) throw std::invalid_argument("geometry revision not found");
     GeometryReader reader(txn,revision);
-    return annotations(txn,*r,reader,name).dump();
+    return annotations(txn,*r,reader,name);
 }
 std::string ObjectStore::editGeometrySequence(WriteTxn& txn,const std::string& objectId,const GeometrySequenceEdit& edit,
     const std::string& expected,const std::vector<GeometryEdgeEdit>& edges)

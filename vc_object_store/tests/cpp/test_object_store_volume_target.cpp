@@ -149,8 +149,8 @@ int main() try
     // objects leave the catalog, the unbound count and the overlay regions.
     {
         const std::vector<std::string> retire{ids["a10"], ids["b72"], ids["b60"], ids["loose1"]};
-        RevisionSelection expected;
-        for (const auto& uuid : retire) expected[uuid] = store.currentObjectRevision(txn, uuid)->uuid;
+        VersionSelection expected;
+        for (const auto& uuid : retire) expected[uuid] = store.currentVersion(txn, uuid);
         auto write = store.write(expected);
         for (const auto& uuid : retire) store.retireObject(write, uuid);
         write.commit();

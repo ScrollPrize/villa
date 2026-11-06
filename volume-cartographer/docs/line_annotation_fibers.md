@@ -5,6 +5,12 @@
 Fibers live in the open project's store (`.vcobj`), or in a store attached beside
 it and chosen for fibers (**File → Stores**). **Attach Read-only Store** supports
 browsing without permitting writes.
+Opening a writable project automatically converts supported old local stores
+with the bundled `vc_object_convert` and saves the new store location in the
+project. The original database is retained beside the upgraded copy, conversion
+report and revision mapping. Read-only entries and hosted stores are not converted.
+Close clients using the old database before opening the project; conversion runs
+synchronously and may take time for large stores.
 VC3D edits geometry, annotations, relationships and retirement directly through
 the database APIs in one `ObjectStoreSession::act` transaction. Splits create two
 objects and retire the original in that transaction. VC3D retains pinned working
@@ -67,6 +73,14 @@ Example build and checks (existing configured Ninja build):
 ninja -C build VC3D test_fiber_side_strip_intersections
 QT_QPA_PLATFORM=offscreen build/bin/VC3D --test-object-store
 build/bin/test_fiber_side_strip_intersections
+```
+
+With `VC_TESTING` enabled, verify automatic conversion, read-only behavior and
+reopening against a copy of a closed legacy store (the supplied file is untouched):
+
+```sh
+QT_QPA_PLATFORM=offscreen VC3D_UPGRADE_STORE_TEST=/path/to/legacy.vcobj \
+  build/bin/VC3D --test-object-store
 ```
 
 ## CP direction annotations

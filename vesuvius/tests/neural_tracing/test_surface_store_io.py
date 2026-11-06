@@ -73,17 +73,20 @@ def test_create_surface_records_binding_provenance_and_missing_vertices(tmp_path
     assert surface.xyz[..., 2][0, 0] == 5.0  # zyx in, xyz stored
 
 
-def test_copy_store_mode_reads_the_pinned_revision_and_creates_sourced_outputs(tmp_path):
+def test_copy_store_mode_reads_the_pinned_version_and_creates_sourced_outputs(tmp_path):
     store = tmp_path / 'objects.vcobj'
     source, revision, _ = _store_with_surface(store)
-    with ObjectStore.open(str(store), author='test') as db:  # a later revision must not be read
+    with ObjectStore.open(str(store), author='test') as db:  # a later version must not be read
+        pinned = db.current_version(source)
+        generation = db.status()['generation']
         edited = np.zeros((6, 8, 3), '<f4')
         db.put_geometry(source, dict(kind='surface', attributes=dict(scale=[0.5, 0.5]),
                                      arrays=[dict(name='points', dtype='<f4', shape=[6, 8, 3], data=edited.tobytes())]),
-                        expected_revision=revision)
-    surfaces = copy._StoredSurfaces(str(store), 'vol', source, revision)
+                        expected_version=pinned)
+    surfaces = copy._StoredSurfaces(str(store), 'vol', source, pinned)
     _, grid, valid = surfaces.load(source, 1)
-    assert grid[1, 1, 2] == pytest.approx(12.0)  # zyx of the pinned revision (x = 1*2 + 10)
+    assert grid[1, 1, 2] == pytest.approx(12.0)  # zyx of the pinned version (x = 1*2 + 10)
+    assert surfaces.source_version == {'generation': generation, 'version': pinned}
     assert not valid[0, 0]
     assert surfaces.name(source) == 'source'
     created = surfaces.save(grid, valid, 'source_front', step_size=2, voxel_size_um=8.0, source='ckpt',
@@ -92,6 +95,8 @@ def test_copy_store_mode_reads_the_pinned_revision_and_creates_sourced_outputs(t
         record = db.object(created)
         meta = record['meta']
         assert meta['provenance']['sources'] == [source]
+        assert meta['provenance']['parameters']['input'] == {'surface': source, 'generation': generation,
+                                                              'version': pinned}
         assert meta['surface_role'] == 'front'
         assert 'area_vx2' not in meta
         assert record['surface']['area'] > 0
@@ -105,6 +110,14 @@ def test_copy_cli_takes_exactly_one_input_mode():
                 base + ['--tifxyz-path', 't', '--surface', 'u']):
         with pytest.raises(SystemExit):
             copy.parse_args(bad)
+    for bad in (base + ['--store', 's', '--surface', 'u', '--volume-uuid', 'v', '--surface-version', '0'],
+                base + ['--store', 's', '--surface', 'u', '--volume-uuid', 'v', '--surface-generation', 'g'],
+                base + ['--tifxyz-path', 't', '--surface-version', '2']):
+        with pytest.raises(SystemExit):
+            copy.parse_args(bad)
     argv = copy._copy_args_to_argv({'store': 's.vcobj', 'surface_uuid': 'u', 'volume_uuid': 'vol',
-                                    'geometry_revision': 'r'})
-    assert argv == ['--store', 's.vcobj', '--surface', 'u', '--geometry-revision', 'r', '--volume-uuid', 'vol']
+                                    'surface_version': 3, 'surface_generation': 'g'})
+    assert argv == ['--store', 's.vcobj', '--surface', 'u', '--surface-version', '3', '--surface-generation', 'g',
+                    '--volume-uuid', 'vol']
+    with pytest.raises(RuntimeError, match='geometry_revision'):
+        copy._copy_args_to_argv({'store': 's.vcobj', 'surface_uuid': 'u', 'geometry_revision': 'r'})

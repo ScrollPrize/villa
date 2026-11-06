@@ -52,15 +52,14 @@ public:
     // and attaches it beside the project; with `kind`, objects of that kind are
     // then kept in it. True once attached.
     bool attachStore(bool readOnly = false, const std::string& kind = {});
+    // Asks for a vc_object_server endpoint and attaches its store beside the project.
+    bool attachHostedStore();
     // With no project open, explains that `purpose` needs one and offers to
     // create or open one. True once a project is open.
     bool requireProject(const QString& purpose);
     // Author recorded on edits: the saved username, asked for until it is not "anon".
     // Empty means cancelled.
     QString objectStoreAuthor();
-    // Clones a hosted store to a local replica, then opens it as the project
-    // or attaches it beside the project.
-    void cloneHostedStore(bool asProject);
     // Collects a kind, a source folder and an optional volume binding, then ingests
     // it into the kind's store in the background (StoreImportController).
     void importIntoObjectStore();
@@ -225,7 +224,6 @@ private:
 
     QAction* _newProjectAct{nullptr};
     QAction* _saveProjectAsAct{nullptr};
-    QAction* _cloneHostedProjectAct{nullptr};
     QAction* _attachVolumeAct{nullptr};
     QAction* _attachNormalGridAct{nullptr};
     QAction* _importUmbilicusAct{nullptr};

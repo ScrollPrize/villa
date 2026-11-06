@@ -15,7 +15,7 @@ if ROOT not in sys.path:
 	sys.path.insert(0, ROOT)
 
 try:
-	from vc_object_store import ObjectStore
+	from vc_object_store import ObjectStore, Surface
 	from vc_object_store.documents import attached_document
 	from vc_object_store.surfaces import create_surface
 except ImportError:  # pragma: no cover - the store bindings are an optional dependency
@@ -93,6 +93,29 @@ class StoredSurfaceReadTest(unittest.TestCase):
 			self.assertEqual(surface.xyz[0, 0].tolist(), [-1.0, -1.0, -1.0])
 			self.assertEqual(surface.xyz[0, 1].tolist(), [-1.0, -1.0, -1.0])
 
+	def test_numbered_version_refs_read_that_version(self) -> None:
+		with tempfile.TemporaryDirectory() as td:
+			store = Path(td) / "objects.vcobj"
+			ObjectStore.create(str(store), author="test").close()
+			xyz = np.full((2, 2, 3), 30.0, "<f4")
+			uid = create_surface(store, xyz, name="s", scale=1.0, volume=VOLUME, tool="test")
+			first = stored_surfaces.read_surface(store, stored_surfaces.surface_ref(uid), volume=VOLUME)
+			with ObjectStore.open(str(store), author="test") as db:
+				with db.write(expected_versions={uid: 1}) as tx:
+					tx.put_geometry(uid, Surface.from_arrays(np.ascontiguousarray(xyz + 1), [1.0, 1.0]),
+									expected_version=1)
+			ref = stored_surfaces.surface_ref(uid, first.version)
+			self.assertEqual(stored_surfaces.parse_surface_ref(ref), (uid, first.version))
+			self.assertEqual(first.version[1], 1)
+			older = stored_surfaces.read_surface(store, ref, volume=VOLUME)
+			current = stored_surfaces.read_surface(store, stored_surfaces.surface_ref(uid), volume=VOLUME)
+			self.assertEqual((older.version, current.version[1]), (first.version, 2))
+			np.testing.assert_array_equal(older.xyz, xyz)
+			np.testing.assert_array_equal(current.xyz, xyz + 1)
+			for bad in (f"vcobj:{uid}@r1", f"vcobj:{uid}@g/0", f"vcobj:{uid}@/3"):
+				with self.assertRaisesRegex(ValueError, "generation"):
+					stored_surfaces.parse_surface_ref(bad)
+
 	def test_approval_surface_scales_in_memory(self) -> None:
 		with tempfile.TemporaryDirectory() as td:
 			store = Path(td) / "objects.vcobj"
@@ -166,9 +189,15 @@ class StoredExportTest(unittest.TestCase):
 			self.assertEqual(corr["points_list"][0]["winding_err"], 0.25)
 			self.assertEqual(atlas["records"][0]["target_xyz"], [1.0, 2.0, 3.0])
 
-			artifacts = Path(str(store) + ".artifacts") / surface_uuid
-			self.assertEqual((artifacts / "model.pt").read_bytes(), ckpt.read_bytes())
-			self.assertTrue((artifacts / "model_params.json").is_file())
+			# The model checkpoint and parameters are published as the surface's artifacts.
+			session = stored_surfaces.StoreSession(store, author="test", shared=True)
+			try:
+				cache = root / "artifact-cache"
+				self.assertEqual(session.artifact_file(surface_uuid, "model.pt", cache).read_bytes(), ckpt.read_bytes())
+				self.assertTrue(session.artifact_file(surface_uuid, "model_params.json", cache).is_file())
+			finally:
+				session.close()
+			self.assertFalse(Path(str(store) + ".artifacts", surface_uuid).exists())
 
 	def test_new_surfaces_take_the_next_free_name_of_their_root(self) -> None:
 		with tempfile.TemporaryDirectory() as td:
@@ -227,31 +256,105 @@ class ServiceStoreRequestTest(unittest.TestCase):
 		self.assertEqual(collection["points"]["7"], {"wind_a": 2.0, "p": [4.0, 5.0, 6.0]})
 
 	def test_surface_and_model_refs_resolve_through_the_store(self) -> None:
-		model = fit_service._store.artifact_directory(self.source) / "model.pt"
-		model.write_bytes(b"checkpoint")
-		resolved = fit_service._body_with_resolved_job_spec({"job_spec": {
-			"model": {"type": "surface", "uuid": self.source},
-			"config": {"external_surfaces": [{"type": "surface", "uuid": self.source, "revision": "r1"}]},
-		}})
-		self.assertEqual(resolved["config"]["external_surfaces"][0]["path"], f"vcobj:{self.source}@r1")
-		self.assertEqual(resolved["model_input"], str(model))
-		model.unlink()
 		with self.assertRaisesRegex(ValueError, "no Lasagna model"):
 			fit_service._body_with_resolved_job_spec({"job_spec": {
 				"model": {"type": "surface", "uuid": self.source}, "config": {}}})
+		checkpoint = Path(self._td.name) / "checkpoint.pt"
+		checkpoint.write_bytes(b"checkpoint")
+		receipt = fit_service._store.publish_artifacts(self.source, {"model.pt": checkpoint})
+		self.assertEqual(len(receipt["objects"]), 1)
+		resolved = fit_service._body_with_resolved_job_spec({"job_spec": {
+			"model": {"type": "surface", "uuid": self.source},
+			"config": {"external_surfaces": [{"type": "surface", "uuid": self.source, "generation": "g1", "version": 2}]},
+		}})
+		self.assertEqual(resolved["config"]["external_surfaces"][0]["path"], f"vcobj:{self.source}@g1/2")
+		with self.assertRaisesRegex(ValueError, "numbered version"):
+			fit_service._body_with_resolved_job_spec({"job_spec": {
+				"model": {"type": "surface", "uuid": self.source},
+				"config": {"external_surfaces": [{"type": "surface", "uuid": self.source, "revision": "r1"}]}}})
+		model = Path(resolved["model_input"])
+		self.assertEqual(model.read_bytes(), b"checkpoint")
+		self.assertNotEqual(model, checkpoint)  # a cached copy of the published bytes
 
-	def test_a_shared_store_is_written_but_synced_by_its_owner(self) -> None:
+	def test_a_shared_store_is_written_through_short_lived_connections(self) -> None:
 		shared = stored_surfaces.StoreSession(self.store_path, author="service", shared=True)
 		try:
 			self.assertEqual(shared.store_uuid, fit_service._store.store_uuid)
-			self.assertEqual(shared.artifact_directory(self.source), fit_service._store.artifact_directory(self.source))
-			shared.sync()  # the owning session syncs; nothing to wait for here
+			checkpoint = Path(self._td.name) / "shared.pt"
+			checkpoint.write_bytes(b"shared")
+			shared.publish_artifacts(self.source, {"model.pt": checkpoint})  # read-only session, written anyway
+			cached = fit_service._store.artifact_file(self.source, "model.pt", Path(self._td.name) / "cache")
+			self.assertEqual(cached.read_bytes(), b"shared")
 			created = create_surface(
-				shared.path, np.zeros((2, 2, 3), np.float32), name="written", scale=1.0, volume=VOLUME, tool="test")
+				shared.location, np.zeros((2, 2, 3), np.float32), name="written", scale=1.0, volume=VOLUME, tool="test")
 		finally:
 			shared.close()
 		with ObjectStore.open(str(self.store_path), read_only=True) as db:
 			self.assertEqual(db.object(created)["name"], "written")
+
+
+
+SERVER = os.environ.get("VC_OBJECT_SERVER")
+
+
+@unittest.skipIf(ObjectStore is None or not SERVER, "needs vc_object_store and VC_OBJECT_SERVER (a vc_object_server binary)")
+class HostedStoreTest(unittest.TestCase):
+	"""A Lasagna service on another machine works on VC3D's store through its vc_object_server endpoint."""
+
+	def setUp(self) -> None:
+		import re
+		import subprocess
+		self._td = tempfile.TemporaryDirectory()
+		self.root = Path(self._td.name)
+		self.store_path = self.root / "objects.vcobj"
+		self.source, self.points = _source_surface(self.store_path)
+		self.server = subprocess.Popen([SERVER, str(self.store_path), "--port", "0"], stderr=subprocess.PIPE, text=True)
+		line = self.server.stderr.readline()
+		port = re.search(r":(\d+)\s*$", line)
+		if not port:
+			self.server.terminate()
+			raise RuntimeError(f"vc_object_server did not start: {line}")
+		self.endpoint = f"http://127.0.0.1:{port.group(1)}"
+
+	def tearDown(self) -> None:
+		self.server.terminate()
+		self.server.wait(timeout=30)
+		self._td.cleanup()
+
+	def test_fit_reads_and_export_writes_through_the_endpoint(self) -> None:
+		ref = stored_surfaces.surface_ref(self.source)
+		xyz, valid, meta = tifxyz_io.load_tifxyz(ref, store=self.endpoint, volume=VOLUME)
+		np.testing.assert_allclose(xyz[1, 1].numpy(), self.points[1, 1])
+		self.assertFalse(bool(valid[0, 0]))
+		surface = approval_inpaint.load_approval_surface(ref, store=self.endpoint, volume=VOLUME)
+		self.assertEqual(float(surface.d[1, 1]), 3.0)
+		self.assertEqual(stored_surfaces.next_free_name(self.endpoint, "source", "version"), "source_v001")
+
+		ckpt = self.root / "model.pt"
+		torch.save(_checkpoint(self.source), ckpt)
+		created: list[str] = []
+		fit2tifxyz.main(["--input", str(ckpt), "--store", self.endpoint, "--volume-uuid", VOLUME,
+						 "--output-name", "fitted.tifxyz", "--single-segment"], created_surfaces=created)
+		[surface_uuid] = created
+		# The service's file shows the results (read-only opens are allowed while it is served).
+		with ObjectStore.open(str(self.store_path), read_only=True) as db:
+			record = db.object(surface_uuid)
+			self.assertEqual(record["name"], "fitted")
+			self.assertEqual(record["meta"]["provenance"]["sources"], [self.source])
+		corr = attached_document(self.endpoint, surface_uuid, fit2tifxyz.CORR_RESULTS_ROLE)
+		self.assertEqual([p["point_id"] for p in corr["points_list"]], [1, 2])
+
+		# A service started on the endpoint resolves the published model.
+		fit_service._store = stored_surfaces.StoreSession(self.endpoint, author="service")
+		try:
+			with ObjectStore.open(str(self.store_path), read_only=True) as db:
+				self.assertEqual(fit_service._store.store_uuid, db.status()["store"])
+			resolved = fit_service._body_with_resolved_job_spec({"job_spec": {
+				"model": {"type": "surface", "uuid": surface_uuid}, "config": {}}})
+			self.assertEqual(Path(resolved["model_input"]).read_bytes(), ckpt.read_bytes())
+		finally:
+			fit_service._store.close()
+			fit_service._store = None
 
 
 if __name__ == "__main__":

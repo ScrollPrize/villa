@@ -1,11 +1,15 @@
-// Included inside runObjectStoreControllerTests(). Always clone the supplied
+// Included inside runObjectStoreControllerTests(). Always copy the supplied
 // real store; neither the source nor a user's working project is edited.
 if (const char* source = std::getenv("VC3D_FIBER_CACHE_TEST_STORE")) {
     QTemporaryDir directory;
     const auto copy = fs::path(directory.path().toStdString()) / "fibers.vcobj";
     OpenOptions options; options.author = "fiber-cache-regression";
-    cloneHub(source, copy, options);
-    detachHub(copy, options.author);
+    {
+        OpenOptions readOnly; readOnly.readOnly = true;
+        ObjectStoreSession original;
+        const auto attached = original.attach(source, readOnly);
+        vc::objects::copyProject(original, attached, copy, "fiber cache regression", options);
+    }
     CState state;
     Controller controller(&state, nullptr, nullptr, nullptr);
     controller._errorDialogsSuppressed = true;
@@ -22,9 +26,8 @@ if (const char* source = std::getenv("VC3D_FIBER_CACHE_TEST_STORE")) {
         const auto paths = controller.fiberTransportPaths({original.id});
         std::map<std::string, std::string> documents;
         const auto attachment = *state.storeFor("fiber");
-        state.objectStoreSession()->read(attachment, [&](const auto& db, const auto& txn, const auto&) {
-            ObjectSelection selection; selection.kind = "fiber"; selection.includeRetired = true;
-            documents = fiberNetworkJson(db, txn, db.currentRevisions(txn, selection), {original.uuid});
+        state.objectStoreSession()->readStore(attachment, [&](const StoreReader& reader, const auto&) {
+            documents = fiberNetworkJson(reader, currentFiberVersions(reader), {original.uuid});
         });
         require(paths.size() == documents.size() && paths.size() > 1, "transport includes the real linked component");
         for (const auto& [uuid, path] : paths) {
@@ -73,7 +76,7 @@ if (const char* source = std::getenv("VC3D_FIBER_CACHE_TEST_STORE")) {
     const auto connection = state.objectStoreSession();
     const auto journal = [&] {
         int64_t position = 0;
-        connection->read(attachment, [&](const auto& db, const auto& txn, const auto&) { position = db.journalPosition(txn); });
+        connection->readStore(attachment, [&](const StoreReader& reader, const auto&) { position = reader.status().commitSequence; });
         return position;
     };
     const auto read = [&](const std::string& uuid) {
@@ -148,6 +151,20 @@ if (const char* source = std::getenv("VC3D_FIBER_CACHE_TEST_STORE")) {
                         "cached relationship endpoints and exact directions match fresh reads");
             }
         }
+        // Summaries read lines only through their digests; they follow edits.
+        const auto summaries = controller.fiberSummaries(ids);
+        require(summaries.size() == fresh.size(), "a summary per live fiber");
+        for (size_t i = 0; i < fresh.size(); ++i) {
+            const auto& summary = summaries[i]; const auto& fiber = fresh[i];
+            const auto spans = Controller::controlSpansForFiber(fiber);
+            require(summary.id == fiber.id && summary.linePointCount == int(fiber.linePoints.size()) &&
+                    summary.lengthVx == vc::fiber_tracer::fiberLineLengthVx(fiber.linePoints) &&
+                    summary.spans.size() == spans.size() &&
+                    std::equal(spans.begin(), spans.end(), summary.spans.begin(), [](const auto& a, const auto& b) {
+                        return a.lengthVx == b.lengthVx && a.linePointCount == b.linePointCount &&
+                               a.firstControlIndex == b.firstControlIndex && a.secondControlIndex == b.secondControlIndex;
+                    }), "summary line digests match fresh reads");
+        }
     };
     warm();
     auto edited = read(original.uuid);
@@ -160,14 +177,14 @@ if (const char* source = std::getenv("VC3D_FIBER_CACHE_TEST_STORE")) {
             [&](const auto& branch) { return branch.branchFiberId == fiber.id; });
     });
     require(unrelated != all.end(), "unrelated real fiber exists");
-    const auto* decodedPoints = controller._storedFiberDecodeCache.at(unrelated->uuid).linePoints.data();
+    const auto* decodedPoints = controller._storedFiberDecodeCache.at(unrelated->uuid)->linePoints.data();
     const auto sidePolyline = controller._sideStripStoredSnapshotCache.at(unrelated->id).snapshot.polyline;
     edited.width += .001;
     controller.commitFibers({&edited});
     checkFresh(); // before polling: peer generation checks must already work
     state.pollObjectStoreChanges();
     require(controller._storedFiberDecodeCache.contains(unrelated->uuid) &&
-            controller._storedFiberDecodeCache.at(unrelated->uuid).linePoints.data() == decodedPoints &&
+            controller._storedFiberDecodeCache.at(unrelated->uuid)->linePoints.data() == decodedPoints &&
             controller._sideStripStoredSnapshotCache.at(unrelated->id).snapshot.polyline == sidePolyline,
             "a local edit preserves unrelated decoded fibers and side-strip snapshots");
     checkFresh();
@@ -221,9 +238,7 @@ if (const char* source = std::getenv("VC3D_FIBER_CACHE_TEST_STORE")) {
                                           VolumeAffine{}, "cache regression");
         else {
             std::vector<std::string> route;
-            connection->read(attachment, [&](const auto& db, const auto& txn, const auto&) {
-                route = db.volumeTransforms(txn).resolve("cache-source", "cache-target").resolved().path;
-            });
+            route = connection->volumeTransforms(attachment).resolve("cache-source", "cache-target").resolved().path;
             (void)chooseVolumeTransform(*connection, attachment, "cache-source", "cache-target", route);
         }
         (void)controller.readStoredFibersCached({original.uuid}, true);
