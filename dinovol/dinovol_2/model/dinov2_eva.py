@@ -2,6 +2,7 @@
 # See THIRD_PARTY_NOTICES.md and LICENSES/Apache-2.0.txt.
 
 from collections import OrderedDict
+from functools import partial
 import math
 from typing import Callable, Optional, Tuple
 
@@ -12,17 +13,55 @@ from timm.layers import trunc_normal_, use_fused_attn, DropPath, SwiGLU, GluMlp,
 from torch import nn
 from torch.nn import LayerNorm
 from torch.nn.attention import SDPBackend, sdpa_kernel
-from torch.utils.checkpoint import checkpoint
+from torch.utils.checkpoint import CheckpointPolicy, checkpoint, create_selective_checkpoint_contexts
 from einops import rearrange
 
 from dinovol_2.model.patch_encode_decode import PatchEmbed, PatchEmbedDeeper
 from dinovol_2.model.rope import (
+    CompassRopePositionEmbedding,
     MixedRopePositionEmbedding,
     RopeCoords,
     RopeEmbedding,
     RopePositionEmbedding,
     apply_rotary_embedding,
 )
+from dinovol_2.ops.point_embeddings import sample_grid_points
+
+
+def _save_convolutions_policy(ctx, op, *args, **kwargs):
+    # Convolution outputs are kept; the norms and activations between them are cheap
+    # pointwise work, recomputed in backward instead of saving each one's output as well.
+    if op is torch.ops.aten.convolution.default:
+        return CheckpointPolicy.MUST_SAVE
+    return CheckpointPolicy.PREFER_RECOMPUTE
+
+
+_save_convolutions_context = partial(create_selective_checkpoint_contexts, _save_convolutions_policy)
+
+
+def _save_attention_policy(ctx, op, *args, **kwargs):
+    # Keep fused attention (including its backward auxiliaries), but recompute
+    # projections, normalization and the MLP. Avoid saving quadratic math-SDPA
+    # intermediates when a fused backend is unavailable.
+    if op in (
+        torch.ops.aten._scaled_dot_product_cudnn_attention.default,
+        torch.ops.aten._scaled_dot_product_efficient_attention.default,
+    ):
+        dropout_index = 5
+    elif op in (
+        torch.ops.aten._scaled_dot_product_flash_attention.default,
+        torch.ops.aten._scaled_dot_product_flash_attention_for_cpu.default,
+    ):
+        dropout_index = 3
+    else:
+        return CheckpointPolicy.PREFER_RECOMPUTE
+    dropout = kwargs.get("dropout_p", args[dropout_index] if len(args) > dropout_index else 0.)
+    # Skipping a random SDPA call during eager replay would shift the RNG stream
+    # for subsequent dropout/drop-path operations in the checkpointed block.
+    return CheckpointPolicy.MUST_SAVE if dropout == 0. else CheckpointPolicy.PREFER_RECOMPUTE
+
+
+_save_attention_context = partial(create_selective_checkpoint_contexts, _save_attention_policy)
 
 
 class InitWeights_He(object):
@@ -69,7 +108,8 @@ class EvaAttention(nn.Module):
             proj_drop: float = 0.,
             attn_head_dim: Optional[int] = None,
             norm_layer: Optional[Callable] = None,
-            attention_backend: Optional[str] = None,
+            attention_backend: Optional[str] = "flash",
+            qk_norm: bool = False,
     ):
         """
 
@@ -84,6 +124,7 @@ class EvaAttention(nn.Module):
             norm_layer:
             attention_backend: preferred fused SDPA kernel (see attention_priority);
                 None keeps PyTorch's default choice.
+            qk_norm: apply RMSNorm over each query/key head before RoPE.
         """
         super().__init__()
         self.num_heads = num_heads
@@ -116,6 +157,8 @@ class EvaAttention(nn.Module):
             self.qkv = None
             self.q_bias = self.k_bias = self.v_bias = None
 
+        self.q_norm = nn.RMSNorm(head_dim, eps=1e-6) if qk_norm else nn.Identity()
+        self.k_norm = nn.RMSNorm(head_dim, eps=1e-6) if qk_norm else nn.Identity()
         self.attn_drop = nn.Dropout(attn_drop)
         self.norm = norm_layer(all_head_dim) if norm_layer is not None else nn.Identity()
         self.proj = nn.Linear(all_head_dim, dim)
@@ -147,6 +190,10 @@ class EvaAttention(nn.Module):
             k = self.k_proj(x).reshape(B, N, self.num_heads, -1).transpose(1, 2)
             v = self.v_proj(x).reshape(B, N, self.num_heads, -1).transpose(1, 2)
 
+        # Normalize each head independently; keep the projection dtype under AMP.
+        q = self.q_norm(q).type_as(v)
+        k = self.k_norm(k).type_as(v)
+
         if rope is not None:
             q = apply_rotary_embedding(q, rope, prefix_tokens=self.num_prefix_tokens).type_as(v)
             k = apply_rotary_embedding(k, rope, prefix_tokens=self.num_prefix_tokens).type_as(v)
@@ -161,6 +208,11 @@ class EvaAttention(nn.Module):
     def _attention(self, q, k, v, *, attn_mask=None, spatial_shape=None):
         if not self.fused_attn:
             raise RuntimeError("Fused attention should be used.")
+        if getattr(self, "inference_precision", "bf16") == "fp8":
+            if self.training or attn_mask is not None:
+                raise RuntimeError("FP8 attention supports unmasked inference only")
+            from dinovol_2.ops.fp8_inference import fp8_attention
+            return fp8_attention(q, k, v)
         dropout_p = self.attn_drop.p if self.training else 0.
         if self.attention_priority is None:
             return F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, dropout_p=dropout_p)
@@ -245,7 +297,8 @@ class EvaBlock(nn.Module):
             rope_kwargs=None,
             ndim: Optional[int] = None,
             attention_type: str = "full",
-            attention_backend: Optional[str] = None,
+            attention_backend: Optional[str] = "flash",
+            qk_norm: bool = False,
     ):
         """
 
@@ -286,6 +339,7 @@ class EvaBlock(nn.Module):
             attn_head_dim=attn_head_dim,
             norm_layer=norm_layer if scale_attn_inner else None,
             attention_backend=attention_backend,
+            qk_norm=qk_norm,
         )
         self.attn = (EvaAxialAttention(**attention_kwargs, axis=0, ndim=ndim)
                      if attention_type == "axial" else EvaAttention(**attention_kwargs))
@@ -445,17 +499,20 @@ class Eva(nn.Module):
             rope_impl=RopePositionEmbedding,
             rope_kwargs=None,
             grad_checkpointing=False,
-            deeper_embed_batch_chunk_size: Optional[int] = None,
+            checkpoint_save_attention: bool = True,
+            deeper_embed_batch_chunk_size: Optional[int] = 1,
             deeper_embed_stage_channels: Optional[Tuple[int, ...]] = None,
             deeper_embed_depth_per_level: Optional[Tuple[int, ...]] = None,
             deeper_embed_use_stem: bool = True,
             deeper_embed_final_projection: bool = True,
             deeper_embed_channels_last: bool = False,
+            deeper_embed_norm_backend: str = "auto",
             deeper_embed_stage_strides=None,
             deeper_embed_stem_channels: Optional[int] = None,
             deeper_embed_stem_type: Optional[str] = None,
             attention_type: str = "full",
-            attention_backend: Optional[str] = None,
+            attention_backend: Optional[str] = "flash",
+            qk_norm: bool = False,
     ):
         """
         Diff to timm implementation
@@ -482,6 +539,9 @@ class Eva(nn.Module):
         # Return the CNN embedding's intermediate stage outputs of global views as
         # features["embed_skips"] (used by the dense point head).
         self.return_embed_skips = False
+        # When point coordinates are given, embed_skips keeps full grids only from this
+        # level on (None below it); every level is returned sampled at the points.
+        self.embed_skip_grid_start = 0
 
         if self.embedding_type == "deeper":
             self._assert_patch_aligned(
@@ -517,6 +577,7 @@ class Eva(nn.Module):
                 stem_channels=deeper_embed_stem_channels,
                 stem_type=deeper_embed_stem_type,
                 channels_last=deeper_embed_channels_last,
+                norm_backend=deeper_embed_norm_backend,
             )
         else:
             raise ValueError(
@@ -529,6 +590,7 @@ class Eva(nn.Module):
         self.num_features = self.embed_dim = embed_dim  # num_features for consistency with other models
         self.dynamic_img_size = dynamic_img_size
         self.grad_checkpointing = grad_checkpointing
+        self.checkpoint_save_attention = checkpoint_save_attention
 
         self.num_reg_tokens = num_reg_tokens
         self.num_class_tokens = (1 if class_token else 0)
@@ -543,15 +605,18 @@ class Eva(nn.Module):
         self.pos_embed = nn.Parameter(
             torch.zeros(1, num_patches + self.num_class_tokens, embed_dim)) if use_abs_pos_emb else None
         self.pos_drop = nn.Dropout(p=pos_drop_rate)
-        self.use_per_block_rope = bool(use_rot_pos_emb and rope_impl is MixedRopePositionEmbedding)
+        self.use_per_block_rope = bool(
+            use_rot_pos_emb and rope_impl in (MixedRopePositionEmbedding, CompassRopePositionEmbedding)
+        )
         if use_rot_pos_emb and embed_dim % num_heads != 0:
             raise ValueError(
                 f"embed_dim must be divisible by num_heads, got embed_dim={embed_dim}, num_heads={num_heads}"
             )
         head_dim = embed_dim // num_heads
-        if use_rot_pos_emb and head_dim % (2 * self.ndim) != 0:
+        rope_dim_multiple = 2 if rope_impl is CompassRopePositionEmbedding else 2 * self.ndim
+        if use_rot_pos_emb and head_dim % rope_dim_multiple != 0:
             raise ValueError(
-                f"RoPE requires head_dim divisible by 2 * ndim, got head_dim={head_dim}, ndim={self.ndim}"
+                f"RoPE requires head_dim divisible by {rope_dim_multiple}, got head_dim={head_dim}, ndim={self.ndim}"
             )
         if use_rot_pos_emb and not self.use_per_block_rope:
             self.rope_embed = rope_impl(
@@ -575,6 +640,7 @@ class Eva(nn.Module):
                 num_heads=num_heads,
                 qkv_bias=qkv_bias,
                 qkv_fused=qkv_fused,
+                qk_norm=qk_norm,
                 mlp_ratio=mlp_ratio,
                 swiglu_mlp=swiglu_mlp,
                 scale_mlp=scale_mlp,
@@ -780,14 +846,23 @@ class Eva(nn.Module):
         # Never modify the shared crop in place: the teacher needs its original values.
         return x.masked_fill(voxel_mask, 0)
 
+    def _run_down_projection(self, x, **kwargs):
+        """With grad checkpointing, the CNN embedding is selectively checkpointed: backward
+        keeps the convolution outputs and recomputes the norms and activations between them."""
+        if (self.embedding_type == "deeper" and self.grad_checkpointing and torch.is_grad_enabled()
+                and not torch.jit.is_scripting()):
+            return checkpoint(self.down_projection, x, use_reentrant=False, context_fn=_save_convolutions_context,
+                              **kwargs)
+        return self.down_projection(x, **kwargs)
+
     def _down_project_with_skips(self, x, skips):
         batch_chunk_size = self.deeper_embed_batch_chunk_size
         if batch_chunk_size is None or x.shape[0] <= batch_chunk_size:
-            tokens, levels = self.down_projection(x, return_skips=True)
+            tokens, levels = self._run_down_projection(x, return_skips=True)
             skips.extend(levels)
             return tokens
         chunks = x.split(batch_chunk_size)
-        outputs = [self.down_projection(chunk, return_skips=True) for chunk in chunks]
+        outputs = [self._run_down_projection(chunk, return_skips=True) for chunk in chunks]
         skips.extend(torch.cat(level, dim=0) for level in zip(*(levels for _, levels in outputs)))
         return torch.cat([tokens for tokens, _ in outputs], dim=0)
 
@@ -803,9 +878,9 @@ class Eva(nn.Module):
                 raise ValueError("embedding skips require the deeper CNN embedding")
             x = self._down_project_with_skips(x, skips)
         elif self.embedding_type == "deeper" and batch_chunk_size is not None and x.shape[0] > batch_chunk_size:
-            x = torch.cat([self.down_projection(chunk) for chunk in x.split(batch_chunk_size)], dim=0)
+            x = torch.cat([self._run_down_projection(chunk) for chunk in x.split(batch_chunk_size)], dim=0)
         else:
-            x = self.down_projection(x)
+            x = self._run_down_projection(x)
         if self.ndim == 2:
             x = rearrange(x, 'b c h w -> b (h w) c').contiguous()
         else:
@@ -820,9 +895,11 @@ class Eva(nn.Module):
 
         return x, rot_pos_embed, target_patch_shape
 
-    def forward_features_list(self, x_list, masks_list, *, view_kind: str = "global"):
+    def forward_features_list(self, x_list, masks_list, *, view_kind: str = "global", point_coordinates=None):
         if not isinstance(x_list, list):
-            return self.forward_features(x_list, masks_list, view_kind=view_kind)
+            return self.forward_features(x_list, masks_list, view_kind=view_kind, point_coordinates=point_coordinates)
+        if point_coordinates is not None:
+            raise ValueError("point_coordinates require a single input tensor, not a list")
         output = []
         for x, masks in zip(x_list, masks_list):
             x_out = self.forward_features(x, masks, view_kind=view_kind)
@@ -865,37 +942,53 @@ class Eva(nn.Module):
             "masks": masks,
         }
 
-    def forward_features(self, x, masks=None, *, view_kind: str = "global"):
+    def forward_features(self, x, masks=None, *, view_kind: str = "global", point_coordinates=None):
         skips = [] if self.return_embed_skips and view_kind == "global" else None
+        input_shape = tuple(x.shape[2:])
         x, rot_pos_embed, rope_shape = self.prepare_tokens_with_masks(x, masks, view_kind=view_kind, skips=skips)
+        skips, skip_points = self._sample_embed_skips(skips, point_coordinates, input_shape)
         rope_coords = self._get_shared_per_block_rope_coords(rope_shape)
         for blk in self.blocks:
             if self.grad_checkpointing and not torch.jit.is_scripting():
                 x = checkpoint(blk, x, rope=rot_pos_embed, rope_shape=rope_shape, rope_coords=rope_coords,
-                               use_reentrant=False)
+                               use_reentrant=False, **self._attention_checkpoint_kwargs())
             else:
                 x = blk(x, rope=rot_pos_embed, rope_shape=rope_shape, rope_coords=rope_coords)
-        return self._with_skips(self._format_features(x, masks, view_kind=view_kind), skips)
+        return self._with_skips(self._format_features(x, masks, view_kind=view_kind), skips, skip_points)
+
+    def _attention_checkpoint_kwargs(self):
+        return {"context_fn": _save_attention_context} if self.checkpoint_save_attention else {}
+
+    def _sample_embed_skips(self, skips, point_coordinates, input_shape):
+        """Sample the CNN skips at [B, P, 3] input-voxel point coordinates before the blocks run.
+
+        The sampling backward scatters into skip-sized gradient grids. Sampled here, autograd
+        runs it after the block backward, just before the CNN backward that consumes those
+        grids, instead of holding them through the block backward. Grids below
+        embed_skip_grid_start are dropped (None) since only their samples are used.
+        """
+        if skips is None or point_coordinates is None:
+            return skips, None
+        points = [sample_grid_points(level.permute(0, 2, 3, 4, 1), point_coordinates, input_shape) for level in skips]
+        grids = [level if index >= self.embed_skip_grid_start else None for index, level in enumerate(skips)]
+        return grids, points
 
     @staticmethod
-    def _with_skips(features, skips):
+    def _with_skips(features, skips, skip_points=None):
         if skips is not None:
             features["embed_skips"] = skips
+        if skip_points is not None:
+            features["embed_skip_points"] = skip_points
         return features
 
-    def forward(self, x, masks=None, is_training=True, *, view_kind: str = "global"):
-        return self.forward_features_list(x, masks, view_kind=view_kind)
+    def forward(self, x, masks=None, is_training=True, *, view_kind: str = "global", point_coordinates=None):
+        return self.forward_features_list(x, masks, view_kind=view_kind, point_coordinates=point_coordinates)
 
     def load_pretrained_weights(self, state_dict, backbone_only=False, unchunk=False):
         if isinstance(state_dict, str):
-            state_dict = torch.load(state_dict, map_location="cpu", weights_only=False)['teacher']
-            new_state_dict = {}
-            for k, v in state_dict.items():
-                if not k.startswith("backbone."):
-                    continue
-                new_key = k.replace("backbone.", "", 1)
-                new_state_dict[new_key] = v
-            state_dict = new_state_dict
+            from dinovol_2.training.checkpoint import backbone_state
+            saved = torch.load(state_dict, map_location="cpu", weights_only=False)
+            state_dict, _ = backbone_state(saved)
 
         if unchunk:
             state_dict = self.unchunk_state_dict(state_dict)
@@ -944,6 +1037,69 @@ class Eva(nn.Module):
                     module.rope_embed.reset_mixed_frequencies_to_axial()
             allowed_missing_keys.add(f"{prefix}.periods")
         return allowed_missing_keys
+
+    def adapt_checkpoint_state(self, state_dict):
+        """Absorb checkpoint layouts this backbone can take over: returns (state_dict, may_be_missing, converted).
+
+        - Mixed-RoPE ``mix_frequencies`` resume as Compass RoPE: radii and angles are set to give
+          the same phases (``converted`` lists those ``rope_embed`` prefixes); the mixed
+          ``periods`` buffer is dropped and Compass rebuilds its own.
+        - Q/K norms absent from a checkpoint trained without them keep their initial weight of
+          one; ``calibrate_qk_norms`` then rescales them to the measured Q/K magnitudes.
+        Keys are relative to this backbone.
+        """
+        state_dict = dict(state_dict)
+        may_be_missing, converted = set(), []
+        for name, module in self.named_modules():
+            rope = getattr(module, "rope_embed", None)
+            prefix = f"{name}.rope_embed" if name else "rope_embed"
+            if isinstance(rope, CompassRopePositionEmbedding) and f"{prefix}.mix_frequencies" in state_dict:
+                rope.set_frequencies(state_dict.pop(f"{prefix}.mix_frequencies"))
+                state_dict.pop(f"{prefix}.periods", None)
+                may_be_missing |= {f"{prefix}.radii", f"{prefix}.angles", f"{prefix}.periods"}
+                converted.append(prefix)
+        for name, module in self.named_modules():
+            if isinstance(module, nn.RMSNorm) and name.endswith(("attn.q_norm", "attn.k_norm")):
+                may_be_missing.add(f"{name}.weight")
+        return state_dict, may_be_missing, converted
+
+    @torch.no_grad()
+    def calibrate_qk_norms(self, inputs, *, amp_dtype=None, reduce=None) -> dict[str, float]:
+        """Set each Q/K RMSNorm weight to the mean RMS of its input, measured with the norms as identity.
+
+        Starting Q/K norms this way keeps attention logits close to those of the same weights
+        without Q/K norm. ``inputs`` are global-view batches; ``reduce`` (e.g. a cross-rank
+        mean) is applied to each [sum, count] pair before the weights are set.
+        """
+        norms = {name: module for name, module in self.named_modules()
+                 if isinstance(module, nn.RMSNorm) and name.endswith(("attn.q_norm", "attn.k_norm"))}
+        sums = {name: torch.zeros(2, dtype=torch.float64) for name in norms}
+
+        def hook(name):
+            def record(module, args, output):
+                x = args[0].float()
+                sums[name] += torch.tensor([float(x.square().mean(-1).sqrt().sum()), x[..., 0].numel()],
+                                           dtype=torch.float64)
+                return args[0]  # identity while measuring: later blocks see what they saw without Q/K norm
+            return record
+
+        handles = [module.register_forward_hook(hook(name)) for name, module in norms.items()]
+        training = self.training
+        self.eval()
+        try:
+            for x in inputs:
+                with torch.autocast(x.device.type, dtype=amp_dtype or torch.bfloat16, enabled=amp_dtype is not None):
+                    self.forward_features(x, masks=None, view_kind="global")
+        finally:
+            for handle in handles:
+                handle.remove()
+            self.train(training)
+        values = {}
+        for name, module in norms.items():
+            total = reduce(sums[name]) if reduce is not None else sums[name]
+            values[name] = float(total[0] / total[1])
+            module.weight.fill_(values[name])
+        return values
 
     def unchunk_state_dict(self, state_dict):
         """
@@ -1016,30 +1172,32 @@ class EvaWithChunking(Eva):
             chunks.append(block_chunk)
         self.blocks = nn.ModuleList(chunks)
 
-    def forward_features(self, x, masks=None, *, view_kind: str = "global"):
+    def forward_features(self, x, masks=None, *, view_kind: str = "global", point_coordinates=None):
         skips = [] if self.return_embed_skips and view_kind == "global" else None
+        input_shape = tuple(x.shape[2:])
         x, rot_pos_embed, rope_shape = self.prepare_tokens_with_masks(x, masks, view_kind=view_kind, skips=skips)
+        skips, skip_points = self._sample_embed_skips(skips, point_coordinates, input_shape)
         rope_coords = self._get_shared_per_block_rope_coords(rope_shape)
 
         if self.chunked_blocks:
             for chunk in self.blocks:
                 if self.grad_checkpointing and not torch.jit.is_scripting():
                     x = checkpoint(chunk, x, rope=rot_pos_embed, rope_shape=rope_shape, rope_coords=rope_coords,
-                                   use_reentrant=False)
+                                   use_reentrant=False, **self._attention_checkpoint_kwargs())
                 else:
                     x = chunk(x, rope=rot_pos_embed, rope_shape=rope_shape, rope_coords=rope_coords)
         else:
             for blk in self.blocks:
                 if self.grad_checkpointing and not torch.jit.is_scripting():
                     x = checkpoint(blk, x, rope=rot_pos_embed, rope_shape=rope_shape, rope_coords=rope_coords,
-                                   use_reentrant=False)
+                                   use_reentrant=False, **self._attention_checkpoint_kwargs())
                 else:
                     x = blk(x, rope=rot_pos_embed, rope_shape=rope_shape, rope_coords=rope_coords)
 
-        return self._with_skips(self._format_features(x, masks, view_kind=view_kind), skips)
+        return self._with_skips(self._format_features(x, masks, view_kind=view_kind), skips, skip_points)
 
-    def forward(self, x, masks=None, is_training=True, *, view_kind: str = "global"):
-        return self.forward_features_list(x, masks, view_kind=view_kind)
+    def forward(self, x, masks=None, is_training=True, *, view_kind: str = "global", point_coordinates=None):
+        return self.forward_features_list(x, masks, view_kind=view_kind, point_coordinates=point_coordinates)
 
 
 class Dinov2PrimusEncL(Eva):

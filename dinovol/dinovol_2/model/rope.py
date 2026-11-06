@@ -1,10 +1,3 @@
-# Copyright (c) Meta Platforms, Inc. and affiliates.
-#
-# This software may be used and distributed in accordance with
-# the terms of the DINOv3 License Agreement.
-#
-# Modified for Dinovol to support three-dimensional position encoding.
-
 import math
 from typing import Literal, Sequence
 
@@ -35,14 +28,18 @@ def apply_rotary_embedding(x: Tensor, rope: RopeEmbedding, *, prefix_tokens: int
             f"x.shape[-2]={x.shape[-2]}, prefix_tokens={prefix_tokens}, rope_tokens={sin.shape[-2]}"
         )
 
-    x_dtype = x.dtype
-    rope_dtype = sin.dtype
-    x_prefix = x[..., :prefix_tokens, :]
-    x_suffix = x[..., prefix_tokens:, :].to(dtype=rope_dtype)
-    x_suffix = rope_apply(x_suffix, sin, cos).to(dtype=x_dtype)
-    if prefix_tokens == 0:
-        return x_suffix
-    return torch.cat((x_prefix, x_suffix), dim=-2)
+    # Equal to concatenating the prefix with rope_apply of the suffix, without
+    # concatenating activations: the prefix gets the identity rotation (cos 1, sin 0)
+    # and rotate_half is a gather with the sign folded into sin. Gathers and
+    # pointwise ops can be recomputed in backward by compiled graphs instead of saved.
+    if prefix_tokens:
+        sin = torch.nn.functional.pad(sin, (0, 0, prefix_tokens, 0))
+        cos = torch.nn.functional.pad(cos, (0, 0, prefix_tokens, 0), value=1.0)
+    half = x.shape[-1] // 2
+    rotation = torch.arange(x.shape[-1], device=x.device).roll(half)
+    signed_sin = torch.cat((-sin[..., :half], sin[..., half:]), dim=-1)
+    x_rope = x.to(dtype=sin.dtype)
+    return ((x_rope * cos) + (x_rope[..., rotation] * signed_sin)).to(dtype=x.dtype)
 
 
 class _BaseRopePositionEmbedding(nn.Module):
@@ -334,7 +331,9 @@ class MixedRopePositionEmbedding(_BaseRopePositionEmbedding):
         return {"mix_frequencies"}
 
     def get_embed_from_coords(self, coords: RopeCoords) -> RopeEmbedding:
-        angles = 2 * math.pi * torch.einsum("td,hpd->htp", coords, self.mix_frequencies)
+        # Autocast would run the einsum, and so the angles and sin/cos, in half precision.
+        with torch.autocast(device_type=coords.device.type, enabled=False):
+            angles = 2 * math.pi * torch.einsum("td,hpd->htp", coords, self.mix_frequencies)
         angles = angles.tile(2)
         cos = torch.cos(angles)
         sin = torch.sin(angles)
@@ -343,6 +342,147 @@ class MixedRopePositionEmbedding(_BaseRopePositionEmbedding):
     def get_embed(self, shape: Sequence[int]) -> RopeEmbedding:
         coords = self.get_coords(shape)
         return self.get_embed_from_coords(coords)
+
+    def forward(self, shape: Sequence[int]) -> RopeEmbedding:
+        return self.get_embed(shape)
+
+
+class CompassRopePositionEmbedding(_BaseRopePositionEmbedding):
+    """Compass-RoPE (Sec. 5 / Appendix F, https://openreview.net/pdf?id=kbIXDF7PD0).
+
+    In 2D, signed radii and stratified polar angles form complex frequencies,
+    mixed by a unitary DFT within each head. Cartesian phase evaluation is
+    equivalent to the paper's polar formula, without atan2 at the grid origin.
+
+    The paper is 2D only. Our 3D extension uses spherical angles and the real
+    orthogonal Hartley transform (Re(DFT) - Im(DFT)) on each spatial component.
+    Unlike discarding the imaginary part of a complex FFT, this preserves
+    frequency energy and commutes with spatial rotations, without favoring an
+    axis. Both paths retain Dinovol's normalized coordinates and 2*pi scaling.
+    """
+
+    def __init__(
+        self,
+        head_dim: int,
+        *,
+        ndim: int,
+        num_heads: int,
+        base: float | None = 100.0,
+        min_period: float | None = None,
+        max_period: float | None = None,
+        normalize_coords: Literal["min", "max", "separate"] = "separate",
+        shift_coords: float | None = None,
+        jitter_coords: float | None = None,
+        rescale_coords: float | None = 2.0,
+        dtype: torch.dtype | None = None,
+        device: torch.device | None = None,
+        use_dft: bool = True,
+        radial_jitter: float = 0.01,
+    ) -> None:
+        if head_dim <= 0 or head_dim % 2:
+            raise ValueError(f"Compass RoPE requires a positive even head_dim, got {head_dim}")
+        if num_heads <= 0:
+            raise ValueError(f"num_heads must be positive for Compass RoPE, got {num_heads}")
+        if not 0 <= radial_jitter < 1:
+            raise ValueError(f"radial_jitter must be in [0, 1), got {radial_jitter}")
+        if dtype not in (None, torch.float32, torch.float64):
+            raise ValueError("Compass RoPE requires float32 or float64 phase precision")
+        super().__init__(
+            head_dim, ndim=ndim, base=base, min_period=min_period, max_period=max_period,
+            normalize_coords=normalize_coords, shift_coords=shift_coords,
+            jitter_coords=jitter_coords, rescale_coords=rescale_coords, dtype=dtype, device=device,
+        )
+        self.num_heads = int(num_heads)
+        self.num_pairs = self.head_dim // 2
+        self.use_dft = bool(use_dft)
+        self.radial_jitter = float(radial_jitter)
+        self.register_buffer("periods", self._build_periods(self.num_pairs, self.head_dim, device=device))
+        self.radii = nn.Parameter(torch.empty(num_heads, self.num_pairs, device=device, dtype=self.dtype))
+        self.angles = nn.Parameter(torch.empty(num_heads, self.num_pairs, ndim - 1, device=device, dtype=self.dtype))
+
+        # Real matrix products implement the small per-head transforms without
+        # complex tensors, including under torch.compile and mixed precision.
+        indices = torch.arange(self.num_pairs, device=device, dtype=self.dtype)
+        phase = (2 * math.pi / self.num_pairs) * indices[:, None] * indices[None, :]
+        self.register_buffer("_dft_cos", phase.cos() / math.sqrt(self.num_pairs), persistent=False)
+        self.register_buffer("_dft_sin", phase.sin() / math.sqrt(self.num_pairs), persistent=False)
+        self._init_weights()
+
+    @torch.no_grad()
+    def _init_weights(self) -> None:
+        self.periods.copy_(self._build_periods(self.num_pairs, self.head_dim, device=self.periods.device))
+        self.radii.uniform_(1 - self.radial_jitter, 1 + self.radial_jitter)
+        self.radii.mul_(self.periods.reciprocal())
+        bins = torch.arange(self.num_pairs, device=self.periods.device, dtype=self.periods.dtype)
+        azimuth = (bins + torch.rand_like(self.radii)) * (2 * math.pi / self.num_pairs)
+        self.angles[..., 0].copy_(azimuth)
+        if self.ndim == 3:
+            # Uniform polar angles would concentrate directions at the poles.
+            # Stratify cos(polar) instead, and independently permute its bins
+            # per head so latitude is not correlated with azimuth or radius.
+            for head in range(self.num_heads):
+                order = torch.randperm(self.num_pairs, device=self.periods.device)
+                z = 2 * (bins + torch.rand_like(bins)) / self.num_pairs - 1
+                self.angles[head, :, 1].copy_(z[order].acos())
+
+    @torch.jit.ignore
+    def no_weight_decay(self) -> set[str]:
+        return {"radii", "angles"}
+
+    @torch.no_grad()
+    def set_frequencies(self, frequencies: Tensor) -> None:
+        """Set radii and angles so the mixed per-pair frequencies equal ``frequencies`` exactly.
+
+        ``frequencies`` is (heads, pairs, ndim), e.g. a mixed-RoPE ``mix_frequencies``: both
+        modules then produce the same phases. The DFT mixing is inverted (the normalized
+        Hartley transform is its own inverse; the 2D DFT by its conjugate), each base vector
+        becomes a nonnegative radius and its direction's spherical angles.
+        """
+        if frequencies.shape != (*self.radii.shape, self.ndim):
+            raise ValueError(f"expected frequencies of shape {(*self.radii.shape, self.ndim)}, got {tuple(frequencies.shape)}")
+        mixed = frequencies.to(device=self.radii.device, dtype=torch.float64)
+        cos, sin = self._dft_cos.double(), self._dft_sin.double()
+        if not self.use_dft:
+            base = mixed
+        elif self.ndim == 2:
+            x, y = mixed.unbind(-1)
+            # (C + iS) @ (x + iy) inverts (C - iS), the orthonormal DFT.
+            base = torch.stack((x @ cos.T - y @ sin.T, y @ cos.T + x @ sin.T), dim=-1)
+        else:
+            base = (cos + sin) @ mixed
+        radii = base.norm(dim=-1)
+        direction = base / radii.clamp_min(torch.finfo(torch.float64).tiny)[..., None]
+        self.radii.copy_(radii)
+        self.angles[..., 0].copy_(torch.atan2(direction[..., 1], direction[..., 0]))
+        if self.ndim == 3:
+            self.angles[..., 1].copy_(direction[..., 2].clamp(-1, 1).acos())
+
+    def _mix_frequencies(self, frequencies: Tensor) -> Tensor:
+        if not self.use_dft:
+            return frequencies
+        if self.ndim == 2:
+            x, y = frequencies.unbind(-1)
+            # (C - iS) @ (x + iy), exactly fft(..., norm="ortho").
+            return torch.stack((x @ self._dft_cos.T + y @ self._dft_sin.T,
+                                y @ self._dft_cos.T - x @ self._dft_sin.T), dim=-1)
+        return (self._dft_cos + self._dft_sin) @ frequencies
+
+    def get_embed_from_coords(self, coords: RopeCoords) -> RopeEmbedding:
+        with torch.autocast(device_type=coords.device.type, enabled=False):
+            azimuth = self.angles[..., 0]
+            if self.ndim == 2:
+                directions = torch.stack((azimuth.cos(), azimuth.sin()), dim=-1)
+            else:
+                polar = self.angles[..., 1]
+                directions = torch.stack((polar.sin() * azimuth.cos(),
+                                          polar.sin() * azimuth.sin(), polar.cos()), dim=-1)
+            frequencies = self._mix_frequencies(self.radii[..., None] * directions)
+            phases = 2 * math.pi * torch.einsum("td,hpd->htp", coords.to(self.radii.dtype), frequencies)
+            phases = phases.tile(2)
+            return phases.sin(), phases.cos()
+
+    def get_embed(self, shape: Sequence[int]) -> RopeEmbedding:
+        return self.get_embed_from_coords(self.get_coords(shape))
 
     def forward(self, shape: Sequence[int]) -> RopeEmbedding:
         return self.get_embed(shape)

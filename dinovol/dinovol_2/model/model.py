@@ -1,10 +1,3 @@
-# Copyright (c) Meta Platforms, Inc. and affiliates.
-#
-# This source code is licensed under the Apache License, Version 2.0
-# found in LICENSES/Apache-2.0.txt.
-#
-# Modified for Dinovol's three-dimensional training pipeline.
-
 from __future__ import annotations
 
 from collections import defaultdict
@@ -18,139 +11,14 @@ from torch.nn.init import trunc_normal_
 from torch.nn.utils.parametrizations import weight_norm
 from torch.utils.checkpoint import checkpoint
 
-from dinovol_2.model.dinov2_eva import Eva, EvaWithChunking
-from dinovol_2.ops.point_embeddings import sample_grid_points
-from dinovol_2.model.rope import MixedRopePositionEmbedding, RopePositionEmbedding
+from dinovol_2.training.checkpoint import backbone_state, method_state
+from dinovol_2.ops.point_embeddings import sample_grid_points, sample_selected_grid_points
+from dinovol_2.model.backbone import (
+    build_backbone, materialize_backbone_config as _materialize_backbone_config,
+    _resolve_backbone_defaults, _config_value,
+)
 
 
-_BACKBONE_DEFAULTS = {
-    "attention_type": "full",
-    "attention_backend": None,
-    "input_channels": 1,
-    "global_crops_size": (256, 256, 256),
-    "local_crops_size": None,
-    "embed_dim": 864,
-    "patch_size": (16, 16, 16),
-    "embedding_type": "default",
-    "deeper_embed_batch_chunk_size": 1,
-    "deeper_embed_stage_channels": None,
-    "deeper_embed_stage_strides": None,
-    "deeper_embed_stem_channels": None,
-    "deeper_embed_stem_type": None,
-    "deeper_embed_depth_per_level": None,
-    "deeper_embed_use_stem": True,
-    "deeper_embed_final_projection": True,
-    "deeper_embed_channels_last": False,
-    "depth": 24,
-    "num_heads": 16,
-    "qkv_bias": True,
-    "qkv_fused": False,
-    "mlp_ratio": 8.0 / 3.0,
-    "swiglu_mlp": True,
-    "scale_mlp": True,
-    "scale_attn_inner": False,
-    "proj_drop_rate": 0.0,
-    "attn_drop_rate": 0.0,
-    "drop_path_rate": 0.0,
-    "drop_path_uniform": False,
-    "init_values": None,
-    "use_abs_pos_emb": False,
-    "use_rot_pos_emb": True,
-    "num_reg_tokens": 4,
-    "untie_cls_and_patch_norms": False,
-    "untie_global_and_local_cls_norm": False,
-    "grad_checkpointing": False,
-    "block_chunks": 0,
-}
-
-_BACKBONE_DEFAULTS_V2 = {
-    "attention_type": "full",
-    "attention_backend": None,
-    "input_channels": 1,
-    "global_crops_size": (256, 256, 256),
-    "local_crops_size": None,
-    "embed_dim": 864,
-    "patch_size": (16, 16, 16),
-    "embedding_type": "default",
-    "deeper_embed_batch_chunk_size": 1,
-    "deeper_embed_stage_channels": None,
-    "deeper_embed_stage_strides": None,
-    "deeper_embed_stem_channels": None,
-    "deeper_embed_stem_type": None,
-    "deeper_embed_depth_per_level": None,
-    "deeper_embed_use_stem": True,
-    "deeper_embed_final_projection": True,
-    "deeper_embed_channels_last": False,
-    "depth": 24,
-    "num_heads": 16,
-    "qkv_bias": True,
-    "qkv_fused": True,
-    "mlp_ratio": 8.0 / 3.0,
-    "swiglu_mlp": True,
-    "scale_mlp": True,
-    "scale_attn_inner": False,
-    "proj_drop_rate": 0.0,
-    "attn_drop_rate": 0.0,
-    "drop_path_rate": 0.3,
-    "drop_path_uniform": False,
-    "init_values": 1e-5,
-    "use_abs_pos_emb": False,
-    "use_rot_pos_emb": True,
-    "num_reg_tokens": 4,
-    "untie_cls_and_patch_norms": False,
-    "untie_global_and_local_cls_norm": False,
-    "grad_checkpointing": False,
-    "block_chunks": 0,
-}
-
-_BACKBONE_DEFAULTS_V3 = {
-    **_BACKBONE_DEFAULTS_V2,
-    "qkv_bias": False,
-    # Effective SwiGLU width: DINOv3's ffn_ratio=3 includes a 2/3 adjustment.
-    "mlp_ratio": 2.0,
-    "scale_mlp": False,
-    "untie_global_and_local_cls_norm": True,
-}
-
-_ROPE_KWARG_CONFIG_KEYS = {
-    "base": "rope_base",
-    "min_period": "rope_min_period",
-    "max_period": "rope_max_period",
-    "normalize_coords": "rope_normalize_coords",
-    "shift_coords": "rope_shift_coords",
-    "jitter_coords": "rope_jitter_coords",
-    "rescale_coords": "rope_rescale_coords",
-    "dtype": "rope_dtype",
-}
-_ROPE_KWARG_DEFAULTS = {
-    "base": 100.0,
-    "normalize_coords": "separate",
-    "rescale_coords": 2.0,
-}
-_ROPE_KWARG_FALLBACK_KEYS = {
-    "base": "pos_embed_rope_base",
-    "min_period": "pos_embed_rope_min_period",
-    "max_period": "pos_embed_rope_max_period",
-    "normalize_coords": "pos_embed_rope_normalize_coords",
-    "shift_coords": "pos_embed_rope_shift_coords",
-    "jitter_coords": "pos_embed_rope_jitter_coords",
-    "rescale_coords": "pos_embed_rope_rescale_coords",
-    "dtype": "pos_embed_rope_dtype",
-}
-_ROPE_DTYPE_ALIASES = {
-    "fp32": torch.float32,
-    "float32": torch.float32,
-    "fp16": torch.float16,
-    "float16": torch.float16,
-    "bf16": torch.bfloat16,
-    "bfloat16": torch.bfloat16,
-}
-_ROPE_IMPL_ALIASES = {
-    "axial": RopePositionEmbedding,
-    "default": RopePositionEmbedding,
-    "mixed": MixedRopePositionEmbedding,
-    "mixed_learnable": MixedRopePositionEmbedding,
-}
 _HEAD_DEFAULTS = {
     "hidden_dim": 2048,
     "bottleneck_dim": 256,
@@ -168,131 +36,6 @@ _HEAD_OUT_DIM_DEFAULTS = {
     "dino": 131072,
     "ibot": 131072,
 }
-
-
-def _resolve_backbone_defaults(config: Mapping[str, Any]) -> Mapping[str, Any]:
-    model_type = config.get("model_type")
-    if isinstance(model_type, str) and model_type.strip().lower() == "v3":
-        return _BACKBONE_DEFAULTS_V3
-    if isinstance(model_type, str) and model_type.strip().lower() == "v2":
-        return _BACKBONE_DEFAULTS_V2
-    return _BACKBONE_DEFAULTS
-
-
-def _resolve_default_rope_type(config: Mapping[str, Any]) -> str:
-    model_type = config.get("model_type")
-    if isinstance(model_type, str) and model_type.strip().lower() == "v2":
-        return "mixed"
-    return "axial"
-
-
-def _as_3tuple(value: int | Tuple[int, int, int]) -> Tuple[int, int, int]:
-    if isinstance(value, int):
-        return (value, value, value)
-    result = tuple(int(v) for v in value)
-    if len(result) != 3:
-        raise ValueError(f"expected 3 values and got {len(result)}: {result}")
-    return result
-
-
-def _config_value(
-    config: Mapping[str, Any],
-    key: str,
-    default: Any,
-    *,
-    fallback_key: Optional[str] = None,
-) -> Any:
-    if key in config:
-        return config[key]
-    if fallback_key is not None and fallback_key in config:
-        return config[fallback_key]
-    return default
-
-
-def _resolve_rope_dtype(value: Any) -> Any:
-    if value is None or isinstance(value, torch.dtype):
-        return value
-    if isinstance(value, str):
-        normalized = value.strip().lower()
-        if normalized in _ROPE_DTYPE_ALIASES:
-            return _ROPE_DTYPE_ALIASES[normalized]
-    raise ValueError(f"unsupported rope dtype value: {value!r}")
-
-
-def _resolve_rope_kwargs(config: Mapping[str, Any]) -> dict[str, Any]:
-    rope_kwargs = dict(config.get("rope_kwargs") or {})
-    for rope_key, config_key in _ROPE_KWARG_CONFIG_KEYS.items():
-        if rope_key in rope_kwargs:
-            continue
-        fallback_key = _ROPE_KWARG_FALLBACK_KEYS[rope_key]
-        if config_key in config or fallback_key in config:
-            rope_kwargs[rope_key] = _config_value(config, config_key, None, fallback_key=fallback_key)
-
-    for rope_key, default_value in _ROPE_KWARG_DEFAULTS.items():
-        rope_kwargs.setdefault(rope_key, default_value)
-
-    if "dtype" in rope_kwargs:
-        rope_kwargs["dtype"] = _resolve_rope_dtype(rope_kwargs["dtype"])
-
-    return rope_kwargs
-
-
-def _resolve_rope_impl(
-    config: Mapping[str, Any],
-    rope_kwargs: Mapping[str, Any],
-) -> tuple[type[nn.Module], dict[str, Any]]:
-    resolved_kwargs = dict(rope_kwargs)
-    rope_type = _config_value(config, "rope_type", None, fallback_key="pos_embed_rope_type")
-    if rope_type is None:
-        rope_type = resolved_kwargs.pop("type", resolved_kwargs.pop("rope_type", _resolve_default_rope_type(config)))
-
-    if isinstance(rope_type, str):
-        normalized = rope_type.strip().lower()
-        if normalized not in _ROPE_IMPL_ALIASES:
-            raise ValueError(
-                f"unsupported rope_type={rope_type!r}; expected one of {sorted(_ROPE_IMPL_ALIASES)}"
-            )
-        return _ROPE_IMPL_ALIASES[normalized], resolved_kwargs
-
-    if isinstance(rope_type, type) and issubclass(rope_type, nn.Module):
-        return rope_type, resolved_kwargs
-
-    raise ValueError(f"unsupported rope_type value: {rope_type!r}")
-
-
-def _materialize_backbone_config(config: Mapping[str, Any]) -> dict[str, Any]:
-    if config.get("deeper_embed_patch_chunk_size") is not None:
-        raise ValueError("Spatial CNN chunking is no longer supported; use deeper_embed_batch_chunk_size instead.")
-    backbone_defaults = _resolve_backbone_defaults(config)
-    backbone_config = {key: config.get(key, default) for key, default in backbone_defaults.items()}
-    if "num_reg_tokens" not in config and "num_register_tokens" in config:
-        backbone_config["num_reg_tokens"] = int(config["num_register_tokens"])
-
-    rope_kwargs = _resolve_rope_kwargs(config)
-    rope_impl, rope_kwargs = _resolve_rope_impl(config, rope_kwargs)
-    rope_type = next(
-        name
-        for name, impl_cls in _ROPE_IMPL_ALIASES.items()
-        if impl_cls is rope_impl
-    )
-
-    global_crops_size = _as_3tuple(backbone_config["global_crops_size"])
-    local_crop_value = backbone_config["local_crops_size"] or global_crops_size
-    local_crops_size = _as_3tuple(local_crop_value)
-
-    materialized = dict(backbone_config)
-    materialized.update(
-        {
-            "global_crops_size": global_crops_size,
-            "local_crops_size": local_crops_size,
-            "patch_size": _as_3tuple(backbone_config["patch_size"]),
-            "rope_type": rope_type,
-            "rope_kwargs": dict(rope_kwargs),
-        }
-    )
-    if "model_type" in config:
-        materialized["model_type"] = config["model_type"]
-    return materialized
 
 
 def _get_vit_lr_decay_rate(
@@ -441,10 +184,8 @@ class PointDenseHead(nn.Module):
 
         # Top-down 3D FPN over the 16^3 -> 32^3 CNN skip grids so 128^3 and 64^3 grids
         # are only indexed by sample_grid_points and freed before iBOT backward.
-        fpn_skips = self.skip_channels[2:] if len(self.skip_channels) > 2 else self.skip_channels[1:]
-        if not fpn_skips:
-            fpn_skips = self.skip_channels
-        self._fpn_skip_start = max(0, len(self.skip_channels) - len(fpn_skips))
+        self._fpn_skip_start = self.fpn_skip_start(len(self.skip_channels))
+        fpn_skips = self.skip_channels[self._fpn_skip_start:]
         self.fpn_in = nn.Conv3d(self.token_dim, self.fpn_dim, kernel_size=1)
         self.fpn_laterals = nn.ModuleList(
             nn.Conv3d(ch, self.fpn_dim, kernel_size=1) for ch in reversed(fpn_skips)
@@ -475,14 +216,15 @@ class PointDenseHead(nn.Module):
         self.obj_proj = nn.Linear(self.hidden_dim, self.out_dim)
         self.ink_proj = nn.Linear(self.hidden_dim, self.ink_dim)
 
-    def _sample_fpn_points(
-        self,
-        token_grid: torch.Tensor,
-        skips: list[torch.Tensor],
-        point_coordinates: torch.Tensor,
-        input_shape: Tuple[int, ...],
-    ) -> torch.Tensor:
-        """Run top-down 3D FPN refinement and sample the target point coordinates (no checkpointing)."""
+    @staticmethod
+    def fpn_skip_start(num_skips: int) -> int:
+        """Index of the first (finest) CNN skip level the FPN refines; finer ones are only sampled."""
+        if num_skips > 2:
+            return 2
+        return 1 if num_skips == 2 else 0
+
+    def fpn_grid(self, token_grid: torch.Tensor, skips: list[torch.Tensor]) -> torch.Tensor:
+        """Run top-down 3D FPN refinement; returns a [B, D, H, W, fpn_dim] grid (no checkpointing)."""
         dtype = token_grid.dtype
         coarser_skips = skips[self._fpn_skip_start:]
         x = self.fpn_in(token_grid.permute(0, 4, 1, 2, 3).contiguous())
@@ -492,8 +234,18 @@ class PointDenseHead(nn.Module):
                 x = F.interpolate(x, size=target_size, mode="trilinear", align_corners=False)
             x = x + lateral(skip.to(dtype))
             x = x + refine(x)
-        fpn_grid = x.permute(0, 2, 3, 4, 1).contiguous()
-        return sample_grid_points(fpn_grid, point_coordinates, input_shape).to(dtype)
+        return x.permute(0, 2, 3, 4, 1).contiguous()
+
+    def _sample_fpn_points(
+        self,
+        token_grid: torch.Tensor,
+        skips: list[torch.Tensor],
+        point_coordinates: torch.Tensor,
+        input_shape: Tuple[int, ...],
+    ) -> torch.Tensor:
+        """Run top-down 3D FPN refinement and sample the target point coordinates (no checkpointing)."""
+        fpn_grid = self.fpn_grid(token_grid, skips)
+        return sample_grid_points(fpn_grid, point_coordinates, input_shape).to(token_grid.dtype)
 
     def forward_points(
         self,
@@ -501,22 +253,39 @@ class PointDenseHead(nn.Module):
         skips: list[torch.Tensor],
         point_coordinates: torch.Tensor,
         input_shape: Tuple[int, ...],
+        skip_points: Optional[list[torch.Tensor]] = None,
     ) -> dict[str, torch.Tensor]:
+        """skip_points: the skips already sampled at point_coordinates (the backbone's
+        embed_skip_points); skips then only needs the FPN levels."""
         dtype = token_grid.dtype
         tokens = sample_grid_points(token_grid, point_coordinates, input_shape)
         fpn_pts = self.fpn_norm(self._sample_fpn_points(token_grid, skips, point_coordinates, input_shape))
-        skip_parts = [
-            norm(sample_grid_points(level.permute(0, 2, 3, 4, 1), point_coordinates, input_shape).to(dtype))
-            for norm, level in zip(self.skip_norms, skips)
-        ]
+        if skip_points is None:
+            skip_points = [
+                sample_grid_points(level.permute(0, 2, 3, 4, 1), point_coordinates, input_shape) for level in skips
+            ]
+        return {**self.readout(tokens, skip_points, fpn_pts, dtype=dtype), "tokens": tokens}
+
+    def readout(
+        self,
+        tokens: torch.Tensor,
+        skip_points: list[torch.Tensor],
+        fpn_points: torch.Tensor,
+        *,
+        dtype: torch.dtype,
+    ) -> dict[str, torch.Tensor]:
+        """Shared trunk and readouts from point-sampled tokens, skips and fpn_norm-ed FPN features.
+
+        dtype is the token grid's dtype, which the skip and token features are cast to.
+        """
+        skip_parts = [norm(points.to(dtype)) for norm, points in zip(self.skip_norms, skip_points)]
         tokens_cast = tokens.to(dtype)
         trunk = self.trunk_norm(
-            self.mlp(torch.cat([tokens_cast, *skip_parts, fpn_pts], dim=-1)) + self.token_shortcut(tokens_cast)
+            self.mlp(torch.cat([tokens_cast, *skip_parts, fpn_points], dim=-1)) + self.token_shortcut(tokens_cast)
         )
         return {
             "dense": F.normalize(self.obj_proj(trunk).float(), dim=-1),
             "ink": F.normalize(self.ink_proj(trunk).float(), dim=-1),
-            "tokens": tokens,
         }
 
     def forward(self, tokens: torch.Tensor, skips: torch.Tensor) -> torch.Tensor:
@@ -538,12 +307,15 @@ class DinoVitStudentTeacher(nn.Module):
     def __init__(self, config: Mapping[str, Any]) -> None:
         super().__init__()
         self.config = dict(config)
-        student_backbone = self._build_backbone(self.config)
+        student_backbone = build_backbone(self.config)
         # dense_head: point heads for the object losses (see pretrain.object_losses).
         self.dense_config = dict(self.config.get("dense_head") or {})
         self.dense_enabled = bool(self.dense_config.get("enabled", False))
         if self.dense_enabled:
             student_backbone.return_embed_skips = True
+            student_backbone.embed_skip_grid_start = PointDenseHead.fpn_skip_start(
+                len(student_backbone.down_projection.skip_channels)
+            )
         teacher_backbone = deepcopy(student_backbone)
 
         student_modules = {
@@ -564,40 +336,23 @@ class DinoVitStudentTeacher(nn.Module):
         self.teacher = nn.ModuleDict(teacher_modules)
 
         pretrained_weights = self.config.get("pretrained_weights")
+        pretrained_cnn_weights = self.config.get("pretrained_cnn_weights")
+        if pretrained_weights and pretrained_cnn_weights:
+            raise ValueError("Configure only one of pretrained_weights and pretrained_cnn_weights")
         if pretrained_weights:
             self.load_pretrained_weights(
                 pretrained_weights,
                 backbone_only=bool(self.config.get("pretrained_backbone_only", True)),
                 unchunk=bool(self.config.get("pretrained_unchunk", False)),
             )
+        elif pretrained_cnn_weights:
+            self.load_pretrained_cnn_weights(pretrained_cnn_weights)
 
         self.synchronize_teacher_from_student()
         self._freeze_teacher()
 
-    @staticmethod
-    def _build_backbone(config: Mapping[str, Any]) -> nn.Module:
-        backbone_config = _materialize_backbone_config(config)
-        rope_impl, rope_kwargs = _resolve_rope_impl(config, backbone_config["rope_kwargs"])
-        global_crops_size = _as_3tuple(backbone_config["global_crops_size"])
-        local_crops_size = _as_3tuple(backbone_config["local_crops_size"])
-        block_chunks = int(backbone_config["block_chunks"])
-        backbone_cls = EvaWithChunking if block_chunks > 0 else Eva
-        kwargs = dict(backbone_config)
-        kwargs.update(
-            {
-                "global_crops_size": global_crops_size,
-                "local_crops_size": local_crops_size,
-                "patch_size": _as_3tuple(backbone_config["patch_size"]),
-                "rope_impl": rope_impl,
-                "rope_kwargs": rope_kwargs,
-            }
-        )
-        kwargs.pop("block_chunks")
-        kwargs.pop("model_type", None)
-        kwargs.pop("rope_type", None)
-        if backbone_cls is EvaWithChunking:
-            kwargs["block_chunks"] = block_chunks
-        return backbone_cls(**kwargs)
+    # Compatibility for callers that used the old private factory.
+    _build_backbone = staticmethod(build_backbone)
 
     def _build_head(self, prefix: str, fallback_prefix: Optional[str] = None) -> DINOHead:
         backbone_defaults = _resolve_backbone_defaults(self.config)
@@ -712,6 +467,40 @@ class DinoVitStudentTeacher(nn.Module):
 
         return _fuse_params_groups(params_groups)
 
+    def load_pretrained_cnn_weights(self, checkpoint_path: str) -> None:
+        """Initialize the deeper CNN stem/stages, keeping the final projection random.
+
+        Strides can differ without changing convolution weight shapes. Require
+        every stem/stage tensor to match, rather than silently loading a subset.
+        The normal constructor synchronization initializes the EMA teacher too.
+        """
+        if self.student.backbone.embedding_type != "deeper":
+            raise ValueError("pretrained_cnn_weights requires embedding_type='deeper'")
+        # Full training checkpoints also contain NumPy RNG state. As with the
+        # other pretrained loaders, only load trusted checkpoint files.
+        checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+        source, _ = backbone_state(checkpoint)
+        prefixes = ("down_projection.stem.", "down_projection.stages.")
+        source = {key: value for key, value in source.items() if key.startswith(prefixes)}
+        target = {key: value for key, value in self.student.backbone.state_dict().items()
+                  if key.startswith(prefixes)}
+        missing = sorted(target.keys() - source.keys())
+        unexpected = sorted(source.keys() - target.keys())
+        mismatched = sorted(key for key in target.keys() & source.keys()
+                            if target[key].shape != source[key].shape)
+        if not target or missing or unexpected or mismatched:
+            raise RuntimeError(
+                "Incompatible pretrained CNN stem/stages: "
+                f"missing={missing}, unexpected={unexpected}, shape_mismatches={mismatched}"
+            )
+        # All components are validated before any live weights are overwritten.
+        for name in ("stem", "stages"):
+            prefix = f"down_projection.{name}."
+            getattr(self.student.backbone.down_projection, name).load_state_dict(
+                {key.removeprefix(prefix): value for key, value in source.items()
+                 if key.startswith(prefix)}, strict=True,
+            )
+
     def load_pretrained_weights(self, checkpoint_path: str, *, backbone_only: bool = True, unchunk: bool = False) -> None:
         if backbone_only:
             self.student.backbone.load_pretrained_weights(checkpoint_path, backbone_only=True, unchunk=unchunk)
@@ -720,6 +509,8 @@ class DinoVitStudentTeacher(nn.Module):
             return
 
         checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+        if "format_version" in checkpoint:
+            checkpoint = method_state(checkpoint, expected_method="dino")
         if "teacher" in checkpoint:
             state_dict = checkpoint["teacher"]
         elif "model" in checkpoint:
@@ -824,15 +615,15 @@ class DinoVitStudentTeacher(nn.Module):
         masked_patch_features: bool,
         masked_source_tokens: Optional[torch.Tensor] = None,
     ) -> dict[str, Mapping[str, torch.Tensor] | torch.Tensor]:
-        """masked_source_tokens: tokens to select the masked ones from, if not the patch tokens."""
+        """masked_source_tokens: already selected cross-view teacher tokens, when supplied."""
         global_outputs = dict(global_outputs)
         cls_projections = self.project_cls_tokens(branch, global_outputs["cls_tokens"])
         outputs: dict[str, Mapping[str, torch.Tensor] | torch.Tensor] = {
             "global": global_outputs,
             "global_cls_projections": cls_projections,
         }
-        masked_tokens = self.select_masked_patch_tokens(
-            global_outputs["patch_tokens"] if masked_source_tokens is None else masked_source_tokens,
+        masked_tokens = masked_source_tokens if masked_source_tokens is not None else self.select_masked_patch_tokens(
+            global_outputs["patch_tokens"],
             mask_indices_list=mask_indices_list,
             n_masked_patches=n_masked_patches,
         )
@@ -861,8 +652,9 @@ class DinoVitStudentTeacher(nn.Module):
             "cls_tokens": cls_tokens,
             "patch_tokens": backbone_outputs["x_norm_patchtokens"],
         }
-        if "embed_skips" in backbone_outputs:
-            outputs["embed_skips"] = backbone_outputs["embed_skips"]
+        for key in ("embed_skips", "embed_skip_points"):
+            if key in backbone_outputs:
+                outputs[key] = backbone_outputs[key]
         if project_cls_tokens:
             outputs["cls_projections"] = self.project_cls_tokens(branch, cls_tokens)
         if project_patch_tokens:
@@ -878,8 +670,12 @@ class DinoVitStudentTeacher(nn.Module):
         project_patch_tokens: bool = False,
         *,
         view_kind: str = "global",
+        point_coordinates: Optional[torch.Tensor] = None,
     ) -> Mapping[str, torch.Tensor] | list[dict[str, torch.Tensor]]:
-        backbone_outputs = branch.backbone(x, masks=masks, is_training=self.training, view_kind=view_kind)
+        """point_coordinates: dense-head points; the backbone then samples its CNN skips there."""
+        backbone_outputs = branch.backbone(
+            x, masks=masks, is_training=self.training, view_kind=view_kind, point_coordinates=point_coordinates
+        )
         if isinstance(backbone_outputs, list):
             return [
                 self._format_branch_outputs(
@@ -904,10 +700,13 @@ class DinoVitStudentTeacher(nn.Module):
         coordinates: torch.Tensor,
         rows: torch.Tensor,
         input_shape: Tuple[int, ...],
+        mask_indices: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Patch tokens of view rows[r] interpolated at coordinates[r] (input voxels), [rows, P, C]."""
+        """Interpolate teacher tokens; optionally return only selected flat rows [M,C]."""
         token_shape = tuple(size // patch for size, patch in zip(input_shape, branch.backbone.patch_size))
         token_grid = patch_tokens.reshape(patch_tokens.shape[0], *token_shape, patch_tokens.shape[-1])
+        if mask_indices is not None:
+            return sample_selected_grid_points(token_grid, coordinates.float(), input_shape, mask_indices, rows)
         # Coordinates outside the view (tokens without a counterpart, left out of the
         # loss by the trainer) are clamped to the border by the sampler.
         return sample_grid_points(token_grid[rows], coordinates.float(), input_shape).to(patch_tokens.dtype)
@@ -925,10 +724,11 @@ class DinoVitStudentTeacher(nn.Module):
         released (the teacher's) or left to autograd (the student's).
         """
         skips = outputs.pop("embed_skips")
+        skip_points = outputs.pop("embed_skip_points", None)
         patch_tokens = outputs["patch_tokens"]
         token_shape = tuple(size // patch for size, patch in zip(input_shape, branch.backbone.patch_size))
         token_grid = patch_tokens.reshape(patch_tokens.shape[0], *token_shape, patch_tokens.shape[-1])
-        return branch.dense_head.forward_points(token_grid, skips, point_coordinates, input_shape)
+        return branch.dense_head.forward_points(token_grid, skips, point_coordinates, input_shape, skip_points)
 
     def forward(
         self,
@@ -967,11 +767,13 @@ class DinoVitStudentTeacher(nn.Module):
                     project_cls_tokens=project_cls_tokens,
                     project_patch_tokens=project_teacher_patch_tokens and mask_indices_list is None,
                     view_kind="global",
+                    point_coordinates=point_coordinates,
                 )
                 teacher_points = None
                 if point_coordinates is not None and "embed_skips" in teacher_outputs:
                     teacher_points = self._point_features(self.teacher, teacher_outputs, point_coordinates, input_shape)
                 teacher_outputs.pop("embed_skips", None)
+                teacher_outputs.pop("embed_skip_points", None)
                 if mask_indices_list is None:
                     teacher_result = teacher_outputs
                 else:
@@ -980,6 +782,7 @@ class DinoVitStudentTeacher(nn.Module):
                         target_tokens = self._cross_view_tokens(
                             self.teacher, teacher_outputs["patch_tokens"], teacher_target_coordinates,
                             teacher_target_rows, input_shape,
+                            mask_indices_list[:n_masked_patches] if n_masked_patches is not None else mask_indices_list,
                         )
                     teacher_result = self._structured_global_outputs(
                         self.teacher,
@@ -996,11 +799,13 @@ class DinoVitStudentTeacher(nn.Module):
             project_cls_tokens=project_cls_tokens,
             project_patch_tokens=project_student_patch_tokens and mask_indices_list is None,
             view_kind="global",
+            point_coordinates=point_coordinates,
         )
         student_points = None
         if point_coordinates is not None and "embed_skips" in student_outputs:
             student_points = self._point_features(self.student, student_outputs, point_coordinates, input_shape)
         student_outputs.pop("embed_skips", None)
+        student_outputs.pop("embed_skip_points", None)
         if mask_indices_list is None:
             outputs: dict[str, Mapping[str, torch.Tensor] | dict[str, Mapping[str, torch.Tensor] | torch.Tensor]] = {
                 "student": student_outputs
