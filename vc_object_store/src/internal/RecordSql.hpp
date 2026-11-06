@@ -26,6 +26,12 @@ std::string activeEdgeSql();
 std::pair<std::string, std::string> lifecycleBinding(sqlite3*, const EdgeRecord&);
 bool lifecycleBindingMatches(sqlite3*, const EdgeRecord&);
 void bindLifecycle(sqlite3*, const EdgeRecord&, const std::string& aEpoch, const std::string& bEpoch);
+void bindLifecycleById(sqlite3*, int64_t edgeId, const std::string& aEpoch, const std::string& bEpoch);
+struct LifecycleBinding {
+    int64_t id;
+    std::string aEpoch,bEpoch;
+};
+void bindLifecycles(sqlite3*,std::span<const LifecycleBinding>,size_t sqlBatchRows=1);
 // Shared selection semantics for records and compact graph topology.
 // Internal frame filters of a volume selection, in stored units.
 struct FrameCursor {
@@ -61,8 +67,14 @@ std::vector<ObjectRecord> readObjectRows(sqlite3* db, Statement& rows, const Obj
 std::optional<int64_t> objectIdByUuid(sqlite3* db, const std::array<unsigned char, 16>& uuid);
 
 void writeObjectDetail(sqlite3* db, int64_t id, const ObjectRecord& rec);
+void insertObjectDetail(sqlite3* db, int64_t id, const ObjectRecord& rec);
+ObjectRecord prepareObjectRecord(const ObjectRecord&);
+void normalizeObjectCoordinates(ObjectRecord&,bool addDefaultCoordinates,sqlite3* existingStore=nullptr);
+void insertObjectRow(sqlite3*,const ObjectRecord&,int64_t id,int64_t generation,
+    const std::string& author,const std::string& host,const std::string& time,bool preserveRecord=false);
 
 void writeTags(sqlite3* db, const char* table, const char* idColumn, int64_t id, const std::vector<std::string>& tags);
+void insertTags(sqlite3* db, const char* table, const char* idColumn, int64_t id, const std::vector<std::string>& tags);
 
 void restoreCommon(sqlite3* db, const char* table, const RecordCommon& rec);
 

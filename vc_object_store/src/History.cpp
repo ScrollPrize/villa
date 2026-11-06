@@ -2,20 +2,19 @@
 #include "internal/RecordJson.hpp"
 #include "internal/RecordSql.hpp"
 #include "internal/EdgeSql.hpp"
+#include "internal/SqlValues.hpp"
 #include "geometry/Dependencies.hpp"
 #include <limits>
 
 namespace vc::objects {
 using namespace detail;
-namespace {
-nlohmann::json dependencyFields(const nlohmann::json* meta, bool retired,
+nlohmann::json detail::dependencyFields(const nlohmann::json* meta, bool retired,
                                 const std::string& epoch, const Anchor& anchor)
 {
     auto selected=nlohmann::json::object();
     for(const auto& key:anchor.metadataKeys)
         if(meta->contains(key)) selected[key]=meta->at(key);
     return nlohmann::json{{"metadata",selected},{"retired",retired},{"lifecycle_epoch",epoch}};
-}
 }
 nlohmann::json detail::dependencyMetadata(const nlohmann::json& record, const Anchor& anchor)
 {
@@ -229,6 +228,25 @@ void detail::historyConflict(sqlite3* db, const std::string& message)
     throw std::runtime_error(message);
 }
 
+void detail::recordCurrentRelationshipValidation(sqlite3* db,int64_t id,
+    const std::string& a,const std::string& b,const std::string& aEpoch,const std::string& bEpoch)
+{
+    const CurrentRelationshipBinding row{id,a,b,aEpoch,bEpoch};
+    recordCurrentRelationshipValidations(db,std::span(&row,1));
+}
+
+void detail::recordCurrentRelationshipValidations(sqlite3* db,std::span<const CurrentRelationshipBinding> rows,size_t sqlBatchRows)
+{
+    writeSqlValues(db,"INSERT INTO current_edge_metadata(edge_id,a_meta,b_meta)",
+        " ON CONFLICT(edge_id) DO UPDATE SET a_meta=excluded.a_meta,b_meta=excluded.b_meta",
+        3,rows.size(),sqlBatchRows,[&](Statement& s,size_t row,int offset){
+            s.bind(offset+1,rows[row].id);s.bind(offset+2,rows[row].aMetadata);s.bind(offset+3,rows[row].bMetadata);
+        });
+    std::vector<LifecycleBinding> lifecycle; lifecycle.reserve(rows.size());
+    for(const auto& row:rows) lifecycle.push_back({row.id,row.aEpoch,row.bEpoch});
+    bindLifecycles(db,lifecycle,sqlBatchRows);
+}
+
 void detail::recordRelationshipValidation(sqlite3* db, const EdgeRecord& edge, bool recordedOnly)
 {
     GeometryPhase phase("detail::recordRelationshipValidation");
@@ -236,10 +254,8 @@ void detail::recordRelationshipValidation(sqlite3* db, const EdgeRecord& edge, b
     if (!history && recordedOnly) throw std::runtime_error("object store: keeping a historical relationship requires history");
     const auto a=currentDependencyMetadata(db,edge.aUuid,edge.aAnchor), b=currentDependencyMetadata(db,edge.bUuid,edge.bAnchor);
     if (!history) {
-        execute(db, "INSERT INTO current_edge_metadata VALUES((SELECT id FROM edges WHERE uuid=?),?,?) "
-            "ON CONFLICT(edge_id) DO UPDATE SET a_meta=excluded.a_meta,b_meta=excluded.b_meta", parseUuid(edge.uuid),
-            a.dump(), b.dump());
-        bindLifecycle(db, edge, a.value("lifecycle_epoch", ""), b.value("lifecycle_epoch", ""));
+        recordCurrentRelationshipValidation(db,*edgeIdByUuid(db,parseUuid(edge.uuid)),a.dump(),b.dump(),
+            a.value("lifecycle_epoch", ""),b.value("lifecycle_epoch", ""));
         return;
     }
     execute(db, "INSERT INTO history_validated_edges VALUES(?,?,?,?) ON CONFLICT(uuid) "

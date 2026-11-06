@@ -53,6 +53,8 @@ file name, so separate imports of the same file agree on its identity.
 
 ## Use
 
+For large immutable datasets, use the C++ [initial batch construction API](docs/initial-import.md). It accepts native objects, geometry and relationships independently of the source format and owns sharded/packed publication.
+
 See the [v2 format](docs/v2-store-format.md) for persistent history-off storage, optional spatial indexing, sealing, shared generations and database/table identities; [collections](docs/collections.md) for linking/overlays and independent shards; and [packed stores](docs/packed-stores.md) for the optional single-file VFS container. Existing schema-17 stores require the separate `vc_object_convert` tool; never change their schema version manually. The proposed redesigned lazy/delta history remains a follow-up, not part of this implementation.
 
 ```python

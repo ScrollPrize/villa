@@ -33,6 +33,8 @@ add_library(vc_objects ${_vc_store_library_type}
     internal/Schema.cpp
     internal/RecordSql.cpp
     internal/EdgeSql.cpp
+    internal/InitialEdges.cpp
+    internal/InitialObjects.cpp
     internal/RecordJson.cpp
     Uuid.cpp
     internal/JsonFields.cpp
@@ -40,6 +42,7 @@ add_library(vc_objects ${_vc_store_library_type}
     Database.cpp
     Provisioning.cpp
     ObjectCollection.cpp
+    InitialImport.cpp
     PackedStore.cpp
     PackedCollection.cpp
     StoreConversion.cpp

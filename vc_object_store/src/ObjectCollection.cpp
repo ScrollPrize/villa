@@ -1,4 +1,6 @@
 #include "vc_object_store/objects/ObjectCollection.hpp"
+#include "internal/InitialEdges.hpp"
+#include "internal/InitialObjects.hpp"
 #include "vc_object_store/objects/PackedStore.hpp"
 #include "internal/RecordSql.hpp"
 #include "internal/EdgeSql.hpp"
@@ -38,7 +40,7 @@ CREATE TABLE collection_members(
 CREATE TABLE collection_refs(
  local_uuid BLOB PRIMARY KEY CHECK(length(local_uuid)=16),
  owner_uuid BLOB NOT NULL CHECK(length(owner_uuid)=16), object_uuid BLOB NOT NULL CHECK(length(object_uuid)=16),
- state TEXT NOT NULL CHECK(state IN ('reference','override','deleted')),
+ state TEXT NOT NULL CHECK(state='reference' OR state='override' OR state='deleted'),
  generation INTEGER NOT NULL, UNIQUE(owner_uuid,object_uuid)
 );
 CREATE TABLE collection_edge_tombstones(
@@ -212,6 +214,7 @@ struct ObjectCollection::Impl {
 };
 struct CollectionTxn::Impl {
     ObjectCollection::Impl* owner;
+    bool producingInitialEdges=false;
     std::variant<ReadTxn,WriteTxn> root;
     mutable std::map<size_t,std::unique_ptr<ReadTxn>> reads;
     mutable std::set<StatementPool*> configured;
@@ -239,6 +242,7 @@ CollectionTxn::CollectionTxn(std::unique_ptr<Impl> p):impl_(std::move(p)){}
 CollectionTxn::CollectionTxn(CollectionTxn&&) noexcept=default;
 CollectionTxn::~CollectionTxn()=default;
 void CollectionTxn::commit(){if(!impl_)throw std::runtime_error("collection: moved transaction");
+    if(impl_->producingInitialEdges)throw std::runtime_error("collection: initial edge producer cannot commit the destination");
     try{std::visit([](auto& t){t.commit();},impl_->root);}catch(...){impl_->clear();impl_->reads.clear();throw;}
     impl_->clear();impl_->reads.clear();}
 bool CollectionTxn::writable()const{return impl_&&std::holds_alternative<WriteTxn>(impl_->root);}
@@ -249,7 +253,7 @@ void ObjectCollection::Impl::check(const CollectionTxn& t)const{
 const Txn& ObjectCollection::Impl::txn(const CollectionTxn& t,size_t n)const{
     check(t);return t.impl_->get(n);
 }
-WriteTxn& ObjectCollection::Impl::writer(CollectionTxn& t){check(t);if(!t.writable())throw std::runtime_error("collection: read-only transaction");return std::get<WriteTxn>(t.impl_->root);}
+WriteTxn& ObjectCollection::Impl::writer(CollectionTxn& t){check(t);if(!t.writable())throw std::runtime_error("collection: read-only transaction");if(t.impl_->producingInitialEdges)throw std::runtime_error("collection: initial edge producer cannot mutate the destination");return std::get<WriteTxn>(t.impl_->root);}
 
 void ObjectCollection::Impl::load(const std::filesystem::path& input,bool root,const std::optional<CollectionMember>& expected,std::set<std::string>& visiting,sqlite3* existingRoot) {
     auto path=normalized(input); auto opt=options;opt.physicalPartitionOnly=true;if(!root)opt.readOnly=true;
@@ -458,6 +462,7 @@ ObjectCollection ObjectCollection::publishShards(const std::filesystem::path& pa
     auto readonly=options;readonly.readOnly=true;return open(path,readonly);
 }
 CollectionTxn ObjectCollection::read(){return CollectionTxn(std::make_unique<CollectionTxn::Impl>(impl_.get(),false));}
+void ObjectCollection::checkpoint(){impl_->nodes[0].store->checkpoint();}
 CollectionTxn ObjectCollection::write(){if(!impl_->nodes[0].collection)throw std::runtime_error("collection: use ObjectStore to edit a plain store");return CollectionTxn(std::make_unique<CollectionTxn::Impl>(impl_.get(),true));}
 std::string ObjectCollection::uuid(const CollectionTxn& t)const{impl_->check(t);return impl_->nodes[0].member.storeUuid;}
 StoreProvisioning ObjectCollection::provisioning(const CollectionTxn& t)const{return impl_->nodes[0].store->provisioning(impl_->txn(t,0));}
@@ -601,6 +606,113 @@ ObjectKey ObjectCollection::addEdge(CollectionTxn& t,const ObjectKey& a,const Ob
 }
 ObjectKey ObjectCollection::insertEdgeWithId(CollectionTxn& t,const ObjectKey& a,const ObjectKey& b,const EdgeRecord& input,int64_t id){
     return impl_->insertEdge(t,a,b,input,id);
+}
+int64_t ObjectCollection::importInitialEdges(CollectionTxn& t,
+    const std::function<bool(std::vector<InitialCollectionEdge>&)>& producer,
+    const InitialEdgeImportOptions& options)
+{
+    if(!producer || !options.maxCachedEndpoints)
+        throw std::invalid_argument("collection: initial edge import requires a producer and positive endpoint cache limit");
+    auto& w=impl_->writer(t);auto* db=impl_->db(t,0);
+    Savepoint save(db);
+    detail::InitialEdgeInserter writer(*impl_->nodes[0].store,w,options.deferIndexes,options.maxCachedEndpoints,options.sqlBatchRows);
+    std::map<ObjectKey,std::string> endpoints;
+    std::vector<InitialCollectionEdge> batch;
+    std::vector<EdgeRecord> native;
+    int64_t count=0;
+    for(;;){
+        batch.clear();
+        const auto before=sqlite3_total_changes64(db);
+        struct ProducerGuard {
+            bool& active;
+            explicit ProducerGuard(bool& value):active(value){active=true;}
+            ~ProducerGuard(){active=false;}
+        };
+        const bool more=[&]{ProducerGuard guard(t.impl_->producingInitialEdges);return producer(batch);}();
+        if(sqlite3_total_changes64(db)!=before)
+            throw std::runtime_error("collection: initial edge producer must not mutate the destination");
+        if(!more){
+            if(!batch.empty())throw std::invalid_argument("collection: initial edge producer returned EOF with records");
+            break;
+        }
+        if(batch.empty())throw std::invalid_argument("collection: initial edge producer returned an empty nonterminal batch");
+        if(batch.size()>static_cast<uint64_t>(INT64_MAX-count))throw std::overflow_error("collection: initial edge count overflow");
+        native.clear();native.reserve(batch.size());
+        // Resolve and construct reference endpoints once per batch, before any
+        // edge binding. This is initial construction, never an object edit.
+        std::map<ObjectKey,std::string> resolved;
+        std::vector<InitialObjectRecord> proxies;
+        std::vector<ObjectKey> proxyKeys;
+        for(const auto& input:batch)for(const auto& original:{input.a,input.b}){
+            const auto key=canonical(original);
+            if(resolved.contains(key))continue;
+            if(auto it=endpoints.find(key);it!=endpoints.end()){
+                resolved.emplace(key,it->second);continue;
+            }
+            GeometryPhase phase("collection.endpoint.resolve");
+            if(auto ref=impl_->ref(t,0,key)){
+                if(ref->state=="deleted"||!objectIdByUuid(db,parseUuid(ref->local)))
+                    throw std::runtime_error("collection: missing/deleted reference endpoint");
+                resolved.emplace(key,ref->local);continue;
+            }
+            auto current=[&]{GeometryPhase lookup("collection.endpoint.parent_lookup");return impl_->locate(t,key);}();
+            if(!current)throw std::runtime_error("collection: missing/deleted object");
+            if(current->node==0){resolved.emplace(key,current->local);continue;}
+            auto record=std::move(current->record);
+            record.uuid=util::nameUuid(impl_->nodes[0].member.storeUuid,"reference:"+key.storeUuid+":"+key.objectUuid);
+            record.storageKind.clear();record.storageRef.clear();record.dataChecksum.reset();record.dataGeneration=0;
+            resolved.emplace(key,record.uuid);
+            proxies.push_back({std::move(record),{}, {}});proxyKeys.push_back(key);
+        }
+        if(!proxies.empty()){
+            GeometryPhase phase("collection.endpoint.materialize");
+            const auto inserted=detail::insertInitialObjects(*impl_->nodes[0].store,w,proxies);
+            const auto generation=writeGeneration(db);
+            for(size_t i=0;i<inserted.size();++i)
+                execute(db,"INSERT INTO collection_refs VALUES(?,?,?,?,?)",parseUuid(inserted[i].first),
+                    parseUuid(proxyKeys[i].storeUuid),parseUuid(proxyKeys[i].objectUuid),std::string("reference"),generation);
+        }
+        for(const auto& [key,local]:resolved){
+            if(endpoints.size()==options.maxCachedEndpoints)endpoints.clear();
+            endpoints.insert_or_assign(key,local);
+        }
+        for(auto& input:batch){
+            auto resolveEndpoint=[&](const ObjectKey& original,const Anchor& anchor){
+                const auto key=canonical(original);
+                if(!anchor.wholeGeometry || !anchor.points.empty()){
+                    if(auto g=impl_->geometry(t,key)){
+                        validateDependencies(anchor,dependencyGeometry(*impl_->nodes[g->first].store,impl_->txn(t,g->first),g->second));
+                        if(g->first!=0)impl_->ensureLocalGeometry(t,key);
+                    }
+                }
+                const auto found=resolved.find(key);
+                if(!anchor.wholeGeometry || !anchor.points.empty())writer.invalidateEndpoint(found->second);
+                return found->second;
+            };
+            auto a=resolveEndpoint(input.a,input.record.aAnchor);
+            auto b=resolveEndpoint(input.b,input.record.bAnchor);
+            input.record.aUuid=std::move(a);input.record.bUuid=std::move(b);
+            native.push_back(std::move(input.record));
+        }
+        writer.append(native);
+        count+=static_cast<int64_t>(native.size());
+    }
+    writer.finish();
+    save.release();
+    return count;
+}
+std::vector<InitialObjectIdentity> ObjectCollection::importInitialObjects(
+    CollectionTxn& t,std::span<const InitialObjectRecord> records)
+{
+    auto& w=impl_->writer(t);auto* db=impl_->db(t,0);
+    if(historyEnabled(db))throw std::runtime_error("initial objects require history-off storage");
+    Statement edges(db,"SELECT 1 FROM edges LIMIT 1");
+    if(edges.row())throw std::runtime_error("initial owned objects must precede local edges");
+    Savepoint save(db);
+    const auto inserted=detail::insertInitialObjects(*impl_->nodes[0].store,w,records);
+    std::vector<InitialObjectIdentity> result;result.reserve(inserted.size());
+    for(const auto& [uuid,id]:inserted)result.push_back({{impl_->nodes[0].member.storeUuid,uuid},id});
+    save.release();return result;
 }
 void ObjectCollection::removeEdge(CollectionTxn& t,const ObjectKey& input){auto key=canonical(input);auto& w=impl_->writer(t);
     if(key.storeUuid==uuid(t)){impl_->nodes[0].store->removeEdge(w,key.objectUuid);return;}

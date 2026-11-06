@@ -29,7 +29,12 @@ for count in "$build_jobs" "$test_jobs"; do
     fi
 done
 mkdir -p -- "$output_dir/build" "$output_dir/logs" "$output_dir/tmp"
-fixture_dir=$(mktemp -d "$output_dir/tmp/run.XXXXXXXX")
+fixture_root=${VC_OBJECT_STORE_FIXTURE_ROOT:-"$output_dir/tmp"}
+if [[ "$fixture_root" != /* || ! -d "$fixture_root" ]]; then
+    echo 'VC_OBJECT_STORE_FIXTURE_ROOT must be an existing absolute directory.' >&2
+    exit 2
+fi
+fixture_dir=$(mktemp -d "$fixture_root/run.XXXXXXXX")
 cleanup() {
     local status=$?
     trap - EXIT

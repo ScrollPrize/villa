@@ -75,12 +75,13 @@ int main()
         const auto values=Json::parse(edge.meta).at("afc");
         require(values.at("arc_a")==1.25&&values.at("winding_distance")==.75&&values.at("measurement").at("custom")==7,"unsupported values retained");
         require(edge.aAnchor.position==std::array<double,3>{1,2,3}&&!source.next(edge),"native anchors and EOF");
+        require(!source.next(edge)&&!source.next(edge),"AFC EOF remains terminal across producer batches");
     }
     {AfcSource source(afc,"1482bcc8-f93e-4c3b-b380-2ddf369318f4",5);EdgeRecord edge;require(!source.next(edge),"subset excludes missing endpoint");}
     {AfcSource source(afc,"1482bcc8-f93e-4c3b-b380-2ddf369318f4");
         require(source.idRanges(8)==std::vector<std::array<int64_t,2>>{{0,1}},"AFC sparse partition bounds");}
     {AfcSource source(afc,"1482bcc8-f93e-4c3b-b380-2ddf369318f4",INT64_MAX,1,10);EdgeRecord edge;
-        require(!source.next(edge),"AFC ID range excludes other constraints");}
+        require(!source.next(edge)&&!source.next(edge),"empty AFC ID range remains terminal");}
     detail::check(sqlite3_open(afc.string().c_str(),&db),db);
     detail::exec(db,"UPDATE constraints SET parallel_winding_distance=NULL");sqlite3_close(db);
     {AfcSource source(afc,"1482bcc8-f93e-4c3b-b380-2ddf369318f4");EdgeRecord edge;

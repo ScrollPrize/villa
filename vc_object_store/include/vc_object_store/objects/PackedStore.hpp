@@ -18,6 +18,12 @@ struct PackedStoreOptions {
     // Only for disposable imports: SQLite sync requests do not sync storage.
     // finalize() always performs durable publication, regardless of this setting.
     bool disposableBulk = false;
+    // Disposable import only: retain all live extents in RAM, never evict or
+    // spill from a producer call. Exhausting residentBytes fails the builder.
+    bool memoryFirst = false;
+    // Optional asynchronous persistence; false defers it until finalize().
+    // Bounded-cache mode may still spill synchronously at its resident limit.
+    bool backgroundFlush = true;
 };
 
 struct PackedDatabaseInfo {

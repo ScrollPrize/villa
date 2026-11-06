@@ -21,6 +21,25 @@ std::string uuidTextByObjectId(sqlite3* db, int64_t id);
 EdgeRecord readEdgeRow(sqlite3* db, const Statement& s, bool details = true,
                        const ObjectFields& fields = std::nullopt);
 std::vector<EdgeRecord> readEdgeRows(sqlite3* db, Statement& rows, const ObjectFields& fields = std::nullopt);
+EdgeRecord prepareNewEdge(const EdgeRecord&);
+struct EdgeInsertRow {
+    const EdgeRecord* record;
+    int64_t id,aId,bId;
+};
+void requireUnusedObjectUuids(sqlite3*,std::span<const EdgeInsertRow>,size_t sqlBatchRows=1);
+void insertEdgeRows(sqlite3*, std::span<const EdgeInsertRow>,int64_t generation,
+    const std::string& author,const std::string& host,const std::string& time,
+    bool preserveRecord=false,size_t sqlBatchRows=1);
+void insertEdgeRow(sqlite3*, const EdgeRecord&, int64_t id, int64_t aId, int64_t bId,
+    int64_t generation, const std::string& author, const std::string& host,
+    const std::string& time, bool preserveRecord = false);
+void insertEdgeGeometryBinding(sqlite3*, int64_t id,
+    const std::optional<std::string>& a, const std::optional<std::string>& b);
+struct EdgeGeometryBinding {
+    int64_t id;
+    std::optional<std::string> a,b;
+};
+void insertEdgeGeometryBindings(sqlite3*,std::span<const EdgeGeometryBinding>,size_t sqlBatchRows=1);
 std::vector<int64_t> componentIds(sqlite3* db, const std::string& start,
                                  const std::vector<std::string>& kinds, bool includeRetired = false,
                                  std::optional<bool> adjacent = std::nullopt);

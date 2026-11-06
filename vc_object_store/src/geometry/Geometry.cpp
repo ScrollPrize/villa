@@ -7,6 +7,7 @@
 #include "internal/History.hpp"
 #include "geometry/SharedGeometry.hpp"
 #include "geometry/SequenceMetadata.hpp"
+#include "geometry/InitialGeometry.hpp"
 
 namespace vc::objects {
 using namespace detail;
@@ -161,6 +162,14 @@ void rebindUnchangedEdges(sqlite3* db, const std::string& object, const std::opt
     }
 }
 
+void insertCurrentGeometry(sqlite3* db,const ObjectStore& store,const std::string& objectUuid,
+    const std::string& uuid,const std::string& hash,const std::string& text,const nlohmann::json& manifest)
+{
+    execute(db,"INSERT INTO current_geometry VALUES(?,?,?,?,?,?,?,?)",parseUuid(uuid),parseUuid(objectUuid),
+        hash,text,writeGeneration(db),store.author(),nowIsoUtc(),store.hostname());
+    indexCurrentMetadata(db,objectUuid,manifest);
+}
+
 void writeRevision(sqlite3* db, const ObjectStore& store, const ObjectRecord& object,
     const std::string& uuid, const GeometryRevision* parent, const std::string& hash, const std::string& text)
 {
@@ -169,9 +178,7 @@ void writeRevision(sqlite3* db, const ObjectStore& store, const ObjectRecord& ob
         // Chunk mappings cascade; payload reclamation happens after writing
         // the replacement, so unchanged hashes can be reused.
         execute(db, "DELETE FROM current_geometry WHERE object_uuid=?", parseUuid(object.uuid));
-        execute(db, "INSERT INTO current_geometry VALUES(?,?,?,?,?,?,?,?)", parseUuid(uuid), parseUuid(object.uuid),
-            hash, text, writeGeneration(db), store.author(), nowIsoUtc(), store.hostname());
-        indexCurrentMetadata(db, object.uuid, nlohmann::json::parse(text));
+        insertCurrentGeometry(db,store,object.uuid,uuid,hash,text,nlohmann::json::parse(text));
         return;
     }
     Statement revision(db, "INSERT INTO geometry_revisions VALUES(?,?,?,?,?,?,?,?,?)", parseUuid(uuid),
@@ -204,18 +211,23 @@ void writeArrays(sqlite3* db, const std::string& revisionUuid,
             insert.reset(); insert.bind(1, hash);
             check(sqlite3_bind_blob64(insert.value, 2, bytes.data(), bytes.size(), SQLITE_STATIC), db, "bind geometry chunk");
             insert.stepDone();
-            if (geometryWork && sqlite3_changes(db)) geometryWork->writtenBytes[array.name] += bytes.size();
-            // Never silently reuse corrupt data, even on a hash collision.
-            verify.reset(); verify.bind(1, hash);
-            if (!verify.row()) throw std::runtime_error("geometry: missing payload after insertion");
-            if(verify.isNull(0)) {
-                const auto existing=readExternalGeometryPayload(db,hash);
-                if(!std::equal(existing.begin(),existing.end(),bytes.begin(),bytes.end()))
-                    throw std::runtime_error("geometry: corrupt or colliding external payload hash");
-            } else if (sqlite3_column_bytes(verify.value, 0) != static_cast<int>(bytes.size()) ||
-                std::memcmp(sqlite3_column_blob(verify.value, 0), bytes.data(), bytes.size()) != 0)
-                throw std::runtime_error("geometry: corrupt or colliding payload hash");
-            if (geometryWork) geometryWork->readBytes[array.name] += bytes.size();
+            const bool inserted=sqlite3_changes(db)!=0;
+            if (geometryWork && inserted) geometryWork->writtenBytes[array.name] += bytes.size();
+            // A successful new INSERT has stored exactly the supplied bytes.
+            // Only reuse needs readback: never silently reuse corrupt data or
+            // a hash collision, including explicitly linked external chunks.
+            if(!inserted) {
+                verify.reset(); verify.bind(1, hash);
+                if (!verify.row()) throw std::runtime_error("geometry: missing reused payload");
+                if(verify.isNull(0)) {
+                    const auto existing=readExternalGeometryPayload(db,hash);
+                    if(!std::equal(existing.begin(),existing.end(),bytes.begin(),bytes.end()))
+                        throw std::runtime_error("geometry: corrupt or colliding external payload hash");
+                } else if (sqlite3_column_bytes(verify.value, 0) != static_cast<int>(bytes.size()) ||
+                    std::memcmp(sqlite3_column_blob(verify.value, 0), bytes.data(), bytes.size()) != 0)
+                    throw std::runtime_error("geometry: corrupt or colliding payload hash");
+                if (geometryWork) geometryWork->readBytes[array.name] += bytes.size();
+            }
             reference.run(parseUuid(revisionUuid), array.name, static_cast<int64_t>(index), hash);
         });
     }
@@ -241,6 +253,60 @@ GeometryData snapshotData(const nlohmann::json& manifest, const DependencyGeomet
     return data;
 }
 
+}
+
+PreparedInitialGeometry detail::prepareInitialGeometry(sqlite3* db,const ObjectRecord& object,
+    const GeometryData& data,const GeometryStorageOptions& storage)
+{
+    GeometryPhase phase("initial.geometry.prepare");
+    if(historyEnabled(db)||spatialEnabled(db))
+        throw std::invalid_argument("initial geometry requires history-off/spatial-off storage");
+    if(object.uuid.empty()||object.kind!=data.kind)
+        throw std::invalid_argument("initial geometry: object missing identity or kind mismatch");
+    PreparedInitialGeometry result;
+    result.record=object;
+    result.manifest=geometryManifest(data,storage.surfaceTileSize);
+    auto meta=nlohmann::json::parse(object.meta);
+    if(data.kind!="surface") {
+        auto source=meta.value("source",nlohmann::json::object());
+        result.manifest["sequences"]=initialSequences(db,data,source);
+        meta["source"]=std::move(source);
+    } else {
+        // Ordinary publication maintains these derived detail fields even when
+        // spatial indexing is disabled. Compute from input, before initial INSERT.
+        const auto& pointArray=*std::find_if(data.arrays.begin(),data.arrays.end(),[](const auto& a){return a.name=="points";});
+        const auto validArray=std::find_if(data.arrays.begin(),data.arrays.end(),[](const auto& a){return a.name==surfaceValidChannel;});
+        const auto points=xyzValues<float>(pointArray.bytes);
+        const auto rows=pointArray.shape[0],columns=pointArray.shape[1];
+        if(!result.record.surface)result.record.surface.emplace();
+        auto& surface=*result.record.surface;
+        surface.gridHeight=rows;surface.gridWidth=columns;
+        surface.area=vc::geometry::surfaceGridArea(rows,columns,
+            [&](int64_t r,int64_t c)->const std::array<float,3>&{return points[size_t(r*columns+c)];},
+            [&](int64_t r,int64_t c){const auto i=size_t(r*columns+c);return vc::geometry::validSurfacePoint(points[i])&&
+                (validArray==data.arrays.end()||validArray->bytes[i]!=0);});
+    }
+    result.record.meta=meta.dump();
+    result.manifestText=result.manifest.dump();
+    if(geometryWork)geometryWork->manifestBytesWritten+=result.manifestText.size();
+    result.contentHash=geometryHash(std::span(reinterpret_cast<const uint8_t*>(result.manifestText.data()),result.manifestText.size()));
+    result.revisionUuid=util::newUuid();
+    result.record.storageKind="sqlite";
+    result.record.dataGeneration=writeGeneration(db);
+    result.record.dataChecksum=result.contentHash;
+    return result;
+}
+
+void detail::writeInitialGeometry(ObjectStore& store,WriteTxn& txn,const PreparedInitialGeometry& prepared,
+    const GeometryData& data,int64_t objectId)
+{
+    GeometryPhase phase("initial.geometry.write");
+    auto* db=ObjectStoreImplAccess::conn(txn);
+    if(historyEnabled(db)||spatialEnabled(db)||objectId<=0)
+        throw std::invalid_argument("initial geometry requires a new object in history-off/spatial-off storage");
+    insertCurrentGeometry(db,store,prepared.record.uuid,prepared.revisionUuid,
+        prepared.contentHash,prepared.manifestText,prepared.manifest);
+    writeArrays(db,prepared.revisionUuid,data.arrays,prepared.manifest);
 }
 
 std::vector<EdgeRecord> ObjectStore::affectedGeometryEdges(const Txn& txn, const std::string& objectUuid,

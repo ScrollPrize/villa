@@ -128,6 +128,58 @@ int main()
         verify(packedDatabasePath(compact)); verify(packedDatabasePath(compact, second));
         require(std::filesystem::file_size(compact) < std::filesystem::file_size(container), "compact export did not remove extent slack");
 
+        // Strict memory-first producers never spill, including SQLite's sync
+        // calls. With the worker disabled, the physical file must remain just
+        // its invalid construction header until explicit final persistence.
+        auto memoryOptions=options;memoryOptions.memoryFirst=true;
+        mustFail([&]{PackedStoreBuilder invalid(temp.path/"invalid-memory.vcobj",memoryOptions);});
+        memoryOptions.disposableBulk=true;memoryOptions.backgroundFlush=false;
+        memoryOptions.residentBytes=16*options.extentBytes;
+        {
+            const auto destination=temp.path/"memory-sql.vcobj";
+            PackedStoreBuilder builder(destination,memoryOptions);
+            populate(builder.addDatabase(root),7);
+            bool found=false;
+            for(const auto& entry:std::filesystem::directory_iterator(temp.path))
+                if(entry.path().filename().string().starts_with("memory-sql.vcobj.building-")){
+                    found=true;require(entry.file_size()==80,"memory-first ingest wrote payload to disk");
+                }
+            require(found,"memory-first staging header missing");
+            builder.finalize(root);
+        }
+        verify(packedDatabasePath(temp.path/"memory-sql.vcobj"));
+        // Exercise concurrent snapshot/rewrite/journal retirement as well as
+        // extent-layout publication; retaining memory must not lose updates.
+        {
+            auto background=memoryOptions;background.backgroundFlush=true;
+            PackedStoreBuilder builder(temp.path/"memory-background.vcobj",background);
+            const auto a=builder.addDatabase(root),b=builder.addDatabase(second);
+            auto first=std::async(std::launch::async,[&]{populate(a,1);});
+            auto other=std::async(std::launch::async,[&]{populate(b,2);});
+            first.get();other.get();builder.finalize(root,false);
+        }
+        verify(packedDatabasePath(temp.path/"memory-background.vcobj"));
+        verify(packedDatabasePath(temp.path/"memory-background.vcobj",second));
+        {
+            auto small=memoryOptions;small.residentBytes=2*options.extentBytes;
+            PackedStoreBuilder builder(temp.path/"memory-budget.vcobj",small);
+            const auto path=builder.addDatabase(root);
+            {
+                RawFile raw(path,true);
+                std::vector<char> bytes(small.residentBytes,'q'),got(bytes.size());
+                require(raw.file->pMethods->xWrite(raw.file,bytes.data(),int(bytes.size()),0)==SQLITE_OK,"memory initial fill");
+                require(raw.file->pMethods->xTruncate(raw.file,17)==SQLITE_OK,"memory shrink");
+                require(raw.file->pMethods->xTruncate(raw.file,sqlite3_int64(bytes.size()))==SQLITE_OK,"memory reextend");
+                require(raw.file->pMethods->xRead(raw.file,got.data(),int(got.size()),0)==SQLITE_OK,"memory read after shrink");
+                require(std::all_of(got.begin(),got.begin()+17,[](char c){return c=='q';})&&
+                    std::all_of(got.begin()+17,got.end(),[](char c){return c==0;}),"memory truncated data reappeared");
+                require(raw.file->pMethods->xWrite(raw.file,"x",1,sqlite3_int64(bytes.size()))==SQLITE_FULL,"memory budget silently spilled");
+                require(packedStoreLastError().find("memory-first resident budget exhausted")!=std::string::npos,"unclear memory budget failure");
+            }
+            mustFail([&]{builder.finalize(root);});
+        }
+        require(!std::filesystem::exists(temp.path/"memory-budget.vcobj"),"failed memory budget published partial data");
+
         // Partial write, eviction/reload, truncate/reextend, and SQLite's required
         // zero-fill semantics on short reads, independent of SQL page behavior.
         {
@@ -320,6 +372,21 @@ int main()
             mustFail([&] { builder.finalize(id); });
         }
         require(!std::filesystem::exists(temp.path / "io-failure.vcobj"), "failed backing writes published a container");
+        {
+            // With persistence explicitly deferred, an unwritable payload
+            // destination cannot stall or fail RAM ingestion. Publication must
+            // still expose the real I/O error rather than claiming success.
+            ScopedFileLimit limited;
+            PackedStoreBuilder builder(temp.path/"memory-io-failure.vcobj",memoryOptions);
+            const auto path=builder.addDatabase(root);
+            {
+                RawFile raw(path,true);std::vector<char> bytes(2*options.extentBytes,'m');
+                require(raw.file->pMethods->xWrite(raw.file,bytes.data(),int(bytes.size()),0)==SQLITE_OK,"memory ingestion attempted backing I/O");
+                require(raw.file->pMethods->xSync(raw.file,SQLITE_SYNC_FULL)==SQLITE_OK,"memory sync attempted backing I/O");
+            }
+            mustFail([&]{builder.finalize(root);});
+        }
+        require(!std::filesystem::exists(temp.path/"memory-io-failure.vcobj"),"failed deferred persistence published a container");
 #endif
         std::cout << "packed VFS tests passed\n";
         return 0;

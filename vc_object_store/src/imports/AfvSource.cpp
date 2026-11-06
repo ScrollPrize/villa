@@ -135,7 +135,7 @@ struct AfcSource::Impl {
     std::unique_ptr<detail::Statement> rows;
     std::string metadata,uuid;
     int64_t count=0,read=0;
-    bool full=false;
+    bool full=false,finished=false;
     ~Impl(){rows.reset();if(db)sqlite3_close(db);}
 };
 AfcSource::AfcSource(const std::filesystem::path& path,const std::string& afvUuid,int64_t pastLastFiberId,int64_t firstConstraintId,int64_t pastLastConstraintId)
@@ -195,7 +195,9 @@ std::vector<std::array<int64_t,2>> AfcSource::idRanges(size_t partitions,int64_t
 bool AfcSource::next(EdgeRecord& edge)
 {
     auto& p=*impl_;auto& s=*p.rows;
+    if(p.finished)return false;
     if(!s.row()){
+        p.finished=true;
         if(p.full && p.read!=p.count)throw std::invalid_argument("AFC declared count mismatch");
         return false;
     }

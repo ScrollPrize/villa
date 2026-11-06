@@ -2,6 +2,7 @@
 #include "vc_object_store/Uuid.hpp"
 #include "internal/Publication.hpp"
 #include "internal/Sqlite.hpp"
+#include "geometry/GeometryInternal.hpp"
 #include <vc_reader/native/platform_io.hpp>
 #include <sqlite3.h>
 #include <nlohmann/json.hpp>
@@ -11,9 +12,9 @@
 #include <array>
 #include <condition_variable>
 #include <cerrno>
-#include <deque>
 #include <cstring>
 #include <limits>
+#include <iterator>
 #include <list>
 #include <map>
 #include <mutex>
@@ -30,6 +31,7 @@ constexpr std::size_t headerBytes = 80;
 constexpr char magic[] = "VCOBJPK2";
 constexpr auto maxOffset = std::uint64_t(std::numeric_limits<sqlite3_int64>::max());
 thread_local std::string lastError;
+struct MemoryBudgetExceeded : std::runtime_error { using std::runtime_error::runtime_error; };
 void rememberError(const char* value) noexcept { try { lastError = value; } catch (...) {} }
 
 void check(int result, const char* what)
@@ -221,6 +223,7 @@ struct Block {
     // rewrite the entire extent for each small page update after initial fill.
     std::vector<bool> dirtyPages;
     std::list<std::shared_ptr<Block>>::iterator lru;
+    std::list<std::weak_ptr<Block>>::iterator queuedAt;
 };
 struct MutableMember {
     std::uint64_t size = 0;
@@ -241,7 +244,7 @@ struct BuildState {
     std::shared_ptr<PhysicalFile> file;
     std::map<std::string, std::shared_ptr<MutableMember>> members;
     std::list<std::shared_ptr<Block>> lru;
-    std::deque<std::weak_ptr<Block>> dirty;
+    std::list<std::weak_ptr<Block>> dirty;
     std::vector<std::uint64_t> freeExtents;
     std::mutex mutex;
     std::condition_variable wake;
@@ -268,7 +271,9 @@ struct BuildState {
         ++block->version;
         if(block->dirtyPages.empty())block->dirtyPages.resize(options.extentBytes/dirtyPageBytes);
         for(auto page=offset/dirtyPageBytes;page<(offset+bytes+dirtyPageBytes-1)/dirtyPageBytes;++page)block->dirtyPages[page]=true;
-        if (!block->queued) { dirty.emplace_back(block); block->queued = true; }
+        if (options.backgroundFlush && !block->queued) {
+            dirty.emplace_back(block);block->queuedAt=std::prev(dirty.end());block->queued=true;
+        }
     }
     struct DirtySpan {std::size_t offset;std::vector<char> bytes;};
     std::vector<DirtySpan> snapshot(Block& block)
@@ -298,6 +303,16 @@ struct BuildState {
     }
     void retire(const std::shared_ptr<Block>& block, std::unique_lock<std::mutex>& lock)
     {
+        // Repeated short-lived journals must not leave an unbounded queue of
+        // expired weak entries behind a slow disk writer.
+        if(block->queued){dirty.erase(block->queuedAt);block->queued=false;}
+        if(options.memoryFirst && block->inFlight) {
+            // The worker owns its byte snapshot. Retain its physical address
+            // until completion, but journal deletion must not wait for disk.
+            block->retired=true;
+            discard(block);
+            return;
+        }
         // Do not recycle an address while an old asynchronous write can still
         // arrive there. A retired queue entry is ignored even if another owner
         // temporarily retains the Block object.
@@ -326,6 +341,15 @@ struct BuildState {
     void load(const std::shared_ptr<Block>& block, std::unique_lock<std::mutex>& lock, bool overwrite = false)
     {
         if (!block->data.empty()) { block->touched = ++clock; lru.splice(lru.begin(), lru, block->lru); return; }
+        if(options.memoryFirst && block->persisted)
+            throw std::logic_error("packed memory-first extent unexpectedly requires disk reload");
+        if(options.memoryFirst && options.extentBytes > options.residentBytes-resident) {
+            failure=std::make_exception_ptr(MemoryBudgetExceeded(
+                "packed memory-first resident budget exhausted (budget="+std::to_string(options.residentBytes)+
+                ", resident="+std::to_string(resident)+", next extent="+std::to_string(options.extentBytes)+
+                "); increase residentBytes or use bounded-cache mode; builder cannot be published"));
+            std::rethrow_exception(failure);
+        }
         while (resident + options.extentBytes > options.residentBytes) {
             std::shared_ptr<Block> oldest;
             for (auto it = lru.rbegin(); it != lru.rend(); ++it)
@@ -346,7 +370,7 @@ struct BuildState {
         if (block->persisted && !overwrite) file->read(block->data.data(), block->data.size(), block->physical);
         block->touched = ++clock;
     }
-    void ensure(MutableMember& member, std::uint64_t end)
+    void ensure(MutableMember& member, std::uint64_t end, std::unique_lock<std::mutex>& lock)
     {
         const auto count = end / options.extentBytes + (end % options.extentBytes != 0);
         while (member.blocks.size() < count) {
@@ -354,11 +378,15 @@ struct BuildState {
             if (freeExtents.empty()) { block->physical = next; next = checkedEnd(next, options.extentBytes); }
             else { block->physical = freeExtents.back(); freeExtents.pop_back(); }
             member.blocks.push_back(std::move(block));
+            // Reserve sparse/truncated extension bytes too: a later read must
+            // never require an unexpected allocation or backing-file access.
+            if(options.memoryFirst)load(member.blocks.back(),lock);
         }
     }
     template<class F> void directIo(MutableMember& member,const std::shared_ptr<Block>& block,
                                     std::unique_lock<std::mutex>& lock,F&& operation)
     {
+        if(options.memoryFirst)throw std::logic_error("packed memory-first cannot perform foreground page I/O");
         if(!member.directFile)member.directFile=std::make_shared<PhysicalFile>(staging,true);
         // The member operation mutex excludes concurrent mutation/truncation of
         // this logical file. The extent flag also prevents physical retirement.
@@ -372,10 +400,14 @@ struct BuildState {
     }
     void write(MutableMember& member, const void* data, std::size_t bytes, std::uint64_t offset)
     {
-        std::lock_guard operation(member.operations);
-        std::unique_lock lock(mutex); healthy();
+        std::unique_lock operation(member.operations,std::defer_lock);
+        {detail::GeometryPhase wait("packed.write.member_wait");operation.lock();}
+        std::unique_lock lock(mutex,std::defer_lock);
+        {detail::GeometryPhase wait("packed.write.global_wait");lock.lock();}
+        detail::GeometryPhase work("packed.write.work");
+        healthy();
         const auto end = checkedEnd(offset, bytes);
-        ensure(member, end);
+        ensure(member, end, lock);
         const auto* p = static_cast<const char*>(data);
         while (bytes) {
             auto block = member.blocks.at(offset / options.extentBytes);
@@ -399,8 +431,12 @@ struct BuildState {
     }
     void read(MutableMember& member, void* data, std::size_t bytes, std::uint64_t offset)
     {
-        std::lock_guard operation(member.operations);
-        std::unique_lock lock(mutex); healthy();
+        std::unique_lock operation(member.operations,std::defer_lock);
+        {detail::GeometryPhase wait("packed.read.member_wait");operation.lock();}
+        std::unique_lock lock(mutex,std::defer_lock);
+        {detail::GeometryPhase wait("packed.read.global_wait");lock.lock();}
+        detail::GeometryPhase work("packed.read.work");
+        healthy();
         auto* p = static_cast<char*>(data);
         while (bytes) {
             auto block = member.blocks.at(offset / options.extentBytes);
@@ -415,7 +451,7 @@ struct BuildState {
         std::lock_guard operation(member.operations);
         std::unique_lock lock(mutex); healthy();
         checkedEnd(size, 0);
-        ensure(member, size);
+        ensure(member, size, lock);
         // Zero the retained tail. Re-extending a file must not expose old data.
         if (size < member.size && size % options.extentBytes) {
             auto block = member.blocks.at(size / options.extentBytes);
@@ -444,6 +480,9 @@ struct BuildState {
     {
         std::unique_lock lock(mutex);
         for (;;) {
+            // Memory-first finalization can export directly from retained RAM.
+            // Do not first drain an unused copy of every page into staging.
+            if(options.memoryFirst && stopping)return;
             std::shared_ptr<Block> selected;
             while (!dirty.empty() && !selected) {
                 auto b = dirty.front().lock(); dirty.pop_front();
@@ -462,6 +501,7 @@ struct BuildState {
             selected->persisted = true;
             selected->flushed = version;
             selected->inFlight = false;
+            if(selected->retired)freeExtents.push_back(selected->physical);
             wake.notify_all();
         }
     }
@@ -501,6 +541,7 @@ PackedFile& cast(sqlite3_file* file) { return *reinterpret_cast<PackedFile*>(fil
 template<class F> int io(F&& f, int code = SQLITE_IOERR) noexcept
 {
     try { f(); return SQLITE_OK; }
+    catch (const MemoryBudgetExceeded& error) { rememberError(error.what()); return SQLITE_FULL; }
     catch (const std::bad_alloc&) { rememberError("allocation failed in packed VFS"); return SQLITE_NOMEM; }
     catch (const std::exception& error) { rememberError(error.what()); return code; }
     catch (...) { rememberError("unknown packed VFS error"); return code; }
@@ -785,6 +826,8 @@ PackedStoreBuilder::PackedStoreBuilder(const std::filesystem::path& destination,
     if (options.extentBytes < 1024u * 1024u || options.extentBytes > 1024u * 1024u * 1024u
         || (options.extentBytes & (options.extentBytes - 1)) || options.residentBytes < options.extentBytes)
         throw std::invalid_argument("packed builder requires power-of-two MiB extents and at least one resident extent");
+    if(options.memoryFirst && !options.disposableBulk)
+        throw std::invalid_argument("packed memory-first requires disposableBulk=true; durability begins at finalize");
     packedStoreVfs();
     auto state = std::make_shared<BuildState>();
     state->options = options;
@@ -797,7 +840,7 @@ PackedStoreBuilder::PackedStoreBuilder(const std::filesystem::path& destination,
     state->file->write(empty.data(), empty.size(), 0);
     impl_->state = state;
     { std::lock_guard lock(registryMutex); builders.emplace(impl_->token, state); }
-    state->worker = std::thread([pointer = state.get()] { pointer->run(); });
+    if(options.backgroundFlush)state->worker = std::thread([pointer = state.get()] { pointer->run(); });
 }
 PackedStoreBuilder::~PackedStoreBuilder()
 {
@@ -895,6 +938,14 @@ void PackedStoreBuilder::finalize(const std::string& rootDatabaseUuid, bool comp
         if (compact) offsets.push_back(position);
         std::uint64_t copied = 0;
         for (const auto& block : member->blocks) {
+            if(compact && state.options.memoryFirst) {
+                const auto n=std::size_t(std::min<std::uint64_t>(buffer.size(),member->size-copied));
+                if(block->data.size()!=state.options.extentBytes)
+                    throw std::logic_error("packed memory-first extent lost residency");
+                target->write(block->data.data(),n,position);
+                position=checkedEnd(position,n);copied+=n;
+                continue;
+            }
             state.flush(*block);
             // Sparse extended ranges have no prior writes; persist zero extents.
             if (!block->persisted) {

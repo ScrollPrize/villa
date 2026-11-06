@@ -1,5 +1,6 @@
 #include "internal/RecordSql.hpp"
 #include "internal/History.hpp"
+#include "internal/SqlValues.hpp"
 #include "geometry/GeometryDelta.hpp"
 
 namespace vc::objects {
@@ -64,9 +65,21 @@ bool detail::lifecycleBindingMatches(sqlite3* db, const EdgeRecord& edge)
 
 void detail::bindLifecycle(sqlite3* db, const EdgeRecord& edge, const std::string& aEpoch, const std::string& bEpoch)
 {
-    execute(db, "INSERT INTO edge_lifecycle_bindings VALUES(?,?,?) ON CONFLICT(edge_id) "
-        "DO UPDATE SET a_epoch=excluded.a_epoch,b_epoch=excluded.b_epoch", *edgeIdByUuid(db, parseUuid(edge.uuid)),
-        aEpoch, bEpoch);
+    bindLifecycleById(db,*edgeIdByUuid(db,parseUuid(edge.uuid)),aEpoch,bEpoch);
+}
+
+void detail::bindLifecycleById(sqlite3* db,int64_t id,const std::string& aEpoch,const std::string& bEpoch)
+{
+    const LifecycleBinding row{id,aEpoch,bEpoch};bindLifecycles(db,std::span(&row,1));
+}
+
+void detail::bindLifecycles(sqlite3* db,std::span<const LifecycleBinding> rows,size_t sqlBatchRows)
+{
+    writeSqlValues(db,"INSERT INTO edge_lifecycle_bindings(edge_id,a_epoch,b_epoch)",
+        " ON CONFLICT(edge_id) DO UPDATE SET a_epoch=excluded.a_epoch,b_epoch=excluded.b_epoch",
+        3,rows.size(),sqlBatchRows,[&](Statement& s,size_t row,int offset){
+            s.bind(offset+1,rows[row].id);s.bind(offset+2,rows[row].aEpoch);s.bind(offset+3,rows[row].bEpoch);
+        });
 }
 
 namespace {

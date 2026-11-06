@@ -4,6 +4,7 @@
 #include "vc_object_store/objects/FiberJson.hpp"
 #include "vc_object_store/Uuid.hpp"
 #include "formats/GeometryOutput.hpp"
+#include <vc_reader/publication.hpp>
 #include <nlohmann/json.hpp>
 #include <algorithm>
 #include <bit>
@@ -16,12 +17,6 @@
 #include <map>
 #include <set>
 #include <system_error>
-#ifdef __linux__
-#include <fcntl.h>
-#include <sys/syscall.h>
-#include <unistd.h>
-#include <linux/fs.h>
-#endif
 
 namespace vc::objects {
 namespace {
@@ -34,22 +29,8 @@ struct Stage {
 };
 void publish(const fs::path& source, const fs::path& destination, bool overwrite, bool directory)
 {
-    const auto status = fs::symlink_status(destination);
-    const bool exists = fs::exists(status);
-    if (exists && !overwrite) throw std::runtime_error("destination already exists (use overwrite): " + destination.string());
-    if (exists && (fs::is_symlink(status) || (directory ? !fs::is_directory(status) : !fs::is_regular_file(status))))
-        throw std::runtime_error("destination must have the same file/directory type and cannot be a symlink");
-#ifdef __linux__
-    // NOREPLACE closes the check/rename race; EXCHANGE replaces nonempty dirs
-    // without a missing-path window. The old destination is cleaned by Stage.
-    const unsigned flags = exists ? RENAME_EXCHANGE : RENAME_NOREPLACE;
-    if (syscall(SYS_renameat2, AT_FDCWD, source.c_str(), AT_FDCWD, destination.c_str(), flags) != 0)
-        throw std::system_error(errno, std::generic_category(), "atomic geometry export publication");
-#else
-    if (directory) throw std::runtime_error("atomic directory export requires Linux renameat2 support");
-    if (overwrite) fs::rename(source, destination);
-    else fs::create_hard_link(source, destination);
-#endif
+    if(fs::is_directory(source)!=directory)throw std::runtime_error("geometry export staging type mismatch");
+    vcr::files::publishPath(source,destination,overwrite);
 }
 } // namespace
 

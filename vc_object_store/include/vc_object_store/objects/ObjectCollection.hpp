@@ -11,6 +11,20 @@ struct ObjectKey {
 };
 struct CollectionObject { ObjectKey key; ObjectRecord record; };
 struct CollectionEdge { ObjectKey key, a, b; EdgeRecord record; };
+struct InitialCollectionEdge { ObjectKey a, b; EdgeRecord record; };
+// Source-independent initial records. Coordinates are already in the declared
+// native frame; no synthetic control points or source-format interpretation.
+struct InitialObjectRecord {
+    ObjectRecord record;
+    std::optional<int64_t> id;
+    std::optional<GeometryData> geometry;
+};
+struct InitialObjectIdentity { ObjectKey key; int64_t id; };
+struct InitialEdgeImportOptions {
+    bool deferIndexes = true;
+    std::size_t maxCachedEndpoints = 65536;
+    std::size_t sqlBatchRows = 1;
+};
 struct CollectionMember {
     std::string databaseUuid, storeUuid;
     int64_t generation = 0;
@@ -62,6 +76,8 @@ public:
     CollectionTxn write();
     std::string uuid(const CollectionTxn&) const;
     StoreProvisioning provisioning(const CollectionTxn&) const;
+    // Flush the local writer's committed WAL; linked readonly stores are unchanged.
+    void checkpoint();
     std::vector<CollectionMember> members() const;
     std::optional<CollectionObject> object(const CollectionTxn&, const ObjectKey&) const;
     // Numeric lookup routes through partition reservations; UUID lookup is
@@ -86,6 +102,20 @@ public:
     void deleteObject(CollectionTxn&, const ObjectKey&);
     ObjectKey addEdge(CollectionTxn&, const ObjectKey& a, const ObjectKey& b, const EdgeRecord&);
     ObjectKey insertEdgeWithId(CollectionTxn&, const ObjectKey& a, const ObjectKey& b, const EdgeRecord&, int64_t id);
+    // Initial-only append: no updates/replacements, no existing local edges,
+    // history off. A failed batch rolls back every object and geometry row.
+    std::vector<InitialObjectIdentity> importInitialObjects(CollectionTxn&,
+        std::span<const InitialObjectRecord>);
+    // Construct the first edge graph of a history-off store. The producer fills
+    // each batch and returns true, or returns false with an empty batch at EOF.
+    // It may read external inputs, but must not mutate this collection. All
+    // batches form one atomic operation; failure restores records/allocators/
+    // indexes. Existing owned objects and sealed dependencies are supported.
+    // Bulk creation stamps use one publication timestamp per batch. Ordinary
+    // editing APIs retain their per-operation behavior.
+    int64_t importInitialEdges(CollectionTxn&,
+        const std::function<bool(std::vector<InitialCollectionEdge>&)>& producer,
+        const InitialEdgeImportOptions& = {});
     void removeEdge(CollectionTxn&, const ObjectKey&);
     void seal(CollectionTxn&);
 private:
