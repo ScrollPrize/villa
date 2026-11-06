@@ -342,8 +342,10 @@ void TransformedGeometryView::validateForWrite(const ObjectStore& db,const Txn& 
     const auto read=version();
     if(!head||head->uuid!=pinned.uuid||!object||!read||object->version!=*read)
         throw std::runtime_error("object changed; reopen its transformed view");
-    const auto mapping=db.volumeTransforms(txn).toVolume(nlohmann::json::parse(object->record.meta),target_,targetScale_);
-    if(!mapping||*mapping!=mapping_)throw std::runtime_error("volume registration changed; reopen its transformed view");
+    checkVolumeMapping(db,txn,pinned.objectUuid,target_,targetScale_,mapping_);
+}
+CheckVolumeMappingOp TransformedGeometryView::checkMappingOperation() const {
+    return {revision().objectUuid,target_,targetScale_,mapping_};
 }
 std::string TransformedGeometryView::writeCoordinates(ObjectStore& db,WriteTxn& txn,const std::string& array,int64_t start,
     const std::vector<geometry::Point>& desired,const std::vector<GeometryEdgeEdit>& edges) const {

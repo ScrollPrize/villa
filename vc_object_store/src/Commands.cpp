@@ -98,6 +98,11 @@ public:
     {
         return {{"op", "keep_recorded_relationship"}, {"uuid", canonical(op.uuid)}};
     }
+    Json operator()(const CheckVolumeMappingOp& op)
+    {
+        return {{"op", "check_volume_mapping"}, {"object", canonical(op.objectUuid)},
+                {"target_volume", op.targetVolume}, {"target_scale", op.targetScale}, {"mapping", op.mapping.json()}};
+    }
     Json operator()(const PutGeometryOp& op)
     {
         return keep(op, {{"op", "put_geometry"}, {"object", canonical(op.objectUuid)}, {"data", data(op.data)},
@@ -230,6 +235,10 @@ TransactionOperation operationFrom(const Json& j, const TransactionPayloads& pay
     const auto op = j.at("op").get<std::string>();
     auto uuid = [&] { return canonical(j.at("uuid").get<std::string>()); };
     if (op == "create_object") return CreateObjectOp{j.at("record").dump()};
+    if (op == "check_volume_mapping")
+        return CheckVolumeMappingOp{canonical(j.at("object").get<std::string>()),
+            j.at("target_volume").get<std::string>(), j.at("target_scale").get<double>(),
+            vcr::catalog::Affine::fromJson(j.at("mapping"))};
     if (op == "update_object") return UpdateObjectOp{j.at("record").dump()};
     if (op == "set_meta") return SetMetaOp{uuid(), j.at("key").get<std::string>(), j.at("value").dump()};
     if (op == "remove_meta") return RemoveMetaOp{uuid(), j.at("key").get<std::string>()};
@@ -547,6 +556,10 @@ struct Executor {
     void operator()(const RemoveEdgeOp& op) { store.removeEdge(txn, op.uuid); }
     void operator()(const RetainRelationshipOp& op) { store.retainRelationship(txn, op.uuid); }
     void operator()(const KeepRecordedRelationshipOp& op) { store.keepRecordedRelationship(txn, op.uuid); }
+    void operator()(const CheckVolumeMappingOp& op)
+    {
+        checkVolumeMapping(store, txn, op.objectUuid, op.targetVolume, op.targetScale, op.mapping);
+    }
     void operator()(const RecordCatalogTransformsOp& op) { store.recordCatalogTransforms(txn, op.registrations); }
     void operator()(const IngestGeometryOp& op)
     {

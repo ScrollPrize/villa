@@ -12,6 +12,19 @@
 #include <limits>
 #include <string_view>
 namespace vc::objects {
+void checkVolumeMapping(const ObjectStore& store, const Txn& txn, const std::string& objectUuid,
+                        const std::string& target, double targetScale, const VolumeAffine& expected)
+{
+    const auto object = store.objectByUuid(txn, objectUuid);
+    const auto mapping = object
+        ? store.volumeTransforms(txn).toVolume(nlohmann::json::parse(object->meta), target, targetScale)
+        : std::nullopt;
+    if (!mapping || *mapping != expected)
+        throw TransactionConflict(TransactionConflict::Reason::ReadDependency,
+            {{"object", objectUuid, std::nullopt, std::nullopt}},
+            "volume registration changed; reopen its transformed view");
+}
+
 std::optional<VolumeAffine> VolumeTransforms::toVolume(const nlohmann::json& metadata,const std::string& target,double targetScale) const {
     if(target.empty() || !std::isfinite(targetScale) || targetScale<=0)throw std::invalid_argument("invalid target volume or scale");
     const auto coordinates=geometryCoordinates(metadata.value("coordinates",nlohmann::json::object()));

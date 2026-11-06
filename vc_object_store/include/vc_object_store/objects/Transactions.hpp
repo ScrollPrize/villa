@@ -186,6 +186,14 @@ struct UpdateEdgeOp { std::string recordJson; };
 struct RemoveEdgeOp { std::string uuid; };
 struct RetainRelationshipOp { std::string uuid; };
 struct KeepRecordedRelationshipOp { std::string uuid; };
+// Recheck the mapping used to compute inverse geometry edits under the writer
+// lock, before those edits. Includes registrations/route choices added since
+// the view was read; unrelated commits do not invalidate the mapping.
+struct CheckVolumeMappingOp {
+    std::string objectUuid, targetVolume;
+    double targetScale = 1;
+    vcr::catalog::Affine mapping;
+};
 struct GeometryRelationshipEdit {
     std::string relationshipUuid;
     std::string action; // retain | update | remove | keep_recorded
@@ -265,7 +273,7 @@ using TransactionOperation = std::variant<
     RetireObjectOp, RestoreObjectOp, DeleteObjectOp,
     AddEdgeOp, UpdateEdgeOp, RemoveEdgeOp, RetainRelationshipOp, KeepRecordedRelationshipOp,
     PutGeometryOp, EditGeometryOp, EditGeometryRectangleOp, RecordCatalogTransformsOp, SetSurfaceChannelsOp,
-    UpdateGeometryArraysOp, IngestGeometryOp>;
+    UpdateGeometryArraysOp, IngestGeometryOp, CheckVolumeMappingOp>;
 
 // Wire/command format version, part of every request digest.
 inline constexpr int kTransactionCommandVersion = 1;

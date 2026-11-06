@@ -312,9 +312,13 @@ per-point annotations) and decides every affected relationship one way,
 `newRequest(attachment)` starts a request for the attachment's store, active
 generation and author. Helpers over a `StoreReader` fill in what an edit
 depends on: `expectRelationshipEndpoints` expects the far ends of an edited
-object's relationships, and `transformDependencies` makes an edit computed
-through a transformed view conflict when a recorded registration or route
-choice changes before it commits. `editCurrentRequest` builds an edit of
+object's relationships. Put a transformed view's `checkMappingOperation()`
+(`CheckVolumeMappingOp`, wire name `check_volume_mapping`) before its inverse
+geometry edits: the writer resolves the mapping again and conflicts if it is
+unavailable, ambiguous or changed, including newly added registrations or
+route choices. The request must also expect the object's numbered version.
+`transformDependencies` guards existing registration records only; it does not
+guard additions to that set. `editCurrentRequest` builds an edit of
 existing objects at their current versions that keeps their relationships as
 recorded, and the session's `editCurrent(attachment, uuids, operations)` and
 `editRecords` read, build and submit one (on any attachment).

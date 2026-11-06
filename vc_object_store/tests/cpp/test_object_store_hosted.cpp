@@ -8,6 +8,10 @@
 #include "vc_object_store/geometry/Geometry.hpp"
 #include "vc_object_store/objects/ObjectStore.hpp"
 #include "vc_object_store/objects/TransactionJson.hpp"
+#include "vc_object_store/objects/ObjectStoreSession.hpp"
+#include "vc_object_store/objects/StoreReader.hpp"
+#include "vc_object_store/objects/SurfaceCreate.hpp"
+#include "vc_object_store/store/GeometryViews.hpp"
 #include "vc_object_store/server/Server.hpp"
 
 #include <algorithm>
@@ -480,6 +484,73 @@ try {
                 int64_t(hosted.selectAllObjects(tracks, std::vector<std::string>{}, 1).size()) == active, "quiet store lists");
     }
 
+    // Inverse edits recheck their mapping in the commit transaction, locally
+    // and over the wire, even when a new registration/choice caused the change.
+    for (bool remote : {false, true}) {
+        ObjectStoreSession session;
+        HostedSessionOptions hostedOptions; hostedOptions.author = "mapping-test";
+        hostedOptions.pollInterval = std::chrono::hours(1);
+        const auto attachment = remote ? session.attachHosted(endpoint, hostedOptions)
+                                       : session.attach(local.path(), options);
+        const auto uuid = util::newUuid();
+        auto create = session.newRequest(attachment);
+        create.expectedObjects[uuid] = std::nullopt;
+        vc::geometry::Surface grid{1, 2, {1, 1}, {{2, 4, 6}, {8, 10, 12}}};
+        create.operations = createSurfaceOperations(uuid, "mapping", {},
+            {{"volume_uuid", "mapping-a"}, {"scale_factor", 1}}, {"test", {}, {}}, {}, vc::geometry::encode(grid));
+        session.submit(attachment, create);
+        const auto original = registerVolumeTransform(session, attachment, "mapping-a", "mapping-b", VolumeAffine::scale(2), "twice");
+        auto registrationKey = [&](const std::string& id) {
+            std::string key;
+            session.readStore(attachment, [&](const StoreReader& reader, const auto&) {
+                const auto transforms = reader.volumeTransforms();
+                for (const auto& registration : transforms.graph.registrations())
+                    if (registration.id == id) key = registration.id + "@" + registration.revision;
+            });
+            require(!key.empty(), "registration has a revision-qualified path key");
+            return key;
+        };
+        auto edit = [&] {
+            auto request = session.newRequest(attachment);
+            session.readStore(attachment, [&](const StoreReader& reader, const auto&) {
+                const auto head = reader.currentObject(uuid);
+                request.expectedObjects[uuid] = head->version;
+                const auto view = GeometrySnapshot(reader).surface(uuid, *head->geometryRevision).viewTransformedAt("mapping-b");
+                auto desired = view.readTile(0, 0, 1, 1).points.front();
+                desired[0] += 2;
+                request.operations = {view.checkMappingOperation(), EditGeometryOp{uuid,
+                    view.surfaceEdits(0, 0, 1, 1, {{float(desired[0]), float(desired[1]), float(desired[2])}}), {}, true}};
+            });
+            TransactionPayloads payloads;
+            const auto json = transactionRequestToJson(request, &payloads);
+            auto decoded = transactionRequestFromJson(json, payloads);
+            require(transactionRequestDigest(decoded) == transactionRequestDigest(request), "mapping guard wire round trip");
+            return decoded;
+        };
+        auto allowed = edit();
+        registerVolumeTransform(session, attachment, "unrelated-a", "unrelated-b", VolumeAffine::scale(4), "unrelated");
+        const auto saved = session.submit(attachment, allowed);
+        require(saved.objects.at(uuid) == 2, "unrelated registration does not block inverse edits");
+        auto blocked = edit();
+        const auto competing = registerVolumeTransform(session, attachment, "mapping-a", "mapping-b", VolumeAffine::scale(3), "thrice");
+        const auto unchanged = session.currentObject(attachment, uuid)->geometryRevision;
+        auto refused = [&](const TransactionRequest& request) {
+            const auto before = session.status(attachment).commitSequence;
+            require(conflictOf([&] { session.submit(attachment, request); }) == TransactionConflict::Reason::ReadDependency,
+                    "changed mapping conflicts before inverse edits");
+            require(session.status(attachment).commitSequence == before &&
+                    session.currentObject(attachment, uuid)->geometryRevision == unchanged &&
+                    !session.receipt(attachment, request.requestUuid), "mapping conflict rolls back the whole request");
+        };
+        refused(blocked); // A newly inserted registration made the route ambiguous.
+        chooseVolumeTransform(session, attachment, "mapping-b", "mapping-a", {"inverse:" + registrationKey(original)});
+        blocked = edit();
+        chooseVolumeTransform(session, attachment, "mapping-a", "mapping-b", {registrationKey(competing)});
+        refused(blocked); // A new forward choice overrides the existing reverse choice.
+        blocked = edit();
+        chooseVolumeTransform(session, attachment, "mapping-a", "mapping-b", {registrationKey(original)});
+        refused(blocked); // Changing an existing choice is guarded too.
+    }
     // Expired staging: a new request cannot run without its bytes, but the
     // identical retry of a committed one is answered without them.
     const auto later = request({{a, 5}, {b, 3}}, {EditGeometryOp{a, {{"points", 0, int32Bytes(11)}}, {{edge, "retain", "{}", "{}"}}}});

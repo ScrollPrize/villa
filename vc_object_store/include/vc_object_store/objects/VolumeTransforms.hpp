@@ -43,6 +43,10 @@ struct VolumeTransforms {
 VolumeTransforms volumeTransformsFrom(const std::vector<std::pair<ObjectRecord,std::string>>& registrations,
                                       const std::vector<ObjectRecord>& choices,
                                       const vcr::catalog::RegistrationGraph* catalog);
+// Throws TransactionConflict when the object's mapping is unavailable,
+// ambiguous or differs from the one used to compute an edit.
+void checkVolumeMapping(const ObjectStore&, const Txn&, const std::string& objectUuid,
+                        const std::string& target, double targetScale, const VolumeAffine& expected);
 // Stable object UUID of a recorded catalog registration (by catalog id).
 std::string catalogTransformUuid(const std::string& registrationId);
 // The stored route choice from `source` to `target`, when there is one.

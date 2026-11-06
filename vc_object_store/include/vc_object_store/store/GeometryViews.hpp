@@ -119,6 +119,9 @@ public:
     double targetScale() const {return targetScale_;}
     // Validate the pinned mapping and geometry before submitting inverse edits.
     void validateForWrite(const ObjectStore&, const Txn&) const;
+    // Place before inverse edits in a checked request; expectedObjects must
+    // also guard the object version used to compute those edits.
+    CheckVolumeMappingOp checkMappingOperation() const;
     std::string writeCoordinates(ObjectStore&, WriteTxn&, const std::string& array, int64_t start,
         const std::vector<geometry::Point>& desired, const std::vector<GeometryEdgeEdit>& edges={}) const;
     std::string writeSurface(ObjectStore&, WriteTxn&, int64_t row, int64_t column, int64_t rows, int64_t columns,
