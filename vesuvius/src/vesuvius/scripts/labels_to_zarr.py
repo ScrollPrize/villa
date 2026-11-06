@@ -1114,7 +1114,7 @@ def process_tile_worker(task: TileTask) -> int:
     tile_row, tile_row_end, tile_col, tile_col_end = task.tile_bounds
 
     # Get coordinates for this tile
-    xyz, valid = surface.resample_full((tile_row, tile_col), (tile_row_end - tile_row, tile_col_end - tile_col), interpolation="smooth")
+    xyz, valid = surface.resample_full((tile_row, tile_col), (tile_row_end - tile_row, tile_col_end - tile_col), interpolation="bicubic")
     x, y, z = xyz[..., 0], xyz[..., 1], xyz[..., 2]
 
     # Get labels for this tile
@@ -1266,7 +1266,7 @@ def collect_tile_points(task: TileTask) -> Optional[Tuple[np.ndarray, np.ndarray
     tile_row, tile_row_end, tile_col, tile_col_end = task.tile_bounds
 
     # Get coordinates for this tile
-    xyz, valid = surface.resample_full((tile_row, tile_col), (tile_row_end - tile_row, tile_col_end - tile_col), interpolation="smooth")
+    xyz, valid = surface.resample_full((tile_row, tile_col), (tile_row_end - tile_row, tile_col_end - tile_col), interpolation="bicubic")
     x, y, z = xyz[..., 0], xyz[..., 1], xyz[..., 2]
 
     # Get labels for this tile
