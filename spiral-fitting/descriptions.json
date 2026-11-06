@@ -246,6 +246,7 @@
     "shell_table_smooth_sigma_theta": "Gaussian smoothing of the outer-shell radius and confidence tables around the umbilicus, in angle bins (each one turn divided by shell_num_theta_bins), wrapping around the full turn. Larger values give a smoother shell target; 0 disables angular smoothing.",
     "shell_min_confidence": "Minimum shell coverage confidence (0 to 1, smoothed occupancy of the shell table normalised to the best-covered cell) for a shell lookup to count. Below it, outer-shell loss samples are ignored and winding_model supervision pairs are dropped. Raising it restricts both to well-covered parts of the shell.",
     "output_save_png_visualizations": "When on, PNG overlays of the fitted spiral on scroll slices are written at the end of a fit, colored by how well patches and strips are satisfied. This adds slice loading and rendering time at the end of the fit.",
-    "output_num_slices_for_visualization": "Number of z slices, evenly spaced across the z range, rendered as PNG overlays when PNG visualizations are on. More slices take more time and disk space."
+    "output_num_slices_for_visualization": "Number of z slices, evenly spaced across the z range, rendered as PNG overlays when PNG visualizations are on. More slices take more time and disk space.",
+    "output_slim_final_checkpoint": "When on, the checkpoint written at the end of a headless fit leaves out the optimiser state, which is about two thirds of the file. The slim checkpoint still exports, flattens and meshes like the full one, but it cannot be resumed. Autosaves during the fit and checkpoints saved from the service are always full."
   }
 }

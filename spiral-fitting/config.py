@@ -630,6 +630,7 @@ class Config:
         self.shell_min_confidence = 0.25
         self.output_save_png_visualizations = False
         self.output_num_slices_for_visualization = 20
+        self.output_slim_final_checkpoint = False
 
         defaults = vars(self)
         fields = {key: _field_spec(key, value)
