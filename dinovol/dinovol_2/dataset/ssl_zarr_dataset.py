@@ -1,6 +1,7 @@
 import atexit
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
+import json
 import math
 import os
 import random
@@ -10,12 +11,13 @@ from typing import Any
 
 import numpy as np
 import torch
-import torch.nn.functional as F
 from scipy import ndimage as ndi
 from scipy.ndimage import binary_dilation
+from scipy.spatial.transform import Rotation
 from torch.utils.data import Dataset
-from vc_reader.reader import load_basic_auth, open_zarr
 
+from dinovol_2.dataset.cuda_pipeline import CropView, SpatialPlan
+from dinovol_2.dataset.volume_reader import open_volume
 from dinovol_2.dataset.object_labels import (
     FIBER_KIND,
     INK_KIND,
@@ -26,16 +28,13 @@ from dinovol_2.dataset.object_labels import (
     distinct_fiber_pairs,
     fiber_objects,
     load_or_build_volume_meshes,
-    s3_auth,
     slab_objects,
 )
-from dinovol_2.dataset.normalization import get_normalization
 from dinovol_2.dataset.point_annotations import (
     load_point_collection,
     map_scale0_voxel_centers,
     xyz_to_zyx,
 )
-from dinovol_2.dataset.training_transforms import create_training_transforms
 
 
 def _otsu_threshold(values: np.ndarray, bins: int = 256) -> float:
@@ -122,6 +121,10 @@ class Volume:
     start_cells: np.ndarray | None = None
     start_cells_origin: tuple[int, int, int] | None = None
     start_cells_shape: tuple[int, int, int] | None = None
+    # The object mask itself (cells of occupancy_factor voxels, bit-packed along x), kept to
+    # check rotated source windows, which the axis-aligned start cells do not describe.
+    inside_cells: np.ndarray | None = None
+    inside_shape: tuple[int, int, int] | None = None
     # Pseudo-object label sources aligned with the selected scale (see object_points).
     surface_path: str | None = None
     surface_level: int = 0
@@ -153,9 +156,12 @@ class ObjectPoints:
 class SourcePlan:
     volume: Volume
     array: Any
-    starts: tuple[int, int, int]
+    # Volume voxel coordinates of the window's first voxel. With axes, window voxel u lies at
+    # starts + axes @ u (a rotated window); without, at starts + u.
+    starts: tuple
     anchor_index: int | None
     mesh_anchor: np.ndarray | None = None
+    axes: np.ndarray | None = None
 
 
 @dataclass(frozen=True)
@@ -188,23 +194,6 @@ def _max_3tuple(*values):
     return tuple(max(int(value[axis]) for value in filtered) for axis in range(3))
 
 
-def _draw_seed() -> int:
-    """A transform seed, from torch's generator: it follows the run's seed and differs per DataLoader worker."""
-    return int(torch.randint(2**63 - 1, ()))
-
-
-def open_volume_level(path, resolution, auth=None, s3_storage_options=None):
-    """Level `resolution` of the volume at `path`; `auth` is a JSON credentials file for https volumes."""
-    path_str = str(path)
-    if path_str.startswith("s3://"):
-        access = s3_auth(s3_storage_options)
-    elif path_str.startswith("https://") and auth is not None:
-        access = load_basic_auth(auth)
-    else:
-        access = None
-    return open_zarr(path_str, level=str(resolution), auth=access)
-
-
 class SSLZarrDataset(Dataset):
     def __init__(self, config, do_augmentations=False, single_crop_only=False):
         self.config = config
@@ -234,8 +223,8 @@ class SSLZarrDataset(Dataset):
         self.num_local_crops = self.config.get("num_local_crops", 8)
         self.volume_auth = self.config["volume_auth"] if "volume_auth" in self.config else None
         self.s3_storage_options = self.config.get("s3_storage_options")
+        self.volume_cache_dir = self.config.get("volume_cache_dir")
         self.vol_trim_pct = self.config.get("vol_trim_pct", 0.60)
-        self.normalizer = get_normalization(self.config.get("normalization_scheme", "robust"))
         point_config = dict(self.config.get("point_supervision") or {})
         self.point_supervision_enabled = bool(point_config.get("enabled", False)) and not self.single_crop_only
         self.point_sampling_probability = float(point_config.get("sampling_probability", 0.1))
@@ -284,12 +273,20 @@ class SSLZarrDataset(Dataset):
                 raise ValueError("object_mask requires occupancy_level (the pyramid level the mask is computed on)")
             if not 0.0 <= self.object_mask_z_trim_pct < 0.5:
                 raise ValueError(f"object_mask.z_trim_pct must be in [0, 0.5), got {self.object_mask_z_trim_pct}")
+        # source_rotation: "uniform" reads every source window in a uniformly random 3D
+        # orientation (the crops, views and object labels follow it); "none" keeps windows
+        # axis-aligned.
+        self.source_rotation = str(self.config.get("source_rotation", "none"))
+        if self.source_rotation not in ("none", "uniform"):
+            raise ValueError(f"source_rotation must be 'none' or 'uniform', got {self.source_rotation!r}")
+        if self.source_rotation != "none" and self.point_supervision_enabled:
+            raise ValueError("point_supervision does not support rotated source windows")
         # read_ahead: source crops each process reads in background threads while it
         # augments the current sample. Their locations are drawn in the calling thread.
         self.read_ahead = int(self.config.get("read_ahead", 0))
         if self.read_ahead < 0:
             raise ValueError(f"read_ahead must be non-negative, got {self.read_ahead}")
-        self._volume_arrays: dict[tuple[str, int], Any] = {}
+        self._volume_handles: dict[tuple[str, int], Any] = {}
         self._handle_pid: int | None = None
         self._atexit_pid: int | None = None
         self._read_executor: ThreadPoolExecutor | None = None
@@ -342,9 +339,10 @@ class SSLZarrDataset(Dataset):
             self.cross_view_token_patch_size = token_patch
 
         if not self.single_crop_only:
-            if self.num_global_crops != 2:
-                raise ValueError(
-                    f"SSLZarrDataset currently expects exactly 2 global crops, got {self.num_global_crops}")
+            if self.num_global_crops < 1:
+                raise ValueError("SSLZarrDataset requires at least one global crop")
+            if self.cross_view_token_patch_size is not None and self.num_global_crops != 2:
+                raise ValueError("Cross-view token correspondences require exactly two global crops")
             if self.local_crop_size is not None and self.num_local_crops < 0:
                 raise ValueError(
                     f"SSLZarrDataset expects a non-negative number of local crops, got {self.num_local_crops}")
@@ -360,32 +358,42 @@ class SSLZarrDataset(Dataset):
                 "source_sampling_size must be at least as large as the largest requested crop size, "
                 f"got source_sampling_size={self.source_sampling_size} and required={required_source_sampling_size}"
             )
-        # gaussian_blur: false removes blur, which erases one-voxel structures.
+        crop_scales = [("global", self.paired_global_crop_size, self.global_crop_scale)]
+        if self.local_crop_size is not None and not self.single_crop_only:
+            crop_scales.append(("local", self.local_crop_size, self.local_crop_scale))
+        for name, target_size, scale_range in crop_scales:
+            largest = self._crop_shape_for_scale(max(scale_range), target_size)
+            if any(crop > source for crop, source in zip(largest, self.source_sampling_size)):
+                raise ValueError(
+                    f"{name} crops at scale {max(scale_range)} span {largest} source voxels, "
+                    f"more than source_sampling_size={self.source_sampling_size}"
+                )
+        if self.object_points_enabled:
+            smallest = self._crop_shape_for_scale(min(self.global_crop_scale), self.paired_global_crop_size)
+            if any(2 * crop <= source for crop, source in zip(smallest, self.source_sampling_size)):
+                raise ValueError(
+                    f"object_points need overlapping global crops, but crops of {smallest} source voxels "
+                    f"can miss each other in source_sampling_size={self.source_sampling_size}"
+                )
         # augmentation: "dino" keeps only flips, right-angle rotations, transposes and
         # brightness/contrast jitter on top of the random resized crops; "full"
         # (default) is the complete pipeline.
         augmentation = str(self.config.get("augmentation", "full"))
         if augmentation not in ("full", "dino"):
             raise ValueError(f"augmentation must be 'full' or 'dino', got {augmentation!r}")
-        transform_options = {
-            "gaussian_blur": bool(self.config.get("gaussian_blur", True)),
-            "dino_only": augmentation == "dino",
-        }
-        self.global_transforms = [create_training_transforms(self.global_crop_size, **transform_options)
-                                  for _ in range(self.num_global_crops)]
-        self.local_transforms = (
-            [create_training_transforms(self.local_crop_size, **transform_options)
-             for _ in range(self.num_local_crops)]
-            if self.local_crop_size is not None
-            else []
-        )
+        self.global_transforms = [SpatialPlan(self.global_crop_size) for _ in range(self.num_global_crops)]
+        self.local_transforms = ([SpatialPlan(self.local_crop_size) for _ in range(self.num_local_crops)]
+                                 if self.local_crop_size is not None else [])
 
         self.volumes = []
 
         for dataset in self.config["datasets"]:
             volume_path = dataset["volume_path"]
             volume_scale = dataset["volume_scale"]
-            with open_volume_level(volume_path, volume_scale, self.volume_auth, self.s3_storage_options) as d_zarr:
+            handle = open_volume(volume_path, volume_scale, self.volume_auth, self.s3_storage_options,
+                                 cache_dir=self.volume_cache_dir)
+            try:
+                d_zarr = handle
                 z, y, x = d_zarr.shape
                 if self.object_mask_enabled:
                     z0 = int(math.ceil(z * self.object_mask_z_trim_pct))
@@ -465,6 +473,8 @@ class SSLZarrDataset(Dataset):
                     ink_anchor_weight=float(dataset.get("ink_anchor_weight", 1.0)),
                     oversample=oversample,
                 ))
+            finally:
+                handle.close()
 
         if self.occupancy_level is not None:
             # Windows inside the object mask are fully occupied: the occupancy check is moot.
@@ -542,43 +552,52 @@ class SSLZarrDataset(Dataset):
 
         volume_path = dataset_config["volume_path"]
         volume_scale = int(dataset_config["volume_scale"])
-        if volume_scale == 0:
-            scale0_shape = selected_shape
-        else:
-            scale0_shape = tuple(
-                int(value)
-                for value in open_volume_level(volume_path, 0, self.volume_auth, self.s3_storage_options).shape
-            )
+        scale0_handle = None
+        try:
+            if volume_scale == 0:
+                scale0_shape = selected_shape
+            else:
+                scale0_handle = open_volume(
+                    volume_path,
+                    0,
+                    self.volume_auth,
+                    self.s3_storage_options,
+                    cache_dir=self.volume_cache_dir,
+                )
+                scale0_shape = tuple(int(value) for value in scale0_handle.shape)
 
-        all_coordinates = []
-        all_type_ids = []
-        usable_start = np.asarray(usable_bbox[:3], dtype=np.float64)
-        usable_stop = np.asarray(usable_bbox[3:], dtype=np.float64)
-        for entry_index, entry in enumerate(entries):
-            if not isinstance(entry, dict) or "path" not in entry or "type" not in entry:
-                raise ValueError(
-                    f"point_collections entry {entry_index} for {volume_path} must contain path and type."
+            all_coordinates = []
+            all_type_ids = []
+            usable_start = np.asarray(usable_bbox[:3], dtype=np.float64)
+            usable_stop = np.asarray(usable_bbox[3:], dtype=np.float64)
+            for entry_index, entry in enumerate(entries):
+                if not isinstance(entry, dict) or "path" not in entry or "type" not in entry:
+                    raise ValueError(
+                        f"point_collections entry {entry_index} for {volume_path} must contain path and type."
+                    )
+                type_name = entry["type"]
+                if not isinstance(type_name, str) or not type_name:
+                    raise ValueError("Point collection types must be non-empty strings.")
+                points = map_scale0_voxel_centers(
+                    xyz_to_zyx(load_point_collection(entry["path"])),
+                    scale0_shape,
+                    selected_shape,
                 )
-            type_name = entry["type"]
-            if not isinstance(type_name, str) or not type_name:
-                raise ValueError("Point collection types must be non-empty strings.")
-            points = map_scale0_voxel_centers(
-                xyz_to_zyx(load_point_collection(entry["path"])),
-                scale0_shape,
-                selected_shape,
-            )
-            usable = np.all((points >= usable_start) & (points < usable_stop), axis=1)
-            points = points[usable]
-            if points.shape[0] == 0:
-                raise ValueError(
-                    f"Point collection {entry['path']} has no annotations usable in the trimmed bounds "
-                    f"of volume {volume_path} at scale {volume_scale}."
+                usable = np.all((points >= usable_start) & (points < usable_stop), axis=1)
+                points = points[usable]
+                if points.shape[0] == 0:
+                    raise ValueError(
+                        f"Point collection {entry['path']} has no annotations usable in the trimmed bounds "
+                        f"of volume {volume_path} at scale {volume_scale}."
+                    )
+                all_coordinates.append(points)
+                all_type_ids.append(
+                    np.full((points.shape[0],), self.point_type_to_id[type_name], dtype=np.int64)
                 )
-            all_coordinates.append(points)
-            all_type_ids.append(
-                np.full((points.shape[0],), self.point_type_to_id[type_name], dtype=np.int64)
-            )
-        return np.concatenate(all_coordinates), np.concatenate(all_type_ids)
+            return np.concatenate(all_coordinates), np.concatenate(all_type_ids)
+        finally:
+            if scale0_handle is not None:
+                scale0_handle.close()
 
     def _load_occupancy(self, volume: Volume) -> None:
         level = int(self.occupancy_level)
@@ -591,7 +610,10 @@ class SSLZarrDataset(Dataset):
         factor = read_factor * pool
         bbox_lo = np.asarray(volume.usable_bbox[:3]) // factor
         bbox_hi = -(-np.asarray(volume.usable_bbox[3:]) // factor)
-        with open_volume_level(volume.path, level, self.volume_auth, self.s3_storage_options) as array:
+        handle = open_volume(volume.path, level, self.volume_auth, self.s3_storage_options,
+                             cache_dir=self.volume_cache_dir)
+        try:
+            array = handle
             # Read one extra cell on each side for the dilation below.
             read_lo = np.maximum((bbox_lo - 1) * pool, 0)
             read_hi = np.minimum((bbox_hi + 1) * pool, array.shape)
@@ -602,6 +624,8 @@ class SSLZarrDataset(Dataset):
             fine[tuple(slice(int(o), int(o) + n) for o, n in zip(offset, values.shape))] = values > 0
             shape = bbox_hi - bbox_lo + 2
             coarse = fine.reshape(shape[0], pool, shape[1], pool, shape[2], pool).any(axis=(1, 3, 5))
+        finally:
+            handle.close()
         # Downsampling can round sparse cells to zero; one cell of dilation keeps every
         # nonzero selected-scale voxel inside an occupied cell.
         coarse = binary_dilation(coarse, structure=np.ones((3, 3, 3), dtype=bool))
@@ -619,7 +643,10 @@ class SSLZarrDataset(Dataset):
         # Same cells as the occupancy grid: 2**occupancy_level selected-scale voxels.
         pool = max(1, 2 ** level // read_factor)
         factor = read_factor * pool
-        with open_volume_level(volume.path, level, self.volume_auth, self.s3_storage_options) as array:
+        handle = open_volume(volume.path, level, self.volume_auth, self.s3_storage_options,
+                             cache_dir=self.volume_cache_dir)
+        try:
+            array = handle
             cells = -(-np.asarray(array.shape) // pool)
             means = np.zeros(tuple(cells), dtype=np.float32)
             nonzero = np.zeros(tuple(cells), dtype=bool)
@@ -634,6 +661,8 @@ class SSLZarrDataset(Dataset):
                 rows = slice(z // pool, z // pool + blocks.shape[0])
                 means[rows] = blocks.mean(axis=(1, 3, 5), dtype=np.float32)
                 nonzero[rows] = (blocks > 0).any(axis=(1, 3, 5))
+        finally:
+            handle.close()
         if volume.object_mask_source == "sam2":
             # The published (SAM2) mask as-is, air margin included. Cells count as nonzero if any
             # voxel is, so edge cells straddle the mask: erode by one cell to keep windows off it.
@@ -644,6 +673,9 @@ class SSLZarrDataset(Dataset):
         else:
             raise ValueError(f"object_mask_source must be 'object' or 'sam2', got {volume.object_mask_source!r}")
         bbox = np.asarray(volume.usable_bbox)
+        if self.source_rotation != "none":
+            volume.inside_cells = np.packbits(inside, axis=2)
+            volume.inside_shape = tuple(int(v) for v in inside.shape)
         starts = window_start_cells(
             inside, factor, self.source_sampling_size, bbox[:3], bbox[3:], volume.object_mask_min_inside
         )
@@ -694,9 +726,75 @@ class SSLZarrDataset(Dataset):
         block = volume.occupancy[tuple(slices)].astype(np.float64)
         return float(np.einsum("ijk,i,j,k->", block, *weights)) / math.prod(self.source_sampling_size)
 
+    def _rotated_window_allowed(self, volume: Volume, origin, axes) -> bool:
+        """Whether a rotated source window stays inside the usable bbox and, with object_mask,
+        the scanned object (points spaced half an object-mask cell apart across the window)."""
+        size = np.asarray(self.source_sampling_size, dtype=np.float64)
+        step = max(1.0, volume.occupancy_factor / 2) if self.object_mask_enabled else 16.0
+        grids = [np.linspace(0.0, n - 1.0, max(2, int(math.ceil((n - 1.0) / step)) + 1)) for n in size]
+        window = np.stack(np.meshgrid(*grids, indexing="ij"), axis=-1).reshape(-1, 3)
+        points = np.asarray(origin, dtype=np.float64) + window @ np.asarray(axes, dtype=np.float64).T
+        lo = np.asarray(volume.usable_bbox[:3], dtype=np.float64)
+        hi = np.asarray(volume.usable_bbox[3:], dtype=np.float64) - 1.0
+        if not np.all((points >= lo) & (points <= hi)):
+            return False
+        if not self.object_mask_enabled:
+            return True
+        cells = (points // volume.occupancy_factor).astype(np.int64)
+        if np.any(cells >= np.asarray(volume.inside_shape)):
+            return False
+        z, y, x = cells.T
+        inside = (volume.inside_cells[z, y, x >> 3] >> (7 - (x & 7))) & 1
+        return float(inside.mean()) >= volume.object_mask_min_inside - 1e-9
+
+    def _sample_rotated_window(self, volume: Volume, anchor=None):
+        """(origin, axes) of a uniformly rotated source window, optionally containing `anchor`."""
+        size = np.asarray(self.source_sampling_size, dtype=np.float64)
+        center = (size - 1.0) / 2.0
+        for _ in range(16):
+            axes = Rotation.random(random_state=int(np.random.randint(2**31))).as_matrix()
+            if anchor is None:
+                starts = (self._sample_object_start(volume) if self.object_mask_enabled
+                          else self._sample_source_start(volume.usable_bbox))
+                origin = np.asarray(starts, dtype=np.float64) + center - axes @ center
+            else:
+                # Keep the anchor within the margin global crop regions clip anchors to.
+                origin = np.asarray(anchor, dtype=np.float64) - axes @ np.random.uniform(1.0, size - 2.0)
+            if self._rotated_window_allowed(volume, origin, axes):
+                return tuple(float(v) for v in origin), axes
+        return None
+
+    @staticmethod
+    def _to_window(plan: SourcePlan, points):
+        """Volume voxel coordinates -> the plan's source-window coordinates."""
+        shifted = np.asarray(points, dtype=np.float64) - np.asarray(plan.starts, dtype=np.float64)
+        return shifted if plan.axes is None else shifted @ plan.axes
+
+    def _read_plan_window(self, plan: SourcePlan):
+        if plan.axes is None:
+            return self._read_source_window(plan.array, plan.starts)
+        values = plan.array.read_affine(self.source_sampling_size, plan.starts, plan.axes, order=1)
+        dtype = np.dtype(plan.array.dtype)
+        if dtype.kind in "iu":
+            info = np.iinfo(dtype)
+            values = np.clip(np.rint(values), info.min, info.max)
+        return values.astype(dtype, copy=False)
+
+    def _read_plan_region(self, plan: SourcePlan, array, lo, hi, factor=1):
+        """Window region [lo, hi) of a label array `factor` times coarser than the volume, nearest-sampled."""
+        lo, hi = np.asarray(lo), np.asarray(hi)
+        if plan.axes is None:
+            starts = np.asarray(plan.starts)
+            if factor == 1:
+                return self._read_region(array, starts + lo, starts + hi)
+            return self._read_coarse_region(array, starts + lo, starts + hi, factor)
+        # Coarse voxel c covers fine voxels [c * factor, (c + 1) * factor): fine p -> (p + .5) / factor - .5.
+        origin = (np.asarray(plan.starts, dtype=np.float64) + plan.axes @ lo.astype(np.float64) + 0.5) / factor - 0.5
+        return array.read_affine(tuple(int(v) for v in hi - lo), origin, plan.axes / factor, order=0)
+
     def __getstate__(self):
         state = self.__dict__.copy()
-        state["_volume_arrays"] = {}
+        state["_volume_handles"] = {}
         state["_handle_pid"] = None
         state["_atexit_pid"] = None
         state["_read_executor"] = None
@@ -717,7 +815,7 @@ class SSLZarrDataset(Dataset):
         self.close()
         self._read_executor = None
         self._pending_reads = deque()
-        self._volume_arrays = {}
+        self._volume_handles = {}
         self._handle_pid = pid
         self._register_close_hook()
 
@@ -727,11 +825,12 @@ class SSLZarrDataset(Dataset):
     def _get_array(self, path, level):
         self._ensure_process_local_handles()
         key = (str(path), int(level))
-        array = self._volume_arrays.get(key)
-        if array is None:
-            array = open_volume_level(path, level, self.volume_auth, self.s3_storage_options)
-            self._volume_arrays[key] = array
-        return array
+        handle = self._volume_handles.get(key)
+        if handle is None:
+            handle = open_volume(path, level, self.volume_auth, self.s3_storage_options,
+                                 cache_dir=self.volume_cache_dir)
+            self._volume_handles[key] = handle
+        return handle
 
     def _read_region(self, array, lo, hi):
         selection = tuple(slice(int(a), int(b)) for a, b in zip(lo, hi))
@@ -762,15 +861,12 @@ class SSLZarrDataset(Dataset):
         picks = [int(order[rng.integers(edges[i], max(edges[i] + 1, edges[i + 1]))]) for i in range(count)]
         return voxels[np.asarray(picks, dtype=np.int64)]
 
-    def _sample_object_points(self, volume: Volume, window_starts, crop_regions) -> ObjectPoints:
+    def _sample_object_points(self, volume: Volume, plan: SourcePlan, crop_regions) -> ObjectPoints:
         """Points inside both global crops; labeled ones come from meshes/ink and/or slab/volume predictions."""
         overlap_lo = np.max([region.starts for region in crop_regions], axis=0)
         overlap_hi = np.min([np.add(region.starts, region.shape) for region in crop_regions], axis=0)
         if np.any(overlap_hi <= overlap_lo):
             raise RuntimeError("Global crops of one source window must overlap.")
-        window_starts_arr = np.asarray(window_starts)
-        absolute_lo = window_starts_arr + overlap_lo
-        absolute_hi = window_starts_arr + overlap_hi
 
         rng = np.random.default_rng(np.random.randint(2**31))
         sources, objects, kinds, inks = [], [], [], []
@@ -781,10 +877,12 @@ class SSLZarrDataset(Dataset):
         # 1. Surface sheets + ink from pre-cached 3D meshes (when available on this volume).
         if volume.meshes:
             max_mesh_sheets = min(self.max_sheets, self.max_objects)
+            window_starts = np.asarray(plan.starts)
             sampled_sheets, mesh_neg_pairs = crop_mesh_objects(
                 volume.meshes,
-                absolute_lo,
-                absolute_hi,
+                overlap_lo if plan.axes is not None else window_starts + overlap_lo,
+                overlap_hi if plan.axes is not None else window_starts + overlap_hi,
+                frame=None if plan.axes is None else (window_starts, plan.axes),
                 min_points=self.mesh_min_points,
                 dedup_distance=self.mesh_dedup_distance,
                 min_separation=self.mesh_min_separation,
@@ -817,14 +915,14 @@ class SSLZarrDataset(Dataset):
         # 2. Fallback binary surface predictions (when meshes are absent) and 3D fiber predictions.
         surface = None
         if not volume.meshes and volume.surface_path:
-            surface = self._read_region(
-                self._get_array(volume.surface_path, volume.surface_level), absolute_lo, absolute_hi
+            surface = self._read_plan_region(
+                plan, self._get_array(volume.surface_path, volume.surface_level), overlap_lo, overlap_hi
             )
         presence = direction = None
         if volume.fiber_paths is not None and budget > 0 and next_obj_id <= self.max_objects:
             presence_path, nx_path, ny_path = volume.fiber_paths
-            presence = self._read_coarse_region(
-                self._get_array(presence_path, volume.fiber_level), absolute_lo, absolute_hi, volume.fiber_factor
+            presence = self._read_plan_region(
+                plan, self._get_array(presence_path, volume.fiber_level), overlap_lo, overlap_hi, volume.fiber_factor
             )
             if int((presence > self.fiber_presence_threshold).sum()) < self.fiber_min_voxels:
                 presence = None
@@ -834,11 +932,14 @@ class SSLZarrDataset(Dataset):
                 if self._read_executor is None:
                     self._read_executor = ThreadPoolExecutor(max_workers=max(2, self.read_ahead), thread_name_prefix="source-read")
                 fut_nx = self._read_executor.submit(
-                    self._read_coarse_region, nx_arr, absolute_lo, absolute_hi, volume.fiber_factor
+                    self._read_plan_region, plan, nx_arr, overlap_lo, overlap_hi, volume.fiber_factor
                 )
-                ny = self._read_coarse_region(ny_arr, absolute_lo, absolute_hi, volume.fiber_factor)
+                ny = self._read_plan_region(plan, ny_arr, overlap_lo, overlap_hi, volume.fiber_factor)
                 nx = fut_nx.result()
                 direction = decode_fiber_directions(nx, ny)
+                if plan.axes is not None:
+                    # Directions are (z, y, x) in volume space: express them along the window axes.
+                    direction = direction @ plan.axes.astype(direction.dtype)
 
         if surface is not None or presence is not None:
             labels = slab_objects(
@@ -929,7 +1030,9 @@ class SSLZarrDataset(Dataset):
             executor.shutdown(wait=True, cancel_futures=True)
             self._read_executor = None
             self._pending_reads.clear()
-        self._volume_arrays.clear()
+        for handle in self._volume_handles.values():
+            handle.close()
+        self._volume_handles.clear()
 
     def __del__(self):
         try:
@@ -937,31 +1040,20 @@ class SSLZarrDataset(Dataset):
         except Exception:
             pass
 
-    def _sample_crop_shape(self, scale_range):
-        ref_depth, ref_height, ref_width = self.source_sampling_size
+    def _crop_shape_for_scale(self, scale, target_size):
+        # The crop keeps the view's aspect ratio, so resizing it is isotropic:
+        # scale**(1/3) is the fraction of the source covered along the view's
+        # longest axis (any axis for cubic views).
+        axis = int(np.argmax(target_size))
+        extent = self.source_sampling_size[axis] * scale ** (1.0 / 3.0)
+        return tuple(max(1, int(round(extent * size / target_size[axis]))) for size in target_size)
+
+    def _sample_crop_shape(self, scale_range, target_size):
         min_scale, max_scale = scale_range
-        scale = np.random.uniform(min_scale, max_scale)
-        scale_per_dim = scale ** (1.0 / 3.0)
-        return (
-            max(1, int(round(ref_depth * scale_per_dim))),
-            max(1, int(round(ref_height * scale_per_dim))),
-            max(1, int(round(ref_width * scale_per_dim))),
-        )
+        return self._crop_shape_for_scale(np.random.uniform(min_scale, max_scale), target_size)
 
     def _finalize_crop(self, crop, target_size):
-        crop = np.asarray(crop, dtype=np.float32)
-        if self.normalizer is not None:
-            crop = self.normalizer.run(crop)
-        crop = torch.from_numpy(crop).unsqueeze(0)
-        if crop.shape[1:] == target_size:
-            return crop.clone()
-        resized = F.interpolate(
-            crop.unsqueeze(0),
-            size=target_size,
-            mode="trilinear",
-            align_corners=False,
-        )
-        return resized.squeeze(0)
+        return CropView(torch.from_numpy(np.array(crop, copy=True, order="C")), tuple(target_size))
 
     def _sample_source_start(self, usable_bbox):
         z0, y0, x0, z1, y1, x1 = usable_bbox
@@ -1021,7 +1113,7 @@ class SSLZarrDataset(Dataset):
         anchor=None,
         anchor_target_size=None,
     ):
-        crop_shape = self._sample_crop_shape(scale_range)
+        crop_shape = self._sample_crop_shape(scale_range, target_size)
         starts = []
         for axis, (source_dim, crop_dim) in enumerate(zip(source_shape, crop_shape)):
             low = 0
@@ -1071,28 +1163,19 @@ class SSLZarrDataset(Dataset):
         )
 
     def _apply_paired_global_transform(self, transform, global_view, gram_teacher_view):
-        seed = _draw_seed()
-        augmented_global = transform.full({"image": global_view}, seed=seed)["image"]
-        return augmented_global, self._transform_gram_teacher(transform, gram_teacher_view, seed)
+        transformed = transform(image=global_view, paired_spatial_image=gram_teacher_view)
+        if gram_teacher_view is not None:
+            gram_teacher_view.augment = not self.gram_teacher_no_augmentations
+        return transformed["image"], transformed["paired_spatial_image"]
 
     def _apply_paired_global_transform_with_points(
-        self,
-        transform,
-        global_view,
-        gram_teacher_view,
-        point_coordinates,
+        self, transform, global_view, gram_teacher_view, point_coordinates,
     ):
-        seed = _draw_seed()
-        transformed = transform.full({"image": global_view, "keypoints": point_coordinates}, seed=seed)
-        gram_teacher = self._transform_gram_teacher(transform, gram_teacher_view, seed)
-        return transformed["image"], gram_teacher, transformed["keypoints"]
-
-    def _transform_gram_teacher(self, transform, gram_teacher_view, seed):
-        """The Gram teacher's view with the geometry of its global view, and its intensity changes if configured."""
-        if gram_teacher_view is None:
-            return None
-        pipeline = transform.geometry if self.gram_teacher_no_augmentations else transform.full
-        return pipeline({"image": gram_teacher_view}, seed=seed)["image"]
+        transformed = transform(image=global_view, paired_spatial_image=gram_teacher_view,
+                                keypoints=point_coordinates)
+        if gram_teacher_view is not None:
+            gram_teacher_view.augment = not self.gram_teacher_no_augmentations
+        return transformed["image"], transformed["paired_spatial_image"], transformed["keypoints"]
 
     @staticmethod
     def _map_points_to_view(points, crop_region, target_size):
@@ -1171,8 +1254,8 @@ class SSLZarrDataset(Dataset):
         vol: Volume,
         *,
         prefer_ink: bool | None = None,
-    ) -> tuple[tuple[int, int, int], np.ndarray] | None:
-        """Sample a source window start centered around a valid mesh or ink point."""
+    ) -> tuple[tuple, np.ndarray, np.ndarray | None] | None:
+        """Sample a source window (starts, anchor, axes) around a valid mesh or ink point."""
         if not vol.meshes:
             return None
         if prefer_ink is None:
@@ -1198,13 +1281,18 @@ class SSLZarrDataset(Dataset):
             pt = pts[int(np.random.randint(pts.shape[0]))]
             if not np.all((pt >= bbox_lo) & (pt < bbox_hi)):
                 continue
+            if self.source_rotation != "none":
+                rotated = self._sample_rotated_window(vol, anchor=pt)
+                if rotated is None:
+                    continue
+                return rotated[0], pt.astype(np.float64, copy=True), rotated[1]
             try:
                 starts = self._sample_point_centered_source_start(vol.usable_bbox, pt)
             except ValueError:
                 continue
             if self.object_mask_enabled and not self._start_allowed(vol, starts):
                 continue
-            return starts, pt.astype(np.float64, copy=True)
+            return starts, pt.astype(np.float64, copy=True), None
         return None
 
     def _draw_source_plan(self, nonzero_threshold):
@@ -1213,6 +1301,7 @@ class SSLZarrDataset(Dataset):
             anchor_index = None
             mesh_anchor = None
             starts = None
+            axes = None
             u_anchor = np.random.random()
             if (
                 self.object_points_enabled
@@ -1222,7 +1311,7 @@ class SSLZarrDataset(Dataset):
                 vol = self.volumes[int(np.random.choice(len(self.volumes), p=self.ink_anchor_vol_weights))]
                 centered = self._sample_mesh_centered_start(vol, prefer_ink=True)
                 if centered is not None:
-                    starts, mesh_anchor = centered
+                    starts, mesh_anchor, axes = centered
             elif (
                 self.object_points_enabled
                 and self.mesh_anchor_vol_weights is not None
@@ -1231,7 +1320,7 @@ class SSLZarrDataset(Dataset):
                 vol = self.volumes[int(np.random.choice(len(self.volumes), p=self.mesh_anchor_vol_weights))]
                 centered = self._sample_mesh_centered_start(vol, prefer_ink=False)
                 if centered is not None:
-                    starts, mesh_anchor = centered
+                    starts, mesh_anchor, axes = centered
             else:
                 vol = self.volumes[int(np.random.choice(len(self.volumes), p=vol_weights))]
                 if (
@@ -1245,6 +1334,14 @@ class SSLZarrDataset(Dataset):
                         vol.usable_bbox,
                         vol.point_coordinates[anchor_index],
                     )
+            if starts is None and self.source_rotation != "none":
+                rotated = self._sample_rotated_window(vol)
+                if rotated is None:
+                    continue
+                starts, axes = rotated
+            if axes is not None:
+                # Rotated windows were already checked against the object mask and bbox.
+                return SourcePlan(vol, self._get_volume_array(vol), starts, anchor_index, mesh_anchor, axes)
             if starts is None:
                 if self.object_mask_enabled:
                     starts = self._sample_object_start(vol)
@@ -1265,7 +1362,7 @@ class SSLZarrDataset(Dataset):
                 source_crop = future.result()
             else:
                 plan = self._draw_source_plan(nonzero_threshold)
-                source_crop = self._read_source_window(plan.array, plan.starts)
+                source_crop = self._read_plan_window(plan)
             if source_crop.size == 0:
                 continue
             # Windows drawn from the object mask are kept as they are; otherwise the
@@ -1278,7 +1375,7 @@ class SSLZarrDataset(Dataset):
             while len(self._pending_reads) < self.read_ahead:
                 next_plan = self._draw_source_plan(nonzero_threshold)
                 self._pending_reads.append(
-                    (next_plan, self._read_executor.submit(self._read_source_window, next_plan.array, next_plan.starts))
+                    (next_plan, self._read_executor.submit(self._read_plan_window, next_plan))
                 )
         return plan, source_crop
 
@@ -1289,6 +1386,10 @@ class SSLZarrDataset(Dataset):
         anchor_index = plan.anchor_index
         mesh_anchor = plan.mesh_anchor
         source_starts = plan.starts if (anchor_index is not None or mesh_anchor is not None) else None
+        if plan.axes is not None and mesh_anchor is not None:
+            # A rotated window's anchor in window coordinates, which start at zero.
+            mesh_anchor = self._to_window(plan, mesh_anchor)
+            source_starts = (0.0, 0.0, 0.0)
 
         if self.single_crop_only:
             crop = self._random_resized_crop_3d_from_array(
@@ -1297,7 +1398,7 @@ class SSLZarrDataset(Dataset):
                 self.global_crop_size,
             )
             if self.do_augmentations:
-                crop = self.global_transforms[0].full({"image": crop}, seed=_draw_seed())["image"]
+                crop = self.global_transforms[0](image=crop)["image"]
             return crop
 
         global_views = []
@@ -1315,7 +1416,7 @@ class SSLZarrDataset(Dataset):
                 for _ in self.global_transforms
             ]
         if self.object_points_enabled:
-            object_points = self._sample_object_points(vol, plan.starts, crop_regions)
+            object_points = self._sample_object_points(vol, plan, crop_regions)
         for view_index, (transform, crop_region) in enumerate(zip(self.global_transforms, crop_regions)):
             # Sample one shared region so the student and Gram teacher observe the
             # exact same 3D field of view, optionally at different resolutions.
@@ -1410,7 +1511,7 @@ class SSLZarrDataset(Dataset):
             ]
             if self.do_augmentations:
                 local_views = [
-                    transform.full({"image": view}, seed=_draw_seed())["image"]
+                    transform(image=view)["image"]
                     for transform, view in zip(self.local_transforms, local_views)
                 ]
 

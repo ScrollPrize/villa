@@ -22,7 +22,8 @@ from scipy.sparse import coo_matrix
 from scipy.sparse.csgraph import connected_components
 from scipy.spatial import cKDTree
 from vc_reader import images
-from vc_reader.reader import ObjectStore, open_zarr
+from vc_reader.reader import ObjectStore
+from dinovol_2.dataset.volume_reader import open_volume
 
 from dinovol_2.dataset.point_annotations import map_scale0_voxel_centers, xyz_to_zyx
 
@@ -168,6 +169,23 @@ def decode_fiber_directions(nx: np.ndarray, ny: np.ndarray) -> np.ndarray:
     return direction / (np.linalg.norm(direction, axis=-1, keepdims=True) + 1e-6)
 
 
+def _mean_nn_distance_at_most(tree: cKDTree, points: np.ndarray, limit: float, bound: float) -> bool:
+    """Same decision as ``tree.query(points)[0].mean() <= limit``, without exact far searches.
+
+    Nearest-neighbour searches for points far from line-like trees visit most of the tree. A
+    search capped at ``bound`` is cheap; a capped point is at least ``bound`` away, so the mean
+    with those set to ``bound`` is a lower bound (rounding is monotone). Only when that bound
+    does not already exceed ``limit`` are the capped points searched exactly.
+    """
+    distances, _ = tree.query(points, k=1, distance_upper_bound=bound)
+    far = ~np.isfinite(distances)
+    if far.any():
+        if float(np.where(far, bound, distances).mean()) > limit:
+            return False
+        distances[far], _ = tree.query(points[far], k=1)
+    return float(distances.mean()) <= limit
+
+
 def fiber_objects(
     present: np.ndarray,
     direction: np.ndarray,
@@ -242,14 +260,12 @@ def fiber_objects(
                     prev_pts.min(0) - pts.max(0) > dedup_distance * 4.0
                 ):
                     continue
-                dist_b_to_a, _ = prev_tree.query(pts, k=1)
-                if float(dist_b_to_a.mean()) <= dedup_distance:
+                if _mean_nn_distance_at_most(prev_tree, pts, dedup_distance, bound=dedup_distance * 4.0):
                     is_dup = True
                     break
                 if tree_b is None:
                     tree_b = cKDTree(pts)
-                dist_a_to_b, _ = tree_b.query(prev_pts, k=1)
-                if float(dist_a_to_b.mean()) <= dedup_distance:
+                if _mean_nn_distance_at_most(tree_b, prev_pts, dedup_distance, bound=dedup_distance * 4.0):
                     is_dup = True
                     break
             if is_dup:
@@ -410,6 +426,24 @@ class MeshSegment:
     anchor_ink_zyx: np.ndarray | None = None
     n_valid_points: int = 0
     n_ink_points: int = 0
+    mmap_dir: str | None = None  # arrays memory-mapped from this directory (see mmap_mesh_segments)
+
+    _MAPPED = ("zyx", "valid", "ink_state", "tile_lo", "tile_hi", "tile_valid", "anchor_valid_zyx", "anchor_ink_zyx")
+
+    def __getstate__(self):
+        # Memory-mapped segments pickle their directory, not their arrays: spawned data
+        # workers re-map the same files and share the page cache instead of each copying them.
+        state = dict(self.__dict__)
+        if self.mmap_dir is not None:
+            for name in self._MAPPED:
+                state[name] = None
+        return state
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+        if self.mmap_dir is not None:
+            for name in self._MAPPED:
+                setattr(self, name, np.load(Path(self.mmap_dir) / f"{name}.npy", mmap_mode="r"))
 
     def ensure_spatial_index(self) -> None:
         if self.n_valid_points <= 0:
@@ -483,7 +517,8 @@ def _read_tiff(url_or_path: str, storage_options: dict[str, Any] | None = None) 
 
 
 def _open_ink_zarr_level(url_or_path: str, level: str = "4", storage_options: dict[str, Any] | None = None) -> np.ndarray:
-    return open_zarr(str(url_or_path).rstrip("/"), level=level, auth=s3_auth(storage_options))[...]
+    with open_volume(url_or_path, level, s3_storage_options=storage_options) as array:
+        return array[:]
 
 
 def build_mesh_segment_from_arrays(
@@ -586,6 +621,49 @@ def save_mesh_segments_cache(cache_path: str | Path, segments: list[MeshSegment]
     tmp_path.replace(path)
 
 
+def mmap_mesh_segments(cache_path: str | Path) -> list[MeshSegment]:
+    """Mesh segments of a cache, memory-mapped from an uncompressed sidecar directory.
+
+    ``<cache>.mmap/`` holds one ``.npy`` per array (spatial index included) and is
+    written once from the compressed cache, atomically. Segments loaded this way are
+    read-only and pickle by path (see ``MeshSegment.__getstate__``).
+    """
+    import shutil
+    import tempfile
+
+    cache_path = Path(cache_path)
+    root = cache_path.with_name(cache_path.name + ".mmap")
+    if not (root / "segments.json").is_file():
+        segments = load_mesh_segments_cache(cache_path)
+        tmp = Path(tempfile.mkdtemp(prefix=root.name + ".", dir=root.parent))
+        records = []
+        for idx, seg in enumerate(segments):
+            directory = tmp / f"{idx:05d}"
+            directory.mkdir()
+            for name in MeshSegment._MAPPED:
+                np.save(directory / f"{name}.npy", np.ascontiguousarray(getattr(seg, name)))
+            records.append(dict(segment_id=seg.segment_id, bbox_lo=seg.bbox_lo.tolist(), bbox_hi=seg.bbox_hi.tolist(),
+                                has_ink=seg.has_ink, tile_size=seg.tile_size, n_valid_points=seg.n_valid_points,
+                                n_ink_points=seg.n_ink_points))
+        (tmp / "segments.json").write_text(json.dumps(records))
+        del segments
+        try:
+            tmp.rename(root)
+        except OSError:  # another process finished it first
+            shutil.rmtree(tmp, ignore_errors=True)
+    records = json.loads((root / "segments.json").read_text())
+    segments = []
+    for idx, record in enumerate(records):
+        directory = root / f"{idx:05d}"
+        arrays = {name: np.load(directory / f"{name}.npy", mmap_mode="r") for name in MeshSegment._MAPPED}
+        segments.append(MeshSegment(
+            segment_id=record["segment_id"], bbox_lo=np.asarray(record["bbox_lo"], np.float32),
+            bbox_hi=np.asarray(record["bbox_hi"], np.float32), has_ink=record["has_ink"],
+            tile_size=record["tile_size"], n_valid_points=record["n_valid_points"],
+            n_ink_points=record["n_ink_points"], mmap_dir=str(directory), **arrays))
+    return segments
+
+
 def load_mesh_segments_cache(cache_path: str | Path) -> list[MeshSegment]:
     with np.load(cache_path, allow_pickle=False) as data:
         n_segments = int(data["n_segments"])
@@ -642,7 +720,7 @@ def load_or_build_volume_meshes(
 ) -> list[MeshSegment]:
     """Load pre-cached MeshSegments for a volume, or build & cache them from metadata.json."""
     if mesh_cache_path is not None and Path(mesh_cache_path).is_file():
-        return load_mesh_segments_cache(mesh_cache_path)
+        return mmap_mesh_segments(mesh_cache_path)
 
     parsed_sample, parsed_vol = parse_sample_and_volume_id(volume_path)
     sample_id = sample_id or parsed_sample
@@ -658,7 +736,7 @@ def load_or_build_volume_meshes(
         cache_file = Path(cache_dir) / f"{prefix}_scale{int(volume_scale)}.npz"
 
     if cache_file is not None and cache_file.is_file():
-        return load_mesh_segments_cache(cache_file)
+        return mmap_mesh_segments(cache_file)
 
     if metadata_path is None:
         candidates = []
@@ -836,6 +914,7 @@ def load_or_build_volume_meshes(
     if cache_file is not None:
         try:
             save_mesh_segments_cache(cache_file, segments)
+            return mmap_mesh_segments(cache_file)
         except OSError:
             pass
     return segments
@@ -872,8 +951,12 @@ def crop_mesh_objects(
     max_sheets: int = 6,
     points_per_sheet: int = 48,
     rng: np.random.Generator | None = None,
+    frame: tuple[np.ndarray, np.ndarray] | None = None,
 ) -> tuple[list[tuple[np.ndarray, np.ndarray]], list[tuple[int, int]]]:
     """Extract single-layer mesh sheet components and their negative pairs in [crop_lo, crop_hi).
+
+    With frame=(origin, axes) the crop is given in rotated window coordinates u, whose volume
+    position is origin + axes @ u; returned coordinates are then window coordinates too.
 
     Each mesh is split into 2D (u, v) connected components inside the crop so multi-wrap
     spiral segments become separate sheet objects. Duplicate overlapping tracings (within
@@ -887,13 +970,23 @@ def crop_mesh_objects(
     rng = np.random.default_rng() if rng is None else rng
     crop_lo = np.asarray(crop_lo, dtype=np.float32)
     crop_hi = np.asarray(crop_hi, dtype=np.float32)
+    if frame is None:
+        box_lo, box_hi = crop_lo, crop_hi
+        to_crop = lambda points: points
+    else:
+        origin, axes = (np.asarray(value, dtype=np.float32) for value in frame)
+        corners = np.stack(np.meshgrid(*zip(crop_lo, crop_hi), indexing="ij"), axis=-1).reshape(-1, 3)
+        corners = origin + corners @ axes.T
+        # The crop's volume-space bounding box preselects segments and tiles.
+        box_lo, box_hi = corners.min(axis=0) - 1.0, corners.max(axis=0) + 1.0
+        to_crop = lambda points: (points - origin) @ axes
 
     candidates: list[CropMeshSheet] = []
     for seg in meshes:
-        if np.any(seg.bbox_hi < crop_lo) or np.any(seg.bbox_lo >= crop_hi):
+        if np.any(seg.bbox_hi < box_lo) or np.any(seg.bbox_lo >= box_hi):
             continue
         seg.ensure_spatial_index()
-        tile_hit = seg.tile_valid & np.all((seg.tile_hi >= crop_lo) & (seg.tile_lo < crop_hi), axis=-1)
+        tile_hit = seg.tile_valid & np.all((seg.tile_hi >= box_lo) & (seg.tile_lo < box_hi), axis=-1)
         if not tile_hit.any():
             continue
         h, w = seg.valid.shape
@@ -909,7 +1002,8 @@ def crop_mesh_objects(
             sub_zyx = seg.zyx[u0:u1, v0:v1]
             sub_valid = seg.valid[u0:u1, v0:v1]
             with np.errstate(invalid="ignore"):
-                inside = sub_valid & np.all((sub_zyx >= crop_lo) & (sub_zyx < crop_hi), axis=-1)
+                local = to_crop(sub_zyx)
+                inside = sub_valid & np.all((local >= crop_lo) & (local < crop_hi), axis=-1)
             if int(inside.sum()) < min_points:
                 continue
             cc_labels, n_cc = ndi.label(inside, structure=EIGHT_CONNECTED_2D)
@@ -924,7 +1018,7 @@ def crop_mesh_objects(
                 u_local, v_local = np.nonzero(local_mask)
                 u = u_local + (u0 + bounds[0].start)
                 v = v_local + (v0 + bounds[1].start)
-                coords = seg.zyx[u, v] - crop_lo
+                coords = to_crop(seg.zyx[u, v]) - crop_lo
                 ink = seg.ink_state[u, v]
                 uv = np.stack([u, v], axis=-1).astype(np.int32)
                 candidates.append(CropMeshSheet(coords=coords, ink_state=ink, uv_coords=uv))
