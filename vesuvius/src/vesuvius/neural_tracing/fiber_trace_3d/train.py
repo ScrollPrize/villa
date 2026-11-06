@@ -677,6 +677,12 @@ def _reviewed_trace_test_config(training: dict[str, Any]) -> dict[str, Any] | No
     interval = raw["interval"]
     if type(interval) is not int or interval < 1:
         raise ValueError("training.reviewed_trace_test.interval must be positive")
+    if raw.get("weights", "ema_0p999") not in ("raw", "ema_0p999"):
+        raise ValueError("reviewed_trace_test.weights must be raw or ema_0p999")
+    cutoff = raw.get("presence_cutoff", 0.25)
+    if (isinstance(cutoff, bool) or not isinstance(cutoff, (int, float))
+            or not math.isfinite(cutoff) or not 0 <= cutoff <= 1):
+        raise ValueError("reviewed_trace_test.presence_cutoff must be between 0 and 1")
     return dict(raw)
 
 
@@ -3387,6 +3393,7 @@ def training_units(
     enable_reviewed_trace: bool = True,
     yield_initialized: bool = False,
     on_model_ready=None,
+    on_ema_ready=None,
     on_failure=None,
 ):
     """Shared training loop, yielding only after completed logical work.
@@ -3611,6 +3618,12 @@ def training_units(
     elif ema.tracks and distributed.is_main:
         print(f"fiber EMA: initialized at update={start_step} decays={training['ema_decays']} (no earlier EMA history)", flush=True)
     del saved_ema
+    if reviewed_trace_test is not None and enable_reviewed_trace:
+        trace_weights = reviewed_trace_test.get('weights', 'ema_0p999')
+        if trace_weights != 'raw' and trace_weights not in ema.tracks:
+            raise ValueError('reviewed trace testing requires training.ema_decays to include 0.999')
+    if on_ema_ready is not None:
+        on_ema_ready(ema)
     run_datestr = str(
         (handoff_progress or {}).get("run_datestr")
         or resolve_run_date(raw_config)
@@ -4529,8 +4542,8 @@ def training_units(
             save_test_snapshots(start_step, initial_metric, initial_metric_name, initial=is_initial)
             if reviewed_trace_test is not None and enable_reviewed_trace and trace_unlocked:
                 if physical_microbatch_sizes is not None:
-                    # Trace inference borrows these resident raw-model replicas
-                    # under the unchanged grant. Optimizer/EMA state stays put.
+                    # Trace inference borrows resident replicas under the grant,
+                    # temporarily applying the selected EMA when requested.
                     # The dense test is complete: do not capture it as pending
                     # or replacement workers will attempt the same test twice.
                     pending_test = None

@@ -113,19 +113,24 @@ def test_build_workload_locks_sources_and_runtime(tmp_path):
     template = {
         "sources": [{"id": name, "expected_test_count": 99} for name in ("A", "B", "C", "unused")],
         "evaluation": {"render": True, "workers": 192,
+                       "trace_args": ["--replay-presence-cutoff", "0", "--replay-presence-mode", "raw"],
                        "gpu_manager": {"enabled": True},
                        "inference": {"input_workers": 192, "flush_workers": 192,
                                      "accumulator_workers": 192,
                                      "max_batch_size": 4}},
     }
     result = build_workload(template, checkpoint=checkpoint, output_root=tmp_path / "out",
-                            split_root=split, devices="0,1", native_binary=binary)
+                            split_root=split, devices="0,1", native_binary=binary, presence_cutoff=.25)
     assert [(row["id"], row["expected_test_count"]) for row in result["sources"]] == [
         ("A", 11), ("B", 6), ("C", 15)]
     assert result["evaluation"]["gpu_manager"]["enabled"] is False
     assert result["evaluation"]["workers"] == 128
     assert result["evaluation"]["inference"]["max_batch_size"] == 4
     assert result["devices"] == "0,1"
+    args = result['evaluation']['trace_args']
+    assert args[args.index('--replay-presence-cutoff') + 1] == '0.25'
+    assert args[args.index('--replay-presence-mode') + 1] == 'modulated'
+    assert template['evaluation']['trace_args'][1] == '0'
 
 
 def test_training_trace_job_rejects_gpu_binding_outside_inherited_grant(monkeypatch, tmp_path):
@@ -150,3 +155,25 @@ def test_reviewed_trace_config_validation():
 def test_unmanaged_trace_does_not_spawn_a_second_model():
     with pytest.raises(ValueError, match="requires managed training"):
         train._run_reviewed_trace_test()
+
+
+@pytest.mark.parametrize("cutoff", [-0.1, 1.1, float("nan"), float("inf"), True, "0.25", None])
+def test_reviewed_trace_rejects_invalid_presence_cutoff(cutoff):
+    value = {"interval": 100, "template": "a", "split_root": "b",
+             "native_binary": "c", "presence_cutoff": cutoff}
+    with pytest.raises(ValueError, match="presence_cutoff"):
+        _reviewed_trace_test_config({"reviewed_trace_test": value})
+
+
+@pytest.mark.parametrize("weights", ["raw", "ema_0p999"])
+def test_reviewed_trace_accepts_weight_selection(weights):
+    value = {"interval": 100, "template": "a", "split_root": "b",
+             "native_binary": "c", "weights": weights}
+    assert _reviewed_trace_test_config({"reviewed_trace_test": value}) == value
+
+
+def test_reviewed_trace_rejects_unsupported_weights():
+    value = {"interval": 100, "template": "a", "split_root": "b",
+             "native_binary": "c", "weights": "ema_typo"}
+    with pytest.raises(ValueError, match="weights"):
+        _reviewed_trace_test_config({"reviewed_trace_test": value})
