@@ -441,6 +441,30 @@ int runObjectStoreControllerTests()
             return fibers.front();
         };
         a=resolve(a.uuid);b=resolve(b.uuid);
+        {
+            auto beforeReset = std::vector<Controller::FiberSaveSnapshot>{controller.makeFiberSaveSnapshot(a)};
+            { auto db = ObjectStore::open(path, options); db.startHistoryGeneration("restored backup"); }
+            bool rejected = false;
+            try { controller.commitFiberStoreAction(beforeReset); }
+            catch (const std::runtime_error&) { rejected = true; }
+            require(rejected, "fiber opened before reset rejects edits");
+            a = resolve(a.uuid); b = resolve(b.uuid);
+            require(a.storePin->generation != a.storePin->writeGeneration,
+                    "reopened fiber retains its publication generation");
+            const auto publication = a.storePin->reference();
+            a.tags.push_back("after-reset");
+            batch = {controller.makeFiberSaveSnapshot(a)};
+            controller.commitFiberStoreAction(batch);
+            a = batch.front().fiber;
+            require(a.storePin->version == publication.version + 1 &&
+                    a.storePin->generation == a.storePin->writeGeneration,
+                    "reopened fiber saves in the active generation");
+            a.tags.push_back("second-save");
+            batch = {controller.makeFiberSaveSnapshot(a)};
+            controller.commitFiberStoreAction(batch);
+            a = batch.front().fiber;
+            require(a.storePin->version == publication.version + 2, "subsequent fiber saves use the new pin");
+        }
         Controller::FiberBranchRef link;
         link.controlPointIndex=0;link.branchControlPointIndex=0;link.branchFiberId=b.id;link.branchFileName=b.fileName;
         link.controlPointPosition=a.controlPoints[0];link.branchControlPointPosition=b.controlPoints[0];

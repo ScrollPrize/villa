@@ -24,11 +24,11 @@ PinnedObject SurfaceStoreEdit::pin() const
 void SurfaceStoreEdit::repin(const TransactionReceipt& receipt)
 {
     const auto version = receipt.objects.find(_uuid);
-    if (version == receipt.objects.end() || !version->second) return;
+    if (version == receipt.objects.end() || !version->second || *version->second == _pin.version) return;
     const auto committed = _session->objectsAtVersions(
         _pin.attachment, {{_pin.object.storeUuid, receipt.generation, _uuid, *version->second}});
     if (!committed.front()) throw std::runtime_error("the saved surface version cannot be read back");
-    _pin = pinOf(_pin.attachment, *committed.front());
+    _pin = pinOf(_pin.attachment, *committed.front(), receipt.generation);
 }
 
 void SurfaceStoreEdit::settlePending()
@@ -59,7 +59,7 @@ void SurfaceStoreEdit::save(QuadSurface& surface, const cv::Rect& rect, const st
     settlePending();
     const auto& points = *surface.rawPointsPtr();
     auto request = _session->newRequest(_pin.attachment);
-    request.generation = _pin.generation;
+    request.generation = _pin.writeGeneration;
     request.expectedObjects = {{_uuid, _pin.version}};
     _session->readStore(_pin.attachment, [&](const StoreReader& reader, const auto&) {
         const GeometrySnapshot snapshot(reader);

@@ -14748,6 +14748,7 @@ std::vector<LineAnnotationController::StoredFiber> LineAnnotationController::rea
     const auto volume = _state->currentVolume();
     const vc::objects::VolumeVoxels target = _state->annotationVolume().value_or(vc::project::AnnotationVolume{});
     connection->readStore(*attachment, [&](const StoreReader& reader, const auto& cancel) {
+        const auto activeGeneration = reader.status().generation;
         // Fibers bound to the open volume (by scale or a registration) are read in its voxels.
         const auto transforms = volume ? std::optional(reader.volumeTransforms()) : std::nullopt;
         auto decode = [&](const ObjectRecord& object, const ObjectRevision& head, bool withLines) {
@@ -14758,7 +14759,7 @@ std::vector<LineAnnotationController::StoredFiber> LineAnnotationController::rea
             fiber.fileName = object.name + ".json";
             fiber.generation = object.generation;
             fiber.tags = object.tags;
-            fiber.storePin = pinOf(*attachment, head);
+            fiber.storePin = pinOf(*attachment, head, activeGeneration);
             fiber.id = fiberIdForUuid(object.uuid);
             try {
                 if (!head.geometryRevision) throw std::runtime_error("Fiber has no geometry");
@@ -15139,7 +15140,7 @@ void LineAnnotationController::commitFiberStoreAction(std::vector<FiberSaveSnaps
         // The request expects each fiber at its pinned version.
         std::optional<int64_t> version;
         if (fiber.storePin && fiber.storePin->stored()) {
-            if (fiber.storePin->generation != request.generation)
+            if (fiber.storePin->writeGeneration != request.generation)
                 throw std::runtime_error("The fiber's pinned version is not in its object store's current history; reopen it");
             version = fiber.storePin->version;
         }
@@ -15390,7 +15391,7 @@ void LineAnnotationController::commitFiberStoreAction(std::vector<FiberSaveSnaps
         auto& fiber = edits[i].fiber;
         if (!saved[i]) throw std::logic_error("A saved fiber version is not in its object store");
         fiber.generation = saved[i]->record.generation;
-        fiber.storePin = pinOf(*attachment, *saved[i]);
+        fiber.storePin = pinOf(*attachment, *saved[i], receipt.generation);
         registerFiberId(fiber.uuid, fiber.id);
     }
     // Shared links also revise the other endpoint: keep its open sessions
@@ -15401,10 +15402,11 @@ void LineAnnotationController::commitFiberStoreAction(std::vector<FiberSaveSnaps
         if (std::any_of(edits.begin(), edits.end(), [&](const auto& edit) { return edit.fiber.uuid == session.fiberUuid; })) continue;
         const auto found = receipt.objects.find(session.fiberUuid);
         if (found == receipt.objects.end() || !found->second ||
-            (session.storePin->version == *found->second && session.storePin->generation == receipt.generation)) continue;
+            session.storePin->version == *found->second) continue;
         if (session.watcher) session.solveQueue.noteSessionMutated();
         session.storePin->version = *found->second;
         session.storePin->generation = receipt.generation;
+        session.storePin->writeGeneration = receipt.generation;
     }
     snapshots = std::move(edits);
 }
@@ -15505,9 +15507,10 @@ std::optional<vc::objects::PinnedObject> LineAnnotationController::fiberPin(uint
     if (uuid.empty() || !attachment) return std::nullopt;
     std::optional<vc::objects::PinnedObject> pin;
     connection->readStore(*attachment, [&](const vc::objects::StoreReader& reader, const auto&) {
+        const auto activeGeneration = reader.status().generation;
         const auto head = reader.currentObject(uuid);
         if (head && !head->record.retired)
-            pin = vc::objects::pinOf(*attachment, *head);
+            pin = vc::objects::pinOf(*attachment, *head, activeGeneration);
     });
     return pin;
 }

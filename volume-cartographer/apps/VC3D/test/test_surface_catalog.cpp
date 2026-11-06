@@ -7,6 +7,7 @@
 // volume's voxels, and record edits (tags, name, retire).
 #include "SurfaceCatalog.hpp"
 #include "vc/core/util/SurfaceArea.hpp"
+#include "vc/core/util/StoreSurfaces.hpp"
 #include "segmentation/SurfaceCorrections.hpp"
 #include "segmentation/SurfaceStoreEdit.hpp"
 #include "SessionDrafts.hpp"
@@ -54,6 +55,59 @@ void storeSurface(ObjectStoreSession& session, const AttachmentIdentity& attachm
     session.submit(attachment, request);
 }
 
+void checkHistoryGenerationSaves(const fs::path& directory)
+{
+    const auto path = directory / "generation.vcobj";
+    OpenOptions options; options.author = "generation-test";
+    auto store = ObjectStore::create(path, options);
+    auto session = std::make_shared<ObjectStoreSession>();
+    const auto attachment = session->attach(path, options);
+    cv::Mat_<cv::Vec3f> points(2, 2);
+    for (int r = 0; r < 2; ++r)
+        for (int c = 0; c < 2; ++c) points(r, c) = {float(c), float(r), 1.f};
+    QuadSurface grid(points, {1.f, 1.f});
+    grid.setChannel("review", cv::Mat_<uint8_t>(2, 2, uint8_t{1}));
+    ObjectRecord record; record.uuid = util::newUuid(); record.kind = "surface";
+    record.meta = nlohmann::json{{"coordinates", volumeCoordinates("vol", 1)}}.dump();
+    storeSurface(*session, attachment, record, quad_surface_geometry(grid));
+    auto opened = SurfaceCatalog::open(session, attachment, {"vol", 1}, record.uuid);
+    SurfaceStoreEdit stale(session, opened.pin);
+    store.startHistoryGeneration("restored backup");
+    (*opened.surface->rawPointsPtr())(0, 0)[2] = 2;
+    bool rejected = false;
+    try { stale.save(*opened.surface, {0, 0, 2, 2}, {}); }
+    catch (const TransactionConflict&) { rejected = true; }
+    require(rejected, "surface opened before reset rejects edits");
+
+    opened = SurfaceCatalog::open(session, attachment, {"vol", 1}, record.uuid);
+    require(opened.pin.generation != opened.pin.writeGeneration, "reopened surface retains its publication generation");
+    SurfaceStoreEdit current(session, opened.pin);
+    const auto publication = opened.pin.reference();
+    // An explicit unchanged channel submits a no-op transaction and exercises repinning.
+    current.save(*opened.surface, {0, 0, 2, 2}, {"review"});
+    require(current.pin().reference() == publication, "no-op save preserves the historical reference");
+    (*opened.surface->rawPointsPtr())(0, 0)[2] = 3;
+    current.save(*opened.surface, {0, 0, 2, 2}, {});
+    require(current.pin().version == publication.version + 1 &&
+            current.pin().generation == current.pin().writeGeneration, "reopened surface saves in the active generation");
+    (*opened.surface->rawPointsPtr())(0, 0)[2] = 4;
+    current.save(*opened.surface, {0, 0, 2, 2}, {});
+    require(current.pin().version == publication.version + 2, "subsequent surface saves use the new pin");
+
+    StoreSurfaces tool(path, "generation-test");
+    auto loaded = tool.load(record.uuid);
+    store.startHistoryGeneration("restored again");
+    (*loaded->rawPointsPtr())(0, 0)[2] = 5;
+    rejected = false;
+    try { tool.update(record.uuid, *loaded); }
+    catch (const TransactionConflict&) { rejected = true; }
+    require(rejected, "tool input opened before reset rejects edits");
+    loaded = tool.load(record.uuid);
+    (*loaded->rawPointsPtr())(0, 0)[2] = 6;
+    require(tool.update(record.uuid, *loaded) == publication.version + 3,
+            "reloaded tool input saves in the active generation");
+}
+
 // Optional real-data check: copy one stored surface, checkpoint a mask edit,
 // recover it in a new session, then verify that saving preserves every XYZ.
 void checkDraftRecovery(const fs::path& sourcePath, const fs::path& directory)
@@ -91,7 +145,7 @@ void checkDraftRecovery(const fs::path& sourcePath, const fs::path& directory)
             const auto head = reader.currentObject(uuid);
             session->setDraft(uuid, quad_surface_grid(*surface),
                 nlohmann::json::parse(head->record.meta).value("coordinates", nlohmann::json::object()),
-                target, pinOf(target, *head).reference());
+                target, pinOf(target, *head, reader.status().generation).reference());
         });
         require(drafts.checkpointNow(), "real mask edit checkpointed");
     }
@@ -100,7 +154,7 @@ void checkDraftRecovery(const fs::path& sourcePath, const fs::path& directory)
     require(drafts.start(checkpoint, 0) && drafts.recovered(uuid), "real mask edit recovered");
     const auto target = session->attach(path, writable);
     std::unique_ptr<QuadSurface> surface;
-    const auto pin = pinOf(target, *session->currentObject(target, uuid));
+    const auto pin = pinOf(target, *session->currentObject(target, uuid), session->status(target).generation);
     session->readStore(target, [&](const StoreReader& reader, const auto&) { surface = load_quad_from_store(reader, uuid); });
     const auto contents = session->draftContents(uuid);
     SessionDrafts::restoreSurface(*surface, contents->surface);
@@ -120,6 +174,7 @@ int main(int argc, char** argv)
     QCoreApplication app(argc, argv);
     try {
         QTemporaryDir dir;
+        checkHistoryGenerationSaves(fs::path(dir.path().toStdString()));
         if (argc > 1) checkDraftRecovery(argv[1], fs::path(dir.path().toStdString()));
         const std::filesystem::path volumeRoot1 = fs::path(dir.path().toStdString()) / "ct.zarr";
         const vcr::zarr::CreateOptions levelZero1{.shape = {4, 4, 4}, .chunks = {4, 4, 4}, .compressor = "", .overwrite = true};
@@ -504,7 +559,7 @@ int main(int argc, char** argv)
                 SessionDrafts drafts(durable);
                 require(drafts.start(draftDirectory, 0) && drafts.recoveredDrafts().empty(), "draft directory in use");
                 const auto store = durable->attach(path, options);
-                const auto pin = pinOf(store, *durable->currentObject(store, native));
+                const auto pin = pinOf(store, *durable->currentObject(store, native), durable->status(store).generation);
                 QuadSurface surface(stored, {1.f, 1.f});
                 surface.id = native;
                 const auto coordinates = vc::objects::volumeCoordinates(volume->id(), 1);

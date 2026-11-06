@@ -215,6 +215,7 @@ SurfaceCatalog::Opened SurfaceCatalog::open(const std::shared_ptr<ObjectStoreSes
     Opened opened;
     auto& current = opened.current;
     session->readStore(attachment, [&](const StoreReader& reader, const auto&) {
+        const auto activeGeneration = reader.status().generation;
         auto revision = reader.currentObject(uuid);
         if (!revision || revision->record.retired || revision->record.kind != "surface")
             throw std::runtime_error("The surface is no longer in the object store");
@@ -232,7 +233,7 @@ SurfaceCatalog::Opened SurfaceCatalog::open(const std::shared_ptr<ObjectStoreSes
                                         .viewTransformedAt(volume.volume, volume.scale);
         opened.surface = load_quad_from_store(reader, revision->objectUuid, *revision->geometryRevision, true, &view);
         opened.view = view.frame();
-        opened.pin = pinOf(attachment, *revision);
+        opened.pin = pinOf(attachment, *revision, activeGeneration);
     });
     opened.surface->setChannelLoader(store_channel_loader(session, attachment, *opened.pin.geometryRevision));
     // Past revisions are viewed; edits continue from the current one.

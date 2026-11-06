@@ -22,6 +22,7 @@ std::unique_ptr<QuadSurface> StoreSurfaces::load(const std::string& uuid, bool a
     bool identity = true;
     const auto& session = objects_.session();
     session->readStore(objects_.attachment(), [&](const vc::objects::StoreReader& reader, const auto&) {
+        const auto activeGeneration = reader.status().generation;
         const auto head = reader.currentObject(vc::objects::util::canonicalUuid(uuid));
         if (!head || !head->geometryRevision) throw std::runtime_error("not a stored surface: " + uuid);
         if (volume) {
@@ -31,7 +32,7 @@ std::unique_ptr<QuadSurface> StoreSurfaces::load(const std::string& uuid, bool a
         } else {
             surface = load_quad_from_store(reader, head->objectUuid, head->geometryRevision, applyValidity);
         }
-        pin = vc::objects::pinOf(objects_.attachment(), *head);
+        pin = vc::objects::pinOf(objects_.attachment(), *head, activeGeneration);
     });
     objects_.noteRead(*pin, volume, identity);
     surface->setChannelLoader(store_channel_loader(session, objects_.attachment(), *pin->geometryRevision));
@@ -60,7 +61,7 @@ int64_t StoreSurfaces::update(const std::string& uuid, QuadSurface& surface)
     const auto& points = *surface.rawPointsPtr();
     const auto& session = objects_.session();
     auto request = session->newRequest(objects_.attachment());
-    request.generation = pin.generation;
+    request.generation = pin.writeGeneration;
     request.expectedObjects = {{canonical, pin.version}};
     session->readStore(objects_.attachment(), [&](const vc::objects::StoreReader& reader, const auto&) {
         const auto view = vc::objects::GeometrySnapshot(reader).viewStored(canonical, pin.geometryRevision);

@@ -707,11 +707,12 @@ void FiberCollectionController::selectFiber(int64_t id, bool focusView, bool ope
         [connection=state_->objectStoreSession(),attachment=*displayedStore(),uuid,volume]() {
             SelectedFiber selected;
             connection->readStore(attachment, [&](const vc::objects::StoreReader& reader, const auto&) {
+                const auto activeGeneration = reader.status().generation;
                 const auto revision=reader.currentObject(uuid);
                 if (!revision || revision->record.retired || !revision->record.fiber)
                     throw std::runtime_error("Fiber is no longer available");
                 auto& row=selected.row;
-                selected.pin=vc::objects::pinOf(attachment,*revision);
+                selected.pin=vc::objects::pinOf(attachment,*revision,activeGeneration);
                 row.record=revision->record;
                 if (!volume.volume.empty())
                     row.mapping = reader.volumeTransforms().toVolume(Json::parse(row.record.meta), volume.volume, volume.scale);
