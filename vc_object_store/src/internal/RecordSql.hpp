@@ -26,12 +26,6 @@ std::string activeEdgeSql();
 std::pair<std::string, std::string> lifecycleBinding(sqlite3*, const EdgeRecord&);
 bool lifecycleBindingMatches(sqlite3*, const EdgeRecord&);
 void bindLifecycle(sqlite3*, const EdgeRecord&, const std::string& aEpoch, const std::string& bEpoch);
-void bindLifecycleById(sqlite3*, int64_t edgeId, const std::string& aEpoch, const std::string& bEpoch);
-struct LifecycleBinding {
-    int64_t id;
-    std::string aEpoch,bEpoch;
-};
-void bindLifecycles(sqlite3*,std::span<const LifecycleBinding>,size_t sqlBatchRows=1);
 // Shared selection semantics for records and compact graph topology.
 // Internal frame filters of a volume selection, in stored units.
 struct FrameCursor {
@@ -65,6 +59,9 @@ ObjectRecord readObjectRow(sqlite3* db, const Statement& s, bool details = true)
 std::vector<ObjectRecord> readObjectRows(sqlite3* db, Statement& rows, const ObjectFields& fields = std::nullopt);
 
 std::optional<int64_t> objectIdByUuid(sqlite3* db, const std::array<unsigned char, 16>& uuid);
+// Endpoint handles are positive for owned objects and negative for compact
+// qualified external keys. They never imply a copied object/detail record.
+std::optional<int64_t> endpointIdByUuid(sqlite3*, const std::array<unsigned char,16>&);
 
 void writeObjectDetail(sqlite3* db, int64_t id, const ObjectRecord& rec);
 void insertObjectDetail(sqlite3* db, int64_t id, const ObjectRecord& rec);

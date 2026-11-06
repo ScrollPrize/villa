@@ -18,14 +18,16 @@ void writeSqlValues(sqlite3* db,std::string_view prefix,std::string_view suffix,
     std::string pattern="(";
     for(size_t i=0;i<columns;++i) {if(i)pattern+=',';pattern+='?';}
     pattern+=')';
+    std::unique_ptr<Statement> statement;size_t previousRows=0;
     for(size_t begin=0;begin<count;) {
         const auto n=std::min(rows,count-begin);
-        std::string sql(prefix);sql+=" VALUES";
-        for(size_t i=0;i<n;++i) {if(i)sql+=',';sql+=pattern;}
-        sql+=suffix;
-        Statement statement(db,sql);
-        for(size_t i=0;i<n;++i) bind(statement,begin+i,int(i*columns));
-        statement.stepDone();begin+=n;
+        if(n!=previousRows){
+            std::string sql(prefix);sql+=" VALUES";
+            for(size_t i=0;i<n;++i) {if(i)sql+=',';sql+=pattern;}
+            sql+=suffix;statement=std::make_unique<Statement>(db,sql);previousRows=n;
+        }else statement->reset();
+        for(size_t i=0;i<n;++i) bind(*statement,begin+i,int(i*columns));
+        statement->stepDone();begin+=n;
     }
 }
 }

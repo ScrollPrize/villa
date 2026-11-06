@@ -47,7 +47,7 @@ void GeometryStage::read(sqlite3* source, sqlite3* known, const std::string& obj
         parseUuid(objectUuid), afterRow);
     while (revisions.row()) {
         auto& revision = staged.emplace_back(Revision{formatUuid(revisions.blob16(0)), revisions.text(4), values<Row>(revisions), {}});
-        const auto parsed = loadGeometryManifest(source, revision.uuid, revision.manifest, revisions.text(3));
+        const auto parsed = loadGeometryManifest(source, revision.uuid, revision.manifest, readDigest(revisions,3));
         // Published revisions/chunk references are immutable. Existing identical
         // revisions need no payload I/O; verify every chunk of incoming revisions.
         Statement present(known, "SELECT 1 FROM geometry_revisions WHERE uuid=?", revisions.blob16(0));
@@ -82,16 +82,16 @@ void GeometryStage::read(sqlite3* source, sqlite3* known, const std::string& obj
             revisions.blob16(0));
         while (chunks.row()) {
             std::vector<uint8_t> external;
-            if(chunks.isNull(3)) external=readExternalGeometryPayload(source,chunks.text(2));
+            if(chunks.isNull(3)) external=readExternalGeometryPayload(source,readDigest(chunks,2));
             const auto bytes=chunks.isNull(3) ? std::span<const uint8_t>(external) :
                 std::span(static_cast<const uint8_t*>(sqlite3_column_blob(chunks.value, 3)),
                           size_t(sqlite3_column_bytes(chunks.value, 3)));
             const auto& a=parsed.at("arrays").at(chunks.text(0));
             const auto hash=a.at("chunks").at(chunks.i64(1));
             if (bytes.size() != uint64_t(layouts.at(chunks.text(0)).chunkBytes(chunks.i64(1))) ||
-                geometryHash(bytes) != chunks.text(2) || hash != chunks.text(2))
+                geometryHash(bytes) != readDigest(chunks,2) || hash != readDigest(chunks,2))
                 throw std::runtime_error("sync: corrupt geometry chunk");
-            revision.chunks.push_back({chunks.text(0), chunks.text(2), chunks.i64(1), std::vector<uint8_t>(bytes.begin(),bytes.end())});
+            revision.chunks.push_back({chunks.text(0), readDigest(chunks,2), chunks.i64(1), std::vector<uint8_t>(bytes.begin(),bytes.end())});
         }
         if (revision.chunks.size() != expected) throw std::runtime_error("sync: missing geometry chunks");
     }
@@ -130,7 +130,7 @@ void GeometryStage::install(sqlite3* destination, const std::string& objectUuid)
         for (const auto& bytes : revision.metadata) storeSharedPayload(destination, "@metadata", bytes);
         for (const auto& chunk : revision.chunks) {
             const auto size = int(chunk.data.size());
-            Statement old(destination, "SELECT hash,data FROM geometry_chunks WHERE hash=?", chunk.hash);
+            Statement old(destination, "SELECT hash,data FROM geometry_chunks WHERE hash=?", parseDigest(chunk.hash));
             if (old.row()) {
                 if(old.isNull(1)) {
                     if(readExternalGeometryPayload(destination,chunk.hash)!=chunk.data)
@@ -138,14 +138,14 @@ void GeometryStage::install(sqlite3* destination, const std::string& objectUuid)
                 } else if (sqlite3_column_bytes(old.value, 1) != size || std::memcmp(sqlite3_column_blob(old.value, 1), chunk.data.data(), size))
                     throw std::runtime_error("sync: geometry chunk hash collision");
             } else {
-                execute(destination, "INSERT INTO geometry_chunks VALUES(?,?)", chunk.hash, std::span(chunk.data));
+                execute(destination, "INSERT INTO geometry_chunks VALUES(?,?)", parseDigest(chunk.hash), std::span(chunk.data));
             }
             Statement binding(destination, "SELECT hash FROM geometry_revision_chunks WHERE revision_uuid=? AND array_name=? AND chunk_index=?",
                 uuid, chunk.array, chunk.index);
             if (binding.row()) {
-                if (binding.text(0) != chunk.hash) throw std::runtime_error("sync: geometry chunk reference collision");
+                if (readDigest(binding,0) != chunk.hash) throw std::runtime_error("sync: geometry chunk reference collision");
             } else {
-                execute(destination, "INSERT INTO geometry_revision_chunks VALUES(?,?,?,?)", uuid, chunk.array, chunk.index, chunk.hash);
+                execute(destination, "INSERT INTO geometry_revision_chunks VALUES(?,?,?,?)", uuid, chunk.array, chunk.index, parseDigest(chunk.hash));
             }
         }
     }

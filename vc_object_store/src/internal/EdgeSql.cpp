@@ -100,9 +100,19 @@ void bindAnchor(Statement& s, int firstIdx, const Anchor& a)
 
 std::string uuidTextByObjectId(sqlite3* db, int64_t id)
 {
-    Statement s(db, "SELECT uuid FROM objects WHERE id=?", id);
+    Statement s(db, id>0 ? "SELECT uuid FROM objects WHERE id=?" : "SELECT uuid FROM external_object_keys WHERE id=?", id);
     if (!s.row()) throw std::runtime_error("object store: dangling edge endpoint id");
     return formatUuid(s.blob16(0));
+}
+
+std::optional<int64_t> endpointIdByUuid(sqlite3* db,const std::array<unsigned char,16>& uuid)
+{
+    if(auto local=objectIdByUuid(db,uuid))return local;
+    Statement s(db,"SELECT id FROM external_object_keys WHERE uuid=?",uuid);
+    if(!s.row())return {};
+    const auto id=s.i64(0);
+    if(s.row())throw std::runtime_error("object store: ambiguous endpoint identity");
+    return id;
 }
 
 EdgeRecord readEdgeRow(sqlite3* db, const Statement& s, bool details, const ObjectFields& fields)
@@ -143,7 +153,7 @@ std::vector<EdgeRecord> readEdgeRows(sqlite3* db, Statement& rows, const ObjectF
     if (result.empty()) return result;
     const auto selection = ids.dump();
     Statement endpoints(db, "SELECT e.id,a.uuid,b.uuid FROM edges e "
-        "JOIN objects a ON a.id=e.a_id JOIN objects b ON b.id=e.b_id "
+        "JOIN endpoint_keys a ON a.id=e.a_id JOIN endpoint_keys b ON b.id=e.b_id "
         "WHERE e.id IN (SELECT value FROM json_each(?))", selection);
     while (endpoints.row()) {
         auto& edge = result.at(positions.at(endpoints.i64(0)));
@@ -187,11 +197,13 @@ void requireUnusedObjectUuids(sqlite3* db,std::span<const EdgeInsertRow> rows,si
     if(!capacity)throw std::runtime_error("SQLite variable limit cannot hold a UUID");
     for(size_t begin=0;begin<rows.size();) {
         const auto count=std::min(capacity,rows.size()-begin);
-        std::string sql="SELECT 1 FROM objects WHERE uuid IN (";
-        for(size_t i=0;i<count;++i){if(i)sql+=',';sql+='?';}sql+=") LIMIT 1";
+        std::string parameters;
+        for(size_t i=0;i<count;++i){if(i)parameters+=',';parameters+='?'+std::to_string(i+1);}
+        std::string sql="SELECT 1 FROM objects WHERE uuid IN ("+parameters+") UNION ALL "
+            "SELECT 1 FROM external_object_keys WHERE uuid IN ("+parameters+") LIMIT 1";
         Statement collision(db,sql);
         for(size_t i=0;i<count;++i)collision.bind(int(i+1),parseUuid(rows[begin+i].record->uuid));
-        if(collision.row())throw std::runtime_error("object store: UUID already belongs to an object");
+        if(collision.row())throw std::runtime_error("object store: UUID already belongs to an object or endpoint key");
         begin+=count;
     }
 }
@@ -227,22 +239,6 @@ void insertEdgeRows(sqlite3* db,std::span<const EdgeInsertRow> rows,int64_t gene
     for(const auto& row:rows) insertTags(db,"edge_tags","edge_id",row.id,row.record->tags);
 }
 
-void insertEdgeGeometryBinding(sqlite3* db,int64_t id,const std::optional<std::string>& a,
-                               const std::optional<std::string>& b)
-{
-    const EdgeGeometryBinding binding{id,a,b};insertEdgeGeometryBindings(db,std::span(&binding,1));
-}
-
-void insertEdgeGeometryBindings(sqlite3* db,std::span<const EdgeGeometryBinding> rows,size_t sqlBatchRows)
-{
-    writeSqlValues(db,"INSERT INTO edge_geometry_bindings(edge_id,a_revision,b_revision)","",3,rows.size(),sqlBatchRows,
-        [&](Statement& s,size_t row,int offset){
-            s.bind(offset+1,rows[row].id);
-            if(rows[row].a) s.bind(offset+2,parseUuid(*rows[row].a));else s.bindNull(offset+2);
-            if(rows[row].b) s.bind(offset+3,parseUuid(*rows[row].b));else s.bindNull(offset+3);
-        });
-}
-
 EdgeRecord addEdgeImpl(sqlite3* db, const std::string& author, const std::string& host, const EdgeRecord& input,
                         bool preserveRecord, const char* importOperation)
 {
@@ -250,13 +246,13 @@ EdgeRecord addEdgeImpl(sqlite3* db, const std::string& author, const std::string
     Savepoint savepoint(db);
     auto rec=prepareNewEdge(input);
     const EdgeInsertRow identity{&rec,0,0,0};requireUnusedObjectUuids(db,std::span(&identity,1));
-    auto aId=objectIdByUuid(db,parseUuid(rec.aUuid)),bId=objectIdByUuid(db,parseUuid(rec.bUuid));
+    auto aId=endpointIdByUuid(db,parseUuid(rec.aUuid)),bId=endpointIdByUuid(db,parseUuid(rec.bUuid));
     if(!aId) throw std::runtime_error("object store: edge endpoint not found: "+rec.aUuid);
     if(!bId) throw std::runtime_error("object store: edge endpoint not found: "+rec.bUuid);
+    if(!lifecycleBindingMatches(db,rec)) throw std::runtime_error("relationship endpoints must be active");
     if(*aId>*bId) {std::swap(aId,bId);swapEndpoints(rec);}
     const auto id=allocateRecordId(db,"edges");
     insertEdgeRow(db,rec,id,*aId,*bId,writeGeneration(db),author,host,nowIsoUtc(),preserveRecord);
-    insertEdgeGeometryBinding(db,id,geometryHead(db,rec.aUuid),geometryHead(db,rec.bUuid));
     if (preserveRecord) restoreCommon(db, "edges", rec);
     appendJournal(db, author, host, parseUuid(rec.uuid), preserveRecord ? rec.generation : writeGeneration(db), preserveRecord ? importOperation : "add_edge");
     savepoint.release();

@@ -115,7 +115,7 @@ void writeBounds(sqlite3* db, int64_t objectId, const std::optional<Bounds>& bou
     Statement put(db, "INSERT INTO object_bounds VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(object_id) DO UPDATE SET "
         "revision_uuid=excluded.revision_uuid,min_x=excluded.min_x,min_y=excluded.min_y,min_z=excluded.min_z,"
         "max_x=excluded.max_x,max_y=excluded.max_y,max_z=excluded.max_z", objectId);
-    if (revision) put.bind(2, parseUuid(*revision)); else put.bindNull(2);
+    if (revision) bindGeometryToken(put,2,*revision); else put.bindNull(2);
     for (size_t i = 0; i < 6; ++i) put.bind(int(i) + 3, (*bounds)[i]);
     put.stepDone();
 }
@@ -292,7 +292,7 @@ void refreshGeometryBounds(sqlite3* db, const std::string& objectUuid)
     Statement head(db, "SELECT o.id,h.revision_uuid FROM objects o JOIN geometry_heads h ON h.object_uuid=o.uuid WHERE o.uuid=?",
         parseUuid(objectUuid));
     if (!head.row()) return;
-    const auto revision = formatUuid(head.blob16(1));
+    const auto revision = readGeometryTokenColumn(head,1);
     refreshSurfaceArea(db, head.i64(0), revision);
     if (!spatialEnabled(db)) return;
     GeometryReader reader(db, revision);
@@ -501,11 +501,11 @@ void createSpatialSchema(sqlite3* db)
     // Exact double bounds remain authoritative. SQLite's float R-tree is only
     // the broad phase. Saturation preserves ordering for very large doubles;
     // queries apply the same saturation and then recheck exact double bounds.
-    const std::string geometryTable = historyEnabled(db) ? "geometry_revisions" : "current_geometry";
+    const std::string geometryReference = historyEnabled(db) ? " REFERENCES geometry_revisions(uuid) DEFERRABLE INITIALLY DEFERRED" : "";
     exec(db, (R"SQL(
 CREATE TABLE object_bounds(
   object_id INTEGER PRIMARY KEY REFERENCES objects(id) ON DELETE CASCADE,
-  revision_uuid BLOB REFERENCES )SQL" + geometryTable + R"SQL((uuid) DEFERRABLE INITIALLY DEFERRED,
+  revision_uuid BLOB)SQL" + geometryReference + R"SQL(,
   min_x REAL NOT NULL,min_y REAL NOT NULL,min_z REAL NOT NULL,
   max_x REAL NOT NULL,max_y REAL NOT NULL,max_z REAL NOT NULL
 );

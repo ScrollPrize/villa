@@ -196,13 +196,12 @@ void leanDependencies(HistoryMode history)
         return pins;
     };
     const auto write=[&]{return history==HistoryMode::On ? store.write(checked()) : store.write();};
-    mustFail([&]{auto txn=write();store.retireObject(txn,a);txn.commit();});
-    {auto txn=write();store.retireObject(txn,a);store.retainRelationship(txn,anchored);store.retainRelationship(txn,empty);txn.commit();}
+    {auto txn=write();store.retireObject(txn,a);txn.commit();}
     {auto txn=store.read();const auto full=objectToJson(*store.objectByUuid(txn,a));
      require(currentDependencyMetadata(ObjectStoreImplAccess::conn(txn),a,Anchor{})==dependencyMetadata(full,Anchor{}),"retired state and lifecycle epoch retained even without metadata keys");}
-    mustFail([&]{auto txn=write();store.restoreObject(txn,a);txn.commit();});
-    {auto txn=write();store.restoreObject(txn,a);store.retainRelationship(txn,anchored);store.retainRelationship(txn,empty);txn.commit();}
-    {auto txn=store.read();require(currentRelationshipApplicable(store,txn,anchored) && currentRelationshipApplicable(store,txn,empty),"explicit revalidation restores both metadata and lifecycle bindings");}
+    {auto txn=write();store.restoreObject(txn,a);txn.commit();}
+    {auto txn=store.read();require(!store.edgeByUuid(txn,anchored)&&!store.edgeByUuid(txn,empty),
+        "restoring an endpoint never revives retired current relationships");}
 }
 }
 

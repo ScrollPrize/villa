@@ -13,13 +13,14 @@ int main()
     TemporaryDirectory dir;
     OpenOptions options;options.author="initial-test";options.history=HistoryMode::Off;options.spatialIndex=false;
     const auto basePath=dir.path/"base.vcobj";
-    ObjectKey a,b,c;
+    ObjectKey a,b,c,d;
     {
         auto base=ObjectStore::create(basePath,options);auto w=base.write();
         ObjectRecord fiber;fiber.kind="fiber";fiber.fiber.emplace();fiber.meta=R"({"label":"A"})";
         a={base.uuid(w),base.upsertObject(w,fiber)};
         fiber.uuid.clear();fiber.meta=R"({"label":"B"})";b={a.storeUuid,base.upsertObject(w,fiber)};
         fiber.uuid.clear();c={a.storeUuid,base.upsertObject(w,fiber)};
+        fiber.uuid.clear();d={a.storeUuid,base.upsertObject(w,fiber)};
         vc::geometry::Fiber shape;shape.linePoints={{0,1,2},{3,4,5},{6,7,8}};
         base.putGeometry(w,a.objectUuid,vc::geometry::encode(shape));
         base.retireObject(w,c.objectUuid);
@@ -79,9 +80,15 @@ int main()
     {
         // The direct comparison CHECK has the same SQL affinity/NULL domain
         // as IN, without constructing a temporary B-tree for every proxy row.
+        {
+            auto collection=ObjectCollection::open(dir.path/"bulk-deferred.vcobj",options);
+            auto edit=collection.write();collection.setMeta(edit,d,"unrelated","true");edit.commit();
+        }
         auto rawOptions=options;rawOptions.physicalPartitionOnly=true;
         auto store=ObjectStore::open(dir.path/"bulk-deferred.vcobj",rawOptions);
         auto w=store.write();auto* db=ObjectStoreImplAccess::conn(w);
+        {detail::Statement count(db,"SELECT count(*) FROM collection_refs WHERE state='override'");
+         require(count.row()&&count.i64(0)==1,"CHECK parity fixture needs one actual override row");}
         detail::exec(db,"CREATE TEMP TABLE old_state(value TEXT NOT NULL CHECK(value IN ('reference','override','deleted')))");
         for(const auto* value:{"'reference'","'override'","'deleted'","NULL","0","''","'Reference'","'reference '","X'7265666572656e6365'","'reference'||char(0)"}){
             detail::Savepoint rollback(db);
@@ -99,19 +106,30 @@ int main()
         auto indexed=inputs.front();indexed.a=a;indexed.b=b;
         indexed.record.aAnchor.wholeGeometry=false;
         indexed.record.aAnchor.points.push_back({"line_points",{1}});
-        auto late=inputs.back();late.a=a;late.b=c;
+        auto rejected=inputs.back();rejected.a=a;rejected.b=c;bool supplied=false;
+        mustFail([&]{store.importInitialEdges(w,[&](auto& batch){
+            if(supplied)return false;supplied=true;batch.push_back(rejected);return true;
+        },{true,1});});
+        require(store.edgesByKind(w,"perpendicular").empty(),"retired endpoint rejects stream without partial rows");
+        auto late=inputs.back();late.a=a;late.b=d;
         store.importInitialEdges(w,[&](auto& batch){
             if(next==2)return false;batch.push_back(next++?late:indexed);return true;
         },{true,1});
         mustFail([&]{store.importInitialObjects(w,{});});
         w.commit();
-        auto r=store.read();require(store.object(r,c)->record.retired,"late endpoint lifecycle preserved");
+        auto r=store.read();require(store.object(r,c)->record.retired,"readonly retired endpoint remains retired");
+        require(!store.object(r,d)->record.retired,"late active endpoint remains active");
         require(store.readGeometryArray(r,a,"line_points").size()==9*sizeof(double),"indexed inherited geometry readable");
         auto raw=ObjectStore::open(dir.path/"late-endpoint.vcobj",OpenOptions{.physicalPartitionOnly=true,.readOnly=true});
         auto rt=raw.read();
-        detail::Statement bindings(ObjectStoreImplAccess::conn(rt),
-            "SELECT count(*) FROM edge_geometry_bindings WHERE a_revision IS NOT NULL OR b_revision IS NOT NULL");
-        require(bindings.row()&&bindings.i64(0)>0,"initial indexed anchors retain native bindings");
+        const auto actual=store.edge(r,{store.uuid(r),indexed.record.uuid});
+        require(actual&&((actual->a==a&&actual->b==b)||(actual->a==b&&actual->b==a)),"initial indexed edge retains qualified endpoint keys");
+        require(store.currentGeometry(r,a).has_value(),"indexed geometry resolves through the collection");
+        detail::Statement counts(ObjectStoreImplAccess::conn(rt),"SELECT (SELECT count(*) FROM objects),"
+            "(SELECT count(*) FROM fibers),(SELECT count(*) FROM current_geometry),(SELECT count(*) FROM geometry_chunks),"
+            "(SELECT count(*) FROM collection_refs)");
+        require(counts.row()&&counts.i64(0)==0&&counts.i64(1)==0&&counts.i64(2)==0&&counts.i64(3)==0&&counts.i64(4)==0,
+            "indexed initial references must not materialize endpoint records or geometry");
     }
     const auto packedPath=dir.path/"packed.vcobj";
     PackedStoreOptions packedOptions;packedOptions.disposableBulk=true;packedOptions.memoryFirst=true;

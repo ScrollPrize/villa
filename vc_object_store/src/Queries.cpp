@@ -3,6 +3,7 @@
 #include "internal/CoordinateFilter.hpp"
 #include "internal/VolumeFrames.hpp"
 #include "internal/TransformedLength.hpp"
+#include "geometry/GeometryToken.hpp"
 
 namespace vc::objects {
 using namespace detail;
@@ -206,7 +207,7 @@ std::vector<VolumeRow> registeredVolumeSelection(sqlite3* db,const ObjectSelecti
             if(byLength||selection.minLength) {
                 Statement head(db,"SELECT revision_uuid FROM geometry_heads WHERE object_uuid=?",parseUuid(row.uuid));
                 if(!head.row())continue;
-                row.volume=transformedLength(db,formatUuid(head.blob16(0)),frame.mapping,*selection.kind);
+                row.volume=transformedLength(db,readGeometryTokenColumn(head,0),frame.mapping,*selection.kind);
                 if(selection.minLength&&row.volume<*selection.minLength)continue;
             }
             if(selection.afterUuid) {

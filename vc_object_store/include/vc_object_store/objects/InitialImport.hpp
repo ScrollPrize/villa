@@ -30,7 +30,8 @@ struct InitialImportResult {
 
 // Available only during the producer callback, on its assigned worker thread.
 // No mutable store/transaction handle is exposed. Objects precede relations;
-// relations may refer to this shard's objects or sealed dependency stores.
+// The one-phase form allows this shard's objects and sealed dependencies;
+// the phased form additionally allows objects in sibling shards.
 class InitialShardImport {
 public:
     ~InitialShardImport();
@@ -45,6 +46,9 @@ private:
     explicit InitialShardImport(std::unique_ptr<Impl>);
     friend InitialImportResult importInitialCollection(const std::filesystem::path&,
         const InitialImportOptions&,const std::function<void(size_t,InitialShardImport&)>&);
+    friend InitialImportResult importInitialCollection(const std::filesystem::path&,
+        const InitialImportOptions&,const std::function<void(size_t,InitialShardImport&)>&,
+        const std::function<void(size_t,InitialShardImport&)>&);
 };
 
 // Constructs, seals and atomically publishes one new collection. The API owns
@@ -56,9 +60,20 @@ private:
 // Dependencies must already be sealed; sibling shards are not mutable links.
 // A fresh logical UUID is allocated for every import; creationStoreUuid must be
 // unset. Producers must supply globally unique object and edge UUIDs across all
-// shards. Native uniqueness is enforced per shard, not by a global registry.
+// shards. Native uniqueness is enforced per shard; the phased form additionally
+// rejects duplicate object identities while merging its endpoint directory.
 InitialImportResult importInitialCollection(const std::filesystem::path& destination,
     const InitialImportOptions&,
     const std::function<void(size_t,InitialShardImport&)>& producer);
+
+// Phased form: all workers finish their object producer before any edge
+// producer starts. Edges can then address any accepted object in this import,
+// including sibling shards, without opening another worker's SQLite connection.
+// Object producers may only append objects; edge producers may only import
+// edges. Failure in either phase cancels peers and prevents publication.
+InitialImportResult importInitialCollection(const std::filesystem::path& destination,
+    const InitialImportOptions&,
+    const std::function<void(size_t,InitialShardImport&)>& objectProducer,
+    const std::function<void(size_t,InitialShardImport&)>& edgeProducer);
 
 } // namespace vc::objects

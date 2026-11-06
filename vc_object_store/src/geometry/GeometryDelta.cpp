@@ -30,7 +30,7 @@ nlohmann::json loadGeometryManifest(sqlite3* db, const std::string& revision,
     auto manifest = nlohmann::json::parse(text);
     if (!manifest.contains("delta")) return verifiedGeometryManifest(text, contentHash);
     Statement checksum(db, "SELECT manifest_hash FROM geometry_deltas WHERE revision_uuid=?", parseUuid(revision));
-    if (!checksum.row() || hashText(text) != checksum.text(0) ||
+    if (!checksum.row() || hashText(text) != readDigest(checksum,0) ||
         manifest.at("delta").at("version") != 1 || manifest.at("delta").at("result_hash") != contentHash)
         throw std::runtime_error("geometry delta: corrupt or unsupported revision manifest");
     return manifest;
@@ -163,7 +163,7 @@ void clearGeometryMaterialization(sqlite3* db, const std::string& object) {
 void materializeGeometry(sqlite3* db, const std::string& object, const std::string& revision) {
     Statement row(db, "SELECT manifest,content_hash FROM geometry_revisions WHERE uuid=?", parseUuid(revision));
     if (!row.row()) throw std::runtime_error("geometry: missing revision");
-    const auto descriptor = loadGeometryManifest(db, revision, row.text(0), row.text(1));
+    const auto descriptor = loadGeometryManifest(db, revision, row.text(0), readDigest(row,1));
     clearGeometryMaterialization(db, object);
     if (!descriptor.contains("delta")) return;
     GeometryReader reader(db, revision, false);
@@ -175,7 +175,7 @@ void materializeGeometry(sqlite3* db, const std::string& object, const std::stri
             const std::string hash = a.at("chunks").at(index);
             if (hash == base.manifest().at("arrays").at(name).at("chunks").at(index).get<std::string>()) continue;
             auto bytes = reader.chunk(name, index);
-            insert.run(parseUuid(object), name, index, hash, bytes);
+            insert.run(parseUuid(object), name, index, parseDigest(hash), bytes);
         }
     execute(db, "INSERT INTO geometry_materializations VALUES(?,?,?)", parseUuid(object), parseUuid(revision),
         manifest.dump());

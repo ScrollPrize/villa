@@ -13,6 +13,11 @@ using Json=nlohmann::json;
 
 int main() try
 {
+    const std::string emptyDigest="e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+    require(formatDigest(geometryDigest({}))==emptyDigest,"binary SHA-256 preserves digest bytes");
+    require(formatDigest(parseDigest(emptyDigest))==emptyDigest,"digest hex boundary round trips");
+    mustFail([&]{parseDigest(std::string(64,'z'));});
+    mustFail([&]{parseDigest("00");});
     TemporaryDirectory temp;
     OpenOptions options;options.author="initial-geometry-test";options.history=HistoryMode::Off;options.spatialIndex=false;
     auto scalar=ObjectStore::create(temp.path/"scalar.vcobj",options);
@@ -49,6 +54,13 @@ int main() try
     }
     {
         auto a=scalar.read(),b=initial.read();
+        for(const auto* txn:{&a,&b}) {
+            auto* db=ObjectStoreImplAccess::conn(*txn);
+            Statement chunks(db,"SELECT count(*) FROM geometry_chunks WHERE typeof(hash)!='blob' OR length(hash)!=32");
+            chunks.row();require(chunks.i64(0)==0,"geometry payload identities must be binary SHA-256");
+            Statement descriptors(db,"SELECT count(*) FROM current_geometry WHERE typeof(content_hash)!='blob' OR length(content_hash)!=32");
+            descriptors.row();require(descriptors.i64(0)==0,"geometry descriptor identities must be binary SHA-256");
+        }
         for(const auto& entry:records){
             const auto expected=scalar.objectByUuid(a,entry.record.uuid),actual=initial.objectByUuid(b,entry.record.uuid);
             require(expected&&actual,"initial geometry object missing");
@@ -86,7 +98,8 @@ int main() try
         auto corrupt=ObjectStore::create(temp.path/"corrupt.vcobj",options);auto txn=corrupt.write();
         auto* db=ObjectStoreImplAccess::conn(txn);
         const auto hash=geometryHash(line.bytes);std::vector<uint8_t> wrong(line.bytes.size(),17);
-        execute(db,"INSERT INTO geometry_chunks(hash,data) VALUES(?,?)",hash,wrong);
+        mustFail([&]{execute(db,"INSERT INTO geometry_chunks(hash,data) VALUES(?,?)",hash,wrong);});
+        execute(db,"INSERT INTO geometry_chunks(hash,data) VALUES(?,?)",parseDigest(hash),wrong);
         mustFail([&]{Savepoint save(db);insertInitialObjects(corrupt,txn,std::span(&fiber,1));save.release();});
         require(!corrupt.objectByUuid(txn,fiber.record.uuid),"colliding payload left a partially imported object");
     }

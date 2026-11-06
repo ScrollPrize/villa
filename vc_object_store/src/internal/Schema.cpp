@@ -1,12 +1,25 @@
 #include "internal/Schema.hpp"
 #include "internal/Spatial.hpp"
 namespace vc::objects::detail {
+void createEndpointSchema(sqlite3* db)
+{
+    exec(db,R"SQL(
+CREATE TABLE external_object_keys(
+ id INTEGER PRIMARY KEY CHECK(id<0),
+ uuid BLOB NOT NULL UNIQUE CHECK(length(uuid)=16),
+ owner_uuid BLOB NOT NULL CHECK(length(owner_uuid)=16),
+ object_uuid BLOB NOT NULL CHECK(length(object_uuid)=16),
+ UNIQUE(owner_uuid,object_uuid)
+);
+CREATE VIEW endpoint_keys AS SELECT id,uuid FROM objects UNION ALL SELECT id,uuid FROM external_object_keys;
+)SQL");
+}
 void createGeometryChunkTable(sqlite3* db, const std::string& name)
 {
     std::string quoted="\"";
     for(char c:name) { quoted+=c; if(c=='\"') quoted+='\"'; }
     quoted+='\"';
-    exec(db,("CREATE TABLE "+quoted+"(hash TEXT PRIMARY KEY CHECK(length(hash)=64),"
+    exec(db,("CREATE TABLE "+quoted+"(hash BLOB PRIMARY KEY CHECK(typeof(hash)='blob' AND length(hash)=32),"
         "data BLOB CHECK(data IS NULL OR (length(data)>0 AND length(data)<=1048576)))").c_str());
 }
 void createGeometryChunkGuards(sqlite3* db)
@@ -24,7 +37,8 @@ void createEdgeIdentityIndex(sqlite3* db)
     exec(db,"DROP INDEX IF EXISTS edges_unique;"
         "CREATE UNIQUE INDEX edges_unique ON edges(kind,a_id,b_id,a_dependencies,b_dependencies,relation_key);");
 }
-void createSchema(sqlite3* db, bool history, const std::optional<std::string>& storeUuid) {
+void createSchema(sqlite3* db, bool history, const std::optional<std::string>& storeUuid, bool immutable) {
+    exec(db,"INSERT INTO store_required_features VALUES('current-state-v1'),('binary-sha256-v1'),('endpoint-keys-v1');");
     exec(db, R"SQL(CREATE TABLE objects(
   id INTEGER PRIMARY KEY,
   uuid BLOB NOT NULL UNIQUE,
@@ -44,9 +58,7 @@ void createSchema(sqlite3* db, bool history, const std::optional<std::string>& s
   coordinate_volume GENERATED ALWAYS AS (json_extract(meta,'$.coordinates.volume_uuid')) VIRTUAL,
   coordinate_scale GENERATED ALWAYS AS (json_extract(meta,'$.coordinates.scale_factor')) VIRTUAL
 );
-CREATE INDEX objects_kind ON objects(kind);
 CREATE INDEX objects_coordinates ON objects(kind,coordinate_volume,coordinate_scale);
-CREATE INDEX objects_approval ON objects(approval_state);
 CREATE TABLE fibers(
   object_id INTEGER PRIMARY KEY REFERENCES objects(id) ON DELETE CASCADE,
   family TEXT NOT NULL DEFAULT '', manual_family INTEGER NOT NULL DEFAULT 0,
@@ -74,6 +86,7 @@ CREATE TABLE object_tags(
 );
 CREATE INDEX object_tags_tag ON object_tags(tag);
 )SQL");
+    createEndpointSchema(db);
     if (history) exec(db, R"SQL(CREATE TABLE journal(
   seq INTEGER PRIMARY KEY AUTOINCREMENT,
   record_uuid BLOB NOT NULL, record_kind TEXT NOT NULL, generation INTEGER NOT NULL,
@@ -86,8 +99,8 @@ CREATE INDEX journal_record ON journal(record_uuid, seq);
     exec(db, R"SQL(CREATE TABLE edges(
   id INTEGER PRIMARY KEY,
   uuid BLOB NOT NULL UNIQUE,
-  a_id INTEGER NOT NULL REFERENCES objects(id) ON DELETE RESTRICT,
-  b_id INTEGER NOT NULL REFERENCES objects(id) ON DELETE RESTRICT,
+  a_id INTEGER NOT NULL,
+  b_id INTEGER NOT NULL,
   kind TEXT NOT NULL CHECK(length(kind)>0),
   generation INTEGER NOT NULL DEFAULT 1,
   created_by TEXT NOT NULL, created_at TEXT NOT NULL, created_host TEXT NOT NULL,
@@ -112,6 +125,11 @@ CREATE TABLE edge_tags(
 );
 CREATE INDEX edge_tags_tag ON edge_tags(tag);
 
+)SQL");
+    // Query accelerators for the interactive editor, not format requirements.
+    // Sealed initial datasets keep only identity/adjacency/coordinate indexes.
+    if(!immutable)exec(db,R"SQL(
+CREATE INDEX objects_approval ON objects(approval_state);
 CREATE INDEX edges_kind_approval_uuid ON edges(kind,approval_state,uuid);
 CREATE INDEX edges_kind_uuid ON edges(kind,uuid);
 CREATE INDEX edges_kind_id ON edges(kind,id);
@@ -119,21 +137,15 @@ CREATE INDEX fibers_family_length ON fibers(family,length DESC,object_id);
 CREATE INDEX fibers_length ON fibers(length DESC,object_id);
 CREATE INDEX tracks_family_length ON tracks(family,length DESC,object_id);
 CREATE INDEX tracks_length ON tracks(length DESC,object_id);
-
-CREATE TABLE edge_geometry_bindings(
-  edge_id INTEGER PRIMARY KEY REFERENCES edges(id) ON DELETE CASCADE,
-  a_revision BLOB, b_revision BLOB
-);
-
 )SQL");
     createGeometryChunkTable(db);
-    createGeometryChunkGuards(db);
+    if(!immutable)createGeometryChunkGuards(db);
     createEdgeIdentityIndex(db);
     if (history) exec(db, R"SQL(CREATE TABLE geometry_revisions(
   uuid BLOB PRIMARY KEY CHECK(length(uuid)=16),
   object_uuid BLOB NOT NULL REFERENCES objects(uuid) ON DELETE RESTRICT,
   parent_uuid BLOB,
-  content_hash TEXT NOT NULL CHECK(length(content_hash)=64),
+  content_hash BLOB NOT NULL CHECK(typeof(content_hash)='blob' AND length(content_hash)=32),
   manifest TEXT NOT NULL CHECK(json_valid(manifest) AND json_type(manifest)='object'),
   object_generation INTEGER NOT NULL,
   created_by TEXT NOT NULL, created_at TEXT NOT NULL, created_host TEXT NOT NULL,
@@ -149,7 +161,7 @@ CREATE TABLE geometry_heads(
 CREATE TABLE geometry_revision_chunks(
   revision_uuid BLOB NOT NULL REFERENCES geometry_revisions(uuid),
   array_name TEXT NOT NULL, chunk_index INTEGER NOT NULL CHECK(chunk_index>=0),
-  hash TEXT NOT NULL REFERENCES geometry_chunks(hash),
+  hash BLOB NOT NULL REFERENCES geometry_chunks(hash),
   PRIMARY KEY(revision_uuid,array_name,chunk_index)
 );
 CREATE TRIGGER geometry_chunks_immutable_update BEFORE UPDATE ON geometry_chunks
@@ -168,7 +180,7 @@ CREATE TRIGGER geometry_revision_chunks_immutable_delete BEFORE DELETE ON geomet
 CREATE TABLE geometry_deltas(
   revision_uuid BLOB PRIMARY KEY REFERENCES geometry_revisions(uuid),
   data BLOB NOT NULL,
-  manifest_hash TEXT NOT NULL CHECK(length(manifest_hash)=64)
+  manifest_hash BLOB NOT NULL CHECK(typeof(manifest_hash)='blob' AND length(manifest_hash)=32)
 );
 CREATE TRIGGER geometry_deltas_immutable_update BEFORE UPDATE ON geometry_deltas
   BEGIN SELECT RAISE(ABORT,'geometry deltas are immutable'); END;
@@ -182,7 +194,7 @@ CREATE TABLE geometry_materializations(
 CREATE TABLE geometry_current_chunks(
   object_uuid BLOB NOT NULL REFERENCES objects(uuid),
   array_name TEXT NOT NULL, chunk_index INTEGER NOT NULL,
-  hash TEXT NOT NULL, data BLOB NOT NULL,
+  hash BLOB NOT NULL, data BLOB NOT NULL,
   PRIMARY KEY(object_uuid,array_name,chunk_index)
 );
 

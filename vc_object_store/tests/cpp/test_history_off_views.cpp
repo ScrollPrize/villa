@@ -2,6 +2,7 @@
 #include "vc_object_store/objects/ObjectStoreSession.hpp"
 #include "vc_object_store/objects/VolumeTransforms.hpp"
 #include "vc_object_store/store/GeometryViews.hpp"
+#include "vc_object_store/geometry/ArrayBytes.hpp"
 #include <iostream>
 
 using namespace vc::objects;
@@ -38,6 +39,21 @@ int main() try
         }
         auto current=store.read();
         mustFail([&]{shown.validateForWrite(store,current);});
+    }
+    {
+        auto txn=store.write();
+        const auto change=[](double value){return GeometryArrayEdit{"line_points",3,detail::scalarBytes<double>(std::array<double,1>{value})};};
+        const auto token=store.editGeometry(txn,fiber,{change(21)},store.currentGeometry(txn,fiber)->uuid);
+        GeometrySnapshot borrowed(store,txn);
+        const auto previous=borrowed.fiber(fiber);
+        require(previous.load().linePoints.back()[0]==21,"writer view reads current geometry");
+        require(store.geometryLengthInVolume(txn,fiber,"b")==42,"writer transformed length before replacement");
+        require(store.editGeometry(txn,fiber,{change(22)},token)==token,
+                "current geometry identity is object plus commit generation");
+        mustFail([&]{previous.load();});
+        require(borrowed.fiber(fiber).load().linePoints.back()[0]==22,"new writer view sees replacement at same generation");
+        require(store.geometryLengthInVolume(txn,fiber,"b")==44,"writer transformed length does not cache same-token old geometry");
+        // Roll back to preserve the fixture used by the session checks below.
     }
     ObjectStoreSession session;
     const auto attached=session.attach(path,options);

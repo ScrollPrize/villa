@@ -2,7 +2,7 @@
 #include "vc_object_store/objects/ObjectStore.hpp"
 
 namespace vc::objects {
-namespace detail { struct CollectionReadContext; }
+namespace detail { struct CollectionReadContext; struct InitialCollectionAccess; }
 // Namespace-qualified logical identities. Local SQL row IDs are deliberately
 // not treated as globally unique across independently created stores.
 struct ObjectKey {
@@ -121,6 +121,7 @@ public:
 private:
     friend class CollectionTxn;
     friend struct detail::CollectionReadContext;
+    friend struct detail::InitialCollectionAccess;
     struct Impl;
     explicit ObjectCollection(std::unique_ptr<Impl>);
     std::unique_ptr<Impl> impl_;

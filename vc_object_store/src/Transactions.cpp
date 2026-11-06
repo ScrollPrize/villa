@@ -2,6 +2,7 @@
 #include "internal/History.hpp"
 #include "imports/SourceIdentityIndex.hpp"
 #include "hub/HubRules.hpp"
+#include "internal/ExternalEndpoint.hpp"
 
 namespace vc::objects {
 using namespace detail;
@@ -38,6 +39,10 @@ void Txn::release(bool commit)
         if (const auto pool = activeStatementPools.find(conn); pool != activeStatementPools.end()) {
             pool->second->externalGeometryChunk = {};
             pool->second->externalGeometryChunkSize = {};
+            pool->second->externalEndpointRecord = {};
+            pool->second->externalEndpointVersion = {};
+            pool->second->externalEndpointValidateAnchor = {};
+            pool->second->promotedEndpointUuid.clear();
         }
         activeStatementPools.erase(conn);
         if (write_) db_->impl_->writerMutex.unlock();
@@ -49,9 +54,12 @@ void Txn::release(bool commit)
                 registerStorageTables(conn);
                 exec(conn, "UPDATE store_write_state SET dirty=1 WHERE singleton=1;");
             }
-            refreshSourceIdentityIndex(conn);
-            if (historyEnabled(conn)) publishHistory(conn);
-            else validateCurrentRelationships(conn);
+            const bool immutable=activeStatementPools.at(conn)->immutableInitial;
+            if(!immutable) {
+                refreshSourceIdentityIndex(conn);
+                if (historyEnabled(conn)) publishHistory(conn);
+                else validateCurrentRelationships(conn);
+            } else {refreshSourceIdentityIndex(conn);exec(conn,"UPDATE store_write_state SET dirty=1 WHERE singleton=1;");}
             exec(conn, "UPDATE store_manifest SET generation=generation+1 WHERE singleton=1 AND "
                        "(SELECT dirty FROM store_write_state WHERE singleton=1)=1;"
                        "UPDATE store_write_state SET dirty=0 WHERE singleton=1 AND dirty=1;");
@@ -59,7 +67,8 @@ void Txn::release(bool commit)
             for (const auto& [uuid, expected] : expectedRevisions_) {
                 Statement head(conn, "SELECT revision_uuid FROM object_heads WHERE object_uuid=?",
                                formatUuid(parseUuid(uuid)));
-                committedRevisions_[uuid] = head.row() ? std::optional(head.text(0)) : std::nullopt;
+                if(head.row())committedRevisions_[uuid]=head.text(0);
+                else committedRevisions_[uuid]=externalEndpointKey(conn,uuid)?std::optional(externalEndpointVersion(conn,uuid)):std::nullopt;
             }
         }
         exec(conn, commit ? "COMMIT;" : "ROLLBACK;");
@@ -117,6 +126,7 @@ WriteTxn ObjectStore::write()
         if (!manifest.row() || manifest.i64(0)) throw std::runtime_error("object store: store is sealed");
         if (manifest.i64(1) == INT64_MAX) throw std::runtime_error("object store: generation exhausted");
         impl_->statementPools.at(impl_->writer)->historyEnabled = manifest.i64(2) != 0;
+        beginCurrentWrite(impl_->writer);
         if (impl_->hubRole != HubRole::None) beginHubWrite(impl_->writer, *impl_->statementPools.at(impl_->writer));
     }
     catch (...) { sqlite3_exec(impl_->writer, "ROLLBACK;", nullptr, nullptr, nullptr); activeStatementPools.erase(impl_->writer); throw; }
@@ -138,6 +148,7 @@ void ObjectStore::checkpoint()
     if (!impl_->writer)
         throw std::runtime_error("object store: checkpoint on read-only handle");
     std::lock_guard<std::mutex> lock(impl_->writerMutex);
+    if(impl_->immutableInitial)return; // journal-off private build; publication owns persistence
     // Bulk-import callers checkpoint after publication. Maintain planner
     // statistics here, outside their atomic write transaction.
     exec(impl_->writer, "PRAGMA optimize;");

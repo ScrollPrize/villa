@@ -80,17 +80,23 @@ try {
         const auto at = db.relationshipsAt(txn, selected);
         require(at.size() == 1 && at[0].applicable, "applicable at the pinned revisions");
     }
-    { auto txn = db.write(heads()); db.retainRelationship(txn, edge); txn.commit(); }
-    require(component(a, std::nullopt, true) == std::vector<std::string>{a, b}, "retained: applicable again");
+    { auto txn = db.write(heads());
+      mustFail([&]{db.retainRelationship(txn, edge);});
+      EdgeRecord replacement;replacement.kind="fiber_branch";replacement.aUuid=a;replacement.bUuid=b;
+      replacement.aAnchor.points=replacement.bAnchor.points={{"points",{0}}};
+      replacement.aAnchor.metadataKeys=replacement.bAnchor.metadataKeys={"coordinates"};
+      edge=db.addEdge(txn,replacement);txn.commit(); }
+    require(component(a, std::nullopt, true) == std::vector<std::string>{a, b}, "explicitly recreated: applicable again");
     for (const bool retire : {true, false}) {
         auto txn = db.write(heads());
-        if (retire) { db.retireObject(txn, a); db.keepRecordedRelationship(txn, edge); }
-        else { db.restoreObject(txn, a); db.keepRecordedRelationshipsOf(txn, a); }
+        if (retire) db.retireObject(txn, a);
+        else db.restoreObject(txn, a);
         txn.commit();
         auto read = db.read();
         require(db.currentGeometry(read, a)->uuid == second, "lifecycle keeps the geometry");
         require(db.componentOf(read, b, {}, nullptr, false, std::nullopt, true) == std::vector<std::string>{b},
-                "a lifecycle change needs revalidation");
+                "retirement removes current relations and restoration does not revive them");
+        require(!db.edgeByUuid(read,edge),"retired relationship is absent from current graph");
     }
     auto txn = db.read();
     require(!db.objectByUuid(txn, a)->retired, "restored");

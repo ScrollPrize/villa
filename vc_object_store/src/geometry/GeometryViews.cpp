@@ -1,6 +1,8 @@
 #include "vc_object_store/store/GeometryViews.hpp"
 #include "vc_object_store/geometry/ArrayBytes.hpp"
 #include "geometry/ArrayLayout.hpp"
+#include "geometry/GeometryToken.hpp"
+#include "internal/Database.hpp"
 #include <map>
 #include <nlohmann/json.hpp>
 #include <cmath>
@@ -27,8 +29,16 @@ struct GeometryViewState {
     std::string objectRevision;
     int64_t objectGeneration = 0;
     std::optional<std::map<int64_t, int64_t>> pointIndex;
-    const GeometryArrayInfo& array(const std::string& name) const {
+    void requireCurrent() const {
         read->require();
+        if (!parseCurrentGeometryToken(revision.uuid)) return;
+        if(sqlite3_txn_state(ObjectStoreImplAccess::conn(*read->txn),"main")!=SQLITE_TXN_WRITE)return;
+        const auto current=read->db->geometryRevision(*read->txn,revision.uuid);
+        if(!current||current->contentHash!=revision.contentHash)
+            throw std::runtime_error("current geometry view changed; reload the view");
+    }
+    const GeometryArrayInfo& array(const std::string& name) const {
+        requireCurrent();
         const auto it = std::find_if(revision.arrays.begin(), revision.arrays.end(),
             [&](const auto& a) { return a.name == name; });
         if (it == revision.arrays.end()) throw std::invalid_argument("missing geometry array: " + name);
@@ -46,7 +56,7 @@ struct GeometryViewState {
         return read->db->readGeometryArray(*read->txn, revision.uuid, name, start * stride, count * stride);
     }
     std::optional<int64_t> indexOf(int64_t id) {
-        read->require();
+        requireCurrent();
         if (id < 0) return std::nullopt;
         if (!pointIndex) {
             const auto bytes = range("point_ids", 0, array("point_ids").shape[0]);
@@ -179,12 +189,12 @@ TypedGeometryView GeometrySnapshot::geometry(const std::string& id, const std::o
 }
 
 GeometryView::GeometryView(std::shared_ptr<State> state) : state_(std::move(state)) {}
-const GeometryRevision& GeometryView::revision() const { state_->read->require(); return state_->revision; }
+const GeometryRevision& GeometryView::revision() const { state_->requireCurrent(); return state_->revision; }
 const std::string& GeometryView::objectRevision() const { state_->read->require(); return state_->objectRevision; }
 int64_t GeometryView::objectGeneration() const { state_->read->require(); return state_->objectGeneration; }
 geometry::Geometry GeometryView::loadGeometry() const
 {
-    state_->read->require();
+    state_->requireCurrent();
     GeometryData data;
     data.kind = state_->revision.kind;
     data.formatVersion = state_->revision.formatVersion;
@@ -229,7 +239,7 @@ int64_t SurfaceView::rows() const { return state_->array("points").shape[0]; }
 int64_t SurfaceView::columns() const { return state_->array("points").shape[1]; }
 std::array<double, 2> SurfaceView::scale() const
 {
-    state_->read->require();
+    state_->requireCurrent();
     auto value = nlohmann::json::parse(state_->revision.attributes).at("scale").get<std::array<double, 2>>();
     for (auto v : value) if (!(v > 0) || !std::isfinite(v)) throw std::invalid_argument("invalid surface scale");
     return value;
@@ -238,7 +248,7 @@ geometry::SurfacePoint SurfaceView::vertex(int64_t row, int64_t column) const { 
 bool SurfaceView::valid(int64_t row, int64_t column) const { return readTile(row, column, 1, 1).valid(0, 0); }
 geometry::Surface SurfaceView::readTile(int64_t row, int64_t column, int64_t rows, int64_t columns) const
 {
-    state_->read->require();
+    state_->requireCurrent();
     const auto bytes = state_->read->db->readGeometryRectangle(*state_->read->txn,
         state_->revision.uuid, "points", row, column, rows, columns);
     geometry::Surface result{rows, columns, scale(), detail::xyzValues<float>(bytes)};
@@ -328,7 +338,7 @@ void TransformedGeometryView::validateForWrite(const ObjectStore& db,const Txn& 
     const auto head=db.currentGeometry(txn,pinned.objectUuid);
     const auto object=db.objectByUuid(txn,pinned.objectUuid);
     const auto generation=std::visit([](const auto& v){return v.objectGeneration();},source_);
-    if(!head||head->uuid!=pinned.uuid||!object||object->generation!=generation)
+    if(!head||head->uuid!=pinned.uuid||head->contentHash!=pinned.contentHash||!object||object->generation!=generation)
         throw std::runtime_error("object changed; reopen its transformed view");
     if(db.provisioning(txn).history==HistoryMode::On){
         const auto historical=db.currentObjectRevision(txn,pinned.objectUuid);

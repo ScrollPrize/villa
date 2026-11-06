@@ -316,7 +316,8 @@ int main() try
         require(store.objectByUuid(txn, added).has_value(), "remaining attachment still reads");
     });
     // Edits that keep relationships as recorded: an anchored vertex moves and the
-    // relationship stays, pinned to the geometry it was made from.
+    // relationship remains historical, pinned to its original geometry, and
+    // is removed from the current graph.
     {
         const auto sheet = util::newUuid(), marker = util::newUuid();
         std::string link;
@@ -333,7 +334,10 @@ int main() try
             link = store.addEdge(txn, edge);
         });
         RevisionSelection pins;
-        session.read(replacement, [&](const auto& store, const auto& txn, const auto&) { pins[sheet] = store.currentObjectRevision(txn, sheet)->uuid; });
+        session.read(replacement, [&](const auto& store, const auto& txn, const auto&) {
+            pins[sheet] = store.currentObjectRevision(txn, sheet)->uuid;
+            pins[marker] = store.currentObjectRevision(txn, marker)->uuid;
+        });
         mustFail([&] { session.act(replacement, pins, [&](auto& store, auto& txn) {
             const auto head = store.currentGeometry(txn, sheet)->uuid;
             std::vector<uint8_t> moved(12); const float xyz[3] = {1, 1, 5}; std::memcpy(moved.data(), xyz, 12);
@@ -346,7 +350,8 @@ int main() try
             store.editGeometry(txn, sheet, edits, head, [&](const std::vector<EdgeRecord>& affected) { return keep(affected); });
         });
         session.read(replacement, [&](const auto& store, const auto& txn, const auto&) {
-            require(store.edgeByUuid(txn, link).has_value(), "relationships survive kept-as-recorded edits");
+            require(!store.edgeByUuid(txn, link), "kept-as-recorded edits remove the current relationship");
+            require(store.relationshipsAt(txn,pins).size()==1,"kept-as-recorded relationship survives in its historical selection");
             const auto points = store.readGeometryArray(txn, store.currentGeometry(txn, sheet)->uuid, "points");
             float z; std::memcpy(&z, points.data() + 8, 4);
             require(z == 5, "the anchored vertex moved");
@@ -365,7 +370,8 @@ int main() try
         session.tagObjects(replacement, {created}, {"defective"}, {"approved"});
         session.editRecords(replacement, {created}, [](ObjectRecord& record) { record.name = "renamed"; });
         session.read(replacement, [&](const auto& store, const auto& txn, const auto&) {
-            require(store.edgeByUuid(txn, link).has_value(), "tagging keeps relationships as recorded");
+            require(!store.edgeByUuid(txn, link), "tagging does not revive a historical-only relationship");
+            require(store.relationshipsAt(txn,pins).size()==1,"tagging preserves the original historical relationship");
             const auto tags = store.objectByUuid(txn, created)->tags;
             require(store.objectByUuid(txn, created)->name == "renamed" &&
                         std::find(tags.begin(), tags.end(), "approved") == tags.end() &&

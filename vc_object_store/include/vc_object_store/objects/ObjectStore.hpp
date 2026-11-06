@@ -288,7 +288,7 @@ struct EdgeSelection {
     bool bothEndpoints = false; // induced subgraph vs incident edges
     std::optional<int64_t> limit;
     std::optional<std::string> afterUuid; // exclusive, UUID-ordered cursor
-    bool includeRetired = false; // includes lifecycle-inactive recorded edges
+    bool includeRetired = false; // endpoint filter; retirement removes current edges
     // nullopt: all kinds; false/true: ordinary/adjacent fiber_branch only.
     // A missing adjacent metadata flag is an ordinary fiber branch.
     std::optional<bool> adjacent;
@@ -398,8 +398,8 @@ struct GeometryEdgeEdit {
     // "retain", "update", "remove", or "keep_recorded". Retain keeps the same
     // relationship and anchors; update supplies both complete anchors in
     // stored a/b order. Revisions are the heads observed BEFORE the edit.
-    // keep_recorded checks the resulting anchor identities but preserves the
-    // historical pins; it does NOT assert applicability to the new geometry.
+    // keep_recorded preserves historical pins and removes the current edge;
+    // it does NOT assert applicability to the new geometry and requires history.
     std::string action;
     std::optional<std::string> aRevision, bRevision;
     Anchor aAnchor, bAnchor;
@@ -457,11 +457,11 @@ public:
     // After endpoint edits, validate anchors/metadataKeys and retain the relationship.
     // The caller decides domain meaning.
     void retainRelationship(WriteTxn&, const std::string& edgeUuid);
-    // Keep historical pins after an endpoint edit without asserting that the
-    // relationship applies to the edited endpoint. Current queries may be stale.
+    // Keep historical pins after an endpoint edit and remove the current edge,
+    // without asserting applicability to the edited endpoint. Requires history.
     void keepRecordedRelationship(WriteTxn&, const std::string& edgeUuid);
-    // keepRecordedRelationship for every relationship of the object, retired
-    // ones included (e.g. after a record-only edit of it).
+    // keepRecordedRelationship for every current relationship of the object
+    // (e.g. after a record-only edit of it).
     void keepRecordedRelationshipsOf(WriteTxn&, const std::string& objectUuid);
     const std::filesystem::path& path() const;
     std::string hostname() const;
@@ -619,10 +619,10 @@ public:
     // match) and enforces (kind, endpoints, dependencies, relationKey) uniqueness.
     std::string addEdge(WriteTxn& txn, const EdgeRecord& record);
     // Import-only explicit edge ID within the reserved edge key range. Uses
-    // the same validation, geometry bindings and history as addEdge.
+    // the same current-endpoint validation and history as addEdge.
     std::string insertEdgeWithId(WriteTxn&, const EdgeRecord&, int64_t id);
     // Refresh anchors/tags/meta while retaining UUID, endpoints, kind and history.
-    // Changes reset approval; revision bindings remain stale until explicitly checked.
+    // Changes reset approval and validate the resulting current endpoint dependencies.
     void updateEdge(WriteTxn& txn, const EdgeRecord& record);
     std::optional<EdgeRecord> edgeByUuid(const Txn& txn, const std::string& uuid) const;
     void removeEdge(WriteTxn& txn, const std::string& uuid);
@@ -700,7 +700,7 @@ public:
 
 private:
     struct Impl;
-    static std::unique_ptr<Impl> openImpl(const std::filesystem::path&, const OpenOptions&, bool create);
+    static std::unique_ptr<Impl> openImpl(const std::filesystem::path&, const OpenOptions&, bool create, bool immutableInitial = false);
     explicit ObjectStore(std::unique_ptr<Impl>);
     void* connection(const Txn&) const;
     std::string editGeometry(WriteTxn&, const std::string& objectUuid, const std::vector<GeometryArrayEdit>&,
@@ -708,6 +708,7 @@ private:
                              const EdgeDecider* decide);
     std::unique_ptr<Impl> impl_;
     friend class Txn;
+    friend struct ObjectStoreImplAccess;
 };
 
 } // namespace vc::objects

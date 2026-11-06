@@ -3,6 +3,7 @@
 #include "vc_object_store/objects/Hub.hpp"
 #include "vc_object_store/geometry/Geometry.hpp"
 #include "internal/Database.hpp"
+#include "internal/Digest.hpp"
 #include "sync/Apply.hpp"
 #include "sync/GeometryTransfer.hpp"
 #include <bit>
@@ -92,7 +93,7 @@ void nativeChanges(HistoryMode history)
     {
         auto txn = store.write();
         mustFail([&] { detail::execute(ObjectStoreImplAccess::conn(txn),
-            "INSERT INTO geometry_chunks VALUES(?,NULL)",std::string(64,'0')); });
+            "INSERT INTO geometry_chunks VALUES(?,NULL)",detail::parseDigest(std::string(64,'0'))); });
         txn.commit();
     }
     require(generation(store) == 2, "plain stores cannot silently acquire missing/external chunk payloads");

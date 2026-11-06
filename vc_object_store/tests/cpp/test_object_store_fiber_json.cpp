@@ -155,7 +155,6 @@ int main() try {
     });
     session.act(attachment, currentNetworkPins, [&](auto& db, auto& txn) {
         db.retireObject(txn, b);
-        db.keepRecordedRelationship(txn, adjacent);
     });
     session.read(attachment, [&](const auto& db, const auto& txn, const auto&) {
         for (auto& [objectUuid, pin] : currentNetworkPins) pin = db.currentObjectRevision(txn,objectUuid)->uuid;

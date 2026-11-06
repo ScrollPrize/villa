@@ -1,4 +1,5 @@
 #include "geometry/GeometryReader.hpp"
+#include "geometry/GeometryToken.hpp"
 #include "vc_object_store/geometry/ArrayBytes.hpp"
 #include "geometry/ArrayLayout.hpp"
 #include "internal/CoordinateFilter.hpp"
@@ -77,7 +78,7 @@ std::vector<SurfaceProximityHit> ObjectStore::nearestSurfaces(const ReadTxn& txn
         if (uuid != object) {
             finish();
             object = uuid;
-            objectRevision = formatUuid(tiles.blob16(1));
+            objectRevision = readGeometryTokenColumn(tiles,1);
             reader.emplace(db, objectRevision);
         }
         const auto row0 = tiles.i64(2), col0 = tiles.i64(3), rows = tiles.i64(4), cols = tiles.i64(5);

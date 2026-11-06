@@ -5,6 +5,7 @@
 #include "internal/RecordSql.hpp"
 #include "hub/HubRules.hpp"
 #include "vc_object_store/objects/PackedStore.hpp"
+#include "internal/ImmutableImport.hpp"
 
 namespace vc::objects {
 thread_local std::unordered_map<sqlite3*, StatementPool*> activeStatementPools;
@@ -14,7 +15,7 @@ ObjectStore::~ObjectStore() = default;
 ObjectStore::ObjectStore(ObjectStore&&) noexcept = default;
 ObjectStore& ObjectStore::operator=(ObjectStore&&) noexcept = default;
 
-std::unique_ptr<ObjectStore::Impl> ObjectStore::openImpl(const std::filesystem::path& path, const OpenOptions& options, bool create)
+std::unique_ptr<ObjectStore::Impl> ObjectStore::openImpl(const std::filesystem::path& path, const OpenOptions& options, bool create, bool immutable)
 {
     const int kApplicationId = 0x56434f42;
     const int kSchemaVersion = 18;
@@ -34,6 +35,9 @@ std::unique_ptr<ObjectStore::Impl> ObjectStore::openImpl(const std::filesystem::
     auto impl = std::make_unique<ObjectStore::Impl>();
     impl->path = path;
     impl->options = options;
+    impl->immutableInitial=immutable;
+    if(immutable && (!create || options.history!=HistoryMode::Off || options.spatialIndex))
+        throw std::invalid_argument("immutable construction requires a new history-off spatial-off database");
     impl->options.readerPoolSize = options.sharedFile ? 1 : std::max(1, options.readerPoolSize);
     if (options.sharedFile) impl->options.geometryCacheBytes = impl->options.spatialCacheBytes = 0;
     impl->hostname = options.hostnameOverride.value_or(detectHostname());
@@ -51,10 +55,21 @@ std::unique_ptr<ObjectStore::Impl> ObjectStore::openImpl(const std::filesystem::
         if (manifest.i64(2) && !options.readOnly)
             throw std::runtime_error("object store: sealed store requires a read-only open");
         Statement features(db, "SELECT name FROM store_required_features");
+        bool currentState=false,binaryHashes=false,endpointKeys=false;
         while (features.row()) {
+            if(features.text(0)=="current-state-v1"){currentState=true;continue;}
+            if(features.text(0)=="binary-sha256-v1"){binaryHashes=true;continue;}
+            if(features.text(0)=="endpoint-keys-v1"){endpointKeys=true;continue;}
             if (features.text(0)=="collection-v1" && options.physicalPartitionOnly) continue;
+            if (features.text(0)==immutableImportFeature) {
+                if(!options.readOnly || !manifest.i64(2) || manifest.i64(1) || manifest.i64(3))
+                    throw std::runtime_error("immutable initial store must be sealed, history/spatial-off and opened readonly");
+                impl->immutableInitial=true;continue;
+            }
             throw std::runtime_error("object store: unsupported required feature (use ObjectCollection for collections): " + features.text(0));
         }
+        if(!currentState) throw std::runtime_error("object store: legacy current-state layout requires separate conversion; refusing mixed v2 semantics");
+        if(!binaryHashes||!endpointKeys) throw std::runtime_error("object store: earlier experimental v2 layout requires rebuilding (binary hashes/qualified endpoint keys absent)");
         Statement physical(db, "SELECT schema_version FROM database_identity WHERE singleton=1");
         if (!physical.row() || physical.i64(0) != kSchemaVersion)
             throw std::runtime_error("object store: invalid database identity/schema");
@@ -76,26 +91,26 @@ std::unique_ptr<ObjectStore::Impl> ObjectStore::openImpl(const std::filesystem::
         impl->writer = openConnection(path, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, options, false);
         if (buildingPacked && pragmaInt(impl->writer, "page_count") != 0)
             throw std::runtime_error("object store: create refuses non-empty packed database: " + path.string());
-        exec(impl->writer, journalMode);
-        exec(impl->writer, "PRAGMA synchronous=FULL;");
+        exec(impl->writer, immutable?"PRAGMA journal_mode=OFF;PRAGMA synchronous=OFF;":journalMode);
+        if(!immutable)exec(impl->writer, "PRAGMA synchronous=FULL;");
         exec(impl->writer, ("PRAGMA application_id=" + std::to_string(kApplicationId) + ";").c_str());
         exec(impl->writer, "BEGIN IMMEDIATE;");
         try {
             createProvisioning(impl->writer, options.history == HistoryMode::On, options.spatialIndex);
-            createSchema(impl->writer, options.history == HistoryMode::On, options.creationStoreUuid);
+            createSchema(impl->writer, options.history == HistoryMode::On, options.creationStoreUuid,immutable);
+            if(immutable)execute(impl->writer,"INSERT INTO store_required_features VALUES(?)",std::string(immutableImportFeature));
             execute(impl->writer,"UPDATE store_manifest SET generation=?",options.initialGeneration);
             Statement owner(impl->writer,"SELECT uuid FROM store_identity"); owner.row();
             for (const auto& [name,range] : {std::pair{"objects",options.objectIdRange},std::pair{"edges",options.edgeIdRange}})
                 execute(impl->writer,"INSERT INTO key_allocators VALUES(?,?,?,?,?)",std::string(name),owner.blob16(0),range[0],range[1],range[0]);
             if (options.history == HistoryMode::On) createHistorySchema(impl->writer);
             createLifecycleSchema(impl->writer);
-            createDependencyIndex(impl->writer);
-            createSourceIdentityIndex(impl->writer);
+            if(!immutable)createGeometryHistoryIndex(impl->writer);
             createStorageDirectory(impl->writer, buildingPacked ? packedDatabaseUuid(path) : std::string{});
             exec(impl->writer, ("PRAGMA user_version=" + std::to_string(kSchemaVersion) + ";").c_str());
             execute(impl->writer, "UPDATE database_identity SET schema_version=? WHERE singleton=1", int64_t(kSchemaVersion));
             registerStorageTables(impl->writer);
-            createChangeTracking(impl->writer);
+            if(!immutable)createChangeTracking(impl->writer);
             exec(impl->writer, "COMMIT;");
         } catch (...) {
             exec(impl->writer, "ROLLBACK;");
@@ -119,12 +134,14 @@ std::unique_ptr<ObjectStore::Impl> ObjectStore::openImpl(const std::filesystem::
         auto pool = std::make_unique<StatementPool>();
         pool->historyEnabled = impl->options.history == HistoryMode::On;
         pool->spatialEnabled = impl->options.spatialIndex;
+        pool->immutableInitial = impl->immutableInitial;
         impl->statementPools.emplace(conn, std::move(pool));
     }
     if (impl->writer) {
         auto pool = std::make_unique<StatementPool>();
         pool->historyEnabled = impl->options.history == HistoryMode::On;
         pool->spatialEnabled = impl->options.spatialIndex;
+        pool->immutableInitial = impl->immutableInitial;
         impl->statementPools.emplace(impl->writer, std::move(pool));
     }
     return impl;

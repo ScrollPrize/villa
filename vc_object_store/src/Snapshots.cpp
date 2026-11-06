@@ -1,6 +1,7 @@
 #include "internal/RecordJson.hpp"
 #include "internal/EdgeSql.hpp"
 #include "internal/History.hpp"
+#include "geometry/GeometryInternal.hpp"
 
 namespace vc::objects {
 using namespace detail;
@@ -41,8 +42,7 @@ std::string ObjectStore::exportJson(const Txn& txn, const JsonExportOptions& opt
     if (!options.selection.includeRetired)
         members += " AND e.id IN (SELECT id FROM edges WHERE " + activeEdgeSql() + ")";
     if (!options.selection.edgeKinds.empty()) members += " AND e.kind IN (SELECT value FROM json_each(?2))";
-    Statement states(db, "SELECT e.uuid,b.a_revision,b.b_revision,ha.revision_uuid,hb.revision_uuid FROM edges e "
-        "LEFT JOIN edge_geometry_bindings b ON b.edge_id=e.id "
+    Statement states(db, "SELECT e.uuid,ha.revision_uuid,hb.revision_uuid FROM edges e "
         "JOIN objects a ON a.id=e.a_id JOIN objects z ON z.id=e.b_id "
         "LEFT JOIN geometry_heads ha ON ha.object_uuid=a.uuid LEFT JOIN geometry_heads hb ON hb.object_uuid=z.uuid "
         "WHERE e.id IN (" + members + ")", included.dump());
@@ -51,11 +51,9 @@ std::string ObjectStore::exportJson(const Txn& txn, const JsonExportOptions& opt
     while (states.row()) {
         const auto id = formatUuid(states.blob16(0));
         auto revision = [&](int col) -> std::optional<std::string> {
-            return states.isNull(col) ? std::nullopt : std::optional(formatUuid(states.blob16(col)));
+            return states.isNull(col) ? std::nullopt : std::optional(readGeometryTokenColumn(states,col));
         };
         EdgeGeometryState state{revision(1), revision(2), false};
-        // Only endpoints whose head moved need dependency-aware inspection.
-        if (state.aRevision != revision(3) || state.bRevision != revision(4)) state = edgeGeometryState(txn, id);
         geometryStates.emplace(id, std::move(state));
     }
     Statement edges(db, "SELECT " + projectedEdgeColumns(edgeFields) + " FROM edges WHERE id IN (" + members + ") ORDER BY uuid",

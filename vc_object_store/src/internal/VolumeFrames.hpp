@@ -64,7 +64,9 @@ inline std::vector<VolumeFrame> volumeFrames(sqlite3* db, const std::string& vol
     std::vector<std::string> kinds;
     if (kind) kinds.push_back(*kind);
     else {
-        Statement next(db, "SELECT kind FROM objects INDEXED BY objects_kind WHERE kind>? ORDER BY kind LIMIT 1");
+        // The existing (kind,uuid) prefix supports the same covering seek;
+        // a separate kind-only B-tree would duplicate every object entry.
+        Statement next(db, "SELECT kind FROM objects INDEXED BY objects_kind_uuid WHERE kind>? ORDER BY kind LIMIT 1");
         for (std::string after;;) {
             next.reset(); next.bind(1, after);
             if (!next.row()) break;

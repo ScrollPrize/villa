@@ -39,8 +39,13 @@ struct StatementPool {
     // Each callback must require an explicit hash -> dependency mapping.
     std::function<std::vector<uint8_t>(const std::string&)> externalGeometryChunk;
     std::function<int64_t(const std::string&)> externalGeometryChunkSize;
+    std::function<ObjectRecord(const std::string&)> externalEndpointRecord;
+    std::function<std::string(const std::string&)> externalEndpointVersion;
+    std::function<void(const std::string&,const Anchor&)> externalEndpointValidateAnchor;
+    std::string promotedEndpointUuid;
     bool historyEnabled = true;
     bool spatialEnabled = true;
+    bool immutableInitial = false;
     int startSchemaVersion = 0;
     std::map<std::string,double> transformedLengths;
     bool readSnapshot = false;
@@ -86,6 +91,7 @@ struct ObjectStore::Impl {
     OpenOptions options;
     std::string hostname;
     HubRole hubRole = HubRole::None;
+    bool immutableInitial = false;
     sqlite3* writer = nullptr;
     std::mutex writerMutex;
     std::vector<sqlite3*> readerPool;
@@ -120,6 +126,9 @@ struct ObjectStore::Impl {
 };
 
 struct ObjectStoreImplAccess {
+    static ObjectStore createInitial(const std::filesystem::path& path,const OpenOptions& options) {
+        return ObjectStore(ObjectStore::openImpl(path,options,true,true));
+    }
     static sqlite3* conn(const Txn& txn)
     {
         if (!txn.active())

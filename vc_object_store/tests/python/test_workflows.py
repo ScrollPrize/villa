@@ -212,17 +212,16 @@ def test_checked_relationships_lifecycle_and_graph(db):
     assert db.relationships_at(selected)[0]['applicable']
     assert db.recorded_relationships(selected[a]) == db.recorded_relationships(selected[b])
     with db.write(expected_revisions=heads(db, a, b)) as tx:
-        tx.retain_relationship(edge)
+        with pytest.raises(ValueError, match='unknown relationship'):
+            tx.retain_relationship(edge)  # historical-only is no longer current
+        edge = tx.add_edge(dict(a=a, b=b, kind='fiber_branch', a_anchor=anchor, b_anchor=anchor))
     assert db.component(a, applicable_only=True) == [a, b]
     for action in ('retire_object', 'restore_object'):
         with db.write(expected_revisions=heads(db, a, b)) as tx:
             getattr(tx, action)(a)
-            if action == 'retire_object':
-                tx.keep_recorded_relationship(edge)
-            else:
-                tx.keep_recorded_relationships_of(a)  # every relationship of a, as recorded
         assert db.current_geometry(a)['uuid'] == second
         assert db.component(b, applicable_only=True) == [b]
+        assert db.edge(edge) is None
     assert not db.object(a)['retired']
     assert db.object_revision(selected[a])['geometry_revision'] == first
     at = db.object_revision(selected[a])['published_at_us']

@@ -34,15 +34,13 @@ EdgeRecord edge(bool points=false) {
 nlohmann::json snapshot(sqlite3* db) {
     nlohmann::json rows=nlohmann::json::array();
     Statement s(db,"SELECT e.uuid,a.uuid,b.uuid,e.kind,e.generation,e.approval_state,e.meta,e.a_dependencies,e.b_dependencies,"
-        "e.relation_key,m.a_meta,m.b_meta,l.a_epoch,l.b_epoch,g.a_revision,g.b_revision "
+        "e.relation_key "
         "FROM edges e JOIN objects a ON a.id=e.a_id JOIN objects b ON b.id=e.b_id "
-        "JOIN current_edge_metadata m ON m.edge_id=e.id JOIN edge_lifecycle_bindings l ON l.edge_id=e.id "
-        "JOIN edge_geometry_bindings g ON g.edge_id=e.id ORDER BY e.id");
+        "ORDER BY e.id");
     while(s.row()) {nlohmann::json row=nlohmann::json::array();
-        for(int i=0;i<16;++i) {
+        for(int i=0;i<10;++i) {
             if(i<3) row.push_back(formatUuid(s.blob16(i)));
             else if(i==4) row.push_back(s.i64(i));
-            else if(i>=14) row.push_back(s.isNull(i)?"none":"present");
             else row.push_back(s.text(i));
         } rows.push_back(row);}
     return rows;
@@ -69,12 +67,17 @@ void parity(bool geometry,bool defer,size_t sqlRows=1,size_t rowCount=2,int vari
         require(scalar(db,"SELECT count(*) FROM edge_tags")==int64_t(rowCount),"deduplicated tags");txn.commit();
     }
     auto x=ordinary.read(),y=bulk.read();
-    require(snapshot(ObjectStoreImplAccess::conn(x))==snapshot(ObjectStoreImplAccess::conn(y)),"native/bulk rows and bindings identical");
+    require(snapshot(ObjectStoreImplAccess::conn(x))==snapshot(ObjectStoreImplAccess::conn(y)),"native/bulk current records identical");
     for(const auto& e:input) {
         const auto expected=ordinary.edgeByUuid(x,e.uuid),actual=bulk.edgeByUuid(y,e.uuid);
         require(expected&&actual&&expected->aUuid==actual->aUuid&&expected->bUuid==actual->bUuid&&
             expected->aAnchor==actual->aAnchor&&expected->bAnchor==actual->bAnchor&&expected->tags==actual->tags,
             "anchor values, endpoint order and tags preserved");
+        require(currentRelationshipApplicable(ordinary,x,e.uuid)&&currentRelationshipApplicable(bulk,y,e.uuid),
+            "ordinary and bulk relationships are valid against current endpoints");
+        const auto os=ordinary.edgeGeometryState(x,e.uuid),bs=bulk.edgeGeometryState(y,e.uuid);
+        require(!os.stale&&!bs.stale&&bool(os.aRevision)==bool(bs.aRevision)&&bool(os.bRevision)==bool(bs.bRevision),
+            "ordinary and bulk geometry state resolves current endpoint descriptors");
     }
     auto tx=bulk.write();auto obj=*bulk.objectByUuid(tx,a);obj.meta=R"({"a":7,"null":null})";bulk.upsertObject(tx,obj);
     mustFail([&]{tx.commit();});
@@ -124,19 +127,19 @@ void invalidateAndExhaust() {
     require(scalar(db,"SELECT count(*) FROM edges WHERE id=9223372036854775807")==1,"maximum ID allocated without overflow");
     require(scalar(db,"SELECT next_id IS NULL FROM key_allocators WHERE name='edges'")==1,"range exhausted");tx.commit();
 }
-void retiredBinding() {
+void rejectRetiredEndpoint() {
     TemporaryDirectory dir;OpenOptions opts;opts.author="test";opts.history=HistoryMode::Off;
     auto store=ObjectStore::create(dir.path/"retired.vcobj",opts);auto e=edge();
     e.aAnchor.metadataKeys.clear();e.bAnchor.metadataKeys.clear();
-    {auto tx=store.write();objects(store,tx);store.retireObject(tx,a);
+    {auto tx=store.write();objects(store,tx);store.retireObject(tx,a);tx.commit();}
+    {auto tx=store.write();
         Savepoint whole(ObjectStoreImplAccess::conn(tx));InitialEdgeInserter initial(store,tx);
-        initial.append(std::span(&e,1));initial.finish();whole.release();tx.commit();}
-    {auto tx=store.read();auto* db=ObjectStoreImplAccess::conn(tx);
-        require(!currentRelationshipApplicable(store,tx,e.uuid),"retired relationship is not applicable");
-        require(scalar(db,"SELECT count(*) FROM edge_lifecycle_bindings WHERE a_epoch!=''")==1,"no-key edge preserves retired epoch");}
-    {auto tx=store.write();store.restoreObject(tx,a);mustFail([&]{tx.commit();});}
+        mustFail([&]{initial.append(std::span(&e,1));});}
+    {auto tx=store.read();require(!store.edgeByUuid(tx,e.uuid),"failed retired-endpoint import leaves no edge");}
+    {auto tx=store.write();store.restoreObject(tx,a);tx.commit();}
+    {auto tx=store.read();require(!store.edgeByUuid(tx,e.uuid),"restoration cannot revive rejected relationship");}
 }
 }
 int main() {try {parity(false,false);parity(false,true);parity(true,true);
-    parity(false,true,64,133);parity(true,true,64,133,99);failures();failures(64);invalidateAndExhaust();retiredBinding();
+    parity(false,true,64,133);parity(true,true,64,133,99);failures();failures(64);invalidateAndExhaust();rejectRetiredEndpoint();
     std::cout<<"initial edge tests passed\n";return 0;}catch(const std::exception& e){std::cerr<<e.what()<<'\n';return 1;}}

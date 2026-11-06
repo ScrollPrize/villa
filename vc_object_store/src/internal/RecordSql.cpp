@@ -1,6 +1,7 @@
 #include "internal/RecordSql.hpp"
 #include "internal/RecordFields.hpp"
 #include "vc_object_store/objects/GeometryCoordinates.hpp"
+#include "geometry/GeometryToken.hpp"
 
 namespace vc::objects::detail {
 const char* kObjectCols =
@@ -365,6 +366,11 @@ std::string upsertObjectImpl(sqlite3* db, const std::string& author, const std::
     const auto bounds = detail::recordBounds(rec);
     Statement collision(db, "SELECT 1 FROM edges WHERE uuid=?", uuid);
     if (collision.row()) throw std::runtime_error("object store: UUID already belongs to an edge");
+    if(!objectIdByUuid(db,uuid)){
+        Statement external(db,"SELECT 1 FROM external_object_keys WHERE uuid=?",uuid);
+        if(external.row()&&activeStatementPools.at(db)->promotedEndpointUuid!=rec.uuid)
+            throw std::runtime_error("object store: UUID belongs to an external endpoint; use qualified replacement");
+    }
     const std::string now = nowIsoUtc();
     Statement managed(db, "SELECT o.data_generation,o.data_checksum,o.storage_ref FROM objects o JOIN geometry_heads h ON h.object_uuid=o.uuid WHERE o.uuid=?",
         uuid);
@@ -438,6 +444,10 @@ std::string jsonPathForKey(const std::string& key)
 
 std::optional<std::string> geometryHead(sqlite3* db, const std::string& objectUuid)
 {
+    if(!historyEnabled(db)){
+        Statement current(db,"SELECT object_generation FROM current_geometry WHERE object_uuid=?",parseUuid(objectUuid));
+        return current.row()?std::optional(currentGeometryToken(objectUuid,current.i64(0))):std::nullopt;
+    }
     Statement s(db, "SELECT revision_uuid FROM geometry_heads WHERE object_uuid=?", parseUuid(objectUuid));
     return s.row() ? std::optional(formatUuid(s.blob16(0))) : std::nullopt;
 }

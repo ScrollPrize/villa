@@ -1,5 +1,6 @@
 #include "internal/Database.hpp"
 #include "geometry/SharedGeometry.hpp"
+#include "internal/ImmutableImport.hpp"
 
 namespace vc::objects {
 using namespace detail;
@@ -16,6 +17,12 @@ int64_t detail::writeGeneration(sqlite3* db)
     Statement s(db, "SELECT generation FROM store_manifest WHERE singleton=1");
     if (!s.row() || s.i64(0) == INT64_MAX) throw std::runtime_error("object store: generation exhausted or absent");
     return s.i64(0) + 1;
+}
+
+bool detail::immutableInitial(sqlite3* db) {
+    if(const auto pool=activeStatementPools.find(db);pool!=activeStatementPools.end())return pool->second->immutableInitial;
+    Statement feature(db,"SELECT 1 FROM store_required_features WHERE name=?",std::string(immutableImportFeature));
+    return feature.row();
 }
 
 int64_t detail::allocateRecordId(sqlite3* db, const char* keySpace)
@@ -84,7 +91,7 @@ void detail::createChangeTracking(sqlite3* db)
 {
     // Transactional dirty marker, including savepoint rollback. Do not use
     // sqlite3_total_changes(): that also counts changes rolled back to a savepoint.
-    for (const auto* table : {"objects", "fibers", "surfaces", "tracks", "object_tags", "edges", "edge_tags", "object_lifecycle", "edge_geometry_bindings", "edge_lifecycle_bindings", "table_directory", "table_key_columns", "store_required_features"}) {
+    for (const auto* table : {"objects", "fibers", "surfaces", "tracks", "object_tags", "edges", "edge_tags", "object_lifecycle", "table_directory", "table_key_columns", "store_required_features"}) {
         for (const auto* op : {"INSERT", "UPDATE", "DELETE"}) {
             const auto sql = std::string("CREATE TRIGGER ") + table + "_v2_" + op + " AFTER " + op + " ON " + table +
                 " BEGIN UPDATE store_write_state SET dirty=1 WHERE singleton=1 AND dirty=0; END;";
@@ -205,47 +212,28 @@ void detail::createCurrentGeometrySchema(sqlite3* db)
     // there are no parent links, deltas, historical heads or retained versions.
     exec(db, R"SQL(
 CREATE TABLE current_geometry(
- uuid BLOB PRIMARY KEY CHECK(length(uuid)=16),
- object_uuid BLOB NOT NULL UNIQUE REFERENCES objects(uuid) ON DELETE CASCADE,
- content_hash TEXT NOT NULL CHECK(length(content_hash)=64),
+ object_uuid BLOB PRIMARY KEY REFERENCES objects(uuid) ON DELETE CASCADE CHECK(length(object_uuid)=16),
+ content_hash BLOB NOT NULL CHECK(typeof(content_hash)='blob' AND length(content_hash)=32),
  manifest TEXT NOT NULL CHECK(json_valid(manifest)),
  object_generation INTEGER NOT NULL,
  created_by TEXT NOT NULL, created_at TEXT NOT NULL, created_host TEXT NOT NULL
 );
 CREATE TABLE current_geometry_chunks(
- revision_uuid BLOB NOT NULL REFERENCES current_geometry(uuid) ON DELETE CASCADE,
+ object_uuid BLOB NOT NULL REFERENCES current_geometry(object_uuid) ON DELETE CASCADE,
  array_name TEXT NOT NULL, chunk_index INTEGER NOT NULL CHECK(chunk_index>=0),
- hash TEXT NOT NULL REFERENCES geometry_chunks(hash),
- PRIMARY KEY(revision_uuid,array_name,chunk_index)
+ hash BLOB NOT NULL REFERENCES geometry_chunks(hash),
+ PRIMARY KEY(object_uuid,array_name,chunk_index)
 );
 CREATE INDEX current_chunk_hash ON current_geometry_chunks(hash);
 CREATE TABLE current_shared_payloads(
  object_uuid BLOB NOT NULL REFERENCES current_geometry(object_uuid) ON DELETE CASCADE,
- hash TEXT NOT NULL REFERENCES geometry_chunks(hash),
+ hash BLOB NOT NULL REFERENCES geometry_chunks(hash),
  PRIMARY KEY(object_uuid,hash)
 );
 CREATE INDEX current_shared_hash ON current_shared_payloads(hash);
-CREATE VIEW geometry_revisions AS SELECT uuid,object_uuid,NULL AS parent_uuid,content_hash,manifest,object_generation,created_by,created_at,created_host FROM current_geometry;
-CREATE VIEW geometry_heads AS SELECT object_uuid,uuid AS revision_uuid FROM current_geometry;
-CREATE VIEW geometry_revision_chunks AS SELECT revision_uuid,array_name,chunk_index,hash FROM current_geometry_chunks;
-CREATE TABLE current_edge_metadata(
- edge_id INTEGER PRIMARY KEY REFERENCES edges(id) ON DELETE CASCADE,
- a_meta TEXT NOT NULL, b_meta TEXT NOT NULL
-);
-CREATE TABLE current_changed_objects(uuid BLOB PRIMARY KEY);
-CREATE TRIGGER current_object_changed AFTER UPDATE ON objects BEGIN
- INSERT INTO current_changed_objects VALUES(new.uuid) ON CONFLICT(uuid) DO NOTHING;
-END;
-CREATE TABLE current_unused_chunks(hash TEXT PRIMARY KEY);
-CREATE TRIGGER current_chunk_replaced AFTER DELETE ON current_geometry_chunks BEGIN
- INSERT INTO current_unused_chunks VALUES(old.hash) ON CONFLICT(hash) DO NOTHING;
-END;
-CREATE TRIGGER current_shared_replaced AFTER DELETE ON current_shared_payloads BEGIN
- INSERT INTO current_unused_chunks VALUES(old.hash) ON CONFLICT(hash) DO NOTHING;
-END;
-CREATE TRIGGER current_payload_insert AFTER INSERT ON geometry_chunks BEGIN
- INSERT INTO current_unused_chunks VALUES(new.hash) ON CONFLICT(hash) DO NOTHING;
-END;
+CREATE VIEW geometry_revisions AS SELECT 'current:'||lower(hex(object_uuid))||':'||object_generation AS uuid,object_uuid,NULL AS parent_uuid,content_hash,manifest,object_generation,created_by,created_at,created_host FROM current_geometry;
+CREATE VIEW geometry_heads AS SELECT object_uuid,'current:'||lower(hex(object_uuid))||':'||object_generation AS revision_uuid FROM current_geometry;
+CREATE VIEW geometry_revision_chunks AS SELECT 'current:'||lower(hex(g.object_uuid))||':'||g.object_generation AS revision_uuid,c.array_name,c.chunk_index,c.hash FROM current_geometry_chunks c JOIN current_geometry g ON g.object_uuid=c.object_uuid;
 )SQL");
 }
 
@@ -254,6 +242,6 @@ void detail::indexCurrentMetadata(sqlite3* db, const std::string& object, const 
     // Shared sequence metadata forms a hash-addressed tree. Record the live
     // reachable chunks as current ownership, not a history of old roots.
     Statement reference(db, "INSERT INTO current_shared_payloads VALUES(?,?)");
-    for(const auto& hash:reachableGeometryMetadata(db,manifest)) reference.run(parseUuid(object),hash);
+    for(const auto& hash:reachableGeometryMetadata(db,manifest)) reference.run(parseUuid(object),parseDigest(hash));
 }
 } // namespace vc::objects

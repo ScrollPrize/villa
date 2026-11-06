@@ -117,7 +117,7 @@ tools and editors that change existing objects without deciding about each
 relationship: it expects the pinned object revisions and every endpoint of
 their relationships, holds the objects' leases, and gives the callback
 `keep_recorded` decisions to pass to geometry edits (affected relationships keep
-their historical pins). `copyObject(from, to, uuid)` copies an
+their historical pins but are removed from the current graph). `copyObject(from, to, uuid)` copies an
 object's current record and geometry from one attachment into another as a new
 object (new UUID, `meta.copied_from` naming the source store, object and
 revisions; point annotations kept); relationships, history and approval stay
@@ -192,17 +192,19 @@ or `whole_geometry`. Editing a dependency requires an explicit decision:
 
 | Decision | Effect |
 | --- | --- |
-| `keep_recorded_relationship` / `action="keep_recorded"` | Validate recorded identities and preserve historical pins; may be inapplicable now |
-| `retain_relationship` / `action="retain"` | Revalidate against resulting endpoints and publish shared new pins |
+| `keep_recorded_relationship` / `action="keep_recorded"` | Preserve historical pins and remove the relationship from the current graph; requires history |
+| `retain_relationship` / `action="retain"` | Revalidate against resulting current endpoints; history-on also publishes new historical pins |
 | `update_edge` / `action="update"` | Publish caller-supplied anchors after validation |
 | `remove_edge` / `action="remove"` | Remove the current relationship |
 
 Geometry `edge_edits` specify `edge_uuid`, `expected_generation`, `action`,
-`a_revision` and `b_revision` (geometry UUIDs or `None`); updates also supply
+`a_revision` and `b_revision` (opaque geometry tokens or `None`); updates also supply
 `a_anchor` and `b_anchor`. Include expected object revisions for all validation
 endpoints in checked writes. Metadata/lifecycle decisions must match final state
 at commit. Unrelated metadata/point edits leave relationships applicable; physical
 or domain-specific validity remains the caller's responsibility.
+
+Current edges always refer to current endpoints. Their geometry, lifecycle and metadata dependencies are checked transactionally, without permanent duplicate binding rows. A later endpoint edit invalidates an earlier validation decision in the same transaction; savepoint rollback also rolls back these decisions.
 
 **Attachments are not graph links.** Edge kind `attachment` ties a data object
 to the object it describes (VC3D growth corrections, Lasagna fit results on a
@@ -243,18 +245,17 @@ are read-only and retain their buffers after closure, not the database transacti
 
 `retired` and `lifecycle_epoch` are library-managed revision fields. Use
 `tx.retire_object(uuid)` or `tx.restore_object(uuid, source_revision=None)` in a
-checked write, with explicit decisions for every surviving incident edge after
-endpoint edits. Retirement retains geometry, metadata and history. Restoration
+checked write when history is enabled (an ordinary write when history is off).
+Retirement removes all incident current edges atomically, while retaining geometry, metadata and any enabled history. Restoration
 uses the last published active content, or an explicit active revision of that
 object; it advances generation and resets approval while preserving creation
 stamps. Already-retired retirement and already-active default restoration are
 no-ops. Restoration does not recreate removed links or physically removed rows.
 
-Lifecycle epochs prevent preserved links from silently reactivating after
-restoration, even with identical geometry. Revalidate explicitly. Default current
-catalogs, spatial queries, traversal and exports omit retired objects and dormant
-edges; traversal cannot pass through retired nodes. `include_retired=True`
-exposes them for inspection without asserting applicability. Direct UUID lookups,
+Restoration never revives old links; explicitly create new links only after their endpoints are active. Current edge creation against retired endpoints is rejected. Default current
+catalogs, spatial queries, traversal and exports omit retired objects;
+traversal cannot pass through retired nodes. `include_retired=True`
+exposes retired objects for inspection. Direct UUID lookups,
 geometry and historical reads remain available. Lifecycle-only changes reuse
 payloads; restoring different geometry can rebuild spatial indexes.
 
@@ -657,6 +658,8 @@ volume's binding. `unboundObjectCount(txn, kind, volume)` counts that tail the
 same way. SQLite never answers a generated column from an index alone, so an
 aggregate over these columns (a GROUP BY or count of a whole kind) still reads
 every row; new queries should seek index ranges instead.
+
+V2 uses the existing `objects_kind_uuid(kind,uuid)` prefix for distinct-kind lookups and kind filtering; it does not duplicate those entries in a separate `objects_kind` index. The coordinate index remains separate because its volume/scale ordering serves different queries.
 
 | Budget | Default | Charged work |
 | --- | ---: | --- |

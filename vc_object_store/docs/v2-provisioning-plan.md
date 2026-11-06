@@ -116,6 +116,10 @@ A higher generation orders dependent states; it does not imply that an unrelated
 
 Independent import workers build unpublished shards under one reserved logical store generation. Finalization publishes the complete store manifest at that generation only after all shards are ready. There is no reader-visible partial store and no need for a transaction spanning the shard databases. Subsequent edits use the writable overlay's generation counter.
 
+Relations must address sibling-shard objects directly by qualified identity, without copying object records or geometry and without joining or opening another worker's SQLite transaction. The coordinated bulk API completes the object phase across workers, shares an immutable compact endpoint directory, then imports relations into independently written shards. This barrier is not a requirement to publish/seal each sibling first. Relations to pre-existing external stores use sealed dependencies. A local endpoint-key mapping is permitted for compact SQL edge handles; it stores identity only, not a duplicate object. Readers resolve the owning shard/store, and actual edits create overrides only when requested.
+
+Payload hashes and native digest references use binary SHA-256 keys (32-byte BLOBs), computed by the shared C++ implementation and bound directly, not SQL conversion functions. Public textual hashes remain an API representation. Object kinds retain their typed records and use the existing composite kind/UUID index; do not add a redundant kind-only index.
+
 ## Integer IDs and reservations
 
 Reserve ranges before parallel import and give workers predetermined IDs. Related tables such as `objects` and `fibers` share the same object key space. Current `objects.id` is shared across kinds: do not allocate overlapping fiber/surface IDs unless references also include a namespace. Initially retain one object key space and a separate edge key space.

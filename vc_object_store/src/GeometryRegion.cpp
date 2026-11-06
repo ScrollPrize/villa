@@ -358,7 +358,7 @@ RegionResult ObjectStore::geometryRegion(const ReadTxn& txn, const RegionSlice& 
             candidates.bind(12,options.kind);
             while(candidates.row()) {
                 requestWork(&RegionStats::candidateVisits);
-                process(formatUuid(candidates.blob16(0)),candidates.i64(1),formatUuid(candidates.blob16(2)),candidates.text(3));
+                process(formatUuid(candidates.blob16(0)),candidates.i64(1),readGeometryTokenColumn(candidates,2),candidates.text(3));
             }
         };
         if(selected)query(true);

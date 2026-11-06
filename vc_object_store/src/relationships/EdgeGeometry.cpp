@@ -1,6 +1,7 @@
 #include "internal/EdgeSql.hpp"
 #include "geometry/Dependencies.hpp"
 #include "internal/History.hpp"
+#include "geometry/GeometryInternal.hpp"
 
 namespace vc::objects {
 using namespace detail;
@@ -11,7 +12,7 @@ void ObjectStore::repairEdgeGeometry(WriteTxn& txn, const EdgeGeometryRepair& re
     const auto edge = edgeByUuid(txn, repair.edgeUuid);
     if (!edge) throw std::runtime_error("geometry repair: edge not found");
     auto canonical = [](const std::optional<std::string>& revision) -> std::optional<std::string> {
-        return revision ? std::optional(formatUuid(parseUuid(*revision))) : std::nullopt;
+        return revision ? std::optional(canonicalGeometryToken(*revision)) : std::nullopt;
     };
     const auto aRevision = canonical(repair.aRevision), bRevision = canonical(repair.bRevision);
     if (geometryHead(db, edge->aUuid) != aRevision || geometryHead(db, edge->bUuid) != bRevision)
@@ -29,9 +30,11 @@ void ObjectStore::repairEdgeGeometry(WriteTxn& txn, const EdgeGeometryRepair& re
     a = normalized.aAnchor; b = normalized.bAnchor;
     const auto state = edgeGeometryState(txn, repair.edgeUuid);
     if (state.aRevision == aRevision && state.bRevision == bRevision && a == edge->aAnchor && b == edge->bAnchor) {
-        if (!lifecycleBindingMatches(db, *edge))
+        Statement changedGeometry(db,"SELECT 1 FROM objects WHERE uuid IN (?,?) AND data_generation=? LIMIT 1",
+            parseUuid(edge->aUuid),parseUuid(edge->bUuid),writeGeneration(db));
+        if (edge->generation!=writeGeneration(db)&&changedGeometry.row())
             stampContentChange(db, author(), hostname(), "edges", *edgeIdByUuid(db, parseUuid(edge->uuid)),
-                               parseUuid(edge->uuid), "lifecycle_revalidated");
+                               parseUuid(edge->uuid), "geometry_revalidated");
         recordRelationshipValidation(db, *edge);
         return;
     }
@@ -42,11 +45,6 @@ void ObjectStore::repairEdgeGeometry(WriteTxn& txn, const EdgeGeometryRepair& re
     bindAnchor(anchors, 1, a); bindAnchor(anchors, 7, b);
     anchors.bind(13, dependenciesToJson(a).dump()); anchors.bind(14, dependenciesToJson(b).dump());
     anchors.bind(15, id); anchors.stepDone();
-    Statement binding(db, "INSERT INTO edge_geometry_bindings VALUES(?,?,?) ON CONFLICT(edge_id) DO UPDATE SET a_revision=excluded.a_revision,b_revision=excluded.b_revision",
-        id);
-    if (aRevision) binding.bind(2, parseUuid(*aRevision)); else binding.bindNull(2);
-    if (bRevision) binding.bind(3, parseUuid(*bRevision)); else binding.bindNull(3);
-    binding.stepDone();
     stampContentChange(db, author(), hostname(), "edges", id, parseUuid(repair.edgeUuid), "geometry_repaired");
     recordRelationshipValidation(db, normalized);
     savepoint.release();
@@ -59,16 +57,9 @@ EdgeGeometryState ObjectStore::edgeGeometryState(const Txn& txn, const std::stri
     auto* db = static_cast<sqlite3*>(connection(txn));
     const auto edge = edgeByUuid(txn, edgeUuid);
     if (!edge) throw std::invalid_argument("geometry: edge not found");
-    Statement binding(db, "SELECT b.a_revision,b.b_revision FROM edge_geometry_bindings b JOIN edges e ON e.id=b.edge_id WHERE e.uuid=?",
-        parseUuid(edgeUuid));
-    EdgeGeometryState result;
-    if (binding.row()) {
-        if (!binding.isNull(0)) result.aRevision = formatUuid(binding.blob16(0));
-        if (!binding.isNull(1)) result.bRevision = formatUuid(binding.blob16(1));
-    }
-    result.stale = detail::endpointChanged(*this, txn, edge->aAnchor, result.aRevision, geometryHead(db, edge->aUuid)) ||
-        detail::endpointChanged(*this, txn, edge->bAnchor, result.bRevision, geometryHead(db, edge->bUuid));
-    return result;
+    // Published current edges are consistent by construction/commit. Historical
+    // queries use relationship_revisions, never a second current binding table.
+    return {geometryHead(db,edge->aUuid),geometryHead(db,edge->bUuid),false};
 }
 
 } // namespace vc::objects

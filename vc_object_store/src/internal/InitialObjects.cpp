@@ -2,6 +2,8 @@
 #include "internal/RecordSql.hpp"
 #include "geometry/InitialGeometry.hpp"
 #include "geometry/GeometryInternal.hpp"
+#include "internal/ImmutableImport.hpp"
+#include "imports/SourceIdentityIndex.hpp"
 
 namespace vc::objects::detail {
 std::vector<std::pair<std::string,int64_t>> insertInitialObjects(
@@ -29,8 +31,8 @@ std::vector<std::pair<std::string,int64_t>> insertInitialObjects(
     for(size_t i=0;i<input.size();++i){
         const auto& value=input[i];auto rec=prepareObjectRecord(value.record);
         normalizeObjectCoordinates(rec,true);
-        {Statement edge(db,"SELECT 1 FROM edges WHERE uuid=?",parseUuid(rec.uuid));
-            if(edge.row())throw std::invalid_argument("object store: UUID already belongs to an edge");}
+        {Statement edge(db,"SELECT 1 FROM edges WHERE uuid=?1 UNION ALL SELECT 1 FROM external_object_keys WHERE uuid=?1",parseUuid(rec.uuid));
+            if(edge.row())throw std::invalid_argument("object store: UUID already belongs to an edge or endpoint key");}
         std::optional<PreparedInitialGeometry> geometry;
         if(value.geometry){geometry=prepareInitialGeometry(db,rec,*value.geometry);rec=geometry->record;}
         else if(rec.storageKind=="sqlite")
@@ -43,6 +45,8 @@ std::vector<std::pair<std::string,int64_t>> insertInitialObjects(
         if(rec.retired||!rec.lifecycleEpoch.empty())writeLifecycle(db,id,rec);
         if(geometry)writeInitialGeometry(store,txn,*geometry,*value.geometry,id);
         else setSpatialBounds(db,id,recordBounds(rec));
+        if(immutableInitial(db)&&rec.kind=="point_collection")
+            markSourceIdentityDirty(db,rec.uuid);
         result.emplace_back(rec.uuid,id);
     }
     return result;

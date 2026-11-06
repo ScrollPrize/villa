@@ -76,7 +76,11 @@ void ObjectStore::deleteObject(WriteTxn& txn, const std::string& uuid)
     Statement row(db, "SELECT id,kind FROM objects WHERE uuid=?", bytes);
     if (!row.row()) throw std::runtime_error("object store: object not found: " + uuid);
     const auto kind = row.text(1);
-    execute(db, "DELETE FROM objects WHERE id=?", row.i64(0));  // FK RESTRICT on edges refuses while referenced
+    // Edge endpoints may also be qualified external handles, so the edges
+    // table cannot use an objects-only FK. Preserve RESTRICT at the native API.
+    Statement incident(db, "SELECT 1 FROM edges WHERE a_id=? OR b_id=? LIMIT 1", row.i64(0), row.i64(0));
+    if (incident.row()) throw std::runtime_error("object store: remove incident relationships before deletion");
+    execute(db, "DELETE FROM objects WHERE id=?", row.i64(0));
     appendJournal(db, impl_->options.author, impl_->hostname, bytes, 0, "delete", kind);
     savepoint.release();
 }

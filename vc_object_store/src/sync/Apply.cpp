@@ -1,4 +1,5 @@
 #include "sync/Apply.hpp"
+#include "internal/History.hpp"
 #include "internal/EdgeSql.hpp"
 #include "internal/RecordSql.hpp"
 #include "geometry/GeometryDelta.hpp"
@@ -67,12 +68,10 @@ void applyHeadsAndEdges(ObjectStore& store, WriteTxn& txn, const Json& before, c
         const bool swap = actual.aUuid != edge.aUuid;
         const auto epochs = record.value("lifecycle_bindings", Json::object());
         bindLifecycle(db, actual, epochs.value(swap ? "b" : "a", ""), epochs.value(swap ? "a" : "b", ""));
-        const auto bindings = record.value("geometry_bindings", Json::object());
-        const auto a = bindings.value(swap ? "b" : "a", Json()), b = bindings.value(swap ? "a" : "b", Json());
-        Statement put(db, "UPDATE edge_geometry_bindings SET a_revision=?,b_revision=? WHERE edge_id=(SELECT id FROM edges WHERE uuid=?)");
-        if (a.is_null()) put.bindNull(1); else put.bind(1, parseUuid(a.get<std::string>()));
-        if (b.is_null()) put.bindNull(2); else put.bind(2, parseUuid(b.get<std::string>()));
-        put.bind(3, parseUuid(id)); put.stepDone();
+        // The merge dependency check already verified the imported evidence.
+        // Published current relations use the final endpoint state, not pins
+        // to a second mutable copy of that state.
+        recordRelationshipValidation(db,actual);
     }
 }
 

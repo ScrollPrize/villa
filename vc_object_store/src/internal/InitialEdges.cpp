@@ -3,6 +3,7 @@
 #include "internal/History.hpp"
 #include "geometry/Dependencies.hpp"
 #include "geometry/GeometryInternal.hpp"
+#include "internal/ImmutableImport.hpp"
 #include <limits>
 
 namespace vc::objects::detail {
@@ -13,15 +14,13 @@ struct InitialEdgeInserter::Impl {
     size_t limit;
     size_t sqlBatchRows;
     bool failed=false,finished=false;
+    bool immutable=false;
     std::string author,host;
     std::vector<std::string> indexes;
     struct Endpoint {
         int64_t id=0;
         bool retired=false;
-        std::string epoch;
         std::optional<std::string> geometry;
-        std::optional<nlohmann::json> meta;
-        std::map<std::vector<std::string>,std::string> projections;
         std::optional<DependencyGeometry> dependencies;
     };
     std::unordered_map<std::string,std::shared_ptr<Endpoint>> endpoints;
@@ -29,6 +28,7 @@ struct InitialEdgeInserter::Impl {
     Impl(ObjectStore& s,WriteTxn& t,bool defer,size_t maximum,size_t sqlRows)
         :store(s),txn(t),db(ObjectStoreImplAccess::conn(t)),limit(maximum),sqlBatchRows(sqlRows),author(s.author()),host(s.hostname())
     {
+        immutable=immutableInitial(db);
         if(historyEnabled(db)) throw std::runtime_error("initial edges require history-off storage");
         if(!limit) throw std::invalid_argument("initial edges require a positive endpoint cache limit");
         if(!sqlBatchRows) throw std::invalid_argument("initial edges require a positive SQL batch size");
@@ -53,24 +53,14 @@ struct InitialEdgeInserter::Impl {
     }
     std::shared_ptr<Endpoint> endpoint(const std::string& uuid) {
         if(const auto found=endpoints.find(uuid);found!=endpoints.end()) return found->second;
-        Statement row(db,"SELECT o.id,coalesce(l.retired,0),coalesce(l.epoch,''),g.revision_uuid "
-            "FROM objects o LEFT JOIN object_lifecycle l ON l.object_id=o.id "
-            "LEFT JOIN geometry_heads g ON g.object_uuid=o.uuid WHERE o.uuid=?",parseUuid(uuid));
+        Statement row(db,"SELECT o.id,coalesce(l.retired,0) "
+            "FROM objects o LEFT JOIN object_lifecycle l ON l.object_id=o.id WHERE o.uuid=?",parseUuid(uuid));
         if(!row.row()) throw std::runtime_error("object store: edge endpoint not found: "+uuid);
-        auto value=std::make_shared<Endpoint>();value->id=row.i64(0);value->retired=row.i64(1)!=0;value->epoch=row.text(2);
-        if(!row.isNull(3)) value->geometry=formatUuid(row.blob16(3));
+        auto value=std::make_shared<Endpoint>();value->id=row.i64(0);value->retired=row.i64(1)!=0;
+        if(value->retired) throw std::runtime_error("initial edge endpoint is retired: "+uuid);
+        value->geometry=geometryHead(db,uuid);
         if(endpoints.size()>=limit) endpoints.clear();
         endpoints.emplace(uuid,value);return value;
-    }
-    const std::string& projection(Endpoint& endpoint,const Anchor& anchor) {
-        if(const auto found=endpoint.projections.find(anchor.metadataKeys);found!=endpoint.projections.end()) return found->second;
-        if(!anchor.metadataKeys.empty()&&!endpoint.meta) {
-            Statement row(db,"SELECT meta FROM objects WHERE id=?",endpoint.id);
-            if(!row.row()) throw std::runtime_error("initial edge endpoint disappeared");
-            endpoint.meta=nlohmann::json::parse(row.text(0));
-        }
-        return endpoint.projections.emplace(anchor.metadataKeys,
-            dependencyFields(endpoint.meta?&*endpoint.meta:nullptr,endpoint.retired,endpoint.epoch,anchor).dump()).first->second;
     }
     void validate(Endpoint& endpoint,const Anchor& anchor) {
         if(!endpoint.geometry||(anchor.wholeGeometry&&anchor.points.empty())) return;
@@ -108,29 +98,51 @@ void InitialEdgeInserter::append(std::span<const EdgeRecord> edges) {
         const auto now=nowIsoUtc();
         std::vector<EdgeRecord> prepared;prepared.reserve(edges.size());
         std::vector<EdgeInsertRow> rows;rows.reserve(edges.size());
-        std::vector<EdgeGeometryBinding> geometry;geometry.reserve(edges.size());
-        std::vector<CurrentRelationshipBinding> bindings;bindings.reserve(edges.size());
+        { GeometryPhase preparation("initial_edges.prepare_and_resolve");
         for(size_t i=0;i<edges.size();++i) {
             auto edge=prepareNewEdge(edges[i]);
             auto a=p.endpoint(edge.aUuid),b=p.endpoint(edge.bUuid);
             if(a->id>b->id) {std::swap(a,b);swapEndpoints(edge);}
             p.validate(*a,edge.aAnchor);p.validate(*b,edge.bAnchor);
-            const auto& am=p.projection(*a,edge.aAnchor);const auto& bm=p.projection(*b,edge.bAnchor);
             const auto id=first+int64_t(i);
             prepared.push_back(std::move(edge));
             rows.push_back({&prepared.back(),id,a->id,b->id});
-            geometry.push_back({id,a->geometry,b->geometry});
-            bindings.push_back({id,am,bm,a->epoch,b->epoch});
         }
-        requireUnusedObjectUuids(p.db,rows,p.sqlBatchRows);
-        insertEdgeRows(p.db,rows,generation,p.author,p.host,now,false,p.sqlBatchRows);
-        insertEdgeGeometryBindings(p.db,geometry,p.sqlBatchRows);
-        recordCurrentRelationshipValidations(p.db,bindings,p.sqlBatchRows);
+        }
+        { GeometryPhase phase("initial_edges.uuid_collision_check");
+          requireUnusedObjectUuids(p.db,rows,p.sqlBatchRows); }
+        { GeometryPhase phase("initial_edges.edge_rows");
+          insertEdgeRows(p.db,rows,generation,p.author,p.host,now,false,p.sqlBatchRows); }
+        if(!p.immutable)for(const auto& edge:prepared)recordRelationshipValidation(p.db,edge);
     } catch(...) {p.failed=true;throw;}
 }
 void InitialEdgeInserter::finish() {
     auto& p=*impl_;p.usable();
-    try {for(const auto& sql:p.indexes) exec(p.db,sql.c_str());p.finished=true;p.endpoints.clear();}
+    try {GeometryPhase phase("initial_edges.finish_indexes");
+        for(const auto& sql:p.indexes) exec(p.db,sql.c_str());p.finished=true;p.endpoints.clear();}
     catch(...) {p.failed=true;throw;}
+}
+void InitialEdgeInserter::appendResolved(std::span<const EdgeInsertRow> input) {
+    auto& p=*impl_;p.usable();
+    try {
+        if(input.empty())return;
+        GeometryPhase phase("native.initial_edges.append_resolved");
+        const auto first=p.reserve(input.size()),generation=writeGeneration(p.db);
+        std::vector<EdgeRecord> prepared;prepared.reserve(input.size());
+        std::vector<EdgeInsertRow> rows;rows.reserve(input.size());
+        {GeometryPhase preparation("initial_edges.prepare_resolved");
+        for(size_t i=0;i<input.size();++i){
+            auto rec=prepareNewEdge(*input[i].record);
+            auto a=input[i].aId,b=input[i].bId;
+            if(rec.aUuid!=input[i].record->aUuid)std::swap(a,b);
+            if(a>b){std::swap(a,b);swapEndpoints(rec);}
+            prepared.push_back(std::move(rec));rows.push_back({&prepared.back(),first+int64_t(i),a,b});
+        }}
+        {GeometryPhase collision("initial_edges.uuid_collision_check");
+            requireUnusedObjectUuids(p.db,rows,p.sqlBatchRows);}
+        {GeometryPhase insertion("initial_edges.edge_rows");
+            insertEdgeRows(p.db,rows,generation,p.author,p.host,nowIsoUtc(),false,p.sqlBatchRows);}
+        if(!p.immutable)for(const auto& edge:prepared)recordRelationshipValidation(p.db,edge);
+    }catch(...){p.failed=true;throw;}
 }
 }

@@ -29,16 +29,13 @@ inline Json syncRecord(ObjectStore& store, const Txn& txn, const std::string& id
     }
     if (const auto edge = store.edgeByUuid(txn, id)) {
         auto record = edgeToJson(*edge); record["record_type"] = "edges";
-        Statement binding(ObjectStoreImplAccess::conn(txn), "SELECT a_revision,b_revision FROM edge_geometry_bindings "
-                                                          "WHERE edge_id=(SELECT id FROM edges WHERE uuid=?)",
-            parseUuid(id));
-        if (!binding.row()) throw std::runtime_error("sync: missing edge geometry binding");
+        const auto geometry=store.edgeGeometryState(txn,id);
         const bool swap = record["a"] != edge->aUuid;
         const auto epochs = lifecycleBinding(ObjectStoreImplAccess::conn(txn), *edge);
         if (!epochs.first.empty() || !epochs.second.empty())
             record["lifecycle_bindings"] = {{"a", swap ? epochs.second : epochs.first},
                                              {"b", swap ? epochs.first : epochs.second}};
-        auto revision = [&](int column) -> Json { return binding.isNull(column) ? Json() : Json(formatUuid(binding.blob16(column))); };
+        auto revision = [&](int column) -> Json { const auto& value=column?geometry.bRevision:geometry.aRevision;return value?Json(*value):Json(); };
         record["geometry_bindings"] = {{"a", revision(swap ? 1 : 0)}, {"b", revision(swap ? 0 : 1)}};
         return recordContent(std::move(record));
     }

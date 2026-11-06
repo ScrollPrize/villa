@@ -2,6 +2,7 @@
 #include "vc_object_store/objects/ObjectStore.hpp"
 #include "vc_object_store/geometry/Geometry.hpp"
 #include "internal/Database.hpp"
+#include "internal/VolumeFrames.hpp"
 #include <sqlite3.h>
 #include <cstring>
 
@@ -136,6 +137,36 @@ void directStore(bool spatial)
     }
 }
 
+void kindIndexes(HistoryMode history)
+{
+    TemporaryDirectory dir;OpenOptions options;options.author="test";options.history=history;options.spatialIndex=false;
+    auto store=ObjectStore::create(dir.path/"kinds",options);
+    {
+        auto txn=store.write();
+        for(const auto* kind:{"fiber","note","surface","track"})for(const auto scale:{1,2,4})for(int i=0;i<3;++i) {
+            ObjectRecord record;record.kind=kind;
+            record.meta=nlohmann::json{{"coordinates",{{"volume_uuid","scan"},{"scale_factor",scale}}}}.dump();
+            store.upsertObject(txn,record);
+        }
+        txn.commit();
+    }
+    auto txn=store.read();auto* db=ObjectStoreImplAccess::conn(txn);
+    require(scalar(store,txn,"SELECT count(*) FROM sqlite_schema WHERE type='index' AND name='objects_kind'")==0,
+            "kind-only object index is redundant");
+    detail::Statement plan(db,"EXPLAIN QUERY PLAN SELECT kind FROM objects INDEXED BY objects_kind_uuid WHERE kind>? ORDER BY kind LIMIT 1",std::string{});
+    bool coveringSeek=false;
+    while(plan.row()) {
+        const auto description=plan.text(3);
+        coveringSeek|=description.find("SEARCH")!=std::string::npos&&description.find("COVERING INDEX objects_kind_uuid")!=std::string::npos;
+        require(description.find("TEMP B-TREE")==std::string::npos,"distinct kind lookup needs no sorting materialization");
+    }
+    require(coveringSeek,"kind prefix preserves covering indexed seeks");
+    for(const auto* kind:{"fiber","note","surface","track"})require(store.objectCount(txn,kind)==9,"kind counts preserved");
+    const auto frames=detail::volumeFrames(db,"scan",std::nullopt,false);
+    require(frames.size()==3&&frames[0].toVolume==1&&frames[1].toVolume==.5&&frames[2].toVolume==.25,
+            "unfiltered volume frame discovery preserves distinct kinds and scales");
+}
+
 void surfaceWithoutSpatial(HistoryMode history)
 {
     TemporaryDirectory dir;
@@ -164,6 +195,8 @@ int main()
 {
     directStore(true);
     directStore(false);
+    kindIndexes(HistoryMode::Off);
+    kindIndexes(HistoryMode::On);
     surfaceWithoutSpatial(HistoryMode::Off);
     surfaceWithoutSpatial(HistoryMode::On);
     TemporaryDirectory dir;

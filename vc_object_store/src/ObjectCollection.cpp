@@ -1,6 +1,7 @@
 #include "vc_object_store/objects/ObjectCollection.hpp"
 #include "internal/InitialEdges.hpp"
 #include "internal/InitialObjects.hpp"
+#include "internal/ImmutableImport.hpp"
 #include "vc_object_store/objects/PackedStore.hpp"
 #include "internal/RecordSql.hpp"
 #include "internal/EdgeSql.hpp"
@@ -10,6 +11,7 @@
 #include "geometry/SharedGeometry.hpp"
 #include "geometry/Dependencies.hpp"
 #include "geometry/GeometryInternal.hpp"
+#include "internal/ExternalEndpoint.hpp"
 #include "internal/Publication.hpp"
 #include <variant>
 #include <limits>
@@ -57,13 +59,13 @@ CREATE TABLE collection_routes(
  PRIMARY KEY(key_space,lower_bound,upper_bound,remainder)
 ) WITHOUT ROWID;
 CREATE TABLE collection_external_chunks(
- hash TEXT PRIMARY KEY REFERENCES geometry_chunks(hash) ON DELETE CASCADE,
+ hash BLOB PRIMARY KEY REFERENCES geometry_chunks(hash) ON DELETE CASCADE CHECK(length(hash)=32),
  database_uuid BLOB NOT NULL CHECK(length(database_uuid)=16),
  byte_length INTEGER NOT NULL CHECK(byte_length>0 AND byte_length<=1048576)
 ) WITHOUT ROWID;
 INSERT INTO store_required_features VALUES('collection-v1');
 )SQL");
-    for(const auto* table:{"collection_members","collection_refs","collection_edge_tombstones","collection_routes","collection_external_chunks"})
+    if(!immutableInitial(db))for(const auto* table:{"collection_members","collection_refs","collection_edge_tombstones","collection_routes","collection_external_chunks"})
         for(const auto* op:{"INSERT","UPDATE","DELETE"})
             exec(db,(std::string("CREATE TRIGGER ")+table+"_"+op+" AFTER "+op+" ON "+table+
                 " BEGIN UPDATE store_write_state SET dirty=1 WHERE singleton=1; END;").c_str());
@@ -122,6 +124,9 @@ nlohmann::json editableObject(ObjectRecord record) {
 void validateInheritedMetadata(const std::vector<CollectionEdge>& edges,const std::string& localOwner,
                                const ObjectKey& key,const ObjectRecord& before,const ObjectRecord& after) {
     const auto original=objectToJson(before),updated=objectToJson(after);
+    // Local edges participate in native transaction validation after an actual
+    // override promotes their endpoint handles. Only inherited edges require
+    // removal/recreation here: their readonly owner cannot revalidate them.
     for(const auto& edge:edges)if(edge.key.storeUuid!=localOwner)
         for(const auto& [endpoint,anchor]:{std::pair{edge.a,edge.record.aAnchor},std::pair{edge.b,edge.record.bAnchor}})
             if(endpoint==key&&dependencyMetadata(original,anchor)!=dependencyMetadata(updated,anchor))
@@ -155,6 +160,7 @@ struct ObjectCollection::Impl {
     struct Node { std::unique_ptr<ObjectStore> store; CollectionMember member; bool collection=false; std::vector<KeyRoute> routes; std::vector<std::string> children; };
     std::vector<Node> nodes;
     OpenOptions options;
+    std::shared_ptr<const InitialEndpointDirectory> initialEndpoints;
     // DFS insertion order is explicit precedence: local, then bases in manifest order.
     // Originals are resolved only after considering all overrides/tombstones.
     std::map<std::string,size_t> byDatabase;
@@ -169,7 +175,7 @@ struct ObjectCollection::Impl {
     void installCallbacks(sqlite3* sql,size_t n,const std::function<sqlite3*(size_t)>& get)const{
         if(!nodes[n].collection)return;
         auto locate=[this,n,sql,get](const std::string& hash){
-            Statement s(sql,"SELECT database_uuid,byte_length FROM collection_external_chunks WHERE hash=?",hash);
+            Statement s(sql,"SELECT database_uuid,byte_length FROM collection_external_chunks WHERE hash=?",parseDigest(hash));
             if(!s.row())throw std::runtime_error("collection: absent external chunk reference");
             const auto id=formatUuid(s.blob16(0));auto it=byDatabase.find(id);
             if(it==byDatabase.end()||!depends(n,it->second))throw std::runtime_error("collection: external chunk is not in an immutable dependency");
@@ -180,6 +186,27 @@ struct ObjectCollection::Impl {
         auto* pool=activeStatementPools.at(sql);
         pool->externalGeometryChunkSize=[locate](const auto& hash){return locate(hash).second;};
         pool->externalGeometryChunk=[locate](const auto& hash){return readGeometryPayload(locate(hash).first,hash);};
+        auto endpoint=[this,n,sql,get](const std::string& alias){
+            const auto key=externalEndpointKey(sql,alias,true);
+            if(!key)throw std::runtime_error("collection: absent endpoint key");
+            auto found=locateSql({key->first,key->second},get,0,[&](size_t i){
+                return i!=n&&(depends(n,i)||nodes[i].member.storeUuid==nodes[n].member.storeUuid);
+            });
+            if(!found)throw std::runtime_error("collection: missing external endpoint");
+            return std::pair{*key,*found};
+        };
+        pool->externalEndpointRecord=[endpoint](const std::string& alias){auto [key,found]=endpoint(alias);found.record.uuid=alias;return found.record;};
+        pool->externalEndpointVersion=[this,endpoint,get](const std::string& alias){
+            auto [key,found]=endpoint(alias);Statement generation(get(found.node),"SELECT generation FROM store_manifest WHERE singleton=1");
+            if(!generation.row())throw std::runtime_error("collection: missing endpoint generation");
+            return externalEndpointToken(key.first,key.second,generation.i64(0));
+        };
+        pool->externalEndpointValidateAnchor=[endpoint,get](const std::string& alias,const Anchor& anchor){
+            auto [key,found]=endpoint(alias);auto* source=get(found.node);
+            const auto geometry=geometryHead(source,found.local);
+            if(!geometry){if(anchor.wholeGeometry&&anchor.points.empty())return;throw std::runtime_error("collection: external endpoint geometry absent");}
+            validateDependencies(anchor,dependencyGeometry(source,*geometry));
+        };
     }
     void check(const CollectionTxn&) const;
     const Txn& txn(const CollectionTxn&,size_t) const;
@@ -193,6 +220,8 @@ struct ObjectCollection::Impl {
         if(!s.row()) return {};return Ref{formatUuid(s.blob16(0)),s.text(1)};
     }
     ObjectKey decode(const CollectionTxn& t,size_t n,const std::string& local) const {
+        {Statement external(db(t,n),"SELECT owner_uuid,object_uuid FROM external_object_keys WHERE uuid=?",parseUuid(local));
+         if(external.row())return {formatUuid(external.blob16(0)),formatUuid(external.blob16(1))};}
         if(nodes[n].collection) {
             Statement s(db(t,n),"SELECT owner_uuid,object_uuid FROM collection_refs WHERE local_uuid=?",parseUuid(local));
             if(s.row()) return {formatUuid(s.blob16(0)),formatUuid(s.blob16(1))};
@@ -200,9 +229,12 @@ struct ObjectCollection::Impl {
         return {nodes[n].member.storeUuid,local};
     }
     struct Located {size_t node; std::string local; ObjectRecord record;};
+    std::optional<Located> locateSql(const ObjectKey&,const std::function<sqlite3*(size_t)>&,size_t start=0,
+                                   const std::function<bool(size_t)>& eligible={}) const;
     std::optional<Located> locate(const CollectionTxn&,const ObjectKey&,size_t start=0) const;
     std::optional<std::pair<size_t,GeometryRevision>> geometry(const CollectionTxn&,const ObjectKey&) const;
     std::string ensureLocal(CollectionTxn&,const ObjectKey&);
+    std::string ensureEndpoint(CollectionTxn&,const ObjectKey&);
     std::string ensureLocalGeometry(CollectionTxn&,const ObjectKey&);
     ObjectKey insertEdge(CollectionTxn&,const ObjectKey&,const ObjectKey&,const EdgeRecord&,std::optional<int64_t>);
     bool hiddenEdge(const CollectionTxn&,const ObjectKey&) const;
@@ -233,7 +265,7 @@ struct CollectionTxn::Impl {
         auto* pool=activeStatementPools.at(db);
         if(configured.insert(pool).second){
             try{owner->installCallbacks(db,n,[this](size_t i){return ObjectStoreImplAccess::conn(get(i));});}
-            catch(...){pool->externalGeometryChunk={};pool->externalGeometryChunkSize={};configured.erase(pool);throw;}
+            catch(...){pool->externalGeometryChunk={};pool->externalGeometryChunkSize={};pool->externalEndpointRecord={};pool->externalEndpointVersion={};pool->externalEndpointValidateAnchor={};configured.erase(pool);throw;}
         }
         return *txn;
     }
@@ -308,14 +340,14 @@ struct detail::CollectionReadContext {
         activeStatementPools[root]=rootPool.get();
         try{get(0);}catch(...){activeStatementPools.erase(root);throw;}
     }
-    ~CollectionReadContext(){for(auto* p:configured){p->externalGeometryChunk={};p->externalGeometryChunkSize={};}activeStatementPools.erase(root);}
+    ~CollectionReadContext(){for(auto* p:configured){p->externalGeometryChunk={};p->externalGeometryChunkSize={};p->externalEndpointRecord={};p->externalEndpointVersion={};p->externalEndpointValidateAnchor={};}activeStatementPools.erase(root);}
     sqlite3* get(size_t n){
         sqlite3* sql=root;
         if(n){auto& r=readers[n];if(!r)r=std::make_unique<ReadTxn>(collection.nodes[n].store->read());sql=ObjectStoreImplAccess::conn(*r);}
         auto* pool=activeStatementPools.at(sql);
         if(configured.insert(pool).second){
             try{collection.installCallbacks(sql,n,[this](size_t i){return get(i);});}
-            catch(...){pool->externalGeometryChunk={};pool->externalGeometryChunkSize={};configured.erase(pool);throw;}
+            catch(...){pool->externalGeometryChunk={};pool->externalGeometryChunkSize={};pool->externalEndpointRecord={};pool->externalEndpointVersion={};pool->externalEndpointValidateAnchor={};configured.erase(pool);throw;}
         }
         return sql;
     }
@@ -325,18 +357,43 @@ std::shared_ptr<void> detail::attachCollectionChunkResolver(sqlite3* db,const st
 }
 std::optional<ObjectCollection::Impl::Located> ObjectCollection::Impl::locate(const CollectionTxn& t,const ObjectKey& key,size_t start)const{
     check(t);
-    for(size_t n=start;n<nodes.size();++n)if(auto v=ref(t,n,key);v&&v->state!="reference"){
-        if(v->state=="deleted")return {};
-        auto r=nodes[n].store->objectByUuid(txn(t,n),v->local);
-        if(!r)throw std::runtime_error("collection: missing overridden record");
-        r->uuid=key.objectUuid;return Located{n,v->local,std::move(*r)};
+    return locateSql(key,[&](size_t n){return db(t,n);},start);
+}
+std::optional<ObjectCollection::Impl::Located> ObjectCollection::Impl::locateSql(const ObjectKey& key,
+    const std::function<sqlite3*(size_t)>& get,size_t start,const std::function<bool(size_t)>& eligible)const{
+    auto read=[&](size_t n,const std::string& local)->std::optional<Located>{
+        Statement s(get(n),std::string("SELECT ")+kObjectCols+" FROM objects WHERE uuid=?",parseUuid(local));
+        if(!s.row())return {};auto record=readObjectRow(get(n),s);record.uuid=key.objectUuid;
+        return Located{n,local,std::move(record)};
+    };
+    for(size_t n=start;n<nodes.size();++n)if((!eligible||eligible(n))&&nodes[n].collection){
+        Statement ref(get(n),"SELECT local_uuid,state FROM collection_refs WHERE owner_uuid=? AND object_uuid=?",
+            parseUuid(key.storeUuid),parseUuid(key.objectUuid));
+        if(!ref.row()||ref.text(1)=="reference")continue;
+        if(ref.text(1)=="deleted")return {};
+        auto result=read(n,formatUuid(ref.blob16(0)));if(!result)throw std::runtime_error("collection: missing overridden record");
+        return result;
     }
     std::optional<Located> found;
-    for(size_t n=start;n<nodes.size();++n)if(nodes[n].member.storeUuid==key.storeUuid){
-        auto r=nodes[n].store->objectByUuid(txn(t,n),key.objectUuid);
-        if(r&&decode(t,n,key.objectUuid)==key){if(found)throw std::runtime_error("collection: duplicate object identity across partitions");found=Located{n,key.objectUuid,std::move(*r)};}
+    for(size_t n=start;n<nodes.size();++n)if((!eligible||eligible(n))&&nodes[n].member.storeUuid==key.storeUuid){
+        if(nodes[n].collection){Statement ref(get(n),"SELECT 1 FROM collection_refs WHERE local_uuid=?",parseUuid(key.objectUuid));if(ref.row())continue;}
+        auto r=read(n,key.objectUuid);if(r){if(found)throw std::runtime_error("collection: duplicate object identity across partitions");found=std::move(r);}
     }
     return found;
+}
+std::string ObjectCollection::Impl::ensureEndpoint(CollectionTxn& t,const ObjectKey& key){
+    auto* sql=db(t,0);
+    if(auto v=ref(t,0,key);v){if(v->state=="deleted")throw std::runtime_error("collection: deleted endpoint");return v->local;}
+    if(key.storeUuid==nodes[0].member.storeUuid&&objectIdByUuid(sql,parseUuid(key.objectUuid)))return key.objectUuid;
+    Statement existing(sql,"SELECT uuid FROM external_object_keys WHERE owner_uuid=? AND object_uuid=?",parseUuid(key.storeUuid),parseUuid(key.objectUuid));
+    if(existing.row())return formatUuid(existing.blob16(0));
+    const auto alias=util::nameUuid(nodes[0].member.storeUuid,"reference:"+key.storeUuid+":"+key.objectUuid);
+    if(objectIdByUuid(sql,parseUuid(alias)))throw std::runtime_error("collection: endpoint key collides with owned object");
+    if(edgeIdByUuid(sql,parseUuid(alias)))throw std::runtime_error("collection: endpoint key collides with edge");
+    Statement next(sql,"SELECT coalesce(min(id),0) FROM external_object_keys");next.row();
+    if(next.i64(0)==INT64_MIN)throw std::overflow_error("collection: endpoint handles exhausted");
+    execute(sql,"INSERT INTO external_object_keys VALUES(?,?,?,?)",next.i64(0)-1,parseUuid(alias),parseUuid(key.storeUuid),parseUuid(key.objectUuid));
+    return alias;
 }
 std::optional<std::pair<size_t,GeometryRevision>> ObjectCollection::Impl::geometry(const CollectionTxn& t,const ObjectKey& key)const{
     if(!locate(t,key))return {};
@@ -351,8 +408,8 @@ std::optional<std::pair<size_t,GeometryRevision>> ObjectCollection::Impl::geomet
 std::string ObjectCollection::Impl::ensureLocal(CollectionTxn& t,const ObjectKey& key){
     GeometryPhase phase("collection.endpoint.resolve");
     auto& w=writer(t);
-    // Existing endpoint proxies are by far the common path for relation imports.
-    // Their pinned parents cannot change, so no all-member lookup is necessary.
+    // Reuse an existing genuine override. Relation insertion uses ensureEndpoint
+    // instead and never materializes an object here.
     if(auto v=ref(t,0,key)){
         if(v->state=="deleted")throw std::runtime_error("collection: missing/deleted object");
         if(!objectIdByUuid(db(t,0),parseUuid(v->local)))throw std::runtime_error("collection: missing reference proxy");
@@ -366,7 +423,29 @@ std::string ObjectCollection::Impl::ensureLocal(CollectionTxn& t,const ObjectKey
     auto record=current->record;record.uuid=util::nameUuid(nodes[0].member.storeUuid,"reference:"+key.storeUuid+":"+key.objectUuid);
     if(nodes[0].store->objectByUuid(txn(t,0),record.uuid))throw std::runtime_error("collection: reference UUID collides with an owned object");
     record.storageKind.clear();record.storageRef.clear();record.dataChecksum.reset();record.dataGeneration=0;
-    const auto local=nodes[0].store->upsertObject(w,record);
+    const auto local=[&]{ExternalEndpointPromotion promotion(db(t,0),record.uuid);return nodes[0].store->upsertObject(w,record);}();
+    // Only a real user-requested override promotes endpoint handles. Relation
+    // insertion itself remains an external key, without copied object data.
+    Statement external(db(t,0),"SELECT id FROM external_object_keys WHERE uuid=?",parseUuid(local));
+    if(external.row()){
+        const auto oldId=external.i64(0),newId=*objectIdByUuid(db(t,0),parseUuid(local));
+        const std::string a="CASE WHEN a_id=?1 THEN ?2 ELSE a_id END",b="CASE WHEN b_id=?1 THEN ?2 ELSE b_id END";
+        const std::string swapped="("+a+")>("+b+")";
+        // Validation snapshots describe endpoint sides, so move them with the
+        // anchors before canonicalizing the physical endpoint handles.
+        if(historyEnabled(db(t,0)))
+            execute(db(t,0),"UPDATE history_validated_edges SET a_meta=b_meta,b_meta=a_meta WHERE replace(uuid,'-','') IN "
+                "(SELECT lower(hex(uuid)) FROM edges WHERE (a_id=?1 OR b_id=?1) AND "+swapped+")",oldId,newId);
+        else
+            execute(db(t,0),"UPDATE temp.current_edge_metadata SET a_meta=b_meta,b_meta=a_meta WHERE edge_id IN "
+                "(SELECT id FROM edges WHERE (a_id=?1 OR b_id=?1) AND "+swapped+")",oldId,newId);
+        std::string sql="UPDATE edges SET a_id=min("+a+","+b+"),b_id=max("+a+","+b+")";
+        for(const auto* suffix:{"anchor_x","anchor_y","anchor_z","dir_x","dir_y","dir_z","dependencies"}){
+            const auto ac=std::string("a_")+suffix,bc=std::string("b_")+suffix;
+            sql+=","+ac+"=CASE WHEN "+swapped+" THEN "+bc+" ELSE "+ac+" END,"+bc+"=CASE WHEN "+swapped+" THEN "+ac+" ELSE "+bc+" END";
+        }
+        execute(db(t,0),sql+" WHERE a_id=?1 OR b_id=?1",oldId,newId);
+    }
     // This proxy is the same logical object, not a new lifecycle. Native upsert
     // intentionally ignores caller lifecycle flags, so preserve them explicitly.
     if(record.retired||!record.lifecycleEpoch.empty())writeLifecycle(db(t,0),*objectIdByUuid(db(t,0),parseUuid(local)),record);
@@ -386,15 +465,15 @@ std::string ObjectCollection::Impl::ensureLocalGeometry(CollectionTxn& t,const O
     auto* target=db(t,0);auto* sourceDb=db(t,source->first);
     GeometryReader reader(sourceDb,source->second.uuid,false);auto manifest=reader.manifest();
     auto borrow=[&](const std::string& hash){
-        Statement exists(target,"SELECT 1 FROM geometry_chunks WHERE hash=?",hash);if(exists.row())return;
+        Statement exists(target,"SELECT 1 FROM geometry_chunks WHERE hash=?",parseDigest(hash));if(exists.row())return;
         const auto size=geometryPayloadSize(sourceDb,hash);
-        execute(target,"INSERT INTO geometry_chunks(hash,data) VALUES(?,NULL)",hash);
-        execute(target,"INSERT INTO collection_external_chunks VALUES(?,?,?)",hash,parseUuid(nodes[source->first].member.databaseUuid),size);
+        execute(target,"INSERT INTO geometry_chunks(hash,data) VALUES(?,NULL)",parseDigest(hash));
+        execute(target,"INSERT INTO collection_external_chunks VALUES(?,?,?)",parseDigest(hash),parseUuid(nodes[source->first].member.databaseUuid),size);
     };
     for(auto& [name,array]:manifest.at("arrays").items()){
         array.erase("source_revision");int64_t index=0;
         for(const auto& entry:array.at("chunks")){
-            const auto hash=entry.get<std::string>();Statement exists(sourceDb,"SELECT 1 FROM geometry_chunks WHERE hash=?",hash);
+            const auto hash=entry.get<std::string>();Statement exists(sourceDb,"SELECT 1 FROM geometry_chunks WHERE hash=?",parseDigest(hash));
             if(exists.row())borrow(hash);
             else {const auto bytes=reader.chunk(name,index);if(storeSharedPayload(target,name,bytes)!=hash)throw std::runtime_error("collection: reconstructed chunk hash mismatch");}
             ++index;
@@ -427,6 +506,31 @@ ObjectCollection ObjectCollection::create(const std::filesystem::path& path,cons
     {auto verified=open(staged.path,OpenOptions{.readOnly=true});}
     staged.publish();
     return open(path,options);
+}
+ObjectCollection detail::InitialCollectionAccess::create(const std::filesystem::path& path,
+    const std::vector<std::filesystem::path>& bases,const OpenOptions& options)
+{
+    // This path is private to the initial builder, which owns staging and
+    // publication. No intermediate writable store is published or reopened.
+    std::vector<CollectionMember> members;int64_t generation=options.initialGeneration;
+    for(const auto& base:bases){auto c=ObjectCollection::open(base,OpenOptions{.readOnly=true});auto r=c.read();
+        const auto p=c.provisioning(r);if(!p.sealed||p.generation>=INT64_MAX-1)
+            throw std::runtime_error("initial collection needs sealed, non-exhausted dependencies");
+        generation=std::max(generation,p.generation);members.push_back(c.impl_->nodes[0].member);}
+    auto opt=options;opt.initialGeneration=generation;opt.physicalPartitionOnly=true;
+    auto store=std::make_unique<ObjectStore>(ObjectStoreImplAccess::createInitial(path,opt));
+    {auto w=store->write();auto* db=ObjectStoreImplAccess::conn(w);collectionSchema(db);
+     int64_t ordinal=0;for(const auto& m:members){
+        if(m.storeUuid==store->uuid(w))throw std::runtime_error("initial collection needs independent dependency ownership");
+        insertMember(db,ordinal++,m,locator(normalized(path),m.locator));}
+     w.commit();}
+    auto p=std::make_unique<ObjectCollection::Impl>();p->options=opt;std::set<std::string> visiting;
+    {auto r=store->read();p->load(path,true,{},visiting,ObjectStoreImplAccess::conn(r));}
+    p->nodes[0].store=std::move(store);return ObjectCollection(std::move(p));
+}
+void detail::InitialCollectionAccess::setEndpoints(ObjectCollection& collection,std::shared_ptr<const InitialEndpointDirectory> endpoints)
+{
+    collection.impl_->initialEndpoints=std::move(endpoints);
 }
 ObjectCollection ObjectCollection::publishShards(const std::filesystem::path& path,const std::vector<std::filesystem::path>& shards,const OpenOptions& options,const std::vector<KeyRoute>& requestedRoutes){
     if(shards.empty())throw std::runtime_error("collection: empty shard list");
@@ -511,8 +615,22 @@ std::string ObjectCollection::editGeometry(CollectionTxn& t,const ObjectKey& inp
     if(!current||current->uuid!=expected)throw std::runtime_error("collection: geometry changed; reload before editing");
     for(const auto& edge:edgesOf(t,key))if(edge.key.storeUuid!=uuid(t))
         throw std::runtime_error("collection: explicitly remove/recreate inherited incident edges before editing geometry");
+    std::map<std::string,CollectionEdge> observed;
+    for(const auto& decision:decisions){
+        const auto before=edge(t,{uuid(t),decision.edgeUuid});
+        if(!before||before->record.generation!=decision.expectedGeneration)throw std::runtime_error("collection: geometry decision edge changed");
+        const auto ga=currentGeometry(t,before->a),gb=currentGeometry(t,before->b);
+        if(decision.aRevision!=(ga?std::optional(ga->uuid):std::nullopt)||decision.bRevision!=(gb?std::optional(gb->uuid):std::nullopt))
+            throw std::runtime_error("collection: geometry decision endpoint changed");
+        observed.emplace(decision.edgeUuid,*before);
+    }
     Savepoint save(impl_->db(t,0));const auto localExpected=impl_->ensureLocalGeometry(t,key);const auto local=impl_->ensureLocal(t,key);
-    auto adapted=decisions;for(auto& d:adapted){if(d.aRevision==expected)d.aRevision=localExpected;if(d.bRevision==expected)d.bRevision=localExpected;}
+    auto adapted=decisions;for(auto& d:adapted){
+        const auto after=*impl_->nodes[0].store->edgeByUuid(w,d.edgeUuid);
+        if(impl_->decode(t,0,after.aUuid)!=observed.at(d.edgeUuid).a){std::swap(d.aAnchor,d.bAnchor);std::swap(d.aRevision,d.bRevision);}
+        d.expectedGeneration=after.generation;
+        d.aRevision=geometryHead(impl_->db(t,0),after.aUuid);d.bRevision=geometryHead(impl_->db(t,0),after.bUuid);
+    }
     const auto result=impl_->nodes[0].store->editGeometry(w,local,edits,localExpected,adapted);save.release();return result;
 }
 std::vector<CollectionEdge> ObjectCollection::edgesOf(const CollectionTxn& t,const ObjectKey& input)const{
@@ -520,9 +638,17 @@ std::vector<CollectionEdge> ObjectCollection::edgesOf(const CollectionTxn& t,con
     std::vector<CollectionEdge> out;std::set<ObjectKey> seen;
     for(size_t n=0;n<impl_->nodes.size();++n){std::vector<std::string> locals;
         if(auto v=impl_->ref(t,n,key))locals.push_back(v->local);
+        {Statement ref(impl_->db(t,n),"SELECT uuid FROM external_object_keys WHERE owner_uuid=? AND object_uuid=?",parseUuid(key.storeUuid),parseUuid(key.objectUuid));
+         if(ref.row())locals.push_back(formatUuid(ref.blob16(0)));}
         if(impl_->nodes[n].member.storeUuid==key.storeUuid&&impl_->nodes[n].store->objectByUuid(impl_->txn(t,n),key.objectUuid))locals.push_back(key.objectUuid);
-        for(const auto& local:locals)for(auto r:impl_->nodes[n].store->edgesOf(impl_->txn(t,n),local)){
+        std::sort(locals.begin(),locals.end());locals.erase(std::unique(locals.begin(),locals.end()),locals.end());
+        for(const auto& local:locals){
+          Statement endpointIds(impl_->db(t,n),"SELECT id FROM endpoint_keys WHERE uuid=?",parseUuid(local));
+          while(endpointIds.row()){
+            Statement selected(impl_->db(t,n),std::string("SELECT ")+kEdgeCols+" FROM edges WHERE (a_id=? OR b_id=?) AND "+activeEdgeSql()+" ORDER BY id",endpointIds.i64(0),endpointIds.i64(0));
+            for(auto r:readEdgeRows(impl_->db(t,n),selected)){
             auto e=impl_->edge(t,n,std::move(r));if(!seen.insert(e.key).second||impl_->hiddenEdge(t,e.key)||!object(t,e.a)||!object(t,e.b))continue;out.push_back(std::move(e));}}
+        }}
     return out;
 }
 std::vector<CollectionEdge> ObjectCollection::edgesByKind(const CollectionTxn& t,const std::string& kind)const{
@@ -555,7 +681,7 @@ std::optional<CollectionEdge> ObjectCollection::edgeById(const CollectionTxn& t,
     return found?edge(t,*found):std::nullopt;
 }
 ObjectKey ObjectCollection::upsertObject(CollectionTxn& t,const ObjectRecord& r){auto& w=impl_->writer(t);
-    if(!r.uuid.empty()){Statement s(impl_->db(t,0),"SELECT 1 FROM collection_refs WHERE local_uuid=?",parseUuid(r.uuid));if(s.row())throw std::runtime_error("collection: use qualified replacement for inherited objects");}
+    if(!r.uuid.empty()){Statement s(impl_->db(t,0),"SELECT 1 FROM collection_refs WHERE local_uuid=?1 UNION ALL SELECT 1 FROM external_object_keys WHERE uuid=?1",parseUuid(r.uuid));if(s.row())throw std::runtime_error("collection: use qualified replacement for inherited objects");}
     return {uuid(t),impl_->nodes[0].store->upsertObject(w,r)};
 }
 void ObjectCollection::replaceObject(CollectionTxn& t,const ObjectKey& input,const ObjectRecord& r){auto key=canonical(input);auto& w=impl_->writer(t);Savepoint save(impl_->db(t,0));
@@ -588,16 +714,15 @@ ObjectKey ObjectCollection::Impl::insertEdge(CollectionTxn& t,const ObjectKey& a
     auto& w=writer(t);Savepoint save(db(t,0));
     {GeometryPhase geometryPhase("collection.edge.geometry");
     for(const auto& [key,anchor]:{std::pair{canonical(a),input.aAnchor},std::pair{canonical(b),input.bAnchor}}){
+        auto endpoint=locate(t,key);
+        if(!endpoint||endpoint->record.retired)throw std::runtime_error("collection: missing/deleted/retired endpoint");
         if(anchor.wholeGeometry&&anchor.points.empty())continue;
         if(auto g=geometry(t,key)){
             validateDependencies(anchor,dependencyGeometry(*nodes[g->first].store,txn(t,g->first),g->second));
-            // Native edge bindings must point to a local descriptor, not NULL:
-            // otherwise later indexed geometry edits bypass their dependency.
-            if(g->first!=0)ensureLocalGeometry(t,key);
         }
     }
     }
-    auto r=input;r.aUuid=ensureLocal(t,canonical(a));r.bUuid=ensureLocal(t,canonical(b));
+    auto r=input;r.aUuid=ensureEndpoint(t,canonical(a));r.bUuid=ensureEndpoint(t,canonical(b));
     const auto result=id?nodes[0].store->insertEdgeWithId(w,r,*id):nodes[0].store->addEdge(w,r);
     save.release();return {nodes[0].member.storeUuid,result};
 }
@@ -616,9 +741,12 @@ int64_t ObjectCollection::importInitialEdges(CollectionTxn& t,
     auto& w=impl_->writer(t);auto* db=impl_->db(t,0);
     Savepoint save(db);
     detail::InitialEdgeInserter writer(*impl_->nodes[0].store,w,options.deferIndexes,options.maxCachedEndpoints,options.sqlBatchRows);
-    std::map<ObjectKey,std::string> endpoints;
+    struct Endpoint {std::string alias;int64_t id;const PreparedDependencies* prepared=nullptr;
+        std::optional<DependencyGeometry> geometry;bool geometryLoaded=false;};
+    std::map<ObjectKey,Endpoint> endpoints;
     std::vector<InitialCollectionEdge> batch;
     std::vector<EdgeRecord> native;
+    std::vector<EdgeInsertRow> rows;
     int64_t count=0;
     for(;;){
         batch.clear();
@@ -637,64 +765,52 @@ int64_t ObjectCollection::importInitialEdges(CollectionTxn& t,
         }
         if(batch.empty())throw std::invalid_argument("collection: initial edge producer returned an empty nonterminal batch");
         if(batch.size()>static_cast<uint64_t>(INT64_MAX-count))throw std::overflow_error("collection: initial edge count overflow");
-        native.clear();native.reserve(batch.size());
-        // Resolve and construct reference endpoints once per batch, before any
-        // edge binding. This is initial construction, never an object edit.
-        std::map<ObjectKey,std::string> resolved;
-        std::vector<InitialObjectRecord> proxies;
-        std::vector<ObjectKey> proxyKeys;
-        for(const auto& input:batch)for(const auto& original:{input.a,input.b}){
+        native.clear();native.reserve(batch.size());rows.clear();rows.reserve(batch.size());
+        if(endpoints.size()>=options.maxCachedEndpoints)endpoints.clear();
+        auto resolveEndpoint=[&](const ObjectKey& original,const Anchor& anchor)->Endpoint&{
             const auto key=canonical(original);
-            if(resolved.contains(key))continue;
-            if(auto it=endpoints.find(key);it!=endpoints.end()){
-                resolved.emplace(key,it->second);continue;
-            }
-            GeometryPhase phase("collection.endpoint.resolve");
-            if(auto ref=impl_->ref(t,0,key)){
-                if(ref->state=="deleted"||!objectIdByUuid(db,parseUuid(ref->local)))
-                    throw std::runtime_error("collection: missing/deleted reference endpoint");
-                resolved.emplace(key,ref->local);continue;
-            }
-            auto current=[&]{GeometryPhase lookup("collection.endpoint.parent_lookup");return impl_->locate(t,key);}();
-            if(!current)throw std::runtime_error("collection: missing/deleted object");
-            if(current->node==0){resolved.emplace(key,current->local);continue;}
-            auto record=std::move(current->record);
-            record.uuid=util::nameUuid(impl_->nodes[0].member.storeUuid,"reference:"+key.storeUuid+":"+key.objectUuid);
-            record.storageKind.clear();record.storageRef.clear();record.dataChecksum.reset();record.dataGeneration=0;
-            resolved.emplace(key,record.uuid);
-            proxies.push_back({std::move(record),{}, {}});proxyKeys.push_back(key);
-        }
-        if(!proxies.empty()){
-            GeometryPhase phase("collection.endpoint.materialize");
-            const auto inserted=detail::insertInitialObjects(*impl_->nodes[0].store,w,proxies);
-            const auto generation=writeGeneration(db);
-            for(size_t i=0;i<inserted.size();++i)
-                execute(db,"INSERT INTO collection_refs VALUES(?,?,?,?,?)",parseUuid(inserted[i].first),
-                    parseUuid(proxyKeys[i].storeUuid),parseUuid(proxyKeys[i].objectUuid),std::string("reference"),generation);
-        }
-        for(const auto& [key,local]:resolved){
-            if(endpoints.size()==options.maxCachedEndpoints)endpoints.clear();
-            endpoints.insert_or_assign(key,local);
-        }
-        for(auto& input:batch){
-            auto resolveEndpoint=[&](const ObjectKey& original,const Anchor& anchor){
-                const auto key=canonical(original);
-                if(!anchor.wholeGeometry || !anchor.points.empty()){
-                    if(auto g=impl_->geometry(t,key)){
-                        validateDependencies(anchor,dependencyGeometry(*impl_->nodes[g->first].store,impl_->txn(t,g->first),g->second));
-                        if(g->first!=0)impl_->ensureLocalGeometry(t,key);
+            auto it=endpoints.find(key);
+            if(it==endpoints.end()){
+                Endpoint endpoint;
+                const InitialEndpoint* prepared=nullptr;
+                if(impl_->initialEndpoints){auto p=impl_->initialEndpoints->find(key);if(p!=impl_->initialEndpoints->end())prepared=&p->second;}
+                if(prepared){
+                    if(prepared->retired)throw std::runtime_error("collection: retired initial endpoint");
+                    const auto& range=impl_->nodes[0].member.objectIds;
+                    if(key.storeUuid==uuid(t)&&prepared->id>=range[0]&&prepared->id<=range[1]){
+                        endpoint.alias=key.objectUuid;endpoint.id=prepared->id;
+                    }else{
+                        endpoint.alias=impl_->ensureEndpoint(t,key);endpoint.id=*endpointIdByUuid(db,parseUuid(endpoint.alias));
                     }
+                    endpoint.prepared=prepared->geometry?&*prepared->geometry:nullptr;endpoint.geometryLoaded=true;
+                }else{
+                    auto current=impl_->locate(t,key);
+                    if(!current||current->record.retired)throw std::runtime_error("collection: missing/deleted/retired endpoint");
+                    endpoint.alias=impl_->ensureEndpoint(t,key);endpoint.id=*endpointIdByUuid(db,parseUuid(endpoint.alias));
                 }
-                const auto found=resolved.find(key);
-                if(!anchor.wholeGeometry || !anchor.points.empty())writer.invalidateEndpoint(found->second);
-                return found->second;
-            };
-            auto a=resolveEndpoint(input.a,input.record.aAnchor);
-            auto b=resolveEndpoint(input.b,input.record.bAnchor);
-            input.record.aUuid=std::move(a);input.record.bUuid=std::move(b);
+                it=endpoints.emplace(key,std::move(endpoint)).first;
+            }
+            auto& endpoint=it->second;
+            if(!anchor.wholeGeometry||!anchor.points.empty()){
+                if(endpoint.prepared)validateDependencies(anchor,*endpoint.prepared);
+                else{
+                    if(!endpoint.geometryLoaded){
+                        if(auto g=impl_->geometry(t,key))endpoint.geometry=dependencyGeometry(*impl_->nodes[g->first].store,impl_->txn(t,g->first),g->second);
+                        endpoint.geometryLoaded=true;
+                    }
+                    if(endpoint.geometry)validateDependencies(anchor,*endpoint.geometry);
+                }
+            }
+            return endpoint;
+        };
+        for(auto& input:batch){
+            auto& a=resolveEndpoint(input.a,input.record.aAnchor);
+            auto& b=resolveEndpoint(input.b,input.record.bAnchor);
+            input.record.aUuid=a.alias;input.record.bUuid=b.alias;
             native.push_back(std::move(input.record));
+            rows.push_back({&native.back(),0,a.id,b.id});
         }
-        writer.append(native);
+        writer.appendResolved(rows);
         count+=static_cast<int64_t>(native.size());
     }
     writer.finish();

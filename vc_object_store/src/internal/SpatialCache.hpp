@@ -1,5 +1,6 @@
 #pragma once
 #include "internal/Database.hpp"
+#include "geometry/GeometryToken.hpp"
 #include <numeric>
 #include <vc_object_store/geometry/BoundsIndex.hpp>
 
@@ -12,7 +13,7 @@ inline SpatialRegion readSpatialRegion(const Statement& rows)
 {
     SpatialRegion r;
     r.objectUuid = formatUuid(rows.blob16(0)); r.kind = rows.text(1);
-    if (!rows.isNull(2)) r.revisionUuid = formatUuid(rows.blob16(2));
+    if (!rows.isNull(2)) r.revisionUuid = readGeometryTokenColumn(rows,2);
     r.arrayName = rows.text(3);
     if (!r.arrayName.empty()) {
         r.start.push_back(rows.i64(4)); r.shape.push_back(rows.i64(6));

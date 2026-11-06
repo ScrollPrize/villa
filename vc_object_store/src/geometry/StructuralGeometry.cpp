@@ -72,7 +72,7 @@ std::string ObjectStore::editGeometrySequence(WriteTxn& txn,const std::string& o
     auto* db=static_cast<sqlite3*>(connection(txn)); checked(db); Savepoint savepoint(db); MetadataCacheScope cache;
     try {
         const auto uuid=formatUuid(parseUuid(objectId)); const auto current=currentGeometry(txn,uuid);
-        if (!current || current->uuid!=formatUuid(parseUuid(expected))) historyConflict(db,"geometry: current revision changed; reload before committing");
+        if (!current || current->uuid!=canonicalGeometryToken(expected)) historyConflict(db,"geometry: current revision changed; reload before committing");
         if (current->kind=="surface" || (current->kind=="fiber" ? edit.array!="control_points" && edit.array!="line_points" : edit.array!="points"))
             throw std::invalid_argument("invalid structural sequence array");
         GeometryReader reader(txn,current->uuid); auto manifest=reader.manifest();
@@ -188,7 +188,7 @@ std::string ObjectStore::resizeSurface(WriteTxn& txn,const std::string& objectId
     auto* db=static_cast<sqlite3*>(connection(txn)); checked(db); Savepoint savepoint(db); MetadataCacheScope cache;
     try {
         const auto uuid=formatUuid(parseUuid(objectId)); const auto current=currentGeometry(txn,uuid);
-        if (!current || current->uuid!=formatUuid(parseUuid(expected))) historyConflict(db,"geometry: current revision changed; reload before committing");
+        if (!current || current->uuid!=canonicalGeometryToken(expected)) historyConflict(db,"geometry: current revision changed; reload before committing");
         if (current->kind!="surface") throw std::invalid_argument("surface resize requires a surface");
         GeometryReader reader(txn,current->uuid); auto manifest=reader.manifest();
         if (resize.rows<0 || resize.columns<0) throw std::invalid_argument("negative surface shape");

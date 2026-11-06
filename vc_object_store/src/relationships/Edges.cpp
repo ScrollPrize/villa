@@ -97,7 +97,7 @@ void ObjectStore::removeEdge(WriteTxn& txn, const std::string& uuid)
 std::vector<EdgeRecord> ObjectStore::edgesOf(const Txn& txn, const std::string& objectUuid, bool includeRetired) const
 {
     sqlite3* db = static_cast<sqlite3*>(connection(txn));
-    auto id = objectIdByUuid(db, parseUuid(objectUuid));
+    auto id = endpointIdByUuid(db, parseUuid(objectUuid));
     if (!id) throw std::runtime_error("object store: object not found: " + objectUuid);
     Statement s(db, std::string("SELECT ") + kEdgeCols + " FROM edges WHERE (a_id=? OR b_id=?)" +
         (includeRetired ? std::string() : " AND " + activeEdgeSql()) + " ORDER BY id", *id, *id);
@@ -137,7 +137,7 @@ std::unique_ptr<Statement> detail::edgeSelectionQuery(sqlite3* db, const EdgeSel
     if (endpointIds || selection.endpointUuids) {
         nlohmann::json ids = endpointIds ? nlohmann::json(*endpointIds) : nlohmann::json::array();
         if (!endpointIds) for (const auto& uuid : *selection.endpointUuids)
-            if (auto id = objectIdByUuid(db, parseUuid(uuid))) ids.push_back(*id);
+            if (auto id = endpointIdByUuid(db, parseUuid(uuid))) ids.push_back(*id);
         const auto members = " IN (SELECT value FROM json_each(" + parameter(ids.dump()) + "))";
         const std::string kind = selection.kind ? " AND kind=?1" : "";
         // Materialize endpoint-index candidates, then probe by primary key.

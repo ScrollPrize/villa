@@ -114,6 +114,51 @@ void failures()
     mustFail([&]{importInitialCollection(racingDir,opt,[&](size_t i,auto&){if(i==0)std::filesystem::create_directory(racingDir);});});
     require(std::filesystem::is_empty(racingDir),"concurrent directory preserved");
 }
+void phased(bool packed)
+{
+    TemporaryDirectory dir;auto opt=options(3,packed);
+    std::vector<std::string> ids(3),edges(3);for(auto& id:ids)id=util::newUuid();for(auto& id:edges)id=util::newUuid();
+    std::atomic<size_t> objectsFinished=0;
+    const auto result=importInitialCollection(dir.path/"phased",opt,[&](size_t i,auto& shard){
+        auto row=fiber(ids[i]);row.id=opt.shards[i].objectIds[0];shard.appendObjects(std::span(&row,1));
+        ++objectsFinished;
+    },[&](size_t i,auto& shard){
+        require(objectsFinished==3,"all object producers precede any edge producer");
+        bool sent=false;shard.importEdges([&](auto& batch){if(sent)return false;sent=true;
+            EdgeRecord edge;edge.uuid=edges[i];edge.kind="sibling";edge.aAnchor.points={{"line_points",{1}}};
+            edge.bAnchor.points={{"line_points",{0}}};edge.aAnchor.metadataKeys={"native"};
+            batch.push_back({{shard.storeUuid(),ids[i]},{shard.storeUuid(),ids[(i+1)%3]},edge});return true;});
+    });
+    auto store=ObjectCollection::open(result.path,OpenOptions{.readOnly=true});auto txn=store.read();
+    for(size_t i=0;i<3;++i) {
+        const auto edge=store.edge(txn,{result.storeUuid,edges[i]});require(bool(edge),"phased sibling edge published");
+        const ObjectKey a{result.storeUuid,ids[i]},b{result.storeUuid,ids[(i+1)%3]};
+        require((edge->a==a&&edge->b==b)||(edge->a==b&&edge->b==a),"phased endpoint identities retained");
+        require(store.readGeometryArray(txn,b,"line_points").size()==6*sizeof(double),"phased sibling geometry routes after publication");
+    }
 }
-int main(){try{for(bool packed:{false,true})for(size_t count:{1u,2u})roundTrip(count,packed);failures();
+void phaseFailures()
+{
+    TemporaryDirectory dir;auto opt=options(3);
+    auto fail=[&](const auto& objects,const auto& edges){
+        mustFail([&]{importInitialCollection(dir.path/"failed",opt,objects,edges);});
+        require(!std::filesystem::exists(dir.path/"failed"),"failed phase never publishes");
+        require(std::filesystem::is_empty(dir.path),"failed phase cleans private shards");
+    };
+    fail([](size_t i,auto&){if(i==0)throw std::runtime_error("object producer failed");},[](size_t,auto&){});
+    fail([](size_t,auto&){},[](size_t i,auto&){if(i==0)throw std::runtime_error("edge producer failed");});
+    fail([](size_t,auto& shard){shard.importEdges([](auto&){return false;});},[](size_t,auto&){});
+    fail([](size_t,auto&){},[](size_t,auto& shard){shard.appendObjects({});});
+    const auto duplicate=util::newUuid();
+    fail([&](size_t,auto& shard){auto row=fiber(duplicate);shard.appendObjects(std::span(&row,1));},[](size_t,auto&){});
+    // Cross-shard geometry validation still rejects an out-of-range anchor.
+    std::vector<std::string> ids(3);for(auto& id:ids)id=util::newUuid();
+    fail([&](size_t i,auto& shard){auto row=fiber(ids[i]);shard.appendObjects(std::span(&row,1));},[&](size_t i,auto& shard){
+        bool sent=false;shard.importEdges([&](auto& batch){if(sent)return false;sent=true;
+            EdgeRecord edge;edge.kind="bad";edge.bAnchor.points={{"line_points",{999}}};
+            batch.push_back({{shard.storeUuid(),ids[i]},{shard.storeUuid(),ids[(i+1)%3]},edge});return true;});
+    });
+}
+}
+int main(){try{for(bool packed:{false,true}){for(size_t count:{1u,2u})roundTrip(count,packed);phased(packed);}failures();phaseFailures();
     std::cout<<"initial import passed\n";return 0;}catch(const std::exception& e){std::cerr<<e.what()<<'\n';return 1;}}

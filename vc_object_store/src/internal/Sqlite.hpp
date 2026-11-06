@@ -39,6 +39,7 @@ public:
     }
     void bindNull(int i);
     void bind(int i, const std::array<unsigned char, 16>& v);
+    template<size_t N> void bind(int i, const std::array<uint8_t,N>& v) { bind(i,std::span<const uint8_t>(v)); }
     template<class... Args> void bindAll(const Args&... args) {
         int index = 1;
         (bind(index++, args), ...);

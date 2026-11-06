@@ -65,9 +65,15 @@ int main() try {
     }
     {auto r=overlay.read();require(overlay.edgeById(r,owner,17)->key==edge,"qualified explicit edge ID was not preserved");}
     {
+        auto read=overlay.read();const auto current=overlay.edge(read,edge);
+        require(current&&((current->a==a&&current->b==c)||(current->a==c&&current->b==a)),"indexed edge retains qualified endpoint keys");
+        require(overlay.currentGeometry(read,a)&&overlay.readGeometryArray(read,a,"line_points")==expected,
+                "indexed inherited geometry resolves through its original owner");
         auto raw=ObjectStore::open(overlayPath,OpenOptions{.physicalPartitionOnly=true,.readOnly=true});auto r=raw.read();
-        Statement binding(ObjectStoreImplAccess::conn(r),"SELECT a_revision IS NOT NULL OR b_revision IS NOT NULL FROM edge_geometry_bindings WHERE edge_id=(SELECT id FROM edges WHERE uuid=?)",parseUuid(edge.objectUuid));
-        require(binding.row()&&binding.i64(0),"indexed inherited edge has no geometry revision binding");
+        Statement counts(ObjectStoreImplAccess::conn(r),"SELECT (SELECT count(*) FROM objects),"
+            "(SELECT count(*) FROM collection_refs),(SELECT count(*) FROM current_geometry),(SELECT count(*) FROM geometry_chunks)");
+        require(counts.row()&&counts.i64(0)==2&&counts.i64(1)==1&&counts.i64(2)==0&&counts.i64(3)==0,
+            "adding indexed edge must not copy endpoint beyond the existing override and owned object");
     }
     const auto boundGeneration=generation(overlay);
     {
