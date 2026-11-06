@@ -15,7 +15,7 @@ from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 from tqdm.auto import tqdm
 
-from dinovol_2.dataset.cuda_pipeline import CudaBatchProcessor, CudaDataLoader
+from dinovol_2.dataset.cuda_pipeline import BatchDataLoader
 from dinovol_2.dataset.ssl_zarr_dataset import SSLZarrDataset
 
 from dinovol_2.eval.task_eval import TaskEvalRunner
@@ -131,6 +131,15 @@ class Trainer:
         self.grad_accumulation_steps = int(self.runtime_config.get("grad_accumulation_steps", 1))
         if self.grad_accumulation_steps < 1:
             raise ValueError("grad_accumulation_steps must be at least 1")
+        lr_scaling = self.optimizer_config.get("lr_scaling")
+        if lr_scaling is not None:
+            # Resolve the peak LR once from the global optimizer source batch and record it.
+            from dinovol_2.methods.jem_config import lr_from_batch
+            global_batch = int(self.data_config.get("batch_size", 2)) * self.world_size * self.grad_accumulation_steps
+            self.base_lr = lr_from_batch(float(lr_scaling["base_lr"]), global_batch,
+                                         int(lr_scaling["reference_batch"]), str(lr_scaling.get("rule", "sqrt")))
+            self.optimizer_config["lr"] = self.base_lr
+            self.optimizer_config["lr_scaling"] = {**dict(lr_scaling), "global_batch": global_batch}
         self.method = method if method is not None else build_method(
             self.config, device=self.device, is_distributed=self.is_distributed, rank=self.rank)
         self.config["method"]["name"] = self.method.name
@@ -370,7 +379,6 @@ class Trainer:
 
     def _build_ssl_dataloader(self, dataset_config: Mapping[str, Any], *, shuffle: bool) -> DataLoader:
         dataset = SSLZarrDataset(dataset_config, do_augmentations=True)
-        collate_fn = self.method.build_collate(dataset)
         shuffle = bool(self.data_config.get("shuffle", shuffle))
         sampler = build_distributed_sampler(
             dataset,
@@ -379,13 +387,13 @@ class Trainer:
             world_size=self.world_size,
             shuffle=shuffle,
         )
-        return CudaDataLoader(
+        return BatchDataLoader(
             dataset,
             device=self.device,
             batch_size=int(self.data_config.get("batch_size", 2)),
             shuffle=shuffle if sampler is None else False,
             sampler=sampler,
-            collate_fn=collate_fn,
+            processor=self.method.build_processor(dataset, self.device),
             generator=self._loader_generator(),
             **self._build_dataloader_kwargs(),
         )
@@ -554,9 +562,8 @@ class Trainer:
         if self._monitor_dataset is None or self._monitor_collate_fn is None:
             monitor_dataset_config = self._dataset_config("monitor_dataset") or self._dataset_config("val_dataset") or self._dataset_config("dataset")
             dataset = SSLZarrDataset(monitor_dataset_config, do_augmentations=True)
-            collate_fn = self.method.build_collate(dataset)
             self._monitor_dataset = dataset
-            self._monitor_collate_fn = CudaBatchProcessor(dataset.config, collate_fn, device=self.device)
+            self._monitor_collate_fn = self.method.build_processor(dataset, self.device)
         return self._monitor_dataset, self._monitor_collate_fn
 
     def build_monitor_batch(self, seed: int | None = None) -> dict[str, Any]:
@@ -634,19 +641,7 @@ class Trainer:
 
     def _monitor_subset(self, batch: Mapping[str, Any]) -> dict[str, Any]:
         """The first monitor_batch_size samples of a collated batch, for save_monitor_image."""
-        batch_size = int(batch["batch_size"])
-        n_global_views = int(batch["n_global_views"])
-        sample_count = min(batch_size, self.monitor_batch_size)
-        global_crops = batch["collated_global_crops"]
-        index = torch.tensor(
-            [view * batch_size + sample for view in range(n_global_views) for sample in range(sample_count)],
-            dtype=torch.long, device=global_crops.device,
-        )
-        return {
-            "collated_global_crops": global_crops.index_select(0, index),
-            "n_global_views": n_global_views,
-            "batch_size": sample_count,
-        }
+        return self.method.monitor_subset(batch, self.monitor_batch_size)
 
     def _run_task_evals(self, step: int) -> None:
         if self._task_evaluator is None:
@@ -810,14 +805,23 @@ class Trainer:
         totals = None
         names = None
         model = getattr(self.method, "model", None)
+        ddp = isinstance(model, DistributedDataParallel)
+
+        def autocast():
+            return torch.autocast(device_type=self.device.type, dtype=self.amp_dtype, enabled=self.use_amp)
+
+        def backward(loss):
+            self.scaler.scale(loss / len(micro_batches)).backward()
+
         for index, micro_batch in enumerate(micro_batches):
-            # Accumulate locally and all-reduce once, on the last microbatch's backward.
+            # Accumulate locally and all-reduce once, on the last microbatch's final backward.
             last = index == len(micro_batches) - 1
-            no_sync = model.no_sync() if isinstance(model, DistributedDataParallel) and not last else contextlib.nullcontext()
-            with no_sync:
-                with torch.autocast(device_type=self.device.type, dtype=self.amp_dtype, enabled=self.use_amp):
-                    output = self.method(micro_batch, step)
-                self.scaler.scale(output.loss / len(micro_batches)).backward()
+
+            def sync_context(sync=True, _last=last):
+                return model.no_sync() if ddp and not (_last and sync) else contextlib.nullcontext()
+
+            output = self.method.forward_backward(micro_batch, step, autocast=autocast,
+                                                  sync_context=sync_context, backward=backward)
             metric_values = {"loss": output.loss, **output.metrics}
             current_names = tuple(metric_values)
             if names is not None and names != current_names:
@@ -828,9 +832,14 @@ class Trainer:
         self.scaler.unscale_(self.optimizer)
         self.method.before_optimizer_step(step)
         clip_grad_norm_(self.method.gradient_parameters(), self.clip_grad)
+        scale_before = self.scaler.get_scale() if self.scaler.is_enabled() else None
         self.scaler.step(self.optimizer)
         self.scaler.update()
-        self.method.after_optimizer_step(step)
+        # GradScaler lowers its scale exactly when it skipped the update (non-finite gradients).
+        if scale_before is None or self.scaler.get_scale() >= scale_before:
+            self.method.after_optimizer_step(step)
+        else:
+            self.method.optimizer_step_skipped(step)
         metrics = dict(zip(names, (totals / len(micro_batches)).tolist()))
         return {**metrics, **self.method.step_metrics(step), "lr": lr, "weight_decay": weight_decay}
 
