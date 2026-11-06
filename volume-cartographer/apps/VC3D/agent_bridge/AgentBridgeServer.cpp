@@ -839,6 +839,7 @@ void AgentBridgeServer::registerHandlers()
 
     registerLasagnaHandlers();
     registerFiberHandlers();
+    registerStoresHandlers();
     registerSeedingHandlers();
 
     registerFlattenHandlers();

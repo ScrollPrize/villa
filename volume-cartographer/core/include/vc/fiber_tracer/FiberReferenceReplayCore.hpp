@@ -3,6 +3,7 @@
 #include "vc/fiber_tracer/FiberTrace.hpp"
 #include "vc/fiber_tracer/FiberReplayMetric.hpp"
 #include "vc/fiber_tracer/PolylineGeometry.hpp"
+#include "vc/fiber_tracer/FiberReverseConsistency.hpp"
 
 namespace vc::fiber_tracer {
 
@@ -75,13 +76,7 @@ using ReplaySegmentRunner = std::function<std::string(
     const PolylineArcSample&, double remainingBase, int maximumSteps,
     const ReplayPointObserver&, const FiberTraceProgressCallback&)>;
 
-struct ReplayReverseCheck {
-    bool passed = false;
-    double travelled = 0;
-    bool converged = false;
-    size_t historyCount = 0;
-    double seconds = 0;
-};
+using ReplayReverseCheck = FiberReverseCheckpointResult;
 
 struct ReplayConsistencyPolicy {
     // Current and previous committed base points; false filters this point.

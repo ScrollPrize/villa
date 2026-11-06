@@ -2,6 +2,7 @@
 
 #include <QObject>
 #include <QString>
+#include <stdexcept>
 #include <cstdint>
 #include <filesystem>
 #include <functional>
@@ -40,6 +41,12 @@ struct POI
     bool suppressViewerRecenter = false;
 };
 
+// A store switch (detach, route, replace) was refused because pending edits
+// could not be saved or an edit operation is running; nothing changed.
+struct StoreSwitchRefused : std::runtime_error {
+    using std::runtime_error::runtime_error;
+};
+
 class CState : public QObject
 {
     Q_OBJECT
@@ -59,11 +66,15 @@ public:
     static void applySurfaceGeometryCacheSettings();
     // The author VC3D writes as: the username setting, else the login name.
     static QString storeAuthor();
+    // Whether the username setting names an author (set, and not "anon").
+    static bool storeAuthorConfigured();
     // Open Options for attaching stores to the viewer's session.
     static vc::objects::OpenOptions storeOpenOptions(const QString& author, bool readOnly);
 
     // Project references are stable IDs; attachments exist only for available stores.
     std::optional<vc::objects::AttachmentIdentity> storeReference(const std::string& id) const;
+    // The project's reference id of an attached store.
+    std::optional<std::string> storeReferenceId(const vc::objects::AttachmentIdentity&) const;
     std::optional<vc::objects::AttachmentIdentity> sampleStore() const;
     vc::objects::AttachmentIdentity prepareStore(const std::filesystem::path&, const QString& author, bool readOnly = false);
     void releasePreparedStore(const vc::objects::AttachmentIdentity&);
@@ -124,6 +135,9 @@ public:
     // Write pending point-collection edits to the store now: the volume's,
     // and (through pointCollectionsSaveRequested) the open surface's corrections.
     void savePointCollections();
+    // The store one of the volume's point collections is kept in; nullopt for
+    // a surface's corrections and in windows without their own collections.
+    std::optional<vc::objects::AttachmentIdentity> pointCollectionStore(uint64_t collectionId) const;
 
     // --- Teardown ---
     void closeAll();

@@ -5,6 +5,40 @@
 
 namespace vc::fiber_tracer {
 
+// GT-independent delayed-check scheduling shared by replay and volume tracing.
+// Caller owns the committed points and performs checks on its worker. No global
+// locks, nested worker pool, or prediction resampling is required by this class.
+class FiberReverseCheckSchedule {
+public:
+    using Verify = std::function<bool(size_t checkpoint, size_t checked, bool terminal)>;
+    FiberReverseCheckSchedule(double interval, size_t delay) : interval_(interval), delay_(delay) {}
+    bool check(const std::vector<cv::Vec3d>& points, bool terminal, const Verify&);
+    // Ordinary presence/width stop: verify from delay edges back, retaining the
+    // accepted incoming-history tail. A history-only tail isn't a passed check.
+    bool stopTail(const std::vector<cv::Vec3d>& points, const Verify&);
+    size_t checked() const { return checked_; }
+    bool historyOnly() const { return historyOnly_; }
+private:
+    void update(const std::vector<cv::Vec3d>&);
+    void accept(const std::vector<cv::Vec3d>&, size_t);
+    double interval_, unchecked_ = 0;
+    size_t delay_, checked_ = 0, observed_ = 0;
+    std::optional<size_t> pending_;
+    bool historyOnly_ = false;
+};
+
+struct FiberReverseCheckpointResult {
+    bool passed = false;
+    double travelled = 0;
+    bool converged = false;
+    size_t historyCount = 0;
+    double seconds = 0;
+};
+FiberReverseCheckpointResult verifyFiberReverseCheckpoint(
+    const FiberPredictionSource&, const vc::lasagna::NormalSampler&,
+    const FiberTraceConfig&, const std::vector<cv::Vec3d>& pointsBase,
+    size_t checkpoint, size_t checked, double widthMeanTrace);
+
 struct ReverseSpanOptions {
     // Incoming edges from the FUTURE side of the forward checkpoint, in reverse
     // travel order. Empty preserves legacy initialization.

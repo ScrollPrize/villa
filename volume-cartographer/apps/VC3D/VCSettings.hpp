@@ -79,6 +79,9 @@ namespace project {
 namespace object_store {
     // Settings array, most recent first; entries hold path, read_only, remote.
     constexpr auto RECENT = "object_store/recent";
+    // Followed by the percent-encoded canonical source folder: the UUID namespace
+    // last used to import it, offered again so a repeat import keeps its identities.
+    constexpr auto IMPORT_UUID_NAMESPACE_PREFIX = "object_store/import_uuid_namespace/";
 }
 
 // -----------------------------------------------------------------------------

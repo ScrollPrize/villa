@@ -116,6 +116,7 @@
 #include "elements/GrowOnlyLabel.hpp"
 #include "MenuActionController.hpp"
 #include "plugins/PluginController.hpp"
+#include "StoreImportController.hpp"
 #include "VolumeAttachmentController.hpp"
 #include "AxisAlignedSliceController.hpp"
 #include "SegmentationCommandHandler.hpp"
@@ -1112,6 +1113,7 @@ CWindow::CWindow(size_t cacheSizeGB) :
 
     _volumeAttachmentController =
         std::make_unique<VolumeAttachmentController>(this);
+    _storeImportController = std::make_unique<StoreImportController>(this);
 
     // create menus/actions controller
     _menuController = std::make_unique<MenuActionController>(this);

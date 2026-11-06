@@ -179,7 +179,7 @@ void AgentBridgeServer::registerSessionHandlers()
             .name = QStringLiteral("project.create"),
             .params = {
                 Params::requiredString(QStringLiteral("path")),
-                Params::requiredString(QStringLiteral("volume")),
+                Params::optionalString(QStringLiteral("volume")),
                 Params::optionalString(QStringLiteral("name")),
                 Params::optionalArray(
                     QStringLiteral("tags"),

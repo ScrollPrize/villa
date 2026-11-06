@@ -22,7 +22,7 @@ view["relationships"] # Recorded relationships, with applicability flags
 view["selection"]     # Object UUID → selected revision UUID
 ```
 
-The object store can be used in place of tifxyz files, fiber jsons, track crossings/dbm files, and pcl jsons in any workflow where these are used and edit history is desired. The store contains the information necessary for any tool which works with these files to instead use the db. The object store can export these files after revision if this is needed. 
+The object store can be used in place of tifxyz files, fiber jsons, track crossings/dbm files, and pcl jsons in any workflow where these are used and edit history is desired. The store contains the information necessary for any tool which works with these files to instead use the db. The object store can export these files after revision if this is needed (`exportGeometry`, `vc_object_export`; also from a caller's read transaction, so read-only stores export too). Exports publish atomically on Linux (`renameat2`) and macOS (`renamex_np`). 
 
 The db has fast spatial queries through a persisted r-tree backed index with optional in-memory views for repeated queries. 
 
@@ -75,6 +75,21 @@ rest. VC3D runs the same ingestion into its attached store from File → Object
 Store → Import from Folder..., optionally binding the imports to the active
 volume. `--tag NAME` (repeatable; in VC3D the Tags field, which defaults to the
 folder's name) adds tags to every imported object, alongside any the source declares.
+
+Every ingestion returns a report (`GeometryIngestReport`; a dict from
+Python): `ingested` and `edges_imported` counts, `problems`, the `uuids` of
+the objects created in commit order, the `existing` identities the store
+already had (including retired objects; a rejected fiber or collection batch
+lists every clash), `cancelled` when the session ingestion stopped early on
+its cancel flag or a detach, and `fatal_error`. By default every failure is
+a problem and ingestion continues as far as it can. With
+`SourceIngestOptions::stopOnInfrastructureError`, a failure that is not the
+source's own (store access, a failed commit, an unexpected exception) stops
+ingestion and is reported as `fatalError` with the objects committed before
+it; invalid sources, coordinate conflicts, existing identities and the store
+changing underneath remain problems. `SourceIngestOptions::requireSourceUuids`
+turns the file-name identity of a UUID-less fiber into a problem, so such
+files need a UUID namespace.
 
 ```sh
 build/bin/vc_object_ingest --db objects.vcobj --author "$USER" --surface /data/surface
