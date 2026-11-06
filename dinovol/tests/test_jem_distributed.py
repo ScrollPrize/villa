@@ -65,11 +65,17 @@ class JemDistributedTests(unittest.TestCase):
             root = Path(folder)
             write_array(root / "volume", np.random.default_rng(0).integers(1, 255, (48,) * 3, dtype=np.uint8))
             config = tiny_config(root, batch=GLOBAL_BATCH)
-            torch.manual_seed(3)
-            method = JemMethod(config, device="cpu")
-            method.successful_updates = 1
-            dataset, samples = _samples(method, config)
-            output, grads = _step(method, method.build_processor(dataset, "cpu")(samples), distributed=False)
+            # Same intra-op threading as the workers, so FP32 reductions run in the same order.
+            threads = torch.get_num_threads()
+            torch.set_num_threads(1)
+            try:
+                torch.manual_seed(3)
+                method = JemMethod(config, device="cpu")
+                method.successful_updates = 1
+                dataset, samples = _samples(method, config)
+                output, grads = _step(method, method.build_processor(dataset, "cpu")(samples), distributed=False)
+            finally:
+                torch.set_num_threads(threads)
             torch.save({"grads": grads, "loss": output.loss, "global": output.metrics["global_collapse_loss"]},
                        root / "reference.pt")
             mp.spawn(_worker, args=(folder,), nprocs=2, join=True)
