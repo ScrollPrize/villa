@@ -1,8 +1,10 @@
 """scripts/import_afv.py streams an Automated Fiber Volume into a new store."""
 import importlib.util
 import json
+import os
 from pathlib import Path
 import sqlite3
+import subprocess
 
 import numpy as np
 import pytest
@@ -91,3 +93,36 @@ def test_malformed_input_publishes_nothing(tmp_path, mutation):
         import_afv.import_afv(source, target, unbound=True, batch_size=1, progress=False)
     assert not target.exists(), 'Failure must not publish even previously committed batches'
     assert not list(tmp_path.glob('.' + target.name + '-*')), 'Failure must remove staging files'
+
+
+@pytest.mark.parametrize('shards', [1, 2])
+@pytest.mark.parametrize('verify', [None, True])
+def test_native_batch_command_readback_is_opt_in(tmp_path, shards, verify):
+    build = os.environ.get('VC_OBJECT_STORE_BUILD_PYTHON_PATH')
+    tool = Path(build).resolve().parent / 'bin' / 'vc_object_import_afv' if build else None
+    if not tool or not tool.exists():
+        pytest.skip('needs the built vc_object_import_afv')
+    source = tmp_path / 'input.afv'
+    fixture(source)
+    output = tmp_path / 'native.vcobj'
+    report = tmp_path / 'report.json'
+    config = dict(source=str(source), output=str(output), unbound=True,
+                  shards=shards, report=str(report))
+    if verify is not None:
+        config['verify_readback'] = verify
+    path = tmp_path / 'config.json'
+    path.write_text(json.dumps(config))
+    completed = subprocess.run([str(tool), str(path)], capture_output=True, text=True, timeout=30)
+    assert completed.returncode == 0, completed.stderr
+    result = json.loads(report.read_text())
+    assert result['fibers'] == 2 and result['points'] == 262
+    assert result['readback_verified'] is bool(verify)
+    assert (result['validation_seconds'] > 0) is bool(verify)
+    assert output.exists()
+
+    config.update(initial_batch=False, output=str(tmp_path / 'legacy'))
+    path.write_text(json.dumps(config))
+    rejected = subprocess.run([str(tool), str(path)], capture_output=True, text=True, timeout=30)
+    assert rejected.returncode != 0
+    assert 'initial_batch:false is removed' in rejected.stderr
+    assert not Path(config['output']).exists()

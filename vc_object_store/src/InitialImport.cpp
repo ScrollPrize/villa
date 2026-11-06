@@ -181,6 +181,7 @@ InitialImportResult importInitialCollection(const std::filesystem::path& target,
     }
 
     Failure failure;
+    std::vector<CollectionMember> completedMembers(paths.size());
     std::vector<std::unique_ptr<detail::InitialEndpointDirectory>> workerEndpoints(paths.size());
     std::shared_ptr<const detail::InitialEndpointDirectory> endpoints;
     size_t objectsRemaining=paths.size();
@@ -229,7 +230,8 @@ InitialImportResult importInitialCollection(const std::filesystem::path& target,
                 // native object/edge construction and index finalization.
                 shard.impl_->result.producerSeconds=std::max(0.0,totalProducer-
                     shard.impl_->result.objectSeconds-shard.impl_->result.edgeSeconds);
-                const auto seal=Clock::now();collection.seal(transaction);transaction.commit();collection.checkpoint();
+                const auto seal=Clock::now();
+                completedMembers[i]=detail::InitialCollectionAccess::sealShard(collection,transaction);
                 shard.impl_->result.sealCommitSeconds=elapsed(seal);
                 return shard.impl_->result;
             } catch(...){failure.record(std::current_exception());throw;}
@@ -239,7 +241,7 @@ InitialImportResult importInitialCollection(const std::filesystem::path& target,
     if(failure.error)std::rethrow_exception(failure.error);
     result.ingestionSeconds=elapsed(start);
     const auto manifestStart=Clock::now();
-    if(paths.size()>1){auto joined=ObjectCollection::publishShards(manifest,paths,common);}
+    if(paths.size()>1)detail::InitialCollectionAccess::writeManifest(manifest,completedMembers,common);
     result.manifestSeconds=elapsed(manifestStart);
     const auto persistence=Clock::now();
     if(packed)packed->finalize(paths.size()==1?packedDatabaseUuid(paths.front()):manifestId);

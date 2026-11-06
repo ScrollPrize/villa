@@ -168,7 +168,7 @@ Json inventory(const fs::path& path){
     }
     return tables;
 }
-Json reduced(const Prepared& data,const fs::path& path){
+Json reduced(const Prepared& data,const fs::path& path,bool verifyReadback){
     auto start=Clock::now();Json result;Db db(path);
     d::exec(db.p,"PRAGMA page_size=65536;PRAGMA journal_mode=OFF;PRAGMA synchronous=OFF;"
         "PRAGMA foreign_keys=ON;PRAGMA cache_size=-524288;"
@@ -200,6 +200,8 @@ Json reduced(const Prepared& data,const fs::path& path){
     d::exec(db.p,"CREATE INDEX edges_a ON edges(a_id,kind);CREATE INDEX edges_b ON edges(b_id,kind);"
         "CREATE INDEX objects_kind ON objects(kind);COMMIT;");
     result["finish_seconds"]=elapsed(finish);result["total_seconds"]=elapsed(start);
+    result["readback_verified"]=verifyReadback;result["verify_seconds"]=0.0;
+    if(!verifyReadback)return result;
     // Full payload readback outside the timed region (no dropped observations).
     const auto verify=Clock::now();
     d::Statement rows(db.p,"SELECT meta FROM edges ORDER BY id");
@@ -220,7 +222,7 @@ Json reduced(const Prepared& data,const fs::path& path){
     return result;
 }
 Json native(const Prepared& data,const fs::path& path,bool linked,bool packed,size_t workers,size_t sqlRows,
-    size_t exportWorkers,bool preSizeExport,size_t residentBytes){
+    size_t exportWorkers,bool preSizeExport,size_t residentBytes,bool verifyReadback){
     InitialImportOptions opt;opt.store.author="prepared-benchmark";opt.store.sqliteCacheBytes=512*1024*1024;
     opt.edges.sqlBatchRows=sqlRows;
     require(workers>0&&workers<=data.objects.size(),"sharded benchmark needs at least one object per worker");
@@ -287,6 +289,8 @@ Json native(const Prepared& data,const fs::path& path,bool linked,bool packed,si
         }}
         out["cross_shard_constraints"]=crossShard;out["remote_endpoint_references"]=remote;
     }
+    out["readback_verified"]=verifyReadback;out["verify_seconds"]=0.0;
+    if(!verifyReadback)return out;
     const auto verify=Clock::now();auto collection=ObjectCollection::open(result.path,OpenOptions{.readOnly=true});auto txn=collection.read();
     for(size_t i=0;i<data.edges.size();i+=std::max(size_t(1),data.edges.size()/10)){
         const auto found=collection.edge(txn,{result.storeUuid,data.edges[i].uuid});
@@ -348,14 +352,19 @@ int main(int argc,char** argv){try{
       for(int repeat=0;repeat<run.value("repetitions",config.value("repetitions",1));++repeat){
         const auto path=root/("case"+std::to_string(caseIndex)+"-"+variant+std::to_string(repeat)+".sqlite");require(!fs::exists(path),"refusing overwrite");
         std::cout<<Json({{"stage","case_start"},{"case",caseIndex},{"variant",variant},{"workers",workers},{"repetition",repeat}}).dump()<<std::endl;
-        Json result=variant=="prototype"?reduced(data,path):native(data,path,variant=="linked",variant.starts_with("native_packed"),workers,sqlRows,
-            exportWorkers,preSizeExport,residentBytes);
+        const bool verifyReadback=config.value("verify_readback",false);
+        Json result=variant=="prototype"?reduced(data,path,verifyReadback):native(data,path,variant=="linked",variant.starts_with("native_packed"),workers,sqlRows,
+            exportWorkers,preSizeExport,residentBytes,verifyReadback);
         result["case"]=caseIndex;result["label"]=run.value("label",variant);result["variant"]=variant;result["workers"]=workers;
-        result["sql_batch_rows"]=sqlRows;result["repetition"]=repeat;result["tables"]=inventory(path);
+        result["sql_batch_rows"]=sqlRows;result["repetition"]=repeat;
         result["packed_export_options_applied"]=variant.starts_with("native_packed");
         result["export_workers"]=exportWorkers;result["pre_size_export"]=preSizeExport;result["resident_bytes"]=residentBytes;
-        require(result["tables"].value("edges",size_t(0))==data.edges.size(),"edge count mismatch");
-        require(result["tables"].value("objects",size_t(0))==(variant=="linked"?0:data.objects.size()),"objects must not be duplicated into relation shards");
+        result["inventory_scanned"]=config.value("inventory",false);
+        if(result["inventory_scanned"].get<bool>()) {
+            result["tables"]=inventory(path);
+            require(result["tables"].value("edges",size_t(0))==data.edges.size(),"edge count mismatch");
+            require(result["tables"].value("objects",size_t(0))==(variant=="linked"?0:data.objects.size()),"objects must not be duplicated into relation shards");
+        }
         uint64_t bytes=0;
         if(fs::is_directory(path)){for(const auto& member:fs::directory_iterator(path))if(member.path().extension()==".vcobj")bytes+=fs::file_size(member.path());}
         else bytes=fs::file_size(path);

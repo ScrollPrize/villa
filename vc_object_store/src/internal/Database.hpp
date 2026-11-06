@@ -109,6 +109,7 @@ struct ObjectStore::Impl {
 
     sqlite3* checkoutReader()
     {
+        if(options.readerPoolSize==0)throw std::logic_error("private initial construction has no reader connections");
         std::unique_lock<std::mutex> lock(poolMutex);
         poolCv.wait(lock, [&] { return !readerPool.empty(); });
         sqlite3* conn = readerPool.back();

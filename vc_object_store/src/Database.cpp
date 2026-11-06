@@ -38,7 +38,7 @@ std::unique_ptr<ObjectStore::Impl> ObjectStore::openImpl(const std::filesystem::
     impl->immutableInitial=immutable;
     if(immutable && (!create || options.history!=HistoryMode::Off || options.spatialIndex))
         throw std::invalid_argument("immutable construction requires a new history-off spatial-off database");
-    impl->options.readerPoolSize = options.sharedFile ? 1 : std::max(1, options.readerPoolSize);
+    impl->options.readerPoolSize = immutable ? 0 : options.sharedFile ? 1 : std::max(1, options.readerPoolSize);
     if (options.sharedFile) impl->options.geometryCacheBytes = impl->options.spatialCacheBytes = 0;
     impl->hostname = options.hostnameOverride.value_or(detectHostname());
 

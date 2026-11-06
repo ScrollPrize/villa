@@ -5,9 +5,18 @@
 #include <fstream>
 #include <future>
 #include <iostream>
+#include <sqlite3.h>
 
 using namespace vc::objects;
 namespace {
+std::atomic<size_t> connectionCount=0;
+int countConnection(sqlite3*,char**,const sqlite3_api_routines*) noexcept {
+    ++connectionCount;return SQLITE_OK;
+}
+struct CountConnections {
+    CountConnections(){connectionCount=0;require(sqlite3_auto_extension(reinterpret_cast<void(*)()>(countConnection))==SQLITE_OK,"install connection counter");}
+    ~CountConnections(){sqlite3_cancel_auto_extension(reinterpret_cast<void(*)()>(countConnection));}
+};
 InitialImportOptions options(size_t shards=1,bool packed=false)
 {
     InitialImportOptions result;result.store.author="bulk-api-test";result.shards.clear();
@@ -137,6 +146,36 @@ void phased(bool packed)
         require(store.readGeometryArray(txn,b,"line_points").size()==6*sizeof(double),"phased sibling geometry routes after publication");
     }
 }
+void directConnections(bool packed) {
+    TemporaryDirectory dir;
+    for(size_t count:{1u,4u}) {
+        auto opt=options(count,packed);std::vector<std::string> ids(count);
+        for(auto& id:ids)id=util::newUuid();
+        InitialImportResult result;
+        {
+            CountConnections observed;
+            result=importInitialCollection(dir.path/("direct-"+std::to_string(count)),opt,
+                [&](size_t i,auto& shard){auto row=fiber(ids[i]);row.id=opt.shards[i].objectIds[0];shard.appendObjects(std::span(&row,1));},
+                [&](size_t i,auto& shard){if(count==1)return;bool sent=false;
+                    shard.importEdges([&](auto& batch){if(sent)return false;sent=true;
+                        EdgeRecord edge;edge.uuid=util::newUuid();edge.kind="direct";
+                        edge.aAnchor.wholeGeometry=edge.bAnchor.wholeGeometry=true;
+                        batch.push_back({{shard.storeUuid(),ids[i]},{shard.storeUuid(),ids[(i+1)%count]},edge});return true;});});
+            require(connectionCount==count+(count>1?1:0),
+                "exactly one writer per new database: no reader pools or reopened shards/collection");
+        }
+        // Validation is deliberately outside construction, like a consumer.
+        auto collection=ObjectCollection::open(result.path,OpenOptions{.readOnly=true});auto read=collection.read();
+        const auto generation=collection.provisioning(read).generation;
+        require(collection.provisioning(read).sealed,"direct output sealed");
+        for(const auto& member:collection.members())if(member.storeUuid==result.storeUuid)
+            require(member.generation==generation,"direct manifest pins committed shard generation");
+        for(size_t i=0;i<count;++i) {
+            const auto object=collection.objectById(read,result.storeUuid,opt.shards[i].objectIds[0]);
+            require(object&&object->key.objectUuid==ids[i],"direct range routing");
+        }
+    }
+}
 void phaseFailures()
 {
     TemporaryDirectory dir;auto opt=options(3);
@@ -177,5 +216,5 @@ void phaseFailures()
     }
 }
 }
-int main(){try{for(bool packed:{false,true}){for(size_t count:{1u,2u})roundTrip(count,packed);phased(packed);}failures();phaseFailures();
+int main(){try{for(bool packed:{false,true}){for(size_t count:{1u,2u})roundTrip(count,packed);phased(packed);directConnections(packed);}failures();phaseFailures();
     std::cout<<"initial import passed\n";return 0;}catch(const std::exception& e){std::cerr<<e.what()<<'\n';return 1;}}

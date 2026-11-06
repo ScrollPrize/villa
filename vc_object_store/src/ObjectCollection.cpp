@@ -109,6 +109,24 @@ void insertMember(sqlite3* db,int64_t ordinal,const CollectionMember& m,const st
     execute(db,"INSERT INTO collection_members VALUES(?,?,?,?,?,?,?,?,?,?)",ordinal,parseUuid(m.databaseUuid),
         parseUuid(m.storeUuid),m.generation,ref,int64_t(m.partition),objects[0],objects[1],edges[0],edges[1]);
 }
+std::vector<KeyRoute> rangeRoutes(const std::vector<CollectionMember>& members) {
+    std::vector<KeyRoute> routes;routes.reserve(2*members.size());
+    for(const auto& m:members)for(const auto* space:{"objects","edges"}) {
+        const auto r=std::string_view(space)=="objects"?m.objectIds:m.edgeIds;
+        routes.push_back({space,RoutingKind::Range,r[0],r[1],1,0,0,m.databaseUuid});
+    }
+    return routes;
+}
+// Shared encoding only. Discovery/validation belongs to the caller, not this
+// writer: the batch builder already owns every member and reserved range.
+void writeShardManifest(ObjectStore& store,const std::filesystem::path& path,
+    const std::vector<CollectionMember>& members,const std::vector<KeyRoute>& routes) {
+    auto w=store.write();auto* db=ObjectStoreImplAccess::conn(w);collectionSchema(db);
+    execute(db,"UPDATE key_allocators SET next_id=NULL");
+    int64_t i=0;for(const auto& m:members)insertMember(db,i++,m,locator(path,m.locator));
+    for(const auto& route:routes)execute(db,"INSERT INTO collection_routes VALUES(?,?,?,?,?,?,?,?)",route.keySpace,int64_t(route.kind),route.lower,route.upper,int64_t(route.divisor),int64_t(route.remainder),int64_t(route.shift),parseUuid(route.databaseUuid));
+    store.seal(w);w.commit();store.checkpoint();
+}
 ObjectKey canonical(ObjectKey key) {
     key.storeUuid=util::canonicalUuid(key.storeUuid);key.objectUuid=util::canonicalUuid(key.objectUuid);return key;
 }
@@ -519,18 +537,41 @@ ObjectCollection detail::InitialCollectionAccess::create(const std::filesystem::
         generation=std::max(generation,p.generation);members.push_back(c.impl_->nodes[0].member);}
     auto opt=options;opt.initialGeneration=generation;opt.physicalPartitionOnly=true;
     auto store=std::make_unique<ObjectStore>(ObjectStoreImplAccess::createInitial(path,opt));
+    auto p=std::make_unique<ObjectCollection::Impl>();p->options=opt;
     {auto w=store->write();auto* db=ObjectStoreImplAccess::conn(w);collectionSchema(db);
      int64_t ordinal=0;for(const auto& m:members){
         if(m.storeUuid==store->uuid(w))throw std::runtime_error("initial collection needs independent dependency ownership");
         insertMember(db,ordinal++,m,locator(normalized(path),m.locator));}
+     CollectionMember root{store->databaseIdentity(w).uuid,store->uuid(w),writeGeneration(db),path,false,opt.objectIdRange,opt.edgeIdRange};
+     std::vector<std::string> children;for(const auto& m:members)children.push_back(m.databaseUuid);
+     p->byDatabase.emplace(root.databaseUuid,0);p->pinned.emplace(root.storeUuid,root.generation);
+     p->nodes.push_back({nullptr,std::move(root),true,{},std::move(children)});
      w.commit();}
-    auto p=std::make_unique<ObjectCollection::Impl>();p->options=opt;std::set<std::string> visiting;
-    {auto r=store->read();p->load(path,true,{},visiting,ObjectStoreImplAccess::conn(r));}
+    // No reader pool or collection loading for the database just constructed.
+    // Pre-existing external dependencies still require their ordinary readers.
+    std::set<std::string> visiting{p->nodes[0].member.databaseUuid};
+    for(const auto& m:members)p->load(m.locator,false,m,visiting);
     p->nodes[0].store=std::move(store);return ObjectCollection(std::move(p));
 }
 void detail::InitialCollectionAccess::setEndpoints(ObjectCollection& collection,std::shared_ptr<const InitialEndpointDirectory> endpoints)
 {
     collection.impl_->initialEndpoints=std::move(endpoints);
+}
+CollectionMember detail::InitialCollectionAccess::sealShard(ObjectCollection& collection,CollectionTxn& transaction) {
+    collection.seal(transaction);
+    auto member=collection.impl_->nodes[0].member;
+    member.generation=writeGeneration(collection.impl_->db(transaction,0));
+    member.partition=true;
+    transaction.commit();collection.checkpoint();
+    return member;
+}
+void detail::InitialCollectionAccess::writeManifest(const std::filesystem::path& path,
+    const std::vector<CollectionMember>& members,const OpenOptions& options) {
+    const auto& first=members.at(0);
+    auto opt=options;opt.history=HistoryMode::Off;opt.spatialIndex=false;
+    opt.creationStoreUuid=first.storeUuid;opt.initialGeneration=first.generation-1;opt.physicalPartitionOnly=true;
+    auto store=ObjectStoreImplAccess::createInitial(path,opt);
+    writeShardManifest(store,path,members,rangeRoutes(members));
 }
 ObjectCollection ObjectCollection::publishShards(const std::filesystem::path& path,const std::vector<std::filesystem::path>& shards,const OpenOptions& options,const std::vector<KeyRoute>& requestedRoutes){
     if(shards.empty())throw std::runtime_error("collection: empty shard list");
@@ -543,8 +584,7 @@ ObjectCollection ObjectCollection::publishShards(const std::filesystem::path& pa
     }
     const auto& first=members.front();if(first.generation<2)throw std::runtime_error("collection: invalid shard generation");
     for(auto& m:members)if(m.storeUuid!=first.storeUuid||m.generation!=first.generation)throw std::runtime_error("collection: shards disagree on ownership/generation");
-    auto routes=requestedRoutes;
-    if(routes.empty())for(auto& m:members)for(auto space:{"objects","edges"}){auto r=std::string(space)=="objects"?m.objectIds:m.edgeIds;routes.push_back({space,RoutingKind::Range,r[0],r[1],1,0,0,m.databaseUuid});}
+    auto routes=requestedRoutes.empty()?rangeRoutes(members):requestedRoutes;
     validateRoutes(routes,members);
     // Custom routing is verified once at publication. Readers only trust the
     // sealed manifest and never rescan all IDs on every open.
@@ -555,11 +595,7 @@ ObjectCollection ObjectCollection::publishShards(const std::filesystem::path& pa
     auto opt=options;opt.history=HistoryMode::Off;opt.spatialIndex=false;opt.creationStoreUuid=first.storeUuid;opt.initialGeneration=first.generation-1;opt.physicalPartitionOnly=true;
     const bool packed=isBuildingPackedDatabasePath(path);
     StagedDatabase staged(path,packed);const auto& stage=staged.path;
-    {auto store=ObjectStore::create(stage,opt);auto w=store.write();auto* db=ObjectStoreImplAccess::conn(w);collectionSchema(db);
-     execute(db,"UPDATE key_allocators SET next_id=NULL");
-     int64_t i=0;for(const auto& m:members)insertMember(db,i++,m,locator(normalized(path),m.locator));
-     for(auto& route:routes)execute(db,"INSERT INTO collection_routes VALUES(?,?,?,?,?,?,?,?)",route.keySpace,int64_t(route.kind),route.lower,route.upper,int64_t(route.divisor),int64_t(route.remainder),int64_t(route.shift),parseUuid(route.databaseUuid));
-     store.seal(w);w.commit();store.checkpoint();}
+    {auto store=ObjectStore::create(stage,opt);writeShardManifest(store,normalized(path),members,routes);}
     // Validate all targets and the routing map before the publication name exists.
     {auto verified=open(stage,OpenOptions{.readOnly=true});}
     staged.publish();
