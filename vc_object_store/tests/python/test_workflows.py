@@ -1,6 +1,7 @@
 from pathlib import Path
 import sqlite3
 import struct
+import uuid
 import subprocess
 import sys
 
@@ -10,8 +11,14 @@ from vc_object_store import ObjectStore, PointCollection, Fiber, Track, Surface,
 from object_helpers import edge_choice
 
 
-def heads(db, *ids):
-    return {uid: db.current_object_revision(uid)['uuid'] for uid in ids}
+def refs(db, *ids):
+    status = db.status()
+    return [dict(store=status['store'], generation=status['generation'], object=uid, version=db.current_version(uid))
+            for uid in ids]
+
+
+def versions(db, *ids):
+    return {uid: db.current_version(uid) for uid in ids}
 
 
 def put(db, geometry, kind='track', **options):
@@ -51,7 +58,7 @@ def test_owned_views_native_export_and_one_time_ingest(db, tmp_path, kind, geome
     db.set_meta(uid, 'coordinate_binding', binding)
     db.set_meta(uid, 'source', {'coordinates': {'scale_factor': 7}, 'volume_uuid': 'stale', 'coordinate_binding': {'active_volume_id': 'stale'}, 'retained_note': 'native'})
     output = tmp_path / 'native'
-    assert db.export_geometry(uid, output) == revision
+    assert db.export_geometry(uid, output) == refs(db, uid)[0]
     with pytest.raises((RuntimeError, ValueError)):
         db.export_geometry(uid, output)
     with ObjectStore.create(str(tmp_path / 'import.vcobj'), author='import') as other:
@@ -88,36 +95,40 @@ def test_surface_channels_sparse_reads_history_and_resize(db, tile):
         packed = db.read_geometry_arrays([first, first], name)
         assert packed.values.tobytes() == original.tobytes() * 2
         assert packed.offsets.tolist() == [0, 35, 70]
-    second = db.edit_geometry_rectangle(uid, 'review', 31, 31, 2, 3, b'\xff\xff' * 6, first)
+    first_version = db.current_version(uid)
+    second = db.edit_geometry_rectangle(uid, 'review', 31, 31, 2, 3, b'\xff\xff' * 6, first_version)
     channel[31:33, 31:34] = 65535
     assert db.read_geometry_array(second, 'review') == channel.tobytes()
     assert db.read_geometry_array(first, 'review') != channel.tobytes()
-    assert db.edit_geometry(uid, [], second) == second
-    with pytest.raises(RuntimeError, match='revision'):
-        db.edit_geometry(uid, [], first)
+    assert db.edit_geometry(uid, [], db.current_version(uid)) == second
+    with pytest.raises(RuntimeError, match='version'):
+        db.edit_geometry(uid, [], first_version)
     # An ink channel rendered finer than the grid: 2x rows, 3x columns.
     ink = np.arange(70 * 111, dtype='<f4').reshape(70, 111)
     with pytest.raises(ValueError, match='whole multiple'):
-        db.update_surface_channels(uid, [array('ink', ink[:69])], [], second)
-    third = db.update_surface_channels(uid, [array('extra', np.zeros((35, 37), 'u1')), array('ink', ink)], ['review'], second)
+        db.update_surface_channels(uid, [array('ink', ink[:69])], [], db.current_version(uid))
+    third = db.update_surface_channels(uid, [array('extra', np.zeros((35, 37), 'u1')), array('ink', ink)], ['review'],
+                                       db.current_version(uid))
     assert db.read_geometry_rectangle(third, 'ink', 61, 100, 4, 5) == ink[61:65, 100:105].tobytes()
     fills = [array('points', np.full((1, 1, 3), -1, '<f4')), array('extra', np.ones((1, 1), 'u1')),
              array('ink', np.zeros((1, 1), '<f4'))]
-    with db.write(expected_revisions=heads(db, uid)) as tx:
-        grown = tx.resize_surface(uid, dict(row=-1, column=-1, rows=37, columns=39, fill=fills), third)
+    expected = versions(db, uid)
+    with db.write(expected_versions=expected) as tx:
+        grown = tx.resize_surface(uid, dict(row=-1, column=-1, rows=37, columns=39, fill=fills), expected[uid])
     assert db.read_geometry_rectangle(grown, 'points', 1, 1, 35, 37) == values.tobytes()
     assert db.read_geometry_rectangle(grown, 'extra', 0, 0, 1, 1) == b'\x01'
     assert db.read_geometry_rectangle(grown, 'ink', 2, 3, 70, 111) == ink.tobytes()
     assert db.read_geometry_rectangle(grown, 'ink', 0, 0, 2, 117) == bytes(2 * 117 * 4)
     with pytest.raises(RuntimeError, match='finer channels'):
-        with db.write(expected_revisions=heads(db, uid)) as tx:
-            tx.resize_surface(uid, dict(row=0, column=0, rows=0, columns=39, fill=fills), grown)
-    grown = db.update_surface_channels(uid, [], ['ink'], grown)
+        expected = versions(db, uid)
+        with db.write(expected_versions=expected) as tx:
+            tx.resize_surface(uid, dict(row=0, column=0, rows=0, columns=39, fill=fills), expected[uid])
+    grown = db.update_surface_channels(uid, [], ['ink'], db.current_version(uid))
     assert db.geometry_revision(grown)['grid_origin'] == [-1, -1]
     extra = np.arange(37 * 39, dtype='<u2').reshape(37, 39)
-    updated = db.update_surface_channels(uid, [array('extra', extra)], [], grown)
+    updated = db.update_surface_channels(uid, [array('extra', extra)], [], db.current_version(uid))
     assert db.read_geometry_array(updated, 'extra') == extra.tobytes()
-    changed = db.edit_geometry_rectangle(uid, 'extra', 31, 31, 2, 3, b'\xff\xff' * 6, updated)
+    changed = db.edit_geometry_rectangle(uid, 'extra', 31, 31, 2, 3, b'\xff\xff' * 6, db.current_version(uid))
     extra[31:33, 31:34] = 65535
     assert db.read_geometry_array(changed, 'extra') == extra.tobytes()
     assert db.read_geometry_rectangle(grown, 'extra', 0, 0, 1, 1) == b'\x01'
@@ -148,7 +159,7 @@ def test_nearest_surfaces_pick_restrict_and_volume_target(db):
     # Vertices marked invalid are holes.
     valid = np.ones((40, 40), 'u1')
     valid[19:23, 11:15] = 0
-    db.update_surface_channels(near, [array('valid', valid)], [], db.current_geometry(near)['uuid'])
+    db.update_surface_channels(near, [array('valid', valid)], [], db.current_version(near))
     hits = db.nearest_surfaces([12.25, 20.5, 11], 5)
     assert hits[0]['object_uuid'] == near and hits[0]['distance'] > 2
 
@@ -189,33 +200,35 @@ def test_checked_relationships_lifecycle_and_graph(db):
     anchor = dict(points=[dict(array='points', index=[0])], metadata_keys=['coordinates'])
     edge = db.add_edge(dict(a=a, b=b, kind='fiber_branch', a_anchor=anchor, b_anchor=anchor))
     db.set_approval(edge, 'approved')
-    selected = heads(db, a, b)
+    selected = refs(db, a, b)
     assert db.component(a, adjacent=False, applicable_only=True) == [a, b]
     assert db.component(a, adjacent=True) == [a]
     assert db.neighbours(a) == [b] and db.edges_by_kind('fiber_branch')[0]['uuid'] == edge
     before = db.journal_since()
-    with pytest.raises(RuntimeError):
-        with db.write(expected_revisions={a: selected[a]}) as tx:
+    with pytest.raises(ValueError):
+        with db.write(expected_versions={a: db.current_version(a)}) as tx:
             tx.set_meta(a, 'rollback', True)
             tx.remove_edge(edge)  # b is also modified, but has no expectation
     assert db.journal_since() == before and db.edge(edge)
-    with db.graph_read(revisions=selected, approval_states=[]) as graph:
+    with db.graph_read(versions=selected, approval_states=[]) as graph:
         edits = [dict(array='points', element_offset=0, data=struct.pack('<i', 9))]
-        assert db.affected_geometry_edit_edges(a, edits, first)[0]['uuid'] == edge
+        read = selected[0]['version']
+        assert db.affected_geometry_edit_edges(a, edits, read)[0]['uuid'] == edge
         with pytest.raises(RuntimeError):
-            db.edit_geometry(a, edits, first)
-        second = db.edit_geometry(a, edits, first, edge_edits=[edge_choice(db, edge, 'keep_recorded')])
+            db.edit_geometry(a, edits, read)
+        second = db.edit_geometry(a, edits, read, edge_edits=[edge_choice(db, edge, 'keep_recorded')])
+        with pytest.raises(RuntimeError, match='version'):
+            db.edit_geometry(a, edits, read, edge_edits=[edge_choice(db, edge, 'keep_recorded')])
         assert graph.read_geometry_arrays('points').values.tolist() in (
             [[1, 2, 3], [4, 5, 6], [1, 2, 3]], [[1, 2, 3], [1, 2, 3], [4, 5, 6]])
         assert graph.component(a) == [a, b]
     assert db.component(a, applicable_only=True) == [a]
-    assert db.relationships_at(selected)[0]['applicable']
-    assert db.recorded_relationships(selected[a]) == db.recorded_relationships(selected[b])
-    with db.write(expected_revisions=heads(db, a, b)) as tx:
+    assert db.relationships_at_versions(selected)[0]['applicable']
+    with db.write(expected_versions=versions(db, a, b)) as tx:
         tx.retain_relationship(edge)
     assert db.component(a, applicable_only=True) == [a, b]
     for action in ('retire_object', 'restore_object'):
-        with db.write(expected_revisions=heads(db, a, b)) as tx:
+        with db.write(expected_versions=versions(db, a, b)) as tx:
             getattr(tx, action)(a)
             if action == 'retire_object':
                 tx.keep_recorded_relationship(edge)
@@ -224,19 +237,28 @@ def test_checked_relationships_lifecycle_and_graph(db):
         assert db.current_geometry(a)['uuid'] == second
         assert db.component(b, applicable_only=True) == [b]
     assert not db.object(a)['retired']
-    assert db.object_revision(selected[a])['geometry_revision'] == first
-    at = db.object_revision(selected[a])['published_at_us']
-    assert db.revision_read_view_at(at)['selection'] == selected
+    pinned = db.objects_at_versions(selected)[0]
+    assert pinned['geometry_revision'] == first
+    assert db.versions_at(pinned['published_at_us']) == sorted(selected, key=lambda ref: ref['object'])
+    restored = db.current_version(a)
+    with db.write(expected_versions=versions(db, a, b)) as tx:
+        tx.restore_object(a, source_version=selected[0]['version'])
+        tx.keep_recorded_relationships_of(a)
+    assert db.current_geometry(a)['uuid'] == first and db.current_version(a) == restored + 1
+    with pytest.raises(ValueError):
+        with db.write(expected_versions=versions(db, a, b)) as tx:
+            tx.restore_object(a, source_version=99)
 
 
 def test_stable_ids_annotations_splice_and_coordinates(db):
     label = {'label': 'A', 'note': 'x' * 70000}
     uid = db.upsert_object(dict(kind='point_collection', meta={'source': {
         'point_attributes': [label, {'label': 'B'}]}}))
-    first = db.put_geometry(uid, PointCollection([10, 20], [[1, 2, 3], [4, 5, 6]]))
-    with db.write(expected_revisions=heads(db, uid)) as tx:
+    db.put_geometry(uid, PointCollection([10, 20], [[1, 2, 3], [4, 5, 6]]))
+    expected = versions(db, uid)
+    with db.write(expected_versions=expected) as tx:
         second = tx.edit_geometry_sequence(uid, dict(array='points', start=1, erase_count=0,
-            parts=[dict(count=1, ids=[30], data=struct.pack('<3d', 7, 8, 9), annotations=[{'label': 'C'}])]), first)
+            parts=[dict(count=1, ids=[30], data=struct.pack('<3d', 7, 8, 9), annotations=[{'label': 'C'}])]), expected[uid])
         tx.set_meta(uid, 'coordinates', {'scale_factor': 4})
     assert db.geometry_point_annotations(second, 'points') == [label, {'label': 'C'}, {'label': 'B'}]
     assert db.read_geometry_array(second, 'point_ids') == struct.pack('<3q', 10, 30, 20)
@@ -244,9 +266,9 @@ def test_stable_ids_annotations_splice_and_coordinates(db):
     with db.geometry_snapshot() as snapshot:
         view = snapshot.point_collection(uid)
         assert view.point(30) == [7, 8, 9]
-        with db.write(expected_revisions={uid: view.object_revision}) as tx:
+        with db.write(expected_versions={uid: view.version}) as tx:
             third = tx.edit_geometry(uid, [dict(array="points", element_offset=3,
-                data=struct.pack("<3d", 10, 11, 12))], view.revision["uuid"])
+                data=struct.pack("<3d", 10, 11, 12))], view.version)
         assert view.point(30) == [7, 8, 9]
     assert db.read_geometry_array(third, 'points')[24:48] == struct.pack('<3d', 10, 11, 12)
 
@@ -322,7 +344,9 @@ def test_record_fields_and_transaction_bindings(db, kind, detail):
     assert record[kind] == detail and record['tags'] == ['review']
     assert record['approved_by'] == 'pytest' and record['approved_generation'] == record['generation']
     fields = ['name', 'format_version', 'storage_kind', 'storage_ref', 'data_generation', 'data_checksum', kind]
-    assert db.select_objects(fields=fields) == [{key: record[key] for key in ['uuid', 'kind', *fields]}]
+    rows = db.select_objects(fields=fields)
+    assert rows[0].pop('version') >= 1 and rows[0].pop('version_generation') == db.status()['generation']
+    assert rows == [{key: record[key] for key in ['uuid', 'kind', *fields]}]
     with ObjectStore.create(db.path + '.copy', author='copy') as other:
         other.import_json(db.export_json())
         assert other.object(uid) == record
@@ -402,11 +426,11 @@ def test_fiber_collection_and_linked_file_import_use_uuid_endpoints(db, tmp_path
         db.export_geometry(uid, output)
         documents.append(json.loads(output.read_text()))
     db.upsert_object(dict(kind="fiber", name="unrelated pending geometry"))
-    historical_pin = db.current_object_revision(a)['uuid']
-    with db.write(expected_revisions=heads(db, a, b)) as tx:
+    historical_pin = db.current_version(a)
+    with db.write(expected_versions=versions(db, a, b)) as tx:
         tx.remove_edge(documents[0]['branches'][0]['edge_uuid'])
     historical = tmp_path / 'historical-graph.json'
-    db.export_geometry(a, historical, object_revision_uuid=historical_pin)
+    assert db.export_geometry(a, historical, version=historical_pin)['version'] == historical_pin
     assert json.loads(historical.read_text()) == documents[0]
     current = tmp_path / 'current-graph.json'
     db.export_geometry(a, current)
@@ -526,119 +550,37 @@ def test_native_export_pins_object_metadata_and_geometry(db, tmp_path, kind, geo
     import json
     uid, first_geometry = put(db, geometry, kind)
     db.set_meta(uid, 'coordinates', {'scale_factor': 2})
-    before = db.current_object_revision(uid)['uuid']
+    before = db.current_version(uid)
     db.set_meta(uid, 'coordinates', {'scale_factor': 4})
     output = tmp_path / 'historical.json'
-    assert db.export_geometry(uid, output, object_revision_uuid=before) == first_geometry
+    assert db.export_geometry(uid, output, version=before)['version'] == before
+    assert db.objects_at_versions([db.export_geometry(uid, output, version=before, overwrite=True)])[0]['geometry_revision'] == first_geometry
     doc = json.loads(output.read_text())
     if kind == 'point_collection':
         doc = next(iter(doc['collections'].values()))
     assert doc['coordinates']['scale_factor'] == 2
-    with pytest.raises(RuntimeError, match='object revision'):
-        db.export_geometry(uid, tmp_path / 'wrong.json', object_revision_uuid=first_geometry)
+    with pytest.raises(RuntimeError, match='object version'):
+        db.export_geometry(uid, tmp_path / 'wrong.json', version=99)
+    with pytest.raises(RuntimeError, match='object version'):
+        db.export_geometry(uid, tmp_path / 'wrong.json', version=before, generation=str(uuid.uuid4()))
 
 
-def test_scripts_edit_hosted_replicas_under_leases(tmp_path):
+def test_session_sees_commits_of_another_writer(tmp_path):
     import vc_object_store as vos
-    hub = tmp_path / 'share' / 'hub.vcobj'
-    hub.parent.mkdir()
-    with ObjectStore.create(str(hub), author='curator') as origin:
-        fiber, _ = put(origin, Fiber([[1, 2, 3], [4, 5, 6]], []), kind='fiber')
-        origin.checkpoint()
-    vos.hub_init(str(hub), 'curator')
-    with pytest.raises(RuntimeError, match='hosted hub'):
-        ObjectStore.open(str(hub), author='curator')
-    for name in ('script', 'viewer'):
-        vos.hub_clone(str(hub), str(tmp_path / f'{name}.vcobj'), name)
-    with ObjectStore.open(str(tmp_path / 'script.vcobj'), author='script') as script, \
-            ObjectStore.open(str(tmp_path / 'viewer.vcobj'), author='viewer') as viewer:
-        with pytest.raises(RuntimeError, match='not leased'):
-            script.set_meta(fiber, 'review', 'done')
-        [lease] = script.acquire_leases([fiber])
-        assert lease['author'] == 'script'
-        script.set_meta(fiber, 'review', 'done')
-        assert script.hub_status()['pending'] == [fiber]
-        assert script.hub_sync() == {'pulled': 0, 'pushed': 1, 'conflicts': []}
-        assert viewer.hub_sync()['pulled'] == 1
-        assert viewer.object(fiber)['meta']['review'] == 'done'
-        with pytest.raises(RuntimeError, match='leased to script'):
-            viewer.acquire_leases([fiber])
-        script.release_leases([fiber])
-        assert viewer.acquire_leases([fiber])[0]['author'] == 'viewer'
-
-
-def test_service_edits_a_hosted_surface_through_a_session(tmp_path):
-    import vc_object_store as vos
-    hub = tmp_path / 'share' / 'hub.vcobj'
-    hub.parent.mkdir()
+    path = tmp_path / 'store.vcobj'
     points = np.stack([*np.mgrid[:4, :5][::-1], np.full((4, 5), 9)], axis=-1).astype('<f4')
-    with ObjectStore.create(str(hub), author='curator') as origin:
+    with ObjectStore.create(str(path), author='curator') as origin:
         surface, _ = put(origin, dict(kind='surface', attributes={'scale': [1, 1]}, arrays=[array('points', points)]), 'surface')
-        origin.checkpoint()
-    vos.hub_init(str(hub), 'curator')
-    for name in ('service', 'viewer'):
-        vos.hub_clone(str(hub), str(tmp_path / f'{name}.vcobj'), name)
     session = vos.ObjectStoreSession()
-    attachment = session.attach(str(tmp_path / 'service.vcobj'), 'service', sync_interval_ms=100, push_delay_ms=20)
+    attachment = session.attach(str(path), 'service')
     assert session.attachments() == [attachment] and session.writable(attachment)
-    assert Path(session.path(attachment)) == tmp_path / 'service.vcobj'  # the replica, not the hub
-    model = session.artifact_directory(attachment, surface)
-    assert model == hub.parent / 'hub.vcobj.artifacts' / surface and model.is_dir()
-    with session.hold_leases(attachment, [surface]):
-        with ObjectStore.open(str(tmp_path / 'service.vcobj'), author='service') as db:
-            revision = db.current_geometry(surface)['uuid']
-            db.edit_geometry_rectangle(surface, 'points', 1, 1, 1, 1, np.array([7, 7, 7], '<f4').tobytes(), revision)
-        status = session.sync_hub_and_wait(attachment, timeout_s=20)
-        assert not status['pending'] and not status['error'] and not status['conflicts']
+    assert Path(session.path(attachment)) == path
+    with ObjectStore.open(str(path), author='script') as db:
+        db.edit_geometry_rectangle(surface, 'points', 1, 1, 1, 1, np.array([7, 7, 7], '<f4').tobytes(),
+                                   db.current_version(surface))
     kinds = [event['kind'] for event in session.take_events()]
     assert kinds[0] == 'attached' and 'committed' in kinds
     session.detach(attachment)
-    with ObjectStore.open(str(tmp_path / 'viewer.vcobj'), author='viewer') as viewer:
-        assert viewer.hub_sync()['pulled'] == 1
-        edited = viewer.read_geometry_rectangle(viewer.current_geometry(surface)['uuid'], 'points', 1, 1, 1, 1)
-        assert edited == np.array([7, 7, 7], '<f4').tobytes()
-
-
-def test_scripts_sync_a_hub_addressed_over_sftp_with_a_password(tmp_path, monkeypatch):
-    """The C++ SFTP test executable acts as ssh and serves files with the installed sftp-server."""
-    import os
-    from urllib.parse import quote
-    import vc_object_store as vos
-    build = os.environ.get('VC_OBJECT_STORE_BUILD_PYTHON_PATH')
-    fixture = Path(build).resolve().parent / 'bin' / 'test_object_store_sftp' if build else None
-    server = next((p for p in ('/usr/lib/openssh/sftp-server', '/usr/lib/ssh/sftp-server', '/usr/libexec/sftp-server',
-                               '/usr/libexec/openssh/sftp-server') if Path(p).exists()), None)
-    if not fixture or not fixture.exists() or not server:
-        pytest.skip('needs the built test_object_store_sftp and an installed OpenSSH sftp-server')
-    bin_dir = tmp_path / 'bin'
-    bin_dir.mkdir()
-    (bin_dir / 'ssh').symlink_to(fixture)
-    monkeypatch.setenv('PATH', f'{bin_dir}:{os.environ["PATH"]}')
-    monkeypatch.setenv('VC_SFTP_TEST_SERVER', server)
-    monkeypatch.setenv('VC_SFTP_TEST_PASSWORD', 'hunter2')
-    hub = tmp_path / 'share' / 'hub.vcobj'
-    hub.parent.mkdir()
-    with ObjectStore.create(str(hub), author='curator') as origin:
-        fiber, _ = put(origin, Fiber([[1, 2, 3], [4, 5, 6]], []), kind='fiber')
-        origin.checkpoint()
-    vos.hub_init(str(hub), 'curator')
-    url = 'sftp://annotator@test-host' + quote(str(hub))
-    prompts = []
-    vos.set_sftp_authenticator(lambda destination, prompt, confirmation: prompts.append(destination) or 'hunter2')
-    try:
-        vos.hub_clone(url, str(tmp_path / 'replica.vcobj'), 'script')
-        vos.hub_clone(str(hub), str(tmp_path / 'local.vcobj'), 'viewer')
-        with ObjectStore.open(str(tmp_path / 'replica.vcobj'), author='script') as script, \
-                ObjectStore.open(str(tmp_path / 'local.vcobj'), author='viewer') as viewer:
-            assert script.hub_status()['hub'] == url
-            script.acquire_leases([fiber])
-            script.set_meta(fiber, 'review', 'remote')
-            assert script.hub_sync()['pushed'] == 1
-            assert viewer.hub_sync()['pulled'] == 1 and viewer.object(fiber)['meta']['review'] == 'remote'
-        assert prompts and set(prompts) == {'annotator@test-host'}
-        assert vos.hub_lock_age(url) is None
-    finally:
-        vos.set_sftp_authenticator(None)
 
 
 def test_surface_vertices_are_missing_by_the_store_rule(db, tmp_path):
@@ -659,7 +601,7 @@ def test_attachments_by_role(db):
     owner, _ = put(db, Surface(1, 1, [1, 1], [[1, 2, 3]]), 'surface')
     results, _ = put(db, PointCollection([1], [[1, 2, 3]]), 'point_collection')
     corrections, _ = put(db, PointCollection([1], [[4, 5, 6]]), 'point_collection')
-    with db.write(expected_revisions=heads(db, owner, results, corrections)) as tx:
+    with db.write(expected_versions=versions(db, owner, results, corrections)) as tx:
         tx.attach(results, owner, 'fit_results')
         tx.attach(corrections, owner, 'corrections')
     other = lambda edge: edge['b'] if edge['a'] == owner else edge['a']

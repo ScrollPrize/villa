@@ -1,3 +1,5 @@
+#include "vc_object_store/objects/StoreReader.hpp"
+#include "vc_object_store/objects/TransactionJson.hpp"
 #include "catalog/Catalog.hpp"
 #include "formats/GeometryInput.hpp"
 #include "formats/RemoteSource.hpp"
@@ -145,54 +147,52 @@ CatalogStoreReport updateCatalogRecords(ObjectStoreSession& session, const Attac
         for (const auto& surface : sample.surfaces(segment)) records.push_back(placeholder(sample, segment, surface));
     }
     report.surfaces = int(records.size());
-    RevisionSelection expected;
-    std::vector<ObjectRecord> changed;
-    session.read(attachment, [&](const auto& db, const auto& read, const auto&) {
+    auto request = session.newRequest(attachment);
+    session.readStore(attachment, [&](const StoreReader& reader, const auto&) {
         for (auto& record : records) {
-            const auto existing = db.objectByUuid(read, record.uuid);
-            if (!existing) {
-                expected[record.uuid] = std::nullopt;
+            const auto head = reader.currentObject(record.uuid);
+            if (!head) {
+                request.expectedObjects[record.uuid] = currentVersionOf(reader, record.uuid);
                 ++report.added;
-                changed.push_back(std::move(record));
+                auto meta = Json::parse(record.meta);
+                meta["catalog_write"] = util::newUuid();
+                record.meta = meta.dump();
+                request.operations.push_back(CreateObjectOp{objectRecordJson(record)});
                 continue;
             }
             if (!refresh) continue;
-            const auto geometry = db.currentGeometry(read, record.uuid);
-            if (geometry && locallyEdited(*existing, *geometry)) {
+            const auto& existing = head->record;
+            const auto geometry = head->geometryRevision ? reader.geometryRevision(*head->geometryRevision) : std::nullopt;
+            if (geometry && locallyEdited(existing, *geometry)) {
                 ++report.preserved;
                 continue;
             }
-            if (sameCatalogRecord(*existing, record)) continue;
+            if (sameCatalogRecord(existing, record)) continue;
             if (geometry) {
                 auto meta = Json::parse(record.meta);
                 meta["catalog_geometry_revision"] = geometry->uuid;
                 record.meta = meta.dump();
                 // The fetched grid stays; a changed published tifxyz is fetched again.
-                if (existing->surface) {
-                    record.surface->gridWidth = existing->surface->gridWidth;
-                    record.surface->gridHeight = existing->surface->gridHeight;
-                    record.surface->scale = existing->surface->scale;
+                if (existing.surface) {
+                    record.surface->gridWidth = existing.surface->gridWidth;
+                    record.surface->gridHeight = existing.surface->gridHeight;
+                    record.surface->scale = existing.surface->scale;
                 }
                 if (Json::parse(geometry->attributes).value("source_url", "") != catalogReference(record)->url) {
                     ++report.stale;
                     stale.push_back(record.uuid);
                 }
             }
-            record.tags = existing->tags;
-            expected[record.uuid] = db.currentObjectRevision(read, record.uuid)->uuid;
+            record.tags = existing.tags;
+            request.expectedObjects[record.uuid] = head->version;
             ++report.updated;
-            changed.push_back(std::move(record));
+            auto meta = Json::parse(record.meta);
+            meta["catalog_write"] = util::newUuid();
+            record.meta = meta.dump();
+            request.operations.push_back(UpdateObjectOp{objectRecordJson(record)});
         }
     });
-    if (!changed.empty())
-        session.fetchWrite(attachment, expected, [&](ObjectStore& db, WriteTxn& txn) {
-            for (auto record : changed) {
-                auto meta = Json::parse(record.meta);
-                meta["catalog_write"] = util::newUuid();
-                record.meta = meta.dump();
-                db.upsertObject(txn, record);
-            }
-        });
+    if (!request.operations.empty()) session.submit(attachment, request);
     return report;
 }
 
@@ -216,7 +216,8 @@ void downloadFile(const std::string& url, const fs::path& path)
 void fetchCatalogSurface(ObjectStore& db, const std::string& uuid, const ObjectStoreSession::FetchWrite& write)
 {
     std::optional<ObjectRecord> record;
-    std::optional<std::string> geometry, revision;
+    std::optional<std::string> geometry;
+    std::optional<int64_t> version;
     {
         auto read = db.read();
         record = db.objectByUuid(read, uuid);
@@ -225,7 +226,7 @@ void fetchCatalogSurface(ObjectStore& db, const std::string& uuid, const ObjectS
             if (record && locallyEdited(*record, *current)) return;
             geometry = current->uuid;
         }
-        if (const auto current = db.currentObjectRevision(read, uuid)) revision = current->uuid;
+        version = db.currentVersion(read, uuid);
     }
     const auto reference = record ? catalogReference(*record) : std::nullopt;
     if (!reference || reference->url.empty()) throw std::runtime_error("not a catalog surface: " + uuid);
@@ -250,9 +251,9 @@ void fetchCatalogSurface(ObjectStore& db, const std::string& uuid, const ObjectS
     updated.surface->gridWidth = prepared.object.surface->gridWidth;
     updated.surface->gridHeight = prepared.object.surface->gridHeight;
     updated.surface->scale = prepared.object.surface->scale;
-    // Expected at the revision read: a concurrent change (another fetch, a
+    // Expected at the version read: a concurrent change (another fetch, a
     // refresh) fails this write, and the next read fetches again.
-    write({{uuid, revision}}, [&](ObjectStore& store, WriteTxn& txn) {
+    write({{uuid, version}}, [&](ObjectStore& store, WriteTxn& txn) {
         store.upsertObject(txn, updated);
         const auto fetched = store.putGeometry(txn, uuid, prepared.geometry, geometry);
         store.setMeta(txn, uuid, "catalog_geometry_revision", Json(fetched).dump());
@@ -272,22 +273,21 @@ void restoreCatalogVersion(ObjectStoreSession& session, const AttachmentIdentity
                            const std::string& objectUuid)
 {
     const auto uuid = util::canonicalUuid(objectUuid);
-    std::optional<std::string> revision;
-    session.read(attachment, [&](const auto& store, const auto& txn, const auto&) {
-        const auto record = store.objectByUuid(txn, uuid);
-        if (!record || !catalogReference(*record)) throw std::runtime_error("not a catalog surface: " + uuid);
-        const auto meta = Json::parse(record->meta);
+    (void)session.editCurrent(attachment, {uuid}, [&](const StoreReader& reader, const std::string&) {
+        const auto current = reader.currentObject(uuid);
+        if (!current || !catalogReference(current->record)) throw std::runtime_error("not a catalog surface: " + uuid);
+        const auto meta = Json::parse(current->record.meta);
         if (!meta.contains("catalog_geometry_revision"))
             throw std::runtime_error("the catalog version of " + uuid + " was never fetched");
         // The catalog's last write (a fetch or refresh) minted this token; the
         // user's later revisions carry it forward.
         const auto token = meta.value("catalog_write", std::string());
-        for (const auto& version : store.objectHistory(txn, uuid))
-            if (!revision && Json::parse(version.record.meta).value("catalog_write", std::string()) == token)
-                revision = version.uuid;
+        for (const auto& version : reader.objectHistory(uuid))
+            if (!version.deleted && Json::parse(version.record.meta).value("catalog_write", std::string()) == token)
+                return std::vector<TransactionOperation>{RestoreObjectOp{
+                    uuid, ObjectVersion{reader.status().storeUuid, version.generation, uuid, version.version}}};
+        throw std::runtime_error("the catalog version of " + uuid + " is not in its history");
     });
-    if (!revision) throw std::runtime_error("the catalog version of " + uuid + " is not in its history");
-    session.editCurrent(attachment, {uuid}, [&](auto& store, auto& txn, const auto&) { store.restoreObject(txn, uuid, *revision); });
 }
 
 CatalogStoreReport refreshCatalog(ObjectStoreSession& session, const AttachmentIdentity& attachment,
@@ -300,19 +300,9 @@ CatalogStoreReport refreshCatalog(ObjectStoreSession& session, const AttachmentI
     return report;
 }
 
-fs::path publishedFile(ObjectStoreSession& session, const AttachmentIdentity& attachment, const std::string& objectUuid,
-                       const std::string& name)
+fs::path fetchPublishedFile(const CatalogFile& file, const fs::path& target)
 {
-    std::optional<CatalogReference> reference;
-    session.read(attachment, [&](const auto& store, const auto& txn, const auto&) {
-        if (const auto record = store.objectByUuid(txn, objectUuid)) reference = catalogReference(*record);
-    });
-    if (!reference) throw std::runtime_error("not a catalog surface: " + objectUuid);
-    const auto file = std::find_if(reference->files.begin(), reference->files.end(),
-                                   [&](const auto& f) { return f.name == name; });
-    if (file == reference->files.end()) throw std::runtime_error("no published file " + name + " for " + objectUuid);
-    const auto target = session.artifactDirectory(attachment, objectUuid) / file->name;
-    if (!fs::is_regular_file(target)) detail::downloadFile(file->url, target);
+    if (!fs::is_regular_file(target)) detail::downloadFile(file.url, target);
     return target;
 }
 

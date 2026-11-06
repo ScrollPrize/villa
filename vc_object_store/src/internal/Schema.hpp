@@ -102,15 +102,17 @@ CREATE TABLE edge_geometry_bindings(
   a_revision BLOB, b_revision BLOB
 );
 
+-- Payload and manifest hashes are SHA-256 digests stored as 32-byte blobs.
 CREATE TABLE geometry_chunks(
-  hash TEXT PRIMARY KEY CHECK(length(hash)=64),
+  hash BLOB PRIMARY KEY CHECK(length(hash)=32),
   data BLOB NOT NULL CHECK(length(data)>0 AND length(data)<=1048576)
 );
 CREATE TABLE geometry_revisions(
   uuid BLOB PRIMARY KEY CHECK(length(uuid)=16),
   object_uuid BLOB NOT NULL REFERENCES objects(uuid) ON DELETE RESTRICT,
   parent_uuid BLOB,
-  content_hash TEXT NOT NULL CHECK(length(content_hash)=64),
+  -- SHA-256 of the manifest text, verified on every load.
+  content_hash BLOB NOT NULL CHECK(length(content_hash)=32),
   manifest TEXT NOT NULL CHECK(json_valid(manifest) AND json_type(manifest)='object'),
   object_generation INTEGER NOT NULL,
   created_by TEXT NOT NULL, created_at TEXT NOT NULL, created_host TEXT NOT NULL,
@@ -126,9 +128,9 @@ CREATE TABLE geometry_heads(
 CREATE TABLE geometry_revision_chunks(
   revision_uuid BLOB NOT NULL REFERENCES geometry_revisions(uuid),
   array_name TEXT NOT NULL, chunk_index INTEGER NOT NULL CHECK(chunk_index>=0),
-  hash TEXT NOT NULL REFERENCES geometry_chunks(hash),
+  hash BLOB NOT NULL REFERENCES geometry_chunks(hash),
   PRIMARY KEY(revision_uuid,array_name,chunk_index)
-);
+) WITHOUT ROWID;
 CREATE TRIGGER geometry_chunks_immutable_update BEFORE UPDATE ON geometry_chunks
   BEGIN SELECT RAISE(ABORT,'geometry chunks are immutable'); END;
 CREATE TRIGGER geometry_chunks_immutable_delete BEFORE DELETE ON geometry_chunks
@@ -162,10 +164,7 @@ CREATE TABLE geometry_current_chunks(
   hash TEXT NOT NULL, data BLOB NOT NULL,
   PRIMARY KEY(object_uuid,array_name,chunk_index)
 );
-
-CREATE TABLE sync_replica(singleton INTEGER PRIMARY KEY CHECK(singleton=1), uuid TEXT NOT NULL);
 )SQL");
-    execute(db, "INSERT INTO sync_replica VALUES(1,?)", util::newUuid());
     detail::createSpatialSchema(db);
     exec(db, "CREATE TABLE store_identity(singleton INTEGER PRIMARY KEY CHECK(singleton=1), uuid BLOB NOT NULL UNIQUE CHECK(length(uuid)=16));");
     execute(db, "INSERT INTO store_identity VALUES(1,?)", parseUuid(util::newUuid()));

@@ -27,8 +27,14 @@ target_compile_features(vc_geometry PUBLIC cxx_std_20)
 
 # Primary SQLite object database; no dependency on vc_core or Qt.
 add_library(vc_objects ${_vc_store_library_type}
-    sftp/SftpVfs.cpp
     internal/Anchors.cpp
+    internal/Ownership.cpp
+    Versions.cpp
+    Selections.cpp
+    Artifacts.cpp
+    Commands.cpp
+    Wire.cpp
+    client/HostedStore.cpp
     internal/Sqlite.cpp
     internal/RecordSql.cpp
     internal/EdgeSql.cpp
@@ -39,6 +45,9 @@ add_library(vc_objects ${_vc_store_library_type}
     Database.cpp
     VolumeTransforms.cpp
     ObjectStoreSession.cpp
+    HostedSession.cpp
+    StoreReader.cpp
+    DraftCheckpoints.cpp
     Project.cpp
     FetchQueue.cpp
     Transactions.cpp
@@ -61,12 +70,7 @@ add_library(vc_objects ${_vc_store_library_type}
     ToolObjects.cpp
     AttachedDocument.cpp
     SurfaceCreate.cpp
-    sync/Replica.cpp
-    sync/GeometryTransfer.cpp
-    sync/Apply.cpp
-    hub/HubRules.cpp
-    hub/Hub.cpp
-    hub/HubWorker.cpp
+    SurfaceGrid.cpp
     geometry/GeometryViews.cpp
     imports/SourceRelationships.cpp
     geometry/GeometryIngestBatch.cpp
@@ -90,10 +94,28 @@ if(TARGET SQLite3::SQLite3)
 else()
     target_link_libraries(vc_objects PUBLIC SQLite::SQLite3)
 endif()
-target_link_libraries(vc_objects PUBLIC vc_geometry vc_reader::sftp vc_reader::catalog nlohmann_json::nlohmann_json PRIVATE OpenSSL::Crypto zstd::libzstd)
+target_link_libraries(vc_objects PUBLIC vc_geometry vc_reader::catalog nlohmann_json::nlohmann_json PRIVATE OpenSSL::Crypto zstd::libzstd)
 target_compile_features(vc_objects PUBLIC cxx_std_20)
 add_library(vc_object_store::vc_objects ALIAS vc_objects)
+# Offline schema conversion; the runtime library knows only the current schema.
+add_library(vc_object_migration STATIC migration/ConvertStore.cpp)
+target_include_directories(vc_object_migration PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+# geometry/GeometryInternal.hpp includes <openssl/evp.h>; Homebrew OpenSSL is not on the default include path.
+target_link_libraries(vc_object_migration PUBLIC vc_objects PRIVATE OpenSSL::Crypto nlohmann_json::nlohmann_json)
+target_compile_features(vc_object_migration PUBLIC cxx_std_20)
 add_library(vc_object_store::vc_geometry ALIAS vc_geometry)
+
+# Hosting service: Boost.Beast/Asio stays private to this target.
+if(VC_OBJECT_STORE_BUILD_SERVER)
+    add_library(vc_object_server STATIC server/Server.cpp)
+    target_link_libraries(vc_object_server PUBLIC vc_objects PRIVATE Boost::headers Threads::Threads nlohmann_json::nlohmann_json)
+    if(WIN32)
+        # Asio sockets on Windows need Winsock and AcceptEx.
+        target_link_libraries(vc_object_server PRIVATE ws2_32 mswsock)
+    endif()
+    target_compile_features(vc_object_server PUBLIC cxx_std_20)
+    add_library(vc_object_store::vc_object_server ALIAS vc_object_server)
+endif()
 
 if(NOT VC_OBJECT_STORE_BUILD_ADAPTERS)
     return()

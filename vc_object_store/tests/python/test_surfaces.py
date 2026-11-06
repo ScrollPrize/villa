@@ -1,3 +1,4 @@
+import pytest
 import numpy as np
 from vc_object_store import ObjectStore, Surface
 from vc_object_store.surfaces import create_surface, read_surface
@@ -19,8 +20,8 @@ def test_created_surface_reads_back_through_registrations(db_path):
         assert "area_vx2" not in record["meta"] and "format" not in record["meta"] and "uuid" not in record["meta"]
         assert record["surface"]["area"] == 0 and record["surface"]["grid_width"] == 2
         db.register_volume_transform("a", "b", [[2, 0, 0, 10], [0, 1, 0, 0], [0, 0, 1, 0]])
-    points, valid, scale, _, revision, channels = read_surface(db_path, uid, volume="a")
-    assert channels == {"approval"} and revision
+    points, valid, scale, _, version, generation, revision, channels = read_surface(db_path, uid, volume="a")
+    assert channels == {"approval"} and revision and version == 1 and generation
     np.testing.assert_array_equal(valid, [[True, True], [False, False]])
     np.testing.assert_array_equal(points[0], xyz[0])
     assert (points[1] == -1).all() and scale == (0.05, 0.05)
@@ -35,9 +36,30 @@ def test_older_revisions_read_in_the_frame_they_were_stored_in(db_path):
     uid = create_surface(db_path, xyz, name="s", scale=1, volume="a", tool="pytest")
     with ObjectStore.open(db_path, author="pytest") as db:
         first = db.current_geometry(uid)["uuid"]
-        db.put_geometry(uid, Surface.from_arrays(np.ascontiguousarray(xyz * 2), [1.0, 1.0]), expected_revision=first)
+        db.put_geometry(uid, Surface.from_arrays(np.ascontiguousarray(xyz * 2), [1.0, 1.0]),
+                        expected_version=db.current_version(uid))
         db.set_meta(uid, "coordinates", {"volume_uuid": "c", "scale_factor": 2})
     current = read_surface(db_path, uid, volume="c")
-    older = read_surface(db_path, uid, volume="a", geometry_revision=first)
+    older = read_surface(db_path, uid, volume="a", version=1)
     np.testing.assert_array_equal(current.points, older.points)
     assert older.geometry_revision == first != current.geometry_revision
+    assert (older.version, current.version) == (1, 3) and older.record["meta"]["coordinates"]["volume_uuid"] == "a"
+    with pytest.raises(ValueError, match="version 9"):
+        read_surface(db_path, uid, volume="a", version=9)
+    assert read_surface(db_path, uid, volume="a", version=1, generation=older.generation).geometry_revision == first
+    with pytest.raises(ValueError, match="version 1"):
+        read_surface(db_path, uid, volume="a", version=1, generation="00000000-0000-4000-8000-000000000000")
+
+
+def test_numbered_surface_uses_its_metadata_when_geometry_is_shared(db_path):
+    ObjectStore.create(db_path, author="pytest").close()
+    xyz = np.array([[[2, 4, 6], [8, 10, 12]]], dtype=np.float32)
+    uid = create_surface(db_path, xyz, name="s", scale=1, volume="a", tool="pytest")
+    with ObjectStore.open(db_path, author="pytest") as db:
+        db.set_meta(uid, "coordinates", {"volume_uuid": "a", "scale_factor": 2})
+    first = read_surface(db_path, uid, volume="a", version=1)
+    current = read_surface(db_path, uid, volume="a")
+    assert first.geometry_revision == current.geometry_revision
+    np.testing.assert_array_equal(first.points, xyz)
+    np.testing.assert_array_equal(current.points, xyz / 2)
+    assert first.record["meta"]["coordinates"]["scale_factor"] == 1

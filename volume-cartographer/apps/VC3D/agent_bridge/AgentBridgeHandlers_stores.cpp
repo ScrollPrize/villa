@@ -26,6 +26,7 @@
 
 #include <vc_object_store/Uuid.hpp>
 #include <vc_object_store/objects/GeometryExport.hpp>
+#include <vc_object_store/objects/StoreReader.hpp>
 #include <vc_reader/zarr.hpp>
 
 // Object stores of the open project (importing source files into them,
@@ -81,7 +82,7 @@ struct ExportTarget {
 };
 
 struct ExportResult {
-    std::string objectRevision;
+    vc::objects::ObjectVersion version;
     std::string geometryRevision;
     QString error;
 };
@@ -239,8 +240,8 @@ QJsonObject AgentBridgeServer::handleObjectsExport(const QJsonValue& params)
         if (std::any_of(candidates.begin(), candidates.end(), [&](const auto& c) { return c.attachment == attachment; }))
             return;
         std::optional<std::string> kind;
-        session->read(attachment, [&](const auto& db, const auto& txn, const auto&) {
-            const auto head = db.currentObjectRevision(txn, uuid);
+        session->readStore(attachment, [&](const vc::objects::StoreReader& reader, const auto&) {
+            const auto head = reader.currentObject(uuid);
             if (head && !head->deleted && !head->record.retired) kind = head->record.kind;
         });
         if (kind) candidates.push_back({store, attachment, *kind});
@@ -266,6 +267,11 @@ QJsonObject AgentBridgeServer::handleObjectsExport(const QJsonValue& params)
                                {{"param", "store"}, {"candidates", stores}}};
     }
     const ExportTarget target = candidates.front();
+    // Native export reads the store file; a hosted store has none here.
+    if (session->hosted(target.attachment))
+        throw AgentBridgeError{-32602, "Objects of a hosted store cannot be exported", {{"param", "store"},
+                               {"store", QString::fromStdString(target.store)}}};
+    const std::filesystem::path storeFile = session->location(target.attachment);
     if (target.kind != "surface" && target.kind != "fiber" && target.kind != "point_collection")
         throw AgentBridgeError{-32602, QStringLiteral("Objects of kind %1 cannot be exported").arg(QString::fromStdString(target.kind)),
                                {{"param", "uuid"}, {"kind", QString::fromStdString(target.kind)}}};
@@ -317,7 +323,10 @@ QJsonObject AgentBridgeServer::handleObjectsExport(const QJsonValue& params)
                 {"uuid", QString::fromStdString(uuid)},
                 {"kind", QString::fromStdString(target.kind)},
                 {"store", QString::fromStdString(target.store)},
-                {"objectRevision", QString::fromStdString(result.objectRevision)},
+                {"version", QJsonObject{{"store", QString::fromStdString(result.version.storeUuid)},
+                                        {"generation", QString::fromStdString(result.version.generation)},
+                                        {"object", QString::fromStdString(result.version.objectUuid)},
+                                        {"version", qint64(result.version.version)}}},
                 {"geometryRevision", QString::fromStdString(result.geometryRevision)},
             };
         }
@@ -325,16 +334,20 @@ QJsonObject AgentBridgeServer::handleObjectsExport(const QJsonValue& params)
                   success ? QStringLiteral("Exported %1").arg(QString::fromStdString(uuid)) : result.error,
                   success ? path : QString());
     });
-    watcher->setFuture(QtConcurrent::run([session, target, uuid, destination, overwrite, validOnly]() {
+    watcher->setFuture(QtConcurrent::run([storeFile, uuid, destination, overwrite, validOnly]() {
         ExportResult result;
         try {
-            session->read(target.attachment, [&](const auto& db, const auto& txn, const auto&) {
-                const auto head = db.currentObjectRevision(txn, uuid);
-                if (!head || head->deleted || head->record.retired)
-                    throw std::runtime_error("the object was removed before it could be exported");
-                result.objectRevision = head->uuid;
-                result.geometryRevision = vc::objects::exportGeometry(db, txn, uuid, destination, std::nullopt, overwrite, validOnly);
-            });
+            // A read-only connection of its own: the export and its reported
+            // version come from one snapshot, and read-only stores export too.
+            vc::objects::OpenOptions options;
+            options.readOnly = true;
+            auto db = vc::objects::ObjectStore::open(storeFile, options);
+            const auto txn = db.read();
+            const auto head = db.currentObjectRevision(txn, uuid);
+            if (!head || head->deleted || head->record.retired)
+                throw std::runtime_error("the object was removed before it could be exported");
+            if (head->geometryRevision) result.geometryRevision = *head->geometryRevision;
+            result.version = vc::objects::exportGeometry(db, txn, uuid, destination, std::nullopt, overwrite, validOnly);
         } catch (const std::exception& error) {
             result.error = QString::fromUtf8(error.what());
         }
@@ -681,7 +694,7 @@ QJsonObject AgentBridgeServer::handleUmbilicusRemove(const QJsonValue&)
     if (!umbilici)
         throw AgentBridgeError{-32007, "No store is routed for umbilici", {{"kind", "store"}}};
     QJsonObject result{{"volume", QString::fromStdString(umbilici->volume)}, {"store", storeReferenceJson(state, umbilici->store)}};
-    if (umbilici->pins.empty()) {
+    if (umbilici->uuids.empty()) {
         result["removed"] = QJsonArray();
         return result;
     }

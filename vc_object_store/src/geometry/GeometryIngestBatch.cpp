@@ -4,6 +4,9 @@
 #include "vc_object_store/Uuid.hpp"
 #include "vc_object_store/objects/GeometryCoordinates.hpp"
 #include "vc_object_store/objects/SurfaceCreate.hpp"
+#include "vc_object_store/objects/StoreReader.hpp"
+#include "vc_object_store/objects/FiberJson.hpp"
+#include "vc_object_store/objects/TransactionJson.hpp"
 #include <set>
 namespace vc::objects {
 namespace {
@@ -57,7 +60,7 @@ int64_t detail::ingestGeometryBatch(ObjectStore& db, WriteTxn& write, std::vecto
         const auto existing=db.objectByUuid(write,p.object.uuid);
         detail::Statement history(connection,"SELECT 1 FROM geometry_revisions WHERE object_uuid=? LIMIT 1",
             detail::parseUuid(p.object.uuid));
-        detail::Statement prior(connection,"SELECT 1 FROM object_revisions WHERE object_uuid=? LIMIT 1", p.object.uuid);
+        detail::Statement prior(connection,"SELECT 1 FROM object_revisions WHERE object_uuid=? LIMIT 1", detail::parseUuid(p.object.uuid));
         if (registeredInitial && (!existing || existing->retired || history.row()))
             throw GeometrySourceRejected("object already exists or was previously imported; re-import is unsupported: "+p.object.uuid);
         if (!registeredInitial && (existing.has_value() || prior.row())) clashes.push_back(p.object.uuid);
@@ -99,4 +102,26 @@ int64_t ingestGeometryBatch(ObjectStore& db, WriteTxn& txn, std::vector<Geometry
 {
     return detail::ingestGeometryBatch(db, txn, std::move(batch), coordinateContext, false);
 }
+void addIngestOperation(TransactionRequest& request, const StoreReader& reader, std::vector<GeometrySource> batch,
+    const std::string& coordinateContext)
+{
+    geometryCoordinates(Json::parse(coordinateContext));
+    IngestGeometryOp op;
+    op.coordinateContext = Json::parse(coordinateContext).dump();
+    for (auto& p : batch) p.object.uuid = util::canonicalUuid(p.object.uuid);
+    // An existing object is expected at its current version, so importing it
+    // again is refused as a re-import rather than as a stale request.
+    auto expect = [&](const std::string& uuid) {
+        if (request.expectedObjects.contains(uuid)) return;
+        const auto current = reader.currentObject(uuid);
+        request.expectedObjects[uuid] = current && !current->deleted ? std::optional(current->version) : std::nullopt;
+    };
+    // Fiber branches name their existing endpoints; links resolved by source
+    // identity (point and winding links) stay within the batch.
+    for (const auto& p : batch) expect(p.object.uuid);
+    for (const auto& target : fiberBatchEndpoints(batch)) expect(target);
+    for (auto& p : batch) op.items.push_back({objectRecordJson(p.object), std::move(p.geometry), p.source.dump()});
+    request.operations.push_back(std::move(op));
+}
+
 }

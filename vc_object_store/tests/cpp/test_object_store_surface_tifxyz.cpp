@@ -1,4 +1,5 @@
 #include "TestSupport.hpp"
+#include "vc_object_store/objects/StoreReader.hpp"
 #include "vc_object_store/Tiff.hpp"
 #include "vc_object_store/geometry/Geometry.hpp"
 #include "vc_object_store/object_links/ObjectLinks.hpp"
@@ -193,8 +194,9 @@ int main() try
     for (const auto& event : session.takeEvents())
         surfacesCommitted |= event.kind == StoreSessionEvent::Kind::Committed && event.touches({"surface"});
     require(surfacesCommitted, "session observers see the ingested surfaces");
-    session.read(attachment, [&](const auto& store, const auto& txn, const auto&) {
-        const auto surfaces = store.objectsByKind(txn, "surface");
+    session.readStore(attachment, [&](const StoreReader& reader, const auto&) {
+        ObjectSelection kind; kind.kind = "surface";
+        const auto surfaces = reader.selectObjects(kind);
         require(surfaces.size() == 2, "the session store holds both surfaces");
         for (auto object : surfaces) {
             std::sort(object.tags.begin(), object.tags.end());
@@ -225,8 +227,9 @@ int main() try
         require(stopped.fatalError && stopped.fatalError->find("injected store failure") != std::string::npos &&
                 stopped.ingested == 1 && stopped.uuids.size() == 1 && stopped.problems.empty() && !stopped.cancelled,
                 "an infrastructure failure stops ingestion and keeps the committed surface");
-        session.read(target, [&](const auto& db, const auto& txn, const auto&) {
-            require(db.objectsByKind(txn, "surface").size() == 1, "the surface before the failure stays committed");
+        session.readStore(target, [&](const StoreReader& reader, const auto&) {
+            ObjectSelection surfaces; surfaces.kind = "surface";
+            require(reader.selectObjects(surfaces).size() == 1, "the surface before the failure stays committed");
         });
         const auto continued = ingestGeometrySource(session, target, "surface", folder, failing);
         require(!continued.fatalError && !continued.problems.empty() &&
@@ -257,7 +260,7 @@ int main() try
             "{}", {}, strict, &cancel);
         require(cancelled.cancelled && cancelled.ingested == 1 && !cancelled.fatalError, "cancellation is reported");
 
-        // A failure entering the job is fatal with an empty report.
+        // A store that cannot take the ingestion is fatal with an empty report.
         auto readOnly = options; readOnly.readOnly = true;
         cancelTarget = session.replace(cancelTarget, cancelStore, readOnly);
         const auto refused = ingestGeometrySource(session, cancelTarget, "surface", folder, {}, "{}", {}, strict);
@@ -270,7 +273,7 @@ int main() try
         {
             auto txn = reader.read();
             const auto revision = exportGeometry(reader, txn, stopped.uuids.front(), exportTo);
-            require(!revision.empty() && fs::exists(exportTo / "meta.json"), "a read-only store exports a surface");
+            require(revision.version > 0 && fs::exists(exportTo / "meta.json"), "a read-only store exports a surface");
             const auto meta = nlohmann::json::parse(std::ifstream(exportTo / "meta.json"));
             require(meta.at("uuid") == stopped.uuids.front(), "export keeps the object UUID");
             mustFail([&] { exportGeometry(reader, txn, stopped.uuids.front(), exportTo); });

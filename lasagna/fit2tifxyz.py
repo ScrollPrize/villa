@@ -6,6 +6,7 @@ import json
 import math
 import shutil
 import sys
+import tempfile
 import uuid
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -55,10 +56,24 @@ class _StoreTarget:
 
 @dataclass(frozen=True)
 class _Written:
-	"""An exported surface: the directory its side files go in (the tifxyz directory, or the stored surface's
-	artifact directory) and its UUID when stored."""
+	"""An exported surface: the directory its side files go in (the tifxyz directory, or, for a stored surface,
+	a temporary directory published as its artifacts by _publish_side_files) and its UUID when stored."""
 	files_dir: Path
 	surface_uuid: str | None = None
+
+
+def _publish_side_files(written: _Written, store: _StoreTarget | None) -> None:
+	"""A stored surface's side files (model checkpoint, model parameters, mask debug output) become its
+	artifacts (relative paths as names); the temporary directory is then removed."""
+	if store is None or written.surface_uuid is None:
+		return
+	try:
+		files = {path.relative_to(written.files_dir).as_posix(): path
+				 for path in sorted(written.files_dir.rglob("*")) if path.is_file()}
+		if files:
+			store.session.publish_artifacts(written.surface_uuid, files)
+	finally:
+		shutil.rmtree(written.files_dir, ignore_errors=True)
 
 
 def _valid_xyz_mask(x: np.ndarray, y: np.ndarray, z: np.ndarray) -> np.ndarray:
@@ -76,7 +91,8 @@ def _build_parser() -> argparse.ArgumentParser:
 	g = p.add_argument_group("io")
 	g.add_argument("--input", required=True, help="Model checkpoint (.pt)")
 	g.add_argument("--output", default=None, help="Output directory (or --store)")
-	g.add_argument("--store", default=None, help="Create the surfaces in this VC object store instead")
+	g.add_argument("--store", default=None,
+		help="Create the surfaces in this VC object store instead: a store file or a vc_object_server endpoint")
 	g.add_argument("--volume-uuid", default=None, help="With --store: the volume the surfaces' coordinates are in")
 	g.add_argument("--voxel-scale", type=float, default=1.0,
 				   help="With --store: those coordinates are at this scale of the volume's voxels (2^-N at level N)")
@@ -326,7 +342,7 @@ def _write_atlas_control_results(written: _Written, results: dict | None, store:
 	document = {key: value for key, value in results.items() if key != "fibers"}
 	from vc_object_store.documents import attach_document
 	attach_document(
-		store.session.path, written.surface_uuid, document, role=ATLAS_RESULTS_ROLE, list_key="records",
+		store.session.location, written.surface_uuid, document, role=ATLAS_RESULTS_ROLE, list_key="records",
 		position_key="target_xyz", name="atlas control points results", volume=store.volume,
 		voxel_scale=store.voxel_scale, author=store.session.author)
 
@@ -342,7 +358,7 @@ def _write_corr_points_results(written: _Written, results: dict | None, store: _
 	document["points_list"] = _corr_points_result_list(results)
 	from vc_object_store.documents import attach_document
 	attach_document(
-		store.session.path, written.surface_uuid, document, role=CORR_RESULTS_ROLE, list_key="points_list",
+		store.session.location, written.surface_uuid, document, role=CORR_RESULTS_ROLE, list_key="points_list",
 		position_key="p", name="correction points results", volume=store.volume,
 		voxel_scale=store.voxel_scale, author=store.session.author)
 
@@ -1087,7 +1103,8 @@ def _copy_model(model_source: Path, directory: Path) -> None:
 
 def _store_surface(store: _StoreTarget, name: str, xyz: np.ndarray, meta: dict, channels: dict[str, np.ndarray],
 				   model_source: Path | None) -> _Written:
-	"""Create the exported surface in the store; the model checkpoint goes to its artifact directory."""
+	"""Create the exported surface in the store; the model checkpoint and other side files are written to a
+	temporary directory and published as its artifacts (_publish_side_files)."""
 	meta = copy.deepcopy(meta)
 	scale = float(meta["scale"][0])
 	meta.pop("model_source", None)
@@ -1099,14 +1116,14 @@ def _store_surface(store: _StoreTarget, name: str, xyz: np.ndarray, meta: dict, 
 	name = name[:-len(".tifxyz")] if name.endswith(".tifxyz") else name
 	from vc_object_store.surfaces import create_surface
 	surface_uuid = create_surface(
-		store.session.path, xyz, name=name, scale=scale, volume=store.volume, tool="lasagna", sources=store.sources,
+		store.session.location, xyz, name=name, scale=scale, volume=store.volume, tool="lasagna", sources=store.sources,
 		meta=meta, channels=channels, tags=store.tags, author=store.session.author, voxel_scale=store.voxel_scale)
 	store.created.append(surface_uuid)
 	print(f"surface_uuid: {surface_uuid}", flush=True)
-	artifacts = store.session.artifact_directory(surface_uuid)
+	side_files = Path(tempfile.mkdtemp(prefix=f"lasagna-{surface_uuid}-"))
 	if model_source is not None:
-		_copy_model(model_source, artifacts)
-	return _Written(artifacts, surface_uuid)
+		_copy_model(model_source, side_files)
+	return _Written(side_files, surface_uuid)
 
 
 def _as_numpy_float32(value: object, *, name: str) -> np.ndarray:
@@ -1218,6 +1235,7 @@ def _export_flatten_checkpoint(
 	if model_params is not None:
 		(written.files_dir / "model_params.json").write_text(json.dumps(model_params, indent=2) + "\n", encoding="utf-8")
 	_write_atlas_control_results(written, atlas_control_export, store)
+	_publish_side_files(written, store)
 	_print_area(area)
 	print(f"[fit2tifxyz] exported {out_dir.name}", flush=True)
 	return 0
@@ -1268,13 +1286,10 @@ def main(argv: list[str] | None = None, *, cancel_fn=None, state: dict | None = 
 	session = stored_surfaces.StoreSession(cfg.store) if own_session else store_session
 	if cfg.output_name and args.output_name_mode != "exact":
 		cfg = replace(cfg, output_name=stored_surfaces.next_free_name(
-			session.path, cfg.output_name.removesuffix(".tifxyz"), args.output_name_mode))
+			session.location, cfg.output_name.removesuffix(".tifxyz"), args.output_name_mode))
 	created = created_surfaces if created_surfaces is not None else []
 	try:
-		result = _export(cfg, cancel_fn=_check_cancel, state=state, store_session=session, created=created)
-		if own_session:
-			session.sync()
-		return result
+		return _export(cfg, cancel_fn=_check_cancel, state=state, store_session=session, created=created)
 	finally:
 		if own_session:
 			session.close()
@@ -1480,6 +1495,7 @@ def _export(cfg: ExportConfig, *, cancel_fn, state: dict | None,
 			(written.files_dir / "model_params.json").write_text(json.dumps(model_params, indent=2) + "\n", encoding="utf-8")
 		_write_corr_points_results(written, corr_points_results, store)
 		_write_atlas_control_results(written, atlas_control_export, store)
+		_publish_side_files(written, store)
 	else:
 		# One tifxyz per depth layer (winding)
 		total_area = {"area_vx2": 0.0}
@@ -1552,6 +1568,7 @@ def _export(cfg: ExportConfig, *, cancel_fn, state: dict | None,
 				(written.files_dir / "model_params.json").write_text(json.dumps(model_params, indent=2) + "\n", encoding="utf-8")
 			_write_corr_points_results(written, corr_points_results, store)
 			_write_atlas_control_results(written, atlas_control_export, store)
+			_publish_side_files(written, store)
 		_print_area(total_area)
 
 	return 0

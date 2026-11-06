@@ -61,7 +61,6 @@ StoreSurfaceOverlayController::StoreSurfaceOverlayController(CState* state, View
     connect(_state, &CState::storeRoutesChanged, this, [this]() { invalidate(); });
     connect(_state, &CState::objectStoreChanged, this, [this](const vc::objects::StoreSessionEvent& event) {
         using Kind = vc::objects::StoreSessionEvent::Kind;
-        if (event.kind == Kind::Hub) return;
         if (event.kind == Kind::Attached || event.kind == Kind::Detached) {
             invalidate();
         } else if (event.kind == Kind::Draft) {

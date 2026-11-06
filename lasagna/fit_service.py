@@ -660,7 +660,7 @@ def _store_uploaded_object(body: dict[str, Any]) -> dict[str, str]:
 
 
 def _is_surface_ref(ref: Any) -> bool:
-    """A stored surface: {"type": "surface", "uuid": ..., "revision": optional geometry revision}."""
+    """A stored surface: {"type": "surface", "uuid": ...}, at a numbered version with "generation" and "version"."""
     return isinstance(ref, dict) and ref.get("type") == "surface"
 
 
@@ -673,13 +673,19 @@ def _require_store() -> stored_surfaces.StoreSession:
 def _stored_surface_path(ref: dict[str, Any]) -> str:
     """The fit's reference to a stored surface (read from the service store)."""
     _require_store()
-    return stored_surfaces.surface_ref(str(ref.get("uuid") or ""), ref.get("revision") or None)
+    if "revision" in ref:
+        raise ValueError("stored surface references select a numbered version (generation and version), not a revision")
+    version = ref.get("version")
+    if version is None:
+        return stored_surfaces.surface_ref(str(ref.get("uuid") or ""))
+    return stored_surfaces.surface_ref(str(ref.get("uuid") or ""), (str(ref.get("generation") or ""), int(version)))
 
 
 def _stored_model_path(ref: dict[str, Any]) -> Path:
-    """The model checkpoint a fit left in a stored surface's artifact directory."""
-    path = _require_store().artifact_directory(str(ref.get("uuid") or ""), create=False) / "model.pt"
-    if not path.is_file():
+    """The model checkpoint a fit published with a stored surface (its ``model.pt`` artifact), as a local copy in
+    the service's object cache."""
+    path = _require_store().artifact_file(str(ref.get("uuid") or ""), "model.pt", _object_store_root() / "artifacts")
+    if path is None:
         raise ValueError(f"surface {ref.get('uuid')} has no Lasagna model")
     return path
 
@@ -692,7 +698,7 @@ def _stored_corr_points(uuids: list[Any], volume: str | None, target_scale: floa
         raise ValueError("corr_point_collections needs a store request (store_uuid and volume_uuid)")
     from vc_object_store.documents import point_collections
     collections: dict[str, Any] = {}
-    for index, stored in enumerate(point_collections(_require_store().path, [str(u) for u in uuids], volume,
+    for index, stored in enumerate(point_collections(_require_store().location, [str(u) for u in uuids], volume,
                                                                 target_scale), start=1):
         collection = dict(stored["source"])
         collection["uuid"] = stored["uuid"]
@@ -1876,8 +1882,7 @@ def _run_optimization(job: _JobState, body: dict[str, Any]) -> None:
         store_volume = _request_store_volume(body)
         store_voxel_scale = _request_voxel_scale(body)
         if store_volume is not None:
-            job.set_running("loading", 0, 0, 0.0, stage_name="Syncing the object store")
-            _require_store().sync()
+            _require_store()
         body = _body_with_resolved_job_spec(body)
     except Exception as exc:
         job.set_error(str(exc))
@@ -1984,7 +1989,7 @@ def _run_optimization(job: _JobState, body: dict[str, Any]) -> None:
         if model_init == "model" and model_input:
             args_section["model-input"] = str(model_input)
         if store_volume is not None:
-            args_section["store"] = _require_store().path
+            args_section["store"] = _require_store().location
             args_section["volume-uuid"] = store_volume
             args_section["voxel-scale"] = store_voxel_scale
         if not omit_model_output:
@@ -2087,7 +2092,7 @@ def _run_optimization(job: _JobState, body: dict[str, Any]) -> None:
             import fit2tifxyz
             export_argv = ["--input", str(model_output)]
             if store_volume is not None:
-                export_argv.extend(["--store", _require_store().path, "--volume-uuid", store_volume,
+                export_argv.extend(["--store", _require_store().location, "--volume-uuid", store_volume,
                                     "--voxel-scale", repr(store_voxel_scale)])
             else:
                 export_argv.extend(["--output", str(output_dir)])
@@ -2132,7 +2137,6 @@ def _run_optimization(job: _JobState, body: dict[str, Any]) -> None:
                 "finalizing", 0, 0, 0.0,
                 stage_name="Finalizing Lasagna preview export")
             if store_volume is not None:
-                _require_store().sync()
                 print(f"[fit-service] results stored: surfaces {output_surfaces} "
                       f"in {time.perf_counter() - save_t0:.3f}s", flush=True)
             else:
@@ -2587,9 +2591,10 @@ def main() -> None:
     p.add_argument("--capture-dir", default=None,
                    help="Directory for captured queued jobs (default: ./job_captures)")
     p.add_argument("--store", default=None,
-                   help="VC object store (a hub replica or local store) VC3D jobs read surfaces from and write to")
+                   help="VC object store VC3D jobs read surfaces from and write to: a store file, or the "
+                        "endpoint of the vc_object_server VC3D attached (http://...)")
     p.add_argument("--shared-store", action="store_true", default=False,
-                   help="--store is the store file of the VC3D that started this service; its session syncs it")
+                   help="--store is the store file of the VC3D that started this service")
     args = p.parse_args()
     if args.store:
         _store = stored_surfaces.StoreSession(args.store, shared=args.shared_store)
