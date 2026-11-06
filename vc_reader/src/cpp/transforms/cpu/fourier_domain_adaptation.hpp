@@ -1,11 +1,11 @@
 #pragma once
 #include "../ops/fourier_domain_adaptation.hpp"
-#include "../shared/voxel_transform.hpp"
+#include "../shared/reference_target.hpp"
 #include "../shared/fourier.hpp"
 namespace vcr::transforms {
 inline ChannelPlan channel_parameters(const FDA& t,const Array& a,Random& r) {
     volume_detail::require_image(a);double blend=draw(t.blend,r),fraction=draw(t.fraction,r);probability(blend);probability(fraction);
-    require(t.reference.shape.size()==a.shape.size() && Shape(t.reference.shape.begin()+1,t.reference.shape.end())==a.spatial(),"FDA reference must match spatial shape");ChannelPlan p;p.values={blend,fraction};return p;
+    require(!t.reference_key.empty() || (t.reference.shape.size()==a.shape.size() && Shape(t.reference.shape.begin()+1,t.reference.shape.end())==a.spatial()),"FDA reference must match spatial shape");ChannelPlan p;p.values={blend,fraction};return p;
 }
 template<class T> VCR_HD inline volume_detail::ComplexT<T> adapt_amplitude(volume_detail::ComplexT<T> input,volume_detail::ComplexT<T> reference,T blend) {
     using namespace volume_detail;T amplitude=hypot(input.re,input.im),target=hypot(reference.re,reference.im);
@@ -18,5 +18,10 @@ template<class T> inline void channel_apply(const FDA& t,std::vector<T>& v,const
     fft_volume(source,g,true);for(std::size_t i=0;i<g.size;++i)v[i]=source[i].re;
     });
 }
-inline void apply(const FDA& t,Sample& s,const Parameters& p) { volume_detail::apply_checked_channels(t,s,p); }
+inline Parameters sample(const FDA& t,const Sample& s,Random& r) {
+    auto p=sample_channels(s,t.options,r,[&](const Array& a,Random& rng){return channel_parameters(t,a,rng);});
+    if(!t.reference_key.empty())volume_detail::reference_target(t.reference_key,s,p);
+    return p;
+}
+inline void apply(const FDA& t,Sample& s,const Parameters& p) { volume_detail::apply_reference_channels(t,s,p); }
 } // namespace vcr::transforms

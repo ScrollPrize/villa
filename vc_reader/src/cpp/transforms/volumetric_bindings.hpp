@@ -1,7 +1,8 @@
 #pragma once
 // Constructor parsing only; transform implementations live in their named headers.
-static void volume_reference(volume_detail::ReferenceVolume& t, Arguments& a) {
+static void volume_reference(volume_detail::ReferenceVolume& t, Arguments& a, std::string* key=nullptr) {
     auto object=a.take("reference",nb::none());require(!object.is_none(),"reference volume is required");
+    if(key && nb::isinstance<nb::str>(object)){*key=nb::cast<std::string>(object);require(!key->empty(),"reference target name must be nonempty");return;}
     Input input;require(nb::try_cast(object,input,false),"reference must be a contiguous CPU NumPy array");
     Shape shape;for(std::size_t i=0;i<input.ndim();++i)shape.push_back(input.shape(i));
     auto dtype=input.dtype();require(dtype.code==std::uint8_t(nb::dlpack::dtype_code::Float) && (dtype.bits==32 || dtype.bits==64),"reference must be float32 or float64");
@@ -24,8 +25,8 @@ static void bind_volumetric(nb::module_& m) {
     bind<Equalize>(m,"Equalize",[](auto& t,auto& a){t.bins=a.get("bins",t.bins);});
     bind<CLAHE>(m,"CLAHE",[](auto& t,auto& a){t.clip_limit=parameter(a,"clip_limit",t.clip_limit);t.tile_shape=a.get("tile_shape",t.tile_shape);t.bins=a.get("bins",t.bins);});
     bind<HistogramMatching>(m,"HistogramMatching",[](auto& t,auto& a){volume_reference(t.reference,a);t.blend=parameter(a,"blend",t.blend);t.bins=a.get("bins",t.bins);});
-    bind<PixelDistributionAdaptation>(m,"PixelDistributionAdaptation",[](auto& t,auto& a){volume_reference(t.reference,a);t.blend=parameter(a,"blend",t.blend);t.mode=volume_mode(a,"mode",{"standard","minmax"},"standard");});
-    bind<FDA>(m,"FDA",[](auto& t,auto& a){volume_reference(t.reference,a);t.blend=parameter(a,"blend",t.blend);t.fraction=parameter(a,"fraction",t.fraction);});
+    bind<PixelDistributionAdaptation>(m,"PixelDistributionAdaptation",[](auto& t,auto& a){volume_reference(t.reference,a,&t.reference_key);t.blend=parameter(a,"blend",t.blend);t.mode=volume_mode(a,"mode",{"standard","minmax"},"standard");});
+    bind<FDA>(m,"FDA",[](auto& t,auto& a){volume_reference(t.reference,a,&t.reference_key);t.blend=parameter(a,"blend",t.blend);t.fraction=parameter(a,"fraction",t.fraction);});
     bind<MultiplicativeNoise>(m,"MultiplicativeNoise",[](auto& t,auto& a){t.low=parameter(a,"low",t.low);t.high=parameter(a,"high",t.high);t.shared_noise=a.get("shared_noise",t.shared_noise);});
     bind<ShotNoise>(m,"ShotNoise",[](auto& t,auto& a){t.photons=parameter(a,"photons",t.photons);t.shared_noise=a.get("shared_noise",t.shared_noise);});
     bind<AdditiveNoise>(m,"AdditiveNoise",[](auto& t,auto& a){t.scale=parameter(a,"scale",t.scale);t.distribution=volume_mode(a,"distribution",{"uniform","gaussian","laplace","beta"},"uniform");t.mean=parameter(a,"mean",t.mean);t.alpha=parameter(a,"alpha",t.alpha);t.beta=parameter(a,"beta",t.beta);t.shared_noise=a.get("shared_noise",t.shared_noise);});

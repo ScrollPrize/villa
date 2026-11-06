@@ -88,8 +88,9 @@ inline void check(const ObjectDropout& t) { require(std::isfinite(t.threshold), 
 inline void check(const GridDropout& t) { volume_detail::check(t.fill); }
 inline void check(const StripeMasking& t) { volume_detail::check(t.fill); }
 inline void check(const HistogramMatching& t) { volume_detail::check(t.reference); }
-inline void check(const PixelDistributionAdaptation& t) { volume_detail::check(t.reference); }
-inline void check(const FDA& t) { volume_detail::check(t.reference); }
+// A named reference target (reference_key) is checked against each sample instead.
+inline void check(const PixelDistributionAdaptation& t) { if (t.reference_key.empty()) volume_detail::check(t.reference); }
+inline void check(const FDA& t) { if (t.reference_key.empty()) volume_detail::check(t.reference); }
 
 template<class T> void validate_transform(const T& t) {
     if constexpr (requires { t.options; }) { probability(t.options.p); probability(t.options.p_channel); }
