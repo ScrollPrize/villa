@@ -330,15 +330,66 @@ def trim_tifxyz_to_valid(tifxyz_path):
     return (h, w), (int(r1 - r0), int(c1 - c0))
 
 
+# Pixels per block for the blockwise steps below, which keeps their temporary copies small
+# next to the strip.
+BLOCK_PIXELS = 1 << 22
+
+
 def max_composite(tif_paths):
+    """Max-composite the slice TIFFs, folding each slice in by row bands and in place, so
+    memory holds the composite and one decoded slice. np.asarray of a whole slice would copy
+    it (Pillow's tobytes), and np.maximum without out= would allocate another full array."""
     composite = None
-    for tif_path in tif_paths:
-        layer = np.asarray(Image.open(tif_path))
-        if composite is None:
-            composite = layer
-        else:
-            composite = np.maximum(composite, layer)
+    for i, tif_path in enumerate(tif_paths):
+        with Image.open(tif_path) as im:
+            im.load()
+            if i == 0:
+                first = (im.mode, im.size)
+            elif (im.mode, im.size) != first:
+                raise ValueError(f'{tif_path} is {(im.mode, im.size)}, the first slice {first}')
+            width, height = im.size
+            rows = max(1, BLOCK_PIXELS // width)
+            for y0 in range(0, height, rows):
+                band = np.asarray(im.crop((0, y0, width, min(height, y0 + rows))))
+                if composite is None:
+                    composite = np.empty((height,) + band.shape[1:], band.dtype)
+                out = composite[y0:y0 + rows]
+                if i == 0:
+                    out[...] = band
+                else:
+                    np.maximum(out, band, out=out)
     return composite
+
+
+def scale_to_uint8(comp):
+    """Scale a composite to 8 bits with its 95th percentile at 255, clipping above.
+
+    Returns (strip8, p95) with the same pixels and p95 as
+    ``np.clip(comp.astype(np.float32) / p95, 0, 1) * 255`` cast to uint8. For uint8/uint16
+    composites (what vc_render_tifxyz writes) that expression is applied to each possible
+    value once and the strip is looked up in the result, so no full-size float copy of the
+    strip is made."""
+    if comp.dtype.kind != 'u' or comp.dtype.itemsize > 2:
+        strip = comp.astype(np.float32)
+        p95 = np.percentile(strip, 95)
+        strip = np.clip(strip / p95, 0, 1) * 255 if p95 > 0 else strip
+        return strip.astype(np.uint8), p95
+    # The percentile interpolates between the 'lower' and 'higher' order statistics. When
+    # they are equal, as they nearly always are in a large integer strip, the float32
+    # percentile is exactly that value; otherwise compute it on a float32 copy of the strip.
+    lower = np.percentile(comp, 95, method='lower')
+    if lower == np.percentile(comp, 95, method='higher'):
+        p95 = np.float32(lower)
+    else:
+        p95 = np.percentile(comp.astype(np.float32), 95, overwrite_input=True)
+    lut = np.arange(np.iinfo(comp.dtype).max + 1, dtype=np.float32)
+    lut = (np.clip(lut / p95, 0, 1) * 255 if p95 > 0 else lut).astype(np.uint8)
+    strip8 = np.empty(comp.shape, dtype=np.uint8)
+    # np.take makes an intp copy of its indices, so look the strip up a block at a time.
+    src, dst = comp.reshape(-1), strip8.reshape(-1)
+    for i in range(0, src.size, BLOCK_PIXELS):
+        np.take(lut, src[i:i + BLOCK_PIXELS], out=dst[i:i + BLOCK_PIXELS])
+    return strip8, p95
 
 
 def strip_jpg_paths(collect_dir, name):
@@ -616,8 +667,11 @@ def main(meshes_dir, volume, remote_url, vc_render_bin, scale, scale_segmentatio
     with ThreadPoolExecutor(max_workers=max(1, num_processes)) as pool:
         futures = {pool.submit(render, name, cp): name for name, cp in render_items}
         for n, future in enumerate(as_completed(futures)):
-            name = futures[future]
+            # A future keeps its result alive: drop it so each composite can be freed once
+            # its strip is written, instead of all of them staying in memory until the end.
+            name = futures.pop(future)
             comp = future.result()
+            del future
             if comp is None:
                 remove_strip_jpgs(collect_dir, name)
                 print(f'[{n + 1}/{len(render_items)}] {name}: WARNING no tifs produced, skipping')
@@ -634,10 +688,8 @@ def main(meshes_dir, volume, remote_url, vc_render_bin, scale, scale_segmentatio
                     # current output. Remove it rather than leave a stale success artifact.
                     remove_strip_jpgs(collect_dir, name)
                     continue
-            strip = comp.astype(np.float32)
-            p95 = np.percentile(strip, 95)
-            strip = np.clip(strip / p95, 0, 1) * 255 if p95 > 0 else strip
-            strip8 = strip.astype(np.uint8)
+            strip8, p95 = scale_to_uint8(comp)
+            del comp
             # Stage all JPGs before replacing old outputs. This keeps the last usable
             # strip if image encoding fails midway through writing a tiled result.
             width = write_strip_jpgs(strip8, name, collect_dir, max_strip_width)
