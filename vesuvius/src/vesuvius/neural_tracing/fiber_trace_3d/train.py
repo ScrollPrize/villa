@@ -4047,6 +4047,12 @@ def training_units(
         for name, value, value_name, previous_best in tracks:
             suffix = "" if name is None else f"_{name}"
             filenames = []
+            if initial and reviewed_trace_test is not None and enable_reviewed_trace and trace_unlocked:
+                selected = reviewed_trace_test.get("weights", "ema_0p999")
+                if ("raw" if name is None else name) == selected:
+                    # The initial dense test precedes regular checkpointing,
+                    # but its trace boundary needs the exact selected weights.
+                    filenames.append(f"current{suffix}.pt")
             if not initial:
                 if test_step % checkpoint_interval == 0:
                     filenames.append(f"current{suffix}.pt")

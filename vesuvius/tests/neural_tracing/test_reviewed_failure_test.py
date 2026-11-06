@@ -177,3 +177,70 @@ def test_reviewed_trace_rejects_unsupported_weights():
              "native_binary": "c", "weights": "ema_typo"}
     with pytest.raises(ValueError, match="weights"):
         _reviewed_trace_test_config({"reviewed_trace_test": value})
+
+
+@pytest.mark.parametrize("weights", ["raw", "ema_0p999"])
+def test_resumed_initial_trace_publishes_exact_selected_checkpoint(tmp_path, monkeypatch, weights):
+    from types import SimpleNamespace
+    from tests.neural_tracing.test_fiber_trace_3d import _loader_with_mapping
+    from tests.neural_tracing.test_training_queue_integration import _Writer
+    from vesuvius.neural_tracing.fiber_trace_3d.ema import ModelEMA
+    from vesuvius.neural_tracing.fiber_trace_3d.reviewed_trace_selection import freeze_trace_checkpoint
+
+    loader = _loader_with_mapping({"patch_shape_zyx": [8, 8, 8], "batch_size": 2,
+                                   "augment_enabled": False})
+    model = torch.nn.Sequential(torch.nn.Conv3d(1, 7, 1), torch.nn.Sigmoid())
+    ema = ModelEMA(model, [.999])
+    for value in ema.tracks["ema_0p999"]["model"].values():
+        value.add_(.1)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=.01)
+    raw = {"batch_size": 2, "patch_shape_zyx": [8, 8, 8],
+           "datasets": [{"base_volume_path": "unused"}], "test_datasets": [{"base_volume_path": "unused"}],
+           "training": {"device": "cpu", "max_steps": 8, "run_path": str(tmp_path / "runs"),
+                        "run_name": "initial-trace", "run_datestr": "fixed", "learning_rate": .01,
+                        "bounded_gradient_accumulation": True, "optimizer_global_batch_size": 2,
+                        "ddp_broadcast_buffers": False, "ema_decays": [.999],
+                        "test_interval": 2, "checkpoint_interval": 2, "kept_snapshot_interval": 0,
+                        "test_control_points": 2, "test_trace2cp_enabled": False,
+                        "sample_vis_interval": 0, "test_sample_vis_interval": 0,
+                        "tensorboard_enabled": False,
+                        "reviewed_trace_test": {"interval": 2, "template": "unused",
+                            "split_root": "unused", "native_binary": "unused", "weights": weights}}}
+    config = tmp_path / "config.json"
+    config.write_text(json.dumps(raw))
+    resume = tmp_path / "resume.pt"
+    train._save_snapshot(resume, model=model, optimizer=optimizer, step=7, config=raw,
+                         metric=1., ema=ema, reviewed_trace_unlocked=True)
+    monkeypatch.setattr(train, "build_fiber_trace_3d_model", lambda config: model)
+    # This test targets publication after the dense test, not angle-gate quality.
+    monkeypatch.setattr(train, "_reviewed_trace_unlocked", lambda previous, losses: True)
+
+    class Batches:
+        def begin_test(self, step):
+            pass
+        def end_test(self, step):
+            pass
+        def test_batches(self, *, global_batch_indices, **kwargs):
+            return (loader.load_batch(index * 2) for index in global_batch_indices)
+
+    metadata = SimpleNamespace(for_config=lambda config: loader)
+    units = train.training_units(config, resume_checkpoint=resume, physical_microbatch_sizes=(2,),
+        yield_initialized=True, batch_source=Batches(), dataset_metadata={"train": metadata, "test": metadata},
+        summary_writer_factory=lambda *args, **kwargs: _Writer())
+    try:
+        for boundary in units:
+            if boundary.phase == "reviewed_trace":
+                assert boundary.step == 7  # Not a regular checkpoint interval.
+                suffix = "" if weights == "raw" else "_ema_0p999"
+                checkpoint, = (tmp_path / "runs").glob(f"**/snapshots/current{suffix}.pt")
+                freeze_trace_checkpoint(checkpoint, tmp_path / "frozen.pt", step=boundary.step,
+                                        samples_seen=boundary.samples_seen, weights=weights)
+                saved = torch.load(checkpoint, map_location="cpu", weights_only=True)
+                expected = model.state_dict() if weights == "raw" else ema.tracks[weights]["model"]
+                for key, value in expected.items():
+                    torch.testing.assert_close(saved["model"][key], value, rtol=0, atol=0)
+                break
+        else:
+            pytest.fail("no initial reviewed-trace boundary")
+    finally:
+        units.close()
