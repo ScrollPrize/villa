@@ -68,8 +68,6 @@ void SurfaceStoreEdit::save(QuadSurface& surface, const cv::Rect& rect, const st
             transformed = snapshot.surface(_uuid, *_pin.geometryRevision).viewTransformedAt(_view->volume, _view->scale);
             if (transformed->mapping() != _view->mapping)
                 throw std::runtime_error("Volume registration changed; reopen the surface before saving");
-            // A registration that changes before the commit conflicts.
-            request.readDependencies = transformDependencies(reader);
         }
         const auto revision = reader.geometryRevision(*_pin.geometryRevision);
         if (!revision) throw std::runtime_error("surface geometry revision not found: " + *_pin.geometryRevision);
@@ -104,6 +102,10 @@ void SurfaceStoreEdit::save(QuadSurface& surface, const cv::Rect& rect, const st
             const auto view = transformed ? *transformed : snapshot.viewStored(_uuid, *_pin.geometryRevision);
             if (auto edit = quad_rect_edit(view, surface, rect, replaced)) request.operations.push_back(std::move(*edit));
         }
+        // Revalidate under the writer lock, including newly added registrations
+        // and route choices that a list of existing record versions cannot guard.
+        if (transformed && !request.operations.empty())
+            request.operations.insert(request.operations.begin(), transformed->checkMappingOperation());
         expectRelationshipEndpoints(reader, request.expectedObjects);
     });
     if (request.operations.empty()) return;
