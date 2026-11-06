@@ -3,6 +3,7 @@
 #include "vc_test.hpp"
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
@@ -12,6 +13,11 @@
 #include <string>
 #include <type_traits>
 #include <utility>
+
+#if defined(PASTIX6) && defined(__linux__)
+#include <igl/pastix6_solver.h>
+#include <sched.h>
+#endif
 
 namespace
 {
@@ -412,6 +418,39 @@ TEST_CASE("SLIM OBJ comparison rejects missing, invalid and conflicting UVs")
     texcoords(0, 0) = std::numeric_limits<double>::quiet_NaN();
     rejects<std::runtime_error>([&] { vertex_uvs(4, faces, texcoords, faces); }, "nonfinite UV");
 }
+
+#if defined(PASTIX6) && defined(__linux__)
+TEST_CASE("PaStiX default thread count stays within the CPUs the process may use")
+{
+    // A process restricted to one CPU (a Slurm job, a container cpuset, taskset) must not
+    // start a thread per core of the machine; PASTIX_NUM_THREADS still wins when it is set.
+    cpu_set_t all;
+    CPU_ZERO(&all);
+    require(sched_getaffinity(0, sizeof(all), &all) == 0, "sched_getaffinity failed");
+    int first = 0;
+    while (first < CPU_SETSIZE && !CPU_ISSET(first, &all))
+        ++first;
+    cpu_set_t one;
+    CPU_ZERO(&one);
+    CPU_SET(first, &one);
+    const char* env = std::getenv("PASTIX_NUM_THREADS");
+    const std::string saved = env ? env : "";
+    unsetenv("PASTIX_NUM_THREADS");
+    const int unrestricted = igl::Pastix6LLT::defaultThreadCount();
+    require(sched_setaffinity(0, sizeof(one), &one) == 0, "sched_setaffinity failed");
+    const int restricted = igl::Pastix6LLT::defaultThreadCount();
+    setenv("PASTIX_NUM_THREADS", "3", 1);
+    const int requested = igl::Pastix6LLT::defaultThreadCount();
+    sched_setaffinity(0, sizeof(all), &all);
+    if (env)
+        setenv("PASTIX_NUM_THREADS", saved.c_str(), 1);
+    else
+        unsetenv("PASTIX_NUM_THREADS");
+    require(unrestricted == CPU_COUNT(&all), "Default thread count is not the number of allowed CPUs");
+    require(restricted == 1, "Default thread count ignores the CPU affinity mask");
+    require(requested == 3, "PASTIX_NUM_THREADS no longer overrides the default");
+}
+#endif
 
 std::pair<Eigen::Index, Eigen::Index> check_real_surface(const char* path)
 {
