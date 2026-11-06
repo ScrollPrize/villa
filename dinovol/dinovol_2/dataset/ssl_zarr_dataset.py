@@ -381,6 +381,20 @@ class SSLZarrDataset(Dataset):
         augmentation = str(self.config.get("augmentation", "full"))
         if augmentation not in ("full", "dino"):
             raise ValueError(f"augmentation must be 'full' or 'dino', got {augmentation!r}")
+        # jem: two patch-lattice view sets per source (see dinovol_2/dataset/jem_views.py).
+        self.jem = None
+        if self.config.get("jem") is not None:
+            from dinovol_2.dataset.jem_views import JemViewSpec
+            jem = dict(self.config["jem"])
+            if self.single_crop_only or self.source_rotation != "none" or self.object_points_enabled \
+                    or self.point_supervision_enabled or self.gram_teacher_crop_size is not None:
+                raise ValueError("JEM views need source_rotation='none' and no single-crop, object-point, "
+                                 "point-supervision or Gram-teacher sampling")
+            self.jem = JemViewSpec.from_config(jem, patch_size=jem.get("patch", 8))
+            if self.source_sampling_size != (self.jem.source_size,) * 3:
+                raise ValueError(f"JEM source_size {self.jem.source_size} must equal source_sampling_size "
+                                 f"{self.source_sampling_size}")
+        self._volume_spacing: dict[int, tuple[float, float, float]] = {}
         self.global_transforms = [SpatialPlan(self.global_crop_size) for _ in range(self.num_global_crops)]
         self.local_transforms = ([SpatialPlan(self.local_crop_size) for _ in range(self.num_local_crops)]
                                  if self.local_crop_size is not None else [])
@@ -1379,7 +1393,28 @@ class SSLZarrDataset(Dataset):
                 )
         return plan, source_crop
 
+    def volume_spacing(self, volume: Volume) -> tuple[float, float, float]:
+        """Voxel spacing (ZYX, micrometers) of the selected level: store metadata, else pixel_size_um."""
+        key = self.volumes.index(volume)
+        if key not in self._volume_spacing:
+            spacing = None
+            try:
+                spacing = getattr(self._get_volume_array(volume), "voxel_size_zyx", None)
+            except Exception:
+                spacing = None
+            if spacing is None or any(value is None or not float(value) > 0 for value in spacing):
+                if volume.pixel_size_um is None:
+                    spacing = (1.0, 1.0, 1.0)
+                else:
+                    # pixel_size_um describes the selected level (see the object mask closing).
+                    spacing = (float(volume.pixel_size_um),) * 3
+            self._volume_spacing[key] = tuple(float(value) for value in spacing)
+        return self._volume_spacing[key]
+
     def __getitem__(self, idx):
+        if self.jem is not None:
+            from dinovol_2.dataset.jem_views import sample_view_sets
+            return sample_view_sets(self, self.jem, augment=self.do_augmentations)
         nonzero_threshold = float(self.config.get("nonzero_threshold", 0.30))
         plan, source_crop = self._next_source_crop(nonzero_threshold)
         vol = plan.volume
