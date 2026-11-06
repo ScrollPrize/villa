@@ -84,6 +84,20 @@ ctest --test-dir build --output-on-failure \
   -R '^(object_store_(session|fiber_json|fiber_session|vc3d_controller)|test_fiber_constraint_geometry)$'
 ```
 
+## Draft recovery
+
+To verify draft mask recovery on a real surface store with the existing build:
+
+```sh
+AGENTS_AGENT_MODE=1 cmake --build volume-cartographer/build --target test_surface_catalog -j 4
+QT_QPA_PLATFORM=offscreen volume-cartographer/build/bin/test_surface_catalog /path/to/surfaces.vcobj
+```
+
+Run from the repository root. The optional store is opened read-only; its first
+surface is copied to a temporary store. The check masks a valid vertex,
+checkpoints it, restores it in a new session, saves, and compares every stored
+XYZ with the original. The ordinary catalog regressions then run as well.
+
 ## Limits
 
 Validation is on Ubuntu aarch64, using offscreen Qt. macOS and amd64 have not been

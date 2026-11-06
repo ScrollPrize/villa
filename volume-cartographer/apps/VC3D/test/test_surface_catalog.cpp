@@ -53,6 +53,66 @@ void storeSurface(ObjectStoreSession& session, const AttachmentIdentity& attachm
     request.operations.push_back(PutGeometryOp{record.uuid, geometry, {}});
     session.submit(attachment, request);
 }
+
+// Optional real-data check: copy one stored surface, checkpoint a mask edit,
+// recover it in a new session, then verify that saving preserves every XYZ.
+void checkDraftRecovery(const fs::path& sourcePath, const fs::path& directory)
+{
+    OpenOptions writable; writable.author = "draft-recovery-test";
+    OpenOptions readOnly; readOnly.readOnly = true;
+    const auto path = directory / "recovery.vcobj", checkpoint = directory / "recovery-drafts";
+    { auto store = ObjectStore::create(path, writable); }
+    std::string uuid;
+    vc::geometry::Surface original;
+    std::size_t masked = 0;
+    {
+        auto session = std::make_shared<ObjectStoreSession>();
+        SessionDrafts drafts(session);
+        require(drafts.start(checkpoint, 0), "real draft directory");
+        const auto source = session->attach(sourcePath, readOnly), target = session->attach(path, writable);
+        std::string sourceUuid;
+        session->readStore(source, [&](const StoreReader& reader, const auto&) {
+            ObjectSelection selection; selection.kind = "surface"; selection.limit = 1;
+            const auto records = reader.selectObjects(selection);
+            require(!records.empty(), "real store contains a surface");
+            sourceUuid = records.front().uuid;
+        });
+        uuid = session->copyObject(source, target, sourceUuid);
+        session->readStore(target, [&](const StoreReader& reader, const auto&) {
+            original = GeometrySnapshot(reader).surface(uuid).load();
+            while (masked < original.points.size() && !original.valid(masked / original.columns, masked % original.columns)) ++masked;
+            require(masked < original.points.size(), "real surface has a valid vertex");
+            auto surface = load_quad_from_store(reader, uuid);
+            const int row = int(masked / original.columns), column = int(masked % original.columns);
+            auto mask = surface->validMask().clone();
+            mask(row, column) = 0;
+            surface->setChannel("mask", mask);
+            (*surface->rawPointsPtr())(row, column) = {-1, -1, -1};
+            const auto head = reader.currentObject(uuid);
+            session->setDraft(uuid, quad_surface_grid(*surface),
+                nlohmann::json::parse(head->record.meta).value("coordinates", nlohmann::json::object()),
+                target, pinOf(target, *head).reference());
+        });
+        require(drafts.checkpointNow(), "real mask edit checkpointed");
+    }
+    auto session = std::make_shared<ObjectStoreSession>();
+    SessionDrafts drafts(session);
+    require(drafts.start(checkpoint, 0) && drafts.recovered(uuid), "real mask edit recovered");
+    const auto target = session->attach(path, writable);
+    std::unique_ptr<QuadSurface> surface;
+    const auto pin = pinOf(target, *session->currentObject(target, uuid));
+    session->readStore(target, [&](const StoreReader& reader, const auto&) { surface = load_quad_from_store(reader, uuid); });
+    const auto contents = session->draftContents(uuid);
+    SessionDrafts::restoreSurface(*surface, contents->surface);
+    SurfaceStoreEdit edit(session, pin);
+    edit.save(*surface, cv::Rect(0, 0, int(original.columns), int(original.rows)), {"mask"}, contents->revision);
+    session->readStore(target, [&](const StoreReader& reader, const auto&) {
+        const auto saved = GeometrySnapshot(reader).surface(uuid).load();
+        require(saved.points == original.points && !saved.valid(masked / saved.columns, masked % saved.columns),
+                "real recovered mask preserves all stored coordinates");
+    });
+    std::cout << "real draft recovery: " << sourcePath << ", " << original.points.size() << " vertices preserved\n";
+}
 }
 
 int main(int argc, char** argv)
@@ -60,6 +120,7 @@ int main(int argc, char** argv)
     QCoreApplication app(argc, argv);
     try {
         QTemporaryDir dir;
+        if (argc > 1) checkDraftRecovery(argv[1], fs::path(dir.path().toStdString()));
         const std::filesystem::path volumeRoot1 = fs::path(dir.path().toStdString()) / "ct.zarr";
         const vcr::zarr::CreateOptions levelZero1{.shape = {4, 4, 4}, .chunks = {4, 4, 4}, .compressor = "", .overwrite = true};
         vcr::zarr::Writer::create(volumeRoot1 / "0", levelZero1);
@@ -469,6 +530,11 @@ int main(int argc, char** argv)
                 };
                 require(files() == 0, "a saved draft is not checkpointed");
                 drafted(2, 2, {8.f, 8.f, 8.f});
+                cv::Mat_<uint8_t> mask(3, 3, uint8_t(255));
+                mask(0, 2) = 0;
+                surface.setChannel("mask", mask);
+                (*surface.rawPointsPtr())(0, 2) = {-1, -1, -1};
+                durable->setDraft(native, quad_surface_grid(surface), coordinates, store, saved);
                 require(drafts.checkpointNow() && files() == 1, "an unsaved edit is checkpointed");
             }
             auto restarted = std::make_shared<ObjectStoreSession>();
@@ -478,6 +544,20 @@ int main(int argc, char** argv)
             require(contents && contents->surface.points[8] == vc::geometry::SurfacePoint{8, 8, 8} &&
                     contents->surface.points[1] == vc::geometry::SurfacePoint{7, 7, 7} &&
                     restarted->draftState(native)->base == saved, "recovered grid and base");
+            const auto store = restarted->attach(path, options);
+            auto opened = SurfaceCatalog::open(restarted, store, {volume->id()}, native);
+            SessionDrafts::restoreSurface(*opened.surface, contents->surface);
+            require(opened.surface->channel("mask", SURF_CHANNEL_NORESIZE).at<uint8_t>(0, 2) == 0,
+                    "restoring a draft replaces the open surface's validity mask");
+            SurfaceStoreEdit edit(restarted, opened.pin, opened.view);
+            edit.save(*opened.surface, cv::Rect(0, 0, 3, 3), {"mask"}, contents->revision);
+            restarted->readStore(store, [&](const StoreReader& reader, const auto&) {
+                const auto view = GeometrySnapshot(reader).surface(native);
+                const auto tile = view.readTile(0, 0, 3, 3);
+                require(!tile.validity[2] && tile.points[2] == vc::geometry::SurfacePoint{stored(0, 2)[0], stored(0, 2)[1], stored(0, 2)[2]},
+                        "saving a recovered mask keeps the original stored coordinates");
+                require(tile.points[8] == vc::geometry::SurfacePoint{8, 8, 8}, "recovered vertex edits are saved too");
+            });
             restarted->clearDraft(native);
             drafts.forgetRecovered(native);
             require(!drafts.recovered(native), "discarded");

@@ -15172,7 +15172,7 @@ void LineAnnotationController::commitFiberStoreAction(std::vector<FiberSaveSnaps
         // vectors and width through the inverse; classification in that frame.
         // A new object derived from one (split halves, a merge) has no stored
         // view yet; its positions go through the inverse of the frame it carries.
-        bool viewed = false;
+        std::vector<TransactionOperation> mappingChecks;
         std::map<std::string, StoredFiber> storedFrames;
         auto inStoredFrame = [&](const StoredFiber& fiber) -> const StoredFiber& {
             if (const auto found = storedFrames.find(fiber.uuid); found != storedFrames.end()) return found->second;
@@ -15192,7 +15192,7 @@ void LineAnnotationController::commitFiberStoreAction(std::vector<FiberSaveSnaps
                     if (shown.mapping() != fiber.frame->storedToVolume)
                         throw std::runtime_error("The fiber's volume registration changed; reopen it");
                     canonical = shown.canonicalFiber(edited);
-                    viewed = true;
+                    mappingChecks.push_back(shown.checkMappingOperation());
                 } else {
                     for (auto& point : canonical.controlPoints) point = inverse.apply(point);
                     for (auto& point : canonical.linePoints) point = inverse.apply(point);
@@ -15295,8 +15295,6 @@ void LineAnnotationController::commitFiberStoreAction(std::vector<FiberSaveSnaps
                 operations.push_back(UpdateObjectOp{objectRecordJson(record)});
             }
         }
-        if (viewed)
-            for (const auto& [uuid, version] : transformDependencies(reader)) request.readDependencies.emplace(uuid, version);
         std::set<std::string> retiredUuids;
         for (const auto& fiber : retired) retiredUuids.insert(fiber.uuid);
         std::set<std::string> retainedBranches;
@@ -15373,6 +15371,9 @@ void LineAnnotationController::commitFiberStoreAction(std::vector<FiberSaveSnaps
         }
         for (const auto& fiber : retired) operations.push_back(RetireObjectOp{fiber.uuid});
         expectRelationshipEndpoints(reader, request.expectedObjects);
+        // Branch anchors can introduce further viewed fibers after the geometry
+        // edits are prepared. Check every mapping before any mutation executes.
+        operations.insert(operations.begin(), mappingChecks.begin(), mappingChecks.end());
     });
     // Durable: written to the session's draft directory before it is sent. A
     // hosted store that does not answer leaves it pending; it is resolved in

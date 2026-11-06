@@ -1,4 +1,7 @@
 #include "SessionDrafts.hpp"
+#include "vc/core/util/QuadSurface.hpp"
+
+#include <stdexcept>
 
 #include <QPointer>
 #include <QTimer>
@@ -57,6 +60,24 @@ std::vector<std::string> SessionDrafts::recoveredDrafts() const
 void SessionDrafts::forgetRecovered(const std::string& objectUuid)
 {
     _recovered.erase(objectUuid);
+}
+
+void SessionDrafts::restoreSurface(QuadSurface& surface, const vc::geometry::Surface& draft)
+{
+    draft.validate();
+    auto* grid = surface.rawPointsPtr();
+    if (!grid || grid->rows != draft.rows || grid->cols != draft.columns)
+        throw std::invalid_argument("Recovered draft grid differs from the open surface");
+    cv::Mat_<uint8_t> mask(grid->rows, grid->cols);
+    for (int r = 0; r < grid->rows; ++r)
+        for (int c = 0; c < grid->cols; ++c) {
+            const auto i = std::size_t(r) * grid->cols + c;
+            const auto& p = draft.points[i];
+            (*grid)(r, c) = cv::Vec3f(p[0], p[1], p[2]);
+            mask(r, c) = draft.validity.empty() || draft.validity[i] ? 255 : 0;
+        }
+    surface.setChannel("mask", mask);
+    surface.invalidateCache();
 }
 
 bool SessionDrafts::checkpointNow()

@@ -18,6 +18,8 @@
 
 #include <vc_object_store/objects/ObjectStoreSession.hpp>
 
+class QuadSurface;
+
 class SessionDrafts : public QObject
 {
     Q_OBJECT
@@ -40,6 +42,9 @@ public:
     std::vector<std::string> recoveredDrafts() const;
     // The user restored or discarded it.
     void forgetRecovered(const std::string& objectUuid);
+
+    // Apply the recovered grid and validity together before the editor saves it.
+    static void restoreSurface(QuadSurface& surface, const vc::geometry::Surface& draft);
 
     // Resolve, in the background, pending saves of attached stores: those
     // recovered at start, and those still pending one tick after they were

@@ -495,13 +495,7 @@ void SegmentationModule::offerRecoveredDraft(const QString& objectUuid)
 
     // The recovered grid becomes the surface's, reapplied on the version on
     // screen, and the next autosave publishes all of it.
-    auto& grid = *surface->rawPointsPtr();
-    for (int r = 0; r < grid.rows; ++r)
-        for (int c = 0; c < grid.cols; ++c) {
-            const auto& p = contents->surface.points[std::size_t(r) * grid.cols + c];
-            grid(r, c) = cv::Vec3f(p[0], p[1], p[2]);
-        }
-    surface->invalidateCache();
+    SessionDrafts::restoreSurface(*surface, contents->surface);
     session->setDraft(uuid, contents->surface, contents->coordinates, pin.attachment, pin.reference());
     _state->recoveredDraftResolved(uuid, true);
     _saveSnapshot.reset();
