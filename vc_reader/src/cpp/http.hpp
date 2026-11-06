@@ -37,6 +37,7 @@ struct HttpOptions {
     int retries = 5;
     Auth auth;
     long request_timeout_ms = 0;
+    bool path_as_is = false;
 };
 
 struct HttpResponse {
@@ -216,6 +217,7 @@ private:
             transfer.any_status = any_status;
             curl_easy_reset(h);
             curl_easy_setopt(h, CURLOPT_URL, url.c_str());
+            curl_easy_setopt(h, CURLOPT_PATH_AS_IS, options_.path_as_is ? 1L : 0L);
             curl_easy_setopt(h, CURLOPT_NOSIGNAL, 1L);
             curl_easy_setopt(h, CURLOPT_FOLLOWLOCATION, get ? 1L : 0L);  // a redirected write is an error
             curl_easy_setopt(h, CURLOPT_USERAGENT, "vc_reader");

@@ -17,6 +17,7 @@ struct Options {
     long stallTimeoutS = 30;        // abort an attempt after this long without receiving data
     int retries = 5;
     long requestTimeoutMs = 0;      // whole-attempt limit; 0 = none
+    bool pathAsIs = false;          // preserve dot segments when paths contain opaque identifiers
 };
 
 struct Response {

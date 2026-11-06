@@ -5,7 +5,7 @@ namespace vcr::http {
 
 struct Session::Impl {
     explicit Impl(const Options& o)
-        : client(HttpOptions{o.connections, o.connectTimeoutMs, o.stallTimeoutS, o.retries, {}, o.requestTimeoutMs}) {}
+        : client(HttpOptions{o.connections, o.connectTimeoutMs, o.stallTimeoutS, o.retries, {}, o.requestTimeoutMs, o.pathAsIs}) {}
     HttpClient client;
 };
 
