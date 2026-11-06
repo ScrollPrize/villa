@@ -144,6 +144,13 @@ try {
         require(session.readGeometryArray(hosted, geometry->uuid, "points") ==
                 direct.readGeometryArray(txn, geometry->uuid, "points"), "geometry array");
         const auto status = direct.status(txn);
+        const ObjectVersion correct{status.storeUuid, status.generation, surface, 1};
+        auto wrongStore = correct;
+        wrongStore.storeUuid = util::newUuid();
+        require(!session.objectsAtVersions(hosted, {wrongStore}).front(), "wrong store with cold version cache");
+        require(session.objectsAtVersions(hosted, {correct}).front().has_value(), "warm version cache");
+        require(!session.objectsAtVersions(hosted, {wrongStore}).front(), "wrong store with warm version cache");
+        require(!direct.objectsAtVersions(txn, {wrongStore}).front(), "wrong store local parity");
         const auto at = session.objectsAtVersions(hosted, {{status.storeUuid, status.generation, surface, 1},
                                                            {status.storeUuid, status.generation, surface, 2}});
         require(at.size() == 2 && at[0] && at[0]->uuid == head->uuid && !at[1], "objects at versions");
@@ -156,6 +163,24 @@ try {
         auto txn = direct.read();
         const LocalStoreReader expected(direct, txn);
         const GeometrySnapshot expectedViews(expected);
+        // No array fits this cache: byte ranges and rectangles still match
+        // local reads, including empty ranges and invalid bounds.
+        ObjectStoreSession uncached;
+        auto noCache = hostedOptions;
+        noCache.cacheBytes = 0;
+        const auto remote = uncached.attachHosted(endpoint, noCache);
+        uncached.readStore(remote, [&](const StoreReader& reader, const auto&) {
+            const auto revision = *reader.currentObject(surface)->geometryRevision;
+            require(reader.readGeometryArray(revision, "points", 12, 24) == expected.readGeometryArray(revision, "points", 12, 24),
+                    "uncached range");
+            for (const auto& rect : {std::array<int64_t, 4>{2, 3, 5, 4}, {2, 0, 5, 20}, {30, 0, 0, 20}, {2, 3, 5, 0}})
+                require(reader.readGeometryRectangle(revision, "points", rect[0], rect[1], rect[2], rect[3]) ==
+                        expected.readGeometryRectangle(revision, "points", rect[0], rect[1], rect[2], rect[3]), "uncached rectangle");
+            require(reader.readGeometryArray(revision, "points", 7200, 0).empty(), "empty uncached range");
+            mustFail([&] { (void)reader.readGeometryArray(revision, "points", -1, 1); });
+            mustFail([&] { (void)reader.readGeometryArray(revision, "points", 7201, 0); });
+            mustFail([&] { (void)reader.readGeometryArray(revision, "points", 0, -1); });
+        });
         bool ran = false;
         session.readStore(hosted, [&](const StoreReader& reader, const auto&) {
             const auto head = reader.currentObject(surface);

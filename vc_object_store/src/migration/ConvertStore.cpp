@@ -3,6 +3,7 @@
 #include "internal/Sqlite.hpp"
 #include "internal/Versions.hpp"
 #include "geometry/GeometryDelta.hpp"
+#include "vc_object_store/objects/Artifacts.hpp"
 
 #include <functional>
 #include <map>
@@ -311,6 +312,33 @@ void copyToCurrentSchema(const std::filesystem::path& stage, const std::filesyst
     report["copied_rows"] = counts;
 }
 
+// The converted history is readable by the runtime, so use its manifest
+// parser and artifact writer for both current and historical references.
+void copyArtifacts(const std::filesystem::path& source, const std::filesystem::path& destination, Json& report)
+{
+    OpenOptions options;
+    options.author = "vc_object_convert";
+    auto store = ObjectStore::open(destination, options);
+    std::map<std::string, uint64_t> files;
+    {
+        auto txn = store.read();
+        Statement objects(ObjectStoreImplAccess::conn(txn), "SELECT DISTINCT object_uuid FROM object_versions");
+        while (objects.row())
+            for (const auto& revision : store.objectHistory(txn, objects.uuid(0)))
+                for (const auto& file : artifactManifest(revision.record)) {
+                    const auto [entry, inserted] = files.emplace(file.sha256, file.length);
+                    if (!inserted && entry->second != file.length)
+                        throw std::runtime_error("convert: inconsistent artifact lengths for " + file.sha256);
+                }
+    }
+    for (const auto& [hash, length] : files) {
+        const auto path = artifactBlobPath(source, hash);
+        if (std::filesystem::file_size(path) != length || store.putArtifact(path) != hash)
+            throw std::runtime_error("convert: artifact does not match its manifest: " + path.string());
+    }
+    report["copied_artifacts"] = files.size();
+}
+
 // Settle-before-convert: refuse replicas with unpublished state and unfinished
 // writes, then drop the coordination tables, which have no successor.
 Json settle(sqlite3* db, Json& report)
@@ -605,6 +633,9 @@ ConversionResult convertStore(const std::filesystem::path& source, const std::fi
 {
     if (std::filesystem::exists(destination))
         throw std::runtime_error("convert: destination exists: " + destination.string());
+    const auto artifacts = artifactBlobDirectory(destination).parent_path();
+    if (std::filesystem::exists(artifacts) || std::filesystem::is_symlink(artifacts))
+        throw std::runtime_error("convert: destination artifacts exist: " + artifacts.string());
     if (std::filesystem::exists(source) && std::filesystem::exists(destination.parent_path().empty() ? "." : destination.parent_path()) &&
         std::filesystem::equivalent(source.parent_path().empty() ? "." : source.parent_path(),
                                     destination.parent_path().empty() ? "." : destination.parent_path()) &&
@@ -658,6 +689,7 @@ ConversionResult convertStore(const std::filesystem::path& source, const std::fi
         staged = {};
 
         copyToCurrentSchema(stage, destination, report);
+        copyArtifacts(source, destination, report);
         removeFiles(stage);
         report["destination_bytes"] = int64_t(std::filesystem::file_size(destination));
         report["validation"] = "ok";
@@ -665,7 +697,12 @@ ConversionResult convertStore(const std::filesystem::path& source, const std::fi
     } catch (...) {
         in = {};
         staged = {};
-        if (created) { removeFiles(stage); removeFiles(destination); }
+        if (created) {
+            removeFiles(stage);
+            removeFiles(destination);
+            std::error_code ignored;
+            std::filesystem::remove_all(artifacts, ignored);
+        }
         throw;
     }
 }

@@ -13,10 +13,12 @@
 // commit sequence are added deterministically from recorded publication order;
 // hub coordination tables are removed. A replica with unpublished, in-flight
 // or conflicting state is refused: settle it with the old tooling first.
+// Content-addressed artifacts referenced by any recorded version are copied
+// and verified. Missing or corrupt referenced blobs fail conversion.
 //
 // Gaps (untimed baselines, relationship states without a recorded
 // publication, geometry revisions that do not identify one object version,
-// metadata holding old revision UUIDs, missing artifact files) are reported,
+// metadata holding old revision UUIDs, missing unversioned external files) are reported,
 // never guessed; they do not by themselves block conversion.
 
 #include <cstdint>

@@ -4,8 +4,13 @@ import os
 import re
 import subprocess
 import uuid
+import http.client
+import http.server
+import threading
+from urllib.parse import urlsplit
 
 import pytest
+import numpy as np
 
 import vc_object_store as vos
 
@@ -32,6 +37,64 @@ def request(status, operations, expected, author="py"):
     return dict(command_version=1, request=str(uuid.uuid4()), store=status["store"], generation=status["generation"],
                 author=author, expected_objects=expected, expected_relationships={}, read_dependencies={},
                 expected_commit_sequence=None, operations=operations)
+
+
+@pytest.mark.parametrize("cache_bytes", [1 << 20, 8 << 20])
+def test_copy_transfers_each_geometry_byte_once(hosted, tmp_path, cache_bytes):
+    from vc_object_store.surfaces import create_surface, read_surface
+
+    store, _ = hosted
+    points = np.arange(512 * 512 * 3, dtype=np.float32).reshape(512, 512, 3) + 1
+    surface = create_surface(store.endpoint, points, name="large", scale=1, volume="a", tool="pytest")
+    destination = tmp_path / "copy.vcobj"
+    vos.ObjectStore.create(str(destination), author="pytest").close()
+    upstream = urlsplit(store.endpoint)
+    transfers = []
+
+    class CountingProxy(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *args):
+            pass
+
+        def forward(self):
+            connection = http.client.HTTPConnection(upstream.hostname, upstream.port, timeout=10)
+            try:
+                body = self.rfile.read(int(self.headers.get("Content-Length", 0)))
+                connection.request(self.command, self.path, body, {"Content-Type": "application/json"})
+                response = connection.getresponse()
+                data = response.read()
+                if "/arrays/points?" in self.path:
+                    transfers.append(len(data))
+                self.send_response(response.status)
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+            finally:
+                connection.close()
+
+        do_GET = forward
+        do_POST = forward
+
+    proxy = http.server.ThreadingHTTPServer(("127.0.0.1", 0), CountingProxy)
+    thread = threading.Thread(target=proxy.serve_forever, daemon=True)
+    thread.start()
+    session = vos.ObjectStoreSession()
+    try:
+        remote = session.attach_hosted(f"http://127.0.0.1:{proxy.server_port}", poll_interval_ms=3600000,
+                                       retries=0, cache_bytes=cache_bytes)
+        local = session.attach(str(destination), "pytest")
+        copied = session.copy_object(remote, local, surface)
+        np.testing.assert_array_equal(read_surface(destination, copied, volume="a").points, points)
+        assert sum(transfers) == points.nbytes
+        if cache_bytes < points.nbytes:
+            assert max(transfers) <= 1 << 20
+        else:
+            assert len(transfers) == 1
+    finally:
+        for attachment in session.attachments():
+            session.detach(attachment)
+        proxy.shutdown()
+        proxy.server_close()
+        thread.join(timeout=10)
 
 
 def test_hosted_requests_queries_and_artifacts(hosted, tmp_path):

@@ -54,6 +54,8 @@ public:
     std::vector<std::optional<ObjectRevision>> objectsAtVersions(const std::vector<ObjectVersion>&);
     std::optional<GeometryRevision> geometryRevision(const std::string& revisionUuid);
     std::shared_ptr<const std::vector<uint8_t>> geometryArray(const std::string& revisionUuid, const std::string& array);
+    std::vector<uint8_t> geometryArrayRange(const std::string& revisionUuid, const std::string& array,
+                                           int64_t offset, const std::optional<int64_t>& count);
     std::shared_ptr<const nlohmann::json> geometryPointAnnotations(const std::string& revisionUuid, const std::string& array);
     VolumeTransforms volumeTransforms();
     // The UUIDs among `uuids` that the store holds (retired included).

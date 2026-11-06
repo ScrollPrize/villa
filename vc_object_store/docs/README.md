@@ -202,6 +202,8 @@ the feed reports them changed. Cached heads are therefore current as of the last
 check. The session's own submissions invalidate theirs at once. Cached data
 stays readable while the host is unreachable; anything else fails, and listings
 and spatial queries always need the host.
+Arrays too large for the cache are read in requested byte ranges; rectangular
+surface reads fetch only their row ranges instead of downloading the whole array.
 
 With a selection limit, `selectObjects` gives each attachment up to `limit`
 records that earlier attachments do not hide. It reads further pages when some
@@ -365,6 +367,11 @@ schema 19 without the one-row `sync_replica` table (the hub's replica
 identity); a schema-19 source is copied as it is, with that table dropped and
 its mapping read back like schema 18's. The report
 gives `source_bytes`, `destination_bytes` and the rows copied per table.
+Content-addressed artifacts named by current or historical versions are copied
+to the destination's artifact directory and verified against their manifest
+hashes and lengths. `copied_artifacts` reports the number of distinct blobs.
+A missing or corrupt referenced blob fails conversion and removes the partial
+destination. An existing destination artifact directory is never overwritten.
 
 ### Artifacts
 

@@ -13,6 +13,7 @@
 #include "vc_object_store/migration/ConvertStore.hpp"
 #include "vc_object_store/objects/ObjectStore.hpp"
 #include "vc_object_store/objects/TransactionJson.hpp"
+#include "vc_object_store/objects/Artifacts.hpp"
 
 #include <sqlite3.h>
 #include <nlohmann/json.hpp>
@@ -180,6 +181,67 @@ try {
         const auto settled = Json::parse(migration::convertStore(source, directory.path / "settled.vcobj").reportJson);
         require(settled.at("source_role") == "replica" &&
                 settled.at("removed_tables") == Json::array({"hub_pending", "hub_upstream", "sync_replica"}), "coordination removed");
+    }
+    // Schema 19 differs from 20 only by sync_replica. Preserve artifacts
+    // named solely by old versions too, without modifying the source.
+    {
+        const auto source = directory.path / "artifacts19.vcobj";
+        const auto input = directory.path / "model.pt";
+        std::string object, oldHash, currentHash;
+        const std::string oldBytes = "old model", currentBytes = "new model";
+        {
+            auto store = ObjectStore::create(source, options);
+            std::ofstream(input) << oldBytes;
+            oldHash = store.putArtifact(input);
+            std::ofstream(input) << currentBytes;
+            currentHash = store.putArtifact(input);
+            auto txn = store.write();
+            ObjectRecord record; record.kind = "note";
+            object = store.upsertObject(txn, record);
+            store.setMeta(txn, object, kArtifactsMetaKey,
+                          artifactManifestJson({{"model.pt", oldHash, oldBytes.size()}}));
+            txn.commit();
+            auto update = store.write(VersionSelection{{object, 1}});
+            store.setMeta(update, object, kArtifactsMetaKey,
+                          artifactManifestJson({{"model.pt", currentHash, currentBytes.size()}}));
+            update.commit();
+        }
+        sql(source, "CREATE TABLE sync_replica(singleton INTEGER PRIMARY KEY CHECK(singleton=1), uuid TEXT NOT NULL);"
+                    "INSERT INTO sync_replica VALUES(1,'00000000-0000-4000-8000-000000000001'); PRAGMA user_version=19;");
+        const auto before = bytesOf(source);
+        const auto destination = directory.path / "converted-artifacts.vcobj";
+        const auto result = migration::convertStore(source, destination);
+        require(Json::parse(result.reportJson).at("copied_artifacts") == 2, "both artifact versions copied");
+        {
+            auto store = ObjectStore::open(destination, options);
+            auto txn = store.read();
+            const auto history = store.objectHistory(txn, object);
+            require(history.size() == 2, "artifact history preserved");
+            for (size_t i = 0; i < history.size(); ++i) {
+                const auto manifest = artifactManifest(history[i].record);
+                const auto bytes = store.readArtifact(manifest.at(0).sha256);
+                require(std::string(bytes.begin(), bytes.end()) == (i == 0 ? oldBytes : currentBytes), "artifact bytes preserved");
+            }
+        }
+        require(bytesOf(source) == before && bytesOf(artifactBlobPath(source, oldHash)) == oldBytes &&
+                bytesOf(artifactBlobPath(source, currentHash)) == currentBytes, "artifact source untouched");
+
+        const auto occupied = directory.path / "occupied.vcobj";
+        const auto occupiedArtifacts = artifactBlobDirectory(occupied).parent_path();
+        std::filesystem::create_directories(occupiedArtifacts);
+        std::ofstream(occupiedArtifacts / "keep") << "keep";
+        mustFail([&] { migration::convertStore(source, occupied); });
+        require(bytesOf(occupiedArtifacts / "keep") == "keep", "existing artifacts untouched");
+
+        const auto oldBlob = artifactBlobPath(source, oldHash);
+        for (const bool missing : {false, true}) {
+            std::filesystem::remove(oldBlob);
+            if (!missing) std::ofstream(oldBlob) << "bad model"; // same length, different hash
+            const auto refused = directory.path / (missing ? "missing.vcobj" : "corrupt.vcobj");
+            mustFail([&] { migration::convertStore(source, refused); });
+            require(!std::filesystem::exists(refused) && !std::filesystem::exists(refused.string() + ".converting") &&
+                    !std::filesystem::exists(artifactBlobDirectory(refused).parent_path()), "failed artifact conversion cleaned up");
+        }
     }
     // Schema 16 (the patches detail table, hub sync baselines): its form of
     // the schema-17 fixture. Surface data is refused; without it the history
