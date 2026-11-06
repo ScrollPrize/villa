@@ -1275,6 +1275,13 @@ Each loader worker assembles a whole 48-source batch (about 4.4 GB of raw crops 
 `/dev/shm`), so the recipe uses 4 workers with `prefetch_factor: 1`; a step takes
 minutes, which leaves the loader far ahead.
 
+Measured on one RTX 5090 (recipe as configured, real 8–9 µm volumes, BF16, one
+source per chunk, three steps): 167–176 s per 48-source update (about 3.5 s per
+source for both passes), plus 12–16 s of parent-side view processing per batch;
+peak 21.6 GiB allocated / 22.4 GiB reserved. Each position's marginal pooled 96
+global / 384 local vectors from 48 sources. A 500k-update run therefore needs
+multi-GPU DDP (`data.batch_size` = 48 / world size).
+
 **Diagnostics.** Per depth and crop type: alignment, visible/masked KL, global
 collapse, MI, marginal/conditional entropy, marginal perplexity, minimum valid
 vectors and distinct sources per position; structural loss per depth; overlap,
