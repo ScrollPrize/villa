@@ -1,5 +1,6 @@
 #include <vc_reader/transforms.hpp>
 #include <iostream>
+#include <random>
 
 int main()
 {
@@ -38,6 +39,26 @@ int main()
             require(threw, std::string("rejected: ") + what);
         };
         Normalize percentiles; percentiles.lower = 90; percentiles.upper = 10; rejected(percentiles, "percentile order");
+        {
+            // Robust normalization of a window about half one constant value (the fill outside a
+            // surface): the MAD is a few units against a span of hundreds, and dividing by it
+            // blew the output up to tens of thousands, while one fill voxel more gave about 3.
+            const std::size_t n = 17 * 64 * 64;
+            std::mt19937 rng(7);
+            std::uniform_real_distribution<float> spread(100.f, 300.f);
+            Normalize robust; robust.mode = Normalization::Robust;
+            for (const std::size_t constant : {n / 2, n / 2 + 400}) {
+                Sample half;
+                half["image"] = {Array({1, 17, 64 * 64}, 'f', 4), image};
+                auto* v = static_cast<float*>(half.at("image").array.data());
+                for (std::size_t i = 0; i < n; ++i) v[i] = i < constant ? 100.f : spread(rng);
+                const auto out = Pipeline({robust}, schema).run(half, 0, true);
+                const auto* x = static_cast<const float*>(out.sample.at("image").array.data());
+                float worst = 0;
+                for (std::size_t i = 0; i < n; ++i) worst = std::max(worst, std::abs(x[i]));
+                require(worst < 10.f, "robust normalization of a half constant window");
+            }
+        }
         Normalize fixed; fixed.scale = 0; rejected(fixed, "fixed scale");
         BrightnessMultiply chance; chance.options.p_channel = 2; rejected(chance, "channel probability");
         Gamma gamma; gamma.p_invert = -1; rejected(gamma, "gamma inversion probability");
