@@ -21,6 +21,14 @@ dependencies = [
     "vc-reader",  # monorepo-only until published
 ]
 
+[project.optional-dependencies]
+# Parting, the layer-contact classifier in dinovol_2/eval/parting/
+parting = [
+    "huggingface-hub",
+    "joblib",
+    "scikit-learn>=1.9.1,<1.10",
+]
+
 [tool.uv.sources]
 vc-reader = { path = "../vc_reader", editable = true }
 
