@@ -108,9 +108,10 @@ def get_volume_dimensions(
     """
 
     # Get volume dimensions in voxels
-    with zarr.open(path, mode="r") as store:
-        sanity_check_zarr_store(store)
-        voxels_z, voxels_y, voxels_x = store["0"].shape
+    # zarr 3 groups are not context managers; a read-only open needs no close
+    store = zarr.open(path, mode="r")
+    sanity_check_zarr_store(store)
+    voxels_z, voxels_y, voxels_x = store["0"].shape
 
     # Get voxel size from metadata.json if it exists
     # Check if path is a URL or local path
