@@ -698,6 +698,10 @@
   grid-column: 2;
   grid-row: 1 / span 2;
 }
+/* Stacked groups sharing one column (Papyrology Team, then Media). */
+.vc-landing .vc-team__col > .vc-team__group + .vc-team__group {
+  margin-top: 40px;
+}
 /* Secondary lists as tabs: three titles spread across the width; the
    hairline under the row and the open tab's ember underline appear only
    once a tab is open. Its panel
