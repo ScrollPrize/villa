@@ -397,6 +397,15 @@ inline void restore_valid(Sample& s) {
         auto n = product(f.array.spatial());
         // A uint8 image keeps its dtype when the fill is one of its values.
         if (narrow(f.array) && !(f.target.fill >= 0 && f.target.fill <= 255 && std::trunc(f.target.fill) == f.target.fill)) widen(f.array);
+        // The usual sample (float32 image, one byte mask channel): a typed loop instead of a
+        // per-voxel dtype dispatch through get() and set(); the same voxels take the same fill.
+        if (f.array.kind == 'f' && f.array.bytes == 4 && mask.bytes == 1 && mask.shape[0] == 1) {
+            const auto* flags = static_cast<const std::uint8_t*>(mask.data());
+            if (std::find(flags, flags + n, std::uint8_t(0)) == flags + n) continue;
+            auto* values = static_cast<float*>(f.array.data()); const float fill = static_cast<float>(f.target.fill);
+            for (std::size_t c = 0; c < f.array.shape[0]; ++c) for (std::size_t i = 0; i < n; ++i) if (!flags[i]) values[c * n + i] = fill;
+            continue;
+        }
         for (std::size_t i = 0; i < f.array.size(); ++i)
             if (!mask.get(mask.shape[0] == 1 ? i % n : i % mask.size())) f.array.set(i, f.target.fill);
     }
