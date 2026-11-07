@@ -13,10 +13,13 @@
 //    "marker": {...}}
 // `detector` is a detector identity (ObjectLinks.hpp: surface-overlap,
 // fiber-surface, track-surface, track-track, point-collection-surface);
-// `ct_volume` is the normal source of the line–surface detectors (absent
-// otherwise); `params` holds that detector's parameters under the names
-// the Python bindings use (surface_uuids, tolerance, ...). `marker` is kept
-// as the marker record's metadata.
+// `ct_volume` is the CT normal source of the line–surface detectors (absent
+// otherwise; their lasagna sources, `normal_x_volume`/`normal_y_volume` or
+// `normal_pool`, are params, and with no source at all they link by the
+// centerline); `params` holds that detector's parameters under the names
+// the Python bindings use (surface_uuids, tolerance, ...). Every path or URL
+// resolves where the detection runs: on the service for a served store.
+// `marker` is kept as the marker record's metadata.
 //
 // The link marker is one object per store, kind kLinkMarkerKind at
 // linkMarkerUuid(), published by every link_objects commit: its metadata is
@@ -42,7 +45,7 @@ std::string linkMarkerUuid();
 
 struct LinkStep {
     std::string detector;
-    std::string ctVolume;                            // line–surface detectors only
+    std::string ctVolume;                            // line–surface detectors only; may be empty
     nlohmann::json params = nlohmann::json::object();
 };
 struct LinkPlan {

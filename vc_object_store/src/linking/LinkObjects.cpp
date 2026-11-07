@@ -58,6 +58,9 @@ bool setLineSurfaceParameter(LineSurfaceParams& p, const std::string& key, const
     else if (key == "surface_scale") p.surfaceScale = number<double>(value, key);
     else if (key == "ct_level") p.ctLevel = number<int>(value, key);
     else if (key == "ct_to_base_scale") p.ctToBaseScale = number<double>(value, key);
+    else if (key == "normal_x_volume") p.normalXVolume = text(value, key);
+    else if (key == "normal_y_volume") p.normalYVolume = text(value, key);
+    else if (key == "normal_pool") p.normalPool = text(value, key);
     else if (key == "working_to_base_scale") p.workingToBaseScale = number<double>(value, key);
     else if (key == "proximity") p.proximity = number<double>(value, key);
     else if (key == "min_contacts") p.minContacts = number<std::size_t>(value, key);
@@ -242,11 +245,11 @@ objects::util::ProgressCallback stepProgress(const objects::util::ProgressCallba
 detail::Detection detect(detail::StoredGeometry& inputs, const LinkStep& step, const objects::PrepareOptions& options)
 {
     const auto progress = stepProgress(options.progress, step.detector);
-    auto normals = [&] {
-        if (step.ctVolume.empty())
-            throw std::invalid_argument("link_objects: " + step.detector + " needs ct_volume (its normal source)");
-        return std::filesystem::path(step.ctVolume);
-    };
+    // The line-surface detectors' normal source: the step's ct_volume, the
+    // params' normal_x_volume/normal_y_volume or normal_pool, or none
+    // (centerline-only). Whichever is named resolves where this runs; the
+    // detector refuses several at once and fails on an unavailable one.
+    const auto normals = std::filesystem::path(step.ctVolume);
     if (step.detector == kPointCollectionSurfaceDetector) {
         auto params = pointCollectionSurfaceParamsFromJson(step.params);
         params.progress = progress;
@@ -272,12 +275,12 @@ detail::Detection detect(detail::StoredGeometry& inputs, const LinkStep& step, c
             params.cacheDirectory = options.scratchDirectory / "fiber-strips";
             std::filesystem::create_directories(params.cacheDirectory);
         }
-        return detail::detectFibersToSurfaces(inputs, normals(), params, options.cancel);
+        return detail::detectFibersToSurfaces(inputs, normals, params, options.cancel);
     }
     if (step.detector == kTrackSurfaceDetector) {
         auto params = trackSurfaceParamsFromJson(step.params);
         params.progress = progress;
-        return detail::detectTracksToSurfaces(inputs, normals(), params, options.cancel);
+        return detail::detectTracksToSurfaces(inputs, normals, params, options.cancel);
     }
     throw std::invalid_argument("link_objects: unknown detector '" + step.detector + "'");
 }

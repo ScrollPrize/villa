@@ -162,6 +162,17 @@ struct LineSurfaceParams {
     double workingToBaseScale = 1.0;
     double ctToBaseScale = 1.0;
     int ctLevel = 0;
+    // Sheet-normal source, at most one of: the detector's ctVolume argument
+    // (structure-tensor normals from uint8 CT), both of these paired uint8
+    // lasagna nx/ny volumes (see LasagnaSheetNormalSampler), or the same
+    // normals' resident-pool pack (PooledLasagnaSheetNormalSampler; ctLevel
+    // does not apply). ctLevel and ctToBaseScale address whichever volume is
+    // selected. With none, no normal strip is built and anchors test the
+    // centerline points themselves. Paths and URLs resolve where the
+    // detection runs (the caller's host for a local store, the service's
+    // for a served one); an unavailable source fails the run.
+    std::filesystem::path normalXVolume, normalYVolume;
+    std::filesystem::path normalPool;
     // Discovery: dense line point -> surface distance.
     double proximity = 1.5;
     std::size_t minContacts = 2;
@@ -198,7 +209,9 @@ struct FiberSurfaceParams : LineSurfaceParams {
     bool rebuildStrips = false;
 };
 
-// Stored fibers -> stored surfaces. CT supplies the normal field.
+// Stored fibers -> stored surfaces. CT (ctVolume), lasagna normals
+// (normalX/YVolume) or a lasagna pack (normalPool) supply the strip normal
+// field; with none, the centerline alone gates anchors.
 // Only line points between projected endpoint controls participate. Anchors use
 // raw line indices and source XYZ. Failed inputs are excluded from stale removal.
 DetectorReport linkFibersToSurfaces(objects::ObjectStore& db,
@@ -226,7 +239,7 @@ struct TrackSurfaceParams : LineSurfaceParams {
     double trackScale = 1.0; // source track XYZ -> working XYZ
     std::vector<std::string> trackUuids; // optional existing graph-object subset
 };
-// Uses the same discovery, CT strip, contact gates and growth as fiber->surface.
+// Uses the same discovery, normal source, contact gates and growth as fiber->surface.
 // Reads stored tracks and surfaces; anchors use raw indices and source XYZ.
 DetectorReport linkTracksToSurfaces(objects::ObjectStore& db,
     const std::filesystem::path& ctVolume, const TrackSurfaceParams& params = {},

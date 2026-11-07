@@ -273,15 +273,22 @@ void localRequests(const TemporaryDirectory& directory)
 
     // Plan errors are refused before anything runs.
     {
+        const auto before = status().commitSequence;
+        const auto markerBefore = marker(db);
         links::LinkPlan bad = plan();
         bad.steps.push_back({"no-such-detector", "", Json::object()});
         mustFail([&] { db.submit(request(status(), bad)); });
         links::LinkPlan unknownKey = plan();
         unknownKey.steps[0].params["tolerence"] = 1;
         mustFail([&] { db.submit(request(status(), unknownKey)); });
-        links::LinkPlan needsNormals = plan();
-        needsNormals.steps.push_back({links::kFiberSurfaceDetector, "", Json::object()});
-        mustFail([&] { db.submit(request(status(), needsNormals)); });
+        // Several normal sources at once, or half a lasagna pair, are plan errors.
+        links::LinkPlan severalSources = plan();
+        severalSources.steps.push_back({links::kFiberSurfaceDetector, "/data/ct.zarr", Json{{"normal_pool", "/data/normals"}}});
+        mustFail([&] { db.submit(request(status(), severalSources)); });
+        links::LinkPlan halfLasagna = plan();
+        halfLasagna.steps.push_back({links::kFiberSurfaceDetector, "", Json{{"normal_x_volume", "/data/nx.zarr"}}});
+        mustFail([&] { db.submit(request(status(), halfLasagna)); });
+        require(status().commitSequence == before && marker(db) == markerBefore, "plan errors write nothing");
     }
 
     // The plan round-trips through its JSON and the request's canonical form.
@@ -397,6 +404,38 @@ void hostedRequests(const TemporaryDirectory& directory)
                 "an impatient client still gets the receipt");
         require(took >= std::chrono::milliseconds(2500), "the answer came from the one running detection");
         require(preparedCount() == before + 1, "a stalled retry does not start another detection");
+        slowPreparationMs = 0;
+    }
+
+    // A save submitted while a link request is detecting commits without
+    // waiting for it: the detection runs on a read worker and the writer is
+    // held only for the publication.
+    {
+        slowPreparationMs = 2500;
+        const auto before = hosted.status().commitSequence;
+        std::optional<TransactionReceipt> linked;
+        std::thread linking([&] { linked = hosted.submit(request(hosted.status(), plan())); });
+        std::this_thread::sleep_for(std::chrono::milliseconds(300));
+        HostedStore saver("http://127.0.0.1:" + std::to_string(service.port()));
+        const auto status = saver.status();
+        TransactionRequest save;
+        save.requestUuid = util::newUuid(); save.storeUuid = status.storeUuid; save.generation = status.generation;
+        save.author = "saver";
+        ObjectRecord note; note.uuid = util::newUuid(); note.kind = "note"; note.name = "saved during detection";
+        save.expectedObjects[note.uuid] = std::nullopt;
+        save.operations.push_back(CreateObjectOp{objectRecordJson(note)});
+        const auto start = std::chrono::steady_clock::now();
+        std::optional<TransactionReceipt> saved;
+        std::exception_ptr failure;
+        try { saved = saver.submit(save); } catch (...) { failure = std::current_exception(); }
+        const auto took = std::chrono::steady_clock::now() - start;
+        linking.join();
+        if (failure) std::rethrow_exception(failure);
+        require(saved->commitSequence.has_value() && *saved->commitSequence == before + 1,
+                "a save during a running detection commits first");
+        require(took < std::chrono::milliseconds(2000), "the save did not wait for the detection");
+        require(linked && linked->commitSequence.has_value() && *linked->commitSequence == before + 2,
+                "the link request, reading nothing the save touched, commits after it");
         slowPreparationMs = 0;
     }
     service.stop();

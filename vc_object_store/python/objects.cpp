@@ -1160,7 +1160,9 @@ NB_MODULE(_native, m)
             },
             nb::arg("ct_volume") = "", nb::arg("kwargs"),
             "Link stored tracks to stored surfaces; select with track_uuids and surface_uuids. "
-            "vc_reader supplies CT normals. Anchors retain raw indices and source XYZ.")
+            "Strip normals come from ct_volume, lasagna normal_x_volume/normal_y_volume, or a "
+            "normal_pool pack; with none, the centerline alone gates anchors. "
+            "Anchors retain raw indices and source XYZ.")
         .def(
             "link_fibers_to_surfaces",
             [](PyObjectStore& self, const std::string& ctVolume, const nb::kwargs& kwargs) {
@@ -1171,7 +1173,9 @@ NB_MODULE(_native, m)
             },
             nb::arg("ct_volume") = "", nb::arg("kwargs"),
             "Link stored fibers to stored surfaces; select with fiber_uuids and surface_uuids. "
-            "vc_reader supplies CT normals. Optional cache_directory stores disposable strips.")
+            "Strip normals come from ct_volume, lasagna normal_x_volume/normal_y_volume, or a "
+            "normal_pool pack; with none, the centerline alone gates anchors. "
+            "Optional cache_directory stores disposable strips.")
         .def_prop_ro("uuid", readMethod<&vo::ObjectStore::uuid>())
         .def("current_object_revision", readMethod<&vo::ObjectStore::currentObjectRevision>(),
              nb::arg("object_uuid"))
