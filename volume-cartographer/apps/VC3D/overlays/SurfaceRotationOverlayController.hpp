@@ -49,6 +49,8 @@ private:
     void applyRotation();
     // Make `surface` the active ("segmentation") surface.
     void showActive(const std::shared_ptr<QuadSurface>& surface);
+    // End the preview: `surface` is the selected segment again.
+    void endPreview(const std::shared_ptr<QuadSurface>& surface);
     static std::shared_ptr<QuadSurface> cloneSurface(const std::shared_ptr<QuadSurface>& surface);
 
     CState* _state{nullptr};
@@ -63,6 +65,7 @@ private:
     double _angleDeg{0.0};
     bool _horizontalFlip{false};
     std::shared_ptr<QuadSurface> _sourceSurface;
+    std::string _sourceSurfaceId;
     std::shared_ptr<QuadSurface> _previewSurface;
 
     // Reentrancy + stale-completion guard for applyRotation's

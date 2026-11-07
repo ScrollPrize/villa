@@ -315,6 +315,7 @@ void SurfaceRotationOverlayController::beginRotate()
 
     cancelRotate();
     _sourceSurface = std::move(source);
+    _sourceSurfaceId = _state->activeSurfaceId();
     _angleDeg = 0.0;
     _horizontalFlip = false;
     _rotateActive = true;
@@ -575,6 +576,14 @@ void SurfaceRotationOverlayController::showActive(const std::shared_ptr<QuadSurf
     _state->setSurface("segmentation", surface, false, true);
 }
 
+void SurfaceRotationOverlayController::endPreview(const std::shared_ptr<QuadSurface>& surface)
+{
+    // Showing the preview replaced the selected surface, so CWindow dropped it as the
+    // active one (onSurfaceWillBeDeleted): give the segment back, as `surface`.
+    _state->setActiveSurface(_sourceSurfaceId, surface);
+    showActive(surface);
+}
+
 void SurfaceRotationOverlayController::applyRotation()
 {
     if (!_rotateActive || !_state || !_sourceSurface) {
@@ -603,7 +612,7 @@ void SurfaceRotationOverlayController::applyRotation()
 
     // No transform: no I/O, nothing to do off-thread.
     if (transform.isNoOp()) {
-        showActive(_sourceSurface);
+        endPreview(_sourceSurface);
         _rotateActive = false;
         _angleDeg = 0.0;
         _horizontalFlip = false;
@@ -661,7 +670,7 @@ void SurfaceRotationOverlayController::applyRotation()
 
                 if (!result.error.isEmpty() || !result.surface) {
                     if (self->_sourceSurface) {
-                        self->showActive(self->_sourceSurface);
+                        self->endPreview(self->_sourceSurface);
                     }
                     self->clearWidgets();
                     self->_rotateActive = false;
@@ -678,13 +687,15 @@ void SurfaceRotationOverlayController::applyRotation()
 
                 if (!self->_saver || !self->_saver(result.surface.get())) {
                     if (self->_sourceSurface) {
-                        self->showActive(self->_sourceSurface);
+                        self->endPreview(self->_sourceSurface);
                     }
                     QMessageBox::warning(nullptr, tr("Surface Transform Failed"),
                                          tr("Failed to save the transformed surface to the object store."));
                     return;
                 }
-                self->showActive(result.surface);
+                // The saved surface is the segment now: the next Rotate/Flip and other
+                // readers of the active surface continue from it, not from the source.
+                self->endPreview(result.surface);
 
                 self->_rotateActive = false;
                 self->_angleDeg = 0.0;
