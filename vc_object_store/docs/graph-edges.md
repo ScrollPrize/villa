@@ -250,8 +250,9 @@ plus `commit_sequence` (the links' commit) and `detectors` (each step with
 its `report`), so a client reads it like any object to decide whether the
 links are current. Two link runs prepared over the same state conflict on
 the marker. A detector that cannot run (an unreadable normal source, missing
-inputs) fails the whole request: no step's links are published, the marker
-does not move, and the error names the detector; candidates a detector
+inputs) fails the whole request, whether the detector reports the failure
+or throws it: no step's links are published, the marker does not move, and
+the error names the detector; candidates a detector
 rejected are not failures and stay in its report's `problems`. A
 preparation is bound to its request's digest and to the store it ran on:
 `submit` refuses it for any other request or store.

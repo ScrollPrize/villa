@@ -300,18 +300,35 @@ objects::PreparedOperation prepareLinkObjects(objects::ObjectStore& store, const
         // conflict on it even when they read disjoint objects.
         result.expectedObjects[linkMarkerUuid()] = store.currentVersion(prepared->inputs->txn(), linkMarkerUuid());
     }
+    // A detector that could not run (a bad normal source, missing inputs,
+    // ...) fails the request: no step's links are published and the marker
+    // does not move. Rejected candidates are not failures; they stay in the
+    // report's problems.
+    auto failed = [](const std::string& detector, const std::string& why) {
+        return objects::PreparationFailed("link_objects: " + detector + " failed; nothing was written" + (why.empty() ? "" : ": " + why));
+    };
     for (const auto& step : prepared->plan.steps) {
         checkCancelled(options);
-        auto detection = detect(*prepared->inputs, step, options);
+        auto detection = [&] {
+            try {
+                return detect(*prepared->inputs, step, options);
+            } catch (const objects::PreparationFailed&) {
+                throw;
+            } catch (const std::invalid_argument&) {
+                throw; // a plan error: the request itself is malformed
+            } catch (const std::exception& error) {
+                // Some detectors report an execution failure by returning a
+                // non-publishing detection, others by throwing; both are
+                // the same failure to the caller.
+                if (options.cancel && options.cancel->load()) throw;
+                throw failed(step.detector, error.what());
+            }
+        }();
         checkCancelled(options);
         if (!detection.publish) {
-            // A detector that could not run (a bad normal source, missing
-            // inputs, ...) fails the request: no step's links are published
-            // and the marker does not move. Rejected candidates are not
-            // failures; they stay in the report's problems.
             std::string why;
             for (const auto& problem : detection.report.problems) why += (why.empty() ? "" : "; ") + problem;
-            throw objects::PreparationFailed("link_objects: " + step.detector + " failed; nothing was written" + (why.empty() ? "" : ": " + why));
+            throw failed(step.detector, why);
         }
         prepared->detections.push_back(std::move(detection));
     }

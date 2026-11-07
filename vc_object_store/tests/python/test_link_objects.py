@@ -87,8 +87,16 @@ def test_link_objects_fails_when_a_detector_cannot_run(db):
     before = db.status()["commit_sequence"]
     failing = {"detectors": PLAN["detectors"] + [{"detector": "track-surface", "ct_volume": "/no/such/ct.zarr", "params": {}}],
                "marker": {}}
-    with pytest.raises(RuntimeError, match="track-surface"):
+    with pytest.raises(vos.PreparationFailed, match="track-surface"):
         db.submit(link_request(db.status(), failing))
     assert db.status()["commit_sequence"] == before
     assert db.select_edges("point-surface") == []
+    assert db.object(vos.link_marker_uuid()) is None
+    # fiber-surface throws on a missing CT volume rather than reporting it;
+    # the request fails the same way.
+    throwing = {"detectors": PLAN["detectors"] + [{"detector": "fiber-surface", "ct_volume": "/no/such/ct.zarr", "params": {}}],
+                "marker": {}}
+    with pytest.raises(vos.PreparationFailed, match="fiber-surface"):
+        db.submit(link_request(db.status(), throwing))
+    assert db.status()["commit_sequence"] == before
     assert db.object(vos.link_marker_uuid()) is None

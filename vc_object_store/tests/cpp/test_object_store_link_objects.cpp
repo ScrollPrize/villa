@@ -256,6 +256,19 @@ void localRequests(const TemporaryDirectory& directory)
         require(status().commitSequence == before && marker(db) == markerBefore && edgeCount(db, "point-surface") == pointEdges,
                 "a failed request writes nothing: no links, the marker unmoved");
         require(!db.receipt(db.read(), failed.requestUuid).has_value(), "no receipt for a failed request");
+
+        // Detectors that throw on an execution failure (fiber-surface opens
+        // the CT volume first) fail the same way as those that report it.
+        links::LinkPlan throwing = plan();
+        throwing.steps.push_back({links::kFiberSurfaceDetector, directory.path.string() + "/no-such-ct.zarr", Json::object()});
+        const auto thrown = request(status(), throwing);
+        refused = false;
+        try { db.submit(thrown); } catch (const PreparationFailed& error) {
+            refused = std::string(error.what()).find(links::kFiberSurfaceDetector) != std::string::npos;
+        }
+        require(refused, "a detector that throws fails the request as a preparation failure");
+        require(status().commitSequence == before && marker(db) == markerBefore, "a thrown detector failure writes nothing");
+        require(!db.receipt(db.read(), thrown.requestUuid).has_value(), "no receipt for a thrown detector failure");
     }
 
     // Plan errors are refused before anything runs.
@@ -324,6 +337,15 @@ void hostedRequests(const TemporaryDirectory& directory)
         try { hosted.submit(request(hosted.status(), failing)); } catch (const PreparationFailed&) { refused = true; }
         require(refused, "a failed hosted detector is reported as such, not retried");
         require(hosted.status().commitSequence == before + 1 && marker(inspect) == markerBefore, "a failed hosted request writes nothing");
+
+        // A detector that throws (rather than reports) its failure is also a
+        // preparation failure over the wire: no 500, no retried detection.
+        links::LinkPlan throwing = plan();
+        throwing.steps.push_back({links::kFiberSurfaceDetector, "/no-such-ct.zarr", Json::object()});
+        refused = false;
+        try { hosted.submit(request(hosted.status(), throwing)); } catch (const PreparationFailed&) { refused = true; }
+        require(refused, "a hosted detector that throws is reported as a preparation failure");
+        require(hosted.status().commitSequence == before + 1 && marker(inspect) == markerBefore, "a thrown hosted failure writes nothing");
     }
 
     auto preparedCount = [&] { return Json::parse(hosted.serviceReport()).at("link_requests").at("detections").get<uint64_t>(); };
