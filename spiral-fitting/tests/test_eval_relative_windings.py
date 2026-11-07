@@ -44,6 +44,14 @@ def test_perfect_annotation_scores_one_with_degenerate_interval():
     assert r['exact_step_share_ci95'] == [1.0, 1.0] and r['n_pairs'] == 15
 
 
+def test_fractional_wind_a_step_is_rounded_not_truncated():
+    """A 0.9-turn or 1.9-turn annotated step is a 1- or 2-turn step; truncation (int()) would halve it (jo-tud, PR #2448)."""
+    pts = [{'winding_annotation': w, 'truth': t, 'creation_time': i}
+           for i, (w, t) in enumerate([(0.0, 10), (1.9, 12), (2.8, 13), (2.9, 13)])]
+    r = ev.score_collection(pts)
+    assert r['n_pairs'] == 3 and r['n_exact'] == 3 and r['sum_abs_err'] == 0
+
+
 def test_shifted_chain_lowers_exact_share_and_reversed_step_is_a_sign_violation():
     """A winding slip inside one chain is the error the tool exists to find; a reversed step is worse than a wrong magnitude."""
     good = {i: _collection(i, [10, 11, 12, 11]) for i in range(3)}

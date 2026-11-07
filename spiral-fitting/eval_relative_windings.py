@@ -7,7 +7,8 @@ anything. Each point is linked to the nearest truth mesh within ``tolerance``
 voxels (point ``p`` is [x, y, z]; tifxyz vertices are stored in full-resolution
 voxel zyx, ``scale`` only describes the grid sampling, so no rescaling is done).
 Consecutive linked points (ordered by ``creation_time``, ties and missing
-times keep file order) give a predicted step ``d_pred = wind_a[j] - wind_a[i]``
+times keep file order) give a predicted step ``d_pred = round(wind_a[j] - wind_a[i])``
+(``wind_a`` is nominally an integer; a fractional value is rounded, not truncated)
 and a true step ``d_true = w[j] - w[i]``.
 
 Linking uses a batched nearest-mesh ``Patch.project`` rather than
@@ -117,7 +118,8 @@ def score_collection(points):
     for a, b, oa, ob in zip(pts, pts[1:], ok, ok[1:]):
         if not (oa and ob):
             continue
-        d_pred = int(b['winding_annotation'] - a['winding_annotation'])
+        # round, not truncate: int(1.9 - 0.0) would read a 1.9-turn step as 1
+        d_pred = int(round(b['winding_annotation'] - a['winding_annotation']))
         d_true = b['truth'] - a['truth']
         pairs += 1
         exact += d_pred == d_true
