@@ -510,13 +510,13 @@ NB_MODULE(_reader, m)
                              nb::ndarray<const float, nb::ndim<3>, nb::c_contig, nb::device::cpu> xyz,
                              nb::ndarray<const float, nb::ndim<3>, nb::c_contig, nb::device::cpu> normals,
                              nb::ndarray<const std::uint8_t, nb::ndim<2>, nb::c_contig, nb::device::cpu> valid,
-                             std::array<double, 3> scale, std::vector<float> offsets) {
+                             std::array<double, 3> scale, std::array<double, 3> offset, std::vector<float> offsets) {
         const auto h = xyz.shape(0), w = xyz.shape(1);
         if (xyz.shape(2) != 3 || normals.shape(0) != h || normals.shape(1) != w || normals.shape(2) != 3 ||
             valid.shape(0) != h || valid.shape(1) != w || h > INT_MAX || w > INT_MAX)
             throw nb::value_error("expected H,W,3 positions/directions and H,W validity");
         vcr::grid::Request request;
-        request.levels.push_back({&array, sample_type(kind, itemsize, swap), scale});
+        request.levels.push_back({&array, sample_type(kind, itemsize, swap), scale, offset});
         request.offsets = std::move(offsets);
         request.pixels = valid.data();
         request.composite = vcr::composite::Options{};
@@ -529,7 +529,7 @@ NB_MODULE(_reader, m)
         auto* data = result->values.data();
         nb::capsule owner(result.release(), [](void* p) noexcept { delete static_cast<vcr::grid::Result*>(p); });
         return nb::ndarray<nb::numpy, float, nb::ndim<2>>(data, {h, w}, owner);
-    }, "array"_a, "kind"_a, "itemsize"_a, "swap"_a, "xyz"_a, "normals"_a, "valid"_a, "scale"_a, "offsets"_a);
+    }, "array"_a, "kind"_a, "itemsize"_a, "swap"_a, "xyz"_a, "normals"_a, "valid"_a, "scale"_a, "offset"_a, "offsets"_a);
 
     m.def("composite_reduce", [](nb::ndarray<const float, nb::ndim<2>, nb::c_contig, nb::device::cpu> values, const std::string& method,
                                  float iso_cutoff, float alpha_min, float alpha_max, float alpha_opacity, float alpha_cutoff,
