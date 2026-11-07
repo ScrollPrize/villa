@@ -36,6 +36,14 @@ template<class T> struct FourierLinePlan {
         radix2(kernel.data(),m,false);
     }
     void apply(ComplexT<T>* v,std::size_t stride,ComplexT<T>* scratch) const {
+        if((n&(n-1))==0){
+            // A power-of-two line is its own radix-2 transform: Bluestein's three
+            // length-m passes (m >= 2n-1) are not needed, and the result is more accurate.
+            for(std::size_t i=0;i<n;++i)scratch[i]=v[i*stride];
+            radix2(scratch,n,inverse);
+            for(std::size_t i=0;i<n;++i)v[i*stride]=scratch[i];
+            return;
+        }
         std::fill(scratch,scratch+m,ComplexT<T>{});
         for(std::size_t i=0;i<n;++i)scratch[i]=v[i*stride]*chirp[i];
         radix2(scratch,m,false);
