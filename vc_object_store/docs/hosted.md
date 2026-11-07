@@ -26,9 +26,12 @@ bound its queues and staged uploads; a full queue answers 503 with
 ([graph edges](graph-edges.md#linking-as-a-checked-request-link_objects))
 runs its detectors on a read worker and queues only their commit to the
 writer; it answers when the detection is done, so `--request-deadline`
-(default 300 s) must exceed the longest link, and `--strip-cache DIR` keeps
-the fiber strips between such requests. `GET /v1/service` reports connection,
-queue, staging, and WAL-checkpoint state. In VC3D: Stores → Attach Hosted
+(default 300 s) and the client's link timeout (`HostedStoreOptions::linkTimeoutS`,
+Python `link_timeout_s`, default 300 s) must both exceed the longest link,
+and `--strip-cache DIR` keeps the fiber strips between such requests. A
+retry of a link request in flight (same UUID) waits for the running
+detection instead of starting another. `GET /v1/service` reports connection,
+queue, staging, link-request, and WAL-checkpoint state. In VC3D: Stores → Attach Hosted
 Store...
 
 ## Pasting an SSH address in VC3D
@@ -88,7 +91,11 @@ with the same types as the local API: `status`, `submit`, `receipt`,
 same `TransactionConflict`. Transport failures, 429, and 5xx are retried with
 the **same request UUID**, so a lost reply is answered by the saved receipt;
 when retries run out the outcome is unknown — recover it with `receipt()` or
-by resubmitting the identical request, never under a new UUID. If a request's
+by resubmitting the identical request, never under a new UUID. A
+`link_objects` request is sent with `linkTimeoutS` (default 300 s, the
+server's default `--request-deadline`) in place of `stallTimeoutS`, since
+its reply waits for the detection; a retry of one joins the detection the
+server is already running. If a request's
 payloads have expired from server staging and no receipt answers it, the
 server names the missing hashes; upload them and resubmit identically.
 

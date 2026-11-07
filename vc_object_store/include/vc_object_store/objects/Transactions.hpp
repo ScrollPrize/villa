@@ -314,12 +314,37 @@ struct TransactionRequest {
 class ObjectStore;
 class WriteTxn;
 
+// A preparation that could not be made: its request publishes nothing and
+// has no receipt (a link detector that failed to run, for instance). Not a
+// transport failure: a retry of the same request repeats the work.
+class PreparationFailed : public std::runtime_error {
+public:
+    using std::runtime_error::runtime_error;
+};
+
 struct PreparedOperation {
     VersionSelection expectedObjects, readDependencies;
     std::function<void(ObjectStore&, WriteTxn&)> apply;
 };
-// By operation index in TransactionRequest::operations.
-using PreparedOperations = std::map<std::size_t, PreparedOperation>;
+
+// What ObjectStore::prepare returns: the request's preparations, bound to
+// the request (its UUID and digest) and the store they ran on. submit refuses a
+// preparation made for another request or on another store, so a
+// preparation can only publish what its own request's detection read.
+class PreparedOperations {
+public:
+    // Nothing to apply: the request has no prepared operation, or its
+    // receipt is already saved (submit replays it).
+    bool empty() const { return operations_.empty(); }
+    // Every version the preparations observed and the write expects.
+    VersionSelection expectedObjects() const;
+    VersionSelection readDependencies() const;
+
+private:
+    friend class ObjectStore;
+    std::string requestUuid_, requestDigest_, storeUuid_, generation_;
+    std::map<std::size_t, PreparedOperation> operations_; // by index in TransactionRequest::operations
+};
 
 struct PrepareOptions {
     util::ProgressCallback progress;          // the preparation's stages (detector progress)

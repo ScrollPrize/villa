@@ -481,7 +481,7 @@ EdgeRecord edgeInput(const Json& j)
 struct Executor {
     ObjectStore& store;
     WriteTxn& txn;
-    const PreparedOperations& prepared;
+    const std::map<std::size_t, PreparedOperation>& prepared;
     std::size_t index = 0; // of the operation being applied
 
     template <class Op> std::vector<GeometryEdgeEdit> edgeEdits(const Op& op)
@@ -661,6 +661,20 @@ void registerOperationPreparer(const std::string& operationName, OperationPrepar
     preparers()[operationName] = std::move(preparer);
 }
 
+VersionSelection PreparedOperations::expectedObjects() const
+{
+    VersionSelection result;
+    for (const auto& [index, preparation] : operations_) mergeVersions(result, preparation.expectedObjects, "expected versions");
+    return result;
+}
+
+VersionSelection PreparedOperations::readDependencies() const
+{
+    VersionSelection result;
+    for (const auto& [index, preparation] : operations_) mergeVersions(result, preparation.readDependencies, "read dependencies");
+    return result;
+}
+
 PreparedOperations ObjectStore::prepare(const TransactionRequest& request, const PrepareOptions& options)
 {
     validateRequest(request);
@@ -672,7 +686,12 @@ PreparedOperations ObjectStore::prepare(const TransactionRequest& request, const
         // Already committed: submit() replays the receipt, so nothing to prepare.
         auto txn = read();
         if (savedReceipt(static_cast<sqlite3*>(connection(txn)), canonical(request.requestUuid), nullptr)) return result;
+        const auto current = status(txn);
+        result.storeUuid_ = current.storeUuid;
+        result.generation_ = current.generation;
     }
+    result.requestUuid_ = canonical(request.requestUuid);
+    result.requestDigest_ = transactionRequestDigest(request);
     for (std::size_t i = 0; i < request.operations.size(); ++i) {
         const auto name = preparedOperationName(request.operations[i]);
         if (!name) continue;
@@ -683,7 +702,7 @@ PreparedOperations ObjectStore::prepare(const TransactionRequest& request, const
         }
         if (!preparer)
             throw std::invalid_argument("transaction: " + *name + " is not available here (its library is not linked)");
-        result.emplace(i, preparer(*this, request.operations[i], options));
+        result.operations_.emplace(i, preparer(*this, request.operations[i], options));
     }
     return result;
 }
@@ -715,7 +734,16 @@ TransactionReceipt ObjectStore::submit(const TransactionRequest& request, const 
     context.storeUuid = request.storeUuid; context.generation = request.generation;
     context.expectedObjects = request.expectedObjects; context.expectedRelationships = request.expectedRelationships;
     context.readDependencies = request.readDependencies; context.expectedCommitSequence = request.expectedCommitSequence;
-    for (const auto& [index, preparation] : prepared) {
+    if (!prepared.empty()) {
+        // A preparation publishes only for the request whose detection it
+        // ran, on the store it read.
+        if (prepared.requestUuid_ != requestUuid || prepared.requestDigest_ != digest)
+            throw std::invalid_argument("transaction: the preparation belongs to another request");
+        const auto current = status(txn);
+        if (prepared.storeUuid_ != current.storeUuid || prepared.generation_ != current.generation)
+            throw std::invalid_argument("transaction: the preparation was made on another store");
+    }
+    for (const auto& [index, preparation] : prepared.operations_) {
         if (index >= request.operations.size() || !preparedOperationName(request.operations[index]))
             throw std::invalid_argument("transaction: preparation " + std::to_string(index) + " names no prepared operation");
         mergeVersions(context.expectedObjects, preparation.expectedObjects, "expected versions");
@@ -729,7 +757,7 @@ TransactionReceipt ObjectStore::submit(const TransactionRequest& request, const 
     txn.expectedRevisions_ = expected;
     txn.expectedObjectVersions_ = context.expectedObjects;
     txn.expectedRelationshipVersions_ = request.expectedRelationships;
-    Executor apply{*this, txn, prepared};
+    Executor apply{*this, txn, prepared.operations_};
     for (apply.index = 0; apply.index < request.operations.size(); ++apply.index)
         std::visit(apply, request.operations[apply.index]);
     txn.commit();
@@ -771,7 +799,8 @@ std::vector<std::string> transactionJsonPayloadHashes(const std::string& text) {
 
 bool transactionJsonHasPreparedOperations(const std::string& text)
 {
-    for (const auto& op : Json::parse(text).at("operations"))
+    const auto request = Json::parse(text); // the loop reads into it
+    for (const auto& op : request.at("operations"))
         if (op.at("op").get<std::string>() == kLinkObjectsOperation) return true;
     return false;
 }

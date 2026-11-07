@@ -78,3 +78,17 @@ def test_link_objects_refuses_a_bad_plan(db):
     with pytest.raises(ValueError):
         db.submit(link_request(db.status(), bad))
     assert db.object(vos.link_marker_uuid()) is None
+
+
+def test_link_objects_fails_when_a_detector_cannot_run(db):
+    plane(db), plane(db), collection(db)
+    put(db, "track", [array("points", [[1, 1, 20], [8, 8, 20], [16, 16, 20]], "<i4")], {"family": "h"},
+        track={"dataset_ref": "dataset", "external_key": "0", "family": "h"})
+    before = db.status()["commit_sequence"]
+    failing = {"detectors": PLAN["detectors"] + [{"detector": "track-surface", "ct_volume": "/no/such/ct.zarr", "params": {}}],
+               "marker": {}}
+    with pytest.raises(RuntimeError, match="track-surface"):
+        db.submit(link_request(db.status(), failing))
+    assert db.status()["commit_sequence"] == before
+    assert db.select_edges("point-surface") == []
+    assert db.object(vos.link_marker_uuid()) is None

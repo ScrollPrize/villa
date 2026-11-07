@@ -302,8 +302,18 @@ objects::PreparedOperation prepareLinkObjects(objects::ObjectStore& store, const
     }
     for (const auto& step : prepared->plan.steps) {
         checkCancelled(options);
-        prepared->detections.push_back(detect(*prepared->inputs, step, options));
+        auto detection = detect(*prepared->inputs, step, options);
         checkCancelled(options);
+        if (!detection.publish) {
+            // A detector that could not run (a bad normal source, missing
+            // inputs, ...) fails the request: no step's links are published
+            // and the marker does not move. Rejected candidates are not
+            // failures; they stay in the report's problems.
+            std::string why;
+            for (const auto& problem : detection.report.problems) why += (why.empty() ? "" : "; ") + problem;
+            throw objects::PreparationFailed("link_objects: " + step.detector + " failed; nothing was written" + (why.empty() ? "" : ": " + why));
+        }
+        prepared->detections.push_back(std::move(detection));
     }
     prepared->inputs->close(); // the snapshot's work is done; the write checks the versions
     for (const auto& [uuid, version] : prepared->inputs->expectations()) result.expectedObjects[uuid] = version;
@@ -315,7 +325,7 @@ objects::PreparedOperation prepareLinkObjects(objects::ObjectStore& store, const
             const auto report = detail::commitDetection(db, *prepared->inputs, txn, detection,
                                                         stepProgress(progress, detection.detector));
             Json step{{"detector", prepared->plan.steps[i].detector}, {"params", prepared->plan.steps[i].params},
-                      {"published", detection.publish}, {"report", detectorReportJson(report)}};
+                      {"report", detectorReportJson(report)}};
             if (!prepared->plan.steps[i].ctVolume.empty()) step["ct_volume"] = prepared->plan.steps[i].ctVolume;
             steps.push_back(std::move(step));
         }

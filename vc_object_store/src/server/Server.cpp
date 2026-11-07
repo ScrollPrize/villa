@@ -359,10 +359,21 @@ std::string utcNow()
     return text;
 }
 
+// A link_objects request being prepared or committed (submitPrepared).
+struct InFlightLink {
+    std::string digest;
+    std::vector<std::function<void(Reply)>> waiters; // every connection awaiting its answer
+};
+
 struct ServerState {
     ServerOptions options;
     std::optional<ObjectStore> store;
     Staging staging;
+    struct {
+        std::mutex mutex;
+        std::map<std::string, std::shared_ptr<InFlightLink>> inFlight; // by request UUID
+        uint64_t detections = 0; // link requests whose detection this service ran (a replay runs none)
+    } links;
     // Before io: connections still queued in io decrement them as io is destroyed.
     std::atomic<std::size_t> connections{0}, responseBytes{0};
     WalUpkeep wal;
@@ -440,7 +451,16 @@ struct ServerState {
             {"queues", {{"writer", writer->queued()}, {"read", readers->queued()}, {"control", control->queued()},
                         {"transfer", transfers->queued()}}},
             {"response_bytes_in_flight", responseBytes.load()},
+            {"link_requests", linkReport()},
             {"staging", staging.report()}, {"wal", walJson}}.dump());
+    }
+
+    Json linkReport()
+    {
+        std::lock_guard lock(links.mutex);
+        std::size_t waiting = 0;
+        for (const auto& [uuid, entry] : links.inFlight) waiting += entry->waiters.size();
+        return {{"in_flight", links.inFlight.size()}, {"waiting_connections", waiting}, {"detections", links.detections}};
     }
 
     // Writer lane: one scheduled checkpoint between transactions.
@@ -480,12 +500,18 @@ struct ServerState {
     // queued to the writer like any transaction, which holds the writer lane
     // only for the commit. A request whose payloads are not all staged takes
     // the ordinary path (a saved receipt or the missing hashes answer it).
+    //
+    // A link request in flight is remembered by its request UUID until it is
+    // answered: a retry of it (a client whose stall timeout elapsed before
+    // the detection was done, or a second client sending the same request)
+    // waits for the running detection and gets its answer, instead of
+    // starting the detection again; a same-UUID request with other contents
+    // is refused, as submit refuses it once the receipt is saved.
     void submitPrepared(const std::shared_ptr<std::string>& body, const std::function<void(Reply)>& done)
     {
         auto request = std::make_shared<TransactionRequest>();
-        auto prepared = std::make_shared<PreparedOperations>();
-        bool ready = false, unstaged = false;
-        const auto reply = guarded([&] {
+        bool parsed = false, unstaged = false;
+        const auto parse = guarded([&] {
             TransactionPayloads payloads;
             for (const auto& hash : transactionJsonPayloadHashes(*body)) {
                 auto bytes = staging.get(hash);
@@ -493,6 +519,44 @@ struct ServerState {
                 payloads.emplace(hash, std::move(*bytes));
             }
             *request = transactionRequestFromJson(*body, payloads);
+            parsed = true;
+            return Reply{};
+        });
+        if (unstaged) {
+            if (!writer->tryPost([this, body, done] { done(guarded([&] { return submit(*body); })); }))
+                done(errorReply(http::status::service_unavailable, "server busy; retry"));
+            return;
+        }
+        if (!parsed) { done(parse); return; }
+        const auto uuid = request->requestUuid;
+        const auto digest = transactionRequestDigest(*request);
+        {
+            std::lock_guard lock(links.mutex);
+            if (const auto running = links.inFlight.find(uuid); running != links.inFlight.end()) {
+                if (running->second->digest != digest)
+                    done(errorReply(http::status::bad_request, "request " + uuid + " is in flight with different contents"));
+                else running->second->waiters.push_back(done);
+                return;
+            }
+            auto entry = std::make_shared<InFlightLink>();
+            entry->digest = digest;
+            entry->waiters.push_back(done);
+            links.inFlight.emplace(uuid, std::move(entry));
+        }
+        // Answers everyone waiting on this request and forgets it.
+        auto finish = [this, uuid](const Reply& reply) {
+            std::vector<std::function<void(Reply)>> waiters;
+            {
+                std::lock_guard lock(links.mutex);
+                const auto running = links.inFlight.find(uuid);
+                waiters.swap(running->second->waiters);
+                links.inFlight.erase(running);
+            }
+            for (const auto& waiter : waiters) waiter(reply);
+        };
+        auto prepared = std::make_shared<PreparedOperations>();
+        bool ready = false;
+        const auto reply = guarded([&] {
             PrepareOptions prepare;
             prepare.localPaths = false;
             prepare.scratchDirectory = options.linkScratchDirectory;
@@ -500,13 +564,12 @@ struct ServerState {
             ready = true;
             return Reply{};
         });
-        if (!ready && !unstaged) { done(reply); return; }
-        std::function<void()> commit;
-        if (unstaged) commit = [this, body, done] { done(guarded([&] { return submit(*body); })); };
-        else commit = [this, request, prepared, done] {
-            done(guarded([&] { return jsonReply(transactionReceiptToJson(store->submit(*request, *prepared))); }));
+        if (ready && !prepared->empty()) { std::lock_guard lock(links.mutex); ++links.detections; }
+        if (!ready) { finish(reply); return; }
+        const auto commit = [this, request, prepared, finish] {
+            finish(guarded([&] { return jsonReply(transactionReceiptToJson(store->submit(*request, *prepared))); }));
         };
-        if (!writer->tryPost(commit)) done(errorReply(http::status::service_unavailable, "server busy; retry"));
+        if (!writer->tryPost(commit)) finish(errorReply(http::status::service_unavailable, "server busy; retry"));
     }
 
     Reply changes(const Target& target)
@@ -798,6 +861,10 @@ struct ServerState {
             return jsonReply(transactionConflictToJson(conflict), http::status::conflict);
         } catch (const MissingPayloads& missing) {
             return jsonReply(Json{{"error", missing.what()}, {"missing", missing.hashes()}}.dump(),
+                             http::status::unprocessable_entity);
+        } catch (const PreparationFailed& failed) {
+            // Not the service's fault and not transient: no retry.
+            return jsonReply(Json{{"error", failed.what()}, {"preparation_failed", true}}.dump(),
                              http::status::unprocessable_entity);
         } catch (const std::invalid_argument& e) {
             return errorReply(http::status::bad_request, e.what());

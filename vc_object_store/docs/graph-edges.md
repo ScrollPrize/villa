@@ -247,13 +247,27 @@ marker = store.object_by_uuid(vos.link_marker_uuid())    # kind LINK_MARKER_KIND
 line–surface detectors name their normal source as `ct_volume`. The link
 marker is one object per store: its metadata is the plan's `marker` content
 plus `commit_sequence` (the links' commit) and `detectors` (each step with
-its `report` and whether it `published`), so a client reads it like any
-object to decide whether the links are current. Two link runs prepared over
-the same state conflict on the marker. On a served store the detectors read
-their CT or Lasagna normals where the service runs, the strip cache is the
-service's own (`vc_object_server --strip-cache`), and a request naming a
-`cache_directory` is refused; the service's `--request-deadline` must exceed
-the longest link, since the reply comes when the detection is done.
+its `report`), so a client reads it like any object to decide whether the
+links are current. Two link runs prepared over the same state conflict on
+the marker. A detector that cannot run (an unreadable normal source, missing
+inputs) fails the whole request: no step's links are published, the marker
+does not move, and the error names the detector; candidates a detector
+rejected are not failures and stay in its report's `problems`. A
+preparation is bound to its request's digest and to the store it ran on:
+`submit` refuses it for any other request or store.
+
+On a served store the detectors read their CT or Lasagna normals where the
+service runs, the strip cache is the service's own
+(`vc_object_server --strip-cache`), and a request naming a `cache_directory`
+is refused. The reply comes when the detection is done, so two timeouts are
+set together: the service's `--request-deadline` and the client's link
+timeout (`HostedStoreOptions::linkTimeoutS`, Python `link_timeout_s`; both
+default to 300 s) must exceed the longest link. A client that gives up
+earlier retries with the same request UUID; the service keeps every link
+request in flight by its UUID, so the retry waits for the detection already
+running (or replays its receipt) instead of starting another, and a
+same-UUID request with other contents is refused. `GET /v1/service` reports
+`link_requests` (`in_flight`, `waiting_connections`, `detections`).
 
 | Detector (`meta.detector.name`) | Pairs | Default edge kind | Notes |
 | --- | --- | --- | --- |

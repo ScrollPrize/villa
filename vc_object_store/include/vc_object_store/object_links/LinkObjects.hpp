@@ -23,7 +23,8 @@
 // the plan's `marker` content plus `commit_sequence` (the commit that
 // published it, which is the links' commit) and `detectors` (each step with
 // its report). A client reads it like any object to decide whether the
-// store's links are current.
+// store's links are current. A detector that fails to run fails the whole
+// request: nothing is published and the marker does not move.
 
 #include "vc_object_store/object_links/ObjectLinks.hpp"
 #include "vc_object_store/objects/Transactions.hpp"
@@ -67,8 +68,9 @@ void enableLinkObjects();
 // The preparer: runs the plan's detectors over one snapshot of `store`
 // (PrepareOptions: progress, cancellation, the service's scratch directory
 // for fiber strips, whether client paths are allowed) and returns the
-// publication. Throws std::invalid_argument for a malformed plan and
-// std::runtime_error when a detector fails or is cancelled.
+// publication. Throws std::invalid_argument for a malformed plan,
+// objects::PreparationFailed when a detector fails to run, and
+// std::runtime_error when cancelled.
 objects::PreparedOperation prepareLinkObjects(objects::ObjectStore& store, const objects::LinkObjectsOp& op,
                                               const objects::PrepareOptions& options);
 

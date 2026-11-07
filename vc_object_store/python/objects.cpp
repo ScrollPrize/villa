@@ -350,13 +350,16 @@ void bindHostedStore(nb::module_& m)
     };
     nb::class_<Hosted>(m, "HostedStore")
         .def("__init__", [](Hosted* self, const std::string& endpoint, int connections, long connectTimeoutMs,
-                            long stallTimeoutS, int retries, long requestTimeoutMs) {
+                            long stallTimeoutS, int retries, long requestTimeoutMs, long linkTimeoutS) {
             vo::HostedStoreOptions o;
             o.connections = connections; o.connectTimeoutMs = connectTimeoutMs; o.stallTimeoutS = stallTimeoutS;
-            o.retries = retries; o.requestTimeoutMs = requestTimeoutMs;
+            o.retries = retries; o.requestTimeoutMs = requestTimeoutMs; o.linkTimeoutS = linkTimeoutS;
             new (self) Hosted(endpoint, o);
         }, nb::arg("endpoint"), nb::arg("connections") = 4, nb::arg("connect_timeout_ms") = 10000,
-           nb::arg("stall_timeout_s") = 60, nb::arg("retries") = 5, nb::arg("request_timeout_ms") = 0)
+           nb::arg("stall_timeout_s") = 60, nb::arg("retries") = 5, nb::arg("request_timeout_ms") = 0,
+           nb::arg("link_timeout_s") = 300,
+           "link_timeout_s: how long a link_objects request may take to be answered (its detection runs on the "
+           "service); set it with the service's --request-deadline.")
         .def_prop_ro("endpoint", &Hosted::endpoint)
         .def("status", [statusPy](Hosted& self) {
             vo::StoreStatus status;
@@ -513,6 +516,7 @@ void bindHostedStore(nb::module_& m)
             self.fetchArtifact(f, destination);
         }, nb::arg("file"), nb::arg("destination"), "Write one manifest entry {name, sha256, length} atomically, verified.");
     nb::exception<vo::StoreBusy>(m, "StoreBusy", PyExc_RuntimeError);
+    nb::exception<vo::PreparationFailed>(m, "PreparationFailed", PyExc_RuntimeError);
 }
 
 // ObjectStoreSession operations that take requests, numbered references and
@@ -544,17 +548,19 @@ void bindSessionOperations(nb::class_<vo::ObjectStoreSession> session)
         }, nb::arg("location"), nb::arg("author") = std::string(), nb::arg("read_only") = false,
            "Attach a store location: a vc_object_server endpoint (http:// or https://; always writable) or a store file.")
         .def("attach_hosted", [](Session& self, const std::string& endpoint, int64_t pollIntervalMs, size_t cacheBytes,
-                                 int retries, long connectTimeoutMs, const std::string& author) {
+                                 int retries, long connectTimeoutMs, const std::string& author, long linkTimeoutS) {
             vo::HostedSessionOptions options;
             options.author = author;
             options.pollInterval = std::chrono::milliseconds(pollIntervalMs);
             options.cacheBytes = cacheBytes;
             options.client.retries = retries;
             options.client.connectTimeoutMs = connectTimeoutMs;
+            options.client.linkTimeoutS = linkTimeoutS;
             nb::gil_scoped_release release;
             return self.attachHosted(endpoint, options);
         }, nb::arg("endpoint"), nb::arg("poll_interval_ms") = 2000, nb::arg("cache_bytes") = vo::HostedSessionOptions{}.cacheBytes,
            nb::arg("retries") = 5, nb::arg("connect_timeout_ms") = 10000, nb::arg("author") = std::string(),
+           nb::arg("link_timeout_s") = 300,
            "Attach a store served by vc_object_server; use the typed operations (no local callbacks).")
         .def("read_surface_grid", [](Session& self, const vo::AttachmentIdentity& attachment, const std::string& uuid,
                                      const std::string& volume, double targetScale, std::optional<int64_t> version,
