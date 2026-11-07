@@ -4,24 +4,20 @@ import json
 from pathlib import Path
 
 import numpy as np
-import zarr
+import pytest
+from vc_reader.reader import create_group
 
-from vesuvius.ink_detection.preprocessing.select_flat_training_chunks import main
+from vesuvius.ink_detection.preprocessing.select_flat_training_chunks import chunk_key_encoder, main
+from vesuvius.ink_detection.volume_io import open_volume
 
 
 SHAPE_ZYX = (4, 16, 16)
 CHUNKS_ZYX = (4, 4, 4)
 
 
-def _write_level0(path: Path, array: np.ndarray) -> None:
-    kwargs = {"mode": "w"}
-    if int(zarr.__version__.split(".", 1)[0]) >= 3:
-        kwargs["zarr_format"] = 2
-    root = zarr.open_group(path, **kwargs)
-    if int(zarr.__version__.split(".", 1)[0]) >= 3:
-        root.create_array("0", data=array, chunks=CHUNKS_ZYX)
-    else:
-        root.create_dataset("0", data=array, chunks=CHUNKS_ZYX)
+def _write_level0(path: Path, array: np.ndarray, **layout) -> None:
+    root = create_group(path, version=layout.get("version", 2), overwrite=True)
+    root.create_array("0", shape=array.shape, chunks=CHUNKS_ZYX, dtype=array.dtype, **layout)[...] = array
 
 
 def _segment(tmp_path: Path) -> Path:
@@ -150,16 +146,29 @@ def test_keeps_every_chunk_a_z_jittered_window_can_read(tmp_path, monkeypatch):
     assert len({p.split("/")[-1].split(".")[0] for p in needed}) > 2  # the jitter really reaches more Z chunks
 
 
-def test_chunk_keys_follow_the_arrays_own_key_encoding():
-    # Review on #1821: Zarr 2 arrays have no `.metadata`; '/'-separated stores must keep their separator.
-    from vesuvius.ink_detection.preprocessing.select_flat_training_chunks import chunk_key_encoder
+@pytest.mark.parametrize(
+    "layout",
+    [
+        {"version": 2, "separator": "."},
+        {"version": 2, "separator": "/"},
+        {"version": 3, "separator": "/"},
+        {"version": 3, "separator": "."},
+        {"version": 3, "separator": "/", "shards": (8, 8, 8)},
+    ],
+    ids=["v2-dot", "v2-slash", "v3-slash", "v3-dot", "v3-sharded"],
+)
+def test_chunk_keys_name_the_files_the_array_stores(tmp_path, layout):
+    # Review on #1821: keys must follow the array's own encoding, not assume "0.1.2".
+    path = tmp_path / "seg-a.zarr"
+    _write_level0(path, np.ones((8, 16, 16), dtype=np.uint8), **layout)
+    level0 = path / "0"
+    stored = {
+        p.relative_to(level0).as_posix()
+        for p in level0.rglob("*")
+        if p.is_file() and not p.name.startswith((".z", "zarr.json"))
+    }
 
-    class Zarr2Array:
-        _dimension_separator = "/"
+    encode = chunk_key_encoder(open_volume(path, 0))
+    keys = {encode((z, y, x)) for z in range(2) for y in range(4) for x in range(4)}
 
-    assert chunk_key_encoder(Zarr2Array())((1, 2, 3)) == "1/2/3"
-
-    class Zarr2DefaultArray:
-        _dimension_separator = None
-
-    assert chunk_key_encoder(Zarr2DefaultArray())((1, 2, 3)) == "1.2.3"
+    assert keys == stored

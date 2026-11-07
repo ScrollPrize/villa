@@ -63,12 +63,22 @@ def parse_args(argv: Sequence[str] | None = None):
 
 
 def chunk_key_encoder(volume):
-    """Map chunk coordinates to the key the array stores them under, for Zarr 2 and Zarr 3."""
-    metadata = getattr(volume, "metadata", None)
-    if metadata is not None and hasattr(metadata, "encode_chunk_key"):  # Zarr 3 (v2 and v3 arrays)
-        return metadata.encode_chunk_key
-    separator = getattr(volume, "_dimension_separator", None) or "."  # Zarr 2
-    return lambda coords: separator.join(map(str, coords))
+    """Map chunk coordinates to the key the array stores them under, from vc_reader's metadata.
+
+    Zarr v2 keys use the array's dimension separator ("0.1.2" or "0/1/2"); v3 keys add the
+    encoding's prefix ("c/0/1/2"), and a sharded v3 array stores each chunk in its shard's key.
+    """
+    meta = volume.meta
+    v3 = meta.raw.get("_vc_reader_v3") or {}
+    prefix = v3.get("prefix", "")
+    chunks_per_shard = tuple(v3.get("shard_chunks") or ())
+
+    def encode(coords) -> str:
+        if chunks_per_shard:
+            coords = (c // n for c, n in zip(coords, chunks_per_shard))
+        return prefix + meta.separator.join(map(str, coords))
+
+    return encode
 
 
 def read_z_range(patch, config, depth: int) -> tuple[int, int]:

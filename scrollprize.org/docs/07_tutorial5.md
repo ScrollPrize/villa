@@ -323,7 +323,7 @@ uv run --extra models python -m vesuvius.ink_detection.preprocessing.select_flat
 uvx --from huggingface_hub hf buckets sync --apply subset.jsonl
 ```
 
-For the tutorial segment this keeps 3,534 of 101,304 level-0 chunks (2.95 GB) with `patch_size [64, 256, 256]`, and 2,862 chunks (2.42 GB) with `[64, 128, 128]`. Step 1 is many small files (12,625 files, 70 MB) and took 13 minutes here; step 3 runs patch discovery and took about 3.5 minutes. Selecting the chunks is config-specific: if you change `patch_size`, `patch_overlap`, `patch_min_labeled_coverage` or the labels, rerun step 3. With `flat_z_window_jitter` enabled, the selection also covers every Z offset the jitter can draw.
+For the tutorial segment this keeps 3,534 of 101,304 level-0 chunks (2.95 GB) with `patch_size [64, 256, 256]`, and 2,862 chunks (2.42 GB) with `[64, 128, 128]`. Step 1 is many small files (12,625 files, 70 MB) and took 8 minutes here; step 3 runs patch discovery and took about 10 seconds. Selecting the chunks is config-specific: if you change `patch_size`, `patch_overlap`, `patch_min_labeled_coverage` or the labels, rerun step 3. With `flat_z_window_jitter` enabled, the selection also covers every Z offset the jitter can draw.
 
 **Settings that fit a 6 GB GPU.** Measured on an RTX 3060 Laptop GPU (6 GB), driver 616.92, WSL2, `torch 2.12.1+cu130`, on the tutorial segment with `mixed_precision: fp16` and `dataloader_workers: 4`. Steady-state time per iteration after 20 iterations; "spills" means the card was full and the driver moved memory into system RAM (see the tip above):
 
