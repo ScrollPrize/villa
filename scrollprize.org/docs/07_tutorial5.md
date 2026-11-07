@@ -566,6 +566,16 @@ Checkpoints embed their training config, so inference rebuilds the model and its
 * **The models are sensitive to depth offsets.** If a checkpoint doesn't respond well on your data, the surface may sit at a slightly different depth than the model expects. Try shifting the window with `--layer-start` / `--layer-end`, or average the predictions over a few nearby windows as a simple ensemble. Training jitters the depth window, so the models tolerate small offsets; larger ones can still throw them off.
 * **The background doesn't sit at zero.** With label smoothing 0.5, the training targets are 0.25 for background and 0.75 for ink, so predictions tend to occupy a compressed range. If a prediction looks washed out, you may want to rescale it for display (for example `(p − 0.25) / 0.5`, clipped to [0, 1]).
 
+**How far the window can shift.** A checkpoint reads a fixed number of slices `W` (17 for the `ink_9um` checkpoints). By default inference uses the centered window of a `D`-slice surface volume, starting at slice `s = D // 2 − W // 2`; a `--layer-start` / `--layer-end` range longer than `W` is center-cropped back to `W`. To shift the window by `k` slices, pass exactly `W` slices: `--layer-start s+k --layer-end s+k+W`. A shift of ±`k` therefore needs a surface volume of at least `W + 2·|k|` slices:
+
+| Surface volume depth `D` | Default window (`W` = 17) | Shifts `k` that fit |
+|---|---|---|
+| 21 (the training renders) | slices 2–18 | −2 … +2 (what training jitter covers) |
+| 28 (the published 9.362&nbsp;µm renders, the w035 render above) | slices 6–22 | −6 … +5 |
+| 41 (`--num-slices 41`) | slices 12–28 | −12 … +12 |
+
+For example, on the 28-slice render `--layer-start 3 --layer-end 20` shifts the window by −3. Windows that extend past the last rendered slice are zero-padded silently (e.g. `--layer-start 13 --layer-end 30`, k = +7 on 28 slices, gives only 15 real slices), so render deep enough: `vc_render_tifxyz --num-slices`. The log line `Selected source layer indices=` shows which slices were used.
+
 Run both seeds and a few different steps; and when you don't know which way the surface faces, run both directions too (`--direction both`). Here is how the two seeds compare on the w035 render from above:
 
 <figure>
