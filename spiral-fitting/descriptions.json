@@ -164,7 +164,7 @@
     "input_use_pcl_same_winding": "Load same-winding point-collection inputs. Applies at a Run boundary: enabling loads the dataset's same_windings.json (and any same-winding document the session named) into the resident fit, disabling drops every resident same-winding collection.",
     "input_use_pcl_drawn_control_points": "Load drawn-control-point point-collection inputs.",
     "input_use_normals": "Allow dense normal stores, sampling, and normal-dependent losses.",
-    "input_use_gradient_magnitude": "Allow gradient-magnitude dense-spacing supervision.",
+    "input_use_gradient_magnitude": "Allow gradient-magnitude dense-spacing supervision. It has an effect only when dense_spacing_mode is grad_mag; in the default winding_model mode grad_mag is never loaded.",
     "input_use_winding_inference": "Allow compact winding-inference supervision.",
     "input_use_outer_shell": "Allow outer-shell losses, lookup maps, and shell-based track filtering.",
     "input_disable_patches": "When on, verified patches are not loaded, and every patch-based loss is inactive. The umbilicus anchor still applies. This gives a fit driven only by the other inputs. Same effect as turning off the verified-patches input.",
