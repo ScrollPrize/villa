@@ -76,12 +76,9 @@ _PLACEHOLDER = re.compile(r'<[^<>/]+>')
 
 
 def open_predictions(path):
-    """Open the predictions array read-only with vesuvius's ``open_zarr`` (local path or URL)."""
-    vesuvius_src = f'{os.path.dirname(os.path.abspath(__file__))}/../vesuvius/src'
-    if vesuvius_src not in sys.path:
-        sys.path.insert(0, vesuvius_src)
-    from vesuvius.data.utils import open_zarr
-    return open_zarr(path, mode='r')
+    """Open the predictions array read-only with vc_reader (local path or URL)."""
+    from vc_reader.reader import open_zarr
+    return open_zarr(path)
 
 
 def downsample_maxpool(x, factor):

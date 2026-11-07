@@ -439,6 +439,33 @@ def _write_order(path):
                 for (key,) in connection.execute('SELECT key FROM Dict ORDER BY rowid')]
 
 
+def test_cpu_backend_opens_a_real_zarr(monkeypatch, tmp_path):
+    # Every other CPU test replaces open_predictions; this one reads the predictions the
+    # way the command line does, through a zarr on disk.
+    kimimaro = pytest.importorskip('kimimaro')
+    pytest.importorskip('cc3d')
+    reader = pytest.importorskip('vc_reader.reader')
+    _small_configuration(monkeypatch)
+    volume = synthetic_predictions()
+    path = tmp_path / 'predictions.zarr'
+    writer = reader.ZarrWriter.create(path, shape=volume.shape, chunks=(64, 64, 64),
+                                      dtype=np.uint8, fill_value=0)
+    writer[:] = volume
+
+    def skeletonize(labels, **kwargs):
+        return kimimaro.skeletonize(labels, **{**kwargs, 'parallel': 1})
+    monkeypatch.setattr(est, 'get_skeleton_tracks',
+                        functools.partial(est.get_skeleton_tracks, skeletonize=skeletonize))
+
+    est.run_cpu(str(path), str(tmp_path / 'from_zarr.dbm'))
+    with monkeypatch.context() as patch:
+        patch.setattr(est, 'open_predictions', lambda _: volume)
+        est.run_cpu('in-memory', str(tmp_path / 'in_memory.dbm'))
+    expected = _read_dbm(tmp_path / 'in_memory.dbm')
+    assert sum(len(pickle.loads(value)) for value in expected.values()) > 0
+    assert _read_dbm(tmp_path / 'from_zarr.dbm') == expected
+
+
 def test_cpu_backend_writes_the_track_format(monkeypatch, tmp_path):
     kimimaro = pytest.importorskip('kimimaro')
     pytest.importorskip('cc3d')
