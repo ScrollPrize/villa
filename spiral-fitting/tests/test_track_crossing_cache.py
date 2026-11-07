@@ -409,6 +409,50 @@ class TrackCrossingCacheTests(unittest.TestCase):
             result['crossing_record_sample'],
             np.empty(0, dtype=np.int32))
 
+    def test_native_resampler_spacing_statistics_do_not_depend_on_workers(self):
+        # The spacing extrema are reduced by hand per thread and merged under a
+        # critical section (OpenMP 2.0, so MSVC's runtime can build the kernel);
+        # one worker and several must agree on every output, statistics included.
+        native = _load_native_track_crossings()
+        if native is None:
+            self.skipTest('VC native crossing extension is not built')
+        rng = np.random.default_rng(1633)
+        lengths = rng.integers(1, 60, size=400)
+        lengths[::37] = 1
+        offsets = np.zeros(len(lengths) + 1, dtype=np.int64)
+        np.cumsum(lengths, out=offsets[1:])
+        steps = rng.normal(scale=rng.uniform(0.1, 3.0, size=(offsets[-1], 1)),
+                           size=(offsets[-1], 3))
+        coordinates = np.empty((offsets[-1], 3), dtype=np.float32)
+        for track in range(len(lengths)):
+            begin, end = offsets[track], offsets[track + 1]
+            coordinates[begin:end] = (
+                rng.uniform(0, 1000, size=3) + np.cumsum(steps[begin:end], axis=0))
+        record_counts = np.where(lengths > 1, rng.integers(0, 4, size=len(lengths)), 0)
+        record_offsets = np.zeros(len(lengths) + 1, dtype=np.int64)
+        np.cumsum(record_counts, out=record_offsets[1:])
+        self_local = np.concatenate([
+            rng.integers(0, lengths[track], size=record_counts[track])
+            for track in range(len(lengths))]).astype(np.int32)
+        partners = rng.integers(0, len(lengths), size=len(self_local)).astype(np.int32)
+        partner_local = np.zeros(len(self_local), dtype=np.int32)
+        crossing_index = native.prepare_crossing_index(
+            record_offsets, partners, self_local, partner_local,
+            lengths.astype(np.int32))
+
+        results = [
+            native.resample_tracks(
+                coordinates, offsets, minimum_spacing=0.5, maximum_spacing=2.0,
+                workers=workers, crossing_index=crossing_index)
+            for workers in (1, 4)]
+        self.assertEqual(results[0].keys(), results[1].keys())
+        for name in results[0]:
+            np.testing.assert_array_equal(
+                np.asarray(results[0][name]), np.asarray(results[1][name]), err_msg=name)
+        self.assertGreater(results[0]['maximum_observed_spacing'],
+                           results[0]['minimum_observed_spacing'])
+        self.assertGreater(int(results[0]['undersized_anchor_gaps']), 0)
+
     def test_native_radix_argsort_is_stable(self):
         native = _load_native_track_crossings()
         if native is None:
