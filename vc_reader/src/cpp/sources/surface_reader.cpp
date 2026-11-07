@@ -366,9 +366,14 @@ std::optional<Patch> patchOf(Geometry& geom, const Pair& start, const Pair& size
     const auto c0 = std::max<std::int64_t>(0, std::int64_t(std::floor(minX))), c1 = std::min<std::int64_t>(cols, std::int64_t(std::floor(maxX)) + 2);
     const auto r0 = std::max<std::int64_t>(0, std::int64_t(std::floor(minY))), r1 = std::min<std::int64_t>(rows, std::int64_t(std::floor(maxY)) + 2);
     if (c1 - c0 < 2 || r1 - r0 < 2) return std::nullopt;
+    // Two more vertices around the window: the Hermite derivatives of its cells (centred
+    // differences, one sided only at the grid's own border or next to a hole) then equal
+    // the whole grid's, so a patch renders as the same pixels of any larger patch.
+    const auto hc0 = std::max<std::int64_t>(0, c0 - 2), hc1 = std::min<std::int64_t>(cols, c1 + 2);
+    const auto hr0 = std::max<std::int64_t>(0, r0 - 2), hr1 = std::min<std::int64_t>(rows, r1 + 2);
     Patch patch;
-    patch.tile = geom.tile({r0, c0}, {r1 - r0, c1 - c0});
-    patch.raster = grid::Raster{x0 - double(c0), y0 - double(r0), sx, sy, int(size[1]), int(size[0]), kx, ky};
+    patch.tile = geom.tile({hr0, hc0}, {hr1 - hr0, hc1 - hc0});
+    patch.raster = grid::Raster{x0 - double(hc0), y0 - double(hr0), sx, sy, int(size[1]), int(size[0]), kx, ky};
     return patch;
 }
 // The vcr::grid surface over a tile's vertices: normals in the surface's physical space.
