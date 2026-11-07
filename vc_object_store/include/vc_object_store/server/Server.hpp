@@ -47,7 +47,14 @@ struct ServerOptions {
     std::size_t maxResponseBytes = 64u << 20;
     // Array reads are refused (503) while unsent response bytes exceed this.
     std::size_t maxResponseBytesInFlight = 512u << 20;
-    std::chrono::seconds requestDeadline{300}; // per request read/write on a connection
+    // Per request read/write on a connection. A link_objects request answers
+    // only when its detection is done, so a service that takes them sets this
+    // above the longest expected link (vc_object_server --request-deadline).
+    std::chrono::seconds requestDeadline{300};
+    // Where link_objects keeps the fiber strip cache between requests
+    // (vc_object_server --strip-cache); empty keeps strips in memory. Client
+    // requests may not name a cache directory of their own.
+    std::filesystem::path linkScratchDirectory;
     // WAL upkeep on the writer lane between transactions: a passive
     // checkpoint every interval (zero disables), then a truncating one when
     // everything was copied but the WAL file is larger than walTruncateBytes.

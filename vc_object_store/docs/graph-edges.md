@@ -216,6 +216,45 @@ vc_object_links --db objects.vcobj --author "$USER" --link-fiber-surfaces --ct /
 vc_object_links --db objects.vcobj --author "$USER" --link-track-surfaces --ct /data/ct.zarr
 ```
 
+### Linking as a checked request: `link_objects`
+
+A `link_objects` operation ([object_links/LinkObjects.hpp](../include/vc_object_store/object_links/LinkObjects.hpp))
+runs an ordered plan of detectors and publishes every link they found,
+together with the store's **link marker**, in one commit — on a local store
+and through `vc_object_server` alike, so a client of a served store never
+runs a detector itself. The request is *prepared* before the writer lock is
+taken (`ObjectStore::prepare`: the detection, over one read snapshot) and
+committed by `submit` expecting every object the detectors read at the
+version they read: a commit touching one of them in between is an ordinary
+`TransactionConflict` and nothing is written; an unrelated commit does not
+interfere. The writer is held only for the publication, as with the
+standalone detectors. An identical retry replays the saved receipt.
+
+```python
+plan = {"detectors": [
+            {"detector": "point-collection-surface", "params": {"tolerance": 2.5}},
+            {"detector": "fiber-surface", "ct_volume": "/data/ct.zarr",
+             "params": {"fiber_uuids": [...], "surface_uuids": [...], "ct_level": 1}},
+            {"detector": "surface-overlap", "params": {}}],
+        "marker": {"key": "..."}}                       # kept in the marker's metadata
+request = {..., "operations": [{"op": vos.LINK_OBJECTS_OPERATION, "plan": plan}]}
+receipt = store.submit(request, progress=lambda stage, done, total, detail: ...)   # local: detectors run here
+receipt = hosted.submit(request)                                                  # served: they run on the service
+marker = store.object_by_uuid(vos.link_marker_uuid())    # kind LINK_MARKER_KIND
+```
+
+`params` take the keyword names of the Python detector calls below; the
+line–surface detectors name their normal source as `ct_volume`. The link
+marker is one object per store: its metadata is the plan's `marker` content
+plus `commit_sequence` (the links' commit) and `detectors` (each step with
+its `report` and whether it `published`), so a client reads it like any
+object to decide whether the links are current. Two link runs prepared over
+the same state conflict on the marker. On a served store the detectors read
+their CT or Lasagna normals where the service runs, the strip cache is the
+service's own (`vc_object_server --strip-cache`), and a request naming a
+`cache_directory` is refused; the service's `--request-deadline` must exceed
+the longest link, since the reply comes when the detection is done.
+
 | Detector (`meta.detector.name`) | Pairs | Default edge kind | Notes |
 | --- | --- | --- | --- |
 | `surface-overlap` | surface ↔ surface | `same-surface` | 3D correspondences, robust UV-pose RANSAC/refit, dense overlap agreement. Key params: `tolerance=2.0`, `sample_spacing=4.0`, `uv_inlier_tolerance=3.0`, `min_inliers=32`, `min_major_spread=20`, `min_minor_spread=5`, `max_refit_rms=2.0`, `min_agreement_ratio=0.6` |

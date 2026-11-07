@@ -22,7 +22,12 @@ is **no authentication** — keep the default loopback listen address behind an
 SSH tunnel, or listen (`--listen`) only on a trusted private network.
 `--read-workers`, `--max-payload-mib`, `--max-staged-mib`, and `--staging-dir`
 bound its queues and staged uploads; a full queue answers 503 with
-`Retry-After`, which clients retry. `GET /v1/service` reports connection,
+`Retry-After`, which clients retry. A `link_objects` request
+([graph edges](graph-edges.md#linking-as-a-checked-request-link_objects))
+runs its detectors on a read worker and queues only their commit to the
+writer; it answers when the detection is done, so `--request-deadline`
+(default 300 s) must exceed the longest link, and `--strip-cache DIR` keeps
+the fiber strips between such requests. `GET /v1/service` reports connection,
 queue, staging, and WAL-checkpoint state. In VC3D: Stores → Attach Hosted
 Store...
 
@@ -232,7 +237,7 @@ bytes, `Content-Length` required; 400 hash/length mismatch, 411 no length,
 | --- | --- |
 | `GET /v1/status` | store, generation, commit sequence, feed start |
 | `GET /v1/service` | connections, queue depths, staging use, WAL checkpoints |
-| `POST /v1/transactions` (request JSON) | receipt; 409 conflict; 422 `missing` payload hashes; 400 invalid |
+| `POST /v1/transactions` (request JSON) | receipt; 409 conflict; 422 `missing` payload hashes; 400 invalid. A request with a `link_objects` operation is prepared on a read worker first |
 | `GET /v1/receipts/{request}` | saved receipt or 404 |
 | `GET /v1/changes?store&generation&sequence&offset&max` | feed page |
 | `GET /v1/objects/{uuid}` | current revision + snapshot status |

@@ -9,6 +9,9 @@
 #include "vc_object_store/objects/Artifacts.hpp"
 #include "vc_object_store/objects/ObjectStore.hpp"
 #include "vc_object_store/objects/TransactionJson.hpp"
+#if VC_OBJECT_SERVER_LINKING
+#include "vc_object_store/object_links/LinkObjects.hpp"
+#endif
 
 #include <boost/asio.hpp>
 #include <boost/beast/core.hpp>
@@ -383,8 +386,16 @@ struct ServerState {
         return ObjectStore::open(path, open);
     }
 
+    static ObjectStore openWithLinking(const std::filesystem::path& path, const ServerOptions& options)
+    {
+#if VC_OBJECT_SERVER_LINKING
+        object_links::enableLinkObjects();
+#endif
+        return openOwned(path, options);
+    }
+
     ServerState(const std::filesystem::path& path, ServerOptions o)
-        : options(std::move(o)), store(openOwned(path, options)),
+        : options(std::move(o)), store(openWithLinking(path, options)),
           staging(stagingDirectory(path, options), options.maxStagedBytes, options.stagingLifetime), acceptor(io)
     {
         const tcp::endpoint endpoint(net::ip::make_address(options.listenAddress), options.port);
@@ -462,6 +473,40 @@ struct ServerState {
     {
         const auto receipt = store->submit(body, [this](const std::string& hash) { return staging.get(hash); });
         return jsonReply(transactionReceiptToJson(receipt));
+    }
+
+    // A request with a prepared operation (link_objects): its preparation
+    // (the detection) runs here, on a read worker; the checked write is then
+    // queued to the writer like any transaction, which holds the writer lane
+    // only for the commit. A request whose payloads are not all staged takes
+    // the ordinary path (a saved receipt or the missing hashes answer it).
+    void submitPrepared(const std::shared_ptr<std::string>& body, const std::function<void(Reply)>& done)
+    {
+        auto request = std::make_shared<TransactionRequest>();
+        auto prepared = std::make_shared<PreparedOperations>();
+        bool ready = false, unstaged = false;
+        const auto reply = guarded([&] {
+            TransactionPayloads payloads;
+            for (const auto& hash : transactionJsonPayloadHashes(*body)) {
+                auto bytes = staging.get(hash);
+                if (!bytes) { unstaged = true; return Reply{}; }
+                payloads.emplace(hash, std::move(*bytes));
+            }
+            *request = transactionRequestFromJson(*body, payloads);
+            PrepareOptions prepare;
+            prepare.localPaths = false;
+            prepare.scratchDirectory = options.linkScratchDirectory;
+            *prepared = store->prepare(*request, prepare);
+            ready = true;
+            return Reply{};
+        });
+        if (!ready && !unstaged) { done(reply); return; }
+        std::function<void()> commit;
+        if (unstaged) commit = [this, body, done] { done(guarded([&] { return submit(*body); })); };
+        else commit = [this, request, prepared, done] {
+            done(guarded([&] { return jsonReply(transactionReceiptToJson(store->submit(*request, *prepared))); }));
+        };
+        if (!writer->tryPost(commit)) done(errorReply(http::status::service_unavailable, "server busy; retry"));
     }
 
     Reply changes(const Target& target)
@@ -666,6 +711,9 @@ struct ServerState {
         Lane* lane = nullptr;
         std::function<Reply()> work;
         bool busy = false;
+        // Set instead of `work` for a request that answers from another lane
+        // (submitPrepared): runs on `lane` and calls done when it has a reply.
+        std::function<void(std::function<void(Reply)>)> continued;
     };
 
     Route route(const Request& request)
@@ -688,8 +736,15 @@ struct ServerState {
         if (method == http::verb::get && is({"v1", "service"})) return {control.get(), [this] { return service(); }};
         if (method == http::verb::get && is({"v1", "receipts", "*"}))
             return {control.get(), [this, target] { return receipt(target->path[2]); }};
-        if (method == http::verb::post && is({"v1", "transactions"}))
+        if (method == http::verb::post && is({"v1", "transactions"})) {
+            if (transactionJsonHasPreparedOperations(*body)) {
+                Route route;
+                route.lane = readers.get();
+                route.continued = [this, body](std::function<void(Reply)> done) { submitPrepared(body, done); };
+                return route;
+            }
             return {writer.get(), [this, body] { return submit(*body); }};
+        }
         if (method == http::verb::get && is({"v1", "changes"}))
             return {readers.get(), [this, target] { return changes(*target); }};
         if (method == http::verb::get && is({"v1", "objects", "*"}))
@@ -774,7 +829,9 @@ struct ServerState {
             done(errorReply(http::status::not_found, "unknown endpoint"));
             return;
         }
-        auto job = [work = std::move(r.work), done]() mutable { done(guarded(work)); };
+        std::function<void()> job;
+        if (r.continued) job = [continued = std::move(r.continued), done] { continued(done); };
+        else job = [work = std::move(r.work), done] { done(guarded(work)); };
         if (!r.lane->tryPost(job)) done(errorReply(http::status::service_unavailable, "server busy; retry"));
     }
 

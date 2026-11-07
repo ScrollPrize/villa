@@ -1,3 +1,4 @@
+#include "linking/Detectors.hpp"
 #include "linking/StoredGeometry.hpp"
 #include "vc_object_store/geometry/Geometry.hpp"
 #include "vc_object_store/object_links/ObjectLinks.hpp"
@@ -146,7 +147,7 @@ std::array<double, 3> projection(const Surface& surface, double row, double col,
 }
 } // namespace
 
-DetectorReport linkPointCollectionsToSurfaces(objects::ObjectStore& db,
+detail::Detection detail::detectPointCollectionsToSurfaces(StoredGeometry& inputs,
     const PointCollectionSurfaceParams& params, const std::atomic_bool* cancel)
 {
     if (!(params.tolerance > 0) || !std::isfinite(params.tolerance) || params.tolerance > std::numeric_limits<float>::max() ||
@@ -156,7 +157,6 @@ DetectorReport linkPointCollectionsToSurfaces(objects::ObjectStore& db,
         throw std::invalid_argument("point-collection-surface: invalid tolerance, scale, window or edge kind");
     checkCancelled(cancel);
     objects::util::reportProgress(params.progress, "loading point collections");
-    detail::StoredGeometry inputs(db);
     auto collections = loadCollections(inputs, params, cancel);
     auto surfaces = loadSurfaces(inputs, params, cancel);
     std::map<std::string, size_t> byName;
@@ -235,14 +235,20 @@ DetectorReport linkPointCollectionsToSurfaces(objects::ObjectStore& db,
         }
     }
     checkCancelled(cancel);
-    auto txn = db.write();
-    auto report = detail::commitStoredCandidates(db, inputs, txn, kPointCollectionSurfaceDetector, 1, candidates,
-        params.replaceStalePending, &scope, params.progress);
-    checkCancelled(cancel);
-    objects::util::reportProgress(params.progress, "committing point-collection links");
-    checkCancelled(cancel);
-    txn.commit();
-    report.objectsConsidered = int64_t(collections.size() + surfaces.size());
-    return report;
+    Detection detection;
+    detection.detector = kPointCollectionSurfaceDetector; detection.version = 1;
+    detection.candidates = std::move(candidates);
+    detection.scope = std::move(scope);
+    detection.replaceStalePending = params.replaceStalePending;
+    detection.report.objectsConsidered = int64_t(collections.size() + surfaces.size());
+    return detection;
+}
+
+DetectorReport linkPointCollectionsToSurfaces(objects::ObjectStore& db,
+    const PointCollectionSurfaceParams& params, const std::atomic_bool* cancel)
+{
+    detail::StoredGeometry inputs(db);
+    const auto detection = detail::detectPointCollectionsToSurfaces(inputs, params, cancel);
+    return detail::publishDetection(db, inputs, detection, params.progress, cancel);
 }
 } // namespace vc::object_links

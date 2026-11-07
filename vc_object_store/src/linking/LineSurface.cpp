@@ -688,14 +688,17 @@ void validateLineSurfaceParams(const LineSurfaceParams& params, double sourceSca
         throw std::invalid_argument("graph links: invalid source coordinate scale");
 }
 
-DetectorReport linkLinesToSurfaces(objects::ObjectStore& db, StoredGeometry& inputs, size_t lineCount, const LineLoader& load,
+Detection detectLinesToSurfaces(StoredGeometry& inputs, size_t lineCount, const LineLoader& load,
     const std::filesystem::path& ctVolume,
     const LineSurfaceParams& params, double sourceScale, const char* detector, int version,
     const std::atomic_bool* cancel)
 {
     validateLineSurfaceParams(params, sourceScale);
     const bool tracks = std::string(detector) == kTrackSurfaceDetector;
-    DetectorReport report;
+    Detection detection;
+    detection.detector = detector; detection.version = version;
+    detection.replaceStalePending = params.replaceStalePending;
+    DetectorReport& report = detection.report;
     try {
         checkCancelled(cancel);
         objects::util::reportProgress(params.progress, "opening normal source");
@@ -875,22 +878,30 @@ DetectorReport linkLinesToSurfaces(objects::ObjectStore& db, StoredGeometry& inp
         }
         checkCancelled(cancel);
         objects::util::reportProgress(params.progress, linkingStage, lineCount, lineCount);
-        auto txn = db.write();
-        checkCancelled(cancel);
-        const auto committed = commitStoredCandidates(db, inputs, txn, detector, version, candidates, params.replaceStalePending, &scope, params.progress);
-        checkCancelled(cancel);
-        objects::util::reportProgress(params.progress, "committing links");
-        txn.commit();
-        report.candidatesFound = committed.candidatesFound;
-        report.edgesCreated = committed.edgesCreated;
-        report.edgesUpdated = committed.edgesUpdated;
-        report.edgesSkippedExisting = committed.edgesSkippedExisting;
-        report.staleRemoved = committed.staleRemoved;
+        detection.candidates = std::move(candidates);
+        detection.scope = scope;
     } catch (const std::exception&) {
         if (!cancel || !cancel->load()) throw;
         report.problems.push_back(std::string(detector) + ": cancelled; no edges committed");
+        detection.publish = false;
     }
-    return report;
+    return detection;
+}
+
+DetectorReport linkLinesToSurfaces(objects::ObjectStore& db, StoredGeometry& inputs, size_t lineCount, const LineLoader& load,
+    const std::filesystem::path& ctVolume,
+    const LineSurfaceParams& params, double sourceScale, const char* detector, int version,
+    const std::atomic_bool* cancel)
+{
+    const auto detection = detectLinesToSurfaces(inputs, lineCount, load, ctVolume, params, sourceScale, detector, version, cancel);
+    try {
+        return publishDetection(db, inputs, detection, params.progress, cancel);
+    } catch (const std::exception&) {
+        if (!cancel || !cancel->load()) throw;
+        auto report = detection.report;
+        report.problems.push_back(std::string(detector) + ": cancelled; no edges committed");
+        return report;
+    }
 }
 
 }  // namespace vc::object_links::detail
