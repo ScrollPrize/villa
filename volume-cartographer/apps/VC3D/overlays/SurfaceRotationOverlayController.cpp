@@ -313,9 +313,10 @@ void SurfaceRotationOverlayController::beginRotate()
         return;
     }
 
+    const auto sourceSurfaceId = _state->activeSurfaceId();
     cancelRotate();
     _sourceSurface = std::move(source);
-    _sourceSurfaceId = _state->activeSurfaceId();
+    _sourceSurfaceId = sourceSurfaceId;
     _angleDeg = 0.0;
     _horizontalFlip = false;
     _rotateActive = true;
