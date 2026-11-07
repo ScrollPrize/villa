@@ -107,12 +107,13 @@ inline void gamma_values(std::vector<T>& v, const ChannelPlan& p, Statistics&& s
     const auto [low, high] = bounds(v); double range = high - low;
     for (auto& x : v) {
         auto unit = (x-T(low))/std::max(T(range),T(t.eps));
-        if (t.clip) unit = std::clamp(unit, T(0), T(1));
+        // Voxels below the (masked) minimum would give pow of a negative base: NaN.
+        unit = t.clip ? std::clamp(unit, T(0), T(1)) : std::max(unit, T(0));
         T value=std::pow(unit,T(p.values[0]))*T(range)+T(low);
         if constexpr(std::is_same_v<T,float>) if(!std::isfinite(value) || !std::isfinite(T(range)))
             {
                 double wide = (double(x)-low)/std::max(range,t.eps);
-                if (t.clip) wide = std::clamp(wide, 0., 1.);
+                wide = t.clip ? std::clamp(wide, 0., 1.) : std::max(wide, 0.);
                 value=T(std::pow(wide,p.values[0])*range+low);
             }
         x=value;
