@@ -13,7 +13,8 @@ const usd = new Intl.NumberFormat("en-US", {
 const contacts = [
   {
     need: "Press & media, use of images",
-    who: "press@scrollprize.org",
+    who: "Christy Chapman",
+    role: "Media & Communications Manager",
     href: "mailto:press@scrollprize.org",
   },
   {
