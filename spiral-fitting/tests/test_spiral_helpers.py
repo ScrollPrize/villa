@@ -24,6 +24,7 @@ from fit_spiral import (
     get_run_dt_resume_iteration,
     materialize_fiber_fit_inputs,
 )
+from losses import get_unattached_pcl_radius_margin
 from tifxyz import load_tifxyz
 
 
@@ -74,6 +75,19 @@ class RunDtLossScheduleTests(unittest.TestCase):
         self.assertEqual(get_unattached_pcl_dt_start(decoupled), 0)
         self.assertTrue(get_dt_loss_eligibility(decoupled, 1)['unattached_pcl'])
         self.assertFalse(get_dt_loss_eligibility(decoupled, 1)['verified_patch'])
+
+
+class UnattachedPclRadiusMarginTests(unittest.TestCase):
+    def test_margin_follows_patch_margin_when_unset(self):
+        cfg = Config({'patch_radius_loss_margin': 0.05}).as_dict()
+        self.assertIsNone(cfg['unattached_pcl_radius_loss_margin'])
+        self.assertEqual(get_unattached_pcl_radius_margin(cfg), 0.05)
+
+    def test_margin_decouples_from_patch_margin(self):
+        cfg = Config({'patch_radius_loss_margin': 0.05,
+                      'unattached_pcl_radius_loss_margin': 0.3}).as_dict()
+        self.assertEqual(get_unattached_pcl_radius_margin(cfg), 0.3)
+        self.assertEqual(cfg['patch_radius_loss_margin'], 0.05)
 
 
 class FiberPointCollectionTests(unittest.TestCase):

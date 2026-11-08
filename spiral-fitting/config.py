@@ -31,6 +31,7 @@ _NULL_TYPES = {
     "track_max_tortuosity": "number",
     "loss_start_track_dt": "integer",
     "loss_start_unattached_pcl_dt": "integer",
+    "unattached_pcl_radius_loss_margin": "number",
     "patch_uuid_filter_regex": "string",
 }
 
@@ -587,6 +588,7 @@ class Config:
         self.loss_weight_rel_winding = 5.0
         self.loss_weight_abs_winding = 5.0
         self.loss_weight_unattached_pcl_radius = 2.0
+        self.unattached_pcl_radius_loss_margin = None
         self.loss_weight_unattached_pcl_dt = 4.0
         # Probability of hopping onto the linked fiber at each junction while
         # sampling a chain walk through a link component in the
