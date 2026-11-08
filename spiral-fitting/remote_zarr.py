@@ -1,11 +1,14 @@
-"""Reading Zarr v2 arrays over HTTP(S): objects with retries, JSON
-metadata, and the chunk indices an anonymous virtual-hosted S3 bucket lists.
-Local paths read the same way, so callers treat both alike."""
+"""Remote Zarr v2 arrays. Whole-array copies go through vc_reader
+(mirror_array). The chunk-level helpers (objects with retries, JSON metadata
+and the chunk indices an anonymous virtual-hosted S3 bucket lists in a z
+range) serve fiber_direction_samples, which fetches a subset of the chunks;
+local paths read the same way, so callers treat both alike."""
 
 from __future__ import annotations
 
 from pathlib import Path
 import json
+import re
 import time
 from urllib.parse import unquote, urlparse
 import xml.etree.ElementTree as ET
@@ -99,79 +102,77 @@ def list_s3_chunk_indices(session, array_url, metadata, first_chunk, last_chunk)
     return result
 
 
+# ---------------------------------------------------------------------------
+# Whole-array copies, through vc_reader
+# ---------------------------------------------------------------------------
+
 _MIRRORED = ".vc-mirrored"
+_VIRTUAL_HOSTED = re.compile(r"^(?P<bucket>[^./]+)\.s3(?:\.(?P<region>[^./]+))?\.amazonaws\.com$")
 
 
-def mirror_array(array_url, directory, *, workers=16, progress=None, session_factory=None):
-    """Copy the Zarr v2 array at ``array_url`` (an anonymous virtual-hosted
-    S3 URL) into the directory Zarr ``directory``, byte for byte: its
-    metadata and every chunk its bucket lists. Interrupted copies resume:
-    chunks already written whole are kept. ``progress(done, total)`` is
-    called as chunks arrive. Returns ``directory``."""
-    from concurrent.futures import ThreadPoolExecutor
-    import threading
+def listable_location(location):
+    """``location`` as vc_reader lists it (its ``s3://`` or ``s3+REGION://``
+    form), or None when its objects cannot be listed: an ``s3://`` or
+    ``s3+REGION://`` location as given, a virtual-hosted Amazon S3 URL
+    (``https://BUCKET.s3[.REGION].amazonaws.com/KEY``) by bucket and region,
+    and nothing else (plain HTTP has no listing)."""
+    location = str(location).strip().rstrip("/")
+    if location.startswith(("s3://", "s3+")):
+        return location
+    parsed = urlparse(location)
+    if parsed.scheme not in ("http", "https") or not parsed.hostname:
+        return None
+    match = _VIRTUAL_HOSTED.match(parsed.hostname)
+    if not match:
+        return None
+    scheme = f"s3+{match['region']}" if match["region"] else "s3"
+    return f"{scheme}://{match['bucket']}/{unquote(parsed.path).lstrip('/')}"
 
-    import requests
 
-    session_factory = session_factory or requests.Session
-    directory = Path(directory)
+def is_listable(location):
+    """Whether vc_reader can list the objects of the array at ``location``,
+    and so copy it whole (listable_location)."""
+    return listable_location(location) is not None
+
+
+def access_for(location):
+    """How ``location`` is reached (vc_reader.reader.auth.resolve_access,
+    "auto"): anonymous, except an ``s3://`` bucket outside the Open Data
+    channels when the environment has AWS credentials. Tests replace it."""
+    from vc_reader.reader.auth import resolve_access
+
+    return resolve_access(str(location), "auto")
+
+
+def mirror_array(array_url, cache_directory, *, workers=16, progress=None, access=None):
+    """Copy the Zarr array at ``array_url`` (is_listable) byte for byte into
+    vc_reader's cache layout under ``cache_directory`` (``_reader.
+    download_prefix``: every object the bucket lists, with no byte budget,
+    so nothing evicts it; objects already there are kept, so an interrupted
+    copy resumes). Returns the array's directory. ``progress(done, total)``
+    is called as objects arrive; ``access`` replaces access_for's."""
+    from vc_reader import _reader
+
+    location = listable_location(array_url)
+    if location is None:
+        raise ValueError(f"{array_url}: its objects cannot be listed; only s3:// arrays and "
+                         "virtual-hosted Amazon S3 URLs are fetched")
+    access = access or access_for(location)
+    directory = Path(_reader.decoded_cache_path(str(cache_directory), access.cache_url(location)))
     if (directory / _MIRRORED).is_file():
         return str(directory)
-    url = str(array_url).rstrip("/")
-    with session_factory() as session:
-        metadata = get_json(session, f"{url}/.zarray")
-        shape, chunks = metadata["shape"], metadata["chunks"]
-        last = tuple(-(-int(s) // int(c)) - 1 for s, c in zip(shape, chunks))
-        indices = list_s3_chunk_indices(session, url, metadata, (0, 0, 0), last)
-        if indices is None:
-            raise ValueError(f"{url}: its chunks cannot be listed; only arrays in an "
-                             "anonymous virtual-hosted S3 bucket are fetched")
-        directory.mkdir(parents=True, exist_ok=True)
-        for name in (".zarray", ".zattrs"):
-            content = fetch(session, f"{url}/{name}")
-            if content is not None:
-                _write_whole(directory / name, content)
-    separator = metadata.get("dimension_separator", ".")
-    missing = [index for index in sorted(indices)
-               if not (directory / separator.join(map(str, index))).is_file()]
-    done = len(indices) - len(missing)
-    lock = threading.Lock()
-    local = threading.local()
-    sessions = []
-    if progress is not None:
-        progress(done, len(indices))
+    workers = max(1, int(workers))
+    options = _reader.OpenOptions(access, [str(cache_directory)], True, None, False, False,
+                                  None, 1, workers, "mmap", False)
 
-    def copy(index):
-        nonlocal done
-        session = getattr(local, "session", None)
-        if session is None:
-            session = local.session = session_factory()
-            with lock:
-                sessions.append(session)
-        content = fetch(session, chunk_url(url, index, metadata))
-        if content is None:
-            raise ValueError(f"{url}: listed chunk {index} is missing")
-        _write_whole(directory / separator.join(map(str, index)), content)
-        with lock:
-            done += 1
-            if progress is not None:
-                progress(done, len(indices))
+    def report(state):
+        if progress is not None and state.status == "downloading":
+            progress(state.completed_files, state.total_files)
 
-    try:
-        with ThreadPoolExecutor(max_workers=max(1, int(workers))) as pool:
-            for _ in pool.map(copy, missing):
-                pass
-    finally:
-        for session in sessions:
-            session.close()
-    (directory / _MIRRORED).write_text(f"{url}\n")
+    result = _reader.download_prefix(location, options, workers=workers, progress=report)
+    if result.error:
+        raise ValueError(f"{array_url}: {result.error}")
+    if not (directory / ".zarray").is_file():
+        raise ValueError(f"{array_url}: the fetched objects hold no .zarray (not a Zarr v2 array?)")
+    (directory / _MIRRORED).write_text(f"{location}\n")
     return str(directory)
-
-
-def _write_whole(path, content):
-    import os
-
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(path.name + ".partial")
-    temporary.write_bytes(content)
-    os.replace(temporary, path)

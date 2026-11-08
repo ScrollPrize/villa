@@ -1,55 +1,89 @@
-"""A requests.Session stand-in serving a local directory as an anonymous
-virtual-hosted S3 bucket: objects by URL, and ListObjectsV2 listings."""
+"""A loopback HTTP server standing in for an S3-compatible endpoint: the
+files of a local directory as the objects of one bucket (path-style URLs),
+with ListObjectsV2 listings. Request signatures are not checked, so any
+fixed keys reach it (FakeS3Server.access)."""
 
+import http.server
 from pathlib import Path
-from urllib.parse import urlparse
+import threading
+from urllib.parse import parse_qsl, quote, unquote, urlparse
 from xml.sax.saxutils import escape
 
-BUCKET = "https://bucket.s3.example.com"
+BUCKET = "bucket"
 
 
-class Response:
-    def __init__(self, status_code, content=b""):
-        self.status_code = status_code
-        self.content = content
+class _Handler(http.server.BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+    root: Path
+    gets: list
 
-    def json(self):
-        import json
-        return json.loads(self.content)
+    def log_message(self, *args):
+        pass
 
-    def raise_for_status(self):
-        if self.status_code >= 400:
-            raise RuntimeError(f"HTTP {self.status_code}")
+    def _respond(self, status, body=b""):
+        self.send_response(status)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        if self.command != "HEAD":
+            self.wfile.write(body)
+
+    def do_HEAD(self):
+        self.do_GET()
+
+    def do_GET(self):
+        parsed = urlparse(self.path)
+        key = unquote(parsed.path).removeprefix(f"/{BUCKET}").lstrip("/")
+        query = dict(parse_qsl(parsed.query, keep_blank_values=True))
+        if query.get("list-type") == "2":
+            prefix = query.get("prefix", "")
+            keys = sorted(str(path.relative_to(self.root)) for path in self.root.rglob("*")
+                          if path.is_file() and str(path.relative_to(self.root)).startswith(prefix))
+            contents = "".join(
+                f"<Contents><Key>{escape(quote(key))}</Key>"
+                f"<Size>{(self.root / key).stat().st_size}</Size></Contents>" for key in keys)
+            return self._respond(200, (
+                '<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">'
+                f"<EncodingType>url</EncodingType>{contents}"
+                "<IsTruncated>false</IsTruncated></ListBucketResult>").encode())
+        self.gets.append(key)
+        path = self.root / key
+        if path.is_file():
+            return self._respond(200, path.read_bytes())
+        self._respond(404, b"<Error><Code>NoSuchKey</Code></Error>")
 
 
-class FakeS3Session:
-    """Serves ``root`` at BUCKET; ``gets`` counts object requests."""
+class FakeS3Server:
+    """Serves ``root`` as bucket BUCKET on a loopback port; ``gets`` records
+    the keys of object requests."""
 
     def __init__(self, root, gets=None):
-        self.root = Path(root)
-        self.gets = gets if gets is not None else []
+        handler = type("Handler", (_Handler,),
+                       {"root": Path(root), "gets": gets if gets is not None else []})
+        self.gets = handler.gets
+        self.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+
+    @property
+    def endpoint(self):
+        return f"http://127.0.0.1:{self.server.server_address[1]}"
+
+    def location(self, key=""):
+        """The ``s3://`` location of ``key`` in the bucket."""
+        return f"s3://{BUCKET}/{key}".rstrip("/")
+
+    def access(self):
+        """A vc_reader Access reaching this server for the bucket."""
+        from vc_reader import _reader
+        return _reader.s3_access(self.location(), "key", "secret", "", "us-east-1", self.endpoint)
+
+    def close(self):
+        self.server.shutdown()
+        self.thread.join()
+        self.server.server_close()
 
     def __enter__(self):
         return self
 
     def __exit__(self, *exc):
         self.close()
-
-    def close(self):
-        pass
-
-    def get(self, url, params=None, timeout=None):
-        parsed = urlparse(url)
-        key = parsed.path.lstrip("/")
-        if params and params.get("list-type") == "2":
-            prefix = params["prefix"]
-            keys = sorted(str(path.relative_to(self.root)) for path in self.root.rglob("*")
-                          if path.is_file()
-                          and str(path.relative_to(self.root)).startswith(prefix))
-            body = "".join(f"<Contents><Key>{escape(k)}</Key></Contents>" for k in keys)
-            return Response(200, (
-                '<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">'
-                f"{body}<IsTruncated>false</IsTruncated></ListBucketResult>").encode())
-        self.gets.append(key)
-        path = self.root / key
-        return Response(200, path.read_bytes()) if path.is_file() else Response(404)

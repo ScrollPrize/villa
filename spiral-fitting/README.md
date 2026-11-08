@@ -606,16 +606,19 @@ service packs them like local arrays; once packed, the cached arrays are no
 longer read.
 
 A service on another host is given the arrays' URLs. It fetches each array
-whole into its cache beside the pack it builds (`<pack>.arrays/`), packs it,
-and removes the copy; an interrupted fetch resumes from the chunks already
-there. Only arrays in an anonymous virtual-hosted S3 bucket (an
-`https://<bucket>.s3.<region>.amazonaws.com/...` URL, as open data is) can be
-listed and fetched. The copy needs the arrays' full size on the service host's
-disk while the pack is built.
+whole, through vc_reader (`download_prefix`), into its cache beside the pack
+it builds (`<pack>.arrays/`, in vc_reader's cache layout), packs it, and
+removes the copy; an interrupted fetch resumes from the objects already
+there. Only arrays whose objects S3 lists can be fetched: `s3://` locations
+(anonymous for open data; otherwise with the AWS credentials of the
+service's environment) and virtual-hosted Amazon S3 URLs
+(`https://<bucket>.s3[.<region>].amazonaws.com/...`, read anonymously). The
+copy needs the arrays' full size on the service host's disk while the pack
+is built.
 
 For a service launched with `--require-prepared-lasagna-packs`, or arrays it
-cannot fetch (`s3://` URLs, private buckets, servers that do not list), pack
-where the arrays are and copy the packs over:
+cannot fetch (plain HTTP servers, which do not list), pack where the arrays
+are and copy the packs over:
 
 ```sh
 python pack_resident_pools.py /path/to/dataset.lasagna.json \

@@ -2130,13 +2130,14 @@ class ServiceState:
 
     def _prepare_lasagna_packs(self, paths, config):
         """Unless it requires prepared packs, a host builds missing pools
-        before linking: from local arrays, or from HTTP(S) ones it first
+        before linking: from local arrays, or from remote ones whose objects
+        vc_reader lists (s3://, or a virtual-hosted Amazon S3 URL) and first
         fetches whole into the cache (beside the pack, removed once it is
         built; an interrupted fetch resumes)."""
         if not self.build_missing_lasagna_packs or not paths.lasagna:
             return
         from lasagna_source import is_remote_location
-        from remote_zarr import is_http
+        from remote_zarr import is_listable
         source = load_lasagna_source(paths.lasagna)
         kinds = _lasagna_pack_kinds(config, source)
         if not kinds:
@@ -2146,10 +2147,11 @@ class ServiceState:
                     source.pack_directory(paths.cache_directory, kind), "meta.json")):
                 continue
             for array in source.arrays(kind):
-                if is_remote_location(array) and not is_http(array):
+                if is_remote_location(array) and not is_listable(array):
                     raise ValueError(
-                        f"Cannot build missing Lasagna {kind} pack: {array} is "
-                        "neither local nor HTTP(S). Prepare the pack where the "
+                        f"Cannot build missing Lasagna {kind} pack: {array} is remote "
+                        "and its objects cannot be listed (not an s3:// location or a "
+                        "virtual-hosted Amazon S3 URL). Prepare the pack where the "
                         "arrays are and copy it into the service cache.")
                 if not is_remote_location(array) and not os.path.isdir(array):
                     raise ValueError(
@@ -3842,23 +3844,24 @@ def _route_upload_file(ctx):
 
 @contextlib.contextmanager
 def _fetched_lasagna_arrays(arrays, sidecar, progress):
-    """``arrays`` made local for building ``sidecar``: each HTTP(S) one
-    fetched whole into ``<sidecar>.arrays/<i>``, removed once the pack is
-    built and kept, to resume, when building fails."""
+    """``arrays`` made local for building ``sidecar``: each remote one
+    fetched whole into ``<sidecar>.arrays`` (vc_reader's cache layout,
+    remote_zarr.mirror_array), removed once the pack is built and kept, to
+    resume, when building fails."""
     from lasagna_source import is_remote_location
     from remote_zarr import mirror_array
 
     root = Path(f"{sidecar}.arrays")
     local = []
-    for index, array in enumerate(arrays):
+    for array in arrays:
         if not is_remote_location(array):
             local.append(array)
             continue
         if progress is not None:
             progress.begin("fetching", "Fetching remote Lasagna arrays", step=0,
-                           total_steps=0, unit="chunks", detail=array)
+                           total_steps=0, unit="objects", detail=array)
         local.append(mirror_array(
-            array, root / str(index), workers=FETCH_WORKERS,
+            array, root, workers=FETCH_WORKERS,
             progress=(None if progress is None else
                       lambda done, total: progress.update(done, total_steps=total))))
     yield local

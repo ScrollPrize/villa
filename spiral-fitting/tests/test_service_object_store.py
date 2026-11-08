@@ -663,10 +663,10 @@ def test_a_launched_service_builds_missing_packs_unless_told_not_to(
 
 
 def test_a_service_packs_remote_arrays_as_it_packs_local_ones(host, store_path, tmp_path,
-                                                             monkeypatch):
+                                                             monkeypatch, request):
     import numpy as np
-    import requests
-    from fake_s3 import BUCKET, FakeS3Session
+    from fake_s3 import FakeS3Server
+    import remote_zarr
     from test_sparse_cuda_cache import write_raw_pack_source
 
     channels = ('normal_x', 'normal_y', 'gradient_magnitude')
@@ -678,9 +678,10 @@ def test_a_service_packs_remote_arrays_as_it_packs_local_ones(host, store_path, 
         return {'location': '/client/remote_cache/s.lasagna.json', 'identity': identity,
                 'group': '0', **{channel: f'{root}/{channel}' for channel in channels}}
     local = lasagna('local-copy', tmp_path / 'bucket')
-    remote = lasagna('remote-copy', BUCKET)
-    gets = []
-    monkeypatch.setattr(requests, 'Session', lambda: FakeS3Session(tmp_path / 'bucket', gets))
+    s3 = FakeS3Server(tmp_path / 'bucket')
+    request.addfinalizer(s3.close)
+    remote = lasagna('remote-copy', s3.location())
+    monkeypatch.setattr(remote_zarr, 'access_for', lambda location: s3.access())
 
     def built(dataset):
         _built(service(host, store_path, build_missing_lasagna_packs=True),
@@ -688,7 +689,7 @@ def test_a_service_packs_remote_arrays_as_it_packs_local_ones(host, store_path, 
                    'project': project(lasagna=dataset, lasagna_scale=2)})
         return host.cache / 'lasagna' / dataset['identity']
     from_local, from_remote = built(local), built(remote)
-    assert gets
+    assert s3.gets
     for kind in ('normals_g0', 'grad_mag_g0'):
         for name in ('table.npy', 'channel_0.u8'):
             assert (from_remote / kind / name).read_bytes() == (from_local / kind / name).read_bytes()
@@ -697,7 +698,7 @@ def test_a_service_packs_remote_arrays_as_it_packs_local_ones(host, store_path, 
 
 
 @pytest.mark.parametrize('location, refused', [
-    ('s3://bucket/array', 'neither local nor HTTP(S)'),
+    ('https://data.example/array', 'its objects cannot be listed'),
     ('/missing/array', 'not an accessible local array')])
 def test_pack_failure_preserves_resident_before_link_refresh(host, store_path,
                                                             monkeypatch, location, refused):
