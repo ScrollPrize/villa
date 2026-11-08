@@ -177,3 +177,34 @@ stores. `vc3d_get_state` lists the store references (`stores`, each with
 - **Store switches save first.** Route, detach and Save As save pending
   edits before switching and fail `-32004` (changing nothing) while growth
   or a line optimization runs; finish or wait for those first.
+
+
+## 10. Ink labels (`vc3d_ink_labels_*`)
+
+- Call `vc3d_ink_labels_open` after activating the segment; every other ink
+  label tool fails `-32007` (`data.kind:"ink_label_session"`) until then. Open
+  never prompts: an autosave newer than the last save fails `-32602`
+  (`data.kind:"autosave_pending"`) under the default `recover="fail"`, so
+  decide between `"restore"` and `"discard"` and call again.
+- Coordinates are label pixels by default: the segment's `vc_render_tifxyz`
+  canvas at full resolution, constants in `state.canvas`. Use
+  `space="volume"` for voxels on the segment (they must lie on the surface the
+  segmentation viewer shows). A `-32009` with `data.kind:"viewer"` means the
+  segmentation viewer is not showing the labeled segment flattened: call
+  `vc3d_activate_segment` for it, or work in label space.
+- The user may be labeling at the same time. Pass `expect={"segment",
+  "serial"}` from your last `vc3d_ink_labels_state` so a paint against a moved
+  session is refused instead of applied, and note that undo stops at the
+  user's edits unless `force=true`.
+- To check unsaved work, use `vc3d_ink_labels_read` (a PNG of a rectangle),
+  not `vc3d_ink_labels_save`, which overwrites the trainer TIFFs. Save blocks
+  until the write lands and returns `saved:false` when nothing changed.
+- To edit a region by hand, read it with `format="values"`, change the image,
+  and paint it back with `mask={"path", "origin", "format": "values"}`: one
+  undo entry with exactly those values.
+- `vc3d_ink_labels_fill`, `_suggest` and `_cleanup` answer when done.
+  Suggestions need the single-channel prediction in `state.prediction`
+  (`labelPxPerPixelX/Y` give its pixel size in label px); accept them with
+  `vc3d_ink_labels_accept_suggestions(ids=...)` or drop them with
+  `_discard_suggestions`. `vc3d_ink_labels_import`, `_versions`,
+  `_dataset_entry`, `_set_tool_state` and `_close` cover the rest of the dock.

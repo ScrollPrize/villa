@@ -15,10 +15,13 @@ public:
     explicit SpiralBrushCursorWidget(QWidget* parent = nullptr);
 
     // `pointPlacementColor` is the accent of the active placement role; it is
-    // only drawn while `pointPlacementVisible`.
+    // only drawn while `pointPlacementVisible`. `ringColor` is the brush
+    // ring's pen.
     void setCursorState(const QPointF& position, int diameter,
                         bool brushDiameterVisible, bool pointPlacementVisible,
-                        const QColor& pointPlacementColor = QColor(50, 255, 215));
+                        const QColor& pointPlacementColor = QColor(50, 255, 215),
+                        const QColor& ringColor = QColor(255, 255, 255, 220));
+    [[nodiscard]] QColor ringColor() const { return _ringColor; }
     void setEditablePclHover(const std::optional<QPointF>& position,
                              const QColor& color, bool sourceMarker,
                              qreal radiusX, qreal radiusY, qreal penWidth);
@@ -39,6 +42,7 @@ private:
     bool _brushDiameterVisible = false;
     bool _pointPlacementVisible = false;
     QColor _pointPlacementColor{50, 255, 215};
+    QColor _ringColor{255, 255, 255, 220};
     std::optional<QPointF> _editablePclHoverPosition;
     QColor _editablePclHoverColor;
     bool _editablePclHoverSourceMarker = false;

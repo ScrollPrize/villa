@@ -2,6 +2,7 @@
 
 #include <QWidget>
 
+class InkLabelController;
 class QComboBox;
 class QLabel;
 class QPushButton;
@@ -13,7 +14,8 @@ class ViewerInkDetectionPanel : public QWidget
     Q_OBJECT
 
 public:
-    explicit ViewerInkDetectionPanel(ViewerManager* viewerManager, QWidget* parent = nullptr);
+    // With `labels` set, the ink label section is added below the detection rows.
+    explicit ViewerInkDetectionPanel(ViewerManager* viewerManager, InkLabelController* labels = nullptr, QWidget* parent = nullptr);
 
 private:
     void populateDetections();

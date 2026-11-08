@@ -3,6 +3,7 @@
 #include "ViewerManager.hpp"
 #include "elements/LabeledControlRow.hpp"
 #include "overlays/InkDetectionOverlayController.hpp"
+#include "viewer_controls/panels/InkLabelPanel.hpp"
 
 #include "Colormaps.hpp"
 
@@ -15,7 +16,7 @@
 
 #include <filesystem>
 
-ViewerInkDetectionPanel::ViewerInkDetectionPanel(ViewerManager* viewerManager, QWidget* parent)
+ViewerInkDetectionPanel::ViewerInkDetectionPanel(ViewerManager* viewerManager, InkLabelController* labels, QWidget* parent)
     : QWidget(parent)
     , _viewerManager(viewerManager)
 {
@@ -54,6 +55,10 @@ ViewerInkDetectionPanel::ViewerInkDetectionPanel(ViewerManager* viewerManager, Q
     flipRow->addControl(_verticalFlipButton);
     flipRow->addStretch(1);
     layout->addWidget(flipRow);
+
+    if (labels) {
+        layout->addWidget(new InkLabelPanel(labels, this));
+    }
 
     populateColormaps();
     populateDetections();

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <QKeySequence>
+#include <QList>
 #include <QString>
 
 namespace vc3d::keybinds {
@@ -46,6 +47,18 @@ extern const ShortcutDef ApplyApprovedTag;
 extern const ShortcutDef ApplyDefectiveTag;
 extern const ShortcutDef FocusedView;
 extern const ShortcutDef CycleViewers;
+extern const ShortcutDef InkLabelMode;
+extern const ShortcutDef InkLabelInk;
+extern const ShortcutDef InkLabelBackground;
+extern const ShortcutDef InkLabelValidation;
+extern const ShortcutDef InkLabelEraser;
+extern const ShortcutDef InkLabelTool;
+extern const ShortcutDef InkLabelSuggest;
+extern const ShortcutDef InkLabelPickAll;
+extern const ShortcutDef InkLabelShow;
+extern const ShortcutDef InkLabelUndo;
+extern const ShortcutDef InkLabelRedo;
+extern const ShortcutDef InkLabelSave;
 } // namespace shortcuts
 
 namespace keypress {
@@ -93,6 +106,9 @@ constexpr QKeySequence::StandardKey Open = QKeySequence::Open;
 } // namespace standard
 
 QKeySequence sequenceFor(const ShortcutDef& def);
+// Every binding of a definition: the platform's alternatives for a standard
+// key (Ctrl+Shift+Z and Ctrl+Y for Redo, say), else its one sequence.
+QList<QKeySequence> sequencesFor(const ShortcutDef& def);
 QKeySequence sequenceFor(const KeyPressDef& def);
 
 QString buildKeybindsHelpText();

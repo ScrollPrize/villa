@@ -11,6 +11,7 @@ from . import (  # noqa: F401  (imported for their registration side effects)
     catalog_volume,
     fiber,
     flatten,
+    ink_labels,
     jobs,
     lasagna,
     manual_add,

@@ -742,6 +742,857 @@
         "type": "object"
       }
     },
+    "ink_labels.accept_suggestions": {
+      "errors": [
+        -32602,
+        -32000,
+        -32007,
+        -32009
+      ],
+      "mcp": {
+        "tool": "vc3d_ink_labels_accept_suggestions"
+      },
+      "params": {
+        "properties": {
+          "all": {
+            "default": false,
+            "type": "boolean"
+          },
+          "ids": {
+            "items": {
+              "maximum": 2147483647,
+              "minimum": 1,
+              "type": "integer"
+            },
+            "type": "array"
+          }
+        },
+        "type": "object"
+      }
+    },
+    "ink_labels.cleanup": {
+      "errors": [
+        -32602,
+        -32000,
+        -32004,
+        -32005,
+        -32007,
+        -32009
+      ],
+      "mcp": {
+        "tool": "vc3d_ink_labels_cleanup"
+      },
+      "params": {
+        "properties": {
+          "bound": {
+            "properties": {
+              "height": {
+                "maximum": 2147483647,
+                "minimum": -2147483648,
+                "type": "integer"
+              },
+              "width": {
+                "maximum": 2147483647,
+                "minimum": -2147483648,
+                "type": "integer"
+              },
+              "x": {
+                "maximum": 2147483647,
+                "minimum": -2147483648,
+                "type": "integer"
+              },
+              "y": {
+                "maximum": 2147483647,
+                "minimum": -2147483648,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "x",
+              "y",
+              "width",
+              "height"
+            ],
+            "type": "object"
+          },
+          "kind": {
+            "enum": [
+              "remove_specks",
+              "fill_holes",
+              "grow",
+              "shrink",
+              "background_ring"
+            ],
+            "type": "string"
+          },
+          "size": {
+            "maximum": 256,
+            "minimum": 1,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "kind"
+        ],
+        "type": "object"
+      }
+    },
+    "ink_labels.close": {
+      "errors": [
+        -32000
+      ],
+      "mcp": {
+        "tool": "vc3d_ink_labels_close"
+      },
+      "params": {
+        "properties": {},
+        "type": "object"
+      }
+    },
+    "ink_labels.dataset_entry": {
+      "errors": [
+        -32000,
+        -32007
+      ],
+      "mcp": {
+        "tool": "vc3d_ink_labels_dataset_entry"
+      },
+      "params": {
+        "properties": {},
+        "type": "object"
+      }
+    },
+    "ink_labels.discard_suggestions": {
+      "errors": [
+        -32000
+      ],
+      "mcp": {
+        "tool": "vc3d_ink_labels_discard_suggestions"
+      },
+      "params": {
+        "properties": {},
+        "type": "object"
+      }
+    },
+    "ink_labels.fill": {
+      "errors": [
+        -32602,
+        -32000,
+        -32002,
+        -32003,
+        -32004,
+        -32005,
+        -32007,
+        -32009
+      ],
+      "mcp": {
+        "paramRenames": {
+          "backgroundKeepsInk": "background_keeps_ink",
+          "class": "label_class",
+          "unlabeledOnly": "unlabeled_only"
+        },
+        "tool": "vc3d_ink_labels_fill"
+      },
+      "params": {
+        "properties": {
+          "above": {
+            "type": "boolean"
+          },
+          "backgroundKeepsInk": {
+            "default": false,
+            "type": "boolean"
+          },
+          "bound": {
+            "properties": {
+              "height": {
+                "maximum": 2147483647,
+                "minimum": -2147483648,
+                "type": "integer"
+              },
+              "width": {
+                "maximum": 2147483647,
+                "minimum": -2147483648,
+                "type": "integer"
+              },
+              "x": {
+                "maximum": 2147483647,
+                "minimum": -2147483648,
+                "type": "integer"
+              },
+              "y": {
+                "maximum": 2147483647,
+                "minimum": -2147483648,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "x",
+              "y",
+              "width",
+              "height"
+            ],
+            "type": "object"
+          },
+          "class": {
+            "default": "ink",
+            "enum": [
+              "ink",
+              "background",
+              "validation"
+            ],
+            "type": "string"
+          },
+          "connectivity": {
+            "maximum": 8,
+            "minimum": 4,
+            "type": "integer"
+          },
+          "erase": {
+            "default": false,
+            "type": "boolean"
+          },
+          "guide": {
+            "enum": [
+              "prediction",
+              "labels"
+            ],
+            "type": "string"
+          },
+          "point": {
+            "properties": {
+              "x": {
+                "type": "number"
+              },
+              "y": {
+                "type": "number"
+              },
+              "z": {
+                "type": "number"
+              }
+            },
+            "required": [
+              "x",
+              "y"
+            ],
+            "type": "object"
+          },
+          "space": {
+            "default": "label",
+            "enum": [
+              "label",
+              "volume"
+            ],
+            "type": "string"
+          },
+          "threshold": {
+            "maximum": 255,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "unlabeledOnly": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "point"
+        ],
+        "type": "object"
+      }
+    },
+    "ink_labels.history": {
+      "errors": [
+        -32602,
+        -32000,
+        -32007,
+        -32009
+      ],
+      "mcp": {
+        "tool": "vc3d_ink_labels_history"
+      },
+      "params": {
+        "properties": {
+          "action": {
+            "enum": [
+              "undo",
+              "redo"
+            ],
+            "type": "string"
+          },
+          "force": {
+            "default": false,
+            "type": "boolean"
+          },
+          "steps": {
+            "default": 1,
+            "maximum": 1000,
+            "minimum": 1,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "action"
+        ],
+        "type": "object"
+      }
+    },
+    "ink_labels.import": {
+      "errors": [
+        -32602,
+        -32000,
+        -32004,
+        -32005,
+        -32007,
+        -32009
+      ],
+      "mcp": {
+        "paramRenames": {
+          "allowResample": "allow_resample",
+          "legacyMaskAs": "legacy_mask_as"
+        },
+        "tool": "vc3d_ink_labels_import"
+      },
+      "params": {
+        "properties": {
+          "allowResample": {
+            "default": false,
+            "type": "boolean"
+          },
+          "label": {
+            "enum": [
+              "ink",
+              "supervision",
+              "validation"
+            ],
+            "type": "string"
+          },
+          "legacyMaskAs": {
+            "enum": [
+              "supervision",
+              "ignore"
+            ],
+            "type": "string"
+          },
+          "path": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "path"
+        ],
+        "type": "object"
+      }
+    },
+    "ink_labels.open": {
+      "errors": [
+        -32602,
+        -32000,
+        -32007,
+        -32009,
+        -32004,
+        -32005
+      ],
+      "mcp": {
+        "paramRenames": {
+          "readOnlyIfLocked": "read_only_if_locked",
+          "startNewVersion": "start_new_version"
+        },
+        "tool": "vc3d_ink_labels_open"
+      },
+      "params": {
+        "properties": {
+          "readOnlyIfLocked": {
+            "default": true,
+            "type": "boolean"
+          },
+          "recover": {
+            "default": "fail",
+            "enum": [
+              "restore",
+              "discard",
+              "fail"
+            ],
+            "type": "string"
+          },
+          "startNewVersion": {
+            "default": false,
+            "type": "boolean"
+          },
+          "version": {
+            "maximum": 9999,
+            "minimum": 1,
+            "type": "integer"
+          }
+        },
+        "type": "object"
+      }
+    },
+    "ink_labels.paint": {
+      "errors": [
+        -32602,
+        -32000,
+        -32002,
+        -32003,
+        -32007,
+        -32009
+      ],
+      "mcp": {
+        "paramRenames": {
+          "backgroundKeepsInk": "background_keeps_ink",
+          "class": "label_class"
+        },
+        "tool": "vc3d_ink_labels_paint"
+      },
+      "params": {
+        "properties": {
+          "backgroundKeepsInk": {
+            "default": false,
+            "type": "boolean"
+          },
+          "class": {
+            "enum": [
+              "ink",
+              "background",
+              "validation"
+            ],
+            "type": "string"
+          },
+          "erase": {
+            "default": false,
+            "type": "boolean"
+          },
+          "expect": {
+            "properties": {
+              "segment": {
+                "type": "string"
+              },
+              "serial": {
+                "maximum": 9007199254740991,
+                "minimum": 0,
+                "type": "integer"
+              }
+            },
+            "type": "object"
+          },
+          "mask": {
+            "properties": {
+              "format": {
+                "enum": [
+                  "paint",
+                  "values"
+                ],
+                "type": "string"
+              },
+              "origin": {
+                "properties": {
+                  "x": {
+                    "maximum": 2147483647,
+                    "minimum": -2147483648,
+                    "type": "integer"
+                  },
+                  "y": {
+                    "maximum": 2147483647,
+                    "minimum": -2147483648,
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "x",
+                  "y"
+                ],
+                "type": "object"
+              },
+              "path": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "path",
+              "origin"
+            ],
+            "type": "object"
+          },
+          "polygon": {
+            "properties": {
+              "points": {
+                "items": {
+                  "properties": {
+                    "x": {
+                      "type": "number"
+                    },
+                    "y": {
+                      "type": "number"
+                    },
+                    "z": {
+                      "type": "number"
+                    }
+                  },
+                  "required": [
+                    "x",
+                    "y"
+                  ],
+                  "type": "object"
+                },
+                "type": "array"
+              }
+            },
+            "required": [
+              "points"
+            ],
+            "type": "object"
+          },
+          "space": {
+            "default": "label",
+            "enum": [
+              "label",
+              "volume"
+            ],
+            "type": "string"
+          },
+          "stroke": {
+            "properties": {
+              "points": {
+                "items": {
+                  "properties": {
+                    "x": {
+                      "type": "number"
+                    },
+                    "y": {
+                      "type": "number"
+                    },
+                    "z": {
+                      "type": "number"
+                    }
+                  },
+                  "required": [
+                    "x",
+                    "y"
+                  ],
+                  "type": "object"
+                },
+                "type": "array"
+              },
+              "radius": {
+                "maximum": 512,
+                "minimum": 0.5,
+                "type": "number"
+              }
+            },
+            "required": [
+              "points",
+              "radius"
+            ],
+            "type": "object"
+          }
+        },
+        "type": "object"
+      }
+    },
+    "ink_labels.read": {
+      "errors": [
+        -32602,
+        -32000,
+        -32007,
+        -32005
+      ],
+      "mcp": {
+        "tool": "vc3d_ink_labels_read"
+      },
+      "params": {
+        "properties": {
+          "format": {
+            "default": "values",
+            "enum": [
+              "values",
+              "ink",
+              "supervision",
+              "validation"
+            ],
+            "type": "string"
+          },
+          "path": {
+            "type": "string"
+          },
+          "rect": {
+            "properties": {
+              "height": {
+                "maximum": 4096,
+                "minimum": 1,
+                "type": "integer"
+              },
+              "width": {
+                "maximum": 4096,
+                "minimum": 1,
+                "type": "integer"
+              },
+              "x": {
+                "maximum": 2147483647,
+                "minimum": -2147483648,
+                "type": "integer"
+              },
+              "y": {
+                "maximum": 2147483647,
+                "minimum": -2147483648,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "x",
+              "y",
+              "width",
+              "height"
+            ],
+            "type": "object"
+          }
+        },
+        "required": [
+          "rect",
+          "path"
+        ],
+        "type": "object"
+      }
+    },
+    "ink_labels.save": {
+      "errors": [
+        -32602,
+        -32000,
+        -32004,
+        -32005,
+        -32007,
+        -32009
+      ],
+      "mcp": {
+        "paramRenames": {
+          "asNewVersion": "as_new_version",
+          "overwriteExternalEdits": "overwrite_external_edits"
+        },
+        "tool": "vc3d_ink_labels_save"
+      },
+      "params": {
+        "properties": {
+          "asNewVersion": {
+            "default": false,
+            "type": "boolean"
+          },
+          "overwriteExternalEdits": {
+            "default": false,
+            "type": "boolean"
+          }
+        },
+        "type": "object"
+      }
+    },
+    "ink_labels.set_tool_state": {
+      "errors": [
+        -32602,
+        -32000,
+        -32005,
+        -32007,
+        -32009
+      ],
+      "mcp": {
+        "paramRenames": {
+          "backgroundKeepsInk": "background_keeps_ink",
+          "class": "label_class",
+          "labelMode": "label_mode"
+        },
+        "tool": "vc3d_ink_labels_set_tool_state"
+      },
+      "params": {
+        "properties": {
+          "assist": {
+            "properties": {
+              "above": {
+                "type": "boolean"
+              },
+              "cleanupSize": {
+                "maximum": 256,
+                "minimum": 1,
+                "type": "integer"
+              },
+              "connectivity": {
+                "maximum": 8,
+                "minimum": 4,
+                "type": "integer"
+              },
+              "guide": {
+                "enum": [
+                  "prediction",
+                  "labels"
+                ],
+                "type": "string"
+              },
+              "median": {
+                "maximum": 5,
+                "minimum": 1,
+                "type": "integer"
+              },
+              "minArea": {
+                "maximum": 100000000,
+                "minimum": 0,
+                "type": "integer"
+              },
+              "threshold": {
+                "maximum": 255,
+                "minimum": 0,
+                "type": "integer"
+              },
+              "unlabeledOnly": {
+                "type": "boolean"
+              }
+            },
+            "type": "object"
+          },
+          "backgroundKeepsInk": {
+            "type": "boolean"
+          },
+          "class": {
+            "enum": [
+              "ink",
+              "background",
+              "validation"
+            ],
+            "type": "string"
+          },
+          "display": {
+            "properties": {
+              "ink": {
+                "type": "boolean"
+              },
+              "opacity": {
+                "maximum": 1,
+                "minimum": 0,
+                "type": "number"
+              },
+              "show": {
+                "type": "boolean"
+              },
+              "supervision": {
+                "type": "boolean"
+              },
+              "validation": {
+                "type": "boolean"
+              }
+            },
+            "type": "object"
+          },
+          "erase": {
+            "type": "boolean"
+          },
+          "labelMode": {
+            "type": "boolean"
+          },
+          "radius": {
+            "maximum": 512,
+            "minimum": 0.5,
+            "type": "number"
+          },
+          "tool": {
+            "enum": [
+              "brush",
+              "polygon",
+              "fill"
+            ],
+            "type": "string"
+          }
+        },
+        "type": "object"
+      }
+    },
+    "ink_labels.state": {
+      "errors": [
+        -32000
+      ],
+      "mcp": {
+        "tool": "vc3d_ink_labels_state"
+      },
+      "params": {
+        "properties": {},
+        "type": "object"
+      }
+    },
+    "ink_labels.suggest": {
+      "errors": [
+        -32602,
+        -32000,
+        -32004,
+        -32005,
+        -32007,
+        -32009
+      ],
+      "mcp": {
+        "paramRenames": {
+          "minArea": "min_area"
+        },
+        "tool": "vc3d_ink_labels_suggest"
+      },
+      "params": {
+        "properties": {
+          "above": {
+            "type": "boolean"
+          },
+          "bound": {
+            "properties": {
+              "height": {
+                "maximum": 2147483647,
+                "minimum": -2147483648,
+                "type": "integer"
+              },
+              "width": {
+                "maximum": 2147483647,
+                "minimum": -2147483648,
+                "type": "integer"
+              },
+              "x": {
+                "maximum": 2147483647,
+                "minimum": -2147483648,
+                "type": "integer"
+              },
+              "y": {
+                "maximum": 2147483647,
+                "minimum": -2147483648,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "x",
+              "y",
+              "width",
+              "height"
+            ],
+            "type": "object"
+          },
+          "median": {
+            "maximum": 5,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "minArea": {
+            "maximum": 100000000,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "threshold": {
+            "maximum": 255,
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "type": "object"
+      }
+    },
+    "ink_labels.versions": {
+      "errors": [
+        -32000,
+        -32007
+      ],
+      "mcp": {
+        "tool": "vc3d_ink_labels_versions"
+      },
+      "params": {
+        "properties": {},
+        "type": "object"
+      }
+    },
     "job.cancel": {
       "errors": [
         -32602,

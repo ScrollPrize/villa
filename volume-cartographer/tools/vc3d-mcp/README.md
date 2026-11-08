@@ -418,3 +418,6 @@ For the wire protocol, limits, method descriptions, and error model, see
 `space`: either a volume `Vec3` or scene `{"x", "y"}`. The MCP schema leaves it
 as `dict[str, float]` so it does not reject either valid shape before the bridge
 can perform semantic validation.
+
+- ink labels for training: open, paint, fill, suggest, clean up, import,
+  read back, undo, save, versions, and the trainer dataset entry;
