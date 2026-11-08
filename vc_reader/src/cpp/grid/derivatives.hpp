@@ -18,8 +18,18 @@ struct Derivatives {
         bool lo=ok(r-dr,c-dc)&&(!column||same(c-dc,c));
         bool hi=ok(r+dr,c+dc)&&(!column||same(c,c+dc));
         if(lo&&hi)return (get(p,r+dr,c+dc)-get(p,r-dr,c-dc))*.5f;
-        if(hi)return get(p,r+dr,c+dc)-get(p,r,c);
-        if(lo)return get(p,r,c)-get(p,r-dr,c-dc);
+        // One sided: second order when the next vertex on that side is valid too; a first
+        // order difference leaves border and hole edge cells with bilinear-grade normals.
+        if(hi){
+            if(ok(r+2*dr,c+2*dc)&&(!column||same(c+dc,c+2*dc)))
+                return (get(p,r+dr,c+dc)*4.f-get(p,r,c)*3.f-get(p,r+2*dr,c+2*dc))*.5f;
+            return get(p,r+dr,c+dc)-get(p,r,c);
+        }
+        if(lo){
+            if(ok(r-2*dr,c-2*dc)&&(!column||same(c-2*dc,c-dc)))
+                return (get(p,r,c)*3.f-get(p,r-dr,c-dc)*4.f+get(p,r-2*dr,c-2*dc))*.5f;
+            return get(p,r,c)-get(p,r-dr,c-dc);
+        }
         return {0,0,0};
     }
     VCR_DERIV_HD void firstAt(int at,float* du,float* dv) const {
