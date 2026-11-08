@@ -282,6 +282,15 @@ void readsCurrentInputsAndTheirDifferences(const fs::path& directory)
     require(shelled.outerShell && shelled.outerShell->state == InputState::Fitted
                 && shelled.outerShell->surface && shelled.surfaces.size() == 1,
             "the outer shell is read beside the patches");
+    // A manifest naming something other than a surface as its shell is
+    // reported, not read as one.
+    auto misnamed = document;
+    for (const auto& object : document["manifest"]["objects"])
+        if (object["kind"] == "point_collection") misnamed["manifest"]["outer_shell"] = object;
+    const auto misread = fixture.read(misnamed);
+    require(!misread.outerShell && misread.problems.size() == 1 && misread.surfaces.size() == 1
+                && misread.problems[0].find("not a surface") != std::string::npos,
+            "an outer shell that is not a surface is a problem: " + Json(misread.problems).dump());
 
     const auto& surface = *inputs.surfaces.at(0).surface;
     require(surface.id == fixture.surface, "input geometry retains its store UUID for viewer queries");

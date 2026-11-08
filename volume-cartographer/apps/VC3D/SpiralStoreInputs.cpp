@@ -30,20 +30,26 @@ std::vector<cv::Vec3d> readXyz(const StoreReader& reader,
                                    [&](const auto& array) { return array.name == name; });
     if (info == revision.arrays.end())
         throw std::runtime_error("geometry " + revision.uuid + " has no " + name + " array");
+    const std::size_t itemSize = info->dtype == "<f8" ? 8 : info->dtype == "<f4" ? 4 : 0;
+    if (!itemSize) throw std::runtime_error(name + " has unsupported dtype " + info->dtype);
+    if (info->shape.size() != 2 || info->shape[1] != 3 || info->shape[0] < 0)
+        throw std::runtime_error(name + " is not an (N, 3) array");
+    const auto count = std::size_t(info->shape[0]);
     const auto bytes = reader.readGeometryArray(revision.uuid, name);
-    const auto count = info->shape.empty() ? 0 : std::size_t(info->shape[0]);
+    // The bytes read must hold the shape: a short read is refused, never read past.
+    if (bytes.size() < count * 3 * itemSize)
+        throw std::runtime_error(name + " holds " + std::to_string(bytes.size()) + " bytes, fewer than its "
+                                 + std::to_string(count) + " x 3 " + info->dtype + " values");
     std::vector<cv::Vec3d> points(count);
     for (std::size_t i = 0; i < count; ++i) {
         for (int axis = 0; axis < 3; ++axis) {
             double value = 0;
-            if (info->dtype == "<f8") {
+            if (itemSize == 8) {
                 std::memcpy(&value, bytes.data() + (i * 3 + axis) * 8, 8);
-            } else if (info->dtype == "<f4") {
+            } else {
                 float single = 0;
                 std::memcpy(&single, bytes.data() + (i * 3 + axis) * 4, 4);
                 value = single;
-            } else {
-                throw std::runtime_error(name + " has unsupported dtype " + info->dtype);
             }
             points[i][axis] = value * scale;
         }
@@ -392,8 +398,15 @@ FitInputs readFitInputs(const StoreReader& reader, const Json& document)
     // The outer shell: read as a surface, held apart from the patches.
     if (const Json shell = valueOrNull(document.at("manifest"), "outer_shell"); shell.is_object()) {
         FitInputs read;
-        readObject(reader, objectPin(shell), result.volumeUuid, read);
-        result.outerShell = std::move(read.surfaces.front());
+        const auto pin = objectPin(shell);
+        readObject(reader, pin, result.volumeUuid, read);
+        // Only a surface pin lands among the surfaces: anything else the
+        // manifest names as its shell is a problem, not a shell.
+        if (read.surfaces.empty())
+            result.problems.push_back("the fit's outer shell " + pin.uuid + " is a " + pin.kind
+                                      + ", not a surface");
+        else
+            result.outerShell = std::move(read.surfaces.front());
     }
     compareRelationships(reader, document.at("manifest"), pins, nullptr, result);
     return result;
