@@ -1,6 +1,7 @@
 #include "internal/RecordSql.hpp"
 #include "geometry/GeometryInternal.hpp"
 #include "geometry/Dependencies.hpp"
+#include "vc_object_store/objects/StoreReader.hpp"
 #include "geometry/DependencyIndex.hpp"
 #include "imports/SourceIdentityIndex.hpp"
 #include "geometry/GeometryDelta.hpp"
@@ -17,7 +18,7 @@ GeometryRevision readGeometryRevision(const Statement& s)
     GeometryRevision r;
     r.uuid = formatUuid(s.blob16(0)); r.objectUuid = formatUuid(s.blob16(1));
     if (!s.isNull(2)) r.parentUuid = formatUuid(s.blob16(2));
-    r.contentHash = s.text(3);
+    r.contentHash = s.hash(3);
     const auto text = s.text(4);
     const auto manifest = loadGeometryManifest(sqlite3_db_handle(s.value), r.uuid, text, r.contentHash);
     r.gridOrigin = manifest.value("grid_origin", std::array<int64_t,2>{0,0});
@@ -83,15 +84,38 @@ std::vector<EdgeRecord> affectedEdges(const ObjectStore& store, const Txn& txn, 
     }
     return result;
 }
+// Decisions other than the keep-recorded default (which an unchanged
+// geometry simply does not use).
+bool explicitEdgeDecisions(const std::vector<GeometryEdgeEdit>& edits)
+{
+    return std::any_of(edits.begin(), edits.end(), [](const auto& e) { return e.edgeUuid != kKeepAffectedRecorded; });
+}
 std::map<std::string, GeometryEdgeEdit> validateEdgeEdits(const ObjectStore& store, const Txn& txn,
     sqlite3* db, const std::string& objectUuid, const detail::DependencyGeometry& after,
     const std::vector<EdgeRecord>& affected, const std::vector<GeometryEdgeEdit>& edgeEdits)
 {
     std::map<std::string, GeometryEdgeEdit> decisions;
+    bool keepRest = false;
     for (const auto& edit : edgeEdits) {
+        if (edit.edgeUuid == kKeepAffectedRecorded) {
+            if (edit.action != "keep_recorded" || keepRest)
+                throw std::invalid_argument("geometry: one keep-recorded default, with action keep_recorded");
+            keepRest = true;
+            continue;
+        }
         const auto uuid = formatUuid(parseUuid(edit.edgeUuid));
         if (!decisions.emplace(uuid, edit).second) throw std::invalid_argument("duplicate geometry edge decision");
     }
+    // The default decides the rest from this checked state: the request's
+    // endpoint expectations already pin the edges' endpoints.
+    if (keepRest)
+        for (const auto& edge : affected)
+            if (!decisions.contains(edge.uuid)) {
+                GeometryEdgeEdit kept;
+                kept.edgeUuid = edge.uuid; kept.expectedGeneration = edge.generation; kept.action = "keep_recorded";
+                kept.aRevision = geometryHead(db, edge.aUuid); kept.bRevision = geometryHead(db, edge.bUuid);
+                decisions.emplace(edge.uuid, std::move(kept));
+            }
     for (const auto& edge : affected) {
         const auto found = decisions.find(edge.uuid);
         if (found == decisions.end())
@@ -146,7 +170,7 @@ void writeRevision(sqlite3* db, const ObjectStore& store, const ObjectRecord& ob
     Statement revision(db, "INSERT INTO geometry_revisions VALUES(?,?,?,?,?,?,?,?,?)", parseUuid(uuid),
         parseUuid(object.uuid));
     if (parent) revision.bind(3, parseUuid(parent->uuid)); else revision.bindNull(3);
-    revision.bind(4, hash); revision.bind(5, text); revision.bind(6, object.generation + 1);
+    revision.bind(4, parseHash(hash)); revision.bind(5, text); revision.bind(6, object.generation + 1);
     revision.bind(7, store.author()); revision.bind(8, nowIsoUtc()); revision.bind(9, store.hostname());
     revision.stepDone();
 }
@@ -168,7 +192,7 @@ void writeArrays(sqlite3* db, const std::string& revisionUuid,
     for (const auto& array : arrays) {
         const auto layout = detail::geometryLayout(manifest.at("arrays").at(array.name));
         detail::forEachGeometryChunk(array, layout.tile, [&](int64_t index, std::span<const uint8_t> bytes) {
-            const std::string hash = manifest.at("arrays").at(array.name).at("chunks").at(index);
+            const auto hash = parseHash(manifest.at("arrays").at(array.name).at("chunks").at(index).get<std::string>());
             insert.reset(); insert.bind(1, hash);
             check(sqlite3_bind_blob64(insert.value, 2, bytes.data(), bytes.size(), SQLITE_STATIC), db, "bind geometry chunk");
             insert.stepDone();
@@ -235,7 +259,7 @@ std::string ObjectStore::putGeometry(WriteTxn& txn, const std::string& objectUui
         }
     }
     if (unchanged) {
-        if (!edgeEdits.empty()) throw std::invalid_argument("geometry is unchanged; edit relationships directly");
+        if (explicitEdgeDecisions(edgeEdits)) throw std::invalid_argument("geometry is unchanged; edit relationships directly");
         savepoint.release();
         return current->uuid;
     }
@@ -457,7 +481,7 @@ std::string ObjectStore::editGeometry(WriteTxn& txn, const std::string& objectId
     const auto plan = prepareEdit(*this, txn, objectUuid, expected, edits);
     const auto current = *currentGeometry(txn, objectUuid);
     if (plan->changes.empty()) {
-        if (!edgeEdits.empty()) throw std::invalid_argument("geometry is unchanged; edit relationships directly");
+        if (explicitEdgeDecisions(edgeEdits)) throw std::invalid_argument("geometry is unchanged; edit relationships directly");
         return current.uuid;
     }
     const auto object = *objectByUuid(txn, objectUuid);
@@ -486,7 +510,7 @@ std::string ObjectStore::editGeometry(WriteTxn& txn, const std::string& objectId
         for (const auto& name : changed) {
             const auto& array = manifest.at("arrays").at(name);
             for (int64_t index = 0; index < geometryLayout(array).chunkCount(); ++index) {
-                const std::string chunk = array.at("chunks").at(index);
+                const auto chunk = parseHash(array.at("chunks").at(index).get<std::string>());
                 stored.reset(); stored.bind(1, chunk);
                 if (!stored.row()) {
                     const auto found = plan->modified->find({name, index});
@@ -577,7 +601,7 @@ std::string ObjectStore::updateSurfaceChannels(WriteTxn& txn, const std::string&
         return value;
     };
     if (logical(manifest) == logical(original)) {
-        if (!edgeEdits.empty()) throw std::invalid_argument("geometry is unchanged; edit relationships directly");
+        if (explicitEdgeDecisions(edgeEdits)) throw std::invalid_argument("geometry is unchanged; edit relationships directly");
         return current->uuid;
     }
     auto after = dependencyGeometry(*this, txn, *current);
@@ -643,26 +667,6 @@ std::string ObjectStore::editGeometryRectangle(WriteTxn& txn, const std::string&
 namespace vc::objects {
 GeometryData ObjectStore::readGeometryData(const Txn& txn, const std::string& uuid, uint64_t budget) const
 {
-    const auto revision = geometryRevision(txn, uuid);
-    if (!revision) throw std::invalid_argument("geometry revision not found");
-    uint64_t total = 0;
-    for (const auto& array : revision->arrays) {
-        if (array.byteLength < 0 || uint64_t(array.byteLength) > budget - total)
-            throw std::runtime_error("geometry read exceeds byte budget; use bounded ranges");
-        total += uint64_t(array.byteLength);
-    }
-    GeometryData data; data.kind = revision->kind; data.formatVersion = revision->formatVersion;
-    data.coordinateSystem = revision->coordinateSystem; data.attributes = revision->attributes;
-    for (const auto& info : revision->arrays) {
-        GeometryArray array{info.name, info.dtype, info.shape, {}};
-        array.bytes.reserve(size_t(info.byteLength));
-        for (int64_t offset = 0; offset < info.byteLength;) {
-            const auto count = std::min<int64_t>(1024 * 1024, info.byteLength - offset);
-            auto bytes = readGeometryArray(txn, uuid, info.name, offset, count);
-            array.bytes.insert(array.bytes.end(), bytes.begin(), bytes.end()); offset += count;
-        }
-        data.arrays.push_back(std::move(array));
-    }
-    return data;
+    return LocalStoreReader(*this, txn).readGeometryData(uuid, budget);
 }
 }

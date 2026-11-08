@@ -1035,7 +1035,8 @@ def _build_parser() -> argparse.ArgumentParser:
 		help="Output-mask dilation radius in exported mesh vertices")
 	p.add_argument("--approval-inpaint-tifxyz", default=None, help=argparse.SUPPRESS)
 	p.add_argument("--store", default=None,
-		help="VC object store holding the stored surfaces (vcobj:<uuid>[@<revision>]) the fit reads")
+		help="VC object store holding the stored surfaces (vcobj:<uuid>[@<generation>/<version>]) the fit reads: a store "
+			 "file or a vc_object_server endpoint (http://...)")
 	p.add_argument("--volume-uuid", default=None,
 		help="Volume whose voxels stored-surface coordinates are read in")
 	p.add_argument("--voxel-scale", type=float, default=1.0,

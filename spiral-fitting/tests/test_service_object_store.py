@@ -72,13 +72,11 @@ def test_binding_resolves_the_store_once_and_records_its_uuid(store_path, tmp_pa
     binding = spiral_service.bind_object_store(Path(store_path).name, 'svc')
     with ObjectStore.open(store_path, read_only=True) as db:
         assert binding.uuid == db.uuid
-        # Shared in place: the store records positions of its own from now on.
-        assert binding.positions == db.store_positions()['store']
-    assert binding.path == str(Path(store_path).resolve())
-    assert binding.config() == {'object_store_path': binding.path,
+        assert binding.generation == db.status()['generation']
+    assert binding.location == str(Path(store_path).resolve()) and not binding.served
+    assert binding.config() == {'object_store_path': binding.location,
                                 'object_store_author': 'svc',
                                 'object_store_input_position': None}
-    assert not binding.hosted
     assert spiral_service.bind_object_store(store_path).author.startswith('spiral-service@')
     garbage = tmp_path / 'garbage.vcobj'
     garbage.write_text('not a store')
@@ -362,12 +360,12 @@ def test_bindings_advertise_the_store_and_its_selection(host, filled_store):
     state.startup_inputs()
     advertised = state.binding_advertisement()
     with ObjectStore.open(filled_store, read_only=True) as db:
-        positions = db.store_positions()
+        status = db.status()
     assert advertised['object_store'] == {
-        'uuid': state.object_store.uuid, 'path': state.object_store.path,
-        'author': 'spiral-test', 'hub': None,
-        'positions': {'identity': positions['store'], 'position': positions['position'],
-                      'position_error': None}}
+        'uuid': state.object_store.uuid, 'generation': status['generation'],
+        'location': state.object_store.location, 'served': False,
+        'author': 'spiral-test', 'commit_sequence': status['commit_sequence'],
+        'position_error': None}
     assert advertised['capabilities']['input_source'] == 'object_store'
     assert advertised['capabilities']['commits'] is True
     # Nothing advertises patch, fiber or PCL files, or a host dataset.
@@ -512,8 +510,8 @@ def test_the_build_reads_the_project_of_its_fit_volume(host, store_path, tmp_pat
     assert request['project'] == {
         'name': 's1', 'volume': VOLUME, 'voxel_size_um': 9.6,
         'z_direction_is_top_to_bottom': False, 'left_handed_coordinates': False,
-        'umbilicus': {'uuid': UMBILICUS['uuid'], 'revision': UMBILICUS['revision'],
-                      'points': 2}}
+        'umbilicus': {'uuid': UMBILICUS['uuid'], 'generation': UMBILICUS['generation'],
+                      'version': UMBILICUS['version'], 'points': 2}}
     assert request['scroll']['umbilicus_coordinate_scale'] == 1.0
     assert request['paths']['volume_uuid'] == VOLUME
     assert 'dataset_root' not in request['paths']
@@ -796,7 +794,7 @@ def test_a_changed_project_volume_rebuilds_everything(host, store_path):
     _built(state, initialize_body())
     state.session = SimpleNamespace(status=lambda: {'state': SessionState.Idle,
                                                     'input_generation': 0})
-    changed = {**UMBILICUS, 'revision': 'b8e6d4f1-2c3d-4e5f-9a01-1b2c3d4e5f60'}
+    changed = {**UMBILICUS, 'version': UMBILICUS['version'] + 1}
     for request, stage in ((initialize_body(), 'model'),
                            (initialize_body() | {'project': project(umbilicus=changed)}, 'all'),
                            (initialize_body() | {'project': project(name='renamed')}, 'all')):

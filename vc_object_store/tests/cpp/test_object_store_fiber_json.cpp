@@ -1,4 +1,6 @@
+#include "vc_object_store/objects/StoreReader.hpp"
 #include "TestSupport.hpp"
+#include "StoreTestSupport.hpp"
 #include "vc_object_store/objects/FiberJson.hpp"
 #include "vc_object_store/objects/ObjectStoreSession.hpp"
 #include "vc_object_store/geometry/Geometry.hpp"
@@ -6,6 +8,20 @@
 #include <iostream>
 using namespace vc::objects;
 using Json = nlohmann::json;
+namespace {
+// Numbered references of versions in the active generation (pins from a receipt).
+std::vector<ObjectVersion> versionsOf(const StoreReader& reader, const VersionSelection& pins)
+{
+    std::vector<ObjectVersion> result;
+    const auto status = reader.status();
+    for (const auto& [uuid, pin] : pins) {
+        if (!pin) throw std::runtime_error("pin without a recorded version");
+        result.push_back({status.storeUuid, status.generation, uuid, *pin});
+    }
+    return result;
+}
+} // namespace
+
 int main() try {
     const auto uuid = util::newUuid();
     Json root{{"type","vc3d_fiber"},{"uuid",uuid},{"version",4},{"name","same name"},
@@ -48,8 +64,8 @@ int main() try {
     const auto path = dir.path / "receipt.vcobj";
     OpenOptions options; options.author = "receipt-test";
     { auto db = ObjectStore::create(path, options); }
-    ObjectStoreSession session; const auto attachment = session.attach(path, options);
-    const auto receipt = session.act(attachment, {{uuid,{}}}, [&](auto& db, auto& txn) {
+    auto store = ObjectStore::open(path, options);
+    const auto receipt = storeAct(store, {{uuid,{}}}, [&](auto& db, auto& txn) {
         auto object = doc.object; object.meta = Json{{"source",source}}.dump();
         db.upsertObject(txn, object); db.putGeometry(txn, uuid, doc.geometry);
     });
@@ -58,19 +74,22 @@ int main() try {
     { auto txn = external.write(receipt); external.setMeta(txn,uuid,"external","true");
       auto changed = source; changed["control_points_attributes"][0]["tags"] = {"changed"};
       mustFail([&] { external.setMeta(txn, uuid, "source", changed.dump()); }); txn.commit();
-      require(txn.committedRevisions().at(uuid) != receipt.at(uuid), "external commit produces different pin"); }
-    session.read(attachment,[&](const auto& db,const auto& txn,const auto&) {
-        require(db.objectRevision(txn,*receipt.at(uuid))->record.meta.find("external") == std::string::npos, "receipt is immutable after external commit");
-        const auto historical=Json::parse(fiberRevisionJson(db,txn,*receipt.at(uuid)));
+      require(txn.receipt()->objects.at(uuid) != receipt.at(uuid), "external commit produces different pin"); }
+    storeReader(store,[&](const StoreReader& reader,const auto&) {
+        const auto pinned = versionsOf(reader, receipt).front();
+        require(reader.objectsAtVersions({pinned}).front()->record.meta.find("external") == std::string::npos, "receipt is immutable after external commit");
+        const auto historical=Json::parse(fiberVersionJson(reader,pinned));
         require(historical["control_points"]==root["control_points"] && historical["line_points"]==root["line_points"], "pinned wire geometry and annotations");
         require(!historical.contains("optimization_mode"), "absent legacy mode stays absent on the wire");
-        mustFail([&] {fiberRevisionJson(db,txn,*receipt.at(uuid),1);});
+        mustFail([&] {fiberVersionJson(reader,pinned,1);});
+        auto later = pinned; ++later.version; ++later.version;
+        mustFail([&] {fiberVersionJson(reader,later);});
     });
-    mustFail([&] { session.act(attachment,receipt,[](auto&,auto&) {}); });
+    mustFail([&] { storeAct(store,receipt,[](auto&,auto&) {}); });
     {
         // Only linked endpoints participate in checked import concurrency.
         const auto unrelated = util::newUuid();
-        session.act(attachment, {{unrelated, {}}}, [&](auto& db, auto& txn) {
+        storeAct(store, {{unrelated, {}}}, [&](auto& db, auto& txn) {
             auto record = doc.object; record.uuid = unrelated;
             db.upsertObject(txn, record); db.putGeometry(txn, unrelated, doc.geometry);
         });
@@ -78,30 +97,30 @@ int main() try {
         linked["branches"] = Json::array({Json{{"target_uuid", uuid}, {"control_point_index", 0},
                                                {"branch_control_point_index", 0}}});
         auto batch = std::vector<GeometrySource>{decodeFiberJson(linked.dump())};
-        RevisionSelection pins{{imported, {}}};
-        session.read(attachment, [&](const auto& db, const auto& txn, const auto&) {
+        VersionSelection pins{{imported, {}}};
+        storeRead(store, [&](const auto& db, const auto& txn, const auto&) {
             for (const auto& target : fiberBatchEndpoints(batch))
-                pins[target] = db.currentObjectRevision(txn, target)->uuid;
+                pins[target] = db.currentVersion(txn, target);
         });
         { auto txn = external.write(); external.setMeta(txn, unrelated, "concurrent", "true"); txn.commit(); }
-        session.act(attachment, pins, [&](auto& db, auto& txn) { ingestGeometryBatch(db, txn, batch); });
+        storeAct(store, pins, [&](auto& db, auto& txn) { ingestGeometryBatch(db, txn, batch); });
         // Reusing the new identity still fails even though unrelated fibers are not pinned.
-        mustFail([&] { session.act(attachment, pins, [&](auto& db, auto& txn) { ingestGeometryBatch(db, txn, batch); }); });
+        mustFail([&] { storeAct(store, pins, [&](auto& db, auto& txn) { ingestGeometryBatch(db, txn, batch); }); });
         const auto rejected = util::newUuid(); linked["uuid"] = rejected;
         batch = {decodeFiberJson(linked.dump())}; pins = {{rejected, {}}};
-        session.read(attachment, [&](const auto& db, const auto& txn, const auto&) {
+        storeRead(store, [&](const auto& db, const auto& txn, const auto&) {
             for (const auto& target : fiberBatchEndpoints(batch))
-                pins[target] = db.currentObjectRevision(txn, target)->uuid;
+                pins[target] = db.currentVersion(txn, target);
         });
         { auto txn = external.write(); external.setMeta(txn, uuid, "concurrent", "true"); txn.commit(); }
-        mustFail([&] { session.act(attachment, pins, [&](auto& db, auto& txn) { ingestGeometryBatch(db, txn, batch); }); });
-        session.read(attachment, [&](const auto& db, const auto& txn, const auto&) {
+        mustFail([&] { storeAct(store, pins, [&](auto& db, auto& txn) { ingestGeometryBatch(db, txn, batch); }); });
+        storeRead(store, [&](const auto& db, const auto& txn, const auto&) {
             require(!db.objectByUuid(txn, rejected), "a changed linked endpoint rejects the entire import");
         });
     }
     const auto a = util::newUuid(), b = util::newUuid(), isolated = util::newUuid();
     std::string ordinary, adjacent;
-    const auto networkPins = session.act(attachment, {{a,{}},{b,{}},{isolated,{}}}, [&](auto& db, auto& txn) {
+    const auto networkPins = storeAct(store, {{a,{}},{b,{}},{isolated,{}}}, [&](auto& db, auto& txn) {
         vc::geometry::Fiber geometry{{{1,2,3},{5,2,3}}, {{1,2,3},{5,2,3}}, {90,10}};
         for (const auto& objectUuid : {a,b,isolated}) {
             ObjectRecord record; record.uuid = objectUuid; record.kind = "fiber";
@@ -124,8 +143,9 @@ int main() try {
         adjacent = db.addEdge(txn, edge); db.setApproval(txn, adjacent, "pending");
     });
     std::map<std::string,std::string> exported;
-    session.read(attachment, [&](const auto& db, const auto& txn, const auto&) {
-        exported = fiberNetworkJson(db, txn, networkPins, {a});
+    storeReader(store, [&](const StoreReader& reader, const auto&) {
+        const auto pinned = versionsOf(reader, networkPins);
+        exported = fiberNetworkJson(reader, pinned, {a});
         require(exported.size() == 2 && exported.contains(b), "export follows linked component only");
         const auto first = Json::parse(exported.at(a)), second = Json::parse(exported.at(b));
         require(first["name"] == second["name"] && first["filename"] != second["filename"], "UUID wire names preserve duplicate labels");
@@ -138,30 +158,33 @@ int main() try {
                 "automatic mark only on pending ordinary links");
         require(first["coordinates"]["scale_factor"] == 4.0, "coordinate binding exported");
         require(!first.contains("coordinate_binding"), "source annotations cannot restore an absent binding");
-        mustFail([&] { fiberNetworkJson(db,txn,{{a,networkPins.at(a)}}); });
-        mustFail([&] { fiberNetworkJson(db,txn,{{a,{}}}); });
-        mustFail([&] { fiberNetworkJson(db,txn,networkPins,{a},1); });
+        const auto onlyA = std::find_if(pinned.begin(), pinned.end(), [&](const auto& v) { return v.objectUuid == a; });
+        mustFail([&] { fiberNetworkJson(reader,{*onlyA}); });
+        auto unrecorded = *onlyA; unrecorded.version = 99;
+        mustFail([&] { fiberNetworkJson(reader,{unrecorded}); });
+        mustFail([&] { fiberNetworkJson(reader,{*onlyA,*onlyA}); });
+        mustFail([&] { fiberNetworkJson(reader,pinned,{a},1); });
     });
-    session.act(attachment, networkPins, [&](auto& db, auto& txn) { db.removeEdge(txn,ordinary); });
-    RevisionSelection currentNetworkPins;
-    session.read(attachment, [&](const auto& db, const auto& txn, const auto&) {
-        require(fiberNetworkJson(db,txn,networkPins,{a}) == exported, "pinned topology survives later edge deletion");
+    storeAct(store, networkPins, [&](auto& db, auto& txn) { db.removeEdge(txn,ordinary); });
+    VersionSelection currentNetworkPins;
+    storeReader(store, [&](const StoreReader& reader, const auto&) {
+        require(fiberNetworkJson(reader,versionsOf(reader,networkPins),{a}) == exported, "pinned topology survives later edge deletion");
         auto current = networkPins;
-        for (auto& [objectUuid, pin] : current) pin = db.currentObjectRevision(txn,objectUuid)->uuid;
+        for (auto& [objectUuid, pin] : current) pin = reader.currentObject(objectUuid)->version;
         currentNetworkPins = current;
-        const auto now = fiberNetworkJson(db,txn,current,{a});
+        const auto now = fiberNetworkJson(reader,versionsOf(reader,current),{a});
         require(Json::parse(now.at(a))["branches"].empty(), "current export observes edge deletion");
         require(Json::parse(now.at(a))["adjacent_branches"].size() == 1, "parallel adjacent edge survives");
     });
-    session.act(attachment, currentNetworkPins, [&](auto& db, auto& txn) {
+    storeAct(store, currentNetworkPins, [&](auto& db, auto& txn) {
         db.retireObject(txn, b);
         db.keepRecordedRelationship(txn, adjacent);
     });
-    session.read(attachment, [&](const auto& db, const auto& txn, const auto&) {
-        for (auto& [objectUuid, pin] : currentNetworkPins) pin = db.currentObjectRevision(txn,objectUuid)->uuid;
-        const auto now = fiberNetworkJson(db,txn,currentNetworkPins,{a});
+    storeReader(store, [&](const StoreReader& reader, const auto&) {
+        for (auto& [objectUuid, pin] : currentNetworkPins) pin = reader.currentObject(objectUuid)->version;
+        const auto now = fiberNetworkJson(reader,versionsOf(reader,currentNetworkPins),{a});
         require(now.size() == 1 && Json::parse(now.at(a))["adjacent_branches"].empty(), "retired endpoints and inactive edges are not transported");
-        require(fiberNetworkJson(db,txn,networkPins,{a}) == exported, "historical network remains independent of current lifecycle");
+        require(fiberNetworkJson(reader,versionsOf(reader,networkPins),{a}) == exported, "historical network remains independent of current lifecycle");
     });
     std::cout << "fiber codec and checked commit receipt passed\n";
 } catch(const std::exception& e) { std::cerr << e.what() << '\n'; return 1; }

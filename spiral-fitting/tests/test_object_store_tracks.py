@@ -47,10 +47,10 @@ def test_refreshed_crossings_are_the_ones_spiral_finds(db):
     from tracks import _build_crossing_partner_csr
     tracks = _lattice(db)
     snapshot = osi.read_snapshot(db, osi.InputRequest())
-    outcomes = osi.refresh_links(db, snapshot, reference.fit_config(),
-                                 osi.NormalSource('none'))
+    planned = osi.link_plan(snapshot, reference.fit_config(), osi.NormalSource('none'))
+    _, outcomes = osi.submit_link_plan(db, planned, author='test')
     [crossing] = [outcome for outcome in outcomes if outcome.detector == 'track_crossing']
-    assert crossing.report['edges_created'] == 9 and not crossing.failed
+    assert crossing.report['edges_created'] == 9 and not crossing.report['problems']
     inputs, counts = _materialize_tracks(db)
     assert counts['tracks'] == 6 and counts['track crossings'] == 9
 

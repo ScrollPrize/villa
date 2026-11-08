@@ -32,6 +32,12 @@ public:
     // Flush, then drop the volume's collections from memory, leaving the store
     // as it is (closing the project).
     void unload();
+    // The store a collection in memory is kept in; nullopt for one this sync
+    // does not keep (a surface's corrections).
+    std::optional<vc::objects::AttachmentIdentity> storeOf(uint64_t collectionId) const
+    {
+        return uuids_.contains(collectionId) ? attachment_ : std::nullopt;
+    }
 
 private:
     void reload();
@@ -50,9 +56,9 @@ private:
     std::map<uint64_t, std::string> uuids_;
     std::set<uint64_t> changed_;
     std::set<std::string> removed_;
-    // The object revision of each collection as this sync last wrote or read
-    // it: a commit leaving another is someone else's.
-    std::map<std::string, std::string> revisions_;
+    // The numbered version (generation, version) of each collection as this
+    // sync last wrote or read it: a commit leaving another is someone else's.
+    std::map<std::string, std::pair<std::string, int64_t>> revisions_;
     // Installing from the store: the collection's change hooks are not edits.
     bool installing_ = false;
 };

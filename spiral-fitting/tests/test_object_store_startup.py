@@ -1,6 +1,7 @@
 """Startup lifecycle of object-store fit inputs: link refresh, frozen reads,
 rank agreement, external frames and resume validation."""
 import hashlib
+import dataclasses
 import json
 import os
 from types import SimpleNamespace
@@ -43,7 +44,7 @@ def test_default_refresh_writes_links_and_freezes_the_inputs(store_path):
     again = load(store_path, rerun)
     assert edges(store_path) == linked
     assert again.digest == inputs.digest
-    assert any(line.startswith('link refresh: skip: unchanged since position') for line in rerun)
+    assert any(line.startswith('link refresh: skip: unchanged since commit') for line in rerun)
     assert not any('running' in line for line in rerun)
     # A forced full refresh reconciles idempotently.
     forced = []
@@ -59,15 +60,20 @@ def test_refresh_failures_are_collected_and_stop_the_fit(store_path, tmp_path):
     config = fit_config(store_path, pcl_link_window_points=1,
                         pcl_link_window_min_points=5)
     lasagna = {'pool': str(tmp_path / 'absent_pack'), 'scale': 4}
+    before = _sha256(store_path)
     with pytest.raises(osi.LinkRefreshError) as error:
         osi.load_fit_inputs(config, lasagna=lasagna, log=lambda line: None)
     text = '\n'.join(error.value.problems)
-    assert 'link refresh pcl_patch: FAILED: ValueError' in text
-    assert 'link refresh fiber_patch: FAILED: RuntimeError' in text
-    # The independent overlap detector still ran, and its commit is reported.
-    assert 'link refresh patch_overlap: 0 created' in text
-    assert 'failed in pcl_patch, fiber_patch; the fit will not train' in text
-    assert 'patch_overlap committed before the failure' in text
+    # The plan is refused whole: no detector ran, nothing was written.
+    assert 'nothing was written' in text and 'point-collection-surface' in text
+    assert _sha256(store_path) == before
+    # A detector that cannot run (the absent normals pack) fails the whole
+    # request the same way, the other detectors' links included.
+    config = fit_config(store_path)
+    with pytest.raises(osi.LinkRefreshError) as error:
+        osi.load_fit_inputs(config, lasagna=lasagna, log=lambda line: None)
+    text = '\n'.join(error.value.problems)
+    assert 'nothing was written' in text and 'fiber-surface' in text
     assert edges(store_path) == []
 
 
@@ -79,7 +85,7 @@ def test_no_refresh_mode_never_writes(store_path):
     assert _sha256(store_path) == before
     assert edges(store_path) == []
     assert inputs.counts['pcl attachments'] == 0
-    assert "link refresh: off; reading the store's current relationships" in log
+    assert any(line.startswith('link refresh: off; pinning commit') for line in log)
     assert not inputs.manifest['link_refresh']['enabled']
     assert 'WARNING: no pcl_patch relationships are consumed' in '\n'.join(inputs.report())
 
@@ -261,51 +267,35 @@ def test_resume_refuses_changed_inputs_and_frames(store_path):
     assert quiet.digest == load(store_path).digest
 
 
-def test_replicas_of_one_store_give_one_digest(store_path, tmp_path):
-    """Two hub clones: the deployed case of one logical store seen through
-    different local files."""
+def test_a_copy_of_the_store_gives_one_digest(store_path, tmp_path):
+    """A copied store file: the same inputs under the same identity."""
     import shutil
-    import vc_object_store as vos
-    vos.hub_init(store_path, 'ingest')
-    first, second = (str(tmp_path / f'{name}.vcobj') for name in ('a', 'b'))
-    for path, author in ((first, 'alice'), (second, 'bob')):
-        vos.hub_clone(store_path, path, author)
-    # Loading on a hosted replica links and publishes at a hub position.
-    linked = load(first, object_store_author='alice')
-    assert linked.manifest['position']['sequence'] > 0
+    linked = load(store_path, object_store_author='alice')
+    assert linked.manifest['position']['commit_sequence'] > 0
     assert linked.manifest['link_refresh']['parameters'] == {
-        key: fit_config(first)[key] for key in osi.LINK_PARAMETER_KEYS}
-    with ObjectStore.open(second, author='bob') as db:
-        assert db.hub_sync(pull=True, push=False)['pulled']
+        key: fit_config(store_path)[key] for key in osi.LINK_PARAMETER_KEYS}
+    copy = str(tmp_path / 'copy.vcobj')
+    shutil.copyfile(store_path, copy)
 
-    # The pull installs the links, and the objects they revise, under the
-    # second replica's own revision UUIDs; the current-state digests agree.
     def current(path):
         with ObjectStore.open(path, read_only=True) as db:
             return osi.read_snapshot(db, osi.request_from_config(fit_config(path)))
-    a, b = current(first), current(second)
-    local = lambda snapshot: {entry['uuid']: entry['object_revision']
-                              for entry in snapshot.manifest()['objects']}
-    versions = lambda snapshot: {entry['uuid']: entry['revision']
-                                 for entry in snapshot.manifest()['relationships']}
-    assert local(a).keys() == local(b).keys()
-    assert local(a) != local(b) and versions(a) != versions(b)
-    assert len(versions(a)) == 3 and a.digest() == b.digest()
-    # Reading the pinned position gives one manifest on any replica.
-    pinned = load(second, object_store_author='bob', object_store_refresh_links=False)
+    a, b = current(store_path), current(copy)
+    versions = lambda snapshot: {entry['uuid']: entry['version']
+                                 for entry in snapshot.manifest()['objects']}
+    assert versions(a) == versions(b) and a.digest() == b.digest()
+    assert len(a.manifest()['relationships']) == 3
+    # Reading the pinned position gives one manifest from either file.
+    pinned = load(copy, object_store_author='bob', object_store_refresh_links=False)
     assert pinned.manifest['position'] == linked.manifest['position']
     assert pinned.counts == linked.counts and pinned.digest == linked.digest
     assert osi.manifest_differences(linked.manifest, pinned.manifest) == []
     assert osi.resume_problems({'object_store': linked.manifest}, pinned) == []
-    # The same content as a plain store gives the same digest too: positions
-    # are provenance, not inputs.
-    plain = str(tmp_path / 'plain.vcobj')
-    shutil.copyfile(first, plain)
-    vos.hub_detach(plain, 'plain')
-    copy = load(plain, object_store_refresh_links=False)
-    assert copy.manifest['position'] is None and copy.digest == linked.digest
-    with pytest.raises(osi.ObjectStoreInputError, match='records no positions'):
-        osi.load_fit_inputs(fit_config(plain), log=lambda line: None, minimum_position=1)
+    # A position ahead of the store's head is refused.
+    ahead = dataclasses.replace(osi.InputPosition.from_provenance(linked.manifest['position']),
+                                commit_sequence=linked.manifest['position']['commit_sequence'] + 100)
+    with pytest.raises(osi.ObjectStoreInputError, match='after this store'):
+        osi.load_fit_inputs(fit_config(copy), log=lambda line: None, minimum_position=ahead)
 
 
 def test_digest_covers_the_metadata_the_adapter_reads(store_path):
@@ -333,6 +323,7 @@ def test_a_checkpoint_before_content_identity_compares_geometry(store_path):
     # relationship content, and revision UUIDs of the replica it ran on.
     for entry in legacy['objects']:
         del entry['metadata_sha256']
+        del entry['version']
         entry['object_revision'] = 'another-replica'
     legacy['relationships'] = [
         {key: entry[key] for key in ('uuid', 'kind', 'family', 'approval_state',

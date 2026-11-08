@@ -24,6 +24,7 @@
 #include <optional>
 
 #include "VCSettings.hpp"
+#include "SessionDrafts.hpp"
 #include "Keybinds.hpp"
 #include "OpenDataNormalGrids.hpp"
 #include "viewer_controls/panels/ViewerCompositePanel.hpp"
@@ -35,6 +36,8 @@
 #include <QKeyEvent>
 #include <QResizeEvent>
 #include <QSettings>
+#include <QDateTime>
+#include <QStandardPaths>
 #include <QMdiArea>
 #include <QMdiSubWindow>
 #include <QApplication>
@@ -112,6 +115,7 @@
 #include "SurfacePanelController.hpp"
 #include "elements/GrowOnlyLabel.hpp"
 #include "MenuActionController.hpp"
+#include "StoreImportController.hpp"
 #include "VolumeAttachmentController.hpp"
 #include "AxisAlignedSliceController.hpp"
 #include "SegmentationCommandHandler.hpp"
@@ -826,6 +830,7 @@ CWindow::CWindow(size_t cacheSizeGB) :
     updateProjectNameLabel();
     connect(_state, &CState::poiChanged, this, &CWindow::onFocusPOIChanged);
     connect(_state, &CState::surfaceWillBeDeleted, this, &CWindow::onSurfaceWillBeDeleted);
+    startDraftRecovery();
 
     _axisAlignedSliceController = std::make_unique<AxisAlignedSliceController>(_state, this);
 
@@ -842,9 +847,6 @@ CWindow::CWindow(size_t cacheSizeGB) :
         if (auto* tabBar = _workspaceTabs->tabBar()) tabBar->setTabButton(spiralIndex, QTabBar::RightSide, nullptr);
         shell->deleteLater();
         connectVolumeSelector(_spiralWorkspace->volumeSelectionControl());
-        connect(_spiralWorkspace, &SpiralWorkspace::hubReplicaRequested, this, [this](const QString& hub) {
-            if (_menuController) _menuController->cloneHostedStore(false, hub, SpiralWorkspace::inputKinds());
-        });
         connect(_spiralWorkspace, &SpiralWorkspace::patchEditorRequested, this,
                 [this](const QString& id, const QString& path) {
                     try {
@@ -967,16 +969,17 @@ CWindow::CWindow(size_t cacheSizeGB) :
     _persistentCacheLowSpaceLabel->hide();
     statusBar()->addPermanentWidget(_persistentCacheLowSpaceLabel);
 
-    _hubStatusLabel = new QLabel(this);
-    _hubStatusLabel->setContentsMargins(8, 0, 8, 0);
-    _hubStatusLabel->setToolTip(tr("Sync state of the attached hosted object store replica"));
-    _hubStatusLabel->hide();
-    statusBar()->addPermanentWidget(_hubStatusLabel);
-    connect(_state, &CState::storeRoutesChanged, this, &CWindow::updateHubStatus);
-    connect(_state, &CState::objectStoreChanged, this, [this](const vc::objects::StoreSessionEvent& event) {
-        using Kind = vc::objects::StoreSessionEvent::Kind;
-        if (event.kind != Kind::Committed && event.kind != Kind::Draft) updateHubStatus();
-    });
+    // Hosted stores: what this client knows of each, from its last status check.
+    _hostedStatusLabel = new QLabel(this);
+    _hostedStatusLabel->setObjectName(QStringLiteral("hostedStoreStatusLabel"));
+    _hostedStatusLabel->setContentsMargins(8, 0, 8, 0);
+    _hostedStatusLabel->hide();
+    statusBar()->addPermanentWidget(_hostedStatusLabel);
+    auto* hostedStatusTimer = new QTimer(this);
+    hostedStatusTimer->setInterval(1000);
+    connect(hostedStatusTimer, &QTimer::timeout, this, &CWindow::updateHostedStatus);
+    connect(_state, &CState::storeRoutesChanged, this, &CWindow::updateHostedStatus);
+    hostedStatusTimer->start();
 
     _persistentCacheSpaceTimer = new QTimer(this);
     _persistentCacheSpaceTimer->setInterval(5000);
@@ -1105,6 +1108,7 @@ CWindow::CWindow(size_t cacheSizeGB) :
 
     _volumeAttachmentController =
         std::make_unique<VolumeAttachmentController>(this);
+    _storeImportController = std::make_unique<StoreImportController>(this);
 
     // create menus/actions controller
     _menuController = std::make_unique<MenuActionController>(this);
@@ -1137,7 +1141,6 @@ CWindow::CWindow(size_t cacheSizeGB) :
     const int projectIndex = _workspaceTabs->addTab(_projectWorkspace, tr("Project"));
     if (auto* tabBar = _workspaceTabs->tabBar()) tabBar->setTabButton(projectIndex, QTabBar::RightSide, nullptr);
     connect(_projectWorkspace, &ProjectWorkspace::projectRenamed, this, &CWindow::updateProjectNameLabel);
-    connect(_projectWorkspace, &ProjectWorkspace::hubSyncRequested, this, &CWindow::promptHubConflicts);
     connect(_projectWorkspace, &ProjectWorkspace::volumeActivationRequested, this, [this](const QString& volumeId) {
         const auto vpkg = _state->vpkg();
         std::shared_ptr<Volume> volume;
@@ -1743,7 +1746,7 @@ void CWindow::configureChunkedViewerConnections(CChunkedVolumeViewer* viewer)
 
                         const auto activeSurface = _state ? _state->surface("segmentation") : nullptr;
                         const bool activeSegmentHasLasagnaModel =
-                            activeSurface && LasagnaServiceManager::instance().surfaceModel(activeSurface->id);
+                            activeSurface && LasagnaServiceManager::instance().surfaceHasModel(activeSurface->id);
 
                         QMenu menu(this);
 
@@ -2718,7 +2721,7 @@ void CWindow::CreateWidgets(void)
             _storeSurfaceOverlay.get(), &StoreSurfaceOverlayController::setSurfaces);
     connect(_surfacePanel.get(), &SurfacePanelController::highlightedSurfacesChanged,
             _storeSurfaceOverlay.get(), &StoreSurfaceOverlayController::setHighlighted);
-    // Another replica, tool or service changed the open surface: reopen it, unless
+    // Another client, tool or service changed the open surface: reopen it, unless
     // it is being edited (its edits continue from their own revisions).
     connect(_surfaceCatalog.get(), &SurfaceCatalog::surfacesCommitted, this, [this](const std::vector<std::string>& uuids) {
         const auto active = _state->activeSurface().lock();
@@ -2728,11 +2731,8 @@ void CWindow::CreateWidgets(void)
         }
         auto known = _segmentationModule ? _segmentationModule->storePin(active.get()) : std::nullopt;
         if (!known && _surfacePanel->opened()) known = _surfacePanel->opened()->pin;
-        std::optional<std::string> head;
-        _surfaceCatalog->session()->read(row->source, [&](const auto& db, const auto& txn, const auto&) {
-            if (const auto revision = db.currentObjectRevision(txn, active->id)) head = revision->uuid;
-        });
-        if (!head || (known && known->objectRevision == *head)) {
+        const auto head = _surfaceCatalog->session()->currentObject(row->source, active->id);
+        if (!head || (known && known->version == head->version && known->generation == head->generation)) {
             return;
         }
         if (_segmentationModule && _segmentationModule->editingEnabled()) {
@@ -4029,6 +4029,35 @@ void CWindow::UpdateVolpkgLabel(int filterCounter)
     }
 }
 
+void CWindow::startDraftRecovery()
+{
+    using namespace vc3d::settings;
+    const QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+    const int seconds = settings.value(object_store::DRAFT_CHECKPOINT_SECONDS,
+                                       object_store::DRAFT_CHECKPOINT_SECONDS_DEFAULT).toInt();
+    auto* drafts = _state->sessionDrafts();
+    if (seconds <= 0 || !drafts) return;
+    auto directory = settings.value(object_store::DRAFT_DIRECTORY).toString().trimmed();
+    if (directory.isEmpty())
+        directory = QStandardPaths::writableLocation(QStandardPaths::AppDataLocation) + QStringLiteral("/drafts");
+    QString message;
+    if (!drafts->start(directory.toStdString(), seconds * 1000)) {
+        message = tr("Crash recovery of unsaved edits is off: %1").arg(drafts->error());
+    } else if (const auto recovered = drafts->recoveredDrafts(); !recovered.empty()) {
+        message = tr("Unsaved edits of %n surface(s) were recovered from an earlier session; "
+                     "open a surface to restore or discard them.", nullptr, int(recovered.size()));
+    }
+    connect(drafts, &SessionDrafts::checkpointFailed, this, [this](const QString& error) {
+        showStatusBarMessage(tr("Unsaved edits are not crash-safe: the draft checkpoint failed: %1").arg(error), 0);
+    });
+    connect(drafts, &SessionDrafts::checkpointRestored, this, [this]() {
+        showStatusBarMessage(tr("Draft checkpoints work again."), 5000);
+    });
+    connect(drafts, &SessionDrafts::pendingResolved, this, [this](const QString& text) { showStatusBarMessage(text, 10000); });
+    if (!message.isEmpty())
+        QTimer::singleShot(0, this, [this, message]() { showStatusBarMessage(message, 15000); });
+}
+
 void CWindow::onShowStatusMessage(QString text, int timeout)
 {
     showStatusBarMessage(text, timeout);
@@ -4427,9 +4456,7 @@ std::optional<vcr::catalog::Affine> CWindow::volumeTransformForSwitch(const vc::
     // choices); without a store, the cached catalog's registrations.
     vc::objects::VolumeTransforms transforms;
     if (const auto attachment = _state->storeFor("volume_transform")) {
-        _state->objectStoreSession()->read(*attachment, [&](const auto& db, const auto& txn, const auto&) {
-            transforms = db.volumeTransforms(txn);
-        });
+        transforms = _state->objectStoreSession()->volumeTransforms(*attachment);
     } else if (const auto catalog = vcr::catalog::cachedManifest(vcr::catalog::catalogCacheFile(std::string(vcr::catalog::kDefaultManifestUrl)))) {
         transforms.graph.addCatalog(*catalog);
     }
@@ -4473,7 +4500,7 @@ void CWindow::setVolumeLevel(int level)
             const auto& opened = *_surfacePanel->opened();
             reopened = SurfaceCatalog::open(_state->objectStoreSession(), opened.pin.attachment,
                                             nextVoxels, opened.surface->id,
-                                            opened.current ? std::nullopt : std::optional(opened.pin.objectRevision));
+                                            opened.current ? std::nullopt : std::optional(opened.pin.reference()));
         }
         _state->vpkg()->setVolumeLevel(volume->id(), level);
     } catch (const std::exception& error) {
@@ -5604,51 +5631,48 @@ std::vector<vc::objects::AttachmentIdentity> openStores(const CState& state)
 }
 }
 
-void CWindow::updateHubStatus()
+void CWindow::updateHostedStatus()
 {
     const auto session = _state->objectStoreSession();
-    QStringList texts;
-    std::vector<std::string> conflicts;
+    const auto pending = session->pendingSubmissions();
+    QStringList texts, tips;
+    bool failing = false;
     for (const auto& attachment : openStores(*_state)) {
-        const auto status = session->hubStatus(attachment);
-        if (!status) continue;
-        texts << tr("%1 Hub: %2").arg(QString::fromStdString(session->path(attachment).stem().string()),
-                                       hubStatusSummary(*status));
-        for (const auto& conflict : status->conflicts) conflicts.push_back(conflict.uuid);
+        std::optional<vc::objects::HostedFreshness> freshness;
+        try { freshness = session->freshness(attachment); } catch (const std::exception&) { continue; }
+        if (!freshness) continue;
+        const auto endpoint = QString::fromStdString(session->location(attachment));
+        const auto checked = freshness->checkedAtUs
+            ? QDateTime::fromMSecsSinceEpoch(*freshness->checkedAtUs / 1000).toLocalTime().toString(QStringLiteral("HH:mm:ss"))
+            : QString();
+        QString text;
+        if (!freshness->error.empty()) {
+            failing = true;
+            text = checked.isEmpty() ? tr("%1: disconnected").arg(endpoint)
+                                     : tr("%1: disconnected, last current %2").arg(endpoint, checked);
+            tips << tr("%1: %2").arg(endpoint, QString::fromStdString(freshness->error));
+        } else if (!checked.isEmpty()) {
+            text = tr("%1: current as of %2").arg(endpoint, checked);
+        } else {
+            text = tr("%1: unknown").arg(endpoint);
+        }
+        const auto waiting = std::count_if(pending.begin(), pending.end(),
+                                           [&](const auto& p) { return p.storeUuid == attachment.storeUuid; });
+        if (waiting) text += tr(" · %n save(s) pending", nullptr, int(waiting));
+        if (freshness->status)
+            tips << tr("%1: store %2, generation %3, commit %4")
+                        .arg(endpoint, QString::fromStdString(freshness->status->storeUuid))
+                        .arg(QString::fromStdString(freshness->status->generation))
+                        .arg(freshness->status->commitSequence);
+        texts << text;
     }
     if (texts.isEmpty()) {
-        _hubStatusLabel->hide();
-        _hubPromptedConflicts.clear();
+        _hostedStatusLabel->hide();
         return;
     }
-    _hubStatusLabel->setText(texts.join(QStringLiteral("  ")));
-    _hubStatusLabel->show();
-    // Ask about a set of conflicts once; Sync Now asks again.
-    if (conflicts.empty() || conflicts == _hubPromptedConflicts) return;
-    _hubPromptedConflicts = conflicts;
-    promptHubConflicts();
+    _hostedStatusLabel->setText(texts.join(QStringLiteral("  ")));
+    _hostedStatusLabel->setToolTip(tips.join(QStringLiteral("\n")));
+    _hostedStatusLabel->setStyleSheet(failing ? QStringLiteral("color: #d28b00; font-weight: 600;") : QString());
+    _hostedStatusLabel->show();
 }
 
-void CWindow::promptHubConflicts()
-{
-    const auto session = _state->objectStoreSession();
-    for (const auto& attachment : openStores(*_state)) {
-        const auto status = session->hubStatus(attachment);
-        if (!status || status->conflicts.empty()) continue;
-        QStringList uuids;
-        for (const auto& conflict : status->conflicts) uuids << QString::fromStdString(conflict.uuid);
-        QMessageBox box(QMessageBox::Warning, tr("Hosted object store conflict"),
-            tr("%n record(s) of %1 changed both here and on the hub:", nullptr, int(uuids.size()))
-                .arg(QString::fromStdString(session->path(attachment).filename().string())) +
-                QStringLiteral("\n") + uuids.mid(0, 10).join(QStringLiteral("\n")) +
-                (uuids.size() > 10 ? QStringLiteral("\n...") : QString()) +
-                tr("\n\nUse the hub's versions (discarding your changes to them), or keep yours and publish them?"),
-            QMessageBox::NoButton, this);
-        auto* useHub = box.addButton(tr("Use Hub Versions"), QMessageBox::DestructiveRole);
-        auto* keepMine = box.addButton(tr("Keep Mine"), QMessageBox::AcceptRole);
-        box.addButton(tr("Later"), QMessageBox::RejectRole);
-        box.exec();
-        if (box.clickedButton() == useHub) session->resolveHubConflicts(attachment, "hub");
-        else if (box.clickedButton() == keepMine) session->resolveHubConflicts(attachment, "local");
-    }
-}

@@ -51,22 +51,6 @@ struct LinkCandidate {
     std::vector<std::string> tags;
 };
 
-// One structured detector outcome. A failure means the run did not do what was
-// asked for its objects (or, with none named, at all): a selected object could
-// not be loaded or validated, or the run was cancelled. Failed objects are left
-// out of stale-edge removal, so their existing edges are unchanged. A diagnostic
-// is an ordinary result, such as rejected candidate pairs, an object too
-// degenerate to link, or an unavailable strip cache.
-struct DetectorIssue {
-    enum class Severity { Failure, Diagnostic };
-    Severity severity = Severity::Failure;
-    std::string stage;                    // "validate", "load", "discover", "cache", "cancel" or "run"
-    std::vector<std::string> objectUuids; // affected objects; empty for the whole run
-    std::string reason;
-    std::string message;                 // human-readable context for this issue
-    int64_t count = 1;                    // occurrences summarized, e.g. rejected pairs
-};
-
 struct DetectorReport {
     int64_t objectsConsidered = 0;   // objects the pass examined
     int64_t candidatesFound = 0;     // candidates produced (before dedupe)
@@ -74,14 +58,14 @@ struct DetectorReport {
     int64_t edgesUpdated = 0;
     int64_t edgesSkippedExisting = 0;
     int64_t staleRemoved = 0;        // own pending edges replaced on re-run
-    bool committed = false;          // the edge counts above were committed
-    std::vector<DetectorIssue> issues;
-
-    bool failed() const;
+    // Objects that could not be loaded or linked (left out of stale-edge
+    // removal, so their existing edges are unchanged), rejected candidate
+    // pairs, an unavailable strip cache, and a cancellation.
+    std::vector<std::string> problems;
 };
-// Invalid parameters throw before any work. Invalid object frames are collected
-// as validation failures; discovery and writes are skipped for the whole run.
-// Other errors that abort a whole detector may throw; nothing is committed then.
+// Invalid parameters, and objects whose coordinate frame cannot be resolved
+// in the params' volume, throw std::invalid_argument before any work. Other
+// errors that abort a whole detector may throw; nothing is committed then.
 
 // Optional stale-edge scope for a partial detector run. Both endpoints
 // must be in objectUuids; empty sets deliberately remove nothing. A
@@ -247,7 +231,7 @@ struct OverlapCorrespondences {
 std::vector<OverlapCorrespondences> materializeOverlapCorrespondences(objects::ObjectStore& db,
     const std::vector<std::string>& edgeUuids, const OverlapCorrespondenceParams& params);
 
-// An overlap edge as a reader saw it at some earlier state (a hub position,
+// An overlap edge as a reader saw it at some earlier state (a pinned input position,
 // say): the edge record's stored endpoint order, whole-geometry anchors and
 // metadata, and each endpoint's object metadata and geometry revision then.
 // The caller has decided the edge applies at that state; it is not checked
@@ -284,7 +268,9 @@ struct LineSurfaceParams : CoordinateParams {
     // normals' resident-pool pack (PooledLasagnaSheetNormalSampler; ctLevel
     // does not apply). ctLevel and ctToBaseScale address whichever volume is
     // selected. With none, no normal strip is built and anchors test the
-    // centerline points themselves.
+    // centerline points themselves. Paths and URLs resolve where the
+    // detection runs (the caller's host for a local store, the service's
+    // for a served one); an unavailable source fails the run.
     std::filesystem::path normalXVolume, normalYVolume;
     std::filesystem::path normalPool;
     // Discovery: dense line point -> surface distance.
@@ -328,9 +314,10 @@ struct FiberSurfaceParams : LineSurfaceParams {
     std::optional<std::vector<std::string>> newUuids;
 };
 
-// Stored fibers -> stored surfaces. CT (ctVolume) or lasagna normals
-// (normalX/YVolume) supply the strip normal field; with neither, the centerline
-// alone gates anchors. Only line points between projected endpoint controls participate. Anchors use
+// Stored fibers -> stored surfaces. CT (ctVolume), lasagna normals
+// (normalX/YVolume) or a lasagna pack (normalPool) supply the strip normal
+// field; with none, the centerline alone gates anchors.
+// Only line points between projected endpoint controls participate. Anchors use
 // raw line indices and source XYZ. Failed inputs are excluded from stale removal.
 DetectorReport linkFibersToSurfaces(objects::ObjectStore& db,
     const std::filesystem::path& ctVolume, const FiberSurfaceParams& params = {},

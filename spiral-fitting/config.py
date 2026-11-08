@@ -35,7 +35,7 @@ _NULL_TYPES = {
     "loss_start_unattached_pcl_dt": "integer",
     "object_store_path": "string",
     "object_store_author": "string",
-    "object_store_input_position": "integer",
+    "object_store_input_position": "mapping",
     "object_store_patch_uuids": "strings",
     "object_store_patch_tags": "strings",
     "object_store_pcl_uuids": "strings",
@@ -739,6 +739,8 @@ class Config:
                 "strings": lambda: isinstance(value, list) and all(
                     isinstance(item, str) for item in value),
                 "dictionary": lambda: isinstance(value, dict),
+                # Any JSON object (a store position).
+                "mapping": lambda: isinstance(value, dict),
             }
             if not valid[spec["type"]]():
                 raise ValueError(f"Invalid value for {key}")

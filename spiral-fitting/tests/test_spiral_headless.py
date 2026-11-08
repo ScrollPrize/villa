@@ -42,7 +42,7 @@ def _zip_checkpoint_bytes(payload=b"payload"):
 
 
 class ProjectScrollTests(unittest.TestCase):
-    UMBILICUS = {"uuid": "u", "revision": "r", "points_zyx": [[0, 1, 2], [10, 1, 2]]}
+    UMBILICUS = {"uuid": "u", "generation": "g", "version": 1, "points_zyx": [[0, 1, 2], [10, 1, 2]]}
     LASAGNA = {"location": "/d/p.lasagna.json", "identity": "run-1", "group": "4",
                "normal_x": "/d/nx.ome.zarr", "normal_y": "/d/ny.ome.zarr"}
 

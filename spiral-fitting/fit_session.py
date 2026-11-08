@@ -171,7 +171,7 @@ from surface_orientation import spiral_outward_sense_for
 # 40: the client's project. Every session request (initialize, rebuild,
 # including a defaults rebuild) carries "project": {"name", "volumes": {store
 # volume: {voxel_size_um, base_shape_zyx, z_direction_is_top_to_bottom,
-# left_handed_coordinates, umbilicus: {uuid, revision, points_zyx}}}}, each
+# left_handed_coordinates, umbilicus: {uuid, revision, points_zyx}}}}, each (47: version)
 # fact only where the project knows it. The build fits the volume its inputs
 # name with that volume's umbilicus and facts; spiral-scroll.json becomes
 # optional, may state only what the project does not know, and must not
@@ -236,7 +236,25 @@ from surface_orientation import spiral_outward_sense_for
 # service start pushes them, and repeating the commit request retries.
 # /bindings advertises capabilities.commits. Default and tag selections
 # leave spiral-fit surfaces out, and naming one as an input is refused.
-API_VERSION = 46
+# 47: no hubs; positions are commits of one store. A service binds one
+# store (a file on its host, or in a later stage the endpoint of the
+# vc_object_server holding it), which clients attach as well; /bindings'
+# object_store carries its uuid, history "generation", "location",
+# "served" and "commit_sequence" (the head, or "position_error"), and no
+# "hub" or "positions". A position is {store, generation, commit_sequence};
+# a request's "inputs_position" is one of the service's store at or below
+# its head, with the "request_uuid" of the client's last save receipt when
+# it has one, which the service's store must hold (a copy with the same
+# identity is refused). Status "input_position" and the input manifest's
+# "position" are such positions ("requested" too); a manifest's objects
+# and relationships carry their numbered "version" instead of revision
+# UUIDs, and the inputs are read exactly at those versions. The link
+# refresh is one link_objects request of the store (all detectors and the
+# link marker commit atomically; a detector failure writes nothing) and
+# "object_store_input_position" (service-owned) is a position. Commits
+# report "version" (no "pushed"/"push_error", no "pending_commits"). The
+# project's umbilicus is {uuid, generation, version, points_zyx}.
+API_VERSION = 47
 
 
 class SessionState(str, Enum):
@@ -954,19 +972,21 @@ PROJECT_INPUT_KEYS = (*PROJECT_LASAGNA_INPUTS, *VOLUME_INPUT_KEYS)
 
 @dataclass(frozen=True)
 class ProjectUmbilicus:
-    """A volume's umbilicus in the project's umbilicus store: its object, the
-    revision VC3D read and its points in the volume's own voxels (ZYX)."""
+    """A volume's umbilicus in the project's umbilicus store: its object,
+    the numbered version (and history generation) VC3D read and its points
+    in the volume's own voxels (ZYX)."""
 
     uuid: str
-    revision: str
+    generation: str
+    version: int
     points_zyx: tuple[tuple[float, float, float], ...]
 
     def manifest(self) -> dict[str, Any]:
-        return {"uuid": self.uuid, "revision": self.revision,
+        return {"uuid": self.uuid, "generation": self.generation, "version": self.version,
                 "points": len(self.points_zyx)}
 
     def to_mapping(self) -> dict[str, Any]:
-        return {"uuid": self.uuid, "revision": self.revision,
+        return {"uuid": self.uuid, "generation": self.generation, "version": self.version,
                 "points_zyx": [list(point) for point in self.points_zyx]}
 
 
@@ -1207,9 +1227,10 @@ def _checked_umbilicus(value: Any, source: str) -> ProjectUmbilicus:
     if not isinstance(value, Mapping):
         raise ScrollSpecError(f"{source}: umbilicus must be an object")
     uuid = str(value.get("uuid") or "").strip()
-    revision = str(value.get("revision") or "").strip()
-    if not uuid or not revision:
-        raise ScrollSpecError(f"{source}: umbilicus needs its uuid and revision")
+    generation = str(value.get("generation") or "").strip()
+    version = value.get("version")
+    if not uuid or type(version) is not int or version <= 0:
+        raise ScrollSpecError(f"{source}: umbilicus needs its uuid and numbered version")
     points = value.get("points_zyx")
     try:
         points = tuple(tuple(float(coordinate) for coordinate in point) for point in points)
@@ -1220,7 +1241,7 @@ def _checked_umbilicus(value: Any, source: str) -> ProjectUmbilicus:
                               for point in points):
         raise ScrollSpecError(
             f"{source}: umbilicus points_zyx must be two or more finite ZYX points")
-    return ProjectUmbilicus(uuid=uuid, revision=revision, points_zyx=points)
+    return ProjectUmbilicus(uuid=uuid, generation=generation, version=int(version), points_zyx=points)
 
 
 @dataclass(frozen=True)
@@ -1327,11 +1348,11 @@ def write_project_umbilicus(directory: str | os.PathLike[str], volume_uuid: str,
     was built with."""
     target = Path(directory)
     target.mkdir(parents=True, exist_ok=True)
-    path = target / f"umbilicus-{umbilicus.revision}.json"
+    path = target / f"umbilicus-{umbilicus.uuid}-v{umbilicus.version}.json"
     document = {
         "control_points": [{"z": z, "y": y, "x": x} for z, y, x in umbilicus.points_zyx],
         "source": {"volume_uuid": volume_uuid, "object_uuid": umbilicus.uuid,
-                   "revision": umbilicus.revision},
+                   "generation": umbilicus.generation, "version": umbilicus.version},
     }
     temporary = path.with_name(f".{path.name}.tmp-{os.getpid()}")
     temporary.write_text(json.dumps(document), encoding="utf-8")
@@ -1495,7 +1516,7 @@ def write_autosave_metadata(
         # input_manifest.object_store_digest), likewise.
         document["input_digest"] = str(input_digest)
     if input_position:
-        # The hub position they were read at ({hub, sequence}).
+        # The store position they were read at ({store, generation, commit_sequence}).
         document["input_position"] = dict(input_position)
     temporary = metadata_path.with_name(f".{metadata_path.name}.incoming")
     with temporary.open("w", encoding="utf-8") as stream:

@@ -51,8 +51,8 @@ def _fit(binding, tmp_path):
     state.session_id = SESSION
     state.session_request = {'project': {
         'name': 's1', 'volume': VOLUME, 'base_shape_zyx': BASE_SHAPE,
-        'umbilicus': {'uuid': UMBILICUS['uuid'], 'revision': UMBILICUS['revision'],
-                      'points': 2}}}
+        'umbilicus': {'uuid': UMBILICUS['uuid'], 'generation': UMBILICUS['generation'],
+                      'version': UMBILICUS['version'], 'points': 2}}}
     serial = iter(range(1, 1000))
 
     def generation(**kwargs):
@@ -72,24 +72,6 @@ def _fit(binding, tmp_path):
 def fit(store_path, tmp_path):
     """A service sharing the store in place."""
     fit = _fit(spiral_service.bind_object_store(store_path, 'svc'), tmp_path)
-    yield fit
-    fit.state.close()
-
-
-@pytest.fixture()
-def hub(store_path, tmp_path):
-    """The startup fixture's store as a hub, and where the service's
-    replica of it goes."""
-    vos.hub_init(store_path, 'ingest')
-    return SimpleNamespace(hub=store_path,
-                           replica=str(tmp_path / 'replicas' / 'service.vcobj'))
-
-
-@pytest.fixture()
-def hosted(hub, tmp_path):
-    """A service bound to its own replica of the hub."""
-    fit = _fit(spiral_service.bind_object_store(hub.replica, 'svc', hub.hub), tmp_path)
-    fit.hub = hub.hub
     yield fit
     fit.state.close()
 
@@ -126,7 +108,7 @@ def test_a_commit_is_the_published_generation_with_its_provenance(fit):
     assert fit.state.binding_advertisement()['capabilities']['commits'] is True
     result = commit(fit, fit.generation())
     assert result['state'] == 'done', result['error']
-    assert result['reused'] is False and result['pushed'] is None
+    assert result['reused'] is False and result['version'] >= 1
     uuid = result['surface_uuid']
 
     xyz, windings = _grid()
@@ -155,7 +137,8 @@ def test_a_commit_is_the_published_generation_with_its_provenance(fit):
     assert meta['model_state_sha256'] == MODEL_STATE
     assert meta['input_digest'] == fit.inputs.digest
     assert meta['input_position'] == fit.inputs.manifest['position']
-    assert meta['umbilicus'] == {'uuid': UMBILICUS['uuid'], 'revision': UMBILICUS['revision']}
+    assert meta['umbilicus'] == {'uuid': UMBILICUS['uuid'], 'generation': UMBILICUS['generation'],
+                                 'version': UMBILICUS['version']}
     assert meta['coordinates']['volume_uuid'] == VOLUME
     provenance = meta['provenance']
     assert provenance['tool'] == 'spiral-fitting'
@@ -166,10 +149,10 @@ def test_a_commit_is_the_published_generation_with_its_provenance(fit):
     position = osi.InputPosition.from_provenance(meta['input_position'])
     with ObjectStore.open(fit.store, read_only=True) as db:
         reproduced = osi.resolve_selection(db, dataclasses.replace(
-            osi.request_from_config(config), position=position))
+            osi.request_from_config(config), pins=osi.InputPins(position)))
         current = osi.read_snapshot(db, osi.request_from_config(fit.config))
-    assert reproduced == {kind: [obj.uuid for obj in fit.inputs.snapshot.objects_of(kind)]
-                          for kind in osi.KINDS}
+    assert reproduced.uuids == {kind: [obj.uuid for obj in fit.inputs.snapshot.objects_of(kind)]
+                                for kind in osi.KINDS}
     # The commit is not an input: the session's selection and digest are
     # unchanged, and naming it is refused.
     assert uuid not in [obj.uuid for obj in current.objects_of('surface')]
@@ -370,166 +353,13 @@ def test_only_a_preview_of_this_session_is_committed(fit):
     assert fit.state.status()['commit'] is None
 
 
-# ---------------------------------------------------------------------------
-# A hub replica: commits are pushed with a plain push, or stay pending
-# ---------------------------------------------------------------------------
-
-def _names(path):
-    with ObjectStore.open(path, read_only=True) as db:
-        return {record['name']: record['uuid'] for record in db.objects_by_kind('surface')}
-
-
-def _on_hub(hub):
-    """UUIDs of the committed fits on ``hub``, read through a fresh clone."""
-    import tempfile
-    with tempfile.TemporaryDirectory() as directory:
-        clone = str(Path(directory) / 'reader.vcobj')
-        vos.hub_clone(hub, clone, 'reader')
-        return sorted(record['uuid'] for record in _committed(clone))
-
-
-def _hub_edges(hub, kind):
-    import tempfile
-    with tempfile.TemporaryDirectory() as directory:
-        clone = str(Path(directory) / 'reader.vcobj')
-        vos.hub_clone(hub, clone, 'reader')
-        with ObjectStore.open(clone, read_only=True) as db:
-            return db.edges_by_kind(kind)
-
-
-def _pending(path):
-    with ObjectStore.open(path, read_only=True) as db:
-        return db.hub_status()['pending']
-
-
-class _HubAway:
-    """The hub unreachable while inside: its file moved aside."""
-
-    def __init__(self, path):
-        self.path = Path(path)
-
-    def __enter__(self):
-        self.path.rename(self.path.with_suffix('.away'))
-
-    def __exit__(self, *exc):
-        self.path.with_suffix('.away').rename(self.path)
-
-
-def test_a_commit_reaches_the_hub(hosted):
-    assert hosted.state.binding_advertisement()['capabilities']['commits'] is True
-    result = commit(hosted, hosted.generation())
-    assert result['state'] == 'done', result['error']
-    assert result['pushed'] is True and result['push_error'] is None
-    assert hosted.state.status()['pending_commits'] == []
-    assert _on_hub(hosted.hub) == [result['surface_uuid']]
-
-
-def test_a_commit_names_its_push_apart_from_its_write(hosted):
-    # Pushing a large surface takes far longer than writing it, so status
-    # must not show "Writing the surface" while the hub transfer runs.
-    stages = []
-    record = hosted.state._commit_stage
-    hosted.state._commit_stage = lambda name: (stages.append(name), record(name))
-    assert commit(hosted, hosted.generation())['pushed'] is True
-    assert stages == ['Waiting for the object store', 'Pulling from the hub',
-                      'Writing the surface to the object store',
-                      'Pushing the surface to the hub']
-    # Committed again, the surface is reused and nothing is written or pushed.
-    stages.clear()
-    assert commit(hosted, hosted.generation())['reused'] is True
-    assert stages == ['Waiting for the object store', 'Pulling from the hub']
-
-
-def test_unpublished_links_are_reverted_before_the_push(hosted):
-    names = _names(hosted.store)
-    # Links a refresh left behind when its revert failed.
-    with ObjectStore.open(hosted.store, author='svc') as db:
-        db.add_edge({'kind': 'related', 'a': names['near'], 'b': names['far'],
-                     'a_anchor': {'whole_geometry': True}, 'b_anchor': {'whole_geometry': True}})
-    result = commit(hosted, hosted.generation())
-    assert result['pushed'] is True
-    assert _hub_edges(hosted.hub, 'related') == []
-    assert _on_hub(hosted.hub) == [result['surface_uuid']]
-    assert _pending(hosted.store) == []
-
-
-def test_a_revert_that_fails_writes_nothing(hosted, monkeypatch):
-    def refuse(self):
-        raise RuntimeError('the hub is locked')
-    monkeypatch.setattr(ObjectStore, 'hub_revert', refuse)
-    result = commit(hosted, hosted.generation())
-    assert result['state'] == 'failed'
-    assert 'the hub is locked' in result['error']
-    assert _committed(hosted.store) == []
-
-
-def test_a_commit_the_hub_did_not_receive_stays_pending(hosted):
-    with _HubAway(hosted.hub):
-        result = commit(hosted, hosted.generation())
-        assert result['state'] == 'done'
-        assert result['pushed'] is False and result['push_error']
-        uuid = result['surface_uuid']
-        assert hosted.state.status()['pending_commits'] == [uuid]
-    assert _on_hub(hosted.hub) == []
-    # Once the hub is back, the next input preparation publishes it with its
-    # links.
-    with ObjectStore.open(hosted.store, author='svc') as store:
-        osi.prepare_position(store, hosted.config, osi.request_from_config(hosted.config),
-                             log=lambda line: None)
-    assert _pending(hosted.store) == []
-    assert _on_hub(hosted.hub) == [uuid]
-
-
-def test_repeating_a_commit_retries_its_push(hosted):
-    artifact = hosted.generation()
-    with _HubAway(hosted.hub):
-        first = commit(hosted, artifact)
-    assert first['pushed'] is False
-    again = commit(hosted, artifact)
-    assert again['reused'] is True and again['pushed'] is True
-    assert again['surface_uuid'] == first['surface_uuid']
-    assert hosted.state.status()['pending_commits'] == []
-    assert _on_hub(hosted.hub) == [first['surface_uuid']]
-
-
-def test_startup_pushes_pending_commits_and_refuses_anything_else(hosted, hub):
-    with _HubAway(hosted.hub):
-        uuid = commit(hosted, hosted.generation())['surface_uuid']
-    hosted.state.close()
-    # A restarted service starts, and publishes the commit.
-    restarted = spiral_service.bind_object_store(hub.replica, 'svc', hub.hub)
-    assert restarted.hub == hosted.state.object_store.hub
-    assert _pending(hub.replica) == []
-    assert _on_hub(hub.hub) == [uuid]
-    # A surface the service did not commit is still refused.
-    from vc_object_store.surfaces import create_surface
-    xyz, _ = _grid()
-    create_surface(hub.replica, np.nan_to_num(xyz, nan=-1.0), name='stray', scale=0.05,
-                   volume=VOLUME, tool='other', author='svc')
-    with pytest.raises(spiral_service.ObjectStoreBindingError, match='unpublished edits'):
-        spiral_service.bind_object_store(hub.replica, 'svc', hub.hub)
-
-
-def test_a_pushed_commit_leaves_the_hub_links_current(hosted):
-    # The commit moves the hub head; the next update finds only an
-    # unselected surface since its links, so it neither relinks nor fails.
-    assert commit(hosted, hosted.generation())['pushed'] is True
-    lines = []
-    with ObjectStore.open(hosted.store, author='svc') as store:
-        prepared = osi.prepare_position(store, hosted.config,
-                                        osi.request_from_config(hosted.config),
-                                        log=lines.append)
-    assert any('link refresh: skip' in line for line in prepared.lines + lines), (
-        prepared.lines, lines)
-
-
-def test_a_commit_waits_for_a_link_refresh(hosted):
-    # A refresh holds the store-write lock while it links and pushes.
-    with hosted.state._store_write_lock:
-        hosted.state.commit({'artifact': hosted.generation()})
+def test_a_commit_waits_for_a_link_refresh(fit):
+    # A refresh holds the store-write lock while it links.
+    with fit.state._store_write_lock:
+        fit.state.commit({'artifact': fit.generation()})
         time.sleep(0.2)
-        commit_state = hosted.state.status()['commit']
+        commit_state = fit.state.status()['commit']
         assert commit_state['state'] == 'running'
         assert commit_state['stage_name'] == 'Waiting for the object store'
-        assert _committed(hosted.store) == []
-    assert settle(hosted.state)['pushed'] is True
+        assert _committed(fit.store) == []
+    assert settle(fit.state)['state'] == 'done'

@@ -1,4 +1,5 @@
 #include "imports/SourceRelationships.hpp"
+#include "vc_object_store/objects/GeometryIngest.hpp"
 #include "vc_object_store/Uuid.hpp"
 #include "geometry/GeometrySnapshot.hpp"
 #include "geometry/Dependencies.hpp"
@@ -16,7 +17,7 @@ struct Points {
     Anchor anchor(int64_t index) const {
         const auto offset = index;
         if (offset < 0 || static_cast<size_t>(offset) >= xyz.size() / 3)
-            throw std::runtime_error("source branch control point index out of range");
+            throw GeometrySourceRejected("source branch control point index out of range");
         Anchor result;
         result.points.push_back({"control_point_ids", {ids.at(index)}});
         result.position = {xyz[3*offset], xyz[3*offset+1], xyz[3*offset+2]};
@@ -45,7 +46,7 @@ int64_t importSourceRelationships(ObjectStore& db, WriteTxn& txn, const std::vec
         auto object = db.objectByUuid(txn, id);
         auto revision = db.currentGeometry(txn, id);
         if (!object || object->kind != "fiber" || !revision)
-            throw std::runtime_error("source relationship endpoint needs stored fiber geometry: " + id);
+            throw GeometrySourceRejected("source relationship endpoint needs stored fiber geometry: " + id);
         GeometrySnapshot snapshot; snapshot.revision = *revision;
         snapshot.arrays["control_points"] = db.readGeometryArray(txn, revision->uuid, "control_points");
         snapshot.arrays["control_point_ids"] = db.readGeometryArray(txn, revision->uuid, "control_point_ids");
@@ -63,14 +64,14 @@ int64_t importSourceRelationships(ObjectStore& db, WriteTxn& txn, const std::vec
             if (forward || reverse) {
                 if (edge.kind == "fiber_branch" &&
                     Json::parse(current.meta).value("adjacent", false) != Json::parse(edge.meta).value("adjacent", false))
-                    throw std::runtime_error("conflicting ordinary/adjacent fiber branch declarations: " +
+                    throw GeometrySourceRejected("conflicting ordinary/adjacent fiber branch declarations: " +
                                              edge.aUuid + " <-> " + edge.bUuid);
                 if (edge.kind == "fiber_branch" &&
                     ((!edge.uuid.empty() && edge.uuid != current.uuid) || edge.approvalState != current.approvalState ||
                      Json::parse(current.meta).value("auto", false) != Json::parse(edge.meta).value("auto", false) ||
                      (forward ? !sameDirection(current.aAnchor, edge.aAnchor) || !sameDirection(current.bAnchor, edge.bAnchor)
                               : !sameDirection(current.bAnchor, edge.aAnchor) || !sameDirection(current.aAnchor, edge.bAnchor))))
-                    throw std::runtime_error("conflicting reciprocal fiber branch declarations");
+                    throw GeometrySourceRejected("conflicting reciprocal fiber branch declarations");
                 return; // Consistent reciprocal declarations represent one edge.
             }
         }
@@ -106,10 +107,10 @@ int64_t importSourceRelationships(ObjectStore& db, WriteTxn& txn, const std::vec
         if(entry.object.kind=="point_collection") validateSourceIdentities(connection,entry.object.uuid);
     auto anchor=[&](const std::string& object,int64_t id) {
         const auto revision=db.currentGeometry(txn,object);
-        if(!revision) throw std::runtime_error("source relationship endpoint needs stored point_collection geometry: "+object);
+        if(!revision) throw GeometrySourceRejected("source relationship endpoint needs stored point_collection geometry: "+object);
         const PointReference reference{"point_ids",{id}};
         const auto bytes=pointValue(dependencyGeometry(db,txn,*revision),reference);
-        if(!bytes) throw std::runtime_error("source link refers to missing point ID");
+        if(!bytes) throw GeometrySourceRejected("source link refers to missing point ID");
         GeometrySnapshot snapshot; snapshot.arrays["point"]=*bytes;
         const auto xyz=snapshot.values<double>("point");
         Anchor result; result.points.push_back(reference); result.position={xyz[0],xyz[1],xyz[2]}; return result;
@@ -127,7 +128,7 @@ int64_t importSourceRelationships(ObjectStore& db, WriteTxn& txn, const std::vec
             for (const auto& link : attributes.value("links", Json::array())) {
                 const auto id = link.get<int64_t>();
                 const auto found=sourcePoint(connection,origin,id);
-                if(!found) throw std::runtime_error("point link target not ingested: " + std::to_string(id));
+                if(!found) throw GeometrySourceRejected("point link target not ingested: " + std::to_string(id));
                 EdgeRecord edge; edge.kind = "point_link"; edge.aUuid = entry.object.uuid; edge.bUuid = found->object;
                 edge.aAnchor = anchor(edge.aUuid,point);
                 edge.bAnchor = anchor(edge.bUuid,id);
@@ -138,7 +139,7 @@ int64_t importSourceRelationships(ObjectStore& db, WriteTxn& txn, const std::vec
         for (const auto& link : entry.source.value("windings_linked", Json::array())) {
             const auto id = link.is_string() ? link.get<std::string>() : std::to_string(link.get<int64_t>());
             const auto found=sourceCollection(connection,origin,id);
-            if(!found) throw std::runtime_error("winding link target not ingested: " + id);
+            if(!found) throw GeometrySourceRejected("winding link target not ingested: " + id);
             EdgeRecord edge; edge.kind = "collection_winding"; edge.aUuid = entry.object.uuid; edge.bUuid = *found;
             edge.aAnchor.wholeGeometry = true; edge.bAnchor.wholeGeometry = true;
             edge.meta = R"({"source_import":"object-source"})";

@@ -56,7 +56,7 @@ def test_the_runtime_reads_the_bound_store_and_reports_it(state, store_path,
     assert status['input_position']['source'] == 'prepared'
     # The adapter's report is in the status and in the event stream.
     report = status['input_report']
-    assert any(line.startswith('reading pinned position') for line in report)
+    assert any(line.startswith('reading pinned commit') for line in report)
     assert f'object-store inputs frozen: digest {inputs.digest[:16]}' in report
     events = [event for event in state.events.read_after(0)['events']
               if event['kind'] == 'inputs']
@@ -102,7 +102,8 @@ def test_input_refusals_reach_status_and_events(state, store_path, device_stubs)
     status = state.status()
     assert status['state'] == 'Uninitialized' and device_stubs == []
     failure = status['input_preparation_error']
-    assert any('pcl_patch: FAILED' in line for line in failure['problems'])
+    assert any('point-collection-surface' in line and 'nothing was written' in line
+               for line in failure['problems'])
     assert 'LinkRefreshError' in failure['message']
     [error] = [event for event in state.events.read_after(0)['events']
                if event['kind'] == 'error']
@@ -160,7 +161,7 @@ def test_a_refresh_failure_stops_both_ranks_before_either_starts(store_path, tmp
     outcome = _two_rank_sessions(tmp_path, store_path, pcl_link_window_min_points=5)
     for rank in outcome:
         assert rank['state'] == 'Error' and not rank['ever_idle']
-        assert any('pcl_patch: FAILED' in line for line in rank['input_problems'])
+        assert any('point-collection-surface' in line for line in rank['input_problems'])
     assert outcome[0]['input_problems'] == outcome[1]['input_problems']
 
 
@@ -298,7 +299,7 @@ def varied_store(tmp_path):
                     'action': 'keep_recorded',
                     'a_revision': db.current_geometry(edge['a'])['uuid'],
                     'b_revision': db.current_geometry(edge['b'])['uuid']}
-        db.put_geometry(far, moved, expected_revision=db.current_geometry(far)['uuid'],
+        db.put_geometry(far, moved, expected_version=db.current_version(far),
                         edge_edits=[keep_recorded(edge) for edge in
                                     db.affected_geometry_edges(far, moved)])
     return path

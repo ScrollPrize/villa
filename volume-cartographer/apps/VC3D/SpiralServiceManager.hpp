@@ -53,55 +53,45 @@ public:
 
     // The one service API version this build speaks; the handshake refuses
     // anything else. Reported to the user so a mismatch is self-explanatory.
-    static constexpr int kApiVersion = 46;
+    static constexpr int kApiVersion = 47;
 
     // The object store a service reads its fit inputs from, beside the one
-    // attached in this VC3D. Inputs are displayed as fitted only when both
-    // are the same store (the same UUID: a hub replica shares it). A service
-    // bound to a hub replica fits hub positions; it matches only a replica
-    // of the same hub (the hub identity), whose positions are comparable.
-    // A local service on a plain store shares the file with this VC3D and
-    // fits positions of the store itself.
+    // attached in this VC3D. Inputs are displayed as fitted, and saved edits
+    // reach the fit, only when both are the same store: the same UUID and
+    // history generation. A service binds a store file on its host or a
+    // served store's endpoint; this VC3D attaches a file or an endpoint.
     struct StoreBinding {
-        QString serviceUuid;   // /bindings object_store.uuid
-        QString servicePath;   // where the service host opened it
-        QString serviceHub;    // the hub address on the service host
-        QString serviceHubIdentity;
-        qint64 servicePosition = -1;  // the service replica's last pull (a shared store's head)
-        QString servicePositionError;  // why it could not be read
-        // Whose positions the service fits: its hub's, or (a plain store
-        // shared in place) the store's own; empty when it fits none.
-        QString servicePositions;
+        QString serviceUuid;        // /bindings object_store.uuid
+        QString serviceGeneration;  // its history generation
+        QString serviceLocation;    // the path or endpoint the service opened
+        bool serviceServed = false; // the service binds a vc_object_server endpoint
+        qint64 serviceCommitSequence = -1;  // the service's store head when advertised
+        QString servicePositionError;       // why it could not be read
         // The attachment is the service's own store file: a local service
-        // on the same path, which saves reach without a hub.
+        // on the same path.
         bool sameFile = false;
-        QString localUuid;     // the attachment's store UUID
-        QString localPath;
-        QString localHub;      // the attachment's hub, when it is a replica
-        QString localHubIdentity;
-        qint64 localPosition = -1;    // the hub position the last sync reached
-        int localPending = 0;         // saved edits not yet pushed
-        int localConflicts = 0;
+        QString localUuid;          // the attachment's store UUID
+        QString localGeneration;
+        QString localLocation;      // its path, or the endpoint it is attached through
+        bool localHosted = false;   // attached through vc_object_server
+        qint64 localCommitSequence = -1;  // the attachment's head at the last refresh
         bool advertised() const { return !serviceUuid.isEmpty(); }
-        bool hosted() const { return !serviceHubIdentity.isEmpty(); }
-        bool localHosted() const { return !localHubIdentity.isEmpty(); }
         bool matches() const
         {
-            return advertised() && serviceUuid == localUuid
-                && (!hosted() || serviceHubIdentity == localHubIdentity);
+            return advertised() && serviceUuid == localUuid && serviceGeneration == localGeneration;
         }
-        // The service fits positions; a client can name one (its saved
-        // edits) when it replicates the service's hub or shares its file.
-        bool positioned() const { return !servicePositions.isEmpty(); }
-        bool shared() const { return positioned() && !hosted() && sameFile && matches(); }
-        bool canUpdate() const { return matches() && (hosted() || shared()); }
-        // Which stores are bound, without sync progress (positions, pending
-        // edits, conflicts), which every hub sync updates.
+        // The service's store is a file local to its host and this VC3D is
+        // not attached to it: edits and commits need it served and attached.
+        bool localToService() const { return advertised() && !serviceServed && !matches(); }
+        // A client can name its saved edits (an input position) when it is
+        // attached to the service's store.
+        bool canUpdate() const { return matches(); }
+        // Which stores are bound, without the heads, which every commit moves.
         QStringList identity() const
         {
-            return {serviceUuid, serviceHubIdentity, servicePositions, localUuid, localPath,
-                    localHubIdentity, matches() ? QStringLiteral("matches") : QString(),
-                    shared() ? QStringLiteral("shared") : QString()};
+            return {serviceUuid, serviceGeneration, serviceLocation, serviceServed ? QStringLiteral("served") : QString(),
+                    localUuid, localGeneration, localLocation, matches() ? QStringLiteral("matches") : QString(),
+                    sameFile ? QStringLiteral("same-file") : QString()};
         }
     };
 
@@ -160,29 +150,29 @@ public:
     void rebuildWithDefaults();
 
     // One "Update fit inputs": the resident fit's inputs replaced in place
-    // (or a rebuild) at a position. Needs a service that fits positions and
-    // either a replica of its hub or its own store file attached here
+    // (or a rebuild) at a position. Needs the service's store attached here
     // (storeBinding().canUpdate()).
     struct InputUpdate {
-        qint64 requested = -1;  // M: where this store's saved (pushed) edits reached
+        qint64 requested = -1;  // M: the store's head (commit sequence) holding this VC3D's saved edits
         qint64 head = -1;       // H: the head the service linked at
         qint64 fitted = -1;     // N: H plus the service's links; the fit's inputs
         QString error;          // empty on success
-        QStringList problems;   // the service's reasons, or the hub conflicts
-        bool conflicts = false; // hub conflicts blocked the push
+        QStringList problems;   // the service's reasons
         // Commits the position includes beyond M by other writers, and
         // commits after N (excluded: they show as stale).
         QStringList includedBeyondRequested;
         QStringList afterFitted;
     };
-    // Hold this replica's background pushes, push its saved edits and wait
-    // (stopping on hub conflicts), then initialize or rebuild the fit from a
-    // hub position including them; finally release the hold and pull to the
-    // position the service fitted. ``request`` is the panel's session request.
-    // With an idle resident fit this updates its inputs in place
-    // (POST /session/update-inputs: model and optimiser state are kept);
-    // without a session it initializes one, and a failed session is rebuilt.
+    // Initialize or rebuild the fit from a position of the service's store
+    // including this VC3D's saved edits (its head and the receipt of its
+    // last save), or with an idle resident fit update its inputs in place
+    // (POST /session/update-inputs: model and optimiser state are kept); a
+    // failed session is rebuilt. ``request`` is the panel's session request.
     void updateFitInputs(QJsonObject request);
+    // The request UUID of the last save this VC3D committed to the attached
+    // store: an input update names it, so the service can verify its store
+    // holds the edits (and is not a copy with the same identity).
+    void setLastSaveRequest(const QString& requestUuid) { _lastSaveRequest = requestUuid; }
     bool inputUpdateActive() const { return _inputUpdateActive; }
     void runIterations(int iterations, const QJsonObject& runConfig,
                        const QJsonObject& dtLossSchedule,
@@ -202,16 +192,9 @@ public:
                         std::optional<vc::objects::AttachmentIdentity> attachment,
                         const QString& unavailableReason = {});
     const StoreBinding& storeBinding() const { return _storeBinding; }
-    // Re-read the attachment's hub state (its sync position), e.g. after a
-    // hub session event.
-    void refreshLocalHub();
-    // Where this machine reaches the service's hub: the profile's hub
-    // address, else for an SSH profile the advertised path on its host
-    // (sftp://destination/path), else the advertised address itself.
-    QString serviceHubAddress() const;
-    // The local service's own replica of the attachment's hub (under the
-    // output root, by hub identity): client and service never share one.
-    static QString localServiceReplica(const QString& outputRoot, const QString& hubIdentity);
+    // Re-read the attachment's status (its generation and head), e.g. after
+    // a commit event.
+    void refreshLocalStore();
     // Configuration keys the service's launch binding owns
     // (schema.fields[*].service_owned): requests never choose them.
     const QSet<QString>& serviceOwnedKeys() const { return _serviceOwnedKeys; }
@@ -234,7 +217,7 @@ public:
     // than being on by default.
     void setPreviewDiagnostics(bool enabled) { _previewDiagnosticsWanted = enabled; }
     // How input changes reach a fit: saved in the store, then an input update
-    // (or, without a hub, a rebuild with current inputs).
+    // (or a rebuild with current inputs).
     static QString inputChangesMessage();
     // Whether this client holds the service's session lease, which every
     // mutating request needs.
@@ -250,11 +233,8 @@ public:
         QString stage;             // while running
         QString surfaceUuid;
         QString geometryRevision;
+        qint64 version = 0;        // the surface's object version in the service's store
         bool reused = false;       // the same fit was committed before
-        // Whether the surface reached the service's hub; nullopt for a
-        // service sharing its store in place (no hub).
-        std::optional<bool> pushed;
-        QString pushError;
         QString error;             // state failed
         // Status "commit", or nullopt when it carries none.
         static std::optional<CommitResult> fromStatus(const QJsonObject& status);
@@ -264,13 +244,9 @@ public:
     // The preview artifact on display, which a commit names.
     QString displayedPreviewArtifact() const { return _installedPreviewArtifact; }
     bool commitActive() const { return !_commitArtifact.isEmpty(); }
-    // Commit the preview artifact `artifact` (default: the one on display),
-    // or repeat a commit to retry its push; the outcome arrives through
-    // commitFinished.
+    // Commit the preview artifact `artifact` (default: the one on display);
+    // the outcome arrives through commitFinished.
     void commitPreview(const QString& artifact = {});
-    // Committed fits the service's hub replica holds unpushed (status
-    // "pending_commits").
-    QStringList pendingCommits() const { return _pendingCommits; }
 
     // Fetch a file intentionally omitted from the initial preview transfer.
     // Only files declared by the currently installed diagnostics artifact are
@@ -380,17 +356,16 @@ private:
     void clearSessionLease();
     void updateStoreBinding();
     void updateSameFile();
-    // A store's journal head: the position a shared store's saves reached.
+    // A store's head: the commit sequence its saves reached.
     static qint64 storeHead(vc::objects::ObjectStoreSession&, const vc::objects::AttachmentIdentity&);
     QString _sessionLeaseId;
     bool _leaseOwner = false;
-    // Update fit inputs in flight: its push hold, released when it finishes.
+    // Update fit inputs in flight.
     bool _inputUpdateActive = false;
+    QString _lastSaveRequest;
     // The resident session's state and input generation, as last reported.
     QString _sessionState;
     qint64 _inputGeneration = 0;
-    qint64 _forwardSyncPosition = -1;  // the fitted position a sync was last asked to reach
-    std::shared_ptr<vc::objects::PushHold> _inputUpdateHold;
     // Each update's callbacks carry its serial; abandoning one (the
     // connection changed under it) bumps the serial, so the late callbacks
     // of the abandoned update are ignored.
@@ -491,7 +466,6 @@ private:
     // request was answered at: only later statuses report its outcome.
     QString _commitArtifact;
     qint64 _commitStatusGeneration = -1;
-    QStringList _pendingCommits;
     void finishCommit(const CommitResult& result);
 
     QStringList artifactCachePins() const;

@@ -1,6 +1,7 @@
 #include "vc_object_store/objects/GeometryIngest.hpp"
 #include "vc_object_store/objects/GeometryCoordinates.hpp"
 #include "vc_object_store/TerminalProgress.hpp"
+#include "vc_object_store/Uuid.hpp"
 #include <iostream>
 
 int main(int argc, char** argv)
@@ -94,8 +95,11 @@ try {
     auto print = [&](const vc::objects::GeometryIngestReport& report) {
         std::cout << report.ingested << " ingested, " << report.problems.size() << " problems\n";
         for (const auto& notice : report.notices) std::cout << notice << '\n';
+        std::cout << report.ingested << " ingested, " << report.existing.size() << " already in the store, "
+                  << report.problems.size() << " problems\n";
         for (const auto& problem : report.problems) std::cerr << problem << '\n';
-        failed |= !report.problems.empty();
+        if (report.fatalError) std::cerr << "stopped: " << *report.fatalError << '\n';
+        failed |= !report.problems.empty() || report.fatalError.has_value();
     };
     for (const auto& [kind, source] : sources) {
         vc::objects::util::TerminalProgress progress("Ingest " + kind, showProgress);

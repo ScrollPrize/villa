@@ -260,14 +260,6 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
     _objectStoreSummary->setTextInteractionFlags(Qt::TextSelectableByMouse);
     pathsForm->addRow(tr("Object store"), _objectStoreSummary);
     describe(QStringLiteral("object_store"), {_objectStoreSummary});
-    _cloneHub = new QPushButton(tr("Clone the Service's Hub…"), pathsContents);
-    _cloneHub->setObjectName(QStringLiteral("spiralCloneHub"));
-    _cloneHub->setToolTip(tr("Edits reach a hub-bound fit through a replica of its hub: "
-                             "clone the hub to a local replica and attach it."));
-    _cloneHub->setVisible(false);
-    pathsForm->addRow(QString(), _cloneHub);
-    connect(_cloneHub, &QPushButton::clicked, this,
-            [this] { emit cloneHubRequested(_service->serviceHubAddress()); });
 
     // Vertical fibers lie on the back face of the papyrus sheet; the fitter can
     // expect them a few voxels radially outside the winding it fits to the
@@ -712,24 +704,14 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
     _openCommitted = new QPushButton(tr("Open"), storedContents);
     _openCommitted->setObjectName(QStringLiteral("spiralOpenCommitted"));
     _openCommitted->setVisible(false);
-    _retryPush = new QPushButton(tr("Retry Push"), storedContents);
-    _retryPush->setObjectName(QStringLiteral("spiralRetryPush"));
-    _retryPush->setVisible(false);
     commitResultRow->addWidget(_commitStatus, 1);
     commitResultRow->addWidget(_openCommitted);
-    commitResultRow->addWidget(_retryPush);
     storedLayout->addLayout(commitResultRow);
-    describe(QStringLiteral("stored_commit"), {_commitPreview, _retryPush});
+    describe(QStringLiteral("stored_commit"), {_commitPreview});
     describe(QStringLiteral("stored_open"), {_openStoredFit, _openCommitted});
     describe(QStringLiteral("stored_status"), {_commitStatus});
     connect(_commitPreview, &QPushButton::clicked, this, [this]() {
         _service->commitPreview();
-        updateCommitActions();
-    });
-    connect(_retryPush, &QPushButton::clicked, this, [this]() {
-        // The same request again: the service reuses the surface and pushes it.
-        _retryPush->setVisible(false);
-        _service->commitPreview(_committedArtifact);
         updateCommitActions();
     });
     connect(_openStoredFit, &QPushButton::clicked, this, [this]() { emit openStoredFitRequested({}); });
@@ -1217,10 +1199,10 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
                     for (const QString& problem : update.problems) lines << QStringLiteral("  ") + problem;
                     _warnings->setText(lines.join(QStringLiteral("\n")));
                 } else {
-                    lines << tr("Updated: the fit reads position %1 (your edits reached %2; linked at %3)")
+                    lines << tr("Updated: the fit reads the store at commit %1 (your edits reached %2; linked at %3)")
                                  .arg(update.fitted).arg(update.requested).arg(update.head);
                     if (!update.includedBeyondRequested.isEmpty())
-                        lines << tr("It includes %n later hub commit(s) by others:", nullptr,
+                        lines << tr("It includes %n later commit(s) by others:", nullptr,
                                     int(update.includedBeyondRequested.size()))
                               << update.includedBeyondRequested.mid(0, 5);
                     if (!update.afterFitted.isEmpty())
@@ -1838,7 +1820,6 @@ void SpiralPanel::setDisplayedStoredFit(const QString& uuid, const QString& name
         _commitStatus->setVisible(true);
         _commitStatus->setText(tr("Showing the committed fit %1 (%2) until the next preview").arg(name, uuid));
         _openCommitted->setVisible(false);
-        _retryPush->setVisible(false);
     }
     updateCommitActions();
 }
@@ -1860,14 +1841,12 @@ void SpiralPanel::updateCommitActions()
         note = tr("No published preview is displayed");
     _commitPreview->setEnabled(note.isEmpty());
     setToolTipNote(_commitPreview, note);
-    _retryPush->setEnabled(_connected && _service->ownsSessionLease() && !_service->commitActive());
 }
 
 void SpiralPanel::showCommitResult(const SpiralServiceManager::CommitResult& result)
 {
     _commitStatus->setVisible(true);
     _openCommitted->setVisible(false);
-    _retryPush->setVisible(false);
     if (result.state != QStringLiteral("done")) {
         _commitStatus->setText(tr("Commit failed: %1").arg(result.error));
         updateCommitActions();
@@ -1878,21 +1857,14 @@ void SpiralPanel::showCommitResult(const SpiralServiceManager::CommitResult& res
     const QString what = result.reused ? tr("Committed before as %1").arg(result.surfaceUuid)
                                        : tr("Committed as %1").arg(result.surfaceUuid);
     const auto& binding = _service->storeBinding();
-    const bool hosted = result.pushed.has_value();
-    if (hosted && !*result.pushed) {
-        // On the service, not on the hub: nothing here can open it yet.
-        _commitStatus->setText(tr("%1 on the service, but not on the hub yet (%2). Later pushes publish it, "
-                                  "or retry now.").arg(what, result.pushError));
-        _retryPush->setVisible(true);
-    } else if (!binding.matches() || (!hosted && !binding.sameFile)) {
-        _commitStatus->setText(tr("%1. Attach the service's object store (or a replica of its hub) "
-                                  "to open it.").arg(what));
-    } else if (hosted) {
-        _commitStatus->setText(tr("%1, on the hub.").arg(what));
-        _openCommitted->setVisible(true);
+    if (!binding.matches()) {
+        _commitStatus->setText(binding.localToService()
+            ? tr("%1, committed to the service's store. This service's store is local to its host: edits "
+                 "and commits need it served (vc_object_server) and attached here to open it.").arg(what)
+            : tr("%1, committed to the service's store. Attach that store to open it.").arg(what));
     } else {
-        // The service shares this store file: open it at once.
-        _commitStatus->setText(tr("%1.").arg(what));
+        // The service's store is attached here: open it at once.
+        _commitStatus->setText(tr("%1, committed to the service's store.").arg(what));
         _openCommitted->setVisible(true);
         emit openStoredFitRequested(result.surfaceUuid);
     }
@@ -1929,47 +1901,41 @@ void SpiralPanel::applyBindings(const QJsonObject& advertisement)
 void SpiralPanel::updateObjectStoreSummary()
 {
     const auto& binding = _service->storeBinding();
-    _cloneHub->setVisible(binding.hosted() && !binding.matches());
-    auto position = [](qint64 value) {
-        return value < 0 ? tr("not synced yet") : tr("position %1").arg(value);
+    auto head = [](qint64 value) {
+        return value < 0 ? tr("head unknown") : tr("at commit %1").arg(value);
     };
-    QString local = binding.localUuid.isEmpty()
+    const QString local = binding.localUuid.isEmpty()
         ? QString()
-        : binding.localHosted()
-            ? tr("%1, a replica of hub %2 (%3), synced to %4")
-                  .arg(binding.localPath, binding.localHub, binding.localHubIdentity,
-                       position(binding.localPosition))
-            : binding.localPath;
+        : tr("%1 (generation %2, %3)%4").arg(binding.localLocation, binding.localGeneration,
+                                            head(binding.localCommitSequence),
+                                            binding.localHosted ? tr(", served") : QString());
     if (!binding.advertised()) {
         _objectStoreSummary->setText(binding.localUuid.isEmpty()
             ? tr("No object store attached in VC3D")
-            : tr("Attached here: %1 (%2)").arg(binding.localUuid, local));
+            : tr("Attached here: %1, %2").arg(binding.localUuid, local));
         return;
     }
-    QString text = tr("Service reads %1 (%2 on the service host)")
-                       .arg(binding.serviceUuid, binding.servicePath);
-    if (binding.hosted())
-        text += tr("\nIt fits positions of hub %1 (%2); its replica is at %3")
-                    .arg(binding.serviceHubIdentity, binding.serviceHub,
-                         binding.servicePositionError.isEmpty()
-                             ? position(binding.servicePosition)
-                             : tr("an unknown position (%1)").arg(binding.servicePositionError));
-    else if (binding.positioned())
-        text += tr("\nIt fits positions of the store itself, now at %1")
-                    .arg(binding.servicePositionError.isEmpty()
-                             ? position(binding.servicePosition)
-                             : tr("an unknown position (%1)").arg(binding.servicePositionError));
+    QString text = binding.serviceServed
+        ? tr("Service reads %1 (generation %2) served at %3, %4")
+              .arg(binding.serviceUuid, binding.serviceGeneration, binding.serviceLocation,
+                   binding.servicePositionError.isEmpty() ? head(binding.serviceCommitSequence)
+                                                          : tr("head unknown (%1)").arg(binding.servicePositionError))
+        : tr("Service reads %1 (generation %2), the file %3 on the service host, %4")
+              .arg(binding.serviceUuid, binding.serviceGeneration, binding.serviceLocation,
+                   binding.servicePositionError.isEmpty() ? head(binding.serviceCommitSequence)
+                                                          : tr("head unknown (%1)").arg(binding.servicePositionError));
     if (binding.matches())
-        text += binding.hosted()
-            ? tr("\nAttached here: %1").arg(local)
-            : binding.shared()
-                ? tr("\nThe same store file is attached here: saved edits reach the fit at its next update")
-                : tr("\nThe same store is attached here");
+        text += binding.sameFile
+            ? tr("\nThe same store file is attached here: saved edits reach the fit at its next update")
+            : tr("\nThe same store is attached here (%1): saved edits reach the fit at its next update").arg(local);
+    else if (binding.localToService())
+        text += tr("\nThis service's store is local to its host: edits and commits need it served "
+                   "(vc_object_server) and attached here");
     else if (binding.localUuid.isEmpty())
         text += tr("\nNo store is attached here: fit inputs cannot be displayed");
     else if (binding.serviceUuid == binding.localUuid)
-        text += tr("\nThe attached copy of this store (%1) is not a replica of the service's hub: "
-                   "edits cannot reach the fit until you clone the hub").arg(local);
+        text += tr("\nThe attached store has the same UUID but history generation %1 (a copy?): "
+                   "edits cannot reach the fit").arg(binding.localGeneration);
     else
         text += tr("\nAnother store is attached here (%1): fit inputs are not displayed as fitted")
                     .arg(binding.localUuid);
@@ -1978,8 +1944,8 @@ void SpiralPanel::updateObjectStoreSummary()
 
 void SpiralPanel::startInputUpdate(bool confirm)
 {
-    if (!_service->storeBinding().positioned()) {
-        _warnings->setText(tr("The Spiral service fits no store positions: saved edits reach the fit "
+    if (!_service->storeBinding().advertised()) {
+        _warnings->setText(tr("The Spiral service names no object store: saved edits reach the fit "
                               "when it is rebuilt with current inputs"));
         return;
     }
@@ -2008,21 +1974,21 @@ void SpiralPanel::startInputUpdate(bool confirm)
 void SpiralPanel::updatePositionSummary()
 {
     const auto& binding = _service->storeBinding();
-    if (!binding.positioned()) {
+    if (!binding.advertised()) {
         _positionSummary->setVisible(false);
         return;
     }
     QStringList lines;
     const QJsonObject position = _lastInputStatus.value(QStringLiteral("input_position")).toObject();
     if (!position.isEmpty()) {
-        const qint64 sequence = position.value(QStringLiteral("sequence")).toInteger();
+        const qint64 sequence = position.value(QStringLiteral("commit_sequence")).toInteger();
         const QJsonValue requested = position.value(QStringLiteral("requested"));
         lines << (position.value(QStringLiteral("source")).toString() == QStringLiteral("checkpoint")
-                      ? tr("The fit reads position %1, recorded by its checkpoint").arg(sequence)
+                      ? tr("The fit reads the store at commit %1, recorded by its checkpoint").arg(sequence)
                   : requested.isNull()
-                      ? tr("The fit reads position %1 (linked at %2)")
+                      ? tr("The fit reads the store at commit %1 (linked at %2)")
                             .arg(sequence).arg(position.value(QStringLiteral("head")).toInteger())
-                      : tr("The fit reads position %1 (requested %2, linked at %3)")
+                      : tr("The fit reads the store at commit %1 (requested %2, linked at %3)")
                             .arg(sequence).arg(requested.toInteger())
                             .arg(position.value(QStringLiteral("head")).toInteger()));
     }
@@ -2031,20 +1997,13 @@ void SpiralPanel::updatePositionSummary()
         lines << tr("The service is preparing the fit's inputs (linking, then reading a pinned position%1)…")
                      .arg(preparing.value(QStringLiteral("requested_position")).isNull()
                               ? QString()
-                              : tr(" including %1").arg(preparing.value(QStringLiteral("requested_position")).toInteger()));
+                              : tr(" including commit %1").arg(preparing.value(QStringLiteral("requested_position")).toInteger()));
     const QJsonObject failed = _lastInputStatus.value(QStringLiteral("input_preparation_error")).toObject();
     if (!failed.isEmpty() && _inputUpdateText.isEmpty())
         lines << tr("The last input update failed; the fit is unchanged: %1")
                      .arg(failed.value(QStringLiteral("message")).toString());
-    if (binding.matches())
-        lines << (binding.localPending > 0
-                      ? tr("This replica: %n saved edit(s) not yet pushed", nullptr, binding.localPending)
-                      : tr("This replica: every saved edit is pushed"))
-                     + (binding.localConflicts > 0
-                            ? tr("; %n hub conflict(s) to resolve", nullptr, binding.localConflicts)
-                            : QString())
-                     + (binding.localPosition >= 0 ? tr("; synced to position %1").arg(binding.localPosition)
-                                                   : QString());
+    if (binding.matches() && binding.localCommitSequence >= 0)
+        lines << tr("The attached store is at commit %1").arg(binding.localCommitSequence);
     if (_localDraftsReady)
         lines << tr("Unsaved drawings in this workspace: save them to the store to include them");
     if (!_inputUpdateText.isEmpty()) lines << _inputUpdateText;
@@ -2066,13 +2025,13 @@ void SpiralPanel::applySessionScroll(const QJsonObject& request)
     const QJsonObject scroll = request.value(QStringLiteral("scroll")).toObject();
     const QJsonObject project = request.value(QStringLiteral("project")).toObject();
     _scrollSummary->setText(
-        tr("%1 — volume %2, %3 µm/voxel, outward %4; umbilicus revision %5")
+        tr("%1 — volume %2, %3 µm/voxel, outward %4; umbilicus version %5")
             .arg(scroll.value(QStringLiteral("name")).toString(),
                  project.value(QStringLiteral("volume")).toString())
             .arg(scroll.value(QStringLiteral("voxel_size_um")).toDouble(), 0, 'g', 4)
             .arg(scroll.value(QStringLiteral("spiral_outward_sense")).toString(),
-                 project.value(QStringLiteral("umbilicus")).toObject()
-                     .value(QStringLiteral("revision")).toString()));
+                 QString::number(project.value(QStringLiteral("umbilicus")).toObject()
+                                     .value(QStringLiteral("version")).toInteger())));
     const QJsonObject lasagna = project.value(QStringLiteral("lasagna")).toObject();
     _lasagnaSummary->setText(
         lasagna.isEmpty()
@@ -2606,13 +2565,14 @@ void SpiralPanel::updateStatus(const QJsonObject& status)
                       && (runnable || state == QStringLiteral("Error")
                           || state == QStringLiteral("Uninitialized")));
     const auto& binding = _service->storeBinding();
-    _updateInputs->setVisible(binding.positioned());
+    _updateInputs->setVisible(binding.advertised());
     _updateInputs->setEnabled(_load->isEnabled() && binding.canUpdate()
                               && status.value(QStringLiteral("input_preparation")).isNull());
-    if (!binding.matches() && binding.hosted())
-        setToolTipNote(_updateInputs, tr("Attach a replica of the service's hub first"));
-    else if (!binding.canUpdate() && binding.positioned())
-        setToolTipNote(_updateInputs, tr("Route Spiral's inputs to the service's own store file first"));
+    if (binding.localToService())
+        setToolTipNote(_updateInputs, tr("This service's store is local to its host: edits and commits need "
+                                         "it served (vc_object_server) and attached here"));
+    else if (!binding.canUpdate() && binding.advertised())
+        setToolTipNote(_updateInputs, tr("Attach the service's object store first"));
     else
         setToolTipNote(_updateInputs, {});
     updatePositionSummary();

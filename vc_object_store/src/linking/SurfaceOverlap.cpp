@@ -1,3 +1,4 @@
+#include "linking/Detectors.hpp"
 #include "linking/StoredGeometry.hpp"
 #include "vc_object_store/geometry/Geometry.hpp"
 #include "vc_object_store/object_links/ObjectLinks.hpp"
@@ -163,12 +164,12 @@ std::optional<LoadedSurface> loadSurface(detail::StoredGeometry& inputs, const o
         surface.uuid = object.uuid;
         surface.scale = surface.grid->scale();
         if (!(surface.scale[0] > 0) || !(surface.scale[1] > 0)) {
-            detail::reportFailure(report, "load", object.uuid, "invalid scale", object.uuid + ": invalid scale, skipped");
+            report.problems.push_back(object.uuid + ": invalid scale, skipped");
             return std::nullopt;
         }
 
     } catch (const std::exception& e) {
-        detail::reportFailure(report, "load", object.uuid, e.what(), object.uuid + ": load failed: " + e.what());
+        report.problems.push_back(object.uuid + ": load failed: " + e.what());
         return std::nullopt;
     }
     const auto* points = surface.grid->rawPointsPtr();
@@ -197,7 +198,7 @@ std::optional<LoadedSurface> loadSurface(detail::StoredGeometry& inputs, const o
         }
     }
     if (surface.samples.empty()) {
-        detail::reportDiagnostic(report, "load", object.uuid, "no usable samples", object.uuid + ": no usable samples, skipped");
+        report.problems.push_back(object.uuid + ": no usable samples, skipped");
         return std::nullopt;
     }
     return surface;
@@ -658,21 +659,23 @@ void validateParams(const SurfaceOverlapParams& params)
 
 }  // namespace
 
-DetectorReport linkSurfaceOverlaps(objects::ObjectStore& db,
-                                 const SurfaceOverlapParams& params, const std::atomic_bool* cancel)
+detail::Detection detail::detectSurfaceOverlaps(StoredGeometry& inputs,
+                                                const SurfaceOverlapParams& params, const std::atomic_bool* cancel)
 {
     validateParams(params);
     Profile profile;
     const auto& progress = params.progress;
     objects::util::reportProgress(progress, "selecting stored surfaces");
-    DetectorReport report;
+    Detection detection;
+    detection.detector = kSurfaceOverlapDetector; detection.version = kSurfaceOverlapVersion;
+    detection.replaceStalePending = params.replaceStalePending;
+    DetectorReport& report = detection.report;
     auto cancelled = [&] { return cancel && cancel->load(); };
 
-    detail::StoredGeometry inputs(db);
     const auto selected = inputs.select("surface", params.surfaceUuids);
     const auto fresh = detail::newAmong(params.newUuids, {&selected}, "surface-overlap");
-    const auto scales = detail::coordinateScales(selected, params, report);
-    if (report.failed()) return report;
+    const auto scales = detail::coordinateScales(selected, params);
+    std::set<std::string> failed; // surfaces that could not be loaded (their edges stay)
 
     // An incremental run loads the new surfaces and the selected surfaces
     // whose stored bounds come within the pair search's bbox pad of one.
@@ -703,14 +706,15 @@ DetectorReport linkSurfaceOverlaps(objects::ObjectStore& db,
         const auto& object = objects[oi];
         objects::util::reportProgress(progress, "loading surfaces", loadedCount++, objects.size(), object.uuid);
         if (cancelled()) {
-            detail::reportFailure(report, "cancel", "", "cancelled", "surface-overlap: cancelled during loading");
-            return report;
+            report.problems.push_back("surface-overlap: cancelled during loading");
+            detection.publish = false;
+            return detection;
         }
         PhaseTimer loadingTimer(profile.enabled ? &profile.loading : nullptr);
         if (auto loaded = loadSurface(inputs, object, params, report, scales.at(object.uuid))) {
             surfaces.push_back(std::move(*loaded));
             seedIndex.push_back(fresh ? selectionIndex[oi] : surfaces.size() - 1);
-        }
+        } else failed.insert(object.uuid);
     }
     objects::util::reportProgress(progress, "loading surfaces", objects.size(), objects.size());
     std::vector<char> isNew(surfaces.size(), 0);
@@ -759,14 +763,16 @@ DetectorReport linkSurfaceOverlaps(objects::ObjectStore& db,
             return harvestTargets(seed, surfaces, targets, index, params, cancel, profile, surfaceProgress);
         }();
         if (cancelled()) {
-            detail::reportFailure(report, "cancel", "", "cancelled", "surface-overlap: cancelled");
-            return report;
+            report.problems.push_back("surface-overlap: cancelled");
+            detection.publish = false;
+            return detection;
         }
         objects::util::reportProgress(surfaceProgress, "fitting overlaps");
         for (auto& [ti, collector] : matches) {
             if (cancelled()) {
-                detail::reportFailure(report, "cancel", "", "cancelled", "surface-overlap: cancelled");
-                return report;
+                report.problems.push_back("surface-overlap: cancelled");
+                detection.publish = false;
+                return detection;
             }
             const LoadedSurface& target = surfaces[ti];
             const auto correspondences = collector.take();
@@ -845,33 +851,28 @@ DetectorReport linkSurfaceOverlaps(objects::ObjectStore& db,
     }
     objects::util::reportProgress(progress, "checking surface pairs", totalPairs, totalPairs);
     for (const auto& [reason, count] : rejections)
-        detail::reportDiagnostic(report, "discover", "", reason,
-            "surface-overlap: " + std::to_string(count) + " pair(s) rejected: " + reason, int64_t(count));
+        report.problems.push_back("surface-overlap: " + std::to_string(count) + " pair(s) rejected: " + reason);
 
-    StaleEdgeScope scope{{params.edgeKind}, {}};
     if (fresh) {
         // Edges of a new surface, with both endpoints selected and loaded or
         // not examined (a partner that failed to load keeps its edges).
-        const auto failed = detail::failedObjects(report);
-        for (const auto& object : selected)
-            if (!failed.contains(object.uuid)) scope.objectUuids.push_back(object.uuid);
-        for (const auto& uuid : *fresh)
-            if (!failed.contains(uuid)) scope.touching.push_back(uuid);
-        if (scope.touching.empty()) scope.objectUuids.clear();  // no new surface loaded: remove nothing
+        std::vector<std::string> selectedUuids;
+        for (const auto& object : selected) selectedUuids.push_back(object.uuid);
+        detection.scope = detail::incrementalScope(params.edgeKind, selectedUuids, *fresh, failed);
     } else {
-        for (const auto& surface : surfaces) scope.objectUuids.push_back(surface.uuid);
+        detection.scope = StaleEdgeScope{{params.edgeKind}, {}};
+        for (const auto& surface : surfaces) detection.scope.objectUuids.push_back(surface.uuid);
     }
-    auto txn = db.write();
-    DetectorReport committed = detail::commitStoredCandidates(db, inputs, txn, kSurfaceOverlapDetector, kSurfaceOverlapVersion, candidates, params.replaceStalePending, &scope, progress);
-    if (cancelled()) throw std::runtime_error("surface-overlap: cancelled before commit");
-    txn.commit();
-    report.committed = true;
-    report.candidatesFound = committed.candidatesFound;
-    report.edgesCreated = committed.edgesCreated;
-    report.edgesUpdated = committed.edgesUpdated;
-    report.edgesSkippedExisting = committed.edgesSkippedExisting;
-    report.staleRemoved = committed.staleRemoved;
-    return report;
+    detection.candidates = std::move(candidates);
+    return detection;
+}
+
+DetectorReport linkSurfaceOverlaps(objects::ObjectStore& db,
+                                 const SurfaceOverlapParams& params, const std::atomic_bool* cancel)
+{
+    detail::StoredGeometry inputs(db);
+    const auto detection = detail::detectSurfaceOverlaps(inputs, params, cancel);
+    return detail::publishDetection(db, inputs, detection, params.progress, cancel);
 }
 
 namespace {
@@ -975,13 +976,13 @@ private:
         DetectorReport report;
         auto loaded = loadSurface(inputs_, object, loading_, report, scale, revision);
         if (!loaded)
-            throw std::runtime_error(report.issues.empty() ? object.uuid + ": surface could not be loaded"
-                                                           : report.issues.front().message);
+            throw std::runtime_error(report.problems.empty() ? object.uuid + ": surface could not be loaded"
+                                                             : report.problems.front());
         return surfaces_.emplace(key, std::move(*loaded)).first->second;
     }
     std::string revisionOf(const std::string& uuid, const std::optional<std::string>& revision)
     {
-        return revision ? *revision : db_.currentGeometry(inputs_.read(), uuid)->uuid;
+        return revision ? *revision : db_.currentGeometry(inputs_.txn(), uuid)->uuid;
     }
 
     objects::ObjectStore& db_;
@@ -1018,12 +1019,12 @@ std::vector<OverlapCorrespondences> materializeOverlapCorrespondences(objects::O
     auto& inputs = materializer.inputs();
     return materializeEach<std::string>(materializer, edgeUuids, [](const std::string& id) { return id; },
         [&](const std::string& id) {
-            const auto edge = db.edgeByUuid(inputs.read(), id);
+            const auto edge = db.edgeByUuid(inputs.txn(), id);
             if (!edge) throw std::runtime_error("edge not found");
             OverlapEdgeView view;
             view.uuid = edge->uuid; view.aUuid = edge->aUuid; view.bUuid = edge->bUuid;
             view.wholeGeometry = edge->aAnchor.wholeGeometry && edge->bAnchor.wholeGeometry;
-            view.stale = db.edgeGeometryState(inputs.read(), edge->uuid).stale;
+            view.stale = db.edgeGeometryState(inputs.txn(), edge->uuid).stale;
             view.meta = edge->meta;
             view.object = [&inputs](const std::string& uuid) { return inputs.select("surface", {uuid}).front(); };
             return view;

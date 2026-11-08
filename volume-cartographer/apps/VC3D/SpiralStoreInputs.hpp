@@ -1,6 +1,7 @@
 #pragma once
 
 #include <vc_object_store/objects/ObjectStore.hpp>
+#include <vc_object_store/objects/StoreReader.hpp>
 
 #include <nlohmann/json.hpp>
 #include <opencv2/core.hpp>
@@ -21,11 +22,9 @@ namespace vc3d::spiral {
 // workspace displays. The store is edited live; a fit read it once, so each
 // input also says whether it still is what the fit read. The fit's side
 // comes from its input manifest (object_store_inputs.json, published by the
-// service as its input manifest artifact), compared by identities every
-// replica of a store shares: geometry revision UUIDs, the metadata values
-// the adapter read, relationship record UUIDs, generations and approval
-// states. The manifest's object and relationship revision UUIDs belong to
-// the service's replica and are never used here.
+// service as its input manifest artifact), compared by identities of the
+// store: geometry revision UUIDs, the metadata values the adapter read,
+// relationship record UUIDs, generations and approval states.
 
 // How one fitted input stands in the attached store now.
 enum class InputState {
@@ -60,7 +59,7 @@ struct FitPointCollection {
     std::vector<cv::Vec3d> points;
     std::vector<std::optional<double>> windings;  // wind_a annotations
     std::string problem;
-    std::string revision;  // the object revision read (of this replica): what an edit starts from
+    int64_t version = 0;  // the object version read: what an edit starts from
 };
 
 struct FitFiber {
@@ -137,7 +136,7 @@ nlohmann::json adapterMetadata(const std::string& kind, const nlohmann::json& me
 // compare the relationships the fit consumed with the ones those heads
 // would give. A store other than the manifest's is refused outright
 // (problems).
-FitInputs readFitInputs(const vc::objects::ObjectStore& db, const vc::objects::Txn& txn,
+FitInputs readFitInputs(const vc::objects::StoreReader& reader,
                         const nlohmann::json& document);
 
 // What a store commit may have changed, read without reading the rest.
@@ -153,7 +152,7 @@ struct FitInputChanges {
 // the manifest objects in `objectUuids` (other UUIDs are ignored) and
 // re-compare only the relationships that involve them or are listed in
 // `relationshipUuids`. Its cost follows the change, not the fit.
-FitInputChanges readFitInputChanges(const vc::objects::ObjectStore& db, const vc::objects::Txn& txn,
+FitInputChanges readFitInputChanges(const vc::objects::StoreReader& reader,
                                     const nlohmann::json& document, const std::set<std::string>& objectUuids,
                                     const std::set<std::string>& relationshipUuids);
 

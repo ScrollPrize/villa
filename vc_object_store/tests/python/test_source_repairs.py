@@ -96,7 +96,7 @@ def test_v3_pending_auto_branches_survive_shared_reconciliation(tmp_path):
         control_point_direction=[0, 1 + 2.0**-52, 0]))
     with ObjectStore.create(str(tmp_path / "auto.vcobj"), author="test") as store:
         report = store.ingest_geometry_source("fiber", directory, uuid_namespace=NAMESPACE)
-        assert report == dict(ingested=2, edges_imported=1, problems=[], notices=[])
+        assert {k: report[k] for k in ("ingested", "edges_imported", "problems", "notices")} == dict(ingested=2, edges_imported=1, problems=[], notices=[])
         [edge] = store.edges_by_kind("fiber_branch")
         assert edge["approval_state"] == "pending" and edge["meta"]["auto"] is True
         exported = tmp_path / "exported"
@@ -108,6 +108,6 @@ def test_v3_pending_auto_branches_survive_shared_reconciliation(tmp_path):
             assert document["branches"][0]["auto"] is True
     with ObjectStore.create(str(tmp_path / "roundtrip.vcobj"), author="test") as store:
         report = store.ingest_geometry_source("fiber", exported)
-        assert report == dict(ingested=2, edges_imported=1, problems=[], notices=[])
+        assert {k: report[k] for k in ("ingested", "edges_imported", "problems", "notices")} == dict(ingested=2, edges_imported=1, problems=[], notices=[])
         [restored] = store.edges_by_kind("fiber_branch")
         assert restored["uuid"] == edge["uuid"] and restored["meta"]["auto"] is True

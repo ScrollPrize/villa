@@ -47,26 +47,6 @@ std::map<std::string, int> detectorVersions()
             {kPointCollectionSurfaceDetector, kPointCollectionSurfaceVersion}};
 }
 
-bool DetectorReport::failed() const
-{
-    return std::any_of(issues.begin(), issues.end(),
-        [](const DetectorIssue& issue) { return issue.severity == DetectorIssue::Severity::Failure; });
-}
-
-void detail::reportFailure(DetectorReport& report, const std::string& stage, const std::string& object,
-    const std::string& reason, const std::string& text)
-{
-    report.issues.push_back({DetectorIssue::Severity::Failure, stage,
-        object.empty() ? std::vector<std::string>{} : std::vector{object}, reason, text});
-}
-
-void detail::reportDiagnostic(DetectorReport& report, const std::string& stage, const std::string& object,
-    const std::string& reason, const std::string& text, int64_t count)
-{
-    report.issues.push_back({DetectorIssue::Severity::Diagnostic, stage,
-        object.empty() ? std::vector<std::string>{} : std::vector{object}, reason, text, count});
-}
-
 static DetectorReport commitCandidatesImpl(objects::ObjectStore& db, objects::WriteTxn& txn,
                                 const std::string& detectorName, int detectorVersion,
                                 const std::vector<LinkCandidate>& candidates, bool replaceStalePending,
@@ -198,7 +178,6 @@ DetectorReport commitCandidates(objects::ObjectStore& db, const std::string& det
                                    replaceStalePending, staleScope, progress);
     objects::util::reportProgress(progress, "committing links");
     txn.commit();
-    report.committed = true;
     return report;
 }
 
@@ -218,6 +197,37 @@ DetectorReport detail::commitStoredCandidates(objects::ObjectStore& db, const St
     inputs.validate(txn);
     return commitCandidatesImpl(db, txn, detectorName, detectorVersion, candidates,
         replaceStalePending, staleScope, progress, true);
+}
+
+DetectorReport detail::commitDetection(objects::ObjectStore& db, const StoredGeometry& inputs, objects::WriteTxn& txn,
+    const Detection& detection, const objects::util::ProgressCallback& progress)
+{
+    auto report = detection.report;
+    if (!detection.publish) return report;
+    const auto committed = commitStoredCandidates(db, inputs, txn, detection.detector, detection.version,
+        detection.candidates, detection.replaceStalePending, &detection.scope, progress);
+    report.candidatesFound = committed.candidatesFound;
+    report.edgesCreated = committed.edgesCreated;
+    report.edgesUpdated = committed.edgesUpdated;
+    report.edgesSkippedExisting = committed.edgesSkippedExisting;
+    report.staleRemoved = committed.staleRemoved;
+    report.problems.insert(report.problems.end(), committed.problems.begin(), committed.problems.end());
+    return report;
+}
+
+DetectorReport detail::publishDetection(objects::ObjectStore& db, const StoredGeometry& inputs, const Detection& detection,
+    const objects::util::ProgressCallback& progress, const std::atomic_bool* cancel)
+{
+    if (!detection.publish) return detection.report;
+    auto cancelled = [&] { if (cancel && cancel->load()) throw std::runtime_error(detection.detector + ": cancelled before commit"); };
+    cancelled();
+    auto txn = db.write();
+    cancelled();
+    auto report = commitDetection(db, inputs, txn, detection, progress);
+    cancelled();
+    objects::util::reportProgress(progress, "committing links");
+    txn.commit();
+    return report;
 }
 
 }  // namespace vc::object_links

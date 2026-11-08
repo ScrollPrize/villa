@@ -111,11 +111,12 @@ struct Fixture {
         surface.channels.push_back(int32Channel("winding_id", generation.windings));
         const Json meta{{"winding_bounds", bounds}, {"component_winding_ids", generation.windingIds},
                         {"source_fit_iteration", 120}};
-        session->act(attachment, {{uuid, std::nullopt}}, [&](auto& db, auto& txn) {
-            createSurface(db, txn, uuid, name, tags, volumeCoordinates(kVolume, scaleFactor),
-                          SurfaceProvenance{"spiral-fitting", Json::object(), {kVolume}}, meta,
-                          vc::geometry::encode(surface));
-        });
+        auto request = session->newRequest(attachment);
+        request.expectedObjects = {{uuid, std::nullopt}};
+        request.operations = createSurfaceOperations(uuid, name, tags, volumeCoordinates(kVolume, scaleFactor),
+                                                     SurfaceProvenance{"spiral-fitting", Json::object(), {kVolume}}, meta,
+                                                     vc::geometry::encode(surface));
+        session->submit(attachment, request);
         return uuid;
     }
 };

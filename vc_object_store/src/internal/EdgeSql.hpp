@@ -23,7 +23,8 @@ EdgeRecord readEdgeRow(sqlite3* db, const Statement& s, bool details = true,
 std::vector<EdgeRecord> readEdgeRows(sqlite3* db, Statement& rows, const ObjectFields& fields = std::nullopt);
 std::vector<int64_t> componentIds(sqlite3* db, const std::string& start,
                                  const std::vector<std::string>& kinds, bool includeRetired = false,
-                                 std::optional<bool> adjacent = std::nullopt);
+                                 std::optional<bool> adjacent = std::nullopt,
+                                 const std::atomic_bool* cancel = nullptr);
 
 std::string addEdgeImpl(sqlite3* db, const std::string& author, const std::string& host, const EdgeRecord& input,
                         bool preserveRecord = false, const char* importOperation = "import");

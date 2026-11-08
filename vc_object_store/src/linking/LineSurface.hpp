@@ -2,6 +2,7 @@
 #include "linking/StoredGeometry.hpp"
 #include "vc_object_store/object_links/ObjectLinks.hpp"
 #include <functional>
+#include <set>
 #include <opencv2/core.hpp>
 
 namespace vc::object_links::detail {
@@ -23,11 +24,19 @@ struct LineIncremental {
     std::vector<objects::ObjectRecord> surfaces;  // new surfaces and those near a new line
     std::set<std::string> fresh;                  // new lines and surfaces
     std::vector<std::string> selected;            // every selected line and surface
+    std::vector<std::string> lines;               // the lines the loader presents, by index
 };
 void validateLineSurfaceParams(const LineSurfaceParams& params, double sourceScale);
 // Load one line at a time so track coordinates need not all be copied into RAM.
+// A cancellation during detection is reported in the detection's problems
+// (publish = false); other failures throw.
+Detection detectLinesToSurfaces(StoredGeometry& inputs, size_t lineCount, const LineLoader& load,
+    const std::filesystem::path& ctVolume,
+    const LineSurfaceParams& params, double sourceScale, const char* detector, int version,
+    const std::atomic_bool* cancel, const LineIncremental* incremental = nullptr);
+// detectLinesToSurfaces published in a write of its own.
 DetectorReport linkLinesToSurfaces(objects::ObjectStore& db, StoredGeometry& inputs, size_t lineCount, const LineLoader& load,
     const std::filesystem::path& ctVolume,
     const LineSurfaceParams& params, double sourceScale, const char* detector, int version,
-    const std::atomic_bool* cancel, DetectorReport report, const LineIncremental* incremental = nullptr);
+    const std::atomic_bool* cancel, const LineIncremental* incremental = nullptr);
 } // namespace vc::object_links::detail

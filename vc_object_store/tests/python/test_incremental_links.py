@@ -1,4 +1,4 @@
-"""Incremental detector runs (new_uuids), progress callbacks and the store's link marker."""
+"""Incremental detector runs (new_uuids) and progress callbacks."""
 import numpy as np
 import pytest
 
@@ -29,7 +29,7 @@ def test_overlap_increment_matches_a_full_run_for_new_pairs(db):
     # Nothing new: nothing is considered, so nothing is removed either.
     stale_old = detector_edge(db, a, c, "same-surface", "surface-overlap")
     report = db.link_surface_overlaps(new_uuids=[])
-    assert report["committed"] and report["objects_considered"] == 0
+    assert report["objects_considered"] == 0
     assert report["edges_created"] == report["stale_removed"] == 0
     kept = named_edges(db, "same-surface")[("a", "b")]["uuid"]
     d, _ = plane(db, 4, "d")
@@ -37,7 +37,7 @@ def test_overlap_increment_matches_a_full_run_for_new_pairs(db):
     stale_new = detector_edge(db, d, c, "same-surface", "surface-overlap")
 
     report = db.link_surface_overlaps(new_uuids=[d, e])
-    assert report["committed"] and not report["failed"], report
+    assert not report["problems"], report
     # c is no partner of d or e: it is never loaded.
     assert report["objects_considered"] == 4
     assert report["edges_created"] == 2 and report["stale_removed"] == 1
@@ -128,7 +128,7 @@ def test_fiber_increment_links_new_fibers_and_surfaces(db):
     f2 = framed_fiber(db, "f2", y=98)
     stale = detector_edge(db, f2, far, "same-surface", "fiber-surface")
     report = db.link_fibers_to_surfaces(**LINE_OPTIONS, new_uuids=[b, f2])
-    assert report["committed"] and not report["failed"], report
+    assert not report["problems"], report
     # Surfaces a, b and fibers f1, f2; the far surface is no partner.
     assert report["objects_considered"] == 4, report
     assert report["stale_removed"] == 1
@@ -156,19 +156,3 @@ def test_progress_reaches_python_and_its_errors_do_not_stop_a_detector(db):
     # Reported as unraisable (a warning under pytest); the detector finishes.
     assert db.link_surface_overlaps(progress=broken)["edges_skipped_existing"] == 1
 
-
-def test_link_marker_is_not_journaled_and_stays_with_its_replica(db):
-    assert db.link_marker() is None
-    db.enable_store_positions()
-    plane(db, 0, "a")
-    head = db.store_positions()["position"]
-    journal = db.journal_since()
-    marker = {"position": head, "key": "abc", "exact": True, "selection": {"surface": ["x"]}}
-    db.set_link_marker(marker)
-    assert db.link_marker() == marker
-    assert db.journal_since() == journal and db.store_positions()["position"] == head
-    db.set_link_marker({"position": head, "exact": False})
-    assert db.link_marker() == {"position": head, "exact": False}
-    # A copy with its own replica identity reads none.
-    db.fork_replica()
-    assert db.link_marker() is None

@@ -19,7 +19,7 @@ def test_surface_discovery_uses_current_revisions_and_preserves_review(db):
     assert db.link_surface_overlaps()["edges_skipped_existing"] == 1
     # A new revision with identical coordinates still needs revalidation.
     gb["attributes"]["edit"] = True
-    db.put_geometry(b, gb, expected_revision=db.current_geometry(b)["uuid"], edge_edits=[edge_choice(db, e["uuid"], "retain") for e in db.affected_geometry_edges(b, gb)])
+    db.put_geometry(b, gb, expected_version=db.current_version(b), edge_edits=[edge_choice(db, e["uuid"], "retain") for e in db.affected_geometry_edges(b, gb)])
     assert not db.edge_geometry_state(edge)["stale"]
     assert db.link_surface_overlaps()["edges_skipped_existing"] == 1
     assert db.edges_of(a)[0]["uuid"] == edge
@@ -63,7 +63,7 @@ def test_stored_track_crossings_selection_and_atomic_failure(db):
     assert db.link_tracks_to_tracks(track_uuids=[a.upper(), a])["stale_removed"] == 0
     gb["arrays"] = [array("points", [[50, y, 20] for y in range(31)], "<i4")]
     edits = [dict(array="points", element_offset=0, data=gb["arrays"][0]["data"])]
-    db.edit_geometry(b, edits, db.current_geometry(b)["uuid"], edge_edits=[edge_choice(db, e["uuid"], "remove") for e in db.affected_geometry_edit_edges(b, edits, db.current_geometry(b)["uuid"])])
+    db.edit_geometry(b, edits, db.current_version(b), edge_edits=[edge_choice(db, e["uuid"], "remove") for e in db.affected_geometry_edit_edges(b, edits, db.current_version(b))])
     assert db.link_tracks_to_tracks(track_uuids=[a, b])["stale_removed"] == 0
     bad = db.upsert_object({"kind": "track", "track": {"dataset_ref": "missing", "external_key": "0"}})
     before = db.journal_since()
@@ -93,7 +93,7 @@ def test_stored_collection_ids_winding_scaling_and_rerun(db):
     assert db.link_point_collections_to_surfaces(point_scale=0.5)["edges_skipped_existing"] == 2
     geometry["arrays"][0] = array("points", [[1000, 1000, 40], [2000, 2000, 40]], "<f8")
     edits = [dict(array="points", element_offset=0, data=geometry["arrays"][0]["data"])]
-    db.edit_geometry(collection, edits, db.current_geometry(collection)["uuid"], edge_edits=[edge_choice(db, e["uuid"], "remove") for e in db.affected_geometry_edit_edges(collection, edits, db.current_geometry(collection)["uuid"])])
+    db.edit_geometry(collection, edits, db.current_version(collection), edge_edits=[edge_choice(db, e["uuid"], "remove") for e in db.affected_geometry_edit_edges(collection, edits, db.current_version(collection))])
     assert db.link_point_collections_to_surfaces(collection_uuids=[collection], surface_uuids=[surface], point_scale=0.5)["stale_removed"] == 0
 
 
@@ -154,7 +154,7 @@ def test_pcl_boundary_hit_keeps_the_valid_source_cell(db, transpose):
         array("point_ids", [975], "<i8"),
     ])
     report = db.link_point_collections_to_surfaces()
-    assert not report["failed"] and report["edges_created"] == 1
+    assert not report["problems"] and report["edges_created"] == 1
     [edge] = db.edges_of(collection)
     anchor = edge["a_anchor"] if edge["a"] == surface else edge["b_anchor"]
     assert edge["meta"]["point_collection_surface"]["ij"][int(transpose)] == 1.0
@@ -163,5 +163,5 @@ def test_pcl_boundary_hit_keeps_the_valid_source_cell(db, transpose):
     assert np.linalg.norm(np.asarray(anchor["position"]) -
                           [3842.944091796875, 2978.4453125, 8808.6533203125]) < 2.5
     assert not db.edge_geometry_state(edge["uuid"])["stale"]
-    assert not db.link_point_collections_to_surfaces()["failed"]
+    assert not db.link_point_collections_to_surfaces()["problems"]
     assert len(db.edges_of(collection)) == 1

@@ -422,7 +422,7 @@ def _write_pending_resume_state(tmp_path, *, gpus="0"):
     return args, invocation, state, state_path
 
 
-@pytest.mark.parametrize("store_change", ["different", "relocated", "replica", "legacy"])
+@pytest.mark.parametrize("store_change", ["different", "relocated", "copy", "legacy"])
 def test_completed_fit_resume_checks_store_identity(tmp_path, store_change):
     args, invocation, state, state_path = _write_pending_resume_state(tmp_path)
     fitted = args.output / "fitted"
@@ -439,9 +439,8 @@ def test_completed_fit_resume_checks_store_identity(tmp_path, store_change):
         elif store_change == "relocated":
             args.object_store.rename(destination)
         else:
-            vos = pytest.importorskip("vc_object_store")
-            vos.hub_init(str(args.object_store), "pytest")
-            vos.hub_clone(str(args.object_store), str(destination), "replica")
+            import shutil
+            shutil.copyfile(args.object_store, destination)
         args.object_store = destination
     run_single._atomic_write_json(state_path, state)
     resumed = run_single._resume_invocation(args, {}, "project", "entity")

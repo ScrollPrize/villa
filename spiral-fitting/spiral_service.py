@@ -22,10 +22,10 @@ Patch, PCL and fiber inputs come from the object store bound at launch
 (``--object-store``), never from an upload. A fit reads the inputs of a
 linked, pinned position of it, and ``POST /session/update-inputs`` replaces
 a resident fit's inputs with a newer position's in place, keeping its model
-and optimiser. With ``--object-store-hub`` the store is the service's
-replica of a hub and positions are the hub's; otherwise the store is shared
-with the client's processes on this machine and records positions of its
-own. Without a position (a rebuild of an old checkpoint's inputs) the
+and optimiser. A position is a commit of the bound store: the store file
+the service opens, which clients on its host attach too, or (a later
+stage) a store served by vc_object_server. Without a position (a rebuild
+of an old checkpoint's inputs) the
 inputs are frozen for a resident session, and
 changing them is an edit in the store followed by a full-input rebuild. One
 client owns the mutation surface through the session lease
@@ -98,7 +98,6 @@ from service_http import (ApiError, TRANSFER_CHUNK_BYTES,
                           is_safe_relative_name)
 from service_artifacts import ArtifactRegistry
 from service_commits import (CommitContext, CommitRefused, commit_in_place,
-                             commit_to_replica, pending_records, push_pending,
                              read_published_generation)
 from preview_index import PublishedPreviewIndex
 from service_files import ExclusiveFileLock, FileLockUnavailable
@@ -151,7 +150,7 @@ _SAFE_SESSION_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 INPUTS_IN_OBJECT_STORE = "inputs_in_object_store"
 # Stable codes of refused input updates (POST /session/update-inputs), and
 # of verbs refused while one is in flight.
-INPUT_UPDATE_UNAVAILABLE = "input_update_unavailable"  # no hub, or no session
+INPUT_UPDATE_UNAVAILABLE = "input_update_unavailable"  # no store, or no session
 INPUT_UPDATE_BUSY = "input_update_busy"                # not an idle session
 INPUT_GENERATION_STALE = "input_generation_stale"      # expected_input_generation
 INPUT_UPDATE_IN_PROGRESS = "input_update_in_progress"  # another verb waits for one
@@ -228,76 +227,47 @@ class ObjectStoreBinding:
 
     Bound once at launch (``--object-store``) and never chosen by a client:
     patch, PCL and fiber inputs, and the links the service's refresh writes,
-    live in this one store. ``path`` is meaningful on the service host only;
-    clients identify the store by ``uuid``, which every replica of it shares.
-    ``author`` names the service in the store when it refreshes links.
-
-    A hosted binding (``hub`` set) is the service's own replica of a hub:
-    it writes only detector links and its own committed fits (surfaces
-    tagged spiral-fit, service_commits). Links are pushed only with a
-    conditional push, and fit hub positions
-    (object_store_inputs.prepare_position); a commit is pushed with a plain
-    push, since a new object cannot conflict, and stays pending until one
-    succeeds.
-    ``hub_identity`` names the hub positions belong to. Otherwise the store
-    is shared in place (VC3D on this machine edits the same file) and
-    records positions of its own, linked in place. ``positions`` names
-    whose positions the service fits: the hub's, or the store's own.
+    live in this one store. ``location`` is where the service opened it: a
+    store file on the service host, which clients on that host attach too,
+    or (``served``) the endpoint of the vc_object_server holding it, which
+    clients anywhere attach. Clients identify the store by ``uuid`` and the
+    history ``generation`` positions belong to. ``author`` names the service
+    in the store when it refreshes links and commits.
     """
 
-    path: str
+    location: str
     uuid: str
+    generation: str
     author: str
-    hub: str = None
-    hub_identity: str = None
-    positions: str = None
+    served: bool = False
 
     @property
-    def hosted(self):
-        return self.hub is not None
-
-    @property
-    def positioned(self):
-        return self.positions is not None
+    def path(self):
+        """The store file, for a binding that opened one (not served)."""
+        return self.location
 
     def config(self):
         """The service-owned configuration a session request receives."""
-        return {"object_store_path": self.path,
+        return {"object_store_path": self.location,
                 "object_store_author": self.author,
                 "object_store_input_position": None}
 
-    def hub_position(self):
-        """``(position, error)``: the hub position this replica last pulled,
-        read now (not the fitted one, which is status ``input_position``),
-        or why it could not be read."""
+    def head(self):
+        """``(commit_sequence, error)``: the store's head, read now (not the
+        fitted position, which is status ``input_position``), or why it
+        could not be read."""
         from vc_object_store import ObjectStore
         try:
-            with ObjectStore.open(self.path, read_only=True) as store:
-                return (store.hub_status() or {}).get("position"), None
-        except Exception as exc:  # noqa: BLE001 - reported, not fatal
-            return None, f"{type(exc).__name__}: {exc}"
-
-    def store_position(self):
-        """``(position, error)``: the head of a shared store, read now."""
-        from vc_object_store import ObjectStore
-        try:
-            with ObjectStore.open(self.path, read_only=True) as store:
-                return (store.store_positions() or {}).get("position"), None
+            with ObjectStore.open(self.location, read_only=True) as store:
+                return int(store.status()["commit_sequence"]), None
         except Exception as exc:  # noqa: BLE001 - reported, not fatal
             return None, f"{type(exc).__name__}: {exc}"
 
     def advertisement(self):
-        result = {"uuid": self.uuid, "path": self.path, "author": self.author,
-                  "hub": None, "positions": None}
-        if self.hosted:
-            position, error = self.hub_position()
-            result["hub"] = {"address": self.hub, "identity": self.hub_identity,
-                             "position": position, "position_error": error}
-        elif self.positioned:
-            position, error = self.store_position()
-            result["positions"] = {"identity": self.positions, "position": position,
-                                   "position_error": error}
-        return result
+        head, error = self.head()
+        return {"uuid": self.uuid, "generation": self.generation, "location": self.location,
+                "served": self.served, "author": self.author,
+                "commit_sequence": head, "position_error": error}
 
 
 # Configuration keys the launch binding owns. A session request or --config
@@ -341,131 +311,51 @@ def default_object_store_author():
     return f"spiral-service@{socket.gethostname()}"
 
 
-def _canonical_hub(vos, address):
-    """A hub address as the store records it (vos.hub_address: a remote URL
-    in its canonical sftp:// form, a path made absolute), local paths
-    resolved first so a symlinked directory names one hub."""
-    if "://" not in str(address):
-        address = Path(address).expanduser().resolve(strict=False)
-    return vos.hub_address(str(address))
+def bind_object_store(location, author=None):
+    """Open the launch object store once; return its binding.
 
-
-_REMOTE_HUB_HINT = (
-    "a remote hub is reached with ssh in batch mode: the service account needs "
-    "a key (or agent) with access to the hub file and its directory, and a "
-    "known_hosts entry for the host")
-
-
-def bind_object_store(path, author=None, hub=None):
-    """Resolve and open the launch object store once; return its binding.
-
-    With ``hub`` the store is this service's replica of that hub: cloned
-    when absent, otherwise checked to replicate that hub. A store that is
-    already a replica binds its own hub. A hosted binding pulls once now, so
-    an unreachable hub (or, for an sftp:// hub, missing ssh credentials or
-    host key) fails startup instead of the first update.
+    ``location`` is a store file (a served endpoint comes in a later
+    stage). A file another process serves (vc_object_server holds its
+    writer lock) is refused: bind that server's endpoint instead.
 
     Raises ObjectStoreBindingError when the vc_object_store module is not
     importable or the store cannot be opened, so startup fails with the
     cause instead of the first fit failing later.
     """
-    resolved = Path(path).expanduser().resolve(strict=False)
     author = author or default_object_store_author()
     try:
-        import vc_object_store as vos
         from vc_object_store import ObjectStore
     except ImportError as exc:
         raise ObjectStoreBindingError(
             f"the vc_object_store Python module is unavailable ({exc}); put "
             "its build's python directory on PYTHONPATH") from exc
-    remote = hub is not None and "://" in str(hub)
-    if hub is not None and not resolved.exists():
-        # A clone copies the whole hub and reports nothing while it runs (a
-        # large one over sftp takes minutes): say so before it starts, as
-        # the only line a client sees until it ends.
-        print(f"Cloning the object-store hub {hub} into this service's replica "
-              f"{resolved} (first launch; later launches reuse it)…", flush=True)
-        started = time.monotonic()
-        try:
-            resolved.parent.mkdir(parents=True, exist_ok=True)
-            vos.hub_clone(_canonical_hub(vos, hub), str(resolved), author)
-        except Exception as exc:
-            raise ObjectStoreBindingError(
-                f"cannot clone the hub {hub} to {resolved}: {exc}"
-                + (f"; {_REMOTE_HUB_HINT}" if remote else "")) from exc
-        print(f"Cloned the object-store hub ({resolved.stat().st_size / 2**20:.0f} MiB "
-              f"in {time.monotonic() - started:.0f} s)", flush=True)
+    if "://" in str(location):
+        raise ObjectStoreBindingError(
+            f"{location} is a store endpoint; this service binds a store file")
+    resolved = Path(location).expanduser().resolve(strict=False)
     if not resolved.is_file():
         raise ObjectStoreBindingError(f"no object store at {resolved}")
     try:
         with ObjectStore.open(str(resolved), read_only=True) as store:
-            uuid = store.uuid
-            status = store.hub_status()
+            status = store.status()
     except Exception as exc:
         raise ObjectStoreBindingError(
             f"cannot open the object store {resolved}: {exc}") from exc
-    if status is None:
-        if hub is not None:
-            raise ObjectStoreBindingError(
-                f"{resolved} exists and is not a replica of the hub {hub}; "
-                "name a new replica path, or omit --object-store-hub")
-        # Shared in place: every write, VC3D's included, records a position
-        # from now on, so the service links and pins positions of the store
-        # itself (no hub, no replicas).
-        try:
-            with ObjectStore.open(str(resolved), author=author) as store:
-                store.enable_store_positions()
-                positions = store.store_positions()["store"]
-        except Exception as exc:
-            raise ObjectStoreBindingError(
-                f"cannot record positions of the object store {resolved}: {exc}") from exc
-        return ObjectStoreBinding(str(resolved), str(uuid), author, positions=positions)
-    if hub is not None and _canonical_hub(vos, hub) != status["hub"]:
-        raise ObjectStoreBindingError(
-            f"{resolved} replicates the hub {status['hub']}, not {hub}")
-    remote = "://" in status["hub"]
-    # Checked before anything is changed: a replica someone else writes
-    # (a VC3D user's, named by mistake) holds their unpushed edits.
+    # Writable: the service links and commits into it. A file a server
+    # holds refuses the writable open.
     try:
-        with ObjectStore.open(str(resolved), read_only=True) as store:
-            others = [writer for writer in store.hub_writers() if writer != author]
+        with ObjectStore.open(str(resolved), author=author):
+            pass
     except Exception as exc:
+        message = str(exc)
+        if "serv" in message.lower() or "lock" in message.lower():
+            raise ObjectStoreBindingError(
+                f"{resolved} is served by vc_object_server; bind its endpoint "
+                f"({message})") from exc
         raise ObjectStoreBindingError(
-            f"cannot open the object store {resolved}: {exc}") from exc
-    if others:
-        raise ObjectStoreBindingError(
-            f"{resolved} is not this service's replica: {', '.join(others)} "
-            f"wrote to it, not only {author}; name a new replica path (the "
-            "service clones one), or start the service as its author")
-    try:
-        with ObjectStore.open(str(resolved), author=author) as store:
-            # The service replica writes only links and its own commits.
-            # Every update links afresh, so unpublished links (an interrupted
-            # update's) are dropped; a revert keeps the commits pending.
-            store.hub_revert()
-            pulled = store.hub_sync(pull=True, push=False)
-            conflicts = pulled["conflicts"]
-            commits, others = pending_records(store)
-    except Exception as exc:
-        raise ObjectStoreBindingError(
-            f"cannot reach the hub {status['hub']} of {resolved}: {exc}"
-            + (f"; {_REMOTE_HUB_HINT}" if remote else "")) from exc
-    if conflicts or others:
-        raise ObjectStoreBindingError(
-            f"{resolved} holds unpublished edits the service did not make "
-            f"({len(others)} pending, {len(conflicts)} in conflict with the hub); "
-            "a service replica must hold none besides its own commits: resolve "
-            "them, or name a new replica path")
-    if commits:
-        # Commits a failed push left behind: publish them now, or keep them
-        # pending for the next push.
-        with ObjectStore.open(str(resolved), author=author) as store:
-            error = push_pending(store)
-        if error is not None:
-            print(f"SPIRAL_COMMIT_PENDING {len(commits)} commit(s) stay unpushed: "
-                  f"{error}", file=sys.stderr, flush=True)
-    return ObjectStoreBinding(str(resolved), str(uuid), author,
-                              status["hub"], status["hub_replica"], status["hub_replica"])
+            f"cannot open the object store {resolved} for writing: {message}") from exc
+    return ObjectStoreBinding(str(resolved), str(status["store"]), str(status["generation"]), author)
+
 
 
 class ServiceBindingError(ValueError):
@@ -780,9 +670,9 @@ class ServiceState:
         self._session_error = None
         self._building = False
         self._build_serial = 0
-        # Hub positions (hosted bindings): the one being linked and pinned
-        # before a build, the last preparation that failed (the resident fit
-        # is then unchanged), and the position the session reads.
+        # Store positions: the one being linked and pinned before a build,
+        # the last preparation that failed (the resident fit is then
+        # unchanged), and the position the session reads.
         self._input_preparation = None
         self._input_preparation_error = None
         self._input_position = None
@@ -829,15 +719,11 @@ class ServiceState:
         # The published input manifest of this session: (digest, artifact).
         self._input_manifest = None
         # Serializes this service's writes to the bound store: link refreshes
-        # (_prepare_position) and commits. A hub sync needs an idle handle,
-        # and a commit must never be pushed halfway through a refresh.
+        # (_prepare_position) and commits.
         self._store_write_lock = threading.Lock()
         # The latest commit (POST /session/commit): what /session/status
         # reports as "commit", guarded by self.lock.
         self._commit = None
-        # Commits the hub replica holds unpushed, as last read (status
-        # "pending_commits"; None when that read failed).
-        self._pending_commit_uuids = self._pending_commits()
         # A preview export runs off the HTTP thread (it costs minutes); this
         # is what makes the verb single-flight and what /session/status
         # reports so a client reconnecting mid-export can see one is running.
@@ -1098,7 +984,6 @@ class ServiceState:
                 response["progress"] = publishing
             response["preview_exporting"] = self._preview_export_active
             response["commit"] = copy.deepcopy(self._commit)
-            response["pending_commits"] = copy.deepcopy(self._pending_commit_uuids)
             return response
 
     def session_state(self):
@@ -1154,7 +1039,7 @@ class ServiceState:
         positioned = self._positioned()
         capabilities["build_missing_lasagna_packs"] = self.build_missing_lasagna_packs
         capabilities["input_positions"] = positioned
-        # A service with positions updates a resident fit's inputs in place.
+        # A service with a store updates a resident fit's inputs in place.
         capabilities["inputs_frozen"] = not positioned
         capabilities["input_updates"] = positioned
         capabilities["commits"] = self._commits_supported()
@@ -1584,21 +1469,60 @@ class ServiceState:
                                payload={"code": INPUT_UPDATE_IN_PROGRESS})
 
     def _positioned(self):
-        return self.object_store is not None and self.object_store.positioned
+        return self.object_store is not None
 
     def _inputs_position(self, value):
         """A request's ``inputs_position``: the position (M) the build's
-        inputs must include, e.g. where a client's saved (and, with a hub,
-        pushed) edits reached."""
+        inputs must include, e.g. where a client's saved edits reached:
+        ``{store, generation, commit_sequence}`` of the service's store, at
+        or below its head, and, when the client has one, the
+        ``request_uuid`` of its last save's receipt, which the service's
+        store must hold (a copy of the store with the same identity does
+        not). Returns an InputPosition."""
+        from object_store_inputs import InputPosition
         if value is None:
             return None
-        if type(value) is not int or value < 0:
-            raise ApiError(HTTPStatus.BAD_REQUEST,
-                           "inputs_position must be a non-negative integer")
         if not self._positioned():
             raise ApiError(HTTPStatus.BAD_REQUEST,
                            "This service's object store records no positions")
-        return value
+        if not isinstance(value, dict) or type(value.get("commit_sequence")) is not int \
+                or value["commit_sequence"] < 0 or not value.get("store") \
+                or not value.get("generation"):
+            raise ApiError(HTTPStatus.BAD_REQUEST,
+                           "inputs_position must be {store, generation, commit_sequence}")
+        position = InputPosition(str(value["store"]), str(value["generation"]),
+                                 int(value["commit_sequence"]))
+        store = self.object_store
+        if position.store != store.uuid or position.generation != store.generation:
+            raise ApiError(
+                HTTPStatus.CONFLICT,
+                f"inputs_position belongs to store {position.store} (generation "
+                f"{position.generation}); this service's store is {store.uuid} "
+                f"(generation {store.generation})",
+                payload={"code": INPUT_UPDATE_UNAVAILABLE})
+        head, error = store.head()
+        if head is None:
+            raise ApiError(HTTPStatus.SERVICE_UNAVAILABLE,
+                           f"The service's object store cannot be read: {error}")
+        if position.commit_sequence > head:
+            raise ApiError(
+                HTTPStatus.CONFLICT,
+                f"inputs_position names commit {position.commit_sequence}, after the "
+                f"service's store head {head}: these edits are not in the service's "
+                "store (a copy with the same UUID?)")
+        request_uuid = value.get("request_uuid")
+        if request_uuid is not None:
+            if not isinstance(request_uuid, str) or not request_uuid:
+                raise ApiError(HTTPStatus.BAD_REQUEST, "request_uuid must be a string")
+            from vc_object_store import ObjectStore
+            with ObjectStore.open(store.location, read_only=True) as handle:
+                receipt = handle.receipt(request_uuid)
+            if receipt is None:
+                raise ApiError(
+                    HTTPStatus.CONFLICT,
+                    f"the save {request_uuid} is not in the service's store (a copy "
+                    "with the same UUID?): its edits cannot reach the fit")
+        return position
 
     def rebuild(self, request):
         """Rebuild the resident session, from the model stage or from nothing.
@@ -1747,9 +1671,10 @@ class ServiceState:
             paths, scroll = self.session_paths, self._session_scroll
             self._build_serial += 1
             update_id = self._build_serial
-            self._input_update = {"build_id": update_id, "requested_position": minimum,
+            requested = None if minimum is None else minimum.provenance()
+            self._input_update = {"build_id": update_id, "requested_position": requested,
                                   "from_generation": generation}
-            self._input_preparation = {"build_id": update_id, "requested_position": minimum}
+            self._input_preparation = {"build_id": update_id, "requested_position": requested}
             self._input_preparation_error = None
             self.status_generation += 1
             session_id = self.session_id
@@ -1769,13 +1694,15 @@ class ServiceState:
                            minimum):
         from spiral_runtime import InputUpdateFailed, InputUpdateRefused
 
+        requested = None if minimum is None else minimum.provenance()
+
         def refused(exc, phase):
             cause = _cause(exc)
             with self.lock:
                 self._input_update = None
                 self._input_preparation = None
                 self._input_preparation_error = {
-                    "build_id": update_id, "requested_position": minimum,
+                    "build_id": update_id, "requested_position": requested,
                     "phase": phase, "recovery_required": False, "message": cause,
                     "problems": list(getattr(exc, "problems", None) or [cause])}
                 self.status_generation += 1
@@ -1792,10 +1719,10 @@ class ServiceState:
             self.events.append("log", line, source="service", operation="updating_inputs")
         with self.lock:
             self._input_preparation = None
-            self._input_update = {**self._input_update, "position": prepared.position.sequence}
+            self._input_update = {**self._input_update, "position": prepared.position.provenance()}
             self.status_generation += 1
         try:
-            result = session.update_inputs(prepared.position.sequence)
+            result = session.update_inputs(prepared.pins.provenance())
         except InputUpdateRefused as exc:
             refused(exc, "preparing")
             return
@@ -1810,7 +1737,7 @@ class ServiceState:
             with self.lock:
                 self._input_update = None
                 self._input_preparation_error = {
-                    "build_id": update_id, "requested_position": minimum,
+                    "build_id": update_id, "requested_position": requested,
                     "phase": "installing", "recovery_required": True, "message": cause,
                     "problems": [cause]}
                 self.status_generation += 1
@@ -1826,17 +1753,17 @@ class ServiceState:
                 if self.session_request:
                     run = dict(self.session_request.get("run") or {})
                     run["config"] = {**(run.get("config") or {}),
-                                     "object_store_input_position": prepared.position.sequence}
+                                     "object_store_input_position": prepared.position.provenance()}
                     self.session_request = {**self.session_request, "run": run}
                 self._input_position = {
-                    **prepared.position.provenance(), "requested": minimum,
+                    **prepared.position.provenance(), "requested": requested,
                     "head": prepared.head, "attempts": prepared.attempts,
                     "source": "update",
                     "input_generation": result.get("input_generation")}
             self._input_update = None
             self.status_generation += 1
         self.events.append(
-            "log", f"Inputs updated to position {prepared.position.sequence} "
+            "log", f"Inputs updated to {prepared.position.describe()} "
             f"(input generation {result.get('input_generation')})",
             source="service", operation="updating_inputs")
 
@@ -1945,27 +1872,26 @@ class ServiceState:
                      reload_inputs=False):
         """Publish ``Loading`` and construct the runtime off the HTTP thread.
 
-        On a binding with positions the build reads a position. A checkpoint
-        resume reads the position the checkpoint recorded of this store (or hub),
-        unless the request reloads the inputs or names a position to
-        include; otherwise the inputs are linked and pinned first
+        With a bound store the build reads a position. A checkpoint resume
+        reads the pins the checkpoint recorded of this store, unless the
+        request reloads the inputs or names a position to include;
+        otherwise the inputs are linked and pinned first
         (``_prepare_then_build``), while the resident session, if any, is
         left alone. Returns the build's ID.
         """
         record = None
         if self._positioned():
-            position = None
+            pins = None
             if paths.checkpoint and minimum is None and not reload_inputs:
-                position = self._checkpoint_position(paths.checkpoint)
-            if position is None:
+                pins = self._checkpoint_pins(paths.checkpoint)
+            if pins is None:
                 return self._begin_prepared_build(paths, run, preview, scroll,
                                                   minimum)
             if self.build_missing_lasagna_packs:
                 return self._begin_prepared_build(
-                    paths, run, preview, scroll, minimum, checkpoint_position=position)
-            run = self._pin_run(run, position)
-            record = {"hub": self.object_store.positions,
-                      "sequence": position, "requested": None, "head": None,
+                    paths, run, preview, scroll, minimum, checkpoint_pins=pins)
+            run = self._pin_run(run, pins)
+            record = {**pins.position.provenance(), "requested": None, "head": None,
                       "attempts": 0, "source": "checkpoint"}
         # The checkpoint's inputs name the fit volume.
         project = scroll.project
@@ -1990,9 +1916,12 @@ class ServiceState:
         return build_id
 
     @staticmethod
-    def _pin_run(run, position):
+    def _pin_run(run, pins):
+        """The run pinned at ``pins`` (InputPins): the configuration names
+        the position; the versions ride along in memory for the build
+        (never in a request or status, which carry the position alone)."""
         return dataclasses.replace(run, config={
-            **run.config, "object_store_input_position": int(position)})
+            **run.config, "object_store_input_position": pins.provenance()})
 
     def _unprepared_volume(self, paths, scroll):
         """The fit volume of a build that prepares no position: the one its
@@ -2011,17 +1940,19 @@ class ServiceState:
                 f"project's only volume (it has {len(volumes)})")
         return volumes[0]
 
-    def _checkpoint_position(self, path):
-        """The position on this service's hub a checkpoint's inputs were
-        read at, or None."""
+    def _checkpoint_pins(self, path):
+        """The pins (object_store_inputs.InputPins) a checkpoint's inputs
+        were read at, when they are of this service's store, or None."""
+        from object_store_inputs import InputPins
         *_, manifest = self._checkpoint_durable_cfg(path)
-        position = ((manifest or {}).get("object_store") or {}).get("position")
-        if not position or position.get("hub") != self.object_store.positions:
+        pins = InputPins.from_manifest((manifest or {}).get("object_store"))
+        if pins is None or pins.position.store != self.object_store.uuid \
+                or pins.position.generation != self.object_store.generation:
             return None
-        return int(position["sequence"])
+        return pins
 
     def _begin_prepared_build(self, paths, run, preview, scroll, minimum,
-                              checkpoint_position=None):
+                              checkpoint_pins=None):
         """Prepare packs and a position off the HTTP thread, then build.
 
         A checkpoint keeps its recorded position without refreshing links.
@@ -2040,7 +1971,7 @@ class ServiceState:
         try:
             self._start_background(
                 target=self._prepare_then_build,
-                args=(build_id, paths, run, preview, scroll, minimum, checkpoint_position),
+                args=(build_id, paths, run, preview, scroll, minimum, checkpoint_pins),
                 name="spiral-input-position", daemon=True)
         except BaseException:
             with self.lock:
@@ -2124,7 +2055,7 @@ class ServiceState:
         progress = self._input_progress()
         with self._store_write_lock:
             try:
-                with ObjectStore.open(self.object_store.path,
+                with ObjectStore.open(self.object_store.location,
                                       author=self.object_store.author) as store:
                     prepared = prepare_position(
                         store, config, request, lasagna=lasagna,
@@ -2136,8 +2067,6 @@ class ServiceState:
                                                    progress)
             finally:
                 progress.close()
-                # A publication carries pending commits along.
-                self._note_pending_commits()
 
     def _prepare_fiber_directions(self, scroll, volume, paths, config):
         """Unless it requires prepared inputs, a host extracts the fiber
@@ -2220,28 +2149,28 @@ class ServiceState:
             progress.close()
 
     def _prepare_then_build(self, build_id, paths, run, preview, scroll, minimum,
-                            checkpoint_position=None):
+                            checkpoint_pins=None):
         try:
             project = scroll.project
-            if checkpoint_position is None:
+            if checkpoint_pins is None:
                 prepared, volume, paths, scroll = self._prepare_inputs(
                     paths, run, scroll, minimum)
                 for line in prepared.lines:
                     self.events.append("log", line, source="service",
                                        operation="preparing_inputs")
-                record = {**prepared.position.provenance(), "requested": minimum,
+                record = {**prepared.position.provenance(),
+                          "requested": None if minimum is None else minimum.provenance(),
                           "head": prepared.head, "attempts": prepared.attempts,
                           "source": "prepared"}
-                run = self._pin_run(run, prepared.position.sequence)
+                run = self._pin_run(run, prepared.pins)
             else:
-                run = self._pin_run(run, checkpoint_position)
+                run = self._pin_run(run, checkpoint_pins)
                 volume = self._unprepared_volume(paths, scroll)
                 config = self._effective_config(paths, run)
                 self._prepare_fiber_directions(scroll, volume, paths, config)
                 paths, scroll = self._resolve_session_scroll(scroll, volume, paths, config)
                 self._prepare_lasagna_packs(paths, config)
-                record = {"hub": self.object_store.positions,
-                          "sequence": checkpoint_position, "requested": None,
+                record = {**checkpoint_pins.position.provenance(), "requested": None,
                           "head": None, "attempts": 0, "source": "checkpoint"}
         except BaseException as exc:
             cause = _cause(exc)
@@ -2249,7 +2178,8 @@ class ServiceState:
                 self._building = False
                 self._input_preparation = None
                 self._input_preparation_error = {
-                    "build_id": build_id, "requested_position": minimum,
+                    "build_id": build_id,
+                    "requested_position": None if minimum is None else minimum.provenance(),
                     "message": cause,
                     "problems": list(getattr(exc, "problems", None) or [cause])}
                 self.status_generation += 1
@@ -3440,25 +3370,6 @@ class ServiceState:
     def _commits_supported(self):
         return self.object_store is not None
 
-    def _note_pending_commits(self):
-        pending = self._pending_commits()
-        with self.lock:
-            if pending != self._pending_commit_uuids:
-                self._pending_commit_uuids = pending
-                self.status_generation += 1
-
-    def _pending_commits(self):
-        """Committed fits this hub replica holds unpushed (status
-        ``pending_commits``); [] without a hub."""
-        if self.object_store is None or not self.object_store.hosted:
-            return []
-        from vc_object_store import ObjectStore
-        try:
-            with ObjectStore.open(self.object_store.path, read_only=True) as store:
-                return pending_records(store)[0]
-        except Exception:  # noqa: BLE001 - status reports what it last knew
-            return None
-
     def commit(self, request):
         """Start committing one published preview to the bound store.
 
@@ -3468,11 +3379,9 @@ class ServiceState:
         answers 410 and commits nothing. Committing the same model state,
         inputs and flatten profile again reuses the surface already
         committed. The result is status ``commit``: ``state`` (running, done
-        or failed), ``surface_uuid``, ``geometry_revision``, ``reused``,
-        ``pushed`` (whether it reached the hub; null for a store shared in
-        place, ``push_error`` saying why not) or ``error``. Repeating the
-        request retries a failed push; status ``pending_commits`` lists the
-        commits the replica holds unpushed.
+        or failed), ``surface_uuid``, ``geometry_revision``, ``version``
+        (the surface's object version in the store), ``reused`` or
+        ``error``.
         """
         artifact_id = (request or {}).get("artifact")
         if not isinstance(artifact_id, str) or not artifact_id:
@@ -3497,8 +3406,7 @@ class ServiceState:
                                 "generation": artifact.generation,
                                 "stage_name": "Reading the published preview",
                                 "surface_uuid": None, "geometry_revision": None,
-                                "reused": None, "pushed": None, "push_error": None,
-                                "error": None}
+                                "version": None, "reused": None, "error": None}
                 self.status_generation += 1
             self._start_background(target=self._commit_job,
                                    args=(session_id, artifact),
@@ -3523,20 +3431,11 @@ class ServiceState:
                                            generation.key.model_state_sha256)
             self._commit_stage("Waiting for the object store")
             with self._store_write_lock:
-                write = (commit_to_replica if self.object_store.hosted
-                         else commit_in_place)
-                result = write(self.object_store.path, generation, context,
-                               stage=self._commit_stage)
-                self._note_pending_commits()
+                result = commit_in_place(self.object_store.location, generation, context,
+                                         stage=self._commit_stage)
             outcome = {"state": "done", "surface_uuid": result.surface_uuid,
                        "geometry_revision": result.geometry_revision,
-                       "reused": result.reused, "pushed": result.pushed,
-                       "push_error": result.push_error}
-            if result.pushed is False:
-                self.events.append(
-                    "log", f"The commit {result.surface_uuid} is not on the hub yet "
-                    f"({result.push_error}); the next push publishes it",
-                    severity="warning", source="service", operation="committing")
+                       "version": result.version, "reused": result.reused}
             if generation.unrepresentable:
                 self.events.append(
                     "log", f"{generation.unrepresentable} vertices of the preview are "
@@ -3599,7 +3498,8 @@ class ServiceState:
                         if checkpoint.get("model_state_sha256") == model_state_sha256
                         else None),
             base_shape_zyx=project.get("base_shape_zyx"),
-            umbilicus=({"uuid": umbilicus.get("uuid"), "revision": umbilicus.get("revision")}
+            umbilicus=({"uuid": umbilicus.get("uuid"), "generation": umbilicus.get("generation"),
+                        "version": umbilicus.get("version")}
                        if umbilicus else None),
             api_version=API_VERSION)
 
@@ -4343,15 +4243,10 @@ def main(argv=None):
                              "new fit. Without it, fits needing it are refused.")
     parser.add_argument("--object-store", required=True, metavar="STORE",
                         help="Object store (.vcobj) this service reads patch, "
-                             "PCL and fiber inputs from, and writes startup "
-                             "link refreshes to. Opened once at startup; "
-                             "clients cannot repoint it.")
-    parser.add_argument("--object-store-hub", default=None, metavar="HUB",
-                        help="Hub (a path, or an sftp://[user@]host/path "
-                             "address) whose replica --object-store is: cloned "
-                             "there when absent. Updates then link and pin hub "
-                             "positions. A store that already is a replica binds "
-                             "its own hub without this flag.")
+                             "PCL and fiber inputs from, and writes link "
+                             "refreshes and commits to. Opened once at startup; "
+                             "clients cannot repoint it. A file vc_object_server "
+                             "serves is refused.")
     parser.add_argument("--object-store-author", default=None, metavar="NAME",
                         help="Author of the links this service's refresh "
                              "writes (default: spiral-service@<host>)")
@@ -4447,9 +4342,7 @@ def main(argv=None):
               f"into VC3D): {key}", flush=True)
 
     try:
-        object_store = bind_object_store(args.object_store,
-                                         args.object_store_author,
-                                         args.object_store_hub)
+        object_store = bind_object_store(args.object_store, args.object_store_author)
     except ObjectStoreBindingError as exc:
         print(f"Refusing to start: {exc}", file=sys.stderr, flush=True)
         return 2
@@ -4522,14 +4415,8 @@ def main(argv=None):
     # remote attach validate compatibility through one code path.
     print(f"Spiral CUDA devices: {','.join(str(gpu_id) for gpu_id in args.gpus)}",
           flush=True)
-    print(f"Spiral object store: {object_store.path} ({object_store.uuid})",
-          flush=True)
-    if object_store.hosted:
-        print(f"Spiral object-store hub: {object_store.hub} "
-              f"({object_store.hub_identity})", flush=True)
-    elif object_store.positioned:
-        print(f"Spiral object store shared in place; positions of "
-              f"{object_store.positions}", flush=True)
+    print(f"Spiral object store: {object_store.location} ({object_store.uuid}, "
+          f"generation {object_store.generation})", flush=True)
     print(f"Spiral output root: {output_root}", flush=True)
     print(f"Spiral cache root: {cache_root}", flush=True)
     winding = bindings.winding_inference_status()

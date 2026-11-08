@@ -20,6 +20,7 @@ add_library(vc_core
         src/Volume.cpp
         src/VolumePkg.cpp
         src/ProjectDocument.cpp
+        src/ProjectCreation.cpp
         src/SurfaceQuerySet.cpp
         src/Logging.cpp
         src/CrashHandler.cpp
@@ -206,8 +207,8 @@ if(VC_BUILD_FIBER_CHUNK_CUDA)
     add_executable(benchmark_fiber_chunk_cuda src/fiber_tracer/FiberChunkGpu.cu)
     foreach(target vc_fiber_chunk_cuda benchmark_fiber_chunk_cuda)
         target_include_directories(${target} PRIVATE include)
-        target_link_libraries(${target} PRIVATE nlohmann_json::nlohmann_json)
-        set_target_properties(${target} PROPERTIES CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON)
+        target_link_libraries(${target} PRIVATE nlohmann_json::nlohmann_json vc_reader::headers)
+        set_target_properties(${target} PROPERTIES CUDA_STANDARD 20 CUDA_STANDARD_REQUIRED ON)
         target_compile_options(${target} PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--fmad=false;--expt-relaxed-constexpr>)
     endforeach()
 endif()

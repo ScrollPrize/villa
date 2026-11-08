@@ -41,6 +41,7 @@
 #include "OpenDataSampleProject.hpp"
 #include "SeedingWidget.hpp"
 #include "SegmentationCommandHandler.hpp"
+#include "StoreImportController.hpp"
 #include "SurfacePanelController.hpp"
 #include "CommandLineToolRunner.hpp"
 #include "ViewerManager.hpp"
@@ -255,6 +256,13 @@ bool AgentBridgeServer::jobIsRunning(const QString& source) const
         if (source == QLatin1String("seeding") && _window->_seedingWidget &&
             _window->_seedingWidget->seedingBatchActive())
             return true;
+        // An import from the Stores menu shares the one import slot.
+        if (source == QLatin1String("import") && _window->_storeImportController &&
+            _window->_storeImportController->inFlight())
+            return true;
+        if (source == QLatin1String("manifest") && _window->_menuController &&
+            _window->_menuController->lasagnaManifestAttachmentInFlight())
+            return true;
     }
     return false;
 }
@@ -419,6 +427,8 @@ QJsonObject AgentBridgeServer::jobStatusJson(const JobRecord& job) const
     // Catalog and volume jobs may expose a structured terminal result.
     o["result"] = job.resultJson.isEmpty() ? QJsonValue(QJsonValue::Null)
                                            : QJsonValue(job.resultJson);
+    o["progress"] = job.progress.isEmpty() ? QJsonValue(QJsonValue::Null)
+                                           : QJsonValue(job.progress);
     return o;
 }
 
@@ -735,6 +745,13 @@ QJsonObject AgentBridgeServer::handleJobCancel(const QJsonValue& params)
             mgr.stopOptimization();
         else
             mgr.cancelJob(externalId);
+    } else if (outSource == QLatin1String("import")) {
+        // Stops before the next object; the job finishes with the partial report.
+        if (!_window || !_window->_storeImportController || !_window->_storeImportController->cancel()) {
+            QJsonObject data;
+            data["detail"] = "no running import to cancel";
+            throw AgentBridgeError{-32005, "Import not running", data};
+        }
     } else if (outSource == QLatin1String("tool")) {
         // grow/trace/render tools run as CommandLineToolRunner child QProcesses:
         // terminate cleanly; toolFinished then resolves the job via finishJob.
@@ -746,8 +763,8 @@ QJsonObject AgentBridgeServer::handleJobCancel(const QJsonValue& params)
         _window->_cmdRunner->cancel();
     } else {
         // growth (QtConcurrent future, no cancel), flatten (self-owned job with no
-        // reachable cancel handle), catalog, volume, autosave: no safe cancel
-        // authority.
+        // reachable cancel handle), catalog, volume, autosave, export, manifest:
+        // no safe cancel authority.
         QJsonObject data;
         data["kind"] = "job";
         data["reason"] = "not cancellable";

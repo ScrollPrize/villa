@@ -224,6 +224,10 @@ set(srcs
     MenuActionController.hpp
     SshPrompts.cpp
     SshPrompts.hpp
+    ProjectResources.cpp
+    ProjectResources.hpp
+    StoreImportController.cpp
+    StoreImportController.hpp
     VolumeAttachmentController.cpp
     VolumeAttachmentController.hpp
     UnifiedBrowserDialog.cpp
@@ -314,6 +318,8 @@ set(srcs
     ToolProcess.hpp
     PointCollectionSync.cpp
     PointCollectionSync.hpp
+    SessionDrafts.cpp
+    SessionDrafts.hpp
     ToolDialogs.cpp
     ToolDialogs.hpp
     ConsoleOutputWidget.cpp
@@ -344,6 +350,7 @@ set(srcs
     agent_bridge/AgentBridgeMethods_points.cpp
     agent_bridge/AgentBridgeMethods_seeding.cpp
     agent_bridge/AgentBridgeMethods_session.cpp
+    agent_bridge/AgentBridgeMethods_stores.cpp
     agent_bridge/AgentBridgeMethods_surfaceops.cpp
     agent_bridge/AgentBridgeMethods_viewer.cpp
     agent_bridge/AgentBridgeMethods_wrap.cpp
@@ -352,6 +359,7 @@ set(srcs
     agent_bridge/AgentBridgeJobs.cpp
     agent_bridge/AgentBridgeHandlers_catalog.cpp
     agent_bridge/AgentBridgeHandlers_session.cpp
+    agent_bridge/AgentBridgeHandlers_stores.cpp
     agent_bridge/AgentBridgeHandlers_editing.cpp
     agent_bridge/AgentBridgeHandlers_wrap.cpp
     agent_bridge/AgentBridgeHandlers_fiber.cpp
@@ -374,6 +382,7 @@ endif()
 add_library(vc3d_app OBJECT ${srcs} resources.qrc)
 add_executable(VC3D VCAppMain.cpp)
 target_link_libraries(VC3D PRIVATE vc3d_app)
+add_dependencies(VC3D vc_object_convert)
 # Its uic headers (ui_*.h) are included by VCAppMain.cpp and the benchmarks too.
 target_include_directories(vc3d_app PUBLIC ${CMAKE_CURRENT_BINARY_DIR}/vc3d_app_autogen/include)
 

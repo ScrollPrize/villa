@@ -20,25 +20,10 @@ def store_path(tmp_path):
 
 @pytest.fixture()
 def shared(tmp_path):
-    """The same objects in one plain store that records positions of its own
-    (VC3D and the service share the file in place)."""
+    """The same objects in one store file the service and an editor (VC3D on
+    the service's host) write in turn."""
     from object_store_fixture import write_walk_store
-    return write_walk_store(tmp_path / 'shared.vcobj', positions=True)
-
-
-@pytest.fixture()
-def replicas(tmp_path):
-    """The same objects as a hub with two replicas: the service's and an
-    editor's. Returns {'service': path, 'editor': path}."""
-    import vc_object_store as vos
-    from object_store_fixture import write_walk_store
-    path = write_walk_store(tmp_path / 'hub.vcobj')
-    vos.hub_init(path, 'ingest')
-    clones = {}
-    for name in ('service', 'editor'):
-        clones[name] = str(tmp_path / f'{name}.vcobj')
-        vos.hub_clone(path, clones[name], name)
-    return clones
+    return write_walk_store(tmp_path / 'shared.vcobj')
 
 
 @pytest.fixture()

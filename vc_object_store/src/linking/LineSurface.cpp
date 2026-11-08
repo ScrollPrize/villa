@@ -29,17 +29,14 @@
 namespace vc::object_links::detail {
 namespace {
 
-// Selects CT, lasagna or no normals. Profiles queries, including cache hits,
-// used by strip marching and surface-link gates.
+// Selects CT, lasagna, packed lasagna or no normals. Profiles queries,
+// including cache hits, used by strip marching and surface-link gates.
 class SheetNormalSource {
 public:
     SheetNormalSource(const std::filesystem::path& ctVolume, const LineSurfaceParams& params)
         : ctVolume_(ctVolume), normalX_(params.normalXVolume), normalY_(params.normalYVolume),
           pool_(params.normalPool), level_(params.ctLevel) {
-        if (params.normalXVolume.empty() != params.normalYVolume.empty())
-            throw std::invalid_argument("graph links: lasagna normals need both normal_x and normal_y volumes");
-        if (int(!ctVolume.empty()) + int(!params.normalXVolume.empty()) + int(!params.normalPool.empty()) > 1)
-            throw std::invalid_argument("graph links: choose CT, lasagna or packed lasagna normals, not several");
+        checkNormalSourceChoice(ctVolume, params);
         const double scale = params.workingToBaseScale / params.ctToBaseScale;
         if (!ctVolume.empty())
             ct_ = std::make_unique<vc::CtSheetNormalSampler>(ctVolume, params.ctLevel, scale);
@@ -52,6 +49,13 @@ public:
     ~SheetNormalSource() {
         if (profile_) printProfile("total");
     }
+    // At most one source may be named; both lasagna volumes go together.
+    static void checkNormalSourceChoice(const std::filesystem::path& ctVolume, const LineSurfaceParams& params) {
+        if (params.normalXVolume.empty() != params.normalYVolume.empty())
+            throw std::invalid_argument("graph links: lasagna normals need both normal_x_volume and normal_y_volume");
+        if (int(!ctVolume.empty()) + int(!params.normalXVolume.empty()) + int(!params.normalPool.empty()) > 1)
+            throw std::invalid_argument("graph links: choose one normal source: ct_volume, normal_x_volume/normal_y_volume or normal_pool");
+    }
     bool available() const { return ct_ || lasagna_ || pooled_; }
     const char* method() const {
         if (ct_) return vc::CtSheetNormalSampler::method;
@@ -59,6 +63,8 @@ public:
         if (pooled_) return vc::PooledLasagnaSheetNormalSampler::method;
         return "centerline";
     }
+    // The source as named, for edge metadata: a CT location, the two lasagna
+    // locations, the pack, or null without normals.
     nlohmann::json location() const {
         if (ct_) return ctVolume_.string();
         if (lasagna_) return {{"normal_x", normalX_.string()}, {"normal_y", normalY_.string()}};
@@ -72,9 +78,20 @@ public:
         if (!available()) throw std::logic_error("graph links: no sheet-normal source");
         const auto start = profile_ ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         vc::CtSheetNormal result;
-        result = ct_ ? ct_->sampleNormal(point, cancel)
-               : lasagna_ ? lasagna_->sampleNormal(point, cancel)
-                          : pooled_->sampleNormal(point, cancel);
+        try {
+            result = ct_ ? ct_->sampleNormal(point, cancel)
+                   : lasagna_ ? lasagna_->sampleNormal(point, cancel)
+                              : pooled_->sampleNormal(point, cancel);
+        } catch (const std::invalid_argument&) {
+            throw; // a bad query point: this line's problem
+        } catch (const vc::SheetNormalSourceError&) {
+            throw;
+        } catch (const std::exception& e) {
+            // Anything else the samplers throw is the source failing to read
+            // (vc_reader I/O), not a property of the line being linked.
+            if (cancel && cancel->load()) throw;
+            throw vc::SheetNormalSourceError(std::string("normal source ") + location().dump() + ": " + e.what());
+        }
         if (profile_) {
             seconds_ += std::chrono::duration<double>(std::chrono::steady_clock::now()-start).count();
             ++queries_;
@@ -459,7 +476,7 @@ std::shared_ptr<SurfaceGrid> cachedStrip(const LineData& fiber, const SheetNorma
         std::error_code ec;
         std::filesystem::remove(temporary, ec);
         checkCancelled(cancel);
-        reportDiagnostic(report, "cache", fiber.uuid, e.what(), fiber.uuid + ": could not save strip cache: " + e.what());
+        report.problems.push_back(fiber.uuid + ": could not save strip cache: " + e.what());
     }
     return strip;
 }
@@ -768,18 +785,23 @@ void validateLineSurfaceParams(const LineSurfaceParams& params, double sourceSca
         throw std::invalid_argument("graph links: invalid source coordinate scale");
 }
 
-DetectorReport linkLinesToSurfaces(objects::ObjectStore& db, StoredGeometry& inputs, size_t lineCount, const LineLoader& load,
+Detection detectLinesToSurfaces(StoredGeometry& inputs, size_t lineCount, const LineLoader& load,
     const std::filesystem::path& ctVolume,
     const LineSurfaceParams& params, double sourceScale, const char* detector, int version,
-    const std::atomic_bool* cancel, DetectorReport report, const LineIncremental* incremental)
+    const std::atomic_bool* cancel, const LineIncremental* incremental)
 {
     validateLineSurfaceParams(params, sourceScale);
+    SheetNormalSource::checkNormalSourceChoice(ctVolume, params);
     const bool tracks = std::string(detector) == kTrackSurfaceDetector;
+    Detection detection;
+    detection.detector = detector; detection.version = version;
+    detection.replaceStalePending = params.replaceStalePending;
+    DetectorReport& report = detection.report;
+    std::set<std::string> failed; // objects that could not be loaded or linked
     try {
         checkCancelled(cancel);
         const auto objects = incremental ? incremental->surfaces : inputs.select("surface", params.surfaceUuids);
-        const auto surfaceScales = coordinateScales(objects, params, report, params.surfaceScale);
-        if (report.failed()) return report;
+        const auto surfaceScales = coordinateScales(objects, params, params.surfaceScale);
         std::map<std::string, nlohmann::json> surfaceFrames;
         for (const auto& object : objects) surfaceFrames[object.uuid] = coordinateProvenance(object, params);
         objects::util::reportProgress(params.progress, "opening normal source");
@@ -789,7 +811,7 @@ DetectorReport linkLinesToSurfaces(objects::ObjectStore& db, StoredGeometry& inp
             try {
                 stripSource = sampler.identity();
             } catch (const std::exception& e) {
-                reportDiagnostic(report, "cache", "", e.what(), std::string("fiber strip cache unavailable: ") + e.what());
+                report.problems.push_back(std::string("fiber strip cache unavailable: ") + e.what());
             }
         }
         std::set<std::string> identities;
@@ -814,7 +836,8 @@ DetectorReport linkLinesToSurfaces(objects::ObjectStore& db, StoredGeometry& inp
                 quad = scaledSurfaceGrid(quad, surfaceScales.at(object.uuid), params.volumeUuid.has_value());
                 mesh = std::make_unique<Mesh>(quad);
             } catch (const std::exception& e) {
-                reportFailure(report, "load", object.uuid, e.what(), object.uuid + ": " + e.what() + ", skipped");
+                report.problems.push_back(object.uuid + ": " + e.what() + ", skipped");
+                failed.insert(object.uuid);
                 continue;
             }
             unique(uuid);
@@ -845,7 +868,10 @@ DetectorReport linkLinesToSurfaces(objects::ObjectStore& db, StoredGeometry& inp
             checkCancelled(cancel);
             objects::util::reportProgress(params.progress, linkingStage, input, lineCount, "loading line");
             auto loaded = load(input, report);
-            if (!loaded) continue;
+            if (!loaded) {
+                if (incremental) failed.insert(incremental->lines.at(input));
+                continue;
+            }
             const auto& fiber = *loaded;
             const double lineScale = fiber.sourceScale;
             unique(fiber.uuid);
@@ -883,9 +909,12 @@ DetectorReport linkLinesToSurfaces(objects::ObjectStore& db, StoredGeometry& inp
                 }
             try {
                 autoLink(fiber, proposals, surfaces, sampler, lineParams, lineScale, stripSource, report, cancel);
+            } catch (const vc::SheetNormalSourceError&) {
+                throw; // the source, not this line, failed: the whole run fails
             } catch (const std::exception& e) {
                 checkCancelled(cancel);
-                reportFailure(report, "discover", fiber.uuid, e.what(), fiber.uuid + ": " + e.what() + ", skipped");
+                report.problems.push_back(fiber.uuid + ": " + e.what() + ", skipped");
+                failed.insert(fiber.uuid);
                 continue;
             }
             if (std::getenv("VC_FIBER_SURFACE_PROFILE")) {
@@ -958,32 +987,31 @@ DetectorReport linkLinesToSurfaces(objects::ObjectStore& db, StoredGeometry& inp
         }
         checkCancelled(cancel);
         objects::util::reportProgress(params.progress, linkingStage, lineCount, lineCount);
-        if (incremental) {
-            // Edges of a new object, both endpoints selected and not failed.
-            const auto failed = failedObjects(report);
-            for (const auto& uuid : incremental->selected)
-                if (!failed.contains(uuid)) scope.objectUuids.push_back(uuid);
-            for (const auto& uuid : incremental->fresh)
-                if (!failed.contains(uuid)) scope.touching.push_back(uuid);
-            if (scope.touching.empty()) scope.objectUuids.clear();
-        }
-        auto txn = db.write();
-        checkCancelled(cancel);
-        const auto committed = commitStoredCandidates(db, inputs, txn, detector, version, candidates, params.replaceStalePending, &scope, params.progress);
-        checkCancelled(cancel);
-        objects::util::reportProgress(params.progress, "committing links");
-        txn.commit();
-        report.committed = true;
-        report.candidatesFound = committed.candidatesFound;
-        report.edgesCreated = committed.edgesCreated;
-        report.edgesUpdated = committed.edgesUpdated;
-        report.edgesSkippedExisting = committed.edgesSkippedExisting;
-        report.staleRemoved = committed.staleRemoved;
+        if (incremental) scope = incrementalScope(params.edgeKind, incremental->selected, incremental->fresh, failed);
+        detection.candidates = std::move(candidates);
+        detection.scope = scope;
     } catch (const std::exception&) {
         if (!cancel || !cancel->load()) throw;
-        reportFailure(report, "cancel", "", "cancelled", std::string(detector) + ": cancelled; no edges committed");
+        report.problems.push_back(std::string(detector) + ": cancelled; no edges committed");
+        detection.publish = false;
     }
-    return report;
+    return detection;
+}
+
+DetectorReport linkLinesToSurfaces(objects::ObjectStore& db, StoredGeometry& inputs, size_t lineCount, const LineLoader& load,
+    const std::filesystem::path& ctVolume,
+    const LineSurfaceParams& params, double sourceScale, const char* detector, int version,
+    const std::atomic_bool* cancel, const LineIncremental* incremental)
+{
+    const auto detection = detectLinesToSurfaces(inputs, lineCount, load, ctVolume, params, sourceScale, detector, version, cancel, incremental);
+    try {
+        return publishDetection(db, inputs, detection, params.progress, cancel);
+    } catch (const std::exception&) {
+        if (!cancel || !cancel->load()) throw;
+        auto report = detection.report;
+        report.problems.push_back(std::string(detector) + ": cancelled; no edges committed");
+        return report;
+    }
 }
 
 }  // namespace vc::object_links::detail

@@ -211,10 +211,9 @@ def on_plane(y, *points):
     return {index: ([z, y, x], None) for index, (z, x) in enumerate(points)}
 
 
-def write_walk_store(path, *, positions=False):
+def write_walk_store(path):
     """Two patches ('near' at y=100, 'far' at y=140) and a PCL 'walk' with
-    two points on near and one on far. ``positions`` makes the store record
-    positions of its own (shared in place). Returns ``path``."""
+    two points on near and one on far. Returns ``path``."""
     from vc_object_store import ObjectStore
     path = str(path)
     with ObjectStore.create(path, author='ingest', hostname='host') as db:
@@ -222,8 +221,6 @@ def write_walk_store(path, *, positions=False):
         put_patch(db, plane(140.0), (0.25, 0.25), name='far')
         put_pcl(db, {**on_plane(100.0, (12.0, 48.0), (16.0, 52.0)),
                      2: ([20.0, 140.0, 56.0], None)}, name='walk')
-        if positions:
-            db.enable_store_positions()
     return path
 
 
@@ -254,29 +251,17 @@ def fit_config(path, author='fitter', **overrides):
     return config
 
 
-def hub_edit(path, change, author='editor'):
-    """An editor's saved edit on a hub replica, pushed: returns the hub
-    position it reached."""
+def shared_edit(path, change, author='editor'):
+    """An editor's write to the store file (shared with the service on its
+    host): returns the commit sequence it reached."""
     from vc_object_store import ObjectStore
     with ObjectStore.open(str(path), author=author) as db:
-        db.hub_sync(pull=True, push=False)
         change(db)
-        report = db.hub_sync(pull=True, push=True)
-    assert not report['conflicts']
-    return report['published_position']
+        return int(db.status()['commit_sequence'])
 
 
-def leased(uuid, edit):
-    """``edit`` of an object, under its lease (as an editor makes it)."""
-    def change(db):
-        db.acquire_leases([uuid])
-        edit(db)
-    return change
-
-
-def shared_edit(path, change):
-    """An editor's write to a store shared in place: returns its position."""
+def head(path):
+    """A store's head commit sequence."""
     from vc_object_store import ObjectStore
-    with ObjectStore.open(str(path), author='editor') as db:
-        change(db)
-        return db.store_positions()['position']
+    with ObjectStore.open(str(path), read_only=True) as db:
+        return int(db.status()['commit_sequence'])

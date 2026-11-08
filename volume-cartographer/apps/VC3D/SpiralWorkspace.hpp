@@ -86,15 +86,12 @@ public:
     [[nodiscard]] QString lineAnnotationDraftUnavailableReason() const;
     void startLineAnnotationDraft();
     // The object kinds Spiral fits, reads and edits. They share one store:
-    // a hub replica of the service's, or the store a local service binds.
+    // the service's store (a file or a served store), or the store a local service binds.
     static const std::vector<std::string>& inputKinds();
 
 signals:
     void spiralSessionActiveChanged(bool active);
     void patchEditorRequested(const QString& id, const QString& path);
-    // Clone a hub (the Spiral service's) to a local replica, attach it and
-    // route inputKinds() to it.
-    void hubReplicaRequested(const QString& hubAddress);
 
 protected:
     void showEvent(QShowEvent* event) override;
@@ -234,21 +231,22 @@ private:
     void pruneBrushPreviewSurfaces();
     QSet<QString> _retainedBrushPreviewIds;
     // Brush patches and new point collections saved to the store, by
-    // gesture id (their object and the revision the save wrote, which their
+    // gesture id (their object and the version the save wrote, which their
     // next edit starts from), and drafts saved but not yet part of the fit
     // (dropped once an input update includes them).
     struct SavedObject {
-        std::string uuid, revision;
+        std::string uuid;
+        int64_t version = 0;
     };
     QHash<QString, SavedObject> _brushPatches;
     QHash<QString, SavedObject> _savedCollections;
     int _savesInFlight = 0;  // submitReadyDrafts writing on a worker thread
     QStringList _savedDraftIds;
     QStringList _savedPatchIds;
-    // Those saved when the input update in flight began, with the revision
+    // Those saved when the input update in flight began, with the version
     // saved: one saved again or edited since stays a local drawing.
-    QHash<QString, std::string> _updatingDrafts;
-    QHash<QString, std::string> _updatingPatches;
+    QHash<QString, int64_t> _updatingDrafts;
+    QHash<QString, int64_t> _updatingPatches;
     void updateSurfaceIntersections();
     void ensureInitialFocus();
     void initializePreviewFocus();

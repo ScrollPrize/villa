@@ -1,5 +1,5 @@
 #include "TestSupport.hpp"
-#include "vc_object_store/objects/ObjectStoreSession.hpp"
+#include "StoreTestSupport.hpp"
 #include "vc_object_store/geometry/Geometry.hpp"
 #include <nlohmann/json.hpp>
 #include <bit>
@@ -14,13 +14,12 @@ int main() try
     OpenOptions options; options.author = "fiber-session-test";
     const auto path = directory.path / "fibers.vcobj";
     { auto store = ObjectStore::create(path, options); }
-    ObjectStoreSession session;
-    const auto attachment = session.attach(path, options);
+    auto db = ObjectStore::open(path, options);
     const auto a = util::newUuid(), b = util::newUuid(), c = util::newUuid();
     vc::geometry::Fiber geometry;
     geometry.controlPoints = {{0,0,0}, {10,0,0}, {20,0,0}};
     geometry.controlPointIds = {10,20,30};
-    session.act(attachment, {{a,{}}, {b,{}}, {c,{}}}, [&](auto& store, auto& txn) {
+    storeAct(db, {{a,{}}, {b,{}}, {c,{}}}, [&](auto& store, auto& txn) {
         for (const auto& uuid : {a,b,c}) {
             ObjectRecord record; record.uuid = uuid; record.kind = "fiber";
             record.name = "duplicate display name";
@@ -32,21 +31,21 @@ int main() try
         }
     });
     auto heads = [&] {
-        RevisionSelection result;
-        session.read(attachment, [&](const auto& store, const auto& txn, const auto&) {
-            for (const auto& uuid : {a,b,c}) result[uuid] = store.currentObjectRevision(txn, uuid)->uuid;
+        VersionSelection result;
+        storeRead(db, [&](const auto& store, const auto& txn, const auto&) {
+            for (const auto& uuid : {a,b,c}) result[uuid] = store.currentVersion(txn, uuid);
         });
         return result;
     };
     auto expected = heads();
     std::string originalGeometry;
-    session.read(attachment, [&](const auto& store, const auto& txn, const auto&) {
+    storeRead(db, [&](const auto& store, const auto& txn, const auto&) {
         ObjectSelection selection; selection.kind = "fiber";
         require(store.selectObjects(txn, selection).size() == 3, "same names retain distinct UUID identities");
         originalGeometry = store.currentGeometry(txn, a)->uuid;
     });
     const auto ordinary = util::newUuid(), adjacent = util::newUuid();
-    session.act(attachment, expected, [&](auto& store, auto& txn) {
+    storeAct(db, expected, [&](auto& store, auto& txn) {
         EdgeRecord edge; edge.uuid = ordinary; edge.kind = "fiber_branch"; edge.aUuid = a; edge.bUuid = b;
         edge.aAnchor.points = {{"control_points", {0}}}; edge.bAnchor.points = edge.aAnchor.points;
         store.addEdge(txn, edge);
@@ -54,7 +53,7 @@ int main() try
         store.addEdge(txn, edge);
         store.setApproval(txn, ordinary, "approved");
     });
-    session.read(attachment, [&](const auto& store, const auto& txn, const auto&) {
+    storeRead(db, [&](const auto& store, const auto& txn, const auto&) {
         ObjectSelection objects; objects.kind = "fiber";
         EdgeSelection edges; edges.kind = "fiber_branch"; edges.adjacent = false; edges.applicableOnly = true;
         require(store.graphReadView(txn, objects, edges).edgeUuids == std::vector<std::string>{ordinary}, "same-winding excludes adjacent edges");
@@ -68,7 +67,7 @@ int main() try
     const auto bits = std::bit_cast<uint64_t>(-5.0);
     GeometryArrayEdit edit{"control_points", 0, std::vector<uint8_t>(8)};
     for (int i = 0; i < 8; ++i) edit.bytes[i] = uint8_t(bits >> (i*8));
-    session.act(attachment, expected, [&](auto& store, auto& txn) {
+    storeAct(db, expected, [&](auto& store, auto& txn) {
         store.editGeometry(txn, a, {edit}, originalGeometry, [&](const std::vector<EdgeRecord>& affected) {
             std::vector<GeometryEdgeEdit> decisions;
             for (const auto& edge : affected) {
@@ -84,8 +83,8 @@ int main() try
         record.fiber->length = geometry.length();
         store.upsertObject(txn, record);
     });
-    mustFail([&] { session.act(attachment, before, [](auto&, auto&) {}); });
-    session.read(attachment, [&](const auto& store, const auto& txn, const auto&) {
+    mustFail([&] { storeAct(db, before, [](auto&, auto&) {}); });
+    storeRead(db, [&](const auto& store, const auto& txn, const auto&) {
         require(store.objectByUuid(txn, a)->fiber->length == 25, "summary committed with geometry");
         const auto current = store.currentGeometry(txn, a)->uuid;
         require(store.readGeometryArray(txn, current, "control_points", 0, 8) == edit.bytes, "bounded current read");
@@ -95,22 +94,22 @@ int main() try
     // Split/merge uses the existing sequence API and explicit source retirement.
     // Start from an unlinked fiber to isolate stable ID and annotation handling.
     const auto source = util::newUuid(), left = util::newUuid(), right = util::newUuid();
-    session.act(attachment, {{source,{}}}, [&](auto& store, auto& txn) {
+    storeAct(db, {{source,{}}}, [&](auto& store, auto& txn) {
         const auto original = *store.objectByUuid(txn, a);
         ObjectRecord record; record.uuid = source; record.kind = "fiber";
         record.name = original.name; record.fiber = original.fiber;
-        record.meta = Json{{"source", {{"control_points_attributes", Json::parse(store.geometryPointAnnotations(
-            txn, store.currentGeometry(txn, a)->uuid, "control_points"))}}}}.dump();
+        record.meta = Json{{"source", {{"control_points_attributes", store.geometryPointAnnotations(
+            txn, store.currentGeometry(txn, a)->uuid, "control_points")}}}}.dump();
         store.upsertObject(txn, record);
         store.putGeometry(txn, source, vc::geometry::encode(geometry));
     });
     std::string sourceGeometry;
-    RevisionSelection splitHeads{{left,{}}, {right,{}}};
-    session.read(attachment, [&](const auto& store, const auto& txn, const auto&) {
-        splitHeads[source] = store.currentObjectRevision(txn, source)->uuid;
+    VersionSelection splitHeads{{left,{}}, {right,{}}};
+    storeRead(db, [&](const auto& store, const auto& txn, const auto&) {
+        splitHeads[source] = store.currentVersion(txn, source);
         sourceGeometry = store.currentGeometry(txn, source)->uuid;
     });
-    session.act(attachment, splitHeads, [&](auto& store, auto& txn) {
+    storeAct(db, splitHeads, [&](auto& store, auto& txn) {
         for (const auto& uuid : {left,right}) {
             ObjectRecord record; record.uuid = uuid; record.kind = "fiber"; record.fiber.emplace();
             record.fiber->controlPointCount = uuid == left ? 2 : 1;
@@ -125,15 +124,15 @@ int main() try
         }
         store.retireObject(txn, source);
     });
-    RevisionSelection mergeHeads;
+    VersionSelection mergeHeads;
     std::string leftGeometry, rightGeometry;
-    session.read(attachment, [&](const auto& store, const auto& txn, const auto&) {
+    storeRead(db, [&](const auto& store, const auto& txn, const auto&) {
         require(store.objectByUuid(txn, source)->retired, "atomic source retirement");
-        for (const auto& uuid : {left,right}) mergeHeads[uuid] = store.currentObjectRevision(txn, uuid)->uuid;
+        for (const auto& uuid : {left,right}) mergeHeads[uuid] = store.currentVersion(txn, uuid);
         leftGeometry = store.currentGeometry(txn, left)->uuid; rightGeometry = store.currentGeometry(txn, right)->uuid;
-        require(Json::parse(store.geometryPointAnnotations(txn, rightGeometry, "control_points"))[0]["label"] == "c", "split annotations");
+        require(store.geometryPointAnnotations(txn, rightGeometry, "control_points")[0]["label"] == "c", "split annotations");
     });
-    session.act(attachment, mergeHeads, [&](auto& store, auto& txn) {
+    storeAct(db, mergeHeads, [&](auto& store, auto& txn) {
         GeometrySequenceEdit sequence; sequence.array = "control_points"; sequence.start = 2;
         GeometrySequencePart part; part.revision = rightGeometry; part.count = 1; sequence.parts.push_back(part);
         store.editGeometrySequence(txn, left, sequence, leftGeometry);
@@ -142,14 +141,12 @@ int main() try
         store.upsertObject(txn, record);
         store.retireObject(txn, right);
     });
-    session.detach(attachment);
-    const auto reattached = session.attach(path, options);
-    session.read(reattached, [&](const auto& store, const auto& txn, const auto&) {
+    auto reopened = ObjectStore::open(path, options);
+    storeRead(reopened, [&](const auto& store, const auto& txn, const auto&) {
         require(store.objectByUuid(txn, left)->fiber->controlPointCount == 3, "immediate persistence and reload");
         const auto revision = store.currentGeometry(txn, left)->uuid;
         require(store.readGeometryArray(txn, revision, "control_point_ids") ==
                 store.readGeometryArray(txn, sourceGeometry, "control_point_ids"), "stable IDs through split and merge");
     });
-    mustFail([&] { session.read(attachment, [](const auto&, const auto&, const auto&) {}); });
-    std::cout << "direct fiber API session tests passed\n";
+    std::cout << "direct fiber API tests passed\n";
 } catch (const std::exception& error) { std::cerr << error.what() << '\n'; return 1; }

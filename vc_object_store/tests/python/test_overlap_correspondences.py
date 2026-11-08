@@ -26,7 +26,7 @@ def flat(dx=0):
 
 def overlap_edge(db):
     report = db.link_surface_overlaps(volume_uuid=VOLUME, min_inliers=16)
-    assert report["edges_created"] == 1 and not report["failed"], report
+    assert report["edges_created"] == 1 and not report["problems"], report
     return db.edges_by_kind("same-surface")[0]
 
 
@@ -108,7 +108,7 @@ def whole_edge(db, kind, meta=None, a=LOW, b=HIGH):
 def move_high_keeping_edges(db, geometry):
     """A new HIGH geometry revision; its edges stay bound to the recorded one."""
     geometry["arrays"] = patch(db, None, flat(11))[1]["arrays"]
-    db.put_geometry(HIGH, geometry, expected_revision=db.current_geometry(HIGH)["uuid"],
+    db.put_geometry(HIGH, geometry, expected_version=db.current_object_revision(HIGH)["version"],
                     edge_edits=[edge_choice(db, e["uuid"], "keep_recorded")
                                 for e in db.affected_geometry_edges(HIGH, geometry)])
 

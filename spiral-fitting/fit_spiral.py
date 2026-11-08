@@ -3148,7 +3148,7 @@ class FitContext:
             manifest['model_state_sha256'] = self.model_state_digest()
             inputs = getattr(self, 'object_store_inputs', None)
             manifest['input_digest'] = inputs.digest if inputs is not None else None
-            # The hub position they were read at, when they were.
+            # The store position they were read at, when they were.
             manifest['input_position'] = ((inputs.manifest or {}).get('position')
                                           if inputs is not None else None)
             if not diagnostics:
@@ -3904,7 +3904,7 @@ class FitContext:
         return self.out_path
 
     # ==========================================================================
-    # Input replacement: a resident fit's inputs at a new hub position
+    # Input replacement: a resident fit's inputs at a new store position
     # ==========================================================================
 
     # Everything derived from the object-store inputs on the host
@@ -3921,12 +3921,14 @@ class FitContext:
     )
 
     def load_replacement_inputs(self, position):
-        """Every rank: read and materialize the inputs at hub ``position``
-        exactly as pinned (object_store_inputs.load_fit_inputs, which checks
-        that the ranks agree on their digest). Allocates host memory only."""
+        """Every rank: read and materialize the inputs at ``position`` (the
+        pins' provenance: object_store_inputs.InputPins, the position and
+        the versions the links left the objects at) exactly as pinned
+        (object_store_inputs.load_fit_inputs, which checks that the ranks
+        agree on their digest). Allocates host memory only."""
         from object_store_inputs import load_fit_inputs
         config = dict(self.config)
-        config['object_store_input_position'] = int(position)
+        config['object_store_input_position'] = dict(position)
         cache = (os.path.join(self.cache_path, 'object_store_strips')
                  if self.cache_path else None)
         return load_fit_inputs(
@@ -4024,8 +4026,8 @@ class FitContext:
                 torch.mps.empty_cache()
             for name in self._INPUT_HOST_ATTRIBUTES:
                 setattr(self, name, getattr(candidate, name))
-            position = (self.object_store_inputs.manifest.get('position') or {}).get('sequence')
-            self.config.update({'object_store_input_position': position})
+            self.config.update({'object_store_input_position':
+                                self.object_store_inputs.manifest.get('position')})
             self.patch_atlas.materialize(self.device)
             # Exclusions are judged afresh for these inputs (the report
             # lists those of the inputs installed now).
@@ -4148,6 +4150,13 @@ class FitContext:
             progress.update(iteration - self.start_iteration + 1)
             self.log_step_metrics(iteration, loss, losses, log_metrics, shell_metrics)
             self._maybe_save_headless_checkpoint(iteration + 1)
+            if self.device.type == 'mps':
+                # Return the step's freed blocks to Metal: otherwise the MPS
+                # caching allocator keeps a ~15 GB pool for the whole fit.
+                # Blocks still used by queued kernels are only released once
+                # the queue has drained.
+                torch.mps.synchronize()
+                torch.mps.empty_cache()
 
         # ==========================================================================
         # Final outputs

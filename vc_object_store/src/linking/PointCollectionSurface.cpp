@@ -1,3 +1,4 @@
+#include "linking/Detectors.hpp"
 #include "linking/StoredGeometry.hpp"
 #include "vc_object_store/geometry/Geometry.hpp"
 #include "vc_object_store/object_links/ObjectLinks.hpp"
@@ -46,7 +47,7 @@ struct Surface {
 // errors (invalid_argument, e.g. unrepresentable scaled XYZ) still abort the run
 // before any write.
 template <class Load>
-void loadEach(const std::vector<objects::ObjectRecord>& objects, DetectorReport& report,
+void loadEach(const std::vector<objects::ObjectRecord>& objects, DetectorReport& report, std::set<std::string>& failed,
     const std::atomic_bool* cancel, Load load)
 {
     for (const auto& object : objects) {
@@ -57,7 +58,8 @@ void loadEach(const std::vector<objects::ObjectRecord>& objects, DetectorReport&
             throw;
         } catch (const std::exception& e) {
             checkCancelled(cancel);
-            detail::reportFailure(report, "load", object.uuid, e.what(), object.uuid + ": " + e.what() + ", skipped");
+            report.problems.push_back(object.uuid + ": " + e.what() + ", skipped");
+            failed.insert(object.uuid);
         }
     }
 }
@@ -83,15 +85,16 @@ std::vector<objects::ObjectRecord> linkableCollections(detail::StoredGeometry& i
 
 std::vector<Collection> loadCollections(detail::StoredGeometry& inputs,
     const std::vector<objects::ObjectRecord>& objects, const PointCollectionSurfaceParams& params,
-    const std::map<std::string, double>& scales, DetectorReport& report, const std::atomic_bool* cancel)
+    const std::map<std::string, double>& scales, DetectorReport& report, std::set<std::string>& failed,
+    const std::atomic_bool* cancel)
 {
     std::vector<Collection> result;
-    loadEach(objects, report, cancel, [&](const objects::ObjectRecord& object) {
+    loadEach(objects, report, failed, cancel, [&](const objects::ObjectRecord& object) {
         const auto geometry = inputs.load(object);
         const auto xyz = geometry.values<double>("points");
         const auto ids = geometry.values<int64_t>("point_ids");
         const auto attributes = Json::parse(object.meta).value("source", Json::object());
-        const auto extras = Json::parse(inputs.pointAnnotations(geometry.revision, "points"));
+        const auto extras = inputs.pointAnnotations(geometry.revision, "points");
         if (!extras.is_null() && (!extras.is_array() || extras.size() != ids.size()))
             throw std::runtime_error("stored point annotations do not match geometry");
         Collection collection;
@@ -123,11 +126,11 @@ std::vector<Collection> loadCollections(detail::StoredGeometry& inputs,
 
 std::vector<Surface> loadSurfaces(detail::StoredGeometry& inputs, const std::vector<objects::ObjectRecord>& objects,
     const PointCollectionSurfaceParams& params, const std::map<std::string, double>& scales,
-    DetectorReport& report, const std::atomic_bool* cancel)
+    DetectorReport& report, std::set<std::string>& failed, const std::atomic_bool* cancel)
 {
     std::vector<Surface> surfaces;
     size_t loaded = 0;
-    loadEach(objects, report, cancel, [&](const objects::ObjectRecord& object) {
+    loadEach(objects, report, failed, cancel, [&](const objects::ObjectRecord& object) {
         objects::util::reportProgress(params.progress, "loading PCL target surfaces", loaded++, objects.size(), object.uuid);
         Surface surface;
         surface.object = object;
@@ -184,7 +187,7 @@ std::array<double, 3> projection(const Surface& surface, const SurfaceIndex::Loo
 }
 } // namespace
 
-DetectorReport linkPointCollectionsToSurfaces(objects::ObjectStore& db,
+detail::Detection detail::detectPointCollectionsToSurfaces(StoredGeometry& inputs,
     const PointCollectionSurfaceParams& params, const std::atomic_bool* cancel)
 {
     if (!(params.tolerance > 0) || !std::isfinite(params.tolerance) || params.tolerance > std::numeric_limits<float>::max() ||
@@ -194,15 +197,22 @@ DetectorReport linkPointCollectionsToSurfaces(objects::ObjectStore& db,
         throw std::invalid_argument("point-collection-surface: invalid tolerance, scale, window or edge kind");
     checkCancelled(cancel);
     objects::util::reportProgress(params.progress, "loading point collections");
-    detail::StoredGeometry inputs(db);
-    DetectorReport loading;
+    Detection detection;
+    detection.detector = kPointCollectionSurfaceDetector; detection.version = kPointCollectionSurfaceVersion;
+    detection.replaceStalePending = params.replaceStalePending;
+    DetectorReport& report = detection.report;
+    std::set<std::string> failed; // objects that could not be loaded (their edges stay)
     const auto collectionObjects = linkableCollections(inputs, params);
     const auto surfaceObjects = inputs.select("surface", params.surfaceUuids);
     const auto fresh = detail::newAmong(params.newUuids, {&collectionObjects, &surfaceObjects},
                                         "point-collection-surface");
-    const auto pointScales = detail::coordinateScales(collectionObjects, params, loading, params.pointScale);
-    const auto surfaceScales = detail::coordinateScales(surfaceObjects, params, loading, params.surfaceScale);
-    if (loading.failed()) return loading;
+    // Every kind is checked before any work, so one refusal names every object.
+    auto frames = detail::resolveCoordinateScales(collectionObjects, params, params.pointScale);
+    const auto surfaceFrames = detail::resolveCoordinateScales(surfaceObjects, params, params.surfaceScale);
+    detail::appendCoordinateScales(frames, surfaceFrames);
+    frames.check(params);
+    const auto& pointScales = frames.scales;
+    const auto& surfaceScales = surfaceFrames.scales;
     // Named-pair targets of an incremental run come from every selected
     // surface (the pair may not be loaded); a full run's from the loaded ones.
     std::map<std::string, std::string> selectedByName;
@@ -237,8 +247,8 @@ DetectorReport linkPointCollectionsToSurfaces(objects::ObjectStore& db,
         collectionsToLoad = keepOnly(collectionObjects, [&](const std::string& uuid) { return collections.contains(uuid); });
         surfacesToLoad = keepOnly(surfaceObjects, [&](const std::string& uuid) { return surfaces.contains(uuid); });
     }
-    auto collections = loadCollections(inputs, collectionsToLoad, params, pointScales, loading, cancel);
-    auto surfaces = loadSurfaces(inputs, surfacesToLoad, params, surfaceScales, loading, cancel);
+    auto collections = loadCollections(inputs, collectionsToLoad, params, pointScales, report, failed, cancel);
+    auto surfaces = loadSurfaces(inputs, surfacesToLoad, params, surfaceScales, report, failed, cancel);
     std::map<std::string, size_t> byName, byUuid;
     std::unordered_map<SurfaceGrid*, size_t> byGrid;
     std::vector<SurfaceIndex::SurfacePtr> grids;
@@ -252,13 +262,10 @@ DetectorReport linkPointCollectionsToSurfaces(objects::ObjectStore& db,
     }
     if (fresh) {
         // Edges of a new object, both endpoints selected and not failed.
-        const auto failed = detail::failedObjects(loading);
+        std::vector<std::string> selectedUuids;
         for (const auto* objects : {&collectionObjects, &surfaceObjects})
-            for (const auto& object : *objects)
-                if (!failed.contains(object.uuid)) scope.objectUuids.push_back(object.uuid);
-        for (const auto& uuid : *fresh)
-            if (!failed.contains(uuid)) scope.touching.push_back(uuid);
-        if (scope.touching.empty()) scope.objectUuids.clear();
+            for (const auto& object : *objects) selectedUuids.push_back(object.uuid);
+        scope = detail::incrementalScope(params.edgeKind, selectedUuids, *fresh, failed);
     }
     // Surfaces an incremental run may link an existing collection to: the new ones.
     std::vector<char> newSurface(surfaces.size(), 0);
@@ -351,16 +358,17 @@ DetectorReport linkPointCollectionsToSurfaces(objects::ObjectStore& db,
         }
     }
     checkCancelled(cancel);
-    auto txn = db.write();
-    auto report = detail::commitStoredCandidates(db, inputs, txn, kPointCollectionSurfaceDetector, kPointCollectionSurfaceVersion, candidates,
-        params.replaceStalePending, &scope, params.progress);
-    checkCancelled(cancel);
-    objects::util::reportProgress(params.progress, "committing point-collection links");
-    checkCancelled(cancel);
-    txn.commit();
-    report.committed = true;
+    detection.candidates = std::move(candidates);
+    detection.scope = std::move(scope);
     report.objectsConsidered = int64_t(collections.size() + surfaces.size());
-    report.issues = std::move(loading.issues);
-    return report;
+    return detection;
+}
+
+DetectorReport linkPointCollectionsToSurfaces(objects::ObjectStore& db,
+    const PointCollectionSurfaceParams& params, const std::atomic_bool* cancel)
+{
+    detail::StoredGeometry inputs(db);
+    const auto detection = detail::detectPointCollectionsToSurfaces(inputs, params, cancel);
+    return detail::publishDetection(db, inputs, detection, params.progress, cancel);
 }
 } // namespace vc::object_links

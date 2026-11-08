@@ -262,7 +262,11 @@ CtSheetNormal PooledLasagnaSheetNormalSampler::sampleNormal(const cv::Vec3d& xyz
             auto& stream = impl_->channels[channel];
             stream.seekg(std::streamoff(row) * impl_->brickVoxels);
             stream.read(reinterpret_cast<char*>(brick.data() + channel * impl_->brickVoxels), impl_->brickVoxels);
-            if (!stream) throw std::runtime_error("cannot read a lasagna pack brick");
+            if (!stream) {
+                stream.clear();
+                throw SheetNormalSourceError("cannot read lasagna pack brick " + std::to_string(row) + " of channel_"
+                                             + std::to_string(channel) + ".u8");
+            }
         }
         if (impl_->bricks.size() == 128) {
             impl_->bricks.erase(impl_->order.front());

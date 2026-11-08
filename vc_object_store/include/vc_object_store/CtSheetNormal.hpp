@@ -3,10 +3,18 @@
 #include <atomic>
 #include <filesystem>
 #include <memory>
+#include <stdexcept>
 #include <string>
 #include <opencv2/core/types.hpp>
 
 namespace vc {
+
+// The normal source itself could not be read (a missing or truncated pack
+// brick, an unreadable chunk): a failure of the run, unlike a query outside
+// the volume or without data, which is an invalid sample.
+struct SheetNormalSourceError : std::runtime_error {
+    using std::runtime_error::runtime_error;
+};
 
 struct CtSheetNormal {
     cv::Vec3d normal{0, 0, 0};

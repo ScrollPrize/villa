@@ -214,7 +214,7 @@ def test_the_outer_shell_is_read_on_its_own_never_as_a_patch(db):
     moved = _grid(31.0, size=8)[..., ::-1].astype('<f4')
     db.put_geometry(shell, {'kind': 'surface', 'attributes': {'scale': [1, 1]},
                             'arrays': [array('points', moved, '<f4')]},
-                    expected_revision=db.current_geometry(shell)['uuid'])
+                    expected_version=db.current_version(shell))
     assert osi.read_snapshot(db, request()).digest() != snapshot.digest()
     # It materializes whole, in the fit frame, beside the patches.
     inputs = osi.materialize(db, osi.read_snapshot(db, request()), z_begin=0, z_end=64,

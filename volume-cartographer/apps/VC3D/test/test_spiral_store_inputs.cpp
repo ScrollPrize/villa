@@ -9,6 +9,7 @@
 #include <vc_object_store/Uuid.hpp>
 #include <vc_object_store/objects/GeometryCoordinates.hpp>
 #include <vc_object_store/objects/ObjectStoreSession.hpp>
+#include <vc_object_store/objects/StoreReader.hpp>
 
 #include <QCoreApplication>
 #include <QTemporaryDir>
@@ -75,9 +76,21 @@ void adapterMetadataMatchesThePythonAdapter()
 struct Fixture {
     std::shared_ptr<ObjectStoreSession> session = std::make_shared<ObjectStoreSession>();
     AttachmentIdentity attachment;
+    fs::path path;
     std::string surface, pcl, fiber, link;
 
-    explicit Fixture(const fs::path& path)
+    // A checked write beside the session: the store file is shared, so a
+    // second connection commits through the store's own API.
+    template <typename Fn> void act(const VersionSelection& expected, Fn&& fn)
+    {
+        OpenOptions options; options.author = "spiral-store-inputs-test";
+        auto db = ObjectStore::open(path, options);
+        auto txn = db.write(expected);
+        fn(db, txn);
+        txn.commit();
+    }
+
+    explicit Fixture(const fs::path& path) : path(path)
     {
         OpenOptions options; options.author = "spiral-store-inputs-test";
         { auto created = ObjectStore::create(path, options); }
@@ -85,8 +98,8 @@ struct Fixture {
         surface = util::newUuid();
         pcl = util::newUuid();
         fiber = util::newUuid();
-        session->act(attachment, {{surface, std::nullopt}, {pcl, std::nullopt}, {fiber, std::nullopt}},
-                     [&](auto& db, auto& txn) {
+        act({{surface, std::nullopt}, {pcl, std::nullopt}, {fiber, std::nullopt}},
+            [&](auto& db, auto& txn) {
             // A 2x3 patch at scale 1 whose last vertex is invalid.
             ObjectRecord record; record.uuid = surface; record.kind = "surface"; record.name = "near";
             record.meta = Json{{"coordinates", volumeCoordinates(kVolume, 1)},
@@ -126,7 +139,7 @@ struct Fixture {
             db.putGeometry(txn, fiber, fiberData);
         });
         // The collection's point 4 lies on the patch.
-        session->act(attachment, pins({surface, pcl}), [&](auto& db, auto& txn) {
+        act(pins({surface, pcl}), [&](auto& db, auto& txn) {
             EdgeRecord edge; edge.kind = "point-surface"; edge.aUuid = surface; edge.bUuid = pcl;
             edge.aAnchor.points = {{"points", {0, 1}}};
             edge.aAnchor.position = std::array<double, 3>{11, 20, 30};
@@ -141,14 +154,14 @@ struct Fixture {
     {
         Json objects = Json::array();
         std::string storeUuid;
-        session->read(attachment, [&](const auto& db, const auto& txn, const auto&) {
-            storeUuid = db.uuid(txn);
+        session->readStore(attachment, [&](const StoreReader& reader, const auto&) {
+            storeUuid = reader.status().storeUuid;
             for (const auto& [uuid, kind, scale] : {std::tuple{surface, "surface", 1.0},
                                                     std::tuple{pcl, "point_collection", 2.0},
                                                     std::tuple{fiber, "fiber", 4.0}}) {
-                const auto current = db.currentObjectRevision(txn, uuid);
+                const auto current = reader.currentObject(uuid);
                 objects.push_back({{"uuid", uuid}, {"kind", kind}, {"name", current->record.name},
-                                   {"object_revision", "another-replica"},
+                                   {"generation", current->generation}, {"version", current->version},
                                    {"geometry_revision", *current->geometryRevision},
                                    {"metadata", vc3d::spiral::adapterMetadata(
                                         kind, Json::parse(current->record.meta), current->record.fiber)},
@@ -157,12 +170,18 @@ struct Fixture {
         });
         // The link as the adapter records it: surface end first.
         Json relationships = Json::array();
-        session->read(attachment, [&](const auto& db, const auto& txn, const auto&) {
-            for (const auto& selected : db.relationshipsAt(txn, {{surface, std::nullopt}, {pcl, std::nullopt}})) {
+        session->readStore(attachment, [&](const StoreReader& reader, const auto&) {
+            const auto status = reader.status();
+            std::vector<ObjectVersion> heads;
+            for (const auto& uuid : {surface, pcl}) {
+                const auto current = reader.currentObject(uuid);
+                heads.push_back({status.storeUuid, current->generation, uuid, current->version});
+            }
+            for (const auto& selected : reader.relationshipsAt(heads)) {
                 const auto& version = selected.relationship;
                 const bool stored = version.record.aUuid == surface;
                 relationships.push_back(
-                    {{"uuid", version.record.uuid}, {"revision", "another-replica"}, {"kind", version.record.kind},
+                    {{"uuid", version.record.uuid}, {"version", version.record.version.value_or(0)}, {"kind", version.record.kind},
                      {"family", "pcl_patch"}, {"approval_state", version.record.approvalState},
                      {"generation", version.record.generation}, {"a", surface},
                      {"a_geometry_revision", *(stored ? version.aGeometryRevision : version.bGeometryRevision)},
@@ -175,12 +194,12 @@ struct Fixture {
                               {"volume_uuid", kVolume}, {"objects", objects}, {"relationships", relationships}}}};
     }
 
-    // Checked writes expect the current revisions of what they change.
-    RevisionSelection pins(std::initializer_list<std::string> uuids)
+    // Checked writes expect the current versions of what they change.
+    VersionSelection pins(std::initializer_list<std::string> uuids)
     {
-        RevisionSelection selection;
-        session->read(attachment, [&](const auto& db, const auto& txn, const auto&) {
-            for (const auto& uuid : uuids) selection[uuid] = db.currentObjectRevision(txn, uuid)->uuid;
+        VersionSelection selection;
+        session->readStore(attachment, [&](const StoreReader& reader, const auto&) {
+            for (const auto& uuid : uuids) selection[uuid] = reader.currentObject(uuid)->version;
         });
         return selection;
     }
@@ -189,8 +208,8 @@ struct Fixture {
                                           const std::set<std::string>& links)
     {
         vc3d::spiral::FitInputChanges result;
-        session->read(attachment, [&](const auto& db, const auto& txn, const auto&) {
-            result = vc3d::spiral::readFitInputChanges(db, txn, document, objects, links);
+        session->readStore(attachment, [&](const StoreReader& reader, const auto&) {
+            result = vc3d::spiral::readFitInputChanges(reader, document, objects, links);
         });
         return result;
     }
@@ -198,8 +217,8 @@ struct Fixture {
     vc3d::spiral::FitInputs read(const Json& document)
     {
         vc3d::spiral::FitInputs result;
-        session->read(attachment, [&](const auto& db, const auto& txn, const auto&) {
-            result = vc3d::spiral::readFitInputs(db, txn, document);
+        session->readStore(attachment, [&](const StoreReader& reader, const auto&) {
+            result = vc3d::spiral::readFitInputs(reader, document);
         });
         return result;
     }
@@ -290,7 +309,7 @@ void readsCurrentInputsAndTheirDifferences(const fs::path& directory)
 
     // A metadata edit the adapter reads, then a geometry edit: what is read
     // is the store now, and the state says what changed since the fit.
-    fixture.session->act(fixture.attachment, fixture.pins({fixture.pcl, fixture.surface}),
+    fixture.act(fixture.pins({fixture.pcl, fixture.surface}),
                          [&](auto& db, auto& txn) {
         db.setMeta(txn, fixture.pcl, "sampling_group", "\"reviewed\"");
         db.setMeta(txn, fixture.surface, "review_note", "\"unrelated\"");
@@ -299,7 +318,7 @@ void readsCurrentInputsAndTheirDifferences(const fs::path& directory)
     require(inputs.pointCollections.at(0).state == InputState::MetadataChanged, "metadata change detected");
     require(inputs.surfaces.at(0).state == InputState::Fitted, "unread metadata is no change");
 
-    fixture.session->act(fixture.attachment, fixture.pins({fixture.fiber}), [&](auto& db, auto& txn) {
+    fixture.act(fixture.pins({fixture.fiber}), [&](auto& db, auto& txn) {
         const auto current = db.currentGeometry(txn, fixture.fiber);
         const double moved[3] = {0, 0, 0};
         GeometryArrayEdit edit{"line_points", 3, {}};
@@ -315,14 +334,14 @@ void readsCurrentInputsAndTheirDifferences(const fs::path& directory)
 
     // Links: an edit changes the fitted one, a new one among the fitted
     // inputs is reported, and a rejected one is no longer consumed.
-    fixture.session->act(fixture.attachment, fixture.pins({fixture.surface, fixture.pcl}),
+    fixture.act(fixture.pins({fixture.surface, fixture.pcl}),
                          [&](auto& db, auto& txn) {
         db.setMeta(txn, fixture.link, "distance", "0.25");
     });
     inputs = incremental(fixture, document, inputs, {}, {fixture.link}, "a link edit");
     require(inputs.relationships.at(0).state == LinkState::Changed, "link edit detected");
     std::string added;
-    fixture.session->act(fixture.attachment, fixture.pins({fixture.surface, fixture.fiber}),
+    fixture.act(fixture.pins({fixture.surface, fixture.fiber}),
                          [&](auto& db, auto& txn) {
         EdgeRecord edge; edge.kind = "same-surface"; edge.aUuid = fixture.surface; edge.bUuid = fixture.fiber;
         edge.aAnchor.wholeGeometry = true; edge.bAnchor.wholeGeometry = true;
@@ -332,12 +351,12 @@ void readsCurrentInputsAndTheirDifferences(const fs::path& directory)
     require(inputs.addedRelationships.size() == 1 && inputs.addedRelationships[0].uuid == added
                 && inputs.addedRelationships[0].a == fixture.surface,
             "a new consumable link is reported");
-    fixture.session->act(fixture.attachment, fixture.pins({fixture.surface, fixture.pcl}),
+    fixture.act(fixture.pins({fixture.surface, fixture.pcl}),
                          [&](auto& db, auto& txn) { db.setApproval(txn, fixture.link, "rejected"); });
     inputs = incremental(fixture, document, inputs, {}, {fixture.link}, "a rejection");
     require(inputs.relationships.at(0).state == LinkState::Dropped, "a rejected link is dropped");
     // Removing the new link: reported by the link alone, or by an endpoint.
-    fixture.session->act(fixture.attachment, fixture.pins({fixture.surface, fixture.fiber}),
+    fixture.act(fixture.pins({fixture.surface, fixture.fiber}),
                          [&](auto& db, auto& txn) { db.removeEdge(txn, added); });
     require(incremental(fixture, document, inputs, {}, {added}, "a removed link").addedRelationships.empty(),
             "a removed link is no longer reported");

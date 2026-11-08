@@ -1,4 +1,5 @@
 // Stored fiber adapter for the shared line-to-surface linker.
+#include "linking/Detectors.hpp"
 #include "linking/LineSurface.hpp"
 #include "linking/StoredGeometry.hpp"
 #include <algorithm>
@@ -28,8 +29,7 @@ std::optional<detail::LineData> loadFiber(detail::StoredGeometry& inputs,
         points("line_points", fiber.line);
         points("control_points", fiber.controls);
         if (fiber.line.size() < 2) {
-            detail::reportDiagnostic(report, "load", object.uuid, "fewer than two line points",
-                object.uuid + ": fewer than two line points, skipped");
+            report.problems.push_back(object.uuid + ": fewer than two line points, skipped");
             return std::nullopt;
         }
         fiber.arclength.assign(fiber.line.size(), 0.0);
@@ -67,21 +67,26 @@ std::optional<detail::LineData> loadFiber(detail::StoredGeometry& inputs,
         }
         return fiber;
     } catch (const std::exception& e) {
-        detail::reportFailure(report, "load", object.uuid, e.what(), object.uuid + ": invalid stored fiber: " + e.what());
+        report.problems.push_back(object.uuid + ": invalid stored fiber: " + e.what());
         return std::nullopt;
     }
 }
 
-} // namespace
 
-DetectorReport linkFibersToSurfaces(objects::ObjectStore& db, const std::filesystem::path& ctVolume,
-    const FiberSurfaceParams& params, const std::atomic_bool* cancel)
+// Select the fibers (and, for an incremental run, their partners) and run
+// `run(count, loader, incremental)` with their loader (strip caching when
+// configured).
+template <class Run> auto withFibers(detail::StoredGeometry& inputs, const FiberSurfaceParams& params, Run&& run)
 {
     detail::validateLineSurfaceParams(params, params.fiberScale);
-    detail::StoredGeometry inputs(db);
     const auto selected = inputs.select("fiber", params.fiberUuids);
-    DetectorReport validation;
-    const auto scales = detail::coordinateScales(selected, params, validation, params.fiberScale);
+    // Fibers and surfaces are checked together before any work, so one
+    // refusal names every object of the run without a frame.
+    auto frames = detail::resolveCoordinateScales(selected, params, params.fiberScale);
+    detail::appendCoordinateScales(frames,
+        detail::resolveCoordinateScales(inputs.select("surface", params.surfaceUuids), params, params.surfaceScale));
+    frames.check(params);
+    const auto& scales = frames.scales;
     std::optional<detail::LineIncremental> incremental;
     auto fibers = selected;
     if (params.newUuids) {
@@ -116,8 +121,9 @@ DetectorReport linkFibersToSurfaces(objects::ObjectStore& db, const std::filesys
         }
         for (const auto& object : selected) incremental->selected.push_back(object.uuid);
         std::erase_if(fibers, [&](const objects::ObjectRecord& object) { return !wantedFibers.contains(object.uuid); });
+        for (const auto& object : fibers) incremental->lines.push_back(object.uuid);
     }
-    auto load = [&](size_t index, DetectorReport& report) -> std::optional<detail::LineData> {
+    const detail::LineLoader load = [&](size_t index, DetectorReport& report) -> std::optional<detail::LineData> {
         auto fiber = loadFiber(inputs, fibers[index], scales.at(fibers[index].uuid), report);
         if (fiber && !params.cacheDirectory.empty()) {
             fiber->stripCacheFile = params.cacheDirectory / (fiber->uuid + ".cbor");
@@ -125,8 +131,26 @@ DetectorReport linkFibersToSurfaces(objects::ObjectStore& db, const std::filesys
         }
         return fiber;
     };
-    return detail::linkLinesToSurfaces(db, inputs, fibers.size(), load, ctVolume,
-        params, params.fiberScale, kFiberSurfaceDetector, kFiberSurfaceVersion, cancel, std::move(validation),
-        incremental ? &*incremental : nullptr);
+    return run(fibers.size(), load, incremental ? &*incremental : nullptr);
+}
+} // namespace
+
+detail::Detection detail::detectFibersToSurfaces(StoredGeometry& inputs, const std::filesystem::path& ctVolume,
+    const FiberSurfaceParams& params, const std::atomic_bool* cancel)
+{
+    return withFibers(inputs, params, [&](size_t count, const LineLoader& load, const LineIncremental* incremental) {
+        return detectLinesToSurfaces(inputs, count, load, ctVolume, params, params.fiberScale, kFiberSurfaceDetector,
+                                     kFiberSurfaceVersion, cancel, incremental);
+    });
+}
+
+DetectorReport linkFibersToSurfaces(objects::ObjectStore& db, const std::filesystem::path& ctVolume,
+    const FiberSurfaceParams& params, const std::atomic_bool* cancel)
+{
+    detail::StoredGeometry inputs(db);
+    return withFibers(inputs, params, [&](size_t count, const detail::LineLoader& load, const detail::LineIncremental* incremental) {
+        return detail::linkLinesToSurfaces(db, inputs, count, load, ctVolume, params, params.fiberScale, kFiberSurfaceDetector,
+                                           kFiberSurfaceVersion, cancel, incremental);
+    });
 }
 } // namespace vc::object_links

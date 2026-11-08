@@ -48,6 +48,7 @@ from vesuvius.ink_detection.models.model import make_model
 from vesuvius.ink_detection.volume_io import (
     open_volume,
     read_bbox_with_padding,
+    read_bboxes_with_padding,
 )
 from vesuvius.utils.cli import HyphenUnderscoreParser
 
@@ -844,16 +845,35 @@ class NativePatchDataset(Dataset):
             ),
         )
 
-    def __getitem__(self, index: int):
-        patch = self.patches[int(index)]
+    def _bbox(self, patch: PatchSpec) -> tuple[int, ...]:
         starts = (int(patch.z0), int(patch.y0), int(patch.x0))
         stops = tuple(
             starts[axis] + self.patch_size_zyx[axis] for axis in range(3)
         )
-        bbox = (*starts, *stops)
+        return (*starts, *stops)
+
+    def __getitem__(self, index: int):
+        bbox = self._bbox(self.patches[int(index)])
         crop, valid_slices = read_bbox_with_padding(
             self._ensure_volume(), bbox, fill_value=0
         )
+        return self._sample(bbox, crop, valid_slices)
+
+    def __getitems__(self, indices: Sequence[int]):
+        """Share remote chunk reads across the batch using vc_reader."""
+        if not is_url_like(self.volume_path):
+            return [self[index] for index in indices]
+        if not indices:
+            return []
+        bboxes = [self._bbox(self.patches[int(index)]) for index in indices]
+        crops = read_bboxes_with_padding(self._ensure_volume(), bboxes, fill_value=0)
+        return [
+            self._sample(bbox, crop, valid_slices)
+            for bbox, (crop, valid_slices) in zip(bboxes, crops)
+        ]
+
+    def _sample(self, bbox, crop: np.ndarray, valid_slices):
+        starts = bbox[:3]
         crop = crop.astype(np.float32, copy=False)
         if valid_slices is not None:
             crop[valid_slices] = normalize_image(

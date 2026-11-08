@@ -2,11 +2,10 @@
 """A Spiral service for VC3D's protocol tests: the real HTTP service bound to
 an object store, with the resident runtime faked.
 
-    python protocol_client_service.py --store STORE.vcobj [--hub HUB] --root DIR --port-file FILE
+    python protocol_client_service.py --store STORE.vcobj --root DIR --port-file FILE
 
-With --hub the store is the service's replica of that hub (cloned when
-absent); without, the store is shared in place. Builds link and pin
-positions (the hub's, or the store's own) as a real service's do.
+The store file is shared with the client on this host. Builds link and pin
+positions of it as a real service's do.
 The faked session freezes inputs the way a real one does: it reads the
 store's default selection (at the pinned position) read-only, writes the run directory's
 object_store_inputs.json and reports its digest, summary and manifest path,
@@ -112,8 +111,7 @@ class FrozenInputsRuntime(FakeRuntime):
         with ObjectStore.open(config['object_store_path'], read_only=True) as store:
             request = osi.request_from_config(config)
             if position is not None:
-                request = dataclasses.replace(request, position=osi.InputPosition(
-                    osi.position_owner(store), position))
+                request = dataclasses.replace(request, pins=osi.InputPins.from_provenance(position))
             snapshot = osi.read_snapshot(store, request)
         manifest = snapshot.manifest()
         manifest['link_refresh'] = {'enabled': False}
@@ -135,9 +133,10 @@ class FrozenInputsRuntime(FakeRuntime):
             threading.Timer(0.2, lambda: self.status_callback(self.status())).start()
 
     def update_inputs(self, position, timeout=1800.0):
-        """A resident input update: the inputs of the position, as pinned."""
-        self.applied = {**self.applied, 'object_store_input_position': position}
+        """A resident input update: the inputs of the position (the pins'
+        provenance), as pinned."""
         self._freeze(position)
+        self.applied = {**self.applied, 'object_store_input_position': self.position}
         self.input_generation += 1
         return {'digest': self.digest, 'input_generation': self.input_generation}
 
@@ -172,7 +171,6 @@ class FrozenInputsRuntime(FakeRuntime):
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__.split('\n\n')[0])
     parser.add_argument('--store', required=True)
-    parser.add_argument('--hub', default=None)
     parser.add_argument('--root', required=True)
     parser.add_argument('--port-file', required=True)
     args = parser.parse_args(argv)
@@ -183,7 +181,7 @@ def main(argv=None):
     spiral_runtime.create_session = FrozenInputsRuntime
     state = spiral_service.ServiceState(
         bindings=spiral_service.bind_service_inputs(output, root / 'cache'),
-        object_store=spiral_service.bind_object_store(args.store, 'protocol-test', args.hub),
+        object_store=spiral_service.bind_object_store(args.store, 'protocol-test'),
         startup_run={'z_begin': 0, 'z_end': 10, 'config': dict(NO_DENSE)})
 
     def publish_flattened(session_id, generation, raw_manifest_path):

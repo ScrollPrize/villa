@@ -23,21 +23,38 @@ nlohmann::json coordinateProvenance(const objects::ObjectRecord& object, const C
     if (!params.volumeUuid) return nlohmann::json::object();
     return {{"coordinates", objects::resolveGeometryCoordinates(nlohmann::json::parse(object.meta), *params.volumeUuid)}};
 }
-std::map<std::string, double> coordinateScales(const std::vector<objects::ObjectRecord>& objects,
-    const CoordinateParams& params, DetectorReport& report, double explicitScale)
+void CoordinateScales::check(const CoordinateParams& params) const
+{
+    if (!failures.empty())
+        throw std::invalid_argument("objects without a coordinate frame in volume " + params.volumeUuid.value_or("") + ": " + failures);
+}
+CoordinateScales resolveCoordinateScales(const std::vector<objects::ObjectRecord>& objects,
+    const CoordinateParams& params, double explicitScale)
 {
     validateCoordinateParams(params, explicitScale);
-    std::map<std::string, double> result;
+    CoordinateScales result;
     for (const auto& object : objects) {
         try {
-            result[object.uuid] = params.volumeUuid
+            result.scales[object.uuid] = params.volumeUuid
                 ? vc::objects::geometryScaleToFrame(coordinateProvenance(object, params), *params.volumeUuid)
                 : explicitScale;
         } catch (const std::exception& e) {
-            reportFailure(report, "validate", object.uuid, e.what(), object.uuid + ": " + e.what());
+            result.failures += (result.failures.empty() ? "" : "; ") + object.uuid + ": " + e.what();
         }
     }
     return result;
+}
+void appendCoordinateScales(CoordinateScales& into, const CoordinateScales& more)
+{
+    into.scales.insert(more.scales.begin(), more.scales.end());
+    if (!more.failures.empty()) into.failures += (into.failures.empty() ? "" : "; ") + more.failures;
+}
+std::map<std::string, double> coordinateScales(const std::vector<objects::ObjectRecord>& objects,
+    const CoordinateParams& params, double explicitScale)
+{
+    const auto resolved = resolveCoordinateScales(objects, params, explicitScale);
+    resolved.check(params);
+    return resolved.scales;
 }
 std::shared_ptr<SurfaceGrid> scaledSurfaceGrid(const std::shared_ptr<SurfaceGrid>& source, double scale,
     bool scaleParameterization)
@@ -62,6 +79,11 @@ std::shared_ptr<SurfaceGrid> scaledSurfaceGrid(const std::shared_ptr<SurfaceGrid
     }
     return std::make_shared<SurfaceGrid>(points, gridScale);
 }
+const objects::ReadTxn& StoredGeometry::txn() const
+{
+    if (!read_) throw std::logic_error("object links: the stored geometry snapshot was closed");
+    return *read_;
+}
 std::vector<objects::ObjectRecord> StoredGeometry::select(const std::string& kind,
     const std::vector<std::string>& uuids)
 {
@@ -70,16 +92,26 @@ std::vector<objects::ObjectRecord> StoredGeometry::select(const std::string& kin
     objects::ObjectSelection selection;
     selection.kind = kind;
     selection.uuids.assign(requested.begin(), requested.end());
-    auto objects = db_.selectObjects(read_, selection);
+    auto objects = db_.selectObjects(txn(), selection);
     if (!requested.empty() && objects.size() != requested.size())
         throw std::invalid_argument("requested objects are missing or not of kind " + kind);
-    for (const auto& object : objects) generations_[object.uuid] = object.generation;
+    for (const auto& object : objects) {
+        generations_[object.uuid] = object.generation;
+        if (!object.version) throw std::runtime_error("object " + object.uuid + " has no numbered version");
+        versions_[object.uuid] = *object.version;
+    }
     return objects;
+}
+objects::VersionSelection StoredGeometry::expectations() const
+{
+    objects::VersionSelection result;
+    for (const auto& [uuid, version] : versions_) result.emplace(uuid, version);
+    return result;
 }
 objects::detail::GeometrySnapshot StoredGeometry::load(const objects::ObjectRecord& object,
     const std::optional<std::string>& named)
 {
-    const auto revision = named ? db_.geometryRevision(read_, *named) : db_.currentGeometry(read_, object.uuid);
+    const auto revision = named ? db_.geometryRevision(txn(), *named) : db_.currentGeometry(txn(), object.uuid);
     if (named && (!revision || revision->objectUuid != object.uuid))
         throw std::runtime_error("object " + object.uuid + " has no geometry revision " + *named + " in this store");
     if (!revision) throw std::runtime_error("object " + object.uuid + " has no stored geometry; ingest it before discovery");
@@ -90,11 +122,11 @@ objects::detail::GeometrySnapshot StoredGeometry::load(const objects::ObjectReco
     result.revision = *revision;
     const std::vector<std::string> names = object.kind == "fiber" ? std::vector<std::string>{"control_points", "line_points"}
         : object.kind == "point_collection" ? std::vector<std::string>{"points", "point_ids"} : std::vector<std::string>{"points"};
-    for (const auto& name : names) result.arrays[name] = db_.readGeometryArray(read_, revision->uuid, name);
+    for (const auto& name : names) result.arrays[name] = db_.readGeometryArray(txn(), revision->uuid, name);
     if (object.kind == "surface")
         for (const auto& array : revision->arrays)
             if (array.name == objects::detail::surfaceValidChannel)
-                result.arrays[array.name] = db_.readGeometryArray(read_, revision->uuid, array.name);
+                result.arrays[array.name] = db_.readGeometryArray(txn(), revision->uuid, array.name);
     return result;
 }
 void StoredGeometry::validate(const objects::WriteTxn& txn) const
@@ -119,7 +151,7 @@ std::optional<Box> StoredGeometry::workingBounds(const objects::ObjectRecord& ob
     selection.bbox = Box{-1e30, -1e30, -1e30, 1e30, 1e30, 1e30};
     if (params.volumeUuid) selection.volume = *params.volumeUuid;
     std::optional<Box> result;
-    for (const auto& region : db_.spatialRegions(read_, selection)) {
+    for (const auto& region : db_.spatialRegions(txn(), selection)) {
         if (!result) { result = region.bbox; continue; }
         for (int axis = 0; axis < 3; ++axis) {
             (*result)[axis] = std::min((*result)[axis], region.bbox[axis]);
@@ -141,7 +173,7 @@ std::set<std::string> StoredGeometry::objectsNear(const std::string& kind, const
     else for (auto& value : query) value /= explicitScale;
     selection.bbox = query;
     std::set<std::string> result;
-    for (const auto& object : db_.selectObjects(read_, selection, std::vector<std::string>{})) result.insert(object.uuid);
+    for (const auto& object : db_.selectObjects(txn(), selection, std::vector<std::string>{})) result.insert(object.uuid);
     return result;
 }
 std::optional<std::set<std::string>> newAmong(const std::optional<std::vector<std::string>>& newUuids,
@@ -159,13 +191,16 @@ std::optional<std::set<std::string>> newAmong(const std::optional<std::vector<st
     }
     return result;
 }
-std::set<std::string> failedObjects(const DetectorReport& report)
+StaleEdgeScope incrementalScope(const std::string& edgeKind, const std::vector<std::string>& selected,
+    const std::set<std::string>& fresh, const std::set<std::string>& failed)
 {
-    std::set<std::string> result;
-    for (const auto& issue : report.issues)
-        if (issue.severity == DetectorIssue::Severity::Failure)
-            result.insert(issue.objectUuids.begin(), issue.objectUuids.end());
-    return result;
+    StaleEdgeScope scope{{edgeKind}, {}, {}};
+    for (const auto& uuid : selected)
+        if (!failed.contains(uuid)) scope.objectUuids.push_back(uuid);
+    for (const auto& uuid : fresh)
+        if (!failed.contains(uuid)) scope.touching.push_back(uuid);
+    if (scope.touching.empty()) scope.objectUuids.clear();
+    return scope;
 }
 std::shared_ptr<SurfaceGrid> surfaceGrid(const objects::detail::GeometrySnapshot& geometry)
 {

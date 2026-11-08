@@ -127,6 +127,13 @@ _QUIESCENT_COMMANDS = frozenset({
 })
 
 
+def _describe_position(position):
+    """A store position (or pins) in a message: its commit."""
+    value = (position or {}).get("position", position) or {}
+    sequence = value.get("commit_sequence") if isinstance(value, dict) else None
+    return f"commit {sequence}" if sequence is not None else "an unknown position"
+
+
 class InputUpdateRefused(RuntimeError):
     """An input update refused before any rank released resident state:
     the fit continues with the inputs it had."""
@@ -504,14 +511,15 @@ class DiscardCheckpointCommand(SessionCommand):
 
 @dataclasses.dataclass
 class PrepareInputsCommand(SessionCommand):
-    """Phase 1 of an input update: read the inputs of a hub position and
+    """Phase 1 of an input update: read the inputs of a store position
+    (``position``: the pins' provenance, object_store_inputs.InputPins) and
     derive everything they shape on the host (FitContext.load_replacement_inputs
     and prepare_input_replacement), touching no resident state. A refusal
     here, or on any sibling rank, leaves the fit exactly as it was."""
 
     kind: ClassVar[str] = "prepare_inputs"
 
-    position: int = 0
+    position: dict = None
 
 
 @dataclasses.dataclass
@@ -523,7 +531,7 @@ class InstallInputsCommand(SessionCommand):
 
     kind: ClassVar[str] = "install_inputs"
 
-    position: int = 0
+    position: dict = None
 
 
 @dataclasses.dataclass
@@ -1342,7 +1350,7 @@ class InteractiveFitSession:
         del pending
 
     def _run_inputs_prepare(self, command):
-        """Read and prepare the inputs of a hub position; touch nothing
+        """Read and prepare the inputs of a store position; touch nothing
         resident. The session leaves Idle for the whole update, so no run is
         admitted against the inputs being replaced."""
         from fit_spiral import InputReplacementRefused
@@ -1352,12 +1360,12 @@ class InteractiveFitSession:
             self._release_pending_inputs()
             with self._condition:
                 self._transition_locked(
-                    SessionState.Loading, f"Preparing inputs at hub position {command.position}",
+                    SessionState.Loading, f"Preparing inputs at {_describe_position(command.position)}",
                     reason=f"input update {command.command_id}")
             self._publish_status()
             self._progress_reporter().begin(
                 "loading", "Reading object-store inputs",
-                detail=f"hub position {command.position}")
+                detail=_describe_position(command.position))
             inputs = self._context.load_replacement_inputs(command.position)
             candidate = self._context.prepare_input_replacement(inputs)
         except Exception as exc:
@@ -1384,17 +1392,17 @@ class InteractiveFitSession:
         if pending is None or pending[0] != command.position:
             self._release_pending_inputs()
             self._leave_checkpoint_load()
-            command.fail(f"No prepared inputs are pending for hub position {command.position}")
+            command.fail(f"No prepared inputs are pending for {_describe_position(command.position)}")
             return
         self._pending_inputs = None
         _, candidate = pending
         try:
             self._progress_reporter().begin(
                 "loading", "Installing object-store inputs",
-                detail=f"hub position {command.position}")
+                detail=_describe_position(command.position))
             warnings = self._context.replace_inputs(candidate)
         except BaseException as exc:
-            error = (f"Installing the inputs of hub position {command.position} failed after "
+            error = (f"Installing the inputs of {_describe_position(command.position)} failed after "
                      f"their predecessors were released; the fit must be rebuilt or loaded "
                      f"from a checkpoint: {type(exc).__name__}: {exc}")
             command.fail(error)
@@ -1415,9 +1423,9 @@ class InteractiveFitSession:
         with self._condition:
             self._adopt_inputs_locked(self._context)
             self._input_generation += 1
-            position = (self._input_position or {}).get("sequence")
             if self._applied_config is not None:
-                self._applied_config["object_store_input_position"] = position
+                self._applied_config["object_store_input_position"] = (
+                    dict(self._input_position) if self._input_position else None)
             self._config_revision += 1
             self._latest_metrics = {}
             revision = self._config_revision
@@ -2149,7 +2157,7 @@ class InteractiveFitSession:
                 session_generation=self.session_generation, epoch=epoch,
                 expected_iteration=self._completed,
                 expected_config_revision=self._config_revision,
-                position=int(position))
+                position=dict(position))
         return self._queue_command(command, timeout)
 
     def install_inputs(self, position, timeout=1800.0, barrier=None):
@@ -2161,7 +2169,7 @@ class InteractiveFitSession:
             epoch = self._enter_epoch_locked("install_inputs", barrier)
             command = InstallInputsCommand(
                 session_generation=self.session_generation, epoch=epoch,
-                expected_iteration=self._completed, position=int(position))
+                expected_iteration=self._completed, position=dict(position))
         return self._queue_command(command, timeout)
 
     def publish_inputs(self, timeout=60.0, barrier=None):
@@ -2182,8 +2190,9 @@ class InteractiveFitSession:
         return self._queue_command(command, timeout)
 
     def update_inputs(self, position, timeout=1800.0):
-        """Replace the fit's inputs with those of hub ``position`` at an
-        iteration boundary, keeping the model and optimiser state.
+        """Replace the fit's inputs with those of store ``position`` (the
+        pins' provenance, object_store_inputs.InputPins) at an iteration
+        boundary, keeping the model and optimiser state.
 
         A single-rank session is its own coordinator: prepare (a refusal
         raises InputUpdateRefused and leaves the fit as it was), install (a

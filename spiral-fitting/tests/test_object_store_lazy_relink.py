@@ -1,7 +1,8 @@
 """Lazy link refresh: the store's link marker lets a refresh skip the
 detectors when the links are current, and an input update link only the
-objects added since. Reads at a plain store's head use its current state,
-not its history."""
+objects added since. Reads at pins never touch the history; a position
+alone reads the current state when it is the store's head, else the
+history."""
 import dataclasses
 
 import pytest
@@ -12,8 +13,7 @@ from vc_object_store import ObjectStore  # noqa: E402
 
 import object_store_inputs as osi  # noqa: E402
 from object_store_fixture import (  # noqa: E402
-    fit_config as _fit_config, hub_edit, names, on_plane, plane, put_patch, put_pcl,
-    shared_edit)
+    fit_config as _fit_config, names, on_plane, plane, put_patch, put_pcl, shared_edit)
 
 pytestmark = pytest.mark.usefixtures('cpu')
 
@@ -24,14 +24,14 @@ def fit_config(path, **overrides):
 
 @pytest.fixture()
 def detectors(monkeypatch):
-    """Each refresh_links call's ``new`` (None for a full run)."""
+    """Each link plan's ``new`` (None for a full run)."""
     calls = []
-    original = osi.refresh_links
+    original = osi.link_plan
 
     def recording(*args, **kwargs):
         calls.append(kwargs.get('new'))
         return original(*args, **kwargs)
-    monkeypatch.setattr(osi, 'refresh_links', recording)
+    monkeypatch.setattr(osi, 'link_plan', recording)
     return calls
 
 
@@ -53,7 +53,7 @@ def plan(log):
 
 def marker(path):
     with ObjectStore.open(path, read_only=True) as db:
-        return db.link_marker()
+        return osi.read_link_marker(db)
 
 
 def edge_uuids(path, kind='point-surface'):
@@ -65,10 +65,10 @@ def test_unchanged_inputs_skip_the_detectors(shared, detectors):
     first, log = run(shared)
     assert plan(log) == 'full' and detectors == [None]
     recorded = marker(shared)
-    assert recorded['exact'] and recorded['position'] == first.position.sequence
+    assert recorded['exact'] and recorded['commit_sequence'] == first.position.commit_sequence
     again, log = run(shared)
     assert plan(log) == 'skip' and len(detectors) == 1
-    assert again.position == first.position and again.head == first.position.sequence
+    assert again.position == first.position and again.head == first.position.commit_sequence
     assert marker(shared) == recorded  # a skip records nothing
 
 
@@ -79,7 +79,7 @@ def test_a_write_outside_the_selection_still_skips(shared, detectors):
     shared_edit(shared, lambda db: db.set_meta(uuids['far'], 'review_note', 'unselected'))
     prepared, log = run(shared, config)
     assert plan(log) == 'skip' and len(detectors) == 1
-    assert prepared.position.sequence == prepared.head
+    assert prepared.position.commit_sequence == prepared.head
 
 
 def _names_in(db):
@@ -105,7 +105,7 @@ def _retire_far(db):
     far = _names_in(db)['far']
     for edge in db.edges_of(far):
         db.remove_edge(edge['uuid'])
-    with db.write({far: db.current_object_revision(far)['uuid']}) as write:
+    with db.write(expected_versions={far: db.current_version(far)}) as write:
         write.retire_object(far)
 
 
@@ -178,33 +178,6 @@ def test_an_update_after_an_edit_of_an_existing_object_runs_in_full(shared, dete
     assert plan(log) == 'full' and detectors[-1] is None
 
 
-def test_a_hub_replica_skips_and_records_a_marker_only_once_published(replicas, detectors,
-                                                                     monkeypatch):
-    def unreachable(store, head):
-        raise RuntimeError('hub unreachable')
-    with monkeypatch.context() as patched:
-        patched.setattr(osi, '_conditional_push', unreachable)
-        with pytest.raises(osi.PositionError):
-            run(replicas['service'])
-    assert marker(replicas['service']) is None
-    first, log = run(replicas['service'])
-    assert plan(log) == 'full'
-    assert marker(replicas['service'])['position'] == first.position.sequence
-    again, log = run(replicas['service'])
-    assert plan(log) == 'skip' and len(detectors) == 2
-    assert again.position == first.position
-    # An editor's new PCL is linked incrementally and published.
-    hub_edit(replicas['editor'], lambda db: put_pcl(db, on_plane(100.0, (20.0, 60.0)), name='extra'))
-    updated, log = run(replicas['service'], incremental=True)
-    assert plan(log) == 'incremental'
-    assert detectors[-1] == {'point_collection': [names(replicas['editor'])['extra']]}
-    assert updated.position.sequence > again.position.sequence
-    recorded = marker(replicas['service'])
-    assert recorded['position'] == updated.position.sequence and not recorded['exact']
-    # A replica's marker is its own; the editor's replica has none.
-    assert marker(replicas['editor']) is None
-
-
 def test_patch_overlaps_off_skip_their_detector_and_turning_them_on_relinks(shared, detectors):
     prepared, log = run(shared, fit_config(shared, input_use_patch_overlaps=False))
     assert 'link refresh patch_overlap: skipped (input_use_patch_overlaps is off)' in prepared.lines
@@ -224,35 +197,37 @@ def test_the_store_reads_are_progress_stages(shared):
             stages.append(snapshot['stage_name'])
     progress = ProgressReporter(publish)
     prepared, _ = run(shared, progress=progress)
-    position = prepared.position.sequence
+    position = prepared.position.commit_sequence
     assert stages[0] == 'Reading the selected inputs'
-    assert stages[-1] == f'Reading the inputs at position {position}'
+    assert stages[-1] == f'Reading the inputs at commit {position}'
     assert 'link refresh pcl_patch' in stages
     assert progress.snapshot() is None  # every stage cleared
 
 
 # ---------------------------------------------------------------------------
-# Reads at the head: a service pins the head it just linked and reads its
-# inputs there; rebuilding that state from history scans every revision.
+# Reads at pins use the numbered history of the pinned versions alone; a
+# position without versions reads the current state when it is the head,
+# else the versions live at the position's commit.
 # ---------------------------------------------------------------------------
 
 class Recording:
-    """A store whose history reads are counted; ``after_current`` runs after
-    each current-state view (to write while a read is in flight)."""
+    """A store whose reads of the state at a past commit (versions_at) are
+    counted; ``after_listing`` runs after each current-state listing (to
+    write while a read is in flight)."""
 
-    def __init__(self, store, after_current=None):
-        self._store, self._after_current = store, after_current
+    def __init__(self, store, after_listing=None):
+        self._store, self._after_listing = store, after_listing
         self.history_reads = 0
 
-    def hub_read_view_at(self, *args, **kwargs):
+    def versions_at(self, *args, **kwargs):
         self.history_reads += 1
-        return self._store.hub_read_view_at(*args, **kwargs)
+        return self._store.versions_at(*args, **kwargs)
 
-    def revision_read_view(self, *args, **kwargs):
-        view = self._store.revision_read_view(*args, **kwargs)
-        if self._after_current is not None:
-            self._after_current()
-        return view
+    def select_objects(self, *args, **kwargs):
+        rows = self._store.select_objects(*args, **kwargs)
+        if self._after_listing is not None:
+            self._after_listing()
+        return rows
 
     def __getattr__(self, name):
         return getattr(self._store, name)
@@ -261,34 +236,36 @@ class Recording:
 def _pinned(path):
     prepared, _ = run(path)
     return prepared, dataclasses.replace(osi.request_from_config(fit_config(path)),
-                                         position=prepared.position)
+                                         pins=prepared.pins)
 
 
-def test_a_read_at_the_head_matches_the_history_read(shared, monkeypatch):
+def test_a_read_at_the_pins_matches_the_history_read(shared):
     def comparable(snapshot):
         return (snapshot.volume_uuid, snapshot.objects, snapshot.relationships,
                 snapshot.exclusions, snapshot.outer_shell, snapshot.notes)
     prepared, request = _pinned(shared)
+    near = names(shared)['near']
+    shared_edit(shared, lambda db: db.set_meta(near, 'review_note', 'later'))
     with ObjectStore.open(shared, read_only=True) as db:
-        assert db.store_positions()['position'] == prepared.position.sequence
         store = Recording(db)
-        uuids = osi.resolve_selection(store, request)
-        current = osi.read_snapshot(store, request, uuids)
-        assert store.history_reads == 0 and uuids == prepared.uuids
-        with monkeypatch.context() as patched:
-            patched.setattr(osi, '_at_head', lambda store, position: False)
-            assert osi.resolve_selection(store, request) == uuids
-            historical = osi.read_snapshot(store, request, uuids)
+        pinned = osi.read_snapshot(store, request)
+        assert store.history_reads == 0
+        assert osi.resolve_selection(store, request).uuids == prepared.selected.uuids
+        by_position = osi.read_snapshot(
+            store, dataclasses.replace(request, pins=osi.InputPins(prepared.position)))
         assert store.history_reads > 0
-    assert current.relationships  # the links the refresh wrote are read
-    assert comparable(current) == comparable(historical)
+    assert pinned.relationships  # the links the refresh wrote are read
+    assert comparable(pinned) == comparable(by_position)
+    assert 'review_note' not in pinned.objects[near].meta
 
 
 @pytest.mark.parametrize('during_read', [False, True])
 def test_a_position_overtaken_by_a_write_is_read_from_history(shared, during_read):
-    # Written before the read, or while it reads the current state (which
+    # Written before the read, or while it lists the current state (which
     # then falls back to history).
-    prepared, request = _pinned(shared)
+    prepared, _ = _pinned(shared)
+    request = dataclasses.replace(osi.request_from_config(fit_config(shared)),
+                                  pins=osi.InputPins(prepared.position))
     near = names(shared)['near']
     writes = []
 
@@ -298,9 +275,8 @@ def test_a_position_overtaken_by_a_write_is_read_from_history(shared, during_rea
     if not during_read:
         write()
     with ObjectStore.open(shared, read_only=True) as db:
-        store = Recording(db, after_current=write if during_read else None)
-        snapshot = osi.read_snapshot(store, request, prepared.uuids)
+        store = Recording(db, after_listing=write if during_read else None)
+        snapshot = osi.read_snapshot(store, request)
         assert writes and store.history_reads > 0
-        if during_read:
-            assert store.history_reads == 1
     assert 'review_note' not in snapshot.objects[near].meta
+    assert snapshot.request.pins.objects == prepared.pins.objects

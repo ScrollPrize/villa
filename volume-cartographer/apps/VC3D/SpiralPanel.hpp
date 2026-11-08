@@ -83,9 +83,6 @@ signals:
     void pointViewToleranceChanged(double tolerance);
     void pythonOutputRequested();
     void removeLocalPatchRequested(const QString& id);
-    // Clone the service's hub to a local replica (prefilled with its address
-    // as this machine reaches it) and attach that.
-    void cloneHubRequested(const QString& hubAddress);
     void addDraftsRequested(bool commitAfterAdd);
     // Show a committed fit; an empty UUID asks which.
     void openStoredFitRequested(const QString& uuid);
@@ -180,7 +177,6 @@ private:
     QComboBox* _checkpointChoice = nullptr;
     QLineEdit* _runTag = nullptr;
     QLabel* _objectStoreSummary = nullptr;
-    QPushButton* _cloneHub = nullptr;
     QCheckBox* _savePngVisualizations = nullptr;
     QCheckBox* _trackLengthBinSampling = nullptr;
     QCheckBox* _verticalFiberOffsetEnabled = nullptr;
@@ -210,7 +206,6 @@ private:
     QPushButton* _openStoredFit = nullptr;
     QLabel* _commitStatus = nullptr;
     QPushButton* _openCommitted = nullptr;
-    QPushButton* _retryPush = nullptr;
     QString _committedFit;        // the latest commit's surface
     QString _committedArtifact;   // and the preview it committed
     QString _displayedStoredFit;

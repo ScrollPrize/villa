@@ -1160,8 +1160,8 @@ class BindingOwnershipTests(unittest.TestCase):
         # The project's umbilicus, written where the fit reads it, and the
         # scroll: the project's name and facts.
         self.assertEqual(attached["project"]["volume"], VOLUME)
-        self.assertEqual(attached["project"]["umbilicus"]["revision"],
-                         UMBILICUS["revision"])
+        self.assertEqual(attached["project"]["umbilicus"]["version"],
+                         UMBILICUS["version"])
         umbilicus = json.loads(Path(attached["paths"]["umbilicus"]).read_text())
         self.assertEqual([[p["z"], p["y"], p["x"]] for p in umbilicus["control_points"]],
                          UMBILICUS["points_zyx"])

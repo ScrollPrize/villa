@@ -3,8 +3,8 @@
 QString SpiralServiceManager::inputChangesMessage()
 {
     return tr("Fit inputs come from the object store, and a resident fit keeps the inputs it "
-              "read. Save edits to the store, then use Update Fit Inputs (or, for a service "
-              "without a hub, Rebuild Fit with current inputs) to fit them.");
+              "read. Save edits to the store, then use Update Fit Inputs (or Rebuild Fit with "
+              "current inputs) to fit them.");
 }
 
 void SpiralServiceManager::claimSessionLease()

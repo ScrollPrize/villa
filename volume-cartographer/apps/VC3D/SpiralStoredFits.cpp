@@ -3,6 +3,7 @@
 #include "vc/core/util/QuadSurface.hpp"
 
 #include <vc_object_store/objects/GeometryCoordinates.hpp>
+#include <vc_object_store/objects/StoreReader.hpp>
 
 #include <QJsonArray>
 #include <QJsonDocument>
@@ -42,9 +43,9 @@ std::set<std::string> spiralFitsAmong(vc::objects::ObjectStoreSession& session,
 {
     std::set<std::string> fits;
     if (uuids.empty()) return fits;
-    session.read(attachment, [&](const auto& db, const auto& txn, const auto&) {
+    session.readStore(attachment, [&](const vc::objects::StoreReader& reader, const auto&) {
         for (const auto& uuid : uuids)
-            if (const auto record = db.objectByUuid(txn, uuid); record && isSpiralFit(*record))
+            if (const auto current = reader.currentObject(uuid); current && !current->deleted && isSpiralFit(current->record))
                 fits.insert(uuid);
     });
     return fits;
@@ -54,8 +55,11 @@ std::vector<StoredFitEntry> listStoredFits(vc::objects::ObjectStoreSession& sess
                                            const vc::objects::AttachmentIdentity& attachment)
 {
     std::vector<StoredFitEntry> result;
-    session.read(attachment, [&](const auto& db, const auto& txn, const auto&) {
-        for (const auto& record : db.objectsByTag(txn, kSpiralFitTag)) {
+    session.readStore(attachment, [&](const vc::objects::StoreReader& reader, const auto&) {
+        vc::objects::ObjectSelection tagged;
+        tagged.kind = "surface";
+        tagged.tag = kSpiralFitTag;
+        for (const auto& record : reader.selectObjects(tagged)) {
             if (!committedFit(record)) continue;
             const Json meta = Json::parse(record.meta, nullptr, false);
             StoredFitEntry entry{record.uuid, record.name, record.createdAt, record.createdBy, std::nullopt};
@@ -77,40 +81,37 @@ StoredFit readStoredFit(const std::shared_ptr<vc::objects::ObjectStoreSession>& 
 {
     auto present = [&]() {
         bool found = false;
-        session->read(attachment, [&](const auto& db, const auto& txn, const auto&) {
-            found = db.objectByUuid(txn, uuid).has_value();
+        session->readStore(attachment, [&](const vc::objects::StoreReader& reader, const auto&) {
+            const auto current = reader.currentObject(uuid);
+            found = current && !current->deleted;
         });
         return found;
     };
-    if (!present() && session->hubStatus(attachment)) {
-        const auto status = session->syncHubAndWait(attachment, syncTimeout);
-        if (status && !status->error.empty())
-            throw std::runtime_error("The committed fit is not in this replica, and syncing it failed: "
-                                     + status->error);
-    }
+    (void)syncTimeout;
     if (!present()) throw std::runtime_error("The committed fit " + uuid + " is not in the attached object store");
     session->ensureGeometry(attachment, uuid);
 
     StoredFit fit;
     Json meta;
-    session->read(attachment, [&](const auto& db, const auto& txn, const auto&) {
-        const auto record = db.objectByUuid(txn, uuid);
-        if (!record || !committedFit(*record))
+    session->readStore(attachment, [&](const vc::objects::StoreReader& reader, const auto&) {
+        const auto current = reader.currentObject(uuid);
+        if (!current || current->deleted || !committedFit(current->record))
             throw std::runtime_error(uuid + " is not a committed Spiral fit (a surface tagged spiral-fit)");
-        meta = Json::parse(record->meta);
-        fit.uuid = record->uuid;
-        fit.name = record->name;
+        const auto& record = current->record;
+        meta = Json::parse(record.meta);
+        fit.uuid = record.uuid;
+        fit.name = record.name;
         const Json coordinates = vc::objects::geometryCoordinates(meta.value("coordinates", Json::object()));
         if (coordinates["volume_uuid"].is_string()) fit.volume = coordinates["volume_uuid"].get<std::string>();
         // Committed in its fit volume's own voxels: read as stored.
         if (fit.volume.empty() || vc::objects::geometryScaleToVolume(meta, fit.volume) != 1.0)
             throw std::runtime_error("The committed fit is not bound to its fit volume at scale 1");
-        const auto revision = geometryRevision ? db.geometryRevision(txn, *geometryRevision)
-                                               : db.currentGeometry(txn, uuid);
+        const auto revision = geometryRevision ? reader.geometryRevision(*geometryRevision)
+                                               : reader.currentGeometry(uuid);
         if (!revision || revision->objectUuid != fit.uuid)
             throw std::runtime_error("The committed fit has no such geometry revision");
         fit.geometryRevision = revision->uuid;
-        fit.surface = std::shared_ptr<QuadSurface>(load_quad_from_store(db, txn, uuid, revision->uuid));
+        fit.surface = std::shared_ptr<QuadSurface>(load_quad_from_store(reader, uuid, revision->uuid));
     });
     fit.surface->setChannelLoader(store_channel_loader(session, attachment, fit.geometryRevision));
 

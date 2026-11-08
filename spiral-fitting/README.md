@@ -80,6 +80,24 @@ rebuild because the exclusion masks depend on the trusted geometry. Saved
 checkpoints remain subject to input-manifest validation; a pre-migration
 track fit is not automatically equivalent to a new store-backed fit.
 
+## CPU surface-track extraction
+
+`extract_surface_tracks.py --backend cpu` labels 6-connected components with
+`vc_reader.geometry.label_components`, then max-pools and filters labels before
+Kimimaro skeletonization. The local `vc-reader` dependency requires its native
+build prerequisites (see [vc_reader](../vc_reader/README.md)).
+
+Use `--slab-workers N --kimimaro-parallel 1` to process multiple slabs concurrently
+on Linux with local predictions. Each worker holds a slab in RAM; the default is
+one worker and eight Kimimaro processes per slab.
+
+```sh
+python extract_surface_tracks.py --backend cpu --predictions /data/predictions.zarr \
+  --out /data/tracks.dbm --z-min 9048 --z-max 9548 \
+  --slab-workers 4 --kimimaro-parallel 1
+python -m pytest -q tests/test_cc_labels.py tests/test_extract_surface_tracks.py
+```
+
 ## CUDA startup check
 
 VC3D fit sessions and command-line fits allocate one CUDA element and synchronize
@@ -120,6 +138,20 @@ from `devices.float_hi()`, which is float32 on MPS;
 comparing a CPU run with an MPS one. `get_ink_metrics.py --device` picks the
 nnU-Net device; without it the folds take CUDA, else MPS, else the CPU, whatever
 the fitting variables say.
+
+## Opt-in flow-field switches
+
+Both are off by default and do not change the math.
+`FIT_SPIRAL_SEP_UPSAMPLE=1` upsamples the LR flow field with three separable
+1D passes instead of `F.interpolate` (the values can differ by float rounding).
+`FIT_SPIRAL_GRAPH_RK4=1` replays the eager RK4 slab integration as CUDA/HIP
+graphs when the fields are on a GPU and the Triton kernel is not used
+(`graph_rk4.py`); it helps on devices where kernel launch overhead dominates.
+Frozen fields use eager integration for point gradients, so repeated calls do
+not cache fresh full-resolution fields. Triton and sampler-only calls do not
+allocate the graph path's persistent LR buffer.
+`FIT_SPIRAL_GRAPH_RK4_MAX` caps the graphs kept for the forward and the backward
+pass each (default 256, oldest evicted first).
 
 ## Input manifest
 
