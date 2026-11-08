@@ -17,6 +17,7 @@ from tracks import (
     _load_native_track_crossings,
     _pack_track_points,
     _packed_store_if_current,
+    _restrict_crossing_partner_csr,
     load_track_crossing_cache,
     _tracks_db_signature,
     track_crossing_cache_path,
@@ -59,6 +60,23 @@ class TrackCrossingCacheTests(unittest.TestCase):
             self.assertEqual(len(cache['partners']), 2)
             np.testing.assert_array_equal(
                 cache['offsets'][1:] - cache['offsets'][:-1], [1, 0, 1])
+
+    def test_track_graph_remaps_like_its_csr_arrays(self):
+        # Without the native crossing module a fit remaps its TrackGraph in
+        # Python, so the graph must remap exactly like the arrays it holds.
+        from track_graph import TrackGraph
+        with tempfile.TemporaryDirectory() as temporary:
+            path = self.make_db(temporary)
+            build_cache(path, show_progress=False)
+            cache = load_track_crossing_cache(path)
+            graph = TrackGraph(cache)
+            for rows in ([0, 1, 2], [0, 2]):
+                source_ids = np.asarray(cache['source_ids'])[rows]
+                expected = _restrict_crossing_partner_csr(cache, source_ids)
+                remapped = _restrict_crossing_partner_csr(graph, source_ids)
+                self.assertEqual(remapped.keys(), expected.keys())
+                for name in expected:
+                    np.testing.assert_array_equal(remapped[name], expected[name])
 
     def test_builder_limits_cache_to_half_open_z_range(self):
         with tempfile.TemporaryDirectory() as temporary:

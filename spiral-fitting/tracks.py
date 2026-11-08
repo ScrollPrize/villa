@@ -1651,6 +1651,12 @@ def load_track_crossing_cache(path, warn=True, expected_z_range=None):
 
 def _restrict_crossing_partner_csr(csr, source_ids):
     """Remap a whole-DB crossing graph onto the fit's surviving track rows."""
+    if not hasattr(csr, 'keys'):
+        # A TrackGraph serves the CSR arrays through csr[name] but cannot be
+        # iterated, so set(csr) in the validator would raise KeyError(0).
+        csr = {name: csr[name] for name in (
+            'source_ids', 'offsets', 'partners', 'self_local',
+            'partner_local', 'positions', 'clearances')}
     _validate_crossing_partner_csr(csr, require_sorted_source_ids=True)
     source_ids = np.asarray(source_ids, dtype=np.uint64)
     cached_source_ids = np.asarray(csr['source_ids'], dtype=np.uint64)
