@@ -134,6 +134,7 @@ InkLabelPanel::InkLabelPanel(InkLabelController* labels, QWidget* parent)
     _bannerLabel = new QLabel(this);
     _bannerLabel->setObjectName(QStringLiteral("inkLabelBanner"));
     _bannerLabel->setWordWrap(true);
+    _bannerLabel->setTextFormat(Qt::PlainText);
     // Palette colors, so the banner reads in light and dark themes.
     _bannerLabel->setFrameShape(QFrame::StyledPanel);
     _bannerLabel->setMargin(4);
@@ -464,6 +465,7 @@ InkLabelPanel::InkLabelPanel(InkLabelController* labels, QWidget* parent)
 
     connect(_labels, &InkLabelController::sessionChanged, this, &InkLabelPanel::refreshSession);
     connect(_labels, &InkLabelController::labelModeChanged, this, &InkLabelPanel::refreshSession);
+    connect(_labels, &InkLabelController::labelModeRefusalChanged, this, &InkLabelPanel::refreshSession);
     connect(_labels, &InkLabelController::dirtyChanged, this, &InkLabelPanel::refreshSession);
     connect(_labels, &InkLabelController::saveFinished, this, &InkLabelPanel::refreshSession);
     connect(_labels, &InkLabelController::toolStateChanged, this, &InkLabelPanel::refreshTools);
@@ -484,6 +486,7 @@ void InkLabelPanel::refreshSession()
     if (!_labels)
         return;
     const InkLabelController::SessionInfo* session = _labels->session();
+    const QString refusal = _labels->labelModeRefusal();
     {
         const QSignalBlocker blocker(_modeButton);
         _modeButton->setChecked(_labels->labelModeEnabled());
@@ -492,7 +495,8 @@ void InkLabelPanel::refreshSession()
         _folderLabel->setText(tr("No labels open. Select a segment and press I."));
         _folderLabel->setToolTip(QString());
         _statusLabel->clear();
-        _bannerLabel->hide();
+        _bannerLabel->setText(refusal);
+        _bannerLabel->setVisible(!refusal.isEmpty());
     } else {
         const QString dir = QString::fromStdString(session->paths.dir.string());
         _folderLabel->setText(dir);
@@ -517,8 +521,9 @@ void InkLabelPanel::refreshSession()
             parts << tr("saving...");
         _statusLabel->setText(parts.join(QStringLiteral(", ")));
 
-        _bannerLabel->setVisible(!session->lockReason.isEmpty());
-        _bannerLabel->setText(session->lockReason);
+        const QString reason = refusal.isEmpty() ? session->lockReason : refusal;
+        _bannerLabel->setVisible(!reason.isEmpty());
+        _bannerLabel->setText(reason);
     }
 
     const bool editable = session && !session->locked && !session->readOnly;

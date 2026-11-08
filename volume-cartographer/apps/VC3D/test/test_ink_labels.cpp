@@ -1,6 +1,9 @@
 // Ink labels: raster, history, files, controller, overlay and keys.
 
 #include "Keybinds.hpp"
+#include "CState.hpp"
+#include "SurfaceCatalog.hpp"
+#include "../../../core/test/support/TestProject.hpp"
 #include "SpiralBrushCursorWidget.hpp"
 #include "ink_labels/InkLabelAssist.hpp"
 #include "ink_labels/InkLabelImport.hpp"
@@ -176,9 +179,10 @@ struct Labeler {
     int approvalStops = 0;
     std::unique_ptr<InkLabelController> labels;
 
-    Labeler()
+    explicit Labeler(CState* state = nullptr)
     {
         InkLabelController::Deps deps;
+        deps.state = state;
         deps.shortcutHost = &host;
         deps.status = [this](const QString& text, int) { messages << text; };
         deps.otherSurfaceToolActive = [this] { return otherTool || editing; };
@@ -254,6 +258,8 @@ private slots:
     void displayTilesPoolExactly();
     void displayTilesMeetOnDevicePixels();
     void panelDrivesController();
+    void panelRetainsFailedActivationRefusal();
+    void panelRetainsToolRefusal();
     void predictionGuideMapsWithFlips();
     void floodConnectivityAndBounds();
     void floodFollowsEqualLabels();
@@ -1702,6 +1708,106 @@ void TestInkLabels::panelDrivesController()
     byText(QStringLiteral("Undo"))->click();
     QCOMPARE(int(l.labels->history()->undoDepth()), 0);
     QVERIFY(panel.findChild<QLabel*>(QStringLiteral("inkLabelStatus"))->text().contains(QStringLiteral("no unsaved changes")));
+}
+
+// A real catalog frame failure leaves the same null state consumed by the
+// label controller after CWindow rejects activation. No CT or remote catalog.
+void TestInkLabels::panelRetainsFailedActivationRefusal()
+{
+    QTemporaryDir dir;
+    QVERIFY(dir.isValid());
+    const auto project = vc::test::createTestProject(toPath(dir) / "fixture.vcobj");
+    CState state;
+    state.setVpkg(project.open());
+    const auto attachment = *state.storeFor("surface");
+    const auto session = state.objectStoreSession();
+    const std::string uuid = vc::objects::util::newUuid();
+    cv::Mat_<cv::Vec3f> points(3, 3);
+    for (int row = 0; row < 3; ++row)
+        for (int col = 0; col < 3; ++col)
+            points(row, col) = {float(col), float(row), 2.f};
+    QuadSurface grid(points, {1.f, 1.f});
+    auto request = session->newRequest(attachment);
+    request.expectedObjects = {{uuid, std::nullopt}};
+    request.operations = vc::objects::createSurfaceOperations(
+        uuid, "fixture", {}, vc::objects::volumeCoordinates("bound-volume", 1),
+        {"label-refusal-test"}, grid.meta, quad_surface_geometry(grid));
+    session->submit(attachment, request);
+
+    QString loadFailure;
+    try {
+        (void)SurfaceCatalog::open(session, attachment, {"different-volume", 1}, uuid);
+    } catch (const std::exception& error) {
+        loadFailure = QString::fromUtf8(error.what());
+        state.clearActiveSurface();
+        state.setSurface("segmentation", nullptr);
+    }
+    QVERIFY(loadFailure.contains(QStringLiteral("no unambiguous transform")));
+    QVERIFY(state.activeSurface().expired());
+
+    Labeler l(&state);
+    InkLabelPanel panel(l.labels.get());
+    auto* button = panel.findChild<QPushButton*>(QStringLiteral("inkLabelModeButton"));
+    auto* banner = panel.findChild<QLabel*>(QStringLiteral("inkLabelBanner"));
+    QVERIFY(button && banner);
+    button->click();
+    const QString expected = QStringLiteral("Select a segment to label ink.");
+    QCOMPARE(l.messages.last(), expected);
+    QCOMPARE(l.labels->labelModeRefusal(), expected);
+    QVERIFY(!l.labels->labelModeEnabled());
+    QVERIFY(!button->isChecked());
+    QVERIFY(!l.labels->session());
+    QCOMPARE(banner->text(), expected);
+    QVERIFY(!banner->isHidden());
+    QVERIFY(!fs::exists(toPath(dir) / "ink_labels"));
+
+    // Recreating the panel must not lose a refusal when there is no session.
+    InkLabelPanel reopened(l.labels.get());
+    auto* reopenedBanner = reopened.findChild<QLabel*>(QStringLiteral("inkLabelBanner"));
+    QCOMPARE(reopenedBanner->text(), expected);
+    QVERIFY(!reopenedBanner->isHidden());
+
+    const auto opened = SurfaceCatalog::open(session, attachment, {"bound-volume", 1}, uuid);
+    state.setActiveSurface(uuid, opened.surface);
+    state.setSurface("segmentation", opened.surface);
+    button->click();
+    QVERIFY(l.labels->labelModeEnabled());
+    QVERIFY(button->isChecked());
+    QVERIFY(l.labels->session());
+    QVERIFY(l.labels->labelModeRefusal().isEmpty());
+    QVERIFY(banner->isHidden());
+    QVERIFY(reopenedBanner->isHidden());
+    QCOMPARE(QString::fromStdString(l.labels->session()->paths.dir.string()),
+             QString::fromStdString((fs::canonical(toPath(dir)) / "ink_labels" / uuid).string()));
+    // Opening labels alone still creates no files or changes to geometry.
+    QVERIFY(!fs::exists(toPath(dir) / "ink_labels"));
+    QCOMPARE(opened.surface->rawPointsPtr()->size(), cv::Size(3, 3));
+}
+
+void TestInkLabels::panelRetainsToolRefusal()
+{
+    QTemporaryDir dir;
+    Labeler l;
+    QVERIFY(l.labels->openForTesting(testCanvas({200, 160}), toPath(dir), "seg").ok);
+    InkLabelPanel panel(l.labels.get());
+    auto* banner = panel.findChild<QLabel*>(QStringLiteral("inkLabelBanner"));
+    auto* button = panel.findChild<QPushButton*>(QStringLiteral("inkLabelModeButton"));
+    QVERIFY(banner && button);
+    l.editing = true;
+    l.labels->labelModeAction()->trigger();
+    const QString expected = QStringLiteral("Turn off segmentation editing to label ink; editing changes the grid labels are attached to.");
+    QCOMPARE(banner->text(), expected);
+    QCOMPARE(l.labels->labelModeRefusal(), expected);
+    QVERIFY(!banner->isHidden());
+    QVERIFY(!button->isChecked());
+    QVERIFY(!l.labels->labelModeEnabled());
+    QCOMPARE(l.approvalStops, 0);
+    // A successful retry clears the exact refusal in an already-open session.
+    l.editing = false;
+    button->click();
+    QVERIFY(l.labels->labelModeEnabled());
+    QVERIFY(l.labels->labelModeRefusal().isEmpty());
+    QVERIFY(banner->isHidden());
 }
 
 // ---------------------------------------------------------------------------

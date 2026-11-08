@@ -4980,6 +4980,9 @@ void CWindow::onSurfaceActivated(const QString& surfaceId, const std::shared_ptr
         _surfacePanel->applyFilters();
     }
 
+    qInfo().noquote() << "Surface activation" << surfaceId
+                     << (_state->activeSurface().expired() ? "null" : "success")
+                     << "volume" << QString::fromStdString(_state->currentVolumeId());
 }
 
 void CWindow::onSurfaceActivatedPreserveEditing(const QString& surfaceId, const std::shared_ptr<QuadSurface>& surface)
@@ -5058,6 +5061,9 @@ void CWindow::onSurfaceActivatedPreserveEditing(const QString& surfaceId, const 
         _surfacePanel->applyFilters();
     }
 
+    qInfo().noquote() << "Surface activation" << surfaceId
+                     << (_state->activeSurface().expired() ? "null" : "success")
+                     << "volume" << QString::fromStdString(_state->currentVolumeId());
 }
 
 void CWindow::onSurfaceWillBeDeleted(std::string name, std::shared_ptr<Surface> surf)

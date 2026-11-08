@@ -345,33 +345,46 @@ void InkLabelController::statusMessage(const QString& text, int ms) const
 // Label mode and tool state
 // ---------------------------------------------------------------------------
 
+void InkLabelController::setLabelModeRefusal(const QString& reason)
+{
+    if (_labelModeRefusal == reason)
+        return;
+    _labelModeRefusal = reason;
+    emit labelModeRefusalChanged();
+}
+
 void InkLabelController::setLabelModeEnabled(bool enabled)
 {
     if (enabled == _labelMode)
         return;
     if (enabled) {
+        const auto refuse = [this](const QString& reason, int ms) {
+            setLabelModeRefusal(reason);
+            qWarning().noquote() << "Ink label mode refused:" << reason;
+            statusMessage(reason, ms);
+        };
         // Refuse before touching any other tool: pressing I while editing
         // changes nothing.
         if (_deps.segmentationEditing && _deps.segmentationEditing()) {
-            statusMessage(tr("Turn off segmentation editing to label ink; editing changes the grid labels are attached to."), 6000);
+            refuse(tr("Turn off segmentation editing to label ink; editing changes the grid labels are attached to."), 6000);
             return;
         }
         if (_deps.stopSurfacePainting)
             _deps.stopSurfacePainting();
         if (_deps.otherSurfaceToolActive && _deps.otherSurfaceToolActive()) {
-            statusMessage(tr("Turn off surface mask painting to label ink."), 6000);
+            refuse(tr("Turn off surface mask painting to label ink."), 6000);
             return;
         }
         if (!_session || _deps.state) {
             const OpenOutcome outcome = openForActiveSegment();
             if (!outcome.ok) {
-                if (!outcome.message.isEmpty())
-                    statusMessage(outcome.message, 8000);
+                refuse(outcome.message, 8000);
                 return;
             }
         }
         if (!_session)
             return;
+        setLabelModeRefusal({});
         _labelMode = true;
         if (!_hintShown) {
             _hintShown = true;
@@ -1017,6 +1030,7 @@ bool InkLabelController::prepareEdit(QString* why)
 void InkLabelController::installSession(std::unique_ptr<Session> session)
 {
     _session = std::move(session);
+    setLabelModeRefusal(_session->info.locked ? _session->info.lockReason : QString{});
     _session->generation = ++_sessionGeneration;
     _session->lastWriteMs = nowMs();
     _polygon.clear();

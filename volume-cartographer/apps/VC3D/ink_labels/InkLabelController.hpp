@@ -173,6 +173,8 @@ public:
     ~InkLabelController() override;
 
     [[nodiscard]] bool labelModeEnabled() const { return _labelMode; }
+    // Retained until the next successful open/enable, including when no session exists.
+    [[nodiscard]] const QString& labelModeRefusal() const { return _labelModeRefusal; }
     // Turning it on opens a session for the active segment if needed. Refused
     // (with a status message) without a project or segment, or while
     // segmentation editing is on.
@@ -350,6 +352,7 @@ signals:
     void dirtyChanged(bool dirty);
     void toolStateChanged();
     void labelModeChanged(bool enabled);
+    void labelModeRefusalChanged();
     void displayChanged();
     void saveFinished(const vc3d::ink_labels::SaveOutcome& outcome);
     void assistChanged();
@@ -499,6 +502,8 @@ private:
 
     Deps _deps;
     bool _labelMode = false;
+    QString _labelModeRefusal;
+    void setLabelModeRefusal(const QString& reason);
     vc3d::ink_labels::PaintClass _class = vc3d::ink_labels::PaintClass::Ink;
     bool _erase = false;
     Tool _tool = Tool::Brush;
