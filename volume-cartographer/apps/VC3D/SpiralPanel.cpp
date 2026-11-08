@@ -1199,8 +1199,13 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
                     for (const QString& problem : update.problems) lines << QStringLiteral("  ") + problem;
                     _warnings->setText(lines.join(QStringLiteral("\n")));
                 } else {
-                    lines << tr("Updated: the fit reads the store at commit %1 (your edits reached %2; linked at %3)")
-                                 .arg(update.fitted).arg(update.requested).arg(update.head);
+                    lines << (update.requested < 0
+                                  ? tr("Updated: the fit reads the service's store at commit %1 (linked at %2; "
+                                       "edits saved here are not in that store)")
+                                        .arg(update.fitted).arg(update.head)
+                                  : tr("Updated: the fit reads the store at commit %1 (your edits reached %2; "
+                                       "linked at %3)")
+                                        .arg(update.fitted).arg(update.requested).arg(update.head));
                     if (!update.includedBeyondRequested.isEmpty())
                         lines << tr("It includes %n later commit(s) by others:", nullptr,
                                     int(update.includedBeyondRequested.size()))
@@ -1707,10 +1712,10 @@ void SpiralPanel::updateDraftActions()
     // why when not).
     if (_addInputs) _addInputs->setEnabled(_localDraftsReady);
     if (_commitInputs)
-        _commitInputs->setEnabled(_localDraftsReady && _service->storeBinding().canUpdate()
+        _commitInputs->setEnabled(_localDraftsReady && _service->storeBinding().canPosition()
                                   && _updateInputs && _updateInputs->isEnabled());
     if (_commitHint)
-        _commitHint->setText(_service->storeBinding().canUpdate()
+        _commitHint->setText(_service->storeBinding().canPosition()
             ? tr("Saved drafts reach the fit at its next input update.")
             : tr("Saved drafts reach the fit when it is rebuilt with current inputs."));
 }
@@ -2569,10 +2574,12 @@ void SpiralPanel::updateStatus(const QJsonObject& status)
     _updateInputs->setEnabled(_load->isEnabled() && binding.canUpdate()
                               && status.value(QStringLiteral("input_preparation")).isNull());
     if (binding.localToService())
-        setToolTipNote(_updateInputs, tr("This service's store is local to its host: edits and commits need "
-                                         "it served (vc_object_server) and attached here"));
-    else if (!binding.canUpdate() && binding.advertised())
-        setToolTipNote(_updateInputs, tr("Attach the service's object store first"));
+        setToolTipNote(_updateInputs, tr("Updates the fit from the service's store on its host. This service's "
+                                         "store is local to its host: edits and commits need it served "
+                                         "(vc_object_server) and attached here"));
+    else if (binding.advertised() && !binding.canPosition())
+        setToolTipNote(_updateInputs, tr("Updates the fit from the service's store head; attach that store "
+                                         "to include the edits saved here"));
     else
         setToolTipNote(_updateInputs, {});
     updatePositionSummary();

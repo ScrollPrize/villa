@@ -274,6 +274,55 @@ private slots:
         QVERIFY(!manager.ownsSessionLease());
     }
 
+    // A service bound to a store file that this VC3D has not attached (S2):
+    // the update names no position and the service links its store's head,
+    // which holds what was saved on its host.
+    void updateFitInputsWithoutAnAttachedStore()
+    {
+        const auto python = qEnvironmentVariable("SPIRAL_TEST_PYTHON");
+        if (python.isEmpty()) QSKIP("Set SPIRAL_TEST_PYTHON to a Spiral Python environment with vc_object_store");
+        qRegisterMetaType<SpiralServiceManager::InputUpdate>();
+        QTemporaryDir directory;
+        const auto storePath = std::filesystem::path(directory.filePath(QStringLiteral("inputs.vcobj")).toStdString());
+        OpenOptions options; options.author = "service-host";
+        { auto created = ObjectStore::create(storePath, options); }
+        // A writer on the service's host, standing in for its local editors.
+        auto host = std::make_shared<ObjectStoreSession>();
+        const auto hostAttachment = host->attach(storePath, options);
+        const auto surface = addSurface(*host, hostAttachment);
+
+        ServiceProcess service;
+        QVERIFY(startService(service, python, directory, QString::fromStdString(storePath.string())));
+        SpiralServiceManager manager;
+        useProtocolProject(manager);
+        QSignalSpy manifests(&manager, &SpiralServiceManager::inputManifestAvailable);
+        QSignalSpy updates(&manager, &SpiralServiceManager::inputUpdateFinished);
+        QSignalSpy progress(&manager, &SpiralServiceManager::inputUpdateProgress);
+        manager.connectToService(protocolProfile(service.port));
+        QTRY_VERIFY_WITH_TIMEOUT(manager.isReady() && manager.ownsSessionLease(), 30000);
+        QTRY_VERIFY_WITH_TIMEOUT(manager.storeBinding().advertised(), 10000);
+        const auto& binding = manager.storeBinding();
+        QVERIFY(binding.localToService() && !binding.matches() && !binding.sameFile);
+        QVERIFY(binding.canUpdate() && !binding.canPosition());
+
+        editSurface(*host, hostAttachment, surface, 3);
+        manager.updateFitInputs(protocolRequest({{"object_store_location", "/elsewhere.vcobj"}}));
+        QCOMPARE(progress.count(), 1);
+        QTRY_COMPARE_WITH_TIMEOUT(updates.count(), 1, 60000);
+        SUCCEEDED_UPDATE(updates, 0, update);
+        // No position was named, so none is reported as reached and no
+        // commits are described beyond it.
+        QCOMPARE(update.requested, qint64{-1});
+        QVERIFY(update.head >= 0 && update.fitted >= update.head);
+        QVERIFY(update.includedBeyondRequested.isEmpty() && update.afterFitted.isEmpty());
+        QTRY_COMPARE_WITH_TIMEOUT(manifests.count(), 1, 30000);
+        QCOMPARE(fittedCells(readManifest(manifests, 0)), 3);
+
+        bool released = false;
+        manager.releaseSessionLease([&]() { released = true; });
+        QTRY_VERIFY_WITH_TIMEOUT(released, 30000);
+    }
+
     // A service sharing VC3D's store file commits the displayed preview in
     // place; VC3D reads it back as a committed fit, and committing it again
     // reuses it.

@@ -859,18 +859,21 @@ void SpiralServiceManager::updateFitInputs(QJsonObject request)
         refused.error = tr("Connect to the Spiral service and own its session lease first");
     else if (!_storeBinding.advertised())
         refused.error = tr("The Spiral service names no object store: rebuild with current inputs instead");
-    else if (_storeBinding.localToService())
-        refused.error = tr("This service's store is local to its host: edits and commits need it served "
-                           "(vc_object_server) and attached here");
-    else if (!_storeBinding.matches() || !session || !_storeAttachment)
-        refused.error = tr("Attach the service's object store (%1, generation %2) to update the fit's inputs")
-                            .arg(_storeBinding.serviceUuid, _storeBinding.serviceGeneration);
     if (!refused.error.isEmpty()) {
         emit inputUpdateFinished(refused);
         return;
     }
     _inputUpdateActive = true;
     const quint64 serial = ++_inputUpdateSerial;
+    // Without the service's store attached here (its file is local to its
+    // host, or another store is attached), the update names no position:
+    // the service links its store's head, which holds what was saved on
+    // its host, and this VC3D's edits are not among them.
+    if (!_storeBinding.canPosition() || !session || !_storeAttachment) {
+        _inputUpdateAttachment.reset();
+        sendInputUpdate(request, -1, serial);
+        return;
+    }
     const vc::objects::AttachmentIdentity attachment = *_storeAttachment;
     _inputUpdateAttachment = std::make_unique<vc::objects::AttachmentIdentity>(attachment);
     // Saves are in the store already: the update includes everything saved
@@ -888,21 +891,25 @@ void SpiralServiceManager::updateFitInputs(QJsonObject request)
 void SpiralServiceManager::sendInputUpdate(QJsonObject request, qint64 requested, quint64 serial)
 {
     emit inputUpdateProgress(QStringLiteral("linking"),
-                             tr("Linking and pinning a position including commit %1…").arg(requested));
+                             requested < 0 ? tr("Linking and pinning the service's store head…")
+                                           : tr("Linking and pinning a position including commit %1…").arg(requested));
     QJsonObject run = request.value(QStringLiteral("run")).toObject();
     QJsonObject config = run.value(QStringLiteral("config")).toObject();
     for (const QString& key : _serviceOwnedKeys) config.remove(key);
     run[QStringLiteral("config")] = config;
     // The position this VC3D's saved edits reached: the attached store's
     // identity and head, and the receipt of its last save when it has one.
-    QJsonObject position{{QStringLiteral("store"), _storeBinding.localUuid},
-                         {QStringLiteral("generation"), _storeBinding.localGeneration},
-                         {QStringLiteral("commit_sequence"), requested}};
-    const QString lastSave = lastSaveRequestOf(_storeBinding);
-    if (!lastSave.isEmpty()) position[QStringLiteral("request_uuid")] = lastSave;
-    QJsonObject body{{QStringLiteral("run"), run},
-                     {QStringLiteral("inputs_position"), position},
-                     {QStringLiteral("command_id"), commandId()}};
+    // None when the service's store is not attached here.
+    QJsonObject position;
+    if (requested >= 0) {
+        position = {{QStringLiteral("store"), _storeBinding.localUuid},
+                    {QStringLiteral("generation"), _storeBinding.localGeneration},
+                    {QStringLiteral("commit_sequence"), requested}};
+        const QString lastSave = lastSaveRequestOf(_storeBinding);
+        if (!lastSave.isEmpty()) position[QStringLiteral("request_uuid")] = lastSave;
+    }
+    QJsonObject body{{QStringLiteral("run"), run}, {QStringLiteral("command_id"), commandId()}};
+    if (!position.isEmpty()) body[QStringLiteral("inputs_position")] = position;
     const bool initialize = !_hasActiveSession;
     // An idle fit keeps training across the update; a failed one is rebuilt.
     // Any other state (a run, a build) is the user's to stop first: a
@@ -918,9 +925,9 @@ void SpiralServiceManager::sendInputUpdate(QJsonObject request, qint64 requested
     QString route = QStringLiteral("/session/initialize");
     if (update) {
         route = QStringLiteral("/session/update-inputs");
-        body = {{QStringLiteral("inputs_position"), position},
-                {QStringLiteral("expected_input_generation"), _inputGeneration},
+        body = {{QStringLiteral("expected_input_generation"), _inputGeneration},
                 {QStringLiteral("command_id"), commandId()}};
+        if (!position.isEmpty()) body[QStringLiteral("inputs_position")] = position;
     } else if (!initialize) {
         route = QStringLiteral("/session/rebuild");
         body[QStringLiteral("inputs")] = QStringLiteral("reload");
@@ -961,10 +968,12 @@ void SpiralServiceManager::finishInputUpdate(InputUpdate update, quint64 serial)
     if (serial != _inputUpdateSerial) return;  // abandoned
     // The store holds the service's links and every edit the position
     // includes: describe what it took in beyond this VC3D's edits, and what
-    // came after it (shown as stale).
+    // came after it (shown as stale). Without the service's store attached
+    // (no position was named) there is nothing to compare against.
     _inputUpdateAttachment.reset();
     const auto session = _storeSession.lock();
-    if (!update.error.isEmpty() || !session || !_storeAttachment) {
+    if (!update.error.isEmpty() || update.requested < 0 || !session || !_storeAttachment
+        || !_storeBinding.canPosition()) {
         _inputUpdateActive = false;
         emit inputUpdateFinished(update);
         return;

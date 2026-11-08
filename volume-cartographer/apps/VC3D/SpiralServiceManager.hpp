@@ -82,9 +82,12 @@ public:
         // The service's store is a file local to its host and this VC3D is
         // not attached to it: edits and commits need it served and attached.
         bool localToService() const { return advertised() && !serviceServed && !matches(); }
-        // A client can name its saved edits (an input position) when it is
-        // attached to the service's store.
-        bool canUpdate() const { return matches(); }
+        // An input update can be asked of any advertised store: the service
+        // links its store's head, which holds what its host's writers saved.
+        bool canUpdate() const { return advertised(); }
+        // The update names this VC3D's saved edits (an input position the
+        // fit must include) only when the service's store is attached here.
+        bool canPosition() const { return matches(); }
         // Which stores are bound, without the heads, which every commit moves.
         QStringList identity() const
         {
@@ -152,7 +155,10 @@ public:
     // (or a rebuild) at a position. Needs the service's store attached here
     // (storeBinding().canUpdate()).
     struct InputUpdate {
-        qint64 requested = -1;  // M: the store's head (commit sequence) holding this VC3D's saved edits
+        // M: the store's head (commit sequence) holding this VC3D's saved
+        // edits; -1 when the service's store is not attached here and the
+        // update named no position (the service linked its head).
+        qint64 requested = -1;
         qint64 head = -1;       // H: the head the service linked at
         qint64 fitted = -1;     // N: H plus the service's links; the fit's inputs
         QString error;          // empty on success
@@ -164,7 +170,8 @@ public:
     };
     // Initialize or rebuild the fit from a position of the service's store
     // including this VC3D's saved edits (its head and the receipt of its
-    // last save), or with an idle resident fit update its inputs in place
+    // last save) when that store is attached here, else from the service's
+    // store head; or with an idle resident fit update its inputs in place
     // (POST /session/update-inputs: model and optimiser state are kept); a
     // failed session is rebuilt. ``request`` is the panel's session request.
     void updateFitInputs(QJsonObject request);
