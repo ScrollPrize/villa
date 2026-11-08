@@ -391,6 +391,53 @@ def test_fit_context_loads_frozen_inputs_from_its_configuration(store_path, tmp_
                              current_iteration=0)
 
 
+def _context(store_path, tmp_path, **options):
+    from config import FitConfig
+    from fit_session import SpiralInputPaths
+    from fit_spiral import FitContext
+    umbilicus = str(tmp_path / 'umbilicus.json')
+    reference.write_umbilicus(umbilicus)
+    return FitContext(
+        FitConfig(fit_config(store_path, **options.pop('config', {}))),
+        scroll=reference.scroll_spec(), paths=SpiralInputPaths(umbilicus=umbilicus),
+        cache_dir=str(tmp_path / 'cache'), out_base_dir=str(tmp_path / 'out'), **options)
+
+
+def test_a_resumed_fit_reads_the_checkpoints_pinned_inputs(store_path, tmp_path):
+    """A command-line resume reads the inputs at the versions the checkpoint
+    recorded (case C6), whatever the store holds now."""
+    import torch
+    from object_store_fixture import names
+    trained = _context(store_path, tmp_path)
+    trained.load_host_inputs()
+    recorded = trained.object_store_inputs
+    checkpoint = str(tmp_path / 'resume.ckpt')
+    torch.save({'cfg': dict(recorded.manifest['materialization']),
+                'input_manifest': {'object_store': json.loads(json.dumps(recorded.manifest))}},
+               checkpoint)
+    # A selected object changes after the checkpoint: its current metadata
+    # is not what the fit was trained on.
+    with ObjectStore.open(store_path, author='editor') as db:
+        db.set_meta(names(store_path)['walk'], 'sampling_group', 'reviewed')
+    log = []
+    context = _context(store_path, tmp_path, resume_path=checkpoint, input_log=log.append)
+    context.load_host_inputs()
+    inputs = context.object_store_inputs
+    assert inputs.digest == recorded.digest
+    assert inputs.manifest['position'] == recorded.manifest['position']
+    assert {entry['uuid']: entry['version'] for entry in inputs.manifest['objects']} == {
+        entry['uuid']: entry['version'] for entry in recorded.manifest['objects']}
+    assert osi.resume_problems({'object_store': recorded.manifest}, inputs) == []
+    assert any('resuming at the checkpoint' in line for line in log)
+    # object_store_allow_changed_inputs resumes against the current inputs.
+    current = _context(store_path, tmp_path, resume_path=checkpoint,
+                       config={'object_store_allow_changed_inputs': True})
+    current.load_host_inputs()
+    assert current.object_store_inputs.digest != recorded.digest
+    assert current.object_store_inputs.manifest['position']['commit_sequence'] \
+        > recorded.manifest['position']['commit_sequence']
+
+
 @pytest.mark.skipif(not os.environ.get('OBJECT_STORE_SMOKE_STORE'),
                     reason='set OBJECT_STORE_SMOKE_STORE to a copy of an ingested dataset store')
 def test_real_data_startup_smoke():

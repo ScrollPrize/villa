@@ -1680,7 +1680,29 @@ class FitContext:
         return load_fit_inputs(
             self.config, lasagna=self._lasagna_normal_inputs(),
             external_frames=self._external_input_frames(), dist=self.dist,
-            cache_directory=self.cache_path, log=self.input_log)
+            cache_directory=self.cache_path, log=self.input_log,
+            pins=self._resume_input_pins())
+
+    def _resume_input_pins(self):
+        """The pins (object_store_inputs.InputPins) the resumed checkpoint's
+        input manifest records, so the fit reads exactly the inputs it was
+        trained on whatever the store holds now, and the checkpoint's input
+        check passes by construction. None when there is no checkpoint, the
+        configuration names a position already (a service build), the
+        checkpoint records no pinned inputs, or
+        object_store_allow_changed_inputs asks for the current inputs."""
+        if (not self.resume_path or self.config['object_store_input_position'] is not None
+                or self.config['object_store_allow_changed_inputs']):
+            return None
+        from object_store_inputs import InputPins
+        checkpoint = load_checkpoint_cpu(self.resume_path)
+        manifest = checkpoint.get('input_manifest') if isinstance(checkpoint, dict) else None
+        pins = InputPins.from_manifest((manifest or {}).get('object_store'))
+        if pins is None or not pins.pinned:
+            return None
+        if self.dist.is_main_process:
+            self.input_log(f'resuming at the checkpoint\'s pinned {pins.position.describe()}')
+        return pins
 
     def _derive_object_store_point_inputs(self, verified_patches, inputs):
         """Install point views derived from object-store attachments.
@@ -3927,12 +3949,10 @@ class FitContext:
         from object_store_inputs import load_fit_inputs
         config = dict(self.config)
         config['object_store_input_position'] = dict(position)
-        cache = (os.path.join(self.cache_path, 'object_store_strips')
-                 if self.cache_path else None)
         return load_fit_inputs(
             config, lasagna=self._lasagna_normal_inputs(),
             external_frames=self._external_input_frames(), dist=self.dist,
-            cache_directory=cache, log=self.input_log)
+            cache_directory=self.cache_path, log=self.input_log)
 
     def prepare_input_replacement(self, inputs):
         """Derive every input-dependent host structure for ``inputs``
