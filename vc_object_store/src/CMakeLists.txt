@@ -116,6 +116,9 @@ if(VC_OBJECT_STORE_BUILD_SERVER)
     target_compile_features(vc_object_server PUBLIC cxx_std_20)
     add_library(vc_object_store::vc_object_server ALIAS vc_object_server)
 endif()
+# The service runs link_objects requests itself (their detection on its read
+# workers), so it links the detectors when they are built; see the end of
+# this file.
 
 if(NOT VC_OBJECT_STORE_BUILD_ADAPTERS)
     return()
@@ -155,6 +158,11 @@ add_library(vc_object_links STATIC
     CtSheetNormal.cpp
     linking/LinkCandidates.cpp linking/SurfaceOverlap.cpp linking/FiberSurface.cpp
     linking/TrackTrack.cpp linking/StoredGeometry.cpp linking/LineSurface.cpp
-    linking/TrackSurface.cpp linking/PointCollectionSurface.cpp)
+    linking/TrackSurface.cpp linking/PointCollectionSurface.cpp linking/LinkObjects.cpp)
 target_include_directories(vc_object_links PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
 target_link_libraries(vc_object_links PUBLIC vc_objects PRIVATE vc_track_crossings vc_object_formats vc_resident_geometry vc_reader::reader opencv_core nlohmann_json::nlohmann_json)
+
+if(TARGET vc_object_server)
+    target_link_libraries(vc_object_server PRIVATE vc_object_links)
+    target_compile_definitions(vc_object_server PRIVATE VC_OBJECT_SERVER_LINKING=1)
+endif()

@@ -8,6 +8,11 @@
 #include <set>
 
 namespace vc::object_links::detail {
+const objects::ReadTxn& StoredGeometry::txn() const
+{
+    if (!read_) throw std::logic_error("object links: the stored geometry snapshot was closed");
+    return *read_;
+}
 std::vector<objects::ObjectRecord> StoredGeometry::select(const std::string& kind,
     const std::vector<std::string>& uuids)
 {
@@ -16,15 +21,25 @@ std::vector<objects::ObjectRecord> StoredGeometry::select(const std::string& kin
     objects::ObjectSelection selection;
     selection.kind = kind;
     selection.uuids.assign(requested.begin(), requested.end());
-    auto objects = db_.selectObjects(read_, selection);
+    auto objects = db_.selectObjects(txn(), selection);
     if (!requested.empty() && objects.size() != requested.size())
         throw std::invalid_argument("requested objects are missing or not of kind " + kind);
-    for (const auto& object : objects) generations_[object.uuid] = object.generation;
+    for (const auto& object : objects) {
+        generations_[object.uuid] = object.generation;
+        if (!object.version) throw std::runtime_error("object " + object.uuid + " has no numbered version");
+        versions_[object.uuid] = *object.version;
+    }
     return objects;
+}
+objects::VersionSelection StoredGeometry::expectations() const
+{
+    objects::VersionSelection result;
+    for (const auto& [uuid, version] : versions_) result.emplace(uuid, version);
+    return result;
 }
 objects::detail::GeometrySnapshot StoredGeometry::load(const objects::ObjectRecord& object)
 {
-    const auto revision = db_.currentGeometry(read_, object.uuid);
+    const auto revision = db_.currentGeometry(txn(), object.uuid);
     if (!revision) throw std::runtime_error("object " + object.uuid + " has no stored geometry; ingest it before discovery");
     if (revision->formatVersion != 1 || revision->coordinateSystem != "source_xyz" || revision->kind != object.kind)
         throw std::runtime_error("unsupported stored geometry for " + object.uuid);
@@ -33,11 +48,11 @@ objects::detail::GeometrySnapshot StoredGeometry::load(const objects::ObjectReco
     result.revision = *revision;
     const std::vector<std::string> names = object.kind == "fiber" ? std::vector<std::string>{"control_points", "line_points"}
         : object.kind == "point_collection" ? std::vector<std::string>{"points", "point_ids"} : std::vector<std::string>{"points"};
-    for (const auto& name : names) result.arrays[name] = db_.readGeometryArray(read_, revision->uuid, name);
+    for (const auto& name : names) result.arrays[name] = db_.readGeometryArray(txn(), revision->uuid, name);
     if (object.kind == "surface")
         for (const auto& array : revision->arrays)
             if (array.name == objects::detail::surfaceValidChannel)
-                result.arrays[array.name] = db_.readGeometryArray(read_, revision->uuid, array.name);
+                result.arrays[array.name] = db_.readGeometryArray(txn(), revision->uuid, array.name);
     return result;
 }
 void StoredGeometry::validate(const objects::WriteTxn& txn) const

@@ -9,6 +9,7 @@
 
 #include <fcntl.h>
 #include <vc_reader/http.hpp>
+#include <variant>
 #include <vc_reader/sftp.hpp>
 #include <vc_reader/native/sigv4.hpp>
 
@@ -44,9 +45,11 @@ std::string serverError(const vcr::http::Response& response)
 
 struct HostedStore::Impl {
     explicit Impl(const HostedStoreOptions& o, bool ssh)
-        : http(vcr::http::Options{o.connections, o.connectTimeoutMs, o.stallTimeoutS, o.retries, o.requestTimeoutMs, true, ssh}) {}
+        : http(vcr::http::Options{o.connections, o.connectTimeoutMs, o.stallTimeoutS, o.retries, o.requestTimeoutMs, true, ssh}),
+          linkHttp(vcr::http::Options{1, o.connectTimeoutMs, o.linkTimeoutS, o.retries, 0, true, ssh}) {}
     std::unique_ptr<vcr::sftp::Forward> forward;
     vcr::http::Session http;
+    vcr::http::Session linkHttp; // link_objects requests: the detection's duration, not a stall
 };
 
 HostedStore::HostedStore(std::string endpoint, HostedStoreOptions options)
@@ -97,15 +100,20 @@ TransactionReceipt HostedStore::submit(const TransactionRequest& request)
         expectOk(response, "stage payload " + hash);
     };
     for (const auto& [hash, bytes] : payloads) upload(hash);
+    bool prepared = false;
+    for (const auto& op : request.operations) prepared = prepared || std::holds_alternative<LinkObjectsOp>(op);
+    auto& http = prepared ? impl_->linkHttp : impl_->http;
     // Staging can expire between upload and submit (or before a retry): the
     // server names what it lacks and the identical request is sent again.
     for (int attempt = 0;; ++attempt) {
-        const auto response = impl_->http.request("POST", requestEndpoint_ + "/v1/transactions", body,
+        const auto response = http.request("POST", requestEndpoint_ + "/v1/transactions", body,
             {{"Content-Type", "application/json"}});
         if (response.status != 422 || attempt == 3) {
             return transactionReceiptFromJson(expectOk(response, "submit " + request.requestUuid).body);
         }
         const auto answer = Json::parse(response.body);  // the loop reads into it
+        if (!answer.contains("missing"))
+            throw PreparationFailed("hosted store: submit " + request.requestUuid + ": " + serverError(response));
         for (const auto& hash : answer.at("missing")) {
             const auto name = hash.get<std::string>();
             if (!payloads.contains(name)) throw std::runtime_error("hosted store: server asked for an unknown payload " + name);

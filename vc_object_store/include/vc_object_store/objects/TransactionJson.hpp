@@ -56,6 +56,9 @@ std::string changePageToJson(const ChangePage&);
 
 // Wire forms shared by the hosted service and its clients.
 std::vector<std::string> transactionJsonPayloadHashes(const std::string& requestJson);
+// Whether the request holds an operation that is prepared before the writer
+// lock (link_objects), so a service runs its preparation on a read worker.
+bool transactionJsonHasPreparedOperations(const std::string& requestJson);
 std::string transactionConflictToJson(const TransactionConflict&);
 TransactionConflict transactionConflictFromJson(const std::string&);
 StoreStatus storeStatusFromJson(const std::string&);

@@ -14,7 +14,10 @@
 // advances the store's commit sequence by one and appends its changes to an
 // ordered feed. A transaction that changes nothing advances nothing.
 
+#include <atomic>
+#include <cstddef>
 #include <cstdint>
+#include <filesystem>
 #include <functional>
 #include <map>
 #include <optional>
@@ -23,6 +26,7 @@
 #include <variant>
 #include <vector>
 
+#include "vc_object_store/Progress.hpp"
 #include "vc_object_store/objects/Geometry.hpp"
 #include <vc_reader/registrations.hpp>
 
@@ -268,12 +272,22 @@ struct IngestGeometryOp {
     std::string coordinateContext = "{}";
 };
 
+// Run relationship detectors over stored objects and publish their links with
+// the store's link marker, as one commit. `planJson` is the canonical plan
+// (object_links/LinkObjects.hpp: the ordered detectors with their parameters
+// and the marker's content). This is a *prepared* operation: detection runs
+// under a read snapshot outside the writer lock (ObjectStore::prepare), and
+// the checked write expects every object the detectors read at the version
+// they read, so a commit in between conflicts and nothing is written.
+struct LinkObjectsOp { std::string planJson; };
+inline constexpr const char* kLinkObjectsOperation = "link_objects"; // its wire name and preparer key
+
 using TransactionOperation = std::variant<
     CreateObjectOp, UpdateObjectOp, SetMetaOp, RemoveMetaOp, SetApprovalOp,
     RetireObjectOp, RestoreObjectOp, DeleteObjectOp,
     AddEdgeOp, UpdateEdgeOp, RemoveEdgeOp, RetainRelationshipOp, KeepRecordedRelationshipOp,
     PutGeometryOp, EditGeometryOp, EditGeometryRectangleOp, RecordCatalogTransformsOp, SetSurfaceChannelsOp,
-    UpdateGeometryArraysOp, IngestGeometryOp, CheckVolumeMappingOp>;
+    UpdateGeometryArraysOp, IngestGeometryOp, CheckVolumeMappingOp, LinkObjectsOp>;
 
 // Wire/command format version, part of every request digest.
 inline constexpr int kTransactionCommandVersion = 1;
@@ -287,5 +301,67 @@ struct TransactionRequest {
     std::optional<int64_t> expectedCommitSequence;
     std::vector<TransactionOperation> operations;
 };
+
+// ---- Prepared operations ---------------------------------------------------
+// An operation whose work happens before the writer lock is taken (link
+// detection over a read snapshot) and whose publication joins the request's
+// checked write. ObjectStore::prepare runs the registered preparer of each
+// such operation and returns what the write needs: the versions the
+// preparation observed, added to the request's expectations and read
+// dependencies at begin, and the publication to run in the operation's place.
+// The request itself (and so its digest and receipt) is unchanged.
+
+class ObjectStore;
+class WriteTxn;
+
+// A preparation that could not be made: its request publishes nothing and
+// has no receipt (a link detector that failed to run, for instance). Not a
+// transport failure: a retry of the same request repeats the work.
+class PreparationFailed : public std::runtime_error {
+public:
+    using std::runtime_error::runtime_error;
+};
+
+struct PreparedOperation {
+    VersionSelection expectedObjects, readDependencies;
+    std::function<void(ObjectStore&, WriteTxn&)> apply;
+};
+
+// What ObjectStore::prepare returns: the request's preparations, bound to
+// the request (its UUID and digest) and the store they ran on. submit refuses a
+// preparation made for another request or on another store, so a
+// preparation can only publish what its own request's detection read.
+class PreparedOperations {
+public:
+    // Nothing to apply: the request has no prepared operation, or its
+    // receipt is already saved (submit replays it).
+    bool empty() const { return operations_.empty(); }
+    // Every version the preparations observed and the write expects.
+    VersionSelection expectedObjects() const;
+    VersionSelection readDependencies() const;
+
+private:
+    friend class ObjectStore;
+    std::string requestUuid_, requestDigest_, storeUuid_, generation_;
+    std::map<std::size_t, PreparedOperation> operations_; // by index in TransactionRequest::operations
+};
+
+struct PrepareOptions {
+    util::ProgressCallback progress;          // the preparation's stages (detector progress)
+    const std::atomic_bool* cancel = nullptr; // checked between steps; a cancelled preparation throws
+    // Where a preparation may keep disposable files of its own (a hosted
+    // service's strip cache); empty keeps everything in memory.
+    std::filesystem::path scratchDirectory;
+    // Whether the request may name files on this host (a standalone writer
+    // runs where its author is; a hosted service refuses client paths).
+    bool localPaths = true;
+};
+
+// The preparer of one operation type, registered by the library that
+// implements it (object_links::enableLinkObjects for "link_objects"), so the
+// core library stays free of detector dependencies. Called by
+// ObjectStore::prepare with the operation to prepare.
+using OperationPreparer = std::function<PreparedOperation(ObjectStore&, const TransactionOperation&, const PrepareOptions&)>;
+void registerOperationPreparer(const std::string& operationName, OperationPreparer);
 
 } // namespace vc::objects

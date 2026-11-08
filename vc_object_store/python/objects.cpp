@@ -15,6 +15,7 @@
 #include "vc_object_store/objects/Selections.hpp"
 #include "vc_object_store/client/HostedStore.hpp"
 #include "vc_object_store/objects/Project.hpp"
+#include "vc_object_store/object_links/LinkObjects.hpp"
 #include "vc_object_store/object_links/ObjectLinks.hpp"
 #include "vc_object_store/CtSheetNormal.hpp"
 using namespace vc::python;
@@ -185,40 +186,13 @@ nb::dict detectorReportToPy(const vc::object_links::DetectorReport& rep)
     return d;
 }
 
-bool setLineSurfaceParameter(vc::object_links::LineSurfaceParams& p, const std::string& key, nb::handle val)
+// Detector keyword arguments as the JSON the detectors' parameter parsers take
+// (object_links/LinkObjects.hpp), so Python and link_objects plans agree.
+nlohmann::json kwargsJson(const nb::kwargs& kwargs)
 {
-    if (key == "surface_uuids") p.surfaceUuids = nb::cast<std::vector<std::string>>(val);
-    else if (key == "surface_scale") p.surfaceScale = nb::cast<double>(val);
-    else if (key == "ct_level") p.ctLevel = nb::cast<int>(val);
-    else if (key == "ct_to_base_scale") p.ctToBaseScale = nb::cast<double>(val);
-    else if (key == "working_to_base_scale") p.workingToBaseScale = nb::cast<double>(val);
-    else if (key == "proximity") p.proximity = nb::cast<double>(val);
-    else if (key == "min_contacts") p.minContacts = nb::cast<std::size_t>(val);
-    else if (key == "strip_spacing") p.stripSpacing = nb::cast<double>(val);
-    else if (key == "strip_rows_each_side") p.stripRowsEachSide = nb::cast<int>(val);
-    else if (key == "strip_march_step") p.stripMarchStep = nb::cast<double>(val);
-    else if (key == "contact_gap") p.contactGap = nb::cast<double>(val);
-    else if (key == "anchor_contact") p.anchorContact = nb::cast<double>(val);
-    else if (key == "same_sheet") p.sameSheet = nb::cast<double>(val);
-    else if (key == "adjacent_low") p.adjacentLow = nb::cast<double>(val);
-    else if (key == "adjacent_high") p.adjacentHigh = nb::cast<double>(val);
-    else if (key == "same_normal") p.sameNormal = nb::cast<double>(val);
-    else if (key == "adjacent_normal") p.adjacentNormal = nb::cast<double>(val);
-    else if (key == "grow_same") p.growSame = nb::cast<double>(val);
-    else if (key == "grow_ratio") p.growRatio = nb::cast<double>(val);
-    else if (key == "strip_gate_ratio") p.stripGateRatio = nb::cast<double>(val);
-    else if (key == "strip_gate_margin") p.stripGateMargin = nb::cast<double>(val);
-    else if (key == "strip_margin") p.stripMargin = nb::cast<double>(val);
-    else if (key == "max_rounds") p.maxRounds = nb::cast<int>(val);
-    else if (key == "edge_kind") p.edgeKind = nb::cast<std::string>(val);
-    else if (key == "replace_stale_pending") p.replaceStalePending = nb::cast<bool>(val);
-    else if (key == "strip_weights") {
-        const auto weights = nb::cast<std::vector<double>>(val);
-        if (weights.size() != p.stripWeights.size())
-            throw std::runtime_error("strip_weights requires four values");
-        std::copy(weights.begin(), weights.end(), p.stripWeights.begin());
-    } else return false;
-    return true;
+    nb::dict d;
+    for (auto item : kwargs) d[item.first] = item.second;
+    return nlohmann::json::parse(jsonDumps(d));
 }
 
 template<class T>
@@ -376,13 +350,16 @@ void bindHostedStore(nb::module_& m)
     };
     nb::class_<Hosted>(m, "HostedStore")
         .def("__init__", [](Hosted* self, const std::string& endpoint, int connections, long connectTimeoutMs,
-                            long stallTimeoutS, int retries, long requestTimeoutMs) {
+                            long stallTimeoutS, int retries, long requestTimeoutMs, long linkTimeoutS) {
             vo::HostedStoreOptions o;
             o.connections = connections; o.connectTimeoutMs = connectTimeoutMs; o.stallTimeoutS = stallTimeoutS;
-            o.retries = retries; o.requestTimeoutMs = requestTimeoutMs;
+            o.retries = retries; o.requestTimeoutMs = requestTimeoutMs; o.linkTimeoutS = linkTimeoutS;
             new (self) Hosted(endpoint, o);
         }, nb::arg("endpoint"), nb::arg("connections") = 4, nb::arg("connect_timeout_ms") = 10000,
-           nb::arg("stall_timeout_s") = 60, nb::arg("retries") = 5, nb::arg("request_timeout_ms") = 0)
+           nb::arg("stall_timeout_s") = 60, nb::arg("retries") = 5, nb::arg("request_timeout_ms") = 0,
+           nb::arg("link_timeout_s") = 300,
+           "link_timeout_s: how long a link_objects request may take to be answered (its detection runs on the "
+           "service); set it with the service's --request-deadline.")
         .def_prop_ro("endpoint", &Hosted::endpoint)
         .def("status", [statusPy](Hosted& self) {
             vo::StoreStatus status;
@@ -539,6 +516,7 @@ void bindHostedStore(nb::module_& m)
             self.fetchArtifact(f, destination);
         }, nb::arg("file"), nb::arg("destination"), "Write one manifest entry {name, sha256, length} atomically, verified.");
     nb::exception<vo::StoreBusy>(m, "StoreBusy", PyExc_RuntimeError);
+    nb::exception<vo::PreparationFailed>(m, "PreparationFailed", PyExc_RuntimeError);
 }
 
 // ObjectStoreSession operations that take requests, numbered references and
@@ -570,17 +548,19 @@ void bindSessionOperations(nb::class_<vo::ObjectStoreSession> session)
         }, nb::arg("location"), nb::arg("author") = std::string(), nb::arg("read_only") = false,
            "Attach a store location: a vc_object_server endpoint (http:// or https://; always writable) or a store file.")
         .def("attach_hosted", [](Session& self, const std::string& endpoint, int64_t pollIntervalMs, size_t cacheBytes,
-                                 int retries, long connectTimeoutMs, const std::string& author) {
+                                 int retries, long connectTimeoutMs, const std::string& author, long linkTimeoutS) {
             vo::HostedSessionOptions options;
             options.author = author;
             options.pollInterval = std::chrono::milliseconds(pollIntervalMs);
             options.cacheBytes = cacheBytes;
             options.client.retries = retries;
             options.client.connectTimeoutMs = connectTimeoutMs;
+            options.client.linkTimeoutS = linkTimeoutS;
             nb::gil_scoped_release release;
             return self.attachHosted(endpoint, options);
         }, nb::arg("endpoint"), nb::arg("poll_interval_ms") = 2000, nb::arg("cache_bytes") = vo::HostedSessionOptions{}.cacheBytes,
            nb::arg("retries") = 5, nb::arg("connect_timeout_ms") = 10000, nb::arg("author") = std::string(),
+           nb::arg("link_timeout_s") = 300,
            "Attach a store served by vc_object_server; use the typed operations (no local callbacks).")
         .def("read_surface_grid", [](Session& self, const vo::AttachmentIdentity& attachment, const std::string& uuid,
                                      const std::string& volume, double targetScale, std::optional<int64_t> version,
@@ -797,6 +777,13 @@ NB_MODULE(_native, m)
         return vo::artifactManifestJson(std::move(parsed));
     }, nb::arg("files"), "Canonical manifest text for the 'artifacts' metadata key; files are {name, sha256, length}.");
     m.attr("ARTIFACTS_META_KEY") = vo::kArtifactsMetaKey;
+    // link_objects requests (object_links/LinkObjects.hpp) on local stores
+    // run their detectors in this process.
+    vc::object_links::enableLinkObjects();
+    m.attr("LINK_OBJECTS_OPERATION") = vo::kLinkObjectsOperation;
+    m.attr("LINK_MARKER_KIND") = vc::object_links::kLinkMarkerKind;
+    m.def("link_marker_uuid", [] { return vc::object_links::linkMarkerUuid(); },
+          "UUID of the store's link marker object (the same in every store).");
     m.def("encode_selection_record", [](const nb::dict& record) { return bytesToPy(vo::encodeSelectionRecord(selectionRecordFromPy(record))); },
           nb::arg("record"), "Compact binary selection record (about 24 bytes per object).");
     m.def("decode_selection_record", [](const nb::bytes& data) {
@@ -1133,22 +1120,7 @@ NB_MODULE(_native, m)
         .def(
             "link_point_collections_to_surfaces",
             [](PyObjectStore& self, const nb::kwargs& kwargs) {
-                vc::object_links::PointCollectionSurfaceParams p;
-                for (auto item : kwargs) {
-                    const auto key = nb::cast<std::string>(item.first);
-                    const nb::handle value = item.second;
-                    if (key == "collection_uuids") p.collectionUuids = nb::cast<std::vector<std::string>>(value);
-                    else if (key == "surface_uuids") p.surfaceUuids = nb::cast<std::vector<std::string>>(value);
-                    else if (key == "tolerance") p.tolerance = nb::cast<double>(value);
-                    else if (key == "point_scale") p.pointScale = nb::cast<double>(value);
-                    else if (key == "surface_scale") p.surfaceScale = nb::cast<double>(value);
-                    else if (key == "window_points") p.windowPoints = nb::cast<int>(value);
-                    else if (key == "window_min_points") p.windowMinPoints = nb::cast<int>(value);
-                    else if (key == "absolute_winding") p.absoluteWinding = nb::cast<std::optional<bool>>(value);
-                    else if (key == "edge_kind") p.edgeKind = nb::cast<std::string>(value);
-                    else if (key == "replace_stale_pending") p.replaceStalePending = nb::cast<bool>(value);
-                    else throw std::runtime_error("link_point_collections_to_surfaces: unknown parameter '" + key + "'");
-                }
+                const auto p = vc::object_links::pointCollectionSurfaceParamsFromJson(kwargsJson(kwargs));
                 return detectorReportToPy(self.withStore<true>([&](auto& db) {
                     return vc::object_links::linkPointCollectionsToSurfaces(db, p);
                 }));
@@ -1160,30 +1132,7 @@ NB_MODULE(_native, m)
         .def(
             "link_surface_overlaps",
             [](PyObjectStore& self, const nb::kwargs& kwargs) {
-                vc::object_links::SurfaceOverlapParams p;
-                for (auto item : kwargs) {
-                    const std::string key = nb::cast<std::string>(item.first);
-                    const nb::handle val = item.second;
-                    if (key == "surface_uuids") p.surfaceUuids = nb::cast<std::vector<std::string>>(val);
-                    else if (key == "workers") p.workers = nb::cast<int>(val);
-                    else if (key == "tolerance") p.tolerance = nb::cast<double>(val);
-                    else if (key == "sample_spacing") p.sampleSpacing = nb::cast<double>(val);
-                    else if (key == "thinning_spacing") p.thinningSpacing = nb::cast<double>(val);
-                    else if (key == "max_correspondences") p.maxCorrespondences = nb::cast<std::size_t>(val);
-                    else if (key == "uv_inlier_tolerance") p.uvInlierTolerance = nb::cast<double>(val);
-                    else if (key == "min_inliers") p.minInliers = nb::cast<std::size_t>(val);
-                    else if (key == "min_major_spread") p.minMajorSpread = nb::cast<double>(val);
-                    else if (key == "min_minor_spread") p.minMinorSpread = nb::cast<double>(val);
-                    else if (key == "max_refit_rms") p.maxRefitRms = nb::cast<double>(val);
-                    else if (key == "min_agreement_ratio") p.minAgreementRatio = nb::cast<double>(val);
-                    else if (key == "min_overlap_fraction") p.minOverlapFraction = nb::cast<double>(val);
-                    else if (key == "ransac_confidence") p.ransacConfidence = nb::cast<double>(val);
-                    else if (key == "ransac_max_hypotheses") p.ransacMaxHypotheses = nb::cast<std::size_t>(val);
-                    else if (key == "allow_reflection") p.allowReflection = nb::cast<bool>(val);
-                    else if (key == "edge_kind") p.edgeKind = nb::cast<std::string>(val);
-                    else if (key == "replace_stale_pending") p.replaceStalePending = nb::cast<bool>(val);
-                    else throw std::runtime_error("link_surface_overlaps: unknown parameter '" + key + "'");
-                }
+                const auto p = vc::object_links::surfaceOverlapParamsFromJson(kwargsJson(kwargs));
                 return detectorReportToPy(self.withStore<true>([&](auto& db) {
                     return vc::object_links::linkSurfaceOverlaps(db, p);
                 }));
@@ -1193,20 +1142,7 @@ NB_MODULE(_native, m)
         .def(
             "link_tracks_to_tracks",
             [](PyObjectStore& self, const nb::kwargs& kwargs) {
-                vc::object_links::TrackTrackParams p;
-                for (auto item : kwargs) {
-                    const auto key = nb::cast<std::string>(item.first);
-                    const nb::handle value = item.second;
-                    if (key == "min_angle_degrees") p.minAngleDegrees = nb::cast<double>(value);
-                    else if (key == "tangent_radius_voxels") p.tangentRadiusVoxels = nb::cast<double>(value);
-                    else if (key == "cluster_index_radius") p.clusterIndexRadius = nb::cast<int>(value);
-                    else if (key == "workers") p.workers = nb::cast<int>(value);
-                    else if (key == "dataset_ref") p.datasetRef = nb::cast<std::string>(value);
-                    else if (key == "track_uuids") p.trackUuids = nb::cast<std::vector<std::string>>(value);
-                    else if (key == "edge_kind") p.edgeKind = nb::cast<std::string>(value);
-                    else if (key == "replace_stale_pending") p.replaceStalePending = nb::cast<bool>(value);
-                    else throw std::runtime_error("link_tracks_to_tracks: unknown parameter '" + key + "'");
-                }
+                const auto p = vc::object_links::trackTrackParamsFromJson(kwargsJson(kwargs));
                 return detectorReportToPy(self.withStore<true>([&](auto& db) {
                     return vc::object_links::linkTracksToTracks(db, p);
                 }));
@@ -1217,43 +1153,29 @@ NB_MODULE(_native, m)
         .def(
             "link_tracks_to_surfaces",
             [](PyObjectStore& self, const std::string& ctVolume, const nb::kwargs& kwargs) {
-                vc::object_links::TrackSurfaceParams p;
-                for (auto item : kwargs) {
-                    const auto key = nb::cast<std::string>(item.first);
-                    const nb::handle val = item.second;
-                    if (key == "track_scale") p.trackScale = nb::cast<double>(val);
-                    else if (key == "track_uuids") p.trackUuids = nb::cast<std::vector<std::string>>(val);
-                    else if (!setLineSurfaceParameter(p, key, val))
-                        throw std::runtime_error("link_tracks_to_surfaces: unknown parameter '" + key + "'");
-                }
+                const auto p = vc::object_links::trackSurfaceParamsFromJson(kwargsJson(kwargs));
                 return detectorReportToPy(self.withStore<true>([&](auto& db) {
                     return vc::object_links::linkTracksToSurfaces(db, ctVolume, p);
                 }));
             },
             nb::arg("ct_volume") = "", nb::arg("kwargs"),
             "Link stored tracks to stored surfaces; select with track_uuids and surface_uuids. "
-            "vc_reader supplies CT normals. Anchors retain raw indices and source XYZ.")
+            "Strip normals come from ct_volume, lasagna normal_x_volume/normal_y_volume, or a "
+            "normal_pool pack; with none, the centerline alone gates anchors. "
+            "Anchors retain raw indices and source XYZ.")
         .def(
             "link_fibers_to_surfaces",
             [](PyObjectStore& self, const std::string& ctVolume, const nb::kwargs& kwargs) {
-                vc::object_links::FiberSurfaceParams p;
-                for (auto item : kwargs) {
-                    const std::string key = nb::cast<std::string>(item.first);
-                    const nb::handle val = item.second;
-                    if (key == "fiber_uuids") p.fiberUuids = nb::cast<std::vector<std::string>>(val);
-                    else if (key == "cache_directory") p.cacheDirectory = nb::cast<std::string>(val);
-                    else if (key == "fiber_scale") p.fiberScale = nb::cast<double>(val);
-                    else if (key == "rebuild_strips") p.rebuildStrips = nb::cast<bool>(val);
-                    else if (!setLineSurfaceParameter(p, key, val))
-                        throw std::runtime_error("link_fibers_to_surfaces: unknown parameter '" + key + "'");
-                }
+                const auto p = vc::object_links::fiberSurfaceParamsFromJson(kwargsJson(kwargs));
                 return detectorReportToPy(self.withStore<true>([&](auto& db) {
                     return vc::object_links::linkFibersToSurfaces(db, ctVolume, p);
                 }));
             },
             nb::arg("ct_volume") = "", nb::arg("kwargs"),
             "Link stored fibers to stored surfaces; select with fiber_uuids and surface_uuids. "
-            "vc_reader supplies CT normals. Optional cache_directory stores disposable strips.")
+            "Strip normals come from ct_volume, lasagna normal_x_volume/normal_y_volume, or a "
+            "normal_pool pack; with none, the centerline alone gates anchors. "
+            "Optional cache_directory stores disposable strips.")
         .def_prop_ro("uuid", readMethod<&vo::ObjectStore::uuid>())
         .def("current_object_revision", readMethod<&vo::ObjectStore::currentObjectRevision>(),
              nb::arg("object_uuid"))
@@ -1284,7 +1206,7 @@ NB_MODULE(_native, m)
             const auto receipt = self.withRead([&](vo::ObjectStore& db, vo::ReadTxn& txn) { return db.receipt(txn, request); });
             return receipt ? jsonLoads(vo::transactionReceiptToJson(*receipt)) : nb::none();
         }, nb::arg("request_uuid"))
-        .def("submit", [](PyObjectStore& self, const nb::object& request, const nb::dict& payloads) {
+        .def("submit", [](PyObjectStore& self, const nb::object& request, const nb::dict& payloads, const nb::object& progress) {
             // The canonical JSON form (transaction_request_json); binary
             // payloads keyed by SHA-256, as on the wire.
             vo::TransactionPayloads bytes;
@@ -1295,14 +1217,26 @@ NB_MODULE(_native, m)
             }
             const auto text = nb::isinstance<nb::str>(request) ? nb::cast<std::string>(request) : jsonDumps(request);
             const auto parsed = vo::transactionRequestFromJson(text, bytes);
+            vo::PrepareOptions options;
+            if (!progress.is_none()) {
+                options.progress = [progress](const vo::util::ProgressUpdate& update) {
+                    nb::gil_scoped_acquire acquire;
+                    progress(nb::str(update.stage.data(), update.stage.size()), update.completed, update.total,
+                             nb::str(update.detail.data(), update.detail.size()));
+                };
+            }
             vo::TransactionReceipt receipt;
             {
                 nb::gil_scoped_release release;
-                receipt = self.require().submit(parsed);
+                auto& db = self.require();
+                const auto prepared = db.prepare(parsed, options);
+                receipt = db.submit(parsed, prepared);
             }
             return jsonLoads(vo::transactionReceiptToJson(receipt));
-        }, nb::arg("request"), nb::arg("payloads") = nb::dict(),
-           "Atomic checked request; identical retries return the saved receipt. Conflicts raise RuntimeError.")
+        }, nb::arg("request"), nb::arg("payloads") = nb::dict(), nb::arg("progress") = nb::none(),
+           "Atomic checked request; identical retries return the saved receipt. Conflicts raise RuntimeError. "
+           "A link_objects request runs its detectors here first (progress(stage, completed, total, detail) "
+           "follows them) and then commits their links with the link marker in one checked write.")
         .def("start_history_generation", [](PyObjectStore& self, const std::string& reason) {
             nb::gil_scoped_release release;
             return self.require().startHistoryGeneration(reason);

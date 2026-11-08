@@ -190,4 +190,35 @@ DetectorReport detail::commitStoredCandidates(objects::ObjectStore& db, const St
         replaceStalePending, staleScope, progress, true);
 }
 
+DetectorReport detail::commitDetection(objects::ObjectStore& db, const StoredGeometry& inputs, objects::WriteTxn& txn,
+    const Detection& detection, const objects::util::ProgressCallback& progress)
+{
+    auto report = detection.report;
+    if (!detection.publish) return report;
+    const auto committed = commitStoredCandidates(db, inputs, txn, detection.detector, detection.version,
+        detection.candidates, detection.replaceStalePending, &detection.scope, progress);
+    report.candidatesFound = committed.candidatesFound;
+    report.edgesCreated = committed.edgesCreated;
+    report.edgesUpdated = committed.edgesUpdated;
+    report.edgesSkippedExisting = committed.edgesSkippedExisting;
+    report.staleRemoved = committed.staleRemoved;
+    report.problems.insert(report.problems.end(), committed.problems.begin(), committed.problems.end());
+    return report;
+}
+
+DetectorReport detail::publishDetection(objects::ObjectStore& db, const StoredGeometry& inputs, const Detection& detection,
+    const objects::util::ProgressCallback& progress, const std::atomic_bool* cancel)
+{
+    if (!detection.publish) return detection.report;
+    auto cancelled = [&] { if (cancel && cancel->load()) throw std::runtime_error(detection.detector + ": cancelled before commit"); };
+    cancelled();
+    auto txn = db.write();
+    cancelled();
+    auto report = commitDetection(db, inputs, txn, detection, progress);
+    cancelled();
+    objects::util::reportProgress(progress, "committing links");
+    txn.commit();
+    return report;
+}
+
 }  // namespace vc::object_links
