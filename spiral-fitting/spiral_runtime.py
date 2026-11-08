@@ -2801,7 +2801,7 @@ class DistributedInteractiveFitSession:
     def update_inputs(self, position, timeout=1800.0):
         """Coordinate an input update across every rank.
 
-        Every rank prepares the inputs of hub ``position`` (reading them
+        Every rank prepares the inputs of the store ``position`` (reading them
         checks that the ranks agree on their digest); a refusal by any rank
         discards every candidate and raises InputUpdateRefused, leaving the
         fit untouched. Only then does every rank release its old inputs and

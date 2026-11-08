@@ -268,8 +268,10 @@ class ObjectStoreBinding:
         except Exception as exc:  # noqa: BLE001 - reported, not fatal
             return None, f"{type(exc).__name__}: {exc}"
 
-    def advertisement(self):
-        head, error = self.head()
+    def advertisement(self, head=None):
+        """The /bindings entry; ``head`` is ``self.head()`` when the caller
+        read it already (one read per request)."""
+        head, error = head if head is not None else self.head()
         return {"uuid": self.uuid, "generation": self.generation, "location": self.location,
                 "served": self.served, "author": self.author,
                 "commit_sequence": head, "position_error": error}
@@ -314,6 +316,12 @@ def _stat_or_none(path):
 
 def default_object_store_author():
     return f"spiral-service@{socket.gethostname()}"
+
+
+# What a writable open of a store file says when vc_object_server holds it
+# (vc_object_store's OwnershipGuard); other open failures are reported as
+# they are.
+SERVED_FILE_MESSAGE = "owned by its hosting service"
 
 
 def bind_object_store(location, author=None, link_timeout_s=300):
@@ -367,7 +375,7 @@ def bind_object_store(location, author=None, link_timeout_s=300):
             pass
     except Exception as exc:
         message = str(exc)
-        if "serv" in message.lower() or "lock" in message.lower():
+        if SERVED_FILE_MESSAGE in message:
             raise ObjectStoreBindingError(
                 f"{resolved} is served by vc_object_server; bind its endpoint "
                 f"({message})") from exc
@@ -1073,11 +1081,13 @@ class ServiceState:
                     "session_checkpoints": self.session_checkpoints(),
                     "capabilities": capabilities}
         if self.object_store is not None:
-            response["object_store"] = self.object_store.advertisement()
-            response["inputs"] = self.startup_inputs(wait=False)
+            # One head read serves the advertisement and the summary's key.
+            head = self.object_store.head() if self.object_store.served else None
+            response["object_store"] = self.object_store.advertisement(head)
+            response["inputs"] = self.startup_inputs(wait=False, head=head)
         return response
 
-    def startup_inputs(self, *, wait=True):
+    def startup_inputs(self, *, wait=True, head=None):
         """What the launch configuration selects from the bound store.
 
         Patches, PCLs and fibers with their revision pins, labels, frames
@@ -1089,9 +1099,17 @@ class ServiceState:
         Reading a large store takes minutes. Without ``wait`` (GET
         /bindings) the caller never reads it: a summary not yet read for the
         store as it stands is read in the background, and meanwhile
-        ``{"pending": True}`` is returned; ask again for the result.
+        ``{"pending": True}`` is returned; ask again for the result. A served
+        store whose server cannot be reached has no summary: the result says
+        so (``{"pending": True, "error"}``), or the call fails when it waits.
+        ``head`` is the served store's ``head()`` when the caller read it.
         """
-        key = self._startup_inputs_key()
+        key, error = self._startup_inputs_key(head)
+        if key is None:
+            message = f"The service's object store cannot be read: {error}"
+            if not wait:
+                return {"pending": True, "error": message}
+            raise ApiError(HTTPStatus.SERVICE_UNAVAILABLE, message)
         with self._startup_inputs_lock:
             cached = self._startup_inputs
             if cached is not None and cached[0] == key:
@@ -1105,20 +1123,24 @@ class ServiceState:
                 return {"pending": True}
         return self._read_startup_inputs(key)
 
-    def _startup_inputs_key(self):
-        """What the startup summary is current for: a store file's size and
-        modification times, or a served store's head (one status request;
-        None when its server cannot be reached, so the next request asks
-        again)."""
+    def _startup_inputs_key(self, head=None):
+        """``(key, error)``: what the startup summary is current for (a store
+        file's size and modification times, or a served store's head, read
+        now unless ``head`` gives it), or ``(None, why)`` when a served
+        store's server cannot be reached. None is never a key: nothing is
+        cached or read for an unreachable store, and the next request asks
+        again."""
         if self.object_store.served:
-            head, _ = self.object_store.head()
-            return None if head is None else ("served", self.object_store.generation, head)
+            head, error = head if head is not None else self.object_store.head()
+            if head is None:
+                return None, error
+            return ("served", self.object_store.generation, head), None
         path = Path(self.object_store.location)
         # An empty WAL (a read-only open after the last writer closed
         # creates one) holds no writes: it keys as an absent one.
         return tuple((info.st_size, info.st_mtime_ns) if info and info.st_size else None
                      for info in (_stat_or_none(path),
-                                  _stat_or_none(Path(f"{path}-wal"))))
+                                  _stat_or_none(Path(f"{path}-wal")))), None
 
     def _read_startup_inputs(self, key):
         """Read the summary for the store as ``key`` stated it, once: a
@@ -1527,22 +1549,26 @@ class ServiceState:
                 f"{position.generation}); this service's store is {store.uuid} "
                 f"(generation {store.generation})",
                 payload={"code": INPUT_UPDATE_UNAVAILABLE})
-        head, error = store.head()
-        if head is None:
+        request_uuid = value.get("request_uuid")
+        if request_uuid is not None and (not isinstance(request_uuid, str) or not request_uuid):
+            raise ApiError(HTTPStatus.BAD_REQUEST, "request_uuid must be a string")
+        # One open (one attachment of a served store) reads the head and
+        # looks the receipt up.
+        try:
+            with store.open(read_only=True) as handle:
+                head = int(handle.status()["commit_sequence"])
+                receipt = handle.receipt(request_uuid) if request_uuid is not None else None
+        except Exception as exc:  # noqa: BLE001 - reported to the client
             raise ApiError(HTTPStatus.SERVICE_UNAVAILABLE,
-                           f"The service's object store cannot be read: {error}")
+                           f"The service's object store cannot be read: "
+                           f"{type(exc).__name__}: {exc}") from exc
         if position.commit_sequence > head:
             raise ApiError(
                 HTTPStatus.CONFLICT,
                 f"inputs_position names commit {position.commit_sequence}, after the "
                 f"service's store head {head}: these edits are not in the service's "
                 "store (a copy with the same UUID?)")
-        request_uuid = value.get("request_uuid")
         if request_uuid is not None:
-            if not isinstance(request_uuid, str) or not request_uuid:
-                raise ApiError(HTTPStatus.BAD_REQUEST, "request_uuid must be a string")
-            with store.open(read_only=True) as handle:
-                receipt = handle.receipt(request_uuid)
             if receipt is None:
                 raise ApiError(
                     HTTPStatus.CONFLICT,
@@ -1647,8 +1673,8 @@ class ServiceState:
         model and optimiser state (stage 2b).
 
         ``inputs_position`` (M) is the position the inputs must include,
-        e.g. where a client's pushed edits reached; the service links and
-        pins N at the hub head (at least M), then every rank replaces its
+        e.g. where a client's saved edits reached; the service links and
+        pins N at the store's head (at least M), then every rank replaces its
         inputs with N's at an iteration boundary. ``expected_input_generation``
         refuses an update computed against another generation than the
         session's. The response returns at once; the work runs off the HTTP

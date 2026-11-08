@@ -297,7 +297,7 @@ def adapter_metadata(kind, meta, fiber=None, track=None):
 
     With the geometry revision (points, arrays and point annotations) it is
     everything materialization reads, so its hash identifies the object's
-    input content on any replica. Other metadata (review notes, ingest
+    input content in any copy of the store. Other metadata (review notes, ingest
     diagnostics) does not reach the fit and does not change the digest.
     """
     meta = meta or {}
@@ -1482,7 +1482,7 @@ def materialize_patch_overlaps(store, snapshot, patches, *, pair_spacing,
     if not edges:
         return collections, counts
     # From the snapshot's records (the edge's pose, its endpoints' frames and
-    # geometry revisions), not the store's current state: a replica pulled
+    # geometry revisions), not the store's current state: a store that moved
     # past the snapshot's position must materialize what the digest names.
     def pinned(rel):
         a, b = rel.stored_order or (rel.a, rel.b)
@@ -2298,11 +2298,19 @@ def submit_link_plan(store, planned, author=None, progress=None, log=None, read_
     # link run may have moved the current marker on already.
     marker = _link_marker_at(store, request, (receipt.get('objects') or {}).get(vos.link_marker_uuid()))
     reports = [step['report'] for step in (marker or {}).get('detectors') or ()]
-    if marker is None or marker.get('commit_sequence') != receipt['commit_sequence'] \
-            or len(reports) != len(runs):
+    committed = receipt['commit_sequence']
+    if marker is None:
         raise LinkRefreshError([
-            f'the link marker does not describe the links committed at commit '
-            f'{receipt["commit_sequence"]}; the receipt names no marker version'])
+            f'the link marker of the links committed at commit {committed} cannot be read: '
+            'the receipt names no marker version'])
+    if marker.get('commit_sequence') != committed:
+        raise LinkRefreshError([
+            f'the link marker the receipt names records commit {marker.get("commit_sequence")}, '
+            f'not the links committed at commit {committed}'])
+    if len(reports) != len(runs):
+        raise LinkRefreshError([
+            f'the link marker of commit {committed} reports {len(reports)} detectors; '
+            f'{len(runs)} ran'])
     for outcome, report in zip(runs, reports):
         outcome.report = report
     seconds = time.monotonic() - started
@@ -2991,7 +2999,7 @@ def resume_problems(checkpoint_input_manifest, inputs, allow_changed=False, log=
         legacy = not records_content_identity(recorded)
         if legacy:
             # Written before inputs were identified by content: its object
-            # revisions name another replica's (or this one's older) records,
+            # revisions name another copy's (or this store's older) records,
             # and it holds no metadata hashes, so compare what it does hold.
             recorded, current = _geometry_identity(recorded), _geometry_identity(current)
         differences = manifest_differences(recorded, current)

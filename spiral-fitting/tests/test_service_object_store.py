@@ -395,6 +395,32 @@ def test_bindings_advertise_the_store_and_its_selection(host, filled_store):
     assert 'selected objects declare different volumes' in refused['problems'][0]
 
 
+def test_an_unreachable_served_store_has_no_summary_and_caches_none(host, monkeypatch):
+    # A served store out of reach: /bindings says so instead of pending
+    # forever, nothing is read or cached for it, and waiting callers fail.
+    # (bind_object_store's own refusal of such an endpoint is tested with a
+    # server; here its attachment attempts are stood in for, as they take
+    # seconds of retries each.)
+    def refused(*args, **kwargs):
+        raise ConnectionRefusedError('connection refused')
+    monkeypatch.setattr(spiral_service.ObjectStoreBinding, 'open', refused)
+    binding = spiral_service.ObjectStoreBinding(
+        'http://127.0.0.1:1', 'store-uuid', 'generation-1', 'svc', served=True)
+    assert binding.head() == (None, 'ConnectionRefusedError: connection refused')
+    state = spiral_service.ServiceState(
+        bindings=host.bindings, object_store=binding,
+        startup_run={'z_begin': 0, 'z_end': 10, 'config': dict(NO_DENSE)})
+    advertised = state.binding_advertisement()
+    assert advertised['object_store']['commit_sequence'] is None
+    assert advertised['object_store']['position_error']
+    assert advertised['inputs']['pending'] is True
+    assert 'cannot be read' in advertised['inputs']['error']
+    assert state._startup_inputs is None and state._startup_inputs_reading is None
+    assert 'cannot be read' in refusal(state.startup_inputs)
+    assert 'cannot be read' in refusal(state._inputs_position, {
+        'store': 'store-uuid', 'generation': 'generation-1', 'commit_sequence': 1})
+
+
 def test_bindings_never_wait_for_the_store_to_be_read(host, filled_store,
                                                      monkeypatch):
     # Reading a large store's selection takes minutes, longer than a client

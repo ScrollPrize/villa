@@ -4352,9 +4352,9 @@ if __name__ == '__main__':
         help='Object store the fit reads patch, PCL, fiber, track and '
              'outer-shell inputs from, and writes refreshed links to: a store '
              'file (.vcobj), or the endpoint of the vc_object_server serving one '
-             '(http://host:port, or ssh://host:port for a server on another '
-             "host's loopback port). A file a server holds is refused: pass "
-             'its endpoint')
+             '(http://host:port, or ssh://host:port, with sftp:// as an alias, for '
+             "a server on another host's loopback port). A file a server holds is "
+             'refused: pass its endpoint')
     parser.add_argument(
         '--object-store-author', metavar='NAME',
         default=os.environ.get('USER') or os.environ.get('USERNAME') or 'spiral-fit',
@@ -4435,11 +4435,17 @@ if __name__ == '__main__':
         # Reject inaccessible or obsolete stores before packing/loading the
         # much larger supervision volumes, opened as the fit will open it: a
         # store file a vc_object_server holds refuses the writable open a
-        # link refresh needs (bind that server's endpoint instead). This
+        # link refresh needs (bind that server's endpoint instead). A fit
+        # that reads a position (configured, or a resumed checkpoint's pins
+        # unless object_store_allow_changed_inputs relinks) never links, so
+        # it opens read-only, as FitContext._resume_input_pins does. This
         # check never refreshes links.
         from object_store_inputs import open_store
+        reads_position = (config['object_store_input_position'] is not None
+                          or (os.environ.get('FIT_SPIRAL_RESUME_PATH')
+                              and not config['object_store_allow_changed_inputs']))
         try:
-            with open_store(config, read_only=not config['object_store_refresh_links']):
+            with open_store(config, read_only=not config['object_store_refresh_links'] or reads_position):
                 pass
         except Exception as exc:
             parser.error(f'cannot open --object-store {cli_args.object_store}: {exc}')
