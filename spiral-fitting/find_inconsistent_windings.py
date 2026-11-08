@@ -246,7 +246,7 @@ def build_fit_inputs(checkpoint, object_store, volume_uuid, filter_z_begin, filt
     cfg = fs.Config().as_dict()
     # Keys the schema no longer has (an older checkpoint) are ignored.
     cfg.update({key: value for key, value in checkpoint['cfg'].items() if key in cfg})
-    cfg['object_store_path'] = object_store
+    cfg['object_store_location'] = object_store
     cfg['object_store_refresh_links'] = False
     cfg['object_store_allow_changed_inputs'] = True
     if volume_uuid is not None:

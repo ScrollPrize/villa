@@ -490,6 +490,11 @@ void bindHostedStore(nb::module_& m)
             { nb::gil_scoped_release release; bytes = self.readGeometryArray(revision, array, offset, count); }
             return bytesToPy(bytes);
         }, nb::arg("revision_uuid"), nb::arg("array_name"), nb::arg("byte_offset") = 0, nb::arg("byte_count") = std::nullopt)
+        .def("geometry_point_annotations", [](Hosted& self, const std::string& revision, const std::string& array) {
+            nlohmann::json annotations;
+            { nb::gil_scoped_release release; annotations = self.geometryPointAnnotations(revision, array); }
+            return jsonLoads(annotations.dump());
+        }, nb::arg("revision_uuid"), nb::arg("array_name"), "Per-point annotations of a sequence array, as ObjectStore's.")
         .def("select_objects", [=](Hosted& self, const nb::object& query, bool withStatus) {
             std::optional<std::vector<std::string>> fields;
             const auto selection = objectQuery(query, fields);
@@ -614,7 +619,9 @@ void bindSessionOperations(nb::class_<vo::ObjectStoreSession> session)
         }, nb::arg("location"), nb::arg("author") = std::string(), nb::arg("read_only") = false,
            "Attach a store location: a vc_object_server endpoint (http:// or https://; always writable) or a store file.")
         .def("attach_hosted", [](Session& self, const std::string& endpoint, int64_t pollIntervalMs, size_t cacheBytes,
-                                 int retries, long connectTimeoutMs, const std::string& author, long linkTimeoutS) {
+                                 int retries, long connectTimeoutMs, const std::string& author, long linkTimeoutS,
+                                 const std::optional<std::filesystem::path>& cacheDirectory,
+                                 const std::optional<int64_t>& diskCacheBytes, int64_t minFreeBytes) {
             vo::HostedSessionOptions options;
             options.author = author;
             options.pollInterval = std::chrono::milliseconds(pollIntervalMs);
@@ -622,12 +629,19 @@ void bindSessionOperations(nb::class_<vo::ObjectStoreSession> session)
             options.client.retries = retries;
             options.client.connectTimeoutMs = connectTimeoutMs;
             options.client.linkTimeoutS = linkTimeoutS;
+            if (cacheDirectory) options.cacheDirectory = *cacheDirectory;
+            options.diskCacheBytes = diskCacheBytes;
+            options.minFreeBytes = minFreeBytes;
             nb::gil_scoped_release release;
             return self.attachHosted(endpoint, options);
         }, nb::arg("endpoint"), nb::arg("poll_interval_ms") = 2000, nb::arg("cache_bytes") = vo::HostedSessionOptions{}.cacheBytes,
            nb::arg("retries") = 5, nb::arg("connect_timeout_ms") = 10000, nb::arg("author") = std::string(),
-           nb::arg("link_timeout_s") = 300,
-           "Attach a store served by vc_object_server; use the typed operations (no local callbacks).")
+           nb::arg("link_timeout_s") = 300, nb::arg("cache_directory") = std::nullopt,
+           nb::arg("disk_cache_bytes") = std::nullopt, nb::arg("min_free_bytes") = 0,
+           "Attach a store served by vc_object_server; use the typed operations (no local callbacks). "
+           "link_timeout_s: how long a link_objects request may take (the service's --request-deadline). "
+           "cache_directory: persistent cache of numbered records, geometry and annotations across processes "
+           "(HostedSessionOptions::cacheDirectory), within disk_cache_bytes and keeping min_free_bytes free.")
         .def("read_surface_grid", [](Session& self, const vo::AttachmentIdentity& attachment, const std::string& uuid,
                                      const std::string& volume, double targetScale, std::optional<int64_t> version,
                                      const std::optional<std::string>& generation) {
@@ -679,6 +693,106 @@ void bindSessionOperations(nb::class_<vo::ObjectStoreSession> session)
             return PyPackedGeometryArray{std::move(packed)};
         }, nb::arg("attachment"), nb::arg("revision_uuids"), nb::arg("array_name"),
            "Read homogeneous arrays into one verified packed buffer with row offsets (as ObjectStore.read_geometry_arrays).")
+        .def("location", &Session::location, nb::arg("attachment"), "The store file of a local attachment, or a hosted one's endpoint.")
+        .def("geometry_revision", [](Session& self, const vo::AttachmentIdentity& attachment, const std::string& revision) {
+            std::optional<vo::GeometryRevision> geometry;
+            {
+                nb::gil_scoped_release release;
+                self.readStore(attachment, [&](const vo::StoreReader& reader, const auto&) { geometry = reader.geometryRevision(revision); });
+            }
+            return toPy(geometry);
+        }, nb::arg("attachment"), nb::arg("revision_uuid"), "A geometry revision's descriptor (as ObjectStore.geometry_revision), or None.")
+        .def("read_geometry_array", [](Session& self, const vo::AttachmentIdentity& attachment, const std::string& revision,
+                                       const std::string& array, int64_t offset, const std::optional<int64_t>& count) {
+            std::vector<uint8_t> bytes;
+            {
+                nb::gil_scoped_release release;
+                self.readStore(attachment, [&](const vo::StoreReader& reader, const auto&) {
+                    bytes = reader.readGeometryArray(revision, array, offset, count);
+                });
+            }
+            return bytesToPy(bytes);
+        }, nb::arg("attachment"), nb::arg("revision_uuid"), nb::arg("array_name"), nb::arg("byte_offset") = 0,
+           nb::arg("byte_count") = std::nullopt, "Exact logical bytes of one array (as ObjectStore.read_geometry_array).")
+        .def("geometry_point_annotations", [](Session& self, const vo::AttachmentIdentity& attachment, const std::string& revision,
+                                              const std::string& array) {
+            nlohmann::json annotations;
+            {
+                nb::gil_scoped_release release;
+                self.readStore(attachment, [&](const vo::StoreReader& reader, const auto&) {
+                    annotations = reader.geometryPointAnnotations(revision, array);
+                });
+            }
+            return jsonLoads(annotations.dump());
+        }, nb::arg("attachment"), nb::arg("revision_uuid"), nb::arg("array_name"),
+           "Per-point annotations of a sequence array (as ObjectStore.geometry_point_annotations).")
+        .def("relationships_at_versions", [](Session& self, const vo::AttachmentIdentity& attachment, const nb::list& refs) {
+            const auto versions = objectVersionsFromPy(refs);
+            std::vector<vo::SelectedRelationship> revisions;
+            {
+                nb::gil_scoped_release release;
+                self.readStore(attachment, [&](const vo::StoreReader& reader, const auto&) { revisions = reader.relationshipsAt(versions); });
+            }
+            nb::list result;
+            for (const auto& revision : revisions) {
+                auto d = relationshipRevisionToPy(revision.relationship);
+                d["applicable"] = revision.applicable;
+                result.append(d);
+            }
+            return result;
+        }, nb::arg("attachment"), nb::arg("refs"), "Relationships recorded between these numbered object versions.")
+        .def("changes_since", [](Session& self, const vo::AttachmentIdentity& attachment, const nb::dict& cursor, int64_t maxChanges) {
+            const vo::FeedCursor c{nb::cast<std::string>(cursor["store"]), nb::cast<std::string>(cursor["generation"]),
+                                   nb::cast<int64_t>(cursor["sequence"]),
+                                   cursor.contains("offset") ? nb::cast<int64_t>(cursor["offset"]) : 0};
+            vo::ChangePage page;
+            {
+                nb::gil_scoped_release release;
+                self.readStore(attachment, [&](const vo::StoreReader& reader, const auto&) { page = reader.changesSince(c, maxChanges); });
+            }
+            return jsonLoads(vo::changePageToJson(page));
+        }, nb::arg("attachment"), nb::arg("cursor"), nb::arg("max_changes") = 4096, "The change feed after cursor (as ObjectStore.changes_since).")
+        .def("select_edges", [](Session& self, const vo::AttachmentIdentity& attachment, const nb::object& query) {
+            std::optional<std::vector<std::string>> fields;
+            const auto selection = vo::edgeQueryRequestFromJson(
+                nb::isinstance<nb::str>(query) ? nb::cast<std::string>(query) : jsonDumps(query), &fields);
+            std::vector<vo::EdgeRecord> records;
+            {
+                nb::gil_scoped_release release;
+                self.readStore(attachment, [&](const vo::StoreReader& reader, const auto&) { records = reader.selectEdges(selection, fields); });
+            }
+            const std::set<std::string> selected = fields ? std::set<std::string>(fields->begin(), fields->end()) : std::set<std::string>{};
+            nb::list result;
+            for (const auto& record : records) result.append(edgeToPy(record, fields ? &selected : nullptr));
+            return result;
+        }, nb::arg("attachment"), nb::arg("query"),
+           "Every edge the query (wire form, as HostedStore.select_edges; complete without a limit) selects in one read.")
+        .def("overlap_correspondences_at", [](Session& self, const vo::AttachmentIdentity& attachment, const nb::list& edges,
+                                              const std::string& volume, double spacing, std::size_t maxPairs) {
+            std::vector<vc::object_links::OverlapEdgeAt> pinned;
+            for (auto item : edges) {
+                const auto edge = nb::cast<nb::dict>(item);
+                auto text = [&](const char* key) { return nb::cast<std::string>(edge[key]); };
+                vc::object_links::OverlapEdgeAt at;
+                at.uuid = text("uuid"); at.aUuid = text("a"); at.bUuid = text("b");
+                at.wholeGeometry = nb::cast<bool>(edge["whole_geometry"]);
+                at.meta = text("meta");
+                at.aObjectMeta = text("a_object_meta"); at.bObjectMeta = text("b_object_meta");
+                at.aGeometryRevision = text("a_geometry_revision");
+                at.bGeometryRevision = text("b_geometry_revision");
+                pinned.push_back(std::move(at));
+            }
+            const vc::object_links::OverlapCorrespondenceParams p{volume, spacing, maxPairs};
+            std::vector<vc::object_links::OverlapCorrespondences> results;
+            {
+                nb::gil_scoped_release release;
+                self.readStore(attachment, [&](const vo::StoreReader& reader, const auto&) {
+                    results = vc::object_links::materializeOverlapCorrespondences(reader, pinned, p);
+                });
+            }
+            return overlapCorrespondencesToPy(results);
+        }, nb::arg("attachment"), nb::arg("edges"), nb::arg("volume_uuid"), nb::arg("spacing") = 8.0, nb::arg("max_pairs") = 256,
+           "ObjectStore.overlap_correspondences_at over any attachment: the pinned geometry revisions are read through it.")
         .def("create_surface", [](Session& self, const vo::AttachmentIdentity& attachment, const std::string& name,
                                   const std::vector<std::string>& tags, const nb::object& coordinates, const std::string& tool,
                                   const nb::object& parameters, const std::vector<std::string>& sources, const nb::object& meta,

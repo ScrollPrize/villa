@@ -33,8 +33,9 @@ _NULL_TYPES = {
     "track_max_tortuosity": "number",
     "loss_start_track_dt": "integer",
     "loss_start_unattached_pcl_dt": "integer",
-    "object_store_path": "string",
+    "object_store_location": "string",
     "object_store_author": "string",
+    "object_store_link_timeout_s": "integer",
     "object_store_input_position": "mapping",
     "object_store_patch_uuids": "strings",
     "object_store_patch_tags": "strings",
@@ -279,8 +280,9 @@ _RUN_MUTABLE_PCL_KEYS = frozenset({
 # The object-store input selection and frames decide what host preparation
 # reads, refreshes and materializes (object_store_inputs.load_fit_inputs).
 OBJECT_STORE_INPUT_KEYS = frozenset({
-    "object_store_path",
+    "object_store_location",
     "object_store_author",
+    "object_store_link_timeout_s",
     "object_store_input_position",
     "object_store_refresh_links",
     "object_store_full_link_refresh",
@@ -666,13 +668,19 @@ class Config:
         # object_store_author, unless refresh_links is off; approved_links_only
         # consumes only approved relationships. A checkpoint resumes only
         # against identical inputs and frames unless allow_changed_inputs.
-        self.object_store_path = None
+        # A store file on this host, or the endpoint of the vc_object_server
+        # serving one (object_store_inputs.open_store).
+        self.object_store_location = None
         self.object_store_author = None
-        # On a hosted replica the inputs are a hub position (a journal
-        # sequence on the store's hub). None links and pins the hub head at
-        # load (object_store_inputs.prepare_position); a position is read
-        # exactly as pinned, without linking. The service sets it from the
-        # position it prepared; a client never does.
+        # How long one link_objects request of a served store may take: its
+        # detectors run on the server, which answers when they are done. Set
+        # with the server's --request-deadline; None is the default 300 s.
+        self.object_store_link_timeout_s = None
+        # The inputs are a position of the store ({store, generation,
+        # commit_sequence}). None links and pins the store's head at load
+        # (object_store_inputs.prepare_position); a position is read exactly
+        # as pinned, without linking. The service sets it from the position
+        # it prepared; a client never does.
         self.object_store_input_position = None
         self.object_store_refresh_links = True
         # A refresh skips the detectors when the store's link marker shows the

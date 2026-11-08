@@ -35,7 +35,7 @@ SESSION = 'spiral-1-0123456789'
 def _fit(binding, tmp_path):
     """A service bound to ``binding``, with a stand-in session whose inputs
     were read (linked and pinned) from its store."""
-    config = fit_config(binding.path, object_store_author='svc')
+    config = fit_config(binding.location, object_store_author='svc')
     inputs = osi.load_fit_inputs(config, log=lambda line: None)
     assert inputs.manifest['position'] is not None
     output = tmp_path / 'output'
@@ -64,7 +64,7 @@ def _fit(binding, tmp_path):
         return state.artifacts.register_directory(
             'spiral-preview', SESSION, number, root, 'manifest.json',
             delete_root_on_prune=True)['id']
-    return SimpleNamespace(state=state, store=binding.path, config=config, inputs=inputs,
+    return SimpleNamespace(state=state, store=binding.location, config=config, inputs=inputs,
                            status=status, generation=generation, output=output)
 
 

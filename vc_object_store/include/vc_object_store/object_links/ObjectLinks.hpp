@@ -16,6 +16,7 @@
 #include <vector>
 
 #include "vc_object_store/objects/ObjectStore.hpp"
+#include "vc_object_store/objects/StoreReader.hpp"
 #include "vc_object_store/Progress.hpp"
 
 namespace vc::object_links {
@@ -247,6 +248,11 @@ struct OverlapEdgeAt {
 // store's current ones (the revisions must be in this store); otherwise as
 // above.
 std::vector<OverlapCorrespondences> materializeOverlapCorrespondences(objects::ObjectStore& db,
+    const std::vector<OverlapEdgeAt>& edges, const OverlapCorrespondenceParams& params);
+// The same over any reader (a session's local or hosted attachment): the
+// geometry revisions are read through it, so a hosted client materializes
+// pinned overlaps without a server route.
+std::vector<OverlapCorrespondences> materializeOverlapCorrespondences(const objects::StoreReader& reader,
     const std::vector<OverlapEdgeAt>& edges, const OverlapCorrespondenceParams& params);
 
 // Fiber/track-to-surface strips have stripRowsEachSide rows at stripSpacing

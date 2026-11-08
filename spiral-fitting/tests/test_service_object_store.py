@@ -74,8 +74,9 @@ def test_binding_resolves_the_store_once_and_records_its_uuid(store_path, tmp_pa
         assert binding.uuid == db.uuid
         assert binding.generation == db.status()['generation']
     assert binding.location == str(Path(store_path).resolve()) and not binding.served
-    assert binding.config() == {'object_store_path': binding.location,
+    assert binding.config() == {'object_store_location': binding.location,
                                 'object_store_author': 'svc',
+                                'object_store_link_timeout_s': 300,
                                 'object_store_input_position': None}
     assert spiral_service.bind_object_store(store_path).author.startswith('spiral-service@')
     garbage = tmp_path / 'garbage.vcobj'
@@ -106,10 +107,10 @@ def test_clients_cannot_choose_the_binding_or_host_input_paths(host, store_path,
     # values (an echoed session request) are not a choice.
     for request in (state.startup_session_request(),
                     {'run': {'z_begin': 0, 'z_end': 10, 'config': {
-                        **NO_DENSE, 'object_store_path': None,
+                        **NO_DENSE, 'object_store_location': None,
                         'object_store_author': 'spiral-test'}}}):
         paths, run, _, _ = state._prepare_session_request(with_project(request))
-        assert run.config['object_store_path'] == state.object_store.path
+        assert run.config['object_store_location'] == state.object_store.location
         assert run.config['object_store_author'] == 'spiral-test'
         assert not {'verified_patches', 'fibers', 'pcls'} & set(paths.manifest())
     # The winding-inference artifact is bound at launch, not named by a request.
@@ -129,7 +130,7 @@ def test_the_binding_wins_over_a_resumed_checkpoints_store(host, store_path,
     from spiral_runtime import InteractiveFitSession
 
     stored = Config().as_dict()
-    stored.update(object_store_path='/written/against/another.vcobj',
+    stored.update(object_store_location='/written/against/another.vcobj',
                   object_store_author='someone-else')
     monkeypatch.setattr(checkpoint_io, 'load_checkpoint_cpu',
                         lambda path: {'cfg': copy.deepcopy(stored)})
@@ -148,7 +149,7 @@ def test_the_binding_wins_over_a_resumed_checkpoints_store(host, store_path,
     session._progress_reporter = lambda: NullProgressReporter()
     session._publish_status = lambda: None
     config = session._resolve_session_config(1)
-    assert config['object_store_path'] == state.object_store.path
+    assert config['object_store_location'] == state.object_store.location
     assert config['object_store_author'] == 'spiral-test'
 
 

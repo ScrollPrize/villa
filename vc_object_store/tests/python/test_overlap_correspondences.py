@@ -183,3 +183,46 @@ def test_pairs_from_an_earlier_state_ignore_later_changes(db):
     db.remove_edge(edge["uuid"])
     assert db.overlap_correspondences([edge["uuid"]], VOLUME)[0]["error"] == "edge not found"
     assert db.overlap_correspondences_at([then], VOLUME) == [before]
+
+
+def test_pinned_pairs_read_through_a_session_attachment(db, db_path, tmp_path):
+    """overlap_correspondences_at over an ObjectStoreSession attachment reads
+    the pinned revisions through its reader: a local attachment and, when a
+    vc_object_server is at hand, a hosted one give the store's own pairs."""
+    import os
+    import re
+    import subprocess
+    import vc_object_store as vos
+    from vc_object_store.locations import open_store
+
+    edge, _ = overlapping_pair(db)
+    then = {"uuid": edge["uuid"], "a": edge["a"], "b": edge["b"], "whole_geometry": True,
+            "meta": json.dumps(edge["meta"]),
+            **{f"{side}_object_meta": json.dumps(db.object(edge[side])["meta"]) for side in "ab"},
+            **{f"{side}_geometry_revision": db.current_geometry(edge[side])["uuid"] for side in "ab"}}
+    expected = db.overlap_correspondences_at([then], VOLUME)
+    assert expected[0]["error"] is None and expected[0]["pairs"]
+    db.close()
+
+    session = vos.ObjectStoreSession()
+    local = session.attach(db_path, "pytest", read_only=True)
+    try:
+        assert session.overlap_correspondences_at(local, [then], VOLUME) == expected
+    finally:
+        session.detach(local)
+
+    server_binary = os.environ.get("VC_OBJECT_SERVER")
+    if not server_binary:
+        pytest.skip("set VC_OBJECT_SERVER to a vc_object_server binary for the hosted half")
+    server = subprocess.Popen([server_binary, db_path, "--port", "0"], stderr=subprocess.PIPE, text=True)
+    try:
+        port = re.search(r":(\d+)\s*$", server.stderr.readline())
+        assert port
+        endpoint = f"http://127.0.0.1:{port.group(1)}"
+        with open_store(endpoint, author="pytest", cache_directory=tmp_path / "cache") as hosted:
+            assert hosted.overlap_correspondences_at([then], VOLUME) == expected
+            # The same edge again is answered from the attachment's cache.
+            assert hosted.overlap_correspondences_at([then], VOLUME) == expected
+    finally:
+        server.terminate()
+        assert server.wait(timeout=30) == 0

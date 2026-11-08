@@ -228,9 +228,9 @@ private slots:
         QTRY_VERIFY_WITH_TIMEOUT(manager.storeBinding().sameFile, 10000);
         QVERIFY(manager.storeBinding().matches() && !manager.storeBinding().serviceServed
                 && manager.storeBinding().canUpdate());
-        QTRY_VERIFY_WITH_TIMEOUT(manager.serviceOwnedKeys().contains(QStringLiteral("object_store_path")), 10000);
+        QTRY_VERIFY_WITH_TIMEOUT(manager.serviceOwnedKeys().contains(QStringLiteral("object_store_location")), 10000);
 
-        const auto request = protocolRequest({{"object_store_path", "/elsewhere.vcobj"}});
+        const auto request = protocolRequest({{"object_store_location", "/elsewhere.vcobj"}});
         editSurface(*session, attachment, surface, 2);
         // A save receipt belongs to the store attached when it was saved:
         // one of another store is not sent with this store's update (the

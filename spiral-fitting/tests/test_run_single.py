@@ -192,9 +192,9 @@ def test_overwrite_refuses_output_containing_object_store(tmp_path, symlink):
     store = args.output / "inputs.vcobj"
     store.write_bytes(b"preserve object store")
     if symlink:
-        args.object_store.symlink_to(store)
+        Path(args.object_store).symlink_to(store)
     else:
-        args.object_store = store
+        args.object_store = str(store)
 
     with pytest.raises(ValueError, match="containing an input"):
         run_single.run(args)
@@ -299,7 +299,7 @@ def _runner_args(tmp_path, *extra):
         "--output", str(tmp_path / "output"),
         *extra,
     ])
-    if args.resume and not args.object_store.exists():
+    if args.resume and not Path(args.object_store).exists():
         vos = pytest.importorskip("vc_object_store")
         vos.ObjectStore.create(str(args.object_store), author="pytest").close()
     return args
@@ -437,11 +437,11 @@ def test_completed_fit_resume_checks_store_identity(tmp_path, store_change):
             vos = pytest.importorskip("vc_object_store")
             vos.ObjectStore.create(str(destination), author="pytest").close()
         elif store_change == "relocated":
-            args.object_store.rename(destination)
+            Path(args.object_store).rename(destination)
         else:
             import shutil
             shutil.copyfile(args.object_store, destination)
-        args.object_store = destination
+        args.object_store = str(destination)
     run_single._atomic_write_json(state_path, state)
     resumed = run_single._resume_invocation(args, {}, "project", "entity")
 

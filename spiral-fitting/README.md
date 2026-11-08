@@ -369,8 +369,12 @@ to update a store; edit objects through the store's API instead.
 ### Running a fit
 
 The command-line fit reads its inputs from the store named by `--object-store`
-(required; the config keys `object_store_path` and `object_store_author` are
-set from the command line, and `FIT_SPIRAL_CONFIG_OVERRIDES` cannot name them):
+(required: a store file, or the endpoint of the `vc_object_server` serving one,
+`http://host:port` or `ssh://host:port`; the config keys `object_store_location`,
+`object_store_author` and `object_store_link_timeout_s` are set from the command
+line, and `FIT_SPIRAL_CONFIG_OVERRIDES` cannot name them). A served store links
+on its server, so `--object-store-link-timeout` must cover the longest link
+refresh (the server's `--request-deadline`):
 
 ```sh
 FIT_SPIRAL_CONFIG_OVERRIDES='{"z_begin": 9000, "z_end": 9100}' \
@@ -880,9 +884,13 @@ renamed project, another Lasagna dataset) rereads everything.
 
 ### Object store, positions and input updates
 
-`--object-store STORE.vcobj` binds the service to one store for its lifetime;
-`--object-store-author NAME` names the author of the links it writes (default
-`spiral-service@<host>`). `object_store_path`, `object_store_author` and
+`--object-store STORE` binds the service to one store location for its lifetime:
+a store file on its host, or the endpoint of the `vc_object_server` serving one
+(a file a server holds is refused; bind its endpoint). `--object-store-author
+NAME` names the author of the links it writes (default `spiral-service@<host>`)
+and `--object-store-link-timeout SECONDS` how long a served store's link refresh
+may take (its server's `--request-deadline`). `object_store_location`,
+`object_store_author`, `object_store_link_timeout_s` and
 `object_store_input_position` are service-owned configuration: `/configuration`
 lists them under `service_owned`, a request that leaves them out or repeats
 the bound values is accepted, and a request naming another value is refused.

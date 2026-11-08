@@ -237,11 +237,20 @@ from surface_orientation import spiral_outward_sense_for
 # /bindings advertises capabilities.commits. Default and tag selections
 # leave spiral-fit surfaces out, and naming one as an input is refused.
 # 47: no hubs; positions are commits of one store. A service binds one
-# store (a file on its host, or in a later stage the endpoint of the
-# vc_object_server holding it), which clients attach as well; /bindings'
-# object_store carries its uuid, history "generation", "location",
-# "served" and "commit_sequence" (the head, or "position_error"), and no
-# "hub" or "positions". A position is {store, generation, commit_sequence};
+# store location (--object-store: a file on its host, or the endpoint of
+# the vc_object_server holding it, http:// or ssh://), which clients attach
+# as well; every read, link refresh and commit goes through that location.
+# /bindings' object_store carries its uuid, history "generation",
+# "location", "served" and "commit_sequence" (the head, or
+# "position_error"), and no "hub" or "positions". The service-owned
+# configuration is object_store_location, object_store_author,
+# object_store_link_timeout_s (--object-store-link-timeout: how long a
+# served store's link refresh may take, the server's --request-deadline)
+# and object_store_input_position. A served store's link refresh reports
+# no detector progress (one "linking" stage), and its fiber-patch normal
+# source (a Lasagna pack or CT path) is read by the server, which must
+# reach it; input_summary names the source used ("fiber_patch_normals").
+# A position is {store, generation, commit_sequence};
 # a request's "inputs_position" is one of the service's store at or below
 # its head, with the "request_uuid" of the client's last save receipt when
 # it has one, which the service's store must hold (a copy with the same

@@ -84,6 +84,7 @@ struct SamplePoint {
 
 struct LoadedSurface {
     std::string uuid;
+    std::string revision; // the geometry revision loaded (overlap correspondences)
     std::shared_ptr<SurfaceGrid> grid;
     const cv::Mat_<cv::Vec3f>* points = nullptr; // stable for this read-only detector run
     nlohmann::json coordinateProvenance;
@@ -152,13 +153,13 @@ std::optional<cv::Vec3f> sampleXyz(const LoadedSurface& surface, Vec2 uv)
                      interp(p00[2], p10[2], p01[2], p11[2])};
 }
 
-std::optional<LoadedSurface> loadSurface(detail::StoredGeometry& inputs, const objects::ObjectRecord& object, const SurfaceOverlapParams& params,
-                                     DetectorReport& report, double sourceScale,
+std::optional<LoadedSurface> loadSurface(const detail::GeometryLoader& load, const objects::ObjectRecord& object,
+                                     const SurfaceOverlapParams& params, DetectorReport& report, double sourceScale,
                                      const std::optional<std::string>& geometryRevision = std::nullopt)
 {
     LoadedSurface surface;
     try {
-        surface.grid = detail::scaledSurfaceGrid(detail::surfaceGrid(inputs.load(object, geometryRevision)), sourceScale,
+        surface.grid = detail::scaledSurfaceGrid(detail::surfaceGrid(load(object, geometryRevision)), sourceScale,
                                                  params.volumeUuid.has_value());
         surface.coordinateProvenance = detail::coordinateProvenance(object, params);
         surface.uuid = object.uuid;
@@ -676,6 +677,10 @@ detail::Detection detail::detectSurfaceOverlaps(StoredGeometry& inputs,
     const auto fresh = detail::newAmong(params.newUuids, {&selected}, "surface-overlap");
     const auto scales = detail::coordinateScales(selected, params);
     std::set<std::string> failed; // surfaces that could not be loaded (their edges stay)
+    const detail::GeometryLoader loader = [&inputs](const objects::ObjectRecord& object,
+                                                    const std::optional<std::string>& revision) {
+        return inputs.load(object, revision);
+    };
 
     // An incremental run loads the new surfaces and the selected surfaces
     // whose stored bounds come within the pair search's bbox pad of one.
@@ -711,7 +716,7 @@ detail::Detection detail::detectSurfaceOverlaps(StoredGeometry& inputs,
             return detection;
         }
         PhaseTimer loadingTimer(profile.enabled ? &profile.loading : nullptr);
-        if (auto loaded = loadSurface(inputs, object, params, report, scales.at(object.uuid))) {
+        if (auto loaded = loadSurface(loader, object, params, report, scales.at(object.uuid))) {
             surfaces.push_back(std::move(*loaded));
             seedIndex.push_back(fresh ? selectionIndex[oi] : surfaces.size() - 1);
         } else failed.insert(object.uuid);
@@ -890,8 +895,8 @@ struct OverlapEdgeView {
 
 class OverlapMaterializer {
 public:
-    OverlapMaterializer(objects::ObjectStore& db, const OverlapCorrespondenceParams& params)
-        : db_(db), params_(params), inputs_(db)
+    OverlapMaterializer(detail::GeometryLoader load, const OverlapCorrespondenceParams& params)
+        : load_(std::move(load)), params_(params)
     {
         if (params.volumeUuid.empty()) throw std::invalid_argument("overlap correspondences: volumeUuid is required");
         if (!(params.spacing > 0) || !std::isfinite(params.spacing) || params.maxPairs == 0)
@@ -899,7 +904,6 @@ public:
         loading_.volumeUuid = params.volumeUuid;
         loading_.sampleSpacing = params.spacing;
     }
-    detail::StoredGeometry& inputs() { return inputs_; }
 
     // Throws the edge's error; `out` names the edge and its endpoints.
     void materialize(const std::function<OverlapEdgeView()>& read, OverlapCorrespondences& out)
@@ -956,8 +960,8 @@ public:
         if (agreeing.empty()) throw std::runtime_error("no agreeing correspondences under the stored pose");
         const auto count = std::min(agreeing.size(), params_.maxPairs);
         for (size_t i = 0; i < count; ++i) out.pairs.push_back(agreeing[i * agreeing.size() / count]);
-        out.aGeometryRevision = revisionOf(edge.aUuid, edge.aGeometryRevision);
-        out.bGeometryRevision = revisionOf(edge.bUuid, edge.bGeometryRevision);
+        out.aGeometryRevision = a.revision;
+        out.bGeometryRevision = b.revision;
     }
 
 private:
@@ -974,20 +978,22 @@ private:
             throw std::runtime_error(object.uuid + ": " + error.what());
         }
         DetectorReport report;
-        auto loaded = loadSurface(inputs_, object, loading_, report, scale, revision);
+        std::string loadedRevision;
+        const detail::GeometryLoader load = [&](const objects::ObjectRecord& record, const std::optional<std::string>& named) {
+            auto snapshot = load_(record, named);
+            loadedRevision = snapshot.revision.uuid;
+            return snapshot;
+        };
+        auto loaded = loadSurface(load, object, loading_, report, scale, revision);
         if (!loaded)
             throw std::runtime_error(report.problems.empty() ? object.uuid + ": surface could not be loaded"
                                                              : report.problems.front());
+        loaded->revision = loadedRevision;
         return surfaces_.emplace(key, std::move(*loaded)).first->second;
     }
-    std::string revisionOf(const std::string& uuid, const std::optional<std::string>& revision)
-    {
-        return revision ? *revision : db_.currentGeometry(inputs_.txn(), uuid)->uuid;
-    }
 
-    objects::ObjectStore& db_;
+    detail::GeometryLoader load_;
     const OverlapCorrespondenceParams& params_;
-    detail::StoredGeometry inputs_;
     SurfaceOverlapParams loading_;
     std::map<std::string, LoadedSurface> surfaces_;
 };
@@ -1015,8 +1021,11 @@ std::vector<OverlapCorrespondences> materializeEach(OverlapMaterializer& materia
 std::vector<OverlapCorrespondences> materializeOverlapCorrespondences(objects::ObjectStore& db,
     const std::vector<std::string>& edgeUuids, const OverlapCorrespondenceParams& params)
 {
-    OverlapMaterializer materializer(db, params);
-    auto& inputs = materializer.inputs();
+    detail::StoredGeometry inputs(db);
+    OverlapMaterializer materializer(
+        [&inputs](const objects::ObjectRecord& object, const std::optional<std::string>& revision) {
+            return inputs.load(object, revision);
+        }, params);
     return materializeEach<std::string>(materializer, edgeUuids, [](const std::string& id) { return id; },
         [&](const std::string& id) {
             const auto edge = db.edgeByUuid(inputs.txn(), id);
@@ -1031,10 +1040,10 @@ std::vector<OverlapCorrespondences> materializeOverlapCorrespondences(objects::O
         });
 }
 
-std::vector<OverlapCorrespondences> materializeOverlapCorrespondences(objects::ObjectStore& db,
-    const std::vector<OverlapEdgeAt>& edges, const OverlapCorrespondenceParams& params)
+namespace {
+std::vector<OverlapCorrespondences> materializePinned(OverlapMaterializer& materializer,
+    const std::vector<OverlapEdgeAt>& edges)
 {
-    OverlapMaterializer materializer(db, params);
     return materializeEach<OverlapEdgeAt>(materializer, edges, [](const OverlapEdgeAt& edge) { return edge.uuid; },
         [](const OverlapEdgeAt& edge) {
             OverlapEdgeView view;
@@ -1052,6 +1061,28 @@ std::vector<OverlapCorrespondences> materializeOverlapCorrespondences(objects::O
             view.bGeometryRevision = edge.bGeometryRevision;
             return view;
         });
+}
+}  // namespace
+
+std::vector<OverlapCorrespondences> materializeOverlapCorrespondences(objects::ObjectStore& db,
+    const std::vector<OverlapEdgeAt>& edges, const OverlapCorrespondenceParams& params)
+{
+    detail::StoredGeometry inputs(db);
+    OverlapMaterializer materializer(
+        [&inputs](const objects::ObjectRecord& object, const std::optional<std::string>& revision) {
+            return inputs.load(object, revision);
+        }, params);
+    return materializePinned(materializer, edges);
+}
+
+std::vector<OverlapCorrespondences> materializeOverlapCorrespondences(const objects::StoreReader& reader,
+    const std::vector<OverlapEdgeAt>& edges, const OverlapCorrespondenceParams& params)
+{
+    OverlapMaterializer materializer(
+        [&reader](const objects::ObjectRecord& object, const std::optional<std::string>& revision) {
+            return detail::loadGeometrySnapshot(reader, object, revision);
+        }, params);
+    return materializePinned(materializer, edges);
 }
 
 }  // namespace vc::object_links

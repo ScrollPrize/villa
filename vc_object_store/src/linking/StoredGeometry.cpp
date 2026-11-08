@@ -108,26 +108,46 @@ objects::VersionSelection StoredGeometry::expectations() const
     for (const auto& [uuid, version] : versions_) result.emplace(uuid, version);
     return result;
 }
-objects::detail::GeometrySnapshot StoredGeometry::load(const objects::ObjectRecord& object,
-    const std::optional<std::string>& named)
+namespace {
+// The arrays a detector reads of `object`'s geometry at `revision` (its
+// current one, or the one `named`), through `readArray`; `checked` sees the
+// revision once it is accepted, before its arrays are read.
+template <class ReadArray, class Checked>
+objects::detail::GeometrySnapshot snapshotOf(const objects::ObjectRecord& object,
+    std::optional<objects::GeometryRevision> revision, const std::optional<std::string>& named,
+    const ReadArray& readArray, const Checked& checked)
 {
-    const auto revision = named ? db_.geometryRevision(txn(), *named) : db_.currentGeometry(txn(), object.uuid);
     if (named && (!revision || revision->objectUuid != object.uuid))
         throw std::runtime_error("object " + object.uuid + " has no geometry revision " + *named + " in this store");
     if (!revision) throw std::runtime_error("object " + object.uuid + " has no stored geometry; ingest it before discovery");
     if (revision->formatVersion != 1 || revision->coordinateSystem != "source_xyz" || revision->kind != object.kind)
         throw std::runtime_error("unsupported stored geometry for " + object.uuid);
-    revisions_[object.uuid] = revision->uuid;
+    checked(*revision);
     objects::detail::GeometrySnapshot result;
     result.revision = *revision;
     const std::vector<std::string> names = object.kind == "fiber" ? std::vector<std::string>{"control_points", "line_points"}
         : object.kind == "point_collection" ? std::vector<std::string>{"points", "point_ids"} : std::vector<std::string>{"points"};
-    for (const auto& name : names) result.arrays[name] = db_.readGeometryArray(txn(), revision->uuid, name);
+    for (const auto& name : names) result.arrays[name] = readArray(revision->uuid, name);
     if (object.kind == "surface")
         for (const auto& array : revision->arrays)
             if (array.name == objects::detail::surfaceValidChannel)
-                result.arrays[array.name] = db_.readGeometryArray(txn(), revision->uuid, array.name);
+                result.arrays[array.name] = readArray(revision->uuid, array.name);
     return result;
+}
+}  // namespace
+objects::detail::GeometrySnapshot StoredGeometry::load(const objects::ObjectRecord& object,
+    const std::optional<std::string>& named)
+{
+    return snapshotOf(object, named ? db_.geometryRevision(txn(), *named) : db_.currentGeometry(txn(), object.uuid),
+        named, [&](const std::string& revision, const std::string& name) { return db_.readGeometryArray(txn(), revision, name); },
+        [&](const objects::GeometryRevision& revision) { revisions_[object.uuid] = revision.uuid; });
+}
+objects::detail::GeometrySnapshot loadGeometrySnapshot(const objects::StoreReader& reader,
+    const objects::ObjectRecord& object, const std::optional<std::string>& named)
+{
+    return snapshotOf(object, named ? reader.geometryRevision(*named) : reader.currentGeometry(object.uuid), named,
+        [&](const std::string& revision, const std::string& name) { return reader.readGeometryArray(revision, name); },
+        [](const objects::GeometryRevision&) {});
 }
 void StoredGeometry::validate(const objects::WriteTxn& txn) const
 {

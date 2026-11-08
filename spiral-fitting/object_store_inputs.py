@@ -18,12 +18,16 @@ the fitter's runtime inputs in three stages:
 The store's automatic detectors are authoritative: their relationships are
 consumed as they are, never relinked by proximity here.
 
-    python object_store_inputs.py STORE.vcobj [--volume V] \
+    python object_store_inputs.py STORE [--volume V] \
         [--z-begin Z0 --z-end Z1 [--config FIT.json]]
 
 prints the selection's report without training. Given a z window it also
 materializes and derives the training views exactly as a fit with that
 configuration would, failing on the same validation errors.
+
+STORE, like the fit configuration's object_store_location, is a store file
+or the endpoint of the vc_object_server serving one (open_store): every
+read, the link refresh and the pins work alike on both.
 """
 import argparse
 import contextlib
@@ -677,6 +681,10 @@ def _records_at_position(store, position):
     publication time of the position's commit, so it reads the change feed
     for that one commit (changes_since)."""
     status = store.status()
+    if not hasattr(store, 'versions_at'):
+        raise ObjectStoreInputError([
+            f'the state of a served store at {position.describe()} cannot be read without '
+            'the object versions pinned there; update the fit\'s inputs to a current position'])
     cursor = {'store': position.store, 'generation': position.generation,
               'sequence': position.commit_sequence - 1}
     page = store.changes_since(cursor, max_changes=1)
@@ -914,6 +922,47 @@ def store_location(store):
         if location:
             return str(location)
     return ''
+
+
+def is_served(store):
+    """Whether a store handle reads a store served by vc_object_server (the
+    detectors of its link requests run there) rather than a store file."""
+    return bool(getattr(store, 'endpoint', None))
+
+
+# Under the fit's cache directory: the fiber strips a local link refresh
+# keeps between runs, and a served store's persistent cache of the numbered
+# records and geometry it read (HostedSessionOptions::cacheDirectory).
+STRIP_CACHE_DIRECTORY = 'object_store_strips'
+HOSTED_CACHE_DIRECTORY = 'object_store_hosted'
+
+
+@contextlib.contextmanager
+def open_store(config, *, read_only=False, cache_directory=None):
+    """The store ``object_store_location`` names, for the block
+    (vc_object_store.locations.open_store): a store file opened read-only
+    or as ``object_store_author``, or a served store attached as that author
+    with ``object_store_link_timeout_s`` for its link requests and, under
+    ``cache_directory`` (the fit's cache), a persistent cache of what it
+    reads. Both give the same reading and request methods."""
+    from vc_object_store.locations import open_store as open_location
+    location = config['object_store_location']
+    if not location:
+        raise ObjectStoreInputError(['object_store_location is not configured'])
+    hosted_cache = os.path.join(cache_directory, HOSTED_CACHE_DIRECTORY) if cache_directory else None
+    with open_location(location, author=config['object_store_author'], read_only=read_only,
+                       link_timeout_s=int(config['object_store_link_timeout_s'] or 300),
+                       cache_directory=hosted_cache) as store:
+        yield store
+
+
+def strip_cache_directory(store, cache_directory):
+    """The fiber strip cache a link refresh of ``store`` uses: under the
+    fit's ``cache_directory`` for a store file; none for a served store,
+    whose server keeps its own (its --strip-cache)."""
+    if not cache_directory or is_served(store):
+        return None
+    return os.path.join(cache_directory, STRIP_CACHE_DIRECTORY)
 
 
 # ---------------------------------------------------------------------------
@@ -2231,6 +2280,11 @@ def submit_link_plan(store, planned, author=None, progress=None, log=None, read_
             log(f'link refresh {outcome.detector}: running ({outcome.mode})')
     started = time.monotonic()
     request = link_request(store.status(), planned.plan, author, read_versions)
+    if progress is not None and is_served(store):
+        # The detectors run on vc_object_server, which reports no progress
+        # over the wire: one stage shows the request is running.
+        progress.begin('linking', 'link refresh on the store\'s server',
+                       detail='no progress is reported until it answers')
     try:
         receipt = store.submit(request, progress=_plan_progress(progress))
     except vos.PreparationFailed as error:
@@ -2525,11 +2579,18 @@ def _refresh(store, snapshot, config, lasagna, cache_directory, log, *, head, in
     object_store_full_link_refresh forces a full refresh. ``head`` is the
     store's commit the snapshot was read at. A conflict (a commit touching
     a read object or the marker between the detectors' snapshot and their
-    commit) propagates for the caller to relink."""
+    commit) propagates for the caller to relink. ``cache_directory`` is the
+    fit's cache (strip_cache_directory)."""
     normal = fiber_normal_source(config, lasagna, snapshot.volume_uuid)
     log(normal.describe())
     if normal.note:
         log(normal.note)
+    if normal.kind != 'none' and is_served(store):
+        # The detectors run on the server, which reads the source itself (a
+        # pack directory or CT path readable there); an unavailable one
+        # fails the refresh, and nothing is written.
+        log('fiber-patch normals are read by the store\'s server (the source must be '
+            'readable there; no fallback)')
     selection = link_marker_selection(snapshot)
     key_parts = link_marker_key_parts(snapshot.volume_uuid, config, normal)
     position = snapshot.position
@@ -2553,7 +2614,7 @@ def _refresh(store, snapshot, config, lasagna, cache_directory, log, *, head, in
     marker = {'version': LINK_MARKER_VERSION, 'store': position.store,
               'generation': position.generation, 'key': content_sha256(key_parts),
               'key_parts': key_parts, 'exact': plan.mode == 'full', 'selection': selection}
-    planned = link_plan(snapshot, config, normal, cache_directory,
+    planned = link_plan(snapshot, config, normal, strip_cache_directory(store, cache_directory),
                         new=plan.new if plan.mode == 'incremental' else None, marker=marker)
     started = time.monotonic()
     pins = snapshot.pins()
@@ -2616,15 +2677,12 @@ def _startup_phase(config, request, lasagna, cache_directory, log, minimum_posit
     update knows) names the position to read exactly. Returns
     ``(SelectedObjects, report lines, InputPins)``; raises
     ObjectStoreInputError on any failure."""
-    from vc_object_store import ObjectStore
-
     author = config['object_store_author']
-    location = config['object_store_path']
     pinned = pins if pins is not None else InputPins.from_provenance(config['object_store_input_position'])
     if pinned is not None:
         # Prepared already (the service linked and pinned it, or a checkpoint
         # recorded it): read it exactly.
-        with ObjectStore.open(location, read_only=True) as store:
+        with open_store(config, read_only=True, cache_directory=cache_directory) as store:
             check_position(store, pinned.position)
             selected = resolve_selection(store, dataclasses.replace(request, pins=pinned))
         return selected, [f'reading pinned {pinned.position.describe()}'], selected.pins()
@@ -2633,8 +2691,8 @@ def _startup_phase(config, request, lasagna, cache_directory, log, minimum_posit
         raise ObjectStoreInputError([
             'object_store_author is required to refresh links '
             '(or set object_store_refresh_links false)'])
-    options = {'author': author} if refresh else {'read_only': True}
-    with ObjectStore.open(location, **options) as store, _console_progress() as progress:
+    with open_store(config, read_only=not refresh, cache_directory=cache_directory) as store, \
+            _console_progress() as progress:
         prepared = prepare_position(store, config, request, lasagna=lasagna,
                                     minimum=minimum_position, cache_directory=cache_directory,
                                     log=log, progress=progress)
@@ -2692,8 +2750,10 @@ def prepare_position(store, config, request, *, lasagna=None, minimum=None,
     links at the head are current, and, with ``incremental`` (an input
     update), link only objects selected since it (_refresh). ``progress``
     (a spiral_progress.ProgressReporter) receives the detectors' progress.
-    Works alike on a store file and a served store: the detectors run
-    where the store is (in this process, or on vc_object_server).
+    ``cache_directory`` is the fit's cache, where a local refresh keeps its
+    fiber strips (strip_cache_directory). Works alike on a store file and a
+    served store (open_store): the detectors run where the store is (in
+    this process, or on vc_object_server, which reports no progress).
     """
     refresh = bool(config['object_store_refresh_links'])
     author = config['object_store_author']
@@ -2887,6 +2947,9 @@ def input_summary(inputs):
         'excluded_relationships': manifest['excluded_relationships'],
         'constraints': dict(sorted(inputs.counts.items())),
         'link_refresh': manifest['link_refresh']['enabled'],
+        # The fiber-patch normal source the links were refreshed with
+        # (NormalSource.provenance: its kind and where it was read from).
+        'fiber_patch_normals': manifest['link_refresh'].get('fiber_patch_normals'),
         'outer_shell': (manifest.get('outer_shell') or {}).get('uuid'),
     }
 
@@ -2959,12 +3022,12 @@ def load_fit_inputs(config, *, lasagna=None, external_frames=None, dist=None,
     Every rank then reads the pinned versions read-only, materializes the
     same frozen snapshot and closes the store; their manifests must agree
     before anyone trains. Returns FitInputs carrying ``manifest`` and
-    ``digest``.
+    ``digest``. ``cache_directory`` is the fit's cache (the strip cache of
+    a local link refresh and a served store's persistent cache live under
+    it).
     """
-    from vc_object_store import ObjectStore
-
-    if not config['object_store_path']:
-        raise ObjectStoreInputError(['object_store_path is not configured'])
+    if not config['object_store_location']:
+        raise ObjectStoreInputError(['object_store_location is not configured'])
     main = dist is None or dist.is_main_process
     status = None
     if main:
@@ -2991,7 +3054,7 @@ def load_fit_inputs(config, *, lasagna=None, external_frames=None, dist=None,
     request = dataclasses.replace(
         request_from_config(config), pins=InputPins.from_provenance(status['pins']))
     try:
-        with ObjectStore.open(config['object_store_path'], read_only=True) as store:
+        with open_store(config, read_only=True, cache_directory=cache_directory) as store:
             snapshot = read_snapshot(store, request)
             normal = fiber_normal_source(config, lasagna, snapshot.volume_uuid)
             inputs = materialize_from_config(store, snapshot, config)
@@ -3024,10 +3087,9 @@ def describe_selection(config):
     from its store as it stands: read-only, without refreshing links or
     materializing anything, and without importing Torch. A selection the
     fitter would refuse reports its problems instead of raising."""
-    from vc_object_store import ObjectStore
     try:
         request = request_from_config(config)
-        with ObjectStore.open(config['object_store_path'], read_only=True) as store:
+        with open_store(config, read_only=True) as store:
             return {'ok': True, **snapshot_summary(read_snapshot(store, request))}
     except ObjectStoreInputError as error:
         return {'ok': False, 'problems': error.problems}
@@ -3046,7 +3108,7 @@ def _report_config(args):
 
 def _parse_args(argv):
     parser = argparse.ArgumentParser(description=__doc__.split('\n\n')[0])
-    parser.add_argument('store')
+    parser.add_argument('store', help='a store file, or the endpoint of the vc_object_server serving one')
     parser.add_argument('--volume', help='fit volume UUID (default: inferred)')
     parser.add_argument('--approved-only', action='store_true')
     for kind, flag in _SELECTOR_CONFIG.items():
@@ -3061,7 +3123,7 @@ def _parse_args(argv):
 
 
 def main(argv=None):
-    from vc_object_store import ObjectStore
+    from vc_object_store.locations import open_store as open_location
 
     args = _parse_args(argv)
     selectors = {}
@@ -3071,7 +3133,7 @@ def main(argv=None):
             tuple(uuids) if uuids is not None else None,
             tuple(tags) if tags is not None else None)
     request = InputRequest(selectors, args.volume, args.approved_only)
-    with ObjectStore.open(args.store, read_only=True) as store:
+    with open_location(args.store, read_only=True) as store:
         try:
             snapshot = read_snapshot(store, request)
             if args.z_begin is not None and args.z_end is not None:

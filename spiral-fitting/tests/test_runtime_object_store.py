@@ -43,7 +43,7 @@ def test_the_runtime_reads_the_bound_store_and_reports_it(state, store_path,
     status = settle(state)
     assert status['state'] == 'Idle', status['error']
     context = state.session._context
-    assert context.config['object_store_path'] == state.object_store.path
+    assert context.config['object_store_location'] == state.object_store.location
     assert context.config['object_store_author'] == 'svc'
     assert device_stubs == [True]
     assert len(edges(store_path)) == 3
@@ -144,7 +144,7 @@ def _rank_session(rank, world_size, rendezvous, root, config, results):
 
 
 def _two_rank_sessions(tmp_path, store, **overrides):
-    config = {**RUN, 'object_store_path': store, 'object_store_author': 'svc', **overrides}
+    config = {**RUN, 'object_store_location': store, 'object_store_author': 'svc', **overrides}
     return two_ranks(_rank_session, tmp_path, str(write_inputs(tmp_path / 'inputs')), config)
 
 
@@ -238,7 +238,7 @@ def test_checkpoint_refusals_name_the_input_remedies(state, tmp_path, device_stu
     # binding's to decide) need a reload.
     changed = json.loads(json.dumps(manifest))
     changed['objects'][0]['geometry_revision'] = 'an-older-geometry'
-    cfg = {**live, 'object_store_path': '/elsewhere.vcobj'}
+    cfg = {**live, 'object_store_location': '/elsewhere.vcobj'}
     refused = refusal('changed.ckpt', cfg, {'object_store': changed, 'volume_uuid': volume},
                       'object-store inputs differ')
     assert (refused.status, refused.payload['stage']) == (409, 'all')
@@ -325,7 +325,7 @@ def test_the_cli_and_the_service_freeze_the_same_inputs(varied_store, tmp_path,
         umbilicus = str(tmp_path / 'cli-umbilicus.json')
         reference.write_umbilicus(umbilicus)
         cli = FitContext(
-            FitConfig({**reference.fit_config(), **config, 'object_store_path': varied_store,
+            FitConfig({**reference.fit_config(), **config, 'object_store_location': varied_store,
                        'object_store_author': 'cli'}),
             scroll=reference.scroll_spec(), paths=SpiralInputPaths(umbilicus=umbilicus),
             cache_dir=str(tmp_path / 'cli-cache'), out_base_dir=str(tmp_path / 'cli-out'),

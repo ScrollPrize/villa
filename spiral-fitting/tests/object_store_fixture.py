@@ -246,7 +246,7 @@ def fit_config(path, author='fitter', **overrides):
     """The reference fit configuration reading the store at ``path``."""
     import object_store_reference as reference
     config = reference.fit_config()
-    config.update(object_store_path=str(path), object_store_author=author)
+    config.update(object_store_location=str(path), object_store_author=author)
     config.update(overrides)
     return config
 

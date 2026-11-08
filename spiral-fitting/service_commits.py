@@ -229,11 +229,12 @@ def read_published_generation(root, manifest_name="manifest.json"):
 
 
 def find_committed_fit(store, key):
-    """The active committed fit surface of ``key`` in ``store``, or None.
+    """The active committed fit surface of ``key`` in ``store`` (a store
+    file or served store handle, object_store_inputs.open_store), or None.
 
     A linear scan of the tag: commits are user-driven and few. Revisit if
     ``spiral-fit`` grows to thousands."""
-    for record in store.objects_by_tag(SPIRAL_FIT_TAG):
+    for record in store.select_objects(object_kind="surface", tag=SPIRAL_FIT_TAG):
         meta = record.get("meta") or {}
         if (record.get("kind") == "surface"
                 and meta.get("model_state_sha256") == key.model_state_sha256
@@ -279,15 +280,16 @@ def check_commit(generation, context):
 STAGE_WRITE = "Writing the surface to the object store"
 
 
-def write_commit(store_path, generation, context):
-    """Create the committed surface in the store at ``store_path`` (a file,
-    or an endpoint: ``create_surface`` takes a location); return its UUID."""
+def write_commit(store_location, generation, context):
+    """Create the committed surface in the store at ``store_location`` (a
+    file, or an endpoint: ``create_surface`` takes a location); return its
+    UUID."""
     from vc_object_store.surfaces import create_surface
     parameters = {"config": dict(generation.config)}
     if context.checkpoint:
         parameters["checkpoint"] = context.checkpoint
     return create_surface(
-        store_path, generation.xyz, name=context.name, scale=generation.scale,
+        store_location, generation.xyz, name=context.name, scale=generation.scale,
         volume=context.volume_uuid, voxel_scale=1.0, tool=COMMIT_TOOL,
         parameters=parameters, sources=context.sources,
         meta=commit_meta(generation, context),
@@ -299,20 +301,21 @@ def _no_stage(_name):
     pass
 
 
-def commit_in_place(store_path, generation, context, stage=_no_stage):
-    """Commit to the store at ``store_path``. The caller serializes the
-    service's store writes, so a concurrent request for the same key finds
-    this one. ``stage`` is called with the name of each step as it starts."""
-    from vc_object_store import ObjectStore
+def commit_in_place(store_location, generation, context, stage=_no_stage):
+    """Commit to the store at ``store_location`` (a store file on this host,
+    or the endpoint of the vc_object_server serving one). The caller
+    serializes the service's store writes, so a concurrent request for the
+    same key finds this one. ``stage`` is called with the name of each step
+    as it starts."""
+    from vc_object_store.locations import open_store
     check_commit(generation, context)
-    with ObjectStore.open(str(store_path), author=context.author) as store:
+    with open_store(store_location, author=context.author) as store:
         existing = find_committed_fit(store, generation.key)
     if existing is not None:
         surface_uuid, reused = existing["uuid"], True
     else:
         stage(STAGE_WRITE)
-        surface_uuid, reused = write_commit(store_path, generation, context), False
-    with ObjectStore.open(str(store_path), read_only=True) as store:
-        revision = store.current_geometry(surface_uuid)["uuid"]
-        version = int(store.current_version(surface_uuid) or 0)
-    return CommitResult(surface_uuid, revision, reused, version)
+        surface_uuid, reused = write_commit(store_location, generation, context), False
+    with open_store(store_location, read_only=True) as store:
+        revision = store.current_object_revision(surface_uuid)
+    return CommitResult(surface_uuid, revision["geometry_revision"], reused, int(revision["version"]))

@@ -975,7 +975,7 @@ class FitContext:
         # service's per-session selection; the CLI resolves its input
         # manifest (fit_session.load_input_manifest). Patches, PCLs, fibers,
         # tracks and the outer shell are not paths: they come from the object
-        # store (config object_store_path), whose selected objects must be in
+        # store (config object_store_location), whose selected objects must be in
         # paths.volume_uuid (check_fit_volume).
         #
         # cache_dir / storage_backend / render_volume_scale are deployment
@@ -1020,7 +1020,7 @@ class FitContext:
         # object_store_inputs.FitInputs materialized from a frozen object-store
         # snapshot: patches and point constraints with the store's links. When
         # None, load_host_inputs refreshes and reads the store the config
-        # names (object_store_path).
+        # names (object_store_location).
         self.object_store_inputs = object_store_inputs
         # Receives each line the object-store adapter reports while it
         # refreshes, freezes and derives the inputs (selection, refresh
@@ -1390,10 +1390,10 @@ class FitContext:
         # object store, linked by its detectors; nothing here reads them from
         # files or links them.
         if self.object_store_inputs is None:
-            if not self.config['object_store_path']:
+            if not self.config['object_store_location']:
                 raise RuntimeError(
                     'patches, fibers and point collections are read from an '
-                    'object store: set object_store_path')
+                    'object store: set object_store_location')
             self.object_store_inputs = self._load_object_store_inputs()
         check_fit_volume(self.paths, self.object_store_inputs.manifest.get('volume_uuid')
                          if self.object_store_inputs.manifest is not None else None)
@@ -1676,13 +1676,11 @@ class FitContext:
                 progress=progress_or_null(self.progress))
         progress_or_null(self.progress).begin(
             'loading', 'Reading object-store inputs',
-            detail=os.path.basename(str(self.config['object_store_path'])))
-        cache = (os.path.join(self.cache_path, 'object_store_strips')
-                 if self.cache_path else None)
+            detail=os.path.basename(str(self.config['object_store_location'])))
         return load_fit_inputs(
             self.config, lasagna=self._lasagna_normal_inputs(),
             external_frames=self._external_input_frames(), dist=self.dist,
-            cache_directory=cache, log=self.input_log)
+            cache_directory=self.cache_path, log=self.input_log)
 
     def _derive_object_store_point_inputs(self, verified_patches, inputs):
         """Install point views derived from object-store attachments.
@@ -4331,13 +4329,22 @@ if __name__ == '__main__':
              'resolve against its directory')
     parser.add_argument(
         '--object-store', required=True, metavar='STORE',
-        help='Object store (.vcobj) the fit reads patch, PCL, fiber, track and '
-             'outer-shell inputs from, and writes refreshed links to')
+        help='Object store the fit reads patch, PCL, fiber, track and '
+             'outer-shell inputs from, and writes refreshed links to: a store '
+             'file (.vcobj), or the endpoint of the vc_object_server serving one '
+             '(http://host:port, or ssh://host:port for a server on another '
+             "host's loopback port). A file a server holds is refused: pass "
+             'its endpoint')
     parser.add_argument(
         '--object-store-author', metavar='NAME',
         default=os.environ.get('USER') or os.environ.get('USERNAME') or 'spiral-fit',
         help='Author of the links the startup refresh writes '
              '(default: $USER, then $USERNAME, then spiral-fit)')
+    parser.add_argument(
+        '--object-store-link-timeout', type=int, default=300, metavar='SECONDS',
+        help='How long one link refresh of a served store may take: its detectors '
+             'run on vc_object_server, which answers when they are done; set it '
+             "with that server's --request-deadline (both default to 300)")
     parser.add_argument(
         '--cache', default=None,
         help='Directory for derived host caches, shared with the interactive '
@@ -4347,7 +4354,8 @@ if __name__ == '__main__':
         parser.add_argument(flag, nargs='?', action=RetiredFlag,
                             help=argparse.SUPPRESS)
     cli_args = parser.parse_args()
-    if os.path.isdir(cli_args.object_store):
+    from vc_object_store.locations import is_endpoint
+    if not is_endpoint(cli_args.object_store) and os.path.isdir(cli_args.object_store):
         candidates = sorted(Path(cli_args.object_store).glob('*.vcobj'))
         hint = (f'; use --object-store {candidates[0]}' if len(candidates) == 1
                 else '; pass the .vcobj database file')
@@ -4358,11 +4366,12 @@ if __name__ == '__main__':
     overrides = get_env_config_overrides()
     # The store is named on the command line only, as the service's
     # binding owns it there.
-    owned = sorted({'object_store_path', 'object_store_author'} & set(overrides))
+    owned = sorted({'object_store_location', 'object_store_author',
+                    'object_store_link_timeout_s'} & set(overrides))
     if owned:
         raise SystemExit(
             f'FIT_SPIRAL_CONFIG_OVERRIDES cannot set {", ".join(owned)}: '
-            'use --object-store / --object-store-author')
+            'use --object-store / --object-store-author / --object-store-link-timeout')
     # The fit setting spiral_outward_sense stands in for a sense the
     # manifest's scroll does not decide, and must agree with one it does.
     try:
@@ -4386,8 +4395,9 @@ if __name__ == '__main__':
         # default; FIT_SPIRAL_CONFIG_OVERRIDES still wins over it.
         config.update(scroll_spec_config_defaults(scroll_spec, config))
         config.update(overrides)
-        config['object_store_path'] = cli_args.object_store
+        config['object_store_location'] = cli_args.object_store
         config['object_store_author'] = cli_args.object_store_author
+        config['object_store_link_timeout_s'] = cli_args.object_store_link_timeout
         # The inputs the configuration needs, checked before anything is
         # built: a missing one is named, never looked for elsewhere.
         input_errors = validate_fit_inputs(
@@ -4403,10 +4413,13 @@ if __name__ == '__main__':
                 + '\n  '.join(f'{error["field"]}: {error["message"]}'
                               for error in input_errors))
         # Reject inaccessible or obsolete stores before packing/loading the
-        # much larger supervision volumes. This check never refreshes links.
-        from vc_object_store import ObjectStore
+        # much larger supervision volumes, opened as the fit will open it: a
+        # store file a vc_object_server holds refuses the writable open a
+        # link refresh needs (bind that server's endpoint instead). This
+        # check never refreshes links.
+        from object_store_inputs import open_store
         try:
-            with ObjectStore.open(cli_args.object_store, read_only=True):
+            with open_store(config, read_only=not config['object_store_refresh_links']):
                 pass
         except Exception as exc:
             parser.error(f'cannot open --object-store {cli_args.object_store}: {exc}')

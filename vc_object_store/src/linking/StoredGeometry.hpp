@@ -3,7 +3,9 @@
 #include "geometry/GeometrySnapshot.hpp"
 #include <vc_object_store/geometry/SurfaceGrid.hpp>
 #include "vc_object_store/objects/GeometryCoordinates.hpp"
+#include "vc_object_store/objects/StoreReader.hpp"
 #include <array>
+#include <functional>
 #include <atomic>
 #include <map>
 #include <memory>
@@ -13,6 +15,16 @@
 namespace vc::object_links::detail {
 // Working-voxel box: min x, y, z, then max x, y, z.
 using Box = std::array<double, 6>;
+
+// Reads the arrays a detector needs of an object's geometry: its current
+// revision, or the named one (StoredGeometry::load, loadGeometrySnapshot).
+using GeometryLoader = std::function<objects::detail::GeometrySnapshot(
+    const objects::ObjectRecord&, const std::optional<std::string>& revision)>;
+// StoredGeometry::load over any reader (a local transaction or a hosted
+// attachment): the object's current geometry, or the named revision of it,
+// which must be the object's. Throws when it has none or an unsupported one.
+objects::detail::GeometrySnapshot loadGeometrySnapshot(const objects::StoreReader& reader,
+    const objects::ObjectRecord& object, const std::optional<std::string>& revision = std::nullopt);
 
 // One read snapshot for selection and geometry. Payloads can be read one object
 // at a time. Before publishing links, check that every observed input is current.

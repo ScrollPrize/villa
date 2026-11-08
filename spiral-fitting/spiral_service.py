@@ -232,7 +232,9 @@ class ObjectStoreBinding:
     or (``served``) the endpoint of the vc_object_server holding it, which
     clients anywhere attach. Clients identify the store by ``uuid`` and the
     history ``generation`` positions belong to. ``author`` names the service
-    in the store when it refreshes links and commits.
+    in the store when it refreshes links and commits; ``link_timeout_s`` is
+    how long a served store's link refresh may take (its server's
+    --request-deadline).
     """
 
     location: str
@@ -240,25 +242,28 @@ class ObjectStoreBinding:
     generation: str
     author: str
     served: bool = False
-
-    @property
-    def path(self):
-        """The store file, for a binding that opened one (not served)."""
-        return self.location
+    link_timeout_s: int = 300
 
     def config(self):
         """The service-owned configuration a session request receives."""
-        return {"object_store_path": self.location,
+        return {"object_store_location": self.location,
                 "object_store_author": self.author,
+                "object_store_link_timeout_s": self.link_timeout_s,
                 "object_store_input_position": None}
+
+    def open(self, *, read_only=False, cache_directory=None):
+        """The store, for a block (object_store_inputs.open_store): a file
+        opened read-only or as the service's author, or the served store
+        attached as it."""
+        from object_store_inputs import open_store
+        return open_store(self.config(), read_only=read_only, cache_directory=cache_directory)
 
     def head(self):
         """``(commit_sequence, error)``: the store's head, read now (not the
         fitted position, which is status ``input_position``), or why it
         could not be read."""
-        from vc_object_store import ObjectStore
         try:
-            with ObjectStore.open(self.location, read_only=True) as store:
+            with self.open(read_only=True) as store:
                 return int(store.status()["commit_sequence"]), None
         except Exception as exc:  # noqa: BLE001 - reported, not fatal
             return None, f"{type(exc).__name__}: {exc}"
@@ -274,8 +279,8 @@ class ObjectStoreBinding:
 # naming one is refused, as the scroll-specification keys are, rather than
 # quietly overruled: a client cannot repoint the inputs a service reads, or
 # choose the position a build pins (it asks with ``inputs_position``).
-SERVICE_OWNED_CONFIG_KEYS = ("object_store_path", "object_store_author",
-                             "object_store_input_position")
+SERVICE_OWNED_CONFIG_KEYS = ("object_store_location", "object_store_author",
+                             "object_store_link_timeout_s", "object_store_input_position")
 
 
 # What /bindings tells a client this service supports, so it can enable or
@@ -311,12 +316,15 @@ def default_object_store_author():
     return f"spiral-service@{socket.gethostname()}"
 
 
-def bind_object_store(location, author=None):
+def bind_object_store(location, author=None, link_timeout_s=300):
     """Open the launch object store once; return its binding.
 
-    ``location`` is a store file (a served endpoint comes in a later
-    stage). A file another process serves (vc_object_server holds its
-    writer lock) is refused: bind that server's endpoint instead.
+    ``location`` is a store file on this host, or the endpoint of the
+    vc_object_server serving one (``http://host:port``, or ``ssh://`` for
+    a server on another host's loopback port), which is attached writable
+    and whose link requests may take ``link_timeout_s``. A file another
+    process serves (vc_object_server holds its writer lock) is refused:
+    bind that server's endpoint instead.
 
     Raises ObjectStoreBindingError when the vc_object_store module is not
     importable or the store cannot be opened, so startup fails with the
@@ -325,13 +333,24 @@ def bind_object_store(location, author=None):
     author = author or default_object_store_author()
     try:
         from vc_object_store import ObjectStore
+        from vc_object_store.locations import is_endpoint, open_store
     except ImportError as exc:
         raise ObjectStoreBindingError(
             f"the vc_object_store Python module is unavailable ({exc}); put "
             "its build's python directory on PYTHONPATH") from exc
+    if is_endpoint(location):
+        try:
+            with open_store(str(location), author=author, link_timeout_s=link_timeout_s) as store:
+                status = store.status()
+        except Exception as exc:  # noqa: BLE001 - every failure refuses the binding
+            raise ObjectStoreBindingError(
+                f"cannot attach the served object store {location}: {exc}") from exc
+        return ObjectStoreBinding(str(location), str(status["store"]), str(status["generation"]),
+                                  author, served=True, link_timeout_s=int(link_timeout_s))
     if "://" in str(location):
         raise ObjectStoreBindingError(
-            f"{location} is a store endpoint; this service binds a store file")
+            f"{location} is neither a store file nor a vc_object_server endpoint "
+            "(http://, https:// or ssh://)")
     resolved = Path(location).expanduser().resolve(strict=False)
     if not resolved.is_file():
         raise ObjectStoreBindingError(f"no object store at {resolved}")
@@ -354,7 +373,8 @@ def bind_object_store(location, author=None):
                 f"({message})") from exc
         raise ObjectStoreBindingError(
             f"cannot open the object store {resolved} for writing: {message}") from exc
-    return ObjectStoreBinding(str(resolved), str(status["store"]), str(status["generation"]), author)
+    return ObjectStoreBinding(str(resolved), str(status["store"]), str(status["generation"]), author,
+                              link_timeout_s=int(link_timeout_s))
 
 
 
@@ -1086,7 +1106,14 @@ class ServiceState:
         return self._read_startup_inputs(key)
 
     def _startup_inputs_key(self):
-        path = Path(self.object_store.path)
+        """What the startup summary is current for: a store file's size and
+        modification times, or a served store's head (one status request;
+        None when its server cannot be reached, so the next request asks
+        again)."""
+        if self.object_store.served:
+            head, _ = self.object_store.head()
+            return None if head is None else ("served", self.object_store.generation, head)
+        path = Path(self.object_store.location)
         # An empty WAL (a read-only open after the last writer closed
         # creates one) holds no writes: it keys as an absent one.
         return tuple((info.st_size, info.st_mtime_ns) if info and info.st_size else None
@@ -1514,8 +1541,7 @@ class ServiceState:
         if request_uuid is not None:
             if not isinstance(request_uuid, str) or not request_uuid:
                 raise ApiError(HTTPStatus.BAD_REQUEST, "request_uuid must be a string")
-            from vc_object_store import ObjectStore
-            with ObjectStore.open(store.location, read_only=True) as handle:
+            with store.open(read_only=True) as handle:
                 receipt = handle.receipt(request_uuid)
             if receipt is None:
                 raise ApiError(
@@ -1986,12 +2012,11 @@ class ServiceState:
         (the link refresh reads normals at its Lasagna scale), then
         object_store_inputs.prepare_position, which must leave that volume
         the fit volume. Returns ``(prepared, volume, paths, ScrollSpec)``."""
-        from vc_object_store import ObjectStore
         from object_store_inputs import read_snapshot, reading_stage, request_from_config
         config = self._effective_config(paths, run)
         progress = self._input_progress()
         try:
-            with ObjectStore.open(self.object_store.path, read_only=True) as store, \
+            with self.object_store.open(read_only=True, cache_directory=paths.cache_directory) as store, \
                     reading_stage(progress, "Reading the selected inputs", "fit volume"):
                 volume = read_snapshot(store, request_from_config(config)).volume_uuid
         finally:
@@ -2037,7 +2062,6 @@ class ServiceState:
         ``volume``, also the fit volume pinned there (``(prepared,
         volume)``). ``incremental`` (an input update) links only objects
         selected since the store's last refresh, when nothing else changed."""
-        from vc_object_store import ObjectStore
         from fit_session import lasagna_normal_inputs
         from object_store_inputs import (fit_volume_at, prepare_position,
                                          request_from_config)
@@ -2045,8 +2069,6 @@ class ServiceState:
         lasagna = lasagna_normal_inputs(
             load_lasagna_source(paths.lasagna) if paths.lasagna else None,
             config, scroll.lasagna_scale, paths.cache_directory)
-        cache = (os.path.join(paths.cache_directory, "object_store_strips")
-                 if paths.cache_directory else None)
 
         def log(line):
             self.events.append("log", line, source="service",
@@ -2055,11 +2077,10 @@ class ServiceState:
         progress = self._input_progress()
         with self._store_write_lock:
             try:
-                with ObjectStore.open(self.object_store.location,
-                                      author=self.object_store.author) as store:
+                with self.object_store.open(cache_directory=paths.cache_directory) as store:
                     prepared = prepare_position(
                         store, config, request, lasagna=lasagna,
-                        minimum=minimum, cache_directory=cache, log=log,
+                        minimum=minimum, cache_directory=paths.cache_directory, log=log,
                         incremental=incremental, progress=progress)
                     if not volume:
                         return prepared
@@ -4242,14 +4263,24 @@ def main(argv=None):
                              "repoint it, and changing it needs a restart and a "
                              "new fit. Without it, fits needing it are refused.")
     parser.add_argument("--object-store", required=True, metavar="STORE",
-                        help="Object store (.vcobj) this service reads patch, "
-                             "PCL and fiber inputs from, and writes link "
-                             "refreshes and commits to. Opened once at startup; "
-                             "clients cannot repoint it. A file vc_object_server "
-                             "serves is refused.")
+                        help="Object store this service reads patch, PCL and "
+                             "fiber inputs from, and writes link refreshes and "
+                             "commits to: a store file (.vcobj) on this host, or "
+                             "the endpoint of the vc_object_server serving one "
+                             "(http://host:port, or ssh://host:port for a server "
+                             "on another host's loopback port). Opened once at "
+                             "startup; clients cannot repoint it. A file "
+                             "vc_object_server serves is refused: bind its "
+                             "endpoint.")
     parser.add_argument("--object-store-author", default=None, metavar="NAME",
                         help="Author of the links this service's refresh "
                              "writes (default: spiral-service@<host>)")
+    parser.add_argument("--object-store-link-timeout", type=int, default=300,
+                        metavar="SECONDS",
+                        help="How long one link refresh of a served store may "
+                             "take: its detectors run on vc_object_server, which "
+                             "answers when they are done. Set it with that "
+                             "server's --request-deadline (both default to 300)")
     parser.add_argument("--require-prepared-lasagna-packs", action="store_true",
                         help="Require Lasagna packs and fiber directions prepared in "
                              "--cache (for a shared host whose cache is curated). By "
@@ -4342,7 +4373,8 @@ def main(argv=None):
               f"into VC3D): {key}", flush=True)
 
     try:
-        object_store = bind_object_store(args.object_store, args.object_store_author)
+        object_store = bind_object_store(args.object_store, args.object_store_author,
+                                         args.object_store_link_timeout)
     except ObjectStoreBindingError as exc:
         print(f"Refusing to start: {exc}", file=sys.stderr, flush=True)
         return 2
@@ -4416,7 +4448,8 @@ def main(argv=None):
     print(f"Spiral CUDA devices: {','.join(str(gpu_id) for gpu_id in args.gpus)}",
           flush=True)
     print(f"Spiral object store: {object_store.location} ({object_store.uuid}, "
-          f"generation {object_store.generation})", flush=True)
+          f"generation {object_store.generation}"
+          f"{', served by vc_object_server' if object_store.served else ''})", flush=True)
     print(f"Spiral output root: {output_root}", flush=True)
     print(f"Spiral cache root: {cache_root}", flush=True)
     winding = bindings.winding_inference_status()

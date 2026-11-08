@@ -106,9 +106,8 @@ class FrozenInputsRuntime(FakeRuntime):
 
     def _freeze(self, position):
         import object_store_inputs as osi
-        from vc_object_store import ObjectStore
         config = self.applied
-        with ObjectStore.open(config['object_store_path'], read_only=True) as store:
+        with osi.open_store(config, read_only=True) as store:
             request = osi.request_from_config(config)
             if position is not None:
                 request = dataclasses.replace(request, pins=osi.InputPins.from_provenance(position))
