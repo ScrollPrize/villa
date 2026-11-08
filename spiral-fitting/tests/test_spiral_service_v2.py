@@ -2842,15 +2842,6 @@ class ServiceProcessTests(unittest.TestCase):
                 process.terminate()
                 process.wait(10)
 
-    def test_the_retired_dataset_flag_is_refused_with_guidance(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            process = self._launch(["--port", "0", "--dataset", temporary]
-                                   + self._launch_arguments(temporary), temporary)
-            output, _ = process.communicate(timeout=30)
-            self.assertEqual(process.returncode, 2)
-            self.assertIn("--dataset is retired", output)
-            self.assertIn("--winding-inference", output)
-
     def test_output_and_object_store_are_required_arguments(self):
         with tempfile.TemporaryDirectory() as temporary:
             process = self._launch(["--port", "0"], temporary)

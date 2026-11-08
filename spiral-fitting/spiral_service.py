@@ -169,13 +169,6 @@ def input_upload_error():
 # Input paths are the service's (its bindings) and the project's; a session
 # request may name only these, each among service-advertised values.
 _CLIENT_SELECTABLE_PATHS = ("checkpoint",)
-# Request paths of the dataset service, refused with what replaced them.
-_RETIRED_REQUEST_PATHS = {
-    "dataset_root": "the service has no dataset; the project block carries "
-                    "the scroll's inputs",
-    "winding_inference": "winding inference is the service's --winding-inference "
-                         "binding; restart the service to change it",
-}
 
 
 def parse_gpu_ids(value):
@@ -1230,8 +1223,7 @@ class ServiceState:
                 "This service owns its input paths; the request may name only "
                 "a checkpoint",
                 [{"field": f"paths.{key}",
-                  "message": _RETIRED_REQUEST_PATHS.get(
-                      key, "Input paths are the service's bindings and the project's")}
+                  "message": "Input paths are the service's bindings and the project's"}
                  for key in offending])
         paths = {"output_directory": bindings.output_directory,
                  "cache_directory": bindings.cache_directory,
@@ -4255,17 +4247,6 @@ def _is_loopback(bind):
         return False
 
 
-class _RetiredDatasetFlag(argparse.Action):
-    """``--dataset``, refused with what replaced it."""
-
-    def __call__(self, parser, namespace, values, option_string=None):
-        parser.error(
-            "--dataset is retired: the service has no dataset. The scroll's "
-            "facts, umbilicus, Lasagna and fiber-inference datasets come from "
-            "the VC3D project; bind winding inference with --winding-inference "
-            "PATH, and prepared Lasagna packs and fiber directions live in --cache")
-
-
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--bind", default="127.0.0.1",
@@ -4279,8 +4260,6 @@ def main(argv=None):
     parser.add_argument("--nonce", default=None,
                         help="Ephemeral credential for a VC3D-owned local process")
     parser.add_argument("--parent-pid", type=int, default=0)
-    parser.add_argument("--dataset", nargs="?", action=_RetiredDatasetFlag,
-                        help=argparse.SUPPRESS)
     parser.add_argument("--output", required=True,
                         help="Root for all generated state (run directories, "
                              "autosaves, previews, input revisions, upload "

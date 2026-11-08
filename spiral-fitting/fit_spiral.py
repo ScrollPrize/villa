@@ -4326,20 +4326,6 @@ if __name__ == '__main__':
                              load_input_manifest, scroll_spec_config_defaults,
                              validate_fit_inputs)
 
-    # Flags of the dataset-directory CLI, refused with what replaced them.
-    retired_flags = {
-        '--dataset': 'name every input in an input manifest and pass --inputs '
-                     'MANIFEST; nothing is discovered in a dataset directory',
-        '--scroll-spec': 'spiral-scroll.json is retired: its scroll facts go in '
-                         'the input manifest\'s scroll block (pass --inputs MANIFEST)',
-        '--lasagna-url': 'state the remote URL as lasagna.original_url in the '
-                         'input manifest',
-    }
-
-    class RetiredFlag(argparse.Action):
-        def __call__(self, parser, namespace, values, option_string=None):
-            parser.error(f'{option_string} is retired: {retired_flags[option_string]}')
-
     parser = argparse.ArgumentParser(
         description='Headless Spiral fit of explicitly named inputs.')
     parser.add_argument(
@@ -4370,9 +4356,6 @@ if __name__ == '__main__':
         help='Directory for derived host caches, shared with the interactive '
              'service (default: $FIT_SPIRAL_CACHE_DIR if set, else '
              '$XDG_CACHE_HOME/vc3d/spiral, i.e. ~/.cache/vc3d/spiral)')
-    for flag in retired_flags:
-        parser.add_argument(flag, nargs='?', action=RetiredFlag,
-                            help=argparse.SUPPRESS)
     cli_args = parser.parse_args()
     from vc_object_store.locations import is_endpoint
     if not is_endpoint(cli_args.object_store) and os.path.isdir(cli_args.object_store):

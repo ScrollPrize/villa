@@ -235,15 +235,6 @@ def test_the_cli_fit_refuses_store_objects_of_another_volume(tmp_path, monkeypat
     context(VOLUME).load_host_inputs()
 
 
-def test_a_retired_cli_flag_is_refused_with_guidance():
-    result = subprocess.run(
-        [sys.executable, str(SPIRAL_DIR / 'fit_spiral.py'), '--dataset', '/data/scroll'],
-        capture_output=True, text=True, cwd=SPIRAL_DIR, timeout=300)
-    assert result.returncode == 2
-    assert '--dataset is retired' in result.stderr
-    assert '--inputs MANIFEST' in result.stderr
-
-
 def test_the_cli_reports_every_missing_input_before_fitting(tmp_path):
     manifest = write_manifest(tmp_path / 'inputs', fiber_directions='absent.npz')
     result = subprocess.run(
