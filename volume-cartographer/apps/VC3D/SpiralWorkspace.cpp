@@ -1,5 +1,7 @@
 #include "SpiralWorkspace.hpp"
+
 #include "SpiralPreviewWindings.hpp"
+#include "SpiralUpdatedDrafts.hpp"
 
 #include <vc_reader/tifxyz.hpp>
 #include <vc_reader/zarr.hpp>
@@ -402,18 +404,19 @@ SpiralWorkspace::SpiralWorkspace(CState* mainState, QWidget* parent)
             [this](const SpiralServiceManager::InputUpdate& update) {
                 const auto drafts = std::exchange(_updatingDrafts, {});
                 const auto patches = std::exchange(_updatingPatches, {});
-                if (!update.error.isEmpty() || !_brush) return;
-                // The fit holds what was saved before the update began: those
-                // drafts are shown as its inputs from now on, unless one was
-                // edited or saved again meanwhile (then it stays a drawing
-                // whose next save replaces its object).
-                auto included = [this](const QHash<QString, int64_t>& saved,
-                                       const QHash<QString, SavedObject>& objects) {
-                    QStringList ids;
-                    for (auto it = saved.cbegin(); it != saved.cend(); ++it)
-                        if (objects.value(it.key()).version == it.value() && _brush->savedUnchanged(it.key()))
-                            ids << it.key();
-                    return ids;
+                if (!_brush) return;
+                // The fit holds what was saved before the update began when
+                // the update named it (a position of the attached store):
+                // those drafts are shown as its inputs from now on, unless
+                // one was edited or saved again meanwhile (then it stays a
+                // drawing whose next save replaces its object). An update
+                // of a service's store not attached here includes none.
+                auto included = [this, &update](const QHash<QString, int64_t>& saved,
+                                                const QHash<QString, SavedObject>& objects) {
+                    return vc3d::spiralDraftsIncludedByUpdate(
+                        update.error, update.requested, saved,
+                        [&objects](const QString& id) { return objects.value(id).version; },
+                        [this](const QString& id) { return _brush->savedUnchanged(id); });
                 };
                 const QStringList fittedDrafts = included(drafts, _savedCollections);
                 const QStringList fittedPatches = included(patches, _brushPatches);
