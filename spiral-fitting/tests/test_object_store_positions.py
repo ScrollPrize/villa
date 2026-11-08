@@ -71,6 +71,55 @@ def test_prepare_links_commits_and_pins_a_position(shared):
     assert third.position == again.position and third.head == again.position.commit_sequence
 
 
+def test_a_commit_while_reading_the_selection_rereads_it(shared, monkeypatch):
+    """The selection, the shell and the position are one capture: a commit
+    between its queries does not label versions of commit N+1 as N."""
+    walk = names(shared)['walk']
+    original = osi.resolve_selector
+    edits = []
+
+    def racing(store, kind, selector, records=None):
+        if not edits:  # after the head is read, before the objects are
+            edits.append(shared_edit(shared, lambda db: db.set_meta(walk, 'review_note', 'mid-read')))
+        return original(store, kind, selector, records)
+    monkeypatch.setattr(osi, 'resolve_selector', racing)
+    request = osi.request_from_config(fit_config(shared, 'service'))
+    with ObjectStore.open(shared, read_only=True) as db:
+        selected = osi.resolve_selection(db, request)
+        assert edits and selected.position.commit_sequence == edits[0] == head(shared)
+        assert selected.versions[walk] == osi.current_record(db, walk)['version']
+        # The position alone reads the same versions from the history.
+        by_position = osi.resolve_selection(
+            db, dataclasses.replace(request, pins=osi.InputPins(selected.position)))
+        assert by_position.versions == selected.versions
+    # With link refresh off the pins are that capture, nothing later.
+    config = fit_config(shared, 'service', object_store_refresh_links=False)
+    prepared = prepare(shared, config)
+    assert prepared.position.commit_sequence == head(shared)
+    assert prepared.pins.objects[walk] == selected.versions[walk]
+
+
+def test_a_refresh_survives_another_run_moving_the_marker(shared, monkeypatch):
+    """A second link run committing before the first reads its marker: the
+    first still reports from the marker its own commit wrote."""
+    walk = names(shared)['walk']
+    original = osi._link_marker_at
+    moved = []
+
+    def racing(store, request, version):
+        if not moved:
+            moved.append(version)
+            shared_edit(shared, lambda db: db.set_meta(walk, 'review_note', 'relinked'))
+            moved.append(prepare(shared).position.commit_sequence)
+        return original(store, request, version)
+    monkeypatch.setattr(osi, '_link_marker_at', racing)
+    prepared = prepare(shared)
+    assert prepared.attempts == 1 and len(prepared.pins.objects) == len(names(shared))
+    assert prepared.position.commit_sequence < moved[1] == head(shared)
+    with ObjectStore.open(shared, read_only=True) as db:
+        assert osi.read_link_marker(db)['commit_sequence'] == moved[1]
+
+
 def _racing(monkeypatch, edit, every=False):
     """Run ``edit`` once the first (or every) refresh has read its snapshot
     and planned its detectors, before its links commit."""

@@ -171,8 +171,10 @@ public:
     void updateFitInputs(QJsonObject request);
     // The request UUID of the last save this VC3D committed to the attached
     // store: an input update names it, so the service can verify its store
-    // holds the edits (and is not a copy with the same identity).
-    void setLastSaveRequest(const QString& requestUuid) { _lastSaveRequest = requestUuid; }
+    // holds the edits (and is not a copy with the same identity). The
+    // receipt belongs to the store (UUID and history generation) attached
+    // at the save; an update of another store does not send it.
+    void setLastSaveRequest(const QString& requestUuid);
     bool inputUpdateActive() const { return _inputUpdateActive; }
     void runIterations(int iterations, const QJsonObject& runConfig,
                        const QJsonObject& dtLossSchedule,
@@ -362,7 +364,15 @@ private:
     bool _leaseOwner = false;
     // Update fit inputs in flight.
     bool _inputUpdateActive = false;
-    QString _lastSaveRequest;
+    // The last save's receipt, scoped to the store it was committed to.
+    struct SaveReceipt {
+        QString requestUuid;
+        QString storeUuid;
+        QString generation;
+    };
+    SaveReceipt _lastSave;
+    // The receipt's request UUID when it is of the attached store, else empty.
+    QString lastSaveRequestOf(const StoreBinding& binding) const;
     // The resident session's state and input generation, as last reported.
     QString _sessionState;
     qint64 _inputGeneration = 0;

@@ -710,21 +710,63 @@ def _pinned_records(store, pins):
     return records
 
 
+# How often a read of the store's current objects is repeated when a commit
+# lands between its queries, before it reads the store's history instead.
+CAPTURE_ATTEMPTS = 8
+
+
+def _capture_current(store, request):
+    """``(status, {kind: {UUID: version}}, shells)`` of the request's
+    selection among the store's current objects and the surfaces tagged
+    OUTER_SHELL_TAG, all at the head ``status`` names. The queries are
+    separate reads, so the head is read before and after them: a commit in
+    between would label versions of a later commit with an earlier head,
+    and the capture is repeated from the new head (CAPTURE_ATTEMPTS)."""
+    for _ in range(CAPTURE_ATTEMPTS):
+        status = store.status()
+        selected = {kind: resolve_selector(store, kind, request.selector(kind)) for kind in KINDS}
+        shells = [] if request.outer_shell == 'off' else [
+            (record['uuid'], record['version']) for record in store.select_objects(
+                object_kind='surface', tag=OUTER_SHELL_TAG, fields=['uuid'])]
+        after = store.status()
+        if (after['generation'], after['commit_sequence']) == (status['generation'], status['commit_sequence']):
+            return status, selected, shells
+    raise ObjectStoreInputError([
+        f'the store kept changing while its inputs were read ({CAPTURE_ATTEMPTS} attempts); retry'])
+
+
+def _shells_among(request, records, uuid=None):
+    """``[(UUID, version)]`` of the outer shells among ``records`` (the
+    state at a position), or of the one pinned as ``uuid``."""
+    if request.outer_shell == 'off':
+        return []
+    if uuid is not None:
+        records = {uuid: records[uuid]} if uuid in records else {}
+    return [(record['uuid'], record['version']) for record in records.values()
+            if outer_shell(record) and not record.get('retired')]
+
+
+def _one_shell(shells):
+    if len(shells) > 1:
+        raise ObjectStoreInputError([
+            f'{len(shells)} surfaces are tagged {OUTER_SHELL_TAG} ({", ".join(sorted(s for s, _ in shells))}); '
+            'the outer shell must be one'])
+    return shells[0] if shells else None
+
+
 def resolve_selection(store, request):
     """The request's selection (SelectedObjects): resolved among the store's
     current objects, or, with pins, among the pinned objects at their
     versions. Pins without object versions (a position alone) resolve at
     the store's head when that is the position, else from the store's
-    history at the position."""
-    def resolve(records=None):
+    history at the position. The selection, the outer shell and the
+    position are one capture: every version is of the position's commit."""
+    def resolve(records):
         return {kind: resolve_selector(store, kind, request.selector(kind), records)
                 for kind in KINDS}
     pins = request.pins
     if pins is None:
-        # The head before the selection is read: a commit in between shows
-        # as a later head, and the versions read stay the pins.
-        status = store.status()
-        selected = resolve()
+        status, selected, shells = _capture_current(store, request)
         position = InputPosition.of_status(status)
     elif pins.pinned:
         records = _pinned_records(store, pins)
@@ -735,50 +777,38 @@ def resolve_selection(store, request):
                 raise ObjectStoreInputError([
                     f'pinned {kind} {uuid} is not a fit input at {pins.position.describe()}'
                     for uuid in missing])
+        shells = [] if pins.outer_shell is None else _shells_among(request, records, pins.outer_shell)
         position = pins.position
     else:
         check_position(store, pins.position)
-        status = store.status()
-        if status['commit_sequence'] == pins.position.commit_sequence:
-            selected = resolve()
-            if store.status()['commit_sequence'] != pins.position.commit_sequence:
-                selected = resolve(_records_at_position(store, pins.position))
-        else:
-            selected = resolve(_records_at_position(store, pins.position))
         position = pins.position
+        status = store.status()
+        captured = None
+        if status['commit_sequence'] == position.commit_sequence:
+            # The head is the position: its current objects, unless a commit
+            # moves the head meanwhile (the capture then reads a later one).
+            status, selected, shells = _capture_current(store, request)
+            if status['commit_sequence'] == position.commit_sequence:
+                captured = selected, shells
+        if captured is None:
+            records = _records_at_position(store, position)
+            selected, shells = resolve(records), _shells_among(request, records)
+    shell = _one_shell(shells)
     versions = {uuid: version for by_kind in selected.values() for uuid, version in by_kind.items()}
-    shell = resolve_outer_shell(store, request, position)
     if shell is not None:
         versions[shell[0]] = shell[1]
     return SelectedObjects({kind: sorted(selected[kind]) for kind in KINDS}, versions, position,
                            None if shell is None else shell[0])
 
 
-def resolve_outer_shell(store, request, position=None):
-    """``(UUID, version)`` of the active surface tagged OUTER_SHELL_TAG (at
-    the request's pins, or now), or None; several are an error. A request
-    that reads no shell gives None."""
-    if request.outer_shell == 'off':
-        return None
-    pins = request.pins
-    if pins is not None and pins.pinned:
-        if pins.outer_shell is None:
-            return None
-        records = _pinned_records(store, pins)
-        record = records.get(pins.outer_shell)
-        shells = [(pins.outer_shell, record['version'])] if record and outer_shell(record) \
-            and not record.get('retired') else []
-    elif pins is not None and store.status()['commit_sequence'] != pins.position.commit_sequence:
-        shells = [(uuid, record['version']) for uuid, record in _records_at_position(store, pins.position).items()
-                  if outer_shell(record) and not record.get('retired')]
-    else:
-        shells = [(record['uuid'], record['version']) for record in store.select_objects(
-            object_kind='surface', tag=OUTER_SHELL_TAG, fields=['uuid'])]
-    if len(shells) > 1:
-        raise ObjectStoreInputError([
-            f'{len(shells)} surfaces are tagged {OUTER_SHELL_TAG} ({", ".join(sorted(s for s, _ in shells))}); '
-            'the outer shell must be one'])
-    return shells[0] if shells else None
+def resolve_outer_shell(store, request):
+    """``(UUID, version)`` of the active surface tagged OUTER_SHELL_TAG at
+    the request's pins (or now), or None; several are an error. A request
+    that reads no shell gives None. resolve_selection reads it with the
+    selection, in one capture."""
+    selected = resolve_selection(store, request)
+    shell = selected.outer_shell
+    return None if shell is None else (shell, selected.versions[shell])
 
 
 def read_snapshot(store, request, selected=None):
@@ -2210,13 +2240,15 @@ def submit_link_plan(store, planned, author=None, progress=None, log=None, read_
     finally:
         if progress is not None:
             progress.clear()
-    marker = read_link_marker(store)
+    # The marker as this commit wrote it (the receipt versions it): another
+    # link run may have moved the current marker on already.
+    marker = _link_marker_at(store, request, (receipt.get('objects') or {}).get(vos.link_marker_uuid()))
     reports = [step['report'] for step in (marker or {}).get('detectors') or ()]
     if marker is None or marker.get('commit_sequence') != receipt['commit_sequence'] \
             or len(reports) != len(runs):
         raise LinkRefreshError([
             f'the link marker does not describe the links committed at commit '
-            f'{receipt["commit_sequence"]}; another link run moved it'])
+            f'{receipt["commit_sequence"]}; the receipt names no marker version'])
     for outcome, report in zip(runs, reports):
         outcome.report = report
     seconds = time.monotonic() - started
@@ -2252,6 +2284,21 @@ def read_link_marker(store):
     from vc_object_store import link_marker_uuid
     record = current_record(store, link_marker_uuid())
     return None if record is None else dict(record.get('meta') or {})
+
+
+def _link_marker_at(store, request, version):
+    """The link marker's metadata at a numbered ``version`` of the store
+    ``request`` (a checked request) names, or None when the version is
+    None or absent."""
+    from vc_object_store import link_marker_uuid
+    if version is None:
+        return None
+    [revision] = store.objects_at_versions([{
+        'store': request['store'], 'generation': request['generation'],
+        'object': link_marker_uuid(), 'version': int(version)}])
+    if revision is None or revision.get('deleted'):
+        return None
+    return dict(revision['record'].get('meta') or {})
 
 
 def link_marker_key_parts(volume_uuid, config, normal_source):

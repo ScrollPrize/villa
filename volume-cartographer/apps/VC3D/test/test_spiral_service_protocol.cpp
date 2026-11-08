@@ -232,6 +232,16 @@ private slots:
 
         const auto request = protocolRequest({{"object_store_path", "/elsewhere.vcobj"}});
         editSurface(*session, attachment, surface, 2);
+        // A save receipt belongs to the store attached when it was saved:
+        // one of another store is not sent with this store's update (the
+        // service would refuse a receipt its store does not hold).
+        const auto otherPath = std::filesystem::path(directory.filePath(QStringLiteral("other.vcobj")).toStdString());
+        { auto created = ObjectStore::create(otherPath, options); }
+        const auto other = session->attach(otherPath, options);
+        manager.setObjectStore(session, other);
+        manager.setLastSaveRequest(QStringLiteral("00000000-0000-4000-8000-000000000000"));
+        manager.setObjectStore(session, attachment);
+        QTRY_VERIFY_WITH_TIMEOUT(manager.storeBinding().sameFile, 10000);
         manager.updateFitInputs(request);
         QTRY_COMPARE_WITH_TIMEOUT(updates.count(), 1, 60000);
         SUCCEEDED_UPDATE(updates, 0, update);

@@ -581,6 +581,22 @@ void SpiralServiceManager::setObjectStore(
     }
 }
 
+void SpiralServiceManager::setLastSaveRequest(const QString& requestUuid)
+{
+    // The save went to the attached store: its identity at this moment
+    // (the generation as last refreshed) scopes the receipt. A receipt of
+    // a store without a readable generation is kept for that UUID alone.
+    _lastSave = {requestUuid, _storeBinding.localUuid, _storeBinding.localGeneration};
+}
+
+QString SpiralServiceManager::lastSaveRequestOf(const StoreBinding& binding) const
+{
+    if (_lastSave.requestUuid.isEmpty() || _lastSave.storeUuid.isEmpty()
+        || _lastSave.storeUuid != binding.localUuid || _lastSave.generation != binding.localGeneration)
+        return {};
+    return _lastSave.requestUuid;
+}
+
 void SpiralServiceManager::refreshLocalStore()
 {
     const auto session = _storeSession.lock();
@@ -882,7 +898,8 @@ void SpiralServiceManager::sendInputUpdate(QJsonObject request, qint64 requested
     QJsonObject position{{QStringLiteral("store"), _storeBinding.localUuid},
                          {QStringLiteral("generation"), _storeBinding.localGeneration},
                          {QStringLiteral("commit_sequence"), requested}};
-    if (!_lastSaveRequest.isEmpty()) position[QStringLiteral("request_uuid")] = _lastSaveRequest;
+    const QString lastSave = lastSaveRequestOf(_storeBinding);
+    if (!lastSave.isEmpty()) position[QStringLiteral("request_uuid")] = lastSave;
     QJsonObject body{{QStringLiteral("run"), run},
                      {QStringLiteral("inputs_position"), position},
                      {QStringLiteral("command_id"), commandId()}};
