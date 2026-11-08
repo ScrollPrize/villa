@@ -1247,8 +1247,11 @@ objects and point ids) as checked writes, each expecting the version its
 edit started from. *Update Fit Inputs* updates an idle fit in place at a
 position including those edits (initializing one when there is none,
 rebuilding a failed one): the position the last save's receipt reached,
-which the service verifies is in its own store (a copy with the same
-identity is refused). It reports the commits that position includes beyond
+which the service verifies is in its own store. A receipt the store lacks
+is refused (edits saved into a copy of the store with the same UUID and
+generation); the check does not catch a copy that shares the receipt, or
+a client that reopened without saving and so sends none. It reports the
+commits that position includes beyond
 the request and those after it, which show as stale. *Save and Update Fit
 Inputs* does both. The run panel's position summary shows unsaved drawings,
 a position being linked, and the position the fit reads.

@@ -253,8 +253,10 @@ from surface_orientation import spiral_outward_sense_for
 # A position is {store, generation, commit_sequence};
 # a request's "inputs_position" is one of the service's store at or below
 # its head, with the "request_uuid" of the client's last save receipt when
-# it has one, which the service's store must hold (a copy with the same
-# identity is refused). Status "input_position" and the input manifest's
+# it has one, which the service's store must hold (a receipt it lacks is
+# refused: edits saved into a copy of the store; a copy sharing the
+# receipt, or a client with no receipt, is not detected). Status
+# "input_position" and the input manifest's
 # "position" are such positions ("requested" too); a manifest's objects
 # and relationships carry their numbered "version" instead of revision
 # UUIDs, and the inputs are read exactly at those versions. The link
