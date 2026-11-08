@@ -90,7 +90,7 @@ entry points, so also search `include/vc_reader/` before concluding something is
 
 | Need | C++ API | Implementation | Python |
 | --- | --- | --- | --- |
-| Read TIFF, PNG or JPEG, whole, by page or windowed; memory-map a TIFF | `source_reader.hpp`: `sources::imageSource`, `readImage`, `readImagePage`, `tiffMapping`, `ImageFile` | `sources/image_file.cpp`, `sources/source_reader.cpp` | `images.py`: `read`, `open`, `memmap` |
+| Read TIFF, PNG or JPEG, whole, by page or windowed; override format for extensionless image sources; memory-map a TIFF | `source_reader.hpp`: `sources::imageSource`, `readImage`, `readImagePage`, `tiffMapping`, `ImageFile` | `sources/image_file.cpp`, `sources/source_reader.cpp` | `images.py`: `read`, `open`, `memmap` |
 | Write TIFF, PNG or JPEG atomically; encode to memory | `image_write.hpp`: `sources::writeTiff`, `TiffWriter`, `writeImage`, `encodePng`, `encodeJpeg` | `sources/image_write.cpp`, `sources/image_encode.cpp` | `images.py`: `write_tiff`, `TiffWriter`; `write_image`, `encode_png`, `encode_jpeg` |
 | Crops of any Zarr, image or stack source, with exact encodings and decode budgets | `source_reader.hpp`: `sources::SourceReader`, `DecodedCache`, `EncodedFiles` | `sources/source_reader.cpp`, `sources/caches.cpp` | `reader/source_reader.py`, `reader/decoded_cache.py` |
 | Aligned multi-target reads in a reference grid; flattened image and label pairs | `aligned_reader.hpp`: `sources::SampleReader`, `PairedReader` | `sources/aligned_reader.cpp` | `sampling.py`: `open_sample`; `paired.py`: `PairedReader` |

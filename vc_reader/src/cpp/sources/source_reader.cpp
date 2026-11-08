@@ -716,7 +716,7 @@ void SourceReader::ready()
     }
 }
 
-Source imageSource(const std::string& location, const OptionsFor& options)
+Source imageSource(const std::string& location, const OptionsFor& options, const std::optional<std::string>& format)
 {
     Source source;
     source.id = location;
@@ -727,7 +727,7 @@ Source imageSource(const std::string& location, const OptionsFor& options)
     selection.series = std::int64_t(0);
     selection.level = std::int64_t(0);
     try {
-        ImageFile image(location, std::nullopt, selection, std::nullopt, files, true);
+        ImageFile image(location, format, selection, std::nullopt, files, true);
         source.axes = image.info().axes;
         source.storage.format = image.format();
         source.storage.selection = std::move(selection);
@@ -735,7 +735,7 @@ Source imageSource(const std::string& location, const OptionsFor& options)
         throw;
     } catch (const std::invalid_argument&) {
         // PNG and JPEG select nothing.
-        ImageFile image(location, std::nullopt, {}, std::nullopt, files);
+        ImageFile image(location, format, {}, std::nullopt, files);
         source.axes = image.info().axes;
         source.storage.format = image.format();
     }
