@@ -167,23 +167,6 @@ QImage maskOverlayToSurface(
     return image;
 }
 
-// Why saved drawings could not reach the service's fit, or empty when the
-// attached store is the one it fits (or no service has named its store).
-QString fitStoreMismatch(const SpiralServiceManager::StoreBinding& binding)
-{
-    if (!binding.advertised() || binding.matches()) return {};
-    if (binding.localToService())
-        return QObject::tr("This service's store is local to its host: edits and commits need it served "
-                           "(vc_object_server) and attached here");
-    if (binding.serviceUuid == binding.localUuid)
-        return QObject::tr("The attached store has the same UUID as the Spiral service's but history "
-                           "generation %1, not %2 (a copy?): drawings saved here would never reach the fit")
-            .arg(binding.localGeneration, binding.serviceGeneration);
-    return QObject::tr("The Spiral service fits store %1, not the attached store %2: "
-                       "drawings saved here would never reach the fit")
-        .arg(binding.serviceUuid, binding.localUuid);
-}
-
 } // namespace
 
 SpiralWorkspace::SpiralWorkspace(CState* mainState, QWidget* parent)
@@ -1067,8 +1050,7 @@ void SpiralWorkspace::addPatchToCurrentFit(
     Q_UNUSED(tifxyzDirectory);
     Q_UNUSED(surface);
     QMessageBox::information(this, tr("Add patch to the Spiral fit"),
-                             tr("Surfaces in the object store are fit inputs when the fit's selection "
-                                "includes them (by default, every active surface). %1")
+                             tr("Surfaces in the store are fit inputs when the fit's selection includes them. %1")
                                  .arg(SpiralServiceManager::inputChangesMessage()));
 }
 
@@ -1076,8 +1058,7 @@ void SpiralWorkspace::addFibersToCurrentFit(const std::vector<uint64_t>& fiberId
 {
     Q_UNUSED(fiberIds);
     QMessageBox::information(this, tr("Add fibers to the Spiral fit"),
-                             tr("Fibers in the object store are fit inputs when the fit's selection "
-                                "includes them (by default, every active fiber). %1")
+                             tr("Fibers in the store are fit inputs when the fit's selection includes them. %1")
                                  .arg(SpiralServiceManager::inputChangesMessage()));
 }
 
@@ -1096,7 +1077,7 @@ void SpiralWorkspace::submitReadyDrafts(bool updateAfter)
     std::optional<double> scale;
     if (!attachment || !session->writable(*attachment))
         problem = tr("Route surfaces, fibers and point collections to one writable store to save Spiral drawings");
-    else if (const QString mismatch = fitStoreMismatch(_service->storeBinding()); !mismatch.isEmpty())
+    else if (const QString mismatch = _service->storeBinding().mismatchAdvice(); !mismatch.isEmpty())
         problem = mismatch;
     else if (!_fitInputs || _fitInputs->volumeUuid.empty())
         problem = tr("Spiral drawings are saved in the fit's volume: wait until the fit's inputs are shown");
@@ -1296,9 +1277,8 @@ void SpiralWorkspace::requestSessionExit(std::function<void()> continuation)
         return;
     }
     QMessageBox box(QMessageBox::Warning, tr("Unfinished Spiral drawings"),
-                    tr("This Spiral workspace holds drawn patches or point collections "
-                       "that are not part of the fit: its inputs are frozen and come "
-                       "from the object store. Leaving discards them."),
+                    tr("Drawn patches or point collections here are not part of the fit. "
+                       "Leaving discards them."),
                     QMessageBox::NoButton, this);
     auto* discard = box.addButton(tr("Discard and Exit"), QMessageBox::DestructiveRole);
     box.addButton(QMessageBox::Cancel);

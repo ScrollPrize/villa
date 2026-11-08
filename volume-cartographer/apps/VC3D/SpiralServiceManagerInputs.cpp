@@ -2,9 +2,19 @@
 
 QString SpiralServiceManager::inputChangesMessage()
 {
-    return tr("Fit inputs come from the object store, and a resident fit keeps the inputs it "
-              "read. Save edits to the store, then use Update Fit Inputs (or Rebuild Fit with "
-              "current inputs) to fit them.");
+    return tr("Save edits to the store, then use Update Fit Inputs or Rebuild Fit with current inputs.");
+}
+
+QString SpiralServiceManager::StoreBinding::mismatchAdvice() const
+{
+    if (!advertised() || matches()) return {};
+    if (localToService())
+        return QObject::tr("Store is on the service host. Attach it to edit or view inputs.");
+    if (localUuid.isEmpty())
+        return QObject::tr("Attach this store to edit or view inputs.");
+    if (serviceUuid == localUuid)
+        return QObject::tr("Store history differs. Attach the service's store to edit or view inputs.");
+    return QObject::tr("A different store is attached. Attach the service's store to edit or view inputs.");
 }
 
 void SpiralServiceManager::claimSessionLease()

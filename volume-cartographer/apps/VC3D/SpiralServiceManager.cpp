@@ -627,22 +627,12 @@ void SpiralServiceManager::updateStoreBinding()
     _storeBinding.servicePositionError = store.value(QStringLiteral("position_error")).toString();
     updateSameFile();
     if (_storeBinding.advertised() && !_storeBinding.matches())
-        emit logMessage(
-            _storeBinding.localUuid.isEmpty()
-                ? tr("The Spiral service reads object store %1, and the project routes Spiral's "
-                     "inputs to no one store here: its fit inputs cannot be displayed")
-                      .arg(_storeBinding.serviceUuid)
-            : _storeBinding.serviceUuid == _storeBinding.localUuid
-                ? tr("The Spiral service reads object store %1 at history generation %2; the attached "
-                     "store has the same UUID but generation %3 (a copy?): its fit inputs are not "
-                     "displayed as fitted")
-                      .arg(_storeBinding.serviceUuid, _storeBinding.serviceGeneration, _storeBinding.localGeneration)
-            : _storeBinding.localToService()
-                ? tr("This service's store is local to its host: edits and commits need it served "
-                     "(vc_object_server) and attached here")
-                : tr("The Spiral service reads object store %1, not the attached store %2: "
-                     "its fit inputs are not displayed as fitted")
-                      .arg(_storeBinding.serviceUuid, _storeBinding.localUuid));
+        emit logMessage(tr("%1 Service store: %2 (history %3). Attached: %4 (history %5).")
+                            .arg(_storeBinding.mismatchAdvice(), _storeBinding.serviceUuid,
+                                 _storeBinding.serviceGeneration,
+                                 _storeBinding.localUuid.isEmpty() ? tr("none") : _storeBinding.localUuid,
+                                 _storeBinding.localUuid.isEmpty() ? QStringLiteral("-")
+                                                                   : _storeBinding.localGeneration));
     emit storeBindingChanged();
 }
 
@@ -858,7 +848,7 @@ void SpiralServiceManager::updateFitInputs(QJsonObject request)
     if (!isReady() || !_leaseOwner)
         refused.error = tr("Connect to the Spiral service and own its session lease first");
     else if (!_storeBinding.advertised())
-        refused.error = tr("The Spiral service names no object store: rebuild with current inputs instead");
+        refused.error = tr("The service has no object store configured.");
     if (!refused.error.isEmpty()) {
         emit inputUpdateFinished(refused);
         return;

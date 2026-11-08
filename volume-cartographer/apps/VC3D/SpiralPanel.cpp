@@ -229,7 +229,7 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
     // Read-only: the project's fit volume is the only source of these, and
     // the service rejects a request that restates them. They are still shown,
     // because a fit's meaning depends on them.
-    _scrollSummary = new QLabel(tr("From the project's fit volume when a fit is built"), pathsContents);
+    _scrollSummary = new QLabel(tr("Set from the project when the fit is built"), pathsContents);
     _scrollSummary->setObjectName(QStringLiteral("spiralScrollSummary"));
     _scrollSummary->setWordWrap(true);
     _scrollSummary->setTextInteractionFlags(Qt::TextSelectableByMouse);
@@ -245,7 +245,7 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
     pathsForm->addRow(tr("Outward sense"), _outwardSense);
     describe(QStringLiteral("outward_sense"), {_outwardSense});
     addPathRow(pathsForm, "umbilicus", tr("Umbilicus"), false);
-    _windingInferenceSummary = new QLabel(tr("Advertised by the service once connected"), pathsContents);
+    _windingInferenceSummary = new QLabel(tr("Connect to check availability"), pathsContents);
     _windingInferenceSummary->setObjectName(QStringLiteral("spiralWindingInferenceSummary"));
     _windingInferenceSummary->setWordWrap(true);
     _windingInferenceSummary->setTextInteractionFlags(Qt::TextSelectableByMouse);
@@ -1200,18 +1200,16 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
                     _warnings->setText(lines.join(QStringLiteral("\n")));
                 } else {
                     lines << (update.requested < 0
-                                  ? tr("Updated: the fit reads the service's store at commit %1 (linked at %2; "
-                                       "edits saved here are not in that store)")
-                                        .arg(update.fitted).arg(update.head)
-                                  : tr("Updated: the fit reads the store at commit %1 (your edits reached %2; "
-                                       "linked at %3)")
-                                        .arg(update.fitted).arg(update.requested).arg(update.head));
+                                  ? tr("Updated to commit %1. Local edits were not included.")
+                                        .arg(update.fitted)
+                                  : tr("Updated to commit %1, including your saved edits.")
+                                        .arg(update.fitted));
                     if (!update.includedBeyondRequested.isEmpty())
-                        lines << tr("It includes %n later commit(s) by others:", nullptr,
+                        lines << tr("Also includes %n later commit(s) by others:", nullptr,
                                     int(update.includedBeyondRequested.size()))
                               << update.includedBeyondRequested.mid(0, 5);
                     if (!update.afterFitted.isEmpty())
-                        lines << tr("%n commit(s) after it are not part of the fit:", nullptr,
+                        lines << tr("%n newer commit(s) are not yet included:", nullptr,
                                     int(update.afterFitted.size()))
                               << update.afterFitted.mid(0, 5);
                     lines << update.problems;
@@ -1851,6 +1849,7 @@ void SpiralPanel::updateCommitActions()
 void SpiralPanel::showCommitResult(const SpiralServiceManager::CommitResult& result)
 {
     _commitStatus->setVisible(true);
+    _commitStatus->setToolTip({});
     _openCommitted->setVisible(false);
     if (result.state != QStringLiteral("done")) {
         _commitStatus->setText(tr("Commit failed: %1").arg(result.error));
@@ -1859,17 +1858,14 @@ void SpiralPanel::showCommitResult(const SpiralServiceManager::CommitResult& res
     }
     _committedFit = result.surfaceUuid;
     _committedArtifact = result.artifact;
-    const QString what = result.reused ? tr("Committed before as %1").arg(result.surfaceUuid)
-                                       : tr("Committed as %1").arg(result.surfaceUuid);
+    const QString what = result.reused ? tr("Already committed to the service's store.")
+                                       : tr("Committed to the service's store.");
+    _commitStatus->setToolTip(tr("Surface: %1").arg(result.surfaceUuid));
     const auto& binding = _service->storeBinding();
     if (!binding.matches()) {
-        _commitStatus->setText(binding.localToService()
-            ? tr("%1, committed to the service's store. This service's store is local to its host: edits "
-                 "and commits need it served (vc_object_server) and attached here to open it.").arg(what)
-            : tr("%1, committed to the service's store. Attach that store to open it.").arg(what));
+        _commitStatus->setText(tr("%1 Attach that store to open the fit.").arg(what));
     } else {
-        // The service's store is attached here: open it at once.
-        _commitStatus->setText(tr("%1, committed to the service's store.").arg(what));
+        _commitStatus->setText(what);
         _openCommitted->setVisible(true);
         emit openStoredFitRequested(result.surfaceUuid);
     }
@@ -1899,59 +1895,52 @@ void SpiralPanel::applyBindings(const QJsonObject& advertisement)
     QString reason;
     _windingInferenceSummary->setText(
         _service->windingInferenceAvailable(&reason)
-            ? tr("Available on the service host — winding-model supervision can run")
-            : tr("Unavailable — winding-model supervision cannot run. %1").arg(reason));
+            ? tr("Available on the service host")
+            : tr("Unavailable: %1").arg(reason));
 }
 
 void SpiralPanel::updateObjectStoreSummary()
 {
     const auto& binding = _service->storeBinding();
     auto head = [](qint64 value) {
-        return value < 0 ? tr("head unknown") : tr("at commit %1").arg(value);
+        return value < 0 ? tr("commit unknown") : tr("commit %1").arg(value);
     };
-    const QString local = binding.localUuid.isEmpty()
-        ? QString()
-        : tr("%1 (generation %2, %3)%4").arg(binding.localLocation, binding.localGeneration,
-                                            head(binding.localCommitSequence),
-                                            binding.localHosted ? tr(", served") : QString());
+    QStringList details;
+    if (!binding.localUuid.isEmpty())
+        details << tr("VC3D: %1\nStore: %2\nHistory: %3\n%4")
+                       .arg(binding.localLocation, binding.localUuid, binding.localGeneration,
+                            head(binding.localCommitSequence));
     if (!binding.advertised()) {
         _objectStoreSummary->setText(binding.localUuid.isEmpty()
-            ? tr("No object store attached in VC3D")
-            : tr("Attached here: %1, %2").arg(binding.localUuid, local));
+            ? tr("No store attached")
+            : tr("Attached: %1").arg(binding.localLocation));
+        _objectStoreSummary->setToolTip(details.join(QStringLiteral("\n\n")));
         return;
     }
-    QString text = binding.serviceServed
-        ? tr("Service reads %1 (generation %2) served at %3, %4")
-              .arg(binding.serviceUuid, binding.serviceGeneration, binding.serviceLocation,
-                   binding.servicePositionError.isEmpty() ? head(binding.serviceCommitSequence)
-                                                          : tr("head unknown (%1)").arg(binding.servicePositionError))
-        : tr("Service reads %1 (generation %2), the file %3 on the service host, %4")
-              .arg(binding.serviceUuid, binding.serviceGeneration, binding.serviceLocation,
-                   binding.servicePositionError.isEmpty() ? head(binding.serviceCommitSequence)
-                                                          : tr("head unknown (%1)").arg(binding.servicePositionError));
+    details << tr("Service: %1\nStore: %2\nHistory: %3\n%4")
+                   .arg(binding.serviceLocation, binding.serviceUuid, binding.serviceGeneration,
+                        head(binding.serviceCommitSequence));
+    if (!binding.servicePositionError.isEmpty()) details << binding.servicePositionError;
+    QString text = tr("%1 (%2)").arg(binding.serviceLocation,
+                                      head(binding.serviceCommitSequence));
+    if (!binding.servicePositionError.isEmpty())
+        text += tr("\nStore unavailable; hover for details.");
     if (binding.matches())
-        text += binding.sameFile
-            ? tr("\nThe same store file is attached here: saved edits reach the fit at its next update")
-            : tr("\nThe same store is attached here (%1): saved edits reach the fit at its next update").arg(local);
-    else if (binding.localToService())
-        text += tr("\nThis service's store is local to its host: edits and commits need it served "
-                   "(vc_object_server) and attached here");
-    else if (binding.localUuid.isEmpty())
-        text += tr("\nNo store is attached here: fit inputs cannot be displayed");
-    else if (binding.serviceUuid == binding.localUuid)
-        text += tr("\nThe attached store has the same UUID but history generation %1 (a copy?): "
-                   "edits cannot reach the fit").arg(binding.localGeneration);
+        text += tr("\nConnected. Save edits, then Update Fit Inputs.");
     else
-        text += tr("\nAnother store is attached here (%1): fit inputs are not displayed as fitted")
-                    .arg(binding.localUuid);
+        text += QStringLiteral("\n") + binding.mismatchAdvice();
+    if (binding.localToService())
+        details << tr("Run vc_object_server on the service host, bind Spiral to its endpoint, "
+                      "then attach that store in VC3D. You can still run the fit, update its "
+                      "inputs, and commit results without attaching it here.");
     _objectStoreSummary->setText(text);
+    _objectStoreSummary->setToolTip(details.join(QStringLiteral("\n\n")));
 }
 
 void SpiralPanel::startInputUpdate(bool confirm)
 {
     if (!_service->storeBinding().advertised()) {
-        _warnings->setText(tr("The Spiral service names no object store: saved edits reach the fit "
-                              "when it is rebuilt with current inputs"));
+        _warnings->setText(tr("The service has no object store configured."));
         return;
     }
     QJsonParseError error;
@@ -1964,8 +1953,7 @@ void SpiralPanel::startInputUpdate(bool confirm)
     if (confirm && _sessionState == QStringLiteral("Error")) {
         const auto answer = QMessageBox::question(
             this, tr("Update Fit Inputs"),
-            tr("The fit failed; updating its inputs rebuilds it from a position including "
-               "your saved edits. Continue?"));
+            tr("The fit failed. Rebuild it with the latest inputs from the service's store?"));
         if (answer != QMessageBox::Yes) return;
     }
     persist();
@@ -1989,28 +1977,28 @@ void SpiralPanel::updatePositionSummary()
         const qint64 sequence = position.value(QStringLiteral("commit_sequence")).toInteger();
         const QJsonValue requested = position.value(QStringLiteral("requested"));
         lines << (position.value(QStringLiteral("source")).toString() == QStringLiteral("checkpoint")
-                      ? tr("The fit reads the store at commit %1, recorded by its checkpoint").arg(sequence)
+                      ? tr("Fit inputs: commit %1 (from checkpoint)").arg(sequence)
                   : requested.isNull()
-                      ? tr("The fit reads the store at commit %1 (linked at %2)")
+                      ? tr("Fit inputs: commit %1 (linked at %2)")
                             .arg(sequence).arg(position.value(QStringLiteral("head")).toInteger())
-                      : tr("The fit reads the store at commit %1 (requested %2, linked at %3)")
+                      : tr("Fit inputs: commit %1 (requested %2, linked at %3)")
                             .arg(sequence).arg(requested.toInteger())
                             .arg(position.value(QStringLiteral("head")).toInteger()));
     }
     const QJsonObject preparing = _lastInputStatus.value(QStringLiteral("input_preparation")).toObject();
     if (!preparing.isEmpty())
-        lines << tr("The service is preparing the fit's inputs (linking, then reading a pinned position%1)…")
+        lines << tr("Preparing inputs%1…")
                      .arg(preparing.value(QStringLiteral("requested_position")).isNull()
                               ? QString()
                               : tr(" including commit %1").arg(preparing.value(QStringLiteral("requested_position")).toInteger()));
     const QJsonObject failed = _lastInputStatus.value(QStringLiteral("input_preparation_error")).toObject();
     if (!failed.isEmpty() && _inputUpdateText.isEmpty())
-        lines << tr("The last input update failed; the fit is unchanged: %1")
+        lines << tr("Input update failed; fit unchanged: %1")
                      .arg(failed.value(QStringLiteral("message")).toString());
     if (binding.matches() && binding.localCommitSequence >= 0)
-        lines << tr("The attached store is at commit %1").arg(binding.localCommitSequence);
+        lines << tr("Store: commit %1").arg(binding.localCommitSequence);
     if (_localDraftsReady)
-        lines << tr("Unsaved drawings in this workspace: save them to the store to include them");
+        lines << tr("Unsaved drawings: save, then update inputs.");
     if (!_inputUpdateText.isEmpty()) lines << _inputUpdateText;
     _positionSummary->setText(lines.join(QStringLiteral("\n")));
     _positionSummary->setVisible(!lines.isEmpty());
@@ -2020,9 +2008,9 @@ void SpiralPanel::resetScrollSummaries()
 {
     // The project's fit volume and Lasagna dataset give these once a fit is
     // built (applySessionScroll).
-    _scrollSummary->setText(tr("From the project's fit volume when a fit is built"));
-    _lasagnaSummary->setText(tr("From the project's selected Lasagna dataset when a fit is built"));
-    _windingInferenceSummary->setText(tr("Advertised by the service once connected"));
+    _scrollSummary->setText(tr("Set from the project when the fit is built"));
+    _lasagnaSummary->setText(tr("Set from the project when the fit is built"));
+    _windingInferenceSummary->setText(tr("Connect to check availability"));
 }
 
 void SpiralPanel::applySessionScroll(const QJsonObject& request)
@@ -2574,12 +2562,9 @@ void SpiralPanel::updateStatus(const QJsonObject& status)
     _updateInputs->setEnabled(_load->isEnabled() && binding.canUpdate()
                               && status.value(QStringLiteral("input_preparation")).isNull());
     if (binding.localToService())
-        setToolTipNote(_updateInputs, tr("Updates the fit from the service's store on its host. This service's "
-                                         "store is local to its host: edits and commits need it served "
-                                         "(vc_object_server) and attached here"));
+        setToolTipNote(_updateInputs, tr("Uses the latest inputs on the service host. Local edits are not included."));
     else if (binding.advertised() && !binding.canPosition())
-        setToolTipNote(_updateInputs, tr("Updates the fit from the service's store head; attach that store "
-                                         "to include the edits saved here"));
+        setToolTipNote(_updateInputs, tr("Uses the service's latest inputs. Attach its store to include local edits."));
     else
         setToolTipNote(_updateInputs, {});
     updatePositionSummary();

@@ -88,6 +88,10 @@ public:
         // The update names this VC3D's saved edits (an input position the
         // fit must include) only when the service's store is attached here.
         bool canPosition() const { return matches(); }
+        // One line saying why edits saved here cannot reach the fit and what
+        // to do about it; empty when the stores match or none is advertised.
+        // The panel, the workspace and the log all show this same line.
+        QString mismatchAdvice() const;
         // Which stores are bound, without the heads, which every commit moves.
         QStringList identity() const
         {
