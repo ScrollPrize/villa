@@ -215,6 +215,34 @@ def test_an_unavailable_source_fails_the_run(db, tmp_path):
     assert db.status()["commit_sequence"] == before
 
 
+def truncated_pack(root):
+    """A pack whose table names a brick row its channel files do not hold: the
+    source itself cannot be read where the fiber lies."""
+    pack = lasagna_pack(root)
+    rows = json.loads((root / "meta.json").read_text())["rows"]
+    table = np.load(root / "table.npy")
+    table[1, 1, 1] = rows - 1  # the fiber's brick -> the last row ...
+    np.save(root / "table.npy", table)
+    for channel in range(2):  # ... which the pools no longer hold
+        voxels = 32 ** 3
+        data = (root / f"channel_{channel}.u8").read_bytes()
+        (root / f"channel_{channel}.u8").write_bytes(data[: (rows - 1) * voxels])
+    meta = json.loads((root / "meta.json").read_text())
+    meta["rows"] = rows - 1
+    (root / "meta.json").write_text(json.dumps(meta))
+    return pack
+
+
+def test_a_source_that_fails_while_sampling_fails_the_run(db, tmp_path):
+    # An unreadable brick is the source failing, not the fiber: no skipped
+    # candidate, no commit.
+    patch(db), fiber(db)
+    before = db.status()["commit_sequence"]
+    with pytest.raises(RuntimeError, match="lasagna pack brick"):
+        db.link_fibers_to_surfaces(**LINE_OPTIONS, **truncated_pack(tmp_path / "truncated"))
+    assert db.status()["commit_sequence"] == before
+
+
 # --- link_objects: the same sources as plan parameters ---
 
 def link_request(status, plan):
@@ -261,6 +289,9 @@ def test_link_objects_refuses_conflicting_sources_and_fails_atomically_on_a_miss
     missing = fiber_plan(normal_pool=str(tmp_path / "no-such-pack"), ct_to_base_scale=2)
     with pytest.raises(vos.PreparationFailed, match="fiber-surface"):
         db.submit(link_request(db.status(), missing))
+    truncated = fiber_plan(**truncated_pack(tmp_path / "truncated"))
+    with pytest.raises(vos.PreparationFailed, match="lasagna pack brick"):
+        db.submit(link_request(db.status(), truncated))
     assert db.status()["commit_sequence"] == before
     assert db.object(vos.link_marker_uuid()) == marker
 

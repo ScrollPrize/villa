@@ -78,9 +78,20 @@ public:
         if (!available()) throw std::logic_error("graph links: no sheet-normal source");
         const auto start = profile_ ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         vc::CtSheetNormal result;
-        result = ct_ ? ct_->sampleNormal(point, cancel)
-               : lasagna_ ? lasagna_->sampleNormal(point, cancel)
-                          : pooled_->sampleNormal(point, cancel);
+        try {
+            result = ct_ ? ct_->sampleNormal(point, cancel)
+                   : lasagna_ ? lasagna_->sampleNormal(point, cancel)
+                              : pooled_->sampleNormal(point, cancel);
+        } catch (const std::invalid_argument&) {
+            throw; // a bad query point: this line's problem
+        } catch (const vc::SheetNormalSourceError&) {
+            throw;
+        } catch (const std::exception& e) {
+            // Anything else the samplers throw is the source failing to read
+            // (vc_reader I/O), not a property of the line being linked.
+            if (cancel && cancel->load()) throw;
+            throw vc::SheetNormalSourceError(std::string("normal source ") + location().dump() + ": " + e.what());
+        }
         if (profile_) {
             seconds_ += std::chrono::duration<double>(std::chrono::steady_clock::now()-start).count();
             ++queries_;
@@ -891,6 +902,8 @@ Detection detectLinesToSurfaces(StoredGeometry& inputs, size_t lineCount, const 
                 }
             try {
                 autoLink(fiber, proposals, surfaces, sampler, lineParams, sourceScale, stripSource, report, cancel);
+            } catch (const vc::SheetNormalSourceError&) {
+                throw; // the source, not this line, failed: the whole run fails
             } catch (const std::exception& e) {
                 checkCancelled(cancel);
                 report.problems.push_back(fiber.uuid + ": " + e.what() + ", skipped");
