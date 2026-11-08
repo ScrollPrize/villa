@@ -167,7 +167,7 @@ def input_upload_error():
         payload={"code": INPUTS_IN_OBJECT_STORE})
 
 # Input paths are the service's (its bindings) and the project's; a session
-# request may name only these, each among service-advertised values.
+# request may specify only these, each among service-advertised values.
 _CLIENT_SELECTABLE_PATHS = ("checkpoint",)
 
 
@@ -224,7 +224,7 @@ class ObjectStoreBinding:
     store file on the service host, which clients on that host attach too,
     or (``served``) the endpoint of the vc_object_server holding it, which
     clients anywhere attach. Clients identify the store by ``uuid`` and the
-    history ``generation`` positions belong to. ``author`` names the service
+    history ``generation`` positions belong to. ``author`` identifies the service
     in the store when it refreshes links and commits; ``link_timeout_s`` is
     how long a served store's link refresh may take (its server's
     --request-deadline).
@@ -245,9 +245,10 @@ class ObjectStoreBinding:
                 "object_store_input_position": None}
 
     def open(self, *, read_only=False, cache_directory=None):
-        """The store, for a block (object_store_inputs.open_store): a file
-        opened read-only or as the service's author, or the served store
-        attached as it."""
+        """Open the local or served store for a context block.
+
+        Writes use the service's author; local files can be opened read-only.
+        """
         from object_store_inputs import open_store
         return open_store(self.config(), read_only=read_only, cache_directory=cache_directory)
 
@@ -423,7 +424,7 @@ class ServiceBindings:
 
 
 def bind_service_inputs(output_directory, cache_directory, winding_inference=None):
-    """Resolve the launch path bindings once. A named winding-inference
+    """Resolve the launch path bindings once. A configured winding-inference
     artifact must exist; one that is unusable for another reason is
     advertised as unavailable (``ServiceBindings.winding_inference_status``)
     and fails only the fits that need it."""
@@ -432,7 +433,7 @@ def bind_service_inputs(output_directory, cache_directory, winding_inference=Non
         winding = str(Path(winding_inference).expanduser().resolve(strict=False))
         if not Path(winding).is_dir():
             raise ServiceBindingError(
-                f"--winding-inference {winding} is not a directory: name the "
+                f"--winding-inference {winding} is not a directory: specify the "
                 "winding-inference artifact (the directory holding its manifest.json)")
     return ServiceBindings(str(output_directory), str(cache_directory), winding)
 
@@ -1168,7 +1169,7 @@ class ServiceState:
     def session_checkpoints(self):
         """Checkpoints under the session output directory, newest first.
 
-        These are the host checkpoints a client may name: everything this
+        These are the host checkpoints a client may select: everything this
         service wrote or received (saves, autosaves, uploads) lives under the
         output directory. Advertising them is what lets a client offer a
         choice instead of asking the user to type a path on a host it may
@@ -1220,7 +1221,7 @@ class ServiceState:
         if offending:
             raise ApiError(
                 HTTPStatus.BAD_REQUEST,
-                "This service owns its input paths; the request may name only "
+                "The service configures input paths; requests may specify only "
                 "a checkpoint",
                 [{"field": f"paths.{key}",
                   "message": "Input paths are the service's bindings and the project's"}
@@ -1294,7 +1295,7 @@ class ServiceState:
         input_config = None
         try:
             # The project (its fit volume and Lasagna dataset) owns these. A
-            # request that names one is refused rather than quietly overruled.
+            # request that overrides one is rejected.
             scroll_owned = sorted(
                 key for key in SCROLL_SPEC_OWNED_RUN_KEYS
                 if key in (request.get("run") or {}))
@@ -1363,7 +1364,7 @@ class ServiceState:
     def _early_volume_problems(self, scroll, paths, config):
         """What the project lacks for a fit volume known before the inputs
         are read: the configured fit_volume_uuid, else the volume a resumed
-        checkpoint recorded. When the store's selection will name the volume
+        checkpoint recorded. When the selected store objects determine the volume
         instead, a project with no volumes, or with no umbilicus for any of
         them, cannot serve it either. Reading the store can take minutes on
         a large one, so these are refused on the request, not after it
@@ -1557,7 +1558,7 @@ class ServiceState:
         if position.commit_sequence > head:
             raise ApiError(
                 HTTPStatus.CONFLICT,
-                f"inputs_position names commit {position.commit_sequence}, after the "
+                f"inputs_position specifies commit {position.commit_sequence}, after the "
                 f"service's store head {head}: these edits are not in the service's "
                 "store (a copy with the same UUID?)")
         if request_uuid is not None:
@@ -1792,7 +1793,7 @@ class ServiceState:
             return
         with self.lock:
             if self.session_id == session_id:
-                # The live request names the inputs now resident: a later
+                # Record the currently loaded inputs so a later
                 # model-only rebuild (and its checkpoints) keeps this position.
                 if self.session_request:
                     run = dict(self.session_request.get("run") or {})
@@ -1814,7 +1815,7 @@ class ServiceState:
     def _rebuild_stage_locked(self, paths, run, preview, scroll, state):
         """How much of the resident session this request has to replace.
 
-        Everything outside ``run.config`` is ``all``. Paths name host inputs
+        Everything outside ``run.config`` is ``all``. Paths refer to host inputs
         whose contents another process may have changed, so retaining a stage
         across one would need a content fingerprint nothing computes; the
         preview block, the run tag, the z window and the storage backend are
@@ -1918,7 +1919,7 @@ class ServiceState:
 
         With a bound store the build reads a position. A checkpoint resume
         reads the pins the checkpoint recorded of this store, unless the
-        request reloads the inputs or names a position to include;
+        request reloads the inputs or specifies a minimum position;
         otherwise the inputs are linked and pinned first
         (``_prepare_then_build``), while the resident session, if any, is
         left alone. Returns the build's ID.
@@ -1937,7 +1938,7 @@ class ServiceState:
             run = self._pin_run(run, pins)
             record = {**pins.position.provenance(), "requested": None, "head": None,
                       "attempts": 0, "source": "checkpoint"}
-        # The checkpoint's inputs name the fit volume.
+        # Use the fit volume recorded in the checkpoint's inputs.
         project = scroll.project
         try:
             volume = self._unprepared_volume(paths, scroll)
@@ -1961,9 +1962,10 @@ class ServiceState:
 
     @staticmethod
     def _pin_run(run, pins):
-        """The run pinned at ``pins`` (InputPins): the configuration names
-        the position; the versions ride along in memory for the build
-        (never in a request or status, which carry the position alone)."""
+        """Store the pinned position and object versions in the run config.
+
+        Client requests and status responses carry only the position.
+        """
         return dataclasses.replace(run, config={
             **run.config, "object_store_input_position": pins.provenance()})
 
@@ -2025,11 +2027,12 @@ class ServiceState:
         return build_id
 
     def _prepare_inputs(self, paths, run, scroll, minimum):
-        """Link and pin the build's position with the configuration it will
-        apply: the fit volume its selection names now resolves the scroll
-        (the link refresh reads normals at its Lasagna scale), then
-        object_store_inputs.prepare_position, which must leave that volume
-        the fit volume. Returns ``(prepared, volume, paths, ScrollSpec)``."""
+        """Resolve the fit volume, then link and pin the selected inputs.
+
+        Resolve the scroll first so linking uses the correct Lasagna scale.
+        Check that preparation keeps the same fit volume.
+        Returns ``(prepared, volume, paths, ScrollSpec)``.
+        """
         from object_store_inputs import read_snapshot, reading_stage, request_from_config
         config = self._effective_config(paths, run)
         progress = self._input_progress()
@@ -2359,7 +2362,7 @@ class ServiceState:
 
         Runs on the fitter thread: it claims the inputs (their digest and
         input generation: an update to another position with identical
-        inputs still names that position) and leaves copying and hashing to
+        inputs still records the new position) and leaves copying and hashing to
         a background thread.
         """
         digest = status.get("input_digest")
@@ -2419,7 +2422,7 @@ class ServiceState:
         The single-GPU runtime reports as rank 0; child ranks of a
         distributed session publish their snapshots through the parent
         queue and arrive here tagged with their originating rank, so every
-        record names the process that produced it.
+        record identifies the process that produced it.
         """
         if not isinstance(status, dict):
             return
@@ -2712,7 +2715,7 @@ class ServiceState:
         return PublishedPreviewIndex(paths.output_directory)
 
     def _retain_pinned_previews(self):
-        """A prune exemption for surfaces a saved checkpoint still names."""
+        """Protect surfaces referenced by a saved checkpoint from pruning."""
         preview_index = self._published_preview_index()
         if preview_index is None:
             return None
@@ -2952,13 +2955,8 @@ class ServiceState:
     def save_checkpoint(self, request):
         """Write a named checkpoint into this session's checkpoint folder.
 
-        The client names the file; the service decides where it lives. A
-        checkpoint has only ever been allowed under the session output
-        directory, so asking the client for an absolute path on a host it may
-        never have seen only ever meant "type the prefix I am about to check
-        for". A name says the same thing without the path policing, and it is
-        the same name ``/session/status`` reports back as
-        ``checkpoint_path``.
+        The client supplies a filename. The service saves it under the
+        session output directory and returns the path as ``checkpoint_path``.
         """
         session = self._require_session()
         name = self._checkpoint_file_name(request.get("name"))
@@ -3055,22 +3053,17 @@ class ServiceState:
                 self.status_generation += 1
 
     def _resolve_load_source(self, request):
-        """The single checkpoint a load request names, resolved by its host.
+        """Resolve a checkpoint from exactly one service-provided reference.
 
-        A load names exactly one of two things, and both are strings this
-        service handed out: ``host_checkpoint`` is one of the checkpoints
-        ``/bindings`` advertises, and ``uploaded_checkpoint`` is the path a
-        checkpoint upload returned. Neither asks the client to reason about a
-        filesystem it may never have seen — that is why they are separate
-        fields rather than one free path: they are checked against different
-        sets, and the client knows which it has without inspecting the string.
+        ``host_checkpoint`` must appear in ``/bindings``;
+        ``uploaded_checkpoint`` must be a path returned by an upload.
         """
         host = str(request.get("host_checkpoint") or "").strip()
         uploaded = str(request.get("uploaded_checkpoint") or "").strip()
         if bool(host) == bool(uploaded):
             raise ApiError(
                 HTTPStatus.BAD_REQUEST,
-                "A load names exactly one of host_checkpoint or "
+                "Specify exactly one of host_checkpoint or "
                 "uploaded_checkpoint")
         if host:
             if host not in set(self.session_checkpoints()):
@@ -3228,7 +3221,7 @@ class ServiceState:
         """Turn a preflight refusal into the 409 a client can act on.
 
         The stage comes from the *whole* cfg diff, not from the invariants the
-        preflight named. Two reasons. Some model-shaping keys the preflight
+        preflight reported. Some model-shaping keys the preflight
         reports (model_flow_bounds_z_margin) are read during host preparation,
         so "only shape keys mismatched" would not imply a model-stage rebuild.
         And a checkpoint's stored cfg overrides host-affecting keys the
@@ -3414,7 +3407,7 @@ class ServiceState:
     def commit(self, request):
         """Start committing one published preview to the bound store.
 
-        ``artifact`` names the preview artifact (status ``preview_artifact``)
+        ``artifact`` identifies the preview artifact (status ``preview_artifact``)
         to commit. The artifact is held from here until the worker has read
         it, so pruning cannot delete it underneath; one already pruned
         answers 410 and commits nothing. Committing the same model state,
@@ -3427,7 +3420,7 @@ class ServiceState:
         artifact_id = (request or {}).get("artifact")
         if not isinstance(artifact_id, str) or not artifact_id:
             raise ApiError(HTTPStatus.BAD_REQUEST,
-                           "artifact must name a published preview")
+                           "artifact must refer to a published preview")
         if not self._commits_supported():
             raise ApiError(HTTPStatus.CONFLICT,
                            "This service cannot commit to its object store")

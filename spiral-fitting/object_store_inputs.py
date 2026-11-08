@@ -121,9 +121,10 @@ class Selector:
 
 @dataclasses.dataclass(frozen=True)
 class InputPosition:
-    """An immutable store state: the store, its history generation and one
-    of its commit sequences (store.status()). Every reader of the store,
-    local or through vc_object_server, names the same state by it."""
+    """Identify a store state by UUID, history generation and commit sequence.
+
+    Local and hosted readers use the same identifiers.
+    """
     store: str
     generation: str
     commit_sequence: int
@@ -198,7 +199,7 @@ class InputPins:
     @classmethod
     def from_manifest(cls, manifest):
         """The pins an input manifest (InputSnapshot.manifest) records, or
-        None when it names no position."""
+        None when it contains no position."""
         position = InputPosition.from_provenance((manifest or {}).get('position'))
         if position is None:
             return None
@@ -1247,7 +1248,7 @@ def materialize_point_collections(store, snapshot, patches, first_id=0,
                 continue
             point = points.get(point_id)
             if point is None:
-                problems.append(f'point-surface edge {rel.uuid} names point '
+                problems.append(f'point-surface edge {rel.uuid} refers to point '
                                 f'{point_id}, absent from {obj.uuid}')
             elif attachment is None:
                 counts['pcl attachments to unfitted patches'] += 1
@@ -2048,7 +2049,7 @@ def fiber_normal_source(config, lasagna=None, volume_uuid=None):
     or not the dense-normal loss is on; fit_session.lasagna_normal_inputs):
     ``{'pool', 'scale'}``, the pack the fitter loads (lasagna_source) and its
     array's downsampling relative to the fit volume. The store reads the
-    pack, never the dataset's arrays; a normal CT's level names its group.
+    pack, never the dataset's arrays; a normal CT's level selects its group.
     Lasagna and CT normals are exclusive; a configured CT is then ignored
     with a note.
     """
@@ -2302,10 +2303,10 @@ def submit_link_plan(store, planned, author=None, progress=None, log=None, read_
     if marker is None:
         raise LinkRefreshError([
             f'the link marker of the links committed at commit {committed} cannot be read: '
-            'the receipt names no marker version'])
+            'the receipt contains no marker version'])
     if marker.get('commit_sequence') != committed:
         raise LinkRefreshError([
-            f'the link marker the receipt names records commit {marker.get("commit_sequence")}, '
+            f'the link marker referenced by the receipt records commit {marker.get("commit_sequence")}, '
             f'not the links committed at commit {committed}'])
     if len(reports) != len(runs):
         raise LinkRefreshError([
@@ -2367,7 +2368,7 @@ def link_marker_key_parts(volume_uuid, config, normal_source):
     """What links depend on outside the store: the fit volume, the
     detector parameters and normal source (link_refresh_provenance), the
     store library's detector versions and which detectors run. A marker
-    records them with their digest (``key``), so a mismatch names what
+    records them with their digest (``key``), so a mismatch reports what
     changed."""
     from vc_object_store import detector_versions
     return {
@@ -2446,7 +2447,7 @@ def changes_after(store, position, head):
     InputPosition of this store) up to commit ``head``, from the store's
     change feed; None when the feed no longer reaches the position
     (another generation, or before its start), and a whole-store refresh
-    is the only safe plan. Each change names its record's kind
+    is the only safe plan. Each change records its kind
     (StoreChange), read in batches."""
     cursor = {'store': position.store, 'generation': position.generation,
               'sequence': position.commit_sequence}
@@ -2682,7 +2683,7 @@ def _startup_phase(config, request, lasagna, cache_directory, log, minimum_posit
     """Rank zero's startup: link and pin a position of the store
     (prepare_position) as object_store_author, unless
     object_store_input_position (or ``pins``, the versions a resume or an
-    update knows) names the position to read exactly. Returns
+    update provides) specifies the position to read exactly. Returns
     ``(SelectedObjects, report lines, InputPins)``; raises
     ObjectStoreInputError on any failure."""
     author = config['object_store_author']
@@ -3025,7 +3026,7 @@ def load_fit_inputs(config, *, lasagna=None, external_frames=None, dist=None,
     the one refresh phase: it links and pins a position of the store,
     including at least ``minimum_position`` (prepare_position), unless
     object_store_input_position (or ``pins``: the versions a resume's
-    checkpoint or an input update knows) names the position to read. The
+    checkpoint or an input update provides) specifies the position to read. The
     other ranks wait for its result, and every rank fails when it fails.
     Every rank then reads the pinned versions read-only, materializes the
     same frozen snapshot and closes the store; their manifests must agree

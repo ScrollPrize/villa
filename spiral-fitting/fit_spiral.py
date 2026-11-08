@@ -1020,7 +1020,7 @@ class FitContext:
         # object_store_inputs.FitInputs materialized from a frozen object-store
         # snapshot: patches and point constraints with the store's links. When
         # None, load_host_inputs refreshes and reads the store the config
-        # names (object_store_location).
+        # specifies (object_store_location).
         self.object_store_inputs = object_store_inputs
         # Receives each line the object-store adapter reports while it
         # refreshes, freezes and derives the inputs (selection, refresh
@@ -1633,7 +1633,7 @@ class FitContext:
 
     @property
     def lasagna_group(self):
-        """The Lasagna arrays' name, or None when the fit reads no dataset."""
+        """The Lasagna array group, or None when no dataset is configured."""
         return self.lasagna_source.group if self.lasagna_source is not None else None
 
     def _lasagna_normal_inputs(self):
@@ -1688,7 +1688,7 @@ class FitContext:
         input manifest records, so the fit reads exactly the inputs it was
         trained on whatever the store holds now, and the checkpoint's input
         check passes by construction. None when there is no checkpoint, the
-        configuration names a position already (a service build), the
+        configuration already specifies a position (a service build), the
         checkpoint records no pinned inputs, or
         object_store_allow_changed_inputs asks for the current inputs."""
         if (not self.resume_path or self.config['object_store_input_position'] is not None
@@ -4327,10 +4327,10 @@ if __name__ == '__main__':
                              validate_fit_inputs)
 
     parser = argparse.ArgumentParser(
-        description='Headless Spiral fit of explicitly named inputs.')
+        description='Headless Spiral fit using an input manifest.')
     parser.add_argument(
         '--inputs', required=True, metavar='MANIFEST',
-        help='Input manifest (JSON) naming the reference volume, the scroll '
+        help='Input manifest (JSON) specifying the reference volume, the scroll '
              'facts, the umbilicus and any supervision inputs; relative paths '
              'resolve against its directory')
     parser.add_argument(
@@ -4367,8 +4367,7 @@ if __name__ == '__main__':
                  or default_user_cache_dir())
 
     overrides = get_env_config_overrides()
-    # The store is named on the command line only, as the service's
-    # binding owns it there.
+    # Configure store access through CLI flags, not environment overrides.
     owned = sorted({'object_store_location', 'object_store_author',
                     'object_store_link_timeout_s'} & set(overrides))
     if owned:
@@ -4401,11 +4400,10 @@ if __name__ == '__main__':
         config['object_store_location'] = cli_args.object_store
         config['object_store_author'] = cli_args.object_store_author
         config['object_store_link_timeout_s'] = cli_args.object_store_link_timeout
-        # The inputs the configuration needs, checked before anything is
-        # built: a missing one is named, never looked for elsewhere.
+        # Report missing required inputs before building anything.
         input_errors = validate_fit_inputs(
             input_paths, config, missing={
-                key: f'name it as {entry} in the input manifest'
+                key: f'set {entry} in the input manifest'
                 for key, entry in (('umbilicus', 'umbilicus.path'),
                                    ('lasagna', 'lasagna.manifest'),
                                    ('fiber_directions', 'fiber_directions'),
@@ -4415,14 +4413,10 @@ if __name__ == '__main__':
                 f'The inputs of {cli_args.inputs} cannot be fitted:\n  '
                 + '\n  '.join(f'{error["field"]}: {error["message"]}'
                               for error in input_errors))
-        # Reject inaccessible or obsolete stores before packing/loading the
-        # much larger supervision volumes, opened as the fit will open it: a
-        # store file a vc_object_server holds refuses the writable open a
-        # link refresh needs (bind that server's endpoint instead). A fit
-        # that reads a position (configured, or a resumed checkpoint's pins
-        # unless object_store_allow_changed_inputs relinks) never links, so
-        # it opens read-only, as FitContext._resume_input_pins does. This
-        # check never refreshes links.
+        # Check store access before loading the large supervision volumes.
+        # Link refresh needs write access; use the endpoint if a server owns
+        # the file. Pinned inputs only need read access. This check does not
+        # refresh links.
         from object_store_inputs import open_store
         reads_position = (config['object_store_input_position'] is not None
                           or (os.environ.get('FIT_SPIRAL_RESUME_PATH')
