@@ -11,7 +11,8 @@ struct SpiralPreviewProvenance {
     // The object-store inputs the previewed model was fitted to; empty for
     // previews published before they were recorded.
     QString inputDigest;
-    // The hub position they were read at; -1 when not read at one.
+    // The store commit they were read at ({store, generation,
+    // commit_sequence}); -1 when not read at one.
     qint64 inputPosition = -1;
 };
 
@@ -22,13 +23,13 @@ inline SpiralPreviewProvenance spiralPreviewProvenance(
         manifest.value(QStringLiteral("source_fit_iteration")).toInteger(-1),
         manifest.value(QStringLiteral("input_digest")).toString(),
         manifest.value(QStringLiteral("input_position")).toObject()
-            .value(QStringLiteral("sequence")).toInteger(-1),
+            .value(QStringLiteral("commit_sequence")).toInteger(-1),
     };
 }
 
 // How a preview's inputs relate to the session's: empty when they are the
 // same inputs (or either is unknown), otherwise a label for the preview,
-// naming the hub position it was fitted at when known. Equal inputs read at
+// naming the store commit it was fitted at when known. Equal inputs read at
 // two positions are the same inputs.
 inline QString spiralPreviewInputNote(const SpiralPreviewProvenance& preview,
                                       const QString& sessionDigest)
@@ -37,7 +38,7 @@ inline QString spiralPreviewInputNote(const SpiralPreviewProvenance& preview,
         || preview.inputDigest == sessionDigest)
         return {};
     if (preview.inputPosition >= 0)
-        return QStringLiteral("fitted to the inputs of hub position %1 (%2, not %3)")
+        return QStringLiteral("fitted to the inputs at commit %1 (%2, not %3)")
             .arg(preview.inputPosition).arg(preview.inputDigest.left(12), sessionDigest.left(12));
     return QStringLiteral("fitted to other inputs (%1, not %2)")
         .arg(preview.inputDigest.left(12), sessionDigest.left(12));

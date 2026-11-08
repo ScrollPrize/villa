@@ -22,7 +22,6 @@
 
 namespace vc::objects {
 class ObjectStoreSession;
-class PushHold;
 struct AttachmentIdentity;
 }
 
@@ -297,8 +296,8 @@ signals:
                                const QString& message);
     void logMessage(const QString& message);
     void errorOccurred(const QString& message);
-    // Update fit inputs: a phase ("pushing", "linking", "pulling") as it
-    // starts, then the outcome.
+    // Update fit inputs: one phase ("linking") as it starts, before the
+    // service is asked, then the outcome.
     void inputUpdateProgress(const QString& phase, const QString& text);
     void inputUpdateFinished(const SpiralServiceManager::InputUpdate& update);
     void commitProgress(const QString& stage);
@@ -382,7 +381,8 @@ private:
     quint64 _inputUpdateSerial = 0;
     void finishInputUpdate(InputUpdate update, quint64 serial);
     void sendInputUpdate(QJsonObject request, qint64 requested, quint64 serial);
-    // The attachment an update holds pushes on: its hold ends with it.
+    // The attachment an update reads its position from: detaching it
+    // abandons the update.
     std::unique_ptr<vc::objects::AttachmentIdentity> _inputUpdateAttachment;
     void abandonInputUpdate(const QString& reason);
     void sendRebuildRequest(QJsonObject request);

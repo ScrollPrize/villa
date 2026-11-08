@@ -389,8 +389,10 @@ SpiralWorkspace::SpiralWorkspace(CState* mainState, QWidget* parent)
 
     _panel = new SpiralPanel(_service, this);
     connect(_panel, &SpiralPanel::openStoredFitRequested, this, &SpiralWorkspace::openStoredFit);
+    // The update's first (and only) phase is emitted as it begins, before
+    // the service is asked: what is saved then is what the fit will hold.
     connect(_service, &SpiralServiceManager::inputUpdateProgress, this, [this](const QString& phase, const QString&) {
-        if (phase != QStringLiteral("pushing")) return;
+        if (phase != QStringLiteral("linking")) return;
         _updatingDrafts.clear();
         _updatingPatches.clear();
         for (const auto& id : _savedDraftIds) _updatingDrafts[id] = _savedCollections.value(id).version;

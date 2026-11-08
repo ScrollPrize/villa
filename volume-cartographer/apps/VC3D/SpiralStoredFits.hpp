@@ -11,7 +11,6 @@
 
 #include <opencv2/core/mat.hpp>
 
-#include <chrono>
 #include <memory>
 #include <optional>
 #include <set>
@@ -60,13 +59,12 @@ struct StoredFit {
     cv::Mat_<int32_t> windingIds;
 };
 
-// Read the committed fit `uuid` (its current geometry, or `geometryRevision`).
-// A hosted replica that does not hold it yet (a commit just pushed from the
-// service) is synced once, waiting up to `syncTimeout`, and read again.
-// Throws std::runtime_error with the reason when it cannot be read.
+// Read the committed fit `uuid` (its current geometry, or `geometryRevision`)
+// from the attached store, which holds every commit as soon as it is made
+// (a file shared in place, or a served store). Throws std::runtime_error
+// with the reason when it cannot be read.
 StoredFit readStoredFit(const std::shared_ptr<vc::objects::ObjectStoreSession>&,
                         const vc::objects::AttachmentIdentity&, const std::string& uuid,
-                        const std::optional<std::string>& geometryRevision = std::nullopt,
-                        std::chrono::milliseconds syncTimeout = std::chrono::seconds(120));
+                        const std::optional<std::string>& geometryRevision = std::nullopt);
 
 }  // namespace vc3d::spiral

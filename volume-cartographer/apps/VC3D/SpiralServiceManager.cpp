@@ -54,7 +54,7 @@ constexpr int kPreviewCacheKept = 3;
 
 // Deterministic default output root per attached object store: the service
 // requires --output, and two stores fitted on this computer must not share
-// generated state (autosaves, previews, replicas). Keyed by the store's
+// generated state (autosaves, previews). Keyed by the store's
 // absolute path, so reattaching the same store reuses its output.
 QString defaultLocalOutputRoot(const QString& storeLocation)
 {

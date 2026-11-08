@@ -76,8 +76,7 @@ std::vector<StoredFitEntry> listStoredFits(vc::objects::ObjectStoreSession& sess
 
 StoredFit readStoredFit(const std::shared_ptr<vc::objects::ObjectStoreSession>& session,
                         const vc::objects::AttachmentIdentity& attachment, const std::string& uuid,
-                        const std::optional<std::string>& geometryRevision,
-                        std::chrono::milliseconds syncTimeout)
+                        const std::optional<std::string>& geometryRevision)
 {
     auto present = [&]() {
         bool found = false;
@@ -87,7 +86,6 @@ StoredFit readStoredFit(const std::shared_ptr<vc::objects::ObjectStoreSession>& 
         });
         return found;
     };
-    (void)syncTimeout;
     if (!present()) throw std::runtime_error("The committed fit " + uuid + " is not in the attached object store");
     session->ensureGeometry(attachment, uuid);
 

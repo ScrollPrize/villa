@@ -221,6 +221,7 @@ private slots:
         useProtocolProject(manager);
         QSignalSpy manifests(&manager, &SpiralServiceManager::inputManifestAvailable);
         QSignalSpy updates(&manager, &SpiralServiceManager::inputUpdateFinished);
+        QSignalSpy progress(&manager, &SpiralServiceManager::inputUpdateProgress);
         QSignalSpy errors(&manager, &SpiralServiceManager::errorOccurred);
         manager.connectToService(protocolProfile(service.port));
         QTRY_VERIFY_WITH_TIMEOUT(manager.isReady() && manager.ownsSessionLease(), 30000);
@@ -243,6 +244,10 @@ private slots:
         manager.setObjectStore(session, attachment);
         QTRY_VERIFY_WITH_TIMEOUT(manager.storeBinding().sameFile, 10000);
         manager.updateFitInputs(request);
+        // The update's one phase, "linking", is emitted as it begins: the
+        // workspace snapshots what is saved then as the fit's inputs.
+        QCOMPARE(progress.count(), 1);
+        QCOMPARE(progress.at(0).at(0).toString(), QStringLiteral("linking"));
         QTRY_COMPARE_WITH_TIMEOUT(updates.count(), 1, 60000);
         SUCCEEDED_UPDATE(updates, 0, update);
         QVERIFY(update.requested > 0 && update.fitted >= update.requested);

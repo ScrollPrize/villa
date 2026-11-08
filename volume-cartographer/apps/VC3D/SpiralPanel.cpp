@@ -2552,8 +2552,8 @@ void SpiralPanel::updateStatus(const QJsonObject& status)
     const bool preparingInputs =
         progress.value(QStringLiteral("operation")).toString()
         == QStringLiteral("loading");
-    // An input update in flight (pushing here, or linking and installing on
-    // the service) holds the fit too: the service refuses Run and rebuilds
+    // An input update in flight (linking and installing on the service)
+    // holds the fit too: the service refuses Run and rebuilds
     // until it settles.
     const bool updatingInputs = _service->inputUpdateActive()
         || !status.value(QStringLiteral("input_update")).isNull();

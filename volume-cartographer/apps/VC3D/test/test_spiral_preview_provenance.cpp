@@ -36,14 +36,14 @@ private slots:
         // A preview or session without a digest is not called different.
         QVERIFY(vc3d::spiralPreviewInputNote({200, {}}, QStringLiteral("bbbb")).isEmpty());
         QVERIFY(vc3d::spiralPreviewInputNote(provenance, {}).isEmpty());
-        // One fitted at a hub position names it.
+        // One fitted at a store commit names it.
         provenance = vc3d::spiralPreviewProvenance({
             {QStringLiteral("input_digest"), QStringLiteral("aaaaaaaaaaaaaaaa")},
-            {QStringLiteral("input_position"), QJsonObject{{QStringLiteral("sequence"), 41}}},
+            {QStringLiteral("input_position"), QJsonObject{{QStringLiteral("commit_sequence"), 41}}},
         });
         QCOMPARE(provenance.inputPosition, qint64{41});
         QCOMPARE(vc3d::spiralPreviewInputNote(provenance, QStringLiteral("bbbbbbbbbbbbbbbb")),
-                 QStringLiteral("fitted to the inputs of hub position 41 (aaaaaaaaaaaa, not bbbbbbbbbbbb)"));
+                 QStringLiteral("fitted to the inputs at commit 41 (aaaaaaaaaaaa, not bbbbbbbbbbbb)"));
     }
 };
 
