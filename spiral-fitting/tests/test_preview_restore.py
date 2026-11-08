@@ -420,7 +420,7 @@ class ServiceRestoreTests(unittest.TestCase):
             state = self._state(output)
             current = self._published(output, 1, DIGEST)
             current.raw_manifest.update(input_digest="inputs-b",
-                                        input_position={"hub": "h", "sequence": 9})
+                                        input_position={"store": "s", "generation": "g", "commit_sequence": 9})
             session = mock.Mock()
             session.status.return_value = {"input_digest": "inputs-b"}
             state.session = session
@@ -428,7 +428,7 @@ class ServiceRestoreTests(unittest.TestCase):
                 if published is None:
                     published = self._published(output, 2, OTHER_DIGEST, iteration=80)
                     published.raw_manifest.update(input_digest="inputs-a",
-                                                  input_position={"hub": "h", "sequence": 5})
+                                                  input_position={"store": "s", "generation": "g", "commit_sequence": 5})
                 raw = output / "raw" / f"g{generation}"
                 raw.mkdir(parents=True)
                 (raw / "manifest.json").write_text("{}")
@@ -442,7 +442,7 @@ class ServiceRestoreTests(unittest.TestCase):
             status = state.status()
             self.assertEqual(state._preview.model_state_sha256, DIGEST)
             self.assertEqual(status["preview_source_iteration"], 40)
-            self.assertEqual(status["preview_input_position"], {"hub": "h", "sequence": 9})
+            self.assertEqual(status["preview_input_position"], {"store": "s", "generation": "g", "commit_sequence": 9})
             self.assertIsNotNone(PublishedPreviewIndex(output).lookup(
                 OTHER_DIGEST, input_digest="inputs-a"))
             records = state.events.read_after(0)["events"]

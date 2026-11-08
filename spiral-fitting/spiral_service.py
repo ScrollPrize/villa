@@ -23,8 +23,8 @@ Patch, PCL and fiber inputs come from the object store bound at launch
 linked, pinned position of it, and ``POST /session/update-inputs`` replaces
 a resident fit's inputs with a newer position's in place, keeping its model
 and optimiser. A position is a commit of the bound store: the store file
-the service opens, which clients on its host attach too, or (a later
-stage) a store served by vc_object_server. Without a position (a rebuild
+the service opens, which clients on its host attach too, or a store served
+by vc_object_server, bound by its endpoint. Without a position (a rebuild
 of an old checkpoint's inputs) the
 inputs are frozen for a resident session, and
 changing them is an edit in the store followed by a full-input rebuild. One

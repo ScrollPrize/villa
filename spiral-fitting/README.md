@@ -6,12 +6,12 @@ the VC3D Spiral workspace; `fit_spiral.py` is the underlying fitter.
 
 ## Running the object-store workflow
 
-Use VC3D and the Spiral service from the same checkout: the explicit-inputs
-protocol is API **45**. Update the existing Spiral environment with `uv sync`
+Use VC3D and the Spiral service from the same checkout: the store-location
+protocol is API **47**. Update the existing Spiral environment with `uv sync`
 from this directory when deploying this checkout (native prerequisites must
 already be installed). This builds the Python bindings, not the standalone
-`vc_object_ingest` and `vc_object_hub` tools; use those from a matching native
-object-store build.
+`vc_object_ingest`, `vc_object_server` and `vc_object_convert` tools; use
+those from a matching native object-store build.
 
 | Input | Command-line fit | Service fit |
 | --- | --- | --- |
@@ -60,9 +60,10 @@ FIT_SPIRAL_CONFIG_OVERRIDES='{"z_begin":9000,"z_end":9100,"input_use_tracks":tru
 ```
 
 For the service, enable tracks and choose the z window in VC3D before
-Initialize Fit. Localhost mode can launch the service itself. A remote
-service needs a replica of the same hub as VC3D; see **Object store,
-positions and input updates** for launch and SSH migration requirements.
+Initialize Fit. Localhost mode can launch the service itself. A service on
+another host that VC3D should edit against needs its store served by
+`vc_object_server` and bound by endpoint; see **Object store, positions and
+input updates**.
 
 Startup normally writes refreshed relationships, including track crossings.
 `object_store_refresh_links: false` consumes existing relationships instead;
@@ -168,7 +169,7 @@ by scrollprize.org/tutorial_spiral.
 
 `runners/run_single.py --resume` records the object store's persistent UUID
 in its run state and checks it even when the fit stage is already complete.
-Moving the store or using a replica of the same store preserves this identity;
+Moving the store or serving it with `vc_object_server` preserves this identity;
 switching to a different store is refused. Older runner state files without
 the UUID cannot establish which store was used and are refused too; use a new
 output directory. This check identifies the store, not its current contents;
@@ -394,13 +395,14 @@ PCL-patch, fiber-patch, patch-overlap and track-crossing links as
 writing them back to the store. Detectors whose object kinds are not all
 selected are skipped. `input_use_patch_overlaps: false` skips the
 patch-overlap detector and adds no overlap pairs to the fit (a rebuild
-setting). Every detector failure is reported together and stops
-the fit before training (detectors that already committed are named; a rerun
-reconciles them). `object_store_refresh_links: false` reads the store's
+setting). The refresh is one `link_objects` request of the store: every
+detector runs under one read snapshot and their links commit together with
+the link marker, so a detector failure stops the fit before training and
+writes nothing. `object_store_refresh_links: false` reads the store's
 current relationships read-only.
 
-After a successful refresh the store records a link marker (not journaled;
-it adds no position and no hub sync carries it): the position, the fit
+The link marker is one `link_marker` record of the store, updated in the
+links' own commit (two concurrent refreshes conflict): the position, the fit
 volume, the link parameters, normal source and detector versions, and the
 selection. The next refresh skips the detectors when the marker's inputs
 match, the selection is the same or smaller, and nothing since its position
@@ -420,8 +422,8 @@ only (refresh still runs, so new links stay pending and unused).
 The outer shell is the one active surface tagged `spiral-outer-shell` (two are
 an error). It is never a patch: the default and tag selections leave it out,
 and naming it in `object_store_patch_uuids` is refused, so no detector links
-it. It is read with the selection, in the same fit volume, and its revision
-is part of the input manifest and digest; a fit with shell losses or
+it. It is read with the selection, in the same fit volume, and it is part
+of the input manifest (at its version) and digest; a fit with shell losses or
 winding-model supervision refuses a store without one, and with
 `input_use_outer_shell` off it is not read. An input update that changes the
 shell is refused (the fit consumed it at build): rebuild instead.
@@ -443,36 +445,38 @@ the selection, consumed relationships and constraint counts; `python
 object_store_inputs.py dataset.vcobj --z-begin Z0 --z-end Z1` prints the same
 report without training.
 
-On a hosted replica (a clone of a store hub; see the store's "Hosted hub and
-replicas") the inputs are a **hub position**: startup pulls the hub head,
-refreshes links over the selection, publishes them with a conditional push
-that succeeds only while the hub is still at that head, and pins the
-resulting position, which later hub commits never change. A commit landing
-meanwhile, even an unrelated one, makes it pull and relink (bounded; a
-conflict keeps the hub's side, since this replica writes only recomputable
-links). `object_store_input_position` reads a position exactly, without
-linking. The manifest records the position (outside the digest: equal inputs
+The inputs are a **position** of the store, `{store, generation,
+commit_sequence}` (its UUID, its history generation and one of its commits,
+as `status()` reports them), the same whether the store is a file or served
+by `vc_object_server`. Startup reads the head, refreshes the links over the
+selection as one checked request that expects every object the detectors
+read, and pins the links' commit: the selected objects at the numbered
+versions it left them, which later commits never change. A commit touching
+one of those objects (or the marker) between the snapshot and the write
+conflicts, and startup reads the new head and relinks (bounded; unrelated
+commits do not interfere). `object_store_input_position` reads a position
+exactly, without linking (a served store needs the pinned versions with
+it). The manifest records the position (outside the digest: equal inputs
 at two positions are equal) and the link parameters and normal source, so a
 later change of either shows the fit's links as stale.
 
 The inputs are frozen for the fit: settings that would relink or re-derive
 them (`config.OBJECT_STORE_PCL_KEYS`, the PCL role toggles, selection and
 frame settings) need a new fit. Each run writes `object_store_inputs.json`
-(store, selection, the revision and scale of every object and the revision of
+(store, selection, the version and scale of every object and the version of
 every consumed relationship, the fit volume, external-input frames,
 materialization settings, and the refresh mode with its fiber-patch normal
 source) and checkpoints carry the same manifest and digest; a resume whose
 inputs differ is refused unless `object_store_allow_changed_inputs`.
 
-The digest identifies inputs the same way on every replica of a store (see
-the store's "Hosted hub and replicas"): an object by its geometry revision
-and a hash of the metadata the adapter reads (`metadata_sha256`: its frame,
-erosion, PCL role and sampling group, fiber classification), a relationship
-by its record, approval, generation, endpoint geometry revisions and a hash
-of its anchors and metadata (`content_sha256`). Object revision and
-relationship version UUIDs differ between replicas; the manifest keeps them
-(`object_revision`, `revision`) to resolve the inputs locally, outside the
-digest. A checkpoint written before these identities is compared on geometry
+The digest identifies inputs by content, not by store history: an object by
+its geometry revision and a hash of the metadata the adapter reads
+(`metadata_sha256`: its frame, erosion, PCL role and sampling group, fiber
+classification), a relationship by its record, approval, generation,
+endpoint geometry revisions and a hash of its anchors and metadata
+(`content_sha256`). The manifest keeps each object's and relationship's
+numbered `version`, outside the digest, to read the inputs back exactly. A
+checkpoint written before these identities is compared on geometry
 revisions and relationship generations, with a warning.
 
 ### Frames and units
@@ -513,15 +517,19 @@ PYTHONPATH=spiral-fitting:$VC_OBJECT_STORE_BUILD/python spiral-fitting/.venv/bin
   spiral-fitting/tests/test_object_store_tracks.py \
   spiral-fitting/tests/test_object_store_startup.py \
   spiral-fitting/tests/test_object_store_positions.py \
-  spiral-fitting/tests/test_object_store_lazy_relink.py
+  spiral-fitting/tests/test_object_store_lazy_relink.py \
+  spiral-fitting/tests/test_object_store_hosted.py
 ```
 
 These build small stores (`tests/object_store_fixture.py`; shared fixtures in
 `tests/conftest.py`) and cover selection, frames and scales, refresh and its
 idempotency, aggregated failures, read-only and approved-only modes, two-rank
 startup (a rank-local failure, manifest mismatch), resume refusal, positions
-linked and pinned on a hub replica or a store shared in place (including
-edits racing the link refresh), lazy and incremental relinking, tracks and
+linked and pinned (including edits racing the link refresh), lazy and
+incremental relinking, the same links, pins, service binding and commits
+through a `vc_object_server` endpoint (`test_object_store_hosted.py` runs a
+server subprocess when `VC_OBJECT_SERVER` names the binary and is skipped
+otherwise), tracks and
 their crossings (equal to the ones Spiral's own exact-crossing builder
 finds), and the runtime constraints against
 `tests/data/object_store_reference.json`, which the removed file loader
@@ -848,7 +856,7 @@ and rebuild carries a `project` block (`fit_session.SpiralProject`):
   Lasagna arrays' downsampling relative to its voxels (`lasagna_scale`, from
   the manifest's `source_to_base`, scaledown and base shape and the volume's
   shape) and its umbilicus from the project's umbilicus store (`uuid`,
-  `revision`, `points_zyx` in the volume's own voxels).
+  `generation`, `version`, `points_zyx` in the volume's own voxels).
 
 The fit volume is the one the selection's objects name (a checkpoint resume:
 the one its inputs were read in). The build fits that project volume:
@@ -867,7 +875,7 @@ the one its inputs were read in). The build fits that project volume:
   one in the cache it refreshes fiber links centerline-only, with a warning.
   The command-line fit builds its normals pack before refreshing.
 - **Umbilicus.** The project's, written under the output directory
-  (`project-inputs/umbilicus-<revision>.json`) as the file the fit reads, at
+  (`project-inputs/umbilicus-<uuid>-v<version>.json`) as the file the fit reads, at
   coordinate scale 1.
 
 The service reads no scroll specification or input manifest (those are the
@@ -879,7 +887,7 @@ dataset, the umbilicus's identity), the resolved `scroll` and `paths` (the
 inputs read by path, the fit volume as `volume_uuid`, and their
 `provenance`: the project and the service's bindings), which checkpoints
 record too. A
-rebuild after the project's volume changed (another umbilicus revision, a
+rebuild after the project's volume changed (another umbilicus version, a
 renamed project, another Lasagna dataset) rereads everything.
 
 ### Object store, positions and input updates
@@ -896,55 +904,45 @@ lists them under `service_owned`, a request that leaves them out or repeats
 the bound values is accepted, and a request naming another value is refused.
 VC3D removes them from saved profiles before sending a request.
 
-**A service on a plain store** (no `--object-store-hub`) shares the file in
-place with the clients on its machine (VC3D's project store): binding it
-makes the store record positions of its own (its journal head after each
-write, by any connection; the store's schema version becomes 18, so binaries
-from before the index refuse it). There is no hub, no replica and no sync:
-VC3D's saves are in the file the service reads. The service links over the
-selection and pins the new head when every write since the head it linked
-at is its own; another writer in between (a save, an approval) makes it
-relink at the new head, up to the same bound. Links it wrote for a head it
-then abandons stay as pending detector output, which the next refresh
-replaces. Keep the store on a local disk (SQLite's WAL does not work over
-network filesystems); a service on another machine needs a hub.
+**A store file** is shared in place with the clients on the service's host
+(VC3D's project store): there is no copy and no sync, VC3D's saves are in
+the file the service reads, and the store's lock serializes the writers.
+Keep the file on a local disk (SQLite's WAL does not work over network
+filesystems). A client on another host cannot attach it: it drives and
+watches the service over HTTP (builds, runs, previews, diagnostics, the
+input manifest), but has no edits, input overlays or opened commits, and
+VC3D says so once: *"This service's store is local to its host: edits and
+commits need it served (vc_object_server) and attached here."*
 
-**A hub-bound service** (`--object-store-hub HUB`, a path or an
-`sftp://[user@]host/path` address) works on its own replica of that hub:
-STORE is cloned there when absent and otherwise checked to replicate HUB; a
-STORE that already is a replica binds its own hub without the flag. Startup
-pulls once, so an unreachable hub fails the launch; for an `sftp://` hub the
-service's ssh runs in batch mode, so its account needs a key (or agent) with
-write access to the hub file and its directory and a `known_hosts` entry.
-SSH hubs now require one-time migration with all clients stopped:
+**A served store** (`vc_object_server STORE --port PORT`, bound by the
+service as `http://127.0.0.1:PORT` when both run on one host) is attached by
+clients anywhere: VC3D attaches `ssh://host:PORT` (or `http(s)://`), routes
+the Spiral kinds to it, and the whole editing workflow works as on a shared
+file. The link refresh then runs on the server: its `--request-deadline`
+and the service's `--object-store-link-timeout` must both cover the longest
+refresh (minutes for a scroll-sized store), its fiber-patch normal source (a
+Lasagna pack under the service's cache, or a CT path) must be readable by
+the server, and the input summary's `fiber_patch_normals` names the source
+used. A file a server holds refuses the service's writable open: bind the
+endpoint. Read-only opens of such a file still work. See the store's
+[serving instructions](../vc_object_store/docs/hosted.md#serving-a-store).
 
-```sh
-vc_object_hub enable-ssh-locking sftp://data-host/share/scroll.hub.vcobj
-```
-
-The server needs Linux, SSH command execution, `flock`, `timeout`, and an
-external OpenSSH `sftp-server`. Every client must be updated and use the SSH
-address after migration, including a service on the hub host: do not mix SSH
-process locking with local-path or mounted access. Previously mounted
-replicas must push before migration and be recloned through SSH afterward.
-The resulting `.lock/process-v1` is permanent and must not be removed.
-See the store's [hub migration instructions](../vc_object_store/docs/README.md#hosted-hub-and-replicas).
-For operations longer than the default 30-minute SSH session deadline, set
-`VC_HUB_SESSION_SECONDS` on the client before launch.
-
-The service's replica writes only detector links, pulls and pushes
-only during a build or an update, and is the only detector writer for its
-selection (a command-line refresh against the same hub would conflict with it).
+The service writes only detector links and its commits, only during a
+build, an update or a commit, and is the only detector writer for its
+selection (a command-line refresh of the same store would conflict with it).
 
 ```sh
-python spiral_service.py --output OUT --object-store ~/spiral/replica.vcobj \
-    --object-store-hub sftp://data-host/share/scroll.hub.vcobj
+vc_object_server /data/scroll.vcobj --port 9800 --request-deadline 1800
+python spiral_service.py --output OUT --object-store http://127.0.0.1:9800 \
+    --object-store-link-timeout 1800
 ```
 
-Each build (Initialize Fit, a full Rebuild Fit) links and pins a position (the
-hub's, or the shared store's own), including at least the request's
-`inputs_position` (the position a client's saved, or pushed, edits reached),
-before tearing anything down: a failure there leaves
+Each build (Initialize Fit, a full Rebuild Fit) links and pins a position,
+including at least the request's `inputs_position` (the position a client's
+saved edits reached: `{store, generation, commit_sequence}`, with the
+`request_uuid` of the last save's receipt, which the service's store must
+hold; a position of another store or generation, past the head, or whose
+receipt the store lacks is refused), before tearing anything down: a failure there leaves
 the resident fit untouched and is reported in `input_preparation_error`. A
 checkpoint resumes at the position it recorded. A model-only rebuild keeps the
 position. `POST /session/update-inputs {"inputs_position", "expected_input_generation"}`
@@ -970,12 +968,13 @@ store. Without `"inputs"` a rebuild that changes only model configuration
 keeps the inputs and one that changes anything else rereads them; the
 response's `inputs` says which happened.
 
-Status carries `input_digest` (the replica-independent digest of the fit's
-selection), `input_summary` (counts per kind and relationship, the volume,
-whether links were refreshed) and `input_position` (hub, sequence, the
-requested position, the head it was linked at, and where it came from). Every
-build and update publishes the selection, with each object's and
-relationship's revision pins, as an `input_manifest` artifact
+Status carries `input_digest` (the content digest of the fit's selection),
+`input_summary` (counts per kind and relationship, the volume, whether links
+were refreshed and which fiber-patch normal source they used) and
+`input_position` (store, generation, commit_sequence, the requested position,
+the head it was linked at, and where it came from). Every build and update
+publishes the selection, with each object's and relationship's version pins,
+as an `input_manifest` artifact
 (`object_store_inputs.json`). Previews, the preview index and autosave
 metadata record the digest and position of the inputs they were made from. A
 checkpoint whose recorded inputs differ from the session's is refused with the
@@ -1213,9 +1212,10 @@ store the project routes surfaces, fibers and point collections to (*File >
 Stores > Show Surfaces From*, and so on). Spiral needs all three routed to
 one store; when the routes differ or are unset it has none. A local profile
 launches its service with `--object-store` set to that store; for a remote
-profile, attach a replica of the store the service was started with and
-route the three kinds to it. The panel's *Object store* row compares the
-store UUIDs: when they differ, or there is no such store, the fit's inputs
+profile, attach the store the service was started with (served by
+`vc_object_server`, as `ssh://host:port`) and route the three kinds to it.
+The panel's *Object store* row compares the store UUIDs and history
+generations: when they differ, or there is no such store, the fit's inputs
 are not displayed. When they match, VC3D downloads
 the session's input manifest and shows each fitted surface, collection and
 fiber as the attached store holds it now: the store is edited live, and a
@@ -1229,35 +1229,29 @@ changes a rebuild's selection may include; *Rebuild Fit* reads them.
 *Show fitted fibers* in Display draws the fit's fibers on the plane views,
 within the point view tolerance of the slice.
 
-A local profile on a plain store launches its service on that same file:
-saved edits are already where the service reads them, and *Update Fit
-Inputs* names the store's head. A direct profile to a loopback address is
-treated the same way when the service advertises the store's path; any other
-profile cannot name positions of a plain store it does not share, so its
-updates need a hub. With a hub-bound service the profile works through a
-replica of the service's hub: a local profile whose store is a replica
-launches its service with its own replica of the same hub (under the output
-root). For a remote profile, attach a replica of the service's hub; *Clone the
-Service's Hub* (shown when Spiral's store is not one) prefills the hub
-address, through the SSH destination for an SSH profile, or the profile's
-saved hub address, and routes the three kinds to the replica. The
-*Object store* row then compares hub identities and positions as well as
-store UUIDs.
+A local profile launches its service on the project's store, a file shared
+in place or the endpoint of the `vc_object_server` the project attached, so
+saved edits are already where the service reads them and *Update Fit
+Inputs* names the store's head. A remote profile attaches the service's
+store over `ssh://host:port` (the service advertises its location and
+whether it is served). When the service's store is a file on its host, the
+panel says so once (edits and commits need it served and attached here);
+*Update Fit Inputs* still runs there, without a position: it reads the
+service host's current head, and the edits saved here are not in it.
 
-Edits are saved into the store (or replica), not into the fit. *Save Drafts
-to Store* (Shift+E) writes the ready brush patches (new surfaces tagged
-`spiral-brush`, in the preview's frame of the fit volume, or new revisions of
+Edits are saved into the store, not into the fit. *Save Drafts to Store*
+(Shift+E) writes the ready brush patches (new surfaces tagged
+`spiral-brush`, in the preview's frame of the fit volume, or new versions of
 ones saved earlier) and point-collection edits (fitted collections keep their
-objects and point ids) as checked revisions; a replica's background sync
-pushes them. *Update Fit Inputs* updates an idle fit in place at a position
-including those edits (initializing one when there is none, rebuilding a
-failed one). With a hub it first holds the replica's pushes, pushes
-everything saved and waits (hub conflicts stop it and are named), and
-afterwards pulls to the position the service fitted. It reports the hub commits that position includes beyond the
-request and those after it, which show as stale. *Save and Update Fit
-Inputs* does both. The run panel's position summary shows the four states:
-unsaved drawings, saved edits not yet pushed (or in conflict), a position
-being linked, and the position the fit reads.
+objects and point ids) as checked writes, each expecting the version its
+edit started from. *Update Fit Inputs* updates an idle fit in place at a
+position including those edits (initializing one when there is none,
+rebuilding a failed one): the position the last save's receipt reached,
+which the service verifies is in its own store (a copy with the same
+identity is refused). It reports the commits that position includes beyond
+the request and those after it, which show as stale. *Save and Update Fit
+Inputs* does both. The run panel's position summary shows unsaved drawings,
+a position being linked, and the position the fit reads.
 
 The VC3D project is the only source of the scroll's name and voxel
 resolution and of the Lasagna dataset (its arrays and scale). None of them
@@ -1325,7 +1319,8 @@ repository root; `vc_object_store`'s Python module on `PYTHONPATH`):
 AGENTS_AGENT_MODE=1 PYTHONPATH=spiral-fitting:<store-build>/python spiral-fitting/.venv/bin/python -m pytest -q \
   spiral-fitting/tests/test_service_object_store.py \
   spiral-fitting/tests/test_runtime_object_store.py \
-  spiral-fitting/tests/test_service_hub_positions.py \
+  spiral-fitting/tests/test_service_commits.py \
+  spiral-fitting/tests/test_object_store_hosted.py \
   spiral-fitting/tests/test_service_mutations.py \
   spiral-fitting/tests/test_workspace_cleanup.py \
   spiral-fitting/tests/test_spiral_service_v2.py

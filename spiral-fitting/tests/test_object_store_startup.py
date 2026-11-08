@@ -320,11 +320,11 @@ def test_a_checkpoint_before_content_identity_compares_geometry(store_path):
     inputs = load(store_path)
     legacy = json.loads(json.dumps(inputs.manifest))
     # The manifest such a checkpoint recorded: no metadata hashes, no
-    # relationship content, and revision UUIDs of the replica it ran on.
+    # relationship content, and revision UUIDs instead of numbered versions.
     for entry in legacy['objects']:
         del entry['metadata_sha256']
         del entry['version']
-        entry['object_revision'] = 'another-replica'
+        entry['object_revision'] = 'another-store'
     legacy['relationships'] = [
         {key: entry[key] for key in ('uuid', 'kind', 'family', 'approval_state',
                                      'generation')} | {'revision': 'another'}

@@ -10,7 +10,7 @@ with *Show fitted fibers* in Display), and *Fit inputs* in the Spiral panel
 reports their digest, counts and what differs from what the fit read,
 including its links. Tracks and their crossing relationships participate in
 the same input comparison, but track geometry is not displayed by this view.
-Use VC3D and the service from the same checkout (API 45); enable tracks in
+Use VC3D and the service from the same checkout (API 47); enable tracks in
 the fit settings after importing them into the service's store. There is no
 track-DBM path selector.
 
@@ -44,29 +44,31 @@ restarts the service); a remote service's binding is configured on its host.
 The panel's *Winding inference* line says whether the service can run
 winding-model supervision, and why not; a fit enabling it without a usable
 binding fails preparation. The panel's *Scroll* and *Store layout* lines show the session's scroll,
-volume, umbilicus revision and Lasagna dataset. Line annotation reads its
+volume, umbilicus version and Lasagna dataset. Line annotation reads its
 normals from the same selected dataset.
 
 The input list holds local drawings: brush patches and drawn point
 collections. *Save Drafts to Store* (Shift+E) saves the ready ones into that
-store as checked revisions, each pinned at the revision its edit
-started from: a save is refused, overwriting nothing, when another editor
-changed or retired that object since. *Update Fit Inputs* (or *Save and
-Update Fit Inputs*) updates the resident fit's inputs in place at a position
-including them, keeping its model and optimiser: a local service shares the
-store file, so the saves are already there; with a hub-bound service the
-update pushes them first. A service that can be named no position (a remote
-one on a plain store) sees saved edits when it is rebuilt with current inputs. The text filter applies to the list. Remove (or
+store as checked writes, each expecting the version its edit started from:
+a save is refused, overwriting nothing, when another editor changed or
+retired that object since. *Update Fit Inputs* (or *Save and Update Fit
+Inputs*) updates the resident fit's inputs in place at a position including
+them, keeping its model and optimiser: the service reads the same store (a
+file shared on its host, or the `vc_object_server` endpoint attached here),
+so the saves are already there. When the service's store is a file on
+another host the panel says so once; an update then names no position and
+reads that host's current head, which the edits saved here are not in. The
+text filter applies to the list. Remove (or
 *Discard Local Changes* in its context menu) discards an unsaved drawing.
 Leaving the workspace with unsaved drawings asks before discarding them.
 
 Changing tracks or their crossings requires *Rebuild Fit* → *Rebuild with
 Current Inputs*, as does changing the outer shell. With tracks enabled and
 `track_exclusion_radius > 0`, updates also require a rebuild because the
-track exclusion masks depend on the fit's trusted geometry. SSH hub setup
-now requires the one-time process-lock migration documented in the
-[object-store guide](../../vc_object_store/docs/README.md#hosted-hub-and-replicas);
-all clients, including the service, must then use the SSH hub address.
+track exclusion masks depend on the fit's trusted geometry. To edit against
+a service on another host, serve its store with `vc_object_server` (see the
+[object-store guide](../../vc_object_store/docs/hosted.md#serving-a-store)),
+bind the service to that endpoint and attach `ssh://host:port` in VC3D.
 
 Build and run the Spiral tests from the repository root using the existing
 configured build directory:
