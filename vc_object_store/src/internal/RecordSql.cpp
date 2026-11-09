@@ -1,4 +1,5 @@
 #include "internal/RecordSql.hpp"
+#include "internal/ExtensionHistory.hpp"
 #include "internal/RecordFields.hpp"
 #include "internal/ImmutableImport.hpp"
 #include "internal/Versions.hpp"
@@ -378,7 +379,7 @@ void insertObjectRow(sqlite3* db,const ObjectRecord& rec,int64_t id,int64_t comm
 }
 
 std::string upsertObjectImpl(sqlite3* db, const std::string& author, const std::string& host, const ObjectRecord& input,
-                             bool preserveRecord, const char* importOperation)
+                             bool preserveRecord, const char* importOperation, bool restoringExtensions)
 {
     Savepoint savepoint(db);
     auto rec=prepareObjectRecord(input);
@@ -404,8 +405,9 @@ std::string upsertObjectImpl(sqlite3* db, const std::string& author, const std::
     const int64_t commit_sequence = writeCommitSequence(db);
     if (auto existing = objectIdByUuid(db, uuid)) {
         id = *existing;
-        Statement cur(db, "SELECT kind,commit_sequence FROM objects WHERE id=?", id);
+        Statement cur(db, "SELECT kind,commit_sequence,meta,state FROM objects WHERE id=?", id);
         (void)cur.row();
+        if (!restoringExtensions) checkExtensionMetadata(cur.i64(3) == 2 ? "{}" : cur.text(2), rec.meta);
         if (cur.text(0) != rec.kind)
             throw std::runtime_error("object store: object kind cannot change (" + cur.text(0) + " -> " + rec.kind + ")");
         beforeCurrentObjectEdit(db,rec.uuid);
@@ -416,6 +418,7 @@ std::string upsertObjectImpl(sqlite3* db, const std::string& author, const std::
             rec.name, commit_sequence, author, now, host, rec.formatVersion, rec.storageKind, rec.storageRef,
             version, rec.dataChecksum, rec.meta, id);
     } else {
+        if (!restoringExtensions) rejectInitialExtensionMetadata(rec.meta);
         id = allocateRecordId(db, "objects");
         insertObjectRow(db,rec,id,commit_sequence,author,host,now,preserveRecord);
     }

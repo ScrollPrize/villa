@@ -86,7 +86,7 @@ StoreStatus storeStatusFromJson(const std::string& text)
     const auto j = Json::parse(text);
     return {j.at("store").get<std::string>(), j.at("generation").get<std::string>(),
             j.at("commit_sequence").get<int64_t>(), j.at("feed_start").get<int64_t>(),
-            j.value("history_enabled", true)};
+            j.value("history_enabled", true), j.value("extensions_present", false)};
 }
 
 ChangePage changePageFromJson(const std::string& text)

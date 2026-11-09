@@ -8,6 +8,8 @@ namespace vc::objects {
 ObjectCopy readObjectCopy(const StoreReader& reader, const std::string& objectUuid,
                           const std::optional<std::string>& copyUuid)
 {
+    if (reader.status().extensionsPresent)
+        throw std::runtime_error("object copy: registered extensions require a database-preserving copy; refusing silent data loss");
     const auto head = reader.currentObject(util::canonicalUuid(objectUuid));
     if (!head) throw std::invalid_argument("object to copy not found: " + objectUuid);
     const auto& object = head->record;
@@ -23,6 +25,8 @@ ObjectCopy readObjectCopy(const StoreReader& reader, const std::string& objectUu
     record.surface = object.surface;
     record.track = object.track;
     auto meta = nlohmann::json::parse(object.meta);
+    if (meta.contains("vcobj_extensions"))
+        throw std::runtime_error("object copy: manual extension fields require an extension-aware copy");
     meta["copied_from"] = {{"store_uuid", reader.status().storeUuid}, {"object_uuid", object.uuid},
         {"generation", head->generation}, {"version", head->version},
         {"geometry_revision", geometry ? nlohmann::json(*geometry) : nlohmann::json()}};

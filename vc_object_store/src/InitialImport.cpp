@@ -186,6 +186,7 @@ InitialImportResult importInitialCollection(const std::filesystem::path& target,
                 auto opts=common;opts.objectIdRange=options.shards[i].objectIds;opts.edgeIdRange=options.shards[i].edgeIds;
                 auto collection=detail::InitialCollectionAccess::create(paths[i],options.dependencies,opts);
                 auto transaction=collection.write();
+                for(const auto& extension:options.extensions)collection.createExtensionTable(transaction,extension);
                 auto state=std::make_unique<InitialShardImport::Impl>(InitialShardImport::Impl{
                     collection,transaction,options.edges,result.storeUuid,failure});
                 state->result.creationSeconds=elapsed(creation);

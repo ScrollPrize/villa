@@ -12,13 +12,14 @@ struct ObjectKey {
 };
 struct CollectionObject { ObjectKey key; ObjectRecord record; };
 struct CollectionEdge { ObjectKey key, a, b; EdgeRecord record; };
-struct InitialCollectionEdge { ObjectKey a, b; EdgeRecord record; };
+struct InitialCollectionEdge { ObjectKey a, b; EdgeRecord record; std::vector<InitialExtensionRow> extensions; };
 // Source-independent initial records. Coordinates are already in the declared
 // native frame; no synthetic control points or source-format interpretation.
 struct InitialObjectRecord {
     ObjectRecord record;
     std::optional<int64_t> id;
     std::optional<GeometryData> geometry;
+    std::vector<InitialExtensionRow> extensions;
 };
 struct InitialObjectIdentity { ObjectKey key; int64_t id; };
 struct InitialEdgeImportOptions {
@@ -80,6 +81,15 @@ public:
     CollectionTxn write();
     std::string uuid(const CollectionTxn&) const;
     StoreProvisioning provisioning(const CollectionTxn&) const;
+    void createExtensionTable(CollectionTxn&, const ExtensionTable&);
+    void replaceExtensionRows(CollectionTxn&, const std::string&, const ObjectKey&,
+                              std::span<const ExtensionRow>);
+    std::vector<ExtensionTableInfo> extensionTables(const CollectionTxn&) const;
+    // Immutable rows overlay by primary key; versioned fields follow the winning
+    // owner, including clears and deletions. A routed UUID prefix visits only the
+    // relevant partition in each layer. Unfiltered scans visit all partitions.
+    void scanExtensionRows(const CollectionTxn&, const std::string&,
+        const std::function<bool(const ExtensionRow&)>&, std::span<const ExtensionValue> keyPrefix = {}) const;
     // Flush the local writer's committed WAL; linked readonly stores are unchanged.
     void checkpoint();
     std::vector<CollectionMember> members() const;

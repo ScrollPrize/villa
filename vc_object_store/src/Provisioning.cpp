@@ -2,6 +2,7 @@
 #include "geometry/SharedGeometry.hpp"
 #include "internal/ImmutableImport.hpp"
 #include "internal/Versions.hpp"
+#include "internal/Extensions.hpp"
 
 namespace vc::objects {
 using namespace detail;
@@ -183,7 +184,7 @@ void detail::forkStorageIdentity(sqlite3* db)
     Statement tables(db, "SELECT name FROM pragma_table_list WHERE schema='main' AND type='table'");
     while (tables.row()) {
         const auto name = tables.text(0);
-        if (name == "table_key_columns") continue;
+        if (name == "table_key_columns" || name == "extension_tables") continue;
         Statement refs(db, "SELECT 1 FROM pragma_foreign_key_list(?) WHERE \"table\" IN "
                            "('database_identity','table_directory','table_key_columns')", name);
         if (refs.row()) throw std::runtime_error("replica fork: extension table references physical identity: " + name);
@@ -191,7 +192,26 @@ void detail::forkStorageIdentity(sqlite3* db)
     exec(db, "DROP TRIGGER database_identity_uuid_immutable;");
     execute(db, "UPDATE database_identity SET uuid=? WHERE singleton=1", parseUuid(util::newUuid()));
     protectDatabaseIdentity(db);
-    exec(db, "DELETE FROM table_key_columns; DELETE FROM table_directory;");
+    // A database fork preserves every extension's rows, source pins and schema.
+    // Only physical table UUIDs change. Defer the known FK checks while moving
+    // the parent and its two core registry references together; commit checks
+    // their completed state. Unknown identity-dependent extensions were rejected
+    // above, rather than silently rewriting their private interpretation.
+    exec(db, "PRAGMA defer_foreign_keys=ON; DROP TRIGGER table_identity_immutable;");
+    const bool extensions = hasExtensionTables(db);
+    std::vector<std::array<unsigned char,16>> tableIds;
+    {
+        Statement rows(db,"SELECT uuid FROM table_directory ORDER BY name");
+        while (rows.row()) tableIds.push_back(rows.blob16(0));
+    }
+    for (const auto& oldId : tableIds) {
+        const auto newId = parseUuid(util::newUuid());
+        execute(db,"UPDATE table_directory SET uuid=? WHERE uuid=?",newId,oldId);
+        execute(db,"UPDATE table_key_columns SET table_uuid=? WHERE table_uuid=?",newId,oldId);
+        if (extensions) execute(db,"UPDATE extension_tables SET table_uuid=? WHERE table_uuid=?",newId,oldId);
+    }
+    exec(db,"CREATE TRIGGER table_identity_immutable BEFORE UPDATE OF uuid ON table_directory "
+            "BEGIN SELECT RAISE(ABORT,'table identity is immutable'); END;");
     registerStorageTables(db);
 }
 

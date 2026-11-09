@@ -3,6 +3,7 @@
 #include "internal/Database.hpp"
 #include "internal/Schema.hpp"
 #include "internal/History.hpp"
+#include "internal/ExtensionHistory.hpp"
 #include "internal/Versions.hpp"
 #include "internal/EdgeSql.hpp"
 #include "internal/RecordJson.hpp"
@@ -271,7 +272,15 @@ void changeHistoryMode(const std::filesystem::path& input, HistoryMode mode)
         while (edges.row()) recordRelationshipValidation(db,readEdgeRow(db,edges));
     }
     if (enabled) publishHistory(db,true); else validateCurrentRelationships(db);
-    if (!enabled) exec(db,"DELETE FROM geometry_chunks WHERE hash NOT IN (SELECT hash FROM _policy_chunks);");
+    if (!enabled) {
+        // Current editable extension fields also own immutable binary chunks.
+        // They use their owner's normal history, not geometry-revision rows.
+        for (const auto& hash : currentExtensionChunks(db)) {
+            Statement retain(db,"INSERT INTO _policy_chunks(hash) VALUES(?)");
+            bindDigest(retain,1,hash); retain.stepDone();
+        }
+        exec(db,"DELETE FROM geometry_chunks WHERE hash NOT IN (SELECT hash FROM _policy_chunks);");
+    }
     exec(db,"DROP TABLE _policy_geometry; DROP TABLE _policy_chunks; DROP TABLE _policy_bounds; DROP TABLE _policy_revision_ids;");
     // Recreate compatible extension triggers and prepare their actions without
     // executing them. References to removed history fail on the staged copy,

@@ -41,7 +41,6 @@ void verifyFiberData(const ObjectRecord* record,bool hasGeometry,const AfvFiber&
 {
     if(!record || !record->fiber || !hasGeometry || record->name!=fiber.name || record->fiber->family!=fiber.detail.family ||
         record->fiber->length!=fiber.detail.length || record->fiber->bbox!=fiber.detail.bbox ||
-        Json::parse(record->meta).at("source").at("afv").at("annotation")!=Json::parse(fiber.annotation) ||
         record->fiber->controlPointCount!=0 || record->fiber->linePointCount!=fiber.detail.linePointCount ||
         read("line_points")!=fiber.xyz || !read("control_points").empty() || !read("control_point_ids").empty())
         throw std::runtime_error("fiber metadata or geometry readback differs from source");
@@ -108,16 +107,21 @@ Json importNative(const Json& config,const std::filesystem::path& input,const st
     std::vector<size_t> fiberMmap(readers),edgeMmap(readers);
     // Join/cancel readers before destroying the cursor/stat buffers they use.
     ParallelImportStream stream({size_t(readers),size_t(workers),batchSize,batchBytes,queueBytes});
-    stream.start(fiberRanges.size()+1,edgeRanges.size(),[&](size_t worker,size_t task,ObjectEmitter& emit){
+    if(!linked){
+        FiberSourceInfo info;info.uuid=sourceUuid;info.fiberCount=source.fiberCount();info.pointCount=source.pointCount();
+        if(config.contains("source_sha256"))info.sha256=config.at("source_sha256").get<std::string>();
+        options.extensions.push_back(fiberSourceExtension(info));
+    }
+    if(hasEdges){
+        std::vector<ExtensionSource> pins;
+        if(linked){auto base=ObjectCollection::open(config.at("geometry_collection").get<std::string>(),readOptions(config));auto tx=base.read();
+            const auto state=base.provisioning(tx);pins.push_back({base.uuid(tx),state.generation,state.commitSequence});}
+        FiberConstraintSourceInfo info;info.fiberSourceUuid=sourceUuid;info.constraintCount=edgeSource->constraintCount();
+        if(config.contains("constraints_sha256"))info.sha256=config.at("constraints_sha256").get<std::string>();
+        options.extensions.push_back(fiberConstraintExtension(info,pins));
+    }
+    stream.start(fiberRanges.size(),edgeRanges.size(),[&](size_t worker,size_t task,ObjectEmitter& emit){
         checkCancelled();
-        if(task==fiberRanges.size()) {
-            ObjectRecord metadata;metadata.uuid=linked?util::nameUuid(sourceUuid,"constraint-source"):sourceUuid;
-            metadata.kind="collection";metadata.name=linked?"constraint-source":input.stem().string();
-            Json fields=linked?Json::object():Json{{"coordinates",coordinates},{"afv",{{"metadata",Json::parse(source.metadataJson())}}}};
-            if(edgeSource)fields["afc"]=Json::parse(edgeSource->metadataJson());
-            metadata.meta=fields.dump();const auto uuid=metadata.uuid;const auto bytes=metadata.meta.size()+sizeof(InitialObjectRecord);
-            emit.emit(ImportObject{InitialObjectRecord{std::move(metadata),{},{}}},bytes,uuid);return;
-        }
         const auto range=fiberRanges[task];auto& part=fiberReaders[worker];
         if(!part){part=std::make_unique<AfvSource>(input,0,0);part->setCacheBytes(sourceCacheBytes);
             fiberMmap[worker]=part->setMmapBytes(sourceMmapBytes);
@@ -125,9 +129,9 @@ Json importNative(const Json& config,const std::filesystem::path& input,const st
         part->selectRange(range[0],range[1]);AfvFiber fiber;int64_t n=0,points=0;
         while(part->next(fiber)) {
             checkCancelled();++n;points+=fiber.detail.linePointCount;
-            auto r=afvObjectRecord(fiber,sourceUuid,coordinates);const auto uuid=r.uuid;
-            const auto bytes=fiber.xyz.size()+r.meta.size()+r.name.size()+sizeof(InitialObjectRecord);
-            auto g=afvGeometry(fiber);emit.emit(ImportObject{InitialObjectRecord{std::move(r),{},std::move(g)}},bytes,uuid);
+            const auto xyzBytes=fiber.xyz.size();auto row=afvInitialRecord(fiber,sourceUuid,coordinates);const auto uuid=row.record.uuid;
+            const auto bytes=xyzBytes+row.record.meta.size()+row.record.name.size()+sizeof(InitialObjectRecord)+extensionPayloadBytes(row.extensions);
+            emit.emit(ImportObject{std::move(row)},bytes,uuid);
         }
         readerFibers[worker]+=n;readerPoints[worker]+=points;sourceFibers.fetch_add(n);sourcePoints.fetch_add(points);
     },[&](size_t worker,size_t task,EdgeEmitter& emit){
@@ -136,10 +140,11 @@ Json importNative(const Json& config,const std::filesystem::path& input,const st
         checkCancelled();auto& part=edgeReaders[worker];const auto range=edgeRanges[task];
         if(!part){part=std::make_unique<AfcSource>(config.at("constraints").get<std::string>(),sourceUuid,fiberEnd);part->setCacheBytes(sourceCacheBytes);
             edgeMmap[worker]=part->setMmapBytes(sourceMmapBytes);}
-        part->selectRange(range[0],range[1]);EdgeRecord e;int64_t n=0;
-        while(part->next(e)){
-            checkCancelled();++n;const auto uuid=e.uuid;const auto bytes=e.meta.size()+sizeof(InitialCollectionEdge);
-            ObjectKey a{"",e.aUuid},b{"",e.bUuid};emit.emit({std::move(a),std::move(b),std::move(e)},bytes,uuid);
+        part->selectRange(range[0],range[1]);AfcConstraint c;int64_t n=0;
+        while(part->next(c)){
+            checkCancelled();++n;auto row=afcInitialRecord(std::move(c));const auto uuid=row.record.uuid;
+            const auto bytes=row.record.meta.size()+sizeof(InitialCollectionEdge)+extensionPayloadBytes(row.extensions);
+            emit.emit(std::move(row),bytes,uuid);
         }
         readerEdges[worker]+=n;sourceEdges.fetch_add(n);
     },[&](size_t worker){
@@ -222,18 +227,28 @@ Json importNative(const Json& config,const std::filesystem::path& input,const st
                 const ObjectKey key{"",util::nameUuid(sourceUuid,"fiber:"+std::to_string(fiber.id))};
                 const auto value=joined.object(txn,key);const auto g=joined.currentGeometry(txn,key);
                 verifyFiberData(value?&value->record:nullptr,bool(g),fiber,[&](const char* name){return joined.readGeometryArray(txn,key,name);});
+                const auto expected=fiberSourceRow(key.objectUuid,fiber.id,fiber.annotation);size_t found=0;
+                const ExtensionValue prefix[]={extensionUuid(key.objectUuid)};
+                joined.scanExtensionRows(txn,kFiberSourceTable,[&](const auto& row){++found;
+                    if(row!=expected.values)throw std::runtime_error("fiber source extension differs");return true;},prefix);
+                if(found!=1)throw std::runtime_error("fiber source extension missing");
             }
         }
         int64_t verifiedEdges=0;
         for(const auto& range:edgeRanges){
-            AfcSource part(config.at("constraints").get<std::string>(),sourceUuid,fiberEnd,range[0],range[1]);EdgeRecord e;
-            while(part.next(e)){
+            AfcSource part(config.at("constraints").get<std::string>(),sourceUuid,fiberEnd,range[0],range[1]);AfcConstraint c;
+            while(part.next(c)){
+                auto& e=c.edge;
                 checkCancelled();
                 const auto actual=joined.edge(txn,{"",e.uuid});if(!actual)throw std::runtime_error("published relation missing");
                 if(actual->a.objectUuid==e.bUuid){std::swap(e.aUuid,e.bUuid);std::swap(e.aAnchor,e.bAnchor);}
                 if(actual->a.objectUuid!=e.aUuid||actual->b.objectUuid!=e.bUuid||actual->record.aAnchor!=e.aAnchor||
                    actual->record.bAnchor!=e.bAnchor||actual->record.kind!=e.kind||Json::parse(actual->record.meta)!=Json::parse(e.meta))
                     throw std::runtime_error("published constraint differs from source");
+                const ExtensionValue prefix[]={extensionUuid(e.uuid)};size_t found=0;
+                joined.scanExtensionRows(txn,kFiberConstraintTable,[&](const auto& row){++found;
+                    if(row!=c.measurement.values)throw std::runtime_error("constraint extension differs");return true;},prefix);
+                if(found!=1)throw std::runtime_error("constraint extension missing");
                 for(const auto& endpoint:{actual->a,actual->b})if(!joined.currentGeometry(txn,endpoint))
                     throw std::runtime_error("constraint endpoint geometry missing");
                 ++verifiedEdges;
@@ -252,6 +267,7 @@ Json importNative(const Json& config,const std::filesystem::path& input,const st
         {"batch_size",batchSize},{"batch_bytes",batchBytes},{"queue_bytes",queueBytes},{"packed",bool(options.packed)},
         {"fibers",fibers},{"points",points},{"constraints",nedges},{"constraints_imported",hasEdges},{"source_pipeline_seconds",sourceSeconds},
         {"geometry_bytes",points*24},{"metadata_json_bytes",metadataBytes},{"constraint_metadata_json_bytes",edgeMetadataBytes},
+        {"fiber_source_extension_rows",fibers},{"constraint_extension_rows",nedges},
         {"source_metadata_json_bytes",linked?edgeSource->metadataJson().size():source.metadataJson().size()},
         {"source_read_seconds",fiberPreparation},{"constraint_source_read_seconds",edgePreparation},{"per_reader",perReader},
         {"source_read_timing","reader-worker preparation sum (decode/UUID/batching), excludes queue push time"},

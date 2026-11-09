@@ -1,5 +1,6 @@
 #include "internal/Versions.hpp"
 #include "internal/History.hpp"
+#include "internal/Extensions.hpp"
 
 #include <limits>
 
@@ -425,7 +426,7 @@ StoreStatus ObjectStore::status(const Txn& txn) const
     auto* db = static_cast<sqlite3*>(connection(txn));
     Statement s(db, "SELECT generation,commit_sequence,feed_start,history_enabled FROM store_manifest WHERE singleton=1");
     if (!s.row()) throw std::runtime_error("object store: missing history state");
-    return {storeUuidText(db), s.uuid(0), s.i64(1), s.i64(2), s.i64(3)!=0};
+    return {storeUuidText(db), s.uuid(0), s.i64(1), s.i64(2), s.i64(3)!=0, hasExtensionTables(db)};
 }
 
 std::optional<TransactionReceipt> ObjectStore::receipt(const Txn& txn, const std::string& requestUuid) const

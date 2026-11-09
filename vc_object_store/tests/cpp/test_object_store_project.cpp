@@ -2,6 +2,8 @@
 #include "vc_object_store/objects/Artifacts.hpp"
 #include "vc_object_store/objects/Project.hpp"
 #include "vc_object_store/objects/PackedStore.hpp"
+#include "vc_object_store/objects/ObjectCopy.hpp"
+#include "vc_object_store/objects/TransactionJson.hpp"
 #include <nlohmann/json.hpp>
 #include <fstream>
 #include <iostream>
@@ -39,6 +41,61 @@ int main() try
 {
     TemporaryDirectory directory;
     const auto path = directory.path / "project.vcobj";
+
+    {
+        const auto sourcePath = directory.path / "extensions.vcobj";
+        const auto targetPath = directory.path / "extensions-copy.vcobj";
+        createProject(sourcePath, "extension source", Json::object(), as("alice"));
+        const auto owner = vc::objects::util::newUuid();
+        ExtensionTable immutable;
+        immutable.name = "ext_copy_result"; immutable.extension = "test.copy";
+        immutable.columns = {{"owner", ExtensionType::Blob}, {"score", ExtensionType::Real}};
+        immutable.primaryKey = {"owner"}; immutable.keySpace = "objects";
+        auto manual = immutable; manual.name = "ext_copy_manual"; manual.versioned = true;
+        const std::vector<ExtensionRow> first{{extensionUuid(owner), 1.25}}, second{{extensionUuid(owner), 2.5}};
+        ObjectVersion sourceFirst;
+        std::string sourceTable;
+        {
+            auto store = ObjectStore::open(sourcePath, as("alice"));
+            {
+                auto txn = store.write();
+                store.createExtensionTable(txn, immutable); store.createExtensionTable(txn, manual);
+                ObjectRecord object; object.uuid = owner; object.kind = "custom_annotation";
+                store.upsertObject(txn, object);
+                store.appendExtensionRows(txn, immutable.name, first);
+                store.replaceExtensionRows(txn, manual.name, owner, first); txn.commit();
+            }
+            {
+                auto txn = store.read();
+                sourceFirst = store.versionReference(txn, *store.currentObjectRevision(txn, owner));
+                for (const auto& info : store.extensionTables(txn)) if (info.name == manual.name) sourceTable = info.tableUuid;
+                const auto status = store.status(txn);
+                require(status.extensionsPresent && storeStatusFromJson(storeStatusToJson(status)).extensionsPresent,
+                    "extension presence survives the hosted-reader status protocol");
+                // The object-level copier cannot know which immutable result
+                // rows belong in a new independent object, so it must refuse.
+                const auto project = projectRecord(LocalStoreReader(store, txn));
+                mustFail([&] { readObjectCopy(LocalStoreReader(store, txn), project->uuid); });
+            }
+            {
+                auto txn = store.write(VersionSelection{{owner, sourceFirst.version}});
+                store.replaceExtensionRows(txn, manual.name, owner, second); txn.commit();
+            }
+        }
+        ObjectStoreSession session;
+        const auto attachment = session.attach(sourcePath, as("alice"));
+        copyProject(session, attachment, targetPath, "extension copy", as("alice"));
+        auto copied = ObjectStore::open(targetPath, as("alice")); auto txn = copied.read();
+        std::vector<ExtensionRow> results, current, historical;
+        copied.scanExtensionRows(txn, immutable.name, [&](const auto& row) { results.push_back(row); return true; });
+        copied.scanExtensionRows(txn, manual.name, [&](const auto& row) { current.push_back(row); return true; });
+        auto old = sourceFirst; old.storeUuid = copied.status(txn).storeUuid;
+        copied.scanExtensionRowsAtVersion(txn, manual.name, old, [&](const auto& row) { historical.push_back(row); return true; });
+        require(results == first && current == second && historical == first,
+            "database fork preserves immutable results and all manual field versions");
+        for (const auto& info : copied.extensionTables(txn)) if (info.name == manual.name)
+            require(info.tableUuid != sourceTable, "fork remaps physical extension table UUID without breaking old snapshots");
+    }
 
     {
         auto directOptions=as("alice"); directOptions.history=HistoryMode::Off;

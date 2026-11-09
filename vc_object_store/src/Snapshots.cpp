@@ -1,6 +1,7 @@
 #include "internal/RecordJson.hpp"
 #include "internal/EdgeSql.hpp"
 #include "internal/History.hpp"
+#include "internal/Extensions.hpp"
 #include "geometry/GeometryInternal.hpp"
 
 namespace vc::objects {
@@ -9,6 +10,7 @@ using namespace detail;
 std::string ObjectStore::exportJson(const Txn& txn, const JsonExportOptions& options) const
 {
     auto* db = static_cast<sqlite3*>(connection(txn));
+    rejectExtensionLoss(db,"metadata JSON export");
     nlohmann::json out{{"format", "vc_object_metadata"}, {"version", 2}, {"metadata_only", true},
         {"store_uuid", uuid(txn)}, {"objects", nlohmann::json::array()}, {"edges", nlohmann::json::array()}};
     const std::set<std::string> fields(options.fields.begin(), options.fields.end());

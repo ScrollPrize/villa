@@ -1,4 +1,5 @@
 #include "internal/EdgeSql.hpp"
+#include "internal/ExtensionHistory.hpp"
 #include "internal/SqlValues.hpp"
 #include "geometry/GeometryInternal.hpp"
 
@@ -262,6 +263,7 @@ EdgeRecord addEdgeImpl(sqlite3* db, const std::string& author, const std::string
     GeometryPhase phase("native.edge.sql");
     Savepoint savepoint(db);
     auto rec=prepareNewEdge(input);
+    rejectInitialExtensionMetadata(rec.meta);
     if(preserveRecord&&rec.aUuid!=formatUuid(parseUuid(input.aUuid)))swapEndpoints(rec);
     const EdgeInsertRow identity{&rec,0,{},{}};requireUnusedObjectUuids(db,std::span(&identity,1));
     if(!lifecycleBindingMatches(db,rec)) throw std::runtime_error("relationship endpoints must be active");

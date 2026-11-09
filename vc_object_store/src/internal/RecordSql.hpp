@@ -74,7 +74,8 @@ void insertTags(sqlite3* db, const char* table, const char* idColumn, int64_t id
 void restoreCommon(sqlite3* db, const char* table, const RecordCommon& rec);
 
 std::string upsertObjectImpl(sqlite3* db, const std::string& author, const std::string& host, const ObjectRecord& input,
-                             bool preserveRecord = false, const char* importOperation = "import");
+                             bool preserveRecord = false, const char* importOperation = "import",
+                             bool restoringExtensions = false);
 
 std::optional<int64_t> edgeIdByUuid(sqlite3* db, const std::array<unsigned char, 16>& uuid);
 

@@ -1,5 +1,6 @@
 #include "internal/InitialObjects.hpp"
 #include "internal/RecordSql.hpp"
+#include "internal/ExtensionHistory.hpp"
 #include "geometry/InitialGeometry.hpp"
 #include "geometry/GeometryInternal.hpp"
 #include "internal/ImmutableImport.hpp"
@@ -39,6 +40,7 @@ std::vector<std::pair<std::string,int64_t>> insertInitialObjectRefs(
     std::vector<std::pair<std::string,int64_t>> result;result.reserve(input.size());
     for(size_t i=0;i<input.size();++i){
         const auto& value=*input[i];auto rec=prepareObjectRecord(value.record);
+        rejectInitialExtensionMetadata(rec.meta);
         std::optional<PreparedInitialGeometry> geometry;
         if(value.geometry){geometry=prepareInitialGeometry(db,rec,*value.geometry);rec=geometry->record;}
         else if(rec.storageKind=="sqlite")

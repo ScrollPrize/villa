@@ -8,6 +8,9 @@ inline void bindAfvSource(nb::module_& m)
         .def(nb::init<const std::filesystem::path&,int64_t,int64_t>(), nb::arg("path"),
              nb::arg("first_id")=0,nb::arg("past_last_id")=INT64_MAX)
         .def_prop_ro("metadata",[](const vo::AfvSource& source){return jsonLoads(source.metadataJson());})
+        .def_prop_ro("uuid", &vo::AfvSource::uuid)
+        .def_prop_ro("fiber_count", &vo::AfvSource::fiberCount)
+        .def_prop_ro("point_count", &vo::AfvSource::pointCount)
         .def("__iter__",[](vo::AfvSource& source)->vo::AfvSource&{return source;},nb::rv_policy::reference_internal)
         .def("__next__",[](vo::AfvSource& source){
             vo::AfvFiber fiber; bool found;

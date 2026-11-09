@@ -2,6 +2,8 @@
 
 `objects/InitialImport.hpp` provides source-independent C++ construction of a sealed, history-off, spatial-index-free collection. Source readers supply native `ObjectRecord`, optional `GeometryData`, and `InitialCollectionEdge` records. The API owns SQLite connections, transactions, ID reservations, shard provisioning, index finalization, sealing, publication and failure cleanup. It does not require AFV or any intermediate database.
 
+Optional typed extension data uses the same construction path. Supply table definitions in `InitialImportOptions::extensions`, then attach `InitialExtensionRow` values to each `InitialObjectRecord::extensions` or `InitialCollectionEdge::extensions`. Definitions are installed in each shard before importing records; rows follow their owning object's or edge's UUID routing and transaction. These initial result tables are immutable (`versioned=false`). See [typed extensions](extensions.md) for input provenance, columns, indexes and editable extensions outside initial construction.
+
 ```cpp
 #include <vc_object_store/objects/InitialImport.hpp>
 using namespace vc::objects;
@@ -64,6 +66,8 @@ Run `bash vc_object_store/scripts/run_cpp_tests.sh` for native regression covera
 Parallel streaming defaults to 32 readers and 32 destination shards. The collection builder must be given matching shard specifications. The lower-level `InitialImportOptions` still defaults to one ordinary SQLite file; choosing parallel streaming does not change ordinary non-sharded store creation.
 
 An `ObjectEmitter` accepts an `ImportObject` containing either an owned `InitialObjectRecord` or a borrowed pointer to one. Borrowed records and their geometry must remain immutable and alive until the stream and importer finish. Writers collect pointers and call `InitialShardImport::appendObjectRefs`; the lower-level `ObjectCollection::importInitialObjectRefs` has the same transactional semantics as owned batches. This avoids copying prepared XYZ arrays without creating a second storage path. Edge emitters accept ordinary `InitialCollectionEdge` records.
+
+Extension values travel in those same records and count toward owned payload byte budgets. Borrowed prepared records include borrowed extension values under the same lifetime rule. No secondary measurement stream, per-row source-state copy or endpoint-directory scan is required.
 
 Call `stream.start(objectTaskCount, edgeTaskCount, objectTask, edgeTask)` before invoking the collection builder, then drain `popObjects` and `popEdges` in its respective callbacks. A callback receives its reader index, task index and emitter, so it can reuse a thread-owned source cursor. Readers that finish their object tasks can prepare edges while other readers complete their final geometry chunks; there is no reader-join barrier between phases. Destination writers still append their objects before their edges. Every producer/writer exception must be forwarded to `stream.fail(std::current_exception())` before rethrowing; call `stream.finish()` to join readers and propagate failures. Destruction cancels and joins an abandoned stream. No partial store is published.
 

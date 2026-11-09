@@ -16,6 +16,7 @@ All SQL UUID fields use the same 16-byte SQLite BLOB representation; public APIs
 | `database_identity` | Independent physical database UUID and schema version |
 | `table_directory` | Binary UUID v4 and SQL name of each application table instance |
 | `table_key_columns` | Ordered primary-key column names for each table UUID |
+| `extension_tables` (optional) | Typed-extension identity, format version, input-state references and extension-owned provisioning; see [extensions](extensions.md) |
 | `store_write_state` | Transactional dirty marker, cleared at commit |
 | `key_allocators` | Namespace UUID, reserved bounds and next ID; NULL means exhausted |
 

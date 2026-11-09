@@ -8,7 +8,7 @@ import subprocess
 
 import numpy as np
 import pytest
-from vc_object_store import ObjectStore
+from vc_object_store import ObjectStore, extension_uuid
 from object_helpers import raw
 
 spec = importlib.util.spec_from_file_location('import_afv', Path(__file__).parents[2] / 'scripts/import_afv.py')
@@ -21,7 +21,9 @@ def fixture(path):
     points[0, 0] = -0.0
     metadata = dict(uuid='1482bcc8-f93e-4c3b-b380-2ddf369318f4', complete=True,
         fiber_count=2, point_count=262, frame={},
-        root=dict(coordinate_order='XYZ', coordinate_units='voxel'), provenance={'test': True})
+        root=dict(coordinate_order='XYZ', coordinate_units='voxel'),
+        provenance={'test': True, 'source_path': '/not/to/be/copied'},
+        report={'included_ids': list(range(200)), 'input_paths': ['/not/to/be/copied']})
     with sqlite3.connect(path) as db:
         db.executescript('''PRAGMA application_id=1447249475; PRAGMA user_version=1;
             CREATE TABLE metadata(key TEXT PRIMARY KEY,value TEXT NOT NULL);
@@ -53,8 +55,15 @@ def test_import_keeps_exact_bytes_metadata_and_refuses_existing_output(tmp_path)
     with ObjectStore.open(str(output), read_only=True) as store:
         objects = store.objects_by_kind('fiber')
         assert len(objects) == 2 and objects[0]['uuid'] != objects[1]['uuid']
+        table, = store.extension_tables()
+        assert table['name'] == 'ext_fiber_graph_solve_sources'
+        assert table['extension'] == 'ext_fiber_graph_solve'
+        assert table['provisioning'] == dict(source_uuid=metadata['uuid'], fiber_count=2, point_count=262)
+        assert table['based_on'] == [], 'An AFV file has no vcobj commit to invent'
         for record in objects:
-            fid = record['meta']['source']['afv']['fiber_id']
+            source_row, = store.extension_rows(table['name'], [extension_uuid(record['uuid'])])
+            key, fid, annotation = source_row
+            assert extension_uuid(key) == record['uuid']
             expected = points if fid == 0 else points[-2:]
             revision = store.current_geometry(record['uuid'])['uuid']
             assert raw(store, revision, 'line_points') == expected.tobytes()
@@ -63,10 +72,13 @@ def test_import_keeps_exact_bytes_metadata_and_refuses_existing_output(tmp_path)
             assert record['fiber']['control_point_count'] == 0
             assert record['meta']['coordinates'] == dict(volume_uuid='20260411134726', scale_factor=4)
             assert record['fiber']['family'] == ('H' if fid == 0 else 'V')
-            assert record['meta']['source']['afv']['annotation']['fiber_follow']['links'] == [-1, 0]
-        collection = store.object(metadata['uuid'])
-        assert collection['meta']['afv']['metadata'] == metadata
-        assert collection['meta']['import'] == dict(fibers=2, points=262)
+            assert json.loads(annotation)['fiber_follow']['links'] == [-1, 0]
+            # put_geometry consumes per-point source annotations and retains
+            # its empty source object; it must not recreate AFV provenance.
+            assert record['meta'].get('source', {}) == {}
+            assert 'afv' not in record['meta'].get('source', {})
+        assert store.object(metadata['uuid']) is None, 'Source provenance must not create a synthetic collection object'
+        assert store.objects_by_kind('collection') == []
     with pytest.raises(FileExistsError):
         import_afv.import_afv(source, output, unbound=True, progress=False)
 
@@ -189,13 +201,21 @@ def test_native_uuid_dispatch_combined_and_linked(tmp_path, packed):
             seen = 0
             for shard in output.glob('part-*.vcobj'):
                 with sqlite3.connect(shard) as db:
+                    for family, provisioning in db.execute('SELECT extension,provisioning FROM extension_tables'):
+                        assert family == 'ext_fiber_graph_solve'
+                        info = json.loads(provisioning)
+                        if 'fiber_source_uuid' in info:
+                            assert info == dict(fiber_source_uuid=metadata['uuid'], constraint_count=17,
+                                                length_units='base_voxels', winding_units='turns', endpoint_order='source')
+                        else:
+                            assert info == dict(source_uuid=metadata['uuid'], fiber_count=2, point_count=262)
                     for (uuid,) in db.execute('SELECT uuid FROM objects'):
                         h = 14695981039346656037
                         for byte in uuid:
                             h = ((h ^ byte) * 1099511628211) & ((1 << 64) - 1)
                         assert h % 4 == int(shard.stem.split('-')[-1])
                         seen += 1
-            assert seen == (1 if mode == 'linked' else 3)
+            assert seen == (0 if mode == 'linked' else 2)
 
 
 @pytest.mark.parametrize('key,value', [

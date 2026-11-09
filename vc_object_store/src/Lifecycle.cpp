@@ -1,5 +1,6 @@
 #include "internal/RecordSql.hpp"
 #include "internal/History.hpp"
+#include "internal/ExtensionHistory.hpp"
 #include "internal/SqlValues.hpp"
 #include "geometry/GeometryDelta.hpp"
 #include "internal/ImmutableImport.hpp"
@@ -140,8 +141,9 @@ void ObjectStore::restoreObject(WriteTxn& txn, const std::string& uuid,
         }
     }
     auto restored = source->record;
+    restoreCurrentExtensionRows(db, "objects", uuid, restored.meta);
     // upsert preserves identity/creation stamps and resets approval normally.
-    upsertObjectImpl(db, author(), hostname(), restored);
+    upsertObjectImpl(db, author(), hostname(), restored, false, "restore", true);
     restored.retired = false; restored.lifecycleEpoch = std::to_string(writeCommitSequence(db));
     writeLifecycle(db, id, restored);
     if (oldGeometry != source->geometryRevision) refreshGeometryBounds(db, uuid);

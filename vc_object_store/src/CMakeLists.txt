@@ -47,12 +47,16 @@ add_library(vc_objects ${_vc_store_library_type}
     formats/FiberJson.cpp
     Database.cpp
     Provisioning.cpp
+    Extensions.cpp
+    ExtensionHistory.cpp
     ObjectCollection.cpp
     InitialImport.cpp
     PackedStore.cpp
     PackedCollection.cpp
     StoreConversion.cpp
     imports/AfvSource.cpp
+    imports/FiberImportExtension.cpp
+    imports/FiberGraphSolveExtension.cpp
     VolumeTransforms.cpp
     ObjectStoreSession.cpp
     HostedSession.cpp

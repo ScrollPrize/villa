@@ -1,5 +1,6 @@
 #include "StorageBindings.hpp"
 #include "AfvBindings.hpp"
+#include "ExtensionBindings.hpp"
 #include "ObjectReadBindings.hpp"
 #include "TypedGeometryBindings.hpp"
 #include "vc_object_store/objects/GeometryCoordinates.hpp"
@@ -772,6 +773,7 @@ void bindSessionOperations(nb::class_<vo::ObjectStoreSession> session)
 NB_MODULE(_native, m)
 {
     bindAfvSource(m);
+    bindExtensionHelpers(m);
     m.def("artifact_manifest_json", [](const nb::list& files) {
         std::vector<vo::ArtifactFile> parsed;
         for (const auto& f : files) {
@@ -1422,4 +1424,6 @@ NB_MODULE(_native, m)
         },nb::arg("object_uuid"),nb::arg("resize"),nb::arg("expected_version"),nb::arg("edge_edits")=nb::list());
     bindMutations(store);
     bindMutations(writer);
+    bindExtensionApi(store);
+    bindExtensionApi(writer);
 }

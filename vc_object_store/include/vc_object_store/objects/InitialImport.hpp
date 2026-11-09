@@ -19,6 +19,9 @@ struct InitialImportOptions {
     std::vector<std::filesystem::path> dependencies;
     std::optional<PackedStoreOptions> packed;
     InitialEdgeImportOptions edges;
+    // Optional extension definitions instantiated independently on each shard.
+    // Payloads accompany owner records in the same parallel stream.
+    std::vector<ExtensionTable> extensions;
 };
 struct InitialShardResult {
     int64_t objects=0,edges=0;

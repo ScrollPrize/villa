@@ -1,5 +1,6 @@
 #include "vc_object_store/objects/StoreReader.hpp"
 #include "internal/RecordSql.hpp"
+#include "internal/ExtensionHistory.hpp"
 #include "vc_object_store/objects/GeometryCoordinates.hpp"
 
 namespace vc::objects {
@@ -55,6 +56,8 @@ void mutateMeta(sqlite3* db, const std::string& author, const std::string& host,
 {
     Savepoint savepoint(db);
     if (key.empty()) throw std::runtime_error("object store: meta key must be non-empty");
+    if (key == extensionManifestKey)
+        throw std::invalid_argument("extension: vcobj_extensions is reserved; use replaceExtensionRows");
     const auto path = jsonPathForKey(key);
     const auto bytes = parseUuid(recordUuid);
     const auto [table, id] = recordLocation(db, bytes, recordUuid);

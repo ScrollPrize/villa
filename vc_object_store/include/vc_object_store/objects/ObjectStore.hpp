@@ -7,6 +7,7 @@
 #include "vc_object_store/objects/Geometry.hpp"
 #include "vc_object_store/objects/GeometryRegion.hpp"
 #include "vc_object_store/objects/Transactions.hpp"
+#include "vc_object_store/objects/Extensions.hpp"
 #include <nlohmann/json_fwd.hpp>
 #include <array>
 #include <atomic>
@@ -442,6 +443,21 @@ class ObjectStore {
 public:
     static ObjectStore create(const std::filesystem::path&, const OpenOptions&);
     StoreProvisioning provisioning(const Txn&) const;
+    // Optional typed tables. Definitions/provenance are immutable; append new
+    // result rows (e.g. keyed by run UUID) instead of rewriting old input pins.
+    // The extension owns its SQL layout and semantics; core owns registration,
+    // transactions and commit stamps. No automatic history of extension rows.
+    void createExtensionTable(WriteTxn&, const ExtensionTable&);
+    std::vector<ExtensionTableInfo> extensionTables(const Txn&) const;
+    void appendExtensionRows(WriteTxn&, const std::string& table, std::span<const ExtensionRow>);
+    // Stream in primary-key order; optional equality prefix uses the PK index.
+    void scanExtensionRows(const Txn&, const std::string& table,
+        const std::function<bool(const ExtensionRow&)>&, std::span<const ExtensionValue> keyPrefix = {}) const;
+    void replaceExtensionRows(WriteTxn&, const std::string& table, const std::string& ownerUuid, std::span<const ExtensionRow>);
+    void scanExtensionRowsAtVersion(const Txn&, const std::string& table, const ObjectVersion&,
+        const std::function<bool(const ExtensionRow&)>&) const;
+    void scanExtensionRowsAtVersion(const Txn&, const std::string& table, const RelationshipVersion&,
+        const std::function<bool(const ExtensionRow&)>&) const;
     DatabaseIdentity databaseIdentity(const Txn&) const;
     // Irreversible publication: future writes (including through already-open
     // handles) are rejected. Linked stores must have been sealed, not merely

@@ -35,6 +35,8 @@ struct Db {
 struct Prepared {
     std::vector<InitialObjectRecord> objects;
     std::vector<EdgeRecord> edges;
+    std::vector<std::vector<InitialExtensionRow>> edgeExtensions;
+    std::vector<ExtensionTable> extensions;
     std::vector<std::array<unsigned char,16>> objectIds,edgeIds;
     std::vector<std::pair<int64_t,int64_t>> endpoints;
     std::vector<std::string> objectPayload,edgePayload;
@@ -66,6 +68,7 @@ Prepared prepare(const Json& config){
     const auto workload=config.at("workload").get<std::string>();
     if(workload=="relations"||workload=="combined"){
         AfcSource constraints(config.at("constraints").get<std::string>(),source.uuid());
+        data.extensions.push_back(fiberConstraintExtension({source.uuid(),{},constraints.constraintCount()}));
         data.sourceConstraints=constraints.constraintCount();
         std::unordered_map<std::string,int64_t> ids;
         std::map<int64_t,int64_t> sourceIds;
@@ -75,18 +78,18 @@ Prepared prepare(const Json& config){
                 o.record.kind="fiber";o.record.fiber.emplace();data.objects.push_back(std::move(o));}
             return it->second;
         };
-        EdgeRecord edge;
-        while(data.edges.size()<limit&&constraints.next(edge)){
+        AfcConstraint c;
+        while(data.edges.size()<limit&&constraints.next(c)){
+            auto& edge=c.edge;
             const auto a=endpoint(edge.aUuid),b=endpoint(edge.bUuid);
             if(workload=="combined") {
-                const auto meta=Json::parse(edge.meta).at("afc");
-                for(const auto& [key,logical]:std::array<std::pair<const char*,int64_t>,2>{{{"source_fiber_a",a},{"source_fiber_b",b}}}) {
-                    const auto original=meta.at(key).get<int64_t>();
+                for(const auto original:{c.sourceFiberA,c.sourceFiberB}) {
+                    const auto logical=ids.at(util::nameUuid(source.uuid(),"fiber:"+std::to_string(original)));
                     auto [found,added]=sourceIds.emplace(original,logical);
                     require(added||found->second==logical,"AFC endpoint source identity is inconsistent");
                 }
             }
-            data.endpoints.emplace_back(a,b);data.edges.push_back(std::move(edge));
+            data.endpoints.emplace_back(a,b);data.edges.push_back(std::move(edge));data.edgeExtensions.push_back({std::move(c.measurement)});
         }
         require(data.edges.size()==limit,"insufficient constraints");
         // Seek only required fibers using the native range reader. Consecutive
@@ -110,6 +113,7 @@ Prepared prepare(const Json& config){
     }else{
         require(workload=="geometry","unknown workload");
         const bool production=config.value("afv_records",false);
+        if(production)data.extensions.push_back(fiberSourceExtension({source.uuid(),{},source.fiberCount(),source.pointCount()}));
         const bool includeConstraints=config.value("include_constraints",false);
         require(!includeConstraints||(production&&config.contains("constraints")),"include_constraints requires afv_records and constraints");
         const auto volume=config.value("volume_id",std::string{});
@@ -128,9 +132,8 @@ Prepared prepare(const Json& config){
             lastSourceId=fiber.id;
             if(production){
                 require(fiber.xyz.size()<=maxBytes&&data.bytes<=maxBytes-fiber.xyz.size(),"prepared XYZ exceeds budget");
-                InitialObjectRecord row;row.id=int64_t(data.objects.size()+1);row.record=imports::afvObjectRecord(fiber,source.uuid(),coordinates);
                 data.points+=fiber.detail.linePointCount;data.bytes+=fiber.xyz.size();
-                row.geometry=imports::afvGeometry(fiber);data.objects.push_back(std::move(row));
+                auto row=imports::afvInitialRecord(fiber,source.uuid(),coordinates);row.id=int64_t(data.objects.size()+1);data.objects.push_back(std::move(row));
             }else {
                 const auto uuid=util::nameUuid(source.uuid(),"fiber:"+std::to_string(fiber.id));
                 data.objects.push_back(geometryRecord(data,std::move(fiber),uuid,int64_t(data.objects.size()+1),maxBytes));
@@ -156,29 +159,22 @@ Prepared prepare(const Json& config){
             }
         }
         require(data.objects.size()==limit,"insufficient fibers");
-        Json constraintMetadata;
         if(includeConstraints){
             require(lastSourceId<INT64_MAX,"last source ID cannot form a bounded interval");
             AfcSource constraints(config.at("constraints").get<std::string>(),source.uuid(),lastSourceId+1);
-            constraintMetadata=Json::parse(constraints.metadataJson());
+            data.extensions.push_back(fiberConstraintExtension({source.uuid(),{},constraints.constraintCount()}));
             std::unordered_map<std::string,int64_t> ids;
             for(const auto& row:data.objects)ids.emplace(row.record.uuid,*row.id);
             const auto constraintLimit=config.at("constraint_limit").get<size_t>();
             require(constraintLimit>0,"matched benchmark needs a positive constraint_limit");
-            EdgeRecord edge;
-            while(data.edges.size()<constraintLimit&&constraints.next(edge)){
+            AfcConstraint c;
+            while(data.edges.size()<constraintLimit&&constraints.next(c)){
+                auto& edge=c.edge;
                 require(ids.contains(edge.aUuid)&&ids.contains(edge.bUuid),"constraint endpoint is absent from the prepared geometry");
                 data.endpoints.emplace_back(ids.at(edge.aUuid),ids.at(edge.bUuid));data.edges.push_back(std::move(edge));
+                data.edgeExtensions.push_back({std::move(c.measurement)});
             }
             require(data.edges.size()==constraintLimit,"insufficient eligible constraints");
-        }
-        if(production){
-            InitialObjectRecord metadata;metadata.id=int64_t(data.objects.size()+1);metadata.record.uuid=source.uuid();metadata.record.kind="collection";
-            metadata.record.name=fs::path(sourcePath).stem().string();
-            Json fields={{"coordinates",coordinates},{"afv",{{"metadata",Json::parse(source.metadataJson())}}}};
-            if(includeConstraints)fields["afc"]=std::move(constraintMetadata);
-            metadata.record.meta=fields.dump();
-            data.objects.push_back(std::move(metadata));
         }
     }
     data.readSeconds=elapsed(start);return data;
@@ -187,10 +183,22 @@ void preparePrototype(Prepared& data){
     const auto encoding=Clock::now();
     // The reduced prototype stores the SAME input attributes in opaque payloads;
     // they are not dropped to make its insertion cheaper. No event bundling.
+    const auto extensionJson=[](std::span<const InitialExtensionRow> rows){
+        auto out=Json::array();
+        for(const auto& row:rows){auto values=Json::array();
+            for(const auto& value:row.values)std::visit([&](const auto& v){using T=std::decay_t<decltype(v)>;
+                if constexpr(std::is_same_v<T,std::monostate>)values.push_back(nullptr);
+                else if constexpr(std::is_same_v<T,std::vector<uint8_t>>)values.push_back(Json::binary(v));
+                else values.push_back(v);},value);
+            out.push_back({{"table",row.table},{"values",std::move(values)}});}
+        return out;
+    };
     for(const auto& o:data.objects){data.objectIds.push_back(d::parseUuid(o.record.uuid));
-        data.objectPayload.push_back(d::objectToJson(o.record).dump());}
-    for(const auto& e:data.edges){data.edgeIds.push_back(d::parseUuid(e.uuid));
-        data.edgePayload.push_back(d::edgeToJson(e,nullptr,false).dump());}
+        auto payload=d::objectToJson(o.record);payload["extension_rows"]=extensionJson(o.extensions);
+        data.objectPayload.push_back(payload.dump());}
+    for(size_t i=0;i<data.edges.size();++i){const auto& e=data.edges[i];data.edgeIds.push_back(d::parseUuid(e.uuid));
+        auto payload=d::edgeToJson(e,nullptr,false);payload["extension_rows"]=extensionJson(data.edgeExtensions.at(i));
+        data.edgePayload.push_back(payload.dump());}
     data.baselineEncodingSeconds=elapsed(encoding);
 }
 Json inventory(const fs::path& path){
@@ -275,6 +283,7 @@ Json native(Prepared& data,const fs::path& path,bool linked,bool packed,size_t w
     size_t exportWorkers,bool preSizeExport,size_t residentBytes,bool verifyReadback,size_t sqliteCacheBytes){
     using namespace vc::objects::imports;
     InitialImportOptions opt;opt.store.author="prepared-benchmark";opt.store.sqliteCacheBytes=sqliteCacheBytes;
+    opt.extensions=data.extensions;
     opt.edges.sqlBatchRows=sqlRows;
     require(workers>0&&workers<=data.objects.size(),"sharded benchmark needs at least one object per worker");
     // Retain benchmark-local prototype IDs, but let native shards allocate their
@@ -305,7 +314,8 @@ Json native(Prepared& data,const fs::path& path,bool linked,bool packed,size_t w
                 emit.emit(ImportObject{&data.objects[i]},sizeof(ImportObject),data.objects[i].record.uuid);
         },[&](size_t,size_t task,EdgeEmitter& emit){
             for(size_t i=task*edgeChunk;i<std::min((task+1)*edgeChunk,data.edges.size());++i){
-                const auto& e=data.edges[i];emit.emit({{"",e.aUuid},{"",e.bUuid},e},sizeof(InitialCollectionEdge)+e.meta.size(),e.uuid);
+                const auto& e=data.edges[i];const auto& ext=data.edgeExtensions.at(i);
+                emit.emit({{"",e.aUuid},{"",e.bUuid},e,ext},sizeof(InitialCollectionEdge)+e.meta.size()+extensionPayloadBytes(ext),e.uuid);
             }
         });
       const auto objectProducer=[&](size_t i,InitialShardImport& part){try{
@@ -365,15 +375,25 @@ Json native(Prepared& data,const fs::path& path,bool linked,bool packed,size_t w
     out["readback_verified"]=verifyReadback;out["verify_seconds"]=0.0;
     if(!verifyReadback)return out;
     const auto verify=Clock::now();auto collection=ObjectCollection::open(result.path,OpenOptions{.readOnly=true});auto txn=collection.read();
+    const auto verifyExtensions=[&](std::span<const InitialExtensionRow> rows){
+        for(const auto& expected:rows){size_t found=0;
+            const ExtensionValue prefix[]={expected.values.front()};
+            collection.scanExtensionRows(txn,expected.table,[&](const ExtensionRow& row){++found;
+                require(row==expected.values,"native extension payload mismatch");return true;},prefix);
+            require(found==1,"native extension row missing or duplicated");}
+    };
     for(size_t i=0;i<data.edges.size();i+=std::max(size_t(1),data.edges.size()/10)){
         const auto found=collection.edge(txn,{result.storeUuid,data.edges[i].uuid});
         require(found&&found->record.meta==data.edges[i].meta,"native metadata mismatch");
         require((found->a.objectUuid==data.edges[i].aUuid&&found->b.objectUuid==data.edges[i].bUuid)||
             (found->b.objectUuid==data.edges[i].aUuid&&found->a.objectUuid==data.edges[i].bUuid),"native endpoints mismatch");
+        verifyExtensions(data.edgeExtensions.at(i));
     }
-    for(size_t i=0;i<data.objects.size();i+=std::max(size_t(1),data.objects.size()/10))if(data.objects[i].geometry)
-        require(collection.readGeometryArray(txn,{owner,data.objects[i].record.uuid},"line_points")==
+    for(size_t i=0;i<data.objects.size();i+=std::max(size_t(1),data.objects.size()/10)){
+        if(data.objects[i].geometry)require(collection.readGeometryArray(txn,{owner,data.objects[i].record.uuid},"line_points")==
             data.objects[i].geometry->arrays.back().bytes,"native geometry mismatch");
+        verifyExtensions(data.objects[i].extensions);
+    }
     out["verify_seconds"]=elapsed(verify);return out;
 }
 }
@@ -403,6 +423,7 @@ int main(int argc,char** argv){try{
         indexedAnchors+=!anchor->points.empty();positionAnchors+=bool(anchor->position);wholeAnchors+=anchor->wholeGeometry;
     }
     std::cout<<Json({{"stage","prepared"},{"objects",data.objects.size()},{"constraints",data.edges.size()},
+        {"extension_tables",data.extensions.size()},
         {"points",data.points},{"xyz_bytes",data.bytes},{"source_seconds",data.readSeconds},{"peak_rss_bytes",benchmark::peakRssBytes()},
         {"source_open_seconds",data.sourceOpenSeconds},{"source_select_seconds",data.sourceSelectSeconds},
         {"source_decode_seconds",data.sourceDecodeSeconds},{"record_preparation_seconds",data.recordSeconds},

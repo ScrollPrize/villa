@@ -459,7 +459,7 @@ std::string storeStatusToJson(const StoreStatus& status)
 {
     return Json{{"store", status.storeUuid}, {"generation", status.generation},
                 {"commit_sequence", status.commitSequence}, {"feed_start", status.feedStart},
-                {"history_enabled", status.historyEnabled}}.dump();
+                {"history_enabled", status.historyEnabled}, {"extensions_present", status.extensionsPresent}}.dump();
 }
 
 std::string changePageToJson(const ChangePage& page) { return pageJson(page).dump(); }

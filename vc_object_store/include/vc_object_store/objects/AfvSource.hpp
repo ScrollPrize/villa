@@ -45,9 +45,12 @@ private:
     std::unique_ptr<Impl> impl_;
 };
 
-// AFV-associated extraction data. Each AFC row becomes one ordinary EdgeRecord;
-// native anchors hold positions, and unsupported solver quantities are retained
-// under meta.afc with explicit original endpoint identities (normalization safe).
+struct AfcConstraint {
+    EdgeRecord edge;
+    int64_t sourceId=0, sourceFiberA=0, sourceFiberB=0;
+    InitialExtensionRow measurement;
+};
+// Each AFC row becomes one ordinary edge plus one typed measurement row.
 // Like AfvSource, each cursor is confined to one reader at a time.
 class AfcSource {
 public:
@@ -63,7 +66,7 @@ public:
     size_t setMmapBytes(size_t);
     std::vector<std::array<int64_t,2>> idRanges(size_t partitions, int64_t limit = 0) const;
     void selectRange(int64_t firstId,int64_t pastLastId);
-    bool next(EdgeRecord&);
+    bool next(AfcConstraint&);
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;

@@ -14,6 +14,8 @@
 #include "geometry/GeometryInternal.hpp"
 #include "internal/ExternalEndpoint.hpp"
 #include "internal/Publication.hpp"
+#include "internal/Extensions.hpp"
+#include "internal/ExtensionHistory.hpp"
 #include <variant>
 #include <limits>
 
@@ -40,6 +42,12 @@ bool KeyRoute::matches(int64_t id) const {
     return value%divisor==remainder;
 }
 namespace {
+void requireCompatibleExtension(const ExtensionTableInfo& a,const ExtensionTableInfo& b) {
+    if(a.extension!=b.extension||a.formatVersion!=b.formatVersion||a.columns!=b.columns||
+       a.primaryKey!=b.primaryKey||a.keySpace!=b.keySpace||a.versioned!=b.versioned||
+       nlohmann::json::parse(a.provisioning)!=nlohmann::json::parse(b.provisioning))
+        throw std::runtime_error("collection: incompatible extension definitions: "+a.name);
+}
 bool hasCollection(sqlite3* db) {
     Statement s(db,"SELECT 1 FROM store_required_features WHERE name='collection-v1'"); return s.row();
 }
@@ -492,8 +500,11 @@ std::string ObjectCollection::Impl::ensureLocal(CollectionTxn& t,const ObjectKey
     if(source->node==0)return key.objectUuid;
     const auto inherited=geometry(t,key);
     auto record=source->record;
+    const auto sourceMeta=record.meta;
+    auto meta=nlohmann::json::parse(record.meta);meta.erase(detail::extensionManifestKey);record.meta=meta.dump();
     record.storageKind.clear();record.storageRef.clear();record.dataChecksum.reset();
     nodes[0].store->upsertObject(w,record);
+    detail::materializeExtensionOwner(db(t,source->node),*nodes[0].store,w,"objects",key.objectUuid,sourceMeta);
     if(record.retired||!record.lifecycleEpoch.empty())
         writeLifecycle(db(t,0),*objectIdByUuid(db(t,0),parseUuid(key.objectUuid)),record);
     if(inherited){
@@ -636,6 +647,80 @@ void ObjectCollection::checkpoint(){impl_->nodes[0].store->checkpoint();}
 CollectionTxn ObjectCollection::write(){if(!impl_->nodes[0].collection)throw std::runtime_error("collection: use ObjectStore to edit a plain store");return CollectionTxn(std::make_unique<CollectionTxn::Impl>(impl_.get(),true));}
 std::string ObjectCollection::uuid(const CollectionTxn& t)const{impl_->check(t);return impl_->nodes[0].member.storeUuid;}
 StoreProvisioning ObjectCollection::provisioning(const CollectionTxn& t)const{return impl_->nodes[0].store->provisioning(impl_->txn(t,0));}
+void ObjectCollection::createExtensionTable(CollectionTxn& t,const ExtensionTable& table){
+    auto& w=impl_->writer(t);impl_->nodes[0].store->createExtensionTable(w,table);
+}
+void ObjectCollection::replaceExtensionRows(CollectionTxn& t,const std::string& table,const ObjectKey& input,
+                                             std::span<const ExtensionRow> rows){
+    const auto owner=canonical(input);auto& w=impl_->writer(t);auto* target=impl_->db(t,0);Savepoint save(target);
+    std::optional<ExtensionTableInfo> info;
+    for(size_t n=0;n<impl_->nodes.size();++n)if(auto candidate=detail::extensionTable(impl_->db(t,n),table)){
+        if(info)requireCompatibleExtension(*info,*candidate);else info=std::move(candidate);
+    }
+    if(!info||!info->versioned)throw std::invalid_argument("collection: replacement requires a versioned extension");
+    if(info->keySpace=="objects")impl_->ensureLocal(t,owner);
+    else {
+        const auto existing=edge(t,owner);if(!existing)throw std::invalid_argument("collection: missing/deleted edge");
+        if(!impl_->nodes[0].store->edgeByUuid(w,owner.objectUuid)) {
+            size_t source=0;
+            for(auto n:impl_->uuidReadOrder(owner.objectUuid,"edges")){
+                Statement exists(impl_->db(t,n),"SELECT 1 FROM edges WHERE uuid=?",parseUuid(owner.objectUuid));
+                if(exists.row()){source=n;break;}}
+            auto record=existing->record;const auto sourceMeta=record.meta;
+            auto meta=nlohmann::json::parse(record.meta);meta.erase(detail::extensionManifestKey);record.meta=meta.dump();
+            record.aUuid=existing->a.objectUuid;record.bUuid=existing->b.objectUuid;
+            impl_->nodes[0].store->addEdge(w,record);
+            detail::materializeExtensionOwner(impl_->db(t,source),*impl_->nodes[0].store,w,"edges",owner.objectUuid,sourceMeta);
+        }
+    }
+    if(!detail::extensionTable(target,table)){
+        ExtensionTable spec;spec.name=info->name;spec.extension=info->extension;spec.formatVersion=info->formatVersion;
+        spec.provisioning=info->provisioning;spec.basedOn=info->basedOn;spec.columns=info->columns;spec.primaryKey=info->primaryKey;
+        spec.indexes=info->indexes;spec.keySpace=info->keySpace;spec.versioned=info->versioned;
+        impl_->nodes[0].store->createExtensionTable(w,spec);
+    }
+    const auto metadata=[&]{Statement value(target,"SELECT meta FROM "+info->keySpace+" WHERE uuid=?",parseUuid(owner.objectUuid));
+        if(!value.row())throw std::runtime_error("collection: extension owner disappeared");return value.text(0);};
+    const auto before=metadata();impl_->nodes[0].store->replaceExtensionRows(w,table,owner.objectUuid,rows);
+    if(metadata()==before)return; // Also undo tentative localization on an inherited no-op.
+    save.release();
+}
+std::vector<ExtensionTableInfo> ObjectCollection::extensionTables(const CollectionTxn& t)const{
+    impl_->check(t);std::vector<ExtensionTableInfo> result;
+    for(size_t n=0;n<impl_->nodes.size();++n){auto tables=detail::extensionTables(impl_->db(t,n));
+        result.insert(result.end(),std::make_move_iterator(tables.begin()),std::make_move_iterator(tables.end()));}
+    return result;
+}
+void ObjectCollection::scanExtensionRows(const CollectionTxn& t,const std::string& name,
+    const std::function<bool(const ExtensionRow&)>& visitor,std::span<const ExtensionValue> prefix)const{
+    impl_->check(t);std::optional<ExtensionTableInfo> schema;
+    for(size_t n=0;n<impl_->nodes.size()&&!schema;++n)schema=detail::extensionTable(impl_->db(t,n),name);
+    if(!schema)throw std::invalid_argument("collection: extension table not found: "+name);
+    std::vector<size_t> order;
+    if(!schema->keySpace.empty()&&!prefix.empty())order=impl_->uuidReadOrder(extensionUuid(prefix.front()),schema->keySpace.c_str());
+    else for(size_t n=0;n<impl_->nodes.size();++n)order.push_back(n);
+    std::vector<size_t> keys;
+    for(const auto& key:schema->primaryKey){const auto col=std::find_if(schema->columns.begin(),schema->columns.end(),[&](const auto& c){return c.name==key;});keys.push_back(size_t(col-schema->columns.begin()));}
+    if(!visitor||prefix.size()>schema->primaryKey.size())throw std::invalid_argument("collection: invalid extension scan");
+    std::set<ExtensionRow> seen;bool more=true;
+    std::map<std::string,std::optional<size_t>> owners;
+    for(const auto n:order){auto* db=impl_->db(t,n);const auto info=detail::extensionTable(db,name);if(!info)continue;
+        requireCompatibleExtension(*schema,*info);
+        detail::scanExtensionRows(db,name,[&](const ExtensionRow& row){
+            if(schema->versioned) {
+                const auto owner=extensionUuid(row.at(keys.front()));
+                auto [cached,added]=owners.try_emplace(owner);
+                if(added)for(auto candidate:impl_->uuidReadOrder(owner,schema->keySpace.c_str())) {
+                    Statement state(impl_->db(t,candidate),"SELECT state FROM "+schema->keySpace+" WHERE uuid=?",parseUuid(owner));
+                    if(state.row()){if(state.i64(0)!=2)cached->second=candidate;break;}
+                }
+                if(!cached->second||*cached->second!=n)return true;
+            }
+            ExtensionRow key;for(auto i:keys)key.push_back(row.at(i));
+            if(seen.insert(std::move(key)).second)more=visitor(row);return more;},prefix);
+        if(!more)break;
+    }
+}
 std::vector<CollectionMember> ObjectCollection::members()const{std::vector<CollectionMember> r;for(const auto& n:impl_->nodes)r.push_back(n.member);return r;}
 std::optional<CollectionObject> ObjectCollection::object(const CollectionTxn& t,const ObjectKey& input)const{
     const auto key=canonical(input);auto r=impl_->locate(t,key);if(!r)return {};return CollectionObject{key,std::move(r->record)};
@@ -853,6 +938,9 @@ int64_t ObjectCollection::importInitialEdges(CollectionTxn& t,
             native.push_back(std::move(input.record));
         }
         writer.append(native);
+        std::vector<const InitialExtensionRow*> extensions;
+        for(const auto& input:batch)for(const auto& row:input.extensions)extensions.push_back(&row);
+        detail::appendInitialExtensions(db,extensions);
         count+=static_cast<int64_t>(native.size());
     }
     writer.finish();
@@ -873,6 +961,9 @@ std::vector<InitialObjectIdentity> ObjectCollection::importInitialObjectRefs(
     if(historyEnabled(db))throw std::runtime_error("initial objects require history-off storage");
     Savepoint save(db);
     const auto inserted=detail::insertInitialObjectRefs(*impl_->nodes[0].store,w,records);
+    std::vector<const InitialExtensionRow*> extensions;
+    for(const auto* record:records)for(const auto& row:record->extensions)extensions.push_back(&row);
+    detail::appendInitialExtensions(db,extensions);
     std::vector<InitialObjectIdentity> result;result.reserve(inserted.size());
     for(const auto& [uuid,id]:inserted)result.push_back({{impl_->nodes[0].member.storeUuid,uuid},id});
     save.release();return result;
@@ -882,6 +973,7 @@ void ObjectCollection::removeEdge(CollectionTxn& t,const ObjectKey& input){
     const auto current=edge(t,key);if(!current)throw std::runtime_error("collection: edge absent");
     if(!impl_->nodes[0].store->edgeByUuid(w,key.objectUuid)){
         auto copy=current->record;copy.aUuid=current->a.objectUuid;copy.bUuid=current->b.objectUuid;
+        auto meta=nlohmann::json::parse(copy.meta);meta.erase(detail::extensionManifestKey);copy.meta=meta.dump();
         impl_->nodes[0].store->addEdge(w,copy);
     }
     impl_->nodes[0].store->removeEdge(w,key.objectUuid);

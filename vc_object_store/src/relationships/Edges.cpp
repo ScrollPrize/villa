@@ -4,6 +4,7 @@
 #include "geometry/Dependencies.hpp"
 #include "geometry/GeometryInternal.hpp"
 #include "internal/History.hpp"
+#include "internal/ExtensionHistory.hpp"
 #include <nlohmann/json.hpp>
 #include <variant>
 
@@ -45,6 +46,7 @@ void ObjectStore::updateEdge(WriteTxn& txn, const EdgeRecord& record)
     if (!existing) throw std::runtime_error("object store: edge not found: " + record.uuid);
     auto rec = record;
     canonicalizeEdge(rec);
+    checkExtensionMetadata(existing->meta, rec.meta);
     if (rec.aUuid != rec.bUuid && rec.aUuid == existing->bUuid && rec.bUuid == existing->aUuid)
         swapEndpoints(rec);
     if (rec.kind != existing->kind || rec.aUuid != existing->aUuid || rec.bUuid != existing->bUuid)
@@ -93,6 +95,7 @@ void ObjectStore::removeEdge(WriteTxn& txn, const std::string& uuid)
     if (!row.row()) throw std::runtime_error("object store: edge not found: " + uuid);
     const auto kind = row.text(1);
     writeRecordVersion(db, "edges", uuid);
+    clearCurrentExtensionRows(db, "edges", uuid);
     execute(db,"UPDATE edges SET state=2,commit_sequence=?,changed_by=?,changed_at=?,changed_host=? WHERE id=?",
         writeCommitSequence(db),author(),nowIsoUtc(),hostname(),row.i64(0));
     appendJournal(db, impl_->options.author, impl_->hostname, bytes, 0, "remove_edge", kind);

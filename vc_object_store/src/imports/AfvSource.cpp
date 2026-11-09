@@ -1,5 +1,7 @@
 #include "vc_object_store/objects/AfvSource.hpp"
 #include "vc_object_store/Uuid.hpp"
+#include "vc_object_store/objects/FiberImportExtension.hpp"
+#include "internal/Anchors.hpp"
 #include "internal/Sqlite.hpp"
 #include "geometry/GeometryInternal.hpp"
 #include <nlohmann/json.hpp>
@@ -174,7 +176,6 @@ struct AfcSource::Impl {
     std::unique_ptr<detail::Statement> rows;
     std::string metadata,uuid;
     std::array<unsigned char,16> uuidBytes;
-    nlohmann::json edgeMetadata={{"afc",nlohmann::json::object()}};
     int64_t count=0,read=0,fiberEnd=INT64_MAX;
     bool full=false,finished=false;
     ~Impl(){rows.reset();if(db)sqlite3_close(db);}
@@ -249,7 +250,7 @@ std::vector<std::array<int64_t,2>> AfcSource::idRanges(size_t partitions,int64_t
         first+int64_t((i+1)*(span/int64_t(n))+std::min<uint64_t>(i+1,span%int64_t(n)))});
     return result;
 }
-bool AfcSource::next(EdgeRecord& edge)
+bool AfcSource::next(AfcConstraint& constraint)
 {
     auto& p=*impl_;auto& s=*p.rows;
     if(p.finished)return false;
@@ -262,6 +263,8 @@ bool AfcSource::next(EdgeRecord& edge)
     }
     for(int col:{0,1,2})if(sqlite3_column_type(s.value,col)!=SQLITE_INTEGER || s.i64(col)<0)
         throw std::invalid_argument("missing or invalid AFC constraint/fiber ID");
+    constraint={};auto& edge=constraint.edge;
+    constraint.sourceId=s.i64(0);constraint.sourceFiberA=s.i64(1);constraint.sourceFiberB=s.i64(2);
     {detail::GeometryPhase identity("source.afc.uuid");
     edge={};edge.uuid=util::nameUuid(p.uuidBytes,"constraint:"+std::to_string(s.i64(0)));
     edge.aUuid=util::nameUuid(p.uuidBytes,"fiber:"+std::to_string(s.i64(1)));
@@ -274,22 +277,22 @@ bool AfcSource::next(EdgeRecord& edge)
     edge.aAnchor.position=std::array<double,3>{s.f64(5),s.f64(6),s.f64(7)};
     edge.bAnchor.position=std::array<double,3>{s.f64(8),s.f64(9),s.f64(10)};
     edge.aAnchor.wholeGeometry=true;edge.bAnchor.wholeGeometry=true;
-    // Keep the fixed object/map nodes between records; only the values change.
-    // This preserves the canonical JSON and every source field without
-    // allocating/freeing the entire descriptor tree for each constraint.
-    auto& fields=p.edgeMetadata["afc"];
-    fields["id"]=s.i64(0);fields["source_fiber_a"]=s.i64(1);fields["source_fiber_b"]=s.i64(2);
-    fields["a_uuid"]=edge.aUuid;fields["b_uuid"]=edge.bUuid;
+    std::array<std::optional<double>,7> values;size_t index=0;
     for(int col:{3,4,11,12,13,14,15}){
-        if(sqlite3_column_type(s.value,col)==SQLITE_NULL){fields[sqlite3_column_name(s.value,col)]=nullptr;continue;}
-        if(!std::isfinite(s.f64(col)))throw std::invalid_argument("non-finite AFC scalar");
-        fields[sqlite3_column_name(s.value,col)]=s.f64(col);
+        if(sqlite3_column_type(s.value,col)!=SQLITE_NULL){
+            if(!std::isfinite(s.f64(col)))throw std::invalid_argument("non-finite AFC scalar");values[index]=s.f64(col);}
+        ++index;
     }
+    std::array<nlohmann::json,3> fields;
     {detail::GeometryPhase parse("source.afc.json_parse");
-    for(int col=16;col<=18;++col)fields[sqlite3_column_name(s.value,col)]=
+    for(int col=16;col<=18;++col)fields[col-16]=
         sqlite3_column_type(s.value,col)==SQLITE_NULL?nlohmann::json(nullptr):nlohmann::json::parse(s.text(col));
     }
-    {detail::GeometryPhase dump("source.afc.json_dump");edge.meta=p.edgeMetadata.dump();}
+    auto& measurement=fields[2];
+    for(const auto& [name,position]:{std::pair{"pointABaseXYZ",edge.aAnchor.position},std::pair{"pointBBaseXYZ",edge.bAnchor.position}})
+        if(measurement.is_object()&&measurement.contains(name)&&measurement.at(name)==nlohmann::json(*position))measurement.erase(name);
+    const bool reversed=detail::canonicalizeEdge(edge);
+    constraint.measurement=fiberConstraintRow(edge.uuid,constraint.sourceId,constraint.sourceFiberA,constraint.sourceFiberB,reversed,values,fields[0],fields[1],measurement);
     ++p.read;return true;
 }
 }

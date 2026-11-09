@@ -1,5 +1,6 @@
 #include "internal/InitialEdges.hpp"
 #include "internal/EdgeSql.hpp"
+#include "internal/ExtensionHistory.hpp"
 #include "geometry/GeometryInternal.hpp"
 #include <limits>
 
@@ -68,6 +69,7 @@ void InitialEdgeInserter::append(std::span<EdgeRecord> input) {
         for(size_t i=0;i<input.size();++i){
             auto& rec=input[i];
             const auto binaryUuid=normalizeNewEdge(rec);
+            rejectInitialExtensionMetadata(rec.meta);
             rows.push_back({&rec,first+int64_t(i),parseUuid(rec.aUuid),parseUuid(rec.bUuid),binaryUuid});
         }}
         {GeometryPhase insertion("initial_edges.edge_rows");

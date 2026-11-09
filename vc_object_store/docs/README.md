@@ -18,6 +18,7 @@ Current schema 21 also supports history-off stores, immutable linked overlays, i
 | [Graph edges](graph-edges.md) | Relationship records and kinds, anchors and dependencies, decisions when geometry changes, applicability, traversal and `graph_read`, link detectors, `vc_object_links` |
 | [Transforms](transforms.md) | `meta.coordinates` (volume identity and scale), volume registrations and route choices, transformed views and edits, volume-target queries |
 | [Typed geometry](typed-geometry.md) | Owned geometry values (`PointCollection`, `Fiber`, `Track`, `Surface`, `Umbilicus`), snapshot views, encoding, validation |
+| [Typed extensions](extensions.md) | Optional indexed result/measurement tables, extension provisioning, input-state references and versioning |
 | [Hosted stores and sessions](hosted.md) | `vc_object_server`, `HostedStore` clients, `ObjectStoreSession` attachments, change events, hosted artifacts, durable drafts |
 
 ## Shared rules

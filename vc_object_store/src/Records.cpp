@@ -1,4 +1,5 @@
 #include "internal/RecordSql.hpp"
+#include "internal/ExtensionHistory.hpp"
 #include "geometry/GeometryDelta.hpp"
 
 namespace vc::objects {
@@ -82,6 +83,7 @@ void ObjectStore::deleteObject(WriteTxn& txn, const std::string& uuid)
     if (incident.row()) throw std::runtime_error("object store: remove incident relationships before deletion");
     beforeCurrentObjectEdit(db,uuid);
     writeObjectVersion(db,uuid);
+    clearCurrentExtensionRows(db, "objects", uuid);
     // Keep only the same-key deletion marker, not live subtype identities or
     // tags. In particular a deleted track must release its source identity.
     for(const auto* table:{"fibers","surfaces","tracks","object_tags"})
