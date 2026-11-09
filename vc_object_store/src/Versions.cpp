@@ -267,7 +267,7 @@ void detail::recordCurrentChange(sqlite3* db, const std::array<unsigned char,16>
     auto& pool=*found->second;
     auto& state=pool.currentWrite;
     if(!state) state=std::make_shared<CurrentWriteState>();
-    else if(!state.unique()) state=std::make_shared<CurrentWriteState>(*state);
+    else if(state.use_count()!=1) state=std::make_shared<CurrentWriteState>(*state);
     const auto uuid=formatUuid(key);
     const auto expectObject=[&](const std::string& object) {
         if(pool.checkedAction && !pool.checkedObjects.contains(object)) {

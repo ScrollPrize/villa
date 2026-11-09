@@ -320,7 +320,7 @@ void detail::recordRelationshipValidation(sqlite3* db, const EdgeRecord& edge, b
     const auto a=currentDependencyMetadata(db,edge.aUuid,edge.aAnchor), b=currentDependencyMetadata(db,edge.bUuid,edge.bAnchor);
     if (!history) {
         auto& state=activeStatementPools.at(db)->currentWrite;
-        if(!state.unique())state=std::make_shared<CurrentWriteState>(*state);
+        if(state.use_count()!=1)state=std::make_shared<CurrentWriteState>(*state);
         state->validated.insert_or_assign(edge.uuid,std::pair{a,b});
         return;
     }
@@ -345,7 +345,7 @@ CurrentWriteState& mutableCurrentWrite(sqlite3* db)
 {
     auto& state=activeStatementPools.at(db)->currentWrite;
     if(!state)state=std::make_shared<CurrentWriteState>();
-    else if(!state.unique())state=std::make_shared<CurrentWriteState>(*state);
+    else if(state.use_count()!=1)state=std::make_shared<CurrentWriteState>(*state);
     return *state;
 }
 }
