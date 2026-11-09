@@ -10,7 +10,7 @@ from volreg import record as rec, release
 BY = {"handle": "j", "email": "j@x"}
 
 
-def make(root, name, pair, at, pipeline, publish="bend"):
+def make(root, name, pair, at, pipeline, publish="bend", decided=True):
     record = rec.Record(root / name)
     record.write(rec.PAIR, {"pair": pair, "coarse_side": "fixed"})
     record.write(rec.HOLDOUT, {"patches": [
@@ -18,7 +18,8 @@ def make(root, name, pair, at, pipeline, publish="bend"):
          "octants": [{"index": 2, "answer": {"answer": "no", "at": at, "by": BY}}]}]})
     decision = {"fit": "f002", "publish": publish, "reason": "", "override": None, "by": BY, "at": at}
     record.write(rec.FINAL_REVIEW, {"rounds": [{"id": "c001", "items": [{"patch": "p0001", "choice": 0}]}],
-                                    "decision": decision})
+                                    "decision": decision if decided else None,
+                                    "revisit": [] if decided else [{"text": "deferred", "done": None}]})
     score = {"lines_up": 25, "median_fine_voxels": 1.0, "p90_fine_voxels": 2.0, "far": 0,
              "median_um": 1.0, "p90_um": 2.0, "bar": {"passes": True}}
     fit = {"scores": {"bend": score, "affine": score}, "bar": {"version": "test"}}
@@ -67,3 +68,13 @@ def test_two_undated_decisions_of_one_pair_are_refused(tmp_path):
     make(old, "a-2", "A", None, pipeline=False)
     with pytest.raises(ValueError, match="cannot tell"):
         release.release(tmp_path / "out", [old])
+
+
+def test_a_pair_under_review_again_is_held_back_whole(tmp_path):
+    old, new = tmp_path / "record-v1", tmp_path / "pipeline-smoke"
+    make(old, "a-auto", "A", None, pipeline=False)
+    make(new, "a", "A", None, pipeline=True, decided=False)
+    index = release.release(tmp_path / "out", [old, new])
+    assert index["pairs"] == []
+    assert {item["source"]: item["why"] for item in index["left_out"]}["record-v1/a-auto"] == \
+        "held back: pipeline-smoke/a is not decided (deferred)"

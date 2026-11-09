@@ -2,9 +2,11 @@
 
 For each pair, the record with the newest decision is taken, whether the pipeline made it
 or it was migrated from the first runs; a pipeline record wins over a migrated one of the
-same pair, since a migrated decision has no time of its own. Of a record, the files a person
-decided and what they rest on are copied whole; the event log, the stage settings and the
-derived state under `work/` stay behind. `index.json` lists each pair with where it came
+same pair, since a migrated decision has no time of its own. A pair whose pipeline record
+is not decided yet (deferred, or still under review) is held back whole: an older decision
+of it is not released in the meantime. Of a record, the files a person decided and what
+they rest on are copied whole; the event log, the stage settings and the derived state under
+`work/` stay behind. `index.json` lists each pair with where it came
 from, its decision and score, the hash of every file, and what its record does not hold
 (a migrated record has no code commit, for example). Nothing is filled in.
 
@@ -81,7 +83,7 @@ def release(out, roots):
     out = Path(out)
     if out.exists():
         raise FileExistsError(f"{out} exists; a release is written whole, into a new folder")
-    by_pair, left_out = {}, []
+    by_pair, pending, left_out = {}, {}, []
     for root in map(Path, roots):
         for directory in sorted(root.iterdir()):
             record = rec.Record(directory)
@@ -93,6 +95,10 @@ def release(out, roots):
             if not decision:
                 left_out.append({"source": source, "pair": record.read(rec.PAIR)["pair"],
                                  "why": final.get("status") or "not decided"})
+                if is_pipeline(record):
+                    open_items = [item["text"] for item in final.get("revisit") or []
+                                  if not item.get("done")]
+                    pending[record.read(rec.PAIR)["pair"]] = (source, open_items)
             elif decision["publish"] == "nothing" or not record.exists(rec.TRANSFORM):
                 left_out.append({"source": source, "pair": record.read(rec.PAIR)["pair"],
                                  "why": "decided to publish nothing"})
@@ -100,6 +106,13 @@ def release(out, roots):
                 by_pair.setdefault(record.read(rec.PAIR)["pair"], []).append((record, source))
     pairs = []
     for name, found in sorted(by_pair.items()):
+        if name in pending:
+            # The pair is being looked at again and nobody has decided yet: an older decision
+            # is not published in the meantime.
+            source, open_items = pending[name]
+            why = f"held back: {source} is not decided" + (f" ({open_items[0]})" if open_items else "")
+            left_out.extend({"source": older, "pair": name, "why": why} for _record, older in found)
+            continue
         found.sort(key=lambda item: newness(item[0]))
         if len(found) > 1 and newness(found[-1][0]) == newness(found[-2][0]):
             raise ValueError(f"{name}: cannot tell which decision is newest: "
