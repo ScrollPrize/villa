@@ -1001,7 +1001,8 @@ uv sync            # creates .venv from pyproject.toml
 
 This also builds Spiral's native helpers as `vc_spiral.spiral_sampling`,
 `vc_spiral.track_crossings` and `vc_spiral.track_store`. OpenMP is used when the toolchain provides it; the
-same modules build with serial kernels when it does not.
+same modules build with serial kernels when it does not, and always on Windows
+(MSVC) and macOS, where torch's wheels load their own OpenMP runtime.
 
 or with conda/pip, install `torch` for your CUDA version and then
 `pip install -e . --group cuda` from `spiral-fitting/` (pip 25.1 or newer).
@@ -1028,6 +1029,16 @@ uv pip install -e '.[cpu]'
 
 Use `.venv/bin/python` (or `uv run --no-sync`) afterwards: a plain `uv sync`
 or `uv run` would reinstall the CUDA build of torch and the `cuda` group.
+
+On macOS, `vc_object_store` links Homebrew's OpenCV, which links OpenBLAS, which
+loads Homebrew's `libomp.dylib`; torch loads its own copy, so `import torch,
+vc_object_store` stops with `OMP: Error #15` unless Python starts with
+`KMP_DUPLICATE_LIB_OK=TRUE`. Spiral's own modules use no OpenMP on macOS, so the
+second runtime only serves OpenBLAS calls inside OpenCV:
+
+```sh
+KMP_DUPLICATE_LIB_OK=TRUE .venv/bin/python fit_spiral.py ...
+```
 
 ### Resident sparse field pools
 
