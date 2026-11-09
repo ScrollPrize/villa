@@ -38,6 +38,9 @@
 #include <vc_object_store/Uuid.hpp>
 
 #include <unistd.h>
+#if defined(__APPLE__)
+#include <dlfcn.h>
+#endif
 
 namespace fs = std::filesystem;
 
@@ -1043,6 +1046,26 @@ static int run_tifxyz(const fs::path& input, const fs::path& output, const Optio
 // main
 // ------------------------------
 int main(int argc, char** argv) {
+  bool blas_omp_single = false;
+#if defined(__APPLE__)
+  // macOS: PaStiX's worker threads call into Homebrew's OpenBLAS, an OpenMP
+  // build, and each call opens its own OpenMP team. OpenBLAS before 0.3.34
+  // races there (its 0.3.34 notes: "Fixed potential race conditions between
+  // concurrent calls to level3 BLAS"); on real segments PaStiX prints
+  // "Negative diagonal term" and flatboi crashes inside libopenblas. One
+  // OpenMP thread per BLAS call avoids it, and PaStiX keeps all its threads.
+  // setenv("OMP_NUM_THREADS") here would be too late, because the OpenMP
+  // runtime OpenBLAS loads has already read it, so change the runtime's
+  // default instead. flatboi has no OpenMP of its own on Clang, so the call is
+  // looked up at run time. An OMP_NUM_THREADS set by the user still wins.
+  if (!std::getenv("OMP_NUM_THREADS")) {
+    using SetDefaults = void (*)(const char*);
+    if (auto set_defaults = reinterpret_cast<SetDefaults>(dlsym(RTLD_DEFAULT, "kmp_set_defaults"))) {
+      set_defaults("OMP_NUM_THREADS=1");
+      blas_omp_single = true;
+    }
+  }
+#endif
   std::string input_path;
   int iters = 50;
   igl::MappingEnergyType energy = igl::MappingEnergyType::SYMMETRIC_DIRICHLET;
@@ -1135,7 +1158,8 @@ int main(int argc, char** argv) {
     const char* on = std::getenv("OMP_NUM_THREADS");
     std::cout << "Threading env: PASTIX_NUM_THREADS="
               << (pn ? pn : "<unset, PaStiX auto via hwloc>")
-              << ", OMP_NUM_THREADS=" << (on ? on : "<unset>")
+              << ", OMP_NUM_THREADS="
+              << (on ? on : blas_omp_single ? "<unset, 1 per BLAS call on macOS>" : "<unset>")
               << ", hardware_concurrency=" << std::thread::hardware_concurrency()
               << std::endl;
   }
