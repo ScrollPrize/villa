@@ -30,6 +30,9 @@ inline constexpr std::string_view kAnonymousRemoteAuthTag =
 struct Entry {
     std::string location;
     std::vector<std::string> tags;
+    // Optional named CZYX scalar display views, in storage channel order.
+    // The source is persisted once; all views share its caches and coordinates.
+    std::vector<std::string> channels;
     bool operator==(const Entry&) const = default;
 };
 
@@ -91,6 +94,7 @@ public:
         std::string location;
         std::vector<std::string> tags;
         std::shared_ptr<Volume> volume;
+        std::vector<std::string> channels;
     };
 
     static std::shared_ptr<VolumePkg> open(const std::filesystem::path& path,
@@ -216,6 +220,8 @@ private:
 
     void resolveAll();
     void resolveVolumeEntry(const vc::project::Entry& e);
+    bool registerVolumeViews(const std::shared_ptr<Volume>& volume, const vc::project::Entry& entry,
+                             bool replace = false);
     void resolveNormalGridEntry(const vc::project::Entry& e);
 
     // Read resources and view state from the document.

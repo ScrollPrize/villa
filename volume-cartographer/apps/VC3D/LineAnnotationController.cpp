@@ -8645,9 +8645,7 @@ bool LineAnnotationController::ensureFiberInferenceDatasetForSession(
             std::vector<VolumePkg::PreparedVolumeAttachment> volumes;
             for (auto& prepared : vc::lasagna::prepareLasagnaProjectVolumes(
                      openedDataset, selected)) {
-                volumes.push_back({
-                    std::move(prepared.location), std::move(prepared.tags),
-                    std::move(prepared.volume)});
+                volumes.push_back(std::move(prepared));
             }
             const auto result = vpkg->attachPreparedLasagnaDataset(
                 selected, {}, true, volumes);

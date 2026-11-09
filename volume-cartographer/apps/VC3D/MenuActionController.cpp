@@ -1972,7 +1972,7 @@ bool MenuActionController::startLasagnaManifestAttachment(const QString& locatio
                 throw std::runtime_error("regular Lasagna data requires grad_mag, nx, and ny normal channels");
             for (auto& prepared : vc::lasagna::prepareLasagnaProjectVolumes(
                      dataset, persistedLocation)) {
-                result.volumes.push_back({std::move(prepared.location), std::move(prepared.tags), std::move(prepared.volume)});
+                result.volumes.push_back(std::move(prepared));
             }
         } catch (const std::exception& error) {
             result.error = QString::fromUtf8(error.what());

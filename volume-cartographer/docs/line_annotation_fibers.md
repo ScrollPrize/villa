@@ -115,8 +115,16 @@ independent of the Fiber model / Lasagna interpolation selection. The compound
 the `sheet_*` channels at their original packed offsets, with separate base- and
 trace-coordinate adapters. Existing normal sampling/interpolation is reused.
 
-Packed CZYX arrays attach as spatial volumes and display their first channel
-(presence for compound AFV). Display reads the shared packed chunk cache directly,
+Attaching a manifest exposes every named packed CZYX channel in the regular
+volume dropdown (for example `presence`, `width`, `nx`, and `sheet_nx`). Each
+view is labeled `source / channel`; the project stores the source once with its
+channel names and restores the views and selected channel on reopening. Channel
+zero retains the old volume ID, and all views share the source's annotation
+coordinate frame. Existing separate ZYX channel volumes are unchanged. Reattach
+a manifest to add the channel views to an older project; opening a bare packed
+volume without a manifest continues to display channel zero.
+
+Display reads the shared packed chunk cache directly,
 without extracting or writing separate channel volumes. Uint8 channel views use
 the existing CUDA display path when enabled: selected scalar bricks are uploaded
 from the shared decoded CZYX cache, with CPU fallback on GPU failure. Other dtypes

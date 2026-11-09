@@ -12,7 +12,7 @@ if (const char* source = std::getenv("VC3D_COMPOUND_TEST_VOLUME")) {
     const auto dataset = vc::lasagna::LasagnaDataset::openLocation(source);
     std::vector<VolumePkg::PreparedVolumeAttachment> volumes;
     for (auto& prepared : vc::lasagna::prepareLasagnaProjectVolumes(dataset, source))
-        volumes.push_back({std::move(prepared.location), std::move(prepared.tags), std::move(prepared.volume)});
+        volumes.push_back(std::move(prepared));
     state.vpkg()->attachPreparedLasagnaDataset(source, {}, true, volumes);
     require(state.vpkg()->selectedLasagnaDataset().empty(), "no Lasagna selected");
     require(state.vpkg()->lasagnaDatasetEntries().empty(), "no Lasagna attached");
@@ -39,6 +39,26 @@ if (const char* source = std::getenv("VC3D_COMPOUND_TEST_VOLUME")) {
     const auto rendered = vcr::grid::sampleCached(frame, request, nullptr);
     require(rendered.level[0] == 0 && rendered.values[0] > 0, "progressive display reads real packed presence");
     require(rendered.cudaFailure.empty(), "compound viewer did not fall back after CUDA failure");
+    const auto reloaded = VolumePkg::open(state.vpkg()->path());
+    require(reloaded->numberOfVolumes() == 7, "all real compound channels survive project reopening");
+    const auto* sharedArray = request.levels[0].array;
+    for (const auto& id : reloaded->volumeIDs()) {
+        const auto view = reloaded->volume(id);
+        require(view->channel().has_value(), "attached compound channel is a named scalar view");
+        auto channelRequest = vc3d::openViewerLevels(openedVolumes, *view).request(2, 0);
+        require(channelRequest.levels.size() == 1 && channelRequest.levels[0].channel == view->channel(),
+                "viewer selects the requested named channel");
+        require(channelRequest.levels[0].array == sharedArray, "all channel views share the opened RAM array");
+        require(!testCuda || channelRequest.levels[0].cuda, "selected channel has CUDA sampling");
+        auto expected = request;
+        expected.levels[0].cuda = nullptr;
+        expected.levels[0].channel = view->channel();
+        const auto cpu = vcr::grid::sample(frame, expected);
+        const auto actual = vcr::grid::sample(frame, channelRequest);
+        require(actual.cudaFailure.empty() && std::abs(actual.values[0] - cpu.values[0]) < 1.e-3f,
+                "selected channel displays the correct real voxel values");
+    }
+    std::cout << "compound_gui PASS: seven named channel views, project reload, shared CPU/CUDA display" << std::endl;
     if (testCuda) {
         auto cpuRequest=request;
         cpuRequest.levels[0].cuda=nullptr;
