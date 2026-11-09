@@ -598,13 +598,12 @@ std::optional<TransactionReceipt> ObjectStoreSession::editCurrent(const Attachme
     readStore(identity, [&](const StoreReader& reader, const auto&) {
         // Guard the versions before callbacks read or compute their edits. A
         // hosted poll during a callback must not advance these expectations.
-        editCurrentRequest(reader, request, objectUuids, {});
-        std::vector<TransactionOperation> edits;
-        for (const auto& objectUuid : objectUuids)
-            for (auto& operation : operations(reader, util::canonicalUuid(objectUuid))) edits.push_back(std::move(operation));
-        // Relationship decisions still run after the edits they describe.
-        for (auto& operation : request.operations) edits.push_back(std::move(operation));
-        request.operations = std::move(edits);
+        buildCurrentEditRequest(reader, request, objectUuids, [&] {
+            std::vector<TransactionOperation> edits;
+            for (const auto& objectUuid : objectUuids)
+                for (auto& operation : operations(reader, util::canonicalUuid(objectUuid))) edits.push_back(std::move(operation));
+            return edits;
+        });
     });
     return submit(identity, request);
 }

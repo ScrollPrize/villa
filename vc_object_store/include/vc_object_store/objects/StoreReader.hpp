@@ -14,6 +14,7 @@
 
 #include <limits>
 #include <set>
+#include <functional>
 
 namespace vc::objects {
 
@@ -100,12 +101,18 @@ void expectRelationshipEndpoints(const StoreReader&, VersionSelection& expected)
 // relationships as recorded (ObjectStoreSession::editCurrent): expects each of
 // `objectUuids` at its current version (throws when one is absent) and every
 // endpoint of their relationships, appends `operations`, then keeps every
-// relationship of each object (retired ones included) as recorded. With
+// surviving relationship of each object as recorded. Relationships removed
+// explicitly or by retirement/historical restoration are not retained. With
 // history disabled there is no archival binding; retain and validate the
 // current relationships instead. Geometry-changing requests must make their
 // affected-relationship decisions explicitly.
 void editCurrentRequest(const StoreReader&, TransactionRequest&, const std::vector<std::string>& objectUuids,
                         std::vector<TransactionOperation> operations);
+// Callback form: capture expected versions before computing the edits, then
+// choose surviving relationships after the operations are known. This keeps
+// hosted reads during the callback from advancing the request's expectations.
+void buildCurrentEditRequest(const StoreReader&, TransactionRequest&, const std::vector<std::string>& objectUuids,
+                             const std::function<std::vector<TransactionOperation>()>& operations);
 // The operation that declares `record`'s coordinate frame
 // (ObjectStore::bindGeometryCoordinates): stored at `storedUnitsPerVoxel`
 // units per voxel of `volume`, merged into its meta.coordinates; throws for a

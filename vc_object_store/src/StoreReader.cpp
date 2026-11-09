@@ -116,6 +116,12 @@ void expectRelationshipEndpoints(const StoreReader& reader, VersionSelection& ex
 void editCurrentRequest(const StoreReader& reader, TransactionRequest& request, const std::vector<std::string>& objectUuids,
                         std::vector<TransactionOperation> operations)
 {
+    buildCurrentEditRequest(reader, request, objectUuids, [&] { return std::move(operations); });
+}
+
+void buildCurrentEditRequest(const StoreReader& reader, TransactionRequest& request, const std::vector<std::string>& objectUuids,
+                             const std::function<std::vector<TransactionOperation>()>& operations)
+{
     std::vector<std::string> uuids;
     for (const auto& objectUuid : objectUuids) {
         const auto uuid = util::canonicalUuid(objectUuid);
@@ -125,15 +131,25 @@ void editCurrentRequest(const StoreReader& reader, TransactionRequest& request, 
         uuids.push_back(uuid);
     }
     expectRelationshipEndpoints(reader, request.expectedObjects);
-    for (auto& operation : operations) request.operations.push_back(std::move(operation));
+    for (auto& operation : operations()) request.operations.push_back(std::move(operation));
     if (uuids.empty()) return;
     EdgeSelection edges;
     edges.endpointUuids = uuids;
     edges.includeRetired = true;
     std::set<std::string> kept;
     const bool history = reader.status().historyEnabled;
+    std::set<std::string> removedEdges, removedEndpoints;
+    for (const auto& operation : request.operations) {
+        if (const auto* remove = std::get_if<RemoveEdgeOp>(&operation))
+            removedEdges.insert(util::canonicalUuid(remove->uuid));
+        else if (const auto* retire = std::get_if<RetireObjectOp>(&operation))
+            removedEndpoints.insert(util::canonicalUuid(retire->uuid));
+        else if (const auto* restore = std::get_if<RestoreObjectOp>(&operation); restore && history && restore->source)
+            removedEndpoints.insert(util::canonicalUuid(restore->uuid));
+    }
     for (const auto& edge : reader.selectEdges(edges, std::vector<std::string>{}))
-        if (kept.insert(edge.uuid).second) {
+        if (!removedEdges.contains(edge.uuid) && !removedEndpoints.contains(edge.aUuid) &&
+            !removedEndpoints.contains(edge.bUuid) && kept.insert(edge.uuid).second) {
             if (history) request.operations.push_back(KeepRecordedRelationshipOp{edge.uuid});
             else request.operations.push_back(RetainRelationshipOp{edge.uuid});
         }

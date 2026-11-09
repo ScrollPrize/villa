@@ -15,8 +15,101 @@
 
 using namespace vc::objects;
 
+namespace {
+void editCurrentLifecycle(HistoryMode history)
+{
+    TemporaryDirectory directory;
+    OpenOptions options; options.author = "lifecycle-test"; options.history = history;
+    const auto path = directory.path / "lifecycle.vcobj";
+    auto store = ObjectStore::create(path, options);
+    const auto a = util::newUuid(), b = util::newUuid(), c = util::newUuid();
+    auto makeEdge = [](const std::string& first, const std::string& second) {
+        EdgeRecord edge; edge.uuid = util::newUuid(); edge.kind = "attachment";
+        edge.aUuid = first; edge.bUuid = second;
+        edge.aAnchor.wholeGeometry = edge.bAnchor.wholeGeometry = true;
+        return edge;
+    };
+    auto ab = makeEdge(a, b), bc = makeEdge(b, c);
+    {
+        auto txn = store.write();
+        for (const auto& uuid : {a, b, c}) {
+            ObjectRecord record; record.uuid = uuid; record.kind = "surface";
+            store.upsertObject(txn, record);
+        }
+        store.addEdge(txn, ab); store.addEdge(txn, bc); txn.commit();
+    }
+    ObjectStoreSession session;
+    const auto attachment = session.attach(path, options);
+    session.editCurrent(attachment, {a, b}, [&](const StoreReader&, const std::string& uuid) {
+        if (uuid == a) return std::vector<TransactionOperation>{RetireObjectOp{a}};
+        return std::vector<TransactionOperation>{SetMetaOp{b, "note", "1"}};
+    });
+    {
+        auto txn = store.read();
+        require(store.objectByUuid(txn, a)->retired, "editCurrent retires an object with relationships");
+        require(!store.edgeByUuid(txn, ab.uuid), "retirement removes its incident relationship");
+        require(store.edgeByUuid(txn, bc.uuid).has_value(), "editCurrent retains unrelated surviving relationships");
+    }
+    session.editCurrent(attachment, {a}, [&](const StoreReader&, const std::string&) {
+        return std::vector<TransactionOperation>{RestoreObjectOp{a, {}}};
+    });
+    {
+        auto txn = store.read();
+        require(!store.objectByUuid(txn, a)->retired && !store.edgeByUuid(txn, ab.uuid),
+                "restoration does not revive removed relationships");
+    }
+    // A no-op restore of an active endpoint must still retain its relationships
+    // when the same request also edits its metadata.
+    session.editCurrent(attachment, {b}, [&](const StoreReader&, const std::string&) {
+        return std::vector<TransactionOperation>{RestoreObjectOp{b, {}}, SetMetaOp{b, "note", "2"}};
+    });
+    {
+        auto txn = store.read();
+        require(store.edgeByUuid(txn, bc.uuid).has_value(), "no-op restore does not suppress normal retention");
+    }
+    if (history == HistoryMode::On) {
+        ObjectVersion source;
+        { auto txn = store.read(); source = store.versionReference(txn, *store.currentObjectRevision(txn, b)); }
+        session.editCurrent(attachment, {b}, [&](const StoreReader&, const std::string&) {
+            return std::vector<TransactionOperation>{RestoreObjectOp{b, source}};
+        });
+        { auto txn = store.read(); require(!store.edgeByUuid(txn, bc.uuid), "historical restore removes old observations without retaining them"); }
+        bc = makeEdge(b, c);
+        VersionSelection expected;
+        { auto txn = store.read(); expected = {{b, store.currentVersion(txn, b)}, {c, store.currentVersion(txn, c)}}; }
+        { auto txn = store.write(expected); store.addEdge(txn, bc); txn.commit(); }
+    }
+    // The standalone request helper must also omit an explicitly removed edge.
+    auto removal = session.newRequest(attachment);
+    session.readStore(attachment, [&](const StoreReader& reader, const auto&) {
+        editCurrentRequest(reader, removal, {b}, {SetMetaOp{b, "note", "3"}, RemoveEdgeOp{bc.uuid}});
+    });
+    require(removal.operations.size() == 2, "no generated retention for an explicitly removed edge");
+    session.submit(attachment, removal);
+    { auto txn = store.read(); require(!store.edgeByUuid(txn, bc.uuid), "explicit relationship removal succeeds through editCurrentRequest"); }
+    // Explicitly asking to retain a missing edge is still an error, not ignored.
+    mustFail([&] {
+        session.editCurrent(attachment, {b}, [&](const StoreReader&, const std::string&) {
+            return std::vector<TransactionOperation>{RetainRelationshipOp{bc.uuid}};
+        });
+    });
+    // Capturing versions must precede callbacks, even if a callback causes a
+    // newer head to become visible (as a hosted reader could).
+    mustFail([&] {
+        session.editCurrent(attachment, {b}, [&](const StoreReader&, const std::string&) {
+            auto txn = store.write(); store.setMeta(txn, b, "external", "true"); txn.commit();
+            return std::vector<TransactionOperation>{SetMetaOp{b, "stale_callback", "true"}};
+        });
+    });
+    { auto txn = store.read(); require(store.objectByUuid(txn, b)->meta.find("stale_callback") == std::string::npos,
+                                      "callback cannot advance the captured edit expectations"); }
+}
+}
+
 int main() try
 {
+    editCurrentLifecycle(HistoryMode::On);
+    editCurrentLifecycle(HistoryMode::Off);
     TemporaryDirectory directory;
     OpenOptions options; options.author = "session-test";
     // Older formats are rejected before the new journal is queried; the ones
