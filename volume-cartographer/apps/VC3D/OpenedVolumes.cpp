@@ -67,7 +67,10 @@ OpenedVolumes::Level OpenedVolumes::level(const Volume& volume, int level)
             shared = vc::cuda::makeReader(*opened->array, opened->meta.type, gpuPool_);
         reader = shared;
     }
-    return {opened, open(volume, base)->placement, std::move(reader)};
+    // Level zero is a coordinate frame, not necessarily a stored array: compact
+    // predictions often start at /2. A nonzero working base is a retained level.
+    const auto working = base == 0 ? vcr::zarr::LevelPlacement{} : open(volume, base)->placement;
+    return {opened, working, std::move(reader)};
 }
 
 const OpenedVolumes::Pyramid& OpenedVolumes::pyramid(const Volume& volume)

@@ -32,7 +32,12 @@ std::array<float, 3> ViewerLevels::vertexSpacing() const
 vcr::grid::Level ViewerLevels::gridLevel(int level) const
 {
     const auto& l = levels[std::size_t(level)];
-    return vcr::zarr::gridLevel(*l.array, l.working, gpuFailed->load() ? nullptr : l.cuda.get());
+    auto result = vcr::zarr::gridLevel(*l.array, l.working, gpuFailed->load() ? nullptr : l.cuda.get());
+    // Compound AFV stores presence in channel zero. The scalar viewer uses it;
+    // the tracing samplers independently select all channels from the manifest.
+    if (l.array->meta.shape.size() == 4)
+        result.channel = 0;
+    return result;
 }
 
 std::vector<vcr::grid::Level> ViewerLevels::gridLevels() const

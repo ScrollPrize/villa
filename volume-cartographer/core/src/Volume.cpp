@@ -123,9 +123,10 @@ std::string signedS3Location(const std::string& url)
 
 std::array<int, 3> shape3(const vcr::Index& shape, const std::string& description)
 {
-    if (shape.size() != 3)
-        throw std::runtime_error("zarr array must be 3D: " + description);
-    return {static_cast<int>(shape[0]), static_cast<int>(shape[1]), static_cast<int>(shape[2])};
+    if (shape.size() != 3 && shape.size() != 4)
+        throw std::runtime_error("zarr array must be ZYX or CZYX: " + description);
+    const auto first = shape.size() - 3;
+    return {static_cast<int>(shape[first]), static_cast<int>(shape[first + 1]), static_cast<int>(shape[first + 2])};
 }
 
 // One physical level per level number (absent numbers are not present): its shape and
@@ -143,6 +144,9 @@ std::vector<PhysicalLevel> physicalLevels(const std::vector<vcr::zarr::PyramidLe
     for (const auto& level : levels) {
         if (level.meta.dtype != levels.front().meta.dtype)
             throw std::runtime_error("levels of " + description + " have different dtypes");
+        if (level.meta.shape.size() != levels.front().meta.shape.size() ||
+            (level.meta.shape.size() == 4 && level.meta.shape[0] != levels.front().meta.shape[0]))
+            throw std::runtime_error("levels of " + description + " have different channel layouts");
         if (out.size() <= static_cast<std::size_t>(level.level))
             out.resize(static_cast<std::size_t>(level.level) + 1);
         auto& entry = out[static_cast<std::size_t>(level.level)];
@@ -163,10 +167,10 @@ void validateWorkingLevel(const std::vector<vcr::zarr::PyramidLevelInfo>& levels
             throw std::runtime_error("VC pyramid numeric groups contain a gap at /" + std::to_string(index) +
                                      " of " + description);
         for (std::size_t axis = 0; axis < 3; ++axis) {
-            const auto first = static_cast<int>(levels.front().meta.shape[axis]);
-            if (!paddedShapeOK(static_cast<long long>(levels[index].meta.shape[axis]),
+            const auto first = shape3(levels.front().meta.shape, description)[axis];
+            if (!paddedShapeOK(shape3(levels[index].meta.shape, description)[axis],
                                levelExtent(first, levels[index].placement.scale[axis]),
-                               static_cast<int>(levels[index].meta.chunks[axis])))
+                               shape3(levels[index].meta.chunks, description)[axis]))
                 throw std::runtime_error("VC pyramid group /" + std::to_string(index) +
                                          " shape is not the downscale of /0 its placement declares, within storage-chunk padding tolerance");
         }

@@ -29,6 +29,8 @@
 #include "LineAnnotationGeneratedViews.hpp"
 #include "LineAnnotationShiftScroll.hpp"
 #include "LineAnnotationDialog.hpp"
+#include "LineAnnotationNormalSource.hpp"
+#include "UnifiedBrowserDialog.hpp"
 #include "SurfacePanelController.hpp"
 #include "VCSettings.hpp"
 #include "FiberFollowService.hpp"
@@ -145,6 +147,7 @@ struct LineAnnotationController::LineAnnotationSession {
     double workingToBaseScale = 1.0;
     std::shared_ptr<vc::lasagna::LasagnaDataset> dataset;
     std::shared_ptr<vc::lasagna::LasagnaNormalSampler> normalSampler;
+    bool usingFiberNormals = false;
     bool inspectionFrameOnly = false;
     bool modelOnly = false;
     // A stored fiber opens view only: the editing signals of its dialog are
@@ -349,6 +352,14 @@ std::vector<vc::objects::ObjectVersion> currentFiberVersions(const vc::objects::
 } // namespace
 
 namespace {
+
+std::optional<std::array<std::size_t, 3>> annotationShapeZYX(const CState* state)
+{
+    const auto volume = state ? state->currentVolume() : nullptr;
+    if (!volume) return std::nullopt;
+    const auto shape = volume->shape();
+    return std::array<std::size_t, 3>{std::size_t(shape[0]), std::size_t(shape[1]), std::size_t(shape[2])};
+}
 
 // Fiber control-point directions and display normals between frames.
 cv::Vec3d mapDirection(const vc::objects::VolumeAffine& m, const cv::Vec3d& d)
@@ -2363,6 +2374,47 @@ void LineAnnotationController::connectSessionEditing(LineAnnotationDialog* dialo
             [this](const std::string& location) {
                 handleFiberInferenceDatasetSelectionChanged(location);
             });
+    connect(dialog, &LineAnnotationDialog::normalSourceSelectionChanged, this,
+            [this](const std::string& source) {
+        for (const auto& pane : _panes) {
+            if (pane.session && pane.session->taskState == LineAnnotationSession::TaskState::Running) {
+                showError(tr("Wait for the running line optimization before changing normals."),
+                          pane.session->suppressErrorDialogs);
+                refreshLineAnnotationDatasetMenus();
+                return;
+            }
+        }
+        if (!_state || !_state->vpkg()) return;
+        try {
+            _state->vpkg()->setAnnotationNormalSource(source);
+        } catch (const std::exception& ex) {
+            showError(tr("Could not save normal source: %1").arg(QString::fromUtf8(ex.what())),
+                      _errorDialogsSuppressed);
+            refreshLineAnnotationDatasetMenus();
+            return;
+        }
+        ++_fiberMetricsGeneration; // discard in-flight results for the previous field
+        _fiberAlignmentMetrics.clear();
+        _pendingFiberAlignmentMetrics.clear();
+        _pendingFiberAlignmentMetricTokens.clear();
+        _fiberMetricsPending = false;
+        for (const auto& pane : _panes) {
+            if (!pane.session || pane.session->modelOnly) continue;
+            auto& session = *pane.session;
+            session.dataset.reset();
+            session.normalSampler.reset();
+            session.traceNormalDataset.reset();
+            session.traceNormalSampler.reset();
+            session.usingFiberNormals = false;
+            session.selectedDatasetLocation.clear();
+            session.traceNormalDatasetLocation.clear();
+            if (!session.controlPoints.empty())
+                setSessionOptimizationState(session, SessionOptimizationState::Unoptimized);
+            updateGeneratedViewMetricsForFiber(session.fiberId);
+        }
+        refreshLineAnnotationDatasetMenus();
+        emit fibersChanged();
+    });
     connect(dialog,
             &LineAnnotationDialog::crossSectionDragFinished,
             this,
@@ -5059,62 +5111,12 @@ bool LineAnnotationController::isAlignmentPendingForFiber(uint64_t fiberId,
 std::shared_ptr<vc::lasagna::LasagnaDataset>
 LineAnnotationController::resolveAlignmentMetricsDataset()
 {
-    if (!_state || !_state->vpkg()) {
-        showError(tr("No volume package loaded."));
-        return {};
-    }
-
-    auto vpkg = _state->vpkg();
-    const auto openDataset = [&](const std::string& location, double scale) {
-        vc::lasagna::LasagnaDatasetOpenOptions options;
-        options.workingToBaseScale = scale;
-        options.remoteCacheRoot = vc3d::remoteCachePathFs();
-        const auto resolved = vcr::zarr::isRemote(location)
-            ? location
-            : vc::project::resolveLocalPath(location, vpkg->path().parent_path()).string();
-        return std::make_shared<vc::lasagna::LasagnaDataset>(
-            vc::lasagna::LasagnaDataset::openLocation(resolved, options));
-    };
-    try {
-        if (const auto resolved = vc3d::opendata::resolveLasagnaForVolume(
-                *vpkg, _state->currentVolumeId())) {
-            // Marker-backed catalog entries retain their origin/auth policy on
-            // local open; direct remote attachments must retain the source URL.
-            return openDataset(resolved->manifestBacked
-                                   ? resolved->manifestPath.string()
-                                   : resolved->sourceManifestLocation,
-                               resolved->workingToBaseScale);
-        }
-    } catch (const std::exception& ex) {
-        showError(tr("Cannot resolve Lasagna for the active volume: %1")
-                      .arg(QString::fromStdString(ex.what())));
-        return {};
-    }
-    std::string selected = vpkg->selectedLasagnaDataset();
-
-    const fs::path startDir = vpkg->path().empty()
-        ? fs::path{}
-        : vpkg->path().parent_path();
-    // Suppressed callers cannot open the dataset picker.
-    auto picked = (_datasetPicker && !_errorDialogsSuppressed)
-        ? _datasetPicker(_parentWidget, startDir)
-        : std::optional<std::string>{};
-    if (!picked || picked->empty()) {
-        if (_errorDialogsSuppressed) {
-            showError(tr("No Lasagna dataset is selected for the active volume."));
-        }
-        return {};
-    }
-    selected = *picked;
-    try {
-        auto dataset = openDataset(selected, 1.0);
-        vpkg->setSelectedLasagnaDataset(selected);
-        return dataset;
-    } catch (const std::exception& ex) {
-        showError(tr("Cannot resolve Lasagna for the active volume: %1")
-                      .arg(QString::fromUtf8(ex.what())));
-        return {};
-    }
+    // Metrics must use the same normal-source policy as annotation/tracing,
+    // including predicted-only compound volumes.
+    LineAnnotationSession session;
+    session.suppressErrorDialogs = _errorDialogsSuppressed;
+    if (!ensureDatasetForSession(session)) return {};
+    return session.dataset;
 }
 
 void LineAnnotationController::requestFiberAlignmentMetricsForFibers(std::vector<uint64_t> fiberIds)
@@ -6464,6 +6466,7 @@ std::optional<uint64_t> LineAnnotationController::createLinkedSeedFiber(
     linkedSeedRecord->workingToBaseScale = templateSession.workingToBaseScale;
     linkedSeedRecord->dataset = templateSession.dataset;
     linkedSeedRecord->normalSampler = templateSession.normalSampler;
+    linkedSeedRecord->usingFiberNormals = templateSession.usingFiberNormals;
     linkedSeedRecord->modelOnly = templateSession.modelOnly;
     ensureSessionFiberIdentity(*linkedSeedRecord);
 
@@ -8264,6 +8267,71 @@ bool LineAnnotationController::ensureDatasetForSession(LineAnnotationSession& se
     std::string selectedIdentity;
     fs::path manifestPath;
     double workingToBaseScale = 1.0;
+    const auto normalPreference = vpkg->annotationNormalSource();
+    if (normalPreference != "lasagna") {
+        std::string fiberLocation = vpkg->selectedFiberInferenceDataset();
+        const auto entries = vpkg->fiberInferenceDatasetEntries();
+        if (fiberLocation.empty() && entries.size() == 1)
+            fiberLocation = entries.front().location;
+        if (!fiberLocation.empty()) {
+            try {
+                if (session.usingFiberNormals && session.normalSampler &&
+                    session.selectedDatasetLocation == fiberLocation) {
+                    const auto scale = vc3d::line_annotation::resolveFiberNormalCoordinateScales(
+                        session.dataset->manifest().baseShapeZYX, annotationShapeZYX(_state), 1.0).fiberBaseToNormalBase;
+                    if (approximatelyEqual(scale, session.workingToBaseScale)) return true;
+                }
+                vc::lasagna::LasagnaDatasetOpenOptions options;
+                options.remoteCacheRoot = vc3d::remoteCachePathFs();
+                const auto location = vcr::zarr::isRemote(fiberLocation)
+                    ? fiberLocation : vc::project::resolveLocalPath(
+                        fiberLocation, vpkg->path().parent_path()).string();
+                const auto opened = vc::lasagna::LasagnaDataset::openLocation(location, options);
+                if (vc3d::line_annotation::usePredictedFiberNormals(opened.manifest(), normalPreference)) {
+                    auto manifest = vc::lasagna::fiberNormalManifest(opened.manifest());
+                    // Annotation points are in the displayed volume's grid. A
+                    // compound pyramid can start below the model's base/L0.
+                    manifest.workingToBaseScale = vc3d::line_annotation::resolveFiberNormalCoordinateScales(
+                        manifest.baseShapeZYX, annotationShapeZYX(_state), 1.0).fiberBaseToNormalBase;
+                    auto dataset = std::make_shared<vc::lasagna::LasagnaDataset>(std::move(manifest));
+                    auto sampler = std::make_shared<vc::lasagna::LasagnaNormalSampler>(*dataset);
+                    session.dataset = std::move(dataset);
+                    session.normalSampler = std::move(sampler);
+                    session.usingFiberNormals = true;
+                    session.selectedDatasetLocation = fiberLocation;
+                    session.selectedManifestPath = opened.manifest().manifestPath;
+                    // normal_manifest records the actual source, including
+                    // the compound AFV when it supplies the normals.
+                    session.selectedLasagnaManifestIdentity = fiberLocation;
+                    const auto entry = std::find_if(entries.begin(), entries.end(),
+                        [&](const auto& e) { return e.location == fiberLocation; });
+                    if (entry != entries.end())
+                        session.selectedLasagnaManifestIdentity = vc3d::opendata::lasagnaSourceManifestLocation(*vpkg, *entry);
+                    session.workingToBaseScale = session.dataset->manifest().workingToBaseScale;
+                    session.traceNormalDataset.reset();
+                    session.traceNormalSampler.reset();
+                    if (vpkg->selectedFiberInferenceDataset() != fiberLocation)
+                        vpkg->setSelectedFiberInferenceDataset(fiberLocation);
+                    return true;
+                }
+            } catch (const std::exception& ex) {
+                showError(tr("Cannot use the selected fiber normal source: %1")
+                              .arg(QString::fromUtf8(ex.what())), headless);
+                return false;
+            }
+        } else if (normalPreference == "fiber") {
+            if (required)
+                showError(tr("Select a fiber dataset with predicted normals in the Fiber dataset menu."), headless);
+            return !required;
+        }
+    }
+    if (session.usingFiberNormals) {
+        session.dataset.reset();
+        session.normalSampler.reset();
+        session.traceNormalDataset.reset();
+        session.traceNormalSampler.reset();
+        session.usingFiberNormals = false;
+    }
     if (!vpkg->selectedLasagnaDataset().empty()) {
         selected = vpkg->selectedLasagnaDataset();
         selectedIdentity = selected;
@@ -8303,7 +8371,15 @@ bool LineAnnotationController::ensureDatasetForSession(LineAnnotationSession& se
         options.remoteCacheRoot = vc3d::remoteCachePathFs();
         const std::string resolved =
             vcr::zarr::isRemote(location) ? location : vc::project::resolveLocalPath(location, vpkg->path().parent_path()).string();
-        return vc::lasagna::LasagnaDataset::openLocation(resolved, options);
+        auto opened = vc::lasagna::LasagnaDataset::openLocation(resolved, options);
+        if (annotationShapeZYX(_state) && opened.manifest().baseShapeZYX) {
+            auto manifest = opened.manifest();
+            workingToBaseScale = vc3d::line_annotation::resolveFiberNormalCoordinateScales(
+                manifest.baseShapeZYX, annotationShapeZYX(_state), 1.0).fiberBaseToNormalBase;
+            manifest.workingToBaseScale = workingToBaseScale;
+            return vc::lasagna::LasagnaDataset(std::move(manifest));
+        }
+        return opened;
     };
 
     // Without a dataset the session falls back to a display-only frame
@@ -8346,6 +8422,16 @@ bool LineAnnotationController::ensureDatasetForSession(LineAnnotationSession& se
         }
         vpkg->setSelectedLasagnaDataset(selected);
     } else {
+        if (session.normalSampler && session.selectedDatasetLocation == selected &&
+            annotationShapeZYX(_state) && session.dataset->manifest().baseShapeZYX) {
+            try {
+                workingToBaseScale = vc3d::line_annotation::resolveFiberNormalCoordinateScales(
+                    session.dataset->manifest().baseShapeZYX, annotationShapeZYX(_state), 1.0).fiberBaseToNormalBase;
+            } catch (const std::exception& ex) {
+                showError(QString::fromUtf8(ex.what()), headless);
+                return false;
+            }
+        }
         if (!session.normalSampler || session.selectedDatasetLocation != selected ||
             session.workingToBaseScale != workingToBaseScale) {
             try {
@@ -8390,6 +8476,7 @@ void LineAnnotationController::refreshLineAnnotationDatasetMenu(
     }
     auto vpkg = _state->vpkg();
     std::vector<std::pair<std::string, std::string>> lasagnaOptions;
+    dialog->setNormalSource(vpkg->annotationNormalSource());
     for (const auto& entry : vpkg->lasagnaDatasetEntries()) {
         lasagnaOptions.emplace_back(entry.location, datasetEntryMenuLabel(entry));
     }
@@ -8432,6 +8519,7 @@ void LineAnnotationController::handleLasagnaDatasetSelectionChanged(
         }
         auto& session = *pane.session;
         if (session.modelOnly) continue;
+        if (session.usingFiberNormals) continue;
         session.dataset.reset();
         session.normalSampler.reset();
         session.traceNormalDataset.reset();
@@ -8474,6 +8562,15 @@ void LineAnnotationController::handleFiberInferenceDatasetSelectionChanged(
         session.fiberInferenceDataset.reset();
         session.fiberPredictionField.reset();
         session.selectedFiberInferenceDatasetLocation.clear();
+        if (session.usingFiberNormals) {
+            session.dataset.reset();
+            session.normalSampler.reset();
+            session.traceNormalDataset.reset();
+            session.traceNormalSampler.reset();
+            session.usingFiberNormals = false;
+            session.selectedDatasetLocation.clear();
+            session.traceNormalDatasetLocation.clear();
+        }
         if (!session.optimizedLine.points.empty() && !session.controlPoints.empty()) {
             setSessionOptimizationState(session, SessionOptimizationState::Unoptimized);
         }
@@ -8599,11 +8696,26 @@ bool LineAnnotationController::ensureFiberInferenceDatasetForSession(
         }
     }
 
+    try {
+        const auto annotationToFiberBase = vc3d::line_annotation::resolveFiberNormalCoordinateScales(
+            session.fiberInferenceDataset->manifest().baseShapeZYX, annotationShapeZYX(_state), 1.0).fiberBaseToNormalBase;
+        session.fiberTraceToBaseScale = session.fiberInferenceDataset->manifest().workingToBaseScale / annotationToFiberBase;
+    } catch (const std::exception& ex) {
+        showError(tr("Fiber dataset does not match the annotation volume: %1")
+                      .arg(QString::fromUtf8(ex.what())), headless);
+        return false;
+    }
+
+    // A newly picked fiber volume can supply the normal field as well. Resolve
+    // it before opening any external Lasagna source (and after the picker).
+    if (!ensureDatasetForSession(session, true, stillValid)) return false;
+    if (stillValid && !stillValid()) return false;
+    const double traceToNormalBase = session.fiberTraceToBaseScale * session.workingToBaseScale;
     if (!session.traceNormalDataset || !session.traceNormalSampler ||
         session.traceNormalDatasetLocation != session.selectedDatasetLocation ||
         !approximatelyEqual(
             session.traceNormalDataset->manifest().workingToBaseScale,
-            session.fiberTraceToBaseScale)) {
+            traceToNormalBase)) {
         try {
             vc::lasagna::LasagnaDatasetOpenOptions options;
             options.workingToBaseScale = session.fiberTraceToBaseScale;
@@ -8614,15 +8726,18 @@ bool LineAnnotationController::ensureFiberInferenceDatasetForSession(
                     : vc::project::resolveLocalPath(
                           session.selectedDatasetLocation,
                           vpkg->path().parent_path()).string();
-            auto dataset = std::make_shared<vc::lasagna::LasagnaDataset>(
-                vc::lasagna::LasagnaDataset::openLocation(normalLocation, options));
+            auto manifest = session.usingFiberNormals
+                ? session.dataset->manifest()
+                : vc::lasagna::LasagnaDataset::openLocation(normalLocation, options).manifest();
+            manifest.workingToBaseScale = traceToNormalBase;
+            auto dataset = std::make_shared<vc::lasagna::LasagnaDataset>(std::move(manifest));
             auto sampler =
                 std::make_shared<vc::lasagna::LasagnaNormalSampler>(*dataset);
             session.traceNormalDataset = std::move(dataset);
             session.traceNormalSampler = std::move(sampler);
             session.traceNormalDatasetLocation = session.selectedDatasetLocation;
         } catch (const std::exception& ex) {
-            showError(tr("Invalid trace-scale Lasagna normal dataset: %1")
+            showError(tr("Invalid trace-scale normal dataset: %1")
                           .arg(QString::fromStdString(ex.what())),
                       headless);
             return false;
@@ -9768,7 +9883,7 @@ bool LineAnnotationController::ensureSessionSolveBackends(
         return false;
     }
     if (!session.normalSampler && !session.modelOnly) {
-        showError(tr("Could not run final line optimization: no Lasagna dataset is loaded."),
+        showError(tr("Could not run final line optimization: no normal source is loaded."),
                   session.suppressErrorDialogs);
         return false;
     }
@@ -11916,15 +12031,19 @@ std::optional<std::string> LineAnnotationController::pickDataset(
     QWidget* parent,
     const fs::path& startDir) const
 {
-    const QString picked = QFileDialog::getOpenFileName(
-        parent,
-        tr("Select Lasagna Dataset"),
-        QString::fromStdString(startDir.string()),
-        tr("Lasagna datasets (*.lasagna.json);;JSON files (*.json);;All files (*)"));
-    if (picked.isEmpty()) {
+    UnifiedBrowserDialog dialog(parent);
+    dialog.setWindowTitle(tr("Select annotation dataset"));
+    dialog.setHint(tr("Select a .lasagna.json manifest or a compound .zarr directory."));
+    dialog.setAcceptsFiles(true);
+    dialog.setAcceptsDirs(true);
+    dialog.setLocalNameFilters({QStringLiteral("*.json")});
+    dialog.setStartUri(QString::fromStdString(startDir.string()));
+    if (dialog.exec() != QDialog::Accepted) {
         return std::nullopt;
     }
-    return picked.toStdString();
+    const auto picked = dialog.selectedUri();
+    const QUrl url(picked);
+    return (url.isLocalFile() ? url.toLocalFile() : picked).toStdString();
 }
 
 int LineAnnotationController::breakExtrapolationDistanceVxForPane(const PaneRecord* pane) const
@@ -12160,8 +12279,12 @@ LineAnnotationController::resolveFiberOptimizationInputs(
 
     ResolvedFiberOptimizationInputs result;
     QStringList failures;
+    auto selectedFiber = vpkg->selectedFiberInferenceDataset();
+    const auto fiberEntries = vpkg->fiberInferenceDatasetEntries();
+    if (selectedFiber.empty() && fiberEntries.size() == 1)
+        selectedFiber = fiberEntries.front().location;
     const std::vector<std::string> fiberCandidates = {
-        vpkg->selectedFiberInferenceDataset(), fallbackFiberLocation};
+        selectedFiber, fallbackFiberLocation};
     for (const auto& candidate : fiberCandidates) {
         if (candidate.empty() || result.fiberDataset) continue;
         try {
@@ -12176,7 +12299,9 @@ LineAnnotationController::resolveFiberOptimizationInputs(
             auto predictions =
                 std::make_shared<vc::fiber_tracer::FiberPredictionField>(*dataset);
             result.fiberManifestLocation = candidate;
-            result.traceToBaseScale = scales.traceToBaseScale;
+            const auto annotationToFiberBase = vc3d::line_annotation::resolveFiberNormalCoordinateScales(
+                opened.manifest().baseShapeZYX, annotationShapeZYX(_state), 1.0).fiberBaseToNormalBase;
+            result.traceToBaseScale = scales.traceToBaseScale / annotationToFiberBase;
             result.fiberDataset = std::move(dataset);
             result.predictions = std::move(predictions);
         } catch (const std::exception& ex) {
@@ -12186,21 +12311,34 @@ LineAnnotationController::resolveFiberOptimizationInputs(
         }
     }
 
-    const std::vector<std::string> normalCandidates = {
-        vpkg->selectedLasagnaDataset(), fallbackNormalLocation};
+    const auto normalPreference = vpkg->annotationNormalSource();
+    bool predictedNormals = false;
+    try {
+        predictedNormals = result.fiberDataset &&
+            vc3d::line_annotation::usePredictedFiberNormals(
+                result.fiberDataset->manifest(), normalPreference);
+    } catch (const std::exception& ex) {
+        if (errorMessage) *errorMessage = QString::fromUtf8(ex.what());
+        return std::nullopt;
+    }
+    const std::vector<std::string> normalCandidates = predictedNormals
+        ? std::vector<std::string>{result.fiberManifestLocation}
+        : std::vector<std::string>{vpkg->selectedLasagnaDataset(), fallbackNormalLocation};
     for (const auto& candidate : normalCandidates) {
         if (candidate.empty() || result.normalDataset || !result.fiberDataset)
             continue;
         try {
-            auto opened = vc::lasagna::LasagnaDataset::openLocation(
-                resolveLocation(candidate), options);
+            auto normalManifest = predictedNormals
+                ? vc::lasagna::fiberNormalManifest(result.fiberDataset->manifest())
+                : vc::lasagna::LasagnaDataset::openLocation(
+                    resolveLocation(candidate), options).manifest();
             const auto coordinateScales =
                 vc3d::line_annotation::resolveFiberNormalCoordinateScales(
-                    opened.manifest().baseShapeZYX,
-                    result.fiberDataset->manifest().baseShapeZYX,
+                    normalManifest.baseShapeZYX,
+                    annotationShapeZYX(_state).has_value() ? annotationShapeZYX(_state) : result.fiberDataset->manifest().baseShapeZYX,
                     result.traceToBaseScale);
 
-            auto baseManifest = opened.manifest();
+            auto baseManifest = normalManifest;
             baseManifest.workingToBaseScale =
                 coordinateScales.fiberBaseToNormalBase;
             auto baseDataset = std::make_shared<vc::lasagna::LasagnaDataset>(
@@ -12208,7 +12346,7 @@ LineAnnotationController::resolveFiberOptimizationInputs(
             auto baseSampler =
                 std::make_shared<vc::lasagna::LasagnaNormalSampler>(*baseDataset);
 
-            auto traceManifest = opened.manifest();
+            auto traceManifest = normalManifest;
             traceManifest.workingToBaseScale =
                 coordinateScales.traceToNormalBase;
             auto traceDataset = std::make_shared<vc::lasagna::LasagnaDataset>(
@@ -12230,7 +12368,7 @@ LineAnnotationController::resolveFiberOptimizationInputs(
     if (!result.normalDataset || !result.fiberDataset) {
         if (errorMessage) {
             QString missing;
-            if (!result.normalDataset) missing += tr("No usable Lasagna normal dataset. ");
+            if (!result.normalDataset) missing += tr("No usable normal source (predicted fiber normals or Lasagna). ");
             if (!result.fiberDataset) missing += tr("No usable fiber-inference dataset. ");
             *errorMessage = missing + failures.join(QStringLiteral("; "));
         }

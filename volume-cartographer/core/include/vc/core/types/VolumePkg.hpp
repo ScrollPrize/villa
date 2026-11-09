@@ -23,6 +23,7 @@ class Volume;
 namespace vc::project {
 
 inline constexpr std::string_view kFiberLasagnaTag = "vc-lasagna-fiber";
+inline constexpr std::string_view kPredictedFiberNormalsTag = "vc-fiber-normal-channels";
 inline constexpr std::string_view kAnonymousRemoteAuthTag =
     "vc-remote-auth:anonymous";
 
@@ -149,6 +150,11 @@ public:
     void setSelectedFiberInferenceDataset(std::string location);
     void clearSelectedFiberInferenceDataset();
 
+    // Project-scoped explicit choice. Unset legacy projects use Lasagna;
+    // attaching a dataset initializes the choice once, never at sampling time.
+    [[nodiscard]] std::string annotationNormalSource() const;
+    void setAnnotationNormalSource(std::string source);
+
     // Viewer bbox in volume coordinates; disabling retains the saved limits.
     [[nodiscard]] std::optional<Rect3D> focusBounds() const { return focusBounds_; }
     [[nodiscard]] bool focusBoundsEnabled() const { return focusBoundsEnabled_; }
@@ -199,6 +205,7 @@ private:
     std::vector<vc::project::Entry> lasagnaDatasets_;
     std::optional<std::string> selectedLasagnaDataset_;
     std::optional<std::string> selectedFiberInferenceDataset_;
+    std::optional<std::string> annotationNormalSource_;
     std::optional<Rect3D> focusBounds_;
     bool focusBoundsEnabled_ = false;
     std::string currentVolumeId_;

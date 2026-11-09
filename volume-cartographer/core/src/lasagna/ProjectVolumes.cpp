@@ -81,6 +81,10 @@ std::vector<PreparedLasagnaProjectVolume> prepareLasagnaProjectVolumes(
             });
 
         auto tags = lasagnaProjectVolumeTags(group, manifestLocation);
+        // Dataset-wide capability: the normal heads may be in separate groups.
+        if (manifest.groupForChannel("sheet_nx") && manifest.groupForChannel("sheet_ny") &&
+            manifest.groupForChannel("sheet_grad_mag"))
+            addUniqueTag(tags, std::string(vc::project::kPredictedFiberNormalsTag));
 
         if (existing != prepared.end()) {
             for (auto& tag : tags)

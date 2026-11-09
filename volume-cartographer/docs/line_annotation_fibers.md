@@ -83,6 +83,69 @@ QT_QPA_PLATFORM=offscreen VC3D_UPGRADE_STORE_TEST=/path/to/legacy.vcobj \
   build/bin/VC3D --test-object-store
 ```
 
+## Normal sources for compound fiber volumes
+
+Use **File → Attach Lasagna / Compound Dataset…**, select the compound prediction
+Zarr directory (containing the embedded `lasagna` manifest in `.zattrs`), and
+choose the **Fiber inference** role. The browser accepts directories as well as
+JSON manifests, locally or remotely. In the annotation
+window's menu, **Tracing / annotation normals** selects:
+
+- **Predicted fiber normals** — requires `sheet_nx`, `sheet_ny`, and
+  `sheet_grad_mag`; reports an error rather
+  than silently falling back when they are unavailable.
+- **Lasagna normals** — explicitly uses the external Lasagna dataset even when
+  the fiber volume supplies normals.
+
+There is no Automatic option. Attaching the first dataset initializes an unset
+project choice to **Predicted fiber normals** when the selected fiber dataset
+contains `sheet_nx`, `sheet_ny`, and `sheet_grad_mag`; otherwise it selects
+**Lasagna normals**. An existing Lasagna selection is preserved. Subsequent
+attachments and dataset changes never override the saved choice. User changes
+are persisted in the `.vcproj` view field `annotation_normal_source` (`fiber`
+or `lasagna`), independently for each project and across reopening. Legacy
+projects without that field use Lasagna until initial attachment setup or an
+explicit user selection. Tracing never silently switches sources.
+
+A compound volume with predicted normals needs **no attached Lasagna volume**
+for seeding, tracing, reoptimization, generated views, or alignment metrics.
+The same policy applies to headless optimization initiated by the GUI. It is
+independent of the Fiber model / Lasagna interpolation selection. The compound
+`nx/ny` channels are fiber **directions**, not normals: the normal sampler uses
+the `sheet_*` channels at their original packed offsets, with separate base- and
+trace-coordinate adapters. Existing normal sampling/interpolation is reused.
+
+Packed CZYX arrays attach as spatial volumes and display their first channel
+(presence for compound AFV). Display reads the shared packed chunk cache directly,
+without extracting or writing separate channel volumes. Channel views use CPU
+sampling; regular 3-D volumes retain their existing GPU display path. Sparse
+pyramids starting at `/2` do not require a physical `/0` array. As with other
+OME pyramids, display coordinates refer to the finest declared grid. The GUI
+maps annotation coordinates into the prediction/normal manifest's base grid,
+so displaying the downscaled compound does not shift tracing to another location.
+
+Changing the project's normal source invalidates the annotation's normal samplers and cached
+alignment metrics; it is refused while a line solve is running. The recorded
+segment `normal_manifest` identifies the actual source, including the compound
+Zarr when predicted normals were used.
+
+Regression checks include `test_line_annotation_coordinate_scale`,
+`test_fiber_prediction_channels`, `test_line_annotation_generated_views`,
+`test_lasagna_project_volumes`, and the reader's `test_native_grid` (including
+nonzero packed channels and progressive cache fills).
+With `VC_TESTING=ON`, the actual GUI controller also has an opt-in real-data
+check (the seed is from the PHerc0332 run named below):
+
+```sh
+VC3D_CONFIG_DIR="$(mktemp -d)" QT_QPA_PLATFORM=offscreen \
+VC3D_COMPOUND_TEST_VOLUME=/data/hendrik/las_manager_inference/PHerc0332-20251211183505-las-sd1-4c4f7467/artifacts/PHerc0332-20251211183505-las-sd1-4c4f7467.zarr \
+build/bin/VC3D --test-object-store
+```
+
+This creates a temporary project, attaches only the real compound prediction,
+checks both coordinate frames and interactive/headless source selection, and
+runs a short native trace. The source data is read-only.
+
 ## CP direction annotations
 
 Shift-drag near an existing CP in either strip to edit its forward direction.
