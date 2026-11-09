@@ -60,7 +60,8 @@ Json importNative(const Json& config,const std::filesystem::path& input,const st
         return value;
     };
     const auto sizeLimit=std::min<uint64_t>(std::numeric_limits<size_t>::max(),INT64_MAX);
-    const int workers=int(integerOption("shards",1,256)),readers=int(integerOption("readers",std::min(workers,16),256));
+    const int workers=int(integerOption("shards",defaultParallelImportWorkers,256)),
+        readers=int(integerOption("readers",std::min(size_t(workers),defaultParallelImportWorkers),256));
     const auto edgeLimit=int64_t(integerOption("constraint_limit",0,INT64_MAX,true));
     const size_t batchSize=integerOption("batch_size",1024,1000000);
     const size_t batchBytes=integerOption("batch_bytes",8*1024*1024,sizeLimit);

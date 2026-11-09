@@ -7,11 +7,13 @@
 #include <variant>
 
 namespace vc::objects::imports {
+inline constexpr size_t defaultParallelImportWorkers=32;
 // Shared transport for decoded files, prepared memory and future native sources.
 // A task is a coarse source chunk, NOT a destination shard. Readers steal tasks;
 // each record is then routed by its UUID to a single independent SQLite writer.
 struct ParallelImportOptions {
-    size_t readers=8,shards=1,batchRows=256,readerBytes=8*1024*1024,queueBytes=256*1024*1024;
+    size_t readers=defaultParallelImportWorkers,shards=defaultParallelImportWorkers,
+        batchRows=256,readerBytes=8*1024*1024,queueBytes=256*1024*1024;
 };
 struct ImportObject {
     std::variant<InitialObjectRecord,const InitialObjectRecord*> value;

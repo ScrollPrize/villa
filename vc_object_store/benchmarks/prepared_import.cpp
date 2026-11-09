@@ -418,7 +418,7 @@ int main(int argc,char** argv){try{
     for(size_t caseIndex=0;caseIndex<cases.size();++caseIndex) {
       const auto& run=cases[caseIndex];const std::string variant=run.at("variant");
       const bool sharded=variant.ends_with("_sharded");
-      const size_t workers=sharded?run.value("workers",config.value("workers",size_t(4))):1;
+      const size_t workers=sharded?run.value("workers",config.value("workers",vc::objects::imports::defaultParallelImportWorkers)):1;
       const size_t sqlRows=run.value("sql_batch_rows",config.value("sql_batch_rows",size_t(1)));
       const size_t exportWorkers=run.value("export_workers",config.value("export_workers",size_t(1)));
       const bool preSizeExport=run.value("pre_size_export",config.value("pre_size_export",false));

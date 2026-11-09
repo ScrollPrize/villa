@@ -41,6 +41,8 @@ void cancellation(){
     mustFail([&]{queue.pop(0,rows,[]{throw std::runtime_error("builder cancelled");});});
 }
 void parallelStream(){
+    const ParallelImportOptions defaults;
+    require(defaults.readers==32&&defaults.shards==32,"parallel import defaults must use 32 readers/writers");
     TemporaryDirectory dir;constexpr size_t count=80,workers=4;
     std::vector<InitialObjectRecord> records(count);std::vector<std::atomic<int>> visits(count);
     for(size_t i=0;i<count;++i){records[i].record.uuid=util::nameUuid("stream-test-"+std::to_string(i));records[i].record.kind="note";}
